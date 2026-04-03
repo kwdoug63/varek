@@ -63,7 +63,7 @@ fn preprocess(img: ImageInput) -> Tensor {
 }
 
 fn infer(tensor: Tensor) -> RawOutput {
-  model := load_model("resnet50.synmodel")
+  model := load_model("resnet50.varekmodel")
   model.forward(tensor)
 }
 
@@ -104,12 +104,25 @@ JSON won because XML was bloated. Python won because C was inaccessible. VAREK w
 
 ## Roadmap
 
-- [ ] v0.1 — Formal grammar spec + reference parser (Python)
-- [ ] v0.2 — Type system + inference engine
-- [ ] v0.3 — LLVM compilation backend
-- [ ] v0.4 — Standard library (I/O, tensors, HTTP, async)
-- [ ] v0.5 — Package manager (`varek` CLI)
-- [ ] v1.0 — Stable release + community RFC process
+- [x] v0.1 — Formal grammar spec + reference parser
+- [x] v0.2 — Type system + Hindley-Milner inference engine
+- [x] v0.3 — LLVM compilation backend + native code generation
+- [x] v0.4 — Standard library (var::io, var::tensor, var::http, var::async, var::pipeline, var::model, var::data)
+- [x] v1.0 — Stable release + `varek` package manager CLI + RFC governance process
+
+**659 tests passing · 13,006 lines of Python · MIT License**
+
+---
+
+## Releases
+
+| Version | Description | Tests |
+|---------|-------------|-------|
+| [v1.0.0](../../releases/tag/v1.0.0) ✓ | Stable release — package manager, REPL, formatter, doc gen, RFC process | 108 |
+| [v0.4.0](../../releases/tag/v0.4.0) | Standard library — 7 modules, 261 functions | 182 |
+| [v0.3.0](../../releases/tag/v0.3.0) | LLVM compilation backend — IR gen, native emit, benchmarks | 97 |
+| [v0.2.0](../../releases/tag/v0.2.0) | Type system — HM inference, unification, tensor shape tracking | 163 |
+| [v0.1.0](../../releases/tag/v0.1.0) | Foundation — lexer, parser, AST, grammar | 109 |
 
 ---
 
@@ -117,7 +130,7 @@ JSON won because XML was bloated. Python won because C was inaccessible. VAREK w
 
 VAREK is open source under the MIT License. We welcome contributions at every level — from grammar discussions to compiler engineering to documentation.
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for guidelines.
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for guidelines. Language changes go through the [RFC process](./docs/GOVERNANCE.md).
 
 ---
 
