@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VAREK — Open Source Data Room</title>
+<style>
+  :root {
+    --purple: #7c3aed;
+    --purple-light: #ede9fe;
+    --teal: #00ffe0;
+    --dark: #0f1117;
+    --mid: #1e293b;
+    --slate: #334155;
+    --muted: #64748b;
+    --border: #e2e8f0;
+    --bg: #f8fafc;
+    --white: #ffffff;
+    --green: #16a34a;
+    --amber: #d97706;
+    --blue: #2563eb;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--mid);
+    line-height: 1.6;
+  }
+
+  /* ── Header ── */
+  .header {
+    background: var(--dark);
+    color: white;
+    padding: 3rem 2rem 2.5rem;
+    position: relative;
+    overflow: hidden;
+  }
+  .header::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(ellipse 60% 80% at 70% 50%, rgba(124,58,237,.25) 0%, transparent 70%);
+  }
+  .header-inner { max-width: 960px; margin: 0 auto; position: relative; }
+  .badge {
+    display: inline-block;
+    background: rgba(124,58,237,.3);
+    border: 1px solid rgba(124,58,237,.5);
+    color: #c4b5fd;
+    font-size: .75rem;
+    font-weight: 600;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    padding: .25rem .75rem;
+    border-radius: 999px;
+    margin-bottom: 1rem;
+  }
+  .header h1 {
+    font-size: 2.75rem;
+    font-weight: 800;
+    letter-spacing: -.02em;
+    color: white;
+    margin-bottom: .4rem;
+  }
+  .header h1 span { color: #c4b5fd; }
+  .header .tagline {
+    color: #94a3b8;
+    font-size: 1.05rem;
+    margin-bottom: 1.5rem;
+  }
+  .header .author {
+    color: #64748b;
+    font-size: .85rem;
+  }
+  .header .author strong { color: #94a3b8; }
+
+  .stats-row {
+    display: flex;
+    gap: 2rem;
+    margin-top: 2rem;
+    flex-wrap: wrap;
+  }
+  .stat { text-align: center; }
+  .stat .num {
+    font-size: 1.75rem;
+    font-weight: 800;
+    color: #c4b5fd;
+    display: block;
+    line-height: 1;
+  }
+  .stat .label {
+    font-size: .75rem;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    margin-top: .2rem;
+  }
+
+  /* ── Main layout ── */
+  .main { max-width: 960px; margin: 0 auto; padding: 2.5rem 2rem; }
+
+  /* ── Section ── */
+  .section { margin-bottom: 3rem; }
+  .section-title {
+    font-size: .7rem;
+    font-weight: 700;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 1rem;
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+  }
+  .section-title::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  /* ── File card ── */
+  .file-card {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: .75rem;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: 0 1.25rem;
+    align-items: start;
+    transition: box-shadow .15s;
+  }
+  .file-card:hover { box-shadow: 0 2px 12px rgba(0,0,0,.07); }
+
+  .file-icon {
+    width: 36px; height: 36px;
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1rem;
+    flex-shrink: 0;
+    margin-top: .1rem;
+  }
+  .icon-zip    { background: #ede9fe; }
+  .icon-pdf    { background: #fee2e2; }
+  .icon-html   { background: #fef3c7; }
+  .icon-md     { background: #dcfce7; }
+  .icon-py     { background: #dbeafe; }
+
+  .file-body { min-width: 0; }
+  .file-name {
+    font-weight: 700;
+    font-size: .95rem;
+    color: var(--dark);
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    margin-bottom: .2rem;
+  }
+  .file-desc {
+    color: var(--slate);
+    font-size: .88rem;
+    line-height: 1.5;
+  }
+  .file-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .35rem;
+    margin-top: .6rem;
+  }
+  .tag {
+    font-size: .7rem;
+    font-weight: 600;
+    padding: .15rem .5rem;
+    border-radius: 4px;
+    letter-spacing: .02em;
+  }
+  .tag-version  { background: #ede9fe; color: #6d28d9; }
+  .tag-tests    { background: #dcfce7; color: #166534; }
+  .tag-lines    { background: #dbeafe; color: #1e40af; }
+  .tag-feature  { background: #fef3c7; color: #92400e; }
+  .tag-doc      { background: #f0fdf4; color: #166534; }
+  .tag-spec     { background: #f0f4ff; color: #3730a3; }
+  .tag-stable   { background: #dcfce7; color: #166534; }
+
+  .file-meta {
+    text-align: right;
+    flex-shrink: 0;
+  }
+  .file-size {
+    font-size: .8rem;
+    font-weight: 600;
+    color: var(--muted);
+    font-family: monospace;
+  }
+  .file-action {
+    display: inline-block;
+    margin-top: .5rem;
+    font-size: .75rem;
+    color: var(--purple);
+    border: 1px solid #c4b5fd;
+    border-radius: 5px;
+    padding: .2rem .6rem;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+
+  /* ── Version timeline ── */
+  .timeline {
+    position: relative;
+    padding-left: 2rem;
+  }
+  .timeline::before {
+    content: '';
+    position: absolute;
+    left: .55rem;
+    top: .5rem;
+    bottom: .5rem;
+    width: 2px;
+    background: linear-gradient(to bottom, #7c3aed, #06b6d4);
+    border-radius: 2px;
+  }
+  .tl-item {
+    position: relative;
+    margin-bottom: 1rem;
+  }
+  .tl-dot {
+    position: absolute;
+    left: -1.55rem;
+    top: .35rem;
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: white;
+    border: 2px solid var(--purple);
+  }
+  .tl-dot.stable { border-color: var(--green); background: var(--green); }
+
+  /* ── Usage guide ── */
+  .guide-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+  @media (max-width: 640px) { .guide-grid { grid-template-columns: 1fr; } }
+
+  .guide-card {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.25rem;
+  }
+  .guide-card h4 {
+    font-size: .9rem;
+    font-weight: 700;
+    color: var(--dark);
+    margin-bottom: .5rem;
+    display: flex;
+    align-items: center;
+    gap: .4rem;
+  }
+  .guide-card p, .guide-card li {
+    font-size: .85rem;
+    color: var(--slate);
+    line-height: 1.55;
+  }
+  .guide-card ul { padding-left: 1.1rem; }
+  .guide-card li { margin-bottom: .2rem; }
+  code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: .82rem;
+    background: #f1f5f9;
+    padding: .1rem .35rem;
+    border-radius: 3px;
+    color: var(--purple);
+  }
+
+  /* ── License + footer ── */
+  .license-box {
+    background: white;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.5rem;
+    display: flex;
+    gap: 1.5rem;
+    align-items: flex-start;
+  }
+  .license-badge {
+    background: var(--purple-light);
+    color: var(--purple);
+    font-weight: 800;
+    font-size: 1.1rem;
+    border-radius: 8px;
+    padding: .6rem 1rem;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .license-text h4 { font-size: .95rem; margin-bottom: .4rem; }
+  .license-text p { font-size: .85rem; color: var(--slate); line-height: 1.55; }
+
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 1.5rem 2rem;
+    text-align: center;
+    font-size: .8rem;
+    color: var(--muted);
+  }
+  footer strong { color: var(--mid); }
+</style>
+</head>
+<body>
+
+<!-- ── HEADER ── -->
+<div class="header">
+  <div class="header-inner">
+    <div class="badge">Open Source Release</div>
+    <h1>VAREK <span>Data Room</span></h1>
+    <p class="tagline">AI Pipeline Programming Language — Complete release archive</p>
+    <p class="author">
+      <strong>Kenneth Wayne Douglas, MD</strong> &nbsp;·&nbsp;
+      MIT License &nbsp;·&nbsp;
+      2025–2026
+    </p>
+    <div class="stats-row">
+      <div class="stat"><span class="num">5</span><span class="label">Versions</span></div>
+      <div class="stat"><span class="num">659</span><span class="label">Tests Passing</span></div>
+      <div class="stat"><span class="num">13,006</span><span class="label">Lines of Code</span></div>
+      <div class="stat"><span class="num">261</span><span class="label">Stdlib Functions</span></div>
+      <div class="stat"><span class="num">10</span><span class="label">Files</span></div>
+      <div class="stat"><span class="num">530KB</span><span class="label">Total Size</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- ── SOURCE RELEASES ── -->
+  <div class="section">
+    <div class="section-title">Source Releases</div>
+    <div class="timeline">
+
+      <div class="tl-item">
+        <div class="tl-dot"></div>
+        <div class="file-card">
+          <div class="file-icon icon-zip">📦</div>
+          <div class="file-body">
+            <div class="file-name">varek-v0.1.zip</div>
+            <div class="file-desc">
+              Foundation layer. Formal EBNF grammar, hand-rolled lexer (all tokens, spans, error recovery),
+              and recursive-descent parser with panic-mode synchronisation. Includes AST node hierarchy
+              and a visitor-based pretty-printer. The entire front-end pipeline.
+            </div>
+            <div class="file-tags">
+              <span class="tag tag-version">v0.1.0</span>
+              <span class="tag tag-tests">109 tests</span>
+              <span class="tag tag-lines">2,546 lines</span>
+              <span class="tag tag-feature">Lexer</span>
+              <span class="tag tag-feature">Parser</span>
+              <span class="tag tag-feature">AST</span>
+              <span class="tag tag-feature">EBNF Grammar</span>
+            </div>
+          </div>
+          <div class="file-meta">
+            <div class="file-size">34 KB</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tl-item">
+        <div class="tl-dot"></div>
+        <div class="file-card">
+          <div class="file-icon icon-zip">📦</div>
+          <div class="file-body">
+            <div class="file-name">varek-v0.2.zip</div>
+            <div class="file-desc">
+              Full static type system. Hindley-Milner inference (Algorithm W), let-polymorphism,
+              Robinson's unification with occurs check, tensor shape tracking via symbolic dimensions,
+              schema structural subtyping, Optional coercion, Result&lt;T&gt; propagation, and
+              a runtime SchemaValidator. Type errors with source spans and "did you mean?" hints.
+            </div>
+            <div class="file-tags">
+              <span class="tag tag-version">v0.2.0</span>
+              <span class="tag tag-tests">163 tests</span>
+              <span class="tag tag-lines">5,562 lines</span>
+              <span class="tag tag-feature">HM Inference</span>
+              <span class="tag tag-feature">Type System</span>
+              <span class="tag tag-feature">Unification</span>
+              <span class="tag tag-feature">Schema Validation</span>
+            </div>
+          </div>
+          <div class="file-meta">
+            <div class="file-size">60 KB</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tl-item">
+        <div class="tl-dot"></div>
+        <div class="file-card">
+          <div class="file-icon icon-zip">📦</div>
+          <div class="file-body">
+            <div class="file-name">varek-v0.3.zip</div>
+            <div class="file-desc">
+              Native code generation. Raw <code>ctypes</code> bindings to <code>libLLVM-20.so</code>
+              — no llvmlite. Emits verified LLVM IR (SSA form, phi nodes, alloca/load/store),
+              native assembly (.s), and object files (.o). Singleton TargetMachine, LLVM optimisation
+              passes, and a tree-walking interpreter retained alongside the compiled path.
+              First benchmarks: IR generation in ~1ms, native 10–100× faster than CPython (projected).
+            </div>
+            <div class="file-tags">
+              <span class="tag tag-version">v0.3.0</span>
+              <span class="tag tag-tests">97 tests</span>
+              <span class="tag tag-lines">7,792 lines</span>
+              <span class="tag tag-feature">LLVM IR</span>
+              <span class="tag tag-feature">Native Codegen</span>
+              <span class="tag tag-feature">Interpreter</span>
+              <span class="tag tag-feature">Benchmarks</span>
+            </div>
+          </div>
+          <div class="file-meta">
+            <div class="file-size">86 KB</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tl-item">
+        <div class="tl-dot"></div>
+        <div class="file-card">
+          <div class="file-icon icon-zip">📦</div>
+          <div class="file-body">
+            <div class="file-name">varek-v0.4.zip</div>
+            <div class="file-desc">
+              Full standard library surface — 7 modules, 261 exported functions.
+              <code>var::io</code> (41 fns: files, paths, streams, env),
+              <code>var::tensor</code> (111 fns: NumPy-backed, linear algebra, activations, distance),
+              <code>var::http</code> (19 fns: client + server),
+              <code>var::async</code> (32 fns: channels, futures, parallel_map, mutex, atomic),
+              <code>var::pipeline</code> (15 fns: execution engine, combinators, streaming),
+              <code>var::model</code> (14 fns: inference, embeddings, tokenization),
+              <code>var::data</code> (29 fns: CSV/JSON/NPY, splits, augmentation, metrics).
+            </div>
+            <div class="file-tags">
+              <span class="tag tag-version">v0.4.0</span>
+              <span class="tag tag-tests">182 tests</span>
+              <span class="tag tag-lines">11,097 lines</span>
+              <span class="tag tag-feature">var::io</span>
+              <span class="tag tag-feature">var::tensor</span>
+              <span class="tag tag-feature">var::http</span>
+              <span class="tag tag-feature">var::async</span>
+              <span class="tag tag-feature">var::pipeline</span>
+              <span class="tag tag-feature">var::model</span>
+              <span class="tag tag-feature">var::data</span>
+            </div>
+          </div>
+          <div class="file-meta">
+            <div class="file-size">118 KB</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tl-item">
+        <div class="tl-dot stable"></div>
+        <div class="file-card">
+          <div class="file-icon icon-zip">📦</div>
+          <div class="file-body">
+            <div class="file-name">varek-v1.0.zip</div>
+            <div class="file-desc">
+              Stable release. <code>syn</code> package manager (20 commands: new / build / run /
+              install / publish / search / repl / fmt / doc). Package format (<code>.synpkg</code>,
+              <code>syn.toml</code>, <code>syn.lock</code>) with semver resolution and SHA-256
+              checksum verification. Interactive REPL with :type / :bench / :ir. Source formatter.
+              Doc generator (Markdown + HTML + JSON). Governance docs, 3 implemented RFCs,
+              community contributor ladder, and formal stability guarantees.
+            </div>
+            <div class="file-tags">
+              <span class="tag tag-version">v1.0.0</span>
+              <span class="tag tag-stable">Stable</span>
+              <span class="tag tag-tests">108 tests</span>
+              <span class="tag tag-lines">13,006 lines</span>
+              <span class="tag tag-feature">Package Manager</span>
+              <span class="tag tag-feature">REPL</span>
+              <span class="tag tag-feature">Formatter</span>
+              <span class="tag tag-feature">Doc Gen</span>
+              <span class="tag tag-feature">RFC Process</span>
+              <span class="tag tag-feature">Governance</span>
+            </div>
+          </div>
+          <div class="file-meta">
+            <div class="file-size">148 KB</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── DOCUMENTATION ── -->
+  <div class="section">
+    <div class="section-title">Documentation &amp; Specification</div>
+
+    <div class="file-card">
+      <div class="file-icon icon-pdf">📄</div>
+      <div class="file-body">
+        <div class="file-name">VAREK-Spec-Paper-Douglas.pdf</div>
+        <div class="file-desc">
+          Formal language specification paper. Covers design motivation, formal grammar,
+          type system semantics, pipeline execution model, and the case for a unified AI/ML
+          pipeline language. Authored by Kenneth Wayne Douglas, MD.
+        </div>
+        <div class="file-tags">
+          <span class="tag tag-spec">Specification</span>
+          <span class="tag tag-doc">Academic Paper</span>
+        </div>
+      </div>
+      <div class="file-meta"><div class="file-size">21 KB</div></div>
+    </div>
+
+    <div class="file-card">
+      <div class="file-icon icon-html">🌐</div>
+      <div class="file-body">
+        <div class="file-name">varek-landing.html</div>
+        <div class="file-desc">
+          Project landing page (single-file HTML). Suitable for hosting on GitHub Pages,
+          a personal domain, or as a project overview. Contains feature overview,
+          code examples, version history, and the design rationale.
+        </div>
+        <div class="file-tags">
+          <span class="tag tag-doc">Landing Page</span>
+          <span class="tag tag-feature">GitHub Pages Ready</span>
+        </div>
+      </div>
+      <div class="file-meta"><div class="file-size">22 KB</div></div>
+    </div>
+
+    <div class="file-card">
+      <div class="file-icon icon-md">📝</div>
+      <div class="file-body">
+        <div class="file-name">VAREK-README.md</div>
+        <div class="file-desc">
+          Project README. Quick start, feature overview, language tour, stdlib module listing,
+          and architecture diagram. Drop this directly into the root of a GitHub repository.
+        </div>
+        <div class="file-tags">
+          <span class="tag tag-doc">README</span>
+          <span class="tag tag-feature">GitHub Ready</span>
+        </div>
+      </div>
+      <div class="file-meta"><div class="file-size">4.5 KB</div></div>
+    </div>
+
+    <div class="file-card">
+      <div class="file-icon icon-md">📝</div>
+      <div class="file-body">
+        <div class="file-name">VAREK-SPEC.md</div>
+        <div class="file-desc">
+          Draft language specification in Markdown. Grammar rules, type system formal description,
+          pipeline semantics, and built-in function signatures. v0.1 draft — superseded by the
+          formal grammar in each version's <code>grammar/VAREK.ebnf</code>.
+        </div>
+        <div class="file-tags">
+          <span class="tag tag-spec">Language Spec</span>
+          <span class="tag tag-doc">Draft v0.1</span>
+        </div>
+      </div>
+      <div class="file-meta"><div class="file-size">6.2 KB</div></div>
+    </div>
+
+    <div class="file-card">
+      <div class="file-icon icon-py">🐍</div>
+      <div class="file-body">
+        <div class="file-name">varek-parser.py</div>
+        <div class="file-desc">
+          Standalone single-file parser prototype. Self-contained — no imports beyond Python stdlib.
+          Useful as a quick reference implementation or for embedding in other projects without
+          the full package structure. Pre-dates the modular v0.1 release.
+        </div>
+        <div class="file-tags">
+          <span class="tag tag-feature">Standalone</span>
+          <span class="tag tag-feature">Zero Dependencies</span>
+          <span class="tag tag-doc">Reference Implementation</span>
+        </div>
+      </div>
+      <div class="file-meta"><div class="file-size">17.5 KB</div></div>
+    </div>
+
+  </div>
+
+  <!-- ── USAGE GUIDE ── -->
+  <div class="section">
+    <div class="section-title">How to Use This Data Room</div>
+    <div class="guide-grid">
+
+      <div class="guide-card">
+        <h4>🚀 Starting a new project</h4>
+        <p>Download <code>varek-v1.0.zip</code>. Unzip, then:</p>
+        <ul>
+          <li><code>python varek_cli.py new my-proj</code></li>
+          <li><code>cd my-proj &amp;&amp; python ../syn_cli.py run</code></li>
+          <li><code>python ../syn_cli.py repl</code></li>
+        </ul>
+        <p style="margin-top:.6rem">Requirements: Python 3.10+, NumPy. LLVM optional (for native emit).</p>
+      </div>
+
+      <div class="guide-card">
+        <h4>📖 Reading the code</h4>
+        <p>Each zip is a self-contained milestone. Recommended reading order:</p>
+        <ul>
+          <li><code>v0.1</code> — lexer.py → parser.py → ast.py</li>
+          <li><code>v0.2</code> — types.py → unify.py → infer.py</li>
+          <li><code>v0.3</code> — llvm_api.py → codegen.py</li>
+          <li><code>v0.4</code> — stdlib/*.py</li>
+          <li><code>v1.0</code> — packager.py → syn_cli.py</li>
+        </ul>
+      </div>
+
+      <div class="guide-card">
+        <h4>🔬 Academic / research use</h4>
+        <p>Start with <strong>VAREK-Spec-Paper-Douglas.pdf</strong> for the formal design rationale. Then <strong>VAREK-SPEC.md</strong> for the grammar and type system. The <code>grammar/VAREK.ebnf</code> inside each zip is the normative grammar definition at each version.</p>
+      </div>
+
+      <div class="guide-card">
+        <h4>🌐 GitHub / open source setup</h4>
+        <ul>
+          <li>Use <strong>VAREK-README.md</strong> as <code>README.md</code> in the repo root</li>
+          <li>Host <strong>varek-landing.html</strong> on GitHub Pages</li>
+          <li>Upload <code>.zip</code> files as GitHub Release assets</li>
+          <li>Copy <code>docs/GOVERNANCE.md</code> and <code>docs/RFC_TEMPLATE.md</code> from <code>v1.0</code> into the repo</li>
+          <li>Add <code>rfcs/</code> directory for community proposals</li>
+        </ul>
+      </div>
+
+      <div class="guide-card">
+        <h4>🏗️ Extending VAREK</h4>
+        <p>The <strong>syn::* stdlib</strong> is the primary extension surface. Add a new module in <code>varek/stdlib/mymodule.py</code>, register it in <code>stdlib/__init__.py</code>, and wire it to the runtime. No core language changes needed.</p>
+        <p style="margin-top:.5rem">For language changes, open an RFC using the template in <code>docs/RFC_TEMPLATE.md</code>.</p>
+      </div>
+
+      <div class="guide-card">
+        <h4>⚡ Running the tests</h4>
+        <ul>
+          <li><code>v0.1</code>: <code>python tests/test_varek.py</code></li>
+          <li><code>v0.2</code>: <code>python tests/test_types.py</code></li>
+          <li><code>v0.3</code>: <code>python tests/test_v03.py</code></li>
+          <li><code>v0.4</code>: <code>python tests/test_stdlib.py</code></li>
+          <li><code>v1.0</code>: <code>python tests/test_v10.py</code></li>
+        </ul>
+        <p style="margin-top:.5rem">All tests pass green. Total: <strong>659 tests</strong>.</p>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── LICENSE ── -->
+  <div class="section">
+    <div class="section-title">License</div>
+    <div class="license-box">
+      <div class="license-badge">MIT</div>
+      <div class="license-text">
+        <h4>MIT License — Free for any use</h4>
+        <p>
+          Copyright © 2025–2026 Kenneth Wayne Douglas, MD.<br>
+          Permission is granted, free of charge, to any person obtaining a copy of this software
+          to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies,
+          subject to the condition that the copyright notice and this permission notice appear
+          in all copies or substantial portions of the software.
+        </p>
+        <p style="margin-top:.6rem; color: var(--muted);">
+          This is the most permissive open source license. You can fork it, build commercial products
+          on it, publish papers citing it, or include it in proprietary software — just keep the
+          copyright notice.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── CUMULATIVE TOTALS ── -->
+  <div class="section">
+    <div class="section-title">Cumulative Build Totals</div>
+    <div class="file-card" style="display:block; padding: 1.5rem;">
+      <table style="width:100%; border-collapse:collapse; font-size:.88rem;">
+        <thead>
+          <tr style="border-bottom:2px solid var(--border);">
+            <th style="text-align:left; padding:.5rem .75rem; color:var(--muted); font-weight:600; text-transform:uppercase; font-size:.72rem; letter-spacing:.06em;">Version</th>
+            <th style="text-align:left; padding:.5rem .75rem; color:var(--muted); font-weight:600; text-transform:uppercase; font-size:.72rem; letter-spacing:.06em;">What Ships</th>
+            <th style="text-align:right; padding:.5rem .75rem; color:var(--muted); font-weight:600; text-transform:uppercase; font-size:.72rem; letter-spacing:.06em;">Tests</th>
+            <th style="text-align:right; padding:.5rem .75rem; color:var(--muted); font-weight:600; text-transform:uppercase; font-size:.72rem; letter-spacing:.06em;">Py Lines</th>
+            <th style="text-align:right; padding:.5rem .75rem; color:var(--muted); font-weight:600; text-transform:uppercase; font-size:.72rem; letter-spacing:.06em;">Size</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr style="border-bottom:1px solid var(--border);">
+            <td style="padding:.6rem .75rem; font-family:monospace; font-weight:700; color:var(--purple);">v0.1</td>
+            <td style="padding:.6rem .75rem; color:var(--slate);">Lexer · Parser · AST · Grammar</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace;">109</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace;">2,546</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace;">34 KB</td>
+          </tr>
+          <tr style="border-bottom:1px solid var(--border);">
+            <td style="padding:.6rem .75rem; font-family:monospace; font-weight:700; color:var(--purple);">v0.2</td>
+            <td style="padding:.6rem .75rem; color:var(--slate);">HM Type Inference · Unification · Schemas</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace;">163</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace;">5,562</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace;">60 KB</td>
+          </tr>
+          <tr style="border-bottom:1px solid var(--border);">
+            <td style="padding:.6rem .75rem; font-family:monospace; font-weight:700; color:var(--purple);">v0.3</td>
+            <td style="padding:.6rem .75rem; color:var(--slate);">LLVM Codegen · Native Emit · Interpreter · Benchmarks</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace;">97</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace;">7,792</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace;">86 KB</td>
+          </tr>
+          <tr style="border-bottom:1px solid var(--border);">
+            <td style="padding:.6rem .75rem; font-family:monospace; font-weight:700; color:var(--purple);">v0.4</td>
+            <td style="padding:.6rem .75rem; color:var(--slate);">7 Stdlib Modules · 261 Functions</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace;">182</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace;">11,097</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace;">118 KB</td>
+          </tr>
+          <tr style="background: #faf5ff;">
+            <td style="padding:.6rem .75rem; font-family:monospace; font-weight:700; color:var(--green);">v1.0 ✓</td>
+            <td style="padding:.6rem .75rem; color:var(--slate); font-weight:600;">Package Manager · REPL · Formatter · Docs · RFC Process</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace; font-weight:700;">108</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace; font-weight:700;">13,006</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace; font-weight:700;">148 KB</td>
+          </tr>
+          <tr style="background: #0f1117; color: white;">
+            <td style="padding:.6rem .75rem; font-family:monospace; font-weight:800; color:#c4b5fd;">TOTAL</td>
+            <td style="padding:.6rem .75rem; color:#94a3b8;">All versions · All artifacts</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace; font-weight:800; color:#86efac;">659</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace; font-weight:800; color:#93c5fd;">13,006</td>
+            <td style="padding:.6rem .75rem; text-align:right; font-family:monospace; font-weight:800; color:#fde68a;">530 KB</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<footer>
+  <strong>VAREK</strong> — AI Pipeline Programming Language &nbsp;·&nbsp;
+  Kenneth Wayne Douglas, MD &nbsp;·&nbsp;
+  MIT License &nbsp;·&nbsp;
+  v1.0.0 Stable Release
+</footer>
+
+</body>
+</html>
