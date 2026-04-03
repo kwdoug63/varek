@@ -1,5 +1,5 @@
 # VAREK
-### Synthetic Neural API & Pipeline Scripting Engine
+### AI Pipeline Programming Language
 
 > *One language. Every stage of the AI pipeline.*
 
