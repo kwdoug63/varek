@@ -126,6 +126,20 @@ JSON won because XML was bloated. Python won because C was inaccessible. VAREK w
 
 ---
 
+## Community
+
+**[GitHub Discussions](https://github.com/kwdoug63/varek/discussions)**
+is the official space for VAREK conversation.
+
+| Category | For |
+|----------|-----|
+| [RFC Proposals](https://github.com/kwdoug63/varek/discussions/categories/rfc-proposals) | Propose language changes |
+| [Q&A](https://github.com/kwdoug63/varek/discussions/categories/q-a) | Ask anything |
+| [Show and Tell](https://github.com/kwdoug63/varek/discussions/categories/show-and-tell) | Share what you built |
+| [General](https://github.com/kwdoug63/varek/discussions/categories/general) | Everything else |
+
+---
+
 ## Contributing
 
 VAREK is open source under the MIT License. We welcome contributions at every level — from grammar discussions to compiler engineering to documentation.
