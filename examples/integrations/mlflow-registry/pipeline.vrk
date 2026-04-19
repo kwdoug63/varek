@@ -1,0 +1,51 @@
+// examples/integrations/mlflow-registry/pipeline.vrk
+// VAREK orchestrating a type-safe evaluation loop with an MLflow registry.
+
+// 1. Define the exact shape of the Model Artifact metadata
+type ModelMetadata = {
+    model_name: String,
+    version: String,
+    artifact_uri: String,
+    framework: String
+}
+
+// 2. Define the exact shape of the Evaluation Metrics
+type EvalMetrics = {
+    accuracy: Float32,
+    log_loss: Float32,
+    inference_time_ms: Float32
+}
+
+// 3. Map the external MLflow API and evaluation boundaries
+@python(module="scripts.mlflow_fetch", fn="get_latest_staging_model")
+external fn pull_from_registry(model_name: String) -> Result<ModelMetadata, RegistryError>
+
+@python(module="scripts.benchmark", fn="run_eval")
+external fn run_benchmark(artifact_uri: String, test_data_path: String) -> Result<EvalMetrics, EvalError>
+
+@python(module="scripts.mlflow_publish", fn="log_metrics")
+external fn log_to_registry(model: ModelMetadata, metrics: EvalMetrics) -> Result<(), RegistryError>
+
+fn main() {
+    let target_model = "clinical_readmission_risk";
+    let test_dataset = "s3://clinical-eval/q3_holdout.parquet";
+
+    // VAREK guarantees the data flow between fetching, evaluating, and logging.
+    match pull_from_registry(target_model) {
+        Ok(metadata) => {
+            print("Fetched {metadata.model_name} v{metadata.version} from MLflow.");
+            
+            // If benchmark.py tries to return 'acc' instead of 'accuracy', 
+            // VAREK halts at the boundary before pushing garbage to MLflow.
+            let metrics = run_benchmark(metadata.artifact_uri, test_dataset).unwrap();
+            
+            print("Evaluation Complete. Accuracy: {metrics.accuracy}. Publishing...");
+            
+            match log_to_registry(metadata, metrics) {
+                Ok(_) => print("Successfully logged metrics to MLflow Tracking Server."),
+                Err(e) => panic("Failed to publish to registry: {e}")
+            }
+        },
+        Err(e) => panic("Failed to fetch model from registry: {e}")
+    }
+}

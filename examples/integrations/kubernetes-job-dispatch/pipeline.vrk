@@ -1,0 +1,44 @@
+// examples/integrations/kubernetes-job-dispatch/pipeline.vrk
+// VAREK dispatching a strictly typed training job natively to Kubernetes.
+
+// 1. Define the exact hyperparameter schema
+type HyperParams = {
+    batch_size: Int32,
+    learning_rate: Float32,
+    epochs: Int32
+}
+
+// 2. Define the exact output schema from the container
+type TrainingResult = {
+    final_loss: Float32,
+    model_uri: String
+}
+
+// 3. VAREK abstracts away the Dockerfile and Kubernetes Job YAML.
+// It compiles this into a strongly typed execution boundary and handles cluster dispatch.
+@kubernetes(
+    base_image="pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime",
+    resources={gpu: "1", cpu: "4", mem: "16Gi"},
+    namespace="ml-training"
+)
+external fn run_training_job(params: HyperParams, dataset_s3_path: String) -> Result<TrainingResult, JobError>
+
+fn main() {
+    let config = HyperParams {
+        batch_size: 64,
+        learning_rate: 0.001,
+        epochs: 50
+    };
+
+    print("Dispatching ResNet training job to Kubernetes cluster...");
+
+    // VAREK handles the K8s API interaction, serializes the inputs safely, and waits for completion.
+    // Compile-time check: If 'config' is missing 'epochs', it fails before ever hitting the cluster.
+    match run_training_job(config, "s3://medical-imaging/chest-xrays/v2") {
+        Ok(result) => {
+            print("Job Complete! Final Loss: {result.final_loss}");
+            print("Model artifact safely registered at: {result.model_uri}");
+        },
+        Err(e) => panic("Kubernetes Job failed at execution boundary: {e}")
+    }
+}

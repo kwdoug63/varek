@@ -1,0 +1,30 @@
+// pipeline.vrk
+// VAREK guarantees pod-to-pod data contracts at compile time.
+
+// Define the exact shape of the data moving between Kubernetes pods
+type ProcessedBatch = {
+    batch_id: String,
+    features: Tensor<Float32, [32, 256]> // e.g., Batch size 32, 256 features
+}
+
+// Map external container execution boundaries
+@kubernetes(image="soberagents/preprocess:v1", resources={cpu: "2", mem: "4Gi"})
+external fn preprocess_data(raw_path: String) -> Result<ProcessedBatch, DataError>
+
+@kubernetes(image="soberagents/train:v1", resources={gpu: "1", mem: "8Gi"})
+external fn train_model(data: ProcessedBatch) -> Result<Float32, TrainError>
+
+fn main() {
+    let raw_data_path = "s3://clinical-data/raw/batch_01";
+
+    // VAREK enforces that the output of preprocess_data 
+    // exactly matches the input requirement of train_model.
+    // If the tensor shapes mismatch, this fails to compile.
+    match preprocess_data(raw_data_path) {
+        Ok(batch) => {
+            let final_loss = train_model(batch).unwrap();
+            print("Pipeline complete. Final Loss: {final_loss}");
+        },
+        Err(e) => panic("Pipeline halted: {e}")
+    }
+}

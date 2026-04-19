@@ -1,0 +1,31 @@
+// examples/integrations/kafka-pipeline/pipeline.vrk
+// VAREK guarantees streaming data contracts at compile time.
+
+// Define the exact shape of the Kafka message
+type TransactionEvent = {
+    tx_id: String,
+    amount: Float32,
+    merchant_category: Int32,
+    timestamp: Int64
+}
+
+// Map the producer stream
+@kafka(topic="live-transactions", role="producer")
+external fn stream_transactions(source_db: String) -> Stream<TransactionEvent>
+
+// Map the consumer ML inference model
+@kafka(topic="live-transactions", role="consumer", group="fraud-detection")
+external fn run_fraud_inference(event_stream: Stream<TransactionEvent>) -> Result<(), StreamError>
+
+fn main() {
+    let source = "postgres://main-db/transactions";
+
+    // VAREK verifies at compile time that the Stream emitted by 
+    // the producer perfectly matches the Stream required by the consumer.
+    let tx_stream = stream_transactions(source);
+    
+    match run_fraud_inference(tx_stream) {
+        Ok(_) => print("Fraud inference stream initialized successfully."),
+        Err(e) => panic("Stream halted at execution boundary: {e}")
+    }
+}

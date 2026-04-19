@@ -1,0 +1,44 @@
+// examples/integrations/rag-pipeline/pipeline.vrk
+// VAREK orchestrating a Retrieval-Augmented Generation (RAG) pipeline safely.
+
+// 1. Define strict types for the vector database payload
+type RetrievedContext = {
+    doc_id: String,
+    text_chunk: String,
+    confidence_score: Float32
+}
+
+// 2. Define the exact JSON schema we expect the LLM to return
+type ClinicalExtraction = {
+    patient_condition: String,
+    recommended_action: String,
+    requires_escalation: Boolean
+}
+
+// 3. Map the external API boundaries
+@http(endpoint="http://localhost:8001/search", method="POST")
+external fn query_vector_db(query: String) -> Result<Array<RetrievedContext>, DatabaseError>
+
+@http(endpoint="http://localhost:8002/generate", method="POST")
+external fn call_llm_agent(prompt: String, context: Array<RetrievedContext>) -> Result<ClinicalExtraction, LlmParseError>
+
+fn main() {
+    let user_query = "Patient presents with severe chest pain and elevated troponin.";
+
+    // VAREK enforces the data contract between the Vector DB and the LLM at compile time.
+    // If the LLM agent changes its output schema in Python, VAREK halts execution.
+    match query_vector_db(user_query) {
+        Ok(context) => {
+            print("Retrieved {context.length()} context chunks. Calling LLM...");
+            
+            match call_llm_agent(user_query, context) {
+                Ok(extraction) => {
+                    print("Condition: {extraction.patient_condition}");
+                    print("Escalate: {extraction.requires_escalation}");
+                },
+                Err(e) => panic("LLM returned malformed schema: {e}")
+            }
+        },
+        Err(e) => panic("Vector DB retrieval failed: {e}")
+    }
+}

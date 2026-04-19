@@ -1,0 +1,39 @@
+// examples/integrations/inference-serving/pipeline.vrk
+// VAREK orchestrating an image classification inference pipeline.
+
+type RawRequest = {
+    request_id: String,
+    image_b64: String
+}
+
+type PredictionResult = {
+    request_id: String,
+    class_label: String,
+    confidence: Float32
+}
+
+// 1. Map the preprocessing boundary
+@python(module="backend.image_utils", fn="decode_and_resize")
+external fn preprocess(b64: String) -> Result<Tensor<Float32, [1, 3, 224, 224]>, DataError>
+
+// 2. Map the heavy inference boundary (e.g., PyTorch or ONNX Runtime)
+@python(module="backend.model_runner", fn="execute_resnet50")
+external fn run_model(input_tensor: Tensor<Float32, [1, 3, 224, 224]>) -> Result<Tensor<Float32, [1, 1000]>, ComputeError>
+
+// 3. Map the postprocessing boundary
+@python(module="backend.image_utils", fn="get_top_class")
+external fn postprocess(logits: Tensor<Float32, [1, 1000]>) -> Result<{label: String, conf: Float32}, DataError>
+
+// 4. Export the compiled pipeline to be called by the FastAPI server
+export fn serve_inference(req: RawRequest) -> Result<PredictionResult, PipelineError> {
+    // VAREK structurally guarantees the tensor shapes between these steps
+    let tensor = preprocess(req.image_b64)?;
+    let logits = run_model(tensor)?;
+    let top_class = postprocess(logits)?;
+
+    return Ok(PredictionResult {
+        request_id: req.request_id,
+        class_label: top_class.label,
+        confidence: top_class.conf
+    });
+}

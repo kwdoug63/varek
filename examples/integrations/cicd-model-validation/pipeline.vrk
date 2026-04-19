@@ -1,0 +1,47 @@
+// examples/integrations/cicd-model-validation/pipeline.vrk
+// VAREK orchestrating PR validation for a new model candidate.
+
+type DriftResult = {
+    feature_name: String,
+    p_value: Float32,
+    is_drifted: Boolean
+}
+
+type EvalResult = {
+    model_version: String,
+    f1_score: Float32,
+    p99_latency_ms: Float32
+}
+
+// Map the testing scripts as execution boundaries
+@python(module="tests.data_drift", fn="check_distribution")
+external fn detect_drift(reference_data: String, pr_data: String) -> Result<DriftResult, TestError>
+
+@python(module="tests.eval_metrics", fn="run_eval")
+external fn evaluate_model(model_path: String, test_data: String) -> Result<EvalResult, TestError>
+
+fn main() {
+    print("Starting VAREK CI/CD Validation Pipeline...");
+
+    // 1. Check for Data Drift
+    let drift = detect_drift("s3://prod-data/reference", "local://data/pr_sample").unwrap();
+    if drift.is_drifted {
+        // VAREK deterministically halts with a non-zero exit code, failing the GitHub Action
+        panic("CI Failed: Data drift detected in {drift.feature_name} (p={drift.p_value})");
+    }
+    print("✅ Data Drift Check: Passed");
+
+    // 2. Check Performance Regressions
+    let eval = evaluate_model("models/pr_candidate.onnx", "local://data/pr_sample").unwrap();
+    
+    // Strict compile-time validation on metric thresholds
+    if eval.f1_score < 0.92 {
+        panic("CI Failed: F1 Score degraded to {eval.f1_score} (Threshold: 0.92)");
+    }
+    if eval.p99_latency_ms > 150.0 {
+        panic("CI Failed: Latency regression. p99 latency is {eval.p99_latency_ms}ms (Max: 150ms)");
+    }
+    
+    print("✅ Model Evaluation Check: Passed");
+    print("CI Pipeline Complete. PR is safe to merge.");
+}

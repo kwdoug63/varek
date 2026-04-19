@@ -1,0 +1,42 @@
+// examples/integrations/secrets-management/pipeline.vrk
+// VAREK orchestrating secure credential injection at runtime.
+
+// 1. Define strict schemas for the required credentials
+secret type DbConfig = {
+    host: String,
+    port: Int32,
+    username: String,
+    password: SecureString // Compiler traps any attempt to log this field
+}
+
+secret type ApiCredentials = {
+    provider: String,
+    token: SecureString
+}
+
+// 2. Map the native integrations to Enterprise Secret Managers
+@aws_secrets_manager(region="us-east-1", secret_id="prod/db/clinical_main")
+external fn fetch_db_creds() -> Result<DbConfig, AuthError>
+
+@hashicorp_vault(path="secret/data/ml/openai-prod")
+external fn fetch_api_keys() -> Result<ApiCredentials, AuthError>
+
+// 3. Map the Python execution boundary
+@python(module="jobs.data_sync", fn="run_secure_sync")
+external fn execute_sync(db: DbConfig, api: ApiCredentials) -> Result<(), SyncError>
+
+fn main() {
+    print("Initializing pipeline. Fetching credentials securely into memory...");
+
+    // VAREK fetches secrets at execution time. They never rest on disk.
+    let db_creds = fetch_db_creds().unwrap();
+    let api_creds = fetch_api_keys().unwrap();
+
+    // The compiler guarantees the Python script gets the exact schema it expects.
+    // If Vault returns an integer token but ApiCredentials expects a SecureString, 
+    // the pipeline halts here, securely, before Python ever boots up.
+    match execute_sync(db_creds, api_creds) {
+        Ok(_) => print("Data sync completed securely."),
+        Err(e) => panic("Pipeline halted at execution boundary: {e}")
+    }
+}

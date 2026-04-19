@@ -1,0 +1,29 @@
+# examples/integrations/cicd-model-validation/.github/workflows/pr_validation.yml
+name: VAREK Model Validation
+
+on:
+  pull_request:
+    paths:
+      - 'models/**'
+      - 'data/**'
+
+jobs:
+  validate-model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          
+      - name: Install dependencies
+        run: |
+          pip install numpy scipy
+          # curl -fsSL https://varek-lang.org/install.sh | bash
+          
+      - name: Run VAREK Validation Pipeline
+        # VAREK handles the orchestration, types, and exit codes.
+        # If the pipeline.vrk script panics, this step fails and blocks the PR.
+        run: varek run pipeline.vrk

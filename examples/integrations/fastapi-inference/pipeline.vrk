@@ -1,0 +1,28 @@
+// examples/integrations/fastapi-inference/pipeline.vrk
+// VAREK safely wraps an external REST boundary
+
+type PatientData = {
+    patient_id: String,
+    feature_vector: Tensor<Float32, [3]> // Structural constraint on the tensor shape
+}
+
+type InferenceResult = {
+    patient_id: String,
+    risk_score: Float32
+}
+
+// Define the external execution boundary
+external fn call_fastapi(endpoint: String, payload: PatientData) -> Result<InferenceResult, NetworkError>
+
+fn main() {
+    let raw_data = PatientData {
+        patient_id: "PT-8921",
+        feature_vector: [1.2, 0.8, 3.1] 
+    };
+
+    // VAREK verifies type compliance at compile time before execution
+    match call_fastapi("http://localhost:8000/predict", raw_data) {
+        Ok(result) => print("Risk Score for {result.patient_id}: {result.risk_score}"),
+        Err(e) => panic("Pipeline halted at execution boundary: {e}")
+    }
+}

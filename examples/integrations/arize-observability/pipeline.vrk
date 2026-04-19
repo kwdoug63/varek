@@ -1,0 +1,42 @@
+// examples/integrations/arize-observability/pipeline.vrk
+// VAREK orchestrating type-safe inference and telemetry logging to Arize AI.
+
+// 1. Define the exact shape of the inference features and output
+type InferenceRecord = {
+    prediction_id: String,
+    feature_age: Float32,
+    feature_bmi: Float32,
+    feature_blood_pressure: Float32,
+    predicted_risk_score: Float32,
+    timestamp_ms: Int64
+}
+
+// 2. Map the execution boundaries
+@python(module="scripts.inference", fn="run_batch_inference")
+external fn execute_model(batch_uri: String) -> Result<Array<InferenceRecord>, ComputeError>
+
+// 3. Map the Arize logging boundary
+@python(module="scripts.arize_logger", fn="log_to_arize")
+external fn log_telemetry(records: Array<InferenceRecord>, model_id: String, environment: String) -> Result<(), NetworkError>
+
+fn main() {
+    let model_id = "clinical_risk_v2.1";
+    let environment = "production";
+
+    print("Running batch inference...");
+
+    // VAREK enforces the data contract between the model and the observability platform.
+    match execute_model("s3://clinical-data/live/batch_09.parquet") {
+        Ok(inference_results) => {
+            print("Generated {inference_results.length()} predictions. Sending telemetry to Arize AI...");
+            
+            // If the inference script accidentally output 'feature_age' as a String,
+            // VAREK traps it at the boundary BEFORE it pollutes the Arize workspace.
+            match log_telemetry(inference_results, model_id, environment) {
+                Ok(_) => print("Successfully logged strictly-typed telemetry to Arize."),
+                Err(e) => panic("Failed to log telemetry: {e}")
+            }
+        },
+        Err(e) => panic("Inference failed: {e}")
+    }
+}

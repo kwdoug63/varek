@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI pipelines are chaos. I built a language to fix that. — Kenneth Wayne Douglas, MD</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:       #0a0a0f;
+    --surface:  #111118;
+    --teal:     #00ffe0;
+    --purple:   #7c3aed;
+    --white:    #f0f0f8;
+    --muted:    #6b7280;
+    --border:   #1e1e2e;
+    --accent:   #00ffe0;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--bg);
+    color: var(--white);
+    font-family: 'Instrument Serif', Georgia, serif;
+    font-size: 20px;
+    line-height: 1.8;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── Progress bar ── */
+  #progress {
+    position: fixed;
+    top: 0; left: 0;
+    height: 2px;
+    width: 0%;
+    background: var(--teal);
+    z-index: 100;
+    transition: width 0.1s linear;
+  }
+
+  /* ── Nav ── */
+  nav {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    z-index: 50;
+    padding: 20px 40px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: rgba(10,10,15,0.85);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+
+  .nav-logo {
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    font-size: 18px;
+    letter-spacing: 0.05em;
+  }
+  .nav-logo span:first-child { color: var(--teal); }
+  .nav-logo span:last-child  { color: #fff; }
+
+  .nav-link {
+    font-family: 'Syne', sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    text-decoration: none;
+    border: 1px solid var(--border);
+    padding: 8px 20px;
+    border-radius: 4px;
+    transition: all 0.2s;
+  }
+  .nav-link:hover { color: var(--teal); border-color: var(--teal); }
+
+  /* ── Hero ── */
+  .hero {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 120px 40px 80px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .hero::before {
+    content: '';
+    position: absolute;
+    top: -200px; left: 50%;
+    transform: translateX(-50%);
+    width: 800px; height: 800px;
+    background: radial-gradient(circle, rgba(0,255,224,0.04) 0%, transparent 70%);
+    pointer-events: none;
+  }
+
+  .hero-inner {
+    max-width: 860px;
+    width: 100%;
+    text-align: center;
+  }
+
+  .hero-kicker {
+    font-family: 'DM Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--teal);
+    margin-bottom: 32px;
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .hero-kicker::before,
+  .hero-kicker::after {
+    content: '';
+    display: block;
+    width: 32px; height: 1px;
+    background: var(--teal);
+    opacity: 0.4;
+  }
+
+  .hero-title {
+    font-family: 'Instrument Serif', serif;
+    font-size: clamp(44px, 7vw, 80px);
+    line-height: 1.08;
+    font-weight: 400;
+    color: #fff;
+    margin-bottom: 32px;
+    letter-spacing: -0.02em;
+  }
+
+  .hero-title em {
+    font-style: italic;
+    color: var(--teal);
+  }
+
+  .hero-byline {
+    font-family: 'Syne', sans-serif;
+    font-size: 14px;
+    font-weight: 400;
+    color: var(--muted);
+    letter-spacing: 0.06em;
+    margin-bottom: 64px;
+  }
+  .hero-byline strong { color: rgba(240,240,248,0.7); font-weight: 600; }
+
+  .hero-scroll {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    animation: bounce 2s ease-in-out infinite;
+  }
+  .hero-scroll svg { opacity: 0.4; }
+
+  @keyframes bounce {
+    0%, 100% { transform: translateY(0); }
+    50%       { transform: translateY(6px); }
+  }
+
+  /* ── Article ── */
+  article {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 0 40px 120px;
+  }
+
+  /* Pull quote opener */
+  .opener {
+    font-size: clamp(22px, 3vw, 28px);
+    line-height: 1.6;
+    color: rgba(240,240,248,0.9);
+    border-left: 3px solid var(--teal);
+    padding-left: 28px;
+    margin-bottom: 56px;
+    font-style: italic;
+  }
+
+  h2 {
+    font-family: 'Syne', sans-serif;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--teal);
+    margin: 72px 0 24px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  h2::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  p {
+    color: rgba(240,240,248,0.82);
+    margin-bottom: 28px;
+    font-size: 20px;
+    line-height: 1.82;
+  }
+
+  strong { color: #fff; font-weight: 600; }
+  em     { color: rgba(240,240,248,0.9); }
+
+  /* Code block */
+  .code-block {
+    background: #0d0d16;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--purple);
+    border-radius: 6px;
+    padding: 28px 32px;
+    margin: 40px 0;
+    overflow-x: auto;
+  }
+
+  .code-block pre {
+    font-family: 'DM Mono', monospace;
+    font-size: 14px;
+    line-height: 1.75;
+    color: #a5b4fc;
+    white-space: pre;
+  }
+
+  .code-label {
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--purple);
+    margin-bottom: 12px;
+    opacity: 0.7;
+  }
+
+  /* Comparison blocks */
+  .compare {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin: 40px 0;
+  }
+
+  @media (max-width: 640px) { .compare { grid-template-columns: 1fr; } }
+
+  .compare-block {
+    background: #0d0d16;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 24px;
+  }
+  .compare-block.bad  { border-top: 3px solid #ef4444; }
+  .compare-block.good { border-top: 3px solid var(--teal); }
+
+  .compare-label {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    margin-bottom: 14px;
+    font-weight: 500;
+  }
+  .bad  .compare-label { color: #ef4444; }
+  .good .compare-label { color: var(--teal); }
+
+  .compare-block pre {
+    font-family: 'DM Mono', monospace;
+    font-size: 13px;
+    line-height: 1.65;
+    color: #94a3b8;
+    white-space: pre-wrap;
+  }
+
+  /* Stat callout */
+  .stats-row {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+    margin: 48px 0;
+  }
+
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 28px 24px;
+    text-align: center;
+  }
+
+  .stat-num {
+    font-family: 'Syne', sans-serif;
+    font-size: 36px;
+    font-weight: 800;
+    color: var(--teal);
+    display: block;
+    line-height: 1;
+    margin-bottom: 8px;
+  }
+
+  .stat-label {
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  /* Pull quote */
+  .pull-quote {
+    font-family: 'Instrument Serif', serif;
+    font-size: clamp(22px, 3vw, 30px);
+    line-height: 1.5;
+    font-style: italic;
+    color: #fff;
+    text-align: center;
+    padding: 56px 0;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    margin: 64px 0;
+    position: relative;
+  }
+
+  .pull-quote::before {
+    content: '\201C';
+    font-size: 120px;
+    color: var(--teal);
+    opacity: 0.12;
+    position: absolute;
+    top: -20px; left: -10px;
+    line-height: 1;
+    font-style: normal;
+  }
+
+  /* CTA */
+  .cta-block {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-top: 3px solid var(--teal);
+    border-radius: 8px;
+    padding: 48px;
+    text-align: center;
+    margin: 72px 0 0;
+  }
+
+  .cta-block h3 {
+    font-family: 'Syne', sans-serif;
+    font-size: 22px;
+    font-weight: 700;
+    color: #fff;
+    margin-bottom: 16px;
+  }
+
+  .cta-block p {
+    font-family: 'Syne', sans-serif;
+    font-size: 15px;
+    color: var(--muted);
+    margin-bottom: 32px;
+    line-height: 1.7;
+  }
+
+  .cta-buttons {
+    display: flex;
+    gap: 16px;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+
+  .btn-primary {
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    background: var(--teal);
+    color: #0a0a0f;
+    text-decoration: none;
+    padding: 14px 32px;
+    border-radius: 4px;
+    transition: all 0.2s;
+  }
+  .btn-primary:hover { background: #fff; transform: translateY(-2px); }
+
+  .btn-secondary {
+    font-family: 'Syne', sans-serif;
+    font-weight: 600;
+    font-size: 14px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    text-decoration: none;
+    padding: 14px 32px;
+    border-radius: 4px;
+    transition: all 0.2s;
+  }
+  .btn-secondary:hover { border-color: var(--teal); color: var(--teal); }
+
+  /* Author card */
+  .author-card {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    padding: 32px 0;
+    border-top: 1px solid var(--border);
+    margin-top: 80px;
+  }
+
+  .author-avatar {
+    width: 56px; height: 56px;
+    border-radius: 50%;
+    background: var(--surface);
+    border: 2px solid var(--teal);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Syne', sans-serif;
+    font-size: 18px;
+    font-weight: 800;
+    color: var(--teal);
+    flex-shrink: 0;
+  }
+
+  .author-name {
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 16px;
+    color: #fff;
+    margin-bottom: 4px;
+  }
+
+  .author-bio {
+    font-family: 'DM Mono', monospace;
+    font-size: 12px;
+    color: var(--muted);
+    letter-spacing: 0.05em;
+  }
+
+  /* fade-in on scroll */
+  .fade-in {
+    opacity: 0;
+    transform: translateY(20px);
+    transition: opacity 0.6s ease, transform 0.6s ease;
+  }
+  .fade-in.visible {
+    opacity: 1;
+    transform: translateY(0);
+  }
+</style>
+</head>
+<body>
+
+<div id="progress"></div>
+
+<nav>
+  <div class="nav-logo">
+    <span>VAR</span><span>EK</span>
+  </div>
+  <a href="https://varek-lang.org" class="nav-link" target="_blank">varek-lang.org ↗</a>
+</nav>
+
+<!-- ── HERO ── -->
+<section class="hero">
+  <div class="hero-inner">
+    <div class="hero-kicker">Kenneth Wayne Douglas, MD</div>
+    <h1 class="hero-title">
+      AI pipelines are <em>chaos.</em><br>
+      I built a language to fix that.
+    </h1>
+    <p class="hero-byline">
+      <strong>April 2026</strong> &nbsp;·&nbsp; 8 min read &nbsp;·&nbsp;
+      Language Design &nbsp;·&nbsp; AI/ML Engineering
+    </p>
+    <div class="hero-scroll">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+        <path d="M8 3v10M3 9l5 5 5-5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      scroll
+    </div>
+  </div>
+</section>
+
+<!-- ── ARTICLE ── -->
+<article>
+
+  <p class="opener fade-in">
+    Every production ML pipeline I built required four separate tools that were
+    never designed to talk to each other. That's not a workflow problem.
+    It's an architectural failure — and it's industry-wide.
+  </p>
+
+  <h2 class="fade-in">The problem nobody talks about</h2>
+
+  <p class="fade-in">
+    Ask any ML engineer what their pipeline looks like in production and you'll
+    get some version of the same answer: <strong>Python</strong> for the logic,
+    <strong>YAML</strong> for configuration, <strong>JSON Schema</strong> for
+    data validation, and <strong>Bash</strong> to stitch the stages together.
+    Four languages. Four independent failure surfaces. Zero type checking at
+    the boundaries between them.
+  </p>
+
+  <p class="fade-in">
+    I built clinical AI pipelines for years. Imaging analysis, EHR processing,
+    multi-modal inference systems. Every one of them was some variation of this
+    same fragmented stack. And every one of them failed in the same ways.
+  </p>
+
+  <p class="fade-in">
+    A Python dict that didn't match the schema expected by the next stage —
+    caught at runtime, 45 minutes into a compute job. A YAML config value
+    parsed as a string when the pipeline expected an integer — no error until
+    the model call failed. A schema change in step three that silently broke
+    step seven because nothing verified compatibility at definition time.
+  </p>
+
+  <p class="fade-in">
+    These aren't edge cases. They're the operating conditions of production AI.
+  </p>
+
+  <div class="pull-quote fade-in">
+    In medicine, we don't tolerate ambiguity at system boundaries. A medication
+    order has a drug, a dose, a route, and a frequency — all typed, all validated
+    before anything executes.
+  </div>
+
+  <p class="fade-in">
+    AI pipelines have no such structure. The cost of that is compounding as
+    these systems move into hospitals, financial institutions, and critical
+    infrastructure. I decided to do something about it.
+  </p>
+
+  <h2 class="fade-in">What I built</h2>
+
+  <p class="fade-in">
+    <strong>VAREK</strong> is an open source AI Pipeline Programming Language.
+    Statically typed, compiled to native machine code via LLVM, with pipeline
+    declarations as a first-class language feature. It replaces the entire
+    Python + YAML + JSON Schema + Bash stack with one language where pipelines
+    are not an afterthought — they're the primary design target.
+  </p>
+
+  <p class="fade-in">
+    Here's what the same image classification pipeline looks like in the
+    current fragmented stack versus VAREK:
+  </p>
+
+  <div class="compare fade-in">
+    <div class="compare-block bad">
+      <div class="compare-label">❌ Current stack — 4 files</div>
+      <pre>
+# input_schema.json (JSON Schema)
+# config.yaml (YAML)
+# pipeline.py (Python)
+# run.sh (Bash)
+
+→ 4 languages
+→ Type info lost at every boundary
+→ Runtime errors only
+→ No step compatibility checks
+      </pre>
+    </div>
+    <div class="compare-block good">
+      <div class="compare-label">✓ VAREK — 1 file</div>
+      <pre>
+schema ImageInput {
+  path:  str,
+  label: str?,
+  width: int
+}
+
+pipeline classify {
+  source: ImageInput[]
+  steps: [
+    preprocess
+    -> normalize
+    -> infer
+    -> postprocess
+  ]
+  output: ClassResult[]
+}</pre>
+    </div>
+  </div>
+
+  <p class="fade-in">
+    The VAREK type checker verifies at compile time that the output type of
+    <code style="font-family:'DM Mono',monospace;font-size:16px;color:#a5b4fc">preprocess</code>
+    matches the input type of
+    <code style="font-family:'DM Mono',monospace;font-size:16px;color:#a5b4fc">normalize</code>,
+    and so on through the entire pipeline. You cannot write a type mismatch
+    that reaches production. The compiler won't allow it.
+  </p>
+
+  <h2 class="fade-in">You don't have to rebuild anything</h2>
+
+  <p class="fade-in">
+    The first question every engineer asks: what about my existing Python stack?
+    The answer is: it works. All of it.
+  </p>
+
+  <div class="code-block fade-in">
+    <div class="code-label">VAREK — Python interop</div>
+    <pre>import python::numpy as np
+import python::torch
+import python::transformers::AutoModel
+import python::pandas as pd</pre>
+  </div>
+
+  <p class="fade-in">
+    Any Python library imports natively. Your existing models, datasets,
+    and utilities work without modification. VAREK replaces the glue between
+    the parts — not the parts themselves. The adoption path is incremental:
+    write one pipeline in VAREK, see the type safety working, expand from there.
+    You are never required to abandon your existing stack.
+  </p>
+
+  <p class="fade-in">
+    Same answer for YAML, JSON Schema, and Bash. VAREK reads YAML files
+    directly through <code style="font-family:'DM Mono',monospace;font-size:16px;color:#a5b4fc">var::io</code>.
+    Schema declarations replace Pydantic and JSON Schema with compile-time
+    enforcement. Pipeline orchestration replaces Bash with typed, auditable
+    step sequencing. Migrate one piece at a time. No deadline.
+  </p>
+
+  <h2 class="fade-in">What shipped</h2>
+
+  <div class="stats-row fade-in">
+    <div class="stat-card">
+      <span class="stat-num">659</span>
+      <span class="stat-label">Tests passing</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-num">261</span>
+      <span class="stat-label">Stdlib functions</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-num">10–40×</span>
+      <span class="stat-label">Faster than Python</span>
+    </div>
+  </div>
+
+  <p class="fade-in">
+    VAREK v1.0 ships with a full standard library across seven modules:
+    <strong>var::io</strong>, <strong>var::tensor</strong> (NumPy-backed),
+    <strong>var::http</strong>, <strong>var::async</strong>,
+    <strong>var::pipeline</strong>, <strong>var::model</strong>, and
+    <strong>var::data</strong>. A package manager with 20 commands.
+    An interactive REPL. A source formatter. A documentation generator.
+    And a formal RFC governance process for community language proposals.
+  </p>
+
+  <p class="fade-in">
+    The 10–40x speed figure comes from native LLVM compilation benchmarks
+    against equivalent CPython implementations on compute-heavy pipeline
+    workloads. Interpreted mode — which runs without LLVM compilation —
+    is comparable to Python and available for prototyping and development.
+    Production pipelines run compiled.
+  </p>
+
+  <h2 class="fade-in">Why a language and not a library</h2>
+
+  <p class="fade-in">
+    This is the question I get most often, and it's the right one to ask.
+  </p>
+
+  <p class="fade-in">
+    Libraries add APIs. Languages change what's expressible. You cannot add
+    compile-time pipeline type checking as a Python library — it requires a
+    type system that understands pipeline semantics at the grammar level. You
+    cannot enforce that the output type of step A matches the input type of
+    step B in a Python decorator. You can only check it at runtime, after the
+    pipeline has already started running.
+  </p>
+
+  <p class="fade-in">
+    VAREK catches these errors when you write the code. Not when you run it.
+    Not when you deploy it. Not 45 minutes into a compute job. When you write
+    it. That requires a language, not a library.
+  </p>
+
+  <p class="fade-in">
+    Python remains part of the stack. VAREK replaces the glue, not the ecosystem.
+  </p>
+
+  <h2 class="fade-in">The medical origin</h2>
+
+  <p class="fade-in">
+    I'm a physician. I trained at USC Keck School of Medicine. I understand,
+    at a clinical level, what happens when a system fails silently at a
+    critical boundary. I've seen it in medical software. I've seen it in every
+    production AI pipeline I've worked on since.
+  </p>
+
+  <p class="fade-in">
+    The design philosophy of VAREK came directly from medicine. In a hospital,
+    a medication order has a drug, a dose, a route, and a frequency. The
+    structure enforces correctness at the point of entry. You cannot submit
+    a medication order with a missing field or a wrong type. The system won't
+    allow it.
+  </p>
+
+  <p class="fade-in">
+    AI pipelines have no such enforcement. The stakes are rising fast as these
+    systems move into clinical, financial, and infrastructure settings.
+    VAREK is my attempt to give AI pipelines the same structural guarantees
+    that medical systems take for granted.
+  </p>
+
+  <h2 class="fade-in">What I need from you</h2>
+
+  <p class="fade-in">
+    VAREK is open source under the MIT license. The repo is live, the
+    releases are tagged, the spec paper is published. The language is real
+    and it works.
+  </p>
+
+  <p class="fade-in">
+    What I need is engineers who build AI pipelines in production — people
+    who live with the Python + YAML + JSON + Bash fragmentation every day —
+    to try it, break it, and tell me what's missing. File an issue. Open
+    an RFC. Propose a change to the standard library. That's how languages
+    improve.
+  </p>
+
+  <p class="fade-in">
+    The first RFC from the community gets a personal response from me
+    within the same day. I mean that.
+  </p>
+
+  <div class="cta-block fade-in">
+    <h3>Try VAREK</h3>
+    <p>
+      MIT license · v1.0 stable · 659 tests passing<br>
+      Python interop · LLVM compilation · Full standard library
+    </p>
+    <div class="cta-buttons">
+      <a href="https://varek-lang.org" class="btn-primary" target="_blank">varek-lang.org</a>
+      <a href="https://github.com/kwdoug63/varek" class="btn-secondary" target="_blank">View on GitHub</a>
+    </div>
+  </div>
+
+  <div class="author-card fade-in">
+    <div class="author-avatar">KD</div>
+    <div>
+      <div class="author-name">Kenneth Wayne Douglas, MD</div>
+      <div class="author-bio">
+        Founder & CEO, Sober Agentic Infrastructure &nbsp;·&nbsp;
+        Creator of VAREK &nbsp;·&nbsp;
+        kenneth.douglas@soberagents.ai
+      </div>
+    </div>
+  </div>
+
+</article>
+
+<script>
+  // Progress bar
+  window.addEventListener('scroll', () => {
+    const doc = document.documentElement;
+    const pct = (doc.scrollTop / (doc.scrollHeight - doc.clientHeight)) * 100;
+    document.getElementById('progress').style.width = pct + '%';
+  });
+
+  // Fade-in on scroll
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        e.target.classList.add('visible');
+        observer.unobserve(e.target);
+      }
+    });
+  }, { threshold: 0.1 });
+
+  document.querySelectorAll('.fade-in').forEach(el => observer.observe(el));
+</script>
+</body>
+</html>

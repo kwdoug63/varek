@@ -1,0 +1,55 @@
+// examples/integrations/fast-streaming-anomaly-detection/pipeline.vrk
+// VAREK high-throughput stream processing, bypassing the Python GIL.
+
+// 1. Define the exact binary structure of the incoming Kafka payload
+type SensorReading = {
+    sensor_id: String,
+    temperature_c: Float32,
+    vibration_hz: Float32,
+    timestamp_ms: Int64
+}
+
+// 2. Define the exact structure of the outgoing alert
+type AnomalyAlert = {
+    sensor_id: String,
+    severity: String,
+    trigger_temp: Float32,
+    timestamp_ms: Int64
+}
+
+// 3. Map the native Kafka I/O boundaries
+@kafka(topic="iot-raw-sensors", role="consumer", group="varek-fast-eval")
+external fn stream_sensors() -> Stream<SensorReading>
+
+@kafka(topic="iot-critical-alerts", role="producer")
+external fn publish_alerts(alerts: Stream<AnomalyAlert>) -> Result<(), StreamError>
+
+// 4. Native LLVM-compiled compute logic (Microsecond latency)
+fn detect_anomaly(reading: SensorReading) -> Option<AnomalyAlert> {
+    // This executes natively. No Python interpreter, no garbage collection pauses.
+    if reading.temperature_c > 105.0 && reading.vibration_hz > 80.0 {
+        return Some(AnomalyAlert {
+            sensor_id: reading.sensor_id,
+            severity: "CRITICAL",
+            trigger_temp: reading.temperature_c,
+            timestamp_ms: reading.timestamp_ms
+        });
+    }
+    return None;
+}
+
+fn main() {
+    print("Initializing native VAREK stream processor (LLVM Backend)...");
+
+    // Pull the raw stream
+    let incoming_stream = stream_sensors();
+
+    // Apply the native filter mapping
+    let alert_stream = incoming_stream.filter_map(detect_anomaly);
+
+    // Push back to Kafka
+    match publish_alerts(alert_stream) {
+        Ok(_) => print("Stream processor active and listening."),
+        Err(e) => panic("Fatal Kafka connection error: {e}")
+    }
+}

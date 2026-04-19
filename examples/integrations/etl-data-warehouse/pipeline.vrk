@@ -1,0 +1,47 @@
+// examples/integrations/etl-data-warehouse/pipeline.vrk
+// VAREK orchestrating a strictly typed ETL job into Snowflake.
+
+// 1. Define the exact shape of the raw data from Postgres
+type RawRecord = {
+    patient_id: String,
+    age: Int32,
+    bp_systolic: Int32,
+    bp_diastolic: Int32
+}
+
+// 2. Define the exact shape of the engineered features going to the Data Warehouse
+type FeatureRow = {
+    patient_id: String,
+    age_normalized: Float32,
+    hypertension_risk: Float32
+}
+
+// 3. Map the execution boundaries (replacing Airflow PythonOperators)
+@python(module="jobs.extract", fn="pull_from_postgres")
+external fn extract_data(query: String) -> Result<Array<RawRecord>, ExtractError>
+
+@python(module="jobs.transform", fn="engineer_features")
+external fn transform_data(raw_data: Array<RawRecord>) -> Result<Array<FeatureRow>, TransformError>
+
+@python(module="jobs.load", fn="write_to_snowflake")
+external fn load_data(features: Array<FeatureRow>, table: String) -> Result<(), LoadError>
+
+fn main() {
+    let query = "SELECT patient_id, age, bp_systolic, bp_diastolic FROM clinical_vitals WHERE date >= '2026-04-01'";
+
+    // VAREK enforces the data contracts at compile time. 
+    // If 'transform_data' expects an Int32 but Postgres returns a Float32, the pipeline refuses to compile.
+    match extract_data(query) {
+        Ok(raw_data) => {
+            print("Extracted {raw_data.length()} records. Transforming...");
+            
+            let features = transform_data(raw_data).unwrap();
+            
+            match load_data(features, "PROD_DB.ML_FEATURES.HYPERTENSION_V1") {
+                Ok(_) => print("ETL Job Complete: Data successfully loaded to Snowflake."),
+                Err(e) => panic("Failed to load to data warehouse: {e}")
+            }
+        },
+        Err(e) => panic("Extraction failed: {e}")
+    }
+}

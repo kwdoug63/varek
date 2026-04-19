@@ -1,0 +1,42 @@
+// examples/integrations/data-lineage-marquez/pipeline.vrk
+// VAREK orchestrating a strictly typed, fully traceable pipeline for HIPAA compliance.
+
+// 1. Define the exact shape of the raw Protected Health Information (PHI)
+type RawEHR = {
+    patient_id: String,
+    ssn: String,
+    diagnosis_code: String,
+    lab_value: Float32
+}
+
+// 2. Define the exact shape of the de-identified data safe for ML training
+type SafeFeatures = {
+    patient_hash: String,
+    diagnosis_code: String,
+    lab_value: Float32
+}
+
+// 3. Map the execution boundary and attach the Lineage Macro.
+// VAREK automatically emits OpenLineage JSON to Marquez/Atlas upon execution.
+@openlineage(namespace="clinical-ml-prod", dataset_in="s3://raw-ehr", dataset_out="snowflake://safe-features")
+@python(module="src.anonymize", fn="mask_phi")
+external fn anonymize_records(raw_data: Array<RawEHR>) -> Result<Array<SafeFeatures>, ComputeError>
+
+fn main() {
+    print("Initializing compliant VAREK pipeline...");
+    
+    // Simulated data fetch
+    let raw_batch = [
+        RawEHR { patient_id: "PT-001", ssn: "000-11-2222", diagnosis_code: "I10", lab_value: 4.2 }
+    ];
+
+    // When this function is called, VAREK natively tracks the START and COMPLETE events,
+    // logging the exact schema types, timestamps, and input/output URIs to the metadata store.
+    match anonymize_records(raw_batch) {
+        Ok(features) => {
+            print("Data successfully anonymized. OpenLineage graph updated.");
+            // Proceed to ML training...
+        },
+        Err(e) => panic("Pipeline halted. Emitting FAILURE event to Lineage Store: {e}")
+    }
+}
