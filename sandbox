@@ -1,6 +1,6 @@
 """
 =============================================================================
-VAREK: SANDBOX (v1.1)
+VAREK — sandbox (v1.1)
 Pluggable IsolationBackend interface + seccomp-bpf reference implementation.
 
 Containment boundary: the Linux kernel.
