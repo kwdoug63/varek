@@ -1,219 +1,425 @@
 """
 =============================================================================
-VAREK: CORE WARDEN (v1.1)
-Architecture: OS-level isolation via pluggable IsolationBackend.
-              PEP 578 audit hook demoted to telemetry-only.
-Purpose: Containment of untrusted code execution in agentic LLM workflows.
-         The kernel is the enforcement boundary; the interpreter is not.
+VAREK REGRESSION TESTS — llamastack/llama-stack-apps#223
+=============================================================================
 
------------------------------------------------------------------------------
-v1.1 CHANGES (closes llamastack/llama-stack-apps#223):
+These tests encode the load-bearing invariants of the v1.1 isolation layer.
+If any test in this file fails, a security regression has been introduced
+and v1.1's containment guarantees no longer hold.
 
-The v1.0 design used a PEP 578 audit hook to deny subprocess.Popen / os.exec*
-events matching a string denylist. External review demonstrated two flaws:
+The issue #223 PoC (by @dengluozhang) showed that v1.0's PEP 578 audit
+hook could not observe subprocess-spawned children and that the v1.0
+string denylist was bypassable. v1.1 moved enforcement to seccomp-bpf +
+cgroups v2 + namespaces. These tests verify the new enforcement is real,
+not theoretical.
 
-  1. sys.addaudithook installs the hook in the current interpreter only.
-     A child process spawned by subprocess.run executes in a separate
-     interpreter (or a non-Python binary) that never inherits the hook.
-     The parent-side hook cannot observe the child's syscalls. The issue
-     #223 PoC exploits this directly.
+Environment requirements (tests skip if unmet):
+  - Linux with cgroups v2 mounted
+  - libseccomp python binding installed (`pyseccomp` or `python3-libseccomp`)
+  - Unprivileged user namespaces enabled
+  - /sys/fs/cgroup/varek.slice writable by the test user
+    (systemd: Delegate=yes on the running unit, or pre-created cgroup)
 
-  2. Substring matching on command args ("nc -e", "hostile-c2.net") is
-     trivially bypassed via /bin/nc, base64, renamed binaries, or any
-     tooling the author hadn't enumerated.
-
-v1.1 response:
-
-  - Enforcement moves out of the audit hook and into sandbox.IsolationBackend
-    (see sandbox.py). The reference backend uses seccomp-bpf + cgroups v2 +
-    user/mount/net/ipc/uts/pid namespaces, installed via PR_SET_NO_NEW_PRIVS
-    before the interpreter's execve. The filter is inherited across fork
-    and cannot be dropped — subprocess escapes are structurally prevented.
-
-  - The denylist is replaced by a binary allowlist (enforced at the parent
-    before execve) and a syscall allowlist + killlist (enforced by the
-    kernel).
-
-  - The PEP 578 audit hook is retained but demoted to telemetry. It emits
-    structured records to subscribers; it never raises. Security no longer
-    depends on it firing.
-
-  - enforce_strict_mode() is retained for v1.0 API compatibility but its
-    semantics have changed: it now arms telemetry only. Untrusted code
-    MUST be executed via execute_untrusted() with a configured backend.
-    Callers who don't configure a backend get IsolationError (fail-closed).
-
-  - KineticIntercept is retained as a deprecated symbol for v1.0 imports.
-    It is no longer raised by the hook. Enforcement failures surface as
-    IsolationError from sandbox.
+Run: pytest tests/security/test_issue_223_regression.py -v
 =============================================================================
 """
 
 from __future__ import annotations
 
-import json
-import logging
+import os
 import sys
-import threading
-import time
-from typing import Callable, Optional
+import tempfile
+import uuid
+
+import pytest
 
 from sandbox import (
-    IsolationBackend,
     SeccompBpfBackend,
     ExecutionPayload,
     ExecutionPolicy,
-    ExecutionOutcome,
+    ResourceLimits,
     IsolationError,
     default_python_policy,
 )
+import varek_warden
+from varek_warden import (
+    configure_backend,
+    execute_untrusted,
+    subscribe_telemetry,
+    enforce_strict_mode,
+)
 
-logging.basicConfig(level=logging.INFO, format="[VAREK] %(message)s")
-_log = logging.getLogger("varek.warden")
+
+# -----------------------------------------------------------------------------
+# Module-level skip: if the backend cannot run on this host, skip everything.
+# -----------------------------------------------------------------------------
+
+_probe = SeccompBpfBackend()
+_unavailable = _probe.is_available()
+if _unavailable is not None:
+    pytest.skip(
+        f"SeccompBpfBackend unavailable on this host: {_unavailable}",
+        allow_module_level=True,
+    )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _configure_backend_once():
+    configure_backend(SeccompBpfBackend())
+
+
+def _canary_path(tag: str) -> str:
+    """A path outside the sandbox that must never be written to. Using
+    a UUID so repeated runs don't collide, and mktemp-free because we
+    want the path NOT to exist."""
+    return os.path.join(
+        tempfile.gettempdir(), f"varek-canary-{tag}-{uuid.uuid4().hex}"
+    )
 
 
 # =============================================================================
-# Backward-compatible symbol (deprecated in v1.1)
+# The issue #223 PoC family: subprocess escape must not execute the child.
+# =============================================================================
+#
+# v1.0 behavior (broken):
+#   - PEP 578 audit hook observes subprocess.Popen event in the parent
+#   - Hook string-matches against "nc -e", "nmap", etc.
+#   - Matches → raise → process killed
+#   - Bypass: use /bin/nc instead of nc, or base64-encode, or rename binary
+#   - Bypass: the hook doesn't observe inside the child; any binary-level
+#     payload runs unobserved once subprocess.run starts its child
+#
+# v1.1 behavior (required):
+#   - No string matching; no denylist
+#   - Seccomp filter loaded inside the interpreter denies execve
+#   - Any attempt to spawn a new binary fails with EPERM
+#   - Attacker's choice of name / encoding / alias is irrelevant because
+#     the kernel rejects the syscall itself
+# -----------------------------------------------------------------------------
+
+def test_issue_223_subprocess_run_cannot_exec_child():
+    """
+    The original PoC shape: untrusted code calls subprocess.run to launch
+    a binary. In v1.0 the child executed before the audit hook could do
+    anything about it. In v1.1, execve is denied and the binary never runs.
+
+    The invariant under test: after running the hostile payload, the
+    canary file must not exist on the host filesystem.
+    """
+    canary = _canary_path("subprocess")
+    assert not os.path.exists(canary)
+
+    payload = f"""
+import subprocess
+# Absolute path — v1.0 denylist miss. Irrelevant in v1.1 (execve denied).
+try:
+    subprocess.run(['/bin/touch', {canary!r}], check=False)
+except Exception:
+    pass
+# Shell-mediated exec — another v1.0 denylist miss. Also denied in v1.1.
+try:
+    subprocess.run(['/bin/sh', '-c', 'echo pwn > {canary}'], check=False)
+except Exception:
+    pass
+"""
+    execute_untrusted(
+        ExecutionPayload(interpreter_path=sys.executable, code=payload)
+    )
+
+    assert not os.path.exists(canary), (
+        "SANDBOX ESCAPE: canary file was written despite seccomp filter. "
+        "This is the exact v1.0 regression that v1.1 was designed to fix."
+    )
+
+
+def test_issue_223_base64_encoded_payload_also_blocked():
+    """v1.0 was bypassable by base64-encoding the command string. v1.1
+    does not inspect strings at all — execve is denied unconditionally."""
+    canary = _canary_path("b64")
+    assert not os.path.exists(canary)
+
+    payload = f"""
+import base64, subprocess
+decoded = base64.b64decode(b'dG91Y2g=').decode()  # 'touch'
+try:
+    subprocess.run(['/bin/' + decoded, {canary!r}], check=False)
+except Exception:
+    pass
+"""
+    execute_untrusted(
+        ExecutionPayload(interpreter_path=sys.executable, code=payload)
+    )
+    assert not os.path.exists(canary)
+
+
+def test_issue_223_renamed_binary_also_blocked():
+    """v1.0 was bypassable by copying a binary to a name not on the
+    denylist. v1.1 denies ALL execve in the sandbox; renaming is moot."""
+    canary = _canary_path("rename")
+    assert not os.path.exists(canary)
+
+    payload = f"""
+import subprocess, shutil
+try:
+    shutil.copy('/bin/touch', '/tmp/varek-evade-{uuid.uuid4().hex}')
+except Exception:
+    pass
+try:
+    subprocess.run(['/tmp/varek-evade', {canary!r}], check=False)
+except Exception:
+    pass
+"""
+    execute_untrusted(
+        ExecutionPayload(interpreter_path=sys.executable, code=payload)
+    )
+    assert not os.path.exists(canary)
+
+
+def test_issue_223_os_exec_family_also_blocked():
+    """The v1.0 denylist covered os.exec* events. v1.1 denies the execve
+    syscall, which is what os.exec* calls under the hood."""
+    canary = _canary_path("osexec")
+    assert not os.path.exists(canary)
+
+    payload = f"""
+import os, sys
+# os.execv would replace this process with /bin/touch if allowed.
+# It's not, so execve returns EPERM and os.execv raises OSError.
+try:
+    os.execv('/bin/touch', ['/bin/touch', {canary!r}])
+except OSError:
+    sys.exit(0)
+"""
+    execute_untrusted(
+        ExecutionPayload(interpreter_path=sys.executable, code=payload)
+    )
+    assert not os.path.exists(canary)
+
+
+# =============================================================================
+# Network isolation
 # =============================================================================
 
-class KineticIntercept(Exception):
-    """
-    DEPRECATED in v1.1. Retained so v1.0 imports don't break.
-
-    The v1.0 semantics (raise from inside the audit hook to terminate the
-    thread) were unsound because the hook doesn't cross the subprocess
-    boundary. Enforcement failures now surface as sandbox.IsolationError.
-    """
+def test_network_is_denied_by_default():
+    """Default policy sets allow_network=False. Both the empty netns and
+    the seccomp filter (which doesn't allowlist socket syscalls) should
+    prevent any outbound network activity."""
+    payload = """
+import socket, sys
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(1.0)
+    s.connect(('1.1.1.1', 53))
+    print('NETWORK_REACHED')
+    sys.exit(0)
+except OSError:
+    sys.exit(42)
+"""
+    outcome = execute_untrusted(
+        ExecutionPayload(interpreter_path=sys.executable, code=payload)
+    )
+    assert outcome.exit_code == 42, (
+        f"Network was not denied. "
+        f"exit={outcome.exit_code}, stdout={outcome.stdout!r}"
+    )
+    assert b"NETWORK_REACHED" not in outcome.stdout
 
 
 # =============================================================================
-# Telemetry (PEP 578 audit hook — demoted, advisory only)
+# Syscall killlist: high-risk syscalls trigger SIGSYS
 # =============================================================================
 
-_telemetry_subscribers: "list[Callable[[dict], None]]" = []
-_telemetry_lock = threading.Lock()
+def test_ptrace_triggers_seccomp_kill():
+    """ptrace is on the killlist. Any invocation must result in SIGSYS (31)
+    and a 'seccomp_killlist_triggered' violation on the outcome."""
+    payload = """
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+libc.ptrace(0, 0, 0, 0)   # PTRACE_TRACEME — hits the killlist
+"""
+    outcome = execute_untrusted(
+        ExecutionPayload(interpreter_path=sys.executable, code=payload)
+    )
+    assert outcome.killed_by_signal == 31, (
+        f"Expected SIGSYS (31), got signal={outcome.killed_by_signal}, "
+        f"exit={outcome.exit_code}, stderr={outcome.stderr!r}"
+    )
+    assert outcome.violation == "seccomp_killlist_triggered"
 
 
-def _telemetry_hook(event: str, args: tuple) -> None:
-    """
-    PEP 578 audit hook. TELEMETRY ONLY — never raises, never denies.
+def test_bpf_syscall_triggers_seccomp_kill():
+    """bpf(2) is on the killlist. eBPF program loading is a direct path to
+    kernel-level escalation and must be killed on sight."""
+    payload = """
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+# syscall number 321 is bpf on x86_64. Any invocation kills the process.
+SYS_BPF = 321
+libc.syscall(SYS_BPF, 0, 0, 0)
+"""
+    outcome = execute_untrusted(
+        ExecutionPayload(interpreter_path=sys.executable, code=payload)
+    )
+    assert outcome.killed_by_signal == 31
+    assert outcome.violation == "seccomp_killlist_triggered"
 
-    Known limitation (the whole point of the v1.1 redesign): this hook
-    does NOT fire inside child processes spawned by subprocess / os.exec*.
-    Containment of hostile child processes is provided by the sandbox
-    IsolationBackend, not by this hook. Treat the events emitted here as
-    observability on the parent's own behavior, not as a security signal.
-    """
+
+# =============================================================================
+# Resource limits
+# =============================================================================
+
+def test_memory_limit_enforced():
+    """cgroup memory.max kills the process when exceeded."""
+    base = default_python_policy()
+    policy = ExecutionPolicy(
+        binary_allowlist=base.binary_allowlist,
+        syscall_allowlist=base.syscall_allowlist,
+        syscall_killlist=base.syscall_killlist,
+        allow_network=False,
+        resources=ResourceLimits(memory_mb=64, wall_clock_timeout_s=10.0),
+    )
+    payload = """
+import sys
+try:
+    chunk = bytearray(512 * 1024 * 1024)  # 512MB — must be killed
+    sys.stdout.write('OOM_NOT_TRIGGERED\\n')
+except MemoryError:
+    sys.exit(33)
+"""
+    outcome = execute_untrusted(
+        ExecutionPayload(interpreter_path=sys.executable, code=payload),
+        policy=policy,
+    )
+    assert b"OOM_NOT_TRIGGERED" not in outcome.stdout
+    # SIGKILL (9) from cgroup OOM, or MemoryError → exit 33, or SIGSYS
+    # if something unexpected. All three confirm memory was constrained.
+    assert (
+        outcome.killed_by_signal == 9
+        or outcome.exit_code == 33
+    ), (
+        f"Memory limit not enforced. "
+        f"signal={outcome.killed_by_signal}, exit={outcome.exit_code}, "
+        f"stderr={outcome.stderr!r}"
+    )
+
+
+def test_wall_clock_timeout_enforced():
+    """A payload that sleeps past the wall clock must be killed."""
+    base = default_python_policy()
+    policy = ExecutionPolicy(
+        binary_allowlist=base.binary_allowlist,
+        syscall_allowlist=base.syscall_allowlist,
+        syscall_killlist=base.syscall_killlist,
+        allow_network=False,
+        resources=ResourceLimits(wall_clock_timeout_s=2.0),
+    )
+    payload = """
+import time
+time.sleep(30)
+print('SHOULD_NEVER_PRINT')
+"""
+    outcome = execute_untrusted(
+        ExecutionPayload(interpreter_path=sys.executable, code=payload),
+        policy=policy,
+    )
+    assert outcome.timed_out is True
+    assert outcome.violation == "wall_clock_timeout"
+    assert b"SHOULD_NEVER_PRINT" not in outcome.stdout
+    assert outcome.wall_clock_s < 5.0, (
+        f"Timeout took too long to fire: {outcome.wall_clock_s}s"
+    )
+
+
+# =============================================================================
+# Fail-closed behavior
+# =============================================================================
+
+def test_execute_without_backend_raises():
+    """If no backend is configured, execute_untrusted must fail closed,
+    not silently downgrade to 'no isolation'."""
+    with varek_warden._backend_lock:
+        saved = varek_warden._active_backend
+        varek_warden._active_backend = None
     try:
-        record = {
-            "ts": time.time(),
-            "event": event,
-            "args_repr": repr(args)[:1024],
-        }
-        _log.info("telemetry %s", json.dumps(record))
-        for subscriber in list(_telemetry_subscribers):
-            try:
-                subscriber(record)
-            except Exception:
-                # Subscriber failures must never break the hook.
-                pass
-    except Exception:
-        # Best-effort; audit hooks run in sensitive contexts and must not raise.
-        pass
+        with pytest.raises(IsolationError, match="no isolation backend"):
+            execute_untrusted(
+                ExecutionPayload(interpreter_path=sys.executable, code="pass")
+            )
+    finally:
+        with varek_warden._backend_lock:
+            varek_warden._active_backend = saved
 
 
-def subscribe_telemetry(callback: Callable[[dict], None]) -> None:
-    """Register a callback for audit-hook telemetry events. Callbacks must
-    not raise; exceptions are swallowed."""
-    with _telemetry_lock:
-        _telemetry_subscribers.append(callback)
+def test_interpreter_not_in_allowlist_raises():
+    """The binary allowlist is enforced at the parent before any process
+    is spawned. A path outside the allowlist must raise IsolationError."""
+    payload = ExecutionPayload(interpreter_path="/bin/sh", code="echo hi")
+    with pytest.raises(IsolationError, match="binary_allowlist"):
+        execute_untrusted(payload)
 
 
-def enforce_strict_mode() -> None:
-    """
-    Arms VAREK telemetry.
-
-    BACKWARD-COMPATIBLE NAME, NEW SEMANTICS: this no longer enforces
-    anything. It installs the PEP 578 telemetry hook. To actually contain
-    untrusted code, call configure_backend() followed by execute_untrusted().
-
-    Fails closed (sys.exit(1)) only if the hook itself cannot be installed
-    — this matches the v1.0 behavior so existing init code is unchanged.
-    """
-    try:
-        sys.addaudithook(_telemetry_hook)
-        print("[+] VAREK v1.1 telemetry hook armed (PEP 578, advisory only).")
-        print("[+] Enforcement is provided by sandbox.IsolationBackend.")
-        print("[+] Call configure_backend() + execute_untrusted() for untrusted code.\n")
-    except Exception as e:
-        _log.error("failed to arm telemetry hook: %s", e)
-        sys.exit(1)
+def test_relative_interpreter_path_rejected():
+    """Absolute-path requirement is a defense against PATH-based attacks
+    on the parent."""
+    payload = ExecutionPayload(interpreter_path="python3", code="pass")
+    with pytest.raises(IsolationError, match="must be absolute"):
+        execute_untrusted(payload)
 
 
 # =============================================================================
-# Enforcement (delegated to IsolationBackend)
+# PEP 578 hook is telemetry-only (v1.1 semantics change)
 # =============================================================================
 
-_active_backend: Optional[IsolationBackend] = None
-_backend_lock = threading.Lock()
-
-
-def configure_backend(backend: Optional[IsolationBackend] = None) -> None:
+def test_pep578_hook_does_not_deny_dangerous_events():
     """
-    Install the IsolationBackend used for all subsequent execute_untrusted()
-    calls. If no backend is passed, SeccompBpfBackend is used.
+    v1.1 regression test: the audit hook must observe dangerous events
+    but never raise. Enforcement lives in the sandbox, not the hook.
 
-    Fails closed: if the backend's is_available() returns a reason, this
-    raises IsolationError. v1.1 does not silently downgrade to a weaker
-    containment mode.
+    If this test ever fails (hook raises), the v1.0 behavior has returned
+    and the semantics contract with downstream callers is broken.
     """
-    backend = backend or SeccompBpfBackend()
-    reason = backend.is_available()
-    if reason is not None:
-        raise IsolationError(
-            f"backend {backend.name()!r} unavailable: {reason}"
-        )
-    with _backend_lock:
-        global _active_backend
-        _active_backend = backend
-    _log.info("isolation backend configured: %s", backend.name())
+    enforce_strict_mode()
+
+    observed = []
+    subscribe_telemetry(lambda r: observed.append(r["event"]))
+
+    import subprocess
+    # This runs OUTSIDE the sandbox — we're testing the parent's own hook,
+    # which in v1.0 would have raised KineticIntercept on this Popen.
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    proc.wait()
+
+    # Hook fired (telemetry works)...
+    assert any(
+        "subprocess" in e or "os.exec" in e or "Popen" in e
+        for e in observed
+    ), f"Telemetry hook did not observe Popen. Events: {observed[:20]}"
+    # ...and did not raise (enforcement removed from the hook).
+    # Reaching this assertion without an exception is the test.
 
 
-def get_active_backend() -> Optional[IsolationBackend]:
-    with _backend_lock:
-        return _active_backend
+# =============================================================================
+# Benign payload smoke test
+# =============================================================================
 
-
-def execute_untrusted(
-    payload: ExecutionPayload,
-    policy: Optional[ExecutionPolicy] = None,
-) -> ExecutionOutcome:
-    """
-    Execute untrusted code inside the configured isolation backend.
-
-    Fails closed if no backend has been configured. This is the v1.1
-    replacement for code paths that previously relied on the audit hook
-    to catch subprocess escapes — which, per issue #223, it cannot.
-    """
-    with _backend_lock:
-        backend = _active_backend
-    if backend is None:
-        raise IsolationError(
-            "no isolation backend configured; call configure_backend() first. "
-            "v1.1 fails closed by design — see docs/security/isolation.md"
-        )
-    return backend.execute(payload, policy or default_python_policy())
-
-
-__all__ = [
-    # v1.0 compat
-    "KineticIntercept", "enforce_strict_mode",
-    # v1.1 telemetry
-    "subscribe_telemetry",
-    # v1.1 enforcement
-    "configure_backend", "get_active_backend", "execute_untrusted",
-    # re-exports so callers don't need to import sandbox directly
-    "ExecutionPayload", "ExecutionPolicy", "ExecutionOutcome",
-    "IsolationBackend", "SeccompBpfBackend", "IsolationError",
-    "default_python_policy",
-]
+def test_benign_payload_runs_and_returns_stdout():
+    """Well-behaved code must actually run. A sandbox that breaks
+    everything is not a sandbox; it's a deny-all."""
+    payload = """
+import sys
+print('hello from sandbox', end='')
+sys.exit(0)
+"""
+    outcome = execute_untrusted(
+        ExecutionPayload(interpreter_path=sys.executable, code=payload)
+    )
+    assert outcome.exit_code == 0, (
+        f"Benign payload failed. stderr={outcome.stderr!r}"
+    )
+    assert outcome.stdout == b"hello from sandbox"
+    assert outcome.violation is None
+    assert outcome.killed_by_signal is None
