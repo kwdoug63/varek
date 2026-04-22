@@ -18,7 +18,7 @@ The v1.0 proposal described PEP 578 audit hooks as the containment primitive for
 
 3. **Untrusted code execution requires OS-level isolation.** The correct containment boundary is the kernel, not the interpreter. seccomp-bpf, cgroups v2, Linux namespaces, Windows Job Objects, and purpose-built sandboxes (gVisor, nsjail, bubblewrap, firejail) exist precisely because language-level policy cannot contain hostile native code.
 
-v1.1 accepts this framing. PEP 578 is **demoted from containment to telemetry** and the primary defense is moved into an OS-level isolation layer.
+v1.1 accepts this framing. The containment boundary moves from the interpreter to the kernel. The PEP 578 hook is **repositioned from primary enforcement to a runtime visibility and advisory-interception layer** in a layered defense — not stripped of value, but no longer load-bearing for containment. The hook observes events the kernel layer cannot (imports, `compile` calls, `pickle` loads, `exec`/`eval` invocations) and fires *before* the syscall a given Python operation would dispatch, which makes conditional interception possible for in-process policy decisions and makes post-hoc triage of seccomp denials tractable. What it cannot do — and what v1.0 incorrectly asked it to do — is serve as the containment boundary for hostile code that reaches native execution or spawns a subprocess. That job now belongs to the isolation backend described in the following sections.
 
 ---
 
@@ -26,7 +26,7 @@ v1.1 accepts this framing. PEP 578 is **demoted from containment to telemetry** 
 
 - **Pluggable isolation interface, not a single mechanism.** Different deployments have different constraints: Linux servers, Windows hosts, air-gapped SCIFs, Kubernetes pods. A hardcoded dependency on any one sandbox is a deployment blocker.
 - **Allowlist, not denylist, at the syscall and binary level.** The default posture for untrusted code is "nothing is allowed unless explicitly permitted."
-- **Defense in depth.** Isolation layer is the containment boundary. PEP 578 remains as in-process telemetry and policy for benign code paths. Resource caps, filesystem restrictions, and network egress policy stack on top.
+- **Defense in depth.** Isolation layer is the containment boundary. PEP 578 remains in-process as a visibility and advisory-interception surface — useful for observing events below the kernel's resolution (imports, `compile`, `pickle`, `exec`/`eval`) and for making seccomp denials triageable — but carries no enforcement weight. Resource caps, filesystem restrictions, and network egress policy stack on top.
 - **No silent fallback to a weaker mode.** If the configured isolation backend is unavailable at runtime, execution of untrusted code fails closed. A warning-level fallback to PEP 578–only containment is explicitly not offered.
 - **Minimal v1.1 scope.** Ship the interface and one reference backend (seccomp-bpf on Linux). gVisor, bubblewrap, and Windows Job Objects are deferred to v1.2+ as additional backend implementations behind the same interface.
 
@@ -125,15 +125,21 @@ Enforcement preference:
 2. **Seccomp-notify path (fallback):** a user-space supervisor resolves the argv[0] via `/proc/<tid>/mem` + `readlink` on the user-namespaced fd and `ACK`s or `RET_ERRNO`s the syscall. Racier but dependency-free.
 3. **Explicit opt-in path:** on kernels that support neither, `SeccompBpfBackend::is_available()` returns `UnavailableReason::KernelTooOld` and execution fails closed.
 
-### 4.4 Telemetry (PEP 578 demoted)
+### 4.4 In-process visibility layer (PEP 578 repositioned)
 
-Inside the child, an audit hook is still installed at interpreter startup. In v1.1 this hook **does not deny**; it only emits structured events to a parent-side supervisor over a pre-opened unix socket fd. These events are written to the VAREK audit log and are used for:
+Inside the child, a PEP 578 audit hook is installed at interpreter startup. In v1.1 this hook **does not deny at the enforcement boundary**; it emits structured events to a parent-side supervisor over a pre-opened unix socket fd and, where configured, makes advisory interception decisions on events the kernel cannot see. The hook is useful precisely because it observes at a different resolution than seccomp:
 
-- Post-hoc incident review
-- Anomaly detection on benign code paths
-- Debuggability when a syscall is denied by seccomp (the hook fires before the denied syscall, giving useful context)
+- It fires on events that have no direct syscall correspondent — `import` resolution, `compile()`, `exec()`/`eval()`, `pickle.find_class`, `marshal.loads`, `open_code` — which the kernel layer cannot distinguish from benign I/O.
+- It fires *before* the syscall that a given Python operation would eventually dispatch, so when seccomp later denies that syscall, the audit event on the supervisor side explains *what Python-level operation produced it*. This turns `EPERM` from opaque into actionable.
+- It supports conditional in-process policy (e.g. refusing a specific `import` in a context where the syscall-level policy would permit the subsequent file read). This is policy composition, not containment.
 
-The security guarantee does not depend on the hook firing. If a child evades, disables, or crashes the hook, the kernel-enforced seccomp + cgroup + namespace boundary is still intact.
+These events are written to the VAREK audit log and are used for:
+
+- Post-hoc incident review and denial triage
+- Anomaly detection on otherwise-benign code paths
+- In-process advisory policy decisions that need Python-level semantics
+
+What this layer is **not**: a containment boundary. The security guarantee does not depend on the hook firing. If a child evades, disables, or crashes the hook — or executes native code that bypasses the Python interpreter entirely — the kernel-enforced seccomp + cgroup + namespace boundary is still intact. The v1.1 architecture treats the hook as a useful layer above the boundary, never as the boundary itself.
 
 ---
 
@@ -180,7 +186,7 @@ policy:
     wall_clock_timeout_ms: 30000
 
 telemetry:
-  pep578_audit_hook: enabled     # telemetry only, not enforcement
+  pep578_audit_hook: enabled     # visibility + advisory interception, not enforcement
   audit_log: /var/log/varek/audit.jsonl
 ```
 
@@ -191,7 +197,7 @@ telemetry:
 | v1.0 API | v1.1 replacement | Notes |
 |----------|------------------|-------|
 | `VarekInterpreter.add_deny_signature(s)` | **Removed.** Use `ExecutionPolicy.binary_allowlist`. | Denylists are unsound. |
-| `VarekInterpreter.execute_with_audit_hook(...)` | `VarekRuntime.execute(payload, policy)` | Audit hook is now telemetry-only; enforcement is in the backend. |
+| `VarekInterpreter.execute_with_audit_hook(...)` | `VarekRuntime.execute(payload, policy)` | Audit hook is now a visibility/advisory-interception layer; containment enforcement is in the backend. |
 | `VarekInterpreter.register_audit_callback(cb)` | `VarekRuntime.subscribe_telemetry(cb)` | Signature preserved; semantics are now advisory. |
 
 A shim maintains the v1.0 API surface for one minor version with a deprecation warning and a hard requirement that an `IsolationBackend` be configured. v1.0 code that relied on the audit hook for security will fail closed until a backend is set.
@@ -203,7 +209,7 @@ A shim maintains the v1.0 API surface for one minor version with a deprecation w
 - `varek/runtime/isolation/interface.vk` — trait + types
 - `varek/runtime/isolation/seccomp/` — reference Linux backend
 - `varek/runtime/isolation/seccomp/profiles/python.default.json` — versioned default profile
-- `varek/runtime/telemetry/pep578.vk` — demoted audit hook, telemetry-only
+- `varek/runtime/audit_hook/pep578.vk` — repositioned audit hook (visibility + advisory interception, non-enforcement)
 - `varek/runtime/runtime.vk` — `VarekRuntime::execute` dispatch
 - PoC from issue #223 added to `tests/security/` as a regression test that **must fail to execute** under the default v1.1 policy
 - `docs/security/isolation.md` — operator-facing documentation
