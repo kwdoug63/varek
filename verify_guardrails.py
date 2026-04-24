@@ -120,7 +120,8 @@ class _FakeUnavailableBackend(IsolationBackend):
     def is_available(self):
         return "synthetic unavailability for testing"
 
-    def run(self, payload, policy):
+    def name(self): return "fake-unavailable"
+    def execute(self, payload, policy):
         raise RuntimeError("should never reach run()")
 
 
