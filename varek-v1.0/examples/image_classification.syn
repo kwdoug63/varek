@@ -1,0 +1,101 @@
+-- ================================================================
+-- VAREK Example: Image Classification Pipeline
+-- examples/image_classification.syn
+--
+-- Demonstrates: schema, pipeline, fn, async fn, |>, Result<T>, ?
+-- Author: Kenneth Wayne Douglas, MD
+-- ================================================================
+
+import python::PIL::Image
+import python::numpy as np
+
+---
+  Input schema for image data.
+  The label field is optional — unlabelled images are supported.
+---
+schema ImageInput {
+  path:   str,
+  label:  str?,
+  width:  int,
+  height: int
+}
+
+schema ClassificationResult {
+  label:      str,
+  confidence: float,
+  top_k:      str[]
+}
+
+---
+  Full end-to-end image classification pipeline.
+  Steps are type-checked at compile time: output of each stage
+  must match the input type of the next.
+---
+pipeline classify_images {
+  source: ImageInput[]
+  steps:  [preprocess -> embed -> infer -> postprocess]
+  output: ClassificationResult[]
+  config {
+    batch_size:  32,
+    parallelism: 8,
+    top_k:       5
+  }
+}
+
+-- ── Stage functions ──────────────────────────────────────────
+
+fn preprocess(img: ImageInput) -> Tensor<float, [3, 224, 224]> {
+  load_image(img.path)
+    |> resize(224, 224)
+    |> to_tensor()
+    |> normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+      )
+}
+
+fn embed(tensor: Tensor<float, [3, 224, 224]>) -> Tensor<float, [2048]> {
+  let backbone = load_model("resnet50_backbone.synmodel")?
+  backbone.forward(tensor).flatten()
+}
+
+async fn infer(embedding: Tensor<float, [2048]>) -> RawOutput {
+  let head = load_model("classifier_head.synmodel")?
+  await head.infer_async(embedding)
+}
+
+fn postprocess(raw: RawOutput) -> ClassificationResult {
+  let scores  = raw.softmax()
+  let top_idx = scores.top_k(5)
+  let labels  = load_labels("imagenet_classes.txt")?
+  make_result(labels[top_idx[0]], scores[top_idx[0]], top_idx)
+}
+
+-- ── Utilities ────────────────────────────────────────────────
+
+fn load_model(path: str) -> Result<Model> {
+  if not file_exists(path) {
+    return Err("Model file not found: " + path)
+  }
+  Ok(Model.from_file(path))
+}
+
+fn load_labels(path: str) -> Result<str[]> {
+  let content = read_file(path)?
+  Ok(content.split("\n"))
+}
+
+-- ── Entry point ──────────────────────────────────────────────
+
+fn main() -> Result<nil> {
+  let images = load_dataset("data/val2024/")?
+
+  let results = classify_images(images)
+
+  for result in results {
+    let pct = result.confidence * 100.0
+    print(result.label + " — " + pct + "%")
+  }
+
+  Ok(nil)
+}

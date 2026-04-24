@@ -1,0 +1,349 @@
+(* ================================================================
+   VAREK FORMAL GRAMMAR — v0.1
+   AI Pipeline Programming Language
+
+   Author : Kenneth Wayne Douglas, MD
+   Version: 0.1
+   License: MIT
+
+   Notation (ISO 14977 Extended BNF):
+     =      definition
+     ,      concatenation
+     ;      termination
+     |      alternation
+     [ x ]  optional (0 or 1)
+     { x }  repetition (0 or more)
+     ( x )  grouping
+     " x "  terminal string
+     (* *)  comment
+   ================================================================ *)
+
+
+(* ── TOP LEVEL ─────────────────────────────────────────────── *)
+
+program
+  = { statement } , EOF ;
+
+statement
+  = import_stmt
+  | schema_decl
+  | pipeline_decl
+  | fn_decl
+  | let_stmt
+  | return_stmt
+  | expr_stmt ;
+
+
+(* ── IMPORTS ────────────────────────────────────────────────── *)
+
+import_stmt
+  = [ "safe" ] , "import" , module_path , [ "as" , IDENT ] ;
+
+module_path
+  = IDENT , { "::" , IDENT } ;
+
+
+(* ── SCHEMA DECLARATIONS ────────────────────────────────────── *)
+
+schema_decl
+  = "schema" , IDENT , "{" , { schema_field } , "}" ;
+
+schema_field
+  = IDENT , ":" , type_expr , [ "?" ] , [ "," ] ;
+
+
+(* ── PIPELINE DECLARATIONS ──────────────────────────────────── *)
+
+pipeline_decl
+  = "pipeline" , IDENT , "{" , pipeline_body , "}" ;
+
+pipeline_body
+  = source_clause
+  , steps_clause
+  , output_clause
+  , [ config_clause ] ;
+
+source_clause
+  = "source" , ":" , type_expr ;
+
+steps_clause
+  = "steps" , ":" , "[" , step_chain , "]" ;
+
+step_chain
+  = IDENT , { "->" , IDENT } ;
+
+output_clause
+  = "output" , ":" , type_expr ;
+
+config_clause
+  = "config" , "{" , { config_field } , "}" ;
+
+config_field
+  = IDENT , ":" , literal , [ "," ] ;
+
+
+(* ── FUNCTION DECLARATIONS ──────────────────────────────────── *)
+
+fn_decl
+  = [ "export" ] , [ "async" ] , "fn" , IDENT ,
+    "(" , [ param_list ] , ")" ,
+    [ "->" , type_expr ] ,
+    block ;
+
+param_list
+  = param , { "," , param } ;
+
+param
+  = IDENT , ":" , type_expr ;
+
+
+(* ── STATEMENTS ─────────────────────────────────────────────── *)
+
+let_stmt
+  = [ "mut" ] , "let" , IDENT , [ ":" , type_expr ] ,
+    ( "=" | ":=" ) , expr ;
+
+return_stmt
+  = "return" , [ expr ] ;
+
+expr_stmt
+  = expr ;
+
+
+(* ── BLOCKS ──────────────────────────────────────────────────── *)
+
+block
+  = "{" , { statement } , [ expr ] , "}" ;
+
+
+(* ── EXPRESSIONS (precedence low -> high) ───────────────────── *)
+
+expr
+  = pipe_expr ;
+
+pipe_expr
+  = or_expr , { "|>" , or_expr } ;
+
+or_expr
+  = and_expr , { "or" , and_expr } ;
+
+and_expr
+  = not_expr , { "and" , not_expr } ;
+
+not_expr
+  = [ "not" ] , comparison_expr ;
+
+comparison_expr
+  = add_expr , [ ( "==" | "!=" | "<" | ">" | "<=" | ">=" ) , add_expr ] ;
+
+add_expr
+  = mul_expr , { ( "+" | "-" ) , mul_expr } ;
+
+mul_expr
+  = unary_expr , { ( "*" | "/" | "%" ) , unary_expr } ;
+
+unary_expr
+  = [ ( "-" | "not" ) ] , postfix_expr ;
+
+postfix_expr
+  = primary_expr , { postfix_op } ;
+
+postfix_op
+  = "." , IDENT                                   (* member access *)
+  | "[" , expr , "]"                              (* index access  *)
+  | "(" , [ arg_list ] , ")"                      (* call          *)
+  | "?"                                           (* propagate     *)
+  ;
+
+primary_expr
+  = literal
+  | IDENT
+  | if_expr
+  | match_expr
+  | for_expr
+  | await_expr
+  | block
+  | "(" , expr , ")"
+  | array_literal
+  | map_literal
+  | tuple_literal
+  | lambda_expr ;
+
+
+(* ── COMPOUND EXPRESSIONS ───────────────────────────────────── *)
+
+if_expr
+  = "if" , expr , block , [ "else" , ( if_expr | block ) ] ;
+
+match_expr
+  = "match" , expr , "{" , { match_arm } , "}" ;
+
+match_arm
+  = match_pattern , "=>" , ( expr | block ) , [ "," ] ;
+
+match_pattern
+  = literal
+  | IDENT
+  | "_" ;                                         (* wildcard *)
+
+for_expr
+  = "for" , IDENT , "in" , expr , block ;
+
+await_expr
+  = "await" , expr ;
+
+lambda_expr
+  = "|" , [ lambda_params ] , "|" ,
+    [ "->" , type_expr ] ,
+    ( expr | block ) ;
+
+lambda_params
+  = lambda_param , { "," , lambda_param } ;
+
+lambda_param
+  = IDENT , [ ":" , type_expr ] ;
+
+arg_list
+  = arg , { "," , arg } ;
+
+arg
+  = [ IDENT , "=" ] , expr ;                      (* positional or keyword *)
+
+array_literal
+  = "[" , [ expr , { "," , expr } ] , "]" ;
+
+map_literal
+  = "{" , [ map_entry , { "," , map_entry } ] , "}" ;
+
+map_entry
+  = expr , ":" , expr ;
+
+tuple_literal
+  = "(" , expr , "," , [ expr , { "," , expr } ] , ")" ;
+
+
+(* ── TYPE EXPRESSIONS ───────────────────────────────────────── *)
+
+type_expr
+  = base_type , { type_suffix } ;
+
+base_type
+  = "int"
+  | "float"
+  | "str"
+  | "bool"
+  | "nil"
+  | "Tensor" , "<" , type_expr , "," , tensor_dims , ">"
+  | "Result" , "<" , type_expr , ">"
+  | "{" , type_expr , ":" , type_expr , "}"      (* map type    *)
+  | "(" , type_expr , { "," , type_expr } , ")"  (* tuple type  *)
+  | IDENT ;                                       (* named type  *)
+
+type_suffix
+  = "?"                                           (* optional    *)
+  | "[]"                                          (* array       *)
+  ;
+
+tensor_dims
+  = "[" , INT , { "," , INT } , "]" ;
+
+
+(* ── LITERALS ───────────────────────────────────────────────── *)
+
+literal
+  = INT
+  | FLOAT
+  | STRING
+  | BOOL
+  | "nil" ;
+
+
+(* ── LEXICAL TOKENS ─────────────────────────────────────────── *)
+
+IDENT
+  = ( LETTER | "_" ) , { LETTER | DIGIT | "_" } ;
+
+INT
+  = DIGIT , { DIGIT }
+  | "0x" , HEX_DIGIT , { HEX_DIGIT }             (* hex literal *)
+  | "0b" , BIN_DIGIT , { BIN_DIGIT }             (* binary literal *)
+  ;
+
+FLOAT
+  = DIGIT , { DIGIT } , "." , { DIGIT } , [ EXPONENT ]
+  | DIGIT , { DIGIT } , EXPONENT ;
+
+EXPONENT
+  = ( "e" | "E" ) , [ "+" | "-" ] , DIGIT , { DIGIT } ;
+
+STRING
+  = '"' , { STRING_CHAR } , '"'
+  | "'" , { STRING_CHAR } , "'" ;
+
+STRING_CHAR
+  = ? any Unicode character except the delimiter and unescaped newline ?
+  | ESCAPE_SEQ ;
+
+ESCAPE_SEQ
+  = "\" , ( '"' | "'" | "\" | "n" | "t" | "r" | "0"
+           | "u{" , HEX_DIGIT , { HEX_DIGIT } , "}" ) ;
+
+BOOL
+  = "true" | "false" ;
+
+LETTER
+  = "A" | ... | "Z" | "a" | ... | "z" ;
+
+DIGIT
+  = "0" | ... | "9" ;
+
+HEX_DIGIT
+  = DIGIT | "a" | ... | "f" | "A" | ... | "F" ;
+
+BIN_DIGIT
+  = "0" | "1" ;
+
+COMMENT
+  = "--" , { ? any character ? } , NEWLINE        (* ignored     *)
+  | "---" , { ? any character ? } , "---"         (* ignored     *)
+  ;
+
+WHITESPACE
+  = { " " | "\t" | "\r" | "\n" }                 (* ignored     *)
+  ;
+
+EOF
+  = ? end of input ? ;
+
+
+(* ── RESERVED KEYWORDS ──────────────────────────────────────── *)
+
+(*
+  The following identifiers are reserved and may not be used as
+  user-defined identifiers:
+
+  and       as        async     await     else      export
+  false     fn        for       if        import    in
+  let       match     mut       nil       not       or
+  pipeline  return    safe      schema    true
+*)
+
+
+(* ── OPERATOR PRECEDENCE (high to low) ──────────────────────── *)
+
+(*
+  Level  Operator(s)              Associativity
+  ─────────────────────────────────────────────
+  8      . [] () ?                Left
+  7      - (unary)  not           Right (unary)
+  6      * / %                    Left
+  5      + -                      Left
+  4      == != < > <= >=          Left (non-assoc)
+  3      not                      Right (unary)
+  2      and                      Left
+  1      or                       Left
+  0      |>                       Left
+*)
+
+
+(* ── END OF GRAMMAR ─────────────────────────────────────────── *)
