@@ -7,6 +7,24 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.1.1] — 2026-04-24
+
+### Added
+
+- `varek_warden.py` — real implementation of the orchestration layer advertised in v1.1. Exposes `configure_backend()`, `execute_untrusted()`, and `subscribe_telemetry()` as callable module-level entry points over the sandbox primitives.
+- `varek_guardrails/` package — public re-export surface. Existing intercept files and external code can now `pip install -e .` and `from varek_guardrails import ...` without resolving loose top-level modules by `sys.path` manipulation.
+- `pyproject.toml` — PEP 621 package metadata. `pytest` is now an optional dev dependency; production installs no longer require it.
+
+### Fixed
+
+- `configure_backend()` now fails closed when `IsolationBackend.is_available()` returns a non-None unavailability reason string. The prior draft had the check inverted, which would have silently accepted unavailable backends — a fail-open bug in a security primitive.
+
+### Moved
+
+- Smoke tests previously resident in `varek_warden.py` relocated to `tests/security/test_warden_smoke.py`.
+
+---
+
 ## [1.1.0] — 2026-04-20
 
 ### Security
