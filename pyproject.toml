@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "varek-guardrails"
+version = "1.1.1"
+description = "Deterministic runtime verification infrastructure for autonomous AI agents — kernel-enforced containment, AST static gates, and PEP 578 telemetry."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Kenneth Wayne Douglas, MD" },
+]
+keywords = [
+    "ai-safety",
+    "agent-security",
+    "sandbox",
+    "seccomp",
+    "containment",
+    "runtime-verification",
+    "llm-security",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Monitoring",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.urls]
+Homepage = "https://varek-lang.org"
+Repository = "https://github.com/kwdoug63/varek"
+Changelog = "https://github.com/kwdoug63/varek/blob/main/CHANGELOG.md"
+Issues = "https://github.com/kwdoug63/varek/issues"
+
+[tool.setuptools]
+py-modules = ["sandbox", "varek_warden"]
+
+[tool.setuptools.packages.find]
+include = ["varek_guardrails*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --strict-markers"
