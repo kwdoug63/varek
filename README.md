@@ -150,6 +150,7 @@ This exercises every public entry point through an eight-step verification. In m
 
 ### Guardrails quick start
 
+```python
 import sys
 from varek_guardrails import (
     SeccompBpfBackend,
@@ -194,6 +195,7 @@ except IsolationError as e:
     # policy malformed). Ordinary containment events surface on the
     # ExecutionOutcome above, not as exceptions.
     print(f"orchestration error: {e}")
+```
 
 ### Guardrails integration demos
 
