@@ -8,6 +8,8 @@
 [![Tests: 659 passing](https://img.shields.io/badge/tests-659%20passing-brightgreen.svg)](#testing)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
+> **Reporting vulnerabilities:** [private vulnerability reporting](https://github.com/kwdoug63/varek/security/advisories/new) or [SECURITY.md](./SECURITY.md). Do not open public issues.
+
 VAREK consists of two things:
 
 1. **VAREK the language** — a statically-typed, Hindley-Milner-inferred, LLVM-compiled programming language purpose-built for AI/ML pipelines. Schema, logic, pipeline, and configuration live in one file with one syntax. **Stable at v1.0.** 659 tests passing across versions.
