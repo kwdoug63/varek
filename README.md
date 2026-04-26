@@ -8,11 +8,7 @@
 [![Tests: 659 passing](https://img.shields.io/badge/tests-659%20passing-brightgreen.svg)](#testing)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-## Security
-
-For security disclosures, see [SECURITY.md](SECURITY.md). 
-Do not open public issues for vulnerabilities.
-VAREK is two things that compose:
+VAREK consists of two things:
 
 1. **VAREK the language** — a statically-typed, Hindley-Milner-inferred, LLVM-compiled programming language purpose-built for AI/ML pipelines. Schema, logic, pipeline, and configuration live in one file with one syntax. **Stable at v1.0.** 659 tests passing across versions.
 
@@ -276,11 +272,29 @@ Guardrails verification: `python verify_guardrails.py` (see the section above).
 
 ## Security
 
-The v1.1.0 release resolved a subprocess-escape weakness in v1.0's audit-hook-based containment, reported by @dengluozhang in issue #223. See [`VAREK_v1.1_SECURITY_UPDATE.md`](./VAREK_v1.1_SECURITY_UPDATE.md) and [`docs/security/threat-model.md`](./docs/security/threat-model.md) for in-scope and out-of-scope threats.
+**Reporting vulnerabilities.** Do not open public issues for security
+issues. Use [GitHub private vulnerability reporting](https://github.com/kwdoug63/varek/security/advisories/new)
+or follow the procedure in [SECURITY.md](./SECURITY.md). All reports
+receive an acknowledgment within 72 hours.
 
-Regression tests for the fix live in [`tests/security/test_issue_223_regression.py`](./tests/security/test_issue_223_regression.py) and must fail to execute under the default policy on a conforming host.
+**Threat model.** In-scope and out-of-scope threats are documented in
+[`docs/security/threat-model.md`](./docs/security/threat-model.md).
+The Guardrails layer is designed to fail closed on unsupported platforms
+and to deny boundary syscalls (`execve`, network egress, file system
+writes outside the working directory) at the kernel — not via string
+matching or audit hooks.
 
-Responsible disclosure: open a GitHub issue with the `security` label.
+**v1.1.0 fix.** Resolved a subprocess-escape weakness in v1.0's
+audit-hook-based containment (issue #223, reported by @dengluozhang).
+Regression tests in [`tests/security/test_issue_223_regression.py`](./tests/security/test_issue_223_regression.py)
+must fail to execute under the default policy on a conforming host.
+See [`VAREK_v1.1_SECURITY_UPDATE.md`](./VAREK_v1.1_SECURITY_UPDATE.md)
+for full details.
+
+**Architecture review.** External architecture review by QEEK-AI
+addressed three items: AST-gate framing (now documented as UX-only,
+not a security boundary), libc binding fallback (caught a real bug),
+and platform-gating CI coverage (now running on macOS, Windows, Linux).
 
 ## Documentation
 
