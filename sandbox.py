@@ -200,13 +200,30 @@ CLONE_NEWNET  = 0x40000000
 
 PR_SET_NO_NEW_PRIVS = 38
 
-_libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
-_libc.unshare.argtypes = [ctypes.c_int]
-_libc.unshare.restype = ctypes.c_int
-_libc.prctl.argtypes = [
-    ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
-]
-_libc.prctl.restype = ctypes.c_int
+# libc bindings for the kernel features VAREK needs (unshare, prctl)
+# only exist on Linux. On macOS and Windows, attempting to bind them
+# at module import time fails with AttributeError (dlsym lookup).
+# We guard the bindings so the module imports cleanly on any platform;
+# is_available() and configure_backend() handle the runtime fail-closed
+# behavior when an unsupported platform tries to actually USE the
+# sandbox. See docs/development.md.
+if sys.platform == "linux":
+    _libc = ctypes.CDLL(
+        ctypes.util.find_library("c") or "libc.so.6",
+        use_errno=True,
+    )
+    _libc.unshare.argtypes = [ctypes.c_int]
+    _libc.unshare.restype = ctypes.c_int
+    _libc.prctl.argtypes = [
+        ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.c_ulong, ctypes.c_ulong,
+    ]
+    _libc.prctl.restype = ctypes.c_int
+else:
+    # Non-Linux platforms: _libc stays None. Any attempt to call
+    # _unshare() or _no_new_privs() will raise AttributeError, which
+    # is caught by the fail-closed envelope in configure_backend().
+    _libc = None
 
 
 def _unshare(flags: int) -> None:
