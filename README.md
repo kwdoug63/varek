@@ -150,7 +150,7 @@ This exercises every public entry point through an eight-step verification. In m
 
 ### Guardrails quick start
 
-```python
+import sys
 from varek_guardrails import (
     SeccompBpfBackend,
     ExecutionPayload,
@@ -170,17 +170,30 @@ subscribe_telemetry(lambda event, args: print(f"[audit] {event}"))
 # Run untrusted code under the default policy:
 # 512 MB / 50% CPU / 64 pids / 30 s wall-clock / network denied / execve denied
 payload = ExecutionPayload(
-    source="def main(): return 42",
-    entrypoint="main",
-    inputs={},
+    interpreter_path=sys.executable,
+    code="print(2 + 2)\n",
 )
 
 try:
     outcome = execute_untrusted(payload, default_python_policy())
-    print(f"return_value={outcome.return_value}, exit_code={outcome.exit_code}")
+    # ExecutionOutcome surfaces containment via these three fields, not
+    # via exception. stdout/stderr are bytes.
+    contained = (
+        outcome.exit_code != 0
+        or outcome.killed_by_signal is not None
+        or outcome.violation is not None
+    )
+    print(
+        f"contained={contained} "
+        f"exit_code={outcome.exit_code} "
+        f"wall_clock_s={outcome.wall_clock_s:.3f}s "
+        f"stdout={outcome.stdout!r}"
+    )
 except IsolationError as e:
-    print(f"contained: {e}")
-```
+    # Raised only at the orchestration boundary (backend not configured,
+    # policy malformed). Ordinary containment events surface on the
+    # ExecutionOutcome above, not as exceptions.
+    print(f"orchestration error: {e}")
 
 ### Guardrails integration demos
 
