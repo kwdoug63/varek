@@ -11,8 +11,7 @@ weakness — please report it privately rather than opening a public issue.
 2. Click "Report a vulnerability"
 3. Fill out the form with details
 
-**Alternative:** Email kenneth.douglas@soberagents.ai with subject line 
-"VAREK Security: [brief description]"
+**Alternative:** Email: kenneth.douglas@soberagents.ai (subject line format: `VAREK Security: <short description>`)
 
 ## What to Include
 
