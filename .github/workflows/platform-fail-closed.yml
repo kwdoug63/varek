@@ -1,0 +1,38 @@
+name: Platform Fail-Closed Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  non-linux-fails-closed:
+    name: Verify non-Linux raises IsolationError
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install test dependencies
+        run: pip install pytest
+      - name: Run platform-gating tests
+        run: pytest tests/test_platform_gating.py::TestPlatformGating -v
+
+  linux-platform-check-passes:
+    name: Verify Linux platform check does not over-block
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install test dependencies
+        run: pip install pytest
+      - name: Run Linux behavior test
+        run: pytest tests/test_platform_gating.py::TestLinuxBehavior -v

@@ -330,6 +330,20 @@ class SeccompBpfBackend(IsolationBackend):
     def execute(
         self, payload: ExecutionPayload, policy: ExecutionPolicy
     ) -> ExecutionOutcome:
+        # Defense-in-depth: re-check availability at the backend entry
+        # point. The primary fail-closed guard is in
+        # varek_warden.configure_backend(), but if a caller instantiates
+        # this backend directly and bypasses configure_backend(), we
+        # still refuse to execute on a host that cannot enforce
+        # containment. See docs/development.md for the supported
+        # development paths on non-Linux platforms.
+        reason = self.is_available()
+        if reason is not None:
+            raise IsolationError(
+                f"SeccompBpfBackend unavailable: {reason}. "
+                f"See docs/development.md for supported platforms."
+            )
+
         # Parent-side validation. These checks are the binary-allowlist
         # enforcement point in v1.1.
         if not os.path.isabs(payload.interpreter_path):

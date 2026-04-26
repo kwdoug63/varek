@@ -37,7 +37,9 @@ def configure_backend(backend: IsolationBackend) -> None:
     reason = backend.is_available()
     if reason is not None:
         raise IsolationError(
-            f"{backend.__class__.__name__} unavailable: {reason}"
+            f"{backend.__class__.__name__} unavailable: {reason}. "
+            f"See docs/development.md for supported platforms and "
+            f"required kernel features."
         )
     global _active_backend
     _active_backend = backend
