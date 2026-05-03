@@ -1,0 +1,14 @@
+name: "agentic-code-execution"
+version: "1.2"
+default_decision: "deny"
+default_reason: "implicit global deny: destination not in egress allowlist"
+rules:
+  - id: "allow-github-api"
+    decision: "allow"
+    match:
+      syscall: "connect"
+      args:
+        dest_port: 443
+        dest_host: "api.github.com"
+    reason: "allow outbound to Github API"
+    audit_log: true
