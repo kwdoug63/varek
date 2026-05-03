@@ -7,6 +7,26 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.2.1] - 2026-05-03
+### Added
+- `waren.py`: Supervisor parent process to enforce out-of-band policy evaluation.
+- `seccomp_bridge.py`: Kernel translation layer handling simulated OS traps and system call verdicts (`ALLOW` / `DENY`).
+- "Warden/Agent" boundary architecture, strictly separating the AI execution space from the policy decision engine.
+
+### Changed
+- Moved evaluation logic out of the single-process agent simulator to prove true hard-enforcement capabilities.
+- Audit logs are now securely written by the parent process, guaranteeing immutability from child process tampering.
+
+## [1.2.0] - 2026-04-28
+### Added
+- Official VAREK v1.2 RFC publication detailing fail-closed semantics and linear rule evaluation.
+- `evaluator.py`: Core policy decision engine with sub-millisecond execution times.
+- `policy.py`: YAML loader for parsing human/AI-readable policy definitions.
+- `decision_log.py`: Deterministic audit logging system for system call transitions.
+- Simulator agent (`agent.py`) to test standard API access, exfiltration attempts, and fail-closed safety pathways.
+
+---
+
 ## [1.1.1] — 2026-04-24
 
 ### Added
