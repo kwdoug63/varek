@@ -2,7 +2,7 @@
 
 ### A statically-typed AI pipeline language, with a Python runtime containment layer for agentic workloads.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Compiler: v1.0](https://img.shields.io/badge/compiler-v1.0-blue.svg)](https://github.com/kwdoug63/varek/releases)
 [![Guardrails: v1.1.1](https://img.shields.io/badge/guardrails-v1.1.1-green.svg)](https://github.com/kwdoug63/varek/releases/tag/v1.1.1)
 [![Tests: 659 passing](https://img.shields.io/badge/tests-659%20passing-brightgreen.svg)](#testing)
@@ -324,6 +324,7 @@ and platform-gating CI coverage (now running on macOS, Windows, Linux).
 - **Issues:** [github.com/kwdoug63/varek/issues](https://github.com/kwdoug63/varek/issues)
 - **Releases:** [github.com/kwdoug63/varek/releases](https://github.com/kwdoug63/varek/releases)
 
-## License
+## ⚖️ License
 
-MIT — see [LICENSE](./LICENSE). Copyright © 2025–2026 Kenneth Wayne Douglas, MD.
+VAREK is open-source software licensed under the [Apache License 2.0](LICENSE). 
+Copyright © 2026 Sober Agentic Infrastructure, Inc.
