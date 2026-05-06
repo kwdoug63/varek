@@ -2,7 +2,7 @@
 
 ### A statically-typed AI pipeline language, with a Python runtime containment layer for agentic workloads.
 
-[!![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Compiler: v1.0](https://img.shields.io/badge/compiler-v1.0-blue.svg)](https://github.com/kwdoug63/varek/releases)
 [![Guardrails: v1.1.1](https://img.shields.io/badge/guardrails-v1.1.1-green.svg)](https://github.com/kwdoug63/varek/releases/tag/v1.1.1)
 [![Tests: 659 passing](https://img.shields.io/badge/tests-659%20passing-brightgreen.svg)](#testing)
