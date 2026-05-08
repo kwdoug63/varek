@@ -16,7 +16,7 @@ This results in **Remote Code Execution (RCE)** at the OS boundary, initiated by
 ## 2. The Vulnerability: Probabilistic Failure
 Current industry standard defenses rely on probabilistic wrappers (LLM-as-a-judge, prompt sanitization, heuristic filtering). In a contested electronic warfare environment, advanced adversaries will invariably find encoding structures that bypass probabilistic filters. 
 
-When probabilistic defenses fail, the agent executes the adversary's instructions. Furthermore, interpreter-level hooks (like Python's PEP 578) are structurally insufficient, as child processes spawned via `subprocess` execute outside the parent's interpreter, blinding the hook to advanced evasion techniques.
+When probabilistic defenses fail, the agent executes the adversary's instructions. Furthermore, interpreter-level hooks (like Python's PEP 578) are structurally insufficient. While they may detect the initial creation of a child process via `subprocess`, the child executes entirely outside the parent's interpreter—blinding the hook to any subsequent actions or advanced evasion techniques executed by the payload.
 
 ## 3. The VAREK v1.3 Solution: Supervisor Architecture & Kernel Interception
 **VAREK** abandons probabilistic text-filtering and interpreter-level illusions in favor of deterministic, hardware-enforced execution boundaries governed by a highly privileged parent process ("The Warden"). 
@@ -41,7 +41,7 @@ The attached Proof of Concept demonstrates an ACO agent analyzing a poisoned PCA
 * **Outcome:** Agent Hijacked -> seccomp-unotify Supervisor Intercept Triggered -> Node Integrity Maintained
 
 **View the Core Architecture and I2O Intercept Implementation:**
-[14-darpa-i2o-demo.py](https://github.com/kwdoug63/varek/blob/main/darpa-i2o/14-darpa-i2o-demo.py)
+[14-darpa-i2o-demo.py](https://github.com/kwdoug63/VAREK/blob/main/darpa-i2o/14-darpa-i2o-demo.py)
 
 ---
 *Developed for evaluation by DARPA I2O Program Management.*
