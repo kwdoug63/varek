@@ -1,6 +1,6 @@
 """
 VAREK — AI Pipeline Programming Language
-v0.2 — Type System + Inference Engine
+v1.3.0 — OS-Level System Call Interception & Stateful Semantic Derivation
 
 Author : Kenneth Wayne Douglas, MD
 License: MIT
@@ -22,7 +22,7 @@ from varek.env      import TypeEnv, SchemaRegistry
 from varek.infer    import Inferrer
 from varek.builtins import build_global_env
 
-__version__ = "1.0.0"
+__version__ = "1.3.0"
 __author__  = "Kenneth Wayne Douglas, MD"
 __license__ = "MIT"
 
