@@ -1,7 +1,7 @@
 # ARCHITECTURE PROPOSAL: Autonomous Cyber Operations (ACO) Guardrails
 **Target Directorate:** DARPA Information Innovation Office (I2O)  
 **Relevance:** Adversarial Robustness, AI Assurance, Language Security (LangSec)  
-**Defense Layer:** VAREK v1.1 (Hardware-Enforced Agentic Infrastructure)  
+**Defense Layer:** VAREK v1.3 (Deterministic OS-Level Containment & Supervisor Architecture)  
 
 ---
 
@@ -18,25 +18,27 @@ Current industry standard defenses rely on probabilistic wrappers (LLM-as-a-judg
 
 When probabilistic defenses fail, the agent executes the adversary's instructions. Furthermore, interpreter-level hooks (like Python's PEP 578) are structurally insufficient, as child processes spawned via `subprocess` execute outside the parent's interpreter, blinding the hook to advanced evasion techniques.
 
-## 3. The VAREK v1.1 Solution: Hardware-Enforced Kernel Interdiction
-**VAREK** abandons probabilistic text-filtering and interpreter-level illusions in favor of deterministic, hardware-enforced execution boundaries. 
+## 3. The VAREK v1.3 Solution: Supervisor Architecture & Kernel Interception
+**VAREK** abandons probabilistic text-filtering and interpreter-level illusions in favor of deterministic, hardware-enforced execution boundaries governed by a highly privileged parent process ("The Warden"). 
 
-VAREK v1.1 decouples *model integrity* from *execution integrity*. It cages untrusted agentic code execution strictly at the Linux kernel level utilizing a pluggable `IsolationBackend`. 
+VAREK v1.3 decouples *model integrity* from *execution integrity* by moving admissibility control completely outside the memory space of the untrusted AI agent.
 
-By strictly enforcing native OS-level primitives—`seccomp-bpf`, `cgroups v2`, user/mount/net namespaces, and the critical `PR_SET_NO_NEW_PRIVS` flag—VAREK operates entirely beneath the AI agent. 
+* **Kernel Interception Bridge (`seccomp-unotify`):** Instead of blindly terminating on syscalls, VAREK pauses the untrusted agent's execution thread directly at the kernel boundary to inspect raw system calls. 
+* **Zero-Trust Memory Validation:** Operating with a ~22μs context-switch overhead, the Warden reads isolated memory arguments and injects verdicts (`SECCOMP_RET_ALLOW` or `EPERM` denials) directly back to the kernel, eliminating TOCTOU (Time-of-check to time-of-use) race conditions.
+* **Stateful Execution Context:** VAREK applies O(1) semantic derivation by tracking file descriptors (FDs) across sequential syscalls to derive high-level intent before execution occurs.
 
-If a hijacked ACO agent attempts an unauthorized syscall or network egress based on weaponized telemetry, VAREK physically snaps the execution thread in microseconds via `SIGSYS`—failing closed and terminating the process before the underlying operating system can process the malicious instruction. (Note: Legacy PEP 578 hooks are retained strictly for structured advisory telemetry to aid in defense-in-depth observability).
+If a hijacked ACO agent attempts an unauthorized syscall or network egress based on weaponized telemetry, the physical circuit breaker drops the execution thread instantly—maintaining mathematical containment.
 
 ---
 
 ## 4. Operational Proof of Concept
 
-The attached Proof of Concept demonstrates an ACO agent analyzing a poisoned PCAP. The embedded payload successfully achieves a cognitive bypass on the LLM, instructing it to initiate a reverse shell. VAREK intercepts and terminates the OS-level syscall deterministically.
+The attached Proof of Concept demonstrates an ACO agent analyzing a poisoned PCAP. The embedded payload successfully achieves a cognitive bypass on the LLM, instructing it to initiate a reverse shell. VAREK's Warden process intercepts the execution at the kernel boundary, evaluates the intent, and deterministically injects an `EPERM` denial.
 
 ### Deployment Scenario:
 * **Node:** Tactical Edge Research Server
 * **Vector:** Weaponized Network Traffic (PCAP)
-* **Outcome:** Agent Hijacked -> seccomp-bpf Kernel Intercept Triggered -> Node Integrity Maintained
+* **Outcome:** Agent Hijacked -> seccomp-unotify Supervisor Intercept Triggered -> Node Integrity Maintained
 
 **View the Core Architecture and I2O Intercept Implementation:**
 [14-darpa-i2o-demo.py](https://github.com/kwdoug63/varek/blob/main/darpa-i2o/14-darpa-i2o-demo.py)
