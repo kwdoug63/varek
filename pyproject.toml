@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "varek-guardrails"
-version = "1.1.1"
-description = "Deterministic runtime verification infrastructure for autonomous AI agents — kernel-enforced containment, AST static gates, and PEP 578 telemetry."
+version = "1.3.0"
+description = "Deterministic runtime verification infrastructure for autonomous AI agents — kernel-enforced containment via seccomp-unotify and PEP 578 telemetry."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -50,7 +50,7 @@ Changelog = "https://github.com/kwdoug63/varek/blob/main/CHANGELOG.md"
 Issues = "https://github.com/kwdoug63/varek/issues"
 
 [tool.setuptools]
-py-modules = ["sandbox", "varek_warden"]
+py-modules = ["sandbox", "varek_warden", "seccomp_bridge"]
 
 [tool.setuptools.packages.find]
 include = ["varek_guardrails*"]
