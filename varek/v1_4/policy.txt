@@ -1,1 +1,31 @@
+# VAREK Warden v1.4 — sample policy
+#
+# Rules are evaluated in order. First match wins. No match -> UNKNOWN
+# -> suppressed -> treated as DENY (symmetric-suppression invariant).
+#
+# Format:
+#   <verb> <kind> <match>
+#     verb  := allow | deny
+#     kind  := path | host | exec
+#     match := prefix string (path), "host:port" or "host" (host),
+#             absolute path (exec)
 
+# --- File open ------------------------------------------------------
+allow path /tmp/varek_allowed_
+allow path /usr/lib/
+allow path /lib/
+allow path /lib64/
+allow path /etc/ld.so.cache
+allow path /proc/self/
+deny  path /etc/shadow
+deny  path /etc/passwd
+deny  path /root/
+
+# --- Network connect ------------------------------------------------
+allow host 127.0.0.1:8080
+deny  host evil.example.com
+
+# --- Process exec ---------------------------------------------------
+allow exec /usr/bin/env
+allow exec /bin/sh
+allow exec /usr/bin/python3
