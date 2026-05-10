@@ -134,3 +134,14 @@ Tracked separately, not part of this release:
 ## License
 
 MIT. See SPDX headers in source files.
+
+## Running the included demo
+
+The default policy allows standard system binaries but not the test
+programs in this directory. Append the demo binaries before running:
+
+```sh
+echo 'allow exec ./target_demo'  >> policy.txt
+echo 'allow exec ./bench_target' >> policy.txt
+sudo ./warden policy.txt -- ./target_demo
+```
