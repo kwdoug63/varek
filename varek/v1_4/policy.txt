@@ -1,4 +1,4 @@
-# VAREK Warden v1.4 — sample policy
+# VAREK Warden v1.4 ??? sample policy
 #
 # Rules are evaluated in order. First match wins. No match -> UNKNOWN
 # -> suppressed -> treated as DENY (symmetric-suppression invariant).

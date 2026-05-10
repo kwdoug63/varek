@@ -1,0 +1,33 @@
+VAREK Warden v1.4 benchmark
+Run timestamp: 2026-05-10T13:07:06+00:00
+Host: Linux 6.8.0-110-generic #110-Ubuntu SMP PREEMPT_DYNAMIC Thu Mar 19 15:09:20 UTC 2026 x86_64 GNU/Linux
+CPU: DO-Regular
+Memory: 458Mi total, 291Mi available
+warden  sha256 prefix: e08e22c79a49
+bench   sha256 prefix: 2b2dedc8e0ac
+Records: 10006
+Wall-clock: 0.309s
+
+============================================================
+ VAREK Warden v1.4 — Decision Latency Report
+============================================================
+ Decisions observed     : 10006
+ Time window            : 0.30 s of wall-clock activity
+
+ Decision distribution
+   ALLOW   :   8006
+   DENY    :   2000
+   UNKNOWN :      0   (always suppressed -> DENY)
+
+ Latency percentiles (microseconds)
+   p50    :     15
+   p90    :     27
+   p95    :     28
+   p99    :     44
+   p99.9  :     72
+   max    :    405
+
+ Soundness
+   False negatives observed (allow on deny-target) : 0
+   Suppressed (UNKNOWN -> DENY)                    : 1000
+============================================================

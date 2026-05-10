@@ -515,8 +515,8 @@ static int inject_resolved_fd(int notify_fd,
 
     struct open_how_local how = {
         .flags   = (uint64_t)a->open_flags & ~(uint64_t)O_PATH,
-        .mode    = (uint64_t)a->open_mode  & 0777,
-        .resolve = RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
+        .mode    = ((uint64_t)a->open_flags & (uint64_t)O_CREAT) ? ((uint64_t)a->open_mode & 0777) : 0,
+        .resolve = RESOLVE_NO_MAGICLINKS,
     };
     int resolved = (int)syscall(__NR_openat2,
                                 cwd_fd, a->target, &how, sizeof(how));
@@ -532,7 +532,7 @@ static int inject_resolved_fd(int notify_fd,
     };
     int rc = ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd);
     close(resolved);
-    return rc;
+    return rc < 0 ? -1 : 0;
 }
 
 /* ---------------- receive loop ---------------- */
@@ -620,8 +620,12 @@ int main(int argc, char **argv) {
 
     log_init();
 
-    signal(SIGINT,  on_term);
-    signal(SIGTERM, on_term);
+    struct sigaction sa = { .sa_handler = on_term };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  /* no SA_RESTART: we want EINTR to break ioctl */
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGCHLD, &sa, NULL);
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
@@ -659,6 +663,7 @@ int main(int argc, char **argv) {
 
     supervise(notify_fd, &p);
 
+    kill(target, SIGKILL);  /* best-effort: ensures waitpid does not hang */
     int status = 0;
     waitpid(target, &status, 0);
     close(notify_fd);

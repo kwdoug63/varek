@@ -1,0 +1,10 @@
+# build artifacts
+warden
+target_demo
+bench_target
+*.o
+
+# benchmark output
+bench.log
+bench_small.log
+*.log
