@@ -1,0 +1,30 @@
+VAREK v1.5 fast_match benchmark
+Run timestamp: 2026-05-12T18:26:18+00:00
+Host: Linux 6.8.0-110-generic #110-Ubuntu SMP PREEMPT_DYNAMIC Thu Mar 19 15:09:20 UTC 2026 x86_64 GNU/Linux
+CPU: DO-Regular
+Memory: 458Mi
+
+============================================================
+ VAREK Warden — Decision Latency Report
+============================================================
+ Decisions observed     : 10000
+ Time window            : 0.05 s of wall-clock activity
+ Measurement precision  : nanosecond (sub-microsecond)
+
+ Decision distribution
+   ALLOW   :   5833
+   DENY    :   4167
+   UNKNOWN :      0   (always suppressed -> DENY)
+
+ Latency percentiles (microseconds)
+   p50    :   0.093
+   p90    :   0.137
+   p95    :   0.151
+   p99    :   0.271
+   p99.9  :   0.526
+   max    :    8.26
+
+ Soundness
+   False negatives observed (allow on deny-target) : 0
+   Suppressed (UNKNOWN -> DENY)                    : 2500
+============================================================
