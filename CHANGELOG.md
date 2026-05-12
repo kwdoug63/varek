@@ -7,6 +7,61 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.5.0] - 2026-05-12
+
+### Added
+
+- `v1_5/fast_match.c`: Fast-path policy matcher using sorted prefix arrays with binary-search lookup. Three-state `ALLOW` / `DENY` / `UNKNOWN` decision procedure with symmetric suppression preserved from v1.4.
+- `v1_5/smt_probe.c`, `v1_5/smt_probe2.c`: SMT decision-procedure feasibility benchmarks (fresh-context and context-reuse access patterns). Retained for richer policies — regex, integer ranges, multi-rule conjunctions — that the prefix matcher cannot express.
+- `v1_5/bench_summarize.py`: Nanosecond-precision summarizer. Backward-compatible with v1.4 pathology logs.
+- `v1_5/NOTES.md`: Design notes documenting the hybrid prefix-DFA + SMT architecture decision.
+- `v1_5/bench_results_v1_5.txt`: Provenance record (host, kernel, CPU, memory) from the measured benchmark run.
+
+### Performance
+
+- `fast_match`: P50 = 93 ns, P99 = 271 ns, P99.9 = 526 ns across 10,000 decisions on DigitalOcean 1 vCPU / 512 MB. Three orders of magnitude faster than the v1.4 Warden's 57 µs P99 — policy-decision time is not the bottleneck in seccomp-unotify enforcement.
+- SMT context-reuse probe: P50 = 465 µs, P99 = 51,959 µs (bimodal distribution). Disqualified from hot-path use; retained for the slow-path role on richer policies.
+- Zero false negatives. Full `UNKNOWN` → `DENY` suppression across the benchmark.
+
+## [1.4.0] - 2026-05-10
+
+### Added
+
+- `v1_4/warden.c`: Production seccomp-unotify Warden in C. Privileged parent process intercepting syscalls, performing cross-process `/proc/<pid>/mem` extraction, and injecting kernel verdicts.
+- `v1_4/policy.txt`: Declarative policy file with `allow` / `deny` verbs across `path`, `host`, and `exec` rule kinds.
+- `v1_4/bench_target.c`, `v1_4/target_demo.c`: Benchmark targets for end-to-end pipeline measurement.
+- `v1_4/bench_summarize.py`: JSON pathology summarizer producing latency percentile reports.
+- `v1_4/Makefile`: Build system for the Warden and its targets.
+- `v1_4/README.md`, `v1_4/RFC_ISSUE.md`: Reference documentation.
+
+### Changed
+
+- Warden migrated from Python (`waren.py`) to C for seccomp-unotify call performance.
+- Policy evaluation hosted in the supervisor process with cross-process memory extraction at the syscall trap boundary.
+
+### Performance
+
+- End-to-end Warden pipeline (seccomp-unotify + `/proc/<pid>/mem` + kernel injection): P99 = 57 µs measured.
+
+## [1.3.0] - 2026-05-10
+
+### Added
+
+- `v1_3/`: Architecture scaffolding for the supervisor-based defense layer.
+- High-speed visual benchmark script for measured rule evaluation.
+- `RFC_TEMPLATE.md` and `VAREK_v1.2_RFC.md`: RFC infrastructure documenting fail-closed semantics and linear rule evaluation.
+- `CONTRIBUTING.md` and Contributor License Agreement (CLA) details.
+- `seccomp_toctou_harness.c`: TOCTOU harness for seccomp-unotify exploration.
+
+### Changed
+
+- Refactored VAREK defense layer and Ant Colony Optimization agent simulation.
+- DARPA I2O whitepaper revised for v1.1 and v1.3 architectures.
+- License unified to MIT across all source files (resolved earlier Apache 2.0 / MIT inconsistency).
+- README consolidated (removed README2 / README3 iterations).
+
+---
+
 ## [1.2.1] - 2026-05-03
 ### Added
 - `waren.py`: Supervisor parent process to enforce out-of-band policy evaluation.
