@@ -50,3 +50,4 @@ bench_target
 # === Logs ===
 *.log
 bench.log
+wandb/
