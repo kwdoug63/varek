@@ -34,4 +34,4 @@ class VarekCircuitBreakerTool(BaseTool):
         return "Database write executed safely."
 
     def _arun(self, payload: str):
-        raise NotImplementedError("Async enforcement requires VAREK Enterprise (SAI).")
+        raise NotImplementedError("Async enforcement is not implemented in this distribution.")
