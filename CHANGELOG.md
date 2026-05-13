@@ -19,7 +19,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Performance
 
-- `fast_match`: P50 = 93 ns, P99 = 271 ns, P99.9 = 526 ns across 10,000 decisions on DigitalOcean 1 vCPU / 512 MB. Three orders of magnitude faster than the v1.4 Warden's 57 µs P99 — policy-decision time is not the bottleneck in seccomp-unotify enforcement.
+- `fast_match`: P50 = 93 ns, P99 = 271 ns, P99.9 = 526 ns across 10,000 decisions on DigitalOcean 1 vCPU / 512 MB. Two orders of magnitude (210x) faster than the v1.4 Warden's 57 µs P99 — policy-decision time is not the bottleneck in seccomp-unotify enforcement.
 - SMT context-reuse probe: P50 = 465 µs, P99 = 51,959 µs (bimodal distribution). Disqualified from hot-path use; retained for the slow-path role on richer policies.
 - Zero false negatives. Full `UNKNOWN` → `DENY` suppression across the benchmark.
 
@@ -43,7 +43,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - End-to-end Warden pipeline (seccomp-unotify + `/proc/<pid>/mem` + kernel injection): P99 = 57 µs measured.
 
-## [1.3.0] - 2026-05-10
+## [1.3.0] - 2026-05-08
 
 ### Added
 
