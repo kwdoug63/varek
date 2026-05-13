@@ -23,6 +23,26 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - SMT context-reuse probe: P50 = 465 µs, P99 = 51,959 µs (bimodal distribution). Disqualified from hot-path use; retained for the slow-path role on richer policies.
 - Zero false negatives. Full `UNKNOWN` → `DENY` suppression across the benchmark.
 
+### Reproduce
+
+    git clone https://github.com/kwdoug63/varek.git
+    cd varek/v1_5
+    sudo apt install -y libz3-dev
+    make
+    ./fast_match 10000 ../v1_4/policy.txt 2> bench_fast.log
+    python3 bench_summarize.py bench_fast.log
+
+### Verify
+
+    git verify-tag v1.5.0
+
+### Links
+- Pull request: [#11](https://github.com/kwdoug63/varek/pull/11)
+- Design notes: [`v1_5/NOTES.md`](https://github.com/kwdoug63/varek/blob/v1.5.0/v1_5/NOTES.md)
+- Provenance: [`v1_5/bench_results_v1_5.txt`](https://github.com/kwdoug63/varek/blob/v1.5.0/v1_5/bench_results_v1_5.txt)
+
+---
+
 ## [1.4.0] - 2026-05-10
 
 ### Added
@@ -42,6 +62,24 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Performance
 
 - End-to-end Warden pipeline (seccomp-unotify + `/proc/<pid>/mem` + kernel injection): P99 = 57 µs measured.
+
+### Reproduce
+
+    git clone https://github.com/kwdoug63/varek.git
+    cd varek/v1_4
+    make
+    ./warden ./bench_target 10000 2> bench.log
+    python3 bench_summarize.py bench.log
+
+### Verify
+
+    git verify-tag v1.4.0
+
+### Links
+- Pull request: [#10](https://github.com/kwdoug63/varek/pull/10)
+- Design RFC: [`docs/RFC_seccomp_unotify_design.md`](https://github.com/kwdoug63/varek/blob/v1.4.0/docs/RFC_seccomp_unotify_design.md)
+
+
 
 ## [1.3.0] - 2026-05-08
 
