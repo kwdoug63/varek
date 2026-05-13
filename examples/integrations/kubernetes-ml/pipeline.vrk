@@ -8,10 +8,10 @@ type ProcessedBatch = {
 }
 
 // Map external container execution boundaries
-@kubernetes(image="soberagents/preprocess:v1", resources={cpu: "2", mem: "4Gi"})
+@kubernetes(image="your-registry/preprocess:v1", resources={cpu: "2", mem: "4Gi"})
 external fn preprocess_data(raw_path: String) -> Result<ProcessedBatch, DataError>
 
-@kubernetes(image="soberagents/train:v1", resources={gpu: "1", mem: "8Gi"})
+@kubernetes(image="your-registry/train:v1", resources={gpu: "1", mem: "8Gi"})
 external fn train_model(data: ProcessedBatch) -> Result<Float32, TrainError>
 
 fn main() {

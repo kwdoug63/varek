@@ -16,8 +16,6 @@ venv/
 *-intercept.py
 *_intercept.py
 darpa-i2o/
-examples/*
-!examples/agent_media_sandbox/
 *.ipynb
 *.ipynb_checkpoints/
 
