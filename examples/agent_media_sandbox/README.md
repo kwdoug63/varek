@@ -35,7 +35,7 @@ cd examples/agent_media_sandbox/
 ./setup.sh
 ```
 
-The default origin is **picsum.photos** — a stable, no-auth placeholder image service that actually returns real JPEGs, so the agent's MIME-type guard exercises a real code path. Override with `ORIGIN_HOST` for any other origin:
+The default origin is **httpbin.org**, a public HTTP testing service whose `/image/jpeg` endpoint returns a real JPEG directly (no redirect chain to chase). This exercises the agent's MIME-type guard on a real code path. Override with `ORIGIN_HOST` for any other origin:
 
 ```sh
 ORIGIN_HOST=images.unsplash.com ./setup.sh
@@ -47,7 +47,7 @@ Then run the agent under Warden using the command `setup.sh` prints:
 sudo ./varek/v1_4/warden \
     /tmp/agent-example/policy.txt \
     -- python3 /tmp/agent-example/agent.py \
-       https://picsum.photos/seed/varek/800/600.jpg
+       https://httpbin.org/image/jpeg
 ```
 
 ### What a denied call looks like
