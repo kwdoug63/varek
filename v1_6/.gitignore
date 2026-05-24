@@ -1,0 +1,11 @@
+# Build artifacts
+plan_demo
+adapter_demo
+/tests/test_evaluator
+/tests/test_symmetric_suppression
+/tests/test_order_invariance
+/tests/test_fanout
+/tests/test_cycle_detection
+/tests/test_adapter
+/tests/test_pathology
+/tests/test_plan_parser

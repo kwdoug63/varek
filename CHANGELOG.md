@@ -7,6 +7,37 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.6.0] - 2026-05-24
+
+### Added
+
+- `v1_6/execution_plan.c`, `v1_6/execution_plan.h`, `v1_6/execution_plan_internal.h`: ExecutionPlan primitive. Fixed-capacity directed acyclic graph of Actions (1024 nodes, 4096 edges); no dynamic allocation past the plan struct.
+- `v1_6/plan_evaluator.c`: Compositional evaluator. Iterative-DFS cycle detection plus per-node decision aggregation under the join over the lattice `SATISFIED < UNKNOWN < UNSATISFIED`. Three-state return with symmetric suppression preserved on both `UNSATISFIED` and `UNKNOWN` from the v1.4 per-action layer.
+- `v1_6/plan_demo.c`: Kernel demo binary.
+- `v1_6/tests/`: Five test binaries — evaluator basics, symmetric suppression, exhaustive order-invariance (960 permutations across three node-set shapes), fanout poisoning at every position, and cycle detection.
+- `v1_6/README.md`, `v1_6/NOTES.md`: Documentation and design rationale.
+
+### Patent
+
+- Implements USPTO Provisional 64/062,549 (filed 2026-05-11): pre-execution verification of action graphs as compositional policy decisions. Lifts the per-Action decision of the v1.4 Warden to a plan-level decision over the whole action graph, evaluated before any node executes.
+
+### Performance
+
+- Verification is a single linear fold with a short-circuit at the top of the lattice, plus one DFS pass for cycle detection. No allocation on the verification path; cycle-detection scratch is in fixed-size thread-local arrays.
+
+### Reproduce
+
+    git clone https://github.com/kwdoug63/varek.git
+    cd varek/v1_6
+    make check
+
+### Verify
+
+    git verify-tag v1.6.0
+
+### Links
+- Release: https://github.com/kwdoug63/varek/releases/tag/v1.6.0
+
 ## [1.5.0] - 2026-05-12
 
 ### Added
