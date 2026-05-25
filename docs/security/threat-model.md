@@ -1,7 +1,7 @@
 # VAREK Threat Model
 
 **Version:** 1.1
-**Last updated:** April 20, 2026
+**Last updated:** May 25, 2026
 **Scope:** the isolation layer used to execute untrusted code (code-interpreter tools, agentic execution contexts, sandboxed eval).
 
 This document states, explicitly, what VAREK's containment layer defends against and what it does not. It is written so operators can make informed deployment decisions and so reviewers can hold the project to a concrete bar.
@@ -21,7 +21,7 @@ The adversary is assumed to be:
 
 - **Fully adaptive.** They know VAREK's design, read this document, and have the source. Security-by-obscurity is not claimed anywhere.
 - **Capable of arbitrary Python.** Any module in the standard library, any installed package, `ctypes`, raw syscalls via `ctypes.CDLL(None).syscall(...)`, and any native extension the interpreter can import.
-- **Non-interactive within a single execution.** The adversary submits a payload and receives stdout/stderr/exit code. They do not have a persistent shell, network callback, or side channel into the sandbox host — subject to §4.
+- **Non-interactive within a single execution.** The adversary submits a payload and receives stdout/stderr/exit code. They do not have a persistent shell, network callback, or side channel into the sandbox host — subject to §5.
 - **Potentially persistent across executions.** The host may process many adversarial payloads in sequence. Containment must hold across the full stream, not just the first one.
 
 The adversary is **not** assumed to be:
@@ -82,39 +82,53 @@ Payloads that load a C extension, a `ctypes`-wrapped shared object, or an embedd
 
 This is the core reason v1.0's PEP 578 approach was wrong: hooks live in Python; native code bypasses them. Seccomp does not have this property.
 
-## 4. Out of scope — undefended threats
+## 4. Known bypasses (expected) — the AST gate is not a security control
 
-### 4.1 Kernel 0-days
+VAREK includes a static AST gate that rejects obvious unauthorized imports and calls before execution. **It is a developer-experience layer, not a security boundary.** Its only job is to return a readable error in ~50ms for common mistakes instead of a kernel kill ~500ms later. It is expected to be bypassable, and the following techniques defeat it by design. Each is documented here so reviewers do not mistake the AST gate for the trust boundary defined in §2.
+
+- `importlib.import_module(...)` and other dynamic import paths
+- `__builtins__.__import__(...)` invoked directly
+- String-constructed module names, e.g. `__import__('o' + 's')`
+- `ctypes.CDLL(...)` loading a native library directly
+- `sys.modules` manipulation to rebind or smuggle a module
+
+None of these grant a capability the kernel layer does not already mediate. A payload that bypasses the AST gate and reaches a denied syscall is killed by seccomp (§3.1, §3.4); one that attempts `execve` is rejected with `EPERM` (§3.1); one that loads native code runs under the same filter as the Python code (§3.6). The AST gate failing is not a containment failure.
+
+The same logic applies to the PEP 578 audit hook, demoted to telemetry in v1.1 (see §2): it does not cross the subprocess boundary and never carries enforcement weight. Bypassing, disabling, or crashing the hook does not affect containment.
+
+## 5. Out of scope — undefended threats
+
+### 5.1 Kernel 0-days
 
 A seccomp-bpf filter is only as strong as the kernel implementing it. A local privilege escalation via an allowlisted syscall (e.g. an `io_uring` bug before `io_uring_setup` was killlisted, an `openat2` LSM bypass, a `futex` UAF) will defeat VAREK's reference backend.
 
 Deployments with nation-state threat models should use the forthcoming gVisor backend (v1.2), which runs a user-space kernel implementation and reduces the host-kernel attack surface by roughly two orders of magnitude.
 
-### 4.2 Side channels
+### 5.2 Side channels
 
 Spectre-class speculative execution attacks, cache timing, power analysis, thermal covert channels, and scheduler-based leaks are not mitigated by VAREK. Mitigation is a deployment concern: dedicated cores, CPU mitigations enabled, no co-tenancy with sensitive workloads.
 
-### 4.3 Exfiltration via policy-permitted channels
+### 5.3 Exfiltration via policy-permitted channels
 
 If the operator's `ExecutionPolicy` sets `allow_network=True` and permits outbound connections to `api.example.com`, hostile code will exfiltrate through that channel. VAREK does not inspect application-layer traffic. Channel allowlisting is the operator's responsibility, not VAREK's.
 
-### 4.4 Supply-chain compromise
+### 5.4 Supply-chain compromise
 
 If the adversary controls the Python interpreter binary, the `libseccomp` library, VAREK's own source, or any dependency pulled at install time, containment is not meaningful. Reproducible builds, signed releases, and pinned dependencies are the operator's responsibility.
 
-### 4.5 Denial of service against the host
+### 5.5 Denial of service against the host
 
 VAREK bounds per-execution resource use. It does not bound aggregate pressure from many concurrent executions, nor does it prevent an adversary from repeatedly paying the fixed cost of sandbox setup (namespace creation, cgroup creation, filter compilation). Operators running public endpoints should rate-limit at a layer above VAREK.
 
-### 4.6 Information disclosure via error channels
+### 5.6 Information disclosure via error channels
 
 Error messages, return codes, and timing are not scrubbed. An adversary who can run many payloads and observe `ExecutionOutcome` can infer facts about the host. This is acceptable for most deployments and is outside v1.1's goals.
 
-### 4.7 Platform coverage
+### 5.7 Platform coverage
 
-The v1.1 reference backend is Linux-only, kernel 5.10+, with cgroups v2 mounted and unprivileged user namespaces enabled. Deployments outside that envelope must wait for the v1.2 backends (gVisor, bubblewrap, Windows Job Objects). The backend fails closed on unsupported hosts rather than silently downgrading.
+The v1.1 reference backend is Linux-only, kernel 5.10, with cgroups v2 mounted and unprivileged user namespaces enabled. Deployments outside that envelope must wait for the v1.2 backends (gVisor, bubblewrap, Windows Job Objects). The backend fails closed on unsupported hosts rather than silently downgrading.
 
-## 5. Non-goals
+## 6. Non-goals
 
 VAREK is not:
 
@@ -123,12 +137,12 @@ VAREK is not:
 - A bug-finder or malware scanner. It contains what it executes; it does not predict whether execution is safe.
 - A policy language. `ExecutionPolicy` is deliberately simple. Rich policy composition (per-tool, per-user, time-bounded) is the caller's responsibility.
 
-## 6. Reporting security issues
+## 7. Reporting security issues
 
 Security issues that affect the containment guarantees in §3 should be reported privately via a GitHub security advisory on the repository rather than public issue. Public-issue reports are also accepted and will be responded to; private reporting is preferred when the issue is exploitable against existing deployments.
 
-Issues that affect only items listed in §4 (out of scope) are not treated as security bugs and should be filed as ordinary feature requests.
+Issues that affect only items listed in §5 (out of scope) are not treated as security bugs and should be filed as ordinary feature requests.
 
-## 7. Changelog of the threat model itself
+## 8. Changelog of the threat model itself
 
-- **2026-04-20 (v1.1):** initial threat model document. Created in response to issue #223. Replaces the implicit v1.0 model in which PEP 578 was treated as an enforcement boundary.
+- **2026-05-25 (v1.1.x): added §4 (known expected bypasses / AST gate clarification) per external review item.**
