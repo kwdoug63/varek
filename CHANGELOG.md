@@ -7,6 +7,36 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.6.1] - 2026-05-24
+
+### Added
+
+- `v1_6/plan_spec.h`: Declarative plan-input type. Carries action kind, target, parameters, and edges; stable across per-action deciders.
+- `v1_6/warden_adapter.c`, `v1_6/warden_adapter.h`: Callback-driven plan builder. `warden_build_and_verify()` takes a `plan_spec_t` and a `plan_decide_fn` callback, constructs an `exec_plan_t`, runs the v1.6.0 evaluator, optionally emits a pathology record, and returns the plan-level decision.
+- `v1_6/pathology.c`, `v1_6/pathology.h`: JSON pathology record emission matching the v1.4 Warden's record style. Plan-level records use a `pp-` prefix. Suppression-reason classifier: `none`, `node`, `cycle`, `empty`, `capacity`, `edge_index`.
+- `v1_6/adapter_demo.c`: Adapter demo with permissive and denying decider scenarios.
+- `v1_6/tests/test_adapter.c`, `v1_6/tests/test_pathology.c`: Adapter dispatch and pathology-format unit tests.
+
+### Notes
+
+- The adapter is callback-driven by design: the v1.6.0 kernel stays independent of any specific per-action policy implementation. A thin shim wrapping the v1.4 `policy_decide()` lands in v1.6.2, not here.
+
+### Reproduce
+
+    git clone https://github.com/kwdoug63/varek.git
+    cd varek/v1_6
+    make check
+    make adapter-demo
+
+### Verify
+
+    git verify-tag v1.6.1
+
+### Links
+- Release: https://github.com/kwdoug63/varek/releases/tag/v1.6.1
+
+---
+
 ## [1.6.0] - 2026-05-24
 
 ### Added

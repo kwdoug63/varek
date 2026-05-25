@@ -1,4 +1,4 @@
-# VAREK v1.6.0 — design notes
+# VAREK v1.6.1 — design notes
 
 ## Scope: pre-execution verification of an ExecutionPlan
 
@@ -16,6 +16,21 @@ execution. The symmetric-suppression invariant — both negative
 states block, only the positive state authorizes — is preserved
 under graph composition.
 
+## Release line
+
+The v1.6 release line ships in three sequential tags:
+
+- **v1.6.0** — verification kernel. ExecutionPlan primitive,
+  compositional evaluator, decision API. No external consumers.
+- **v1.6.1** *(this release)* — adapter layer. Declarative
+  `plan_spec_t` input, callback-driven plan builder, JSON
+  pathology record emission. The adapter is the bridge between
+  a caller's per-action policy logic and the kernel's plan-level
+  decision.
+- **v1.6.2** — patched v1.4 Warden integration: text plan-file
+  format, `--plan` CLI flag, pre-fork verification gate, end-to-end
+  integration smoke test.
+
 ## What ships in v1.6.0
 
 1. ExecutionPlan primitive — node and edge construction with
@@ -26,47 +41,68 @@ under graph composition.
    join.
 3. Plan-level tri-state decision: `SATISFIED` / `UNSATISFIED` /
    `UNKNOWN`.
-4. Authorization API: `exec_plan_authorized()` returns `true`
-   exactly when the plan-level decision is `SATISFIED`.
-5. Test suite covering symmetric suppression on `UNSAT`, symmetric
-   suppression on `UNKNOWN`, all-`SAT` acceptance, fanout poisoning
-   at every position, exhaustive permutation invariance, and cycle
-   rejection.
+4. Authorization API: `exec_plan_authorized()`.
+5. Test suite for kernel invariants.
 
-## What is NOT in v1.6.0
+## What ships in v1.6.1
 
-- **Warden adapter.** The v1.6.0 evaluator consumes pre-computed
-  per-node decisions. The callback-driven adapter that calls the
-  v1.4 `policy_decide()` per node, builds a plan, and emits
-  pathology records is tracked for v1.6.1.
-- **v1.4 Warden integration.** The patched Warden with a `--plan`
-  CLI flag and a pre-fork verification gate is tracked for v1.6.2.
-- **`var::` stdlib surface for plan construction.** Deferred.
-  Public stdlib surfaces are far harder to change than internal
-  kernel APIs; keeping the surface back until the kernel has been
-  exercised by a real consumer lets us iterate on the kernel
-  without breaking a stable contract.
-- **Per-edge policy semantics.** Edges in v1.6.0 carry only
-  ordering / data-dependency information used by the cycle check.
-  Policies that reason about data flow across edges (taint
-  propagation, capability transfer) are tracked for v1.7+.
+1. `plan_spec_t` — declarative description of an intended plan.
+   Carries action kind, target, parameters, edges, and capacity
+   metadata. Stable across deciders.
+2. `warden_build_and_verify()` — callback-driven adapter. Given a
+   spec and a `plan_decide_fn` callback, builds an `exec_plan_t`,
+   calls the kernel evaluator, optionally emits a pathology
+   record, and returns the plan-level decision.
+3. JSON pathology emission matching the format and prefix
+   convention of the v1.4 Warden's per-action records. Plan-level
+   records use the `pp-` prefix; per-action records use `pr-`.
+4. Capacity, validity, and structural error classifiers in the
+   pathology output: `node`, `cycle`, `empty`, `capacity`,
+   `edge_index`.
+5. Two additional test binaries: `test_adapter` and
+   `test_pathology`.
+
+## What is NOT in v1.6.1
+
+- **v1.4 Warden integration.** The patched supervisor with a
+  `--plan` CLI flag and a pre-fork verification gate is tracked
+  for v1.6.2. The adapter shipped here is callable from any
+  caller; the actual wiring into the v1.4 `main()` is the v1.6.2
+  patch.
+- **Text plan-file parser.** Reading a plan declaration from a
+  file format suitable for the `--plan` CLI flag is v1.6.2 work.
+- **`var::` stdlib surface for plan construction.** Public stdlib
+  surfaces commit us to compatibility guarantees the kernel and
+  adapter do not yet require. Deferred until the kernel and
+  adapter have been exercised against the patched Warden in
+  v1.6.2.
+- **Per-edge policy semantics.** Edges carry only ordering /
+  data-dependency information used by the cycle check. Policies
+  that reason about data flow across edges (taint propagation,
+  capability transfer) are tracked for v1.7+.
 - **Persistent plan serialization.** Plans are in-memory only.
 
-## Why kernel-first
+## Why adapter is callback-driven
 
-Three reasons.
+The kernel module (v1.6.0) is intentionally independent of any
+specific per-action policy implementation. The adapter could have
+taken a direct dependency on the v1.4 Warden's `policy_decide()`,
+but that would have created a circular-ish import (warden depends
+on adapter depends on warden) and would have prevented unit
+testing the adapter against synthetic deciders.
 
-1. **Patent substance.** The patentable element is the
-   compositional evaluator over the plan graph. Hardening that in
-   isolation, with a focused test suite, is the right risk
-   posture for the v1.6 line.
-2. **API stability.** Public stdlib surfaces commit us to
-   compatibility guarantees the kernel itself does not require.
-   Letting the kernel settle first means surface ergonomics can
-   be tuned against real consumers rather than guessed at.
-3. **Blast radius.** v1.6.0 with no public surface affects only
-   internal callers. If a defect surfaces, the fix doesn't break
-   downstream consumers because there aren't any yet.
+The callback shape is:
+
+```c
+typedef plan_decision_t (*plan_decide_fn)(const plan_spec_node_t *node,
+                                          void *ctx);
+```
+
+The v1.4 Warden's `policy_decide()` will be wrapped in a thin shim
+that translates a `plan_spec_node_t` into the Warden's internal
+`struct action` and returns the resulting `decision_t` as a
+`plan_decision_t`. That shim lives in the v1.6.2 patch, not in
+this release.
 
 ## Compositional decision rule
 
@@ -81,60 +117,57 @@ For a plan with per-node decisions `D = {d_1, ..., d_n}`:
 | Else (all `d_i == SATISFIED`)      | `SATISFIED`     |
 
 The aggregator is the join over the lattice
-`SATISFIED < UNKNOWN < UNSATISFIED`. It is:
-
-- **Associative**: `join(a, join(b, c)) = join(join(a, b), c)`.
-- **Commutative**: `join(a, b) = join(b, a)`.
-- **Idempotent**: `join(a, a) = a`.
-
-Fold order is therefore observably irrelevant. The structural DFS
-in phase 1 imposes an order for cycle detection only;
-`tests/test_order_invariance.c` verifies the algebraic property
-exhaustively over 960 permutations across three node-set shapes.
+`SATISFIED < UNKNOWN < UNSATISFIED`. Associative, commutative,
+idempotent. Exhaustively tested for order invariance over 960
+permutations.
 
 ## Symmetric suppression under composition
 
-The patent invariant — `UNSATISFIED` and `UNKNOWN` both suppress
-per-Action execution — lifts directly to the plan level under the
-join above. Either of those values at any node propagates to the
-plan-level result.
+`UNSATISFIED` and `UNKNOWN` both suppress per-Action execution
+in the v1.4 patent. That invariant lifts directly to the plan
+level under the join above: either value at any node propagates
+to the plan-level result. The join preserves the more
+informative of the two for pathology output (`UNSATISFIED`
+dominates `UNKNOWN`); both block the plan equally.
 
-The join preserves the **more informative** of the two for
-pathology output: `UNSATISFIED` dominates `UNKNOWN`, because
-"a specific action is known-disallowed" carries more information
-than "the verifier could not form an opinion." Both block the
-plan equally. `exec_plan_authorized()` returns `true` only on
-`SATISFIED`, encoding the invariant at the API boundary so the
-caller cannot accidentally execute a suppressed plan.
+## JSON pathology format
 
-## Why cycle yields UNKNOWN, not UNSATISFIED
+One JSON object per verification, written to stderr by the
+adapter when `emit_pathology` is true. Fields are detailed in
+`README.md`. Two design choices worth noting:
 
-A cyclic edge set is a structurally unverifiable input. The plan
-graph contract requires acyclicity (the directed-acyclic part is
-load-bearing for compositional reasoning). Returning `UNKNOWN`
-rather than `UNSATISFIED` reflects what actually happened: the
-verifier could not form a meaningful opinion about the action
-set. Both still suppress the plan; the distinction matters for
-pathology telemetry and for downstream debugging.
-
-The contract also rejects self-edges at insertion. Longer cycles
-are caught by the DFS in `plan_evaluator.c`.
+1. **`pp-` prefix on `report_id`.** Plan-level records use `pp-`
+   so they're trivially distinguishable from the v1.4 Warden's
+   per-action `pr-` records. When v1.6.2 lands and both record
+   types share a stderr stream, the prefix lets downstream
+   consumers (log aggregators, SIEMs, pathology dashboards)
+   filter without parsing the body.
+2. **`suppression_reason` is a classifier, not a free-text
+   explanation.** Values are fixed: `none`, `node`, `cycle`,
+   `empty`, `capacity`, `edge_index`. This keeps the format
+   parseable and the cardinality bounded for telemetry
+   aggregation.
 
 ## Determinism and allocation
 
-No allocation on the verification path. The cycle-detection
-scratch (color array, CSR adjacency, DFS stack) lives in
-thread-local arrays sized to `PLAN_MAX_NODES` and
-`PLAN_MAX_EDGES`. The fold over node decisions is a single
-linear pass with a short-circuit at the top of the lattice.
+No allocation on the verification path. The kernel's cycle
+detection scratch lives in thread-local arrays sized to
+`PLAN_MAX_NODES` and `PLAN_MAX_EDGES`. The adapter allocates one
+`exec_plan_t` per build via `exec_plan_new()`; the caller is
+responsible for freeing.
 
-There is no recursion. The DFS uses an explicit stack to avoid
-stack-overflow concerns under large plans and to keep memory
-consumption predictable.
+The pathology emission path uses a fixed-size stack buffer for
+the JSON record; record sizes are bounded by the field set above.
+No `malloc` on the emit path.
 
-The only allocation in the entire module is the single `calloc`
-in `exec_plan_new()`. `tests/` exercises this without leaks under
-ASan.
+## Threading model
+
+The kernel and adapter are single-threaded by contract:
+verification happens on a single supervisor thread, before any
+forked process runs. Multiple supervisor threads with disjoint
+plans are safe (the thread-local scratch in the kernel
+guarantees this); concurrent verification of the same plan from
+multiple threads is not supported and not exercised.
 
 ## Validation
 
