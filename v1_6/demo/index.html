@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: MIT -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VAREK v1.6 demo &mdash; pre-execution plan verification</title>
+<meta name="description" content="Compositional verification of agent action graphs. USPTO Provisional 64/062,549.">
+
+<link rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/asciinema-player@3/dist/bundle/asciinema-player.min.css">
+
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --muted: #5a5a5a;
+    --bg: #ffffff;
+    --accent: #00b8a4;
+    --link: #0a6cdd;
+    --code-bg: #f3f3f3;
+    --border: #e5e5e5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e8e8;
+      --muted: #a0a0a0;
+      --bg: #121212;
+      --accent: #00ffe0;
+      --link: #66b3ff;
+      --code-bg: #1f1f1f;
+      --border: #2a2a2a;
+    }
+  }
+  html, body { background: var(--bg); color: var(--fg); }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                 Roboto, Helvetica, Arial, sans-serif;
+    max-width: 960px;
+    margin: 2.5rem auto;
+    padding: 0 1.25rem;
+    line-height: 1.55;
+  }
+  h1 { font-size: 1.7rem; margin-bottom: 0.25rem; letter-spacing: -0.01em; }
+  .tag {
+    display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px;
+    background: var(--accent); color: #001a17;
+    font-size: 0.75rem; font-weight: 600; letter-spacing: 0.04em;
+    text-transform: uppercase; vertical-align: middle;
+  }
+  .meta { color: var(--muted); font-size: 0.92rem; margin: 0.5rem 0 1.75rem; }
+  .meta a { color: var(--link); text-decoration: none; }
+  .meta a:hover { text-decoration: underline; }
+  p { margin: 0.9rem 0; }
+  code, pre {
+    font-family: ui-monospace, SFMono-Regular, "JetBrains Mono",
+                 Menlo, Consolas, monospace;
+    font-size: 0.9em;
+  }
+  code { background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 3px; }
+  pre {
+    background: var(--code-bg); padding: 0.75rem 1rem;
+    border-radius: 4px; overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  .player-wrap {
+    margin: 1.75rem 0;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .scenes {
+    margin: 1.5rem 0;
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.92rem;
+  }
+  .scenes th, .scenes td {
+    text-align: left; padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .scenes th { color: var(--muted); font-weight: 600; }
+  .scenes td:first-child { color: var(--muted); white-space: nowrap; width: 4rem; }
+  footer {
+    margin-top: 3rem; padding-top: 1.25rem;
+    border-top: 1px solid var(--border);
+    color: var(--muted); font-size: 0.85rem;
+  }
+  footer a { color: var(--link); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+</style>
+</head>
+
+<body>
+
+<h1>VAREK v1.6 demo <span class="tag">v1.6.2</span></h1>
+<div class="meta">
+  Pre-execution verification of agent action graphs.
+  USPTO Provisional 64/062,549 (May 2026).
+  &mdash;
+  <a href="https://github.com/kwdoug63/varek">github.com/kwdoug63/varek</a>
+</div>
+
+<p>
+  This 56-second recording walks through the v1.6 unit tests, the kernel and
+  adapter demos, and the patched v1.4 Warden refusing to fork on an
+  <code>UNSATISFIED</code> plan and then layering plan-level and per-action
+  verification on an authorized plan.
+</p>
+
+<div class="player-wrap">
+  <div id="demo"></div>
+</div>
+
+<table class="scenes">
+  <thead>
+    <tr><th>Scene</th><th>Substance</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>0:00</td><td>Title comments &mdash; v1.6 / USPTO 64/062,549</td></tr>
+    <tr><td>0:03</td><td><code>make check</code> &mdash; 8 unit test binaries</td></tr>
+    <tr><td>0:11</td><td><code>./plan_demo</code> &mdash; v1.6.0 kernel</td></tr>
+    <tr><td>0:15</td><td><code>./adapter_demo</code> &mdash; v1.6.1 adapter + JSON pathology</td></tr>
+    <tr><td>0:24</td><td>Denied plan &mdash; patched Warden refuses to fork</td></tr>
+    <tr><td>0:39</td><td>Authorized plan &mdash; both <code>pp-</code> and <code>pr-</code> records visible</td></tr>
+    <tr><td>0:54</td><td>Closing &mdash; layered defense, end to end</td></tr>
+  </tbody>
+</table>
+
+<p>
+  Reproduce locally:
+</p>
+
+<pre><code>git clone https://github.com/kwdoug63/varek
+cd varek/v1_6
+make check
+python3 demo/make_cast.py</code></pre>
+
+<p>
+  Full annotated transcript, embedding instructions, and patent-claim
+  mapping are in
+  <a href="https://github.com/kwdoug63/varek/blob/main/v1_6/demo/DEMO.md">v1_6/demo/DEMO.md</a>.
+</p>
+
+<footer>
+  <a href="https://varek-lang.org/">varek-lang.org</a> &middot;
+  <a href="https://github.com/kwdoug63/varek">source</a> &middot;
+  MIT licensed
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/asciinema-player@3/dist/bundle/asciinema-player.min.js"></script>
+<script>
+  AsciinemaPlayer.create('./varek_v1_6_demo.cast',
+    document.getElementById('demo'),
+    {
+      autoPlay: false,
+      loop:     false,
+      fit:      'width',
+      theme:    'asciinema',
+      idleTimeLimit: 1.5
+    });
+</script>
+
+</body>
+</html>

@@ -1,4 +1,4 @@
-# VAREK v1.6.1 — design notes
+# VAREK v1.6 — design notes
 
 ## Scope: pre-execution verification of an ExecutionPlan
 
@@ -18,18 +18,22 @@ under graph composition.
 
 ## Release line
 
-The v1.6 release line ships in three sequential tags:
+The v1.6 line breaks into three patch releases, each strictly
+additive over the previous:
 
 - **v1.6.0** — verification kernel. ExecutionPlan primitive,
-  compositional evaluator, decision API. No external consumers.
-- **v1.6.1** *(this release)* — adapter layer. Declarative
-  `plan_spec_t` input, callback-driven plan builder, JSON
-  pathology record emission. The adapter is the bridge between
-  a caller's per-action policy logic and the kernel's plan-level
-  decision.
-- **v1.6.2** — patched v1.4 Warden integration: text plan-file
-  format, `--plan` CLI flag, pre-fork verification gate, end-to-end
-  integration smoke test.
+  compositional evaluator, plan-level tri-state decision,
+  authorization predicate. No consumers, no integration.
+- **v1.6.1** — adapter and pathology. A callback-based adapter
+  turns a `plan_spec_t` into per-node decisions and feeds the
+  v1.6.0 evaluator. JSON pathology sink matches v1.4 record style.
+- **v1.6.2** — real Warden integration. A text-format plan file
+  parser and a unified-diff patch against `varek/v1_4/warden.c`
+  add a `--plan` CLI flag and a pre-fork verification gate. The
+  patched Warden refuses to start the target process if the plan
+  does not verify as `SATISFIED`.
+
+Each release was designed to ship as a separate tag.
 
 ## What ships in v1.6.0
 
@@ -41,68 +45,125 @@ The v1.6 release line ships in three sequential tags:
    join.
 3. Plan-level tri-state decision: `SATISFIED` / `UNSATISFIED` /
    `UNKNOWN`.
-4. Authorization API: `exec_plan_authorized()`.
-5. Test suite for kernel invariants.
+4. Authorization API: `exec_plan_authorized()` returns `true`
+   exactly when the plan-level decision is `SATISFIED`.
+5. Test suite covering symmetric suppression on `UNSAT`, symmetric
+   suppression on `UNKNOWN`, all-`SAT` acceptance, fanout poisoning
+   at every position, exhaustive permutation invariance, and cycle
+   rejection.
 
 ## What ships in v1.6.1
 
-1. `plan_spec_t` — declarative description of an intended plan.
-   Carries action kind, target, parameters, edges, and capacity
-   metadata. Stable across deciders.
-2. `warden_build_and_verify()` — callback-driven adapter. Given a
-   spec and a `plan_decide_fn` callback, builds an `exec_plan_t`,
-   calls the kernel evaluator, optionally emits a pathology
-   record, and returns the plan-level decision.
-3. JSON pathology emission matching the format and prefix
-   convention of the v1.4 Warden's per-action records. Plan-level
-   records use the `pp-` prefix; per-action records use `pr-`.
-4. Capacity, validity, and structural error classifiers in the
-   pathology output: `node`, `cycle`, `empty`, `capacity`,
-   `edge_index`.
-5. Two additional test binaries: `test_adapter` and
-   `test_pathology`.
+1. `plan_spec_t` — a declarative input type. Borrow-only; no
+   deep copies.
+2. `warden_adapter_verify()` — turns a spec into per-node decisions
+   via a caller-supplied decider callback, builds the
+   `exec_plan_t`, runs verification, emits a pathology record.
+3. `pathology_sink_t` — JSON-emitting sink matching the v1.4
+   `emit_pathology()` style (`pp-` prefix for plan-level records).
+4. Defensive coercion of decider return values outside the
+   tri-state to `UNKNOWN`.
+5. JSON-safe label escaping.
+6. Tests covering happy path, every suppression mode, every
+   structural failure mode, JSON output format validation, and
+   sequence-counter monotonicity.
 
-## What is NOT in v1.6.1
+## What ships in v1.6.2
 
-- **v1.4 Warden integration.** The patched supervisor with a
-  `--plan` CLI flag and a pre-fork verification gate is tracked
-  for v1.6.2. The adapter shipped here is callable from any
-  caller; the actual wiring into the v1.4 `main()` is the v1.6.2
-  patch.
-- **Text plan-file parser.** Reading a plan declaration from a
-  file format suitable for the `--plan` CLI flag is v1.6.2 work.
-- **`var::` stdlib surface for plan construction.** Public stdlib
-  surfaces commit us to compatibility guarantees the kernel and
-  adapter do not yet require. Deferred until the kernel and
-  adapter have been exercised against the patched Warden in
-  v1.6.2.
-- **Per-edge policy semantics.** Edges carry only ordering /
-  data-dependency information used by the cycle check. Policies
-  that reason about data flow across edges (taint propagation,
-  capability transfer) are tracked for v1.7+.
-- **Persistent plan serialization.** Plans are in-memory only.
+1. `plan_parser` — text-format plan file loader. Two directives
+   only (`action`, `edge`). Structured `file:line: reason` errors
+   surface every parse failure. Owns its string storage so the
+   produced `plan_spec_t` is safe to borrow until the parser
+   handle is freed.
+2. `warden_v1_4.patch` — a unified diff against the v1.4 Warden:
+   - Adds v1.6 includes after the existing block.
+   - Adds a `kind_from_string()` mapping helper.
+   - Adds a `warden_plan_decider()` that wraps the existing
+     `policy_decide()` into the `plan_action_decider_fn`
+     signature. This is the only required glue because
+     `policy_decide()` already exposes the right granularity
+     and only consults `(kind, target)`.
+   - Adds a `warden_verify_plan()` orchestration function.
+   - Updates `usage()` and `main()` to accept the optional
+     `--plan <file>` between the policy path and `--`.
+   - Inserts the pre-fork gate: on a non-`SATISFIED` plan,
+     `main()` returns `1` before `fork()` is called.
+3. Makefile edits adding `-I../../v1_6`, linking the v1.6
+   sources into the warden binary, and adding a
+   `run-plan-demo` target.
+4. `integration_test.sh` — end-to-end regression check that
+   builds the patched warden and runs four cases against it.
 
-## Why adapter is callback-driven
+## What is NOT in v1.6.x
 
-The kernel module (v1.6.0) is intentionally independent of any
-specific per-action policy implementation. The adapter could have
-taken a direct dependency on the v1.4 Warden's `policy_decide()`,
-but that would have created a circular-ish import (warden depends
-on adapter depends on warden) and would have prevented unit
-testing the adapter against synthetic deciders.
+### `var::` stdlib surface for plan construction
 
-The callback shape is:
+This was on the v1.6.1 roadmap when I recommended "kernel-only
+for v1.6.0, surface ergonomics in v1.6.1." Investigating the
+repo at HEAD changed the recommendation.
 
-```c
-typedef plan_decision_t (*plan_decide_fn)(const plan_spec_node_t *node,
-                                          void *ctx);
-```
+The post-rename Python `var::` stdlib only exists in the frozen
+`varek-v1.0/` directory, where the modules still use legacy
+`syn::` references (a known release-artifact issue). The active
+Warden line moved from Python (v1.2 / v1.3 prototypes, both
+`DEPRECATED.md`-marked) to C in v1.4 onward. There is no
+maintained Python `var::` surface at HEAD to add a `var::plan`
+module to.
 
-The v1.4 Warden's `policy_decide()` will be wrapped in a thin shim
-that translates a `plan_spec_node_t` into the Warden's internal
-`struct action` and returns the resulting `decision_t` as a
-`plan_decision_t`. That shim lives in the v1.6.2 patch, not in
-this release.
+Options for the future:
+
+1. Resurrect the Python `var::` layer outside the v1.0 archive
+   as a separate, larger project — call it the "var:: language
+   layer revival" — and add `var::plan` once that scaffolding
+   exists.
+2. Build a fresh Python surface for plan construction specifically.
+3. Defer plan construction to a different surface entirely
+   (the text format that v1.6.2 ships, a structured API binding,
+   an agent SDK).
+
+None of these is a small task that fits cleanly under the v1.6
+line. The text format in `plan_parser` is the surface for v1.6.x;
+the language-level surface decision is moved out as a separate
+planning item.
+
+### Per-edge data-flow or capability-transfer policies
+
+Edges in v1.6 carry only ordering / data-dependency information
+used by the cycle check. Policies that reason about data flow
+across edges (taint propagation, capability transfer) are
+tracked for v1.7+.
+
+### Persistent plan serialization
+
+Plans are in-memory only. The text format is the loader, not the
+serializer.
+
+### Richer plan-file format
+
+Quoted targets, parameter fields, conditional edges, includes,
+and similar elaborations are out of scope for v1.6.2. The format
+shipped is the minimum needed to declare an action graph the
+existing v1.4 `policy_decide()` can act on. Richer surfaces wait
+until the C-API integration has run in real deployments.
+
+## Why kernel-first, surface-later, integration-last
+
+Three reasons:
+
+1. **Patent substance.** The patentable element is the
+   compositional evaluator over the plan graph. Hardening that
+   in isolation, with a focused test suite, is the right risk
+   posture for the v1.6 line.
+2. **API stability.** Public surfaces commit us to compatibility
+   guarantees the kernel does not require. Letting the kernel
+   settle first (v1.6.0) means the adapter (v1.6.1) and the
+   integration (v1.6.2) were tuned against real consumers
+   rather than speculation.
+3. **Blast radius.** Each step is reviewable in isolation. The
+   v1.6.2 patch is 213 lines of unified diff against existing
+   files; everything else lives in `v1_6/` and does not touch
+   the operating Warden code unless `warden_v1_4.patch` is
+   applied.
 
 ## Compositional decision rule
 
@@ -118,61 +179,120 @@ For a plan with per-node decisions `D = {d_1, ..., d_n}`:
 
 The aggregator is the join over the lattice
 `SATISFIED < UNKNOWN < UNSATISFIED`. Associative, commutative,
-idempotent. Exhaustively tested for order invariance over 960
-permutations.
+idempotent — fold order is observably irrelevant.
 
 ## Symmetric suppression under composition
 
-`UNSATISFIED` and `UNKNOWN` both suppress per-Action execution
-in the v1.4 patent. That invariant lifts directly to the plan
-level under the join above: either value at any node propagates
-to the plan-level result. The join preserves the more
-informative of the two for pathology output (`UNSATISFIED`
-dominates `UNKNOWN`); both block the plan equally.
+The patent invariant — `UNSATISFIED` and `UNKNOWN` both suppress
+per-Action execution — lifts directly to the plan level under the
+join above. Either of those values at any node propagates to the
+plan-level result.
 
-## JSON pathology format
+The join preserves the **more informative** of the two for
+pathology output: `UNSATISFIED` dominates `UNKNOWN`. Both block
+the plan equally; `exec_plan_authorized()` returns `true` only on
+`SATISFIED`.
 
-One JSON object per verification, written to stderr by the
-adapter when `emit_pathology` is true. Fields are detailed in
-`README.md`. Two design choices worth noting:
+The v1.6.1 pathology record extends this with `suppression_reason`
+so operators can distinguish node-level denials (`"node"`) from
+structural problems (`"cycle"`, `"empty"`, `"capacity"`,
+`"edge_index"`).
 
-1. **`pp-` prefix on `report_id`.** Plan-level records use `pp-`
-   so they're trivially distinguishable from the v1.4 Warden's
-   per-action `pr-` records. When v1.6.2 lands and both record
-   types share a stderr stream, the prefix lets downstream
-   consumers (log aggregators, SIEMs, pathology dashboards)
-   filter without parsing the body.
-2. **`suppression_reason` is a classifier, not a free-text
-   explanation.** Values are fixed: `none`, `node`, `cycle`,
-   `empty`, `capacity`, `edge_index`. This keeps the format
-   parseable and the cardinality bounded for telemetry
-   aggregation.
+## Why cycle yields UNKNOWN, not UNSATISFIED
+
+A cyclic edge set is a structurally unverifiable input. The plan
+graph contract requires acyclicity (the directed-acyclic part is
+load-bearing for compositional reasoning). Returning `UNKNOWN`
+rather than `UNSATISFIED` reflects what actually happened: the
+verifier could not form a meaningful opinion about the action
+set. Both still suppress the plan; the distinction matters for
+pathology telemetry and for downstream debugging.
 
 ## Determinism and allocation
 
-No allocation on the verification path. The kernel's cycle
-detection scratch lives in thread-local arrays sized to
-`PLAN_MAX_NODES` and `PLAN_MAX_EDGES`. The adapter allocates one
-`exec_plan_t` per build via `exec_plan_new()`; the caller is
-responsible for freeing.
+No allocation on the verification path. The cycle-detection
+scratch (color array, CSR adjacency, DFS stack) lives in
+thread-local arrays sized to `PLAN_MAX_NODES` and
+`PLAN_MAX_EDGES`. The fold over node decisions is a single
+linear pass with a short-circuit at the top of the lattice.
 
-The pathology emission path uses a fixed-size stack buffer for
-the JSON record; record sizes are bounded by the field set above.
-No `malloc` on the emit path.
+The v1.6.1 adapter caches per-node decisions on a stack array
+sized to `PLAN_MAX_NODES` so the pathology pass can name the
+first non-`SATISFIED` node without re-querying the decider. The
+parser owns its string storage and frees in one pass via
+`plan_parser_free()`.
+
+Heap allocations: `exec_plan_new()`, `pathology_sink_new()`,
+`plan_parser_load()` (handle + `strdup`'d tokens). All free
+cleanly in their dual; tests run without leaks under ASan.
+
+There is no recursion. The DFS uses an explicit stack to avoid
+stack-overflow concerns under large plans.
 
 ## Threading model
 
-The kernel and adapter are single-threaded by contract:
-verification happens on a single supervisor thread, before any
-forked process runs. Multiple supervisor threads with disjoint
-plans are safe (the thread-local scratch in the kernel
-guarantees this); concurrent verification of the same plan from
-multiple threads is not supported and not exercised.
+Single-threaded by contract, matching the v1.4 Warden's
+supervisor-thread invariant. The pathology sequence counter is
+not atomic. The cycle-detection scratch is thread-local so
+calling the evaluator from multiple supervisor threads is safe
+in principle; the sink and adapter are not. If a multi-threaded
+adapter call site appears later, the sink will need a mutex.
+
+## Patched Warden behavior
+
+The v1.6.2 patch inserts the plan-verification gate between
+`policy_load()` + `log_init()` and `fork()`. The sequence becomes:
+
+```
+parse argv (now accepts optional --plan)
+policy_load()
+log_init()
+if plan_path:
+    plan_parser_load()
+    warden_adapter_verify() with policy_decide-wrapping decider
+    emit plan-level pathology record
+    if not SATISFIED: return 1   <-- no fork, no child process
+fork()
+... existing v1.4 supervise path unchanged ...
+```
+
+Without `--plan`, the binary's behavior is exact-equivalent to
+v1.4. With `--plan`, an unauthorized plan halts the supervisor
+before the target ever starts, which is the strongest possible
+realization of "pre-execution verification."
+
+## JSON pathology format
+
+The plan-level record format mirrors the v1.4 per-action style
+(see `varek/v1_4/warden.c::emit_pathology`) with the `pp-`
+prefix on `report_id`:
+
+```json
+{"report_id":"pp-<sec>.<nsec>-<seq>",
+ "type":"plan_verify",
+ "decision":"SATISFIED|UNSATISFIED|UNKNOWN",
+ "authorized":true|false,
+ "n_nodes":<size_t>,
+ "n_edges":<size_t>,
+ "latency_us":<uint64>,
+ "suppression_reason":"none|node|cycle|empty|capacity|edge_index",
+ "suppressed_node":"<label>"|null,
+ "suppressed_decision":"SATISFIED|UNSATISFIED|UNKNOWN",
+ "timestamp_ns":<int64>}
+```
+
+Latency is monotonic-clock microseconds across the full adapter
+call (decider dispatch, plan build, verify). Timestamp is wall
+clock.
 
 ## Validation
 
-All tests pass under gcc 13.3 with
+All v1.6.x unit tests pass under gcc 13.3 with
 `-Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes
 -Wmissing-prototypes` (zero warnings) and under
-`-fsanitize=address,undefined` (zero diagnostics). Run with
-`make check`.
+`-fsanitize=address,undefined` (zero diagnostics). The v1.6.2
+integration smoke test (`integration_test.sh`) passes against a
+freshly-built patched Warden on the same toolchain.
+
+The patch applies cleanly via `patch -p1 < v1_6/warden_v1_4.patch`
+from the repo root against the current HEAD of github.com/kwdoug63/varek.

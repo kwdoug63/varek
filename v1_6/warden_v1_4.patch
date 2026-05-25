@@ -1,0 +1,213 @@
+--- a/varek/v1_4/warden.c
++++ b/varek/v1_4/warden.c
+@@ -84,6 +84,16 @@
+ #include <time.h>
+ #include <unistd.h>
+ 
++/* VAREK v1.6 plan-graph integration headers.
++ * The v1_6/ directory ships these as a self-contained module; this
++ * Warden translation unit only references them through the public
++ * APIs declared below. See varek/v1_6/README.md for the contract. */
++#include "execution_plan.h"
++#include "pathology.h"
++#include "plan_parser.h"
++#include "plan_spec.h"
++#include "warden_adapter.h"
++
+ /* Kernel/libc compatibility shims --------------------------------- */
+ #ifndef __NR_openat2
+ #define __NR_openat2 437
+@@ -441,6 +451,83 @@
+     return DEC_UNKNOWN;
+ }
+ 
++/* ---------------- v1.6 plan-graph integration ---------------- */
++
++/* Map a plan_spec_action_t kind string to the v1.4 action_kind_t.
++ * Unknown kinds map to ACT_OTHER, which policy_decide() treats as
++ * unmatched -> DEC_UNKNOWN under symmetric suppression. */
++static action_kind_t kind_from_string(const char *s) {
++    if (!s)                                  return ACT_OTHER;
++    if (strcmp(s, "file_open")    == 0)      return ACT_FILE_OPEN;
++    if (strcmp(s, "net_connect")  == 0)      return ACT_NET_CONNECT;
++    if (strcmp(s, "process_exec") == 0)      return ACT_PROCESS_EXEC;
++    return ACT_OTHER;
++}
++
++struct warden_plan_ud {
++    const struct policy *policy;
++};
++
++/* Adapter decider that wraps the existing per-action policy_decide()
++ * for use by warden_adapter_verify(). The plan_spec_action_t's
++ * (kind, target) pair is sufficient because policy_decide() only
++ * inspects those two fields. */
++static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
++                                           void *ud)
++{
++    const struct warden_plan_ud *u = (const struct warden_plan_ud *)ud;
++    if (!u || !u->policy || !a) return PLAN_DEC_UNKNOWN;
++
++    struct action act;
++    memset(&act, 0, sizeof(act));
++    act.kind = kind_from_string(a->kind);
++    if (a->target) {
++        snprintf(act.target, sizeof(act.target), "%s", a->target);
++    }
++    decision_t d = policy_decide(u->policy, &act);
++    switch (d) {
++        case DEC_ALLOW:   return PLAN_DEC_SATISFIED;
++        case DEC_DENY:    return PLAN_DEC_UNSATISFIED;
++        case DEC_UNKNOWN: return PLAN_DEC_UNKNOWN;
++    }
++    return PLAN_DEC_UNKNOWN;
++}
++
++/* Verify an agent's declared plan against the current policy, ahead
++ * of any execution. Returns 0 if the plan is authorized, non-zero
++ * otherwise. Emits a plan-level pathology record to stderr. */
++static int warden_verify_plan(const char *plan_path,
++                              const struct policy *policy)
++{
++    char err[256] = {0};
++    plan_parsed_t *parsed = plan_parser_load(plan_path, err, sizeof(err));
++    if (!parsed) {
++        fprintf(stderr, "[warden] plan load failed: %s\n", err);
++        return 1;
++    }
++
++    const plan_spec_t *spec = plan_parser_spec(parsed);
++    pathology_sink_t *sink = pathology_sink_new(stderr);
++    struct warden_plan_ud ud = { .policy = policy };
++
++    plan_decision_t pd = warden_adapter_verify(spec, warden_plan_decider,
++                                               &ud, sink);
++
++    pathology_sink_free(sink);
++    plan_parser_free(parsed);
++
++    if (pd != PLAN_DEC_SATISFIED) {
++        fprintf(stderr,
++                "[warden] plan rejected (%s); refusing to fork target\n",
++                plan_decision_name(pd));
++        return 1;
++    }
++    fprintf(stderr,
++            "[warden] plan authorized (%zu actions); proceeding to supervise\n",
++            spec->n_actions);
++    return 0;
++}
++
+ /* ---------------- Pathology Report ---------------- */
+ 
+ static FILE *g_log = NULL;
+@@ -596,30 +683,64 @@
+ 
+ static void usage(const char *argv0) {
+     fprintf(stderr,
+-        "usage: %s <policy.txt> -- <target> [args...]\n"
++        "usage: %s <policy.txt> [--plan <plan.txt>] -- <target> [args...]\n"
+         "\n"
+         "  Privileged seccomp-unotify supervisor (VAREK Warden v1.4).\n"
++        "\n"
++        "  Optional --plan <plan.txt> enables v1.6 pre-execution plan\n"
++        "  verification. The target is not forked unless the plan\n"
++        "  verifies as SATISFIED against the loaded policy.\n"
++        "\n"
+         "  Policy file format (one rule per line):\n"
+         "    allow path /tmp/safe/\n"
+         "    deny  path /etc/\n"
+         "    allow host 127.0.0.1:8080\n"
+         "    deny  host evil.example.com\n"
+-        "    allow exec /usr/bin/env\n",
++        "    allow exec /usr/bin/env\n"
++        "\n"
++        "  Plan file format (see varek/v1_6/sample_plan.txt):\n"
++        "    action <label> <kind> <target>\n"
++        "    edge   <from_label> <to_label>\n",
+         argv0);
+ }
+ 
+ int main(int argc, char **argv) {
+-    if (argc < 4 || strcmp(argv[2], "--") != 0) {
++    /* Positional parse with optional --plan between policy_path and --.
++     * Accepted forms:
++     *   warden policy.txt -- target [args...]
++     *   warden policy.txt --plan plan.txt -- target [args...] */
++    if (argc < 4) { usage(argv[0]); return 2; }
++
++    const char *policy_path = argv[1];
++    const char *plan_path   = NULL;
++    int sep_idx = -1;
++
++    if (strcmp(argv[2], "--") == 0) {
++        sep_idx = 2;
++    } else if (strcmp(argv[2], "--plan") == 0) {
++        if (argc < 6 || strcmp(argv[4], "--") != 0) {
++            usage(argv[0]); return 2;
++        }
++        plan_path = argv[3];
++        sep_idx   = 4;
++    } else {
+         usage(argv[0]); return 2;
+     }
+-    const char *policy_path = argv[1];
+-    char *const *target_argv = &argv[3];
++
++    if (sep_idx + 1 >= argc) { usage(argv[0]); return 2; }
++    char *const *target_argv = &argv[sep_idx + 1];
+ 
+     struct policy p;
+     if (policy_load(policy_path, &p) < 0) return 1;
+ 
+     log_init();
+ 
++    /* v1.6 pre-execution plan verification. Fires before fork; on
++     * any non-SATISFIED result the target is not started. */
++    if (plan_path && warden_verify_plan(plan_path, &p) != 0) {
++        return 1;
++    }
++
+     struct sigaction sa = { .sa_handler = on_term };
+     sigemptyset(&sa.sa_mask);
+     sa.sa_flags = 0;  /* no SA_RESTART: we want EINTR to break ioctl */
+--- a/varek/v1_4/Makefile
++++ b/varek/v1_4/Makefile
+@@ -7,14 +7,24 @@
+            -D_GNU_SOURCE -std=gnu11
+ LDFLAGS ?=
+ 
++# v1.6 plan-graph integration. The Warden references these symbols
++# directly; -I../../v1_6 lets warden.c #include the v1.6 headers.
++V1_6_DIR  := ../../v1_6
++V1_6_SRC  := $(V1_6_DIR)/execution_plan.c \
++             $(V1_6_DIR)/plan_evaluator.c \
++             $(V1_6_DIR)/warden_adapter.c \
++             $(V1_6_DIR)/pathology.c \
++             $(V1_6_DIR)/plan_parser.c
++CFLAGS    += -I$(V1_6_DIR)
++
+ BINS := warden target_demo bench_target
+ 
+-.PHONY: all clean run-demo run-bench check-kernel
++.PHONY: all clean run-demo run-bench run-plan-demo check-kernel
+ 
+ all: $(BINS)
+ 
+-warden: warden.c
+-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
++warden: warden.c $(V1_6_SRC)
++	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden.c $(V1_6_SRC)
+ 
+ target_demo: target_demo.c
+ 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+@@ -35,6 +45,9 @@
+ run-demo: warden target_demo
+ 	@sudo ./warden policy.txt -- ./target_demo
+ 
++run-plan-demo: warden target_demo
++	@sudo ./warden policy.txt --plan $(V1_6_DIR)/sample_plan.txt -- ./target_demo
++
+ run-bench: warden bench_target
+ 	@sudo ./warden policy.txt -- ./bench_target 10000 2> bench.log
+ 	@python3 bench_summarize.py bench.log

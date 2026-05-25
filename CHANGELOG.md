@@ -7,6 +7,39 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.6.2] - 2026-05-24
+
+### Added
+
+- `v1_6/plan_parser.c`, `v1_6/plan_parser.h`: Text plan-file format parser. Reads `action` and `edge` directives into an owning parsed-plan handle; reports errors with `file:line` precision.
+- `v1_6/sample_plan.txt`: Example plan file demonstrating the format.
+- `v1_6/warden_v1_4.patch`: Unified diff against `varek/v1_4/warden.c` and its Makefile. Adds a `--plan` CLI flag and a pre-fork plan-verification gate to the v1.4 Warden. On any non-`SATISFIED` plan the supervisor refuses to fork the target; behavior without `--plan` is preserved bit-for-bit.
+- `v1_6/integration_test.sh`: End-to-end integration smoke test. Four cases: denied plan blocks the fork, authorized plan emits a `SATISFIED` record, absent `--plan` preserves v1.4 behavior, malformed plan surfaces a `file:line` parse error.
+- `v1_6/demo/`: Recorded asciinema cast of the end-to-end demo, a reproducible cast generator (`make_cast.py`), a drop-on-server HTML player page (`index.html`), and an annotated transcript (`DEMO.md`).
+- `v1_6/tests/test_plan_parser.c`: Parser unit tests.
+
+### Changed
+
+- `varek/v1_4/warden.c`, `varek/v1_4/Makefile` (on applying `warden_v1_4.patch`): `--plan <file>` flag verifies the declared action graph before `fork()`. Plan-level pathology records are emitted with a `pp-` prefix; the existing per-action records keep their `pr-` prefix, so both coexist in a single stderr stream and are filterable by prefix.
+
+### Reproduce
+
+    git clone https://github.com/kwdoug63/varek.git
+    cd varek/v1_6
+    make check
+    git apply warden_v1_4.patch        # from repo root: git apply v1_6/warden_v1_4.patch
+    make -C ../varek/v1_4 warden
+    ./integration_test.sh
+
+### Verify
+
+    git verify-tag v1.6.2
+
+### Links
+- Release: https://github.com/kwdoug63/varek/releases/tag/v1.6.2
+
+---
+
 ## [1.6.1] - 2026-05-24
 
 ### Added

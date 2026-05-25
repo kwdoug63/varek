@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# VAREK v1.6.1 — ExecutionPlan verification + adapter + pathology
+# VAREK v1.6 — ExecutionPlan verification + adapter
 
 CC      ?= gcc
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Wpedantic -Wshadow \
@@ -10,8 +10,8 @@ CORE_SRC := execution_plan.c plan_evaluator.c
 CORE_HDR := execution_plan.h execution_plan_internal.h
 
 # v1.6.1 adapter + pathology
-ADAPTER_SRC := pathology.c warden_adapter.c
-ADAPTER_HDR := pathology.h plan_spec.h warden_adapter.h
+ADAPTER_SRC := pathology.c warden_adapter.c plan_parser.c
+ADAPTER_HDR := pathology.h plan_spec.h warden_adapter.h plan_parser.h
 
 ALL_SRC := $(CORE_SRC) $(ADAPTER_SRC)
 ALL_HDR := $(CORE_HDR) $(ADAPTER_HDR)
@@ -25,7 +25,8 @@ TESTS := tests/test_evaluator \
          tests/test_fanout \
          tests/test_cycle_detection \
          tests/test_adapter \
-         tests/test_pathology
+         tests/test_pathology \
+         tests/test_plan_parser
 
 .PHONY: all check demo adapter-demo clean
 

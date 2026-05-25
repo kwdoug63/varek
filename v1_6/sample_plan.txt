@@ -1,0 +1,20 @@
+# sample_plan.txt — example ExecutionPlan declaration.
+#
+# Format:
+#   action <label> <kind> <target>
+#   edge   <from_label> <to_label>
+#
+# An agent that:
+#   1. reads an input file under an allowed prefix
+#   2. runs a transform via /usr/bin/python3
+#   3. connects to an allowed local endpoint
+#   4. writes an audit record (in parallel with the connect)
+
+action load   file_open    /tmp/varek_allowed_input.json
+action exec   process_exec /usr/bin/python3
+action post   net_connect  127.0.0.1:8080
+action audit  file_open    /tmp/varek_allowed_audit.log
+
+edge load exec
+edge exec post
+edge exec audit
