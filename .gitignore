@@ -50,3 +50,7 @@ bench_target
 *.log
 bench.log
 wandb/
+
+varek-v1_6-release-staging/
+varek-v1_6-release-staging.tar.gz
+VAREK-Spec-Paper-Douglas-v1.6.pdf

@@ -1,0 +1,10 @@
+# Build artifacts
+varek_demo
+warden_example
+/tests/test_dataflow
+/tests/test_v17_1
+/tests/test_v17_2
+/tests/test_v17_3
+/tests/test_v17_4
+/tests/test_v18_0
+*.o

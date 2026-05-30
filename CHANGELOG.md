@@ -7,6 +7,231 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.8.1] - 2026-05-30
+
+### Added
+
+- `v1_7/varek_dataflow.h`: Public umbrella header. One include for the whole v1.7/v1.8 surface (plan, label, policy, dataflow kernel, adapter, pathology, binding, config).
+- `v1_7/warden_integration_example.c` (`make example`): Runnable reference of the Warden's `--plan` gate over the full stack. Demonstrates sanitize-then-send authorizing and direct exfiltration refused with full pathology.
+- `v1_7/varek_demo.c`, `v1_7/demo_policy.cfg`, `v1_7/demo/DEMO.md` (`make demo`): Narrated 8-scenario walkthrough exercising the real verifier against `demo_policy.cfg`. Exits 0 only if all scenarios behave as documented, so doubles as a full-stack smoke test.
+- `docs/security/threat-model-dataflow.md`: Companion to `docs/security/threat-model.md`, scoped explicitly to the v1.7/v1.8 cross-action data-flow layer. Trust boundaries, security properties (each pinned to a test), eight stated limitations, recommended external-audit scope.
+
+### Notes
+
+- No behavior change, no API change. The v1.8.0 kernel, adapter, binding, pathology, and config source files are byte-identical. v1.8.1 turns the v1.8.0 tree into something a customer can adopt and a reviewer can sign off on.
+- Why a patch release for documentation: a released tag should identify a fixed, reproducible state. Adding substantive artifacts under the existing v1.8.0 tag would mean v1.8.0 no longer identifies one specific state. v1.8.1 is the correct semver position; v1.8.0 stays immutable.
+
+### Reproduce
+
+    git clone https://github.com/kwdoug63/varek.git
+    cd varek/v1_7
+    make check
+    make demo
+
+### Verify
+
+    git verify-tag v1.8.1
+
+### Links
+- Release: https://github.com/kwdoug63/varek/releases/tag/v1.8.1
+
+---
+
+## [1.8.0] - 2026-05-30
+
+### Added
+
+- `v1_7/plan_dataflow.h`, `v1_7/plan_dataflow.c`: Operator-designated, audited declassification. `plan_dataflow_add_declassify()` populates a per-node declassify set; `plan_dataflow_node_declassified()` exposes the audit set (`inbound ∩ declassify`) recoverable after verification.
+- `v1_7/plan_label_policy.h`: `declassify` slot on `plan_label_class_t`.
+- `v1_7/plan_policy_config.c`: `declassify NAME` rule-body statement.
+- `v1_7/plan_label.h`: `plan_label_set_minus_into()` and `plan_label_set_intersect_into()` set primitives.
+- `v1_7/tests/test_v18_0.c`: v1.8.0 safety properties (16 checks).
+
+### Changed
+
+- **Kernel propagation rule.** v1.7.x: `outbound = inbound ∪ origin` (monotone — labels only accumulate). v1.8.0: `outbound = (inbound \ declassify) ∪ origin`. Labels can now disappear from the flow. Backward compatible: with no labels declassified, behavior is byte-identical to v1.7.4.
+
+### Security
+
+This is the only mechanism in VAREK that can bypass the read-secret-then-exfiltrate guarantee. Four safety properties are pinned by tests:
+
+1. **Operator-only.** The `declassify` set is populated by the policy, never by the plan or agent. An attacker cannot introduce a declassifying node.
+2. **Two explicit assertions.** Declassification affects only outbound. A node is still policed on its full inbound, so a redactor of a sticky label must also carry `permit_in` for that label, or it fails closed to `UNKNOWN`. Both assertions are required to authorize a sanitize-then-send flow.
+3. **Cannot be routed around.** A bypass edge from the secret's source straight to the denying sink still carries the raw label and is refused.
+4. **Audited.** Every label dropped is recoverable via `plan_dataflow_node_declassified()` — which sensitive labels, at which node, on every plan submission.
+
+**Stated limitation.** VAREK confirms a designated redactor was permitted to see a label and that the label was dropped during propagation. It does not prove the redactor's code sanitizes. Declassification is an operator trust assertion, audited but not verified. Same posture as CaMeL (Google DeepMind + ETH, arXiv 2503.18813) and FIDES (Microsoft Research, arXiv 2505.23643). See `docs/security/threat-model-dataflow.md` L1.
+
+The minor-version bump signals operators to review their trust assumptions before enabling declassification. Polish releases should not carry that signal; this one should.
+
+### Patent
+
+- This is implementation of established information-flow control technique (Denning & Denning, 1977), substantially overlapping with concurrent prior art (CaMeL, FIDES). No claim of novelty on the data-flow verifier itself; the only narrow candidate for surviving claim language is the cross-layer integration of plan-level data-flow verification with kernel-boundary syscall enforcement (Provisional 64/059,592). Counsel evaluation is the operative path; no claim coverage is asserted in source.
+
+### Reproduce
+
+    git clone https://github.com/kwdoug63/varek.git
+    cd varek/v1_7
+    make check          # 207 checks across six test binaries
+
+### Verify
+
+    git verify-tag v1.8.0
+
+### Links
+- Release: https://github.com/kwdoug63/varek/releases/tag/v1.8.0
+- Discussion: https://github.com/kwdoug63/varek/discussions  (v1.8.0 — declassification: design, safety properties, and your review questions)
+
+---
+
+## [1.7.4] - 2026-05-30
+
+### Added
+
+- `v1_7/plan_label_policy.h`: `plan_action_arg_t` and `named_args`/`n_named_args` on the action descriptor; `plan_label_rule_match_t` and `matches`/`n_matches` on the rule.
+- `v1_7/plan_dataflow_adapter.c`: Hand-rolled two-pointer `glob_match` (`*`, `?`, literals). Bounded, auditable, no ReDoS surface. Regex was deliberately not chosen for a security-policy matcher.
+- `v1_7/plan_policy_config.c`: `match KEY PATTERN` rule-body statement.
+- `v1_7/plan_dataflow_pathology.c`: `originators` array on suppression records. Traces an offending label back through the hops to where it entered the plan (the node whose `origin` set contains it).
+- `v1_7/plan_dataflow.c`, `v1_7/plan_dataflow.h`: `plan_dataflow_node_origin()` read accessor for callers that need lineage outside the pathology emitter.
+- `v1_7/tests/test_v17_4.c`: Argument matching + lineage tests (37 checks).
+
+### Changed
+
+- **Duplicate `action_name` rules now permitted (intentional behavior change).** v1.7.3 rejected them with `ERR_RULE_DUPLICATE`. v1.7.4 evaluates them in declaration order — first match wins. This is how the canonical internal-vs-external egress split is expressed: `rule send_http` with `match url *internal*` and `permit_in SECRET`, then a catch-all `rule send_http` with `deny_in SECRET`. Place specific rules before catch-alls. Configs that previously failed to load with the duplicate-rule error will now load and evaluate.
+- **Pathology buffer NUL-terminated on success (snprintf semantics).** Previously the buffer was not NUL-terminated and a caller doing `printf("%s", buf)` read past the content into uninitialized memory. Returned length still excludes the NUL; effective capacity is `bufsz - 1`. Length-based callers (including `plan_warden_verify`) are unaffected. A regression test asserts `n == strlen(buf)`.
+
+### Reproduce
+
+    git clone https://github.com/kwdoug63/varek.git
+    cd varek/v1_7
+    make check
+    ./tests/test_v17_4
+
+### Verify
+
+    git verify-tag v1.7.4
+
+### Links
+- Release: https://github.com/kwdoug63/varek/releases/tag/v1.7.4
+
+---
+
+## [1.7.3] - 2026-05-30
+
+### Added
+
+- `v1_7/plan_policy_config.c`, `v1_7/plan_policy_config.h`: Line-oriented text policy config loader. Grammar: `varek_policy 1`, `strict`, `label NAME ID`, `sticky NAME`, `rule ACTION_NAME` blocks with `origin`/`deny_in`/`unknown_in`/`permit_in NAME` rule-body statements. Comments only at the start of a line.
+- `v1_7/example_policy.cfg`: Canonical operator-facing reference.
+- `v1_7/tests/test_v17_3.c`: Config grammar tests, 14 enumerated parse errors with 1-based line numbers and static error-message pointers (42 checks).
+
+### Notes
+
+- Load once at Warden startup; the loaded `plan_label_policy_config_t` is read-only after load and safe to share across threads. Free at shutdown. Allocation happens at load, never on the per-plan verification path.
+
+### Reproduce
+
+    git clone https://github.com/kwdoug63/varek.git
+    cd varek/v1_7
+    make check
+    ./tests/test_v17_3
+
+### Verify
+
+    git verify-tag v1.7.3
+
+### Links
+- Release: https://github.com/kwdoug63/varek/releases/tag/v1.7.3
+
+---
+
+## [1.7.2] - 2026-05-30
+
+### Added
+
+- `v1_7/plan_warden_binding.c`, `v1_7/plan_warden_binding.h`: `plan_warden_verify(req, resp)` — single-call entry point that wraps companion allocation, classification, two-axis verification, pathology emission, and cleanup. Companion lifetime is entirely inside the call. This is the supported entry point for the v1.4 Warden's `--plan` gate.
+- `v1_7/plan_dataflow.h`: `plan_decision_join()` publicized; the lattice join is used in three places and the rank table is no longer duplicated.
+- `v1_7/tests/test_v17_2.c`: Binding tests (50 checks).
+
+### Notes
+
+- Two-failure-mode contract documented at the API. `rc == 0` with non-`SATISFIED` verdict means refused plan (pathology in the buffer). `rc == -1` means verifier failure itself (verdict defaults to `UNKNOWN`). Both require refusal; `-1` is the stronger "something is wrong with the verifier" signal.
+
+### Reproduce
+
+    git clone https://github.com/kwdoug63/varek.git
+    cd varek/v1_7
+    make check
+    ./tests/test_v17_2
+
+### Verify
+
+    git verify-tag v1.7.2
+
+### Links
+- Release: https://github.com/kwdoug63/varek/releases/tag/v1.7.2
+
+---
+
+## [1.7.1] - 2026-05-30
+
+### Added
+
+- `v1_7/plan_dataflow.c`, `v1_7/plan_dataflow.h`: Per-label sticky model. `plan_dataflow_mark_sticky()` marks a label sticky; the kernel's sticky-unclassified path returns `UNKNOWN` (which suppresses) for any sticky label reaching a node without an explicit disposition. `plan_dataflow_add_permit_in()` is the explicit "this node may see this label" assertion that turns sticky off at a trusted carrier.
+- `v1_7/plan_label_policy.h`: Classification surface — `plan_action_desc_t`, `plan_label_class_t`, policy-callback contract, reference table-driven policy.
+- `v1_7/plan_dataflow_adapter.c`, `v1_7/plan_dataflow_adapter.h`: `plan_dataflow_populate()` walks an action array against a policy and writes label sets onto the data-flow companion.
+- `v1_7/plan_dataflow_pathology.c`, `v1_7/plan_dataflow_pathology.h`: Deterministic JSON refusal output. Names the offending node, the kind of offense (`deny_in` / `unknown_in` / `sticky_unclassified`), the labels involved, and the immediate predecessor edges that carried each offending label.
+- `v1_7/tests/test_v17_1.c`: Sticky posture, adapter populate, pathology emission tests (32 checks; cumulative 60).
+
+### Changed
+
+- **Kernel posture: deny-list → per-label sticky (fail-safe).** With no labels marked sticky, behavior is byte-identical to v1.7.0. Production policies should mark sensitive labels sticky to engage the fail-safe path; the v1.7.0 deny-list default of passing unclassified labels silently is inconsistent with VAREK's discipline elsewhere.
+
+### Reproduce
+
+    git clone https://github.com/kwdoug63/varek.git
+    cd varek/v1_7
+    make check
+    ./tests/test_v17_1
+
+### Verify
+
+    git verify-tag v1.7.1
+
+### Links
+- Release: https://github.com/kwdoug63/varek/releases/tag/v1.7.1
+
+---
+
+## [1.7.0] - 2026-05-30
+
+### Added
+
+- `v1_7/plan_label.h`: Flat-set label primitive. Fixed-capacity bitset (`PLAN_MAX_LABELS = 128`), set-union semantics, allocation-free.
+- `v1_7/plan_dataflow.c`, `v1_7/plan_dataflow.h`: Cross-action data-flow kernel. Kahn-topological forward propagation, per-node disposition slots (`origin`, `deny_in`, `unknown_in`), tri-state node-level flow decision.
+- `v1_7/plan_dataflow.h`: `plan_decision_join()` — the lattice join over the v1.6 node-axis verdict and the new v1.7 flow-axis verdict. Same `SATISFIED < UNKNOWN < UNSATISFIED` lattice as v1.6, so symmetric suppression composes across both axes.
+- `v1_7/v1_6_compat.h`: Read-only access to v1.6 internals via `execution_plan_internal.h`. Two static-inline helpers (`dataflow_plan_get_edge`, `dataflow_plan_get_node_label`) used by propagation and pathology. v1.6 source files are unchanged; tagged v1.6.x releases stay byte-identical.
+- `v1_7/tests/test_dataflow.c`: Kernel tests covering canonical exfil, fanout poisoning, suppression precedence, cycle UNKNOWN, two-axis join, determinism, empty plan (28 checks).
+
+### Notes
+
+- **Pre-release / development snapshot.** v1.7.0 ships with a deny-list posture: unclassified inbound labels are SATISFIED by default. That posture is inconsistent with VAREK's fail-safe discipline elsewhere and is replaced in v1.7.1 with per-label sticky semantics. **Install v1.7.1+ instead.** v1.7.0 is published as a pre-release for tag continuity, not as a recommended starting point.
+
+### Reproduce
+
+    git clone https://github.com/kwdoug63/varek.git
+    cd varek/v1_7
+    make check
+    ./tests/test_dataflow
+
+### Verify
+
+    git verify-tag v1.7.0
+
+### Links
+- Release: https://github.com/kwdoug63/varek/releases/tag/v1.7.0 (pre-release)
+
+---
+
 ## [1.6.2] - 2026-05-24
 
 ### Added
