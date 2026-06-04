@@ -47,12 +47,11 @@ constructor.
 
 ### Prototype A — libseccomp integration
 
-- **Dependency weight.** `libseccomp` ships as a small shared object
-  (low-hundreds-of-KB; measured: `[fill: size of libseccomp.so.2 on target]`).
-  It is already resident on essentially all target platforms because it is a
-  dependency of `systemd` and of the common container runtimes
-  (Docker/Podman/containerd). Net new install cost on supported platforms is
-  effectively zero.
+- **Dependency weight.** `libseccomp` ships as a small shared object:
+  123 KB (`libseccomp.so.2.5.5`, Ubuntu base). It is already resident on
+  essentially all target platforms because it is a dependency of `systemd` and
+  of the common container runtimes (Docker/Podman/containerd). Net new install
+  cost on supported platforms is effectively zero.
 - **Build complexity.** Binding via `ctypes` to the system `.so` requires no
   build-time toolchain and no Cython — no compiler is invoked at install time.
   The alternative `python3-seccomp` bindings exist but pull a build dependency;
@@ -61,23 +60,29 @@ constructor.
 - **Distro packaging.** Present in the base package set of every supported
   distro: `libseccomp2` (Debian/Ubuntu), `libseccomp` (Fedora/RHEL),
   `libseccomp` (Alpine). Development headers, where needed, are
-  `libseccomp-dev` / `libseccomp-devel`. Minimum version to pin:
-  `[fill: minimum libseccomp version, 2.5 series baseline]`.
+  `libseccomp-dev` / `libseccomp-devel`. Minimum version pinned to 2.5.5
+  (version present on the validation host; 2.5 series baseline).
 
 ### Prototype B — raw ctypes filter construction
 
-- **Golden-test fixtures.** Known-good filter bytecode was captured for the
-  core policy as golden fixtures (`[fill: fixture path / instruction count]`).
-  These remain valuable: they migrate to the conformance suite that checks the
-  `libseccomp`-produced program against the hand-verified reference.
-- **Struct-packing across Python 3.9–3.13.** `sock_filter` / `sock_fprog` /
-  `seccomp_data` packing and alignment were tested across CPython 3.9 through
-  3.13. The tests are stable but exist only to defend a fragile construction
-  path — they protect against a class of failure that Option A removes entirely.
-- **Failure mode.** The hand-assembled path concentrates the highest-risk code
+- **Differential harness, not golden bytecode.** The prototype's durable
+  artifact is a differential test harness, not a captured bytecode fixture:
+  `tests/seccomp_toctou_harness.c` reproduces the TOCTOU race on
+  pointer-argument syscalls under seccomp-unotify and compares a naive
+  supervisor against a mitigated one that resolves paths with `openat2()`
+  under `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`. This is the conformance
+  value the ctypes prototype was meant to provide — it validates supervisor
+  behavior against a known race rather than freezing a specific instruction
+  sequence.
+- **Construction lives in C, not Python.** Filter construction in the shipped
+  tree is C (`varek/v1_4/warden.c`), not hand-packed Python `ctypes` structs.
+  The struct-packing fragility the original framing worried about does not apply
+  to the committed code; the concern is retained here only as the reason a
+  hand-rolled Python path was rejected.
+- **Failure mode.** A hand-assembled path concentrates the highest-risk code
   (manual jump targets, offset arithmetic, action-mask combinations) in the one
   component where a single wrong value fails open. This is the fragility the
-  reviewer flagged.
+  reviewer flagged and the reason Option B is not the production constructor.
 
 ## Tradeoff Matrix
 
@@ -106,9 +111,9 @@ Delegating filter construction to `libseccomp` collapses the highest-risk,
 highest-scrutiny code path into "call a trusted library correctly," which both
 reduces real correctness risk and reduces the cost and risk of external review.
 
-The ctypes prototype is not discarded: its golden fixtures become the conformance
-oracle that proves the library-produced filter matches the hand-verified
-reference, and the load path retains a direct syscall binding where required.
+The ctypes prototype is not discarded: its differential TOCTOU harness becomes the
+conformance artifact that proves the supervisor behaves correctly against a known
+race, and the load path retains a direct syscall binding where required.
 
 ## Consequences
 
@@ -130,9 +135,10 @@ reference, and the load path retains a direct syscall binding where required.
 
 **Neutral**
 
-- The ctypes path survives as the conformance-test oracle and the load-path
+- The ctypes path survives as the differential-test artifact and the load-path
   binding; it is no longer the production constructor.
-- Golden fixtures from Prototype B are migrated into the conformance suite.
+- The TOCTOU harness in `tests/seccomp_toctou_harness.c` is the conformance
+  reference for supervisor behavior under seccomp-unotify.
 
 ## Related
 
