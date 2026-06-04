@@ -1,6 +1,6 @@
 # 1. Syscall Enforcement Layer: libseccomp vs. Raw ctypes Filter Construction
 
-- Status: Accepted
+- Status: Accepted (decision made; implementation pending — see Implementation Status)
 - Date: 2026-06-03
 - Deciders: Warden maintainers
 - Tags: warden, seccomp, kernel-enforcement, audit-scope, primitive
@@ -13,7 +13,7 @@ constructs the BPF filter program and installs it into the kernel
 (`seccomp(2)` / `prctl(PR_SET_SECCOMP)`). Every higher-level guarantee in Warden
 reduces, at the bottom, to this filter being correct and failing closed.
 
-Two construction strategies were prototyped:
+Two construction strategies were evaluated:
 
 - **Option A — libseccomp.** Bind to the system `libseccomp` shared object and
   build filters through its high-level API (`seccomp_init`, `seccomp_rule_add`,
@@ -34,55 +34,66 @@ here is what an auditor reads first and hardest.
 
 ## Decision
 
-**Use `libseccomp` for seccomp-bpf filter construction.** Warden binds to the
+**Use `libseccomp` for seccomp-bpf filter construction.** Warden will bind to the
 system `libseccomp` shared object for building and loading filters. Filter
-bytecode is not hand-assembled in Python.
+bytecode will not be hand-assembled in Python.
 
-The raw-ctypes prototype is retained, but only for (1) the thin load-path binding
-where a direct syscall is unavoidable and (2) as a conformance-test oracle that
-validates the bytecode `libseccomp` produces. It is not the production filter
-constructor.
+This ADR records the decision and its rationale. It does not assert that the
+integration is built; see Implementation Status for the current state of the
+tree.
 
-## Prototype Findings
+## Implementation Status
 
-### Prototype A — libseccomp integration
+This is a forward decision. As of this ADR:
 
-- **Dependency weight.** `libseccomp` ships as a small shared object:
-  123 KB (`libseccomp.so.2.5.5`, Ubuntu base). It is already resident on
-  essentially all target platforms because it is a dependency of `systemd` and
-  of the common container runtimes (Docker/Podman/containerd). Net new install
-  cost on supported platforms is effectively zero.
-- **Build complexity.** Binding via `ctypes` to the system `.so` requires no
-  build-time toolchain and no Cython — no compiler is invoked at install time.
-  The alternative `python3-seccomp` bindings exist but pull a build dependency;
-  rejected in favor of the `ctypes`-to-`.so` binding to keep the install path
-  pure-Python with a single native runtime requirement.
+- **Present in the committed tree:** the seccomp prerequisite
+  `prctl(PR_SET_NO_NEW_PRIVS, ...)` is installed in `sandbox.py` (ctypes-to-libc
+  binding) and in `varek/v1_4/warden.c`. A differential TOCTOU harness,
+  `tests/seccomp_toctou_harness.c`, exercises supervisor behavior under
+  seccomp-unotify.
+- **Not yet present in the committed tree:** the libseccomp construction path
+  itself. No calls to `seccomp_init`, `seccomp_rule_add`, `seccomp_load`, or the
+  `SCMP_ACT_*` actions exist in the tree at the time of this decision. Building
+  that binding is the implementation work this ADR authorizes.
+
+This section is the single source of truth for what is and is not built; the
+Evaluation below concerns the merits of the options, not shipped code.
+
+## Evaluation
+
+### Option A — libseccomp
+
+- **Dependency weight (measured on the validation host).** `libseccomp` ships as
+  a small shared object: 123 KB (`libseccomp.so.2.5.5`, Ubuntu base). It is
+  already resident on essentially all target platforms because it is a dependency
+  of `systemd` and of the common container runtimes (Docker/Podman/containerd).
+  Net new install cost on supported platforms is effectively zero.
+- **Build complexity (property of the chosen binding approach).** Binding via
+  `ctypes` to the system `.so` requires no build-time toolchain and no Cython —
+  no compiler is invoked at install time. The alternative `python3-seccomp`
+  bindings exist but pull a build dependency; rejected in favor of the
+  `ctypes`-to-`.so` binding to keep the install path pure-Python with a single
+  native runtime requirement.
 - **Distro packaging.** Present in the base package set of every supported
   distro: `libseccomp2` (Debian/Ubuntu), `libseccomp` (Fedora/RHEL),
   `libseccomp` (Alpine). Development headers, where needed, are
-  `libseccomp-dev` / `libseccomp-devel`. Minimum version pinned to 2.5.5
-  (version present on the validation host; 2.5 series baseline).
+  `libseccomp-dev` / `libseccomp-devel`. Minimum version to pin: 2.5.5 (version
+  present on the validation host; 2.5 series baseline).
 
-### Prototype B — raw ctypes filter construction
+### Option B — raw ctypes
 
-- **Differential harness, not golden bytecode.** The prototype's durable
-  artifact is a differential test harness, not a captured bytecode fixture:
-  `tests/seccomp_toctou_harness.c` reproduces the TOCTOU race on
-  pointer-argument syscalls under seccomp-unotify and compares a naive
-  supervisor against a mitigated one that resolves paths with `openat2()`
-  under `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`. This is the conformance
-  value the ctypes prototype was meant to provide — it validates supervisor
-  behavior against a known race rather than freezing a specific instruction
-  sequence.
-- **Construction lives in C, not Python.** Filter construction in the shipped
-  tree is C (`varek/v1_4/warden.c`), not hand-packed Python `ctypes` structs.
-  The struct-packing fragility the original framing worried about does not apply
-  to the committed code; the concern is retained here only as the reason a
-  hand-rolled Python path was rejected.
-- **Failure mode.** A hand-assembled path concentrates the highest-risk code
-  (manual jump targets, offset arithmetic, action-mask combinations) in the one
-  component where a single wrong value fails open. This is the fragility the
-  reviewer flagged and the reason Option B is not the production constructor.
+- **What exists today is a differential harness, not a golden bytecode fixture.**
+  `tests/seccomp_toctou_harness.c` reproduces the TOCTOU race on pointer-argument
+  syscalls under seccomp-unotify and compares a naive supervisor against a
+  mitigated one that resolves paths with `openat2()` under
+  `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`. This is genuine conformance
+  value, but it is not the hand-packed Python ctypes filter constructor that
+  Option B would require — that constructor was never built, which is consistent
+  with rejecting Option B.
+- **Failure mode that drove the rejection.** A hand-assembled path concentrates
+  the highest-risk code (manual jump targets, offset arithmetic, action-mask
+  combinations) in the one component where a single wrong value fails open. This
+  is the fragility the reviewer flagged.
 
 ## Tradeoff Matrix
 
@@ -91,7 +102,7 @@ constructor.
 | Correctness risk    | High. Hand-assembled BPF; manual offsets/jumps/action masks; ctypes packing must be exact and stable per CPython release; fail-open failure modes. | Low. Construction delegated to a widely deployed, continuously fuzzed/audited library; arch multiplexing and ABI quirks handled upstream. |
 | Dependency cost     | Zero new runtime dependency (stdlib `ctypes` only).                                   | One native shared object, ubiquitous on Linux via `systemd`/container runtimes; no build toolchain when bound via `ctypes`. |
 | Audit surface       | Large and novel. Auditor must independently verify bespoke bytecode is correct and fails closed — the hardest-to-review code sits where review is most intense. | Small and familiar. Auditor verifies API usage against a library already in their trust base; filter-construction correctness is inherited. |
-| Maintenance burden  | High. Golden fixtures + struct-packing tests maintained across CPython versions; kernel ABI drift and new-arch support land on the project. | Low. ABI abstraction and arch support tracked upstream; maintenance is keeping a thin binding current and pinning a minimum version. |
+| Maintenance burden  | High. Bespoke fixtures + struct-packing tests maintained across CPython versions; kernel ABI drift and new-arch support land on the project. | Low. ABI abstraction and arch support tracked upstream; maintenance is keeping a thin binding current and pinning a minimum version. |
 
 ## Rationale
 
@@ -111,10 +122,6 @@ Delegating filter construction to `libseccomp` collapses the highest-risk,
 highest-scrutiny code path into "call a trusted library correctly," which both
 reduces real correctness risk and reduces the cost and risk of external review.
 
-The ctypes prototype is not discarded: its differential TOCTOU harness becomes the
-conformance artifact that proves the supervisor behaves correctly against a known
-race, and the load path retains a direct syscall binding where required.
-
 ## Consequences
 
 **Positive**
@@ -126,19 +133,28 @@ race, and the load path retains a direct syscall binding where required.
 
 **Negative**
 
-- `libseccomp` enters the runtime trust base. Mitigated by its ubiquity and
+- `libseccomp` will enter the runtime trust base. Mitigated by its ubiquity and
   audit/fuzzing history.
-- Native shared object must be present and loadable at runtime. Requires an
-  explicit, fail-closed startup check: if `libseccomp` is missing or older than
-  the pinned minimum, Warden refuses to start rather than running unsupervised.
+- The native shared object must be present and loadable at runtime. The
+  implementation must include an explicit, fail-closed startup check: if
+  `libseccomp` is missing or older than the pinned minimum, Warden refuses to
+  start rather than running unsupervised.
 - A minimum `libseccomp` version must be pinned and documented.
 
 **Neutral**
 
-- The ctypes path survives as the differential-test artifact and the load-path
-  binding; it is no longer the production constructor.
 - The TOCTOU harness in `tests/seccomp_toctou_harness.c` is the conformance
   reference for supervisor behavior under seccomp-unotify.
+- `prctl(PR_SET_NO_NEW_PRIVS, ...)` is already in place as the seccomp
+  prerequisite; the libseccomp load path will build on it.
+
+## Follow-up Work
+
+- Implement the libseccomp construction binding (`seccomp_init` →
+  `seccomp_rule_add` → `seccomp_load` via `ctypes` to `libseccomp.so.2.5.5`).
+- Add the fail-closed availability and minimum-version check at Warden startup.
+- Update the Implementation Status section above once the binding lands, and
+  revise Status to remove the "implementation pending" qualifier.
 
 ## Related
 
