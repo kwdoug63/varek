@@ -2,7 +2,7 @@
 
 To protect the VAREK ecosystem and our users, we require all contributors to sign a Contributor License Agreement (CLA) before we can merge any Pull Requests. 
 
-This agreement ensures that you have the right to submit your code and that Sober Agentic Infrastructure, Inc. has the right to distribute it under the Apache 2.0 license.
+This agreement ensures that you have the right to submit your code and that Sober Agentic Infrastructure, Inc. has the right to distribute it under the MIT license.
 
 **How it works:**
 1. Open a Pull Request.
