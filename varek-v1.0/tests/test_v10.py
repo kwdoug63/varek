@@ -66,7 +66,7 @@ TOML = '''
 name        = "test-pkg"
 version     = "1.2.3"
 authors     = ["Alice", "Bob"]
-license     = "Apache-2.0"
+license     = "MIT"
 description = "A test package"
 keywords    = ["test", "varek"]
 varek     = ">=1.0.0"
@@ -93,7 +93,7 @@ m = ManifestParser.parse(TOML)
 chk("manifest name",       lambda m=m: m.package.name == "test-pkg")
 chk("manifest version",    lambda m=m: str(m.package.version) == "1.2.3")
 chk("manifest authors",    lambda m=m: len(m.package.authors) == 2)
-chk("manifest license",    lambda m=m: m.package.license == "Apache-2.0")
+chk("manifest license",    lambda m=m: m.package.license == "MIT")
 chk("manifest desc",       lambda m=m: "test" in m.package.description)
 chk("manifest keywords",   lambda m=m: "varek" in m.package.keywords)
 chk("manifest deps",       lambda m=m: "core-utils" in m.dependencies)
