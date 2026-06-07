@@ -58,6 +58,52 @@
 extern "C" {
 #endif
 
+/* ----------------------------------------------------------------------
+ * v1.8.2 / v1.9 additions — bounded-refusal breaker + progress safety.
+ *
+ * Three optional top-level directives extend the grammar:
+ *
+ *   refusal_budget N             # v1.8.2. N >= 1. Max retryable
+ *                                # UNSATISFIED verdicts the breaker
+ *                                # tolerates for one (session,signature)
+ *                                # before latching to the exhaustion
+ *                                # disposition. Absent => breaker
+ *                                # disabled (pre-v1.8.2 pass-through).
+ *
+ *   on_exhaustion deny           # v1.8.2. Terminal disposition once the
+ *   on_exhaustion terminal NAME  # refusal budget is spent. 'deny' is a
+ *                                # permanent automated refusal (abort).
+ *                                # 'terminal NAME' fires the pre-
+ *                                # authorized safe action NAME (which
+ *                                # must itself be a declared rule and,
+ *                                # per v1.9, must authorize). Absent =>
+ *                                # deny (fail-closed terminal).
+ *
+ *   unknown_disposition deny           # v1.8.2. Terminal disposition for
+ *   unknown_disposition terminal NAME  # an UNKNOWN verdict. UNKNOWN is
+ *                                # never retried (a re-run reproduces it),
+ *                                # so it routes here immediately. Absent
+ *                                # => deny.
+ *
+ * None of these touch the decision procedure. The verdict for any single
+ * submission remains a pure function of (plan, policy). The breaker only
+ * interprets the SEQUENCE of verdicts for one (session, signature) and
+ * picks a deterministic terminal disposition; the resolution is bounded
+ * and never requires human intervention.
+ * -------------------------------------------------------------------- */
+
+/* A terminal disposition: what the breaker does once retries are spent
+ * (on_exhaustion) or for an UNKNOWN verdict (unknown_disposition). */
+typedef enum {
+    PLAN_DISP_DENY     = 0,   /* permanent automated refusal / abort */
+    PLAN_DISP_TERMINAL = 1,   /* fire the named pre-authorized safe action */
+} plan_disposition_kind_t;
+
+typedef struct plan_disposition {
+    plan_disposition_kind_t kind;
+    const char             *action_name;  /* borrowed; non-NULL iff TERMINAL */
+} plan_disposition_t;
+
 /* Opaque config handle. */
 typedef struct plan_label_policy_config plan_label_policy_config_t;
 
@@ -103,6 +149,43 @@ plan_label_policy_config_pathology_opts(const plan_label_policy_config_t *cfg);
 /* Diagnostics: number of rules and labels loaded. */
 size_t plan_label_policy_config_n_rules(const plan_label_policy_config_t *cfg);
 size_t plan_label_policy_config_n_labels(const plan_label_policy_config_t *cfg);
+
+/* ---------- v1.8.2 / v1.9 accessors ---------- */
+
+/* True iff a refusal_budget >= 1 was declared (breaker enabled). */
+bool plan_label_policy_config_breaker_enabled(const plan_label_policy_config_t *cfg);
+
+/* The declared refusal budget (0 iff the breaker is disabled). */
+unsigned plan_label_policy_config_refusal_budget(const plan_label_policy_config_t *cfg);
+
+/* Terminal disposition once the refusal budget is spent. Defaults to
+ * {PLAN_DISP_DENY, NULL} when no on_exhaustion directive is present. */
+plan_disposition_t
+plan_label_policy_config_on_exhaustion(const plan_label_policy_config_t *cfg);
+
+/* Terminal disposition for an UNKNOWN verdict. Defaults to
+ * {PLAN_DISP_DENY, NULL} when no unknown_disposition directive is present. */
+plan_disposition_t
+plan_label_policy_config_unknown_disposition(const plan_label_policy_config_t *cfg);
+
+/* True iff some rule names this action. Used by the v1.9 progress
+ * verifier to confirm a terminal disposition's safe action exists. */
+bool plan_label_policy_config_has_action(const plan_label_policy_config_t *cfg,
+                                         const char *action_name);
+
+/* True iff the policy can produce a refusal at all: a non-empty sticky
+ * set, or any rule with a non-empty deny_in / unknown_in set. A policy
+ * that cannot refuse is trivially progress-safe. */
+bool plan_label_policy_config_can_refuse(const plan_label_policy_config_t *cfg);
+
+/* True iff some rule for 'action_name' classifies a sticky label into
+ * its deny_in or unknown_in set — meaning the action is refused the
+ * moment that label reaches it. A terminal fallback for which this
+ * holds is deadlock-prone (it cannot safely absorb the refused flow it
+ * is meant to terminate), so the v1.9 progress verifier rejects it.
+ * Conservative: checks every rule that names the action. */
+bool plan_label_policy_config_action_denies_sticky(
+        const plan_label_policy_config_t *cfg, const char *action_name);
 
 #ifdef __cplusplus
 }

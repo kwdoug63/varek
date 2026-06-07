@@ -39,6 +39,15 @@ struct plan_label_policy_config {
     char *label_names[PLAN_MAX_LABELS];
     size_t n_labels;
 
+    /* v1.8.2 bounded-refusal breaker config. calloc() gives the safe
+     * defaults: breaker disabled, both dispositions = deny. */
+    bool               budget_set;
+    unsigned           refusal_budget;
+    bool               on_exhaustion_set;
+    bool               unknown_disp_set;
+    plan_disposition_t on_exhaustion;   /* .action_name owned (strdup) or NULL */
+    plan_disposition_t unknown_disp;    /* .action_name owned (strdup) or NULL */
+
     /* Each rule's action_name is strdup'd; we walk rules[] on free
      * to release them. */
 };
@@ -67,6 +76,11 @@ static const char *ERR_VERSION_LATE         = "varek_policy pragma must precede 
 static const char *ERR_STRICT_EXTRA_ARGS    = "'strict' takes no arguments";
 static const char *ERR_EXTRA_TOKENS         = "unexpected extra tokens on line";
 static const char *ERR_MATCH_BAD_ARGS       = "'match' requires KEY and PATTERN";
+static const char *ERR_BUDGET_BAD           = "'refusal_budget' requires a positive integer";
+static const char *ERR_BUDGET_DUP           = "duplicate 'refusal_budget' directive";
+static const char *ERR_DISP_BAD             = "disposition must be 'deny' or 'terminal NAME'";
+static const char *ERR_DISP_DUP_EXH         = "duplicate 'on_exhaustion' directive";
+static const char *ERR_DISP_DUP_UNK         = "duplicate 'unknown_disposition' directive";
 
 /* ---------- Helpers ---------- */
 
@@ -251,6 +265,61 @@ static const char *add_match_to_rule(plan_label_rule_t *rule,
     return NULL;
 }
 
+/* ---------- v1.8.2 breaker directive handlers ---------- */
+
+static const char *handle_refusal_budget(parse_state_t *st, int n_tokens,
+                                         char **tokens)
+{
+    if (st->cfg->budget_set) return ERR_BUDGET_DUP;
+    if (n_tokens != 2)       return ERR_BUDGET_BAD;
+    char *end = NULL;
+    long n = strtol(tokens[1], &end, 10);
+    if (!end || *end != '\0' || n < 1) return ERR_BUDGET_BAD;
+    st->cfg->refusal_budget = (unsigned)n;
+    st->cfg->budget_set     = true;
+    return NULL;
+}
+
+/* Parse 'deny' | 'terminal NAME' from tokens[1..]. On TERMINAL the
+ * action name is strdup'd into out->action_name (owned by cfg). */
+static const char *parse_disposition(int n_tokens, char **tokens,
+                                     plan_disposition_t *out)
+{
+    if (n_tokens == 2 && strcmp(tokens[1], "deny") == 0) {
+        out->kind        = PLAN_DISP_DENY;
+        out->action_name = NULL;
+        return NULL;
+    }
+    if (n_tokens == 3 && strcmp(tokens[1], "terminal") == 0) {
+        char *dup = xstrdup(tokens[2]);
+        if (!dup) return ERR_OOM;
+        out->kind        = PLAN_DISP_TERMINAL;
+        out->action_name = dup;          /* owned; freed in config_free */
+        return NULL;
+    }
+    return ERR_DISP_BAD;
+}
+
+static const char *handle_on_exhaustion(parse_state_t *st, int n_tokens,
+                                        char **tokens)
+{
+    if (st->cfg->on_exhaustion_set) return ERR_DISP_DUP_EXH;
+    const char *e = parse_disposition(n_tokens, tokens, &st->cfg->on_exhaustion);
+    if (e) return e;
+    st->cfg->on_exhaustion_set = true;
+    return NULL;
+}
+
+static const char *handle_unknown_disposition(parse_state_t *st, int n_tokens,
+                                              char **tokens)
+{
+    if (st->cfg->unknown_disp_set) return ERR_DISP_DUP_UNK;
+    const char *e = parse_disposition(n_tokens, tokens, &st->cfg->unknown_disp);
+    if (e) return e;
+    st->cfg->unknown_disp_set = true;
+    return NULL;
+}
+
 /* ---------- Rule-body statement handler ---------- */
 
 static const char *handle_body(parse_state_t *st, int n_tokens, char **tokens)
@@ -357,6 +426,9 @@ int plan_label_policy_config_load_stream(FILE *stream,
             else if (strcmp(kw, "label")        == 0) err = handle_label(&st, n_tokens, tokens);
             else if (strcmp(kw, "sticky")       == 0) err = handle_sticky(&st, n_tokens, tokens);
             else if (strcmp(kw, "rule")         == 0) err = handle_rule(&st, n_tokens, tokens);
+            else if (strcmp(kw, "refusal_budget") == 0) err = handle_refusal_budget(&st, n_tokens, tokens);
+            else if (strcmp(kw, "on_exhaustion")  == 0) err = handle_on_exhaustion(&st, n_tokens, tokens);
+            else if (strcmp(kw, "unknown_disposition") == 0) err = handle_unknown_disposition(&st, n_tokens, tokens);
             else                                       err = ERR_UNKNOWN_STMT;
             if (err) break;
 
@@ -421,6 +493,8 @@ void plan_label_policy_config_free(plan_label_policy_config_t *cfg)
         }
         free(cfg->rules);
     }
+    free((void *)cfg->on_exhaustion.action_name);
+    free((void *)cfg->unknown_disp.action_name);
     free(cfg);
 }
 
@@ -456,4 +530,71 @@ size_t plan_label_policy_config_n_rules(const plan_label_policy_config_t *cfg)
 size_t plan_label_policy_config_n_labels(const plan_label_policy_config_t *cfg)
 {
     return cfg ? cfg->n_labels : 0;
+}
+
+/* ---------- v1.8.2 / v1.9 accessors ---------- */
+
+bool plan_label_policy_config_breaker_enabled(const plan_label_policy_config_t *cfg)
+{
+    return cfg && cfg->budget_set;
+}
+
+unsigned plan_label_policy_config_refusal_budget(const plan_label_policy_config_t *cfg)
+{
+    return cfg ? cfg->refusal_budget : 0u;
+}
+
+plan_disposition_t
+plan_label_policy_config_on_exhaustion(const plan_label_policy_config_t *cfg)
+{
+    plan_disposition_t deny = { PLAN_DISP_DENY, NULL };
+    return cfg ? cfg->on_exhaustion : deny;
+}
+
+plan_disposition_t
+plan_label_policy_config_unknown_disposition(const plan_label_policy_config_t *cfg)
+{
+    plan_disposition_t deny = { PLAN_DISP_DENY, NULL };
+    return cfg ? cfg->unknown_disp : deny;
+}
+
+bool plan_label_policy_config_has_action(const plan_label_policy_config_t *cfg,
+                                         const char *action_name)
+{
+    if (!cfg || !action_name) return false;
+    for (size_t i = 0; i < cfg->n_rules; i++) {
+        if (cfg->rules[i].action_name &&
+            strcmp(cfg->rules[i].action_name, action_name) == 0)
+            return true;
+    }
+    return false;
+}
+
+bool plan_label_policy_config_can_refuse(const plan_label_policy_config_t *cfg)
+{
+    if (!cfg) return false;
+    if (!plan_label_set_empty(&cfg->policy.sticky)) return true;
+    for (size_t i = 0; i < cfg->n_rules; i++) {
+        const plan_label_class_t *c = &cfg->rules[i].classify;
+        if (!plan_label_set_empty(&c->deny_in))    return true;
+        if (!plan_label_set_empty(&c->unknown_in)) return true;
+    }
+    return false;
+}
+
+bool plan_label_policy_config_action_denies_sticky(
+        const plan_label_policy_config_t *cfg, const char *action_name)
+{
+    if (!cfg || !action_name) return false;
+    const plan_label_set_t *sticky = &cfg->policy.sticky;
+    if (plan_label_set_empty(sticky)) return false;
+    for (size_t i = 0; i < cfg->n_rules; i++) {
+        if (!cfg->rules[i].action_name ||
+            strcmp(cfg->rules[i].action_name, action_name) != 0)
+            continue;
+        const plan_label_class_t *c = &cfg->rules[i].classify;
+        if (plan_label_set_intersects(&c->deny_in, sticky))    return true;
+        if (plan_label_set_intersects(&c->unknown_in, sticky)) return true;
+    }
+    return false;
 }
