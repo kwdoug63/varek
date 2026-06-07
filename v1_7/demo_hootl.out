@@ -1,0 +1,45 @@
+VAREK v1.9 — human-out-of-the-loop demonstration
+Certify the policy can always resolve without a human, then run unattended.
+
+== STARTUP 1/2  reject a policy that is not progress-safe ==
+    policy: uncertified_policy.cfg
+    progress-safety: UNSATISFIED  (policy can refuse but declares no refusal_budget (unbounded retry is not human-out-of-the-loop safe))
+    obligation P1 failed: add: refusal_budget N
+    -> refusing to start unattended (exit 3).
+
+== STARTUP 2/2  certify and boot the real policy ==
+    policy: hotl_policy.cfg
+    progress-safety: SATISFIED  (policy is progress-safe (human-out-of-the-loop certified))
+    -> certified human-out-of-the-loop; starting unattended.
+
+== RUN  scenario 1/4  in-policy action authorizes ==
+  agent writes a check within its limit.
+    step 1  write_check(amount=200)  verdict=SATISFIED  breaker=PASS
+    -> authorized; check written. No human.
+
+== RUN  scenario 2/4  refusal, re-planning harness resolves in-budget ==
+  first proposal is over the limit; the harness re-plans monotonically (clamps toward the limit).
+    step 1  write_check(amount=284)  verdict=UNSATISFIED  breaker=REFUSED_RETRYABLE
+    step 2  write_check(amount=200)  verdict=SATISFIED  breaker=PASS
+    -> authorized; check written. No human.
+
+== RUN  scenario 3/4  stuck planner bounded to an automated fallback ==
+  a stuck or adversarial planner resubmits the identical over-limit action; the budget (3) is spent, then the pre-authorized fallback fires.
+    step 1  write_check(amount=284)  verdict=UNSATISFIED  breaker=REFUSED_RETRYABLE
+    step 2  write_check(amount=284)  verdict=UNSATISFIED  breaker=REFUSED_RETRYABLE
+    step 3  write_check(amount=284)  verdict=UNSATISFIED  breaker=TERMINAL_ACTION  -> run abort_txn
+    -> pre-authorized abort_txn executed. No human.
+
+== RUN  scenario 4/4  indeterminate verdict disposed without a human ==
+  the decision procedure returns UNKNOWN (the binding's -1 maps here). UNKNOWN is never retried — a re-run reproduces it — so it goes straight to the policy's unknown_disposition.
+    step 1  write_check(amount=999)  verdict=UNKNOWN  breaker=TERMINAL_DENY
+    -> automated deny (task aborted). No human.
+
+== RESULT ==
+    unattended sessions ....... 4
+    submissions ............... 7  (= 4 resolved + 3 bounded retries)
+    authorized (executed) ..... 2
+    automated terminals ....... 2
+    human interventions ....... 0
+
+    every session resolved automatically; no human in the loop
