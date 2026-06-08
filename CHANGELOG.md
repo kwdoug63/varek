@@ -7,6 +7,156 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased] — v1.10 / v1.11 (planned, not shipped)
+
+The next line is one program: **shrink the UNKNOWN region without weakening
+soundness.** Every item below moves cases out of UNKNOWN into a provable
+SATISFIED or UNSATISFIED, and is admitted only under a soundness obligation that
+forbids it from ever turning a genuinely unsafe action into SATISFIED. Nothing in
+this section is present in a released tag; it is stated as direction.
+
+### Planned — v1.10
+
+- **Verdict-distribution harness.** Measurement and regression gating over a
+  corpus of realistic agent action-graphs. Reports the four-cell outcome
+  (SATISFIED/UNSATISFIED/UNKNOWN against ground-truth SAFE/UNSAFE), the
+  safe-action clear rate, and a hard `unsafe_satisfied == 0` gate. Ground truth
+  is the customer-authored policy; adversarial near-miss labels come from an
+  independent oracle, never from SAI. Built first; a measured baseline is itself
+  a shippable milestone.
+- **Bitvector flag/argument fragment.** Decidable QF_BV reasoning over syscall
+  flag/argument bits, aligned with the Warden kernel layer (provisional
+  #64/059,592). Soundness obligation: ABI-faithful width/signedness, plus a
+  conservative-mask rule (bits outside the policy's mask force UNKNOWN, never a
+  silent SATISFIED). Lowest audit cost; lands first to prove the loop end to end.
+- **Bounded string fragment.** A deliberately restricted, length-bounded string
+  fragment (prefix/suffix/contains and membership in a fixed regex set) so the
+  verifier can prove path-prefix and host-allowlist predicates instead of
+  refusing them. The expected headline reduction in over-refusal. Soundness
+  obligation: encoding faithfulness plus a length-guard (over-length strings
+  escape to UNKNOWN; never truncate-then-check). No new decision procedure — the
+  fragment lowers into procedures already in scope.
+
+### Candidate — v1.11
+
+- **Bounded sequence fragment.** Element-level reasoning for the cross-action
+  data-flow subsystem, modeling collections as a fixed `N` slots plus a length.
+  Composes on top of the bounded string/bitvector fragments (a sequence element
+  is one of those). Soundness obligation adds a composition lemma and a
+  bounded-length guard. Sequenced after strings because it inherits the element
+  fragment's guarantee.
+
+---
+
+## [1.9.0] - 2026-05-30
+
+### Added
+
+- `v1_7/plan_progress.h`, `v1_7/plan_progress.c`: **Progress-safety
+  verification.** A load-time liveness proof that turns human-out-of-the-loop
+  (HOOTL) from a configuration choice into a property the verifier certifies per
+  policy. v1.6–v1.8 prove safety (nothing unauthorized executes); v1.9 adds the
+  complementary proof that the system always has a legal, automated next move, so
+  "never requires a human" is certified rather than hoped.
+- `v1_7/INTEGRATION-hotl.md`, `v1_7/warden_hotl_example.c`: integration guide and
+  runnable reference for using the progress verifier as an unattended-startup
+  gate.
+- `v1_7/demo_hootl.c`: HOOTL demonstration.
+- `v1_7/tests/test_v19_progress.c`: 10/10, clean under
+  `-fsanitize=address,undefined`.
+
+### The theorem certified
+
+For every non-authorizing verdict (UNSATISFIED or UNKNOWN) the policy can
+produce, the v1.8.2 breaker's deterministic resolution reaches an automated
+terminal outcome in finitely many steps, with no point requiring human
+intervention. Decomposed into four obligations: P1 bounded refusal, P2 disposed
+UNKNOWN, P3 disposed exhaustion, P4 authorized fallback (the reachability proof,
+discharged by composing the underlying decision procedure as its authorization
+oracle).
+
+### Result shape
+
+Three-state, matching VAREK semantics: `SATISFIED` (certified progress-safe /
+HOOTL), `UNSATISFIED` (a concrete gap, with the failing obligation named),
+`UNKNOWN` (could not decide — fail closed, treated as not certified).
+
+### Operational use
+
+Call `plan_progress_verify()` at policy load and refuse to start unattended
+unless it certifies. If no automated terminal is guaranteed, the system never
+reaches run time.
+
+### Reproduce
+
+    git clone https://github.com/kwdoug63/varek.git
+    cd varek/v1_7
+    make check
+
+---
+
+## [1.8.2] - 2026-05-30
+
+Point release. Adds a non-bypassable loop bound to the enforcement layer without
+touching the decision procedure.
+
+### Added
+
+- `v1_7/plan_breaker.h`, `v1_7/plan_breaker.c`: **Bounded-refusal breaker.** The
+  decision procedure answers "may this submission run?" purely and statelessly; a
+  refused plan returns UNSATISFIED and what the agent does next is the host's
+  business. Left unbounded, a stuck or adversarial planner can resubmit the same
+  refused action-graph forever — a self-inflicted denial of service, and in an
+  unattended deployment a hang only a human could break. The breaker closes that
+  loop in the trusted boundary, keyed by `(session, action-signature)`, so the
+  bound cannot be defeated by buggy or compromised harness code. Each individual
+  verdict stays a pure function of `(plan, policy)`; the breaker only interprets
+  the *sequence* of verdicts for one signature.
+- `v1_7/tests/test_v18_2_breaker.c`: 19/19, clean under
+  `-fsanitize=address,undefined`.
+
+### Changed
+
+- `v1_7/plan_policy_config.h`, `v1_7/plan_policy_config.c`: three optional
+  top-level policy directives plus accessors. Fully backward compatible — a policy
+  declaring none of them behaves exactly as pre-v1.8.2, and the v1.8.0
+  declassification suite passes unchanged (16/0).
+
+### Policy grammar additions
+
+    refusal_budget N                 # N >= 1; absent => breaker disabled
+    on_exhaustion deny               # default when absent
+    on_exhaustion terminal NAME      # fire a pre-authorized safe action
+    unknown_disposition deny         # default when absent
+    unknown_disposition terminal NAME
+
+### Semantics
+
+- `SATISFIED` clears the signature's counter and latch (authorization always wins;
+  a now-authorized action is never blocked by past refusals).
+- `UNSATISFIED` increments. Below budget: retryable refusal (host may re-plan).
+  At/over budget: fire `on_exhaustion`, latch.
+- `UNKNOWN` routes immediately to `unknown_disposition` and latches — never
+  retried, because re-running the same input reproduces UNKNOWN.
+- A latched signature replays its terminal outcome idempotently. With the breaker
+  disabled, UNSATISFIED is always retryable and never latches (pre-v1.8.2
+  pass-through). Memory pressure interning a new entry fails closed to the
+  exhaustion disposition.
+
+### Boundaries
+
+The decision procedure is untouched; the counter is enforcement state, not
+decision state. The breaker never authors a corrected action — re-planning and
+executing a named safe action remain the host's job.
+
+### Reproduce
+
+    git clone https://github.com/kwdoug63/varek.git
+    cd varek/v1_7
+    make check
+
+---
+
 ## [1.8.1] - 2026-05-30
 
 ### Added
