@@ -63,6 +63,13 @@
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+
+/* v1.9.1: io_uring syscall numbers (x86_64 / arm64-generic) */
+#ifndef __NR_io_uring_setup
+#define __NR_io_uring_setup    425
+#define __NR_io_uring_enter    426
+#define __NR_io_uring_register 427
+#endif
 #include <netinet/in.h>
 #include <sched.h>
 #include <signal.h>
@@ -292,12 +299,16 @@ static int install_user_notif_filter(void) {
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
 
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,  4, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_connect, 3, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execve,  2, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execveat,1, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup,    8, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_enter,    7, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_register, 6, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,   4, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_connect,  3, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execve,   2, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execveat, 1, 0),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
     };
     struct sock_fprog prog = {
         .len    = sizeof(filter) / sizeof(filter[0]),
@@ -667,6 +678,21 @@ static void supervise(int notify_fd, const struct policy *p) {
                 continue;
             }
             d_final = DEC_DENY;
+        }
+
+        /* v1.9.1: deny-only network/exec mediation. A connect/execve
+         * allow cannot be enforced via CONTINUE without a TOCTOU race
+         * on its pointer argument, and there is no fd to inject
+         * (dial-and-inject is a v1.10 item). Fail closed. */
+        if (d_final == DEC_ALLOW && act.kind != ACT_FILE_OPEN) {
+            d_final = DEC_DENY;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            uint64_t lat_dn = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
+                            + (t1.tv_nsec - t0.tv_nsec);
+            emit_pathology(seq++, req.pid, &act, d_raw, d_final,
+                           "deny_only_nonfile_v191", lat_dn, EACCES);
+            send_simple(notify_fd, req.id, d_final);
+            continue;
         }
 
         send_simple(notify_fd, req.id, d_final);

@@ -48,6 +48,48 @@ this section is present in a released tag; it is stated as direction.
 
 ---
 
+## [1.9.1] - 2026-06-20
+
+Hardening and disclosure patch. No verdict-semantics changes; the v1.9
+progress-safety proof is untouched. The invariant is unchanged: no extension may
+move a genuinely unsafe action to SATISFIED.
+
+### Security
+
+- **io_uring bypass closed.** The Warden baseline policy now denies the io_uring
+  submission interface (`io_uring_setup`, `io_uring_enter`, `io_uring_register`)
+  with `EPERM`. io_uring dispatches operations off the syscall entry path, where
+  seccomp — and therefore the Warden's user-notification mediation — cannot
+  observe them; denying instance creation is the only sound mitigation at this
+  layer. New: `v1_7/warden_seccomp_baseline.c`,
+  `v1_7/tests/test_v191_io_uring.c`.
+- **seccomp user-notification TOCTOU discipline.** Hardened the supervisor
+  against time-of-check-to-time-of-use on pointer arguments:
+  `SECCOMP_USER_NOTIF_FLAG_CONTINUE` is no longer used to authorize any syscall
+  whose decision depended on user-pointer contents; pointer-argument operations
+  are performed by the supervisor on validated, copied arguments and the result
+  is injected via `SECCOMP_IOCTL_NOTIF_ADDFD`; every notification is revalidated
+  with `SECCOMP_IOCTL_NOTIF_ID_VALID` before the supervisor acts. New:
+  `v1_7/warden_notify_hardening.{h,c}`.
+
+### Added
+
+- **UNKNOWN-reason diagnostics.** UNKNOWN verdicts now carry the undischarged
+  predicate and the fragment that would resolve it. Additive; SATISFIED and
+  UNSATISFIED are unchanged and soundness is unaffected.
+  Spec: `docs/security/v1.9.1-verifier-notes.md`.
+- **Deterministic resource bounds** on the decision procedure (max step / time
+  ceilings, obligation memoization). A bound hit yields UNKNOWN (fail closed),
+  never a coerced pass.
+- `docs/security/THREAT-MODEL.md`, `docs/security/TRUSTED-COMPUTING-BASE.md`.
+
+### Changed
+
+- Documented the per-component trusted-vs-verified status of the verification
+  chain and the plan to shrink the trusted base (see TRUSTED-COMPUTING-BASE.md).
+
+---
+
 ## [1.9.0] - 2026-05-30
 
 ### Added
