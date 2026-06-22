@@ -55,7 +55,7 @@ not, and is handled by the supervisor-performs pattern above.
 - **Deterministic resource bounds.** Per-obligation step and time ceilings with
   an obligation memoization cache. A bound hit yields UNKNOWN (fail closed),
   never a coerced pass; the step ceiling is the authoritative, reproducible cut.
-- **Security documentation.** `docs/security/THREAT-MODEL.md` and
+- **Security documentation.** `docs/security/threat-model.md` and
   `docs/security/TRUSTED-COMPUTING-BASE.md`.
 
 ## Changed

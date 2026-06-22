@@ -210,7 +210,7 @@ implicit flows (information conveyed through control structure rather than data
 movement) is on the roadmap and is not claimed in this release. The boundary is
 stated rather than blurred.
 
-The published `docs/security/THREAT-MODEL.md` and
+The published `docs/security/threat-model.md` and
 `docs/security/TRUSTED-COMPUTING-BASE.md` are the authoritative statement of
 assumptions, in-scope and out-of-scope threats, the adversary models, and the
 per-component trusted-vs-verified status of the verification chain. The dataflow
@@ -252,7 +252,7 @@ published on the project site; the runnable C demo is in the repository
 
 - **INTEGRATION-hotl.md** — using the progress verifier as an unattended-startup
   gate.
-- **docs/security/THREAT-MODEL.md** — adversary models, in-scope guarantees,
+- **docs/security/threat-model.md** — adversary models, in-scope guarantees,
   out-of-scope non-goals, and the open bypass classes, stated rather than blurred.
 - **docs/security/TRUSTED-COMPUTING-BASE.md** — per-component trusted-vs-verified
   status of the verification chain and the plan to shrink the trusted base.

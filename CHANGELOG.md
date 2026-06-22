@@ -81,7 +81,7 @@ move a genuinely unsafe action to SATISFIED.
 - **Deterministic resource bounds** on the decision procedure (max step / time
   ceilings, obligation memoization). A bound hit yields UNKNOWN (fail closed),
   never a coerced pass.
-- `docs/security/THREAT-MODEL.md`, `docs/security/TRUSTED-COMPUTING-BASE.md`.
+- `docs/security/threat-model.md`, `docs/security/TRUSTED-COMPUTING-BASE.md`.
 
 ### Changed
 
