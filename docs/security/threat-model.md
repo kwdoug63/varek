@@ -1,148 +1,115 @@
-# VAREK Threat Model
+# VAREK — Threat Model
+
+Version: current as of v1.9.1 · MIT · github.com/kwdoug63/varek
+
+This document states what VAREK defends, against whom, and what it explicitly
+does not defend. It is deliberately conservative: where a guarantee is
+conditional, the condition is named. VAREK relocates trust rather than
+eliminating it — from "trust the model's judgment" to "trust the policy, the
+decision procedure, and the enforcement boundary" — and the boundaries below are
+where that relocated trust lives.
+
+## 1. What VAREK is
+
+VAREK decides, before an action takes effect, whether that action complies with
+an explicit, human-authored policy, and enforces the decision at the system
+boundary. Every action resolves to SATISFIED (provably compliant, may proceed),
+UNSATISFIED (provably non-compliant, denied), or UNKNOWN (not decidable within
+bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
+
+## 2. Assets and trust boundaries
+
+- **Asset:** the integrity of the authorization decision — that no action takes
+  effect unless it is SATISFIED under the active policy.
+- **Trust boundary 1:** the policy author (trusted to express intent correctly —
+  see §5, non-goal 1).
+- **Trust boundary 2:** the verification chain — surface-language compiler,
+  obligation encoder, and the SMT decision procedure (see the Trusted Computing
+  Base document for per-component status).
+- **Trust boundary 3:** the enforcement layer — the Warden supervisor and the
+  kernel mechanisms it relies on (seccomp user-notification, and, where
+  deployed, Landlock and capability restrictions).
+
+## 3. Adversary models
+
+VAREK is specified against two adversaries. The default deployment posture is
+Model A; Model B is the hardened posture and is named wherever a guarantee
+depends on it.
+
+**Model A — capable but non-adversarial agent (default).** An autonomous agent
+that may be mistaken, misaligned, or manipulated into *attempting* actions
+outside policy, but is not assumed to be actively exploiting the sandbox
+implementation. VAREK's purpose under Model A is to ensure that attempted
+out-of-policy actions are denied before they take effect.
+
+**Model B — adversarial co-resident process (hardened).** A process that
+actively tries to defeat enforcement: racing argument memory, routing operations
+off the mediated path, or probing for an action that is SATISFIED-but-harmful
+near a policy boundary. VAREK's enforcement layer is hardened against the known
+Model-B techniques below, with the residual limits stated honestly.
+
+## 4. In-scope guarantees
+
+- **Authorization before execution.** No mediated action takes effect without a
+  SATISFIED verdict under the active policy. UNKNOWN and UNSATISFIED both fail
+  closed.
+- **Compositional plan safety (action-graph).** A planned directed acyclic graph
+  of actions is verified before its first action runs, and re-verified as the
+  agent revises it.
+- **Cross-action data-flow bounds.** A source labeled secret cannot reach a sink
+  forbidden by policy, across actions, with declassification only where audited.
+- **Progress-safety / liveness (v1.9).** At policy load the verifier certifies
+  that every refusal resolves to an automated terminal in finitely many steps —
+  human-out-of-the-loop is a certified property, not a setting.
+- **Enforcement-layer hardening (v1.9.1).**
+  - *io_uring is denied in the baseline policy.* io_uring dispatches operations
+    off the syscall entry path, where seccomp cannot observe them; instance
+    creation is refused so the mediated path cannot be bypassed.
+  - *Scalar vs. pointer arguments.* Decisions on scalar register arguments
+    (flags, fd numbers, integer modes) are TOCTOU-safe because the kernel
+    snapshots them. Decisions on pointer-dereferenced data are not made by
+    letting the syscall continue; the supervisor performs the action on copied,
+    validated arguments and injects the result, or denies.
+  - *Stale-notification safety.* Every notification is revalidated immediately
+    before the supervisor acts.
+
+## 5. Out of scope / non-goals
+
+These are real limits, not omissions. Several are addressed on the roadmap; none
+are claimed as solved.
+
+1. **Policy validity.** VAREK proves compliance with the policy as written. It
+   does not prove the policy is correct or complete. A catastrophic action can be
+   SATISFIED if the policy failed to forbid it. Validation of policy intent is
+   the operator's responsibility.
+2. **Application-level semantics beyond the mediated boundary.** Where harm is
+   indistinct at the syscall layer (e.g. "send funds" is a socket write), policy
+   must be expressed at the tool-call / function-call interceptor layer; syscall
+   mediation alone under-constrains such actions.
+3. **Kernel and hardware integrity.** A kernel zero-day, a hypervisor escape, a
+   hardware/microarchitectural side channel, or a fault-injection attack is below
+   VAREK's enforcement layer and out of scope. Defense in depth (Landlock,
+   capability drops, namespaces, seccomp) reduces but does not eliminate exposure.
+4. **Covert/side channels.** VAREK bounds explicit data flow across mediated
+   actions; it does not claim to close timing or other covert channels.
+5. **Availability under forced UNKNOWN.** An adversary who can force decision
+   timeouts forces UNKNOWN — which is safe (fail closed) but is an availability
+   concern, not an authorization breach. Bounded deterministically in v1.9.1.
+6. **Soundness of the trusted chain.** Until proof objects are independently
+   checked, the SMT decision procedure and the compilation to obligations are
+   trusted, not verified. See the Trusted Computing Base document.
+
+## 6. Residual risks (acknowledged)
 
-**Version:** 1.1
-**Last updated:** May 25, 2026
-**Scope:** the isolation layer used to execute untrusted code (code-interpreter tools, agentic execution contexts, sandboxed eval).
+- Pointer-argument operations rely on the supervisor-performs-and-inject pattern;
+  deployments that mediate path-based access should layer Landlock for in-kernel,
+  race-free filesystem restriction rather than relying on argument copying alone.
+- The verification chain's soundness rests on components currently trusted (§5.6).
+- An agent may probe for SATISFIED-but-harmful actions near a policy boundary;
+  this is a policy-tightness question (§5.1), not an enforcement bypass.
 
-This document states, explicitly, what VAREK's containment layer defends against and what it does not. It is written so operators can make informed deployment decisions and so reviewers can hold the project to a concrete bar.
+## 7. Versioning
 
----
-
-## 1. Adversary model
-
-The adversary is any code passed to `execute_untrusted()` that the caller has not written, reviewed, or proven safe. In practice this is:
-
-- Code generated by a language model in an agentic loop
-- Code pasted by an end-user into a notebook or code-interpreter tool
-- Plugin code or third-party scripts invoked by an agent
-- Any binary or native extension reachable from such code
-
-The adversary is assumed to be:
-
-- **Fully adaptive.** They know VAREK's design, read this document, and have the source. Security-by-obscurity is not claimed anywhere.
-- **Capable of arbitrary Python.** Any module in the standard library, any installed package, `ctypes`, raw syscalls via `ctypes.CDLL(None).syscall(...)`, and any native extension the interpreter can import.
-- **Non-interactive within a single execution.** The adversary submits a payload and receives stdout/stderr/exit code. They do not have a persistent shell, network callback, or side channel into the sandbox host — subject to §5.
-- **Potentially persistent across executions.** The host may process many adversarial payloads in sequence. Containment must hold across the full stream, not just the first one.
-
-The adversary is **not** assumed to be:
-
-- A privileged local user on the host
-- The operator of the VAREK-hosting service
-- Capable of modifying VAREK's own code, its Python interpreter, its libseccomp binding, or the host kernel
-
-## 2. Trust boundary
-
-The **kernel is the trust boundary.** Everything above the kernel — the Python interpreter, VAREK itself, installed packages, the PEP 578 audit hook — is considered potentially compromisable by the adversary once untrusted code begins to run.
-
-This is the core architectural shift from v1.0. v1.0 treated the Python interpreter as the enforcement boundary via PEP 578 audit hooks, which the issue #223 review demonstrated to be unsound: hooks are interpreter-local and do not survive `execve` into a child process. v1.1 moves enforcement into the kernel so it holds across every `fork`, `clone`, and whatever native code the payload loads.
-
-## 3. In scope — defended threats
-
-### 3.1 Subprocess escape (the issue #223 class)
-
-Any attempt by untrusted code to spawn a new binary via `subprocess.run`, `subprocess.Popen`, `os.system`, `os.exec*`, `os.posix_spawn`, `ctypes` direct syscall, or a C extension's internal `execve` **must fail**.
-
-**Mechanism:** `execve` and `execveat` are not in the sandbox's seccomp syscall allowlist. They fall through to the default action of `ERRNO(EPERM)`. The filter is loaded under `PR_SET_NO_NEW_PRIVS`, which both (a) lets the filter be loaded unprivileged and (b) makes the filter unforgeable and undroppable by any descendant.
-
-**What this defeats:** renamed binaries (`/tmp/not-nc`), absolute-path bypasses (`/bin/nc` vs `nc`), base64-encoded commands, LOLBins, any attacker binary the adversary drops to disk. The kernel rejects the syscall regardless of argv content.
-
-### 3.2 Network egress (unauthorized C2, exfiltration)
-
-Payloads that attempt outbound connections — direct socket, DNS lookup, HTTP client, raw ICMP — **must fail** when policy sets `allow_network=False` (the default).
-
-**Mechanism:** two layers. (1) The sandbox runs in an empty network namespace (`CLONE_NEWNET`), which has only a down `lo` interface and no routes. (2) The seccomp filter denies `socket`, `connect`, `sendto`, `sendmsg`, and the rest of the socket-family syscalls by default. Either layer alone would block egress; both hold independently.
-
-**Why two layers:** the netns alone fails closed for IP traffic but does not prevent abstract unix sockets within the sandbox. The seccomp denial covers that gap and also hardens against kernel netns bugs.
-
-### 3.3 Filesystem tampering
-
-Payloads that attempt to read or write files outside the per-execution scratch directory **must fail**.
-
-**Mechanism:** the sandbox unshares the mount namespace (`CLONE_NEWNS`), and the payload's working directory and `HOME` are set to a private tmpfs-backed scratch path that is destroyed after execution. `PATH` is set to empty. The filesystem denylist is not enumerated; instead, the adversary's filesystem view is structurally restricted.
-
-**Gap acknowledged:** the v1.1 reference backend does not bind-mount a minimal rootfs over `/`. The sandboxed process can still `read` files on the host mount namespace that were inherited at `unshare` time. Operators running multi-tenant hosts should set `HOME` and `cwd` to scratch (v1.1 does this) and deploy on a per-request rootfs (bubblewrap or gVisor backend, v1.2).
-
-### 3.4 Kernel privilege escalation via high-risk syscalls
-
-Payloads that invoke syscalls historically used as stepping stones to kernel exploits — `ptrace`, `process_vm_readv`, `process_vm_writev`, `kcmp`, `bpf`, `perf_event_open`, `userfaultfd`, `io_uring_setup`, `keyctl`, `init_module`, `finit_module`, `kexec_load`, `reboot`, `mount`, `pivot_root`, `chroot`, `unshare`, `setns`, `ioperm`, `iopl` — **must be killed on sight**.
-
-**Mechanism:** these syscalls are on the seccomp killlist. The filter action is `SECCOMP_RET_KILL_PROCESS` (SIGSYS, signal 31). The process is terminated immediately; no cleanup hooks run, no exception is raised in Python. `ExecutionOutcome.violation` will be set to `seccomp_killlist_triggered`.
-
-### 3.5 Resource exhaustion
-
-Payloads that attempt to exhaust memory, CPU, process count, or wall-clock — `bytearray(10**10)`, fork bombs, busy loops, `time.sleep(forever)` — **must be bounded**.
-
-**Mechanism:** cgroups v2 caps. `memory.max` = `ResourceLimits.memory_mb * 1MiB` (default 512); OOM kill on breach. `cpu.max` = quota computed from `cpu_quota_pct` (default 50% of one core). `pids.max` (default 64) bounds forkbomb blast radius. Wall-clock timeout (default 30s) is enforced by the parent via `subprocess.Popen.communicate(timeout=...)` and results in `SIGKILL` plus `violation = "wall_clock_timeout"`.
-
-### 3.6 Hostile native code
-
-Payloads that load a C extension, a `ctypes`-wrapped shared object, or an embedded interpreter and execute native code **must remain caged**.
-
-**Mechanism:** the seccomp filter lives in the kernel, not in the Python interpreter. Native code runs under the same filter the Python code runs under. `ctypes.CDLL(None).execve(...)` returns EPERM for the same reason `os.execv` does.
-
-This is the core reason v1.0's PEP 578 approach was wrong: hooks live in Python; native code bypasses them. Seccomp does not have this property.
-
-## 4. Known bypasses (expected) — the AST gate is not a security control
-
-VAREK includes a static AST gate that rejects obvious unauthorized imports and calls before execution. **It is a developer-experience layer, not a security boundary.** Its only job is to return a readable error in ~50ms for common mistakes instead of a kernel kill ~500ms later. It is expected to be bypassable, and the following techniques defeat it by design. Each is documented here so reviewers do not mistake the AST gate for the trust boundary defined in §2.
-
-- `importlib.import_module(...)` and other dynamic import paths
-- `__builtins__.__import__(...)` invoked directly
-- String-constructed module names, e.g. `__import__('o' + 's')`
-- `ctypes.CDLL(...)` loading a native library directly
-- `sys.modules` manipulation to rebind or smuggle a module
-
-None of these grant a capability the kernel layer does not already mediate. A payload that bypasses the AST gate and reaches a denied syscall is killed by seccomp (§3.1, §3.4); one that attempts `execve` is rejected with `EPERM` (§3.1); one that loads native code runs under the same filter as the Python code (§3.6). The AST gate failing is not a containment failure.
-
-The same logic applies to the PEP 578 audit hook, demoted to telemetry in v1.1 (see §2): it does not cross the subprocess boundary and never carries enforcement weight. Bypassing, disabling, or crashing the hook does not affect containment.
-
-## 5. Out of scope — undefended threats
-
-### 5.1 Kernel 0-days
-
-A seccomp-bpf filter is only as strong as the kernel implementing it. A local privilege escalation via an allowlisted syscall (e.g. an `io_uring` bug before `io_uring_setup` was killlisted, an `openat2` LSM bypass, a `futex` UAF) will defeat VAREK's reference backend.
-
-Deployments with nation-state threat models should use the forthcoming gVisor backend (v1.2), which runs a user-space kernel implementation and reduces the host-kernel attack surface by roughly two orders of magnitude.
-
-### 5.2 Side channels
-
-Spectre-class speculative execution attacks, cache timing, power analysis, thermal covert channels, and scheduler-based leaks are not mitigated by VAREK. Mitigation is a deployment concern: dedicated cores, CPU mitigations enabled, no co-tenancy with sensitive workloads.
-
-### 5.3 Exfiltration via policy-permitted channels
-
-If the operator's `ExecutionPolicy` sets `allow_network=True` and permits outbound connections to `api.example.com`, hostile code will exfiltrate through that channel. VAREK does not inspect application-layer traffic. Channel allowlisting is the operator's responsibility, not VAREK's.
-
-### 5.4 Supply-chain compromise
-
-If the adversary controls the Python interpreter binary, the `libseccomp` library, VAREK's own source, or any dependency pulled at install time, containment is not meaningful. Reproducible builds, signed releases, and pinned dependencies are the operator's responsibility.
-
-### 5.5 Denial of service against the host
-
-VAREK bounds per-execution resource use. It does not bound aggregate pressure from many concurrent executions, nor does it prevent an adversary from repeatedly paying the fixed cost of sandbox setup (namespace creation, cgroup creation, filter compilation). Operators running public endpoints should rate-limit at a layer above VAREK.
-
-### 5.6 Information disclosure via error channels
-
-Error messages, return codes, and timing are not scrubbed. An adversary who can run many payloads and observe `ExecutionOutcome` can infer facts about the host. This is acceptable for most deployments and is outside v1.1's goals.
-
-### 5.7 Platform coverage
-
-The v1.1 reference backend is Linux-only, kernel 5.10, with cgroups v2 mounted and unprivileged user namespaces enabled. Deployments outside that envelope must wait for the v1.2 backends (gVisor, bubblewrap, Windows Job Objects). The backend fails closed on unsupported hosts rather than silently downgrading.
-
-## 6. Non-goals
-
-VAREK is not:
-
-- A full container runtime. It does not manage images, networks, volumes, or orchestration.
-- A multi-tenant isolation boundary at the trust level of a VM. Deployments that require VM-level isolation should run VAREK inside a VM per tenant.
-- A bug-finder or malware scanner. It contains what it executes; it does not predict whether execution is safe.
-- A policy language. `ExecutionPolicy` is deliberately simple. Rich policy composition (per-tool, per-user, time-bounded) is the caller's responsibility.
-
-## 7. Reporting security issues
-
-Security issues that affect the containment guarantees in §3 should be reported privately via a GitHub security advisory on the repository rather than public issue. Public-issue reports are also accepted and will be responded to; private reporting is preferred when the issue is exploitable against existing deployments.
-
-Issues that affect only items listed in §5 (out of scope) are not treated as security bugs and should be filed as ordinary feature requests.
-
-## 8. Changelog of the threat model itself
-
-- **2026-05-25 (v1.1.x): added §4 (known expected bypasses / AST gate clarification) per external review item.**
+This threat model tracks the released runtime. Guarantees attributed to a version
+hold only at or after that tag. Statements of roadmap intent are marked as such
+and are not guarantees.

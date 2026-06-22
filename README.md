@@ -386,7 +386,7 @@ or [SECURITY.md](./SECURITY.md). Reports receive acknowledgment within 72 hours.
 
 **Threat model and trusted computing base.** Adversary models, in-scope
 guarantees, and out-of-scope conditions are documented in
-[`docs/security/THREAT-MODEL.md`](./docs/security/THREAT-MODEL.md); the
+[`docs/security/threat-model.md`](./docs/security/threat-model.md); the
 per-component trusted-vs-verified status of the verification chain is in
 [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md).
 The cross-action data-flow threat model is in
@@ -408,7 +408,7 @@ platform-gating CI coverage (now macOS, Windows, Linux).
 ## Documentation
 
 - **Spec paper:** [`varek-spec-paper-v1.9.1.md`](./varek-spec-paper-v1.9.1.md) — language and runtime specification, design rationale, the verdict model
-- **Security:** [`docs/security/THREAT-MODEL.md`](./docs/security/THREAT-MODEL.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
+- **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
 - **Verification notes:** [`docs/verification/`](./docs/verification/README.md) — the v1.10/v1.11 program
 - **Changelog:** [`CHANGELOG.md`](./CHANGELOG.md)
 - **Website:** [varek-lang.org](https://varek-lang.org)
