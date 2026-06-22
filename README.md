@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.9.0-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.9.1-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -32,7 +32,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.9.0.**
+   **Current release: v1.9.1.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -81,8 +81,17 @@ The runtime line has progressed well beyond simple syscall containment:
   human-out-of-the-loop operation per policy: for every non-authorizing verdict,
   a deterministic, automated terminal outcome is reachable in finitely many steps.
   "Never requires a human" becomes certified rather than hoped.
+- **v1.9.1 — enforcement hardening, measured.** Closes an io_uring bypass (it
+  dispatches I/O off the syscall path where seccomp can't see it), and removes the
+  time-of-check-to-time-of-use (TOCTOU) race from file mediation: the supervisor
+  resolves the approved path and injects the descriptor rather than letting the
+  syscall re-read attacker-mutable memory. Measured against a race harness, the
+  prior approve-then-continue strategy leaked the protected target 510 times in
+  20,000 attempts; the resolve-and-inject strategy leaked 0. `connect`/`execve`
+  are deny-only (fail closed) pending the v1.10 dial-and-inject path. See
+  [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.9 history.
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.9.1 history.
 
 ### Installation
 
@@ -225,7 +234,7 @@ async fn infer(tensor: Tensor) -> RawOutput {
 ```
 
 The equivalent Python requires four files in two languages. The full language
-description is in the [spec paper](./varek-spec-paper-v1.9.md).
+description is in the [spec paper](./varek-spec-paper-v1.9.1.md).
 
 ### Core language features
 
@@ -247,35 +256,52 @@ library is 261 functions across 7 modules: `var::io`, `var::tensor`, `var::http`
 `var::async`, `var::pipeline`, `var::model`, `var::data`.
 
 ## How the layers compose
+Your AI workload
+VAREK (.varek)                 Python agent code
 
-```
-  Your AI workload
-  ----------------
+typed, LLVM-compiled           (LangChain, AutoGen,
 
-  VAREK (.varek)                 Python agent code
-  typed, LLVM-compiled           (LangChain, AutoGen,
-  unsafe ops inexpressible        CrewAI, custom ...)
-        |                                |
-        |                          action-graph
-        |                                |
-        |                                v
-        |                    +------------------------+
-        |                    | SMT decision procedure |
-        |                    | -> SATISFIED /         |
-        |                    |    UNSATISFIED /        |
-        |                    |    UNKNOWN              |
-        |                    +-----------+------------+
-        |                                |
-        |                                v
-        |                    +------------------------+
-        |                    | Warden runtime         |
-        |                    | kernel enforcement     |
-        |                    | (seccomp-unotify/eBPF) |
-        |                    | fail closed            |
-        |                    +------------------------+
-        v
-  native binary (runs directly)
-```
+unsafe ops inexpressible        CrewAI, custom ...)
+
+|                                |
+
+|                          action-graph
+
+|                                |
+
+|                                v
+
+|                    +------------------------+
+
+|                    | SMT decision procedure |
+
+|                    | -> SATISFIED /         |
+
+|                    |    UNSATISFIED /        |
+
+|                    |    UNKNOWN              |
+
+|                    +-----------+------------+
+
+|                                |
+
+|                                v
+
+|                    +------------------------+
+
+|                    | Warden runtime         |
+
+|                    | kernel enforcement     |
+
+|                    | (seccomp-unotify/eBPF) |
+
+|                    | fail closed            |
+
+|                    +------------------------+
+
+v
+
+native binary (runs directly)
 
 A VAREK pipeline is verified at compile time. Python agent code is verified
 per-action at run time and bounded at the kernel. The two layers address
@@ -290,6 +316,7 @@ different risks at different points in the stack.
 - [x] **v1.7** — Cross-action data-flow verification
 - [x] **v1.8.2** — Bounded-refusal breaker
 - [x] **v1.9.0** — Progress-safety / HOOTL liveness proof
+- [x] **v1.9.1** — Enforcement hardening: io_uring closed; TOCTOU-safe file mediation (510→0); `connect`/`execve` deny-only
 - [ ] **v1.10 (planned)** — The UNKNOWN-shrinking program (below)
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
 
@@ -320,6 +347,11 @@ each with one named soundness obligation and the trusted code it introduces:
 - **v1.11 candidate — bounded sequence fragment.** Element-level reasoning for the
   cross-action data-flow subsystem, composed on the fragments above.
 
+Race-free network mediation (a supervisor-dials-and-injects path replacing the
+v1.9.1 deny-only posture for `connect`) and a default-deny syscall allowlist
+(closing alternate-ABI and variant-syscall bypass classes) are also on the v1.10
+line.
+
 Design and auditor notes live in
 [`docs/verification/`](./docs/verification/README.md): the harness spec, corpus
 schema, and one note per fragment.
@@ -339,9 +371,12 @@ Language test suite — 659 passing across versions:
 
 Runtime test suites are version-scoped and run clean under
 `-fsanitize=address,undefined` — e.g. the v1.8.2 breaker (19/19) and the v1.9
-progress-safety verifier (10/10). Build and run with `make check` in the relevant
-version directory. Containment verification: `python verify_guardrails.py` (see
-above).
+progress-safety verifier (10/10). v1.9.1 enforcement is measured directly by a
+TOCTOU race harness (`tests/seccomp_toctou_harness.c`): 510 sentinel leaks in
+20,000 attempts for approve-then-continue versus 0 for resolve-and-inject, with
+io_uring denial checked under the Warden filter. Build and run with `make check`
+in the relevant version directory. Containment verification: `python
+verify_guardrails.py` (see above).
 
 ## Security
 
@@ -349,12 +384,18 @@ above).
 [GitHub private vulnerability reporting](https://github.com/kwdoug63/varek/security/advisories/new)
 or [SECURITY.md](./SECURITY.md). Reports receive acknowledgment within 72 hours.
 
-**Threat model.** In-scope and out-of-scope threats are documented in
-[`docs/security/threat-model.md`](./docs/security/threat-model.md), with the
-cross-action data-flow threat model in
+**Threat model and trusted computing base.** Adversary models, in-scope
+guarantees, and out-of-scope conditions are documented in
+[`docs/security/THREAT-MODEL.md`](./docs/security/THREAT-MODEL.md); the
+per-component trusted-vs-verified status of the verification chain is in
+[`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md).
+The cross-action data-flow threat model is in
 [`docs/security/threat-model-dataflow.md`](./docs/security/threat-model-dataflow.md).
 The runtime fails closed on unsupported platforms and denies boundary syscalls at
-the kernel, not via string matching or audit hooks.
+the kernel, not via string matching or audit hooks. As of v1.9.1 the Warden
+filter denies io_uring; network egress (`connect`) is deny-only pending the v1.10
+dial-and-inject path; the filter is allow-by-default for unlisted syscalls, with a
+default-deny allowlist on the v1.10 line.
 
 **v1.1.0 fix.** Resolved a subprocess-escape weakness in v1.0's audit-hook-based
 containment (issue #223, reported by @dengluozhang). See
@@ -366,7 +407,8 @@ platform-gating CI coverage (now macOS, Windows, Linux).
 
 ## Documentation
 
-- **Spec paper:** [`varek-spec-paper-v1.9.md`](./varek-spec-paper-v1.9.md) — language and runtime specification, design rationale, the verdict model
+- **Spec paper:** [`varek-spec-paper-v1.9.1.md`](./varek-spec-paper-v1.9.1.md) — language and runtime specification, design rationale, the verdict model
+- **Security:** [`docs/security/THREAT-MODEL.md`](./docs/security/THREAT-MODEL.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
 - **Verification notes:** [`docs/verification/`](./docs/verification/README.md) — the v1.10/v1.11 program
 - **Changelog:** [`CHANGELOG.md`](./CHANGELOG.md)
 - **Website:** [varek-lang.org](https://varek-lang.org)
