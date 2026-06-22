@@ -1,6 +1,6 @@
 # VAREK — Technical Specification
 
-**Version 1.9 (current)**
+**Version 1.9.1 (current)**
 Deterministic runtime verification of autonomous AI agents using formal methods.
 
 Author: Kenneth Wayne Douglas, MD
@@ -21,7 +21,12 @@ runtime behavior at the system boundary to a formal decision over agent plans.
 Through v1.8 the system proves *safety* — nothing unauthorized executes. v1.9
 adds a complementary load-time *liveness* proof, certifying that an unattended
 (human-out-of-the-loop) deployment always has a legal automated next move, so
-"never requires a human" is certified per policy rather than assumed.
+"never requires a human" is certified per policy rather than assumed. v1.9.1
+hardens the enforcement boundary itself: it closes an io_uring bypass, makes
+file-open mediation provably race-free against a time-of-check-to-time-of-use
+(TOCTOU) attack — measured at zero leaks where the prior approach leaked 510
+across 20,000 attempts — fails closed on actions it cannot yet mediate race-free,
+and publishes the project threat model and trusted-computing-base.
 
 ---
 
@@ -110,6 +115,39 @@ UNKNOWN (could not decide; fail closed, not certified). Used as an
 unattended-startup gate, it makes "no human at run time" provable: if no
 automated terminal is guaranteed, the system never reaches run time.
 
+### 2.7 Enforcement hardening (v1.9.1)
+
+v1.9.1 hardens the Warden's kernel-boundary enforcement and is the first release
+to publish a measured result for the enforcement layer itself.
+
+**io_uring bypass closed.** io_uring dispatches operations from kernel worker
+threads off the syscall entry path, where a seccomp filter — and therefore the
+Warden's user-notification mediation — cannot observe them. A policy that mediates
+file or network syscalls was silently bypassable by routing the same operations
+through an io_uring instance. The Warden's filter now denies io_uring instance
+creation outright; there is no sound way to mediate it at this layer.
+
+**TOCTOU discipline, measured.** When a mediation decision depends on a pointer
+argument — a path, a socket address — letting the original syscall proceed after
+approval is unsafe: a second thread in the target can rewrite the argument between
+the check and the kernel's use of it. v1.9.1 removes that pattern. For file opens,
+the supervisor resolves the approved path itself (with magic-link resolution
+disabled) and injects the resulting descriptor into the target, so the target's
+syscall never runs against mutable memory. Measured against a TOCTOU race harness,
+the approve-then-continue strategy leaked the protected target 510 times across
+20,000 attempts; the resolve-and-inject strategy leaked 0. Network and exec
+actions (`connect`, `execve`) cannot yet be mediated race-free — there is no
+descriptor to inject for a connection — so they are deny-only (fail closed)
+pending the supervisor-dials-and-injects path on the v1.10 roadmap. Agent network
+egress is deny-only at this version, by design.
+
+**Scope.** The hardening applies to the reference Warden supervisor. In the public
+source tree the verification layer and the Warden are integrated by reference; the
+syscall filter is allow-by-default for unlisted syscalls, so alternate-ABI and
+variant-syscall bypass classes remain open and are addressed by a planned
+default-deny allowlist. These boundaries are stated in the published threat model
+rather than blurred.
+
 ---
 
 ## 3. Three-state decision semantics
@@ -144,6 +182,18 @@ domains symbolically rather than sampling points, and the three-state verdict is
 deterministically, with UNKNOWN as the fail-safe residue. Coverage of the
 infinite space is by construction, not by enumeration.
 
+### 3.2 UNKNOWN diagnostics and resource bounds (v1.9.1)
+
+Two additive changes in v1.9.1 touch the decision layer without altering any
+SATISFIED or UNSATISFIED outcome. UNKNOWN verdicts now carry a diagnostic — the
+undischarged predicate and the fragment that would resolve it — so a refusal is
+navigable rather than opaque, ahead of the v1.10/v1.11 fragments that will
+actually shrink the UNKNOWN region. And the decision procedure now enforces
+deterministic resource bounds (a step ceiling, a wall-clock safety net, and
+obligation memoization); a bound hit yields UNKNOWN, never a coerced pass, so a
+forced timeout degrades to a safe refusal rather than a hang or a silent
+authorization.
+
 ---
 
 ## 4. Verification scope and guarantees
@@ -160,9 +210,11 @@ implicit flows (information conveyed through control structure rather than data
 movement) is on the roadmap and is not claimed in this release. The boundary is
 stated rather than blurred.
 
-The published threat-model documents (`docs/security/threat-model.md` and
-`docs/security/threat-model-dataflow.md`) are the authoritative statement of
-assumptions, in-scope threats, and out-of-scope conditions.
+The published `docs/security/THREAT-MODEL.md` and
+`docs/security/TRUSTED-COMPUTING-BASE.md` are the authoritative statement of
+assumptions, in-scope and out-of-scope threats, the adversary models, and the
+per-component trusted-vs-verified status of the verification chain. The dataflow
+threat model documents the v1.8 information-flow boundary.
 
 ---
 
@@ -178,6 +230,10 @@ as a passing one.
   enforcement backend cannot be guaranteed, rather than degrading silently.
 - v1.9 progress verifier: `test_v19_progress.c`, 10/10, clean under
   `-fsanitize=address,undefined`.
+- v1.9.1 enforcement, measured directly: a TOCTOU race harness
+  (`tests/seccomp_toctou_harness.c`) reports 510 sentinel leaks across 20,000
+  attempts for approve-then-continue versus 0 for resolve-and-inject; io_uring
+  denial is checked under the Warden filter (`v1_7/tests/test_v191_io_uring.c`).
 
 ---
 
@@ -196,8 +252,15 @@ published on the project site; the runnable C demo is in the repository
 
 - **INTEGRATION-hotl.md** — using the progress verifier as an unattended-startup
   gate.
-- **docs/security/threat-model.md**, **threat-model-dataflow.md** — assumptions,
-  in-scope and out-of-scope threats, and the boundaries of the guarantee.
+- **docs/security/THREAT-MODEL.md** — adversary models, in-scope guarantees,
+  out-of-scope non-goals, and the open bypass classes, stated rather than blurred.
+- **docs/security/TRUSTED-COMPUTING-BASE.md** — per-component trusted-vs-verified
+  status of the verification chain and the plan to shrink the trusted base.
+- **docs/security/v1.9.1-verifier-notes.md** — the UNKNOWN-diagnostic and
+  resource-bound specifications.
+- **RELEASE-v1.9.1.md** — the v1.9.1 enforcement-hardening release notes, with the
+  measured TOCTOU result.
+- **threat-model-dataflow.md** — the v1.8 information-flow boundary.
 - **docs/adr/0001-syscall-layer.md** — the syscall-layer architecture decision
   (libseccomp over raw ctypes, on correctness and audit-surface grounds).
 - **SECURITY.md** — supported versions, private vulnerability reporting, and the
@@ -229,8 +292,11 @@ authorizations — not theory coverage; theory extension is only the means.
    the cross-action data-flow subsystem, composed on top of the string and
    bitvector fragments.
 
-Also on the roadmap: expanded information-flow coverage including implicit flows,
-surface-language ergonomics for `var::`, and continued external audit and
+Also on the roadmap: race-free network mediation (a supervisor-dials-and-injects
+path that replaces the v1.9.1 deny-only posture for `connect`); a default-deny
+syscall allowlist closing the alternate-ABI and variant-syscall bypass classes at
+the Warden boundary; expanded information-flow coverage including implicit flows;
+surface-language ergonomics for `var::`; and continued external audit and
 independent assurance engagement. These are stated as direction; they are not
 present in the current release and are not claimed.
 
@@ -265,7 +331,8 @@ Relicensing considerations are deferred pending conversion.
 | v1.7 | Kernel-boundary integration; vertical stack from system boundary to formal decision. |
 | v1.8 | Cross-action data-flow verification; audited declassification (v1.8.0); bounded-refusal breaker (v1.8.2). |
 | v1.8.1 | Stable release candidate for the v1.7/v1.8 line; narrated demo; threat-model docs. |
-| **v1.9** | **Progress-safety verification.** Load-time liveness proof; certified human-out-of-the-loop. |
+| v1.9 | Progress-safety verification. Load-time liveness proof; certified human-out-of-the-loop. |
+| **v1.9.1** | **Enforcement hardening.** io_uring bypass closed; TOCTOU-safe file-open mediation (measured 510&#8594;0 on the race harness); connect/execve deny-only; threat-model and trusted-computing-base published. |
 | v1.10 (planned) | Verdict-distribution harness; bitvector and bounded-string fragments. Shrinking UNKNOWN. |
 | v1.11 (candidate) | Bounded-sequence fragment for cross-action data flow. |
 
