@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to VAREK are documented in this file.
 
@@ -7,7 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased] — v1.10 / v1.11 (planned, not shipped)
+## [Unreleased] â€” v1.10 / v1.11 (planned, not shipped)
 
 The next line is one program: **shrink the UNKNOWN region without weakening
 soundness.** Every item below moves cases out of UNKNOWN into a provable
@@ -15,7 +15,7 @@ SATISFIED or UNSATISFIED, and is admitted only under a soundness obligation that
 forbids it from ever turning a genuinely unsafe action into SATISFIED. Nothing in
 this section is present in a released tag; it is stated as direction.
 
-### Planned — v1.10
+### Planned â€” v1.10
 
 - **Verdict-distribution harness.** Measurement and regression gating over a
   corpus of realistic agent action-graphs. Reports the four-cell outcome
@@ -34,10 +34,10 @@ this section is present in a released tag; it is stated as direction.
   verifier can prove path-prefix and host-allowlist predicates instead of
   refusing them. The expected headline reduction in over-refusal. Soundness
   obligation: encoding faithfulness plus a length-guard (over-length strings
-  escape to UNKNOWN; never truncate-then-check). No new decision procedure — the
+  escape to UNKNOWN; never truncate-then-check). No new decision procedure â€” the
   fragment lowers into procedures already in scope.
 
-### Candidate — v1.11
+### Candidate â€” v1.11
 
 - **Bounded sequence fragment.** Element-level reasoning for the cross-action
   data-flow subsystem, modeling collections as a fixed `N` slots plus a length.
@@ -45,6 +45,56 @@ this section is present in a released tag; it is stated as direction.
   is one of those). Soundness obligation adds a composition lemma and a
   bounded-length guard. Sequenced after strings because it inherits the element
   fragment's guarantee.
+
+---
+
+## [1.9.2] - 2026-06-21
+
+Hardening patch. No verdict-semantics changes; the v1.9 progress-safety proof is
+untouched. The invariant is unchanged: no extension may move a genuinely unsafe
+action to SATISFIED.
+
+### Security
+
+- **Default-deny allowlist.** The Warden baseline is inverted from
+  allow-plus-denylist to default-deny allowlist: only an explicit allowlist is
+  admitted, so unknown and variant syscalls (`clone3`, `openat2`, `faccessat2`,
+  `pidfd_*`) and 32-bit multiplexers (`socketcall`, `ipc`) are denied by
+  construction. New: `v1_7/warden_seccomp_baseline.{c,h}`,
+  `v1_7/tests/test_v192_baseline_deny.c`.
+- **Native-ABI lockdown.** The deny default applies across all architectures and
+  no secondary ABI is admitted, so the 32-bit compat (`int 0x80`) and x32
+  (`__X32_SYSCALL_BIT`) paths are denied. Asserted on the live kernel by
+  `v1_7/tests/test_v192_abi_lockdown.c` (release-blocking).
+- **Unprivileged-user-namespace denial.** `clone`/`unshare` are filtered on the
+  scalar flags argument to deny `CLONE_NEWUSER` and the namespace set; `clone3`,
+  `setns` hard-denied.
+- **Hard-deny set** (`SCMP_ACT_KILL_PROCESS` in strict mode) for `ptrace`,
+  `bpf`, `userfaultfd`, `process_vm_readv/writev`, `pidfd_getfd`, the mount/FUSE
+  family, the module/`kexec`/`perf_event_open`/`keyctl` family, and
+  `memfd_create` â€” mapping to bypass classes 3â€“6. io_uring denial (v1.9.1) is
+  retained inside this set.
+- **Supervisor/target lifecycle coupling.** Target SIGKILLed on supervisor death
+  (`PR_SET_PDEATHSIG` + re-parent re-check + cgroup.kill fallback); supervisor
+  watches target via pidfd; injected fds carry `O_CLOEXEC`; in-flight
+  notifications bounded (excess fails closed, trips the v1.8.2 breaker). New:
+  `v1_7/warden_lifecycle.{c,h}`.
+
+### Added
+
+- `docs/security/bypass-classes.md` â€” bypass-class checklist and
+  mediation-completeness argument.
+- `docs/security/v1.9.2-baseline-allowlist.md` â€” allowlist rationale and
+  class-to-syscall map.
+- `docs/security/v1.10-architecture-roadmap.md` â€” model/TCB-changing track
+  (Landlock, acquisition tiering, post-grant re-mediation, UNKNOWN escalation
+  ladder, TCB shrink via proof-checking).
+- `v1_7/warden_landlock.c` â€” v1.10 skeleton (not wired into v1.9.2).
+
+### Changed
+
+- The io_uring denial is now an entry in the default-deny allowlist's hard-deny
+  set rather than a standalone denylist rule.
 
 ---
 
@@ -59,7 +109,7 @@ move a genuinely unsafe action to SATISFIED.
 - **io_uring bypass closed.** The Warden baseline policy now denies the io_uring
   submission interface (`io_uring_setup`, `io_uring_enter`, `io_uring_register`)
   with `EPERM`. io_uring dispatches operations off the syscall entry path, where
-  seccomp — and therefore the Warden's user-notification mediation — cannot
+  seccomp â€” and therefore the Warden's user-notification mediation â€” cannot
   observe them; denying instance creation is the only sound mitigation at this
   layer. New: `v1_7/warden_seccomp_baseline.c`,
   `v1_7/tests/test_v191_io_uring.c`.
@@ -97,7 +147,7 @@ move a genuinely unsafe action to SATISFIED.
 - `v1_7/plan_progress.h`, `v1_7/plan_progress.c`: **Progress-safety
   verification.** A load-time liveness proof that turns human-out-of-the-loop
   (HOOTL) from a configuration choice into a property the verifier certifies per
-  policy. v1.6–v1.8 prove safety (nothing unauthorized executes); v1.9 adds the
+  policy. v1.6â€“v1.8 prove safety (nothing unauthorized executes); v1.9 adds the
   complementary proof that the system always has a legal, automated next move, so
   "never requires a human" is certified rather than hoped.
 - `v1_7/INTEGRATION-hotl.md`, `v1_7/warden_hotl_example.c`: integration guide and
@@ -121,7 +171,7 @@ oracle).
 
 Three-state, matching VAREK semantics: `SATISFIED` (certified progress-safe /
 HOOTL), `UNSATISFIED` (a concrete gap, with the failing obligation named),
-`UNKNOWN` (could not decide — fail closed, treated as not certified).
+`UNKNOWN` (could not decide â€” fail closed, treated as not certified).
 
 ### Operational use
 
@@ -148,7 +198,7 @@ touching the decision procedure.
   decision procedure answers "may this submission run?" purely and statelessly; a
   refused plan returns UNSATISFIED and what the agent does next is the host's
   business. Left unbounded, a stuck or adversarial planner can resubmit the same
-  refused action-graph forever — a self-inflicted denial of service, and in an
+  refused action-graph forever â€” a self-inflicted denial of service, and in an
   unattended deployment a hang only a human could break. The breaker closes that
   loop in the trusted boundary, keyed by `(session, action-signature)`, so the
   bound cannot be defeated by buggy or compromised harness code. Each individual
@@ -160,7 +210,7 @@ touching the decision procedure.
 ### Changed
 
 - `v1_7/plan_policy_config.h`, `v1_7/plan_policy_config.c`: three optional
-  top-level policy directives plus accessors. Fully backward compatible — a policy
+  top-level policy directives plus accessors. Fully backward compatible â€” a policy
   declaring none of them behaves exactly as pre-v1.8.2, and the v1.8.0
   declassification suite passes unchanged (16/0).
 
@@ -178,7 +228,7 @@ touching the decision procedure.
   a now-authorized action is never blocked by past refusals).
 - `UNSATISFIED` increments. Below budget: retryable refusal (host may re-plan).
   At/over budget: fire `on_exhaustion`, latch.
-- `UNKNOWN` routes immediately to `unknown_disposition` and latches — never
+- `UNKNOWN` routes immediately to `unknown_disposition` and latches â€” never
   retried, because re-running the same input reproduces UNKNOWN.
 - A latched signature replays its terminal outcome idempotently. With the breaker
   disabled, UNSATISFIED is always retryable and never latches (pre-v1.8.2
@@ -188,7 +238,7 @@ touching the decision procedure.
 ### Boundaries
 
 The decision procedure is untouched; the counter is enforcement state, not
-decision state. The breaker never authors a corrected action — re-planning and
+decision state. The breaker never authors a corrected action â€” re-planning and
 executing a named safe action remain the host's job.
 
 ### Reproduce
@@ -233,7 +283,7 @@ executing a named safe action remain the host's job.
 
 ### Added
 
-- `v1_7/plan_dataflow.h`, `v1_7/plan_dataflow.c`: Operator-designated, audited declassification. `plan_dataflow_add_declassify()` populates a per-node declassify set; `plan_dataflow_node_declassified()` exposes the audit set (`inbound ∩ declassify`) recoverable after verification.
+- `v1_7/plan_dataflow.h`, `v1_7/plan_dataflow.c`: Operator-designated, audited declassification. `plan_dataflow_add_declassify()` populates a per-node declassify set; `plan_dataflow_node_declassified()` exposes the audit set (`inbound âˆ© declassify`) recoverable after verification.
 - `v1_7/plan_label_policy.h`: `declassify` slot on `plan_label_class_t`.
 - `v1_7/plan_policy_config.c`: `declassify NAME` rule-body statement.
 - `v1_7/plan_label.h`: `plan_label_set_minus_into()` and `plan_label_set_intersect_into()` set primitives.
@@ -241,7 +291,7 @@ executing a named safe action remain the host's job.
 
 ### Changed
 
-- **Kernel propagation rule.** v1.7.x: `outbound = inbound ∪ origin` (monotone — labels only accumulate). v1.8.0: `outbound = (inbound \ declassify) ∪ origin`. Labels can now disappear from the flow. Backward compatible: with no labels declassified, behavior is byte-identical to v1.7.4.
+- **Kernel propagation rule.** v1.7.x: `outbound = inbound âˆª origin` (monotone â€” labels only accumulate). v1.8.0: `outbound = (inbound \ declassify) âˆª origin`. Labels can now disappear from the flow. Backward compatible: with no labels declassified, behavior is byte-identical to v1.7.4.
 
 ### Security
 
@@ -250,7 +300,7 @@ This is the only mechanism in VAREK that can bypass the read-secret-then-exfiltr
 1. **Operator-only.** The `declassify` set is populated by the policy, never by the plan or agent. An attacker cannot introduce a declassifying node.
 2. **Two explicit assertions.** Declassification affects only outbound. A node is still policed on its full inbound, so a redactor of a sticky label must also carry `permit_in` for that label, or it fails closed to `UNKNOWN`. Both assertions are required to authorize a sanitize-then-send flow.
 3. **Cannot be routed around.** A bypass edge from the secret's source straight to the denying sink still carries the raw label and is refused.
-4. **Audited.** Every label dropped is recoverable via `plan_dataflow_node_declassified()` — which sensitive labels, at which node, on every plan submission.
+4. **Audited.** Every label dropped is recoverable via `plan_dataflow_node_declassified()` â€” which sensitive labels, at which node, on every plan submission.
 
 **Stated limitation.** VAREK confirms a designated redactor was permitted to see a label and that the label was dropped during propagation. It does not prove the redactor's code sanitizes. Declassification is an operator trust assertion, audited but not verified. Same posture as CaMeL (Google DeepMind + ETH, arXiv 2503.18813) and FIDES (Microsoft Research, arXiv 2505.23643). See `docs/security/threat-model-dataflow.md` L1.
 
@@ -272,7 +322,7 @@ The minor-version bump signals operators to review their trust assumptions befor
 
 ### Links
 - Release: https://github.com/kwdoug63/varek/releases/tag/v1.8.0
-- Discussion: https://github.com/kwdoug63/varek/discussions  (v1.8.0 — declassification: design, safety properties, and your review questions)
+- Discussion: https://github.com/kwdoug63/varek/discussions  (v1.8.0 â€” declassification: design, safety properties, and your review questions)
 
 ---
 
@@ -289,7 +339,7 @@ The minor-version bump signals operators to review their trust assumptions befor
 
 ### Changed
 
-- **Duplicate `action_name` rules now permitted (intentional behavior change).** v1.7.3 rejected them with `ERR_RULE_DUPLICATE`. v1.7.4 evaluates them in declaration order — first match wins. This is how the canonical internal-vs-external egress split is expressed: `rule send_http` with `match url *internal*` and `permit_in SECRET`, then a catch-all `rule send_http` with `deny_in SECRET`. Place specific rules before catch-alls. Configs that previously failed to load with the duplicate-rule error will now load and evaluate.
+- **Duplicate `action_name` rules now permitted (intentional behavior change).** v1.7.3 rejected them with `ERR_RULE_DUPLICATE`. v1.7.4 evaluates them in declaration order â€” first match wins. This is how the canonical internal-vs-external egress split is expressed: `rule send_http` with `match url *internal*` and `permit_in SECRET`, then a catch-all `rule send_http` with `deny_in SECRET`. Place specific rules before catch-alls. Configs that previously failed to load with the duplicate-rule error will now load and evaluate.
 - **Pathology buffer NUL-terminated on success (snprintf semantics).** Previously the buffer was not NUL-terminated and a caller doing `printf("%s", buf)` read past the content into uninitialized memory. Returned length still excludes the NUL; effective capacity is `bufsz - 1`. Length-based callers (including `plan_warden_verify`) are unaffected. A regression test asserts `n == strlen(buf)`.
 
 ### Reproduce
@@ -340,7 +390,7 @@ The minor-version bump signals operators to review their trust assumptions befor
 
 ### Added
 
-- `v1_7/plan_warden_binding.c`, `v1_7/plan_warden_binding.h`: `plan_warden_verify(req, resp)` — single-call entry point that wraps companion allocation, classification, two-axis verification, pathology emission, and cleanup. Companion lifetime is entirely inside the call. This is the supported entry point for the v1.4 Warden's `--plan` gate.
+- `v1_7/plan_warden_binding.c`, `v1_7/plan_warden_binding.h`: `plan_warden_verify(req, resp)` â€” single-call entry point that wraps companion allocation, classification, two-axis verification, pathology emission, and cleanup. Companion lifetime is entirely inside the call. This is the supported entry point for the v1.4 Warden's `--plan` gate.
 - `v1_7/plan_dataflow.h`: `plan_decision_join()` publicized; the lattice join is used in three places and the rank table is no longer duplicated.
 - `v1_7/tests/test_v17_2.c`: Binding tests (50 checks).
 
@@ -369,14 +419,14 @@ The minor-version bump signals operators to review their trust assumptions befor
 ### Added
 
 - `v1_7/plan_dataflow.c`, `v1_7/plan_dataflow.h`: Per-label sticky model. `plan_dataflow_mark_sticky()` marks a label sticky; the kernel's sticky-unclassified path returns `UNKNOWN` (which suppresses) for any sticky label reaching a node without an explicit disposition. `plan_dataflow_add_permit_in()` is the explicit "this node may see this label" assertion that turns sticky off at a trusted carrier.
-- `v1_7/plan_label_policy.h`: Classification surface — `plan_action_desc_t`, `plan_label_class_t`, policy-callback contract, reference table-driven policy.
+- `v1_7/plan_label_policy.h`: Classification surface â€” `plan_action_desc_t`, `plan_label_class_t`, policy-callback contract, reference table-driven policy.
 - `v1_7/plan_dataflow_adapter.c`, `v1_7/plan_dataflow_adapter.h`: `plan_dataflow_populate()` walks an action array against a policy and writes label sets onto the data-flow companion.
 - `v1_7/plan_dataflow_pathology.c`, `v1_7/plan_dataflow_pathology.h`: Deterministic JSON refusal output. Names the offending node, the kind of offense (`deny_in` / `unknown_in` / `sticky_unclassified`), the labels involved, and the immediate predecessor edges that carried each offending label.
 - `v1_7/tests/test_v17_1.c`: Sticky posture, adapter populate, pathology emission tests (32 checks; cumulative 60).
 
 ### Changed
 
-- **Kernel posture: deny-list → per-label sticky (fail-safe).** With no labels marked sticky, behavior is byte-identical to v1.7.0. Production policies should mark sensitive labels sticky to engage the fail-safe path; the v1.7.0 deny-list default of passing unclassified labels silently is inconsistent with VAREK's discipline elsewhere.
+- **Kernel posture: deny-list â†’ per-label sticky (fail-safe).** With no labels marked sticky, behavior is byte-identical to v1.7.0. Production policies should mark sensitive labels sticky to engage the fail-safe path; the v1.7.0 deny-list default of passing unclassified labels silently is inconsistent with VAREK's discipline elsewhere.
 
 ### Reproduce
 
@@ -400,7 +450,7 @@ The minor-version bump signals operators to review their trust assumptions befor
 
 - `v1_7/plan_label.h`: Flat-set label primitive. Fixed-capacity bitset (`PLAN_MAX_LABELS = 128`), set-union semantics, allocation-free.
 - `v1_7/plan_dataflow.c`, `v1_7/plan_dataflow.h`: Cross-action data-flow kernel. Kahn-topological forward propagation, per-node disposition slots (`origin`, `deny_in`, `unknown_in`), tri-state node-level flow decision.
-- `v1_7/plan_dataflow.h`: `plan_decision_join()` — the lattice join over the v1.6 node-axis verdict and the new v1.7 flow-axis verdict. Same `SATISFIED < UNKNOWN < UNSATISFIED` lattice as v1.6, so symmetric suppression composes across both axes.
+- `v1_7/plan_dataflow.h`: `plan_decision_join()` â€” the lattice join over the v1.6 node-axis verdict and the new v1.7 flow-axis verdict. Same `SATISFIED < UNKNOWN < UNSATISFIED` lattice as v1.6, so symmetric suppression composes across both axes.
 - `v1_7/v1_6_compat.h`: Read-only access to v1.6 internals via `execution_plan_internal.h`. Two static-inline helpers (`dataflow_plan_get_edge`, `dataflow_plan_get_node_label`) used by propagation and pathology. v1.6 source files are unchanged; tagged v1.6.x releases stay byte-identical.
 - `v1_7/tests/test_dataflow.c`: Kernel tests covering canonical exfil, fanout poisoning, suppression precedence, cycle UNKNOWN, two-axis join, determinism, empty plan (28 checks).
 
@@ -494,7 +544,7 @@ The minor-version bump signals operators to review their trust assumptions befor
 - `v1_6/execution_plan.c`, `v1_6/execution_plan.h`, `v1_6/execution_plan_internal.h`: ExecutionPlan primitive. Fixed-capacity directed acyclic graph of Actions (1024 nodes, 4096 edges); no dynamic allocation past the plan struct.
 - `v1_6/plan_evaluator.c`: Compositional evaluator. Iterative-DFS cycle detection plus per-node decision aggregation under the join over the lattice `SATISFIED < UNKNOWN < UNSATISFIED`. Three-state return with symmetric suppression preserved on both `UNSATISFIED` and `UNKNOWN` from the v1.4 per-action layer.
 - `v1_6/plan_demo.c`: Kernel demo binary.
-- `v1_6/tests/`: Five test binaries — evaluator basics, symmetric suppression, exhaustive order-invariance (960 permutations across three node-set shapes), fanout poisoning at every position, and cycle detection.
+- `v1_6/tests/`: Five test binaries â€” evaluator basics, symmetric suppression, exhaustive order-invariance (960 permutations across three node-set shapes), fanout poisoning at every position, and cycle detection.
 - `v1_6/README.md`, `v1_6/NOTES.md`: Documentation and design rationale.
 
 ### Patent
@@ -523,16 +573,16 @@ The minor-version bump signals operators to review their trust assumptions befor
 ### Added
 
 - `v1_5/fast_match.c`: Fast-path policy matcher using sorted prefix arrays with binary-search lookup. Three-state `ALLOW` / `DENY` / `UNKNOWN` decision procedure with symmetric suppression preserved from v1.4.
-- `v1_5/smt_probe.c`, `v1_5/smt_probe2.c`: SMT decision-procedure feasibility benchmarks (fresh-context and context-reuse access patterns). Retained for richer policies — regex, integer ranges, multi-rule conjunctions — that the prefix matcher cannot express.
+- `v1_5/smt_probe.c`, `v1_5/smt_probe2.c`: SMT decision-procedure feasibility benchmarks (fresh-context and context-reuse access patterns). Retained for richer policies â€” regex, integer ranges, multi-rule conjunctions â€” that the prefix matcher cannot express.
 - `v1_5/bench_summarize.py`: Nanosecond-precision summarizer. Backward-compatible with v1.4 pathology logs.
 - `v1_5/NOTES.md`: Design notes documenting the hybrid prefix-DFA + SMT architecture decision.
 - `v1_5/bench_results_v1_5.txt`: Provenance record (host, kernel, CPU, memory) from the measured benchmark run.
 
 ### Performance
 
-- `fast_match`: P50 = 93 ns, P99 = 271 ns, P99.9 = 526 ns across 10,000 decisions on DigitalOcean 1 vCPU / 512 MB. Two orders of magnitude (210x) faster than the v1.4 Warden's 57 µs P99 — policy-decision time is not the bottleneck in seccomp-unotify enforcement.
-- SMT context-reuse probe: P50 = 465 µs, P99 = 51,959 µs (bimodal distribution). Disqualified from hot-path use; retained for the slow-path role on richer policies.
-- Zero false negatives. Full `UNKNOWN` → `DENY` suppression across the benchmark.
+- `fast_match`: P50 = 93 ns, P99 = 271 ns, P99.9 = 526 ns across 10,000 decisions on DigitalOcean 1 vCPU / 512 MB. Two orders of magnitude (210x) faster than the v1.4 Warden's 57 Âµs P99 â€” policy-decision time is not the bottleneck in seccomp-unotify enforcement.
+- SMT context-reuse probe: P50 = 465 Âµs, P99 = 51,959 Âµs (bimodal distribution). Disqualified from hot-path use; retained for the slow-path role on richer policies.
+- Zero false negatives. Full `UNKNOWN` â†’ `DENY` suppression across the benchmark.
 
 ### Reproduce
 
@@ -572,7 +622,7 @@ The minor-version bump signals operators to review their trust assumptions befor
 
 ### Performance
 
-- End-to-end Warden pipeline (seccomp-unotify + `/proc/<pid>/mem` + kernel injection): P99 = 57 µs measured.
+- End-to-end Warden pipeline (seccomp-unotify + `/proc/<pid>/mem` + kernel injection): P99 = 57 Âµs measured.
 
 ### Reproduce
 
@@ -631,17 +681,17 @@ The minor-version bump signals operators to review their trust assumptions befor
 
 ---
 
-## [1.1.1] — 2026-04-24
+## [1.1.1] â€” 2026-04-24
 
 ### Added
 
-- `varek_warden.py` — real implementation of the orchestration layer advertised in v1.1. Exposes `configure_backend()`, `execute_untrusted()`, and `subscribe_telemetry()` as callable module-level entry points over the sandbox primitives.
-- `varek_guardrails/` package — public re-export surface. Existing intercept files and external code can now `pip install -e .` and `from varek_guardrails import ...` without resolving loose top-level modules by `sys.path` manipulation.
-- `pyproject.toml` — PEP 621 package metadata. `pytest` is now an optional dev dependency; production installs no longer require it.
+- `varek_warden.py` â€” real implementation of the orchestration layer advertised in v1.1. Exposes `configure_backend()`, `execute_untrusted()`, and `subscribe_telemetry()` as callable module-level entry points over the sandbox primitives.
+- `varek_guardrails/` package â€” public re-export surface. Existing intercept files and external code can now `pip install -e .` and `from varek_guardrails import ...` without resolving loose top-level modules by `sys.path` manipulation.
+- `pyproject.toml` â€” PEP 621 package metadata. `pytest` is now an optional dev dependency; production installs no longer require it.
 
 ### Fixed
 
-- `configure_backend()` now fails closed when `IsolationBackend.is_available()` returns a non-None unavailability reason string. The prior draft had the check inverted, which would have silently accepted unavailable backends — a fail-open bug in a security primitive.
+- `configure_backend()` now fails closed when `IsolationBackend.is_available()` returns a non-None unavailability reason string. The prior draft had the check inverted, which would have silently accepted unavailable backends â€” a fail-open bug in a security primitive.
 
 ### Moved
 
@@ -649,13 +699,13 @@ The minor-version bump signals operators to review their trust assumptions befor
 
 ---
 
-## [1.1.0] — 2026-04-20
+## [1.1.0] â€” 2026-04-20
 
 ### Security
 
 **Resolves a subprocess-escape weakness in the v1.0 containment design** reported by @dengluozhang in issue #223. The v1.0 architecture used a PEP 578 audit hook to deny `subprocess.Popen`, `os.exec*`, and related events by matching against a string-based signature list. Review demonstrated two flaws:
 
-1. `sys.addaudithook` installs a callback in the current interpreter only. Child processes spawned via `subprocess.run` execute in a fresh interpreter or a non-Python binary that never inherits the hook. Parent-side audit callbacks cannot observe syscalls in the child. The reporter's proof-of-concept exploited this directly — the malicious payload executed in the child process while the parent hook saw nothing.
+1. `sys.addaudithook` installs a callback in the current interpreter only. Child processes spawned via `subprocess.run` execute in a fresh interpreter or a non-Python binary that never inherits the hook. Parent-side audit callbacks cannot observe syscalls in the child. The reporter's proof-of-concept exploited this directly â€” the malicious payload executed in the child process while the parent hook saw nothing.
 2. String-signature denylists on command arguments (`nc -e`, `nmap`, known C2 hostnames) were trivially bypassable via absolute paths (`/bin/nc`), base64-encoded commands, renamed binaries, or any attacker tooling not enumerated in the list.
 
 **Fix:** enforcement moved out of the interpreter and into the kernel. The new reference backend combines seccomp-bpf, cgroups v2, and user/mount/network/IPC/UTS/PID namespaces, loaded under `PR_SET_NO_NEW_PRIVS`. The filter is installed before untrusted code runs, inherited across every `fork` and `clone`, and cannot be dropped by any descendant. `execve` is denied by default, which structurally prevents the subprocess-escape class of bypass regardless of argv content.
@@ -664,14 +714,14 @@ Severity: **High**. Users running v1.0 with untrusted code should upgrade.
 
 ### Added
 
-- `sandbox.py` — new module. Defines the `IsolationBackend` interface and ships `SeccompBpfBackend` as the reference implementation. Additional backends (gVisor, bubblewrap, Windows Job Objects) will implement the same interface in future releases.
-- `ExecutionPayload`, `ExecutionPolicy`, `ExecutionOutcome`, `ResourceLimits` — typed policy and result primitives.
-- `default_python_policy()` — safe defaults for untrusted Python execution: allowlisted-only syscall profile, killlist for high-risk syscalls, network denied, 512 MB / 50% CPU / 64 pids / 30 s wall-clock caps.
-- `varek_warden.configure_backend()` — installs the active isolation backend. Fails closed if the backend reports unavailable; no silent downgrade.
-- `varek_warden.execute_untrusted()` — the v1.1 entry point for running untrusted code. Requires a configured backend.
-- `varek_warden.subscribe_telemetry()` — registers callbacks for PEP 578 audit events, now emitted as advisory telemetry only.
-- `docs/security/threat-model.md` — explicit in-scope and out-of-scope threats for the containment layer.
-- `tests/security/test_issue_223_regression.py` — the reporter's PoC is now a regression test. Must fail to execute under the default policy. Tests also cover subprocess escape via base64-encoded commands, renamed binaries, `os.execv`, plus network isolation, killlist triggers, resource caps, and fail-closed behavior.
+- `sandbox.py` â€” new module. Defines the `IsolationBackend` interface and ships `SeccompBpfBackend` as the reference implementation. Additional backends (gVisor, bubblewrap, Windows Job Objects) will implement the same interface in future releases.
+- `ExecutionPayload`, `ExecutionPolicy`, `ExecutionOutcome`, `ResourceLimits` â€” typed policy and result primitives.
+- `default_python_policy()` â€” safe defaults for untrusted Python execution: allowlisted-only syscall profile, killlist for high-risk syscalls, network denied, 512 MB / 50% CPU / 64 pids / 30 s wall-clock caps.
+- `varek_warden.configure_backend()` â€” installs the active isolation backend. Fails closed if the backend reports unavailable; no silent downgrade.
+- `varek_warden.execute_untrusted()` â€” the v1.1 entry point for running untrusted code. Requires a configured backend.
+- `varek_warden.subscribe_telemetry()` â€” registers callbacks for PEP 578 audit events, now emitted as advisory telemetry only.
+- `docs/security/threat-model.md` â€” explicit in-scope and out-of-scope threats for the containment layer.
+- `tests/security/test_issue_223_regression.py` â€” the reporter's PoC is now a regression test. Must fail to execute under the default policy. Tests also cover subprocess escape via base64-encoded commands, renamed binaries, `os.execv`, plus network isolation, killlist triggers, resource caps, and fail-closed behavior.
 
 ### Changed
 
@@ -681,7 +731,7 @@ Severity: **High**. Users running v1.0 with untrusted code should upgrade.
 
 ### Deprecated
 
-- `KineticIntercept` — retained as an importable symbol so v1.0 code does not break at import time, but the audit hook no longer raises it. Enforcement failures now surface as `sandbox.IsolationError`. The symbol will be removed in v2.0.
+- `KineticIntercept` â€” retained as an importable symbol so v1.0 code does not break at import time, but the audit hook no longer raises it. Enforcement failures now surface as `sandbox.IsolationError`. The symbol will be removed in v2.0.
 
 ### Removed
 
@@ -699,7 +749,7 @@ A v1.0 call that previously looked like:
 
 ```python
 varek_warden.enforce_strict_mode()
-exec(untrusted_code)  # relied on the audit hook to catch escapes — unsafe
+exec(untrusted_code)  # relied on the audit hook to catch escapes â€” unsafe
 ```
 
 becomes:
@@ -727,7 +777,7 @@ The design flaw addressed by this release was reported by @dengluozhang on issue
 
 ---
 
-## [1.0.0] — 2026-04-06
+## [1.0.0] â€” 2026-04-06
 
 Initial public release under the MIT license.
 
@@ -735,8 +785,8 @@ Initial public release under the MIT license.
 
 - Statically-typed AI/ML pipeline programming language compiling to native code via LLVM.
 - Hindley-Milner type inference extended to tensor shapes.
-- `varek_warden.py` — PEP 578 audit hook-based runtime intercept for OS-level syscalls spawned from agentic execution contexts.
-- `enforce_strict_mode()` — parent-interpreter audit hook arming for code-interpreter tool containment.
+- `varek_warden.py` â€” PEP 578 audit hook-based runtime intercept for OS-level syscalls spawned from agentic execution contexts.
+- `enforce_strict_mode()` â€” parent-interpreter audit hook arming for code-interpreter tool containment.
 
 ### Known limitations (addressed in 1.1)
 
