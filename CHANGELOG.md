@@ -98,6 +98,56 @@ action to SATISFIED.
 
 ---
 
+## [1.9.2] - 2026-06-21
+
+Hardening patch. No verdict-semantics changes; the v1.9 progress-safety proof is
+untouched. The invariant is unchanged: no extension may move a genuinely unsafe
+action to SATISFIED.
+
+### Security
+
+- **Default-deny allowlist.** The Warden baseline is inverted from
+  allow-plus-denylist to default-deny allowlist: only an explicit allowlist is
+  admitted, so unknown and variant syscalls (`clone3`, `openat2`, `faccessat2`,
+  `pidfd_*`) and 32-bit multiplexers (`socketcall`, `ipc`) are denied by
+  construction. New: `v1_7/warden_seccomp_baseline.{c,h}`,
+  `v1_7/tests/test_v192_baseline_deny.c`.
+- **Native-ABI lockdown.** The deny default applies across all architectures and
+  no secondary ABI is admitted, so the 32-bit compat (`int 0x80`) and x32
+  (`__X32_SYSCALL_BIT`) paths are denied. Asserted on the live kernel by
+  `v1_7/tests/test_v192_abi_lockdown.c` (release-blocking).
+- **Unprivileged-user-namespace denial.** `clone`/`unshare` are filtered on the
+  scalar flags argument to deny `CLONE_NEWUSER` and the namespace set; `clone3`,
+  `setns` hard-denied.
+- **Hard-deny set** (`SCMP_ACT_KILL_PROCESS` in strict mode) for `ptrace`,
+  `bpf`, `userfaultfd`, `process_vm_readv/writev`, `pidfd_getfd`, the mount/FUSE
+  family, the module/`kexec`/`perf_event_open`/`keyctl` family, and
+  `memfd_create` â€” mapping to bypass classes 3â€“6. io_uring denial (v1.9.1) is
+  retained inside this set.
+- **Supervisor/target lifecycle coupling.** Target SIGKILLed on supervisor death
+  (`PR_SET_PDEATHSIG` + re-parent re-check + cgroup.kill fallback); supervisor
+  watches target via pidfd; injected fds carry `O_CLOEXEC`; in-flight
+  notifications bounded (excess fails closed, trips the v1.8.2 breaker). New:
+  `v1_7/warden_lifecycle.{c,h}`.
+
+### Added
+
+- `docs/security/bypass-classes.md` â€” bypass-class checklist and
+  mediation-completeness argument.
+- `docs/security/v1.9.2-baseline-allowlist.md` â€” allowlist rationale and
+  class-to-syscall map.
+- `docs/security/v1.10-architecture-roadmap.md` â€” model/TCB-changing track
+  (Landlock, acquisition tiering, post-grant re-mediation, UNKNOWN escalation
+  ladder, TCB shrink via proof-checking).
+- `v1_7/warden_landlock.c` â€” v1.10 skeleton (not wired into v1.9.2).
+
+### Changed
+
+- The io_uring denial is now an entry in the default-deny allowlist's hard-deny
+  set rather than a standalone denylist rule.
+
+---
+
 ## [1.9.1] - 2026-06-20
 
 Hardening and disclosure patch. No verdict-semantics changes; the v1.9
