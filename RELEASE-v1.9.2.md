@@ -2,7 +2,6 @@
 
 Released 2026-06-21 · MIT · github.com/kwdoug63/varek
 
-*(Set the release date to your tag date.)*
 
 ## Summary
 

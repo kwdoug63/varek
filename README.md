@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.9.1-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.9.2-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -32,7 +32,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.9.1.**
+   **Current release: v1.9.2.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -81,6 +81,7 @@ The runtime line has progressed well beyond simple syscall containment:
   human-out-of-the-loop operation per policy: for every non-authorizing verdict,
   a deterministic, automated terminal outcome is reachable in finitely many steps.
   "Never requires a human" becomes certified rather than hoped.
+- **v1.9.2 — mediation completeness.** Default-deny allowlist replacing allow-by-default; native-ABI lockdown (x32 bypass closed); hard-deny set; scalar-flag `CLONE_NEWUSER` denial; supervisor/target lifecycle coupling. Wired into the live Warden and validated by a conformance target; deny-only bootstrap-exec regression found and fixed. See [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md).
 - **v1.9.1 — enforcement hardening, measured.** Closes an io_uring bypass (it
   dispatches I/O off the syscall path where seccomp can't see it), and removes the
   time-of-check-to-time-of-use (TOCTOU) race from file mediation: the supervisor
@@ -91,7 +92,7 @@ The runtime line has progressed well beyond simple syscall containment:
   are deny-only (fail closed) pending the v1.10 dial-and-inject path. See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.9.1 history.
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.9.2 history.
 
 ### Installation
 
@@ -234,7 +235,7 @@ async fn infer(tensor: Tensor) -> RawOutput {
 ```
 
 The equivalent Python requires four files in two languages. The full language
-description is in the [spec paper](./varek-spec-paper-v1.9.1.md).
+description is in the [spec paper](./varek-spec-paper-v1.9.2.md).
 
 ### Core language features
 
@@ -317,6 +318,7 @@ different risks at different points in the stack.
 - [x] **v1.8.2** — Bounded-refusal breaker
 - [x] **v1.9.0** — Progress-safety / HOOTL liveness proof
 - [x] **v1.9.1** — Enforcement hardening: io_uring closed; TOCTOU-safe file mediation (510→0); `connect`/`execve` deny-only
+- [x] **v1.9.2** — Mediation completeness: default-deny allowlist; native-ABI/x32 lockdown; hard-deny set; `CLONE_NEWUSER` denial; lifecycle coupling; live-Warden integration + conformance validation
 - [ ] **v1.10 (planned)** — The UNKNOWN-shrinking program (below)
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
 
@@ -348,7 +350,9 @@ each with one named soundness obligation and the trusted code it introduces:
   cross-action data-flow subsystem, composed on the fragments above.
 
 Race-free network mediation (a supervisor-dials-and-injects path replacing the
-v1.9.1 deny-only posture for `connect`) and a default-deny syscall allowlist
+v1.9.1 deny-only posture for `connect`) remains on the roadmap; the default-deny
+syscall allowlist closing the alternate-ABI and variant-syscall bypass classes
+shipped in v1.9.2
 (closing alternate-ABI and variant-syscall bypass classes) are also on the v1.10
 line.
 
@@ -392,7 +396,7 @@ per-component trusted-vs-verified status of the verification chain is in
 The cross-action data-flow threat model is in
 [`docs/security/threat-model-dataflow.md`](./docs/security/threat-model-dataflow.md).
 The runtime fails closed on unsupported platforms and denies boundary syscalls at
-the kernel, not via string matching or audit hooks. As of v1.9.1 the Warden
+the kernel, not via string matching or audit hooks. As of v1.9.2 the Warden
 filter denies io_uring; network egress (`connect`) is deny-only pending the v1.10
 dial-and-inject path; the filter is allow-by-default for unlisted syscalls, with a
 default-deny allowlist on the v1.10 line.
@@ -407,7 +411,7 @@ platform-gating CI coverage (now macOS, Windows, Linux).
 
 ## Documentation
 
-- **Spec paper:** [`varek-spec-paper-v1.9.1.md`](./varek-spec-paper-v1.9.1.md) — language and runtime specification, design rationale, the verdict model
+- **Spec paper:** [`varek-spec-paper-v1.9.2.md`](./varek-spec-paper-v1.9.2.md) — language and runtime specification, design rationale, the verdict model
 - **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
 - **Verification notes:** [`docs/verification/`](./docs/verification/README.md) — the v1.10/v1.11 program
 - **Changelog:** [`CHANGELOG.md`](./CHANGELOG.md)
