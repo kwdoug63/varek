@@ -1,0 +1,10 @@
+# VAREK Warden conformance policy — Test Target 1
+#
+# Used by: sudo ./warden conformance_policy.txt -- ./target_conformance
+#
+# The allowed work directory must exist before the run (the target cannot
+# mkdir under default-deny — that is by design):
+#   mkdir -p /tmp/varek_conf
+#
+allow path /tmp/varek_conf/
+deny  path /etc/
