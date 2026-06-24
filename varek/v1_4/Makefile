@@ -6,6 +6,7 @@ CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -Wpedantic -Wno-unused-parameter \
            -D_GNU_SOURCE -std=gnu11
 LDFLAGS ?=
+LDLIBS  ?= -lseccomp
 
 # v1.6 plan-graph integration. The Warden references these symbols
 # directly; -I../../v1_6 lets warden.c #include the v1.6 headers.
@@ -23,8 +24,8 @@ BINS := warden target_demo bench_target
 
 all: $(BINS)
 
-warden: warden.c $(V1_6_SRC)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden.c $(V1_6_SRC)
+warden: warden.c warden_baseline_filter.c $(V1_6_SRC)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c $(V1_6_SRC) $(LDLIBS)
 
 target_demo: target_demo.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<

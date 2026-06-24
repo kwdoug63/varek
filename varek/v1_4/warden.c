@@ -100,6 +100,7 @@
 #include "plan_parser.h"
 #include "plan_spec.h"
 #include "warden_adapter.h"
+#include "warden_baseline_filter.h"
 
 /* Kernel/libc compatibility shims --------------------------------- */
 #ifndef __NR_openat2
@@ -292,34 +293,7 @@ static int xproc_read_bytes(pid_t pid, uint64_t addr, void *out, size_t len) {
 
 /* ---------------- BPF filter ---------------- */
 
-static int install_user_notif_filter(void) {
-    struct sock_filter filter[] = {
-        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ARCH_NR, 1, 0),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
 
-        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup,    8, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_enter,    7, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_register, 6, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,   4, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_connect,  3, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execve,   2, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execveat, 1, 0),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
-    };
-    struct sock_fprog prog = {
-        .len    = sizeof(filter) / sizeof(filter[0]),
-        .filter = filter,
-    };
-    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) return -1;
-    return syscall(__NR_seccomp,
-                   SECCOMP_SET_MODE_FILTER,
-                   SECCOMP_FILTER_FLAG_NEW_LISTENER,
-                   &prog);
-}
 
 /* ---------------- fd passing ---------------- */
 
@@ -784,7 +758,8 @@ int main(int argc, char **argv) {
 
     if (target == 0) {
         close(sv[0]);
-        int notify_fd = install_user_notif_filter();
+        int notify_fd =
+            install_baseline_user_notif_filter(getenv("VAREK_WARDEN_OBSERVE") != NULL);
         if (notify_fd < 0) { perror("seccomp"); _exit(1); }
         if (send_fd(sv[1], notify_fd) < 0) { perror("send_fd"); _exit(1); }
         close(notify_fd);
