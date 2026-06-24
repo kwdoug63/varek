@@ -29,7 +29,9 @@
 // then ship with observe off. This is how you flip a live target to default-deny
 // without stranding it.
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "warden_baseline_filter.h"
 
 #include <seccomp.h>
