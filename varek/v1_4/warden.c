@@ -245,6 +245,7 @@ struct exec_ctx {
     bool    in_use;
     uint64_t seq;
     char    cwd[PATH_LIMIT];
+    bool    launched;
 };
 
 static struct exec_ctx g_ctx[MAX_CTX];
@@ -612,7 +613,8 @@ static int inject_resolved_fd(int notify_fd,
 static volatile sig_atomic_t g_stop = 0;
 static void on_term(int sig) { (void)sig; g_stop = 1; }
 
-static void supervise(int notify_fd, const struct policy *p) {
+static void supervise(int notify_fd, const struct policy *p,
+                      const char *bootstrap_path) {
     uint64_t seq = 0;
     while (!g_stop) {
         struct seccomp_notif req;
@@ -636,6 +638,23 @@ static void supervise(int notify_fd, const struct policy *p) {
             emit_pathology(seq++, req.pid, &act, DEC_UNKNOWN, DEC_DENY,
                            "intent_derivation_failed", lat, EACCES);
             send_simple(notify_fd, req.id, DEC_DENY);
+            continue;
+        }
+
+        /* Bootstrap launch: the target's own first execve of the operator-
+         * specified binary is authorized by the act of launching it. Allowed
+         * exactly once per pid, before the target runs any code (no TOCTOU on
+         * the path: single-threaded, blocked in execve). Later execs fall
+         * through to the deny-only block below. */
+        if (act.kind == ACT_PROCESS_EXEC && ctx && !ctx->launched &&
+            bootstrap_path && strcmp(act.target, bootstrap_path) == 0) {
+            ctx->launched = true;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            uint64_t lat_b = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
+                           + (t1.tv_nsec - t0.tv_nsec);
+            emit_pathology(seq++, req.pid, &act, DEC_ALLOW, DEC_ALLOW,
+                           "bootstrap_exec_allow", lat_b, 0);
+            send_simple(notify_fd, req.id, DEC_ALLOW);
             continue;
         }
 
@@ -783,7 +802,7 @@ int main(int argc, char **argv) {
         "[warden] supervising pid=%d  notify_fd=%d  policy=%s (%zu rules)\n",
         target, notify_fd, p.name, p.n_rules);
 
-    supervise(notify_fd, &p);
+    supervise(notify_fd, &p, target_argv[0]);
 
     kill(target, SIGKILL);  /* best-effort: ensures waitpid does not hang */
     int status = 0;
