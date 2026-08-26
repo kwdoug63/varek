@@ -16,10 +16,8 @@ VAREK decides whether an AI agent's planned actions are allowed **before** they
 execute, and enforces that decision at the kernel boundary.
 
 An agent's intended actions are represented as an **action-graph** — a directed
-acyclic graph of planned actions. An **SMT decision procedure** evaluates that
-graph against a policy and returns one of three verdicts: **SATISFIED**,
-**UNSATISFIED**, or **UNKNOWN**. The **Warden** runtime carries that verdict to
-the kernel (via `seccomp-unotify` / eBPF) and refuses any disallowed syscall
+acyclic graph of planned actions. A **two-tier decision procedure** evaluates that graph against a policy: a compiled decidable matcher rules on the common case in nanoseconds, backed by a full SMT decision procedure for policies the fast path cannot express. Both return one of three verdicts — **SATISFIED**, **UNSATISFIED**, or **UNKNOWN** — and both fail closed. The **Warden** runtime carries that verdict to
+the kernel (via `seccomp user-notify (seccomp-BPF)`) and refuses any disallowed syscall
 before it lands. The check is pre-execution: an action that cannot be proven
 allowed never runs.
 
@@ -265,43 +263,47 @@ typed, LLVM-compiled           (LangChain, AutoGen,
 unsafe ops inexpressible        CrewAI, custom ...)
 
 |                                |
-
+```
 |                          action-graph
 
 |                                |
 
 |                                v
 
-|                    +------------------------+
+|                    +-----------------------------------+
 
-|                    | SMT decision procedure |
+|                    | two-tier decision procedure       |
 
-|                    | -> SATISFIED /         |
+|                    |   decidable matcher (fast)        |
 
-|                    |    UNSATISFIED /        |
+|                    |   + SMT for richer policy         | 
 
-|                    |    UNKNOWN              |
+|                    |   -> SATISFIED /                  | 
 
-|                    +-----------+------------+
+|                    |      UNSATISFIED /                | 
+
+|                    |      UNKNOWN                      |
+
+|                    +-----------------------------------+
 
 |                                |
 
 |                                v
 
-|                    +------------------------+
+|                    +-----------------------------------+
 
-|                    | Warden runtime         |
+|                    | Warden runtime                    |
 
-|                    | kernel enforcement     |
+|                    | kernel enforcement                |
 
-|                    | (seccomp-unotify/eBPF) |
+|                    | seccomp user-notify (seccomp-BPF) |
 
-|                    | fail closed            |
+|                    | fail closed                       |
 
-|                    +------------------------+
+|                    +-----------------------------------+
 
 v
-
+```
 native binary (runs directly)
 
 A VAREK pipeline is verified at compile time. Python agent code is verified
