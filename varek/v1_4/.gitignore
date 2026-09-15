@@ -2,9 +2,12 @@
 warden
 target_demo
 bench_target
+target_conformance
 *.o
 
 # benchmark output
 bench.log
 bench_small.log
 *.log
+tests/lifecycle_target
+tests/test_v193_lifecycle

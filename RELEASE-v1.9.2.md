@@ -56,11 +56,16 @@ family, and `memfd_create` are denied with `SCMP_ACT_KILL_PROCESS` in strict mod
 
 ### Supervisor/target lifecycle coupling
 
-The target is SIGKILLed if the supervisor dies (`PR_SET_PDEATHSIG` plus a
-re-parent re-check, with a cgroup.kill fallback); the supervisor watches the
-target via pidfd. Injected fds carry `O_CLOEXEC` so a granted capability cannot
-leak across `execve`. In-flight notifications are bounded; excess fails closed
-and trips the v1.8.2 bounded-refusal breaker. New: `v1_7/warden_lifecycle.{c,h}`.
+The target is SIGKILLed if the supervisor dies (`PR_SET_PDEATHSIG`); the
+supervisor watches the target via pidfd. Injected fds carry `O_CLOEXEC` so a
+granted capability cannot leak across `execve`. New:
+`v1_7/warden_lifecycle.{c,h}`.
+
+> **Correction (v1.9.3).** At this release only the `O_CLOEXEC` part was
+> enforced by the live Warden; PDEATHSIG coupling and the pidfd watch were not
+> yet wired in, so bypass class 7 was **partial**, not closed. v1.9.3 wires
+> them in and extends the coupling to everything the agent spawns. See
+> [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md).
 
 ## Added
 

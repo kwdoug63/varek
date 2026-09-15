@@ -48,6 +48,64 @@ this section is present in a released tag; it is stated as direction.
 
 ---
 
+## [1.9.3] - 2026-09-15
+
+v1.9.3 wires the v1.9.2 supervisor/target lifecycle module into the live
+Warden and corrects the v1.9.2 record: at v1.9.2, bypass class 7
+(supervisor-as-target / lifecycle) was **partial**, not closed. No verdict
+semantics change.
+
+### Security
+
+- **The agent dies with the supervisor.** The target sets
+  `PR_SET_PDEATHSIG(SIGKILL)` before installing its filter (`prctl` is outside
+  the allowlist, so the agent cannot clear it). A liveness pipe held only by the
+  supervisor catches a supervisor that died before that call; the target
+  refuses to run unmonitored. This replaces the `getppid()` re-check, which
+  returns 0 inside a PID namespace; `wd_target_couple_to_supervisor()` now takes
+  the pipe fd.
+- **So does everything the agent spawned.** The target runs as init of a
+  dedicated PID namespace, so the kernel kills all of its descendants when it
+  dies. `PR_SET_PDEATHSIG` alone does not cover descendants.
+- **Orderly shutdown kills the whole tree** (namespace + process group).
+- **Target watched via pidfd** alongside the listener, closing a hang where the
+  target exited just before the supervisor blocked in `NOTIF_RECV`.
+- **`CAP_SYS_ADMIN` preflight.** The Warden checks for the capability at
+  startup and refuses to run without it, with a clear message.
+  `VAREK_WARDEN_NO_PIDNS=1` opts out of the namespace (and the requirement)
+  with a warning; in that mode descendants are not guaranteed to die on a
+  supervisor crash.
+
+### Added
+
+- `varek/v1_4/tests/test_v193_lifecycle.c` and `tests/lifecycle_target.c`;
+  `make test-lifecycle`. SIGKILLs and SIGTERMs a live Warden supervising an
+  agent that forks and asserts no agent process survives; exercises the
+  fork-race guard. Fails against the pre-fix Warden (crash: 2 survivors;
+  orderly shutdown: 1 survivor).
+- `make target_conformance` and `make run-conformance` (creates
+  `/tmp/varek_conf`, then runs the conformance target under the Warden).
+- `RELEASE-v1.9.3.md`; spec paper updated to v1.9.3 (§2.9).
+
+### Fixed
+
+- **Conformance target setup.** `target_conformance` failed its
+  `allowed_open` phase when `/tmp/varek_conf` did not exist (the target cannot
+  create it under enforcement). It now reports a `setup` failure with the fix,
+  and `make run-conformance` creates the directory.
+
+### Changed
+
+- The supervised agent sees itself as PID 1 and `getppid()` returns 0.
+  Pathology records still report the host PID. Policy decisions are unchanged
+  (verified identical on the demo, plan-verification, bench, and conformance
+  workloads).
+- `docs/security/bypass-classes.md`: class 7 is **closed as of v1.9.3**
+  (partial in v1.9.2). `WD_MAX_INFLIGHT_NOTIFS` is documented as not enforced
+  by the single-threaded v1.4 Warden (in-flight concurrency is 1).
+
+---
+
 ## [1.9.2] - 2026-06-21
 
 Hardening patch. No verdict-semantics changes; the v1.9 progress-safety proof is
@@ -75,10 +133,10 @@ action to SATISFIED.
   `memfd_create` — mapping to bypass classes 3–6. io_uring denial (v1.9.1) is
   retained inside this set.
 - **Supervisor/target lifecycle coupling.** Target SIGKILLed on supervisor death
-  (`PR_SET_PDEATHSIG` + re-parent re-check + cgroup.kill fallback); supervisor
-  watches target via pidfd; injected fds carry `O_CLOEXEC`; in-flight
-  notifications bounded (excess fails closed, trips the v1.8.2 breaker). New:
-  `v1_7/warden_lifecycle.{c,h}`.
+  (`PR_SET_PDEATHSIG`); supervisor watches target via pidfd; injected fds carry
+  `O_CLOEXEC`. New: `v1_7/warden_lifecycle.{c,h}`. **Correction (v1.9.3):**
+  only the `O_CLOEXEC` part was enforced by the live Warden at this release;
+  PDEATHSIG coupling and the pidfd watch were integrated in v1.9.3.
 
 ### Added
 

@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.9.2-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.9.3-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -30,7 +30,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.9.2.**
+   **Current release: v1.9.3.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -79,7 +79,8 @@ The runtime line has progressed well beyond simple syscall containment:
   human-out-of-the-loop operation per policy: for every non-authorizing verdict,
   a deterministic, automated terminal outcome is reachable in finitely many steps.
   "Never requires a human" becomes certified rather than hoped.
-- **v1.9.2 — mediation completeness.** Default-deny allowlist replacing allow-by-default; native-ABI lockdown (x32 bypass closed); hard-deny set; scalar-flag `CLONE_NEWUSER` denial; supervisor/target lifecycle coupling. Wired into the live Warden and validated by a conformance target; deny-only bootstrap-exec regression found and fixed. See [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md).
+- **v1.9.3 — lifecycle coupling in the live Warden.** If the supervisor stops, the agent stops, and so does everything it started: the agent runs in its own PID namespace and is killed on supervisor death, with a fork-race guard and a pidfd watch. The Warden now requires `CAP_SYS_ADMIN` and checks for it at startup. A crash test kills a live Warden and asserts no agent process survives. Also corrects the v1.9.2 record (bypass class 7 was partial at v1.9.2) and fixes conformance-target setup. See [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md).
+- **v1.9.2 — mediation completeness.** Default-deny allowlist replacing allow-by-default; native-ABI lockdown (x32 bypass closed); hard-deny set; scalar-flag `CLONE_NEWUSER` denial; lifecycle-coupling module (integrated into the live Warden in v1.9.3). Default-deny baseline wired into the live Warden and validated by a conformance target; deny-only bootstrap-exec regression found and fixed. See [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md).
 - **v1.9.1 — enforcement hardening, measured.** Closes an io_uring bypass (it
   dispatches I/O off the syscall path where seccomp can't see it), and removes the
   time-of-check-to-time-of-use (TOCTOU) race from file mediation: the supervisor
@@ -90,7 +91,7 @@ The runtime line has progressed well beyond simple syscall containment:
   are deny-only (fail closed) pending the v1.10 dial-and-inject path. See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.9.2 history.
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.9.3 history.
 
 ### Installation
 
@@ -107,6 +108,10 @@ pip install -e ".[dev]"
 - `libseccomp` Python binding (`pyseccomp` or `python3-libseccomp`)
 - Unprivileged user namespaces enabled
 - `/sys/fs/cgroup/varek.slice` writable by the test user
+
+The C Warden (`varek/v1_4`) additionally requires `CAP_SYS_ADMIN` (run it as
+root or via `sudo`); it checks at startup and refuses to run without it. See
+[`varek/v1_4/README.md`](./varek/v1_4/README.md).
 
 The runtime **fails closed** if these are unmet. The package installs and imports
 cleanly everywhere, but `SeccompBpfBackend.is_available()` returns an explanatory
@@ -233,7 +238,7 @@ async fn infer(tensor: Tensor) -> RawOutput {
 ```
 
 The equivalent Python requires four files in two languages. The full language
-description is in the [spec paper](./varek-spec-paper-v1.9.2.md).
+description is in the [spec paper](./varek-spec-paper-v1.9.3.md).
 
 ### Core language features
 
@@ -320,7 +325,8 @@ different risks at different points in the stack.
 - [x] **v1.8.2** — Bounded-refusal breaker
 - [x] **v1.9.0** — Progress-safety / HOOTL liveness proof
 - [x] **v1.9.1** — Enforcement hardening: io_uring closed; TOCTOU-safe file mediation (510→0); `connect`/`execve` deny-only
-- [x] **v1.9.2** — Mediation completeness: default-deny allowlist; native-ABI/x32 lockdown; hard-deny set; `CLONE_NEWUSER` denial; lifecycle coupling; live-Warden integration + conformance validation
+- [x] **v1.9.2** — Mediation completeness: default-deny allowlist; native-ABI/x32 lockdown; hard-deny set; `CLONE_NEWUSER` denial; live-Warden integration + conformance validation
+- [x] **v1.9.3** — Lifecycle coupling in the live Warden: PID-namespace isolation, death-signal coupling, fork-race guard, pidfd watch; crash test
 - [ ] **v1.10 (planned)** — The UNKNOWN-shrinking program (below)
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
 
@@ -354,9 +360,8 @@ each with one named soundness obligation and the trusted code it introduces:
 Race-free network mediation (a supervisor-dials-and-injects path replacing the
 v1.9.1 deny-only posture for `connect`) remains on the roadmap; the default-deny
 syscall allowlist closing the alternate-ABI and variant-syscall bypass classes
-shipped in v1.9.2
-(closing alternate-ABI and variant-syscall bypass classes) are also on the v1.10
-line.
+shipped in v1.9.2, and supervisor/target lifecycle coupling shipped in the live
+Warden in v1.9.3.
 
 Design and auditor notes live in
 [`docs/verification/`](./docs/verification/README.md): the harness spec, corpus
@@ -398,10 +403,12 @@ per-component trusted-vs-verified status of the verification chain is in
 The cross-action data-flow threat model is in
 [`docs/security/threat-model-dataflow.md`](./docs/security/threat-model-dataflow.md).
 The runtime fails closed on unsupported platforms and denies boundary syscalls at
-the kernel, not via string matching or audit hooks. As of v1.9.2 the Warden
-filter denies io_uring; network egress (`connect`) is deny-only pending the v1.10
-dial-and-inject path; the filter is allow-by-default for unlisted syscalls, with a
-default-deny allowlist on the v1.10 line.
+the kernel, not via string matching or audit hooks. As of v1.9.3 the Warden
+filter is default-deny (an explicit allowlist, native ABI only, with a hard-deny
+set that includes io_uring); network egress (`connect`) is deny-only pending the
+v1.10 dial-and-inject path; and the agent runs in its own PID namespace, so it
+and everything it spawned die with the supervisor. The per-class status is in
+[`docs/security/bypass-classes.md`](./docs/security/bypass-classes.md).
 
 **v1.1.0 fix.** Resolved a subprocess-escape weakness in v1.0's audit-hook-based
 containment (issue #223, reported by @dengluozhang). See
@@ -413,8 +420,8 @@ platform-gating CI coverage (now macOS, Windows, Linux).
 
 ## Documentation
 
-- **Spec paper:** [`varek-spec-paper-v1.9.2.md`](./varek-spec-paper-v1.9.2.md) — language and runtime specification, design rationale, the verdict model
-- **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
+- **Spec paper:** [`varek-spec-paper-v1.9.3.md`](./varek-spec-paper-v1.9.3.md) — language and runtime specification, design rationale, the verdict model
+- **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`docs/security/bypass-classes.md`](./docs/security/bypass-classes.md), [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md), [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
 - **Verification notes:** [`docs/verification/`](./docs/verification/README.md) — the v1.10/v1.11 program
 - **Changelog:** [`CHANGELOG.md`](./CHANGELOG.md)
 - **Website:** [varek-lang.org](https://varek-lang.org)

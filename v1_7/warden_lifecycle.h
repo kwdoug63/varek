@@ -5,13 +5,15 @@
 // model assumes the supervisor is alive and watching. If it is not, unmediated
 // syscalls keep running on a now-unmonitored target. Three couplings:
 //
-//   - target dies if supervisor dies  (PR_SET_PDEATHSIG + cgroup.kill fallback)
+//   - target dies if supervisor dies  (PR_SET_PDEATHSIG + liveness-pipe race
+//                                       check)
+//   - target's descendants die with it (dedicated PID namespace, target = init)
 //   - supervisor learns if target dies (pidfd poll), to release state
 //   - injected fds carry O_CLOEXEC      (ADDFD must not leak across exec)
 //   - a bound on in-flight notifications (flood DoS containment)
 //
-// Reference-quality against the public kernel API; integrate and test before
-// tagging.
+// Integrated into the v1.4 Warden (varek/v1_4/warden.c) and covered end to
+// end by varek/v1_4/tests/test_v192_lifecycle.c.
 #ifndef WARDEN_LIFECYCLE_H
 #define WARDEN_LIFECYCLE_H
 
@@ -22,11 +24,23 @@
 extern "C" {
 #endif
 
-// Call in the TARGET, after fork/clone and before installing the seccomp
-// filter / execing the agent. Requests SIGKILL when the supervisor (this
-// process's parent) dies. Re-checks getppid() to defeat the
-// parent-died-before-prctl race. Returns 0 / -errno.
-int wd_target_couple_to_supervisor(pid_t expected_supervisor_pid);
+// Call in the SUPERVISOR, once, before forking the target. Places the NEXT
+// child the supervisor forks into a fresh PID namespace as its init (pid 1).
+// When that init dies, the kernel SIGKILLs every other process in the
+// namespace, so anything the agent spawned dies with it. Requires
+// CAP_SYS_ADMIN. The supervisor must fork exactly one child afterwards.
+// Returns 0 / -errno.
+int wd_supervisor_isolate_pids(void);
+
+// Call in the TARGET, after fork and before installing the seccomp filter /
+// execing the agent. Requests SIGKILL when the supervisor (the thread that
+// forked this process) dies. liveness_fd is the read end of a pipe whose write
+// end only the supervisor holds; if it already reports POLLHUP, the supervisor
+// died before PR_SET_PDEATHSIG took effect (the fork/prctl race) and the
+// target must not continue. A pipe is used instead of getppid() because
+// getppid() returns 0 inside a PID namespace. Returns 0, -ESRCH if the
+// supervisor is already gone, or -errno.
+int wd_target_couple_to_supervisor(int liveness_fd);
 
 // Call in the SUPERVISOR for a managed target. Returns a pidfd (>=0) that
 // becomes readable when the target exits, so the supervisor can release the
@@ -40,10 +54,11 @@ int wd_cgroup_kill(const char *cgroup_dir);
 
 // ---- notification hygiene -------------------------------------------------
 
-// Bound on concurrently-handled notifications. A target spamming mediated
-// syscalls must not exhaust supervisor memory or stall mediation for siblings.
-// Past the bound, the supervisor responds to excess notifications with EPERM
-// (fail closed) and trips the bounded-refusal breaker (v1.8.2) for the source.
+// Bound on concurrently-handled notifications, for a future multi-threaded
+// supervisor. NOT enforced by the v1.4 Warden: it handles one notification at
+// a time (in-flight concurrency is 1) and pending requests queue in the
+// kernel, so there is no supervisor-side state to exhaust. A multi-threaded
+// supervisor must enforce this bound (excess -> EPERM, fail closed).
 #ifndef WD_MAX_INFLIGHT_NOTIFS
 #define WD_MAX_INFLIGHT_NOTIFS 256
 #endif

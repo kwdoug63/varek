@@ -2,7 +2,7 @@
 
 # VAREK — Technical Specification
 
-**Version 1.9.2 (current)**
+**Version 1.9.3 (current)**
 
 *Deterministic runtime verification of autonomous AI agents using formal methods.*
 
@@ -17,7 +17,7 @@ License: MIT · Project: [varek-lang.org](https://varek-lang.org) · Source: [gi
 
 VAREK is an open-source compiled language and runtime for verifying the behavior of autonomous AI agents before that behavior takes effect. Policies are compiled to a satisfiability-modulo-theories decision procedure that returns one of three results — SATISFIED, UNSATISFIED, or UNKNOWN — and the runtime is fail-closed: an action proceeds only on an explicit SATISFIED. The stack is vertical, from runtime behavior at the system boundary to a formal decision over agent plans.
 
-Through v1.8 the system proves *safety* — nothing unauthorized executes. v1.9 adds a complementary load-time *liveness* proof, certifying that an unattended (human-out-of-the-loop) deployment always has a legal automated next move, so "never requires a human" is certified per policy rather than assumed. v1.9.1 hardened the enforcement boundary — closing an io_uring bypass and making file-open mediation provably race-free against a time-of-check-to-time-of-use (TOCTOU) attack, measured at zero leaks where the prior approach leaked 510 across 20,000 attempts. v1.9.2 completes that boundary's inversion: the Warden's syscall filter moves from allow-by-default to a *default-deny allowlist* with native-ABI lockdown (closing the x32 bypass), a hard-deny set for never-admissible syscalls, and scalar-flag denial of unprivileged user namespaces. The default-deny baseline is wired into the live reference Warden and validated end-to-end by a conformance target that passes under enforcement; the same target surfaced and fixed a launch regression in the deny-only exec path. The previously open alternate-ABI and variant-syscall bypass classes are now closed by construction.
+Through v1.8 the system proves *safety* — nothing unauthorized executes. v1.9 adds a complementary load-time *liveness* proof, certifying that an unattended (human-out-of-the-loop) deployment always has a legal automated next move, so "never requires a human" is certified per policy rather than assumed. v1.9.1 hardened the enforcement boundary — closing an io_uring bypass and making file-open mediation provably race-free against a time-of-check-to-time-of-use (TOCTOU) attack, measured at zero leaks where the prior approach leaked 510 across 20,000 attempts. v1.9.2 completes that boundary's inversion: the Warden's syscall filter moves from allow-by-default to a *default-deny allowlist* with native-ABI lockdown (closing the x32 bypass), a hard-deny set for never-admissible syscalls, and scalar-flag denial of unprivileged user namespaces. The default-deny baseline is wired into the live reference Warden and validated end-to-end by a conformance target that passes under enforcement; the same target surfaced and fixed a launch regression in the deny-only exec path. The previously open alternate-ABI and variant-syscall bypass classes are now closed by construction. v1.9.3 couples the agent's lifetime to the supervisor's in the live Warden: the agent runs as the first process of its own PID namespace and is killed if the supervisor stops, so neither the agent nor anything it spawned keeps running without oversight — asserted by a crash test that kills a live supervisor.
 
 ---
 
@@ -71,7 +71,7 @@ v1.9.1 hardens the Warden's kernel-boundary enforcement and is the first release
 
 **TOCTOU discipline, measured.** When a mediation decision depends on a pointer argument — a path, a socket address — letting the original syscall proceed after approval is unsafe: a second thread in the target can rewrite the argument between the check and the kernel's use of it. v1.9.1 removes that pattern. For file opens, the supervisor resolves the approved path itself (with magic-link resolution disabled) and injects the resulting descriptor into the target, so the target's syscall never runs against mutable memory. Measured against a TOCTOU race harness, the approve-then-continue strategy leaked the protected target 510 times across 20,000 attempts; the resolve-and-inject strategy leaked 0. Network and exec actions (`connect`, `execve`) cannot yet be mediated race-free — there is no descriptor to inject for a connection — so they are deny-only (fail closed) pending the supervisor-dials-and-injects path on the v1.10 roadmap.
 
-**Scope, as of v1.9.1.** The hardening applied to the reference Warden supervisor, whose syscall filter was allow-by-default for unlisted syscalls — leaving the alternate-ABI and variant-syscall bypass classes open. v1.9.2 (§2.8) closes them. These boundaries are stated in the published threat model rather than blurred.
+**Scope, as of v1.9.1.** The hardening applied to the reference Warden supervisor, whose syscall filter was allow-by-default for unlisted syscalls — leaving the alternate-ABI and variant-syscall bypass classes open. v1.9.2 (§2.8) closes them; v1.9.3 (§2.9) closes the supervisor-lifecycle class. These boundaries are stated in the published threat model rather than blurred.
 
 ### 2.8 Mediation completeness (v1.9.2)
 
@@ -83,11 +83,25 @@ v1.9.2 inverts the Warden's enforcement model and wires the result into the live
 
 **Hard-deny set and namespace denial.** Syscalls with no legitimate use inside a mediated agent — `ptrace`, `bpf`, `userfaultfd`, `process_vm_readv`/`writev`, `pidfd_getfd`, the mount/FUSE family, the kernel-module and `kexec` family, `perf_event_open`, and the key-management calls — are denied with process termination in strict mode. `clone` and `unshare` are filtered on their scalar flags argument (a register value the kernel snapshots, so the check is race-free) to deny `CLONE_NEWUSER` and the namespace-creation set, the root of a large fraction of container escapes; `clone3`, whose flags live behind a pointer that cannot be inspected at this layer, is hard-denied.
 
-**Supervisor and target lifetimes are coupled.** Enforcement assumes the supervisor is alive and watching. The target is terminated if the supervisor dies (death-signal coupling with a re-parent re-check, and a control-group kill fallback); the supervisor watches the target through a process descriptor; injected descriptors carry close-on-exec so a granted capability cannot leak across `execve`; and in-flight notifications are bounded, with excess failing closed and tripping the v1.8.2 bounded-refusal breaker.
+**Supervisor and target lifetimes (specified in v1.9.2, enforced in v1.9.3).** v1.9.2 specified and shipped a lifecycle-coupling module — death-signal coupling of the target to the supervisor, a process-descriptor watch, and close-on-exec on injected descriptors. Close-on-exec was enforced by the live Warden at release; the death-signal coupling and process-descriptor watch were not yet wired into it, so the supervisor-lifecycle bypass class was partially mitigated in v1.9.2. §2.9 describes the v1.9.3 integration.
 
 **Integration and validation.** The default-deny baseline is not a parallel artifact: it replaces the allow-by-default filter the reference Warden actually installs, mediating exactly the syscalls the supervisor models (`openat`, `connect`, `execve`, `execveat`) and admitting the rest of a target's legitimate surface. A conformance target — a running, agent-shaped workload — exercises the boundary end to end and reports a verdict per phase: it opens an allowed file (mediated, satisfied by descriptor injection), is refused a denied path, creates a socket (admitted), and is denied an outbound connection (deny-only). Under live enforcement it passes every phase. Flipping a real workload to default-deny is gated on an observe-then-enforce pass: the filter offers an observe mode whose default action logs rather than blocks, so a target's required syscalls are harvested before the deny default is turned on, while the hard-deny set still terminates on a dangerous call even while observing.
 
 **A found-and-fixed regression.** The conformance target surfaced a latent fault: the v1.9.1 deny-only exec mediation denied *every* authorizing exec verdict, including the target's own bootstrap `execve` — so no target could launch under the post-v1.9.1 supervisor. v1.9.2 authorizes exactly the operator-specified target's first exec, once per process, before the target runs any code (no TOCTOU: the target is single-threaded and blocked in `execve`), and leaves every later, agent-initiated exec deny-only. The break was found by the conformance target and the fix verified by it.
+
+### 2.9 Supervisor/target lifecycle coupling (v1.9.3)
+
+Enforcement assumes the supervisor is alive. If it stops, mediated calls fail closed, but an agent that keeps running can still act through capabilities it already holds. v1.9.3 removes that window in the live Warden.
+
+**The agent dies with the supervisor.** The target requests a kill signal on supervisor death before it installs its filter; the agent cannot clear the request afterwards, because the call that sets it is outside the baseline allowlist. A supervisor that dies between fork and that request would leave the target unmonitored, so the target first confirms, through a pipe only the supervisor holds open, that the supervisor is still alive, and refuses to continue if it is not.
+
+**So does everything the agent spawned.** A death signal applies to one process, not to the processes it creates. The target therefore runs as the first process of a dedicated PID namespace; when that process dies, the kernel kills every other process in the namespace. On orderly shutdown the supervisor kills the whole tree (namespace and process group). The supervisor watches the target through a process descriptor alongside the notification listener, which also closes a hang in which the target exited just before the supervisor blocked waiting for its next request.
+
+**Fail closed on setup.** The namespace requires `CAP_SYS_ADMIN`. The Warden checks for it at startup and refuses to run without it; an explicit opt-out runs without the namespace and states that spawned processes are then not covered on a supervisor crash.
+
+**Validation.** A crash test runs the live Warden over an agent that spawns a child, kills the supervisor with `SIGKILL` and, separately, stops it with `SIGTERM`, and asserts that no agent process survives either; it also checks the fork-race guard. Against the pre-fix Warden it fails (two survivors after a crash, one after orderly shutdown); against v1.9.3 it passes. Policy decisions on the demo, plan-verification, benchmark, and conformance workloads are unchanged. Inside the namespace the agent observes its own process ID as 1; audit records carry the host process ID.
+
+The single-threaded reference Warden handles one notification at a time, so pending requests queue in the kernel rather than in supervisor memory. The in-flight notification bound described with the v1.9.2 module applies to a future multi-threaded supervisor and is not claimed for this release.
 
 ---
 
@@ -111,7 +125,7 @@ This is also why the input space being effectively infinite is not a problem the
 
 ### 3.2 UNKNOWN diagnostics and resource bounds (v1.9.1)
 
-Two additive changes in v1.9.1, unchanged in v1.9.2, touch the decision layer without altering any SATISFIED or UNSATISFIED outcome. UNKNOWN verdicts carry a diagnostic — the undischarged predicate and the fragment that would resolve it — so a refusal is navigable rather than opaque, ahead of the v1.10/v1.11 fragments that will actually shrink the UNKNOWN region. The decision procedure enforces deterministic resource bounds (a step ceiling, a wall-clock safety net, and obligation memoization); a bound hit yields UNKNOWN, never a coerced pass, so a forced timeout degrades to a safe refusal rather than a hang or a silent authorization.
+Two additive changes in v1.9.1, unchanged through v1.9.3, touch the decision layer without altering any SATISFIED or UNSATISFIED outcome. UNKNOWN verdicts carry a diagnostic — the undischarged predicate and the fragment that would resolve it — so a refusal is navigable rather than opaque, ahead of the v1.10/v1.11 fragments that will actually shrink the UNKNOWN region. The decision procedure enforces deterministic resource bounds (a step ceiling, a wall-clock safety net, and obligation memoization); a bound hit yields UNKNOWN, never a coerced pass, so a forced timeout degrades to a safe refusal rather than a hang or a silent authorization.
 
 ---
 
@@ -132,7 +146,8 @@ The testing posture mirrors the runtime posture: where a guarantee cannot be est
 - v1.9 progress verifier: `test_v19_progress.c`, 10/10, clean under `-fsanitize=address,undefined`.
 - v1.9.1 enforcement, measured directly: a TOCTOU race harness (`tests/seccomp_toctou_harness.c`) reports 510 sentinel leaks across 20,000 attempts for approve-then-continue versus 0 for resolve-and-inject; io_uring denial is checked under the Warden filter (`v1_7/tests/test_v191_io_uring.c`).
 - v1.9.2 mediation completeness, asserted on the live kernel: `test_v192_abi_lockdown.c` admits the native call and kills the x32 call (release-blocking); `test_v192_baseline_deny.c` confirms `ptrace`, `bpf`, `userfaultfd`, `process_vm_readv`, `pidfd_getfd`, `perf_event_open`, and `clone`/`unshare(CLONE_NEWUSER)` are all denied.
-- v1.9.2 end-to-end, under the live Warden: `target_conformance` passes all phases (allowed-file round-trip via descriptor injection, denied-path refusal, socket admitted, outbound connect denied); the bootstrap-exec fix is corroborated by the demo target launching under enforcement.
+- v1.9.2 end-to-end, under the live Warden: `target_conformance` passes all phases (allowed-file round-trip via descriptor injection, denied-path refusal, socket admitted, outbound connect denied); the bootstrap-exec fix is corroborated by the demo target launching under enforcement. The target reports a missing work directory as a setup failure rather than a boundary failure (v1.9.3).
+- v1.9.3 lifecycle coupling, under the live Warden: `test_v193_lifecycle.c` kills the supervisor (`SIGKILL`, then `SIGTERM`) while it supervises an agent with a child process and asserts no agent process survives; it also exercises the fork-race guard.
 
 ---
 
@@ -150,6 +165,7 @@ A narrated demo walks through the stack end to end: authorization on a compliant
 - `docs/security/v1.9.2-baseline-allowlist.md` — the default-deny allowlist rationale and class-to-syscall map.
 - `docs/security/v1.10-architecture-roadmap.md` — the model- and TCB-changing track (Landlock, acquisition-tiering, post-grant re-mediation, the UNKNOWN escalation ladder, TCB shrink via proof-checking).
 - `docs/security/TRUSTED-COMPUTING-BASE.md` — per-component trusted-vs-verified status of the verification chain and the plan to shrink the trusted base.
+- `RELEASE-v1.9.3.md` — the v1.9.3 lifecycle-coupling release notes.
 - `RELEASE-v1.9.2.md` — the v1.9.2 mediation-completeness release notes.
 - `docs/adr/0001-syscall-layer.md` — the syscall-layer architecture decision (libseccomp over raw ctypes, on correctness and audit-surface grounds).
 - `SECURITY.md` — supported versions, private vulnerability reporting, and the security contact (kenneth.douglas@soberagents.ai).
@@ -190,7 +206,8 @@ VAREK is released under the **MIT license**. Three provisional patent applicatio
 | v1.8.1 | Stable release candidate for the v1.7/v1.8 line; narrated demo; threat-model docs. |
 | v1.9 | Progress-safety verification. Load-time liveness proof; certified human-out-of-the-loop. |
 | v1.9.1 | Enforcement hardening. io_uring bypass closed; TOCTOU-safe file-open mediation (measured 510→0 on the race harness); connect/execve deny-only; threat-model and trusted-computing-base published. |
-| **v1.9.2** | **Mediation completeness.** Default-deny allowlist replacing allow-by-default; native-ABI lockdown (x32 bypass closed); hard-deny set; scalar-flag CLONE_NEWUSER denial; supervisor/target lifecycle coupling. Wired into the live Warden and validated by a conformance target; deny-only bootstrap-exec regression found and fixed. |
+| v1.9.2 | Mediation completeness. Default-deny allowlist replacing allow-by-default; native-ABI lockdown (x32 bypass closed); hard-deny set; scalar-flag CLONE_NEWUSER denial; lifecycle-coupling module (integrated in v1.9.3). Default-deny baseline wired into the live Warden and validated by a conformance target; deny-only bootstrap-exec regression found and fixed. |
+| **v1.9.3** | **Lifecycle coupling in the live Warden.** Agent runs in its own PID namespace and dies with the supervisor, along with everything it spawned; fork-race guard; process-descriptor watch; `CAP_SYS_ADMIN` preflight; crash test. Corrects the v1.9.2 status of the supervisor-lifecycle bypass class (partial at v1.9.2). |
 | v1.10 (planned) | Verdict-distribution harness; bitvector and bounded-string fragments. Shrinking UNKNOWN. Race-free network and filesystem mediation; trusted-base reduction. |
 | v1.11 (candidate) | Bounded-sequence fragment for cross-action data flow. |
 

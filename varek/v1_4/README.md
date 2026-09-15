@@ -45,8 +45,47 @@ For each notification, the Warden:
 - Linux kernel ≥ 5.14 (`SECCOMP_ADDFD_FLAG_SEND`).
 - x86_64. The BPF arch check in `warden.c` is hardcoded; porting to
   another architecture requires updating `ARCH_NR`.
-- `CAP_SYS_ADMIN` to install the seccomp filter and read
+- `CAP_SYS_ADMIN` (run as root or via `sudo`). The Warden checks for it
+  at startup and refuses to run without it, because it creates the
+  target's PID namespace (see below). It also covers reading
   `/proc/<pid>/mem`.
+
+## Lifecycle coupling (v1.9.3)
+
+The target runs as init (PID 1) of a dedicated PID namespace and is
+SIGKILLed if the Warden dies, so the agent and every process it spawned
+stop with the supervisor, whether the Warden exits normally or crashes.
+The Warden refuses to start without `CAP_SYS_ADMIN` or if it cannot
+create the namespace. Setting `VAREK_WARDEN_NO_PIDNS=1` skips the
+namespace and the capability check (with a warning); in that mode the
+agent itself still dies with the Warden, but processes it spawned are
+not guaranteed to on a crash.
+
+Inside the namespace the agent sees its own PID as 1 and `getppid()`
+returns 0. Pathology records report the host PID.
+
+```sh
+make test-lifecycle
+```
+
+The test kills a live Warden (`SIGKILL`, then `SIGTERM`) while it
+supervises an agent that has spawned a child, and fails if any agent
+process survives.
+
+For a screen recording, `sudo ./lifecycle_video.sh` runs the same crash
+against the pre-fix Warden (built from git, `BEFORE_REF`, default
+`v1.9.3^`) and against this one, with pacing and colour.
+
+## Conformance target
+
+```sh
+make run-conformance
+```
+
+Builds `target_conformance` (static), creates its work directory
+`/tmp/varek_conf`, and runs it under the Warden. The target cannot
+create that directory itself under enforcement; if it is missing, the
+target reports a `setup` failure rather than a boundary failure.
 
 ## Build
 

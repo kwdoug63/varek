@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: MIT
 // target_conformance.c — VAREK Warden conformance target ("Test Target 1")
 //
-// A realistic agent-shaped workload that exercises the v1.9.2 default-deny
+// A realistic agent-shaped workload that exercises the v1.9.2+ default-deny
 // enforcement boundary end to end, then reports whether each operation behaved
 // as the policy requires. Run it under the Warden:
 //
+//   make run-conformance
+//
+// which builds this target, creates its work directory, and runs:
+//
 //   sudo ./warden conformance_policy.txt -- ./target_conformance
+//
+// The work directory (/tmp/varek_conf) must exist before the run: creating
+// directories is outside the baseline allowlist, so the target cannot make it
+// under enforcement. A missing directory is reported as a setup failure, not
+// as a boundary failure.
 //
 // It is the executable analogue of the test suite: where the unit tests assert
 // the filter denies ptrace/x32 in isolation, this proves a *running program*
@@ -22,7 +31,9 @@
 // 1 otherwise. Phase results are printed to stderr as JSON-ish lines so they
 // interleave cleanly with the Warden's own pathology records.
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -31,6 +42,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 
 #define ALLOWED_DIR  "/tmp/varek_conf"
@@ -102,6 +114,18 @@ static void phase_connect(int s) {
 int main(void) {
     fprintf(stderr, "{\"target\":\"conformance\",\"phase\":\"start\","
                     "\"note\":\"verdicts assume Warden enforcement is active\"}\n");
+
+    // Setup check (v1.9.3): without the work directory the allowed open fails
+    // for a reason unrelated to the boundary. stat() is in the allowlist and
+    // not mediated, so this does not consume a policy decision.
+    struct stat st;
+    if (stat(ALLOWED_DIR, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        verdict("setup", 0, "missing work directory " ALLOWED_DIR
+                "; run 'make run-conformance' or 'mkdir -p " ALLOWED_DIR "'");
+        fprintf(stderr, "{\"target\":\"conformance\",\"phase\":\"summary\","
+                        "\"pass\":0,\"fail\":1}\n");
+        return 2;
+    }
 
     phase_allowed_file();
     phase_denied_file();

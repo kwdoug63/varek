@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: MIT
 // warden_lifecycle.c — v1.9.2
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   // unshare(), CLONE_NEWPID
+#endif
 #include "warden_lifecycle.h"
 
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
+#include <sched.h>
+#include <poll.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <signal.h>
@@ -20,15 +25,29 @@
 #define __NR_pidfd_open 434
 #endif
 
-int wd_target_couple_to_supervisor(pid_t expected_supervisor_pid) {
-    // SIGKILL the target the moment the supervisor (parent) dies.
+int wd_supervisor_isolate_pids(void) {
+    if (unshare(CLONE_NEWPID) != 0)
+        return -errno;
+    return 0;
+}
+
+int wd_target_couple_to_supervisor(int liveness_fd) {
+    // SIGKILL the target the moment the supervisor dies. PDEATHSIG tracks the
+    // thread that forked us; the v1.4 Warden is single-threaded, so that is
+    // the supervisor's lifetime. The agent cannot clear it afterwards: prctl
+    // is not in the baseline allowlist.
     if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0)
         return -errno;
     // Race: the supervisor may have died between fork and this prctl, in which
-    // case we have re-parented and PDEATHSIG now refers to the WRONG parent.
-    // Detect by confirming our parent is still who we expect; if not, refuse to
+    // case PDEATHSIG will never fire. The supervisor is the only holder of the
+    // pipe's write end, so POLLHUP here means it is already gone. Refuse to
     // continue as an unmonitored target.
-    if (getppid() != expected_supervisor_pid)
+    struct pollfd pfd = { .fd = liveness_fd, .events = POLLIN };
+    int r;
+    do { r = poll(&pfd, 1, 0); } while (r < 0 && errno == EINTR);
+    if (r < 0)
+        return -errno;
+    if (r > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLIN)))
         return -ESRCH;
     return 0;
 }

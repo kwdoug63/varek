@@ -61,6 +61,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/audit.h>
+#include <linux/capability.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 
@@ -82,6 +83,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -101,6 +103,7 @@
 #include "plan_spec.h"
 #include "warden_adapter.h"
 #include "warden_baseline_filter.h"
+#include "warden_lifecycle.h"   /* v1.9.3 supervisor/target lifecycle coupling */
 
 /* Kernel/libc compatibility shims --------------------------------- */
 #ifndef __NR_openat2
@@ -613,14 +616,33 @@ static int inject_resolved_fd(int notify_fd,
 static volatile sig_atomic_t g_stop = 0;
 static void on_term(int sig) { (void)sig; g_stop = 1; }
 
-static void supervise(int notify_fd, const struct policy *p,
-                      const char *bootstrap_path) {
+static void supervise(int notify_fd, int target_pidfd,
+                      const struct policy *p, const char *bootstrap_path) {
     uint64_t seq = 0;
     while (!g_stop) {
+        /* v1.9.3: wait on the listener AND the target's pidfd. Blocking in
+         * NOTIF_RECV alone can hang forever if the target exits between the
+         * g_stop check and the ioctl (the SIGCHLD is already spent). */
+        struct pollfd pfds[2] = {
+            { .fd = notify_fd,    .events = POLLIN },
+            { .fd = target_pidfd, .events = POLLIN },
+        };
+        int pr = poll(pfds, target_pidfd >= 0 ? 2 : 1, -1);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        if (target_pidfd >= 0 && (pfds[1].revents & POLLIN))
+            return;                       /* target exited */
+        if (pfds[0].revents & (POLLHUP | POLLERR | POLLNVAL))
+            return;                       /* no process left under the filter */
+        if (!(pfds[0].revents & POLLIN))
+            continue;
+
         struct seccomp_notif req;
         memset(&req, 0, sizeof(req));
         if (ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_RECV, &req) < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == ENOENT) continue;  /* ENOENT: requester died */
             return;
         }
 
@@ -698,6 +720,28 @@ static void supervise(int notify_fd, const struct policy *p,
     }
 }
 
+/* v1.9.3: stop the agent and everything it started. With a PID namespace,
+ * killing the target (its init) makes the kernel kill the rest; the process
+ * group signal covers the VAREK_WARDEN_NO_PIDNS case. */
+static void kill_target_tree(pid_t target) {
+    kill(-target, SIGKILL);
+    kill(target, SIGKILL);
+}
+
+/* v1.9.3: CAP_SYS_ADMIN preflight. The PID namespace that carries lifecycle
+ * coupling needs it; checking up front gives a clear error before any policy
+ * or plan work, instead of failing at unshare(). */
+static int have_cap_sys_admin(void) {
+    struct __user_cap_header_struct hdr = {
+        .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0 };
+    struct __user_cap_data_struct data[2];
+    memset(data, 0, sizeof data);
+    if (syscall(SYS_capget, &hdr, data) != 0)
+        return 0;
+    return (data[CAP_TO_INDEX(CAP_SYS_ADMIN)].effective
+            & CAP_TO_MASK(CAP_SYS_ADMIN)) != 0;
+}
+
 /* ---------------- main ---------------- */
 
 static void usage(const char *argv0) {
@@ -705,6 +749,12 @@ static void usage(const char *argv0) {
         "usage: %s <policy.txt> [--plan <plan.txt>] -- <target> [args...]\n"
         "\n"
         "  Privileged seccomp-unotify supervisor (VAREK Warden v1.4).\n"
+        "\n"
+        "  Requires CAP_SYS_ADMIN (run as root or via sudo): the target runs\n"
+        "  as init of its own PID namespace so it, and everything it spawns,\n"
+        "  dies with the Warden. VAREK_WARDEN_NO_PIDNS=1 skips the namespace\n"
+        "  and the requirement; processes the agent spawns may then outlive\n"
+        "  a crashed Warden.\n"
         "\n"
         "  Optional --plan <plan.txt> enables v1.6 pre-execution plan\n"
         "  verification. The target is not forked unless the plan\n"
@@ -749,6 +799,17 @@ int main(int argc, char **argv) {
     if (sep_idx + 1 >= argc) { usage(argv[0]); return 2; }
     char *const *target_argv = &argv[sep_idx + 1];
 
+    const int pidns = getenv("VAREK_WARDEN_NO_PIDNS") == NULL;
+    if (pidns && !have_cap_sys_admin()) {
+        fprintf(stderr,
+            "[warden] CAP_SYS_ADMIN is required (run as root or via sudo). The "
+            "Warden runs the agent in its own PID namespace so the agent and "
+            "everything it spawns die with the Warden. To run without it, set "
+            "VAREK_WARDEN_NO_PIDNS=1 and accept that processes the agent spawns "
+            "may outlive a crashed Warden.\n");
+        return 1;
+    }
+
     struct policy p;
     if (policy_load(policy_path, &p) < 0) return 1;
 
@@ -772,11 +833,51 @@ int main(int argc, char **argv) {
         perror("socketpair"); return 1;
     }
 
+    /* v1.9.3 lifecycle coupling.
+     *
+     * (1) Liveness pipe: only the supervisor holds the write end. The target
+     *     uses it to detect a supervisor that died before PR_SET_PDEATHSIG
+     *     took effect.
+     * (2) PID namespace: the target becomes init of a fresh namespace, so the
+     *     kernel kills everything the agent spawned when the target dies.
+     *     Fail closed if unavailable; VAREK_WARDEN_NO_PIDNS=1 opts out, in
+     *     which case descendants are NOT guaranteed to die on a supervisor
+     *     crash. */
+    int live[2];
+    if (pipe2(live, O_CLOEXEC) < 0) { perror("pipe2"); return 1; }
+
+    if (pidns) {
+        int rc = wd_supervisor_isolate_pids();
+        if (rc < 0) {
+            fprintf(stderr,
+                "[warden] cannot create PID namespace (%s); refusing to start. "
+                "Run with CAP_SYS_ADMIN, or set VAREK_WARDEN_NO_PIDNS=1 to accept "
+                "that processes the agent spawns may outlive a crashed supervisor.\n",
+                strerror(-rc));
+            return 1;
+        }
+    } else {
+        fprintf(stderr,
+            "[warden] WARNING: VAREK_WARDEN_NO_PIDNS set; agent descendants are "
+            "not guaranteed to die if the supervisor crashes\n");
+    }
+
     pid_t target = fork();
     if (target < 0) { perror("fork"); return 1; }
 
     if (target == 0) {
         close(sv[0]);
+        close(live[1]);
+        /* Own process group, so orderly shutdown can signal the whole tree
+         * even without a PID namespace. setpgid/setsid are not in the
+         * baseline allowlist, so the agent cannot leave the group. */
+        if (setpgid(0, 0) < 0) { perror("setpgid"); _exit(1); }
+        int crc = wd_target_couple_to_supervisor(live[0]);
+        if (crc < 0) {
+            fprintf(stderr, "[warden-target] lifecycle coupling failed (%s); "
+                            "refusing to run unsupervised\n", strerror(-crc));
+            _exit(1);
+        }
         int notify_fd =
             install_baseline_user_notif_filter(getenv("VAREK_WARDEN_OBSERVE") != NULL);
         if (notify_fd < 0) { perror("seccomp"); _exit(1); }
@@ -789,24 +890,36 @@ int main(int argc, char **argv) {
     }
 
     close(sv[1]);
+    close(live[0]);   /* live[1] stays open for the supervisor's lifetime */
     int notify_fd = recv_fd(sv[0]);
     close(sv[0]);
     if (notify_fd < 0) {
         fprintf(stderr, "[warden] failed to receive notify fd\n");
-        kill(target, SIGKILL);
+        kill_target_tree(target);
+        waitpid(target, NULL, 0);
+        return 1;
+    }
+
+    /* v1.9.3: watch the target via pidfd (readable when it exits). */
+    int target_pidfd = wd_supervisor_watch_target(target);
+    if (target_pidfd < 0) {
+        fprintf(stderr, "[warden] pidfd_open failed (%s); refusing to supervise\n",
+                strerror(-target_pidfd));
+        kill_target_tree(target);
         waitpid(target, NULL, 0);
         return 1;
     }
 
     fprintf(stderr,
-        "[warden] supervising pid=%d  notify_fd=%d  policy=%s (%zu rules)\n",
-        target, notify_fd, p.name, p.n_rules);
+        "[warden] supervising pid=%d  notify_fd=%d  policy=%s (%zu rules)  pidns=%s\n",
+        target, notify_fd, p.name, p.n_rules, pidns ? "on" : "off");
 
-    supervise(notify_fd, &p, target_argv[0]);
+    supervise(notify_fd, target_pidfd, &p, target_argv[0]);
 
-    kill(target, SIGKILL);  /* best-effort: ensures waitpid does not hang */
+    kill_target_tree(target);  /* the agent and everything it spawned */
     int status = 0;
     waitpid(target, &status, 0);
+    close(target_pidfd);
     close(notify_fd);
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
