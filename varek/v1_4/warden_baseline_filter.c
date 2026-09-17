@@ -87,7 +87,11 @@ static const char *kAdmit[] = {
     // supervisor learns to mediate the message path.
     "socket", "socketpair", "bind", "listen", "accept", "accept4",
     "getsockname", "getpeername", "getsockopt", "setsockopt",
-    "sendto", "recvfrom", "sendmsg", "recvmsg", "shutdown",
+    // v1.12: sendto/sendmsg are NO LONGER admitted here — they can reach the
+    // network without connect (a datagram send with an explicit destination),
+    // which bypassed the deny-only connect posture. They are mediated below.
+    // Inbound-only recv stays admitted.
+    "recvfrom", "recvmsg", "shutdown",
     // termination
     "exit", "exit_group",
     NULL
@@ -95,7 +99,12 @@ static const char *kAdmit[] = {
 
 // MEDIATE -> NOTIFY: EXACTLY the four supervise()/derive_intent() handles.
 static const char *kMediate[] = {
-    "openat", "connect", "execve", "execveat", NULL
+    "openat", "connect", "execve", "execveat",
+    // v1.12: egress-capable datagram/message sends. Routed to the supervisor
+    // so a send carrying an inet destination is subject to the same deny-only
+    // network posture as connect, closing the sendto/sendmsg egress bypass
+    // (bypass-classes.md class 3).
+    "sendto", "sendmsg", NULL
 };
 
 // HARD-DENY: never admissible (classes 3-6). KILL in strict mode, even in

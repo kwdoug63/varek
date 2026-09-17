@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.9.3-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.12.0-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -30,7 +30,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.9.3.**
+   **Current release: v1.12.0.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -79,6 +79,7 @@ The runtime line has progressed well beyond simple syscall containment:
   human-out-of-the-loop operation per policy: for every non-authorizing verdict,
   a deterministic, automated terminal outcome is reachable in finitely many steps.
   "Never requires a human" becomes certified rather than hoped.
+- **v1.12.0 — mediation correctness.** Closes five ways a supervised process could reach a denied object or corrupt the authorization record: `..` traversal and symlink/`/proc/self` escapes (the Warden now resolves the object once, decides policy on its canonical path, and injects that same fd — resolve-then-decide); audit-log forgery via a crafted pathname (all agent-controlled strings are JSON-escaped, records gain a `resolved` field); and datagram egress via `sendto`/`sendmsg` that bypassed the deny-only `connect` posture (both are now mediated as `net.send`). Adds a tool that exports authorization evidence in the CycloneDX 1.6 format (`tools/varek_cyclonedx.py`) and a `make test-v112` regression suite. No verdict-semantics change; v1.10/v1.11 remain reserved for the verification program below. See [`RELEASE-v1.12.0.md`](./RELEASE-v1.12.0.md).
 - **v1.9.3 — lifecycle coupling in the live Warden.** If the supervisor stops, the agent stops, and so does everything it started: the agent runs in its own PID namespace and is killed on supervisor death, with a fork-race guard and a pidfd watch. The Warden now requires `CAP_SYS_ADMIN` and checks for it at startup. A crash test kills a live Warden and asserts no agent process survives. Also corrects the v1.9.2 record (bypass class 7 was partial at v1.9.2) and fixes conformance-target setup. See [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md).
 - **v1.9.2 — mediation completeness.** Default-deny allowlist replacing allow-by-default; native-ABI lockdown (x32 bypass closed); hard-deny set; scalar-flag `CLONE_NEWUSER` denial; lifecycle-coupling module (integrated into the live Warden in v1.9.3). Default-deny baseline wired into the live Warden and validated by a conformance target; deny-only bootstrap-exec regression found and fixed. See [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md).
 - **v1.9.1 — enforcement hardening, measured.** Closes an io_uring bypass (it
@@ -91,7 +92,7 @@ The runtime line has progressed well beyond simple syscall containment:
   are deny-only (fail closed) pending the v1.10 dial-and-inject path. See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.9.3 history.
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.12.0 history.
 
 ### Installation
 
@@ -238,7 +239,7 @@ async fn infer(tensor: Tensor) -> RawOutput {
 ```
 
 The equivalent Python requires four files in two languages. The full language
-description is in the [spec paper](./varek-spec-paper-v1.9.3.md).
+description is in the [spec paper](./varek-spec-paper-v1.12.md).
 
 ### Core language features
 
@@ -327,6 +328,7 @@ different risks at different points in the stack.
 - [x] **v1.9.1** — Enforcement hardening: io_uring closed; TOCTOU-safe file mediation (510→0); `connect`/`execve` deny-only
 - [x] **v1.9.2** — Mediation completeness: default-deny allowlist; native-ABI/x32 lockdown; hard-deny set; `CLONE_NEWUSER` denial; live-Warden integration + conformance validation
 - [x] **v1.9.3** — Lifecycle coupling in the live Warden: PID-namespace isolation, death-signal coupling, fork-race guard, pidfd watch; crash test
+- [x] **v1.12** — Mediation correctness: resolve-then-decide (traversal / symlink / `/proc/self`), audit-log integrity, datagram-egress mediation; authorization-evidence export in the CycloneDX 1.6 format
 - [ ] **v1.10 (planned)** — The UNKNOWN-shrinking program (below)
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
 
@@ -337,7 +339,9 @@ different risks at different points in the stack.
 
 ## The verification program (v1.10 / v1.11)
 
-> **Planned and candidate work, not shipped.** No v1.10 or v1.11 tag exists. This
+> **Planned and candidate work, not shipped.** No v1.10 or v1.11 tag exists; both
+> numbers are **reserved** for this verification program. v1.12 (mediation
+> correctness) shipped ahead of them and does not touch it. This
 > documents direction; shipped behavior is in [`CHANGELOG.md`](./CHANGELOG.md).
 
 The post-v1.9 program has a single goal: migrate cases out of the UNKNOWN verdict
@@ -403,7 +407,7 @@ per-component trusted-vs-verified status of the verification chain is in
 The cross-action data-flow threat model is in
 [`docs/security/threat-model-dataflow.md`](./docs/security/threat-model-dataflow.md).
 The runtime fails closed on unsupported platforms and denies boundary syscalls at
-the kernel, not via string matching or audit hooks. As of v1.9.3 the Warden
+the kernel, not via string matching or audit hooks. As of v1.12 the Warden
 filter is default-deny (an explicit allowlist, native ABI only, with a hard-deny
 set that includes io_uring); network egress (`connect`) is deny-only pending the
 v1.10 dial-and-inject path; and the agent runs in its own PID namespace, so it
@@ -420,8 +424,8 @@ platform-gating CI coverage (now macOS, Windows, Linux).
 
 ## Documentation
 
-- **Spec paper:** [`varek-spec-paper-v1.9.3.md`](./varek-spec-paper-v1.9.3.md) — language and runtime specification, design rationale, the verdict model
-- **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`docs/security/bypass-classes.md`](./docs/security/bypass-classes.md), [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md), [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
+- **Spec paper:** [`varek-spec-paper-v1.12.md`](./varek-spec-paper-v1.12.md) — language and runtime specification, design rationale, the verdict model
+- **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`docs/security/bypass-classes.md`](./docs/security/bypass-classes.md), [`RELEASE-v1.12.0.md`](./RELEASE-v1.12.0.md), [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md), [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
 - **Verification notes:** [`docs/verification/`](./docs/verification/README.md) — the v1.10/v1.11 program
 - **Changelog:** [`CHANGELOG.md`](./CHANGELOG.md)
 - **Website:** [varek-lang.org](https://varek-lang.org)
@@ -436,6 +440,15 @@ platform-gating CI coverage (now macOS, Windows, Linux).
 
 VAREK is open-source software licensed under the [MIT License](LICENSE).
 Copyright (c) 2026 Sober Agentic Infrastructure, Inc. See [NOTICE](./NOTICE).
+
+### Trademarks
+
+CycloneDX is a trademark of the OWASP Foundation. VAREK and Sober Agentic
+Infrastructure, Inc. are not affiliated with, endorsed by, or certified by the
+OWASP Foundation or the CycloneDX project. The CycloneDX name is used only to
+describe interoperability with the openly published CycloneDX format
+(standardized as ECMA-424, with Apache-2.0-licensed schemas). All other product
+names and marks are the property of their respective owners.
 
 ## Examples
 

@@ -2,7 +2,7 @@
 
 # VAREK — Technical Specification
 
-**Version 1.9.3 (current)**
+**Version 1.12.0 (current)**
 
 *Deterministic runtime verification of autonomous AI agents using formal methods.*
 
@@ -102,6 +102,20 @@ Enforcement assumes the supervisor is alive. If it stops, mediated calls fail cl
 **Validation.** A crash test runs the live Warden over an agent that spawns a child, kills the supervisor with `SIGKILL` and, separately, stops it with `SIGTERM`, and asserts that no agent process survives either; it also checks the fork-race guard. Against the pre-fix Warden it fails (two survivors after a crash, one after orderly shutdown); against v1.9.3 it passes. Policy decisions on the demo, plan-verification, benchmark, and conformance workloads are unchanged. Inside the namespace the agent observes its own process ID as 1; audit records carry the host process ID.
 
 The single-threaded reference Warden handles one notification at a time, so pending requests queue in the kernel rather than in supervisor memory. The in-flight notification bound described with the v1.9.2 module applies to a future multi-threaded supervisor and is not claimed for this release.
+
+### 2.10 Mediation correctness (v1.12)
+
+A decision is only as sound as the identity of the object it is made about, and a record is only evidence if the process it describes cannot forge it. Through v1.9.3 the reference Warden fell short on both counts in ways that did not change the decision *procedure* but let a determined agent reach a denied object or corrupt the authorization log. v1.12 closes them. The three-state semantics and the symmetric-suppression invariant are unchanged; v1.10 and v1.11 remain reserved for the verification program of §8.
+
+**Resolve-then-decide.** The prior Warden matched policy against the pathname string the agent supplied and then, separately, opened whatever that string resolved to — two steps that could name two different objects. A relative-path escape (`/allowed/../../denied`) matched an allowed prefix as text; a symlink planted inside an allowed directory was followed to a denied target; and `/proc/self`, a magic symlink the kernel resolves in the *caller's* context, resolved to the supervisor rather than the agent, so an agent opening `/proc/self/mem` received a handle on the Warden. v1.12 opens the object once with symlink and magic-link resolution disabled, reads the canonical path back from the resolved descriptor, decides policy on that path, and hands the agent the same descriptor it resolved. Decision and delivered capability refer to the same inode by construction, and there is no second resolution to race. The resolver flags the prior threat model already claimed (no-symlinks in addition to no-magic-links) are now the flags the code sets; the earlier build set only the latter.
+
+**Audit-log integrity.** The agent-controlled pathname was interpolated into the JSON pathology record without escaping, so a crafted path could inject a forged authorization record into the verdict stream a downstream consumer reads. v1.12 escapes every agent-controlled field, so each record is well-formed for any input and no agent string can begin, end, or fabricate a record. Each record additionally reports the resolved canonical object the decision was made on.
+
+**Datagram-egress mediation.** The baseline filter admitted the datagram send calls unconditionally, so an agent could reach the network with a connectionless send and never invoke the deny-only connection call — a residue of the superseded allow-by-default model. Those sends are now mediated on the same footing as connection setup: a send carrying a network destination is refused under the deny-only network posture, while inbound receive calls remain admitted. Mediating the send path required moving the bootstrap handoff of the notification listener off of message-passing (which the new mediation would itself trap during startup) and onto a descriptor-transfer primitive the supervisor drives, so no post-filter message send is needed.
+
+**Evidence export.** The pathology stream exports as a Bill of Materials in the CycloneDX 1.6 format — the runtime as a tool component with its license and provisional-patent references, the supervised run as the subject component, each authorized object as a component, and an Authorization-Before-Execution attestation as an annotation. Output validates against the published CycloneDX 1.6 schema. The exporter refuses a stream that does not parse cleanly, so a corrupted log cannot be laundered into an attestation. (CycloneDX is a trademark of the OWASP Foundation; VAREK is not affiliated with or endorsed by the OWASP Foundation or the CycloneDX project, and uses the name only to describe interoperability with the openly published CycloneDX format, standardized as ECMA-424. See the project NOTICE file.)
+
+**Validation.** An adversarial target exercises all four escapes and one legitimate open under the reference Warden; the harness asserts on both the agent's view and the verdict stream, including that the stream remains well-formed with no injected record. It fails against the pre-v1.12 Warden and passes against v1.12. Decisions on the demo, plan-verification, benchmark, and conformance workloads are unchanged except that traversal and symlink opens previously mis-authorized are now correctly refused.
 
 ---
 
@@ -207,7 +221,8 @@ VAREK is released under the **MIT license**. Three provisional patent applicatio
 | v1.9 | Progress-safety verification. Load-time liveness proof; certified human-out-of-the-loop. |
 | v1.9.1 | Enforcement hardening. io_uring bypass closed; TOCTOU-safe file-open mediation (measured 510→0 on the race harness); connect/execve deny-only; threat-model and trusted-computing-base published. |
 | v1.9.2 | Mediation completeness. Default-deny allowlist replacing allow-by-default; native-ABI lockdown (x32 bypass closed); hard-deny set; scalar-flag CLONE_NEWUSER denial; lifecycle-coupling module (integrated in v1.9.3). Default-deny baseline wired into the live Warden and validated by a conformance target; deny-only bootstrap-exec regression found and fixed. |
-| **v1.9.3** | **Lifecycle coupling in the live Warden.** Agent runs in its own PID namespace and dies with the supervisor, along with everything it spawned; fork-race guard; process-descriptor watch; `CAP_SYS_ADMIN` preflight; crash test. Corrects the v1.9.2 status of the supervisor-lifecycle bypass class (partial at v1.9.2). |
+| v1.9.3 | Lifecycle coupling in the live Warden. Agent runs in its own PID namespace and dies with the supervisor, along with everything it spawned; fork-race guard; process-descriptor watch; `CAP_SYS_ADMIN` preflight; crash test. Corrects the v1.9.2 status of the supervisor-lifecycle bypass class (partial at v1.9.2). |
+| **v1.12.0** | **Mediation correctness.** Resolve-then-decide for file opens (closes `..` traversal, symlink escape, and `/proc/self` supervisor-context confusion); audit-log integrity (agent-controlled fields escaped; records carry the resolved object); datagram-egress mediation (`sendto`/`sendmsg` refused for network destinations under the deny-only posture); listener handoff moved to a descriptor-transfer primitive. Adds a tool that exports authorization evidence in the CycloneDX 1.6 format and the `test-v112` regression suite. No verdict-semantics change; v1.10/v1.11 reserved for §8. |
 | v1.10 (planned) | Verdict-distribution harness; bitvector and bounded-string fragments. Shrinking UNKNOWN. Race-free network and filesystem mediation; trusted-base reduction. |
 | v1.11 (candidate) | Bounded-sequence fragment for cross-action data flow. |
 

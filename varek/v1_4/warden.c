@@ -119,6 +119,20 @@
 #define SECCOMP_ADDFD_FLAG_SEND (1UL << 1)
 #endif
 
+/* v1.12: pidfd_open / pidfd_getfd for the bootstrap listener-fd handoff.
+ * Mediating sendto/sendmsg means the child can no longer use SCM_RIGHTS
+ * (sendmsg) to pass the seccomp listener fd to the supervisor — that sendmsg
+ * would trap on the just-installed filter with no one to answer it. Instead
+ * the child writes the fd NUMBER over the socketpair (a plain write(), which
+ * is admitted) and the supervisor pulls the actual fd out of the child with
+ * pidfd_getfd(). The supervisor is not under seccomp, so these are free. */
+#ifndef __NR_pidfd_open
+#define __NR_pidfd_open 434
+#endif
+#ifndef __NR_pidfd_getfd
+#define __NR_pidfd_getfd 438
+#endif
+
 struct open_how_local {
     uint64_t flags;
     uint64_t mode;
@@ -152,6 +166,7 @@ static const char *decision_name(decision_t d) {
 typedef enum {
     ACT_FILE_OPEN,
     ACT_NET_CONNECT,
+    ACT_NET_SEND,        /* v1.12: sendto/sendmsg egress */
     ACT_PROCESS_EXEC,
     ACT_OTHER,
 } action_kind_t;
@@ -159,6 +174,9 @@ typedef enum {
 struct action {
     action_kind_t kind;
     char          target[PATH_LIMIT];   /* path or "host:port" or argv[0] */
+    int           open_dirfd;           /* v1.12: openat's dirfd argument */
+    char          resolved[PATH_LIMIT]; /* v1.12: canonical path of the object
+                                         * the policy actually decided on */
     int           open_flags;
     int           open_mode;
     int           connect_family;
@@ -169,6 +187,7 @@ static const char *action_kind_name(action_kind_t k) {
     switch (k) {
         case ACT_FILE_OPEN:    return "file.open";
         case ACT_NET_CONNECT:  return "net.connect";
+        case ACT_NET_SEND:     return "net.send";
         case ACT_PROCESS_EXEC: return "process.exec";
         case ACT_OTHER:        return "other";
     }
@@ -280,8 +299,11 @@ static int xproc_read_str(pid_t pid, uint64_t addr, char *out, size_t outlen) {
     if (n < 0) return -1;
     out[n] = '\0';
     for (ssize_t i = 0; i < n; i++) if (out[i] == '\0') return 0;
-    out[outlen - 1] = '\0';
-    return 0;
+    /* v1.12: no terminator inside the window. An over-length (or unreadable)
+     * string is refused, never truncated and then checked: the policy would
+     * be deciding on a path the kernel was never asked to open. */
+    out[0] = '\0';
+    return -1;
 }
 
 static int xproc_read_bytes(pid_t pid, uint64_t addr, void *out, size_t len) {
@@ -301,36 +323,31 @@ static int xproc_read_bytes(pid_t pid, uint64_t addr, void *out, size_t len) {
 
 /* ---------------- fd passing ---------------- */
 
-static int send_fd(int sock, int fd) {
-    char buf[CMSG_SPACE(sizeof(int))] = {0};
-    char dummy = 'x';
-    struct iovec io = { .iov_base = &dummy, .iov_len = 1 };
-    struct msghdr msg = {
-        .msg_iov = &io, .msg_iovlen = 1,
-        .msg_control = buf, .msg_controllen = sizeof(buf),
-    };
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type  = SCM_RIGHTS;
-    cmsg->cmsg_len   = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
-    return sendmsg(sock, &msg, 0) < 0 ? -1 : 0;
+/* v1.12: full-buffer write/read helpers over the socketpair. These carry the
+ * listener fd NUMBER (an int) and a one-byte ack, using write()/read() — both
+ * admitted by the baseline filter — so the bootstrap needs no post-filter
+ * sendmsg. The listener fd itself is transferred out-of-band via pidfd_getfd()
+ * on the supervisor side. */
+static int write_all(int fd, const void *buf, size_t len) {
+    const char *p = buf;
+    while (len) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        if (n == 0) return -1;
+        p += n; len -= (size_t)n;
+    }
+    return 0;
 }
 
-static int recv_fd(int sock) {
-    char buf[CMSG_SPACE(sizeof(int))] = {0};
-    char dummy;
-    struct iovec io = { .iov_base = &dummy, .iov_len = 1 };
-    struct msghdr msg = {
-        .msg_iov = &io, .msg_iovlen = 1,
-        .msg_control = buf, .msg_controllen = sizeof(buf),
-    };
-    if (recvmsg(sock, &msg, 0) < 0) return -1;
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS) return -1;
-    int fd;
-    memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
-    return fd;
+static int read_all(int fd, void *buf, size_t len) {
+    char *p = buf;
+    while (len) {
+        ssize_t n = read(fd, p, len);
+        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        if (n == 0) return -1;
+        p += n; len -= (size_t)n;
+    }
+    return 0;
 }
 
 /* ---------------- Semantic Derivation ---------------- */
@@ -346,6 +363,8 @@ static int derive_intent(const struct seccomp_notif *req,
         if (xproc_read_str(req->pid, req->data.args[1],
                            out->target, sizeof(out->target)) < 0)
             return -1;
+        out->open_dirfd = (int)req->data.args[0];
+        out->resolved[0] = '\0';
         out->open_flags = (int)req->data.args[2];
         out->open_mode  = (int)(req->data.args[3] & 0777);
         return 0;
@@ -386,6 +405,54 @@ static int derive_intent(const struct seccomp_notif *req,
         }
         return 0;
     }
+    if (nr == __NR_sendto || nr == __NR_sendmsg) {
+        /* v1.12: extract the destination sockaddr, if any, so the send is
+         * subject to the deny-only network posture. sendto passes dest_addr in
+         * arg4 / addrlen in arg5; sendmsg carries msg_name / msg_namelen inside
+         * the struct msghdr in arg1. A send with NO destination (connected
+         * socket, or a purely local send) still lands here as ACT_NET_SEND and
+         * is denied — in the v1.4 deny-only model no inet socket can be
+         * connected (connect is denied), and egress-capable sends are not
+         * authorizable. */
+        out->kind = ACT_NET_SEND;
+        uint64_t addr = 0, alen = 0;
+        if (nr == __NR_sendto) {
+            addr = req->data.args[4];
+            alen = req->data.args[5];
+        } else {
+            struct { uint64_t name; uint32_t namelen; } mh; /* head of msghdr */
+            if (xproc_read_bytes(req->pid, req->data.args[1], &mh, sizeof(mh)) == 0) {
+                addr = mh.name;
+                alen = mh.namelen;
+            }
+        }
+        if (addr && alen >= sizeof(sa_family_t)) {
+            struct sockaddr_storage ss;
+            memset(&ss, 0, sizeof(ss));
+            socklen_t l = alen > sizeof(ss) ? sizeof(ss) : (socklen_t)alen;
+            if (xproc_read_bytes(req->pid, addr, &ss, l) == 0) {
+                if (ss.ss_family == AF_INET) {
+                    struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
+                    char ip[INET_ADDRSTRLEN] = {0};
+                    inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+                    snprintf(out->target, sizeof(out->target), "%s:%u",
+                             ip, ntohs(sin->sin_port));
+                } else if (ss.ss_family == AF_INET6) {
+                    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
+                    char ip[INET6_ADDRSTRLEN] = {0};
+                    inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip));
+                    snprintf(out->target, sizeof(out->target), "[%s]:%u",
+                             ip, ntohs(sin6->sin6_port));
+                } else {
+                    snprintf(out->target, sizeof(out->target), "family:%u",
+                             (unsigned)ss.ss_family);
+                }
+            }
+        }
+        if (out->target[0] == '\0')
+            snprintf(out->target, sizeof(out->target), "<no-dest>");
+        return 0;
+    }
     if (nr == __NR_execve || nr == __NR_execveat) {
         out->kind = ACT_PROCESS_EXEC;
         uint64_t pathaddr = (nr == __NR_execve)
@@ -406,11 +473,20 @@ static decision_t policy_decide(const struct policy *p,
                                 const struct action *a)
 {
     if (a->kind == ACT_FILE_OPEN) {
+        /* v1.12: decide on the RESOLVED, canonical path — the object the
+         * kernel actually opened — not the raw pathname the agent supplied.
+         * `..` traversal and symlink/bind-mount indirection can no longer
+         * make a denied object match an allow rule, because resolved is the
+         * real target after `..` collapse and (with RESOLVE_NO_SYMLINKS) with
+         * no symlink component permitted at all. If resolution has not run or
+         * failed, resolved is empty and nothing matches -> UNKNOWN -> deny. */
+        const char *decide_on = a->resolved[0] ? a->resolved : "";
+        if (decide_on[0] == '\0') return DEC_UNKNOWN;
         for (size_t i = 0; i < p->n_rules; i++) {
             const struct rule *r = &p->rules[i];
             if (r->kind != RULE_PATH_PREFIX) continue;
             size_t L = strlen(r->match);
-            if (strncmp(a->target, r->match, L) == 0) return r->decision;
+            if (strncmp(decide_on, r->match, L) == 0) return r->decision;
         }
         return DEC_UNKNOWN;
     }
@@ -519,6 +595,29 @@ static int warden_verify_plan(const char *plan_path,
 
 /* ---------------- Pathology Report ---------------- */
 
+/* v1.12: emit s as a JSON string body (without the surrounding quotes),
+ * escaping every character that would otherwise let an attacker-controlled
+ * path forge a second record or break out of the string. Control bytes go to
+ * \uXXXX; the record is well-formed JSON for any byte sequence. This closes
+ * the audit-log-forgery class: before this, a path containing `","...` was
+ * written verbatim into the verdict stream. */
+static void json_escape(FILE *f, const char *s) {
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+            case '"':  fputs("\\\"", f); break;
+            case '\\': fputs("\\\\", f); break;
+            case '\b': fputs("\\b", f);  break;
+            case '\f': fputs("\\f", f);  break;
+            case '\n': fputs("\\n", f);  break;
+            case '\r': fputs("\\r", f);  break;
+            case '\t': fputs("\\t", f);  break;
+            default:
+                if (*p < 0x20) fprintf(f, "\\u%04x", (unsigned)*p);
+                else           fputc(*p, f);
+        }
+    }
+}
+
 static FILE *g_log = NULL;
 
 static void log_init(void) {
@@ -537,21 +636,27 @@ static void emit_pathology(uint64_t seq,
     if (!g_log) return;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
+    /* v1.12: target and resolved are escaped via json_escape(); every other
+     * field is drawn from a fixed enum or an integer, so the whole record is
+     * well-formed JSON regardless of agent-controlled input. */
     fprintf(g_log,
         "{\"report_id\":\"pr-%ld.%09ld-%" PRIu64 "\","
         "\"agent_pid\":%d,"
         "\"action\":\"%s\","
-        "\"target\":\"%s\","
-        "\"decision_raw\":\"%s\","
+        "\"target\":\"",
+        (long)ts.tv_sec, ts.tv_nsec, seq,
+        (int)pid,
+        action_kind_name(a->kind));
+    json_escape(g_log, a->target);
+    fputs("\",\"resolved\":\"", g_log);
+    json_escape(g_log, a->resolved[0] ? a->resolved : "");
+    fprintf(g_log,
+        "\",\"decision_raw\":\"%s\","
         "\"decision_final\":\"%s\","
         "\"rule\":\"%s\","
         "\"kernel_verdict\":\"%s\","
         "\"latency_us\":%" PRIu64 ","
         "\"timestamp_ns\":%lld}\n",
-        (long)ts.tv_sec, ts.tv_nsec, seq,
-        (int)pid,
-        action_kind_name(a->kind),
-        a->target,
         decision_name(d_raw),
         decision_name(d_final),
         rule_id ? rule_id : "none",
@@ -579,11 +684,43 @@ static void send_simple(int notify_fd, uint64_t id, decision_t d) {
     ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);
 }
 
-static int inject_resolved_fd(int notify_fd,
-                              uint64_t id,
-                              pid_t target_pid,
-                              const struct action *a)
+/* v1.12 AT_FDCWD constant (avoid pulling a divergent libc definition). */
+#ifndef VAREK_AT_FDCWD
+#define VAREK_AT_FDCWD (-100)
+#endif
+
+/* v1.12: resolve-once. Open the object the agent named, exactly once, in a
+ * way that pins WHICH object every later step reasons about, and record its
+ * canonical path into a->resolved for the policy decision and the audit log.
+ *
+ * Resolution flags (the header and bypass-classes.md claimed these; the code
+ * shipped only RESOLVE_NO_MAGICLINKS through v1.9.3 — this is the fix):
+ *   RESOLVE_NO_SYMLINKS   — no symlink component anywhere in the path. A
+ *                           symlink planted inside an allowed directory can no
+ *                           longer redirect the open to a denied object.
+ *   RESOLVE_NO_MAGICLINKS — /proc/<pid>/fd/N and /proc/self magic links do not
+ *                           resolve, so the agent cannot reach the Warden's own
+ *                           /proc/self view (it named /proc/self; the kernel
+ *                           would resolve that in the SUPERVISOR's context).
+ *   RESOLVE_BENEATH is deliberately NOT set: allow rules legitimately name
+ *   absolute paths outside the cwd (e.g. /lib/). `..` is instead defanged by
+ *   deciding on the post-`..`-collapse canonical path (see below), not by
+ *   forbidding `..` outright.
+ *
+ * dirfd handling: the v1.4 supervisor does not mirror the target's fd table,
+ * so a relative open against a target-held dirfd cannot be resolved soundly.
+ * Only AT_FDCWD (resolved against /proc/<pid>/cwd) and absolute paths are
+ * handled; any other dirfd fails closed. Returns the resolved fd (>=0, caller
+ * owns it) or -1. On success a->resolved holds the canonical path. */
+static int resolve_target_open(pid_t target_pid, struct action *a)
 {
+    a->resolved[0] = '\0';
+
+    if (a->open_dirfd != VAREK_AT_FDCWD && a->target[0] != '/') {
+        /* relative open against a dirfd we do not track: fail closed. */
+        return -1;
+    }
+
     char proc_cwd[64];
     snprintf(proc_cwd, sizeof(proc_cwd), "/proc/%d/cwd", target_pid);
     int cwd_fd = open(proc_cwd, O_PATH | O_DIRECTORY);
@@ -592,13 +729,34 @@ static int inject_resolved_fd(int notify_fd,
     struct open_how_local how = {
         .flags   = (uint64_t)a->open_flags & ~(uint64_t)O_PATH,
         .mode    = ((uint64_t)a->open_flags & (uint64_t)O_CREAT) ? ((uint64_t)a->open_mode & 0777) : 0,
-        .resolve = RESOLVE_NO_MAGICLINKS,
+        .resolve = (uint64_t)RESOLVE_NO_SYMLINKS | (uint64_t)RESOLVE_NO_MAGICLINKS,
     };
     int resolved = (int)syscall(__NR_openat2,
                                 cwd_fd, a->target, &how, sizeof(how));
     close(cwd_fd);
     if (resolved < 0) return -1;
 
+    /* Canonical path of exactly this fd — this is the string the policy
+     * decides on and the audit log records. Reading the magic link of a fd we
+     * ourselves hold is safe; it is the agent naming /proc/self that the
+     * RESOLVE_NO_MAGICLINKS above blocks. */
+    char linkpath[64];
+    snprintf(linkpath, sizeof(linkpath), "/proc/self/fd/%d", resolved);
+    ssize_t rl = readlink(linkpath, a->resolved, sizeof(a->resolved) - 1);
+    if (rl < 0) { close(resolved); a->resolved[0] = '\0'; return -1; }
+    a->resolved[rl] = '\0';
+    /* readlink can annotate a deleted/anon inode as " (deleted)"; such an
+     * object has no stable policy identity. Fail closed. */
+    if (a->resolved[0] != '/') { close(resolved); a->resolved[0] = '\0'; return -1; }
+
+    return resolved;
+}
+
+/* v1.12: hand an already-resolved fd (from resolve_target_open) to the target.
+ * No second open — the object decided on IS the object delivered, so there is
+ * no resolve/decide/open TOCTOU window. */
+static int inject_fd(int notify_fd, uint64_t id, int resolved)
+{
     struct seccomp_notif_addfd addfd = {
         .id          = id,
         .flags       = SECCOMP_ADDFD_FLAG_SEND,
@@ -606,9 +764,7 @@ static int inject_resolved_fd(int notify_fd,
         .newfd       = 0,
         .newfd_flags = O_CLOEXEC,
     };
-    int rc = ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd);
-    close(resolved);
-    return rc < 0 ? -1 : 0;
+    return ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd) < 0 ? -1 : 0;
 }
 
 /* ---------------- receive loop ---------------- */
@@ -680,11 +836,31 @@ static void supervise(int notify_fd, int target_pidfd,
             continue;
         }
 
+        /* v1.12: resolve-then-decide for file opens. The object is opened once,
+         * canonicalized, and only then matched against policy, so the decision
+         * and the delivered fd refer to the same inode. Resolution failure
+         * (symlink component, untracked dirfd, over-long path, deleted inode)
+         * is a hard deny before any policy match. */
+        int resolved_fd = -1;
+        if (act.kind == ACT_FILE_OPEN) {
+            resolved_fd = resolve_target_open(req.pid, &act);
+            if (resolved_fd < 0) {
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                uint64_t lat_r = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
+                               + (t1.tv_nsec - t0.tv_nsec);
+                emit_pathology(seq++, req.pid, &act, DEC_UNKNOWN, DEC_DENY,
+                               "resolution_failed", lat_r, EACCES);
+                send_simple(notify_fd, req.id, DEC_DENY);
+                continue;
+            }
+        }
+
         decision_t d_raw   = policy_decide(p, &act);
         decision_t d_final = (d_raw == DEC_ALLOW) ? DEC_ALLOW : DEC_DENY;
 
-        if (d_final == DEC_ALLOW && act.kind == ACT_FILE_OPEN) {
-            if (inject_resolved_fd(notify_fd, req.id, req.pid, &act) == 0) {
+        if (act.kind == ACT_FILE_OPEN) {
+            if (d_final == DEC_ALLOW && inject_fd(notify_fd, req.id, resolved_fd) == 0) {
+                close(resolved_fd);
                 clock_gettime(CLOCK_MONOTONIC, &t1);
                 uint64_t lat = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                              + (t1.tv_nsec - t0.tv_nsec);
@@ -692,7 +868,18 @@ static void supervise(int notify_fd, int target_pidfd,
                                "resolved_fd_injection", lat, 0);
                 continue;
             }
+            /* denied by policy, or injection failed: drop the resolved fd and
+             * fall through to a fail-closed deny. */
+            close(resolved_fd);
             d_final = DEC_DENY;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            uint64_t lat_d = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
+                           + (t1.tv_nsec - t0.tv_nsec);
+            emit_pathology(seq++, req.pid, &act, d_raw, d_final,
+                           d_raw == DEC_UNKNOWN ? "default_deny_unknown" : "policy_match",
+                           lat_d, EACCES);
+            send_simple(notify_fd, req.id, d_final);
+            continue;
         }
 
         /* v1.9.1: deny-only network/exec mediation. A connect/execve
@@ -881,7 +1068,16 @@ int main(int argc, char **argv) {
         int notify_fd =
             install_baseline_user_notif_filter(getenv("VAREK_WARDEN_OBSERVE") != NULL);
         if (notify_fd < 0) { perror("seccomp"); _exit(1); }
-        if (send_fd(sv[1], notify_fd) < 0) { perror("send_fd"); _exit(1); }
+        /* v1.12: hand the fd NUMBER to the supervisor and wait for it to pull
+         * the fd via pidfd_getfd(). write()/read() are admitted; no sendmsg. */
+        if (write_all(sv[1], &notify_fd, sizeof(notify_fd)) < 0) {
+            perror("write notify_fd"); _exit(1);
+        }
+        char ack = 0;
+        if (read_all(sv[1], &ack, 1) < 0 || ack != 1) {
+            fprintf(stderr, "[warden-target] supervisor did not acquire listener\n");
+            _exit(1);
+        }
         close(notify_fd);
         close(sv[1]);
         execvp(target_argv[0], target_argv);
@@ -891,14 +1087,39 @@ int main(int argc, char **argv) {
 
     close(sv[1]);
     close(live[0]);   /* live[1] stays open for the supervisor's lifetime */
-    int notify_fd = recv_fd(sv[0]);
-    close(sv[0]);
-    if (notify_fd < 0) {
-        fprintf(stderr, "[warden] failed to receive notify fd\n");
-        kill_target_tree(target);
-        waitpid(target, NULL, 0);
+
+    /* v1.12: acquire the seccomp listener fd via pidfd_getfd(). The child sent
+     * the fd number; we pull the fd out of the child's table, then ack so the
+     * child can drop its copy and exec. This replaces the SCM_RIGHTS handoff so
+     * that sendto/sendmsg can be mediated without deadlocking the bootstrap. */
+    int child_fd_num = -1;
+    if (read_all(sv[0], &child_fd_num, sizeof(child_fd_num)) < 0 || child_fd_num < 0) {
+        fprintf(stderr, "[warden] failed to read listener fd number\n");
+        close(sv[0]); kill_target_tree(target); waitpid(target, NULL, 0);
         return 1;
     }
+    int target_pidfd_h = (int)syscall(__NR_pidfd_open, target, 0);
+    if (target_pidfd_h < 0) {
+        fprintf(stderr, "[warden] pidfd_open for handoff failed: %s\n", strerror(errno));
+        close(sv[0]); kill_target_tree(target); waitpid(target, NULL, 0);
+        return 1;
+    }
+    int notify_fd = (int)syscall(__NR_pidfd_getfd, target_pidfd_h, child_fd_num, 0);
+    if (notify_fd < 0) {
+        fprintf(stderr, "[warden] pidfd_getfd of listener failed: %s\n", strerror(errno));
+        close(target_pidfd_h); close(sv[0]);
+        kill_target_tree(target); waitpid(target, NULL, 0);
+        return 1;
+    }
+    close(target_pidfd_h);
+    char ack = 1;
+    if (write_all(sv[0], &ack, 1) < 0) {
+        fprintf(stderr, "[warden] failed to ack listener handoff\n");
+        close(notify_fd); close(sv[0]);
+        kill_target_tree(target); waitpid(target, NULL, 0);
+        return 1;
+    }
+    close(sv[0]);
 
     /* v1.9.3: watch the target via pidfd (readable when it exits). */
     int target_pidfd = wd_supervisor_watch_target(target);
