@@ -1,0 +1,39 @@
+# VAREK generic sector policy — HEALTHCARE
+# ------------------------------------------------------------------------------
+# For an autonomous agent operating inside a clinical / health-operations
+# workflow (drafting orders, updating records, routing prior authorizations,
+# handling protected health information (PHI) in the electronic health record
+# (EHR)).
+#
+# Posture: DEFAULT-DENY. Any action not matched by an allow rule below returns
+# UNKNOWN and fails closed. Rules are evaluated top to bottom; the first match
+# wins, so the deny rules that narrow an allowed prefix come FIRST. File rules
+# match the RESOLVED canonical path (v1.12), so `..`, symlinks, and /proc/self
+# cannot smuggle a denied object past an allow prefix.
+#
+# Replace the example paths/hosts with your deployment's real locations. This is
+# a starting allowlist, not a finished authorization — tighten per workflow.
+# ------------------------------------------------------------------------------
+
+# --- Denied even though they sit under an allowed tree (evaluated first) ------
+deny  path /var/lib/ehr/audit/            # audit trail is append-only to the system, never the agent
+deny  path /var/lib/ehr/records/deceased/ # decedent records: separate legal-hold handling
+deny  path /etc/                          # no system configuration
+deny  path /root/                         # no operator home
+
+# --- Files the agent may reach ------------------------------------------------
+allow path /var/lib/ehr/records/          # patient record store (read/update per workflow)
+allow path /var/spool/hl7/outbound/       # HL7 / FHIR messages the agent composes
+allow path /var/lib/ehr/orders/draft/     # order drafts staged for clinician sign-off
+allow path /tmp/varek/                     # scratch workspace
+allow path /usr/lib/                        # loader / shared libraries
+allow path /lib/
+allow path /lib64/
+allow path /etc/ld.so.cache
+
+# --- Programs the agent may launch --------------------------------------------
+allow exec /usr/bin/python3
+
+# --- Network the agent may reach (deny-only outbound; connect is fail-closed) --
+allow host 127.0.0.1:8443                  # local FHIR / interoperability gateway
+# No external egress: PHI does not leave the host. Any un-listed host is denied.

@@ -1,0 +1,40 @@
+# VAREK generic sector policy — CYBERSECURITY
+# ------------------------------------------------------------------------------
+# For an autonomous SOC / detection-and-response agent: reading telemetry and
+# logs, triaging alerts, quarantining artifacts, querying a local search tier.
+# A detection agent READS widely and WRITES narrowly — it must never gain a
+# shell, load kernel code, or reach the systems it monitors.
+#
+# Posture: DEFAULT-DENY. Deny rules that carve holes out of an allowed tree come
+# first. File rules match the RESOLVED canonical path (v1.12).
+#
+# Replace example paths/hosts with your deployment's real locations.
+# ------------------------------------------------------------------------------
+
+# --- Denied even under an allowed tree (evaluated first) ----------------------
+deny  path /var/log/varek/                 # the agent's own audit trail is not agent-writable
+deny  path /etc/shadow                     # never
+deny  path /etc/ssh/                        # no host key or SSH config access
+deny  path /root/
+
+# --- Files the agent may reach ------------------------------------------------
+allow path /var/log/                        # system + application logs (read for detection)
+allow path /var/lib/varek/quarantine/      # where suspicious artifacts are isolated
+allow path /var/lib/detection/rules/       # YARA / Sigma rule sets (read)
+allow path /tmp/varek/                      # scratch workspace
+allow path /usr/lib/
+allow path /lib/
+allow path /lib64/
+allow path /etc/ld.so.cache
+
+# --- Programs the agent may launch --------------------------------------------
+allow exec /usr/bin/python3
+allow exec /usr/bin/yara
+# NOTE: no shell. /bin/sh and /bin/bash are intentionally NOT allowed — a
+# detection agent that can spawn a shell is a detection agent that can be lived
+# off. Any un-listed exec target is denied.
+
+# --- Network the agent may reach (deny-only outbound) -------------------------
+allow host 127.0.0.1:9200                  # local search / SIEM tier (e.g. Elasticsearch)
+allow host 127.0.0.1:8686                  # local detection API
+# No egress to the monitored estate: the agent observes, it does not connect out.

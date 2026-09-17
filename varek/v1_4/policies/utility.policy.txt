@@ -1,0 +1,37 @@
+# VAREK generic sector policy — UTILITY / CRITICAL INFRASTRUCTURE (OT)
+# ------------------------------------------------------------------------------
+# For an autonomous agent assisting operations at a utility (power, water, gas):
+# reading SCADA / operational-technology (OT) telemetry, correlating events,
+# preparing recommendations. The controlling risk is a control-plane write to a
+# setpoint or breaker. This policy makes the agent read-only toward the process:
+# it may observe telemetry and propose, but every actuation path is denied.
+#
+# Posture: DEFAULT-DENY. Deny rules carving holes out of an allowed tree come
+# first. File rules match the RESOLVED canonical path (v1.12).
+#
+# Replace example paths/hosts with your deployment's real locations.
+# ------------------------------------------------------------------------------
+
+# --- Denied even under an allowed tree (evaluated first) ----------------------
+deny  path /var/lib/scada/setpoints/write/ # NO control writes — actuation is human-authorized
+deny  path /var/lib/scada/breakers/        # NO breaker/relay operations
+deny  path /etc/
+deny  path /root/
+
+# --- Files the agent may reach ------------------------------------------------
+allow path /var/lib/scada/telemetry/       # historian / real-time telemetry (read)
+allow path /var/lib/scada/setpoints/read/  # current setpoints (read only)
+allow path /var/lib/ot/events/             # alarm / event log (read)
+allow path /tmp/varek/                      # scratch workspace
+allow path /usr/lib/
+allow path /lib/
+allow path /lib64/
+allow path /etc/ld.so.cache
+
+# --- Programs the agent may launch --------------------------------------------
+allow exec /usr/bin/python3
+
+# --- Network the agent may reach (deny-only outbound) -------------------------
+allow host 127.0.0.1:1502                  # local read-only OT/Modbus data broker
+# The control network is NOT reachable. The agent cannot open a session to a
+# PLC, RTU, or field device — any such (un-listed) connection is denied.
