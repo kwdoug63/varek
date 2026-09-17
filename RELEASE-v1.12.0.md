@@ -9,8 +9,8 @@ the three-state SMT decision procedure and the symmetric-suppression invariant
 (**no extension may move a genuinely unsafe action to SATISFIED**) are untouched
 — but it fixes five ways a process under the live Warden could make the runtime
 authorize, deliver, or record the wrong thing. Four are enforcement escapes; one
-is an integrity flaw in the evidence the runtime produces. It also adds a
-CycloneDX 1.6 evidence exporter.
+is an integrity flaw in the evidence the runtime produces. It also adds a tool
+that exports authorization evidence in the CycloneDX 1.6 format.
 
 The version jumps from v1.9.3 to v1.12. **v1.10 and v1.11 are reserved** for the
 UNKNOWN-shrinking verification program (verdict-distribution harness, bitvector
@@ -90,17 +90,24 @@ for it.
 
 ## Added
 
-- **`varek/v1_4/tools/varek_cyclonedx.py`** — renders a Warden pathology log as a
-  **CycloneDX 1.6** Bill of Materials: the Warden as a `metadata.tools` component
-  (MIT license plus the three provisional-patent references as properties), the
-  supervised run as `metadata.component`, each distinct authorized object as a
-  component carrying the deciding rule, and an Authorization-Before-Execution
-  attestation as a top-level annotation (policy identity, run window, verdict
-  distribution, the invariants that held). Output validates against the official
-  CycloneDX 1.6 JSON schema. It uses only stable 1.6; the "pre-defined
-  perspectives" proposal (CycloneDX specification PR #1067, targeting 2.0-dev) is
-  noted as a natural future carrier for a `cdx:perspectives:*` reference on the
-  attestation, not a dependency of this release.
+- **`varek/v1_4/tools/varek_cyclonedx.py`** — exports a Warden pathology log as a
+  Bill of Materials in the **CycloneDX 1.6** format: the Warden as a
+  `metadata.tools` component (MIT license plus the three provisional-patent
+  references as properties), the supervised run as `metadata.component`, each
+  distinct authorized object as a component carrying the deciding rule, and an
+  Authorization-Before-Execution attestation as a top-level annotation (policy
+  identity, run window, verdict distribution, the invariants that held). Output
+  validates against the published CycloneDX 1.6 JSON schema. It uses only stable
+  1.6; the "pre-defined perspectives" proposal (CycloneDX specification PR #1067,
+  targeting 2.0-dev) is noted as a natural future carrier for a
+  `cdx:perspectives:*` reference on the attestation, not a dependency of this
+  release.
+
+  CycloneDX is a trademark of the OWASP Foundation. VAREK and Sober Agentic
+  Infrastructure, Inc. are not affiliated with, endorsed by, or certified by the
+  OWASP Foundation or the CycloneDX project; the CycloneDX name is used only to
+  describe interoperability with the openly published CycloneDX format
+  (ECMA-424). See the `NOTICE` file.
 
   ```
   ./warden policy.txt -- ./agent 2> run.log

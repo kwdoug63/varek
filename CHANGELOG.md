@@ -52,7 +52,8 @@ this section is present in a released tag; it is stated as direction.
 
 v1.12 is a mediation-correctness release. It closes five ways a process under
 the live Warden could reach a denied object or corrupt the authorization record,
-and adds a CycloneDX 1.6 evidence export. No verdict *semantics* change — the
+and adds a tool that exports authorization evidence in the CycloneDX 1.6 format.
+No verdict *semantics* change — the
 three-state SMT decision procedure and the symmetric-suppression invariant are
 untouched — but several decisions the Warden believed it was making soundly were
 being made on the wrong object. The version jumps to v1.12: v1.10 and v1.11
@@ -111,14 +112,16 @@ is unaffected by and orthogonal to this release.
   legitimate open; the harness asserts on both the agent's view and the Warden's
   verdict stream (including that the stream stays valid JSON with no forged
   record). Fails against the pre-v1.12 Warden.
-- `varek/v1_4/tools/varek_cyclonedx.py` — renders a Warden pathology log as a
-  **CycloneDX 1.6** Bill of Materials: the Warden as a tool component (license +
-  provisional-patent properties), the run as `metadata.component`, each distinct
-  authorized object as a component, and an Authorization-Before-Execution
-  attestation as a top-level annotation. Output validates against the official
-  CycloneDX 1.6 JSON schema. Uses only stable 1.6; the "pre-defined perspectives"
-  proposal (specification PR #1067) is noted as a future 2.0 binding, not a
-  dependency.
+- `varek/v1_4/tools/varek_cyclonedx.py` — exports a Warden pathology log as a
+  Bill of Materials in the **CycloneDX 1.6** format: the Warden as a tool
+  component (license + provisional-patent properties), the run as
+  `metadata.component`, each distinct authorized object as a component, and an
+  Authorization-Before-Execution attestation as a top-level annotation. Output
+  validates against the published CycloneDX 1.6 JSON schema. Uses only stable
+  1.6; the "pre-defined perspectives" proposal (specification PR #1067) is noted
+  as a future 2.0 binding, not a dependency. CycloneDX is a trademark of the
+  OWASP Foundation; VAREK is not affiliated with or endorsed by the OWASP
+  Foundation or the CycloneDX project (see `NOTICE`).
 
 ### Fixed
 

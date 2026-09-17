@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 """
-varek_cyclonedx.py — turn a VAREK Warden pathology log into a CycloneDX 1.6 BOM.
+varek_cyclonedx.py — export a VAREK Warden pathology log as authorization
+evidence in the CycloneDX 1.6 format.
 
 The Warden emits one JSON pathology record per mediated action (see
 `emit_pathology()` in warden.c): the action, the raw pathname the agent
 supplied, the RESOLVED canonical object (v1.12+), the policy decision, the rule
 that fired, and the per-decision latency. That stream IS the authorization
-evidence for a run. This tool renders it as a CycloneDX 1.6 Bill of Materials so
-the evidence travels in a standard, tool-consumable form alongside an SBOM.
+evidence for a run. This tool renders it as a Bill of Materials in the
+CycloneDX 1.6 format so the evidence travels in a standard, tool-consumable form
+alongside an SBOM.
+
+Trademark: CycloneDX is a trademark of the OWASP Foundation. VAREK and Sober
+Agentic Infrastructure, Inc. are not affiliated with, endorsed by, or certified
+by the OWASP Foundation or the CycloneDX project. The CycloneDX name is used here
+only to describe interoperability with the openly published CycloneDX format
+(ECMA-424), whose schemas are Apache-2.0 licensed. See the NOTICE file.
 
 What it produces (all within stable CycloneDX 1.6 — no dependency on any
 unmerged specification proposal):
