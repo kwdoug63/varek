@@ -58,3 +58,6 @@ VAREK-Spec-Paper-Douglas-v1.6.pdf
 # build artifacts
 varek/v1_4/target_conformance
 varek/v1_4/warden
+
+# v1.12 test probe build artifact
+varek/v1_4/tests/v112_probe

@@ -79,7 +79,7 @@ baseline filter test still passes. Validated on Linux 6.18, x86_64.
 - `WD_MAX_INFLIGHT_NOTIFS` is documented as applying to a future
   multi-threaded supervisor. The v1.4 Warden handles one notification at a
   time, and pending requests queue in the kernel.
-- Spec paper updated to v1.9.3 (`varek-spec-paper-v1.9.3.md`, §2.9).
+- Spec paper updated to v1.9.3 (`varek-spec-paper-v1.12.md`, §2.9).
 
 ## Not in this release
 

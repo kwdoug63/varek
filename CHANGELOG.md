@@ -48,6 +48,87 @@ this section is present in a released tag; it is stated as direction.
 
 ---
 
+## [1.12.0] - 2026-09-17
+
+v1.12 is a mediation-correctness release. It closes five ways a process under
+the live Warden could reach a denied object or corrupt the authorization record,
+and adds a CycloneDX 1.6 evidence export. No verdict *semantics* change — the
+three-state SMT decision procedure and the symmetric-suppression invariant are
+untouched — but several decisions the Warden believed it was making soundly were
+being made on the wrong object. The version jumps to v1.12: v1.10 and v1.11
+remain **reserved** for the UNKNOWN-shrinking verification program (below), which
+is unaffected by and orthogonal to this release.
+
+### Security
+
+- **Resolve-then-decide for file opens.** The Warden previously matched policy
+  against the raw pathname string the agent supplied, then opened whatever that
+  path resolved to. Two objects could therefore differ: an allow rule could
+  match a benign prefix while the kernel opened a denied file. v1.12 opens the
+  object **once**, canonicalizes it (`readlink` on the resolved fd), decides
+  policy on that canonical path, and injects that same fd — decision and
+  delivered capability now refer to the same inode. Closes:
+  - **`..` traversal.** `/tmp/allowed/../../etc/shadow` matched the allowed
+    prefix and was opened. Now the decision is made on the collapsed canonical
+    path (`/etc/shadow`), which matches no allow rule.
+  - **Symlink escape.** A symlink inside an allowed directory pointing at a
+    denied object was followed. The resolver now sets
+    `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` — the flags the header and
+    threat model already claimed but the shipped code did not set (it set only
+    `RESOLVE_NO_MAGICLINKS`). A symlink component now fails resolution and is
+    denied.
+  - **`/proc/self` context confusion.** `/proc/self/*` is a magic symlink the
+    kernel resolves in the **caller's** context — the supervisor's, not the
+    agent's — so `open("/proc/self/mem")` returned a handle on the Warden.
+    `RESOLVE_NO_MAGICLINKS` now refuses it.
+- **Audit-log integrity.** The agent-controlled pathname was written into the
+  JSON pathology record unescaped, so a crafted path could inject a forged
+  `"decision_final":"ALLOW"` record into the verdict stream. All
+  agent-controlled strings are now JSON-escaped; every record is well-formed
+  JSON for any byte sequence. Records also gain a `resolved` field carrying the
+  canonical object the decision was made on.
+- **Datagram egress mediation.** `sendto`/`sendmsg` were admitted unconditionally
+  by the baseline filter, so an agent could reach the network with a datagram
+  send and never call the (deny-only) `connect` — a hole inherited from the
+  allow-by-default model and previously disclosed under bypass class 3. Both are
+  now mediated as `net.send`; a send carrying an inet destination is refused
+  under the same deny-only network posture as `connect`. Inbound
+  `recvfrom`/`recvmsg` stay admitted.
+
+### Changed
+
+- **Bootstrap listener handoff uses `pidfd_getfd`.** Mediating `sendmsg` broke
+  the old `SCM_RIGHTS` fd handoff (the child's own `sendmsg` trapped on its
+  just-installed filter with no supervisor yet listening). The child now writes
+  the listener fd *number* over the socketpair with `write()` (admitted) and the
+  supervisor pulls the fd out of the child with `pidfd_open`/`pidfd_getfd`. No
+  post-filter `sendmsg` is required, so both send syscalls can be mediated.
+
+### Added
+
+- `varek/v1_4/tests/v112_probe.c`, `tests/test_v112.sh`, `tests/v112_policy.txt`;
+  `make test-v112`. An adversarial target exercises all five bypasses and one
+  legitimate open; the harness asserts on both the agent's view and the Warden's
+  verdict stream (including that the stream stays valid JSON with no forged
+  record). Fails against the pre-v1.12 Warden.
+- `varek/v1_4/tools/varek_cyclonedx.py` — renders a Warden pathology log as a
+  **CycloneDX 1.6** Bill of Materials: the Warden as a tool component (license +
+  provisional-patent properties), the run as `metadata.component`, each distinct
+  authorized object as a component, and an Authorization-Before-Execution
+  attestation as a top-level annotation. Output validates against the official
+  CycloneDX 1.6 JSON schema. Uses only stable 1.6; the "pre-defined perspectives"
+  proposal (specification PR #1067) is noted as a future 2.0 binding, not a
+  dependency.
+
+### Fixed
+
+- `docs/security/bypass-classes.md`: class 3 is **closed** for the datagram send
+  path (`sendto`/`sendmsg` now mediated); class 4's symlink/magiclink resolution
+  claim now matches the shipped resolver flags. Adds an audit-log-integrity row
+  and a `/proc/self` context-confusion note.
+
+---
+
 ## [1.9.3] - 2026-09-15
 
 v1.9.3 wires the v1.9.2 supervisor/target lifecycle module into the live

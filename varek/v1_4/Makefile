@@ -25,7 +25,7 @@ CFLAGS    += -I$(V1_7_DIR)
 
 BINS := warden target_demo bench_target
 
-.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle
+.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112
 
 all: $(BINS)
 
@@ -69,6 +69,15 @@ tests/test_v193_lifecycle: tests/test_v193_lifecycle.c $(LIFECYCLE)
 test-lifecycle: warden tests/lifecycle_target tests/test_v193_lifecycle
 	@sudo ./tests/test_v193_lifecycle ./warden ./policy.txt $(abspath tests/lifecycle_target)
 
+# v1.12 mediation regression: resolve-then-decide (traversal, symlink,
+# /proc/self), audit-log soundness, and datagram-egress mediation. The probe is
+# built static so its own loader opens stay out of policy.
+tests/v112_probe: tests/v112_probe.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $<
+
+test-v112: warden tests/v112_probe
+	@sudo ./tests/test_v112.sh ./warden tests/v112_policy.txt $(abspath tests/v112_probe)
+
 # Conformance target (Test Target 1). Built static so the loader's own
 # library opens stay out of policy. Creates the work directory first: the
 # target cannot create it under enforcement.
@@ -82,4 +91,4 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe
