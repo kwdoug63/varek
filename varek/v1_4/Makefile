@@ -25,7 +25,7 @@ CFLAGS    += -I$(V1_7_DIR)
 
 BINS := warden target_demo bench_target
 
-.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112
+.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 video-v112
 
 all: $(BINS)
 
@@ -77,6 +77,12 @@ tests/v112_probe: tests/v112_probe.c
 
 test-v112: warden tests/v112_probe
 	@sudo ./tests/test_v112.sh ./warden tests/v112_policy.txt $(abspath tests/v112_probe)
+
+# v1.12 before/after demo, video-capture friendly (see v112_video.sh header).
+# Builds the pre-fix Warden from the v1.9.3 tag and runs the same adversarial
+# agent under both; every verdict on screen is read from the live Warden.
+video-v112: warden tests/v112_probe
+	@sudo ./v112_video.sh
 
 # Conformance target (Test Target 1). Built static so the loader's own
 # library opens stay out of policy. Creates the work directory first: the
