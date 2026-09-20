@@ -1,0 +1,67 @@
+# VAREK generic sector policy — AWS / CLOUD OPERATIONS
+# ------------------------------------------------------------------------------
+# For an autonomous cloud-operations agent (SRE / platform / FinOps) working
+# against an AWS account: reading telemetry, rendering infrastructure plans, and
+# staging changes for a human to apply. The agent PROPOSES; a human APPLIES.
+#
+# The controlling risks are an agent that grants itself permission, harvests
+# credentials, or edits the record of what it did. This policy denies the three
+# service endpoints that make those possible — IAM, Secrets Manager and
+# CloudTrail — along with the instance metadata service, which is the usual way
+# an agent on EC2 obtains credentials it was never issued.
+#
+# Posture: DEFAULT-DENY. Deny rules carving holes out of an allowed tree come
+# first. File rules match the RESOLVED canonical path (v1.12), closing the
+# traversal / symlink / /proc/self escapes that would otherwise let an agent
+# reach material outside its authorized set.
+#
+# Replace the example region, paths and endpoints with your deployment's real
+# locations.
+# ------------------------------------------------------------------------------
+
+# --- Denied even under an allowed tree (evaluated first) ----------------------
+deny  path /var/log/varek/                 # the agent's own audit trail is not agent-writable
+deny  path /var/lib/cloudops/.aws/         # long-lived access keys — never read
+deny  path /etc/shadow                     # never
+deny  path /etc/ssh/                       # no host key or SSH config access
+deny  path /root/
+
+# --- Files the agent may reach ------------------------------------------------
+allow path /var/lib/cloudops/state/        # terraform state (read, for plan rendering)
+allow path /var/lib/cloudops/plans/        # rendered plans staged for human review
+allow path /var/log/                       # local agent + application logs (read)
+allow path /tmp/varek/                     # scratch workspace
+allow path /usr/lib/
+allow path /lib/
+allow path /lib64/
+allow path /etc/ld.so.cache
+
+# --- Programs the agent may launch --------------------------------------------
+allow exec /usr/bin/python3
+allow exec /usr/bin/terraform
+# NOTE: no shell. /bin/sh and /bin/bash are intentionally NOT allowed — an agent
+# that can spawn a shell can run anything the exec allowlist was meant to bound.
+# Any un-listed exec target is denied.
+
+# --- Network the agent may reach (deny-only outbound) -------------------------
+# The denied endpoints come first. These are the three refusals a cloud-ops
+# agent must never be able to talk its way past.
+deny  host iam.amazonaws.com               # no self-granted permission
+deny  host sts.amazonaws.com               # no assuming a role it was not issued
+deny  host secretsmanager.us-east-1.amazonaws.com   # no reading application secrets
+deny  host cloudtrail.us-east-1.amazonaws.com       # the audit record is not agent-writable
+deny  host 169.254.169.254                 # IMDS — no harvesting instance credentials
+
+allow host monitoring.us-east-1.amazonaws.com:443   # CloudWatch metrics (read)
+allow host logs.us-east-1.amazonaws.com:443         # CloudWatch Logs (read)
+allow host ec2.us-east-1.amazonaws.com:443          # describe calls for plan rendering
+allow host s3.us-east-1.amazonaws.com:443           # terraform state backend
+
+# --- Note on granularity ------------------------------------------------------
+# A host rule authorizes an ENDPOINT, not an ACTION. It can keep the agent away
+# from IAM, Secrets Manager and CloudTrail entirely, but it cannot distinguish a
+# describe from a mutate on an endpoint that is allowed. Pair this policy with a
+# least-privilege IAM role: the role decides which actions are possible, VAREK
+# decides which endpoints are reachable at all, and a call must clear both.
+# Default-deny applies to each independently, so neither is a single point of
+# failure for the other.
