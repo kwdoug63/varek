@@ -1,6 +1,6 @@
 # VAREK — Trusted Computing Base
 
-Version: current as of v1.9.1 · MIT · github.com/kwdoug63/varek
+Version: current as of v1.12.0 · MIT · github.com/kwdoug63/varek
 
 A SATISFIED verdict is only as sound as the components that produce and enforce
 it. This document lists every component in the verification-and-enforcement
@@ -28,8 +28,9 @@ move components leftward — and, above all, to shrink the set that must be trus
 | Obligation encoder | Encodes the obligation for the decision procedure | Trusted | Planned: encoder-faithfulness checks per fragment (already part of the v1.10/v1.11 soundness obligations). |
 | SMT decision procedure (external backend) | Discharges the obligation to SATISFIED / UNSATISFIED / UNKNOWN | Trusted | Third-party; solvers have historically shipped soundness bugs. **Primary TCB-reduction target:** emit proof objects validated by a small independent checker (below), plus differential cross-checking on critical verdicts. |
 | Proof checker | Independently validates the decision procedure's proof objects | Planned (Checked) | Once shipped, the procedure moves from *trusted* to *checked*: trust collapses to a small, auditable checker rather than the whole solver. |
-| Warden supervisor (C) | Mediates syscalls; enforces the decision at the boundary | Trusted | Memory-safe-reviewed; v1.9.1 hardened the TOCTOU discipline. In external-audit scope. |
-| Kernel mechanisms (seccomp, Landlock, capabilities) | In-kernel enforcement primitives the Warden builds on | Trusted | Out of VAREK's control; relied upon as a platform assumption (see Threat Model §5.3). |
+| Warden supervisor (C) | Mediates syscalls; enforces the decision at the boundary | Trusted | Memory-safe-reviewed. v1.9.1 hardened the TOCTOU discipline; v1.9.2 moved the baseline to a default-deny allowlist; v1.9.3 coupled the agent's lifetime to the supervisor's; v1.12 made the Warden decide on the resolved object it delivers and escape all agent-controlled fields in the verdict stream. In external-audit scope. |
+| Evidence exporter (`varek/v1_4/tools/varek_cyclonedx.py`) | Converts the verdict stream to a CycloneDX 1.6 BOM | Trusted | Added in v1.12. Refuses a stream that does not parse cleanly, so a corrupted log cannot become an attestation; output validates against the published CycloneDX 1.6 schema. Its correctness does not affect enforcement, only the exported record. |
+| Kernel mechanisms (seccomp, PID namespaces, capabilities) | In-kernel enforcement primitives the Warden builds on | Trusted | Out of VAREK's control; relied upon as a platform assumption (see Threat Model §5.3). Landlock is roadmap (v1.10), not wired in. |
 | Build / toolchain | Produces the deployed binaries | Trusted | Planned: reproducible builds so a third party can reproduce the artifact bit-for-bit. |
 
 ## Soundness of the chain
