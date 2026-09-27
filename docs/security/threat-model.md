@@ -1,6 +1,6 @@
 # VAREK — Threat Model
 
-Version: current as of v1.9.1 · MIT · github.com/kwdoug63/varek
+Version: current as of v1.12.0 · MIT · github.com/kwdoug63/varek
 
 This document states what VAREK defends, against whom, and what it explicitly
 does not defend. It is deliberately conservative: where a guarantee is
@@ -21,14 +21,18 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
 
 - **Asset:** the integrity of the authorization decision — that no action takes
   effect unless it is SATISFIED under the active policy.
+- **Asset:** the integrity of the authorization record — that the verdict stream
+  (and any evidence exported from it) reflects the decisions actually made and
+  cannot be forged by the supervised process (v1.12).
 - **Trust boundary 1:** the policy author (trusted to express intent correctly —
   see §5, non-goal 1).
 - **Trust boundary 2:** the verification chain — surface-language compiler,
   obligation encoder, and the SMT decision procedure (see the Trusted Computing
   Base document for per-component status).
 - **Trust boundary 3:** the enforcement layer — the Warden supervisor and the
-  kernel mechanisms it relies on (seccomp user-notification, and, where
-  deployed, Landlock and capability restrictions).
+  kernel mechanisms it relies on (seccomp user-notification and seccomp-BPF,
+  PID namespaces, and capability restrictions). Landlock is on the v1.10 roadmap
+  and is not wired into the current Warden.
 
 ## 3. Adversary models
 
@@ -72,6 +76,33 @@ Model-B techniques below, with the residual limits stated honestly.
     validated arguments and injects the result, or denies.
   - *Stale-notification safety.* Every notification is revalidated immediately
     before the supervisor acts.
+- **Mediation completeness (v1.9.2).** The baseline filter is a default-deny
+  allowlist: unknown and variant syscalls are denied by construction. No
+  secondary ABI is admitted (32-bit compat and x32 paths are denied). Unprivileged
+  user namespaces are denied on the scalar flags argument. A hard-deny set covers
+  `ptrace`, `bpf`, `userfaultfd`, `process_vm_readv/writev`, `pidfd_getfd`, the
+  mount/FUSE family, the module/`kexec`/`perf_event_open`/`keyctl` family,
+  `memfd_create`, and io_uring.
+- **Supervisor/target lifecycle coupling (v1.9.3).** The agent runs as init of its
+  own PID namespace and is killed if the supervisor stops, so neither the agent
+  nor anything it spawned keeps running without oversight. The Warden requires
+  `CAP_SYS_ADMIN` and refuses to start without it. With `VAREK_WARDEN_NO_PIDNS=1`
+  the namespace is disabled and descendants are not guaranteed to die on a
+  supervisor crash.
+- **Mediation correctness (v1.12).**
+  - *Resolve-then-decide.* File opens are resolved once with
+    `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`; policy is decided on the
+    canonical path of the resolved descriptor, and that same descriptor is
+    injected. Decision and delivered capability refer to the same object, closing
+    `..` traversal, symlink escapes, and `/proc/self` context confusion.
+  - *Authorization-record integrity.* Every agent-controlled string is escaped, so
+    no input can begin, end, or forge a record in the verdict stream. Records
+    carry the resolved object the decision was made on.
+  - *Datagram egress.* `sendto`/`sendmsg` are mediated as network sends and
+    refused for an inet destination under the deny-only network posture.
+
+The per-class status of every known bypass class is maintained in
+`docs/security/bypass-classes.md`.
 
 ## 5. Out of scope / non-goals
 
@@ -101,9 +132,12 @@ are claimed as solved.
 
 ## 6. Residual risks (acknowledged)
 
-- Pointer-argument operations rely on the supervisor-performs-and-inject pattern;
-  deployments that mediate path-based access should layer Landlock for in-kernel,
-  race-free filesystem restriction rather than relying on argument copying alone.
+- Pointer-argument operations rely on the supervisor-performs-and-inject pattern.
+  Path resolution is performed once by the supervisor (v1.12), but in-kernel,
+  race-free filesystem restriction via Landlock remains roadmap (v1.10).
+- Network access is deny-only for outbound connections and inet datagram sends;
+  a mediated allow path (supervisor dials and injects) is roadmap (v1.10).
+- Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).
 - An agent may probe for SATISFIED-but-harmful actions near a policy boundary;
   this is a policy-tightness question (§5.1), not an enforcement bypass.

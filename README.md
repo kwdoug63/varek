@@ -36,7 +36,10 @@ VAREK has two layers, developed in sequence:
    **Stable at v1.0.**
 
 The runtime can protect any agent stack (LangChain, AutoGen, CrewAI, custom
-orchestrators). The language is for pipelines you write fresh. They are useful
+orchestrators), and it does not depend on the model provider or agent platform:
+the decision is made and enforced outside the agent, at the kernel boundary, and
+its evidence — the verdict stream and the CycloneDX 1.6 export — can be inspected
+without relying on the agent's vendor. The language is for pipelines you write fresh. They are useful
 independently and complementary together.
 
 ## The verdict model
