@@ -50,6 +50,10 @@ def parse(path):
     obj_re = re.compile(r"\{[^{}]*\"report_id\"[^{}]*\}")
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
+            # v1.12.1: only lines that start with '{' are Warden records; the
+            # agent's relayed stderr is prefixed "[agent] " and is skipped.
+            if not line.startswith("{"):
+                continue
             for m in obj_re.finditer(line):
                 try:
                     yield json.loads(m.group(0))

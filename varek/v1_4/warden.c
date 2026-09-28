@@ -82,6 +82,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <sys/prctl.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -620,8 +621,102 @@ static void json_escape(FILE *f, const char *s) {
 
 static FILE *g_log = NULL;
 
-static void log_init(void) {
-    g_log = stderr;
+/* v1.12.1: authenticated verdict stream.
+ *
+ * v1.12.0 escaped agent-controlled strings inside a record, but the agent
+ * shared the Warden's stderr, so it could still write a whole, well-formed
+ * record of its own ("ALLOW /etc/shadow") that no consumer could tell apart
+ * from a real one. Three changes close that:
+ *
+ *   1. The agent no longer shares the stream. Its stderr is a pipe the Warden
+ *      relays line by line with an "[agent] " prefix and control bytes
+ *      escaped, so no agent byte can begin a line of the verdict stream.
+ *   2. Every record carries a per-run id (128 random bits the agent never
+ *      sees) and a contiguous seq. A record the agent smuggles in by another
+ *      route (stdout merged with 2>&1) cannot carry the right id.
+ *   3. The stream is framed by run_start and run_end records, so truncation
+ *      and a missing tail are detectable.
+ *
+ * tools/varek_cyclonedx.py verifies all three and refuses to attest a stream
+ * that fails any of them. */
+static char     g_run_id[33];
+static uint64_t g_records = 0;       /* decision records emitted */
+static bool     g_relay_midline = false;
+
+static int log_init(void) {
+    /* The stream is the Warden's stderr, through a private descriptor
+     * (close-on-exec, never inherited by the agent) that is fully buffered
+     * and flushed once per record: each record reaches the file in a single
+     * write(), so nothing else writing to the same file can land inside it. */
+    int fd = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 3);
+    if (fd < 0) return -1;
+    g_log = fdopen(fd, "w");
+    if (!g_log) { close(fd); return -1; }
+    static char logbuf[1 << 16];
+    setvbuf(g_log, logbuf, _IOFBF, sizeof logbuf);
+    unsigned char rnd[16];
+    size_t got = 0;
+    while (got < sizeof rnd) {
+        ssize_t n = getrandom(rnd + got, sizeof rnd - got, 0);
+        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        got += (size_t)n;
+    }
+    for (size_t i = 0; i < sizeof rnd; i++)
+        snprintf(g_run_id + 2 * i, 3, "%02x", rnd[i]);
+    return 0;
+}
+
+/* A Warden record always starts on a fresh line, even if the agent's last
+ * relayed output ended mid-line. */
+static void log_line_start(void) {
+    if (g_relay_midline) { fputc('\n', g_log); g_relay_midline = false; }
+}
+
+/* Relay whatever the agent has written to its stderr pipe. Returns 0 while
+ * the pipe may produce more, -1 at EOF or error (stop polling it). */
+static int relay_agent_stderr(int fd) {
+    unsigned char buf[4096];
+    for (;;) {
+        ssize_t n = read(fd, buf, sizeof buf);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN) { fflush(g_log); return 0; }
+            fflush(g_log);
+            return -1;
+        }
+        if (n == 0) { fflush(g_log); return -1; }
+        for (ssize_t i = 0; i < n; i++) {
+            unsigned char c = buf[i];
+            if (!g_relay_midline) { fputs("[agent] ", g_log); g_relay_midline = true; }
+            if (c == '\n') { fputc('\n', g_log); g_relay_midline = false; }
+            else if ((c < 0x20 && c != '\t') || c == 0x7f)
+                fprintf(g_log, "\\x%02x", (unsigned)c);   /* \r cannot split a line */
+            else fputc(c, g_log);
+        }
+    }
+}
+
+static void emit_run_start(const char *policy_path, const struct policy *p) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    log_line_start();
+    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.12.1\","
+                   "\"policy_path\":\"", g_run_id);
+    json_escape(g_log, policy_path);
+    fprintf(g_log, "\",\"policy_rules\":%zu,\"timestamp_ns\":%lld}\n",
+            p->n_rules, (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+    fflush(g_log);
+}
+
+static void emit_run_end(int exit_status) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    log_line_start();
+    fprintf(g_log, "{\"event\":\"run_end\",\"run\":\"%s\",\"records\":%" PRIu64 ","
+                   "\"exit_status\":%d,\"timestamp_ns\":%lld}\n",
+            g_run_id, g_records, exit_status,
+            (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+    fflush(g_log);
 }
 
 static void emit_pathology(uint64_t seq,
@@ -639,12 +734,16 @@ static void emit_pathology(uint64_t seq,
     /* v1.12: target and resolved are escaped via json_escape(); every other
      * field is drawn from a fixed enum or an integer, so the whole record is
      * well-formed JSON regardless of agent-controlled input. */
+    log_line_start();
     fprintf(g_log,
         "{\"report_id\":\"pr-%ld.%09ld-%" PRIu64 "\","
+        "\"run\":\"%s\","
+        "\"seq\":%" PRIu64 ","
         "\"agent_pid\":%d,"
         "\"action\":\"%s\","
         "\"target\":\"",
         (long)ts.tv_sec, ts.tv_nsec, seq,
+        g_run_id, g_records,
         (int)pid,
         action_kind_name(a->kind));
     json_escape(g_log, a->target);
@@ -668,6 +767,7 @@ static void emit_pathology(uint64_t seq,
         (uint64_t)(latency_ns / 1000ULL),
         (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     fflush(g_log);
+    g_records++;
 }
 
 /* ---------------- Kernel Injection ---------------- */
@@ -923,21 +1023,27 @@ static int inject_fd(int notify_fd, uint64_t id, int resolved)
 static volatile sig_atomic_t g_stop = 0;
 static void on_term(int sig) { (void)sig; g_stop = 1; }
 
-static void supervise(int notify_fd, int target_pidfd,
+static void supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                       const struct policy *p, const char *bootstrap_path) {
     uint64_t seq = 0;
     while (!g_stop) {
         /* v1.9.3: wait on the listener AND the target's pidfd. Blocking in
          * NOTIF_RECV alone can hang forever if the target exits between the
-         * g_stop check and the ioctl (the SIGCHLD is already spent). */
-        struct pollfd pfds[2] = {
+         * g_stop check and the ioctl (the SIGCHLD is already spent).
+         * v1.12.1: also on the agent's stderr pipe, which is relayed. A
+         * negative fd is ignored by poll(). */
+        struct pollfd pfds[3] = {
             { .fd = notify_fd,    .events = POLLIN },
             { .fd = target_pidfd, .events = POLLIN },
+            { .fd = agent_err_fd, .events = POLLIN },
         };
-        int pr = poll(pfds, target_pidfd >= 0 ? 2 : 1, -1);
+        int pr = poll(pfds, 3, -1);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return;
+        }
+        if (agent_err_fd >= 0 && (pfds[2].revents & (POLLIN | POLLHUP | POLLERR))) {
+            if (relay_agent_stderr(agent_err_fd) < 0) agent_err_fd = -1;
         }
         if (target_pidfd >= 0 && (pfds[1].revents & POLLIN))
             return;                       /* target exited */
@@ -1163,7 +1269,26 @@ int main(int argc, char **argv) {
     struct policy p;
     if (policy_load(policy_path, &p) < 0) return 1;
 
-    log_init();
+    if (log_init() < 0) {
+        fprintf(stderr, "[warden] cannot open the verdict stream or create a run id (%s)\n",
+                strerror(errno));
+        return 1;
+    }
+    /* v1.12.1: if stdout and stderr are the same file (2>&1), the agent's
+     * stdout lands in the verdict stream unprefixed. Records stay
+     * authenticated by run id and seq, and the exporter refuses a stream
+     * holding anything that parses as a foreign record, but say so. */
+    {
+        struct stat so, se;
+        if (fstat(1, &so) == 0 && fstat(2, &se) == 0 &&
+            so.st_dev == se.st_dev && so.st_ino == se.st_ino) {
+            fprintf(stderr,
+                "[warden] WARNING: stdout and stderr are the same file; the agent's "
+                "stdout will be mixed into the verdict stream. Keep them separate "
+                "(e.g. 2> run.log) for an attestable log.\n");
+        }
+    }
+    emit_run_start(policy_path, &p);
 
     /* v1.6 pre-execution plan verification. Fires before fork; on
      * any non-SATISFIED result the target is not started. */
@@ -1196,6 +1321,11 @@ int main(int argc, char **argv) {
     int live[2];
     if (pipe2(live, O_CLOEXEC) < 0) { perror("pipe2"); return 1; }
 
+    /* v1.12.1: the agent's stderr is a pipe the supervisor relays, so the
+     * agent never writes to the verdict stream directly. */
+    int errpipe[2];
+    if (pipe2(errpipe, O_CLOEXEC) < 0) { perror("pipe2"); return 1; }
+
     if (pidns) {
         int rc = wd_supervisor_isolate_pids();
         if (rc < 0) {
@@ -1218,6 +1348,9 @@ int main(int argc, char **argv) {
     if (target == 0) {
         close(sv[0]);
         close(live[1]);
+        close(errpipe[0]);
+        if (dup2(errpipe[1], STDERR_FILENO) < 0) _exit(1);   /* dup2 clears CLOEXEC */
+        close(errpipe[1]);
         /* Own process group, so orderly shutdown can signal the whole tree
          * even without a PID namespace. setpgid/setsid are not in the
          * baseline allowlist, so the agent cannot leave the group. */
@@ -1250,6 +1383,9 @@ int main(int argc, char **argv) {
 
     close(sv[1]);
     close(live[0]);   /* live[1] stays open for the supervisor's lifetime */
+    close(errpipe[1]);
+    int agent_err_fd = errpipe[0];
+    (void)fcntl(agent_err_fd, F_SETFL, fcntl(agent_err_fd, F_GETFL) | O_NONBLOCK);
 
     /* v1.12: acquire the seccomp listener fd via pidfd_getfd(). The child sent
      * the fd number; we pull the fd out of the child's table, then ack so the
@@ -1298,12 +1434,17 @@ int main(int argc, char **argv) {
         "[warden] supervising pid=%d  notify_fd=%d  policy=%s (%zu rules)  pidns=%s\n",
         target, notify_fd, p.name, p.n_rules, pidns ? "on" : "off");
 
-    supervise(notify_fd, target_pidfd, &p, target_argv[0]);
+    supervise(notify_fd, target_pidfd, agent_err_fd, &p, target_argv[0]);
 
     kill_target_tree(target);  /* the agent and everything it spawned */
     int status = 0;
     waitpid(target, &status, 0);
+    /* Relay anything the agent wrote before it died, then close the stream. */
+    (void)relay_agent_stderr(agent_err_fd);
+    close(agent_err_fd);
+    int rc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    emit_run_end(rc);
     close(target_pidfd);
     close(notify_fd);
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    return rc;
 }
