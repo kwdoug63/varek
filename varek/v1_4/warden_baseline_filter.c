@@ -10,9 +10,10 @@
 // SCMP_ACT_NOTIFY on the assumption of a supervisor that can decide them. The
 // v1.4 supervise()/derive_intent() models ONLY openat, connect, execve,
 // execveat; any other NOTIFY becomes ACT_OTHER -> deny. So here the mediate set
-// is exactly those four, and the syscalls the supervisor does not mediate
-// (networking, message I/O) are ADMITTED — otherwise default-deny would break
-// every target. Same hard-deny set, same scalar-flag CLONE_NEWUSER denial, same
+// is exactly those four (plus the v1.12 sends), and the outbound-neutral
+// syscalls the supervisor does not mediate (socket creation, receive) are
+// ADMITTED — otherwise default-deny would break every target. The inbound
+// calls (bind/listen/accept) are not admitted as of v1.12.1. Same hard-deny set, same scalar-flag CLONE_NEWUSER denial, same
 // native-ABI lockdown (which is what closes the x32 hole the raw filter has).
 //
 // Contract matches the function it replaces: sets PR_SET_NO_NEW_PRIVS, installs
@@ -80,12 +81,16 @@ static const char *kAdmit[] = {
     "sigaltstack", "tgkill",
     // sync
     "futex",
-    // networking — the v1.4 supervisor does NOT mediate these; targets need them.
-    // connect IS mediated (below). sendto/recvfrom on a connectionless socket can
-    // reach the network without connect — a known gap inherited from the
-    // allow-by-default model, documented in bypass-classes.md; tighten when the
-    // supervisor learns to mediate the message path.
-    "socket", "socketpair", "bind", "listen", "accept", "accept4",
+    // networking — socket creation and socket options stay admitted so targets
+    // start normally; connect and the egress-capable sends are mediated (below).
+    // v1.12.1: bind, listen, accept and accept4 are NO LONGER admitted. They are
+    // the inbound half of networking (a TCP listener, a bound UDP receiver, an
+    // abstract unix socket the host can reach) and the deny-only network posture
+    // had left them open to a root agent. They fall to the default EPERM. bind
+    // on a pathname unix socket also created a file outside open() mediation;
+    // that is closed with it. The Warden also runs the agent in its own, empty
+    // network namespace (warden.c), so no interface is reachable either way.
+    "socket", "socketpair",
     "getsockname", "getpeername", "getsockopt", "setsockopt",
     // v1.12: sendto/sendmsg are NO LONGER admitted here — they can reach the
     // network without connect (a datagram send with an explicit destination),

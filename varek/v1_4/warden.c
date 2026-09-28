@@ -1361,6 +1361,22 @@ int main(int argc, char **argv) {
                             "refusing to run unsupervised\n", strerror(-crc));
             _exit(1);
         }
+        /* v1.12.1: the agent gets its own network namespace, holding only a
+         * loopback interface that is down. Nothing can reach it and it can
+         * reach nothing, whatever sockets it creates; the filter also refuses
+         * bind/listen/accept. Must precede the filter, which denies
+         * CLONE_NEWNET. With the PID namespace (CAP_SYS_ADMIN held) failure is
+         * fatal; in VAREK_WARDEN_NO_PIDNS mode it is a warning. */
+        if (unshare(CLONE_NEWNET) < 0) {
+            if (pidns) {
+                fprintf(stderr, "[warden-target] cannot create a network namespace "
+                                "(%s); refusing to run\n", strerror(errno));
+                _exit(1);
+            }
+            fprintf(stderr, "[warden-target] WARNING: no network namespace (%s); "
+                            "the agent shares the host network (bind/listen/accept "
+                            "are still refused)\n", strerror(errno));
+        }
         int notify_fd =
             install_baseline_user_notif_filter(getenv("VAREK_WARDEN_OBSERVE") != NULL);
         if (notify_fd < 0) { perror("seccomp"); _exit(1); }
@@ -1430,9 +1446,23 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* v1.12.1: report whether the agent really has its own network
+     * namespace, by comparing namespace identities rather than trusting
+     * the child. */
+    const char *netns = "unknown";
+    {
+        char mine[64], theirs[64], path[64];
+        ssize_t a = readlink("/proc/self/ns/net", mine, sizeof mine - 1);
+        snprintf(path, sizeof path, "/proc/%d/ns/net", target);
+        ssize_t b = readlink(path, theirs, sizeof theirs - 1);
+        if (a > 0 && b > 0) {
+            mine[a] = theirs[b] = '\0';
+            netns = strcmp(mine, theirs) ? "on" : "off";
+        }
+    }
     fprintf(stderr,
-        "[warden] supervising pid=%d  notify_fd=%d  policy=%s (%zu rules)  pidns=%s\n",
-        target, notify_fd, p.name, p.n_rules, pidns ? "on" : "off");
+        "[warden] supervising pid=%d  notify_fd=%d  policy=%s (%zu rules)  pidns=%s  netns=%s\n",
+        target, notify_fd, p.name, p.n_rules, pidns ? "on" : "off", netns);
 
     supervise(notify_fd, target_pidfd, agent_err_fd, &p, target_argv[0]);
 
