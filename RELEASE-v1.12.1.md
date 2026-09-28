@@ -43,8 +43,12 @@ the agent's pathname, so the decided object is still the delivered one.
   into the name is refused. The agent's umask is applied.
 - **FIFOs and devices.** The real open adds `O_NONBLOCK` and clears it
   afterwards unless the agent asked for it, so nothing can block the supervisor.
-  One visible difference: opening a FIFO for writing with no reader returns
-  `ENXIO` instead of waiting.
+  Two visible differences for FIFOs: opening one for writing with no reader
+  returns `ENXIO` instead of waiting, and opening one for reading with no writer
+  returns at once, so `read()` reports end-of-file until a writer connects.
+- **Unnamed temporary files.** `O_TMPFILE` is decided on the directory it names,
+  and the file gets the agent's mode and umask (v1.12.0 created it with mode
+  0000).
 - **Errors after ALLOW.** An allowed open that fails for an ordinary reason
   (`EEXIST` for `O_CREAT | O_EXCL` on an existing file, `ENXIO` above) returns
   that errno to the agent. The record says `"kernel_verdict":"ERRNO"` and carries
@@ -63,6 +67,8 @@ v1.12.1:
 - **The agent no longer writes to the stream.** Its stderr is a pipe the Warden
   relays line by line with an `[agent] ` prefix, escaping control bytes, so no
   agent byte can begin a line of the verdict stream and a `\r` cannot split one.
+  At most 64 KiB is relayed per wake-up, so an agent flooding its stderr cannot
+  keep the Warden from answering its other requests.
 - **One write per record.** Records go through a private close-on-exec
   descriptor, fully buffered and flushed once per record, so nothing else writing
   to the same file can land inside a record.
@@ -106,6 +112,11 @@ outside `open()` mediation.
   unaffected; `run_start` and `run_end` are new record types.
 - `varek_cyclonedx.py` no longer accepts v1.12.0 logs.
 - Targets that listen for connections now get `EPERM` from `bind`/`listen`.
+- `O_TMPFILE` naming an allowed directory itself (for example `/tmp/work` under
+  `allow path /tmp/work/`) is now denied, because the decision is made on the
+  directory's canonical path, which has no trailing slash. v1.12.0 decided on a
+  path inside it. This fails closed and matches how opening that directory
+  directly has always been decided.
 - Decision latency is unchanged within run-to-run noise (P50 5 µs; P99 43–53 µs
   before and 46–50 µs after, three runs each of `bench_target 10000` on the same
   host).

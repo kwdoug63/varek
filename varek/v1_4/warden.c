@@ -675,11 +675,15 @@ static void log_line_start(void) {
     if (g_relay_midline) { fputc('\n', g_log); g_relay_midline = false; }
 }
 
-/* Relay whatever the agent has written to its stderr pipe. Returns 0 while
- * the pipe may produce more, -1 at EOF or error (stop polling it). */
-static int relay_agent_stderr(int fd) {
+/* Relay what the agent has written to its stderr pipe. Returns 0 while the
+ * pipe may produce more, -1 at EOF or error (stop polling it). While
+ * supervising, at most 64 KiB is relayed per call, so an agent flooding its
+ * stderr cannot keep the supervisor from answering seccomp notifications;
+ * drain_all empties the pipe at the end of the run (up to 1 MiB, so a
+ * surviving writer cannot hold the Warden open). */
+static int relay_agent_stderr(int fd, bool drain_all) {
     unsigned char buf[4096];
-    for (;;) {
+    for (int chunks = 0; chunks < (drain_all ? 256 : 16); chunks++) {
         ssize_t n = read(fd, buf, sizeof buf);
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -697,6 +701,8 @@ static int relay_agent_stderr(int fd) {
             else fputc(c, g_log);
         }
     }
+    fflush(g_log);
+    return 0;
 }
 
 static void emit_run_start(const char *policy_path, const struct policy *p) {
@@ -966,8 +972,10 @@ static mode_t target_umask(pid_t pid) {
  *
  * O_NONBLOCK is added for the open itself so a FIFO or device cannot block
  * the single-threaded supervisor, then cleared again unless the agent asked
- * for it. One visible difference follows from that: opening a FIFO for
- * writing when no reader exists returns ENXIO instead of waiting. */
+ * for it. Two visible differences follow for FIFOs: opening one for writing
+ * when no reader exists returns ENXIO instead of waiting, and opening one
+ * for reading when no writer exists returns at once, so read() reports
+ * end-of-file until a writer connects instead of the open waiting for it. */
 static int materialize_target(pid_t target_pid, const struct action *a,
                               const struct resolved_target *r)
 {
@@ -985,7 +993,17 @@ static int materialize_target(pid_t target_pid, const struct action *a,
          * O_NOFOLLOW is dropped here only because /proc/self/fd/N is itself a
          * link; the agent's path was already resolved with no symlinks. */
         int flags = (want & ~O_NOFOLLOW) | O_NONBLOCK | O_CLOEXEC;
-        fd = open(self, flags, 0);
+        if ((want & O_TMPFILE) == O_TMPFILE) {
+            /* O_TMPFILE creates an unnamed file in the pinned directory:
+             * apply the agent's mode and umask, as for O_CREAT. */
+            mode_t old = umask(target_umask(target_pid));
+            fd = open(self, flags, (mode_t)(a->open_mode & 07777));
+            int saved = errno;
+            umask(old);
+            errno = saved;
+        } else {
+            fd = open(self, flags, 0);
+        }
     } else if (r->parent_fd >= 0) {
         if (want & O_PATH) return -ENOENT;
         int flags = want | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
@@ -1046,7 +1064,7 @@ static void supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             return;
         }
         if (agent_err_fd >= 0 && (pfds[2].revents & (POLLIN | POLLHUP | POLLERR))) {
-            if (relay_agent_stderr(agent_err_fd) < 0) agent_err_fd = -1;
+            if (relay_agent_stderr(agent_err_fd, false) < 0) agent_err_fd = -1;
         }
         if (target_pidfd >= 0 && (pfds[1].revents & POLLIN))
             return;                       /* target exited */
@@ -1473,7 +1491,7 @@ int main(int argc, char **argv) {
     int status = 0;
     waitpid(target, &status, 0);
     /* Relay anything the agent wrote before it died, then close the stream. */
-    (void)relay_agent_stderr(agent_err_fd);
+    (void)relay_agent_stderr(agent_err_fd, true);
     close(agent_err_fd);
     int rc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
     emit_run_end(rc);

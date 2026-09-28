@@ -82,8 +82,12 @@ inbound networking was left open. No verdict *semantics* change.
 
 ### Changed
 
-- Opening a FIFO for writing when no reader exists returns `ENXIO` instead of
-  waiting (the Warden opens with `O_NONBLOCK`, then clears it).
+- FIFOs: opening one for writing when no reader exists returns `ENXIO` instead
+  of waiting, and opening one for reading when no writer exists returns at once
+  (the Warden opens with `O_NONBLOCK`, then clears it).
+- `O_TMPFILE` is decided on the directory it names and gets the agent's mode and
+  umask (v1.12.0 gave mode 0000). Naming an allowed directory itself is denied
+  when the rule has a trailing slash, as for any open of that directory.
 - An ALLOW whose open then fails (`EEXIST`, `ENXIO`, ...) returns that errno to
   the agent. Records gain `run`, `seq` and `errno` fields, and `kernel_verdict`
   reads `ERRNO` in that case.
