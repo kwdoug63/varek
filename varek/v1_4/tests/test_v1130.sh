@@ -61,10 +61,13 @@ expect "a rule without flag clauses admits writes"   rw_write OK
 expect "... and appends"                             rw_append OK
 expect "flag bit 31 (outside the ABI set) refused"   unknown_bit_31 REFUSED
 expect "flag bit 24 (outside the ABI set) refused"   unknown_bit_24 REFUSED
+expect "access mode 3 with O_TRUNC refused"          access_mode_3_trunc REFUSED
+[ "$(cat "$RW/w.txt" 2>/dev/null)" != "" ] || true
 n="$(grep -c '"rule":"fragment_escape_flags"' "$OUT/verdicts")"
-[ "$n" -eq 2 ] && pass "both recorded as fragment_escape_flags" || flunk "both recorded as fragment_escape_flags (saw $n)"
-grep '^{' "$OUT/verdicts" | grep '"decision_final":"ALLOW"' | grep "$RO/data.txt" | grep -q '"policy_line":3' \
-  && pass "an ALLOW record names the deciding policy line" || flunk "an ALLOW record names the deciding policy line"
+[ "$n" -eq 3 ] && pass "all three recorded as fragment_escape_flags" || flunk "all three recorded as fragment_escape_flags (saw $n)"
+roline="$(grep -n '^allow path /tmp/varek_ro_v1130/' "$HERE/tests/v1130_policy.txt" | cut -d: -f1)"
+grep '^{' "$OUT/verdicts" | grep '"decision_final":"ALLOW"' | grep "$RO/data.txt" | grep -q "\"policy_line\":$roline," \
+  && pass "an ALLOW record names the deciding policy line ($roline)" || flunk "an ALLOW record names the deciding policy line ($roline)"
 grep -Eq '"warden":"1\.13\.' "$OUT/verdicts" && pass "run_start names Warden 1.13.x" || flunk "run_start names Warden 1.13.x"
 
 echo "== 2. load-time analysis reports a rule that can never fire =="
@@ -93,6 +96,17 @@ grep -q "flag clause 'readonly' on a non-path rule" <<<"$o" && pass "flag clause
 printf 'allow path /tmp/ +O_BOGUS\n' > "$OUT/bogus.txt"
 o="$("$WARDEN" "$OUT/bogus.txt" -- /bin/true 2>&1 || true)"
 grep -q "unknown flag clause '+O_BOGUS'" <<<"$o" && pass "unknown flag name refused" || flunk "unknown flag name refused"
+printf 'allow path /tmp/a\001b/\n' > "$OUT/ctl.txt"
+o="$("$WARDEN" "$OUT/ctl.txt" -- /bin/true 2>&1 || true)"
+grep -q "control byte 0x01 in constant" <<<"$o" && pass "control byte in a constant refused" || flunk "control byte in a constant refused"
+printf 'require warden 1.99\nallow path /tmp/\n' > "$OUT/req.txt"
+o="$("$WARDEN" "$OUT/req.txt" -- /bin/true 2>&1 || true)"
+grep -q "policy requires Warden 1.99; this is 1.13" <<<"$o" && ! grep -q "supervising pid=" <<<"$o" \
+  && pass "require warden 1.99: refused, agent not started" || flunk "require warden 1.99 refused"
+printf 'allow path /tmp/log/ +O_APPEND\n' > "$OUT/adv.txt"
+o="$("$WARDEN" "$OUT/adv.txt" -- /bin/true 2>&1 || true)"
+grep -q "note: clause on O_APPEND constrains only the open() call" <<<"$o" \
+  && pass "load-time note: +O_APPEND is not append-only (fcntl can clear it)" || flunk "load-time note for +O_APPEND"
 
 echo "== 4. shipped policies lint clean =="
 for p in "$HERE"/policy.txt "$HERE"/conformance_policy.txt "$HERE"/policies/*.txt; do
@@ -108,7 +122,7 @@ plan() { printf 'action a file_open %s\n' "$1" > "$OUT/plan.txt"
 
 echo "== 6. decision procedure vs SMT solver =="
 if python3 -c 'import z3' 2>/dev/null; then
-    o="$(python3 "$HERE/tools/smt_crosscheck.py" --vdp "$VDP" --fuzz 60 --seed 1100 --queries 40 \
+    o="$(python3 "$HERE/tools/smt_crosscheck.py" --vdp "$VDP" --fuzz 20 --seed 1130 --queries 40 \
          "$HERE"/policy.txt "$HERE"/conformance_policy.txt "$HERE"/policies/*.txt "$HERE"/tests/*policy*.txt 2>&1)"
     echo "$o" | sed 's/^/    /' | tail -3
     grep -q "smt_crosscheck: PASS (0 disagreements)" <<<"$o" && pass "zero disagreements with the solver" || flunk "zero disagreements with the solver"

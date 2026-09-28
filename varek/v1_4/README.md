@@ -123,6 +123,7 @@ One rule per line. First match wins. No match returns `UNKNOWN`,
 which is suppressed.
 
 ```
+require warden <major>.<minor>      (v1.13: an older Warden refuses the file)
 <verb> <kind> <match> [flag-clause ...]
   verb  := allow | deny
   kind  := path | host | exec
@@ -138,8 +139,14 @@ Every rule is decided by the SMT decision procedure in `smt_decide.c`
 (v1.13). A path rule is matched on the resolved canonical path, so name
 canonical prefixes (`/usr/lib/`, not `/lib/`) and end directory prefixes
 with `/`. `access=ro` alone is not read-only on Linux (`O_RDONLY|O_TRUNC`
-truncates, `O_RDONLY|O_CREAT` creates); use `readonly`. More than 256
-rules, or an unknown or contradictory clause, is a load error.
+truncates, `O_RDONLY|O_CREAT` creates); use `readonly`. A clause
+constrains the flags passed to `openat()`: `readonly` is sound, but
+`fcntl(F_SETFL)` can change `O_APPEND`, `O_NONBLOCK`, `O_ASYNC`,
+`O_DIRECT` and `O_NOATIME` afterwards (the Warden notes such clauses).
+Access mode 3 and unknown flag bits are refused. More than 256 rules,
+an unknown or contradictory clause, a control byte in a constant, or an
+unmet `require` is a load error. Start a policy that uses flag clauses
+with `require warden 1.13`: a v1.12 Warden would silently ignore them.
 
 Lines beginning with `#` are comments, and `#` also starts a trailing
 comment. See `policy.txt` and `policies/` for examples, and check a policy

@@ -11,8 +11,8 @@
 // open flags; "read-only" could not be expressed. The probe checks that a
 // read-only rule admits reads and refuses every way of modifying the file
 // through open() (write access, O_TRUNC even with O_RDONLY, O_CREAT even with
-// O_RDONLY), and that flag bits outside the ABI open(2) set are refused as
-// outside the decision procedure's fragment.
+// O_RDONLY), and that flag bits outside the ABI open(2) set, and access mode
+// 3, are refused as outside the decision procedure's fragment.
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -81,6 +81,9 @@ int main(void) {
      * -> refused, even under the permissive rule. */
     raw_refuse("unknown_bit_31",        RW "/w.txt",    0x80000000u);
     raw_refuse("unknown_bit_24",        RW "/w.txt",    0x01000000u);
+    /* Access mode 3 (O_WRONLY|O_RDWR): matches no access= clause, yet the
+     * kernel honours O_TRUNC with it. Outside the fragment -> refused. */
+    raw_refuse("access_mode_3_trunc",   RW "/w.txt",    0x3u | O_TRUNC);
 
     line("done", "", 0);
     return 0;

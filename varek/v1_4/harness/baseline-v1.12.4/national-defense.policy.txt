@@ -17,32 +17,21 @@
 # Replace example paths/hosts with the enclave's real locations.
 # ------------------------------------------------------------------------------
 
-# v1.13: `readonly` (= access=ro -O_CREAT -O_TRUNC) makes a rule admit reads
-# only. Through v1.12 a path rule admitted every open flag, so the rules marked
-# "(read)" below, and the loader rules, also admitted writes by the (root)
-# agent. /etc/ld.so.cache is allowed BEFORE `deny path /etc/`: first match
-# wins, and in the v1.12 ordering that allow could never fire. Check any
-# policy with:  tools/vdp_check <policy> lint
-#
-# `require warden 1.13` makes an older Warden refuse this file (its parser
-# would otherwise ignore `readonly` and admit writes).
-require warden 1.13
-
 # --- Denied even under an allowed tree (evaluated first) ----------------------
 deny  path /var/lib/c2/crypto/             # keying material / COMSEC — never
 deny  path /var/lib/c2/xdomain/            # cross-domain transfer staging — human-authorized only
-allow path /etc/ld.so.cache readonly            # loader cache: read
 deny  path /etc/
 deny  path /root/
 
 # --- Files the agent may reach ------------------------------------------------
-allow path /var/lib/c2/taskorders/ readonly     # tasking / mission orders (read)
-allow path /var/lib/intel/products/ readonly    # finished intelligence products (read)
+allow path /var/lib/c2/taskorders/         # tasking / mission orders (read)
+allow path /var/lib/intel/products/        # finished intelligence products (read)
 allow path /var/lib/c2/staffwork/draft/    # staff products staged for human review
 allow path /tmp/varek/                      # scratch workspace
-allow path /usr/lib/ readonly                   # loader / shared libraries: read, never write
-allow path /lib/ readonly                       # loader / shared libraries: read, never write
-allow path /lib64/ readonly                     # loader / shared libraries: read, never write
+allow path /usr/lib/
+allow path /lib/
+allow path /lib64/
+allow path /etc/ld.so.cache
 
 # --- Programs the agent may launch --------------------------------------------
 allow exec /usr/bin/python3

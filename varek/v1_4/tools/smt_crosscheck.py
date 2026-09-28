@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -58,18 +59,32 @@ class PolicyError(Exception):
     pass
 
 
+WS = re.compile(r"[ \t\r\n\v\f]+")        # ASCII whitespace only, as C strtok_r
+
+
 def parse_policy(path):
     """Independent re-implementation of the policy grammar (smt_decide.h)."""
     rules = []
     with open(path, "rb") as fh:
         for lineno, raw in enumerate(fh, 1):
+            if b"\0" in raw:
+                raise PolicyError(f"{path}:{lineno}: NUL byte")
             text = raw.decode("latin-1")
             toks = []
-            for t in text.split():
+            for t in WS.split(text):
+                if not t:
+                    continue
                 if t.startswith("#"):
                     break
                 toks.append(t)
             if not toks:
+                continue
+            if toks[0] == "require":
+                m = re.fullmatch(r"(\d+)\.(\d+)", toks[2]) if len(toks) == 3 else None
+                if len(toks) != 3 or toks[1] != "warden" or not m:
+                    raise PolicyError(f"{path}:{lineno}: bad directive")
+                if (int(m.group(1)), int(m.group(2))) > (1, 13):
+                    raise PolicyError(f"{path}:{lineno}: requires newer Warden")
                 continue
             if len(toks) < 3:
                 raise PolicyError(f"{path}:{lineno}: bad rule")
@@ -80,6 +95,8 @@ def parse_policy(path):
                 raise PolicyError(f"{path}:{lineno}: kind")
             if not (1 <= len(const) <= L):
                 raise PolicyError(f"{path}:{lineno}: constant length")
+            if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in const):
+                raise PolicyError(f"{path}:{lineno}: control byte in constant")
             mask = value = 0
             for t in toks[3:]:
                 if kind != "path":
@@ -107,29 +124,46 @@ def parse_policy(path):
 
 # ---------------------------------------------------------------- encoding --
 
-_BYTE = z3.Range(chr(1), chr(255))
+# Every solver object of one policy lives in its own Z3 context, dropped when
+# the policy is done: a single global context accumulates every term of every
+# query (gigabytes with near-bound constants).
+CTX = None
+
+
+def new_context():
+    global CTX
+    CTX = z3.Context()
+
+
+def _byte_re():
+    return z3.Range(chr(1), chr(255), ctx=CTX)
+
+
+def fdomain(f):
+    """Admissible flags: ABI bits only, and not access mode 3."""
+    return z3.And((f & z3.BitVecVal(~KNOWN & 0xFFFFFFFF, 32, ctx=CTX)) == 0,
+                  (f & z3.BitVecVal(ACC, 32, ctx=CTX)) != z3.BitVecVal(ACC, 32, ctx=CTX))
 
 
 def domain(s, f):
-    return z3.And(z3.Length(s) <= L, z3.InRe(s, z3.Star(_BYTE)),
-                  (f & z3.BitVecVal(~KNOWN & 0xFFFFFFFF, 32)) == 0)
+    return z3.And(z3.Length(s) <= L, z3.InRe(s, z3.Star(_byte_re())), fdomain(f))
 
 
 def str_atom(r, s):
-    c = z3.StringVal(r["c"])
+    c = z3.StringVal(r["c"], ctx=CTX)
     if r["kind"] == "path":
         return z3.PrefixOf(c, s)
     if r["kind"] == "exec":
         return s == c
     if ":" in r["c"]:
         return s == c
-    return z3.Or(s == c, z3.PrefixOf(z3.StringVal(r["c"] + ":"), s))
+    return z3.Or(s == c, z3.PrefixOf(z3.StringVal(r["c"] + ":", ctx=CTX), s))
 
 
 def bv_atom(r, f):
     if r["mask"] == 0:
-        return z3.BoolVal(True)
-    return (f & z3.BitVecVal(r["mask"], 32)) == z3.BitVecVal(r["value"], 32)
+        return z3.BoolVal(True, ctx=CTX)
+    return (f & z3.BitVecVal(r["mask"], 32, ctx=CTX)) == z3.BitVecVal(r["value"], 32, ctx=CTX)
 
 
 def fires_first(rules, idx, s, f):
@@ -142,7 +176,7 @@ def fires_first(rules, idx, s, f):
 
 
 def sat(*fs):
-    so = z3.Solver()
+    so = z3.Solver(ctx=CTX)
     so.set("timeout", 20000)
     so.add(*fs)
     r = so.check()
@@ -152,9 +186,9 @@ def sat(*fs):
 
 
 def oracle_ground(rules, kind, sval, fval):
-    s, f = z3.String("s"), z3.BitVec("f", 32)
+    s, f = z3.String("s", ctx=CTX), z3.BitVec("f", 32, ctx=CTX)
     fv = fval if (kind == "path" and fval is not None) else 0
-    pin = [s == z3.StringVal(sval), f == z3.BitVecVal(fv, 32)]
+    pin = [s == z3.StringVal(sval, ctx=CTX), f == z3.BitVecVal(fv, 32, ctx=CTX)]
     if not sat(domain(s, f), *pin):
         return "UNKNOWN"                      # outside the fragment
     for i, r in enumerate(rules):
@@ -167,15 +201,15 @@ def oracle_ground(rules, kind, sval, fval):
 
 def oracle_symbolic(rules, sval):
     """path, concrete s, symbolic f. SATISFIED iff every admissible f is."""
-    s, f = z3.String("s"), z3.BitVec("f", 32)
-    pin = s == z3.StringVal(sval)
+    s, f = z3.String("s", ctx=CTX), z3.BitVec("f", 32, ctx=CTX)
+    pin = s == z3.StringVal(sval, ctx=CTX)
     if not sat(domain(s, f), pin):
         return "UNKNOWN"
     idx = [i for i, r in enumerate(rules) if r["kind"] == "path"]
     allow_first = z3.Or([fires_first(rules, i, s, f) for i in idx
-                         if rules[i]["verb"] == "allow"] or [z3.BoolVal(False)])
+                         if rules[i]["verb"] == "allow"] or [z3.BoolVal(False, ctx=CTX)])
     deny_first = z3.Or([fires_first(rules, i, s, f) for i in idx
-                        if rules[i]["verb"] == "deny"] or [z3.BoolVal(False)])
+                        if rules[i]["verb"] == "deny"] or [z3.BoolVal(False, ctx=CTX)])
     if not sat(domain(s, f), pin, z3.Not(allow_first)):
         return "SATISFIED"
     if not sat(domain(s, f), pin, z3.Not(deny_first)):
@@ -194,14 +228,18 @@ def oracle_symbolic(rules, sval):
 class ByteStr:
     def __init__(self, rules):
         m = max([len(r["c"]) + 1 for r in rules] + [1]) + 1
-        self.n = z3.Int("n")
-        self.b = [z3.BitVec(f"b{k}", 8) for k in range(m)]
+        self.n = z3.Int("n", ctx=CTX)
+        self.b = [z3.BitVec(f"b{k}", 8, ctx=CTX) for k in range(m)]
 
     def domain(self):
-        cs = [self.n >= 0, self.n <= L]
-        for k, bk in enumerate(self.b):
-            cs.append(z3.Implies(self.n > k, bk != 0))
-        return z3.And(cs)
+        # Length bound only. The byte range 1..255 needs no constraint: atoms
+        # only compare positions with constant bytes, and the grammar forbids
+        # bytes 0x00-0x20 and 0x7f in constants, so a 0 byte in a model acts
+        # exactly like an unused byte in 1..255, which always exists at every
+        # position (at most 222 values can occur). Dropping the ~4,100
+        # implications a near-bound constant needed keeps the query fast; the
+        # encoding stays exact.
+        return z3.And(self.n >= 0, self.n <= L)
 
     def prefix(self, c):
         return z3.And(self.n >= len(c),
@@ -217,18 +255,23 @@ def str_atom_bytes(r, bs):
         return bs.prefix(c)
     if r["kind"] == "exec" or ":" in c:
         return bs.eq(c)
-    return z3.Or(bs.eq(c), bs.prefix(c + ":"))
+    # host(c, s) = s == c OR prefix(c ++ ":", s), written with the shared prefix
+    # factored out: prefix(c, s) AND (|s| == |c| OR s[|c|] == ':'). Logically
+    # identical; the solver times out on the unfactored disjunction of two long
+    # conjunctions (a 4 KB constant) and answers the factored form instantly.
+    k = len(c)
+    at_k = bs.b[k] == ord(":") if k < len(bs.b) else z3.BoolVal(False, ctx=CTX)
+    return z3.And(bs.prefix(c), z3.Or(bs.n == k, z3.And(bs.n >= k + 1, at_k)))
 
 
 def oracle_reach(rules, i):
     bs = ByteStr(rules)
-    f = z3.BitVec("f", 32)
+    f = z3.BitVec("f", 32, ctx=CTX)
     k = rules[i]["kind"]
     here = z3.And(str_atom_bytes(rules[i], bs), bv_atom(rules[i], f))
     before = [z3.Not(z3.And(str_atom_bytes(r, bs), bv_atom(r, f)))
               for r in rules[:i] if r["kind"] == k]
-    fdom = (f & z3.BitVecVal(~KNOWN & 0xFFFFFFFF, 32)) == 0
-    return "REACHABLE" if sat(bs.domain(), fdom, here, *before) else "DEAD"
+    return "REACHABLE" if sat(bs.domain(), fdomain(f), here, *before) else "DEAD"
 
 
 # ------------------------------------------------------------ procedure IO --
@@ -240,6 +283,11 @@ def run_vdp(vdp, policy, mode, stdin=None):
 
 
 # ------------------------------------------------------------- query gen --
+
+def rand_const_bytes(rng):
+    """Occasionally non-ASCII bytes, never whitespace/control (as the grammar)."""
+    return rng.choice(["\xa0", "\x85", "\xe9", "\xff", "\x80"])
+
 
 def gen_queries(rules, rng, n):
     consts = {"path": [], "host": [], "exec": []}
@@ -268,7 +316,8 @@ def gen_queries(rules, rng, n):
             if r < 0.2:
                 fval = None                                   # symbolic
             elif r < 0.25:
-                fval = rng.choice([0x80000000, 0x01000000, 0x0800000])  # unknown bits
+                fval = rng.choice([0x80000000, 0x01000000, 0x0800000,       # unknown bits
+                                   0x3, 0x203, 0x43])                        # access mode 3
             else:
                 fval = rng.getrandbits(32) & KNOWN & rng.choice(
                     [0x3, 0x243, 0x7FFFC3, 0x40 | 0x200 | 0x3, 0x400 | 0x3])
@@ -278,28 +327,54 @@ def gen_queries(rules, rng, n):
     return out
 
 
+FLAG_CLAUSES = ["readonly", "access=ro", "access=wo", "access=rw"] + \
+    [sign + name for name in FLAG_BITS for sign in "+-"]
+
+
 def fuzz_policy(rng, path):
     frags = ["/a", "/a/", "/a/b", "/ab", "/b/", "/a/b/c", "x", "x:1", "/"]
     lines = []
+    if rng.random() < 0.3:
+        lines.append(rng.choice(["require warden 1.13", "require warden 1.12",
+                                 "require warden 1.14", "require warden x"]))
+    wide = rng.random() < 0.2           # many distinct flag bits: reach the bound
     for _ in range(rng.randint(1, 9)):
         kind = rng.choice(["path", "path", "path", "host", "exec"])
         c = rng.choice(frags) + rng.choice(["", "", "a", "/", ":2"])
+        r = rng.random()
+        if r < 0.05:
+            c = "/" + "d" * rng.randint(L - 8, L + 2)     # near / over the length bound
+        elif r < 0.12:
+            c = c + rand_const_bytes(rng)                  # non-ASCII byte in a constant
         verb = rng.choice(["allow", "deny"])
         clauses = []
         if kind == "path":
-            for _ in range(rng.randint(0, 3)):
-                clauses.append(rng.choice(["readonly", "access=ro", "access=wo",
-                                           "access=rw", "+O_TRUNC", "-O_TRUNC",
-                                           "+O_CREAT", "-O_CREAT", "+O_APPEND",
-                                           "-O_CLOEXEC", "+O_DIRECTORY"]))
-        lines.append(" ".join([verb, kind, c] + clauses))
-    with open(path, "w") as fh:
+            if wide:
+                # distinct flag names, random signs: up to 19 relevant bits,
+                # enough to reach the procedure's 16-bit enumeration bound
+                names = rng.sample(sorted(FLAG_BITS), rng.randint(8, len(FLAG_BITS)))
+                clauses += [rng.choice("+-") + n for n in names]
+                if rng.random() < 0.5:
+                    clauses.append(rng.choice(["access=ro", "access=wo", "access=rw"]))
+            else:
+                for _ in range(rng.randint(0, 3)):
+                    clauses.append(rng.choice(FLAG_CLAUSES))
+        elif rng.random() < 0.05:
+            clauses.append("readonly")                     # must be refused on host/exec
+        line = " ".join([verb, kind, c] + clauses)
+        if rng.random() < 0.05:
+            line += "\r"                                   # CRLF
+        if rng.random() < 0.05:
+            line += "  # trailing comment"
+        lines.append(line)
+    with open(path, "w", encoding="latin-1", newline="") as fh:
         fh.write("\n".join(lines) + "\n")
 
 
 # ------------------------------------------------------------------ check --
 
 def check_policy(vdp, policy, rng, nq, stats, verbose):
+    new_context()
     fails = []
     try:
         rules = parse_policy(policy)
@@ -351,13 +426,15 @@ def check_policy(vdp, policy, rng, nq, stats, verbose):
             want = oracle_ground(rules, kind, sval, fval)
             stats["ground"] += 1
         got = r["verdict"]
+        if r.get("why") == "enumeration_bound":
+            stats["bound_seen"] += 1
         if got == want:
             continue
         if got == "UNKNOWN" and r.get("why") == "enumeration_bound":
             stats["bound_unknown"] += 1
             continue
         shown = sval if len(sval) < 60 else sval[:30] + f"...({len(sval)} bytes)"
-        fails.append(f"{policy}: {kind} {shown!r} flags={fl if False else fval}: C={got} ({r.get('why')}) solver={want}")
+        fails.append(f"{policy}: {kind} {shown!r} flags={fval}: C={got} ({r.get('why')}) solver={want}")
     return fails
 
 
@@ -373,7 +450,7 @@ def main():
 
     rng = random.Random(a.seed)
     stats = {k: 0 for k in ("policies", "rejected_policies", "reach", "reach_unknown",
-                            "ground", "symbolic", "bound_unknown")}
+                            "ground", "symbolic", "bound_unknown", "bound_seen")}
     fails = []
     for p in a.policies:
         fails += check_policy(a.vdp, p, rng, a.queries, stats, a.verbose)
@@ -392,7 +469,9 @@ def main():
     print(f"smt_crosscheck: {stats['policies']} policies ({stats['rejected_policies']} "
           f"rejected by both parsers), {total} checks: {stats['reach']} reachability, "
           f"{stats['ground']} ground, {stats['symbolic']} symbolic-flag; "
-          f"conservative UNKNOWN at the enumeration bound: "
+          f"procedure hit its enumeration bound {stats['bound_seen']} times "
+          f"(verdicts) and {stats['reach_unknown']} times (reachability); "
+          f"of these, conservative UNKNOWN where the solver was definite: "
           f"{stats['reach_unknown'] + stats['bound_unknown']}")
     for fl in fails[:40]:
         print("  DISAGREE", fl)

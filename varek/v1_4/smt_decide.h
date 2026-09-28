@@ -33,6 +33,9 @@
 //     also refuses to truncate; see xproc_read_str);
 //   - conservative mask: a flags value with any bit outside the ABI-defined
 //     open(2) flag set (VDP_KNOWN_OFLAGS) is UNKNOWN, whatever the rules say;
+//   - access mode 3 (O_WRONLY|O_RDWR, the kernel's "ioctl-only" mode, which
+//     still honours O_TRUNC and O_CREAT) matches none of access=ro|wo|rw and
+//     is UNKNOWN;
 //   - bounded enumeration: a non-ground query whose relevant flag bits
 //     exceed VDP_MAX_ENUM_BITS returns UNKNOWN rather than an unproved answer.
 //
@@ -47,10 +50,22 @@
 //                         the --plan gate, whose file_open actions carry no
 //                         flags.
 //   vdp_rule_reachable()  is there ANY (s, f) for which rule i is the first
-//                         rule that holds? Decided exactly for this fragment
-//                         (finite witness set over the constants' trie plus a
-//                         bounded bitvector enumeration). Used at policy load
-//                         to report rules that can never fire.
+//                         rule that holds? Decided exactly over the abstract
+//                         domain (any byte string up to the bound, any in-
+//                         fragment flags value), by a finite witness set over
+//                         the constants' trie plus a bounded bitvector
+//                         enumeration. Over the actions that really occur it
+//                         errs toward REACHABLE (the safe direction for a
+//                         warning). Used at policy load to report rules that
+//                         can never fire.
+//
+// What a flag clause constrains. A clause constrains the flags the agent passes
+// to openat(), checked when the Warden opens the object. That is sound for
+// readonly: the access mode, O_TRUNC and O_CREAT take effect at open and cannot
+// be changed afterwards. It is NOT a persistent property for bits fcntl(F_SETFL)
+// can change later (O_APPEND, O_NONBLOCK, O_ASYNC, O_DIRECT, O_NOATIME) or bits
+// the kernel adjusts (O_LARGEFILE is forced on 64-bit; the __O_SYNC bit alone
+// gains O_DSYNC). vdp_rule_advisory() reports such clauses.
 //
 // Every answer this procedure gives is cross-checked against an SMT solver by
 // tools/smt_crosscheck.py (differential, zero-disagreement gate).
@@ -118,6 +133,7 @@ typedef enum {
     VDP_WHY_UNKNOWN_FLAGS,     /* flag bits outside the ABI set -> UNKNOWN */
     VDP_WHY_SYMBOLIC_MIXED,    /* symbolic f: outcomes differ -> UNKNOWN */
     VDP_WHY_ENUM_BOUND,        /* too many relevant bits -> UNKNOWN */
+    VDP_WHY_ACCESS_MODE_3,     /* O_ACCMODE == 3: outside the fragment -> UNKNOWN */
 } vdp_why_t;
 
 const char *vdp_verdict_name(vdp_verdict_t v);
@@ -138,7 +154,14 @@ const char *vdp_kind_name(vdp_kind_t k);
  *   +O_NAME                               (bit must be set)
  *   -O_NAME                               (bit must be clear)
  * A path rule's constant is a prefix; host is host[:port] (a bare host matches
- * any port); exec is an exact path. */
+ * any port); exec is an exact path. A constant may not contain control bytes
+ * (0x00-0x1f, 0x7f).
+ *
+ * Directive:
+ *   require warden <major>.<minor>
+ * refuses to load on an older procedure. Put it first in any policy that uses
+ * flag clauses: a v1.12 Warden fails to load it (unknown verb) instead of
+ * silently ignoring the clauses, which v1.12's parser did. */
 int vdp_policy_load(const char *path, vdp_policy_t *p, char *err, size_t errlen);
 
 /* Decide a single action. s must be a NUL-terminated string. flags is used only
@@ -154,5 +177,14 @@ vdp_reach_t vdp_rule_reachable(const vdp_policy_t *p, size_t i);
 
 /* Name <-> bit for flag clauses; returns 0 if unknown. */
 uint32_t vdp_flag_bit(const char *name);
+
+/* Advisory text for a rule (flag clauses that constrain only the open() call,
+ * non-ASCII bytes in the constant). Writes a NUL-terminated message and returns
+ * its length, or 0 if there is nothing to report. */
+size_t vdp_rule_advisory(const vdp_rule_t *r, char *buf, size_t n);
+
+/* The Warden version this procedure implements, for `require warden X.Y`. */
+#define VDP_WARDEN_MAJOR 1
+#define VDP_WARDEN_MINOR 13
 
 #endif /* VAREK_SMT_DECIDE_H */

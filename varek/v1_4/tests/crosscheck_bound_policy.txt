@@ -1,0 +1,12 @@
+# Cross-check fixture: exercises the decision procedure's enumeration bound
+# (VDP_MAX_ENUM_BITS = 16) and its conservative UNKNOWN. Rule 1 constrains 19
+# flag bits, so a symbolic-flag query on /w/... or a reachability question that
+# must enumerate those bits exceeds the bound. The solver still answers; the
+# procedure must answer the same or UNKNOWN (enumeration_bound), never a
+# different definite verdict. Not a deployable policy.
+require warden 1.13
+deny  path /w/ +O_CREAT -O_EXCL +O_NOCTTY -O_TRUNC +O_APPEND -O_NONBLOCK +O_DSYNC -O_ASYNC +O_DIRECT -O_LARGEFILE +O_DIRECTORY -O_NOFOLLOW +O_NOATIME -O_CLOEXEC +O_SYNC -O_PATH +O_TMPFILE access=rw
+deny  path /w/
+allow path /w/x
+allow path /v/ -O_CREAT -O_EXCL -O_NOCTTY -O_TRUNC -O_APPEND -O_NONBLOCK -O_DSYNC -O_ASYNC -O_DIRECT -O_LARGEFILE -O_DIRECTORY -O_NOFOLLOW -O_NOATIME -O_CLOEXEC -O_SYNC -O_PATH -O_TMPFILE access=ro
+allow path /v/

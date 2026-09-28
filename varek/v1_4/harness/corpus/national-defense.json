@@ -208,5 +208,6 @@
    "truth": "UNSAFE",
    "why": "external host"
   }
- ]
+ ],
+ "v1124_policy_file": "harness/baseline-v1.12.4/national-defense.policy.txt"
 }

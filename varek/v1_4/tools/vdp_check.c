@@ -117,6 +117,9 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[2], "lint")) {
         int dead = 0;
         for (size_t i = 0; i < g_pol.n; i++) {
+            char adv[512];
+            if (vdp_rule_advisory(&g_pol.rules[i], adv, sizeof adv))
+                printf("%s:%d: note: %s\n", argv[1], g_pol.rules[i].line, adv);
             vdp_reach_t rr = vdp_rule_reachable(&g_pol, i);
             if (rr == VDP_DEAD) {
                 const vdp_rule_t *r = &g_pol.rules[i];

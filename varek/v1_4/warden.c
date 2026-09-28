@@ -234,6 +234,9 @@ static int policy_load(const char *path, struct policy *p) {
     for (size_t i = 0; i < p->v.n; i++) {
         vdp_reach_t rr = vdp_rule_reachable(&p->v, i);
         const vdp_rule_t *r = &p->v.rules[i];
+        char adv[512];
+        if (vdp_rule_advisory(r, adv, sizeof adv))
+            fprintf(stderr, "[warden] policy %s:%d: note: %s\n", path, r->line, adv);
         if (rr == VDP_DEAD) {
             dead++;
             fprintf(stderr, "[warden] policy %s:%d: WARNING: %s %s rule can never "
@@ -506,7 +509,8 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
  * action lies outside the decision procedure's fragment is named as such. */
 static const char *decision_rule_id(const struct action *a, decision_t d_raw) {
     if (d_raw != DEC_UNKNOWN) return "policy_match";
-    if (a->why && !strcmp(a->why, "unknown_flag_bits")) return "fragment_escape_flags";
+    if (a->why && (!strcmp(a->why, "unknown_flag_bits") ||
+                   !strcmp(a->why, "access_mode_3")))  return "fragment_escape_flags";
     if (a->why && !strcmp(a->why, "length_guard"))      return "fragment_escape_length";
     return "default_deny_unknown";
 }
@@ -1459,7 +1463,8 @@ static void usage(const char *argv0) {
         "    deny  host evil.example.com\n"
         "    allow exec /usr/bin/env\n"
         "    allow path /var/log/ readonly     (v1.13: access=ro -O_CREAT -O_TRUNC)\n"
-        "  Path rules also take access=ro|wo|rw, +O_NAME, -O_NAME.\n"
+        "  Path rules also take access=ro|wo|rw, +O_NAME, -O_NAME. Begin a policy\n"
+        "  that uses them with: require warden 1.13\n"
         "  Check a policy with: tools/vdp_check <policy> lint\n"
         "\n"
         "  Plan file format (see varek/v1_6/sample_plan.txt):\n"
@@ -1509,7 +1514,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    struct policy p;
+    /* ~1 MB (256 rules x 4 KB constants): static, not on the stack. */
+    static struct policy p;
     if (policy_load(policy_path, &p) < 0) return 1;
 
     if (log_init() < 0) {

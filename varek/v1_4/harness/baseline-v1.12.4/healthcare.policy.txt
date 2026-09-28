@@ -15,21 +15,9 @@
 # a starting allowlist, not a finished authorization — tighten per workflow.
 # ------------------------------------------------------------------------------
 
-# v1.13: `readonly` (= access=ro -O_CREAT -O_TRUNC) makes a rule admit reads
-# only. Through v1.12 a path rule admitted every open flag, so the rules marked
-# "(read)" below, and the loader rules, also admitted writes by the (root)
-# agent. /etc/ld.so.cache is allowed BEFORE `deny path /etc/`: first match
-# wins, and in the v1.12 ordering that allow could never fire. Check any
-# policy with:  tools/vdp_check <policy> lint
-#
-# `require warden 1.13` makes an older Warden refuse this file (its parser
-# would otherwise ignore `readonly` and admit writes).
-require warden 1.13
-
 # --- Denied even though they sit under an allowed tree (evaluated first) ------
 deny  path /var/lib/ehr/audit/            # audit trail is append-only to the system, never the agent
 deny  path /var/lib/ehr/records/deceased/ # decedent records: separate legal-hold handling
-allow path /etc/ld.so.cache readonly            # loader cache: read
 deny  path /etc/                          # no system configuration
 deny  path /root/                         # no operator home
 
@@ -38,9 +26,10 @@ allow path /var/lib/ehr/records/          # patient record store (read/update pe
 allow path /var/spool/hl7/outbound/       # HL7 / FHIR messages the agent composes
 allow path /var/lib/ehr/orders/draft/     # order drafts staged for clinician sign-off
 allow path /tmp/varek/                     # scratch workspace
-allow path /usr/lib/ readonly                   # loader / shared libraries
-allow path /lib/ readonly                       # loader / shared libraries: read, never write
-allow path /lib64/ readonly                     # loader / shared libraries: read, never write
+allow path /usr/lib/                        # loader / shared libraries
+allow path /lib/
+allow path /lib64/
+allow path /etc/ld.so.cache
 
 # --- Programs the agent may launch --------------------------------------------
 allow exec /usr/bin/python3

@@ -17,14 +17,22 @@ the harness reports:
     the run (exit 1). This is the soundness obligation every v1.10/v1.11-program
     extension is admitted under.
 
-To measure what the new fragment buys, the same actions are also decided under
-two policies v1.12 could have enforced from the same file:
+To measure what the new fragment buys, the same actions are also decided under:
 
-  v1.12-permissive  every flag clause removed (v1.12 ignored open flags, so a
-                    "(read)" rule also admitted writes);
-  v1.12-strict      every rule that carries a flag clause removed (the only way
-                    to keep writes out under v1.12, which also turns the reads
-                    into UNKNOWN).
+  v1.12.4 shipped   the policy file as v1.12.4 shipped it (a verbatim copy in
+                    harness/baseline-v1.12.4/, named by the case's
+                    "v1124_policy_file"): what users actually had;
+  flags ignored     the v1.13 file with every flag clause removed (what v1.12
+                    would have enforced from it: a "(read)" rule admits writes);
+  flag rules dropped the v1.13 file with every flag-constrained rule removed
+                    (the only way to keep those writes out under v1.12, which
+                    also turns the reads into UNKNOWN).
+
+Two caveats the report states rather than hides. A SATISFIED verdict on an exec
+or connect is still refused at run time (those are deny-only since v1.9.1), so
+the report gives file-open figures separately. And the same action appears in
+several cases (the loader actions are in all five), so the report gives the
+number of distinct actions.
 
 PROVENANCE. The seed corpus shipped in harness/corpus/ is synthetic: its
 policies are SAI's example sector policies and its SAFE/UNSAFE labels were
@@ -41,6 +49,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -73,12 +82,24 @@ def flags_value(spec):
     return v
 
 
+_WS = re.compile(r"[ \t\r\n\v\f]+")
+
+
 def strip_policy(text, mode):
-    """v1.12 views of a v1.13 policy."""
+    """v1.12 views of a v1.13 policy. Tokenizes as the C parser does: ASCII
+    whitespace only, and '#' starts a comment only at the start of a token."""
     out = []
     for ln in text.splitlines():
-        body = ln.split("#", 1)[0].split()
-        if len(body) < 3:
+        body = []
+        for t in _WS.split(ln):
+            if not t:
+                continue
+            if t.startswith("#"):
+                break
+            body.append(t)
+        if len(body) < 3 or body[0] == "require":
+            if body and body[0] == "require":
+                continue                                  # v1.12 had no directives
             out.append(ln)
             continue
         if len(body) > 3:
@@ -123,6 +144,10 @@ def load_cases(args, base):
         pf = c["policy_file"]
         with open(pf if os.path.isabs(pf) else os.path.join(base, pf)) as fh:
             c["_policy"] = fh.read()
+        bf = c.get("v1124_policy_file")
+        if bf:
+            with open(bf if os.path.isabs(bf) else os.path.join(base, bf)) as fh:
+                c["_policy_v1124"] = fh.read()
         cases.append(c)
     return cases
 
@@ -145,12 +170,14 @@ def summarize(tab):
     }
 
 
-def fmt_row(name, s):
+def fmt_row(name, s, f):
     t = s["table"]
     return (f"  {name:18s} SAFE: {t['SAFE']['SATISFIED']:3d} SAT {t['SAFE']['UNSATISFIED']:3d} UNSAT "
             f"{t['SAFE']['UNKNOWN']:3d} UNK | UNSAFE: {t['UNSAFE']['SATISFIED']:3d} SAT "
             f"{t['UNSAFE']['UNSATISFIED']:3d} UNSAT {t['UNSAFE']['UNKNOWN']:3d} UNK | "
-            f"clear {100 * s['clear_rate']:5.1f}%  unsafe_satisfied {s['unsafe_satisfied']}")
+            f"clear {100 * s['clear_rate']:5.1f}% (file opens {100 * f['clear_rate']:5.1f}%)  "
+            f"unsafe_satisfied {s['unsafe_satisfied']} (file opens {f['unsafe_satisfied']}; "
+            f"{s.get('unsafe_satisfied_distinct', 0)} distinct)")
 
 
 def main():
@@ -162,17 +189,31 @@ def main():
     a = ap.parse_args()
 
     cases = load_cases(a.corpus, a.base)
-    views = {"v1.13": None, "v1.12-permissive": "permissive", "v1.12-strict": "strict"}
+    views = {"v1.13": None, "v1.12.4 shipped": "v1124",
+             "flags ignored": "permissive", "flag rules dropped": "strict"}
     tabs = {v: table() for v in views}
+    ftabs = {v: table() for v in views}      # file opens only
+    unsafe_sat = {v: set() for v in views}   # distinct UNSAFE actions proved SATISFIED
     details = []
     synthetic = False
     for c in cases:
         synthetic |= c.get("provenance", "").startswith("synthetic")
         for view, mode in views.items():
-            pol = c["_policy"] if mode is None else strip_policy(c["_policy"], mode)
+            if mode is None:
+                pol = c["_policy"]
+            elif mode == "v1124":
+                if "_policy_v1124" not in c:
+                    continue
+                pol = c["_policy_v1124"]
+            else:
+                pol = strip_policy(c["_policy"], mode)
             res = decide(a.vdp, pol, c["actions"])
             for act, r in zip(c["actions"], res):
                 tabs[view][act["truth"]][r["verdict"]] += 1
+                if act["truth"] == "UNSAFE" and r["verdict"] == "SATISFIED":
+                    unsafe_sat[view].add((act["kind"], act["target"], json.dumps(act.get("flags"))))
+                if act["kind"] == "path":
+                    ftabs[view][act["truth"]][r["verdict"]] += 1
                 if view == "v1.13":
                     details.append({"case": c["id"], "label": act["label"], "kind": act["kind"],
                                     "target": act["target"], "flags": act.get("flags"),
@@ -180,15 +221,23 @@ def main():
                                     "why": r["why"], "policy_line": r["line"]})
 
     report = {v: summarize(t) for v, t in tabs.items()}
+    for v in views:
+        report[v]["unsafe_satisfied_distinct"] = len(unsafe_sat[v])
+    freport = {v: summarize(t) for v, t in ftabs.items()}
+    report["file_opens"] = freport
     report["cases"] = len(cases)
     report["actions"] = report["v1.13"]["safe"] + report["v1.13"]["unsafe"]
+    distinct = {(d["kind"], d["target"], json.dumps(d["flags"]), d["truth"]) for d in details}
+    report["distinct_actions"] = len(distinct)
     report["provenance"] = ("synthetic: SAI-authored policies and labels; a regression gate "
                             "and demonstration, not a measured baseline") if synthetic else "as supplied"
 
     print(f"verdict_harness: {report['cases']} cases, {report['actions']} actions "
-          f"[{report['provenance']}]")
+          f"({report['distinct_actions']} distinct) [{report['provenance']}]")
     for v in views:
-        print(fmt_row(v, report[v]))
+        print(fmt_row(v, report[v], freport[v]))
+    print("  note: exec/connect SATISFIED verdicts are still refused at run time "
+          "(deny-only since v1.9.1); file-open figures are the runtime outcome")
     bad = [d for d in details if d["truth"] == "UNSAFE" and d["verdict"] == "SATISFIED"]
     over = [d for d in details if d["truth"] == "SAFE" and d["verdict"] != "SATISFIED"]
     for d in bad:

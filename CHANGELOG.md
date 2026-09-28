@@ -59,36 +59,49 @@ First release of the v1.10 verification program. Every Warden decision is now
 made by an SMT decision procedure (`smt_decide.c`) over a quantifier-free
 fragment of bounded strings (the object) and 32-bit bitvectors (the open flags),
 replacing v1.12's prefix/equality matching. Three-state semantics and the
-symmetric-suppression invariant are unchanged; flag-free policies decide exactly
-as before.
+symmetric-suppression invariant are unchanged; flag-free policies decide as
+before, except that unknown flag bits and access mode 3 are now refused (fail
+closed).
 
 ### Added
 
 - **Open-flag policy clauses** on path rules: `readonly` (= `access=ro -O_CREAT
   -O_TRUNC`), `access=ro|wo|rw`, `+O_NAME`, `-O_NAME`. Through v1.12 a path rule
   admitted every open flag, so "read-only" could not be expressed.
-- **Fragment boundary as soundness obligations:** a string over 4095 bytes, or a
-  flags value with a bit outside the x86_64 `open(2)` set, is UNKNOWN (recorded
-  as `fragment_escape_length` / `fragment_escape_flags`); a symbolic query over
-  more than 16 relevant flag bits is UNKNOWN.
+- **Fragment boundary as soundness obligations:** a string over 4095 bytes, a
+  flags value with a bit outside the x86_64 `open(2)` set, or access mode 3 is
+  UNKNOWN (recorded as `fragment_escape_length` / `fragment_escape_flags`); a
+  query over more than 16 relevant flag bits is UNKNOWN.
+- **Flag clauses constrain the flags passed to `openat()`**, not the
+  descriptor's later state: `readonly` is sound (access mode, `O_TRUNC`,
+  `O_CREAT` are fixed at open), but `fcntl(F_SETFL)` can change `O_APPEND`,
+  `O_NONBLOCK`, `O_ASYNC`, `O_DIRECT`, `O_NOATIME` afterwards, and the kernel
+  forces `O_LARGEFILE`. The Warden and `vdp_check lint` print a note on such
+  clauses.
+- **`require warden <major>.<minor>`** directive: an older Warden refuses the
+  file (v1.12 fails on the unknown verb instead of silently ignoring flag
+  clauses). Control bytes in a constant are refused; non-ASCII bytes get a note.
 - **Load-time analysis:** the Warden decides, for every rule, whether any action
   can reach it first, and warns on each rule that can never fire.
   `tools/vdp_check <policy> lint|analyze|batch` exposes the same procedure.
 - **Symbolic flags in the `--plan` gate:** a planned `file_open` is SATISFIED
   only if every admissible flags value is.
 - **Solver cross-check** (`tools/smt_crosscheck.py`, `make crosscheck`): an
-  independent parser and encoding for an off-the-shelf SMT solver; zero
-  disagreements over 677 checks on every repository policy and 19,199 checks on
-  600 fuzzed policies. Mutation test: 6 of 7 planted bugs caught; the seventh is
-  semantically equivalent in the current atom language.
+  independent parser and encoding for an off-the-shelf SMT solver. Zero
+  disagreements: 954 checks on the 14 repository policies and 25,670 on 600
+  fuzzed policies (seeds 1-3; 398 accepted and 202 rejected by both parsers),
+  including 83 hits of the enumeration bound. Mutation test: 6 of 7 planted
+  bugs caught; the seventh is semantically equivalent in the current atom
+  language.
 - **Verdict-distribution harness** (`tools/verdict_harness.py`, `make harness`,
-  `harness/corpus/`): verdict by ground truth, clear rate, and the
-  `unsafe_satisfied == 0` gate, alongside the two policies v1.12 could have
-  enforced from the same file. Seed corpus (synthetic, SAI-authored): v1.13 88.5%
-  clear with 0 unsafe SATISFIED; v1.12-permissive 88.5% with 28; v1.12-strict
-  42.3% with 0.
+  `harness/corpus/`, `harness/baseline-v1.12.4/`): verdict by ground truth,
+  clear rate, and the `unsafe_satisfied == 0` gate, against the policies as
+  v1.12.4 shipped them. Seed corpus (synthetic, SAI-authored), file opens: v1.13
+  clears 85.4% of safe opens with 0 unsafe SATISFIED; v1.12.4 as shipped 75.6%
+  with 24 (16 distinct).
 - Records gain `policy_line`. `tests/v1130_probe.c`, `tests/test_v1130.sh`,
-  `tests/v1130_policy.txt`, `make test-v1130`. `RELEASE-v1.13.0.md`.
+  `tests/v1130_policy.txt`, `tests/crosscheck_bound_policy.txt`,
+  `make test-v1130`. `RELEASE-v1.13.0.md`.
 
 ### Security
 
@@ -97,10 +110,11 @@ as before.
   `/etc/ld.so.cache`) admitted writes, so the root agent could overwrite
   `libc.so.6`; "(read)" rules (logs, detection rules, SCADA telemetry and
   setpoints, market snapshots, tasking, intelligence products) admitted writes
-  too. They are now `readonly`.
+  too. They are now `readonly`, and each file begins `require warden 1.13`.
 - **Dead rule fixed in four example policies:** `deny path /etc/` preceded
   `allow path /etc/ld.so.cache`, so the loader-cache allow never fired. Found by
-  the new load-time analysis.
+  the new load-time analysis. (Being a prefix rule, the moved allow also
+  admits read-only opens of names beginning `/etc/ld.so.cache`.)
 - **The parser no longer drops rules silently.** v1.12 stopped at 256 rules
   without a word (a 257th deny was ignored) and ignored every token after the
   third. Over 256 rules, an unknown or contradictory flag clause, or a flag
@@ -111,7 +125,8 @@ as before.
 - `run_start` reads `"warden":"1.13.0"`; the policy loads as `v1.13`.
 - `test_v1122.sh` and `test_v1123.sh` compare the Warden version with `sort -V`.
 - Do not load a v1.13 policy into an older Warden: the v1.12 parser ignores flag
-  clauses and admits every flag.
+  clauses and admits every flag. `require warden 1.13` makes it refuse instead.
+- `struct policy` in the Warden is static (about 1 MB; it was on the stack).
 
 ---
 

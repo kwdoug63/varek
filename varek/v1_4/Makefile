@@ -133,9 +133,14 @@ test-v1130: warden tools/vdp_check tests/v1130_probe
 	@sudo ./tests/test_v1130.sh ./warden ./tools/vdp_check $(abspath tests/v1130_probe)
 
 # Differential check of the decision procedure against an SMT solver (Z3).
+# These are exactly the runs RELEASE-v1.13.0.md quotes: every policy in the
+# repository, then 200 fuzzed policies for each of seeds 1, 2 and 3.
 crosscheck: tools/vdp_check
-	@python3 tools/smt_crosscheck.py --vdp tools/vdp_check --fuzz 200 --seed 1010 \
+	@python3 tools/smt_crosscheck.py --vdp tools/vdp_check --queries 60 \
 	    policy.txt conformance_policy.txt policies/*.txt tests/*policy*.txt
+	@for seed in 1 2 3; do \
+	    python3 tools/smt_crosscheck.py --vdp tools/vdp_check --fuzz 200 --seed $$seed --queries 60 || exit 1; \
+	done
 
 # Verdict-distribution harness over the (synthetic) seed corpus.
 harness: tools/vdp_check

@@ -105,6 +105,7 @@ const char *vdp_why_name(vdp_why_t w) {
         case VDP_WHY_UNKNOWN_FLAGS:  return "unknown_flag_bits";
         case VDP_WHY_SYMBOLIC_MIXED: return "symbolic_flags_mixed";
         case VDP_WHY_ENUM_BOUND:     return "enumeration_bound";
+        case VDP_WHY_ACCESS_MODE_3:  return "access_mode_3";
     }
     return "unknown";
 }
@@ -175,6 +176,21 @@ int vdp_policy_load(const char *path, vdp_policy_t *p, char *err, size_t errlen)
             tok[nt++] = t;
         }
         if (nt == 0) continue;
+        if (!strcmp(tok[0], "require")) {
+            int maj = -1, mn = -1;
+            char tail = 0;
+            if (nt != 3 || strcmp(tok[1], "warden") ||
+                sscanf(tok[2], "%d.%d%c", &maj, &mn, &tail) != 2 || maj < 0 || mn < 0) {
+                rc = perr(err, errlen, path, lineno, "bad directive (need: require warden <major>.<minor>)");
+                break;
+            }
+            if (maj > VDP_WARDEN_MAJOR || (maj == VDP_WARDEN_MAJOR && mn > VDP_WARDEN_MINOR)) {
+                rc = perr(err, errlen, path, lineno, "policy requires Warden %d.%d; this is %d.%d",
+                          maj, mn, VDP_WARDEN_MAJOR, VDP_WARDEN_MINOR);
+                break;
+            }
+            continue;
+        }
         if (nt < 3) { rc = perr(err, errlen, path, lineno, "bad rule (need: verb kind constant)"); break; }
         if (p->n >= VDP_MAX_RULES) {
             rc = perr(err, errlen, path, lineno,
@@ -197,6 +213,13 @@ int vdp_policy_load(const char *path, vdp_policy_t *p, char *err, size_t errlen)
         size_t cl = strlen(tok[2]);
         if (cl == 0 || cl > VDP_STR_MAX) {
             rc = perr(err, errlen, path, lineno, "constant length %zu out of range", cl); break;
+        }
+        for (size_t k = 0; k < cl; k++) {
+            unsigned char ch = (unsigned char)tok[2][k];
+            if (ch < 0x20 || ch == 0x7f) {
+                rc = perr(err, errlen, path, lineno, "control byte 0x%02x in constant", ch);
+                goto out;
+            }
         }
         memcpy(r->s.c, tok[2], cl + 1);
         r->s.len = cl;
@@ -281,10 +304,12 @@ struct sym_ctx {
     int outcome;              /* -2 unset, -1 none, else verb */
     int first_rule;
     bool mixed;
+    bool multi_rule;          /* same outcome reached through different rules */
 };
 
 static bool sym_cb(uint32_t f, void *ud) {
     struct sym_ctx *c = ud;
+    if ((f & K_O_ACCMODE) == K_O_ACCMODE) return true;   /* outside the fragment */
     int oc = -1, ri = -1;
     for (size_t k = 0; k < c->n; k++) {
         const vdp_rule_t *r = &c->p->rules[c->cand[k]];
@@ -292,6 +317,7 @@ static bool sym_cb(uint32_t f, void *ud) {
     }
     if (c->outcome == -2) { c->outcome = oc; c->first_rule = ri; }
     else if (c->outcome != oc) { c->mixed = true; return false; }
+    else if (c->first_rule != ri) c->multi_rule = true;
     return true;
 }
 
@@ -309,6 +335,10 @@ vdp_verdict_t vdp_decide(const vdp_policy_t *p, vdp_kind_t kind, const char *s,
     bool ground = (kind != VDP_KIND_PATH) || has_flags;
     if (kind == VDP_KIND_PATH && has_flags && (flags & ~VDP_KNOWN_OFLAGS)) {
         *why = VDP_WHY_UNKNOWN_FLAGS;
+        return VDP_UNKNOWN;
+    }
+    if (kind == VDP_KIND_PATH && has_flags && (flags & K_O_ACCMODE) == K_O_ACCMODE) {
+        *why = VDP_WHY_ACCESS_MODE_3;
         return VDP_UNKNOWN;
     }
     if (kind != VDP_KIND_PATH) flags = 0;   /* non-path rules carry no bv atom */
@@ -345,7 +375,7 @@ vdp_verdict_t vdp_decide(const vdp_policy_t *p, vdp_kind_t kind, const char *s,
     enum_subsets(bits, sym_cb, &c);
     if (c.mixed) { *why = VDP_WHY_SYMBOLIC_MIXED; return VDP_UNKNOWN; }
     if (c.outcome < 0) { *why = VDP_WHY_NO_RULE; return VDP_UNKNOWN; }
-    *rule_index = c.first_rule;
+    *rule_index = c.multi_rule ? -1 : c.first_rule;   /* -1: several rules agree */
     *why = VDP_WHY_RULE;
     return c.outcome == (int)VDP_ALLOW ? VDP_SATISFIED : VDP_UNSATISFIED;
 }
@@ -435,7 +465,7 @@ static int bv_first_possible(const vdp_policy_t *p, size_t i, const int *J, size
     uint32_t sub = 0;
     for (;;) {
         uint32_t f = bi->value | sub;
-        bool ok = true;
+        bool ok = (f & K_O_ACCMODE) != K_O_ACCMODE;       /* in the fragment */
         for (size_t k = 0; k < nj && ok; k++)
             if (bv_holds(&p->rules[J[k]].b, f)) ok = false;
         if (ok) return 1;
@@ -507,4 +537,40 @@ vdp_reach_t vdp_rule_reachable(const vdp_policy_t *p, size_t i) {
     dset_free(&D);
     dset_free(&W);
     return res;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Advisories                                                                */
+/* ------------------------------------------------------------------------ */
+
+#define K_FCNTL_MUTABLE (K_O_APPEND | K_O_NONBLOCK | K_FASYNC | K_O_DIRECT | K_O_NOATIME)
+
+size_t vdp_rule_advisory(const vdp_rule_t *r, char *buf, size_t n) {
+    if (!n) return 0;
+    buf[0] = '\0';
+    size_t w = 0;
+#define ADD(...) do { int k_ = snprintf(buf + w, n - w, __VA_ARGS__); \
+                      if (k_ > 0) w = (w + (size_t)k_ < n) ? w + (size_t)k_ : n - 1; } while (0)
+    uint32_t m = r->b.mask;
+    if (m & K_FCNTL_MUTABLE) {
+        ADD("%sclause on", w ? "; " : "");
+        for (size_t i = 0; i < sizeof kFlagNames / sizeof kFlagNames[0]; i++)
+            if (m & K_FCNTL_MUTABLE & kFlagNames[i].bit) ADD(" %s", kFlagNames[i].name);
+        ADD(" constrains only the open() call: fcntl(F_SETFL) can change it afterwards");
+    }
+    if (m & K_O_LARGEFILE)
+        ADD("%sO_LARGEFILE is set by the kernel on every 64-bit open; the clause "
+            "constrains only what the agent passes", w ? "; " : "");
+    if (m & (K_O_DSYNC | K___O_SYNC))
+        ADD("%sclauses on O_DSYNC/O_SYNC constrain the flags as passed; the kernel "
+            "adds O_DSYNC to an open that sets the O_SYNC bit alone", w ? "; " : "");
+    for (size_t i = 0; i < r->s.len; i++) {
+        if ((unsigned char)r->s.c[i] >= 0x80) {
+            ADD("%sconstant contains non-ASCII bytes: check it is not a mistyped "
+                "space or other invisible character", w ? "; " : "");
+            break;
+        }
+    }
+#undef ADD
+    return w;
 }
