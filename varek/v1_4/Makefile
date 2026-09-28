@@ -25,7 +25,7 @@ CFLAGS    += -I$(V1_7_DIR)
 
 BINS := warden target_demo bench_target
 
-.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 video-v112
+.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 video-v112
 
 all: $(BINS)
 
@@ -78,6 +78,15 @@ tests/v112_probe: tests/v112_probe.c
 test-v112: warden tests/v112_probe
 	@sudo ./tests/test_v112.sh ./warden tests/v112_policy.txt $(abspath tests/v112_probe)
 
+# v1.12.1 regression: denied opens have no side effect, the verdict stream is
+# authenticated (relayed agent stderr, run id, seq, framing; the exporter
+# refuses forged or foreign records), and inbound networking is refused.
+tests/v1121_probe: tests/v1121_probe.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $<
+
+test-v1121: warden tests/v1121_probe
+	@sudo ./tests/test_v1121.sh ./warden tests/v1121_policy.txt $(abspath tests/v1121_probe) tools/varek_cyclonedx.py
+
 # v1.12 before/after demo, video-capture friendly (see v112_video.sh header).
 # Builds the pre-fix Warden from the v1.9.3 tag and runs the same adversarial
 # agent under both; every verdict on screen is read from the live Warden.
@@ -97,4 +106,4 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe

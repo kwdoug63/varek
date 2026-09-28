@@ -85,7 +85,7 @@ import json, sys
 ok = True
 for ln in open(sys.argv[1]):
     ln = ln.strip()
-    if not ln or ln.startswith('[warden'):  # human status lines
+    if not ln.startswith('{'):  # human status lines, relayed [agent] output
         continue
     try:
         json.loads(ln)

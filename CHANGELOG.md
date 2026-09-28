@@ -48,6 +48,73 @@ this section is present in a released tag; it is stated as direction.
 
 ---
 
+## [1.12.1] - 2026-09-28
+
+v1.12.1 fixes three defects found in v1.12.0: a denied file open could still
+change the filesystem, the supervised agent could forge verdict records, and
+inbound networking was left open. No verdict *semantics* change.
+
+### Security
+
+- **A DENY has no side effect.** v1.12.0 resolved a file open by opening the
+  object with the agent's own flags, as root, *before* the policy decision. A
+  denied `O_TRUNC` still emptied the file, a denied `O_CREAT` still created a
+  root-owned file, and a blocking open (a FIFO with no peer) wedged the
+  single-threaded Warden. The object is now pinned with an `O_PATH` descriptor
+  (which opens nothing), the decision is made on its canonical path, and only
+  after ALLOW is it opened with the agent's flags through the pinned descriptor,
+  so the decided object is still the delivered one. `O_CREAT` of a new name pins
+  the parent directory and decides on `<canonical parent>/<name>`; the file is
+  created with `openat(parent, name, O_NOFOLLOW)` under the agent's umask.
+- **Authenticated verdict stream.** The agent shared the Warden's stderr, so it
+  could write a complete, well-formed record ("ALLOW /etc/shadow") that the
+  CycloneDX exporter then listed as authorized. The agent's stderr is now a pipe
+  the Warden relays with an `[agent] ` prefix (control bytes escaped). Records are
+  written through a private close-on-exec descriptor, one `write()` per record,
+  and carry a per-run id and a contiguous `seq`; `run_start`/`run_end` records
+  frame the stream. `varek_cyclonedx.py` refuses a stream with a foreign run id,
+  a `seq` gap or repeat, or no `run_end` (unless `--allow-incomplete`).
+- **Inbound networking refused.** `bind`, `listen`, `accept` and `accept4` were
+  admitted, so a root agent could open a listener or an abstract unix socket the
+  host could reach. They now fall to the default EPERM, and the agent runs in its
+  own network namespace (loopback only, down). Required with the PID namespace;
+  a warning under `VAREK_WARDEN_NO_PIDNS=1`.
+
+### Changed
+
+- FIFOs: opening one for writing when no reader exists returns `ENXIO` instead
+  of waiting, and opening one for reading when no writer exists returns at once
+  (the Warden opens with `O_NONBLOCK`, then clears it).
+- `O_TMPFILE` is decided on the directory it names and gets the agent's mode and
+  umask (v1.12.0 gave mode 0000). Naming an allowed directory itself is denied
+  when the rule has a trailing slash, as for any open of that directory.
+- An ALLOW whose open then fails (`EEXIST`, `ENXIO`, ...) returns that errno to
+  the agent. Records gain `run`, `seq` and `errno` fields, and `kernel_verdict`
+  reads `ERRNO` in that case.
+- The agent's stderr appears in the Warden's output prefixed `[agent] `.
+- The status line reports `netns=on|off`.
+- `varek_cyclonedx.py` refuses v1.12.0 logs (they carry no run id, so their
+  records could have been forged). The BOM gains `varek:run.id` and
+  `varek:run.complete`.
+- `bench_summarize.py` and `bench_histogram.py` read only lines that begin with
+  `{`.
+
+### Added
+
+- `varek/v1_4/tests/v1121_probe.c`, `tests/test_v1121.sh`,
+  `tests/v1121_policy.txt`; `make test-v1121`. Fails against v1.12.0 (the denied
+  file is truncated, a file appears in the denied directory, and the Warden hangs
+  on the FIFO).
+- `RELEASE-v1.12.1.md`.
+
+### Fixed
+
+- `docs/security/bypass-classes.md`: class 3 records inbound networking (closed
+  in v1.12.1); the resolve-then-decide and audit-log-integrity sections describe
+  the v1.12.0 defects and their fixes.
+
+---
+
 ## [1.12.0] - 2026-09-17
 
 v1.12 is a mediation-correctness release. It closes five ways a process under

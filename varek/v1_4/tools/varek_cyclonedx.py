@@ -43,8 +43,9 @@ Usage:
         [--output bom.json] [--serial urn:uuid:...]
 
 Reads the log from --log or stdin. Writes the BOM to --output or stdout.
-Exit status is non-zero only on malformed input, never on the presence of
-refusals (a run full of denials is a valid, well-formed authorization record).
+Exit status is non-zero when the stream cannot be authenticated (see
+_parse_log), never on the presence of refusals (a run full of denials is a
+valid, well-formed authorization record).
 """
 
 import argparse
@@ -53,7 +54,7 @@ import json
 import sys
 import uuid
 
-VAREK_VERSION = "1.12.0"
+VAREK_VERSION = "1.12.1"
 SPEC_VERSION = "1.6"
 
 # The provisional patents, as recorded in the runtime's own documentation.
@@ -64,23 +65,85 @@ PATENTS = [
 ]
 
 
-def _parse_log(stream):
-    """Yield pathology records from a Warden log stream, skipping human status
-    lines (those beginning with '[warden')."""
+class StreamError(SystemExit):
+    pass
+
+
+def _parse_log(stream, allow_incomplete=False):
+    """Read a Warden verdict stream and return (run, records, complete).
+
+    v1.12.1 streams are authenticated, and this refuses any stream it cannot
+    authenticate (a refusal is a non-zero exit with the reason):
+
+      * Only lines that START with '{' are records. Everything else is a human
+        status line ("[warden] ...") or the agent's relayed stderr
+        ("[agent] ..."), which the Warden prefixes so no agent byte can begin a
+        line. Lines are split on '\n' only (never on '\r').
+      * The first record is run_start, carrying a per-run id the agent never
+        sees. Every decision record must carry that id and a seq that counts
+        up from 0 with no gap or repeat. A record with any other id is foreign
+        (for example the agent's stdout merged in with 2>&1) and the stream is
+        refused.
+      * run_end closes the stream and states the record count. A stream with
+        no run_end is incomplete (the Warden was killed, or the log was cut)
+        and is refused unless allow_incomplete is set.
+
+    v1.12.0 and older logs have no run id and are refused: their records
+    could be forged by the supervised agent."""
+    name = getattr(stream, "name", "<stdin>")
+
+    def fail(lineno, why):
+        raise StreamError(f"varek_cyclonedx: {name}:{lineno}: {why} "
+                          f"Refusing to emit a BOM.")
+
+    run = None
     records = []
+    ended = None
     for lineno, raw in enumerate(stream, 1):
-        line = raw.strip()
-        if not line or line.startswith("[warden"):
+        if not raw.startswith("{"):
             continue
         try:
-            rec = json.loads(line)
+            rec = json.loads(raw)
         except json.JSONDecodeError as e:
-            raise SystemExit(f"varek_cyclonedx: {getattr(stream,'name','<stdin>')}:{lineno}: "
-                             f"not valid JSON ({e}). A malformed verdict stream cannot be "
-                             f"attested; refusing to emit a BOM.")
-        if isinstance(rec, dict) and "decision_final" in rec:
-            records.append(rec)
-    return records
+            fail(lineno, f"record is not valid JSON ({e}).")
+        if not isinstance(rec, dict):
+            fail(lineno, "record is not a JSON object.")
+        event = rec.get("event")
+        if event == "run_start":
+            if run is not None:
+                fail(lineno, "second run_start in one stream.")
+            run = rec.get("run")
+            if not isinstance(run, str) or len(run) != 32:
+                fail(lineno, "run_start has no valid run id.")
+            continue
+        if "decision_final" not in rec and event != "run_end":
+            continue   # e.g. a pre-launch plan record; carries no authorization
+        if run is None:
+            fail(lineno, "record before run_start (a pre-v1.12.1 log, or not a "
+                         "Warden stream); its records cannot be authenticated.")
+        if ended is not None:
+            fail(lineno, "record after run_end.")
+        if rec.get("run") != run:
+            fail(lineno, "foreign record: its run id does not match this run's "
+                         "run_start (it was not written by this Warden run).")
+        if event == "run_end":
+            if rec.get("records") != len(records):
+                fail(lineno, f"run_end counts {rec.get('records')} records, the "
+                             f"stream holds {len(records)}.")
+            ended = rec
+            continue
+        if rec.get("seq") != len(records):
+            fail(lineno, f"seq {rec.get('seq')} where {len(records)} was expected "
+                         f"(a record is missing, repeated or foreign).")
+        records.append(rec)
+
+    if run is None:
+        fail(0, "no run_start record: not a v1.12.1+ Warden stream.")
+    if ended is None and not allow_incomplete:
+        fail(0, "no run_end record: the stream is incomplete (the Warden did "
+                "not finish, or the log was cut). Use --allow-incomplete to "
+                "attest the part that is present.")
+    return run, records, ended is not None
 
 
 def _ts(records):
@@ -95,7 +158,7 @@ def _ts(records):
     return fmt(start), fmt(end)
 
 
-def build_bom(records, agent, policy, serial):
+def build_bom(records, agent, policy, serial, run_id="", complete=True):
     now = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     run_start, run_end = _ts(records)
 
@@ -137,6 +200,8 @@ def build_bom(records, agent, policy, serial):
         "description": "Autonomous agent run supervised under VAREK Authorization-Before-Execution.",
         "properties": [
             {"name": "varek:policy", "value": policy},
+            {"name": "varek:run.id", "value": run_id},
+            {"name": "varek:run.complete", "value": "true" if complete else "false"},
             {"name": "varek:run.start", "value": run_start},
             {"name": "varek:run.end", "value": run_end},
             {"name": "varek:decisions.total", "value": str(len(records))},
@@ -220,15 +285,21 @@ def main(argv=None):
     ap.add_argument("--policy", default="policy.txt", help="policy identity for the run")
     ap.add_argument("--output", help="output BOM path (default: stdout)")
     ap.add_argument("--serial", help="BOM serialNumber (default: a fresh urn:uuid)")
+    ap.add_argument("--allow-incomplete", action="store_true",
+                    help="attest a stream with no run_end record (marked run.complete=false)")
     args = ap.parse_args(argv)
 
-    stream = open(args.log) if args.log else sys.stdin
-    records = _parse_log(stream)
+    # Split on '\n' only, so a '\r' the agent wrote cannot start a new line.
     if args.log:
-        stream.close()
+        stream = open(args.log, encoding="utf-8", errors="surrogateescape", newline="\n")
+    else:
+        stream = open(sys.stdin.fileno(), encoding="utf-8", errors="surrogateescape",
+                      newline="\n", closefd=False)
+    run_id, records, complete = _parse_log(stream, args.allow_incomplete)
+    stream.close()
 
     serial = args.serial or f"urn:uuid:{uuid.uuid4()}"
-    bom = build_bom(records, args.agent, args.policy, serial)
+    bom = build_bom(records, args.agent, args.policy, serial, run_id, complete)
 
     out = json.dumps(bom, indent=2)
     if args.output:
