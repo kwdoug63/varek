@@ -25,7 +25,7 @@ CFLAGS    += -I$(V1_7_DIR)
 
 BINS := warden target_demo bench_target
 
-.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 video-v112
+.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 video-v112
 
 all: $(BINS)
 
@@ -87,6 +87,19 @@ tests/v1121_probe: tests/v1121_probe.c
 test-v1121: warden tests/v1121_probe
 	@sudo ./tests/test_v1121.sh ./warden tests/v1121_policy.txt $(abspath tests/v1121_probe) tools/varek_cyclonedx.py
 
+# v1.12.2 regression: threads (clone3 answers ENOSYS so libc falls back to the
+# inspectable clone), wait4/waitid, the narrow ioctl allowlist, and the kill
+# report. Runs the filter unit test first, then the probe under the Warden.
+tests/v1122_probe: tests/v1122_probe.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -static -pthread -o $@ $<
+
+tests/test_v14_filter: tests/test_v14_filter.c warden_baseline_filter.c
+	$(CC) $(CFLAGS) -I. $(LDFLAGS) -pthread -o $@ $^ $(LDLIBS)
+
+test-v1122: warden tests/v1122_probe tests/test_v14_filter
+	@sudo ./tests/test_v14_filter
+	@sudo ./tests/test_v1122.sh ./warden tests/v1122_policy.txt $(abspath tests/v1122_probe) tools/varek_cyclonedx.py
+
 # v1.12 before/after demo, video-capture friendly (see v112_video.sh header).
 # Builds the pre-fix Warden from the v1.9.3 tag and runs the same adversarial
 # agent under both; every verdict on screen is read from the live Warden.
@@ -106,4 +119,4 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/test_v14_filter

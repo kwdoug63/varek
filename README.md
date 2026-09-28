@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.12.1-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.12.2-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -30,7 +30,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.12.1.**
+   **Current release: v1.12.2.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -82,6 +82,7 @@ The runtime line has progressed well beyond simple syscall containment:
   human-out-of-the-loop operation per policy: for every non-authorizing verdict,
   a deterministic, automated terminal outcome is reachable in finitely many steps.
   "Never requires a human" becomes certified rather than hoped.
+- **v1.12.2 — threads and child processes.** Agent code can now start threads, wait for its children and call `isatty()`. `clone3` answers `ENOSYS` instead of killing the process (glibc >= 2.34 creates every thread with it), so libc falls back to `clone()`, whose flags the filter checks; `clone3` still never runs and the namespace denials are unchanged. `wait4`/`waitid` are admitted, and `ioctl` is admitted for six read-or-own-descriptor requests (`TIOCSTI` and the rest stay refused). A filter-killed agent is now reported. Also closes an exec-allowlist bypass: the launch exec, answered with `CONTINUE`, was granted once per pid, so a thread could race its path; it is now granted once per run. Adds `make test-v1122`. Known issue: dynamically linked agents cannot yet load their libraries (symlinked paths are refused since v1.12.0); planned for v1.12.3. See [`RELEASE-v1.12.2.md`](./RELEASE-v1.12.2.md).
 - **v1.12.1 — mediation-correctness follow-up.** Fixes three defects found in v1.12.0. A denied file open no longer has side effects: the Warden pins the object with `O_PATH`, decides, and only after ALLOW opens it with the agent's flags (v1.12.0 opened first, so a DENY could still truncate or create a file, and a FIFO could wedge the supervisor). The verdict stream is authenticated: the agent's stderr is relayed with an `[agent] ` prefix, every record carries a per-run id and a contiguous `seq`, and `varek_cyclonedx.py` refuses a stream holding a forged, missing or foreign record. Inbound networking is refused: `bind`/`listen`/`accept` are denied and the agent runs in its own network namespace. Adds `make test-v1121`. No verdict-semantics change. See [`RELEASE-v1.12.1.md`](./RELEASE-v1.12.1.md).
 - **v1.12.0 — mediation correctness.** Closes five ways a supervised process could reach a denied object or corrupt the authorization record: `..` traversal and symlink/`/proc/self` escapes (the Warden now resolves the object once, decides policy on its canonical path, and injects that same fd — resolve-then-decide); audit-log forgery via a crafted pathname (all agent-controlled strings are JSON-escaped, records gain a `resolved` field); and datagram egress via `sendto`/`sendmsg` that bypassed the deny-only `connect` posture (both are now mediated as `net.send`). Adds a tool that exports authorization evidence in the CycloneDX 1.6 format (`tools/varek_cyclonedx.py`) and a `make test-v112` regression suite. No verdict-semantics change; v1.10/v1.11 remain reserved for the verification program below. See [`RELEASE-v1.12.0.md`](./RELEASE-v1.12.0.md).
 - **v1.9.3 — lifecycle coupling in the live Warden.** If the supervisor stops, the agent stops, and so does everything it started: the agent runs in its own PID namespace and is killed on supervisor death, with a fork-race guard and a pidfd watch. The Warden now requires `CAP_SYS_ADMIN` and checks for it at startup. A crash test kills a live Warden and asserts no agent process survives. Also corrects the v1.9.2 record (bypass class 7 was partial at v1.9.2) and fixes conformance-target setup. See [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md).
@@ -96,7 +97,7 @@ The runtime line has progressed well beyond simple syscall containment:
   are deny-only (fail closed) pending the v1.10 dial-and-inject path. See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.12.1 history.
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.12.2 history.
 
 ### Installation
 
@@ -334,6 +335,8 @@ different risks at different points in the stack.
 - [x] **v1.9.3** — Lifecycle coupling in the live Warden: PID-namespace isolation, death-signal coupling, fork-race guard, pidfd watch; crash test
 - [x] **v1.12** — Mediation correctness: resolve-then-decide (traversal / symlink / `/proc/self`), audit-log integrity, datagram-egress mediation; authorization-evidence export in the CycloneDX 1.6 format
 - [x] **v1.12.1** — Side-effect-free denials (resolve, decide, then open), authenticated verdict stream, inbound networking refused
+- [x] **v1.12.2** — Threads and child processes: `clone3` answers `ENOSYS` (libc falls back to the filtered `clone`), `wait4`/`waitid`, narrow `ioctl` allowlist, kill report; bootstrap exec granted once per run
+- [ ] **v1.12.3 (next)** — Dynamically linked agents: follow symlinks during resolution without letting `/proc/self` resolve to the Warden
 - [ ] **v1.10 (planned)** — The UNKNOWN-shrinking program (below)
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
 

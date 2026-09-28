@@ -709,7 +709,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     log_line_start();
-    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.12.1\","
+    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.12.2\","
                    "\"policy_path\":\"", g_run_id);
     json_escape(g_log, policy_path);
     fprintf(g_log, "\",\"policy_rules\":%zu,\"timestamp_ns\":%lld}\n",
@@ -1044,9 +1044,14 @@ static int inject_fd(int notify_fd, uint64_t id, int resolved)
 static volatile sig_atomic_t g_stop = 0;
 static void on_term(int sig) { (void)sig; g_stop = 1; }
 
-static void supervise(int notify_fd, int target_pidfd, int agent_err_fd,
-                      const struct policy *p, const char *bootstrap_path) {
+/* Returns true when the agent went away on its own (its pidfd fired, or no
+ * task is left under the filter), false when the Warden stopped supervising for
+ * another reason and is about to kill it. */
+static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
+                      const struct policy *p, const char *bootstrap_path,
+                      pid_t bootstrap_pid) {
     uint64_t seq = 0;
+    bool bootstrap_done = false;
     while (!g_stop) {
         /* v1.9.3: wait on the listener AND the target's pidfd. Blocking in
          * NOTIF_RECV alone can hang forever if the target exits between the
@@ -1061,15 +1066,15 @@ static void supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         int pr = poll(pfds, 3, -1);
         if (pr < 0) {
             if (errno == EINTR) continue;
-            return;
+            return false;
         }
         if (agent_err_fd >= 0 && (pfds[2].revents & (POLLIN | POLLHUP | POLLERR))) {
             if (relay_agent_stderr(agent_err_fd, false) < 0) agent_err_fd = -1;
         }
         if (target_pidfd >= 0 && (pfds[1].revents & POLLIN))
-            return;                       /* target exited */
+            return true;                        /* target exited */
         if (pfds[0].revents & (POLLHUP | POLLERR | POLLNVAL))
-            return;                       /* no process left under the filter */
+            return true;                        /* no process left under the filter */
         if (!(pfds[0].revents & POLLIN))
             continue;
 
@@ -1077,7 +1082,7 @@ static void supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         memset(&req, 0, sizeof(req));
         if (ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_RECV, &req) < 0) {
             if (errno == EINTR || errno == ENOENT) continue;  /* ENOENT: requester died */
-            return;
+            return false;
         }
 
         struct timespec t0, t1;
@@ -1098,13 +1103,25 @@ static void supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         }
 
         /* Bootstrap launch: the target's own first execve of the operator-
-         * specified binary is authorized by the act of launching it. Allowed
-         * exactly once per pid, before the target runs any code (no TOCTOU on
-         * the path: single-threaded, blocked in execve). Later execs fall
-         * through to the deny-only block below. */
-        if (act.kind == ACT_PROCESS_EXEC && ctx && !ctx->launched &&
+         * specified binary is authorized by the act of launching it, and is
+         * answered with CONTINUE. That is sound only while nothing else can
+         * touch the path buffer: the launching process, before it has run any
+         * agent code, single-threaded, blocked in execve.
+         *
+         * v1.12.2: allowed exactly ONCE per run, and only to the process the
+         * Warden launched. Through v1.12.1 it was allowed once per pid, so any
+         * thread or child the agent started could execve the bootstrap path
+         * and get CONTINUE while a sibling sharing its memory rewrote the path
+         * between the Warden's read and the kernel's, executing a binary the
+         * policy never allowed. Raw clone(CLONE_VM) made that reachable
+         * before; with threads admitted it would be routine. Every later exec,
+         * including a re-exec of the agent's own binary, falls through to the
+         * deny-only block below. */
+        if (act.kind == ACT_PROCESS_EXEC && !bootstrap_done &&
+            (pid_t)req.pid == bootstrap_pid &&
             bootstrap_path && strcmp(act.target, bootstrap_path) == 0) {
-            ctx->launched = true;
+            bootstrap_done = true;
+            if (ctx) ctx->launched = true;
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat_b = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                            + (t1.tv_nsec - t0.tv_nsec);
@@ -1195,6 +1212,7 @@ static void supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                        d_raw == DEC_UNKNOWN ? "default_deny_unknown" : "policy_match",
                        lat, d_final == DEC_ALLOW ? 0 : EACCES);
     }
+    return false;                         /* the Warden was asked to stop */
 }
 
 /* v1.9.3: stop the agent and everything it started. With a PID namespace,
@@ -1485,7 +1503,8 @@ int main(int argc, char **argv) {
         "[warden] supervising pid=%d  notify_fd=%d  policy=%s (%zu rules)  pidns=%s  netns=%s\n",
         target, notify_fd, p.name, p.n_rules, pidns ? "on" : "off", netns);
 
-    supervise(notify_fd, target_pidfd, agent_err_fd, &p, target_argv[0]);
+    bool agent_ended = supervise(notify_fd, target_pidfd, agent_err_fd, &p,
+                                 target_argv[0], target);
 
     kill_target_tree(target);  /* the agent and everything it spawned */
     int status = 0;
@@ -1494,6 +1513,15 @@ int main(int argc, char **argv) {
     (void)relay_agent_stderr(agent_err_fd, true);
     close(agent_err_fd);
     int rc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    /* v1.12.2: say when the agent died by a signal. Through v1.12.1 an agent
+     * killed by the filter (SIGSYS) left only an exit code of 1, which is how a
+     * thread-starting agent could be killed on every run without a word. Only
+     * when the agent ended on its own: otherwise the SIGKILL is the Warden's. */
+    if (agent_ended && WIFSIGNALED(status))
+        fprintf(stderr, "[warden] agent killed by signal %d (%s)%s\n",
+                WTERMSIG(status), strsignal(WTERMSIG(status)),
+                WTERMSIG(status) == SIGSYS
+                    ? ": most likely a hard-denied system call" : "");
     emit_run_end(rc);
     close(target_pidfd);
     close(notify_fd);
