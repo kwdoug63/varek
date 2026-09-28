@@ -25,7 +25,7 @@ CFLAGS    += -I$(V1_7_DIR)
 
 BINS := warden target_demo bench_target tools/vdp_check
 
-.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 crosscheck harness video-v112
+.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -132,14 +132,25 @@ tests/v1130_probe: tests/v1130_probe.c
 test-v1130: warden tools/vdp_check tests/v1130_probe
 	@sudo ./tests/test_v1130.sh ./warden ./tools/vdp_check $(abspath tests/v1130_probe)
 
-# Differential check of the decision procedure against an SMT solver (Z3).
-# These are exactly the runs RELEASE-v1.13.0.md quotes: every policy in the
-# repository, then 200 fuzzed policies for each of seeds 1, 2 and 3.
+# v1.14: the bounded string fragment (exact / prefix / suffix / contains / glob
+# matchers). Enforcement under a live Warden (on resolved paths, through a
+# symlink), load-time analysis by the automaton search, parser refusals and
+# v1.13 compatibility, the --plan gate, the cross-check and the harness gate.
+tests/v1140_probe: tests/v1140_probe.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $<
+
+test-v1140: warden tools/vdp_check tests/v1140_probe
+	@sudo ./tests/test_v1140.sh ./warden ./tools/vdp_check $(abspath tests/v1140_probe)
+
+# Differential check of the decision procedure against an SMT solver (Z3) and,
+# for suffix / contains / glob reachability, a derivative-based oracle. These
+# are exactly the runs RELEASE-v1.14.0.md quotes: every policy in the
+# repository, then 300 fuzzed policies for each of seeds 1, 2 and 3.
 crosscheck: tools/vdp_check
 	@python3 tools/smt_crosscheck.py --vdp tools/vdp_check --queries 60 \
 	    policy.txt conformance_policy.txt policies/*.txt tests/*policy*.txt
 	@for seed in 1 2 3; do \
-	    python3 tools/smt_crosscheck.py --vdp tools/vdp_check --fuzz 200 --seed $$seed --queries 60 || exit 1; \
+	    python3 tools/smt_crosscheck.py --vdp tools/vdp_check --fuzz 300 --seed $$seed --queries 60 || exit 1; \
 	done
 
 # Verdict-distribution harness over the (synthetic) seed corpus.
@@ -165,4 +176,4 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/test_v14_filter
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/test_v14_filter

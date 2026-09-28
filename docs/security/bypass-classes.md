@@ -90,6 +90,16 @@ inode, or a trailing symlink opened `O_NOFOLLOW`) is a hard deny before any
 policy match, and a procfs object outside the agent's own `/proc/<tgid>` fails
 closed.
 
+**v1.14: name matchers decide on the same canonical path.** `suffix`,
+`contains` and `glob` rules (v1.14) are matched on the canonical path read back
+from the pinned fd, like every path rule, so a symlink with an innocent name is
+decided by its target's name. They judge a *name*, not a file's identity: a hard
+link that already exists under another name is decided by that name. While the
+Warden enforces, the agent cannot create one — `rename*`, `link*` and
+`symlink*` are outside the default-deny allowlist — but in observe mode
+(`VAREK_WARDEN_OBSERVE=1`) those syscalls are only logged, so name matchers are
+not a boundary there. Matching is byte-wise and case-sensitive.
+
 **v1.12.1: resolve, decide, then open.** v1.12.0 performed that single
 resolution as a real open with the agent's own flags, before the decision. A
 denied open therefore still had effects: `O_TRUNC` emptied a denied file,

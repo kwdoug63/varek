@@ -124,34 +124,74 @@ which is suppressed.
 
 ```
 require warden <major>.<minor>      (v1.13: an older Warden refuses the file)
-<verb> <kind> <match> [flag-clause ...]
-  verb  := allow | deny
-  kind  := path | host | exec
-  match := prefix string (path), "host:port" or "host" (host),
-          absolute path (exec)
+<verb> <kind> [matcher] <constant> [flag-clause ...]
+  verb     := allow | deny
+  kind     := path | host | exec
+  matcher  (path and exec only, v1.14):
+          exact                    the whole string equals the constant
+          prefix                   starts with it (the default for path)
+          suffix                   ends with it
+          contains                 contains it
+          glob                     matches the glob (below), anchored
+  constant := without a matcher: a prefix (path), "host:port" or "host"
+          (host), an absolute path (exec)
   flag-clause (path only, v1.13):
           readonly                 access=ro -O_CREAT -O_TRUNC
           access=ro|wo|rw          the O_ACCMODE bits only
           +O_NAME | -O_NAME        bit must be set | clear
 ```
 
+Glob syntax (v1.14), matched against the whole resolved path:
+
+| Pattern | Matches |
+|---|---|
+| `?` | one byte other than `/` |
+| `[abc]`, `[a-z]`, `[!a]` / `[^a]` | one byte from the set; never `/` (a `/` inside is refused) |
+| `*` | zero or more bytes, none of them `/` |
+| `**` | zero or more bytes of any value |
+| `/**/` | a `/`, then zero or more whole segments: `/a/**/b` matches `/a/b` and `/a/x/y/b` |
+| `\x` | the byte `x` literally |
+
+At most 32 wildcards per glob; `***` is refused. Matching is byte-wise and
+case-sensitive (`suffix .pem` does not match `KEY.PEM`; write `glob
+**.[pP][eE][mM]`). A keyword is read as a matcher only when a constant
+follows it that is not itself a flag clause, so every v1.13 policy keeps its
+meaning.
+
+```
+require warden 1.14
+deny  path suffix .pem                              # key material under any allowed tree
+deny  path glob /**/.env                            # dotenv files at any depth
+deny  path glob /var/lib/ehr/records/*/psychotherapy/**
+allow path exact /etc/hosts readonly                # this file, not /etc/hosts.allow
+allow path /var/lib/ehr/records/
+```
+
 Every rule is decided by the SMT decision procedure in `smt_decide.c`
 (v1.13). A path rule is matched on the resolved canonical path, so name
 canonical prefixes (`/usr/lib/`, not `/lib/`) and end directory prefixes
-with `/`. `access=ro` alone is not read-only on Linux (`O_RDONLY|O_TRUNC`
+with `/`. Matchers judge that path's name, not the file's identity: a
+pre-existing hard link under another name is decided by its own name. When
+the Warden enforces, the agent itself cannot create links or rename files
+(those syscalls are refused); in observe mode (`VAREK_WARDEN_OBSERVE=1`)
+they are only logged, so name matchers are not a boundary there. `access=ro` alone is not read-only on Linux (`O_RDONLY|O_TRUNC`
 truncates, `O_RDONLY|O_CREAT` creates); use `readonly`. A clause
 constrains the flags passed to `openat()`: `readonly` is sound, but
 `fcntl(F_SETFL)` can change `O_APPEND`, `O_NONBLOCK`, `O_ASYNC`,
 `O_DIRECT` and `O_NOATIME` afterwards (the Warden notes such clauses).
 Access mode 3 and unknown flag bits are refused. More than 256 rules,
-an unknown or contradictory clause, a control byte in a constant, or an
-unmet `require` is a load error. Start a policy that uses flag clauses
-with `require warden 1.13`: a v1.12 Warden would silently ignore them.
+an unknown or contradictory clause, a malformed glob, a matcher on a host
+rule, a control byte in a constant, or an unmet `require` is a load error.
+Start a policy that uses flag clauses with `require warden 1.13` (a v1.12
+Warden would silently ignore them), and one that uses matchers with
+`require warden 1.14`.
 
 Lines beginning with `#` are comments, and `#` also starts a trailing
 comment. See `policy.txt` and `policies/` for examples, and check a policy
 with `tools/vdp_check <policy> lint`, which reports every rule that can
-never fire.
+never fire (v1.14: `vdp_check <policy> analyze` also prints, for every
+reachable rule, a shortest path and flags value on which it is the first
+rule to hold).
 
 ## Threat model
 

@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.13.0-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.14.0-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -16,7 +16,7 @@ VAREK decides whether an AI agent's planned actions are allowed **before** they
 execute, and enforces that decision at the kernel boundary.
 
 An agent's intended actions are represented as an **action-graph** — a directed
-acyclic graph of planned actions. An **SMT decision procedure** evaluates that graph against a policy. In the Warden it is a purpose-built procedure for a decidable fragment — bounded strings for the object, bitvectors for the open flags — that decides in microseconds with bounded worst case, is cross-checked against an off-the-shelf SMT solver, and returns UNKNOWN for anything outside its fragment rather than guessing. Every verdict is one of three — **SATISFIED**, **UNSATISFIED**, or **UNKNOWN** — and it fails closed. The **Warden** runtime carries that verdict to
+acyclic graph of planned actions. An **SMT decision procedure** evaluates that graph against a policy. In the Warden it is a purpose-built procedure for a decidable fragment — bounded strings for the object (prefix, exact, suffix, contains and glob matching), bitvectors for the open flags — that decides in microseconds with bounded worst case, is cross-checked against an off-the-shelf SMT solver, and returns UNKNOWN for anything outside its fragment rather than guessing. Every verdict is one of three — **SATISFIED**, **UNSATISFIED**, or **UNKNOWN** — and it fails closed. The **Warden** runtime carries that verdict to
 the kernel (via `seccomp user-notify (seccomp-BPF)`) and refuses any disallowed syscall
 before it lands. The check is pre-execution: an action that cannot be proven
 allowed never runs.
@@ -30,7 +30,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.13.0.**
+   **Current release: v1.14.0.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -82,6 +82,7 @@ The runtime line has progressed well beyond simple syscall containment:
   human-out-of-the-loop operation per policy: for every non-authorizing verdict,
   a deterministic, automated terminal outcome is reachable in finitely many steps.
   "Never requires a human" becomes certified rather than hoped.
+- **v1.14.0 — the bounded string fragment.** Second release of the v1.10 verification program. Path and exec rules take a matcher before the constant — `exact`, `prefix` (the default), `suffix`, `contains` or `glob` (`?`, `[...]`, `*`, `**`, and `/**/` for any number of segments) — so a policy can deny a kind of file wherever it appears under an allowed tree: private keys (`suffix .pem`), dotenv files at any depth (`glob /**/.env`), a patient's psychotherapy notes. Matching is on the resolved canonical path, so a symlink with an innocent name is decided as its target. Globs compile to a small automaton stepped word-parallel (well under a microsecond added per decision; bounded worst case). At load the Warden decides exactly, by an automaton search bounded at the 4095-byte length limit, whether each rule can ever fire, and `vdp_check analyze` prints a shortest witness for each rule that can. The cross-check adds an independent derivative-based procedure for reachability alongside the solver. Every v1.13 policy keeps its meaning (checked against the v1.13.0 build). The example sector policies now deny key material, dotenv files and `.ssh` under every allowed tree, plus sector-specific paths. See [`RELEASE-v1.14.0.md`](./RELEASE-v1.14.0.md).
 - **v1.13.0 — the SMT decision procedure in the enforcement path.** First release of the v1.10 verification program. Every Warden decision is now made by an SMT decision procedure over a quantifier-free fragment of bounded strings (the object) and 32-bit bitvectors (the open flags), with a fragment boundary that returns UNKNOWN rather than guessing. Policies can now say read-only (`readonly`, `access=`, `+O_…`/`-O_…`); through v1.12 a path rule admitted every open flag, so the example sector policies' "(read)" rules and loader rules admitted writes by a root agent — they now enforce read-only. At load the Warden reports every rule that can never fire (it found one in four example policies). The procedure is cross-checked against an off-the-shelf SMT solver (zero disagreements over 26,624 checks, `make crosscheck`), and a verdict-distribution harness gates on `unsafe_satisfied == 0`: on its synthetic seed corpus v1.13 clears 85.4% of safe file opens with none unsafe authorized, where the policies as v1.12.4 shipped them cleared 75.6% and authorized 24 unsafe opens. Flag clauses constrain the flags passed to `openat()` (`readonly` is sound; `fcntl` can change `O_APPEND` and a few others later). Median latency unchanged. See [`RELEASE-v1.13.0.md`](./RELEASE-v1.13.0.md).
 - **v1.12.4 — the `--plan` gate authorizes file opens again.** Optional pre-execution plan verification had rejected every plan that declared a `file_open` action since v1.12.0: the per-open decision moved to the resolved canonical path, but the plan decider (which runs before the agent is forked) never filled it, so every file-open node was UNKNOWN. The decider now decides on the lexically canonical form of the declared absolute path, so a plan opening a policy-allowed file verifies again; a `..` that lexically escapes, or a relative path, stays UNKNOWN. The gate does not follow symlinks (there is no agent yet) and remains an advisory pre-check — every open is still mediated per-syscall at runtime. Adds `make test-v1124`. See [`RELEASE-v1.12.4.md`](./RELEASE-v1.12.4.md).
 - **v1.12.3 — dynamically linked agents.** Follows ordinary symlinks and decides policy on the object's canonical path, so a dynamically linked agent (CPython, a JVM, Node) can load its libraries — since v1.12.0 the resolver refused any path with a symlink, and on merged-`/usr` systems `/lib` and library SONAMEs are symlinks. The security property is unchanged: a symlink to a denied object is decided as that object and refused. `/proc/self` and `/proc/thread-self` are mapped to the agent's own process (never the Warden's), and any other process's `/proc`, or a procfs reached through a planted symlink, fails closed. Because the decision is on the canonical path, `allow path` prefixes name canonical locations (`/usr/lib/`, not `/lib/`). Adds `make test-v1123`. See [`RELEASE-v1.12.3.md`](./RELEASE-v1.12.3.md).
@@ -100,7 +101,7 @@ The runtime line has progressed well beyond simple syscall containment:
   are deny-only (fail closed) pending the v1.10 dial-and-inject path. See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.13.0 history.
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.14.0 history.
 
 ### Installation
 
@@ -342,7 +343,8 @@ different risks at different points in the stack.
 - [x] **v1.12.3** — Dynamically linked agents: follow symlinks and decide on the canonical path; `/proc/self` mapped to the agent
 - [x] **v1.12.4** — The `--plan` gate authorizes file opens again (decide on the lexically canonical declared path)
 - [x] **v1.13.0** — First release of the v1.10 verification program: SMT decision procedure in the enforcement path; open-flag (bitvector) fragment; load-time dead-rule analysis; solver cross-check; verdict-distribution harness
-- [~] **v1.10 program** — The UNKNOWN-shrinking program (below); first release shipped as v1.13.0. Remaining: suffix/contains/regex string atoms, customer-derived corpus and measured baseline, proof objects
+- [x] **v1.14.0** — Bounded string fragment: `exact` / `suffix` / `contains` / `glob` matchers; exact automaton-based rule reachability with witnesses; derivative-based reachability oracle in the cross-check
+- [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0 and v1.14.0. Remaining: proof objects and an independent checker (next), customer-derived corpus and measured baseline
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
 
 ### Language
@@ -352,10 +354,11 @@ different risks at different points in the stack.
 
 ## The verification program (v1.10 / v1.11)
 
-> **Planned and candidate work, not shipped.** No v1.10 or v1.11 tag exists; both
-> numbers are **reserved** for this verification program. v1.12 (mediation
-> correctness) shipped ahead of them and does not touch it. This
-> documents direction; shipped behavior is in [`CHANGELOG.md`](./CHANGELOG.md).
+> **Partly shipped.** No v1.10 or v1.11 tag exists: the program's releases ship
+> as v1.13.0 and v1.14.0 so version numbers keep increasing (marked below); the
+> rest is planned or candidate work. v1.12 (mediation correctness) shipped ahead
+> of the program and does not touch it. Shipped behavior is in
+> [`CHANGELOG.md`](./CHANGELOG.md).
 
 The post-v1.9 program has a single goal: migrate cases out of the UNKNOWN verdict
 into a provable verdict, raising the clear rate on safe agent actions — under a
@@ -367,10 +370,13 @@ each with one named soundness obligation and the trusted code it introduces:
 
 - **v1.10 step 1 — verdict-distribution harness + corpus.** The measurement
   baseline. Hard gate: zero unsafe authorizations across the corpus.
+  *Shipped in v1.13.0 with a synthetic seed corpus; a customer-derived corpus
+  is outstanding.*
 - **v1.10 step 2 — bitvector fragment.** Decidable reasoning over fixed-width
-  syscall flag/argument bits. Lowest audit cost.
+  syscall flag/argument bits. Lowest audit cost. *Shipped in v1.13.0.*
 - **v1.10 step 3 — bounded string fragment (headline).** Length-bounded
   path-prefix and host-allowlist predicates made provable instead of refused.
+  *Shipped: prefix/equality in v1.13.0; suffix, contains and globs in v1.14.0.*
 - **v1.11 candidate — bounded sequence fragment.** Element-level reasoning for the
   cross-action data-flow subsystem, composed on the fragments above.
 

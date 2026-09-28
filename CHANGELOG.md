@@ -17,10 +17,12 @@ its first release shipped as **v1.13.0** (below) so version numbers keep
 increasing. Shipped in v1.13.0: the SMT decision procedure in the enforcement
 path, the bitvector flag fragment, the prefix/equality part of the bounded
 string fragment, and the verdict-distribution harness (synthetic seed corpus).
-Still planned: the rest of the bounded string fragment, a customer-derived
-corpus and measured baseline, proof objects, and the v1.11 sequence fragment.
+Shipped in v1.14.0: the rest of the bounded string fragment (suffix, contains
+and glob matchers, with exact load-time reachability). Still planned: proof
+objects and an independent checker (next), a customer-derived corpus and
+measured baseline, and the v1.11 sequence fragment.
 
-### Planned — v1.10 program (status as of v1.13.0)
+### Planned — v1.10 program (status as of v1.14.0)
 
 - **Verdict-distribution harness.** Measurement and regression gating over a
   corpus of realistic agent action-graphs. Reports the four-cell outcome
@@ -34,7 +36,9 @@ corpus and measured baseline, proof objects, and the v1.11 sequence fragment.
   #64/059,592). Soundness obligation: ABI-faithful width/signedness, plus a
   conservative-mask rule (bits outside the policy's mask force UNKNOWN, never a
   silent SATISFIED). Lowest audit cost; lands first to prove the loop end to end.
-- **Bounded string fragment.** A deliberately restricted, length-bounded string
+- **Bounded string fragment.** *(Shipped: prefix/equality in v1.13.0;
+  suffix, contains and globs — the fixed regular family chosen for the "fixed
+  regex set" — in v1.14.0.)* A deliberately restricted, length-bounded string
   fragment (prefix/suffix/contains and membership in a fixed regex set) so the
   verifier can prove path-prefix and host-allowlist predicates instead of
   refusing them. The expected headline reduction in over-refusal. Soundness
@@ -52,6 +56,71 @@ corpus and measured baseline, proof objects, and the v1.11 sequence fragment.
   fragment's guarantee.
 
 ---
+
+## [1.14.0] - 2026-09-28
+
+Second release of the v1.10 verification program: the rest of the bounded
+string fragment. Path and exec rules take a matcher before the constant —
+`exact`, `prefix` (the path default), `suffix`, `contains` or `glob` — so a
+policy can deny a kind of file wherever it appears under an allowed tree. Every
+v1.13 policy keeps its meaning; three-state semantics and symmetric suppression
+are unchanged.
+
+### Added
+
+- **Matchers** `exact | prefix | suffix | contains | glob` on path and exec
+  rules. Globs: `?`, `[...]` sets (never `/`), `*` (no `/`), `**` (any bytes),
+  the `/**/` unit (zero or more whole segments), `\x` escapes; anchored,
+  byte-wise, case-sensitive, matched on the resolved canonical path. At most 32
+  wildcards per glob and 65,536 glob tokens per policy (bounds the work of one
+  decision); `***`, a `/` in a set, bad ranges, unterminated sets and matchers
+  on host rules are load errors.
+- **Glob matching** by a compiled token automaton with literal prefix/suffix
+  and minimum-length rejection and a word-parallel step (cost independent of
+  the number of active states). Worst case at the cap: 12 ms per decision on
+  an adversarial policy; typical overhead about 0.1 µs.
+- **Exact rule reachability for the new atoms**: breadth-first search over the
+  product of the rules' subset-construction automata, bounded at depth 4095 so
+  the length bound is decided exactly, with flag signatures enumerated and only
+  inclusion-minimal shadow sets searched; UNKNOWN (never a guess) past a state
+  or work budget. `vdp_check <policy> analyze` prints a shortest witness string
+  and flags value for every reachable rule; `analyze automaton` forces the
+  automaton search (testing).
+- **Cross-check**: independent Python parser and glob translation; Z3 string
+  and regex theories for verdicts and witness confirmation; a
+  Brzozowski-derivative procedure (exact at the bound) for reachability, also
+  checked against Z3's unbounded regex query where conclusive; UNKNOWN accepted
+  only with a documented budget reason. Fixtures for the length bound,
+  shadowing, the state budget and keyword compatibility.
+- **Harness**: a "v1.13.0 shipped" view (`harness/baseline-v1.13.0/`) and 24
+  corpus actions (17 UNSAFE, 7 SAFE near misses).
+- `make test-v1140`: live-Warden enforcement of every matcher (including
+  through a symlink), analysis, parser refusals, v1.13 compatibility against
+  the v1.13.0 build, the `--plan` gate, cross-check and harness gate.
+
+### Security
+
+- The example sector policies deny `.pem` and `.key` files, dotenv files
+  (`.env`, `.env.*`) and anything under a `.ssh` directory under every allowed
+  tree; finance denies macro-capable workbooks in its read/write workpapers;
+  healthcare denies psychotherapy notes (directory and files, any depth);
+  national-defense denies compartmented products. On the synthetic corpus the
+  17 unsafe opens v1.13.0's policies authorized (all added in this release) are
+  refused, with no safe open lost (87.5% of safe opens cleared in both).
+- Name matchers judge the path's name, not the file's identity; the agent
+  cannot rename or link files while the Warden enforces (those syscalls are
+  outside the allowlist), but can in observe mode.
+
+### Changed
+
+- After `require warden 1.14`, a matcher keyword with no constant (forgotten,
+  or turned into a comment by `#`) is a load error rather than a prefix rule
+  for the word.
+- `require warden` takes `<digits>.<digits>` only (a sign, accepted by v1.13's
+  `sscanf`, is refused).
+- The Warden and `vdp_check lint` note a path/exec constant that can match no
+  absolute path, and name the reason when reachability is not decided.
+- `run_start` reads `"warden":"1.14.0"`; the CycloneDX exporter reports 1.14.0.
 
 ## [1.13.0] - 2026-09-28
 
