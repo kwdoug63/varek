@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: MIT
+// vdp_checker.h — VAREK certificate checker (v1.15).
+//
+// The SMT decision procedure (smt_decide.c) decides every Warden action. From
+// v1.15 each SATISFIED verdict carries a certificate, and this checker must
+// accept the certificate before the Warden authorizes the action. The checker
+// is written separately from the procedure and shares no code with it: it has
+// its own policy parser and its own matchers, and none of the procedure's
+// optimizations (fast rejection, word-parallel automata, reachability search,
+// enumeration pruning). An authorization therefore needs two independent
+// implementations to agree, and a logic bug confined to the procedure cannot
+// authorize an action. The trusted base for "no action is authorized that the
+// policy does not allow" is this checker (and the kernel mechanisms around it),
+// not the procedure. (Both run in the Warden's process, so this separation does
+// not extend to memory corruption.) The checker is independent in code, not in
+// design: it follows the same grammar, its glob parser mirrors the procedure's
+// structure, and its matcher runs the same automaton one step at a time.
+//
+// ---------------------------------------------------------------------------
+// The claim a certificate proves
+// ---------------------------------------------------------------------------
+//
+// An action is (kind, s, f): kind is path, host or exec; s is the string the
+// policy is matched against (the resolved canonical path, "host:port", or the
+// exec path); f is the open flags for a path, or "any" for a symbolic query
+// (the --plan gate), and ignored for host and exec.
+//
+// Ground claim (f given): rule r is the first rule of this kind that holds on
+// (s, f), and r is an allow rule. A rule holds when its string atom holds on
+// s and its flag atom (f & mask) == value holds on f. The action must lie in
+// the fragment: |s| <= 4095 and, for a path, f has no bit outside the x86_64
+// open(2) set and access mode is not 3.
+//
+// Symbolic claim (path, f = any): for EVERY admissible f (no bit outside the
+// open(2) set, access mode not 3) the first rule that holds on (s, f) exists
+// and is an allow rule.
+//
+// ---------------------------------------------------------------------------
+// Certificate
+// ---------------------------------------------------------------------------
+//
+//   r   the index (0-based, in file order, counting rules only) of the rule
+//       that decides a ground claim; -1 is allowed for a symbolic claim, where
+//       several rules may decide for different f.
+//   w   a witness that rule r's string atom holds on s:
+//         prefix / exact / suffix / host   none (the checker compares bytes)
+//         contains c                       an offset k with s[k .. k+|c|) == c
+//         glob                             one span [a, b) of s per stretch
+//                                          token, in pattern order
+//
+// Stretch tokens of a glob are `*`, `**`, and the `/**/` unit. A glob is read
+// as a sequence of tokens: a literal byte (also `\x`), a one-byte set (`?`,
+// `[...]`), `*` (zero or more bytes, none '/'), `**` (zero or more bytes), and
+// the `/**/` unit, which is the literal '/' followed by a SEGS token: zero
+// bytes, or one or more bytes of which the last is '/'. The span of a `/**/`
+// unit covers its SEGS part only (the bytes after the leading '/').
+//
+// Checking a ground certificate:
+//   1. the action is in the fragment;
+//   2. rule r exists, is an allow rule of this kind, and its flag atom holds;
+//   3. the witness shows r's string atom holds (for a glob: walking the tokens
+//      left to right, each literal and set token takes the next byte, each
+//      stretch token takes exactly its span, which must start where the walk
+//      is and satisfy the token, and the walk ends at |s|);
+//   4. no earlier rule of this kind holds on (s, f) — decided here, with the
+//      checker's own matchers.
+// Checking a symbolic certificate: the checker computes which path rules'
+// string atoms hold on s and enumerates every admissible value of the flag bits
+// those rules test. A symbolic certificate that names one deciding rule (r >= 0)
+// carries that rule's witness, which is checked too; r = -1 carries none.
+//
+// The checker implements the policy grammar of VAREK 1.15 (smt_decide.h). A
+// policy it cannot parse is refused, so the Warden does not start.
+
+#ifndef VAREK_VDP_CHECKER_H
+#define VAREK_VDP_CHECKER_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#define VDPC_GRAMMAR_MAJOR 1
+#define VDPC_GRAMMAR_MINOR 15
+
+#define VDPC_MAX_S        4095
+#define VDPC_MAX_RULES    256
+#define VDPC_MAX_STRETCH  32          /* a glob has at most 32 wildcards */
+
+enum { VDPC_PATH = 0, VDPC_HOST = 1, VDPC_EXEC = 2 };
+
+typedef struct vdpc_rule vdpc_rule_t;
+
+typedef struct {
+    vdpc_rule_t  *rules;
+    size_t        n;
+    unsigned char sha256[32];         /* of the policy bytes as loaded */
+} vdpc_policy_t;
+
+typedef struct {
+    int      r;                       /* deciding rule, or -1 (symbolic only) */
+    int      wkind;                   /* 0 none, 1 contains offset, 2 glob spans */
+    uint32_t off;                     /* contains: offset */
+    uint32_t nspan;                   /* glob: number of spans */
+    uint32_t span[VDPC_MAX_STRETCH][2];
+} vdpc_cert_t;
+
+/* Parse a policy from memory (the exact bytes the Warden loaded). 0, or -1
+ * with a message. */
+int  vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
+               char *err, size_t errlen);
+void vdpc_free(vdpc_policy_t *p);
+
+/* Check a certificate for a SATISFIED claim. has_flags false means the
+ * symbolic claim (path only). Returns 1 if the certificate is accepted, 0 if
+ * not (the reason in why). */
+int vdpc_check(const vdpc_policy_t *p, int kind, const char *s, size_t sl,
+               uint32_t flags, bool has_flags, const vdpc_cert_t *c,
+               char *why, size_t whylen);
+
+/* A parsed rule, for comparison with another parser (the Warden compares the
+ * decision procedure's parse with this one at load). */
+enum { VDPC_M_PREFIX, VDPC_M_EXACT, VDPC_M_SUFFIX, VDPC_M_CONTAINS, VDPC_M_GLOB, VDPC_M_HOST };
+typedef struct {
+    bool        allow;
+    int         kind, match, line;
+    const char *c;
+    size_t      clen;
+    uint32_t    mask, value;
+} vdpc_rule_info_t;
+int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *out);
+
+/* Does rule i's string atom hold on s? (Testing and audit: which rules match
+ * a path, by the checker's own matchers.) 1, 0, or -1 if there is no rule i. */
+int vdpc_holds(const vdpc_policy_t *p, size_t i, const char *s, size_t sl);
+
+/* Hex form of the policy digest (65 bytes with the NUL). */
+void vdpc_digest_hex(const vdpc_policy_t *p, char out[65]);
+
+/* SHA-256 (FIPS 180-4), used for the policy digest. */
+void vdpc_sha256(const void *data, size_t len, unsigned char out[32]);
+
+#endif /* VAREK_VDP_CHECKER_H */
