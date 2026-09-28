@@ -22,8 +22,10 @@ For each notification, the Warden:
    `ALLOW`, `DENY`, or `UNKNOWN`. `DENY` and `UNKNOWN` both surface
    to the kernel as `EPERM` (symmetric suppression).
 4. For path-argument syscalls on `ALLOW`, resolves the path itself
-   with `openat2(RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)` rooted
-   at `/proc/<pid>/cwd`, and returns the resolved descriptor through
+   with `openat2(RESOLVE_NO_MAGICLINKS)` rooted at `/proc/<pid>/cwd`
+   (ordinary symlinks followed since v1.12.3, deciding on the object's
+   canonical path; `/proc/self` mapped to the agent), and returns the
+   resolved descriptor through
    `SECCOMP_IOCTL_NOTIF_ADDFD` with `SECCOMP_ADDFD_FLAG_SEND`. The
    kernel does not re-read the userspace pathname pointer.
 5. Emits a JSON pathology record with `CLOCK_MONOTONIC` decision
