@@ -1,0 +1,4 @@
+# v1.15 cross-check fixture: a policy for a newer Warden must be refused
+# by the decision procedure, the certificate checker and the oracle alike.
+require warden 1.16
+allow path /srv/

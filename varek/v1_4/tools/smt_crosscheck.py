@@ -32,6 +32,7 @@ Exit 0 iff there are zero disagreements.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -286,12 +287,14 @@ def parse_glob(rx, pat, where):
     parts = Parts()
     i, n, wild, after_slash = 0, len(pat), 0, False
     ntok = 0                       # tokens as the C program counts them
+    gtoks = []                     # the token sequence (certificate witnesses)
     while i < n:
         ch = pat[i]
         if ch == "\\":
             if i + 1 >= n:
                 raise PolicyError(f"{where}: lone backslash")
             run.append(pat[i + 1])
+            gtoks.append(("lit", ord(pat[i + 1])))
             ntok += 1
             after_slash = False
             i += 2
@@ -302,20 +305,24 @@ def parse_glob(rx, pat, where):
                 if after_slash and pat[i + 2:i + 3] == "/":
                     # "/**/": the '/' is already in the literal run; (.*/)? follows
                     parts.append(rx.alt(rx.EPS, rx.cat(rx.TOP, rx.cset([ord("/")]))))
+                    gtoks.append(("segs",))
                     i += 3
                     after_slash = True
                 else:
                     parts.append(rx.TOP)
+                    gtoks.append(("dstar",))
                     i += 2
                     after_slash = False
             else:
                 parts.append(rx.star(rx.cset(NOTSLASH)))
+                gtoks.append(("star",))
                 i += 1
                 after_slash = False
             wild += 1
             ntok += 1
         elif ch == "?":
             parts.append(rx.cset(NOTSLASH))
+            gtoks.append(("set", NOTSLASH))
             wild += 1
             ntok += 1
             after_slash = False
@@ -357,19 +364,21 @@ def parse_glob(rx, pat, where):
             if not closed:
                 raise PolicyError(f"{where}: unterminated class")
             parts.append(rx.cset(NOTSLASH - members if neg else members))
+            gtoks.append(("set", frozenset(NOTSLASH - members if neg else members)))
             wild += 1
             ntok += 1
             after_slash = False
             i = j
         else:
             run.append(ch)
+            gtoks.append(("lit", ord(ch)))
             ntok += 1
             after_slash = ch == "/"
             i += 1
         if wild > GLOB_MAX_WILD:
             raise PolicyError(f"{where}: too many wildcards")
     parts.append(rx.EPS)                        # flush the last literal run
-    return rx.cats(*parts), ntok
+    return rx.cats(*parts), ntok, gtoks
 
 
 def atom_rx(rx, r):
@@ -423,7 +432,7 @@ def parse_lines(raw_lines, path):
                 if len(toks) != 3 or toks[1] != "warden" or not m:
                     raise PolicyError(f"{path}:{lineno}: bad directive")
                 v = (int(m.group(1)), int(m.group(2)))
-                if v > (1, 14):
+                if v > (1, 15):
                     raise PolicyError(f"{path}:{lineno}: requires newer Warden")
                 req = max(req, v)
                 continue
@@ -449,9 +458,9 @@ def parse_lines(raw_lines, path):
                 raise PolicyError(f"{path}:{lineno}: control byte in constant")
             if len(rules) >= 256:
                 raise PolicyError(f"{path}: more than 256 rules")
-            grx = None
+            grx, gtoks = None, None
             if op == "glob":
-                grx, nt = parse_glob(rx, const, f"{path}:{lineno}")
+                grx, nt, gtoks = parse_glob(rx, const, f"{path}:{lineno}")
                 glob_tokens += nt
                 if glob_tokens > GLOB_MAX_TOTAL:
                     raise PolicyError(f"{path}:{lineno}: glob tokens over the policy total")
@@ -473,7 +482,7 @@ def parse_lines(raw_lines, path):
                     raise PolicyError(f"{path}:{lineno}: contradictory")
                 mask |= m
                 value |= v & m
-            r = {"verb": verb, "kind": kind, "op": op, "c": const, "rx": grx,
+            r = {"verb": verb, "kind": kind, "op": op, "c": const, "rx": grx, "gtoks": gtoks,
                  "mask": mask, "value": value, "line": lineno}
             r["lang"] = atom_rx(rx, r)
             rules.append(r)
@@ -866,7 +875,7 @@ FLAG_CLAUSES = ["readonly", "access=ro", "access=wo", "access=rw"] + \
     [sign + name for name in FLAG_BITS for sign in "+-"]
 
 GLOB_PIECES = ["/a", "/b", "/", "*", "**", "?", "[ab]", "[!a]", "[a-c]", "[]a]", ".x",
-               "/**/", "\\*", "\\[", "\\/", "x", ":", "\xe9", "[^b]"]
+               "/**/", "\\*", "\\[", "\\/", "\\/**/", "x", ":", "\xe9", "[^b]"]
 GLOB_TAILS = ["/*", "/**", "*", "/**/b", "/?", "[ab]*", "/*/b", "**/", "/[!a]", ".x", "/"]
 GLOB_BAD = ["[", "\\", "***", "[/]", "[b-a]", "[!]", "[a-/]", "?" * 33]
 AMBIGUOUS = ["allow path glob readonly", "deny path suffix -O_CREAT", "allow path exact",
@@ -885,7 +894,10 @@ def fuzz_line(rng, prior, strings, wide):
         # a rule that overlaps an earlier one: same kind, the earlier
         # constant's literal stem, a broader or narrower matcher
         kind, c0 = rng.choice(prior)
-        stem = re.split(r"[*?\[\\]", c0, maxsplit=1)[0] or "/"
+        # (at most 64 bytes of it: copying a near-bound constant into several
+        # rules adds nothing the dedicated near-bound rules do not, and only
+        # slows the oracle's derivative search)
+        stem = re.split(r"[*?\[\\]", c0, maxsplit=1)[0][:64] or "/"
         if kind == "host":
             c = stem
         else:
@@ -949,8 +961,9 @@ def fuzz_policy(rng, path):
     valid = rng.random() < 0.7
     lines = []
     if rng.random() < 0.3:
-        lines.append(rng.choice(["require warden 1.14", "require warden 1.13", "require warden 01.14"] +
-                                ([] if valid else ["require warden 1.15", "require warden x",
+        lines.append(rng.choice(["require warden 1.14", "require warden 1.13", "require warden 01.14",
+                                 "require warden 1.15"] +
+                                ([] if valid else ["require warden 1.16", "require warden x",
                                                    "require warden +1.14", "require warden 1.+14",
                                                    "require warden 1.1400000"])))
     wide = rng.random() < 0.15          # many distinct flag bits: reach the bound
@@ -978,7 +991,265 @@ def fuzz_policy(rng, path):
 
 # ------------------------------------------------------------------ check --
 
-def check_policy(vdp, policy, rng, nq, stats, verbose):
+# ------------------------------------------------------------ certificates --
+# v1.15: every SATISFIED verdict carries a certificate (rule index + witness)
+# that the independent checker (tools/vdp_cert_check, checker/vdp_checker.c)
+# must accept. The cross-check requires: every certificate the procedure emits
+# is accepted and its witness is valid by the definition below (written from
+# checker/vdp_checker.h); every forged certificate whose claim is false is
+# rejected; and a mutated witness is accepted exactly when it is still valid.
+
+def trace_valid(gtoks, s, spans):
+    """Does the span list prove that the glob (token list) matches s?"""
+    pos, k = 0, 0
+    for tk in gtoks:
+        if tk[0] in ("lit", "set"):
+            if pos >= len(s):
+                return False
+            b = ord(s[pos])
+            if (tk[0] == "lit" and b != tk[1]) or (tk[0] == "set" and b not in tk[1]):
+                return False
+            pos += 1
+            continue
+        if k >= len(spans):
+            return False
+        a, b = spans[k]
+        k += 1
+        if a != pos or b < a or b > len(s):
+            return False
+        seg = s[a:b]
+        if tk[0] == "star" and "/" in seg:
+            return False
+        if tk[0] == "segs" and seg and seg[-1] != "/":
+            return False
+        pos = b
+    return k == len(spans) and pos == len(s)
+
+
+def find_spans(gtoks, s, relax=None):
+    """Some valid span list for s, or None (small patterns only). relax drops
+    one rule of the definition ("star": '/' allowed in a * span; "segs": a
+    /**/ span need not end in '/'), to build witnesses that are wrong in
+    exactly that way."""
+    if len(gtoks) > 200 or len(s) > 400:
+        return None
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 5000))
+    memo = {}
+
+    def go(ti, pos):
+        key = (ti, pos)
+        if key in memo:
+            return memo[key]
+        res = None
+        if ti == len(gtoks):
+            res = [] if pos == len(s) else None
+        else:
+            tk = gtoks[ti]
+            if tk[0] in ("lit", "set"):
+                if pos < len(s):
+                    b = ord(s[pos])
+                    if (tk[0] == "lit" and b == tk[1]) or (tk[0] == "set" and b in tk[1]):
+                        res = go(ti + 1, pos + 1)
+            else:
+                for e in range(pos, len(s) + 1):
+                    seg = s[pos:e]
+                    if tk[0] == "star" and "/" in seg and relax != "star":
+                        break
+                    if tk[0] == "segs" and seg and seg[-1] != "/" and relax != "segs":
+                        continue
+                    rest = go(ti + 1, e)
+                    if rest is not None:
+                        res = [(pos, e)] + rest
+                        break
+        memo[key] = res
+        return res
+    return go(0, 0)
+
+
+def wit_str(spans):
+    return "g:" + ",".join(f"{a}-{b}" for a, b in spans)
+
+
+def parse_wit(w):
+    if w.startswith("g:"):
+        return [tuple(int(x) for x in p.split("-")) for p in w[2:].split(",") if p]
+    return None
+
+
+def cert_checks(checker, policy, rules, rx, qs, res, wants, rng, stats, fails):
+    lines, expect, labels = [], [], []
+
+    def add(kind, sval, fval, r, w, want, label):
+        fl = "-" if fval is None else hex(fval)
+        hx = sval.encode("latin-1").hex() or "="
+        lines.append(f"{kind} {fl} {hx} {r} {w}")
+        expect.append(want)
+        labels.append(label)
+
+    for (kind, sval, fval), r, want in zip(qs, res, wants):
+        allow_idx = [i for i, x in enumerate(rules) if x["kind"] == kind and x["verb"] == "allow"]
+        sym = kind == "path" and fval is None
+        if r["verdict"] != want:
+            continue       # the procedure's conservative UNKNOWN (enumeration bound)
+        if r["verdict"] == "SATISFIED":
+            w = r.get("w", "!")
+            ri = r["rule"]
+            if w == "!":
+                fails.append(f"{policy}: {kind} {sval[:40]!r}: SATISFIED without a witness")
+                continue
+            if w.startswith("g:") and not trace_valid(rules[ri]["gtoks"], sval, parse_wit(w)):
+                fails.append(f"{policy}: {kind} {sval[:40]!r}: the procedure's glob witness {w} is invalid")
+            add(kind, sval, fval, ri, w, "ok", "procedure certificate")
+            stats["certs_emitted"] += 1
+            # a mutated witness is accepted exactly when it is still valid
+            spans = parse_wit(w)
+            if spans:
+                m = [list(x) for x in spans]
+                k = rng.randrange(len(m))
+                m[k][rng.randrange(2)] += rng.choice([-1, 1, 2])
+                m = [tuple(x) for x in m]
+                if all(0 <= a and 0 <= b for a, b in m):
+                    add(kind, sval, fval, ri, wit_str(m),
+                        "ok" if trace_valid(rules[ri]["gtoks"], sval, m) else "reject", "mutated witness")
+                    stats["certs_mutated"] += 1
+        # forged claims: another allow rule, or any rule when not SATISFIED
+        if sym:
+            truth_first = None
+        else:
+            truth_first = r["rule"] if r["verdict"] == "SATISFIED" else None
+        # (-1 claims "every flags value is decided by some allow rule": a
+        # forgery only when the verdict is not SATISFIED)
+        for fr in rng.sample(allow_idx, min(3, len(allow_idx))) + \
+                ([-1] if sym and r["verdict"] != "SATISFIED" else []):
+            if fr == truth_first:
+                continue
+            if sym and r["verdict"] == "SATISFIED" and fr == r["rule"]:
+                continue
+            rr = rules[fr] if fr >= 0 else None
+            w = "-"
+            if rr and rr["op"] == "contains":
+                k = sval.find(rr["c"])
+                w = f"c:{k if k >= 0 else 0}"
+            elif rr and rr["op"] == "glob":
+                sp = find_spans(rr["gtoks"], sval)
+                w = wit_str(sp) if sp is not None else wit_str([(0, 0)] * sum(
+                    1 for t in rr["gtoks"] if t[0] in ("star", "dstar", "segs")))
+            add(kind, sval, fval, fr, w, "reject", "forged claim")
+            stats["certs_forged"] += 1
+    # Strings that a glob matches only if one rule of the definition is
+    # relaxed (a '/' inside '*', a /**/ unit not ending in '/'): claims on them
+    # with the relaxed witness must be refused.
+    for fr, rr in enumerate(rules):
+        if rr["op"] != "glob" or rr["verb"] != "allow":
+            continue
+        for _ in range(3):
+            out = []
+            for tk in rr["gtoks"]:
+                if tk[0] == "lit":
+                    out.append(chr(tk[1]))
+                elif tk[0] == "set":
+                    out.append(chr(rng.choice(sorted(tk[1]))))
+                elif tk[0] == "star":
+                    out.append(rng.choice(["", "a", "a/b", "/"]))
+                elif tk[0] == "dstar":
+                    out.append(rng.choice(["", "a", "a/"]))
+                else:
+                    out.append(rng.choice(["", "x", "a/x"]))
+            sval = "".join(out)
+            if len(sval) > L or rx.matches(rr["lang"], sval):
+                continue
+            for relax in ("star", "segs"):
+                sp = find_spans(rr["gtoks"], sval, relax)
+                if sp is not None:
+                    fv = 0 if rr["kind"] != "path" else rr["value"]
+                    add(rr["kind"], sval, fv, fr, wit_str(sp), "reject", f"witness wrong ({relax})")
+                    stats["certs_forged"] += 1
+    # Deny claims, kind confusion, and witnesses wrong in one specific way.
+    for (kind, sval, fval), r, want in zip(qs, res, wants):
+        if len(sval) > L:
+            continue
+        for fr, rr in enumerate(rules):
+            if rr["kind"] == kind and rr["verb"] == "deny" and rng.random() < 0.3:
+                add(kind, sval, fval, fr, "-", "reject", "deny-rule claim")
+                stats["certs_forged"] += 1
+            elif rr["kind"] != kind and rr["verb"] == "allow" and rng.random() < 0.2:
+                add(kind, sval, fval, fr, "-", "reject", "claim with a rule of another kind")
+                stats["certs_forged"] += 1
+            elif rr["kind"] == kind and rr["op"] == "glob" and not rx.matches(rr["lang"], sval):
+                for relax in ("star", "segs"):
+                    sp = find_spans(rr["gtoks"], sval, relax)
+                    if sp is not None:
+                        add(kind, sval, fval, fr, wit_str(sp), "reject", f"witness wrong ({relax})")
+                        stats["certs_forged"] += 1
+    # The checker's own matchers against the oracle's languages, rule by rule
+    # and string by string (both directions: a missed match would let a forged
+    # claim past an earlier deny rule; an extra one would refuse a true one).
+    # Besides the queries: strings drawn from every rule's language, and some
+    # padded to exactly the 4095-byte bound.
+    probes = []
+    for rr in rules:
+        for _ in range(4):
+            probes.append(sample(rx, rr["lang"], rng))
+    for x in list(probes[:6]):
+        if 0 < len(x) < L:
+            probes.append((x + "/" + "a" * L)[:L])
+            probes.append(("/" + "a" * L)[: L - len(x)] + x)
+    strs = [sval for _, sval, _ in qs if len(sval) <= L + 3] + [x for x in probes if len(x) <= L]
+    hp = subprocess.run([checker, policy, "holds"],
+                        input="\n".join(x.encode("latin-1").hex() or "=" for x in strs) + "\n",
+                        capture_output=True, text=True, timeout=600)
+    hl = hp.stdout.splitlines()
+    if len(hl) != len(strs):
+        fails.append(f"{policy}: checker 'holds' answered {len(hl)} of {len(strs)}")
+    else:
+        for sval, row in zip(strs, hl):
+            for i, rr in enumerate(rules):
+                want = rx.matches(rr["lang"], sval)
+                stats["cert_holds"] += 1
+                if (row[i] == "1") != want:
+                    fails.append(f"{policy}: checker says rule {i} (line {rr['line']}) "
+                                 f"{'holds' if row[i] == '1' else 'does not hold'} on {sval[:60]!r}; "
+                                 f"the oracle says {'it does' if want else 'it does not'}")
+                    break
+        # targeted forgeries: an allow rule that holds, after the first rule
+        # that holds (so only the earlier-rule check can refuse the claim)
+        extra = [(k, x, rng.choice([0, 0x1, 0x2, 0x241])) for x in probes for k in ("path", "exec")]
+        for (kind, sval, fval), r, want in list(zip(qs, res, wants)) + [(e, None, None) for e in extra]:
+            if (kind == "path" and fval is None) or len(sval) > L:
+                continue
+            fv = fval if kind == "path" else 0
+            hold = [i for i, rr in enumerate(rules) if rr["kind"] == kind
+                    and (fv & rr["mask"]) == rr["value"] and rx.matches(rr["lang"], sval)]
+            if len(hold) < 2 or (kind == "path" and ((fv & ~KNOWN) or (fv & ACC) == ACC)):
+                continue
+            for fr in hold[1:]:
+                rr = rules[fr]
+                if rr["verb"] != "allow":
+                    continue
+                w = "-"
+                if rr["op"] == "contains":
+                    w = f"c:{sval.find(rr['c'])}"
+                elif rr["op"] == "glob":
+                    sp = find_spans(rr["gtoks"], sval)
+                    if sp is None:
+                        continue
+                    w = wit_str(sp)
+                add(kind, sval, fval, fr, w, "reject", "shadowed claim")
+                stats["certs_shadowed"] += 1
+    if not lines:
+        return
+    p = subprocess.run([checker, policy, "batch"], input="\n".join(lines) + "\n",
+                       capture_output=True, text=True, timeout=600)
+    got = [json.loads(l) for l in p.stdout.splitlines() if l.strip()]
+    if len(got) != len(lines):
+        fails.append(f"{policy}: checker answered {len(got)} of {len(lines)} ({p.stderr.strip()[:200]})")
+        return
+    for ln, want, lab, g in zip(lines, expect, labels, got):
+        if g["check"] != want:
+            fails.append(f"{policy}: checker {g['check']} ({g.get('why')}) on {lab}, expected {want}: {ln[:160]}")
+
+
+def check_policy(vdp, policy, rng, nq, stats, verbose, checker=None):
     new_context()
     fails = []
     try:
@@ -992,6 +1263,17 @@ def check_policy(vdp, policy, rng, nq, stats, verbose):
     if py_ok != c_ok:
         fails.append(f"{policy}: parse disagreement (python ok={py_ok}, C ok={c_ok}; {err.strip() or ''} {'' if py_ok else py_err})")
         return fails
+    if checker:
+        # the certificate checker parses the policy independently too
+        k = subprocess.run([checker, policy, "digest"], capture_output=True, text=True)
+        if (k.returncode == 0) != c_ok:
+            fails.append(f"{policy}: parse disagreement (checker ok={k.returncode == 0}, "
+                         f"procedure ok={c_ok}; {k.stderr.strip()[:200]})")
+            return fails
+        if c_ok:
+            with open(policy, "rb") as fh:
+                if k.stdout.strip() != hashlib.sha256(fh.read()).hexdigest():
+                    fails.append(f"{policy}: checker's policy digest differs from SHA-256")
     if not py_ok:
         stats["rejected_policies"] += 1
         return fails
@@ -1059,6 +1341,7 @@ def check_policy(vdp, policy, rng, nq, stats, verbose):
     if len(res) != len(qs):
         fails.append(f"{policy}: batch answered {len(res)} of {len(qs)}")
         return fails
+    wants = []
     for (kind, sval, fval), r in zip(qs, res):
         if kind == "path" and fval is None:
             want = oracle_symbolic(rx, rules, sval)
@@ -1067,6 +1350,7 @@ def check_policy(vdp, policy, rng, nq, stats, verbose):
             want = oracle_ground(rx, rules, kind, sval, fval)
             stats["ground"] += 1
         got = r["verdict"]
+        wants.append(want)
         if r.get("why") == "enumeration_bound":
             stats["bound_seen"] += 1
         if got == want:
@@ -1076,12 +1360,16 @@ def check_policy(vdp, policy, rng, nq, stats, verbose):
             continue
         shown = sval if len(sval) < 60 else sval[:30] + f"...({len(sval)} bytes)"
         fails.append(f"{policy}: {kind} {shown!r} flags={fval}: C={got} ({r.get('why')}) solver={want}")
+    if checker:
+        cert_checks(checker, policy, rules, rx, qs, res, wants, rng, stats, fails)
     return fails
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--vdp", required=True)
+    ap.add_argument("--cert", help="certificate checker (tools/vdp_cert_check): check every "
+                    "certificate the procedure emits, and forged and mutated ones")
     ap.add_argument("--fuzz", type=int, default=0, help="random policies to generate")
     ap.add_argument("--seed", type=int, default=1010)
     ap.add_argument("--queries", type=int, default=60)
@@ -1093,15 +1381,16 @@ def main():
     stats = {k: 0 for k in ("policies", "rejected_policies", "string_policies", "reach",
                             "reach_regex", "reach_solver_inconclusive", "reach_forced_checked",
                             "reach_unknown", "witnesses", "ground", "symbolic",
-                            "bound_unknown", "bound_seen")}
+                            "bound_unknown", "bound_seen", "certs_emitted", "certs_forged",
+                            "certs_mutated", "certs_shadowed", "cert_holds")}
     fails = []
     for p in a.policies:
-        fails += check_policy(a.vdp, p, rng, a.queries, stats, a.verbose)
+        fails += check_policy(a.vdp, p, rng, a.queries, stats, a.verbose, a.cert)
     with tempfile.TemporaryDirectory() as td:
         for k in range(a.fuzz):
             p = os.path.join(td, f"fuzz{k}.txt")
             fuzz_policy(rng, p)
-            fails += check_policy(a.vdp, p, rng, a.queries, stats, a.verbose)
+            fails += check_policy(a.vdp, p, rng, a.queries, stats, a.verbose, a.cert)
             if fails and not a.verbose:
                 keep = os.path.join(tempfile.gettempdir(), f"vdp_fail_{k}.txt")
                 with open(p, encoding="latin-1") as src, open(keep, "w", encoding="latin-1") as dst:
@@ -1123,6 +1412,12 @@ def main():
           f"timeout); procedure bound hits {stats['bound_seen']} (verdicts), "
           f"{stats['reach_unknown']} (reachability); conservative UNKNOWN answers at a "
           f"budget: {stats['reach_unknown'] + stats['bound_unknown']}")
+    if a.cert:
+        print(f"smt_crosscheck: certificates: {stats['certs_emitted']} emitted by the procedure "
+              f"and accepted, {stats['certs_forged']} forged claims and "
+              f"{stats['certs_shadowed']} claims shadowed by an earlier rule rejected, "
+              f"{stats['certs_mutated']} mutated witnesses judged as the definition says; "
+              f"{stats['cert_holds']} rule/string matches agree with the oracle")
     for fl in fails[:40]:
         print("  DISAGREE", fl)
     print(f"smt_crosscheck: {'PASS' if not fails else 'FAIL'} "

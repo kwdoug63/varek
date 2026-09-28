@@ -54,7 +54,7 @@ import json
 import sys
 import uuid
 
-VAREK_VERSION = "1.14.0"
+VAREK_VERSION = "1.15.0"
 SPEC_VERSION = "1.6"
 
 # The provisional patents, as recorded in the runtime's own documentation.
@@ -69,7 +69,7 @@ class StreamError(SystemExit):
     pass
 
 
-def _parse_log(stream, allow_incomplete=False):
+def _parse_log(stream, allow_incomplete=False, meta=None):
     """Read a Warden verdict stream and return (run, records, complete).
 
     v1.12.1 streams are authenticated, and this refuses any stream it cannot
@@ -119,6 +119,8 @@ def _parse_log(stream, allow_incomplete=False):
             w = rec.get("warden")
             if isinstance(w, str) and w:
                 warden_version = w
+            if meta is not None:
+                meta["run_start"] = rec      # v1.15: policy_sha256, for the audit
             continue
         if "decision_final" not in rec and event != "run_end":
             continue   # e.g. a pre-launch plan record; carries no authorization
@@ -163,7 +165,7 @@ def _ts(records):
 
 
 def build_bom(records, agent, policy, serial, run_id="", complete=True,
-              warden_version=VAREK_VERSION):
+              warden_version=VAREK_VERSION, policy_sha256=""):
     # v1.12.2: the Warden component carries the version named in the stream's
     # run_start (the Warden that made the decisions), not this exporter's.
     now = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -207,6 +209,8 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
         "description": "Autonomous agent run supervised under VAREK Authorization-Before-Execution.",
         "properties": [
             {"name": "varek:policy", "value": policy},
+            # v1.15: the SHA-256 of the policy bytes the Warden decided with
+            {"name": "varek:policy.sha256", "value": policy_sha256},
             {"name": "varek:run.id", "value": run_id},
             {"name": "varek:run.complete", "value": "true" if complete else "false"},
             {"name": "varek:run.start", "value": run_start},
@@ -236,7 +240,13 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
                 {"name": "varek:rule", "value": str(r.get("rule", ""))},
                 {"name": "varek:requested", "value": str(r.get("target", ""))},
                 {"name": "varek:kernel_verdict", "value": str(r.get("kernel_verdict", ""))},
-            ],
+            ] + ([
+                # v1.15: the verdict's certificate, as the independent checker
+                # accepted it (re-checkable with tools/varek_audit.py)
+                {"name": "varek:certificate.rule", "value": str(r["cert_rule"])},
+                {"name": "varek:certificate.witness", "value": str(r.get("cert_witness", ""))},
+                {"name": "varek:certificate.check", "value": str(r.get("check", ""))},
+            ] if "cert_rule" in r else []),
         }
         components.append(comp)
 
@@ -302,12 +312,13 @@ def main(argv=None):
     else:
         stream = open(sys.stdin.fileno(), encoding="utf-8", errors="surrogateescape",
                       newline="\n", closefd=False)
-    run_id, records, complete, warden_version = _parse_log(stream, args.allow_incomplete)
+    meta = {}
+    run_id, records, complete, warden_version = _parse_log(stream, args.allow_incomplete, meta)
     stream.close()
 
     serial = args.serial or f"urn:uuid:{uuid.uuid4()}"
     bom = build_bom(records, args.agent, args.policy, serial, run_id, complete,
-                    warden_version)
+                    warden_version, str(meta.get("run_start", {}).get("policy_sha256", "")))
 
     out = json.dumps(bom, indent=2)
     if args.output:
