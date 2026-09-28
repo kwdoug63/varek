@@ -54,7 +54,7 @@ import json
 import sys
 import uuid
 
-VAREK_VERSION = "1.12.4"
+VAREK_VERSION = "1.13.0"
 SPEC_VERSION = "1.6"
 
 # The provisional patents, as recorded in the runtime's own documentation.
