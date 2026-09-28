@@ -1,0 +1,4 @@
+# v1.12.2 regression policy. The probe is static, so only its working
+# directory is named. /tmp/varek_denied_v1122/ and /bin/true are NOT named:
+# opens there and the spawn of /bin/true fall through to default-deny.
+allow path /tmp/varek_allowed_v1122/

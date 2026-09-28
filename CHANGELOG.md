@@ -48,6 +48,67 @@ this section is present in a released tag; it is stated as direction.
 
 ---
 
+## [1.12.2] - 2026-09-28
+
+v1.12.2 lets ordinary agents run under the live Warden: they can start threads,
+collect their children and call `isatty()`. All three gaps date from the v1.9.2
+default-deny allowlist. It also closes an exec-allowlist bypass through the
+bootstrap exec that threads would have made routine. No verdict *semantics*
+change, and no namespace denial is weaker.
+
+### Security
+
+- **Bootstrap exec granted once per run.** The agent's launch exec is answered
+  with `CONTINUE`, which is sound only for the single-threaded launching
+  process. It was granted once per pid, so a new thread could `execve` the
+  agent's binary while a sibling rewrote the path between the Warden's read and
+  the kernel's, running a binary the exec policy never allowed (reachable before
+  via raw `clone(CLONE_VM)`). It is now granted once per run, to the launched
+  process only; every later exec is deny-only.
+
+### Fixed
+
+- **Threads.** `clone3` was hard-denied (KILL), and glibc >= 2.34 creates every
+  thread with it, so an agent that started one thread was killed on the spot.
+  `clone3` now answers `ENOSYS`; libc falls back to `clone()`, whose flags the
+  filter checks. `clone3` still never executes, and `clone(CLONE_NEWUSER)` and
+  the namespace set are still killed. A thread's opens are mediated exactly like
+  the main thread's and are recorded under its own thread id.
+- **Waiting for children.** `wait4` and `waitid` are admitted; `waitpid()`,
+  `subprocess.run()` and `os.system()` failed with `EPERM` after the child ran.
+- **ioctl.** Admitted for `TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`,
+  `FIONBIO` and `FIONREAD` only (full 64-bit match). `isatty()` returned `EPERM`
+  and CPython could not mark its descriptors close-on-exec. `TIOCSTI`, `TCSETS`
+  and every other request stay refused.
+
+### Changed
+
+- The Warden prints `[warden] agent killed by signal N (...)` when the agent dies
+  by a signal; through v1.12.1 a filter kill left only exit status 1.
+- `varek_cyclonedx.py` takes the Warden version for the BOM from the stream's
+  `run_start` record, so a v1.12.1 log is labelled 1.12.1.
+- `run_start` reads `"warden":"1.12.2"`.
+- A thread or child can no longer re-execute the agent's own binary (e.g.
+  Python `multiprocessing` in `spawn` mode); exec is deny-only after the launch.
+
+### Added
+
+- `varek/v1_4/tests/v1122_probe.c`, `tests/test_v1122.sh`,
+  `tests/v1122_policy.txt`; `make test-v1122`, which also builds and runs the
+  filter unit test `tests/test_v14_filter.c` (now with `clone3`, `wait4` and
+  `ioctl` cases). Fails against v1.12.1: the probe is killed at its first
+  `pthread_create`.
+- `RELEASE-v1.12.2.md`.
+
+### Known issues
+
+- Dynamically linked agents (CPython included) still cannot start: since
+  v1.12.0 resolution refuses symlinked paths, and `/lib` and library SONAME links
+  are symlinks. Static targets are unaffected. Planned for v1.12.3.
+- The `--plan` gate still refuses plans containing `file_open` (since v1.12.0).
+
+---
+
 ## [1.12.1] - 2026-09-28
 
 v1.12.1 fixes three defects found in v1.12.0: a denied file open could still
