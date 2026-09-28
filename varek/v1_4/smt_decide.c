@@ -147,6 +147,7 @@ const char *vdp_kind_name(vdp_kind_t k) {
  */
 
 enum { T_ONE = 0, T_STAR = 1, T_SEGS = 2 };
+#define TYPE_IS_STRETCH(t) ((t) == T_STAR || (t) == T_SEGS)
 
 struct vdp_tok { uint8_t type; uint16_t set; };
 typedef struct { uint64_t w[4]; } bset_t;
@@ -500,6 +501,102 @@ const char *vdp_matcher_prefix(const vdp_rule_t *r) {
     return "";
 }
 
+/* v1.15: a witness that a glob matches, for the certificate. Runs the
+ * automaton from the start (no fast path), keeps every state set, and walks
+ * back from the accepting state to the start, recording for each STAR and
+ * SEGS token the span of s it took. Returns 1 with the spans, 0 if s does not
+ * match, -1 on allocation failure. */
+static int prog_witness(const struct vdp_prog *p, const char *s, size_t sl,
+                        uint32_t (*span)[2], size_t maxspan, size_t *nspan) {
+    size_t W = PW(p), w1 = p->w1, n = p->ntok;
+    uint64_t *S = malloc((sl + 1) * W * sizeof *S);
+    long *start = malloc((n + 1) * sizeof *start), *end = malloc((n + 1) * sizeof *end);
+    if (!S || !start || !end) { free(S); free(start); free(end); return -1; }
+    int rc = 0;
+    prog_start(p, S);
+    for (size_t i = 0; i < sl; i++) {
+        unsigned b = (unsigned char)s[i];
+        if (!b || !prog_step(p, S + i * W, b, S + (i + 1) * W)) goto out;
+    }
+    if (!st_has(S + sl * W, n)) goto out;
+    for (size_t k = 0; k <= n; k++) start[k] = end[k] = -1;
+
+    /* Backward walk. (pos, q, in): position state q, or inside SEGS token q. */
+    size_t pos = sl, q = n;
+    bool in = false;
+#define POS(P, Q) st_has(S + (P) * W, (Q))
+#define INS(P, Q) st_has(S + (P) * W + w1, (Q))
+#define TYPE(K) (p->tok[K].type)
+#define TAKES(K, B) bs_has(&p->sets[p->tok[K].set], (B))
+    while (pos > 0 || q > 0 || in) {
+        if (in) {                                  /* inside SEGS token q, pos > 0 */
+            if (POS(pos - 1, q)) { in = false; pos--; start[q] = (long)pos; }
+            else if (INS(pos - 1, q)) pos--;
+            else { rc = -1; goto out; }
+            continue;
+        }
+        if (q < n && (TYPE(q) == T_STAR || TYPE(q) == T_SEGS)) start[q] = (long)pos;
+        unsigned b = pos ? (unsigned char)s[pos - 1] : 0;
+        if (q > 0 && TYPE(q - 1) != T_ONE && POS(pos, q - 1)) {
+            /* the skip over token q-1 (STAR ends, or SEGS is empty) */
+            end[q - 1] = (long)pos;
+            q--;
+        } else if (pos > 0 && q > 0 && TYPE(q - 1) == T_ONE && TAKES(q - 1, b) && POS(pos - 1, q - 1)) {
+            pos--; q--;
+        } else if (pos > 0 && q < n && TYPE(q) == T_STAR && TAKES(q, b) && POS(pos - 1, q)) {
+            pos--;                                 /* the star took one more byte */
+        } else if (pos > 0 && q > 0 && TYPE(q - 1) == T_SEGS && b == '/' &&
+                   (POS(pos - 1, q - 1) || INS(pos - 1, q - 1))) {
+            end[q - 1] = (long)pos;                /* SEGS ends with this '/' */
+            if (POS(pos - 1, q - 1)) { pos--; q--; start[q] = (long)pos; }
+            else { pos--; q--; in = true; }
+        } else { rc = -1; goto out; }              /* cannot happen: S is exact */
+    }
+    /* The walk ends in the start state, which may be inside a first STAR. */
+    if (n > 0 && TYPE(0) == T_STAR) start[0] = 0;
+#undef POS
+#undef INS
+#undef TYPE
+#undef TAKES
+    *nspan = 0;
+    for (size_t k = 0; k < n; k++) {
+        if (TYPE_IS_STRETCH(p->tok[k].type)) {
+            if (*nspan >= maxspan || start[k] < 0 || end[k] < start[k]) { rc = -1; goto out; }
+            span[*nspan][0] = (uint32_t)start[k];
+            span[*nspan][1] = (uint32_t)end[k];
+            (*nspan)++;
+        }
+    }
+    rc = 1;
+out:
+    free(S); free(start); free(end);
+    return rc;
+}
+
+int vdp_certificate(const vdp_policy_t *p, int rule_index, const char *s, vdp_cert_t *c) {
+    memset(c, 0, sizeof *c);
+    c->rule = rule_index;
+    if (rule_index < 0) return 0;                  /* symbolic, several rules */
+    if ((size_t)rule_index >= p->n) return -1;
+    const vdp_str_atom_t *a = &p->rules[rule_index].s;
+    size_t sl = strnlen(s, VDP_STR_MAX + 1);
+    if (a->op == VDP_STR_CONTAINS) {
+        const char *hit = memmem(s, sl, a->c, a->len);
+        if (!hit) return -1;
+        c->wkind = VDP_WIT_OFFSET;
+        c->off = (uint32_t)(hit - s);
+        return 0;
+    }
+    if (a->op == VDP_STR_GLOB) {
+        size_t ns = 0;
+        if (prog_witness(a->prog, s, sl, c->span, VDP_GLOB_MAX_WILD, &ns) != 1) return -1;
+        c->wkind = VDP_WIT_SPANS;
+        c->nspan = (uint32_t)ns;
+        return 0;
+    }
+    return 0;
+}
+
 void vdp_policy_free(vdp_policy_t *p) {
     if (!p) return;
     for (size_t i = 0; i < p->n; i++) {
@@ -512,7 +609,7 @@ void vdp_policy_free(vdp_policy_t *p) {
 /* Policy parsing                                                            */
 /* ------------------------------------------------------------------------ */
 
-static int vdp_policy_load_inner(const char *path, vdp_policy_t *p, char *err, size_t errlen);
+static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, char *err, size_t errlen);
 
 static int perr(char *err, size_t errlen, const char *path, int line,
                 const char *fmt, ...) {
@@ -570,14 +667,25 @@ static int bv_add(vdp_bv_atom_t *b, uint32_t mask, uint32_t value) {
 
 int vdp_policy_load(const char *path, vdp_policy_t *p, char *err, size_t errlen) {
     memset(p, 0, sizeof(*p));
-    int rc = vdp_policy_load_inner(path, p, err, errlen);
+    FILE *f = fopen(path, "re");
+    if (!f) return perr(err, errlen, path, 0, "cannot open: %s", strerror(errno));
+    int rc = vdp_policy_load_inner(path, f, p, err, errlen);
     if (rc < 0) { vdp_policy_free(p); p->n = 0; }
     return rc;
 }
 
-static int vdp_policy_load_inner(const char *path, vdp_policy_t *p, char *err, size_t errlen) {
-    FILE *f = fopen(path, "re");
-    if (!f) return perr(err, errlen, path, 0, "cannot open: %s", strerror(errno));
+int vdp_policy_load_mem(const char *name, const char *buf, size_t len, vdp_policy_t *p,
+                        char *err, size_t errlen) {
+    memset(p, 0, sizeof(*p));
+    if (len == 0) return 0;                        /* an empty policy: no rules */
+    FILE *f = fmemopen((void *)buf, len, "r");
+    if (!f) return perr(err, errlen, name, 0, "cannot read policy: %s", strerror(errno));
+    int rc = vdp_policy_load_inner(name, f, p, err, errlen);
+    if (rc < 0) { vdp_policy_free(p); p->n = 0; }
+    return rc;
+}
+
+static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, char *err, size_t errlen) {
 
     char *line = NULL;
     size_t cap = 0;
@@ -809,6 +917,22 @@ vdp_verdict_t vdp_decide(const vdp_policy_t *p, vdp_kind_t kind, const char *s,
 
     size_t sl = strnlen(s, VDP_STR_MAX + 1);
     if (sl > VDP_STR_MAX) { *why = VDP_WHY_LENGTH_GUARD; return VDP_UNKNOWN; }
+
+#ifdef VDP_FAULT_INJECT
+    /* TEST BUILDS ONLY (make warden_faultinject, tests/test_v1150.sh): a
+     * planted bug. A path ending in "/.inject" is decided SATISFIED by the last
+     * allow path rule, whatever the policy says, so the test can show that the
+     * certificate checker, not the procedure, has the last word. */
+    if (kind == VDP_KIND_PATH && sl >= 8 && !memcmp(s + sl - 8, "/.inject", 8)) {
+        for (size_t i = p->n; i-- > 0;) {
+            if (p->rules[i].kind == VDP_KIND_PATH && p->rules[i].verb == VDP_ALLOW) {
+                *rule_index = (int)i;
+                *why = VDP_WHY_RULE;
+                return VDP_SATISFIED;
+            }
+        }
+    }
+#endif
 
     bool ground = (kind != VDP_KIND_PATH) || has_flags;
     if (kind == VDP_KIND_PATH && has_flags && (flags & ~VDP_KNOWN_OFLAGS)) {

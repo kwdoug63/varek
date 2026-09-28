@@ -17,9 +17,12 @@
 //       runs both methods on the same policies).
 //   vdp_check <policy> batch
 //       Reads queries from stdin, one per line:
-//           <path|host|exec> <flags|-> <hex-encoded string>
+//           <path|host|exec> <flags|-> <hex-encoded string, or '=' if empty>
 //       flags is a decimal or 0x-hex 32-bit value, or '-' for symbolic flags.
-//       Writes one JSON line per query: {"verdict","rule","line","why"}.
+//       Writes one JSON line per query: {"verdict","rule","line","why"}, and
+//       for a SATISFIED verdict (v1.15) its certificate's witness "w" in the
+//       vdp_cert_check input form ('-', 'c:<offset>' or 'g:<a>-<b>,...';
+//       "!" if no witness could be built).
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -58,7 +61,7 @@ static int do_batch(void) {
         char *k = strtok_r(line, " ", &save);
         char *fl = strtok_r(NULL, " ", &save);
         char *hx = strtok_r(NULL, " ", &save);
-        if (!hx) hx = "";          /* empty string */
+        if (!hx || !strcmp(hx, "=")) hx = "";   /* empty string (absent, or '=') */
         vdp_kind_t kind;
         if (!k || !fl || parse_kind(k, &kind) < 0) {
             printf("{\"error\":\"bad query\"}\n");
@@ -83,9 +86,21 @@ static int do_batch(void) {
         int ri;
         vdp_why_t why;
         vdp_verdict_t v = vdp_decide(&g_pol, kind, s, flags, has_flags, &ri, &why);
-        printf("{\"verdict\":\"%s\",\"rule\":%d,\"line\":%d,\"why\":\"%s\"}\n",
+        printf("{\"verdict\":\"%s\",\"rule\":%d,\"line\":%d,\"why\":\"%s\"",
                vdp_verdict_name(v), ri, ri >= 0 ? g_pol.rules[ri].line : -1,
                vdp_why_name(why));
+        if (v == VDP_SATISFIED) {
+            vdp_cert_t c;
+            if (vdp_certificate(&g_pol, ri, s, &c) < 0) printf(",\"w\":\"!\"");
+            else if (c.wkind == VDP_WIT_OFFSET) printf(",\"w\":\"c:%u\"", c.off);
+            else if (c.wkind == VDP_WIT_SPANS) {
+                printf(",\"w\":\"g:");
+                for (uint32_t k = 0; k < c.nspan; k++)
+                    printf("%s%u-%u", k ? "," : "", c.span[k][0], c.span[k][1]);
+                printf("\"");
+            } else printf(",\"w\":\"-\"");
+        }
+        printf("}\n");
     }
     free(line);
     fflush(stdout);

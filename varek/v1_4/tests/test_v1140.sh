@@ -160,8 +160,10 @@ for p in pols:
     ra = subprocess.run([new, p, "analyze"], capture_output=True, text=True).stdout
     rb = subprocess.run([old, p, "analyze"], capture_output=True, text=True).stdout
     strip = lambda t: [ {k: v for k, v in json.loads(l).items() if k in ("index","line","kind","verb","reach")} for l in t.splitlines() ]
+    # verdicts compared field by field (v1.15 adds the certificate witness "w")
+    verd = lambda t: [ {k: v for k, v in json.loads(l).items() if k in ("verdict","rule","line","why")} for l in t.splitlines() ]
     n += len(qs)
-    if a != b or strip(ra) != strip(rb):
+    if verd(a) != verd(b) or strip(ra) != strip(rb):
         bad += 1; print("DIFF", p)
 print(f"compat: {len(pols)} policies, {n} queries, {bad} policies differ")
 PY
