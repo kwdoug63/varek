@@ -50,9 +50,10 @@ this section is present in a released tag; it is stated as direction.
 
 ## [1.12.2] - 2026-09-28
 
-v1.12.2 lets ordinary agents run under the live Warden: they can start threads,
-collect their children and call `isatty()`. All three gaps date from the v1.9.2
-default-deny allowlist. It also closes an exec-allowlist bypass through the
+v1.12.2 lets agent code start threads, collect its children and call
+`isatty()` under the live Warden. All three gaps date from the v1.9.2 default-deny
+allowlist. (Dynamically linked agents such as CPython still cannot start until
+v1.12.3; see Known issues.) It also closes an exec-allowlist bypass through the
 bootstrap exec that threads would have made routine. No verdict *semantics*
 change, and no namespace denial is weaker.
 
@@ -78,13 +79,18 @@ change, and no namespace denial is weaker.
   `subprocess.run()` and `os.system()` failed with `EPERM` after the child ran.
 - **ioctl.** Admitted for `TCGETS`, `TIOCGWINSZ`, `FIOCLEX`, `FIONCLEX`,
   `FIONBIO` and `FIONREAD` only (full 64-bit match). `isatty()` returned `EPERM`
-  and CPython could not mark its descriptors close-on-exec. `TIOCSTI`, `TCSETS`
+  and CPython could not make a descriptor non-inheritable. `TIOCSTI`, `TCSETS`
   and every other request stay refused.
+- **Removed-ABI calls kill the whole process.** The bad-architecture action is
+  `KILL_PROCESS` in strict builds; libseccomp's default killed only the calling
+  thread.
+- **`unshare(CLONE_NEWTIME)`** is denied with the other namespace bits (it was
+  admitted in observe mode).
 
 ### Changed
 
 - The Warden prints `[warden] agent killed by signal N (...)` when the agent dies
-  by a signal; through v1.12.1 a filter kill left only exit status 1.
+  by a signal on its own; through v1.12.1 a filter kill left only exit status 1.
 - `varek_cyclonedx.py` takes the Warden version for the BOM from the stream's
   `run_start` record, so a v1.12.1 log is labelled 1.12.1.
 - `run_start` reads `"warden":"1.12.2"`.

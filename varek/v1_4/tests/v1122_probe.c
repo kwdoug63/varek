@@ -25,7 +25,7 @@
 //               real exit status.
 //   ioctl       the six admitted requests behave as on a normal system
 //               (isatty() on a pipe says ENOTTY, FIOCLEX sets FD_CLOEXEC);
-//               TIOCSTI, TCSETS and an admitted request with junk in the upper
+//               TIOCSTI, TCSETS (both tried on a pipe) and an admitted request with junk in the upper
 //               32 bits are refused with EPERM before reaching any driver.
 //   reexec      a thread, and a forked child, that execve the agent's own binary
 //               are refused. The bootstrap exec is answered with CONTINUE, which
@@ -228,9 +228,11 @@ static void check_ioctl(void) {
         line("ioctl_fionread", "OK", 0);
     else line("ioctl_fionread", "FAILED", errno);
     /* Refused: EPERM comes from the filter; a pipe would otherwise say ENOTTY. */
+    /* On a pipe the kernel itself would answer ENOTTY, so EPERM can only be
+     * the filter's; and a regression cannot push input into a real terminal. */
     char c = 'x';
     errno = 0;
-    int r = ioctl(0, TIOCSTI, &c);
+    int r = ioctl(p[0], TIOCSTI, &c);
     line("ioctl_tiocsti", r < 0 && errno == EPERM ? "REFUSED" : "ADMITTED", r < 0 ? errno : 0);
     struct termios_stub { char b[64]; } tio = {0};
     errno = 0;

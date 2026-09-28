@@ -138,8 +138,9 @@ static const char *kHardDeny[] = {
 
 // v1.12.2: ioctl, admitted for these request numbers only. Through v1.12.1
 // ioctl was not admitted at all, so isatty() failed with EPERM instead of
-// ENOTTY and ioctl(FIOCLEX), which CPython uses to mark every fd it opens
-// close-on-exec, failed outright: Python could not even open its script.
+// ENOTTY, and ioctl(FIOCLEX), which CPython uses when it makes a descriptor
+// non-inheritable and treats as fatal on EPERM, failed: under v1.12.1 CPython
+// could not open its own script.
 // Each request below only reads state or changes a flag on the caller's own
 // descriptor that fcntl (already admitted) can change too. Every other request
 // stays refused, TIOCSTI (pushing input into a terminal the operator may be
@@ -185,19 +186,19 @@ static int deny_ns_bits(scmp_filter_ctx ctx, int sysnr) {
 // clone3 takes its flags inside a struct in the caller's memory, which a
 // seccomp filter cannot read, so the namespace-bit checks applied to clone and
 // unshare cannot be applied to it; it must never run. Through v1.12.1 it was on
-// the kill list. But glibc >= 2.34 creates every thread (and every posix_spawn
-// child) with clone3, so an agent that started a single thread, which includes
-// most Python, Java and Node agents, was killed on the spot.
+// the kill list. But glibc >= 2.34 creates every thread with clone3 (and
+// recent glibc, 2.39 here, uses it for posix_spawn too), so an agent that
+// started a single thread was killed on the spot.
 //
 // ENOSYS is the answer the C library is written to handle: it means "this
 // kernel has no clone3", and glibc and Rust's standard library then retry with
-// clone(), whose flags are a register argument the filter does check (musl and
-// the Go runtime never use clone3). It has to be ENOSYS: glibc falls back on
+// clone(), whose flags are a register argument the filter does check (musl
+// never uses clone3; Go's runtime threads use clone). It has to be ENOSYS: glibc falls back on
 // ENOSYS only, so the default EPERM would still break every thread. With it,
 // threads and posix_spawn work, every clone the agent makes still goes through
 // the namespace-bit denials below, and clone3 itself still never executes.
-// Docker's default profile, systemd, Chromium and Flatpak answer clone3 the
-// same way for the same reason.
+// Docker's default profile (for containers without CAP_SYS_ADMIN), systemd,
+// Chromium and Flatpak answer clone3 the same way for the same reason.
 //
 // No other rule names clone3, and this one is the same in enforce, observe and
 // non-strict builds.
@@ -216,11 +217,19 @@ static int build(scmp_filter_ctx *out_ctx, int observe) {
     uint32_t def = observe ? SCMP_ACT_LOG : SCMP_ACT_ERRNO(EPERM);
     scmp_filter_ctx ctx = seccomp_init(def);
     if (!ctx) return -ENOMEM;
+    int rc;
 
     (void)seccomp_arch_remove(ctx, SCMP_ARCH_X86);   // no 32-bit compat ABI
     (void)seccomp_arch_remove(ctx, SCMP_ARCH_X32);   // x32 falls to default/kill
+#if WD_BASELINE_STRICT
+    // v1.12.2: a call from a removed ABI (i386, x32) kills the whole process,
+    // not just the calling thread. libseccomp's default is KILL_THREAD, which
+    // was equivalent while agents could not start threads; with threads it
+    // would leave the rest of the process running, possibly holding locks.
+    if ((rc = seccomp_attr_set(ctx, SCMP_FLTATR_ACT_BADARCH,
+                               SCMP_ACT_KILL_PROCESS)) < 0) goto fail;
+#endif
 
-    int rc;
     if ((rc = add_list(ctx, kHardDeny, WD_HARD_DENY)) < 0) goto fail;  // most severe first
     if ((rc = add_clone3(ctx)) < 0) goto fail;
     for (size_t i = 0; i < sizeof kIoctlAdmit / sizeof kIoctlAdmit[0]; ++i) {
@@ -232,6 +241,13 @@ static int build(scmp_filter_ctx *out_ctx, int observe) {
     if ((rc = add_list(ctx, kAdmit, SCMP_ACT_ALLOW)) < 0) goto fail;
     if ((rc = deny_ns_bits(ctx, SCMP_SYS(clone))) < 0) goto fail;
     if ((rc = deny_ns_bits(ctx, SCMP_SYS(unshare))) < 0) goto fail;
+    // v1.12.2: unshare(CLONE_NEWTIME) was missing from the namespace set
+    // (it only mattered in observe mode, whose default action admits). clone()
+    // cannot take CLONE_NEWTIME: that bit sits in its exit-signal field.
+    rc = seccomp_rule_add(ctx, WD_HARD_DENY, SCMP_SYS(unshare), 1,
+                          SCMP_A0(SCMP_CMP_MASKED_EQ, (scmp_datum_t)CLONE_NEWTIME,
+                                  (scmp_datum_t)CLONE_NEWTIME));
+    if (rc < 0) goto fail;
 
     // clone admitted only when no namespace bit is set (conditional allow; an
     // unconditional allow would collapse the ns-bit denies above).

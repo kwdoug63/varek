@@ -121,6 +121,12 @@ else flunk "run_start names Warden 1.12.2"; fi
 if python3 "$EXPORTER" --log "$VERDICTS" --output "$OUT/bom.json" >/dev/null 2>"$OUT/exp.err"; then
     pass "CycloneDX exporter accepts the multithreaded stream"
 else flunk "CycloneDX exporter accepts the multithreaded stream ($(head -1 "$OUT/exp.err"))"; fi
+# The BOM names the Warden version from run_start, not the exporter's own.
+sed 's/"warden":"1\.12\.2"/"warden":"9.9.9"/' "$VERDICTS" > "$OUT/relabel.log"
+if python3 "$EXPORTER" --log "$OUT/relabel.log" --output "$OUT/relabel.json" >/dev/null 2>&1 \
+   && grep -q '"version": "9.9.9"' "$OUT/relabel.json"; then
+    pass "BOM takes the Warden version from run_start"
+else flunk "BOM takes the Warden version from run_start"; fi
 
 echo "-- 7. a killed agent is reported"
 # A static one-liner that makes a hard-denied call. Built here so the suite has
@@ -133,7 +139,7 @@ if printf '#include <unistd.h>\n#include <sys/syscall.h>\nint main(void){syscall
         pass "Warden reports the agent was killed by SIGSYS"
     else flunk "Warden reports the agent was killed by SIGSYS"; fi
 else
-    note SKIP "no C compiler for the kill-report check"
+    flunk "build the kill-report helper (needs a C compiler with static libc)"
 fi
 
 rm -rf "$OUT"

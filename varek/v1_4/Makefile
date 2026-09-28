@@ -94,7 +94,7 @@ tests/v1122_probe: tests/v1122_probe.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -static -pthread -o $@ $<
 
 tests/test_v14_filter: tests/test_v14_filter.c warden_baseline_filter.c
-	$(CC) $(CFLAGS) -I. $(LDFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(CFLAGS) -I. $(LDFLAGS) -pthread -o $@ $^ $(LDLIBS)
 
 test-v1122: warden tests/v1122_probe tests/test_v14_filter
 	@sudo ./tests/test_v14_filter

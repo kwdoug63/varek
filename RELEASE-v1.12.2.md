@@ -5,20 +5,25 @@ Released 2026-09-28 · MIT · github.com/kwdoug63/varek
 ## Summary
 
 v1.12.2 fixes three gaps in the baseline seccomp filter that stopped ordinary
-agents from running under the live Warden, and one exec-allowlist bypass that
-admitting threads would have made routine. The three filter gaps date from the
-default-deny allowlist in v1.9.2:
+agent code from running under the live Warden, and one exec-allowlist bypass
+that admitting threads would have made routine. The three filter gaps date from
+the default-deny allowlist in v1.9.2:
 
 - **An agent that started a thread was killed.** `clone3` was on the kill list,
   and glibc 2.34 and later creates every thread with `clone3`. That covers every
-  current mainstream distribution (Ubuntu 22.04+, Debian 12+, RHEL 9+), and with
-  it most Python, Java and Node agents.
+  current mainstream distribution (Ubuntu 22.04+, Debian 12+, RHEL 9+).
 - **An agent could start a child process but never collect it.** `wait4` and
   `waitid` were not admitted, so `waitpid()`, `subprocess.run()` and
   `os.system()` failed after the child had already run.
 - **`ioctl` was not admitted at all.** `isatty()` failed with `EPERM` instead of
-  `ENOTTY`, and CPython, which marks every descriptor it opens close-on-exec with
-  `ioctl(FIOCLEX)`, could not open its own script.
+  `ENOTTY`. CPython uses `ioctl(FIOCLEX)` when it makes a descriptor
+  non-inheritable and treats `EPERM` there as fatal, so it could not open its
+  own script.
+
+Python, Java and Node are normally dynamically linked, and such agents cannot
+start under v1.12.x (see Known issues; planned for v1.12.3). This release
+removes the thread, wait and `ioctl` blockers they would hit next. Static
+agents benefit now.
 
 Testing the thread fix turned up the bypass: the Warden's one-time "bootstrap"
 exec allow was granted once per *process id*, not once per run, and is answered
@@ -50,9 +55,9 @@ binary, get `CONTINUE`, and have a sibling thread rewrite the path between the
 Warden's read and the kernel's. The kernel then ran a binary the exec policy had
 never allowed. It still ran under the same filter, so its opens and connects
 were still mediated, but the exec allowlist was bypassed. A deliberate agent
-could already reach this through a raw `clone(CLONE_VM)`. With threads admitted,
-ordinary thread code could reach it too, and the race was reproduced against
-the v1.12.2 filter before this fix.
+could already have reached it through a raw `clone(CLONE_VM)`. With threads
+admitted, ordinary thread code could reach it too, and the race was reproduced
+against the v1.12.2 filter before this fix.
 
 v1.12.2 grants the bootstrap allow exactly once per run, and only to the process
 the Warden launched. Every later exec, including a thread or child re-executing
@@ -71,8 +76,9 @@ v1.12.1 the filter enforced that by killing the process.
 v1.12.2 enforces it by answering `ENOSYS` ("this kernel has no clone3"). The C
 library is written to handle that answer: glibc and Rust's standard library
 retry with `clone()`, whose flags are a register argument the filter does check.
-(musl and the Go runtime never use `clone3`.) Docker's default seccomp profile,
-systemd, Chromium and Flatpak answer `clone3` the same way, for the same reason.
+musl never uses `clone3`, and Go's runtime threads use `clone`. Docker's default
+seccomp profile (for containers without `CAP_SYS_ADMIN`), systemd, Chromium and
+Flatpak answer `clone3` the same way, for the same reason.
 
 What this does and does not change:
 
@@ -88,6 +94,22 @@ What this does and does not change:
   create threads with a raw `clone(CLONE_VM | CLONE_THREAD ...)` call; what
   changes is that a normal C library can do it too.
 - The rule is the same in enforce, observe and non-strict builds.
+
+### Whole-process kill for removed ABIs
+
+A call through a removed ABI (i386 `int 0x80`, x32) used libseccomp's default
+bad-architecture action, which kills only the calling thread. That made no
+difference while agents could not start threads. With threads, the rest of the
+process would keep running, possibly holding locks. In strict builds it now
+kills the whole process, like every other hard deny.
+
+### unshare(CLONE_NEWTIME) in the namespace set
+
+`CLONE_NEWTIME` was missing from the namespace bits denied on `unshare`. In
+enforce mode that made no difference, because `unshare` without a listed bit
+fell to the default `EPERM`. In observe mode, whose default action admits, it
+was allowed. It is now denied like the other namespace bits. (`clone` cannot
+take `CLONE_NEWTIME`: that bit sits in its exit-signal field.)
 
 ### wait4 and waitid admitted
 
@@ -107,7 +129,8 @@ own process tree.
 Each one only reads state or changes a flag on the caller's own descriptor that
 the already-admitted `fcntl` can change. Every other request is still refused,
 including `TIOCSTI`, which could push input into a terminal the operator is
-sitting at, and `TCSETS`. The match is on the full 64-bit argument, so an
+sitting at, and `TCSETS`. The match is on the full 64-bit argument (the
+filter checks that the upper 32 bits are zero), so an
 admitted request with junk in the upper bits matches nothing and is refused.
 
 ### A killed agent is reported
@@ -117,8 +140,11 @@ is how a thread-starting agent could be killed on every run without a word. The
 Warden now prints, for example:
 
 ```
-[warden] agent killed by signal 31 (Bad system call): a hard-denied system call
+[warden] agent killed by signal 31 (Bad system call): most likely a hard-denied system call
 ```
+
+It prints this only when the agent ended on its own, not when the Warden was
+stopped and killed the agent itself.
 
 ### Exporter names the Warden that made the decisions
 
@@ -128,7 +154,7 @@ exported with this tool is labelled 1.12.1, not 1.12.2.
 
 ## Testing
 
-- `make test-v1122`: 11 filter unit checks, then 37 assertions against a live
+- `make test-v1122`: 12 filter unit checks, then 38 assertions against a live
   Warden. Against v1.12.1 the probe is killed at its first `pthread_create` and
   the suite fails. Against a build with the thread fix but not the bootstrap
   fix, the re-exec checks fail.
@@ -140,29 +166,34 @@ exported with this tool is labelled 1.12.1, not 1.12.2.
     `clone(CLONE_NEWUSER)` is still killed with `SIGSYS`.
   - `waitpid`, `wait4` with `rusage`, `waitid` and `WNOHANG` report the child's
     real status.
-  - The `ioctl` allowlist behaves as above.
+  - The `ioctl` allowlist behaves as above. `TIOCSTI` and `TCSETS` are tried on
+    a pipe, where the kernel would answer `ENOTTY`, so an `EPERM` can only come
+    from the filter.
+  - A removed-ABI call from a non-main thread kills the whole process.
   - A thread and a forked child that `execve` the agent's own binary are
     refused, and the run holds exactly one bootstrap allow.
   - `posix_spawn` of a binary the policy does not name fails, is recorded, and
     the agent survives.
-  - The multithreaded stream exports as a CycloneDX BOM, and a killed agent is
-    reported.
+  - The multithreaded stream exports as a CycloneDX BOM, the BOM takes the
+    Warden version from `run_start`, and a killed agent is reported.
 - `make test-v1121`, `make test-v112`, `make test-lifecycle` and
   `make run-conformance` pass unchanged.
-- Decision latency is unchanged within run-to-run noise (P50 5 µs; P99 59–66 µs
-  before and 56–58 µs after, three runs each of `bench_target 10000` on the same
-  host).
+- Decision latency is unchanged within run-to-run noise (P50 5–6 µs before and
+  3–6 µs after; P99 60–107 µs before and 53–76 µs after; five interleaved runs
+  each of `bench_target 10000` on the same host).
 
 ## Compatibility
 
 - A `clone3` call now returns `ENOSYS` instead of killing the process.
   `clone3` has left the hard-deny list.
-- Agents that start threads, wait for children, or call `isatty()` now run.
+- Static agents that start threads, wait for children, or call `isatty()` now
+  run. Dynamically linked agents need v1.12.3.
 - An agent can no longer re-execute its own binary from a thread or child (for
   example Python `multiprocessing` in `spawn` mode). Exec is deny-only apart
   from the one launch, as documented since v1.9.1.
-- `vfork` is still not admitted and returns `EPERM`; glibc and CPython fall back
-  to `clone`.
+- `vfork` is still not admitted. glibc's `vfork()` returns `EPERM` to its
+  caller; glibc's `posix_spawn` does not use it, and CPython falls back to
+  `fork()`.
 - No policy-file, plan-file or record-format change. `run_start` reads
   `"warden":"1.12.2"`.
 
