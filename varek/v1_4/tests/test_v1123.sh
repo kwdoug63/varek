@@ -102,8 +102,9 @@ if grep '^{' "$VERDICTS" | grep '"ALLOW"' | grep -Eq '"/proc/(1|[0-9]+/task)?/?(
 else pass "no foreign /proc object was allowed"; fi
 
 echo "-- 5. verdict stream still attests"
-if grep '^{' "$VERDICTS" | grep -Eq '"warden":"1\.12\.([3-9]|[1-9][0-9])"'; then pass "run_start names Warden 1.12.3 or later"
-else flunk "run_start names Warden 1.12.3 or later"; fi
+wv="$(grep -o '"warden":"[0-9.]*"' "$VERDICTS" | head -1 | cut -d'"' -f4)"
+if [ -n "$wv" ] && printf '%s\n%s\n' 1.12.3 "$wv" | sort -V -C; then pass "run_start names Warden 1.12.3 or later ($wv)"
+else flunk "run_start names Warden 1.12.3 or later (got ${wv:-none})"; fi
 if python3 "$EXPORTER" --log "$VERDICTS" --output "$OUT/bom.json" >/dev/null 2>"$OUT/exp.err"; then
     pass "CycloneDX exporter accepts the stream"
 else flunk "CycloneDX exporter accepts the stream ($(head -1 "$OUT/exp.err"))"; fi

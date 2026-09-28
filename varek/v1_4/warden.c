@@ -109,6 +109,7 @@
 #include "plan_spec.h"
 #include "warden_adapter.h"
 #include "warden_baseline_filter.h"
+#include "smt_decide.h"            /* v1.13 SMT decision procedure */
 #include "warden_lifecycle.h"   /* v1.9.3 supervisor/target lifecycle coupling */
 
 /* Kernel/libc compatibility shims --------------------------------- */
@@ -185,6 +186,9 @@ struct action {
                                          * the policy actually decided on */
     int           open_flags;
     int           open_mode;
+    bool          flags_known;          /* v1.13: open_flags came from the syscall */
+    int           policy_line;          /* v1.13: deciding rule's line, or -1 */
+    const char   *why;                  /* v1.13: decision-procedure reason */
     int           connect_family;
     int           connect_port;
 };
@@ -202,67 +206,50 @@ static const char *action_kind_name(action_kind_t k) {
 
 /* ---------------- Policy ---------------- */
 
-typedef enum { RULE_PATH_PREFIX, RULE_HOST, RULE_EXEC } rule_kind_t;
-
-struct rule {
-    rule_kind_t kind;
-    char        match[PATH_LIMIT];
-    decision_t  decision;
-};
-
+/* v1.13: the policy is parsed and decided by the SMT decision procedure in
+ * smt_decide.c. See smt_decide.h for the fragment (bounded strings for the
+ * path/host/exec constant, a 32-bit bitvector for open flags), the verdict
+ * semantics, and the soundness obligations. */
 struct policy {
     char         name[64];
     char         version[16];
-    struct rule  rules[MAX_RULES];
-    size_t       n_rules;
+    vdp_policy_t v;
 };
 
 static int policy_load(const char *path, struct policy *p) {
     memset(p, 0, sizeof(*p));
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.4");
-
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "[warden] policy: cannot open %s: %s\n",
-                path, strerror(errno));
+    snprintf(p->version, sizeof(p->version), "1.13");
+    char err[512];
+    if (vdp_policy_load(path, &p->v, err, sizeof err) < 0) {
+        fprintf(stderr, "[warden] policy %s\n", err);
         return -1;
     }
-
-    char line[512];
-    int  lineno = 0;
-    while (fgets(line, sizeof(line), f) && p->n_rules < MAX_RULES) {
-        lineno++;
-        char *q = line;
-        while (*q && isspace((unsigned char)*q)) q++;
-        if (*q == '#' || *q == '\0' || *q == '\n') continue;
-        size_t L = strlen(q);
-        while (L && (q[L-1] == '\n' || q[L-1] == '\r' || q[L-1] == ' ')) {
-            q[--L] = '\0';
+    /* v1.13: load-time analysis. The decision procedure decides, for every
+     * rule, whether ANY action can reach it as the first matching rule. A rule
+     * that can never fire is almost always a policy bug (typically a deny
+     * shadowed by an earlier, broader allow), so it is reported. It does not
+     * change any decision. */
+    size_t dead = 0;
+    for (size_t i = 0; i < p->v.n; i++) {
+        vdp_reach_t rr = vdp_rule_reachable(&p->v, i);
+        const vdp_rule_t *r = &p->v.rules[i];
+        char adv[512];
+        if (vdp_rule_advisory(r, adv, sizeof adv))
+            fprintf(stderr, "[warden] policy %s:%d: note: %s\n", path, r->line, adv);
+        if (rr == VDP_DEAD) {
+            dead++;
+            fprintf(stderr, "[warden] policy %s:%d: WARNING: %s %s rule can never "
+                    "fire: every action it matches is decided by an earlier rule\n",
+                    path, r->line, r->verb == VDP_ALLOW ? "allow" : "deny",
+                    vdp_kind_name(r->kind));
+        } else if (rr == VDP_REACH_UNKNOWN) {
+            fprintf(stderr, "[warden] policy %s:%d: note: reachability not decided "
+                    "(outside the enumeration bound)\n", path, r->line);
         }
-
-        char verb[16] = {0}, kind[16] = {0}, match[PATH_LIMIT] = {0};
-        if (sscanf(q, "%15s %15s %4095s", verb, kind, match) != 3) {
-            fprintf(stderr, "[warden] policy %s:%d: bad rule\n",
-                    path, lineno);
-            fclose(f); return -1;
-        }
-        struct rule *r = &p->rules[p->n_rules];
-        if      (!strcmp(kind, "path"))   r->kind = RULE_PATH_PREFIX;
-        else if (!strcmp(kind, "host"))   r->kind = RULE_HOST;
-        else if (!strcmp(kind, "exec"))   r->kind = RULE_EXEC;
-        else { fprintf(stderr, "[warden] policy %s:%d: unknown kind %s\n",
-                       path, lineno, kind); fclose(f); return -1; }
-        if      (!strcmp(verb, "allow"))  r->decision = DEC_ALLOW;
-        else if (!strcmp(verb, "deny"))   r->decision = DEC_DENY;
-        else { fprintf(stderr, "[warden] policy %s:%d: unknown verb %s\n",
-                       path, lineno, verb); fclose(f); return -1; }
-        snprintf(r->match, sizeof(r->match), "%s", match);
-        p->n_rules++;
     }
-    fclose(f);
-    fprintf(stderr, "[warden] loaded policy %s v%s with %zu rules\n",
-            p->name, p->version, p->n_rules);
+    fprintf(stderr, "[warden] loaded policy %s v%s with %zu rules (%zu can never fire)\n",
+            p->name, p->version, p->v.n, dead);
     return 0;
 }
 
@@ -362,6 +349,7 @@ static int derive_intent(const struct seccomp_notif *req,
                          struct action *out)
 {
     memset(out, 0, sizeof(*out));
+    out->policy_line = -1;
     int nr = (int)req->data.nr;
 
     if (nr == __NR_openat) {
@@ -371,7 +359,10 @@ static int derive_intent(const struct seccomp_notif *req,
             return -1;
         out->open_dirfd = (int)req->data.args[0];
         out->resolved[0] = '\0';
+        /* The kernel's openat() takes `int flags`: the upper 32 bits of the
+         * register are ignored, and so is the decision procedure's model. */
         out->open_flags = (int)req->data.args[2];
+        out->flags_known = true;
         out->open_mode  = (int)(req->data.args[3] & 0777);
         return 0;
     }
@@ -475,52 +466,53 @@ static int derive_intent(const struct seccomp_notif *req,
 
 /* ---------------- Policy Decision ---------------- */
 
-static decision_t policy_decide(const struct policy *p,
-                                const struct action *a)
+static decision_t policy_decide(const struct policy *p, struct action *a)
 {
-    if (a->kind == ACT_FILE_OPEN) {
-        /* v1.12: decide on the RESOLVED, canonical path — the object the
-         * kernel actually opened — not the raw pathname the agent supplied.
-         * `..` traversal and symlink/bind-mount indirection can no longer
-         * make a denied object match an allow rule, because resolved is the
-         * real target after `..` collapse and after every symlink has been
-         * followed (v1.12.3; v1.12.0-v1.12.2 refused symlinks outright). If
-         * resolution has not run or failed, resolved is empty and nothing
-         * matches -> UNKNOWN -> deny. */
-        const char *decide_on = a->resolved[0] ? a->resolved : "";
-        if (decide_on[0] == '\0') return DEC_UNKNOWN;
-        for (size_t i = 0; i < p->n_rules; i++) {
-            const struct rule *r = &p->rules[i];
-            if (r->kind != RULE_PATH_PREFIX) continue;
-            size_t L = strlen(r->match);
-            if (strncmp(decide_on, r->match, L) == 0) return r->decision;
-        }
-        return DEC_UNKNOWN;
+    /* v1.13: every decision is made by the SMT decision procedure
+     * (smt_decide.c). A file open is decided on the RESOLVED canonical path
+     * (v1.12: the object actually delivered, after `..` collapse and every
+     * symlink followed) together with the open flags; if resolution has not
+     * run or failed, resolved is empty and the verdict is UNKNOWN -> deny.
+     * When the flags are not known (the --plan gate), they are symbolic:
+     * SATISFIED only if every admissible flags value is. */
+    a->policy_line = -1;
+    a->why = NULL;
+    vdp_kind_t kind;
+    const char *s;
+    switch (a->kind) {
+        case ACT_FILE_OPEN:
+            kind = VDP_KIND_PATH;
+            s = a->resolved;
+            if (s[0] == '\0') { a->why = "no_resolved_path"; return DEC_UNKNOWN; }
+            break;
+        case ACT_NET_CONNECT:  kind = VDP_KIND_HOST; s = a->target; break;
+        case ACT_PROCESS_EXEC: kind = VDP_KIND_EXEC; s = a->target; break;
+        default:
+            a->why = "not_in_fragment";
+            return DEC_UNKNOWN;
     }
-    if (a->kind == ACT_NET_CONNECT) {
-        for (size_t i = 0; i < p->n_rules; i++) {
-            const struct rule *r = &p->rules[i];
-            if (r->kind != RULE_HOST) continue;
-            if (strcmp(a->target, r->match) == 0) return r->decision;
-            const char *colon = strchr(a->target, ':');
-            if (colon) {
-                size_t hostlen = (size_t)(colon - a->target);
-                if (strlen(r->match) == hostlen &&
-                    strncmp(a->target, r->match, hostlen) == 0)
-                    return r->decision;
-            }
-        }
-        return DEC_UNKNOWN;
+    int ri;
+    vdp_why_t why;
+    vdp_verdict_t v = vdp_decide(&p->v, kind, s, (uint32_t)a->open_flags,
+                                 a->kind == ACT_FILE_OPEN && a->flags_known,
+                                 &ri, &why);
+    a->why = vdp_why_name(why);
+    if (ri >= 0) a->policy_line = p->v.rules[ri].line;
+    switch (v) {
+        case VDP_SATISFIED:   return DEC_ALLOW;
+        case VDP_UNSATISFIED: return DEC_DENY;
+        default:              return DEC_UNKNOWN;
     }
-    if (a->kind == ACT_PROCESS_EXEC) {
-        for (size_t i = 0; i < p->n_rules; i++) {
-            const struct rule *r = &p->rules[i];
-            if (r->kind != RULE_EXEC) continue;
-            if (strcmp(a->target, r->match) == 0) return r->decision;
-        }
-        return DEC_UNKNOWN;
-    }
-    return DEC_UNKNOWN;
+}
+
+/* v1.13: the record's rule id for a policy decision. An UNKNOWN because the
+ * action lies outside the decision procedure's fragment is named as such. */
+static const char *decision_rule_id(const struct action *a, decision_t d_raw) {
+    if (d_raw != DEC_UNKNOWN) return "policy_match";
+    if (a->why && (!strcmp(a->why, "unknown_flag_bits") ||
+                   !strcmp(a->why, "access_mode_3")))  return "fragment_escape_flags";
+    if (a->why && !strcmp(a->why, "length_guard"))      return "fragment_escape_length";
+    return "default_deny_unknown";
 }
 
 /* ---------------- v1.6 plan-graph integration ---------------- */
@@ -783,11 +775,11 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     log_line_start();
-    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.12.4\","
+    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.13.0\","
                    "\"policy_path\":\"", g_run_id);
     json_escape(g_log, policy_path);
     fprintf(g_log, "\",\"policy_rules\":%zu,\"timestamp_ns\":%lld}\n",
-            p->n_rules, (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+            p->v.n, (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     fflush(g_log);
 }
 
@@ -836,6 +828,7 @@ static void emit_pathology(uint64_t seq,
         "\",\"decision_raw\":\"%s\","
         "\"decision_final\":\"%s\","
         "\"rule\":\"%s\","
+        "\"policy_line\":%d,"
         "\"kernel_verdict\":\"%s\","
         "\"errno\":%d,"
         "\"latency_us\":%" PRIu64 ","
@@ -843,6 +836,7 @@ static void emit_pathology(uint64_t seq,
         decision_name(d_raw),
         decision_name(d_final),
         rule_id ? rule_id : "none",
+        a->policy_line,
         /* v1.12.1: an ALLOW whose open then failed (EEXIST, ENXIO, ...)
          * delivered nothing; say so rather than reporting ALLOW. */
         d_final == DEC_ALLOW ? (kernel_errno ? "ERRNO" : "ALLOW") : "EPERM",
@@ -1390,7 +1384,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             uint64_t lat_d = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                            + (t1.tv_nsec - t0.tv_nsec);
             emit_pathology(seq++, req.pid, &act, d_raw, d_final,
-                           d_raw == DEC_UNKNOWN ? "default_deny_unknown" : "policy_match",
+                           decision_rule_id(&act, d_raw),
                            lat_d, EACCES);
             send_simple(notify_fd, req.id, d_final);
             continue;
@@ -1416,7 +1410,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         uint64_t lat = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                      + (t1.tv_nsec - t0.tv_nsec);
         emit_pathology(seq++, req.pid, &act, d_raw, d_final,
-                       d_raw == DEC_UNKNOWN ? "default_deny_unknown" : "policy_match",
+                       decision_rule_id(&act, d_raw),
                        lat, d_final == DEC_ALLOW ? 0 : EACCES);
     }
     return false;                         /* the Warden was asked to stop */
@@ -1468,6 +1462,10 @@ static void usage(const char *argv0) {
         "    allow host 127.0.0.1:8080\n"
         "    deny  host evil.example.com\n"
         "    allow exec /usr/bin/env\n"
+        "    allow path /var/log/ readonly     (v1.13: access=ro -O_CREAT -O_TRUNC)\n"
+        "  Path rules also take access=ro|wo|rw, +O_NAME, -O_NAME. Begin a policy\n"
+        "  that uses them with: require warden 1.13\n"
+        "  Check a policy with: tools/vdp_check <policy> lint\n"
         "\n"
         "  Plan file format (see varek/v1_6/sample_plan.txt):\n"
         "    action <label> <kind> <target>\n"
@@ -1516,7 +1514,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    struct policy p;
+    /* ~1 MB (256 rules x 4 KB constants): static, not on the stack. */
+    static struct policy p;
     if (policy_load(policy_path, &p) < 0) return 1;
 
     if (log_init() < 0) {
@@ -1712,7 +1711,7 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr,
         "[warden] supervising pid=%d  notify_fd=%d  policy=%s (%zu rules)  pidns=%s  netns=%s\n",
-        target, notify_fd, p.name, p.n_rules, pidns ? "on" : "off", netns);
+        target, notify_fd, p.name, p.v.n, pidns ? "on" : "off", netns);
 
     bool agent_ended = supervise(notify_fd, target_pidfd, agent_err_fd, &p,
                                  target_argv[0], target);

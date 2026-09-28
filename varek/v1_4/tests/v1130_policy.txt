@@ -1,0 +1,5 @@
+# v1.13.0 regression policy: the open-flag (bitvector) fragment.
+# The probe is static, so only its fixtures are named.
+require warden 1.13
+allow path /tmp/varek_ro_v1130/ readonly     # read-only: access=ro -O_CREAT -O_TRUNC
+allow path /tmp/varek_rw_v1130/              # any flags within the ABI set
