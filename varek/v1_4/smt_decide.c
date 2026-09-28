@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// smt_decide.c — VAREK SMT decision procedure (v1.13; the v1.10 verification
+// smt_decide.c — VAREK SMT decision procedure (v1.14; the v1.10 verification
 // program). See smt_decide.h for the fragment, the verdict semantics and the
 // soundness obligations.
 
@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -120,8 +121,398 @@ const char *vdp_kind_name(vdp_kind_t k) {
 }
 
 /* ------------------------------------------------------------------------ */
+/* String programs (v1.14)                                                   */
+/* ------------------------------------------------------------------------ */
+/*
+ * Every string atom of the bounded string fragment compiles to a program: a
+ * sequence of tokens, each one of
+ *
+ *   ONE(S)   exactly one byte from the set S
+ *   STAR(S)  zero or more bytes from S
+ *   SEGS     the regular expression (.*\/)? : empty, or any bytes ending in
+ *            '/'. The glob unit slash-star-star-slash compiles to ONE('/')
+ *            followed by SEGS.
+ *
+ * Sets never contain byte 0. A program with tokens t_0..t_{n-1} defines a
+ * nondeterministic automaton without epsilon moves except the forward skip over
+ * STAR and SEGS tokens:
+ *
+ *   position state k (0 <= k <= n)   the first k tokens are matched; n accepts
+ *   inner state k                    inside SEGS token k (read some bytes, want '/')
+ *
+ * Glob patterns compile to programs at load and are matched by simulating the
+ * automaton on a bitset of states (vdp_decide). prefix / exact / suffix /
+ * contains compile to programs only for the reachability search; vdp_decide
+ * matches them with memcmp / memmem.
+ */
+
+enum { T_ONE = 0, T_STAR = 1, T_SEGS = 2 };
+
+struct vdp_tok { uint8_t type; uint16_t set; };
+typedef struct { uint64_t w[4]; } bset_t;
+
+struct vdp_prog {
+    size_t          ntok;
+    struct vdp_tok *tok;
+    size_t          nsets;
+    bset_t         *sets;
+    size_t          w1;         /* words per half of a state set (bits 0..ntok) */
+    /* Necessary conditions, checked before the automaton runs (vdp_decide's
+     * hot path): every match starts with pre[0..npre), ends with
+     * suf[0..nsuf), contains mid[0..nmid) (the longest run of single-byte
+     * tokens), has at least minlen bytes, and exactly minlen if exact. */
+    size_t          npre, nsuf, nmid, minlen;
+    bool            exact;
+    unsigned char  *pre, *suf, *mid;
+    /* Word-parallel step tables (bit k = token k): bm[b * w1 ..] the tokens
+     * whose set holds byte b; the tokens that are ONE, STAR, SEGS, and
+     * STAR or SEGS (the forward skips). */
+    uint64_t       *bm, *onem, *starm, *segsm, *skipm;
+};
+
+static inline bool bs_has(const bset_t *s, unsigned b) { return (s->w[b >> 6] >> (b & 63)) & 1; }
+static inline void bs_add(bset_t *s, unsigned b) { s->w[b >> 6] |= 1ull << (b & 63); }
+
+static bset_t bs_any(void) {            /* 1..255 */
+    bset_t s = { { ~0ull, ~0ull, ~0ull, ~0ull } };
+    s.w[0] &= ~1ull;
+    return s;
+}
+static bset_t bs_notslash(void) {       /* 1..255 minus '/' */
+    bset_t s = bs_any();
+    s.w['/' >> 6] &= ~(1ull << ('/' & 63));
+    return s;
+}
+static bset_t bs_one(unsigned char b) { bset_t s = { { 0, 0, 0, 0 } }; bs_add(&s, b); return s; }
+static bool bs_eq(const bset_t *a, const bset_t *b) { return !memcmp(a, b, sizeof *a); }
+
+struct pbuild { struct vdp_prog *p; size_t tcap, scap; };
+
+static int pb_set(struct pbuild *b, const bset_t *s) {
+    for (size_t i = 0; i < b->p->nsets; i++)
+        if (bs_eq(&b->p->sets[i], s)) return (int)i;
+    if (b->p->nsets == b->scap) {
+        size_t nc = b->scap ? b->scap * 2 : 8;
+        bset_t *ns = realloc(b->p->sets, nc * sizeof *ns);
+        if (!ns) return -1;
+        b->p->sets = ns;
+        b->scap = nc;
+    }
+    b->p->sets[b->p->nsets] = *s;
+    return (int)b->p->nsets++;
+}
+
+static int pb_tok(struct pbuild *b, int type, const bset_t *s) {
+    int si = 0;
+    if (s && (si = pb_set(b, s)) < 0) return -1;
+    if (b->p->ntok == b->tcap) {
+        size_t nc = b->tcap ? b->tcap * 2 : 16;
+        struct vdp_tok *nt = realloc(b->p->tok, nc * sizeof *nt);
+        if (!nt) return -1;
+        b->p->tok = nt;
+        b->tcap = nc;
+    }
+    b->p->tok[b->p->ntok].type = (uint8_t)type;
+    b->p->tok[b->p->ntok].set = (uint16_t)si;
+    b->p->ntok++;
+    return 0;
+}
+
+static void prog_free(struct vdp_prog *p) {
+    if (!p) return;
+    free(p->tok);
+    free(p->sets);
+    free(p->pre);
+    free(p->suf);
+    free(p->mid);
+    free(p->bm);
+    free(p->onem);
+    free(p);
+}
+
+/* The byte of a singleton set, or -1. */
+static int bs_single(const bset_t *s) {
+    int n = 0, b = -1;
+    for (int w = 0; w < 4; w++) {
+        n += __builtin_popcountll(s->w[w]);
+        if (s->w[w]) b = w * 64 + __builtin_ctzll(s->w[w]);
+    }
+    return n == 1 ? b : -1;
+}
+
+static struct vdp_prog *prog_new(struct pbuild *b) {
+    memset(b, 0, sizeof *b);
+    b->p = calloc(1, sizeof *b->p);
+    return b->p;
+}
+
+static struct vdp_prog *prog_done(struct pbuild *b) {
+    struct vdp_prog *p = b->p;
+    p->w1 = (p->ntok + 1 + 63) / 64;
+    /* Literal prefix and suffix, minimum length (fast rejection). */
+    p->exact = true;
+    for (size_t k = 0; k < p->ntok; k++) {
+        if (p->tok[k].type == T_ONE) p->minlen++;
+        else p->exact = false;
+    }
+    size_t k = 0;
+    while (k < p->ntok && p->tok[k].type == T_ONE && bs_single(&p->sets[p->tok[k].set]) >= 0) k++;
+    p->npre = k;
+    k = p->ntok;
+    while (k > 0 && p->tok[k - 1].type == T_ONE && bs_single(&p->sets[p->tok[k - 1].set]) >= 0) k--;
+    p->nsuf = p->ntok - k;
+    p->pre = malloc(p->npre + 1);
+    p->suf = malloc(p->nsuf + 1);
+    /* Longest run of single-byte tokens: any match holds it as a substring. */
+    size_t best = 0, bstart = 0, run = 0;
+    for (size_t i = 0; i < p->ntok; i++) {
+        if (p->tok[i].type == T_ONE && bs_single(&p->sets[p->tok[i].set]) >= 0) {
+            if (++run > best) { best = run; bstart = i + 1 - run; }
+        } else run = 0;
+    }
+    p->nmid = best;
+    p->mid = malloc(best + 1);
+    if (!p->mid) { prog_free(p); return NULL; }
+    for (size_t i = 0; i < best; i++) p->mid[i] = (unsigned char)bs_single(&p->sets[p->tok[bstart + i].set]);
+    size_t W = p->w1;
+    p->bm = calloc(256 * W, sizeof *p->bm);
+    p->onem = calloc(4 * W, sizeof *p->onem);
+    if (!p->pre || !p->suf || !p->bm || !p->onem) { prog_free(p); return NULL; }
+    p->starm = p->onem + W;
+    p->segsm = p->onem + 2 * W;
+    p->skipm = p->onem + 3 * W;
+    for (size_t i = 0; i < p->ntok; i++) {
+        uint64_t bit = 1ull << (i & 63);
+        size_t w = i >> 6;
+        const struct vdp_tok *tk = &p->tok[i];
+        if (tk->type == T_ONE) p->onem[w] |= bit;
+        else if (tk->type == T_STAR) p->starm[w] |= bit;
+        else p->segsm[w] |= bit;
+        if (tk->type != T_ONE) p->skipm[w] |= bit;
+        if (tk->type != T_SEGS)
+            for (unsigned c = 1; c < 256; c++)
+                if (bs_has(&p->sets[tk->set], c)) p->bm[c * W + w] |= bit;
+    }
+    for (size_t i = 0; i < p->npre; i++) p->pre[i] = (unsigned char)bs_single(&p->sets[p->tok[i].set]);
+    for (size_t i = 0; i < p->nsuf; i++)
+        p->suf[i] = (unsigned char)bs_single(&p->sets[p->tok[p->ntok - p->nsuf + i].set]);
+    return p;
+}
+
+/* Literal-based atoms as programs (for the reachability search). */
+static struct vdp_prog *prog_from_atom(vdp_str_op_t op, const char *c, size_t len) {
+    struct pbuild b;
+    if (!prog_new(&b)) return NULL;
+    bset_t any = bs_any();
+    int rc = 0;
+    if (op == VDP_STR_SUFFIX || op == VDP_STR_CONTAINS) rc |= pb_tok(&b, T_STAR, &any);
+    for (size_t i = 0; i < len && !rc; i++) {
+        bset_t one = bs_one((unsigned char)c[i]);
+        rc |= pb_tok(&b, T_ONE, &one);
+    }
+    if (op == VDP_STR_PREFIX || op == VDP_STR_CONTAINS) rc |= pb_tok(&b, T_STAR, &any);
+    if (rc) { prog_free(b.p); return NULL; }
+    return prog_done(&b);
+}
+
+/* Compile a glob. Returns NULL with a message in emsg on a malformed pattern
+ * (or out of memory). */
+static struct vdp_prog *prog_glob(const char *c, size_t len, char *emsg, size_t en) {
+    struct pbuild b;
+    if (!prog_new(&b)) { snprintf(emsg, en, "out of memory"); return NULL; }
+    bset_t any = bs_any(), ns = bs_notslash();
+    bool after_slash = false;     /* previous token is an unescaped '/' (or SEGS) */
+    int wild = 0;
+    size_t i = 0;
+#define FAIL(...) do { snprintf(emsg, en, __VA_ARGS__); prog_free(b.p); return NULL; } while (0)
+#define TOK(ty, s) do { if (pb_tok(&b, (ty), (s)) < 0) FAIL("out of memory"); } while (0)
+    while (i < len) {
+        unsigned char ch = (unsigned char)c[i];
+        if (ch == '\\') {
+            if (i + 1 >= len) FAIL("glob ends in a lone backslash");
+            bset_t one = bs_one((unsigned char)c[i + 1]);
+            TOK(T_ONE, &one);
+            after_slash = false;
+            i += 2;
+        } else if (ch == '*') {
+            if (i + 1 < len && c[i + 1] == '*') {
+                if (i + 2 < len && c[i + 2] == '*') FAIL("'***' in a glob is ambiguous");
+                if (after_slash && i + 2 < len && c[i + 2] == '/') {
+                    TOK(T_SEGS, NULL);          /* the '/' before is already a token */
+                    i += 3;
+                    after_slash = true;
+                } else {
+                    TOK(T_STAR, &any);
+                    i += 2;
+                    after_slash = false;
+                }
+            } else {
+                TOK(T_STAR, &ns);
+                i += 1;
+                after_slash = false;
+            }
+            wild++;
+        } else if (ch == '?') {
+            TOK(T_ONE, &ns);
+            wild++;
+            after_slash = false;
+            i++;
+        } else if (ch == '[') {
+            size_t j = i + 1;
+            bool neg = false;
+            if (j < len && (c[j] == '!' || c[j] == '^')) { neg = true; j++; }
+            bset_t m = { { 0, 0, 0, 0 } };
+            bool first = true, closed = false;
+            while (j < len) {
+                unsigned char x = (unsigned char)c[j];
+                if (x == ']' && !first) { closed = true; j++; break; }
+                first = false;
+                if (x == '\\') {
+                    if (j + 1 >= len) FAIL("glob ends in a lone backslash");
+                    x = (unsigned char)c[++j];
+                }
+                j++;
+                unsigned char y = x;
+                if (j + 1 < len && c[j] == '-' && c[j + 1] != ']') {
+                    j++;
+                    y = (unsigned char)c[j];
+                    if (y == '\\') {
+                        if (j + 1 >= len) FAIL("glob ends in a lone backslash");
+                        y = (unsigned char)c[++j];
+                    }
+                    j++;
+                    if (y < x) FAIL("bad range %c-%c in a glob class", x, y);
+                }
+                for (unsigned v = x; v <= y; v++) {
+                    if (v == '/') FAIL("'/' in a glob class never matches; write it outside the class");
+                    bs_add(&m, v);
+                }
+            }
+            if (!closed) FAIL("unterminated '[' in a glob");
+            if (neg) {
+                for (int w = 0; w < 4; w++) m.w[w] = ns.w[w] & ~m.w[w];
+            }
+            TOK(T_ONE, &m);
+            wild++;
+            after_slash = false;
+            i = j;
+        } else {
+            bset_t one = bs_one(ch);
+            TOK(T_ONE, &one);
+            after_slash = (ch == '/');
+            i++;
+        }
+        if (wild > VDP_GLOB_MAX_WILD) FAIL("more than %d wildcards in a glob", VDP_GLOB_MAX_WILD);
+    }
+#undef TOK
+#undef FAIL
+    return prog_done(&b);
+}
+
+/* Automaton state sets. A set is 2 * w1 words: bits 0..ntok of the first half
+ * are the position states, bit k of the second half is "inside SEGS token k".
+ * Every step is word-parallel over the tables built in prog_done, so a step
+ * costs O(ntok / 64) whatever the number of active states. */
+#define PW(p) (2 * (p)->w1)
+#define ST_MAXW (2 * ((VDP_STR_MAX + 3 + 63) / 64))   /* ntok <= VDP_STR_MAX + 2 */
+
+static inline bool st_has(const uint64_t *S, size_t q) { return (S[q >> 6] >> (q & 63)) & 1; }
+
+/* Forward skips: a position state k whose token is STAR or SEGS also puts
+ * k + 1 in the set, transitively along a run of such tokens. With K the skip
+ * mask and Y = P & K, the sum Y + K carries from each bit of Y to the end of
+ * its run of K (runs are separated by a 0 bit, which stops the carry), and
+ * (Y + K) ^ K holds exactly the bits from the lowest bit of Y in each run to
+ * one past the run's end. */
+static void prog_close(const struct vdp_prog *p, uint64_t *S) {
+    size_t W = p->w1;
+    uint64_t c = 0;
+    for (size_t w = 0; w < W; w++) {
+        uint64_t k = p->skipm[w], y = S[w] & k;
+        uint64_t s = y + k;
+        uint64_t c1 = s < y;
+        uint64_t s2 = s + c;
+        uint64_t c2 = s2 < s;
+        S[w] |= s2 ^ k;
+        c = c1 | c2;
+    }
+}
+
+static void prog_start(const struct vdp_prog *p, uint64_t *S) {
+    memset(S, 0, PW(p) * sizeof *S);
+    S[0] = 1;
+    prog_close(p, S);
+}
+
+/* T := step(S, b); returns true if T is non-empty. */
+static bool prog_step(const struct vdp_prog *p, const uint64_t *S, unsigned b, uint64_t *T) {
+    size_t W = p->w1;
+    const uint64_t *P = S, *I = S + W, *m = p->bm + (size_t)b * W;
+    uint64_t *TP = T, *TI = T + W;
+    uint64_t carry = 0, carry2 = 0;
+    bool slash = (b == '/');
+    for (size_t w = 0; w < W; w++) {
+        uint64_t aw = P[w] & m[w];
+        uint64_t one = aw & p->onem[w];
+        uint64_t segs = P[w] & p->segsm[w];
+        uint64_t in = I[w] | segs;                 /* SEGS: any byte stays inside */
+        TI[w] = in;
+        TP[w] = (one << 1) | carry | (aw & p->starm[w]);
+        carry = one >> 63;
+        if (slash) {                               /* '/' ends the segment run */
+            TP[w] |= (in << 1) | carry2;
+            carry2 = in >> 63;
+        }
+    }
+    prog_close(p, TP);
+    for (size_t w = 0; w < 2 * W; w++) if (T[w]) return true;
+    return false;
+}
+
+static bool prog_match(const struct vdp_prog *p, const char *s, size_t sl) {
+    if (sl < p->minlen || (p->exact && sl != p->minlen)) return false;
+    if (memcmp(s, p->pre, p->npre) || memcmp(s + sl - p->nsuf, p->suf, p->nsuf)) return false;
+    if (p->nmid > p->npre && p->nmid > p->nsuf && !memmem(s, sl, p->mid, p->nmid)) return false;
+    uint64_t A[ST_MAXW], B[ST_MAXW];
+    uint64_t *S = A, *T = B;
+    /* The literal prefix matched above; the only way through it is one token
+     * per byte, so the automaton resumes in state npre. */
+    memset(S, 0, PW(p) * sizeof *S);
+    S[p->npre >> 6] |= 1ull << (p->npre & 63);
+    prog_close(p, S);
+    for (size_t i = p->npre; i < sl; i++) {
+        unsigned b = (unsigned char)s[i];
+        if (!b || !prog_step(p, S, b, T)) return false;
+        uint64_t *x = S; S = T; T = x;
+    }
+    return st_has(S, p->ntok);
+}
+
+const char *vdp_matcher_prefix(const vdp_rule_t *r) {
+    switch (r->s.op) {
+        case VDP_STR_PREFIX:   return r->kind == VDP_KIND_PATH ? "" : "prefix ";
+        case VDP_STR_EQ:       return r->kind == VDP_KIND_EXEC ? "" : "exact ";
+        case VDP_STR_HOST:     return "";
+        case VDP_STR_SUFFIX:   return "suffix ";
+        case VDP_STR_CONTAINS: return "contains ";
+        case VDP_STR_GLOB:     return "glob ";
+    }
+    return "";
+}
+
+void vdp_policy_free(vdp_policy_t *p) {
+    if (!p) return;
+    for (size_t i = 0; i < p->n; i++) {
+        prog_free(p->rules[i].s.prog);
+        p->rules[i].s.prog = NULL;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 /* Policy parsing                                                            */
 /* ------------------------------------------------------------------------ */
+
+static int vdp_policy_load_inner(const char *path, vdp_policy_t *p, char *err, size_t errlen);
 
 static int perr(char *err, size_t errlen, const char *path, int line,
                 const char *fmt, ...) {
@@ -138,6 +529,36 @@ static int perr(char *err, size_t errlen, const char *path, int line,
     return -1;
 }
 
+/* "<digits>.<digits>", nothing else (sscanf would also take signs and
+ * spaces); -1 otherwise. */
+static int parse_version(const char *s, int *maj, int *mn) {
+    int *out[2] = { maj, mn };
+    for (int part = 0; part < 2; part++) {
+        long v = 0;
+        int nd = 0;
+        while (*s >= '0' && *s <= '9') {
+            v = v * 10 + (*s++ - '0');
+            if (++nd > 6) return -1;
+        }
+        if (!nd) return -1;
+        *out[part] = (int)v;
+        if (part == 0 && *s++ != '.') return -1;
+    }
+    return *s ? -1 : 0;
+}
+
+/* Is t a flag clause (syntactically)? Used to tell a matcher keyword from a
+ * v1.13 constant that happens to be spelt like one. */
+static bool is_flag_clause(const char *t) {
+    return !strcmp(t, "readonly") || !strcmp(t, "access=ro") || !strcmp(t, "access=wo") ||
+           !strcmp(t, "access=rw") || ((t[0] == '+' || t[0] == '-') && vdp_flag_bit(t + 1));
+}
+
+static const struct { const char *name; vdp_str_op_t op; } kMatchers[] = {
+    { "exact", VDP_STR_EQ }, { "prefix", VDP_STR_PREFIX }, { "suffix", VDP_STR_SUFFIX },
+    { "contains", VDP_STR_CONTAINS }, { "glob", VDP_STR_GLOB },
+};
+
 /* Merge (mask, value) into a rule's bitvector atom; -1 on contradiction. */
 static int bv_add(vdp_bv_atom_t *b, uint32_t mask, uint32_t value) {
     uint32_t overlap = b->mask & mask;
@@ -149,6 +570,12 @@ static int bv_add(vdp_bv_atom_t *b, uint32_t mask, uint32_t value) {
 
 int vdp_policy_load(const char *path, vdp_policy_t *p, char *err, size_t errlen) {
     memset(p, 0, sizeof(*p));
+    int rc = vdp_policy_load_inner(path, p, err, errlen);
+    if (rc < 0) { vdp_policy_free(p); p->n = 0; }
+    return rc;
+}
+
+static int vdp_policy_load_inner(const char *path, vdp_policy_t *p, char *err, size_t errlen) {
     FILE *f = fopen(path, "re");
     if (!f) return perr(err, errlen, path, 0, "cannot open: %s", strerror(errno));
 
@@ -157,6 +584,8 @@ int vdp_policy_load(const char *path, vdp_policy_t *p, char *err, size_t errlen)
     ssize_t got;
     int lineno = 0;
     int rc = 0;
+    int req_maj = 0, req_min = 0;       /* highest `require warden` seen so far */
+    size_t glob_tokens = 0;
     while ((got = getline(&line, &cap, f)) >= 0) {
         lineno++;
         if (memchr(line, '\0', (size_t)got)) {
@@ -178,9 +607,7 @@ int vdp_policy_load(const char *path, vdp_policy_t *p, char *err, size_t errlen)
         if (nt == 0) continue;
         if (!strcmp(tok[0], "require")) {
             int maj = -1, mn = -1;
-            char tail = 0;
-            if (nt != 3 || strcmp(tok[1], "warden") ||
-                sscanf(tok[2], "%d.%d%c", &maj, &mn, &tail) != 2 || maj < 0 || mn < 0) {
+            if (nt != 3 || strcmp(tok[1], "warden") || parse_version(tok[2], &maj, &mn) < 0) {
                 rc = perr(err, errlen, path, lineno, "bad directive (need: require warden <major>.<minor>)");
                 break;
             }
@@ -189,6 +616,7 @@ int vdp_policy_load(const char *path, vdp_policy_t *p, char *err, size_t errlen)
                           maj, mn, VDP_WARDEN_MAJOR, VDP_WARDEN_MINOR);
                 break;
             }
+            if (maj > req_maj || (maj == req_maj && mn > req_min)) { req_maj = maj; req_min = mn; }
             continue;
         }
         if (nt < 3) { rc = perr(err, errlen, path, lineno, "bad rule (need: verb kind constant)"); break; }
@@ -210,21 +638,66 @@ int vdp_policy_load(const char *path, vdp_policy_t *p, char *err, size_t errlen)
         else if (!strcmp(tok[1], "exec")) { r->kind = VDP_KIND_EXEC; r->s.op = VDP_STR_EQ; }
         else { rc = perr(err, errlen, path, lineno, "unknown kind %s", tok[1]); break; }
 
-        size_t cl = strlen(tok[2]);
+        /* v1.14 matcher: a keyword followed by a constant that is not itself a
+         * flag clause (so `allow path glob readonly`, a v1.13 prefix rule for
+         * the constant "glob", keeps its meaning). */
+        int ci = 2;
+        for (size_t m = 0; m < sizeof kMatchers / sizeof kMatchers[0]; m++) {
+            if (strcmp(tok[2], kMatchers[m].name)) continue;
+            if (nt < 4 || is_flag_clause(tok[3])) {
+                /* A v1.13 constant spelt like a keyword keeps its meaning, but a
+                 * policy that requires 1.14 or later means a matcher here, so a
+                 * missing constant (or one a '#' turned into a comment) is an
+                 * error rather than a prefix rule for the word. */
+                if (req_maj > 1 || (req_maj == 1 && req_min >= 14)) {
+                    rc = perr(err, errlen, path, lineno,
+                              "matcher '%s' without a constant (a constant may not start "
+                              "with '#'; write `prefix %s` for a constant named %s)",
+                              tok[2], tok[2], tok[2]);
+                    goto out;
+                }
+                continue;
+            }
+            if (r->kind == VDP_KIND_HOST) {
+                rc = perr(err, errlen, path, lineno,
+                          "matcher '%s' on a host rule (matchers apply to path and exec rules)",
+                          tok[2]);
+                goto out;
+            }
+            r->s.op = kMatchers[m].op;
+            ci = 3;
+            break;
+        }
+        const char *cs = tok[ci];
+        size_t cl = strlen(cs);
         if (cl == 0 || cl > VDP_STR_MAX) {
             rc = perr(err, errlen, path, lineno, "constant length %zu out of range", cl); break;
         }
         for (size_t k = 0; k < cl; k++) {
-            unsigned char ch = (unsigned char)tok[2][k];
+            unsigned char ch = (unsigned char)cs[k];
             if (ch < 0x20 || ch == 0x7f) {
                 rc = perr(err, errlen, path, lineno, "control byte 0x%02x in constant", ch);
                 goto out;
             }
         }
-        memcpy(r->s.c, tok[2], cl + 1);
+        memcpy(r->s.c, cs, cl + 1);
         r->s.len = cl;
+        if (r->s.op == VDP_STR_GLOB) {
+            char gm[160] = "out of memory";
+            r->s.prog = prog_glob(r->s.c, r->s.len, gm, sizeof gm);
+            if (!r->s.prog) { rc = perr(err, errlen, path, lineno, "%s", gm); break; }
+            glob_tokens += r->s.prog->ntok;
+            if (glob_tokens > VDP_GLOB_MAX_TOTAL) {
+                p->n++;
+                rc = perr(err, errlen, path, lineno,
+                          "glob patterns total more than %d tokens (bounds the work per decision)",
+                          VDP_GLOB_MAX_TOTAL);
+                break;
+            }
+        }
+        p->n++;             /* counted now so vdp_policy_free releases the glob */
 
-        for (int i = 3; i < nt; i++) {
+        for (int i = ci + 1; i < nt; i++) {
             const char *t = tok[i];
             if (r->kind != VDP_KIND_PATH) {
                 rc = perr(err, errlen, path, lineno, "flag clause '%s' on a non-path rule", t); goto out;
@@ -250,7 +723,6 @@ int vdp_policy_load(const char *path, vdp_policy_t *p, char *err, size_t errlen)
                 rc = perr(err, errlen, path, lineno, "contradictory flag clause '%s'", t); goto out;
             }
         }
-        p->n++;
     }
 out:
     free(line);
@@ -272,6 +744,12 @@ static bool str_holds(const vdp_str_atom_t *a, const char *s, size_t sl) {
             if (sl == a->len && memcmp(s, a->c, a->len) == 0) return true;
             if (memchr(a->c, ':', a->len)) return false;
             return sl > a->len && memcmp(s, a->c, a->len) == 0 && s[a->len] == ':';
+        case VDP_STR_SUFFIX:
+            return sl >= a->len && memcmp(s + sl - a->len, a->c, a->len) == 0;
+        case VDP_STR_CONTAINS:
+            return memmem(s, sl, a->c, a->len) != NULL;
+        case VDP_STR_GLOB:
+            return a->prog && prog_match(a->prog, s, sl);
     }
     return false;
 }
@@ -449,8 +927,10 @@ static unsigned char fresh_byte(const struct dset *D, const char *pre, size_t pl
     return 0;
 }
 
-/* Exists f ⊆ KNOWN: B_i(f) and no j in J has B_j(f)?  1 yes, 0 no, -1 bound. */
-static int bv_first_possible(const vdp_policy_t *p, size_t i, const int *J, size_t nj) {
+/* Exists f ⊆ KNOWN: B_i(f) and no j in J has B_j(f)?  1 yes (f in *fout),
+ * 0 no, -1 bound. */
+static int bv_first_possible(const vdp_policy_t *p, size_t i, const int *J, size_t nj,
+                             uint32_t *fout) {
     const vdp_bv_atom_t *bi = &p->rules[i].b;
     uint32_t free_bits = 0;
     for (size_t k = 0; k < nj; k++) {
@@ -468,15 +948,33 @@ static int bv_first_possible(const vdp_policy_t *p, size_t i, const int *J, size
         bool ok = (f & K_O_ACCMODE) != K_O_ACCMODE;       /* in the fragment */
         for (size_t k = 0; k < nj && ok; k++)
             if (bv_holds(&p->rules[J[k]].b, f)) ok = false;
-        if (ok) return 1;
+        if (ok) { *fout = f; return 1; }
         if (sub == free_bits) break;
         sub = (sub - free_bits) & free_bits;
     }
     return 0;
 }
 
-vdp_reach_t vdp_rule_reachable(const vdp_policy_t *p, size_t i) {
-    if (i >= p->n) return VDP_REACH_UNKNOWN;
+static __thread const char *g_reach_why = "";
+const char *vdp_reach_unknown_reason(void) { return g_reach_why; }
+const char *vdp_reach_unknown_text(void) {
+    if (!strcmp(g_reach_why, "state_budget")) return "the automaton search hit its state budget";
+    if (!strcmp(g_reach_why, "witness_alphabet"))
+        return "a constant is followed by every byte value in other constants";
+    return "outside the enumeration bound";
+}
+bool vdp_reach_force_automaton = false;
+
+static void put_witness(char *wit, size_t wcap, size_t *wlen, const char *s, size_t sl) {
+    if (wlen) *wlen = sl;
+    if (!wit || !wcap) return;
+    size_t k = sl < wcap - 1 ? sl : wcap - 1;
+    memcpy(wit, s, k);
+    wit[k] = '\0';
+}
+
+static vdp_reach_t reach_trie(const vdp_policy_t *p, size_t i, char *wit, size_t wcap,
+                              size_t *wlen, uint32_t *wflags) {
     const vdp_rule_t *ri = &p->rules[i];
     vdp_kind_t kind = ri->kind;
 
@@ -519,6 +1017,7 @@ vdp_reach_t vdp_rule_reachable(const vdp_policy_t *p, size_t i) {
     if (rc_oom) { dset_free(&D); dset_free(&W); return VDP_REACH_UNKNOWN; }
 
     vdp_reach_t res = VDP_DEAD;
+    bool bound = false;
     int J[VDP_MAX_RULES];
     for (size_t w = 0; w < W.n && res != VDP_REACHABLE; w++) {
         const char *s = W.v[w];
@@ -529,14 +1028,513 @@ vdp_reach_t vdp_rule_reachable(const vdp_policy_t *p, size_t i) {
             const vdp_rule_t *r = &p->rules[j];
             if (r->kind == kind && str_holds(&r->s, s, sl)) J[nj++] = (int)j;
         }
-        int b = bv_first_possible(p, i, J, nj);
-        if (b == 1) res = VDP_REACHABLE;
-        else if (b < 0) incomplete = true;
+        uint32_t f = 0;
+        int b = bv_first_possible(p, i, J, nj, &f);
+        if (b == 1) {
+            res = VDP_REACHABLE;
+            put_witness(wit, wcap, wlen, s, sl);
+            if (wflags) *wflags = f;
+        }
+        else if (b < 0) bound = true;
     }
-    if (res == VDP_DEAD && incomplete) res = VDP_REACH_UNKNOWN;
+    if (res == VDP_DEAD && (incomplete || bound)) {
+        res = VDP_REACH_UNKNOWN;
+        g_reach_why = bound ? "enumeration_bound" : "witness_alphabet";
+    }
     dset_free(&D);
     dset_free(&W);
     return res;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Reachability by automaton product search (v1.14)                          */
+/* ------------------------------------------------------------------------ */
+/*
+ * Once a kind has a suffix, contains or glob rule, the witness set above no
+ * longer covers every class of strings, so reachability is decided on the
+ * rules' automata instead. Every string atom of the kind is a program (above).
+ *
+ * Bytes are grouped into classes on which every set of every program involved
+ * (and the test b == '/') agrees; one representative per class suffices.
+ *
+ * For a set S of earlier rules, "rule i fires first on some s" (flags aside)
+ * is  L_i \ U_{j in S} L_j  containing a string of length <= VDP_STR_MAX. A
+ * breadth-first search over tuples of per-rule DFA states (built lazily by
+ * subset construction) finds the shortest such string, so the length bound is
+ * decided exactly: the search does not expand past depth VDP_STR_MAX.
+ *
+ * Flags: S depends on f. With J the earlier rules whose flag atom is
+ * compatible with B_i and whose language meets L_i, S(f) = { j in J : B_j(f) }.
+ * Reachability is monotone (S subset of S' and Reach(S') imply Reach(S)), so
+ * only the inclusion-minimal S(f) over the enumerated f need a search; first
+ * the rules whose B_j holds whenever B_i does (S_always, a subset of every
+ * S(f)) are tried, and if that search is DEAD so is the rule.
+ *
+ * With no competing rule the search is not needed: a program's shortest string
+ * takes one byte per ONE token and none for STAR / SEGS (prog_shortest).
+ *
+ * Budgets: VDP_MAX_ENUM_BITS free flag bits, LD_MAX_STATES DFA states per rule,
+ * PROD_MAX_INTS for one product search and REACH_WORK for the whole query.
+ * Past a budget the answer is UNKNOWN (never a guessed DEAD or REACHABLE).
+ */
+
+#define LD_MAX_STATES  (1u << 14)
+#define PROD_MAX_INTS  (1u << 22)
+#define REACH_WORK     (1ull << 23)   /* per query: DFA words stepped + tuple components */
+
+static __thread unsigned long long g_work;
+
+enum { LF_ACC = 1, LF_UNIV = 2, LF_EMPTY = 4 };
+
+struct ldfa {
+    const struct vdp_prog *pg;
+    size_t    W;          /* words per state set */
+    uint64_t *st;         /* n * W */
+    uint8_t  *fl;         /* LF_* per state */
+    int      *tr;         /* n * ncls, -1 = not computed */
+    size_t    n, cap, ncls;
+    int      *ht;         /* open addressing, -1 empty */
+    size_t    htcap;
+    int       any_set;    /* index of the ANY set in pg, or -1 */
+};
+
+static uint64_t hash_words(const uint64_t *w, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= w[i]; h *= 1099511628211ull; h ^= h >> 29; }
+    return h;
+}
+
+static void ld_free(struct ldfa *L) {
+    free(L->st); free(L->fl); free(L->tr); free(L->ht);
+    memset(L, 0, sizeof *L);
+}
+
+static int ld_rehash(struct ldfa *L, size_t nc) {
+    int *nh = malloc(nc * sizeof *nh);
+    if (!nh) return -1;
+    for (size_t k = 0; k < nc; k++) nh[k] = -1;
+    for (size_t id = 0; id < L->n; id++) {
+        size_t h = (size_t)hash_words(L->st + id * L->W, L->W) & (nc - 1);
+        while (nh[h] >= 0) h = (h + 1) & (nc - 1);
+        nh[h] = (int)id;
+    }
+    free(L->ht);
+    L->ht = nh;
+    L->htcap = nc;
+    return 0;
+}
+
+/* Intern a state set; returns its id, or -1 (budget / memory). */
+static int ld_intern(struct ldfa *L, const uint64_t *S) {
+    size_t h = (size_t)hash_words(S, L->W) & (L->htcap - 1);
+    while (L->ht[h] >= 0) {
+        int id = L->ht[h];
+        if (!memcmp(L->st + (size_t)id * L->W, S, L->W * sizeof *S)) return id;
+        h = (h + 1) & (L->htcap - 1);
+    }
+    if (L->n >= LD_MAX_STATES) return -1;
+    if (L->n == L->cap) {
+        size_t nc = L->cap * 2;
+        uint64_t *ns = realloc(L->st, nc * L->W * sizeof *ns);
+        if (!ns) return -1;
+        L->st = ns;
+        uint8_t *nf = realloc(L->fl, nc);
+        if (!nf) return -1;
+        L->fl = nf;
+        int *nt = realloc(L->tr, nc * L->ncls * sizeof *nt);
+        if (!nt) return -1;
+        L->tr = nt;
+        L->cap = nc;
+    }
+    size_t id = L->n++;
+    memcpy(L->st + id * L->W, S, L->W * sizeof *S);
+    for (size_t c = 0; c < L->ncls; c++) L->tr[id * L->ncls + c] = -1;
+    const struct vdp_prog *p = L->pg;
+    uint8_t f = 0;
+    bool empty = true;
+    for (size_t w = 0; w < L->W; w++) if (S[w]) { empty = false; break; }
+    if (empty) f |= LF_EMPTY;
+    if (st_has(S, p->ntok)) f |= LF_ACC;
+    /* Universal: the last token is STAR(any byte) and we are at it, so every
+     * continuation stays accepted. (A sufficient test; used only to prune.) */
+    if (p->ntok && p->tok[p->ntok - 1].type == T_STAR &&
+        (int)p->tok[p->ntok - 1].set == L->any_set && st_has(S, p->ntok - 1))
+        f |= LF_UNIV;
+    L->fl[id] = f;
+    if (2 * L->n > L->htcap && ld_rehash(L, L->htcap * 2) < 0) return -1;
+    h = (size_t)hash_words(S, L->W) & (L->htcap - 1);
+    while (L->ht[h] >= 0) h = (h + 1) & (L->htcap - 1);
+    L->ht[h] = (int)id;
+    return (int)id;
+}
+
+static int ld_init(struct ldfa *L, const struct vdp_prog *pg, size_t ncls) {
+    memset(L, 0, sizeof *L);
+    L->pg = pg;
+    L->W = PW(pg);
+    L->ncls = ncls;
+    L->cap = 16;
+    L->st = malloc(L->cap * L->W * sizeof *L->st);
+    L->fl = malloc(L->cap);
+    L->tr = malloc(L->cap * ncls * sizeof *L->tr);
+    L->htcap = 64;
+    L->ht = malloc(L->htcap * sizeof *L->ht);
+    if (!L->st || !L->fl || !L->tr || !L->ht) return -1;
+    for (size_t k = 0; k < L->htcap; k++) L->ht[k] = -1;
+    bset_t any = bs_any();
+    L->any_set = -1;
+    for (size_t k = 0; k < pg->nsets; k++) if (bs_eq(&pg->sets[k], &any)) L->any_set = (int)k;
+    uint64_t S[ST_MAXW];
+    prog_start(pg, S);
+    return ld_intern(L, S) == 0 ? 0 : -1;       /* the start state is id 0 */
+}
+
+static int ld_next(struct ldfa *L, int id, size_t cls, unsigned rep) {
+    int *slot = &L->tr[(size_t)id * L->ncls + cls];
+    if (*slot >= 0) return *slot;
+    uint64_t T[ST_MAXW];
+    g_work += L->W;
+    prog_step(L->pg, L->st + (size_t)id * L->W, rep, T);
+    int nid = ld_intern(L, T);           /* may move L->tr */
+    if (nid >= 0) L->tr[(size_t)id * L->ncls + cls] = nid;
+    return nid;
+}
+
+/* Shortest string of a program alone: a byte from each ONE token's set, nothing
+ * for STAR and SEGS. 1 (written to buf, length in *len) or 0 (a set is empty
+ * or the string would pass the bound). */
+static int prog_shortest(const struct vdp_prog *p, char *buf, size_t *len) {
+    size_t n = 0;
+    for (size_t k = 0; k < p->ntok; k++) {
+        if (p->tok[k].type != T_ONE) continue;
+        const bset_t *s = &p->sets[p->tok[k].set];
+        int b = -1;
+        for (unsigned c = 'a'; c <= 'z' && b < 0; c++) if (bs_has(s, c)) b = (int)c;
+        for (unsigned c = 1; c < 256 && b < 0; c++) if (bs_has(s, c)) b = (int)c;
+        if (b < 0 || n >= VDP_STR_MAX) return 0;
+        buf[n++] = (char)b;
+    }
+    *len = n;
+    return 1;
+}
+
+static size_t tup_hash(const int *t, size_t m) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t q = 0; q < m; q++) { h ^= (uint64_t)(uint32_t)t[q]; h *= 1099511628211ull; h ^= h >> 31; }
+    return (size_t)h;
+}
+
+/* Product search. comp[0] is rule i's automaton; comp[1..m-1] are others.
+ * inter == false: accept when comp[0] accepts and no other does (rule i
+ *                 fires first); others that reach the empty set drop out.
+ * inter == true:  m == 2, accept when both accept (the languages meet).
+ * Returns 1 (witness written), 0 (no string of length <= VDP_STR_MAX), or -1
+ * (budget). */
+static int prod_search(struct ldfa **comp, size_t m, bool inter, const unsigned char *rep,
+                       size_t ncls, char *wit, size_t wcap, size_t *wlen) {
+    size_t cap = 256, n = 0;
+    int *tup = malloc(cap * m * sizeof *tup);
+    int *par = malloc(cap * sizeof *par);
+    uint8_t *via = malloc(cap);
+    uint16_t *dep = malloc(cap * sizeof *dep);
+    size_t htcap = 1024;
+    int *ht = malloc(htcap * sizeof *ht);
+    int *cur = malloc(m * sizeof *cur);
+    int res = -1;
+    if (m == 1 && !inter) {
+        char buf[VDP_STR_MAX + 1];
+        size_t len = 0;
+        res = prog_shortest(comp[0]->pg, buf, &len);
+        if (res == 1) put_witness(wit, wcap, wlen, buf, len);
+        goto done;
+    }
+    if (!tup || !par || !via || !dep || !ht || !cur) goto done;
+    for (size_t k = 0; k < htcap; k++) ht[k] = -1;
+
+    /* start tuple */
+    for (size_t k = 0; k < m; k++) {
+        uint8_t f = comp[k]->fl[0];
+        if (k == 0 || inter) {
+            if (f & LF_EMPTY) { res = 0; goto done; }
+            cur[k] = 0;
+        } else {
+            if (f & LF_UNIV) { res = 0; goto done; }
+            cur[k] = (f & LF_EMPTY) ? -1 : 0;
+        }
+    }
+    memcpy(tup, cur, m * sizeof *cur);
+    par[0] = -1; via[0] = 0; dep[0] = 0; n = 1;
+    {
+        size_t h = tup_hash(cur, m) & (htcap - 1);
+        ht[h] = 0;
+    }
+    for (size_t head = 0; head < n; head++) {
+        const int *t = tup + head * m;
+        bool acc = comp[0]->fl[t[0]] & LF_ACC;
+        for (size_t k = 1; k < m && acc; k++) {
+            if (inter) acc = comp[k]->fl[t[k]] & LF_ACC;
+            else if (t[k] >= 0 && (comp[k]->fl[t[k]] & LF_ACC)) acc = false;
+        }
+        if (acc) {
+            size_t len = dep[head];
+            char buf[VDP_STR_MAX + 1];
+            size_t pos = len;
+            for (int x = (int)head; par[x] >= 0; x = par[x]) buf[--pos] = (char)rep[via[x]];
+            put_witness(wit, wcap, wlen, buf, len);
+            res = 1;
+            goto done;
+        }
+        if (dep[head] >= VDP_STR_MAX) continue;
+        g_work += m * ncls;
+        if (g_work > REACH_WORK) { res = -1; goto done; }
+        for (size_t c = 0; c < ncls; c++) {
+            const int *tt = tup + head * m;        /* tup may move below */
+            bool dead = false;
+            for (size_t k = 0; k < m && !dead; k++) {
+                if (tt[k] < 0) { cur[k] = -1; continue; }
+                int nx = ld_next(comp[k], tt[k], c, rep[c]);
+                if (nx < 0) { res = -1; goto done; }
+                tt = tup + head * m;
+                uint8_t f = comp[k]->fl[nx];
+                if (k == 0 || inter) { if (f & LF_EMPTY) dead = true; cur[k] = nx; }
+                else if (f & LF_UNIV) dead = true;
+                else cur[k] = (f & LF_EMPTY) ? -1 : nx;
+            }
+            if (dead) continue;
+            size_t h = tup_hash(cur, m) & (htcap - 1);
+            bool seen = false;
+            while (ht[h] >= 0) {
+                if (!memcmp(tup + (size_t)ht[h] * m, cur, m * sizeof *cur)) { seen = true; break; }
+                h = (h + 1) & (htcap - 1);
+            }
+            if (seen) continue;
+            if ((n + 1) * m > PROD_MAX_INTS) { res = -1; goto done; }
+            if (n == cap) {
+                size_t nc = cap * 2;
+                int *a = realloc(tup, nc * m * sizeof *a); if (!a) goto done; tup = a;
+                int *b = realloc(par, nc * sizeof *b); if (!b) goto done; par = b;
+                uint8_t *v = realloc(via, nc); if (!v) goto done; via = v;
+                uint16_t *d = realloc(dep, nc * sizeof *d); if (!d) goto done; dep = d;
+                cap = nc;
+            }
+            memcpy(tup + n * m, cur, m * sizeof *cur);
+            par[n] = (int)head; via[n] = (uint8_t)c; dep[n] = (uint16_t)(dep[head] + 1);
+            ht[h] = (int)n;
+            n++;
+            if (2 * n > htcap) {
+                size_t nc = htcap * 2;
+                int *nh = malloc(nc * sizeof *nh);
+                if (!nh) goto done;
+                for (size_t k = 0; k < nc; k++) nh[k] = -1;
+                for (size_t x = 0; x < n; x++) {
+                    size_t hh = tup_hash(tup + x * m, m) & (nc - 1);
+                    while (nh[hh] >= 0) hh = (hh + 1) & (nc - 1);
+                    nh[hh] = (int)x;
+                }
+                free(ht); ht = nh; htcap = nc;
+            }
+        }
+    }
+    res = 0;
+done:
+    free(tup); free(par); free(via); free(dep); free(ht); free(cur);
+    return res;
+}
+
+/* Refine the byte classes by one set. */
+static void refine(unsigned char *cls, size_t *ncls, const bset_t *s) {
+    int map[256][2];
+    for (size_t k = 0; k < *ncls; k++) map[k][0] = map[k][1] = -1;
+    size_t nn = 0;
+    unsigned char out[256];
+    for (unsigned b = 1; b < 256; b++) {
+        int in = bs_has(s, b);
+        int *slot = &map[cls[b]][in];
+        if (*slot < 0) *slot = (int)nn++;
+        out[b] = (unsigned char)*slot;
+    }
+    memcpy(cls + 1, out + 1, 255);
+    *ncls = nn;
+}
+
+static vdp_reach_t reach_automaton(const vdp_policy_t *p, size_t i, char *wit, size_t wcap,
+                                   size_t *wlen, uint32_t *wflags) {
+    const vdp_rule_t *ri = &p->rules[i];
+    vdp_kind_t kind = ri->kind;
+    const vdp_bv_atom_t *bi = &ri->b;
+
+    /* Candidates: rule i, then earlier same-kind rules whose flag atom can hold
+     * together with B_i. */
+    int cand[VDP_MAX_RULES];
+    size_t nc = 0;
+    cand[nc++] = (int)i;
+    for (size_t j = 0; j < i; j++) {
+        const vdp_rule_t *r = &p->rules[j];
+        if (r->kind != kind) continue;
+        uint32_t ov = bi->mask & r->b.mask;
+        if ((bi->value & ov) != (r->b.value & ov)) continue;
+        cand[nc++] = (int)j;
+    }
+
+    struct vdp_prog *owned[VDP_MAX_RULES] = { 0 };
+    const struct vdp_prog *pg[VDP_MAX_RULES];
+    struct ldfa L[VDP_MAX_RULES];
+    size_t nld = 0;
+    vdp_reach_t res = VDP_REACH_UNKNOWN;
+    const char *why = "state_budget";
+    g_work = 0;
+    uint64_t (*sets)[4] = NULL;
+    uint32_t *setf = NULL;
+    size_t nsets = 0;
+
+    for (size_t k = 0; k < nc; k++) {
+        const vdp_str_atom_t *a = &p->rules[cand[k]].s;
+        if (a->op == VDP_STR_GLOB) pg[k] = a->prog;
+        else pg[k] = owned[k] = prog_from_atom(a->op, a->c, a->len);
+        if (!pg[k]) goto out;
+    }
+
+    /* Byte classes. */
+    unsigned char cls[256] = { 0 };
+    size_t ncls = 1;
+    bset_t slash = bs_one('/');
+    refine(cls, &ncls, &slash);
+    for (size_t k = 0; k < nc; k++)
+        for (size_t s = 0; s < pg[k]->nsets; s++) refine(cls, &ncls, &pg[k]->sets[s]);
+    unsigned char rep[256];
+    bool have[256] = { false };
+    /* Prefer readable representatives. */
+    for (unsigned b = 'a'; b <= 'z'; b++) if (!have[cls[b]]) { have[cls[b]] = true; rep[cls[b]] = (unsigned char)b; }
+    for (unsigned b = 1; b < 256; b++) if (!have[cls[b]]) { have[cls[b]] = true; rep[cls[b]] = (unsigned char)b; }
+
+    for (nld = 0; nld < nc; nld++)
+        if (ld_init(&L[nld], pg[nld], ncls) < 0) { nld++; goto out; }
+
+    /* J: candidates whose language meets L_i. A rule that never meets L_i is
+     * left out of every search: its automaton may never reach the empty set
+     * (a contains rule does not), so it would only multiply the product. */
+    int J[VDP_MAX_RULES];
+    size_t nj = 0;
+    for (size_t k = 1; k < nc; k++) {
+        struct ldfa *two[2] = { &L[0], &L[k] };
+        int r = prod_search(two, 2, true, rep, ncls, NULL, 0, NULL);
+        if (r != 0) J[nj++] = (int)k;       /* budget: keep it (conservative) */
+    }
+
+    /* S_always: B_j holds whenever B_i does. */
+    struct ldfa *comp[VDP_MAX_RULES];
+    size_t m = 0;
+    comp[m++] = &L[0];
+    uint32_t free_bits = 0;
+    for (size_t x = 0; x < nj; x++) {
+        const vdp_bv_atom_t *bj = &p->rules[cand[J[x]]].b;
+        if ((bj->mask & ~bi->mask) == 0) comp[m++] = &L[J[x]];
+        else free_bits |= bj->mask & ~bi->mask;
+    }
+    char wb[VDP_STR_MAX + 1];
+    size_t wl = 0;
+    int r = prod_search(comp, m, false, rep, ncls, wb, sizeof wb, &wl);
+    if (r == 0) { res = VDP_DEAD; goto out; }
+    if (r < 0) goto out;
+    if (free_bits == 0) {
+        res = VDP_REACHABLE;
+        put_witness(wit, wcap, wlen, wb, wl);
+        if (wflags) *wflags = bi->value;     /* access mode of B_i is 0..2 or free (0) */
+        goto out;
+    }
+    if (popcount32(free_bits) > VDP_MAX_ENUM_BITS) { why = "enumeration_bound"; goto out; }
+
+    /* Enumerate f; collect the distinct S(f) (as bitsets over J positions). */
+    size_t scap = 64;
+    sets = malloc(scap * sizeof *sets);
+    setf = malloc(scap * sizeof *setf);
+    if (!sets || !setf) goto out;
+    uint32_t sub = 0;
+    for (;;) {
+        uint32_t f = bi->value | sub;
+        if ((f & K_O_ACCMODE) != K_O_ACCMODE) {
+            uint64_t s[4] = { 0, 0, 0, 0 };
+            for (size_t x = 0; x < nj; x++)
+                if (bv_holds(&p->rules[cand[J[x]]].b, f)) s[x >> 6] |= 1ull << (x & 63);
+            bool dup = false;
+            for (size_t q = 0; q < nsets && !dup; q++) dup = !memcmp(sets[q], s, sizeof s);
+            if (!dup) {
+                if (nsets == scap) {
+                    scap *= 2;
+                    uint64_t (*ns)[4] = realloc(sets, scap * sizeof *ns);
+                    if (!ns) goto out;
+                    sets = ns;
+                    uint32_t *nf = realloc(setf, scap * sizeof *nf);
+                    if (!nf) goto out;
+                    setf = nf;
+                }
+                memcpy(sets[nsets], s, sizeof s);
+                setf[nsets++] = f;
+            }
+        }
+        if (sub == free_bits) break;
+        sub = (sub - free_bits) & free_bits;
+    }
+
+    bool budget = false;
+    res = VDP_DEAD;
+    for (size_t q = 0; q < nsets; q++) {
+        bool minimal = true;              /* no other distinct set strictly inside */
+        for (size_t o = 0; o < nsets && minimal; o++) {
+            if (o == q) continue;
+            bool sub_o = true;
+            for (int w = 0; w < 4; w++) if (sets[o][w] & ~sets[q][w]) sub_o = false;
+            if (sub_o) minimal = false;
+        }
+        if (!minimal) continue;
+        m = 0;
+        comp[m++] = &L[0];
+        for (size_t x = 0; x < nj; x++)
+            if ((sets[q][x >> 6] >> (x & 63)) & 1) comp[m++] = &L[J[x]];
+        r = prod_search(comp, m, false, rep, ncls, wb, sizeof wb, &wl);
+        if (r == 1) {
+            res = VDP_REACHABLE;
+            put_witness(wit, wcap, wlen, wb, wl);
+            if (wflags) *wflags = setf[q];
+            break;
+        }
+        if (r < 0) budget = true;
+    }
+    if (res == VDP_DEAD && budget) res = VDP_REACH_UNKNOWN;
+
+out:
+    if (res == VDP_REACH_UNKNOWN) g_reach_why = why;
+    free(sets);
+    free(setf);
+    for (size_t k = 0; k < nld; k++) ld_free(&L[k]);
+    for (size_t k = 0; k < nc; k++) prog_free(owned[k]);
+    return res;
+}
+
+vdp_reach_t vdp_rule_reachable_witness(const vdp_policy_t *p, size_t i,
+                                       char *wit, size_t wcap, size_t *wlen,
+                                       uint32_t *wflags) {
+    g_reach_why = "";
+    if (wlen) *wlen = 0;
+    if (wit && wcap) wit[0] = '\0';
+    if (i >= p->n) return VDP_REACH_UNKNOWN;
+    vdp_kind_t kind = p->rules[i].kind;
+    bool automaton = false;
+    if (kind != VDP_KIND_HOST) {
+        automaton = vdp_reach_force_automaton;
+        for (size_t j = 0; j <= i && !automaton; j++) {
+            const vdp_rule_t *r = &p->rules[j];
+            if (r->kind == kind && (r->s.op == VDP_STR_SUFFIX || r->s.op == VDP_STR_CONTAINS ||
+                                    r->s.op == VDP_STR_GLOB))
+                automaton = true;
+        }
+    }
+    return automaton ? reach_automaton(p, i, wit, wcap, wlen, wflags)
+                     : reach_trie(p, i, wit, wcap, wlen, wflags);
+}
+
+vdp_reach_t vdp_rule_reachable(const vdp_policy_t *p, size_t i) {
+    return vdp_rule_reachable_witness(p, i, NULL, 0, NULL, NULL);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -564,6 +1562,16 @@ size_t vdp_rule_advisory(const vdp_rule_t *r, char *buf, size_t n) {
     if (m & (K_O_DSYNC | K___O_SYNC))
         ADD("%sclauses on O_DSYNC/O_SYNC constrain the flags as passed; the kernel "
             "adds O_DSYNC to an open that sets the O_SYNC bit alone", w ? "; " : "");
+    if (r->kind != VDP_KIND_HOST) {
+        const char *c = r->s.c;
+        bool rel = false;
+        if (r->s.op == VDP_STR_PREFIX || r->s.op == VDP_STR_EQ) rel = c[0] != '/';
+        else if (r->s.op == VDP_STR_GLOB)
+            rel = c[0] != '/' && c[0] != '*' && !(c[0] == '\\' && c[1] == '/');
+        if (rel)
+            ADD("%sthe constant does not start with '/', but the Warden decides on "
+                "absolute resolved paths, so this rule matches no real action", w ? "; " : "");
+    }
     for (size_t i = 0; i < r->s.len; i++) {
         if ((unsigned char)r->s.c[i] >= 0x80) {
             ADD("%sconstant contains non-ASCII bytes: check it is not a mistyped "

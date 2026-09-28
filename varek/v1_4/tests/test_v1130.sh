@@ -68,7 +68,9 @@ n="$(grep -c '"rule":"fragment_escape_flags"' "$OUT/verdicts")"
 roline="$(grep -n '^allow path /tmp/varek_ro_v1130/' "$HERE/tests/v1130_policy.txt" | cut -d: -f1)"
 grep '^{' "$OUT/verdicts" | grep '"decision_final":"ALLOW"' | grep "$RO/data.txt" | grep -q "\"policy_line\":$roline," \
   && pass "an ALLOW record names the deciding policy line ($roline)" || flunk "an ALLOW record names the deciding policy line ($roline)"
-grep -Eq '"warden":"1\.13\.' "$OUT/verdicts" && pass "run_start names Warden 1.13.x" || flunk "run_start names Warden 1.13.x"
+ver="$(sed -n 's/.*"event":"run_start".*"warden":"\([0-9.]*\)".*/\1/p' "$OUT/verdicts" | head -1)"
+[ -n "$ver" ] && [ "$(printf '%s\n1.13.0\n' "$ver" | sort -V | head -1)" = 1.13.0 ] \
+  && pass "run_start names Warden $ver (>= 1.13.0)" || flunk "run_start names Warden >= 1.13.0 (saw '$ver')"
 
 echo "== 2. load-time analysis reports a rule that can never fire =="
 cat > "$OUT/dead.txt" <<'EOF'
@@ -101,7 +103,7 @@ o="$("$WARDEN" "$OUT/ctl.txt" -- /bin/true 2>&1 || true)"
 grep -q "control byte 0x01 in constant" <<<"$o" && pass "control byte in a constant refused" || flunk "control byte in a constant refused"
 printf 'require warden 1.99\nallow path /tmp/\n' > "$OUT/req.txt"
 o="$("$WARDEN" "$OUT/req.txt" -- /bin/true 2>&1 || true)"
-grep -q "policy requires Warden 1.99; this is 1.13" <<<"$o" && ! grep -q "supervising pid=" <<<"$o" \
+grep -Eq "policy requires Warden 1.99; this is 1\.(1[3-9]|[2-9][0-9])" <<<"$o" && ! grep -q "supervising pid=" <<<"$o" \
   && pass "require warden 1.99: refused, agent not started" || flunk "require warden 1.99 refused"
 printf 'allow path /tmp/log/ +O_APPEND\n' > "$OUT/adv.txt"
 o="$("$WARDEN" "$OUT/adv.txt" -- /bin/true 2>&1 || true)"

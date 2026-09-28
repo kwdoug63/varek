@@ -209,7 +209,8 @@ static const char *action_kind_name(action_kind_t k) {
 /* v1.13: the policy is parsed and decided by the SMT decision procedure in
  * smt_decide.c. See smt_decide.h for the fragment (bounded strings for the
  * path/host/exec constant, a 32-bit bitvector for open flags), the verdict
- * semantics, and the soundness obligations. */
+ * semantics, and the soundness obligations. v1.14 adds the bounded string
+ * fragment: exact, prefix, suffix, contains and glob matchers. */
 struct policy {
     char         name[64];
     char         version[16];
@@ -219,7 +220,7 @@ struct policy {
 static int policy_load(const char *path, struct policy *p) {
     memset(p, 0, sizeof(*p));
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.13");
+    snprintf(p->version, sizeof(p->version), "1.14");
     char err[512];
     if (vdp_policy_load(path, &p->v, err, sizeof err) < 0) {
         fprintf(stderr, "[warden] policy %s\n", err);
@@ -240,12 +241,14 @@ static int policy_load(const char *path, struct policy *p) {
         if (rr == VDP_DEAD) {
             dead++;
             fprintf(stderr, "[warden] policy %s:%d: WARNING: %s %s rule can never "
-                    "fire: every action it matches is decided by an earlier rule\n",
+                    "fire: every action it matches is decided by an earlier rule, "
+                    "or it matches no string within the length bound\n",
                     path, r->line, r->verb == VDP_ALLOW ? "allow" : "deny",
                     vdp_kind_name(r->kind));
         } else if (rr == VDP_REACH_UNKNOWN) {
             fprintf(stderr, "[warden] policy %s:%d: note: reachability not decided "
-                    "(outside the enumeration bound)\n", path, r->line);
+                    "(%s)\n", path, r->line,
+                    vdp_reach_unknown_text());
         }
     }
     fprintf(stderr, "[warden] loaded policy %s v%s with %zu rules (%zu can never fire)\n",
@@ -775,7 +778,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     log_line_start();
-    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.13.0\","
+    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.14.0\","
                    "\"policy_path\":\"", g_run_id);
     json_escape(g_log, policy_path);
     fprintf(g_log, "\",\"policy_rules\":%zu,\"timestamp_ns\":%lld}\n",
@@ -1463,8 +1466,10 @@ static void usage(const char *argv0) {
         "    deny  host evil.example.com\n"
         "    allow exec /usr/bin/env\n"
         "    allow path /var/log/ readonly     (v1.13: access=ro -O_CREAT -O_TRUNC)\n"
+        "    deny  path suffix .pem            (v1.14 matchers: exact, prefix,\n"
+        "    deny  path glob /home/*/.ssh/**    suffix, contains, glob; path and exec)\n"
         "  Path rules also take access=ro|wo|rw, +O_NAME, -O_NAME. Begin a policy\n"
-        "  that uses them with: require warden 1.13\n"
+        "  that uses flag clauses with require warden 1.13, matchers with 1.14.\n"
         "  Check a policy with: tools/vdp_check <policy> lint\n"
         "\n"
         "  Plan file format (see varek/v1_6/sample_plan.txt):\n"

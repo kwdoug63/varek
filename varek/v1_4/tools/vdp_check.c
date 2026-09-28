@@ -8,8 +8,13 @@
 //       Human-readable: parse errors, and every rule that can never fire.
 //       Exit 0 if the policy parses and no rule is DEAD, 1 if some rule is
 //       DEAD, 2 on a parse error.
-//   vdp_check <policy> analyze
-//       One JSON line per rule: {"index","line","kind","verb","reach"}.
+//   vdp_check <policy> analyze [automaton]
+//       One JSON line per rule: {"index","line","kind","verb","reach"}, plus
+//       for a REACHABLE rule a witness: "witness" (hex string) and "flags"
+//       (the rule is the first to hold on that pair), and for UNKNOWN the
+//       budget that was hit ("why"). With `automaton`, every path and exec
+//       rule is decided by the automaton search (testing: the cross-check
+//       runs both methods on the same policies).
 //   vdp_check <policy> batch
 //       Reads queries from stdin, one per line:
 //           <path|host|exec> <flags|-> <hex-encoded string>
@@ -92,10 +97,11 @@ static const char *reach_name(vdp_reach_t r) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s <policy> lint|analyze|batch\n", argv[0]);
+    if (argc != 3 && !(argc == 4 && !strcmp(argv[2], "analyze") && !strcmp(argv[3], "automaton"))) {
+        fprintf(stderr, "usage: %s <policy> lint|analyze [automaton]|batch\n", argv[0]);
         return 2;
     }
+    if (argc == 4) vdp_reach_force_automaton = true;
     char err[512];
     if (vdp_policy_load(argv[1], &g_pol, err, sizeof err) < 0) {
         if (!strcmp(argv[2], "lint")) fprintf(stderr, "policy error: %s\n", err);
@@ -105,12 +111,23 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[2], "batch")) return do_batch();
     if (!strcmp(argv[2], "analyze")) {
+        static char wit[VDP_STR_MAX + 1];
         for (size_t i = 0; i < g_pol.n; i++) {
             const vdp_rule_t *r = &g_pol.rules[i];
-            printf("{\"index\":%zu,\"line\":%d,\"kind\":\"%s\",\"verb\":\"%s\",\"reach\":\"%s\"}\n",
+            size_t wl = 0;
+            uint32_t wf = 0;
+            vdp_reach_t rr = vdp_rule_reachable_witness(&g_pol, i, wit, sizeof wit, &wl, &wf);
+            printf("{\"index\":%zu,\"line\":%d,\"kind\":\"%s\",\"verb\":\"%s\",\"reach\":\"%s\"",
                    i, r->line, vdp_kind_name(r->kind),
-                   r->verb == VDP_ALLOW ? "allow" : "deny",
-                   reach_name(vdp_rule_reachable(&g_pol, i)));
+                   r->verb == VDP_ALLOW ? "allow" : "deny", reach_name(rr));
+            if (rr == VDP_REACHABLE) {
+                printf(",\"witness\":\"");
+                for (size_t k = 0; k < wl; k++) printf("%02x", (unsigned char)wit[k]);
+                printf("\",\"flags\":\"0x%x\"", wf);
+            } else if (rr == VDP_REACH_UNKNOWN) {
+                printf(",\"why\":\"%s\"", vdp_reach_unknown_reason());
+            }
+            printf("}\n");
         }
         return 0;
     }
@@ -123,13 +140,14 @@ int main(int argc, char **argv) {
             vdp_reach_t rr = vdp_rule_reachable(&g_pol, i);
             if (rr == VDP_DEAD) {
                 const vdp_rule_t *r = &g_pol.rules[i];
-                printf("%s:%d: %s %s %s can never fire (every action it matches is "
-                       "decided by an earlier rule)\n", argv[1], r->line,
-                       r->verb == VDP_ALLOW ? "allow" : "deny", vdp_kind_name(r->kind), r->s.c);
+                printf("%s:%d: %s %s %s%s can never fire (every action it matches is decided "
+                       "by an earlier rule, or it matches no string within the length bound)\n",
+                       argv[1], r->line, r->verb == VDP_ALLOW ? "allow" : "deny",
+                       vdp_kind_name(r->kind), vdp_matcher_prefix(r), r->s.c);
                 dead++;
             } else if (rr == VDP_REACH_UNKNOWN) {
-                printf("%s:%d: reachability not decided (outside the enumeration bound)\n",
-                       argv[1], g_pol.rules[i].line);
+                printf("%s:%d: reachability not decided (%s)\n", argv[1], g_pol.rules[i].line,
+                    vdp_reach_unknown_text());
             }
         }
         printf("%s: %zu rules, %d can never fire\n", argv[1], g_pol.n, dead);
