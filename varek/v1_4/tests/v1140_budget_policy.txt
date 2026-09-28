@@ -1,0 +1,9 @@
+# v1.14 cross-check fixture: the reachability search's state budget. Each glob
+# alone is decided at once (no competing rule), but the second against the
+# first needs the product of two subset automata of 2^15 states each, past the
+# budget, so its reachability is UNKNOWN (state_budget): a load-time note,
+# never a guessed DEAD. Verdicts on concrete paths are unaffected.
+require warden 1.14
+deny  path glob **a??????????????
+allow path glob **b??????????????
+allow path /tmp/
