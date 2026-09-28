@@ -1,11 +1,9 @@
 # v1.12.3 regression policy. The probe is DYNAMICALLY linked, so the loader's
 # own opens must be allowed. Because policy now matches the CANONICAL path,
-# these are the canonical (post-symlink) prefixes: on a merged-/usr system the
+# these are the canonical (post-symlink) prefixes. On a merged-/usr system the
 # loader's /lib/... opens resolve to /usr/lib/..., and libc.so.6 resolves to
 # its versioned file.
 allow path /usr/lib/
-allow path /lib/
-allow path /lib64/
 allow path /etc/ld.so.cache
 # The agent's own /proc, reached as /proc/self/... (mapped to the agent).
 allow path /proc/self/

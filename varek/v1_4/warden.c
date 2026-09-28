@@ -855,11 +855,14 @@ static void send_errno(int notify_fd, uint64_t id, int err) {
  *   /proc/self — an ordinary symlink, but resolved by the SUPERVISOR it would
  *                name the supervisor's own process. So (v1.12.3) a leading
  *                /proc/self or /proc/thread-self in the agent's path is
- *                rewritten to the agent's own /proc/<tgid> before resolution,
- *                and after resolution any object on a procfs mount must lie
- *                under /proc/<the agent's tgid>/ or under a non-process /proc
- *                entry; anything else (the supervisor's own /proc/<pid>, reached
- *                through a symlink, or another process's) fails closed. An
+ *                rewritten to the agent's own /proc/<tgid> before resolution
+ *                (it is a magic link RESOLVE_NO_MAGICLINKS would otherwise
+ *                refuse). A planted symlink pointing at a magic link such as
+ *                /proc/self/mem is refused by RESOLVE_NO_MAGICLINKS during
+ *                resolution. After resolution any object on a procfs mount must
+ *                lie under /proc/<the agent's tgid>/ or be a non-process /proc
+ *                entry; a numeric /proc/<pid> that is not the agent's (the
+ *                supervisor's own, or another process's) fails closed. An
  *                object under the agent's own /proc/<tgid>/ is decided and
  *                recorded as /proc/self/..., which is how policies name it.
  *   RESOLVE_BENEATH is deliberately NOT set: allow rules legitimately name

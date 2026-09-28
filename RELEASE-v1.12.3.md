@@ -65,14 +65,29 @@ places:
   `/proc/<tgid>/task/<tid>`), so it resolves to the agent, not the supervisor.
 - **After resolution**, any object that lands on a procfs mount must be either
   the agent's own `/proc/<tgid>/…` or a non-process entry (`/proc/cpuinfo`,
-  `/proc/sys/…`). The Warden's own `/proc/<pid>/…`, another process's, or a
-  procfs reached through a symlink (for example a planted symlink to
-  `/proc/self/mem`, which resolves in the Warden's context) all fail closed. An
-  object that is the agent's own is decided and recorded as `/proc/self/…`, which
-  is how policies name it.
+  `/proc/sys/…`). The Warden's own `/proc/<pid>/…` and any other process's
+  `/proc/<pid>/…` — reached directly or through a symlink — fail closed.
 
-This closes the `/proc/self` supervisor-context confusion for the symlink-
-following case, the same class v1.12.0 closed for the refuse-symlinks case.
+Two distinct guards cover `/proc`, and it is worth being precise about which
+does what:
+
+- `/proc/self`, `/proc/thread-self` and `/proc/<pid>/fd/N` are **magic links**.
+  `RESOLVE_NO_MAGICLINKS` refuses to follow them during resolution, so a *planted
+  symlink* pointing at `/proc/self/mem` (which would resolve in the Warden's
+  context) fails at resolution, before any policy or `/proc` check. This is why a
+  *leading* `/proc/self` in the agent's own path has to be rewritten to
+  `/proc/<tgid>` first — otherwise the agent could not name its own `/proc` at
+  all.
+- A path or symlink that reaches another process's **numeric** `/proc/<pid>/…`
+  (the Warden's own, or any other process's) is an ordinary path that resolves
+  fine; the post-resolution check refuses it because `<pid>` is not the agent's
+  `tgid`.
+
+An object that is the agent's own is decided and recorded as `/proc/self/…`,
+which is how policies name it. A non-process procfs entry (`/proc/kcore`,
+`/proc/sysrq-trigger`, `/proc/sys/…`) is not refused by this check — it is
+governed by policy like any other path, so a broad `allow path /proc/` would
+expose it; name the specific entries an agent needs.
 
 ## Compatibility
 
@@ -81,17 +96,22 @@ following case, the same class v1.12.0 closed for the refuse-symlinks case.
   matches; use the canonical target (`/usr/lib/`). This was already true for the
   target of a `..` or symlink before v1.12.3; it now also applies to the loader
   search path. Policies that already name canonical prefixes are unaffected.
+  Prefix matching is literal, so end a directory prefix with `/` (`/usr/lib/`,
+  not `/usr/lib`, which would also match `/usr/libexec`); the shipped policies
+  do.
 - To open a symlink *as a link* rather than its target, an agent passes
   `O_NOFOLLOW`; the Warden refuses it (a link is not an allowable object).
 - `/proc/self/…` and `/proc/thread-self/…` opened by the agent now resolve to
   the agent's own process and are recorded as `/proc/self/…`.
 - No policy-file, plan-file or record-format change. `run_start` reads
   `"warden":"1.12.3"`.
-- Decision latency is unchanged within run-to-run noise: the requester's `tgid`
-  is looked up only for a `/proc/self` path or an object that lands on procfs, so
-  an ordinary open reads no extra `/proc` file (P50 5–8 µs before and after; P99
-  59–90 µs before and 55–94 µs after, five interleaved runs of
-  `bench_target 10000`).
+- Decision latency is unchanged within run-to-run noise. A successful resolve
+  adds an `fstat` and an `fstatfs` on the pinned descriptor (an `O_CREAT` that
+  pins the parent adds one `fstatfs`); the requester's `tgid` is looked up
+  (`/proc/<tid>/status`) only for a `/proc/self` path or an object that lands on
+  procfs, so an ordinary open reads no extra `/proc` file. P50 5–8 µs before and
+  after; P99 59–90 µs before and 55–94 µs after, five interleaved runs of
+  `bench_target 10000`.
 
 ## Testing
 

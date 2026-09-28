@@ -98,9 +98,11 @@ Model-B techniques below, with the residual limits stated honestly.
     **followed** (v1.12.3) and decided on their canonical target — a symlink to a
     denied object is refused, and dynamically linked agents' loaders work;
     v1.12.0–v1.12.2 instead refused any symlinked path (`RESOLVE_NO_SYMLINKS`). A
-    leading `/proc/self`/`thread-self` is mapped to the agent's own process
-    before resolution, and any procfs object outside the agent's `/proc/<tgid>`
-    fails closed afterward.
+    leading `/proc/self`/`thread-self` (a magic link) is mapped to the agent's
+    own process before resolution; a planted symlink to a magic link such as
+    `/proc/self/mem` is refused by `RESOLVE_NO_MAGICLINKS`; and a numeric
+    `/proc/<pid>` object that is not the agent's own fails a post-resolution
+    check. Non-process `/proc` entries remain governed by policy.
   - *Authorization-record integrity.* Every agent-controlled string is escaped, so
     no input can begin, end, or forge a record in the verdict stream. Records
     carry the resolved object the decision was made on.

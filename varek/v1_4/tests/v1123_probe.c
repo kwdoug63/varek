@@ -95,19 +95,26 @@ int main(void) {
     //     absolute /proc/<pid>/ that is not the agent's own is refused.
     must_refuse("proc_pid1_mem", "/proc/1/mem", O_RDONLY);
 
-    // 11. A symlink in an allowed dir pointing at /proc/self: it is NOT the
-    //     leading /proc/self the Warden maps to the agent, so it resolves in
-    //     the SUPERVISOR's context to /proc/<warden pid>/... — which the
-    //     post-resolution /proc check refuses because it is not the agent's.
+    // 11. A symlink pointing at /proc/self/mem: /proc/self is a MAGIC link, so
+    //     RESOLVE_NO_MAGICLINKS refuses it during resolution (before any policy
+    //     or /proc check) — the agent cannot follow a planted link into the
+    //     supervisor's context.
     must_refuse("symlink_to_proc_self", ALLOW "/link_to_proc_self_mem", O_RDONLY);
 
-    // 12. A bare denied /proc entry stays refused.
+    // 12. A symlink pointing at another process's NUMERIC /proc/<pid>/mem: this
+    //     resolves (no magic link in the path), and the post-resolution /proc
+    //     check refuses it because it is not the agent's own /proc/<tgid>.
+    must_refuse("symlink_to_proc_pid1", ALLOW "/link_to_proc_pid1_mem", O_RDONLY);
+
+    // 13. A bare denied /proc entry stays refused by default-deny (it is a
+    //     non-process procfs entry, so the /proc check does not itself refuse
+    //     it; the policy does not name it).
     must_refuse("proc_kcore", "/proc/kcore", O_RDONLY);
 
-    // 13. A legitimate non-symlink open in the allowed dir still works.
+    // 14. A legitimate non-symlink open in the allowed dir still works.
     must_open("plain_allowed", ALLOW "/ok.txt", O_RDONLY, "legitimate");
 
-    // 14. The denied file opened directly is still refused.
+    // 15. The denied file opened directly is still refused.
     must_refuse("denied_direct", DENIED "/secret.txt", O_RDONLY);
 
     line("done", "", 0);

@@ -72,12 +72,14 @@ change.
 ### Security
 
 - **`/proc/self` maps to the agent, not the supervisor.** A leading `/proc/self`
-  or `/proc/thread-self` is rewritten to the agent's own `/proc/<tgid>` before
-  resolution. After resolution, any object on a procfs mount must be the agent's
-  own `/proc/<tgid>/…` or a non-process entry; the supervisor's `/proc`, another
-  process's, or a procfs reached through a planted symlink (e.g. a symlink to
-  `/proc/self/mem`) fails closed. The agent's own entries are recorded as
-  `/proc/self/…`.
+  or `/proc/thread-self` (a magic link `RESOLVE_NO_MAGICLINKS` would otherwise
+  refuse) is rewritten to the agent's own `/proc/<tgid>` before resolution. A
+  planted symlink pointing at `/proc/self/mem` is a magic link and is refused
+  during resolution. A path or symlink reaching another process's numeric
+  `/proc/<pid>/…` resolves, then fails the post-resolution check because it is
+  not the agent's `/proc/<tgid>`. The agent's own entries are recorded as
+  `/proc/self/…`. A non-process `/proc` entry (`/proc/kcore`, `/proc/sys/…`) is
+  governed by policy, not by this check.
 - **A trailing symlink opened `O_NOFOLLOW`** is refused (the agent's `O_NOFOLLOW`
   reaches the `O_PATH` resolve, which returns the link; a link is not an
   allowable object).
