@@ -655,16 +655,19 @@ static void emit_pathology(uint64_t seq,
         "\"decision_final\":\"%s\","
         "\"rule\":\"%s\","
         "\"kernel_verdict\":\"%s\","
+        "\"errno\":%d,"
         "\"latency_us\":%" PRIu64 ","
         "\"timestamp_ns\":%lld}\n",
         decision_name(d_raw),
         decision_name(d_final),
         rule_id ? rule_id : "none",
-        d_final == DEC_ALLOW ? "ALLOW" : "EPERM",
+        /* v1.12.1: an ALLOW whose open then failed (EEXIST, ENXIO, ...)
+         * delivered nothing; say so rather than reporting ALLOW. */
+        d_final == DEC_ALLOW ? (kernel_errno ? "ERRNO" : "ALLOW") : "EPERM",
+        kernel_errno,
         (uint64_t)(latency_ns / 1000ULL),
         (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     fflush(g_log);
-    (void)kernel_errno;
 }
 
 /* ---------------- Kernel Injection ---------------- */
@@ -684,75 +687,223 @@ static void send_simple(int notify_fd, uint64_t id, decision_t d) {
     ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);
 }
 
+/* v1.12.1: fail the agent's syscall with a specific errno (used when an
+ * ALLOWED open fails for an ordinary reason such as EEXIST or ENXIO). */
+static void send_errno(int notify_fd, uint64_t id, int err) {
+    struct seccomp_notif_resp resp = {
+        .id = id, .val = 0, .error = -err, .flags = 0,
+    };
+    ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);
+}
+
 /* v1.12 AT_FDCWD constant (avoid pulling a divergent libc definition). */
 #ifndef VAREK_AT_FDCWD
 #define VAREK_AT_FDCWD (-100)
 #endif
 
-/* v1.12: resolve-once. Open the object the agent named, exactly once, in a
- * way that pins WHICH object every later step reasons about, and record its
- * canonical path into a->resolved for the policy decision and the audit log.
+/* v1.12.1: resolve without side effects, decide, THEN open.
  *
- * Resolution flags (the header and bypass-classes.md claimed these; the code
- * shipped only RESOLVE_NO_MAGICLINKS through v1.9.3 — this is the fix):
- *   RESOLVE_NO_SYMLINKS   — no symlink component anywhere in the path. A
- *                           symlink planted inside an allowed directory can no
- *                           longer redirect the open to a denied object.
- *   RESOLVE_NO_MAGICLINKS — /proc/<pid>/fd/N and /proc/self magic links do not
- *                           resolve, so the agent cannot reach the Warden's own
- *                           /proc/self view (it named /proc/self; the kernel
- *                           would resolve that in the SUPERVISOR's context).
+ * v1.12.0 resolved the object by opening it with the agent's own flags and
+ * only then consulted policy. The open ran as root before the decision, so a
+ * DENY still had effects: O_TRUNC emptied a denied file, O_CREAT created a
+ * root-owned file in a denied directory, and a blocking open (a FIFO with no
+ * peer) wedged the single-threaded supervisor.
+ *
+ * v1.12.1 splits the step in two:
+ *
+ *   resolve_target()      pins the object with an O_PATH descriptor, which
+ *                         opens nothing (no truncation, no creation, no device
+ *                         or FIFO open semantics), and records its canonical
+ *                         path for the decision and the audit log;
+ *   materialize_target()  runs only after ALLOW, and opens the pinned object
+ *                         with the agent's real flags.
+ *
+ * The decision and the delivered fd still name the same inode: the real open
+ * goes through the pinned O_PATH fd (/proc/self/fd/N of the supervisor's own
+ * descriptor), not through the agent's pathname a second time.
+ *
+ * Creation. An O_PATH open of a name that does not exist fails, so for O_CREAT
+ * the parent directory is pinned instead and the decision is made on
+ * <canonical parent>/<name>. After ALLOW the file is created with
+ * openat(parent_fd, name, flags | O_NOFOLLOW): the parent is the directory
+ * that was decided on, and a symlink raced into the name is refused (ELOOP).
+ *
+ * Resolution flags (unchanged from v1.12.0):
+ *   RESOLVE_NO_SYMLINKS   — no symlink component anywhere in the path.
+ *   RESOLVE_NO_MAGICLINKS — /proc/<pid>/fd/N and /proc/self do not resolve, so
+ *                           the agent cannot reach the supervisor's own view.
  *   RESOLVE_BENEATH is deliberately NOT set: allow rules legitimately name
- *   absolute paths outside the cwd (e.g. /lib/). `..` is instead defanged by
- *   deciding on the post-`..`-collapse canonical path (see below), not by
- *   forbidding `..` outright.
+ *   absolute paths outside the cwd. `..` is defanged by deciding on the
+ *   post-collapse canonical path.
+ *   O_NOFOLLOW is NOT passed to the O_PATH resolve: with O_PATH it would make
+ *   openat2 return the trailing symlink itself instead of refusing it.
  *
- * dirfd handling: the v1.4 supervisor does not mirror the target's fd table,
- * so a relative open against a target-held dirfd cannot be resolved soundly.
- * Only AT_FDCWD (resolved against /proc/<pid>/cwd) and absolute paths are
- * handled; any other dirfd fails closed. Returns the resolved fd (>=0, caller
- * owns it) or -1. On success a->resolved holds the canonical path. */
-static int resolve_target_open(pid_t target_pid, struct action *a)
+ * dirfd handling: only AT_FDCWD (resolved against /proc/<pid>/cwd) and
+ * absolute paths are handled; any other dirfd fails closed. */
+
+struct resolved_target {
+    int  path_fd;          /* O_PATH fd on the object, or -1 when creating */
+    int  parent_fd;        /* O_PATH fd on the parent directory when creating */
+    char name[256];        /* final component when creating */
+};
+
+static void resolved_target_close(struct resolved_target *r) {
+    if (r->path_fd   >= 0) close(r->path_fd);
+    if (r->parent_fd >= 0) close(r->parent_fd);
+    r->path_fd = r->parent_fd = -1;
+}
+
+/* Canonical path of a descriptor the supervisor holds. Fails closed on a
+ * deleted or anonymous inode (readlink does not start with '/'). */
+static int fd_canonical_path(int fd, char *out, size_t outlen) {
+    char linkpath[64];
+    snprintf(linkpath, sizeof(linkpath), "/proc/self/fd/%d", fd);
+    ssize_t rl = readlink(linkpath, out, outlen - 1);
+    if (rl < 0 || (size_t)rl >= outlen - 1) { out[0] = '\0'; return -1; }
+    out[rl] = '\0';
+    if (out[0] != '/') { out[0] = '\0'; return -1; }
+    return 0;
+}
+
+static int openat2_path(int dirfd, const char *path, uint64_t extra_flags) {
+    struct open_how_local how = {
+        .flags   = (uint64_t)O_PATH | (uint64_t)O_CLOEXEC | extra_flags,
+        .mode    = 0,
+        .resolve = (uint64_t)RESOLVE_NO_SYMLINKS | (uint64_t)RESOLVE_NO_MAGICLINKS,
+    };
+    return (int)syscall(__NR_openat2, dirfd, path, &how, sizeof(how));
+}
+
+/* Returns 0 with r filled and a->resolved set, or -1 (fail closed). Nothing
+ * on the filesystem is opened, created or modified. */
+static int resolve_target(pid_t target_pid, struct action *a,
+                          struct resolved_target *r)
 {
     a->resolved[0] = '\0';
+    r->path_fd = r->parent_fd = -1;
+    r->name[0] = '\0';
 
-    if (a->open_dirfd != VAREK_AT_FDCWD && a->target[0] != '/') {
-        /* relative open against a dirfd we do not track: fail closed. */
-        return -1;
-    }
+    if (a->open_dirfd != VAREK_AT_FDCWD && a->target[0] != '/')
+        return -1;   /* relative open against a dirfd we do not track */
 
     char proc_cwd[64];
     snprintf(proc_cwd, sizeof(proc_cwd), "/proc/%d/cwd", target_pid);
-    int cwd_fd = open(proc_cwd, O_PATH | O_DIRECTORY);
+    int cwd_fd = open(proc_cwd, O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (cwd_fd < 0) return -1;
 
-    struct open_how_local how = {
-        .flags   = (uint64_t)a->open_flags & ~(uint64_t)O_PATH,
-        .mode    = ((uint64_t)a->open_flags & (uint64_t)O_CREAT) ? ((uint64_t)a->open_mode & 0777) : 0,
-        .resolve = (uint64_t)RESOLVE_NO_SYMLINKS | (uint64_t)RESOLVE_NO_MAGICLINKS,
-    };
-    int resolved = (int)syscall(__NR_openat2,
-                                cwd_fd, a->target, &how, sizeof(how));
+    int fd = openat2_path(cwd_fd, a->target,
+                          (uint64_t)a->open_flags & (uint64_t)O_DIRECTORY);
+    if (fd >= 0) {
+        close(cwd_fd);
+        if (fd_canonical_path(fd, a->resolved, sizeof(a->resolved)) < 0) {
+            close(fd);
+            return -1;
+        }
+        r->path_fd = fd;
+        return 0;
+    }
+    if (errno != ENOENT || !(a->open_flags & O_CREAT)) {
+        close(cwd_fd);
+        return -1;
+    }
+
+    /* O_CREAT of a name that does not exist yet: pin the parent. */
+    const char *t = a->target;
+    size_t tl = strlen(t);
+    if (tl == 0 || t[tl - 1] == '/') { close(cwd_fd); return -1; }
+    const char *slash = strrchr(t, '/');
+    const char *name  = slash ? slash + 1 : t;
+    if (!strcmp(name, ".") || !strcmp(name, "..") ||
+        strlen(name) >= sizeof(r->name)) {
+        close(cwd_fd);
+        return -1;
+    }
+    char dir[PATH_LIMIT];
+    if (!slash)          snprintf(dir, sizeof(dir), ".");
+    else if (slash == t) snprintf(dir, sizeof(dir), "/");
+    else                 snprintf(dir, sizeof(dir), "%.*s", (int)(slash - t), t);
+
+    int pfd = openat2_path(cwd_fd, dir, (uint64_t)O_DIRECTORY);
     close(cwd_fd);
-    if (resolved < 0) return -1;
+    if (pfd < 0) return -1;
 
-    /* Canonical path of exactly this fd — this is the string the policy
-     * decides on and the audit log records. Reading the magic link of a fd we
-     * ourselves hold is safe; it is the agent naming /proc/self that the
-     * RESOLVE_NO_MAGICLINKS above blocks. */
-    char linkpath[64];
-    snprintf(linkpath, sizeof(linkpath), "/proc/self/fd/%d", resolved);
-    ssize_t rl = readlink(linkpath, a->resolved, sizeof(a->resolved) - 1);
-    if (rl < 0) { close(resolved); a->resolved[0] = '\0'; return -1; }
-    a->resolved[rl] = '\0';
-    /* readlink can annotate a deleted/anon inode as " (deleted)"; such an
-     * object has no stable policy identity. Fail closed. */
-    if (a->resolved[0] != '/') { close(resolved); a->resolved[0] = '\0'; return -1; }
-
-    return resolved;
+    char parent[PATH_LIMIT];
+    if (fd_canonical_path(pfd, parent, sizeof(parent)) < 0) { close(pfd); return -1; }
+    int n = snprintf(a->resolved, sizeof(a->resolved), "%s%s%s",
+                     parent, strcmp(parent, "/") ? "/" : "", name);
+    if (n < 0 || (size_t)n >= sizeof(a->resolved)) {
+        a->resolved[0] = '\0';
+        close(pfd);
+        return -1;
+    }
+    r->parent_fd = pfd;
+    snprintf(r->name, sizeof(r->name), "%s", name);
+    return 0;
 }
 
-/* v1.12: hand an already-resolved fd (from resolve_target_open) to the target.
+/* The agent's umask, so a file the supervisor creates on its behalf gets the
+ * permissions the agent's own open would have produced. Falls back to 022. */
+static mode_t target_umask(pid_t pid) {
+    char path[64], line[128];
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    FILE *f = fopen(path, "re");
+    mode_t m = 022;
+    if (!f) return m;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned int v;
+        if (sscanf(line, "Umask: %o", &v) == 1) { m = (mode_t)(v & 0777); break; }
+    }
+    fclose(f);
+    return m;
+}
+
+/* Runs only after ALLOW. Opens the pinned object with the agent's own flags
+ * and returns the fd to inject, or -errno (the agent receives that errno,
+ * exactly as its own open would have).
+ *
+ * O_NONBLOCK is added for the open itself so a FIFO or device cannot block
+ * the single-threaded supervisor, then cleared again unless the agent asked
+ * for it. One visible difference follows from that: opening a FIFO for
+ * writing when no reader exists returns ENXIO instead of waiting. */
+static int materialize_target(pid_t target_pid, const struct action *a,
+                              const struct resolved_target *r)
+{
+    int want = a->open_flags;
+    int fd;
+
+    if (r->path_fd >= 0) {
+        if (want & O_PATH) {
+            fd = fcntl(r->path_fd, F_DUPFD_CLOEXEC, 0);
+            return fd < 0 ? -errno : fd;
+        }
+        char self[64];
+        snprintf(self, sizeof(self), "/proc/self/fd/%d", r->path_fd);
+        /* Through the pinned descriptor: same inode that was decided on.
+         * O_NOFOLLOW is dropped here only because /proc/self/fd/N is itself a
+         * link; the agent's path was already resolved with no symlinks. */
+        int flags = (want & ~O_NOFOLLOW) | O_NONBLOCK | O_CLOEXEC;
+        fd = open(self, flags, 0);
+    } else if (r->parent_fd >= 0) {
+        if (want & O_PATH) return -ENOENT;
+        int flags = want | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
+        mode_t old = umask(target_umask(target_pid));
+        fd = openat(r->parent_fd, r->name, flags, (mode_t)(a->open_mode & 07777));
+        int saved = errno;
+        umask(old);
+        errno = saved;
+    } else {
+        return -EACCES;
+    }
+    if (fd < 0) return -errno;
+
+    if (!(want & O_NONBLOCK)) {
+        int fl = fcntl(fd, F_GETFL);
+        if (fl >= 0) (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+    }
+    return fd;
+}
+
+/* v1.12: hand an already-opened fd (from materialize_target) to the target.
  * No second open — the object decided on IS the object delivered, so there is
  * no resolve/decide/open TOCTOU window. */
 static int inject_fd(int notify_fd, uint64_t id, int resolved)
@@ -836,15 +987,15 @@ static void supervise(int notify_fd, int target_pidfd,
             continue;
         }
 
-        /* v1.12: resolve-then-decide for file opens. The object is opened once,
-         * canonicalized, and only then matched against policy, so the decision
-         * and the delivered fd refer to the same inode. Resolution failure
-         * (symlink component, untracked dirfd, over-long path, deleted inode)
-         * is a hard deny before any policy match. */
-        int resolved_fd = -1;
+        /* v1.12.1: resolve-then-decide-then-open for file opens. The object
+         * is pinned with O_PATH (no side effect), canonicalized, matched
+         * against policy, and only on ALLOW opened with the agent's flags
+         * through the pinned descriptor. Resolution failure (symlink
+         * component, untracked dirfd, over-long path, deleted inode, missing
+         * parent) is a hard deny before any policy match. */
+        struct resolved_target rt = { .path_fd = -1, .parent_fd = -1 };
         if (act.kind == ACT_FILE_OPEN) {
-            resolved_fd = resolve_target_open(req.pid, &act);
-            if (resolved_fd < 0) {
+            if (resolve_target(req.pid, &act, &rt) < 0) {
                 clock_gettime(CLOCK_MONOTONIC, &t1);
                 uint64_t lat_r = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                                + (t1.tv_nsec - t0.tv_nsec);
@@ -859,19 +1010,31 @@ static void supervise(int notify_fd, int target_pidfd,
         decision_t d_final = (d_raw == DEC_ALLOW) ? DEC_ALLOW : DEC_DENY;
 
         if (act.kind == ACT_FILE_OPEN) {
-            if (d_final == DEC_ALLOW && inject_fd(notify_fd, req.id, resolved_fd) == 0) {
-                close(resolved_fd);
+            if (d_final == DEC_ALLOW) {
+                /* Nothing has been opened with the agent's flags until here. */
+                int ofd = materialize_target(req.pid, &act, &rt);
+                resolved_target_close(&rt);
+                const char *rule = "resolved_fd_injection";
+                int err = 0;
+                if (ofd < 0) {
+                    err  = -ofd;
+                    rule = "allowed_open_failed";
+                } else if (!notif_id_valid(notify_fd, req.id) ||
+                           inject_fd(notify_fd, req.id, ofd) != 0) {
+                    /* Requester gone, or injection failed: nothing delivered. */
+                    err  = EACCES;
+                    rule = "injection_failed";
+                }
+                if (ofd >= 0) close(ofd);
+                if (err) send_errno(notify_fd, req.id, err);
                 clock_gettime(CLOCK_MONOTONIC, &t1);
                 uint64_t lat = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                              + (t1.tv_nsec - t0.tv_nsec);
-                emit_pathology(seq++, req.pid, &act, d_raw, d_final,
-                               "resolved_fd_injection", lat, 0);
+                emit_pathology(seq++, req.pid, &act, d_raw, d_final, rule, lat, err);
                 continue;
             }
-            /* denied by policy, or injection failed: drop the resolved fd and
-             * fall through to a fail-closed deny. */
-            close(resolved_fd);
-            d_final = DEC_DENY;
+            /* Denied by policy: the pinned object was never opened. */
+            resolved_target_close(&rt);
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat_d = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                            + (t1.tv_nsec - t0.tv_nsec);
