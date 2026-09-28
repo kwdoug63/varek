@@ -18,11 +18,12 @@ increasing. Shipped in v1.13.0: the SMT decision procedure in the enforcement
 path, the bitvector flag fragment, the prefix/equality part of the bounded
 string fragment, and the verdict-distribution harness (synthetic seed corpus).
 Shipped in v1.14.0: the rest of the bounded string fragment (suffix, contains
-and glob matchers, with exact load-time reachability). Still planned: proof
-objects and an independent checker (next), a customer-derived corpus and
-measured baseline, and the v1.11 sequence fragment.
+and glob matchers, with exact load-time reachability). Shipped in v1.15.0:
+certificates for every authorization, checked in-line by an independent
+checker. Still planned: a customer-derived corpus and measured baseline, a
+formally verified checker, and the v1.11 sequence fragment.
 
-### Planned — v1.10 program (status as of v1.14.0)
+### Planned — v1.10 program (status as of v1.15.0)
 
 - **Verdict-distribution harness.** Measurement and regression gating over a
   corpus of realistic agent action-graphs. Reports the four-cell outcome
@@ -56,6 +57,56 @@ measured baseline, and the v1.11 sequence fragment.
   fragment's guarantee.
 
 ---
+
+## [1.15.0] - 2026-09-28
+
+Third release of the v1.10 verification program: certificates. Every SATISFIED
+verdict carries a certificate — the deciding rule and a witness that its
+constant matches — and the Warden authorizes the action only if a separately
+written checker accepts it. For authorizations, the decision procedure moves
+from trusted to checked against logic bugs; the trusted decision code is now
+the checker (about 540 lines of C, its own parser and matchers, no shared
+source).
+
+### Added
+
+- **Certificate checker** `checker/vdp_checker.c` (with SHA-256) and its CLI
+  `tools/vdp_cert_check` (`digest`, `batch`, `holds`). The glob matcher is a
+  row-by-row dynamic program with literal prefix/suffix/length pre-filters. Checks that the action is
+  in the fragment, that rule `r` is an allow rule of the kind whose flag clause
+  holds, that the witness proves its constant matches (`contains`: an offset;
+  `glob`: one span per `*`, `**`, `/**/`), and — deciding them itself — that no
+  earlier rule holds. For the `--plan` gate's any-flags claims it enumerates
+  every admissible value of the relevant flag bits.
+- **Certificates from the procedure**: `vdp_certificate()` (glob witnesses by a
+  backward walk over the automaton's state sets); `vdp_check batch` prints the
+  witness of every SATISFIED verdict; `vdp_policy_load_mem()`.
+- **In-line checking in the Warden**: the policy file is read once, both parsers
+  parse the same bytes (the Warden compares the two parses rule by rule and
+  refuses to start on any difference), and
+  their SHA-256 is recorded in `run_start` as `policy_sha256`. A file open is
+  authorized only after the checker accepts its certificate; records carry
+  `open_flags`, `cert_rule`, `cert_witness` and `check` (flat fields). A
+  refused certificate denies the open
+  (`certificate_refused`, with `check_why`). The `--plan` gate certifies too.
+- **Audit**: `tools/varek_audit.py` re-checks a saved verdict stream
+  (authenticated against the agent as by the exporter, tied to the policy file
+  by SHA-256, no authorization other than certified file opens and the launch
+  exec, every certificate re-checked by the checker; test-build streams
+  refused). It does not protect the log from whoever holds it. The CycloneDX export
+  includes the policy SHA-256 and each authorization's certificate.
+- **Cross-check `--cert`**: the checker's parser and digest against the
+  procedure's and Python's; every emitted certificate accepted; forged,
+  shadowed and mutated certificates judged correctly; the checker's per-rule
+  matches against the oracle's languages.
+- `make test-v1150`, with a test-only `warden_faultinject` whose procedure has a
+  planted bug: the checker refuses its wrong verdicts.
+
+### Changed
+
+- `run_start` reads `"warden":"1.15.0"`; `require warden 1.15` is accepted.
+- `bench_summarize.py` parses each record line as one JSON object (its regular
+  expression for flat objects would drop a record with a nested value).
 
 ## [1.14.0] - 2026-09-28
 
