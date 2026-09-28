@@ -116,13 +116,14 @@ if grep '^{' "$VERDICTS" | grep '"process.exec"' | grep '"DENY"' | grep -q '/bin
 else flunk "the refused spawn is in the verdict stream"; fi
 
 echo "-- 6. verdict stream still attests"
-if grep '^{' "$VERDICTS" | grep -q '"warden":"1.12.2"'; then pass "run_start names Warden 1.12.2"
-else flunk "run_start names Warden 1.12.2"; fi
+# 1.12.2 or any later 1.12.x (the suite keeps running on later releases).
+if grep '^{' "$VERDICTS" | grep -Eq '"warden":"1\.12\.([2-9]|[1-9][0-9])"'; then pass "run_start names Warden 1.12.2 or later"
+else flunk "run_start names Warden 1.12.2 or later"; fi
 if python3 "$EXPORTER" --log "$VERDICTS" --output "$OUT/bom.json" >/dev/null 2>"$OUT/exp.err"; then
     pass "CycloneDX exporter accepts the multithreaded stream"
 else flunk "CycloneDX exporter accepts the multithreaded stream ($(head -1 "$OUT/exp.err"))"; fi
 # The BOM names the Warden version from run_start, not the exporter's own.
-sed 's/"warden":"1\.12\.2"/"warden":"9.9.9"/' "$VERDICTS" > "$OUT/relabel.log"
+sed -E 's/"warden":"[0-9.]+"/"warden":"9.9.9"/' "$VERDICTS" > "$OUT/relabel.log"
 if python3 "$EXPORTER" --log "$OUT/relabel.log" --output "$OUT/relabel.json" >/dev/null 2>&1 \
    && grep -q '"version": "9.9.9"' "$OUT/relabel.json"; then
     pass "BOM takes the Warden version from run_start"

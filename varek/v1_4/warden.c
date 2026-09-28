@@ -32,8 +32,9 @@
  *      symmetric-suppression invariant in the patent.
  *
  *   7. Kernel Injection — for path-arg syscalls (openat) Warden
- *      resolves the path itself via openat2(O_PATH, RESOLVE_NO_SYMLINKS |
- *      RESOLVE_NO_MAGICLINKS), decides, and only after ALLOW opens the
+ *      resolves the path itself via openat2(O_PATH, RESOLVE_NO_MAGICLINKS;
+ *      ordinary symlinks followed from v1.12.3, with /proc/self mapped to the
+ *      agent), decides on the canonical path, and only after ALLOW opens the
  *      pinned object with the agent's flags (v1.12.1) and returns that fd
  *      through SECCOMP_IOCTL_NOTIF_ADDFD with SECCOMP_ADDFD_FLAG_SEND. The
  *      kernel never re-reads the userspace pathname pointer.
@@ -90,6 +91,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -481,9 +483,10 @@ static decision_t policy_decide(const struct policy *p,
          * kernel actually opened — not the raw pathname the agent supplied.
          * `..` traversal and symlink/bind-mount indirection can no longer
          * make a denied object match an allow rule, because resolved is the
-         * real target after `..` collapse and (with RESOLVE_NO_SYMLINKS) with
-         * no symlink component permitted at all. If resolution has not run or
-         * failed, resolved is empty and nothing matches -> UNKNOWN -> deny. */
+         * real target after `..` collapse and after every symlink has been
+         * followed (v1.12.3; v1.12.0-v1.12.2 refused symlinks outright). If
+         * resolution has not run or failed, resolved is empty and nothing
+         * matches -> UNKNOWN -> deny. */
         const char *decide_on = a->resolved[0] ? a->resolved : "";
         if (decide_on[0] == '\0') return DEC_UNKNOWN;
         for (size_t i = 0; i < p->n_rules; i++) {
@@ -709,7 +712,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     log_line_start();
-    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.12.2\","
+    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.12.3\","
                    "\"policy_path\":\"", g_run_id);
     json_escape(g_log, policy_path);
     fprintf(g_log, "\",\"policy_rules\":%zu,\"timestamp_ns\":%lld}\n",
@@ -837,15 +840,37 @@ static void send_errno(int notify_fd, uint64_t id, int err) {
  * openat(parent_fd, name, flags | O_NOFOLLOW): the parent is the directory
  * that was decided on, and a symlink raced into the name is refused (ELOOP).
  *
- * Resolution flags (unchanged from v1.12.0):
- *   RESOLVE_NO_SYMLINKS   — no symlink component anywhere in the path.
- *   RESOLVE_NO_MAGICLINKS — /proc/<pid>/fd/N and /proc/self do not resolve, so
- *                           the agent cannot reach the supervisor's own view.
+ * Resolution flags:
+ *   Ordinary symlinks are FOLLOWED (v1.12.3). v1.12.0 through v1.12.2 set
+ *   RESOLVE_NO_SYMLINKS, which refused every path with a symlink anywhere in
+ *   it. On merged-/usr systems /lib is a symlink, and shared-library names
+ *   (libz.so.1 -> libz.so.1.3) are symlinks, so the dynamic loader could not
+ *   open most libraries and every dynamically linked agent failed before
+ *   main(). Following symlinks does not weaken the decision: policy is matched
+ *   on the canonical path of the object the resolution actually reached, and
+ *   that same object is what is delivered. A symlink in an allowed directory
+ *   that points at a denied file is decided as the denied file.
+ *   RESOLVE_NO_MAGICLINKS — /proc/<pid>/fd/N, /proc/<pid>/cwd, exe and root do
+ *                           not resolve.
+ *   /proc/self — an ordinary symlink, but resolved by the SUPERVISOR it would
+ *                name the supervisor's own process. So (v1.12.3) a leading
+ *                /proc/self or /proc/thread-self in the agent's path is
+ *                rewritten to the agent's own /proc/<tgid> before resolution
+ *                (it is a magic link RESOLVE_NO_MAGICLINKS would otherwise
+ *                refuse). A planted symlink pointing at a magic link such as
+ *                /proc/self/mem is refused by RESOLVE_NO_MAGICLINKS during
+ *                resolution. After resolution any object on a procfs mount must
+ *                lie under /proc/<the agent's tgid>/ or be a non-process /proc
+ *                entry; a numeric /proc/<pid> that is not the agent's (the
+ *                supervisor's own, or another process's) fails closed. An
+ *                object under the agent's own /proc/<tgid>/ is decided and
+ *                recorded as /proc/self/..., which is how policies name it.
  *   RESOLVE_BENEATH is deliberately NOT set: allow rules legitimately name
  *   absolute paths outside the cwd. `..` is defanged by deciding on the
  *   post-collapse canonical path.
- *   O_NOFOLLOW is NOT passed to the O_PATH resolve: with O_PATH it would make
- *   openat2 return the trailing symlink itself instead of refusing it.
+ *   O_NOFOLLOW from the agent is honoured: it is passed to the O_PATH resolve,
+ *   which then returns the trailing symlink itself, and a trailing symlink
+ *   fails closed (EACCES; a normal open would say ELOOP).
  *
  * dirfd handling: only AT_FDCWD (resolved against /proc/<pid>/cwd) and
  * absolute paths are handled; any other dirfd fails closed. */
@@ -878,9 +903,92 @@ static int openat2_path(int dirfd, const char *path, uint64_t extra_flags) {
     struct open_how_local how = {
         .flags   = (uint64_t)O_PATH | (uint64_t)O_CLOEXEC | extra_flags,
         .mode    = 0,
-        .resolve = (uint64_t)RESOLVE_NO_SYMLINKS | (uint64_t)RESOLVE_NO_MAGICLINKS,
+        .resolve = (uint64_t)RESOLVE_NO_MAGICLINKS,
     };
     return (int)syscall(__NR_openat2, dirfd, path, &how, sizeof(how));
+}
+
+/* v1.12.3: thread-group id of a requesting task (req.pid is a thread id). */
+static pid_t task_tgid(pid_t tid) {
+    char path[64], line[128];
+    snprintf(path, sizeof(path), "/proc/%d/status", tid);
+    FILE *f = fopen(path, "re");
+    if (!f) return -1;
+    pid_t tgid = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "Tgid:", 5) == 0) { tgid = (pid_t)strtol(line + 5, NULL, 10); break; }
+    }
+    fclose(f);
+    return tgid > 0 ? tgid : -1;
+}
+
+/* v1.12.3: does this path start with /proc/self or /proc/thread-self? Only
+ * these need the requester's tgid before resolution; every other path is left
+ * alone, so the common open never reads /proc/<tid>/status. */
+static bool path_is_proc_self(const char *in, bool *thread_self) {
+    static const char kSelf[] = "/proc/self", kThread[] = "/proc/thread-self";
+    if (!strncmp(in, kThread, sizeof(kThread) - 1) &&
+        (in[sizeof(kThread) - 1] == '\0' || in[sizeof(kThread) - 1] == '/')) {
+        *thread_self = true; return true;
+    }
+    if (!strncmp(in, kSelf, sizeof(kSelf) - 1) &&
+        (in[sizeof(kSelf) - 1] == '\0' || in[sizeof(kSelf) - 1] == '/')) {
+        *thread_self = false; return true;
+    }
+    return false;
+}
+
+/* Rewrite a leading /proc/self or /proc/thread-self (already matched) to the
+ * agent's own /proc/<tgid>[/task/<tid>], so the supervisor does not resolve it
+ * to itself. Returns 0 (out filled), or -1 if it does not fit. */
+static int rewrite_proc_self(const char *in, bool thread_self,
+                             pid_t tgid, pid_t tid, char *out, size_t outlen) {
+    static const char kSelf[] = "/proc/self", kThread[] = "/proc/thread-self";
+    int n;
+    if (thread_self) {
+        const char *rest = in + sizeof(kThread) - 1;
+        n = snprintf(out, outlen, "/proc/%d/task/%d%s", tgid, tid, rest);
+    } else {
+        const char *rest = in + sizeof(kSelf) - 1;
+        n = snprintf(out, outlen, "/proc/%d%s", tgid, rest);
+    }
+    return (n < 0 || (size_t)n >= outlen) ? -1 : 0;
+}
+
+#ifndef PROC_SUPER_MAGIC
+#define PROC_SUPER_MAGIC 0x9fa0
+#endif
+
+/* v1.12.3: after resolution, an object on procfs must be the agent's own
+ * (/proc/<tgid>/...) or a non-process entry (/proc/cpuinfo, /proc/sys/...).
+ * The agent's own entries are rewritten to /proc/self/... for the decision and
+ * the record. The tgid is looked up here, only when the object is actually on
+ * procfs, and cached in *tgid_cache across the calls of one resolution.
+ * Returns 0, or -1 to fail closed. */
+static int check_proc_object(int fd, pid_t tid, pid_t *tgid_cache,
+                             char *canon, size_t canonlen) {
+    struct statfs sf;
+    if (fstatfs(fd, &sf) < 0) return -1;
+    if ((unsigned long)sf.f_type != (unsigned long)PROC_SUPER_MAGIC) return 0;
+    if (strncmp(canon, "/proc", 5) != 0 || (canon[5] != '/' && canon[5] != '\0'))
+        return -1;                        /* a procfs mounted somewhere else */
+    const char *p = canon + 5;
+    if (*p == '\0') return 0;             /* /proc itself */
+    p++;                                  /* past the '/' */
+    if (*p < '0' || *p > '9') return 0;   /* not a /proc/<pid> entry */
+    char *end;
+    long n = strtol(p, &end, 10);
+    if (*end != '/' && *end != '\0') return 0;   /* e.g. a name starting with a digit */
+    if (*tgid_cache < 0) {
+        *tgid_cache = task_tgid(tid);
+        if (*tgid_cache < 0) return -1;
+    }
+    if (n != (long)*tgid_cache) return -1;   /* the supervisor's, or another process's */
+    char tmp[PATH_LIMIT];
+    int w = snprintf(tmp, sizeof(tmp), "/proc/self%s", end);
+    if (w < 0 || (size_t)w >= sizeof(tmp) || (size_t)w >= canonlen) return -1;
+    memcpy(canon, tmp, (size_t)w + 1);
+    return 0;
 }
 
 /* Returns 0 with r filled and a->resolved set, or -1 (fail closed). Nothing
@@ -895,16 +1003,39 @@ static int resolve_target(pid_t target_pid, struct action *a,
     if (a->open_dirfd != VAREK_AT_FDCWD && a->target[0] != '/')
         return -1;   /* relative open against a dirfd we do not track */
 
+    /* tgid is needed only for a /proc/self path (before resolution) or a procfs
+     * object (after). Compute it lazily so an ordinary open never reads
+     * /proc/<tid>/status. */
+    pid_t tgid = -1;
+    char path[PATH_LIMIT];
+    bool thread_self = false;
+    if (path_is_proc_self(a->target, &thread_self)) {
+        tgid = task_tgid(target_pid);
+        if (tgid < 0) return -1;
+        if (rewrite_proc_self(a->target, thread_self, tgid, target_pid,
+                              path, sizeof(path)) < 0)
+            return -1;
+    } else {
+        if ((size_t)snprintf(path, sizeof(path), "%s", a->target) >= sizeof(path))
+            return -1;
+    }
+
     char proc_cwd[64];
     snprintf(proc_cwd, sizeof(proc_cwd), "/proc/%d/cwd", target_pid);
     int cwd_fd = open(proc_cwd, O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (cwd_fd < 0) return -1;
 
-    int fd = openat2_path(cwd_fd, a->target,
-                          (uint64_t)a->open_flags & (uint64_t)O_DIRECTORY);
+    int fd = openat2_path(cwd_fd, path,
+                          (uint64_t)a->open_flags &
+                          ((uint64_t)O_DIRECTORY | (uint64_t)O_NOFOLLOW));
     if (fd >= 0) {
         close(cwd_fd);
-        if (fd_canonical_path(fd, a->resolved, sizeof(a->resolved)) < 0) {
+        struct stat st;
+        /* O_NOFOLLOW on a trailing symlink: O_PATH handed back the link. */
+        if (fstat(fd, &st) < 0 || S_ISLNK(st.st_mode) ||
+            fd_canonical_path(fd, a->resolved, sizeof(a->resolved)) < 0 ||
+            check_proc_object(fd, target_pid, &tgid, a->resolved, sizeof(a->resolved)) < 0) {
+            a->resolved[0] = '\0';
             close(fd);
             return -1;
         }
@@ -917,7 +1048,7 @@ static int resolve_target(pid_t target_pid, struct action *a,
     }
 
     /* O_CREAT of a name that does not exist yet: pin the parent. */
-    const char *t = a->target;
+    const char *t = path;
     size_t tl = strlen(t);
     if (tl == 0 || t[tl - 1] == '/') { close(cwd_fd); return -1; }
     const char *slash = strrchr(t, '/');
@@ -937,7 +1068,11 @@ static int resolve_target(pid_t target_pid, struct action *a,
     if (pfd < 0) return -1;
 
     char parent[PATH_LIMIT];
-    if (fd_canonical_path(pfd, parent, sizeof(parent)) < 0) { close(pfd); return -1; }
+    if (fd_canonical_path(pfd, parent, sizeof(parent)) < 0 ||
+        check_proc_object(pfd, target_pid, &tgid, parent, sizeof(parent)) < 0) {
+        close(pfd);
+        return -1;
+    }
     int n = snprintf(a->resolved, sizeof(a->resolved), "%s%s%s",
                      parent, strcmp(parent, "/") ? "/" : "", name);
     if (n < 0 || (size_t)n >= sizeof(a->resolved)) {
@@ -991,7 +1126,8 @@ static int materialize_target(pid_t target_pid, const struct action *a,
         snprintf(self, sizeof(self), "/proc/self/fd/%d", r->path_fd);
         /* Through the pinned descriptor: same inode that was decided on.
          * O_NOFOLLOW is dropped here only because /proc/self/fd/N is itself a
-         * link; the agent's path was already resolved with no symlinks. */
+         * link; the agent's O_NOFOLLOW was already honoured at resolution
+         * (a trailing symlink fails closed there). */
         int flags = (want & ~O_NOFOLLOW) | O_NONBLOCK | O_CLOEXEC;
         if ((want & O_TMPFILE) == O_TMPFILE) {
             /* O_TMPFILE creates an unnamed file in the pinned directory:

@@ -48,6 +48,55 @@ this section is present in a released tag; it is stated as direction.
 
 ---
 
+## [1.12.3] - 2026-09-28
+
+v1.12.3 lets dynamically linked agents (CPython, a JVM, Node) run under the live
+Warden. Since v1.12.0 the resolver set `RESOLVE_NO_SYMLINKS`, refusing any path
+with a symlink; on merged-`/usr` systems `/lib` and library SONAMEs are
+symlinks, so the loader could not open its libraries. No verdict *semantics*
+change.
+
+### Changed
+
+- **Symlinks are followed and decided on the canonical path.** `openat2` follows
+  symlinks to a single pinned object; policy is matched on that object's
+  canonical path (`readlink` of the pinned fd) and the same fd is delivered. A
+  symlink in an allowed directory pointing at a denied file is decided as the
+  denied file and refused, exactly as before; a symlink to an allowed object is
+  now followed and delivered. `RESOLVE_NO_MAGICLINKS` still set; `..` still
+  decided on the post-collapse path.
+- **Policies match canonical prefixes.** An `allow path` naming a symlinked
+  location (e.g. `/lib/`) no longer matches; name the canonical target
+  (`/usr/lib/`). The demo, benchmark and conformance policies already do.
+
+### Security
+
+- **`/proc/self` maps to the agent, not the supervisor.** A leading `/proc/self`
+  or `/proc/thread-self` (a magic link `RESOLVE_NO_MAGICLINKS` would otherwise
+  refuse) is rewritten to the agent's own `/proc/<tgid>` before resolution. A
+  planted symlink pointing at `/proc/self/mem` is a magic link and is refused
+  during resolution. A path or symlink reaching another process's numeric
+  `/proc/<pid>/…` resolves, then fails the post-resolution check because it is
+  not the agent's `/proc/<tgid>`. The agent's own entries are recorded as
+  `/proc/self/…`. A non-process `/proc` entry (`/proc/kcore`, `/proc/sys/…`) is
+  governed by policy, not by this check.
+- **A trailing symlink opened `O_NOFOLLOW`** is refused (the agent's `O_NOFOLLOW`
+  reaches the `O_PATH` resolve, which returns the link; a link is not an
+  allowable object).
+
+### Added
+
+- `varek/v1_4/tests/v1123_probe.c` (built dynamically), `tests/test_v1123.sh`,
+  `tests/v1123_policy.txt`; `make test-v1123`. Fails against v1.12.2 (its
+  symlink and `/proc/self` opens are refused).
+- `RELEASE-v1.12.3.md`.
+
+### Known issue
+
+- The `--plan` gate still refuses plans containing `file_open` (since v1.12.0).
+
+---
+
 ## [1.12.2] - 2026-09-28
 
 v1.12.2 lets agent code start threads, collect its children and call

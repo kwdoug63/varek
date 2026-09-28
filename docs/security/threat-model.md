@@ -91,10 +91,18 @@ Model-B techniques below, with the residual limits stated honestly.
   supervisor crash.
 - **Mediation correctness (v1.12).**
   - *Resolve-then-decide.* File opens are resolved once with
-    `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`; policy is decided on the
-    canonical path of the resolved descriptor, and that same descriptor is
-    injected. Decision and delivered capability refer to the same object, closing
-    `..` traversal, symlink escapes, and `/proc/self` context confusion.
+    `RESOLVE_NO_MAGICLINKS`; policy is decided on the canonical path of the
+    resolved descriptor, and that same descriptor is injected. Decision and
+    delivered capability refer to the same object, closing `..` traversal,
+    symlink escapes, and `/proc/self` context confusion. Ordinary symlinks are
+    **followed** (v1.12.3) and decided on their canonical target — a symlink to a
+    denied object is refused, and dynamically linked agents' loaders work;
+    v1.12.0–v1.12.2 instead refused any symlinked path (`RESOLVE_NO_SYMLINKS`). A
+    leading `/proc/self`/`thread-self` (a magic link) is mapped to the agent's
+    own process before resolution; a planted symlink to a magic link such as
+    `/proc/self/mem` is refused by `RESOLVE_NO_MAGICLINKS`; and a numeric
+    `/proc/<pid>` object that is not the agent's own fails a post-resolution
+    check. Non-process `/proc` entries remain governed by policy.
   - *Authorization-record integrity.* Every agent-controlled string is escaped, so
     no input can begin, end, or forge a record in the verdict stream. Records
     carry the resolved object the decision was made on.
