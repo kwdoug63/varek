@@ -54,7 +54,7 @@ import json
 import sys
 import uuid
 
-VAREK_VERSION = "1.12.1"
+VAREK_VERSION = "1.12.2"
 SPEC_VERSION = "1.6"
 
 # The provisional patents, as recorded in the runtime's own documentation.
@@ -99,6 +99,7 @@ def _parse_log(stream, allow_incomplete=False):
     run = None
     records = []
     ended = None
+    warden_version = VAREK_VERSION
     for lineno, raw in enumerate(stream, 1):
         if not raw.startswith("{"):
             continue
@@ -115,6 +116,9 @@ def _parse_log(stream, allow_incomplete=False):
             run = rec.get("run")
             if not isinstance(run, str) or len(run) != 32:
                 fail(lineno, "run_start has no valid run id.")
+            w = rec.get("warden")
+            if isinstance(w, str) and w:
+                warden_version = w
             continue
         if "decision_final" not in rec and event != "run_end":
             continue   # e.g. a pre-launch plan record; carries no authorization
@@ -143,7 +147,7 @@ def _parse_log(stream, allow_incomplete=False):
         fail(0, "no run_end record: the stream is incomplete (the Warden did "
                 "not finish, or the log was cut). Use --allow-incomplete to "
                 "attest the part that is present.")
-    return run, records, ended is not None
+    return run, records, ended is not None, warden_version
 
 
 def _ts(records):
@@ -158,7 +162,10 @@ def _ts(records):
     return fmt(start), fmt(end)
 
 
-def build_bom(records, agent, policy, serial, run_id="", complete=True):
+def build_bom(records, agent, policy, serial, run_id="", complete=True,
+              warden_version=VAREK_VERSION):
+    # v1.12.2: the Warden component carries the version named in the stream's
+    # run_start (the Warden that made the decisions), not this exporter's.
     now = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     run_start, run_end = _ts(records)
 
@@ -182,7 +189,7 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True):
         "bom-ref": "tool:varek-warden",
         "publisher": "Sober Agentic Infrastructure, Inc.",
         "name": "VAREK Warden",
-        "version": VAREK_VERSION,
+        "version": warden_version,
         "description": "Pre-execution authorization runtime for autonomous AI agents "
                        "(Authorization-Before-Execution; kernel-enforced via seccomp-BPF "
                        "and seccomp user-notify).",
@@ -251,7 +258,7 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True):
         "subjects": ["agent-run"],
         "annotator": {"component": {
             "type": "application", "bom-ref": "annotator:varek-warden",
-            "name": "VAREK Warden", "version": VAREK_VERSION,
+            "name": "VAREK Warden", "version": warden_version,
         }},
         "timestamp": now,
         "text": attest_text,
@@ -295,11 +302,12 @@ def main(argv=None):
     else:
         stream = open(sys.stdin.fileno(), encoding="utf-8", errors="surrogateescape",
                       newline="\n", closefd=False)
-    run_id, records, complete = _parse_log(stream, args.allow_incomplete)
+    run_id, records, complete, warden_version = _parse_log(stream, args.allow_incomplete)
     stream.close()
 
     serial = args.serial or f"urn:uuid:{uuid.uuid4()}"
-    bom = build_bom(records, args.agent, args.policy, serial, run_id, complete)
+    bom = build_bom(records, args.agent, args.policy, serial, run_id, complete,
+                    warden_version)
 
     out = json.dumps(bom, indent=2)
     if args.output:

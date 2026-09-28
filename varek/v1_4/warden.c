@@ -709,7 +709,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     log_line_start();
-    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.12.1\","
+    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.12.2\","
                    "\"policy_path\":\"", g_run_id);
     json_escape(g_log, policy_path);
     fprintf(g_log, "\",\"policy_rules\":%zu,\"timestamp_ns\":%lld}\n",
@@ -1508,6 +1508,13 @@ int main(int argc, char **argv) {
     (void)relay_agent_stderr(agent_err_fd, true);
     close(agent_err_fd);
     int rc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    /* v1.12.2: say when the agent died by a signal. Through v1.12.1 an agent
+     * killed by the filter (SIGSYS) left only an exit code of 1, which is how a
+     * thread-starting agent could be killed on every run without a word. */
+    if (WIFSIGNALED(status))
+        fprintf(stderr, "[warden] agent killed by signal %d (%s)%s\n",
+                WTERMSIG(status), strsignal(WTERMSIG(status)),
+                WTERMSIG(status) == SIGSYS ? ": a hard-denied system call" : "");
     emit_run_end(rc);
     close(target_pidfd);
     close(notify_fd);
