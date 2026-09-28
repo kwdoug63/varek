@@ -1,6 +1,6 @@
 # VAREK — Trusted Computing Base
 
-Version: current as of v1.12.0 · MIT · github.com/kwdoug63/varek
+Version: current as of v1.15.0 · MIT · github.com/kwdoug63/varek
 
 A SATISFIED verdict is only as sound as the components that produce and enforce
 it. This document lists every component in the verification-and-enforcement
@@ -26,23 +26,28 @@ move components leftward — and, above all, to shrink the set that must be trus
 |-----------|------|--------|--------------|
 | Surface-language compiler | Lowers human-authored policy to a formal obligation | Trusted | Unverified lowering; planned move to *checked* via obligation round-trip validation. |
 | Obligation encoder | Encodes the obligation for the decision procedure | Trusted | Planned: encoder-faithfulness checks per fragment (already part of the v1.10/v1.11 soundness obligations). |
-| SMT decision procedure, enforcement (`varek/v1_4/smt_decide.c`) | Decides every Warden action to SATISFIED / UNSATISFIED / UNKNOWN; decides rule reachability at policy load | Trusted | Added in v1.13; v1.14 adds the glob compiler and word-parallel matcher (on the enforcement path) and the automaton product search for reachability (load time, advisory). Purpose-built for a quantifier-free bounded-string + bitvector fragment, in-process, bounded worst case, no external solver on the enforcement path. Its fragment boundary (length guard, conservative flag mask, enumeration bound) returns UNKNOWN. **Differentially checked** against an off-the-shelf SMT solver (`tools/smt_crosscheck.py`: independent parser and encoding; zero disagreements on the repository policies and seeded fuzzed policies — see each release's notes for the counts) and, for reachability with suffix/contains/glob atoms, against an independent derivative-based procedure; mutation-tested. The two parsers share the grammar in `smt_decide.h`, so a mistake in the grammar itself is common-mode. The cross-check validates the implementation against its specification; it cannot find a gap between the specification and kernel behaviour (such as flags `fcntl` can change after open). Still trusted rather than *checked*: no per-verdict proof object yet. |
-| SMT decision procedure (external backend) | Discharges richer obligations (plan-level and future fragments); serves as the differential oracle for the enforcement procedure | Trusted (not on the enforcement path) | Third-party; solvers have historically shipped soundness bugs. Since v1.13 the Warden does not call it at run time; a solver bug can mask a disagreement in the cross-check but cannot change a live decision. **Primary TCB-reduction target:** emit proof objects validated by a small independent checker (below). |
-| Proof checker | Independently validates the decision procedure's proof objects | Planned (Checked) | Once shipped, the procedure moves from *trusted* to *checked*: trust collapses to a small, auditable checker rather than the whole solver. |
+| SMT decision procedure, enforcement (`varek/v1_4/smt_decide.c`) | Decides every Warden action to SATISFIED / UNSATISFIED / UNKNOWN; decides rule reachability at policy load | **Checked** for authorizations (v1.15); trusted for refusals and analysis | Added in v1.13; v1.14 added the glob compiler, the word-parallel matcher and the automaton reachability search. **Since v1.15 every SATISFIED verdict carries a certificate — the deciding rule and a witness that its constant matches — and the Warden authorizes the action only if the independent certificate checker (next row) accepts it.** A defect confined to the procedure can therefore no longer authorize an action; it can still wrongly *refuse* one (a wrong UNSATISFIED/UNKNOWN is fail-closed and uncertified), and its load-time reachability analysis is advisory. Also differentially checked against an off-the-shelf SMT solver and, for string reachability, a derivative-based procedure (`tools/smt_crosscheck.py`), and mutation-tested. |
+| Certificate checker (`varek/v1_4/checker/vdp_checker.c`) | Accepts or refuses each SATISFIED verdict's certificate before the Warden acts on it; re-checks saved streams (`tools/varek_audit.py`) | Trusted | Added in v1.15. About 540 lines of C including SHA-256, written separately from the procedure: its own policy parser and matchers, no shared source, none of the procedure's optimizations (no word-parallel automata, bitset tricks, reachability search or enumeration pruning). It is not independent in design: both follow the same grammar, its glob parser mirrors the procedure's structure, and its matcher runs the same automaton one step at a time; the diversity comes from the Python oracle and the review's own translations. It runs in the Warden's process, so the separation holds against logic bugs in the procedure, not memory corruption. For "no action is authorized that the policy does not allow", this checker — not the procedure — is now the trusted decision code. Validated by the cross-check (every procedure certificate accepted; forged claims refused; mutated witnesses judged as the definition says; its parser and SHA-256 compared with the procedure's and Python's), by a live test with a deliberately broken procedure, and by its own mutation test. Both parsers follow the grammar in `smt_decide.h`, so a mistake in the grammar itself is common-mode; the grammar is small and documented rule by rule. |
+| SMT decision procedure (external backend) | Discharges richer obligations (plan-level and future fragments); serves as the differential oracle for the enforcement procedure | Trusted (not on the enforcement path) | Third-party; solvers have historically shipped soundness bugs. Since v1.13 the Warden does not call it at run time; a solver bug can mask a disagreement in the cross-check but cannot change a live decision. |
 | Warden supervisor (C) | Mediates syscalls; enforces the decision at the boundary | Trusted | Memory-safe-reviewed. v1.9.1 hardened the TOCTOU discipline; v1.9.2 moved the baseline to a default-deny allowlist; v1.9.3 coupled the agent's lifetime to the supervisor's; v1.12 made the Warden decide on the resolved object it delivers and escape all agent-controlled fields in the verdict stream. In external-audit scope. |
-| Evidence exporter (`varek/v1_4/tools/varek_cyclonedx.py`) | Converts the verdict stream to a CycloneDX 1.6 BOM | Trusted | Added in v1.12. Refuses a stream that does not parse cleanly, so a corrupted log cannot become an attestation; output validates against the published CycloneDX 1.6 schema. Its correctness does not affect enforcement, only the exported record. |
+| Evidence exporter (`varek/v1_4/tools/varek_cyclonedx.py`) | Converts the verdict stream to a CycloneDX 1.6 BOM | Trusted | Added in v1.12. Refuses a stream that does not parse cleanly, so a corrupted log cannot become an attestation; output validates against the published CycloneDX 1.6 schema. Its correctness does not affect enforcement, only the exported record. v1.15 adds the policy SHA-256 and each authorization's certificate to the BOM. |
+| Audit tool (`varek/v1_4/tools/varek_audit.py`) | Re-checks a saved verdict stream: authenticates it against the agent, ties it to a policy file by SHA-256, refuses any authorization other than certified file opens and the launch exec, and re-runs the certificate checker on every authorization | Trusted (the Python glue); the decisions it re-checks rest on the certificate checker | Added in v1.15. Does not affect enforcement, and does not protect the log from whoever holds it (no signature). |
 | Kernel mechanisms (seccomp, PID namespaces, capabilities) | In-kernel enforcement primitives the Warden builds on | Trusted | Out of VAREK's control; relied upon as a platform assumption (see Threat Model §5.3). Landlock is roadmap (v1.10), not wired in. |
 | Build / toolchain | Produces the deployed binaries | Trusted | Planned: reproducible builds so a third party can reproduce the artifact bit-for-bit. |
 
 ## Soundness of the chain
 
-The current chain is **trusted end to end above the kernel**: a defect in the
-compiler lowering, the encoder, or the decision procedure could yield a wrong
-SATISFIED. The mitigation strategy, in priority order:
+Above the kernel, the Warden's authorizations now rest on the certificate
+checker rather than on the decision procedure (v1.15): an action is authorized
+only when the procedure says SATISFIED **and** the separately written checker
+accepts the certificate. A defect in the surface-language compiler or the
+encoder could still yield a wrong policy text, and the checker is trusted. The
+mitigation strategy, in priority order:
 
-1. **Shrink the trusted base.** Have the decision procedure emit proof objects
-   that a small, independently auditable checker validates (an LCF-style move).
-   Trust then rests on the checker, not the solver — a far smaller surface.
+1. **Shrink the trusted base.** *Done for Warden authorizations in v1.15:*
+   certificates checked by a small, independent checker before the action takes
+   effect (an LCF-style move). Next: a checker small enough to verify formally,
+   and certificates for the plan-level backend.
 2. **Differential cross-checking.** On critical verdicts, corroborate with a
    second, independent backend; a disagreement is escalated, never silently
    resolved to SATISFIED.
@@ -54,6 +59,7 @@ SATISFIED. The mitigation strategy, in priority order:
 ## What this does not claim
 
 No component above the kernel is currently *verified* in the strong sense. This
-document exists so that fact is stated rather than discovered. The roadmap moves
-the SMT decision procedure to *checked* first (it is the highest-leverage item),
-followed by the compiler and encoder.
+document exists so that fact is stated rather than discovered. v1.15 moved the
+enforcement decision procedure to *checked* for authorizations; the certificate
+checker that took its place is trusted, and is the natural candidate for formal
+verification. The compiler and encoder come next.

@@ -110,6 +110,7 @@
 #include "warden_adapter.h"
 #include "warden_baseline_filter.h"
 #include "smt_decide.h"            /* v1.13 SMT decision procedure */
+#include "checker/vdp_checker.h"   /* v1.15 independent certificate checker */
 #include "warden_lifecycle.h"   /* v1.9.3 supervisor/target lifecycle coupling */
 
 /* Kernel/libc compatibility shims --------------------------------- */
@@ -189,6 +190,10 @@ struct action {
     bool          flags_known;          /* v1.13: open_flags came from the syscall */
     int           policy_line;          /* v1.13: deciding rule's line, or -1 */
     const char   *why;                  /* v1.13: decision-procedure reason */
+    int           rule_index;           /* v1.15: deciding rule's index, or -1 */
+    bool          certified;            /* v1.15: the checker accepted the certificate */
+    char          cert[420];            /* v1.15: the certificate, as record fields */
+    char          check_why[160];       /* v1.15: why the checker refused it */
     int           connect_family;
     int           connect_port;
 };
@@ -212,19 +217,78 @@ static const char *action_kind_name(action_kind_t k) {
  * semantics, and the soundness obligations. v1.14 adds the bounded string
  * fragment: exact, prefix, suffix, contains and glob matchers. */
 struct policy {
-    char         name[64];
-    char         version[16];
-    vdp_policy_t v;
+    char          name[64];
+    char          version[16];
+    vdp_policy_t  v;
+    vdpc_policy_t c;                    /* v1.15: the checker's own parse */
+    char          sha256[65];           /* v1.15: of the policy bytes both parsed */
 };
+
+#define POLICY_MAX_BYTES (16u << 20)
 
 static int policy_load(const char *path, struct policy *p) {
     memset(p, 0, sizeof(*p));
+#ifdef VDP_FAULT_INJECT
+    fprintf(stderr, "[warden] WARNING: TEST BUILD with a planted decision-procedure bug "
+            "(warden_faultinject); never use it to supervise a real agent\n");
+#endif
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.14");
+    snprintf(p->version, sizeof(p->version), "1.15");
     char err[512];
-    if (vdp_policy_load(path, &p->v, err, sizeof err) < 0) {
-        fprintf(stderr, "[warden] policy %s\n", err);
+    /* v1.15: read the file once. The decision procedure and the certificate
+     * checker parse these same bytes, and their SHA-256 goes in run_start, so
+     * an audit can tie every certificate to the exact policy text. */
+    FILE *f = fopen(path, "re");
+    if (!f) { fprintf(stderr, "[warden] policy %s: %s\n", path, strerror(errno)); return -1; }
+    char *buf = malloc(POLICY_MAX_BYTES + 1);
+    size_t len = buf ? fread(buf, 1, POLICY_MAX_BYTES + 1, f) : 0;
+    bool rd_err = !buf || ferror(f);
+    fclose(f);
+    if (rd_err || len > POLICY_MAX_BYTES) {
+        fprintf(stderr, "[warden] policy %s: %s\n", path,
+                rd_err ? "read error" : "larger than 16 MiB");
+        free(buf);
         return -1;
+    }
+    if (vdp_policy_load_mem(path, buf, len, &p->v, err, sizeof err) < 0) {
+        fprintf(stderr, "[warden] policy %s\n", err);
+        free(buf);
+        return -1;
+    }
+    if (vdpc_load(path, buf, len, &p->c, err, sizeof err) < 0) {
+        fprintf(stderr, "[warden] policy %s (certificate checker)\n", err);
+        free(buf);
+        return -1;
+    }
+    free(buf);
+    vdpc_digest_hex(&p->c, p->sha256);
+    if (p->c.n != p->v.n) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure read %zu rules and the "
+                "certificate checker %zu; refusing to start\n", path, p->v.n, p->c.n);
+        return -1;
+    }
+    /* Rule by rule, the two parses must agree: verb, kind, matcher, constant
+     * and flag clause. (A divergence could only cause denials, since an
+     * authorization needs both; this makes it fail loudly at startup.) */
+    for (size_t i = 0; i < p->v.n; i++) {
+        const vdp_rule_t *r = &p->v.rules[i];
+        vdpc_rule_info_t ci;
+        static const int op_to_match[] = {
+            [VDP_STR_PREFIX] = VDPC_M_PREFIX, [VDP_STR_EQ] = VDPC_M_EXACT,
+            [VDP_STR_HOST] = VDPC_M_HOST, [VDP_STR_SUFFIX] = VDPC_M_SUFFIX,
+            [VDP_STR_CONTAINS] = VDPC_M_CONTAINS, [VDP_STR_GLOB] = VDPC_M_GLOB,
+        };
+        static const int kind_to_c[] = {
+            [VDP_KIND_PATH] = VDPC_PATH, [VDP_KIND_HOST] = VDPC_HOST, [VDP_KIND_EXEC] = VDPC_EXEC,
+        };
+        if (vdpc_rule_info(&p->c, i, &ci) < 0 || ci.allow != (r->verb == VDP_ALLOW) ||
+            ci.kind != kind_to_c[r->kind] || ci.match != op_to_match[r->s.op] ||
+            ci.clen != r->s.len || memcmp(ci.c, r->s.c, r->s.len) != 0 ||
+            ci.mask != r->b.mask || ci.value != r->b.value || ci.line != r->line) {
+            fprintf(stderr, "[warden] policy %s:%d: the decision procedure and the certificate "
+                    "checker read this rule differently; refusing to start\n", path, r->line);
+            return -1;
+        }
     }
     /* v1.13: load-time analysis. The decision procedure decides, for every
      * rule, whether ANY action can reach it as the first matching rule. A rule
@@ -251,8 +315,8 @@ static int policy_load(const char *path, struct policy *p) {
                     vdp_reach_unknown_text());
         }
     }
-    fprintf(stderr, "[warden] loaded policy %s v%s with %zu rules (%zu can never fire)\n",
-            p->name, p->version, p->v.n, dead);
+    fprintf(stderr, "[warden] loaded policy %s v%s with %zu rules (%zu can never fire), "
+            "sha256 %s\n", p->name, p->version, p->v.n, dead, p->sha256);
     return 0;
 }
 
@@ -479,6 +543,7 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
      * When the flags are not known (the --plan gate), they are symbolic:
      * SATISFIED only if every admissible flags value is. */
     a->policy_line = -1;
+    a->rule_index = -1;
     a->why = NULL;
     vdp_kind_t kind;
     const char *s;
@@ -500,6 +565,7 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
                                  a->kind == ACT_FILE_OPEN && a->flags_known,
                                  &ri, &why);
     a->why = vdp_why_name(why);
+    a->rule_index = ri;
     if (ri >= 0) a->policy_line = p->v.rules[ri].line;
     switch (v) {
         case VDP_SATISFIED:   return DEC_ALLOW;
@@ -516,6 +582,70 @@ static const char *decision_rule_id(const struct action *a, decision_t d_raw) {
                    !strcmp(a->why, "access_mode_3")))  return "fragment_escape_flags";
     if (a->why && !strcmp(a->why, "length_guard"))      return "fragment_escape_length";
     return "default_deny_unknown";
+}
+
+/* The verdict stream (defined below). */
+static FILE *g_log;
+static void log_line_start(void);
+static void json_escape(FILE *f, const char *s);
+
+/* v1.15: before a SATISFIED verdict authorizes anything, the procedure emits a
+ * certificate (the deciding rule and a witness that its constant matches) and
+ * the independent checker (checker/vdp_checker.c: its own parser and
+ * matchers) must accept it. A certificate the checker refuses denies the
+ * action, so a logic bug confined to the decision procedure cannot authorize one.
+ * Returns true if the checker accepted. */
+static bool certify(const struct policy *p, struct action *a) {
+    a->certified = false;
+    a->cert[0] = '\0';
+    a->check_why[0] = '\0';
+    int kind;
+    const char *s;
+    switch (a->kind) {
+        case ACT_FILE_OPEN:    kind = VDPC_PATH; s = a->resolved; break;
+        case ACT_NET_CONNECT:  kind = VDPC_HOST; s = a->target;   break;
+        case ACT_PROCESS_EXEC: kind = VDPC_EXEC; s = a->target;   break;
+        default:
+            snprintf(a->check_why, sizeof a->check_why, "no certificate for this action kind");
+            return false;
+    }
+    vdp_cert_t vc;
+    if (vdp_certificate(&p->v, a->rule_index, s, &vc) < 0) {
+        snprintf(a->cert, sizeof a->cert, "\"cert_rule\":%d,\"cert_witness\":\"!\"", a->rule_index);
+        snprintf(a->check_why, sizeof a->check_why, "the procedure built no witness");
+        return false;
+    }
+    vdpc_cert_t cc;
+    memset(&cc, 0, sizeof cc);
+    cc.r = vc.rule;
+    cc.wkind = vc.wkind;
+    cc.off = vc.off;
+    cc.nspan = vc.nspan;
+    for (uint32_t k = 0; k < vc.nspan && k < VDPC_MAX_STRETCH; k++) {
+        cc.span[k][0] = vc.span[k][0];
+        cc.span[k][1] = vc.span[k][1];
+    }
+    bool has_flags = a->kind != ACT_FILE_OPEN || a->flags_known;
+    /* The certificate as recorded, as flat fields (no nested object, so a
+     * consumer that reads records as flat JSON objects keeps working):
+     * "cert_rule" the rule index, "cert_witness" the witness. */
+    int n = snprintf(a->cert, sizeof a->cert, "\"cert_rule\":%d,\"cert_witness\":\"", cc.r);
+    if (cc.wkind == 1) n += snprintf(a->cert + n, sizeof a->cert - (size_t)n, "c:%u", cc.off);
+    else if (cc.wkind == 2) {
+        n += snprintf(a->cert + n, sizeof a->cert - (size_t)n, "g:");
+        for (uint32_t k = 0; k < cc.nspan && (size_t)n < sizeof a->cert; k++)
+            n += snprintf(a->cert + n, sizeof a->cert - (size_t)n, "%s%u-%u", k ? "," : "",
+                          cc.span[k][0], cc.span[k][1]);
+    } else n += snprintf(a->cert + n, sizeof a->cert - (size_t)n, "-");
+    if ((size_t)n < sizeof a->cert) snprintf(a->cert + n, sizeof a->cert - (size_t)n, "\"");
+    if (!vdpc_check(&p->c, kind, s, strlen(s), (uint32_t)a->open_flags, has_flags, &cc,
+                    a->check_why, sizeof a->check_why)) {
+        for (char *q = a->check_why; *q; q++)          /* recorded inside a JSON string */
+            if (*q == '"' || *q == '\\' || (unsigned char)*q < 0x20) *q = '\'';
+        return false;
+    }
+    a->certified = true;
+    return true;
 }
 
 /* ---------------- v1.6 plan-graph integration ---------------- */
@@ -623,6 +753,15 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
         (void)plan_lexical_canon(act.target, act.resolved, sizeof(act.resolved));
     }
     decision_t d = policy_decide(u->policy, &act);
+    if (d == DEC_ALLOW && !certify(u->policy, &act)) {
+        /* v1.15: the plan gate authorizes only what the checker confirms. */
+        log_line_start();
+        fputs("[warden] plan: certificate refused for \"", g_log);
+        json_escape(g_log, act.target);
+        fprintf(g_log, "\": %s\n", act.check_why);
+        fflush(g_log);
+        return PLAN_DEC_UNKNOWN;
+    }
     switch (d) {
         case DEC_ALLOW:   return PLAN_DEC_SATISFIED;
         case DEC_DENY:    return PLAN_DEC_UNSATISFIED;
@@ -778,11 +917,17 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     log_line_start();
-    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.14.0\","
+    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.15.0\","
                    "\"policy_path\":\"", g_run_id);
     json_escape(g_log, policy_path);
-    fprintf(g_log, "\",\"policy_rules\":%zu,\"timestamp_ns\":%lld}\n",
-            p->v.n, (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+    fprintf(g_log, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s\"timestamp_ns\":%lld}\n",
+            p->v.n, p->sha256,
+#ifdef VDP_FAULT_INJECT
+            "\"build\":\"faultinject\",",     /* a test build: never a real run */
+#else
+            "",
+#endif
+            (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     fflush(g_log);
 }
 
@@ -809,6 +954,9 @@ static void emit_pathology(uint64_t seq,
     if (!g_log) return;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
+    char flags_json[16] = "";
+    if (a->kind == ACT_FILE_OPEN && a->flags_known)
+        snprintf(flags_json, sizeof flags_json, "0x%x", (unsigned)a->open_flags);
     /* v1.12: target and resolved are escaped via json_escape(); every other
      * field is drawn from a fixed enum or an integer, so the whole record is
      * well-formed JSON regardless of agent-controlled input. */
@@ -832,6 +980,8 @@ static void emit_pathology(uint64_t seq,
         "\"decision_final\":\"%s\","
         "\"rule\":\"%s\","
         "\"policy_line\":%d,"
+        "%s%s%s"
+        "%s%s%s%s%s%s"
         "\"kernel_verdict\":\"%s\","
         "\"errno\":%d,"
         "\"latency_us\":%" PRIu64 ","
@@ -840,6 +990,13 @@ static void emit_pathology(uint64_t seq,
         decision_name(d_final),
         rule_id ? rule_id : "none",
         a->policy_line,
+        /* v1.15: the open flags, so an audit can re-check the certificate */
+        flags_json[0] ? "\"open_flags\":\"" : "", flags_json, flags_json[0] ? "\"," : "",
+        /* v1.15: the certificate and the checker's answer */
+        "", a->cert, a->cert[0] ? "," : "",
+        a->cert[0] ? (a->certified ? "\"check\":\"ok\"," : "\"check\":\"refused\",\"check_why\":\"") : "",
+        a->cert[0] && !a->certified ? a->check_why : "",
+        a->cert[0] && !a->certified ? "\"," : "",
         /* v1.12.1: an ALLOW whose open then failed (EEXIST, ENXIO, ...)
          * delivered nothing; say so rather than reporting ALLOW. */
         d_final == DEC_ALLOW ? (kernel_errno ? "ERRNO" : "ALLOW") : "EPERM",
@@ -1356,6 +1513,17 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
 
         decision_t d_raw   = policy_decide(p, &act);
         decision_t d_final = (d_raw == DEC_ALLOW) ? DEC_ALLOW : DEC_DENY;
+        /* v1.15: a file open is authorized only if the independent checker
+         * accepts the verdict's certificate. */
+        bool cert_refused = false;
+        if (d_final == DEC_ALLOW && act.kind == ACT_FILE_OPEN && !certify(p, &act)) {
+            d_final = DEC_DENY;
+            cert_refused = true;
+            /* No agent-controlled byte here: the path is in the record. */
+            log_line_start();
+            fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n",
+                    g_records, act.check_why);
+        }
 
         if (act.kind == ACT_FILE_OPEN) {
             if (d_final == DEC_ALLOW) {
@@ -1387,7 +1555,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             uint64_t lat_d = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                            + (t1.tv_nsec - t0.tv_nsec);
             emit_pathology(seq++, req.pid, &act, d_raw, d_final,
-                           decision_rule_id(&act, d_raw),
+                           cert_refused ? "certificate_refused" : decision_rule_id(&act, d_raw),
                            lat_d, EACCES);
             send_simple(notify_fd, req.id, d_final);
             continue;

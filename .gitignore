@@ -66,5 +66,8 @@ varek/v1_4/tests/v1122_probe
 varek/v1_4/tests/v1123_probe
 varek/v1_4/tests/v1130_probe
 varek/v1_4/tests/v1140_probe
+varek/v1_4/tests/v1150_probe
+varek/v1_4/warden_faultinject
+varek/v1_4/tools/vdp_cert_check
 varek/v1_4/tools/vdp_check
 varek/v1_4/tests/test_v14_filter

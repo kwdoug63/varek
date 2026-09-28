@@ -1,0 +1,9 @@
+# v1.15.0 regression policy: certificates and the independent checker.
+require warden 1.15
+deny  path suffix .pem
+deny  path /tmp/varek_v1150/secret/
+deny  path glob /tmp/varek_v1150/work/**/.inject
+allow path glob /tmp/varek_v1150/logs/*.log readonly
+deny  path /tmp/varek_v1150/logs/
+allow path contains /shared/c/
+allow path /tmp/varek_v1150/

@@ -193,6 +193,27 @@ never fire (v1.14: `vdp_check <policy> analyze` also prints, for every
 reachable rule, a shortest path and flags value on which it is the first
 rule to hold).
 
+## Certificates (v1.15)
+
+Every SATISFIED verdict carries a certificate: the deciding rule's index and a
+witness that its constant matches (none for prefix / exact / suffix / host, an
+offset for `contains`, one span per `*`, `**` and `/**/` for a `glob`). Before a
+file open is authorized, the independent checker in `checker/vdp_checker.c` —
+its own policy parser and matchers, no code shared with `smt_decide.c` — must
+accept it: the deciding rule is an allow rule whose flag clause holds, the
+witness proves its constant matches, and no earlier rule holds. A refused
+certificate denies the open (`"rule":"certificate_refused"`). The policy file is
+read once and both parse the same bytes, whose SHA-256 goes in `run_start`.
+
+```
+tools/vdp_cert_check policy.txt digest       # the SHA-256 the Warden records
+tools/varek_audit.py --policy policy.txt --checker tools/vdp_cert_check verdicts.log
+```
+
+The audit authenticates the stream, checks the policy file's SHA-256 against
+`run_start`, and re-checks every authorization's certificate. The format and
+the checking rules are specified in `checker/vdp_checker.h`.
+
 ## Threat model
 
 - **Supervised process**: fully adversarial. May spawn `CLONE_VM`

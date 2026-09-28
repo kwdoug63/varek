@@ -40,25 +40,26 @@ Expected output style (numbers will vary by host):
   ============================================================
 """
 import json
-import re
 import statistics
 import sys
 
 
 def parse(path):
     """Yield pathology records from a Warden stderr log."""
-    obj_re = re.compile(r"\{[^{}]*\"report_id\"[^{}]*\}")
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             # v1.12.1: only lines that start with '{' are Warden records; the
             # agent's relayed stderr is prefixed "[agent] " and is skipped.
+            # v1.15: each line is parsed as one JSON object (a regex for flat
+            # objects would silently drop any record with a nested value).
             if not line.startswith("{"):
                 continue
-            for m in obj_re.finditer(line):
-                try:
-                    yield json.loads(m.group(0))
-                except json.JSONDecodeError:
-                    continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(rec, dict) and "report_id" in rec:
+                yield rec
 
 
 def percentile(sorted_data, p):

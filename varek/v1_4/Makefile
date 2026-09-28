@@ -23,14 +23,27 @@ V1_7_DIR  := ../../v1_7
 LIFECYCLE := $(V1_7_DIR)/warden_lifecycle.c
 CFLAGS    += -I$(V1_7_DIR)
 
-BINS := warden target_demo bench_target tools/vdp_check
+BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check
 
-.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 crosscheck harness video-v112
+.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 crosscheck harness video-v112
 
 all: $(BINS)
 
-warden: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(LIFECYCLE) $(V1_6_SRC)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c $(LIFECYCLE) $(V1_6_SRC) $(LDLIBS)
+CHECKER := checker/vdp_checker.c checker/vdp_checker.h
+
+warden: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(V1_6_SRC)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c $(LIFECYCLE) $(V1_6_SRC) $(LDLIBS)
+
+# v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
+# ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that
+# the certificate checker refuses the wrong verdict. Never deploy it.
+warden_faultinject: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(V1_6_SRC)
+	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c $(LIFECYCLE) $(V1_6_SRC) $(LDLIBS)
+
+# v1.15: command-line front end to the certificate checker (policy digest,
+# batch certificate checks). Links the checker only, never smt_decide.c.
+tools/vdp_cert_check: tools/vdp_cert_check.c $(CHECKER)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/vdp_cert_check.c checker/vdp_checker.c
 
 # v1.13: command-line front end to the SMT decision procedure (lint, analyze,
 # batch queries); the same smt_decide.c the Warden runs.
@@ -142,15 +155,25 @@ tests/v1140_probe: tests/v1140_probe.c
 test-v1140: warden tools/vdp_check tests/v1140_probe
 	@sudo ./tests/test_v1140.sh ./warden ./tools/vdp_check $(abspath tests/v1140_probe)
 
+# v1.15: certificates. Every authorization carries a certificate the
+# independent checker accepted in-line; the audit tool re-checks a saved
+# stream; a planted procedure bug (warden_faultinject) is refused by the
+# checker; the --plan gate; forged certificates; the cross-check with --cert.
+tests/v1150_probe: tests/v1150_probe.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $<
+
+test-v1150: warden warden_faultinject tools/vdp_check tools/vdp_cert_check tests/v1150_probe
+	@sudo ./tests/test_v1150.sh ./warden ./warden_faultinject ./tools/vdp_check ./tools/vdp_cert_check $(abspath tests/v1150_probe)
+
 # Differential check of the decision procedure against an SMT solver (Z3) and,
 # for suffix / contains / glob reachability, a derivative-based oracle. These
-# are exactly the runs RELEASE-v1.14.0.md quotes: every policy in the
+# are exactly the runs RELEASE-v1.15.0.md quotes: every policy in the
 # repository, then 300 fuzzed policies for each of seeds 1, 2 and 3.
-crosscheck: tools/vdp_check
-	@python3 tools/smt_crosscheck.py --vdp tools/vdp_check --queries 60 \
+crosscheck: tools/vdp_check tools/vdp_cert_check
+	@python3 tools/smt_crosscheck.py --vdp tools/vdp_check --cert tools/vdp_cert_check --queries 60 \
 	    policy.txt conformance_policy.txt policies/*.txt tests/*policy*.txt
 	@for seed in 1 2 3; do \
-	    python3 tools/smt_crosscheck.py --vdp tools/vdp_check --fuzz 300 --seed $$seed --queries 60 || exit 1; \
+	    python3 tools/smt_crosscheck.py --vdp tools/vdp_check --cert tools/vdp_cert_check --fuzz 300 --seed $$seed --queries 60 || exit 1; \
 	done
 
 # Verdict-distribution harness over the (synthetic) seed corpus.
@@ -176,4 +199,4 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/test_v14_filter
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe warden_faultinject tests/test_v14_filter

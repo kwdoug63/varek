@@ -226,6 +226,31 @@ vdp_verdict_t vdp_decide(const vdp_policy_t *p, vdp_kind_t kind, const char *s,
  * kind's default (prefix for path, exact for exec, host for host). */
 const char *vdp_matcher_prefix(const vdp_rule_t *r);
 
+/* As vdp_policy_load, from a buffer (v1.15: the Warden reads the policy file
+ * once, and both this procedure and the certificate checker parse those same
+ * bytes, whose SHA-256 it records). */
+int vdp_policy_load_mem(const char *name, const char *buf, size_t len, vdp_policy_t *p,
+                        char *err, size_t errlen);
+
+/* v1.15: the certificate of a SATISFIED verdict (see checker/vdp_checker.h for
+ * what it proves and how it is checked). rule is the deciding rule's index, or
+ * -1 for a symbolic verdict several rules decide; the witness shows that
+ * rule's string atom holds on s: none (prefix, exact, suffix, host), an offset
+ * (contains), or one span of s per STAR / SEGS token of a glob, in order. */
+enum { VDP_WIT_NONE = 0, VDP_WIT_OFFSET = 1, VDP_WIT_SPANS = 2 };
+typedef struct {
+    int      rule;
+    int      wkind;
+    uint32_t off;
+    uint32_t nspan;
+    uint32_t span[VDP_GLOB_MAX_WILD][2];
+} vdp_cert_t;
+
+/* Fill the certificate for a SATISFIED verdict that vdp_decide reached with
+ * rule_index on s. 0, or -1 if no witness could be built (which the checker
+ * then refuses: the action is not authorized). */
+int vdp_certificate(const vdp_policy_t *p, int rule_index, const char *s, vdp_cert_t *c);
+
 /* Release what vdp_policy_load allocated (compiled globs). */
 void vdp_policy_free(vdp_policy_t *p);
 
@@ -263,6 +288,6 @@ size_t vdp_rule_advisory(const vdp_rule_t *r, char *buf, size_t n);
 
 /* The Warden version this procedure implements, for `require warden X.Y`. */
 #define VDP_WARDEN_MAJOR 1
-#define VDP_WARDEN_MINOR 14
+#define VDP_WARDEN_MINOR 15
 
 #endif /* VAREK_SMT_DECIDE_H */

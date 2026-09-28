@@ -1,0 +1,12 @@
+# v1.15 cross-check fixture for the certificate checker.
+require warden 1.15
+# Every admissible access mode is allowed, one rule each: a symbolic (any
+# flags) query is SATISFIED only because access mode 3 is outside the fragment.
+allow path /srv/modes/ access=ro
+allow path /srv/modes/ access=wo
+allow path /srv/modes/ access=rw
+# A /**/ unit: /srv/pub/xf.txt does NOT match (the unit is empty or ends in
+# '/'), so a witness giving the unit the span "x" must be refused.
+allow path glob /srv/pub/**/f.txt
+# A * span may not hold '/': /srv/one/a/b.log does not match.
+allow path glob /srv/one/*.log
