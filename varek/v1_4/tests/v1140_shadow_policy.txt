@@ -1,0 +1,30 @@
+# v1.14 cross-check fixture: rules shadowed (or not) by earlier suffix,
+# contains and glob rules. Each pair's expected reachability is in the comment;
+# the procedure, the solver and the derivative oracle must all agree.
+require warden 1.14
+deny  path glob /a/*
+allow path /a/                    # REACHABLE, only below a subdirectory (/a/x/...)
+deny  path glob /b/**
+allow path /b/                    # DEAD
+deny  path suffix .x
+allow path glob /c/*.x            # DEAD
+deny  path contains /d/
+allow path glob /**/d/**          # DEAD: every match contains /d/
+deny  path glob /e/[!a]*
+allow path glob /e/?*             # REACHABLE: /e/a...
+deny  path glob /f/* readonly
+allow path /f/                    # REACHABLE with write flags, or below a subdirectory
+deny  path glob /g/**/h
+allow path glob /g/*/h            # DEAD: one segment is "zero or more segments"
+deny  path glob /i/*/h
+allow path glob /i/**/h           # REACHABLE: /i/h, /i/x/y/h
+deny  exec glob /usr/bin/*
+allow exec prefix /usr/bin/       # REACHABLE: /usr/bin/x/y
+deny  exec exact /usr/bin/x/y       # DEAD: the prefix allow above takes it
+allow exec suffix /y              # REACHABLE
+deny  path glob \/**/k            # an escaped '/' does not start the /**/ unit: '/' .* '/k'
+allow path exact /k               # REACHABLE (the glob needs two slashes)
+deny  path glob /n/[!a]x          # a negated class never matches '/'
+allow path exact /n//x            # REACHABLE
+deny  path glob /ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp/**/**/x   # two /**/ units whose skips straddle a 64-bit word
+allow path exact /ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp/x        # DEAD: both units match zero segments

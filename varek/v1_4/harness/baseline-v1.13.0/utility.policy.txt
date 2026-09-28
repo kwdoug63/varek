@@ -19,19 +19,9 @@
 # wins, and in the v1.12 ordering that allow could never fire. Check any
 # policy with:  tools/vdp_check <policy> lint
 #
-# `require warden 1.13` made a v1.12 Warden refuse this file (its parser
+# `require warden 1.13` makes an older Warden refuse this file (its parser
 # would otherwise ignore `readonly` and admit writes).
-#
-# v1.14: path and exec rules take a matcher (exact, prefix, suffix, contains,
-# glob) before the constant; without one, a path rule is a prefix, as before.
-# The block of v1.14 rules below denies key material and credentials wherever
-# they appear under an allowed tree, which a prefix rule could not express.
-# Matching is on the resolved path's name and is case-sensitive; the agent
-# cannot rename files or create links (those syscalls are refused when the
-# Warden enforces), so it cannot give an existing file a name these rules miss.
-#
-# `require warden 1.14` makes an older Warden refuse this file.
-require warden 1.14
+require warden 1.13
 
 # --- Denied even under an allowed tree (evaluated first) ----------------------
 deny  path /var/lib/scada/setpoints/write/ # NO control writes — actuation is human-authorized
@@ -39,15 +29,6 @@ deny  path /var/lib/scada/breakers/        # NO breaker/relay operations
 allow path /etc/ld.so.cache readonly            # loader cache: read
 deny  path /etc/
 deny  path /root/
-
-# --- v1.14: hazards anywhere under an allowed tree (evaluated early) ----------
-# The bounded string fragment matches on more than a prefix, so these rules
-# reach into every tree the agent is allowed below, including its scratch space.
-deny  path suffix .pem                     # private keys and certificates
-deny  path suffix .key                     # private keys
-deny  path glob /**/.env                   # dotenv credential files, at any depth
-deny  path glob /**/.env.*                 # ... and their variants (.env.local, .env.production)
-deny  path contains /.ssh                  # SSH keys and configuration (and the directory), anywhere
 
 # --- Files the agent may reach ------------------------------------------------
 allow path /var/lib/scada/telemetry/ readonly   # historian / real-time telemetry (read)

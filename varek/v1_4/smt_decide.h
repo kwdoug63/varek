@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
-// smt_decide.h — VAREK SMT decision procedure for the Warden (v1.13; the first
-// release of the v1.10 verification program).
+// smt_decide.h — VAREK SMT decision procedure for the Warden (v1.14; the v1.10
+// verification program: v1.13 added the flag fragment, v1.14 the bounded
+// string fragment).
 //
 // A policy is compiled into a quantifier-free formula over two variables per
 // action:
@@ -13,8 +14,13 @@
 //
 // Each rule r_i is  verb_i  S_i(s) AND B_i(f)  where
 //
-//   S_i is one string atom:  prefix(c, s) | s == c | host(c, s)
+//   S_i is one string atom:
+//        prefix(c, s) | s == c | host(c, s)                         (v1.13)
+//        suffix(c, s) | contains(c, s) | s in glob(c)               (v1.14)
 //        host(c, s) := s == c  OR  (c has no ':' AND prefix(c ++ ":", s))
+//        glob(c) is the regular language of a path glob (see the grammar
+//        below): literal bytes, ?, [...] classes, * (no '/'), ** (any bytes)
+//        and the unit /**/ (zero or more whole path segments).
 //   B_i is one bitvector atom:  (f & m_i) == v_i   (m_i == 0 means true)
 //
 // Rules of one action kind are ordered; the first rule whose formula holds
@@ -52,12 +58,17 @@
 //   vdp_rule_reachable()  is there ANY (s, f) for which rule i is the first
 //                         rule that holds? Decided exactly over the abstract
 //                         domain (any byte string up to the bound, any in-
-//                         fragment flags value), by a finite witness set over
-//                         the constants' trie plus a bounded bitvector
-//                         enumeration. Over the actions that really occur it
-//                         errs toward REACHABLE (the safe direction for a
-//                         warning). Used at policy load to report rules that
-//                         can never fire.
+//                         fragment flags value). For prefix / exact / host
+//                         atoms, by a finite witness set over the constants'
+//                         trie; once a kind has a suffix, contains or glob
+//                         rule, by a breadth-first search of the product of
+//                         the rules' automata (shortest witness first, so the
+//                         length bound is exact). Both use a bounded bitvector
+//                         enumeration for the flags; past the enumeration or
+//                         state budget the answer is UNKNOWN. Over the actions
+//                         that really occur it errs toward REACHABLE (the safe
+//                         direction for a warning). Used at policy load to
+//                         report rules that can never fire.
 //
 // What a flag clause constrains. A clause constrains the flags the agent passes
 // to openat(), checked when the Warden opens the object. That is sound for
@@ -80,6 +91,8 @@
 #define VDP_STR_MAX        4095     /* bound on s, bytes (PATH_LIMIT - 1) */
 #define VDP_MAX_RULES      256
 #define VDP_MAX_ENUM_BITS  16       /* bounded bitvector enumeration */
+#define VDP_GLOB_MAX_WILD  32       // wildcards per glob (* ** ? [...] and the /**/ unit)
+#define VDP_GLOB_MAX_TOTAL 65536    // glob tokens per policy: bounds the work per decision
 
 /* The x86_64 open(2) flag bits (uapi asm-generic/fcntl.h). Anything outside
  * this set is outside the fragment. */
@@ -87,7 +100,12 @@
 
 typedef enum { VDP_KIND_PATH = 0, VDP_KIND_HOST = 1, VDP_KIND_EXEC = 2 } vdp_kind_t;
 typedef enum { VDP_ALLOW = 0, VDP_DENY = 1 } vdp_verb_t;
-typedef enum { VDP_STR_PREFIX = 0, VDP_STR_EQ = 1, VDP_STR_HOST = 2 } vdp_str_op_t;
+typedef enum {
+    VDP_STR_PREFIX = 0, VDP_STR_EQ = 1, VDP_STR_HOST = 2,          /* v1.13 */
+    VDP_STR_SUFFIX = 3, VDP_STR_CONTAINS = 4, VDP_STR_GLOB = 5,    /* v1.14 */
+} vdp_str_op_t;
+
+struct vdp_prog;    /* a compiled glob (smt_decide.c) */
 
 typedef enum {
     VDP_UNKNOWN = 0,
@@ -102,9 +120,10 @@ typedef enum {
 } vdp_reach_t;
 
 typedef struct {
-    vdp_str_op_t op;
-    size_t       len;
-    char         c[VDP_STR_MAX + 1];
+    vdp_str_op_t      op;
+    size_t            len;
+    char              c[VDP_STR_MAX + 1];  /* the constant; for glob, the pattern */
+    struct vdp_prog  *prog;                /* glob only: compiled at load */
 } vdp_str_atom_t;
 
 typedef struct {
@@ -140,28 +159,59 @@ const char *vdp_verdict_name(vdp_verdict_t v);
 const char *vdp_why_name(vdp_why_t w);
 const char *vdp_kind_name(vdp_kind_t k);
 
-/* Parse a policy file. Returns 0, or -1 with a message in err. Refuses (never
- * silently drops) a policy with more than VDP_MAX_RULES rules, an over-long
- * line, an empty constant, an unknown token, or a contradictory flag clause.
- *
- * Line format:
- *   <allow|deny> <path|host|exec> <constant> [flag-clause...]
- * flag-clause (path rules only):
- *   readonly                              (access=ro -O_CREAT -O_TRUNC)
- *   access=ro | access=wo | access=rw     (the O_ACCMODE bits only; note that
- *                                          O_RDONLY|O_TRUNC truncates and
- *                                          O_RDONLY|O_CREAT creates on Linux)
- *   +O_NAME                               (bit must be set)
- *   -O_NAME                               (bit must be clear)
- * A path rule's constant is a prefix; host is host[:port] (a bare host matches
- * any port); exec is an exact path. A constant may not contain control bytes
- * (0x00-0x1f, 0x7f).
- *
- * Directive:
- *   require warden <major>.<minor>
- * refuses to load on an older procedure. Put it first in any policy that uses
- * flag clauses: a v1.12 Warden fails to load it (unknown verb) instead of
- * silently ignoring the clauses, which v1.12's parser did. */
+// Parse a policy file. Returns 0, or -1 with a message in err. Refuses (never
+// silently drops) a policy with more than VDP_MAX_RULES rules, a line of more
+// than 64 tokens, an empty constant, an unknown token, a malformed glob, glob
+// patterns over VDP_GLOB_MAX_TOTAL tokens in all, or a contradictory flag
+// clause. Release with vdp_policy_free().
+//
+// Line format:
+//   <allow|deny> <path|host|exec> [matcher] <constant> [flag-clause...]
+// matcher (v1.14; path and exec rules only):
+//   exact      s == constant
+//   prefix     s starts with constant    (the default for path)
+//   suffix     s ends with constant
+//   contains   constant occurs in s
+//   glob       s matches the glob constant, anchored at both ends:
+//                ?        one byte other than '/'
+//                [...]    one byte from a set: a, a-z, [!...] or [^...] to
+//                         negate; never matches '/' (a '/' inside is refused).
+//                         A ']' first in the set and a '-' last are literal;
+//                         \x inside a set is the byte x.
+//                *        zero or more bytes, none of them '/'
+//                **       zero or more bytes of any value
+//                /**/     a '/', then zero or more whole segments each ending
+//                         in '/' (so /a/**/b matches /a/b and /a/x/y/b); only
+//                         with an unescaped '/' before the ** (\/**/ is a
+//                         '/' then ** then '/')
+//                \x       the byte x literally
+//              at most VDP_GLOB_MAX_WILD wildcards; *** is refused.
+// Without a matcher, path is prefix, exec is exact, and host is host[:port] (a
+// bare host matches any port). A matcher keyword is read as a matcher only
+// when a constant follows it that is not itself a flag clause, so every v1.13
+// policy keeps its meaning (write `prefix glob` for a constant named glob).
+// After `require warden 1.14` (or later) a matcher keyword with no constant
+// after it is an error, not a prefix rule for the word. Tokens are separated
+// by ASCII whitespace and a token starting with '#' starts a comment, so a
+// constant can contain neither whitespace nor a leading '#'.
+// flag-clause (path rules only):
+//   readonly                              (access=ro -O_CREAT -O_TRUNC)
+//   access=ro | access=wo | access=rw     (the O_ACCMODE bits only; note that
+//                                          O_RDONLY|O_TRUNC truncates and
+//                                          O_RDONLY|O_CREAT creates on Linux)
+//   +O_NAME                               (bit must be set)
+//   -O_NAME                               (bit must be clear)
+// A constant (glob patterns included) may not contain control bytes
+// (0x00-0x1f, 0x7f).
+//
+// Directive:
+//   require warden <major>.<minor>
+// refuses to load on an older procedure. Put it first in any policy that uses
+// flag clauses: a v1.12 Warden fails to load it (unknown verb) instead of
+// silently ignoring the clauses, which v1.12's parser did. A policy that uses
+// matchers should say `require warden 1.14`; a v1.13 Warden refuses matcher
+// lines in any case (it reads the constant as an unknown flag clause), and the
+// directive makes the reason explicit.
 int vdp_policy_load(const char *path, vdp_policy_t *p, char *err, size_t errlen);
 
 /* Decide a single action. s must be a NUL-terminated string. flags is used only
@@ -172,8 +222,36 @@ vdp_verdict_t vdp_decide(const vdp_policy_t *p, vdp_kind_t kind, const char *s,
                          uint32_t flags, bool has_flags,
                          int *rule_index, vdp_why_t *why);
 
+/* The rule's matcher as written ("glob ", "suffix ", ...), or "" when it is the
+ * kind's default (prefix for path, exact for exec, host for host). */
+const char *vdp_matcher_prefix(const vdp_rule_t *r);
+
+/* Release what vdp_policy_load allocated (compiled globs). */
+void vdp_policy_free(vdp_policy_t *p);
+
 /* Can rule i ever be the first rule (of its kind) that holds? */
 vdp_reach_t vdp_rule_reachable(const vdp_policy_t *p, size_t i);
+
+/* As vdp_rule_reachable, and on VDP_REACHABLE also a witness: a string (at
+ * most wcap - 1 bytes, NUL-terminated, length in *wlen) and a flags value for
+ * which rule i is the first rule that holds. wit may be NULL. */
+vdp_reach_t vdp_rule_reachable_witness(const vdp_policy_t *p, size_t i,
+                                       char *wit, size_t wcap, size_t *wlen,
+                                       uint32_t *wflags);
+
+/* Testing only: decide every reachability query with the automaton search,
+ * also for kinds the trie method covers (the cross-check runs both). */
+extern bool vdp_reach_force_automaton;
+
+/* Why the last reachability query in this thread returned VDP_REACH_UNKNOWN:
+ * "enumeration_bound" (more than VDP_MAX_ENUM_BITS free flag bits),
+ * "state_budget" (the automaton search's state or work budget), or
+ * "witness_alphabet" (the trie method found a constant prefix followed by all
+ * 255 byte values, so its witness set may be incomplete); "" if it did not. */
+const char *vdp_reach_unknown_reason(void);
+
+/* The same, as text for a load-time note. */
+const char *vdp_reach_unknown_text(void);
 
 /* Name <-> bit for flag clauses; returns 0 if unknown. */
 uint32_t vdp_flag_bit(const char *name);
@@ -185,6 +263,6 @@ size_t vdp_rule_advisory(const vdp_rule_t *r, char *buf, size_t n);
 
 /* The Warden version this procedure implements, for `require warden X.Y`. */
 #define VDP_WARDEN_MAJOR 1
-#define VDP_WARDEN_MINOR 13
+#define VDP_WARDEN_MINOR 14
 
 #endif /* VAREK_SMT_DECIDE_H */

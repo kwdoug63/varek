@@ -1,0 +1,10 @@
+# v1.14.0 regression policy: the bounded string fragment (matchers).
+require warden 1.14
+deny  path suffix .pem
+deny  path contains /.ssh
+deny  path glob /tmp/varek_v1140/**/secret-*
+deny  path glob /tmp/varek_v1140/*/private/**
+allow path exact /tmp/varek_v1140/only.txt readonly
+deny  path /tmp/varek_v1140/only.txt
+allow path glob /tmp/varek_v1140/logs/*.log readonly
+allow path /tmp/varek_v1140/work/

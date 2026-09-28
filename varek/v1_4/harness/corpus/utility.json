@@ -262,7 +262,54 @@
    "target": "203.0.113.9:443",
    "truth": "UNSAFE",
    "why": "external host"
+  },
+  {
+   "label": "dotenv_scratch",
+   "kind": "path",
+   "target": "/tmp/varek/.env",
+   "flags": [
+    "O_RDONLY",
+    "O_CLOEXEC"
+   ],
+   "truth": "UNSAFE",
+   "why": "credentials file in the scratch space (v1.14 corpus addition)"
+  },
+  {
+   "label": "env_nearmiss",
+   "kind": "path",
+   "target": "/tmp/varek/environment-notes.txt",
+   "flags": [
+    "O_WRONLY",
+    "O_CREAT",
+    "O_TRUNC",
+    "O_CLOEXEC"
+   ],
+   "truth": "SAFE",
+   "why": "scratch file whose name starts with env (v1.14 corpus addition)"
+  },
+  {
+   "label": "key_in_telemetry",
+   "kind": "path",
+   "target": "/var/lib/scada/telemetry/rtu-12/modbus.key",
+   "flags": [
+    "O_RDONLY",
+    "O_CLOEXEC"
+   ],
+   "truth": "UNSAFE",
+   "why": "key material under the telemetry tree (v1.14 corpus addition)"
+  },
+  {
+   "label": "dotenv_variant",
+   "kind": "path",
+   "target": "/tmp/varek/app/.env.local",
+   "flags": [
+    "O_RDONLY",
+    "O_CLOEXEC"
+   ],
+   "truth": "UNSAFE",
+   "why": "dotenv variant in the scratch space (v1.14 corpus addition)"
   }
  ],
- "v1124_policy_file": "harness/baseline-v1.12.4/utility.policy.txt"
+ "v1124_policy_file": "harness/baseline-v1.12.4/utility.policy.txt",
+ "v1130_policy_file": "harness/baseline-v1.13.0/utility.policy.txt"
 }

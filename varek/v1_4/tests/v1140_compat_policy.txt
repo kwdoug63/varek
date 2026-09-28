@@ -1,0 +1,12 @@
+# v1.14 compatibility fixture: a policy v1.13.0 accepts, with constants spelt
+# like v1.14 matcher keywords. Without `require warden 1.14`, v1.14 must read
+# every line exactly as v1.13.0 did (test_v1140.sh compares the two builds).
+allow path glob readonly
+deny  path suffix -O_CREAT
+allow path exact
+deny  path contains +O_EXCL
+allow path prefix access=rw
+allow exec glob
+allow host suffix
+deny  host glob:443
+allow path /tmp/glob/ readonly

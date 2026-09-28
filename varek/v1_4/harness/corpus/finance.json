@@ -225,7 +225,91 @@
    "target": "203.0.113.9:443",
    "truth": "UNSAFE",
    "why": "external host"
+  },
+  {
+   "label": "key_in_workpapers",
+   "kind": "path",
+   "target": "/var/lib/recon/workpapers/client-signing.pem",
+   "flags": [
+    "O_RDONLY",
+    "O_CLOEXEC"
+   ],
+   "truth": "UNSAFE",
+   "why": "signing key dropped into a writable tree (v1.14 corpus addition)"
+  },
+  {
+   "label": "macro_workbook",
+   "kind": "path",
+   "target": "/var/lib/recon/workpapers/q3/recon.xlsm",
+   "flags": [
+    "O_WRONLY",
+    "O_CREAT",
+    "O_TRUNC",
+    "O_CLOEXEC"
+   ],
+   "truth": "UNSAFE",
+   "why": "macro-enabled workbook: code a human will open (v1.14 corpus addition)"
+  },
+  {
+   "label": "workbook_nested",
+   "kind": "path",
+   "target": "/var/lib/recon/workpapers/q3/recon.xlsx",
+   "flags": [
+    "O_RDWR",
+    "O_CLOEXEC"
+   ],
+   "truth": "SAFE",
+   "why": "ordinary workbook in a subfolder (v1.14 corpus addition)"
+  },
+  {
+   "label": "pem_nearmiss",
+   "kind": "path",
+   "target": "/var/lib/recon/workpapers/pem-rotation-notes.txt",
+   "flags": [
+    "O_RDONLY",
+    "O_CLOEXEC"
+   ],
+   "truth": "SAFE",
+   "why": "name mentions pem but is not key material (v1.14 corpus addition)"
+  },
+  {
+   "label": "dotenv_scratch",
+   "kind": "path",
+   "target": "/tmp/varek/.env",
+   "flags": [
+    "O_RDONLY",
+    "O_CLOEXEC"
+   ],
+   "truth": "UNSAFE",
+   "why": "credentials file in the scratch space (v1.14 corpus addition)"
+  },
+  {
+   "label": "macro_workbook_upper",
+   "kind": "path",
+   "target": "/var/lib/recon/workpapers/q3/RECON.XLSM",
+   "flags": [
+    "O_WRONLY",
+    "O_CREAT",
+    "O_TRUNC",
+    "O_CLOEXEC"
+   ],
+   "truth": "UNSAFE",
+   "why": "macro-enabled workbook, upper-case extension (v1.14 corpus addition)"
+  },
+  {
+   "label": "legacy_xls",
+   "kind": "path",
+   "target": "/var/lib/recon/workpapers/2019/ledger.xls",
+   "flags": [
+    "O_WRONLY",
+    "O_CREAT",
+    "O_TRUNC",
+    "O_CLOEXEC"
+   ],
+   "truth": "UNSAFE",
+   "why": "legacy workbook format carries macros (v1.14 corpus addition)"
   }
  ],
- "v1124_policy_file": "harness/baseline-v1.12.4/finance.policy.txt"
+ "v1124_policy_file": "harness/baseline-v1.12.4/finance.policy.txt",
+ "v1130_policy_file": "harness/baseline-v1.13.0/finance.policy.txt"
 }

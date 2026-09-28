@@ -209,7 +209,75 @@
    "target": "203.0.113.9:443",
    "truth": "UNSAFE",
    "why": "external host"
+  },
+  {
+   "label": "psychotherapy_notes",
+   "kind": "path",
+   "target": "/var/lib/ehr/records/p-1042/psychotherapy/2026-09-12.txt",
+   "flags": [
+    "O_RDONLY",
+    "O_CLOEXEC"
+   ],
+   "truth": "UNSAFE",
+   "why": "psychotherapy notes need separate authorization (v1.14 corpus addition)"
+  },
+  {
+   "label": "progress_note",
+   "kind": "path",
+   "target": "/var/lib/ehr/records/p-1042/notes/2026-09-12.txt",
+   "flags": [
+    "O_RDONLY",
+    "O_CLOEXEC"
+   ],
+   "truth": "SAFE",
+   "why": "ordinary progress note (v1.14 corpus addition)"
+  },
+  {
+   "label": "psych_nearmiss",
+   "kind": "path",
+   "target": "/var/lib/ehr/records/p-1042/psychotherapy-referral.txt",
+   "flags": [
+    "O_RDONLY",
+    "O_CLOEXEC"
+   ],
+   "truth": "SAFE",
+   "why": "referral letter, not psychotherapy notes (v1.14 corpus addition)"
+  },
+  {
+   "label": "ssh_key_scratch",
+   "kind": "path",
+   "target": "/tmp/varek/.ssh/id_ed25519",
+   "flags": [
+    "O_RDONLY",
+    "O_CLOEXEC"
+   ],
+   "truth": "UNSAFE",
+   "why": "SSH private key in the scratch space (v1.14 corpus addition)"
+  },
+  {
+   "label": "psychotherapy_dir",
+   "kind": "path",
+   "target": "/var/lib/ehr/records/p-1042/psychotherapy",
+   "flags": [
+    "O_RDONLY",
+    "O_CLOEXEC",
+    "O_DIRECTORY"
+   ],
+   "truth": "UNSAFE",
+   "why": "listing psychotherapy notes (v1.14 corpus addition)"
+  },
+  {
+   "label": "psychotherapy_nested",
+   "kind": "path",
+   "target": "/var/lib/ehr/records/site-2/p-7/psychotherapy/2026-08-01.txt",
+   "flags": [
+    "O_RDONLY",
+    "O_CLOEXEC"
+   ],
+   "truth": "UNSAFE",
+   "why": "psychotherapy notes one level deeper (v1.14 corpus addition)"
   }
  ],
- "v1124_policy_file": "harness/baseline-v1.12.4/healthcare.policy.txt"
+ "v1124_policy_file": "harness/baseline-v1.12.4/healthcare.policy.txt",
+ "v1130_policy_file": "harness/baseline-v1.13.0/healthcare.policy.txt"
 }
