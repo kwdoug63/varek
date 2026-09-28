@@ -117,8 +117,9 @@ else flunk "the refused spawn is in the verdict stream"; fi
 
 echo "-- 6. verdict stream still attests"
 # 1.12.2 or any later 1.12.x (the suite keeps running on later releases).
-if grep '^{' "$VERDICTS" | grep -Eq '"warden":"1\.12\.([2-9]|[1-9][0-9])"'; then pass "run_start names Warden 1.12.2 or later"
-else flunk "run_start names Warden 1.12.2 or later"; fi
+wv="$(grep -o '"warden":"[0-9.]*"' "$VERDICTS" | head -1 | cut -d'"' -f4)"
+if [ -n "$wv" ] && printf '%s\n%s\n' 1.12.2 "$wv" | sort -V -C; then pass "run_start names Warden 1.12.2 or later ($wv)"
+else flunk "run_start names Warden 1.12.2 or later (got ${wv:-none})"; fi
 if python3 "$EXPORTER" --log "$VERDICTS" --output "$OUT/bom.json" >/dev/null 2>"$OUT/exp.err"; then
     pass "CycloneDX exporter accepts the multithreaded stream"
 else flunk "CycloneDX exporter accepts the multithreaded stream ($(head -1 "$OUT/exp.err"))"; fi

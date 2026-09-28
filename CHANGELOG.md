@@ -7,15 +7,20 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased] — v1.10 / v1.11 (planned, not shipped)
+## [Unreleased] — the v1.10 / v1.11 verification program (continuing)
 
-The next line is one program: **shrink the UNKNOWN region without weakening
-soundness.** Every item below moves cases out of UNKNOWN into a provable
-SATISFIED or UNSATISFIED, and is admitted only under a soundness obligation that
-forbids it from ever turning a genuinely unsafe action into SATISFIED. Nothing in
-this section is present in a released tag; it is stated as direction.
+The program: **shrink the UNKNOWN region without weakening soundness.** Every
+item moves cases out of UNKNOWN into a provable SATISFIED or UNSATISFIED, and is
+admitted only under a soundness obligation that forbids it from ever turning a
+genuinely unsafe action into SATISFIED. "v1.10" and "v1.11" name the program;
+its first release shipped as **v1.13.0** (below) so version numbers keep
+increasing. Shipped in v1.13.0: the SMT decision procedure in the enforcement
+path, the bitvector flag fragment, the prefix/equality part of the bounded
+string fragment, and the verdict-distribution harness (synthetic seed corpus).
+Still planned: the rest of the bounded string fragment, a customer-derived
+corpus and measured baseline, proof objects, and the v1.11 sequence fragment.
 
-### Planned — v1.10
+### Planned — v1.10 program (status as of v1.13.0)
 
 - **Verdict-distribution harness.** Measurement and regression gating over a
   corpus of realistic agent action-graphs. Reports the four-cell outcome
@@ -45,6 +50,68 @@ this section is present in a released tag; it is stated as direction.
   is one of those). Soundness obligation adds a composition lemma and a
   bounded-length guard. Sequenced after strings because it inherits the element
   fragment's guarantee.
+
+---
+
+## [1.13.0] - 2026-09-28
+
+First release of the v1.10 verification program. Every Warden decision is now
+made by an SMT decision procedure (`smt_decide.c`) over a quantifier-free
+fragment of bounded strings (the object) and 32-bit bitvectors (the open flags),
+replacing v1.12's prefix/equality matching. Three-state semantics and the
+symmetric-suppression invariant are unchanged; flag-free policies decide exactly
+as before.
+
+### Added
+
+- **Open-flag policy clauses** on path rules: `readonly` (= `access=ro -O_CREAT
+  -O_TRUNC`), `access=ro|wo|rw`, `+O_NAME`, `-O_NAME`. Through v1.12 a path rule
+  admitted every open flag, so "read-only" could not be expressed.
+- **Fragment boundary as soundness obligations:** a string over 4095 bytes, or a
+  flags value with a bit outside the x86_64 `open(2)` set, is UNKNOWN (recorded
+  as `fragment_escape_length` / `fragment_escape_flags`); a symbolic query over
+  more than 16 relevant flag bits is UNKNOWN.
+- **Load-time analysis:** the Warden decides, for every rule, whether any action
+  can reach it first, and warns on each rule that can never fire.
+  `tools/vdp_check <policy> lint|analyze|batch` exposes the same procedure.
+- **Symbolic flags in the `--plan` gate:** a planned `file_open` is SATISFIED
+  only if every admissible flags value is.
+- **Solver cross-check** (`tools/smt_crosscheck.py`, `make crosscheck`): an
+  independent parser and encoding for an off-the-shelf SMT solver; zero
+  disagreements over 677 checks on every repository policy and 19,199 checks on
+  600 fuzzed policies. Mutation test: 6 of 7 planted bugs caught; the seventh is
+  semantically equivalent in the current atom language.
+- **Verdict-distribution harness** (`tools/verdict_harness.py`, `make harness`,
+  `harness/corpus/`): verdict by ground truth, clear rate, and the
+  `unsafe_satisfied == 0` gate, alongside the two policies v1.12 could have
+  enforced from the same file. Seed corpus (synthetic, SAI-authored): v1.13 88.5%
+  clear with 0 unsafe SATISFIED; v1.12-permissive 88.5% with 28; v1.12-strict
+  42.3% with 0.
+- Records gain `policy_line`. `tests/v1130_probe.c`, `tests/test_v1130.sh`,
+  `tests/v1130_policy.txt`, `make test-v1130`. `RELEASE-v1.13.0.md`.
+
+### Security
+
+- **Example sector policies enforce the read-only access their comments
+  claimed.** The loader rules (`/usr/lib/`, `/lib/`, `/lib64/`,
+  `/etc/ld.so.cache`) admitted writes, so the root agent could overwrite
+  `libc.so.6`; "(read)" rules (logs, detection rules, SCADA telemetry and
+  setpoints, market snapshots, tasking, intelligence products) admitted writes
+  too. They are now `readonly`.
+- **Dead rule fixed in four example policies:** `deny path /etc/` preceded
+  `allow path /etc/ld.so.cache`, so the loader-cache allow never fired. Found by
+  the new load-time analysis.
+- **The parser no longer drops rules silently.** v1.12 stopped at 256 rules
+  without a word (a 257th deny was ignored) and ignored every token after the
+  third. Over 256 rules, an unknown or contradictory flag clause, or a flag
+  clause on a host/exec rule is now a load error.
+
+### Changed
+
+- `run_start` reads `"warden":"1.13.0"`; the policy loads as `v1.13`.
+- `test_v1122.sh` and `test_v1123.sh` compare the Warden version with `sort -V`.
+- Do not load a v1.13 policy into an older Warden: the v1.12 parser ignores flag
+  clauses and admits every flag.
 
 ---
 
