@@ -48,6 +48,34 @@ this section is present in a released tag; it is stated as direction.
 
 ---
 
+## [1.12.4] - 2026-09-28
+
+v1.12.4 fixes the optional `--plan` pre-execution gate, which had rejected every
+plan declaring a `file_open` action since v1.12.0. No runtime verdict *semantics*
+change.
+
+### Fixed
+
+- **The `--plan` gate authorizes file opens again.** Since v1.12.0
+  `policy_decide` has decided a file open on the resolved canonical path, but the
+  plan decider — which runs before the agent is forked — never filled that field,
+  so every `file_open` node was UNKNOWN and any plan that opened a file was
+  rejected (including the shipped `sample_plan.txt` and the v1.6 integration
+  test). The decider now fills it with the lexically canonical form of the
+  declared absolute path (`.`, `..` and duplicate slashes collapsed, `..` clamped
+  at `/`). A plan opening a policy-allowed file is SATISFIED again; a `..` that
+  lexically escapes an allowed prefix, or a relative path, stays UNKNOWN. Plan
+  verification does not follow symlinks (there is no agent yet) — it is an
+  advisory pre-check, and every open is still mediated per-syscall at runtime.
+
+### Added
+
+- `varek/v1_4/tests/test_v1124.sh` and `make test-v1124`. Fails against v1.12.3
+  (every file-open plan node is UNKNOWN).
+- `RELEASE-v1.12.4.md`.
+
+---
+
 ## [1.12.3] - 2026-09-28
 
 v1.12.3 lets dynamically linked agents (CPython, a JVM, Node) run under the live
