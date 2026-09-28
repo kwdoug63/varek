@@ -23,14 +23,19 @@ V1_7_DIR  := ../../v1_7
 LIFECYCLE := $(V1_7_DIR)/warden_lifecycle.c
 CFLAGS    += -I$(V1_7_DIR)
 
-BINS := warden target_demo bench_target
+BINS := warden target_demo bench_target tools/vdp_check
 
-.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 video-v112
+.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 crosscheck harness video-v112
 
 all: $(BINS)
 
-warden: warden.c warden_baseline_filter.c $(LIFECYCLE) $(V1_6_SRC)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c $(LIFECYCLE) $(V1_6_SRC) $(LDLIBS)
+warden: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(LIFECYCLE) $(V1_6_SRC)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c $(LIFECYCLE) $(V1_6_SRC) $(LDLIBS)
+
+# v1.13: command-line front end to the SMT decision procedure (lint, analyze,
+# batch queries); the same smt_decide.c the Warden runs.
+tools/vdp_check: tools/vdp_check.c smt_decide.c smt_decide.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/vdp_check.c smt_decide.c
 
 target_demo: target_demo.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
@@ -117,6 +122,25 @@ test-v1123: warden tests/v1123_probe
 test-v1124: warden
 	@sudo ./tests/test_v1124.sh ./warden
 
+# v1.13: the SMT decision procedure in the enforcement path. Flag-fragment
+# enforcement under a live Warden, load-time dead-rule analysis, parser
+# refusals, lint of the shipped policies, the --plan gate's symbolic flags, the
+# solver cross-check and the harness gate. Needs python3 and z3-solver.
+tests/v1130_probe: tests/v1130_probe.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $<
+
+test-v1130: warden tools/vdp_check tests/v1130_probe
+	@sudo ./tests/test_v1130.sh ./warden ./tools/vdp_check $(abspath tests/v1130_probe)
+
+# Differential check of the decision procedure against an SMT solver (Z3).
+crosscheck: tools/vdp_check
+	@python3 tools/smt_crosscheck.py --vdp tools/vdp_check --fuzz 200 --seed 1010 \
+	    policy.txt conformance_policy.txt policies/*.txt tests/*policy*.txt
+
+# Verdict-distribution harness over the (synthetic) seed corpus.
+harness: tools/vdp_check
+	@python3 tools/verdict_harness.py --vdp tools/vdp_check harness/corpus/
+
 # v1.12 before/after demo, video-capture friendly (see v112_video.sh header).
 # Builds the pre-fix Warden from the v1.9.3 tag and runs the same adversarial
 # agent under both; every verdict on screen is read from the live Warden.
@@ -136,4 +160,4 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/test_v14_filter
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/test_v14_filter
