@@ -556,6 +556,7 @@ static action_kind_t kind_from_string(const char *s) {
  * `..` that would rise above `/` is clamped at `/` (as the kernel does for an
  * absolute path), never allowed to escape. */
 static int plan_lexical_canon(const char *in, char *out, size_t outlen) {
+    if (outlen) out[0] = '\0';                  /* NUL-terminate on every -1 path */
     if (!in || in[0] != '/') return -1;         /* absolute only */
     const char *seg[PATH_LIMIT / 2];
     size_t nseg = 0;
@@ -573,7 +574,7 @@ static int plan_lexical_canon(const char *in, char *out, size_t outlen) {
             if (nseg > 0) nseg--;                /* ".." : pop, clamped at / */
             continue;
         }
-        if (nseg >= sizeof seg / sizeof seg[0]) return -1;
+        if (nseg >= sizeof seg / sizeof seg[0]) { if (outlen) out[0] = '\0'; return -1; }
         seg[nseg++] = start;                     /* remember start; length re-derived below */
     }
     /* Rebuild. Re-derive each segment's length by scanning to the next '/'. */
@@ -587,7 +588,7 @@ static int plan_lexical_canon(const char *in, char *out, size_t outlen) {
         const char *st = seg[i];
         size_t len = 0;
         while (st[len] && st[len] != '/') len++;
-        if (w + 1 + len >= outlen) return -1;
+        if (w + 1 + len >= outlen) { out[0] = '\0'; return -1; }
         out[w++] = '/';
         memcpy(out + w, st, len);
         w += len;

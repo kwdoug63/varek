@@ -73,9 +73,9 @@ directly and were never affected.
 
 ## Testing
 
-- `make test-v1124`: drives the Warden's `--plan` path (target `/bin/true`, so
-  nothing is forked past the gate) and checks that an allowed `file_open` is
-  SATISFIED and launches; an unlisted one is UNKNOWN and a denied one is
+- `make test-v1124`: drives the Warden's `--plan` path with `/bin/true` as a
+  harmless no-op target (it exits immediately when a plan authorizes and forks
+  it) and checks that an allowed `file_open` is SATISFIED and launches; an unlisted one is UNKNOWN and a denied one is
   UNSATISFIED, both refusing to fork; `.`/`..` collapse before the decision; a
   `..` escape and a relative path stay UNKNOWN; and a `file_open` mixed with an
   allowed exec and connect is SATISFIED while a denied connect still rejects the
