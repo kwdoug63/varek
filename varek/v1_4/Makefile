@@ -25,7 +25,7 @@ CFLAGS    += -I$(V1_7_DIR)
 
 BINS := warden target_demo bench_target
 
-.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 video-v112
+.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 video-v112
 
 all: $(BINS)
 
@@ -109,6 +109,13 @@ tests/v1123_probe: tests/v1123_probe.c
 
 test-v1123: warden tests/v1123_probe
 	@sudo ./tests/test_v1123.sh ./warden tests/v1123_policy.txt $(abspath tests/v1123_probe) tools/varek_cyclonedx.py
+
+# v1.12.4 regression: the --plan gate authorizes plans that open policy-allowed
+# files again (a file_open node was always UNKNOWN from v1.12.0 because the plan
+# decider never filled the resolved path the file-open decision reads). No probe:
+# it drives the Warden's pre-fork --plan path directly.
+test-v1124: warden
+	@sudo ./tests/test_v1124.sh ./warden
 
 # v1.12 before/after demo, video-capture friendly (see v112_video.sh header).
 # Builds the pre-fix Warden from the v1.9.3 tag and runs the same adversarial

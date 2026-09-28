@@ -536,6 +536,67 @@ static action_kind_t kind_from_string(const char *s) {
     return ACT_OTHER;
 }
 
+/* v1.12.4: lexical canonicalization of an absolute path for PLAN verification.
+ *
+ * The runtime file-open decision (policy_decide on ACT_FILE_OPEN) is made on
+ * the object's canonical path as resolved against the live agent's cwd, with
+ * every symlink followed (resolve_target). A plan is verified BEFORE the agent
+ * is forked, so there is no process to resolve against and the named file may
+ * not exist yet. Plan verification is therefore an approximation: it collapses
+ * `.`, `..` and duplicate slashes lexically and decides policy on that, which
+ * is the pre-execution analog of the runtime canonical path. It does not follow
+ * symlinks (there is nothing to follow yet), so a plan that lexically clears the
+ * policy is still enforced per-syscall at runtime; the gate is an advisory
+ * pre-check, not a substitute for enforcement.
+ *
+ * Only absolute paths can be verified this way. A relative plan path has no
+ * cwd to resolve against before fork, so it stays UNKNOWN (the plan is not
+ * SATISFIED) rather than being guessed. Returns 0 with out filled, or -1.
+ *
+ * `..` that would rise above `/` is clamped at `/` (as the kernel does for an
+ * absolute path), never allowed to escape. */
+static int plan_lexical_canon(const char *in, char *out, size_t outlen) {
+    if (outlen) out[0] = '\0';                  /* NUL-terminate on every -1 path */
+    if (!in || in[0] != '/') return -1;         /* absolute only */
+    const char *seg[PATH_LIMIT / 2];
+    size_t nseg = 0;
+    const char *p = in;
+    while (*p) {
+        while (*p == '/') p++;                   /* skip slashes */
+        if (!*p) break;
+        const char *start = p;
+        while (*p && *p != '/') p++;
+        size_t len = (size_t)(p - start);
+        if (len == 1 && start[0] == '.') {
+            continue;                            /* "." : no-op */
+        }
+        if (len == 2 && start[0] == '.' && start[1] == '.') {
+            if (nseg > 0) nseg--;                /* ".." : pop, clamped at / */
+            continue;
+        }
+        if (nseg >= sizeof seg / sizeof seg[0]) { if (outlen) out[0] = '\0'; return -1; }
+        seg[nseg++] = start;                     /* remember start; length re-derived below */
+    }
+    /* Rebuild. Re-derive each segment's length by scanning to the next '/'. */
+    size_t w = 0;
+    if (nseg == 0) {
+        if (outlen < 2) return -1;
+        out[0] = '/'; out[1] = '\0';
+        return 0;
+    }
+    for (size_t i = 0; i < nseg; i++) {
+        const char *st = seg[i];
+        size_t len = 0;
+        while (st[len] && st[len] != '/') len++;
+        if (w + 1 + len >= outlen) { out[0] = '\0'; return -1; }
+        out[w++] = '/';
+        memcpy(out + w, st, len);
+        w += len;
+    }
+    out[w] = '\0';
+    return 0;
+}
+
 struct warden_plan_ud {
     const struct policy *policy;
 };
@@ -555,6 +616,16 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
     act.kind = kind_from_string(a->kind);
     if (a->target) {
         snprintf(act.target, sizeof(act.target), "%s", a->target);
+    }
+    /* v1.12.4: policy_decide() decides a file open on the RESOLVED canonical
+     * path (v1.12.0+), not the raw target. At plan time there is no live agent
+     * to resolve against, so fill act.resolved with the lexically canonical
+     * form of the declared absolute path. Without this, resolved stays empty
+     * and every file_open node is UNKNOWN -> the plan gate rejected every plan
+     * that opened a file (the bug present since v1.12.0). A relative or
+     * unparseable path leaves resolved empty and stays UNKNOWN. */
+    if (act.kind == ACT_FILE_OPEN) {
+        (void)plan_lexical_canon(act.target, act.resolved, sizeof(act.resolved));
     }
     decision_t d = policy_decide(u->policy, &act);
     switch (d) {
@@ -712,7 +783,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     log_line_start();
-    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.12.3\","
+    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.12.4\","
                    "\"policy_path\":\"", g_run_id);
     json_escape(g_log, policy_path);
     fprintf(g_log, "\",\"policy_rules\":%zu,\"timestamp_ns\":%lld}\n",
@@ -1400,7 +1471,11 @@ static void usage(const char *argv0) {
         "\n"
         "  Plan file format (see varek/v1_6/sample_plan.txt):\n"
         "    action <label> <kind> <target>\n"
-        "    edge   <from_label> <to_label>\n",
+        "    edge   <from_label> <to_label>\n"
+        "  A file_open target is verified against the policy on its lexically\n"
+        "  canonical path (. and .. collapsed); it must be absolute. Symlinks\n"
+        "  are not followed at plan time (there is no agent yet), so the gate is\n"
+        "  an advisory pre-check and every open is still mediated at runtime.\n",
         argv0);
 }
 

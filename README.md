@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.12.3-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.12.4-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -30,7 +30,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.12.3.**
+   **Current release: v1.12.4.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -82,6 +82,7 @@ The runtime line has progressed well beyond simple syscall containment:
   human-out-of-the-loop operation per policy: for every non-authorizing verdict,
   a deterministic, automated terminal outcome is reachable in finitely many steps.
   "Never requires a human" becomes certified rather than hoped.
+- **v1.12.4 — the `--plan` gate authorizes file opens again.** Optional pre-execution plan verification had rejected every plan that declared a `file_open` action since v1.12.0: the per-open decision moved to the resolved canonical path, but the plan decider (which runs before the agent is forked) never filled it, so every file-open node was UNKNOWN. The decider now decides on the lexically canonical form of the declared absolute path, so a plan opening a policy-allowed file verifies again; a `..` that lexically escapes, or a relative path, stays UNKNOWN. The gate does not follow symlinks (there is no agent yet) and remains an advisory pre-check — every open is still mediated per-syscall at runtime. Adds `make test-v1124`. See [`RELEASE-v1.12.4.md`](./RELEASE-v1.12.4.md).
 - **v1.12.3 — dynamically linked agents.** Follows ordinary symlinks and decides policy on the object's canonical path, so a dynamically linked agent (CPython, a JVM, Node) can load its libraries — since v1.12.0 the resolver refused any path with a symlink, and on merged-`/usr` systems `/lib` and library SONAMEs are symlinks. The security property is unchanged: a symlink to a denied object is decided as that object and refused. `/proc/self` and `/proc/thread-self` are mapped to the agent's own process (never the Warden's), and any other process's `/proc`, or a procfs reached through a planted symlink, fails closed. Because the decision is on the canonical path, `allow path` prefixes name canonical locations (`/usr/lib/`, not `/lib/`). Adds `make test-v1123`. See [`RELEASE-v1.12.3.md`](./RELEASE-v1.12.3.md).
 - **v1.12.2 — threads and child processes.** Agent code can now start threads, wait for its children and call `isatty()`. `clone3` answers `ENOSYS` instead of killing the process (glibc >= 2.34 creates every thread with it), so libc falls back to `clone()`, whose flags the filter checks; `clone3` still never runs and the namespace denials are unchanged. `wait4`/`waitid` are admitted, and `ioctl` is admitted for six read-or-own-descriptor requests (`TIOCSTI` and the rest stay refused). A filter-killed agent is now reported. Also closes an exec-allowlist bypass: the launch exec, answered with `CONTINUE`, was granted once per pid, so a thread could race its path; it is now granted once per run. Adds `make test-v1122`. Known issue: dynamically linked agents cannot yet load their libraries (symlinked paths are refused since v1.12.0); planned for v1.12.3. See [`RELEASE-v1.12.2.md`](./RELEASE-v1.12.2.md).
 - **v1.12.1 — mediation-correctness follow-up.** Fixes three defects found in v1.12.0. A denied file open no longer has side effects: the Warden pins the object with `O_PATH`, decides, and only after ALLOW opens it with the agent's flags (v1.12.0 opened first, so a DENY could still truncate or create a file, and a FIFO could wedge the supervisor). The verdict stream is authenticated: the agent's stderr is relayed with an `[agent] ` prefix, every record carries a per-run id and a contiguous `seq`, and `varek_cyclonedx.py` refuses a stream holding a forged, missing or foreign record. Inbound networking is refused: `bind`/`listen`/`accept` are denied and the agent runs in its own network namespace. Adds `make test-v1121`. No verdict-semantics change. See [`RELEASE-v1.12.1.md`](./RELEASE-v1.12.1.md).
@@ -98,7 +99,7 @@ The runtime line has progressed well beyond simple syscall containment:
   are deny-only (fail closed) pending the v1.10 dial-and-inject path. See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.12.3 history.
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.12.4 history.
 
 ### Installation
 
@@ -338,6 +339,7 @@ different risks at different points in the stack.
 - [x] **v1.12.1** — Side-effect-free denials (resolve, decide, then open), authenticated verdict stream, inbound networking refused
 - [x] **v1.12.2** — Threads and child processes: `clone3` answers `ENOSYS` (libc falls back to the filtered `clone`), `wait4`/`waitid`, narrow `ioctl` allowlist, kill report; bootstrap exec granted once per run
 - [x] **v1.12.3** — Dynamically linked agents: follow symlinks and decide on the canonical path; `/proc/self` mapped to the agent
+- [x] **v1.12.4** — The `--plan` gate authorizes file opens again (decide on the lexically canonical declared path)
 - [ ] **v1.10 (planned)** — The UNKNOWN-shrinking program (below)
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
 
