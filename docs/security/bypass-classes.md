@@ -34,7 +34,7 @@ except where noted:
 |---|-------|--------|------------|
 | 1 | Alternate-ABI / syscall-table (compat int 0x80, x32 `__X32_SYSCALL_BIT`, arm compat, 32-bit multiplexers `socketcall`/`ipc`) | closed | Native-only default-deny. Secondary arches removed; multiplexers unreachable. Asserted on live kernel by `test_v192_abi_lockdown.c`. |
 | 2 | Variant-syscall evasion (`clone3`, `openat2`, `faccessat2`, `pidfd_*`) | closed | Default-deny allowlist: a variant is denied unless admitted. `clone3` hard-denied (pointer-flags, uninspectable). When we mediate an effect we mediate **every** syscall producing it. |
-| 3 | Off-path I/O dispatch | closed (send path, v1.12); partial elsewhere | `io_uring_*` denied (v1.9.1, retained). `process_vm_readv/writev`, `pidfd_getfd`, `memfd_create` hard-denied. **mmap-after-open** contained by acquisition-time mediation: the `open` was mediated, so the fd is authorized; the mapping rides an authorized capability. **Datagram egress** (`sendto`/`sendmsg` reaching the network without `connect`) **closed in v1.12**: both are mediated as `net.send` and refused for an inet destination under the deny-only network posture; inbound `recvfrom`/`recvmsg` stay admitted. **SCM_RIGHTS fd passing** contained by the fd-provenance invariant below. |
+| 3 | Off-path I/O dispatch | closed (send path, v1.12; inbound, v1.12.1); partial elsewhere | `io_uring_*` denied (v1.9.1, retained). `process_vm_readv/writev`, `pidfd_getfd`, `memfd_create` hard-denied. **mmap-after-open** contained by acquisition-time mediation: the `open` was mediated, so the fd is authorized; the mapping rides an authorized capability. **Datagram egress** (`sendto`/`sendmsg` reaching the network without `connect`) **closed in v1.12**: both are mediated as `net.send` and refused for an inet destination under the deny-only network posture; inbound `recvfrom`/`recvmsg` stay admitted. **Inbound networking** (`bind`/`listen`/`accept`/`accept4`, a TCP listener or an abstract unix socket the host can reach) was left admitted through v1.12.0; **closed in v1.12.1**: the four calls are refused, and the agent runs in its own network namespace holding only a loopback interface that is down. **SCM_RIGHTS fd passing** contained by the fd-provenance invariant below. |
 | 4 | Deterministic TOCTOU primitives (`userfaultfd`, FUSE/attacker mounts, symlink/magic-link swaps) | partial | `userfaultfd` and the mount/FUSE family (`mount`, `umount2`, `fsopen`, `fsconfig`, `fsmount`, `move_mount`, `open_tree`) hard-denied. Path races and symlink/magic-link swaps: the supervisor resolves the object **once** with `openat2(RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`, decides policy on the **resolved canonical path** (`readlink` of the resolved fd), and injects that same fd (v1.12 resolve-then-decide) — a symlink component fails resolution and is denied, and a `..` traversal is decided on the post-collapse path. Before v1.12 the shipped resolver set only `RESOLVE_NO_MAGICLINKS`, so a symlink inside an allowed directory was followed, and the decision was made on the raw pathname rather than the resolved object; both are fixed. `RESOLVE_BENEATH` is intentionally **not** set (allow rules legitimately name absolute paths outside the cwd); `..` is defanged by deciding on the canonical path, not by forbidding it. Race-free kernel-side resolution via **Landlock** remains roadmap (reserved v1.10). |
 | 4a | Supervisor-context path confusion (`/proc/self/*`) | closed (v1.12) | `/proc/self` and `/proc/thread-self` are magic symlinks the kernel resolves in the **caller's** context — the supervisor's — so an agent naming `/proc/self/mem` would receive a handle on the Warden. `RESOLVE_NO_MAGICLINKS` (now actually set) refuses them. Reading the resolved fd's own `/proc/self/fd/N` link to canonicalize is safe: that link is dereferenced by the supervisor on a fd it already holds, not on an agent-named path. |
 | 5 | New-execution-context / privilege surface (unprivileged user namespaces `CLONE_NEWUSER`, `ptrace`, unexpected `execve` helpers) | closed | `clone`/`unshare` scalar-flag filter denies `CLONE_NEWUSER` (and the namespace set) race-free; `setns`/`clone3` hard-denied. `ptrace` hard-denied. `execve`/`execveat` mediated against a supervisor-enforced exec-target allowlist. |
@@ -78,14 +78,28 @@ A policy decision is only as sound as the identity of the object it is made
 about. Through v1.9.3 the Warden decided on the **pathname string** the agent
 supplied and then, separately, opened whatever that string resolved to — two
 steps that could name two different inodes (`..` collapse, a symlink component,
-a `/proc/self` magic link resolving in the supervisor's context). v1.12 collapses
-them: the object is opened **once** with `RESOLVE_NO_SYMLINKS |
-RESOLVE_NO_MAGICLINKS`, its canonical path is read back from the resolved fd, the
-policy decision is made on that canonical path, and *that same fd* is injected
-into the agent. There is no second open, so there is no resolve/decide/deliver
-TOCTOU window, and the object decided on is by construction the object delivered.
-Resolution failure (a symlink component, an over-long path, an untracked dirfd,
-or a deleted inode) is a hard deny before any policy match.
+a `/proc/self` magic link resolving in the supervisor's context). v1.12 collapsed
+them: the object was resolved **once** with `RESOLVE_NO_SYMLINKS |
+RESOLVE_NO_MAGICLINKS`, its canonical path read back from the resolved fd, the
+policy decision made on that canonical path, and *that same fd* injected into the
+agent. Resolution failure (a symlink component, an over-long path, an untracked
+dirfd, or a deleted inode) is a hard deny before any policy match.
+
+**v1.12.1: resolve, decide, then open.** v1.12.0 performed that single
+resolution as a real open with the agent's own flags, before the decision. A
+denied open therefore still had effects: `O_TRUNC` emptied a denied file,
+`O_CREAT` created a root-owned file in a denied directory, and a blocking open
+(a FIFO with no peer) wedged the single-threaded supervisor. v1.12.1 pins the
+object with an `O_PATH` descriptor, which opens nothing, decides on its
+canonical path, and only after ALLOW opens it with the agent's flags **through
+the pinned descriptor** (`/proc/self/fd/N` of the supervisor's own fd), so the
+object decided on is still the object delivered. For `O_CREAT` of a name that
+does not exist, the parent directory is pinned, the decision is made on
+`<canonical parent>/<name>`, and the file is created with
+`openat(parent_fd, name, O_NOFOLLOW)` under the agent's umask. The real open
+adds `O_NONBLOCK` and clears it afterwards unless the agent asked for it, so a
+FIFO or device cannot block the supervisor; opening a FIFO for writing with no
+reader returns `ENXIO` instead of waiting. Asserted by `make test-v1121`.
 
 ## Audit-log integrity
 
@@ -99,3 +113,25 @@ for any byte sequence, and no agent input can begin, end, or fabricate a record.
 The `varek_cyclonedx.py` exporter refuses to emit a BOM from a stream that does
 not parse cleanly line by line, so a corrupted log cannot be laundered into an
 attestation.
+
+**v1.12.1: an authenticated stream.** Escaping stopped forgery *inside* a
+record, but the agent still shared the Warden's stderr, so it could write a
+whole, well-formed record of its own, and the exporter listed the object it
+named as authorized. v1.12.1 closes that:
+
+- The agent's stderr is a pipe the Warden relays line by line with an
+  `[agent] ` prefix and control bytes escaped, so no agent byte can begin a line
+  of the verdict stream, and a `\r` cannot split one.
+- Records go through a private close-on-exec descriptor, fully buffered and
+  flushed once per record, so each record reaches the file in one `write()`.
+- Every record carries a per-run id (128 random bits the agent never sees) and a
+  `seq` counting up from 0; `run_start` and `run_end` records frame the stream.
+- `varek_cyclonedx.py` refuses a stream with no `run_start`, a record with a
+  foreign run id (for example the agent's stdout merged in with `2>&1`), a `seq`
+  gap or repeat, or no `run_end` (unless `--allow-incomplete`). v1.12.0 logs carry
+  no run id and are refused.
+
+Residual: the stream is authenticated against the supervised agent, not signed.
+A party that can edit the log file after the run can still alter it; signing or
+hash-chaining records for third-party verification is future work.
+

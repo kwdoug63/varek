@@ -32,14 +32,17 @@
  *      symmetric-suppression invariant in the patent.
  *
  *   7. Kernel Injection — for path-arg syscalls (openat) Warden
- *      resolves the path itself via openat2(RESOLVE_NO_SYMLINKS |
- *      RESOLVE_NO_MAGICLINKS) and returns the resolved fd through
- *      SECCOMP_IOCTL_NOTIF_ADDFD with SECCOMP_ADDFD_FLAG_SEND. The
+ *      resolves the path itself via openat2(O_PATH, RESOLVE_NO_SYMLINKS |
+ *      RESOLVE_NO_MAGICLINKS), decides, and only after ALLOW opens the
+ *      pinned object with the agent's flags (v1.12.1) and returns that fd
+ *      through SECCOMP_IOCTL_NOTIF_ADDFD with SECCOMP_ADDFD_FLAG_SEND. The
  *      kernel never re-reads the userspace pathname pointer.
  *
  *   8. Pathology Report — every decision is emitted as a JSON record
- *      to the configured sink (stderr by default), with monotonic-
- *      clock decision latency in microseconds.
+ *      to the Warden's stderr, with monotonic-clock decision latency in
+ *      microseconds. v1.12.1: records carry a per-run id and seq, are framed
+ *      by run_start/run_end, and the agent's own stderr is relayed with an
+ *      "[agent] " prefix so it cannot write a record (see log_init()).
  *
  * Trapped syscalls in this reference: openat, connect, execve.
  * The architecture extends to any syscall by adding a new case to
