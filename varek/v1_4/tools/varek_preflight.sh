@@ -4,7 +4,7 @@
 # varek_preflight.sh — check a Warden deployment before you run it (v1.16.1).
 #
 #   tools/varek_preflight.sh <policy> [--log PATH] [--sign-key KEY] [--anchor PATH]
-#                            [--run] [--install-deps]
+#                            [--spool DIR] [--run] [--install-deps]
 #
 # Checks, in order, and prints PASS / WARN / FAIL for each:
 #   1. The Warden and its tools are built and up to date; if not, the build
@@ -26,6 +26,11 @@
 #        --anchor PATH  not a symlink; a regular file (one name), FIFO or
 #                       character device, or a new file in an existing
 #                       directory; the agent cannot open it;
+#                       A FIFO anchor must have its reader (the forwarder,
+#                       tools/varek_anchor_forward.py) running; a regular-file
+#                       anchor on this host is a warning, since this host's root
+#                       could rewrite it;
+#        --spool DIR    the forwarder's spool: the agent must not open it;
 #        with a key or an anchor, the agent must not be able to open a block
 #        device, /dev/mem, /dev/kmem, /dev/port, /proc/kcore, /dev/sg*,
 #        /dev/nvme* or /dev/bsg/*.
@@ -35,7 +40,8 @@
 #      needed), its verdict stream written to a new temporary file (mktemp) in
 #      the --log directory, which must belong to root and not be writable by
 #      others (or be sticky, like /tmp); then the audit of that stream (with
-#      KEY.pub if it exists, and the anchor if it is a regular file). The
+#      KEY.pub if it exists, and the anchor if it is a regular file, or the
+#      forwarder's spool (--spool) for a FIFO anchor). The
 #      temporary file is removed. With --anchor, the trial run's checkpoints
 #      are appended to the real anchor like any run's.
 #
@@ -44,7 +50,7 @@
 set -u
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"          # varek/v1_4
-POLICY="" LOG="" KEY="" ANCHOR="" RUN=0 INSTALL=0
+POLICY="" LOG="" KEY="" ANCHOR="" SPOOL="" RUN=0 INSTALL=0
 usage() { sed -n '6,7p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 need() { [ $# -ge 2 ] && [ -n "$2" ] || { echo "varek_preflight: $1 needs a value" >&2; usage; }; }
 while [ $# -gt 0 ]; do
@@ -52,6 +58,7 @@ while [ $# -gt 0 ]; do
         --log)          need "$@"; LOG="$2"; shift 2 ;;
         --sign-key)     need "$@"; KEY="$2"; shift 2 ;;
         --anchor)       need "$@"; ANCHOR="$2"; shift 2 ;;
+        --spool)        need "$@"; SPOOL="$2"; shift 2 ;;
         --run)          RUN=1; shift ;;
         --install-deps) INSTALL=1; shift ;;
         -h|--help)      usage ;;
@@ -181,7 +188,18 @@ if [ -n "$ANCHOR" ]; then
     elif [ -e "$A" ]; then
         if [ -f "$A" ]; then
             [ "$(stat -c %h "$A")" = 1 ] || { fail "anchor $A has $(stat -c %h "$A") names (hard links): refused"; ok=0; }
-        elif [ -p "$A" ]; then warn "anchor $A is a FIFO: its reader must be running before the Warden starts"
+        elif [ -p "$A" ]; then
+            # The Warden opens the anchor non-blocking for writing, which fails
+            # (ENXIO) when no process has the FIFO open for reading.
+            if python3 -c 'import os,sys
+try:
+    os.close(os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK))
+except OSError:
+    sys.exit(1)' "$A" 2>/dev/null; then
+                pass "anchor FIFO $A has a reader (the forwarder is running)"
+            else
+                fail "anchor FIFO $A has no reader: start the forwarder (tools/varek_anchor_forward.py) first; the Warden refuses it otherwise"; ok=0
+            fi
         elif [ -c "$A" ]; then :
         else fail "anchor $A is not a regular file, FIFO or character device"; ok=0; fi
     else
@@ -194,6 +212,20 @@ if [ -n "$ANCHOR" ]; then
             *)       fail "anchor: the policy lets the agent open ${r#* } (refused)" ;;
         esac
     fi
+    if [ ! -p "$A" ] && [ ! -c "$A" ]; then
+        warn "the anchor is a file on this host: it protects the stream against people who cannot write it, not against this host's root. To anchor off this host, point --anchor at a FIFO read by tools/varek_anchor_forward.py"
+    fi
+fi
+if [ -n "$KEY" ] && { [ -z "$ANCHOR" ] || { [ ! -p "$(abs "$ANCHOR")" ] && [ ! -c "$(abs "$ANCHOR")" ]; }; }; then
+    warn "the signing key and the verdict streams are both on this host: the signatures protect against holders of the logs who are not root here; against this host's root only an off-host anchor helps"
+fi
+if [ -n "$SPOOL" ]; then
+    S="$(abs "$SPOOL")"
+    r="$(openable "$S/anchor.spool")"
+    case "$r" in
+        closed*) pass "forwarder spool ${r#* }: the agent cannot open it" ;;
+        *)       fail "forwarder spool: the policy lets the agent open ${r#* }; keep the spool outside every allowed path" ;;
+    esac
 fi
 if [ -n "$KEY$ANCHOR" ]; then
     raw="$( { find /dev \( -type b -o -type c \) 2>/dev/null | grep -E '^/dev/(mem|kmem|port|sg[^/]*|nvme[^/]*|bsg/.*)$'
@@ -225,6 +257,11 @@ if [ "$RUN" = 1 ]; then
                 aa=(--policy "$POLICY" --checker "$CERT")
                 [ -n "$KEY" ] && [ -f "$(abs "$KEY").pub" ] && aa+=(--pubkey "$(abs "$KEY").pub")
                 [ -n "$ANCHOR" ] && [ -f "$(abs "$ANCHOR")" ] && aa+=(--anchor "$(abs "$ANCHOR")")
+                # A FIFO anchor: the forwarder's spool holds what it received.
+                if [ -n "$ANCHOR" ] && [ -p "$(abs "$ANCHOR")" ] && [ -n "$SPOOL" ]; then
+                    sleep 2
+                    aa+=(--anchor "$(abs "$SPOOL")/anchor.spool")
+                fi
                 o="$($SUDO python3 "$HERE/tools/varek_audit.py" "${aa[@]}" "$T" 2>&1)"
                 if grep -q "varek_audit: PASS" <<<"$o"; then pass "audit: $(grep -o 'integrity: .*' <<<"$o")"
                 else fail "audit of the trial stream: $(grep -m1 -E 'PROBLEM|FAIL' <<<"$o")"; fi

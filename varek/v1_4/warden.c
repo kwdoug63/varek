@@ -1091,7 +1091,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.16.1\","
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.16.2\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
