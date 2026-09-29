@@ -20,10 +20,11 @@ string fragment, and the verdict-distribution harness (synthetic seed corpus).
 Shipped in v1.14.0: the rest of the bounded string fragment (suffix, contains
 and glob matchers, with exact load-time reachability). Shipped in v1.15.0:
 certificates for every authorization, checked in-line by an independent
-checker. Still planned: a customer-derived corpus and measured baseline, a
+checker. v1.16.0 (outside the program) protects the verdict stream against its
+holder and bounds the cost of one decision. Still planned: a customer-derived corpus and measured baseline, a
 formally verified checker, and the v1.11 sequence fragment.
 
-### Planned — v1.10 program (status as of v1.15.0)
+### Planned — v1.10 program (status as of v1.16.0)
 
 - **Verdict-distribution harness.** Measurement and regression gating over a
   corpus of realistic agent action-graphs. Reports the four-cell outcome
@@ -57,6 +58,59 @@ formally verified checker, and the v1.11 sequence fragment.
   fragment's guarantee.
 
 ---
+
+## [1.16.0] - 2026-09-28
+
+Addresses the two limits v1.15.0 disclosed. The verdict stream is hash-chained,
+Ed25519-signed at checkpoints and optionally anchored off the log, so whoever
+holds the log cannot rewrite it undetected; and a policy's globs are capped at
+4,096 tokens, which bounds one decision at about 20 ms in the worst case
+(v1.15: 415 ms).
+
+### Added
+
+- **Hash chain**: every record of a run ends with `"chain"`, SHA-256 of the
+  previous chain value and the record's exact bytes; `chain_{-1}` =
+  SHA-256("VAREK-LOG-CHAIN-1"). run_start carries `"log":"chain-1"`.
+- **Signatures** (`--sign-key FILE`): run_start, a `checkpoint` record every 64
+  decision records (`--checkpoint-every N`) and at least once a second while
+  records are pending, and run_end carry `"sig"`, an Ed25519 signature over
+  "VAREK-LOG-SIG-1" || chain (libsodium). run_start names the public key.
+  Checkpoints are written between notifications. `tools/varek_keygen` makes a
+  key pair (seed file 0600, `.pub`).
+- **External anchor** (`--anchor PATH`, a file, FIFO or character device):
+  each checkpoint-type record is appended as one line, non-blocking; a failed
+  write becomes an `anchor_error` record.
+- **Startup refusals**: a key file that is not a private regular file, a
+  malformed key, or a policy that would let the agent open the key or the
+  anchor (decided by the certificate checker, `vdpc_path_openable`); a FIFO
+  anchor with no reader.
+- **Audit**: `--pubkey` (the stream must be signed by that key) and `--anchor`
+  (every signed record anchored and every anchored record present; any
+  `anchor_error` fails); a complete signed stream must end in a signed
+  run_end; an `integrity:` line (`none`, `chain`, `signed, key not pinned`,
+  `signed`, `signed, anchored`). Signatures are verified by
+  `tools/varek_ed25519.py`, a pure-Python RFC 8032 verifier (canonical
+  encodings, S < L, no small-order key), not by the signing library.
+- The stream parser (exporter and audit) verifies the chain of v1.16 streams;
+  the BOM gains `varek:log.chain` and `varek:log.pubkey`.
+- `vdp_check lint` reports the policy's glob size against the cap.
+- `make test-v1160`; `tests/log_rechain.py` (test helper: recompute the chain,
+  or re-sign, as a log holder would).
+
+### Changed
+
+- **Glob tokens per policy capped at 4,096** (was 65,536) in the decision
+  procedure, the certificate checker and the cross-check's parser.
+  `tests/v1140_bound2_policy.txt` split into `v1140_bound2` and `v1140_bound4`.
+- The certificate checker matches `contains` with `memmem` (linear time).
+- If a record cannot be written to the verdict stream, the Warden stops
+  supervising (the agent is killed) instead of running on unrecorded. With
+  `--anchor`, SIGPIPE is ignored by the Warden (restored for the agent).
+- `run_start` reads `"warden":"1.16.0"`; `require warden 1.16` is accepted.
+- The Warden and `tools/varek_keygen` link libsodium.
+- Regression tests that edit a stream to test the certificate audit
+  (`test_v1150.sh`, `test_v1122.sh`) recompute the chain first.
 
 ## [1.15.0] - 2026-09-28
 

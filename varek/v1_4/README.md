@@ -40,6 +40,8 @@ For each notification, the Warden:
 | `target_demo.c`       | Small workload exercising each trapped syscall path.            |
 | `bench_target.c`      | Workload for driving N trapped syscalls under the supervisor.   |
 | `bench_summarize.py`  | Parses pathology records into percentile latency statistics.    |
+| `checker/`            | v1.15 independent certificate checker.                          |
+| `tools/`              | `vdp_check`, `vdp_cert_check`, `varek_keygen` (v1.16), the audit, the CycloneDX exporter, the cross-check. |
 | `Makefile`            | `make`, `make run-demo`, `make run-bench`, `make check-kernel`. |
 
 ## Requirements
@@ -51,6 +53,8 @@ For each notification, the Warden:
   at startup and refuses to run without it, because it creates the
   target's PID namespace (see below). It also covers reading
   `/proc/<pid>/mem`.
+- libseccomp and, from v1.16, libsodium (`apt install libseccomp-dev
+  libsodium-dev`).
 
 ## Lifecycle coupling (v1.9.3)
 
@@ -213,6 +217,34 @@ tools/varek_audit.py --policy policy.txt --checker tools/vdp_cert_check verdicts
 The audit authenticates the stream, checks the policy file's SHA-256 against
 `run_start`, and re-checks every authorization's certificate. The format and
 the checking rules are specified in `checker/vdp_checker.h`.
+
+A policy's globs may total at most 4,096 tokens (v1.16); with the 4,095-byte
+length bound this bounds the work of one decision (about 20 ms at worst,
+microseconds for real policies). `tools/vdp_check <policy> lint` reports the
+policy's glob size.
+
+## Log integrity (v1.16)
+
+The verdict stream is hash-chained: every record of a run ends with
+`"chain"`, SHA-256 of the previous chain value and the record's bytes. With a
+signing key, run_start, a checkpoint every 64 records (and at least once a
+second) and run_end are signed with Ed25519; with an anchor, each of those is
+also appended to a file, FIFO or device that the log's holder cannot rewrite.
+
+```
+tools/varek_keygen /etc/varek/log.key        # log.key (0600) + log.key.pub
+sudo ./warden policy.txt --sign-key /etc/varek/log.key --anchor /var/varek/anchor \
+    -- ./agent 2> verdicts.log
+tools/varek_audit.py --policy policy.txt --checker tools/vdp_cert_check \
+    --pubkey /etc/varek/log.key.pub --anchor /var/varek/anchor verdicts.log
+```
+
+The Warden refuses to start if the policy would let the agent open the key or
+the anchor. The audit's `integrity:` line says how far the stream is protected
+against its holder (`none`, `chain`, `signed, key not pinned`, `signed`,
+`signed, anchored`). See `RELEASE-v1.16.0.md` for what remains (a key holder
+without an anchor, the unanchored tail of an unfinished run, root on the host
+during the run).
 
 ## Threat model
 

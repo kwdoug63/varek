@@ -1,6 +1,6 @@
 # VAREK — Trusted Computing Base
 
-Version: current as of v1.15.0 · MIT · github.com/kwdoug63/varek
+Version: current as of v1.16.0 · MIT · github.com/kwdoug63/varek
 
 A SATISFIED verdict is only as sound as the components that produce and enforce
 it. This document lists every component in the verification-and-enforcement
@@ -31,7 +31,9 @@ move components leftward — and, above all, to shrink the set that must be trus
 | SMT decision procedure (external backend) | Discharges richer obligations (plan-level and future fragments); serves as the differential oracle for the enforcement procedure | Trusted (not on the enforcement path) | Third-party; solvers have historically shipped soundness bugs. Since v1.13 the Warden does not call it at run time; a solver bug can mask a disagreement in the cross-check but cannot change a live decision. |
 | Warden supervisor (C) | Mediates syscalls; enforces the decision at the boundary | Trusted | Memory-safe-reviewed. v1.9.1 hardened the TOCTOU discipline; v1.9.2 moved the baseline to a default-deny allowlist; v1.9.3 coupled the agent's lifetime to the supervisor's; v1.12 made the Warden decide on the resolved object it delivers and escape all agent-controlled fields in the verdict stream. In external-audit scope. |
 | Evidence exporter (`varek/v1_4/tools/varek_cyclonedx.py`) | Converts the verdict stream to a CycloneDX 1.6 BOM | Trusted | Added in v1.12. Refuses a stream that does not parse cleanly, so a corrupted log cannot become an attestation; output validates against the published CycloneDX 1.6 schema. Its correctness does not affect enforcement, only the exported record. v1.15 adds the policy SHA-256 and each authorization's certificate to the BOM. |
-| Audit tool (`varek/v1_4/tools/varek_audit.py`) | Re-checks a saved verdict stream: authenticates it against the agent, ties it to a policy file by SHA-256, refuses any authorization other than certified file opens and the launch exec, and re-runs the certificate checker on every authorization | Trusted (the Python glue); the decisions it re-checks rest on the certificate checker | Added in v1.15. Does not affect enforcement, and does not protect the log from whoever holds it (no signature). |
+| Audit tool (`varek/v1_4/tools/varek_audit.py`) | Re-checks a saved verdict stream: authenticates it against the agent, ties it to a policy file by SHA-256, refuses any authorization other than certified file opens and the launch exec, and re-runs the certificate checker on every authorization; from v1.16 verifies the hash chain, the signatures against a pinned key and the anchor | Trusted (the Python glue); the decisions it re-checks rest on the certificate checker | Added in v1.15. Does not affect enforcement. v1.16 adds protection against the log's holder (next two rows). |
+| Log signing (libsodium: Ed25519, SHA-256; `warden.c` log chain) | Chains every record and signs run_start, checkpoints and run_end; appends them to the external anchor | Trusted | Added in v1.16. For "the log is the one the Warden wrote", the trusted parts are libsodium (widely deployed and audited), the ~150 lines of chaining and key handling in `warden.c`, and the custody of the key. The chain format is specified in `warden.c` and checked by the audit's own code. The Warden refuses to start when the policy would let the agent open the key or the anchor. |
+| Signature verifier (`varek/v1_4/tools/varek_ed25519.py`) | Verifies the stream's signatures for the audit | Trusted | Added in v1.16. About 100 lines of Python following RFC 8032, written separately from the signer so the audit does not rely on the library that made the signatures. Strict (canonical encodings, S < L, no small-order key). Passes the RFC 8032 vectors and agrees with OpenSSL on the test suite's cases. |
 | Kernel mechanisms (seccomp, PID namespaces, capabilities) | In-kernel enforcement primitives the Warden builds on | Trusted | Out of VAREK's control; relied upon as a platform assumption (see Threat Model §5.3). Landlock is roadmap (v1.10), not wired in. |
 | Build / toolchain | Produces the deployed binaries | Trusted | Planned: reproducible builds so a third party can reproduce the artifact bit-for-bit. |
 
@@ -55,6 +57,18 @@ mitigation strategy, in priority order:
    reproduce both the binary and the verdicts independently.
 4. **External audit** scoped to the *soundness of the verification chain*, not
    only to memory-safety defects.
+
+## Integrity of the record (v1.16)
+
+The asset "the verdict stream reflects the decisions actually made" has two
+adversaries. The supervised agent has been unable to forge, drop or reorder a
+record since v1.12.1 (run id, sequence numbers, relayed stderr). From v1.16 the
+log's holder cannot either, up to what the key and the anchor cover: without
+the key, nothing before the last signature can change and a stream cannot be
+cut short undetected; with an anchor, anchored history cannot change even for
+the key holder. Not covered: records after the last anchored checkpoint of an
+unfinished run, root on the Warden host during the run, and the unchained
+lines (status lines, the agent's relayed stderr, pre-launch plan records).
 
 ## What this does not claim
 

@@ -146,7 +146,16 @@ named as authorized. v1.12.1 closes that:
   gap or repeat, or no `run_end` (unless `--allow-incomplete`). v1.12.0 logs carry
   no run id and are refused.
 
-Residual: the stream is authenticated against the supervised agent, not signed.
-A party that can edit the log file after the run can still alter it; signing or
-hash-chaining records for third-party verification is future work.
+**v1.16: against the log's holder.** Every record is hash-chained (`"chain"`,
+SHA-256 over the previous value and the record's bytes); with `--sign-key`,
+run_start, a checkpoint every 64 records (and at least once a second) and
+run_end are Ed25519-signed; with `--anchor`, those records are also appended
+to storage the holder cannot rewrite. `varek_audit.py --pubkey --anchor`
+verifies all three with its own RFC 8032 verifier. The Warden refuses to start
+if the policy would let the agent open the key or the anchor.
+
+Residual: someone holding the log and the signing key can rewrite whatever was
+not anchored (all of it, without an anchor); root on the Warden host during
+the run can forge records before they are signed; status lines, the agent's
+relayed stderr and pre-launch plan records are not chained.
 

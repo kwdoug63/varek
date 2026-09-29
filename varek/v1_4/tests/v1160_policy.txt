@@ -1,0 +1,10 @@
+# v1.16 regression fixture: a run with enough authorized opens for several
+# checkpoints. The signing key and the anchor live under /tmp/varek_v1160/keys/
+# and /tmp/varek_v1160/anchor*, which this policy does not let the agent open.
+require warden 1.16
+allow path /usr/lib/
+allow path /lib/
+allow path /lib64/
+allow path /etc/ld.so.cache
+deny  path /tmp/varek_v1160/data/secret
+allow path /tmp/varek_v1160/data/ readonly
