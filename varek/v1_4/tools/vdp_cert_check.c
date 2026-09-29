@@ -17,6 +17,14 @@
 //       Read hex strings ('=' for the empty string) from stdin, one per line;
 //       write one line of '0'/'1' per string, one character per rule: does
 //       that rule's constant match, by the checker's own matchers (testing).
+//   vdp_cert_check <policy> openable
+//       v1.16.1: read absolute paths from stdin, one per line. For each, print
+//       "openable <path>" if some open(2) flags value of an open of that path
+//       is decided by an allow rule (the agent could open it), else
+//       "closed <path>". An existing path is first resolved to its canonical
+//       form, as the Warden decides on it. This is the check the Warden makes
+//       at startup for its verdict stream, signing key and anchor
+//       (tools/varek_preflight.sh uses it). Exit 1 if any path is openable.
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -24,6 +32,7 @@
 #include "../checker/vdp_checker.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -106,8 +115,8 @@ static void json_str(const char *s) {
 
 int main(int argc, char **argv) {
     if (argc != 3 || (strcmp(argv[2], "digest") && strcmp(argv[2], "batch") &&
-                      strcmp(argv[2], "holds"))) {
-        fprintf(stderr, "usage: %s <policy> digest|batch|holds\n", argv[0]);
+                      strcmp(argv[2], "holds") && strcmp(argv[2], "openable"))) {
+        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable\n", argv[0]);
         return 2;
     }
     FILE *f = fopen(argv[1], "rb");
@@ -146,6 +155,43 @@ int main(int argc, char **argv) {
     size_t lcap = 0;
     ssize_t n;
     static char s[VDPC_MAX_S + 64];
+    if (!strcmp(argv[2], "openable")) {
+        int any = 0;
+        while ((n = getline(&line, &lcap, stdin)) >= 0) {
+            while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+            if (n == 0) continue;
+            if (line[0] != '/') { printf("error %s (not an absolute path)\n", line); any = 1; continue; }
+            /* An existing path is canonicalized; for one that does not exist
+             * yet (a log file about to be created), its directory is. */
+            char rp[PATH_MAX], dir[PATH_MAX];
+            const char *path = line;
+            if (realpath(line, rp)) {
+                path = rp;
+            } else {
+                char *slash = strrchr(line, '/');
+                size_t dl = (size_t)(slash - line);
+                if (dl > 0 && dl < sizeof dir) {
+                    memcpy(dir, line, dl);
+                    dir[dl] = '\0';
+                    char rd[PATH_MAX];
+                    if (realpath(dir, rd)) {
+                        size_t a = strcmp(rd, "/") ? strlen(rd) : 0, b = strlen(slash);
+                        if (a + b < sizeof rp) {
+                            memcpy(rp, rd, a);
+                            memcpy(rp + a, slash, b + 1);
+                            path = rp;
+                        }
+                    }
+                }
+            }
+            int o = vdpc_path_openable(&pol, path, strlen(path));
+            printf("%s %s\n", o ? "openable" : "closed", path);
+            any |= o;
+        }
+        free(line);
+        vdpc_free(&pol);
+        return any;
+    }
     if (!strcmp(argv[2], "holds")) {
         while ((n = getline(&line, &lcap, stdin)) >= 0) {
             while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';

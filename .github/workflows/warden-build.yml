@@ -1,0 +1,35 @@
+name: Warden build
+
+# v1.16.1: the Warden (varek/v1_4) needs the libseccomp and libsodium
+# development headers. This builds it and its tools with exactly those
+# packages, lints the shipped policies, and runs the preflight check on each
+# (no root: the dependency, build, policy and verdict-stream checks).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build the Warden with libseccomp + libsodium
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libseccomp-dev libsodium-dev
+      - name: Build the Warden and its tools
+        run: make -C varek/v1_4 all
+      - name: Lint the shipped policies
+        run: |
+          for p in varek/v1_4/policy.txt varek/v1_4/conformance_policy.txt varek/v1_4/policies/*.txt; do
+            varek/v1_4/tools/vdp_check "$p" lint
+          done
+      - name: Preflight the shipped policies (verdict stream in /var/log/varek/)
+        run: |
+          for p in varek/v1_4/policy.txt varek/v1_4/conformance_policy.txt varek/v1_4/policies/*.txt; do
+            varek/v1_4/tools/varek_preflight.sh "$p" --log /var/log/varek/verdicts.log
+          done
