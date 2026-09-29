@@ -146,6 +146,10 @@
 #define __NR_pidfd_getfd 438
 #endif
 
+#ifndef VAREK_AT_FDCWD
+#define VAREK_AT_FDCWD (-100)
+#endif
+
 struct open_how_local {
     uint64_t flags;
     uint64_t mode;
@@ -181,8 +185,16 @@ typedef enum {
     ACT_NET_CONNECT,
     ACT_NET_SEND,        /* v1.12: sendto/sendmsg egress */
     ACT_PROCESS_EXEC,
+    ACT_FILE_STAT,       /* v1.17.0: newfstatat, statx */
+    ACT_FILE_ACCESS,     /* v1.17.0: access, faccessat, faccessat2 */
+    ACT_FILE_READLINK,   /* v1.17.0: readlink, readlinkat */
     ACT_OTHER,
 } action_kind_t;
+
+/* v1.17.0: the metadata and link lookups, mediated like opens. */
+static bool is_meta_kind(action_kind_t k) {
+    return k == ACT_FILE_STAT || k == ACT_FILE_ACCESS || k == ACT_FILE_READLINK;
+}
 
 struct action {
     action_kind_t kind;
@@ -201,6 +213,14 @@ struct action {
     char          check_why[160];       /* v1.15: why the checker refused it */
     int           connect_family;
     int           connect_port;
+    /* v1.17.0: metadata lookups */
+    int           meta_nr;              /* the system call */
+    uint64_t      out_addr;             /* where the answer goes in the agent */
+    uint64_t      out_len;              /* readlink's buffer size */
+    int           at_flags;             /* AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH, ... */
+    unsigned      statx_mask;
+    int           access_mode;          /* F_OK/R_OK/W_OK/X_OK */
+    bool          path_null;            /* a NULL path pointer */
 };
 
 static const char *action_kind_name(action_kind_t k) {
@@ -209,6 +229,9 @@ static const char *action_kind_name(action_kind_t k) {
         case ACT_NET_CONNECT:  return "net.connect";
         case ACT_NET_SEND:     return "net.send";
         case ACT_PROCESS_EXEC: return "process.exec";
+        case ACT_FILE_STAT:     return "file.stat";
+        case ACT_FILE_ACCESS:   return "file.access";
+        case ACT_FILE_READLINK: return "file.readlink";
         case ACT_OTHER:        return "other";
     }
     return "invalid";
@@ -522,6 +545,72 @@ static int derive_intent(const struct seccomp_notif *req,
             snprintf(out->target, sizeof(out->target), "<no-dest>");
         return 0;
     }
+    /* v1.17.0: metadata and link lookups. Through v1.16.3 these were admitted
+     * outright and never logged, so an agent could learn that any file
+     * existed, its size and owner, and read where any link (including the
+     * Warden's own /proc/<pid>/fd entries) pointed, with no record. They are
+     * now decided like a read-only open of the same object. */
+    if (nr == __NR_newfstatat || nr == __NR_statx || nr == __NR_access ||
+        nr == __NR_faccessat || nr == __NR_faccessat2 ||
+        nr == __NR_readlink || nr == __NR_readlinkat) {
+        uint64_t pathaddr = 0;
+        int dfd = VAREK_AT_FDCWD;
+        out->meta_nr = nr;
+        switch (nr) {
+            case __NR_newfstatat:
+                out->kind = ACT_FILE_STAT;
+                dfd = (int)req->data.args[0]; pathaddr = req->data.args[1];
+                out->out_addr = req->data.args[2]; out->at_flags = (int)req->data.args[3];
+                break;
+            case __NR_statx:
+                out->kind = ACT_FILE_STAT;
+                dfd = (int)req->data.args[0]; pathaddr = req->data.args[1];
+                out->at_flags = (int)req->data.args[2];
+                out->statx_mask = (unsigned)req->data.args[3];
+                out->out_addr = req->data.args[4];
+                break;
+            case __NR_access:
+                out->kind = ACT_FILE_ACCESS;
+                pathaddr = req->data.args[0]; out->access_mode = (int)req->data.args[1];
+                break;
+            case __NR_faccessat:
+                out->kind = ACT_FILE_ACCESS;
+                dfd = (int)req->data.args[0]; pathaddr = req->data.args[1];
+                out->access_mode = (int)req->data.args[2];
+                break;
+            case __NR_faccessat2:
+                out->kind = ACT_FILE_ACCESS;
+                dfd = (int)req->data.args[0]; pathaddr = req->data.args[1];
+                out->access_mode = (int)req->data.args[2];
+                out->at_flags = (int)req->data.args[3];
+                break;
+            case __NR_readlink:
+                out->kind = ACT_FILE_READLINK;
+                pathaddr = req->data.args[0];
+                out->out_addr = req->data.args[1]; out->out_len = req->data.args[2];
+                break;
+            default: /* __NR_readlinkat */
+                out->kind = ACT_FILE_READLINK;
+                dfd = (int)req->data.args[0]; pathaddr = req->data.args[1];
+                out->out_addr = req->data.args[2]; out->out_len = req->data.args[3];
+                break;
+        }
+        out->open_dirfd = dfd;
+        if (pathaddr == 0) {
+            out->path_null = true;
+            out->target[0] = '\0';
+        } else if (xproc_read_str(req->pid, pathaddr, out->target, sizeof(out->target)) < 0) {
+            return -1;
+        }
+        /* Decided as the open that would reveal the same thing: a read, or
+         * for access(W_OK) a write. */
+        int m = out->access_mode & (R_OK | W_OK);
+        out->open_flags = out->kind == ACT_FILE_ACCESS && m == W_OK ? O_WRONLY
+                        : out->kind == ACT_FILE_ACCESS && m == (R_OK | W_OK) ? O_RDWR
+                        : O_RDONLY;
+        out->flags_known = true;
+        return 0;
+    }
     if (nr == __NR_execve || nr == __NR_execveat) {
         out->kind = ACT_PROCESS_EXEC;
         uint64_t pathaddr = (nr == __NR_execve)
@@ -554,6 +643,9 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
     const char *s;
     switch (a->kind) {
         case ACT_FILE_OPEN:
+        case ACT_FILE_STAT:
+        case ACT_FILE_ACCESS:
+        case ACT_FILE_READLINK:
             kind = VDP_KIND_PATH;
             s = a->resolved;
             if (s[0] == '\0') { a->why = "no_resolved_path"; return DEC_UNKNOWN; }
@@ -567,7 +659,7 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
     int ri;
     vdp_why_t why;
     vdp_verdict_t v = vdp_decide(&p->v, kind, s, (uint32_t)a->open_flags,
-                                 a->kind == ACT_FILE_OPEN && a->flags_known,
+                                 kind == VDP_KIND_PATH && a->flags_known,
                                  &ri, &why);
     a->why = vdp_why_name(why);
     a->rule_index = ri;
@@ -607,7 +699,10 @@ static bool certify(const struct policy *p, struct action *a) {
     int kind;
     const char *s;
     switch (a->kind) {
-        case ACT_FILE_OPEN:    kind = VDPC_PATH; s = a->resolved; break;
+        case ACT_FILE_OPEN:
+        case ACT_FILE_STAT:
+        case ACT_FILE_ACCESS:
+        case ACT_FILE_READLINK: kind = VDPC_PATH; s = a->resolved; break;
         case ACT_NET_CONNECT:  kind = VDPC_HOST; s = a->target;   break;
         case ACT_PROCESS_EXEC: kind = VDPC_EXEC; s = a->target;   break;
         default:
@@ -630,7 +725,7 @@ static bool certify(const struct policy *p, struct action *a) {
         cc.span[k][0] = vc.span[k][0];
         cc.span[k][1] = vc.span[k][1];
     }
-    bool has_flags = a->kind != ACT_FILE_OPEN || a->flags_known;
+    bool has_flags = kind != VDPC_PATH || a->flags_known;
     /* The certificate as recorded, as flat fields (no nested object, so a
      * consumer that reads records as flat JSON objects keeps working):
      * "cert_rule" the rule index, "cert_witness" the witness. */
@@ -1144,7 +1239,7 @@ static void emit_pathology(uint64_t seq,
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     char flags_json[16] = "";
-    if (a->kind == ACT_FILE_OPEN && a->flags_known)
+    if ((a->kind == ACT_FILE_OPEN || is_meta_kind(a->kind)) && a->flags_known)
         snprintf(flags_json, sizeof flags_json, "0x%x", (unsigned)a->open_flags);
     /* v1.12: target and resolved are escaped via json_escape(); every other
      * field is drawn from a fixed enum or an integer, so the whole record is
@@ -1224,9 +1319,7 @@ static void send_errno(int notify_fd, uint64_t id, int err) {
 }
 
 /* v1.12 AT_FDCWD constant (avoid pulling a divergent libc definition). */
-#ifndef VAREK_AT_FDCWD
-#define VAREK_AT_FDCWD (-100)
-#endif
+
 
 /* v1.12.1: resolve without side effects, decide, THEN open.
  *
@@ -1664,6 +1757,227 @@ static int inject_fd(int notify_fd, uint64_t id, int resolved)
     return ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd) < 0 ? -1 : 0;
 }
 
+/* ---------------- v1.17.0: metadata and link lookups ---------------- */
+
+/* The directories that lead to what an allow rule names: for `allow path
+ * /usr/lib/python3/`, the directories /, /usr, /usr/lib and /usr/lib/python3.
+ * A path rule's literal start is its constant (prefix, exact) or the part of a
+ * glob before its first wildcard; suffix and contains rules have none. The
+ * policy already says these exist, so a read-type lookup on one of them
+ * (stat, access(F_OK/R_OK), and readlink, which on a directory only says
+ * EINVAL) is answered without a policy decision. Without
+ * this, realpath() and the like fail on every allowed path, because each
+ * component's lstat/readlink would be refused. */
+#define MAX_ANCESTORS 2048
+static char  *g_ancestors[MAX_ANCESTORS];
+static size_t g_nancestors = 0;
+
+static void add_ancestor(const char *s, size_t n) {
+    if (n == 0) { s = "/"; n = 1; }
+    for (size_t i = 0; i < g_nancestors; i++)
+        if (strlen(g_ancestors[i]) == n && !memcmp(g_ancestors[i], s, n)) return;
+    if (g_nancestors < MAX_ANCESTORS) {
+        char *c = strndup(s, n);
+        if (c) g_ancestors[g_nancestors++] = c;
+    }
+}
+
+static void load_ancestors(const struct policy *p) {
+    for (size_t r = 0; r < p->v.n; r++) {
+        const vdp_rule_t *ru = &p->v.rules[r];
+        if (ru->verb != VDP_ALLOW || ru->kind != VDP_KIND_PATH) continue;
+        size_t lit = 0;
+        if (ru->s.op == VDP_STR_PREFIX || ru->s.op == VDP_STR_EQ) lit = ru->s.len;
+        else if (ru->s.op == VDP_STR_GLOB)
+            while (lit < ru->s.len && !strchr("*?[\\", ru->s.c[lit])) lit++;
+        else continue;
+        if (lit == 0 || ru->s.c[0] != '/') continue;
+        /* Every directory strictly before the last '/' of the literal part,
+         * plus the literal itself when it ends in '/' (the named directory). */
+        for (size_t i = 1; i <= lit; i++)
+            if (i == lit ? ru->s.c[i - 1] == '/' : ru->s.c[i] == '/')
+                add_ancestor(ru->s.c, i == lit ? i - 1 : i);
+        add_ancestor("/", 1);
+    }
+}
+
+static bool is_ancestor(const char *canon) {
+    for (size_t i = 0; i < g_nancestors; i++)
+        if (!strcmp(g_ancestors[i], canon)) return true;
+    return false;
+}
+
+
+static void send_value(int notify_fd, uint64_t id, int64_t val) {
+    struct seccomp_notif_resp resp = { .id = id, .val = val, .error = 0, .flags = 0 };
+    ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);
+}
+
+/* Write an answer into the agent's memory. /proc/<pid>/mem is opened first
+ * and the notification checked second, so the descriptor cannot belong to a
+ * process that reused the pid of one that died. Returns 0 or -errno. */
+static int xproc_write(pid_t pid, int notify_fd, uint64_t id,
+                       uint64_t addr, const void *buf, size_t len) {
+    if (addr == 0) return -EFAULT;
+    char p[64];
+    snprintf(p, sizeof(p), "/proc/%d/mem", pid);
+    int fd = open(p, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return -EFAULT;
+    if (!notif_id_valid(notify_fd, id)) { close(fd); return -ESRCH; }
+    ssize_t n = pwrite(fd, buf, len, (off_t)addr);
+    close(fd);
+    return n == (ssize_t)len ? 0 : -EFAULT;
+}
+
+/* One of the agent's own descriptors, duplicated into the supervisor (the
+ * supervisor is not under the agent's filter, so pidfd_getfd is open to it).
+ * AT_FDCWD is the agent's working directory. Returns a descriptor or -errno. */
+static int agent_fd(pid_t tid, int fd) {
+    if (fd == VAREK_AT_FDCWD) {
+        char p[64];
+        snprintf(p, sizeof(p), "/proc/%d/cwd", tid);
+        int r = open(p, O_PATH | O_DIRECTORY | O_CLOEXEC);
+        return r < 0 ? -EBADF : r;
+    }
+    if (fd < 0) return -EBADF;
+    pid_t tgid = task_tgid(tid);
+    if (tgid < 0) return -ESRCH;
+    int pfd = (int)syscall(__NR_pidfd_open, tgid, 0);
+    if (pfd < 0) return -ESRCH;
+    int r = (int)syscall(__NR_pidfd_getfd, pfd, fd, 0);
+    int e = errno;
+    close(pfd);
+    (void)e;
+    return r < 0 ? -EBADF : r;
+}
+
+/* Answer the lookup on an object the supervisor holds. Returns the system
+ * call's return value (>= 0) or -errno. */
+static int64_t meta_answer(pid_t tid, int notify_fd, uint64_t id,
+                           const struct action *a, int ofd) {
+    if (a->kind == ACT_FILE_STAT) {
+        if (a->meta_nr == __NR_statx) {
+            struct statx stx;
+            memset(&stx, 0, sizeof stx);
+            if (syscall(__NR_statx, ofd, "", AT_EMPTY_PATH | (a->at_flags & AT_STATX_SYNC_TYPE),
+                        a->statx_mask, &stx) < 0)
+                return -errno;
+            int w = xproc_write(tid, notify_fd, id, a->out_addr, &stx, sizeof stx);
+            return w < 0 ? w : 0;
+        }
+        struct stat st;
+        if (fstatat(ofd, "", &st, AT_EMPTY_PATH) < 0) return -errno;
+        int w = xproc_write(tid, notify_fd, id, a->out_addr, &st, sizeof st);
+        return w < 0 ? w : 0;
+    }
+    if (a->kind == ACT_FILE_ACCESS) {
+        /* What the agent may do is what the policy lets the Warden do on its
+         * behalf (decided above). Nothing may be executed after the launch
+         * (deny-only), so X_OK is refused. */
+        if (a->access_mode & ~(F_OK | R_OK | W_OK | X_OK)) return -EINVAL;
+        if (a->access_mode & X_OK) return -EACCES;
+        return 0;
+    }
+    /* readlink */
+    if ((int64_t)a->out_len <= 0) return -EINVAL;
+    struct stat lst;
+    if (fstat(ofd, &lst) < 0) return -errno;
+    if (!S_ISLNK(lst.st_mode)) return -EINVAL;     /* what readlink says of a non-link */
+    char buf[PATH_LIMIT];
+    size_t want = a->out_len < sizeof buf ? (size_t)a->out_len : sizeof buf;
+    ssize_t n = readlinkat(ofd, "", buf, want);
+    if (n < 0) return -errno;
+    int w = xproc_write(tid, notify_fd, id, a->out_addr, buf, (size_t)n);
+    return w < 0 ? w : n;
+}
+
+/* The lookup's own object, when it names one the agent already holds (an
+ * empty path with AT_EMPTY_PATH, or readlinkat(fd, "")): answered without a
+ * policy decision, like read() on that descriptor. 1 if handled here. */
+static int meta_on_held_fd(pid_t tid, int notify_fd, uint64_t id, const struct action *a) {
+    bool empty_ok = (a->kind == ACT_FILE_STAT || a->meta_nr == __NR_faccessat2)
+                        ? (a->at_flags & AT_EMPTY_PATH) != 0
+                        : a->meta_nr == __NR_readlinkat;
+    if (a->target[0] != '\0') return 0;
+    if (!empty_ok) {                         /* an empty path names nothing */
+        send_errno(notify_fd, id, a->path_null ? EFAULT : ENOENT);
+        return 1;
+    }
+    int ofd = agent_fd(tid, a->open_dirfd);
+    if (ofd < 0) { send_errno(notify_fd, id, (int)-ofd); return 1; }
+    int64_t r = meta_answer(tid, notify_fd, id, a, ofd);
+    close(ofd);
+    if (r < 0) send_errno(notify_fd, id, (int)-r);
+    else       send_value(notify_fd, id, r);
+    return 1;
+}
+
+/* Resolve the object a lookup names, without following a trailing symlink
+ * when the call says not to (lstat, readlink). On success *ofd is an O_PATH
+ * descriptor and a->resolved its canonical path. When the object does not
+ * exist, *ofd is -1, a->resolved is <canonical parent>/<name> and *missing is
+ * the errno the agent's own call would have seen, so the decision is made on
+ * where it would be. Returns 0, or -1 to fail closed. */
+static int resolve_meta(pid_t tid, struct action *a, int *ofd, int *missing) {
+    *ofd = -1;
+    *missing = 0;
+    a->resolved[0] = '\0';
+    pid_t tgid = -1;
+    char path[PATH_LIMIT];
+    bool thread_self = false;
+    if (path_is_proc_self(a->target, &thread_self)) {
+        tgid = task_tgid(tid);
+        if (tgid < 0 || rewrite_proc_self(a->target, thread_self, tgid, tid,
+                                          path, sizeof(path)) < 0)
+            return -1;
+    } else if ((size_t)snprintf(path, sizeof(path), "%s", a->target) >= sizeof(path)) {
+        return -1;
+    }
+    int base = agent_fd(tid, path[0] == '/' ? VAREK_AT_FDCWD : a->open_dirfd);
+    if (base < 0) return -1;
+    bool nofollow = a->kind == ACT_FILE_READLINK ||
+                    (a->kind == ACT_FILE_STAT && (a->at_flags & AT_SYMLINK_NOFOLLOW)) ||
+                    (a->kind == ACT_FILE_ACCESS && (a->at_flags & AT_SYMLINK_NOFOLLOW));
+    int fd = openat2_path(base, path, nofollow ? (uint64_t)O_NOFOLLOW : 0);
+    if (fd >= 0) {
+        close(base);
+        if (fd_canonical_path(fd, a->resolved, sizeof(a->resolved)) < 0 ||
+            check_proc_object(fd, tid, &tgid, a->resolved, sizeof(a->resolved)) < 0) {
+            a->resolved[0] = '\0';
+            close(fd);
+            return -1;
+        }
+        *ofd = fd;
+        return 0;
+    }
+    int e = errno;
+    if (e != ENOENT && e != ENOTDIR) { close(base); return -1; }
+    /* Not there: decide on where it would be. */
+    size_t tl = strlen(path);
+    while (tl > 1 && path[tl - 1] == '/') path[--tl] = '\0';
+    const char *slash = strrchr(path, '/');
+    const char *name = slash ? slash + 1 : path;
+    if (!*name || !strcmp(name, ".") || !strcmp(name, "..")) { close(base); return -1; }
+    char dir[PATH_LIMIT];
+    if (!slash)             snprintf(dir, sizeof(dir), ".");
+    else if (slash == path) snprintf(dir, sizeof(dir), "/");
+    else                    snprintf(dir, sizeof(dir), "%.*s", (int)(slash - path), path);
+    int pfd = openat2_path(base, dir, (uint64_t)O_DIRECTORY);
+    close(base);
+    if (pfd < 0) return -1;              /* the parent is missing too: fail closed */
+    char parent[PATH_LIMIT];
+    int rc = -1;
+    if (fd_canonical_path(pfd, parent, sizeof(parent)) == 0 &&
+        check_proc_object(pfd, tid, &tgid, parent, sizeof(parent)) == 0) {
+        int n = snprintf(a->resolved, sizeof(a->resolved), "%s%s%s",
+                         parent, strcmp(parent, "/") ? "/" : "", name);
+        if (n > 0 && (size_t)n < sizeof(a->resolved)) { *missing = e; rc = 0; }
+        else a->resolved[0] = '\0';
+    }
+    close(pfd);
+    return rc;
+}
+
 /* ---------------- receive loop ---------------- */
 
 static volatile sig_atomic_t g_stop = 0;
@@ -1756,6 +2070,94 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             emit_pathology(seq++, req.pid, &act, DEC_ALLOW, DEC_ALLOW,
                            "bootstrap_exec_allow", lat_b, 0);
             send_simple(notify_fd, req.id, DEC_ALLOW);
+            continue;
+        }
+
+        /* v1.17.0: metadata and link lookups (stat, statx, access, readlink):
+         * resolved like an open, refused by identity if protected, decided as
+         * a read-only open of the same object (access(W_OK) as a write),
+         * certified, recorded, and answered by the Warden itself. A lookup on
+         * a descriptor the agent already holds is answered without a
+         * decision, like read() on it. A name that does not exist is decided
+         * on where it would be: ENOENT inside the policy, EACCES outside, so
+         * the lookup no longer tells the agent what exists elsewhere. */
+        if (is_meta_kind(act.kind)) {
+            if (meta_on_held_fd(req.pid, notify_fd, req.id, &act)) continue;
+            int mfd = -1, missing = 0;
+            const char *mforbid = NULL;
+            if (resolve_meta(req.pid, &act, &mfd, &missing) < 0) {
+                mforbid = "resolution_failed";
+            } else if (mfd >= 0) {
+                const char *f = forbidden_object(mfd, act.resolved);
+                if (f && strcmp(f, "raw_device") != 0) mforbid = f;   /* stat of a disk is harmless */
+            }
+            if (mforbid) {
+                if (mfd >= 0) close(mfd);
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                uint64_t lat_m = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
+                               + (t1.tv_nsec - t0.tv_nsec);
+                emit_pathology(seq++, req.pid, &act,
+                               strcmp(mforbid, "resolution_failed") ? DEC_DENY : DEC_UNKNOWN,
+                               DEC_DENY, mforbid, lat_m, EACCES);
+                send_simple(notify_fd, req.id, DEC_DENY);
+                continue;
+            }
+            /* A directory the policy's allow rules lead to: a read-type
+             * lookup is answered without a decision (see load_ancestors). */
+            if (mfd >= 0 &&
+                !(act.kind == ACT_FILE_ACCESS && (act.access_mode & (W_OK | X_OK)))) {
+                struct stat ast;
+                if (fstat(mfd, &ast) == 0 && S_ISDIR(ast.st_mode) && is_ancestor(act.resolved)) {
+                    int64_t r = meta_answer(req.pid, notify_fd, req.id, &act, mfd);
+                    close(mfd);
+                    if (r < 0) send_errno(notify_fd, req.id, (int)-r);
+                    else       send_value(notify_fd, req.id, r);
+                    clock_gettime(CLOCK_MONOTONIC, &t1);
+                    uint64_t lat_a = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
+                                   + (t1.tv_nsec - t0.tv_nsec);
+                    emit_pathology(seq++, req.pid, &act, DEC_ALLOW, DEC_ALLOW,
+                                   "metadata_ancestor", lat_a, r < 0 ? (int)-r : 0);
+                    continue;
+                }
+            }
+            decision_t m_raw   = policy_decide(p, &act);
+            decision_t m_final = (m_raw == DEC_ALLOW) ? DEC_ALLOW : DEC_DENY;
+            bool m_cert_refused = false;
+            if (m_final == DEC_ALLOW && !certify(p, &act)) {
+                m_final = DEC_DENY;
+                m_cert_refused = true;
+                log_line_start();
+                fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n",
+                        g_records, act.check_why);
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            if (m_final != DEC_ALLOW) {
+                if (mfd >= 0) close(mfd);
+                uint64_t lat_m = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
+                               + (t1.tv_nsec - t0.tv_nsec);
+                emit_pathology(seq++, req.pid, &act, m_raw, m_final,
+                               m_cert_refused ? "certificate_refused" : decision_rule_id(&act, m_raw),
+                               lat_m, EACCES);
+                send_simple(notify_fd, req.id, DEC_DENY);
+                continue;
+            }
+            int64_t r;
+            const char *rule;
+            if (mfd < 0) {
+                r = -missing;
+                rule = "metadata_not_found";
+            } else {
+                r = meta_answer(req.pid, notify_fd, req.id, &act, mfd);
+                close(mfd);
+                rule = r < 0 ? "metadata_failed" : "metadata_answered";
+            }
+            if (r < 0) send_errno(notify_fd, req.id, (int)-r);
+            else       send_value(notify_fd, req.id, r);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            uint64_t lat_m = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
+                           + (t1.tv_nsec - t0.tv_nsec);
+            emit_pathology(seq++, req.pid, &act, m_raw, m_final, rule, lat_m,
+                           r < 0 ? (int)-r : 0);
             continue;
         }
 
@@ -2244,6 +2646,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     load_raw_char_majors();                 /* v1.17.0 */
+    load_ancestors(&p);                     /* v1.17.0 */
     if (refuse_exposed_stream(&p) < 0) return 1;
     if (key_path && load_sign_key(key_path, &p) < 0) return 1;
     if (anchor_path && open_anchor(anchor_path, &p) < 0) return 1;

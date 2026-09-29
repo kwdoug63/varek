@@ -68,10 +68,14 @@ static const char *kAdmit[] = {
     // file I/O on already-authorized fds (provenance enforced by the supervisor
     // via fd injection; openat itself is mediated below)
     "read", "write", "readv", "writev", "pread64", "pwrite64", "preadv2",
-    "pwritev2", "close", "close_range", "lseek", "fstat", "newfstatat", "statx",
+    "pwritev2", "close", "close_range", "lseek", "fstat",
     "fsync", "fdatasync", "dup", "dup3", "fcntl", "pipe2", "eventfd2",
-    "getdents64", "getcwd", "readlink", "readlinkat",
-    "access", "faccessat", "faccessat2",
+    "getdents64", "getcwd",
+    // v1.17.0: newfstatat, statx, readlink, readlinkat, access, faccessat and
+    // faccessat2 are NO LONGER admitted. They reveal whether any file exists,
+    // its size, owner and times, and where any link points (including the
+    // Warden's own /proc/<pid>/fd entries), and they were never logged. They
+    // are mediated below and decided like a read-only open.
     // poll / wait
     "ppoll", "poll", "pselect6", "select",
     // v1.12.2: collecting a child's exit status. Through v1.12.1 an agent could
@@ -111,14 +115,18 @@ static const char *kAdmit[] = {
     NULL
 };
 
-// MEDIATE -> NOTIFY: EXACTLY the four supervise()/derive_intent() handles.
+// MEDIATE -> NOTIFY: exactly what supervise()/derive_intent() handles.
 static const char *kMediate[] = {
     "openat", "connect", "execve", "execveat",
     // v1.12: egress-capable datagram/message sends. Routed to the supervisor
     // so a send carrying an inet destination is subject to the same deny-only
     // network posture as connect, closing the sendto/sendmsg egress bypass
     // (bypass-classes.md class 3).
-    "sendto", "sendmsg", NULL
+    "sendto", "sendmsg",
+    // v1.17.0: metadata and link lookups, decided like a read-only open and
+    // answered by the supervisor (warden.c: meta_answer).
+    "newfstatat", "statx", "readlink", "readlinkat",
+    "access", "faccessat", "faccessat2", NULL
 };
 
 // HARD-DENY: never admissible (classes 3-6). KILL in strict mode, even in
