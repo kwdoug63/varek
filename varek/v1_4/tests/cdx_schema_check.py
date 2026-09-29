@@ -18,7 +18,7 @@ import sys
 
 def main(paths):
     try:
-        import rfc3987  # noqa: F401  (enables "uri" format checking in jsonschema)
+        import rfc3986_validator  # noqa: F401  (enables "uri" format checking in jsonschema)
         from cyclonedx.schema import SchemaVersion
         from cyclonedx.validation.json import JsonStrictValidator
     except ImportError as e:
