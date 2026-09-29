@@ -256,6 +256,7 @@ second) and run_end are signed with Ed25519; with an anchor, each of those is
 also appended to a file, FIFO or device that the log's holder cannot rewrite.
 
 ```
+make                                         # builds tools/varek_keygen too
 tools/varek_keygen /etc/varek/log.key        # log.key (0600) + log.key.pub
 sudo ./warden policy.txt --sign-key /etc/varek/log.key --anchor /var/varek/anchor \
     -- ./agent 2> verdicts.log
@@ -269,6 +270,38 @@ against its holder (`none`, `chain`, `signed, key not pinned`, `signed`,
 `signed, anchored`). See `RELEASE-v1.16.0.md` for what remains (a key holder
 without an anchor, the unanchored tail of an unfinished run, root on the host
 during the run).
+
+## Off-host anchor (v1.16.2)
+
+An anchor file on the Warden's own host does not protect against that host's
+root, who also holds the signing key. To close that, send the anchor to a
+second machine the Warden host's root cannot administer, as it is written:
+
+1. **On the Warden host** (as root): make the forwarder's SSH key
+   (`ssh-keygen -t ed25519 -N '' -f /etc/varek/anchor_ssh_key`).
+2. **On the anchor host** (any small Linux server, as root):
+   `tools/varek_anchor_receiver.sh --name <warden-host> --pubkey '<contents of
+   anchor_ssh_key.pub>'`. It creates an account whose only access is to append
+   well-formed anchor lines to an append-only (`chattr +a`) file, and prints
+   the host key's fingerprint.
+   Then, **on the Warden host**: pin the anchor host's key
+   (`ssh-keyscan -t ed25519 <anchor-host> > /etc/varek/anchor_known_hosts`,
+   and compare `ssh-keygen -lf` of it with the printed fingerprint), install
+   `tools/systemd/varek-anchor-forward.service` with the anchor host's name,
+   and `systemctl enable --now varek-anchor-forward`.
+3. **Run the Warden** with `--anchor /run/varek/anchor.fifo`. The forwarder
+   sends each checkpoint within about a second, spools through outages, and
+   resends after restarts.
+4. **Check it**: `tools/varek_preflight.sh <policy> --log ... --sign-key ...
+   --anchor /run/varek/anchor.fifo --spool /var/lib/varek/anchor-spool --run`.
+5. **Audit** with the anchor host's copy: copy
+   `/srv/varek-anchor/<warden-host>.anchor.log` from the anchor host (not through
+   the forwarder's key, which can only append) and pass it as `--anchor`.
+
+Who can do what, afterwards: someone who holds the logs but not the key can
+change nothing before the last signature; this host's root, who holds the key,
+can change nothing that reached the anchor host; the anchor host's root can
+lift the append-only attribute, so keep that machine under separate control.
 
 ## Threat model
 

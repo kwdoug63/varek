@@ -80,11 +80,16 @@ says so and gives the preflight command.
 ```sh
 cd varek/v1_4
 make deps                                    # once, if headers are missing (sudo)
+make                                         # build first: varek_keygen is built here
+mkdir -p /var/log/varek /etc/varek
 tools/varek_keygen /etc/varek/log.key        # once, if you sign
 tools/varek_preflight.sh policies/finance.policy.txt \
     --log /var/log/varek/verdicts.log --sign-key /etc/varek/log.key \
     --anchor /var/log/varek/anchor.log --run
 ```
+
+(Corrected in v1.16.2: the first version of these notes ran `varek_keygen`
+before anything had built it.)
 
 **Scope.** The preflight applies the Warden's rules to each location; the
 Warden's own check still runs on every start.

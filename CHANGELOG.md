@@ -59,6 +59,38 @@ formally verified checker, and the v1.11 sequence fragment.
 
 ---
 
+## [1.16.2] - 2026-09-28
+
+The off-host anchor. An anchor file on the Warden's own host does not protect
+against that host's root, who also holds the signing key; this release ships
+the pieces to anchor on a second machine as records are written. No change to
+decisions, records or the policy grammar.
+
+### Added
+
+- `tools/varek_anchor_forward.py`: reads the Warden's anchor FIFO (creating it
+  and holding it open), spools every well-formed anchor line locally, and sends
+  it off-host (`--ssh USER@HOST` with a dedicated key and pinned host key, or
+  `--exec COMMAND`), retrying with backoff; at-least-once delivery, resumes
+  after restarts.
+- `tools/varek_anchor_receiver.sh`: sets up the anchor host: an account whose
+  SSH key has one forced command appending well-formed anchor lines to a
+  `chattr +a` file (no shell, forwarding or other command).
+- `tools/systemd/varek-anchor-forward.service`.
+- Preflight: a FIFO anchor must have a reader (FAIL otherwise); `--spool DIR`;
+  a trial run with a FIFO anchor is audited against the spool; warnings for a
+  local-file anchor and for a signing key with no off-host anchor.
+- `make test-v1162`.
+
+### Fixed
+
+- The command order in `RELEASE-v1.16.1.md` and `varek/v1_4/README.md`:
+  `varek_keygen` was run before anything built it.
+
+### Changed
+
+- `run_start` reads `"warden":"1.16.2"`.
+
 ## [1.16.1] - 2026-09-28
 
 Deployment preflight for v1.16.0's two new requirements: the verdict stream
