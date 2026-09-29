@@ -55,6 +55,11 @@ typedef struct plan_breaker_result {
     unsigned    budget;            /* effective budget (0 == breaker disabled) */
     const char *terminal_action;   /* non-NULL iff outcome == TERMINAL_ACTION */
     bool        latched;           /* signature is now in a terminal state */
+    /* v1.19.0: the session's count, across every plan it submitted. */
+    unsigned    session_refusals;  /* refused submissions counted in this session */
+    unsigned    session_budget;    /* session_refusal_budget (0 == no session limit) */
+    bool        session_exhausted; /* the session's limit is spent: every refused
+                                      submission in it is now terminal */
 } plan_breaker_result_t;
 
 /* Opaque per-Warden breaker state. Holds the (session, signature) ->
@@ -113,6 +118,22 @@ uint64_t plan_breaker_signature_graph(const plan_action_desc_t *actions,
  * signature latches: every later non-SATISFIED submission of the same
  * signature returns the same terminal outcome without re-counting.
  *
+ * v1.19.0, the session's limit. refusal_budget bounds resubmissions of ONE
+ * signature, so a planner that changed one step each time started a new
+ * count every time. The breaker now also counts, per session, every refused
+ * submission (UNSATISFIED or UNKNOWN) that is not a replay of an already
+ * latched signature, whatever its signature. When the policy declares
+ * session_refusal_budget N, the Nth such refusal latches the session to
+ * on_exhaustion (result.session_exhausted): that refusal is terminal (an
+ * UNSATISFIED one gets on_exhaustion, an UNKNOWN its unknown_disposition),
+ * and every later refused submission in the session gets on_exhaustion
+ * without being counted, except a signature already latched, which keeps
+ * its own outcome. Counts saturate at UINT_MAX. A SATISFIED submission still passes, and it
+ * does not clear the session's count: an authorized plan in between would
+ * otherwise reset the bound on the refused ones. With no session limit
+ * declared the session is still counted (the count is reported and saved)
+ * but never latches.
+ *
  * If the breaker is DISABLED (no refusal_budget in the policy), an
  * UNSATISFIED verdict always returns REFUSED_RETRYABLE and never
  * latches — exactly the pre-v1.8.2 pass-through. The v1.9 progress
@@ -138,11 +159,17 @@ plan_breaker_result_t plan_breaker_step(plan_breaker_t *b,
  * loads the table from a state file it owns before stepping it, and saves it
  * after.
  *
- * Format: a header line "varek-breaker 1", then one line per entry:
+ * Format (v1.19.0: version 2): a header line "varek-breaker 2", then one line
+ * per (session, signature) entry:
  *   <session as hex, or "-"> <signature, 16 hex digits> <refusals>
  *   <latched 0|1> <outcome> <terminal action name, or "-">
- * and a trailer "end <number of entries>", so a file cut short (even at a line
- * boundary) is refused rather than read as a smaller table.
+ * then one line per session:
+ *   session <session as hex, or "-"> <refusals> <latched 0|1> <outcome>
+ *   <terminal action name, or "-">
+ * and a trailer "end <number of entry and session lines>", so a file cut
+ * short (even at a line boundary) is refused rather than read as a smaller
+ * table. A version 1 table (v1.18.0: entries only) still loads; each
+ * session's count starts at the refusals its entries hold.
  *
  * plan_breaker_load() fills an EMPTY breaker. It returns 0, or -1 on any
  * malformed line (the caller must then fail closed rather than start from an

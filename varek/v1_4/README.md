@@ -341,9 +341,18 @@ plan that needs one cannot run as declared.
   does), and distinct graphs never share one. After the
   policy's `refusal_budget` the outcome latches to its `on_exhaustion`
   disposition; an UNKNOWN goes straight to `unknown_disposition`.
+- **the session's limit (v1.19.0).** Each refused plan also counts against its
+  session, whatever the plan (an UNKNOWN counts; resubmitting a plan that is
+  already terminal does not). The refusal that reaches the policy's
+  `session_refusal_budget` is terminal, and so is every later refused plan in
+  the session, whatever it is: they get `on_exhaustion` (a plan already
+  terminal keeps its own outcome, and an UNKNOWN gets `unknown_disposition`). `refusal_budget` alone let a planner that
+  changed one step each time start a new count every time. An authorized plan
+  still runs in an exhausted session, and does not reset its count.
 - **the progress-safety check (v1.9).** At startup: the Warden refuses to start
   unless every refusal ends in an automated outcome, and unless the policy
-  declares a `refusal_budget` (the Warden's own policy can always refuse).
+  declares a `refusal_budget` (the Warden's own policy can always refuse) and a
+  `session_refusal_budget`.
 
 The breaker's table lives in `--breaker-state <dir>/<name>` (default
 `/var/lib/varek/breaker.state`). The Warden refuses to start unless `<dir>` is
@@ -363,13 +372,14 @@ Outcome: when the plan is refused, the agent never runs and the Warden exits 3
 message names the pre-authorized action the host must run); 1 on an error. When
 it is authorized, the Warden exits with the agent's status, which can also be 3,
 4 or 5. A host that acts on the outcome reads `--gate-status <file>`, one line
-written before the agent starts (`PASS`, `REFUSED_RETRYABLE n/budget`,
-`TERMINAL_DENY`, `TERMINAL_ACTION <name>` or `ERROR ...`; empty if the gate
-never decided), or the `plan_gate` record in the verdict stream. The status file
+written before the agent starts (`PASS`, `REFUSED_RETRYABLE n/budget session
+m/limit`, `TERMINAL_DENY`, `TERMINAL_ACTION <name>` or `ERROR ...`; empty if
+the gate never decided), or the `plan_gate` record in the verdict stream, which
+also carries `session_refusals`, `session_budget` and `session_exhausted`. The status file
 gets the state files' checks: its directory and the file must be private to the
 Warden's user, and the policy must not reach it.
 
-The count is per session and per state file, and whoever starts the Warden
+The counts are per session and per state file, and whoever starts the Warden
 chooses both. It bounds a host that resubmits through a launcher it does not
 control (a service unit or wrapper that fixes `--session` and
 `--breaker-state`); a host that can choose them can start a new count.

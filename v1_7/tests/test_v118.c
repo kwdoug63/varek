@@ -284,7 +284,7 @@ static void test_breaker_persistence(void)
     plan_breaker_t *b2 = round_trip(b1, cfg, &text);
     CHECK(b2 != NULL, "state saves and loads");
     if (!b2) { plan_breaker_free(b1); plan_label_policy_config_free(cfg); return; }
-    CHECK(text && strstr(text, "varek-breaker 1\n") == text, "state file starts with its header");
+    CHECK(text && strstr(text, "varek-breaker 2\n") == text, "state file starts with its header");
     free(text);
 
     r = plan_breaker_step(b2, "session one", sig, PLAN_DEC_UNSATISFIED, cfg);

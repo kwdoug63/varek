@@ -63,11 +63,14 @@ allow exec /usr/bin/python3
 allow host 127.0.0.1:8080
 EOF
 FLOW="$D/flow.cfg"
+# v1.19.0: the Warden also requires a session_refusal_budget; 100 is high
+# enough that these checks never reach it (test_v1190.sh checks it).
 cat > "$FLOW" <<'EOF'
 varek_policy 1
 label SECRET 0
 sticky SECRET
 refusal_budget 2
+session_refusal_budget 100
 on_exhaustion terminal abort_txn
 unknown_disposition deny
 rule file_open
@@ -143,8 +146,8 @@ has 'plan flow pathology: {' && pass "the flow pathology names the offending flo
 has 'plan rejected' && ! has 'supervising pid=' && pass "the agent is not started" || flunk "the agent is not started"
 R="$(gate_rec)"
 grep -q '"breaker":"REFUSED_RETRYABLE","refusals":1,"budget":2' <<<"$R" && pass "plan_gate record: REFUSED_RETRYABLE, 1 of 2" || flunk "plan_gate record: REFUSED_RETRYABLE, 1 of 2 ($R)"
-[ "$(cat "$D/state/gs" 2>/dev/null)" = "REFUSED_RETRYABLE 1/2" ] && pass "--gate-status says REFUSED_RETRYABLE 1/2" || flunk "--gate-status says REFUSED_RETRYABLE 1/2 ($(cat "$D/state/gs" 2>/dev/null))"
-check "the breaker state holds its header and trailer" grep -qx 'end 1' "$STATE"
+[ "$(cat "$D/state/gs" 2>/dev/null)" = "REFUSED_RETRYABLE 1/2 session 1/100" ] && pass "--gate-status says REFUSED_RETRYABLE 1/2 (v1.19.0: session 1/100)" || flunk "--gate-status says REFUSED_RETRYABLE 1/2 ($(cat "$D/state/gs" 2>/dev/null))"
+check "the breaker state holds its header and trailer (v1.19.0: one entry, one session)" grep -qx 'end 2' "$STATE"
 
 gate s1 leak.txt
 [ "$RC" -eq 5 ] && has 'pre-authorized action abort_txn' && pass "the second refusal, in a new Warden run, spends the budget: terminal abort_txn (exit 5)" \

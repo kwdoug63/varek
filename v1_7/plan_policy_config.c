@@ -43,6 +43,8 @@ struct plan_label_policy_config {
      * defaults: breaker disabled, both dispositions = deny. */
     bool               budget_set;
     unsigned           refusal_budget;
+    bool               session_budget_set;      /* v1.19.0 */
+    unsigned           session_refusal_budget;
     bool               on_exhaustion_set;
     bool               unknown_disp_set;
     plan_disposition_t on_exhaustion;   /* .action_name owned (strdup) or NULL */
@@ -78,6 +80,9 @@ static const char *ERR_EXTRA_TOKENS         = "unexpected extra tokens on line";
 static const char *ERR_MATCH_BAD_ARGS       = "'match' requires KEY and PATTERN";
 static const char *ERR_BUDGET_BAD           = "'refusal_budget' requires a positive integer";
 static const char *ERR_BUDGET_DUP           = "duplicate 'refusal_budget' directive";
+static const char *ERR_SBUDGET_BAD          = "'session_refusal_budget' requires a positive integer";
+static const char *ERR_SBUDGET_DUP          = "duplicate 'session_refusal_budget' directive";
+static const char *ERR_SBUDGET_ALONE        = "'session_refusal_budget' requires 'refusal_budget'";
 static const char *ERR_DISP_BAD             = "disposition must be 'deny' or 'terminal NAME'";
 static const char *ERR_DISP_DUP_EXH         = "duplicate 'on_exhaustion' directive";
 static const char *ERR_DISP_DUP_UNK         = "duplicate 'unknown_disposition' directive";
@@ -280,6 +285,21 @@ static const char *handle_refusal_budget(parse_state_t *st, int n_tokens,
     return NULL;
 }
 
+/* v1.19.0: the limit on refused plans in one session, whatever plans they
+ * are. */
+static const char *handle_session_refusal_budget(parse_state_t *st, int n_tokens,
+                                                 char **tokens)
+{
+    if (st->cfg->session_budget_set) return ERR_SBUDGET_DUP;
+    if (n_tokens != 2)               return ERR_SBUDGET_BAD;
+    char *end = NULL;
+    long n = strtol(tokens[1], &end, 10);
+    if (!end || *end != '\0' || n < 1 || n > 1000000) return ERR_SBUDGET_BAD;
+    st->cfg->session_refusal_budget = (unsigned)n;
+    st->cfg->session_budget_set     = true;
+    return NULL;
+}
+
 /* Parse 'deny' | 'terminal NAME' from tokens[1..]. On TERMINAL the
  * action name is strdup'd into out->action_name (owned by cfg). */
 static const char *parse_disposition(int n_tokens, char **tokens,
@@ -427,6 +447,8 @@ int plan_label_policy_config_load_stream(FILE *stream,
             else if (strcmp(kw, "sticky")       == 0) err = handle_sticky(&st, n_tokens, tokens);
             else if (strcmp(kw, "rule")         == 0) err = handle_rule(&st, n_tokens, tokens);
             else if (strcmp(kw, "refusal_budget") == 0) err = handle_refusal_budget(&st, n_tokens, tokens);
+            else if (strcmp(kw, "session_refusal_budget") == 0)
+                err = handle_session_refusal_budget(&st, n_tokens, tokens);
             else if (strcmp(kw, "on_exhaustion")  == 0) err = handle_on_exhaustion(&st, n_tokens, tokens);
             else if (strcmp(kw, "unknown_disposition") == 0) err = handle_unknown_disposition(&st, n_tokens, tokens);
             else                                       err = ERR_UNKNOWN_STMT;
@@ -438,6 +460,8 @@ int plan_label_policy_config_load_stream(FILE *stream,
     }
 
     if (!err && ferror(stream)) err = ERR_IO;
+    /* A session limit without the breaker would never be applied. */
+    if (!err && cfg->session_budget_set && !cfg->budget_set) err = ERR_SBUDGET_ALONE;
 
     if (err) {
         if (err_line) *err_line = st.line_no;
@@ -542,6 +566,11 @@ bool plan_label_policy_config_breaker_enabled(const plan_label_policy_config_t *
 unsigned plan_label_policy_config_refusal_budget(const plan_label_policy_config_t *cfg)
 {
     return cfg ? cfg->refusal_budget : 0u;
+}
+
+unsigned plan_label_policy_config_session_refusal_budget(const plan_label_policy_config_t *cfg)
+{
+    return cfg && cfg->session_budget_set ? cfg->session_refusal_budget : 0u;
 }
 
 plan_disposition_t

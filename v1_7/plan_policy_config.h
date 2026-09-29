@@ -83,6 +83,18 @@ extern "C" {
  *                                # per v1.9, must authorize). Absent =>
  *                                # deny (fail-closed terminal).
  *
+ *   session_refusal_budget N     # v1.19.0. 1 <= N <= 1000000. The most
+ *                                # refused submissions one session may
+ *                                # make, whatever plans they are. Once N
+ *                                # are counted the session latches to the
+ *                                # on_exhaustion disposition: every later
+ *                                # refused submission in it is terminal.
+ *                                # refusal_budget bounds resubmissions of
+ *                                # one plan; this bounds a planner that
+ *                                # changes the plan each time. Requires
+ *                                # refusal_budget. Absent => no session
+ *                                # limit (the Warden requires one).
+ *
  *   unknown_disposition deny           # v1.8.2. Terminal disposition for
  *   unknown_disposition terminal NAME  # an UNKNOWN verdict. UNKNOWN is
  *                                # never retried (a re-run reproduces it),
@@ -161,6 +173,9 @@ bool plan_label_policy_config_breaker_enabled(const plan_label_policy_config_t *
 
 /* The declared refusal budget (0 iff the breaker is disabled). */
 unsigned plan_label_policy_config_refusal_budget(const plan_label_policy_config_t *cfg);
+
+/* v1.19.0: the declared session_refusal_budget, 0 when there is none. */
+unsigned plan_label_policy_config_session_refusal_budget(const plan_label_policy_config_t *cfg);
 
 /* Terminal disposition once the refusal budget is spent. Defaults to
  * {PLAN_DISP_DENY, NULL} when no on_exhaustion directive is present. */
