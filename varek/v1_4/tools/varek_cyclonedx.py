@@ -56,7 +56,7 @@ import re
 import sys
 import uuid
 
-VAREK_VERSION = "1.16.1"
+VAREK_VERSION = "1.16.2"
 SPEC_VERSION = "1.6"
 
 # The provisional patents, as recorded in the runtime's own documentation.
@@ -112,7 +112,8 @@ def _chain_step(st, raw, rec, lineno, ndecisions, fail):
                          f"the stream holds {ndecisions} before it.")
         sig = m.group(2).decode() if m.group(2) else None
         st["signed"].append({"event": event, "chain": h, "sig": sig, "line": lineno,
-                             "records": rec.get("records", 0), "ndec": ndecisions})
+                             "records": rec.get("records", 0), "ndec": ndecisions,
+                             "ts": rec.get("timestamp_ns")})
         if sig:
             st["since_signed"] = 0
     elif event == "anchor_error":

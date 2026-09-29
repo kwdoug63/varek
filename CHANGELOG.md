@@ -59,6 +59,59 @@ formally verified checker, and the v1.11 sequence fragment.
 
 ---
 
+## [1.16.2] - 2026-09-28
+
+The off-host anchor. An anchor file on the Warden's own host does not protect
+against that host's root, who also holds the signing key; this release ships
+the pieces to anchor on a second machine as records are written. No change to
+decisions, records or the policy grammar.
+
+### Added
+
+- `tools/varek_anchor_forward.py`: reads the Warden's anchor FIFO (creating it,
+  holding it open, and holding `FIFO.lock` as proof it is alive), spools every
+  well-formed anchor line locally, and sends it off-host (`--ssh USER@HOST`
+  with a dedicated key and pinned host key, or `--exec COMMAND`), retrying with
+  backoff; at-least-once delivery, resumes after restarts; on a full disk it
+  pauses reading and cuts partial writes back; refuses files owned by others
+  or reached through symlinks.
+- `tools/varek_anchor_receiver.sh`: sets up the anchor host: an account whose
+  SSH key has one forced command appending well-formed anchor lines to a
+  `chattr +a` file (no shell, forwarding or other command).
+- `tools/systemd/varek-anchor-forward.service`.
+- Preflight: a FIFO anchor must have a reader (FAIL otherwise); `--spool DIR`;
+  a trial run with a FIFO anchor is audited against the spool; warnings for a
+  local-file anchor and for a signing key with no off-host anchor.
+- The receiver's forced command reads the whole batch before locking, stamps
+  it with the receiver's clock (`"received_ns"`), closes a torn line, and fails
+  (so the forwarder retries) when it cannot write; setup checks everything
+  before creating anything and refuses a public key with more than one line,
+  an existing account that is not its own, root, and a filesystem without
+  `chattr +a` (unless `--allow-no-chattr`).
+- Audit: `--list-runs`, `--max-anchor-delay` (measured from the stream's signed
+  times), `--clock-slack` (default 5 s: a record received more than this before
+  it was written fails the run, so both hosts need synchronised clocks; both
+  options take only a finite number of seconds ≥ 0); a record is anchored if any validly signed line matches it;
+  unsigned, conflicting and malformed lines are noted and ignored; a signed
+  line for a record the stream lacks fails the run unless it arrived after the
+  run's run_end was anchored.
+- Preflight: forwarder liveness via its lock; with `--run --spool`, checks the
+  trial run's own records were delivered off-host.
+- `make test-v1162`.
+
+### Fixed
+
+- The command order in `RELEASE-v1.16.1.md` and `varek/v1_4/README.md`:
+  `varek_keygen` was run before anything built it.
+
+### Changed
+
+- The Warden refuses a FIFO anchor whose forwarder lock (`FIFO.lock`) is free,
+  holds the FIFO read-write after checking it has a reader, so records written
+  while the forwarder restarts wait in the pipe, and at exit, if no forwarder
+  runs, waits up to 10 s for one to read them.
+- `run_start` reads `"warden":"1.16.2"`.
+
 ## [1.16.1] - 2026-09-28
 
 Deployment preflight for v1.16.0's two new requirements: the verdict stream

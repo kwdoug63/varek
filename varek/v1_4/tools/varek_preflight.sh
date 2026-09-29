@@ -4,7 +4,7 @@
 # varek_preflight.sh — check a Warden deployment before you run it (v1.16.1).
 #
 #   tools/varek_preflight.sh <policy> [--log PATH] [--sign-key KEY] [--anchor PATH]
-#                            [--run] [--install-deps]
+#                            [--spool DIR] [--run] [--install-deps]
 #
 # Checks, in order, and prints PASS / WARN / FAIL for each:
 #   1. The Warden and its tools are built and up to date; if not, the build
@@ -26,6 +26,11 @@
 #        --anchor PATH  not a symlink; a regular file (one name), FIFO or
 #                       character device, or a new file in an existing
 #                       directory; the agent cannot open it;
+#                       A FIFO anchor must have its reader (the forwarder,
+#                       tools/varek_anchor_forward.py) running; a regular-file
+#                       anchor on this host is a warning, since this host's root
+#                       could rewrite it;
+#        --spool DIR    the forwarder's spool: the agent must not open it;
 #        with a key or an anchor, the agent must not be able to open a block
 #        device, /dev/mem, /dev/kmem, /dev/port, /proc/kcore, /dev/sg*,
 #        /dev/nvme* or /dev/bsg/*.
@@ -35,7 +40,8 @@
 #      needed), its verdict stream written to a new temporary file (mktemp) in
 #      the --log directory, which must belong to root and not be writable by
 #      others (or be sticky, like /tmp); then the audit of that stream (with
-#      KEY.pub if it exists, and the anchor if it is a regular file). The
+#      KEY.pub if it exists, and the anchor if it is a regular file, or the
+#      forwarder's spool (--spool) for a FIFO anchor). The
 #      temporary file is removed. With --anchor, the trial run's checkpoints
 #      are appended to the real anchor like any run's.
 #
@@ -44,7 +50,7 @@
 set -u
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"          # varek/v1_4
-POLICY="" LOG="" KEY="" ANCHOR="" RUN=0 INSTALL=0
+POLICY="" LOG="" KEY="" ANCHOR="" SPOOL="" RUN=0 INSTALL=0
 usage() { sed -n '6,7p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 need() { [ $# -ge 2 ] && [ -n "$2" ] || { echo "varek_preflight: $1 needs a value" >&2; usage; }; }
 while [ $# -gt 0 ]; do
@@ -52,6 +58,7 @@ while [ $# -gt 0 ]; do
         --log)          need "$@"; LOG="$2"; shift 2 ;;
         --sign-key)     need "$@"; KEY="$2"; shift 2 ;;
         --anchor)       need "$@"; ANCHOR="$2"; shift 2 ;;
+        --spool)        need "$@"; SPOOL="$2"; shift 2 ;;
         --run)          RUN=1; shift ;;
         --install-deps) INSTALL=1; shift ;;
         -h|--help)      usage ;;
@@ -177,11 +184,43 @@ fi
 if [ -n "$ANCHOR" ]; then
     A="$(abs "$ANCHOR")"
     ok=1
-    if [ -L "$A" ]; then fail "anchor $A is a symlink (the Warden opens it with O_NOFOLLOW and refuses)"; ok=0
+    if [ ! -x "$(dirname "$A")" ] && [ -e "$(dirname "$A")" ]; then
+        warn "cannot look inside $(dirname "$A") as this user, so the anchor was not checked (run the preflight as root)"; ok=0; unchecked=1
+    elif [ -L "$A" ]; then fail "anchor $A is a symlink (the Warden opens it with O_NOFOLLOW and refuses)"; ok=0
     elif [ -e "$A" ]; then
         if [ -f "$A" ]; then
             [ "$(stat -c %h "$A")" = 1 ] || { fail "anchor $A has $(stat -c %h "$A") names (hard links): refused"; ok=0; }
-        elif [ -p "$A" ]; then warn "anchor $A is a FIFO: its reader must be running before the Warden starts"
+        elif [ -p "$A" ]; then
+            # The Warden opens the anchor non-blocking for writing, which fails
+            # (ENXIO) when no process has the FIFO open for reading.
+            # The forwarder holds FIFO.lock while it runs; a FIFO merely held
+            # open (a running Warden holds its anchor read-write) is not a
+            # forwarder. Without a lock file (another kind of reader), only
+            # the reader check applies.
+            live="$(python3 -c 'import errno,fcntl,os,sys
+fifo = sys.argv[1]
+try:
+    fd = os.open(fifo + ".lock", os.O_RDONLY | os.O_NOFOLLOW)
+except OSError:
+    fd = None
+if fd is not None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)   # shared: never conflicts with another probe
+        print("dead")
+    except OSError:
+        print("alive")
+    sys.exit(0)
+try:
+    os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+    print("reader")
+except OSError:
+    print("none")' "$A" 2>/dev/null)"
+            case "$live" in
+                alive)  pass "anchor FIFO $A: the forwarder is running (it holds $A.lock)" ;;
+                reader) warn "anchor FIFO $A has a reader, but not the VAREK forwarder (no $A.lock): a running Warden's own hold would look the same" ;;
+                dead)   fail "anchor FIFO $A: the forwarder is not running ($A.lock is free); the Warden refuses it. Start the forwarder first"; ok=0 ;;
+                *)      fail "anchor FIFO $A has no reader: start the forwarder (tools/varek_anchor_forward.py) first; the Warden refuses it otherwise"; ok=0 ;;
+            esac
         elif [ -c "$A" ]; then :
         else fail "anchor $A is not a regular file, FIFO or character device"; ok=0; fi
     else
@@ -194,6 +233,20 @@ if [ -n "$ANCHOR" ]; then
             *)       fail "anchor: the policy lets the agent open ${r#* } (refused)" ;;
         esac
     fi
+    if [ -z "${unchecked:-}" ] && [ ! -p "$A" ] && [ ! -c "$A" ]; then
+        warn "the anchor is a file on this host: it protects the stream against people who cannot write it, not against this host's root. To anchor off this host, point --anchor at a FIFO read by tools/varek_anchor_forward.py"
+    fi
+fi
+if [ -n "$KEY" ] && [ -z "${unchecked:-}" ] && { [ -z "$ANCHOR" ] || { [ ! -p "$(abs "$ANCHOR")" ] && [ ! -c "$(abs "$ANCHOR")" ]; }; }; then
+    warn "the signing key and the verdict streams are both on this host: the signatures protect against holders of the logs who are not root here; against this host's root only an off-host anchor helps"
+fi
+if [ -n "$SPOOL" ]; then
+    S="$(abs "$SPOOL")"
+    r="$(openable "$S/anchor.spool")"
+    case "$r" in
+        closed*) pass "forwarder spool ${r#* }: the agent cannot open it" ;;
+        *)       fail "forwarder spool: the policy lets the agent open ${r#* }; keep the spool outside every allowed path" ;;
+    esac
 fi
 if [ -n "$KEY$ANCHOR" ]; then
     raw="$( { find /dev \( -type b -o -type c \) 2>/dev/null | grep -E '^/dev/(mem|kmem|port|sg[^/]*|nvme[^/]*|bsg/.*)$'
@@ -225,6 +278,31 @@ if [ "$RUN" = 1 ]; then
                 aa=(--policy "$POLICY" --checker "$CERT")
                 [ -n "$KEY" ] && [ -f "$(abs "$KEY").pub" ] && aa+=(--pubkey "$(abs "$KEY").pub")
                 [ -n "$ANCHOR" ] && [ -f "$(abs "$ANCHOR")" ] && aa+=(--anchor "$(abs "$ANCHOR")")
+                # A FIFO anchor: the forwarder's spool holds what it received,
+                # and its sent.offset shows whether it reached the anchor host.
+                if [ -n "$ANCHOR" ] && [ -p "$(abs "$ANCHOR")" ]; then
+                    if [ -n "$SPOOL" ]; then
+                        # Delivered: the trial run's own run_end is in the spool,
+                        # and the forwarder's sent offset is past it.
+                        SPF="$(abs "$SPOOL")/anchor.spool" delivered=0
+                        trid="$($SUDO grep -o '"event":"run_start","run":"[0-9a-f]*"' "$T" | head -1 | cut -d'"' -f8)"
+                        for _ in $(seq 1 30); do
+                            endb="$($SUDO grep -b "\"run\":\"$trid\",\"event\":\"run_end\"" "$SPF" 2>/dev/null | head -1)"
+                            if [ -n "$trid" ] && [ -n "$endb" ]; then
+                                pos="${endb%%:*}"; line="${endb#*:}"
+                                need=$((pos + ${#line} + 1))
+                                off="$($SUDO cat "$(abs "$SPOOL")/sent.offset" 2>/dev/null || echo 0)"
+                                [ "$off" -ge "$need" ] 2>/dev/null && { delivered=1; break; }
+                            fi
+                            sleep 0.5
+                        done
+                        if [ "$delivered" = 1 ]; then pass "the forwarder delivered the trial run's records off-host"
+                        else fail "the forwarder has not delivered the trial run's records off-host within 15 s: check the anchor host's name, the SSH key and the pinned host key (journalctl -u varek-anchor-forward)"; fi
+                        aa+=(--anchor "$SPF")
+                    else
+                        warn "a FIFO anchor without --spool: the trial run's delivery off-host was not checked"
+                    fi
+                fi
                 o="$($SUDO python3 "$HERE/tools/varek_audit.py" "${aa[@]}" "$T" 2>&1)"
                 if grep -q "varek_audit: PASS" <<<"$o"; then pass "audit: $(grep -o 'integrity: .*' <<<"$o")"
                 else fail "audit of the trial stream: $(grep -m1 -E 'PROBLEM|FAIL' <<<"$o")"; fi
@@ -238,5 +316,6 @@ if [ "$RUN" = 1 ]; then
 fi
 
 echo
+[ -n "${unchecked:-}" ] && echo "preflight: some checks need root; run it as root for a complete check"
 if [ "$fails" -eq 0 ]; then echo "preflight: PASS ($warns warning(s))"; else echo "preflight: FAIL ($fails failure(s), $warns warning(s))"; fi
 [ "$fails" -eq 0 ]

@@ -23,6 +23,11 @@ jobs:
           sudo apt-get install -y build-essential libseccomp-dev libsodium-dev
       - name: Build the Warden and its tools
         run: make -C varek/v1_4 all
+      - name: Check the deployment scripts parse
+        run: |
+          python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py
+          bash -n varek/v1_4/tools/varek_preflight.sh
+          bash -n varek/v1_4/tools/varek_anchor_receiver.sh
       - name: Lint the shipped policies
         run: |
           for p in varek/v1_4/policy.txt varek/v1_4/conformance_policy.txt varek/v1_4/policies/*.txt; do

@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT
+# VAREK v1.16.2: forward the Warden's anchor records off this host.
+#
+# Install:  cp tools/systemd/varek-anchor-forward.service /etc/systemd/system/
+#           edit ANCHOR_HOST (and the paths, if yours differ), then
+#           systemctl daemon-reload && systemctl enable --now varek-anchor-forward
+# Run the Warden with:  --anchor /run/varek/anchor.fifo
+# Set up the anchor host with tools/varek_anchor_receiver.sh.
+[Unit]
+Description=VAREK anchor forwarder (Warden anchor FIFO -> off-host append-only log)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/varek/varek/v1_4/tools/varek_anchor_forward.py \
+    --fifo /run/varek/anchor.fifo \
+    --spool /var/lib/varek/anchor-spool \
+    --ssh varek-anchor@ANCHOR_HOST \
+    --ssh-key /etc/varek/anchor_ssh_key \
+    --known-hosts /etc/varek/anchor_known_hosts
+Restart=always
+RestartSec=2
+# /run/varek holds the FIFO; keep it across restarts of this service.
+RuntimeDirectory=varek
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -13,8 +13,9 @@
 #      the pinned key.
 #   3. Someone holding the log AND the key: a rewritten, re-signed log passes
 #      the signature check but fails against the anchor.
-#   4. Anchor failures are recorded in the stream (anchor_error) and fail the
-#      anchored audit; supervision is not affected.
+#   4. Anchor failures are recorded (anchor_error for a full FIFO; a status
+#      line at exit for records no reader took) and fail the anchored audit;
+#      supervision is not affected.
 #   5. The Warden refuses to start when the policy would let the agent open the
 #      signing key, the anchor, the verdict stream itself or a raw block device,
 #      or when the key is not private, has a second name, or is malformed.
@@ -212,13 +213,15 @@ timeout 30 "$WARDEN" "$POL" --sign-key "$D/keys/k1" --anchor "$D/fifo" --checkpo
 rc=$?; wait "$rd" 2>/dev/null
 grep -q "file 12" "$OUT/stdout2" && grep -q '"event":"run_end"' "$OUT/v2" \
   && pass "the FIFO reader went away: the run completes (Warden rc $rc)" || flunk "run with a dead anchor reader"
-grep -q '"event":"anchor_error".*"errno":32' "$OUT/v2" \
-  && pass "failed anchor writes are recorded (anchor_error, EPIPE)" || flunk "anchor_error records"
-grep -q '^\[warden\] could not anchor run_end' "$OUT/v2" && [ "$(grep '^{' "$OUT/v2" | tail -1 | grep -c '"event":"run_end"')" = 1 ] \
-  && pass "a failed run_end anchor is reported, and run_end stays the last record" || flunk "run_end anchor failure"
+# v1.16.2: the Warden holds a FIFO anchor read-write, so the records it writes
+# after the reader left wait in the pipe; at exit it waits 10 s for a reader,
+# then reports them as lost (run_end stays the last record).
+grep -q '^\[warden\] anchor: .* not read within 10 s' "$OUT/v2" \
+  && [ "$(grep '^{' "$OUT/v2" | tail -1 | grep -c '"event":"run_end"')" = 1 ] \
+  && pass "unread anchor records are reported at exit, and run_end stays the last record" || flunk "unread anchor records"
 o="$("${A[@]}" --pubkey "$D/keys/k1.pub" --anchor "$OUT/fifo_got" "$OUT/v2" 2>&1)"
-grep -q "could not anchor" <<<"$o" && grep -q FAIL <<<"$o" \
-  && pass "the anchored audit fails and names the gap" || { flunk "anchored audit after anchor errors"; echo "$o" | head -6; }
+grep -q "was never anchored" <<<"$o" && grep -q FAIL <<<"$o" \
+  && pass "the anchored audit fails and names the records never anchored" || { flunk "anchored audit after lost records"; echo "$o" | head -6; }
 o="$("${A[@]}" --pubkey "$D/keys/k1.pub" "$OUT/v2" 2>&1)"
 grep -q PASS <<<"$o" && pass "the signed stream itself still verifies" || { flunk "signed stream after anchor errors"; echo "$o" | head -6; }
 # A reader that never reads: the FIFO fills (EAGAIN) and supervision goes on.

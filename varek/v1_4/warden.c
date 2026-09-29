@@ -85,6 +85,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/prctl.h>
@@ -895,6 +896,8 @@ static bool          g_signing = false;
 static unsigned char g_pk[crypto_sign_PUBLICKEYBYTES];
 static unsigned char *g_sk;                /* sodium_malloc: guarded, locked, not dumped */
 static int           g_anchor_fd = -1;
+static bool          g_anchor_fifo = false;  /* v1.16.2: held read-write; drained at exit */
+static char          g_anchor_lock[PATH_MAX + 8];  /* v1.16.2: the forwarder's liveness lock */
 static uint64_t      g_ckpt_every = 64;
 static uint64_t      g_since_ckpt = 0;      /* decision records since the last signed record */
 static struct timespec g_last_ckpt;         /* CLOCK_MONOTONIC */
@@ -1091,7 +1094,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.16.1\","
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.16.2\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
@@ -1939,6 +1942,24 @@ static int load_sign_key(const char *path, const struct policy *p) {
     return 0;
 }
 
+/* v1.16.2: tools/varek_anchor_forward.py holds an exclusive lock on
+ * FIFO.lock while it runs. 1: a forwarder holds it; 0: the lock file exists
+ * and is free (no forwarder, even if the FIFO is held open by another
+ * Warden); -1: no lock file (another kind of reader; only the reader check
+ * applies). */
+static int forwarder_alive(const char *fifo) {
+    char lp[PATH_MAX + 8];
+    if ((size_t)snprintf(lp, sizeof lp, "%s.lock", fifo) >= sizeof lp) return -1;
+    int fd = open(lp, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    snprintf(g_anchor_lock, sizeof g_anchor_lock, "%s", lp);
+    /* A shared probe: it conflicts only with the forwarder's exclusive lock,
+     * never with another probe. */
+    int r = flock(fd, LOCK_SH | LOCK_NB) == 0 ? 0 : (errno == EWOULDBLOCK ? 1 : -1);
+    close(fd);                                   /* releases it if we took it */
+    return r;
+}
+
 /* --anchor PATH: a regular file, FIFO or character device the Warden appends
  * checkpoint-type records to. Opened non-blocking: a FIFO needs its reader
  * running first. */
@@ -1956,6 +1977,30 @@ static int open_anchor(const char *path, const struct policy *p) {
         return -1;
     }
     if (refuse_if_agent_can_open(p, fd, path, "anchor") < 0) { close(fd); return -1; }
+    if (S_ISFIFO(st.st_mode) && forwarder_alive(path) == 0) {
+        fprintf(stderr, "[warden] anchor %s: the forwarder is not running (%s.lock is free; the FIFO "
+                "may only be held open by another Warden). Start it first.\n", path, path);
+        close(fd);
+        return -1;
+    }
+    if (S_ISFIFO(st.st_mode)) {
+        /* v1.16.2: the open above proved a reader (the forwarder) is there.
+         * Now hold the FIFO read-write through the same inode, so that if the
+         * forwarder restarts mid-run, records written meanwhile wait in the
+         * pipe (64 KiB) instead of failing with EPIPE. The Warden never reads
+         * from it. */
+        char self[64];
+        snprintf(self, sizeof self, "/proc/self/fd/%d", fd);
+        int rw = open(self, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+        if (rw < 0) {
+            fprintf(stderr, "[warden] anchor %s: cannot hold the FIFO open (%s)\n", path, strerror(errno));
+            close(fd);
+            return -1;
+        }
+        close(fd);
+        fd = rw;
+        g_anchor_fifo = true;
+    }
     g_anchor_fd = fd;
     return 0;
 }
@@ -1966,6 +2011,34 @@ static int refuse_exposed_stream(const struct policy *p) {
     struct stat st;
     if (fstat(STDERR_FILENO, &st) < 0 || !S_ISREG(st.st_mode)) return 0;
     return refuse_if_agent_can_open(p, STDERR_FILENO, "(stderr)", "verdict stream");
+}
+
+/* v1.16.2: a FIFO anchor's unread records vanish when its last descriptor
+ * closes. Before exiting, give the forwarder up to 10 s to read what is still
+ * in the pipe (it may be restarting), and say so if it does not. */
+static void anchor_drain(void) {
+    if (g_anchor_fd < 0 || !g_anchor_fifo) return;
+    int left = 0;
+    for (int i = 0; i < 200; i++) {
+        if (ioctl(g_anchor_fd, FIONREAD, &left) < 0 || left == 0) return;
+        /* A live forwarder holds the pipe itself: what is left is safe with
+         * it (it may just be busy sending). */
+        if (g_anchor_lock[0]) {
+            int fd = open(g_anchor_lock, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            if (fd >= 0) {
+                int busy = flock(fd, LOCK_SH | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+                close(fd);
+                if (busy) return;
+            }
+        }
+        struct timespec ts = { 0, 50 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    log_line_start();
+    fprintf(g_log, "[warden] anchor: %d byte(s) of records in the FIFO were not read within 10 s of "
+            "the run's end and no forwarder is running; unless another process keeps the FIFO open "
+            "until one starts, they are lost (the audit reports them as never anchored)\n", left);
+    fflush(g_log);
 }
 
 /* ---------------- main ---------------- */
@@ -2307,6 +2380,7 @@ int main(int argc, char **argv) {
                 WTERMSIG(status) == SIGSYS
                     ? ": most likely a hard-denied system call" : "");
     emit_run_end(rc);
+    anchor_drain();
     if (g_sk) sodium_free(g_sk);             /* zeroes it */
     close(target_pidfd);
     close(notify_fd);

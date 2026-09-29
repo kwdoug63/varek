@@ -25,7 +25,7 @@ CFLAGS    += -I$(V1_7_DIR)
 
 BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen
 
-.PHONY: all deps deps-check preflight clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 crosscheck harness video-v112
+.PHONY: all deps deps-check preflight clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -210,6 +210,13 @@ test-v1160: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen tests
 # fails the ones the Warden would refuse; the dependency check names packages.
 test-v1161: warden tools/vdp_cert_check tools/varek_keygen
 	@sudo ./tests/test_v1161.sh ./warden ./tools/vdp_cert_check
+
+# v1.16.2: the off-host anchor. A receiver behind a private sshd on
+# 127.0.0.1:2222 and the forwarder: a run anchored off-host audits "signed,
+# anchored"; the receiver only appends; an outage loses nothing; preflight
+# checks the FIFO's reader. Skipped without OpenSSH.
+test-v1162: warden tools/vdp_cert_check tools/varek_keygen tests/v1160_probe
+	@sudo ./tests/test_v1162.sh ./warden ./tools/varek_keygen $(abspath tests/v1160_probe)
 
 # Differential check of the decision procedure against an SMT solver (Z3) and,
 # for suffix / contains / glob reachability, a derivative-based oracle. These
