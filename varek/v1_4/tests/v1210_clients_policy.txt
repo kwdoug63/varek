@@ -1,0 +1,28 @@
+# v1.21 real-client policy (test_v1210.sh): curl, Python (requests) and
+# Node.js, dynamically linked, as the agent. Read-only access to what the
+# interpreters load; the scripts and the test CA under /tmp/varek_v1210/.
+# Destinations: the local test servers only. test_v1210.sh appends the CDN
+# addresses it resolved for its live check.
+require warden 1.21
+allow path /etc/ld.so.cache readonly
+allow path /etc/ssl/ readonly                  # CA bundle, openssl.cnf
+allow path /etc/localtime readonly
+allow path /usr/lib/ readonly
+allow path /lib/ readonly
+allow path /lib64/ readonly
+allow path /usr/local/lib/ readonly            # Python site-packages (requests)
+allow path /usr/share/ readonly
+allow path /opt/node22/ readonly               # the Node.js install used here
+allow path /proc/self/ readonly
+allow path /sys/fs/cgroup/ readonly            # Node reads its CPU and memory limits
+allow path /dev/null
+allow path /dev/urandom readonly
+allow path /tmp/varek_v1210/work/ readonly     # the client scripts
+allow path /tmp/varek_v1210/tls/cert.pem readonly
+allow host 127.0.0.1:18181                     # TCP echo
+allow host 127.0.0.1:18183                     # UDP echo
+allow host 127.0.0.1:18187                     # HTTP
+allow host 127.0.0.1:18188                     # HTTPS (test CA)
+allow host 127.0.0.1:18190                     # benchmark listener
+allow host unix:/tmp/varek_v1210/sock/s.sock
+allow host unix:/tmp/varek_v1210/sock/http.sock

@@ -156,6 +156,10 @@
 #define __NR_pidfd_getfd 438
 #endif
 
+#ifndef VAREK_PIDFD_THREAD
+#define VAREK_PIDFD_THREAD O_EXCL      /* PIDFD_THREAD, Linux 6.9 */
+#endif
+
 #ifndef VAREK_AT_FDCWD
 #define VAREK_AT_FDCWD (-100)
 #endif
@@ -194,6 +198,7 @@ typedef enum {
     ACT_FILE_OPEN,
     ACT_NET_CONNECT,
     ACT_NET_SEND,        /* v1.12: sendto/sendmsg egress */
+    ACT_NET_BIND,        /* v1.21: bind, performed only for a wildcard address, port 0 */
     ACT_PROCESS_EXEC,
     ACT_FILE_STAT,       /* v1.17.0: newfstatat, statx */
     ACT_FILE_ACCESS,     /* v1.17.0: access, faccessat, faccessat2 */
@@ -223,6 +228,17 @@ struct action {
     char          check_why[160];       /* v1.15: why the checker refused it */
     int           connect_family;
     int           connect_port;
+    /* v1.21: decided connections and relayed sends */
+    unsigned char sa[sizeof(struct sockaddr_storage)]; /* the destination, copied once */
+    int           salen;                /* connect's addrlen as the kernel reads it */
+    bool          salen_bad;            /* < 0 or > sizeof(sockaddr_storage): EINVAL */
+    int           sock_fd;              /* the agent's descriptor (arg 0) */
+    const char   *sock_name;            /* "tcp", "udp", "unix-stream", ... (record) */
+    uint64_t      dial_ns;              /* dial start to completion */
+    int           send_nr;              /* sendto / sendmsg / sendmmsg */
+    uint64_t      send_flags;           /* the flags register */
+    uint64_t      msg_addr;             /* sendmsg: struct msghdr *; sendmmsg: mmsghdr[] */
+    unsigned      mmsg_vlen;            /* sendmmsg: vlen */
     /* v1.17.0: metadata lookups */
     int           meta_nr;              /* the system call */
     uint64_t      out_addr;             /* where the answer goes in the agent */
@@ -239,6 +255,7 @@ static const char *action_kind_name(action_kind_t k) {
         case ACT_FILE_OPEN:    return "file.open";
         case ACT_NET_CONNECT:  return "net.connect";
         case ACT_NET_SEND:     return "net.send";
+        case ACT_NET_BIND:     return "net.bind";
         case ACT_PROCESS_EXEC: return "process.exec";
         case ACT_FILE_STAT:     return "file.stat";
         case ACT_FILE_ACCESS:   return "file.access";
@@ -272,7 +289,7 @@ static int policy_load(const char *path, struct policy *p) {
             "(warden_faultinject); never use it to supervise a real agent\n");
 #endif
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.20");
+    snprintf(p->version, sizeof(p->version), "1.21");
     char err[512];
     /* v1.15: read the file once. The decision procedure and the certificate
      * checker parse these same bytes, and their SHA-256 goes in run_start, so
@@ -474,13 +491,27 @@ static int derive_intent(const struct seccomp_notif *req,
     }
     if (nr == __NR_connect) {
         out->kind = ACT_NET_CONNECT;
-        socklen_t len = (socklen_t)req->data.args[2];
-        if (len > sizeof(struct sockaddr_storage)) len = sizeof(struct sockaddr_storage);
+        out->sock_fd = (int)req->data.args[0];
+        /* v1.21: the kernel takes addrlen as an int and refuses one below 0 or
+         * above sizeof(struct sockaddr_storage) with EINVAL. The destination is
+         * copied here, once; the Warden dials this copy and never lets the
+         * kernel read the agent's memory again. */
+        int ilen = (int)req->data.args[2];
         struct sockaddr_storage ss;
         memset(&ss, 0, sizeof(ss));
-        if (xproc_read_bytes(req->pid, req->data.args[1], &ss, len) < 0)
+        if (ilen < 0 || (size_t)ilen > sizeof(struct sockaddr_storage)) {
+            out->salen_bad = true;
+            snprintf(out->target, sizeof(out->target), "addrlen:%d", ilen);
+            return 0;
+        }
+        socklen_t len = (socklen_t)ilen;
+        if (len > 0 && xproc_read_bytes(req->pid, req->data.args[1], &ss, len) < 0)
             return -1;
-        if (ss.ss_family == AF_INET) {
+        memcpy(out->sa, &ss, sizeof ss);
+        out->salen = ilen;
+        if (len < sizeof(sa_family_t)) {
+            snprintf(out->target, sizeof(out->target), "addrlen:%d", ilen);
+        } else if (ss.ss_family == AF_INET) {
             struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
             char ip[INET_ADDRSTRLEN] = {0};
             inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
@@ -498,14 +529,65 @@ static int derive_intent(const struct seccomp_notif *req,
             out->connect_port   = ntohs(sin6->sin6_port);
         } else if (ss.ss_family == AF_UNIX) {
             struct sockaddr_un *sun = (struct sockaddr_un *)&ss;
-            snprintf(out->target, sizeof(out->target), "unix:%s",
-                     sun->sun_path[0] ? sun->sun_path : "<abstract>");
+            size_t pl = len > offsetof(struct sockaddr_un, sun_path)
+                      ? len - offsetof(struct sockaddr_un, sun_path) : 0;
+            if (pl == 0)
+                snprintf(out->target, sizeof(out->target), "unix:<unnamed>");
+            else if (sun->sun_path[0] == '\0')
+                snprintf(out->target, sizeof(out->target), "unix:<abstract>");
+            else
+                snprintf(out->target, sizeof(out->target), "unix:%.*s",
+                         (int)strnlen(sun->sun_path, pl), sun->sun_path);
             out->connect_family = AF_UNIX;
         } else {
             snprintf(out->target, sizeof(out->target), "family:%u",
                      (unsigned)ss.ss_family);
             out->connect_family = ss.ss_family;
         }
+        return 0;
+    }
+    if (nr == __NR_bind) {
+        /* v1.21: the address is copied once; net_bind decides and binds. */
+        out->kind = ACT_NET_BIND;
+        out->sock_fd = (int)req->data.args[0];
+        int ilen = (int)req->data.args[2];
+        if (ilen < 0 || (size_t)ilen > sizeof(struct sockaddr_storage)) {
+            out->salen_bad = true;
+            snprintf(out->target, sizeof(out->target), "addrlen:%d", ilen);
+            return 0;
+        }
+        if (ilen > 0 && xproc_read_bytes(req->pid, req->data.args[1], out->sa, (size_t)ilen) < 0)
+            return -1;
+        out->salen = ilen;
+        sa_family_t fam = 0;
+        if (ilen >= (int)sizeof fam) memcpy(&fam, out->sa, sizeof fam);
+        if (fam == AF_INET && (size_t)ilen >= sizeof(struct sockaddr_in)) {
+            struct sockaddr_in in;
+            memcpy(&in, out->sa, sizeof in);
+            char ip[INET_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET, &in.sin_addr, ip, sizeof ip);
+            snprintf(out->target, sizeof(out->target), "%s:%u", ip, ntohs(in.sin_port));
+        } else if (fam == AF_INET6 && ilen >= 24) {
+            struct sockaddr_in6 in6;
+            memset(&in6, 0, sizeof in6);
+            memcpy(&in6, out->sa, (size_t)ilen < sizeof in6 ? (size_t)ilen : sizeof in6);
+            char ip[INET6_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET6, &in6.sin6_addr, ip, sizeof ip);
+            snprintf(out->target, sizeof(out->target), "[%s]:%u", ip, ntohs(in6.sin6_port));
+        } else {
+            snprintf(out->target, sizeof(out->target), "family:%u", (unsigned)fam);
+        }
+        return 0;
+    }
+    if (nr == __NR_sendmmsg) {
+        /* v1.21: relayed like sendmsg, one message at a time (net_send_relay). */
+        out->kind = ACT_NET_SEND;
+        out->send_nr = nr;
+        out->sock_fd = (int)req->data.args[0];
+        out->msg_addr = req->data.args[1];
+        out->mmsg_vlen = (unsigned)req->data.args[2];
+        out->send_flags = req->data.args[3];
+        snprintf(out->target, sizeof(out->target), "<sendmmsg>");
         return 0;
     }
     if (nr == __NR_sendto || nr == __NR_sendmsg) {
@@ -518,6 +600,10 @@ static int derive_intent(const struct seccomp_notif *req,
          * connected (connect is denied), and egress-capable sends are not
          * authorizable. */
         out->kind = ACT_NET_SEND;
+        out->send_nr = nr;
+        out->sock_fd = (int)req->data.args[0];
+        out->send_flags = nr == __NR_sendto ? req->data.args[3] : req->data.args[2];
+        out->msg_addr = req->data.args[1];
         uint64_t addr = 0, alen = 0;
         if (nr == __NR_sendto) {
             addr = req->data.args[4];
@@ -672,7 +758,13 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
             s = a->resolved;
             if (s[0] == '\0') { a->why = "no_resolved_path"; return DEC_UNKNOWN; }
             break;
-        case ACT_NET_CONNECT:  kind = VDP_KIND_HOST; s = a->target; break;
+        case ACT_NET_CONNECT:
+            /* v1.21: decided on the destination the Warden will dial, in its
+             * canonical spelling (net_decision_string), never the agent's. */
+            kind = VDP_KIND_HOST;
+            s = a->resolved;
+            if (s[0] == '\0') { a->why = "no_resolved_destination"; return DEC_UNKNOWN; }
+            break;
         case ACT_PROCESS_EXEC: kind = VDP_KIND_EXEC; s = a->target; break;
         default:
             a->why = "not_in_fragment";
@@ -725,7 +817,7 @@ static bool certify(const struct policy *p, struct action *a) {
         case ACT_FILE_STAT:
         case ACT_FILE_ACCESS:
         case ACT_FILE_READLINK: kind = VDPC_PATH; s = a->resolved; break;
-        case ACT_NET_CONNECT:  kind = VDPC_HOST; s = a->target;   break;
+        case ACT_NET_CONNECT:  kind = VDPC_HOST; s = a->resolved; break;   /* v1.21 */
         case ACT_PROCESS_EXEC: kind = VDPC_EXEC; s = a->target;   break;
         default:
             snprintf(a->check_why, sizeof a->check_why, "no certificate for this action kind");
@@ -848,6 +940,10 @@ struct warden_plan_ud {
     const struct policy *policy;
 };
 
+/* v1.21 (warden_net.inc.c): a net_connect step's destination as the runtime
+ * spells it. */
+static int net_plan_canon(const char *in, char *out, size_t n, char *why, size_t wn);
+
 /* Adapter decider that wraps the existing per-action policy_decide()
  * for use by warden_adapter_verify(). The plan_spec_action_t's
  * (kind, target) pair is sufficient because policy_decide() only
@@ -877,22 +973,31 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
     if (act.kind == ACT_FILE_OPEN) {
         (void)plan_lexical_canon(act.target, act.resolved, sizeof(act.resolved));
     }
-    /* v1.18.0: the runtime refuses every connect and every launch after the
-     * first, whatever the policy says (deny-only since v1.9.1). Through
-     * v1.17.0 the gate still asked the policy about them, so a plan whose
-     * connect or launch step the policy allowed was authorized although that
-     * step would certainly be refused once the agent ran it. The gate now
-     * says what will happen: UNSATISFIED. (A plan lists what the agent will
-     * do after it starts, so every process_exec step is a later launch.) */
-    if (act.kind == ACT_NET_CONNECT || act.kind == ACT_PROCESS_EXEC) {
+    /* v1.18.0: the runtime refuses every launch after the first, whatever
+     * the policy says, so a process_exec step is UNSATISFIED (a plan lists
+     * what the agent does after it starts, so every such step is a later
+     * launch). v1.21: connects are decided at runtime, so a net_connect step
+     * is decided by the policy on the destination the runtime would decide
+     * on (net_plan_canon); through v1.20.0 it was always UNSATISFIED. */
+    if (act.kind == ACT_PROCESS_EXEC) {
         log_line_start();
         fprintf(g_log, "[warden] plan: %s step \"", a->kind);
         json_escape(g_log, act.target);
-        fprintf(g_log, "\" is UNSATISFIED: the Warden refuses every %s at runtime, "
-                "whatever the policy says\n",
-                act.kind == ACT_NET_CONNECT ? "connect" : "launch after the first");
+        fprintf(g_log, "\" is UNSATISFIED: the Warden refuses every launch after the first "
+                "at runtime, whatever the policy says\n");
         fflush(g_log);
         return PLAN_DEC_UNSATISFIED;
+    }
+    if (act.kind == ACT_NET_CONNECT) {
+        char why[200];
+        if (net_plan_canon(act.target, act.resolved, sizeof act.resolved, why, sizeof why) < 0) {
+            log_line_start();
+            fputs("[warden] plan: net_connect step \"", g_log);
+            json_escape(g_log, act.target);
+            fprintf(g_log, "\" is UNKNOWN: %s\n", why);
+            fflush(g_log);
+            return PLAN_DEC_UNKNOWN;
+        }
     }
     decision_t d = policy_decide(u->policy, &act);
     if (d == DEC_ALLOW && !certify(u->policy, &act)) {
@@ -1232,7 +1337,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.20.0\","
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.21.0\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
@@ -1282,6 +1387,11 @@ static const char *errno_label(int e) {
         case ELOOP:        return "ELOOP";
         case ENAMETOOLONG: return "ENAMETOOLONG";
         case EFAULT:       return "EFAULT";
+        case EAFNOSUPPORT: return "EAFNOSUPPORT";   /* v1.21 */
+        case ENOTSOCK:     return "ENOTSOCK";
+        case EBADF:        return "EBADF";
+        case EMSGSIZE:     return "EMSGSIZE";
+        case ENOBUFS:      return "ENOBUFS";
         default:           return "ERRNO";
     }
 }
@@ -1306,6 +1416,12 @@ static void emit_pathology(uint64_t seq,
     if (a->kind == ACT_FILE_ACCESS && flags_json[0])
         snprintf(flags_json + strlen(flags_json), sizeof flags_json - strlen(flags_json),
                  "\",\"access_mode\":\"%d", a->access_mode & 7);
+    /* v1.21: a connect's socket kind and how long the dial took, so the
+     * Warden's own cost (latency_us minus dial_us) can be read per record. */
+    char net_json[64] = "";
+    if (a->kind == ACT_NET_CONNECT && a->sock_name)
+        snprintf(net_json, sizeof net_json, "\"sock\":\"%s\",\"dial_us\":%" PRIu64 ",",
+                 a->sock_name, (uint64_t)(a->dial_ns / 1000ULL));
     /* v1.12: target and resolved are escaped via json_escape(); every other
      * field is drawn from a fixed enum or an integer, so the whole record is
      * well-formed JSON regardless of agent-controlled input. */
@@ -1331,6 +1447,7 @@ static void emit_pathology(uint64_t seq,
         "\"policy_line\":%d,"
         "%s%s%s"
         "%s%s%s%s%s%s"
+        "%s"
         "\"kernel_verdict\":\"%s\","
         "\"errno\":%d,"
         "\"latency_us\":%" PRIu64 ","
@@ -1346,12 +1463,17 @@ static void emit_pathology(uint64_t seq,
         a->cert[0] ? (a->certified ? "\"check\":\"ok\"," : "\"check\":\"refused\",\"check_why\":\"") : "",
         a->cert[0] && !a->certified ? a->check_why : "",
         a->cert[0] && !a->certified ? "\"," : "",
+        net_json,
         /* v1.12.1: an ALLOW whose open then failed (EEXIST, ENXIO, ...)
          * delivered nothing; say so rather than reporting ALLOW.
          * v1.18.0: a refusal names the errno the agent actually received
          * (EACCES). Through v1.17.0 it said "EPERM", which the Warden never
          * sends for a mediated call. */
-        d_final == DEC_ALLOW ? (kernel_errno ? "ERRNO" : "ALLOW")
+        /* v1.21: a connect handed over still in progress (EINPROGRESS, as the
+         * agent's own non-blocking connect would say) was allowed and made. */
+        d_final == DEC_ALLOW ? ((kernel_errno && !(a->kind == ACT_NET_CONNECT &&
+                                                   kernel_errno == EINPROGRESS))
+                                ? "ERRNO" : "ALLOW")
                              : errno_label(kernel_errno ? kernel_errno : EACCES),
         kernel_errno,
         (uint64_t)(latency_ns / 1000ULL),
@@ -1427,21 +1549,25 @@ static void send_errno(int notify_fd, uint64_t id, int err) {
  *   on the canonical path of the object the resolution actually reached, and
  *   that same object is what is delivered. A symlink in an allowed directory
  *   that points at a denied file is decided as the denied file.
- *   RESOLVE_NO_MAGICLINKS — /proc/<pid>/fd/N, /proc/<pid>/cwd, exe and root do
- *                           not resolve.
- *   /proc/self — an ordinary symlink, but resolved by the SUPERVISOR it would
- *                name the supervisor's own process. So (v1.12.3) a leading
- *                /proc/self or /proc/thread-self in the agent's path is
- *                rewritten to the agent's own /proc/<tgid> before resolution
- *                (it is a magic link RESOLVE_NO_MAGICLINKS would otherwise
- *                refuse). A planted symlink pointing at a magic link such as
- *                /proc/self/mem is refused by RESOLVE_NO_MAGICLINKS during
- *                resolution. After resolution any object on a procfs mount must
- *                lie under /proc/<the agent's tgid>/ or be a non-process /proc
- *                entry; a numeric /proc/<pid> that is not the agent's (the
- *                supervisor's own, or another process's) fails closed. An
- *                object under the agent's own /proc/<tgid>/ is decided and
- *                recorded as /proc/self/..., which is how policies name it.
+ *   RESOLVE_NO_MAGICLINKS — the kernel's magic links (/proc/<pid>/fd/N, cwd,
+ *                           exe, root, ns/, map_files/) do not resolve.
+ *   /proc/self — an ordinary symlink (not a magic link: RESOLVE_NO_MAGICLINKS
+ *                follows it), but resolved by the SUPERVISOR it names the
+ *                supervisor's own process. So (v1.12.3) a leading /proc/self or
+ *                /proc/thread-self in the agent's path is rewritten to the
+ *                agent's own /proc/<tgid> before resolution; without that, the
+ *                check below would refuse every /proc/self path, since it would
+ *                reach the supervisor's /proc/<pid>. After resolution any object
+ *                on a procfs mount must lie under /proc/<the agent's tgid>/ or be
+ *                a non-process /proc entry; a numeric /proc/<pid> that is not the
+ *                agent's (the supervisor's own, or another process's) fails
+ *                closed. That check, check_proc_object(), is what refuses a
+ *                planted symlink pointing at /proc/self/mem: it resolves to the
+ *                supervisor's /proc/<pid>/mem and is refused there. (v1.21
+ *                correction: through v1.20 this comment credited
+ *                RESOLVE_NO_MAGICLINKS with that refusal.) An object under the
+ *                agent's own /proc/<tgid>/ is decided and recorded as
+ *                /proc/self/..., which is how policies name it.
  *   RESOLVE_BENEATH is deliberately NOT set: allow rules legitimately name
  *   absolute paths outside the cwd. `..` is defanged by deciding on the
  *   post-collapse canonical path.
@@ -1966,9 +2092,17 @@ static int agent_fd(pid_t tid, int fd) {
         return r < 0 ? -EBADF : r;
     }
     if (fd < 0) return -EBADF;
-    pid_t tgid = task_tgid(tid);
-    if (tgid < 0) return -ESRCH;
-    int pfd = (int)syscall(__NR_pidfd_open, tgid, 0);
+    /* v1.21: the requesting task's own descriptor table, through a pidfd for
+     * that thread (PIDFD_THREAD, Linux 6.9). A task the agent started without
+     * CLONE_FILES has a table of its own, and the thread-group leader's
+     * descriptor N may be another object. Older kernels refuse the flag
+     * (EINVAL); they get the thread group's pidfd, as through v1.20. */
+    int pfd = (int)syscall(__NR_pidfd_open, tid, VAREK_PIDFD_THREAD);
+    if (pfd < 0 && errno == EINVAL) {
+        pid_t tgid = task_tgid(tid);
+        if (tgid < 0) return -ESRCH;
+        pfd = (int)syscall(__NR_pidfd_open, tgid, 0);
+    }
     if (pfd < 0) return -ESRCH;
     int r = (int)syscall(__NR_pidfd_getfd, pfd, fd, 0);
     int e = errno;
@@ -2151,6 +2285,8 @@ static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *mi
     return rc;
 }
 
+#include "warden_net.inc.c"          /* v1.21: decided connections */
+
 /* ---------------- receive loop ---------------- */
 
 static volatile sig_atomic_t g_stop = 0;
@@ -2163,7 +2299,6 @@ static void on_term(int sig) { if (sig == SIGCHLD) g_child_exited = 1; g_stop = 
 static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                       const struct policy *p, const char *bootstrap_path,
                       pid_t bootstrap_pid) {
-    uint64_t seq = 0;
     bool bootstrap_done = false;
     while (!g_stop && !g_log_broken) {
         /* v1.9.3: wait on the listener AND the target's pidfd. Blocking in
@@ -2171,17 +2306,32 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * g_stop check and the ioctl (the SIGCHLD is already spent).
          * v1.12.1: also on the agent's stderr pipe, which is relayed. A
          * negative fd is ignored by poll(). */
-        struct pollfd pfds[3] = {
+        /* v1.21: also on the sockets of connects and sends still being
+         * finished for the agent (warden_net.inc.c). */
+        struct pollfd pfds[3 + MAX_PENDING] = {
             { .fd = notify_fd,    .events = POLLIN },
             { .fd = target_pidfd, .events = POLLIN },
             { .fd = agent_err_fd, .events = POLLIN },
         };
+        int npoll = g_npend;
+        for (int i = 0; i < npoll; i++) {
+            pfds[3 + i].fd = g_pend[i]->kind == PEND_UNIX_RETRY ? -1 : g_pend[i]->sock;
+            pfds[3 + i].events = POLLOUT;
+            pfds[3 + i].revents = 0;
+        }
         /* v1.16: checkpoints are written here, between notifications, so
          * signing never delays an answer the agent is waiting for. */
-        int pr = poll(pfds, 3, maybe_checkpoint());
+        int to = maybe_checkpoint(), pto = pend_timeout_ms();
+        if (pto >= 0 && (to < 0 || pto < to)) to = pto;
+        int pr = poll(pfds, (nfds_t)(3 + npoll), to);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return false;
+        }
+        if (npoll > 0) {
+            short rev[MAX_PENDING];
+            for (int i = 0; i < npoll; i++) rev[i] = pfds[3 + i].revents;
+            pend_service(notify_fd, rev, npoll);
         }
         if (agent_err_fd >= 0 && (pfds[2].revents & (POLLIN | POLLHUP | POLLERR))) {
             if (relay_agent_stderr(agent_err_fd, false) < 0) agent_err_fd = -1;
@@ -2211,7 +2361,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                          + (t1.tv_nsec - t0.tv_nsec);
-            emit_pathology(seq++, req.pid, &act, DEC_UNKNOWN, DEC_DENY,
+            emit_pathology(g_report_seq++, req.pid, &act, DEC_UNKNOWN, DEC_DENY,
                            "intent_derivation_failed", lat, EACCES);
             send_simple(notify_fd, req.id, DEC_DENY);
             continue;
@@ -2249,7 +2399,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat_b = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                            + (t1.tv_nsec - t0.tv_nsec);
-            emit_pathology(seq++, req.pid, &act, DEC_ALLOW, DEC_ALLOW,
+            emit_pathology(g_report_seq++, req.pid, &act, DEC_ALLOW, DEC_ALLOW,
                            "bootstrap_exec_allow", lat_b, 0);
             send_simple(notify_fd, req.id, DEC_ALLOW);
             continue;
@@ -2280,7 +2430,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                 clock_gettime(CLOCK_MONOTONIC, &t1);
                 uint64_t lat_m = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                                + (t1.tv_nsec - t0.tv_nsec);
-                emit_pathology(seq++, req.pid, &act,
+                emit_pathology(g_report_seq++, req.pid, &act,
                                strcmp(mforbid, "resolution_failed") ? DEC_DENY : DEC_UNKNOWN,
                                DEC_DENY, mforbid, lat_m, EACCES);
                 send_simple(notify_fd, req.id, DEC_DENY);
@@ -2300,7 +2450,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                     clock_gettime(CLOCK_MONOTONIC, &t1);
                     uint64_t lat_a = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                                    + (t1.tv_nsec - t0.tv_nsec);
-                    emit_pathology(seq++, req.pid, &act, DEC_ALLOW, DEC_ALLOW,
+                    emit_pathology(g_report_seq++, req.pid, &act, DEC_ALLOW, DEC_ALLOW,
                                    "metadata_ancestor", lat_a, r < 0 ? (int)-r : 0);
                     continue;
                 }
@@ -2320,7 +2470,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                 if (mfd >= 0) close(mfd);
                 uint64_t lat_m = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                                + (t1.tv_nsec - t0.tv_nsec);
-                emit_pathology(seq++, req.pid, &act, m_raw, m_final,
+                emit_pathology(g_report_seq++, req.pid, &act, m_raw, m_final,
                                m_cert_refused ? "certificate_refused" : decision_rule_id(&act, m_raw),
                                lat_m, EACCES);
                 send_simple(notify_fd, req.id, DEC_DENY);
@@ -2341,8 +2491,23 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat_m = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                            + (t1.tv_nsec - t0.tv_nsec);
-            emit_pathology(seq++, req.pid, &act, m_raw, m_final, rule, lat_m,
+            emit_pathology(g_report_seq++, req.pid, &act, m_raw, m_final, rule, lat_m,
                            r < 0 ? (int)-r : 0);
+            continue;
+        }
+
+        /* v1.21: connects are decided on the destination the Warden will
+         * dial, dialed by the Warden and handed over (warden_net.inc.c).
+         * Sends with no destination of their own on a TCP or UDP socket are
+         * relayed; the rest fall through to the refusal below. */
+        if (act.kind == ACT_NET_CONNECT) {
+            net_connect(notify_fd, &req, &act, p, &t0);
+            continue;
+        }
+        if (act.kind == ACT_NET_SEND && net_send_relay(notify_fd, &req, &act, &t0))
+            continue;
+        if (act.kind == ACT_NET_BIND) {
+            net_bind(notify_fd, &req, &act, &t0);
             continue;
         }
 
@@ -2358,7 +2523,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                 clock_gettime(CLOCK_MONOTONIC, &t1);
                 uint64_t lat_r = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                                + (t1.tv_nsec - t0.tv_nsec);
-                emit_pathology(seq++, req.pid, &act, DEC_UNKNOWN, DEC_DENY,
+                emit_pathology(g_report_seq++, req.pid, &act, DEC_UNKNOWN, DEC_DENY,
                                "resolution_failed", lat_r, EACCES);
                 send_simple(notify_fd, req.id, DEC_DENY);
                 continue;
@@ -2373,7 +2538,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                 clock_gettime(CLOCK_MONOTONIC, &t1);
                 uint64_t lat_f = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                                + (t1.tv_nsec - t0.tv_nsec);
-                emit_pathology(seq++, req.pid, &act, DEC_DENY, DEC_DENY, forbid, lat_f, EACCES);
+                emit_pathology(g_report_seq++, req.pid, &act, DEC_DENY, DEC_DENY, forbid, lat_f, EACCES);
                 send_simple(notify_fd, req.id, DEC_DENY);
                 continue;
             }
@@ -2414,7 +2579,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                 clock_gettime(CLOCK_MONOTONIC, &t1);
                 uint64_t lat = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                              + (t1.tv_nsec - t0.tv_nsec);
-                emit_pathology(seq++, req.pid, &act, d_raw, d_final, rule, lat, err);
+                emit_pathology(g_report_seq++, req.pid, &act, d_raw, d_final, rule, lat, err);
                 continue;
             }
             /* Denied by policy: the pinned object was never opened. */
@@ -2422,23 +2587,23 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat_d = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                            + (t1.tv_nsec - t0.tv_nsec);
-            emit_pathology(seq++, req.pid, &act, d_raw, d_final,
+            emit_pathology(g_report_seq++, req.pid, &act, d_raw, d_final,
                            cert_refused ? "certificate_refused" : decision_rule_id(&act, d_raw),
                            lat_d, EACCES);
             send_simple(notify_fd, req.id, d_final);
             continue;
         }
 
-        /* v1.9.1: deny-only network/exec mediation. A connect/execve
-         * allow cannot be enforced via CONTINUE without a TOCTOU race
-         * on its pointer argument, and there is no fd to inject
-         * (dial-and-inject is a v1.10 item). Fail closed. */
+        /* v1.9.1: deny-only mediation of what remains: a launch after the
+         * first (an execve allow cannot be enforced via CONTINUE without a
+         * TOCTOU race on its pointer argument). v1.21: connects no longer
+         * reach here; the Warden dials them (net_connect above). */
         if (d_final == DEC_ALLOW && act.kind != ACT_FILE_OPEN) {
             d_final = DEC_DENY;
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat_dn = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                             + (t1.tv_nsec - t0.tv_nsec);
-            emit_pathology(seq++, req.pid, &act, d_raw, d_final,
+            emit_pathology(g_report_seq++, req.pid, &act, d_raw, d_final,
                            "deny_only_nonfile_v191", lat_dn, EACCES);
             send_simple(notify_fd, req.id, d_final);
             continue;
@@ -2448,7 +2613,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         clock_gettime(CLOCK_MONOTONIC, &t1);
         uint64_t lat = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                      + (t1.tv_nsec - t0.tv_nsec);
-        emit_pathology(seq++, req.pid, &act, d_raw, d_final,
+        emit_pathology(g_report_seq++, req.pid, &act, d_raw, d_final,
                        decision_rule_id(&act, d_raw),
                        lat, d_final == DEC_ALLOW ? 0 : EACCES);
     }
@@ -2868,6 +3033,7 @@ static char g_state_name[NAME_MAX + 1];
 static char g_state_tmp[NAME_MAX + 1];
 static const char *g_breaker_path;      /* for messages */
 static const char *g_session = "default";
+static bool g_check_only = false;       /* v1.21: --check-startup */
 static int  g_gate_status_fd = -1;      /* --gate-status */
 
 enum { GATE_PASS = 0, GATE_ERROR = 1, GATE_RETRYABLE = 3, GATE_TERMINAL_DENY = 4,
@@ -3060,7 +3226,7 @@ static int flow_setup(const struct policy *pol, const char *cfg_path, const char
                                   O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
         close(gd);
         if (g_gate_status_fd < 0 || fstat(g_gate_status_fd, &gs) < 0 || !own_private_file(&gs) ||
-            ftruncate(g_gate_status_fd, 0) != 0) {
+            (!g_check_only && ftruncate(g_gate_status_fd, 0) != 0)) {
             fprintf(stderr, "[warden] --gate-status %s: %s; refusing to start\n", gate_status_path,
                     g_gate_status_fd < 0 ? strerror(errno)
                                          : "must be a regular file owned by the Warden's user and "
@@ -3184,8 +3350,14 @@ static int warden_gate_plan_flow(const char *plan_path, const struct policy *pol
         plan_decision_t d = warden_plan_decider(sa, &ud);
         if (exec_plan_add_node(plan, sa->label, d) == PLAN_NODE_ID_INVALID) goto out;
         const char *tgt = sa->target ? sa->target : "";
+        char nwhy[200];
         if (sa->kind && strcmp(sa->kind, "file_open") == 0 &&
             plan_lexical_canon(tgt, canon[i], sizeof canon[i]) == 0)
+            tgt = canon[i];
+        /* v1.21: a connect step's destination in the spelling the node check
+         * and the runtime decide on. */
+        else if (sa->kind && strcmp(sa->kind, "net_connect") == 0 &&
+                 net_plan_canon(tgt, canon[i], sizeof canon[i], nwhy, sizeof nwhy) == 0)
             tgt = canon[i];
         plan_action_arg_t *a = &args[i * per_step];
         a[0].key = "target";
@@ -3359,8 +3531,10 @@ static void usage(const char *argv0) {
         "              [--sign-key <key>]\n"
         "              [--anchor <path>] [--checkpoint-every <n>] [--run-as <user>]\n"
         "              -- <target> [args...]\n"
+        "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
         "\n"
         "  Privileged seccomp-unotify supervisor (VAREK Warden v1.4).\n"
+        "  --check-startup runs the startup checks and exits (0: would start).\n"
         "\n"
         "  Requires CAP_SYS_ADMIN (run as root or via sudo): the target runs\n"
         "  as init of its own PID namespace so it, and everything it spawns,\n"
@@ -3370,8 +3544,10 @@ static void usage(const char *argv0) {
         "\n"
         "  Optional --plan <plan.txt> enables v1.6 pre-execution plan\n"
         "  verification. The target is not forked unless the plan\n"
-        "  verifies as SATISFIED against the loaded policy. A net_connect or\n"
-        "  process_exec step is UNSATISFIED: the runtime refuses those (v1.18).\n"
+        "  verifies as SATISFIED against the loaded policy. A process_exec\n"
+        "  step is UNSATISFIED: the runtime refuses launches (v1.18). v1.21: a\n"
+        "  net_connect step is decided like the connect it names (a.b.c.d:port,\n"
+        "  [IPv6]:port or unix:/path; a host name is UNKNOWN until stage 2).\n"
         "  v1.20: a step may declare key=value fields after its target; they\n"
         "  reach only the --flow-policy's rules (see v1_6/plan_parser.h), and a\n"
         "  flow policy whose rules match them must declare trust_declared_fields.\n"
@@ -3396,6 +3572,16 @@ static void usage(const char *argv0) {
         "  Ed25519; --anchor <path> also appends each checkpoint to <path>\n"
         "  (append-only or off-host storage). tools/varek_audit.py verifies both.\n"
         "\n"
+        "  v1.21 decided connections: each connect is decided on the destination\n"
+        "  the Warden will dial (host rules; the checker confirms any ALLOW),\n"
+        "  dialed by the Warden outside the agent's empty network namespace, and\n"
+        "  handed over in place of the agent's socket (SECCOMP_IOCTL_NOTIF_ADDFD).\n"
+        "  TCP and UDP over IPv4 and IPv6, and Unix sockets named by a path.\n"
+        "  Refused whatever the policy says: sends that name a destination,\n"
+        "  abstract Unix addresses, inbound calls, other socket kinds.\n"
+        "\n"
+        , argv0, argv0);
+    fputs(
         "  v1.17: the agent runs as an unprivileged user with no capabilities.\n"
         "  --run-as <user|uid[:gid]> picks the user (default nobody); --run-as root\n"
         "  keeps the pre-v1.17 behaviour and prints a warning. The Warden still\n"
@@ -3406,8 +3592,10 @@ static void usage(const char *argv0) {
         "  Policy file format (one rule per line):\n"
         "    allow path /tmp/safe/\n"
         "    deny  path /etc/\n"
-        "    allow host 127.0.0.1:8080\n"
-        "    deny  host evil.example.com\n"
+        "    allow host 127.0.0.1:8080          (v1.21: the Warden dials it and\n"
+        "    allow host [::1]                    hands over the socket; a numeric\n"
+        "    allow host unix:/run/app.sock       address, [IPv6] or unix:/path;\n"
+        "    deny  host 203.0.113.7              names never match: stage 2)\n"
         "    allow exec /usr/bin/env\n"
         "    allow path /var/log/ readonly     (v1.13: access=ro -O_CREAT -O_TRUNC)\n"
         "    deny  path suffix .pem            (v1.14 matchers: exact, prefix,\n"
@@ -3425,7 +3613,7 @@ static void usage(const char *argv0) {
         "  canonical path (. and .. collapsed); it must be absolute. Symlinks\n"
         "  are not followed at plan time (there is no agent yet), so the gate is\n"
         "  an advisory pre-check and every open is still mediated at runtime.\n",
-        argv0);
+        stderr);
 }
 
 int main(int argc, char **argv) {
@@ -3433,7 +3621,16 @@ int main(int argc, char **argv) {
      * Accepted forms:
      *   warden policy.txt -- target [args...]
      *   warden policy.txt --plan plan.txt -- target [args...] */
-    if (argc < 4) { usage(argv[0]); return 2; }
+    /* v1.21: `warden <policy> [options] --check-startup` runs every check the
+     * Warden makes before it starts an agent (the policy in both parsers, the
+     * verdict stream, --sign-key, --anchor, raw devices, and with
+     * --flow-policy the flow policy's progress safety and budgets, the breaker
+     * state directory, lock and table, and --gate-status), then exits: 0 if
+     * the Warden would start, 1 with the reason otherwise. No agent runs and
+     * no verdict stream is written. tools/varek_preflight.sh uses it. */
+    for (int i = 2; i < argc && strcmp(argv[i], "--"); i++)
+        if (!strcmp(argv[i], "--check-startup")) g_check_only = true;
+    if (argc < (g_check_only ? 3 : 4)) { usage(argv[0]); return 2; }
 
     const char *policy_path = argv[1];
     const char *plan_path   = NULL;
@@ -3448,6 +3645,7 @@ int main(int argc, char **argv) {
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) { sep_idx = i; break; }
+        if (strcmp(argv[i], "--check-startup") == 0) continue;
         if (i + 1 >= argc) { usage(argv[0]); return 2; }
         if (strcmp(argv[i], "--plan") == 0 && !plan_path) {
             plan_path = argv[++i];
@@ -3480,8 +3678,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (sep_idx < 0 || sep_idx + 1 >= argc) { usage(argv[0]); return 2; }
-    if (flow_path && !plan_path) {
+    if (!g_check_only && (sep_idx < 0 || sep_idx + 1 >= argc)) { usage(argv[0]); return 2; }
+    if (flow_path && !plan_path && !g_check_only) {
         fprintf(stderr, "[warden] --flow-policy checks a plan; give --plan too\n");
         return 2;
     }
@@ -3489,7 +3687,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[warden] --session, --breaker-state and --gate-status need --flow-policy\n");
         return 2;
     }
-    char *const *target_argv = &argv[sep_idx + 1];
+    char *const *target_argv = sep_idx >= 0 && sep_idx + 1 < argc ? &argv[sep_idx + 1] : NULL;
 
     /* v1.17.0: who the agent runs as, and the program it launches. */
     struct run_as ra;
@@ -3508,13 +3706,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[warden] WARNING: --run-as root: the agent runs as root with every "
                 "capability (the pre-v1.17 behaviour); only the seccomp filter holds it back\n");
     static char boot_path[PATH_MAX];
-    if (find_program(target_argv[0], boot_path, sizeof boot_path) < 0) {
+    if (target_argv && find_program(target_argv[0], boot_path, sizeof boot_path) < 0) {
         fprintf(stderr, "[warden] %s: program not found (or not a regular file)\n", target_argv[0]);
         return 127;
     }
 
     const int pidns = getenv("VAREK_WARDEN_NO_PIDNS") == NULL;
-    if (pidns && !have_cap_sys_admin()) {
+    if (pidns && !have_cap_sys_admin() && !g_check_only) {
         fprintf(stderr,
             "[warden] CAP_SYS_ADMIN is required (run as root or via sudo). The "
             "Warden runs the agent in its own PID namespace so the agent and "
@@ -3541,6 +3739,17 @@ int main(int argc, char **argv) {
     if ((key_path || anchor_path) && refuse_raw_devices(&p) < 0) return 1;
     if (flow_path && flow_setup(&p, flow_path, state_arg, session_arg, gstatus_arg) < 0)
         return 1;                                                           /* v1.18.0 */
+    if (g_check_only) {
+        fprintf(stderr, "[warden] startup checks passed: the policy%s%s%s%s would be accepted%s\n",
+                key_path ? ", the signing key" : "", anchor_path ? ", the anchor" : "",
+                flow_path ? ", the flow policy, the breaker state" : "",
+                gstatus_arg ? ", --gate-status" : "",
+                pidns && !have_cap_sys_admin() ? " (but this user lacks CAP_SYS_ADMIN, which "
+                "a run needs)" : "");
+        if (g_sk) sodium_free(g_sk);
+        return 0;
+    }
+    if (!target_argv) { usage(argv[0]); return 2; }
     /* A FIFO anchor whose reader went away must fail the write (EPIPE, then
      * an anchor_error record), not kill the Warden. The agent gets the
      * default disposition back before it runs (see the child below). */
@@ -3775,6 +3984,19 @@ int main(int argc, char **argv) {
             mine[a] = theirs[b] = '\0';
             netns = strcmp(mine, theirs) ? "on" : "off";
         }
+        /* v1.21: both namespaces, held open: a connect's socket options are
+         * compared with a socket made in the agent's (warden_net.inc.c). */
+        g_host_netns = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+        g_agent_netns = open(path, O_RDONLY | O_CLOEXEC);
+        g_netns_separate = !strcmp(netns, "on");
+        if (g_netns_separate && (g_host_netns < 0 || g_agent_netns < 0)) {
+            fprintf(stderr, "[warden] cannot hold the network namespaces (%s); refusing to "
+                    "supervise\n", strerror(errno));
+            kill_target_tree(target);
+            waitpid(target, NULL, 0);
+            return 1;
+        }
+        sockref_warm();
     }
     fprintf(stderr,
         "[warden] supervising pid=%d  notify_fd=%d  policy=%s (%zu rules)  pidns=%s  netns=%s"

@@ -53,7 +53,7 @@ policy match. This closes three escapes:
 - **`/proc/self` context confusion.** `/proc/self/*` is a magic symlink the
   kernel resolves in the **caller's** context — here the supervisor's. An agent
   opening `/proc/self/mem` received a read/write handle on the Warden's own
-  address space. `RESOLVE_NO_MAGICLINKS` (now actually set) refuses it.
+  address space. `RESOLVE_NO_MAGICLINKS` (now actually set) refuses it. *(Correction, v1.21.0: `/proc/self` is an ordinary symlink, not a magic link, so `RESOLVE_NO_MAGICLINKS` does not refuse it. In v1.12.0 to v1.12.2 `RESOLVE_NO_SYMLINKS` refused it, like any symlink; from v1.12.3 a leading `/proc/self` is mapped to the agent and a post-resolution `/proc` check refuses another process's `/proc/<pid>`.)*
 
 ### Audit-log integrity
 

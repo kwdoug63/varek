@@ -41,7 +41,10 @@ The default origin is **httpbin.org**, a public HTTP testing service whose `/ima
 ORIGIN_HOST=images.unsplash.com ./setup.sh
 ```
 
-Then run the agent under Warden using the command `setup.sh` prints:
+Then run the agent under Warden using the command `setup.sh` prints. *(The
+fetch works from Warden v1.21, which dials each allowed connect and hands the
+agent the socket. Through v1.20.0 every connect was refused whatever the
+policy said, so this example's fetch failed; correction, v1.21.0.)*
 
 ```sh
 sudo ./varek/v1_4/warden \
@@ -59,10 +62,12 @@ If the agent — or anything operating through it — attempts to fetch from a n
  "agent_pid":12345,
  "action":"net.connect",
  "target":"203.0.113.99:443",
+ "resolved":"203.0.113.99:443",
  "decision_raw":"UNKNOWN",
  "decision_final":"DENY",
  "rule":"default_deny_unknown",
- "kernel_verdict":"EPERM",
+ "sock":"tcp",
+ "kernel_verdict":"EACCES",
  "latency_us":71,
  "timestamp_ns":1747100000000000000}
 ```
@@ -71,7 +76,7 @@ The agent's reasoning never proceeded on tampered input, because the input never
 
 ### Iterating the policy
 
-First runs usually surface one or two paths the agent touches that `setup.sh` didn't predict — a config file under `/etc/`, a cache directory under `$HOME`, a font for a media library. Each denial emits a pathology record naming the exact target. Add an `allow path` rule for it and re-run. The policy converges quickly because the trapped syscall set is small (`openat`, `connect`, `execve`).
+First runs usually surface one or two paths the agent touches that `setup.sh` didn't predict — a config file under `/etc/`, a cache directory under `$HOME`, a font for a media library. Each denial emits a pathology record naming the exact target. Add an `allow path` rule for it and re-run. The policy converges quickly because the calls the Warden decides are few (file opens and lookups, connects, launches).
 
 ### Framework drop-in
 
@@ -79,6 +84,6 @@ Because enforcement happens at the syscall boundary, the agent framework lives *
 
 ### DNS caveat
 
-Warden matches `connect()` calls against resolved IPs. `setup.sh` handles this by resolving the origin once at setup time and pinning the IP in the policy, plus allowing the system DNS resolver (`127.0.0.53:53` on systemd-resolved hosts) so the agent's own `getaddrinfo` succeeds at runtime.
+Warden matches `connect()` calls against resolved IPs. `setup.sh` handles this by resolving the origin once at setup time and pinning the IP in the policy, plus allowing the system DNS resolver (`127.0.0.53:53` on systemd-resolved hosts) so the agent's own `getaddrinfo` succeeds at runtime. Allowing the resolver also lets the agent send whatever it likes to it inside DNS queries; host names without agent DNS are the planned v1.21 stage 2 ([design](../../docs/security/v1.21-stage2-host-names.md)).
 
 For higher-assurance setups, pre-resolve in code and drop the DNS-resolver allow rule entirely. The agent then connects only to a pinned IP and the resolver path is dead.

@@ -77,7 +77,14 @@ does what:
   context) fails at resolution, before any policy or `/proc` check. This is why a
   *leading* `/proc/self` in the agent's own path has to be rewritten to
   `/proc/<tgid>` first — otherwise the agent could not name its own `/proc` at
-  all.
+  all. *(Correction, v1.21.0: `/proc/<pid>/fd/N` is a magic link, but
+  `/proc/self` and `/proc/thread-self` are ordinary symlinks, which
+  `RESOLVE_NO_MAGICLINKS` follows. A planted symlink to `/proc/self/mem`
+  resolves, in the Warden's context, to the Warden's own `/proc/<pid>/mem`, and
+  the second guard below refuses it. The rewrite of a leading `/proc/self` is
+  needed because, unrewritten, it would reach the Warden's `/proc/<pid>` and
+  that guard would refuse it. The outcome was always a refusal; only the
+  mechanism was misnamed.)*
 - A path or symlink that reaches another process's **numeric** `/proc/<pid>/…`
   (the Warden's own, or any other process's) is an ordinary path that resolves
   fine; the post-resolution check refuses it because `<pid>` is not the agent's

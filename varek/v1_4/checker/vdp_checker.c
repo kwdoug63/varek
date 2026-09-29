@@ -520,8 +520,12 @@ static bool str_holds(const vdpc_rule_t *r, const char *s, size_t sl) {
              * dominate the cost of an open. */
             return memmem(s, sl, c, cl) != NULL;
         case M_HOST:
+            /* v1.21: a constant with no port matches every port: colon-free
+             * (IPv4), or a bracketed IPv6 address ("[::1]"). */
             if (sl == cl && memcmp(s, c, cl) == 0) return true;
-            if (memchr(c, ':', cl)) return false;
+            if (memchr(c, ':', cl) &&
+                !(cl >= 2 && c[0] == '[' && c[cl - 1] == ']' && !memchr(c + 1, ']', cl - 2)))
+                return false;
             return sl > cl && memcmp(s, c, cl) == 0 && s[cl] == ':';
         case M_GLOB:
             if (sl < r->minlen || (r->fixed && sl != r->minlen)) return false;

@@ -802,7 +802,10 @@ change.
   or `/proc/thread-self` (a magic link `RESOLVE_NO_MAGICLINKS` would otherwise
   refuse) is rewritten to the agent's own `/proc/<tgid>` before resolution. A
   planted symlink pointing at `/proc/self/mem` is a magic link and is refused
-  during resolution. A path or symlink reaching another process's numeric
+  during resolution. *(Correction, v1.21.0: `/proc/self` is an ordinary symlink,
+  which `RESOLVE_NO_MAGICLINKS` follows; the planted link resolves to the
+  Warden's own `/proc/<pid>/mem` and the post-resolution `/proc` check refuses
+  it.)* A path or symlink reaching another process's numeric
   `/proc/<pid>/…` resolves, then fails the post-resolution check because it is
   not the agent's `/proc/<tgid>`. The agent's own entries are recorded as
   `/proc/self/…`. A non-process `/proc` entry (`/proc/kcore`, `/proc/sys/…`) is
@@ -992,6 +995,7 @@ is unaffected by and orthogonal to this release.
     kernel resolves in the **caller's** context — the supervisor's, not the
     agent's — so `open("/proc/self/mem")` returned a handle on the Warden.
     `RESOLVE_NO_MAGICLINKS` now refuses it.
+    *(Correction, v1.21.0: `/proc/self` is an ordinary symlink, not a magic link, so `RESOLVE_NO_MAGICLINKS` does not refuse it. In v1.12.0 to v1.12.2 `RESOLVE_NO_SYMLINKS` refused it, like any symlink; from v1.12.3 a leading `/proc/self` is mapped to the agent and a post-resolution `/proc` check refuses another process's `/proc/<pid>`.)*
 - **Audit-log integrity.** The agent-controlled pathname was written into the
   JSON pathology record unescaped, so a crafted path could inject a forged
   `"decision_final":"ALLOW"` record into the verdict stream. All

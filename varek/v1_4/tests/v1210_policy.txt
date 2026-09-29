@@ -1,0 +1,20 @@
+# v1.21 decided-connections regression policy (test_v1210.sh). The probe is
+# static, so no loader paths. Destinations the probe must reach are allowed
+# by address; everything else is refused by default.
+require warden 1.21
+allow path /tmp/varek_v1210/work/
+allow host 127.0.0.1:18181                     # TCP echo
+allow host 127.0.0.1:18183                     # UDP echo
+allow host 127.0.0.1:18184                     # a listener that never accepts
+allow host 127.0.0.1:18185                     # nothing listens here
+allow host 127.0.0.1:18186                     # TCP, greets "A" (the race's allowed side)
+allow host [::1]:18181                         # IPv6 echo, where the host has IPv6
+allow host [2001:db8::1]:443                   # decided but not dialable here
+allow host unix:/tmp/varek_v1210/sock/s.sock
+allow host unix:/tmp/varek_v1210/sock/d.sock
+allow host unix:/tmp/varek_v1210/sock/q.sock
+allow host unix:/tmp/varek_v1210/sock/root.sock   # allowed, but only root may use it
+# 127.0.0.1:18182, [2001:db8::2]:443 and /tmp/varek_v1210/outside/other.sock
+# are not named: refused.
+allow host 127.0.0.1:18190                     # benchmark: accept and close
+allow host unix:/tmp/varek_v1210/sock/bench.sock

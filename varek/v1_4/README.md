@@ -8,9 +8,15 @@ supervisor-side path resolution, and structured decision logging.
 
 The Warden runs as a privileged parent process. It forks a child,
 installs a seccomp filter in the child, and acquires the supervisor
-side of the unotify channel via `SCM_RIGHTS`. Trapped syscalls in this
-release: `openat`, `connect`, `execve`, `execveat`. Other syscalls are
-allowed through the BPF filter.
+side of the unotify channel with `pidfd_getfd` (v1.12; through v1.9.3,
+`SCM_RIGHTS`). The filter is default-deny (v1.9.2): the calls it routes to
+the Warden are `openat`, `connect`, `execve`, `execveat`, the metadata
+lookups (`newfstatat`, `statx`, `access`, `faccessat`, `faccessat2`,
+`readlink`, `readlinkat`), `sendmsg`, `sendmmsg`, `bind`, and `sendto` when it
+names a destination (v1.21); the rest are admitted or refused by the filter
+itself (`warden_baseline_filter.c`). *(Correction, v1.21.0: through v1.20.0
+this paragraph described the v1.4 prototype: four trapped calls, everything
+else allowed, the listener passed with `SCM_RIGHTS`.)*
 
 For each notification, the Warden:
 
@@ -23,9 +29,10 @@ For each notification, the Warden:
    to the agent as `EACCES` (symmetric suppression), and the record's
    `kernel_verdict` says `EACCES`. A system call the filter neither
    admits nor mediates is handled by the filter itself and not recorded:
-   most get `EPERM`, a hard-denied one (`ptrace`, `bpf`, `io_uring_setup`
+   most get `EPERM`, a hard-denied one (`ptrace`, `bpf`, `io_uring_enter`
    and the others in `warden_baseline_filter.c`) kills the agent, and
-   `clone3` gets `ENOSYS` so that libc falls back to `clone`.
+   `clone3` and (v1.21) `io_uring_setup` get `ENOSYS` so that libc falls
+   back to `clone` and libuv to epoll.
 4. For path-argument syscalls on `ALLOW`, resolves the path itself
    with `openat2(RESOLVE_NO_MAGICLINKS)` rooted at `/proc/<pid>/cwd`
    (ordinary symlinks followed since v1.12.3, deciding on the object's
@@ -33,7 +40,12 @@ For each notification, the Warden:
    resolved descriptor through
    `SECCOMP_IOCTL_NOTIF_ADDFD` with `SECCOMP_ADDFD_FLAG_SEND`. The
    kernel does not re-read the userspace pathname pointer.
-5. Emits a JSON pathology record with `CLOCK_MONOTONIC` decision
+5. For `connect` on `ALLOW` (v1.21), dials the destination it decided on
+   itself, from its own network namespace, with a socket of the agent's
+   kind carrying the options the agent set, and puts the connected socket
+   in place of the agent's descriptor (`SECCOMP_IOCTL_NOTIF_ADDFD` with
+   `SECCOMP_ADDFD_FLAG_SETFD`). See "Decided connections" below.
+6. Emits a JSON pathology record with `CLOCK_MONOTONIC` decision
    latency in microseconds.
 
 ## Layout
@@ -166,8 +178,11 @@ require warden <major>.<minor>      (v1.13: an older Warden refuses the file)
           suffix                   ends with it
           contains                 contains it
           glob                     matches the glob (below), anchored
-  constant := without a matcher: a prefix (path), "host:port" or "host"
-          (host), an absolute path (exec)
+  constant := without a matcher: a prefix (path), an absolute path
+          (exec), or for host: a.b.c.d:port, a.b.c.d (any port),
+          [IPv6]:port, [IPv6] (any port, v1.21) or unix:/path (exact),
+          matched against the destination as the Warden spells it; a host
+          name never matches (v1.21 stage 2), and lint says so
   flag-clause (path only, v1.13):
           readonly                 access=ro -O_CREAT -O_TRUNC
           access=ro|wo|rw          the O_ACCMODE bits only
@@ -322,10 +337,12 @@ Who can do what, afterwards:
 
 `--plan <plan.txt>` checks a declared action-graph before the agent starts; the
 agent is not started unless it is SATISFIED. Each `file_open` step is decided
-by the SMT decision procedure on its lexically canonical path. A `net_connect`
-or `process_exec` step is UNSATISFIED, since v1.18.0: the runtime refuses every
-connect and every launch after the agent's own, whatever the policy says, so a
-plan that needs one cannot run as declared.
+by the SMT decision procedure on its lexically canonical path. A
+`process_exec` step is UNSATISFIED, since v1.18.0: the runtime refuses every
+launch after the agent's own, whatever the policy says. A `net_connect` step is
+decided like the connect it names (v1.21: `a.b.c.d:port`, `[IPv6]:port`, or
+`unix:/path` lexically canonicalized); a host name is UNKNOWN until stage 2.
+From v1.18.0 to v1.20.0 every `net_connect` step was UNSATISFIED.
 
 `--flow-policy <cfg>` (v1.18.0) adds, with a label policy in the v1.7 format
 (`v1_7/example_policy.cfg`):
@@ -411,13 +428,63 @@ seccomp domain.
 A reproducer for the canonical seccomp-unotify TOCTOU race on
 pointer-argument syscalls is at `test/seccomp_toctou_harness.c`.
 
+## Decided connections (v1.21)
+
+Through v1.20.0 every connect was refused whatever the policy said
+(`deny_only_nonfile_v191`): letting an allowed connect continue in the kernel
+would let a second thread change the destination after the check. From v1.21:
+
+1. The destination is copied once from the agent's memory.
+2. It is spelt as the decision is made: `a.b.c.d:port`, `[IPv6]:port` (an
+   IPv4-mapped address as its IPv4 form), or, for a Unix socket named by a
+   path, `unix:<canonical path>` after resolving it like a file open.
+3. The SMT decision procedure decides it against the `host` rules; the
+   independent checker must accept the certificate of an ALLOW.
+4. The Warden makes a socket of the agent's kind in its own network namespace
+   (the agent's has no working interface), copies over every option the agent
+   set that differs from a fresh socket in the agent's namespace (or fails the
+   connect), and connects it to the copy it decided on; a Unix connect is made
+   with the agent's uid and gid, so the socket's permissions and the server's
+   `SO_PEERCRED` see the agent, not root.
+5. The connected socket replaces the agent's descriptor (same number, the
+   agent's close-on-exec and non-blocking state), and the agent's connect
+   returns what its own would have: 0, `EINPROGRESS` for a non-blocking socket,
+   or the dial's errno.
+
+A blocking connect that is still in progress is finished asynchronously: the
+agent's thread waits while the Warden answers other requests, and is answered
+when the socket connects, fails, or reaches the agent's `SO_SNDTIMEO`
+(`EINPROGRESS`, as the kernel does). Records carry `"sock"` (tcp, udp,
+unix-stream, ...) and `"dial_us"`; `latency_us` minus `dial_us` is the
+Warden's own time.
+
+Sends: `sendto` with no destination is admitted by the filter; `sendmsg` and
+`sendmmsg` with no destination and no control data are sent by the Warden on
+TCP and UDP sockets; a send naming a destination is refused. `bind` is
+performed by the Warden for the wildcard address and port 0 only (libuv binds
+UDP sockets so); `listen` and `accept` stay refused. Refused whatever the
+policy says: abstract and unnamed Unix addresses, IPv6 scope ids, `AF_UNSPEC`,
+other families and socket kinds, `MSG_FASTOPEN`, `IP_OPTIONS` and IPv6 routing
+headers.
+
+Known differences from a native connect: a descriptor `dup`'d from the socket
+before the connect keeps the agent's original, unconnected socket; a Unix
+server sees the Warden's pid in `SO_PEERCRED` (with the agent's uid and gid);
+a blocking connect repeated while the first is still in progress gets
+`EALREADY` at once rather than waiting.
+
+`make test-v1210` runs the probe, the records and their audit, the plan gate,
+curl, Python `requests` and Node.js as the agent, a live CDN fetch by address
+where the host can reach one, and the per-connection latency.
+
 ## Scope
 
 In scope:
 
 - Privileged seccomp-unotify supervisor.
 - Supervisor-side path resolution for `openat` via `openat2 + ADDFD`.
-- Sockaddr inspection for `connect`.
+- Decided connections for `connect` (v1.21): TCP and connected UDP over IPv4
+  and IPv6, Unix sockets by path; the Warden dials and hands over the socket.
 - Path-based decisions for `execve` and `execveat`.
 - JSON pathology records with measured decision latency.
 - Whole-plan verification before launch (`--plan`), with the data-flow check,

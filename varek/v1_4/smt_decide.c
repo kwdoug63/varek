@@ -8,6 +8,9 @@
 #endif
 #include "smt_decide.h"
 
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -851,6 +854,16 @@ out:
 /* Atoms                                                                     */
 /* ------------------------------------------------------------------------ */
 
+/* v1.21: a host constant without a port matches that address on any port: an
+ * IPv4 address or other colon-free constant ("127.0.0.1"), or (v1.21) a
+ * bracketed IPv6 address ("[::1]"), whose colons are inside the brackets.
+ * Through v1.20 "[::1]" matched only the string "[::1]", which no connect
+ * produces. The certificate checker has the same rule (vdp_checker.c). */
+bool vdp_host_portless(const char *c, size_t cl) {
+    if (!memchr(c, ':', cl)) return true;
+    return cl >= 2 && c[0] == '[' && c[cl - 1] == ']' && !memchr(c + 1, ']', cl - 2);
+}
+
 static bool str_holds(const vdp_str_atom_t *a, const char *s, size_t sl) {
     switch (a->op) {
         case VDP_STR_PREFIX:
@@ -859,7 +872,7 @@ static bool str_holds(const vdp_str_atom_t *a, const char *s, size_t sl) {
             return sl == a->len && memcmp(s, a->c, a->len) == 0;
         case VDP_STR_HOST:
             if (sl == a->len && memcmp(s, a->c, a->len) == 0) return true;
-            if (memchr(a->c, ':', a->len)) return false;
+            if (!vdp_host_portless(a->c, a->len)) return false;
             return sl > a->len && memcmp(s, a->c, a->len) == 0 && s[a->len] == ':';
         case VDP_STR_SUFFIX:
             return sl >= a->len && memcmp(s + sl - a->len, a->c, a->len) == 0;
@@ -997,7 +1010,7 @@ vdp_verdict_t vdp_decide(const vdp_policy_t *p, vdp_kind_t kind, const char *s,
 /*
  * Truth of every string atom on s depends only on (a) which elements of D are
  * prefixes of s, and (b) whether s equals a constant, where D is the set of all
- * constants of this kind (plus c ++ ":" for colon-free host constants). Every
+ * constants of this kind (plus c ++ ":" for portless host constants). Every
  * such class that contains a string of length <= VDP_STR_MAX contains one of:
  *
  *   - an element of D (covers s equal to a constant, and s == d in D);
@@ -1116,7 +1129,7 @@ static vdp_reach_t reach_trie(const vdp_policy_t *p, size_t i, char *wit, size_t
         const vdp_rule_t *r = &p->rules[j];
         if (r->kind != kind) continue;
         if (dset_add(&D, r->s.c, r->s.len) < 0) { dset_free(&D); return VDP_REACH_UNKNOWN; }
-        if (r->s.op == VDP_STR_HOST && !memchr(r->s.c, ':', r->s.len)) {
+        if (r->s.op == VDP_STR_HOST && vdp_host_portless(r->s.c, r->s.len)) {
             char tmp[VDP_STR_MAX + 2];
             memcpy(tmp, r->s.c, r->s.len);
             tmp[r->s.len] = ':';
@@ -1676,6 +1689,71 @@ vdp_reach_t vdp_rule_reachable(const vdp_policy_t *p, size_t i) {
 
 #define K_FCNTL_MUTABLE (K_O_APPEND | K_O_NONBLOCK | K_FASYNC | K_O_DIRECT | K_O_NOATIME)
 
+/* v1.21: is c a host constant a connect can produce? Fills why when not. */
+bool vdp_host_constant_ok(const char *c, size_t cl, char *why, size_t wn) {
+    char buf[VDP_STR_MAX + 1];
+    if (cl > VDP_STR_MAX) cl = VDP_STR_MAX;
+    memcpy(buf, c, cl);
+    buf[cl] = '\0';
+    if (!strncmp(buf, "unix:", 5)) {
+        if (buf[5] != '/') {
+            snprintf(why, wn, "a unix: constant must name an absolute path (the Warden decides on "
+                     "the socket's canonical path)");
+            return false;
+        }
+        return true;
+    }
+    char addr[VDP_STR_MAX + 1];
+    const char *port = NULL;
+    int fam;
+    if (buf[0] == '[') {
+        char *rb = strchr(buf, ']');
+        if (!rb) goto name;
+        size_t al = (size_t)(rb - buf - 1);
+        memcpy(addr, buf + 1, al);
+        addr[al] = '\0';
+        if (rb[1] == ':') port = rb + 2;
+        else if (rb[1] != '\0') goto name;
+        fam = AF_INET6;
+    } else {
+        char *colon = strchr(buf, ':');
+        size_t al = colon ? (size_t)(colon - buf) : cl;
+        memcpy(addr, buf, al);
+        addr[al] = '\0';
+        if (colon) port = colon + 1;
+        fam = AF_INET;
+    }
+    unsigned char bin[16];
+    char canon[INET6_ADDRSTRLEN];
+    if (inet_pton(fam, addr, bin) != 1) goto name;
+    if (fam == AF_INET6 && !memcmp(bin, "\0\0\0\0\0\0\0\0\0\0\xff\xff", 12)) {
+        inet_ntop(AF_INET, bin + 12, canon, sizeof canon);
+        snprintf(why, wn, "an IPv4-mapped address is decided as its IPv4 form, %s", canon);
+        return false;
+    }
+    inet_ntop(fam, bin, canon, sizeof canon);
+    if (strcmp(canon, addr) != 0) {
+        snprintf(why, wn, "the Warden spells this address %s%s%s", fam == AF_INET6 ? "[" : "",
+                 canon, fam == AF_INET6 ? "]" : "");
+        return false;
+    }
+    if (port) {
+        unsigned long v = 0;
+        size_t k = 0;
+        for (; port[k] >= '0' && port[k] <= '9' && k < 6; k++) v = v * 10 + (unsigned)(port[k] - '0');
+        if (k == 0 || port[k] || v > 65535 || (k > 1 && port[0] == '0')) {
+            snprintf(why, wn, "the port must be a decimal number from 0 to 65535 without leading "
+                     "zeros");
+            return false;
+        }
+    }
+    return true;
+name:
+    snprintf(why, wn, "not a numeric address: host rules match a.b.c.d[:port], [IPv6][:port] "
+             "or unix:/path (host names are planned for v1.21 stage 2)");
+    return false;
+}
+
 size_t vdp_rule_advisory(const vdp_rule_t *r, char *buf, size_t n) {
     if (!n) return 0;
     buf[0] = '\0';
@@ -1704,6 +1782,16 @@ size_t vdp_rule_advisory(const vdp_rule_t *r, char *buf, size_t n) {
         if (rel)
             ADD("%sthe constant does not start with '/', but the Warden decides on "
                 "absolute resolved paths, so this rule matches no real action", w ? "; " : "");
+    }
+    /* v1.21: the Warden decides a connect on the numeric destination it will
+     * dial, spelt as inet_ntop writes it: a.b.c.d:port, [IPv6]:port (an
+     * IPv4-mapped IPv6 address as its IPv4 form), or unix:<canonical path>.
+     * A constant in any other form can never match (a host name above all:
+     * `deny host evil.example.com` never fired), so say so. */
+    if (r->kind == VDP_KIND_HOST) {
+        char why[160];
+        if (!vdp_host_constant_ok(r->s.c, r->s.len, why, sizeof why))
+            ADD("%s%s, so this rule can never match", w ? "; " : "", why);
     }
     for (size_t i = 0; i < r->s.len; i++) {
         if ((unsigned char)r->s.c[i] >= 0x80) {

@@ -67,12 +67,13 @@ extern "C" {
  *
  * Three optional top-level directives extend the grammar:
  *
- *   refusal_budget N             # v1.8.2. N >= 1. Max retryable
- *                                # UNSATISFIED verdicts the breaker
- *                                # tolerates for one (session,signature)
- *                                # before latching to the exhaustion
- *                                # disposition. Absent => breaker
- *                                # disabled (pre-v1.8.2 pass-through).
+ *   refusal_budget N             # v1.8.2. N >= 1. The Nth UNSATISFIED
+ *                                # verdict for one (session, signature)
+ *                                # latches to the exhaustion disposition,
+ *                                # so N - 1 refusals are retryable (N = 1:
+ *                                # the first refusal is terminal).
+ *                                # Absent => breaker disabled
+ *                                # (pre-v1.8.2 pass-through).
  *
  *   on_exhaustion deny           # v1.8.2. Terminal disposition once the
  *   on_exhaustion terminal NAME  # refusal budget is spent. 'deny' is a

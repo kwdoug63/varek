@@ -99,10 +99,11 @@ echo "== a relative plan path cannot be verified pre-fork -> UNKNOWN =="
 run_plan 'action load file_open var/data/input.json'
 expect "relative file_open target is UNKNOWN" UNKNOWN rejected
 
-echo "== exec and connect steps are UNSATISFIED even when the policy allows them =="
-# v1.18.0: the runtime refuses every connect and every launch after the first,
-# whatever the policy says, so a plan that needs one cannot run as declared.
-# Through v1.17.0 the gate authorized this plan.
+echo "== exec steps are UNSATISFIED even when the policy allows them =="
+# v1.18.0: the runtime refuses every launch after the first, whatever the
+# policy says, so a plan that needs one cannot run as declared. Through v1.17.0
+# the gate authorized this plan. (v1.18.0 to v1.20.0 refused connect steps the
+# same way; from v1.21 they are decided, see below.)
 run_plan 'action load file_open /var/data/in.json
 action exec process_exec /usr/bin/python3
 action post net_connect 127.0.0.1:8080
@@ -112,11 +113,24 @@ expect "file_open + policy-allowed exec + connect is UNSATISFIED" UNSATISFIED re
 run_plan 'action exec process_exec /usr/bin/python3'
 expect "a lone policy-allowed exec step is UNSATISFIED" UNSATISFIED rejected
 
-echo "== a denied non-file node still rejects a plan that also opens a file =="
+echo "== a refused non-file node still rejects a plan that also opens a file =="
+# v1.21: connects are decided on the numeric destination the Warden dials, so
+# a host name cannot be decided before the agent runs: the step is UNKNOWN
+# (through v1.20.0 every connect step was UNSATISFIED).
 run_plan 'action load file_open /var/data/in.json
 action post net_connect api.example.com:443
 edge load post'
-expect "denied connect makes the whole plan UNSATISFIED" UNSATISFIED rejected
+expect "a connect step naming a host is UNKNOWN, and rejects the plan" UNKNOWN rejected
+run_plan 'action load file_open /var/data/in.json
+action post net_connect 127.0.0.1:9999
+edge load post'
+expect "a connect step no rule allows rejects the plan" UNKNOWN rejected
+
+echo "== v1.21: a connect step the policy allows is authorized =="
+run_plan 'action load file_open /var/data/in.json
+action post net_connect 127.0.0.1:8080
+edge load post'
+expect "file_open + policy-allowed connect is SATISFIED" SATISFIED authorized
 
 echo
 if [ "$fail" -eq 0 ]; then echo "test_v1124: PASS"; else echo "test_v1124: FAIL"; fi

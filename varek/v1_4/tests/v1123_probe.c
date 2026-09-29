@@ -95,10 +95,11 @@ int main(void) {
     //     absolute /proc/<pid>/ that is not the agent's own is refused.
     must_refuse("proc_pid1_mem", "/proc/1/mem", O_RDONLY);
 
-    // 11. A symlink pointing at /proc/self/mem: /proc/self is a MAGIC link, so
-    //     RESOLVE_NO_MAGICLINKS refuses it during resolution (before any policy
-    //     or /proc check) — the agent cannot follow a planted link into the
-    //     supervisor's context.
+    // 11. A symlink pointing at /proc/self/mem: resolved by the Warden, it
+    //     reaches the Warden's own /proc/<pid>/mem (/proc/self is an ordinary
+    //     symlink, which RESOLVE_NO_MAGICLINKS follows), and the post-resolution
+    //     /proc check refuses a numeric /proc/<pid> that is not the agent's
+    //     (v1.21 correction: this comment credited RESOLVE_NO_MAGICLINKS).
     must_refuse("symlink_to_proc_self", ALLOW "/link_to_proc_self_mem", O_RDONLY);
 
     // 12. A symlink pointing at another process's NUMERIC /proc/<pid>/mem: this

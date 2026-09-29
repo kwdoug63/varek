@@ -32,7 +32,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen
 
-.PHONY: all deps deps-check preflight clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 crosscheck harness video-v112
+.PHONY: all deps deps-check preflight clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -58,18 +58,18 @@ deps:
 # --run a real trial run). Example:
 #   make preflight POLICY=policies/finance.policy.txt LOG=/var/log/varek/verdicts.log
 preflight:
-	@./tools/varek_preflight.sh "$(POLICY)" $(if $(LOG),--log "$(LOG)") $(if $(KEY),--sign-key "$(KEY)") $(if $(ANCHOR),--anchor "$(ANCHOR)") $(if $(RUN),--run)
+	@./tools/varek_preflight.sh "$(POLICY)" $(if $(LOG),--log "$(LOG)") $(if $(KEY),--sign-key "$(KEY)") $(if $(ANCHOR),--anchor "$(ANCHOR)") $(if $(FLOW),--flow-policy "$(FLOW)") $(if $(STATE),--breaker-state "$(STATE)") $(if $(RUN),--run)
 
 CHECKER := checker/vdp_checker.c checker/vdp_checker.h
 
-warden: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
+warden: warden.c warden_net.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS)
 
 # v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
 # ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that
 # the certificate checker refuses the wrong verdict. Never deploy it.
-warden_faultinject: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
+warden_faultinject: warden.c warden_net.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
 	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS)
 
@@ -261,6 +261,23 @@ test-v1200: warden tools/vdp_cert_check tests/v1180_probe
 	@out="$$($(V1_6_DIR)/tests/test_plan_fields)"; rc=$$?; printf '%s\n' "$$out" | tail -1; exit $$rc
 	@sudo ./tests/test_v1200.sh ./warden ./tools/vdp_cert_check $(abspath tests/v1180_probe)
 
+# v1.21.0: decided connections. The Warden decides each connect on the
+# destination it will dial, dials it outside the agent's network namespace and
+# hands the connected socket over (SECCOMP_IOCTL_NOTIF_ADDFD). The probe
+# (static) covers TCP, UDP, Unix, the destination-swap race, options carried
+# over, relayed sends and every refusal; the script adds the plan gate, the
+# records and their audit, then real clients (curl, Python requests, Node)
+# and the per-connection latency (tests/bench_v1210_connect.sh).
+tests/v1210_probe: tests/v1210_probe.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -static -pthread -o $@ $<
+
+tests/v1210_bench: tests/v1210_bench.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $<
+
+test-v1210: warden tools/vdp_check tools/vdp_cert_check tests/v1210_probe tests/v1210_bench tests/test_v14_filter
+	@sudo ./tests/test_v14_filter
+	@sudo ./tests/test_v1210.sh ./warden ./tools/vdp_cert_check $(abspath tests/v1210_probe) $(abspath tests/v1210_bench)
+
 # v1.16.2: the off-host anchor. A receiver behind a private sshd on
 # 127.0.0.1:2222 and the forwarder: a run anchored off-host audits "signed,
 # anchored"; the receiver only appends; an outage loses nothing; preflight
@@ -303,4 +320,4 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe warden_faultinject tests/test_v14_filter
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter

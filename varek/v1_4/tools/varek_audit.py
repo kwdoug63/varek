@@ -62,6 +62,12 @@ AUTHORIZED_OPEN_RULES = ("resolved_fd_injection", "allowed_open_failed", "inject
 # read-only open and certified the same way.
 META_ACTIONS = ("file.stat", "file.access", "file.readlink")
 META_RULES = ("metadata_answered", "metadata_not_found", "metadata_failed")
+# v1.21: decided connections. Every net.connect the policy allowed carries a
+# certificate for the destination the Warden dialed ("resolved": a.b.c.d:port,
+# [IPv6]:port or unix:<path>), whatever became of the dial.
+CONNECT_RULES = ("dialed_fd_injection", "dialed_in_progress", "dial_failed",
+                 "injection_failed", "requester_gone", "already_connected",
+                 "socket_option_failed", "too_many_pending")
 
 
 def policy_ancestors(path):
@@ -420,7 +426,7 @@ def main(argv=None):
         problems.append(f"the policy file hashes to {digest}, the Warden ran with {recorded}")
 
     lines, which = [], []
-    authorized = refused = lookups = 0
+    authorized = refused = lookups = connects = 0
     ancestors = None
     launches = 0
     for rec in records:
@@ -449,12 +455,15 @@ def main(argv=None):
             continue
         is_open = rec.get("action") == "file.open" and rec.get("rule") in AUTHORIZED_OPEN_RULES
         is_meta = rec.get("action") in META_ACTIONS and rec.get("rule") in META_RULES
-        if not (is_open or is_meta):
+        is_conn = rec.get("action") == "net.connect" and rec.get("rule") in CONNECT_RULES
+        if not (is_open or is_meta or is_conn):
             problems.append(f"seq {rec.get('seq')}: an authorization that is not a certified "
-                            f"file open or lookup ({rec.get('action')}, rule {rec.get('rule')})")
+                            f"file open, lookup or connect ({rec.get('action')}, rule {rec.get('rule')})")
             continue
         if is_meta:
             lookups += 1
+        elif is_conn:
+            connects += 1
         else:
             authorized += 1
         cr, cw = rec.get("cert_rule"), rec.get("cert_witness")
@@ -464,7 +473,13 @@ def main(argv=None):
             continue
         s = rec.get("resolved", "")
         fl = rec.get("open_flags")
-        if not isinstance(fl, str) or not fl.startswith("0x"):
+        if is_conn:
+            fl = "0x0"                   # host rules carry no flag clause
+            if not s:
+                problems.append(f"seq {rec.get('seq')}: authorized connect without the "
+                                f"destination it was decided on")
+                continue
+        elif not isinstance(fl, str) or not fl.startswith("0x"):
             problems.append(f"seq {rec.get('seq')}: authorized open without its open flags")
             continue
         try:
@@ -475,7 +490,7 @@ def main(argv=None):
         if " " in cw or not cw:
             problems.append(f"seq {rec.get('seq')}: malformed certificate witness")
             continue
-        lines.append(f"path {fl} {hx} {cr} {cw}")
+        lines.append(f"{'host' if is_conn else 'path'} {fl} {hx} {cr} {cw}")
         which.append(rec)
 
     checked = 0
@@ -496,6 +511,7 @@ def main(argv=None):
 
     print(f"varek_audit: run {run} (Warden {warden}, {'complete' if complete else 'INCOMPLETE'}), "
           f"{len(records)} records, {authorized} authorized file opens, {lookups} lookups, "
+          f"{connects} authorized connects, "
           f"{checked} certificates "
           f"re-checked, {refused} refused in-line")
     print(f"varek_audit: integrity: {integrity}")

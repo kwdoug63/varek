@@ -110,7 +110,7 @@ refuse "reversed range refused"               'deny path glob /tmp/[z-a]'       
 refuse "33 wildcards refused"                 "deny path glob /tmp/$(printf '?%.0s' $(seq 1 33))" "more than 32 wildcards"
 refuse "matcher on a host rule refused"       'deny host suffix .example.com'    "matcher 'suffix' on a host rule"
 refuse "flag clause on an exec glob refused"  'deny exec glob /usr/bin/* readonly' "flag clause 'readonly' on a non-path rule"
-refuse "require warden 1.99 refused"          $'require warden 1.99\nallow path /tmp/' "policy requires Warden 1.99; this is 1.1[4-9]"
+refuse "require warden 1.99 refused"          $'require warden 1.99\nallow path /tmp/' "policy requires Warden 1.99; this is 1\.[1-9][0-9]"
 refuse "require warden +1.14 refused"         $'require warden +1.14\nallow path /tmp/' "bad directive"
 refuse "under 1.14, a matcher with no constant is an error" $'require warden 1.14\ndeny path glob' "matcher 'glob' without a constant"
 refuse "under 1.14, a constant eaten by a '#' comment is an error" $'require warden 1.14\ndeny path suffix #.pem' "matcher 'suffix' without a constant"

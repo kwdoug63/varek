@@ -1,4 +1,4 @@
-# VAREK Warden v1.4 ??? sample policy
+# VAREK Warden v1.4 sample policy
 #
 # Rules are evaluated in order. First match wins. No match -> UNKNOWN
 # -> suppressed -> treated as DENY (symmetric-suppression invariant).
@@ -7,7 +7,9 @@
 #   <verb> <kind> <match>
 #     verb  := allow | deny
 #     kind  := path | host | exec
-#     match := prefix string (path), "host:port" or "host" (host),
+#     match := prefix string (path); a numeric address (host):
+#             a.b.c.d:port, a.b.c.d (any port), [IPv6]:port, [IPv6]
+#             (any port, v1.21) or unix:/path (a Unix socket, exact);
 #             absolute path (exec)
 
 # --- File open ------------------------------------------------------
@@ -22,8 +24,16 @@ deny  path /etc/passwd
 deny  path /root/
 
 # --- Network connect ------------------------------------------------
+# v1.21: decided connections. Through v1.20.0 every connect was refused,
+# whatever these lines said; from v1.21 the Warden dials an allowed
+# destination itself and hands the agent the connected socket.
+# Host rules match the numeric address the Warden dials: a host NAME never
+# matches (the v1.4 sample `deny host evil.example.com` never fired). Names
+# are planned for v1.21 stage 2 (a hosts view the Warden serves).
+# Anything not allowed is refused by default; a deny rule is for carving an
+# exception out of a broader allow.
 allow host 127.0.0.1:8080
-deny  host evil.example.com
+deny  host 203.0.113.7                    # an address, not a name (TEST-NET-3)
 
 # --- Process exec ---------------------------------------------------
 allow exec /usr/bin/env

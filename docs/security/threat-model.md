@@ -84,7 +84,9 @@ Model-B techniques below, with the residual limits stated honestly.
   user namespaces are denied on the scalar flags argument. A hard-deny set covers
   `ptrace`, `bpf`, `userfaultfd`, `process_vm_readv/writev`, `pidfd_getfd`, the
   mount/FUSE family, the module/`kexec`/`perf_event_open`/`keyctl` family,
-  `memfd_create`, and io_uring.
+  `memfd_create`, and io_uring (v1.21: `io_uring_setup` answers `ENOSYS`, so
+  libuv falls back to epoll; no ring can be created, and `io_uring_enter` and
+  `io_uring_register` still kill).
 - **Supervisor/target lifecycle coupling (v1.9.3).** The agent runs as init of its
   own PID namespace and is killed if the supervisor stops, so neither the agent
   nor anything it spawned keeps running without oversight. The Warden requires
@@ -100,11 +102,15 @@ Model-B techniques below, with the residual limits stated honestly.
     **followed** (v1.12.3) and decided on their canonical target — a symlink to a
     denied object is refused, and dynamically linked agents' loaders work;
     v1.12.0–v1.12.2 instead refused any symlinked path (`RESOLVE_NO_SYMLINKS`). A
-    leading `/proc/self`/`thread-self` (a magic link) is mapped to the agent's
-    own process before resolution; a planted symlink to a magic link such as
-    `/proc/self/mem` is refused by `RESOLVE_NO_MAGICLINKS`; and a numeric
-    `/proc/<pid>` object that is not the agent's own fails a post-resolution
-    check. Non-process `/proc` entries remain governed by policy.
+    leading `/proc/self`/`thread-self` is mapped to the agent's own process
+    before resolution; a numeric `/proc/<pid>` object that is not the agent's
+    own fails a post-resolution check, and that check is also what refuses a
+    planted symlink to `/proc/self/mem` (it resolves to the Warden's own
+    `/proc/<pid>/mem`). `/proc/self` is an ordinary symlink, which
+    `RESOLVE_NO_MAGICLINKS` follows; that flag refuses the kernel's magic links
+    (`/proc/<pid>/fd/N`, `cwd`, `exe`, `root`, `ns/`). *(Correction, v1.21.0:
+    through v1.20.0 this credited `RESOLVE_NO_MAGICLINKS` with refusing
+    `/proc/self/mem`.)* Non-process `/proc` entries remain governed by policy.
   - *Authorization-record integrity.* Every agent-controlled string is escaped, so
     no input can begin, end, or forge a record in the verdict stream. Records
     carry the resolved object the decision was made on. From v1.16 records are
@@ -117,6 +123,30 @@ Model-B techniques below, with the residual limits stated honestly.
     device.
   - *Datagram egress.* `sendto`/`sendmsg` are mediated as network sends and
     refused for an inet destination under the deny-only network posture.
+- **Decided connections (v1.21).** Each outbound `connect` is decided on the
+  destination the Warden will dial, copied once from the agent's memory and
+  spelt canonically (`a.b.c.d:port`, `[IPv6]:port` with an IPv4-mapped address
+  as its IPv4 form, or `unix:<canonical path>` for a path socket resolved like
+  a file open); the independent checker must accept the certificate of any
+  ALLOW. The Warden then dials the destination itself, from outside the
+  agent's empty network namespace, and puts the connected socket in place of
+  the agent's descriptor (`SECCOMP_IOCTL_NOTIF_ADDFD`); the kernel never reads
+  the agent's sockaddr, so a second thread cannot change the destination after
+  the check (a 2,000-attempt swap race in `make test-v1210` reaches the
+  denied side 0 times). Options the agent set on its socket are carried over,
+  or the connect fails. A Unix connect is made with the agent's uid and gid.
+  Every connect is recorded, chained, signed and certificate-checked by
+  `varek_audit.py`, like a file open. Refused whatever the policy says: sends
+  that name a destination, abstract and unnamed Unix addresses, IPv6 scope
+  ids, raw and other socket kinds, `MSG_FASTOPEN`, source routing
+  (`IP_OPTIONS`, IPv6 routing headers), and inbound calls (`listen`, `accept`;
+  `bind` only for the wildcard address and port 0).
+- **Where, not what (v1.21).** VAREK decides *where* an agent may connect.
+  Once a destination is allowed, the agent may send it anything: an allowed
+  host is a channel, and data the agent may read may leave through it. What an
+  agent sends is for the service, or an egress proxy or DLP tool in front of
+  it, which VAREK works alongside. Allowing a Unix socket also grants whatever
+  its server does for the agent's uid, including descriptors it passes back.
 
 The per-class status of every known bypass class is maintained in
 `docs/security/bypass-classes.md`.
@@ -152,8 +182,14 @@ are claimed as solved.
 - Pointer-argument operations rely on the supervisor-performs-and-inject pattern.
   Path resolution is performed once by the supervisor (v1.12), but in-kernel,
   race-free filesystem restriction via Landlock remains roadmap (v1.10).
-- Network access is deny-only for outbound connections and inet datagram sends;
-  a mediated allow path (supervisor dials and injects) is roadmap (v1.10).
+- Network access (v1.21): outbound connects are decided and dialed by the
+  Warden; unconnected datagram sends stay refused. Host rules match numeric
+  addresses only: host names are v1.21 stage 2 (`v1.21-stage2-host-names.md`),
+  and until then a name must be resolved outside the agent. An allowed address
+  on a shared content network also reaches the other sites served from it.
+  Rules on request contents (method, path, body) are stage 3, through an
+  egress proxy. *(Through v1.20.0 this read: network access is deny-only; a
+  mediated allow path is roadmap.)*
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).
 - An agent may probe for SATISFIED-but-harmful actions near a policy boundary;
