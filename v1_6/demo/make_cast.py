@@ -259,12 +259,12 @@ def prepare_environment(v1_6_dir: Path) -> tuple[Path, Path]:
     (scene / "policy.txt").write_text(
         "allow path /var/data/\n"
         "allow exec /usr/bin/python3\n"
-        "deny  host api.example.com\n"
+        "deny  host 203.0.113.7\n"
     )
     (scene / "plan_denied.txt").write_text(
         "action load file_open    /var/data/input.json\n"
         "action exec process_exec /usr/bin/python3\n"
-        "action post net_connect  api.example.com:443\n"
+        "action post net_connect  203.0.113.7:443\n"
         "edge load exec\n"
         "edge exec post\n"
     )

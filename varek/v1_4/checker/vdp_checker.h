@@ -80,7 +80,7 @@
 #include <stdint.h>
 
 #define VDPC_GRAMMAR_MAJOR 1
-#define VDPC_GRAMMAR_MINOR 16
+#define VDPC_GRAMMAR_MINOR 21
 
 #define VDPC_MAX_S        4095
 #define VDPC_MAX_RULES    256

@@ -32,9 +32,10 @@ To measure what each fragment buys, the same actions are also decided under:
                     fragment, which also turns the reads into UNKNOWN).
 
 Two caveats the report states rather than hides. A SATISFIED verdict on an exec
-or connect is still refused at run time (those are deny-only since v1.9.1), so
-the report gives file-open figures separately. And the same action appears in
-several cases (the loader actions are in all five), so the report gives the
+is still refused at run time (exec is deny-only since v1.9.1), so the report
+gives file-open figures separately. (Connect verdicts are the runtime outcome
+since v1.21.0, when the Warden began dialing allowed connects.) And the same
+action appears in several cases (the loader actions are in all five), so the report gives the
 number of distinct actions.
 
 PROVENANCE. The seed corpus shipped in harness/corpus/ is synthetic: its
@@ -252,8 +253,8 @@ def main():
           f"({report['distinct_actions']} distinct) [{report['provenance']}]")
     for v in views:
         print(fmt_row(v, report[v], freport[v]))
-    print("  note: exec/connect SATISFIED verdicts are still refused at run time "
-          "(deny-only since v1.9.1); file-open figures are the runtime outcome")
+    print("  note: exec SATISFIED verdicts are still refused at run time (deny-only "
+          "since v1.9.1); file-open and connect verdicts are the runtime outcome")
     bad = [d for d in details if d["truth"] == "UNSAFE" and d["verdict"] == "SATISFIED"]
     over = [d for d in details if d["truth"] == "SAFE" and d["verdict"] != "SATISFIED"]
     for d in bad:

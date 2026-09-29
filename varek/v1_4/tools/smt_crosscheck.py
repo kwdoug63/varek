@@ -383,6 +383,18 @@ def parse_glob(rx, pat, where):
     return rx.cats(*parts), ntok, gtoks
 
 
+def host_portless(c):
+    """v1.21: a host constant without a port matches every port: a dotted-quad
+    IPv4 address, or a bracketed IPv6 address such as [::1] (colons only inside
+    the brackets). Any other constant matches only itself."""
+    if ":" not in c:
+        parts = c.split(".")
+        return len(parts) == 4 and all(
+            1 <= len(p) <= 3 and p.isdigit() and p.isascii() and int(p) <= 255
+            and not (len(p) > 1 and p[0] == "0") for p in parts)
+    return len(c) >= 2 and c[0] == "[" and c[-1] == "]" and "]" not in c[1:-1]
+
+
 def atom_rx(rx, r):
     """The language of a rule's string atom."""
     c, op = r["c"], r["op"]
@@ -397,7 +409,7 @@ def atom_rx(rx, r):
     if op == "glob":
         return r["rx"]
     # host
-    if ":" in c:
+    if not host_portless(c):
         return rx.lit(c)
     return rx.alt(rx.lit(c), rx.cat(rx.lit(c + ":"), rx.TOP))
 
@@ -434,7 +446,7 @@ def parse_lines(raw_lines, path):
                 if len(toks) != 3 or toks[1] != "warden" or not m:
                     raise PolicyError(f"{path}:{lineno}: bad directive")
                 v = (int(m.group(1)), int(m.group(2)))
-                if v > (1, 16):
+                if v > (1, 21):
                     raise PolicyError(f"{path}:{lineno}: requires newer Warden")
                 req = max(req, v)
                 continue
@@ -579,7 +591,7 @@ def str_atom(rx, r, s):
         return smt.Contains(s, c)
     if op == "glob":
         return smt.InRe(s, rx_to_smt(rx, r["rx"]))
-    if ":" in r["c"]:
+    if not host_portless(r["c"]):
         return s == c
     return smt.Or(s == c, smt.PrefixOf(zstr(r["c"] + ":"), s))
 
@@ -690,7 +702,7 @@ def str_atom_bytes(r, bs):
     c = r["c"]
     if r["op"] == "prefix":
         return bs.prefix(c)
-    if r["op"] == "eq" or ":" in c:
+    if r["op"] == "eq" or not host_portless(c):
         return bs.eq(c)
     # host(c, s) = s == c OR prefix(c ++ ":", s), written with the shared prefix
     # factored out: prefix(c, s) AND (|s| == |c| OR s[|c|] == ':'). Logically
@@ -855,7 +867,7 @@ def gen_queries(rules, rx, rng, n):
             sval = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 8)))
         if len(sval) > L + 3:
             sval = sval[: L + rng.randint(-2, 3)]
-        if kind == "host" and base and ":" not in base and rng.random() < 0.4:
+        if kind == "host" and base and host_portless(base) and rng.random() < 0.4:
             sval = base + ":" + str(rng.choice([80, 443, 8080]))
         if kind == "path":
             r = rng.random()
@@ -888,7 +900,8 @@ AMBIGUOUS = ["allow path glob readonly", "deny path suffix -O_CREAT", "allow pat
 
 
 def fuzz_line(rng, prior, strings, wide):
-    frags = ["/a", "/a/", "/a/b", "/ab", "/b/", "/a/b/c", "x", "x:1", "/"]
+    frags = ["/a", "/a/", "/a/b", "/ab", "/b/", "/a/b/c", "x", "x:1", "/", "[::1]", "[a]", "[:]",
+             "1.2.3.4", "1.2.3.4:5", "01.2.3.4", "256.1.1.1", "unix", "unix:/a"]
     if rng.random() < 0.03:
         return rng.choice(AMBIGUOUS)
     matcher = None
@@ -964,7 +977,7 @@ def fuzz_policy(rng, path):
     lines = []
     if rng.random() < 0.3:
         lines.append(rng.choice(["require warden 1.14", "require warden 1.13", "require warden 01.14",
-                                 "require warden 1.15", "require warden 1.16"] +
+                                 "require warden 1.15", "require warden 1.16", "require warden 1.21"] +
                                 ([] if valid else ["require warden 1.17", "require warden x",
                                                    "require warden +1.14", "require warden 1.+14",
                                                    "require warden 1.1400000"])))

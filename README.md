@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.20.0-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.21.0-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -48,7 +48,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.20.0.**
+   **Current release: v1.21.0.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -88,7 +88,9 @@ Warden sits between an agent framework and the operating system. Before containe
 code opens or looks up a file, connects, sends a datagram or launches a program,
 the Warden decides that call and enforces the verdict at the kernel; with
 `--plan`, the whole declared action-graph is also checked before the agent
-starts. This is structural containment — not a string-match denylist that
+starts. Since v1.21 an allowed connect is dialed by the Warden itself and the
+connected socket handed to the agent, the way allowed files have been handed
+over since v1.12. This is structural containment — not a string-match denylist that
 falls to absolute paths, base64 encoding, or renamed binaries.
 
 The runtime line has progressed well beyond simple syscall containment:
@@ -113,6 +115,7 @@ The runtime line has progressed well beyond simple syscall containment:
   "Never requires a human" becomes certified rather than hoped. Since v1.18.0 the
   Warden runs it on the `--flow-policy` at startup and refuses to start if it
   fails.
+- **v1.21.0 — decided connections.** Through v1.20.0 a supervised agent had no network: every connect was refused, whatever the policy said, because letting an allowed connect continue in the kernel would let a second thread change the destination after the check. The Warden now decides each connect on the destination it copied once (the independent checker confirms any ALLOW), dials it itself from outside the agent's empty network namespace, and hands over the connected socket with `SECCOMP_IOCTL_NOTIF_ADDFD`, carrying over the socket options the agent set (the 58 the Warden knows; others set before the connect are not carried). TCP and connected UDP over IPv4 and IPv6, and Unix sockets decided on their canonical path (IPv6 decisions are tested; IPv6 dialing was not exercised on the release host, whose kernel has no IPv6, and the test reports it as SKIPPED there). The plan gate decides `net_connect` steps instead of refusing them. Tested with curl, Python `requests` and Node.js, and with a 2,000-attempt destination-swap race that reached the denied side 0 times. On a 2-vCPU test host a connect took about 75 to 125 µs longer than a native one at the median, and more at p99; a `requests.get` to a local server about 0.17 ms longer (1.21 → 1.38 ms). Figures in the release notes. Also: the sector policies' key and credential rules match in any case (`server.PEM`, `x.pem.bak`, `id_rsa` outside `.ssh` were allowed), Node.js runs under the Warden at all (`io_uring_setup` answers `ENOSYS`), and the preflight checks the plan gate's flow policy and count file. See [`RELEASE-v1.21.0.md`](./RELEASE-v1.21.0.md).
 - **v1.20.0 — fields on plan steps.** A plan step had one field, its target, so flow rules could see nothing else it declared. A step can now carry up to 16 `key=value` fields after its target (quoted values may hold spaces: `contains="a customer record"`), and the Warden's `--flow-policy` rules match them like any named argument. The node check and the runtime still see only the target. Fields are the agent's declarations, so the Warden refuses a flow policy whose rules match them unless it declares `trust_declared_fields`. The plan file's lines may be 16383 bytes (were 1022); targets stay under 4096 bytes. See [`RELEASE-v1.20.0.md`](./RELEASE-v1.20.0.md).
 - **v1.19.0 — a refusal limit per session.** The plan gate's breaker counted refusals per (session, plan), so a planner that changed one step each time got a fresh count every time and was never stopped. A flow policy now declares `session_refusal_budget N`, which the Warden requires: the Nth refused plan in a session, and every refused plan after it, is terminal, whatever the plans were. Authorized plans still run and do not reset the count. `--gate-status` and the `plan_gate` record report the session's count; the state file moves to format 2 and v1.18.0 tables still load. See [`RELEASE-v1.19.0.md`](./RELEASE-v1.19.0.md).
 - **v1.18.0 — the claims and the code agree.** A review listed ten places where the published claims and the code disagreed; each is fixed in the code or in the claim. The `--plan` gate now runs the v1.7 data-flow check, the v1.8.2 refusal breaker and the v1.9 progress-safety check (`--flow-policy`; the breaker's counts persist across runs in a state file the agent cannot reach), which through v1.17.0 were a library the Warden did not call, and it refuses connect and launch steps the runtime would refuse. Flow rules can match a URL's host (`match url.host`) instead of a whole-URL glob that matched outside hosts. The CycloneDX export's attestation is derived from the stream, checks the policy file, can be signed (JSF, Ed25519) and is tested against the CycloneDX 1.6 schema. Refusal records name `EACCES`, the errno sent. Release notes, CHANGELOG and the spec paper are corrected where they described code that was never committed, and figures without a record are re-measured or restated. See [`RELEASE-v1.18.0.md`](./RELEASE-v1.18.0.md).
@@ -139,10 +142,48 @@ The runtime line has progressed well beyond simple syscall containment:
   prior approve-then-continue strategy leaked the protected target (1,848 to
   1,889 times in 20,000 attempts on a 2-vCPU host, re-measured for v1.18.0; the
   510 quoted here before has no record); the resolve-and-inject strategy leaked 0. `connect`/`execve`
-  are deny-only (fail closed) pending the v1.10 dial-and-inject path. See
+  are deny-only (fail closed) pending the v1.10 dial-and-inject path
+  (connects: shipped in v1.21.0; launches after the first stay refused). See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
 See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.17.0 history.
+
+### Network
+
+A supervised agent's network is decided connection by connection (v1.21).
+When it calls `connect`, the Warden copies the destination once, decides it
+against the policy's `host` rules with the SMT decision procedure (the
+independent checker must accept any ALLOW), dials it itself from outside the
+agent's network namespace, which has no working interface, and hands the agent
+the connected socket in place of its own, the way it hands over files. The
+kernel never reads the agent's copy of the destination, so a second thread
+cannot change it after the check. Every connection is logged, chained and
+signed like a file open.
+
+```
+allow host 10.20.0.15:443              # an address and port
+allow host [2001:db8::15]:443          # IPv6
+allow host 127.0.0.1                   # any port on this address
+allow host unix:/run/fhir/gw.sock      # a Unix socket, by its canonical path
+```
+
+Covered: TCP and connected UDP over IPv4 and IPv6, Unix stream, datagram and
+seqpacket sockets named by a path. IPv6 destinations are decided and certified
+like IPv4 ones; dialing them was not exercised on the v1.21.0 release host (its
+kernel has no IPv6), where `make test-v1210` reports that case as SKIPPED. Refused whatever the policy says: sends that
+name their own destination (an unconnected datagram), inbound connections,
+abstract Unix addresses, raw and other socket kinds.
+
+Host rules match the numeric address the Warden dials. Host names
+(`allow host api.example.com:443`) are the next stage, planned for the v1.21
+line: the Warden will resolve the allowed names itself and serve the agent a
+hosts view of them, so the agent sends no DNS of its own
+([design](./docs/security/v1.21-stage2-host-names.md)). Until then, resolve a
+name outside the agent and allow its addresses.
+
+VAREK decides *where* an agent may connect. *What* it sends there is for your
+egress proxy or DLP tooling, which VAREK works alongside: an allowed host is a
+channel.
 
 ### Installation
 
@@ -394,6 +435,9 @@ different risks at different points in the stack.
 - [x] **v1.18.0** — Claims and code agree: data-flow, breaker and progress checks in the Warden's plan gate; URL host matching; derived, signed, schema-tested CycloneDX export; corrected records and figures
 - [x] **v1.19.0** — A refusal limit per session for the plan gate's breaker (`session_refusal_budget`)
 - [x] **v1.20.0** — Fields on plan steps (`key=value` after the target) for the flow policy; `trust_declared_fields`
+- [x] **v1.21.0** — Decided connections: the Warden decides each connect, dials it outside the agent's network namespace and hands over the socket (TCP, connected UDP, IPv4/IPv6 (IPv6 dialing untested on the release host), Unix); the plan gate decides connect steps
+- [ ] **v1.21 stage 2** — Host names without agent DNS: the Warden resolves allowed names and serves a hosts view ([design](./docs/security/v1.21-stage2-host-names.md))
+- [ ] **v1.21 stage 3 (opt-in)** — Rules on request contents through a Warden-owned or customer egress proxy
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
 
@@ -431,7 +475,8 @@ each with one named soundness obligation and the trusted code it introduces:
   cross-action data-flow subsystem, composed on the fragments above.
 
 Race-free network mediation (a supervisor-dials-and-injects path replacing the
-v1.9.1 deny-only posture for `connect`) remains on the roadmap; the default-deny
+v1.9.1 deny-only posture for `connect`) shipped in v1.21.0; host names (stage 2)
+and rules on request contents (stage 3) remain on the roadmap. The default-deny
 syscall allowlist closing the alternate-ABI and variant-syscall bypass classes
 shipped in v1.9.2, and supervisor/target lifecycle coupling shipped in the live
 Warden in v1.9.3.
@@ -464,7 +509,11 @@ v1.9.1 enforcement is measured directly by a TOCTOU race harness
 host, approve-then-continue leaked the protected file 1,848 to 1,889 times and
 resolve-and-inject leaked it 0 times (`tests/toctou_results_v1.18.0.txt`; the
 count depends on the host). io_uring is denied by the live Warden filter
-(`varek/v1_4/tests/test_v14_filter`, v1.18.0). Build and run with `make check`
+(`varek/v1_4/tests/test_v14_filter`, v1.18.0; from v1.21 its creation
+answers `ENOSYS` rather than killing, so Node.js runs). Decided connections
+(v1.21) are tested with real clients (curl, Python `requests`, Node.js) and a
+destination-swap race: 2,000 attempts, 0 reached the denied side (`make
+test-v1210`). Build and run with `make check`
 in the relevant version directory. Containment verification: `python
 verify_guardrails.py` (see above).
 
@@ -484,8 +533,10 @@ The cross-action data-flow threat model is in
 The runtime fails closed on unsupported platforms and denies boundary syscalls at
 the kernel, not via string matching or audit hooks. As of v1.12 the Warden
 filter is default-deny (an explicit allowlist, native ABI only, with a hard-deny
-set that includes io_uring); network egress (`connect`) is deny-only pending the
-v1.10 dial-and-inject path; and the agent runs in its own PID namespace, so it
+set that includes `io_uring_enter` and `io_uring_register`, while `io_uring_setup`
+answers `ENOSYS` from v1.21 so that Node.js falls back to epoll); since v1.21 each outbound connect is decided and
+dialed by the Warden, which hands the agent the connected socket (an agent's own
+network namespace stays empty); and the agent runs in its own PID namespace, so it
 and everything it spawned die with the supervisor. The per-class status is in
 [`docs/security/bypass-classes.md`](./docs/security/bypass-classes.md).
 

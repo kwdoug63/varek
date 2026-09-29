@@ -32,9 +32,9 @@ fi
 # Resolve ALL IPv4 addresses for the origin host. Warden sees post-DNS IPs
 # at the connect() syscall; getaddrinfo returns multiple A records for
 # CDN-fronted hosts and Python tries each in turn, so every one must be
-# allowlisted. IPv4-only because warden formats IPv6 connect targets as
-# [addr]:port and the policy line `allow host <addr>:<port>` cannot
-# disambiguate IPv6 colons from the port colon.
+# allowlisted. IPv4 only, to keep the policy short; an IPv6 address is written
+# `allow host [addr]:port` (correction, v1.21.0: this comment said IPv6 could
+# not be written).
 ORIGIN_IPS="$(getent ahostsv4 "$ORIGIN_HOST" | awk '{print $1}' | sort -u)"
 if [ -z "$ORIGIN_IPS" ]; then
     echo "ERROR: could not resolve $ORIGIN_HOST to any IPv4 address" >&2

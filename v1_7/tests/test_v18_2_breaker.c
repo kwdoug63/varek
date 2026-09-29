@@ -78,7 +78,8 @@ int main(void)
 
     uint64_t sig = 0xABCDEF12u;  /* stand-in signature for this test */
 
-    /* Three retryable refusals, then latch to terminal action. */
+    /* A budget of 3: two retryable refusals, and the third latches to the
+     * terminal action (budget N: N - 1 retryable). */
     plan_breaker_result_t r;
     r = plan_breaker_step(b, "sess-1", sig, PLAN_DEC_UNSATISFIED, cfg);
     CHECK(r.outcome == PLAN_BREAKER_REFUSED_RETRYABLE && r.refusals == 1,

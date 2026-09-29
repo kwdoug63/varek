@@ -281,6 +281,13 @@ def _scope(warden_version):
     if _version_at_least(warden_version, (1, 17)):
         mediated = ("file opens and file lookups (stat, access, readlink), connects, "
                     "program launches and datagram sends")
+    if _version_at_least(warden_version, (1, 21)):
+        # v1.21: connects are dialed by the Warden; a send with no destination
+        # of its own on a connected socket is not recorded (sendto is admitted
+        # by the filter; sendmsg and sendmmsg are relayed without a record).
+        mediated = ("file opens and file lookups (stat, access, readlink), connects "
+                    "(each dialed by the Warden and handed over), program launches, and "
+                    "sends that name a destination or carry control data")
     return (f"The record covers the system calls this Warden version pauses and "
             f"decides: {mediated}. Calls the kernel filter admits without asking the "
             f"Warden (reads and writes on descriptors already held, memory, time, "

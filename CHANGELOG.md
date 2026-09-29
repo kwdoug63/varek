@@ -25,19 +25,11 @@ holder and bounds the cost of one decision. v1.17.0 and v1.18.0 are also outside
 the program: v1.17.0 protects the Warden's own files and drops the agent's root
 privileges, and v1.18.0 fixes where the public claims and the code disagreed
 (the plan gate's data-flow check, breaker and signed BOM export); v1.19.0 adds
-a refusal limit per session to the breaker, and v1.20.0 fields on plan steps.
-None of them changes the verification program. Still planned: a customer-derived corpus and measured baseline, a
+a refusal limit per session to the breaker, v1.20.0 fields on plan steps, and
+v1.21.0 decided connections. None of them changes the verification program. Still planned: a customer-derived corpus and measured baseline, a
 formally verified checker, and the v1.11 sequence fragment (issues #21–#25).
 
-### Changed (test tooling)
-
-- The CycloneDX schema check (`tests/cdx_schema_check.py`, `make test-v1180`)
-  uses `rfc3986-validator` (MIT) instead of `rfc3987` (GPLv3+) for jsonschema's
-  "uri" format checking, so running the tests no longer needs a GPL package.
-  Validation results are unchanged: a signed BOM is valid with either, and
-  invalid with neither. No runtime code imports either package.
-
-### Planned — v1.10 program (status as of v1.20.0; unchanged since v1.16.0)
+### Planned — v1.10 program (status as of v1.21.0; unchanged since v1.16.0)
 
 - **Verdict-distribution harness.** Measurement and regression gating over a
   corpus of realistic agent action-graphs. Reports the four-cell outcome
@@ -71,6 +63,108 @@ formally verified checker, and the v1.11 sequence fragment (issues #21–#25).
   fragment's guarantee.
 
 ---
+
+## [1.21.0] - 2026-09-29
+
+v1.21.0 lets a supervised agent connect where its policy allows. The Warden
+decides each outbound connect, dials it itself outside the agent's network
+namespace and hands the connected socket over; through v1.20.0 every connect
+was refused. `allow host` rules take effect and the grammar version is 1.21,
+so it is a minor release. Verdicts on file opens, lookups and launches are
+unchanged. See [`RELEASE-v1.21.0.md`](./RELEASE-v1.21.0.md).
+
+### Added
+
+- Decided connections (`varek/v1_4/warden_net.inc.c`). The destination is
+  copied once, spelt canonically (`a.b.c.d:port`, `[IPv6]:port` with an
+  IPv4-mapped address as its IPv4 form, `unix:<canonical path>`), decided
+  against the `host` rules, and certified by the independent checker. The
+  Warden makes a socket of the agent's kind in its own namespace, copies the
+  socket options the agent set (58 listed; others are not carried), connects
+  it (a Unix connect with the agent's uid and gid), and replaces the agent's
+  descriptor with it (`SECCOMP_IOCTL_NOTIF_ADDFD`, `SECCOMP_ADDFD_FLAG_SETFD`).
+  A blocking connect that is still in progress is finished asynchronously and
+  answered at connect, failure or the agent's `SO_SNDTIMEO`. TCP and connected
+  UDP over IPv4 and IPv6 (IPv6 dialing untested on the release host), Unix
+  stream, datagram and seqpacket sockets named by a path.
+- Sends with no destination: `sendto` with a NULL address is admitted by the
+  filter (not with `MSG_FASTOPEN`); `sendmsg`/`sendmmsg` are read once and sent
+  by the Warden with no address and no control data on TCP and UDP sockets.
+- `bind` of a TCP or UDP socket to the wildcard address and port 0 is performed
+  by the Warden (libuv binds UDP sockets so); every other bind is refused.
+- The plan gate decides `net_connect` steps like the connect they name; a
+  host-name step is UNKNOWN with the reason.
+- Connect records carry `"sock"` and `"dial_us"`; `varek_audit.py` accepts
+  certified connects and re-checks their certificates; the CycloneDX export
+  describes them.
+- `warden <policy> --check-startup [...]` checks the startup conditions and
+  exits. `tools/varek_preflight.sh` takes `--flow-policy`, `--breaker-state`,
+  `--gate-status` and `--session` and checks them with it.
+- `make test-v1210` (90 checks: the probe, records and audit, plan gate, curl,
+  Python `requests` and Node.js as the agent, a CDN fetch by address, sector
+  policies, preflight, latency) and new cases in `tests/test_v14_filter`.
+  Latency figures: `varek/v1_4/tests/connect_latency_v1.21.0.txt`.
+- `docs/security/v1.21-stage2-host-names.md`: the plan for host names without
+  agent DNS (a Warden-served hosts view), stage 2 of this release line.
+
+### Changed
+
+- A host constant without a port matches any port only when it is a
+  dotted-quad IPv4 address or a bracketed IPv6 one (all three parsers). A host
+  rule naming a host is reported at load as one that can never match, and
+  `vdp_check lint` counts it (exit 1).
+- The filter refuses (`EACCES`) `setsockopt` of `IP_OPTIONS`, `IPV6_RTHDR`,
+  `IPV6_2292RTHDR` and `IPV6_2292PKTOPTIONS`, comparing only the low 32 bits
+  of `level` and `optname`; other options stay admitted.
+- `io_uring_setup` answers `ENOSYS` (it killed the agent), so Node.js runs;
+  `io_uring_enter` and `io_uring_register` stay hard-denied.
+- The five sector policies' key, credential and SSH rules match in any case
+  and are anchored (`server.PEM`, `x.pem.bak`, `.ENV.local`, `id_rsa` outside
+  `.ssh` were allowed); the healthcare psychotherapy and decedent directories
+  match in any case; `allow host` lines are marked as taking effect from v1.21.
+- `policy.txt`'s sample `deny host evil.example.com` (which never fired) is a
+  numeric rule; so are the host rules in the v1.6 integration test and demo
+  and in `test_v1124.sh`.
+- `run_start` says `"warden":"1.21.0"`; the default policy version is `1.21`.
+- `pyproject.toml`: the description says what the package is; the
+  `seccomp_bridge` module, never in the repository, is removed.
+- The CycloneDX schema check (`tests/cdx_schema_check.py`, `make test-v1180`)
+  uses `rfc3986-validator` (MIT) instead of `rfc3987` (GPLv3+) for jsonschema's
+  "uri" format checking, so running the tests no longer needs a GPL package.
+  Validation results are unchanged: a signed BOM is valid with either, and
+  invalid with neither. No runtime code imports either package.
+
+### Fixed (documentation, dated corrections)
+
+- `bypass-classes.md` credited an fd-provenance invariant the code does not
+  implement; rows 3 and 8, the v1.10 roadmap and the comments in `warden.c`
+  and `v1_7/warden_seccomp_baseline.c` are corrected, and a "Descriptor
+  provenance" section states what holds.
+- `/proc/self` is an ordinary symlink, not a magic link:
+  `RESOLVE_NO_MAGICLINKS` does not refuse it. Corrected in the v1.12.0 and
+  v1.12.3 release notes, this changelog, the threat model, the spec paper,
+  `warden.c` and the tests' comments.
+- The breaker's "N" versus "N−1": the Nth refusal is terminal (headers,
+  sample configuration, v1.8.2 changelog).
+- The spec paper and the trusted computing base describe v1.21 (connects
+  dialed; the Warden's new trusted code; the audit's connects).
+
+### Found in review
+
+A security review of the code found no breakout, egress to an undecided
+destination, credential escalation, filter bypass or record forgery. It led to
+a byte bound on waiting sends and connects beside the count bound, and to
+corrected comments on buffer clamping, what is read after the decision, and
+the credential switch. A review of every claim against the code found: `allow
+host unix` matched every Unix socket while lint said it could never match
+(fixed: the portless rule above); `IPV6_2292PKTOPTIONS` admitted (now
+refused); a second blocking connect while the first waited was dialed and then
+replaced (now `EALREADY`, and a replaced descriptor is left alone); the first
+draft's sector-policy globs missed and over-matched names (anchored); the v1.6
+integration test failing; socket options overclaimed; IPv6 dialing claimed but
+untested; and stale statements in the harness, spec paper, threat model, TCB,
+stage-2 plan, preflight, examples and tests. All fixed before release; see the
+release notes.
 
 ## [1.20.0] - 2026-09-29
 
@@ -802,7 +896,10 @@ change.
   or `/proc/thread-self` (a magic link `RESOLVE_NO_MAGICLINKS` would otherwise
   refuse) is rewritten to the agent's own `/proc/<tgid>` before resolution. A
   planted symlink pointing at `/proc/self/mem` is a magic link and is refused
-  during resolution. A path or symlink reaching another process's numeric
+  during resolution. *(Correction, v1.21.0: `/proc/self` is an ordinary symlink,
+  which `RESOLVE_NO_MAGICLINKS` follows; the planted link resolves to the
+  Warden's own `/proc/<pid>/mem` and the post-resolution `/proc` check refuses
+  it.)* A path or symlink reaching another process's numeric
   `/proc/<pid>/…` resolves, then fails the post-resolution check because it is
   not the agent's `/proc/<tgid>`. The agent's own entries are recorded as
   `/proc/self/…`. A non-process `/proc` entry (`/proc/kcore`, `/proc/sys/…`) is
@@ -992,6 +1089,7 @@ is unaffected by and orthogonal to this release.
     kernel resolves in the **caller's** context — the supervisor's, not the
     agent's — so `open("/proc/self/mem")` returned a handle on the Warden.
     `RESOLVE_NO_MAGICLINKS` now refuses it.
+    *(Correction, v1.21.0: `/proc/self` is an ordinary symlink, not a magic link, so `RESOLVE_NO_MAGICLINKS` does not refuse it. In v1.12.0 to v1.12.2 `RESOLVE_NO_SYMLINKS` refused it, like any symlink; from v1.12.3 a leading `/proc/self` is mapped to the agent and a post-resolution `/proc` check refuses another process's `/proc/<pid>`.)*
 - **Audit-log integrity.** The agent-controlled pathname was written into the
   JSON pathology record unescaped, so a crafted path could inject a forged
   `"decision_final":"ALLOW"` record into the verdict stream. All

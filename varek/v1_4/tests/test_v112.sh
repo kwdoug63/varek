@@ -5,7 +5,7 @@
 #
 #   1. `..` traversal out of an allowed directory       -> refused
 #   2. symlink inside an allowed directory              -> refused
-#   3. /proc/self magic link (supervisor's context)     -> refused
+#   3. /proc/self (resolved in the supervisor's context) -> refused
 #   4. audit-log forgery via a crafted pathname         -> record stays sound
 #   5. datagram egress via sendto AND sendmsg           -> refused
 #   + a legitimate open inside the allowed directory    -> still succeeds
@@ -68,7 +68,7 @@ assert_denied() { # assert_denied <target-substring> <label>
 }
 assert_denied '/../../etc/shadow'  "dotdot traversal"
 assert_denied 'link_to_shadow'     "symlink escape"
-assert_denied '/proc/self/mem'     "proc/self magic link"
+assert_denied '/proc/self/mem'     "proc/self/mem"
 assert_denied '127.0.0.1:9999'     "udp sendto egress"
 
 # Audit-log soundness: no record with report_id "FORGED" may exist, and every

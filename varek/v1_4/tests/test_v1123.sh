@@ -48,7 +48,7 @@ ln -s "$ALLOW/ok.txt"              "$ALLOW/rel_link"            # -> allowed fil
 ln -s "$DENIED/secret.txt"         "$ALLOW/link_to_secret"      # -> denied file
 ln -s /etc/shadow                  "$ALLOW/link_to_etc_shadow"  # -> absolute denied
 ln -s link_to_secret               "$ALLOW/chain_a"             # -> symlink -> denied
-ln -s /proc/self/mem               "$ALLOW/link_to_proc_self_mem" # magic link -> refused during resolution
+ln -s /proc/self/mem               "$ALLOW/link_to_proc_self_mem" # resolves in the Warden's context -> refused by the /proc check
 ln -s /proc/1/mem                  "$ALLOW/link_to_proc_pid1_mem" # numeric foreign proc -> refused by the /proc check
 
 OUT="$(mktemp -d)"
@@ -88,7 +88,7 @@ expect "a trailing symlink opened O_NOFOLLOW is refused"          nofollow_trail
 echo "-- 4. /proc/self maps to the agent; other /proc refused"
 expect "/proc/self/cmdline reads back the agent's own argv"       proc_self_is_agent OK
 expect "/proc/thread-self/cmdline reads back the agent's own argv" proc_thread_self_agent OK
-expect "a symlink to /proc/self (a magic link) is refused at resolution" symlink_to_proc_self REFUSED
+expect "a symlink to /proc/self (resolved as the Warden's /proc) is refused" symlink_to_proc_self REFUSED
 expect "a symlink to another process's numeric /proc/1/mem is refused"   symlink_to_proc_pid1 REFUSED
 expect "another process's /proc/1/mem opened directly is refused"       proc_pid1_mem REFUSED
 expect "/proc/kcore (a non-process /proc entry) is refused by default-deny" proc_kcore REFUSED

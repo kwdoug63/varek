@@ -4,7 +4,8 @@
 # varek_preflight.sh — check a Warden deployment before you run it (v1.16.1).
 #
 #   tools/varek_preflight.sh <policy> [--log PATH] [--sign-key KEY] [--anchor PATH]
-#                            [--spool DIR] [--run] [--install-deps]
+#                            [--spool DIR] [--flow-policy CFG [--breaker-state FILE]
+#                            [--gate-status FILE] [--session ID]] [--run] [--install-deps]
 #
 # Checks, in order, and prints PASS / WARN / FAIL for each:
 #   1. The Warden and its tools are built and up to date; if not, the build
@@ -36,6 +37,18 @@
 #        /dev/nvme* or /dev/bsg/*.
 #      These checks cannot see everything the Warden sees (whether a FIFO has
 #      a reader, for one); --run is the definitive test.
+#   3b. v1.21, with --flow-policy: the plan gate's configuration, checked by the
+#      Warden itself (`warden <policy> --check-startup --flow-policy ...`, as
+#      root, via sudo if needed): the flow policy loads, is progress-safe and
+#      declares refusal_budget and session_refusal_budget (and
+#      trust_declared_fields if its rules match plan fields); the breaker's
+#      count file (--breaker-state, default /var/lib/varek/breaker.state): its
+#      directory, lock and table are the Warden's user's, writable by no one
+#      else, and closed to the agent; --gate-status likewise. Through v1.20.0
+#      the preflight checked none of these, so a deployment it passed could
+#      still refuse to start. The check creates the state directory (default
+#      path only), the lock file and the --gate-status file if missing, as a
+#      real start would (an existing --gate-status file is not truncated).
 #   4. --run: a real trial run (`warden ... -- /bin/true`, as root, via sudo if
 #      needed), its verdict stream written to a new temporary file (mktemp) in
 #      the --log directory, which must belong to root and not be writable by
@@ -51,7 +64,8 @@ set -u
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"          # varek/v1_4
 POLICY="" LOG="" KEY="" ANCHOR="" SPOOL="" RUN=0 INSTALL=0
-usage() { sed -n '6,7p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+FLOW="" STATE="" GSTATUS="" SESSION=""
+usage() { sed -n '6,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 need() { [ $# -ge 2 ] && [ -n "$2" ] || { echo "varek_preflight: $1 needs a value" >&2; usage; }; }
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -59,6 +73,10 @@ while [ $# -gt 0 ]; do
         --sign-key)     need "$@"; KEY="$2"; shift 2 ;;
         --anchor)       need "$@"; ANCHOR="$2"; shift 2 ;;
         --spool)        need "$@"; SPOOL="$2"; shift 2 ;;
+        --flow-policy)  need "$@"; FLOW="$2"; shift 2 ;;
+        --breaker-state) need "$@"; STATE="$2"; shift 2 ;;
+        --gate-status)  need "$@"; GSTATUS="$2"; shift 2 ;;
+        --session)      need "$@"; SESSION="$2"; shift 2 ;;
         --run)          RUN=1; shift ;;
         --install-deps) INSTALL=1; shift ;;
         -h|--help)      usage ;;
@@ -67,6 +85,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$POLICY" ] || usage
+if [ -z "$FLOW" ] && [ -n "$STATE$GSTATUS$SESSION" ]; then
+    echo "varek_preflight: --breaker-state, --gate-status and --session need --flow-policy" >&2; usage
+fi
 
 fails=0 warns=0
 pass() { printf '  PASS  %s\n' "$1"; }
@@ -124,7 +145,7 @@ if ! "$CERT" "$POLICY" digest >/dev/null 2>&1; then
 else
     pass "the policy loads ($(grep -o 'glob tokens [0-9]* of [0-9]*' <<<"$o"), sha256 $("$CERT" "$POLICY" digest | cut -c1-16)…)"
 fi
-[ "$rc" -eq 1 ] && warn "lint: $(grep -c 'can never fire' <<<"$o") rule(s) can never fire (tools/vdp_check $POLICY lint)"
+[ "$rc" -eq 1 ] && warn "lint: $(grep -c ' can never fire (' <<<"$o") rule(s) can never fire and $(grep -c 'so this rule can never match' <<<"$o") host rule(s) can never match a connect (tools/vdp_check $POLICY lint)"
 
 echo "== 3. what the Warden refuses at startup"
 # The canonical path an open would reach, and whether the agent could open it.
@@ -254,6 +275,21 @@ if [ -n "$KEY$ANCHOR" ]; then
               [ -e /proc/kcore ] && echo /proc/kcore; } | sort -u | "$CERT" "$POLICY" openable | grep '^openable' | head -5)"
     if [ -z "$raw" ]; then pass "no raw disk or memory device is open to the agent"
     else fail "the policy lets the agent open raw storage (refused with a key or anchor): $(tr '\n' ' ' <<<"${raw//openable /}")"; fi
+fi
+
+if [ -n "$FLOW" ]; then
+    echo "== 3b. the plan gate (--flow-policy) and its count file"
+    ga=("$POLICY" --check-startup --flow-policy "$(abs "$FLOW")")
+    [ -n "$STATE" ] && ga+=(--breaker-state "$(abs "$STATE")")
+    [ -n "$GSTATUS" ] && ga+=(--gate-status "$(abs "$GSTATUS")")
+    [ -n "$SESSION" ] && ga+=(--session "$SESSION")
+    o="$($SUDO "$WARDEN" "${ga[@]}" 2>&1)"; rc=$?
+    if [ "$rc" -eq 0 ] && grep -q 'startup checks passed' <<<"$o"; then
+        pass "the flow policy is progress-safe and declares its budgets; the breaker state ${STATE:-/var/lib/varek/breaker.state} is private to the Warden's user and closed to the agent${GSTATUS:+, and so is --gate-status}"
+    else
+        why="$(grep -m1 -E '^\[warden\] (--|the policy would|breaker|plan|cannot)' <<<"$o")"
+        fail "the Warden would refuse to start: ${why:-$(tail -1 <<<"$o")}"
+    fi
 fi
 
 if [ "$RUN" = 1 ]; then

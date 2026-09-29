@@ -8,11 +8,12 @@
 // Why a v1.4-specific builder and not wd_seccomp_build_baseline() directly:
 // the generic baseline routes socket/bind/sendmsg/recvmsg/openat2/... to
 // SCMP_ACT_NOTIFY on the assumption of a supervisor that can decide them. The
-// v1.4 supervise()/derive_intent() models ONLY openat, connect, execve,
-// execveat; any other NOTIFY becomes ACT_OTHER -> deny. So here the mediate set
-// is exactly those four (plus the v1.12 sends), and the outbound-neutral
-// syscalls the supervisor does not mediate (socket creation, receive) are
-// ADMITTED — otherwise default-deny would break every target. The inbound
+// v1.4 supervise()/derive_intent() models ONLY the calls in kMediate below;
+// any other NOTIFY becomes ACT_OTHER -> deny. So here the mediate set is exactly
+// those (openat, connect, execve, execveat, the v1.12 sends, the v1.17 lookups,
+// and from v1.21 bind and sendmmsg), and the outbound-neutral syscalls the
+// supervisor does not mediate (socket creation, receive) are ADMITTED —
+// otherwise default-deny would break every target. The inbound
 // calls (bind/listen/accept) are not admitted as of v1.12.1. Same hard-deny
 // set (minus clone3, which answers ENOSYS from v1.12.2), same scalar-flag
 // CLONE_NEWUSER denial, same native-ABI lockdown (which is what closes the x32
@@ -41,6 +42,8 @@
 #include <sched.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -56,8 +59,10 @@
 #endif
 
 // ADMIT: what a target process needs to run, MINUS anything that opens a
-// mediated capability. Networking and message I/O are here (NOT mediated by the
-// v1.4 supervisor). Tighten per workload; grow via observe mode. This is a
+// mediated capability. Socket creation, receive and socket options are here;
+// connect, bind and the sends that can carry a destination are mediated
+// (kMediate, add_sends), and setsockopt is admitted by conditional rules
+// (add_setsockopt, v1.21). Tighten per workload; grow via observe mode. This is a
 // starting allowlist for a typical dynamically-linked Linux target.
 static const char *kAdmit[] = {
     // loader / process startup
@@ -65,8 +70,9 @@ static const char *kAdmit[] = {
     "rseq", "brk", "membarrier", "getrandom",
     // memory
     "mmap", "mprotect", "munmap", "mremap", "madvise",
-    // file I/O on already-authorized fds (provenance enforced by the supervisor
-    // via fd injection; openat itself is mediated below)
+    // file I/O on descriptors the agent holds (openat itself is mediated
+    // below, and an allowed open is delivered by fd injection; nothing tracks
+    // a descriptor afterwards: bypass-classes.md, "Descriptor provenance")
     "read", "write", "readv", "writev", "pread64", "pwrite64", "preadv2",
     "pwritev2", "close", "close_range", "lseek", "fstat",
     "fsync", "fdatasync", "dup", "dup3", "fcntl", "pipe2", "eventfd2",
@@ -94,8 +100,9 @@ static const char *kAdmit[] = {
     "sigaltstack", "tgkill",
     // sync
     "futex",
-    // networking — socket creation and socket options stay admitted so targets
-    // start normally; connect and the egress-capable sends are mediated (below).
+    // networking — socket creation stays admitted so targets start normally,
+    // and socket options are admitted by add_setsockopt except the routing
+    // ones; connect, bind and the egress-capable sends are mediated (below).
     // v1.12.1: bind, listen, accept and accept4 are NO LONGER admitted. They are
     // the inbound half of networking (a TCP listener, a bound UDP receiver, an
     // abstract unix socket the host can reach) and the deny-only network posture
@@ -104,10 +111,13 @@ static const char *kAdmit[] = {
     // that is closed with it. The Warden also runs the agent in its own, empty
     // network namespace (warden.c), so no interface is reachable either way.
     "socket", "socketpair",
-    "getsockname", "getpeername", "getsockopt", "setsockopt",
+    "getsockname", "getpeername", "getsockopt",
+    // v1.21: setsockopt is admitted by conditional rules (add_setsockopt).
     // v1.12: sendto/sendmsg are NO LONGER admitted here — they can reach the
     // network without connect (a datagram send with an explicit destination),
     // which bypassed the deny-only connect posture. They are mediated below.
+    // v1.21: sendto with NO destination is admitted by a conditional rule
+    // (add_sends); sendmsg and sendmmsg are relayed by the Warden.
     // Inbound-only recv stays admitted.
     "recvfrom", "recvmsg", "shutdown",
     // termination
@@ -121,8 +131,17 @@ static const char *kMediate[] = {
     // v1.12: egress-capable datagram/message sends. Routed to the supervisor
     // so a send carrying an inet destination is subject to the same deny-only
     // network posture as connect, closing the sendto/sendmsg egress bypass
-    // (bypass-classes.md class 3).
-    "sendto", "sendmsg",
+    // (bypass-classes.md class 3). v1.21: sendmsg and sendmmsg carry their
+    // destination in the agent's memory, so the Warden reads each message
+    // once and sends it itself (net_send_relay) when it names no destination
+    // and carries no control data, and refuses it otherwise. sendto is
+    // routed here only when it names a destination or asks for TCP Fast Open
+    // (add_sends); every other sendto is admitted.
+    "sendmsg", "sendmmsg",
+    // v1.21: bind is performed by the Warden for a TCP or UDP socket and the
+    // wildcard address with port 0 only (libuv binds so before every UDP
+    // connect); every other bind is refused (net_bind in warden_net.inc.c).
+    "bind",
     // v1.17.0: metadata and link lookups, decided like a read-only open and
     // answered by the supervisor (warden.c: meta_answer).
     "newfstatat", "statx", "readlink", "readlinkat",
@@ -132,7 +151,10 @@ static const char *kMediate[] = {
 // HARD-DENY: never admissible (classes 3-6). KILL in strict mode, even in
 // observe mode.
 static const char *kHardDeny[] = {
-    "io_uring_setup", "io_uring_enter", "io_uring_register",
+    // v1.21: io_uring_setup answers ENOSYS (add_io_uring_setup) so libuv, and
+    // with it Node.js, falls back to epoll; with no ring ever created, the
+    // other two can only be reached by an agent probing for them.
+    "io_uring_enter", "io_uring_register",
     "process_vm_readv", "process_vm_writev", "pidfd_getfd",
     "userfaultfd",
     "mount", "umount2", "fsopen", "fsconfig", "fsmount", "move_mount", "open_tree",
@@ -220,6 +242,132 @@ static int add_clone3(scmp_filter_ctx ctx) {
     return (rc < 0 && rc != -EEXIST) ? rc : 0;
 }
 
+// v1.21: sendto(fd, buf, len, flags, dest_addr, addrlen). With dest_addr NULL
+// the kernel reads no address at all (dest_addr is a register, so no other
+// thread can change it after this check), and the send goes to the socket's
+// connected peer, exactly as write() would; write() is admitted. It is
+// admitted here unless MSG_FASTOPEN is set, which on a TCP socket in the
+// Warden's namespace could open a connection of its own. A sendto that names
+// a destination, or sets MSG_FASTOPEN, goes to the Warden, which refuses it.
+// Through v1.20.0 every sendto went to the Warden and was refused, so send()
+// failed even where nothing could be reached.
+static int add_sends(scmp_filter_ctx ctx) {
+    int rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(sendto), 2,
+                              SCMP_A4(SCMP_CMP_EQ, 0),
+                              SCMP_A3(SCMP_CMP_MASKED_EQ, (scmp_datum_t)MSG_FASTOPEN, 0));
+    if (rc < 0) return rc;
+    rc = seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(sendto), 1, SCMP_A4(SCMP_CMP_NE, 0));
+    if (rc < 0) return rc;
+    return seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, SCMP_SYS(sendto), 1,
+                            SCMP_A3(SCMP_CMP_MASKED_EQ, (scmp_datum_t)MSG_FASTOPEN,
+                                    (scmp_datum_t)MSG_FASTOPEN));
+}
+
+// v1.21: socket options that would send the agent's packets somewhere the
+// connect did not decide: IPv4 source routing (IP_OPTIONS with LSRR/SSRR) and
+// IPv6 routing headers (IPV6_RTHDR, its RFC 2292 form IPV6_2292RTHDR, and
+// IPV6_2292PKTOPTIONS, which installs sticky options in control-message form,
+// a type 2 routing header among them; each can send a connected socket's
+// packets to an address in the header instead of the peer decided on). A
+// socket the Warden connected lives in the host's network namespace, so these
+// are refused (EACCES) on every socket, in observe mode too. Every other
+// setsockopt stays admitted.
+//
+// Two properties of libseccomp shape this. An unconditional rule on a call
+// overrides conditional ones on the same call (an unconditional ALLOW would
+// make the refusals dead), and a rule may compare an argument only once. So
+// setsockopt is admitted by disjoint conditional rules that together cover
+// every (level, optname) pair except the four refused ones. And the
+// comparisons are 64-bit even through SCMP_A1_32 (which truncates only the
+// constant), while the kernel reads level and optname as ints: an ordered
+// comparison would let a register with junk in its upper half (level
+// 41 | 1 << 40, which the kernel reads as 41) through. Every rule is
+// therefore a masked equality whose mask lies within the low 32 bits: (arg &
+// mask) == value tests exactly the int the kernel will read. A range of ints
+// is covered by aligned power-of-two blocks, like a CIDR decomposition.
+#define IP_OPTIONS_NR          4
+#define IPV6_2292RTHDR_NR      5
+#define IPV6_2292PKTOPTIONS_NR 6
+#define IPV6_RTHDR_NR          57
+
+// Rules admitting every int in [lo, hi] for argument `arg` (plus the extra
+// comparison, if any), as aligned blocks.
+static int allow_int_range(scmp_filter_ctx ctx, int nr, unsigned arg, uint64_t lo, uint64_t hi,
+                           const struct scmp_arg_cmp *extra) {
+    while (lo <= hi) {
+        uint64_t size = 1;
+        while (size < (1ull << 32) && (lo & (size * 2 - 1)) == 0 && lo + size * 2 - 1 <= hi)
+            size *= 2;
+        struct scmp_arg_cmp c = { arg, SCMP_CMP_MASKED_EQ,
+                                  (scmp_datum_t)(0xffffffffull & ~(size - 1)), (scmp_datum_t)lo };
+        int rc = extra ? seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 2, *extra, c)
+                       : seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 1, c);
+        if (rc < 0) return rc;
+        lo += size;
+        if (lo == 0) break;               // wrapped past 2^64 (cannot happen below 2^32)
+    }
+    return 0;
+}
+
+// Admit every int of `arg` except the sorted values in ex[0..n).
+static int allow_int_except(scmp_filter_ctx ctx, int nr, unsigned arg, const uint32_t *ex, size_t n,
+                            const struct scmp_arg_cmp *extra) {
+    uint64_t lo = 0;
+    for (size_t i = 0; i <= n; i++) {
+        uint64_t hi = i < n ? (uint64_t)ex[i] : 0x100000000ull;
+        if (hi > lo) {
+            int rc = allow_int_range(ctx, nr, arg, lo, hi - 1, extra);
+            if (rc < 0) return rc;
+        }
+        if (i < n) lo = (uint64_t)ex[i] + 1;
+    }
+    return 0;
+}
+
+static int add_setsockopt(scmp_filter_ctx ctx) {
+    const int nr = SCMP_SYS(setsockopt);
+    int rc;
+#define LOW32_EQ(arg, v) ((struct scmp_arg_cmp){ arg, SCMP_CMP_MASKED_EQ, 0xffffffffull, (scmp_datum_t)(v) })
+    static const struct { uint32_t level, name; } ban[] = {
+        { IPPROTO_IP, IP_OPTIONS_NR }, { IPPROTO_IPV6, IPV6_2292RTHDR_NR },
+        { IPPROTO_IPV6, IPV6_2292PKTOPTIONS_NR }, { IPPROTO_IPV6, IPV6_RTHDR_NR },
+    };
+    for (size_t i = 0; i < sizeof ban / sizeof ban[0]; ++i)
+        if ((rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EACCES), nr, 2, LOW32_EQ(1, ban[i].level),
+                                   LOW32_EQ(2, ban[i].name))) < 0)
+            return rc;
+    // Every level but IPPROTO_IP (0) and IPPROTO_IPV6 (41): any optname.
+    static const uint32_t levels_ex[] = { IPPROTO_IP, IPPROTO_IPV6 };
+    if ((rc = allow_int_except(ctx, nr, 1, levels_ex, 2, NULL)) < 0) return rc;
+    // IPPROTO_IP: every optname but IP_OPTIONS.
+    static const uint32_t ip_ex[] = { IP_OPTIONS_NR };
+    struct scmp_arg_cmp lv = LOW32_EQ(1, IPPROTO_IP);
+    if ((rc = allow_int_except(ctx, nr, 2, ip_ex, 1, &lv)) < 0) return rc;
+    // IPPROTO_IPV6: every optname but the routing-header options.
+    static const uint32_t ip6_ex[] = { IPV6_2292RTHDR_NR, IPV6_2292PKTOPTIONS_NR, IPV6_RTHDR_NR };
+    lv = LOW32_EQ(1, IPPROTO_IPV6);
+    if ((rc = allow_int_except(ctx, nr, 2, ip6_ex, 3, &lv)) < 0) return rc;
+#undef LOW32_EQ
+    return 0;
+}
+
+// v1.21: io_uring_setup answers ENOSYS instead of killing the process.
+//
+// io_uring (bypass class 3) runs I/O the filter never sees, so no ring may
+// exist. From v1.9.1 io_uring_setup killed the caller. But libuv (so Node.js
+// 20 and later) calls io_uring_setup at startup to see whether the kernel has
+// io_uring, so no Node program could run under the Warden. ENOSYS is the
+// answer libuv (and liburing's users) take to mean "this kernel has none" and
+// fall back to epoll and a thread pool, as they do on kernels before 5.1. No
+// ring is ever created, so io_uring_enter and io_uring_register, which need
+// one, stay on the kill list. The same reasoning as clone3 (add_clone3).
+static int add_io_uring_setup(scmp_filter_ctx ctx) {
+    int nr = seccomp_syscall_resolve_name("io_uring_setup");
+    if (nr == __NR_SCMP_ERROR) nr = 425;           // x86_64
+    int rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), nr, 0);
+    return (rc < 0 && rc != -EEXIST) ? rc : 0;
+}
+
 // Build the filter. default_action is EPERM (enforce) or LOG (observe).
 static int build(scmp_filter_ctx *out_ctx, int observe) {
     uint32_t def = observe ? SCMP_ACT_LOG : SCMP_ACT_ERRNO(EPERM);
@@ -240,12 +388,15 @@ static int build(scmp_filter_ctx *out_ctx, int observe) {
 
     if ((rc = add_list(ctx, kHardDeny, WD_HARD_DENY)) < 0) goto fail;  // most severe first
     if ((rc = add_clone3(ctx)) < 0) goto fail;
+    if ((rc = add_io_uring_setup(ctx)) < 0) goto fail;       // v1.21
     for (size_t i = 0; i < sizeof kIoctlAdmit / sizeof kIoctlAdmit[0]; ++i) {
         rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 1,
                               SCMP_A1(SCMP_CMP_EQ, (scmp_datum_t)kIoctlAdmit[i]));
         if (rc < 0) goto fail;
     }
     if ((rc = add_list(ctx, kMediate, SCMP_ACT_NOTIFY)) < 0) goto fail;
+    if ((rc = add_sends(ctx)) < 0) goto fail;                 // v1.21
+    if ((rc = add_setsockopt(ctx)) < 0) goto fail;            // v1.21
     if ((rc = add_list(ctx, kAdmit, SCMP_ACT_ALLOW)) < 0) goto fail;
     if ((rc = deny_ns_bits(ctx, SCMP_SYS(clone))) < 0) goto fail;
     if ((rc = deny_ns_bits(ctx, SCMP_SYS(unshare))) < 0) goto fail;

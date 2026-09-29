@@ -70,6 +70,8 @@ varek/v1_4/tests/v1150_probe
 varek/v1_4/tests/v1160_probe
 varek/v1_4/tests/v1170_probe
 varek/v1_4/tests/v1180_probe
+varek/v1_4/tests/v1210_probe
+varek/v1_4/tests/v1210_bench
 varek/v1_4/warden_faultinject
 varek/v1_4/tools/vdp_cert_check
 varek/v1_4/tools/vdp_check

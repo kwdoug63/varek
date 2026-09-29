@@ -104,10 +104,13 @@ static const char *kAdmit[] = {
     // memory / process basics
     "brk", "mmap", "mprotect", "munmap", "mremap", "madvise",
     "exit", "exit_group", "rseq", "set_robust_list", "get_robust_list",
-    // fd I/O on ALREADY-AUTHORIZED descriptors (provenance enforced in Warden;
-    // see fd-provenance invariant in bypass-classes.md). read/write are NOT
-    // mediated per-call by design — only acquisition is. mmap-after-open is
-    // contained the same way: the open was mediated, so the fd is authorized.
+    // fd I/O on descriptors the agent already holds. read/write are NOT
+    // mediated per call by design; only acquisition is. The Warden does not
+    // track descriptor lineage: what makes a held descriptor acceptable is
+    // that every way to acquire one is mediated or refused (see "Descriptor
+    // provenance" in docs/security/bypass-classes.md for the ways that are
+    // not, e.g. descriptors inherited at launch). mmap-after-open is contained
+    // the same way: the open was mediated.
     "read", "write", "readv", "writev", "pread64", "pwrite64",
     "close", "close_range", "lseek", "fstat", "newfstatat", "fsync", "fdatasync",
     "dup", "dup3", "fcntl", "pipe2", "eventfd2",

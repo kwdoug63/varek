@@ -289,8 +289,20 @@ uint32_t vdp_flag_bit(const char *name);
  * its length, or 0 if there is nothing to report. */
 size_t vdp_rule_advisory(const vdp_rule_t *r, char *buf, size_t n);
 
-/* The Warden version this procedure implements, for `require warden X.Y`. */
+/* v1.21: does a host rule's constant name an address without a port (so it
+ * matches that address on every port)? See smt_decide.c. */
+bool vdp_host_portless(const char *c, size_t cl);
+bool vdp_host_is_ipv4(const char *c, size_t cl);
+
+/* v1.21: can a connect produce this host constant (numeric address in the
+ * Warden's spelling, optional decimal port, or unix:<absolute path)? When not,
+ * writes the reason to why and returns false. Used for a load-time note. */
+bool vdp_host_constant_ok(const char *c, size_t cl, char *why, size_t wn);
+
+/* The Warden version this procedure implements, for `require warden X.Y`.
+ * v1.21: host rules take effect (decided connections), and a bracketed IPv6
+ * constant without a port ("[::1]") matches every port. */
 #define VDP_WARDEN_MAJOR 1
-#define VDP_WARDEN_MINOR 16
+#define VDP_WARDEN_MINOR 21
 
 #endif /* VAREK_SMT_DECIDE_H */

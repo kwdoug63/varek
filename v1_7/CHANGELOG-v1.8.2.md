@@ -22,7 +22,9 @@ function of `(plan, policy)`; the breaker only interprets the *sequence*
 of verdicts for one signature and, once the policy's refusal budget is
 spent, latches to a deterministic terminal disposition declared in the
 policy. Resolution is bounded — at most `budget` retryable refusals per
-signature — and no outcome requires human intervention.
+signature — and no outcome requires human intervention. *(Correction,
+v1.21.0: with a budget of N, the Nth refusal is terminal, so at most N − 1
+refusals are retryable.)*
 
 ### New files
 - `plan_breaker.h` / `plan_breaker.c`

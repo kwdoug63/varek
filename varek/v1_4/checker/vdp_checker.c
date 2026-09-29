@@ -507,6 +507,29 @@ static bool glob_match(const gtok_t *g, size_t n, const char *s, size_t sl) {
     return at[n];
 }
 
+/* v1.21: a dotted-quad IPv4 address (four decimal parts, 1-3 digits, <= 255,
+ * no leading zero), written independently of smt_decide.c. */
+static bool ipv4_quad(const char *c, size_t n) {
+    size_t i = 0;
+    int parts = 0;
+    while (parts < 4) {
+        size_t st = i;
+        unsigned v = 0;
+        while (i < n && c[i] >= '0' && c[i] <= '9') {
+            if (i - st == 3) return false;
+            v = v * 10 + (unsigned)(c[i] - '0');
+            i++;
+        }
+        if (i == st || v > 255 || (c[st] == '0' && i - st > 1)) return false;
+        parts++;
+        if (parts < 4) {
+            if (i >= n || c[i] != '.') return false;
+            i++;
+        }
+    }
+    return i == n;
+}
+
 static bool str_holds(const vdpc_rule_t *r, const char *s, size_t sl) {
     const char *c = r->c;
     size_t cl = r->clen;
@@ -520,8 +543,15 @@ static bool str_holds(const vdpc_rule_t *r, const char *s, size_t sl) {
              * dominate the cost of an open. */
             return memmem(s, sl, c, cl) != NULL;
         case M_HOST:
+            /* v1.21: a constant with no port matches every port: a dotted-quad
+             * IPv4 address, or a bracketed IPv6 address ("[::1]"). Any other
+             * constant matches only itself (so `allow host unix` does not
+             * match unix:<path>). */
             if (sl == cl && memcmp(s, c, cl) == 0) return true;
-            if (memchr(c, ':', cl)) return false;
+            if (!(memchr(c, ':', cl) ? (cl >= 2 && c[0] == '[' && c[cl - 1] == ']' &&
+                                        !memchr(c + 1, ']', cl - 2))
+                                     : ipv4_quad(c, cl)))
+                return false;
             return sl > cl && memcmp(s, c, cl) == 0 && s[cl] == ':';
         case M_GLOB:
             if (sl < r->minlen || (r->fixed && sl != r->minlen)) return false;

@@ -106,14 +106,22 @@ gate() {
 has() { grep -q -- "$1" <<<"$G"; }
 gate_rec() { grep '^{"event":"plan_gate"' "$OUT/gate.err" | head -1; }
 
-echo "== 1. connect and launch steps are UNSATISFIED at the plan gate =="
+echo "== 1. launch steps are UNSATISFIED at the plan gate; connect steps are decided (v1.21) =="
+# v1.18.0 to v1.20.0: the runtime refused every connect, so the gate refused
+# every connect step. v1.21: the Warden dials an allowed connect, so the gate
+# decides a connect step like the connect it names.
 plan conn.txt 'action read file_open /tmp/varek_v1180/data/public/ok.txt
 action post net_connect 127.0.0.1:8080
 edge read post'
 "$WARDEN" "$POL" --plan "$D/conn.txt" -- "$PROBE" > "$OUT/c.out" 2> "$OUT/c.err"; rc=$?
-check "a policy-allowed connect step rejects the plan"      grep -q 'plan rejected (UNSATISFIED)' "$OUT/c.err"
-check "the gate says the runtime refuses every connect"     grep -q 'refuses every connect at runtime' "$OUT/c.err"
-nocheck "the agent is not started"                          grep -q 'supervising pid=' "$OUT/c.err"
+check "a policy-allowed connect step is authorized (v1.21)" grep -q 'plan authorized (2 actions)' "$OUT/c.err"
+nocheck "the gate no longer says every connect is refused"  grep -q 'refuses every connect at runtime' "$OUT/c.err"
+check "the agent is started"                                grep -q 'supervising pid=' "$OUT/c.err"
+plan conn2.txt 'action read file_open /tmp/varek_v1180/data/public/ok.txt
+action post net_connect 127.0.0.1:9090
+edge read post'
+"$WARDEN" "$POL" --plan "$D/conn2.txt" -- "$PROBE" > /dev/null 2> "$OUT/c2.err"; rc=$?
+check "a connect step the policy does not allow rejects the plan" grep -q 'plan rejected' "$OUT/c2.err"
 [ "$rc" -ne 0 ] && pass "the Warden exits non-zero ($rc)" || flunk "the Warden exits non-zero"
 plan exec.txt 'action run process_exec /usr/bin/python3'
 "$WARDEN" "$POL" --plan "$D/exec.txt" -- "$PROBE" > /dev/null 2> "$OUT/x.err"

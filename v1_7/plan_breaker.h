@@ -16,9 +16,11 @@
  * function of (plan, policy); the breaker only interprets the SEQUENCE
  * of verdicts for one signature and, once the policy's refusal budget
  * is spent, latches to a deterministic terminal disposition declared in
- * the policy. Resolution is bounded — at most 'budget' retryable
- * refusals per signature — and no outcome ever requires human
- * intervention. That is the v1.8.2 contribution: a non-bypassable loop
+ * the policy. Resolution is bounded — with a budget of N, the Nth
+ * refusal of a signature is terminal, so at most N - 1 refusals are
+ * retryable and a host may re-plan at most N - 1 times (correction,
+ * v1.21.0: through v1.20.0 this said at most N retryable refusals) —
+ * and no outcome ever requires human intervention. That is the v1.8.2 contribution: a non-bypassable loop
  * bound that lives in the trusted boundary, not in vendor harness code.
  *
  * The breaker never authors a corrected action. It returns one of four
