@@ -71,3 +71,4 @@ varek/v1_4/warden_faultinject
 varek/v1_4/tools/vdp_cert_check
 varek/v1_4/tools/vdp_check
 varek/v1_4/tests/test_v14_filter
+varek/v1_4/tools/varek_keygen
