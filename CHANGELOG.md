@@ -29,6 +29,14 @@ a refusal limit per session to the breaker, and v1.20.0 fields on plan steps.
 None of them changes the verification program. Still planned: a customer-derived corpus and measured baseline, a
 formally verified checker, and the v1.11 sequence fragment (issues #21–#25).
 
+### Changed (test tooling)
+
+- The CycloneDX schema check (`tests/cdx_schema_check.py`, `make test-v1180`)
+  uses `rfc3986-validator` (MIT) instead of `rfc3987` (GPLv3+) for jsonschema's
+  "uri" format checking, so running the tests no longer needs a GPL package.
+  Validation results are unchanged: a signed BOM is valid with either, and
+  invalid with neither. No runtime code imports either package.
+
 ### Planned — v1.10 program (status as of v1.20.0; unchanged since v1.16.0)
 
 - **Verdict-distribution harness.** Measurement and regression gating over a
