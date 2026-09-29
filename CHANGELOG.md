@@ -21,10 +21,14 @@ Shipped in v1.14.0: the rest of the bounded string fragment (suffix, contains
 and glob matchers, with exact load-time reachability). Shipped in v1.15.0:
 certificates for every authorization, checked in-line by an independent
 checker. v1.16.0 (outside the program) protects the verdict stream against its
-holder and bounds the cost of one decision. Still planned: a customer-derived corpus and measured baseline, a
-formally verified checker, and the v1.11 sequence fragment.
+holder and bounds the cost of one decision. v1.17.0 and v1.18.0 are also outside
+the program: v1.17.0 protects the Warden's own files and drops the agent's root
+privileges, and v1.18.0 fixes where the public claims and the code disagreed
+(the plan gate's data-flow check, breaker and signed BOM export); neither
+changes the verification program. Still planned: a customer-derived corpus and measured baseline, a
+formally verified checker, and the v1.11 sequence fragment (issues #21–#25).
 
-### Planned — v1.10 program (status as of v1.16.0)
+### Planned — v1.10 program (status as of v1.18.0; unchanged since v1.16.0)
 
 - **Verdict-distribution harness.** Measurement and regression gating over a
   corpus of realistic agent action-graphs. Reports the four-cell outcome
