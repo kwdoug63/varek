@@ -169,8 +169,8 @@ changes what the `--plan` gate authorizes, so it is a minor release. No verdict
 
 ### Tests
 
-- `make test-v1180` (72 checks, plus the v1.7-layer test's 70 and the live
-  filter's io_uring probe). 47 of the 72 fail against the v1.17.0 Warden. Every
+- `make test-v1180` (73 checks, plus the v1.7-layer test's 74 and the live
+  filter's io_uring probe). 47 of the 73 fail against the v1.17.0 Warden. Every
   earlier suite still passes, with `test_v1124` and the v1.6 integration test
   updated for the plan-gate change. Two rounds of independent review of the
   new code found, among others, a breaker count resettable by an interrupted

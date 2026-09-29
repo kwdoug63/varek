@@ -75,6 +75,52 @@ static const char *find_named_arg(const plan_action_desc_t *action,
  *   path    the rest up to '?' or '#', "/" when empty. */
 #define URL_PART_MAX 512
 
+/* An IPv6 literal (without brackets) that embeds an IPv4 address: the
+ * IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d) ranges, in
+ * either dotted or hex spelling. A rule on the IPv4 address cannot see through
+ * these, so they are unreadable. Returns true also for anything unparseable. */
+static bool v6_embeds_v4(const char *h, size_t n)
+{
+    unsigned g[8] = {0};
+    int ng = 0, gap = -1;
+    size_t i = 0;
+    if (n >= 2 && h[0] == ':' && h[1] == ':') { gap = 0; i = 2; }
+    while (i < n) {
+        if (ng >= 8) return true;
+        size_t j = i;
+        unsigned v = 0;
+        while (j < n && j - i < 5 && ((h[j] >= '0' && h[j] <= '9') ||
+               (h[j] >= 'a' && h[j] <= 'f') || (h[j] >= 'A' && h[j] <= 'F'))) {
+            int d = h[j] <= '9' ? h[j] - '0' : (h[j] | 0x20) - 'a' + 10;
+            v = v * 16 + (unsigned)d;
+            j++;
+        }
+        if (j < n && h[j] == '.') return true;                  /* dotted IPv4 tail */
+        if (j == i || j - i > 4 || v > 0xffff) return true;
+        g[ng++] = v;
+        if (j == n) break;
+        if (h[j] != ':') return true;
+        if (j + 1 < n && h[j + 1] == ':') {
+            if (gap >= 0) return true;
+            gap = ng;
+            j++;
+        }
+        i = j + 1;
+        if (i == n && gap != ng) return true;                  /* trailing ':' */
+    }
+    unsigned full[8] = {0};
+    if (gap >= 0) {
+        int tail = ng - gap;
+        for (int k = 0; k < gap; k++) full[k] = g[k];
+        for (int k = 0; k < tail; k++) full[8 - tail + k] = g[gap + k];
+    } else {
+        if (ng != 8) return true;
+        for (int k = 0; k < 8; k++) full[k] = g[k];
+    }
+    for (int k = 0; k < 5; k++) if (full[k]) return false;
+    return full[5] == 0xffff || full[5] == 0;
+}
+
 static int url_component(const char *url, const char *part, char *out, size_t outsz)
 {
     if (!url || !part || outsz < 2) return -1;
@@ -95,6 +141,7 @@ static int url_component(const char *url, const char *part, char *out, size_t ou
     if (*host == '[') {
         host_end = memchr(host, ']', auth_len);
         if (!host_end) return -1;
+        if (v6_embeds_v4(host + 1, (size_t)(host_end - host - 1))) return -1;
         for (const char *q = host + 1; q < host_end; q++)
             if (!((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f') ||
                   (*q >= 'A' && *q <= 'F') || *q == ':' || *q == '.')) return -1;

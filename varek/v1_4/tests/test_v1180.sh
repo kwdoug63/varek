@@ -273,6 +273,7 @@ mkdir -p "$D/data/gsdir" && chmod 755 "$D/data/gsdir"
 gate s1 apart.txt --gate-status "$D/data/gsdir/gs"
 [ "$RC" -eq 1 ] && has 'would let the agent open it' && pass "a --gate-status file the policy reaches stops the Warden" \
     || flunk "a --gate-status file the policy reaches stops the Warden (exit $RC)"
+[ ! -e "$D/data/gsdir/gs" ] && pass "and the Warden did not create it first" || flunk "the Warden did not create the refused --gate-status file"
 python3 "$AUDIT" --policy "$POL" --checker "$CERT" "$OUT/p.err" > "$OUT/p.audit" 2>&1 \
     && pass "varek_audit accepts a stream holding a plan_gate record" || flunk "varek_audit accepts a stream holding a plan_gate record ($(tail -2 "$OUT/p.audit"))"
 

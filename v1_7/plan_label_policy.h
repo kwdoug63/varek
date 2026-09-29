@@ -113,7 +113,7 @@ typedef struct plan_label_policy {
  * rule deciding it. Unreadable: userinfo, a backslash in the authority; a host
  * with other than letters, digits, '.' and '-', an empty label, or a numeric
  * last label that is not a canonical dotted quad (127.1, 2130706433,
- * 0x7f.0.0.1); a port outside 1-65535 or with a leading zero; a path with '%',
+ * 0x7f.0.0.1), or an IPv6 literal that embeds an IPv4 address; a port outside 1-65535 or with a leading zero; a path with '%',
  * '\\', ';', an empty segment or a dot segment. */
 typedef struct plan_label_rule_match {
     const char *key;        /* named-arg key the action must carry */

@@ -1518,20 +1518,24 @@ static bool  g_pdir_set;
 static dev_t g_pdir_dev;
 static ino_t g_pdir_ino;
 
-static bool in_protected_dir(const char *canon, int parent_fd) {
-    if (!g_pdir_set) return false;
+/* 1: the object is in the state directory; 0: it is not; -1: its directory
+ * could not be examined (the caller refuses, as resolution_failed). The
+ * directory is found from the canonical path: the agent cannot rename or
+ * mount, so it cannot swap it between resolution and this check. */
+static int in_protected_dir(const char *canon, int parent_fd) {
+    if (!g_pdir_set) return 0;
     struct stat ds;
     if (parent_fd >= 0) {
-        if (fstat(parent_fd, &ds) < 0) return true;           /* fail closed */
+        if (fstat(parent_fd, &ds) < 0) return -1;
     } else {
         char dir[PATH_MAX];
         const char *slash = canon ? strrchr(canon, '/') : NULL;
-        if (!slash) return true;
+        if (!slash) return -1;
         size_t n = slash == canon ? 1 : (size_t)(slash - canon);
-        if (n >= sizeof dir) return true;
+        if (n >= sizeof dir) return -1;
         memcpy(dir, canon, n);
         dir[n] = '\0';
-        if (stat(dir, &ds) < 0) return true;
+        if (stat(dir, &ds) < 0) return -1;
     }
     return ds.st_dev == g_pdir_dev && ds.st_ino == g_pdir_ino;
 }
@@ -1542,9 +1546,11 @@ static const char *forbidden_object(int fd, const char *canon) {
     for (int i = 0; i < g_nprotected; i++)
         if (st.st_dev == g_protected[i].dev && st.st_ino == g_protected[i].ino)
             return "protected_object";
-    if ((st.st_dev == g_pdir_dev && st.st_ino == g_pdir_ino && g_pdir_set) ||
-        in_protected_dir(canon, -1))
+    if (g_pdir_set && st.st_dev == g_pdir_dev && st.st_ino == g_pdir_ino)
         return "protected_object";
+    int pd = in_protected_dir(canon, -1);
+    if (pd < 0) return "resolution_failed";
+    if (pd > 0) return "protected_object";
     if (S_ISBLK(st.st_mode)) return "raw_device";
     if (S_ISCHR(st.st_mode)) {
         unsigned ma = major(st.st_rdev), mi = minor(st.st_rdev);
@@ -2357,7 +2363,8 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             /* v1.17.0: the signing key, the anchor, the verdict stream and raw
              * storage are refused by identity, before the policy is asked. */
             const char *forbid = rt.path_fd >= 0 ? forbidden_object(rt.path_fd, act.resolved)
-                               : (in_protected_dir(NULL, rt.parent_fd) ? "protected_object" : NULL);
+                               : in_protected_dir(NULL, rt.parent_fd) < 0 ? "resolution_failed"
+                               : in_protected_dir(NULL, rt.parent_fd) > 0 ? "protected_object" : NULL;
             if (forbid) {
                 resolved_target_close(&rt);
                 clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -3012,6 +3019,15 @@ static int flow_setup(const struct policy *pol, const char *cfg_path, const char
             if (gd >= 0) close(gd);
             return -1;
         }
+        char gdr[PATH_MAX], gfull[PATH_MAX];
+        int gfl = fd_path(gd, gdr, sizeof gdr) < 0 ? -1
+                : snprintf(gfull, sizeof gfull, "%s%s%s", gdr, strcmp(gdr, "/") ? "/" : "", gname);
+        if (gfl < 0 || (size_t)gfl >= sizeof gfull || vdpc_path_openable(&pol->c, gfull, (size_t)gfl)) {
+            fprintf(stderr, "[warden] --gate-status %s: the policy would let the agent open it; "
+                    "refusing to start\n", gate_status_path);
+            close(gd);
+            return -1;
+        }
         g_gate_status_fd = openat(gd, gname,
                                   O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
         close(gd);
@@ -3021,13 +3037,6 @@ static int flow_setup(const struct policy *pol, const char *cfg_path, const char
                     g_gate_status_fd < 0 ? strerror(errno)
                                          : "must be a regular file owned by the Warden's user and "
                                            "writable by no one else");
-            return -1;
-        }
-        char grp[PATH_MAX];
-        if (fd_path(g_gate_status_fd, grp, sizeof grp) < 0 ||
-            vdpc_path_openable(&pol->c, grp, strlen(grp))) {
-            fprintf(stderr, "[warden] --gate-status %s: the policy would let the agent open it; "
-                    "refusing to start\n", gate_status_path);
             return -1;
         }
         protect_fd(g_gate_status_fd, "gate_status");

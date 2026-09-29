@@ -28,8 +28,8 @@ verdict with UNKNOWN suppressed to DENY, the certificates and the
 symmetric-suppression invariant (**no extension may move a genuinely unsafe
 action to SATISFIED**).
 
-`make test-v1180` has 72 checks, plus the v1.7 layer's new test (70) and the
-live filter's io_uring probe; 47 of the 72 fail against the v1.17.0 Warden.
+`make test-v1180` has 73 checks, plus the v1.7 layer's new test (74) and the
+live filter's io_uring probe; 47 of the 73 fail against the v1.17.0 Warden.
 Every earlier suite still passes. Two rounds of independent review of this
 release's own new code found problems in the breaker, the gate status, URL
 matching and the exporter (a count that could be reset, graphs that shared a
@@ -131,7 +131,8 @@ rule that merely did not match an unreadable URL would let it fall through to
 a later permissive rule. Unreadable: userinfo `@` or a backslash in the
 authority; a host with anything but letters, digits, dots and hyphens, an
 empty label, or a numeric last label that is not a canonical dotted quad
-(`127.1`, `2130706433`, `0x7f.0.0.1`); a port outside 1–65535 or with a leading
+(`127.1`, `2130706433`, `0x7f.0.0.1`), or an IPv6 literal that embeds an IPv4
+address (`[::ffff:127.0.0.1]`); a port outside 1–65535 or with a leading
 zero; a path with `%`, `\`, `;`, an empty segment or a `.`/`..` segment. The
 host and scheme are compared case-blind (a pattern written `*.EVIL.example`
 still matches); the path is case-sensitive. The examples now say:
@@ -176,7 +177,8 @@ model say not to use one for hosts.
   public key, since signing vouches for the stream. Without either, the
   attestation says how many signed records the stream carries and that they
   were not checked. For an incomplete stream (`--allow-incomplete`) it says how
-  many records come after the last signature.
+  many records come after the last signature, and `--sign-key` refuses to sign
+  a BOM that includes such records.
 - **Schema-tested.** `make test-v1180` and CI validate unsigned and signed BOMs
   against the CycloneDX 1.6 schema, using the OWASP CycloneDX project's
   validator (`varek/v1_4/tools/requirements-test.txt`).
@@ -260,8 +262,9 @@ Python binding. It could not run end to end on this release's test host.
 
 ## Known limits
 
-- The breaker bounds resubmissions of the same action-graph (up to the order of
-  its steps and edges). A planner that submits a different graph each time,
+- The breaker bounds resubmissions of the same action-graph, up to the order of
+  its distinct steps and its edges; declaring two identical steps in the other
+  order starts a new count. A planner that submits a different graph each time,
   even one extra step, is counted per graph, not in total. The count is per
   session and state file, both chosen by whoever starts the Warden.
 - The plan gate still decides file opens on the lexically canonical declared

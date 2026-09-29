@@ -117,6 +117,7 @@ static void test_deny_spellings(void)
         "https://a.evil.example/", "https://A.Evil.Example/",
         "https://h.example:0443/admin", "https://h.example:443//admin",
         "https://h.example:443/;/admin",
+        "https://[::ffff:127.0.0.1]/", "https://[0:0:0:0:0:ffff:7f00:1]/", "https://[::7f00:1]/",
     };
     for (size_t i = 0; i < sizeof urls / sizeof urls[0]; i++) {
         char msg[200];
@@ -125,6 +126,7 @@ static void test_deny_spellings(void)
     }
     CHECK(permitted(d, "https://127.0.0.1/") == 0, "the canonical address hits the deny rule");
     CHECK(permitted(d, "https://ok.example/") == 1, "an unrelated host gets the permissive rule");
+    CHECK(permitted(d, "https://[2001:db8::1]/") == 1, "an ordinary IPv6 literal is readable");
     {
         plan_action_arg_t args[2] = { { "url", "https://ok.example/" }, { "url", "https://127.0.0.1/" } };
         plan_action_desc_t a = { .name = "send_http", .named_args = args, .n_named_args = 2 };

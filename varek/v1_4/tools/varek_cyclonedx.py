@@ -719,6 +719,10 @@ def main(argv=None):
     if args.pubkey:
         log_info["verified_key"], log_info["unsigned_tail"] = \
             check_stream_signatures(meta, args.pubkey, complete)
+    if args.sign_key and log_info.get("unsigned_tail"):
+        raise StreamError(f"varek_cyclonedx: the stream has no run_end and its last "
+                          f"{log_info['unsigned_tail']} record(s) come after the last "
+                          f"signature; refusing to sign a BOM that includes them.")
     recorded_sha = str(meta.get("run_start", {}).get("policy_sha256", ""))
     if args.policy is None:
         # v1.18.0: name the policy the Warden recorded, not a fixed label (the
