@@ -166,7 +166,7 @@ Line-oriented text. See `sample_plan.txt` for a worked example.
 
 ```
 # Comments begin with #.
-action <label> <kind> <target>
+action <label> <kind> <target> [<key>=<value> ...]
 edge   <from_label> <to_label>
 ```
 
@@ -179,7 +179,17 @@ edge   <from_label> <to_label>
   the Warden's gate decides every `net_connect` and `process_exec`
   step UNSATISFIED, because the runtime refuses those whatever the
   policy says; only `file_open` steps can be SATISFIED.
-- `<target>` is a single whitespace-free token.
+- `<target>` is a single whitespace-free token, at most 4095 bytes.
+- v1.20.0: after the target, up to 16 fields, `key=value`. A key is
+  `[a-z][a-z0-9_]*` (at most 32 characters, unique in the action, not
+  `target`). A value is bare (no space, tab, `"` or control character)
+  or quoted, `"..."`, with `\"`, `\\`, `\n`, `\r`, `\t` and `\xHH`
+  (not `\x00`); at most 4096 bytes. A line is at most 16383 bytes, and a
+  NUL byte refuses the file. `plan_parser_fields()` returns a step's
+  fields. The Warden hands them to its `--flow-policy` rules; the node
+  check (and this directory's Verdict Service front end, `plan_verify`)
+  ignores them. They are declarations: nothing compares the agent's later
+  calls with them.
 - Edge labels must reference action lines declared earlier in
   the file. Self-edges are rejected at parse time.
 - Errors are reported as `file:line: reason`.

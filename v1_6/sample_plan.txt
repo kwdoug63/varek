@@ -1,8 +1,11 @@
 # sample_plan.txt — example ExecutionPlan declaration.
 #
 # Format:
-#   action <label> <kind> <target>
+#   action <label> <kind> <target> [<key>=<value> ...]
 #   edge   <from_label> <to_label>
+#
+# (v1.20.0: fields after the target, e.g. contains="a customer record",
+# reach only a --flow-policy's rules; see plan_parser.h.)
 #
 # An agent that:
 #   1. reads an input file under an allowed prefix

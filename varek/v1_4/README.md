@@ -331,9 +331,21 @@ plan that needs one cannot run as declared.
 (`v1_7/example_policy.cfg`):
 
 - **the data-flow check (v1.7).** Steps reach the flow policy as actions named
-  by their kind, with one argument, `target`: for a `file_open`, the canonical
-  path. A plan whose edges carry a sticky label to a step that denies it is
-  refused, and `[warden] plan flow pathology:` names the flow.
+  by their kind, with the argument `target` (for a `file_open`, the canonical
+  path) and, since v1.20.0, every field the step declares after its target
+  (`action r file_open /srv/in/msg contains="a customer record"`; see
+  `v1_6/plan_parser.h`). A plan whose edges carry a sticky label to a step that
+  denies it is refused, and `[warden] plan flow pathology:` names the flow.
+- **declared fields (v1.20.0).** Fields reach only the flow policy; the node
+  check and the runtime see the target alone. The agent writes its plan, so
+  declaring or omitting a field changes which rule applies: a rule that
+  permits on a field is unlocked by declaring it, a rule that refuses on a
+  field is avoided by leaving it out, and a field rule placed before a stricter
+  one skips it. The Warden refuses to start with a flow policy whose rules match
+  a field (anything but `target`) unless it declares `trust_declared_fields`.
+  Fields help an honest planner say more about its steps; like the edges, they
+  are not evidence. A changed value makes a new plan for the breaker (its own
+  per-plan count), so the session limit is what bounds that.
 - **the refusal breaker (v1.8.2).** Each refused plan counts against
   (`--session <id>`, default `default`; the plan's signature). The signature
   covers the plan's steps and edges: reordering distinct steps or edges, or

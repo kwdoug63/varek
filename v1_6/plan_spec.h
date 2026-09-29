@@ -31,6 +31,22 @@ typedef struct {
     const char *label;       /* optional, surfaces in pathology records */
 } plan_spec_action_t;
 
+/* v1.20.0: a field declared on a plan step (key=value after its target in a
+ * plan file; see plan_parser.h). Kept apart from plan_spec_action_t so that
+ * struct, and callers' initializers of it, are unchanged. */
+#define PLAN_FIELDS_MAX        16u
+#define PLAN_FIELD_KEY_MAX     32u
+#define PLAN_FIELD_VALUE_MAX 4096u
+/* v1.20.0: the longest target a plan file may declare. The Warden decides a
+ * target in a 4096-byte buffer; a longer one (possible once a line may be
+ * 16 KB) would be cut short and decided as a different path. */
+#define PLAN_TARGET_MAX      4095u
+
+typedef struct {
+    const char *key;
+    const char *value;
+} plan_spec_field_t;
+
 /* A dependency edge between two actions by index into the actions
  * array. 'to_idx' depends on 'from_idx'. */
 typedef struct {

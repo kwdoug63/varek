@@ -12,5 +12,6 @@ warden_example
 /tests/test_v19_progress
 /tests/test_v118
 /tests/test_v119
+/tests/test_v120
 /tests/test_v192_abi_lockdown
 /tests/test_v192_baseline_deny

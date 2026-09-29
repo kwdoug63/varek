@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.19.0-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.20.0-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -48,7 +48,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.19.0.**
+   **Current release: v1.20.0.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -96,7 +96,8 @@ The runtime line has progressed well beyond simple syscall containment:
 - **v1.7 — cross-action data-flow verification.** Reasoning across edges of the
   action-graph, not just per-action checks. Run by the Warden's `--plan` gate
   with `--flow-policy` since v1.18.0; through v1.17.0 it was a library with tests
-  that the Warden did not call.
+  that the Warden did not call. Since v1.20.0 a plan step can declare fields
+  besides its target, which the flow rules can match.
 - **v1.8.2 — bounded-refusal breaker.** A loop bound in the trusted boundary,
   keyed by `(session, action-graph signature)`, so a stuck planner cannot
   resubmit the same refused action-graph forever: after the policy's refusal
@@ -112,6 +113,7 @@ The runtime line has progressed well beyond simple syscall containment:
   "Never requires a human" becomes certified rather than hoped. Since v1.18.0 the
   Warden runs it on the `--flow-policy` at startup and refuses to start if it
   fails.
+- **v1.20.0 — fields on plan steps.** A plan step had one field, its target, so flow rules could see nothing else it declared. A step can now carry up to 16 `key=value` fields after its target (quoted values may hold spaces: `contains="a customer record"`), and the Warden's `--flow-policy` rules match them like any named argument. The node check and the runtime still see only the target. Fields are the agent's declarations, so the Warden refuses a flow policy whose rules match them unless it declares `trust_declared_fields`. The plan file's lines may be 16383 bytes (were 1022); targets stay under 4096 bytes. See [`RELEASE-v1.20.0.md`](./RELEASE-v1.20.0.md).
 - **v1.19.0 — a refusal limit per session.** The plan gate's breaker counted refusals per (session, plan), so a planner that changed one step each time got a fresh count every time and was never stopped. A flow policy now declares `session_refusal_budget N`, which the Warden requires: the Nth refused plan in a session, and every refused plan after it, is terminal, whatever the plans were. Authorized plans still run and do not reset the count. `--gate-status` and the `plan_gate` record report the session's count; the state file moves to format 2 and v1.18.0 tables still load. See [`RELEASE-v1.19.0.md`](./RELEASE-v1.19.0.md).
 - **v1.18.0 — the claims and the code agree.** A review listed ten places where the published claims and the code disagreed; each is fixed in the code or in the claim. The `--plan` gate now runs the v1.7 data-flow check, the v1.8.2 refusal breaker and the v1.9 progress-safety check (`--flow-policy`; the breaker's counts persist across runs in a state file the agent cannot reach), which through v1.17.0 were a library the Warden did not call, and it refuses connect and launch steps the runtime would refuse. Flow rules can match a URL's host (`match url.host`) instead of a whole-URL glob that matched outside hosts. The CycloneDX export's attestation is derived from the stream, checks the policy file, can be signed (JSF, Ed25519) and is tested against the CycloneDX 1.6 schema. Refusal records name `EACCES`, the errno sent. Release notes, CHANGELOG and the spec paper are corrected where they described code that was never committed, and figures without a record are re-measured or restated. See [`RELEASE-v1.18.0.md`](./RELEASE-v1.18.0.md).
 - **v1.17.0 — closing three live gaps.** The signing key, the anchor and the verdict stream are refused by identity (device and inode) on every open and lookup, so a bind mount or hard link into an allowed tree no longer reaches them; raw storage and memory devices are refused the same way whatever the policy says. `stat`, `statx`, `access` and `readlink` are mediated like opens: decided, certified, recorded and answered by the Warden, where they were admitted and unlogged. The agent runs as an unprivileged user with no capabilities (`--run-as`, default `nobody`), where it ran as root with every capability. Adds `make test-v1170` (48 checks). See [`RELEASE-v1.17.0.md`](./RELEASE-v1.17.0.md).
@@ -391,6 +393,7 @@ different risks at different points in the stack.
 - [x] **v1.17.0** — Protected files refused by identity; stat/access/readlink mediated; agent unprivileged
 - [x] **v1.18.0** — Claims and code agree: data-flow, breaker and progress checks in the Warden's plan gate; URL host matching; derived, signed, schema-tested CycloneDX export; corrected records and figures
 - [x] **v1.19.0** — A refusal limit per session for the plan gate's breaker (`session_refusal_budget`)
+- [x] **v1.20.0** — Fields on plan steps (`key=value` after the target) for the flow policy; `trust_declared_fields`
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
 

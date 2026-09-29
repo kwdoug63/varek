@@ -16,16 +16,17 @@
  *      "demo:SAT:" / "demo:UNSAT:" / "demo:UNK:", that decision is used
  *      verbatim (the rest of the target is ignored). This is the
  *      caller-asserted path for reliably exercising all three states.
- *      We use a target prefix because the plan grammar accepts exactly
- *      three fields per action (label, kind, target) and rejects a
- *      fourth — so the override must live inside the target token.
+ *      We use a target prefix because, when this was written, the plan
+ *      grammar accepted exactly three fields per action (label, kind,
+ *      target). v1.20.0 added key=value fields after the target; this
+ *      front end reads plans that carry them and ignores them.
  *   2. Bound policy: otherwise a small, deterministic policy decides by
  *      action kind/target. This is the authentic decision path.
  *
  * Plan file format (from plan_parser.h):
- *   action <label> <kind> <target>
+ *   action <label> <kind> <target> [<key>=<value> ...]
  *   edge   <from_label> <to_label>
- * (three fields per action; targets contain no whitespace.)
+ * (targets contain no whitespace; fields are ignored here.)
  *
  * Usage:  plan_verify <plan_file>
  * Output: one line of JSON on stdout; exit 0 on a produced verdict,

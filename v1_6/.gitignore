@@ -10,3 +10,4 @@ plan_verify
 /tests/test_adapter
 /tests/test_pathology
 /tests/test_plan_parser
+/tests/test_plan_fields
