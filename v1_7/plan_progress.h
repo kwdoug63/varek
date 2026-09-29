@@ -21,7 +21,11 @@
  *
  *   P1  Bounded refusal. If the policy can refuse at all, a
  *       refusal_budget >= 1 must be declared. An unbounded refusal is a
- *       potential infinite retry loop.
+ *       potential infinite retry loop. (v1.19.0 note: refusal_budget bounds
+ *       resubmissions of ONE plan; a planner that submits a different plan
+ *       each time is bounded only by session_refusal_budget. P1 does not
+ *       require it, so library callers certified before v1.19.0 stay
+ *       certified; the Warden's --flow-policy gate does require it.)
  *
  *   P2  Disposed UNKNOWN. unknown_disposition must be terminal (deny, or
  *       a terminal action that satisfies P4). 'deny' is always terminal.

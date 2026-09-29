@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.18.0-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.19.0-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -48,7 +48,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.18.0.**
+   **Current release: v1.19.0.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -103,18 +103,20 @@ The runtime line has progressed well beyond simple syscall containment:
   budget, the outcome is a declared terminal (deny, or a pre-authorized action).
   Each verdict stays a pure function of `(plan, policy)`; the breaker only
   interprets the *sequence* of verdicts. In the Warden since v1.18.0, with its
-  counts kept across runs in a state file the agent cannot reach. A planner that
-  submits a different graph each time is counted per graph, not in total.
+  counts kept across runs in a state file the agent cannot reach. Since v1.19.0
+  it also bounds each session (`session_refusal_budget`), so a planner that
+  submits a different graph each time is stopped too.
 - **v1.9.0 — progress-safety / HOOTL.** A load-time liveness proof that certifies
   human-out-of-the-loop operation per policy: for every non-authorizing verdict,
   a deterministic, automated terminal outcome is reachable in finitely many steps.
   "Never requires a human" becomes certified rather than hoped. Since v1.18.0 the
   Warden runs it on the `--flow-policy` at startup and refuses to start if it
   fails.
-- **v1.16.2 — off-host anchor.** An anchor on the Warden's own host does not protect against that host's root, who also holds the signing key. `tools/varek_anchor_forward.py` sends each checkpoint off the host within about a second (spooling through outages) to an append-only receiver set up by `tools/varek_anchor_receiver.sh` — an SSH account that can only append well-formed anchor lines to a `chattr +a` file — or to any command. The preflight now checks the forwarder is running and warns when the anchor or the key leave that gap open. See [`RELEASE-v1.16.2.md`](./RELEASE-v1.16.2.md).
+- **v1.19.0 — a refusal limit per session.** The plan gate's breaker counted refusals per (session, plan), so a planner that changed one step each time got a fresh count every time and was never stopped. A flow policy now declares `session_refusal_budget N`, which the Warden requires: the Nth refused plan in a session, and every refused plan after it, is terminal, whatever the plans were. Authorized plans still run and do not reset the count. `--gate-status` and the `plan_gate` record report the session's count; the state file moves to format 2 and v1.18.0 tables still load. See [`RELEASE-v1.19.0.md`](./RELEASE-v1.19.0.md).
 - **v1.18.0 — the claims and the code agree.** A review listed ten places where the published claims and the code disagreed; each is fixed in the code or in the claim. The `--plan` gate now runs the v1.7 data-flow check, the v1.8.2 refusal breaker and the v1.9 progress-safety check (`--flow-policy`; the breaker's counts persist across runs in a state file the agent cannot reach), which through v1.17.0 were a library the Warden did not call, and it refuses connect and launch steps the runtime would refuse. Flow rules can match a URL's host (`match url.host`) instead of a whole-URL glob that matched outside hosts. The CycloneDX export's attestation is derived from the stream, checks the policy file, can be signed (JSF, Ed25519) and is tested against the CycloneDX 1.6 schema. Refusal records name `EACCES`, the errno sent. Release notes, CHANGELOG and the spec paper are corrected where they described code that was never committed, and figures without a record are re-measured or restated. See [`RELEASE-v1.18.0.md`](./RELEASE-v1.18.0.md).
 - **v1.17.0 — closing three live gaps.** The signing key, the anchor and the verdict stream are refused by identity (device and inode) on every open and lookup, so a bind mount or hard link into an allowed tree no longer reaches them; raw storage and memory devices are refused the same way whatever the policy says. `stat`, `statx`, `access` and `readlink` are mediated like opens: decided, certified, recorded and answered by the Warden, where they were admitted and unlogged. The agent runs as an unprivileged user with no capabilities (`--run-as`, default `nobody`), where it ran as root with every capability. Adds `make test-v1170` (48 checks). See [`RELEASE-v1.17.0.md`](./RELEASE-v1.17.0.md).
 - **v1.16.3 — the Verdict Service's plan checker, in the repository.** `v1_6/plan_verify_cli.c` (`make -C v1_6 plan_verify`) is the file-in / JSON-out front end the VAREK Verdict Service runs; its source had existed only on the service host. Its JSON output is now escaped: before, a crafted target could make the output read as SATISFIED when the evaluator had decided UNSATISFIED. See [`RELEASE-v1.16.3.md`](./RELEASE-v1.16.3.md).
+- **v1.16.2 — off-host anchor.** An anchor on the Warden's own host does not protect against that host's root, who also holds the signing key. `tools/varek_anchor_forward.py` sends each checkpoint off the host within about a second (spooling through outages) to an append-only receiver set up by `tools/varek_anchor_receiver.sh` — an SSH account that can only append well-formed anchor lines to a `chattr +a` file — or to any command. The preflight now checks the forwarder is running and warns when the anchor or the key leave that gap open. See [`RELEASE-v1.16.2.md`](./RELEASE-v1.16.2.md).
 - **v1.16.1 — deployment preflight.** `tools/varek_preflight.sh` checks a deployment before it runs: the build dependencies (libsodium is new in v1.16; `make deps` installs them), the build, the policy, and every location the Warden refuses at startup — the verdict stream file, the signing key, the anchor — checked with the Warden's own rules, plus an optional audited trial run. All seven shipped policies pass with the stream in `/var/log/varek/`. A CI job builds the Warden with libseccomp and libsodium. See [`RELEASE-v1.16.1.md`](./RELEASE-v1.16.1.md).
 - **v1.16.0 — a verdict stream its holder cannot rewrite, and a bound on every decision.** Addresses the two limits v1.15.0 disclosed. Every record is hash-chained; with `--sign-key`, run_start, a checkpoint every 64 records and run_end are signed with Ed25519; with `--anchor`, each checkpoint is also appended to storage the log's holder cannot rewrite. `tools/varek_audit.py --pubkey --anchor` then catches any edit, insertion, removal or reordering before the last signature, and a stream cut short, by someone without the key, and any rewrite of anchored history even by someone with it; it verifies signatures with its own pure-Python RFC 8032 verifier. The Warden refuses to start if the policy would let the agent open the key, the anchor, the verdict stream itself or a raw disk. Globs are capped at 4,096 tokens per policy, which bounds the work of one decision; the worst case measured is about 26 ms median in the live Warden (v1.15's checker alone: 415 ms), and real policies are unchanged. See [`RELEASE-v1.16.0.md`](./RELEASE-v1.16.0.md).
 - **v1.15.0 — certificates: every authorization independently checked.** Third release of the v1.10 verification program. Every SATISFIED verdict now carries a certificate — the deciding rule and a witness that its constant matches — and the Warden authorizes the action only if a separately written checker accepts it (`checker/vdp_checker.c`: about 540 lines, its own policy parser and matchers, no code shared with the decision procedure). A bug confined to the decision procedure can no longer authorize an action: a test build with a planted bug shows the checker refusing its wrong verdicts. Certificates and the policy's SHA-256 go into the verdict stream, and `tools/varek_audit.py` re-checks a saved run without trusting the Warden that made it. See [`RELEASE-v1.15.0.md`](./RELEASE-v1.15.0.md).
@@ -388,6 +390,7 @@ different risks at different points in the stack.
 - [x] **v1.16.3** — Verdict Service plan checker (`plan_verify`) in the repository; JSON output escaped
 - [x] **v1.17.0** — Protected files refused by identity; stat/access/readlink mediated; agent unprivileged
 - [x] **v1.18.0** — Claims and code agree: data-flow, breaker and progress checks in the Warden's plan gate; URL host matching; derived, signed, schema-tested CycloneDX export; corrected records and figures
+- [x] **v1.19.0** — A refusal limit per session for the plan gate's breaker (`session_refusal_budget`)
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
 

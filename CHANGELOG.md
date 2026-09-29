@@ -24,11 +24,12 @@ checker. v1.16.0 (outside the program) protects the verdict stream against its
 holder and bounds the cost of one decision. v1.17.0 and v1.18.0 are also outside
 the program: v1.17.0 protects the Warden's own files and drops the agent's root
 privileges, and v1.18.0 fixes where the public claims and the code disagreed
-(the plan gate's data-flow check, breaker and signed BOM export); neither
-changes the verification program. Still planned: a customer-derived corpus and measured baseline, a
+(the plan gate's data-flow check, breaker and signed BOM export); v1.19.0 adds
+a refusal limit per session to the breaker. None of them changes the
+verification program. Still planned: a customer-derived corpus and measured baseline, a
 formally verified checker, and the v1.11 sequence fragment (issues #21–#25).
 
-### Planned — v1.10 program (status as of v1.18.0; unchanged since v1.16.0)
+### Planned — v1.10 program (status as of v1.19.0; unchanged since v1.16.0)
 
 - **Verdict-distribution harness.** Measurement and regression gating over a
   corpus of realistic agent action-graphs. Reports the four-cell outcome
@@ -62,6 +63,55 @@ formally verified checker, and the v1.11 sequence fragment (issues #21–#25).
   fragment's guarantee.
 
 ---
+
+## [1.19.0] - 2026-09-29
+
+v1.19.0 bounds the refusals in a whole session. The plan gate's breaker counted
+refused plans per session and per plan, so a planner that changed one step each
+time got a fresh count every time and was never stopped (a v1.18.0 known
+limit). It adds a policy directive and changes what the Warden requires at
+startup, so it is a minor release. Per-call verdicts are unchanged.
+
+### Added
+
+- `session_refusal_budget N` (v1.7 flow policy, 1 to 1,000,000; requires
+  `refusal_budget`). The breaker counts every refused submission in a session
+  (UNSATISFIED or UNKNOWN, not a replay of a plan already terminal), whatever
+  the plan. The refusal that reaches N is terminal, and every later refused plan
+  in the session gets `on_exhaustion` without being counted. An authorized plan
+  still runs and does not reset the session's count.
+- `plan_label_policy_config_session_refusal_budget()`; `plan_breaker_result_t`
+  gains `session_refusals`, `session_budget` and `session_exhausted`.
+- `--gate-status`: `REFUSED_RETRYABLE n/budget session m/limit`. The
+  `plan_gate` record adds `session_refusals`, `session_budget` and
+  `session_exhausted`.
+- `make test-v1190`: `v1_7/tests/test_v119` (65 checks, also in
+  `make -C v1_7 check`) and `varek/v1_4/tests/test_v1190.sh` (22 checks; 21
+  fail against v1.18.0).
+
+### Changed
+
+- The Warden refuses to start with a `--flow-policy` that declares no
+  `session_refusal_budget`.
+- The breaker state file is format 2 (a line per session; the trailer counts
+  both kinds of line). Format 1 still loads: each session starts from the
+  refusals its plans hold, a plan latched by an UNKNOWN counting 1. A format 2
+  session line whose count is below its plans' refusals is refused, and a
+  session with plans but no line starts from their sum.
+- Counts in the state file are plain decimal digits up to 4,294,967,295; `-1`,
+  `+3` and larger values are refused (sscanf's `%u` read `-1` as the maximum,
+  which the next refusal wrapped to 0). Counts saturate instead of wrapping.
+- `run_start` says `"warden":"1.19.0"`; the default policy version is `1.19`.
+- `v1_7/hotl_policy.cfg` declares `session_refusal_budget 10`.
+- `varek/v1_4/tests/test_v1180.sh`: its flow policy declares
+  `session_refusal_budget 100`, and it expects the new status line and trailer.
+
+### Found in review
+
+An independent review of this release's code found no way around the limit in
+normal operation, and four smaller problems, fixed before release: the two
+state-file resets above, an authorized plan's record reporting an exhausted
+session as not exhausted, and no test for an UNKNOWN that reaches the limit.
 
 ## [1.18.0] - 2026-09-29
 

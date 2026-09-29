@@ -272,7 +272,7 @@ static int policy_load(const char *path, struct policy *p) {
             "(warden_faultinject); never use it to supervise a real agent\n");
 #endif
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.18");
+    snprintf(p->version, sizeof(p->version), "1.19");
     char err[512];
     /* v1.15: read the file once. The decision procedure and the certificate
      * checker parse these same bytes, and their SHA-256 goes in run_start, so
@@ -1229,7 +1229,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.18.0\","
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.19.0\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
@@ -2818,7 +2818,10 @@ static int find_program(const char *name, char *out, size_t n) {
  *   at startup  the v1.9 progress-safety check on <cfg>: the Warden refuses to
  *               start unless every refusal ends in an automated outcome. It
  *               also requires a refusal_budget, since the Warden's own policy
- *               can always refuse a step even when <cfg> cannot.
+ *               can always refuse a step even when <cfg> cannot, and (v1.19.0)
+ *               a session_refusal_budget: refusal_budget bounds resubmissions
+ *               of one plan, so a planner that changed one step each time
+ *               started a new count every time.
  *   per plan    the v1.6 node check and the v1.7 flow check (plan_warden_verify),
  *               then the breaker, keyed by (--session, the plan's signature),
  *               with its counts kept in --breaker-state across runs.
@@ -2893,6 +2896,13 @@ static int flow_setup(const struct policy *pol, const char *cfg_path, const char
                 "policy can refuse a plan step even when the flow policy cannot, so a "
                 "budget is required to bound resubmissions (add, e.g., refusal_budget 3 "
                 "and on_exhaustion deny); refusing to start\n", cfg_path);
+        return -1;
+    }
+    if (plan_label_policy_config_session_refusal_budget(g_flow_cfg) == 0) {
+        fprintf(stderr, "[warden] --flow-policy %s declares no session_refusal_budget. "
+                "refusal_budget bounds resubmissions of one plan; without a session limit "
+                "a planner that changes one step each time is never stopped (add, e.g., "
+                "session_refusal_budget 10); refusing to start\n", cfg_path);
         return -1;
     }
     if (session) {
@@ -3201,6 +3211,7 @@ static int warden_gate_plan_flow(const char *plan_path, const struct policy *pol
     plan_breaker_result_t r;
     memset(&r, 0, sizeof r);
     r.budget = plan_label_policy_config_refusal_budget(g_flow_cfg);
+    r.session_budget = plan_label_policy_config_session_refusal_budget(g_flow_cfg);
     bool state_error = false;
     if (flock(g_state_lock, LOCK_EX) != 0) {
         fprintf(stderr, "[warden] cannot lock the breaker state %s: %s\n", g_breaker_path,
@@ -3234,9 +3245,11 @@ static int warden_gate_plan_flow(const char *plan_path, const struct policy *pol
             plan_decision_name(resp.verdict));
     json_escape(f, g_session);
     fprintf(f, "\",\"signature\":\"%016" PRIx64 "\",\"breaker\":\"%s\",\"refusals\":%u,"
-               "\"budget\":%u,\"terminal_action\":\"", sig,
+               "\"budget\":%u,\"session_refusals\":%u,\"session_budget\":%u,"
+               "\"session_exhausted\":%s,\"terminal_action\":\"", sig,
             state_error ? "STATE_ERROR" : plan_breaker_outcome_name(r.outcome),
-            r.refusals, r.budget);
+            r.refusals, r.budget, r.session_refusals, r.session_budget,
+            r.session_exhausted ? "true" : "false");
     json_escape(f, r.terminal_action ? r.terminal_action : "");
     fprintf(f, "\",\"timestamp_ns\":%lld}\n", (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end(NULL);
@@ -3260,24 +3273,33 @@ static int warden_gate_plan_flow(const char *plan_path, const struct policy *pol
         break;
     case PLAN_BREAKER_REFUSED_RETRYABLE:
         fprintf(stderr, "[warden] plan rejected (%s; node %s, flow %s); refusal %u of %u for "
-                "this plan in session %s; the host may submit a different plan\n",
+                "this plan and %u of %u in session %s; the host may submit a different plan\n",
                 plan_decision_name(resp.verdict), plan_decision_name(resp.node_axis),
-                plan_decision_name(resp.flow_axis), r.refusals, r.budget, g_session);
-        snprintf(st_line, sizeof st_line, "REFUSED_RETRYABLE %u/%u\n", r.refusals, r.budget);
+                plan_decision_name(resp.flow_axis), r.refusals, r.budget,
+                r.session_refusals, r.session_budget, g_session);
+        snprintf(st_line, sizeof st_line, "REFUSED_RETRYABLE %u/%u session %u/%u\n",
+                 r.refusals, r.budget, r.session_refusals, r.session_budget);
         result = GATE_RETRYABLE;
         break;
     case PLAN_BREAKER_TERMINAL_ACTION:
-        fprintf(stderr, "[warden] plan rejected (%s); terminal: the host must run the "
+        fprintf(stderr, "[warden] plan rejected (%s); terminal%s: the host must run the "
                 "pre-authorized action %s\n", plan_decision_name(resp.verdict),
+                r.session_exhausted ? " (session refusal limit reached)" : "",
                 r.terminal_action ? r.terminal_action : "?");
         snprintf(st_line, sizeof st_line, "TERMINAL_ACTION %.256s\n",
                  r.terminal_action ? r.terminal_action : "?");
         result = GATE_TERMINAL_ACTION;
         break;
     default:
-        fprintf(stderr, "[warden] plan rejected (%s); terminal: deny (no further "
-                "submission of this plan in session %s will run)\n",
-                plan_decision_name(resp.verdict), g_session);
+        if (r.session_exhausted)
+            fprintf(stderr, "[warden] plan rejected (%s); terminal: deny (session %s has "
+                    "reached its refusal limit, %u of %u; no further refused plan in it "
+                    "may be resubmitted)\n", plan_decision_name(resp.verdict), g_session,
+                    r.session_refusals, r.session_budget);
+        else
+            fprintf(stderr, "[warden] plan rejected (%s); terminal: deny (no further "
+                    "submission of this plan in session %s will run)\n",
+                    plan_decision_name(resp.verdict), g_session);
         snprintf(st_line, sizeof st_line, "TERMINAL_DENY\n");
         result = GATE_TERMINAL_DENY;
         break;
@@ -3319,14 +3341,17 @@ static void usage(const char *argv0) {
         "\n"
         "  v1.18 --flow-policy <cfg> (v1.7 label policy) adds the data-flow check\n"
         "  and the refusal breaker to the gate. At startup <cfg> must pass the v1.9\n"
-        "  progress-safety check and declare a refusal_budget. Each refused plan\n"
-        "  counts against (--session <id>, default \"default\"; the plan's actions),\n"
+        "  progress-safety check and declare a refusal_budget and (v1.19) a\n"
+        "  session_refusal_budget. Each refused plan counts against that plan and\n"
+        "  against its session (--session <id>, default \"default\"), whatever the\n"
+        "  plan; reaching either limit is terminal. The counts are\n"
         "  kept in --breaker-state <file> (default /var/lib/varek/breaker.state).\n"
         "  Refused: the agent never runs; exit 3 (the host may re-plan), 4 (terminal\n"
         "  deny) or 5 (terminal: run the pre-authorized action the message names);\n"
         "  1 on an error. Authorized: the exit status is the agent's, which may be\n"
         "  3, 4 or 5 too, so read --gate-status <file> (one line: PASS,\n"
-        "  REFUSED_RETRYABLE n/budget, TERMINAL_DENY, TERMINAL_ACTION <name>, ERROR).\n"
+        "  REFUSED_RETRYABLE n/budget session m/limit, TERMINAL_DENY,\n"
+        "  TERMINAL_ACTION <name>, ERROR).\n"
         "\n"
         "  v1.16 log integrity: every record is hash-chained. --sign-key <key>\n"
         "  (from tools/varek_keygen) signs run_start, a checkpoint every <n>\n"

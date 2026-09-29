@@ -65,9 +65,14 @@ for (;;) {
 done: ;
 ```
 
-The loop provably terminates: at most `refusal_budget` retryable
+The loop provably terminates: fewer than `refusal_budget` retryable
 refusals per signature, then a latched terminal outcome. No branch waits
-for a person.
+for a person. `refusal_budget` alone bounds resubmissions of one plan; a
+harness that changes the plan each time gets a fresh count for every
+signature. With `session_refusal_budget N` (v1.19.0; the Warden requires
+it) the session is bounded too: the Nth refusal in the session, whatever
+the plans, latches the whole session to `on_exhaustion`
+(`r.session_exhausted`).
 
 ## Division of responsibility
 
@@ -85,7 +90,8 @@ for a person.
 
 A progress-safe HOTL policy declares:
 
-1. `refusal_budget N` (N >= 1) if the policy can refuse.
+1. `refusal_budget N` (N >= 1) if the policy can refuse, and
+   `session_refusal_budget M` (v1.19.0) to bound the session as a whole.
 2. `unknown_disposition deny` or `... terminal NAME`.
 3. `on_exhaustion deny` or `... terminal NAME`.
 4. For any `terminal NAME`: `NAME` is a declared rule, does not deny or
