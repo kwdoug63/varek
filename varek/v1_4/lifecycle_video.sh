@@ -14,7 +14,7 @@
 #          sudo ./lifecycle_video.sh --quick         (no pacing)
 #          sudo BEFORE_REF=<git-ref> ./lifecycle_video.sh
 #
-# Requires: root, Linux >= 5.14, libseccomp-dev, a git checkout.
+# Requires: root, Linux >= 5.14, libseccomp-dev, libsodium-dev (v1.16+), a git checkout.
 
 set -euo pipefail
 cd "$(dirname "$0")"

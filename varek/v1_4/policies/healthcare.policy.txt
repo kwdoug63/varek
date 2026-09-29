@@ -13,6 +13,11 @@
 #
 # Replace the example paths/hosts with your deployment's real locations. This is
 # a starting allowlist, not a finished authorization — tighten per workflow.
+# v1.16: write the Warden's verdict stream outside every path this policy
+# allows (e.g. 2> /var/log/varek/verdicts.log). The Warden refuses to start
+# when the agent could open its own stream; /tmp/varek/ below is the agent's
+# scratch space, so a log there is refused. Check a deployment with
+#   tools/varek_preflight.sh <policy> --log <path> [--sign-key <key>] --run
 # ------------------------------------------------------------------------------
 
 # v1.13: `readonly` (= access=ro -O_CREAT -O_TRUNC) makes a rule admit reads

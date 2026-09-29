@@ -59,6 +59,34 @@ formally verified checker, and the v1.11 sequence fragment.
 
 ---
 
+## [1.16.1] - 2026-09-28
+
+Deployment preflight for v1.16.0's two new requirements: the verdict stream
+check (the Warden refuses a stream file the agent could open) and libsodium.
+No change to decisions, records or the policy grammar.
+
+### Added
+
+- `tools/varek_preflight.sh <policy> [--log] [--sign-key] [--anchor] [--run]
+  [--install-deps]`: build dependencies, build, policy, every location the
+  Warden refuses at startup (stream, key, anchor, raw disks), and with `--run`
+  a trial run whose stream is audited.
+- `tools/vdp_cert_check <policy> openable`: could the agent open this path
+  (the Warden's own check, `vdpc_path_openable`, on the canonical path).
+- `make deps`, `make deps-check` (the build stops with the install command when
+  the libseccomp or libsodium headers are missing), `make preflight`.
+- `make test-v1161`; CI job `.github/workflows/warden-build.yml` (installs
+  `libseccomp-dev` and `libsodium-dev`, builds, lints and preflights the
+  shipped policies).
+
+### Changed
+
+- `run_start` reads `"warden":"1.16.1"`.
+- Sector policies: a header note on where to put the verdict stream
+  (`/var/log/varek/`; comments only).
+- `docs/development.md`, `varek/v1_4/README.md` and the video scripts list the
+  libsodium build dependency.
+
 ## [1.16.0] - 2026-09-28
 
 Addresses the two limits v1.15.0 disclosed. The verdict stream is hash-chained,

@@ -53,8 +53,11 @@ For each notification, the Warden:
   at startup and refuses to run without it, because it creates the
   target's PID namespace (see below). It also covers reading
   `/proc/<pid>/mem`.
-- libseccomp and, from v1.16, libsodium (`apt install libseccomp-dev
-  libsodium-dev`).
+- libseccomp and, from v1.16, libsodium development headers:
+  `sudo apt-get install -y build-essential libseccomp-dev libsodium-dev`
+  (Debian/Ubuntu) or `sudo dnf install -y gcc make libseccomp-devel
+  libsodium-devel` (Fedora/RHEL). `make deps` runs the right one; `make`
+  stops with that command if they are missing.
 
 ## Lifecycle coupling (v1.9.3)
 
@@ -96,9 +99,29 @@ target reports a `setup` failure rather than a boundary failure.
 ## Build
 
 ```sh
+make deps            # once: libseccomp and libsodium headers (sudo)
 make check-kernel
 make
 ```
+
+## Before you deploy: preflight (v1.16.1)
+
+From v1.16 the Warden refuses to start when the policy would let the agent open
+its own verdict stream file (the file its stderr goes to), its signing key, its
+anchor or, with a key or anchor, a raw disk. Check a deployment without running
+anything:
+
+```sh
+tools/varek_preflight.sh policies/finance.policy.txt --log /var/log/varek/verdicts.log \
+    --sign-key /etc/varek/log.key --anchor /var/log/varek/anchor.log
+```
+
+It checks the build dependencies, builds, loads the policy, and decides each
+location exactly as the Warden will (`tools/vdp_cert_check <policy> openable`).
+Add `--run` for a real trial run (as root) whose stream is written next to the
+log and audited. Put the verdict stream outside every path the policy allows:
+`/var/log/varek/` works with every shipped policy; a stream in the agent's
+scratch space (`/tmp/varek/` in the sector policies) is refused.
 
 ## Demo
 
