@@ -13,7 +13,7 @@ side of the unotify channel with `pidfd_getfd` (v1.12; through v1.9.3,
 the Warden are `openat`, `connect`, `execve`, `execveat`, the metadata
 lookups (`newfstatat`, `statx`, `access`, `faccessat`, `faccessat2`,
 `readlink`, `readlinkat`), `sendmsg`, `sendmmsg`, `bind`, and `sendto` when it
-names a destination (v1.21); the rest are admitted or refused by the filter
+names a destination or sets `MSG_FASTOPEN` (v1.21); the rest are admitted or refused by the filter
 itself (`warden_baseline_filter.c`). *(Correction, v1.21.0: through v1.20.0
 this paragraph described the v1.4 prototype: four trapped calls, everything
 else allowed, the listener passed with `SCM_RIGHTS`.)*
@@ -32,7 +32,10 @@ For each notification, the Warden:
    most get `EPERM`, a hard-denied one (`ptrace`, `bpf`, `io_uring_enter`
    and the others in `warden_baseline_filter.c`) kills the agent, and
    `clone3` and (v1.21) `io_uring_setup` get `ENOSYS` so that libc falls
-   back to `clone` and libuv to epoll.
+   back to `clone` and libuv to epoll. From v1.21 the filter also answers
+   `setsockopt` with `EACCES` for the options that would route a connected
+   socket's packets elsewhere (`IP_OPTIONS`, `IPV6_RTHDR`,
+   `IPV6_2292RTHDR`, `IPV6_2292PKTOPTIONS`).
 4. For path-argument syscalls on `ALLOW`, resolves the path itself
    with `openat2(RESOLVE_NO_MAGICLINKS)` rooted at `/proc/<pid>/cwd`
    (ordinary symlinks followed since v1.12.3, deciding on the object's
@@ -441,11 +444,16 @@ would let a second thread change the destination after the check. From v1.21:
 3. The SMT decision procedure decides it against the `host` rules; the
    independent checker must accept the certificate of an ALLOW.
 4. The Warden makes a socket of the agent's kind in its own network namespace
-   (the agent's has no working interface), copies over every option the agent
-   set that differs from a fresh socket in the agent's namespace (or fails the
-   connect), and connects it to the copy it decided on; a Unix connect is made
-   with the agent's uid and gid, so the socket's permissions and the server's
-   `SO_PEERCRED` see the agent, not root.
+   (the agent's has no working interface), copies over each option the agent
+   set that differs from a fresh socket in the agent's namespace, for the 58
+   options in the Warden's list (`k_sockopts` in `warden_net.inc.c`; the
+   connect fails if one cannot be copied). An option outside the list set
+   before the connect (`SO_TIMESTAMPING`, `TCP_QUICKACK`, a socket filter,
+   `TCP_ULP`, ...) is not carried; options set after the connect apply to the
+   connected socket as usual. It then connects the socket to the copy it
+   decided on; a Unix connect is made with the agent's uid and gid, so the
+   socket's permissions and the server's `SO_PEERCRED` see the agent, not
+   root.
 5. The connected socket replaces the agent's descriptor (same number, the
    agent's close-on-exec and non-blocking state), and the agent's connect
    returns what its own would have: 0, `EINPROGRESS` for a non-blocking socket,
@@ -485,6 +493,8 @@ In scope:
 - Supervisor-side path resolution for `openat` via `openat2 + ADDFD`.
 - Decided connections for `connect` (v1.21): TCP and connected UDP over IPv4
   and IPv6, Unix sockets by path; the Warden dials and hands over the socket.
+  IPv6 dialing was not exercised on the release host (no IPv6 in its kernel;
+  the test reports it SKIPPED).
 - Path-based decisions for `execve` and `execveat`.
 - JSON pathology records with measured decision latency.
 - Whole-plan verification before launch (`--plan`), with the data-flow check,

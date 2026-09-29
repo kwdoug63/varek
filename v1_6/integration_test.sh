@@ -38,11 +38,16 @@ trap 'rm -rf "${TMP}"' EXIT
 cat > "${TMP}/policy.txt" <<EOF
 allow path /var/data/
 allow exec /usr/bin/python3
-deny  host api.example.com
+allow host 127.0.0.1:8080
+deny  host 203.0.113.7
 EOF
 
-# v1.18.0: file opens only. A process_exec or net_connect step is UNSATISFIED
-# at the gate, because the runtime refuses those whatever the policy says.
+# v1.18.0: file opens only. A process_exec step is UNSATISFIED at the gate,
+# because the runtime refuses launches whatever the policy says. v1.21: a
+# net_connect step is decided like the connect it names; a host rule matches
+# the numeric address dialed (a name never matches, so the v1.18 sample
+# `deny host api.example.com` never fired), so the denied plan names an
+# address a deny rule covers.
 cat > "${TMP}/plan_allowed.txt" <<EOF
 action load  file_open /var/data/input.json
 action audit file_open /var/data/audit.log
@@ -51,7 +56,7 @@ EOF
 
 cat > "${TMP}/plan_denied.txt" <<EOF
 action load file_open    /var/data/input.json
-action post net_connect  api.example.com:443
+action post net_connect  203.0.113.7:443
 edge load post
 EOF
 

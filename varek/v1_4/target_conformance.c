@@ -96,8 +96,10 @@ static int phase_socket(void) {
     return s;
 }
 
-// Phase 4: connect that socket outbound. connect() IS mediated and v1.9.1 is
-// deny-only for network. Expect: refused.
+// Phase 4: connect that socket outbound. connect() IS mediated; through
+// v1.20.0 every connect was refused (deny-only), and from v1.21 a connect is
+// dialed only when a host rule allows it. The conformance policy has no host
+// rule for 1.1.1.1:80, so either way. Expect: refused.
 static void phase_connect(int s) {
     if (s < 0) { verdict("connect_denied", 0, "no socket from phase 3"); return; }
     struct sockaddr_in a;

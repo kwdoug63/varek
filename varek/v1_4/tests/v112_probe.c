@@ -47,7 +47,8 @@ int main(void) {
     // 3. symlink inside an allowed dir pointing at a denied object.
     try_open("symlink_escape", "/tmp/varek_allowed_probe/link_to_shadow");
 
-    // 4. /proc/self magic link — resolves in the SUPERVISOR's context.
+    // 4. /proc/self (an ordinary symlink, not a magic link) — resolved by the
+    //    supervisor it names the SUPERVISOR; v1.12.3 maps it to the agent.
     try_open("proc_self_mem", "/proc/self/mem");
 
     // 5. audit-log forgery via a crafted pathname. If the Warden writes the

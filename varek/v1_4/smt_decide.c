@@ -854,13 +854,30 @@ out:
 /* Atoms                                                                     */
 /* ------------------------------------------------------------------------ */
 
+/* v1.21: a dotted-quad IPv4 address as a connect spells it: four decimal
+ * parts of 1 to 3 digits, each at most 255, no leading zero. */
+bool vdp_host_is_ipv4(const char *c, size_t cl) {
+    size_t i = 0;
+    for (int part = 0; part < 4; part++) {
+        if (part && (i >= cl || c[i++] != '.')) return false;
+        size_t st = i;
+        unsigned v = 0;
+        while (i < cl && c[i] >= '0' && c[i] <= '9' && i - st < 3) v = v * 10 + (unsigned)(c[i++] - '0');
+        if (i == st || v > 255 || (i - st > 1 && c[st] == '0')) return false;
+    }
+    return i == cl;
+}
+
 /* v1.21: a host constant without a port matches that address on any port: an
- * IPv4 address or other colon-free constant ("127.0.0.1"), or (v1.21) a
- * bracketed IPv6 address ("[::1]"), whose colons are inside the brackets.
- * Through v1.20 "[::1]" matched only the string "[::1]", which no connect
- * produces. The certificate checker has the same rule (vdp_checker.c). */
+ * IPv4 address ("127.0.0.1"), or a bracketed IPv6 address ("[::1]"), whose
+ * colons are inside the brackets. Any other constant matches only itself.
+ * Through v1.20 every colon-free constant matched "<constant>:<anything>", so
+ * `allow host unix` matched every Unix socket (unix:<path>) once v1.21 began
+ * deciding them; and "[::1]" matched only the string "[::1]", which no connect
+ * produces. The certificate checker (vdp_checker.c) and the cross-check oracle
+ * (tools/smt_crosscheck.py) have the same rule. */
 bool vdp_host_portless(const char *c, size_t cl) {
-    if (!memchr(c, ':', cl)) return true;
+    if (!memchr(c, ':', cl)) return vdp_host_is_ipv4(c, cl);
     return cl >= 2 && c[0] == '[' && c[cl - 1] == ']' && !memchr(c + 1, ']', cl - 2);
 }
 

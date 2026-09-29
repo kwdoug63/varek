@@ -67,7 +67,7 @@ META_RULES = ("metadata_answered", "metadata_not_found", "metadata_failed")
 # [IPv6]:port or unix:<path>), whatever became of the dial.
 CONNECT_RULES = ("dialed_fd_injection", "dialed_in_progress", "dial_failed",
                  "injection_failed", "requester_gone", "already_connected",
-                 "socket_option_failed", "too_many_pending")
+                 "socket_option_failed", "too_many_pending", "dialed_descriptor_replaced")
 
 
 def policy_ancestors(path):

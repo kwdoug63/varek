@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -544,6 +545,53 @@ static void slow(void) {
     else ok("warden_not_stalled", "20 other connects while one waited, worst %.1f ms", worst);
 }
 
+/* ---- a connect still waiting in the Warden ---- */
+
+struct slow_on { int fd; int err; };
+static void *slow_connect_on(void *x) {
+    struct slow_on *a = x;
+    struct sockaddr_in sa = in4(P_SLOW);
+    a->err = connect_errno(a->fd, &sa, sizeof sa);
+    return NULL;
+}
+
+static void pending_semantics(void) {
+    /* Another connect on the same socket while the first waits: EALREADY, as
+     * the kernel says, and nothing is dialed. */
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    struct timeval tv = { 0, 400000 };
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    struct slow_on a = { s, 0 };
+    pthread_t t;
+    pthread_create(&t, NULL, slow_connect_on, &a);
+    usleep(80000);
+    struct sockaddr_in okd = in4(P_ALLOW);
+    int e = connect_errno(s, &okd, sizeof okd);
+    pthread_join(t, NULL);
+    if (e != EALREADY) bad("connect_while_pending", "%s (want EALREADY)", strerror(e));
+    else if (a.err != EINPROGRESS) bad("connect_while_pending", "first connect: %s", strerror(a.err));
+    else ok("connect_while_pending", "EALREADY; the first connect then timed out (EINPROGRESS)");
+    close(s);
+    /* The descriptor closed and reused while the connect waits: the Warden
+     * answers the connect and leaves the new occupant of the number alone. */
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    a.fd = s;
+    a.err = 0;
+    pthread_create(&t, NULL, slow_connect_on, &a);
+    usleep(80000);
+    int p[2];
+    close(s);
+    if (pipe(p)) { bad("descriptor_replaced", "pipe"); pthread_join(t, NULL); return; }
+    if (p[0] != s) { dup2(p[0], s); close(p[0]); }
+    pthread_join(t, NULL);
+    struct stat st;
+    if (fstat(s, &st) || !S_ISFIFO(st.st_mode)) bad("descriptor_replaced", "the reused descriptor was overwritten");
+    else ok("descriptor_replaced", "the connect returned %s; the pipe now at that number was left alone",
+            a.err ? strerror(a.err) : "0");
+    close(s); close(p[1]);
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -558,6 +606,7 @@ int main(int argc, char **argv) {
     unix_cases();
     odd();
     slow();
+    pending_semantics();
     race(iters);
     printf("PROBE done fails=%d bypasses=%d\n", fails, bypasses);
     return fails || bypasses;

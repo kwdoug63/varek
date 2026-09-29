@@ -37,7 +37,8 @@
 # Matching is on the resolved path's name, byte for byte. Through v1.20.0 these
 # rules were case-sensitive and matched the exact name only, so server.PEM,
 # x.pem.bak and an id_rsa outside a .ssh directory were allowed; from v1.21
-# they spell each letter as a class of both cases and match copies too. The
+# they spell each letter as a class of both cases and also match a name that
+# continues after the extension with a dot or a ~ (see the rules). The
 # agent cannot rename files or create links (those syscalls are refused when
 # the Warden enforces), so it cannot give an existing file a name these rules
 # miss; files it creates in its own scratch space are covered by the same rules.
@@ -47,7 +48,8 @@ require warden 1.14
 
 # --- Denied even though they sit under an allowed tree (evaluated first) ------
 deny  path /var/lib/ehr/audit/            # audit trail is append-only to the system, never the agent
-deny  path /var/lib/ehr/records/deceased/ # decedent records: separate legal-hold handling
+deny  path glob /var/lib/ehr/records/[dD][eE][cC][eE][aA][sS][eE][dD]     # decedent records: separate legal-hold
+deny  path glob /var/lib/ehr/records/[dD][eE][cC][eE][aA][sS][eE][dD]/**  # handling (v1.21: any case)
 allow path /etc/ld.so.cache readonly            # loader cache: read
 deny  path /etc/                          # no system configuration
 deny  path /root/                         # no operator home
@@ -56,16 +58,24 @@ deny  path /root/                         # no operator home
 # The bounded string fragment matches on more than a prefix, so these rules
 # reach into every tree the agent is allowed below, including its scratch space.
 # v1.21: each letter below is a class of both cases ([pP]), so these match a
-# name in any case, and a copy of the file under a longer name.
-deny  path glob /**/*.[pP][eE][mM]*       # private keys and certificates (x.pem, x.PEM, x.pem.bak)
-deny  path glob /**/*.[kK][eE][yY]*       # private keys (x.key, x.KEY, x.key.orig)
+# name in any case. A name continuing after the extension with a dot or a ~
+# (x.pem.bak, x.key~) matches too; other extensions of the name (serverpem,
+# x_pem, j.pemberton.json) do not.
+deny  path glob /**/*.[pP][eE][mM]        # private keys and certificates (x.pem, x.PEM)
+deny  path glob /**/*.[pP][eE][mM].*      # ... and copies (x.pem.bak, x.PEM.orig)
+deny  path glob /**/*.[pP][eE][mM]~       # ... and editor backups (x.pem~)
+deny  path glob /**/*.[kK][eE][yY]        # private keys (x.key, x.KEY)
+deny  path glob /**/*.[kK][eE][yY].*      # ... and copies (x.key.orig)
+deny  path glob /**/*.[kK][eE][yY]~
 deny  path glob /**/.[eE][nN][vV]         # dotenv credential files, at any depth
 deny  path glob /**/.[eE][nN][vV].*       # ... and their variants (.env.local, .ENV.production)
+deny  path glob /**/.[eE][nN][vV]~
 deny  path glob /**/.[sS][sS][hH]*        # SSH keys and configuration: the directory (and .ssh-old, ...),
 deny  path glob /**/.[sS][sS][hH]*/**     # ... and everything in it, anywhere
 deny  path glob /**/[iI][dD]_[rR][sS][aA]*          # SSH private keys wherever they sit, not only
 deny  path glob /**/[iI][dD]_[dD][sS][aA]*          # under .ssh (id_rsa, id_rsa.bak, id_ecdsa_sk,
-deny  path glob /**/[iI][dD]_[eE][cC][dD][sS][aA]*       # id_ed25519, ...)
+deny  path glob /**/[iI][dD]_[eE][cC][dD][sS][aA]*       # id_ed25519, ...; not a name with a prefix
+                                            # such as old_id_rsa)
 deny  path glob /**/[iI][dD]_[eE][dD]25519*
 deny  path glob /var/lib/ehr/records/**/[pP][sS][yY][cC][hH][oO][tT][hH][eE][rR][aA][pP][yY]     # psychotherapy notes need separate patient
 deny  path glob /var/lib/ehr/records/**/[pP][sS][yY][cC][hH][oO][tT][hH][eE][rR][aA][pP][yY]/**  # authorization: the directory and its files, at any depth

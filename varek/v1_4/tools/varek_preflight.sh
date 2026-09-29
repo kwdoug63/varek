@@ -47,7 +47,8 @@
 #      else, and closed to the agent; --gate-status likewise. Through v1.20.0
 #      the preflight checked none of these, so a deployment it passed could
 #      still refuse to start. The check creates the state directory (default
-#      path only) and the lock file if missing, as a real start would.
+#      path only), the lock file and the --gate-status file if missing, as a
+#      real start would (an existing --gate-status file is not truncated).
 #   4. --run: a real trial run (`warden ... -- /bin/true`, as root, via sudo if
 #      needed), its verdict stream written to a new temporary file (mktemp) in
 #      the --log directory, which must belong to root and not be writable by
@@ -144,7 +145,7 @@ if ! "$CERT" "$POLICY" digest >/dev/null 2>&1; then
 else
     pass "the policy loads ($(grep -o 'glob tokens [0-9]* of [0-9]*' <<<"$o"), sha256 $("$CERT" "$POLICY" digest | cut -c1-16)…)"
 fi
-[ "$rc" -eq 1 ] && warn "lint: $(grep -c 'can never fire' <<<"$o") rule(s) can never fire (tools/vdp_check $POLICY lint)"
+[ "$rc" -eq 1 ] && warn "lint: $(grep -c ' can never fire (' <<<"$o") rule(s) can never fire and $(grep -c 'so this rule can never match' <<<"$o") host rule(s) can never match a connect (tools/vdp_check $POLICY lint)"
 
 echo "== 3. what the Warden refuses at startup"
 # The canonical path an open would reach, and whether the agent could open it.

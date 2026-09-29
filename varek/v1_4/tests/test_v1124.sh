@@ -28,7 +28,7 @@ cat > "$POLICY" <<'EOF'
 allow path /var/data/
 allow path /etc/ld.so.cache
 allow exec /usr/bin/python3
-deny  host api.example.com
+deny  host 203.0.113.7
 allow host 127.0.0.1:8080
 EOF
 

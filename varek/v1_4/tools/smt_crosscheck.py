@@ -384,11 +384,14 @@ def parse_glob(rx, pat, where):
 
 
 def host_portless(c):
-    """v1.21: a host constant without a port matches every port: colon-free
-    (IPv4), or a bracketed IPv6 address such as [::1] (colons only inside the
-    brackets)."""
+    """v1.21: a host constant without a port matches every port: a dotted-quad
+    IPv4 address, or a bracketed IPv6 address such as [::1] (colons only inside
+    the brackets). Any other constant matches only itself."""
     if ":" not in c:
-        return True
+        parts = c.split(".")
+        return len(parts) == 4 and all(
+            1 <= len(p) <= 3 and p.isdigit() and p.isascii() and int(p) <= 255
+            and not (len(p) > 1 and p[0] == "0") for p in parts)
     return len(c) >= 2 and c[0] == "[" and c[-1] == "]" and "]" not in c[1:-1]
 
 
@@ -897,7 +900,8 @@ AMBIGUOUS = ["allow path glob readonly", "deny path suffix -O_CREAT", "allow pat
 
 
 def fuzz_line(rng, prior, strings, wide):
-    frags = ["/a", "/a/", "/a/b", "/ab", "/b/", "/a/b/c", "x", "x:1", "/", "[::1]", "[a]", "[:]"]
+    frags = ["/a", "/a/", "/a/b", "/ab", "/b/", "/a/b/c", "x", "x:1", "/", "[::1]", "[a]", "[:]",
+             "1.2.3.4", "1.2.3.4:5", "01.2.3.4", "256.1.1.1", "unix", "unix:/a"]
     if rng.random() < 0.03:
         return rng.choice(AMBIGUOUS)
     matcher = None

@@ -122,25 +122,39 @@ Model-B techniques below, with the residual limits stated honestly.
     key, the anchor, its own verdict stream file or a raw disk or memory
     device.
   - *Datagram egress.* `sendto`/`sendmsg` are mediated as network sends and
-    refused for an inet destination under the deny-only network posture.
+    were refused for an inet destination under the deny-only network posture
+    through v1.20.0. From v1.21 a send that names a destination is still
+    refused whatever the policy says; a send with none goes to the peer of a
+    connect the Warden decided (see below).
 - **Decided connections (v1.21).** Each outbound `connect` is decided on the
   destination the Warden will dial, copied once from the agent's memory and
   spelt canonically (`a.b.c.d:port`, `[IPv6]:port` with an IPv4-mapped address
   as its IPv4 form, or `unix:<canonical path>` for a path socket resolved like
   a file open); the independent checker must accept the certificate of any
-  ALLOW. The Warden then dials the destination itself, from outside the
+  ALLOW. (IPv6 decisions are tested; IPv6 dialing was not exercised on the
+  v1.21.0 release host, whose kernel has no IPv6.) The Warden then dials the destination itself, from outside the
   agent's empty network namespace, and puts the connected socket in place of
   the agent's descriptor (`SECCOMP_IOCTL_NOTIF_ADDFD`); the kernel never reads
   the agent's sockaddr, so a second thread cannot change the destination after
   the check (a 2,000-attempt swap race in `make test-v1210` reaches the
-  denied side 0 times). Options the agent set on its socket are carried over,
-  or the connect fails. A Unix connect is made with the agent's uid and gid.
-  Every connect is recorded, chained, signed and certificate-checked by
-  `varek_audit.py`, like a file open. Refused whatever the policy says: sends
+  denied side 0 times). Options the agent set on its socket before the
+  connect are carried over if they are among the 58 the Warden knows (buffer
+  sizes, timeouts, keepalive, `TCP_NODELAY`, congestion control, TOS and TTL,
+  and the like), or the connect fails; options outside that list set before
+  the connect (for example `SO_TIMESTAMPING`, `TCP_QUICKACK`, a socket filter,
+  `TCP_ULP`) are silently not carried. Options set after the connect apply to
+  the connected socket as usual. A Unix connect is made with the agent's uid and gid.
+  Every connect the Warden decides is recorded, chained and signed, like a
+  file open; every ALLOW carries a certificate that the checker accepted
+  before the dial and that `varek_audit.py` re-checks. A blocking connect that
+  reaches the agent's `SO_SNDTIMEO` returns `EINPROGRESS` and, as in the
+  kernel, keeps connecting: the socket the agent holds may connect later, to
+  the destination that was decided. Refused whatever the policy says: sends
   that name a destination, abstract and unnamed Unix addresses, IPv6 scope
   ids, raw and other socket kinds, `MSG_FASTOPEN`, source routing
   (`IP_OPTIONS`, IPv6 routing headers), and inbound calls (`listen`, `accept`;
-  `bind` only for the wildcard address and port 0).
+  `bind` is allowed only for a TCP or UDP socket to the wildcard address and
+  port 0, which the Warden performs and does not record).
 - **Where, not what (v1.21).** VAREK decides *where* an agent may connect.
   Once a destination is allowed, the agent may send it anything: an allowed
   host is a channel, and data the agent may read may leave through it. What an

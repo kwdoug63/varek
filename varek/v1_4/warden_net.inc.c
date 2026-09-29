@@ -10,6 +10,9 @@
  * way files have been handled since v1.12:
  *
  *   1. derive_intent() copies the destination out of the agent's memory ONCE.
+ *      (The socket's kind, its options and flags, and for a Unix connect the
+ *      agent's uid and gid, are read from the live agent afterwards; none of
+ *      them can change where the connection goes.)
  *   2. It is spelt canonically (net_decision_string: a.b.c.d:port,
  *      [IPv6]:port with an IPv4-mapped address as its IPv4 form, or
  *      unix:<canonical path> for a path socket resolved like a file open) and
@@ -37,8 +40,9 @@
  * Warden's namespace, not the agent's), IPv6 scope ids (an interface index of
  * the agent's namespace means nothing in the host's), other address families
  * and socket kinds (raw, SCTP, MPTCP, vsock, ...), AF_UNSPEC "disconnects",
- * sends that carry their own destination, and inbound calls (bind, listen,
- * accept stay outside the allowlist).
+ * sends that carry their own destination, and inbound calls (listen and
+ * accept stay outside the allowlist; bind is performed by the Warden only for
+ * the wildcard address and port 0, see net_bind).
  *
  * Sends on a connected socket: sendto() with no destination is admitted by the
  * filter itself (its destination is a register, so the kernel reads nothing
@@ -148,14 +152,18 @@ static int agent_creds(pid_t tid, uid_t *uid, gid_t *gid) {
 /* ---- socket options the agent set before connect ----
  *
  * A socket the Warden makes starts with its namespace's defaults. Each option
- * below is read from the agent's socket and compared with a socket of the same
- * kind freshly made in the AGENT's namespace (created once per kind and kept):
- * what differs, the agent set, and it is set on the Warden's socket. An option
- * the agent left alone is not copied, so, for one, the kernel's receive-buffer
- * autotuning stays on. A difference that cannot be applied fails the connect
- * with that errno rather than handing over a socket that quietly behaves
- * otherwise. Not carried over: SO_BINDTODEVICE (an interface of the agent's
- * namespace) and anything only a privileged process can set. */
+ * in the table below is read from the agent's socket and compared with a
+ * socket of the same kind freshly made in the AGENT's namespace (created once
+ * per kind and kept): what differs, the agent set, and it is set on the
+ * Warden's socket. An option the agent left alone is not copied, so, for one,
+ * the kernel's receive-buffer autotuning stays on. If setting a difference
+ * fails, the connect fails with that errno. Values the kernel clamps
+ * (buffer sizes against the host's limits) are applied as the kernel allows,
+ * as the agent's own setsockopt would have been. Options NOT in the table are
+ * not carried over: device and interface binding (SO_BINDTODEVICE,
+ * IP_MULTICAST_IF; interfaces of the agent's namespace mean nothing in the
+ * host's), anything only a privileged process can set (SO_MARK, SO_PRIORITY
+ * above 6, IP_TRANSPARENT), and rarer options not listed here. */
 enum { OPT_INT, OPT_TIMEVAL, OPT_LINGER, OPT_STR };
 #define FAM_IN4  1u
 #define FAM_IN6  2u
@@ -179,6 +187,9 @@ static const struct sockopt_desc k_sockopts[] = {
     { SOL_SOCKET,  SO_TIMESTAMPNS,        OPT_INT,     7, 7 },
     { SOL_SOCKET,  SO_PASSCRED,           OPT_INT,     FAM_UNIX, 7 },
     { SOL_SOCKET,  SO_ZEROCOPY,           OPT_INT,     FAM_IN4 | FAM_IN6, 7 },
+    { SOL_SOCKET,  SO_REUSEADDR,          OPT_INT,     7, 7 },
+    { SOL_SOCKET,  SO_REUSEPORT,          OPT_INT,     FAM_IN4 | FAM_IN6, 7 },
+    { SOL_SOCKET,  SO_INCOMING_CPU,       OPT_INT,     FAM_IN4 | FAM_IN6, 7 },
     { IPPROTO_TCP, TCP_NODELAY,           OPT_INT,     FAM_IN4 | FAM_IN6, TY_STREAM },
     { IPPROTO_TCP, TCP_KEEPIDLE,          OPT_INT,     FAM_IN4 | FAM_IN6, TY_STREAM },
     { IPPROTO_TCP, TCP_KEEPINTVL,         OPT_INT,     FAM_IN4 | FAM_IN6, TY_STREAM },
@@ -192,6 +203,9 @@ static const struct sockopt_desc k_sockopts[] = {
     { IPPROTO_TCP, TCP_LINGER2,           OPT_INT,     FAM_IN4 | FAM_IN6, TY_STREAM },
     { IPPROTO_TCP, TCP_FASTOPEN_CONNECT,  OPT_INT,     FAM_IN4 | FAM_IN6, TY_STREAM },
     { IPPROTO_TCP, TCP_CONGESTION,        OPT_STR,     FAM_IN4 | FAM_IN6, TY_STREAM },
+    { IPPROTO_TCP, TCP_THIN_LINEAR_TIMEOUTS, OPT_INT,  FAM_IN4 | FAM_IN6, TY_STREAM },
+    { IPPROTO_TCP, TCP_SAVE_SYN,          OPT_INT,     FAM_IN4 | FAM_IN6, TY_STREAM },
+    { IPPROTO_TCP, TCP_INQ,               OPT_INT,     FAM_IN4 | FAM_IN6, TY_STREAM },
     { IPPROTO_IP,  IP_TOS,                OPT_INT,     FAM_IN4 | FAM_IN6, 7 },
     { IPPROTO_IP,  IP_TTL,                OPT_INT,     FAM_IN4 | FAM_IN6, 7 },
     { IPPROTO_IP,  IP_MTU_DISCOVER,       OPT_INT,     FAM_IN4 | FAM_IN6, 7 },
@@ -199,6 +213,11 @@ static const struct sockopt_desc k_sockopts[] = {
     { IPPROTO_IP,  IP_RECVTOS,            OPT_INT,     FAM_IN4 | FAM_IN6, 7 },
     { IPPROTO_IP,  IP_RECVTTL,            OPT_INT,     FAM_IN4 | FAM_IN6, 7 },
     { IPPROTO_IP,  IP_PKTINFO,            OPT_INT,     FAM_IN4 | FAM_IN6, TY_DGRAM },
+    { IPPROTO_IP,  IP_MULTICAST_TTL,      OPT_INT,     FAM_IN4 | FAM_IN6, TY_DGRAM },
+    { IPPROTO_IP,  IP_MULTICAST_LOOP,     OPT_INT,     FAM_IN4 | FAM_IN6, TY_DGRAM },
+    { IPPROTO_IP,  IP_BIND_ADDRESS_NO_PORT, OPT_INT,   FAM_IN4 | FAM_IN6, 7 },
+    { IPPROTO_IP,  IP_FREEBIND,           OPT_INT,     FAM_IN4 | FAM_IN6, 7 },
+    { IPPROTO_IP,  IP_RECVORIGDSTADDR,    OPT_INT,     FAM_IN4 | FAM_IN6, TY_DGRAM },
     { IPPROTO_IPV6, IPV6_V6ONLY,          OPT_INT,     FAM_IN6, 7 },
     { IPPROTO_IPV6, IPV6_TCLASS,          OPT_INT,     FAM_IN6, 7 },
     { IPPROTO_IPV6, IPV6_UNICAST_HOPS,    OPT_INT,     FAM_IN6, 7 },
@@ -206,6 +225,9 @@ static const struct sockopt_desc k_sockopts[] = {
     { IPPROTO_IPV6, IPV6_RECVERR,         OPT_INT,     FAM_IN6, 7 },
     { IPPROTO_IPV6, IPV6_RECVPKTINFO,     OPT_INT,     FAM_IN6, TY_DGRAM },
     { IPPROTO_IPV6, IPV6_RECVTCLASS,      OPT_INT,     FAM_IN6, 7 },
+    { IPPROTO_IPV6, IPV6_MULTICAST_HOPS,  OPT_INT,     FAM_IN6, TY_DGRAM },
+    { IPPROTO_IPV6, IPV6_MULTICAST_LOOP,  OPT_INT,     FAM_IN6, TY_DGRAM },
+    { IPPROTO_IPV6, IPV6_RECVHOPLIMIT,    OPT_INT,     FAM_IN6, 7 },
     { IPPROTO_UDP, UDP_CORK,              OPT_INT,     FAM_IN4 | FAM_IN6, TY_DGRAM },
     { IPPROTO_UDP, UDP_SEGMENT,           OPT_INT,     FAM_IN4 | FAM_IN6, TY_DGRAM },
     { IPPROTO_UDP, UDP_GRO,               OPT_INT,     FAM_IN4 | FAM_IN6, TY_DGRAM },
@@ -428,7 +450,13 @@ fail:
 
 /* A Unix connect made with the agent's effective uid and gid, so the server
  * sees the agent's credentials (SO_PEERCRED; its pid is the Warden's) and the
- * socket file's permissions are checked against the agent, not root. */
+ * socket file's permissions are checked against the agent, not root.
+ *
+ * Invariant: between dropping and restoring the credentials, the Warden runs
+ * nothing but this one non-blocking connect (its sockets are made with
+ * SOCK_NONBLOCK); the Warden is single-threaded and its signal handler only
+ * sets flags. Never add other work inside this window: it would run with the
+ * agent's credentials. A failure to restore stops the Warden. */
 static int connect_as_agent(int s, const struct sockaddr *sa, socklen_t sl, uid_t uid, gid_t gid) {
     if (uid == 0 && gid == 0) return connect(s, sa, sl) < 0 ? -errno : 0;
     gid_t saved[64];
@@ -456,7 +484,11 @@ static int connect_as_agent(int s, const struct sockaddr *sa, socklen_t sl, uid_
 /* ---- connects and sends that finish later ---- */
 
 enum { PEND_CONNECT = 1, PEND_UNIX_RETRY, PEND_SEND };
-#define MAX_PENDING 256
+/* Each entry is an agent thread blocked in its call (a thread can wait in one
+ * call at a time), holding one socket and, for a send, its data. Bounded by
+ * count and by bytes held; past either, the call gets ENOBUFS. */
+#define MAX_PENDING 1024
+#define MAX_PENDING_BYTES (32u << 20)
 #define UNIX_RETRY_NS (5 * 1000000LL)
 
 struct pending_op {
@@ -465,6 +497,8 @@ struct pending_op {
     pid_t            tid;
     int              sock;          /* the Warden's socket (connect), a dup of the agent's (send) */
     int              agent_fd;
+    dev_t            ag_dev;        /* the agent's socket this connect was made on */
+    ino_t            ag_ino;
     bool             cloexec, nonblock, has_deadline;
     struct timespec  deadline, next_try, t0, t_dial;
     decision_t       d_raw;
@@ -484,6 +518,7 @@ struct pending_op {
 };
 static struct pending_op *g_pend[MAX_PENDING];
 static int g_npend = 0;
+static size_t g_pend_bytes = 0;
 
 static void ts_add_ns(struct timespec *t, int64_t ns) {
     t->tv_sec += ns / 1000000000LL;
@@ -521,6 +556,7 @@ static void pend_free(int i) {
     struct pending_op *op = g_pend[i];
     if (op->sock >= 0) close(op->sock);
     if (op->pin >= 0) close(op->pin);
+    g_pend_bytes -= op->buf ? op->len : 0;
     free(op->buf);
     free(op->act);
     free(op);
@@ -530,15 +566,33 @@ static void pend_free(int i) {
 /* Hand the Warden's socket to the agent in place of its descriptor, and
  * answer its connect with reply_err (0 or EINPROGRESS). Returns the rule for
  * the record. */
-static const char *handover(int notify_fd, uint64_t id, int s, int agent_fd, bool cloexec,
-                            bool nonblock, int reply_err, int *kerr) {
+static const char *handover(int notify_fd, uint64_t id, pid_t tid, int s, int afd,
+                            dev_t ag_dev, ino_t ag_ino, bool cloexec, bool nonblock,
+                            int reply_err, int *kerr) {
+    /* The descriptor must still hold the socket the connect was made on. If
+     * another thread closed it, or put something else at that number, while
+     * the Warden dialed, the kernel's own connect would finish on the socket
+     * it started with and leave the descriptor table alone: so answer the
+     * connect, install nothing, and let the Warden's socket go. (A swap in the
+     * last instant between this check and ADDFD is not caught; it only hurts
+     * the agent's own bookkeeping.) */
+    int cur = agent_fd(tid, afd);
+    struct stat cst;
+    bool same = cur >= 0 && fstat(cur, &cst) == 0 && cst.st_dev == ag_dev && cst.st_ino == ag_ino;
+    if (cur >= 0) close(cur);
+    if (!same) {
+        if (reply_err) send_errno(notify_fd, id, reply_err);
+        else           send_value(notify_fd, id, 0);
+        *kerr = reply_err;
+        return "dialed_descriptor_replaced";
+    }
     int fl = fcntl(s, F_GETFL);
     if (fl >= 0) (void)fcntl(s, F_SETFL, nonblock ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK));
     struct seccomp_notif_addfd addfd = {
         .id          = id,
         .flags       = SECCOMP_ADDFD_FLAG_SETFD,
         .srcfd       = (uint32_t)s,
-        .newfd       = (uint32_t)agent_fd,
+        .newfd       = (uint32_t)afd,
         .newfd_flags = cloexec ? O_CLOEXEC : 0,
     };
     if (ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd) < 0) {
@@ -591,6 +645,13 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
         return;
     }
     a->sock_name = k.name;
+    struct stat agst;
+    if (fstat(ag, &agst) < 0) {
+        close(ag);
+        net_record(tid, a, DEC_DENY, DEC_DENY, "bad_descriptor", t0, EBADF);
+        send_errno(notify_fd, req->id, EBADF);
+        return;
+    }
 
     struct sockaddr_storage dial;
     socklen_t dial_len = 0;
@@ -631,6 +692,12 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
         socklen_t pl = sizeof peer;
         int again = 0;
         if (getpeername(ag, (struct sockaddr *)&peer, &pl) == 0) again = EISCONN;
+        /* A connect on this same socket still waiting in the Warden (another
+         * thread's blocking connect): the kernel says EALREADY. */
+        for (int i = 0; !again && i < g_npend; i++)
+            if ((g_pend[i]->kind == PEND_CONNECT || g_pend[i]->kind == PEND_UNIX_RETRY) &&
+                g_pend[i]->ag_dev == agst.st_dev && g_pend[i]->ag_ino == agst.st_ino)
+                again = EALREADY;
         else if (!strcmp(k.name, "tcp")) {
             struct tcp_info ti;
             socklen_t tl = sizeof ti;
@@ -722,8 +789,8 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
         if (pin >= 0) close(pin);
         a->dial_ns = ns_between(&td, &tn);
         int kerr = 0;
-        const char *r = handover(notify_fd, req->id, s, a->sock_fd, cloexec, nonblock,
-                                 rc == 0 ? 0 : EINPROGRESS, &kerr);
+        const char *r = handover(notify_fd, req->id, tid, s, a->sock_fd, agst.st_dev, agst.st_ino,
+                                 cloexec, nonblock, rc == 0 ? 0 : EINPROGRESS, &kerr);
         close(s);
         net_record(tid, a, d_raw, d_final, r, t0, kerr);
         return;
@@ -747,6 +814,8 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
         op->tid = tid;
         op->sock = s;
         op->agent_fd = a->sock_fd;
+        op->ag_dev = agst.st_dev;
+        op->ag_ino = agst.st_ino;
         op->cloexec = cloexec;
         op->nonblock = nonblock;
         op->t0 = *t0;
@@ -891,7 +960,7 @@ static bool net_send_relay(int notify_fd, const struct seccomp_notif *req, struc
         ssize_t r = sendmsg(ag, &mh, sflags);
         int e = errno;
         if (r < 0 && (e == EAGAIN || e == EWOULDBLOCK) && !nonblock && i == 0) {
-            struct pending_op *op = pend_new();
+            struct pending_op *op = g_pend_bytes + (size_t)len <= MAX_PENDING_BYTES ? pend_new() : NULL;
             if (!op) { free(buf); close(ag); send_errno(notify_fd, req->id, ENOBUFS); return true; }
             op->kind = PEND_SEND;
             op->id = req->id;
@@ -901,6 +970,7 @@ static bool net_send_relay(int notify_fd, const struct seccomp_notif *req, struc
             memcpy(op->act, a, sizeof *a);
             op->buf = buf;
             op->len = (size_t)len;
+            g_pend_bytes += (size_t)len;
             op->flags = sflags;
             op->want_sigpipe = !(flags & MSG_NOSIGNAL);
             op->mmsg_len_addr = a->send_nr == __NR_sendmmsg ? a->msg_addr + 56 : 0;
@@ -988,8 +1058,9 @@ static void pend_finish_connect(int notify_fd, struct pending_op *op, int so_err
          * answers a timed-out blocking connect with EINPROGRESS and goes on
          * connecting, so the socket is handed over either way. */
         int kerr = 0;
-        const char *r = handover(notify_fd, op->id, op->sock, op->agent_fd, op->cloexec,
-                                 op->nonblock, timed_out ? EINPROGRESS : 0, &kerr);
+        const char *r = handover(notify_fd, op->id, op->tid, op->sock, op->agent_fd, op->ag_dev,
+                                 op->ag_ino, op->cloexec, op->nonblock,
+                                 timed_out ? EINPROGRESS : 0, &kerr);
         net_record(op->tid, op->act, op->d_raw, DEC_ALLOW, r, &op->t0, kerr);
     } else {
         send_errno(notify_fd, op->id, so_error);

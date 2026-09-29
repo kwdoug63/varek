@@ -147,11 +147,17 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(argv[2], "lint")) {
-        int dead = 0;
+        int dead = 0, hostnever = 0;
         for (size_t i = 0; i < g_pol.n; i++) {
-            char adv[512];
+            char adv[512], hw[160];
             if (vdp_rule_advisory(&g_pol.rules[i], adv, sizeof adv))
                 printf("%s:%d: note: %s\n", argv[1], g_pol.rules[i].line, adv);
+            /* v1.21: a host rule whose constant no connect can produce (a
+             * name, a non-canonical spelling) matches nothing: counted, and
+             * lint fails, as for a rule that can never fire. */
+            if (g_pol.rules[i].kind == VDP_KIND_HOST &&
+                !vdp_host_constant_ok(g_pol.rules[i].s.c, g_pol.rules[i].s.len, hw, sizeof hw))
+                hostnever++;
             vdp_reach_t rr = vdp_rule_reachable(&g_pol, i);
             if (rr == VDP_DEAD) {
                 const vdp_rule_t *r = &g_pol.rules[i];
@@ -169,8 +175,12 @@ int main(int argc, char **argv) {
          * of one decision (4,096 tokens x a 4,095-byte string). */
         printf("%s: glob tokens %zu of %d\n", argv[1], vdp_policy_glob_tokens(&g_pol),
                VDP_GLOB_MAX_TOTAL);
-        printf("%s: %zu rules, %d can never fire\n", argv[1], g_pol.n, dead);
-        return dead ? 1 : 0;
+        if (hostnever)
+            printf("%s: %zu rules, %d can never fire, %d host rules can never match a connect\n",
+                   argv[1], g_pol.n, dead, hostnever);
+        else
+            printf("%s: %zu rules, %d can never fire\n", argv[1], g_pol.n, dead);
+        return dead || hostnever ? 1 : 0;
     }
     fprintf(stderr, "unknown mode %s\n", argv[2]);
     return 2;

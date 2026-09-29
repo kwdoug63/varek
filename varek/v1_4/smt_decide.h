@@ -292,6 +292,7 @@ size_t vdp_rule_advisory(const vdp_rule_t *r, char *buf, size_t n);
 /* v1.21: does a host rule's constant name an address without a port (so it
  * matches that address on every port)? See smt_decide.c. */
 bool vdp_host_portless(const char *c, size_t cl);
+bool vdp_host_is_ipv4(const char *c, size_t cl);
 
 /* v1.21: can a connect produce this host constant (numeric address in the
  * Warden's spelling, optional decimal port, or unix:<absolute path)? When not,

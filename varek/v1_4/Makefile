@@ -267,7 +267,7 @@ test-v1200: warden tools/vdp_cert_check tests/v1180_probe
 # (static) covers TCP, UDP, Unix, the destination-swap race, options carried
 # over, relayed sends and every refusal; the script adds the plan gate, the
 # records and their audit, then real clients (curl, Python requests, Node)
-# and the per-connection latency (tests/bench_v1210_connect.sh).
+# and the per-connection latency (section 6 of tests/test_v1210.sh).
 tests/v1210_probe: tests/v1210_probe.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -static -pthread -o $@ $<
 

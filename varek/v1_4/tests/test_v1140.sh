@@ -139,12 +139,12 @@ if git -C "$HERE" rev-parse -q --verify v1.13.0^{commit} >/dev/null 2>&1; then
     for f in smt_decide.c smt_decide.h tools/vdp_check.c; do git -C "$HERE" show "v1.13.0:varek/v1_4/$f" > "$old/$f"; done
     if cc -O2 -o "$old/vdp_check" "$old/tools/vdp_check.c" "$old/smt_decide.c" 2>/dev/null; then
         python3 - "$HERE" "$VDP" "$old/vdp_check" <<'PY' > "$OUT/compat" 2>&1
-import glob, json, random, subprocess, sys
+import glob, json, random, re, subprocess, sys
 here, new, old = sys.argv[1:4]
 pols = sorted(glob.glob(f"{here}/harness/baseline-v1.13.0/*.txt") + glob.glob(f"{here}/harness/baseline-v1.12.4/*.txt")
               + [f"{here}/tests/v1130_policy.txt", f"{here}/tests/crosscheck_bound_policy.txt", f"{here}/policy.txt",
                  f"{here}/tests/v1140_compat_policy.txt"])
-rng = random.Random(1140); n = 0; bad = 0
+rng = random.Random(1140); n = 0; bad = 0; expected = 0
 for p in pols:
     consts = [l.split()[2] for l in open(p, encoding="latin-1") if l.split()[:1] in (["allow"], ["deny"])]
     qs = []
@@ -163,9 +163,32 @@ for p in pols:
     # verdicts compared field by field (v1.15 adds the certificate witness "w")
     verd = lambda t: [ {k: v for k, v in json.loads(l).items() if k in ("verdict","rule","line","why")} for l in t.splitlines() ]
     n += len(qs)
-    if verd(a) != verd(b) or strip(ra) != strip(rb):
-        bad += 1; print("DIFF", p)
-print(f"compat: {len(pols)} policies, {n} queries, {bad} policies differ")
+    # v1.21: a host constant without a port matches any port only when it is a
+    # dotted-quad IPv4 address or a bracketed IPv6 one; through v1.20 any
+    # colon-free constant did (so `allow host unix` matched every Unix socket).
+    # A query whose v1.13 verdict came from such a rule, or whose verdict can
+    # only differ through it, is the intended change and is counted apart.
+    lines = open(p, encoding="latin-1").read().split("\n")
+    def v121_change(q, x, y):
+        if not q.startswith("host "): return False
+        for v in (x, y):
+            ln = v.get("line", 0)
+            if ln:
+                t = lines[ln - 1].split()
+                t = t[:next((j for j, w in enumerate(t) if w.startswith("#")), len(t))]
+                if len(t) >= 3 and t[1] == "host":
+                    c = t[-1] if t[2] in ("exact", "prefix", "suffix", "contains", "glob") and len(t) > 3 else t[2]
+                    if ":" not in c and not re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", c) and not c.startswith("["):
+                        return True
+        return False
+    va, vb = verd(a), verd(b)
+    diffs = [i for i in range(len(qs)) if va[i] != vb[i]]
+    exp = [i for i in diffs if v121_change(qs[i], va[i], vb[i])]
+    expected += len(exp)
+    if len(diffs) != len(exp) or strip(ra) != strip(rb):
+        bad += 1; print("DIFF", p, [qs[i] for i in diffs if i not in exp][:3])
+print(f"compat: {len(pols)} policies, {n} queries, {bad} policies differ "
+      f"({expected} host queries differ as intended by the v1.21 portless rule)")
 PY
         sed 's/^/    /' "$OUT/compat"
         grep -q "0 policies differ" "$OUT/compat" && pass "v1.13.0 and v1.12.4 policies: identical verdicts and reachability under v1.13.0 and v1.14" \

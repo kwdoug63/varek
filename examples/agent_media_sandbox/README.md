@@ -10,7 +10,7 @@ Repo layout assumed:
 
 When an agent fetches external content — images, audio, video, documents — the download step is one of the largest attack surfaces in the stack. A poisoned URL, a MIME-confusion payload, or a misrouted write can compromise the host even when the agent's reasoning is sound.
 
-VAREK contains the fetch at the **seccomp-unotify** boundary. The agent runs unmodified as a child process; the privileged Warden supervisor traps `openat`, `connect`, and `execve`, decides each one against a text policy file, and either allows it through, denies it with `EACCES`, or — for `openat` — substitutes a kernel-resolved fd to close the path-traversal window. The agent's source imports nothing from VAREK. The sandbox is the wrapping invocation.
+VAREK contains the fetch at the **seccomp-unotify** boundary. The agent runs unmodified as a child process; the privileged Warden supervisor traps `openat`, `connect`, and `execve` (and the lookups and sends that go with them), decides each one against a text policy file, and either denies it with `EACCES` or carries it out itself: for `openat` it resolves the path and hands over that descriptor, closing the path-traversal window; for `connect` (from v1.21) it dials the destination it decided on and hands over the connected socket, so a second thread cannot change the address after the check. `execve` other than the agent's own launch is refused whatever the policy says, since letting it continue in the kernel would race on its path. The agent's source imports nothing from VAREK. The sandbox is the wrapping invocation.
 
 The same policy file holds whether the agent is built on Hermes Agent, LangChain, LlamaIndex, the OpenAI Agents SDK, or a hand-rolled loop. LLM choice is independent: a Qwen3-class model or a free-tier Gemini key works the same as a frontier model.
 
@@ -59,6 +59,7 @@ If the agent — or anything operating through it — attempts to fetch from a n
 
 ```json
 {"report_id":"pr-1747100000.000000000-42",
+ "run":"…", "seq":42,
  "agent_pid":12345,
  "action":"net.connect",
  "target":"203.0.113.99:443",
@@ -66,8 +67,11 @@ If the agent — or anything operating through it — attempts to fetch from a n
  "decision_raw":"UNKNOWN",
  "decision_final":"DENY",
  "rule":"default_deny_unknown",
+ "policy_line":0,
  "sock":"tcp",
+ "dial_us":0,
  "kernel_verdict":"EACCES",
+ "errno":13,
  "latency_us":71,
  "timestamp_ns":1747100000000000000}
 ```

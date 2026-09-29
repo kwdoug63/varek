@@ -19,9 +19,11 @@
  *      with the SECCOMP_IOCTL_NOTIF_ID_VALID guard to materialize
  *      pointer arguments into the supervisor's address space.
  *
- *   4. Stateful Execution Context — per-pid state object tracking
- *      cwd snapshots, opened-fd lineage, and a sequence number used
- *      for pathology-report correlation.
+ *   4. Stateful Execution Context — per-pid state object holding a
+ *      sequence number used for pathology-report correlation and whether
+ *      the pid has launched. (Correction, v1.21.0: this said it tracked
+ *      cwd snapshots and opened-fd lineage; it tracks neither, and nothing
+ *      in the Warden tracks descriptors after it grants them.)
  *
  *   5. Semantic Derivation Engine — maps (syscall, args, ExecCtx) to
  *      a structured Action {kind, target, parameters}, the form the
@@ -45,9 +47,10 @@
  *      by run_start/run_end, and the agent's own stderr is relayed with an
  *      "[agent] " prefix so it cannot write a record (see log_init()).
  *
- * Trapped syscalls in this reference: openat, connect, execve.
- * The architecture extends to any syscall by adding a new case to
- * derive_intent() and policy_decide().
+ * The calls the filter routes here are listed in warden_baseline_filter.c
+ * (kMediate, add_sends): opens, lookups, connects, launches, bind, and the
+ * sends that can carry a destination. The architecture extends to any
+ * syscall by adding a new case to derive_intent() and policy_decide().
  *
  * Build:    make
  * Run:      sudo ./warden policy.txt -- ./target_program [args...]
@@ -90,6 +93,7 @@
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/random.h>
+#include <sys/resource.h>
 #include <sys/prctl.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -371,8 +375,19 @@ static int policy_load(const char *path, struct policy *p) {
                     vdp_reach_unknown_text());
         }
     }
-    fprintf(stderr, "[warden] loaded policy %s v%s with %zu rules (%zu can never fire), "
-            "sha256 %s\n", p->name, p->version, p->v.n, dead, p->sha256);
+    /* v1.21: host rules no connect can match (names, non-canonical spellings;
+     * each got a note above). */
+    size_t hostnever = 0;
+    for (size_t i = 0; i < p->v.n; i++) {
+        char hw[160];
+        if (p->v.rules[i].kind == VDP_KIND_HOST &&
+            !vdp_host_constant_ok(p->v.rules[i].s.c, p->v.rules[i].s.len, hw, sizeof hw))
+            hostnever++;
+    }
+    fprintf(stderr, "[warden] loaded policy %s v%s with %zu rules (%zu can never fire%s), "
+            "sha256 %s\n", p->name, p->version, p->v.n, dead,
+            hostnever ? "; some host rules can never match a connect, see the notes" : "",
+            p->sha256);
     return 0;
 }
 
@@ -591,14 +606,13 @@ static int derive_intent(const struct seccomp_notif *req,
         return 0;
     }
     if (nr == __NR_sendto || nr == __NR_sendmsg) {
-        /* v1.12: extract the destination sockaddr, if any, so the send is
-         * subject to the deny-only network posture. sendto passes dest_addr in
-         * arg4 / addrlen in arg5; sendmsg carries msg_name / msg_namelen inside
-         * the struct msghdr in arg1. A send with NO destination (connected
-         * socket, or a purely local send) still lands here as ACT_NET_SEND and
-         * is denied — in the v1.4 deny-only model no inet socket can be
-         * connected (connect is denied), and egress-capable sends are not
-         * authorizable. */
+        /* v1.12: extract the destination sockaddr, if any, for the record. sendto
+         * passes dest_addr in arg4 / addrlen in arg5; sendmsg carries msg_name /
+         * msg_namelen inside the struct msghdr in arg1. v1.21: a sendto reaches
+         * here only if it names a destination or sets MSG_FASTOPEN (the filter
+         * admits the rest) and is refused; a sendmsg with no destination and no
+         * control data is relayed by net_send_relay, and any other send is
+         * refused below. */
         out->kind = ACT_NET_SEND;
         out->send_nr = nr;
         out->sock_fd = (int)req->data.args[0];
@@ -3578,7 +3592,9 @@ static void usage(const char *argv0) {
         "  handed over in place of the agent's socket (SECCOMP_IOCTL_NOTIF_ADDFD).\n"
         "  TCP and UDP over IPv4 and IPv6, and Unix sockets named by a path.\n"
         "  Refused whatever the policy says: sends that name a destination,\n"
-        "  abstract Unix addresses, inbound calls, other socket kinds.\n"
+        "  abstract Unix addresses, listen and accept, any bind other than a\n"
+        "  TCP or UDP socket to the wildcard address and port 0 (which the\n"
+        "  Warden performs), other socket kinds.\n"
         "\n"
         , argv0, argv0);
     fputs(
@@ -3997,6 +4013,16 @@ int main(int argc, char **argv) {
             return 1;
         }
         sockref_warm();
+    }
+    /* v1.21: up to MAX_PENDING connects and sends can wait in the Warden, each
+     * holding a socket: raise the Warden's own descriptor limit (after the
+     * fork, so the agent keeps its own). */
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max < 65536 ? rl.rlim_max : 65536;
+            (void)setrlimit(RLIMIT_NOFILE, &rl);
+        }
     }
     fprintf(stderr,
         "[warden] supervising pid=%d  notify_fd=%d  policy=%s (%zu rules)  pidns=%s  netns=%s"

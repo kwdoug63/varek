@@ -28,16 +28,18 @@ T="$HERE/tests"
 D=/tmp/varek_v1210
 OUT="$(mktemp -d)"
 POL="$T/v1210_policy.txt" CPOL="$OUT/clients.policy"
-fail=0
+fail=0 skips=0
 pass()  { printf '  PASS   %s\n' "$1"; }
 flunk() { printf '  FAIL   %s\n' "$1"; fail=1; }
-skip()  { printf '  SKIP   %s\n' "$1"; }
+skip()  { printf '  SKIP   %s\n' "$1"; skips=$((skips + 1)); }
 check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else flunk "$d"; fi; }
 
 SERVERS=""
 cleanup() { [ -n "$SERVERS" ] && kill "$SERVERS" 2>/dev/null; wait 2>/dev/null; rm -rf "$OUT" "$D"; }
 trap cleanup EXIT
 
+# A server left by an interrupted run would hold the ports.
+pkill -f "v1210_servers\.py $D\$" 2>/dev/null && sleep 0.5
 rm -rf "$D"
 mkdir -p "$D/work" "$D/tls"
 chmod 755 "$D" "$D/work" "$D/tls"
@@ -59,6 +61,7 @@ if grep -q 'BYPASSED' "$OUT/probe.out"; then flunk "no destination the policy de
 else pass "no destination the policy denies was reached"; fi
 if grep -q ' FAIL ' "$OUT/probe.out"; then flunk "every case had the promised outcome"
 else pass "every case had the promised outcome"; fi
+while read -r _ c _ why; do skip "probe case $c: $why"; done < <(grep '^PROBE [^ ]* *SKIP' "$OUT/probe.out")
 check "the race ran and had no escapes"            grep -q 'toctou_race .* OK .* 0 escapes' "$OUT/probe.out"
 check "the Unix server saw the agent's uid, not root" grep -q 'unix:s.sock peer uid=65534' "$D/servers.log"
 check "the Unix datagram reached its server"       grep -q 'unix-dgram d.sock got 5 bytes' "$D/servers.log"
@@ -99,6 +102,10 @@ checks = {
   "a connect on a connected socket answers EISCONN": has(rule="already_connected", errno=106),
   "the slow connect was handed over at SO_SNDTIMEO":
       has(resolved="127.0.0.1:18184", rule="dialed_in_progress"),
+  "a second connect on a socket still connecting answers EALREADY":
+      has(resolved="127.0.0.1:18181", rule="already_connected", errno=114),
+  "a descriptor replaced while its connect waited is left alone":
+      has(resolved="127.0.0.1:18184", rule="dialed_descriptor_replaced"),
   "no connect is refused by the old deny-only rule":
       not any(r.get("rule") == "deny_only_nonfile_v191" for r in c),
   "every ALLOW carries a certificate the checker accepted":
@@ -167,7 +174,13 @@ cases = {
                  ("/var/lib/ehr/records/p1/id_rsa", 0), ("/var/lib/ehr/records/p1/Psychotherapy/n.txt", 0),
                  ("/var/lib/ehr/records/p1/PSYCHOTHERAPY", 0), ("/tmp/varek/.SSH/config", 0),
                  ("/tmp/varek/.ssh-old/k", 0), ("/tmp/varek/.Env", 0), ("/tmp/varek/app.KEY", 0),
-                 ("/var/lib/ehr/records/p1/chart.json", 1), ("/usr/lib/python3.11/keyword.py", 1)],
+                 ("/var/lib/ehr/records/p1/chart.json", 1), ("/usr/lib/python3.11/keyword.py", 1),
+                 ("/var/lib/ehr/records/p1/x.pem~", 0), ("/tmp/varek/.env~", 0),
+                 ("/var/lib/ehr/records/Deceased/p9.json", 0),
+                 # not refused: a longer name, not a copy (documented in the policy)
+                 ("/var/lib/ehr/records/p1/j.pemberton.json", 1),
+                 ("/var/lib/ehr/records/p1/visit.keynotes.txt", 1),
+                 ("/var/lib/ehr/records/p1/psychotherapy-referral.txt", 1)],
   "national-defense": [("/var/lib/intel/products/a/Compartmented/x", 0), ("/tmp/varek/id_ECDSA", 0)],
   "finance": [("/tmp/varek/Server.Pem", 0)], "utility": [("/tmp/varek/ID_ED25519.bak", 0)],
   "cybersecurity": [("/tmp/varek/x.key~", 0)],
@@ -308,5 +321,8 @@ sed 's/^/     /' "$LAT"
 [ -n "${VAREK_LATENCY_OUT:-}" ] && cp "$LAT" "$VAREK_LATENCY_OUT"
 
 echo
-if [ "$fail" -eq 0 ]; then echo "ALL PASSED (v1.21.0)"; else echo "FAILURES PRESENT"; fi
+if [ "$fail" -eq 0 ]; then
+    if [ "$skips" -gt 0 ]; then echo "ALL PASSED (v1.21.0), $skips SKIPPED (see SKIP lines above)"
+    else echo "ALL PASSED (v1.21.0)"; fi
+else echo "FAILURES PRESENT"; fi
 exit "$fail"

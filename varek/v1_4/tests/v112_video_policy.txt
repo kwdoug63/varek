@@ -2,7 +2,7 @@
 # Deliberately PERMISSIVE where a real operator plausibly would be: it allows
 # the agent's own working directory AND /proc/self/ (agents routinely read their
 # own /proc/self/*). Under the pre-fix Warden that permissiveness leaks — a
-# symlink or /proc/self magic link reaches a denied object. Under v1.12 the same
+# symlink or a /proc/self path reaches a denied object. Under v1.12 the same
 # policy is safe, because the decision is made on the resolved object. The point
 # of the demo is that v1.12 makes a generous policy safe, not that a locked-down
 # policy hides the bug.

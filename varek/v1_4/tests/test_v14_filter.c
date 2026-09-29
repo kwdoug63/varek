@@ -71,12 +71,13 @@ static int run_probe(const char *what) {
         if (!strcmp(what, "ipv6_rthdr"))  { int u = socket(AF_INET, SOCK_DGRAM, 0); int one = 1; r = syscall(SYS_setsockopt, u, 41, 57, &one, 4); _exit(r < 0 && errno == EACCES ? 0 : 88); }
         if (!strcmp(what, "rthdr_hibits")){ int u = socket(AF_INET, SOCK_DGRAM, 0); int one = 1; r = syscall(SYS_setsockopt, u, 41UL | (1UL << 40), 57UL | (1UL << 33), &one, 4); _exit(r < 0 && errno == EACCES ? 0 : 89); }
         if (!strcmp(what, "ipv6_2292rthdr")){ int u = socket(AF_INET, SOCK_DGRAM, 0); int one = 1; r = syscall(SYS_setsockopt, u, 41, 5, &one, 4); _exit(r < 0 && errno == EACCES ? 0 : 88); }
+        if (!strcmp(what, "ipv6_pktoptions")){ int u = socket(AF_INET, SOCK_DGRAM, 0); int one = 1; r = syscall(SYS_setsockopt, u, 41UL | (1UL << 50), 6, &one, 4); _exit(r < 0 && errno == EACCES ? 0 : 88); }
         if (!strcmp(what, "setsockopt_ok")) {
             int t4 = socket(AF_INET, SOCK_STREAM, 0), u4 = socket(AF_INET, SOCK_DGRAM, 0), one = 1, tos = 16;
             if (setsockopt(t4, IPPROTO_TCP, TCP_NODELAY, &one, 4) || setsockopt(t4, SOL_SOCKET, SO_KEEPALIVE, &one, 4) ||
                 setsockopt(t4, IPPROTO_IP, IP_TOS, &tos, 4) || setsockopt(u4, IPPROTO_UDP, 1 /* UDP_CORK */, &one, 4))
                 _exit(90);
-            static const int v6opts[] = { 1, 4, 6, 7, 8, 15, 16, 26, 31, 32, 47, 48, 55, 56, 58, 67 };
+            static const int v6opts[] = { 1, 4, 7, 8, 15, 16, 26, 31, 32, 47, 48, 55, 56, 58, 67 };
             for (size_t k = 0; k < sizeof v6opts / sizeof v6opts[0]; k++)
                 if (setsockopt(u4, IPPROTO_IPV6, v6opts[k], &one, 4) == 0 || errno != ENOPROTOOPT) _exit(91);
             if (setsockopt(u4, IPPROTO_IP, 3, &one, 4) == 0 && 0) _exit(92);
@@ -112,6 +113,7 @@ int main(void) {
         { "ipv6_rthdr",    "allow" },
         { "rthdr_hibits",  "allow" },
         { "ipv6_2292rthdr","allow" },
+        { "ipv6_pktoptions","allow" },
         { "setsockopt_ok", "allow" },
     };
     int fails = 0;
