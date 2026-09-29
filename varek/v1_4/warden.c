@@ -92,6 +92,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/vfs.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -1289,6 +1290,80 @@ static void send_errno(int notify_fd, uint64_t id, int err) {
  * dirfd handling: only AT_FDCWD (resolved against /proc/<pid>/cwd) and
  * absolute paths are handled; any other dirfd fails closed. */
 
+/* v1.17.0: objects the agent must never reach, identified by device and
+ * inode rather than by path.
+ *
+ * Through v1.16.3 the Warden refused to START if the policy would let the
+ * agent open the signing key, the anchor or the verdict stream by their real
+ * path. A second path to the same file defeated that: with the key's
+ * directory bind-mounted under an allowed tree, the agent opened
+ * /tmp/varek_allowed_x/log.key, the policy said ALLOW, and it read the private
+ * key. Any alias the operator or a container runtime creates (bind mount,
+ * overlay lower layer, a hard link made after startup) has the same inode, so
+ * the runtime check below is made on identity, after resolution, on the object
+ * actually pinned, before the policy is consulted. The startup checks stay as
+ * an early, clearer error.
+ *
+ * Raw storage and memory devices are refused the same way, whatever the policy
+ * says and whatever path reaches them: block devices; /dev/mem, /dev/kmem,
+ * /dev/port (character 1:1, 1:2, 1:4); the character devices that pass
+ * commands to a disk (the sg, bsg, nvme and nvme-generic majors, read from
+ * /proc/devices at startup); and /proc/kcore. Each reads every file on the
+ * machine, the signing key included, below any path rule. */
+#define MAX_PROTECTED 8
+struct protected_obj { dev_t dev; ino_t ino; const char *what; };
+static struct protected_obj g_protected[MAX_PROTECTED];
+static int g_nprotected = 0;
+static unsigned g_raw_char_majors[16];
+static int g_nraw_char_majors = 0;
+
+static void protect_fd(int fd, const char *what) {
+    struct stat st;
+    if (g_nprotected < MAX_PROTECTED && fstat(fd, &st) == 0) {
+        g_protected[g_nprotected].dev = st.st_dev;
+        g_protected[g_nprotected].ino = st.st_ino;
+        g_protected[g_nprotected].what = what;
+        g_nprotected++;
+    }
+}
+
+static void load_raw_char_majors(void) {
+    FILE *f = fopen("/proc/devices", "re");
+    if (!f) return;
+    char line[128];
+    bool chr = false;
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, "Character devices:", 18)) { chr = true; continue; }
+        if (!strncmp(line, "Block devices:", 14)) { chr = false; continue; }
+        unsigned major;
+        char name[64];
+        if (!chr || sscanf(line, "%u %63s", &major, name) != 2) continue;
+        if ((!strcmp(name, "sg") || !strcmp(name, "bsg") || !strcmp(name, "nvme") ||
+             !strcmp(name, "nvme-generic")) && g_nraw_char_majors < 16)
+            g_raw_char_majors[g_nraw_char_majors++] = major;
+    }
+    fclose(f);
+}
+
+/* NULL if the pinned object may be decided by the policy; otherwise the
+ * record's rule id for refusing it outright. */
+static const char *forbidden_object(int fd, const char *canon) {
+    struct stat st;
+    if (fstat(fd, &st) < 0) return "resolution_failed";
+    for (int i = 0; i < g_nprotected; i++)
+        if (st.st_dev == g_protected[i].dev && st.st_ino == g_protected[i].ino)
+            return "protected_object";
+    if (S_ISBLK(st.st_mode)) return "raw_device";
+    if (S_ISCHR(st.st_mode)) {
+        unsigned ma = major(st.st_rdev), mi = minor(st.st_rdev);
+        if (ma == 1 && (mi == 1 || mi == 2 || mi == 4)) return "raw_device";
+        for (int i = 0; i < g_nraw_char_majors; i++)
+            if (ma == g_raw_char_majors[i]) return "raw_device";
+    }
+    if (!strcmp(canon, "/proc/kcore")) return "raw_device";
+    return NULL;
+}
+
 struct resolved_target {
     int  path_fd;          /* O_PATH fd on the object, or -1 when creating */
     int  parent_fd;        /* O_PATH fd on the parent directory when creating */
@@ -1701,6 +1776,18 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                 send_simple(notify_fd, req.id, DEC_DENY);
                 continue;
             }
+            /* v1.17.0: the signing key, the anchor, the verdict stream and raw
+             * storage are refused by identity, before the policy is asked. */
+            const char *forbid = rt.path_fd >= 0 ? forbidden_object(rt.path_fd, act.resolved) : NULL;
+            if (forbid) {
+                resolved_target_close(&rt);
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                uint64_t lat_f = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
+                               + (t1.tv_nsec - t0.tv_nsec);
+                emit_pathology(seq++, req.pid, &act, DEC_DENY, DEC_DENY, forbid, lat_f, EACCES);
+                send_simple(notify_fd, req.id, DEC_DENY);
+                continue;
+            }
         }
 
         decision_t d_raw   = policy_decide(p, &act);
@@ -1914,6 +2001,7 @@ static int load_sign_key(const char *path, const struct policy *p) {
         return -1;
     }
     if (refuse_if_agent_can_open(p, fd, path, "signing key") < 0) { close(fd); return -1; }
+    protect_fd(fd, "signing key");          /* v1.17.0: refused by identity at runtime too */
     char buf[80];
     ssize_t n;
     do { n = read(fd, buf, sizeof buf); } while (n < 0 && errno == EINTR);
@@ -2001,6 +2089,7 @@ static int open_anchor(const char *path, const struct policy *p) {
         fd = rw;
         g_anchor_fifo = true;
     }
+    protect_fd(fd, "anchor");               /* v1.17.0 */
     g_anchor_fd = fd;
     return 0;
 }
@@ -2009,7 +2098,12 @@ static int open_anchor(const char *path, const struct policy *p) {
  * agent could truncate or read it (and learn the run id). v1.16 refuses. */
 static int refuse_exposed_stream(const struct policy *p) {
     struct stat st;
-    if (fstat(STDERR_FILENO, &st) < 0 || !S_ISREG(st.st_mode)) return 0;
+    if (fstat(STDERR_FILENO, &st) < 0) return 0;
+    /* v1.17.0: a file or FIFO holding the stream is refused by identity at
+     * runtime whatever path reaches it; a regular file is also checked by
+     * path here, for a clear error at startup. */
+    if (S_ISREG(st.st_mode) || S_ISFIFO(st.st_mode)) protect_fd(STDERR_FILENO, "verdict stream");
+    if (!S_ISREG(st.st_mode)) return 0;
     return refuse_if_agent_can_open(p, STDERR_FILENO, "(stderr)", "verdict stream");
 }
 
@@ -2149,6 +2243,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[warden] libsodium failed to initialize\n");
         return 1;
     }
+    load_raw_char_majors();                 /* v1.17.0 */
     if (refuse_exposed_stream(&p) < 0) return 1;
     if (key_path && load_sign_key(key_path, &p) < 0) return 1;
     if (anchor_path && open_anchor(anchor_path, &p) < 0) return 1;
