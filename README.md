@@ -438,7 +438,8 @@ schema, and one note per fragment.
 
 Language test suites, as each archived release runs them (counted for v1.18.0,
 Python 3.11; through v1.17.0 this table said 109 tests for v0.1 and 659 passing
-in all):
+in all). The v0.1–v0.4 releases are zip files in [`archive/`](./archive/README.md);
+v1.0 is in [`varek-v1.0/`](./varek-v1.0/):
 
 | Component | Tests | Passing |
 |-----------|------:|--------:|
