@@ -314,10 +314,18 @@ def main(argv=None):
     ap.add_argument("--anchor", help="the Warden's --anchor file: the stream's signed records "
                     "must match it")
     ap.add_argument("--run", help="the run id the stream must carry (run_start's \"run\")")
-    ap.add_argument("--max-anchor-delay", type=float, metavar="SECONDS",
+    def seconds(v):
+        try:
+            x = float(v)
+        except ValueError:
+            x = float("nan")
+        if not (x >= 0 and x != float("inf")):
+            raise argparse.ArgumentTypeError(f"{v!r}: expected a finite number of seconds >= 0")
+        return x
+    ap.add_argument("--max-anchor-delay", type=seconds, metavar="SECONDS",
                     help="fail if any record reached the anchor later than this after it was "
                          "written (needs a v1.16.2 receiver's receive times)")
-    ap.add_argument("--clock-slack", type=float, default=5.0, metavar="SECONDS",
+    ap.add_argument("--clock-slack", type=seconds, default=5.0, metavar="SECONDS",
                     help="how far the anchor host's clock may run behind the Warden host's "
                          "(default 5): a record received earlier than that before it was written fails")
     ap.add_argument("--list-runs", action="store_true",

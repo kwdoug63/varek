@@ -154,6 +154,14 @@ o1="$("${A[@]}" --pubkey "$OUT/log.key.pub" --anchor "$RF" --max-anchor-delay 1.
 o2="$("${A[@]}" --pubkey "$OUT/log.key.pub" --anchor "$RF" --max-anchor-delay 1.5 "$LOGD/v2.log" 2>&1)"
 grep -q PASS <<<"$o1" && grep -q "reached the anchor more than" <<<"$o2" \
   && pass "--max-anchor-delay 1.5: the prompt run passes, the run held during the outage fails" || { flunk "late records"; echo "$o1" | tail -2; echo "$o2" | tail -2; }
+bad=0
+for v in nan inf -1; do
+  "${A[@]}" --pubkey "$OUT/log.key.pub" --anchor "$RF" --clock-slack "$v" "$LOGD/v1.log" >/dev/null 2>&1 && bad=1
+  "${A[@]}" --pubkey "$OUT/log.key.pub" --anchor "$RF" --max-anchor-delay "$v" "$LOGD/v1.log" >/dev/null 2>&1 && bad=1
+done
+o="$("${A[@]}" --pubkey "$OUT/log.key.pub" --anchor "$RF" --clock-slack 0 "$LOGD/v1.log" 2>&1)"
+[ "$bad" = 0 ] && grep -q PASS <<<"$o" \
+  && pass "--clock-slack and --max-anchor-delay refuse nan, inf and negative values" || { flunk "seconds validation"; echo "$o" | tail -2; }
 # Held records whose anchor-line times are edited to look prompt: the audit
 # measures against the stream's signed times, not the anchor line's.
 stop_sshd

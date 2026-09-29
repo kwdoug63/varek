@@ -197,7 +197,7 @@ Then run the Warden with `--anchor /run/varek/anchor.fifo`.
 
 ## Testing
 
-`make test-v1162` (30 checks) runs a receiver behind a private sshd on
+`make test-v1162` (31 checks) runs a receiver behind a private sshd on
 127.0.0.1:2222, with the forwarder in front of the Warden.
 
 - **Setup.** A public key carrying a second line is refused before anything is
@@ -213,6 +213,8 @@ Then run the Warden with `--anchor /run/varek/anchor.fifo`.
   - The anchor host is down: the records wait in the spool and are delivered.
   - `--max-anchor-delay 1.5` passes the prompt run and fails the one held
     during the outage.
+  - `--clock-slack` and `--max-anchor-delay` refuse `nan`, `inf` and negative
+    values.
   - The anchor lines' times are edited to look prompt: the run still fails
     (the delay is measured from the stream).
   - The forwarder is stopped for 3 s mid-run: no anchor error, and the run
@@ -274,15 +276,20 @@ The second found:
 - torn lines on a full disk;
 - the receiver left partial state behind on refusal.
 
-The third found only low-severity issues, all fixed:
+The third found only low-severity issues:
 
 - two liveness probes running at once (the Warden's and the preflight's)
-  could each see the other's lock and report a live forwarder as dead; the
-  probes now take a shared lock, which conflicts only with the forwarder's,
-  and a starting forwarder retries its lock for 2 s;
+  could each see the other's lock and report a stopped forwarder as running,
+  and a probe could make a starting forwarder give up; the probes now take a
+  shared lock, which conflicts only with the forwarder's, and a starting
+  forwarder retries its lock for 2 s;
 - the negative-delay check assumed synchronised clocks without saying so
   (now documented, with `--clock-slack`);
-- a full spool disk logged a warning for every line (now once per 30 s).
+- a full spool disk logged a warning on every pass of the forwarder's loop
+  (now once per 30 s);
+- after the fixes, a re-check found `--clock-slack` accepted `nan`, `inf` and
+  negative values; it and `--max-anchor-delay` now take only a finite number
+  of seconds ≥ 0.
 
 All are fixed and covered above.
 
