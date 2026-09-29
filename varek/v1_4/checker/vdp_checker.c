@@ -5,6 +5,9 @@
 // trick and no shortcut beyond what the definitions say. It shares no code
 // with smt_decide.c and does not include its header.
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE                   /* memmem */
+#endif
 #include "vdp_checker.h"
 
 #include <stdarg.h>
@@ -351,7 +354,7 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
         const char *ge = parse_glob(c, cl, &r->g, &r->ng);
         if (ge) return fail(err, en, name, ln, "%s", ge);
         *glob_total += r->ng;
-        if (*glob_total > 65536) return fail(err, en, name, ln, "glob tokens over the policy total");
+        if (*glob_total > VDPC_GLOB_MAX_TOTAL) return fail(err, en, name, ln, "glob tokens over the policy total");
         r->fixed = true;
         for (size_t k = 0; k < r->ng; k++) {
             if (r->g[k].type == G_LIT || r->g[k].type == G_SET) r->minlen++;
@@ -508,9 +511,10 @@ static bool str_holds(const vdpc_rule_t *r, const char *s, size_t sl) {
         case M_EXACT:  return sl == cl && memcmp(s, c, cl) == 0;
         case M_SUFFIX: return sl >= cl && memcmp(s + sl - cl, c, cl) == 0;
         case M_CONTAINS:
-            for (size_t k = 0; k + cl <= sl; k++)
-                if (memcmp(s + k, c, cl) == 0) return true;
-            return false;
+            /* memmem (libc, linear time): a byte-by-byte search is quadratic
+             * in the worst case, and 256 such rules on a 4,095-byte path would
+             * dominate the cost of an open. */
+            return memmem(s, sl, c, cl) != NULL;
         case M_HOST:
             if (sl == cl && memcmp(s, c, cl) == 0) return true;
             if (memchr(c, ':', cl)) return false;
@@ -659,4 +663,37 @@ int vdpc_check(const vdpc_policy_t *p, int kind, const char *s, size_t sl,
     }
     if (c->r >= 0 && c->r != deciding) return reject(why, wn, "certificate names the wrong rule");
     return 1;
+}
+
+/* v1.16: could the agent open path s with SOME admissible flags value? The
+ * Warden asks this of its signing key and its anchor file at startup and
+ * refuses to run a policy that would let the agent open either. Same
+ * enumeration as the symbolic claim above: only the flag bits of the rules
+ * whose string atom holds on s matter. */
+int vdpc_path_openable(const vdpc_policy_t *p, const char *s, size_t sl) {
+    if (sl > VDPC_MAX_S || memchr(s, '\0', sl)) return 0;   /* outside the fragment: refused */
+    size_t hold[VDPC_MAX_RULES], nh = 0;
+    uint32_t bits = 0;
+    for (size_t j = 0; j < p->n; j++) {
+        const vdpc_rule_t *e = &p->rules[j];
+        if (e->kind != VDPC_PATH || !str_holds(e, s, sl)) continue;
+        hold[nh++] = j;
+        bits |= e->mask;
+        if (e->mask == 0) break;
+    }
+    uint32_t sub = 0;
+    for (;;) {
+        if ((sub & ACCMODE) != ACCMODE) {
+            for (size_t k = 0; k < nh; k++) {
+                const vdpc_rule_t *e = &p->rules[hold[k]];
+                if (flag_holds(e, sub)) {
+                    if (e->allow) return 1;
+                    break;
+                }
+            }
+        }
+        if (sub == bits) break;
+        sub = (sub - bits) & bits;
+    }
+    return 0;
 }

@@ -80,11 +80,12 @@
 #include <stdint.h>
 
 #define VDPC_GRAMMAR_MAJOR 1
-#define VDPC_GRAMMAR_MINOR 15
+#define VDPC_GRAMMAR_MINOR 16
 
 #define VDPC_MAX_S        4095
 #define VDPC_MAX_RULES    256
 #define VDPC_MAX_STRETCH  32          /* a glob has at most 32 wildcards */
+#define VDPC_GLOB_MAX_TOTAL 4096      /* glob tokens per policy (v1.16; was 65536) */
 
 enum { VDPC_PATH = 0, VDPC_HOST = 1, VDPC_EXEC = 2 };
 
@@ -132,6 +133,10 @@ int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *out);
 /* Does rule i's string atom hold on s? (Testing and audit: which rules match
  * a path, by the checker's own matchers.) 1, 0, or -1 if there is no rule i. */
 int vdpc_holds(const vdpc_policy_t *p, size_t i, const char *s, size_t sl);
+
+/* v1.16: 1 if some admissible open(2) flags value of an open of path s is
+ * decided by an allow rule (the agent could open s), 0 if none is. */
+int vdpc_path_openable(const vdpc_policy_t *p, const char *s, size_t sl);
 
 /* Hex form of the policy digest (65 bytes with the NUL). */
 void vdpc_digest_hex(const vdpc_policy_t *p, char out[65]);
