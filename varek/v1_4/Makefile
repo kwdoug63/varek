@@ -30,18 +30,18 @@ BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check too
 all: $(BINS)
 
 # v1.16.1: the Warden needs the libseccomp and (from v1.16) libsodium headers.
-# Checked before building, with the command that installs them; `make deps`
-# runs that command.
+# Checked when (and only when) the Warden or varek_keygen is about to be built,
+# naming the command that installs them; `make deps` runs that command.
 deps-check:
 	@printf '#include <seccomp.h>\n#include <sodium.h>\n' | $(CC) -E -x c - >/dev/null 2>&1 || { \
 	    echo "ERROR: the Warden needs the libseccomp and libsodium development headers."; \
-	    echo "  Debian/Ubuntu: sudo apt-get install -y build-essential libseccomp-dev libsodium-dev"; \
+	    echo "  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libsodium-dev"; \
 	    echo "  Fedora/RHEL:   sudo dnf install -y gcc make libseccomp-devel libsodium-devel"; \
 	    echo "  or run: make deps"; exit 1; }
 
 deps:
 	@if command -v apt-get >/dev/null 2>&1; then \
-	    sudo apt-get install -y build-essential libseccomp-dev libsodium-dev; \
+	    sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libsodium-dev; \
 	elif command -v dnf >/dev/null 2>&1; then \
 	    sudo dnf install -y gcc make libseccomp-devel libsodium-devel; \
 	else echo "install libseccomp and libsodium (development packages) with your package manager"; exit 1; fi
@@ -51,17 +51,19 @@ deps:
 # --run a real trial run). Example:
 #   make preflight POLICY=policies/finance.policy.txt LOG=/var/log/varek/verdicts.log
 preflight:
-	@./tools/varek_preflight.sh $(POLICY) $(if $(LOG),--log $(LOG)) $(if $(KEY),--sign-key $(KEY)) $(if $(ANCHOR),--anchor $(ANCHOR)) $(if $(RUN),--run)
+	@./tools/varek_preflight.sh "$(POLICY)" $(if $(LOG),--log "$(LOG)") $(if $(KEY),--sign-key "$(KEY)") $(if $(ANCHOR),--anchor "$(ANCHOR)") $(if $(RUN),--run)
 
 CHECKER := checker/vdp_checker.c checker/vdp_checker.h
 
-warden: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(V1_6_SRC) | deps-check
+warden: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(V1_6_SRC)
+	@$(MAKE) -s --no-print-directory deps-check
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c $(LIFECYCLE) $(V1_6_SRC) $(LDLIBS)
 
 # v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
 # ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that
 # the certificate checker refuses the wrong verdict. Never deploy it.
-warden_faultinject: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(V1_6_SRC) | deps-check
+warden_faultinject: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(V1_6_SRC)
+	@$(MAKE) -s --no-print-directory deps-check
 	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c $(LIFECYCLE) $(V1_6_SRC) $(LDLIBS)
 
 # v1.15: command-line front end to the certificate checker (policy digest,
@@ -70,7 +72,8 @@ tools/vdp_cert_check: tools/vdp_cert_check.c $(CHECKER)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/vdp_cert_check.c checker/vdp_checker.c
 
 # v1.16: Ed25519 key pair for signing the verdict stream (--sign-key).
-tools/varek_keygen: tools/varek_keygen.c | deps-check
+tools/varek_keygen: tools/varek_keygen.c
+	@$(MAKE) -s --no-print-directory deps-check
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/varek_keygen.c -lsodium
 
 # v1.13: command-line front end to the SMT decision procedure (lint, analyze,

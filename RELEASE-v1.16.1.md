@@ -17,20 +17,29 @@ decisions, records or the policy grammar.
 
 - **`tools/varek_preflight.sh`** checks a deployment end to end, printing PASS,
   WARN or FAIL for each step:
-  1. the build dependencies (`--install-deps` installs them);
-  2. the build;
-  3. the policy;
-  4. every location the Warden refuses at startup: the verdict stream
-     (`--log`), the signing key (`--sign-key`), the anchor (`--anchor`), and
-     raw disks when a key or anchor is used;
-  5. with `--run`, a real trial run whose stream is audited.
+  1. the build: up-to-date binaries are enough (a production host needs no
+     compiler or headers); otherwise the dependencies are checked
+     (`--install-deps` installs them) and the tools are built;
+  2. the policy;
+  3. every location the Warden refuses at startup, with the Warden's own rules:
+     the verdict stream (`--log`), the signing key (`--sign-key`), the anchor
+     (`--anchor`), and raw disks when a key or anchor is used;
+  4. with `--run`, a real trial run whose stream is audited. This is the
+     definitive test: some things (such as whether a FIFO anchor has a reader)
+     only the Warden can see.
 - **`tools/vdp_cert_check <policy> openable`** answers the question behind
   every one of those refusals: could the agent open this path? It uses the
-  same certificate-checker function the Warden uses, so the answers agree. The
-  new test checks that on every shipped policy.
+  same certificate-checker function the Warden uses, on the path an open would
+  reach:
+  - symlinks followed, and a dangling one followed to its target;
+  - for a file not yet created, its deepest existing directory canonicalized.
+
+  The new test checks that it agrees with the live Warden on every shipped
+  policy.
 - **`make` names the missing packages.**
-  - If the libseccomp or libsodium headers are missing, the build stops with
-    the command that installs them.
+  - If the libseccomp or libsodium headers are missing when the Warden needs
+    building, the build stops with the command that installs them. Up-to-date
+    binaries build nothing and need no headers.
   - `make deps` runs that command.
   - `make preflight POLICY=… LOG=…` runs the preflight.
 - **A CI job** (`.github/workflows/warden-build.yml`) installs exactly
@@ -77,15 +86,17 @@ tools/varek_preflight.sh policies/finance.policy.txt \
     --anchor /var/log/varek/anchor.log --run
 ```
 
-**Scope.** The preflight decides each location exactly as the Warden does. It
-does not replace the Warden's own startup check, which still runs on every
-start.
+**Scope.** The preflight applies the Warden's rules to each location; the
+Warden's own check still runs on every start.
 
 **Side effects of `--run`.**
 
-- It needs root.
-- It writes its trial stream to a temporary file next to `--log` and removes it
-  afterwards.
+- It needs root, through sudo if you are not root. Nothing else uses sudo: a
+  key you cannot read is reported, not read through sudo.
+- It writes its trial stream to a new temporary file (mktemp) in the `--log`
+  directory and removes it afterwards. The directory must belong to root and
+  not be writable by others (or be sticky, like `/tmp`), since the Warden
+  writes there as root.
 - With `--anchor`, the trial run's checkpoints are appended to the anchor like
   any run's.
 
@@ -97,8 +108,10 @@ start.
   - `make test-v1161`;
   - the CI job.
 - **Changed:**
-  - `warden`, `warden_faultinject` and `tools/varek_keygen` depend on
-    `deps-check` (an order-only prerequisite, so it causes no rebuilds);
+  - `warden`, `warden_faultinject` and `tools/varek_keygen` run `deps-check`
+    as the first step of their build, so only a rebuild needs the headers;
+  - the Warden's raw-device check matches `/dev/bsg/` exactly (it matched any
+    `/dev/bsg*` directory);
   - `run_start` reads `"warden":"1.16.1"`;
   - the sector policies gain a header note on where to put the verdict stream
     (comments only: their rules are unchanged, but their SHA-256 differs);
@@ -107,21 +120,40 @@ start.
 
 ## Testing
 
-`make test-v1161` (12 checks):
+`make test-v1161` (26 checks):
 
 - For every shipped policy and three stream locations, the `openable` check and
   the live Warden agree on all 21 pairs.
 - The preflight passes a signed, anchored deployment with an audited trial run.
 - It fails each case the Warden would refuse:
-  - a stream in scratch space;
-  - a group-readable key;
-  - a hard-linked key;
-  - a key or an anchor the agent could open;
-  - a missing key.
+  - streams: in scratch space; a dangling symlink into it; a new file under a
+    symlinked directory that leads there; reached through a symlink with two
+    names; in a directory that does not exist;
+  - keys: group-readable, hard-linked, missing, open to the agent, and three
+    malformed layouts;
+  - anchors: open to the agent, a symlink, a directory, with two names, in a
+    missing directory.
+- A log directory whose name looks like a shell command is treated as a name
+  and never run.
+- `--run` refuses a log directory another user owns.
+- A FIFO stream in an allowed path is a warning, not a failure: the Warden
+  refuses only regular files.
 - `make` names the packages when the headers are missing. This was also
   checked on a host with libsodium removed: the Warden build and the preflight
   both stop with the install command, and `--install-deps` installs it and
   continues to a passing trial run.
+
+**Independent review.** It found these problems, all fixed and covered by the
+test:
+
+- `--run` wrote its trial stream to a predictable name as root, so a symlink
+  planted there could overwrite any file.
+- A log path containing shell syntax was run as a command.
+- Several stream, anchor and key cases passed the preflight although the
+  Warden refuses them.
+- A prebuilt host without headers could not use `make` or the preflight.
+- The `/dev/bsg` prefix mismatch.
+- Overstatements in these notes.
 
 Earlier suites pass: `test-v1160`, `test-v1150`, `test-v1140`, `test-v1130`,
 `test-v1124`, `test-v1123`, `test-v1122`, `test-v1121`, `test-v112`,

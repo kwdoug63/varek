@@ -108,18 +108,19 @@ make
 
 From v1.16 the Warden refuses to start when the policy would let the agent open
 its own verdict stream file (the file its stderr goes to), its signing key, its
-anchor or, with a key or anchor, a raw disk. Check a deployment without running
-anything:
+anchor or, with a key or anchor, a raw disk. Check a deployment before running
+it:
 
 ```sh
 tools/varek_preflight.sh policies/finance.policy.txt --log /var/log/varek/verdicts.log \
     --sign-key /etc/varek/log.key --anchor /var/log/varek/anchor.log
 ```
 
-It checks the build dependencies, builds, loads the policy, and decides each
-location exactly as the Warden will (`tools/vdp_cert_check <policy> openable`).
-Add `--run` for a real trial run (as root) whose stream is written next to the
-log and audited. Put the verdict stream outside every path the policy allows:
+It checks the build (building only if the binaries are out of date), loads the
+policy, and checks each location with the Warden's rules
+(`tools/vdp_cert_check <policy> openable`). Add `--run` for a real trial run
+(as root) whose stream is written next to the log and audited; that is the
+definitive test. Put the verdict stream outside every path the policy allows:
 `/var/log/varek/` works with every shipped policy; a stream in the agent's
 scratch space (`/tmp/varek/` in the sector policies) is refused.
 

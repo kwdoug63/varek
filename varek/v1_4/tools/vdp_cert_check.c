@@ -21,8 +21,10 @@
 //       v1.16.1: read absolute paths from stdin, one per line. For each, print
 //       "openable <path>" if some open(2) flags value of an open of that path
 //       is decided by an allow rule (the agent could open it), else
-//       "closed <path>". An existing path is first resolved to its canonical
-//       form, as the Warden decides on it. This is the check the Warden makes
+//       "closed <path>", with <path> the canonical path an open would reach
+//       (symlinks followed, a dangling one to its target; for a path that
+//       does not exist, its deepest existing ancestor canonicalized), which
+//       is what the Warden decides on. This is the check the Warden makes
 //       at startup for its verdict stream, signing key and anchor
 //       (tools/varek_preflight.sh uses it). Exit 1 if any path is openable.
 
@@ -33,6 +35,8 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -113,6 +117,52 @@ static void json_str(const char *s) {
     }
 }
 
+/* The canonical path an open of p would reach, following symlinks (as a
+ * shell's `2> p` does) and creating the last component if it is missing: an
+ * existing path is canonicalized; a dangling symlink is followed to its
+ * target; otherwise the deepest existing ancestor is canonicalized and the
+ * rest appended. 0, or -1 if it cannot be told. */
+static int canon_for_open(const char *p, char out[PATH_MAX], int depth) {
+    if (depth > 40 || p[0] != '/' || strlen(p) >= PATH_MAX) return -1;
+    if (realpath(p, out)) return 0;
+    struct stat st;
+    if (lstat(p, &st) == 0 && S_ISLNK(st.st_mode)) {
+        char tgt[PATH_MAX], next[PATH_MAX];
+        ssize_t k = readlink(p, tgt, sizeof tgt - 1);
+        if (k <= 0) return -1;
+        tgt[k] = '\0';
+        if (tgt[0] == '/') {
+            memcpy(next, tgt, (size_t)k + 1);
+        } else {
+            const char *slash = strrchr(p, '/');
+            size_t dl = (size_t)(slash - p) + 1;              /* keep the '/' */
+            if (dl + (size_t)k >= sizeof next) return -1;
+            memcpy(next, p, dl);
+            memcpy(next + dl, tgt, (size_t)k + 1);
+        }
+        return canon_for_open(next, out, depth + 1);
+    }
+    char buf[PATH_MAX];
+    size_t len = strlen(p);
+    memcpy(buf, p, len + 1);
+    for (size_t i = len; i > 0; i--) {
+        if (buf[i - 1] != '/' || i - 1 == len - 1) continue;
+        size_t cut = i - 1;                                    /* p[cut] == '/' */
+        char save = buf[cut > 0 ? cut : 1];
+        if (cut == 0) { buf[1] = '\0'; } else buf[cut] = '\0';
+        char rd[PATH_MAX];
+        int ok = realpath(buf, rd) != NULL;
+        if (cut == 0) buf[1] = save; else buf[cut] = '/';
+        if (!ok) continue;
+        size_t a = strcmp(rd, "/") ? strlen(rd) : 0, b = len - cut;
+        if (a + b >= PATH_MAX) return -1;
+        memcpy(out, rd, a);
+        memcpy(out + a, p + cut, b + 1);
+        return 0;
+    }
+    return -1;
+}
+
 int main(int argc, char **argv) {
     if (argc != 3 || (strcmp(argv[2], "digest") && strcmp(argv[2], "batch") &&
                       strcmp(argv[2], "holds") && strcmp(argv[2], "openable"))) {
@@ -161,29 +211,13 @@ int main(int argc, char **argv) {
             while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
             if (n == 0) continue;
             if (line[0] != '/') { printf("error %s (not an absolute path)\n", line); any = 1; continue; }
-            /* An existing path is canonicalized; for one that does not exist
-             * yet (a log file about to be created), its directory is. */
-            char rp[PATH_MAX], dir[PATH_MAX];
-            const char *path = line;
-            if (realpath(line, rp)) {
-                path = rp;
-            } else {
-                char *slash = strrchr(line, '/');
-                size_t dl = (size_t)(slash - line);
-                if (dl > 0 && dl < sizeof dir) {
-                    memcpy(dir, line, dl);
-                    dir[dl] = '\0';
-                    char rd[PATH_MAX];
-                    if (realpath(dir, rd)) {
-                        size_t a = strcmp(rd, "/") ? strlen(rd) : 0, b = strlen(slash);
-                        if (a + b < sizeof rp) {
-                            memcpy(rp, rd, a);
-                            memcpy(rp + a, slash, b + 1);
-                            path = rp;
-                        }
-                    }
-                }
+            char rp[PATH_MAX];
+            if (canon_for_open(line, rp, 0) < 0) {
+                printf("error %s (cannot determine the path an open would reach)\n", line);
+                any = 1;
+                continue;
             }
+            const char *path = rp;
             int o = vdpc_path_openable(&pol, path, strlen(path));
             printf("%s %s\n", o ? "openable" : "closed", path);
             any |= o;

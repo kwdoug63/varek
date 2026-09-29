@@ -30,6 +30,7 @@ jobs:
           done
       - name: Preflight the shipped policies (verdict stream in /var/log/varek/)
         run: |
+          sudo mkdir -p /var/log/varek
           for p in varek/v1_4/policy.txt varek/v1_4/conformance_policy.txt varek/v1_4/policies/*.txt; do
             varek/v1_4/tools/varek_preflight.sh "$p" --log /var/log/varek/verdicts.log
           done

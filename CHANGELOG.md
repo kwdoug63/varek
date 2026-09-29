@@ -73,8 +73,9 @@ No change to decisions, records or the policy grammar.
   a trial run whose stream is audited.
 - `tools/vdp_cert_check <policy> openable`: could the agent open this path
   (the Warden's own check, `vdpc_path_openable`, on the canonical path).
-- `make deps`, `make deps-check` (the build stops with the install command when
-  the libseccomp or libsodium headers are missing), `make preflight`.
+- `make deps`, `make deps-check` (a Warden build stops with the install command
+  when the libseccomp or libsodium headers are missing; up-to-date binaries
+  need none), `make preflight`.
 - `make test-v1161`; CI job `.github/workflows/warden-build.yml` (installs
   `libseccomp-dev` and `libsodium-dev`, builds, lints and preflights the
   shipped policies).
@@ -82,6 +83,7 @@ No change to decisions, records or the policy grammar.
 ### Changed
 
 - `run_start` reads `"warden":"1.16.1"`.
+- The Warden's raw-device check matches `/dev/bsg/` exactly.
 - Sector policies: a header note on where to put the verdict stream
   (`/var/log/varek/`; comments only).
 - `docs/development.md`, `varek/v1_4/README.md` and the video scripts list the

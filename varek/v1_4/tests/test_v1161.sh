@@ -67,7 +67,51 @@ rm -f "$D/keys/k2"
 { cat "$FIN"; echo "allow path $D/keys/"; } > "$OUT/leaky.txt"
 check_fail "a key the agent could open fails" "the policy lets the agent open" "$OUT/leaky.txt" --sign-key "$D/keys/k"
 check_fail "an anchor the agent could open fails" "anchor: the policy lets the agent open" "$FIN" --anchor /tmp/varek/anchor
-check_fail "a missing key fails" "does not exist" "$FIN" --sign-key "$D/keys/none"
+check_fail "a missing key fails" "not found" "$FIN" --sign-key "$D/keys/none"
+
+echo "== 2b. cases the review found (the Warden refuses; the preflight must fail)"
+mkdir -p "$D/r" /tmp/varek
+ln -sfn /tmp/varek/v1161_dl.log "$D/r/dangling.log"
+check_fail "a log that is a dangling symlink into scratch space fails" "the policy lets the agent open it" "$FIN" --log "$D/r/dangling.log"
+timeout 20 "$WARDEN" "$FIN" -- /bin/true 2> "$D/r/dangling.log" >/dev/null
+grep -q "would let the agent open the verdict stream" /tmp/varek/v1161_dl.log && pass "... and the Warden refuses it too" || flunk "Warden on a dangling-symlink log"
+rm -f /tmp/varek/v1161_dl.log
+: > "$D/r/t1"; ln "$D/r/t1" "$D/r/t2"; ln -sfn "$D/r/t1" "$D/r/viasym.log"
+check_fail "a log reached through a symlink, with two names, fails" "has 2 names" "$FIN" --log "$D/r/viasym.log"
+ln -sfn /tmp/varek "$D/r/tlink"
+check_fail "a new log under a symlinked ancestor in scratch space fails" "the policy lets the agent open it" "$FIN" --log "$D/r/tlink/v1161sub/v.log"
+check_fail "a log whose directory does not exist fails" "does not exist" "$FIN" --log "$D/r/nodir/v.log"
+: > "$D/r/safe_anchor"; ln -sfn "$D/r/safe_anchor" "$D/r/anchor_link"
+check_fail "an anchor that is a symlink fails" "anchor .* is a symlink" "$FIN" --anchor "$D/r/anchor_link"
+mkdir -p "$D/r/anchor_dir"
+check_fail "an anchor that is a directory fails" "not a regular file, FIFO or character device" "$FIN" --anchor "$D/r/anchor_dir"
+check_fail "an anchor whose directory does not exist fails" "anchor's directory" "$FIN" --anchor "$D/r/nodir/anchor"
+: > "$D/r/a1"; ln "$D/r/a1" "$D/r/a2"
+check_fail "an anchor with two names fails" "has 2 names" "$FIN" --anchor "$D/r/a1"
+hex="$(head -c 64 "$D/keys/k")"
+for v in 'nn' 'lead' 'split'; do
+    case "$v" in
+        nn)    printf '%s\n\n' "$hex" ;;
+        lead)  printf '\n%s' "$hex" ;;
+        split) printf '%s\n%s' "${hex:0:32}" "${hex:32}" ;;
+    esac > "$D/keys/bad_$v"; chmod 600 "$D/keys/bad_$v"
+    check_fail "a malformed key ($v) fails" "not exactly 64 hex" "$FIN" --sign-key "$D/keys/bad_$v"
+done
+mkfifo "$D/r/ff_unused" 2>/dev/null
+mkdir -p '/tmp/varek_v1161_$(touch /tmp/varek_v1161_PWNED)'
+chmod 755 '/tmp/varek_v1161_$(touch /tmp/varek_v1161_PWNED)'
+rm -f /tmp/varek_v1161_PWNED
+o="$("$PRE" "$FIN" --log '/tmp/varek_v1161_$(touch /tmp/varek_v1161_PWNED)/v.log' --run 2>&1)"
+[ ! -e /tmp/varek_v1161_PWNED ] && grep -q "preflight: PASS" <<<"$o" \
+  && pass "a log directory named like a command is used as a name, never run" || { flunk "command in the log path"; echo "$o" | tail -4; }
+rm -rf '/tmp/varek_v1161_$(touch /tmp/varek_v1161_PWNED)' /tmp/varek_v1161_PWNED
+mkdir -p "$D/shared"; chown nobody "$D/shared" 2>/dev/null || chown 65534 "$D/shared"
+check_fail "--run refuses a log directory another user owns" "must belong to root" "$FIN" --log "$D/shared/v.log" --run
+mkfifo /tmp/varek/v1161_fifo
+o="$("$PRE" "$FIN" --log /tmp/varek/v1161_fifo 2>&1)"
+grep -q "WARN  verdict stream /tmp/varek/v1161_fifo is not a regular file" <<<"$o" && grep -q "preflight: PASS" <<<"$o" \
+  && pass "a FIFO log in an allowed path is a warning (the Warden refuses only regular files)" || flunk "FIFO log"
+rm -f /tmp/varek/v1161_fifo
 
 echo "== 3. build dependency check"
 o="$(make -s -C "$HERE" deps-check CC=false 2>&1)"
