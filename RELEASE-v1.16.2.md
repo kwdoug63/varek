@@ -94,6 +94,10 @@ the Warden host cannot set that time.
 - **How the audit uses it.** The audit reports each record's delay: its
   receive time against the time in the stream's own signed record.
   `--max-anchor-delay` turns a long delay into a failure.
+- **Clocks.** Keep both hosts' clocks synchronised (NTP). A record that
+  appears received more than 5 s before it was written fails the run, since
+  that can only mean a wrong clock or a forged line; `--clock-slack SECONDS`
+  changes the 5 s.
 - **What it cannot prove.** Someone who holds the key and withholds records
   can rewrite them with new times before releasing them. The receive time
   bounds when a record was anchored, not when it was created.
@@ -177,7 +181,7 @@ Then run the Warden with `--anchor /run/varek/anchor.fifo`.
   - `tools/varek_anchor_forward.py` (Python 3 standard library only);
   - `tools/varek_anchor_receiver.sh`;
   - `tools/systemd/varek-anchor-forward.service`;
-  - `varek_audit.py --list-runs` and `--max-anchor-delay`;
+  - `varek_audit.py --list-runs`, `--max-anchor-delay` and `--clock-slack`;
   - in the preflight, the forwarder liveness check, `--spool`, the delivery
     check, and the warnings for a local-file anchor and an on-host key;
   - `make test-v1162`.
@@ -246,7 +250,7 @@ produces EPIPE `anchor_error` records. The Warden holds the FIFO, so the
 records wait in the pipe, and at exit it reports what no reader took.
 `test_v1160.sh` checks that report instead.
 
-**Independent review.** Two rounds. The first found:
+**Independent review.** Three rounds. The first found:
 
 - a public key with an embedded newline gave an unrestricted shell on the
   anchor host;
@@ -270,12 +274,23 @@ The second found:
 - torn lines on a full disk;
 - the receiver left partial state behind on refusal.
 
+The third found only low-severity issues, all fixed:
+
+- two liveness probes running at once (the Warden's and the preflight's)
+  could each see the other's lock and report a live forwarder as dead; the
+  probes now take a shared lock, which conflicts only with the forwarder's,
+  and a starting forwarder retries its lock for 2 s;
+- the negative-delay check assumed synchronised clocks without saying so
+  (now documented, with `--clock-slack`);
+- a full spool disk logged a warning for every line (now once per 30 s).
+
 All are fixed and covered above.
 
 ## Requirements
 
 - **Warden:** unchanged dependencies.
 - **Forwarder:** Python 3, plus the OpenSSH client for `--ssh`.
+- **Both hosts:** synchronised clocks (NTP; see Receive times).
 - **Receiver:**
   - OpenSSH server;
   - `useradd`, `flock`, GNU `date` (nanoseconds) and `ssh-keygen`;

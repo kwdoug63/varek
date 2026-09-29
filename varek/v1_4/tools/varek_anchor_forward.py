@@ -106,6 +106,7 @@ class Spool:
         self.offp = os.path.join(d, "sent.offset")
         self.fd = _open_nofollow(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
         self.held = []                   # lines read but not yet written (disk full)
+        self.last_warn = -1e9
 
     def append(self, lines):
         """Write lines (plus any held back earlier). On a write error (disk
@@ -128,8 +129,11 @@ class Spool:
                 os.ftruncate(self.fd, start)
             except OSError:
                 pass
-            log(f"cannot write the spool ({e.strerror}); {len(self.held)} line(s) held in memory, "
-                f"FIFO reads paused")
+            now = time.monotonic()
+            if now - self.last_warn >= 30:
+                self.last_warn = now
+                log(f"cannot write the spool ({e.strerror}); {len(self.held)} line(s) held in memory, "
+                    f"FIFO reads paused")
             return False
         self.held = []
         return True
@@ -203,9 +207,13 @@ def open_fifo(path):
     # test it to tell a live forwarder from a FIFO merely held open (another
     # Warden holds its anchor FIFO read-write).
     lk = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-    try:
-        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    for i in range(40):                   # a probe holds a shared lock for a moment
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            time.sleep(0.05)
+    else:
         raise SystemExit(f"varek_anchor_forward: another forwarder holds {path}.lock")
     return fd, lk
 

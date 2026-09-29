@@ -1953,7 +1953,9 @@ static int forwarder_alive(const char *fifo) {
     int fd = open(lp, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return -1;
     snprintf(g_anchor_lock, sizeof g_anchor_lock, "%s", lp);
-    int r = flock(fd, LOCK_EX | LOCK_NB) == 0 ? 0 : (errno == EWOULDBLOCK ? 1 : -1);
+    /* A shared probe: it conflicts only with the forwarder's exclusive lock,
+     * never with another probe. */
+    int r = flock(fd, LOCK_SH | LOCK_NB) == 0 ? 0 : (errno == EWOULDBLOCK ? 1 : -1);
     close(fd);                                   /* releases it if we took it */
     return r;
 }
@@ -2024,7 +2026,7 @@ static void anchor_drain(void) {
         if (g_anchor_lock[0]) {
             int fd = open(g_anchor_lock, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
             if (fd >= 0) {
-                int busy = flock(fd, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+                int busy = flock(fd, LOCK_SH | LOCK_NB) != 0 && errno == EWOULDBLOCK;
                 close(fd);
                 if (busy) return;
             }

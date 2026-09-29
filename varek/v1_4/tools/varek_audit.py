@@ -141,7 +141,7 @@ def log_integrity(a, meta, run, complete, problems):
     if a.anchor:
         before = len(problems)
         skey = pk if stream_key is not None and _hex_key(stream_key) else None
-        CLOCK_SLACK = 5.0
+        CLOCK_SLACK = a.clock_slack
         lines, other_runs, unparsed = read_anchor(a.anchor, problems)
         mine = [e for e in lines if e.get("run") == run]
         other_runs.discard(run)
@@ -317,6 +317,9 @@ def main(argv=None):
     ap.add_argument("--max-anchor-delay", type=float, metavar="SECONDS",
                     help="fail if any record reached the anchor later than this after it was "
                          "written (needs a v1.16.2 receiver's receive times)")
+    ap.add_argument("--clock-slack", type=float, default=5.0, metavar="SECONDS",
+                    help="how far the anchor host's clock may run behind the Warden host's "
+                         "(default 5): a record received earlier than that before it was written fails")
     ap.add_argument("--list-runs", action="store_true",
                     help="with --anchor: list every run the anchor holds, then exit")
     ap.add_argument("log", nargs="?")

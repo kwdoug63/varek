@@ -121,7 +121,9 @@ case "${1:-}" in *[!A-Za-z0-9._-]*|"") exit 2 ;; esac
 f="${VAREK_ANCHOR_DIR:-/srv/varek-anchor}/$1.anchor.log"
 tmp="$(mktemp)" || exit 3
 trap 'rm -f "$tmp" "$tmp.ok"' EXIT
-head -c 4194304 > "$tmp" || exit 3                     # a batch is at most 1 MiB
+# The forwarder sends at most 1 MiB per batch; anything past 4 MiB is not
+# read (and so not stored), and the forwarder would send it again.
+head -c 4194304 > "$tmp" || exit 3
 re='^\{"run":"[0-9a-f]{32}","event":"(run_start|checkpoint|run_end)","records":(0|[1-9][0-9]{0,19}),"chain":"[0-9a-f]{64}"(,"sig":"[0-9a-f]{128}")?,"timestamp_ns":(0|[1-9][0-9]{0,18})\}$'
 LC_ALL=C grep -E "$re" "$tmp" > "$tmp.ok"; rc=$?
 [ "$rc" -le 1 ] || exit 4

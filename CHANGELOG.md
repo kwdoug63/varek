@@ -89,7 +89,8 @@ decisions, records or the policy grammar.
   an existing account that is not its own, root, and a filesystem without
   `chattr +a` (unless `--allow-no-chattr`).
 - Audit: `--list-runs`, `--max-anchor-delay` (measured from the stream's signed
-  times); a record is anchored if any validly signed line matches it;
+  times), `--clock-slack` (default 5 s: a record received more than this before
+  it was written fails the run, so both hosts need synchronised clocks); a record is anchored if any validly signed line matches it;
   unsigned, conflicting and malformed lines are noted and ignored; a signed
   line for a record the stream lacks fails the run unless it arrived after the
   run's run_end was anchored.
