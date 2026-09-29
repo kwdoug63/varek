@@ -25,7 +25,7 @@ CFLAGS    += -I$(V1_7_DIR)
 
 BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen
 
-.PHONY: all deps deps-check preflight clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 crosscheck harness video-v112
+.PHONY: all deps deps-check preflight clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -211,6 +211,15 @@ test-v1160: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen tests
 test-v1161: warden tools/vdp_cert_check tools/varek_keygen
 	@sudo ./tests/test_v1161.sh ./warden ./tools/vdp_cert_check
 
+# v1.17.0: the signing key, stream and anchor refused by identity (through a
+# bind mount into the allowed tree); raw devices refused; stat/access/readlink
+# mediated, recorded and audited; the agent unprivileged (--run-as).
+tests/v1170_probe: tests/v1170_probe.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $<
+
+test-v1170: warden tools/vdp_cert_check tools/varek_keygen tests/v1170_probe
+	@sudo ./tests/test_v1170.sh ./warden ./tools/vdp_cert_check ./tools/varek_keygen $(abspath tests/v1170_probe)
+
 # v1.16.2: the off-host anchor. A receiver behind a private sshd on
 # 127.0.0.1:2222 and the forwarder: a run anchored off-host audits "signed,
 # anchored"; the receiver only appends; an outage loses nothing; preflight
@@ -252,4 +261,4 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe warden_faultinject tests/test_v14_filter
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe warden_faultinject tests/test_v14_filter

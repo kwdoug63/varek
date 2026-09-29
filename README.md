@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.16.3-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.17.0-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -30,7 +30,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.16.3.**
+   **Current release: v1.17.0.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -83,6 +83,7 @@ The runtime line has progressed well beyond simple syscall containment:
   a deterministic, automated terminal outcome is reachable in finitely many steps.
   "Never requires a human" becomes certified rather than hoped.
 - **v1.16.2 — off-host anchor.** An anchor on the Warden's own host does not protect against that host's root, who also holds the signing key. `tools/varek_anchor_forward.py` sends each checkpoint off the host within about a second (spooling through outages) to an append-only receiver set up by `tools/varek_anchor_receiver.sh` — an SSH account that can only append well-formed anchor lines to a `chattr +a` file — or to any command. The preflight now checks the forwarder is running and warns when the anchor or the key leave that gap open. See [`RELEASE-v1.16.2.md`](./RELEASE-v1.16.2.md).
+- **v1.17.0 — closing three live gaps.** The signing key, the anchor and the verdict stream are refused by identity (device and inode) on every open and lookup, so a bind mount or hard link into an allowed tree no longer reaches them; raw storage and memory devices are refused the same way whatever the policy says. `stat`, `statx`, `access` and `readlink` are mediated like opens: decided, certified, recorded and answered by the Warden, where they were admitted and unlogged. The agent runs as an unprivileged user with no capabilities (`--run-as`, default `nobody`), where it ran as root with every capability. Adds `make test-v1170`. See [`RELEASE-v1.17.0.md`](./RELEASE-v1.17.0.md).
 - **v1.16.3 — the Verdict Service's plan checker, in the repository.** `v1_6/plan_verify_cli.c` (`make -C v1_6 plan_verify`) is the file-in / JSON-out front end the VAREK Verdict Service runs; its source had existed only on the service host. Its JSON output is now escaped: before, a crafted target could make the output read as SATISFIED when the evaluator had decided UNSATISFIED. See [`RELEASE-v1.16.3.md`](./RELEASE-v1.16.3.md).
 - **v1.16.1 — deployment preflight.** `tools/varek_preflight.sh` checks a deployment before it runs: the build dependencies (libsodium is new in v1.16; `make deps` installs them), the build, the policy, and every location the Warden refuses at startup — the verdict stream file, the signing key, the anchor — checked with the Warden's own rules, plus an optional audited trial run. All seven shipped policies pass with the stream in `/var/log/varek/`. A CI job builds the Warden with libseccomp and libsodium. See [`RELEASE-v1.16.1.md`](./RELEASE-v1.16.1.md).
 - **v1.16.0 — a verdict stream its holder cannot rewrite, and a bound on every decision.** Addresses the two limits v1.15.0 disclosed. Every record is hash-chained; with `--sign-key`, run_start, a checkpoint every 64 records and run_end are signed with Ed25519; with `--anchor`, each checkpoint is also appended to storage the log's holder cannot rewrite. `tools/varek_audit.py --pubkey --anchor` then catches any edit, insertion, removal or reordering before the last signature, and a stream cut short, by someone without the key, and any rewrite of anchored history even by someone with it; it verifies signatures with its own pure-Python RFC 8032 verifier. The Warden refuses to start if the policy would let the agent open the key, the anchor, the verdict stream itself or a raw disk. Globs are capped at 4,096 tokens per policy, which bounds the work of one decision; the worst case measured is about 26 ms median in the live Warden (v1.15's checker alone: 415 ms), and real policies are unchanged. See [`RELEASE-v1.16.0.md`](./RELEASE-v1.16.0.md).
@@ -106,7 +107,7 @@ The runtime line has progressed well beyond simple syscall containment:
   are deny-only (fail closed) pending the v1.10 dial-and-inject path. See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.16.3 history.
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.17.0 history.
 
 ### Installation
 
@@ -354,6 +355,7 @@ different risks at different points in the stack.
 - [x] **v1.16.1** — Deployment preflight (dependencies, build, stream/key/anchor locations, trial run); libsodium build check and CI job
 - [x] **v1.16.2** — Off-host anchor: forwarder (FIFO → spool → SSH or any command), append-only receiver, systemd unit; preflight checks
 - [x] **v1.16.3** — Verdict Service plan checker (`plan_verify`) in the repository; JSON output escaped
+- [x] **v1.17.0** — Protected files refused by identity; stat/access/readlink mediated; agent unprivileged
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
 
@@ -454,7 +456,7 @@ platform-gating CI coverage (now macOS, Windows, Linux).
 ## Documentation
 
 - **Spec paper:** [`varek-spec-paper-v1.12.md`](./varek-spec-paper-v1.12.md) — language and runtime specification, design rationale, the verdict model
-- **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`docs/security/bypass-classes.md`](./docs/security/bypass-classes.md), [`RELEASE-v1.12.1.md`](./RELEASE-v1.12.1.md), [`RELEASE-v1.12.0.md`](./RELEASE-v1.12.0.md), [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md), [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
+- **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`docs/security/bypass-classes.md`](./docs/security/bypass-classes.md), [`RELEASE-v1.17.0.md`](./RELEASE-v1.17.0.md), [`RELEASE-v1.12.1.md`](./RELEASE-v1.12.1.md), [`RELEASE-v1.12.0.md`](./RELEASE-v1.12.0.md), [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md), [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
 - **Verification notes:** [`docs/verification/`](./docs/verification/README.md) — the v1.10/v1.11 program
 - **Changelog:** [`CHANGELOG.md`](./CHANGELOG.md)
 - **Website:** [varek-lang.org](https://varek-lang.org)
