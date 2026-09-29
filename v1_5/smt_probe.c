@@ -2,7 +2,7 @@
 /*
  * smt_probe.c — feasibility benchmark for SMT-discharged policy decisions
  *
- * Goal: measure end-to-end latency of a single SMT decision using Z3's
+ * Goal: measure end-to-end latency of a single SMT decision using an off-the-shelf SMT solver's
  *       string theory, to determine whether the architecture can support
  *       SMT-based policy_decide() within the deck's stated latency budget.
  *
@@ -19,7 +19,7 @@
  *
  * Each iteration:
  *   - Picks an input from a varied workload (matching, non-matching, edge case)
- *   - Builds Z3 AST from scratch (worst-case; no caching)
+ *   - Builds the solver's AST from scratch (worst-case; no caching)
  *   - Calls Z3_solver_check
  *   - Records CLOCK_MONOTONIC latency in microseconds
  *   - Emits a JSON pathology record compatible with bench_summarize.py
@@ -34,7 +34,7 @@
  * Run:      ./smt_probe [iterations]   2> bench.log
  *           python3 bench_summarize.py bench.log
  *
- * Requires: libz3-dev (Z3 C API), Linux >= 5.14, Ubuntu 24.04 or similar.
+ * Requires: the solver's C library (make deps), Linux >= 5.14, Ubuntu 24.04 or similar.
  */
 
 #ifndef _GNU_SOURCE
@@ -84,7 +84,7 @@ static const char *decision_name(decision_t d) {
 }
 
 /*
- * Build the Z3 AST and check satisfiability.
+ * Build the solver AST and check satisfiability.
  *
  * One context per call (worst case; no reuse). This measures the floor cost
  * of a single decision with zero caching. Real production code would reuse
@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
     fprintf(stderr,
         "[smt_probe] rule_prefix=%s  iterations=%d  workload_size=%zu\n",
         RULE_PREFIX, iter, WORKLOAD_N);
-    fprintf(stderr, "[smt_probe] Z3 version: ");
+    fprintf(stderr, "[smt_probe] solver version: ");
     {
         unsigned major, minor, build, rev;
         Z3_get_version(&major, &minor, &build, &rev);
@@ -146,7 +146,7 @@ int main(int argc, char **argv) {
     }
     fflush(stderr);
 
-    /* Warmup: Z3's first call pays library-init cost we don't want to count. */
+    /* Warmup: The solver's first call pays library-init cost we don't want to count. */
     (void)smt_decide("/warmup", RULE_PREFIX);
     (void)smt_decide("/tmp/varek_allowed_warmup", RULE_PREFIX);
 

@@ -381,7 +381,8 @@ def test_pep578_hook_does_not_deny_dangerous_events():
     enforce_strict_mode()
 
     observed = []
-    subscribe_telemetry(lambda r: observed.append(r["event"]))
+    # Callbacks receive (event, args), as subscribe_telemetry() documents.
+    subscribe_telemetry(lambda event, args: observed.append(event))
 
     import subprocess
     # This runs OUTSIDE the sandbox — we're testing the parent's own hook,

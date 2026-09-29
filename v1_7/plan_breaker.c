@@ -11,6 +11,8 @@
 
 #include "plan_breaker.h"
 
+#include <inttypes.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -53,6 +55,23 @@ uint64_t plan_breaker_signature(const plan_action_desc_t *actions,
             h = fnv1a_str(h, a->named_args[j].key);
             h = fnv1a_str(h, a->named_args[j].value);
         }
+    }
+    return h;
+}
+
+uint64_t plan_breaker_signature_graph(const plan_action_desc_t *actions,
+                                      size_t n_actions,
+                                      const uint32_t *edge_from,
+                                      const uint32_t *edge_to,
+                                      size_t n_edges)
+{
+    uint64_t h = plan_breaker_signature(actions, n_actions);
+    uint64_t ne = (uint64_t)n_edges;
+    h = fnv1a(h, "edges", 5);
+    h = fnv1a(h, &ne, sizeof ne);
+    for (size_t i = 0; edge_from && edge_to && i < n_edges; i++) {
+        uint32_t e[2] = { edge_from[i], edge_to[i] };
+        h = fnv1a(h, e, sizeof e);
     }
     return h;
 }
@@ -221,6 +240,105 @@ plan_breaker_result_t plan_breaker_step(plan_breaker_t *b,
     e->latched_action  = r.terminal_action;
     r.latched          = true;
     return r;
+}
+
+/* ---------- Persistence (v1.18.0) ---------- */
+
+static int hexval(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+int plan_breaker_save(const plan_breaker_t *b, FILE *out)
+{
+    if (!b || !out) return -1;
+    if (fprintf(out, "varek-breaker 1\n") < 0) return -1;
+    for (size_t i = 0; i < b->n; i++) {
+        const entry_t *e = &b->entries[i];
+        if (!e->session[0]) {
+            if (fputc('-', out) == EOF) return -1;
+        } else {
+            for (const unsigned char *c = (const unsigned char *)e->session; *c; c++)
+                if (fprintf(out, "%02x", *c) < 0) return -1;
+        }
+        if (fprintf(out, " %016" PRIx64 " %u %d %d %s\n",
+                    e->signature, e->refusals, e->latched ? 1 : 0,
+                    (int)e->latched_outcome,
+                    e->latched_action ? e->latched_action : "-") < 0)
+            return -1;
+    }
+    return fflush(out) == 0 ? 0 : -1;
+}
+
+static const char *known_action(const plan_label_policy_config_t *cfg, const char *name)
+{
+    plan_disposition_t d[2] = {
+        plan_label_policy_config_on_exhaustion(cfg),
+        plan_label_policy_config_unknown_disposition(cfg),
+    };
+    for (int i = 0; i < 2; i++)
+        if (d[i].kind == PLAN_DISP_TERMINAL && d[i].action_name &&
+            strcmp(d[i].action_name, name) == 0)
+            return d[i].action_name;
+    return NULL;
+}
+
+int plan_breaker_load(plan_breaker_t *b, FILE *in,
+                      const plan_label_policy_config_t *cfg)
+{
+    if (!b || !in || !cfg || b->n != 0) return -1;
+    char line[1024];
+    if (!fgets(line, sizeof line, in) || strcmp(line, "varek-breaker 1\n") != 0)
+        return -1;
+    while (fgets(line, sizeof line, in)) {
+        size_t len = strlen(line);
+        if (len == 0 || line[len - 1] != '\n') return -1;   /* over-long or cut */
+        line[len - 1] = '\0';
+        char sess_hex[520], action[256];
+        char sig_hex[17];
+        unsigned refusals;
+        int latched, outcome;
+        char tail;
+        if (sscanf(line, "%519s %16s %u %d %d %255s %c", sess_hex, sig_hex,
+                   &refusals, &latched, &outcome, action, &tail) != 6)
+            return -1;
+        if (strlen(sig_hex) != 16 || (latched != 0 && latched != 1) ||
+            (outcome != PLAN_BREAKER_TERMINAL_DENY && outcome != PLAN_BREAKER_TERMINAL_ACTION))
+            return -1;
+        uint64_t sig = 0;
+        for (int i = 0; i < 16; i++) {
+            int v = hexval(sig_hex[i]);
+            if (v < 0) return -1;
+            sig = (sig << 4) | (uint64_t)v;
+        }
+        char session[260];
+        if (strcmp(sess_hex, "-") == 0) {
+            session[0] = '\0';
+        } else {
+            size_t hl = strlen(sess_hex);
+            if (hl % 2 || hl / 2 >= sizeof session) return -1;
+            for (size_t i = 0; i < hl / 2; i++) {
+                int hi = hexval(sess_hex[2 * i]), lo = hexval(sess_hex[2 * i + 1]);
+                if (hi < 0 || lo < 0 || (hi == 0 && lo == 0)) return -1;
+                session[i] = (char)(hi * 16 + lo);
+            }
+            session[hl / 2] = '\0';
+        }
+        if (find_entry(b, session, sig)) return -1;          /* duplicate */
+        entry_t *e = intern_entry(b, session, sig);
+        if (!e) return -1;
+        e->refusals = refusals;
+        e->latched  = latched == 1;
+        e->latched_outcome = (plan_breaker_outcome_t)outcome;
+        e->latched_action  = NULL;
+        if (e->latched && outcome == PLAN_BREAKER_TERMINAL_ACTION) {
+            e->latched_action = strcmp(action, "-") ? known_action(cfg, action) : NULL;
+            if (!e->latched_action) e->latched_outcome = PLAN_BREAKER_TERMINAL_DENY;
+        }
+    }
+    return ferror(in) ? -1 : 0;
 }
 
 const char *plan_breaker_outcome_name(plan_breaker_outcome_t o)

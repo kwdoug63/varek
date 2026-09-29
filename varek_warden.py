@@ -4,6 +4,9 @@
 #   configure_backend(backend)   — install the active isolation backend
 #   execute_untrusted(payload, policy) — run untrusted code under containment
 #   subscribe_telemetry(callback) — register a PEP 578 advisory callback
+# and keeps the two v1.0 names the v1.1 CHANGELOG promised to keep:
+#   enforce_strict_mode()        — arms the PEP 578 hook, telemetry only
+#   KineticIntercept             — deprecated exception, never raised
 #
 # This module is pure orchestration. All kernel-level enforcement lives
 # in sandbox.py (SeccompBpfBackend and the IsolationBackend interface).
@@ -21,6 +24,13 @@ from sandbox import (
 _active_backend: Optional[IsolationBackend] = None
 _telemetry_subscribers: list[Callable] = []
 _audit_hook_installed: bool = False
+
+
+class KineticIntercept(Exception):
+    """Deprecated (v1.1). The v1.0 audit hook raised this to deny an event.
+    Kept importable so v1.0 code does not break at import time; nothing raises
+    it any more. Enforcement failures surface as sandbox.IsolationError.
+    To be removed in v2.0."""
 
 
 def configure_backend(backend: IsolationBackend) -> None:
@@ -75,6 +85,22 @@ def subscribe_telemetry(callback: Callable[[str, tuple], None]) -> None:
     """
     global _audit_hook_installed
     _telemetry_subscribers.append(callback)
+    if not _audit_hook_installed:
+        import sys
+        sys.addaudithook(_dispatch_telemetry)
+        _audit_hook_installed = True
+
+
+def enforce_strict_mode() -> None:
+    """v1.0 entry point, kept by name and signature (v1.1 CHANGELOG).
+
+    In v1.1 and later it only arms the process-wide PEP 578 audit hook as
+    advisory telemetry: the hook observes events and hands them to the
+    subscribe_telemetry() callbacks, but it never raises and never denies.
+    It provides no containment. Call configure_backend() and run untrusted code
+    through execute_untrusted() for that. Calling it more than once is harmless.
+    """
+    global _audit_hook_installed
     if not _audit_hook_installed:
         import sys
         sys.addaudithook(_dispatch_telemetry)

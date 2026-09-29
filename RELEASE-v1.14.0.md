@@ -210,7 +210,7 @@ pairs, with zero differences.
 
 Two lessons from the oracle itself:
 
-- Z3's string literal constructor decodes `\u{..}` escape sequences. A path
+- The reference solver's string literal constructor decodes `\u{..}` escape sequences. A path
   containing that text was compared as a different string, and a 4,201-byte
   string passed its length guard. The cross-check now escapes every backslash.
 - The solver's regex theory answers unbounded reachability instantly, but not
@@ -389,7 +389,7 @@ decided".
   release:
   - malformed matcher lines loading as prefix rules;
   - sector rules that missed case, depth and file variants;
-  - Z3 escape decoding in the oracle;
+  - the solver's escape decoding in the oracle;
   - unverified UNKNOWN reasons;
   - worst-case decision and analysis cost;
   - parser corner cases.
@@ -398,6 +398,7 @@ decided".
 
 Runtime: unchanged from v1.13.0 (Linux ≥ 5.14, `pidfd_getfd`, `CAP_SYS_ADMIN`,
 x86_64). The solver is not a runtime dependency. The cross-check and
-`make test-v1140` also need `python3` and the `z3-solver` package. The
+`make test-v1140` also need `python3` and the reference solver's package
+(`tools/requirements-crosscheck.txt` since v1.18.0). The
 compatibility section of `make test-v1140` needs `git` and the `v1.13.0` tag, and
 is skipped without them.

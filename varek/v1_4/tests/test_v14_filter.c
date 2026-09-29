@@ -50,6 +50,9 @@ static int run_probe(const char *what) {
         // v1.12.2: a removed-ABI call from a non-main thread kills the whole
         // process (badarch = KILL_PROCESS), not just that thread.
         if (!strcmp(what, "x32_in_thread")){ pthread_t t; if (pthread_create(&t,NULL,x32_thread,NULL)) _exit(85); pthread_join(t,NULL); _exit(62); }
+        // v1.18.0: io_uring (bypass class 3, closed in v1.9.1) under the live
+        // filter; its instance creation is hard-denied, so the process dies.
+        if (!strcmp(what, "io_uring_setup")){ r = syscall(425,1,(void*)0); _exit(r>=0?60:63); }
         if (!strcmp(what, "x32"))         { r = syscall(SYS_getpid|__X32_SYSCALL_BIT); _exit(r>=0?70:0); }
         _exit(99);
     }
@@ -72,6 +75,7 @@ int main(void) {
         { "ioctl_tcgets",  "allow" },
         { "ioctl_tiocsti", "deny"  },
         { "x32_in_thread", "killed" },
+        { "io_uring_setup","killed" },
     };
     int fails = 0;
     for (size_t i = 0; i < sizeof t/sizeof t[0]; ++i) {

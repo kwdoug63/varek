@@ -1,0 +1,8 @@
+# Python packages the regression tests need (v1.18.0).
+#   pip install -r tools/requirements-test.txt
+#
+# CycloneDX 1.6 schema validation of the exporter's output (make test-v1180):
+# the OWASP CycloneDX project's schemas and validator. rfc3987 turns on "uri"
+# format checking, which the JSF signature schema needs.
+cyclonedx-python-lib[json-validation]>=8
+rfc3987>=1.3

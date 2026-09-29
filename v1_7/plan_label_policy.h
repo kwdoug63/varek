@@ -100,6 +100,12 @@ typedef struct plan_label_policy {
  * the arg's value matches the glob pattern. All constraints on a
  * rule must hold (AND). Pointers are borrowed from the policy
  * owner. */
+/* v1.18.0: a key of the form <arg>.scheme, <arg>.host, <arg>.port or
+ * <arg>.path matches the pattern against that component of the named arg
+ * <arg>, parsed strictly as an absolute URL (a URL with userinfo, a bad host
+ * or a bad port matches nothing). Use `url.host` to allow a set of hosts: a
+ * glob over the whole URL cannot, because '*' also matches '/', '?', '#' and
+ * '@'. Component values are lower-cased for scheme and host. */
 typedef struct plan_label_rule_match {
     const char *key;        /* named-arg key the action must carry */
     const char *pattern;    /* shell-style glob: * = any chars, ? = one char */

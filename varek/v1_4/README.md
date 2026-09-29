@@ -20,7 +20,10 @@ For each notification, the Warden:
    raw syscall number, arguments, and per-pid Execution Context.
 3. Evaluates the Action against the configured policy, returning
    `ALLOW`, `DENY`, or `UNKNOWN`. `DENY` and `UNKNOWN` both surface
-   to the kernel as `EPERM` (symmetric suppression).
+   to the agent as `EACCES` (symmetric suppression), and the record's
+   `kernel_verdict` says `EACCES`. A system call the filter does not
+   admit or mediate at all is refused by the filter itself with `EPERM`
+   and is not recorded.
 4. For path-argument syscalls on `ALLOW`, resolves the path itself
    with `openat2(RESOLVE_NO_MAGICLINKS)` rooted at `/proc/<pid>/cwd`
    (ordinary symlinks followed since v1.12.3, deciding on the object's
@@ -313,6 +316,39 @@ Who can do what, afterwards:
 - **The anchor host's root** can lift the append-only attribute, so keep that
   machine under separate control.
 
+## Plan gate (v1.6, v1.18.0)
+
+`--plan <plan.txt>` checks a declared action-graph before the agent starts; the
+agent is not started unless it is SATISFIED. Each `file_open` step is decided
+by the SMT decision procedure on its lexically canonical path. A `net_connect`
+or `process_exec` step is UNSATISFIED, since v1.18.0: the runtime refuses every
+connect and every launch after the agent's own, whatever the policy says, so a
+plan that needs one cannot run as declared.
+
+`--flow-policy <cfg>` (v1.18.0) adds, in a label policy in the v1.7 format
+(`v1_7/example_policy.cfg`):
+
+- **the data-flow check (v1.7).** Steps reach the flow policy as actions named
+  by their kind, with one argument, `target`: for a `file_open`, the canonical
+  path. A plan whose edges carry a sticky label to a step that denies it is
+  refused, and `[warden] plan flow pathology:` names the flow.
+- **the refusal breaker (v1.8.2).** Each refused plan counts against
+  (`--session <id>`, the plan's signature: its steps and its edges), in a state
+  file the Warden owns (`--breaker-state`, default
+  `/var/lib/varek/breaker.state`; 0600, not a symlink, locked while in use,
+  protected from the agent by identity like the signing key). After the
+  policy's `refusal_budget` the outcome latches to its `on_exhaustion`
+  disposition; an UNKNOWN goes straight to `unknown_disposition`. A state file
+  that cannot be read back refuses the plan.
+- **the progress-safety check (v1.9).** At startup: the Warden refuses to start
+  unless every refusal ends in an automated outcome, and unless the policy
+  declares a `refusal_budget` (the Warden's own policy can always refuse).
+
+Exit status: 0 the agent ran; 3 refused, the host may submit a different plan;
+4 terminal deny; 5 terminal, and the message names the pre-authorized action
+the host must run. A `plan_gate` record in the verdict stream holds both axes,
+the breaker's outcome and the counts.
+
 ## Threat model
 
 - **Supervised process**: fully adversarial. May spawn `CLONE_VM`
@@ -337,10 +373,11 @@ In scope:
 - Sockaddr inspection for `connect`.
 - Path-based decisions for `execve` and `execveat`.
 - JSON pathology records with measured decision latency.
+- Whole-plan verification before launch (`--plan`), with the data-flow check,
+  refusal breaker and progress-safety check under `--flow-policy` (v1.18.0).
 
 Tracked separately, not part of this release:
 
-- Workflow-graph (whole-plan) verification.
 - BPF-LSM enforcement path.
 - Compliance-framework mappings in pathology output.
 - Multi-host coordination.

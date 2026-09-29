@@ -25,9 +25,19 @@ unmerged specification proposal):
     three provisional-patent references as properties.
   * metadata.component — the supervised agent run (application), carrying the
     policy identity and the run window as properties.
-  * annotations[] — one machine- and human-readable authorization attestation:
-    the verdict distribution, the authorized/refused counts, and the
-    Authorization-Before-Execution invariant that held for the run.
+  * annotations[] — one machine- and human-readable authorization attestation.
+    v1.18.0: every sentence in it is derived from the stream (the counts, the
+    UNKNOWN verdicts and what became of them, which authorizations name a
+    resolved object and carry an accepted certificate, the plan gate's
+    decision, whether the stream is chained), and it says which system calls
+    the record covers. Through v1.17.0 most of it was fixed wording, including
+    "no action reached the kernel without a verdict", which is not true of the
+    calls the filter admits without asking the Warden. If the records break an
+    invariant the text would state (an UNKNOWN that was authorized), the
+    exporter refuses to attest.
+  * signature — v1.18.0, with --sign-key: an Ed25519 signature over the whole
+    BOM in the JSON Signature Format (JSF) that CycloneDX 1.6 defines, made
+    with the Warden's log key (tools/varek_keygen). --verify checks one.
   * components[] — one component per DISTINCT resolved object the agent was
     authorized to reach, each with the deciding rule as a property. Refused
     actions are summarized in the annotation, not minted as components (a
@@ -40,7 +50,13 @@ emits stable 1.6 today and leaves that binding for a 2.0 target.
 
 Usage:
     varek_cyclonedx.py --log bench.log --agent ./target_demo --policy policy.txt \
-        [--output bom.json] [--serial urn:uuid:...]
+        [--output bom.json] [--serial urn:uuid:...] [--sign-key log.key]
+    varek_cyclonedx.py --verify bom.json [--pubkey log.key.pub]
+
+--policy names the policy for the record. When it is a readable file, its
+SHA-256 must equal the policy_sha256 the Warden recorded in run_start (v1.15+),
+or the exporter refuses: the BOM would otherwise name a policy the Warden did
+not decide with.
 
 Reads the log from --log or stdin. Writes the BOM to --output or stdout.
 Exit status is non-zero when the stream cannot be authenticated (see
@@ -49,14 +65,21 @@ valid, well-formed authorization record).
 """
 
 import argparse
+import base64
+import ctypes
+import ctypes.util
 import datetime as _dt
 import hashlib
 import json
+import os
 import re
 import sys
 import uuid
 
-VAREK_VERSION = "1.17.0"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import varek_ed25519  # noqa: E402  (pure-Python RFC 8032 verification)
+
+VAREK_VERSION = "1.18.0"
 SPEC_VERSION = "1.6"
 
 # The provisional patents, as recorded in the runtime's own documentation.
@@ -197,7 +220,12 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
                 meta["run_start"] = rec      # v1.15: policy_sha256, for the audit
             continue
         if "decision_final" not in rec and event != "run_end":
-            continue   # e.g. a pre-launch plan record; carries no authorization
+            # e.g. a pre-launch plan record; carries no authorization. v1.18.0:
+            # this run's plan_gate record (chained above) goes to the attestation.
+            if event == "plan_gate" and run is not None and rec.get("run") == run \
+                    and meta is not None:
+                meta["plan_gate"] = rec
+            continue
         if run is None:
             fail(lineno, "record before run_start (a pre-v1.12.1 log, or not a "
                          "Warden stream); its records cannot be authenticated.")
@@ -240,8 +268,98 @@ def _ts(records):
     return fmt(start), fmt(end)
 
 
+FILE_ACTIONS = ("file.open", "file.stat", "file.access", "file.readlink")
+
+
+def _scope(warden_version):
+    """What the Warden records, by version: which calls it decides."""
+    mediated = "file opens, connects, program launches and datagram sends"
+    if _version_at_least(warden_version, (1, 17)):
+        mediated = ("file opens and file lookups (stat, access, readlink), connects, "
+                    "program launches and datagram sends")
+    return (f"The record covers the system calls this Warden version pauses and "
+            f"decides: {mediated}. Calls the kernel filter admits without asking the "
+            f"Warden (reads and writes on descriptors already held, memory, time, "
+            f"threads) and calls it refuses outright are not recorded.")
+
+
+def attestation(records, authorized, refused, dist, policy, run_start, run_end,
+                warden_version, complete, log_info, plan_gate, policy_check):
+    """v1.18.0: the attestation text and its facts, each derived from the
+    stream. Raises StreamError when the records break an invariant the text
+    would otherwise assert."""
+    unknown = [r for r in records if r.get("decision_raw") == "UNKNOWN"]
+    unknown_allowed = [r for r in unknown if r.get("decision_final") == "ALLOW"]
+    if unknown_allowed:
+        raise StreamError(
+            f"varek_cyclonedx: {len(unknown_allowed)} record(s) turn an UNKNOWN verdict "
+            f"into ALLOW (first: seq {unknown_allowed[0].get('seq')}); the stream breaks "
+            f"symmetric suppression. Refusing to emit a BOM.")
+    auth_files = [r for r in authorized if r.get("action") in FILE_ACTIONS]
+    resolved = [r for r in auth_files if r.get("resolved")]
+    certified = [r for r in authorized if r.get("check") == "ok"]
+    cert_refused = [r for r in records if r.get("check") == "refused"]
+
+    parts = [f"VAREK authorization record for policy '{policy}' "
+             f"(SHA-256 {policy_check}).",
+             f"{len(records)} decision(s) recorded between {run_start} and {run_end}: "
+             f"{len(authorized)} authorized, {len(refused)} refused."
+             + ("" if complete else " The stream has no run_end: the run did not "
+                "finish, or the record was cut."),
+             "Raw verdicts: " + (", ".join(f"{k}={v}" for k, v in sorted(dist.items()))
+                                 or "none") + "."]
+    if unknown:
+        parts.append(f"All {len(unknown)} UNKNOWN verdict(s) were refused "
+                     f"(symmetric suppression).")
+    else:
+        parts.append("No UNKNOWN verdicts.")
+    if auth_files:
+        if len(resolved) == len(auth_files):
+            parts.append(f"All {len(auth_files)} authorized file decision(s) name the "
+                         f"resolved canonical object they were made on.")
+        else:
+            parts.append(f"{len(resolved)} of {len(auth_files)} authorized file "
+                         f"decision(s) name a resolved object; the others predate "
+                         f"resolve-then-decide (v1.12) or did not record it.")
+    if authorized:
+        parts.append(f"{len(certified)} of {len(authorized)} authorization(s) carry a "
+                     f"certificate the independent checker accepted"
+                     + (" (certificates start in v1.15)." if len(certified) < len(authorized)
+                        and not _version_at_least(warden_version, (1, 15)) else "."))
+    if cert_refused:
+        parts.append(f"The checker refused {len(cert_refused)} certificate(s); those "
+                     f"actions were refused.")
+    if plan_gate:
+        parts.append(f"Before launch, the plan gate decided {plan_gate.get('verdict')} "
+                     f"(node {plan_gate.get('node_axis')}, flow {plan_gate.get('flow_axis')}; "
+                     f"breaker {plan_gate.get('breaker')}).")
+    chain = log_info.get("chain", "none")
+    if chain != "none":
+        parts.append("The stream is hash-chained (this exporter checked the chain)"
+                     + (" and signed; check the signatures with tools/varek_audit.py."
+                        if log_info.get("pubkey") else "; it is not signed."))
+    else:
+        parts.append("The stream is not hash-chained (a Warden before v1.16).")
+    parts.append(_scope(warden_version))
+
+    facts = [
+        ("varek:unknown.total", str(len(unknown))),
+        ("varek:unknown.authorized", "0"),
+        ("varek:authorized.files", str(len(auth_files))),
+        ("varek:authorized.files.resolved", str(len(resolved))),
+        ("varek:authorized.certified", str(len(certified))),
+        ("varek:certificates.refused", str(len(cert_refused))),
+        ("varek:policy.sha256.check", policy_check),
+    ]
+    if plan_gate:
+        facts += [("varek:plan_gate.verdict", str(plan_gate.get("verdict", ""))),
+                  ("varek:plan_gate.breaker", str(plan_gate.get("breaker", "")))]
+    return " ".join(parts), facts
+
+
 def build_bom(records, agent, policy, serial, run_id="", complete=True,
-              warden_version=VAREK_VERSION, policy_sha256="", log_info=None):
+              warden_version=VAREK_VERSION, policy_sha256="", log_info=None,
+              plan_gate=None, policy_check="not checked"):
     # v1.12.2: the Warden component carries the version named in the stream's
     # run_start (the Warden that made the decisions), not this exporter's.
     now = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -330,18 +448,10 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
         }
         components.append(comp)
 
-    attest_text = (
-        f"VAREK Authorization-Before-Execution attestation. Policy '{policy}'. "
-        f"{len(records)} action(s) mediated between {run_start} and {run_end}: "
-        f"{len(authorized)} authorized, {len(refused)} refused. "
-        f"Raw verdict distribution: "
-        + ", ".join(f"{k}={v}" for k, v in sorted(dist.items()))
-        + ". Every action was decided BEFORE it executed; no action reached the "
-        "kernel without a verdict. UNKNOWN verdicts were suppressed to DENY "
-        "(symmetric-suppression invariant). File decisions were made on the "
-        "resolved canonical object, not the requested pathname (v1.12 "
-        "resolve-then-decide)."
-    )
+    attest_text, facts = attestation(records, authorized, refused, dist, policy,
+                                     run_start, run_end, warden_version, complete,
+                                     log_info or {}, plan_gate, policy_check)
+    agent_component["properties"] += [{"name": k, "value": v} for k, v in facts]
 
     annotation = {
         "bom-ref": "authorization-attestation",
@@ -375,16 +485,142 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
     return bom
 
 
+# ---------------- v1.18.0: JSF signature (Ed25519) ----------------
+
+def jcs(obj):
+    """RFC 8785 JSON canonicalization of the BOM: keys sorted, no whitespace,
+    ECMAScript string escaping. The BOM holds only objects, arrays, strings,
+    integers and booleans (no floats), and every key is ASCII, so sorting by
+    code point equals JCS's UTF-16 order. A lone surrogate (a path byte that is
+    not UTF-8, read with surrogateescape) is written as its \\u escape, as
+    ECMAScript does."""
+    def check(o):
+        if isinstance(o, float):
+            raise ValueError("a float in the BOM: JCS number form not implemented")
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if not k.isascii():
+                    raise ValueError("a non-ASCII key in the BOM")
+                check(v)
+        elif isinstance(o, list):
+            for v in o:
+                check(v)
+    check(obj)
+    text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    text = re.sub("[\ud800-\udfff]", lambda m: "\\u%04x" % ord(m.group()), text)
+    return text.encode("utf-8")
+
+
+def _b64u(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def _b64u_dec(t):
+    if not isinstance(t, str) or not re.fullmatch(r"[A-Za-z0-9_-]*", t):
+        raise ValueError("not base64url")
+    return base64.urlsafe_b64decode(t + "=" * (-len(t) % 4))
+
+
+def _read_hex32(arg, what):
+    txt = arg
+    if os.path.exists(arg):
+        with open(arg) as fh:
+            txt = fh.read()
+    txt = txt.strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", txt):
+        raise SystemExit(f"varek_cyclonedx: {what} must be 64 hex characters (or a file holding them)")
+    return bytes.fromhex(txt)
+
+
+def sign_bom(bom, key_path):
+    """Add a JSF signature over the BOM, made with libsodium (the library the
+    Warden signs its stream with) from the varek_keygen seed file."""
+    name = ctypes.util.find_library("sodium")
+    if not name:
+        raise SystemExit("varek_cyclonedx: --sign-key needs libsodium (the Warden's dependency)")
+    na = ctypes.CDLL(name)
+    if na.sodium_init() < 0:
+        raise SystemExit("varek_cyclonedx: libsodium failed to initialize")
+    if not os.path.isfile(key_path):
+        raise SystemExit(f"varek_cyclonedx: --sign-key {key_path}: no such file")
+    seed = _read_hex32(key_path, "--sign-key")
+    pk = ctypes.create_string_buffer(32)
+    sk = ctypes.create_string_buffer(64)
+    if na.crypto_sign_seed_keypair(pk, sk, seed) != 0:
+        raise SystemExit("varek_cyclonedx: cannot derive the key pair")
+    bom.pop("signature", None)
+    bom["signature"] = {"algorithm": "Ed25519",
+                        "publicKey": {"kty": "OKP", "crv": "Ed25519", "x": _b64u(pk.raw)}}
+    msg = jcs(bom)
+    sig = ctypes.create_string_buffer(64)
+    rc = na.crypto_sign_detached(sig, None, msg, ctypes.c_ulonglong(len(msg)), sk)
+    ctypes.memset(sk, 0, 64)
+    if rc != 0:
+        raise SystemExit("varek_cyclonedx: signing failed")
+    bom["signature"]["value"] = _b64u(sig.raw)
+    return pk.raw
+
+
+def verify_bom(path, pubkey_arg=None):
+    """Check a BOM's JSF Ed25519 signature. Returns 0 if it verifies (and, with
+    pubkey_arg, was made by that key), else 1, saying why."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            bom = json.load(fh)
+    except (OSError, ValueError) as e:
+        print(f"varek_cyclonedx: {path}: cannot read ({e})", file=sys.stderr)
+        return 1
+    sig = bom.get("signature") if isinstance(bom, dict) else None
+    if not isinstance(sig, dict):
+        print(f"varek_cyclonedx: {path}: not signed", file=sys.stderr)
+        return 1
+    pkobj = sig.get("publicKey") or {}
+    try:
+        if sig.get("algorithm") != "Ed25519" or pkobj.get("kty") != "OKP" \
+                or pkobj.get("crv") != "Ed25519" or set(sig) - {"algorithm", "publicKey", "value"}:
+            raise ValueError("expected an Ed25519 JSF signer with algorithm, publicKey and value only")
+        pk = _b64u_dec(pkobj.get("x"))
+        value = _b64u_dec(sig.get("value"))
+    except (ValueError, TypeError) as e:
+        print(f"varek_cyclonedx: {path}: malformed signature ({e})", file=sys.stderr)
+        return 1
+    unsigned = dict(bom)
+    unsigned["signature"] = {k: v for k, v in sig.items() if k != "value"}
+    if not varek_ed25519.verify(pk, jcs(unsigned), value):
+        print(f"varek_cyclonedx: {path}: signature does NOT verify (the BOM was changed "
+              f"after signing, or the signature is not for it)", file=sys.stderr)
+        return 1
+    if pubkey_arg is not None and pk != _read_hex32(pubkey_arg, "--pubkey"):
+        print(f"varek_cyclonedx: {path}: signature verifies, but under key {pk.hex()}, "
+              f"not the one given", file=sys.stderr)
+        return 1
+    log_pk = ""
+    for p in ((bom.get("metadata") or {}).get("component") or {}).get("properties", []):
+        if isinstance(p, dict) and p.get("name") == "varek:log.pubkey":
+            log_pk = p.get("value") or ""
+    same = " (the key that signed the run's verdict stream)" if log_pk == pk.hex() else ""
+    print(f"varek_cyclonedx: {path}: signature OK, key {pk.hex()}{same}")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Render a VAREK Warden pathology log as a CycloneDX 1.6 BOM.")
     ap.add_argument("--log", help="Warden pathology log (default: stdin)")
     ap.add_argument("--agent", default="agent", help="name/path of the supervised agent")
-    ap.add_argument("--policy", default="policy.txt", help="policy identity for the run")
+    ap.add_argument("--policy", default=None,
+                    help="the policy file the Warden ran with (default: the policy_path "
+                         "run_start records). A readable file must match the SHA-256 the "
+                         "Warden recorded.")
     ap.add_argument("--output", help="output BOM path (default: stdout)")
     ap.add_argument("--serial", help="BOM serialNumber (default: a fresh urn:uuid)")
     ap.add_argument("--allow-incomplete", action="store_true",
                     help="attest a stream with no run_end record (marked run.complete=false)")
+    ap.add_argument("--sign-key", help="sign the BOM (JSF, Ed25519) with this varek_keygen key file")
+    ap.add_argument("--verify", metavar="BOM", help="verify a signed BOM and exit")
+    ap.add_argument("--pubkey", help="with --verify: require this public key (hex, or a .pub file)")
     args = ap.parse_args(argv)
+    if args.verify:
+        return verify_bom(args.verify, args.pubkey)
 
     # Split on '\n' only, so a '\r' the agent wrote cannot start a new line.
     if args.log:
@@ -400,9 +636,27 @@ def main(argv=None):
     lg = meta.get("log")
     log_info = {"chain": (lg["head"].hex() if lg else "none"),
                 "pubkey": str(meta.get("run_start", {}).get("log_pubkey", ""))}
+    recorded_sha = str(meta.get("run_start", {}).get("policy_sha256", ""))
+    if args.policy is None:
+        # v1.18.0: name the policy the Warden recorded, not a fixed label (the
+        # default was "policy.txt", whatever the run used).
+        args.policy = str(meta.get("run_start", {}).get("policy_path", "") or "unrecorded")
+    if os.path.isfile(args.policy):
+        with open(args.policy, "rb") as fh:
+            given = hashlib.sha256(fh.read()).hexdigest()
+        if recorded_sha and given != recorded_sha:
+            raise StreamError(f"varek_cyclonedx: --policy {args.policy} has SHA-256 {given}, "
+                              f"but the Warden decided with {recorded_sha}. Refusing to emit "
+                              f"a BOM that names a policy the run did not use.")
+        policy_check = (f"{given}, equal to the file named" if recorded_sha
+                        else f"{given} of the file named; this Warden did not record one")
+    else:
+        policy_check = (f"{recorded_sha} as the Warden recorded it; the name given is not a "
+                        f"file, so it was not compared" if recorded_sha else "not recorded")
     bom = build_bom(records, args.agent, args.policy, serial, run_id, complete,
-                    warden_version, str(meta.get("run_start", {}).get("policy_sha256", "")),
-                    log_info)
+                    warden_version, recorded_sha, log_info, meta.get("plan_gate"), policy_check)
+    if args.sign_key:
+        sign_bom(bom, args.sign_key)
 
     out = json.dumps(bom, indent=2)
     if args.output:

@@ -8,3 +8,8 @@ warden_example
 /tests/test_v17_4
 /tests/test_v18_0
 *.o
+/tests/test_v18_2_breaker
+/tests/test_v19_progress
+/tests/test_v118
+/tests/test_v192_abi_lockdown
+/tests/test_v192_baseline_deny

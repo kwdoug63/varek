@@ -1,60 +1,14 @@
 """
-VAREK — AI Pipeline Programming Language
-v1.3.0 — OS-Level System Call Interception & Stateful Semantic Derivation
+VAREK v1.3 — policy-evaluator prototype (deprecated; see DEPRECATED.md).
 
-Author : Kenneth Wayne Douglas, MD
-License: MIT
+The current implementation is the C Warden in varek/v1_4/.
+
+This package once re-exported the VAREK language front end (lexer, parser,
+type checker) from a `varek` package that is not part of this repository — the
+language lives in varek-v1.0/ — so importing anything under varek.v1_3 failed
+and its tests could not be collected. The prototype does not use the language;
+its modules (evaluator, policy, decision_log, warden, seccomp_bridge) import
+only each other.
 """
 
-from varek.lexer    import Lexer, Token, TT
-from varek.parser   import Parser
-from varek.errors   import ErrorBag, VarekError
-from varek.printer  import ASTPrinter
-from varek.checker  import TypeChecker, CheckResult, SchemaValidator
-from varek.types    import (
-    Type, TypeVar, Scheme, Substitution,
-    PrimType, OptionalType, ArrayType, MapType, TupleType,
-    TensorType, ResultType, FunctionType, SchemaType, FieldDef,
-    T_INT, T_FLOAT, T_STR, T_BOOL, T_NIL,
-    Dim, fresh_var,
-)
-from varek.env      import TypeEnv, SchemaRegistry
-from varek.infer    import Inferrer
-from varek.builtins import build_global_env
-
 __version__ = "1.3.0"
-__author__  = "Kenneth Wayne Douglas, MD"
-__license__ = "MIT"
-
-
-def parse(source: str, filename: str = "<stdin>"):
-    lexer  = Lexer(source, filename)
-    tokens = lexer.tokenize()
-    errors = ErrorBag()
-    for e in lexer.errors:
-        errors.add(e)
-    parser = Parser(tokens, filename)
-    tree   = parser.parse()
-    for e in parser.errors:
-        errors.add(e)
-    return tree, errors
-
-
-def check(source: str, filename: str = "<stdin>") -> CheckResult:
-    return TypeChecker.check(source, filename)
-
-
-def check_expr(source: str):
-    return TypeChecker.check_expr(source)
-
-
-__all__ = [
-    "Lexer","Token","TT","Parser","ASTPrinter","parse",
-    "TypeChecker","CheckResult","SchemaValidator","check","check_expr",
-    "Type","TypeVar","Scheme","Substitution",
-    "PrimType","OptionalType","ArrayType","MapType","TupleType",
-    "TensorType","ResultType","FunctionType","SchemaType","FieldDef",
-    "T_INT","T_FLOAT","T_STR","T_BOOL","T_NIL","Dim","fresh_var",
-    "TypeEnv","SchemaRegistry","Inferrer","build_global_env",
-    "ErrorBag","VarekError",
-]

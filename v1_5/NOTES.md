@@ -21,15 +21,15 @@ Three benchmarks, all in this directory:
 
 | Probe | Description | Hot-path? |
 |---|---|---|
-| `smt_probe.c`  | Z3 string-theory, fresh context per call (worst case) | No |
-| `smt_probe2.c` | Z3 string-theory, context reuse with push/pop          | No |
+| `smt_probe.c`  | Off-the-shelf SMT solver, string theory, fresh context per call (worst case) | No |
+| `smt_probe2.c` | Off-the-shelf SMT solver, string theory, context reuse with push/pop | No |
 | `fast_match.c` | Sorted prefix array + binary search                    | **Yes** |
 
 Each emits JSON pathology records compatible with `bench_summarize.py`.
 
 ## What we found
 
-### SMT probe results (DigitalOcean 1 vCPU / 512 MB, Z3 4.8.12)
+### SMT probe results (DigitalOcean 1 vCPU / 512 MB, solver release 4.8.12)
 
 | Probe | P50 | P99 | Max | Notes |
 |---|---|---|---|---|
@@ -38,13 +38,13 @@ Each emits JSON pathology records compatible with `bench_summarize.py`.
 
 The dramatic P50 drop from probe 1 to probe 2 confirmed that fresh-
 context creation dominates the worst case. But probe 2's P99 went *up*
-relative to probe 1, exposing a textbook Z3 string-theory pathology:
+relative to probe 1, exposing a textbook string-theory pathology of the solver:
 
 - Most decisions complete in ~500 µs (excellent).
 - A meaningful fraction take 40-50 ms (catastrophic).
 - Almost nothing in between.
 
-Z3 string theory accumulates internal state across `push/pop` cycles
+The solver's string theory accumulates internal state across `push/pop` cycles
 (learned lemmas, string-axiom unfoldings, propagation cache). Over
 thousands of queries this state grows and occasionally triggers
 expensive recomputation on individual checks. This is a known issue
@@ -60,13 +60,15 @@ use SMT string theory on a hot path.
 | P99.9 | 526 nanoseconds |
 | Max | 8.26 µs |
 | 10K decisions | 50 ms wall-clock |
-| False negatives | 0 |
+| False negatives (allow on a deny-target path, this benchmark) | 0 |
 | UNKNOWN suppressions | 2,500 of 2,500 |
 
-Sub-microsecond at all percentiles up to P99.9. Three orders of
-magnitude faster than the v1.4 Warden's measured 57 µs P99 — which
-tells us the Warden's tail latency is dominated by seccomp, proc/mem,
-and kernel-injection overhead, not the policy decision itself.
+Sub-microsecond at all percentiles up to P99.9: about 160 times below the
+v1.4 Warden's measured end-to-end P99 of 44 µs
+(`varek/v1_4/bench_results_v1_4.txt`) — which tells us the Warden's tail
+latency is dominated by seccomp, proc/mem, and kernel-injection overhead, not
+the policy decision itself. (Corrected in v1.18.0: this note said "three
+orders of magnitude" against a 57 µs P99 that no recorded run shows.)
 
 ## Why we kept the SMT probes in the repo
 
@@ -106,7 +108,7 @@ are tracked separately and explicitly out of scope here:
 ## Reproduce
 
 ```sh
-sudo apt install -y libz3-dev
+make deps    # the solver's C library, for the two SMT probes
 make
 ./fast_match  10000 ../v1_4/policy.txt 2> bench_fast.log
 ./smt_probe2  1000                     2> bench_probe2.log

@@ -1,0 +1,4 @@
+# The reference SMT solver for tools/smt_crosscheck.py (make crosscheck,
+# make test-v1130 / test-v1140 / test-v1150 / test-v1160), v1.18.0:
+#   pip install -r tools/requirements-crosscheck.txt
+z3-solver>=4.8

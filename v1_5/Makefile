@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 #
-# VAREK v1.5 \xe2\x80\x94 SMT probe build
+# VAREK v1.5 — SMT probe build
 #
-# Requires: libz3-dev installed
-#   sudo apt install -y libz3-dev
+# The two SMT probes link the reference off-the-shelf SMT solver's C library;
+# `make deps` installs it (fast_match needs nothing).
 
 CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -Wpedantic -Wno-unused-parameter \
@@ -15,7 +15,7 @@ BIN  := smt_probe
 BIN2 := smt_probe2
 BIN3 := fast_match
 
-.PHONY: all clean run check-z3
+.PHONY: all clean run deps check-solver
 
 all: $(BIN) $(BIN2) $(BIN3)
 
@@ -28,12 +28,17 @@ $(BIN2): smt_probe2.c
 $(BIN3): fast_match.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
-check-z3:
+deps:
+	@if command -v apt-get >/dev/null 2>&1; then sudo apt-get install -y libz3-dev; \
+	elif command -v dnf >/dev/null 2>&1; then sudo dnf install -y z3-devel; \
+	else echo "install the solver's C development package with your package manager"; exit 1; fi
+
+check-solver:
 	@if ! ldconfig -p | grep -q libz3; then \
-		echo "ERROR: libz3 not found. Install with: sudo apt install -y libz3-dev"; \
+		echo "ERROR: the solver's C library is not installed; run: make deps"; \
 		exit 1; \
 	fi
-	@echo "OK: libz3 present"
+	@echo "OK: solver library present"
 
 run: $(BIN)
 	./$(BIN) 10000 2> bench.log

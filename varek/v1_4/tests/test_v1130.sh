@@ -15,7 +15,7 @@
 #   4. The shipped policies lint clean (no rule that can never fire).
 #   5. The --plan gate treats a planned file_open's flags as symbolic.
 #   6. The decision procedure agrees with an SMT solver on every check
-#      (tools/smt_crosscheck.py; needs python3 + z3-solver).
+#      (tools/smt_crosscheck.py; needs python3 and tools/requirements-crosscheck.txt).
 #   7. The verdict-distribution harness gate: unsafe_satisfied == 0.
 #
 # Usage: ./test_v1130.sh <warden> <vdp_check> <probe_bin>
@@ -129,7 +129,7 @@ if python3 -c 'import z3' 2>/dev/null; then
     echo "$o" | sed 's/^/    /' | tail -3
     grep -q "smt_crosscheck: PASS (0 disagreements)" <<<"$o" && pass "zero disagreements with the solver" || flunk "zero disagreements with the solver"
 else
-    flunk "python3 module z3 not found (pip install z3-solver): the solver cross-check is required"
+    flunk "the reference SMT solver is not installed (pip install -r tools/requirements-crosscheck.txt): the solver cross-check is required"
 fi
 
 echo "== 7. verdict-distribution harness gate =="

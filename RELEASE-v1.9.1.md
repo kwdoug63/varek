@@ -41,7 +41,9 @@ check and the kernel's use of it. v1.9.1 enforces three rules:
 - Every notification is revalidated with `SECCOMP_IOCTL_NOTIF_ID_VALID`
   immediately before the supervisor acts.
 
-New: `v1_7/warden_notify_hardening.{h,c}`. Decisions on scalar register
+New: `v1_7/warden_notify_hardening.{h,c}` *(correction, v1.18.0: that file was
+never committed; the discipline is implemented inline in `varek/v1_4/warden.c`)*.
+Decisions on scalar register
 arguments remain safe (the kernel snapshots them); pointer-dereferenced data does
 not, and is handled by the supervisor-performs pattern above.
 
@@ -54,6 +56,13 @@ not, and is handled by the supervisor-performs pattern above.
 - **Deterministic resource bounds.** Per-obligation step and time ceilings with
   an obligation memoization cache. A bound hit yields UNKNOWN (fail closed),
   never a coerced pass; the step ceiling is the authoritative, reproducible cut.
+
+*Correction (v1.18.0): the UNKNOWN-reason diagnostics and the resource bounds
+above were specified in `docs/security/v1.9.1-verifier-notes.md` but not
+implemented in this release. From v1.13.0, an UNKNOWN record's `rule` names its
+cause, and the decision procedure's work is bounded by construction (a length
+guard, a flag-enumeration bound, and from v1.16.0 a glob-token cap); there is no
+wall-clock ceiling and no memoization cache.*
 - **Security documentation.** `docs/security/threat-model.md` and
   `docs/security/TRUSTED-COMPUTING-BASE.md`.
 

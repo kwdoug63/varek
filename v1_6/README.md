@@ -175,7 +175,10 @@ edge   <from_label> <to_label>
 - `<kind>` is a free-form token interpreted by the decider. The
   v1.4 Warden glue recognizes `file_open`, `net_connect`,
   `process_exec`; everything else maps to `ACT_OTHER` and is
-  suppressed under symmetric-suppression semantics.
+  suppressed under symmetric-suppression semantics. Since v1.18.0
+  the Warden's gate decides every `net_connect` and `process_exec`
+  step UNSATISFIED, because the runtime refuses those whatever the
+  policy says; only `file_open` steps can be SATISFIED.
 - `<target>` is a single whitespace-free token.
 - Edge labels must reference action lines declared earlier in
   the file. Self-edges are rejected at parse time.

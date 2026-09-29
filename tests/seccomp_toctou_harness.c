@@ -452,6 +452,10 @@ int main(int argc, char **argv) {
 
         printf("[target ] iterations=%d  opens_succeeded=%d  sentinel_leaks=%d\n",
                iterations, opens, leaks);
+        /* v1.18.0: _exit() does not flush stdio, so with stdout on a pipe or a
+         * file this count line was lost and only the RACE WON/LOST verdict
+         * appeared. */
+        fflush(stdout);
         _exit(leaks > 0 ? 10 : 0);
     }
 

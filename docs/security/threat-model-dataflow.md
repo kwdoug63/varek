@@ -22,6 +22,19 @@ of VAREK's defense surface and have non-overlapping trust boundaries:
 
 A deployment relies on both. Read both.
 
+> **Where it runs (v1.18.0).** Through v1.17.0 this layer was a library with
+> tests; the Warden did not call it, so its guarantees held only for a host
+> that called `plan_warden_verify()` itself. Since v1.18.0 the Warden's
+> `--plan` gate runs it when given `--flow-policy`, together with the v1.8.2
+> refusal breaker (counts kept across runs in a state file the agent cannot
+> reach) and the v1.9 progress-safety check at startup. In the Warden, plan
+> steps reach the flow policy as actions named `file_open`, `net_connect` and
+> `process_exec` with one argument, `target` (the canonical path for a
+> `file_open`), and every `net_connect` and `process_exec` step is refused on
+> the node axis (the runtime refuses them). Rules that match URLs should match
+> a component (`match url.host …`), not the whole URL (v1.18.0; see
+> `v1_7/plan_label_policy.h`).
+
 This document is written for two readers: a CISO evaluating the layer
 for deployment, and an external auditor (Trail of Bits, NCC Group,
 Doyensec, or equivalent) scoping an engagement.
