@@ -56,7 +56,7 @@ import re
 import sys
 import uuid
 
-VAREK_VERSION = "1.16.0"
+VAREK_VERSION = "1.16.1"
 SPEC_VERSION = "1.6"
 
 # The provisional patents, as recorded in the runtime's own documentation.

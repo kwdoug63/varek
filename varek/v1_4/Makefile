@@ -25,19 +25,45 @@ CFLAGS    += -I$(V1_7_DIR)
 
 BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen
 
-.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 crosscheck harness video-v112
+.PHONY: all deps deps-check preflight clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 crosscheck harness video-v112
 
 all: $(BINS)
+
+# v1.16.1: the Warden needs the libseccomp and (from v1.16) libsodium headers.
+# Checked when (and only when) the Warden or varek_keygen is about to be built,
+# naming the command that installs them; `make deps` runs that command.
+deps-check:
+	@printf '#include <seccomp.h>\n#include <sodium.h>\n' | $(CC) -E -x c - >/dev/null 2>&1 || { \
+	    echo "ERROR: the Warden needs the libseccomp and libsodium development headers."; \
+	    echo "  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libsodium-dev"; \
+	    echo "  Fedora/RHEL:   sudo dnf install -y gcc make libseccomp-devel libsodium-devel"; \
+	    echo "  or run: make deps"; exit 1; }
+
+deps:
+	@if command -v apt-get >/dev/null 2>&1; then \
+	    sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libsodium-dev; \
+	elif command -v dnf >/dev/null 2>&1; then \
+	    sudo dnf install -y gcc make libseccomp-devel libsodium-devel; \
+	else echo "install libseccomp and libsodium (development packages) with your package manager"; exit 1; fi
+
+# v1.16.1: check a deployment before running it (dependencies, build, policy,
+# the verdict stream / key / anchor locations the Warden refuses, and with
+# --run a real trial run). Example:
+#   make preflight POLICY=policies/finance.policy.txt LOG=/var/log/varek/verdicts.log
+preflight:
+	@./tools/varek_preflight.sh "$(POLICY)" $(if $(LOG),--log "$(LOG)") $(if $(KEY),--sign-key "$(KEY)") $(if $(ANCHOR),--anchor "$(ANCHOR)") $(if $(RUN),--run)
 
 CHECKER := checker/vdp_checker.c checker/vdp_checker.h
 
 warden: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(V1_6_SRC)
+	@$(MAKE) -s --no-print-directory deps-check
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c $(LIFECYCLE) $(V1_6_SRC) $(LDLIBS)
 
 # v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
 # ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that
 # the certificate checker refuses the wrong verdict. Never deploy it.
 warden_faultinject: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(V1_6_SRC)
+	@$(MAKE) -s --no-print-directory deps-check
 	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c $(LIFECYCLE) $(V1_6_SRC) $(LDLIBS)
 
 # v1.15: command-line front end to the certificate checker (policy digest,
@@ -47,6 +73,7 @@ tools/vdp_cert_check: tools/vdp_cert_check.c $(CHECKER)
 
 # v1.16: Ed25519 key pair for signing the verdict stream (--sign-key).
 tools/varek_keygen: tools/varek_keygen.c
+	@$(MAKE) -s --no-print-directory deps-check
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/varek_keygen.c -lsodium
 
 # v1.13: command-line front end to the SMT decision procedure (lint, analyze,
@@ -177,6 +204,12 @@ tests/v1160_probe: tests/v1160_probe.c
 
 test-v1160: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen tests/v1160_probe
 	@sudo ./tests/test_v1160.sh ./warden ./tools/vdp_check ./tools/vdp_cert_check ./tools/varek_keygen $(abspath tests/v1160_probe)
+
+# v1.16.1: deployment preflight. vdp_cert_check's openable check agrees with
+# the Warden's startup refusal; varek_preflight.sh passes a good deployment and
+# fails the ones the Warden would refuse; the dependency check names packages.
+test-v1161: warden tools/vdp_cert_check tools/varek_keygen
+	@sudo ./tests/test_v1161.sh ./warden ./tools/vdp_cert_check
 
 # Differential check of the decision procedure against an SMT solver (Z3) and,
 # for suffix / contains / glob reachability, a derivative-based oracle. These

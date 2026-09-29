@@ -57,6 +57,22 @@ codespace** on the repository page.
 This is the path of least friction for contributors who do not run
 Linux locally.
 
+### Building the Warden (C)
+
+The Warden runtime (`varek/v1_4/`) builds on Linux with a C compiler and the
+libseccomp and libsodium development headers (libsodium since v1.16):
+
+```bash
+sudo apt-get install -y build-essential libseccomp-dev libsodium-dev   # Debian/Ubuntu
+sudo dnf install -y gcc make libseccomp-devel libsodium-devel          # Fedora/RHEL
+make -C varek/v1_4                                                       # or: make -C varek/v1_4 deps
+```
+
+`make` stops with the install command if a header is missing. Before
+deploying, `varek/v1_4/tools/varek_preflight.sh <policy> --log <path> --run`
+checks the dependencies, the build, the policy and the verdict stream, key and
+anchor locations the Warden refuses at startup, and does a trial run.
+
 ## Verifying your environment
 
 A simple availability check:

@@ -1091,7 +1091,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.16.0\","
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.16.1\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
@@ -1866,7 +1866,7 @@ static int raw_device_scan(const struct policy *p, const char *dir, int depth) {
                                      !strcmp(e->d_name, "port") ||
                                      !strncmp(e->d_name, "sg", 2) ||
                                      !strncmp(e->d_name, "nvme", 4))) ||
-                     !strncmp(dir, "/dev/bsg", 8)));
+                     !strcmp(dir, "/dev/bsg") || !strncmp(dir, "/dev/bsg/", 9)));
         if (raw && vdpc_path_openable(&p->c, path, strlen(path))) {
             fprintf(stderr, "[warden] the policy would let the agent open %s, which gives raw "
                     "access to storage (including the signing key or the anchor); deny it. "
