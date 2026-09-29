@@ -11,7 +11,7 @@
 #   1. A flow rule that matches a field decides the plan: the same plan with
 #      and without the field gets different verdicts; quoted values keep
 #      their spaces.
-#   2. Fields reach only the flow policy: they cannot make a step the Warden's
+#   2. Fields reach the flow policy: they cannot make a step the Warden's
 #      own policy refuses pass the node check.
 #   3. Fields are part of the plan's breaker signature, in key order: the same
 #      fields in another order are the same plan, a changed value is not.
@@ -135,7 +135,7 @@ FLOWARG="$D/permit.cfg" gate s6 sink.txt
     && pass "with trust_declared_fields, a permit on a field is unlocked by declaring it (the risk the line accepts)" \
     || flunk "a permit on a field behaves as documented (exit $rc_no then $RC)"
 
-echo "== 2. fields reach only the flow policy =="
+echo "== 2. fields cannot pass the node check =="
 printf 'action w file_open /tmp/varek_v1200/data/secret/private contains=nothing\n' > "$D/node.txt"
 gate s2 node.txt
 [ "$RC" -ne 0 ] && has 'node UNSATISFIED' && ! has 'supervising pid=' \
@@ -183,7 +183,7 @@ printf 'action w file_open /tmp/varek_v1200/data/public/ok k=v\0 j=evil\n' > "$D
 
 "$WARDEN" "$POL" --plan "$D/sink.txt" -- "$PROBE" > /dev/null 2> "$OUT/plain.err"; rc=$?
 [ "$rc" -eq 0 ] && grep -q 'plan authorized' "$OUT/plain.err" \
-    && pass "--plan without --flow-policy reads a plan with fields (the node check ignores them)" \
+    && pass "--plan without --flow-policy reads a plan with fields (the node check ignores these fields)" \
     || flunk "--plan alone reads a plan with fields (rc=$rc)"
 
 echo "== 5. the audit =="

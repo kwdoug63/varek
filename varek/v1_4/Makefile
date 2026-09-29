@@ -32,7 +32,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen
 
-.PHONY: all deps deps-check preflight clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 crosscheck harness video-v112
+.PHONY: all deps deps-check preflight clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -273,6 +273,11 @@ tests/v1210_probe: tests/v1210_probe.c
 
 tests/v1210_bench: tests/v1210_bench.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $<
+
+# v1.21.1: a plan step may declare how it opens its file (open=read,
+# open=O_WRONLY|O_CREAT|...); the gate decides the step with those flags.
+test-v1211: warden tools/vdp_cert_check tests/v1180_probe
+	@sudo ./tests/test_v1211.sh ./warden ./tools/vdp_cert_check $(abspath tests/v1180_probe)
 
 test-v1210: warden tools/vdp_check tools/vdp_cert_check tests/v1210_probe tests/v1210_bench tests/test_v14_filter
 	@sudo ./tests/test_v14_filter

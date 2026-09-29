@@ -31,8 +31,11 @@ A deployment relies on both. Read both.
 > steps reach the flow policy as actions named `file_open`, `net_connect` and
 > `process_exec` with the argument `target` (the canonical path for a
 > `file_open`) and, since v1.20.0, the fields the step declares after its
-> target; every `net_connect` and `process_exec` step is refused on the node
-> axis (the runtime refuses them). Fields are declarations, like the edges:
+> target. On the node axis a `process_exec` step is refused (the runtime
+> refuses launches); a `net_connect` step is decided on its numeric
+> destination (v1.21.0; from v1.18.0 to v1.20.0 it was refused); and a
+> `file_open` step is decided with the open flags its `open` field declares,
+> or with the flags unknown when it declares none (v1.21.1). Fields are declarations, like the edges:
 > the agent can declare or omit them, so a rule on a field can be unlocked
 > (a permit) or avoided (a refusal), and the Warden refuses a flow policy with
 > such rules unless it declares `trust_declared_fields`. Rules that match URLs should match

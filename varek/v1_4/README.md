@@ -356,8 +356,9 @@ From v1.18.0 to v1.20.0 every `net_connect` step was UNSATISFIED.
   (`action r file_open /srv/in/msg contains="a customer record"`; see
   `v1_6/plan_parser.h`). A plan whose edges carry a sticky label to a step that
   denies it is refused, and `[warden] plan flow pathology:` names the flow.
-- **declared fields (v1.20.0).** Fields reach only the flow policy; the node
-  check and the runtime see the target alone. The agent writes its plan, so
+- **declared fields (v1.20.0).** Fields reach the flow policy; the runtime
+  sees the target alone, and so does the node check apart from one field,
+  `open` (next item). The agent writes its plan, so
   declaring or omitting a field changes which rule applies: a rule that
   permits on a field is unlocked by declaring it, a rule that refuses on a
   field is avoided by leaving it out, and a field rule placed before a stricter
@@ -366,6 +367,24 @@ From v1.18.0 to v1.20.0 every `net_connect` step was UNSATISFIED.
   Fields help an honest planner say more about its steps; like the edges, they
   are not evidence. A changed value makes a new plan for the breaker (its own
   per-plan count), so the session limit is what bounds that.
+- **how a file is opened (v1.21.1).** A step carries no open flags, so a
+  `file_open` step whose path is allowed only by a rule with a flag clause
+  (`readonly`, `access=ro`, `-O_TRUNC`, ...) was UNKNOWN at the gate although
+  the runtime allowed the same open. A `file_open` step may declare its flags
+  in an `open` field, which the node check reads: `open=read` (`O_RDONLY` and
+  nothing else, what `readonly` allows) or an access mode followed by flags,
+  `open=O_WRONLY|O_CREAT|O_TRUNC` (`O_RDONLY`, `O_WRONLY` or `O_RDWR` first,
+  then any of `O_CREAT`, `O_EXCL`, `O_NOCTTY`, `O_TRUNC`, `O_APPEND`,
+  `O_NONBLOCK`, `O_DSYNC`, `O_ASYNC`, `O_DIRECT`, `O_LARGEFILE`,
+  `O_DIRECTORY`, `O_NOFOLLOW`, `O_NOATIME`, `O_CLOEXEC`, `O_SYNC`, `O_PATH`,
+  `O_TMPFILE`, each once). The step is decided and certified with exactly
+  those flags. A name has the value an agent's `open()` passes for it
+  (`O_SYNC` and `O_TMPFILE` as glibc's composites); `O_LARGEFILE` is the
+  kernel's bit, as in a policy's flag clauses. Like every declaration, the field does not bind the agent: an
+  open with other flags is decided on its own flags at run time. A value in
+  any other form, a repeated flag, or an `open` field on another kind of step
+  makes the step UNKNOWN, with the reason logged. Without the field a step is
+  decided as before. The field also reaches the flow policy like any other.
 - **the refusal breaker (v1.8.2).** Each refused plan counts against
   (`--session <id>`, default `default`; the plan's signature). The signature
   covers the plan's steps and edges: reordering distinct steps or edges, or

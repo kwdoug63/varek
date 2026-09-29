@@ -129,9 +129,9 @@ static const char *kAdmit[] = {
 static const char *kMediate[] = {
     "openat", "connect", "execve", "execveat",
     // v1.12: egress-capable datagram/message sends. Routed to the supervisor
-    // so a send carrying an inet destination is subject to the same deny-only
-    // network posture as connect, closing the sendto/sendmsg egress bypass
-    // (bypass-classes.md class 3). v1.21: sendmsg and sendmmsg carry their
+    // so a send carrying an inet destination was refused, like every connect
+    // then (the deny-only posture of v1.9.1 to v1.20.0), closing the
+    // sendto/sendmsg egress bypass (bypass-classes.md class 3). v1.21: sendmsg and sendmmsg carry their
     // destination in the agent's memory, so the Warden reads each message
     // once and sends it itself (net_send_relay) when it names no destination
     // and carries no control data, and refuses it otherwise. sendto is

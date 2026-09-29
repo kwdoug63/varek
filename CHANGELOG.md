@@ -26,10 +26,10 @@ the program: v1.17.0 protects the Warden's own files and drops the agent's root
 privileges, and v1.18.0 fixes where the public claims and the code disagreed
 (the plan gate's data-flow check, breaker and signed BOM export); v1.19.0 adds
 a refusal limit per session to the breaker, v1.20.0 fields on plan steps, and
-v1.21.0 decided connections. None of them changes the verification program. Still planned: a customer-derived corpus and measured baseline, a
+v1.21.0 decided connections (v1.21.1 open flags on plan steps). None of them changes the verification program. Still planned: a customer-derived corpus and measured baseline, a
 formally verified checker, and the v1.11 sequence fragment (issues #21–#25).
 
-### Planned — v1.10 program (status as of v1.21.0; unchanged since v1.16.0)
+### Planned — v1.10 program (status as of v1.21.1; unchanged since v1.16.0)
 
 - **Verdict-distribution harness.** Measurement and regression gating over a
   corpus of realistic agent action-graphs. Reports the four-cell outcome
@@ -63,6 +63,55 @@ formally verified checker, and the v1.11 sequence fragment (issues #21–#25).
   fragment's guarantee.
 
 ---
+
+## [1.21.1] - 2026-09-29
+
+v1.21.1 lets a plan step declare how it opens its file, so the `--plan` gate
+can authorize a declared read of a path the policy allows only read-only. It
+adds one field the node check reads and changes nothing at run time. See
+[`RELEASE-v1.21.1.md`](./RELEASE-v1.21.1.md).
+
+### Added
+
+- The `open` field on a `file_open` plan step: `open=read` (`O_RDONLY` only)
+  or an access mode followed by `O_` flags joined by `|`
+  (`open=O_WRONLY|O_CREAT|O_TRUNC`). The node check decides and certifies the
+  step with those flags. Any other form, a repeated flag, or the field on
+  another kind of step makes the step UNKNOWN, with the reason logged; without
+  the field a step is decided as before. Names take the value an agent's
+  `open()` passes (`O_SYNC`, `O_TMPFILE` as glibc's composites) and
+  `O_LARGEFILE` the kernel's bit, as in the policy language.
+- `make test-v1211` (`varek/v1_4/tests/test_v1211.sh`, 33 checks; 23 fail
+  against v1.21.0).
+
+### Changed
+
+- `run_start` says `"warden":"1.21.1"`.
+- The host-names plan (stage 2) targets v1.21.2 and `require warden 1.21.2`.
+
+### Fixed
+
+- `warden_verify_plan` read the plan's action count after freeing the plan;
+  it is read before (present since before v1.21.0).
+
+### Found in review
+
+An independent review found that `O_LARGEFILE` first took glibc's value (0
+on x86_64) rather than the policy language's kernel bit, so a declared
+`O_RDONLY|O_LARGEFILE` passed a `+O_LARGEFILE` denial the runtime applied;
+that the new refusal line printed the plan's kind unescaped; the
+use-after-free above; stale connect statements in `v1_6/README.md`, the spec
+paper and a filter comment; and wrong test counts and gaps in the test. All
+fixed before release.
+
+### Fixed (documentation)
+
+- `v1_6/sample_plan.txt` said the Warden refuses every connect and that a
+  `net_connect` step is UNSATISFIED; `docs/security/threat-model-dataflow.md`
+  said every `net_connect` step is refused on the node axis. Both were true
+  through v1.20.0 only. The sample's first step now declares `open=read`.
+- The Warden's usage text, `varek/v1_4/README.md`, `v1_6/README.md` and
+  `v1_6/plan_parser.h` said the node check ignores every field.
 
 ## [1.21.0] - 2026-09-29
 
