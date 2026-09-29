@@ -88,9 +88,9 @@ before.
   So does the Verdict Service front end, `v1_6/plan_verify`.
 - Network and launch steps are still refused at the gate (the runtime refuses
   them, v1.18.0), whatever their fields say. Fields describing a request, such
-  as its body or headers, reach the flow check and its findings, and decide a
-  plan for a host that runs the v1.7 check itself (`plan_warden_verify()`);
-  in the Warden they cannot make a network step pass.
+  as its body or headers, reach the flow check, and decide a plan for a host
+  that runs the v1.7 check itself (`plan_warden_verify()`); in the Warden they
+  cannot make a network step pass.
 
 ## `trust_declared_fields`
 
@@ -126,8 +126,10 @@ match only the target need no change. In the library,
   bytes, the most the Warden's 4096-byte path buffer holds; before, the line
   limit kept them under about 1 KB.
 - **Flow policies** whose rules match an argument other than `target` need
-  `trust_declared_fields` to start the Warden. In the Warden only `target`
-  existed before, so no working v1.19.0 Warden policy is affected.
+  `trust_declared_fields` to start the Warden. In a v1.19.0 Warden such rules
+  could never match (only `target` existed), so a policy that has them now
+  stops the Warden until it declares the line or drops those rules. Policies
+  whose rules match only the target are unaffected.
 - **Records:** `run_start` says `"warden":"1.20.0"`; the default policy
   version is `1.20`. No record format changes.
 - No change to the Warden's policy format, the breaker state file or the
