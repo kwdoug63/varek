@@ -7,76 +7,74 @@ Released 2026-09-28 · MIT · github.com/kwdoug63/varek
 The first real deployment check, on a single droplet, passed with
 `integrity: signed, anchored`. It also made a gap visible: the signing key, the
 verdict streams and the anchor file were all on the same machine, so that
-machine's root could rewrite a log and re-sign it.
+machine's root could rewrite a log and sign it again.
 
 - **The anchor.** It is the only defense against that host's root. It works
   only if it lives somewhere that root cannot rewrite.
 - **The key.** The signatures still protect against everyone else who handles
   the logs, but they cannot protect against the machine that holds the key.
 
-v1.16.2 ships the missing piece: a way to put the anchor on a second machine
-as it is written. It also corrects the command order in the v1.16.1 notes.
-There is no change to decisions, records or the policy grammar.
+v1.16.2 ships a way to put the anchor on a second machine as records are
+written. It also corrects the command order in the v1.16.1 notes. Decisions,
+records and the policy grammar are unchanged.
 
 - **`tools/varek_anchor_forward.py`** reads the Warden's anchor FIFO and sends
   each record off the host, normally within a second.
-  - **Always a reader.** It creates the FIFO and holds it open, so the Warden
-    always finds a reader.
+  - **Liveness.** It holds the FIFO open and holds a lock on `FIFO.lock` while
+    it runs, so the Warden and the preflight can tell a live forwarder from a
+    FIFO that is merely held open.
   - **Spool first.** Every record goes to a local spool before it is sent, and
     sending is retried with backoff. An outage of the anchor host delays
-    anchoring but loses nothing the forwarder has read, and after a restart
-    it resumes where it stopped.
-  - **When records can still be lost.** Two cases: while the forwarder itself
-    is stopped for longer than the pipe can hold (64 KiB, a few hundred
-    records), or for more than 10 s at the end of a run. The Warden records
-    either case (`anchor_error`, or a status line), and the audit reports the
-    records as never anchored.
-  - **A full spool disk.** Records are held in memory until there is room.
+    anchoring. Records the forwarder has spooled are not lost, and after a
+    restart it resumes where it stopped.
+  - **A full spool disk.** It stops reading the FIFO, leaving the rest in the
+    pipe, and cuts any partial write back.
   - **Files it trusts.** It refuses a FIFO, spool directory or spool file that
     belongs to another user or is a symlink.
-  - **Filtered.** Only well-formed anchor lines are forwarded.
   - **Destinations.** `--ssh USER@HOST` sends to an append-only receiver.
-    `--exec COMMAND` sends to any sink that stores lines from stdin, such as a
-    remote syslog or an object store with a retention lock.
-- **`tools/varek_anchor_receiver.sh`** sets up the anchor host (as root). It
-  creates an account whose SSH key has one forced command: append well-formed
-  anchor lines to a file marked append-only (`chattr +a`). The account gets:
-  - no shell;
-  - no forwarding;
-  - no other command;
-  - no way to change or remove a line.
-
-  Only the anchor host's own root can lift the attribute.
+    `--exec COMMAND` sends to any sink that stores lines from stdin.
+- **`tools/varek_anchor_receiver.sh`** sets up the anchor host (as root).
+  - **Checks first.** It creates nothing until every check has passed:
+    - a single-line public key that `ssh-keygen` accepts;
+    - no existing account other than its own, and never root;
+    - a root-owned directory;
+    - a filesystem that supports `chattr +a`.
+  - **The account.** Its SSH key is `restrict`ed to one forced command: append
+    well-formed anchor lines to a file marked append-only. So it has no shell,
+    no port forwarding and no other command, and it cannot change or remove a
+    line.
+  - **What the forced command does:**
+    - reads the whole batch before taking the file's lock (so a stalled
+      session blocks nobody);
+    - stamps the batch with this host's receive time (`"received_ns"`);
+    - closes any torn last line;
+    - exits non-zero on any failure, so the forwarder retries.
 - **`tools/systemd/varek-anchor-forward.service`** runs the forwarder as a
   service. Point the Warden's `--anchor` at `/run/varek/anchor.fifo`.
-- **The Warden holds a FIFO anchor read-write.** It first checks that a reader
-  is there, then keeps the FIFO open read-write.
-  - **A forwarder restart mid-run.** Records written while the forwarder is
-    restarting wait in the pipe instead of failing.
-  - **At exit.** The Warden gives the forwarder up to 10 s to read what is
-    left, and says so if it does not.
-- **The receiver stores each line with its own receive time**
-  (`"received_ns"`).
-  - One writer at a time (`flock`).
-  - A write failure makes the forwarder retry.
-- **The audit** has three new options:
-  - `--list-runs` lists every run in an anchor;
-  - `--max-anchor-delay` fails late records;
-  - `--run` names the run to audit.
-
-  It also ignores unsigned, conflicting and malformed anchor lines, and says
-  so.
-- **The preflight checks the new pieces.**
-  - A FIFO anchor must have its reader running. The Warden refuses one without
-    a reader, so this is now a FAIL before you start, not a refusal at start.
-  - A trial run with a FIFO anchor is audited against the forwarder's spool.
-  - `--spool` checks that the agent cannot open the spool.
-  - With `--run` and `--spool`, it checks that the trial run's records were
-    actually delivered off-host. A wrong anchor host name, SSH key or host key
-    fails here.
-  - Two warnings name the gap this release closes:
-    - an anchor that is a plain file on the Warden's host;
-    - a signing key on the same host as the logs with no off-host anchor.
+- **The Warden** handles a FIFO anchor differently.
+  - **At start.** It refuses the anchor when the forwarder's lock is free,
+    even if another Warden holds the FIFO open. Once it starts, it keeps the
+    FIFO open read-write, so records written while the forwarder restarts wait
+    in the pipe.
+  - **At exit.** If no forwarder is running, it gives one up to 10 s to
+    appear. After that it reports what was left.
+- **The audit** gets two new options and a new rule for anchor lines:
+  - **`--list-runs`** lists every run an anchor holds.
+  - **`--max-anchor-delay SECONDS`** fails records that reached the anchor
+    host too late after they were written. It measures from the stream's
+    signed times, not from the anchor line's own.
+  - **Which lines count.** A record is anchored if any validly signed line
+    matches it.
+    - Lines without a valid signature, lines that conflict with a record and
+      lines that are not JSON are noted and ignored.
+    - A signed line for a record the stream does not hold is evidence of
+      rewriting. The exception is a line received after the run's `run_end`
+      was anchored, which is only noted.
+- **The preflight** checks the new pieces:
+  - the forwarder is alive (its lock);
+  - `--spool` is a place the agent cannot open;
+  - with `--run --spool`, the trial run's own records were delivered off-host;
+  - it warns about a local-file anchor and an on-host key.
 
 ## Who can do what, with the anchor off-host
 
@@ -86,32 +84,47 @@ yet.
 
 | Who | Holds | What they can do undetected |
 |---|---|---|
-| Someone holding the logs, without the key | the logs | Nothing before the last signature (the signatures) |
-| The Warden host's root | the logs, the key, the forwarder's SSH key | Nothing that reached the anchor host. What has not been delivered yet can be changed or withheld: the last second or so, or everything since the anchor host became unreachable (an outage, or root blocking it). The receive times make this visible (next paragraph). |
-| The anchor host's root | the anchor | Could lift the append-only attribute, so keep that machine under separate control |
+| Someone holding the logs, without the key | the logs | Nothing before the last signature (the signatures). |
+| The Warden host's root | the logs, the key, the forwarder's SSH key | Nothing that reached the anchor host. Records not yet delivered (the last second or so, or everything since the anchor host became unreachable or the forwarder was stopped) can be changed or withheld. |
+| The anchor host's root | the anchor | Could lift the append-only attribute, so keep that machine under separate control. |
 
-**Receive times.** The receiver stores each line with its own receive time
-(`"received_ns"`), which the Warden host cannot set.
+**Receive times.** The anchor host stamps each batch with its own clock, and
+the Warden host cannot set that time.
 
-- **The delay.** The audit prints how late the run's records arrived.
-  `--max-anchor-delay SECONDS` fails the audit when any record arrived later
-  than that, which is when it could have been changed before anchoring.
-- **Picking the run.** Take the run id to audit from the anchor host:
-  `varek_audit.py --list-runs --anchor FILE` lists every run it holds, with
-  times. Then pass `--run`. Otherwise a host that withheld one run could hand
-  over another.
+- **How the audit uses it.** The audit reports each record's delay: its
+  receive time against the time in the stream's own signed record.
+  `--max-anchor-delay` turns a long delay into a failure.
+- **What it cannot prove.** Someone who holds the key and withholds records
+  can rewrite them with new times before releasing them. The receive time
+  bounds when a record was anchored, not when it was created.
+- **Picking the run.** Take the run to audit from the anchor host with
+  `--list-runs`, and pass `--run`. Otherwise a host that withheld one run
+  could hand over another.
 
-**Appending to the anchor.** Whoever holds the forwarder's SSH key can
-append, not change. The audit judges a run by the first validly signed line
-for each record:
+**Appending.**
 
-- lines without a valid signature are noted and ignored;
-- later conflicting lines are noted and ignored;
-- lines that are not JSON are noted and ignored.
+- Whoever holds the forwarder's SSH key can append to the anchor but cannot
+  change or remove what is there.
+- Appended lines cannot make a record that was anchored look different.
+- Someone holding the Warden's key can still make a run's audit fail: for
+  instance, by appending a signed line for a record the log does not hold
+  before the run's `run_end` arrives, or simply by deleting the log. They can
+  always do that. It does not make an altered run pass.
 
-So appended lines cannot make a genuine run fail or an altered one pass. The
-Warden host's root can still make a run fail in other ways, for instance by
-deleting its log.
+**When records can still be lost.** Each of these is reported, and the audit
+then reports those records as never anchored:
+
+- **The forwarder stops for a long time mid-run.** Once the pipe (64 KiB, a
+  few hundred records) fills, the Warden records an `anchor_error`.
+- **A run ends while no forwarder runs, and none starts within 10 s.** The
+  Warden prints a status line.
+- **The forwarder stops while holding records it could not spool.** It logs
+  them as lost.
+
+**A hint for the anchor host.** Set `ClientAliveInterval` in its sshd
+configuration so that dead sessions are closed. The forced command never
+holds the lock while waiting for input, but a dead session keeps a process
+alive until sshd notices.
 
 ## Setting it up (two machines)
 
@@ -148,10 +161,15 @@ tools/varek_preflight.sh policies/finance.policy.txt \
     --anchor /run/varek/anchor.fifo --spool /var/lib/varek/anchor-spool --run
 ```
 
-Then run the Warden with `--anchor /run/varek/anchor.fifo`. To audit, copy
-`/srv/varek-anchor/droplet1.anchor.log` from the anchor host and pass it to
-`varek_audit.py --anchor`. Copy it as root or another account: the forwarder's
-key can only append.
+Then run the Warden with `--anchor /run/varek/anchor.fifo`.
+
+**To audit:**
+
+1. Copy `/srv/varek-anchor/droplet1.anchor.log` from the anchor host, as root
+   or another account (the forwarder's key can only append).
+2. Pick the run with `varek_audit.py --list-runs --anchor droplet1.anchor.log`.
+3. Audit it with `--anchor droplet1.anchor.log --run <id>`, plus
+   `--max-anchor-delay` if you want late records to fail.
 
 ## Changes
 
@@ -159,50 +177,66 @@ key can only append.
   - `tools/varek_anchor_forward.py` (Python 3 standard library only);
   - `tools/varek_anchor_receiver.sh`;
   - `tools/systemd/varek-anchor-forward.service`;
-  - the `--spool` option and the FIFO reader check in `varek_preflight.sh`;
+  - `varek_audit.py --list-runs` and `--max-anchor-delay`;
+  - in the preflight, the forwarder liveness check, `--spool`, the delivery
+    check, and the warnings for a local-file anchor and an on-host key;
   - `make test-v1162`.
+- **Changed (Warden):**
+  - a FIFO anchor needs a live forwarder when its `FIFO.lock` exists;
+  - it is held read-write, and drained for up to 10 s at exit when no
+    forwarder runs;
+  - `run_start` reads `"warden":"1.16.2"`.
+- **Changed (audit):** which anchor lines count (above).
 - **Fixed:** the command order in `RELEASE-v1.16.1.md` ("Using it") and in
-  `varek/v1_4/README.md`. `varek_keygen` must be built before it is run.
-- **Changed:**
-  - the Warden holds a FIFO anchor read-write, and drains it at exit (up to
-    10 s);
-  - `run_start` reads `"warden":"1.16.2"`;
-  - `varek/v1_4/README.md` gains an "Off-host anchor" section.
+  `varek/v1_4/README.md`. `varek_keygen` must be built before it is run, and
+  `/etc/varek` must exist.
 
 ## Testing
 
-`make test-v1162` (24 checks). It runs a receiver behind a private sshd on
-127.0.0.1:2222, with the forwarder in front of the Warden, and checks:
+`make test-v1162` (30 checks) runs a receiver behind a private sshd on
+127.0.0.1:2222, with the forwarder in front of the Warden.
 
-- **Off-host anchoring.** Every signed record of a run reaches the receiver,
-  and the run audits `signed, anchored` against the receiver's copy.
+- **Setup.** A public key carrying a second line is refused before anything is
+  created. The receiver is set up with one restricted key.
+- **Off-host anchoring.** Every signed record of a run reaches the receiver
+  with a receive time, and the run audits `signed, anchored`.
 - **The receiver only appends.**
-  - A public key carrying a second line is refused at setup.
-  - Its account does not run a requested command (one that would succeed if
-    it ran).
-  - It drops malformed lines.
-  - It cannot truncate the file.
+  - A requested command is not run (one that would succeed if it ran).
+  - Malformed lines are dropped.
+  - The file cannot be truncated.
   - A connection through a requested port forward gets nothing.
 - **Nothing is lost.**
-  - The anchor host is down: the records wait in the spool and are delivered
-    when it returns.
+  - The anchor host is down: the records wait in the spool and are delivered.
+  - `--max-anchor-delay 1.5` passes the prompt run and fails the one held
+    during the outage.
+  - The anchor lines' times are edited to look prompt: the run still fails
+    (the delay is measured from the stream).
   - The forwarder is stopped for 3 s mid-run: no anchor error, and the run
     audits `signed, anchored`.
   - The receiver cannot write: the forwarder retries until it can.
-  - The spool disk is full: lines are held in memory and sent once there is
-    room.
-- **Receive times.** Each line carries one. `--max-anchor-delay` flags records
-  that arrived late.
-- **Extra anchor lines.** Unsigned, conflicting (validly signed) and
-  malformed lines are noted and ignored, and the run passes. `--list-runs`
-  lists every run.
+  - The spool disk is full: the forwarder keeps running and sends once there
+    is room.
+- **Extra anchor lines.** None of these makes the run fail; each is noted:
+  - unsigned lines;
+  - a conflicting, validly signed line placed first;
+  - lines that are not JSON;
+  - a 5,000-digit number;
+  - a signed line appended after the run ended.
+
+  `--list-runs` lists every run.
 - **The preflight.**
   - With the forwarder running, the trial run is delivered off-host and
     audited, with no warnings.
   - With the anchor host down, delivery fails.
-  - A FIFO with no reader fails.
+  - A FIFO held open by another Warden, with the forwarder gone, fails, and
+    the Warden refuses it too.
+  - A FIFO with no reader at all fails.
   - A local-file anchor and an on-host key are warnings.
   - A spool the agent could open fails.
+- **Liveness.**
+  - With a busy forwarder, the Warden exits at once and the records still
+    arrive.
+  - A stalled session does not block another.
 - **`--exec`.** It delivers to a command, and the run audits `anchored`.
 
 The test is skipped without OpenSSH. Earlier suites pass.
@@ -212,14 +246,11 @@ produces EPIPE `anchor_error` records. The Warden holds the FIFO, so the
 records wait in the pipe, and at exit it reports what no reader took.
 `test_v1160.sh` checks that report instead.
 
-**Independent review.** It found problems in the first version of this
-release, all fixed and covered above:
+**Independent review.** Two rounds. The first found:
 
 - a public key with an embedded newline gave an unrestricted shell on the
   anchor host;
-- the notes overstated what the anchor protects: records not yet delivered,
-  including whole runs during an outage, were open to rewriting, with no trace
-  (hence receive times, `--max-anchor-delay` and `--list-runs`);
+- the notes overstated what the anchor protects;
 - appended or malformed lines could make honest runs fail;
 - a forwarder restart mid-run lost checkpoints;
 - a failed append could look successful where `/bin/sh` is bash, and
@@ -228,13 +259,25 @@ release, all fixed and covered above:
 - a rotation crash could skip lines;
 - the forwarder trusted files owned by other users;
 - the receiver would take over existing accounts;
-- the preflight passed without checking delivery;
-- two test checks passed without the protection they tested.
+- the preflight passed without checking delivery.
+
+The second found:
+
+- the anchor delay could be faked by editing the spool;
+- a FIFO held open by another Warden looked like a live forwarder;
+- a line placed first, or a huge number, could still make an honest run fail;
+- a stalled session blocked all appends;
+- torn lines on a full disk;
+- the receiver left partial state behind on refusal.
+
+All are fixed and covered above.
 
 ## Requirements
 
-- **Warden:** unchanged.
+- **Warden:** unchanged dependencies.
 - **Forwarder:** Python 3, plus the OpenSSH client for `--ssh`.
-- **Receiver:** OpenSSH server, `useradd`, and a filesystem that supports
-  `chattr +a` (ext4, XFS). The receiver script says so when the filesystem
-  does not.
+- **Receiver:**
+  - OpenSSH server;
+  - `useradd`, `flock`, GNU `date` (nanoseconds) and `ssh-keygen`;
+  - a filesystem that supports `chattr +a` (ext4, XFS). Setup fails otherwise,
+    unless `--allow-no-chattr` is given.

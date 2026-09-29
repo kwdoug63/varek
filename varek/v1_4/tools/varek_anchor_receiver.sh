@@ -63,27 +63,53 @@ case "$PUBKEY" in *[[:cntrl:]]*|*\"*|*\\*) die "--pubkey: must be a single line 
     || die "--pubkey: expected one OpenSSH public key line (ssh-ed25519 AAAA... comment)"
 printf '%s\n' "$PUBKEY" | ssh-keygen -l -f - >/dev/null 2>&1 || die "--pubkey: ssh-keygen does not accept this key"
 
-# The account: create it, or accept an existing one only if it is this
-# receiver's (a system account whose home is DIR). Never root.
+# Everything is checked before anything is created.
 if id "$USERN" >/dev/null 2>&1; then
     uid="$(id -u "$USERN")"; home="$(getent passwd "$USERN" | cut -d: -f6)"
     [ "$uid" -ne 0 ] || die "--user: refusing to use root"
     [ "$home" = "$DIR" ] || die "user $USERN exists with home $home, not $DIR: choose another --user"
+    NEWUSER=0
 else
-    useradd --system --home-dir "$DIR" --no-create-home --shell /bin/sh "$USERN"
+    NEWUSER=1
 fi
-# No password, but not locked: sshd refuses key logins to a locked ("!")
-# account on some configurations.
-usermod -p '*' "$USERN"
 if [ -e "$DIR" ]; then
     [ -d "$DIR" ] && [ ! -L "$DIR" ] && [ "$(stat -c %u "$DIR")" = 0 ] \
         || die "$DIR exists and is not a root-owned directory"
+    NEWDIR=0
+else
+    NEWDIR=1
 fi
-install -d -o root -g root -m 755 "$DIR" "$DIR/.ssh"
+for tool in flock date ssh-keygen chattr lsattr; do
+    command -v "$tool" >/dev/null 2>&1 || die "$tool is required"
+done
+date +%s%N | grep -Eq '^[0-9]{19}$' || die "date +%s%N must print nanoseconds (GNU date)"
+install -d -o root -g root -m 755 "$DIR"
+probe="$DIR/.chattr-probe.$$"
+: > "$probe"
+if chattr +a "$probe" 2>/dev/null && lsattr "$probe" | cut -d' ' -f1 | grep -q a; then
+    CHATTR=1; chattr -a "$probe"
+else
+    CHATTR=0
+fi
+rm -f "$probe"
+if [ "$CHATTR" = 0 ] && [ "$NOCHATTR" = 0 ]; then
+    [ "$NEWDIR" = 1 ] && rmdir "$DIR"
+    die "this filesystem does not support chattr +a (append-only): use one that does (ext4, XFS), or --allow-no-chattr"
+fi
 
-# The forced command: only well-formed anchor lines, only appended, each with
-# this host's receive time; one writer at a time (flock); a failure to write
-# exits non-zero, so the forwarder keeps the lines and retries.
+# Create.
+[ "$NEWUSER" = 1 ] && useradd --system --home-dir "$DIR" --no-create-home --shell /bin/sh "$USERN"
+# No password, but not locked: sshd refuses key logins to a locked ("!")
+# account on some configurations.
+usermod -p '*' "$USERN"
+install -d -o root -g root -m 755 "$DIR/.ssh"
+
+# The forced command. It reads the whole batch first (so a stalled session
+# never holds the lock), keeps only well-formed anchor lines, stamps the batch
+# with this host's receive time, and appends it under an exclusive lock
+# (waiting at most 30 s). A torn last line left by a failed write is closed
+# before appending. Any failure exits non-zero, so the forwarder keeps the
+# lines and retries (duplicates are harmless).
 install -d -o root -g root -m 755 "$(dirname "$HELPER")"
 cat > "$HELPER" <<'EOF'
 #!/bin/sh
@@ -93,26 +119,31 @@ cat > "$HELPER" <<'EOF'
 set -u
 case "${1:-}" in *[!A-Za-z0-9._-]*|"") exit 2 ;; esac
 f="${VAREK_ANCHOR_DIR:-/srv/varek-anchor}/$1.anchor.log"
-exec 9>>"$f" || exit 3
-flock 9 || exit 4
-re='^\{"run":"[0-9a-f]{32}","event":"(run_start|checkpoint|run_end)","records":(0|[1-9][0-9]*),"chain":"[0-9a-f]{64}"(,"sig":"[0-9a-f]{128}")?,"timestamp_ns":(0|[1-9][0-9]*)\}$'
-while IFS= read -r l; do
-    printf '%s\n' "$l" | LC_ALL=C grep -Eq "$re" || continue
-    now="$(date +%s%N)" || exit 5
-    printf '%s,"received_ns":%s}\n' "${l%\}}" "$now" >&9 || exit 6
-done
+tmp="$(mktemp)" || exit 3
+trap 'rm -f "$tmp" "$tmp.ok"' EXIT
+head -c 4194304 > "$tmp" || exit 3                     # a batch is at most 1 MiB
+re='^\{"run":"[0-9a-f]{32}","event":"(run_start|checkpoint|run_end)","records":(0|[1-9][0-9]{0,19}),"chain":"[0-9a-f]{64}"(,"sig":"[0-9a-f]{128}")?,"timestamp_ns":(0|[1-9][0-9]{0,18})\}$'
+LC_ALL=C grep -E "$re" "$tmp" > "$tmp.ok"; rc=$?
+[ "$rc" -le 1 ] || exit 4
+[ -s "$tmp.ok" ] || exit 0
+now="$(date +%s%N)" || exit 5
+case "$now" in *[!0-9]*|"") exit 5 ;; esac
+exec 9>>"$f" || exit 6
+flock -w 30 9 || exit 7
+if [ -s "$f" ] && [ "$(tail -c 1 "$f" | od -An -tx1 | tr -d ' ')" != 0a ]; then
+    printf '\n' >&9 || exit 8                          # close a torn line
+fi
+sed "s/}\$/,\"received_ns\":$now}/" "$tmp.ok" >&9 || exit 9
 exit 0
 EOF
 chmod 755 "$HELPER"
 
 F="$DIR/$NAME.anchor.log"
 [ -e "$F" ] || install -o "$USERN" -g "$USERN" -m 640 /dev/null "$F"
-if chattr +a "$F" 2>/dev/null && lsattr "$F" | cut -d' ' -f1 | grep -q a; then
+if [ "$CHATTR" = 1 ] && chattr +a "$F" 2>/dev/null; then
     ATTR="append-only (chattr +a)"
-elif [ "$NOCHATTR" = 1 ]; then
-    ATTR="NOT append-only (this filesystem does not support chattr +a; --allow-no-chattr): the account could rewrite it"
 else
-    die "cannot make $F append-only (chattr +a): use a filesystem that supports it (ext4, XFS), or --allow-no-chattr"
+    ATTR="NOT append-only (--allow-no-chattr): the account could rewrite it"
 fi
 
 KEYLINE="restrict,command=\"VAREK_ANCHOR_DIR=$DIR $HELPER $NAME\" $PUBKEY"

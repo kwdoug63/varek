@@ -185,7 +185,7 @@ if [ -n "$ANCHOR" ]; then
     A="$(abs "$ANCHOR")"
     ok=1
     if [ ! -x "$(dirname "$A")" ] && [ -e "$(dirname "$A")" ]; then
-        warn "cannot look inside $(dirname "$A") as this user, so the anchor was not checked (run the preflight as root)"; ok=0
+        warn "cannot look inside $(dirname "$A") as this user, so the anchor was not checked (run the preflight as root)"; ok=0; unchecked=1
     elif [ -L "$A" ]; then fail "anchor $A is a symlink (the Warden opens it with O_NOFOLLOW and refuses)"; ok=0
     elif [ -e "$A" ]; then
         if [ -f "$A" ]; then
@@ -193,15 +193,34 @@ if [ -n "$ANCHOR" ]; then
         elif [ -p "$A" ]; then
             # The Warden opens the anchor non-blocking for writing, which fails
             # (ENXIO) when no process has the FIFO open for reading.
-            if python3 -c 'import os,sys
+            # The forwarder holds FIFO.lock while it runs; a FIFO merely held
+            # open (a running Warden holds its anchor read-write) is not a
+            # forwarder. Without a lock file (another kind of reader), only
+            # the reader check applies.
+            live="$(python3 -c 'import errno,fcntl,os,sys
+fifo = sys.argv[1]
 try:
-    os.close(os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK))
+    fd = os.open(fifo + ".lock", os.O_RDONLY | os.O_NOFOLLOW)
 except OSError:
-    sys.exit(1)' "$A" 2>/dev/null; then
-                pass "anchor FIFO $A has a reader (the forwarder is running)"
-            else
-                fail "anchor FIFO $A has no reader: start the forwarder (tools/varek_anchor_forward.py) first; the Warden refuses it otherwise"; ok=0
-            fi
+    fd = None
+if fd is not None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        print("dead")
+    except OSError:
+        print("alive")
+    sys.exit(0)
+try:
+    os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+    print("reader")
+except OSError:
+    print("none")' "$A" 2>/dev/null)"
+            case "$live" in
+                alive)  pass "anchor FIFO $A: the forwarder is running (it holds $A.lock)" ;;
+                reader) warn "anchor FIFO $A has a reader, but not the VAREK forwarder (no $A.lock): a running Warden's own hold would look the same" ;;
+                dead)   fail "anchor FIFO $A: the forwarder is not running ($A.lock is free); the Warden refuses it. Start the forwarder first"; ok=0 ;;
+                *)      fail "anchor FIFO $A has no reader: start the forwarder (tools/varek_anchor_forward.py) first; the Warden refuses it otherwise"; ok=0 ;;
+            esac
         elif [ -c "$A" ]; then :
         else fail "anchor $A is not a regular file, FIFO or character device"; ok=0; fi
     else
@@ -214,11 +233,11 @@ except OSError:
             *)       fail "anchor: the policy lets the agent open ${r#* } (refused)" ;;
         esac
     fi
-    if [ ! -p "$A" ] && [ ! -c "$A" ]; then
+    if [ -z "${unchecked:-}" ] && [ ! -p "$A" ] && [ ! -c "$A" ]; then
         warn "the anchor is a file on this host: it protects the stream against people who cannot write it, not against this host's root. To anchor off this host, point --anchor at a FIFO read by tools/varek_anchor_forward.py"
     fi
 fi
-if [ -n "$KEY" ] && { [ -z "$ANCHOR" ] || { [ ! -p "$(abs "$ANCHOR")" ] && [ ! -c "$(abs "$ANCHOR")" ]; }; }; then
+if [ -n "$KEY" ] && [ -z "${unchecked:-}" ] && { [ -z "$ANCHOR" ] || { [ ! -p "$(abs "$ANCHOR")" ] && [ ! -c "$(abs "$ANCHOR")" ]; }; }; then
     warn "the signing key and the verdict streams are both on this host: the signatures protect against holders of the logs who are not root here; against this host's root only an off-host anchor helps"
 fi
 if [ -n "$SPOOL" ]; then
@@ -263,11 +282,18 @@ if [ "$RUN" = 1 ]; then
                 # and its sent.offset shows whether it reached the anchor host.
                 if [ -n "$ANCHOR" ] && [ -p "$(abs "$ANCHOR")" ]; then
                     if [ -n "$SPOOL" ]; then
+                        # Delivered: the trial run's own run_end is in the spool,
+                        # and the forwarder's sent offset is past it.
                         SPF="$(abs "$SPOOL")/anchor.spool" delivered=0
+                        trid="$($SUDO grep -o '"event":"run_start","run":"[0-9a-f]*"' "$T" | head -1 | cut -d'"' -f8)"
                         for _ in $(seq 1 30); do
-                            sz="$($SUDO stat -c %s "$SPF" 2>/dev/null || echo 0)"
-                            off="$($SUDO cat "$(abs "$SPOOL")/sent.offset" 2>/dev/null || echo 0)"
-                            [ "$sz" -gt 0 ] && [ "$off" -ge "$sz" ] 2>/dev/null && { delivered=1; break; }
+                            endb="$($SUDO grep -b "\"run\":\"$trid\",\"event\":\"run_end\"" "$SPF" 2>/dev/null | head -1)"
+                            if [ -n "$trid" ] && [ -n "$endb" ]; then
+                                pos="${endb%%:*}"; line="${endb#*:}"
+                                need=$((pos + ${#line} + 1))
+                                off="$($SUDO cat "$(abs "$SPOOL")/sent.offset" 2>/dev/null || echo 0)"
+                                [ "$off" -ge "$need" ] 2>/dev/null && { delivered=1; break; }
+                            fi
                             sleep 0.5
                         done
                         if [ "$delivered" = 1 ]; then pass "the forwarder delivered the trial run's records off-host"
@@ -290,5 +316,6 @@ if [ "$RUN" = 1 ]; then
 fi
 
 echo
+[ -n "${unchecked:-}" ] && echo "preflight: some checks need root; run it as root for a complete check"
 if [ "$fails" -eq 0 ]; then echo "preflight: PASS ($warns warning(s))"; else echo "preflight: FAIL ($fails failure(s), $warns warning(s))"; fi
 [ "$fails" -eq 0 ]

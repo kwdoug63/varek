@@ -216,7 +216,7 @@ grep -q "file 12" "$OUT/stdout2" && grep -q '"event":"run_end"' "$OUT/v2" \
 # v1.16.2: the Warden holds a FIFO anchor read-write, so the records it writes
 # after the reader left wait in the pipe; at exit it waits 10 s for a reader,
 # then reports them as lost (run_end stays the last record).
-grep -q '^\[warden\] anchor: .* not read by the forwarder within 10 s' "$OUT/v2" \
+grep -q '^\[warden\] anchor: .* not read within 10 s' "$OUT/v2" \
   && [ "$(grep '^{' "$OUT/v2" | tail -1 | grep -c '"event":"run_end"')" = 1 ] \
   && pass "unread anchor records are reported at exit, and run_end stays the last record" || flunk "unread anchor records"
 o="$("${A[@]}" --pubkey "$D/keys/k1.pub" --anchor "$OUT/fifo_got" "$OUT/v2" 2>&1)"

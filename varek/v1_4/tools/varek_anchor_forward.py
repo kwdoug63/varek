@@ -19,7 +19,8 @@ gap:
 
   * It creates the FIFO (mode 600) and holds it open, so the Warden always
     finds a reader (the Warden refuses a FIFO anchor with none, and never
-    blocks on it).
+    blocks on it), and holds an exclusive lock on FIFO.lock while it runs,
+    which the Warden and the preflight test to know it is alive.
   * Every line it reads is first appended to a local spool, then sent. Sending
     is retried with backoff until it succeeds, so an outage of the anchor host
     delays anchoring but loses nothing already read; after a restart, whatever was not yet
@@ -44,6 +45,7 @@ stderr. SIGTERM: one last attempt to send, then exit.
 
 import argparse
 import errno
+import fcntl
 import json
 import os
 import re
@@ -55,8 +57,8 @@ import sys
 import time
 
 LINE = re.compile(rb'^\{"run":"[0-9a-f]{32}","event":"(run_start|checkpoint|run_end)",'
-                  rb'"records":(0|[1-9][0-9]*),"chain":"[0-9a-f]{64}"(,"sig":"[0-9a-f]{128}")?,'
-                  rb'"timestamp_ns":(0|[1-9][0-9]*)\}$')
+                  rb'"records":(0|[1-9][0-9]{0,19}),"chain":"[0-9a-f]{64}"(,"sig":"[0-9a-f]{128}")?,'
+                  rb'"timestamp_ns":(0|[1-9][0-9]{0,18})\}$')
 MAX_LINE = 1024
 ROTATE_AT = 16 << 20            # rotate the spool once fully sent and this large
 BATCH_MAX = 1 << 20
@@ -107,25 +109,27 @@ class Spool:
 
     def append(self, lines):
         """Write lines (plus any held back earlier). On a write error (disk
-        full), keep them in memory and report False; the caller retries."""
+        full), cut the spool back to where it was, so no torn line remains,
+        keep the lines in memory, and report False; the caller retries and
+        stops reading the FIFO meanwhile (the Warden's hold keeps the rest in
+        the pipe)."""
         self.held.extend(lines)
         if not self.held:
             return True
         data = b"".join(l + b"\n" for l in self.held)
+        start = os.fstat(self.fd).st_size
         try:
             n = 0
             while n < len(data):
                 n += os.write(self.fd, data[n:])
             os.fsync(self.fd)
         except OSError as e:
-            # A partial write leaves a torn line; pending() sends whole lines
-            # only, and the torn one is completed by the retry (as a new line).
-            log(f"cannot write the spool ({e.strerror}); {len(self.held)} line(s) held in memory")
-            if n:
-                try:
-                    os.write(self.fd, b"\n")
-                except OSError:
-                    pass
+            try:
+                os.ftruncate(self.fd, start)
+            except OSError:
+                pass
+            log(f"cannot write the spool ({e.strerror}); {len(self.held)} line(s) held in memory, "
+                f"FIFO reads paused")
             return False
         self.held = []
         return True
@@ -195,7 +199,15 @@ def open_fifo(path):
         os.close(fd)
         raise SystemExit(f"varek_anchor_forward: {path} is not a FIFO owned by this user")
     os.fchmod(fd, 0o600)
-    return fd
+    # A lock held for the forwarder's lifetime: the Warden and the preflight
+    # test it to tell a live forwarder from a FIFO merely held open (another
+    # Warden holds its anchor FIFO read-write).
+    lk = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit(f"varek_anchor_forward: another forwarder holds {path}.lock")
+    return fd, lk
 
 
 def sender(a):
@@ -265,13 +277,14 @@ def main(argv=None):
             if not spool.pending()[1]:
                 return 0
 
-    fd = open_fifo(a.fifo)
+    fd, _lock = open_fifo(a.fifo)
     log(f"reading {a.fifo}, spooling to {spool.path}, sending to {name}")
     buf = b""
     backoff = a.interval
     next_try = 0.0
     while not stop["now"]:
-        r, _, _ = select.select([fd], [], [], a.interval)
+        # While lines are held back by a full disk, leave the rest in the pipe.
+        r, _, _ = select.select([] if spool.held else [fd], [], [], a.interval)
         if r:
             try:
                 chunk = os.read(fd, 65536)
@@ -300,6 +313,11 @@ def main(argv=None):
             else:
                 backoff = min(backoff * 2, 60.0)
                 next_try = now + backoff
+    if spool.held:
+        spool.append([])
+    if spool.held:
+        log(f"stopping with {len(spool.held)} line(s) that could not be written to the spool: "
+            f"they are lost; the audit will report them as never anchored")
     try_send()
     log("stopped")
     return 0

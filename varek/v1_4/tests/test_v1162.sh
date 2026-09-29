@@ -60,6 +60,7 @@ cleanup() {
     chattr -a "$RD"/*.anchor.log "$RD"/*.moved 2>/dev/null
     rm -rf "$RD" /run/varek-v1162 /var/lib/varek-v1162 "$LOGD" "$(dirname "$HELPER")" "$OUT" \
            /tmp/varek_v1162_marker
+    pkill -u "$U" 2>/dev/null; sleep 0.3      # e.g. a helper still reading a stalled session
     userdel "$U" 2>/dev/null
 }
 trap cleanup EXIT
@@ -149,8 +150,35 @@ stop_fwd; start_sshd; start_fwd
 wait_run "$RF" "$R2" "$n2" && pass "it returns (and the forwarder restarts): they are delivered" || flunk "delivery after outage"
 o="$("${A[@]}" --pubkey "$OUT/log.key.pub" --anchor "$RF" "$LOGD/v2.log" 2>&1)"
 grep -q "integrity: signed, anchored" <<<"$o" && pass "the run made during the outage audits signed, anchored" || flunk "audit after outage"
-o="$("${A[@]}" --pubkey "$OUT/log.key.pub" --anchor "$RF" --max-anchor-delay 0.001 "$LOGD/v2.log" 2>&1)"
-grep -q "reached the anchor more than" <<<"$o" && pass "--max-anchor-delay flags records that arrived late" || flunk "late records"
+o1="$("${A[@]}" --pubkey "$OUT/log.key.pub" --anchor "$RF" --max-anchor-delay 1.5 "$LOGD/v1.log" 2>&1)"
+o2="$("${A[@]}" --pubkey "$OUT/log.key.pub" --anchor "$RF" --max-anchor-delay 1.5 "$LOGD/v2.log" 2>&1)"
+grep -q PASS <<<"$o1" && grep -q "reached the anchor more than" <<<"$o2" \
+  && pass "--max-anchor-delay 1.5: the prompt run passes, the run held during the outage fails" || { flunk "late records"; echo "$o1" | tail -2; echo "$o2" | tail -2; }
+# Held records whose anchor-line times are edited to look prompt: the audit
+# measures against the stream's signed times, not the anchor line's.
+stop_sshd
+warden_run "$LOGD/v2b.log" -- /bin/true
+R2b="$(runid "$LOGD/v2b.log")"; n2b=$(nsig "$LOGD/v2b.log")
+sleep 3
+python3 - "$SP/anchor.spool" "$R2b" <<'EOF'
+import re, sys
+p, run = sys.argv[1], sys.argv[2].encode()
+b = open(p, "rb").read()
+def bump(m):
+    return b'"timestamp_ns":' + str(int(m.group(1)) + 60_000_000_000).encode()
+out = []
+for l in b.split(b"\n"):
+    if run in l:
+        l = re.sub(rb'"timestamp_ns":([0-9]+)', bump, l)
+    out.append(l)
+open(p, "wb").write(b"\n".join(out))
+EOF
+start_sshd; stop_fwd; start_fwd
+wait_run "$RF" "$R2b" "$n2b"
+o="$("${A[@]}" --pubkey "$OUT/log.key.pub" --anchor "$RF" --max-anchor-delay 1.5 "$LOGD/v2b.log" 2>&1)"
+grep -q "reached the anchor more than" <<<"$o" && grep -q FAIL <<<"$o" \
+  && pass "anchor-line times edited to look prompt: the delay is measured from the stream, and the run fails" \
+  || { flunk "edited anchor times"; echo "$o" | tail -3; }
 # Forwarder restarted in the middle of a run: the Warden holds the FIFO open.
 warden_run "$LOGD/v3.log" --checkpoint-every 1 -- "$PROBE" -s 3000 /etc/ld.so.cache /etc/ld.so.cache &
 wp=$!
@@ -194,32 +222,87 @@ fi
 start_fwd
 
 echo "== 4. extra anchor lines neither fool nor block the audit"
-cp "$RF" "$OUT/extra.log"
 line="$(grep "\"run\":\"$R1\"" "$RF" | grep '"event":"run_end"' | head -1)"
-{ printf '%s\n' "${line/\"records\":/\"records\":9}"         # conflicting, later, still validly signed
+{ printf '%s\n' "${line/\"records\":/\"records\":9}"         # conflicting, placed FIRST, still validly signed
+  cat "$RF"
   printf '%s\n' "$(sed -E 's/"sig":"[0-9a-f]{128}"/"sig":"'"$(printf '0%.0s' $(seq 1 128))"'"/' <<<"$line")"
   echo 'this is not JSON'
-} >> "$OUT/extra.log"
+  printf '{"run":"%s","records":%s}\n' "$R1" "$(head -c 5000 /dev/zero | tr '\0' 7)"   # a 5000-digit number
+} > "$OUT/extra.log"
 o="$("${A[@]}" --pubkey "$OUT/log.key.pub" --anchor "$OUT/extra.log" "$LOGD/v1.log" 2>&1)"
 grep -q "integrity: signed, anchored" <<<"$o" && grep -q "PASS" <<<"$o" && grep -q "no valid signature" <<<"$o" \
-  && grep -q "first one received was used" <<<"$o" && grep -q "not JSON" <<<"$o" \
-  && pass "unsigned, conflicting and malformed extra lines are noted and ignored" || { flunk "extra lines"; echo "$o" | tail -6; }
+  && grep -q "different event or count" <<<"$o" && grep -q "not JSON" <<<"$o" && ! grep -q Traceback <<<"$o" \
+  && pass "unsigned, conflicting (even first) and malformed extra lines, and a huge number, are noted and ignored" \
+  || { flunk "extra lines"; echo "$o" | tail -6; }
+if python3 -c "import cryptography" 2>/dev/null; then
+    # Someone holding the Warden's key appends a signed record the stream
+    # does not hold, after the run ended: noted, not a failure.
+    python3 - "$OUT/log.key" "$R1" > "$OUT/bogus.line" <<'EOF'
+import os, sys, time
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+k = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(open(sys.argv[1]).read().strip()))
+ch = os.urandom(32)
+print('{"run":"%s","event":"checkpoint","records":3,"chain":"%s","sig":"%s","timestamp_ns":%d}'
+      % (sys.argv[2], ch.hex(), k.sign(b"VAREK-LOG-SIG-1" + ch).hex(), time.time_ns()))
+EOF
+    "${SSH[@]}" -i "$OUT/fwkey" "$U@127.0.0.1" < "$OUT/bogus.line" >/dev/null 2>&1
+    o="$("${A[@]}" --pubkey "$OUT/log.key.pub" --anchor "$RF" "$LOGD/v1.log" 2>&1)"
+    grep -q "arrived after its run_end was anchored" <<<"$o" && grep -q PASS <<<"$o" \
+      && pass "a signed line appended after the run ended is noted, and the finished run still passes" \
+      || { flunk "appended signed line"; echo "$o" | tail -3; }
+else
+    printf '  %-6s %s\n' SKIP "appended signed line (python3 cryptography not installed)"
+fi
 o="$(python3 "$HERE/tools/varek_audit.py" --list-runs --anchor "$RF" 2>&1)"
 for r in "$R1" "$R2" "$R3" "$R4"; do grep -q "$r" <<<"$o" || { flunk "--list-runs misses $r"; break; }; done
 grep -q "run(s) in" <<<"$o" && pass "--list-runs lists every run in the anchor" || flunk "--list-runs"
 
 echo "== 5. preflight"
 o="$("$PRE" "$POL" --log "$LOGD/p.log" --sign-key "$OUT/log.key" --anchor "$FIFO" --spool "$SP" --run 2>&1)"
-grep -q "has a reader" <<<"$o" && grep -q "delivered the trial run's records off-host" <<<"$o" \
+grep -q "the forwarder is running" <<<"$o" && grep -q "delivered the trial run's records off-host" <<<"$o" \
   && grep -q "integrity: signed, anchored" <<<"$o" && grep -q "preflight: PASS (0 warning" <<<"$o" \
   && pass "forwarder running: trial run delivered off-host and audited; no warnings" || { flunk "preflight with forwarder"; echo "$o" | grep -E "FAIL|WARN"; }
 stop_sshd
 o="$("$PRE" "$POL" --log "$LOGD/p.log" --sign-key "$OUT/log.key" --anchor "$FIFO" --spool "$SP" --run 2>&1)"
 grep -q "has not delivered" <<<"$o" && grep -q "preflight: FAIL" <<<"$o" && pass "anchor host down: the trial run's delivery fails" || flunk "preflight delivery failure"
 start_sshd
+# A running Warden holds the FIFO read-write; with the forwarder gone, the
+# FIFO still "has a reader", but the forwarder's lock is free.
+warden_run "$LOGD/vA.log" -- "$PROBE" -s 6000 /etc/ld.so.cache &
+wa=$!
+sleep 1; stop_fwd
+o="$("$PRE" "$POL" --anchor "$FIFO" 2>&1)"
+ob="$(timeout 20 "$WARDEN" "$POL" --sign-key "$OUT/log.key" --anchor "$FIFO" -- /bin/true 2>&1)"
+grep -q "the forwarder is not running" <<<"$o" && grep -q "the forwarder is not running" <<<"$ob" && ! grep -q "supervising pid=" <<<"$ob" \
+  && pass "a FIFO held open by another Warden is not taken for a forwarder (preflight fails; the Warden refuses)" \
+  || { flunk "held FIFO without forwarder"; echo "$o" | grep -E "FIFO"; echo "$ob" | head -2; }
+start_fwd
+wait "$wa"
+# A busy forwarder: the Warden does not wait for it at exit.
+stop_fwd
+python3 "$FWD" --fifo "$FIFO" --spool "$OUT/busy_spool" --exec "sleep 5; cat >> $OUT/busy_sink" --interval 0.3 \
+    >> "$OUT/fw4.log" 2>&1 &
+FWPID=$!; sleep 0.8
+t0=$(date +%s%N)
+warden_run "$LOGD/vB.log" -- /bin/true
+el=$(( ($(date +%s%N) - t0) / 1000000 ))
+[ "$el" -lt 4000 ] && ! grep -q "not read within" "$LOGD/vB.log" && wait_run "$OUT/busy_sink" "$(runid "$LOGD/vB.log")" 2 \
+  && pass "a busy forwarder: the Warden exits at once (${el} ms), and the records still arrive" || flunk "busy forwarder (${el} ms)"
+stop_fwd; start_fwd
+# A stalled session does not block others (the lock is taken only to write).
+( sleep 30 | "${SSH[@]}" -i "$OUT/fwkey" "$U@127.0.0.1" >/dev/null 2>&1 ) & st=$!
+sleep 1.5
+t0=$(date +%s%N)
+grep "\"run\":\"$R1\"" "$RF" | head -1 | timeout 15 "${SSH[@]}" -i "$OUT/fwkey" "$U@127.0.0.1" >/dev/null 2>&1; rc=$?
+el=$(( ($(date +%s%N) - t0) / 1000000 ))
+kill "$st" 2>/dev/null; pkill -P "$st" 2>/dev/null
+[ "$rc" = 0 ] && [ "$el" -lt 10000 ] && pass "a stalled session does not block another (${el} ms)" || flunk "stalled session (rc $rc, ${el} ms)"
 stop_fwd
 o="$("$PRE" "$POL" --anchor "$FIFO" 2>&1)"
-grep -q "has no reader" <<<"$o" && grep -q "preflight: FAIL" <<<"$o" && pass "a FIFO anchor with no reader fails" || flunk "FIFO without reader"
+grep -q "the forwarder is not running" <<<"$o" && grep -q "preflight: FAIL" <<<"$o" && pass "the forwarder stopped: a FIFO anchor fails" || flunk "FIFO without forwarder"
+mkfifo "$OUT/bare.fifo"
+o="$("$PRE" "$POL" --anchor "$OUT/bare.fifo" 2>&1)"
+grep -q "has no reader" <<<"$o" && grep -q "preflight: FAIL" <<<"$o" && pass "a FIFO with no reader at all fails" || flunk "FIFO without reader"
 o="$("$PRE" "$POL" --log "$LOGD/p.log" --sign-key "$OUT/log.key" --anchor "$LOGD/local.anchor" 2>&1)"
 grep -q "WARN  the anchor is a file on this host" <<<"$o" && grep -q "WARN  the signing key and the verdict streams are both on this host" <<<"$o" \
   && grep -q "preflight: PASS" <<<"$o" && pass "a local-file anchor and an on-host key are warnings" || flunk "local anchor warnings"

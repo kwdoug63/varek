@@ -141,72 +141,101 @@ def log_integrity(a, meta, run, complete, problems):
     if a.anchor:
         before = len(problems)
         skey = pk if stream_key is not None and _hex_key(stream_key) else None
+        CLOCK_SLACK = 5.0
         lines, other_runs, unparsed = read_anchor(a.anchor, problems)
         mine = [e for e in lines if e.get("run") == run]
         other_runs.discard(run)
         in_log = {c["chain"].hex(): c for c in signed}
-        # Per chain value, the first valid line in the anchor's (arrival) order
-        # decides; later lines for the same chain are noted, not trusted. In a
-        # signed stream a line counts only if its signature verifies, so lines
-        # appended by someone without the key are ignored.
-        first, ignored, conflicts = {}, 0, 0
+        # Which anchor lines count. In a signed stream, only lines whose
+        # signature verifies (a line appended by someone without the key is
+        # ignored). A record of the stream is anchored if ANY counting line
+        # carries its chain value with the same event, count and signature;
+        # other lines for that chain change nothing (the chain value already
+        # fixes the record) and are noted.
+        valid, ignored = [], 0
         for e in mine:
             ch = str(e.get("chain"))
             if skey is not None:
                 sig = e.get("sig")
                 try:
-                    good = isinstance(sig, str) and bytes.fromhex(ch) and \
+                    good = isinstance(sig, str) and len(ch) == 64 and \
                         varek_ed25519.verify(skey, LOG_SIG_DOMAIN + bytes.fromhex(ch), bytes.fromhex(sig))
                 except ValueError:
                     good = False
                 if not good:
                     ignored += 1
                     continue
-            if ch in first:
-                if (e.get("event"), e.get("sig"), e.get("records")) != \
-                        (first[ch].get("event"), first[ch].get("sig"), first[ch].get("records")):
-                    conflicts += 1
-                continue
-            first[ch] = e
-        for ch, e in first.items():
+            valid.append(e)
+        matched, conflicts, foreign_chain = {}, 0, []
+        for e in valid:
+            ch = str(e.get("chain"))
             c = in_log.get(ch)
             if c is None:
-                problems.append(f"anchored {e.get('event')} (records {e.get('records')}) is not in "
-                                f"the stream: the stream was rewritten after it was anchored")
-            elif e.get("event") != c["event"] or e.get("sig") != c["sig"] or \
-                    e.get("records") != c["records"]:
-                problems.append(f"anchored {e.get('event')} differs from the stream's (line {c['line']})")
+                foreign_chain.append(e)
+            elif (e.get("event"), e.get("sig"), e.get("records")) == (c["event"], c["sig"], c["records"]):
+                matched.setdefault(ch, e)
+            else:
+                conflicts += 1
         for ch, c in in_log.items():
-            if ch not in first:
+            if ch not in matched:
                 problems.append(f"line {c['line']}: {c['event']} was never anchored")
+        # A validly signed anchored record the stream does not hold is evidence
+        # the stream was rewritten, unless the anchor host received it after
+        # this run's run_end had been anchored (then it was appended later, by
+        # someone holding the key, and changes nothing that was anchored).
+        end_rx = None
+        for ch, e in matched.items():
+            if e.get("event") == "run_end" and isinstance(e.get("received_ns"), int):
+                end_rx = e["received_ns"]
+        late_foreign = 0
+        for e in foreign_chain:
+            rx = e.get("received_ns")
+            if end_rx is not None and isinstance(rx, int) and rx > end_rx:
+                late_foreign += 1
+                continue
+            problems.append(f"anchored {e.get('event')} (records {e.get('records')}) is not in "
+                            f"the stream: the stream was rewritten after it was anchored")
         for ae in log["anchor_errors"]:
             problems.append(f"line {ae['line']}: the Warden could not anchor a {ae['anchoring']} "
                             f"record (errno {ae['errno']})")
-        if not first:
+        if not valid:
             problems.append("the anchor holds nothing for this run")
         if ignored:
             print(f"varek_audit: note: {ignored} anchor line(s) for this run carry no valid signature "
                   f"and were ignored")
         if conflicts:
-            print(f"varek_audit: note: {conflicts} later anchor line(s) repeat a chain value with "
-                  f"different contents; the first one received was used")
+            print(f"varek_audit: note: {conflicts} anchor line(s) repeat a record's chain value with "
+                  f"a different event or count; ignored (the chain value fixes the record)")
+        if late_foreign:
+            print(f"varek_audit: note: {late_foreign} signed anchor line(s) for records the stream "
+                  f"does not hold arrived after its run_end was anchored; ignored")
         if unparsed:
             print(f"varek_audit: note: {unparsed} anchor line(s) are not JSON and were ignored")
         if other_runs:
             print(f"varek_audit: note: the anchor also holds {len(other_runs)} other run(s); "
                   f"list them with --list-runs")
-        # How late each record reached the anchor host (v1.16.2 receivers add
-        # "received_ns" with their own clock).
-        delays = [(e["received_ns"] - e["timestamp_ns"]) / 1e9 for e in first.values()
-                  if isinstance(e.get("received_ns"), int) and isinstance(e.get("timestamp_ns"), int)]
+        # How late each record reached the anchor host: its receive time (set
+        # by the anchor host) against the time in the STREAM's signed record
+        # (an anchor line's own timestamp is not trusted). A record received
+        # well before it was written means the clocks disagree or the times
+        # were changed.
+        delays = []
+        for ch, e in matched.items():
+            c = in_log[ch]
+            if isinstance(e.get("received_ns"), int) and isinstance(c.get("ts"), int):
+                delays.append((e["received_ns"] - c["ts"]) / 1e9)
         if delays:
-            late = [d for d in delays if d > a.max_anchor_delay] if a.max_anchor_delay is not None else []
-            print(f"varek_audit: anchoring delay: at most {max(delays):.1f} s "
-                  f"({len(delays)} record(s) with a receive time)")
-            if late:
-                problems.append(f"{len(late)} record(s) reached the anchor more than "
-                                f"{a.max_anchor_delay:g} s after they were written (at most "
-                                f"{max(late):.1f} s): they could have been changed before anchoring")
+            print(f"varek_audit: anchoring delay: at most {max(delays):.1f} s, at least "
+                  f"{min(delays):.1f} s ({len(delays)} record(s) with a receive time)")
+            if min(delays) < -CLOCK_SLACK:
+                problems.append(f"a record was received {-min(delays):.1f} s before the stream says it was "
+                                f"written: the hosts' clocks disagree, or the times were changed")
+            if a.max_anchor_delay is not None:
+                late = [d for d in delays if d > a.max_anchor_delay]
+                if late:
+                    problems.append(f"{len(late)} record(s) reached the anchor more than "
+                                    f"{a.max_anchor_delay:g} s after they were written (at most "
+                                    f"{max(late):.1f} s): they could have been changed before anchoring")
         elif a.max_anchor_delay is not None:
             problems.append("--max-anchor-delay given, but the anchor has no receive times "
                             "(a v1.16.2 receiver adds them)")
@@ -214,7 +243,7 @@ def log_integrity(a, meta, run, complete, problems):
             level += ", anchored"
             if stream_key is None and not complete:
                 # Anchor only: what reached the anchor is sealed, nothing after it.
-                sealed = [c["ndec"] for c in signed if c["chain"].hex() in first]
+                sealed = [c["ndec"] for c in signed if c["chain"].hex() in matched]
                 meta["signed_through"] = max(sealed) if sealed else 0
                 level += f"; covers the first {meta['signed_through']} decision records only"
     return level
@@ -230,7 +259,7 @@ def read_anchor(path, problems):
             for line in fh:
                 try:
                     e = json.loads(line)
-                except json.JSONDecodeError:
+                except ValueError:           # JSONDecodeError, or a huge number
                     unparsed += 1
                     continue
                 if not isinstance(e, dict):
