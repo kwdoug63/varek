@@ -98,6 +98,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <limits.h>
 #include <sodium.h>              /* v1.16: SHA-256 chain, Ed25519 signatures */
 
@@ -892,7 +893,7 @@ static bool     g_relay_midline = false;
 static unsigned char g_chain[32];
 static bool          g_signing = false;
 static unsigned char g_pk[crypto_sign_PUBLICKEYBYTES];
-static unsigned char g_sk[crypto_sign_SECRETKEYBYTES];
+static unsigned char *g_sk;                /* sodium_malloc: guarded, locked, not dumped */
 static int           g_anchor_fd = -1;
 static uint64_t      g_ckpt_every = 64;
 static uint64_t      g_since_ckpt = 0;      /* decision records since the last signed record */
@@ -1105,8 +1106,10 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     if (g_signing) {
         char pk_hex[2 * crypto_sign_PUBLICKEYBYTES + 1];
         sodium_bin2hex(pk_hex, sizeof pk_hex, g_pk, sizeof g_pk);
-        fprintf(f, "\"log_pubkey\":\"%s\",\"checkpoint_every\":%" PRIu64 ",", pk_hex, g_ckpt_every);
+        fprintf(f, "\"log_pubkey\":\"%s\",", pk_hex);
     }
+    if (checkpoints_on())
+        fprintf(f, "\"checkpoint_every\":%" PRIu64 ",", g_ckpt_every);
     if (g_anchor_fd >= 0) fputs("\"anchored\":true,", f);
     fprintf(f, "\"timestamp_ns\":%lld}\n", (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end("run_start");
@@ -1586,7 +1589,8 @@ static int inject_fd(int notify_fd, uint64_t id, int resolved)
 /* ---------------- receive loop ---------------- */
 
 static volatile sig_atomic_t g_stop = 0;
-static void on_term(int sig) { (void)sig; g_stop = 1; }
+static volatile sig_atomic_t g_child_exited = 0;
+static void on_term(int sig) { if (sig == SIGCHLD) g_child_exited = 1; g_stop = 1; }
 
 /* Returns true when the agent went away on its own (its pidfd fired, or no
  * task is left under the filter), false when the Warden stopped supervising for
@@ -1796,12 +1800,32 @@ static int have_cap_sys_admin(void) {
 
 /* ---------------- v1.16: signing key and anchor ---------------- */
 
-/* The policy must not let the agent open the file at path (with any flags):
- * decided by the certificate checker, which every authorization needs. */
-static int refuse_if_agent_can_open(const struct policy *p, const char *path, const char *what) {
+/* The canonical path of an open descriptor, as the kernel resolved it (no
+ * second lookup that could race with a rename). */
+static int fd_path(int fd, char *out, size_t n) {
+    char link[64];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    ssize_t k = readlink(link, out, n - 1);
+    if (k <= 0 || (size_t)k >= n - 1 || out[0] != '/') return -1;
+    out[k] = '\0';
+    return 0;
+}
+
+/* The policy must not let the agent open the file behind fd (with any flags):
+ * decided by the certificate checker, which every authorization needs. A
+ * regular file must have exactly one name, or the agent could reach it through
+ * another (a hard link in an allowed directory). */
+static int refuse_if_agent_can_open(const struct policy *p, int fd, const char *path,
+                                    const char *what) {
+    struct stat st;
     char rp[PATH_MAX];
-    if (!realpath(path, rp)) {
-        fprintf(stderr, "[warden] %s %s: %s\n", what, path, strerror(errno));
+    if (fstat(fd, &st) < 0 || fd_path(fd, rp, sizeof rp) < 0) {
+        fprintf(stderr, "[warden] %s %s: cannot determine its path\n", what, path);
+        return -1;
+    }
+    if (S_ISREG(st.st_mode) && st.st_nlink != 1) {
+        fprintf(stderr, "[warden] the %s %s has %lu names (hard links); the agent could reach "
+                "it through another. Refusing to start.\n", what, rp, (unsigned long)st.st_nlink);
         return -1;
     }
     if (vdpc_path_openable(&p->c, rp, strlen(rp))) {
@@ -1813,8 +1837,61 @@ static int refuse_if_agent_can_open(const struct policy *p, const char *path, co
     return 0;
 }
 
+/* Raw access to a disk reads (or writes) every file on it, whatever the path
+ * rules say: with a signing key or an anchor, refuse a policy that would let
+ * the agent open any block device under /dev, /dev/mem, /dev/kmem, /dev/port,
+ * /proc/kcore, or a disk's command device (/dev/sg*, /dev/nvme*, /dev/bsg/).
+ * Only nodes that exist are checked; the agent cannot create one (mknod is not
+ * in its allowlist). Other drivers that expose storage are not recognized. */
+static int raw_device_scan(const struct policy *p, const char *dir, int depth) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int rc = 0;
+    struct dirent *e;
+    while (rc == 0 && (e = readdir(d)) != NULL) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char path[PATH_MAX];
+        if ((size_t)snprintf(path, sizeof path, "%s/%s", dir, e->d_name) >= sizeof path) continue;
+        struct stat st;
+        if (lstat(path, &st) < 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (depth < 4) rc = raw_device_scan(p, path, depth + 1);
+            continue;
+        }
+        /* Block devices; memory; and the character devices that pass commands
+         * to a disk (SCSI generic, NVMe, block SCSI generic). */
+        bool raw = S_ISBLK(st.st_mode) ||
+                   (S_ISCHR(st.st_mode) &&
+                    ((depth == 0 && (!strcmp(e->d_name, "mem") || !strcmp(e->d_name, "kmem") ||
+                                     !strcmp(e->d_name, "port") ||
+                                     !strncmp(e->d_name, "sg", 2) ||
+                                     !strncmp(e->d_name, "nvme", 4))) ||
+                     !strncmp(dir, "/dev/bsg", 8)));
+        if (raw && vdpc_path_openable(&p->c, path, strlen(path))) {
+            fprintf(stderr, "[warden] the policy would let the agent open %s, which gives raw "
+                    "access to storage (including the signing key or the anchor); deny it. "
+                    "Refusing to start.\n", path);
+            rc = -1;
+        }
+    }
+    closedir(d);
+    return rc;
+}
+
+static int refuse_raw_devices(const struct policy *p) {
+    if (raw_device_scan(p, "/dev", 0) < 0) return -1;
+    struct stat st;
+    if (stat("/proc/kcore", &st) == 0 && vdpc_path_openable(&p->c, "/proc/kcore", 11)) {
+        fprintf(stderr, "[warden] the policy would let the agent open /proc/kcore; deny it. "
+                "Refusing to start.\n");
+        return -1;
+    }
+    return 0;
+}
+
 /* --sign-key FILE: an Ed25519 seed, 64 hex characters (tools/varek_keygen
- * makes one), in a regular file no one but its owner can read or write. */
+ * makes one), in a regular file with one name that no one but its owner can
+ * read or write. */
 static int load_sign_key(const char *path, const struct policy *p) {
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
@@ -1833,6 +1910,7 @@ static int load_sign_key(const char *path, const struct policy *p) {
         close(fd);
         return -1;
     }
+    if (refuse_if_agent_can_open(p, fd, path, "signing key") < 0) { close(fd); return -1; }
     char buf[80];
     ssize_t n;
     do { n = read(fd, buf, sizeof buf); } while (n < 0 && errno == EINTR);
@@ -1849,13 +1927,14 @@ static int load_sign_key(const char *path, const struct policy *p) {
                 "make one with tools/varek_keygen)\n", path);
         return -1;
     }
-    crypto_sign_seed_keypair(g_pk, g_sk, seed);
-    sodium_memzero(seed, sizeof seed);
-    (void)sodium_mlock(g_sk, sizeof g_sk);
-    if (refuse_if_agent_can_open(p, path, "signing key") < 0) {
-        sodium_memzero(g_sk, sizeof g_sk);
+    g_sk = sodium_malloc(crypto_sign_SECRETKEYBYTES);
+    if (!g_sk) {
+        sodium_memzero(seed, sizeof seed);
+        fprintf(stderr, "[warden] cannot allocate protected memory for the signing key\n");
         return -1;
     }
+    crypto_sign_seed_keypair(g_pk, g_sk, seed);
+    sodium_memzero(seed, sizeof seed);
     g_signing = true;
     return 0;
 }
@@ -1876,9 +1955,17 @@ static int open_anchor(const char *path, const struct policy *p) {
         close(fd);
         return -1;
     }
-    if (refuse_if_agent_can_open(p, path, "anchor") < 0) { close(fd); return -1; }
+    if (refuse_if_agent_can_open(p, fd, path, "anchor") < 0) { close(fd); return -1; }
     g_anchor_fd = fd;
     return 0;
+}
+
+/* The verdict stream itself: if it is a regular file the agent could open, the
+ * agent could truncate or read it (and learn the run id). v1.16 refuses. */
+static int refuse_exposed_stream(const struct policy *p) {
+    struct stat st;
+    if (fstat(STDERR_FILENO, &st) < 0 || !S_ISREG(st.st_mode)) return 0;
+    return refuse_if_agent_can_open(p, STDERR_FILENO, "(stderr)", "verdict stream");
 }
 
 /* ---------------- main ---------------- */
@@ -1989,8 +2076,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[warden] libsodium failed to initialize\n");
         return 1;
     }
+    if (refuse_exposed_stream(&p) < 0) return 1;
     if (key_path && load_sign_key(key_path, &p) < 0) return 1;
     if (anchor_path && open_anchor(anchor_path, &p) < 0) return 1;
+    if ((key_path || anchor_path) && refuse_raw_devices(&p) < 0) return 1;
     /* A FIFO anchor whose reader went away must fail the write (EPIPE, then
      * an anchor_error record), not kill the Warden. The agent gets the
      * default disposition back before it runs (see the child below). */
@@ -2020,6 +2109,8 @@ int main(int argc, char **argv) {
     /* v1.6 pre-execution plan verification. Fires before fork; on
      * any non-SATISFIED result the target is not started. */
     if (plan_path && warden_verify_plan(plan_path, &p) != 0) {
+        emit_run_end(1);                    /* v1.16: a closed (and signed) stream */
+        if (g_sk) sodium_free(g_sk);
         return 1;
     }
 
@@ -2194,6 +2285,7 @@ int main(int argc, char **argv) {
 
     bool agent_ended = supervise(notify_fd, target_pidfd, agent_err_fd, &p,
                                  target_argv[0], target);
+    agent_ended = agent_ended || g_child_exited;   /* before the Warden's own SIGKILL */
 
     kill_target_tree(target);  /* the agent and everything it spawned */
     int status = 0;
@@ -2206,13 +2298,16 @@ int main(int argc, char **argv) {
      * killed by the filter (SIGSYS) left only an exit code of 1, which is how a
      * thread-starting agent could be killed on every run without a word. Only
      * when the agent ended on its own: otherwise the SIGKILL is the Warden's. */
+    /* v1.16: SIGCHLD also stops the loop, and then the agent ended on its own
+     * (agent_ended above; through v1.15 that race lost this report about one
+     * run in four). */
     if (agent_ended && WIFSIGNALED(status))
         fprintf(stderr, "[warden] agent killed by signal %d (%s)%s\n",
                 WTERMSIG(status), strsignal(WTERMSIG(status)),
                 WTERMSIG(status) == SIGSYS
                     ? ": most likely a hard-denied system call" : "");
     emit_run_end(rc);
-    sodium_memzero(g_sk, sizeof g_sk);
+    if (g_sk) sodium_free(g_sk);             /* zeroes it */
     close(target_pidfd);
     close(notify_fd);
     return rc;

@@ -219,8 +219,8 @@ The audit authenticates the stream, checks the policy file's SHA-256 against
 the checking rules are specified in `checker/vdp_checker.h`.
 
 A policy's globs may total at most 4,096 tokens (v1.16); with the 4,095-byte
-length bound this bounds the work of one decision (about 20 ms at worst,
-microseconds for real policies). `tools/vdp_check <policy> lint` reports the
+length bound this bounds the work of one decision (tens of milliseconds for
+adversarial policies, microseconds for real ones). `tools/vdp_check <policy> lint` reports the
 policy's glob size.
 
 ## Log integrity (v1.16)
@@ -239,8 +239,8 @@ tools/varek_audit.py --policy policy.txt --checker tools/vdp_cert_check \
     --pubkey /etc/varek/log.key.pub --anchor /var/varek/anchor verdicts.log
 ```
 
-The Warden refuses to start if the policy would let the agent open the key or
-the anchor. The audit's `integrity:` line says how far the stream is protected
+The Warden refuses to start if the policy would let the agent open the key,
+the anchor, the verdict stream file or a raw disk. The audit's `integrity:` line says how far the stream is protected
 against its holder (`none`, `chain`, `signed, key not pinned`, `signed`,
 `signed, anchored`). See `RELEASE-v1.16.0.md` for what remains (a key holder
 without an anchor, the unanchored tail of an unfinished run, root on the host

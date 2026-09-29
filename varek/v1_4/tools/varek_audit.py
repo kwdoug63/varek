@@ -60,16 +60,19 @@ import varek_ed25519  # noqa: E402
 AUTHORIZED_OPEN_RULES = ("resolved_fd_injection", "allowed_open_failed", "injection_failed")
 
 
-def _read_pubkey(arg):
-    """64 hex characters, given directly or in a file."""
-    txt = arg
-    if os.path.exists(arg):
-        with open(arg) as fh:
-            txt = fh.read().strip()
-    txt = txt.strip().lower()
-    if len(txt) != 64 or any(c not in "0123456789abcdef" for c in txt):
+def _hex_key(txt):
+    """Exactly 64 lowercase hex characters, or None."""
+    if not isinstance(txt, str) or len(txt) != 64 or any(c not in "0123456789abcdef" for c in txt):
         return None
     return bytes.fromhex(txt)
+
+
+def _cli_pubkey(arg):
+    """--pubkey: 64 hex characters, or a file holding them (tools/varek_keygen's .pub)."""
+    if os.path.isfile(arg):
+        with open(arg) as fh:
+            arg = fh.read()
+    return _hex_key(arg.strip().lower())
 
 
 def log_integrity(a, meta, run, complete, problems):
@@ -86,13 +89,13 @@ def log_integrity(a, meta, run, complete, problems):
     signed = log["signed"]
     stream_key = rs.get("log_pubkey")
     if stream_key is not None:
-        pk = _read_pubkey(stream_key)
+        pk = _hex_key(stream_key)
         if pk is None:
             problems.append("run_start carries a malformed log_pubkey")
             return level
         pinned = None
         if a.pubkey:
-            pinned = _read_pubkey(a.pubkey)
+            pinned = _cli_pubkey(a.pubkey)
             if pinned is None:
                 problems.append("--pubkey is not 64 hex characters (or a file holding them)")
             elif pinned != pk:
@@ -108,11 +111,30 @@ def log_integrity(a, meta, run, complete, problems):
                 problems.append(f"line {c['line']}: {c['event']} signature does not verify")
         if complete and (not signed or signed[-1]["event"] != "run_end"):
             problems.append("the stream does not end in a signed run_end")
-        if log["since_signed"] and not complete:
-            print(f"varek_audit: note: {log['since_signed']} record(s) after the last signature "
-                  f"are not covered by any signature (the stream is incomplete)")
+        # The Warden signs at least every checkpoint_every decision records. A
+        # longer stretch without a signature means checkpoints were removed
+        # (possible only at the unsigned end of an incomplete stream).
+        every = rs.get("checkpoint_every")
+        if not isinstance(every, int) or every < 1:
+            problems.append("run_start of a signed stream has no valid checkpoint_every")
+            every = None
+        prev = 0
+        sigs = [c for c in signed if c["sig"]]
+        for c in sigs:
+            if every is not None and c["ndec"] - prev > every:
+                problems.append(f"line {c['line']}: {c['ndec'] - prev} decision records since the "
+                                f"previous signature, more than checkpoint_every ({every}): "
+                                f"checkpoints were removed")
+            prev = c["ndec"]
+        tail = meta["ndecisions"] - prev
+        if every is not None and tail > every:
+            problems.append(f"{tail} decision records after the last signature, more than "
+                            f"checkpoint_every ({every}): checkpoints were removed")
+        meta["signed_through"] = prev
         level = "signed" if (pinned is not None and pinned == pk and not bad) \
             else "signed, key not pinned (pass --pubkey to rely on the signatures)"
+        if not complete:
+            level += f"; covers the first {prev} decision records only"
     elif a.pubkey:
         problems.append("--pubkey given, but the stream is not signed (the Warden ran "
                         "without --sign-key)")
@@ -150,6 +172,11 @@ def log_integrity(a, meta, run, complete, problems):
             problems.append("the anchor holds nothing for this run")
         if len(problems) == before:
             level += ", anchored"
+            if stream_key is None and not complete:
+                # Anchor only: what reached the anchor is sealed, nothing after it.
+                sealed = [c["ndec"] for c in signed if c["chain"].hex() in anchored]
+                meta["signed_through"] = max(sealed) if sealed else 0
+                level += f"; covers the first {meta['signed_through']} decision records only"
     return level
 
 
@@ -165,6 +192,7 @@ def main(argv=None):
                     "or a .pub file from tools/varek_keygen): signatures must verify under it")
     ap.add_argument("--anchor", help="the Warden's --anchor file: the stream's signed records "
                     "must match it")
+    ap.add_argument("--run", help="the run id the stream must carry (run_start's \"run\")")
     ap.add_argument("log")
     a = ap.parse_args(argv)
 
@@ -176,7 +204,17 @@ def main(argv=None):
             print(f"varek_audit: FAIL: {e}")
             return 1
     problems = []
+    meta["ndecisions"] = len(records)
     integrity = log_integrity(a, meta, run, complete, problems)
+    if a.run and a.run != run:
+        problems.append(f"the stream is run {run}, not the run asked for ({a.run})")
+    # An incomplete signed stream is audited only as far as its last signature:
+    # the records after it could have been written by anyone.
+    if not complete and "signed_through" in meta and meta["signed_through"] < len(records):
+        dropped = len(records) - meta["signed_through"]
+        print(f"varek_audit: note: the last {dropped} decision record(s) follow the last "
+              f"signature (the stream is incomplete); they are not audited")
+        records = records[:meta["signed_through"]]
     if meta.get("run_start", {}).get("build") and not a.allow_test_build:
         problems.append(f"the stream comes from a test build ({meta['run_start']['build']}), "
                         f"not a Warden that may supervise a real agent")
@@ -248,6 +286,12 @@ def main(argv=None):
           f"{len(records)} records, {authorized} authorized file opens, {checked} certificates "
           f"re-checked, {refused} refused in-line")
     print(f"varek_audit: integrity: {integrity}")
+    t0 = meta.get("run_start", {}).get("timestamp_ns")
+    if isinstance(t0, int):
+        import datetime
+        when = datetime.datetime.fromtimestamp(t0 / 1e9, datetime.timezone.utc)
+        print(f"varek_audit: run started {when.isoformat(timespec='seconds')} "
+              f"(policy {meta['run_start'].get('policy_path')!r})")
     for pr in problems[:50]:
         print(f"  PROBLEM {pr}")
     print(f"varek_audit: {'PASS' if not problems else 'FAIL'}")

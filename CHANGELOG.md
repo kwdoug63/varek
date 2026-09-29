@@ -64,8 +64,9 @@ formally verified checker, and the v1.11 sequence fragment.
 Addresses the two limits v1.15.0 disclosed. The verdict stream is hash-chained,
 Ed25519-signed at checkpoints and optionally anchored off the log, so whoever
 holds the log cannot rewrite it undetected; and a policy's globs are capped at
-4,096 tokens, which bounds one decision at about 20 ms in the worst case
-(v1.15: 415 ms).
+4,096 tokens, which bounds the work of one decision (on adversarial policies
+about 26 ms median in the live Warden, 61 ms at most observed; v1.15's checker
+alone took 415 ms).
 
 ### Added
 
@@ -81,29 +82,39 @@ holds the log cannot rewrite it undetected; and a policy's globs are capped at
 - **External anchor** (`--anchor PATH`, a file, FIFO or character device):
   each checkpoint-type record is appended as one line, non-blocking; a failed
   write becomes an `anchor_error` record.
-- **Startup refusals**: a key file that is not a private regular file, a
-  malformed key, or a policy that would let the agent open the key or the
-  anchor (decided by the certificate checker, `vdpc_path_openable`); a FIFO
-  anchor with no reader.
+- **Startup refusals**: a key file that is not a private regular file with one
+  name, a malformed key, or a policy that would let the agent open the key or
+  the anchor (decided by the certificate checker, `vdpc_path_openable`, on the
+  path the kernel reports for the open file); with a key or anchor, a policy
+  that would let the agent open a block device, `/dev/mem`, `/dev/kmem`,
+  `/dev/port`, `/proc/kcore` or a disk command device; for every run, a
+  verdict stream file the policy would let the agent open; a FIFO anchor with
+  no reader. The key is kept in libsodium's guarded memory.
 - **Audit**: `--pubkey` (the stream must be signed by that key) and `--anchor`
   (every signed record anchored and every anchored record present; any
   `anchor_error` fails); a complete signed stream must end in a signed
-  run_end; an `integrity:` line (`none`, `chain`, `signed, key not pinned`,
-  `signed`, `signed, anchored`). Signatures are verified by
+  run_end; at most `checkpoint_every` decision records between signatures;
+  `--allow-incomplete` audits only up to the last signature; `--run ID`; the
+  run's start time is printed; an `integrity:` line (`none`, `chain`,
+  `signed, key not pinned`, `signed`, `signed, anchored`). Signatures are verified by
   `tools/varek_ed25519.py`, a pure-Python RFC 8032 verifier (canonical
   encodings, S < L, no small-order key), not by the signing library.
-- The stream parser (exporter and audit) verifies the chain of v1.16 streams;
-  the BOM gains `varek:log.chain` and `varek:log.pubkey`.
+- The stream parser (exporter and audit) verifies the chain of v1.16 streams
+  and refuses a 1.16+ stream whose chain was stripped; the BOM gains
+  `varek:log.chain` and `varek:log.pubkey`.
 - `vdp_check lint` reports the policy's glob size against the cap.
-- `make test-v1160`; `tests/log_rechain.py` (test helper: recompute the chain,
-  or re-sign, as a log holder would).
+- `make test-v1160` with `tests/v1160_probe`; `tests/log_rechain.py` (test
+  helper: recompute the chain, or re-sign, as a log holder would).
 
 ### Changed
 
 - **Glob tokens per policy capped at 4,096** (was 65,536) in the decision
   procedure, the certificate checker and the cross-check's parser.
   `tests/v1140_bound2_policy.txt` split into `v1140_bound2` and `v1140_bound4`.
-- The certificate checker matches `contains` with `memmem` (linear time).
+- The certificate checker matches `contains` with `memmem` (linear time), and
+  its glob matcher computes each row in one pass (no per-byte clearing and
+  copying).
+- A rejected `--plan` ends the stream with run_end.
 - If a record cannot be written to the verdict stream, the Warden stops
   supervising (the agent is killed) instead of running on unrecorded. With
   `--anchor`, SIGPIPE is ignored by the Warden (restored for the agent).
@@ -111,6 +122,12 @@ holds the log cannot rewrite it undetected; and a policy's globs are capped at
 - The Warden and `tools/varek_keygen` link libsodium.
 - Regression tests that edit a stream to test the certificate audit
   (`test_v1150.sh`, `test_v1122.sh`) recompute the chain first.
+
+### Fixed
+
+- The report of an agent killed by a signal ("agent killed by signal 31") was
+  lost about one run in four: the SIGCHLD handler could end the loop before the
+  agent's exit was noticed.
 
 ## [1.15.0] - 2026-09-28
 

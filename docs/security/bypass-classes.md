@@ -152,10 +152,12 @@ run_start, a checkpoint every 64 records (and at least once a second) and
 run_end are Ed25519-signed; with `--anchor`, those records are also appended
 to storage the holder cannot rewrite. `varek_audit.py --pubkey --anchor`
 verifies all three with its own RFC 8032 verifier. The Warden refuses to start
-if the policy would let the agent open the key or the anchor.
+if the policy would let the agent open the key, the anchor, its own verdict
+stream file, or (with a key or anchor) a raw disk or memory device.
 
 Residual: someone holding the log and the signing key can rewrite whatever was
 not anchored (all of it, without an anchor); root on the Warden host during
 the run can forge records before they are signed; status lines, the agent's
-relayed stderr and pre-launch plan records are not chained.
+relayed stderr and `--plan` gate records are not chained; raw storage devices
+the startup check does not recognize.
 

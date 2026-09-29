@@ -465,39 +465,43 @@ static bool is_stretch(int type) { return type == G_STAR || type == G_DSTAR || t
 
 /* Row dynamic programming. at[j]: tokens [0, j) match s[0, i). inside[j]:
  * token j is a SEGS that has taken at least one byte of s[.., i) and not yet
- * ended. */
+ * ended. Each new row is computed from the previous one in a single pass
+ * (v1.16: no per-byte clearing or copying, so many short globs cost no more
+ * per token than one long one); the two rows are then swapped. */
 #define MAXG (VDPC_MAX_S + 3)
 static bool glob_match(const gtok_t *g, size_t n, const char *s, size_t sl) {
-    static __thread bool at[MAXG], nat[MAXG], inside[MAXG], ninside[MAXG];
+    static __thread bool row_a[MAXG], row_b[MAXG], seg_a[MAXG], seg_b[MAXG];
     if (n + 1 > MAXG) return false;
-    memset(at, 0, n + 1);
-    memset(inside, 0, n + 1);
+    bool *at = row_a, *nat = row_b, *inside = seg_a, *ninside = seg_b;
     at[0] = true;
-    for (size_t j = 0; j < n; j++)
-        if (at[j] && is_stretch(g[j].type)) at[j + 1] = true;       /* empty stretch */
+    inside[0] = false;
+    for (size_t j = 0; j < n; j++) {
+        at[j + 1] = at[j] && is_stretch(g[j].type);                   /* empty stretch */
+        inside[j + 1] = false;
+    }
     for (size_t i = 0; i < sl; i++) {
         unsigned char b = (unsigned char)s[i];
-        memset(nat, 0, n + 1);
-        memset(ninside, 0, n + 1);
         bool any = false;
+        nat[0] = false;                       /* no token prefix matches a nonempty string emptily */
         for (size_t j = 0; j < n; j++) {
             const gtok_t *t = &g[j];
+            bool v, in = false;               /* v: nat[j + 1]; in: ninside[j] */
             if (t->type == G_LIT || t->type == G_SET) {
-                if (at[j] && tok_takes(t, b)) nat[j + 1] = true;
+                v = at[j] && tok_takes(t, b);
             } else if (t->type == G_STAR || t->type == G_DSTAR) {
-                if (at[j + 1] && tok_takes(t, b)) nat[j + 1] = true;  /* the stretch grows */
-            } else {                                                    /* G_SEGS */
-                if (at[j] || inside[j]) {
-                    ninside[j] = true;
-                    if (b == '/') nat[j + 1] = true;
-                }
+                v = at[j + 1] && tok_takes(t, b);                     /* the stretch grows */
+            } else {                                                  /* G_SEGS */
+                in = at[j] || inside[j];
+                v = in && b == '/';
             }
-            if (nat[j] && is_stretch(t->type)) nat[j + 1] = true;      /* empty stretch */
-            any = any || nat[j] || ninside[j];
+            if (nat[j] && is_stretch(t->type)) v = true;              /* empty stretch */
+            nat[j + 1] = v;
+            ninside[j] = in;
+            any = any || v || in;
         }
-        any = any || nat[n];
-        memcpy(at, nat, n + 1);
-        memcpy(inside, ninside, n + 1);
+        ninside[n] = false;
+        bool *tmp = at; at = nat; nat = tmp;
+        tmp = inside; inside = ninside; ninside = tmp;
         if (!any) return false;
     }
     return at[n];

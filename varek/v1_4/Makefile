@@ -172,8 +172,11 @@ test-v1150: warden warden_faultinject tools/vdp_check tools/vdp_cert_check tests
 # v1.16: the verdict stream against its holder (hash chain, Ed25519-signed
 # checkpoints, the external anchor, tampering by a holder with and without the
 # key, anchor failures, startup refusals) and the 4,096-token glob cap.
-test-v1160: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen
-	@sudo ./tests/test_v1160.sh ./warden ./tools/vdp_check ./tools/vdp_cert_check ./tools/varek_keygen
+tests/v1160_probe: tests/v1160_probe.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $<
+
+test-v1160: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen tests/v1160_probe
+	@sudo ./tests/test_v1160.sh ./warden ./tools/vdp_check ./tools/vdp_cert_check ./tools/varek_keygen $(abspath tests/v1160_probe)
 
 # Differential check of the decision procedure against an SMT solver (Z3) and,
 # for suffix / contains / glob reachability, a derivative-based oracle. These
@@ -209,4 +212,4 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe warden_faultinject tests/test_v14_filter
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe warden_faultinject tests/test_v14_filter

@@ -78,6 +78,17 @@ CHECKPOINT_EVENTS = ("run_start", "checkpoint", "run_end")
 _CHAIN_TAIL = re.compile(rb',"chain":"([0-9a-f]{64})"(?:,"sig":"([0-9a-f]{128})")?\}\n?\Z')
 
 
+def _version_at_least(v, want):
+    """True if v (e.g. "1.16.0") is at least want (e.g. (1, 16))."""
+    if not isinstance(v, str):
+        return False
+    parts = v.split(".")
+    try:
+        return tuple(int(x) for x in parts[:2]) >= want
+    except ValueError:
+        return False
+
+
 def _chain_step(st, raw, rec, lineno, ndecisions, fail):
     """v1.16: check one record's chain value against the exact bytes of the
     line, and advance the chain."""
@@ -101,7 +112,7 @@ def _chain_step(st, raw, rec, lineno, ndecisions, fail):
                          f"the stream holds {ndecisions} before it.")
         sig = m.group(2).decode() if m.group(2) else None
         st["signed"].append({"event": event, "chain": h, "sig": sig, "line": lineno,
-                             "records": rec.get("records", 0)})
+                             "records": rec.get("records", 0), "ndec": ndecisions})
         if sig:
             st["since_signed"] = 0
     elif event == "anchor_error":
@@ -178,6 +189,9 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             w = rec.get("warden")
             if isinstance(w, str) and w:
                 warden_version = w
+            if chained is None and _version_at_least(w, (1, 16)):
+                fail(lineno, "run_start names a Warden that chains its records (1.16 or later) "
+                             "but the stream is not chained: the chain was stripped.")
             if meta is not None:
                 meta["run_start"] = rec      # v1.15: policy_sha256, for the audit
             continue

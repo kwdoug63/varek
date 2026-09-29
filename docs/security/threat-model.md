@@ -113,7 +113,8 @@ Model-B techniques below, with the residual limits stated honestly.
     alter, insert, remove, reorder or truncate records undetected before the
     last signature (without the key) or before the last anchored checkpoint
     (with it). The Warden refuses a policy that would let the agent open the
-    key or the anchor.
+    key, the anchor, its own verdict stream file or a raw disk or memory
+    device.
   - *Datagram egress.* `sendto`/`sendmsg` are mediated as network sends and
     refused for an inet destination under the deny-only network posture.
 
