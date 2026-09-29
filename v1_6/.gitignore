@@ -1,6 +1,7 @@
 # Build artifacts
 plan_demo
 adapter_demo
+plan_verify
 /tests/test_evaluator
 /tests/test_symmetric_suppression
 /tests/test_order_invariance

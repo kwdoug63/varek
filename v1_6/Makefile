@@ -18,6 +18,8 @@ ALL_HDR := $(CORE_HDR) $(ADAPTER_HDR)
 
 DEMO         := plan_demo
 ADAPTER_DEMO := adapter_demo
+# v1.16.3: the file-in / JSON-out front end the VAREK Verdict Service runs
+PLAN_VERIFY  := plan_verify
 
 TESTS := tests/test_evaluator \
          tests/test_symmetric_suppression \
@@ -28,15 +30,18 @@ TESTS := tests/test_evaluator \
          tests/test_pathology \
          tests/test_plan_parser
 
-.PHONY: all check demo adapter-demo clean
+.PHONY: all check check-plan-verify demo adapter-demo clean
 
-all: $(DEMO) $(ADAPTER_DEMO) $(TESTS)
+all: $(DEMO) $(ADAPTER_DEMO) $(PLAN_VERIFY) $(TESTS)
 
 $(DEMO): plan_demo.c $(CORE_SRC) $(CORE_HDR)
 	$(CC) $(CFLAGS) -o $@ plan_demo.c $(CORE_SRC)
 
 $(ADAPTER_DEMO): adapter_demo.c $(ALL_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ adapter_demo.c $(ALL_SRC)
+
+$(PLAN_VERIFY): plan_verify_cli.c $(ALL_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ plan_verify_cli.c $(ALL_SRC)
 
 tests/%: tests/%.c $(ALL_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -I. -o $@ $< $(ALL_SRC)
@@ -51,5 +56,8 @@ check: $(TESTS)
 	@set -e; for t in $(TESTS); do echo "-- $$t"; ./$$t; done
 	@echo "all tests passed"
 
+check-plan-verify: $(PLAN_VERIFY)
+	sh tests/test_plan_verify.sh ./$(PLAN_VERIFY)
+
 clean:
-	rm -f $(DEMO) $(ADAPTER_DEMO) $(TESTS)
+	rm -f $(DEMO) $(ADAPTER_DEMO) $(PLAN_VERIFY) $(TESTS)

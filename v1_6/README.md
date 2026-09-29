@@ -208,6 +208,40 @@ plan-level records:
 }
 ```
 
+## plan_verify: the Verdict Service's front end (v1.16.3)
+
+`plan_verify_cli.c` reads a plan file in the format above, runs the
+compositional evaluator, and prints one line of JSON. The VAREK Verdict
+Service (`api.varek-lang.org`) runs it for each request.
+
+```sh
+make plan_verify
+./plan_verify sample_plan.txt
+# {"engine":"VAREK","version":"1.16.3","decision":"UNSATISFIED","authorized":false,
+#  "n_actions":4,"n_edges":3,"governing_node":{"label":"load","kind":"file_open",
+#  "target":"/tmp/varek_allowed_input.json"}}
+```
+
+- **Exit status:** 0 with a verdict; 2 with `{"error":"parse_failed",...}`
+  when the plan cannot be read (no verdict is invented); 3 if the output
+  could not be written.
+- **Per-action decisions** come from a small demonstration policy that
+  matches text:
+  - `file_open` targets starting with `/work/` or `/tmp/varek_conf/` are
+    SATISFIED, with no path normalization, so `/work/../etc/x` counts;
+  - `net_connect` targets *containing* `allowed.internal`, ignoring case, are
+    SATISFIED;
+  - other reads and connections are UNSATISFIED;
+  - `process_exec` and unknown kinds are UNKNOWN.
+
+  A target beginning `demo:SAT:`, `demo:UNSAT:` or `demo:UNK:` (in any case)
+  asserts that decision instead.
+- **It is a demonstration front end, not a production policy.** Whoever writes
+  the plan can assert any verdict through the `demo:` override.
+- **Output is escaped** (since v1.16.3): no label, kind, target or error text can
+  add or change a field. `make check-plan-verify` runs its 24 checks, and
+  `tests/compare_plan_verify.py OLD NEW` compares two builds on random plans.
+
 ## Applying the v1.4 integration
 
 From the repo root:
