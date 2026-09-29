@@ -113,7 +113,7 @@ static int url_component(const char *url, const char *part, char *out, size_t ou
     }
     unsigned long portnum = 0;
     if (port) {
-        if (port == auth_end) return -1;
+        if (port == auth_end || *port == '0') return -1;      /* empty, or a leading zero */
         for (const char *q = port; q < auth_end; q++) {
             if (*q < '0' || *q > '9') return -1;
             portnum = portnum * 10 + (unsigned long)(*q - '0');
@@ -132,6 +132,32 @@ static int url_component(const char *url, const char *part, char *out, size_t ou
         if (len == 0 || src[len - 1] == '.' || src[0] == '.') return -1;
         for (size_t i = 1; i < len; i++)
             if (src[i] == '.' && src[i - 1] == '.') return -1;   /* empty label */
+        /* A host whose last label is numeric (or 0x...) is an IPv4 address to
+         * a URL reader, which also accepts 127.1, 2130706433 and 0x7f.0.0.1.
+         * Only the canonical dotted quad is readable here. */
+        if (src[0] != '[') {
+            size_t ls = len;
+            while (ls > 0 && src[ls - 1] != '.') ls--;
+            bool numeric = true;
+            for (size_t i = ls; i < len; i++)
+                if (src[i] < '0' || src[i] > '9') numeric = false;
+            bool hexy = len - ls >= 2 && src[ls] == '0' && (src[ls + 1] == 'x' || src[ls + 1] == 'X');
+            if (numeric || hexy) {
+                int parts = 0;
+                size_t i = 0;
+                while (i < len) {
+                    size_t j = i;
+                    unsigned v = 0;
+                    while (j < len && src[j] >= '0' && src[j] <= '9') { v = v * 10 + (unsigned)(src[j] - '0'); j++; if (v > 255) return -1; }
+                    if (j == i || (j - i > 1 && src[i] == '0')) return -1;   /* empty, or a leading zero */
+                    parts++;
+                    if (j == len) break;
+                    if (src[j] != '.') return -1;
+                    i = j + 1;
+                }
+                if (parts != 4) return -1;
+            }
+        }
     } else if (strcmp(part, "port") == 0) {
         src = port ? port : ""; len = port ? (size_t)(auth_end - port) : 0;
     } else if (strcmp(part, "path") == 0) {
@@ -140,7 +166,8 @@ static int url_component(const char *url, const char *part, char *out, size_t ou
         /* Matched as written, so refuse what a server would rewrite: an
          * encoded byte ("%2f", "%2e"), a backslash, a "." or ".." segment. */
         for (size_t i = 0; i < len; i++) {
-            if (src[i] == '%' || src[i] == '\\') return -1;
+            if (src[i] == '%' || src[i] == '\\' || src[i] == ';') return -1;
+            if (src[i] == '/' && i + 1 < len && src[i + 1] == '/') return -1;   /* empty segment */
             if (src[i] == '.' && (i == 0 || src[i - 1] == '/')) {
                 size_t k = i + 1;
                 if (k < len && src[k] == '.') k++;
@@ -181,14 +208,33 @@ static const char *component_key(const char *key, char *base, size_t basesz)
 /* A component key is always derived from the URL in <arg>: an argument that is
  * literally named "url.host" is never consulted, or a caller could pass
  * url=https://evil.example/ with "url.host"=x.internal.acme.com. */
+/* The URL in argument `base`, or NULL; *twice is set when the action carries
+ * that argument more than once (a URL rule cannot tell which one counts). */
+static const char *url_arg(const plan_action_desc_t *action, const char *base, bool *twice)
+{
+    const char *v = NULL;
+    *twice = false;
+    for (size_t i = 0; action->named_args && i < action->n_named_args; i++) {
+        const plan_action_arg_t *a = &action->named_args[i];
+        if (a->key && strcmp(a->key, base) == 0) {
+            if (v) *twice = true;
+            v = a->value;
+        }
+    }
+    return v;
+}
+
 static const char *match_value(const plan_action_desc_t *action, const char *key,
-                               char *buf, size_t bufsz)
+                               char *buf, size_t bufsz, bool *fold)
 {
     char base[128];
+    bool twice;
+    *fold = false;
     const char *part = component_key(key, base, sizeof base);
     if (!part) return find_named_arg(action, key);
-    const char *url = find_named_arg(action, base);
-    if (!url || url_component(url, part, buf, bufsz) != 0) return NULL;
+    const char *url = url_arg(action, base, &twice);
+    if (!url || twice || url_component(url, part, buf, bufsz) != 0) return NULL;
+    *fold = !strcmp(part, "host") || !strcmp(part, "scheme");   /* compared case-blind */
     return buf;
 }
 
@@ -208,8 +254,9 @@ static bool unparseable_component(const plan_label_table_t *tbl,
         for (size_t j = 0; j < r->n_matches; j++) {
             const char *part = component_key(r->matches[j].key, base, sizeof base);
             if (!part) continue;
-            const char *url = find_named_arg(action, base);
-            if (url && url_component(url, part, buf, sizeof buf) != 0) return true;
+            bool twice;
+            const char *url = url_arg(action, base, &twice);
+            if (url && (twice || url_component(url, part, buf, sizeof buf) != 0)) return true;
         }
     }
     return false;
@@ -220,12 +267,23 @@ static bool unparseable_component(const plan_label_table_t *tbl,
 static bool rule_matches_action(const plan_label_rule_t *r,
                                 const plan_action_desc_t *action)
 {
-    char buf[URL_PART_MAX];
+    char buf[URL_PART_MAX], pat[URL_PART_MAX];
     for (size_t i = 0; i < r->n_matches; i++) {
         const plan_label_rule_match_t *m = &r->matches[i];
-        const char *val = match_value(action, m->key, buf, sizeof buf);
+        bool fold;
+        const char *val = match_value(action, m->key, buf, sizeof buf, &fold);
         if (!val) return false;
-        if (!glob_match(m->pattern, val)) return false;
+        const char *pattern = m->pattern;
+        if (fold && pattern) {
+            /* the value is lower-cased; so is the pattern, or a rule written
+             * as *.EVIL.example would never match */
+            size_t n = strlen(pattern);
+            if (n >= sizeof pat) return false;
+            for (size_t k = 0; k <= n; k++)
+                pat[k] = (pattern[k] >= 'A' && pattern[k] <= 'Z') ? (char)(pattern[k] - 'A' + 'a') : pattern[k];
+            pattern = pat;
+        }
+        if (!glob_match(pattern, val)) return false;
     }
     return true;
 }

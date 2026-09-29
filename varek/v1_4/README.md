@@ -335,9 +335,10 @@ plan that needs one cannot run as declared.
   path. A plan whose edges carry a sticky label to a step that denies it is
   refused, and `[warden] plan flow pathology:` names the flow.
 - **the refusal breaker (v1.8.2).** Each refused plan counts against
-  (`--session <id>`, default `default`; the plan's signature). The signature is
-  canonical over the plan's steps and edges, so reordering steps or edges,
-  repeating an edge or renumbering steps does not start a new count. After the
+  (`--session <id>`, default `default`; the plan's signature). The signature
+  covers the plan's steps and edges: reordering distinct steps or edges, or
+  repeating an edge, does not start a new count, and distinct graphs never
+  share one. After the
   policy's `refusal_budget` the outcome latches to its `on_exhaustion`
   disposition; an UNKNOWN goes straight to `unknown_disposition`.
 - **the progress-safety check (v1.9).** At startup: the Warden refuses to start
@@ -352,8 +353,9 @@ policy lets the agent open none of them. The lock is held while the gate reads,
 steps and writes the table, not while the agent runs. The table is written to
 `<name>.tmp` and renamed into place, so an interrupted write leaves the previous
 table; a table that does not read back (empty, cut short, altered) refuses the
-plan with exit 1. The lock file and the table are also refused to the agent by
-identity, like the signing key.
+plan with exit 1. Every file in the state directory, including a table a
+concurrent Warden writes later, is refused to the agent by identity (the
+directory's), like the signing key, whatever path reaches it.
 
 Outcome: when the plan is refused, the agent never runs and the Warden exits 3
 (the host may submit a different plan), 4 (terminal deny) or 5 (terminal: the
@@ -361,8 +363,10 @@ message names the pre-authorized action the host must run); 1 on an error. When
 it is authorized, the Warden exits with the agent's status, which can also be 3,
 4 or 5. A host that acts on the outcome reads `--gate-status <file>`, one line
 written before the agent starts (`PASS`, `REFUSED_RETRYABLE n/budget`,
-`TERMINAL_DENY`, `TERMINAL_ACTION <name>` or `ERROR ...`), or the `plan_gate`
-record in the verdict stream.
+`TERMINAL_DENY`, `TERMINAL_ACTION <name>` or `ERROR ...`; empty if the gate
+never decided), or the `plan_gate` record in the verdict stream. The status file
+gets the state files' checks: its directory and the file must be private to the
+Warden's user, and the policy must not reach it.
 
 The count is per session and per state file, and whoever starts the Warden
 chooses both. It bounds a host that resubmits through a launcher it does not

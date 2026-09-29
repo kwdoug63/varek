@@ -341,8 +341,12 @@ def attestation(records, authorized, refused, dist, policy, run_start, run_end,
     if chain != "none":
         nsig, nsigned = log_info.get("sigs", 0), log_info.get("signable", 0)
         if log_info.get("verified_key"):
-            sig_text = (f"; all {nsig} of its signed records verify under the key given "
-                        f"({log_info['verified_key']}), checked by this exporter.")
+            tail = log_info.get("unsigned_tail", 0)
+            sig_text = (f"; all {nsig} of its signed records verify under the key "
+                        f"{log_info['verified_key']}, checked by this exporter"
+                        + (f"; the last {tail} record(s) come after the last signature "
+                           f"(the stream has no run_end) and are covered by the chain only."
+                           if tail else "."))
         elif nsig:
             sig_text = (f"; {nsig} of its {nsigned} checkpoint-type records carry a signature, "
                         f"not checked here (give --pubkey, or run tools/varek_audit.py --pubkey).")
@@ -543,9 +547,15 @@ def _read_hex32(arg, what):
     return bytes.fromhex(txt)
 
 
-def sign_bom(bom, key_path):
-    """Add a JSF signature over the BOM, made with libsodium (the library the
-    Warden signs its stream with) from the varek_keygen seed file."""
+def public_key_of(key_path):
+    """The public key (hex) of a varek_keygen seed file, via libsodium."""
+    na, seed, pk, sk = _keypair(key_path)
+    ctypes.memset(sk, 0, 64)
+    ctypes.memset(seed, 0, 32)
+    return pk.raw.hex()
+
+
+def _keypair(key_path):
     name = ctypes.util.find_library("sodium")
     if not name:
         raise SystemExit("varek_cyclonedx: --sign-key needs libsodium (the Warden's dependency)")
@@ -554,15 +564,23 @@ def sign_bom(bom, key_path):
         raise SystemExit("varek_cyclonedx: libsodium failed to initialize")
     if not os.path.isfile(key_path):
         raise SystemExit(f"varek_cyclonedx: --sign-key {key_path}: no such file")
-    # The seed and the secret key live in ctypes buffers that are zeroed on
-    # every path. (Python may still hold copies of the file's text; the key
-    # file itself is the secret to guard.)
     seed = ctypes.create_string_buffer(_read_hex32(key_path, "--sign-key"), 32)
     pk = ctypes.create_string_buffer(32)
     sk = ctypes.create_string_buffer(64)
+    if na.crypto_sign_seed_keypair(pk, sk, seed) != 0:
+        ctypes.memset(seed, 0, 32)
+        raise SystemExit("varek_cyclonedx: cannot derive the key pair")
+    return na, seed, pk, sk
+
+
+def sign_bom(bom, key_path):
+    """Add a JSF signature over the BOM, made with libsodium (the library the
+    Warden signs its stream with) from the varek_keygen seed file."""
+    # The seed and the secret key live in ctypes buffers that are zeroed on
+    # every path. (Python may still hold copies of the file's text; the key
+    # file itself is the secret to guard.)
+    na, seed, pk, sk = _keypair(key_path)
     try:
-        if na.crypto_sign_seed_keypair(pk, sk, seed) != 0:
-            raise SystemExit("varek_cyclonedx: cannot derive the key pair")
         bom.pop("signature", None)
         bom["signature"] = {"algorithm": "Ed25519",
                             "publicKey": {"kty": "OKP", "crv": "Ed25519", "x": _b64u(pk.raw)}}
@@ -649,7 +667,7 @@ def check_stream_signatures(meta, pubkey_arg, complete):
             (complete and signed[-1]["event"] != "run_end"):
         raise StreamError("varek_cyclonedx: the stream's signed records do not cover it from "
                           "run_start to run_end. Refusing to emit a BOM.")
-    return pk.hex()
+    return pk.hex(), (0 if complete else int(lg.get("since_signed", 0)))
 
 
 def main(argv=None):
@@ -694,8 +712,13 @@ def main(argv=None):
                 "pubkey": str(meta.get("run_start", {}).get("log_pubkey", "")),
                 "signable": len(lg["signed"]) if lg else 0,
                 "sigs": sum(1 for c in lg["signed"] if c.get("sig")) if lg else 0}
+    if args.sign_key and not args.pubkey:
+        # v1.18.0: signing vouches for the BOM, so the stream it was made from
+        # must verify: under the key given, or else under the signing key.
+        args.pubkey = public_key_of(args.sign_key)
     if args.pubkey:
-        log_info["verified_key"] = check_stream_signatures(meta, args.pubkey, complete)
+        log_info["verified_key"], log_info["unsigned_tail"] = \
+            check_stream_signatures(meta, args.pubkey, complete)
     recorded_sha = str(meta.get("run_start", {}).get("policy_sha256", ""))
     if args.policy is None:
         # v1.18.0: name the policy the Warden recorded, not a fixed label (the

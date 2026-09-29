@@ -247,7 +247,32 @@ cp "$OUT/gate.err" "$OUT/p.err"
 check "the agent is refused the table through a bind mount" grep -q "^PROBE open $D/data/alias/breaker REFUSED EACCES" "$OUT/gate.out"
 check "that refusal is recorded as protected_object" grep -q "\"target\":\"$D/data/alias/breaker\".*\"rule\":\"protected_object\"" "$OUT/p.err"
 check "an ordinary allowed file still opens" grep -q "^PROBE open $D/data/public/ok.txt OK hello" "$OUT/gate.out"
+# A table another Warden renames into place while this agent runs is a new
+# inode this Warden never saw; the state directory's identity still covers it.
+"$WARDEN" "$POL" --plan "$D/apart.txt" --flow-policy "$FLOW" --breaker-state "$STATE" --session s10 \
+    -- "$PROBE" --sleep 2 "$D/data/alias/breaker" "$D/data/alias/breaker.lock" > "$OUT/cc.out" 2> "$OUT/cc.err" &
+bg=$!
+sleep 0.7
+gate s11 leak.txt
+wait "$bg"
+check "a table written by a concurrent Warden is refused through the bind mount" \
+    grep -q "^PROBE open $D/data/alias/breaker REFUSED EACCES" "$OUT/cc.out"
+check "so is the lock file" grep -q "^PROBE open $D/data/alias/breaker.lock REFUSED EACCES" "$OUT/cc.out"
 umount "$D/data/alias"
+
+# --gate-status gets the state files' checks.
+install -m 666 /dev/null "$D/state/gs2"
+gate s1 apart.txt --gate-status "$D/state/gs2"
+[ "$RC" -eq 1 ] && has 'writable by no one else' && pass "a --gate-status file others can write stops the Warden" \
+    || flunk "a --gate-status file others can write stops the Warden (exit $RC)"
+mkfifo "$D/state/gsfifo"
+timeout 10 "$WARDEN" "$POL" --plan "$D/apart.txt" --flow-policy "$FLOW" --breaker-state "$STATE" \
+    --gate-status "$D/state/gsfifo" -- "$PROBE" > /dev/null 2>&1; rc=$?
+[ "$rc" -eq 1 ] && pass "a FIFO as --gate-status is refused at once (no hang)" || flunk "a FIFO as --gate-status is refused at once (rc=$rc)"
+mkdir -p "$D/data/gsdir" && chmod 755 "$D/data/gsdir"
+gate s1 apart.txt --gate-status "$D/data/gsdir/gs"
+[ "$RC" -eq 1 ] && has 'would let the agent open it' && pass "a --gate-status file the policy reaches stops the Warden" \
+    || flunk "a --gate-status file the policy reaches stops the Warden (exit $RC)"
 python3 "$AUDIT" --policy "$POL" --checker "$CERT" "$OUT/p.err" > "$OUT/p.audit" 2>&1 \
     && pass "varek_audit accepts a stream holding a plan_gate record" || flunk "varek_audit accepts a stream holding a plan_gate record ($(tail -2 "$OUT/p.audit"))"
 
@@ -278,7 +303,7 @@ python3 "$CDX" --log "$OUT/run.log" --agent v1180_probe --policy "$DENYPOL" --si
     --pubkey "$D/state/log.key.pub" --output "$OUT/signed.json" 2> "$OUT/x.err" \
     && pass "the exporter checks the stream's signatures and signs with the log key" || flunk "the exporter checks and signs ($(cat "$OUT/x.err"))"
 STXT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["annotations"][0]["text"])' "$OUT/signed.json" 2>/dev/null)"
-grep -q 'verify under the key given' <<<"$STXT" && pass "the attestation says the stream's signatures verified" || flunk "the attestation says the stream's signatures verified"
+grep -q 'signed records verify under the key' <<<"$STXT" && pass "the attestation says the stream's signatures verified" || flunk "the attestation says the stream's signatures verified"
 grep -q 'not checked here' <<<"$TXT" && pass "without --pubkey it says the signatures were not checked" || flunk "without --pubkey it says the signatures were not checked ($TXT)"
 python3 "$CDX" --verify "$OUT/signed.json" --pubkey "$D/state/log.key.pub" > "$OUT/v.out" 2>&1 \
     && pass "the BOM's signature verifies under the Warden's public key" || flunk "the BOM's signature verifies ($(cat "$OUT/v.out"))"
@@ -298,6 +323,21 @@ nocheck "a BOM with a duplicated key fails verification" python3 "$CDX" --verify
 "$KEYGEN" "$D/state/other.key" > /dev/null
 nocheck "a different --pubkey fails verification" python3 "$CDX" --verify "$OUT/signed.json" --pubkey "$D/state/other.key.pub"
 nocheck "an unsigned BOM does not verify" python3 "$CDX" --verify "$OUT/bom.json" --pubkey "$D/state/log.key.pub"
+# Signing vouches for the stream: with --sign-key alone, the stream must verify
+# under that key, so an edited stream (chain recomputed) is not signed.
+python3 -c '
+import sys
+out, done = [], False
+for line in open(sys.argv[1], encoding="utf-8", errors="surrogateescape"):
+    if not done and "\"decision_raw\":\"DENY\"" in line:
+        line = line.replace("\"decision_final\":\"DENY\"", "\"decision_final\":\"ALLOW\"", 1)
+        done = True
+    out.append(line)
+open(sys.argv[2], "w", encoding="utf-8", errors="surrogateescape").writelines(out)' "$OUT/run.log" "$OUT/edited.log"
+python3 "$RECHAIN" "$OUT/edited.log" > "$OUT/edited2.log" 2>/dev/null
+python3 "$CDX" --log "$OUT/edited2.log" --policy "$DENYPOL" --sign-key "$D/state/log.key" --output "$OUT/e.json" 2> "$OUT/x.err"; rc=$?
+[ "$rc" -ne 0 ] && grep -q 'does not verify' "$OUT/x.err" && [ ! -s "$OUT/e.json" ] \
+    && pass "--sign-key alone refuses to sign a BOM of an edited stream" || flunk "--sign-key alone refuses to sign an edited stream (rc=$rc)"
 # A stream whose signatures were stripped (the chain does not cover them), and
 # one re-signed under another key, are refused under the Warden's key.
 python3 -c '

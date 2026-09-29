@@ -73,14 +73,15 @@ void            plan_breaker_free(plan_breaker_t *b);
 uint64_t plan_breaker_signature(const plan_action_desc_t *actions,
                                 size_t n_actions);
 
-/* v1.18.0: the signature of the whole action-graph, canonical: the multiset
- * of steps and the set of edges between them, each sorted, so listing steps or
- * edges in another order, repeating an edge or renumbering the steps gives the
- * same signature. Two plans with the same steps but different edges (one
- * routes a secret to an egress, one does not) differ; with
- * plan_breaker_signature() alone, an authorized plan cleared the refusal count
- * of a refused one that differed only in its edges. Out-of-range edge indices
- * are ignored. The Warden's --plan gate uses this form. */
+/* v1.18.0: the signature of the whole action-graph. Steps are ordered by their
+ * content (identical steps keep their plan order) and edges are written
+ * between those positions, sorted, repeats dropped: listing distinct steps or
+ * the edges in another order, or repeating an edge, gives the same signature,
+ * and different edge sets never share one. Two plans with the same steps but
+ * different edges (one routes a secret to an egress, one does not) differ;
+ * with plan_breaker_signature() alone, an authorized plan cleared the refusal
+ * count of a refused one that differed only in its edges. Out-of-range edge
+ * indices are ignored. The Warden's --plan gate uses this form. */
 uint64_t plan_breaker_signature_graph(const plan_action_desc_t *actions,
                                       size_t n_actions,
                                       const uint32_t *edge_from,

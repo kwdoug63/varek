@@ -1511,12 +1511,40 @@ static void load_raw_char_majors(void) {
 
 /* NULL if the pinned object may be decided by the policy; otherwise the
  * record's rule id for refusing it outright. */
+/* v1.18.0: the breaker's state directory. Every file in it (the table, its
+ * lock, a table a concurrent Warden renames in later) is refused whatever path
+ * reaches it, including a bind mount of the directory into an allowed tree. */
+static bool  g_pdir_set;
+static dev_t g_pdir_dev;
+static ino_t g_pdir_ino;
+
+static bool in_protected_dir(const char *canon, int parent_fd) {
+    if (!g_pdir_set) return false;
+    struct stat ds;
+    if (parent_fd >= 0) {
+        if (fstat(parent_fd, &ds) < 0) return true;           /* fail closed */
+    } else {
+        char dir[PATH_MAX];
+        const char *slash = canon ? strrchr(canon, '/') : NULL;
+        if (!slash) return true;
+        size_t n = slash == canon ? 1 : (size_t)(slash - canon);
+        if (n >= sizeof dir) return true;
+        memcpy(dir, canon, n);
+        dir[n] = '\0';
+        if (stat(dir, &ds) < 0) return true;
+    }
+    return ds.st_dev == g_pdir_dev && ds.st_ino == g_pdir_ino;
+}
+
 static const char *forbidden_object(int fd, const char *canon) {
     struct stat st;
     if (fstat(fd, &st) < 0) return "resolution_failed";
     for (int i = 0; i < g_nprotected; i++)
         if (st.st_dev == g_protected[i].dev && st.st_ino == g_protected[i].ino)
             return "protected_object";
+    if ((st.st_dev == g_pdir_dev && st.st_ino == g_pdir_ino && g_pdir_set) ||
+        in_protected_dir(canon, -1))
+        return "protected_object";
     if (S_ISBLK(st.st_mode)) return "raw_device";
     if (S_ISCHR(st.st_mode)) {
         unsigned ma = major(st.st_rdev), mi = minor(st.st_rdev);
@@ -2328,7 +2356,8 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             }
             /* v1.17.0: the signing key, the anchor, the verdict stream and raw
              * storage are refused by identity, before the policy is asked. */
-            const char *forbid = rt.path_fd >= 0 ? forbidden_object(rt.path_fd, act.resolved) : NULL;
+            const char *forbid = rt.path_fd >= 0 ? forbidden_object(rt.path_fd, act.resolved)
+                               : (in_protected_dir(NULL, rt.parent_fd) ? "protected_object" : NULL);
             if (forbid) {
                 resolved_target_close(&rt);
                 clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -2952,12 +2981,53 @@ static int flow_setup(const struct policy *pol, const char *cfg_path, const char
     protect_fd(g_state_lock, "breaker_state");
     int sfd = openat(g_state_dir, g_state_name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (sfd >= 0) { protect_fd(sfd, "breaker_state"); close(sfd); }
+    struct stat dst;
+    if (fstat(g_state_dir, &dst) == 0) {
+        g_pdir_dev = dst.st_dev;
+        g_pdir_ino = dst.st_ino;
+        g_pdir_set = true;
+    }
 
     if (gate_status_path) {
-        g_gate_status_fd = open(gate_status_path,
-                                O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
-        if (g_gate_status_fd < 0) {
-            fprintf(stderr, "[warden] --gate-status %s: %s\n", gate_status_path, strerror(errno));
+        /* A host acts on this file, so it gets the state files' checks: a
+         * private directory and file of the Warden's user that the agent cannot
+         * reach. Opened non-blocking (a FIFO does not stall startup) and
+         * truncated only once it has passed. Empty until the gate decides. */
+        char gdir[PATH_MAX];
+        const char *gslash = strrchr(gate_status_path, '/');
+        const char *gname = gslash ? gslash + 1 : gate_status_path;
+        size_t gl = gslash ? (size_t)(gslash - gate_status_path) : 0;
+        if (gslash && gl == 0) gl = 1;
+        if (!*gname || gl >= sizeof gdir) {
+            fprintf(stderr, "[warden] --gate-status %s: not a file name\n", gate_status_path);
+            return -1;
+        }
+        if (gslash) memcpy(gdir, gate_status_path, gl); else gdir[gl++] = '.';
+        gdir[gl] = '\0';
+        int gd = open(gdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        struct stat gs;
+        if (gd < 0 || fstat(gd, &gs) < 0 || gs.st_uid != geteuid() || (gs.st_mode & 022)) {
+            fprintf(stderr, "[warden] --gate-status %s: its directory must be owned by the Warden's "
+                    "user and writable by no one else; refusing to start\n", gate_status_path);
+            if (gd >= 0) close(gd);
+            return -1;
+        }
+        g_gate_status_fd = openat(gd, gname,
+                                  O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
+        close(gd);
+        if (g_gate_status_fd < 0 || fstat(g_gate_status_fd, &gs) < 0 || !own_private_file(&gs) ||
+            ftruncate(g_gate_status_fd, 0) != 0) {
+            fprintf(stderr, "[warden] --gate-status %s: %s; refusing to start\n", gate_status_path,
+                    g_gate_status_fd < 0 ? strerror(errno)
+                                         : "must be a regular file owned by the Warden's user and "
+                                           "writable by no one else");
+            return -1;
+        }
+        char grp[PATH_MAX];
+        if (fd_path(g_gate_status_fd, grp, sizeof grp) < 0 ||
+            vdpc_path_openable(&pol->c, grp, strlen(grp))) {
+            fprintf(stderr, "[warden] --gate-status %s: the policy would let the agent open it; "
+                    "refusing to start\n", gate_status_path);
             return -1;
         }
         protect_fd(g_gate_status_fd, "gate_status");

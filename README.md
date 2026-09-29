@@ -371,7 +371,7 @@ different risks at different points in the stack.
 - [x] **v1.7** — Cross-action data-flow verification
 - [x] **v1.8.2** — Bounded-refusal breaker
 - [x] **v1.9.0** — Progress-safety / HOOTL liveness proof
-- [x] **v1.9.1** — Enforcement hardening: io_uring closed; TOCTOU-safe file mediation (510→0); `connect`/`execve` deny-only
+- [x] **v1.9.1** — Enforcement hardening: io_uring closed; TOCTOU-safe file mediation (race-harness leaks → 0); `connect`/`execve` deny-only
 - [x] **v1.9.2** — Mediation completeness: default-deny allowlist; native-ABI/x32 lockdown; hard-deny set; `CLONE_NEWUSER` denial; live-Warden integration + conformance validation
 - [x] **v1.9.3** — Lifecycle coupling in the live Warden: PID-namespace isolation, death-signal coupling, fork-race guard, pidfd watch; crash test
 - [x] **v1.12** — Mediation correctness: resolve-then-decide (traversal / symlink / `/proc/self`), audit-log integrity, datagram-egress mediation; authorization-evidence export in the CycloneDX 1.6 format

@@ -86,6 +86,55 @@ static const char *kPortPolicy =
     "  match url.path /v1/*\n"
     "  permit_in SECRET\n";
 
+static const char *kDenyFirst =
+    "varek_policy 1\n"
+    "label SECRET 0\n"
+    "sticky SECRET\n"
+    "rule send_http\n"
+    "  match url.host 127.0.0.1\n"
+    "  deny_in SECRET\n"
+    "rule send_http\n"
+    "  match url.host *.EVIL.example\n"
+    "  deny_in SECRET\n"
+    "rule send_http\n"
+    "  match url.port 443\n"
+    "  match url.path /admin*\n"
+    "  deny_in SECRET\n"
+    "rule send_http\n"
+    "  permit_in SECRET\n";
+
+/* Deny rules must not be stepped around by another spelling of the same
+ * host, port or path: each such spelling is either matched by the deny rule
+ * or refused outright (-1), never given the permissive rule (1). */
+static void test_deny_spellings(void)
+{
+    printf("-- 1b. other spellings do not step around a deny rule\n");
+    plan_label_policy_config_t *d = load(kDenyFirst);
+    CHECK(d != NULL, "deny-first policy loads");
+    if (!d) return;
+    static const char *urls[] = {
+        "https://127.1/", "https://2130706433/", "https://0x7f.0.0.1/", "https://127.000.0.1/",
+        "https://a.evil.example/", "https://A.Evil.Example/",
+        "https://h.example:0443/admin", "https://h.example:443//admin",
+        "https://h.example:443/;/admin",
+    };
+    for (size_t i = 0; i < sizeof urls / sizeof urls[0]; i++) {
+        char msg[200];
+        snprintf(msg, sizeof msg, "%s is not given the permissive rule", urls[i]);
+        CHECK(permitted(d, urls[i]) != 1, msg);
+    }
+    CHECK(permitted(d, "https://127.0.0.1/") == 0, "the canonical address hits the deny rule");
+    CHECK(permitted(d, "https://ok.example/") == 1, "an unrelated host gets the permissive rule");
+    {
+        plan_action_arg_t args[2] = { { "url", "https://ok.example/" }, { "url", "https://127.0.0.1/" } };
+        plan_action_desc_t a = { .name = "send_http", .named_args = args, .n_named_args = 2 };
+        plan_label_class_t cls;
+        const plan_label_policy_t *pol = plan_label_policy_config_policy(d);
+        CHECK(pol->classify(&a, &cls, pol->ctx) == -1, "a repeated url argument fails the classification");
+    }
+    plan_label_policy_config_free(d);
+}
+
 static void test_url_components(void)
 {
     printf("-- 1. URL component match keys\n");
@@ -322,12 +371,28 @@ static void test_graph_signature(void)
     CHECK(s1 == plan_breaker_signature_graph(r, 3, f4, t4, 2), "steps renumbered: same signature");
     CHECK(s1 != plan_breaker_signature_graph(a, 3, f5, t5, 1), "a different edge set: different signature");
     CHECK(s1 != plan_breaker_signature_graph(a, 3, NULL, NULL, 0), "no edges: different signature");
+
+    /* Identical steps are not merged: S->M1->P (a leak through the middle)
+     * and S->M1, M2->P (no path from S to P) must not share a count. */
+    plan_action_arg_t ms = { "target", "/srv/secret/k" }, mm = { "target", "/srv/mid" },
+                      mp = { "target", "/srv/public/out" };
+    plan_action_desc_t g[4] = {
+        { .name = "file_open", .named_args = &ms, .n_named_args = 1 },
+        { .name = "file_open", .named_args = &mm, .n_named_args = 1 },
+        { .name = "file_open", .named_args = &mm, .n_named_args = 1 },
+        { .name = "file_open", .named_args = &mp, .n_named_args = 1 },
+    };
+    uint32_t lf[] = { 0, 1 }, lt[] = { 1, 3 };               /* S->M1, M1->P */
+    uint32_t sf[] = { 0, 2 }, stt[] = { 1, 3 };              /* S->M1, M2->P */
+    CHECK(plan_breaker_signature_graph(g, 4, lf, lt, 2) != plan_breaker_signature_graph(g, 4, sf, stt, 2),
+          "graphs differing only in which identical step an edge uses differ");
 }
 
 int main(void)
 {
     printf("VAREK v1.18.0 — v1.7 layer\n");
     test_url_components();
+    test_deny_spellings();
     test_breaker_persistence();
     test_graph_signature();
     printf("\n%d/%d checks passed\n", g_pass, g_pass + g_fail);

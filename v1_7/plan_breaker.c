@@ -72,17 +72,20 @@ static uint64_t step_hash(const plan_action_desc_t *a)
     return h;
 }
 
-static int cmp_u64(const void *x, const void *y)
-{
-    uint64_t a = *(const uint64_t *)x, b = *(const uint64_t *)y;
-    return (a > b) - (a < b);
-}
-
 static int cmp_pair(const void *x, const void *y)
 {
     const uint64_t *a = x, *b = y;
     if (a[0] != b[0]) return (a[0] > b[0]) - (a[0] < b[0]);
     return (a[1] > b[1]) - (a[1] < b[1]);
+}
+
+/* Sort context for ordering step indices by (hash, index). */
+static const uint64_t *g_sort_hash;
+static int cmp_step(const void *x, const void *y)
+{
+    size_t i = *(const size_t *)x, j = *(const size_t *)y;
+    if (g_sort_hash[i] != g_sort_hash[j]) return g_sort_hash[i] < g_sort_hash[j] ? -1 : 1;
+    return (i > j) - (i < j);
 }
 
 uint64_t plan_breaker_signature_graph(const plan_action_desc_t *actions,
@@ -91,31 +94,42 @@ uint64_t plan_breaker_signature_graph(const plan_action_desc_t *actions,
                                       const uint32_t *edge_to,
                                       size_t n_edges)
 {
-    /* Canonical: the multiset of steps (each hashed from its name and
-     * arguments) and the set of edges written as (step, step) pairs, both
-     * sorted. Listing the steps or the edges in another order, repeating an
-     * edge, or renumbering the steps gives the same signature. Two identical
-     * steps are indistinguishable, which can only merge graphs (a stricter
-     * count), never split one. If allocation fails, the signature is derived
-     * from the steps alone. */
+    /* The steps are put in a canonical order: by their hash (name and
+     * arguments), identical steps keeping their order in the plan. Each edge
+     * is written as (position, position) in that order, and the edges are
+     * sorted with repeats dropped. So listing distinct steps or the edges in
+     * another order, or repeating an edge, gives the same signature, while
+     * different edge sets always give different ones. Identical steps are
+     * never merged: merging would let an authorized graph clear the count of a
+     * refused one that differs only in which copy an edge uses. Reordering
+     * identical steps can give a new signature (a new count). If allocation
+     * fails, the signature is derived from the steps alone. */
     uint64_t *st = calloc(n_actions ? n_actions : 1, sizeof *st);
+    size_t *ord = calloc(n_actions ? n_actions : 1, sizeof *ord);
+    size_t *pos = calloc(n_actions ? n_actions : 1, sizeof *pos);
     uint64_t *ed = calloc(2 * (n_edges ? n_edges : 1), sizeof *ed);
-    if (!st || !ed) { free(st); free(ed); return plan_breaker_signature(actions, n_actions) ^ 1; }
-    for (size_t i = 0; i < n_actions; i++) st[i] = step_hash(&actions[i]);
+    if (!st || !ord || !pos || !ed) {
+        free(st); free(ord); free(pos); free(ed);
+        return plan_breaker_signature(actions, n_actions) ^ 1;
+    }
+    for (size_t i = 0; i < n_actions; i++) { st[i] = step_hash(&actions[i]); ord[i] = i; }
+    g_sort_hash = st;
+    qsort(ord, n_actions, sizeof *ord, cmp_step);
+    g_sort_hash = NULL;
+    for (size_t k = 0; k < n_actions; k++) pos[ord[k]] = k;
     size_t ne = 0;
     for (size_t i = 0; edge_from && edge_to && i < n_edges; i++) {
         if (edge_from[i] >= n_actions || edge_to[i] >= n_actions) continue;
-        ed[2 * ne]     = st[edge_from[i]];
-        ed[2 * ne + 1] = st[edge_to[i]];
+        ed[2 * ne]     = (uint64_t)pos[edge_from[i]];
+        ed[2 * ne + 1] = (uint64_t)pos[edge_to[i]];
         ne++;
     }
-    qsort(st, n_actions, sizeof *st, cmp_u64);
     qsort(ed, ne, 2 * sizeof *ed, cmp_pair);
     uint64_t h = 0xCBF29CE484222325ULL;
-    h = fnv1a(h, "graph-1", 7);
+    h = fnv1a(h, "graph-2", 7);
     uint64_t na = (uint64_t)n_actions;
     h = fnv1a(h, &na, sizeof na);
-    h = fnv1a(h, st, n_actions * sizeof *st);
+    for (size_t k = 0; k < n_actions; k++) h = fnv1a(h, &st[ord[k]], sizeof st[0]);
     uint64_t nu = 0;
     for (size_t i = 0; i < ne; i++) {
         if (i && ed[2 * i] == ed[2 * i - 2] && ed[2 * i + 1] == ed[2 * i - 1]) continue;
@@ -123,8 +137,7 @@ uint64_t plan_breaker_signature_graph(const plan_action_desc_t *actions,
         nu++;
     }
     h = fnv1a(h, &nu, sizeof nu);
-    free(st);
-    free(ed);
+    free(st); free(ord); free(pos); free(ed);
     return h;
 }
 
