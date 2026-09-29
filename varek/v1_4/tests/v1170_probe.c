@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #define D "/tmp/varek_v1170/allowed"
@@ -95,6 +96,24 @@ static int mode_meta(void) {
     char *rp = realpath(D "/sub/../lnk", b);
     if (rp) printf("PROBE %-22s OK %s\n", "realpath", rp);
     else res("realpath", 0, errno);
+    /* Review follow-ups. */
+    try_stat("key_trailing_slash", D "/keys/log.key/", 0);     /* exists, not a dir */
+    try_stat("dangling_link_out", D "/dangle", 0);             /* -> a missing outside path */
+    try_stat("link_to_outside", D "/outlink", 0);              /* -> /etc/shadow */
+    try_stat("denied_ancestor", "/tmp/varek_v1170/hidden/bob", 0);
+    struct stat ast;
+    r = stat("/tmp/varek_v1170", &ast);
+    if (r == 0) printf("PROBE %-22s OK mtime=%lld nlink=%lu\n", "ancestor_stat",
+                       (long long)ast.st_mtime, (unsigned long)ast.st_nlink);
+    else res("ancestor_stat", 0, errno);
+    r = fstatat(AT_FDCWD, "", &ast, AT_EMPTY_PATH);             /* the working directory */
+    e = errno; res("cwd_empty_path", r == 0, e);
+    r = (int)syscall(SYS_faccessat2, AT_FDCWD, "", W_OK, AT_EMPTY_PATH);
+    e = errno; res("cwd_access_w", r == 0, e);
+    long k = syscall(SYS_readlink, D "/lnk", b, 0x100000005UL);  /* int bufsiz = 5 */
+    printf("PROBE %-22s %ld\n", "readlink_int_size", k);
+    r = fstatat(AT_FDCWD, D "/ok.txt", &ast, 0x8000000);
+    e = errno; res("stat_bad_flags", r == 0, e);
     return 0;
 }
 

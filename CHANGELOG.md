@@ -83,8 +83,11 @@ the policy), so it is a minor release. No verdict *semantics* change.
   and times, and where any link pointed (including the Warden's own
   `/proc/<pid>/fd` entries). They are now resolved like an open, decided as a
   read-only open of the same object (`access(W_OK)` as a write), certified,
-  recorded and answered by the Warden. A missing name gives `ENOENT` inside the
-  policy and `EACCES` outside it. `access(X_OK)` is refused.
+  recorded and answered by the Warden. A name that does not exist gives
+  `ENOENT` inside the policy and `EACCES` outside it; a name that exists but
+  cannot be followed (a trailing slash on a file, a symlink whose target is
+  missing) fails closed. `access(X_OK)` is refused; flags the kernel would
+  refuse give `EINVAL`.
 - **The agent runs unprivileged.** It ran as root with every capability; it now
   runs as `nobody` (or `--run-as <user|uid[:gid]>`) with no supplementary
   groups, an empty capability bounding set and no capabilities. `--run-as
@@ -98,10 +101,14 @@ the policy), so it is a minor release. No verdict *semantics* change.
   directories must be searchable by that user. PATH is searched as `execvp`
   does. The launch approval accepts that `execveat` once, from the launched
   process only.
-- Answered without a decision: a lookup on a descriptor the agent already holds
-  (not recorded, like `read()`), and a read-type lookup on a directory an allow
-  rule's literal start leads to (recorded as `metadata_ancestor`), so
-  `realpath()` works on allowed paths.
+- Answered without a decision: `stat`/`statx` of a descriptor the agent already
+  holds (not recorded, like `read()`), and a read-type lookup on a directory an
+  allow rule's literal start leads to and no deny rule covers (recorded as
+  `metadata_ancestor`; existence and type only, with times zeroed), so
+  `realpath()` works on allowed paths. The working directory, `access()` and
+  `readlink()` on a descriptor are decided like a named object.
+- `--run-as` refuses group 0 for an unprivileged user and an empty group
+  (`1000:`). A missing program is refused before launch (exit 127).
 - Records gain the actions `file.stat`, `file.access` and `file.readlink` and
   the rules `metadata_answered`, `metadata_not_found`, `metadata_failed`,
   `metadata_ancestor`, `protected_object` and `raw_device`. The status line
@@ -114,8 +121,8 @@ the policy), so it is a minor release. No verdict *semantics* change.
 ### Added
 
 - `varek/v1_4/tests/v1170_probe.c`, `tests/test_v1170.sh`,
-  `tests/v1170_policy.txt`; `make test-v1170` (36 checks). Against v1.16.3,
-  20 of them fail: the key, stream and anchor are read through a bind mount,
+  `tests/v1170_policy.txt`; `make test-v1170` (48 checks). Against v1.16.3,
+  28 of them fail: the key, stream and anchor are read through a bind mount,
   lookups outside the policy succeed unrecorded, and the agent is uid 0.
 - `RELEASE-v1.17.0.md`.
 

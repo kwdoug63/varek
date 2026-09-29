@@ -16,7 +16,7 @@ with UNKNOWN suppressed to DENY, the certificates and the symmetric-suppression
 invariant (**no extension may move a genuinely unsafe action to SATISFIED**)
 are untouched. It does change defaults, so it is a minor release.
 
-`make test-v1170` (36 checks) covers all three; 20 of its checks fail against
+`make test-v1170` (48 checks) covers all three; 28 of its checks fail against
 v1.16.3. Every earlier suite (v1.9.3 lifecycle, v1.12 to v1.16.2), the
 conformance target, the v1.6 integration test and the v1.7 checks still pass.
 
@@ -64,17 +64,26 @@ They are now sent to the Warden, which:
 - **answers** the call itself, writing the result into the agent's memory.
 
 A name that does not exist is decided on where it would be: `ENOENT` inside the
-policy, `EACCES` outside it, so a lookup no longer says what exists elsewhere.
-`access(X_OK)` is refused, since nothing may be executed after the launch.
+policy, `EACCES` outside it, so a lookup no longer says what exists elsewhere. A
+name that exists but cannot be followed (a trailing slash on a file, or a
+symlink whose target is missing) fails closed, so a link inside the policy
+cannot be used to ask whether something outside it exists. `access(X_OK)` is
+refused, since nothing may be executed after the launch. Flags the kernel would
+refuse get `EINVAL`, and `readlink`'s size is read as the kernel reads it (an
+`int`).
 
 Two cases are answered without a decision:
 
 - **A descriptor the agent already holds** (`fstat`, `statx` with
-  `AT_EMPTY_PATH`): like `read()` on it, not recorded.
+  `AT_EMPTY_PATH`): like `read()` on it, not recorded. The working directory is
+  not treated as held (the agent never acquired it through the Warden), and
+  `access()` and `readlink()` on a descriptor are decided like a named object.
 - **A directory an allow rule leads to.** For `allow path /usr/lib/python3/`
   that is `/`, `/usr`, `/usr/lib` and `/usr/lib/python3`: a read-type lookup is
-  answered and recorded as `metadata_ancestor`. Without this, `realpath()` and
-  the like fail on every allowed path.
+  answered and recorded as `metadata_ancestor`, unless a deny rule covers the
+  directory. The answer carries existence and type only: times are zeroed and
+  the link count is 1. Without this, `realpath()` and the like fail on every
+  allowed path.
 
 `varek_audit.py` re-checks every certified lookup and checks each
 `metadata_ancestor` record against the policy's allow rules.
@@ -90,7 +99,8 @@ the filter is loaded the Warden's child clears its supplementary groups,
 empties the capability bounding and ambient sets, switches group and user, and
 verifies that no capability remains. `PR_SET_PDEATHSIG` is set after the
 switch, because a credential change clears it. `--run-as root` keeps the old
-behaviour and prints a warning.
+behaviour and prints a warning. An unprivileged user in group 0 is refused, and
+so is an empty group (`--run-as 1000:`), which would otherwise read as group 0.
 
 File access does not depend on the agent's own rights: the Warden opens and
 looks up allowed files on its behalf, as root, only after the policy allows
@@ -107,7 +117,7 @@ sound as before. A script (`#!`) is launched by its path.
 ## Compatibility
 
 - **The agent is no longer root.** A program that the unprivileged user cannot
-  execute is refused with a clear message (exit 127). For a script, every
+  execute, or that does not exist, is refused with a clear message (exit 127). For a script, every
   directory above it must also be searchable by that user. `--run-as root`
   restores the old behaviour.
 - **Lookups are now decided by the policy.** A lookup outside the policy gets
@@ -137,6 +147,19 @@ sound as before. A script (`#!`) is launched by its path.
 - The deployment preflight (`varek_preflight.sh`) still checks the protected
   files by path, so it cannot see a bind mount. The runtime check now covers
   it.
+- Identity protection covers anything that presents the same device and inode:
+  bind mounts, hard links, renames. A stacked filesystem that re-presents the
+  key under a new device (an overlay mount whose lower layer holds it) is not
+  recognized. Keep the key, anchor and log off any filesystem the agent's
+  allowed trees are built from.
+- A verdict stream written through a pipe (`2> >(tee run.log)`) is protected as
+  a pipe; the file `tee` writes is not known to the Warden. Write the stream to
+  a file (`2> run.log`) or keep that file outside the policy.
+- Answers are written into the agent's memory through `/proc/<pid>/mem`, which
+  can write into the agent's own read-only pages. That affects only the agent
+  and data it could already write.
+- The Warden still resolves every path itself, on one thread, so a lookup on a
+  hung network or FUSE filesystem stalls supervision, as an open always could.
 
 ## Requirements
 

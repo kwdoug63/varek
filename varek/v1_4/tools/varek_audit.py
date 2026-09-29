@@ -66,39 +66,47 @@ META_RULES = ("metadata_answered", "metadata_not_found", "metadata_failed")
 
 def policy_ancestors(path):
     """The directories an allow rule's literal start leads to (warden.c:
-    load_ancestors): lookups on these are answered without a decision."""
-    flag = lambda t: t == "readonly" or t.startswith("access=") or t[:3] in ("+O_", "-O_")
+    load_ancestors): lookups on these may be answered without a decision. The
+    Warden answers a subset (it also skips any a deny rule covers); a record
+    outside this set is a problem. Lines and tokens are split exactly as the
+    policy parser does (smt_decide.c): lines on '\\n' only, tokens on ASCII
+    whitespace, a token starting with '#' ends the line."""
+    import re
+    flag = lambda t: t == b"readonly" or t.startswith(b"access=") or t[:3] in (b"+O_", b"-O_")
     out = {"/"}
-    with open(path, encoding="utf-8", errors="surrogateescape") as fh:
-        for line in fh:
-            toks = []
-            for t in line.split():
-                if t.startswith("#"):
-                    break
-                toks.append(t)
-            if len(toks) < 3 or toks[0] != "allow" or toks[1] != "path":
+    with open(path, "rb") as fh:
+        data = fh.read()
+    for line in data.split(b"\n"):
+        toks = []
+        for t in re.split(rb"[ \t\r\v\f]+", line):
+            if not t:
                 continue
-            m, c = "prefix", toks[2]
-            if toks[2] in ("exact", "prefix", "suffix", "contains", "glob") and \
-                    len(toks) > 3 and not flag(toks[3]):
-                m, c = toks[2], toks[3]
-            if m in ("prefix", "exact"):
-                lit = c
-            elif m == "glob":
-                k = 0
-                while k < len(c) and c[k] not in "*?[\\":
-                    k += 1
-                lit = c[:k]
-            else:
-                continue
-            if not lit.startswith("/"):
-                continue
-            for i in range(1, len(lit) + 1):
-                if i == len(lit):
-                    if lit[i - 1] == "/":
-                        out.add(lit[:i - 1] or "/")
-                elif lit[i] == "/":
-                    out.add(lit[:i])
+            if t.startswith(b"#"):
+                break
+            toks.append(t)
+        if len(toks) < 3 or toks[0] != b"allow" or toks[1] != b"path":
+            continue
+        m, c = b"prefix", toks[2]
+        if toks[2] in (b"exact", b"prefix", b"suffix", b"contains", b"glob") and \
+                len(toks) > 3 and not flag(toks[3]):
+            m, c = toks[2], toks[3]
+        if m in (b"prefix", b"exact"):
+            lit = c
+        elif m == b"glob":
+            k = 0
+            while k < len(c) and c[k:k + 1] not in (b"*", b"?", b"[", b"\\"):
+                k += 1
+            lit = c[:k]
+        else:
+            continue
+        if not lit.startswith(b"/"):
+            continue
+        for i in range(1, len(lit) + 1):
+            if i == len(lit):
+                if lit[i - 1:i] == b"/":
+                    out.add((lit[:i - 1] or b"/").decode("utf-8", "surrogateescape"))
+            elif lit[i:i + 1] == b"/":
+                out.add(lit[:i].decode("utf-8", "surrogateescape"))
     return out
 
 
@@ -432,6 +440,11 @@ def main(argv=None):
             if rec.get("resolved") not in ancestors:
                 problems.append(f"seq {rec.get('seq')}: a lookup answered as a directory the "
                                 f"policy leads to, but {rec.get('resolved')!r} is not one")
+            elif rec.get("open_flags") != "0x0" or \
+                    (rec.get("action") == "file.access" and
+                     int(rec.get("access_mode", "7")) & 3):
+                problems.append(f"seq {rec.get('seq')}: a lookup answered as a directory the "
+                                f"policy leads to, but it asked for more than a read")
             lookups += 1
             continue
         is_open = rec.get("action") == "file.open" and rec.get("rule") in AUTHORIZED_OPEN_RULES

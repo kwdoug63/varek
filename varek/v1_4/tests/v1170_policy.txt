@@ -9,3 +9,7 @@ allow path /tmp/varek_v1170/allowed/ro/ readonly
 deny  path /tmp/varek_v1170/allowed/ro/
 allow path /tmp/varek_v1170/allowed/
 allow path /proc/self/
+# An allow rule under a denied tree: its leading directories (/tmp/varek_v1170/
+# hidden, .../hidden/bob) must not be answered as "ancestors".
+deny  path /tmp/varek_v1170/hidden/
+allow path /tmp/varek_v1170/hidden/bob/work/

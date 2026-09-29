@@ -48,6 +48,9 @@ chmod 755 "$D" "$D/allowed"
 echo ok > "$D/allowed/ok.txt"
 echo x > "$D/allowed/ro/x"
 ln -s ok.txt "$D/allowed/lnk"
+ln -s /root/varek_v1170_missing "$D/allowed/dangle"
+ln -s /etc/shadow "$D/allowed/outlink"
+mkdir -p "$D/hidden/bob/work"
 "$KEYGEN" "$D/secret/log.key" > "$D/secret/log.key.hex"
 mknod "$D/allowed/blk" b 7 0
 mknod "$D/allowed/mem" c 1 1
@@ -86,7 +89,7 @@ fi
 
 echo "== 2. stat, access and readlink are mediated =="
 M="$OUT/meta.out"
-( cd /tmp && "$WARDEN" "$POL" -- "$PROBE" meta > "$M" 2> "$OUT/meta.log" )
+( cd /var && "$WARDEN" "$POL" -- "$PROBE" meta > "$M" 2> "$OUT/meta.log" )
 expect "stat inside the policy: answered"            "$M" stat_allowed         "OK size=3"
 expect "stat of /etc/shadow: refused"                 "$M" stat_shadow          "ERR Permission denied"
 expect "missing name inside the policy: ENOENT"       "$M" stat_missing_inside  "ERR No such file"
@@ -102,6 +105,15 @@ expect "access(X_OK): no (nothing may be executed)"   "$M" access_X             
 expect "fstat of a held descriptor: answered"         "$M" fstat_held           "OK size=3"
 expect "statx inside the policy: answered"            "$M" statx                "OK size=3"
 expect "realpath() of an allowed path works"          "$M" realpath             "OK /tmp/varek_v1170/allowed/ok.txt"
+expect "trailing slash on the key's alias: refused"   "$M" key_trailing_slash   "ERR Permission denied"
+expect "dangling link to outside: refused, no oracle" "$M" dangling_link_out    "ERR Permission denied"
+expect "link to /etc/shadow: refused"                 "$M" link_to_outside      "ERR Permission denied"
+expect "ancestor under a deny rule: refused"          "$M" denied_ancestor      "ERR Permission denied"
+expect "ancestor answer: existence only (no times)"   "$M" ancestor_stat        "OK mtime=0 nlink=1"
+expect "stat of a cwd outside the policy: refused"    "$M" cwd_empty_path       "ERR Permission denied"
+expect "access(W_OK) on that cwd: refused"            "$M" cwd_access_w         "ERR Permission denied"
+expect "readlink size is an int (writes 5 bytes)"     "$M" readlink_int_size    "^PROBE readlink_int_size +5$"
+expect "unknown stat flags: EINVAL"                   "$M" stat_bad_flags       "ERR Invalid argument"
 grep -q '"action":"file.stat","target":"/etc/shadow",[^}]*"decision_final":"DENY"' "$OUT/meta.log" \
     && pass "the refused stat is recorded" || flunk "no record of the refused stat"
 grep -q '"action":"file.readlink","target":"/tmp/varek_v1170/allowed/lnk",[^}]*"rule":"metadata_answered"' "$OUT/meta.log" \
@@ -130,6 +142,13 @@ grep -Eq '^PROBE Uid:\s+0\s' "$P" && grep -q 'WARNING: --run-as root' "$OUT/root
     && pass "--run-as root: uid 0, with a warning" || flunk "--run-as root"
 "$WARDEN" "$POL" --run-as no_such_user_v1170 -- "$PROBE" priv > /dev/null 2>&1; rc=$?
 [ "$rc" = 2 ] && pass "an unknown user is refused (exit 2)" || flunk "unknown user (exit $rc)"
+"$WARDEN" "$POL" --run-as 1000: -- "$PROBE" priv > /dev/null 2>&1; rc=$?
+[ "$rc" = 2 ] && pass "--run-as 1000: (empty group) is refused" || flunk "empty group (exit $rc)"
+"$WARDEN" "$POL" --run-as 65534:0 -- "$PROBE" priv > /dev/null 2>&1; rc=$?
+[ "$rc" = 2 ] && pass "--run-as with group root is refused" || flunk "group root (exit $rc)"
+"$WARDEN" "$POL" -- "$D/no_such_program" > /dev/null 2> "$OUT/missing.log"; rc=$?
+[ "$rc" = 127 ] && grep -q 'program not found' "$OUT/missing.log" \
+    && pass "a missing program: a clear refusal (exit 127)" || flunk "missing program (exit $rc)"
 cp "$PROBE" "$D/secret/private_probe"; chmod 700 "$D/secret/private_probe"
 "$WARDEN" "$POL" -- "$D/secret/private_probe" priv > "$P" 2> "$OUT/noexec.log"; rc=$?
 [ "$rc" = 127 ] && grep -q 'cannot execute' "$OUT/noexec.log" \

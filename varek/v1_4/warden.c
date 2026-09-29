@@ -223,6 +223,7 @@ struct action {
     unsigned      statx_mask;
     int           access_mode;          /* F_OK/R_OK/W_OK/X_OK */
     bool          path_null;            /* a NULL path pointer */
+    bool          bad_flags;            /* flags the kernel would refuse (EINVAL) */
 };
 
 static const char *action_kind_name(action_kind_t k) {
@@ -598,6 +599,17 @@ static int derive_intent(const struct seccomp_notif *req,
                 break;
         }
         out->open_dirfd = dfd;
+        out->bad_flags =
+            (nr == __NR_newfstatat &&
+             (out->at_flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH))) ||
+            (nr == __NR_statx &&
+             ((out->at_flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH |
+                                 AT_STATX_SYNC_TYPE)) ||
+              (out->at_flags & AT_STATX_SYNC_TYPE) == AT_STATX_SYNC_TYPE ||
+              (out->statx_mask & STATX__RESERVED))) ||
+            (nr == __NR_faccessat2 &&
+             (out->at_flags & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))) ||
+            (out->kind == ACT_FILE_ACCESS && (out->access_mode & ~(F_OK | R_OK | W_OK | X_OK)));
         if (pathaddr == 0) {
             out->path_null = true;
             out->target[0] = '\0';
@@ -1240,9 +1252,14 @@ static void emit_pathology(uint64_t seq,
     if (!g_log) return;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    char flags_json[16] = "";
+    char flags_json[40] = "";
     if ((a->kind == ACT_FILE_OPEN || is_meta_kind(a->kind)) && a->flags_known)
         snprintf(flags_json, sizeof flags_json, "0x%x", (unsigned)a->open_flags);
+    /* v1.17.0: what an access() asked, so an audit can tell F_OK/R_OK from
+     * W_OK/X_OK. */
+    if (a->kind == ACT_FILE_ACCESS && flags_json[0])
+        snprintf(flags_json + strlen(flags_json), sizeof flags_json - strlen(flags_json),
+                 "\",\"access_mode\":\"%d", a->access_mode & 7);
     /* v1.12: target and resolved are escaped via json_escape(); every other
      * field is drawn from a fixed enum or an integer, so the whole record is
      * well-formed JSON regardless of agent-controlled input. */
@@ -1809,6 +1826,24 @@ static bool is_ancestor(const char *canon) {
     return false;
 }
 
+/* An ancestor a deny rule covers (the directory, or what is inside it) is not
+ * answered: `deny path /home/` before `allow path /home/bob/work/` leaves
+ * /home and /home/bob to the policy, which refuses them. */
+static bool ancestor_denied(const struct policy *p, const char *dir) {
+    char withslash[PATH_LIMIT];
+    const char *cands[2] = { dir, withslash };
+    int nc = 1;
+    if (strcmp(dir, "/") && (size_t)snprintf(withslash, sizeof withslash, "%s/", dir) < sizeof withslash)
+        nc = 2;
+    for (int k = 0; k < nc; k++) {
+        int ri;
+        vdp_why_t why;
+        if (vdp_decide(&p->v, VDP_KIND_PATH, cands[k], O_RDONLY, true, &ri, &why) == VDP_UNSATISFIED)
+            return true;
+    }
+    return false;
+}
+
 
 static void send_value(int notify_fd, uint64_t id, int64_t val) {
     struct seccomp_notif_resp resp = { .id = id, .val = val, .error = 0, .flags = 0 };
@@ -1856,19 +1891,33 @@ static int agent_fd(pid_t tid, int fd) {
 /* Answer the lookup on an object the supervisor holds. Returns the system
  * call's return value (>= 0) or -errno. */
 static int64_t meta_answer(pid_t tid, int notify_fd, uint64_t id,
-                           const struct action *a, int ofd) {
+                           const struct action *a, int ofd, bool ancestor) {
     if (a->kind == ACT_FILE_STAT) {
         if (a->meta_nr == __NR_statx) {
             struct statx stx;
             memset(&stx, 0, sizeof stx);
-            if (syscall(__NR_statx, ofd, "", AT_EMPTY_PATH | (a->at_flags & AT_STATX_SYNC_TYPE),
-                        a->statx_mask, &stx) < 0)
+            /* The sync type is not passed on: a forced sync on a network
+             * filesystem would stall the single-threaded supervisor. */
+            if (syscall(__NR_statx, ofd, "", AT_EMPTY_PATH, a->statx_mask, &stx) < 0)
                 return -errno;
+            if (ancestor) {                  /* existence and type only */
+                memset(&stx.stx_atime, 0, sizeof stx.stx_atime);
+                memset(&stx.stx_btime, 0, sizeof stx.stx_btime);
+                memset(&stx.stx_ctime, 0, sizeof stx.stx_ctime);
+                memset(&stx.stx_mtime, 0, sizeof stx.stx_mtime);
+                stx.stx_nlink = 1;
+            }
             int w = xproc_write(tid, notify_fd, id, a->out_addr, &stx, sizeof stx);
             return w < 0 ? w : 0;
         }
         struct stat st;
         if (fstatat(ofd, "", &st, AT_EMPTY_PATH) < 0) return -errno;
+        if (ancestor) {
+            memset(&st.st_atim, 0, sizeof st.st_atim);
+            memset(&st.st_mtim, 0, sizeof st.st_mtim);
+            memset(&st.st_ctim, 0, sizeof st.st_ctim);
+            st.st_nlink = 1;
+        }
         int w = xproc_write(tid, notify_fd, id, a->out_addr, &st, sizeof st);
         return w < 0 ? w : 0;
     }
@@ -1880,23 +1929,32 @@ static int64_t meta_answer(pid_t tid, int notify_fd, uint64_t id,
         if (a->access_mode & X_OK) return -EACCES;
         return 0;
     }
-    /* readlink */
-    if ((int64_t)a->out_len <= 0) return -EINVAL;
+    /* readlink: the kernel takes the size as an int. */
+    int bufsiz = (int)(uint32_t)a->out_len;
+    if (bufsiz <= 0) return -EINVAL;
     struct stat lst;
     if (fstat(ofd, &lst) < 0) return -errno;
     if (!S_ISLNK(lst.st_mode)) return -EINVAL;     /* what readlink says of a non-link */
     char buf[PATH_LIMIT];
-    size_t want = a->out_len < sizeof buf ? (size_t)a->out_len : sizeof buf;
+    size_t want = (size_t)bufsiz < sizeof buf ? (size_t)bufsiz : sizeof buf;
     ssize_t n = readlinkat(ofd, "", buf, want);
     if (n < 0) return -errno;
     int w = xproc_write(tid, notify_fd, id, a->out_addr, buf, (size_t)n);
     return w < 0 ? w : n;
 }
 
-/* The lookup's own object, when it names one the agent already holds (an
- * empty path with AT_EMPTY_PATH, or readlinkat(fd, "")): answered without a
- * policy decision, like read() on that descriptor. 1 if handled here. */
-static int meta_on_held_fd(pid_t tid, int notify_fd, uint64_t id, const struct action *a) {
+/* A lookup with an empty path names a descriptor, not a path: the agent's
+ * dirfd (with AT_EMPTY_PATH), or readlinkat(fd, ""). Returns:
+ *   1  answered here (stat/statx of a descriptor the agent already holds, like
+ *      read() on it: no decision, not recorded; or an error);
+ *   2  the object is *held_ofd and must be decided like a named one: the
+ *      working directory (AT_FDCWD), whose rights the agent never acquired
+ *      through the Warden, and access()/readlink(), which ask what the agent
+ *      may do or see rather than what it already holds;
+ *   0  not an empty path. */
+static int meta_on_held_fd(pid_t tid, int notify_fd, uint64_t id, const struct action *a,
+                           int *held_ofd) {
+    *held_ofd = -1;
     bool empty_ok = (a->kind == ACT_FILE_STAT || a->meta_nr == __NR_faccessat2)
                         ? (a->at_flags & AT_EMPTY_PATH) != 0
                         : a->meta_nr == __NR_readlinkat;
@@ -1907,7 +1965,11 @@ static int meta_on_held_fd(pid_t tid, int notify_fd, uint64_t id, const struct a
     }
     int ofd = agent_fd(tid, a->open_dirfd);
     if (ofd < 0) { send_errno(notify_fd, id, (int)-ofd); return 1; }
-    int64_t r = meta_answer(tid, notify_fd, id, a, ofd);
+    if (a->kind != ACT_FILE_STAT || a->open_dirfd == VAREK_AT_FDCWD) {
+        *held_ofd = ofd;
+        return 2;
+    }
+    int64_t r = meta_answer(tid, notify_fd, id, a, ofd, false);
     close(ofd);
     if (r < 0) send_errno(notify_fd, id, (int)-r);
     else       send_value(notify_fd, id, r);
@@ -1920,11 +1982,21 @@ static int meta_on_held_fd(pid_t tid, int notify_fd, uint64_t id, const struct a
  * exist, *ofd is -1, a->resolved is <canonical parent>/<name> and *missing is
  * the errno the agent's own call would have seen, so the decision is made on
  * where it would be. Returns 0, or -1 to fail closed. */
-static int resolve_meta(pid_t tid, struct action *a, int *ofd, int *missing) {
+static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *missing) {
     *ofd = -1;
     *missing = 0;
     a->resolved[0] = '\0';
     pid_t tgid = -1;
+    if (held >= 0) {                     /* an empty path: the descriptor itself */
+        if (fd_canonical_path(held, a->resolved, sizeof(a->resolved)) < 0 ||
+            check_proc_object(held, tid, &tgid, a->resolved, sizeof(a->resolved)) < 0) {
+            a->resolved[0] = '\0';
+            close(held);
+            return -1;
+        }
+        *ofd = held;
+        return 0;
+    }
     char path[PATH_LIMIT];
     bool thread_self = false;
     if (path_is_proc_self(a->target, &thread_self)) {
@@ -1967,6 +2039,16 @@ static int resolve_meta(pid_t tid, struct action *a, int *ofd, int *missing) {
     int pfd = openat2_path(base, dir, (uint64_t)O_DIRECTORY);
     close(base);
     if (pfd < 0) return -1;              /* the parent is missing too: fail closed */
+    /* Only a name that truly does not exist is decided on where it would be.
+     * If it exists (a trailing slash on a file, ENOTDIR; or a symlink whose
+     * target is missing), failing here would answer for an object the
+     * identity check never saw, or tell the agent whether a link's target
+     * outside the policy exists: fail closed instead. */
+    struct stat nst;
+    if (fstatat(pfd, name, &nst, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT) {
+        close(pfd);
+        return -1;
+    }
     char parent[PATH_LIMIT];
     int rc = -1;
     if (fd_canonical_path(pfd, parent, sizeof(parent)) == 0 &&
@@ -2093,10 +2175,12 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * on where it would be: ENOENT inside the policy, EACCES outside, so
          * the lookup no longer tells the agent what exists elsewhere. */
         if (is_meta_kind(act.kind)) {
-            if (meta_on_held_fd(req.pid, notify_fd, req.id, &act)) continue;
+            if (act.bad_flags) { send_errno(notify_fd, req.id, EINVAL); continue; }
+            int held = -1;
+            if (meta_on_held_fd(req.pid, notify_fd, req.id, &act, &held) == 1) continue;
             int mfd = -1, missing = 0;
             const char *mforbid = NULL;
-            if (resolve_meta(req.pid, &act, &mfd, &missing) < 0) {
+            if (resolve_meta(req.pid, &act, held, &mfd, &missing) < 0) {
                 mforbid = "resolution_failed";
             } else if (mfd >= 0) {
                 const char *f = forbidden_object(mfd, act.resolved);
@@ -2118,8 +2202,9 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             if (mfd >= 0 &&
                 !(act.kind == ACT_FILE_ACCESS && (act.access_mode & (W_OK | X_OK)))) {
                 struct stat ast;
-                if (fstat(mfd, &ast) == 0 && S_ISDIR(ast.st_mode) && is_ancestor(act.resolved)) {
-                    int64_t r = meta_answer(req.pid, notify_fd, req.id, &act, mfd);
+                if (fstat(mfd, &ast) == 0 && S_ISDIR(ast.st_mode) && is_ancestor(act.resolved) &&
+                    !ancestor_denied(p, act.resolved)) {
+                    int64_t r = meta_answer(req.pid, notify_fd, req.id, &act, mfd, true);
                     close(mfd);
                     if (r < 0) send_errno(notify_fd, req.id, (int)-r);
                     else       send_value(notify_fd, req.id, r);
@@ -2158,7 +2243,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                 r = -missing;
                 rule = "metadata_not_found";
             } else {
-                r = meta_answer(req.pid, notify_fd, req.id, &act, mfd);
+                r = meta_answer(req.pid, notify_fd, req.id, &act, mfd, false);
                 close(mfd);
                 rule = r < 0 ? "metadata_failed" : "metadata_answered";
             }
@@ -2565,7 +2650,11 @@ static int parse_run_as(const char *v, struct run_as *ra) {
     if (v[0] >= '0' && v[0] <= '9') {
         char *end;
         unsigned long u = strtoul(v, &end, 10), g = u;
-        if (*end == ':') g = strtoul(end + 1, &end, 10);
+        if (*end == ':') {
+            const char *gs = end + 1;
+            if (*gs < '0' || *gs > '9') return -1;  /* "1000:" is not group 0 */
+            g = strtoul(gs, &end, 10);
+        }
         if (*end || u > 0x7fffffffUL || g > 0x7fffffffUL) return -1;
         ra->uid = (uid_t)u;
         ra->gid = (gid_t)g;
@@ -2579,6 +2668,7 @@ static int parse_run_as(const char *v, struct run_as *ra) {
         }
     }
     if (ra->uid == 0) ra->drop = false;            /* uid 0 is root */
+    if (ra->drop && ra->gid == 0) return -2;       /* group root for an unprivileged user */
     return 0;
 }
 
@@ -2606,8 +2696,9 @@ static int drop_privileges(const struct run_as *ra) {
  * name). Returns 0 with out filled, or -1. */
 static int find_program(const char *name, char *out, size_t n) {
     if (strchr(name, '/')) {
+        struct stat st;
         if ((size_t)snprintf(out, n, "%s", name) >= n) return -1;
-        return 0;
+        return stat(out, &st) == 0 && S_ISREG(st.st_mode) ? 0 : -1;
     }
     const char *path = getenv("PATH");
     if (!path || !*path) path = "/usr/local/bin:/usr/bin:/bin";
@@ -2726,9 +2817,15 @@ int main(int argc, char **argv) {
 
     /* v1.17.0: who the agent runs as, and the program it launches. */
     struct run_as ra;
-    if (parse_run_as(run_as_arg ? run_as_arg : "nobody", &ra) < 0) {
+    int prc = parse_run_as(run_as_arg ? run_as_arg : "nobody", &ra);
+    if (prc == -2) {
+        fprintf(stderr, "[warden] --run-as %s: an unprivileged user in group 0 (root) is refused; "
+                "name a non-root group\n", run_as_arg ? run_as_arg : "nobody");
+        return 2;
+    }
+    if (prc < 0) {
         fprintf(stderr, "[warden] --run-as %s: no such user (give a name, uid or uid:gid)\n",
-                run_as_arg);
+                run_as_arg ? run_as_arg : "nobody");
         return 2;
     }
     if (!ra.drop)
@@ -2736,7 +2833,7 @@ int main(int argc, char **argv) {
                 "capability (the pre-v1.17 behaviour); only the seccomp filter holds it back\n");
     static char boot_path[PATH_MAX];
     if (find_program(target_argv[0], boot_path, sizeof boot_path) < 0) {
-        fprintf(stderr, "[warden] %s: program not found\n", target_argv[0]);
+        fprintf(stderr, "[warden] %s: program not found (or not a regular file)\n", target_argv[0]);
         return 127;
     }
 
@@ -2940,8 +3037,10 @@ int main(int argc, char **argv) {
      * that sendto/sendmsg can be mediated without deadlocking the bootstrap. */
     int child_fd_num = -1;
     if (read_all(sv[0], &child_fd_num, sizeof(child_fd_num)) < 0 || child_fd_num < 0) {
-        fprintf(stderr, "[warden] failed to read listener fd number\n");
         close(sv[0]); kill_target_tree(target); waitpid(target, NULL, 0);
+        (void)relay_agent_stderr(agent_err_fd, true);   /* v1.17.0: the child's reason */
+        fprintf(stderr, "[warden] the agent's setup failed before supervision began "
+                        "(see the [agent] lines above)\n");
         return 1;
     }
     int target_pidfd_h = (int)syscall(__NR_pidfd_open, target, 0);
