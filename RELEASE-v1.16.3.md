@@ -78,8 +78,10 @@ evaluator decided.
 - **The policy matches text, not resolved paths or hosts.** `/work/../etc/x`
   counts as under `/work/`. Any target *containing* `allowed.internal`
   (ignoring case) counts as allowed. The `demo:` prefix ignores case.
-- **A NUL byte ends a line.** Text after a NUL on the same line is ignored,
-  and a line that begins with a NUL is skipped.
+- **NUL bytes.** A NUL in a line makes the parser reject it as too long,
+  except on a last line with no newline, where the text after the NUL is
+  ignored. A line that begins with a NUL is skipped; if it is over 1,023
+  bytes, its remainder is read as a new line.
 - **Labels are at most 63 characters.** The parser rejects a 64-character
   label, although its header comment says 64.
 - **Long file paths shorten parse errors.** Error text is limited to 256
@@ -120,7 +122,7 @@ curl -s 127.0.0.1:8088/healthz
 - **No verdict:** missing field, extra field, invalid label, unknown edge
   label, missing file, and a file path containing a quote and a backslash
   all give `parse_failed` with exit 2; no argument gives a usage error on
-  stderr; a failed write to stdout gives a non-zero exit.
+  stderr; a failed write to stdout gives exit 3.
 
 Every output must be exactly one line of valid UTF-8 holding one JSON object
 with no repeated keys. The test passes under dash, bash and `bash --posix`.

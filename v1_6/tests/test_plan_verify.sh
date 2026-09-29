@@ -108,8 +108,9 @@ else echo "  PASS  no argument: usage on stderr, non-zero exit"; fi
 n=$((n + 1))
 plan 'action a file_open /work/x\n'
 if [ -w /dev/full ]; then
-    if "$PV" "$T/p" > /dev/full 2>/dev/null; then echo "  FAIL  a failed write to stdout: exit 0"; fail=1
-    else echo "  PASS  a failed write to stdout: non-zero exit"; fi
+    "$PV" "$T/p" > /dev/full 2>/dev/null; rc=$?
+    if [ "$rc" = 3 ]; then echo "  PASS  a failed write to stdout: exit 3"
+    else echo "  FAIL  a failed write to stdout: exit $rc, wanted 3"; fail=1; fi
 else echo "  PASS  a failed write to stdout: skipped (no /dev/full)"; fi
 
 echo
