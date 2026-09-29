@@ -124,7 +124,9 @@ if python3 "$EXPORTER" --log "$VERDICTS" --output "$OUT/bom.json" >/dev/null 2>"
     pass "CycloneDX exporter accepts the multithreaded stream"
 else flunk "CycloneDX exporter accepts the multithreaded stream ($(head -1 "$OUT/exp.err"))"; fi
 # The BOM names the Warden version from run_start, not the exporter's own.
-sed -E 's/"warden":"[0-9.]+"/"warden":"9.9.9"/' "$VERDICTS" > "$OUT/relabel.log"
+sed -E 's/"warden":"[0-9.]+"/"warden":"9.9.9"/' "$VERDICTS" > "$OUT/relabel.raw"
+# v1.16: re-chain the edited stream (the chain is checked while reading it).
+python3 "$(dirname "$0")/log_rechain.py" "$OUT/relabel.raw" > "$OUT/relabel.log"
 if python3 "$EXPORTER" --log "$OUT/relabel.log" --output "$OUT/relabel.json" >/dev/null 2>&1 \
    && grep -q '"version": "9.9.9"' "$OUT/relabel.json"; then
     pass "BOM takes the Warden version from run_start"

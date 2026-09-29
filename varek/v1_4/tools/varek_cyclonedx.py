@@ -50,11 +50,13 @@ valid, well-formed authorization record).
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
+import re
 import sys
 import uuid
 
-VAREK_VERSION = "1.15.0"
+VAREK_VERSION = "1.16.0"
 SPEC_VERSION = "1.6"
 
 # The provisional patents, as recorded in the runtime's own documentation.
@@ -67,6 +69,55 @@ PATENTS = [
 
 class StreamError(SystemExit):
     pass
+
+
+LOG_CHAIN_FORMAT = "chain-1"
+LOG_CHAIN_IV = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
+LOG_SIG_DOMAIN = b"VAREK-LOG-SIG-1"
+CHECKPOINT_EVENTS = ("run_start", "checkpoint", "run_end")
+_CHAIN_TAIL = re.compile(rb',"chain":"([0-9a-f]{64})"(?:,"sig":"([0-9a-f]{128})")?\}\n?\Z')
+
+
+def _version_at_least(v, want):
+    """True if v (e.g. "1.16.0") is at least want (e.g. (1, 16))."""
+    if not isinstance(v, str):
+        return False
+    parts = v.split(".")
+    try:
+        return tuple(int(x) for x in parts[:2]) >= want
+    except ValueError:
+        return False
+
+
+def _chain_step(st, raw, rec, lineno, ndecisions, fail):
+    """v1.16: check one record's chain value against the exact bytes of the
+    line, and advance the chain."""
+    b = raw.encode("utf-8", errors="surrogateescape")
+    m = _CHAIN_TAIL.search(b)
+    if not m:
+        fail(lineno, "record of a chained stream without a well-formed chain value "
+                     "(it was edited, or not written by the Warden).")
+    body = b[:m.start()]
+    h = hashlib.sha256(st["head"] + body).digest()
+    if h.hex() != m.group(1).decode():
+        fail(lineno, "hash chain broken: this record, or one before it, was altered, "
+                     "inserted, removed or reordered.")
+    st["head"] = h
+    st["n"] += 1
+    st["since_signed"] += 1
+    event = rec.get("event")
+    if event in CHECKPOINT_EVENTS:
+        if event == "checkpoint" and rec.get("records") != ndecisions:
+            fail(lineno, f"checkpoint counts {rec.get('records')} decision records, "
+                         f"the stream holds {ndecisions} before it.")
+        sig = m.group(2).decode() if m.group(2) else None
+        st["signed"].append({"event": event, "chain": h, "sig": sig, "line": lineno,
+                             "records": rec.get("records", 0), "ndec": ndecisions})
+        if sig:
+            st["since_signed"] = 0
+    elif event == "anchor_error":
+        st["anchor_errors"].append({"line": lineno, "anchoring": rec.get("anchoring"),
+                                    "errno": rec.get("errno")})
 
 
 def _parse_log(stream, allow_incomplete=False, meta=None):
@@ -89,7 +140,16 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
         and is refused unless allow_incomplete is set.
 
     v1.12.0 and older logs have no run id and are refused: their records
-    could be forged by the supervised agent."""
+    could be forged by the supervised agent.
+
+    v1.16 streams (run_start carries "log":"chain-1") are hash-chained: every
+    record of the run ends with "chain":"<hex>", SHA-256 of the previous chain
+    value and the record's exact bytes up to that field. A record whose chain
+    value is wrong, or a record of the run without one, refuses the stream.
+    The chain alone only catches accidental damage (anyone can recompute it);
+    what it gives the audit is a single value per record that signatures and
+    an external anchor can seal. The signed records ("sig") are returned in
+    meta["log"] for tools/varek_audit.py to verify."""
     name = getattr(stream, "name", "<stdin>")
 
     def fail(lineno, why):
@@ -100,6 +160,7 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
     records = []
     ended = None
     warden_version = VAREK_VERSION
+    chained = None      # v1.16: the chain state, when run_start says the stream is chained
     for lineno, raw in enumerate(stream, 1):
         if not raw.startswith("{"):
             continue
@@ -110,6 +171,15 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
         if not isinstance(rec, dict):
             fail(lineno, "record is not a JSON object.")
         event = rec.get("event")
+        if event == "run_start" or (run is not None and rec.get("run") == run):
+            if chained is not None or (event == "run_start" and run is None
+                                       and rec.get("log") == LOG_CHAIN_FORMAT):
+                if chained is None:
+                    chained = {"head": LOG_CHAIN_IV, "n": 0, "signed": [], "since_signed": 0,
+                               "anchor_errors": []}
+                if ended is not None:
+                    fail(lineno, "record after run_end.")
+                _chain_step(chained, raw, rec, lineno, len(records), fail)
         if event == "run_start":
             if run is not None:
                 fail(lineno, "second run_start in one stream.")
@@ -119,6 +189,9 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             w = rec.get("warden")
             if isinstance(w, str) and w:
                 warden_version = w
+            if chained is None and _version_at_least(w, (1, 16)):
+                fail(lineno, "run_start names a Warden that chains its records (1.16 or later) "
+                             "but the stream is not chained: the chain was stripped.")
             if meta is not None:
                 meta["run_start"] = rec      # v1.15: policy_sha256, for the audit
             continue
@@ -143,6 +216,8 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
                          f"(a record is missing, repeated or foreign).")
         records.append(rec)
 
+    if meta is not None:
+        meta["log"] = chained            # v1.16: None for an unchained (pre-1.16) stream
     if run is None:
         fail(0, "no run_start record: not a v1.12.1+ Warden stream.")
     if ended is None and not allow_incomplete:
@@ -165,7 +240,7 @@ def _ts(records):
 
 
 def build_bom(records, agent, policy, serial, run_id="", complete=True,
-              warden_version=VAREK_VERSION, policy_sha256=""):
+              warden_version=VAREK_VERSION, policy_sha256="", log_info=None):
     # v1.12.2: the Warden component carries the version named in the stream's
     # run_start (the Warden that made the decisions), not this exporter's.
     now = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -212,6 +287,10 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
             # v1.15: the SHA-256 of the policy bytes the Warden decided with
             {"name": "varek:policy.sha256", "value": policy_sha256},
             {"name": "varek:run.id", "value": run_id},
+            # v1.16: the stream's hash chain (checked while reading it) and its
+            # signing key; the signatures themselves are verified by varek_audit.py
+            {"name": "varek:log.chain", "value": (log_info or {}).get("chain", "none")},
+            {"name": "varek:log.pubkey", "value": (log_info or {}).get("pubkey", "")},
             {"name": "varek:run.complete", "value": "true" if complete else "false"},
             {"name": "varek:run.start", "value": run_start},
             {"name": "varek:run.end", "value": run_end},
@@ -317,8 +396,12 @@ def main(argv=None):
     stream.close()
 
     serial = args.serial or f"urn:uuid:{uuid.uuid4()}"
+    lg = meta.get("log")
+    log_info = {"chain": (lg["head"].hex() if lg else "none"),
+                "pubkey": str(meta.get("run_start", {}).get("log_pubkey", ""))}
     bom = build_bom(records, args.agent, args.policy, serial, run_id, complete,
-                    warden_version, str(meta.get("run_start", {}).get("policy_sha256", "")))
+                    warden_version, str(meta.get("run_start", {}).get("policy_sha256", "")),
+                    log_info)
 
     out = json.dumps(bom, indent=2)
     if args.output:

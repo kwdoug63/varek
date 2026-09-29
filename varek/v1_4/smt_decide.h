@@ -92,7 +92,7 @@
 #define VDP_MAX_RULES      256
 #define VDP_MAX_ENUM_BITS  16       /* bounded bitvector enumeration */
 #define VDP_GLOB_MAX_WILD  32       // wildcards per glob (* ** ? [...] and the /**/ unit)
-#define VDP_GLOB_MAX_TOTAL 65536    // glob tokens per policy: bounds the work per decision
+#define VDP_GLOB_MAX_TOTAL 4096     // glob tokens per policy: bounds the work per decision (v1.16: was 65536)
 
 /* The x86_64 open(2) flag bits (uapi asm-generic/fcntl.h). Anything outside
  * this set is outside the fragment. */
@@ -254,6 +254,9 @@ int vdp_certificate(const vdp_policy_t *p, int rule_index, const char *s, vdp_ce
 /* Release what vdp_policy_load allocated (compiled globs). */
 void vdp_policy_free(vdp_policy_t *p);
 
+/* v1.16: total glob tokens in the policy (<= VDP_GLOB_MAX_TOTAL). */
+size_t vdp_policy_glob_tokens(const vdp_policy_t *p);
+
 /* Can rule i ever be the first rule (of its kind) that holds? */
 vdp_reach_t vdp_rule_reachable(const vdp_policy_t *p, size_t i);
 
@@ -288,6 +291,6 @@ size_t vdp_rule_advisory(const vdp_rule_t *r, char *buf, size_t n);
 
 /* The Warden version this procedure implements, for `require warden X.Y`. */
 #define VDP_WARDEN_MAJOR 1
-#define VDP_WARDEN_MINOR 15
+#define VDP_WARDEN_MINOR 16
 
 #endif /* VAREK_SMT_DECIDE_H */

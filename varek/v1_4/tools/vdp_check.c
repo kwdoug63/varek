@@ -165,6 +165,10 @@ int main(int argc, char **argv) {
                     vdp_reach_unknown_text());
             }
         }
+        /* v1.16: the policy's glob size against the cap that bounds the work
+         * of one decision (4,096 tokens x a 4,095-byte string). */
+        printf("%s: glob tokens %zu of %d\n", argv[1], vdp_policy_glob_tokens(&g_pol),
+               VDP_GLOB_MAX_TOTAL);
         printf("%s: %zu rules, %d can never fire\n", argv[1], g_pol.n, dead);
         return dead ? 1 : 0;
     }

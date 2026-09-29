@@ -597,6 +597,15 @@ int vdp_certificate(const vdp_policy_t *p, int rule_index, const char *s, vdp_ce
     return 0;
 }
 
+/* v1.16: the policy's glob size, in tokens (at most VDP_GLOB_MAX_TOTAL). With
+ * the length bound it bounds the matching work of one decision. */
+size_t vdp_policy_glob_tokens(const vdp_policy_t *p) {
+    size_t t = 0;
+    for (size_t i = 0; i < p->n; i++)
+        if (p->rules[i].s.prog) t += p->rules[i].s.prog->ntok;
+    return t;
+}
+
 void vdp_policy_free(vdp_policy_t *p) {
     if (!p) return;
     for (size_t i = 0; i < p->n; i++) {

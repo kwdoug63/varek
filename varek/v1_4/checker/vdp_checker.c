@@ -5,6 +5,9 @@
 // trick and no shortcut beyond what the definitions say. It shares no code
 // with smt_decide.c and does not include its header.
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE                   /* memmem */
+#endif
 #include "vdp_checker.h"
 
 #include <stdarg.h>
@@ -351,7 +354,7 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
         const char *ge = parse_glob(c, cl, &r->g, &r->ng);
         if (ge) return fail(err, en, name, ln, "%s", ge);
         *glob_total += r->ng;
-        if (*glob_total > 65536) return fail(err, en, name, ln, "glob tokens over the policy total");
+        if (*glob_total > VDPC_GLOB_MAX_TOTAL) return fail(err, en, name, ln, "glob tokens over the policy total");
         r->fixed = true;
         for (size_t k = 0; k < r->ng; k++) {
             if (r->g[k].type == G_LIT || r->g[k].type == G_SET) r->minlen++;
@@ -462,39 +465,43 @@ static bool is_stretch(int type) { return type == G_STAR || type == G_DSTAR || t
 
 /* Row dynamic programming. at[j]: tokens [0, j) match s[0, i). inside[j]:
  * token j is a SEGS that has taken at least one byte of s[.., i) and not yet
- * ended. */
+ * ended. Each new row is computed from the previous one in a single pass
+ * (v1.16: no per-byte clearing or copying, so many short globs cost no more
+ * per token than one long one); the two rows are then swapped. */
 #define MAXG (VDPC_MAX_S + 3)
 static bool glob_match(const gtok_t *g, size_t n, const char *s, size_t sl) {
-    static __thread bool at[MAXG], nat[MAXG], inside[MAXG], ninside[MAXG];
+    static __thread bool row_a[MAXG], row_b[MAXG], seg_a[MAXG], seg_b[MAXG];
     if (n + 1 > MAXG) return false;
-    memset(at, 0, n + 1);
-    memset(inside, 0, n + 1);
+    bool *at = row_a, *nat = row_b, *inside = seg_a, *ninside = seg_b;
     at[0] = true;
-    for (size_t j = 0; j < n; j++)
-        if (at[j] && is_stretch(g[j].type)) at[j + 1] = true;       /* empty stretch */
+    inside[0] = false;
+    for (size_t j = 0; j < n; j++) {
+        at[j + 1] = at[j] && is_stretch(g[j].type);                   /* empty stretch */
+        inside[j + 1] = false;
+    }
     for (size_t i = 0; i < sl; i++) {
         unsigned char b = (unsigned char)s[i];
-        memset(nat, 0, n + 1);
-        memset(ninside, 0, n + 1);
         bool any = false;
+        nat[0] = false;                       /* no token prefix matches a nonempty string emptily */
         for (size_t j = 0; j < n; j++) {
             const gtok_t *t = &g[j];
+            bool v, in = false;               /* v: nat[j + 1]; in: ninside[j] */
             if (t->type == G_LIT || t->type == G_SET) {
-                if (at[j] && tok_takes(t, b)) nat[j + 1] = true;
+                v = at[j] && tok_takes(t, b);
             } else if (t->type == G_STAR || t->type == G_DSTAR) {
-                if (at[j + 1] && tok_takes(t, b)) nat[j + 1] = true;  /* the stretch grows */
-            } else {                                                    /* G_SEGS */
-                if (at[j] || inside[j]) {
-                    ninside[j] = true;
-                    if (b == '/') nat[j + 1] = true;
-                }
+                v = at[j + 1] && tok_takes(t, b);                     /* the stretch grows */
+            } else {                                                  /* G_SEGS */
+                in = at[j] || inside[j];
+                v = in && b == '/';
             }
-            if (nat[j] && is_stretch(t->type)) nat[j + 1] = true;      /* empty stretch */
-            any = any || nat[j] || ninside[j];
+            if (nat[j] && is_stretch(t->type)) v = true;              /* empty stretch */
+            nat[j + 1] = v;
+            ninside[j] = in;
+            any = any || v || in;
         }
-        any = any || nat[n];
-        memcpy(at, nat, n + 1);
-        memcpy(inside, ninside, n + 1);
+        ninside[n] = false;
+        bool *tmp = at; at = nat; nat = tmp;
+        tmp = inside; inside = ninside; ninside = tmp;
         if (!any) return false;
     }
     return at[n];
@@ -508,9 +515,10 @@ static bool str_holds(const vdpc_rule_t *r, const char *s, size_t sl) {
         case M_EXACT:  return sl == cl && memcmp(s, c, cl) == 0;
         case M_SUFFIX: return sl >= cl && memcmp(s + sl - cl, c, cl) == 0;
         case M_CONTAINS:
-            for (size_t k = 0; k + cl <= sl; k++)
-                if (memcmp(s + k, c, cl) == 0) return true;
-            return false;
+            /* memmem (libc, linear time): a byte-by-byte search is quadratic
+             * in the worst case, and 256 such rules on a 4,095-byte path would
+             * dominate the cost of an open. */
+            return memmem(s, sl, c, cl) != NULL;
         case M_HOST:
             if (sl == cl && memcmp(s, c, cl) == 0) return true;
             if (memchr(c, ':', cl)) return false;
@@ -659,4 +667,37 @@ int vdpc_check(const vdpc_policy_t *p, int kind, const char *s, size_t sl,
     }
     if (c->r >= 0 && c->r != deciding) return reject(why, wn, "certificate names the wrong rule");
     return 1;
+}
+
+/* v1.16: could the agent open path s with SOME admissible flags value? The
+ * Warden asks this of its signing key and its anchor file at startup and
+ * refuses to run a policy that would let the agent open either. Same
+ * enumeration as the symbolic claim above: only the flag bits of the rules
+ * whose string atom holds on s matter. */
+int vdpc_path_openable(const vdpc_policy_t *p, const char *s, size_t sl) {
+    if (sl > VDPC_MAX_S || memchr(s, '\0', sl)) return 0;   /* outside the fragment: refused */
+    size_t hold[VDPC_MAX_RULES], nh = 0;
+    uint32_t bits = 0;
+    for (size_t j = 0; j < p->n; j++) {
+        const vdpc_rule_t *e = &p->rules[j];
+        if (e->kind != VDPC_PATH || !str_holds(e, s, sl)) continue;
+        hold[nh++] = j;
+        bits |= e->mask;
+        if (e->mask == 0) break;
+    }
+    uint32_t sub = 0;
+    for (;;) {
+        if ((sub & ACCMODE) != ACCMODE) {
+            for (size_t k = 0; k < nh; k++) {
+                const vdpc_rule_t *e = &p->rules[hold[k]];
+                if (flag_holds(e, sub)) {
+                    if (e->allow) return 1;
+                    break;
+                }
+            }
+        }
+        if (sub == bits) break;
+        sub = (sub - bits) & bits;
+    }
+    return 0;
 }

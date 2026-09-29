@@ -98,6 +98,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <limits.h>
+#include <sodium.h>              /* v1.16: SHA-256 chain, Ed25519 signatures */
 
 /* VAREK v1.6 plan-graph integration headers.
  * The v1_6/ directory ships these as a self-contained module; this
@@ -233,7 +236,7 @@ static int policy_load(const char *path, struct policy *p) {
             "(warden_faultinject); never use it to supervise a real agent\n");
 #endif
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.15");
+    snprintf(p->version, sizeof(p->version), "1.16");
     char err[512];
     /* v1.15: read the file once. The decision procedure and the certificate
      * checker parse these same bytes, and their SHA-256 goes in run_start, so
@@ -854,6 +857,172 @@ static char     g_run_id[33];
 static uint64_t g_records = 0;       /* decision records emitted */
 static bool     g_relay_midline = false;
 
+/* v1.16: log integrity against whoever HOLDS the log.
+ *
+ * v1.12.1 made the stream unforgeable by the supervised agent. It did nothing
+ * against a person who holds the log file afterwards and edits it. Three
+ * layers address that:
+ *
+ *   1. Hash chain (always on). Every record of this run (run_start, each
+ *      decision record, checkpoint, anchor_error, run_end) ends with
+ *        "chain":"<hex>"   chain_i = SHA-256(chain_{i-1} || body_i)
+ *      where body_i is the record's exact bytes from its '{' up to (not
+ *      including) the ',"chain":' that follows, and chain_{-1} =
+ *      SHA-256("VAREK-LOG-CHAIN-1"). Editing, inserting, removing or
+ *      reordering any record changes every chain value after it.
+ *   2. Ed25519 signatures (--sign-key). run_start, every checkpoint and
+ *      run_end also carry "sig": an Ed25519 signature over
+ *      "VAREK-LOG-SIG-1" || chain_i (the raw 32 bytes). A checkpoint is written
+ *      after every N decision records (--checkpoint-every, default 64) and once
+ *      a second while records are pending. With the public key pinned, an
+ *      auditor detects any change to the log up to the last signature; without
+ *      the private key nobody can re-sign a rewritten log, and a log cut short
+ *      has no signed run_end.
+ *   3. External anchor (--anchor PATH). Each signed record (or, without a key,
+ *      each checkpoint-type record) is also appended, as one line, to PATH:
+ *      storage the log's holder cannot rewrite (a FIFO to a forwarder, remote
+ *      syslog, WORM or object-lock storage, an RFC 3161 timestamping step).
+ *      Once a chain value is anchored, not even the key holder can rewrite the
+ *      history before it undetected. A failed anchor write is recorded in the
+ *      stream (event anchor_error) and never blocks supervision.
+ *
+ * Human status lines ("[warden] ...") and the agent's relayed stderr
+ * ("[agent] ...") are not records and are not chained. */
+#define LOG_CHAIN_IV   "VAREK-LOG-CHAIN-1"
+#define LOG_SIG_DOMAIN "VAREK-LOG-SIG-1"
+static unsigned char g_chain[32];
+static bool          g_signing = false;
+static unsigned char g_pk[crypto_sign_PUBLICKEYBYTES];
+static unsigned char *g_sk;                /* sodium_malloc: guarded, locked, not dumped */
+static int           g_anchor_fd = -1;
+static uint64_t      g_ckpt_every = 64;
+static uint64_t      g_since_ckpt = 0;      /* decision records since the last signed record */
+static struct timespec g_last_ckpt;         /* CLOCK_MONOTONIC */
+static uint64_t      g_anchor_errors = 0;
+static bool          g_log_broken = false;  /* a record could not be written */
+static FILE         *g_rf;                  /* the record being built */
+static char         *g_rb;
+static size_t        g_rl;
+
+static bool checkpoints_on(void) { return g_signing || g_anchor_fd >= 0; }
+
+static FILE *rec_begin(void) {
+    rewind(g_rf);
+    return g_rf;
+}
+
+static void emit_anchor_error(const char *event, int err);
+
+/* Append one checkpoint-type record to the anchor, in a single write(). The
+ * descriptor is non-blocking: a slow or absent reader never stalls the
+ * Warden; the failure is recorded instead. */
+static void anchor_write(const char *event, const char *chain_hex, const char *sig_hex) {
+    if (g_anchor_fd < 0) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    char line[512];
+    int n = snprintf(line, sizeof line,
+                     "{\"run\":\"%s\",\"event\":\"%s\",\"records\":%" PRIu64 ","
+                     "\"chain\":\"%s\"%s%s%s,\"timestamp_ns\":%lld}\n",
+                     g_run_id, event, g_records, chain_hex,
+                     sig_hex ? ",\"sig\":\"" : "", sig_hex ? sig_hex : "", sig_hex ? "\"" : "",
+                     (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+    ssize_t w;
+    do { w = write(g_anchor_fd, line, (size_t)n); } while (w < 0 && errno == EINTR);
+    if (w != n) {
+        int err = w < 0 ? errno : EIO;
+        g_anchor_errors++;
+        if (strcmp(event, "run_end") != 0) {
+            emit_anchor_error(event, err);
+        } else {
+            /* Nothing may follow run_end in the stream; the audit finds the
+             * unanchored run_end by itself. */
+            log_line_start();
+            fprintf(g_log, "[warden] could not anchor run_end: %s\n", strerror(err));
+            fflush(g_log);
+        }
+    }
+}
+
+/* Finish the record in g_rf (a complete "{...}\n"): chain it, sign it if it is
+ * checkpoint-type and a key is loaded, write it to the stream in one write(),
+ * and anchor it. event is NULL for a plain (decision) record. */
+static void rec_end(const char *ckpt_event) {
+    fflush(g_rf);
+    if (g_rl < 2 || memcmp(g_rb + g_rl - 2, "}\n", 2) != 0) {
+        /* Cannot happen: every writer ends its record with "}\n". */
+        fprintf(stderr, "[warden] internal error: malformed record; stopping\n");
+        abort();
+    }
+    size_t bl = g_rl - 2;
+    crypto_hash_sha256_state st;
+    crypto_hash_sha256_init(&st);
+    crypto_hash_sha256_update(&st, g_chain, sizeof g_chain);
+    crypto_hash_sha256_update(&st, (const unsigned char *)g_rb, bl);
+    crypto_hash_sha256_final(&st, g_chain);
+    char chain_hex[65], sig_hex[2 * crypto_sign_BYTES + 1];
+    sodium_bin2hex(chain_hex, sizeof chain_hex, g_chain, sizeof g_chain);
+    bool sign = ckpt_event && g_signing;
+    if (sign) {
+        unsigned char msg[sizeof LOG_SIG_DOMAIN - 1 + 32], sig[crypto_sign_BYTES];
+        memcpy(msg, LOG_SIG_DOMAIN, sizeof LOG_SIG_DOMAIN - 1);
+        memcpy(msg + sizeof LOG_SIG_DOMAIN - 1, g_chain, 32);
+        crypto_sign_detached(sig, NULL, msg, sizeof msg, g_sk);
+        sodium_bin2hex(sig_hex, sizeof sig_hex, sig, sizeof sig);
+    }
+    log_line_start();
+    fwrite(g_rb, 1, bl, g_log);
+    fprintf(g_log, ",\"chain\":\"%s\"%s%s%s}\n", chain_hex,
+            sign ? ",\"sig\":\"" : "", sign ? sig_hex : "", sign ? "\"" : "");
+    /* A stream that cannot be written stops supervision (fail closed): the
+     * agent must not run on unrecorded. */
+    if (fflush(g_log) != 0 || ferror(g_log)) g_log_broken = true;
+    if (ckpt_event) {
+        g_since_ckpt = 0;
+        clock_gettime(CLOCK_MONOTONIC, &g_last_ckpt);
+        anchor_write(ckpt_event, chain_hex, sign ? sig_hex : NULL);
+    }
+}
+
+static void emit_anchor_error(const char *event, int err) {
+    FILE *f = rec_begin();
+    fprintf(f, "{\"event\":\"anchor_error\",\"run\":\"%s\",\"anchoring\":\"%s\","
+               "\"records\":%" PRIu64 ",\"errno\":%d,\"anchor_errors\":%" PRIu64 "}\n",
+            g_run_id, event, g_records, err, g_anchor_errors);
+    rec_end(NULL);                      /* chained; not itself anchored */
+}
+
+/* A checkpoint: a signed (and anchored) record that seals every record before
+ * it. */
+static void emit_checkpoint(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    FILE *f = rec_begin();
+    fprintf(f, "{\"event\":\"checkpoint\",\"run\":\"%s\",\"records\":%" PRIu64 ","
+               "\"timestamp_ns\":%lld}\n",
+            g_run_id, g_records, (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+    rec_end("checkpoint");
+}
+
+#define CKPT_INTERVAL_MS 1000
+
+/* Called between notifications (never while an agent thread waits on an
+ * answer): a checkpoint after every g_ckpt_every decision records, and once a
+ * second while any are pending. Returns the poll() timeout until the next
+ * time-based checkpoint (-1: none pending). */
+static int maybe_checkpoint(void) {
+    if (!checkpoints_on() || g_since_ckpt == 0) return -1;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long long ms = (now.tv_sec - g_last_ckpt.tv_sec) * 1000LL
+                 + (now.tv_nsec - g_last_ckpt.tv_nsec) / 1000000LL;
+    if (g_since_ckpt >= g_ckpt_every || ms >= CKPT_INTERVAL_MS) {
+        emit_checkpoint();
+        return -1;
+    }
+    return (int)(CKPT_INTERVAL_MS - ms);
+}
+
 static int log_init(void) {
     /* The stream is the Warden's stderr, through a private descriptor
      * (close-on-exec, never inherited by the agent) that is fully buffered
@@ -863,8 +1032,13 @@ static int log_init(void) {
     if (fd < 0) return -1;
     g_log = fdopen(fd, "w");
     if (!g_log) { close(fd); return -1; }
-    static char logbuf[1 << 16];
+    static char logbuf[1 << 17];
     setvbuf(g_log, logbuf, _IOFBF, sizeof logbuf);
+    /* v1.16: records are built here, then chained and written in one piece. */
+    g_rf = open_memstream(&g_rb, &g_rl);
+    if (!g_rf) return -1;
+    crypto_hash_sha256(g_chain, (const unsigned char *)LOG_CHAIN_IV, sizeof LOG_CHAIN_IV - 1);
+    clock_gettime(CLOCK_MONOTONIC, &g_last_ckpt);
     unsigned char rnd[16];
     size_t got = 0;
     while (got < sizeof rnd) {
@@ -916,30 +1090,41 @@ static int relay_agent_stderr(int fd, bool drain_all) {
 static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    log_line_start();
-    fprintf(g_log, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.15.0\","
-                   "\"policy_path\":\"", g_run_id);
-    json_escape(g_log, policy_path);
-    fprintf(g_log, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s\"timestamp_ns\":%lld}\n",
-            p->v.n, p->sha256,
+    FILE *f = rec_begin();
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.16.0\","
+               "\"policy_path\":\"", g_run_id);
+    json_escape(f, policy_path);
+    fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
 #ifdef VDP_FAULT_INJECT
-            "\"build\":\"faultinject\",",     /* a test build: never a real run */
+            "\"build\":\"faultinject\","      /* a test build: never a real run */
 #else
-            "",
+            ""
 #endif
-            (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
-    fflush(g_log);
+            );
+    /* v1.16: how this stream is protected (see the log integrity notes). */
+    fputs("\"log\":\"chain-1\",", f);
+    if (g_signing) {
+        char pk_hex[2 * crypto_sign_PUBLICKEYBYTES + 1];
+        sodium_bin2hex(pk_hex, sizeof pk_hex, g_pk, sizeof g_pk);
+        fprintf(f, "\"log_pubkey\":\"%s\",", pk_hex);
+    }
+    if (checkpoints_on())
+        fprintf(f, "\"checkpoint_every\":%" PRIu64 ",", g_ckpt_every);
+    if (g_anchor_fd >= 0) fputs("\"anchored\":true,", f);
+    fprintf(f, "\"timestamp_ns\":%lld}\n", (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+    rec_end("run_start");
 }
 
 static void emit_run_end(int exit_status) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    log_line_start();
-    fprintf(g_log, "{\"event\":\"run_end\",\"run\":\"%s\",\"records\":%" PRIu64 ","
-                   "\"exit_status\":%d,\"timestamp_ns\":%lld}\n",
+    FILE *f = rec_begin();
+    fprintf(f, "{\"event\":\"run_end\",\"run\":\"%s\",\"records\":%" PRIu64 ","
+               "\"exit_status\":%d,%s\"timestamp_ns\":%lld}\n",
             g_run_id, g_records, exit_status,
+            g_anchor_errors ? "\"anchor_errors_seen\":true," : "",
             (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
-    fflush(g_log);
+    rec_end("run_end");
 }
 
 static void emit_pathology(uint64_t seq,
@@ -960,8 +1145,8 @@ static void emit_pathology(uint64_t seq,
     /* v1.12: target and resolved are escaped via json_escape(); every other
      * field is drawn from a fixed enum or an integer, so the whole record is
      * well-formed JSON regardless of agent-controlled input. */
-    log_line_start();
-    fprintf(g_log,
+    FILE *f = rec_begin();
+    fprintf(f,
         "{\"report_id\":\"pr-%ld.%09ld-%" PRIu64 "\","
         "\"run\":\"%s\","
         "\"seq\":%" PRIu64 ","
@@ -972,10 +1157,10 @@ static void emit_pathology(uint64_t seq,
         g_run_id, g_records,
         (int)pid,
         action_kind_name(a->kind));
-    json_escape(g_log, a->target);
-    fputs("\",\"resolved\":\"", g_log);
-    json_escape(g_log, a->resolved[0] ? a->resolved : "");
-    fprintf(g_log,
+    json_escape(f, a->target);
+    fputs("\",\"resolved\":\"", f);
+    json_escape(f, a->resolved[0] ? a->resolved : "");
+    fprintf(f,
         "\",\"decision_raw\":\"%s\","
         "\"decision_final\":\"%s\","
         "\"rule\":\"%s\","
@@ -1003,8 +1188,9 @@ static void emit_pathology(uint64_t seq,
         kernel_errno,
         (uint64_t)(latency_ns / 1000ULL),
         (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
-    fflush(g_log);
+    rec_end(NULL);
     g_records++;
+    g_since_ckpt++;
 }
 
 /* ---------------- Kernel Injection ---------------- */
@@ -1403,7 +1589,8 @@ static int inject_fd(int notify_fd, uint64_t id, int resolved)
 /* ---------------- receive loop ---------------- */
 
 static volatile sig_atomic_t g_stop = 0;
-static void on_term(int sig) { (void)sig; g_stop = 1; }
+static volatile sig_atomic_t g_child_exited = 0;
+static void on_term(int sig) { if (sig == SIGCHLD) g_child_exited = 1; g_stop = 1; }
 
 /* Returns true when the agent went away on its own (its pidfd fired, or no
  * task is left under the filter), false when the Warden stopped supervising for
@@ -1413,7 +1600,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                       pid_t bootstrap_pid) {
     uint64_t seq = 0;
     bool bootstrap_done = false;
-    while (!g_stop) {
+    while (!g_stop && !g_log_broken) {
         /* v1.9.3: wait on the listener AND the target's pidfd. Blocking in
          * NOTIF_RECV alone can hang forever if the target exits between the
          * g_stop check and the ioctl (the SIGCHLD is already spent).
@@ -1424,7 +1611,9 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             { .fd = target_pidfd, .events = POLLIN },
             { .fd = agent_err_fd, .events = POLLIN },
         };
-        int pr = poll(pfds, 3, -1);
+        /* v1.16: checkpoints are written here, between notifications, so
+         * signing never delays an answer the agent is waiting for. */
+        int pr = poll(pfds, 3, maybe_checkpoint());
         if (pr < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -1609,11 +1798,182 @@ static int have_cap_sys_admin(void) {
             & CAP_TO_MASK(CAP_SYS_ADMIN)) != 0;
 }
 
+/* ---------------- v1.16: signing key and anchor ---------------- */
+
+/* The canonical path of an open descriptor, as the kernel resolved it (no
+ * second lookup that could race with a rename). */
+static int fd_path(int fd, char *out, size_t n) {
+    char link[64];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    ssize_t k = readlink(link, out, n - 1);
+    if (k <= 0 || (size_t)k >= n - 1 || out[0] != '/') return -1;
+    out[k] = '\0';
+    return 0;
+}
+
+/* The policy must not let the agent open the file behind fd (with any flags):
+ * decided by the certificate checker, which every authorization needs. A
+ * regular file must have exactly one name, or the agent could reach it through
+ * another (a hard link in an allowed directory). */
+static int refuse_if_agent_can_open(const struct policy *p, int fd, const char *path,
+                                    const char *what) {
+    struct stat st;
+    char rp[PATH_MAX];
+    if (fstat(fd, &st) < 0 || fd_path(fd, rp, sizeof rp) < 0) {
+        fprintf(stderr, "[warden] %s %s: cannot determine its path\n", what, path);
+        return -1;
+    }
+    if (S_ISREG(st.st_mode) && st.st_nlink != 1) {
+        fprintf(stderr, "[warden] the %s %s has %lu names (hard links); the agent could reach "
+                "it through another. Refusing to start.\n", what, rp, (unsigned long)st.st_nlink);
+        return -1;
+    }
+    if (vdpc_path_openable(&p->c, rp, strlen(rp))) {
+        fprintf(stderr, "[warden] the policy would let the agent open the %s (%s); deny that "
+                "path or keep the file outside every path the policy allows. Refusing to start.\n",
+                what, rp);
+        return -1;
+    }
+    return 0;
+}
+
+/* Raw access to a disk reads (or writes) every file on it, whatever the path
+ * rules say: with a signing key or an anchor, refuse a policy that would let
+ * the agent open any block device under /dev, /dev/mem, /dev/kmem, /dev/port,
+ * /proc/kcore, or a disk's command device (/dev/sg*, /dev/nvme*, /dev/bsg/).
+ * Only nodes that exist are checked; the agent cannot create one (mknod is not
+ * in its allowlist). Other drivers that expose storage are not recognized. */
+static int raw_device_scan(const struct policy *p, const char *dir, int depth) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int rc = 0;
+    struct dirent *e;
+    while (rc == 0 && (e = readdir(d)) != NULL) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char path[PATH_MAX];
+        if ((size_t)snprintf(path, sizeof path, "%s/%s", dir, e->d_name) >= sizeof path) continue;
+        struct stat st;
+        if (lstat(path, &st) < 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (depth < 4) rc = raw_device_scan(p, path, depth + 1);
+            continue;
+        }
+        /* Block devices; memory; and the character devices that pass commands
+         * to a disk (SCSI generic, NVMe, block SCSI generic). */
+        bool raw = S_ISBLK(st.st_mode) ||
+                   (S_ISCHR(st.st_mode) &&
+                    ((depth == 0 && (!strcmp(e->d_name, "mem") || !strcmp(e->d_name, "kmem") ||
+                                     !strcmp(e->d_name, "port") ||
+                                     !strncmp(e->d_name, "sg", 2) ||
+                                     !strncmp(e->d_name, "nvme", 4))) ||
+                     !strncmp(dir, "/dev/bsg", 8)));
+        if (raw && vdpc_path_openable(&p->c, path, strlen(path))) {
+            fprintf(stderr, "[warden] the policy would let the agent open %s, which gives raw "
+                    "access to storage (including the signing key or the anchor); deny it. "
+                    "Refusing to start.\n", path);
+            rc = -1;
+        }
+    }
+    closedir(d);
+    return rc;
+}
+
+static int refuse_raw_devices(const struct policy *p) {
+    if (raw_device_scan(p, "/dev", 0) < 0) return -1;
+    struct stat st;
+    if (stat("/proc/kcore", &st) == 0 && vdpc_path_openable(&p->c, "/proc/kcore", 11)) {
+        fprintf(stderr, "[warden] the policy would let the agent open /proc/kcore; deny it. "
+                "Refusing to start.\n");
+        return -1;
+    }
+    return 0;
+}
+
+/* --sign-key FILE: an Ed25519 seed, 64 hex characters (tools/varek_keygen
+ * makes one), in a regular file with one name that no one but its owner can
+ * read or write. */
+static int load_sign_key(const char *path, const struct policy *p) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        fprintf(stderr, "[warden] signing key %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        fprintf(stderr, "[warden] signing key %s: not a regular file\n", path);
+        close(fd);
+        return -1;
+    }
+    if (st.st_mode & 077) {
+        fprintf(stderr, "[warden] signing key %s: readable or writable by group or others "
+                "(chmod 600 it)\n", path);
+        close(fd);
+        return -1;
+    }
+    if (refuse_if_agent_can_open(p, fd, path, "signing key") < 0) { close(fd); return -1; }
+    char buf[80];
+    ssize_t n;
+    do { n = read(fd, buf, sizeof buf); } while (n < 0 && errno == EINTR);
+    close(fd);
+    unsigned char seed[crypto_sign_SEEDBYTES];
+    size_t bl = 0;
+    bool ok = (n == 64 || (n == 65 && buf[64] == '\n')) &&
+              sodium_hex2bin(seed, sizeof seed, buf, 64, NULL, &bl, NULL) == 0 &&
+              bl == sizeof seed;
+    sodium_memzero(buf, sizeof buf);
+    if (!ok) {
+        sodium_memzero(seed, sizeof seed);
+        fprintf(stderr, "[warden] signing key %s: not a VAREK signing key (64 hex characters; "
+                "make one with tools/varek_keygen)\n", path);
+        return -1;
+    }
+    g_sk = sodium_malloc(crypto_sign_SECRETKEYBYTES);
+    if (!g_sk) {
+        sodium_memzero(seed, sizeof seed);
+        fprintf(stderr, "[warden] cannot allocate protected memory for the signing key\n");
+        return -1;
+    }
+    crypto_sign_seed_keypair(g_pk, g_sk, seed);
+    sodium_memzero(seed, sizeof seed);
+    g_signing = true;
+    return 0;
+}
+
+/* --anchor PATH: a regular file, FIFO or character device the Warden appends
+ * checkpoint-type records to. Opened non-blocking: a FIFO needs its reader
+ * running first. */
+static int open_anchor(const char *path, const struct policy *p) {
+    int fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "[warden] anchor %s: %s%s\n", path, strerror(errno),
+                errno == ENXIO ? " (no reader on the FIFO: start the forwarder first)" : "");
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !(S_ISREG(st.st_mode) || S_ISFIFO(st.st_mode) || S_ISCHR(st.st_mode))) {
+        fprintf(stderr, "[warden] anchor %s: not a regular file, FIFO or character device\n", path);
+        close(fd);
+        return -1;
+    }
+    if (refuse_if_agent_can_open(p, fd, path, "anchor") < 0) { close(fd); return -1; }
+    g_anchor_fd = fd;
+    return 0;
+}
+
+/* The verdict stream itself: if it is a regular file the agent could open, the
+ * agent could truncate or read it (and learn the run id). v1.16 refuses. */
+static int refuse_exposed_stream(const struct policy *p) {
+    struct stat st;
+    if (fstat(STDERR_FILENO, &st) < 0 || !S_ISREG(st.st_mode)) return 0;
+    return refuse_if_agent_can_open(p, STDERR_FILENO, "(stderr)", "verdict stream");
+}
+
 /* ---------------- main ---------------- */
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s <policy.txt> [--plan <plan.txt>] -- <target> [args...]\n"
+        "usage: %s <policy.txt> [--plan <plan.txt>] [--sign-key <key>] [--anchor <path>]\n"
+        "              [--checkpoint-every <n>] -- <target> [args...]\n"
         "\n"
         "  Privileged seccomp-unotify supervisor (VAREK Warden v1.4).\n"
         "\n"
@@ -1626,6 +1986,12 @@ static void usage(const char *argv0) {
         "  Optional --plan <plan.txt> enables v1.6 pre-execution plan\n"
         "  verification. The target is not forked unless the plan\n"
         "  verifies as SATISFIED against the loaded policy.\n"
+        "\n"
+        "  v1.16 log integrity: every record is hash-chained. --sign-key <key>\n"
+        "  (from tools/varek_keygen) signs run_start, a checkpoint every <n>\n"
+        "  records (default 64, and at least once a second) and run_end with\n"
+        "  Ed25519; --anchor <path> also appends each checkpoint to <path>\n"
+        "  (append-only or off-host storage). tools/varek_audit.py verifies both.\n"
         "\n"
         "  Policy file format (one rule per line):\n"
         "    allow path /tmp/safe/\n"
@@ -1659,21 +2025,35 @@ int main(int argc, char **argv) {
 
     const char *policy_path = argv[1];
     const char *plan_path   = NULL;
+    const char *key_path    = NULL;     /* v1.16 */
+    const char *anchor_path = NULL;     /* v1.16 */
     int sep_idx = -1;
 
-    if (strcmp(argv[2], "--") == 0) {
-        sep_idx = 2;
-    } else if (strcmp(argv[2], "--plan") == 0) {
-        if (argc < 6 || strcmp(argv[4], "--") != 0) {
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--") == 0) { sep_idx = i; break; }
+        if (i + 1 >= argc) { usage(argv[0]); return 2; }
+        if (strcmp(argv[i], "--plan") == 0 && !plan_path) {
+            plan_path = argv[++i];
+        } else if (strcmp(argv[i], "--sign-key") == 0 && !key_path) {
+            key_path = argv[++i];
+        } else if (strcmp(argv[i], "--anchor") == 0 && !anchor_path) {
+            anchor_path = argv[++i];
+        } else if (strcmp(argv[i], "--checkpoint-every") == 0) {
+            const char *v = argv[++i];
+            uint64_t n = 0;
+            size_t k = 0;
+            for (; v[k] >= '0' && v[k] <= '9' && k < 8; k++) n = n * 10 + (uint64_t)(v[k] - '0');
+            if (k == 0 || v[k] || n < 1 || n > 1000000) {
+                fprintf(stderr, "[warden] --checkpoint-every takes 1 to 1000000\n");
+                return 2;
+            }
+            g_ckpt_every = n;
+        } else {
             usage(argv[0]); return 2;
         }
-        plan_path = argv[3];
-        sep_idx   = 4;
-    } else {
-        usage(argv[0]); return 2;
     }
 
-    if (sep_idx + 1 >= argc) { usage(argv[0]); return 2; }
+    if (sep_idx < 0 || sep_idx + 1 >= argc) { usage(argv[0]); return 2; }
     char *const *target_argv = &argv[sep_idx + 1];
 
     const int pidns = getenv("VAREK_WARDEN_NO_PIDNS") == NULL;
@@ -1690,6 +2070,20 @@ int main(int argc, char **argv) {
     /* ~1 MB (256 rules x 4 KB constants): static, not on the stack. */
     static struct policy p;
     if (policy_load(policy_path, &p) < 0) return 1;
+
+    /* v1.16: log integrity. */
+    if (sodium_init() < 0) {
+        fprintf(stderr, "[warden] libsodium failed to initialize\n");
+        return 1;
+    }
+    if (refuse_exposed_stream(&p) < 0) return 1;
+    if (key_path && load_sign_key(key_path, &p) < 0) return 1;
+    if (anchor_path && open_anchor(anchor_path, &p) < 0) return 1;
+    if ((key_path || anchor_path) && refuse_raw_devices(&p) < 0) return 1;
+    /* A FIFO anchor whose reader went away must fail the write (EPIPE, then
+     * an anchor_error record), not kill the Warden. The agent gets the
+     * default disposition back before it runs (see the child below). */
+    if (anchor_path) signal(SIGPIPE, SIG_IGN);
 
     if (log_init() < 0) {
         fprintf(stderr, "[warden] cannot open the verdict stream or create a run id (%s)\n",
@@ -1715,6 +2109,8 @@ int main(int argc, char **argv) {
     /* v1.6 pre-execution plan verification. Fires before fork; on
      * any non-SATISFIED result the target is not started. */
     if (plan_path && warden_verify_plan(plan_path, &p) != 0) {
+        emit_run_end(1);                    /* v1.16: a closed (and signed) stream */
+        if (g_sk) sodium_free(g_sk);
         return 1;
     }
 
@@ -1768,6 +2164,7 @@ int main(int argc, char **argv) {
     if (target < 0) { perror("fork"); return 1; }
 
     if (target == 0) {
+        signal(SIGPIPE, SIG_DFL);       /* v1.16: an ignored signal survives execve */
         close(sv[0]);
         close(live[1]);
         close(errpipe[0]);
@@ -1888,6 +2285,7 @@ int main(int argc, char **argv) {
 
     bool agent_ended = supervise(notify_fd, target_pidfd, agent_err_fd, &p,
                                  target_argv[0], target);
+    agent_ended = agent_ended || g_child_exited;   /* before the Warden's own SIGKILL */
 
     kill_target_tree(target);  /* the agent and everything it spawned */
     int status = 0;
@@ -1900,12 +2298,16 @@ int main(int argc, char **argv) {
      * killed by the filter (SIGSYS) left only an exit code of 1, which is how a
      * thread-starting agent could be killed on every run without a word. Only
      * when the agent ended on its own: otherwise the SIGKILL is the Warden's. */
+    /* v1.16: SIGCHLD also stops the loop, and then the agent ended on its own
+     * (agent_ended above; through v1.15 that race lost this report about one
+     * run in four). */
     if (agent_ended && WIFSIGNALED(status))
         fprintf(stderr, "[warden] agent killed by signal %d (%s)%s\n",
                 WTERMSIG(status), strsignal(WTERMSIG(status)),
                 WTERMSIG(status) == SIGSYS
                     ? ": most likely a hard-denied system call" : "");
     emit_run_end(rc);
+    if (g_sk) sodium_free(g_sk);             /* zeroes it */
     close(target_pidfd);
     close(notify_fd);
     return rc;

@@ -64,7 +64,7 @@ WS = re.compile(r"[ \t\r\n\v\f]+")        # ASCII whitespace only, as C strtok_r
 MATCHERS = {"exact": "eq", "prefix": "prefix", "suffix": "suffix",
             "contains": "contains", "glob": "glob"}
 GLOB_MAX_WILD = 32
-GLOB_MAX_TOTAL = 65536
+GLOB_MAX_TOTAL = 4096
 MAX_TOKENS = 64
 ANY = frozenset(range(1, 256))
 NOTSLASH = ANY - {ord("/")}
@@ -432,7 +432,7 @@ def parse_lines(raw_lines, path):
                 if len(toks) != 3 or toks[1] != "warden" or not m:
                     raise PolicyError(f"{path}:{lineno}: bad directive")
                 v = (int(m.group(1)), int(m.group(2)))
-                if v > (1, 15):
+                if v > (1, 16):
                     raise PolicyError(f"{path}:{lineno}: requires newer Warden")
                 req = max(req, v)
                 continue
@@ -962,8 +962,8 @@ def fuzz_policy(rng, path):
     lines = []
     if rng.random() < 0.3:
         lines.append(rng.choice(["require warden 1.14", "require warden 1.13", "require warden 01.14",
-                                 "require warden 1.15"] +
-                                ([] if valid else ["require warden 1.16", "require warden x",
+                                 "require warden 1.15", "require warden 1.16"] +
+                                ([] if valid else ["require warden 1.17", "require warden x",
                                                    "require warden +1.14", "require warden 1.+14",
                                                    "require warden 1.1400000"])))
     wide = rng.random() < 0.15          # many distinct flag bits: reach the bound

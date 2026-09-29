@@ -116,8 +116,8 @@ refuse "under 1.14, a matcher with no constant is an error" $'require warden 1.1
 refuse "under 1.14, a constant eaten by a '#' comment is an error" $'require warden 1.14\ndeny path suffix #.pem' "matcher 'suffix' without a constant"
 { echo 'require warden 1.14'; for i in $(seq 1 17); do printf 'deny path glob /%s*\n' "$(head -c 3998 /dev/zero | tr '\0' "$(printf "\\$(printf '%03o' $((97 + i)))")")"; done; } > "$OUT/cap.txt"
 o="$("$WARDEN" "$OUT/cap.txt" -- /bin/true 2>&1 || true)"
-grep -q "glob patterns total more than 65536 tokens" <<<"$o" && ! grep -q "supervising pid=" <<<"$o" \
-  && pass "glob patterns over 65536 tokens in all refused (bounds the work per decision)" || flunk "glob token cap ($(head -1 <<<"$o"))"
+grep -Eq "glob patterns total more than [0-9]+ tokens" <<<"$o" && ! grep -q "supervising pid=" <<<"$o" \
+  && pass "glob patterns over the per-policy token cap refused (bounds the work per decision)" || flunk "glob token cap ($(head -1 <<<"$o"))"
 printf 'allow path glob readonly\n' > "$OUT/kw.txt"
 printf 'path 0x0 %s\npath 0x0 %s\npath 0x1 %s\n' "$(printf globx | od -An -tx1 | tr -d ' \n')" \
        "$(printf /tmp/x | od -An -tx1 | tr -d ' \n')" "$(printf globx | od -An -tx1 | tr -d ' \n')" > "$OUT/kwq"

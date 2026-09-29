@@ -6,7 +6,7 @@ CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -Wpedantic -Wno-unused-parameter \
            -D_GNU_SOURCE -std=gnu11
 LDFLAGS ?=
-LDLIBS  ?= -lseccomp
+LDLIBS  ?= -lseccomp -lsodium
 
 # v1.6 plan-graph integration. The Warden references these symbols
 # directly; -I../../v1_6 lets warden.c #include the v1.6 headers.
@@ -23,9 +23,9 @@ V1_7_DIR  := ../../v1_7
 LIFECYCLE := $(V1_7_DIR)/warden_lifecycle.c
 CFLAGS    += -I$(V1_7_DIR)
 
-BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check
+BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen
 
-.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 crosscheck harness video-v112
+.PHONY: all clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -44,6 +44,10 @@ warden_faultinject: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h 
 # batch certificate checks). Links the checker only, never smt_decide.c.
 tools/vdp_cert_check: tools/vdp_cert_check.c $(CHECKER)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/vdp_cert_check.c checker/vdp_checker.c
+
+# v1.16: Ed25519 key pair for signing the verdict stream (--sign-key).
+tools/varek_keygen: tools/varek_keygen.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/varek_keygen.c -lsodium
 
 # v1.13: command-line front end to the SMT decision procedure (lint, analyze,
 # batch queries); the same smt_decide.c the Warden runs.
@@ -165,6 +169,15 @@ tests/v1150_probe: tests/v1150_probe.c
 test-v1150: warden warden_faultinject tools/vdp_check tools/vdp_cert_check tests/v1150_probe
 	@sudo ./tests/test_v1150.sh ./warden ./warden_faultinject ./tools/vdp_check ./tools/vdp_cert_check $(abspath tests/v1150_probe)
 
+# v1.16: the verdict stream against its holder (hash chain, Ed25519-signed
+# checkpoints, the external anchor, tampering by a holder with and without the
+# key, anchor failures, startup refusals) and the 4,096-token glob cap.
+tests/v1160_probe: tests/v1160_probe.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $<
+
+test-v1160: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen tests/v1160_probe
+	@sudo ./tests/test_v1160.sh ./warden ./tools/vdp_check ./tools/vdp_cert_check ./tools/varek_keygen $(abspath tests/v1160_probe)
+
 # Differential check of the decision procedure against an SMT solver (Z3) and,
 # for suffix / contains / glob reachability, a derivative-based oracle. These
 # are exactly the runs RELEASE-v1.15.0.md quotes: every policy in the
@@ -199,4 +212,4 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe warden_faultinject tests/test_v14_filter
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe warden_faultinject tests/test_v14_filter

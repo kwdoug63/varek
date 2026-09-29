@@ -80,16 +80,23 @@ echo "== 2. the audit tool re-checks a saved stream =="
 o="$(python3 "$AUDIT" --policy "$POL" --checker "$CERT" "$OUT/verdicts" 2>&1)"
 echo "$o" | sed 's/^/    /' | head -3
 grep -q "varek_audit: PASS" <<<"$o" && pass "audit of the stream passes" || flunk "audit of the stream passes"
-sed -E '0,/"cert_witness":"g:[0-9]+-[0-9]+"/s//"cert_witness":"g:0-1"/' "$OUT/verdicts" > "$OUT/tampered"
+# v1.16: each edit below is followed by recomputing the stream's hash chain
+# (tests/log_rechain.py), as the log's holder could, so these checks exercise
+# the certificate audit itself; test_v1160.sh covers the chain and signatures.
+RECHAIN="$HERE/tests/log_rechain.py"
+sed -E '0,/"cert_witness":"g:[0-9]+-[0-9]+"/s//"cert_witness":"g:0-1"/' "$OUT/verdicts" > "$OUT/tampered.raw"
+python3 "$RECHAIN" "$OUT/tampered.raw" > "$OUT/tampered"
 o="$(python3 "$AUDIT" --policy "$POL" --checker "$CERT" "$OUT/tampered" 2>&1)"
 grep -q "varek_audit: FAIL" <<<"$o" && grep -q "refused" <<<"$o" \
   && pass "a tampered witness fails the audit" || flunk "a tampered witness fails the audit"
-sed -E '0,/"cert_rule":[0-9]+,"cert_witness":"[^"]*","check":"ok",/s///' "$OUT/verdicts" > "$OUT/stripped"
+sed -E '0,/"cert_rule":[0-9]+,"cert_witness":"[^"]*","check":"ok",/s///' "$OUT/verdicts" > "$OUT/stripped.raw"
+python3 "$RECHAIN" "$OUT/stripped.raw" > "$OUT/stripped"
 o="$(python3 "$AUDIT" --policy "$POL" --checker "$CERT" "$OUT/stripped" 2>&1)"
 grep -q "without an accepted certificate" <<<"$o" && pass "a removed certificate fails the audit" \
   || flunk "a removed certificate fails the audit"
 sed -E '0,/"decision_final":"DENY","rule":"policy_match"/s//"decision_final":"ALLOW","rule":"policy_match"/' \
-    "$OUT/verdicts" > "$OUT/flipped"
+    "$OUT/verdicts" > "$OUT/flipped.raw"
+python3 "$RECHAIN" "$OUT/flipped.raw" > "$OUT/flipped"
 o="$(python3 "$AUDIT" --policy "$POL" --checker "$CERT" "$OUT/flipped" 2>&1)"
 grep -q "not a certified file open" <<<"$o" && pass "a denial rewritten as ALLOW fails the audit" \
   || flunk "a denial rewritten as ALLOW fails the audit"

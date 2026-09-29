@@ -23,7 +23,9 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
   effect unless it is SATISFIED under the active policy.
 - **Asset:** the integrity of the authorization record — that the verdict stream
   (and any evidence exported from it) reflects the decisions actually made and
-  cannot be forged by the supervised process (v1.12).
+  cannot be forged by the supervised process (v1.12), nor rewritten afterwards
+  by whoever holds the log, within what the signing key and the external
+  anchor cover (v1.16).
 - **Trust boundary 1:** the policy author (trusted to express intent correctly —
   see §5, non-goal 1).
 - **Trust boundary 2:** the verification chain — surface-language compiler,
@@ -105,7 +107,14 @@ Model-B techniques below, with the residual limits stated honestly.
     check. Non-process `/proc` entries remain governed by policy.
   - *Authorization-record integrity.* Every agent-controlled string is escaped, so
     no input can begin, end, or forge a record in the verdict stream. Records
-    carry the resolved object the decision was made on.
+    carry the resolved object the decision was made on. From v1.16 records are
+    hash-chained, checkpoints are Ed25519-signed (`--sign-key`) and optionally
+    appended to an external anchor (`--anchor`), so the log's holder cannot
+    alter, insert, remove, reorder or truncate records undetected before the
+    last signature (without the key) or before the last anchored checkpoint
+    (with it). The Warden refuses a policy that would let the agent open the
+    key, the anchor, its own verdict stream file or a raw disk or memory
+    device.
   - *Datagram egress.* `sendto`/`sendmsg` are mediated as network sends and
     refused for an inet destination under the deny-only network posture.
 
