@@ -405,5 +405,6 @@ record is written before the answer, so a denied call waits about 3 µs longer.
 - **Runtime:** unchanged (Linux ≥ 5.14, `pidfd_getfd`, `CAP_SYS_ADMIN`,
   x86_64), plus **libsodium** (1.0.18 or later).
 - **Audit:** `python3` only.
-- **Tests:** the cross-check needs `z3-solver`. `make test-v1160`'s re-signing
+- **Tests:** the cross-check needs the reference solver's package
+  (`tools/requirements-crosscheck.txt` since v1.18.0). `make test-v1160`'s re-signing
   cases use the Python `cryptography` package and are skipped without it.

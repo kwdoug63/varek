@@ -41,18 +41,18 @@ allow exec /usr/bin/python3
 deny  host api.example.com
 EOF
 
+# v1.18.0: file opens only. A process_exec or net_connect step is UNSATISFIED
+# at the gate, because the runtime refuses those whatever the policy says.
 cat > "${TMP}/plan_allowed.txt" <<EOF
-action load file_open    /var/data/input.json
-action exec process_exec /usr/bin/python3
-edge load exec
+action load  file_open /var/data/input.json
+action audit file_open /var/data/audit.log
+edge load audit
 EOF
 
 cat > "${TMP}/plan_denied.txt" <<EOF
 action load file_open    /var/data/input.json
-action exec process_exec /usr/bin/python3
 action post net_connect  api.example.com:443
-edge load exec
-edge exec post
+edge load post
 EOF
 
 fails=0

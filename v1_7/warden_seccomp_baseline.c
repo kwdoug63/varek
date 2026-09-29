@@ -30,7 +30,8 @@
 //      CLONE_NEWUSER bit is race-free and done here. Anything whose decision
 //      depends on pointer-referenced memory (paths, struct args) is NOT decided
 //      here — it is routed to the unotify supervisor's performs-and-ADDFD path
-//      (warden_notify_hardening, v1.9.1). clone3() takes a pointer struct whose
+//      (in varek/v1_4/warden.c; a separate warden_notify_hardening module was
+//      announced for v1.9.1 but never committed). clone3() takes a pointer struct whose
 //      flags we cannot inspect at this layer, so clone3 is denied outright.
 //
 // This file compiles against libseccomp and its tests pass standalone on a Linux

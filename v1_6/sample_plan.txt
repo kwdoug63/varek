@@ -6,15 +6,18 @@
 #
 # An agent that:
 #   1. reads an input file under an allowed prefix
-#   2. runs a transform via /usr/bin/python3
-#   3. connects to an allowed local endpoint
-#   4. writes an audit record (in parallel with the connect)
+#   2. writes a result under the same prefix
+#   3. writes an audit record (in parallel with the result)
+#
+# v1.18.0: the plan declares file opens only. The Warden refuses every
+# connect, and every program launch after the agent's own start, whatever the
+# policy says, so a net_connect or process_exec step is UNSATISFIED at the
+# gate (through v1.17.0 this sample declared both, and the gate authorized a
+# plan whose connect and launch the runtime would then refuse).
 
 action load   file_open    /tmp/varek_allowed_input.json
-action exec   process_exec /usr/bin/python3
-action post   net_connect  127.0.0.1:8080
+action result file_open    /tmp/varek_allowed_result.json
 action audit  file_open    /tmp/varek_allowed_audit.log
 
-edge load exec
-edge exec post
-edge exec audit
+edge load result
+edge load audit

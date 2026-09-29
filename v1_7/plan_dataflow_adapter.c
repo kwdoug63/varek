@@ -54,16 +54,283 @@ static const char *find_named_arg(const plan_action_desc_t *action,
     return NULL;
 }
 
+/* v1.18.0: URL components as match keys.
+ *
+ * A glob over a whole URL cannot say "this host". In the v1.7.4 example rule
+ * `match url https://<star>.internal.acme.com/<star>` (<star> = '*') the first
+ * star also matches '/', '?', '#' and '@', so https://evil.example/x.internal.acme.com/
+ * and https://evil.example#.internal.acme.com/ matched the "internal only" rule.
+ * A key of the form <arg>.scheme, <arg>.host, <arg>.port or <arg>.path parses
+ * the named arg <arg> as an absolute URL and matches the pattern against that
+ * one component: `match url.host *.internal.acme.com`.
+ *
+ * The parse is strict, and a URL it rejects matches no component rule (the
+ * permissive rule does not apply, so a later name-only rule decides):
+ *   scheme  [A-Za-z][A-Za-z0-9+.-]* then "://", lower-cased;
+ *   authority up to the first '/', '?' or '#'; any '@' (userinfo) or '\\'
+ *           rejects the URL, since readers disagree about which host it names;
+ *   host    [A-Za-z0-9.-] only (no percent-encoding), lower-cased, one
+ *           trailing '.' dropped, not empty; or a bracketed IPv6 literal;
+ *   port    digits after ':', 1 to 65535; empty when absent;
+ *   path    the rest up to '?' or '#', "/" when empty. */
+#define URL_PART_MAX 512
+
+/* An IPv6 literal (without brackets) that embeds an IPv4 address: the
+ * IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d) ranges, in
+ * either dotted or hex spelling. A rule on the IPv4 address cannot see through
+ * these, so they are unreadable. Returns true also for anything unparseable. */
+static bool v6_embeds_v4(const char *h, size_t n)
+{
+    unsigned g[8] = {0};
+    int ng = 0, gap = -1;
+    size_t i = 0;
+    if (n >= 2 && h[0] == ':' && h[1] == ':') { gap = 0; i = 2; }
+    while (i < n) {
+        if (ng >= 8) return true;
+        size_t j = i;
+        unsigned v = 0;
+        while (j < n && j - i < 5 && ((h[j] >= '0' && h[j] <= '9') ||
+               (h[j] >= 'a' && h[j] <= 'f') || (h[j] >= 'A' && h[j] <= 'F'))) {
+            int d = h[j] <= '9' ? h[j] - '0' : (h[j] | 0x20) - 'a' + 10;
+            v = v * 16 + (unsigned)d;
+            j++;
+        }
+        if (j < n && h[j] == '.') return true;                  /* dotted IPv4 tail */
+        if (j == i || j - i > 4 || v > 0xffff) return true;
+        g[ng++] = v;
+        if (j == n) break;
+        if (h[j] != ':') return true;
+        if (j + 1 < n && h[j + 1] == ':') {
+            if (gap >= 0) return true;
+            gap = ng;
+            j++;
+        }
+        i = j + 1;
+        if (i == n && gap != ng) return true;                  /* trailing ':' */
+    }
+    unsigned full[8] = {0};
+    if (gap >= 0) {
+        int tail = ng - gap;
+        for (int k = 0; k < gap; k++) full[k] = g[k];
+        for (int k = 0; k < tail; k++) full[8 - tail + k] = g[gap + k];
+    } else {
+        if (ng != 8) return true;
+        for (int k = 0; k < 8; k++) full[k] = g[k];
+    }
+    for (int k = 0; k < 5; k++) if (full[k]) return false;
+    return full[5] == 0xffff || full[5] == 0;
+}
+
+static int url_component(const char *url, const char *part, char *out, size_t outsz)
+{
+    if (!url || !part || outsz < 2) return -1;
+    const char *p = url;
+    if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z'))) return -1;
+    while ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+           (*p >= '0' && *p <= '9') || *p == '+' || *p == '.' || *p == '-') p++;
+    if (strncmp(p, "://", 3) != 0) return -1;
+    size_t scheme_len = (size_t)(p - url);
+    const char *auth = p + 3;
+    size_t auth_len = strcspn(auth, "/?#");
+    if (auth_len == 0) return -1;
+    for (size_t i = 0; i < auth_len; i++)
+        if (auth[i] == '@' || auth[i] == '\\') return -1;
+
+    const char *host = auth, *host_end, *port = NULL;
+    const char *auth_end = auth + auth_len;
+    if (*host == '[') {
+        host_end = memchr(host, ']', auth_len);
+        if (!host_end) return -1;
+        if (v6_embeds_v4(host + 1, (size_t)(host_end - host - 1))) return -1;
+        for (const char *q = host + 1; q < host_end; q++)
+            if (!((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f') ||
+                  (*q >= 'A' && *q <= 'F') || *q == ':' || *q == '.')) return -1;
+        host_end++;
+        if (host_end < auth_end) {
+            if (*host_end != ':') return -1;
+            port = host_end + 1;
+        }
+    } else {
+        host_end = memchr(host, ':', auth_len);
+        if (host_end) port = host_end + 1; else host_end = auth_end;
+        if (host_end == host) return -1;
+        for (const char *q = host; q < host_end; q++)
+            if (!((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
+                  (*q >= '0' && *q <= '9') || *q == '.' || *q == '-')) return -1;
+    }
+    unsigned long portnum = 0;
+    if (port) {
+        if (port == auth_end || *port == '0') return -1;      /* empty, or a leading zero */
+        for (const char *q = port; q < auth_end; q++) {
+            if (*q < '0' || *q > '9') return -1;
+            portnum = portnum * 10 + (unsigned long)(*q - '0');
+            if (portnum > 65535) return -1;
+        }
+        if (portnum == 0) return -1;
+    }
+
+    const char *src; size_t len;
+    bool lower = false;
+    if (strcmp(part, "scheme") == 0) {
+        src = url; len = scheme_len; lower = true;
+    } else if (strcmp(part, "host") == 0) {
+        src = host; len = (size_t)(host_end - host); lower = true;
+        if (len > 1 && src[len - 1] == '.' && src[0] != '[') len--;
+        if (len == 0 || src[len - 1] == '.' || src[0] == '.') return -1;
+        for (size_t i = 1; i < len; i++)
+            if (src[i] == '.' && src[i - 1] == '.') return -1;   /* empty label */
+        /* A host whose last label is numeric (or 0x...) is an IPv4 address to
+         * a URL reader, which also accepts 127.1, 2130706433 and 0x7f.0.0.1.
+         * Only the canonical dotted quad is readable here. */
+        if (src[0] != '[') {
+            size_t ls = len;
+            while (ls > 0 && src[ls - 1] != '.') ls--;
+            bool numeric = true;
+            for (size_t i = ls; i < len; i++)
+                if (src[i] < '0' || src[i] > '9') numeric = false;
+            bool hexy = len - ls >= 2 && src[ls] == '0' && (src[ls + 1] == 'x' || src[ls + 1] == 'X');
+            if (numeric || hexy) {
+                int parts = 0;
+                size_t i = 0;
+                while (i < len) {
+                    size_t j = i;
+                    unsigned v = 0;
+                    while (j < len && src[j] >= '0' && src[j] <= '9') { v = v * 10 + (unsigned)(src[j] - '0'); j++; if (v > 255) return -1; }
+                    if (j == i || (j - i > 1 && src[i] == '0')) return -1;   /* empty, or a leading zero */
+                    parts++;
+                    if (j == len) break;
+                    if (src[j] != '.') return -1;
+                    i = j + 1;
+                }
+                if (parts != 4) return -1;
+            }
+        }
+    } else if (strcmp(part, "port") == 0) {
+        src = port ? port : ""; len = port ? (size_t)(auth_end - port) : 0;
+    } else if (strcmp(part, "path") == 0) {
+        src = auth_end; len = strcspn(auth_end, "?#");
+        if (len == 0) { src = "/"; len = 1; }
+        /* Matched as written, so refuse what a server would rewrite: an
+         * encoded byte ("%2f", "%2e"), a backslash, a "." or ".." segment. */
+        for (size_t i = 0; i < len; i++) {
+            if (src[i] == '%' || src[i] == '\\' || src[i] == ';') return -1;
+            if (src[i] == '/' && i + 1 < len && src[i + 1] == '/') return -1;   /* empty segment */
+            if (src[i] == '.' && (i == 0 || src[i - 1] == '/')) {
+                size_t k = i + 1;
+                if (k < len && src[k] == '.') k++;
+                if (k == len || src[k] == '/') return -1;
+            }
+        }
+    } else {
+        return -1;
+    }
+    if (len >= outsz) return -1;
+    for (size_t i = 0; i < len; i++) {
+        char c = src[i];
+        out[i] = (lower && c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    out[len] = '\0';
+    return 0;
+}
+
+/* The value a match constraint tests: the named arg itself, or (v1.18.0) one
+ * URL component of it for a key "<arg>.<part>". NULL when the action has no
+ * such arg or its URL does not parse. */
+/* If key is a URL component key "<arg>.<part>", write <arg> to base and
+ * return the part name; else NULL. */
+static const char *component_key(const char *key, char *base, size_t basesz)
+{
+    const char *dot = key ? strrchr(key, '.') : NULL;
+    if (!dot || dot == key) return NULL;
+    const char *part = dot + 1;
+    if (strcmp(part, "scheme") && strcmp(part, "host") &&
+        strcmp(part, "port") && strcmp(part, "path")) return NULL;
+    size_t bl = (size_t)(dot - key);
+    if (bl >= basesz) return NULL;
+    memcpy(base, key, bl);
+    base[bl] = '\0';
+    return part;
+}
+
+/* A component key is always derived from the URL in <arg>: an argument that is
+ * literally named "url.host" is never consulted, or a caller could pass
+ * url=https://evil.example/ with "url.host"=x.internal.acme.com. */
+/* The URL in argument `base`, or NULL; *twice is set when the action carries
+ * that argument more than once (a URL rule cannot tell which one counts). */
+static const char *url_arg(const plan_action_desc_t *action, const char *base, bool *twice)
+{
+    const char *v = NULL;
+    *twice = false;
+    for (size_t i = 0; action->named_args && i < action->n_named_args; i++) {
+        const plan_action_arg_t *a = &action->named_args[i];
+        if (a->key && strcmp(a->key, base) == 0) {
+            if (v) *twice = true;
+            v = a->value;
+        }
+    }
+    return v;
+}
+
+static const char *match_value(const plan_action_desc_t *action, const char *key,
+                               char *buf, size_t bufsz, bool *fold)
+{
+    char base[128];
+    bool twice;
+    *fold = false;
+    const char *part = component_key(key, base, sizeof base);
+    if (!part) return find_named_arg(action, key);
+    const char *url = url_arg(action, base, &twice);
+    if (!url || twice || url_component(url, part, buf, bufsz) != 0) return NULL;
+    *fold = !strcmp(part, "host") || !strcmp(part, "scheme");   /* compared case-blind */
+    return buf;
+}
+
+/* True if some rule for this action tests a component of a URL argument the
+ * action carries, and that URL does not parse for that component. The
+ * classification then fails (the plan is refused) instead of the rule simply
+ * not matching: with first-match-wins, a deny rule on url.host that skipped an
+ * unparseable URL would let it fall through to a later, more permissive rule
+ * (https://u@a.evil.example/ past `match url.host *.evil.example`). */
+static bool unparseable_component(const plan_label_table_t *tbl,
+                                  const plan_action_desc_t *action)
+{
+    char base[128], buf[URL_PART_MAX];
+    for (size_t i = 0; i < tbl->n_rules; i++) {
+        const plan_label_rule_t *r = &tbl->rules[i];
+        if (!r->action_name || strcmp(r->action_name, action->name) != 0) continue;
+        for (size_t j = 0; j < r->n_matches; j++) {
+            const char *part = component_key(r->matches[j].key, base, sizeof base);
+            if (!part) continue;
+            bool twice;
+            const char *url = url_arg(action, base, &twice);
+            if (url && (twice || url_component(url, part, buf, sizeof buf) != 0)) return true;
+        }
+    }
+    return false;
+}
+
 /* All match constraints on a rule must hold. A rule with no matches
  * (n_matches == 0) is name-only and always passes this check. */
 static bool rule_matches_action(const plan_label_rule_t *r,
                                 const plan_action_desc_t *action)
 {
+    char buf[URL_PART_MAX], pat[URL_PART_MAX];
     for (size_t i = 0; i < r->n_matches; i++) {
         const plan_label_rule_match_t *m = &r->matches[i];
-        const char *val = find_named_arg(action, m->key);
+        bool fold;
+        const char *val = match_value(action, m->key, buf, sizeof buf, &fold);
         if (!val) return false;
-        if (!glob_match(m->pattern, val)) return false;
+        const char *pattern = m->pattern;
+        if (fold && pattern) {
+            /* the value is lower-cased; so is the pattern, or a rule written
+             * as *.EVIL.example would never match */
+            size_t n = strlen(pattern);
+            if (n >= sizeof pat) return false;
+            for (size_t k = 0; k <= n; k++)
+                pat[k] = (pattern[k] >= 'A' && pattern[k] <= 'Z') ? (char)(pattern[k] - 'A' + 'a') : pattern[k];
+            pattern = pat;
+        }
+        if (!glob_match(pattern, val)) return false;
     }
     return true;
 }
@@ -76,6 +343,10 @@ int plan_label_policy_from_table(const plan_action_desc_t *action,
         return -1;
 
     const plan_label_table_t *tbl = (const plan_label_table_t *)ctx;
+
+    /* v1.18.0: fail closed on a URL a component rule cannot read. */
+    if (action->name && unparseable_component(tbl, action))
+        return -1;
 
     for (size_t i = 0; i < tbl->n_rules; i++) {
         const plan_label_rule_t *r = &tbl->rules[i];

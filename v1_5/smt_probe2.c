@@ -3,7 +3,7 @@
  * smt_probe2.c — context-reuse benchmark for SMT-discharged policy decisions
  *
  * Same encoding as smt_probe.c but with the realistic production pattern:
- * one Z3 context and one solver are created at startup and reused across
+ * one solver context and one solver are created at startup and reused across
  * all decisions via Z3_solver_push / Z3_solver_pop. This measures the
  * per-decision cost as it would be in the Warden's hot path, not the
  * worst-case create-and-tear-down cost from probe v1.
@@ -144,7 +144,7 @@ int main(int argc, char **argv) {
     {
         unsigned major, minor, build, rev;
         Z3_get_version(&major, &minor, &build, &rev);
-        fprintf(stderr, "[smt_probe2] Z3 version: %u.%u.%u (build %u)\n",
+        fprintf(stderr, "[smt_probe2] solver version: %u.%u.%u (build %u)\n",
                 major, minor, build, rev);
     }
     fflush(stderr);

@@ -23,6 +23,10 @@
  *                                # rules with the same action name are
  *                                # walked in declaration order;
  *                                # first match wins.
+ *                                # v1.18.0: KEY may be ARG.host,
+ *                                # ARG.scheme, ARG.port or ARG.path
+ *                                # to match one component of a URL
+ *                                # (match url.host *.corp.example).
  *     origin NAME                # rule-body statements; must be
  *     deny_in NAME               # indented (any leading whitespace).
  *     unknown_in NAME

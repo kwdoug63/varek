@@ -53,9 +53,9 @@ expect() { # expect <desc> <wanted-verdict> <wanted-line>
 
 echo "== the fix: a plan that opens an allowed file is authorized =="
 run_plan 'action load file_open /var/data/input.json
-action exec process_exec /usr/bin/python3
-edge load exec'
-expect "allowed file_open + exec is SATISFIED" SATISFIED authorized
+action audit file_open /var/data/audit.log
+edge load audit'
+expect "allowed file_opens are SATISFIED" SATISFIED authorized
 [ "$FORKED" = yes ] && pass "target is forked after an authorized plan" || flunk "target is forked after an authorized plan"
 
 echo "== a file_open the policy does not cover is UNKNOWN (rejected) =="
@@ -99,13 +99,18 @@ echo "== a relative plan path cannot be verified pre-fork -> UNKNOWN =="
 run_plan 'action load file_open var/data/input.json'
 expect "relative file_open target is UNKNOWN" UNKNOWN rejected
 
-echo "== file_open mixed with allowed exec/connect stays authorized =="
+echo "== exec and connect steps are UNSATISFIED even when the policy allows them =="
+# v1.18.0: the runtime refuses every connect and every launch after the first,
+# whatever the policy says, so a plan that needs one cannot run as declared.
+# Through v1.17.0 the gate authorized this plan.
 run_plan 'action load file_open /var/data/in.json
 action exec process_exec /usr/bin/python3
 action post net_connect 127.0.0.1:8080
 edge load exec
 edge exec post'
-expect "file_open + allowed exec + allowed connect is SATISFIED" SATISFIED authorized
+expect "file_open + policy-allowed exec + connect is UNSATISFIED" UNSATISFIED rejected
+run_plan 'action exec process_exec /usr/bin/python3'
+expect "a lone policy-allowed exec step is UNSATISFIED" UNSATISFIED rejected
 
 echo "== a denied non-file node still rejects a plan that also opens a file =="
 run_plan 'action load file_open /var/data/in.json

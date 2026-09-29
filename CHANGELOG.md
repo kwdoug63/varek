@@ -59,6 +59,127 @@ formally verified checker, and the v1.11 sequence fragment.
 
 ---
 
+## [1.18.0] - 2026-09-29
+
+v1.18.0 fixes the ten places where the published claims and the code disagreed
+(as listed after the v1.17.0 review). Each is fixed in the code where the claim
+was the intent, and in the claim where the code was right. It adds options and
+changes what the `--plan` gate authorizes, so it is a minor release. No verdict
+*semantics* change for per-call decisions.
+
+### Fixed (code)
+
+- **The `--plan` gate runs the data-flow check, the refusal breaker and the
+  progress-safety check.** The v1.7 data-flow check, the v1.8.2 breaker and the
+  v1.9 progress-safety check were a library with tests; the README described
+  them as part of the runtime, but the Warden never called them. With
+  `--flow-policy <cfg>` the gate now runs the node and flow checks
+  (`plan_warden_verify`), then the breaker, keyed by `--session` and the plan's
+  signature (steps in content order, edges between them; order and repeats do
+  not matter, distinct graphs never share one), with its table kept
+  across runs in `--breaker-state` (default `/var/lib/varek/breaker.state`):
+  the directory, table and lock file must be private to the Warden's user and
+  unreachable under the policy; the table is replaced atomically, the lock is
+  held for the gate only, and a table that does not read back refuses the plan
+  (exit 1). At startup the Warden refuses to start unless the flow policy
+  passes the progress-safety check and declares a `refusal_budget`. A refused
+  plan exits 3 (retryable), 4 (terminal deny) or 5 (terminal: run the named
+  pre-authorized action); `--gate-status <file>` (a private file the policy
+  does not reach) reports the outcome apart from the agent's own exit status.
+  The state directory is protected from the agent by identity, so a table a
+  concurrent Warden writes later is covered too. A chained `plan_gate` record
+  holds the decision.
+- **The plan gate refuses connect and launch steps.** It authorized a plan whose
+  `net_connect` or `process_exec` step the policy allowed, although the runtime
+  refuses every connect and every later launch whatever the policy says. Those
+  steps are now UNSATISFIED.
+- **URL host matching in flow rules.** The example "internal hosts only" rule,
+  `match url https://*.internal.acme.com/*`, also matched
+  `https://evil.example/x.internal.acme.com/`, because `*` matches `/`. A match
+  key `<arg>.host`, `.scheme`, `.port` or `.path` now matches one component of a
+  strictly parsed URL, never an argument literally named that way, with host
+  and scheme compared case-blind; a URL a component rule cannot read
+  (userinfo, a non-canonical numeric host such as `127.1`, a port with a
+  leading zero, a path with `%`, `;`, `//` or a dot segment, a repeated URL
+  argument) refuses the plan instead of skipping the rule. The examples use
+  `match url.host *.internal.acme.com`.
+- **The CycloneDX export.** Its attestation was mostly fixed wording, including
+  "no action reached the kernel without a verdict", which is not true of calls
+  the filter admits outright. Every sentence is now derived from the stream,
+  including which calls the record covers; an UNKNOWN that was authorized makes
+  the exporter refuse. `--policy` defaults to the policy the Warden recorded, and
+  a policy file that is not the one the Warden decided with is refused.
+  `--sign-key` signs the BOM (JSF, Ed25519, with the log key); `--verify`
+  checks a signature against the key given with `--pubkey` (required); with
+  `--pubkey` when exporting, or `--sign-key` alone, the stream's own
+  signatures must verify. The output is tested against the CycloneDX 1.6
+  schema.
+- **Refusal records name the errno sent.** They said `kernel_verdict: EPERM`;
+  the agent receives `EACCES`, and the record now says so.
+- **The v1.2 and v1.1 Python suites run.** `varek/v1_2/__init__.py` (and v1_3)
+  imported a language package not in the repository, so `pytest` stopped at
+  collection; the v1.1 regression suite imported `enforce_strict_mode`, which
+  the v1.1 CHANGELOG said was kept but was missing. Both are restored
+  (`enforce_strict_mode()` arms the audit hook as telemetry only;
+  `KineticIntercept` is importable again, deprecated), and a plain `pytest`
+  completes. The v1.1 suite skips on a host without cgroup v2 and libseccomp's
+  Python binding.
+- **Breaker signature.** `plan_breaker_signature_graph()` covers steps and
+  edges, so an authorized plan no longer clears the refusal count of a refused
+  one that differs only in its edges; reordering distinct steps or edges, or
+  repeating an edge, does not start a new count; identical steps are never
+  merged. The state file ends with a count of its entries, so a truncated
+  table is refused.
+
+### Changed
+
+- `make -C v1_7 check` runs the v1.8.2 breaker and v1.9 progress tests (built by
+  hand before) and the new v1.7-layer test; `make -C v1_7 check-seccomp` runs
+  the v1.9.2 kernel checks.
+- The live filter's test (`test_v14_filter`) checks that `io_uring_setup` kills
+  the process.
+- `tests/seccomp_toctou_harness.c` flushes its count line before `_exit`; the
+  counts were lost when stdout was a pipe or a file.
+- The cross-check tool, the release notes, the Makefiles and the v1.5 notes
+  refer to "the reference SMT solver" instead of the product. Its Python package
+  is listed in `varek/v1_4/tools/requirements-crosscheck.txt`; the name remains
+  only where software must use it (the import, the package, the v1.5 probes'
+  C API and link flag).
+- `v1_6/sample_plan.txt` declares file opens only.
+
+### Corrected (documentation)
+
+- Release notes, this CHANGELOG and the spec paper listed code that was never
+  committed: `v1_7/warden_notify_hardening.{h,c}` (v1.9.1; the discipline is
+  inline in `warden.c`), the v1.9.1 UNKNOWN diagnostics and resource bounds
+  (specified, not implemented), `v1_7/warden_landlock.c` (v1.9.2) and
+  `tests/security/test_warden_smoke.py` (v1.1.1). Each now carries a dated
+  correction.
+- The README's opening described every decision as made by the SMT decision
+  procedure over the action-graph; it now says which calls are decided, which
+  are refused whatever the policy says, and which the filter admits undecided.
+- Figures without a record: the language test table (109 v0.1 tests, 659
+  passing) is replaced by counts from running each archive (641 tests, 629
+  passing); the v1.4 P99 of 57 µs is replaced by the recorded 44 µs, and the
+  v1.5 speed-up restated (about 160 times, not 210 or "three orders"); "zero
+  false negatives" is restated as a benchmark count; the TOCTOU harness's "510
+  leaks in 20,000" is replaced by a recorded re-run
+  (`tests/toctou_results_v1.18.0.txt`). Mis-encoded characters in this file are
+  fixed.
+
+### Tests
+
+- `make test-v1180` (73 checks, plus the v1.7-layer test's 74 and the live
+  filter's io_uring probe). 47 of the 73 fail against the v1.17.0 Warden. Every
+  earlier suite still passes, with `test_v1124` and the v1.6 integration test
+  updated for the plan-gate change. Two rounds of independent review of the
+  new code found, among others, a breaker count resettable by an interrupted
+  write or through a bind mount, distinct graphs sharing a count, `--verify`
+  trusting the BOM's own key and deny rules stepped around by other spellings
+  of a host; all are fixed and tested.
+
+---
+
 ## [1.17.0] - 2026-09-29
 
 v1.17.0 closes three live gaps found in the v1.16.3 review: the Warden's own
@@ -404,10 +525,10 @@ are unchanged.
   or work budget. `vdp_check <policy> analyze` prints a shortest witness string
   and flags value for every reachable rule; `analyze automaton` forces the
   automaton search (testing).
-- **Cross-check**: independent Python parser and glob translation; Z3 string
-  and regex theories for verdicts and witness confirmation; a
+- **Cross-check**: independent Python parser and glob translation; the reference
+  solver's string and regex theories for verdicts and witness confirmation; a
   Brzozowski-derivative procedure (exact at the bound) for reachability, also
-  checked against Z3's unbounded regex query where conclusive; UNKNOWN accepted
+  checked against the solver's unbounded regex query where conclusive; UNKNOWN accepted
   only with a documented budget reason. Fixtures for the length bound,
   shadowing, the state budget and keyword compatibility.
 - **Harness**: a "v1.13.0 shipped" view (`harness/baseline-v1.13.0/`) and 24
@@ -911,7 +1032,7 @@ action to SATISFIED.
 - `docs/security/v1.10-architecture-roadmap.md` — model/TCB-changing track
   (Landlock, acquisition tiering, post-grant re-mediation, UNKNOWN escalation
   ladder, TCB shrink via proof-checking).
-- `v1_7/warden_landlock.c` — v1.10 skeleton (not wired into v1.9.2).
+- `v1_7/warden_landlock.c` — v1.10 skeleton (not wired into v1.9.2). *(Correction, v1.18.0: this file was never committed. Landlock is not implemented; the design is in `docs/security/v1.10-architecture-roadmap.md`.)*
 
 ### Changed
 
@@ -942,7 +1063,10 @@ move a genuinely unsafe action to SATISFIED.
   are performed by the supervisor on validated, copied arguments and the result
   is injected via `SECCOMP_IOCTL_NOTIF_ADDFD`; every notification is revalidated
   with `SECCOMP_IOCTL_NOTIF_ID_VALID` before the supervisor acts. New:
-  `v1_7/warden_notify_hardening.{h,c}`.
+  `v1_7/warden_notify_hardening.{h,c}`. *(Correction, v1.18.0: that file was
+  never committed. The discipline itself is implemented inline in
+  `varek/v1_4/warden.c`: descriptor injection with `SECCOMP_IOCTL_NOTIF_ADDFD`
+  and `SECCOMP_IOCTL_NOTIF_ID_VALID` checks.)*
 
 ### Added
 
@@ -953,6 +1077,13 @@ move a genuinely unsafe action to SATISFIED.
 - **Deterministic resource bounds** on the decision procedure (max step / time
   ceilings, obligation memoization). A bound hit yields UNKNOWN (fail closed),
   never a coerced pass.
+
+  *(Correction, v1.18.0: neither of these two items was implemented in v1.9.1;
+  only the specification was committed. From v1.13.0 an UNKNOWN record's `rule`
+  names its cause (`fragment_escape_flags`, `fragment_escape_length`,
+  `default_deny_unknown`), and the decision procedure's work is bounded by a
+  length guard, a 16-bit flag enumeration bound and, from v1.16.0, a 4,096-token
+  glob cap. There is no wall-clock ceiling and no memoization cache.)*
 - `docs/security/threat-model.md`, `docs/security/TRUSTED-COMPUTING-BASE.md`.
 
 ### Changed
@@ -1248,7 +1379,7 @@ The minor-version bump signals operators to review their trust assumptions befor
 
 ### Changed
 
-- **Kernel posture: deny-list â†’ per-label sticky (fail-safe).** With no labels marked sticky, behavior is byte-identical to v1.7.0. Production policies should mark sensitive labels sticky to engage the fail-safe path; the v1.7.0 deny-list default of passing unclassified labels silently is inconsistent with VAREK's discipline elsewhere.
+- **Kernel posture: deny-list → per-label sticky (fail-safe).** With no labels marked sticky, behavior is byte-identical to v1.7.0. Production policies should mark sensitive labels sticky to engage the fail-safe path; the v1.7.0 deny-list default of passing unclassified labels silently is inconsistent with VAREK's discipline elsewhere.
 
 ### Reproduce
 
@@ -1402,15 +1533,15 @@ The minor-version bump signals operators to review their trust assumptions befor
 
 ### Performance
 
-- `fast_match`: P50 = 93 ns, P99 = 271 ns, P99.9 = 526 ns across 10,000 decisions on DigitalOcean 1 vCPU / 512 MB. Two orders of magnitude (210x) faster than the v1.4 Warden's 57 Âµs P99 — policy-decision time is not the bottleneck in seccomp-unotify enforcement.
-- SMT context-reuse probe: P50 = 465 Âµs, P99 = 51,959 Âµs (bimodal distribution). Disqualified from hot-path use; retained for the slow-path role on richer policies.
-- Zero false negatives. Full `UNKNOWN` â†’ `DENY` suppression across the benchmark.
+- `fast_match`: P50 = 93 ns, P99 = 271 ns, P99.9 = 526 ns across 10,000 decisions on DigitalOcean 1 vCPU / 512 MB. About 160 times below the v1.4 Warden's measured end-to-end P99 of 44 µs (`varek/v1_4/bench_results_v1_4.txt`) — policy-decision time is not the bottleneck in seccomp-unotify enforcement. (Corrected in v1.18.0: this entry said 210x against a 57 µs P99 that no recorded run shows.)
+- SMT context-reuse probe: P50 = 465 µs, P99 = 51,959 µs (bimodal distribution). Disqualified from hot-path use; retained for the slow-path role on richer policies.
+- No false negatives observed in this benchmark: 0 allows of a deny-target path across the 10,000 decisions (`v1_5/bench_results_v1_5.txt`), with every `UNKNOWN` suppressed to `DENY`. A count from one benchmark, not a proof. (Reworded in v1.18.0 from "Zero false negatives.")
 
 ### Reproduce
 
     git clone https://github.com/kwdoug63/varek.git
     cd varek/v1_5
-    sudo apt install -y libz3-dev
+    make deps    # the solver's C library, for the SMT probes
     make
     ./fast_match 10000 ../v1_4/policy.txt 2> bench_fast.log
     python3 bench_summarize.py bench_fast.log
@@ -1444,7 +1575,7 @@ The minor-version bump signals operators to review their trust assumptions befor
 
 ### Performance
 
-- End-to-end Warden pipeline (seccomp-unotify + `/proc/<pid>/mem` + kernel injection): P99 = 57 Âµs measured.
+- End-to-end Warden pipeline (seccomp-unotify + `/proc/<pid>/mem` + kernel injection): P50 = 15 µs, P99 = 44 µs over 10,006 decisions (`varek/v1_4/bench_results_v1_4.txt`). (Corrected in v1.18.0: this entry said P99 = 57 µs, which no recorded run shows.)
 
 ### Reproduce
 
@@ -1517,7 +1648,7 @@ The minor-version bump signals operators to review their trust assumptions befor
 
 ### Moved
 
-- Smoke tests previously resident in `varek_warden.py` relocated to `tests/security/test_warden_smoke.py`.
+- Smoke tests previously resident in `varek_warden.py` relocated to `tests/security/test_warden_smoke.py`. *(Correction, v1.18.0: that file was never committed; the v1.1 regression tests are `tests/security/test_issue_223_regression.py`.)*
 
 ---
 

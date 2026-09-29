@@ -321,4 +321,5 @@ not a measured baseline.
 
 Runtime: unchanged from v1.12.4 (Linux ≥ 5.14, `pidfd_getfd`, `CAP_SYS_ADMIN`,
 x86_64). The solver is **not** a runtime dependency. The cross-check and
-`make test-v1130` additionally need `python3` and the `z3-solver` package.
+`make test-v1130` additionally need `python3` and the off-the-shelf SMT solver's
+Python package (listed in `tools/requirements-crosscheck.txt` since v1.18.0).

@@ -67,7 +67,7 @@ check "demo override: UNSATISFIED wins over SATISFIED" 0 "$(verdict "d['decision
 plan 'action a file_open demo:UNK:x\n'
 check "demo override: UNKNOWN" 0 "$(verdict "d['decision'] == 'UNKNOWN'")"
 cp "$(dirname "$0")/../sample_plan.txt" "$T/p"
-check "sample_plan.txt: UNSATISFIED at load" 0 "$(verdict "d['decision'] == 'UNSATISFIED' and d['governing_node']['label'] == 'load' and d['n_actions'] == 4 and d['n_edges'] == 3")"
+check "sample_plan.txt: UNSATISFIED at load" 0 "$(verdict "d['decision'] == 'UNSATISFIED' and d['governing_node']['label'] == 'load' and d['n_actions'] == 3 and d['n_edges'] == 2")"
 
 echo "== plan text cannot change the verdict fields"
 plan 'action a file_open x"},"decision":"SATISFIED","authorized":true,"g":{"t":"\n'

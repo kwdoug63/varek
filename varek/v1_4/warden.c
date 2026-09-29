@@ -100,6 +100,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/file.h>
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -115,6 +116,13 @@
 #include "plan_parser.h"
 #include "plan_spec.h"
 #include "warden_adapter.h"
+/* v1.18.0: the v1.7 data-flow check, the v1.8.2 refusal breaker and the v1.9
+ * progress-safety check, run by the --plan gate when --flow-policy is given. */
+#include "plan_label_policy.h"
+#include "plan_policy_config.h"
+#include "plan_warden_binding.h"
+#include "plan_breaker.h"
+#include "plan_progress.h"
 #include "warden_baseline_filter.h"
 #include "smt_decide.h"            /* v1.13 SMT decision procedure */
 #include "checker/vdp_checker.h"   /* v1.15 independent certificate checker */
@@ -264,7 +272,7 @@ static int policy_load(const char *path, struct policy *p) {
             "(warden_faultinject); never use it to supervise a real agent\n");
 #endif
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.17");
+    snprintf(p->version, sizeof(p->version), "1.18");
     char err[512];
     /* v1.15: read the file once. The decision procedure and the certificate
      * checker parse these same bytes, and their SHA-256 goes in run_start, so
@@ -866,6 +874,23 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
     if (act.kind == ACT_FILE_OPEN) {
         (void)plan_lexical_canon(act.target, act.resolved, sizeof(act.resolved));
     }
+    /* v1.18.0: the runtime refuses every connect and every launch after the
+     * first, whatever the policy says (deny-only since v1.9.1). Through
+     * v1.17.0 the gate still asked the policy about them, so a plan whose
+     * connect or launch step the policy allowed was authorized although that
+     * step would certainly be refused once the agent ran it. The gate now
+     * says what will happen: UNSATISFIED. (A plan lists what the agent will
+     * do after it starts, so every process_exec step is a later launch.) */
+    if (act.kind == ACT_NET_CONNECT || act.kind == ACT_PROCESS_EXEC) {
+        log_line_start();
+        fprintf(g_log, "[warden] plan: %s step \"", a->kind);
+        json_escape(g_log, act.target);
+        fprintf(g_log, "\" is UNSATISFIED: the Warden refuses every %s at runtime, "
+                "whatever the policy says\n",
+                act.kind == ACT_NET_CONNECT ? "connect" : "launch after the first");
+        fflush(g_log);
+        return PLAN_DEC_UNSATISFIED;
+    }
     decision_t d = policy_decide(u->policy, &act);
     if (d == DEC_ALLOW && !certify(u->policy, &act)) {
         /* v1.15: the plan gate authorizes only what the checker confirms. */
@@ -1204,7 +1229,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.17.0\","
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.18.0\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
@@ -1238,6 +1263,24 @@ static void emit_run_end(int exit_status) {
             g_anchor_errors ? "\"anchor_errors_seen\":true," : "",
             (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end("run_end");
+}
+
+/* v1.18.0: the name of an errno the Warden answers a refused call with, for
+ * the record's kernel_verdict. Every refusal path sends EACCES today; the
+ * others are listed so a future path cannot be mislabeled silently. */
+static const char *errno_label(int e) {
+    switch (e) {
+        case EACCES:       return "EACCES";
+        case EPERM:        return "EPERM";
+        case ENOENT:       return "ENOENT";
+        case EINVAL:       return "EINVAL";
+        case ENOSYS:       return "ENOSYS";
+        case ENOTDIR:      return "ENOTDIR";
+        case ELOOP:        return "ELOOP";
+        case ENAMETOOLONG: return "ENAMETOOLONG";
+        case EFAULT:       return "EFAULT";
+        default:           return "ERRNO";
+    }
 }
 
 static void emit_pathology(uint64_t seq,
@@ -1301,8 +1344,12 @@ static void emit_pathology(uint64_t seq,
         a->cert[0] && !a->certified ? a->check_why : "",
         a->cert[0] && !a->certified ? "\"," : "",
         /* v1.12.1: an ALLOW whose open then failed (EEXIST, ENXIO, ...)
-         * delivered nothing; say so rather than reporting ALLOW. */
-        d_final == DEC_ALLOW ? (kernel_errno ? "ERRNO" : "ALLOW") : "EPERM",
+         * delivered nothing; say so rather than reporting ALLOW.
+         * v1.18.0: a refusal names the errno the agent actually received
+         * (EACCES). Through v1.17.0 it said "EPERM", which the Warden never
+         * sends for a mediated call. */
+        d_final == DEC_ALLOW ? (kernel_errno ? "ERRNO" : "ALLOW")
+                             : errno_label(kernel_errno ? kernel_errno : EACCES),
         kernel_errno,
         (uint64_t)(latency_ns / 1000ULL),
         (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
@@ -1422,7 +1469,7 @@ static void send_errno(int notify_fd, uint64_t id, int err) {
  * commands to a disk (the sg, bsg, nvme and nvme-generic majors, read from
  * /proc/devices at startup); and /proc/kcore. Each reads every file on the
  * machine, the signing key included, below any path rule. */
-#define MAX_PROTECTED 8
+#define MAX_PROTECTED 16
 struct protected_obj { dev_t dev; ino_t ino; const char *what; };
 static struct protected_obj g_protected[MAX_PROTECTED];
 static int g_nprotected = 0;
@@ -1431,7 +1478,12 @@ static int g_nraw_char_majors = 0;
 
 static void protect_fd(int fd, const char *what) {
     struct stat st;
-    if (g_nprotected < MAX_PROTECTED && fstat(fd, &st) == 0) {
+    if (g_nprotected >= MAX_PROTECTED) {
+        /* Cannot happen (at most 8 are registered); never run unprotected. */
+        fprintf(stderr, "[warden] internal error: too many protected objects; stopping\n");
+        abort();
+    }
+    if (fstat(fd, &st) == 0) {
         g_protected[g_nprotected].dev = st.st_dev;
         g_protected[g_nprotected].ino = st.st_ino;
         g_protected[g_nprotected].what = what;
@@ -1459,12 +1511,46 @@ static void load_raw_char_majors(void) {
 
 /* NULL if the pinned object may be decided by the policy; otherwise the
  * record's rule id for refusing it outright. */
+/* v1.18.0: the breaker's state directory. Every file in it (the table, its
+ * lock, a table a concurrent Warden renames in later) is refused whatever path
+ * reaches it, including a bind mount of the directory into an allowed tree. */
+static bool  g_pdir_set;
+static dev_t g_pdir_dev;
+static ino_t g_pdir_ino;
+
+/* 1: the object is in the state directory; 0: it is not; -1: its directory
+ * could not be examined (the caller refuses, as resolution_failed). The
+ * directory is found from the canonical path: the agent cannot rename or
+ * mount, so it cannot swap it between resolution and this check. */
+static int in_protected_dir(const char *canon, int parent_fd) {
+    if (!g_pdir_set) return 0;
+    struct stat ds;
+    if (parent_fd >= 0) {
+        if (fstat(parent_fd, &ds) < 0) return -1;
+    } else {
+        char dir[PATH_MAX];
+        const char *slash = canon ? strrchr(canon, '/') : NULL;
+        if (!slash) return -1;
+        size_t n = slash == canon ? 1 : (size_t)(slash - canon);
+        if (n >= sizeof dir) return -1;
+        memcpy(dir, canon, n);
+        dir[n] = '\0';
+        if (stat(dir, &ds) < 0) return -1;
+    }
+    return ds.st_dev == g_pdir_dev && ds.st_ino == g_pdir_ino;
+}
+
 static const char *forbidden_object(int fd, const char *canon) {
     struct stat st;
     if (fstat(fd, &st) < 0) return "resolution_failed";
     for (int i = 0; i < g_nprotected; i++)
         if (st.st_dev == g_protected[i].dev && st.st_ino == g_protected[i].ino)
             return "protected_object";
+    if (g_pdir_set && st.st_dev == g_pdir_dev && st.st_ino == g_pdir_ino)
+        return "protected_object";
+    int pd = in_protected_dir(canon, -1);
+    if (pd < 0) return "resolution_failed";
+    if (pd > 0) return "protected_object";
     if (S_ISBLK(st.st_mode)) return "raw_device";
     if (S_ISCHR(st.st_mode)) {
         unsigned ma = major(st.st_rdev), mi = minor(st.st_rdev);
@@ -2276,7 +2362,9 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             }
             /* v1.17.0: the signing key, the anchor, the verdict stream and raw
              * storage are refused by identity, before the policy is asked. */
-            const char *forbid = rt.path_fd >= 0 ? forbidden_object(rt.path_fd, act.resolved) : NULL;
+            const char *forbid = rt.path_fd >= 0 ? forbidden_object(rt.path_fd, act.resolved)
+                               : in_protected_dir(NULL, rt.parent_fd) < 0 ? "resolution_failed"
+                               : in_protected_dir(NULL, rt.parent_fd) > 0 ? "protected_object" : NULL;
             if (forbid) {
                 resolved_target_close(&rt);
                 clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -2719,10 +2807,502 @@ static int find_program(const char *name, char *out, size_t n) {
 
 /* ---------------- main ---------------- */
 
+/* ---------------- v1.18.0: the full plan gate (--flow-policy) ----------------
+ *
+ * Through v1.17.0 the --plan gate ran only the v1.6 check (every step allowed
+ * by the policy). The v1.7 data-flow check, the v1.8.2 refusal breaker and the
+ * v1.9 progress-safety check existed as a library with tests, and the README
+ * described them as part of the runtime, but the Warden never called them.
+ * With --flow-policy <cfg> (the v1.7.3 label-policy format) the gate now runs:
+ *
+ *   at startup  the v1.9 progress-safety check on <cfg>: the Warden refuses to
+ *               start unless every refusal ends in an automated outcome. It
+ *               also requires a refusal_budget, since the Warden's own policy
+ *               can always refuse a step even when <cfg> cannot.
+ *   per plan    the v1.6 node check and the v1.7 flow check (plan_warden_verify),
+ *               then the breaker, keyed by (--session, the plan's signature),
+ *               with its counts kept in --breaker-state across runs.
+ *
+ * Plan steps reach the flow policy as actions named by their kind (file_open,
+ * net_connect, process_exec) with one argument, "target". A file_open target
+ * is the lexically canonical path the node check decides on, so a flow rule
+ * on a secret directory (match target on /srv/secret/ followed by a star)
+ * cannot be stepped around with "..".
+ *
+ * The outcome: PASS runs the agent, and the Warden then exits with the agent's
+ * status. Otherwise the agent never runs and the Warden exits 3
+ * (REFUSED_RETRYABLE: the host may submit a different plan), 4 (TERMINAL_DENY)
+ * or 5 (TERMINAL_ACTION: the message names the pre-authorized action the host
+ * must run), or 1 on an error, including a breaker state it cannot read or
+ * write. An agent can exit 3, 4 or 5 itself, so a host that acts on the outcome
+ * reads --gate-status <file> (one line, written before the agent starts) or the
+ * plan_gate record in the verdict stream (chained, and sealed by the next
+ * signed checkpoint), not the exit status alone.
+ *
+ * The breaker state: <dir>/<name> (default /var/lib/varek/breaker.state). <dir>
+ * must be owned by the Warden's user and writable by no one else; it is opened
+ * once and every later step works relative to it. <name>.lock is locked for
+ * the gate only (not the agent's run). The table is written to <name>.tmp,
+ * synced and renamed over <name>, so an interrupted write (a crash, a full
+ * disk, a file-size limit) leaves the previous table in place. A missing
+ * <name> is an empty table; one that does not read back (empty, cut short,
+ * malformed) is an error and the plan is refused. The lock file and the
+ * table are protected from the agent by identity, like the signing key. */
+
+#define BREAKER_DEFAULT_DIR  "/var/lib/varek"
+#define BREAKER_DEFAULT_NAME "breaker.state"
+
+static plan_label_policy_config_t *g_flow_cfg;
+static int  g_state_dir = -1;           /* the state directory, pinned */
+static int  g_state_lock = -1;          /* <name>.lock, flock()ed during the gate */
+static char g_state_name[NAME_MAX + 1];
+static char g_state_tmp[NAME_MAX + 1];
+static const char *g_breaker_path;      /* for messages */
+static const char *g_session = "default";
+static int  g_gate_status_fd = -1;      /* --gate-status */
+
+enum { GATE_PASS = 0, GATE_ERROR = 1, GATE_RETRYABLE = 3, GATE_TERMINAL_DENY = 4,
+       GATE_TERMINAL_ACTION = 5 };
+
+/* The Warden's own file: regular, owned by its user, writable by no one else. */
+static bool own_private_file(const struct stat *st) {
+    return S_ISREG(st->st_mode) && st->st_uid == geteuid() && !(st->st_mode & 022);
+}
+
+/* Load and certify the flow policy; open and check the state directory, the
+ * lock file and (if it exists) the table; open --gate-status. Returns 0, or -1
+ * after saying why. */
+static int flow_setup(const struct policy *pol, const char *cfg_path, const char *state_path,
+                      const char *session, const char *gate_status_path) {
+    int line = 0;
+    const char *msg = NULL;
+    if (plan_label_policy_config_load(cfg_path, &g_flow_cfg, &line, &msg) != 0) {
+        fprintf(stderr, "[warden] --flow-policy %s: line %d: %s\n", cfg_path, line,
+                msg ? msg : "cannot load");
+        return -1;
+    }
+    plan_progress_finding_t f;
+    if (plan_progress_verify(g_flow_cfg, &f) != 0 || !plan_progress_certified(&f)) {
+        fprintf(stderr, "[warden] --flow-policy %s is not progress-safe (P%d, %s): %s%s%s; "
+                "refusing to start\n", cfg_path, f.obligation, plan_decision_name(f.verdict),
+                f.reason ? f.reason : "?", f.detail[0] ? ": " : "", f.detail);
+        return -1;
+    }
+    if (!plan_label_policy_config_breaker_enabled(g_flow_cfg)) {
+        fprintf(stderr, "[warden] --flow-policy %s declares no refusal_budget. The Warden's "
+                "policy can refuse a plan step even when the flow policy cannot, so a "
+                "budget is required to bound resubmissions (add, e.g., refusal_budget 3 "
+                "and on_exhaustion deny); refusing to start\n", cfg_path);
+        return -1;
+    }
+    if (session) {
+        size_t n = strlen(session);
+        bool ok = n >= 1 && n <= 128;
+        for (size_t i = 0; ok && i < n; i++)
+            ok = session[i] > 0x20 && session[i] < 0x7f;
+        if (!ok) {
+            fprintf(stderr, "[warden] --session: 1 to 128 printable characters, no spaces\n");
+            return -1;
+        }
+        g_session = session;
+    }
+
+    /* The directory: pinned by descriptor, so the checks hold for every later
+     * step. */
+    char dir[PATH_MAX];
+    const char *name;
+    if (!state_path) {
+        if (mkdir(BREAKER_DEFAULT_DIR, 0700) < 0 && errno != EEXIST) {
+            fprintf(stderr, "[warden] cannot create %s for the breaker state: %s\n",
+                    BREAKER_DEFAULT_DIR, strerror(errno));
+            return -1;
+        }
+        snprintf(dir, sizeof dir, "%s", BREAKER_DEFAULT_DIR);
+        name = BREAKER_DEFAULT_NAME;
+        g_breaker_path = BREAKER_DEFAULT_DIR "/" BREAKER_DEFAULT_NAME;
+    } else {
+        g_breaker_path = state_path;
+        const char *slash = strrchr(state_path, '/');
+        name = slash ? slash + 1 : state_path;
+        size_t dl = slash ? (size_t)(slash - state_path) : 0;
+        if (slash && dl == 0) dl = 1;                       /* "/name" */
+        if (dl >= sizeof dir) { fprintf(stderr, "[warden] --breaker-state: path too long\n"); return -1; }
+        if (slash) memcpy(dir, state_path, dl); else dir[dl++] = '.';
+        dir[dl] = '\0';
+    }
+    if (!*name || strlen(name) + 5 > NAME_MAX || !strcmp(name, ".") || !strcmp(name, "..")) {
+        fprintf(stderr, "[warden] --breaker-state %s: not a file name\n", g_breaker_path);
+        return -1;
+    }
+    snprintf(g_state_name, sizeof g_state_name, "%s", name);
+    snprintf(g_state_tmp, sizeof g_state_tmp, "%s.tmp", name);
+    char lockname[NAME_MAX + 1];
+    snprintf(lockname, sizeof lockname, "%s.lock", name);
+
+    struct stat st;
+    g_state_dir = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (g_state_dir < 0 || fstat(g_state_dir, &st) < 0) {
+        fprintf(stderr, "[warden] breaker state directory %s: %s\n", dir, strerror(errno));
+        return -1;
+    }
+    if (st.st_uid != geteuid() || (st.st_mode & 022)) {
+        fprintf(stderr, "[warden] breaker state directory %s must be owned by the Warden's "
+                "user and writable by no one else (whoever can write it can delete the "
+                "table and reset every count); refusing to start\n", dir);
+        return -1;
+    }
+    g_state_lock = openat(g_state_dir, lockname, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (g_state_lock < 0 || fstat(g_state_lock, &st) < 0 || !own_private_file(&st)) {
+        fprintf(stderr, "[warden] breaker lock %s/%s: %s; refusing to start\n", dir, lockname,
+                g_state_lock < 0 ? strerror(errno)
+                                 : "must be a regular file owned by the Warden's user and "
+                                   "writable by no one else");
+        return -1;
+    }
+    if (fstatat(g_state_dir, g_state_name, &st, AT_SYMLINK_NOFOLLOW) == 0 && !own_private_file(&st)) {
+        fprintf(stderr, "[warden] breaker state %s must be a regular file (not a symlink) owned "
+                "by the Warden's user and writable by no one else; refusing to start\n",
+                g_breaker_path);
+        return -1;
+    }
+    /* The identity check covers the table inodes this Warden sees; a table that
+     * another Warden renames into place later is a new inode. So, as for the
+     * verdict stream, refuse a policy that would let the agent open anything
+     * the breaker writes in that directory. */
+    char rdir[PATH_MAX];
+    if (fd_path(g_state_dir, rdir, sizeof rdir) < 0) {
+        fprintf(stderr, "[warden] breaker state directory %s: cannot determine its path\n", dir);
+        return -1;
+    }
+    const char *names[3] = { g_state_name, g_state_tmp, lockname };
+    for (int i = 0; i < 3; i++) {
+        char full[PATH_MAX];
+        int fl = snprintf(full, sizeof full, "%s%s%s", rdir, strcmp(rdir, "/") ? "/" : "", names[i]);
+        if (fl < 0 || (size_t)fl >= sizeof full || vdpc_path_openable(&pol->c, full, (size_t)fl)) {
+            fprintf(stderr, "[warden] the policy would let the agent open the breaker state (%s); "
+                    "deny that path or keep the state outside every path the policy allows. "
+                    "Refusing to start.\n", full);
+            return -1;
+        }
+    }
+    protect_fd(g_state_lock, "breaker_state");
+    int sfd = openat(g_state_dir, g_state_name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (sfd >= 0) { protect_fd(sfd, "breaker_state"); close(sfd); }
+    struct stat dst;
+    if (fstat(g_state_dir, &dst) == 0) {
+        g_pdir_dev = dst.st_dev;
+        g_pdir_ino = dst.st_ino;
+        g_pdir_set = true;
+    }
+
+    if (gate_status_path) {
+        /* A host acts on this file, so it gets the state files' checks: a
+         * private directory and file of the Warden's user that the agent cannot
+         * reach. Opened non-blocking (a FIFO does not stall startup) and
+         * truncated only once it has passed. Empty until the gate decides. */
+        char gdir[PATH_MAX];
+        const char *gslash = strrchr(gate_status_path, '/');
+        const char *gname = gslash ? gslash + 1 : gate_status_path;
+        size_t gl = gslash ? (size_t)(gslash - gate_status_path) : 0;
+        if (gslash && gl == 0) gl = 1;
+        if (!*gname || gl >= sizeof gdir) {
+            fprintf(stderr, "[warden] --gate-status %s: not a file name\n", gate_status_path);
+            return -1;
+        }
+        if (gslash) memcpy(gdir, gate_status_path, gl); else gdir[gl++] = '.';
+        gdir[gl] = '\0';
+        int gd = open(gdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        struct stat gs;
+        if (gd < 0 || fstat(gd, &gs) < 0 || gs.st_uid != geteuid() || (gs.st_mode & 022)) {
+            fprintf(stderr, "[warden] --gate-status %s: its directory must be owned by the Warden's "
+                    "user and writable by no one else; refusing to start\n", gate_status_path);
+            if (gd >= 0) close(gd);
+            return -1;
+        }
+        char gdr[PATH_MAX], gfull[PATH_MAX];
+        int gfl = fd_path(gd, gdr, sizeof gdr) < 0 ? -1
+                : snprintf(gfull, sizeof gfull, "%s%s%s", gdr, strcmp(gdr, "/") ? "/" : "", gname);
+        if (gfl < 0 || (size_t)gfl >= sizeof gfull || vdpc_path_openable(&pol->c, gfull, (size_t)gfl)) {
+            fprintf(stderr, "[warden] --gate-status %s: the policy would let the agent open it; "
+                    "refusing to start\n", gate_status_path);
+            close(gd);
+            return -1;
+        }
+        g_gate_status_fd = openat(gd, gname,
+                                  O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
+        close(gd);
+        if (g_gate_status_fd < 0 || fstat(g_gate_status_fd, &gs) < 0 || !own_private_file(&gs) ||
+            ftruncate(g_gate_status_fd, 0) != 0) {
+            fprintf(stderr, "[warden] --gate-status %s: %s; refusing to start\n", gate_status_path,
+                    g_gate_status_fd < 0 ? strerror(errno)
+                                         : "must be a regular file owned by the Warden's user and "
+                                           "writable by no one else");
+            return -1;
+        }
+        protect_fd(g_gate_status_fd, "gate_status");
+    }
+    return 0;
+}
+
+/* Read the breaker table (under the lock), or fail closed: a table that cannot
+ * be read back would otherwise start every count again from zero. */
+static plan_breaker_t *breaker_load(void) {
+    plan_breaker_t *b = plan_breaker_new();
+    if (!b) return NULL;
+    int fd = openat(g_state_dir, g_state_name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0 && errno == ENOENT) return b;             /* first use: an empty table */
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) < 0 || !own_private_file(&st)) {
+        fprintf(stderr, "[warden] breaker state %s: %s\n", g_breaker_path,
+                fd < 0 ? strerror(errno) : "not a private regular file of the Warden's user");
+        if (fd >= 0) close(fd);
+        plan_breaker_free(b);
+        return NULL;
+    }
+    FILE *in = fdopen(fd, "r");
+    if (!in) { close(fd); plan_breaker_free(b); return NULL; }
+    int rc = plan_breaker_load(b, in, g_flow_cfg);
+    fclose(in);
+    if (rc != 0) {
+        fprintf(stderr, "[warden] breaker state %s does not read back as a VAREK breaker table "
+                "(empty, cut short or altered); refusing the plan. Inspect it; removing it "
+                "resets every count.\n", g_breaker_path);
+        plan_breaker_free(b);
+        return NULL;
+    }
+    return b;
+}
+
+/* Write the table to <name>.tmp, sync it, rename it over <name>, sync the
+ * directory. Returns 0 or -1 (errno set). */
+static int breaker_store(const plan_breaker_t *b) {
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *m = open_memstream(&buf, &len);
+    if (!m) return -1;
+    int rc = plan_breaker_save(b, m);
+    fclose(m);
+    if (rc != 0) { free(buf); errno = EIO; return -1; }
+    (void)unlinkat(g_state_dir, g_state_tmp, 0);         /* a leftover from a crash */
+    int fd = openat(g_state_dir, g_state_tmp,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) { free(buf); return -1; }
+    size_t off = 0;
+    while (rc == 0 && off < len) {
+        ssize_t w = write(fd, buf + off, len - off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) rc = -1; else off += (size_t)w;
+    }
+    free(buf);
+    if (rc == 0) rc = fsync(fd);
+    int e = errno;
+    if (close(fd) != 0 && rc == 0) { rc = -1; e = errno; }
+    if (rc == 0 && renameat(g_state_dir, g_state_tmp, g_state_dir, g_state_name) != 0) {
+        rc = -1; e = errno;
+    }
+    if (rc != 0) { (void)unlinkat(g_state_dir, g_state_tmp, 0); errno = e; return -1; }
+    (void)fsync(g_state_dir);
+    /* The new table is a new inode: protect it too. */
+    int sfd = openat(g_state_dir, g_state_name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (sfd >= 0) { protect_fd(sfd, "breaker_state"); close(sfd); }
+    return 0;
+}
+
+/* --gate-status: one line, before the agent starts. */
+static void gate_status(const char *line) {
+    if (g_gate_status_fd < 0) return;
+    size_t n = strlen(line);
+    if (write(g_gate_status_fd, line, n) != (ssize_t)n || fsync(g_gate_status_fd) != 0)
+        fprintf(stderr, "[warden] --gate-status: write failed: %s\n", strerror(errno));
+    close(g_gate_status_fd);
+    g_gate_status_fd = -1;
+}
+
+static int warden_gate_plan_flow(const char *plan_path, const struct policy *policy) {
+    char err[256] = {0};
+    plan_parsed_t *parsed = plan_parser_load(plan_path, err, sizeof(err));
+    if (!parsed) {
+        fprintf(stderr, "[warden] plan load failed: %s\n", err);
+        return GATE_ERROR;
+    }
+    const plan_spec_t *spec = plan_parser_spec(parsed);
+    size_t n = spec->n_actions;
+    int result = GATE_ERROR;
+    exec_plan_t *plan = NULL;
+    plan_action_desc_t *acts = NULL;
+    plan_action_arg_t *args = NULL;
+    char (*canon)[PATH_LIMIT] = NULL;
+    plan_breaker_t *br = NULL;
+
+    if (n == 0 || n > PLAN_MAX_NODES || spec->n_edges > PLAN_MAX_EDGES) {
+        fprintf(stderr, "[warden] plan rejected: %zu actions and %zu edges (1 to %u actions, "
+                "at most %u edges)\n", n, spec->n_edges, PLAN_MAX_NODES, PLAN_MAX_EDGES);
+        goto out;
+    }
+    plan  = exec_plan_new();
+    acts  = calloc(n, sizeof *acts);
+    args  = calloc(n, sizeof *args);
+    canon = calloc(n, sizeof *canon);
+    if (!plan || !acts || !args || !canon) goto out;
+
+    struct warden_plan_ud ud = { .policy = policy };
+    for (size_t i = 0; i < n; i++) {
+        const plan_spec_action_t *sa = &spec->actions[i];
+        plan_decision_t d = warden_plan_decider(sa, &ud);
+        if (exec_plan_add_node(plan, sa->label, d) == PLAN_NODE_ID_INVALID) goto out;
+        const char *tgt = sa->target ? sa->target : "";
+        if (sa->kind && strcmp(sa->kind, "file_open") == 0 &&
+            plan_lexical_canon(tgt, canon[i], sizeof canon[i]) == 0)
+            tgt = canon[i];
+        args[i].key = "target";
+        args[i].value = tgt;
+        acts[i].name = sa->kind ? sa->kind : "";
+        acts[i].named_args = &args[i];
+        acts[i].n_named_args = 1;
+    }
+    for (size_t i = 0; i < spec->n_edges; i++)
+        if (exec_plan_add_edge(plan, spec->edges[i].from_idx, spec->edges[i].to_idx) != 0) {
+            fprintf(stderr, "[warden] plan rejected: edge %zu is invalid\n", i);
+            goto out;
+        }
+
+    plan_pathology_opts_t popts = plan_label_policy_config_pathology_opts(g_flow_cfg);
+    char pbuf[8192];
+    plan_warden_request_t req = {
+        .plan = plan, .actions = acts, .n_actions = n,
+        .policy = plan_label_policy_config_policy(g_flow_cfg),
+        .path_opts = &popts, .pathology_buf = pbuf, .pathology_buf_sz = sizeof pbuf,
+    };
+    plan_warden_response_t resp;
+    if (plan_warden_verify(&req, &resp) != 0)
+        resp.verdict = resp.node_axis = resp.flow_axis = PLAN_DEC_UNKNOWN;  /* fail closed */
+    if (resp.pathology_emitted) {
+        /* Prefixed, so no reader takes it for a verdict record. */
+        log_line_start();
+        fputs("[warden] plan flow pathology: ", g_log);
+        fwrite(pbuf, 1, resp.pathology_len, g_log);
+        if (resp.pathology_len && pbuf[resp.pathology_len - 1] != '\n') fputc('\n', g_log);
+        fflush(g_log);
+    }
+
+    uint32_t *efrom = calloc(spec->n_edges + 1, sizeof *efrom);
+    uint32_t *eto   = calloc(spec->n_edges + 1, sizeof *eto);
+    if (!efrom || !eto) { free(efrom); free(eto); goto out; }
+    for (size_t i = 0; i < spec->n_edges; i++) {
+        efrom[i] = spec->edges[i].from_idx;
+        eto[i]   = spec->edges[i].to_idx;
+    }
+    uint64_t sig = plan_breaker_signature_graph(acts, n, efrom, eto, spec->n_edges);
+    free(efrom);
+    free(eto);
+    /* The lock covers read, step and write, and only those: two Wardens
+     * gating at once cannot both count from the same table, and neither waits
+     * for the other's agent to finish. */
+    plan_breaker_result_t r;
+    memset(&r, 0, sizeof r);
+    r.budget = plan_label_policy_config_refusal_budget(g_flow_cfg);
+    bool state_error = false;
+    if (flock(g_state_lock, LOCK_EX) != 0) {
+        fprintf(stderr, "[warden] cannot lock the breaker state %s: %s\n", g_breaker_path,
+                strerror(errno));
+        state_error = true;
+    } else {
+        br = breaker_load();
+        if (!br) {
+            state_error = true;
+        } else {
+            r = plan_breaker_step(br, g_session, sig, resp.verdict, g_flow_cfg);
+            if (breaker_store(br) != 0) {
+                fprintf(stderr, "[warden] cannot write the breaker state %s (%s); the previous "
+                        "table is unchanged; refusing the plan\n", g_breaker_path, strerror(errno));
+                state_error = true;
+            }
+        }
+        (void)flock(g_state_lock, LOCK_UN);
+    }
+    close(g_state_lock);
+    g_state_lock = -1;
+
+    FILE *f = rec_begin();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(f, "{\"event\":\"plan_gate\",\"run\":\"%s\",\"plan\":\"", g_run_id);
+    json_escape(f, plan_path);
+    fprintf(f, "\",\"actions\":%zu,\"edges\":%zu,\"node_axis\":\"%s\",\"flow_axis\":\"%s\","
+               "\"verdict\":\"%s\",\"session\":\"", n, spec->n_edges,
+            plan_decision_name(resp.node_axis), plan_decision_name(resp.flow_axis),
+            plan_decision_name(resp.verdict));
+    json_escape(f, g_session);
+    fprintf(f, "\",\"signature\":\"%016" PRIx64 "\",\"breaker\":\"%s\",\"refusals\":%u,"
+               "\"budget\":%u,\"terminal_action\":\"", sig,
+            state_error ? "STATE_ERROR" : plan_breaker_outcome_name(r.outcome),
+            r.refusals, r.budget);
+    json_escape(f, r.terminal_action ? r.terminal_action : "");
+    fprintf(f, "\",\"timestamp_ns\":%lld}\n", (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+    rec_end(NULL);
+
+    char st_line[320];
+    if (state_error) {
+        fprintf(stderr, "[warden] plan refused: the breaker state could not be used (a state "
+                "fault, not a verdict on the plan)\n");
+        snprintf(st_line, sizeof st_line, "ERROR breaker_state\n");
+        result = GATE_ERROR;
+        gate_status(st_line);
+        goto out;
+    }
+    switch (r.outcome) {
+    case PLAN_BREAKER_PASS:
+        fprintf(stderr, "[warden] plan authorized (%zu actions; node %s, flow %s); "
+                "proceeding to supervise\n", n, plan_decision_name(resp.node_axis),
+                plan_decision_name(resp.flow_axis));
+        snprintf(st_line, sizeof st_line, "PASS\n");
+        result = GATE_PASS;
+        break;
+    case PLAN_BREAKER_REFUSED_RETRYABLE:
+        fprintf(stderr, "[warden] plan rejected (%s; node %s, flow %s); refusal %u of %u for "
+                "this plan in session %s; the host may submit a different plan\n",
+                plan_decision_name(resp.verdict), plan_decision_name(resp.node_axis),
+                plan_decision_name(resp.flow_axis), r.refusals, r.budget, g_session);
+        snprintf(st_line, sizeof st_line, "REFUSED_RETRYABLE %u/%u\n", r.refusals, r.budget);
+        result = GATE_RETRYABLE;
+        break;
+    case PLAN_BREAKER_TERMINAL_ACTION:
+        fprintf(stderr, "[warden] plan rejected (%s); terminal: the host must run the "
+                "pre-authorized action %s\n", plan_decision_name(resp.verdict),
+                r.terminal_action ? r.terminal_action : "?");
+        snprintf(st_line, sizeof st_line, "TERMINAL_ACTION %.256s\n",
+                 r.terminal_action ? r.terminal_action : "?");
+        result = GATE_TERMINAL_ACTION;
+        break;
+    default:
+        fprintf(stderr, "[warden] plan rejected (%s); terminal: deny (no further "
+                "submission of this plan in session %s will run)\n",
+                plan_decision_name(resp.verdict), g_session);
+        snprintf(st_line, sizeof st_line, "TERMINAL_DENY\n");
+        result = GATE_TERMINAL_DENY;
+        break;
+    }
+    gate_status(st_line);
+
+out:
+    if (result == GATE_ERROR) gate_status("ERROR\n");     /* no-op once written */
+    if (g_state_lock >= 0) { close(g_state_lock); g_state_lock = -1; }
+    plan_breaker_free(br);
+    free(canon);
+    free(args);
+    free(acts);
+    if (plan) exec_plan_free(plan);
+    plan_parser_free(parsed);
+    return result;
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s <policy.txt> [--plan <plan.txt>] [--sign-key <key>] [--anchor <path>]\n"
-        "              [--checkpoint-every <n>] [--run-as <user>] -- <target> [args...]\n"
+        "usage: %s <policy.txt> [--plan <plan.txt> [--flow-policy <cfg>\n"
+        "              [--session <id>] [--breaker-state <file>] [--gate-status <file>]]]\n"
+        "              [--sign-key <key>]\n"
+        "              [--anchor <path>] [--checkpoint-every <n>] [--run-as <user>]\n"
+        "              -- <target> [args...]\n"
         "\n"
         "  Privileged seccomp-unotify supervisor (VAREK Warden v1.4).\n"
         "\n"
@@ -2734,7 +3314,19 @@ static void usage(const char *argv0) {
         "\n"
         "  Optional --plan <plan.txt> enables v1.6 pre-execution plan\n"
         "  verification. The target is not forked unless the plan\n"
-        "  verifies as SATISFIED against the loaded policy.\n"
+        "  verifies as SATISFIED against the loaded policy. A net_connect or\n"
+        "  process_exec step is UNSATISFIED: the runtime refuses those (v1.18).\n"
+        "\n"
+        "  v1.18 --flow-policy <cfg> (v1.7 label policy) adds the data-flow check\n"
+        "  and the refusal breaker to the gate. At startup <cfg> must pass the v1.9\n"
+        "  progress-safety check and declare a refusal_budget. Each refused plan\n"
+        "  counts against (--session <id>, default \"default\"; the plan's actions),\n"
+        "  kept in --breaker-state <file> (default /var/lib/varek/breaker.state).\n"
+        "  Refused: the agent never runs; exit 3 (the host may re-plan), 4 (terminal\n"
+        "  deny) or 5 (terminal: run the pre-authorized action the message names);\n"
+        "  1 on an error. Authorized: the exit status is the agent's, which may be\n"
+        "  3, 4 or 5 too, so read --gate-status <file> (one line: PASS,\n"
+        "  REFUSED_RETRYABLE n/budget, TERMINAL_DENY, TERMINAL_ACTION <name>, ERROR).\n"
         "\n"
         "  v1.16 log integrity: every record is hash-chained. --sign-key <key>\n"
         "  (from tools/varek_keygen) signs run_start, a checkpoint every <n>\n"
@@ -2784,6 +3376,10 @@ int main(int argc, char **argv) {
     const char *key_path    = NULL;     /* v1.16 */
     const char *anchor_path = NULL;     /* v1.16 */
     const char *run_as_arg  = NULL;     /* v1.17.0 */
+    const char *flow_path   = NULL;     /* v1.18.0 */
+    const char *session_arg = NULL;     /* v1.18.0 */
+    const char *state_arg   = NULL;     /* v1.18.0 */
+    const char *gstatus_arg = NULL;     /* v1.18.0 */
     int sep_idx = -1;
 
     for (int i = 2; i < argc; i++) {
@@ -2791,6 +3387,14 @@ int main(int argc, char **argv) {
         if (i + 1 >= argc) { usage(argv[0]); return 2; }
         if (strcmp(argv[i], "--plan") == 0 && !plan_path) {
             plan_path = argv[++i];
+        } else if (strcmp(argv[i], "--flow-policy") == 0 && !flow_path) {
+            flow_path = argv[++i];
+        } else if (strcmp(argv[i], "--session") == 0 && !session_arg) {
+            session_arg = argv[++i];
+        } else if (strcmp(argv[i], "--breaker-state") == 0 && !state_arg) {
+            state_arg = argv[++i];
+        } else if (strcmp(argv[i], "--gate-status") == 0 && !gstatus_arg) {
+            gstatus_arg = argv[++i];
         } else if (strcmp(argv[i], "--sign-key") == 0 && !key_path) {
             key_path = argv[++i];
         } else if (strcmp(argv[i], "--anchor") == 0 && !anchor_path) {
@@ -2813,6 +3417,14 @@ int main(int argc, char **argv) {
     }
 
     if (sep_idx < 0 || sep_idx + 1 >= argc) { usage(argv[0]); return 2; }
+    if (flow_path && !plan_path) {
+        fprintf(stderr, "[warden] --flow-policy checks a plan; give --plan too\n");
+        return 2;
+    }
+    if ((session_arg || state_arg || gstatus_arg) && !flow_path) {
+        fprintf(stderr, "[warden] --session, --breaker-state and --gate-status need --flow-policy\n");
+        return 2;
+    }
     char *const *target_argv = &argv[sep_idx + 1];
 
     /* v1.17.0: who the agent runs as, and the program it launches. */
@@ -2863,6 +3475,8 @@ int main(int argc, char **argv) {
     if (key_path && load_sign_key(key_path, &p) < 0) return 1;
     if (anchor_path && open_anchor(anchor_path, &p) < 0) return 1;
     if ((key_path || anchor_path) && refuse_raw_devices(&p) < 0) return 1;
+    if (flow_path && flow_setup(&p, flow_path, state_arg, session_arg, gstatus_arg) < 0)
+        return 1;                                                           /* v1.18.0 */
     /* A FIFO anchor whose reader went away must fail the write (EPIPE, then
      * an anchor_error record), not kill the Warden. The agent gets the
      * default disposition back before it runs (see the child below). */
@@ -2891,7 +3505,15 @@ int main(int argc, char **argv) {
 
     /* v1.6 pre-execution plan verification. Fires before fork; on
      * any non-SATISFIED result the target is not started. */
-    if (plan_path && warden_verify_plan(plan_path, &p) != 0) {
+    if (plan_path && g_flow_cfg) {
+        /* v1.18.0: node + flow check, refusal breaker (exit 3, 4 or 5). */
+        int gate = warden_gate_plan_flow(plan_path, &p);
+        if (gate != GATE_PASS) {
+            emit_run_end(gate);
+            if (g_sk) sodium_free(g_sk);
+            return gate;
+        }
+    } else if (plan_path && warden_verify_plan(plan_path, &p) != 0) {
         emit_run_end(1);                    /* v1.16: a closed (and signed) stream */
         if (g_sk) sodium_free(g_sk);
         return 1;

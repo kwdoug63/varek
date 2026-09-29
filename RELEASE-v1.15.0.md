@@ -94,7 +94,7 @@ has none of the procedure's optimizations. They are not independent in design:
   word-parallel.
 
 The diversity comes from elsewhere. The cross-check's Python oracle translates
-each glob into a regular language and decides it by derivatives and by Z3, and
+each glob into a regular language and decides it by derivatives and by the reference solver, and
 the independent review added its own regular-expression translation and a
 harness comparing the two C parsers. None of them found a disagreement.
 
@@ -342,4 +342,5 @@ glob sets out of policies for latency-sensitive agents.
 
 Runtime: unchanged (Linux ≥ 5.14, `pidfd_getfd`, `CAP_SYS_ADMIN`, x86_64). The
 checker needs nothing beyond libc. The cross-check and `make test-v1150` also
-need `python3` and the `z3-solver` package.
+need `python3` and the reference solver's package (`tools/requirements-crosscheck.txt`
+since v1.18.0).

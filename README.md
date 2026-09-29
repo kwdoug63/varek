@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.17.0-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.18.0-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -16,10 +16,28 @@ VAREK decides whether an AI agent's planned actions are allowed **before** they
 execute, and enforces that decision at the kernel boundary.
 
 An agent's intended actions are represented as an **action-graph** — a directed
-acyclic graph of planned actions. An **SMT decision procedure** evaluates that graph against a policy. In the Warden it is a purpose-built procedure for a decidable fragment — bounded strings for the object (prefix, exact, suffix, contains and glob matching), bitvectors for the open flags — that decides in microseconds with bounded worst case, is cross-checked against an off-the-shelf SMT solver, and returns UNKNOWN for anything outside its fragment rather than guessing. Every SATISFIED verdict carries a certificate that a small, independently written checker must accept before the action takes effect. Every verdict is one of three — **SATISFIED**, **UNSATISFIED**, or **UNKNOWN** — and it fails closed. The **Warden** runtime carries that verdict to
-the kernel (via `seccomp user-notify (seccomp-BPF)`) and refuses any disallowed syscall
-before it lands. The check is pre-execution: an action that cannot be proven
-allowed never runs.
+acyclic graph of planned actions. Before the agent starts, the Warden's optional
+`--plan` gate checks a declared action-graph: every step against the policy and,
+with `--flow-policy`, the data flowing along its edges. While the agent runs, the
+**Warden** pauses each file open, file lookup (`stat`, `access`, `readlink`),
+connect, program launch and datagram send at the kernel (via seccomp-BPF and
+seccomp user-notify) and decides it before it runs. File opens and lookups are
+decided by an **SMT decision procedure**: in the Warden, a purpose-built procedure
+for a decidable fragment — bounded strings for the object (prefix, exact, suffix,
+contains and glob matching), bitvectors for the open flags — that decides in
+microseconds with bounded worst case, is cross-checked against an off-the-shelf
+SMT solver, and returns UNKNOWN for anything outside its fragment rather than
+guessing. Every file open it authorizes, and every lookup it decides, carries a
+certificate that a small, independently written checker must accept before the
+call takes effect. Lookups of the directories leading to an allowed path, and of
+descriptors the agent already holds, are answered without a decision.
+Connects, datagram sends and every launch after the agent's own are refused,
+whatever the policy says. Every verdict is one of three — **SATISFIED**,
+**UNSATISFIED**, or **UNKNOWN** — and it fails closed: a paused call that cannot
+be proven allowed never runs. System calls the kernel filter admits without
+asking (memory, time, threads, and reads and writes on descriptors the agent
+already holds, whether the Warden opened them or the agent made them, such as
+sockets and pipes) run undecided, and the rest are refused outright.
 
 The design premise is a clinical one: you do not deploy a system that is
 *usually* right when the cost of being wrong is unbounded. UNKNOWN is therefore a
@@ -30,7 +48,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.17.0.**
+   **Current release: v1.18.0.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -54,8 +72,11 @@ silent default.
 | **UNKNOWN** | Cannot be decided either way within bounds. | **Fail closed** — never coerced to a pass. |
 
 A two-state allow/deny system must convert every UNKNOWN into a false allow or a
-false block. VAREK refuses that conversion: UNKNOWN routes to a deterministic,
-policy-declared disposition and never requires a human to break a loop (see
+false block. VAREK refuses that conversion. In the running agent an UNKNOWN is
+refused, like an UNSATISFIED (symmetric suppression). At the `--plan` gate with a
+`--flow-policy`, it goes to the deterministic disposition that policy declares,
+and the Warden refuses to start unless a check at load time certifies that every
+refusal ends in an automated outcome, so none needs a human to break a loop (see
 progress-safety, below). That refusal is what separates a verifier from a
 heuristic — nothing is SATISFIED unless it is provably safe.
 
@@ -64,32 +85,41 @@ heuristic — nothing is SATISFIED unless it is provably safe.
 ### What it does
 
 Warden sits between an agent framework and the operating system. Before contained
-code performs `execve`, `subprocess.run`, network egress, or other boundary
-syscalls, the verdict for the corresponding action-graph is decided and enforced
-at the kernel. This is structural containment — not a string-match denylist that
+code opens or looks up a file, connects, sends a datagram or launches a program,
+the Warden decides that call and enforces the verdict at the kernel; with
+`--plan`, the whole declared action-graph is also checked before the agent
+starts. This is structural containment — not a string-match denylist that
 falls to absolute paths, base64 encoding, or renamed binaries.
 
 The runtime line has progressed well beyond simple syscall containment:
 
 - **v1.7 — cross-action data-flow verification.** Reasoning across edges of the
-  action-graph, not just per-action checks.
-- **v1.8.2 — bounded-refusal breaker.** A non-bypassable loop bound in the
-  trusted boundary, keyed by `(session, action-signature)`, so a stuck or
-  adversarial planner cannot resubmit a refused action-graph forever. Each verdict
-  stays a pure function of `(plan, policy)`; the breaker only interprets the
-  *sequence* of verdicts.
+  action-graph, not just per-action checks. Run by the Warden's `--plan` gate
+  with `--flow-policy` since v1.18.0; through v1.17.0 it was a library with tests
+  that the Warden did not call.
+- **v1.8.2 — bounded-refusal breaker.** A loop bound in the trusted boundary,
+  keyed by `(session, action-graph signature)`, so a stuck planner cannot
+  resubmit the same refused action-graph forever: after the policy's refusal
+  budget, the outcome is a declared terminal (deny, or a pre-authorized action).
+  Each verdict stays a pure function of `(plan, policy)`; the breaker only
+  interprets the *sequence* of verdicts. In the Warden since v1.18.0, with its
+  counts kept across runs in a state file the agent cannot reach. A planner that
+  submits a different graph each time is counted per graph, not in total.
 - **v1.9.0 — progress-safety / HOOTL.** A load-time liveness proof that certifies
   human-out-of-the-loop operation per policy: for every non-authorizing verdict,
   a deterministic, automated terminal outcome is reachable in finitely many steps.
-  "Never requires a human" becomes certified rather than hoped.
+  "Never requires a human" becomes certified rather than hoped. Since v1.18.0 the
+  Warden runs it on the `--flow-policy` at startup and refuses to start if it
+  fails.
 - **v1.16.2 — off-host anchor.** An anchor on the Warden's own host does not protect against that host's root, who also holds the signing key. `tools/varek_anchor_forward.py` sends each checkpoint off the host within about a second (spooling through outages) to an append-only receiver set up by `tools/varek_anchor_receiver.sh` — an SSH account that can only append well-formed anchor lines to a `chattr +a` file — or to any command. The preflight now checks the forwarder is running and warns when the anchor or the key leave that gap open. See [`RELEASE-v1.16.2.md`](./RELEASE-v1.16.2.md).
+- **v1.18.0 — the claims and the code agree.** A review listed ten places where the published claims and the code disagreed; each is fixed in the code or in the claim. The `--plan` gate now runs the v1.7 data-flow check, the v1.8.2 refusal breaker and the v1.9 progress-safety check (`--flow-policy`; the breaker's counts persist across runs in a state file the agent cannot reach), which through v1.17.0 were a library the Warden did not call, and it refuses connect and launch steps the runtime would refuse. Flow rules can match a URL's host (`match url.host`) instead of a whole-URL glob that matched outside hosts. The CycloneDX export's attestation is derived from the stream, checks the policy file, can be signed (JSF, Ed25519) and is tested against the CycloneDX 1.6 schema. Refusal records name `EACCES`, the errno sent. Release notes, CHANGELOG and the spec paper are corrected where they described code that was never committed, and figures without a record are re-measured or restated. See [`RELEASE-v1.18.0.md`](./RELEASE-v1.18.0.md).
 - **v1.17.0 — closing three live gaps.** The signing key, the anchor and the verdict stream are refused by identity (device and inode) on every open and lookup, so a bind mount or hard link into an allowed tree no longer reaches them; raw storage and memory devices are refused the same way whatever the policy says. `stat`, `statx`, `access` and `readlink` are mediated like opens: decided, certified, recorded and answered by the Warden, where they were admitted and unlogged. The agent runs as an unprivileged user with no capabilities (`--run-as`, default `nobody`), where it ran as root with every capability. Adds `make test-v1170` (48 checks). See [`RELEASE-v1.17.0.md`](./RELEASE-v1.17.0.md).
 - **v1.16.3 — the Verdict Service's plan checker, in the repository.** `v1_6/plan_verify_cli.c` (`make -C v1_6 plan_verify`) is the file-in / JSON-out front end the VAREK Verdict Service runs; its source had existed only on the service host. Its JSON output is now escaped: before, a crafted target could make the output read as SATISFIED when the evaluator had decided UNSATISFIED. See [`RELEASE-v1.16.3.md`](./RELEASE-v1.16.3.md).
 - **v1.16.1 — deployment preflight.** `tools/varek_preflight.sh` checks a deployment before it runs: the build dependencies (libsodium is new in v1.16; `make deps` installs them), the build, the policy, and every location the Warden refuses at startup — the verdict stream file, the signing key, the anchor — checked with the Warden's own rules, plus an optional audited trial run. All seven shipped policies pass with the stream in `/var/log/varek/`. A CI job builds the Warden with libseccomp and libsodium. See [`RELEASE-v1.16.1.md`](./RELEASE-v1.16.1.md).
 - **v1.16.0 — a verdict stream its holder cannot rewrite, and a bound on every decision.** Addresses the two limits v1.15.0 disclosed. Every record is hash-chained; with `--sign-key`, run_start, a checkpoint every 64 records and run_end are signed with Ed25519; with `--anchor`, each checkpoint is also appended to storage the log's holder cannot rewrite. `tools/varek_audit.py --pubkey --anchor` then catches any edit, insertion, removal or reordering before the last signature, and a stream cut short, by someone without the key, and any rewrite of anchored history even by someone with it; it verifies signatures with its own pure-Python RFC 8032 verifier. The Warden refuses to start if the policy would let the agent open the key, the anchor, the verdict stream itself or a raw disk. Globs are capped at 4,096 tokens per policy, which bounds the work of one decision; the worst case measured is about 26 ms median in the live Warden (v1.15's checker alone: 415 ms), and real policies are unchanged. See [`RELEASE-v1.16.0.md`](./RELEASE-v1.16.0.md).
 - **v1.15.0 — certificates: every authorization independently checked.** Third release of the v1.10 verification program. Every SATISFIED verdict now carries a certificate — the deciding rule and a witness that its constant matches — and the Warden authorizes the action only if a separately written checker accepts it (`checker/vdp_checker.c`: about 540 lines, its own policy parser and matchers, no code shared with the decision procedure). A bug confined to the decision procedure can no longer authorize an action: a test build with a planted bug shows the checker refusing its wrong verdicts. Certificates and the policy's SHA-256 go into the verdict stream, and `tools/varek_audit.py` re-checks a saved run without trusting the Warden that made it. See [`RELEASE-v1.15.0.md`](./RELEASE-v1.15.0.md).
 - **v1.14.0 — the bounded string fragment.** Second release of the v1.10 verification program. Path and exec rules take a matcher before the constant — `exact`, `prefix` (the default), `suffix`, `contains` or `glob` (`?`, `[...]`, `*`, `**`, and `/**/` for any number of segments) — so a policy can deny a kind of file wherever it appears under an allowed tree: private keys (`suffix .pem`), dotenv files at any depth (`glob /**/.env`), a patient's psychotherapy notes. Matching is on the resolved canonical path, so a symlink with an innocent name is decided as its target. Globs compile to a small automaton stepped word-parallel (well under a microsecond added per decision; bounded worst case). At load the Warden decides exactly, by an automaton search bounded at the 4095-byte length limit, whether each rule can ever fire, and `vdp_check analyze` prints a shortest witness for each rule that can. The cross-check adds an independent derivative-based procedure for reachability alongside the solver. Every v1.13 policy keeps its meaning (checked against the v1.13.0 build). The example sector policies now deny key material, dotenv files and `.ssh` under every allowed tree, plus sector-specific paths. See [`RELEASE-v1.14.0.md`](./RELEASE-v1.14.0.md).
-- **v1.13.0 — the SMT decision procedure in the enforcement path.** First release of the v1.10 verification program. Every Warden decision is now made by an SMT decision procedure over a quantifier-free fragment of bounded strings (the object) and 32-bit bitvectors (the open flags), with a fragment boundary that returns UNKNOWN rather than guessing. Policies can now say read-only (`readonly`, `access=`, `+O_…`/`-O_…`); through v1.12 a path rule admitted every open flag, so the example sector policies' "(read)" rules and loader rules admitted writes by a root agent — they now enforce read-only. At load the Warden reports every rule that can never fire (it found one in four example policies). The procedure is cross-checked against an off-the-shelf SMT solver (zero disagreements over 26,624 checks, `make crosscheck`), and a verdict-distribution harness gates on `unsafe_satisfied == 0`: on its synthetic seed corpus v1.13 clears 85.4% of safe file opens with none unsafe authorized, where the policies as v1.12.4 shipped them cleared 75.6% and authorized 24 unsafe opens. Flag clauses constrain the flags passed to `openat()` (`readonly` is sound; `fcntl` can change `O_APPEND` and a few others later). Median latency unchanged. See [`RELEASE-v1.13.0.md`](./RELEASE-v1.13.0.md).
+- **v1.13.0 — the SMT decision procedure in the enforcement path.** First release of the v1.10 verification program. Every file-open decision (correction, v1.18.0: through v1.13.0 this said every Warden decision; datagram sends and the agent's own launch are not decided by it, and connects and later launches are refused whatever it says) is now made by an SMT decision procedure over a quantifier-free fragment of bounded strings (the object) and 32-bit bitvectors (the open flags), with a fragment boundary that returns UNKNOWN rather than guessing. Policies can now say read-only (`readonly`, `access=`, `+O_…`/`-O_…`); through v1.12 a path rule admitted every open flag, so the example sector policies' "(read)" rules and loader rules admitted writes by a root agent — they now enforce read-only. At load the Warden reports every rule that can never fire (it found one in four example policies). The procedure is cross-checked against an off-the-shelf SMT solver (zero disagreements over 26,624 checks, `make crosscheck`), and a verdict-distribution harness gates on `unsafe_satisfied == 0`: on its synthetic seed corpus v1.13 clears 85.4% of safe file opens with none unsafe authorized, where the policies as v1.12.4 shipped them cleared 75.6% and authorized 24 unsafe opens. Flag clauses constrain the flags passed to `openat()` (`readonly` is sound; `fcntl` can change `O_APPEND` and a few others later). Median latency unchanged. See [`RELEASE-v1.13.0.md`](./RELEASE-v1.13.0.md).
 - **v1.12.4 — the `--plan` gate authorizes file opens again.** Optional pre-execution plan verification had rejected every plan that declared a `file_open` action since v1.12.0: the per-open decision moved to the resolved canonical path, but the plan decider (which runs before the agent is forked) never filled it, so every file-open node was UNKNOWN. The decider now decides on the lexically canonical form of the declared absolute path, so a plan opening a policy-allowed file verifies again; a `..` that lexically escapes, or a relative path, stays UNKNOWN. The gate does not follow symlinks (there is no agent yet) and remains an advisory pre-check — every open is still mediated per-syscall at runtime. Adds `make test-v1124`. See [`RELEASE-v1.12.4.md`](./RELEASE-v1.12.4.md).
 - **v1.12.3 — dynamically linked agents.** Follows ordinary symlinks and decides policy on the object's canonical path, so a dynamically linked agent (CPython, a JVM, Node) can load its libraries — since v1.12.0 the resolver refused any path with a symlink, and on merged-`/usr` systems `/lib` and library SONAMEs are symlinks. The security property is unchanged: a symlink to a denied object is decided as that object and refused. `/proc/self` and `/proc/thread-self` are mapped to the agent's own process (never the Warden's), and any other process's `/proc`, or a procfs reached through a planted symlink, fails closed. Because the decision is on the canonical path, `allow path` prefixes name canonical locations (`/usr/lib/`, not `/lib/`). Adds `make test-v1123`. See [`RELEASE-v1.12.3.md`](./RELEASE-v1.12.3.md).
 - **v1.12.2 — threads and child processes.** Agent code can now start threads, wait for its children and call `isatty()`. `clone3` answers `ENOSYS` instead of killing the process (glibc >= 2.34 creates every thread with it), so libc falls back to `clone()`, whose flags the filter checks; `clone3` still never runs and the namespace denials are unchanged. `wait4`/`waitid` are admitted, and `ioctl` is admitted for six read-or-own-descriptor requests (`TIOCSTI` and the rest stay refused). A filter-killed agent is now reported. Also closes an exec-allowlist bypass: the launch exec, answered with `CONTINUE`, was granted once per pid, so a thread could race its path; it is now granted once per run. Adds `make test-v1122`. Known issue: dynamically linked agents cannot yet load their libraries (symlinked paths are refused since v1.12.0); planned for v1.12.3. See [`RELEASE-v1.12.2.md`](./RELEASE-v1.12.2.md).
@@ -102,8 +132,9 @@ The runtime line has progressed well beyond simple syscall containment:
   time-of-check-to-time-of-use (TOCTOU) race from file mediation: the supervisor
   resolves the approved path and injects the descriptor rather than letting the
   syscall re-read attacker-mutable memory. Measured against a race harness, the
-  prior approve-then-continue strategy leaked the protected target 510 times in
-  20,000 attempts; the resolve-and-inject strategy leaked 0. `connect`/`execve`
+  prior approve-then-continue strategy leaked the protected target (1,848 to
+  1,889 times in 20,000 attempts on a 2-vCPU host, re-measured for v1.18.0; the
+  510 quoted here before has no record); the resolve-and-inject strategy leaked 0. `connect`/`execve`
   are deny-only (fail closed) pending the v1.10 dial-and-inject path. See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
@@ -340,7 +371,7 @@ different risks at different points in the stack.
 - [x] **v1.7** — Cross-action data-flow verification
 - [x] **v1.8.2** — Bounded-refusal breaker
 - [x] **v1.9.0** — Progress-safety / HOOTL liveness proof
-- [x] **v1.9.1** — Enforcement hardening: io_uring closed; TOCTOU-safe file mediation (510→0); `connect`/`execve` deny-only
+- [x] **v1.9.1** — Enforcement hardening: io_uring closed; TOCTOU-safe file mediation (race-harness leaks → 0); `connect`/`execve` deny-only
 - [x] **v1.9.2** — Mediation completeness: default-deny allowlist; native-ABI/x32 lockdown; hard-deny set; `CLONE_NEWUSER` denial; live-Warden integration + conformance validation
 - [x] **v1.9.3** — Lifecycle coupling in the live Warden: PID-namespace isolation, death-signal coupling, fork-race guard, pidfd watch; crash test
 - [x] **v1.12** — Mediation correctness: resolve-then-decide (traversal / symlink / `/proc/self`), audit-log integrity, datagram-egress mediation; authorization-evidence export in the CycloneDX 1.6 format
@@ -356,6 +387,7 @@ different risks at different points in the stack.
 - [x] **v1.16.2** — Off-host anchor: forwarder (FIFO → spool → SSH or any command), append-only receiver, systemd unit; preflight checks
 - [x] **v1.16.3** — Verdict Service plan checker (`plan_verify`) in the repository; JSON output escaped
 - [x] **v1.17.0** — Protected files refused by identity; stat/access/readlink mediated; agent unprivileged
+- [x] **v1.18.0** — Claims and code agree: data-flow, breaker and progress checks in the Warden's plan gate; URL host matching; derived, signed, schema-tested CycloneDX export; corrected records and figures
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
 
@@ -404,23 +436,28 @@ schema, and one note per fragment.
 
 ## Testing
 
-Language test suite — 659 passing across versions:
+Language test suites, as each archived release runs them (counted for v1.18.0,
+Python 3.11; through v1.17.0 this table said 109 tests for v0.1 and 659 passing
+in all):
 
-| Component | Tests |
-|-----------|------:|
-| v0.1 — Lexer + Parser + AST | 109 |
-| v0.2 — Type System + HM Inference | 163 |
-| v0.3 — LLVM Codegen | 97 |
-| v0.4 — Standard Library | 182 |
-| v1.0 — Package Manager + REPL | 108 |
-| **Total** | **659** |
+| Component | Tests | Passing |
+|-----------|------:|--------:|
+| v0.1 — Lexer + Parser + AST | 91 | 88 (2 fail; 1 hangs) |
+| v0.2 — Type System + HM Inference | 163 | 163 |
+| v0.3 — LLVM Codegen | 97 | 97 |
+| v0.4 — Standard Library | 182 | 173 (9 fail: unfinished `syn::` to `var::` rename) |
+| v1.0 — Package Manager + REPL | 108 | 108 |
+| **Total** | **641** | **629** |
 
 Runtime test suites are version-scoped and run clean under
 `-fsanitize=address,undefined` — e.g. the v1.8.2 breaker (19/19) and the v1.9
-progress-safety verifier (10/10). v1.9.1 enforcement is measured directly by a
-TOCTOU race harness (`tests/seccomp_toctou_harness.c`): 510 sentinel leaks in
-20,000 attempts for approve-then-continue versus 0 for resolve-and-inject, with
-io_uring denial checked under the Warden filter. Build and run with `make check`
+progress-safety verifier (10/10), both in `make -C v1_7 check` since v1.18.0.
+v1.9.1 enforcement is measured directly by a TOCTOU race harness
+(`tests/seccomp_toctou_harness.c`): in three runs of 20,000 attempts on a 2-vCPU
+host, approve-then-continue leaked the protected file 1,848 to 1,889 times and
+resolve-and-inject leaked it 0 times (`tests/toctou_results_v1.18.0.txt`; the
+count depends on the host). io_uring is denied by the live Warden filter
+(`varek/v1_4/tests/test_v14_filter`, v1.18.0). Build and run with `make check`
 in the relevant version directory. Containment verification: `python
 verify_guardrails.py` (see above).
 

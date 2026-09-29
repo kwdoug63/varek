@@ -1,0 +1,19 @@
+VAREK seccomp user-notify TOCTOU harness (tests/seccomp_toctou_harness.c)
+Recorded for v1.18.0, 2026-09-29T12:55:59Z
+Host: Linux 6.18.44-fc-v49 x86_64, 2 vCPU
+Command: ./seccomp_toctou_harness --naive 20000   (three runs)
+         ./seccomp_toctou_harness --mitigated 20000   (three runs)
+
+naive (approve-then-CONTINUE, the kernel re-reads the path):
+[target ] iterations=20000  opens_succeeded=2728  sentinel_leaks=1870
+[target ] iterations=20000  opens_succeeded=2651  sentinel_leaks=1889
+[target ] iterations=20000  opens_succeeded=2665  sentinel_leaks=1848
+
+mitigated (resolve, decide, inject the descriptor):
+[target ] iterations=20000  opens_succeeded=3697  sentinel_leaks=0
+[target ] iterations=20000  opens_succeeded=4209  sentinel_leaks=0
+[target ] iterations=20000  opens_succeeded=3652  sentinel_leaks=0
+
+The leak count depends on the host's scheduling; what is stable is that the
+naive supervisor leaks and the mitigated one does not. The "510 leaks in 20,000
+attempts" quoted through v1.17.0 has no recorded run in the repository.

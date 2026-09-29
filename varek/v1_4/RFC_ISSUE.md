@@ -144,7 +144,7 @@ inherit a known-good pattern than invent a new one.
 - General code review of VAREK at large.
 - Policy-language design feedback.
 - Performance discussion (separate issue, separate benchmarks).
-- Anything about the SMT/Z3 layer above the seccomp supervisor.
+- Anything about the SMT layer above the seccomp supervisor.
 - Anything outside the seccomp-unotify enforcement path.
 
 ## How to engage

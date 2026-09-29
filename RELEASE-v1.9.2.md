@@ -74,7 +74,7 @@ granted capability cannot leak across `execve`. New:
 - `docs/security/v1.9.2-baseline-allowlist.md` — allowlist rationale and
   class-to-syscall map.
 - `docs/security/v1.10-architecture-roadmap.md` — the model/TCB-changing track.
-- `v1_7/warden_landlock.c` — v1.10 skeleton (not wired into v1.9.2).
+- `v1_7/warden_landlock.c` — v1.10 skeleton (not wired into v1.9.2). *(Correction, v1.18.0: this file was never committed. Landlock is not implemented; the design is in `docs/security/v1.10-architecture-roadmap.md`.)*
 
 ## Changed
 

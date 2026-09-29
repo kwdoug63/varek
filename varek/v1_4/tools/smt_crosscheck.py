@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: MIT
 """
 smt_crosscheck.py — differential check of the Warden's SMT decision procedure
-(smt_decide.c, driven through tools/vdp_check) against an SMT solver (Z3).
+(smt_decide.c, driven through tools/vdp_check) against an off-the-shelf SMT
+solver (the reference solver: its Python package is listed in
+tools/requirements-crosscheck.txt and imported below as `smt`).
 
 The policy is re-parsed here independently of the C parser and encoded in the
 solver's string and bitvector theories:
@@ -41,7 +43,7 @@ import subprocess
 import sys
 import tempfile
 
-import z3
+import z3 as smt  # the reference SMT solver; see tools/requirements-crosscheck.txt
 
 L = 4095
 KNOWN = 0x007FFFC3
@@ -78,7 +80,7 @@ def is_flag_clause(t):
 # ------------------------------------------------------------ regex terms --
 # A small regular-expression algebra over bytes 1..255, used three ways: as the
 # meaning of a glob (written from the grammar in smt_decide.h, independently of
-# the C token machine), translated to Z3's regex theory, and decided directly by
+# the C token machine), translated to the solver's regex theory, and decided directly by
 # Brzozowski derivatives (the bounded-length reachability fallback below).
 # Terms are interned integers so hashing and equality are O(1).
 
@@ -491,7 +493,7 @@ def parse_lines(raw_lines, path):
 
 # ---------------------------------------------------------------- encoding --
 
-# Every solver object of one policy lives in its own Z3 context, dropped when
+# Every solver object of one policy lives in its own solver context, dropped when
 # the policy is done: a single global context accumulates every term of every
 # query (gigabytes with near-bound constants).
 CTX = None
@@ -499,106 +501,106 @@ CTX = None
 
 def new_context():
     global CTX
-    CTX = z3.Context()
+    CTX = smt.Context()
 
 
 def zstr(s):
-    """A Z3 string literal for s. z3.StringVal decodes \\u{..} escape sequences;
+    """A solver string literal for s. smt.StringVal decodes \\u{..} escape sequences;
     escaping every backslash as \\u{5c} makes it take s byte for byte."""
-    return z3.StringVal(s.replace("\\", "\\u{5c}"), ctx=CTX)
+    return smt.StringVal(s.replace("\\", "\\u{5c}"), ctx=CTX)
 
 
 def _byte_re():
-    return z3.Range(chr(1), chr(255), ctx=CTX)
+    return smt.Range(chr(1), chr(255), ctx=CTX)
 
 
 def fdomain(f):
     """Admissible flags: ABI bits only, and not access mode 3."""
-    return z3.And((f & z3.BitVecVal(~KNOWN & 0xFFFFFFFF, 32, ctx=CTX)) == 0,
-                  (f & z3.BitVecVal(ACC, 32, ctx=CTX)) != z3.BitVecVal(ACC, 32, ctx=CTX))
+    return smt.And((f & smt.BitVecVal(~KNOWN & 0xFFFFFFFF, 32, ctx=CTX)) == 0,
+                  (f & smt.BitVecVal(ACC, 32, ctx=CTX)) != smt.BitVecVal(ACC, 32, ctx=CTX))
 
 
 def domain(s, f):
-    return z3.And(z3.Length(s) <= L, z3.InRe(s, z3.Star(_byte_re())), fdomain(f))
+    return smt.And(smt.Length(s) <= L, smt.InRe(s, smt.Star(_byte_re())), fdomain(f))
 
 
-def set_to_z3(s):
-    """A byte set as a union of Z3 character ranges."""
+def set_to_smt(s):
+    """A byte set as a union of the solver's character ranges."""
     b = sorted(s)
     runs, lo = [], b[0]
     for x, y in zip(b, b[1:] + [None]):
         if y != x + 1:
-            runs.append(z3.Range(chr(lo), chr(x), ctx=CTX))
+            runs.append(smt.Range(chr(lo), chr(x), ctx=CTX))
             if y is not None:
                 lo = y
-    return runs[0] if len(runs) == 1 else z3.Union(*runs)
+    return runs[0] if len(runs) == 1 else smt.Union(*runs)
 
 
-def rx_to_z3(rx, a, memo=None):
+def rx_to_smt(rx, a, memo=None):
     memo = {} if memo is None else memo
     if a in memo:
         return memo[a]
     n = rx.node[a]
     k = n[0]
     if k == "0":
-        r = z3.Empty(z3.ReSort(z3.StringSort(ctx=CTX)))
+        r = smt.Empty(smt.ReSort(smt.StringSort(ctx=CTX)))
     elif k == "e":
-        r = z3.Re(zstr(""))
+        r = smt.Re(zstr(""))
     elif k == "c":
-        r = set_to_z3(n[1])
+        r = set_to_smt(n[1])
     elif k == "l":
-        r = z3.Re(zstr(n[1][n[2]:]))
+        r = smt.Re(zstr(n[1][n[2]:]))
     elif k == ".":
-        r = z3.Concat(rx_to_z3(rx, n[1], memo), rx_to_z3(rx, n[2], memo))
+        r = smt.Concat(rx_to_smt(rx, n[1], memo), rx_to_smt(rx, n[2], memo))
     elif k == "*":
-        r = z3.Star(rx_to_z3(rx, n[1], memo))
+        r = smt.Star(rx_to_smt(rx, n[1], memo))
     elif k == "|":
-        r = z3.Union(*[rx_to_z3(rx, x, memo) for x in n[1]])
+        r = smt.Union(*[rx_to_smt(rx, x, memo) for x in n[1]])
     elif k == "&":
-        r = z3.Intersect(*[rx_to_z3(rx, x, memo) for x in n[1]])
+        r = smt.Intersect(*[rx_to_smt(rx, x, memo) for x in n[1]])
     else:
-        r = z3.Complement(rx_to_z3(rx, n[1], memo))
+        r = smt.Complement(rx_to_smt(rx, n[1], memo))
     memo[a] = r
     return r
 
 
 def str_atom(rx, r, s):
-    """Ground / symbolic-flag encoding: Z3's string functions, and its regex
+    """Ground / symbolic-flag encoding: the solver's string functions, and its regex
     membership for globs."""
     c = zstr(r["c"])
     op = r["op"]
     if op == "prefix":
-        return z3.PrefixOf(c, s)
+        return smt.PrefixOf(c, s)
     if op == "eq":
         return s == c
     if op == "suffix":
-        return z3.SuffixOf(c, s)
+        return smt.SuffixOf(c, s)
     if op == "contains":
-        return z3.Contains(s, c)
+        return smt.Contains(s, c)
     if op == "glob":
-        return z3.InRe(s, rx_to_z3(rx, r["rx"]))
+        return smt.InRe(s, rx_to_smt(rx, r["rx"]))
     if ":" in r["c"]:
         return s == c
-    return z3.Or(s == c, z3.PrefixOf(zstr(r["c"] + ":"), s))
+    return smt.Or(s == c, smt.PrefixOf(zstr(r["c"] + ":"), s))
 
 
 def bv_atom(r, f):
     if r["mask"] == 0:
-        return z3.BoolVal(True, ctx=CTX)
-    return (f & z3.BitVecVal(r["mask"], 32, ctx=CTX)) == z3.BitVecVal(r["value"], 32, ctx=CTX)
+        return smt.BoolVal(True, ctx=CTX)
+    return (f & smt.BitVecVal(r["mask"], 32, ctx=CTX)) == smt.BitVecVal(r["value"], 32, ctx=CTX)
 
 
 def fires_first(rx, rules, idx, s, f):
     """Rule idx holds and no earlier rule of its kind holds."""
     k = rules[idx]["kind"]
-    here = z3.And(str_atom(rx, rules[idx], s), bv_atom(rules[idx], f))
-    before = [z3.Not(z3.And(str_atom(rx, r, s), bv_atom(r, f)))
+    here = smt.And(str_atom(rx, rules[idx], s), bv_atom(rules[idx], f))
+    before = [smt.Not(smt.And(str_atom(rx, r, s), bv_atom(r, f)))
               for r in rules[:idx] if r["kind"] == k]
-    return z3.And(here, *before)
+    return smt.And(here, *before)
 
 
 def check(*fs, timeout=20000):
-    so = z3.Solver(ctx=CTX)
+    so = smt.Solver(ctx=CTX)
     so.set("timeout", timeout)
     so.add(*fs)
     return so.check(), so
@@ -606,17 +608,17 @@ def check(*fs, timeout=20000):
 
 def sat(*fs):
     r, _ = check(*fs)
-    if r == z3.unknown:
+    if r == smt.unknown:
         raise RuntimeError("solver returned unknown (timeout)")
-    return r == z3.sat
+    return r == smt.sat
 
 
 def oracle_first(rx, rules, kind, sval, fval):
     """Index of the first rule that holds on the concrete action, None if no
     rule holds, or 'OUT' if the action is outside the fragment."""
-    s, f = z3.String("s", ctx=CTX), z3.BitVec("f", 32, ctx=CTX)
+    s, f = smt.String("s", ctx=CTX), smt.BitVec("f", 32, ctx=CTX)
     fv = fval if (kind == "path" and fval is not None) else 0
-    pin = [s == zstr(sval), f == z3.BitVecVal(fv, 32, ctx=CTX)]
+    pin = [s == zstr(sval), f == smt.BitVecVal(fv, 32, ctx=CTX)]
     if not sat(domain(s, f), *pin):
         return "OUT"
     for i, r in enumerate(rules):
@@ -636,24 +638,24 @@ def oracle_ground(rx, rules, kind, sval, fval):
 
 def oracle_symbolic(rx, rules, sval):
     """path, concrete s, symbolic f. SATISFIED iff every admissible f is."""
-    s, f = z3.String("s", ctx=CTX), z3.BitVec("f", 32, ctx=CTX)
+    s, f = smt.String("s", ctx=CTX), smt.BitVec("f", 32, ctx=CTX)
     pin = s == zstr(sval)
     if not sat(domain(s, f), pin):
         return "UNKNOWN"
     idx = [i for i, r in enumerate(rules) if r["kind"] == "path"]
-    allow_first = z3.Or([fires_first(rx, rules, i, s, f) for i in idx
-                         if rules[i]["verb"] == "allow"] or [z3.BoolVal(False, ctx=CTX)])
-    deny_first = z3.Or([fires_first(rx, rules, i, s, f) for i in idx
-                        if rules[i]["verb"] == "deny"] or [z3.BoolVal(False, ctx=CTX)])
-    if not sat(domain(s, f), pin, z3.Not(allow_first)):
+    allow_first = smt.Or([fires_first(rx, rules, i, s, f) for i in idx
+                         if rules[i]["verb"] == "allow"] or [smt.BoolVal(False, ctx=CTX)])
+    deny_first = smt.Or([fires_first(rx, rules, i, s, f) for i in idx
+                        if rules[i]["verb"] == "deny"] or [smt.BoolVal(False, ctx=CTX)])
+    if not sat(domain(s, f), pin, smt.Not(allow_first)):
         return "SATISFIED"
-    if not sat(domain(s, f), pin, z3.Not(deny_first)):
+    if not sat(domain(s, f), pin, smt.Not(deny_first)):
         return "UNSATISFIED"
     return "UNKNOWN"
 
 
 # Reachability, legacy atoms (prefix / exact / host): a length n and one 8-bit
-# vector per character position. Z3's string theory does not finish on
+# vector per character position. The solver's string theory does not finish on
 # conjunctions of many negated prefixof constraints (the same tail pathology
 # v1.5 measured), while this encoding is plain QF_BV + linear integer
 # arithmetic. It is exact: every atom reads only positions below
@@ -663,8 +665,8 @@ def oracle_symbolic(rx, rules, sval):
 class ByteStr:
     def __init__(self, rules):
         m = max([len(r["c"]) + 1 for r in rules] + [1]) + 1
-        self.n = z3.Int("n", ctx=CTX)
-        self.b = [z3.BitVec(f"b{k}", 8, ctx=CTX) for k in range(m)]
+        self.n = smt.Int("n", ctx=CTX)
+        self.b = [smt.BitVec(f"b{k}", 8, ctx=CTX) for k in range(m)]
 
     def domain(self):
         # Length bound only. The byte range 1..255 needs no constraint: atoms
@@ -674,14 +676,14 @@ class ByteStr:
         # position (at most 222 values can occur). Dropping the ~4,100
         # implications a near-bound constant needed keeps the query fast; the
         # encoding stays exact.
-        return z3.And(self.n >= 0, self.n <= L)
+        return smt.And(self.n >= 0, self.n <= L)
 
     def prefix(self, c):
-        return z3.And(self.n >= len(c),
+        return smt.And(self.n >= len(c),
                       *[self.b[k] == ord(ch) for k, ch in enumerate(c)])
 
     def eq(self, c):
-        return z3.And(self.n == len(c), self.prefix(c))
+        return smt.And(self.n == len(c), self.prefix(c))
 
 
 def str_atom_bytes(r, bs):
@@ -695,8 +697,8 @@ def str_atom_bytes(r, bs):
     # identical; the solver times out on the unfactored disjunction of two long
     # conjunctions (a 4 KB constant) and answers the factored form instantly.
     k = len(c)
-    at_k = bs.b[k] == ord(":") if k < len(bs.b) else z3.BoolVal(False, ctx=CTX)
-    return z3.And(bs.prefix(c), z3.Or(bs.n == k, z3.And(bs.n >= k + 1, at_k)))
+    at_k = bs.b[k] == ord(":") if k < len(bs.b) else smt.BoolVal(False, ctx=CTX)
+    return smt.And(bs.prefix(c), smt.Or(bs.n == k, smt.And(bs.n >= k + 1, at_k)))
 
 
 LEGACY_OPS = ("prefix", "eq", "host")
@@ -706,21 +708,21 @@ def oracle_reach_bytes(rules, i):
     k = rules[i]["kind"]
     rs = [r for r in rules[:i + 1] if r["kind"] == k]
     bs = ByteStr(rs)
-    f = z3.BitVec("f", 32, ctx=CTX)
-    here = z3.And(str_atom_bytes(rules[i], bs), bv_atom(rules[i], f))
-    before = [z3.Not(z3.And(str_atom_bytes(r, bs), bv_atom(r, f)))
+    f = smt.BitVec("f", 32, ctx=CTX)
+    here = smt.And(str_atom_bytes(rules[i], bs), bv_atom(rules[i], f))
+    before = [smt.Not(smt.And(str_atom_bytes(r, bs), bv_atom(r, f)))
               for r in rules[:i] if r["kind"] == k]
     return "REACHABLE" if sat(bs.domain(), fdomain(f), here, *before) else "DEAD"
 
 
 # Reachability with suffix / contains / glob atoms. Two independent deciders:
 #
-#  (1) Z3's regex theory, WITHOUT the length bound (with it, Z3 unrolls to the
+#  (1) the solver's regex theory, WITHOUT the length bound (with it, the solver unrolls to the
 #      bound and does not finish on near-bound constants). UNSAT means DEAD at
 #      any length. SAT with a model of length <= L means REACHABLE. SAT with a
 #      longer model, or a timeout, is inconclusive for the bounded question.
 #  (2) Brzozowski derivatives over the terms above: breadth-first to depth L,
-#      so the bound is exact. The flags are handled by Z3: every satisfiable
+#      so the bound is exact. The flags are handled by the solver: every satisfiable
 #      signature (which earlier rules' flag atoms hold, given B_i) is
 #      enumerated, and the string question is asked for each one.
 #
@@ -728,18 +730,18 @@ def oracle_reach_bytes(rules, i):
 # is conclusive.
 
 def flag_signatures(rules, i, earlier):
-    f = z3.BitVec("f", 32, ctx=CTX)
-    so = z3.Solver(ctx=CTX)
+    f = smt.BitVec("f", 32, ctx=CTX)
+    so = smt.Solver(ctx=CTX)
     so.add(fdomain(f), bv_atom(rules[i], f))
     atoms = [bv_atom(rules[j], f) for j in earlier]
     out = []
-    while so.check() == z3.sat:
+    while so.check() == smt.sat:
         m = so.model()
-        sig = tuple(z3.is_true(m.eval(a, model_completion=True)) for a in atoms)
+        sig = tuple(smt.is_true(m.eval(a, model_completion=True)) for a in atoms)
         fv = m.eval(f, model_completion=True).as_long()
         out.append((sig, fv))
-        so.add(z3.Or([a if not v else z3.Not(a) for a, v in zip(atoms, sig)] or
-                     [z3.BoolVal(False, ctx=CTX)]))
+        so.add(smt.Or([a if not v else smt.Not(a) for a, v in zip(atoms, sig)] or
+                     [smt.BoolVal(False, ctx=CTX)]))
     return out
 
 
@@ -754,16 +756,16 @@ def oracle_reach_rx(rx, rules, i, stats):
         if rx.shortest(q, L) is not None:
             deriv = "REACHABLE"
             break
-    # (1) Z3 regex, unbounded
-    s, f = z3.String("s", ctx=CTX), z3.BitVec("f", 32, ctx=CTX)
+    # (1) the solver's regex theory, unbounded
+    s, f = smt.String("s", ctx=CTX), smt.BitVec("f", 32, ctx=CTX)
     memo = {}
-    here = z3.And(z3.InRe(s, rx_to_z3(rx, rules[i]["lang"], memo)), bv_atom(rules[i], f))
-    before = [z3.Not(z3.And(z3.InRe(s, rx_to_z3(rx, rules[j]["lang"], memo)), bv_atom(rules[j], f)))
+    here = smt.And(smt.InRe(s, rx_to_smt(rx, rules[i]["lang"], memo)), bv_atom(rules[i], f))
+    before = [smt.Not(smt.And(smt.InRe(s, rx_to_smt(rx, rules[j]["lang"], memo)), bv_atom(rules[j], f)))
               for j in earlier]
-    r, so = check(z3.InRe(s, z3.Star(_byte_re())), fdomain(f), here, *before, timeout=10000)
-    if r == z3.unsat:
+    r, so = check(smt.InRe(s, smt.Star(_byte_re())), fdomain(f), here, *before, timeout=10000)
+    if r == smt.unsat:
         solver = "DEAD"
-    elif r == z3.sat and len(so.model()[s].as_string()) <= L:
+    elif r == smt.sat and len(so.model()[s].as_string()) <= L:
         solver = "REACHABLE"
     else:
         solver = None
@@ -838,7 +840,7 @@ def gen_queries(rules, rx, rng, n):
             if by_kind[kind] and rng.random() < 0.85 else ""
         choice = rng.random()
         if rng.random() < 0.03:
-            base = base + "\\u{" + rng.choice(["62", "2f", "5c", "41"]) + "}"   # Z3 escape text
+            base = base + "\\u{" + rng.choice(["62", "2f", "5c", "41"]) + "}"   # the solver's escape text
         if choice < 0.35:
             sval = base
         elif choice < 0.55:
@@ -1407,7 +1409,7 @@ def main():
                         if k.startswith("reach_unknown_")) or "none"
     print(f"smt_crosscheck: reachability UNKNOWN by reason: {reasons}")
     print(f"smt_crosscheck: string reachability decided by derivatives {stats['reach_regex']} "
-          f"times, Z3 regex conclusive on {stats['reach_regex'] - stats['reach_solver_inconclusive']} "
+          f"times, solver regex conclusive on {stats['reach_regex'] - stats['reach_solver_inconclusive']} "
           f"(inconclusive {stats['reach_solver_inconclusive']}: model past the length bound or "
           f"timeout); procedure bound hits {stats['bound_seen']} (verdicts), "
           f"{stats['reach_unknown']} (reachability); conservative UNKNOWN answers at a "

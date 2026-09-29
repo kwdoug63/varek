@@ -21,7 +21,7 @@
 #      and the v1.13.0 tag are available).
 #   5. The --plan gate decides planned file_opens with the matchers.
 #   6. The decision procedure agrees with the solver and the derivative oracle
-#      (tools/smt_crosscheck.py; needs python3 + z3-solver).
+#      (tools/smt_crosscheck.py; needs python3 and tools/requirements-crosscheck.txt).
 #   7. The verdict-distribution harness gate: unsafe_satisfied == 0.
 #
 # Usage: ./test_v1140.sh <warden> <vdp_check> <probe_bin>
@@ -191,7 +191,7 @@ if python3 -c 'import z3' 2>/dev/null; then
     echo "$o" | sed 's/^/    /' | tail -3
     grep -q "smt_crosscheck: PASS (0 disagreements)" <<<"$o" && pass "zero disagreements" || flunk "zero disagreements"
 else
-    flunk "python3 module z3 not found (pip install z3-solver): the solver cross-check is required"
+    flunk "the reference SMT solver is not installed (pip install -r tools/requirements-crosscheck.txt): the solver cross-check is required"
 fi
 
 echo "== 7. verdict-distribution harness gate =="

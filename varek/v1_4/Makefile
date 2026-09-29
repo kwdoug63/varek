@@ -23,9 +23,16 @@ V1_7_DIR  := ../../v1_7
 LIFECYCLE := $(V1_7_DIR)/warden_lifecycle.c
 CFLAGS    += -I$(V1_7_DIR)
 
+# v1.18.0: the --plan gate's data-flow check (v1.7), refusal breaker (v1.8.2)
+# and progress-safety check (v1.9), for --flow-policy.
+FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
+             $(V1_7_DIR)/plan_dataflow_pathology.c $(V1_7_DIR)/plan_warden_binding.c \
+             $(V1_7_DIR)/plan_policy_config.c $(V1_7_DIR)/plan_breaker.c \
+             $(V1_7_DIR)/plan_progress.c
+
 BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen
 
-.PHONY: all deps deps-check preflight clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 crosscheck harness video-v112
+.PHONY: all deps deps-check preflight clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -55,16 +62,16 @@ preflight:
 
 CHECKER := checker/vdp_checker.c checker/vdp_checker.h
 
-warden: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(V1_6_SRC)
+warden: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c $(LIFECYCLE) $(V1_6_SRC) $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS)
 
 # v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
 # ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that
 # the certificate checker refuses the wrong verdict. Never deploy it.
-warden_faultinject: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(V1_6_SRC)
+warden_faultinject: warden.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
-	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c $(LIFECYCLE) $(V1_6_SRC) $(LDLIBS)
+	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS)
 
 # v1.15: command-line front end to the certificate checker (policy digest,
 # batch certificate checks). Links the checker only, never smt_decide.c.
@@ -169,7 +176,8 @@ test-v1124: warden
 # v1.13: the SMT decision procedure in the enforcement path. Flag-fragment
 # enforcement under a live Warden, load-time dead-rule analysis, parser
 # refusals, lint of the shipped policies, the --plan gate's symbolic flags, the
-# solver cross-check and the harness gate. Needs python3 and z3-solver.
+# solver cross-check and the harness gate. Needs python3 and
+# tools/requirements-crosscheck.txt.
 tests/v1130_probe: tests/v1130_probe.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $<
 
@@ -217,8 +225,25 @@ test-v1161: warden tools/vdp_cert_check tools/varek_keygen
 tests/v1170_probe: tests/v1170_probe.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $<
 
+tests/v1180_probe: tests/v1180_probe.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $<
+
 test-v1170: warden tools/vdp_cert_check tools/varek_keygen tests/v1170_probe
 	@sudo ./tests/test_v1170.sh ./warden ./tools/vdp_cert_check ./tools/varek_keygen $(abspath tests/v1170_probe)
+
+# v1.18.0: where the published claims and the code disagreed. The --plan gate
+# refuses connect/launch steps; --flow-policy runs the data-flow check, the
+# refusal breaker (state kept across runs, protected from the agent) and the
+# progress-safety check; refusals record EACCES; the CycloneDX export is derived
+# from the stream, checks the policy, is signed (JSF Ed25519) and schema-valid;
+# the Python suites collect. Also runs the v1.7 layer's checks (URL host
+# matching, breaker state) and the live filter's io_uring probe. The schema
+# check needs tools/requirements-test.txt.
+test-v1180: warden tools/vdp_cert_check tools/varek_keygen tests/v1180_probe tests/test_v14_filter
+	@$(MAKE) -s --no-print-directory -C $(V1_7_DIR) tests/test_v118
+	@out="$$($(V1_7_DIR)/tests/test_v118)"; rc=$$?; printf '%s\n' "$$out" | tail -1; exit $$rc
+	@sudo ./tests/test_v14_filter
+	@sudo ./tests/test_v1180.sh ./warden ./tools/vdp_cert_check ./tools/varek_keygen $(abspath tests/v1180_probe)
 
 # v1.16.2: the off-host anchor. A receiver behind a private sshd on
 # 127.0.0.1:2222 and the forwarder: a run anchored off-host audits "signed,
@@ -227,7 +252,8 @@ test-v1170: warden tools/vdp_cert_check tools/varek_keygen tests/v1170_probe
 test-v1162: warden tools/vdp_cert_check tools/varek_keygen tests/v1160_probe
 	@sudo ./tests/test_v1162.sh ./warden ./tools/varek_keygen $(abspath tests/v1160_probe)
 
-# Differential check of the decision procedure against an SMT solver (Z3) and,
+# Differential check of the decision procedure against an off-the-shelf SMT
+# solver (tools/requirements-crosscheck.txt) and,
 # for suffix / contains / glob reachability, a derivative-based oracle. These
 # are exactly the runs RELEASE-v1.15.0.md quotes: every policy in the
 # repository, then 300 fuzzed policies for each of seeds 1, 2 and 3.
@@ -261,4 +287,4 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe warden_faultinject tests/test_v14_filter
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe warden_faultinject tests/test_v14_filter

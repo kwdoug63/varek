@@ -17,7 +17,7 @@
 #      (an earlier rule holds, a deny rule, a false witness, flags outside the
 #      fragment) are refused.
 #   6. The decision procedure, the solver and the checker agree
-#      (tools/smt_crosscheck.py --cert; needs python3 + z3-solver).
+#      (tools/smt_crosscheck.py --cert; needs python3 and tools/requirements-crosscheck.txt).
 #
 # Usage: ./test_v1150.sh <warden> <warden_faultinject> <vdp_check> <vdp_cert_check> <probe_bin>
 set -u
@@ -172,7 +172,7 @@ if python3 -c 'import z3' 2>/dev/null; then
     echo "$o" | grep -E "certificates:|PASS|FAIL" | sed 's/^/    /'
     grep -q "smt_crosscheck: PASS (0 disagreements)" <<<"$o" && pass "zero disagreements" || flunk "zero disagreements"
 else
-    flunk "python3 module z3 not found (pip install z3-solver): the cross-check is required"
+    flunk "the reference SMT solver is not installed (pip install -r tools/requirements-crosscheck.txt): the cross-check is required"
 fi
 
 echo

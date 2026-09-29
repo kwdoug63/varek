@@ -73,6 +73,21 @@ void            plan_breaker_free(plan_breaker_t *b);
 uint64_t plan_breaker_signature(const plan_action_desc_t *actions,
                                 size_t n_actions);
 
+/* v1.18.0: the signature of the whole action-graph. Steps are ordered by their
+ * content (identical steps keep their plan order) and edges are written
+ * between those positions, sorted, repeats dropped: listing distinct steps or
+ * the edges in another order, or repeating an edge, gives the same signature,
+ * and different edge sets never share one. Two plans with the same steps but
+ * different edges (one routes a secret to an egress, one does not) differ;
+ * with plan_breaker_signature() alone, an authorized plan cleared the refusal
+ * count of a refused one that differed only in its edges. Out-of-range edge
+ * indices are ignored. The Warden's --plan gate uses this form. */
+uint64_t plan_breaker_signature_graph(const plan_action_desc_t *actions,
+                                      size_t n_actions,
+                                      const uint32_t *edge_from,
+                                      const uint32_t *edge_to,
+                                      size_t n_edges);
+
 /*
  * Advance the breaker for one submission.
  *
@@ -114,6 +129,30 @@ plan_breaker_result_t plan_breaker_step(plan_breaker_t *b,
                                         uint64_t signature,
                                         plan_decision_t verdict,
                                         const plan_label_policy_config_t *cfg);
+
+/* v1.18.0: persistence, so the bound holds across Warden runs.
+ *
+ * The Warden gates one plan per launch, so a breaker that lived only in
+ * memory would forget every refusal when the run ended, and a host could
+ * resubmit a refused plan forever by launching again. The Warden therefore
+ * loads the table from a state file it owns before stepping it, and saves it
+ * after.
+ *
+ * Format: a header line "varek-breaker 1", then one line per entry:
+ *   <session as hex, or "-"> <signature, 16 hex digits> <refusals>
+ *   <latched 0|1> <outcome> <terminal action name, or "-">
+ * and a trailer "end <number of entries>", so a file cut short (even at a line
+ * boundary) is refused rather than read as a smaller table.
+ *
+ * plan_breaker_load() fills an EMPTY breaker. It returns 0, or -1 on any
+ * malformed line (the caller must then fail closed rather than start from an
+ * empty table, which would forget the refusals). A latched TERMINAL_ACTION
+ * entry whose action is no longer the config's on_exhaustion or
+ * unknown_disposition action is loaded as TERMINAL_DENY.
+ * plan_breaker_save() returns 0, or -1 on a write error. */
+int plan_breaker_load(plan_breaker_t *b, FILE *in,
+                      const plan_label_policy_config_t *cfg);
+int plan_breaker_save(const plan_breaker_t *b, FILE *out);
 
 /* Human-readable name for an outcome (for the refusal/decision log). */
 const char *plan_breaker_outcome_name(plan_breaker_outcome_t o);
