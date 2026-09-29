@@ -215,8 +215,8 @@ test-v1161: warden tools/vdp_cert_check tools/varek_keygen
 # 127.0.0.1:2222 and the forwarder: a run anchored off-host audits "signed,
 # anchored"; the receiver only appends; an outage loses nothing; preflight
 # checks the FIFO's reader. Skipped without OpenSSH.
-test-v1162: warden tools/vdp_cert_check tools/varek_keygen
-	@sudo ./tests/test_v1162.sh ./warden ./tools/varek_keygen
+test-v1162: warden tools/vdp_cert_check tools/varek_keygen tests/v1160_probe
+	@sudo ./tests/test_v1162.sh ./warden ./tools/varek_keygen $(abspath tests/v1160_probe)
 
 # Differential check of the decision procedure against an SMT solver (Z3) and,
 # for suffix / contains / glob reachability, a derivative-based oracle. These

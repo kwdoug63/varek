@@ -80,6 +80,15 @@ decisions, records or the policy grammar.
 - Preflight: a FIFO anchor must have a reader (FAIL otherwise); `--spool DIR`;
   a trial run with a FIFO anchor is audited against the spool; warnings for a
   local-file anchor and for a signing key with no off-host anchor.
+- The receiver stores each line with its own receive time (`"received_ns"`),
+  one writer at a time (flock), and fails (so the forwarder retries) when it
+  cannot write; it refuses a public key with more than one line, an existing
+  account that is not its own, root, and a filesystem without `chattr +a`
+  (unless `--allow-no-chattr`).
+- Audit: `--list-runs`, `--max-anchor-delay`; unsigned, conflicting and
+  malformed anchor lines are noted and ignored (the first validly signed line
+  per record decides).
+- Preflight: with `--run --spool`, checks the trial run was delivered off-host.
 - `make test-v1162`.
 
 ### Fixed
@@ -89,6 +98,9 @@ decisions, records or the policy grammar.
 
 ### Changed
 
+- The Warden holds a FIFO anchor read-write after checking it has a reader, so
+  records written while the forwarder restarts wait in the pipe; at exit it
+  waits up to 10 s for the forwarder to read them.
 - `run_start` reads `"warden":"1.16.2"`.
 
 ## [1.16.1] - 2026-09-28

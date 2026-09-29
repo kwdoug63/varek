@@ -184,7 +184,9 @@ fi
 if [ -n "$ANCHOR" ]; then
     A="$(abs "$ANCHOR")"
     ok=1
-    if [ -L "$A" ]; then fail "anchor $A is a symlink (the Warden opens it with O_NOFOLLOW and refuses)"; ok=0
+    if [ ! -x "$(dirname "$A")" ] && [ -e "$(dirname "$A")" ]; then
+        warn "cannot look inside $(dirname "$A") as this user, so the anchor was not checked (run the preflight as root)"; ok=0
+    elif [ -L "$A" ]; then fail "anchor $A is a symlink (the Warden opens it with O_NOFOLLOW and refuses)"; ok=0
     elif [ -e "$A" ]; then
         if [ -f "$A" ]; then
             [ "$(stat -c %h "$A")" = 1 ] || { fail "anchor $A has $(stat -c %h "$A") names (hard links): refused"; ok=0; }
@@ -257,10 +259,23 @@ if [ "$RUN" = 1 ]; then
                 aa=(--policy "$POLICY" --checker "$CERT")
                 [ -n "$KEY" ] && [ -f "$(abs "$KEY").pub" ] && aa+=(--pubkey "$(abs "$KEY").pub")
                 [ -n "$ANCHOR" ] && [ -f "$(abs "$ANCHOR")" ] && aa+=(--anchor "$(abs "$ANCHOR")")
-                # A FIFO anchor: the forwarder's spool holds what it received.
-                if [ -n "$ANCHOR" ] && [ -p "$(abs "$ANCHOR")" ] && [ -n "$SPOOL" ]; then
-                    sleep 2
-                    aa+=(--anchor "$(abs "$SPOOL")/anchor.spool")
+                # A FIFO anchor: the forwarder's spool holds what it received,
+                # and its sent.offset shows whether it reached the anchor host.
+                if [ -n "$ANCHOR" ] && [ -p "$(abs "$ANCHOR")" ]; then
+                    if [ -n "$SPOOL" ]; then
+                        SPF="$(abs "$SPOOL")/anchor.spool" delivered=0
+                        for _ in $(seq 1 30); do
+                            sz="$($SUDO stat -c %s "$SPF" 2>/dev/null || echo 0)"
+                            off="$($SUDO cat "$(abs "$SPOOL")/sent.offset" 2>/dev/null || echo 0)"
+                            [ "$sz" -gt 0 ] && [ "$off" -ge "$sz" ] 2>/dev/null && { delivered=1; break; }
+                            sleep 0.5
+                        done
+                        if [ "$delivered" = 1 ]; then pass "the forwarder delivered the trial run's records off-host"
+                        else fail "the forwarder has not delivered the trial run's records off-host within 15 s: check the anchor host's name, the SSH key and the pinned host key (journalctl -u varek-anchor-forward)"; fi
+                        aa+=(--anchor "$SPF")
+                    else
+                        warn "a FIFO anchor without --spool: the trial run's delivery off-host was not checked"
+                    fi
                 fi
                 o="$($SUDO python3 "$HERE/tools/varek_audit.py" "${aa[@]}" "$T" 2>&1)"
                 if grep -q "varek_audit: PASS" <<<"$o"; then pass "audit: $(grep -o 'integrity: .*' <<<"$o")"

@@ -257,7 +257,8 @@ also appended to a file, FIFO or device that the log's holder cannot rewrite.
 
 ```
 make                                         # builds tools/varek_keygen too
-tools/varek_keygen /etc/varek/log.key        # log.key (0600) + log.key.pub
+sudo mkdir -p /etc/varek                     # as root from here on
+sudo tools/varek_keygen /etc/varek/log.key   # log.key (0600) + log.key.pub
 sudo ./warden policy.txt --sign-key /etc/varek/log.key --anchor /var/varek/anchor \
     -- ./agent 2> verdicts.log
 tools/varek_audit.py --policy policy.txt --checker tools/vdp_cert_check \
@@ -298,10 +299,19 @@ second machine the Warden host's root cannot administer, as it is written:
    `/srv/varek-anchor/<warden-host>.anchor.log` from the anchor host (not through
    the forwarder's key, which can only append) and pass it as `--anchor`.
 
-Who can do what, afterwards: someone who holds the logs but not the key can
-change nothing before the last signature; this host's root, who holds the key,
-can change nothing that reached the anchor host; the anchor host's root can
-lift the append-only attribute, so keep that machine under separate control.
+Who can do what, afterwards:
+
+- **Someone who holds the logs but not the key** can change nothing before the
+  last signature.
+- **This host's root, who holds the key,** can change nothing that reached the
+  anchor host. What has not been delivered yet (the last second or so, or
+  everything since the anchor host became unreachable) is still open to it.
+- **The receive times** that the anchor host records make that visible.
+  `varek_audit.py` prints the delay, `--max-anchor-delay` enforces a limit, and
+  `--list-runs` shows every run the anchor holds, so pick the run to audit
+  there.
+- **The anchor host's root** can lift the append-only attribute, so keep that
+  machine under separate control.
 
 ## Threat model
 
