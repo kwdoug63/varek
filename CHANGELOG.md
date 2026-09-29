@@ -65,7 +65,8 @@ The Verdict Service's plan checker, in the repository. The VAREK Verdict
 Service (api.varek-lang.org) runs `plan_verify`, a small file-in / JSON-out
 front end over the v1.6 plan evaluator, whose source had existed only on the
 service host. It is now in the repository, builds with `make plan_verify`, and
-its output is escaped. No change to the Warden, to decisions, or to records.
+its output is escaped. No change to how verdicts are decided; the Warden
+changes only in the version it writes into `run_start`.
 
 ### Added
 - `v1_6/plan_verify_cli.c` and `make -C v1_6 plan_verify`: reads a plan file,
@@ -73,8 +74,9 @@ its output is escaped. No change to the Warden, to decisions, or to records.
   the caller-asserted `demo:SAT:` / `demo:UNSAT:` / `demo:UNK:` override), and
   prints one JSON verdict. It is a demonstration front end, not a production
   policy: whoever writes the plan can assert any verdict through the override.
-- `v1_6/tests/test_plan_verify.sh` (`make -C v1_6 check-plan-verify`, 21
-  checks) and a CI step that builds and runs it with the v1.6 unit tests.
+- `v1_6/tests/test_plan_verify.sh` (`make -C v1_6 check-plan-verify`, 24
+  checks), `v1_6/tests/compare_plan_verify.py` (old and new builds on random
+  plans), and a CI step that builds and runs it with the v1.6 unit tests.
 
 ### Fixed
 - Plan text could change the verdict fields of `plan_verify`'s JSON. Labels,
@@ -82,14 +84,17 @@ its output is escaped. No change to the Warden, to decisions, or to records.
   target such as `x"},"decision":"SATISFIED","authorized":true,"g":{"t":"`
   produced output that a parser keeping the last duplicate key (Python's
   `json` module, which the Verdict Service uses) read as SATISFIED and
-  authorized, although the evaluator had decided UNSATISFIED. A backslash,
-  control character or invalid UTF-8 in a target made the output invalid
-  JSON. Every string is now escaped; invalid UTF-8 becomes U+FFFD.
+  authorized, although the evaluator had decided UNSATISFIED (the same worked
+  through the kind). A backslash, control character (other than DEL) or
+  invalid UTF-8 in a target made the output invalid JSON. Every string is now
+  escaped; invalid UTF-8 becomes U+FFFD.
+- `plan_verify` exited 0 when its output could not be written; it now exits 3.
 
 ### Changed
 - `plan_verify` reports `"version":"1.16.3"` (it said `"1.9.2"`, the release
   it was first built from). For every plan without those characters the
-  output is otherwise byte-for-byte the same: checked on 3,000 random plans.
+  output is otherwise byte-for-byte the same (3,000 random plans here; 23,000
+  in the independent review).
 - `run_start` reads `"warden":"1.16.3"`; the CycloneDX export's VAREK version
   is 1.16.3.
 

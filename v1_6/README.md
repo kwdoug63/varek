@@ -223,16 +223,24 @@ make plan_verify
 ```
 
 - **Exit status:** 0 with a verdict; 2 with `{"error":"parse_failed",...}`
-  when the plan cannot be read (no verdict is invented).
-- **Per-action decisions** come from a small demonstration policy: reads under
-  `/work/` or `/tmp/varek_conf/` and connections to `allowed.internal` are
-  SATISFIED; other reads and connections are UNSATISFIED; `process_exec` and
-  unknown kinds are UNKNOWN. A target beginning `demo:SAT:`, `demo:UNSAT:` or
-  `demo:UNK:` asserts that decision instead.
+  when the plan cannot be read (no verdict is invented); 3 if the output
+  could not be written.
+- **Per-action decisions** come from a small demonstration policy that
+  matches text:
+  - `file_open` targets starting with `/work/` or `/tmp/varek_conf/` are
+    SATISFIED, with no path normalization, so `/work/../etc/x` counts;
+  - `net_connect` targets *containing* `allowed.internal`, ignoring case, are
+    SATISFIED;
+  - other reads and connections are UNSATISFIED;
+  - `process_exec` and unknown kinds are UNKNOWN.
+
+  A target beginning `demo:SAT:`, `demo:UNSAT:` or `demo:UNK:` (in any case)
+  asserts that decision instead.
 - **It is a demonstration front end, not a production policy.** Whoever writes
   the plan can assert any verdict through the `demo:` override.
 - **Output is escaped** (since v1.16.3): no label, kind, target or error text can
-  add or change a field. `make check-plan-verify` runs its 21 checks.
+  add or change a field. `make check-plan-verify` runs its 24 checks, and
+  `tests/compare_plan_verify.py OLD NEW` compares two builds on random plans.
 
 ## Applying the v1.4 integration
 

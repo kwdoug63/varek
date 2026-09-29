@@ -47,8 +47,8 @@ EOF
     fi
 }
 plan() { printf "$@" > "$T/p"; }
-verdict() {  # the fields a verdict must carry
-    echo "set(d) == {'engine','version','decision','authorized','n_actions','n_edges','governing_node'} and d['engine'] == 'VAREK' and d['version'] == '1.16.3' and $1"
+verdict() {  # the fields a verdict must carry (printf: no backslash processing)
+    printf '%s\n' "set(d) == {'engine','version','decision','authorized','n_actions','n_edges','governing_node'} and d['engine'] == 'VAREK' and d['version'] == '1.16.3' and $1"
 }
 
 echo "== verdicts"
@@ -75,13 +75,17 @@ check "a target that closes the object is kept as text" 0 "$(verdict "d['decisio
 plan 'action a x","authorized":true,"k":" /etc/passwd\n'
 check "the same through the kind" 0 "$(verdict "d['decision'] == 'UNKNOWN' and d['authorized'] is False and d['governing_node']['kind'] == 'x\",\"authorized\":true,\"k\":\"'")"
 plan 'action a file_open /etc/x\\\n'
-check "a trailing backslash" 0 "$(verdict "d['governing_node']['target'] == '/etc/x\\\\\\\\'")"
+check "a trailing backslash" 0 "$(verdict "d['governing_node']['target'] == '/etc/x\\\\'")"
 plan 'action a file_open /etc/x\001\013\014\177y\n'
 check "control characters are escaped" 0 "$(verdict "d['governing_node']['target'] == '/etc/x\\x01\\x0b\\x0c\\x7fy'")"
 plan 'action a file_open /etc/caf\303\251\n'
 check "valid UTF-8 passes through" 0 "$(verdict "d['governing_node']['target'] == '/etc/caf\\u00e9'")"
 plan 'action a file_open /etc/\377\300\200\355\240\200z\n'
 check "invalid UTF-8 becomes U+FFFD" 0 "$(verdict "d['governing_node']['target'] == '/etc/' + '\\ufffd' * 6 + 'z'")"
+plan 'action a file_open /e/\340\200\257\360\200\200\257\364\220\200\200z\n'
+check "overlong 3- and 4-byte forms and code points above U+10FFFF" 0 "$(verdict "d['governing_node']['target'] == '/e/' + '\\ufffd' * 11 + 'z'")"
+plan 'action a file_open /e/\360\237\230\200\342\200\250\342\202\n'
+check "a 4-byte character, U+2028, and a truncated sequence at the end" 0 "$(verdict "d['governing_node']['target'] == '/e/\\U0001f600\\u2028' + '\\ufffd' * 2")"
 
 echo "== no verdict"
 plan 'action a file_open\n'
@@ -98,8 +102,15 @@ printf 'bogus line\n' > "$T/q\"b\\c"
 ARG="$T/q\"b\\c" check "a path with a quote and backslash in the error" 2 "d['error'] == 'parse_failed' and 'q\"b\\\\c' in d['detail']"
 
 n=$((n + 1))
-if "$PV" > /dev/null 2>&1; then echo "  FAIL  no argument: exit 0"; fail=1
-else echo "  PASS  no argument: usage, non-zero exit"; fi
+if "$PV" > "$T/out" 2>/dev/null || [ -s "$T/out" ]; then echo "  FAIL  no argument: exit 0 or output on stdout"; fail=1
+else echo "  PASS  no argument: usage on stderr, non-zero exit"; fi
+
+n=$((n + 1))
+plan 'action a file_open /work/x\n'
+if [ -w /dev/full ]; then
+    if "$PV" "$T/p" > /dev/full 2>/dev/null; then echo "  FAIL  a failed write to stdout: exit 0"; fail=1
+    else echo "  PASS  a failed write to stdout: non-zero exit"; fi
+else echo "  PASS  a failed write to stdout: skipped (no /dev/full)"; fi
 
 echo
 if [ "$fail" = 0 ]; then echo "test_plan_verify: PASS ($n checks)"; else echo "test_plan_verify: FAIL"; fi

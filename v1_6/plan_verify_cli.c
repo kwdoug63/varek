@@ -29,7 +29,8 @@
  *
  * Usage:  plan_verify <plan_file>
  * Output: one line of JSON on stdout; exit 0 on a produced verdict,
- *         2 on parse/load failure (verdict cannot be produced).
+ *         2 on parse/load failure (verdict cannot be produced),
+ *         3 if the output could not be written in full.
  *
  * Build:  make plan_verify   (in v1_6/)
  *
@@ -109,6 +110,13 @@ static void json_str(FILE *f, const char *s)
     fputc('"', f);
 }
 
+/* Exit status for a verdict or error line: rc, or 3 if stdout failed. */
+static int finish(int rc)
+{
+    if (fflush(stdout) != 0 || ferror(stdout)) return 3;
+    return rc;
+}
+
 static int str_ieq(const char *a, const char *b)
 {
     return a && b && strcasecmp(a, b) == 0;
@@ -181,14 +189,14 @@ int main(int argc, char **argv)
         fputs("{\"error\":\"parse_failed\",\"detail\":", stdout);
         json_str(stdout, err[0] ? err : "unknown parse error");
         fputs("}\n", stdout);
-        return 2;
+        return finish(2);
     }
 
     const plan_spec_t *spec = plan_parser_spec(parsed);
     if (!spec) {
         printf("{\"error\":\"no_spec\"}\n");
         plan_parser_free(parsed);
-        return 2;
+        return finish(2);
     }
 
     /* Run the real evaluator. sink=NULL: we emit our own single-line JSON. */
@@ -228,5 +236,5 @@ int main(int argc, char **argv)
     fputs("}}\n", stdout);
 
     plan_parser_free(parsed);
-    return 0;
+    return finish(0);
 }

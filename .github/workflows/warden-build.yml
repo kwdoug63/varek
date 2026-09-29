@@ -4,6 +4,8 @@ name: Warden build
 # development headers. This builds it and its tools with exactly those
 # packages, lints the shipped policies, and runs the preflight check on each
 # (no root: the dependency, build, policy and verdict-stream checks).
+# v1.16.3: it also builds and tests v1_6/plan_verify, the Verdict Service's
+# plan checker, with the v1.6 unit tests.
 
 on:
   push:
