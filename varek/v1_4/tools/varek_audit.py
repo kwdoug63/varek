@@ -58,6 +58,56 @@ import varek_ed25519  # noqa: E402
 
 # Record rules for an authorized file open (the policy decided ALLOW).
 AUTHORIZED_OPEN_RULES = ("resolved_fd_injection", "allowed_open_failed", "injection_failed")
+# v1.17.0: metadata and link lookups (stat, access, readlink) are decided like a
+# read-only open and certified the same way.
+META_ACTIONS = ("file.stat", "file.access", "file.readlink")
+META_RULES = ("metadata_answered", "metadata_not_found", "metadata_failed")
+
+
+def policy_ancestors(path):
+    """The directories an allow rule's literal start leads to (warden.c:
+    load_ancestors): lookups on these may be answered without a decision. The
+    Warden answers a subset (it also skips any a deny rule covers); a record
+    outside this set is a problem. Lines and tokens are split exactly as the
+    policy parser does (smt_decide.c): lines on '\\n' only, tokens on ASCII
+    whitespace, a token starting with '#' ends the line."""
+    import re
+    flag = lambda t: t == b"readonly" or t.startswith(b"access=") or t[:3] in (b"+O_", b"-O_")
+    out = {"/"}
+    with open(path, "rb") as fh:
+        data = fh.read()
+    for line in data.split(b"\n"):
+        toks = []
+        for t in re.split(rb"[ \t\r\v\f]+", line):
+            if not t:
+                continue
+            if t.startswith(b"#"):
+                break
+            toks.append(t)
+        if len(toks) < 3 or toks[0] != b"allow" or toks[1] != b"path":
+            continue
+        m, c = b"prefix", toks[2]
+        if toks[2] in (b"exact", b"prefix", b"suffix", b"contains", b"glob") and \
+                len(toks) > 3 and not flag(toks[3]):
+            m, c = toks[2], toks[3]
+        if m in (b"prefix", b"exact"):
+            lit = c
+        elif m == b"glob":
+            k = 0
+            while k < len(c) and c[k:k + 1] not in (b"*", b"?", b"[", b"\\"):
+                k += 1
+            lit = c[:k]
+        else:
+            continue
+        if not lit.startswith(b"/"):
+            continue
+        for i in range(1, len(lit) + 1):
+            if i == len(lit):
+                if lit[i - 1:i] == b"/":
+                    out.add((lit[:i - 1] or b"/").decode("utf-8", "surrogateescape"))
+            elif lit[i:i + 1] == b"/":
+                out.add(lit[:i].decode("utf-8", "surrogateescape"))
+    return out
 
 
 def _hex_key(txt):
@@ -370,7 +420,8 @@ def main(argv=None):
         problems.append(f"the policy file hashes to {digest}, the Warden ran with {recorded}")
 
     lines, which = [], []
-    authorized = refused = 0
+    authorized = refused = lookups = 0
+    ancestors = None
     launches = 0
     for rec in records:
         allowed = rec.get("decision_final") == "ALLOW" or rec.get("kernel_verdict") == "ALLOW"
@@ -383,11 +434,29 @@ def main(argv=None):
             if launches > 1:
                 problems.append(f"seq {rec.get('seq')}: a second launch exec")
             continue
-        if rec.get("action") != "file.open" or rec.get("rule") not in AUTHORIZED_OPEN_RULES:
-            problems.append(f"seq {rec.get('seq')}: an authorization that is not a certified "
-                            f"file open ({rec.get('action')}, rule {rec.get('rule')})")
+        if rec.get("action") in META_ACTIONS and rec.get("rule") == "metadata_ancestor":
+            if ancestors is None:
+                ancestors = policy_ancestors(a.policy)
+            if rec.get("resolved") not in ancestors:
+                problems.append(f"seq {rec.get('seq')}: a lookup answered as a directory the "
+                                f"policy leads to, but {rec.get('resolved')!r} is not one")
+            elif rec.get("open_flags") != "0x0" or \
+                    (rec.get("action") == "file.access" and
+                     int(rec.get("access_mode", "7")) & 3):
+                problems.append(f"seq {rec.get('seq')}: a lookup answered as a directory the "
+                                f"policy leads to, but it asked for more than a read")
+            lookups += 1
             continue
-        authorized += 1
+        is_open = rec.get("action") == "file.open" and rec.get("rule") in AUTHORIZED_OPEN_RULES
+        is_meta = rec.get("action") in META_ACTIONS and rec.get("rule") in META_RULES
+        if not (is_open or is_meta):
+            problems.append(f"seq {rec.get('seq')}: an authorization that is not a certified "
+                            f"file open or lookup ({rec.get('action')}, rule {rec.get('rule')})")
+            continue
+        if is_meta:
+            lookups += 1
+        else:
+            authorized += 1
         cr, cw = rec.get("cert_rule"), rec.get("cert_witness")
         if not isinstance(cr, int) or not isinstance(cw, str) or rec.get("check") != "ok":
             problems.append(f"seq {rec.get('seq')}: authorized open of {rec.get('resolved')!r} "
@@ -426,7 +495,8 @@ def main(argv=None):
                                     f"refused: {o.get('why')}")
 
     print(f"varek_audit: run {run} (Warden {warden}, {'complete' if complete else 'INCOMPLETE'}), "
-          f"{len(records)} records, {authorized} authorized file opens, {checked} certificates "
+          f"{len(records)} records, {authorized} authorized file opens, {lookups} lookups, "
+          f"{checked} certificates "
           f"re-checked, {refused} refused in-line")
     print(f"varek_audit: integrity: {integrity}")
     t0 = meta.get("run_start", {}).get("timestamp_ns")

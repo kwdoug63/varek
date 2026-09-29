@@ -59,6 +59,80 @@ formally verified checker, and the v1.11 sequence fragment.
 
 ---
 
+## [1.17.0] - 2026-09-29
+
+v1.17.0 closes three live gaps found in the v1.16.3 review: the Warden's own
+files could be reached through an alias, metadata and link lookups were
+admitted and never logged, and the agent ran as root with every capability.
+It changes defaults (the agent is no longer root; lookups are now decided by
+the policy), so it is a minor release. No verdict *semantics* change.
+
+### Security
+
+- **The signing key, anchor and verdict stream are refused by identity.**
+  Through v1.16.3 the Warden refused to start if the policy allowed these by
+  their real path only. With the key's directory bind-mounted into an allowed
+  tree, the agent read the private key. Every open and lookup is now checked,
+  after resolution and before the policy, against their device and inode
+  (`protected_object`), so any alias is refused.
+- **Raw storage and memory are refused whatever the policy says.** Block
+  devices, `/dev/mem`, `/dev/kmem`, `/dev/port`, the sg/bsg/nvme command
+  devices and `/proc/kcore`, reached by any path (`raw_device`).
+- **stat, statx, access and readlink are mediated.** They were admitted and
+  unlogged, so an agent could learn whether any file existed, its size, owner
+  and times, and where any link pointed (including the Warden's own
+  `/proc/<pid>/fd` entries). They are now resolved like an open, decided as a
+  read-only open of the same object (`access(W_OK)` as a write), certified,
+  recorded and answered by the Warden. A name that does not exist gives
+  `ENOENT` inside the policy and `EACCES` outside it; a name that exists but
+  cannot be followed (a trailing slash on a file, a symlink whose target is
+  missing) fails closed. `access(X_OK)` is refused; flags the kernel would
+  refuse give `EINVAL`.
+- **The agent runs unprivileged.** It ran as root with every capability; it now
+  runs as `nobody` (or `--run-as <user|uid[:gid]>`) with no supplementary
+  groups, an empty capability bounding set and no capabilities. `--run-as
+  root` keeps the old behaviour with a warning.
+
+### Changed
+
+- The program is opened by the Warden while still root and launched with
+  `execveat(fd, "", AT_EMPTY_PATH)`, so the unprivileged user needs execute
+  permission on the file only. A script (`#!`) is launched by its path, so its
+  directories must be searchable by that user. PATH is searched as `execvp`
+  does. The launch approval accepts that `execveat` once, from the launched
+  process only.
+- Answered without a decision: `stat`/`statx` of a descriptor the agent already
+  holds (not recorded, like `read()`), and a read-type lookup on a directory an
+  allow rule's literal start leads to and no deny rule covers (recorded as
+  `metadata_ancestor`; existence and type only, with times zeroed), so
+  `realpath()` works on allowed paths. The working directory, `access()` and
+  `readlink()` on a descriptor are decided like a named object.
+- `--run-as` refuses group 0 for an unprivileged user and an empty group
+  (`1000:`). A missing program is refused before launch (exit 127).
+- Records gain the actions `file.stat`, `file.access` and `file.readlink` and
+  the rules `metadata_answered`, `metadata_not_found`, `metadata_failed`,
+  `metadata_ancestor`, `protected_object` and `raw_device`. The status line
+  gains `uid=` and `caps=`.
+- `varek_audit.py` re-checks the certificates of lookups and checks every
+  `metadata_ancestor` record against the policy.
+- Python 3 startup under the Warden: about 39 ms, from 31 ms (24 ms without
+  the Warden). Decision latency unchanged within run-to-run noise.
+
+### Added
+
+- `varek/v1_4/tests/v1170_probe.c`, `tests/test_v1170.sh`,
+  `tests/v1170_policy.txt`; `make test-v1170` (48 checks). Against v1.16.3,
+  28 of them fail: the key, stream and anchor are read through a bind mount,
+  lookups outside the policy succeed unrecorded, and the agent is uid 0.
+- `RELEASE-v1.17.0.md`.
+
+### Fixed
+
+- `docs/security/bypass-classes.md`: classes 5 and 6 updated; new rows for
+  metadata lookups (10) and aliases of the Warden's own files (11).
+
+---
+
 ## [1.16.3] - 2026-09-29
 
 The Verdict Service's plan checker, in the repository. The VAREK Verdict
