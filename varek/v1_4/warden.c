@@ -66,6 +66,8 @@
 #include <inttypes.h>
 #include <linux/audit.h>
 #include <linux/capability.h>
+#include <grp.h>
+#include <pwd.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 
@@ -261,7 +263,7 @@ static int policy_load(const char *path, struct policy *p) {
             "(warden_faultinject); never use it to supervise a real agent\n");
 #endif
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.16");
+    snprintf(p->version, sizeof(p->version), "1.17");
     char err[512];
     /* v1.15: read the file once. The decision procedure and the certificate
      * checker parse these same bytes, and their SHA-256 goes in run_start, so
@@ -1190,7 +1192,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.16.3\","
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.17.0\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
@@ -2059,9 +2061,18 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * before; with threads admitted it would be routine. Every later exec,
          * including a re-exec of the agent's own binary, falls through to the
          * deny-only block below. */
+        /* v1.17.0: the launch is execveat(fd, "", AT_EMPTY_PATH) on the
+         * program the Warden's own code opened before dropping privileges (or
+         * execve of its path, for a script). The descriptor is in a register,
+         * not memory, and the launching process runs only Warden code until
+         * the exec, so CONTINUE stays as sound as before. */
+        bool boot_by_fd = act.kind == ACT_PROCESS_EXEC && req.data.nr == __NR_execveat &&
+                          act.target[0] == '\0' && (req.data.args[4] & AT_EMPTY_PATH);
         if (act.kind == ACT_PROCESS_EXEC && !bootstrap_done &&
-            (pid_t)req.pid == bootstrap_pid &&
-            bootstrap_path && strcmp(act.target, bootstrap_path) == 0) {
+            (pid_t)req.pid == bootstrap_pid && bootstrap_path &&
+            (boot_by_fd || strcmp(act.target, bootstrap_path) == 0)) {
+            if (boot_by_fd)
+                snprintf(act.target, sizeof act.target, "%s", bootstrap_path);
             bootstrap_done = true;
             if (ctx) ctx->launched = true;
             clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -2537,12 +2548,90 @@ static void anchor_drain(void) {
     fflush(g_log);
 }
 
+/* ---------------- v1.17.0: the agent runs unprivileged ---------------- */
+
+/* Through v1.16.3 the agent ran as root with every capability; only the
+ * seccomp filter held it back. It now runs as an unprivileged user (--run-as,
+ * default nobody) with an empty capability bounding set. File access does not
+ * depend on the agent's own rights: the Warden opens (and looks up) files on
+ * its behalf, as root, and only after the policy allows it. What changes is
+ * what the agent could do with any call the filter admits, and with any kernel
+ * bug it reaches: as nobody, with no capabilities, far less. */
+struct run_as { bool drop; uid_t uid; gid_t gid; };
+
+static int parse_run_as(const char *v, struct run_as *ra) {
+    ra->drop = true;
+    if (!strcmp(v, "root")) { ra->drop = false; ra->uid = 0; ra->gid = 0; return 0; }
+    if (v[0] >= '0' && v[0] <= '9') {
+        char *end;
+        unsigned long u = strtoul(v, &end, 10), g = u;
+        if (*end == ':') g = strtoul(end + 1, &end, 10);
+        if (*end || u > 0x7fffffffUL || g > 0x7fffffffUL) return -1;
+        ra->uid = (uid_t)u;
+        ra->gid = (gid_t)g;
+    } else {
+        struct passwd *pw = getpwnam(v);
+        if (!pw) {
+            if (strcmp(v, "nobody") != 0) return -1;
+            ra->uid = 65534; ra->gid = 65534;       /* nobody, where not in passwd */
+        } else {
+            ra->uid = pw->pw_uid; ra->gid = pw->pw_gid;
+        }
+    }
+    if (ra->uid == 0) ra->drop = false;            /* uid 0 is root */
+    return 0;
+}
+
+/* In the child, before the filter: no supplementary groups, an empty
+ * capability bounding and ambient set, then the unprivileged user and group
+ * (which clears the permitted and effective sets). Verified afterwards. */
+static int drop_privileges(const struct run_as *ra) {
+    if (setgroups(0, NULL) < 0) return -errno;
+    for (int cap = 0; cap <= 63; cap++)
+        if (prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) < 0 && errno != EINVAL) return -errno;
+    (void)prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+    if (setresgid(ra->gid, ra->gid, ra->gid) < 0) return -errno;
+    if (setresuid(ra->uid, ra->uid, ra->uid) < 0) return -errno;
+    struct __user_cap_header_struct hdr = { .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0 };
+    struct __user_cap_data_struct data[2];
+    memset(data, 0, sizeof data);
+    if (syscall(SYS_capget, &hdr, data) != 0) return -errno;
+    for (int i = 0; i < 2; i++)
+        if (data[i].effective || data[i].permitted || data[i].inheritable) return -EPERM;
+    if (getuid() != ra->uid || geteuid() != ra->uid || getgid() != ra->gid) return -EPERM;
+    return 0;
+}
+
+/* The program to launch, as execvp would find it (PATH search for a bare
+ * name). Returns 0 with out filled, or -1. */
+static int find_program(const char *name, char *out, size_t n) {
+    if (strchr(name, '/')) {
+        if ((size_t)snprintf(out, n, "%s", name) >= n) return -1;
+        return 0;
+    }
+    const char *path = getenv("PATH");
+    if (!path || !*path) path = "/usr/local/bin:/usr/bin:/bin";
+    while (*path) {
+        const char *c = strchr(path, ':');
+        size_t len = c ? (size_t)(c - path) : strlen(path);
+        int w = len ? snprintf(out, n, "%.*s/%s", (int)len, path, name)
+                    : snprintf(out, n, "./%s", name);
+        struct stat st;
+        if (w > 0 && (size_t)w < n && stat(out, &st) == 0 && S_ISREG(st.st_mode) &&
+            (st.st_mode & 0111))
+            return 0;
+        if (!c) break;
+        path = c + 1;
+    }
+    return -1;
+}
+
 /* ---------------- main ---------------- */
 
 static void usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s <policy.txt> [--plan <plan.txt>] [--sign-key <key>] [--anchor <path>]\n"
-        "              [--checkpoint-every <n>] -- <target> [args...]\n"
+        "              [--checkpoint-every <n>] [--run-as <user>] -- <target> [args...]\n"
         "\n"
         "  Privileged seccomp-unotify supervisor (VAREK Warden v1.4).\n"
         "\n"
@@ -2561,6 +2650,13 @@ static void usage(const char *argv0) {
         "  records (default 64, and at least once a second) and run_end with\n"
         "  Ed25519; --anchor <path> also appends each checkpoint to <path>\n"
         "  (append-only or off-host storage). tools/varek_audit.py verifies both.\n"
+        "\n"
+        "  v1.17: the agent runs as an unprivileged user with no capabilities.\n"
+        "  --run-as <user|uid[:gid]> picks the user (default nobody); --run-as root\n"
+        "  keeps the pre-v1.17 behaviour and prints a warning. The Warden still\n"
+        "  opens allowed files for the agent, so the user needs no file access of\n"
+        "  its own; it must be able to execute the program (a script's directories\n"
+        "  must also be searchable by it).\n"
         "\n"
         "  Policy file format (one rule per line):\n"
         "    allow path /tmp/safe/\n"
@@ -2596,6 +2692,7 @@ int main(int argc, char **argv) {
     const char *plan_path   = NULL;
     const char *key_path    = NULL;     /* v1.16 */
     const char *anchor_path = NULL;     /* v1.16 */
+    const char *run_as_arg  = NULL;     /* v1.17.0 */
     int sep_idx = -1;
 
     for (int i = 2; i < argc; i++) {
@@ -2607,6 +2704,8 @@ int main(int argc, char **argv) {
             key_path = argv[++i];
         } else if (strcmp(argv[i], "--anchor") == 0 && !anchor_path) {
             anchor_path = argv[++i];
+        } else if (strcmp(argv[i], "--run-as") == 0 && !run_as_arg) {
+            run_as_arg = argv[++i];
         } else if (strcmp(argv[i], "--checkpoint-every") == 0) {
             const char *v = argv[++i];
             uint64_t n = 0;
@@ -2624,6 +2723,22 @@ int main(int argc, char **argv) {
 
     if (sep_idx < 0 || sep_idx + 1 >= argc) { usage(argv[0]); return 2; }
     char *const *target_argv = &argv[sep_idx + 1];
+
+    /* v1.17.0: who the agent runs as, and the program it launches. */
+    struct run_as ra;
+    if (parse_run_as(run_as_arg ? run_as_arg : "nobody", &ra) < 0) {
+        fprintf(stderr, "[warden] --run-as %s: no such user (give a name, uid or uid:gid)\n",
+                run_as_arg);
+        return 2;
+    }
+    if (!ra.drop)
+        fprintf(stderr, "[warden] WARNING: --run-as root: the agent runs as root with every "
+                "capability (the pre-v1.17 behaviour); only the seccomp filter holds it back\n");
+    static char boot_path[PATH_MAX];
+    if (find_program(target_argv[0], boot_path, sizeof boot_path) < 0) {
+        fprintf(stderr, "[warden] %s: program not found\n", target_argv[0]);
+        return 127;
+    }
 
     const int pidns = getenv("VAREK_WARDEN_NO_PIDNS") == NULL;
     if (pidns && !have_cap_sys_admin()) {
@@ -2745,18 +2860,7 @@ int main(int argc, char **argv) {
          * even without a PID namespace. setpgid/setsid are not in the
          * baseline allowlist, so the agent cannot leave the group. */
         if (setpgid(0, 0) < 0) { perror("setpgid"); _exit(1); }
-        int crc = wd_target_couple_to_supervisor(live[0]);
-        if (crc < 0) {
-            fprintf(stderr, "[warden-target] lifecycle coupling failed (%s); "
-                            "refusing to run unsupervised\n", strerror(-crc));
-            _exit(1);
-        }
-        /* v1.12.1: the agent gets its own network namespace, holding only a
-         * loopback interface that is down. Nothing can reach it and it can
-         * reach nothing, whatever sockets it creates; the filter also refuses
-         * bind/listen/accept. Must precede the filter, which denies
-         * CLONE_NEWNET. With the PID namespace (CAP_SYS_ADMIN held) failure is
-         * fatal; in VAREK_WARDEN_NO_PIDNS mode it is a warning. */
+        /* v1.12.1 network namespace: needs CAP_SYS_ADMIN, so before the drop. */
         if (unshare(CLONE_NEWNET) < 0) {
             if (pidns) {
                 fprintf(stderr, "[warden-target] cannot create a network namespace "
@@ -2766,6 +2870,33 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[warden-target] WARNING: no network namespace (%s); "
                             "the agent shares the host network (bind/listen/accept "
                             "are still refused)\n", strerror(errno));
+        }
+        /* v1.17.0: open the program while still root, so the unprivileged
+         * user needs only execute permission on the file itself, not on every
+         * directory above it. A script (#!) is launched by its path instead:
+         * its interpreter must open it by name. */
+        int exec_fd = open(boot_path, O_RDONLY | O_CLOEXEC);
+        if (exec_fd < 0) {
+            fprintf(stderr, "[warden-target] %s: %s\n", boot_path, strerror(errno));
+            _exit(127);
+        }
+        char magic[2] = {0, 0};
+        bool is_script = pread(exec_fd, magic, 2, 0) == 2 && magic[0] == '#' && magic[1] == '!';
+        if (ra.drop) {
+            int drc = drop_privileges(&ra);
+            if (drc < 0) {
+                fprintf(stderr, "[warden-target] cannot drop to uid %u gid %u (%s); "
+                                "refusing to run\n", (unsigned)ra.uid, (unsigned)ra.gid,
+                                strerror(-drc));
+                _exit(1);
+            }
+        }
+        /* After the credential change: PR_SET_PDEATHSIG is cleared by one. */
+        int crc = wd_target_couple_to_supervisor(live[0]);
+        if (crc < 0) {
+            fprintf(stderr, "[warden-target] lifecycle coupling failed (%s); "
+                            "refusing to run unsupervised\n", strerror(-crc));
+            _exit(1);
         }
         int notify_fd =
             install_baseline_user_notif_filter(getenv("VAREK_WARDEN_OBSERVE") != NULL);
@@ -2782,8 +2913,18 @@ int main(int argc, char **argv) {
         }
         close(notify_fd);
         close(sv[1]);
-        execvp(target_argv[0], target_argv);
-        perror("execvp");
+        extern char **environ;
+        if (is_script) {
+            close(exec_fd);
+            execv(boot_path, target_argv);
+        } else {
+            syscall(__NR_execveat, exec_fd, "", target_argv, environ, AT_EMPTY_PATH);
+        }
+        fprintf(stderr, "[warden-target] cannot execute %s as uid %u: %s%s\n", boot_path,
+                (unsigned)getuid(), strerror(errno),
+                errno == EACCES ? " (the user --run-as names must be able to execute it; "
+                                  "for a script, every directory above it must be "
+                                  "searchable too)" : "");
         _exit(127);
     }
 
@@ -2851,11 +2992,13 @@ int main(int argc, char **argv) {
         }
     }
     fprintf(stderr,
-        "[warden] supervising pid=%d  notify_fd=%d  policy=%s (%zu rules)  pidns=%s  netns=%s\n",
-        target, notify_fd, p.name, p.v.n, pidns ? "on" : "off", netns);
+        "[warden] supervising pid=%d  notify_fd=%d  policy=%s (%zu rules)  pidns=%s  netns=%s"
+        "  uid=%u%s\n",
+        target, notify_fd, p.name, p.v.n, pidns ? "on" : "off", netns,
+        (unsigned)ra.uid, ra.drop ? " caps=none" : " caps=all");
 
     bool agent_ended = supervise(notify_fd, target_pidfd, agent_err_fd, &p,
-                                 target_argv[0], target);
+                                 boot_path, target);
     agent_ended = agent_ended || g_child_exited;   /* before the Warden's own SIGKILL */
 
     kill_target_tree(target);  /* the agent and everything it spawned */
