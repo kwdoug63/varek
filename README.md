@@ -27,14 +27,17 @@ for a decidable fragment — bounded strings for the object (prefix, exact, suff
 contains and glob matching), bitvectors for the open flags — that decides in
 microseconds with bounded worst case, is cross-checked against an off-the-shelf
 SMT solver, and returns UNKNOWN for anything outside its fragment rather than
-guessing. Every file open or lookup it authorizes carries a certificate that a
-small, independently written checker must accept before the call takes effect.
+guessing. Every file open it authorizes, and every lookup it decides, carries a
+certificate that a small, independently written checker must accept before the
+call takes effect. Lookups of the directories leading to an allowed path, and of
+descriptors the agent already holds, are answered without a decision.
 Connects, datagram sends and every launch after the agent's own are refused,
 whatever the policy says. Every verdict is one of three — **SATISFIED**,
 **UNSATISFIED**, or **UNKNOWN** — and it fails closed: a paused call that cannot
 be proven allowed never runs. System calls the kernel filter admits without
-asking (memory, time, threads, reads and writes on descriptors the Warden already
-opened for the agent) run undecided, and the rest are refused outright.
+asking (memory, time, threads, and reads and writes on descriptors the agent
+already holds, whether the Warden opened them or the agent made them, such as
+sockets and pipes) run undecided, and the rest are refused outright.
 
 The design premise is a clinical one: you do not deploy a system that is
 *usually* right when the cost of being wrong is unbounded. UNKNOWN is therefore a

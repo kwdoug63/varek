@@ -75,11 +75,16 @@ changes what the `--plan` gate authorizes, so it is a minor release. No verdict
   them as part of the runtime, but the Warden never called them. With
   `--flow-policy <cfg>` the gate now runs the node and flow checks
   (`plan_warden_verify`), then the breaker, keyed by `--session` and the plan's
-  signature, with its counts kept across runs in `--breaker-state` (default
-  `/var/lib/varek/breaker.state`). At startup the Warden refuses to start unless
-  the flow policy passes the progress-safety check and declares a
-  `refusal_budget`. Exit 3: refused, retryable; 4: terminal deny; 5: terminal,
-  run the named pre-authorized action. A chained `plan_gate` record holds the
+  canonical signature (steps and edges, in any order), with its table kept
+  across runs in `--breaker-state` (default `/var/lib/varek/breaker.state`):
+  the directory, table and lock file must be private to the Warden's user and
+  unreachable under the policy; the table is replaced atomically, the lock is
+  held for the gate only, and a table that does not read back refuses the plan
+  (exit 1). At startup the Warden refuses to start unless the flow policy
+  passes the progress-safety check and declares a `refusal_budget`. A refused
+  plan exits 3 (retryable), 4 (terminal deny) or 5 (terminal: run the named
+  pre-authorized action); `--gate-status <file>` reports the outcome apart
+  from the agent's own exit status. A chained `plan_gate` record holds the
   decision.
 - **The plan gate refuses connect and launch steps.** It authorized a plan whose
   `net_connect` or `process_exec` step the policy allowed, although the runtime
@@ -89,16 +94,20 @@ changes what the `--plan` gate authorizes, so it is a minor release. No verdict
   `match url https://*.internal.acme.com/*`, also matched
   `https://evil.example/x.internal.acme.com/`, because `*` matches `/`. A match
   key `<arg>.host`, `.scheme`, `.port` or `.path` now matches one component of a
-  strictly parsed URL (userinfo, a bad host or a bad port matches nothing); the
-  examples use `match url.host *.internal.acme.com`.
+  strictly parsed URL, never an argument literally named that way; a URL a
+  component rule cannot read (userinfo, a bad host, port or path) refuses the
+  plan instead of skipping the rule. The examples use
+  `match url.host *.internal.acme.com`.
 - **The CycloneDX export.** Its attestation was mostly fixed wording, including
   "no action reached the kernel without a verdict", which is not true of calls
   the filter admits outright. Every sentence is now derived from the stream,
   including which calls the record covers; an UNKNOWN that was authorized makes
   the exporter refuse. `--policy` defaults to the policy the Warden recorded, and
   a policy file that is not the one the Warden decided with is refused.
-  `--sign-key` signs the BOM (JSF, Ed25519, with the log key) and `--verify`
-  checks a signature. The output is tested against the CycloneDX 1.6 schema.
+  `--sign-key` signs the BOM (JSF, Ed25519, with the log key); `--verify`
+  checks a signature against the key given with `--pubkey` (required); with
+  `--pubkey` when exporting, the stream's own signatures must verify. The
+  output is tested against the CycloneDX 1.6 schema.
 - **Refusal records name the errno sent.** They said `kernel_verdict: EPERM`;
   the agent receives `EACCES`, and the record now says so.
 - **The v1.2 and v1.1 Python suites run.** `varek/v1_2/__init__.py` (and v1_3)
@@ -109,9 +118,11 @@ changes what the `--plan` gate authorizes, so it is a minor release. No verdict
   `KineticIntercept` is importable again, deprecated), and a plain `pytest`
   completes. The v1.1 suite skips on a host without cgroup v2 and libseccomp's
   Python binding.
-- **Breaker signature.** `plan_breaker_signature_graph()` covers edges as well as
-  steps, so an authorized plan no longer clears the refusal count of a refused
-  one that differs only in its edges.
+- **Breaker signature.** `plan_breaker_signature_graph()` is canonical over steps
+  and edges, so an authorized plan no longer clears the refusal count of a
+  refused one that differs only in its edges, and reordering or repeating
+  edges does not start a new count. The state file ends with a count of its
+  entries, so a truncated table is refused.
 
 ### Changed
 
@@ -151,10 +162,13 @@ changes what the `--plan` gate authorizes, so it is a minor release. No verdict
 
 ### Tests
 
-- `make test-v1180` (48 checks, plus the v1.7-layer test's 40 and the live
-  filter's io_uring probe). 28 of the 48 fail against the v1.17.0 Warden. Every
+- `make test-v1180` (66 checks, plus the v1.7-layer test's 56 and the live
+  filter's io_uring probe). 42 of the 66 fail against the v1.17.0 Warden. Every
   earlier suite still passes, with `test_v1124` and the v1.6 integration test
-  updated for the plan-gate change.
+  updated for the plan-gate change. An independent review of the first build
+  found the breaker count resettable by an interrupted write, the signature
+  sensitive to edge order and `--verify` trusting the BOM's own key; all three
+  are fixed and tested.
 
 ---
 

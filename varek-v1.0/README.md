@@ -195,13 +195,15 @@ See `docs/GOVERNANCE.md` for the full process.
 
 | Version | Highlights |
 |---------|-----------|
-| **v0.1** | Formal grammar (EBNF), lexer, recursive-descent parser — 109 tests |
+| **v0.1** | Formal grammar (EBNF), lexer, recursive-descent parser — 91 tests (88 pass; 2 fail, 1 hangs) |
 | **v0.2** | Hindley-Milner type inference, HM Algorithm W, schema validation — 163 tests |
 | **v0.3** | LLVM IR codegen (libLLVM-20 via ctypes), native assembly/object emit — 97 tests |
-| **v0.4** | Standard library: 7 modules, 261 functions (io/tensor/http/async/pipeline/model/data) — 182 tests |
+| **v0.4** | Standard library: 7 modules, 261 functions (io/tensor/http/async/pipeline/model/data) — 182 tests (173 pass; 9 fail on the unfinished `syn::` to `var::` rename) |
 | **v1.0** | Package manager (`varek` CLI), REPL, formatter, doc gen, governance — 108 tests |
 
-**Cumulative test count: 659 tests across all versions.**
+**Cumulative test count: 641 tests across all versions, 629 passing** (counted by
+running each release archive for VAREK v1.18.0; this line said 659 before, and
+v0.1 was listed with 109 tests).
 
 ---
 

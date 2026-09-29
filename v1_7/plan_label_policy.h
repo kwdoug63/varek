@@ -102,10 +102,16 @@ typedef struct plan_label_policy {
  * owner. */
 /* v1.18.0: a key of the form <arg>.scheme, <arg>.host, <arg>.port or
  * <arg>.path matches the pattern against that component of the named arg
- * <arg>, parsed strictly as an absolute URL (a URL with userinfo, a bad host
- * or a bad port matches nothing). Use `url.host` to allow a set of hosts: a
- * glob over the whole URL cannot, because '*' also matches '/', '?', '#' and
- * '@'. Component values are lower-cased for scheme and host. */
+ * <arg>, parsed strictly as an absolute URL. Use `url.host` to allow a set of
+ * hosts: a glob over the whole URL cannot, because '*' also matches '/', '?',
+ * '#' and '@'. Scheme and host are lower-cased; the path is matched as written.
+ * Such a key is reserved: it is always derived from <arg>, never read from an
+ * argument literally named "url.host". If <arg> is present but the component
+ * cannot be read (userinfo, a backslash in the authority, a host with other
+ * than letters, digits, '.' and '-' or with an empty label, a port outside
+ * 1-65535, a path with '%', '\\' or a dot segment), classification fails for
+ * the whole action (the reference callback returns -1), so the plan is
+ * refused rather than a later rule deciding it. */
 typedef struct plan_label_rule_match {
     const char *key;        /* named-arg key the action must carry */
     const char *pattern;    /* shell-style glob: * = any chars, ? = one char */

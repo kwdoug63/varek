@@ -111,18 +111,18 @@ static void test_url_components(void)
           "url.host allows a real internal host");
     CHECK(permitted(host, "https://API.Internal.ACME.com./v1") == 1,
           "host is compared lower-cased, one trailing dot dropped");
-    CHECK(permitted(host, "https://api.internal.acme.com@evil.example/") == 0,
-          "userinfo ('@') matches nothing");
-    CHECK(permitted(host, "https://evil.example\\.internal.acme.com/") == 0,
-          "a backslash in the authority matches nothing");
-    CHECK(permitted(host, "https://evil%2einternal.acme.com/") == 0,
-          "a percent-encoded host matches nothing");
+    CHECK(permitted(host, "https://api.internal.acme.com@evil.example/") == -1,
+          "userinfo ('@') fails the classification");
+    CHECK(permitted(host, "https://evil.example\\.internal.acme.com/") == -1,
+          "a backslash in the authority fails the classification");
+    CHECK(permitted(host, "https://evil%2einternal.acme.com/") == -1,
+          "a percent-encoded host fails the classification");
     CHECK(permitted(host, "http://api.internal.acme.com/") == 0,
           "url.scheme https refuses http");
-    CHECK(permitted(host, "not a url") == 0, "an unparseable URL matches nothing");
-    CHECK(permitted(host, "https://api.internal.acme.com:0/") == 0, "port 0 matches nothing");
-    CHECK(permitted(host, "https://api.internal.acme.com:99999/") == 0,
-          "an out-of-range port matches nothing");
+    CHECK(permitted(host, "not a url") == -1, "an unparseable URL fails the classification");
+    CHECK(permitted(host, "https://api.internal.acme.com:0/") == -1, "port 0 fails the classification");
+    CHECK(permitted(host, "https://api.internal.acme.com:99999/") == -1,
+          "an out-of-range port fails the classification");
 
     CHECK(permitted(port, "https://api.internal.acme.com:8443/v1/x") == 1,
           "url.port and url.path match their components");
@@ -132,6 +132,27 @@ static void test_url_components(void)
           "url.path is the path only");
     CHECK(permitted(port, "https://api.internal.acme.com:8443/v2/x?q=/v1/") == 0,
           "url.path stops at the query");
+
+    /* A literal argument named "url.host" is never consulted. */
+    {
+        plan_action_arg_t args[2] = { { "url", "https://evil.example/" },
+                                      { "url.host", "x.internal.acme.com" } };
+        plan_action_desc_t a = { .name = "send_http", .named_args = args, .n_named_args = 2 };
+        plan_label_class_t cls;
+        memset(&cls, 0, sizeof cls);
+        const plan_label_policy_t *pol = plan_label_policy_config_policy(host);
+        int rc = pol->classify(&a, &cls, pol->ctx);
+        CHECK(rc == 0 && !plan_label_set_test(&cls.permit_in, 0),
+              "a literal \"url.host\" argument cannot stand in for the URL's host");
+    }
+    CHECK(permitted(host, "https://.internal.acme.com/") == -1, "a host with a leading dot is refused");
+    CHECK(permitted(host, "https://a..internal.acme.com/") == -1, "a host with an empty label is refused");
+    CHECK(permitted(port, "https://api.internal.acme.com:8443/v1/..%2f..%2fadmin") == -1,
+          "an encoded path is refused, not matched as written");
+    CHECK(permitted(port, "https://api.internal.acme.com:8443/v1/../admin") == -1,
+          "a dot segment in the path is refused");
+    CHECK(permitted(host, "https://u@api.internal.acme.com/") == -1,
+          "a URL a component rule cannot read fails the classification (plan refused)");
 
     plan_label_policy_config_free(host);
     plan_label_policy_config_free(glob);
@@ -253,16 +274,24 @@ static void test_breaker_persistence(void)
     CHECK(load_text("varek-breaker 2\n", cfg) == -1, "a wrong header is refused");
     CHECK(load_text("varek-breaker 1\n- 00000000000000zz 1 0 2 -\n", cfg) == -1,
           "a bad signature is refused");
-    CHECK(load_text("varek-breaker 1\n- 0000000000000001 1 0 2 -\n- 0000000000000001 2 0 2 -\n", cfg) == -1,
+    CHECK(load_text("varek-breaker 1\n- 0000000000000001 1 0 2 -\n- 0000000000000001 2 0 2 -\nend 2\n", cfg) == -1,
           "a duplicate entry is refused");
     CHECK(load_text("varek-breaker 1\n- 0000000000000001 1 0 2 -", cfg) == -1,
           "a cut-off last line is refused");
-    CHECK(load_text("varek-breaker 1\n- 0000000000000001 1 0 2 - extra\n", cfg) == -1,
+    CHECK(load_text("varek-breaker 1\n- 0000000000000001 1 0 2 -\n", cfg) == -1,
+          "a file cut at a line boundary (no trailer) is refused");
+    CHECK(load_text("varek-breaker 1\n", cfg) == -1, "a header alone is refused");
+    CHECK(load_text("varek-breaker 1\n- 0000000000000001 1 0 2 -\nend 2\n", cfg) == -1,
+          "a trailer that miscounts is refused");
+    CHECK(load_text("varek-breaker 1\n- 0000000000000001 1 0 2 -\nend 1\n- 0000000000000002 1 0 2 -\n", cfg) == -1,
+          "data after the trailer is refused");
+    CHECK(load_text("varek-breaker 1\n- 0000000000000001 1 0 2 - extra\nend 1\n", cfg) == -1,
           "trailing fields are refused");
-    CHECK(load_text("varek-breaker 1\n6100 0000000000000001 1 1 3 abort_txn\n", cfg) == -1,
+    CHECK(load_text("varek-breaker 1\n6100 0000000000000001 1 1 3 abort_txn\nend 1\n", cfg) == -1,
           "a NUL byte in a session is refused");
-    CHECK(load_text("varek-breaker 1\n- 0000000000000001 1 0 2 -\n", cfg) == 0,
+    CHECK(load_text("varek-breaker 1\n- 0000000000000001 1 0 2 -\nend 1\n", cfg) == 0,
           "a well-formed file loads");
+    CHECK(load_text("varek-breaker 1\nend 0\n", cfg) == 0, "an empty table loads");
 
     plan_breaker_free(b1);
     plan_breaker_free(b2);
@@ -270,11 +299,37 @@ static void test_breaker_persistence(void)
     plan_label_policy_config_free(cfg);
 }
 
+static void test_graph_signature(void)
+{
+    printf("-- 3. the graph signature is canonical\n");
+    plan_action_arg_t ta = { "target", "/srv/secret/k" }, tb = { "target", "/srv/public/out" },
+                      tc = { "target", "/srv/log" };
+    plan_action_desc_t a[3] = {
+        { .name = "file_open", .named_args = &ta, .n_named_args = 1 },
+        { .name = "file_open", .named_args = &tb, .n_named_args = 1 },
+        { .name = "file_open", .named_args = &tc, .n_named_args = 1 },
+    };
+    /* the same steps, listed in another order: b, c, a */
+    plan_action_desc_t r[3] = { a[1], a[2], a[0] };
+    uint32_t f1[] = { 0, 0 }, t1[] = { 1, 2 };              /* a->b, a->c */
+    uint32_t f2[] = { 0, 0 }, t2[] = { 2, 1 };              /* a->c, a->b */
+    uint32_t f3[] = { 0, 0, 0 }, t3[] = { 1, 2, 1 };        /* a->b, a->c, a->b */
+    uint32_t f4[] = { 2, 2 }, t4[] = { 0, 1 };              /* renumbered: a->b, a->c */
+    uint32_t f5[] = { 0 }, t5[] = { 2 };                    /* a->c only */
+    uint64_t s1 = plan_breaker_signature_graph(a, 3, f1, t1, 2);
+    CHECK(s1 == plan_breaker_signature_graph(a, 3, f2, t2, 2), "edges in another order: same signature");
+    CHECK(s1 == plan_breaker_signature_graph(a, 3, f3, t3, 3), "a repeated edge: same signature");
+    CHECK(s1 == plan_breaker_signature_graph(r, 3, f4, t4, 2), "steps renumbered: same signature");
+    CHECK(s1 != plan_breaker_signature_graph(a, 3, f5, t5, 1), "a different edge set: different signature");
+    CHECK(s1 != plan_breaker_signature_graph(a, 3, NULL, NULL, 0), "no edges: different signature");
+}
+
 int main(void)
 {
     printf("VAREK v1.18.0 — v1.7 layer\n");
     test_url_components();
     test_breaker_persistence();
+    test_graph_signature();
     printf("\n%d/%d checks passed\n", g_pass, g_pass + g_fail);
     return g_fail ? 1 : 0;
 }

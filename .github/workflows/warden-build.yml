@@ -52,8 +52,12 @@ jobs:
         run: |
           python3 -m pip install --break-system-packages -r varek/v1_4/tools/requirements-test.txt pytest pyyaml
           python3 -m pytest -q tests
-          mkdir -p /tmp/ci_data
+          mkdir -p /tmp/ci_data /tmp/ci_key
           printf 'allow path /tmp/ci_data/\n' > /tmp/ci_policy.txt
-          sudo varek/v1_4/warden /tmp/ci_policy.txt -- /bin/true 2> /tmp/ci_run.log || true
+          varek/v1_4/tools/varek_keygen /tmp/ci_key/log.key
+          sudo varek/v1_4/warden /tmp/ci_policy.txt --sign-key /tmp/ci_key/log.key -- /bin/true 2> /tmp/ci_run.log || true
           python3 varek/v1_4/tools/varek_cyclonedx.py --log /tmp/ci_run.log --policy /tmp/ci_policy.txt --output /tmp/ci_bom.json
-          python3 varek/v1_4/tests/cdx_schema_check.py /tmp/ci_bom.json
+          python3 varek/v1_4/tools/varek_cyclonedx.py --log /tmp/ci_run.log --policy /tmp/ci_policy.txt \
+            --pubkey /tmp/ci_key/log.key.pub --sign-key /tmp/ci_key/log.key --output /tmp/ci_signed.json
+          python3 varek/v1_4/tools/varek_cyclonedx.py --verify /tmp/ci_signed.json --pubkey /tmp/ci_key/log.key.pub
+          python3 varek/v1_4/tests/cdx_schema_check.py /tmp/ci_bom.json /tmp/ci_signed.json

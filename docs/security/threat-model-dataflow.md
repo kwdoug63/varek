@@ -32,8 +32,10 @@ A deployment relies on both. Read both.
 > `process_exec` with one argument, `target` (the canonical path for a
 > `file_open`), and every `net_connect` and `process_exec` step is refused on
 > the node axis (the runtime refuses them). Rules that match URLs should match
-> a component (`match url.host …`), not the whole URL (v1.18.0; see
-> `v1_7/plan_label_policy.h`).
+> a component (`match url.host …`), not the whole URL; a URL such a rule cannot
+> read refuses the plan (v1.18.0; see `v1_7/plan_label_policy.h`). The breaker
+> counts per session and state file, which whoever starts the Warden chooses;
+> it bounds a host only if that host cannot choose them.
 
 This document is written for two readers: a CISO evaluating the layer
 for deployment, and an external auditor (Trail of Bits, NCC Group,

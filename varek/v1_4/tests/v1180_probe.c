@@ -7,6 +7,8 @@
 //   PROBE open <path> OK <first bytes>
 //   PROBE open <path> REFUSED <errno name> (<errno>)
 //
+// "--sleep N" waits N seconds; "--exit N" exits with status N.
+//
 // The test asserts on these lines and on the Warden's verdict stream.
 
 #ifndef _GNU_SOURCE
@@ -15,7 +17,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static const char *ename(int e) {
@@ -29,6 +33,15 @@ static const char *ename(int e) {
 
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--sleep") == 0 && i + 1 < argc) {   /* hold the run open */
+            struct timespec ts = { .tv_sec = atoi(argv[++i]), .tv_nsec = 0 };
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        if (strcmp(argv[i], "--exit") == 0 && i + 1 < argc) {    /* exit with a status */
+            fflush(stdout);
+            return atoi(argv[++i]);
+        }
         int fd = open(argv[i], O_RDONLY | O_CLOEXEC);
         if (fd < 0) {
             int e = errno;

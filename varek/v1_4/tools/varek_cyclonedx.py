@@ -37,7 +37,10 @@ unmerged specification proposal):
     exporter refuses to attest.
   * signature — v1.18.0, with --sign-key: an Ed25519 signature over the whole
     BOM in the JSON Signature Format (JSF) that CycloneDX 1.6 defines, made
-    with the Warden's log key (tools/varek_keygen). --verify checks one.
+    with the Warden's log key (tools/varek_keygen). --verify checks one
+    against the public key the caller trusts (--pubkey, required); the key
+    inside the BOM is not trusted. With --pubkey when exporting, the stream's
+    own signatures must verify under that key, or no BOM is written.
   * components[] — one component per DISTINCT resolved object the agent was
     authorized to reach, each with the deciding rule as a property. Refused
     actions are summarized in the annotation, not minted as components (a
@@ -50,8 +53,9 @@ emits stable 1.6 today and leaves that binding for a 2.0 target.
 
 Usage:
     varek_cyclonedx.py --log bench.log --agent ./target_demo --policy policy.txt \
-        [--output bom.json] [--serial urn:uuid:...] [--sign-key log.key]
-    varek_cyclonedx.py --verify bom.json [--pubkey log.key.pub]
+        [--output bom.json] [--serial urn:uuid:...] [--pubkey log.key.pub]
+        [--sign-key log.key]
+    varek_cyclonedx.py --verify bom.json --pubkey log.key.pub
 
 --policy names the policy for the record. When it is a readable file, its
 SHA-256 must equal the policy_sha256 the Warden recorded in run_start (v1.15+),
@@ -335,9 +339,16 @@ def attestation(records, authorized, refused, dist, policy, run_start, run_end,
                      f"breaker {plan_gate.get('breaker')}).")
     chain = log_info.get("chain", "none")
     if chain != "none":
-        parts.append("The stream is hash-chained (this exporter checked the chain)"
-                     + (" and signed; check the signatures with tools/varek_audit.py."
-                        if log_info.get("pubkey") else "; it is not signed."))
+        nsig, nsigned = log_info.get("sigs", 0), log_info.get("signable", 0)
+        if log_info.get("verified_key"):
+            sig_text = (f"; all {nsig} of its signed records verify under the key given "
+                        f"({log_info['verified_key']}), checked by this exporter.")
+        elif nsig:
+            sig_text = (f"; {nsig} of its {nsigned} checkpoint-type records carry a signature, "
+                        f"not checked here (give --pubkey, or run tools/varek_audit.py --pubkey).")
+        else:
+            sig_text = "; it carries no signatures."
+        parts.append("The stream is hash-chained (this exporter checked the chain)" + sig_text)
     else:
         parts.append("The stream is not hash-chained (a Warden before v1.16).")
     parts.append(_scope(warden_version))
@@ -543,30 +554,45 @@ def sign_bom(bom, key_path):
         raise SystemExit("varek_cyclonedx: libsodium failed to initialize")
     if not os.path.isfile(key_path):
         raise SystemExit(f"varek_cyclonedx: --sign-key {key_path}: no such file")
-    seed = _read_hex32(key_path, "--sign-key")
+    # The seed and the secret key live in ctypes buffers that are zeroed on
+    # every path. (Python may still hold copies of the file's text; the key
+    # file itself is the secret to guard.)
+    seed = ctypes.create_string_buffer(_read_hex32(key_path, "--sign-key"), 32)
     pk = ctypes.create_string_buffer(32)
     sk = ctypes.create_string_buffer(64)
-    if na.crypto_sign_seed_keypair(pk, sk, seed) != 0:
-        raise SystemExit("varek_cyclonedx: cannot derive the key pair")
-    bom.pop("signature", None)
-    bom["signature"] = {"algorithm": "Ed25519",
-                        "publicKey": {"kty": "OKP", "crv": "Ed25519", "x": _b64u(pk.raw)}}
-    msg = jcs(bom)
-    sig = ctypes.create_string_buffer(64)
-    rc = na.crypto_sign_detached(sig, None, msg, ctypes.c_ulonglong(len(msg)), sk)
-    ctypes.memset(sk, 0, 64)
-    if rc != 0:
-        raise SystemExit("varek_cyclonedx: signing failed")
-    bom["signature"]["value"] = _b64u(sig.raw)
-    return pk.raw
+    try:
+        if na.crypto_sign_seed_keypair(pk, sk, seed) != 0:
+            raise SystemExit("varek_cyclonedx: cannot derive the key pair")
+        bom.pop("signature", None)
+        bom["signature"] = {"algorithm": "Ed25519",
+                            "publicKey": {"kty": "OKP", "crv": "Ed25519", "x": _b64u(pk.raw)}}
+        msg = jcs(bom)
+        sig = ctypes.create_string_buffer(64)
+        if na.crypto_sign_detached(sig, None, msg, ctypes.c_ulonglong(len(msg)), sk) != 0:
+            raise SystemExit("varek_cyclonedx: signing failed")
+        bom["signature"]["value"] = _b64u(sig.raw)
+        return pk.raw
+    finally:
+        ctypes.memset(sk, 0, 64)
+        ctypes.memset(seed, 0, 32)
 
 
-def verify_bom(path, pubkey_arg=None):
-    """Check a BOM's JSF Ed25519 signature. Returns 0 if it verifies (and, with
-    pubkey_arg, was made by that key), else 1, saying why."""
+def _no_duplicate_keys(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError(f"duplicate key {k!r}")
+        d[k] = v
+    return d
+
+
+def verify_bom(path, pubkey_arg):
+    """Check a BOM's JSF Ed25519 signature against the key the caller trusts.
+    Returns 0 if it verifies under that key, else 1, saying why. The key the BOM
+    carries is not trusted: anyone can sign a BOM with a key of their own."""
     try:
         with open(path, encoding="utf-8") as fh:
-            bom = json.load(fh)
+            bom = json.load(fh, object_pairs_hook=_no_duplicate_keys)
     except (OSError, ValueError) as e:
         print(f"varek_cyclonedx: {path}: cannot read ({e})", file=sys.stderr)
         return 1
@@ -590,17 +616,40 @@ def verify_bom(path, pubkey_arg=None):
         print(f"varek_cyclonedx: {path}: signature does NOT verify (the BOM was changed "
               f"after signing, or the signature is not for it)", file=sys.stderr)
         return 1
-    if pubkey_arg is not None and pk != _read_hex32(pubkey_arg, "--pubkey"):
-        print(f"varek_cyclonedx: {path}: signature verifies, but under key {pk.hex()}, "
-              f"not the one given", file=sys.stderr)
+    if pk != _read_hex32(pubkey_arg, "--pubkey"):
+        print(f"varek_cyclonedx: {path}: signed under key {pk.hex()}, not the one given",
+              file=sys.stderr)
         return 1
-    log_pk = ""
-    for p in ((bom.get("metadata") or {}).get("component") or {}).get("properties", []):
-        if isinstance(p, dict) and p.get("name") == "varek:log.pubkey":
-            log_pk = p.get("value") or ""
-    same = " (the key that signed the run's verdict stream)" if log_pk == pk.hex() else ""
-    print(f"varek_cyclonedx: {path}: signature OK, key {pk.hex()}{same}")
+    print(f"varek_cyclonedx: {path}: signature OK under the key given ({pk.hex()})")
     return 0
+
+
+def check_stream_signatures(meta, pubkey_arg, complete):
+    """v1.18.0: verify the stream's signed records against the key the caller
+    trusts (as tools/varek_audit.py --pubkey does for the signatures). Raises
+    StreamError on any failure; returns the key's hex."""
+    pk = _read_hex32(pubkey_arg, "--pubkey")
+    lg = meta.get("log")
+    if not lg:
+        raise StreamError("varek_cyclonedx: --pubkey given, but the stream is not chained "
+                          "(a Warden before v1.16): nothing is signed. Refusing to emit a BOM.")
+    named = str(meta.get("run_start", {}).get("log_pubkey", ""))
+    if named != pk.hex():
+        raise StreamError(f"varek_cyclonedx: run_start names signing key {named or '(none)'}, "
+                          f"not the one given. Refusing to emit a BOM.")
+    signed = lg.get("signed", [])
+    for c in signed:
+        if not c.get("sig"):
+            raise StreamError(f"varek_cyclonedx: line {c['line']}: {c['event']} record is not "
+                              f"signed. Refusing to emit a BOM.")
+        if not varek_ed25519.verify(pk, LOG_SIG_DOMAIN + c["chain"], bytes.fromhex(c["sig"])):
+            raise StreamError(f"varek_cyclonedx: line {c['line']}: {c['event']} signature does "
+                              f"not verify under the key given. Refusing to emit a BOM.")
+    if not signed or signed[0]["event"] != "run_start" or \
+            (complete and signed[-1]["event"] != "run_end"):
+        raise StreamError("varek_cyclonedx: the stream's signed records do not cover it from "
+                          "run_start to run_end. Refusing to emit a BOM.")
+    return pk.hex()
 
 
 def main(argv=None):
@@ -616,10 +665,17 @@ def main(argv=None):
     ap.add_argument("--allow-incomplete", action="store_true",
                     help="attest a stream with no run_end record (marked run.complete=false)")
     ap.add_argument("--sign-key", help="sign the BOM (JSF, Ed25519) with this varek_keygen key file")
-    ap.add_argument("--verify", metavar="BOM", help="verify a signed BOM and exit")
-    ap.add_argument("--pubkey", help="with --verify: require this public key (hex, or a .pub file)")
+    ap.add_argument("--verify", metavar="BOM",
+                    help="verify a signed BOM against --pubkey and exit")
+    ap.add_argument("--pubkey", help="the Warden's log public key (hex, or its .pub file): with "
+                    "--verify, the key the BOM must be signed with; when exporting, the key "
+                    "the stream's signatures must verify under")
     args = ap.parse_args(argv)
     if args.verify:
+        if not args.pubkey:
+            print("varek_cyclonedx: --verify needs --pubkey: a signature under the key the BOM "
+                  "carries proves only that someone holding that key signed it", file=sys.stderr)
+            return 2
         return verify_bom(args.verify, args.pubkey)
 
     # Split on '\n' only, so a '\r' the agent wrote cannot start a new line.
@@ -635,7 +691,11 @@ def main(argv=None):
     serial = args.serial or f"urn:uuid:{uuid.uuid4()}"
     lg = meta.get("log")
     log_info = {"chain": (lg["head"].hex() if lg else "none"),
-                "pubkey": str(meta.get("run_start", {}).get("log_pubkey", ""))}
+                "pubkey": str(meta.get("run_start", {}).get("log_pubkey", "")),
+                "signable": len(lg["signed"]) if lg else 0,
+                "sigs": sum(1 for c in lg["signed"] if c.get("sig")) if lg else 0}
+    if args.pubkey:
+        log_info["verified_key"] = check_stream_signatures(meta, args.pubkey, complete)
     recorded_sha = str(meta.get("run_start", {}).get("policy_sha256", ""))
     if args.policy is None:
         # v1.18.0: name the policy the Warden recorded, not a fixed label (the

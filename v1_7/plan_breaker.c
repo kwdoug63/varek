@@ -59,20 +59,72 @@ uint64_t plan_breaker_signature(const plan_action_desc_t *actions,
     return h;
 }
 
+static uint64_t step_hash(const plan_action_desc_t *a)
+{
+    uint64_t h = 0xCBF29CE484222325ULL;
+    h = fnv1a_str(h, a->name);
+    uint64_t nn = (uint64_t)a->n_named_args;
+    h = fnv1a(h, &nn, sizeof nn);
+    for (size_t j = 0; j < a->n_named_args; j++) {
+        h = fnv1a_str(h, a->named_args[j].key);
+        h = fnv1a_str(h, a->named_args[j].value);
+    }
+    return h;
+}
+
+static int cmp_u64(const void *x, const void *y)
+{
+    uint64_t a = *(const uint64_t *)x, b = *(const uint64_t *)y;
+    return (a > b) - (a < b);
+}
+
+static int cmp_pair(const void *x, const void *y)
+{
+    const uint64_t *a = x, *b = y;
+    if (a[0] != b[0]) return (a[0] > b[0]) - (a[0] < b[0]);
+    return (a[1] > b[1]) - (a[1] < b[1]);
+}
+
 uint64_t plan_breaker_signature_graph(const plan_action_desc_t *actions,
                                       size_t n_actions,
                                       const uint32_t *edge_from,
                                       const uint32_t *edge_to,
                                       size_t n_edges)
 {
-    uint64_t h = plan_breaker_signature(actions, n_actions);
-    uint64_t ne = (uint64_t)n_edges;
-    h = fnv1a(h, "edges", 5);
-    h = fnv1a(h, &ne, sizeof ne);
+    /* Canonical: the multiset of steps (each hashed from its name and
+     * arguments) and the set of edges written as (step, step) pairs, both
+     * sorted. Listing the steps or the edges in another order, repeating an
+     * edge, or renumbering the steps gives the same signature. Two identical
+     * steps are indistinguishable, which can only merge graphs (a stricter
+     * count), never split one. If allocation fails, the signature is derived
+     * from the steps alone. */
+    uint64_t *st = calloc(n_actions ? n_actions : 1, sizeof *st);
+    uint64_t *ed = calloc(2 * (n_edges ? n_edges : 1), sizeof *ed);
+    if (!st || !ed) { free(st); free(ed); return plan_breaker_signature(actions, n_actions) ^ 1; }
+    for (size_t i = 0; i < n_actions; i++) st[i] = step_hash(&actions[i]);
+    size_t ne = 0;
     for (size_t i = 0; edge_from && edge_to && i < n_edges; i++) {
-        uint32_t e[2] = { edge_from[i], edge_to[i] };
-        h = fnv1a(h, e, sizeof e);
+        if (edge_from[i] >= n_actions || edge_to[i] >= n_actions) continue;
+        ed[2 * ne]     = st[edge_from[i]];
+        ed[2 * ne + 1] = st[edge_to[i]];
+        ne++;
     }
+    qsort(st, n_actions, sizeof *st, cmp_u64);
+    qsort(ed, ne, 2 * sizeof *ed, cmp_pair);
+    uint64_t h = 0xCBF29CE484222325ULL;
+    h = fnv1a(h, "graph-1", 7);
+    uint64_t na = (uint64_t)n_actions;
+    h = fnv1a(h, &na, sizeof na);
+    h = fnv1a(h, st, n_actions * sizeof *st);
+    uint64_t nu = 0;
+    for (size_t i = 0; i < ne; i++) {
+        if (i && ed[2 * i] == ed[2 * i - 2] && ed[2 * i + 1] == ed[2 * i - 1]) continue;
+        h = fnv1a(h, &ed[2 * i], 2 * sizeof *ed);
+        nu++;
+    }
+    h = fnv1a(h, &nu, sizeof nu);
+    free(st);
+    free(ed);
     return h;
 }
 
@@ -269,6 +321,9 @@ int plan_breaker_save(const plan_breaker_t *b, FILE *out)
                     e->latched_action ? e->latched_action : "-") < 0)
             return -1;
     }
+    /* The trailer: a file cut short, even at a line boundary, does not read
+     * back as a smaller table. */
+    if (fprintf(out, "end %zu\n", b->n) < 0) return -1;
     return fflush(out) == 0 ? 0 : -1;
 }
 
@@ -292,10 +347,19 @@ int plan_breaker_load(plan_breaker_t *b, FILE *in,
     char line[1024];
     if (!fgets(line, sizeof line, in) || strcmp(line, "varek-breaker 1\n") != 0)
         return -1;
+    bool ended = false;
     while (fgets(line, sizeof line, in)) {
         size_t len = strlen(line);
+        if (ended) return -1;                                /* data after the trailer */
         if (len == 0 || line[len - 1] != '\n') return -1;   /* over-long or cut */
         line[len - 1] = '\0';
+        if (strncmp(line, "end ", 4) == 0) {
+            char *endp = NULL;
+            unsigned long long n = strtoull(line + 4, &endp, 10);
+            if (!endp || *endp || line[4] < '0' || line[4] > '9' || n != b->n) return -1;
+            ended = true;
+            continue;
+        }
         char sess_hex[520], action[256];
         char sig_hex[17];
         unsigned refusals;
@@ -338,7 +402,7 @@ int plan_breaker_load(plan_breaker_t *b, FILE *in,
             if (!e->latched_action) e->latched_outcome = PLAN_BREAKER_TERMINAL_DENY;
         }
     }
-    return ferror(in) ? -1 : 0;
+    return (ferror(in) || !ended) ? -1 : 0;
 }
 
 const char *plan_breaker_outcome_name(plan_breaker_outcome_t o)

@@ -241,8 +241,8 @@ test-v1170: warden tools/vdp_cert_check tools/varek_keygen tests/v1170_probe
 # check needs tools/requirements-test.txt.
 test-v1180: warden tools/vdp_cert_check tools/varek_keygen tests/v1180_probe tests/test_v14_filter
 	@$(MAKE) -s --no-print-directory -C $(V1_7_DIR) tests/test_v118
-	@$(V1_7_DIR)/tests/test_v118 | tail -1
-	@sudo ./tests/test_v14_filter | grep -E '^(io_uring_setup|PASS)'
+	@out="$$($(V1_7_DIR)/tests/test_v118)"; rc=$$?; printf '%s\n' "$$out" | tail -1; exit $$rc
+	@sudo ./tests/test_v14_filter
 	@sudo ./tests/test_v1180.sh ./warden ./tools/vdp_cert_check ./tools/varek_keygen $(abspath tests/v1180_probe)
 
 # v1.16.2: the off-host anchor. A receiver behind a private sshd on

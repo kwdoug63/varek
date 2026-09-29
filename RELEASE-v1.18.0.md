@@ -28,9 +28,13 @@ verdict with UNKNOWN suppressed to DENY, the certificates and the
 symmetric-suppression invariant (**no extension may move a genuinely unsafe
 action to SATISFIED**).
 
-`make test-v1180` has 48 checks, plus the v1.7 layer's new test (40) and the
-live filter's io_uring probe. 28 of the 48 fail against the v1.17.0 Warden.
-Every earlier suite still passes.
+`make test-v1180` has 66 checks, plus the v1.7 layer's new test (56) and the
+live filter's io_uring probe; 42 of the 66 fail against the v1.17.0 Warden.
+Every earlier suite still passes. An independent review of the first build of
+this release found three further problems in the new breaker and exporter code
+(a count that could be reset, a signature that depended on edge order, and a
+BOM verification that trusted the key inside the BOM); they are fixed here and
+covered by the suite.
 
 ## The plan gate runs the whole v1.7–v1.9 pipeline
 
@@ -53,24 +57,44 @@ the Warden's `--plan` gate", but the Warden never called it.
   lexically canonical path the node check decides on, so a flow rule cannot be
   stepped around with `..`.
 - **The breaker** counts each refused plan against (`--session <id>`, the
-  plan's signature). The signature now covers the plan's edges as well as its
-  steps (`plan_breaker_signature_graph()`); with steps alone, authorizing the
-  same steps without the leaking edge cleared the leaking plan's count. After
-  the policy's `refusal_budget` the outcome latches to its `on_exhaustion`
-  disposition; an UNKNOWN goes straight to `unknown_disposition`.
+  plan's signature). After the policy's `refusal_budget` the outcome latches to
+  its `on_exhaustion` disposition; an UNKNOWN goes straight to
+  `unknown_disposition`. The signature (`plan_breaker_signature_graph()`) is
+  canonical over the plan's steps and edges: listing steps or edges in another
+  order, repeating an edge or renumbering the steps gives the same signature,
+  while the same steps with different edges give a different one (with steps
+  alone, authorizing the steps without the leaking edge cleared the leaking
+  plan's count).
 - **The breaker's counts persist.** The Warden gates one plan per launch, so an
-  in-memory breaker would forget every refusal. The counts are kept in
-  `--breaker-state` (default `/var/lib/varek/breaker.state`): opened without
-  following symlinks, refused unless it is a regular file owned by the Warden's
-  user and writable by no one else, locked while in use, and protected from the
-  agent by identity, like the signing key (v1.17.0). A state file that cannot
-  be read back refuses the plan rather than starting the counts again.
+  in-memory breaker would forget every refusal. The table is kept in
+  `--breaker-state <dir>/<name>` (default `/var/lib/varek/breaker.state`). The
+  Warden refuses to start unless `<dir>` is owned by its user and writable by no
+  one else, the table (if present) and `<name>.lock` are its user's regular
+  files writable by no one else, and the policy lets the agent open none of
+  them. `<name>.lock` is held while the gate reads, steps and writes the table,
+  and released before the agent runs. The table is written to `<name>.tmp`,
+  synced and renamed into place, so a Warden killed mid-write (a crash, a full
+  disk, a file-size limit) leaves the previous table. A table that does not
+  read back (empty, cut short, altered; it ends with a count of its entries)
+  refuses the plan with exit 1, a state fault rather than a verdict. The lock
+  file and the table are also refused to the agent by identity, like the
+  signing key (v1.17.0).
+- **Who sets the count.** The count is per session and per state file, and
+  whoever starts the Warden chooses both. It bounds a host that resubmits
+  through a launcher it does not control (a service unit or wrapper that fixes
+  `--session` and `--breaker-state`); a host that can choose them can start a
+  new count.
 
-Exit status: 0, the agent ran; 3, refused, the host may submit a different
-plan; 4, terminal deny; 5, terminal, and the message names the pre-authorized
-action the host must run. A `plan_gate` record in the verdict stream (chained,
-and sealed by the next signed checkpoint) holds both axes, the breaker's
-outcome and the counts; `varek_audit.py` and the exporter accept it.
+Outcome: when the plan is refused, the agent never runs and the Warden exits 3
+(the host may submit a different plan), 4 (terminal deny) or 5 (terminal: the
+message names the pre-authorized action the host must run), or 1 on an error.
+When it is authorized, the Warden exits with the agent's status, which can also
+be 3, 4 or 5. So a host that acts on the outcome reads `--gate-status <file>`
+(one line, written before the agent starts: `PASS`, `REFUSED_RETRYABLE
+n/budget`, `TERMINAL_DENY`, `TERMINAL_ACTION <name>` or `ERROR ...`) or the
+`plan_gate` record in the verdict stream (chained, and sealed by the next signed
+checkpoint), which holds both axes, the breaker's outcome and the counts;
+`varek_audit.py` and the exporter accept it.
 
 Without `--flow-policy`, `--plan` behaves as before apart from the next change.
 
@@ -91,9 +115,15 @@ and `@`, so it also matched `https://evil.example/x.internal.acme.com/` and
 `https://evil.example#.internal.acme.com/`. A match key of the form
 `<arg>.host`, `<arg>.scheme`, `<arg>.port` or `<arg>.path` now parses the named
 argument strictly as an absolute URL and matches the pattern against that one
-component. A URL with userinfo (`@`), a backslash in the authority, a host with
-anything but letters, digits, dots and hyphens (or a bracketed IPv6 literal),
-or a port outside 1–65535 matches nothing. The examples now say:
+component. Scheme and host are lower-cased and one trailing dot is dropped
+from the host; the path is matched as written. Such a key is always derived
+from the URL, never read from an argument literally named `url.host`. If the
+component cannot be read (userinfo `@`, a backslash in the authority, a host
+with anything but letters, digits, dots and hyphens or with an empty label, a
+port outside 1–65535, a path with `%`, `\` or a `.`/`..` segment), the whole
+action fails classification and the plan is refused: with first-match-wins, a
+deny rule that merely did not match an unreadable URL would let it fall through
+to a later permissive rule. The examples now say:
 
 ```
 rule send_http
@@ -124,9 +154,15 @@ model say not to use one for hosts.
 - **A signature.** `--sign-key <key>` signs the BOM with the Warden's log key
   (from `varek_keygen`) in the JSON Signature Format that CycloneDX 1.6 defines:
   Ed25519 over the JCS-canonical BOM, made with libsodium.
-  `--verify <bom> [--pubkey <key.pub>]` checks it with the audit's own
-  pure-Python Ed25519, and says whether the key is the one that signed the
-  run's stream.
+  `--verify <bom> --pubkey <key.pub>` checks it with the audit's own
+  pure-Python Ed25519 against the key the caller trusts. `--pubkey` is
+  required: anyone can sign a BOM with a key of their own, so the key inside
+  the BOM proves nothing. A BOM with a duplicated JSON key is refused.
+- **The stream's signatures, checked.** With `--pubkey` when exporting, the
+  stream's signed records must name and verify under that key from `run_start`
+  to `run_end`, or no BOM is written, and the attestation says they verified.
+  Without it, the attestation says how many signed records the stream carries
+  and that they were not checked.
 - **Schema-tested.** `make test-v1180` and CI validate unsigned and signed BOMs
   against the CycloneDX 1.6 schema, using the OWASP CycloneDX project's
   validator (`varek/v1_4/tools/requirements-test.txt`).
@@ -193,11 +229,15 @@ Python binding. It could not run end to end on this release's test host.
 
 - **`--plan` rejects connect and launch steps.** A plan that declared them and
   was authorized before is now rejected (exit 1). Declare file opens only.
-- **New exit codes with `--flow-policy`:** 3, 4 and 5 (see above). Without it,
-  exit codes are unchanged.
+- **New exit codes with `--flow-policy`:** 3, 4 and 5 when the plan is
+  refused, 1 on an error (see above); after an authorized plan, the agent's
+  status as before. Without `--flow-policy`, exit codes are unchanged.
+- **Flow rules on URL components** refuse a plan whose URL they cannot read,
+  rather than skipping the rule.
 - **Exporter:** `--policy` defaults to the recorded policy path, and a
-  mismatching policy file is refused. The attestation text and the run
-  component's properties changed; the BOM structure did not.
+  mismatching policy file is refused. `--verify` needs `--pubkey`. The
+  attestation text and the run component's properties changed; the BOM
+  structure did not.
 - **Records:** a refusal's `kernel_verdict` is `EACCES` (was `EPERM`); a
   `plan_gate` event may appear before the first decision record.
 - **Build:** the Warden links the v1.7 layer (no new library). The schema check
@@ -206,17 +246,22 @@ Python binding. It could not run end to end on this release's test host.
 
 ## Known limits
 
-- The breaker bounds resubmissions of the same action-graph. A planner that
-  submits a different graph each time is counted per graph, not in total.
+- The breaker bounds resubmissions of the same action-graph (up to the order of
+  its steps and edges). A planner that submits a different graph each time,
+  even one extra step, is counted per graph, not in total. The count is per
+  session and state file, both chosen by whoever starts the Warden.
 - The plan gate still decides file opens on the lexically canonical declared
   path, without following symlinks; every open is still mediated at runtime.
 - In the Warden, flow rules see one argument per step (`target`); the plan file
   has no field for others.
 - The deployment preflight does not know about `--flow-policy` or the breaker
   state file.
-- The breaker state is rewritten in place. If the Warden dies during that write,
-  the file will not read back, and every plan is refused until an operator
-  inspects the file or removes it (which resets every count).
+- A table that has been damaged (not merely interrupted: the write is atomic)
+  refuses every plan until an operator inspects it or removes it, which resets
+  every count.
+- Identity protection covers the table inodes this Warden sees; the startup
+  check that the policy reaches none of the breaker's files covers a table a
+  concurrent Warden writes later.
 - The Verdict Service's plan checker (`v1_6/plan_verify_cli.c`) is unchanged.
   It remains a demonstration with a built-in policy, as its v1.16.3 notes say.
 
