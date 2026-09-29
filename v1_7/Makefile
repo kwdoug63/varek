@@ -37,6 +37,7 @@ EXAMPLE      := warden_example
 # v1.18.0: the v1.8.2 breaker and v1.9 progress tests were built by hand only;
 # `make check` now runs them, and test_v118 (URL host matching, breaker state).
 # v1.19.0: test_v119 (the session's refusal limit).
+# v1.20.0: test_v120 (rules on declared fields).
 TESTS := tests/test_dataflow \
          tests/test_v17_1 \
          tests/test_v17_2 \
@@ -46,7 +47,8 @@ TESTS := tests/test_dataflow \
          tests/test_v18_2_breaker \
          tests/test_v19_progress \
          tests/test_v118 \
-         tests/test_v119
+         tests/test_v119 \
+         tests/test_v120
 
 # The v1.9.2 kernel checks need libseccomp and a Linux x86_64 kernel.
 SECCOMP_TESTS := tests/test_v192_abi_lockdown tests/test_v192_baseline_deny

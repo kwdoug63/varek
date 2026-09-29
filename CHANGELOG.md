@@ -25,11 +25,11 @@ holder and bounds the cost of one decision. v1.17.0 and v1.18.0 are also outside
 the program: v1.17.0 protects the Warden's own files and drops the agent's root
 privileges, and v1.18.0 fixes where the public claims and the code disagreed
 (the plan gate's data-flow check, breaker and signed BOM export); v1.19.0 adds
-a refusal limit per session to the breaker. None of them changes the
-verification program. Still planned: a customer-derived corpus and measured baseline, a
+a refusal limit per session to the breaker, and v1.20.0 fields on plan steps.
+None of them changes the verification program. Still planned: a customer-derived corpus and measured baseline, a
 formally verified checker, and the v1.11 sequence fragment (issues #21–#25).
 
-### Planned — v1.10 program (status as of v1.19.0; unchanged since v1.16.0)
+### Planned — v1.10 program (status as of v1.20.0; unchanged since v1.16.0)
 
 - **Verdict-distribution harness.** Measurement and regression gating over a
   corpus of realistic agent action-graphs. Reports the four-cell outcome
@@ -63,6 +63,53 @@ formally verified checker, and the v1.11 sequence fragment (issues #21–#25).
   fragment's guarantee.
 
 ---
+
+## [1.20.0] - 2026-09-29
+
+v1.20.0 lets a plan step declare fields besides its target, for the data-flow
+policy to match. It extends the plan file format and adds a flow-policy
+directive, so it is a minor release. Per-call verdicts are unchanged.
+
+### Added
+
+- Plan step fields: `action <label> <kind> <target> [<key>=<value> ...]`, up to
+  16 per step. Keys `[a-z][a-z0-9_]*` (at most 32, unique, not `target`);
+  values bare or quoted with `\"` `\\` `\n` `\r` `\t` `\xHH` escapes (not
+  `\x00`), at most 4096 bytes. `plan_parser_fields()` returns them;
+  `plan_spec_action_t` is unchanged.
+- The Warden's `--flow-policy` rules see each step's fields as named arguments
+  beside `target`, in key order. The node check and the runtime see only the
+  target. Fields are part of the breaker signature (order-independent).
+- `trust_declared_fields` (flow policy). The Warden refuses a flow policy with a
+  rule that matches an argument other than `target` unless it declares this:
+  the agent chooses its fields, so declaring or omitting one can unlock a
+  permit, avoid a refusal or skip a stricter rule.
+  `plan_label_policy_config_field_rule()` and
+  `plan_label_policy_config_trusts_declared_fields()`.
+- `make test-v1200`: `v1_6/tests/test_plan_fields` (48 checks, in
+  `make -C v1_6 check`), `v1_7/tests/test_v120` (14, in `make -C v1_7 check`)
+  and `varek/v1_4/tests/test_v1200.sh` (22; 21 fail against v1.19.0).
+
+### Changed
+
+- Plan file lines may hold 16383 bytes (were 1022); targets at most 4095
+  bytes; a NUL byte refuses the file (the parser reads with `getline`, so it
+  sees one).
+- The node check calls a target that does not fit the Warden's path buffer
+  UNKNOWN instead of truncating it.
+- `run_start` says `"warden":"1.20.0"`; the default policy version is `1.20`.
+- Docs: the plan grammar in the Warden's usage, `v1_6/README.md`,
+  `v1_6/sample_plan.txt`, `varek/v1_4/README.md` and the data-flow threat
+  model; `v1_6/plan_verify` reads fields and ignores them.
+
+### Found in review
+
+An independent review of this release's code found that, with the longer
+lines, a target could exceed the Warden's 4096-byte path buffer and the node
+check decided the truncated path: a 10 KB target that collapses to a denied
+file was authorized at the gate (every open was still decided at runtime).
+Fixed before release by the target limit and the UNKNOWN above. It also led to
+`trust_declared_fields`, the NUL check and the exact line limit.
 
 ## [1.19.0] - 2026-09-29
 

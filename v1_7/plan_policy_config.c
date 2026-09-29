@@ -44,6 +44,7 @@ struct plan_label_policy_config {
     bool               budget_set;
     unsigned           refusal_budget;
     bool               session_budget_set;      /* v1.19.0 */
+    bool               trust_declared_fields;   /* v1.20.0 */
     unsigned           session_refusal_budget;
     bool               on_exhaustion_set;
     bool               unknown_disp_set;
@@ -83,6 +84,8 @@ static const char *ERR_BUDGET_DUP           = "duplicate 'refusal_budget' direct
 static const char *ERR_SBUDGET_BAD          = "'session_refusal_budget' requires a positive integer";
 static const char *ERR_SBUDGET_DUP          = "duplicate 'session_refusal_budget' directive";
 static const char *ERR_SBUDGET_ALONE        = "'session_refusal_budget' requires 'refusal_budget'";
+static const char *ERR_TRUST_ARGS           = "'trust_declared_fields' takes no arguments";
+static const char *ERR_TRUST_DUP            = "duplicate 'trust_declared_fields' directive";
 static const char *ERR_DISP_BAD             = "disposition must be 'deny' or 'terminal NAME'";
 static const char *ERR_DISP_DUP_EXH         = "duplicate 'on_exhaustion' directive";
 static const char *ERR_DISP_DUP_UNK         = "duplicate 'unknown_disposition' directive";
@@ -184,6 +187,16 @@ static const char *handle_strict(parse_state_t *st, int n_tokens, char **tokens)
     (void)tokens;
     if (n_tokens != 1) return ERR_STRICT_EXTRA_ARGS;
     st->cfg->table.strict = true;
+    return NULL;
+}
+
+/* v1.20.0: the operator accepts rules that match fields the agent declares. */
+static const char *handle_trust_fields(parse_state_t *st, int n_tokens, char **tokens)
+{
+    (void)tokens;
+    if (n_tokens != 1) return ERR_TRUST_ARGS;
+    if (st->cfg->trust_declared_fields) return ERR_TRUST_DUP;
+    st->cfg->trust_declared_fields = true;
     return NULL;
 }
 
@@ -443,6 +456,8 @@ int plan_label_policy_config_load_stream(FILE *stream,
             const char *kw = tokens[0];
             if      (strcmp(kw, "varek_policy") == 0) err = handle_varek_policy(&st, n_tokens, tokens);
             else if (strcmp(kw, "strict")       == 0) err = handle_strict(&st, n_tokens, tokens);
+            else if (strcmp(kw, "trust_declared_fields") == 0)
+                err = handle_trust_fields(&st, n_tokens, tokens);
             else if (strcmp(kw, "label")        == 0) err = handle_label(&st, n_tokens, tokens);
             else if (strcmp(kw, "sticky")       == 0) err = handle_sticky(&st, n_tokens, tokens);
             else if (strcmp(kw, "rule")         == 0) err = handle_rule(&st, n_tokens, tokens);
@@ -571,6 +586,32 @@ unsigned plan_label_policy_config_refusal_budget(const plan_label_policy_config_
 unsigned plan_label_policy_config_session_refusal_budget(const plan_label_policy_config_t *cfg)
 {
     return cfg && cfg->session_budget_set ? cfg->session_refusal_budget : 0u;
+}
+
+bool plan_label_policy_config_trusts_declared_fields(const plan_label_policy_config_t *cfg)
+{
+    return cfg && cfg->trust_declared_fields;
+}
+
+bool plan_label_policy_config_field_rule(const plan_label_policy_config_t *cfg,
+                                         const char **action, const char **key)
+{
+    if (action) *action = NULL;
+    if (key) *key = NULL;
+    if (!cfg) return false;
+    for (size_t i = 0; i < cfg->n_rules; i++) {
+        const plan_label_rule_t *r = &cfg->rules[i];
+        for (size_t j = 0; j < r->n_matches; j++) {
+            const char *k = r->matches[j].key;
+            if (!k) continue;
+            size_t base = strcspn(k, ".");
+            if (base == 6 && strncmp(k, "target", 6) == 0) continue;
+            if (action) *action = r->action_name;
+            if (key) *key = k;
+            return true;
+        }
+    }
+    return false;
 }
 
 plan_disposition_t

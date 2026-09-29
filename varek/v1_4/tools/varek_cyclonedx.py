@@ -83,7 +83,7 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import varek_ed25519  # noqa: E402  (pure-Python RFC 8032 verification)
 
-VAREK_VERSION = "1.19.0"
+VAREK_VERSION = "1.20.0"
 SPEC_VERSION = "1.6"
 
 # The provisional patents, as recorded in the runtime's own documentation.

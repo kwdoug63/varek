@@ -29,9 +29,13 @@ A deployment relies on both. Read both.
 > refusal breaker (counts kept across runs in a state file the agent cannot
 > reach) and the v1.9 progress-safety check at startup. In the Warden, plan
 > steps reach the flow policy as actions named `file_open`, `net_connect` and
-> `process_exec` with one argument, `target` (the canonical path for a
-> `file_open`), and every `net_connect` and `process_exec` step is refused on
-> the node axis (the runtime refuses them). Rules that match URLs should match
+> `process_exec` with the argument `target` (the canonical path for a
+> `file_open`) and, since v1.20.0, the fields the step declares after its
+> target; every `net_connect` and `process_exec` step is refused on the node
+> axis (the runtime refuses them). Fields are declarations, like the edges:
+> the agent can declare or omit them, so a rule on a field can be unlocked
+> (a permit) or avoided (a refusal), and the Warden refuses a flow policy with
+> such rules unless it declares `trust_declared_fields`. Rules that match URLs should match
 > a component (`match url.host …`), not the whole URL; a URL such a rule cannot
 > read refuses the plan (v1.18.0; see `v1_7/plan_label_policy.h`). The breaker
 > counts per plan and, since v1.19.0, per session (`session_refusal_budget`,

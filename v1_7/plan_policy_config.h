@@ -83,6 +83,14 @@ extern "C" {
  *                                # per v1.9, must authorize). Absent =>
  *                                # deny (fail-closed terminal).
  *
+ *   trust_declared_fields        # v1.20.0. No arguments. Accepts rules
+ *                                # that match an argument other than
+ *                                # target. In the Warden those are the
+ *                                # fields a plan step declares, which the
+ *                                # agent chooses; the Warden refuses a
+ *                                # policy with such rules without this.
+ *                                # See ..._config_field_rule().
+ *
  *   session_refusal_budget N     # v1.19.0. 1 <= N <= 1000000. The most
  *                                # refused submissions one session may
  *                                # make, whatever plans they are. Once N
@@ -176,6 +184,21 @@ unsigned plan_label_policy_config_refusal_budget(const plan_label_policy_config_
 
 /* v1.19.0: the declared session_refusal_budget, 0 when there is none. */
 unsigned plan_label_policy_config_session_refusal_budget(const plan_label_policy_config_t *cfg);
+
+/* v1.20.0: true iff the policy declares trust_declared_fields. */
+bool plan_label_policy_config_trusts_declared_fields(const plan_label_policy_config_t *cfg);
+
+/* v1.20.0: true iff some rule matches an argument other than "target" (or a
+ * component of it, target.host and so on); *action and *key then name the
+ * first such rule and key. In the Warden those arguments are the fields a
+ * plan step declares, so the agent chooses them: declaring or omitting a
+ * field changes which rule applies, which can loosen the verdict (a rule
+ * that permits on a field is unlocked by declaring it; a rule that refuses
+ * on a field is avoided by leaving it out; a field rule placed before a
+ * stricter one shadows it). The Warden refuses such a policy unless it
+ * declares trust_declared_fields. */
+bool plan_label_policy_config_field_rule(const plan_label_policy_config_t *cfg,
+                                         const char **action, const char **key);
 
 /* Terminal disposition once the refusal budget is spent. Defaults to
  * {PLAN_DISP_DENY, NULL} when no on_exhaustion directive is present. */

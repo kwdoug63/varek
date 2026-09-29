@@ -272,7 +272,7 @@ static int policy_load(const char *path, struct policy *p) {
             "(warden_faultinject); never use it to supervise a real agent\n");
 #endif
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.19");
+    snprintf(p->version, sizeof(p->version), "1.20");
     char err[512];
     /* v1.15: read the file once. The decision procedure and the certificate
      * checker parse these same bytes, and their SHA-256 goes in run_start, so
@@ -861,6 +861,9 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
     struct action act;
     memset(&act, 0, sizeof(act));
     act.kind = kind_from_string(a->kind);
+    /* v1.20.0: a target that does not fit is UNKNOWN, never cut short and
+     * decided as the shorter path it would become. */
+    if (a->target && strlen(a->target) >= sizeof(act.target)) return PLAN_DEC_UNKNOWN;
     if (a->target) {
         snprintf(act.target, sizeof(act.target), "%s", a->target);
     }
@@ -1229,7 +1232,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.19.0\","
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.20.0\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
@@ -2827,10 +2830,13 @@ static int find_program(const char *name, char *out, size_t n) {
  *               with its counts kept in --breaker-state across runs.
  *
  * Plan steps reach the flow policy as actions named by their kind (file_open,
- * net_connect, process_exec) with one argument, "target". A file_open target
- * is the lexically canonical path the node check decides on, so a flow rule
- * on a secret directory (match target on /srv/secret/ followed by a star)
- * cannot be stepped around with "..".
+ * net_connect, process_exec) with the argument "target" and (v1.20.0) every
+ * field the step declares (key=value after the target in the plan file), in
+ * key order. A file_open target is the lexically canonical path the node check
+ * decides on, so a flow rule on a secret directory (match target on
+ * /srv/secret/ followed by a star) cannot be stepped around with "..". Fields
+ * reach only the flow policy: the node check and the runtime see the target
+ * alone, and nothing compares the agent's later calls with its fields.
  *
  * The outcome: PASS runs the agent, and the Warden then exits with the agent's
  * status. Otherwise the agent never runs and the Warden exits 3
@@ -2896,6 +2902,18 @@ static int flow_setup(const struct policy *pol, const char *cfg_path, const char
                 "policy can refuse a plan step even when the flow policy cannot, so a "
                 "budget is required to bound resubmissions (add, e.g., refusal_budget 3 "
                 "and on_exhaustion deny); refusing to start\n", cfg_path);
+        return -1;
+    }
+    const char *fr_action = NULL, *fr_key = NULL;
+    if (plan_label_policy_config_field_rule(g_flow_cfg, &fr_action, &fr_key) &&
+        !plan_label_policy_config_trusts_declared_fields(g_flow_cfg)) {
+        fprintf(stderr, "[warden] --flow-policy %s: a rule for %s matches '%s', a field the plan "
+                "step declares. The agent writes its plan, so declaring or omitting a field "
+                "changes which rule applies: a rule that permits on a field is unlocked by "
+                "declaring it, one that refuses on a field is avoided by leaving it out, and a "
+                "field rule placed before a stricter one skips it. Add trust_declared_fields "
+                "to the flow policy to accept that; refusing to start\n", cfg_path,
+                fr_action ? fr_action : "?", fr_key ? fr_key : "?");
         return -1;
     }
     if (plan_label_policy_config_session_refusal_budget(g_flow_cfg) == 0) {
@@ -3128,6 +3146,10 @@ static void gate_status(const char *line) {
     g_gate_status_fd = -1;
 }
 
+static int cmp_arg_key(const void *x, const void *y) {
+    return strcmp(((const plan_action_arg_t *)x)->key, ((const plan_action_arg_t *)y)->key);
+}
+
 static int warden_gate_plan_flow(const char *plan_path, const struct policy *policy) {
     char err[256] = {0};
     plan_parsed_t *parsed = plan_parser_load(plan_path, err, sizeof(err));
@@ -3140,7 +3162,8 @@ static int warden_gate_plan_flow(const char *plan_path, const struct policy *pol
     int result = GATE_ERROR;
     exec_plan_t *plan = NULL;
     plan_action_desc_t *acts = NULL;
-    plan_action_arg_t *args = NULL;
+    plan_action_arg_t *args = NULL;     /* per step: target, then its fields */
+    const size_t per_step = 1 + PLAN_FIELDS_MAX;
     char (*canon)[PATH_LIMIT] = NULL;
     plan_breaker_t *br = NULL;
 
@@ -3151,7 +3174,7 @@ static int warden_gate_plan_flow(const char *plan_path, const struct policy *pol
     }
     plan  = exec_plan_new();
     acts  = calloc(n, sizeof *acts);
-    args  = calloc(n, sizeof *args);
+    args  = calloc(n * per_step, sizeof *args);
     canon = calloc(n, sizeof *canon);
     if (!plan || !acts || !args || !canon) goto out;
 
@@ -3164,11 +3187,22 @@ static int warden_gate_plan_flow(const char *plan_path, const struct policy *pol
         if (sa->kind && strcmp(sa->kind, "file_open") == 0 &&
             plan_lexical_canon(tgt, canon[i], sizeof canon[i]) == 0)
             tgt = canon[i];
-        args[i].key = "target";
-        args[i].value = tgt;
+        plan_action_arg_t *a = &args[i * per_step];
+        a[0].key = "target";
+        a[0].value = tgt;
+        size_t nf = 0;
+        const plan_spec_field_t *fl = plan_parser_fields(parsed, i, &nf);
+        if (nf > PLAN_FIELDS_MAX) goto out;
+        for (size_t k = 0; k < nf; k++) {
+            a[1 + k].key = fl[k].key;
+            a[1 + k].value = fl[k].value;
+        }
+        /* Key order (keys are unique), so declaring the same fields in
+         * another order is the same step, and the same breaker signature. */
+        qsort(&a[1], nf, sizeof *a, cmp_arg_key);
         acts[i].name = sa->kind ? sa->kind : "";
-        acts[i].named_args = &args[i];
-        acts[i].n_named_args = 1;
+        acts[i].named_args = a;
+        acts[i].n_named_args = 1 + nf;
     }
     for (size_t i = 0; i < spec->n_edges; i++)
         if (exec_plan_add_edge(plan, spec->edges[i].from_idx, spec->edges[i].to_idx) != 0) {
@@ -3338,6 +3372,9 @@ static void usage(const char *argv0) {
         "  verification. The target is not forked unless the plan\n"
         "  verifies as SATISFIED against the loaded policy. A net_connect or\n"
         "  process_exec step is UNSATISFIED: the runtime refuses those (v1.18).\n"
+        "  v1.20: a step may declare key=value fields after its target; they\n"
+        "  reach only the --flow-policy's rules (see v1_6/plan_parser.h), and a\n"
+        "  flow policy whose rules match them must declare trust_declared_fields.\n"
         "\n"
         "  v1.18 --flow-policy <cfg> (v1.7 label policy) adds the data-flow check\n"
         "  and the refusal breaker to the gate. At startup <cfg> must pass the v1.9\n"
@@ -3380,8 +3417,10 @@ static void usage(const char *argv0) {
         "  Check a policy with: tools/vdp_check <policy> lint\n"
         "\n"
         "  Plan file format (see varek/v1_6/sample_plan.txt):\n"
-        "    action <label> <kind> <target>\n"
+        "    action <label> <kind> <target> [key=value | key=\"quoted value\" ...]\n"
         "    edge   <from_label> <to_label>\n"
+        "  Fields (v1.20) are declarations: the node check ignores them and\n"
+        "  nothing compares the agent's later calls with them.\n"
         "  A file_open target is verified against the policy on its lexically\n"
         "  canonical path (. and .. collapsed); it must be absolute. Symlinks\n"
         "  are not followed at plan time (there is no agent yet), so the gate is\n"

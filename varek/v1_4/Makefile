@@ -32,7 +32,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen
 
-.PHONY: all deps deps-check preflight clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 crosscheck harness video-v112
+.PHONY: all deps deps-check preflight clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -252,6 +252,14 @@ test-v1190: warden tools/vdp_cert_check tests/v1180_probe
 	@$(MAKE) -s --no-print-directory -C $(V1_7_DIR) tests/test_v119
 	@out="$$($(V1_7_DIR)/tests/test_v119)"; rc=$$?; printf '%s\n' "$$out" | tail -1; exit $$rc
 	@sudo ./tests/test_v1190.sh ./warden ./tools/vdp_cert_check $(abspath tests/v1180_probe)
+
+# v1.20.0: fields on plan steps (key=value after the target), handed to the
+# --flow-policy's rules as named arguments. Also runs the v1.6 parser's field
+# tests.
+test-v1200: warden tools/vdp_cert_check tests/v1180_probe
+	@$(MAKE) -s --no-print-directory -C $(V1_6_DIR) tests/test_plan_fields
+	@out="$$($(V1_6_DIR)/tests/test_plan_fields)"; rc=$$?; printf '%s\n' "$$out" | tail -1; exit $$rc
+	@sudo ./tests/test_v1200.sh ./warden ./tools/vdp_cert_check $(abspath tests/v1180_probe)
 
 # v1.16.2: the off-host anchor. A receiver behind a private sshd on
 # 127.0.0.1:2222 and the forwarder: a run anchored off-host audits "signed,

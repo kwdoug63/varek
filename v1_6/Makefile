@@ -28,7 +28,8 @@ TESTS := tests/test_evaluator \
          tests/test_cycle_detection \
          tests/test_adapter \
          tests/test_pathology \
-         tests/test_plan_parser
+         tests/test_plan_parser \
+         tests/test_plan_fields
 
 .PHONY: all check check-plan-verify demo adapter-demo clean
 
