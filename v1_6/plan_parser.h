@@ -29,6 +29,9 @@
  *     newline; it was 1022 through v1.19.0). A NUL byte refuses the file. Fields are what the agent DECLARES, like the rest
  *     of the plan; nothing checks the agent's later traffic against them.
  *     plan_parser_fields() returns them; plan_spec_action_t is unchanged.
+ *     v1.21.1: the Warden's node check reads one field, a file_open
+ *     step's `open` (open=read, or an access mode then O_ flags joined
+ *     by '|'), and decides the step with those open flags.
  *   - <from_label> / <to_label> must reference action lines already
  *     declared above the edge line.
  *

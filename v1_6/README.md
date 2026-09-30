@@ -176,9 +176,12 @@ edge   <from_label> <to_label>
   v1.4 Warden glue recognizes `file_open`, `net_connect`,
   `process_exec`; everything else maps to `ACT_OTHER` and is
   suppressed under symmetric-suppression semantics. Since v1.18.0
-  the Warden's gate decides every `net_connect` and `process_exec`
-  step UNSATISFIED, because the runtime refuses those whatever the
-  policy says; only `file_open` steps can be SATISFIED.
+  the Warden's gate decides every `process_exec` step UNSATISFIED,
+  because the runtime refuses later launches whatever the policy
+  says. A `net_connect` step is decided like the connect it names
+  (v1.21.0; from v1.18.0 to v1.20.0 it was UNSATISFIED too), and a
+  `file_open` step with the flags its `open` field declares
+  (v1.21.1).
 - `<target>` is a single whitespace-free token, at most 4095 bytes.
 - v1.20.0: after the target, up to 16 fields, `key=value`. A key is
   `[a-z][a-z0-9_]*` (at most 32 characters, unique in the action, not
@@ -186,9 +189,11 @@ edge   <from_label> <to_label>
   or quoted, `"..."`, with `\"`, `\\`, `\n`, `\r`, `\t` and `\xHH`
   (not `\x00`); at most 4096 bytes. A line is at most 16383 bytes, and a
   NUL byte refuses the file. `plan_parser_fields()` returns a step's
-  fields. The Warden hands them to its `--flow-policy` rules; the node
-  check (and this directory's Verdict Service front end, `plan_verify`)
-  ignores them. They are declarations: nothing compares the agent's later
+  fields. The Warden hands them to its `--flow-policy` rules. Its node
+  check reads one of them from v1.21.1, a `file_open` step's `open` field
+  (`open=read`, or `open=O_WRONLY|O_CREAT|...`), and decides the step with
+  those open flags; see `varek/v1_4/README.md`. This directory's Verdict
+  Service front end, `plan_verify`, ignores fields. They are declarations: nothing compares the agent's later
   calls with them.
 - Edge labels must reference action lines declared earlier in
   the file. Self-edges are rejected at parse time.

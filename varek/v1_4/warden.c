@@ -952,7 +952,97 @@ static int plan_lexical_canon(const char *in, char *out, size_t outlen) {
 
 struct warden_plan_ud {
     const struct policy *policy;
+    /* v1.21.1: the parsed plan, so the node check can read a step's `open`
+     * field (NULL: no fields). */
+    const plan_parsed_t *parsed;
+    const plan_spec_t   *spec;
 };
+
+/* v1.21.1: how a file_open step says it will open its file.
+ *
+ * A plan step has no open flags of its own, so through v1.21.0 the node check
+ * decided a file_open step with the flags unknown, and a path allowed only by
+ * a rule with a flag clause (`readonly`, `access=ro`, `-O_TRUNC`, ...) was
+ * UNKNOWN at the gate although the runtime allowed the same open. A step may
+ * now declare its flags in an `open` field:
+ *
+ *   open=read                      O_RDONLY, nothing else (what `readonly` allows)
+ *   open=O_WRONLY|O_CREAT|O_TRUNC  an access mode (O_RDONLY, O_WRONLY or O_RDWR)
+ *                                  first, then any of the flags below, each once
+ *
+ * A name has the value an agent's open() passes for it: O_SYNC and O_TMPFILE
+ * are glibc's composites (O_SYNC includes O_DSYNC, O_TMPFILE includes
+ * O_DIRECTORY), and O_LARGEFILE is the kernel's bit, which is also what the
+ * name means in a policy's flag clauses.
+ *
+ * The step is then decided and certified with exactly those flags, as the
+ * runtime decides an open with the flags the agent passes. Nothing binds the
+ * agent's later opens to them (as with every declaration in a plan): an open
+ * with other flags is decided on its own flags at run time. A value that is
+ * not one of these forms, an `open` field on another kind of step, or a
+ * repeated flag makes the step UNKNOWN, with the reason logged.
+ * Returns 1 and sets *flags for a valid field, 0 when the step has no `open`
+ * field, -1 (with why) when the field is present but not understood. */
+static const struct { const char *name; int bits; } kPlanOpenFlags[] = {
+    { "O_CREAT", O_CREAT },       { "O_EXCL", O_EXCL },           { "O_NOCTTY", O_NOCTTY },
+    { "O_TRUNC", O_TRUNC },       { "O_APPEND", O_APPEND },       { "O_NONBLOCK", O_NONBLOCK },
+    { "O_DSYNC", O_DSYNC },       { "O_ASYNC", O_ASYNC },         { "O_DIRECT", O_DIRECT },
+    /* The kernel's bit, as the policy language names it (smt_decide.c
+     * K_O_LARGEFILE): glibc defines O_LARGEFILE as 0 on x86_64, which would
+     * make a declared O_LARGEFILE mean no flag at all. */
+    { "O_LARGEFILE", 0100000 },   { "O_DIRECTORY", O_DIRECTORY }, { "O_NOFOLLOW", O_NOFOLLOW },
+    { "O_NOATIME", O_NOATIME },   { "O_CLOEXEC", O_CLOEXEC },     { "O_SYNC", O_SYNC },
+    { "O_PATH", O_PATH },         { "O_TMPFILE", O_TMPFILE },
+};
+
+static int plan_open_field(const struct warden_plan_ud *u, const plan_spec_action_t *a,
+                           int *flags, char *why, size_t wn) {
+    if (!u->parsed || !u->spec || a < u->spec->actions ||
+        a >= u->spec->actions + u->spec->n_actions)
+        return 0;
+    size_t nf = 0;
+    const plan_spec_field_t *fl = plan_parser_fields(u->parsed, (size_t)(a - u->spec->actions), &nf);
+    const char *v = NULL;
+    for (size_t k = 0; k < nf; k++)
+        if (fl[k].key && !strcmp(fl[k].key, "open")) { v = fl[k].value ? fl[k].value : ""; break; }
+    if (!v) return 0;
+    if (!a->kind || strcmp(a->kind, "file_open")) {
+        snprintf(why, wn, "an open field is only for a file_open step");
+        return -1;
+    }
+    if (!strcmp(v, "read")) { *flags = O_RDONLY; return 1; }
+    char buf[512];
+    if (strlen(v) >= sizeof buf) { snprintf(why, wn, "the open field is too long"); return -1; }
+    snprintf(buf, sizeof buf, "%s", v);
+    int f = 0, seen = 0, first = 1;
+    char *save = NULL;
+    for (char *t = strtok_r(buf, "|", &save); t; t = strtok_r(NULL, "|", &save), first = 0) {
+        if (first) {
+            if      (!strcmp(t, "O_RDONLY")) f = O_RDONLY;
+            else if (!strcmp(t, "O_WRONLY")) f = O_WRONLY;
+            else if (!strcmp(t, "O_RDWR"))   f = O_RDWR;
+            else {
+                snprintf(why, wn, "the open field must be read, or begin with O_RDONLY, O_WRONLY or O_RDWR");
+                return -1;
+            }
+            continue;
+        }
+        size_t i = 0, nn = sizeof kPlanOpenFlags / sizeof kPlanOpenFlags[0];
+        while (i < nn && strcmp(t, kPlanOpenFlags[i].name)) i++;
+        if (i == nn) { snprintf(why, wn, "the open field names an unknown flag"); return -1; }
+        if (seen & (1 << i)) { snprintf(why, wn, "the open field repeats a flag"); return -1; }
+        seen |= 1 << i;
+        f |= kPlanOpenFlags[i].bits;
+    }
+    /* An empty value, or `|` at either end or doubled, leaves a token out:
+     * refuse rather than guess what was meant. */
+    if (first || v[0] == '|' || v[strlen(v) - 1] == '|' || strstr(v, "||")) {
+        snprintf(why, wn, "the open field is empty or malformed");
+        return -1;
+    }
+    *flags = f;
+    return 1;
+}
 
 /* v1.21 (warden_net.inc.c): a net_connect step's destination as the runtime
  * spells it. */
@@ -986,6 +1076,23 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
      * unparseable path leaves resolved empty and stays UNKNOWN. */
     if (act.kind == ACT_FILE_OPEN) {
         (void)plan_lexical_canon(act.target, act.resolved, sizeof(act.resolved));
+    }
+    /* v1.21.1: the flags the step declares it will open with (see
+     * plan_open_field). */
+    {
+        char why[160];
+        int of = 0, r = plan_open_field(u, a, &of, why, sizeof why);
+        if (r < 0) {
+            log_line_start();
+            fputs("[warden] plan: ", g_log);
+            json_escape(g_log, a->kind ? a->kind : "");     /* the plan's own text */
+            fputs(" step \"", g_log);
+            json_escape(g_log, act.target);
+            fprintf(g_log, "\" is UNKNOWN: %s\n", why);
+            fflush(g_log);
+            return PLAN_DEC_UNKNOWN;
+        }
+        if (r > 0) { act.open_flags = of; act.flags_known = true; }
     }
     /* v1.18.0: the runtime refuses every launch after the first, whatever
      * the policy says, so a process_exec step is UNSATISFIED (a plan lists
@@ -1046,11 +1153,14 @@ static int warden_verify_plan(const char *plan_path,
 
     const plan_spec_t *spec = plan_parser_spec(parsed);
     pathology_sink_t *sink = pathology_sink_new(stderr);
-    struct warden_plan_ud ud = { .policy = policy };
+    struct warden_plan_ud ud = { .policy = policy, .parsed = parsed, .spec = spec };
 
     plan_decision_t pd = warden_adapter_verify(spec, warden_plan_decider,
                                                &ud, sink);
 
+    /* v1.21.1: read the count before the plan is freed (spec points into it;
+     * through v1.21.0 it was read after plan_parser_free). */
+    size_t n_actions = spec->n_actions;
     pathology_sink_free(sink);
     plan_parser_free(parsed);
 
@@ -1062,7 +1172,7 @@ static int warden_verify_plan(const char *plan_path,
     }
     fprintf(stderr,
             "[warden] plan authorized (%zu actions); proceeding to supervise\n",
-            spec->n_actions);
+            n_actions);
     return 0;
 }
 
@@ -1351,7 +1461,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.21.0\","
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.21.1\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
@@ -3014,8 +3124,9 @@ static int find_program(const char *name, char *out, size_t n) {
  * key order. A file_open target is the lexically canonical path the node check
  * decides on, so a flow rule on a secret directory (match target on
  * /srv/secret/ followed by a star) cannot be stepped around with "..". Fields
- * reach only the flow policy: the node check and the runtime see the target
- * alone, and nothing compares the agent's later calls with its fields.
+ * reach the flow policy; the node check reads only a file_open step's `open`
+ * field (v1.21.1, plan_open_field), the runtime none, and nothing compares
+ * the agent's later calls with its fields.
  *
  * The outcome: PASS runs the agent, and the Warden then exits with the agent's
  * status. Otherwise the agent never runs and the Warden exits 3
@@ -3358,7 +3469,7 @@ static int warden_gate_plan_flow(const char *plan_path, const struct policy *pol
     canon = calloc(n, sizeof *canon);
     if (!plan || !acts || !args || !canon) goto out;
 
-    struct warden_plan_ud ud = { .policy = policy };
+    struct warden_plan_ud ud = { .policy = policy, .parsed = parsed, .spec = spec };
     for (size_t i = 0; i < n; i++) {
         const plan_spec_action_t *sa = &spec->actions[i];
         plan_decision_t d = warden_plan_decider(sa, &ud);
@@ -3563,8 +3674,12 @@ static void usage(const char *argv0) {
         "  net_connect step is decided like the connect it names (a.b.c.d:port,\n"
         "  [IPv6]:port or unix:/path; a host name is UNKNOWN until stage 2).\n"
         "  v1.20: a step may declare key=value fields after its target; they\n"
-        "  reach only the --flow-policy's rules (see v1_6/plan_parser.h), and a\n"
+        "  reach the --flow-policy's rules (see v1_6/plan_parser.h), and a\n"
         "  flow policy whose rules match them must declare trust_declared_fields.\n"
+        "  v1.21.1: a file_open step may declare how it opens its file,\n"
+        "  open=read or open=O_WRONLY|O_CREAT|O_TRUNC (an access mode, then O_\n"
+        "  flags); the node check decides the step with those flags, so a path\n"
+        "  allowed only read-only is SATISFIED for a declared read.\n"
         "\n"
         "  v1.18 --flow-policy <cfg> (v1.7 label policy) adds the data-flow check\n"
         "  and the refusal breaker to the gate. At startup <cfg> must pass the v1.9\n"
@@ -3623,8 +3738,8 @@ static void usage(const char *argv0) {
         "  Plan file format (see varek/v1_6/sample_plan.txt):\n"
         "    action <label> <kind> <target> [key=value | key=\"quoted value\" ...]\n"
         "    edge   <from_label> <to_label>\n"
-        "  Fields (v1.20) are declarations: the node check ignores them and\n"
-        "  nothing compares the agent's later calls with them.\n"
+        "  Fields (v1.20) are declarations: the node check reads only open=\n"
+        "  (v1.21.1), and nothing compares the agent's later calls with them.\n"
         "  A file_open target is verified against the policy on its lexically\n"
         "  canonical path (. and .. collapsed); it must be absolute. Symlinks\n"
         "  are not followed at plan time (there is no agent yet), so the gate is\n"

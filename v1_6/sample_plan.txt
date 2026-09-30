@@ -5,20 +5,26 @@
 #   edge   <from_label> <to_label>
 #
 # (v1.20.0: fields after the target, e.g. contains="a customer record",
-# reach only a --flow-policy's rules; see plan_parser.h.)
+# reach a --flow-policy's rules; see plan_parser.h. v1.21.1: the Warden's
+# node check also reads a file_open step's `open` field, the flags the step
+# will open its file with: open=read, or open=O_WRONLY|O_CREAT|O_TRUNC.)
 #
 # An agent that:
 #   1. reads an input file under an allowed prefix
 #   2. writes a result under the same prefix
 #   3. writes an audit record (in parallel with the result)
 #
-# v1.18.0: the plan declares file opens only. The Warden refuses every
-# connect, and every program launch after the agent's own start, whatever the
-# policy says, so a net_connect or process_exec step is UNSATISFIED at the
-# gate (through v1.17.0 this sample declared both, and the gate authorized a
-# plan whose connect and launch the runtime would then refuse).
+# v1.21.0: a net_connect step is decided like the connect it names, on a
+# numeric destination (a.b.c.d:port, [IPv6]:port or unix:/path), and the
+# runtime dials an allowed one. From v1.18.0 to v1.20.0 every connect was
+# refused and a net_connect step was UNSATISFIED. A process_exec step is still
+# UNSATISFIED: the Warden refuses every launch after the agent's own start,
+# whatever the policy says. This sample declares file opens only; a connect
+# step would read, for example:
+#
+#   action fetch  net_connect  127.0.0.1:8080
 
-action load   file_open    /tmp/varek_allowed_input.json
+action load   file_open    /tmp/varek_allowed_input.json   open=read
 action result file_open    /tmp/varek_allowed_result.json
 action audit  file_open    /tmp/varek_allowed_audit.log
 
