@@ -322,7 +322,7 @@ VAREK is released under the **MIT license**. Three provisional patent applicatio
 Earlier editions of this paper (v1.9.1 through v1.12) made statements a later review of the code did not bear out. They are corrected in the text above; this list records what changed.
 
 1. **UNKNOWN diagnostics and resource bounds.** Specified for v1.9.1 but not implemented then. §3.2 describes what exists, from v1.13.0. (Corrected in v1.18.0.)
-2. **TOCTOU figure.** "510 leaks in 20,000 attempts" has no recorded run. The v1.18.0 re-run gave 1,848 to 1,889 leaks for approve-then-continue and 0 for resolve-and-inject. (Corrected in v1.18.0.)
+2. **TOCTOU figure.** v1.18.0 found no record of "510 leaks in 20,000 attempts" in the repository and re-ran the harness: 1,848 to 1,889 leaks for approve-then-continue and 0 for resolve-and-inject. (Corrected in v1.18.0.) The 510 was measured: one run each way for v1.9.1 in GitHub Codespaces, 510 against 0, whose output was kept only in the build session and is now committed as `tests/toctou_results_v1.9.1.txt`. The naive count depends on the host; the mitigated count was 0 in every run. (Correction to the correction, 2026-09-30.)
 3. **io_uring test.** `v1_7/tests/test_v191_io_uring.c` does not check io_uring under the Warden filter on its own; `test_v14_filter` does, from v1.18.0. (Corrected in v1.18.0.)
 4. **Data-flow, breaker and progress-safety in the Warden.** Through v1.17.0 these were a library with tests that the Warden did not call; the `--plan` gate runs them with `--flow-policy` from v1.18.0. (Corrected in v1.18.0.)
 5. **Connect deny-only.** True from v1.9.1 through v1.20.0; from v1.21.0 connects are decided and dialed by the Warden. (Corrected in v1.21.0 and v1.21.1.)

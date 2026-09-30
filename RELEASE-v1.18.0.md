@@ -232,6 +232,9 @@ Python binding. It could not run end to end on this release's test host.
   runs on a 2-vCPU host gave 1,848 to 1,889 leaks for approve-then-continue and
   0 for resolve-and-inject (`tests/toctou_results_v1.18.0.txt`). The harness
   had been dropping its count line when stdout was not a terminal.
+  *(Correction, 2026-09-30: the 510 was measured, in one GitHub Codespaces run
+  for v1.9.1 whose output was kept only in the build session. It is committed
+  as `tests/toctou_results_v1.9.1.txt`.)*
 - **The solver.** Prose now says "the reference SMT solver". Its Python package
   is listed in `varek/v1_4/tools/requirements-crosscheck.txt`. The name remains
   only where software must use it: the import in `smt_crosscheck.py`, that

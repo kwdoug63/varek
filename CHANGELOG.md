@@ -29,6 +29,17 @@ a refusal limit per session to the breaker, v1.20.0 fields on plan steps, and
 v1.21.0 decided connections (v1.21.1 open flags on plan steps). None of them changes the verification program. Still planned: a customer-derived corpus and measured baseline, a
 formally verified checker, and the v1.11 sequence fragment (issues #21–#25).
 
+### Fixed (documentation)
+
+- **The 510 TOCTOU figure has a record.** v1.18.0 said the harness's "510 leaks
+  in 20,000 attempts" had no recorded run. It was measured: one run each way
+  for v1.9.1 in GitHub Codespaces (naive 510, mitigated 0), whose output was
+  kept only in the build session. It is now committed as
+  `tests/toctou_results_v1.9.1.txt`, and the README, spec papers (v1.12,
+  v1.21.1), `RELEASE-v1.18.0.md` and `tests/toctou_results_v1.18.0.txt` say so.
+  The v1.18.0 re-run (1,848 to 1,889 against 0 on a 2-vCPU host) stands; the
+  naive count depends on the host.
+
 ### Planned — v1.10 program (status as of v1.21.1; unchanged since v1.16.0)
 
 - **Verdict-distribution harness.** Measurement and regression gating over a
@@ -416,7 +427,9 @@ changes what the `--plan` gate authorizes, so it is a minor release. No verdict
   v1.5 speed-up restated (about 160 times, not 210 or "three orders"); "zero
   false negatives" is restated as a benchmark count; the TOCTOU harness's "510
   leaks in 20,000" is replaced by a recorded re-run
-  (`tests/toctou_results_v1.18.0.txt`). Mis-encoded characters in this file are
+  (`tests/toctou_results_v1.18.0.txt`). *(Correction, 2026-09-30: the 510 had
+  a run, kept only in the v1.9.1 build session; see
+  `tests/toctou_results_v1.9.1.txt`.)* Mis-encoded characters in this file are
   fixed.
 
 ### Tests

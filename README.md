@@ -144,9 +144,11 @@ The runtime line has progressed well beyond simple syscall containment:
   time-of-check-to-time-of-use (TOCTOU) race from file mediation: the supervisor
   resolves the approved path and injects the descriptor rather than letting the
   syscall re-read attacker-mutable memory. Measured against a race harness, the
-  prior approve-then-continue strategy leaked the protected target (1,848 to
-  1,889 times in 20,000 attempts on a 2-vCPU host, re-measured for v1.18.0; the
-  510 quoted here before has no record); the resolve-and-inject strategy leaked 0. `connect`/`execve`
+  prior approve-then-continue strategy leaked the protected target 510 times in
+  20,000 attempts (one run, GitHub Codespaces, v1.9.1:
+  [`tests/toctou_results_v1.9.1.txt`](./tests/toctou_results_v1.9.1.txt)) and
+  1,848 to 1,889 times on a 2-vCPU host when re-measured for v1.18.0; the
+  resolve-and-inject strategy leaked 0 in every run. `connect`/`execve`
   are deny-only (fail closed) pending the v1.10 dial-and-inject path
   (connects: shipped in v1.21.0; launches after the first stay refused). See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
@@ -514,8 +516,9 @@ v1.9.1 enforcement is measured directly by a TOCTOU race harness
 (`tests/seccomp_toctou_harness.c`): in three runs of 20,000 attempts on a 2-vCPU
 host, approve-then-continue leaked the protected file 1,848 to 1,889 times and
 resolve-and-inject leaked it 0 times (`tests/toctou_results_v1.18.0.txt`; the
-count depends on the host). io_uring is denied by the live Warden filter
-(`varek/v1_4/tests/test_v14_filter`, v1.18.0; from v1.21 its creation
+count depends on the host). The first measurement, for v1.9.1 in GitHub
+Codespaces, was 510 against 0 (`tests/toctou_results_v1.9.1.txt`). io_uring is
+denied by the live Warden filter (`varek/v1_4/tests/test_v14_filter`, v1.18.0; from v1.21 its creation
 answers `ENOSYS` rather than killing, so Node.js runs). Decided connections
 (v1.21) are tested with real clients (curl, Python `requests`, Node.js) and a
 destination-swap race: 2,000 attempts, 0 reached the denied side (`make
