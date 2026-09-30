@@ -21,18 +21,22 @@ acyclic graph of planned actions. Before the agent starts, the Warden's optional
 with `--flow-policy`, the data flowing along its edges. While the agent runs, the
 **Warden** pauses each file open, file lookup (`stat`, `access`, `readlink`),
 connect, program launch and datagram send at the kernel (via seccomp-BPF and
-seccomp user-notify) and decides it before it runs. File opens and lookups are
-decided by an **SMT decision procedure**: in the Warden, a purpose-built procedure
-for a decidable fragment — bounded strings for the object (prefix, exact, suffix,
-contains and glob matching), bitvectors for the open flags — that decides in
-microseconds with bounded worst case, is cross-checked against an off-the-shelf
-SMT solver, and returns UNKNOWN for anything outside its fragment rather than
-guessing. Every file open it authorizes, and every lookup it decides, carries a
-certificate that a small, independently written checker must accept before the
-call takes effect. Lookups of the directories leading to an allowed path, and of
-descriptors the agent already holds, are answered without a decision.
-Connects, datagram sends and every launch after the agent's own are refused,
-whatever the policy says. Every verdict is one of three — **SATISFIED**,
+seccomp user-notify) and decides it before it runs. File opens, lookups and
+connects are decided by an **SMT decision procedure**: in the Warden, a
+purpose-built procedure for a decidable fragment — bounded strings for the object
+(prefix, exact, suffix, contains and glob matching), bitvectors for the open
+flags — that decides in microseconds with bounded worst case, is cross-checked
+against an off-the-shelf SMT solver, and returns UNKNOWN for anything outside its
+fragment rather than guessing. Every file open and connect it authorizes, and
+every lookup it decides, carries a certificate that a small, independently
+written checker must accept before the call takes effect. Lookups of the
+directories leading to an allowed path, and of descriptors the agent already
+holds, are answered without a decision. Since v1.21.0 a connect is decided on the
+destination the Warden copied once, and an allowed one is dialed by the Warden
+and handed to the agent as a connected socket; the agent's own network namespace
+stays empty. A datagram send that names a destination, and every launch after the
+agent's own, are refused whatever the policy says; a send with no destination
+goes to the peer of a connect the Warden decided. Every verdict is one of three — **SATISFIED**,
 **UNSATISFIED**, or **UNKNOWN** — and it fails closed: a paused call that cannot
 be proven allowed never runs. System calls the kernel filter admits without
 asking (memory, time, threads, and reads and writes on descriptors the agent
