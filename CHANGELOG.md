@@ -31,6 +31,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   and Amazon Linux, `/lib64` is a link to `/usr/lib64`, and the Warden decides
   on the resolved path, so every dynamically linked agent was refused its
   shared libraries (UNKNOWN) on those systems. Writes there stay refused.
+- The Warden builds against older glibc headers (Amazon Linux 2023, RHEL 9:
+  glibc 2.34), which lack `CLONE_NEWTIME`; it is defined from the kernel's
+  value when missing. Found by the first AMI build.
 
 ---
 
