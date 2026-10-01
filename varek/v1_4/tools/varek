@@ -1,0 +1,992 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""
+varek: one command for running and checking the VAREK Warden.
+
+The Warden and its tools (warden, vdp_check, vdp_cert_check, varek_keygen,
+varek_audit.py, varek_cyclonedx.py, varek_preflight.sh) each take their own
+arguments. This command wraps them for day-to-day use and reads the settings
+they share from one file, /etc/varek/varek.conf, so an operator types
+
+    sudo varek init --pack healthcare
+    sudo varek run -- python3 agent.py
+    varek refusals
+    varek audit
+    varek export
+
+instead of assembling each tool's flags. Every subcommand prints the
+underlying command it runs with --show-commands, so nothing is hidden.
+
+Settings:   /etc/varek/varek.conf (override with VAREK_CONFIG=<file>)
+Runtime:    the directory above this script (override with VAREK_HOME=<dir>)
+"""
+
+import argparse
+import configparser
+import datetime as _dt
+import glob
+import hashlib
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+
+CLI_VERSION = "1.0.0"
+DEFAULT_CONFIG = "/etc/varek/varek.conf"
+DEFAULT_ETC = "/etc/varek"
+DEFAULT_LOG_DIR = "/var/log/varek"
+
+SHOW_COMMANDS = False
+
+
+# ------------------------------------------------------------------ output --
+
+def _tty():
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def _paint(code, text):
+    return f"\033[{code}m{text}\033[0m" if _tty() else text
+
+
+def ok(msg):
+    print(f"  {_paint('32', 'OK  ')}  {msg}")
+
+
+def warn(msg):
+    print(f"  {_paint('33', 'WARN')}  {msg}")
+
+
+def fail(msg):
+    print(f"  {_paint('31', 'FAIL')}  {msg}")
+
+
+def info(msg):
+    print(msg)
+
+
+def hint(msg):
+    print(f"        {_paint('2', msg)}")
+
+
+class CliError(Exception):
+    """A problem the operator can fix; printed without a traceback."""
+
+    def __init__(self, msg, fix=None, code=2):
+        super().__init__(msg)
+        self.fix = fix
+        self.code = code
+
+
+# ------------------------------------------------------------------ layout --
+
+def varek_home():
+    env = os.environ.get("VAREK_HOME")
+    if env:
+        return os.path.abspath(env)
+    here = os.path.dirname(os.path.realpath(__file__))
+    return os.path.dirname(here)  # tools/.. = the Warden's directory
+
+
+def tool(name):
+    home = varek_home()
+    for p in (os.path.join(home, "tools", name), os.path.join(home, name)):
+        if os.path.exists(p):
+            return p
+    return os.path.join(home, "tools", name)
+
+
+def warden_bin():
+    return os.path.join(varek_home(), "warden")
+
+
+def config_path():
+    return os.environ.get("VAREK_CONFIG", DEFAULT_CONFIG)
+
+
+def load_config(required=True):
+    path = config_path()
+    cp = configparser.ConfigParser()
+    if not os.path.exists(path):
+        if required:
+            raise CliError(f"no configuration at {path}",
+                           fix="run `sudo varek init --pack <name>` first "
+                               "(`varek policy list` shows the packs)")
+        return None
+    cp.read(path)
+    if "varek" not in cp:
+        raise CliError(f"{path} has no [varek] section", fix="re-run `sudo varek init`")
+    c = cp["varek"]
+    etc = os.path.dirname(os.path.abspath(path))
+    return {
+        "path": path,
+        "etc": etc,
+        "policy": c.get("policy", os.path.join(etc, "policy.txt")),
+        "log_dir": c.get("log_dir", DEFAULT_LOG_DIR),
+        "sign_key": c.get("sign_key", "").strip(),
+        "anchor": c.get("anchor", "").strip(),
+        "spool": c.get("spool", "").strip(),
+        "run_as": c.get("run_as", "nobody").strip() or "nobody",
+        "packs_dir": c.get("packs_dir", os.path.join(etc, "packs")),
+    }
+
+
+def write_config(path, cfg):
+    cp = configparser.ConfigParser()
+    cp["varek"] = {k: cfg[k] for k in
+                   ("policy", "log_dir", "sign_key", "anchor", "spool", "run_as", "packs_dir")}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write("# VAREK settings, written by `varek init`. Edit by hand or re-run init.\n")
+        fh.write("#   policy     the policy the Warden enforces\n")
+        fh.write("#   log_dir    where each run's verdict stream is written\n")
+        fh.write("#   sign_key   Ed25519 key that signs the stream (empty: unsigned)\n")
+        fh.write("#   anchor     optional --anchor path (FIFO for an off-host anchor)\n")
+        fh.write("#   spool      the anchor forwarder's spool directory, if any\n")
+        fh.write("#   run_as     the unprivileged user the agent runs as\n")
+        fh.write("#   packs_dir  where licensed policy packs are kept\n")
+        cp.write(fh)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+# ----------------------------------------------------------------- helpers --
+
+def run_cmd(argv, check=True, capture=False, **kw):
+    if SHOW_COMMANDS:
+        print(_paint("2", "$ " + " ".join(shlex.quote(a) for a in argv)), file=sys.stderr)
+    opts = {"text": True}
+    if capture:
+        opts.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    opts.update(kw)
+    try:
+        r = subprocess.run(argv, **opts)
+    except FileNotFoundError:
+        raise CliError(f"{argv[0]} is missing",
+                       fix=f"build the runtime: `make` in {varek_home()}")
+    if check and r.returncode != 0:
+        detail = (r.stderr or r.stdout or "").strip() if capture else ""
+        raise CliError(f"{os.path.basename(argv[0])} exited with {r.returncode}"
+                       + (f": {detail}" if detail else ""), code=r.returncode or 1)
+    return r
+
+
+def need_root(what):
+    if os.geteuid() != 0:
+        raise CliError(f"{what} needs root", fix=f"run it with sudo: `sudo varek {what}`")
+
+
+def sha256_file(path):
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def builtin_packs():
+    out = {}
+    for p in sorted(glob.glob(os.path.join(varek_home(), "policies", "*.policy.txt"))):
+        out[os.path.basename(p)[:-len(".policy.txt")]] = p
+    return out
+
+
+def packs_dir(cfg):
+    if cfg:
+        return cfg["packs_dir"]
+    return os.path.join(os.path.dirname(os.path.abspath(config_path())), "packs")
+
+
+def installed_packs(cfg):
+    out = {}
+    d = packs_dir(cfg)
+    if os.path.isdir(d):
+        for p in sorted(glob.glob(os.path.join(d, "*.policy.txt"))):
+            out[os.path.basename(p)[:-len(".policy.txt")]] = p
+    return out
+
+
+def backup_name(path):
+    base = path + ".bak-" + _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    name, n = base, 1
+    while os.path.exists(name):
+        name, n = f"{base}-{n}", n + 1
+    return name
+
+
+def resolve_pack(name, cfg):
+    if os.path.isfile(name):
+        return os.path.abspath(name)
+    packs = {**builtin_packs(), **installed_packs(cfg)}
+    if name in packs:
+        return packs[name]
+    raise CliError(f"no policy pack or file named '{name}'",
+                   fix="`varek policy list` shows the packs; or give a path to a policy file")
+
+
+def pack_summary(path):
+    """First descriptive comment line of a policy file."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                s = line.strip()
+                if s.startswith("#") and len(s) > 2 and not set(s[1:].strip()) <= set("-=_ "):
+                    return s.lstrip("# ").strip()
+    except OSError:
+        pass
+    return ""
+
+
+def lint_policy(path):
+    r = run_cmd([tool("vdp_check"), path, "lint"], check=False, capture=True)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def policy_rules(path):
+    counts = {"allow": {}, "deny": {}}
+    require = None
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            if parts[0] == "require" and len(parts) >= 3:
+                require = parts[2]
+            elif parts[0] in counts and len(parts) >= 2:
+                counts[parts[0]][parts[1]] = counts[parts[0]].get(parts[1], 0) + 1
+    return counts, require
+
+
+def read_records(log):
+    recs = []
+    with open(log, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    recs.append(json.loads(line))
+                except ValueError:
+                    pass
+    return recs
+
+
+def run_logs(cfg):
+    d = cfg["log_dir"]
+    if os.path.isdir(d) and not os.access(d, os.R_OK | os.X_OK):
+        raise CliError(f"cannot read {d} (verdict streams are root-only)",
+                       fix="run it with sudo, or pass a log file you can read")
+    files = glob.glob(os.path.join(cfg["log_dir"], "verdicts-*.log"))
+    return sorted(files, key=os.path.getmtime, reverse=True)
+
+
+def latest_log(cfg, given=None):
+    if given:
+        if not os.path.isfile(given):
+            raise CliError(f"no log at {given}")
+        return given
+    logs = run_logs(cfg)
+    if not logs:
+        raise CliError(f"no runs yet in {cfg['log_dir']}",
+                       fix="start one with `sudo varek run -- <agent command>`")
+    return logs[0]
+
+
+def summarize(recs):
+    s = {"run": None, "start": None, "complete": False, "warden": None, "policy": None,
+         "policy_sha": None,
+         "allowed": 0, "refused": 0, "unknown": 0, "refusals": []}
+    for r in recs:
+        ev = r.get("event")
+        if ev == "run_start":
+            s["run"] = r.get("run")
+            s["warden"] = r.get("warden")
+            s["policy"] = r.get("policy_path")
+            s["policy_sha"] = r.get("policy_sha256")
+            ts = r.get("timestamp_ns")
+            if ts:
+                s["start"] = _dt.datetime.fromtimestamp(ts / 1e9).strftime("%Y-%m-%d %H:%M:%S")
+        elif ev == "run_end":
+            s["complete"] = True
+        elif "decision_final" in r:
+            d = r["decision_final"]
+            if d == "ALLOW":
+                s["allowed"] += 1
+            else:
+                if r.get("decision_raw") == "UNKNOWN":
+                    s["unknown"] += 1
+                s["refused"] += 1
+                s["refusals"].append(r)
+    return s
+
+
+def verdict_word(r):
+    raw = r.get("decision_raw", "")
+    return {"ALLOW": "SATISFIED", "DENY": "UNSATISFIED", "UNKNOWN": "UNKNOWN"}.get(raw, raw)
+
+
+def _pubkey(cfg):
+    if cfg["sign_key"] and os.path.exists(cfg["sign_key"] + ".pub"):
+        return cfg["sign_key"] + ".pub"
+    return None
+
+
+def _policy_for_log(cfg, s):
+    """The policy file a run was decided with: the one whose SHA-256 matches
+    run_start's, looked for where it was, then among backups and packs."""
+    want = s.get("policy_sha")
+    cands = [s.get("policy"), cfg["policy"]]
+    cands += list(installed_packs(cfg).values()) + list(builtin_packs().values())
+    cands += sorted(glob.glob(cfg["policy"] + ".bak-*"), reverse=True)
+    seen = set()
+    for c in cands:
+        if not c or c in seen or not os.path.isfile(c):
+            continue
+        seen.add(c)
+        if not want or sha256_file(c) == want:
+            return c
+    return None
+
+
+# ------------------------------------------------------------- subcommands --
+
+def cmd_doctor(args):
+    info("VAREK doctor: is this host ready to run the Warden?\n")
+    bad = 0
+
+    if platform.system() == "Linux" and platform.machine() == "x86_64":
+        ok(f"Linux x86_64 ({platform.release()})")
+    else:
+        fail(f"{platform.system()} {platform.machine()}: the Warden needs Linux on x86_64")
+        bad += 1
+
+    m = re.match(r"(\d+)\.(\d+)", platform.release())
+    if m and (int(m.group(1)), int(m.group(2))) >= (5, 14):
+        ok("kernel 5.14 or later (seccomp user-notify with ADDFD_FLAG_SEND)")
+    else:
+        fail(f"kernel {platform.release()} is older than 5.14")
+        hint("use Amazon Linux 2023, RHEL 9, Ubuntu 22.04 or later")
+        bad += 1
+
+    if os.path.isdir("/sys/fs/cgroup") and os.path.exists("/sys/fs/cgroup/cgroup.controllers"):
+        ok("cgroups v2 mounted")
+    else:
+        warn("cgroups v2 not detected (needed by the Python sandbox, not by the Warden)")
+
+    missing = [n for n in ("warden", "tools/vdp_check", "tools/vdp_cert_check", "tools/varek_keygen")
+               if not os.access(os.path.join(varek_home(), n), os.X_OK)]
+    if missing:
+        fail("runtime not built: " + ", ".join(missing))
+        hint(f"cd {varek_home()} && make deps && make")
+        bad += 1
+    else:
+        ok(f"runtime built in {varek_home()}")
+
+    if os.geteuid() == 0:
+        ok("running as root (init, run and preflight need it)")
+    else:
+        warn("not root: `varek init`, `varek run` and `varek preflight` need sudo")
+
+    cfg = None
+    try:
+        cfg = load_config()
+        ok(f"settings in {cfg['path']}")
+    except CliError as e:
+        fail(str(e))
+        hint(e.fix)
+        bad += 1
+
+    if cfg:
+        if os.path.isfile(cfg["policy"]):
+            rc, out = lint_policy(cfg["policy"]) if not missing else (1, "runtime not built")
+            if rc == 0:
+                ok(f"policy {cfg['policy']} loads and lints")
+            else:
+                fail(f"policy {cfg['policy']} does not lint: {out.splitlines()[-1] if out else rc}")
+                hint("`varek policy check` shows every problem")
+                bad += 1
+        else:
+            fail(f"policy {cfg['policy']} is missing")
+            hint("`sudo varek policy use <pack>`")
+            bad += 1
+
+        if cfg["sign_key"]:
+            try:
+                st = os.stat(cfg["sign_key"])
+                if st.st_mode & 0o077:
+                    fail(f"signing key {cfg['sign_key']} is readable by group or others")
+                    hint(f"sudo chmod 600 {cfg['sign_key']}")
+                    bad += 1
+                else:
+                    ok(f"signing key {cfg['sign_key']} (mode 600)")
+            except PermissionError:
+                ok(f"signing key {cfg['sign_key']} exists (unreadable to you, as it should be)")
+            except FileNotFoundError:
+                fail(f"signing key {cfg['sign_key']} is missing")
+                hint("`sudo varek init --force-key` makes a new one")
+                bad += 1
+        else:
+            warn("no signing key: verdict streams are hash-chained but not signed")
+
+        d = cfg["log_dir"]
+        if os.path.isdir(d):
+            st = os.stat(d)
+            if st.st_mode & 0o002:
+                fail(f"log directory {d} is writable by everyone")
+                bad += 1
+            else:
+                ok(f"log directory {d}")
+        else:
+            fail(f"log directory {d} is missing")
+            hint(f"sudo install -d -m 0750 {d}")
+            bad += 1
+
+        if cfg["anchor"]:
+            ok(f"anchor {cfg['anchor']}")
+        else:
+            warn("no off-host anchor: root on this host could rewrite unanchored history")
+            hint("see `Off-host anchor` in the Warden README to add one")
+
+    print()
+    if bad:
+        info(f"{bad} problem(s) to fix before running agents.")
+        return 1
+    info("Ready. Next: `sudo varek preflight --run`, then `sudo varek run -- <agent command>`.")
+    return 0
+
+
+def cmd_init(args):
+    need_root("init")
+    path = config_path()
+    etc = os.path.dirname(os.path.abspath(path))
+    existing = load_config(required=False)
+    if existing and not args.force:
+        raise CliError(f"{path} already exists",
+                       fix="use `sudo varek policy use <pack>` to change the policy, "
+                           "or `sudo varek init --force ...` to start over")
+    if not args.pack:
+        names = ", ".join(sorted({**builtin_packs(), **installed_packs(existing)}))
+        raise CliError("choose a policy pack with --pack",
+                       fix=f"packs: {names}; or --pack /path/to/policy.txt")
+
+    src = resolve_pack(args.pack, existing)
+    rc, out = lint_policy(src)
+    if rc != 0:
+        raise CliError(f"{src} does not lint:\n{out}")
+
+    info(f"Setting up VAREK in {etc}\n")
+    os.makedirs(etc, exist_ok=True)
+    os.chmod(etc, 0o755)
+    pdir = os.path.join(etc, "packs")
+    os.makedirs(pdir, exist_ok=True)
+
+    policy = os.path.join(etc, "policy.txt")
+    if os.path.exists(policy) and sha256_file(policy) != sha256_file(src):
+        backup = backup_name(policy)
+        shutil.copy2(policy, backup)
+        ok(f"previous policy kept as {backup}")
+    shutil.copyfile(src, policy)
+    os.chmod(policy, 0o644)
+    ok(f"policy {os.path.basename(src)} -> {policy}")
+
+    key = ""
+    if not args.no_sign:
+        key = os.path.join(etc, "log.key")
+        if os.path.exists(key) and not args.force_key:
+            ok(f"signing key {key} kept (use --force-key to replace it)")
+        else:
+            for p in (key, key + ".pub"):
+                if os.path.exists(p):
+                    os.remove(p)
+            run_cmd([tool("varek_keygen"), key], capture=True)
+            ok(f"signing key {key} (600) and {key}.pub")
+    else:
+        warn("no signing key (--no-sign): streams will be chained but not signed")
+
+    log_dir = args.log_dir or DEFAULT_LOG_DIR
+    os.makedirs(log_dir, exist_ok=True)
+    os.chmod(log_dir, 0o750)
+    ok(f"log directory {log_dir} (750)")
+
+    cfg = {"policy": policy, "log_dir": log_dir, "sign_key": key,
+           "anchor": args.anchor or "", "spool": args.spool or "",
+           "run_as": args.run_as or "nobody", "packs_dir": pdir}
+    write_config(path, cfg)
+    ok(f"settings written to {path}")
+
+    print()
+    info("Done. Next steps:")
+    info("  sudo varek preflight --run      # a real trial run, then its audit")
+    info("  sudo varek run -- <agent command>")
+    return 0
+
+
+def cmd_policy_list(args):
+    cfg = load_config(required=False)
+    active = sha256_file(cfg["policy"]) if cfg and os.path.isfile(cfg["policy"]) else None
+    rows = [(n, p, "built-in") for n, p in builtin_packs().items()] + \
+           [(n, p, "installed") for n, p in installed_packs(cfg).items()]
+    if not rows:
+        info("No policy packs found.")
+        return 0
+    width = max(len(n) for n, _, _ in rows)
+    info("Policy packs (use with `sudo varek policy use <name>`):\n")
+    for n, p, kind in rows:
+        mark = "*" if active and sha256_file(p) == active else " "
+        info(f" {mark} {n.ljust(width)}  {kind:9}  {pack_summary(p)}")
+    if active:
+        info("\n * = the active policy")
+    return 0
+
+
+def cmd_policy_show(args):
+    cfg = load_config(required=not args.file)
+    path = resolve_pack(args.file, cfg) if args.file else cfg["policy"]
+    counts, require = policy_rules(path)
+    digest = run_cmd([tool("vdp_cert_check"), path, "digest"], capture=True).stdout.strip()
+    info(f"Policy   {path}")
+    info(f"About    {pack_summary(path)}")
+    info(f"SHA-256  {digest}   (recorded in every run's run_start)")
+    info(f"Needs    Warden {require or 'any version'}")
+    for verb in ("allow", "deny"):
+        parts = ", ".join(f"{v} {k}" for k, v in sorted(counts[verb].items())) or "none"
+        info(f"{verb.capitalize():8} {parts}")
+    info("Anything not allowed is UNKNOWN and refused.")
+    return 0
+
+
+def cmd_policy_check(args):
+    cfg = load_config(required=not args.file)
+    path = resolve_pack(args.file, cfg) if args.file else cfg["policy"]
+    rc, out = lint_policy(path)
+    print(out)
+    if args.explain and rc == 0:
+        r = run_cmd([tool("vdp_check"), path, "analyze"], check=False, capture=True)
+        print((r.stdout + r.stderr).rstrip())
+    print()
+    if rc == 0:
+        info(f"{path}: OK")
+    else:
+        info(f"{path}: fix the lines above before using this policy")
+    return 0 if rc == 0 else 1
+
+
+def cmd_policy_use(args):
+    need_root("policy use")
+    cfg = load_config()
+    src = resolve_pack(args.pack, cfg)
+    rc, out = lint_policy(src)
+    if rc != 0:
+        raise CliError(f"{src} does not lint:\n{out}")
+    dst = cfg["policy"]
+    if os.path.exists(dst):
+        if sha256_file(dst) == sha256_file(src):
+            info(f"{os.path.basename(src)} is already the active policy.")
+            return 0
+        backup = backup_name(dst)
+        shutil.copy2(dst, backup)
+        ok(f"previous policy kept as {backup}")
+    shutil.copyfile(src, dst)
+    os.chmod(dst, 0o644)
+    ok(f"{os.path.basename(src)} is now the active policy ({dst})")
+    info("Check it with `sudo varek preflight --run` before the next agent run.")
+    return 0
+
+
+def cmd_policy_add(args):
+    need_root("policy add")
+    cfg = load_config(required=False)
+    if not os.path.isfile(args.file):
+        raise CliError(f"no file at {args.file}")
+    rc, out = lint_policy(args.file)
+    if rc != 0:
+        raise CliError(f"{args.file} does not lint:\n{out}")
+    name = args.name or os.path.basename(args.file)
+    if not name.endswith(".policy.txt"):
+        name = re.sub(r"\.txt$", "", name) + ".policy.txt"
+    pdir = packs_dir(cfg)
+    os.makedirs(pdir, exist_ok=True)
+    dst = os.path.join(pdir, name)
+    shutil.copyfile(args.file, dst)
+    os.chmod(dst, 0o644)
+    short = name[:-len(".policy.txt")]
+    ok(f"pack '{short}' installed in {pdir}")
+    if cfg:
+        info(f"Make it active with `sudo varek policy use {short}`.")
+    else:
+        info(f"Set VAREK up with it: `sudo varek init --pack {short}`.")
+    return 0
+
+
+def cmd_preflight(args):
+    cfg = load_config()
+    argv = [tool("varek_preflight.sh"), cfg["policy"],
+            "--log", os.path.join(cfg["log_dir"], "verdicts.log")]
+    if cfg["sign_key"]:
+        argv += ["--sign-key", cfg["sign_key"]]
+    if cfg["anchor"]:
+        argv += ["--anchor", cfg["anchor"]]
+    if cfg["spool"]:
+        argv += ["--spool", cfg["spool"]]
+    if args.run:
+        need_root("preflight --run")
+        argv.append("--run")
+    return run_cmd(argv, check=False).returncode
+
+
+def cmd_run(args):
+    need_root("run")
+    cfg = load_config()
+    cmd = args.command
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        raise CliError("no agent command given",
+                       fix="put it after --, e.g. `sudo varek run -- python3 agent.py`")
+    policy = resolve_pack(args.policy, cfg) if args.policy else cfg["policy"]
+    os.makedirs(cfg["log_dir"], exist_ok=True)
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log = args.log or os.path.join(cfg["log_dir"], f"verdicts-{stamp}.log")
+    n = 1
+    while os.path.exists(log) and not args.log:
+        log = os.path.join(cfg["log_dir"], f"verdicts-{stamp}-{n}.log")
+        n += 1
+
+    argv = [warden_bin(), policy]
+    if args.plan:
+        argv += ["--plan", args.plan]
+    if cfg["sign_key"]:
+        argv += ["--sign-key", cfg["sign_key"]]
+    if cfg["anchor"]:
+        argv += ["--anchor", cfg["anchor"]]
+    argv += ["--run-as", args.run_as or cfg["run_as"], "--"] + cmd
+
+    fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+    label = pack_summary(policy) or os.path.basename(policy)
+    print(_paint("2", f"[varek] supervising `{' '.join(cmd)}` under {label}; "
+                      f"verdicts -> {log}"), file=sys.stderr)
+    with os.fdopen(fd, "w") as err:
+        r = run_cmd(argv, check=False, stderr=err)
+
+    agent_err = []
+    with open(log, encoding="utf-8", errors="replace") as fh:
+        agent_err = [ln[len("[agent] "):].rstrip("\n") for ln in fh if ln.startswith("[agent] ")]
+    if agent_err:
+        print(_paint("2", f"[varek] the agent's stderr ({len(agent_err)} line(s), kept in the log):"),
+              file=sys.stderr)
+        for ln in agent_err[-args.stderr_lines:]:
+            print("  " + ln, file=sys.stderr)
+    s = summarize(read_records(log))
+    print(_paint("2", f"[varek] run {s['run'] or '?'} ended (exit {r.returncode}): "
+                      f"{s['allowed']} allowed, {s['refused']} refused "
+                      f"({s['unknown']} UNKNOWN)"), file=sys.stderr)
+    if s["refused"]:
+        print(_paint("2", "[varek] see why with `varek refusals`"), file=sys.stderr)
+    if s["run"] is None:
+        with open(log, encoding="utf-8", errors="replace") as fh:
+            tail = fh.read().strip().splitlines()[-5:]
+        print("[varek] the Warden did not start the agent:", file=sys.stderr)
+        for line in tail:
+            print("   " + line, file=sys.stderr)
+    return r.returncode
+
+
+def cmd_status(args):
+    cfg = load_config()
+    info(f"Settings   {cfg['path']}")
+    if os.path.isfile(cfg["policy"]):
+        counts, _ = policy_rules(cfg["policy"])
+        n = sum(sum(v.values()) for v in counts.values())
+        info(f"Policy     {cfg['policy']} ({n} rules) - {pack_summary(cfg['policy'])}")
+    else:
+        info(f"Policy     {cfg['policy']} (MISSING)")
+    info(f"Signing    {cfg['sign_key'] or 'off (chained, unsigned)'}")
+    info(f"Anchor     {cfg['anchor'] or 'none'}")
+    info(f"Agent user {cfg['run_as']}")
+    info(f"Logs       {cfg['log_dir']}")
+    logs = run_logs(cfg)
+    if logs:
+        s = summarize(read_records(logs[0]))
+        info(f"Last run   {s['start'] or '?'}  {s['allowed']} allowed, {s['refused']} refused"
+             f"{'' if s['complete'] else '  (no run_end: still running or cut short)'}")
+        info(f"           {logs[0]}")
+    else:
+        info("Last run   none yet")
+    return 0
+
+
+def cmd_runs(args):
+    cfg = load_config()
+    logs = run_logs(cfg)[: args.n]
+    if not logs:
+        info(f"No runs in {cfg['log_dir']}.")
+        return 0
+    info(f"{'STARTED':19}  {'ALLOWED':>7}  {'REFUSED':>7}  {'DONE':4}  LOG")
+    for log in logs:
+        s = summarize(read_records(log))
+        info(f"{(s['start'] or '?'):19}  {s['allowed']:>7}  {s['refused']:>7}  "
+             f"{'yes' if s['complete'] else 'no':4}  {log}")
+    return 0
+
+
+def policy_line_text(path, n):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh, 1):
+                if i == n:
+                    return line.split("#", 1)[0].strip()
+    except OSError:
+        pass
+    return None
+
+
+RULE_WORDS = {
+    "default_deny_unknown": "no rule allows it",
+    "resolution_failed": "the path could not be resolved (missing, or outside what the agent can reach)",
+    "metadata_not_found": "the path does not exist",
+    "certificate_refused": "the independent checker refused the certificate",
+    "allowed_open_failed": "allowed, but the open itself failed",
+    "bad_address": "the agent passed an unreadable address",
+    "family_refused": "that kind of socket is never allowed",
+    "unspec_refused": "an unspecified address is never allowed",
+    "unix_abstract_refused": "abstract Unix sockets are never allowed",
+    "scope_id_refused": "IPv6 scope ids are never allowed",
+    "bind_refused": "the agent may not bind sockets",
+}
+
+
+def cmd_refusals(args):
+    cfg = load_config()
+    log = latest_log(cfg, args.log)
+    s = summarize(read_records(log))
+    policy = _policy_for_log(cfg, s)
+    if not s["refusals"]:
+        info(f"No refusals in {log}.")
+        return 0
+    info(f"{s['refused']} refused action(s) in {log}:\n")
+    for r in s["refusals"][: args.n]:
+        line = r.get("policy_line", -1)
+        if isinstance(line, int) and line >= 0:
+            text = policy_line_text(policy, line) if policy else None
+            where = f"policy line {line}" + (f": {text}" if text else
+                                             " (that policy file is no longer on this host)")
+        elif r.get("rule") in RULE_WORDS:
+            where = RULE_WORDS[r["rule"]]
+        else:
+            where = r.get("rule", "no rule matched")
+        target = r.get("resolved") or r.get("target", "")
+        info(f"  {verdict_word(r):11}  {r.get('action', '?'):13}  {target}")
+        hint(f"{where}; the agent got {r.get('kernel_verdict', '?')}")
+    if s["refused"] > args.n:
+        info(f"\n  ... and {s['refused'] - args.n} more (use -n to see them)")
+    info("\nUNSATISFIED: a deny rule matched.  UNKNOWN: no rule allowed it (refused by default).")
+    return 0
+
+
+def cmd_audit(args):
+    cfg = load_config()
+    log = latest_log(cfg, args.log)
+    s = summarize(read_records(log))
+    policy = _policy_for_log(cfg, s)
+    if not policy:
+        raise CliError("the policy file this run used is no longer on this host "
+                       f"(SHA-256 {s.get('policy_sha')})",
+                       fix="restore it, then audit with tools/varek_audit.py --policy <file>")
+    argv = [sys.executable, tool("varek_audit.py"),
+            "--policy", policy, "--checker", tool("vdp_cert_check")]
+    pub = _pubkey(cfg)
+    if pub:
+        argv += ["--pubkey", pub]
+    if cfg["anchor"] and os.path.isfile(cfg["anchor"]):
+        argv += ["--anchor", cfg["anchor"]]
+    if args.allow_incomplete:
+        argv.append("--allow-incomplete")
+    argv.append(log)
+    return run_cmd(argv, check=False).returncode
+
+
+def cmd_export(args):
+    if args.verify:
+        cfg = load_config(required=False)
+        pub = args.pubkey or (_pubkey(cfg) if cfg else None)
+        if not pub:
+            raise CliError("verifying needs the Warden's public key",
+                           fix="pass --pubkey /etc/varek/log.key.pub")
+        return run_cmd([sys.executable, tool("varek_cyclonedx.py"),
+                        "--verify", args.verify, "--pubkey", pub], check=False).returncode
+    cfg = load_config()
+    log = latest_log(cfg, args.log)
+    s = summarize(read_records(log))
+    out = args.output or re.sub(r"\.log$", "", log) + ".cdx.json"
+    policy = _policy_for_log(cfg, s)
+    if not policy:
+        raise CliError("the policy file this run used is no longer on this host "
+                       f"(SHA-256 {s.get('policy_sha')})",
+                       fix="restore it; the evidence must name the policy the run used")
+    argv = [sys.executable, tool("varek_cyclonedx.py"), "--log", log,
+            "--policy", policy, "--agent", args.agent, "--output", out]
+    if not args.no_sign and cfg["sign_key"]:
+        if not os.access(cfg["sign_key"], os.R_OK):
+            raise CliError("signing the evidence needs the signing key, which only root can read",
+                           fix="run `sudo varek export`, or `varek export --no-sign`")
+        argv += ["--sign-key", cfg["sign_key"]]
+    elif _pubkey(cfg):
+        argv += ["--pubkey", _pubkey(cfg)]
+    if args.allow_incomplete:
+        argv.append("--allow-incomplete")
+    rc = run_cmd(argv, check=False).returncode
+    if rc == 0:
+        ok(f"CycloneDX 1.6 authorization evidence written to {out}")
+        if "--sign-key" in argv:
+            hint(f"signed; anyone can check it with `varek export --verify {out}`")
+    return rc
+
+
+def cmd_version(args):
+    w = "not built"
+    try:
+        with open(warden_bin(), "rb") as fh:
+            m = re.search(rb'"warden":"(\d+\.\d+\.\d+)"', fh.read())
+        if m:
+            w = m.group(1).decode()
+        else:
+            with open(warden_bin(), "rb") as fh:
+                m = re.search(rb"(1\.\d+\.\d+)", fh.read())
+            w = m.group(1).decode() if m else "unknown"
+    except OSError:
+        pass
+    info(f"varek command {CLI_VERSION}")
+    info(f"VAREK Warden  {w}  ({varek_home()})")
+    return 0
+
+
+# -------------------------------------------------------------------- main --
+
+EPILOG = """\
+Getting started:
+  sudo varek doctor                       is this host ready?
+  sudo varek init --pack healthcare       settings, signing key, log directory
+  sudo varek preflight --run              a real trial run, then its audit
+  sudo varek run -- python3 agent.py      supervise an agent
+  varek refusals                          what was refused in the last run, and why
+  varek audit                             re-check the last run's verdicts and signatures
+  sudo varek export                       signed CycloneDX 1.6 evidence for auditors
+
+Add --show-commands to any command to print the underlying tool calls.
+"""
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="varek",
+        description="Run AI agents under the VAREK Warden and check what it decided.",
+        epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--show-commands", action="store_true",
+                   help="print each underlying command before running it")
+    sub = p.add_subparsers(dest="cmd", metavar="<command>")
+
+    def add(name, fn, help_, **kw):
+        sp = sub.add_parser(name, help=help_, description=help_, **kw)
+        sp.set_defaults(fn=fn)
+        return sp
+
+    add("doctor", cmd_doctor, "check that this host can run the Warden")
+
+    sp = add("init", cmd_init, "set up settings, signing key and log directory (root)")
+    sp.add_argument("--pack", help="policy pack name (see `varek policy list`) or a policy file")
+    sp.add_argument("--log-dir", help=f"where verdict streams go (default {DEFAULT_LOG_DIR})")
+    sp.add_argument("--run-as", help="unprivileged user the agent runs as (default nobody)")
+    sp.add_argument("--anchor", help="anchor path, e.g. /run/varek/anchor.fifo for an off-host anchor")
+    sp.add_argument("--spool", help="the anchor forwarder's spool directory")
+    sp.add_argument("--no-sign", action="store_true", help="do not create a signing key")
+    sp.add_argument("--force", action="store_true", help="overwrite existing settings")
+    sp.add_argument("--force-key", action="store_true", help="replace an existing signing key")
+
+    pol = sub.add_parser("policy", help="list, inspect, check and switch policies",
+                         description="List, inspect, check and switch policies.")
+    psub = pol.add_subparsers(dest="pcmd", metavar="<action>")
+    pol.set_defaults(fn=lambda a: (pol.print_help(), 0)[1])
+    x = psub.add_parser("list", help="show the policy packs available")
+    x.set_defaults(fn=cmd_policy_list)
+    x = psub.add_parser("show", help="summarize a policy (default: the active one)")
+    x.add_argument("file", nargs="?")
+    x.set_defaults(fn=cmd_policy_show)
+    x = psub.add_parser("check", help="lint a policy: rules that never fire, syntax errors")
+    x.add_argument("file", nargs="?")
+    x.add_argument("--explain", action="store_true",
+                   help="also show, for each rule, an example it decides")
+    x.set_defaults(fn=cmd_policy_check)
+    x = psub.add_parser("use", help="make a pack or file the active policy (root)")
+    x.add_argument("pack")
+    x.set_defaults(fn=cmd_policy_use)
+    x = psub.add_parser("add", help="install a licensed policy pack file (root)")
+    x.add_argument("file")
+    x.add_argument("--name", help="name to install it under")
+    x.set_defaults(fn=cmd_policy_add)
+
+    sp = add("preflight", cmd_preflight, "check the deployment before running agents")
+    sp.add_argument("--run", action="store_true", help="also do a real trial run and audit it (root)")
+
+    sp = add("run", cmd_run, "run an agent under the Warden (root)",
+             usage="varek run [options] -- <agent command> [args...]")
+    sp.add_argument("--policy", help="use this pack or file instead of the active policy")
+    sp.add_argument("--plan", help="check this action-graph plan before the agent starts")
+    sp.add_argument("--run-as", help="unprivileged user for the agent (default from settings)")
+    sp.add_argument("--log", help="write the verdict stream here instead of a new file")
+    sp.add_argument("--stderr-lines", type=int, default=20, metavar="N",
+                    help="after the run, show the last N lines the agent wrote to stderr "
+                         "(the Warden keeps them in the verdict stream; default 20)")
+    sp.add_argument("command", nargs=argparse.REMAINDER)
+
+    add("status", cmd_status, "show settings and the last run")
+
+    sp = add("runs", cmd_runs, "list recent runs")
+    sp.add_argument("-n", type=int, default=10, help="how many (default 10)")
+
+    sp = add("refusals", cmd_refusals, "list the actions refused in a run, and why")
+    sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")
+    sp.add_argument("-n", type=int, default=25, help="how many to show (default 25)")
+
+    sp = add("audit", cmd_audit, "re-check a run's certificates, chain and signatures")
+    sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")
+    sp.add_argument("--allow-incomplete", action="store_true",
+                    help="audit a run that has no run_end yet")
+
+    sp = add("export", cmd_export, "write CycloneDX 1.6 authorization evidence for a run")
+    sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")
+    sp.add_argument("-o", "--output", help="output file (default: next to the log, .cdx.json)")
+    sp.add_argument("--agent", default="agent", help="name of the agent, for the evidence")
+    sp.add_argument("--no-sign", action="store_true", help="do not sign the evidence")
+    sp.add_argument("--allow-incomplete", action="store_true",
+                    help="export a run that has no run_end yet")
+    sp.add_argument("--verify", metavar="BOM", help="verify a signed evidence file instead")
+    sp.add_argument("--pubkey", help="public key to verify with (default from settings)")
+
+    add("version", cmd_version, "show the varek command and Warden versions")
+    return p
+
+
+def main(argv=None):
+    global SHOW_COMMANDS
+    p = build_parser()
+    args = p.parse_args(argv)
+    SHOW_COMMANDS = args.show_commands
+    if not getattr(args, "fn", None):
+        p.print_help()
+        return 0
+    try:
+        return args.fn(args) or 0
+    except CliError as e:
+        print(f"varek: {e}", file=sys.stderr)
+        if e.fix:
+            print(f"  fix: {e.fix}", file=sys.stderr)
+        return e.code if isinstance(e.code, int) else 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

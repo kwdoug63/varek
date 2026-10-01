@@ -98,7 +98,16 @@ SUDO=""; [ "$(id -u)" -eq 0 ] || SUDO="sudo"
 TOOLS=(warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen)
 
 echo "== 1. build"
-if make -q -C "$HERE" "${TOOLS[@]}" >/dev/null 2>&1; then
+installed_ok() { for t in "${TOOLS[@]}"; do [ -x "$HERE/$t" ] || return 1; done; }
+if [ ! -f "$HERE/Makefile" ]; then
+    # v1.22: an installed runtime (`make install`, the AMI) has no sources to build.
+    if installed_ok; then
+        pass "the Warden and its tools are installed ($HERE)"
+    else
+        fail "the installed runtime in $HERE is incomplete (need: ${TOOLS[*]})"
+        echo "preflight: FAIL"; exit 1
+    fi
+elif make -q -C "$HERE" "${TOOLS[@]}" >/dev/null 2>&1; then
     pass "the Warden and its tools are built and up to date"
 else
     have_header() { printf '#include <%s>\n' "$1" | ${CC:-cc} -E -x c - >/dev/null 2>&1; }
