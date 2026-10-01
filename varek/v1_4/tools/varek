@@ -332,8 +332,8 @@ def _policy_for_log(cfg, s):
     run_start's, looked for where it was, then among backups and packs."""
     want = s.get("policy_sha")
     cands = [s.get("policy"), cfg["policy"]]
-    cands += sorted(glob.glob(cfg["policy"] + ".bak-*"), reverse=True)
     cands += list(installed_packs(cfg).values()) + list(builtin_packs().values())
+    cands += sorted(glob.glob(cfg["policy"] + ".bak-*"), reverse=True)
     seen = set()
     for c in cands:
         if not c or c in seen or not os.path.isfile(c):
