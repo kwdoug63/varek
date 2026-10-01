@@ -76,7 +76,11 @@ export VAREK_CONFIG="$SMOKE/etc/varek.conf"
 "$BINDIR/varek" init --pack healthcare --log-dir "$SMOKE/log"
 "$BINDIR/varek" doctor || true   # the build instance has no anchor or license role
 "$BINDIR/varek" preflight --run
-"$BINDIR/varek" run -- /bin/sh -c 'cat /etc/hostname >/dev/null 2>&1; echo smoke-ok'
+# A Python agent (what buyers run) whose read of /etc/hostname must be refused.
+# Not /bin/sh: on AL2023 it is bash, which needs getpgrp() and /dev/tty.
+smoke=$("$BINDIR/varek" run -- /usr/bin/python3 -c \
+    'exec("try: open(\"/etc/hostname\")\nexcept OSError: print(\"smoke-ok\")")')
+grep -q smoke-ok <<<"$smoke" || die "the smoke agent did not run as expected: $smoke"
 refused=$("$BINDIR/varek" refusals)
 grep -q UNSATISFIED <<<"$refused" || die "the refused read did not show up"
 "$BINDIR/varek" audit
