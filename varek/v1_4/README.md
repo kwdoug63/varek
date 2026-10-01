@@ -51,6 +51,27 @@ For each notification, the Warden:
 6. Emits a JSON pathology record with `CLOCK_MONOTONIC` decision
    latency in microseconds.
 
+## Quick start: the `varek` command (v1.22)
+
+`tools/varek` wraps the Warden and its tools in one command and keeps their
+shared settings in `/etc/varek/varek.conf`:
+
+```sh
+make deps && make && sudo make install     # /opt/varek, plus /usr/local/bin/varek
+sudo varek doctor                          # is this host ready?
+sudo varek init --pack healthcare          # settings, signing key, log directory
+sudo varek preflight --run                 # a real trial run, then its audit
+sudo varek run -- python3 agent.py         # supervise an agent
+varek refusals                             # what the last run refused, and why
+sudo varek audit                           # re-check certificates, chain, signatures
+sudo varek export                          # signed CycloneDX 1.6 evidence
+varek export --verify <file>.cdx.json      # anyone can check that evidence
+```
+
+`varek policy list|show|check|use|add` manages policies, `varek runs` and
+`varek status` show history, and `--show-commands` prints the underlying tool
+calls. `make test-cli` runs its tests (root, Linux).
+
 ## Layout
 
 | File                  | Purpose                                                         |

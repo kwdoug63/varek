@@ -7,6 +7,26 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased] — the `varek` command (planned v1.22.0)
+
+### Added
+- `varek/v1_4/tools/varek`: one command for running and checking the Warden,
+  reading shared settings from `/etc/varek/varek.conf`: `doctor`, `init`,
+  `policy list|show|check|use|add`, `preflight`, `run`, `status`, `runs`,
+  `refusals`, `audit`, `export` (signed CycloneDX 1.6, `--verify`) and
+  `version`. It wraps the existing tools and changes no verdict semantics;
+  `--show-commands` prints each underlying call. `audit`, `export` and
+  `refusals` find the policy file a run used by the SHA-256 in its run_start,
+  so a later policy switch does not break the audit of an older run.
+- `make install` / `make uninstall` (`PREFIX`, default `/opt/varek`; `BINDIR`,
+  default `/usr/local/bin`) and `make test-cli` (`tests/test_varek_cli.py`).
+
+### Changed
+- `tools/varek_preflight.sh` accepts an installed runtime (no Makefile beside
+  it) whose binaries are present, instead of trying to build it.
+
+---
+
 ## [Unreleased] — the v1.10 / v1.11 verification program (continuing)
 
 The program: **shrink the UNKNOWN region without weakening soundness.** Every

@@ -32,7 +32,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen
 
-.PHONY: all deps deps-check preflight clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 crosscheck harness video-v112
+.PHONY: all deps deps-check preflight install uninstall test-cli clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -326,3 +326,30 @@ run-conformance: warden target_conformance
 
 clean:
 	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter
+
+# v1.22: install the runtime and the `varek` command.
+#   sudo make install                  -> /opt/varek, plus /usr/local/bin/varek
+#   sudo make install PREFIX=/srv/varek BINDIR=/usr/bin
+PREFIX ?= /opt/varek
+BINDIR ?= /usr/local/bin
+INSTALL_TOOLS := tools/varek tools/vdp_check tools/vdp_cert_check tools/varek_keygen \
+	tools/varek_audit.py tools/varek_cyclonedx.py tools/varek_ed25519.py \
+	tools/varek_preflight.sh tools/varek_anchor_forward.py tools/varek_anchor_receiver.sh
+
+install: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen
+	install -d -m 0755 $(DESTDIR)$(PREFIX)/tools $(DESTDIR)$(PREFIX)/policies $(DESTDIR)$(BINDIR)
+	install -m 0755 warden $(DESTDIR)$(PREFIX)/warden
+	install -m 0755 $(INSTALL_TOOLS) $(DESTDIR)$(PREFIX)/tools/
+	install -m 0644 policies/*.policy.txt $(DESTDIR)$(PREFIX)/policies/
+	if [ -d tools/systemd ]; then install -d -m 0755 $(DESTDIR)$(PREFIX)/tools/systemd && \
+	    install -m 0644 tools/systemd/* $(DESTDIR)$(PREFIX)/tools/systemd/; fi
+	ln -sf $(PREFIX)/tools/varek $(DESTDIR)$(BINDIR)/varek
+	@echo "installed in $(PREFIX); next: sudo varek doctor"
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/varek
+	rm -rf $(DESTDIR)$(PREFIX)
+	@echo "removed $(PREFIX); settings in /etc/varek and logs in /var/log/varek were kept"
+
+test-cli: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen
+	python3 -m pytest -q tests/test_varek_cli.py
