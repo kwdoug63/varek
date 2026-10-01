@@ -194,10 +194,17 @@ def builtin_packs():
     return out
 
 
+def packs_dir(cfg):
+    if cfg:
+        return cfg["packs_dir"]
+    return os.path.join(os.path.dirname(os.path.abspath(config_path())), "packs")
+
+
 def installed_packs(cfg):
     out = {}
-    if cfg and os.path.isdir(cfg["packs_dir"]):
-        for p in sorted(glob.glob(os.path.join(cfg["packs_dir"], "*.policy.txt"))):
+    d = packs_dir(cfg)
+    if os.path.isdir(d):
+        for p in sorted(glob.glob(os.path.join(d, "*.policy.txt"))):
             out[os.path.basename(p)[:-len(".policy.txt")]] = p
     return out
 
@@ -473,8 +480,8 @@ def cmd_init(args):
     info(f"Setting up VAREK in {etc}\n")
     os.makedirs(etc, exist_ok=True)
     os.chmod(etc, 0o755)
-    packs_dir = os.path.join(etc, "packs")
-    os.makedirs(packs_dir, exist_ok=True)
+    pdir = os.path.join(etc, "packs")
+    os.makedirs(pdir, exist_ok=True)
 
     policy = os.path.join(etc, "policy.txt")
     if os.path.exists(policy) and sha256_file(policy) != sha256_file(src):
@@ -506,7 +513,7 @@ def cmd_init(args):
 
     cfg = {"policy": policy, "log_dir": log_dir, "sign_key": key,
            "anchor": args.anchor or "", "spool": args.spool or "",
-           "run_as": args.run_as or "nobody", "packs_dir": packs_dir}
+           "run_as": args.run_as or "nobody", "packs_dir": pdir}
     write_config(path, cfg)
     ok(f"settings written to {path}")
 
@@ -591,7 +598,7 @@ def cmd_policy_use(args):
 
 def cmd_policy_add(args):
     need_root("policy add")
-    cfg = load_config()
+    cfg = load_config(required=False)
     if not os.path.isfile(args.file):
         raise CliError(f"no file at {args.file}")
     rc, out = lint_policy(args.file)
@@ -600,12 +607,17 @@ def cmd_policy_add(args):
     name = args.name or os.path.basename(args.file)
     if not name.endswith(".policy.txt"):
         name = re.sub(r"\.txt$", "", name) + ".policy.txt"
-    os.makedirs(cfg["packs_dir"], exist_ok=True)
-    dst = os.path.join(cfg["packs_dir"], name)
+    pdir = packs_dir(cfg)
+    os.makedirs(pdir, exist_ok=True)
+    dst = os.path.join(pdir, name)
     shutil.copyfile(args.file, dst)
     os.chmod(dst, 0o644)
-    ok(f"pack '{name[:-len('.policy.txt')]}' installed in {cfg['packs_dir']}")
-    info(f"Make it active with `sudo varek policy use {name[:-len('.policy.txt')]}`.")
+    short = name[:-len(".policy.txt")]
+    ok(f"pack '{short}' installed in {pdir}")
+    if cfg:
+        info(f"Make it active with `sudo varek policy use {short}`.")
+    else:
+        info(f"Set VAREK up with it: `sudo varek init --pack {short}`.")
     return 0
 
 
@@ -659,6 +671,14 @@ def cmd_run(args):
     with os.fdopen(fd, "w") as err:
         r = run_cmd(argv, check=False, stderr=err)
 
+    agent_err = []
+    with open(log, encoding="utf-8", errors="replace") as fh:
+        agent_err = [ln[len("[agent] "):].rstrip("\n") for ln in fh if ln.startswith("[agent] ")]
+    if agent_err:
+        print(_paint("2", f"[varek] the agent's stderr ({len(agent_err)} line(s), kept in the log):"),
+              file=sys.stderr)
+        for ln in agent_err[-args.stderr_lines:]:
+            print("  " + ln, file=sys.stderr)
     s = summarize(read_records(log))
     print(_paint("2", f"[varek] run {s['run'] or '?'} ended (exit {r.returncode}): "
                       f"{s['allowed']} allowed, {s['refused']} refused "
@@ -789,14 +809,15 @@ def cmd_audit(args):
 
 
 def cmd_export(args):
-    cfg = load_config()
     if args.verify:
-        pub = args.pubkey or _pubkey(cfg)
+        cfg = load_config(required=False)
+        pub = args.pubkey or (_pubkey(cfg) if cfg else None)
         if not pub:
             raise CliError("verifying needs the Warden's public key",
                            fix="pass --pubkey /etc/varek/log.key.pub")
         return run_cmd([sys.executable, tool("varek_cyclonedx.py"),
                         "--verify", args.verify, "--pubkey", pub], check=False).returncode
+    cfg = load_config()
     log = latest_log(cfg, args.log)
     s = summarize(read_records(log))
     out = args.output or re.sub(r"\.log$", "", log) + ".cdx.json"
@@ -915,6 +936,9 @@ def build_parser():
     sp.add_argument("--plan", help="check this action-graph plan before the agent starts")
     sp.add_argument("--run-as", help="unprivileged user for the agent (default from settings)")
     sp.add_argument("--log", help="write the verdict stream here instead of a new file")
+    sp.add_argument("--stderr-lines", type=int, default=20, metavar="N",
+                    help="after the run, show the last N lines the agent wrote to stderr "
+                         "(the Warden keeps them in the verdict stream; default 20)")
     sp.add_argument("command", nargs=argparse.REMAINDER)
 
     add("status", cmd_status, "show settings and the last run")

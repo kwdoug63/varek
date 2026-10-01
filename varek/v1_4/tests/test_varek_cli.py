@@ -138,3 +138,20 @@ def test_old_run_is_audited_against_the_policy_it_used(tmp_path):
     assert "PASS" in r.stdout + r.stderr
     r = varek("refusals", str(first), config=conf, check=0)
     assert "deny  path /etc/" in r.stdout
+
+
+@needs_runtime
+def test_pack_added_before_init_and_stderr_and_standalone_verify(tmp_path):
+    conf = str(tmp_path / "etc" / "varek.conf")
+    pack = tmp_path / "site.policy.txt"
+    pack.write_text(open(os.path.join(HERE, "policies", "healthcare.policy.txt")).read())
+    varek("policy", "add", str(pack), "--name", "site", config=conf, check=0)   # no settings yet
+    varek("init", "--pack", "site", "--log-dir", str(tmp_path / "log"), config=conf, check=0)
+    r = varek("run", "--", "/bin/sh", "-c", "echo to-stderr >&2; true", config=conf, check=0)
+    assert "to-stderr" in r.stderr                   # the agent's stderr is shown after the run
+    varek("export", config=conf, check=0)
+    bom = next((tmp_path / "log").glob("*.cdx.json"))
+    pub = str(tmp_path / "etc" / "log.key.pub")
+    # An auditor with no VAREK settings can verify with the public key alone.
+    varek("export", "--verify", str(bom), "--pubkey", pub,
+          config=str(tmp_path / "nowhere.conf"), check=0)
