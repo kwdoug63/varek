@@ -36,7 +36,10 @@ import stat
 import subprocess
 import sys
 
-CLI_VERSION = "1.0.0"
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import varek_license  # noqa: E402
+
+CLI_VERSION = "1.1.0"
 DEFAULT_CONFIG = "/etc/varek/varek.conf"
 DEFAULT_ETC = "/etc/varek"
 DEFAULT_LOG_DIR = "/var/log/varek"
@@ -225,6 +228,35 @@ def resolve_pack(name, cfg):
         return packs[name]
     raise CliError(f"no policy pack or file named '{name}'",
                    fix="`varek policy list` shows the packs; or give a path to a policy file")
+
+
+def require_entitlement(src):
+    """Enterprise packs need a VAREK Enterprise entitlement; everything else doesn't.
+
+    Only the choice of an Enterprise pack is gated. The Warden and the
+    open-source packs (VAREK Core) work with or without a license.
+    """
+    if not varek_license.is_enterprise_pack(src):
+        return
+    r = varek_license.check(varek_home())
+    if r.ok:
+        ok(f"VAREK Enterprise license: {r.dimension}")
+        return
+    name = os.path.basename(src)
+    core = ", ".join(sorted(n for n, p in builtin_packs().items()
+                            if not varek_license.is_enterprise_pack(p)))
+    if r.status == varek_license.NOT_LICENSED:
+        raise CliError(f"{name} is a VAREK Enterprise pack and this AWS account has no "
+                       f"VAREK Enterprise subscription ({r.detail})",
+                       fix=f"subscribe on AWS Marketplace, or use a VAREK Core pack: {core}")
+    if r.status == varek_license.NOT_MARKETPLACE:
+        raise CliError(f"{name} is a VAREK Enterprise pack; it runs on the VAREK Enterprise "
+                       "AMI from AWS Marketplace",
+                       fix=f"use a VAREK Core pack: {core}")
+    raise CliError(f"{name} is a VAREK Enterprise pack and the license could not be "
+                   f"checked: {r.detail}",
+                   fix="attach an instance role allowing license-manager:CheckoutLicense "
+                       "(see `varek license`), then try again")
 
 
 def pack_summary(path):
@@ -450,6 +482,16 @@ def cmd_doctor(args):
             warn("no off-host anchor: root on this host could rewrite unanchored history")
             hint("see `Off-host anchor` in the Warden README to add one")
 
+    if os.path.exists(os.path.join(varek_home(), varek_license.MARKETPLACE_FILE)):
+        r = varek_license.check(varek_home())
+        if r.ok:
+            ok(f"VAREK Enterprise license: {r.dimension}")
+        elif r.status == varek_license.NOT_LICENSED:
+            warn("no VAREK Enterprise entitlement: the VAREK Core packs still work")
+        else:
+            warn(f"VAREK Enterprise license not checked: {r.detail}")
+            hint("`varek license` shows the IAM permission the instance needs")
+
     print()
     if bad:
         info(f"{bad} problem(s) to fix before running agents.")
@@ -476,6 +518,7 @@ def cmd_init(args):
     rc, out = lint_policy(src)
     if rc != 0:
         raise CliError(f"{src} does not lint:\n{out}")
+    require_entitlement(src)
 
     info(f"Setting up VAREK in {etc}\n")
     os.makedirs(etc, exist_ok=True)
@@ -534,12 +577,42 @@ def cmd_policy_list(args):
         return 0
     width = max(len(n) for n, _, _ in rows)
     info("Policy packs (use with `sudo varek policy use <name>`):\n")
+    any_ent = False
     for n, p, kind in rows:
         mark = "*" if active and sha256_file(p) == active else " "
-        info(f" {mark} {n.ljust(width)}  {kind:9}  {pack_summary(p)}")
+        if varek_license.is_enterprise_pack(p):
+            kind, any_ent = "enterprise", True
+        info(f" {mark} {n.ljust(width)}  {kind:10}  {pack_summary(p)}")
     if active:
         info("\n * = the active policy")
+    if any_ent:
+        info("enterprise = needs a VAREK Enterprise subscription (`varek license` checks it)")
     return 0
+
+
+def cmd_license(args):
+    try:
+        mp = varek_license.load_marketplace(varek_home())
+    except ValueError as e:
+        raise CliError(str(e))
+    if mp is None:
+        info("This is VAREK Core (open source). No license is needed or checked.")
+        info("VAREK Enterprise, with the HIPAA and SOC 2 packs, is sold on AWS Marketplace.")
+        return 0
+    info(f"VAREK Enterprise, AWS Marketplace product {mp['product_id']}")
+    info(f"Checking for: {', '.join(mp['dimensions'])}\n")
+    r = varek_license.check(varek_home())
+    if r.ok:
+        ok(f"licensed: {r.dimension}")
+        return 0
+    if r.status == varek_license.NOT_LICENSED:
+        warn(f"no VAREK Enterprise entitlement for this AWS account ({r.detail})")
+        hint("the Warden and the VAREK Core packs keep working; Enterprise packs can't be chosen")
+        return 1
+    fail(f"could not check the license: {r.detail}")
+    hint("the instance needs an IAM role with this permission:")
+    hint('  {"Effect": "Allow", "Action": "license-manager:CheckoutLicense", "Resource": "*"}')
+    return 1
 
 
 def cmd_policy_show(args):
@@ -581,6 +654,7 @@ def cmd_policy_use(args):
     rc, out = lint_policy(src)
     if rc != 0:
         raise CliError(f"{src} does not lint:\n{out}")
+    require_entitlement(src)
     dst = cfg["policy"]
     if os.path.exists(dst):
         if sha256_file(dst) == sha256_file(src):
@@ -647,6 +721,8 @@ def cmd_run(args):
         raise CliError("no agent command given",
                        fix="put it after --, e.g. `sudo varek run -- python3 agent.py`")
     policy = resolve_pack(args.policy, cfg) if args.policy else cfg["policy"]
+    if args.policy:
+        require_entitlement(policy)
     os.makedirs(cfg["log_dir"], exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     log = args.log or os.path.join(cfg["log_dir"], f"verdicts-{stamp}.log")
@@ -965,6 +1041,7 @@ def build_parser():
     sp.add_argument("--verify", metavar="BOM", help="verify a signed evidence file instead")
     sp.add_argument("--pubkey", help="public key to verify with (default from settings)")
 
+    add("license", cmd_license, "check the VAREK Enterprise subscription (AWS Marketplace)")
     add("version", cmd_version, "show the varek command and Warden versions")
     return p
 

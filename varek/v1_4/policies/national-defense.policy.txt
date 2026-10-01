@@ -87,6 +87,7 @@ allow path /var/lib/intel/products/ readonly    # finished intelligence products
 allow path /var/lib/c2/staffwork/draft/    # staff products staged for human review
 allow path /tmp/varek/                      # scratch workspace
 allow path /usr/lib/ readonly                   # loader / shared libraries: read, never write
+allow path /usr/lib64/ readonly                 # shared libraries on RHEL, Fedora and Amazon Linux (/lib64 -> /usr/lib64)
 allow path /lib/ readonly                       # loader / shared libraries: read, never write
 allow path /lib64/ readonly                     # loader / shared libraries: read, never write
 

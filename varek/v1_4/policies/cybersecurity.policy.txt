@@ -79,6 +79,7 @@ allow path /var/lib/varek/quarantine/      # where suspicious artifacts are isol
 allow path /var/lib/detection/rules/ readonly   # YARA / Sigma rule sets (read)
 allow path /tmp/varek/                      # scratch workspace
 allow path /usr/lib/ readonly                   # loader / shared libraries: read, never write
+allow path /usr/lib64/ readonly                 # shared libraries on RHEL, Fedora and Amazon Linux (/lib64 -> /usr/lib64)
 allow path /lib/ readonly                       # loader / shared libraries: read, never write
 allow path /lib64/ readonly                     # loader / shared libraries: read, never write
 

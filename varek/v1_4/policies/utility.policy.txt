@@ -80,6 +80,7 @@ allow path /var/lib/scada/setpoints/read/ readonly # current setpoints (read onl
 allow path /var/lib/ot/events/ readonly         # alarm / event log (read)
 allow path /tmp/varek/                      # scratch workspace
 allow path /usr/lib/ readonly                   # loader / shared libraries: read, never write
+allow path /usr/lib64/ readonly                 # shared libraries on RHEL, Fedora and Amazon Linux (/lib64 -> /usr/lib64)
 allow path /lib/ readonly                       # loader / shared libraries: read, never write
 allow path /lib64/ readonly                     # loader / shared libraries: read, never write
 

@@ -7,6 +7,33 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased] — VAREK Enterprise on AWS Marketplace (planned v1.23.0)
+
+### Added
+- `varek/v1_4/packaging/aws-marketplace/`: Packer build of the VAREK
+  Enterprise AMI (Amazon Linux 2023, x86_64, us-east-1). `install.sh` patches
+  the base image, builds and installs the runtime, adds the Enterprise packs
+  (supplied from outside the repository), removes the compiler and proves the
+  installed image with a real run, audit and signed export. `harden.sh` makes
+  the image meet the AWS Marketplace AMI policy (key-only SSH, no root login,
+  no passwords, no authorized_keys, host keys or private keys) and removes the
+  build instance's identity. `build.sh` checks the inputs and runs Packer.
+- `tools/varek_license.py` and `varek license`: on the AMI, choosing an
+  Enterprise policy pack checks the buyer's contract with AWS License Manager
+  (`CheckoutLicense`, highest tier first). Without an entitlement the command
+  explains and lists the VAREK Core packs; the Warden and the Core packs never
+  depend on the license. `varek policy list` marks Enterprise packs and
+  `varek doctor` reports the license. Off the AMI nothing is checked.
+- `tests/test_varek_license.py` (in `make test-cli`), using a stand-in `aws`.
+
+### Fixed
+- The five VAREK Core packs allow `/usr/lib64/` read-only. On RHEL, Fedora
+  and Amazon Linux, `/lib64` is a link to `/usr/lib64`, and the Warden decides
+  on the resolved path, so every dynamically linked agent was refused its
+  shared libraries (UNKNOWN) on those systems. Writes there stay refused.
+
+---
+
 ## [Unreleased] — the `varek` command (planned v1.22.0)
 
 ### Added
