@@ -49,6 +49,12 @@
 #include <stdint.h>
 #include <unistd.h>
 
+// Older glibc <sched.h> (Amazon Linux 2023 and RHEL 9 ship glibc 2.34) lacks
+// CLONE_NEWTIME although their kernels support time namespaces.
+#ifndef CLONE_NEWTIME
+#define CLONE_NEWTIME 0x00000080   // linux/sched.h, since Linux 5.6
+#endif
+
 #ifndef WD_BASELINE_STRICT
 #define WD_BASELINE_STRICT 1
 #endif

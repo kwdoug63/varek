@@ -86,6 +86,7 @@ allow path /var/spool/hl7/outbound/       # HL7 / FHIR messages the agent compos
 allow path /var/lib/ehr/orders/draft/     # order drafts staged for clinician sign-off
 allow path /tmp/varek/                     # scratch workspace
 allow path /usr/lib/ readonly                   # loader / shared libraries
+allow path /usr/lib64/ readonly                 # shared libraries on RHEL, Fedora and Amazon Linux (/lib64 -> /usr/lib64)
 allow path /lib/ readonly                       # loader / shared libraries: read, never write
 allow path /lib64/ readonly                     # loader / shared libraries: read, never write
 

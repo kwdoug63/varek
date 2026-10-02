@@ -334,7 +334,8 @@ PREFIX ?= /opt/varek
 BINDIR ?= /usr/local/bin
 INSTALL_TOOLS := tools/varek tools/vdp_check tools/vdp_cert_check tools/varek_keygen \
 	tools/varek_audit.py tools/varek_cyclonedx.py tools/varek_ed25519.py \
-	tools/varek_preflight.sh tools/varek_anchor_forward.py tools/varek_anchor_receiver.sh
+	tools/varek_preflight.sh tools/varek_anchor_forward.py tools/varek_anchor_receiver.sh \
+	tools/varek_license.py
 
 install: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/tools $(DESTDIR)$(PREFIX)/policies $(DESTDIR)$(BINDIR)
@@ -352,4 +353,4 @@ uninstall:
 	@echo "removed $(PREFIX); settings in /etc/varek and logs in /var/log/varek were kept"
 
 test-cli: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen
-	python3 -m pytest -q tests/test_varek_cli.py
+	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_license.py
