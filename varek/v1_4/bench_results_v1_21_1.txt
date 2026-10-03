@@ -1,0 +1,94 @@
+VAREK v1.21.1: varek bench results
+
+Produced with `varek bench` (varek command 1.2.0, this branch) against the Warden built
+from main at 887cbab: the v1.21.1 Warden sources plus one build fix since the tag (a CLONE_NEWTIME
+definition in warden_baseline_filter.c for glibc 2.34 hosts), which changes nothing on this host.
+Host: a 2-vCPU cloud VM of the same kind as the one behind tests/connect_latency_v1.21.0.txt.
+Full results, including every check and the per-run p50s: bench_results_v1_21_1.json.
+
+1. sudo varek bench --bare            (the bench's own 5 rules; verdict stream unsigned)
+
+VAREK bench: what mediation costs per call on this host
+
+  Warden    1.21.1  (sha256 bbc2e350545b)   varek command 1.2.0
+  Host      Linux 6.18.44-fc-v64 x86_64, 2 CPU, Intel(R) Xeon(R) Processor @ 2.80GHz, 8031 MiB
+  Date      2026-10-03T18:22:05Z
+  Policy    bench rules only (5 rules), sha256 9e6cc6405a1e
+  Agent     runs as nobody; verdict stream chained, unsigned; workload static
+  Runs      5 native and 5 under the Warden, alternating; 2000 timed calls of each kind per run, after 200 warm-up
+
+  Microseconds per call, as the agent measured it (p50 / p90 / p99):
+
+                                               native    under the Warden    added   Warden decision
+                                      p50   p90   p99     p50   p90   p99      p50        p50    p99
+  open, allowed (read)                2.3   2.9   4.6      70    92   166      +67       56    134
+  open, denied by a rule              0.9   1.0   1.7      53    74   131      +52       13     41
+  open, no rule (UNKNOWN)             0.8   0.9   1.5      58    76   134      +57       13     41
+  connect, allowed (dialed)            24    29    56     148   197   306     +124      118    240
+  connect, denied by a rule            24    28    55      56    73   142      +32       12     38
+  request (connect + 1 KiB reply)      76   113   241     214   268   418     +138      105    232
+
+  Warden p50 across runs: open_allowed 65-73, open_denied 51-56, open_unknown 54-61, connect_allowed 133-158, connect_denied 51-59, request 205-224
+  Of the allowed connect's decision, dialing the destination took p50 31 us.
+
+  Verdicts  all 40 checks passed: every allowed call was certified and succeeded, every denied
+            or unmatched call was refused with EACCES, and the denied listener was never reached.
+
+
+2. sudo varek bench --policy healthcare   (the healthcare pack's 33 rules first, then the bench's;
+   verdict stream signed, as `varek init` sets it up)
+
+VAREK bench: what mediation costs per call on this host
+
+  Warden    1.21.1  (sha256 bbc2e350545b)   varek command 1.2.0
+  Host      Linux 6.18.44-fc-v64 x86_64, 2 CPU, Intel(R) Xeon(R) Processor @ 2.80GHz, 8031 MiB
+  Date      2026-10-03T18:22:15Z
+  Policy    healthcare + 5 bench rules (38 rules), sha256 5bf75e4a47b0
+  Agent     runs as nobody; verdict stream signed; workload static
+  Runs      5 native and 5 under the Warden, alternating; 2000 timed calls of each kind per run, after 200 warm-up
+
+  Microseconds per call, as the agent measured it (p50 / p90 / p99):
+
+                                               native    under the Warden    added   Warden decision
+                                      p50   p90   p99     p50   p90   p99      p50        p50    p99
+  open, allowed (read)                2.4   3.0   5.6      80   106   186      +78       67    156
+  open, denied by a rule              0.9   1.2   1.8      57    80   139      +56       17     49
+  open, no rule (UNKNOWN)             0.8   1.1   1.6      61    82   140      +60       17     50
+  connect, allowed (dialed)            24    29    61     147   187   309     +123      117    247
+  connect, denied by a rule            24    30    57      56    73   128      +32       12     36
+  request (connect + 1 KiB reply)      86   118   231     209   258   392     +123      104    222
+
+  Warden p50 across runs: open_allowed 77-83, open_denied 55-59, open_unknown 59-63, connect_allowed 136-152, connect_denied 53-57, request 205-214
+  Of the allowed connect's decision, dialing the destination took p50 32 us.
+
+  Verdicts  all 40 checks passed: every allowed call was certified and succeeded, every denied
+            or unmatched call was refused with EACCES, and the denied listener was never reached.
+
+  Notes
+  - 'added' is the cost of a mediated call: the decision, the notification round trip
+    to the Warden, and (for an allowed open or connect) the Warden opening the file or
+    dialing the destination for the agent. 'Warden decision' is the Warden's own time
+    from its verdict records, without the round trip.
+  - Natively the denied and unmatched calls do their full work (the file opens, the
+    connection is made); under the Warden they are refused before any of it.
+  - An agent slows down by (mediated calls) x (added), so how much depends on how
+    often it opens files and connects compared with the work it does in between.
+    The request row shows one call next to a small whole request on loopback; a
+    real network request takes far longer, so the share there is smaller.
+  - These numbers are for this host. Compare hosts by running varek bench on each.
+
+How these compare with figures published earlier
+------------------------------------------------
+- The v1.14, v1.15 and v1.16 release notes give a P50 of 8 us for "all decisions",
+  from bench_target. That is the Warden's own time (latency_us in its records, timed
+  from the moment it receives the notification), not what the agent waits, and it is
+  a median over bench_target's mix, in which every connect was refused after its
+  decision with nothing dialed (v1.9.1's deny-only posture, in force until v1.21.0).
+  The "Warden decision" column above is the same measure, split by kind of call:
+  13-17 us for a refused open, 56-67 us for an authorized open (v1.15 and
+  v1.16 reported 48-51 us for authorized opens alone), and 117-118 us for an allowed
+  connect, which since v1.21.0 includes the Warden dialing the destination.
+- What the agent waits for a mediated call is the "under the Warden" column: about
+  53-80 us for an open and 147-148 us for an allowed connect on this host,
+  32-138 us more than the same call natively ("added").
+- The per-run p50s under the Warden are in each report ("Warden p50 across runs").

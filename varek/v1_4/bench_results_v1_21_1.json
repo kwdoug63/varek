@@ -1,0 +1,1054 @@
+{
+  "bare": {
+    "varek_bench": 1,
+    "date": "2026-10-03T18:22:05Z",
+    "host": {
+      "kernel": "6.18.44-fc-v64",
+      "machine": "x86_64",
+      "cpus": 2,
+      "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+      "memory": "8031 MiB"
+    },
+    "warden": {
+      "version": "1.21.1",
+      "path": "warden",
+      "sha256": "bbc2e350545b7cc5080ece21fe4df59910a991df83eba66129ff274610340e88"
+    },
+    "workload": {
+      "path": "tools/bench_workload",
+      "sha256": "f830e7513e657f5e73695c7e5055f5d28c96d5b97730d294112a726dd500519a",
+      "static": true
+    },
+    "policy": {
+      "base": null,
+      "base_path": null,
+      "rules": 5,
+      "bench_rules": 5,
+      "sha256": "9e6cc6405a1ec177bd22ae884422fb68e729bd3479a477eb47f9813faabe9a9c"
+    },
+    "settings": {
+      "calls_per_kind_per_run": 2000,
+      "warmup": 200,
+      "rounds": 5,
+      "run_as": "nobody",
+      "signing": false
+    },
+    "kinds": {
+      "open_allowed": {
+        "label": "open, allowed (read)",
+        "native": {
+          "n": 10000,
+          "p50": 2.3,
+          "p90": 2.9,
+          "p99": 4.6,
+          "max": 200.0,
+          "mean": 2.6
+        },
+        "warden": {
+          "n": 10000,
+          "p50": 69.7,
+          "p90": 92.2,
+          "p99": 166.5,
+          "max": 3505.8,
+          "mean": 75.0
+        },
+        "added_p50_us": 67.4,
+        "round_p50_us": {
+          "native": [
+            2.4,
+            2.4,
+            2.3,
+            2.3,
+            2.3
+          ],
+          "warden": [
+            70.8,
+            70.6,
+            64.6,
+            65.0,
+            72.8
+          ]
+        },
+        "warden_decision_us": {
+          "n": 10000,
+          "p50": 56,
+          "p90": 74,
+          "p99": 134,
+          "max": 3510,
+          "mean": 60.2
+        },
+        "dial_us": null
+      },
+      "open_denied": {
+        "label": "open, denied by a rule",
+        "native": {
+          "n": 10000,
+          "p50": 0.9,
+          "p90": 1.0,
+          "p99": 1.7,
+          "max": 392.3,
+          "mean": 1.0
+        },
+        "warden": {
+          "n": 10000,
+          "p50": 53.1,
+          "p90": 74.0,
+          "p99": 131.3,
+          "max": 4088.8,
+          "mean": 58.7
+        },
+        "added_p50_us": 52.2,
+        "round_p50_us": {
+          "native": [
+            0.9,
+            0.9,
+            0.9,
+            0.9,
+            0.9
+          ],
+          "warden": [
+            54.0,
+            53.5,
+            51.6,
+            51.3,
+            55.9
+          ]
+        },
+        "warden_decision_us": {
+          "n": 10000,
+          "p50": 13,
+          "p90": 17,
+          "p99": 41,
+          "max": 471,
+          "mean": 14.1
+        },
+        "dial_us": null
+      },
+      "open_unknown": {
+        "label": "open, no rule (UNKNOWN)",
+        "native": {
+          "n": 10000,
+          "p50": 0.8,
+          "p90": 0.9,
+          "p99": 1.5,
+          "max": 79.0,
+          "mean": 0.9
+        },
+        "warden": {
+          "n": 10000,
+          "p50": 57.8,
+          "p90": 76.5,
+          "p99": 133.5,
+          "max": 2733.2,
+          "mean": 61.7
+        },
+        "added_p50_us": 57.0,
+        "round_p50_us": {
+          "native": [
+            0.8,
+            0.8,
+            0.8,
+            0.8,
+            0.8
+          ],
+          "warden": [
+            58.3,
+            58.3,
+            53.7,
+            55.9,
+            61.0
+          ]
+        },
+        "warden_decision_us": {
+          "n": 10000,
+          "p50": 13,
+          "p90": 17,
+          "p99": 41,
+          "max": 1192,
+          "mean": 14.4
+        },
+        "dial_us": null
+      },
+      "connect_allowed": {
+        "label": "connect, allowed (dialed)",
+        "native": {
+          "n": 10000,
+          "p50": 24.1,
+          "p90": 29.0,
+          "p99": 56.3,
+          "max": 2745.8,
+          "mean": 26.4
+        },
+        "warden": {
+          "n": 10000,
+          "p50": 148.2,
+          "p90": 197.1,
+          "p99": 305.6,
+          "max": 6004.3,
+          "mean": 157.9
+        },
+        "added_p50_us": 124.1,
+        "round_p50_us": {
+          "native": [
+            23.8,
+            23.3,
+            24.4,
+            24.2,
+            24.2
+          ],
+          "warden": [
+            150.8,
+            149.8,
+            133.5,
+            133.3,
+            157.9
+          ]
+        },
+        "warden_decision_us": {
+          "n": 10000,
+          "p50": 118,
+          "p90": 160,
+          "p99": 240,
+          "max": 3572,
+          "mean": 127.1
+        },
+        "dial_us": {
+          "n": 10000,
+          "p50": 31,
+          "p90": 40,
+          "p99": 74,
+          "max": 876,
+          "mean": 33.2
+        }
+      },
+      "connect_denied": {
+        "label": "connect, denied by a rule",
+        "native": {
+          "n": 10000,
+          "p50": 24.0,
+          "p90": 27.9,
+          "p99": 55.2,
+          "max": 303.4,
+          "mean": 24.9
+        },
+        "warden": {
+          "n": 10000,
+          "p50": 55.9,
+          "p90": 72.7,
+          "p99": 141.6,
+          "max": 3590.2,
+          "mean": 60.9
+        },
+        "added_p50_us": 31.9,
+        "round_p50_us": {
+          "native": [
+            23.0,
+            22.7,
+            24.3,
+            24.3,
+            24.3
+          ],
+          "warden": [
+            57.0,
+            56.3,
+            51.1,
+            53.8,
+            59.2
+          ]
+        },
+        "warden_decision_us": {
+          "n": 10000,
+          "p50": 12,
+          "p90": 15,
+          "p99": 38,
+          "max": 176,
+          "mean": 12.6
+        },
+        "dial_us": null
+      },
+      "request": {
+        "label": "request (connect + 1 KiB reply)",
+        "native": {
+          "n": 10000,
+          "p50": 75.7,
+          "p90": 112.8,
+          "p99": 241.3,
+          "max": 3697.5,
+          "mean": 87.5
+        },
+        "warden": {
+          "n": 10000,
+          "p50": 214.2,
+          "p90": 267.8,
+          "p99": 417.6,
+          "max": 5352.7,
+          "mean": 224.0
+        },
+        "added_p50_us": 138.5,
+        "round_p50_us": {
+          "native": [
+            85.8,
+            90.1,
+            72.5,
+            68.9,
+            69.2
+          ],
+          "warden": [
+            219.0,
+            218.4,
+            204.9,
+            207.9,
+            224.4
+          ]
+        },
+        "warden_decision_us": {
+          "n": 10000,
+          "p50": 105,
+          "p90": 142,
+          "p99": 232,
+          "max": 5181,
+          "mean": 115.2
+        },
+        "dial_us": {
+          "n": 10000,
+          "p50": 29,
+          "p90": 37,
+          "p99": 69,
+          "max": 5039,
+          "mean": 31.4
+        }
+      }
+    },
+    "checks": [
+      {
+        "check": "round 1 native: every call succeeds natively",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 1 Warden: open_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 1 Warden: open_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 1 Warden: open_unknown: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 1 Warden: connect_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 1 Warden: connect_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 1 Warden: request: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 1 Warden: the denied listener was never reached",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 Warden: open_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 Warden: open_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 Warden: open_unknown: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 Warden: connect_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 Warden: connect_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 Warden: request: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 Warden: the denied listener was never reached",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 native: every call succeeds natively",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 native: every call succeeds natively",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 Warden: open_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 Warden: open_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 Warden: open_unknown: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 Warden: connect_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 Warden: connect_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 Warden: request: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 Warden: the denied listener was never reached",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 Warden: open_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 Warden: open_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 Warden: open_unknown: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 Warden: connect_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 Warden: connect_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 Warden: request: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 Warden: the denied listener was never reached",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 native: every call succeeds natively",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 native: every call succeeds natively",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 Warden: open_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 Warden: open_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 Warden: open_unknown: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 Warden: connect_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 Warden: connect_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 Warden: request: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 Warden: the denied listener was never reached",
+        "ok": true,
+        "detail": ""
+      }
+    ],
+    "ok": true,
+    "kept": null,
+    "varek_command": "1.2.0"
+  },
+  "healthcare_signed": {
+    "varek_bench": 1,
+    "date": "2026-10-03T18:22:15Z",
+    "host": {
+      "kernel": "6.18.44-fc-v64",
+      "machine": "x86_64",
+      "cpus": 2,
+      "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+      "memory": "8031 MiB"
+    },
+    "warden": {
+      "version": "1.21.1",
+      "path": "warden",
+      "sha256": "bbc2e350545b7cc5080ece21fe4df59910a991df83eba66129ff274610340e88"
+    },
+    "workload": {
+      "path": "tools/bench_workload",
+      "sha256": "f830e7513e657f5e73695c7e5055f5d28c96d5b97730d294112a726dd500519a",
+      "static": true
+    },
+    "policy": {
+      "base": "healthcare",
+      "base_path": "policies/healthcare.policy.txt",
+      "rules": 38,
+      "bench_rules": 5,
+      "sha256": "5bf75e4a47b01025f93422e6f3b5fc9461f31e061beaf8b6419e67b6ce7ab093"
+    },
+    "settings": {
+      "calls_per_kind_per_run": 2000,
+      "warmup": 200,
+      "rounds": 5,
+      "run_as": "nobody",
+      "signing": true
+    },
+    "kinds": {
+      "open_allowed": {
+        "label": "open, allowed (read)",
+        "native": {
+          "n": 10000,
+          "p50": 2.4,
+          "p90": 3.0,
+          "p99": 5.6,
+          "max": 74.5,
+          "mean": 2.6
+        },
+        "warden": {
+          "n": 10000,
+          "p50": 80.3,
+          "p90": 106.4,
+          "p99": 185.9,
+          "max": 2500.5,
+          "mean": 88.4
+        },
+        "added_p50_us": 77.9,
+        "round_p50_us": {
+          "native": [
+            2.5,
+            2.3,
+            2.3,
+            2.4,
+            2.3
+          ],
+          "warden": [
+            82.6,
+            77.0,
+            82.3,
+            78.9,
+            79.7
+          ]
+        },
+        "warden_decision_us": {
+          "n": 10000,
+          "p50": 67,
+          "p90": 92,
+          "p99": 156,
+          "max": 2490,
+          "mean": 74.1
+        },
+        "dial_us": null
+      },
+      "open_denied": {
+        "label": "open, denied by a rule",
+        "native": {
+          "n": 10000,
+          "p50": 0.9,
+          "p90": 1.2,
+          "p99": 1.8,
+          "max": 4422.3,
+          "mean": 1.5
+        },
+        "warden": {
+          "n": 10000,
+          "p50": 56.8,
+          "p90": 80.3,
+          "p99": 138.6,
+          "max": 3445.3,
+          "mean": 63.8
+        },
+        "added_p50_us": 55.9,
+        "round_p50_us": {
+          "native": [
+            0.9,
+            0.9,
+            0.9,
+            0.9,
+            0.9
+          ],
+          "warden": [
+            58.1,
+            55.4,
+            58.7,
+            56.3,
+            56.3
+          ]
+        },
+        "warden_decision_us": {
+          "n": 10000,
+          "p50": 17,
+          "p90": 23,
+          "p99": 49,
+          "max": 898,
+          "mean": 18.8
+        },
+        "dial_us": null
+      },
+      "open_unknown": {
+        "label": "open, no rule (UNKNOWN)",
+        "native": {
+          "n": 10000,
+          "p50": 0.8,
+          "p90": 1.1,
+          "p99": 1.6,
+          "max": 74.6,
+          "mean": 0.9
+        },
+        "warden": {
+          "n": 10000,
+          "p50": 61.0,
+          "p90": 82.3,
+          "p99": 139.9,
+          "max": 5130.3,
+          "mean": 67.9
+        },
+        "added_p50_us": 60.2,
+        "round_p50_us": {
+          "native": [
+            0.8,
+            0.8,
+            0.8,
+            0.8,
+            0.8
+          ],
+          "warden": [
+            62.0,
+            59.0,
+            62.7,
+            60.3,
+            60.7
+          ]
+        },
+        "warden_decision_us": {
+          "n": 10000,
+          "p50": 17,
+          "p90": 23,
+          "p99": 50,
+          "max": 615,
+          "mean": 19.0
+        },
+        "dial_us": null
+      },
+      "connect_allowed": {
+        "label": "connect, allowed (dialed)",
+        "native": {
+          "n": 10000,
+          "p50": 23.9,
+          "p90": 29.2,
+          "p99": 61.0,
+          "max": 222.6,
+          "mean": 25.7
+        },
+        "warden": {
+          "n": 10000,
+          "p50": 147.1,
+          "p90": 187.1,
+          "p99": 309.2,
+          "max": 2516.1,
+          "mean": 157.0
+        },
+        "added_p50_us": 123.2,
+        "round_p50_us": {
+          "native": [
+            24.6,
+            24.0,
+            24.2,
+            23.2,
+            24.0
+          ],
+          "warden": [
+            152.1,
+            135.5,
+            152.3,
+            142.5,
+            146.5
+          ]
+        },
+        "warden_decision_us": {
+          "n": 10000,
+          "p50": 117,
+          "p90": 150,
+          "p99": 247,
+          "max": 2441,
+          "mean": 125.6
+        },
+        "dial_us": {
+          "n": 10000,
+          "p50": 32,
+          "p90": 40,
+          "p99": 74,
+          "max": 1047,
+          "mean": 34.1
+        }
+      },
+      "connect_denied": {
+        "label": "connect, denied by a rule",
+        "native": {
+          "n": 10000,
+          "p50": 23.6,
+          "p90": 29.6,
+          "p99": 56.9,
+          "max": 2102.7,
+          "mean": 25.2
+        },
+        "warden": {
+          "n": 10000,
+          "p50": 55.7,
+          "p90": 72.6,
+          "p99": 127.5,
+          "max": 3070.5,
+          "mean": 60.4
+        },
+        "added_p50_us": 32.1,
+        "round_p50_us": {
+          "native": [
+            23.7,
+            24.1,
+            24.1,
+            22.6,
+            23.7
+          ],
+          "warden": [
+            56.9,
+            52.7,
+            57.2,
+            54.2,
+            55.5
+          ]
+        },
+        "warden_decision_us": {
+          "n": 10000,
+          "p50": 12,
+          "p90": 15,
+          "p99": 36,
+          "max": 373,
+          "mean": 12.8
+        },
+        "dial_us": null
+      },
+      "request": {
+        "label": "request (connect + 1 KiB reply)",
+        "native": {
+          "n": 10000,
+          "p50": 86.4,
+          "p90": 118.1,
+          "p99": 230.8,
+          "max": 3130.9,
+          "mean": 91.0
+        },
+        "warden": {
+          "n": 10000,
+          "p50": 209.3,
+          "p90": 258.0,
+          "p99": 391.7,
+          "max": 4076.8,
+          "mean": 218.7
+        },
+        "added_p50_us": 122.9,
+        "round_p50_us": {
+          "native": [
+            94.7,
+            76.5,
+            79.5,
+            91.7,
+            82.2
+          ],
+          "warden": [
+            214.3,
+            204.9,
+            212.9,
+            205.9,
+            209.4
+          ]
+        },
+        "warden_decision_us": {
+          "n": 10000,
+          "p50": 104,
+          "p90": 138,
+          "p99": 222,
+          "max": 2910,
+          "mean": 112.5
+        },
+        "dial_us": {
+          "n": 10000,
+          "p50": 29,
+          "p90": 37,
+          "p99": 69,
+          "max": 551,
+          "mean": 31.3
+        }
+      }
+    },
+    "checks": [
+      {
+        "check": "round 1 native: every call succeeds natively",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 1 Warden: open_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 1 Warden: open_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 1 Warden: open_unknown: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 1 Warden: connect_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 1 Warden: connect_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 1 Warden: request: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 1 Warden: the denied listener was never reached",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 Warden: open_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 Warden: open_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 Warden: open_unknown: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 Warden: connect_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 Warden: connect_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 Warden: request: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 Warden: the denied listener was never reached",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 2 native: every call succeeds natively",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 native: every call succeeds natively",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 Warden: open_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 Warden: open_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 Warden: open_unknown: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 Warden: connect_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 Warden: connect_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 Warden: request: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 3 Warden: the denied listener was never reached",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 Warden: open_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 Warden: open_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 Warden: open_unknown: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 Warden: connect_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 Warden: connect_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 Warden: request: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 Warden: the denied listener was never reached",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 4 native: every call succeeds natively",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 native: every call succeeds natively",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 Warden: open_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 Warden: open_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 Warden: open_unknown: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 Warden: connect_allowed: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 Warden: connect_denied: refused with EACCES",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 Warden: request: allowed, certified, and the call succeeded",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "round 5 Warden: the denied listener was never reached",
+        "ok": true,
+        "detail": ""
+      }
+    ],
+    "ok": true,
+    "kept": null,
+    "varek_command": "1.2.0"
+  }
+}

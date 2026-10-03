@@ -2,6 +2,7 @@
 warden
 target_demo
 bench_target
+tools/bench_workload
 target_conformance
 *.o
 
