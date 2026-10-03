@@ -2,7 +2,7 @@
 
 # VAREK — Technical Specification
 
-**Version 1.21.1** (September 29, 2026). Supersedes the v1.12 edition. Corrections made to earlier editions are folded into the text and listed in Appendix B.
+**Version 1.21.1** (September 29, 2026; revised October 3, 2026 with v1.22.0: latency figures from `varek bench` and the roadmap). Supersedes the v1.12 edition. Corrections made to earlier editions are folded into the text and listed in Appendix B.
 
 *Deterministic runtime verification of autonomous AI agents using formal methods.*
 
@@ -49,7 +49,7 @@ From v1.14 a path or exec rule takes a matcher before its constant — `exact`, 
 
 The fragment boundary is a soundness obligation: an over-length string (more than 4,095 bytes), a flag bit outside the ABI set, access mode 3, or a query beyond the enumeration bound is UNKNOWN. Rule reachability is decided exactly over the abstract domain (any byte string up to the bound) by a breadth-first search of the product of the rules' automata, and each reachable rule comes with a shortest witness; at load the Warden reports every rule that can never fire. A general SMT solver is kept off the hot path (v1.5 measured tail latencies of tens of milliseconds for its string theory) and used instead as an independent differential oracle over every repository policy and seeded random policies — zero disagreements over 26,624 checks at v1.13 — joined from v1.14 by a derivative-based procedure that settles bounded reachability where the solver's regular-expression theory does not finish.
 
-**Cost.** At v1.14 the procedure alone decided a representative path in about 155–165 ns on the finance and healthcare policies. In the live Warden on a 2-vCPU host, the median across all decisions, including the notification round trip, is 8 µs, and about 50 µs for an authorized file open, which includes resolving and opening the file and checking its certificate (v1.14 and v1.15 release notes). From v1.16 a policy's globs are capped at 4,096 tokens, which bounds the work of one decision: on adversarial policies built to hit the worst case, one decision in the live Warden takes about 26 ms (median); real policies are unchanged.
+**Cost.** At v1.14 the procedure alone decided a representative path in about 155–165 ns on the finance and healthcare policies. In the live Warden on a 2-vCPU host (`varek bench`, v1.22.0), the Warden's own time for a decision is 13–17 µs for a refused file open and 56–66 µs for an authorized one, which includes resolving and opening the file and checking its certificate; what the agent waits for the call, notification round trip included, is 53–57 µs and 70–80 µs, against 1–2.4 µs natively (`bench_results_v1_22_0.txt`). From v1.16 a policy's globs are capped at 4,096 tokens, which bounds the work of one decision: on adversarial policies built to hit the worst case, one decision in the live Warden takes about 26 ms (median); real policies are unchanged.
 
 ### 2.3 Certificates: every authorization independently checked (v1.15)
 
@@ -263,7 +263,7 @@ The v1.10/v1.11 verification program has one goal: move cases out of UNKNOWN int
 
 Next, stated as direction and not claimed as shipped:
 
-- **Host names without agent DNS (v1.21.2, planned).** Policies name hosts (`allow host api.example.com:443`); the Warden resolves the allowed names itself and answers the agent's `/etc/hosts` lookup with a view of only those names, so the agent never sends a DNS query, a name the policy does not allow does not resolve, and DNS cannot carry data out. The decision is made on `name:port`, certified like any host rule, and recorded with the resolution it relied on.
+- **Host names without agent DNS (v1.24.0, planned).** Policies name hosts (`allow host api.example.com:443`); the Warden resolves the allowed names itself and answers the agent's `/etc/hosts` lookup with a view of only those names, so the agent never sends a DNS query, a name the policy does not allow does not resolve, and DNS cannot carry data out. The decision is made on `name:port`, certified like any host rule, and recorded with the resolution it relied on.
 - **Bounded sequence fragment (v1.11, candidate).** Element-level reasoning for the cross-action data-flow subsystem, composed on top of the string and bitvector fragments so its soundness inherits theirs.
 - **A customer baseline** for the verdict-distribution harness, on a design partner's workload and policy.
 - **The v1.10 architecture track:** race-free filesystem enforcement and trusted-base reduction via a kernel-native sandbox (Landlock); acquisition-time mediation tiering with a latency gate; an optional post-grant re-mediation mode; an escalation ladder for UNKNOWN at the kernel edge; and a trusted base reduced to a minimal supervisor, a small proof checker and the kernel.
@@ -312,7 +312,9 @@ VAREK is released under the **MIT license**. Three provisional patent applicatio
 | v1.20.0 | Fields on plan steps; `trust_declared_fields`. |
 | v1.21.0 | Decided connections: each connect decided on the destination copied once, dialed by the Warden and handed to the agent; TCP, connected UDP, Unix sockets; tested with curl, Python and Node.js. |
 | **v1.21.1** | **Plan steps say how they open a file (`open=`), so the plan gate can authorize declared reads on read-only paths.** Corrects the sample plan and the data-flow threat model. |
-| v1.21.2 (planned) | Host names without agent DNS. |
+| v1.22.0 | The `varek` command (`doctor`, `init`, `run`, `refusals`, `audit`, `export`, ...) and `varek bench`, which measures the cost of mediation per call on the host it runs on and checks every verdict. |
+| v1.23.0 (planned) | VAREK Enterprise on AWS Marketplace. |
+| v1.24.0 (planned) | Host names without agent DNS. |
 | v1.11 (candidate) | Bounded sequence fragment for cross-action data flow. |
 
 ---
@@ -328,6 +330,7 @@ Earlier editions of this paper (v1.9.1 through v1.12) made statements a later re
 5. **Connect deny-only.** True from v1.9.1 through v1.20.0; from v1.21.0 connects are decided and dialed by the Warden. (Corrected in v1.21.0 and v1.21.1.)
 6. **`/proc/self`.** It is an ordinary symlink, not a magic link, and disabling magic-link resolution does not refuse it. The no-symlinks flag refused it in v1.12.0 to v1.12.2; from v1.12.3 a leading `/proc/self` is mapped to the agent and any other process's `/proc/<pid>` is refused after resolution. (Corrected in v1.21.0.)
 7. **Benchmark figures.** A v1.4 P99 of 57 µs is 44 µs in the recorded run; "zero false negatives" is a count of 0 in one benchmark, not a proof. (Corrected in v1.18.0.)
+8. **Decision latency.** The v1.21.1 edition gave the median across all decisions as 8 µs "including the notification round trip". That figure, from the v1.14 to v1.16 release notes, is the Warden's own time (its clock starts when the notification is received, so the round trip is not in it), over the v1.4 `bench_target` mix, in which every connect was refused with nothing dialed. §2 now gives `varek bench` figures per kind of call, both the Warden's time and what the agent waits. (Corrected in v1.22.0.)
 
 ---
 

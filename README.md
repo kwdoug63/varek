@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.21.1-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.22.0-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -52,7 +52,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.21.1.**
+   **Current release: v1.22.0.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -119,6 +119,7 @@ The runtime line has progressed well beyond simple syscall containment:
   "Never requires a human" becomes certified rather than hoped. Since v1.18.0 the
   Warden runs it on the `--flow-policy` at startup and refuses to start if it
   fails.
+- **v1.22.0 — the `varek` command and `varek bench`.** One command runs and checks the Warden with shared settings in `/etc/varek/varek.conf`: `doctor`, `init`, `policy`, `preflight`, `run`, `refusals`, `audit`, `export` (signed CycloneDX 1.6) and `bench`; `sudo make install` puts it in `/usr/local/bin`. `varek bench` measures what mediation costs per call on the host it runs on, natively and under the Warden, and checks every verdict: on a 2-vCPU host an authorized open takes 70–80 µs under the Warden (2.4 natively), a refused open 53–57 µs, an allowed connect 143–148 µs (23–24 natively); the Warden's own time is 13–17, 56–66 and 114–118 µs ([results](./varek/v1_4/bench_results_v1_22_0.txt)). The "8 µs" median published with v1.14–v1.16 was the Warden's own time over a mix with no dialed connects, not what the agent waits. Also: the Core packs allow `/usr/lib64/` read-only (RHEL, Fedora, Amazon Linux), and the Warden builds on glibc 2.34. The Warden's decisions are unchanged. See [`RELEASE-v1.22.0.md`](./RELEASE-v1.22.0.md).
 - **v1.21.1 — plan steps say how they open.** A plan step had no open flags, so the `--plan` gate decided a `file_open` step with the flags unknown, and a path the policy allows only read-only (every shipped sector policy's libraries, and data in four of them) was UNKNOWN at the gate although the runtime allowed the read. A `file_open` step may now declare `open=read`, or an access mode and flags (`open=O_WRONLY|O_CREAT|O_TRUNC`), and the gate decides it with those flags; anything it does not understand is UNKNOWN. Also corrects the sample plan and the data-flow threat model, which still said every connect step is refused. See [`RELEASE-v1.21.1.md`](./RELEASE-v1.21.1.md).
 - **v1.21.0 — decided connections.** Through v1.20.0 a supervised agent had no network: every connect was refused, whatever the policy said, because letting an allowed connect continue in the kernel would let a second thread change the destination after the check. The Warden now decides each connect on the destination it copied once (the independent checker confirms any ALLOW), dials it itself from outside the agent's empty network namespace, and hands over the connected socket with `SECCOMP_IOCTL_NOTIF_ADDFD`, carrying over the socket options the agent set (the 58 the Warden knows; others set before the connect are not carried). TCP and connected UDP over IPv4 and IPv6, and Unix sockets decided on their canonical path (IPv6 decisions are tested; IPv6 dialing was not exercised on the release host, whose kernel has no IPv6, and the test reports it as SKIPPED there). The plan gate decides `net_connect` steps instead of refusing them. Tested with curl, Python `requests` and Node.js, and with a 2,000-attempt destination-swap race that reached the denied side 0 times. On a 2-vCPU test host a connect took about 75 to 125 µs longer than a native one at the median, and more at p99; a `requests.get` to a local server about 0.17 ms longer (1.21 → 1.38 ms). Figures in the release notes. Also: the sector policies' key and credential rules match in any case (`server.PEM`, `x.pem.bak`, `id_rsa` outside `.ssh` were allowed), Node.js runs under the Warden at all (`io_uring_setup` answers `ENOSYS`), and the preflight checks the plan gate's flow policy and count file. See [`RELEASE-v1.21.0.md`](./RELEASE-v1.21.0.md).
 - **v1.20.0 — fields on plan steps.** A plan step had one field, its target, so flow rules could see nothing else it declared. A step can now carry up to 16 `key=value` fields after its target (quoted values may hold spaces: `contains="a customer record"`), and the Warden's `--flow-policy` rules match them like any named argument. The node check and the runtime still see only the target. Fields are the agent's declarations, so the Warden refuses a flow policy whose rules match them unless it declares `trust_declared_fields`. The plan file's lines may be 16383 bytes (were 1022); targets stay under 4096 bytes. See [`RELEASE-v1.20.0.md`](./RELEASE-v1.20.0.md).
@@ -442,7 +443,9 @@ different risks at different points in the stack.
 - [x] **v1.20.0** — Fields on plan steps (`key=value` after the target) for the flow policy; `trust_declared_fields`
 - [x] **v1.21.0** — Decided connections: the Warden decides each connect, dials it outside the agent's network namespace and hands over the socket (TCP, connected UDP, IPv4/IPv6 (IPv6 dialing untested on the release host), Unix); the plan gate decides connect steps
 - [x] **v1.21.1** — Plan steps declare how they open a file (`open=read`, `open=O_WRONLY|O_CREAT|…`), so the gate authorizes declared reads of read-only paths
-- [ ] **v1.21 stage 2** — Host names without agent DNS: the Warden resolves allowed names and serves a hosts view ([design](./docs/security/v1.21-stage2-host-names.md))
+- [x] **v1.22.0** — The `varek` command (run, refusals, audit, signed export, policy packs) and `varek bench` (per-call cost of mediation on the host, every verdict checked)
+- [ ] **v1.23.0** — VAREK Enterprise on AWS Marketplace (AMI with Enterprise policy packs and a License Manager check)
+- [ ] **v1.24.0** (v1.21 stage 2) — Host names without agent DNS: the Warden resolves allowed names and serves a hosts view ([design](./docs/security/v1.21-stage2-host-names.md))
 - [ ] **v1.21 stage 3 (opt-in)** — Rules on request contents through a Warden-owned or customer egress proxy
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
