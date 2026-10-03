@@ -30,7 +30,7 @@ jobs:
         run: make -C varek/v1_4 all
       - name: Check the deployment scripts parse
         run: |
-          python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py
+          python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py varek/v1_4/tools/varek_bench.py
           bash -n varek/v1_4/tools/varek_preflight.sh
           bash -n varek/v1_4/tools/varek_anchor_receiver.sh
       - name: Lint the shipped policies
@@ -52,6 +52,7 @@ jobs:
         run: |
           python3 -m pip install --break-system-packages -r varek/v1_4/tools/requirements-test.txt pytest pyyaml
           python3 -m pytest -q tests
+          python3 -m pytest -q varek/v1_4/tests/test_varek_bench.py   # varek bench: the parts that need no root
           mkdir -p /tmp/ci_data /tmp/ci_key
           printf 'allow path /tmp/ci_data/\n' > /tmp/ci_policy.txt
           varek/v1_4/tools/varek_keygen /tmp/ci_key/log.key
