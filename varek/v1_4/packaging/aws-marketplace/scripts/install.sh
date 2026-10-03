@@ -30,7 +30,9 @@ say "Build and runtime packages"
 # libseccomp and libsodium are installed by name first so dnf records them as
 # wanted: removing the -devel packages later must not take the libraries with it.
 dnf -y install libseccomp libsodium python3 awscli-2
-dnf -y install gcc make libseccomp-devel libsodium-devel tar gzip
+# glibc-static: `varek bench`'s workload is linked static, so its runs under
+# the Warden make no loader opens (v1.22).
+dnf -y install gcc make libseccomp-devel libsodium-devel glibc-static tar gzip
 
 say "Building VAREK ${VAREK_VERSION:-}"
 BUILD=$(mktemp -d /tmp/varek-build.XXXXXX)
@@ -63,7 +65,7 @@ else
 fi
 
 say "Removing the compiler and headers"
-dnf -y remove gcc make libseccomp-devel libsodium-devel
+dnf -y remove gcc make libseccomp-devel libsodium-devel glibc-static
 dnf -y autoremove
 if ldd "$PREFIX/warden" "$PREFIX/tools/vdp_check" "$PREFIX/tools/vdp_cert_check" \
         "$PREFIX/tools/varek_keygen" | grep -q 'not found'; then
@@ -90,6 +92,11 @@ boms=("$SMOKE"/log/*.cdx.json)
 for bom in "${boms[@]}"; do
     "$BINDIR/varek" export --verify "$bom"
 done
+# varek bench: its workload runs natively and under the Warden and every
+# verdict is checked (exit 1 if one is wrong). A short run: this proves the
+# installed bench works, it is not a measurement of the image.
+"$BINDIR/varek" bench -n 200 --warmup 20 --rounds 1 > "$SMOKE/bench.txt" 2>&1 \
+    || { cat "$SMOKE/bench.txt"; die "varek bench failed"; }
 "$BINDIR/varek" policy list
 "$BINDIR/varek" version
 unset VAREK_CONFIG
