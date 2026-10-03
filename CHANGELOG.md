@@ -50,8 +50,39 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   so a later policy switch does not break the audit of an older run.
 - `make install` / `make uninstall` (`PREFIX`, default `/opt/varek`; `BINDIR`,
   default `/usr/local/bin`) and `make test-cli` (`tests/test_varek_cli.py`).
+- `varek bench` (varek command 1.2.0; `tools/varek_bench.py`,
+  `tools/bench_workload.c`): measures what mediation costs per call on the
+  host it runs on. A fixed workload runs natively and as the agent under the
+  Warden, alternating (default five runs each, 2,000 timed calls of each kind
+  per run after 200 warm-up), for six kinds of call: allowed, denied and
+  unmatched file opens, allowed and denied connects, and a small whole request
+  on loopback. It reports p50 / p90 / p99 natively and under the Warden as the
+  agent timed them, the time added, and the Warden's own decision time from its
+  records, stamped with the host, the Warden's version and SHA-256 and the
+  policy's SHA-256; and it checks every verdict (allowed calls certified and
+  successful, refused calls `EACCES`, the denied listener never reached),
+  exiting 1 if one is wrong. It decides with the active policy's rules followed
+  by its own (`--policy`, `--bare`), signs as configured, keeps its streams out
+  of the log directory, and with `--max-added-p50` gates CI. `-o` / `--json`
+  give machine-readable results. `make run-bench` now runs it; the v1.4 bench
+  is `make run-bench-v14`. `tests/test_varek_bench.py` is part of
+  `make test-cli`. The AMI build installs `glibc-static` for the static
+  workload and runs a short `varek bench` in its smoke test.
+- `bench_results_v1_21_1.txt` / `.json`: the first results, for the v1.21.1
+  Warden on a 2-vCPU host, with the bench's own rules and with the healthcare
+  pack (signed). Per call as the agent sees it, p50: an authorized open
+  70-80 us (2.3 natively), a refused open 53-61 us, an allowed connect
+  147-148 us (24 natively), a denied connect 56 us. The Warden's own time is
+  13-17 us for a refused open, 56-67 us for an authorized open and 117-118 us
+  for an allowed connect, dial included.
 
 ### Changed
+- The "8 us" P50 for all decisions published with v1.14, v1.15 and v1.16 is
+  the Warden's own time (from its records, which start the clock when the
+  notification is received), over a `bench_target` mix in which every connect
+  was refused after its decision with nothing dialed. It does not include the
+  notification round trip the agent waits through, and since v1.21.0 an
+  allowed connect is dialed. Use the per-kind figures from `varek bench`.
 - `tools/varek_preflight.sh` accepts an installed runtime (no Makefile beside
   it) whose binaries are present, instead of trying to build it.
 
