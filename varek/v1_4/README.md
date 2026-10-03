@@ -66,11 +66,40 @@ varek refusals                             # what the last run refused, and why
 sudo varek audit                           # re-check certificates, chain, signatures
 sudo varek export                          # signed CycloneDX 1.6 evidence
 varek export --verify <file>.cdx.json      # anyone can check that evidence
+sudo varek bench                           # what mediation costs per call on this host
 ```
 
 `varek policy list|show|check|use|add` manages policies, `varek runs` and
 `varek status` show history, and `--show-commands` prints the underlying tool
 calls. `make test-cli` runs its tests (root, Linux).
+
+### Measuring the cost: `varek bench`
+
+`sudo varek bench` runs a fixed workload (`tools/bench_workload`) natively and
+as the agent under the Warden, five times each, alternating, and reports for
+six kinds of call (an allowed, a denied and an unmatched file open; an allowed
+and a denied connect; a small whole request on loopback):
+
+- the time the call took natively and under the Warden, as the agent timed it
+  (p50 / p90 / p99), and the difference ("added");
+- the Warden's own decision time, from its verdict records (`latency_us`;
+  for a connect it includes dialing the destination, `dial_us`);
+- checks on every verdict: each allowed call was certified and succeeded, each
+  denied or unmatched call was refused with `EACCES`, and the listener behind
+  the denied destination was never reached. A failed check makes it exit 1.
+
+It decides with the active policy's rules followed by five rules of its own
+(`--policy <pack or file>` for another policy, `--bare` for its own rules
+only), so the cost of a real policy is in the numbers; if a rule of that
+policy decides one of the bench's calls differently, the check names the line.
+It signs its verdict streams when `varek init` set up signing (`--no-sign` to
+skip), keeps them out of `/var/log/varek`, and removes everything it made
+unless `--keep`. `-o results.json` saves every number and check;
+`--max-added-p50 <us>` fails the run (exit 1) if any kind of call adds more
+than that, for CI. The numbers are for the host they were measured on, and
+its listeners are ordinary loopback ports: another local user connecting to
+the bench's denied port during a run makes that check fail.
+Results for v1.21.1: [`bench_results_v1_21_1.txt`](bench_results_v1_21_1.txt).
 
 ## Layout
 
@@ -79,8 +108,9 @@ calls. `make test-cli` runs its tests (root, Linux).
 | `warden.c`            | Supervisor binary. Single-file C11.                             |
 | `policy.txt`          | Sample policy in the rule format the Warden parses.             |
 | `target_demo.c`       | Small workload exercising each trapped syscall path.            |
-| `bench_target.c`      | Workload for driving N trapped syscalls under the supervisor.   |
+| `bench_target.c`      | v1.4 workload for driving N trapped syscalls under the supervisor (`make run-bench-v14`). |
 | `bench_summarize.py`  | Parses pathology records into percentile latency statistics.    |
+| `tools/varek_bench.py`, `tools/bench_workload.c` | v1.22 `varek bench`: native vs Warden, per kind of call, every verdict checked (`make run-bench`). |
 | `checker/`            | v1.15 independent certificate checker.                          |
 | `tools/`              | `vdp_check`, `vdp_cert_check`, `varek_keygen` (v1.16), the audit, the CycloneDX exporter, the cross-check. |
 | `Makefile`            | `make`, `make run-demo`, `make run-bench`, `make check-kernel`. |

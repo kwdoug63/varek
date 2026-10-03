@@ -30,9 +30,9 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
              $(V1_7_DIR)/plan_policy_config.c $(V1_7_DIR)/plan_breaker.c \
              $(V1_7_DIR)/plan_progress.c
 
-BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen
+BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check preflight install uninstall test-cli clean run-demo run-bench run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 crosscheck harness video-v112
+.PHONY: all deps deps-check preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -94,6 +94,21 @@ target_demo: target_demo.c
 bench_target: bench_target.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
+# v1.22: the workload behind `varek bench`. Static where the host has a static
+# libc (Debian/Ubuntu: libc6-dev; Fedora/RHEL/Amazon Linux: glibc-static), so a
+# run under the Warden makes no loader opens; otherwise dynamic, and the bench
+# adds read-only loader rules to the policy it runs with.
+tools/bench_workload: tools/bench_workload.c
+	@if printf 'int main(void){return 0;}\n' | $(CC) -static -x c -o $@.probe - 2>/dev/null; then \
+	    rm -f $@.probe; \
+	    echo "$(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $<"; \
+	    $(CC) $(CFLAGS) $(LDFLAGS) -static -o $@ $<; \
+	else \
+	    rm -f $@.probe; \
+	    echo "note: no static libc; building $@ dynamically (install glibc-static or libc6-dev for a static build)"; \
+	    $(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<; \
+	fi
+
 check-kernel:
 	@uname -r | awk -F. '{ \
 	  if ($$1 < 5 || ($$1 == 5 && $$2 < 14)) { \
@@ -110,7 +125,13 @@ run-demo: warden target_demo
 run-plan-demo: warden target_demo
 	@sudo ./warden policy.txt --plan $(V1_6_DIR)/sample_plan.txt -- ./target_demo
 
-run-bench: warden bench_target
+# v1.22: `varek bench` (native vs Warden, per kind of call, every verdict
+# checked). The v1.4 bench (Warden-side decision latency only) stays as
+# run-bench-v14.
+run-bench: warden tools/vdp_check tools/vdp_cert_check tools/bench_workload
+	@sudo ./tools/varek bench --bare
+
+run-bench-v14: warden bench_target
 	@sudo ./warden policy.txt -- ./bench_target 10000 2> bench.log
 	@python3 bench_summarize.py bench.log
 
@@ -335,9 +356,9 @@ BINDIR ?= /usr/local/bin
 INSTALL_TOOLS := tools/varek tools/vdp_check tools/vdp_cert_check tools/varek_keygen \
 	tools/varek_audit.py tools/varek_cyclonedx.py tools/varek_ed25519.py \
 	tools/varek_preflight.sh tools/varek_anchor_forward.py tools/varek_anchor_receiver.sh \
-	tools/varek_license.py
+	tools/varek_license.py tools/varek_bench.py tools/bench_workload
 
-install: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen
+install: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/tools $(DESTDIR)$(PREFIX)/policies $(DESTDIR)$(BINDIR)
 	install -m 0755 warden $(DESTDIR)$(PREFIX)/warden
 	install -m 0755 $(INSTALL_TOOLS) $(DESTDIR)$(PREFIX)/tools/
@@ -352,5 +373,5 @@ uninstall:
 	rm -rf $(DESTDIR)$(PREFIX)
 	@echo "removed $(PREFIX); settings in /etc/varek and logs in /var/log/varek were kept"
 
-test-cli: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen
-	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_license.py
+test-cli: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
+	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_license.py tests/test_varek_bench.py
