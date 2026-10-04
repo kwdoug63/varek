@@ -99,19 +99,23 @@ A test image first (no Marketplace product needed):
 
 ```bash
 cd varek/varek/v1_4/packaging/aws-marketplace
-./build.sh --version 1.23.0 --packs ~/varek-packs --test
+./build.sh --version 1.23.1 --packs ~/varek-packs --test
 ```
 
 Then the image for the listing, with the product's ID for License Manager:
 
 ```bash
-./build.sh --version 1.23.0 --packs ~/varek-packs --product-id <product ID>
+./build.sh --version 1.23.1 --packs ~/varek-packs --product-id prod-ceonv23mvlzw4
 ```
 
 AWS's License Manager guide calls this the "Product ID with a Globally Unique
-Identifier (GUID) format", and the portal may also show a `prod-...` ID for
-the same product. `build.sh` accepts either form; confirm which one License
-Manager uses with a test license (below) before submitting the version.
+Identifier (GUID) format", but for VAREK Enterprise the licenses AWS
+Marketplace issues carry `ProductSKU` `prod-ceonv23mvlzw4`, the `prod-...` ID
+the portal shows (confirmed 2026-10-04 with a license received through a
+private offer). `build.sh` accepts either form. To check, in the buyer
+account: `aws license-manager list-received-licenses --query 'Licenses[].ProductSKU'`
+(License Manager may first need its service-linked role there:
+`aws iam create-service-linked-role --aws-service-name license-manager.amazonaws.com`).
 
 #### Test the license check before the listing is live
 
@@ -120,7 +124,7 @@ Marketplace one. Build with your account's issuer instead of Marketplace's:
 
 ```bash
 ACCT=$(aws sts get-caller-identity --query Account --output text)
-./build.sh --version 1.23.0-lmtest --packs ~/varek-packs --product-id <product ID> \
+./build.sh --version 1.23.1-lmtest --packs ~/varek-packs --product-id <product ID> \
   --issuer-fingerprint "aws:$ACCT:Self:issuer-fingerprint"
 ```
 

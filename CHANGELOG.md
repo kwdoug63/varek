@@ -9,6 +9,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.23.1] - 2026-10-04 — Enterprise license check fix
+
+The VAREK Enterprise AMI for AWS Marketplace, rebuilt with the fixes below.
+The Warden's decisions are unchanged from v1.23.0; it reports version 1.23.1.
+
 ### Added
 - `docs/aws-deployment-guide.md`: deployment guide for VAREK Enterprise on AWS
   (architecture, IAM, keys, data and network, costs, sizing, deployment, health
