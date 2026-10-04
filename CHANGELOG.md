@@ -17,6 +17,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   architecture diagram, `docs/images/aws-deployment-architecture.svg`.
 
 ### Fixed
+- VAREK Enterprise license check (`tools/varek_license.py`): it asked License
+  Manager for each contract dimension with `Unit=None`, which License Manager
+  refuses, because AWS Marketplace issues contract dimensions as Count
+  entitlements (MaxCount 1). On the 1.23.0 AMI a subscriber could therefore not
+  select the HIPAA or SOC 2 pack. The checkout now asks for `Value=1,Unit=Count`
+  and returns the unit at once with `CheckInLicense`, so the next check (another
+  `varek run --policy`, or another instance) is not refused while a provisional
+  checkout holds it for up to an hour. If the check-in is refused, `varek
+  license` says so. Found by an end-to-end test with a private offer to a second
+  AWS account; the tests' stand-in for License Manager now behaves as the real
+  one did.
+- `iam/instance-license-policy.json` adds `license-manager:CheckInLicense`;
+  `varek license`, the packaging README and the deployment guide say so, and the
+  guide's troubleshooting covers a held entitlement, License Manager's service
+  role and the 1.23.0 issue.
 - `tools/systemd/varek-anchor-forward.service` ran the forwarder from
   `/opt/varek/varek/v1_4/tools/`, a source-checkout path. It now uses
   `/opt/varek/tools/varek_anchor_forward.py`, where `make install` and the VAREK

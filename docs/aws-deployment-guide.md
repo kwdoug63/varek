@@ -117,7 +117,7 @@ Region selector.
 | Kernel | 5.14 or later, with seccomp user notification. The AMI's kernel meets this; `varek doctor` checks it |
 | Instance type | t3.medium or larger x86_64 type ([section 6](#6-sizing)) |
 | Storage | The 10 GiB gp3 root volume is enough for VAREK; add space for your agents and for verdict streams you keep on the instance |
-| IAM | An instance role allowing `license-manager:CheckoutLicense` to use the Enterprise packs |
+| IAM | An instance role allowing `license-manager:CheckoutLicense` and `license-manager:CheckInLicense` to use the Enterprise packs |
 | Network | Outbound HTTPS 443 to AWS License Manager in the instance's Region (through a NAT gateway or a VPC interface endpoint) |
 | Instance metadata | IMDSv2. The AMI requires it by default; the license check uses it to find the Region |
 | Subscription | A VAREK Enterprise contract on AWS Marketplace (Tier A or Tier B). Without one, VAREK runs with the open-source VAREK Core packs |
@@ -209,8 +209,8 @@ stop if the Warden crashes. SAI does not recommend it for production.
 
 ### Least privilege
 
-- **IAM.** The instance role needs exactly one action,
-  `license-manager:CheckoutLicense`. Add `AmazonSSMManagedInstanceCore` only
+- **IAM.** The instance role needs exactly two actions,
+  `license-manager:CheckoutLicense` and `license-manager:CheckInLicense`. Add `AmazonSSMManagedInstanceCore` only
   if you use Session Manager. Do not attach broader policies to the VAREK
   instance: anything the instance role allows, an agent that escaped its
   policy could attempt through the instance's credentials. The policy packs
@@ -241,12 +241,13 @@ do otherwise.
 
 | Role | Where | Policy | Why |
 |---|---|---|---|
-| Instance role (e.g. `VarekEnterpriseInstance`) | Your account, attached to the instance | [`instance-license-policy.json`](../varek/v1_4/packaging/aws-marketplace/iam/instance-license-policy.json): `license-manager:CheckoutLicense` on `*` | Checks that your account holds a VAREK Enterprise entitlement before an Enterprise pack is selected. Trust policy: [`ec2-trust.json`](../varek/v1_4/packaging/aws-marketplace/iam/ec2-trust.json) |
+| Instance role (e.g. `VarekEnterpriseInstance`) | Your account, attached to the instance | [`instance-license-policy.json`](../varek/v1_4/packaging/aws-marketplace/iam/instance-license-policy.json): `license-manager:CheckoutLicense` and `license-manager:CheckInLicense` on `*` | Checks that your account holds a VAREK Enterprise entitlement before an Enterprise pack is selected. Trust policy: [`ec2-trust.json`](../varek/v1_4/packaging/aws-marketplace/iam/ec2-trust.json) |
 | Same role, optional | Your account | AWS managed `AmazonSSMManagedInstanceCore` | Session Manager access without inbound SSH |
 
-`CheckoutLicense` is called with a provisional checkout for the product and
-contract dimension only. No information about your workload is sent. VAREK
-makes no other AWS API call.
+`CheckoutLicense` is called with a provisional checkout of one unit of the
+contract dimension, and the unit is returned at once with `CheckInLicense`:
+VAREK only needs to know that your account holds it. No information about your
+workload is sent. VAREK makes no other AWS API call.
 
 ### Keys
 
@@ -569,6 +570,10 @@ it runs.
 | `[warden] CAP_SYS_ADMIN is required` | Warden started without root | Use `sudo varek run` |
 | `could not check the license: ...` | No instance role, the role lacks `CheckoutLicense`, no route to License Manager, or IMDS unreachable | Attach the role from [7.1](#71-create-the-instance-role); check outbound 443 and IMDSv2; run `varek license` again |
 | `no VAREK Enterprise entitlement for this AWS account` | The account running the instance has no active contract | Check the subscription in AWS Marketplace (**Manage subscriptions**); VAREK Core packs keep working |
+| `licensed: ...` followed by `not returned (... CheckInLicense)` | The instance role allows `CheckoutLicense` but not `CheckInLicense`, so each check holds your entitlement for up to an hour | Add `license-manager:CheckInLicense` to the role ([7.1](#71-create-the-instance-role)) |
+| `no VAREK Enterprise entitlement` although you hold a contract | A check made in the last hour without `CheckInLicense` still holds the entitlement | Add `CheckInLicense` to the role and wait up to an hour |
+| On VAREK 1.23.0: `no VAREK Enterprise entitlement` although you hold a contract | Known issue in 1.23.0: its check asks License Manager for the entitlement in a form it refuses, so Enterprise packs cannot be selected. Fixed in 1.23.1 | Launch the 1.23.1 version and move your settings ([11.2](#112-patches-and-upgrades)); the Warden and the VAREK Core packs work on 1.23.0 |
+| `Service role not found` from License Manager | License Manager has not been set up in your account | In your AWS account: `aws iam create-service-linked-role --aws-service-name license-manager.amazonaws.com` |
 | `policy ... does not lint` | Syntax error or unknown rule | `varek policy check --explain` |
 | The agent fails with "Permission denied" | The policy refused an action | `varek refusals` names the action and the deciding line; allow it in the policy if it is intended |
 | `[varek] the Warden did not start the agent` | Startup check failed (policy, key permissions, anchor, a path the agent may not reach) | The lines printed after it give the reason; `sudo varek doctor` and `sudo varek preflight --run` |
@@ -716,7 +721,7 @@ VAREK uses few AWS resources. The limits that can matter:
 
 - **EC2 On-Demand vCPU quota** for the instance family you choose, per Region.
 - **AWS License Manager API rate.** Each `varek run --policy <enterprise pack>`
-  makes a `CheckoutLicense` call. Choose the pack once with
+  makes a `CheckoutLicense` and a `CheckInLicense` call. Choose the pack once with
   `varek policy use` so runs make no call.
 - **VPC interface endpoints and NAT gateways** per VPC, if you add them.
 

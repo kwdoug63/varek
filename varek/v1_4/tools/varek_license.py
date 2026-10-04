@@ -13,9 +13,19 @@ only to test the image against a self-issued License Manager license
 
 `check()` asks AWS License Manager whether the buyer's account holds one of
 those dimensions, by calling CheckoutLicense through the AWS CLI that ships
-with Amazon Linux 2023. The instance needs a role allowing
-license-manager:CheckoutLicense; nothing else is called and no data about the
+with Amazon Linux 2023, then returns what it checked out with CheckInLicense.
+The instance needs a role allowing license-manager:CheckoutLicense and
+license-manager:CheckInLicense; nothing else is called and no data about the
 workload is sent.
+
+AWS Marketplace issues each contract dimension as a Count entitlement
+(MaxCount 1 for a single-unit contract), so the checkout asks for Value=1,
+Unit=Count. A provisional checkout holds that count for up to an hour; the
+check only needs to know the account holds it, so it checks the count back in
+at once. Otherwise the next check within the hour (another `varek run
+--policy`, or another instance) would find the count in use and be refused.
+(v1.23.1: v1.23.0 asked for Unit=None, which License Manager refuses for a
+Count entitlement, and never checked in.)
 
 The result only decides whether the Enterprise policy packs (the files whose
 header says they are licensed to VAREK Enterprise subscribers) may be selected.
@@ -115,10 +125,34 @@ def _checkout(aws, region, product_id, dimension, timeout, issuer=ISSUER_FINGERP
             "--product-sku", product_id,
             "--checkout-type", "PROVISIONAL",
             "--key-fingerprint", issuer,
-            "--entitlements", f"Name={dimension},Unit=None",
+            "--entitlements", f"Name={dimension},Value=1,Unit=Count",
             "--client-token", uuid.uuid4().hex,
             "--output", "json"]
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+
+
+def _check_in(aws, region, token, timeout):
+    """Return a checked-out count; '' on success, else why it was not returned."""
+    argv = [aws, "license-manager", "check-in-license",
+            "--region", region,
+            "--license-consumption-token", token]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return str(e)
+    if r.returncode == 0:
+        return ""
+    err = (r.stderr or r.stdout or "").strip()
+    if "AccessDenied" in err or "UnauthorizedOperation" in err:
+        return "the instance role does not allow license-manager:CheckInLicense"
+    return _first_line(err) or f"aws exited with {r.returncode}"
+
+
+def _consumption_token(stdout):
+    try:
+        return str(json.loads(stdout or "{}").get("LicenseConsumptionToken", "")).strip()
+    except ValueError:
+        return ""
 
 
 def check(varek_home, region=None, aws=None, timeout=20):
@@ -144,7 +178,16 @@ def check(varek_home, region=None, aws=None, timeout=20):
             return Result(UNAVAILABLE, f"License Manager did not answer: {e}",
                           product_id=mp["product_id"])
         if r.returncode == 0:
-            return Result(LICENSED, f"entitlement {dim} checked out", dim, mp["product_id"])
+            token = _consumption_token(r.stdout)
+            why = _check_in(aws, region, token, timeout) if token else \
+                "License Manager returned no consumption token"
+            detail = f"entitlement {dim} checked out and returned"
+            if why:
+                # Licensed all the same; the count stays in use until it expires
+                # (up to an hour), so checks made meanwhile are refused.
+                detail = (f"entitlement {dim} checked out, but not returned ({why}); "
+                          "it stays in use for up to an hour")
+            return Result(LICENSED, detail, dim, mp["product_id"])
         err = (r.stderr or r.stdout or "").strip()
         last = err
         # Only "you don't hold this dimension" moves on to the next one.
