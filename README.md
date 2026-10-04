@@ -559,7 +559,7 @@ platform-gating CI coverage (now macOS, Windows, Linux).
 
 ## Documentation
 
-- **Spec paper:** [`varek-spec-paper-v1.12.md`](./varek-spec-paper-v1.12.md) — language and runtime specification, design rationale, the verdict model
+- **Spec paper:** [`varek-spec-paper-v1.22.0.md`](./varek-spec-paper-v1.22.0.md) — language and runtime specification, design rationale, the verdict model
 - **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`docs/security/bypass-classes.md`](./docs/security/bypass-classes.md), [`RELEASE-v1.17.0.md`](./RELEASE-v1.17.0.md), [`RELEASE-v1.12.1.md`](./RELEASE-v1.12.1.md), [`RELEASE-v1.12.0.md`](./RELEASE-v1.12.0.md), [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md), [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
 - **Verification notes:** [`docs/verification/`](./docs/verification/README.md) — the v1.10/v1.11 program
 - **Changelog:** [`CHANGELOG.md`](./CHANGELOG.md)
