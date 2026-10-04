@@ -9,6 +9,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+- Deployment guide: the listing now offers m7i-flex.large and c7i-flex.large;
+  sizing, prerequisites and the launch steps say so, and that only the listed
+  types launch. Troubleshooting covers the Free plan (which cannot launch AWS
+  Marketplace AMIs) and an instance type the listing does not offer.
+
 ## [1.23.1] - 2026-10-04 — Enterprise license check fix
 
 The VAREK Enterprise AMI for AWS Marketplace, rebuilt with the fixes below.
