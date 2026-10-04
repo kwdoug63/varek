@@ -4,8 +4,8 @@
 # Build the VAREK Enterprise AMI in the AWS account your credentials point at
 # (AWS CloudShell in the seller account works as is).
 #
-#   ./build.sh --version 1.23.0 --packs ~/varek-packs --product-id <product ID>
-#   ./build.sh --version 1.23.0 --packs ~/varek-packs --test     # no license check
+#   ./build.sh --version 1.23.1 --packs ~/varek-packs --product-id <product ID>
+#   ./build.sh --version 1.23.1 --packs ~/varek-packs --test     # no license check
 #
 # --packs is a directory of Enterprise *.policy.txt files. They are licensed
 # content and are never committed to this repository.
@@ -35,7 +35,7 @@ while [ $# -gt 0 ]; do
 done
 
 die() { echo "build.sh: $*" >&2; exit 1; }
-[ -n "$version" ] || die "--version is required (e.g. 1.23.0)"
+[ -n "$version" ] || die "--version is required (e.g. 1.23.1)"
 [ -n "$packs" ] && [ -d "$packs" ] || die "--packs must be a directory of Enterprise *.policy.txt files"
 packs=$(cd "$packs" && pwd)   # absolute, so the git checks below see the real path
 if [ "$test" -eq 0 ]; then
