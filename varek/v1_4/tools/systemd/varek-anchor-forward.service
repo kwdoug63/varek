@@ -4,6 +4,8 @@
 # Install:  cp tools/systemd/varek-anchor-forward.service /etc/systemd/system/
 #           edit ANCHOR_HOST (and the paths, if yours differ), then
 #           systemctl daemon-reload && systemctl enable --now varek-anchor-forward
+# The script path is where `make install` (PREFIX=/opt/varek) and the VAREK
+# Enterprise AMI put the tools. From a source checkout, use its tools/ path.
 # Run the Warden with:  --anchor /run/varek/anchor.fifo
 # Set up the anchor host with tools/varek_anchor_receiver.sh.
 [Unit]
@@ -13,7 +15,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/varek/varek/v1_4/tools/varek_anchor_forward.py \
+ExecStart=/usr/bin/python3 /opt/varek/tools/varek_anchor_forward.py \
     --fifo /run/varek/anchor.fifo \
     --spool /var/lib/varek/anchor-spool \
     --ssh varek-anchor@ANCHOR_HOST \

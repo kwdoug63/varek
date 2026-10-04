@@ -516,8 +516,9 @@ instance in another AWS account).
    and compare `ssh-keygen -lf /etc/varek/anchor_known_hosts` with the
    printed fingerprint). Copy
    `/opt/varek/tools/systemd/varek-anchor-forward.service` to
-   `/etc/systemd/system/`, set `ANCHOR_HOST` and set the script path in
-   `ExecStart` to `/opt/varek/tools/varek_anchor_forward.py`, then
+   `/etc/systemd/system/` and set `ANCHOR_HOST` in it. On VAREK 1.23.0
+   images, also change the script path in `ExecStart` to
+   `/opt/varek/tools/varek_anchor_forward.py` (later images ship it so). Then
    `sudo systemctl daemon-reload && sudo systemctl enable --now varek-anchor-forward`.
 4. Point VAREK at the anchor:
    `sudo varek init --force --pack <your pack> --anchor /run/varek/anchor.fifo --spool /var/lib/varek/anchor-spool`
