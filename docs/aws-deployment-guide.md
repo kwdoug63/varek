@@ -1,6 +1,6 @@
 # VAREK Enterprise on AWS: Deployment Guide
 
-Version 1.0, for VAREK Enterprise 1.23.0 on AWS Marketplace.
+Version 1.1, for VAREK Enterprise 1.23.1 on AWS Marketplace.
 Published by Sober Agentic Infrastructure, Inc. (SAI).
 
 This guide covers deploying, operating, backing up, upgrading and getting
