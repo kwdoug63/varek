@@ -16,6 +16,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   with an index to the AWS Foundational Technical Review requirements, and its
   architecture diagram, `docs/images/aws-deployment-architecture.svg`.
 
+### Fixed
+- `tools/systemd/varek-anchor-forward.service` ran the forwarder from
+  `/opt/varek/varek/v1_4/tools/`, a source-checkout path. It now uses
+  `/opt/varek/tools/varek_anchor_forward.py`, where `make install` and the VAREK
+  Enterprise AMI put it, so the unit works as copied. The deployment guide's
+  workaround is now needed only on 1.23.0 images.
+
 ### Changed
 - The five VAREK Core packs (cybersecurity, finance, healthcare, national-defense,
   utility) allow `/usr/share/` read-only: shared operating-system data such as time
