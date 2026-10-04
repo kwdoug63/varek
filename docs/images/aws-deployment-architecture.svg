@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="660" viewBox="0 0 1040 660" font-family="Arial, Helvetica, sans-serif" font-size="13">
+  <title>VAREK Enterprise on AWS: typical deployment</title>
+  <desc>A VAREK Enterprise EC2 instance in a private subnet of the customer's VPC. The instance role allows license-manager:CheckoutLicense. Outbound HTTPS reaches AWS License Manager, Systems Manager and the Amazon Linux repositories through VPC endpoints or a NAT gateway. The supervised agent reaches only the destinations its policy allows. An optional off-host anchor receives signed checkpoints over SSH.</desc>
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#232F3E"/>
+    </marker>
+    <marker id="arrg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7D8998"/>
+    </marker>
+  </defs>
+  <rect width="1040" height="660" fill="#FFFFFF"/>
+
+  <!-- AWS Cloud: customer account -->
+  <rect x="20" y="20" width="760" height="620" fill="none" stroke="#232F3E" stroke-width="1.5"/>
+  <rect x="20" y="20" width="26" height="26" fill="#232F3E"/>
+  <text x="33" y="38" fill="#FFFFFF" font-size="10" font-weight="bold" text-anchor="middle">AWS</text>
+  <text x="54" y="38" fill="#232F3E" font-weight="bold">AWS Cloud: customer account</text>
+
+  <!-- Region -->
+  <rect x="40" y="60" width="720" height="560" fill="none" stroke="#147EBA" stroke-width="1.2" stroke-dasharray="6 4"/>
+  <text x="52" y="80" fill="#147EBA" font-weight="bold">Region (any Region the listing is offered in)</text>
+
+  <!-- VPC -->
+  <rect x="60" y="95" width="470" height="505" fill="none" stroke="#8C4FFF" stroke-width="1.5"/>
+  <rect x="60" y="95" width="26" height="22" fill="#8C4FFF"/>
+  <text x="73" y="110" fill="#FFFFFF" font-size="9" font-weight="bold" text-anchor="middle">VPC</text>
+  <text x="94" y="111" fill="#8C4FFF" font-weight="bold">Customer VPC</text>
+
+  <!-- AZ -->
+  <rect x="78" y="128" width="434" height="456" fill="none" stroke="#147EBA" stroke-width="1" stroke-dasharray="4 4"/>
+  <text x="90" y="146" fill="#147EBA">Availability Zone</text>
+
+  <!-- Private subnet -->
+  <rect x="94" y="158" width="402" height="410" fill="#E6F6F7" stroke="#00A4A6" stroke-width="1.2"/>
+  <text x="106" y="177" fill="#00777A" font-weight="bold">Private subnet</text>
+  <text x="106" y="193" fill="#00777A" font-size="11">Security group: no inbound rules, or SSH 22 from an admin CIDR</text>
+
+  <!-- EC2 instance -->
+  <rect x="112" y="206" width="366" height="270" fill="#FFFFFF" stroke="#ED7100" stroke-width="1.5"/>
+  <rect x="112" y="206" width="34" height="34" fill="#ED7100"/>
+  <text x="129" y="228" fill="#FFFFFF" font-size="10" font-weight="bold" text-anchor="middle">EC2</text>
+  <text x="154" y="221" fill="#232F3E" font-weight="bold">Amazon EC2 instance (x86_64, t3.medium or larger)</text>
+  <text x="154" y="236" fill="#545B64" font-size="11">VAREK Enterprise AMI: Amazon Linux 2023, IMDSv2 required</text>
+
+  <rect x="128" y="252" width="160" height="62" fill="#FDF2E9" stroke="#ED7100"/>
+  <text x="208" y="273" text-anchor="middle" font-weight="bold" fill="#232F3E">VAREK Warden</text>
+  <text x="208" y="289" text-anchor="middle" font-size="11" fill="#545B64">sudo varek run (root,</text>
+  <text x="208" y="303" text-anchor="middle" font-size="11" fill="#545B64">CAP_SYS_ADMIN)</text>
+
+  <rect x="306" y="252" width="156" height="62" fill="#FFFFFF" stroke="#545B64" stroke-dasharray="4 3"/>
+  <text x="384" y="273" text-anchor="middle" font-weight="bold" fill="#232F3E">AI agent</text>
+  <text x="384" y="289" text-anchor="middle" font-size="11" fill="#545B64">runs as nobody, every</text>
+  <text x="384" y="303" text-anchor="middle" font-size="11" fill="#545B64">capability dropped</text>
+  <line x1="288" y1="283" x2="304" y2="283" stroke="#232F3E" stroke-width="1.3" marker-end="url(#arr)"/>
+  <text x="297" y="330" text-anchor="middle" font-size="10" fill="#545B64">decides each file, network and exec action before it runs</text>
+
+  <rect x="128" y="342" width="160" height="56" fill="#F2F3F3" stroke="#7D8998"/>
+  <text x="208" y="362" text-anchor="middle" font-weight="bold" font-size="12" fill="#232F3E">/etc/varek</text>
+  <text x="208" y="377" text-anchor="middle" font-size="11" fill="#545B64">settings, policy, packs,</text>
+  <text x="208" y="391" text-anchor="middle" font-size="11" fill="#545B64">Ed25519 signing key (600)</text>
+
+  <rect x="306" y="342" width="156" height="56" fill="#F2F3F3" stroke="#7D8998"/>
+  <text x="384" y="362" text-anchor="middle" font-weight="bold" font-size="12" fill="#232F3E">/var/log/varek</text>
+  <text x="384" y="377" text-anchor="middle" font-size="11" fill="#545B64">signed verdict streams,</text>
+  <text x="384" y="391" text-anchor="middle" font-size="11" fill="#545B64">CycloneDX evidence (750)</text>
+
+  <rect x="128" y="410" width="334" height="52" fill="#3F8624" fill-opacity="0.08" stroke="#3F8624"/>
+  <text x="295" y="429" text-anchor="middle" font-weight="bold" font-size="12" fill="#232F3E">Amazon EBS root volume (gp3, 10 GiB)</text>
+  <text x="295" y="446" text-anchor="middle" font-size="11" fill="#545B64">enable EBS encryption at launch (AWS KMS)</text>
+
+  <!-- IAM role -->
+  <rect x="112" y="490" width="366" height="62" fill="#FFFFFF" stroke="#DD344C" stroke-width="1.3"/>
+  <rect x="112" y="490" width="34" height="34" fill="#DD344C"/>
+  <text x="129" y="512" fill="#FFFFFF" font-size="10" font-weight="bold" text-anchor="middle">IAM</text>
+  <text x="154" y="506" fill="#232F3E" font-weight="bold">IAM instance role</text>
+  <text x="154" y="522" fill="#545B64" font-size="11">license-manager:CheckoutLicense (required for Enterprise packs)</text>
+  <text x="154" y="537" fill="#545B64" font-size="11">AmazonSSMManagedInstanceCore (optional, for Session Manager)</text>
+
+  <!-- Endpoints / NAT column -->
+  <rect x="548" y="158" width="196" height="196" fill="#FFFFFF" stroke="#8C4FFF" stroke-width="1.2"/>
+  <text x="646" y="178" text-anchor="middle" font-weight="bold" fill="#232F3E">Outbound HTTPS 443</text>
+  <text x="646" y="194" text-anchor="middle" font-size="11" fill="#545B64">VPC interface endpoints</text>
+  <text x="646" y="208" text-anchor="middle" font-size="11" fill="#545B64">or a NAT gateway</text>
+
+  <rect x="562" y="220" width="168" height="36" fill="#DD344C" fill-opacity="0.08" stroke="#DD344C"/>
+  <text x="646" y="236" text-anchor="middle" font-size="12" font-weight="bold" fill="#232F3E">AWS License Manager</text>
+  <text x="646" y="250" text-anchor="middle" font-size="10" fill="#545B64">CheckoutLicense, your account</text>
+
+  <rect x="562" y="264" width="168" height="36" fill="#E7157B" fill-opacity="0.08" stroke="#E7157B"/>
+  <text x="646" y="280" text-anchor="middle" font-size="12" font-weight="bold" fill="#232F3E">AWS Systems Manager</text>
+  <text x="646" y="294" text-anchor="middle" font-size="10" fill="#545B64">Session Manager (optional)</text>
+
+  <rect x="562" y="308" width="168" height="36" fill="#F2F3F3" stroke="#7D8998"/>
+  <text x="646" y="324" text-anchor="middle" font-size="12" font-weight="bold" fill="#232F3E">Amazon Linux repos</text>
+  <text x="646" y="338" text-anchor="middle" font-size="10" fill="#545B64">dnf patches (Amazon S3)</text>
+
+  <line x1="478" y1="250" x2="560" y2="250" stroke="#232F3E" stroke-width="1.3" marker-end="url(#arr)"/>
+  <line x1="478" y1="290" x2="560" y2="282" stroke="#232F3E" stroke-width="1.3" marker-end="url(#arr)"/>
+  <line x1="478" y1="330" x2="560" y2="326" stroke="#232F3E" stroke-width="1.3" marker-end="url(#arr)"/>
+
+  <!-- Operator -->
+  <rect x="548" y="392" width="196" height="70" fill="#FFFFFF" stroke="#545B64"/>
+  <text x="646" y="414" text-anchor="middle" font-weight="bold" fill="#232F3E">Operator</text>
+  <text x="646" y="431" text-anchor="middle" font-size="11" fill="#545B64">Session Manager, or SSH as</text>
+  <text x="646" y="446" text-anchor="middle" font-size="11" fill="#545B64">ec2-user with your key pair</text>
+  <line x1="548" y1="430" x2="480" y2="430" stroke="#232F3E" stroke-width="1.3" marker-end="url(#arr)"/>
+
+  <!-- AWS Backup -->
+  <rect x="548" y="490" width="196" height="62" fill="#3F8624" fill-opacity="0.08" stroke="#3F8624"/>
+  <text x="646" y="512" text-anchor="middle" font-weight="bold" fill="#232F3E">AWS Backup / EBS snapshots</text>
+  <text x="646" y="529" text-anchor="middle" font-size="11" fill="#545B64">/etc/varek and /var/log/varek</text>
+  <text x="646" y="543" text-anchor="middle" font-size="11" fill="#545B64">(optional, recommended)</text>
+  <line x1="462" y1="452" x2="546" y2="506" stroke="#7D8998" stroke-width="1.2" stroke-dasharray="5 3" marker-end="url(#arrg)"/>
+
+  <!-- Outside the account -->
+  <text x="800" y="38" fill="#232F3E" font-weight="bold">Outside this account</text>
+
+  <rect x="800" y="158" width="220" height="104" fill="#FFFFFF" stroke="#545B64" stroke-dasharray="4 3"/>
+  <text x="910" y="180" text-anchor="middle" font-weight="bold" fill="#232F3E">Agent's destinations</text>
+  <text x="910" y="198" text-anchor="middle" font-size="11" fill="#545B64">model APIs, internal services:</text>
+  <text x="910" y="213" text-anchor="middle" font-size="11" fill="#545B64">only the addresses and ports</text>
+  <text x="910" y="228" text-anchor="middle" font-size="11" fill="#545B64">the policy allows; every other</text>
+  <text x="910" y="243" text-anchor="middle" font-size="11" fill="#545B64">connect is refused</text>
+  <path d="M462 268 C 520 120, 700 120, 798 200" fill="none" stroke="#7D8998" stroke-width="1.2" stroke-dasharray="5 3" marker-end="url(#arrg)"/>
+
+  <rect x="800" y="392" width="220" height="104" fill="#FFFFFF" stroke="#545B64" stroke-dasharray="4 3"/>
+  <text x="910" y="414" text-anchor="middle" font-weight="bold" fill="#232F3E">Off-host anchor (optional)</text>
+  <text x="910" y="432" text-anchor="middle" font-size="11" fill="#545B64">small Linux host in another</text>
+  <text x="910" y="447" text-anchor="middle" font-size="11" fill="#545B64">account; append-only file of</text>
+  <text x="910" y="462" text-anchor="middle" font-size="11" fill="#545B64">signed checkpoints, over SSH 22</text>
+  <path d="M478 470 C 560 600, 760 600, 860 498" fill="none" stroke="#7D8998" stroke-width="1.2" stroke-dasharray="5 3" marker-end="url(#arrg)"/>
+
+  <text x="800" y="560" font-size="11" fill="#545B64">Solid arrows: a standard</text>
+  <text x="800" y="576" font-size="11" fill="#545B64">Enterprise deployment. Dashed:</text>
+  <text x="800" y="592" font-size="11" fill="#545B64">optional, or set by policy.</text>
+</svg>
