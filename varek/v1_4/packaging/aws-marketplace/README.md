@@ -14,6 +14,9 @@ sells as VAREK Enterprise: Amazon Linux 2023 (x86_64) with the Warden, the
 | `iam/ec2-trust.json` | Trust policy for that instance role |
 | `iam/marketplace-ami-ingestion-trust.json` | Trust policy for the role that lets AWS Marketplace copy the AMI |
 
+Buyers deploy and operate the image with the
+[VAREK Enterprise on AWS deployment guide](../../../../docs/aws-deployment-guide.md).
+
 The Enterprise packs (`hipaa.policy.txt`, `soc2.policy.txt`) are licensed
 content. They are passed to the build with `--packs` from outside the
 repository, and `build.sh` refuses any pack that is tracked in git.

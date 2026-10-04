@@ -9,6 +9,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+- `docs/aws-deployment-guide.md`: deployment guide for VAREK Enterprise on AWS
+  (architecture, IAM, keys, data and network, costs, sizing, deployment, health
+  checks, backup and recovery, key rotation, upgrades, fault handling, support),
+  with an index to the AWS Foundational Technical Review requirements, and its
+  architecture diagram, `docs/images/aws-deployment-architecture.svg`.
+
 ### Changed
 - The five VAREK Core packs (cybersecurity, finance, healthcare, national-defense,
   utility) allow `/usr/share/` read-only: shared operating-system data such as time
