@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.22.0-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.23.0-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -52,7 +52,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.22.0.**
+   **Current release: v1.23.0.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -444,7 +444,7 @@ different risks at different points in the stack.
 - [x] **v1.21.0** — Decided connections: the Warden decides each connect, dials it outside the agent's network namespace and hands over the socket (TCP, connected UDP, IPv4/IPv6 (IPv6 dialing untested on the release host), Unix); the plan gate decides connect steps
 - [x] **v1.21.1** — Plan steps declare how they open a file (`open=read`, `open=O_WRONLY|O_CREAT|…`), so the gate authorizes declared reads of read-only paths
 - [x] **v1.22.0** — The `varek` command (run, refusals, audit, signed export, policy packs) and `varek bench` (per-call cost of mediation on the host, every verdict checked)
-- [ ] **v1.23.0** — VAREK Enterprise on AWS Marketplace (AMI with Enterprise policy packs and a License Manager check)
+- [x] **v1.23.0** — VAREK Enterprise on AWS Marketplace (AMI with Enterprise policy packs and a License Manager check)
 - [ ] **v1.24.0** (v1.21 stage 2) — Host names without agent DNS: the Warden resolves allowed names and serves a hosts view ([design](./docs/security/v1.21-stage2-host-names.md))
 - [ ] **v1.21 stage 3 (opt-in)** — Rules on request contents through a Warden-owned or customer egress proxy
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker

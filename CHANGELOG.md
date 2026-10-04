@@ -7,11 +7,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased] — VAREK Enterprise on AWS Marketplace (planned v1.23.0)
+## [1.23.0] - 2026-10-04 — VAREK Enterprise on AWS Marketplace
 
 The packaging and the license check below are in the source from v1.22.0 on;
 they take effect only on the VAREK Enterprise AMI, whose first published image
-will be v1.23.0.
+is v1.23.0. The Warden's decisions are unchanged from v1.22.0; the Warden now
+reports version 1.23.0 so `varek version`, the AMI name and the listing agree.
 
 ### Added
 - `varek/v1_4/packaging/aws-marketplace/`: Packer build of the VAREK
