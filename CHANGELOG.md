@@ -7,6 +7,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased]
+
+### Changed
+- The five VAREK Core packs (cybersecurity, finance, healthcare, national-defense,
+  utility) allow `/usr/share/` read-only: shared operating-system data such as time
+  zones and locale. Before, an agent's interpreter was refused these reads (UNKNOWN)
+  on startup. The packs' key, certificate, `.env` and `.ssh` denials still come first,
+  and `/etc/` stays denied. Each Core pack has one more rule (healthcare: 34).
+
 ## [1.23.0] - 2026-10-04 — VAREK Enterprise on AWS Marketplace
 
 The packaging and the license check below are in the source from v1.22.0 on;
