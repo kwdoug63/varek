@@ -115,7 +115,8 @@ Region selector.
 | Operating system | Amazon Linux 2023, included in the AMI |
 | Architecture | x86_64 (64-bit Intel or AMD). Arm (Graviton) is not supported |
 | Kernel | 5.14 or later, with seccomp user notification. The AMI's kernel meets this; `varek doctor` checks it |
-| Instance type | t3.medium or larger x86_64 type ([section 6](#6-sizing)) |
+| Instance type | An x86_64 type the listing offers, t3.medium or larger; m7i-flex.large and c7i-flex.large are offered too ([section 6](#6-sizing)) |
+| AWS account plan | A paid account plan. Accounts on the AWS Free plan cannot launch AWS Marketplace AMIs |
 | Storage | The 10 GiB gp3 root volume is enough for VAREK; add space for your agents and for verdict streams you keep on the instance |
 | IAM | An instance role allowing `license-manager:CheckoutLicense` and `license-manager:CheckInLicense` to use the Enterprise packs |
 | Network | Outbound HTTPS 443 to AWS License Manager in the instance's Region (through a NAT gateway or a VPC interface endpoint) |
@@ -374,8 +375,16 @@ own: one Warden process per running agent, with a policy table of about 1 MB.
 | Use | Suggested starting point |
 |---|---|
 | Evaluation, one or two agents | t3.medium (2 vCPU, 4 GiB) |
+| Evaluation or light production at lower cost | c7i-flex.large (2 vCPU, 4 GiB) or m7i-flex.large (2 vCPU, 8 GiB) |
 | Production, several concurrent agents | A general-purpose x86_64 type with headroom for the agents' own CPU and memory (for example the m-family at `large` or above) |
 | Agents that load large local models | Size for the model; VAREK's share is negligible |
+
+Only the instance types the listing offers can launch the AMI; the list is on
+the listing's **Pricing** tab, and the EC2 launch wizard shows the same set.
+Smaller types such as t3.micro and t3.small are not offered. The flex types
+(c7i-flex, m7i-flex) cost less than their non-flex equivalents and suit
+workloads that do not need the full CPU all the time, which describes most
+agents: they spend much of their time waiting on model APIs.
 
 Measured overhead (`varek bench`, VAREK 1.23.0 on a t3.medium, healthcare
 pack, median): refused actions are decided in 18 to 23 microseconds; an
@@ -423,7 +432,8 @@ In the AWS Marketplace listing, choose **Continue to Subscribe**, then
 **Continue to Configuration** and **Launch through EC2**. In the EC2 launch
 wizard:
 
-1. **Instance type:** t3.medium or larger x86_64 ([section 6](#6-sizing)).
+1. **Instance type:** t3.medium or larger, or m7i-flex.large or c7i-flex.large
+   ([section 6](#6-sizing)).
 2. **Key pair:** your own, or none if you will use Session Manager.
 3. **Network:** your VPC and a private subnet; no public IP unless needed.
 4. **Security group:** no inbound rules (Session Manager), or SSH 22 from
@@ -574,6 +584,8 @@ it runs.
 | `no VAREK Enterprise entitlement` although you hold a contract | A check made in the last hour without `CheckInLicense` still holds the entitlement | Add `CheckInLicense` to the role and wait up to an hour |
 | On VAREK 1.23.0: `no VAREK Enterprise entitlement` although you hold a contract | Known issue in 1.23.0: its check asks License Manager for the entitlement in a form it refuses, so Enterprise packs cannot be selected. Fixed in 1.23.1 | Launch the 1.23.1 version and move your settings ([11.2](#112-patches-and-upgrades)); the Warden and the VAREK Core packs work on 1.23.0 |
 | `Service role not found` from License Manager | License Manager has not been set up in your account | In your AWS account: `aws iam create-service-linked-role --aws-service-name license-manager.amazonaws.com` |
+| `The specified image is not eligible for Free Tier` at launch | The AWS account is on the Free plan, which cannot launch AWS Marketplace AMIs | Upgrade the account to the paid plan (Billing and Cost Management, or `aws freetier upgrade-account-plan --account-plan-type PAID`); remaining credits carry over |
+| `The instance configuration for this AWS Marketplace product is not supported` | The instance type is not one the listing offers | Choose one from the listing's **Pricing** tab ([section 6](#6-sizing)) |
 | `policy ... does not lint` | Syntax error or unknown rule | `varek policy check --explain` |
 | The agent fails with "Permission denied" | The policy refused an action | `varek refusals` names the action and the deciding line; allow it in the policy if it is intended |
 | `[varek] the Warden did not start the agent` | Startup check failed (policy, key permissions, anchor, a path the agent may not reach) | The lines printed after it give the reason; `sudo varek doctor` and `sudo varek preflight --run` |
