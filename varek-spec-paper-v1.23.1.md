@@ -241,7 +241,7 @@ The testing posture mirrors the runtime posture: where a guarantee cannot be est
 - v1.21.1: `make test-v1211`, 33 checks, 23 of which fail against the v1.21.0 Warden.
 - v1.22.0: `make test-cli`, the `varek` command and `varek bench`, including end-to-end runs under the Warden and a bench whose every verdict is checked.
 - v1.23.0: the AMI build proves the installed image before it is published: a real run under the Warden, its audit and a signed export, then the bench's smoke run.
-- v1.23.1: the license check run against the real AWS License Manager in a second AWS account, through a private offer; each check licensed and returned its unit.
+- v1.23.1: the license check run against the real AWS License Manager in a second AWS account, through a private offer; each check licensed and returned its unit. Then end to end as a buyer: the published v1.23.1 AMI launched from the listing in that account on an m7i-flex.large with the documented instance role, where `varek license` reported `licensed: enterprise_tier_a`, `varek init --pack hipaa` installed the HIPAA pack, a second `varek license` was licensed again (the unit had been returned), and `varek doctor` reported the host ready.
 - From v1.18.0 each release's own code was reviewed independently before tagging, and the findings fixed in the release are listed in its notes.
 
 ---
