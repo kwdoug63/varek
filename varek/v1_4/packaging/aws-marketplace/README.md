@@ -39,7 +39,12 @@ License Manager ([AWS docs](https://docs.aws.amazon.com/marketplace/latest/userg
 On this image, choosing an Enterprise pack (`varek init --pack hipaa`,
 `varek policy use soc2`, `varek run --policy ...`) calls `CheckoutLicense`
 for each dimension in `marketplace.json`, highest tier first, using the AWS
-CLI that ships with AL2023 and the instance's IAM role.
+CLI that ships with AL2023 and the instance's IAM role. Marketplace issues each
+contract dimension as a Count entitlement (MaxCount 1), so the checkout asks
+for `Value=1,Unit=Count`, and the unit is returned at once with
+`CheckInLicense`; a provisional checkout would otherwise hold it for an hour
+and refuse the next check (v1.23.1; v1.23.0 asked for `Unit=None`, which
+License Manager refuses).
 
 - Licensed: the pack is used.
 - Not licensed, or the check cannot be made (no role, no network): the

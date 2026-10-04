@@ -258,7 +258,7 @@ def require_entitlement(src):
     raise CliError(f"{name} is a VAREK Enterprise pack and the license could not be "
                    f"checked: {r.detail}",
                    fix="attach an instance role allowing license-manager:CheckoutLicense "
-                       "(see `varek license`), then try again")
+                       "and license-manager:CheckInLicense (see `varek license`), then try again")
 
 
 def pack_summary(path):
@@ -606,14 +606,21 @@ def cmd_license(args):
     r = varek_license.check(varek_home())
     if r.ok:
         ok(f"licensed: {r.dimension}")
+        if "not returned" in r.detail:
+            warn(r.detail)
+            hint("allow license-manager:CheckInLicense in the instance role, "
+                 "or checks within the next hour are refused")
         return 0
     if r.status == varek_license.NOT_LICENSED:
         warn(f"no VAREK Enterprise entitlement for this AWS account ({r.detail})")
+        hint("if this account does hold a subscription, a check made in the last hour "
+             "may still hold it; see `Troubleshooting` in docs/aws-deployment-guide.md")
         hint("the Warden and the VAREK Core packs keep working; Enterprise packs can't be chosen")
         return 1
     fail(f"could not check the license: {r.detail}")
-    hint("the instance needs an IAM role with this permission:")
-    hint('  {"Effect": "Allow", "Action": "license-manager:CheckoutLicense", "Resource": "*"}')
+    hint("the instance needs an IAM role with these permissions:")
+    hint('  {"Effect": "Allow", "Action": ["license-manager:CheckoutLicense",')
+    hint('   "license-manager:CheckInLicense"], "Resource": "*"}')
     return 1
 
 

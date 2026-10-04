@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
-"""Tests for the VAREK Enterprise entitlement check (v1.23). Run with `make test-cli`.
+"""Tests for the VAREK Enterprise entitlement check (v1.23, v1.23.1). Run with `make test-cli`.
 
 AWS is never called: a stand-in `aws` script answers CheckoutLicense the way
-License Manager does, chosen by FAKE_AWS_MODE.
+License Manager does, chosen by FAKE_AWS_MODE (and FAKE_AWS_CHECKIN).
 """
 import json
 import os
@@ -21,23 +21,42 @@ BUILT = all(os.access(os.path.join(HERE, b), os.X_OK)
 ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
 
 FAKE_AWS = r"""#!/bin/sh
-# Stand-in for `aws license-manager checkout-license`.
+# Stand-in for `aws license-manager checkout-license | check-in-license`, behaving
+# as License Manager did for a real VAREK Enterprise contract (2026-10-04): each
+# dimension is a Count entitlement with MaxCount 1, so a checkout must ask for
+# Value=1,Unit=Count, and a count stays in use until it is checked in.
 echo "$@" >> "$FAKE_AWS_LOG"
-dim=$(echo "$@" | sed -n 's/.*Name=\([A-Za-z0-9_]*\),Unit=None.*/\1/p')
+HELD="${FAKE_AWS_LOG}.held"
+touch "$HELD"
+case "$2" in
+  check-in-license)
+    if [ "$FAKE_AWS_CHECKIN" = "denied" ]; then
+      echo "An error occurred (AccessDeniedException) when calling the CheckInLicense operation: not authorized" >&2
+      exit 254
+    fi
+    tok=$(echo "$@" | sed -n 's/.*--license-consumption-token \([^ ]*\).*/\1/p')
+    grep -vx "${tok#tok-}" "$HELD" > "$HELD.new"; mv "$HELD.new" "$HELD"
+    exit 0 ;;
+esac
+dim=$(echo "$@" | sed -n 's/.*--entitlements Name=\([A-Za-z0-9_]*\),.*/\1/p')
+asks_one=$(echo "$@" | grep -c "Name=$dim,Value=1,Unit=Count")
+refuse() {
+    echo "An error occurred (NoEntitlementsAllowedException) when calling the CheckoutLicense operation: No Entitlements Allowed." >&2
+    exit 254
+}
 case "$FAKE_AWS_MODE" in
   licensed:*)
-    if [ "$dim" = "${FAKE_AWS_MODE#licensed:}" ]; then
-      echo '{"LicenseConsumptionToken": "t", "EntitlementsAllowed": [{"Name": "'"$dim"'"}]}'
-      exit 0
-    fi
-    echo "An error occurred (NoEntitlementsAllowedException) when calling the CheckoutLicense operation: No entitlements" >&2
-    exit 254 ;;
+    [ "$dim" = "${FAKE_AWS_MODE#licensed:}" ] || refuse
+    [ "$asks_one" = 1 ] || refuse                 # e.g. Unit=None, as v1.23.0 asked
+    grep -qx "$dim" "$HELD" && refuse             # the one count is in use
+    echo "$dim" >> "$HELD"
+    echo '{"LicenseConsumptionToken": "tok-'"$dim"'", "EntitlementsAllowed": [{"Name": "'"$dim"'", "Value": "1", "Unit": "Count"}]}'
+    exit 0 ;;
   notallowed)
     echo "An error occurred (EntitlementNotAllowedException) when calling the CheckoutLicense operation: x" >&2
     exit 254 ;;
   none)
-    echo "An error occurred (NoEntitlementsAllowedException) when calling the CheckoutLicense operation: No entitlements" >&2
-    exit 254 ;;
+    refuse ;;
   denied)
     echo "An error occurred (AccessDeniedException) when calling the CheckoutLicense operation: not authorized" >&2
     exit 254 ;;
@@ -97,18 +116,27 @@ def test_enterprise_mark(tmp_path):
     assert not vl.is_enterprise_pack(str(tmp_path / "missing"))
 
 
+def checkouts(log):
+    return [c for c in log.read_text().splitlines() if c.startswith("license-manager checkout-license")]
+
+
+def check_ins(log):
+    return [c for c in log.read_text().splitlines() if c.startswith("license-manager check-in-license")]
+
+
 def test_holds_the_second_dimension(home, monkeypatch):
     h, log = home
     monkeypatch.setenv("FAKE_AWS_MODE", "licensed:enterprise_tier_a")
     r = vl.check(str(h))
     assert r.ok and r.dimension == "enterprise_tier_a"
-    calls = log.read_text().splitlines()
+    calls = checkouts(log)
     assert len(calls) == 2                      # tier_b refused, then tier_a granted
     for c in calls:
         assert "--product-sku prod-test123" in c
         assert "--checkout-type PROVISIONAL" in c
         assert "--key-fingerprint " + vl.ISSUER_FINGERPRINT in c
         assert "--region us-east-1" in c
+        assert "Value=1,Unit=Count" in c and "Unit=None" not in c
 
 
 def test_self_issued_test_license(home, monkeypatch):
@@ -121,13 +149,40 @@ def test_self_issued_test_license(home, monkeypatch):
     assert "--key-fingerprint aws:111122223333:Self:issuer-fingerprint" in log.read_text()
 
 
+def test_count_is_returned_so_the_next_check_succeeds(home, monkeypatch):
+    # v1.23.1: a Marketplace contract dimension is a Count with MaxCount 1. v1.23.0
+    # never checked it back in, so a second check within the hour was refused.
+    h, log = home
+    monkeypatch.setenv("FAKE_AWS_MODE", "licensed:enterprise_tier_b")
+    for _ in range(3):
+        r = vl.check(str(h))
+        assert r.ok and r.dimension == "enterprise_tier_b"
+        assert "returned" in r.detail and "not returned" not in r.detail
+    ins = check_ins(log)
+    assert len(ins) == 3
+    assert all("--license-consumption-token tok-enterprise_tier_b" in c for c in ins)
+    assert all("--region us-east-1" in c for c in ins)
+
+
+def test_check_in_refused_is_reported(home, monkeypatch):
+    h, log = home
+    monkeypatch.setenv("FAKE_AWS_MODE", "licensed:enterprise_tier_a")
+    monkeypatch.setenv("FAKE_AWS_CHECKIN", "denied")
+    r = vl.check(str(h))
+    assert r.ok                                     # the account is licensed all the same
+    assert "not returned" in r.detail and "CheckInLicense" in r.detail
+    # ...but the count stays in use, which is why the check-in matters:
+    assert vl.check(str(h)).status == vl.NOT_LICENSED
+
+
 @pytest.mark.parametrize("mode", ["none", "notallowed"])
 def test_no_entitlement(home, monkeypatch, mode):
     h, log = home
     monkeypatch.setenv("FAKE_AWS_MODE", mode)
     r = vl.check(str(h))
     assert r.status == vl.NOT_LICENSED and not r.ok
-    assert len(log.read_text().splitlines()) == 2    # both tiers were tried
+    assert len(checkouts(log)) == 2                  # both tiers were tried
+    assert not check_ins(log)
 
 
 @pytest.mark.parametrize("mode, words", [("denied", "CheckoutLicense"),
@@ -138,7 +193,7 @@ def test_cannot_check(home, monkeypatch, mode, words):
     monkeypatch.setenv("FAKE_AWS_MODE", mode)
     r = vl.check(str(h))
     assert r.status == vl.UNAVAILABLE and words in r.detail
-    assert len(log.read_text().splitlines()) == 1   # stops at the first hard error
+    assert len(checkouts(log)) == 1                 # stops at the first hard error
 
 
 def test_no_aws_cli(home, monkeypatch):

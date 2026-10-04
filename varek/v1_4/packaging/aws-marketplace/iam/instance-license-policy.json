@@ -4,7 +4,10 @@
     {
       "Sid": "VarekEnterpriseLicenseCheck",
       "Effect": "Allow",
-      "Action": "license-manager:CheckoutLicense",
+      "Action": [
+        "license-manager:CheckoutLicense",
+        "license-manager:CheckInLicense"
+      ],
       "Resource": "*"
     }
   ]
