@@ -9,6 +9,7 @@ name: Warden build
 # v1.18.0: the v1.7 layer's tests (data flow, breaker, progress safety, URL
 # host matching), the Python suites, and the exporter's output against the
 # CycloneDX 1.6 schema.
+# v1.24.0: the host-name grammar and the resolution table (make test-v1240).
 
 on:
   push:
@@ -44,6 +45,8 @@ jobs:
           for p in varek/v1_4/policy.txt varek/v1_4/conformance_policy.txt varek/v1_4/policies/*.txt; do
             varek/v1_4/tools/varek_preflight.sh "$p" --log /var/log/varek/verdicts.log
           done
+      - name: v1.24 host names (grammar, resolution table, the Warden as root)
+        run: sudo make -C varek/v1_4 test-v1240
       - name: Build and test the plan_verify CLI (v1_6, v1.16.3)
         run: make -C v1_6 plan_verify check check-plan-verify
       - name: Test the v1.7 layer (v1.18.0)

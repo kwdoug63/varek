@@ -705,6 +705,7 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
     int lineno = 0;
     int rc = 0;
     int req_maj = 0, req_min = 0;       /* highest `require warden` seen so far */
+    int legacy_name_line = 0;           /* v1.24: a host name read before `require warden 1.24` */
     size_t glob_tokens = 0;
     while ((got = getline(&line, &cap, f)) >= 0) {
         lineno++;
@@ -734,6 +735,13 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             if (maj > VDP_WARDEN_MAJOR || (maj == VDP_WARDEN_MAJOR && mn > VDP_WARDEN_MINOR)) {
                 rc = perr(err, errlen, path, lineno, "policy requires Warden %d.%d; this is %d.%d",
                           maj, mn, VDP_WARDEN_MAJOR, VDP_WARDEN_MINOR);
+                break;
+            }
+            if (legacy_name_line && (maj > 1 || (maj == 1 && mn >= 24))) {
+                rc = perr(err, errlen, path, lineno,
+                          "require warden %d.%d after a host name (line %d) that it would give "
+                          "a new meaning; put the directive before the host rules",
+                          maj, mn, legacy_name_line);
                 break;
             }
             if (maj > req_maj || (maj == req_maj && mn > req_min)) { req_maj = maj; req_min = mn; }
@@ -802,6 +810,21 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
         }
         memcpy(r->s.c, cs, cl + 1);
         r->s.len = cl;
+        if (r->kind == VDP_KIND_HOST) {
+            /* v1.24: a constant in name form is a host name after `require
+             * warden 1.24`, and must then be a valid one; before it, it keeps
+             * its v1.21 meaning (an exact string, which no connect produces). */
+            char why[160];
+            int nf = vdp_host_name_form(cs, cl, why, sizeof why);
+            if (nf != 0 && (req_maj > 1 || (req_maj == 1 && req_min >= 24))) {
+                if (nf < 0) { rc = perr(err, errlen, path, lineno, "bad host name: %s", why); break; }
+                r->s.name = true;
+                r->s.portless = !memchr(cs, ':', cl);
+            } else {
+                if (nf != 0 && !legacy_name_line) legacy_name_line = lineno;
+                r->s.portless = vdp_host_portless(cs, cl);
+            }
+        }
         if (r->s.op == VDP_STR_GLOB) {
             char gm[160] = "out of memory";
             r->s.prog = prog_glob(r->s.c, r->s.len, gm, sizeof gm);
@@ -881,6 +904,56 @@ bool vdp_host_portless(const char *c, size_t cl) {
     return cl >= 2 && c[0] == '[' && c[cl - 1] == ']' && !memchr(c + 1, ']', cl - 2);
 }
 
+/* v1.24: is c a host constant in name form, and a valid one? See smt_decide.h
+ * for the form. 0: not in name form (a numeric form: '[', "unix:", or digits
+ * and dots before the first ':'); 1: a valid name constant; -1: in name form
+ * but invalid, the reason in why. */
+int vdp_host_name_form(const char *c, size_t cl, char *why, size_t wn) {
+    if ((cl >= 1 && c[0] == '[') || (cl >= 5 && !memcmp(c, "unix:", 5))) return 0;
+    const char *colon = memchr(c, ':', cl);
+    size_t hl = colon ? (size_t)(colon - c) : cl;
+    bool numeric = true;
+    for (size_t i = 0; i < hl; i++)
+        if (!((c[i] >= '0' && c[i] <= '9') || c[i] == '.')) { numeric = false; break; }
+    if (numeric) return 0;
+#define BAD(...) do { snprintf(why, wn, __VA_ARGS__); return -1; } while (0)
+    if (memchr(c, '*', hl))
+        BAD("wildcards are not host names (wildcard rules are planned for v1.25; name each host)");
+    if (c[hl - 1] == '.') BAD("a trailing dot is not allowed (write the name without it)");
+    for (size_t i = 0; i < hl; i++) {
+        unsigned char ch = (unsigned char)c[i];
+        if (ch >= 'A' && ch <= 'Z') BAD("host names are written in lowercase");
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '.'))
+            BAD("a host name has only a-z, 0-9, '-' and '.' (an internationalized name is "
+                "written as its A-labels, xn--...)");
+    }
+    if (hl > 253) BAD("a host name is at most 253 bytes");
+    size_t st = 0;
+    bool digits = true;
+    for (size_t i = 0; i <= hl; i++) {
+        if (i < hl && c[i] != '.') continue;
+        size_t ll = i - st;
+        if (ll == 0) BAD("empty label");
+        if (ll > 63) BAD("a label is at most 63 bytes");
+        if (c[st] == '-' || c[i - 1] == '-') BAD("a label cannot start or end with '-'");
+        digits = true;
+        for (size_t k = st; k < i; k++) if (c[k] < '0' || c[k] > '9') { digits = false; break; }
+        st = i + 1;
+    }
+    if (digits) BAD("the last label is all digits (an address is written a.b.c.d)");
+    if (hl == 4 && !memcmp(c, "unix", 4)) BAD("unix is reserved (unix:/path names a Unix socket)");
+    if (colon) {
+        const char *port = colon + 1;
+        size_t pl = cl - hl - 1, k = 0;
+        unsigned long v = 0;
+        for (; k < pl && k < 6 && port[k] >= '0' && port[k] <= '9'; k++) v = v * 10 + (unsigned)(port[k] - '0');
+        if (pl == 0 || k != pl || v > 65535 || (pl > 1 && port[0] == '0'))
+            BAD("the port must be a decimal number from 0 to 65535 without leading zeros");
+    }
+#undef BAD
+    return 1;
+}
+
 static bool str_holds(const vdp_str_atom_t *a, const char *s, size_t sl) {
     switch (a->op) {
         case VDP_STR_PREFIX:
@@ -889,7 +962,7 @@ static bool str_holds(const vdp_str_atom_t *a, const char *s, size_t sl) {
             return sl == a->len && memcmp(s, a->c, a->len) == 0;
         case VDP_STR_HOST:
             if (sl == a->len && memcmp(s, a->c, a->len) == 0) return true;
-            if (!vdp_host_portless(a->c, a->len)) return false;
+            if (!a->portless) return false;
             return sl > a->len && memcmp(s, a->c, a->len) == 0 && s[a->len] == ':';
         case VDP_STR_SUFFIX:
             return sl >= a->len && memcmp(s + sl - a->len, a->c, a->len) == 0;
@@ -1146,7 +1219,7 @@ static vdp_reach_t reach_trie(const vdp_policy_t *p, size_t i, char *wit, size_t
         const vdp_rule_t *r = &p->rules[j];
         if (r->kind != kind) continue;
         if (dset_add(&D, r->s.c, r->s.len) < 0) { dset_free(&D); return VDP_REACH_UNKNOWN; }
-        if (r->s.op == VDP_STR_HOST && vdp_host_portless(r->s.c, r->s.len)) {
+        if (r->s.op == VDP_STR_HOST && r->s.portless) {
             char tmp[VDP_STR_MAX + 2];
             memcpy(tmp, r->s.c, r->s.len);
             tmp[r->s.len] = ':';
@@ -1766,9 +1839,21 @@ bool vdp_host_constant_ok(const char *c, size_t cl, char *why, size_t wn) {
     }
     return true;
 name:
-    snprintf(why, wn, "not a numeric address: host rules match a.b.c.d[:port], [IPv6][:port] "
-             "or unix:/path (host names are planned for v1.21 stage 2)");
+    snprintf(why, wn, "not a numeric address: host rules match a.b.c.d[:port], [IPv6][:port], "
+             "unix:/path, or a host name after `require warden 1.24`");
     return false;
+}
+
+/* v1.24: can a connect ever match host rule r? Fills why when not. */
+bool vdp_host_rule_ok(const vdp_rule_t *r, char *why, size_t wn) {
+    if (r->kind != VDP_KIND_HOST || r->s.name) return true;
+    char nw[160];
+    if (vdp_host_name_form(r->s.c, r->s.len, nw, sizeof nw) != 0) {
+        snprintf(why, wn, "a host name is matched only after `require warden 1.24` (before this "
+                 "rule)");
+        return false;
+    }
+    return vdp_host_constant_ok(r->s.c, r->s.len, why, wn);
 }
 
 size_t vdp_rule_advisory(const vdp_rule_t *r, char *buf, size_t n) {
@@ -1802,12 +1887,14 @@ size_t vdp_rule_advisory(const vdp_rule_t *r, char *buf, size_t n) {
     }
     /* v1.21: the Warden decides a connect on the numeric destination it will
      * dial, spelt as inet_ntop writes it: a.b.c.d:port, [IPv6]:port (an
-     * IPv4-mapped IPv6 address as its IPv4 form), or unix:<canonical path>.
-     * A constant in any other form can never match (a host name above all:
-     * `deny host evil.example.com` never fired), so say so. */
+     * IPv4-mapped IPv6 address as its IPv4 form), or unix:<canonical path>;
+     * v1.24: or on name:port for the allowed names that resolved to it. A
+     * constant in any other form can never match (a host name without
+     * `require warden 1.24`: `deny host evil.example.com` never fired through
+     * v1.20), so say so. */
     if (r->kind == VDP_KIND_HOST) {
         char why[160];
-        if (!vdp_host_constant_ok(r->s.c, r->s.len, why, sizeof why))
+        if (!vdp_host_rule_ok(r, why, sizeof why))
             ADD("%s%s, so this rule can never match", w ? "; " : "", why);
     }
     for (size_t i = 0; i < r->s.len; i++) {

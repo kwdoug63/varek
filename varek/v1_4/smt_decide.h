@@ -17,7 +17,9 @@
 //   S_i is one string atom:
 //        prefix(c, s) | s == c | host(c, s)                         (v1.13)
 //        suffix(c, s) | contains(c, s) | s in glob(c)               (v1.14)
-//        host(c, s) := s == c  OR  (c has no ':' AND prefix(c ++ ":", s))
+//        host(c, s) := s == c  OR  (portless(c) AND prefix(c ++ ":", s))
+//          portless(c): c names an address or (v1.24) a host name without a
+//          port; decided once at load (see vdp_policy_load).
 //        glob(c) is the regular language of a path glob (see the grammar
 //        below): literal bytes, ?, [...] classes, * (no '/'), ** (any bytes)
 //        and the unit /**/ (zero or more whole path segments).
@@ -124,6 +126,8 @@ typedef struct {
     size_t            len;
     char              c[VDP_STR_MAX + 1];  /* the constant; for glob, the pattern */
     struct vdp_prog  *prog;                /* glob only: compiled at load */
+    bool              portless;            /* host only: no port, so every port matches */
+    bool              name;                /* host only (v1.24): a host name rule */
 } vdp_str_atom_t;
 
 typedef struct {
@@ -212,6 +216,14 @@ const char *vdp_kind_name(vdp_kind_t k);
 // matchers should say `require warden 1.14`; a v1.13 Warden refuses matcher
 // lines in any case (it reads the constant as an unknown flag clause), and the
 // directive makes the reason explicit.
+// v1.24: a host rule names a host (`allow host api.example.com:443`) only
+// after `require warden 1.24` (or later); a Warden before 1.24 then refuses
+// the policy instead of loading name rules it cannot match. After the
+// directive a host constant in name form that is not a valid name is refused
+// (see vdp_host_name_form). Without it, such a constant keeps its v1.21
+// meaning (an exact string no connect produces; a load-time note says so), and
+// a `require warden 1.24` that follows such a rule is refused, so that one
+// policy cannot hold host names under both meanings.
 int vdp_policy_load(const char *path, vdp_policy_t *p, char *err, size_t errlen);
 
 /* Decide a single action. s must be a NUL-terminated string. flags is used only
@@ -299,10 +311,32 @@ bool vdp_host_is_ipv4(const char *c, size_t cl);
  * writes the reason to why and returns false. Used for a load-time note. */
 bool vdp_host_constant_ok(const char *c, size_t cl, char *why, size_t wn);
 
+/* v1.24: host names. A host constant is in name form unless it starts with
+ * '[' or "unix:", or the part before its first ':' is empty or only digits and
+ * dots (those are numeric forms, as in v1.21). A constant in name form is
+ *   <name>  or  <name>:<port>
+ * where <name> is lowercase letters, digits, '-' and '.', labels of 1 to 63
+ * bytes that neither start nor end with '-', at most 253 bytes, no trailing
+ * dot, a last label that is not all digits, internationalized names as
+ * A-labels (xn--...) only, and not the word "unix" (unix:/path names a Unix
+ * socket); <port> is decimal, 0 to 65535, without leading zeros. Wildcards
+ * (*.example.com) are not names (planned for v1.25).
+ * Returns 0 if c is not in name form, 1 if it is a valid name constant, -1 if
+ * it is in name form but invalid (the reason in why). */
+int vdp_host_name_form(const char *c, size_t cl, char *why, size_t wn);
+
+/* v1.24: can a connect ever match this host rule? A name rule (`require
+ * warden 1.24` before it) can; a constant in name form without the directive
+ * cannot, nor can a numeric constant vdp_host_constant_ok refuses. When not,
+ * writes the reason to why and returns false. */
+bool vdp_host_rule_ok(const vdp_rule_t *r, char *why, size_t wn);
+
 /* The Warden version this procedure implements, for `require warden X.Y`.
  * v1.21: host rules take effect (decided connections), and a bracketed IPv6
- * constant without a port ("[::1]") matches every port. */
+ * constant without a port ("[::1]") matches every port.
+ * v1.24: host names (`allow host api.example.com:443`); a name without a port
+ * matches every port. Name rules need `require warden 1.24` before them. */
 #define VDP_WARDEN_MAJOR 1
-#define VDP_WARDEN_MINOR 21
+#define VDP_WARDEN_MINOR 24
 
 #endif /* VAREK_SMT_DECIDE_H */

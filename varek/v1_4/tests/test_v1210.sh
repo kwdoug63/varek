@@ -155,7 +155,9 @@ gate exec.txt; check "a launch step is still UNSATISFIED"      grep -q 'refuses 
 echo "== 4. host constants a connect can never produce =="
 printf 'deny host evil.example.com\nallow host [::1]\nallow host 010.1.2.3:80\nallow host unix:run/x.sock\nallow host [::ffff:10.0.0.1]:80\nallow host 127.0.0.1:8443\n' > "$OUT/names.txt"
 "$HERE/tools/vdp_check" "$OUT/names.txt" lint > "$OUT/lint.out" 2>&1
-check "a host name is reported as never matching"              grep -q 'names.txt:1: note: not a numeric address' "$OUT/lint.out"
+# v1.24: without `require warden 1.24` a host name keeps its v1.21 meaning,
+# and the note says what makes it match.
+check "a host name is reported as never matching"              grep -q 'names.txt:1: note: a host name is matched only after `require warden 1.24`' "$OUT/lint.out"
 check "an IPv4-mapped constant names its IPv4 form"            grep -q 'names.txt:5: note: an IPv4-mapped address is decided as its IPv4 form, 10.0.0.1' "$OUT/lint.out"
 check "a relative unix: constant is reported"                  grep -q 'names.txt:4: note: a unix: constant must name an absolute path' "$OUT/lint.out"
 if grep -q 'names.txt:[26]: note' "$OUT/lint.out"; then flunk "canonical constants draw no note"; else pass "canonical constants draw no note"; fi

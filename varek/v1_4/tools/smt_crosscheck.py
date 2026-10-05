@@ -395,6 +395,29 @@ def host_portless(c):
     return len(c) >= 2 and c[0] == "[" and c[-1] == "]" and "]" not in c[1:-1]
 
 
+NAME_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def host_name_form(c):
+    """v1.24: 0 if c is a numeric host form ('[', 'unix:', or only digits and
+    dots before the first ':'), 1 if it is a valid host name constant
+    (name or name:port), -1 if it is in name form but invalid. Written from the
+    grammar in smt_decide.h, independently of both C parsers."""
+    if c.startswith("[") or c.startswith("unix:"):
+        return 0
+    host, sep, port = c.partition(":")
+    if all(ch in "0123456789." for ch in host):
+        return 0
+    if len(host) > 253 or host == "unix":
+        return -1
+    labels = host.split(".")
+    if not all(NAME_LABEL.fullmatch(l) for l in labels) or labels[-1].isdigit():
+        return -1
+    if sep and not re.fullmatch(r"0|[1-9][0-9]{0,4}", port) or (sep and int(port) > 65535):
+        return -1
+    return 1
+
+
 def atom_rx(rx, r):
     """The language of a rule's string atom."""
     c, op = r["c"], r["op"]
@@ -409,7 +432,7 @@ def atom_rx(rx, r):
     if op == "glob":
         return r["rx"]
     # host
-    if not host_portless(c):
+    if not r["portless"]:
         return rx.lit(c)
     return rx.alt(rx.lit(c), rx.cat(rx.lit(c + ":"), rx.TOP))
 
@@ -424,6 +447,7 @@ def parse_lines(raw_lines, path):
     rules = []
     rx = RX()
     req = (0, 0)                   # highest `require warden` so far
+    legacy_name = False            # v1.24: a host name read before `require warden 1.24`
     glob_tokens = 0
     if True:
         for lineno, raw in enumerate(raw_lines, 1):
@@ -446,8 +470,10 @@ def parse_lines(raw_lines, path):
                 if len(toks) != 3 or toks[1] != "warden" or not m:
                     raise PolicyError(f"{path}:{lineno}: bad directive")
                 v = (int(m.group(1)), int(m.group(2)))
-                if v > (1, 21):
+                if v > (1, 24):
                     raise PolicyError(f"{path}:{lineno}: requires newer Warden")
+                if legacy_name and v >= (1, 24):
+                    raise PolicyError(f"{path}:{lineno}: require warden 1.24 after a host name")
                 req = max(req, v)
                 continue
             if len(toks) < 3:
@@ -496,8 +522,18 @@ def parse_lines(raw_lines, path):
                     raise PolicyError(f"{path}:{lineno}: contradictory")
                 mask |= m
                 value |= v & m
+            portless = name = False
+            if kind == "host":
+                nf = host_name_form(const)
+                if nf and req >= (1, 24):
+                    if nf < 0:
+                        raise PolicyError(f"{path}:{lineno}: bad host name")
+                    name, portless = True, ":" not in const
+                else:
+                    legacy_name = legacy_name or nf != 0
+                    portless = host_portless(const)
             r = {"verb": verb, "kind": kind, "op": op, "c": const, "rx": grx, "gtoks": gtoks,
-                 "mask": mask, "value": value, "line": lineno}
+                 "mask": mask, "value": value, "line": lineno, "portless": portless, "name": name}
             r["lang"] = atom_rx(rx, r)
             rules.append(r)
     return rules, rx
@@ -591,7 +627,7 @@ def str_atom(rx, r, s):
         return smt.Contains(s, c)
     if op == "glob":
         return smt.InRe(s, rx_to_smt(rx, r["rx"]))
-    if not host_portless(r["c"]):
+    if not r["portless"]:
         return s == c
     return smt.Or(s == c, smt.PrefixOf(zstr(r["c"] + ":"), s))
 
@@ -702,7 +738,7 @@ def str_atom_bytes(r, bs):
     c = r["c"]
     if r["op"] == "prefix":
         return bs.prefix(c)
-    if r["op"] == "eq" or not host_portless(c):
+    if r["op"] == "eq" or not r["portless"]:
         return bs.eq(c)
     # host(c, s) = s == c OR prefix(c ++ ":", s), written with the shared prefix
     # factored out: prefix(c, s) AND (|s| == |c| OR s[|c|] == ':'). Logically
@@ -867,7 +903,8 @@ def gen_queries(rules, rx, rng, n):
             sval = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 8)))
         if len(sval) > L + 3:
             sval = sval[: L + rng.randint(-2, 3)]
-        if kind == "host" and base and host_portless(base) and rng.random() < 0.4:
+        if kind == "host" and base and (host_portless(base) or (host_name_form(base) == 1 and ":" not in base)) \
+                and rng.random() < 0.4:
             sval = base + ":" + str(rng.choice([80, 443, 8080]))
         if kind == "path":
             r = rng.random()
@@ -902,6 +939,12 @@ AMBIGUOUS = ["allow path glob readonly", "deny path suffix -O_CREAT", "allow pat
 def fuzz_line(rng, prior, strings, wide):
     frags = ["/a", "/a/", "/a/b", "/ab", "/b/", "/a/b/c", "x", "x:1", "/", "[::1]", "[a]", "[:]",
              "1.2.3.4", "1.2.3.4:5", "01.2.3.4", "256.1.1.1", "unix", "unix:/a"]
+    # v1.24 host names, valid and not
+    names = ["api.example.com", "api.example.com:443", "a.b", "a-b.c0", "xn--bcher-kva.example",
+             "localhost", "x", "a.b:0", "a.b:65535", "Api.example.com", "a.b.", "*.example.com",
+             "a..b", "-a.b", "a-.b", "a.123", "1a.2", "a.b:65536", "a.b:080", "a.b:", "unix:80",
+             "a_b.c", "a.b:1:2", "\xe9.example", "a" * 63 + ".b", "a" * 64 + ".b",
+             ".".join(["a" * 63] * 4)[:253], ".".join(["a" * 63] * 4)[:252] + "aa"]
     if rng.random() < 0.03:
         return rng.choice(AMBIGUOUS)
     matcher = None
@@ -921,8 +964,12 @@ def fuzz_line(rng, prior, strings, wide):
                                      ("glob", stem + "/**/b"), ("suffix", stem[-2:] or stem),
                                      ("contains", stem[1:3] or stem)])
     else:
-        kind = rng.choice(["path", "path", "path", "host", "exec"])
+        kind = rng.choice(["path", "path", "path", "host", "host", "exec"])
         c = rng.choice(frags) + rng.choice(["", "", "a", "/", ":2"])
+        if kind == "host" and rng.random() < 0.6:
+            c = rng.choice(names) + rng.choice(["", "", "", ":443", "a"])
+            if rng.random() < 0.6:
+                c = rng.choice(names[:8])              # valid names, with and without a port
         if strings and kind != "host" and rng.random() < 0.7:
             matcher = rng.choice(["exact", "prefix", "suffix", "contains", "glob", "glob"])
         elif strings and kind == "host" and rng.random() < 0.03:
@@ -977,14 +1024,20 @@ def fuzz_policy(rng, path):
     lines = []
     if rng.random() < 0.3:
         lines.append(rng.choice(["require warden 1.14", "require warden 1.13", "require warden 01.14",
-                                 "require warden 1.15", "require warden 1.16", "require warden 1.21"] +
-                                ([] if valid else ["require warden 1.17", "require warden x",
+                                 "require warden 1.15", "require warden 1.16", "require warden 1.21",
+                                 "require warden 1.24", "require warden 1.24"] +
+                                ([] if valid else ["require warden 1.25", "require warden x",
                                                    "require warden +1.14", "require warden 1.+14",
                                                    "require warden 1.1400000"])))
+    elif rng.random() < 0.35:
+        lines.append("require warden 1.24")             # v1.24: host names take effect
     wide = rng.random() < 0.15          # many distinct flag bits: reach the bound
     strings = rng.random() < 0.65       # use v1.14 matchers in this policy
     prior = []
+    late_require = not valid and rng.random() < 0.1
     for _ in range(rng.randint(1, 12)):
+        if late_require and rng.random() < 0.3:
+            lines.append("require warden 1.24")    # after a host name: refused
         for _try in range(30):
             got = fuzz_line(rng, prior, strings, wide)
             line = got if isinstance(got, str) else got[0]

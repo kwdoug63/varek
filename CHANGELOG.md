@@ -10,6 +10,22 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Added
+- v1.24.0, in progress (host names without agent DNS,
+  `docs/security/v1.21-stage2-host-names.md`), sections 1 and 2:
+  - Policy grammar: `allow host api.example.com[:port]` and `deny host <name>`
+    after `require warden 1.24`, in the decision procedure, the certificate
+    checker and the cross-check oracle; malformed names, wildcards (v1.25) and
+    a `require warden 1.24` after a host name are refused at load. Without the
+    directive a name keeps its v1.21 meaning. The policy-grammar version is
+    1.24. No connect matches a name rule yet (section 4).
+  - The resolution table (`warden_resolve.c`): the Warden resolves every
+    allowed name before the agent runs and refreshes each at its TTL (clamped,
+    `--dns-ttl-min` / `--dns-ttl-max`) in a resolver helper process, keeps a
+    dropped address for a grace period (`--dns-grace-max`), and writes each
+    result as a chained `resolution` record. `--check-startup` reports names
+    that do not resolve.
+  - Tests: `make test-v1240` (grammar in both parsers, the table against a
+    local test DNS server, the Warden run as root); CI runs it.
 - Network roadmap designs: `docs/security/v1.25-wildcard-host-names.md`
   (opt-in wildcard host names, v1.25.0) and `docs/security/v1.26-egress-proxy.md`
   (the egress proxy, v1.26.0, previously "v1.21 stage 3"). The v1.24.0 host-name
