@@ -204,7 +204,9 @@ else
                   ' "blocked.example.com": {"ttl": 30, "a": ["127.0.0.1"]}}' > "$OUT/zone.json"
     # where the clients live (each prefix is allowed read-only)
     NODE=$(readlink -f "$(command -v node 2>/dev/null)" 2>/dev/null)
-    JAVA=$(readlink -f "$(command -v java 2>/dev/null)" 2>/dev/null)
+    # the distribution's OpenJDK when it is there (CI installs it), else java on PATH
+    JAVA=$(ls /usr/lib/jvm/java-21-openjdk-*/bin/java 2>/dev/null | head -1)
+    [ -n "$JAVA" ] || JAVA=$(readlink -f "$(command -v java 2>/dev/null)" 2>/dev/null)
     PREFIXES="/usr/ /lib /etc/ssl/ /proc/ /sys/ $W/"
     [ -n "$NODE" ] && PREFIXES="$PREFIXES $(dirname "$(dirname "$NODE")")/"
     [ -n "$JAVA" ] && PREFIXES="$PREFIXES $(dirname "$(dirname "$JAVA")")/ /etc/java-21-openjdk/ /etc/java-17-openjdk/"

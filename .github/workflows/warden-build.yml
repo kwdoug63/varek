@@ -27,6 +27,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libseccomp-dev libsodium-dev
+          # v1.24: test_v1240.sh runs a Java client as the agent, with the
+          # distribution's OpenJDK (the runner's preinstalled JDKs differ)
+          sudo apt-get install -y openjdk-21-jdk-headless
       - name: Build the Warden and its tools
         run: make -C varek/v1_4 all
       - name: Check the deployment scripts parse
