@@ -14,7 +14,7 @@
 # Default URLs, one per content network (check them with --hours 0.05 first):
 #   https://pypi.org/robots.txt                     Fastly
 #   https://www.cloudflare.com/cdn-cgi/trace        Cloudflare
-#   https://d1.awsstatic.com/robots.txt             CloudFront
+#   https://aws.amazon.com/robots.txt             CloudFront
 # A URL whose responses do not show the expected network's headers fails the
 # check, so a target that moved to another network is noticed.
 #
@@ -40,7 +40,7 @@ while [ $# -gt 0 ]; do
 done
 [ ${#URLS[@]} -gt 0 ] || URLS=("https://pypi.org/robots.txt=fastly"
                                "https://www.cloudflare.com/cdn-cgi/trace=cloudflare"
-                               "https://d1.awsstatic.com/robots.txt=cloudfront")
+                               "https://aws.amazon.com/robots.txt=cloudfront")
 [ "$(id -u)" = 0 ] || { echo "soak.sh: run as root (the Warden needs CAP_SYS_ADMIN)"; exit 2; }
 for b in warden tools/vdp_cert_check; do
     [ -x "$V14/$b" ] || { echo "soak.sh: build first: make -C $V14 all"; exit 2; }
