@@ -17,6 +17,11 @@
 //       Read hex strings ('=' for the empty string) from stdin, one per line;
 //       write one line of '0'/'1' per string, one character per rule: does
 //       that rule's constant match, by the checker's own matchers (testing).
+//   vdp_cert_check <policy> kinds
+//       v1.24: one line, one character per rule: p (path), h (host) or e
+//       (exec), by the checker's own parse (varek_audit.py uses it with holds
+//       to confirm that no earlier host rule holds on a connect's other
+//       candidates).
 //   vdp_cert_check <policy> openable
 //       v1.16.1: read absolute paths from stdin, one per line. For each, print
 //       "openable <path>" if some open(2) flags value of an open of that path
@@ -165,8 +170,9 @@ static int canon_for_open(const char *p, char out[PATH_MAX], int depth) {
 
 int main(int argc, char **argv) {
     if (argc != 3 || (strcmp(argv[2], "digest") && strcmp(argv[2], "batch") &&
-                      strcmp(argv[2], "holds") && strcmp(argv[2], "openable"))) {
-        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable\n", argv[0]);
+                      strcmp(argv[2], "holds") && strcmp(argv[2], "openable") &&
+                      strcmp(argv[2], "kinds"))) {
+        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds\n", argv[0]);
         return 2;
     }
     FILE *f = fopen(argv[1], "rb");
@@ -197,6 +203,17 @@ int main(int argc, char **argv) {
         char hex[65];
         vdpc_digest_hex(&pol, hex);
         printf("%s\n", hex);
+        vdpc_free(&pol);
+        return 0;
+    }
+
+    if (!strcmp(argv[2], "kinds")) {
+        for (size_t i = 0; i < pol.n; i++) {
+            vdpc_rule_info_t ri;
+            vdpc_rule_info(&pol, i, &ri);
+            putchar(ri.kind == VDPC_PATH ? 'p' : ri.kind == VDPC_HOST ? 'h' : 'e');
+        }
+        putchar('\n');
         vdpc_free(&pol);
         return 0;
     }

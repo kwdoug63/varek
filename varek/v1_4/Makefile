@@ -32,7 +32,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 crosscheck harness video-v112
+.PHONY: all deps deps-check preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -62,16 +62,20 @@ preflight:
 
 CHECKER := checker/vdp_checker.c checker/vdp_checker.h
 
-warden: warden.c warden_net.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
+# v1.24: the resolution table (warden_resolve.c) runs a resolver thread and
+# uses the host's resolver library.
+RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c
+
+warden: warden.c warden_net.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS)
+	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
 
 # v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
 # ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that
 # the certificate checker refuses the wrong verdict. Never deploy it.
-warden_faultinject: warden.c warden_net.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
+warden_faultinject: warden.c warden_net.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
-	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS)
+	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
 
 # v1.15: command-line front end to the certificate checker (policy digest,
 # batch certificate checks). Links the checker only, never smt_decide.c.
@@ -311,6 +315,17 @@ test-v1210: warden tools/vdp_check tools/vdp_cert_check tests/v1210_probe tests/
 test-v1162: warden tools/vdp_cert_check tools/varek_keygen tests/v1160_probe
 	@sudo ./tests/test_v1162.sh ./warden ./tools/varek_keygen $(abspath tests/v1160_probe)
 
+# v1.24.0 (in progress): host names. The policy grammar in both parsers, the
+# resolution table against a local test DNS server, and (as root) the Warden
+# resolving a policy's names before and while the agent runs. Sections 1 and 2
+# need no root (CI runs them); section 3 is skipped without it.
+tests/test_v1240_resolve: tests/test_v1240_resolve.c $(RESOLVE)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_v1240_resolve.c warden_resolve.c -lresolv
+
+test-v1240: warden tools/vdp_check tools/vdp_cert_check tests/test_v1240_resolve
+	@./tests/test_v1240.sh ./tools/vdp_check ./tools/vdp_cert_check ./tests/test_v1240_resolve \
+	    $(if $(filter 0,$(shell id -u)),./warden)
+
 # Differential check of the decision procedure against an off-the-shelf SMT
 # solver (tools/requirements-crosscheck.txt) and,
 # for suffix / contains / glob reachability, a derivative-based oracle. These
@@ -346,7 +361,7 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve
 
 # v1.22: install the runtime and the `varek` command.
 #   sudo make install                  -> /opt/varek, plus /usr/local/bin/varek

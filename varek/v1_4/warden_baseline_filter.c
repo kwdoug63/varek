@@ -134,6 +134,8 @@ static const char *kAdmit[] = {
 // MEDIATE -> NOTIFY: exactly what supervise()/derive_intent() handles.
 static const char *kMediate[] = {
     "openat", "connect", "execve", "execveat",
+    // v1.24: the legacy open(2) (musl), decided as openat(AT_FDCWD, ...).
+    "open",
     // v1.12: egress-capable datagram/message sends. Routed to the supervisor
     // so a send carrying an inet destination was refused, like every connect
     // then (the deny-only posture of v1.9.1 to v1.20.0), closing the

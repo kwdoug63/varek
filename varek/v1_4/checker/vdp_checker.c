@@ -134,6 +134,8 @@ struct vdpc_rule {
     bool     fixed;
     uint32_t mask, value;             /* flag atom (f & mask) == value */
     int      line;
+    bool     portless;                /* host: no port, so every port matches */
+    bool     name;                    /* host (v1.24): a host name rule */
 };
 
 void vdpc_free(vdpc_policy_t *p) {
@@ -311,9 +313,59 @@ static bool parse_ver(const char *s, int *maj, int *mn) {
 
 static bool ver_ge(int a, int b, int c, int d) { return a > c || (a == c && b >= d); }
 
+static bool ipv4_quad(const char *c, size_t n);
+
+/* v1.24: a host constant in name form (written independently of
+ * smt_decide.c's vdp_host_name_form, which documents the form). 0: a numeric
+ * form ('[', "unix:", or only digits and dots before the first ':'), 1: a
+ * valid name constant, -1: in name form but not a valid name. */
+static int host_name_form(const char *c, size_t n, const char **why) {
+    if (n > 0 && c[0] == '[') return 0;
+    if (n >= 5 && memcmp(c, "unix:", 5) == 0) return 0;
+    size_t h = 0;
+    bool only_num = true;
+    while (h < n && c[h] != ':') {
+        if (c[h] != '.' && (c[h] < '0' || c[h] > '9')) only_num = false;
+        h++;
+    }
+    if (only_num) return 0;
+    if (memchr(c, '*', h)) { *why = "wildcard host name"; return -1; }
+    if (h > 253) { *why = "host name over 253 bytes"; return -1; }
+    size_t lab = 0;                   /* bytes in the current label */
+    bool lab_digits = true;
+    for (size_t i = 0; i < h; i++) {
+        char ch = c[i];
+        if (ch == '.') {
+            if (lab == 0 || c[i - 1] == '-') { *why = "bad label"; return -1; }
+            lab = 0;
+            lab_digits = true;
+            continue;
+        }
+        bool lower = ch >= 'a' && ch <= 'z', digit = ch >= '0' && ch <= '9';
+        if (!lower && !digit && ch != '-') { *why = "byte not allowed in a host name"; return -1; }
+        if (lab == 0 && ch == '-') { *why = "bad label"; return -1; }
+        if (++lab > 63) { *why = "label over 63 bytes"; return -1; }
+        if (!digit) lab_digits = false;
+    }
+    if (lab == 0 || c[h - 1] == '-') { *why = "bad label"; return -1; }   /* trailing dot or '-' */
+    if (lab_digits) { *why = "last label all digits"; return -1; }
+    if (h == 4 && memcmp(c, "unix", 4) == 0) { *why = "host name unix is reserved"; return -1; }
+    if (h < n) {
+        size_t pl = n - h - 1;
+        unsigned long v = 0;
+        if (pl < 1 || pl > 5 || (pl > 1 && c[h + 1] == '0')) { *why = "bad port"; return -1; }
+        for (size_t i = h + 1; i < n; i++) {
+            if (c[i] < '0' || c[i] > '9') { *why = "bad port"; return -1; }
+            v = v * 10 + (unsigned long)(c[i] - '0');
+        }
+        if (v > 65535) { *why = "bad port"; return -1; }
+    }
+    return 1;
+}
+
 /* One line: tokens (NUL-terminated copies in `line`). Returns -1 on error. */
 static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj, int req_min,
-                      size_t *glob_total, vdpc_rule_t *r, char *err, size_t en) {
+                      int *legacy_name, size_t *glob_total, vdpc_rule_t *r, char *err, size_t en) {
     memset(r, 0, sizeof *r);
     r->line = ln;
     if (!strcmp(tok[0], "allow")) r->allow = true;
@@ -350,6 +402,24 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
     if (!r->c) return fail(err, en, name, ln, "out of memory");
     memcpy(r->c, c, cl + 1);
     r->clen = cl;
+    if (r->kind == VDPC_HOST) {
+        /* v1.24: names only after `require warden 1.24`; before it a constant
+         * in name form is matched exactly, as in v1.21. */
+        const char *why = "";
+        int nf = host_name_form(c, cl, &why);
+        if (nf != 0 && ver_ge(req_maj, req_min, 1, 24)) {
+            if (nf < 0) return fail(err, en, name, ln, "%s", why);
+            r->name = true;
+            r->portless = memchr(c, ':', cl) == NULL;
+        } else {
+            if (nf != 0 && !*legacy_name) *legacy_name = ln;
+            /* v1.21: a dotted-quad IPv4 address, or a bracketed IPv6 address
+             * ("[::1]"), without a port */
+            r->portless = memchr(c, ':', cl) ? (cl >= 2 && c[0] == '[' && c[cl - 1] == ']' &&
+                                                !memchr(c + 1, ']', cl - 2))
+                                             : ipv4_quad(c, cl);
+        }
+    }
     if (r->match == M_GLOB) {
         const char *ge = parse_glob(c, cl, &r->g, &r->ng);
         if (ge) return fail(err, en, name, ln, "%s", ge);
@@ -390,6 +460,7 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
     p->rules = calloc(VDPC_MAX_RULES, sizeof *p->rules);
     if (!p->rules) return fail(err, en, name, 0, "out of memory");
     int req_maj = 0, req_min = 0;
+    int legacy_name = 0;              /* v1.24: line of a host name read before `require warden 1.24` */
     size_t glob_total = 0;
     int ln = 0;
     size_t pos = 0;
@@ -429,13 +500,15 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
                     rc = fail(err, en, name, ln, "bad directive");
                 else if (!ver_ge(VDPC_GRAMMAR_MAJOR, VDPC_GRAMMAR_MINOR, a, b))
                     rc = fail(err, en, name, ln, "policy requires a newer Warden");
+                else if (legacy_name && ver_ge(a, b, 1, 24))
+                    rc = fail(err, en, name, ln, "require warden after a host name it would change");
                 else if (ver_ge(a, b, req_maj, req_min)) { req_maj = a; req_min = b; }
             } else if (nt < 3) {
                 rc = fail(err, en, name, ln, "bad rule");
             } else if (p->n == VDPC_MAX_RULES) {
                 rc = fail(err, en, name, ln, "more than 256 rules");
             } else {
-                rc = parse_rule(name, ln, tok, nt, req_maj, req_min, &glob_total,
+                rc = parse_rule(name, ln, tok, nt, req_maj, req_min, &legacy_name, &glob_total,
                                 &p->rules[p->n], err, en);
                 p->n++;                       /* counted either way: freed below */
             }
@@ -544,14 +617,12 @@ static bool str_holds(const vdpc_rule_t *r, const char *s, size_t sl) {
             return memmem(s, sl, c, cl) != NULL;
         case M_HOST:
             /* v1.21: a constant with no port matches every port: a dotted-quad
-             * IPv4 address, or a bracketed IPv6 address ("[::1]"). Any other
-             * constant matches only itself (so `allow host unix` does not
-             * match unix:<path>). */
+             * IPv4 address, a bracketed IPv6 address ("[::1]"), or (v1.24) a
+             * host name; decided at load (r->portless). Any other constant
+             * matches only itself (so `allow host unix` does not match
+             * unix:<path>). */
             if (sl == cl && memcmp(s, c, cl) == 0) return true;
-            if (!(memchr(c, ':', cl) ? (cl >= 2 && c[0] == '[' && c[cl - 1] == ']' &&
-                                        !memchr(c + 1, ']', cl - 2))
-                                     : ipv4_quad(c, cl)))
-                return false;
+            if (!r->portless) return false;
             return sl > cl && memcmp(s, c, cl) == 0 && s[cl] == ':';
         case M_GLOB:
             if (sl < r->minlen || (r->fixed && sl != r->minlen)) return false;
@@ -577,6 +648,8 @@ int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *o) {
     o->clen = r->clen;
     o->mask = r->mask;
     o->value = r->value;
+    o->portless = r->portless;
+    o->name = r->name;
     return 0;
 }
 

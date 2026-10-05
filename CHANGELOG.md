@@ -10,6 +10,48 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Added
+- v1.24.0, in progress (host names without agent DNS,
+  `docs/security/v1.21-stage2-host-names.md`), sections 1 and 2:
+  - Policy grammar: `allow host api.example.com[:port]` and `deny host <name>`
+    after `require warden 1.24`, in the decision procedure, the certificate
+    checker and the cross-check oracle; malformed names, wildcards (v1.25) and
+    a `require warden 1.24` after a host name are refused at load. Without the
+    directive a name keeps its v1.21 meaning. The policy-grammar version is
+    1.24. No connect matches a name rule yet (section 4).
+  - The resolution table (`warden_resolve.c`): the Warden resolves every
+    allowed name before the agent runs and refreshes each at its TTL (clamped,
+    `--dns-ttl-min` / `--dns-ttl-max`) in a resolver helper process, keeps a
+    dropped address for a grace period (`--dns-grace-max`), and writes each
+    result as a chained `resolution` record. `--check-startup` reports names
+    that do not resolve.
+  - Sections 3 and 4 (`warden_names.inc.c`): while the policy has a host name
+    rule, the agent's opens of `/etc/hosts`, `/etc/resolv.conf` and
+    `/etc/nsswitch.conf` get the Warden's views (only the allowed names; no
+    reachable nameserver; `hosts: files`), every connect to port 53 is refused,
+    and a connect is decided on its address and the names that resolved to it
+    (the first rule over all of them decides; the checker confirms no earlier
+    rule holds on another). Records carry `dialed`, `candidates` and the table
+    generation; `varek_audit.py` checks views, the name-to-address binding
+    against the resolution records, and earlier rules. The plan gate decides
+    `net_connect <name>:<port>` steps on the name.
+  - The legacy `open(2)` is mediated, as `openat(AT_FDCWD, ...)`: a static
+    musl program never calls `openat`, so through v1.23 a musl agent could
+    open no file. The `resolv.conf` view says `timeout:0`, so musl, which
+    queries its nameserver after `/etc/hosts`, gives up at once.
+  - Tests: `make test-v1240` (grammar in both parsers, the table against a
+    local test DNS server, and as root the Warden with Python, curl, Node, a
+    static musl client, Go and Java as the agent); CI runs it. It fails 81 of
+    its 88 checks against v1.23.1.
+  - `tests/soak_v1240/`: the 24-hour soak test against Fastly-, Cloudflare-
+    and CloudFront-hosted APIs (`soak.sh`, an agent, and a checker for the
+    design's section 5), to run on a host with outbound HTTPS.
+  - `RELEASE-v1.24.0.md`: draft release notes; the soak results, latency and
+    review findings are pending.
+- `docs/security/v1.27-program-launches.md`: the design for decided program
+  launches (a Landlock execute ruleset built from the policy's `allow exec`
+  rules, the Warden deciding and recording each launch, an identity check
+  after it). Its version, v1.27.0 or v1.25.0, depends on whether the first
+  buyers' agents are API-calling or coding agents.
 - Network roadmap designs: `docs/security/v1.25-wildcard-host-names.md`
   (opt-in wildcard host names, v1.25.0) and `docs/security/v1.26-egress-proxy.md`
   (the egress proxy, v1.26.0, previously "v1.21 stage 3"). The v1.24.0 host-name

@@ -229,6 +229,12 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             if event == "plan_gate" and run is not None and rec.get("run") == run \
                     and meta is not None:
                 meta["plan_gate"] = rec
+            # v1.24: this run's resolution records, each with the number of
+            # decision records before it (varek_audit.py checks a connect
+            # decided on a name against the resolutions it relied on).
+            if event == "resolution" and run is not None and rec.get("run") == run \
+                    and meta is not None:
+                meta.setdefault("resolutions", []).append((len(records), rec))
             continue
         if run is None:
             fail(lineno, "record before run_start (a pre-v1.12.1 log, or not a "

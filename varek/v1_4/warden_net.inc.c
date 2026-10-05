@@ -666,7 +666,34 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
         return;
     }
 
-    decision_t d_raw = policy_decide(p, a);
+    /* v1.24: while the policy has a host name rule, no connect reaches any
+     * DNS server (the agent resolves only through the Warden's views), and a
+     * destination is decided on its address and the names it belongs to
+     * (warden_names.inc.c). */
+    if (fam != AF_UNIX) {
+        const void *ad;
+        unsigned port;
+        if (dial.ss_family == AF_INET6) {
+            const struct sockaddr_in6 *d6 = (const struct sockaddr_in6 *)&dial;
+            ad = &d6->sin6_addr;
+            port = ntohs(d6->sin6_port);
+        } else {
+            const struct sockaddr_in *d4 = (const struct sockaddr_in *)&dial;
+            ad = &d4->sin_addr;
+            port = ntohs(d4->sin_port);
+        }
+        rule = NULL;
+        if (g_any_name && port == 53) rule = "dns_refused";
+        else if (names_candidates(a, dial.ss_family, ad, port) < 0) rule = "too_many_names";
+        if (rule) {
+            close(ag);
+            net_record(tid, a, DEC_DENY, DEC_DENY, rule, t0, EACCES);
+            send_simple(notify_fd, req->id, DEC_DENY);
+            return;
+        }
+    }
+    decision_t d_raw = names_decide(p, a);
+    names_record_fields(a);
     decision_t d_final = d_raw == DEC_ALLOW ? DEC_ALLOW : DEC_DENY;
     bool cert_refused = false;
     if (d_final == DEC_ALLOW && !certify(p, a)) {
@@ -1162,12 +1189,21 @@ static int pend_timeout_ms(void) {
 
 /* The destination a plan's net_connect step names, in the spelling the
  * runtime decides on: a.b.c.d:port, [IPv6]:port (an IPv4-mapped address as
- * its IPv4 form), or unix:<lexically canonical absolute path>. A host name
- * cannot be decided before the agent runs (the runtime decides on the address
- * it dials; names are v1.21 stage 2), so it is refused with the reason.
- * Returns 0, or -1 with why filled. */
+ * its IPv4 form), or unix:<lexically canonical absolute path>. v1.24: when
+ * the policy has host name rules, also name:port (a valid name, as the policy
+ * grammar has it), decided on the name without resolving it: the step is a
+ * declaration, and the runtime decides the address it dials. Without name
+ * rules a name cannot be decided before the agent runs, so it is refused with
+ * the reason. Returns 0, or -1 with why filled. */
 static int net_plan_canon(const char *in, char *out, size_t n, char *why, size_t wn) {
     if (!in) { snprintf(why, wn, "no target"); return -1; }
+    if (g_any_name && strchr(in, ':')) {
+        char nw[160];
+        if (vdp_host_name_form(in, strlen(in), nw, sizeof nw) == 1) {
+            if ((size_t)snprintf(out, n, "%s", in) >= n) { snprintf(why, wn, "too long"); return -1; }
+            return 0;
+        }
+    }
     if (!strncmp(in, "unix:", 5)) {
         char c[PATH_LIMIT];
         if (plan_lexical_canon(in + 5, c, sizeof c) < 0) {
@@ -1205,6 +1241,7 @@ static int net_plan_canon(const char *in, char *out, size_t n, char *why, size_t
     return 0;
 bad:
     snprintf(why, wn, "not a numeric address with a port (a.b.c.d:port, [IPv6]:port or "
-             "unix:/path); host names are v1.21 stage 2");
+             "unix:/path)%s", g_any_name ? ", or a host name with a port"
+                                         : "; host names need `require warden 1.24` and a host name rule");
     return -1;
 }

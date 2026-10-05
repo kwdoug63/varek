@@ -153,10 +153,11 @@ int main(int argc, char **argv) {
             if (vdp_rule_advisory(&g_pol.rules[i], adv, sizeof adv))
                 printf("%s:%d: note: %s\n", argv[1], g_pol.rules[i].line, adv);
             /* v1.21: a host rule whose constant no connect can produce (a
-             * name, a non-canonical spelling) matches nothing: counted, and
+             * non-canonical spelling, or a v1.24 host name without `require
+             * warden 1.24`) matches nothing: counted, and
              * lint fails, as for a rule that can never fire. */
             if (g_pol.rules[i].kind == VDP_KIND_HOST &&
-                !vdp_host_constant_ok(g_pol.rules[i].s.c, g_pol.rules[i].s.len, hw, sizeof hw))
+                !vdp_host_rule_ok(&g_pol.rules[i], hw, sizeof hw))
                 hostnever++;
             vdp_reach_t rr = vdp_rule_reachable(&g_pol, i);
             if (rr == VDP_DEAD) {

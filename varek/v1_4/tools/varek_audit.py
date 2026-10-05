@@ -32,6 +32,15 @@ policy file alone:
      the certificate checker (tools/vdp_cert_check, the same small program the
      Warden runs; it shares no code with the decision procedure).
   5. A stream from the test-only fault-injected Warden is refused.
+  6. v1.24, host names: a view the Warden served for /etc/hosts,
+     /etc/resolv.conf or /etc/nsswitch.conf (no file opened, so no
+     certificate) is accepted only for that path, a read-only open, in a run
+     whose policy has host name rules. A connect decided with the resolution
+     table must name every candidate it was decided over: each name bound to
+     the address dialed by the latest resolution record before it (current, or
+     in grace), every name such a record binds to that address present, and no
+     host rule before the deciding one holding on any other candidate (the
+     checker's own matchers).
 
 Exit 0 only if all of these hold. The verdict stream is the Warden's stderr
 (`warden policy -- agent 2> verdicts.log`). The report's "integrity" line says
@@ -68,6 +77,68 @@ META_RULES = ("metadata_answered", "metadata_not_found", "metadata_failed")
 CONNECT_RULES = ("dialed_fd_injection", "dialed_in_progress", "dial_failed",
                  "injection_failed", "requester_gone", "already_connected",
                  "socket_option_failed", "too_many_pending", "dialed_descriptor_replaced")
+# v1.24: while a policy has host name rules, a read-only open of these paths is
+# answered with a view the Warden wrote (no file is opened, so there is no
+# certificate): rule -> the path it answers.
+VIEW_RULES = {"hosts_view": "/etc/hosts", "resolv_view": "/etc/resolv.conf",
+              "nsswitch_view": "/etc/nsswitch.conf"}
+O_CREAT, O_TRUNC = 0o100, 0o1000
+
+
+def _addr_of(dest):
+    """The address part of a numeric destination: a.b.c.d:port -> a.b.c.d,
+    [IPv6]:port -> IPv6."""
+    host = dest.rsplit(":", 1)[0]
+    return host[1:-1] if host.startswith("[") else host
+
+
+def check_names(rec, pos, resolutions, problems):
+    """v1.24: a connect decided with the resolution table. Its candidates are
+    the address dialed and name:port for each name that address belonged to;
+    each name must be bound to the address by the latest resolution record
+    before this record (current, or within its grace), and every name whose
+    latest record lists the address must be a candidate. Returns the
+    candidates other than the one decided on (for the earlier-rule check)."""
+    seq = rec.get("seq")
+    cands, dialed, res = rec.get("candidates"), rec.get("dialed"), rec.get("resolved")
+    if not (isinstance(cands, list) and cands and all(isinstance(c, str) for c in cands)
+            and isinstance(dialed, str) and cands[0] == dialed and res in cands):
+        problems.append(f"seq {seq}: a connect's candidates, dialed address and decided "
+                        f"destination do not agree")
+        return []
+    addr, port = _addr_of(dialed), dialed.rsplit(":", 1)[-1]
+    ts = rec.get("timestamp_ns")
+    latest = {}
+    for p, r in resolutions:
+        if p > pos:
+            break
+        if isinstance(r.get("name"), str):
+            latest[r["name"]] = r
+    named = set()
+    for c in cands[1:]:
+        name, _, cport = c.rpartition(":")
+        named.add(name)
+        if cport != port:
+            problems.append(f"seq {seq}: candidate {c!r} has another port than {dialed!r}")
+            continue
+        r = latest.get(name)
+        if r is None:
+            problems.append(f"seq {seq}: candidate {c!r}: no resolution of {name} before it")
+            continue
+        ok = addr in (r.get("addresses") or [])
+        for g in r.get("grace") or []:
+            if isinstance(g, dict) and g.get("address") == addr and isinstance(g.get("until_s"), int) \
+                    and isinstance(ts, int) and isinstance(r.get("timestamp_ns"), int) \
+                    and ts <= r["timestamp_ns"] + g["until_s"] * 10**9:
+                ok = True
+        if not ok:
+            problems.append(f"seq {seq}: candidate {c!r}: {name} did not resolve to {addr} "
+                            f"(by its resolution records)")
+    for name, r in latest.items():
+        if addr in (r.get("addresses") or []) and name not in named:
+            problems.append(f"seq {seq}: {name} resolved to {addr} but is not a candidate: the "
+                            f"connect was not decided on every name of its address")
+    return [c for c in cands if c != res]
 
 
 def policy_ancestors(path):
@@ -426,10 +497,13 @@ def main(argv=None):
         problems.append(f"the policy file hashes to {digest}, the Warden ran with {recorded}")
 
     lines, which = [], []
-    authorized = refused = lookups = connects = 0
+    authorized = refused = lookups = connects = views = 0
+    resolutions = meta.get("resolutions", [])
+    names_policy = meta.get("run_start", {}).get("host_name_rules") is True
+    others = []                          # (rec, decided rule, other candidates)
     ancestors = None
     launches = 0
-    for rec in records:
+    for pos, rec in enumerate(records):
         allowed = rec.get("decision_final") == "ALLOW" or rec.get("kernel_verdict") == "ALLOW"
         if not allowed:
             if rec.get("rule") == "certificate_refused":
@@ -452,6 +526,25 @@ def main(argv=None):
                 problems.append(f"seq {rec.get('seq')}: a lookup answered as a directory the "
                                 f"policy leads to, but it asked for more than a read")
             lookups += 1
+            continue
+        if rec.get("action") == "file.open" and rec.get("rule") in VIEW_RULES:
+            fl = rec.get("open_flags")
+            try:
+                flv = int(fl, 16)
+            except (TypeError, ValueError):
+                flv = -1
+            if not names_policy:
+                problems.append(f"seq {rec.get('seq')}: a view answered, but run_start says the "
+                                f"policy has no host name rules")
+            elif rec.get("resolved") != VIEW_RULES[rec["rule"]]:
+                problems.append(f"seq {rec.get('seq')}: a {rec['rule']} answered an open of "
+                                f"{rec.get('resolved')!r}")
+            elif flv < 0 or flv & 3 or flv & (O_CREAT | O_TRUNC):
+                problems.append(f"seq {rec.get('seq')}: a view answered an open that does not "
+                                f"only read ({fl})")
+            elif not isinstance(rec.get("view_generation"), int):
+                problems.append(f"seq {rec.get('seq')}: a view without its generation")
+            views += 1
             continue
         is_open = rec.get("action") == "file.open" and rec.get("rule") in AUTHORIZED_OPEN_RULES
         is_meta = rec.get("action") in META_ACTIONS and rec.get("rule") in META_RULES
@@ -492,6 +585,8 @@ def main(argv=None):
             continue
         lines.append(f"{'host' if is_conn else 'path'} {fl} {hx} {cr} {cw}")
         which.append(rec)
+        if is_conn and "candidates" in rec:
+            others.append((rec, cr, check_names(rec, pos, resolutions, problems)))
 
     checked = 0
     if lines and not problems:
@@ -509,9 +604,34 @@ def main(argv=None):
                     problems.append(f"seq {rec.get('seq')}: certificate for {rec.get('resolved')!r} "
                                     f"refused: {o.get('why')}")
 
+    # v1.24: no earlier host rule holds on any other candidate of a connect
+    # decided with names (the checker's own parse and matchers).
+    if others and not problems:
+        k = subprocess.run([a.checker, a.policy, "kinds"], capture_output=True, text=True)
+        kinds = k.stdout.strip() if k.returncode == 0 else ""
+        strs = [c for _, _, oc in others for c in oc]
+        if not kinds:
+            problems.append(f"checker failed: {k.stderr.strip()}")
+        elif strs:
+            h = subprocess.run([a.checker, a.policy, "holds"],
+                               input="\n".join(c.encode().hex() or "=" for c in strs) + "\n",
+                               capture_output=True, text=True)
+            rows = h.stdout.split()
+            if h.returncode != 0 or len(rows) != len(strs):
+                problems.append(f"checker failed: {h.stderr.strip()}")
+            else:
+                it = iter(rows)
+                for rec, cr, oc in others:
+                    for c in oc:
+                        row = next(it)
+                        early = [i for i in range(min(cr, len(row))) if kinds[i] == "h" and row[i] == "1"]
+                        if early:
+                            problems.append(f"seq {rec.get('seq')}: rule {early[0]} holds on candidate "
+                                            f"{c!r}, before the rule that decided the connect")
     print(f"varek_audit: run {run} (Warden {warden}, {'complete' if complete else 'INCOMPLETE'}), "
           f"{len(records)} records, {authorized} authorized file opens, {lookups} lookups, "
           f"{connects} authorized connects, "
+          f"{views} host-name views, "
           f"{checked} certificates "
           f"re-checked, {refused} refused in-line")
     print(f"varek_audit: integrity: {integrity}")

@@ -131,6 +131,7 @@
 #include "smt_decide.h"            /* v1.13 SMT decision procedure */
 #include "checker/vdp_checker.h"   /* v1.15 independent certificate checker */
 #include "warden_lifecycle.h"   /* v1.9.3 supervisor/target lifecycle coupling */
+#include "warden_resolve.h"     /* v1.24 resolution table for host name rules */
 
 /* Kernel/libc compatibility shims --------------------------------- */
 #ifndef __NR_openat2
@@ -252,6 +253,11 @@ struct action {
     int           access_mode;          /* F_OK/R_OK/W_OK/X_OK */
     bool          path_null;            /* a NULL path pointer */
     bool          bad_flags;            /* flags the kernel would refuse (EINVAL) */
+    /* v1.24: host names (warden_names.inc.c) */
+    int           ncand;                /* connect: candidate strings decided over */
+    char          cand[16][WR_NAME_MAX + 8];
+    char          dialed[64];           /* connect: the numeric destination dialed */
+    char          extra[4608];          /* extra record fields, trusted text, each ending in ',' */
 };
 
 static const char *action_kind_name(action_kind_t k) {
@@ -327,8 +333,9 @@ static int policy_load(const char *path, struct policy *p) {
                 "certificate checker %zu; refusing to start\n", path, p->v.n, p->c.n);
         return -1;
     }
-    /* Rule by rule, the two parses must agree: verb, kind, matcher, constant
-     * and flag clause. (A divergence could only cause denials, since an
+    /* Rule by rule, the two parses must agree: verb, kind, matcher, constant,
+     * flag clause, and (v1.24) whether a host rule is a name and matches every
+     * port. (A divergence could only cause denials, since an
      * authorization needs both; this makes it fail loudly at startup.) */
     for (size_t i = 0; i < p->v.n; i++) {
         const vdp_rule_t *r = &p->v.rules[i];
@@ -344,7 +351,8 @@ static int policy_load(const char *path, struct policy *p) {
         if (vdpc_rule_info(&p->c, i, &ci) < 0 || ci.allow != (r->verb == VDP_ALLOW) ||
             ci.kind != kind_to_c[r->kind] || ci.match != op_to_match[r->s.op] ||
             ci.clen != r->s.len || memcmp(ci.c, r->s.c, r->s.len) != 0 ||
-            ci.mask != r->b.mask || ci.value != r->b.value || ci.line != r->line) {
+            ci.mask != r->b.mask || ci.value != r->b.value || ci.line != r->line ||
+            ci.portless != r->s.portless || ci.name != r->s.name) {
             fprintf(stderr, "[warden] policy %s:%d: the decision procedure and the certificate "
                     "checker read this rule differently; refusing to start\n", path, r->line);
             return -1;
@@ -375,13 +383,13 @@ static int policy_load(const char *path, struct policy *p) {
                     vdp_reach_unknown_text());
         }
     }
-    /* v1.21: host rules no connect can match (names, non-canonical spellings;
-     * each got a note above). */
+    /* v1.21: host rules no connect can match (non-canonical spellings, and
+     * v1.24 host names without `require warden 1.24`; each got a note above). */
     size_t hostnever = 0;
     for (size_t i = 0; i < p->v.n; i++) {
         char hw[160];
         if (p->v.rules[i].kind == VDP_KIND_HOST &&
-            !vdp_host_constant_ok(p->v.rules[i].s.c, p->v.rules[i].s.len, hw, sizeof hw))
+            !vdp_host_rule_ok(&p->v.rules[i], hw, sizeof hw))
             hostnever++;
     }
     fprintf(stderr, "[warden] loaded policy %s v%s with %zu rules (%zu can never fire%s), "
@@ -502,6 +510,22 @@ static int derive_intent(const struct seccomp_notif *req,
         out->open_flags = (int)req->data.args[2];
         out->flags_known = true;
         out->open_mode  = (int)(req->data.args[3] & 0777);
+        return 0;
+    }
+    /* v1.24: the legacy open(2), which musl uses (a static musl program never
+     * calls openat), is open relative to the working directory: decided and
+     * answered exactly as openat(AT_FDCWD, path, flags, mode). Through v1.23 it
+     * fell to the filter's default deny, so a musl agent could open nothing. */
+    if (nr == __NR_open) {
+        out->kind = ACT_FILE_OPEN;
+        if (xproc_read_str(req->pid, req->data.args[0],
+                           out->target, sizeof(out->target)) < 0)
+            return -1;
+        out->open_dirfd = VAREK_AT_FDCWD;
+        out->resolved[0] = '\0';
+        out->open_flags = (int)req->data.args[1];
+        out->flags_known = true;
+        out->open_mode  = (int)(req->data.args[2] & 0777);
         return 0;
     }
     if (nr == __NR_connect) {
@@ -872,6 +896,23 @@ static bool certify(const struct policy *p, struct action *a) {
             if (*q == '"' || *q == '\\' || (unsigned char)*q < 0x20) *q = '\'';
         return false;
     }
+    /* v1.24: a connect decided over several candidates (the address and the
+     * names it belongs to): the checker also confirms, with its own matchers,
+     * that no earlier host rule holds on any other candidate. */
+    if (a->kind == ACT_NET_CONNECT && a->ncand > 1) {
+        for (int c = 0; c < a->ncand; c++) {
+            if (!strcmp(a->cand[c], s)) continue;
+            for (int i = 0; i < cc.r; i++) {
+                vdpc_rule_info_t ri;
+                if (vdpc_rule_info(&p->c, (size_t)i, &ri) < 0 || ri.kind != VDPC_HOST) continue;
+                if (vdpc_holds(&p->c, (size_t)i, a->cand[c], strlen(a->cand[c])) == 1) {
+                    snprintf(a->check_why, sizeof a->check_why,
+                             "an earlier rule (line %d) holds on another candidate", ri.line);
+                    return false;
+                }
+            }
+        }
+    }
     a->certified = true;
     return true;
 }
@@ -1222,6 +1263,9 @@ static FILE *g_log = NULL;
  * tools/varek_cyclonedx.py verifies all three and refuses to attest a stream
  * that fails any of them. */
 static char     g_run_id[33];
+static wr_table_t g_names;           /* v1.24: the resolution table (see names_setup) */
+static bool       g_names_on = false;
+static bool       g_any_name = false;  /* v1.24: the policy has a host name rule (allow or deny) */
 static uint64_t g_records = 0;       /* decision records emitted */
 static bool     g_relay_midline = false;
 
@@ -1481,8 +1525,70 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     if (checkpoints_on())
         fprintf(f, "\"checkpoint_every\":%" PRIu64 ",", g_ckpt_every);
     if (g_anchor_fd >= 0) fputs("\"anchored\":true,", f);
+    /* v1.24: the names the Warden resolves (each gets a resolution record). */
+    if (g_any_name) fputs("\"host_name_rules\":true,", f);
+    if (g_names_on) fprintf(f, "\"host_names\":%zu,\"resolver\":\"%s\",", g_names.n, g_names.resolver);
     fprintf(f, "\"timestamp_ns\":%lld}\n", (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end("run_start");
+}
+
+/* ---- v1.24: host names (docs/security/v1.21-stage2-host-names.md) ----
+ * The Warden resolves every name an allow rule names, itself, and keeps what
+ * each resolved to (warden_resolve.c). Every result is a chained record. */
+/* Build the table from the policy's allow name rules. 0, or -1. */
+static int names_setup(const struct policy *p, const wr_config_t *cfg) {
+    char why[160];
+    if (wr_table_init(&g_names, cfg, why, sizeof why) < 0) {
+        fprintf(stderr, "[warden] %s\n", why);
+        return -1;
+    }
+    for (size_t i = 0; i < p->v.n; i++) {
+        const vdp_rule_t *r = &p->v.rules[i];
+        if (r->kind == VDP_KIND_HOST && r->s.name) g_any_name = true;
+        if (r->kind != VDP_KIND_HOST || !r->s.name || r->verb != VDP_ALLOW) continue;
+        char name[WR_NAME_MAX + 1];
+        const char *colon = memchr(r->s.c, ':', r->s.len);
+        size_t nl = colon ? (size_t)(colon - r->s.c) : r->s.len;
+        if (nl > WR_NAME_MAX) return -1;            /* both parsers refuse it */
+        memcpy(name, r->s.c, nl);
+        name[nl] = '\0';
+        if (wr_table_add(&g_names, name) < 0) {
+            fprintf(stderr, "[warden] out of memory for the resolution table\n");
+            return -1;
+        }
+    }
+    g_names_on = g_names.n > 0;
+    return 0;
+}
+
+static void emit_resolution(void *ctx, size_t i, const wr_result_t *r) {
+    (void)ctx;
+    FILE *f = rec_begin();
+    wr_format_record(f, g_run_id, &g_names, i, r, wr_now_ms());
+    rec_end(NULL);
+}
+
+/* Resolve every name before the agent runs. A name that does not resolve is
+ * reported and retried; it does not stop the Warden. With record false (the
+ * startup checks) nothing is written to the verdict stream. */
+static void names_resolve_all(bool record) {
+    for (size_t i = 0; i < g_names.n; i++) {
+        wr_result_t r;
+        wr_lookup(&g_names, g_names.e[i].name, &r);
+        wr_apply(&g_names, i, &r, wr_now_ms());
+        if (record) emit_resolution(NULL, i, &r);
+        size_t cur = 0;
+        for (size_t k = 0; k < g_names.e[i].n; k++) if (g_names.e[i].addrs[k].until_ms == 0) cur++;
+        if (cur == 0)
+            fprintf(stderr, "[warden] host name %s did not resolve (A %s, AAAA %s); the agent "
+                    "cannot reach it until it does; retrying every %u s\n", g_names.e[i].name,
+                    r.st[0] == WR_ST_NXDOMAIN ? "nxdomain" : r.st[0] == WR_ST_NODATA ? "nodata" : "failed",
+                    r.st[1] == WR_ST_NXDOMAIN ? "nxdomain" : r.st[1] == WR_ST_NODATA ? "nodata" : "failed",
+                    g_names.cfg.ttl_min);
+        else if (!record)
+            fprintf(stderr, "[warden] host name %s resolves to %zu address%s\n",
+                    g_names.e[i].name, cur, cur == 1 ? "" : "es");
+    }
 }
 
 static void emit_run_end(int exit_status) {
@@ -1571,7 +1677,7 @@ static void emit_pathology(uint64_t seq,
         "\"policy_line\":%d,"
         "%s%s%s"
         "%s%s%s%s%s%s"
-        "%s"
+        "%s%s"
         "\"kernel_verdict\":\"%s\","
         "\"errno\":%d,"
         "\"latency_us\":%" PRIu64 ","
@@ -1587,7 +1693,7 @@ static void emit_pathology(uint64_t seq,
         a->cert[0] ? (a->certified ? "\"check\":\"ok\"," : "\"check\":\"refused\",\"check_why\":\"") : "",
         a->cert[0] && !a->certified ? a->check_why : "",
         a->cert[0] && !a->certified ? "\"," : "",
-        net_json,
+        net_json, a->extra,
         /* v1.12.1: an ALLOW whose open then failed (EEXIST, ENXIO, ...)
          * delivered nothing; say so rather than reporting ALLOW.
          * v1.18.0: a refusal names the errno the agent actually received
@@ -2409,6 +2515,7 @@ static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *mi
     return rc;
 }
 
+#include "warden_names.inc.c"        /* v1.24: host-name views and candidates */
 #include "warden_net.inc.c"          /* v1.21: decided connections */
 
 /* ---------------- receive loop ---------------- */
@@ -2432,30 +2539,50 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * negative fd is ignored by poll(). */
         /* v1.21: also on the sockets of connects and sends still being
          * finished for the agent (warden_net.inc.c). */
-        struct pollfd pfds[3 + MAX_PENDING] = {
+        /* v1.24: also on the resolver helper's results. */
+        struct pollfd pfds[4 + MAX_PENDING] = {
             { .fd = notify_fd,    .events = POLLIN },
             { .fd = target_pidfd, .events = POLLIN },
             { .fd = agent_err_fd, .events = POLLIN },
+            { .fd = wr_async_fd(&g_names), .events = POLLIN },
         };
         int npoll = g_npend;
         for (int i = 0; i < npoll; i++) {
-            pfds[3 + i].fd = g_pend[i]->kind == PEND_UNIX_RETRY ? -1 : g_pend[i]->sock;
-            pfds[3 + i].events = POLLOUT;
-            pfds[3 + i].revents = 0;
+            pfds[4 + i].fd = g_pend[i]->kind == PEND_UNIX_RETRY ? -1 : g_pend[i]->sock;
+            pfds[4 + i].events = POLLOUT;
+            pfds[4 + i].revents = 0;
         }
         /* v1.16: checkpoints are written here, between notifications, so
-         * signing never delays an answer the agent is waiting for. */
+         * signing never delays an answer the agent is waiting for. v1.24:
+         * likewise, refreshes are handed to the resolver helper here and
+         * their results applied here; the lookups themselves never run in
+         * the Warden. */
         int to = maybe_checkpoint(), pto = pend_timeout_ms();
         if (pto >= 0 && (to < 0 || pto < to)) to = pto;
-        int pr = poll(pfds, (nfds_t)(3 + npoll), to);
+        if (g_names_on) {
+            wr_async_schedule(&g_names, wr_now_ms());
+            int dto = wr_next_due_ms(&g_names, wr_now_ms());
+            if (dto >= 0 && (to < 0 || dto < to)) to = dto;
+        }
+        int pr = poll(pfds, (nfds_t)(4 + npoll), to);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return false;
         }
         if (npoll > 0) {
             short rev[MAX_PENDING];
-            for (int i = 0; i < npoll; i++) rev[i] = pfds[3 + i].revents;
+            for (int i = 0; i < npoll; i++) rev[i] = pfds[4 + i].revents;
             pend_service(notify_fd, rev, npoll);
+        }
+        if (g_names_on && (pfds[3].revents & (POLLIN | POLLHUP | POLLERR))) {
+            wr_async_collect(&g_names, wr_now_ms(), emit_resolution, NULL);
+            /* v1.24: without the helper the table would go stale; stop
+             * (fail closed: the agent is killed, as for a broken stream). */
+            if (!wr_async_alive(&g_names)) {
+                fprintf(stderr, "[warden] the resolver helper exited; host names can no longer be "
+                        "refreshed, stopping the run\n");
+                return false;
+            }
         }
         if (agent_err_fd >= 0 && (pfds[2].revents & (POLLIN | POLLHUP | POLLERR))) {
             if (relay_agent_stderr(agent_err_fd, false) < 0) agent_err_fd = -1;
@@ -2642,6 +2769,15 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * component, untracked dirfd, over-long path, deleted inode, missing
          * parent) is a hard deny before any policy match. */
         struct resolved_target rt = { .path_fd = -1, .parent_fd = -1 };
+        /* v1.24: /etc/hosts, /etc/resolv.conf and /etc/nsswitch.conf, named
+         * as such, are answered with the Warden's views while the policy has
+         * a host name rule (warden_names.inc.c), whether or not the host has
+         * the file. */
+        if (g_any_name && act.kind == ACT_FILE_OPEN && view_open_readonly(&act) &&
+            view_by_target(act.target) >= 0) {
+            view_serve(notify_fd, &req, &act, p, view_by_target(act.target), &t0);
+            continue;
+        }
         if (act.kind == ACT_FILE_OPEN) {
             if (resolve_target(req.pid, &act, &rt) < 0) {
                 clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -2664,6 +2800,14 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                                + (t1.tv_nsec - t0.tv_nsec);
                 emit_pathology(g_report_seq++, req.pid, &act, DEC_DENY, DEC_DENY, forbid, lat_f, EACCES);
                 send_simple(notify_fd, req.id, DEC_DENY);
+                continue;
+            }
+            /* v1.24: the same views, reached by another spelling (a symlink,
+             * "..", /etc/resolv.conf's own target). */
+            if (g_any_name && view_open_readonly(&act) && view_by_canonical(act.resolved) >= 0) {
+                int v = view_by_canonical(act.resolved);
+                resolved_target_close(&rt);
+                view_serve(notify_fd, &req, &act, p, v, &t0);
                 continue;
             }
         }
@@ -3655,6 +3799,8 @@ static void usage(const char *argv0) {
         "              [--session <id>] [--breaker-state <file>] [--gate-status <file>]]]\n"
         "              [--sign-key <key>]\n"
         "              [--anchor <path>] [--checkpoint-every <n>] [--run-as <user>]\n"
+        "              [--dns-server <a.b.c.d[:port]>] [--dns-ttl-min <s>] [--dns-ttl-max <s>]\n"
+        "              [--dns-grace-max <s>]\n"
         "              -- <target> [args...]\n"
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
         "\n"
@@ -3713,6 +3859,17 @@ static void usage(const char *argv0) {
         "\n"
         , argv0, argv0);
     fputs(
+        "  v1.24 host names (with `require warden 1.24`): the Warden resolves\n"
+        "  every name an allow rule names, A and AAAA, before the agent runs, and\n"
+        "  refreshes each at its TTL clamped to [--dns-ttl-min, --dns-ttl-max]\n"
+        "  (default 30 and 3600 s) in a resolver helper; an address that drops\n"
+        "  out of an answer stays valid for the old TTL, at most --dns-grace-max\n"
+        "  (default 300 s). Each result is a resolution record. --dns-server\n"
+        "  resolves through that server instead of the host's resolv.conf (a\n"
+        "  validating resolver, or a test server).\n"
+        "\n"
+        , stderr);
+    fputs(
         "  v1.17: the agent runs as an unprivileged user with no capabilities.\n"
         "  --run-as <user|uid[:gid]> picks the user (default nobody); --run-as root\n"
         "  keeps the pre-v1.17 behaviour and prints a warning. The Warden still\n"
@@ -3726,7 +3883,8 @@ static void usage(const char *argv0) {
         "    allow host 127.0.0.1:8080          (v1.21: the Warden dials it and\n"
         "    allow host [::1]                    hands over the socket; a numeric\n"
         "    allow host unix:/run/app.sock       address, [IPv6] or unix:/path;\n"
-        "    deny  host 203.0.113.7              names never match: stage 2)\n"
+        "    deny  host 203.0.113.7              host names: see v1.24 above)\n"
+        "    allow host api.example.com:443     (v1.24, after `require warden 1.24`)\n"
         "    allow exec /usr/bin/env\n"
         "    allow path /var/log/ readonly     (v1.13: access=ro -O_CREAT -O_TRUNC)\n"
         "    deny  path suffix .pem            (v1.14 matchers: exact, prefix,\n"
@@ -3748,6 +3906,9 @@ static void usage(const char *argv0) {
 }
 
 int main(int argc, char **argv) {
+    /* v1.24: the resolver helper is this program re-executed (a clean address
+     * space, without the signing key); see warden_resolve.h. */
+    if (argc >= 2 && !strcmp(argv[1], "--resolver-helper")) return wr_helper_exec_main(argc, argv);
     /* Positional parse with optional --plan between policy_path and --.
      * Accepted forms:
      *   warden policy.txt -- target [args...]
@@ -3772,6 +3933,8 @@ int main(int argc, char **argv) {
     const char *session_arg = NULL;     /* v1.18.0 */
     const char *state_arg   = NULL;     /* v1.18.0 */
     const char *gstatus_arg = NULL;     /* v1.18.0 */
+    wr_config_t dns_cfg;                /* v1.24 */
+    wr_config_default(&dns_cfg);
     int sep_idx = -1;
 
     for (int i = 2; i < argc; i++) {
@@ -3804,6 +3967,22 @@ int main(int argc, char **argv) {
                 return 2;
             }
             g_ckpt_every = n;
+        } else if (strcmp(argv[i], "--dns-server") == 0 && !dns_cfg.server) {
+            dns_cfg.server = argv[++i];                                     /* v1.24 */
+        } else if (strcmp(argv[i], "--dns-ttl-min") == 0 || strcmp(argv[i], "--dns-ttl-max") == 0 ||
+                   strcmp(argv[i], "--dns-grace-max") == 0) {
+            const char *opt = argv[i], *v = argv[++i];
+            uint32_t n = 0;
+            size_t k = 0;
+            for (; v[k] >= '0' && v[k] <= '9' && k < 6; k++) n = n * 10 + (uint32_t)(v[k] - '0');
+            if (k == 0 || v[k] || n > 86400 || (n < 1 && strcmp(opt, "--dns-grace-max"))) {
+                fprintf(stderr, "[warden] %s takes %s to 86400 (seconds)\n", opt,
+                        strcmp(opt, "--dns-grace-max") ? "1" : "0");
+                return 2;
+            }
+            if (!strcmp(opt, "--dns-ttl-min")) dns_cfg.ttl_min = n;
+            else if (!strcmp(opt, "--dns-ttl-max")) dns_cfg.ttl_max = n;
+            else dns_cfg.grace_max = n;
         } else {
             usage(argv[0]); return 2;
         }
@@ -3870,7 +4049,12 @@ int main(int argc, char **argv) {
     if ((key_path || anchor_path) && refuse_raw_devices(&p) < 0) return 1;
     if (flow_path && flow_setup(&p, flow_path, state_arg, session_arg, gstatus_arg) < 0)
         return 1;                                                           /* v1.18.0 */
+    if (names_setup(&p, &dns_cfg) < 0) return 1;                            /* v1.24 */
+    if (g_any_name) views_setup();
     if (g_check_only) {
+        /* v1.24: resolve each allowed name and report the ones that fail (a
+         * name that does not resolve does not stop the Warden). */
+        if (g_names_on) names_resolve_all(false);
         fprintf(stderr, "[warden] startup checks passed: the policy%s%s%s%s would be accepted%s\n",
                 key_path ? ", the signing key" : "", anchor_path ? ", the anchor" : "",
                 flow_path ? ", the flow policy, the breaker state" : "",
@@ -3906,6 +4090,21 @@ int main(int argc, char **argv) {
         }
     }
     emit_run_start(policy_path, &p);
+    /* v1.24: every allowed host name is resolved before the agent runs.
+     * Refreshes then run in a resolver helper process (warden_resolve.c),
+     * started now: while the Warden is single-threaded and before the agent's
+     * PID namespace exists. Without it the table would go stale, so a failure
+     * to start it stops the run. */
+    if (g_names_on) {
+        names_resolve_all(true);
+        if (wr_async_start(&g_names, "/proc/self/exe") < 0) {
+            fprintf(stderr, "[warden] cannot start the resolver helper (%s); refusing to start\n",
+                    strerror(errno));
+            emit_run_end(1);
+            if (g_sk) sodium_free(g_sk);
+            return 1;
+        }
+    }
 
     /* v1.6 pre-execution plan verification. Fires before fork; on
      * any non-SATISFIED result the target is not started. */
@@ -4168,6 +4367,7 @@ int main(int argc, char **argv) {
                 WTERMSIG(status), strsignal(WTERMSIG(status)),
                 WTERMSIG(status) == SIGSYS
                     ? ": most likely a hard-denied system call" : "");
+    if (g_names_on) wr_async_stop(&g_names);    /* v1.24 */
     emit_run_end(rc);
     anchor_drain();
     if (g_sk) sodium_free(g_sk);             /* zeroes it */

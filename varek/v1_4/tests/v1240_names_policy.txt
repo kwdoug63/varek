@@ -1,0 +1,13 @@
+# v1.24: host names (docs/security/v1.21-stage2-host-names.md, section 1).
+# Used by tests/test_v1240.sh and by make crosscheck (tests/*policy*.txt).
+require warden 1.24
+deny  host api.example.com:80
+allow host api.example.com
+allow host login.example.com:443
+allow host xn--bcher-kva.example:8443
+allow host localhost
+deny  host 10.0.0.9:22
+allow host 10.0.0.9:443
+allow host [::1]
+allow host unix:/run/agent.sock
+allow path /tmp/varek_v1240/
