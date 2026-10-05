@@ -47,6 +47,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     design's section 5), to run on a host with outbound HTTPS.
   - `RELEASE-v1.24.0.md`: draft release notes; the soak results, latency and
     review findings are pending.
+- `docs/security/v1.27-program-launches.md`: the design for decided program
+  launches (a Landlock execute ruleset built from the policy's `allow exec`
+  rules, the Warden deciding and recording each launch, an identity check
+  after it). Its version, v1.27.0 or v1.25.0, depends on whether the first
+  buyers' agents are API-calling or coding agents.
 - Network roadmap designs: `docs/security/v1.25-wildcard-host-names.md`
   (opt-in wildcard host names, v1.25.0) and `docs/security/v1.26-egress-proxy.md`
   (the egress proxy, v1.26.0, previously "v1.21 stage 3"). The v1.24.0 host-name
