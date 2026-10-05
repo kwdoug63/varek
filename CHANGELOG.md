@@ -24,8 +24,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     dropped address for a grace period (`--dns-grace-max`), and writes each
     result as a chained `resolution` record. `--check-startup` reports names
     that do not resolve.
+  - Sections 3 and 4 (`warden_names.inc.c`): while the policy has a host name
+    rule, the agent's opens of `/etc/hosts`, `/etc/resolv.conf` and
+    `/etc/nsswitch.conf` get the Warden's views (only the allowed names; no
+    reachable nameserver; `hosts: files`), every connect to port 53 is refused,
+    and a connect is decided on its address and the names that resolved to it
+    (the first rule over all of them decides; the checker confirms no earlier
+    rule holds on another). Records carry `dialed`, `candidates` and the table
+    generation; `varek_audit.py` checks views, the name-to-address binding
+    against the resolution records, and earlier rules. The plan gate decides
+    `net_connect <name>:<port>` steps on the name.
   - Tests: `make test-v1240` (grammar in both parsers, the table against a
-    local test DNS server, the Warden run as root); CI runs it.
+    local test DNS server, and as root the Warden with Python, Node, Go and
+    Java as the agent); CI runs it.
 - Network roadmap designs: `docs/security/v1.25-wildcard-host-names.md`
   (opt-in wildcard host names, v1.25.0) and `docs/security/v1.26-egress-proxy.md`
   (the egress proxy, v1.26.0, previously "v1.21 stage 3"). The v1.24.0 host-name

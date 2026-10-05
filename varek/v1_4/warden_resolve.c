@@ -341,6 +341,19 @@ int wr_ip_parse(const char *s, wr_ip_t *ip) {
     return -1;
 }
 
+void wr_hosts_view(const wr_table_t *t, FILE *f) {
+    fputs("127.0.0.1 localhost\n::1 localhost\n", f);
+    char a[INET6_ADDRSTRLEN];
+    for (size_t i = 0; i < t->n; i++) {
+        const wr_entry_t *e = &t->e[i];
+        for (size_t k = 0; k < e->n; k++) {
+            if (e->addrs[k].until_ms != 0) continue;
+            wr_ip_str(&e->addrs[k].ip, a, sizeof a);
+            fprintf(f, "%s %s\n", a, e->name);
+        }
+    }
+}
+
 static const char *st_name(wr_status_t s) {
     switch (s) {
         case WR_ST_OK:       return "ok";

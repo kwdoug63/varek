@@ -136,6 +136,14 @@ size_t wr_names_for(const wr_table_t *t, const wr_ip_t *ip, int64_t now, size_t 
 /* Drop grace addresses whose time is up. */
 void wr_expire(wr_table_t *t, int64_t now);
 
+/* v1.24 (section 3): the hosts view the agent reads as /etc/hosts:
+ *   127.0.0.1 localhost
+ *   ::1 localhost
+ * then one line per current address of each name ("<address> <name>"), in
+ * table order. Addresses in grace are left out (the agent may still connect
+ * to one it read before; it cannot look it up again). */
+void wr_hosts_view(const wr_table_t *t, FILE *f);
+
 /* An address as text ("192.0.2.1", "2001:db8::1"). */
 void wr_ip_str(const wr_ip_t *ip, char *out, size_t n);
 

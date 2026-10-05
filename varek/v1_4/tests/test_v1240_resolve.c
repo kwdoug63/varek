@@ -118,6 +118,15 @@ int main(int argc, char **argv) {
     CHECK(t.e[api].next_ms == now + 30000, "api: refresh at the TTL");
     wr_ip_t a10 = ip("192.0.2.10"), a11 = ip("192.0.2.11"), a6 = ip("2001:db8::10");
     CHECK(wr_entry_has(&t.e[api], &a10, now) && wr_entry_has(&t.e[api], &a6, now), "api addresses");
+    {
+        char hv[1024];
+        FILE *f = fmemopen(hv, sizeof hv, "w");
+        wr_hosts_view(&t, f);
+        fclose(f);
+        CHECK(!strcmp(hv, "127.0.0.1 localhost\n::1 localhost\n192.0.2.10 api.example.test\n"
+                          "192.0.2.11 api.example.test\n2001:db8::10 api.example.test\n"),
+              "hosts view: %s", hv);
+    }
 
     /* 2. a CNAME chain: the target's addresses, the chain's smallest TTL */
     wr_lookup(&t, "www.example.test", &r);

@@ -253,6 +253,11 @@ struct action {
     int           access_mode;          /* F_OK/R_OK/W_OK/X_OK */
     bool          path_null;            /* a NULL path pointer */
     bool          bad_flags;            /* flags the kernel would refuse (EINVAL) */
+    /* v1.24: host names (warden_names.inc.c) */
+    int           ncand;                /* connect: candidate strings decided over */
+    char          cand[16][WR_NAME_MAX + 8];
+    char          dialed[64];           /* connect: the numeric destination dialed */
+    char          extra[4608];          /* extra record fields, trusted text, each ending in ',' */
 };
 
 static const char *action_kind_name(action_kind_t k) {
@@ -875,6 +880,23 @@ static bool certify(const struct policy *p, struct action *a) {
             if (*q == '"' || *q == '\\' || (unsigned char)*q < 0x20) *q = '\'';
         return false;
     }
+    /* v1.24: a connect decided over several candidates (the address and the
+     * names it belongs to): the checker also confirms, with its own matchers,
+     * that no earlier host rule holds on any other candidate. */
+    if (a->kind == ACT_NET_CONNECT && a->ncand > 1) {
+        for (int c = 0; c < a->ncand; c++) {
+            if (!strcmp(a->cand[c], s)) continue;
+            for (int i = 0; i < cc.r; i++) {
+                vdpc_rule_info_t ri;
+                if (vdpc_rule_info(&p->c, (size_t)i, &ri) < 0 || ri.kind != VDPC_HOST) continue;
+                if (vdpc_holds(&p->c, (size_t)i, a->cand[c], strlen(a->cand[c])) == 1) {
+                    snprintf(a->check_why, sizeof a->check_why,
+                             "an earlier rule (line %d) holds on another candidate", ri.line);
+                    return false;
+                }
+            }
+        }
+    }
     a->certified = true;
     return true;
 }
@@ -1227,6 +1249,7 @@ static FILE *g_log = NULL;
 static char     g_run_id[33];
 static wr_table_t g_names;           /* v1.24: the resolution table (see names_setup) */
 static bool       g_names_on = false;
+static bool       g_any_name = false;  /* v1.24: the policy has a host name rule (allow or deny) */
 static uint64_t g_records = 0;       /* decision records emitted */
 static bool     g_relay_midline = false;
 
@@ -1487,6 +1510,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
         fprintf(f, "\"checkpoint_every\":%" PRIu64 ",", g_ckpt_every);
     if (g_anchor_fd >= 0) fputs("\"anchored\":true,", f);
     /* v1.24: the names the Warden resolves (each gets a resolution record). */
+    if (g_any_name) fputs("\"host_name_rules\":true,", f);
     if (g_names_on) fprintf(f, "\"host_names\":%zu,\"resolver\":\"%s\",", g_names.n, g_names.resolver);
     fprintf(f, "\"timestamp_ns\":%lld}\n", (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end("run_start");
@@ -1504,6 +1528,7 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
     }
     for (size_t i = 0; i < p->v.n; i++) {
         const vdp_rule_t *r = &p->v.rules[i];
+        if (r->kind == VDP_KIND_HOST && r->s.name) g_any_name = true;
         if (r->kind != VDP_KIND_HOST || !r->s.name || r->verb != VDP_ALLOW) continue;
         char name[WR_NAME_MAX + 1];
         const char *colon = memchr(r->s.c, ':', r->s.len);
@@ -1636,7 +1661,7 @@ static void emit_pathology(uint64_t seq,
         "\"policy_line\":%d,"
         "%s%s%s"
         "%s%s%s%s%s%s"
-        "%s"
+        "%s%s"
         "\"kernel_verdict\":\"%s\","
         "\"errno\":%d,"
         "\"latency_us\":%" PRIu64 ","
@@ -1652,7 +1677,7 @@ static void emit_pathology(uint64_t seq,
         a->cert[0] ? (a->certified ? "\"check\":\"ok\"," : "\"check\":\"refused\",\"check_why\":\"") : "",
         a->cert[0] && !a->certified ? a->check_why : "",
         a->cert[0] && !a->certified ? "\"," : "",
-        net_json,
+        net_json, a->extra,
         /* v1.12.1: an ALLOW whose open then failed (EEXIST, ENXIO, ...)
          * delivered nothing; say so rather than reporting ALLOW.
          * v1.18.0: a refusal names the errno the agent actually received
@@ -2474,6 +2499,7 @@ static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *mi
     return rc;
 }
 
+#include "warden_names.inc.c"        /* v1.24: host-name views and candidates */
 #include "warden_net.inc.c"          /* v1.21: decided connections */
 
 /* ---------------- receive loop ---------------- */
@@ -2727,6 +2753,15 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * component, untracked dirfd, over-long path, deleted inode, missing
          * parent) is a hard deny before any policy match. */
         struct resolved_target rt = { .path_fd = -1, .parent_fd = -1 };
+        /* v1.24: /etc/hosts, /etc/resolv.conf and /etc/nsswitch.conf, named
+         * as such, are answered with the Warden's views while the policy has
+         * a host name rule (warden_names.inc.c), whether or not the host has
+         * the file. */
+        if (g_any_name && act.kind == ACT_FILE_OPEN && view_open_readonly(&act) &&
+            view_by_target(act.target) >= 0) {
+            view_serve(notify_fd, &req, &act, p, view_by_target(act.target), &t0);
+            continue;
+        }
         if (act.kind == ACT_FILE_OPEN) {
             if (resolve_target(req.pid, &act, &rt) < 0) {
                 clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -2749,6 +2784,14 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                                + (t1.tv_nsec - t0.tv_nsec);
                 emit_pathology(g_report_seq++, req.pid, &act, DEC_DENY, DEC_DENY, forbid, lat_f, EACCES);
                 send_simple(notify_fd, req.id, DEC_DENY);
+                continue;
+            }
+            /* v1.24: the same views, reached by another spelling (a symlink,
+             * "..", /etc/resolv.conf's own target). */
+            if (g_any_name && view_open_readonly(&act) && view_by_canonical(act.resolved) >= 0) {
+                int v = view_by_canonical(act.resolved);
+                resolved_target_close(&rt);
+                view_serve(notify_fd, &req, &act, p, v, &t0);
                 continue;
             }
         }
@@ -3991,6 +4034,7 @@ int main(int argc, char **argv) {
     if (flow_path && flow_setup(&p, flow_path, state_arg, session_arg, gstatus_arg) < 0)
         return 1;                                                           /* v1.18.0 */
     if (names_setup(&p, &dns_cfg) < 0) return 1;                            /* v1.24 */
+    if (g_any_name) views_setup();
     if (g_check_only) {
         /* v1.24: resolve each allowed name and report the ones that fail (a
          * name that does not resolve does not stop the Warden). */
