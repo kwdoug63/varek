@@ -9,6 +9,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+- Network roadmap designs: `docs/security/v1.25-wildcard-host-names.md`
+  (opt-in wildcard host names, v1.25.0) and `docs/security/v1.26-egress-proxy.md`
+  (the egress proxy, v1.26.0, previously "v1.21 stage 3"). The v1.24.0 host-name
+  plan, README roadmap and threat model point to them.
+
 ### Changed
 - Deployment guide: the listing now offers m7i-flex.large and c7i-flex.large;
   sizing, prerequisites and the launch steps say so, and that only the listed

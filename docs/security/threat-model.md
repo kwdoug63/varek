@@ -201,8 +201,10 @@ are claimed as solved.
   addresses only: host names are v1.21 stage 2 (`v1.21-stage2-host-names.md`),
   and until then a name must be resolved outside the agent. An allowed address
   on a shared content network also reaches the other sites served from it.
-  Rules on request contents (method, path, body) are stage 3, through an
-  egress proxy. *(Through v1.20.0 this read: network access is deny-only; a
+  Wildcard names are planned for v1.25.0 (`v1.25-wildcard-host-names.md`).
+  Deciding on the name the agent asks the server for, and rules on request
+  contents (method, path, body), are stage 3, through the v1.26.0 egress
+  proxy (`v1.26-egress-proxy.md`). *(Through v1.20.0 this read: network access is deny-only; a
   mediated allow path is roadmap.)*
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).
