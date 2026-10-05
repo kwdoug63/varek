@@ -286,10 +286,18 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
         check "go: another name fails"                           grep -q '^ERR unlisted ' "$OUT/go.out"
     else skip "go (not installed)"; fi
 
-    if [ -n "$JAVA" ] && command -v javac > /dev/null && javac -d "$W" "$T/V1240Client.java" > /dev/null 2>&1; then
+    # compiled by the javac of the JDK that runs it (a runner may have several)
+    JAVAC="$(dirname "$JAVA" 2>/dev/null)/javac"
+    if [ -n "$JAVA" ] && [ -x "$JAVAC" ] && "$JAVAC" --release 11 -d "$W" "$T/V1240Client.java" > /dev/null 2>&1; then
         chmod -R a+rX "$W"
         agent -- "$JAVA" -Xshare:off -cp "$W" V1240Client "$HP" > "$OUT/java.out"
         sed 's/^/     /' "$OUT/java.out"
+        if ! grep -q '^OK resolve' "$OUT/java.out"; then
+            # say why: the JVM's own errors and what the Warden refused it
+            echo "     java did not resolve; its stderr and the refusals:"
+            grep '^\[agent\]' "$OUT/a.log" | head -10 | sed 's/^/       /'
+            grep '"decision_final":"DENY"' "$OUT/a.log" | sed -E 's/.*"action":"([^"]*)","target":"([^"]*)".*"rule":"([a-z_0-9]+)".*/       \1 \2 \3/' | sort | uniq -c | head -25
+        fi
         check "java: an allowed name resolves"   grep -q '^OK resolve 127.0.0.1 ' "$OUT/java.out"
         check "java: and http connects"          grep -q '^OK http 200 ' "$OUT/java.out"
         check "java: another name fails"         grep -q '^ERR unlisted ' "$OUT/java.out"
