@@ -10,7 +10,8 @@
  * file:
  *   /etc/hosts          localhost, then each allowed name's current addresses
  *   /etc/resolv.conf    a nameserver no one answers (192.0.2.1, reserved for
- *                       documentation), attempts:1 timeout:1
+ *                       documentation), attempts:1 timeout:0 (musl, which
+ *                       queries it, then gives up at once)
  *   /etc/nsswitch.conf  hosts: files (and files for passwd, group)
  * The open is matched by the path the agent gave (when it is exactly one of
  * the three) or by the canonical path it resolves to (the three, or what each
@@ -83,7 +84,7 @@ static int view_memfd(int v) {
     FILE *f = open_memstream(&buf, &len);
     if (!f) return -1;
     if (v == VIEW_HOSTS) wr_hosts_view(&g_names, f);
-    else if (v == VIEW_RESOLV) fputs("nameserver 192.0.2.1\noptions attempts:1 timeout:1\n", f);
+    else if (v == VIEW_RESOLV) fputs("nameserver 192.0.2.1\noptions attempts:1 timeout:0\n", f);
     else fputs("passwd: files\ngroup: files\nhosts: files\n", f);
     if (fclose(f) != 0) { free(buf); return -1; }
     int fd = memfd_create(kViewRule[v], MFD_CLOEXEC | MFD_ALLOW_SEALING);

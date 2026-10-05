@@ -512,6 +512,22 @@ static int derive_intent(const struct seccomp_notif *req,
         out->open_mode  = (int)(req->data.args[3] & 0777);
         return 0;
     }
+    /* v1.24: the legacy open(2), which musl uses (a static musl program never
+     * calls openat), is open relative to the working directory: decided and
+     * answered exactly as openat(AT_FDCWD, path, flags, mode). Through v1.23 it
+     * fell to the filter's default deny, so a musl agent could open nothing. */
+    if (nr == __NR_open) {
+        out->kind = ACT_FILE_OPEN;
+        if (xproc_read_str(req->pid, req->data.args[0],
+                           out->target, sizeof(out->target)) < 0)
+            return -1;
+        out->open_dirfd = VAREK_AT_FDCWD;
+        out->resolved[0] = '\0';
+        out->open_flags = (int)req->data.args[1];
+        out->flags_known = true;
+        out->open_mode  = (int)(req->data.args[2] & 0777);
+        return 0;
+    }
     if (nr == __NR_connect) {
         out->kind = ACT_NET_CONNECT;
         out->sock_fd = (int)req->data.args[0];

@@ -34,9 +34,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     generation; `varek_audit.py` checks views, the name-to-address binding
     against the resolution records, and earlier rules. The plan gate decides
     `net_connect <name>:<port>` steps on the name.
+  - The legacy `open(2)` is mediated, as `openat(AT_FDCWD, ...)`: a static
+    musl program never calls `openat`, so through v1.23 a musl agent could
+    open no file. The `resolv.conf` view says `timeout:0`, so musl, which
+    queries its nameserver after `/etc/hosts`, gives up at once.
   - Tests: `make test-v1240` (grammar in both parsers, the table against a
-    local test DNS server, and as root the Warden with Python, Node, Go and
-    Java as the agent); CI runs it.
+    local test DNS server, and as root the Warden with Python, curl, Node, a
+    static musl client, Go and Java as the agent); CI runs it. It fails 81 of
+    its 88 checks against v1.23.1.
+  - `tests/soak_v1240/`: the 24-hour soak test against Fastly-, Cloudflare-
+    and CloudFront-hosted APIs (`soak.sh`, an agent, and a checker for the
+    design's section 5), to run on a host with outbound HTTPS.
+  - `RELEASE-v1.24.0.md`: draft release notes; the soak results, latency and
+    review findings are pending.
 - Network roadmap designs: `docs/security/v1.25-wildcard-host-names.md`
   (opt-in wildcard host names, v1.25.0) and `docs/security/v1.26-egress-proxy.md`
   (the egress proxy, v1.26.0, previously "v1.21 stage 3"). The v1.24.0 host-name

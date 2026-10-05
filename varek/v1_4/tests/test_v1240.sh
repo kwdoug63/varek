@@ -15,8 +15,8 @@
 #      refreshes them while it runs, and writes each result as a chained
 #      record the exporter and the audit accept; --check-startup reports each
 #      name. Skipped when not root.
-#   4. as root, sections 3 and 4: real clients as the agent (Python and Node
-#      through glibc, Go's own resolver, Java) resolve an allowed name through
+#   4. as root, sections 3 and 4: real clients as the agent (Python, curl and
+#      Node through glibc, a static musl client, Go's own resolver, Java) resolve an allowed name through
 #      the Warden's views and connect, decided on the name; other names fail at
 #      once; no connect reaches port 53; the first rule over the address and
 #      its names decides; an address in grace; a deny on /etc/hosts; the plan
@@ -304,7 +304,24 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
         check "java: and http connects"          grep -q '^OK http 200 ' "$OUT/java.out"
         check "java: another name fails"         grep -q '^ERR unlisted ' "$OUT/java.out"
     else skip "java (no JDK)"; fi
-    skip "musl (an Alpine-built client) is not in this test"
+    if command -v musl-gcc > /dev/null && musl-gcc -static -O2 -o "$W/v1240_client_musl" "$T/v1240_client_musl.c" 2>/dev/null; then
+        chmod 755 "$W/v1240_client_musl"
+        agent -- "$W/v1240_client_musl" "$HP" > "$OUT/musl.out"
+        sed 's/^/     /' "$OUT/musl.out"
+        check "musl (static, its own resolver): an allowed name resolves" grep -q '^OK resolve 127.0.0.1 ' "$OUT/musl.out"
+        check "musl: and connects"                                         grep -q '^OK http 200 ' "$OUT/musl.out"
+        if awk '$1 == "ERR" && $2 == "unlisted" && $4 < 100 {ok = 1} END {exit !ok}' "$OUT/musl.out"; then
+            pass "musl: another name fails within 100 ms"
+        else flunk "musl: another name fails within 100 ms"; fi
+    else skip "musl (no musl-gcc; apt install musl-tools)"; fi
+    if command -v curl > /dev/null; then
+        agent -- /usr/bin/curl -s -o /dev/null -w 'OK http %{http_code}\n' --max-time 5 "http://api.example.com:$HP/" > "$OUT/curl.out"
+        agent -- /usr/bin/curl -s -o /dev/null -w '%{http_code}\n' --max-time 5 "http://other.example.com:$HP/" > "$OUT/curl2.out"
+        echo "curl unlisted exit $?" >> "$OUT/curl2.out"
+        sed 's/^/     /' "$OUT/curl.out" "$OUT/curl2.out"
+        check "curl: fetches from an allowed name"   grep -q '^OK http 200' "$OUT/curl.out"
+        check "curl: another name does not resolve"  grep -q '^curl unlisted exit 6$' "$OUT/curl2.out"
+    else skip "curl (not installed)"; fi
 
     # Port 53: refused whatever the numeric rules say; a resolver listening
     # there gets nothing.
@@ -351,8 +368,9 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
     printf 'action a net_connect api.example.com:443\n' > "$OUT/plan_ok.txt"
     printf 'action a net_connect other.example.com:443\n' > "$OUT/plan_no.txt"
     "$WARDEN" "$POL" --dns-server "127.0.0.1:$PORT" --plan "$OUT/plan_ok.txt" -- /bin/true > /dev/null 2> "$OUT/g1.err"
-    if grep -q 'plan rejected' "$OUT/g1.err"; then flunk "the plan gate: a step to an allowed name passes"
-    else pass "the plan gate: a step to an allowed name passes"; fi
+    if grep -q 'plan authorized' "$OUT/g1.err" && ! grep -q 'plan rejected' "$OUT/g1.err"; then
+        pass "the plan gate: a step to an allowed name passes"
+    else flunk "the plan gate: a step to an allowed name passes"; fi
     "$WARDEN" "$POL" --dns-server "127.0.0.1:$PORT" --plan "$OUT/plan_no.txt" -- /bin/true > /dev/null 2> "$OUT/g2.err"
     check "the plan gate: a step to another name is rejected" grep -q 'plan rejected' "$OUT/g2.err"
     rm -rf "$W"
