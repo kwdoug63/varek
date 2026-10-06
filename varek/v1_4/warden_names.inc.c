@@ -13,6 +13,8 @@
  *                       documentation), attempts:1 timeout:0 (musl, which
  *                       queries it, then gives up at once)
  *   /etc/nsswitch.conf  hosts: files (and files for passwd, group)
+ *   (v1.25: with the stub resolver up, resolv.conf names it, 127.53.53.53,
+ *   and nsswitch.conf says hosts: files dns; see warden_stub.inc.c)
  *   /etc/host.conf      multi on: without it (no file, or one the policy does
  *                       not let the agent read) glibc returns only the first
  *                       /etc/hosts line for a name, so the agent got a single
@@ -47,13 +49,19 @@ static uint64_t ns_between(const struct timespec *a, const struct timespec *b);
 
 /* ---- section 3: the views ---- */
 
-enum { VIEW_HOSTS = 0, VIEW_RESOLV = 1, VIEW_NSSWITCH = 2, VIEW_HOSTCONF = 3, VIEW_N = 4 };
+/* v1.25: with the stub resolver up, /etc/netsvc.conf and /etc/svc.conf too,
+ * both empty. c-ares (Node's dns.resolve*) reads them after resolv.conf and
+ * nsswitch.conf, and takes a refused open of either (the Warden answers
+ * EACCES for a file it does not allow, whether or not it exists) as a broken
+ * configuration: it then drops what it read and asks 127.0.0.1. */
+enum { VIEW_HOSTS = 0, VIEW_RESOLV = 1, VIEW_NSSWITCH = 2, VIEW_HOSTCONF = 3, VIEW_NETSVC = 4,
+       VIEW_SVC = 5, VIEW_N = 6 };
 static const char *const kViewPath[VIEW_N] = { "/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf",
-                                               "/etc/host.conf" };
+                                               "/etc/host.conf", "/etc/netsvc.conf", "/etc/svc.conf" };
 static const char *const kViewRule[VIEW_N] = { "hosts_view", "resolv_view", "nsswitch_view",
-                                               "hostconf_view" };
+                                               "hostconf_view", "netsvc_view", "svc_view" };
 static char     g_view_canon[VIEW_N][PATH_LIMIT];  /* realpath on the host at startup, or "" */
-static int      g_view_fd[VIEW_N] = { -1, -1, -1, -1 };
+static int      g_view_fd[VIEW_N] = { -1, -1, -1, -1, -1, -1 };
 static uint64_t g_view_gen = UINT64_MAX;          /* g_names.generation the hosts memfd holds */
 
 /* At startup: what each view path resolves to on the host. */
@@ -66,14 +74,18 @@ static void views_setup(void) {
     }
 }
 
+/* Is view v served in this run? (The last two only with the stub resolver.) */
+static bool view_on(int v) { return v < VIEW_NETSVC || g_stub_on; }
+
 static int view_by_target(const char *target) {
-    for (int v = 0; v < VIEW_N; v++) if (!strcmp(target, kViewPath[v])) return v;
+    for (int v = 0; v < VIEW_N; v++) if (view_on(v) && !strcmp(target, kViewPath[v])) return v;
     return -1;
 }
 
 static int view_by_canonical(const char *resolved) {
     for (int v = 0; v < VIEW_N; v++)
-        if (!strcmp(resolved, kViewPath[v]) || (g_view_canon[v][0] && !strcmp(resolved, g_view_canon[v])))
+        if (view_on(v) &&
+            (!strcmp(resolved, kViewPath[v]) || (g_view_canon[v][0] && !strcmp(resolved, g_view_canon[v]))))
             return v;
     return -1;
 }
@@ -91,9 +103,13 @@ static int view_memfd(int v) {
     FILE *f = open_memstream(&buf, &len);
     if (!f) return -1;
     if (v == VIEW_HOSTS) wr_hosts_view(&g_names, f);
+    /* v1.25: with the stub resolver up, the agent's questions go to it */
+    else if (v == VIEW_RESOLV && g_stub_on) fputs("nameserver 127.53.53.53\noptions attempts:2 timeout:5\n", f);
     else if (v == VIEW_RESOLV) fputs("nameserver 192.0.2.1\noptions attempts:1 timeout:0\n", f);
-    else if (v == VIEW_NSSWITCH) fputs("passwd: files\ngroup: files\nhosts: files\n", f);
-    else fputs("multi on\n", f);
+    else if (v == VIEW_NSSWITCH) fputs(g_stub_on ? "passwd: files\ngroup: files\nhosts: files dns\n"
+                                                 : "passwd: files\ngroup: files\nhosts: files\n", f);
+    else if (v == VIEW_HOSTCONF) fputs("multi on\n", f);
+    /* VIEW_NETSVC, VIEW_SVC: empty */
     if (fclose(f) != 0) { free(buf); return -1; }
     int fd = memfd_create(kViewRule[v], MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (fd < 0) { free(buf); return -1; }

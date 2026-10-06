@@ -659,6 +659,9 @@ static int derive_intent(const struct seccomp_notif *req,
             memset(&ss, 0, sizeof(ss));
             socklen_t l = alen > sizeof(ss) ? sizeof(ss) : (socklen_t)alen;
             if (xproc_read_bytes(req->pid, addr, &ss, l) == 0) {
+                /* v1.25: the copy a send to the stub is made with */
+                memcpy(out->sa, &ss, l);
+                out->salen = (int)l;
                 if (ss.ss_family == AF_INET) {
                     struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
                     char ip[INET_ADDRSTRLEN] = {0};
@@ -1267,6 +1270,9 @@ static char     g_run_id[33];
 static wr_table_t g_names;           /* v1.24: the resolution table (see names_setup) */
 static bool       g_names_on = false;
 static bool       g_any_name = false;  /* v1.24: the policy has a host name rule (allow or deny) */
+static bool       g_any_wild = false;  /* v1.25: the policy has a wildcard allow rule (warden_stub.inc.c) */
+static void       stub_resolved(size_t i);
+static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden_stub.inc.c) */
 static char       g_psl_sha[65], g_shared_sha[65];  /* v1.25: the lists wildcards were checked against */
 static uint64_t g_records = 0;       /* decision records emitted */
 static bool     g_relay_midline = false;
@@ -1533,6 +1539,9 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     if (g_psl_sha[0]) fprintf(f, "\"psl_sha256\":\"%s\",\"shared_domains_sha256\":\"%s\",",
                               g_psl_sha, g_shared_sha);
     if (g_names_on) fprintf(f, "\"host_names\":%zu,\"resolver\":\"%s\",", g_names.n, g_names.resolver);
+    /* v1.25: where the agent's questions go (connects and sends to it are
+     * records with rule dns_stub) */
+    if (g_any_wild) fputs("\"dns_stub\":\"127.53.53.53:53\",", f);
     fprintf(f, "\"timestamp_ns\":%lld}\n", (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end("run_start");
 }
@@ -1550,6 +1559,7 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
     for (size_t i = 0; i < p->v.n; i++) {
         const vdp_rule_t *r = &p->v.rules[i];
         if (r->kind == VDP_KIND_HOST && r->s.name) g_any_name = true;
+        if (r->kind == VDP_KIND_HOST && r->s.wild && r->verb == VDP_ALLOW) g_any_wild = true;
         /* v1.25: a wildcard names no host to resolve in advance */
         if (r->kind != VDP_KIND_HOST || !r->s.name || r->s.wild || r->verb != VDP_ALLOW) continue;
         char name[WR_NAME_MAX + 1];
@@ -1563,7 +1573,8 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
             return -1;
         }
     }
-    g_names_on = g_names.n > 0;
+    /* v1.25: a wildcard adds names when the agent asks (the stub) */
+    g_names_on = g_names.n > 0 || g_any_wild;
     return 0;
 }
 
@@ -1635,6 +1646,7 @@ static void emit_resolution(void *ctx, size_t i, const wr_result_t *r) {
     FILE *f = rec_begin();
     wr_format_record(f, g_run_id, &g_names, i, r, wr_now_ms());
     rec_end(NULL);
+    stub_resolved(i);                   /* v1.25: answer the agent's waiting questions */
 }
 
 /* Resolve every name before the agent runs. A name that does not resolve is
@@ -2586,6 +2598,7 @@ static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *mi
 
 #include "warden_names.inc.c"        /* v1.24: host-name views and candidates */
 #include "warden_net.inc.c"          /* v1.21: decided connections */
+#include "warden_stub.inc.c"         /* v1.25: the stub resolver for wildcard names */
 
 /* ---------------- receive loop ---------------- */
 
@@ -2609,7 +2622,8 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         /* v1.21: also on the sockets of connects and sends still being
          * finished for the agent (warden_net.inc.c). */
         /* v1.24: also on the resolver helper's results. */
-        struct pollfd pfds[4 + MAX_PENDING] = {
+        /* v1.25: and on the stub resolver's sockets (warden_stub.inc.c). */
+        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN] = {
             { .fd = notify_fd,    .events = POLLIN },
             { .fd = target_pidfd, .events = POLLIN },
             { .fd = agent_err_fd, .events = POLLIN },
@@ -2626,14 +2640,16 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * likewise, refreshes are handed to the resolver helper here and
          * their results applied here; the lookups themselves never run in
          * the Warden. */
+        int nstub = stub_poll_fill(&pfds[4 + npoll]);
         int to = maybe_checkpoint(), pto = pend_timeout_ms();
         if (pto >= 0 && (to < 0 || pto < to)) to = pto;
         if (g_names_on) {
+            wr_retire_due(&g_names, wr_now_ms());
             wr_async_schedule(&g_names, wr_now_ms());
             int dto = wr_next_due_ms(&g_names, wr_now_ms());
             if (dto >= 0 && (to < 0 || dto < to)) to = dto;
         }
-        int pr = poll(pfds, (nfds_t)(4 + npoll), to);
+        int pr = poll(pfds, (nfds_t)(4 + npoll + nstub), to);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -2643,6 +2659,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             for (int i = 0; i < npoll; i++) rev[i] = pfds[4 + i].revents;
             pend_service(notify_fd, rev, npoll);
         }
+        stub_service(p, &pfds[4 + npoll], nstub);
         if (g_names_on && (pfds[3].revents & (POLLIN | POLLHUP | POLLERR))) {
             wr_async_collect(&g_names, wr_now_ms(), emit_resolution, NULL);
             /* v1.24: without the helper the table would go stale; stop
@@ -2825,6 +2842,8 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             continue;
         }
         if (act.kind == ACT_NET_SEND && net_send_relay(notify_fd, &req, &act, &t0))
+            continue;
+        if (act.kind == ACT_NET_SEND && stub_sendto(notify_fd, &req, &act, &t0))   /* v1.25 */
             continue;
         if (act.kind == ACT_NET_BIND) {
             net_bind(notify_fd, &req, &act, &t0);
@@ -4402,6 +4421,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         sockref_warm();
+        stub_setup();                   /* v1.25 */
     }
     /* v1.21: up to MAX_PENDING connects and sends can wait in the Warden, each
      * holding a socket: raise the Warden's own descriptor limit (after the

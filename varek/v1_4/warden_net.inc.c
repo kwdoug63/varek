@@ -52,6 +52,8 @@
  * (net_send_relay). */
 
 #include <linux/sockios.h>
+
+#define STUB_ADDR_TEXT "127.53.53.53"   /* v1.25: STUB_ADDR in warden_stub.inc.c */
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 
@@ -79,6 +81,12 @@ static int      g_host_netns  = -1;     /* the Warden's own network namespace */
 static int      g_agent_netns = -1;     /* the agent's (empty) one */
 static bool     g_netns_separate = false;
 static uint64_t g_report_seq = 0;       /* report_id sequence (was supervise()'s seq) */
+
+/* v1.25: the stub resolver (warden_stub.inc.c, included after this file) */
+struct sock_kind;
+static bool stub_is_dest(const struct sockaddr_storage *dial);
+static void stub_connect(int notify_fd, const struct seccomp_notif *req, struct action *a,
+                         int ag, const struct sock_kind *k, const struct timespec *t0);
 
 static uint64_t ns_between(const struct timespec *a, const struct timespec *b) {
     int64_t d = (int64_t)(b->tv_sec - a->tv_sec) * 1000000000LL + (b->tv_nsec - a->tv_nsec);
@@ -683,6 +691,12 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
             port = ntohs(d4->sin_port);
         }
         rule = NULL;
+        /* v1.25: the stub resolver's port 53 is the one that is reached */
+        if (stub_is_dest(&dial) && (!strcmp(k.name, "udp") || !strcmp(k.name, "tcp"))) {
+            snprintf(a->resolved, sizeof a->resolved, "%s:53", STUB_ADDR_TEXT);
+            stub_connect(notify_fd, req, a, ag, &k, t0);
+            return;
+        }
         if (g_any_name && port == 53) rule = "dns_refused";
         else if (names_candidates(a, dial.ss_family, ad, port) < 0) rule = "too_many_names";
         if (rule) {

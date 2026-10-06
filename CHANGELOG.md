@@ -11,7 +11,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 - v1.25.0, in progress (opt-in wildcard host names,
-  `docs/security/v1.25-wildcard-host-names.md`), sections 1 and 2:
+  `docs/security/v1.25-wildcard-host-names.md`), sections 1 to 3:
   - Policy grammar: `allow host *.example.com[:port]` after
     `require warden 1.25`, in the decision procedure, the certificate checker
     and the cross-check oracle; held as a glob (`?*.example.com:443`), so it is
@@ -22,7 +22,23 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     one (`*.s3.amazonaws.com`), or the VAREK list (`*.my.salesforce.com`). The
     lists are pinned in `varek/v1_4/data/` (the Public Suffix List is MPL-2.0);
     their SHA-256 goes in `run_start`; lint and the Warden name the entry.
-  - Tests: `make test-v1250`.
+  - The stub resolver (`warden_stub.inc.c`): with a wildcard allow rule, the
+    agent's `resolv.conf` view names `127.53.53.53`, a UDP and TCP stub the
+    Warden binds in the agent's own network namespace, and `nsswitch.conf`
+    says `hosts: files dns`. A connect to it is made by the Warden on the
+    agent's own socket, and a musl-style `sendto` is relayed; both are
+    `dns_stub` records, and every other port-53 connect stays refused. A
+    name no allow rule can reach gets NXDOMAIN at once and sends nothing
+    upstream. A name a wildcard matches is looked up by the resolver helper
+    when asked (a `resolution` record with `"dynamic":true`) and expires
+    when its TTL passes with no new question. Connects are decided on the
+    name, as in v1.24. `run_start` names the stub (`dns_stub`), and
+    `varek_audit.py` accepts `dns_stub` records only to it. Two more empty
+    views, `/etc/netsvc.conf` and `/etc/svc.conf`, keep c-ares (Node's
+    `dns.resolve*`) from discarding its configuration.
+  - Tests: `make test-v1250`. As root it runs Python, curl, Node
+    (`dns.lookup` and `dns.resolve4`), Go, Java and a static musl client
+    through the stub. 21 of its 31 stub checks fail without the stub.
 - v1.24.0, in progress (host names without agent DNS,
   `docs/security/v1.21-stage2-host-names.md`), sections 1 and 2:
   - Policy grammar: `allow host api.example.com[:port]` and `deny host <name>`

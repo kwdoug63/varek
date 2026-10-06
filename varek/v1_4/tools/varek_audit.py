@@ -41,6 +41,9 @@ policy file alone:
      in grace), every name such a record binds to that address present, and no
      host rule before the deciding one holding on any other candidate (the
      checker's own matchers).
+  7. v1.25: a connect or send with rule dns_stub (to the Warden's own stub
+     resolver, in the agent's network namespace) is accepted only to the stub
+     address run_start names.
 
 Exit 0 only if all of these hold. The verdict stream is the Warden's stderr
 (`warden policy -- agent 2> verdicts.log`). The report's "integrity" line says
@@ -81,7 +84,8 @@ CONNECT_RULES = ("dialed_fd_injection", "dialed_in_progress", "dial_failed",
 # answered with a view the Warden wrote (no file is opened, so there is no
 # certificate): rule -> the path it answers.
 VIEW_RULES = {"hosts_view": "/etc/hosts", "resolv_view": "/etc/resolv.conf",
-              "nsswitch_view": "/etc/nsswitch.conf", "hostconf_view": "/etc/host.conf"}
+              "nsswitch_view": "/etc/nsswitch.conf", "hostconf_view": "/etc/host.conf",
+              "netsvc_view": "/etc/netsvc.conf", "svc_view": "/etc/svc.conf"}
 O_CREAT, O_TRUNC = 0o100, 0o1000
 
 
@@ -497,7 +501,7 @@ def main(argv=None):
         problems.append(f"the policy file hashes to {digest}, the Warden ran with {recorded}")
 
     lines, which = [], []
-    authorized = refused = lookups = connects = views = 0
+    authorized = refused = lookups = connects = views = stubs = 0
     resolutions = meta.get("resolutions", [])
     names_policy = meta.get("run_start", {}).get("host_name_rules") is True
     others = []                          # (rec, decided rule, other candidates)
@@ -526,6 +530,18 @@ def main(argv=None):
                 problems.append(f"seq {rec.get('seq')}: a lookup answered as a directory the "
                                 f"policy leads to, but it asked for more than a read")
             lookups += 1
+            continue
+        if rec.get("rule") == "dns_stub" and rec.get("action") in ("net.connect", "net.send"):
+            # v1.25: a connect or send to the Warden's own stub resolver (no
+            # certificate: it reaches nothing outside the agent's namespace)
+            stub = meta.get("run_start", {}).get("dns_stub")
+            if not stub:
+                problems.append(f"seq {rec.get('seq')}: a stub connect, but run_start names no "
+                                f"stub resolver")
+            elif rec.get("resolved") != stub:
+                problems.append(f"seq {rec.get('seq')}: a dns_stub record to {rec.get('resolved')!r}, "
+                                f"not the stub at {stub}")
+            stubs += 1
             continue
         if rec.get("action") == "file.open" and rec.get("rule") in VIEW_RULES:
             fl = rec.get("open_flags")
@@ -631,7 +647,7 @@ def main(argv=None):
     print(f"varek_audit: run {run} (Warden {warden}, {'complete' if complete else 'INCOMPLETE'}), "
           f"{len(records)} records, {authorized} authorized file opens, {lookups} lookups, "
           f"{connects} authorized connects, "
-          f"{views} host-name views, "
+          f"{views} host-name views, {stubs} stub resolver connects, "
           f"{checked} certificates "
           f"re-checked, {refused} refused in-line")
     print(f"varek_audit: integrity: {integrity}")

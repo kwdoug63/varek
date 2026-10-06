@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 #
 # test_v1250.sh — v1.25.0, wildcard host names: the parts built so far
-# (docs/security/v1.25-wildcard-host-names.md, sections 1 and 2).
+# (docs/security/v1.25-wildcard-host-names.md, sections 1 to 3).
 #
 #   1. policy grammar: *.<suffix>[:port] after `require warden 1.25`, refused
 #      forms, the same answer from the decision procedure and the certificate
@@ -16,6 +16,14 @@
 #      A-label (punycode) form of every Unicode entry; lint names the entry;
 #      the Warden refuses such a policy at startup and, as root, records both
 #      lists' SHA-256 in run_start
+#   3. the stub resolver (as root): Python, curl, Node (dns.lookup and
+#      dns.resolve4), Go, Java and a static musl client resolve a name only a
+#      wildcard allows, through the Warden's stub, and connect, decided on the
+#      name; a name outside every rule fails within 50 ms and no question for
+#      it leaves the host; TCP questions; TXT gets an empty answer and nothing
+#      upstream; any other port-53 connect is refused; the audit accepts the
+#      run and refuses a dns_stub record forged to another address; a policy
+#      with exact names only has no stub
 #
 # Usage: test_v1250.sh <vdp_check> <vdp_cert_check> <test_v1250_shared> [<warden>]
 set -u
@@ -156,6 +164,164 @@ if [ -n "$WARDEN" ]; then
         rm -rf /tmp/varek_v1250
     else skip "run_start (needs root)"; fi
 else skip "the Warden's startup checks (no warden binary given)"; fi
+
+echo "== 3. the stub resolver: names a wildcard allows, resolved when asked =="
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
+    skip "the stub resolver (needs root and the warden binary)"
+else
+    W=/tmp/varek_v1250w
+    rm -rf "$W"; mkdir -p "$W"; chmod 755 "$W"
+    cp "$T/v1250_client.py" "$T/v1250_client.js" "$W/"
+    chmod 644 "$W"/*
+    PORT=$((20000 + RANDOM % 20000))
+    HP=$((40000 + RANDOM % 5000))
+    SFX=svc.example.com
+    printf '{' > "$OUT/zone.json"
+    for c in py node go java musl curl tcp txt; do printf '"%s.%s": {"ttl": 30, "a": ["127.0.0.1"]},' "$c" "$SFX"; done >> "$OUT/zone.json"
+    printf '"x.example.org": {"ttl": 30, "a": ["127.0.0.1"]}}\n' >> "$OUT/zone.json"
+    : > "$OUT/q.log"
+    python3 "$T/dns_test_server.py" --port "$PORT" --zone "$OUT/zone.json" --log "$OUT/q.log" \
+        --ready "$OUT/ready" > "$OUT/dns.out" 2>&1 &
+    SERVERS="$!"
+    python3 -m http.server "$HP" --bind 127.0.0.1 > /dev/null 2>&1 &
+    SERVERS="$SERVERS $!"
+    trap 'kill $SERVERS 2>/dev/null; rm -rf "$OUT" "$W"' EXIT
+    for _ in $(seq 50); do
+        [ -e "$OUT/ready" ] && python3 -c "import socket; socket.create_connection(('127.0.0.1', $HP), 0.2)" 2>/dev/null && break
+        sleep 0.1
+    done
+    NODE=$(readlink -f "$(command -v node 2>/dev/null)" 2>/dev/null)
+    JAVA=$(ls /usr/lib/jvm/java-21-openjdk-*/bin/java 2>/dev/null | head -1)
+    [ -n "$JAVA" ] || JAVA=$(readlink -f "$(command -v java 2>/dev/null)" 2>/dev/null)
+    PREFIXES="/usr/ /lib /etc/ssl/ /proc/ /sys/ $W/"
+    [ -n "$NODE" ] && PREFIXES="$PREFIXES $(dirname "$(dirname "$NODE")")/"
+    [ -n "$JAVA" ] && PREFIXES="$PREFIXES $(dirname "$(dirname "$JAVA")")/ /etc/java-21-openjdk/ /etc/java-17-openjdk/"
+    POL="$OUT/stub.policy"
+    { printf 'require warden 1.25\n'
+      printf 'allow host *.%s:%s\n' "$SFX" "$HP"
+      printf 'allow host 127.0.0.1:53\n'                    # refused anyway: not the stub
+      for d in $PREFIXES; do printf 'allow path %s readonly\n' "$d"; done
+      printf 'allow path /etc/ld.so.cache readonly\nallow path /tmp/hsperfdata_nobody/\n'
+    } > "$POL"
+    agent() { env -i PATH=/usr/bin:/bin timeout 90 "$WARDEN" "$POL" --dns-server "127.0.0.1:$PORT" "$@" 2> "$OUT/a.log"; }
+    fast() {   # fast <file> <case>: the case failed within 50 ms
+        awk -v c="$2" '$1 == "ERR" && $2 == c && $NF < 50 {ok = 1} END {exit !ok}' "$1"
+    }
+
+    agent -- /usr/bin/python3 "$W/v1250_client.py" "$HP" "py.$SFX" x.example.org > "$OUT/py.out"
+    sed 's/^/     /' "$OUT/py.out"
+    check "run_start names the stub"                    grep -q '"dns_stub":"127.53.53.53:53"' "$OUT/a.log"
+    check "python (glibc): a name only the wildcard allows resolves through the stub" \
+        grep -q '^OK resolve 127.0.0.1 ' "$OUT/py.out"
+    check "python: and connects"                         grep -q '^OK http 200 ' "$OUT/py.out"
+    check "the connect was decided on the name" \
+        grep -q "\"resolved\":\"py.$SFX:$HP\",\"decision_raw\":\"ALLOW\"" "$OUT/a.log"
+    check "the name's lookup is a resolution record (dynamic)" \
+        grep -q "\"event\":\"resolution\",\"run\":\"[0-9a-f]*\",\"name\":\"py.$SFX\".*\"dynamic\":true" "$OUT/a.log"
+    check "the agent's questions went to the stub (dns_stub records)" \
+        grep -q '"target":"127.53.53.53:53",.*"rule":"dns_stub"' "$OUT/a.log"
+    if fast "$OUT/py.out" unlisted; then pass "a name outside every rule fails within 50 ms"
+    else flunk "a name outside every rule fails within 50 ms"; fi
+    check "the audit accepts the run" \
+        python3 "$HERE/tools/varek_audit.py" --policy "$POL" --checker "$CERT" "$OUT/a.log"
+    python3 - "$OUT/a.log" "$OUT/forged.log" <<'PY'
+import hashlib, sys
+head = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
+out, done = [], False
+for line in open(sys.argv[1], encoding="utf-8", errors="surrogateescape"):
+    if line.startswith("{") and ',"chain":"' in line:
+        cut = line.index(',"chain":"')
+        body = line[:cut]
+        if not done and '"rule":"dns_stub"' in body:
+            body = body.replace('"resolved":"127.53.53.53:53"', '"resolved":"127.0.0.1:53"')
+            done = True
+        head = hashlib.sha256(head + body.encode("utf-8", "surrogateescape")).digest()
+        line = body + ',"chain":"' + head.hex() + line[cut + 10 + 64:]
+    out.append(line)
+open(sys.argv[2], "w", encoding="utf-8", errors="surrogateescape").write("".join(out))
+PY
+    if python3 "$HERE/tools/varek_audit.py" --policy "$POL" --checker "$CERT" "$OUT/forged.log" > "$OUT/forged.out" 2>&1; then
+        flunk "the audit refuses a dns_stub record to another address"
+    else check "the audit refuses a dns_stub record to another address" grep -q 'not the stub' "$OUT/forged.out"; fi
+
+    agent -- /usr/bin/python3 "$W/v1250_client.py" raw tcp A "tcp.$SFX" > "$OUT/raw.out"
+    agent -- /usr/bin/python3 "$W/v1250_client.py" raw udp TXT "txt.$SFX" >> "$OUT/raw.out"
+    agent -- /usr/bin/python3 "$W/v1250_client.py" raw udp A x.example.org >> "$OUT/raw.out"
+    agent -- /usr/bin/python3 "$W/v1250_client.py" connect 127.0.0.1 53 >> "$OUT/raw.out"
+    sed 's/^/     /' "$OUT/raw.out"
+    check "a question over TCP is answered"             grep -q '^OK raw-tcp-A rcode=0 an=1 127.0.0.1 ' "$OUT/raw.out"
+    check "a TXT question for an allowed name: an empty answer" \
+        grep -q '^OK raw-udp-TXT rcode=0 an=0 ' "$OUT/raw.out"
+    check "a question for a name outside every rule: NXDOMAIN" \
+        grep -q '^OK raw-udp-A rcode=3 an=0 ' "$OUT/raw.out"
+    check "a connect to another port-53 server is refused (dns_refused)" \
+        grep -q '^ERR connect 127.0.0.1:53 ' "$OUT/raw.out"
+
+    if command -v curl > /dev/null; then
+        agent -- /usr/bin/curl -s -o /dev/null -w '%{http_code}\n' --max-time 5 "http://curl.$SFX:$HP/" > "$OUT/curl.out"
+        check "curl: fetches from a name only the wildcard allows" grep -qx 200 "$OUT/curl.out"
+    else skip "curl (not installed)"; fi
+
+    if [ -n "$NODE" ]; then
+        agent -- "$NODE" "$W/v1250_client.js" "$HP" "node.$SFX" x.example.org > "$OUT/node.out"
+        sed 's/^/     /' "$OUT/node.out"
+        check "node: dns.lookup resolves"            grep -q '^OK resolve 127.0.0.1 ' "$OUT/node.out"
+        check "node: and http connects"              grep -q '^OK http 200 ' "$OUT/node.out"
+        check "node: dns.resolve4 (its own question) resolves through the stub" \
+            grep -q '^OK resolve4 127.0.0.1 ' "$OUT/node.out"
+        check "node: a name outside every rule fails (lookup and resolve4)" \
+            sh -c "grep -q '^ERR unlisted ' '$OUT/node.out' && grep -q '^ERR resolve4-unlisted ' '$OUT/node.out'"
+    else skip "node (not installed)"; fi
+
+    GO=$(command -v go || ls /usr/local/go/bin/go 2>/dev/null)
+    if [ -n "$GO" ] && (cd "$T" && CGO_ENABLED=0 GOCACHE="$OUT/gocache" "$GO" build -o "$W/v1250_client_go" \
+            v1250_client.go) > /dev/null 2>&1; then
+        chmod 755 "$W/v1250_client_go"
+        agent -- "$W/v1250_client_go" "$HP" "go.$SFX" x.example.org > "$OUT/go.out"
+        sed 's/^/     /' "$OUT/go.out"
+        check "go (its own resolver, its own questions): resolves" grep -q '^OK resolve 127.0.0.1 ' "$OUT/go.out"
+        check "go: and http connects"                               grep -q '^OK http 200 ' "$OUT/go.out"
+        if fast "$OUT/go.out" unlisted; then pass "go: a name outside every rule fails within 50 ms"
+        else flunk "go: a name outside every rule fails within 50 ms"; fi
+    else skip "go (not installed)"; fi
+
+    JAVAC="$(dirname "$JAVA" 2>/dev/null)/javac"
+    if [ -n "$JAVA" ] && [ -x "$JAVAC" ] && "$JAVAC" --release 11 -d "$W" "$T/V1250Client.java" > /dev/null 2>&1; then
+        chmod -R a+rX "$W"
+        agent -- "$JAVA" -Xshare:off -cp "$W" V1250Client "$HP" "java.$SFX" x.example.org > "$OUT/java.out"
+        sed 's/^/     /' "$OUT/java.out"
+        check "java: resolves"                   grep -q '^OK resolve 127.0.0.1 ' "$OUT/java.out"
+        check "java: and http connects"          grep -q '^OK http 200 ' "$OUT/java.out"
+        check "java: a name outside every rule fails" grep -q '^ERR unlisted ' "$OUT/java.out"
+    else skip "java (no JDK)"; fi
+
+    if command -v musl-gcc > /dev/null && musl-gcc -static -O2 -o "$W/v1250_client_musl" "$T/v1250_client_musl.c" 2>/dev/null; then
+        chmod 755 "$W/v1250_client_musl"
+        agent -- "$W/v1250_client_musl" "$HP" "musl.$SFX" x.example.org > "$OUT/musl.out"
+        sed 's/^/     /' "$OUT/musl.out"
+        check "musl (sendto, unconnected): resolves through the stub" grep -q '^OK resolve 127.0.0.1 ' "$OUT/musl.out"
+        check "musl: and connects"                                     grep -q '^OK http 200 ' "$OUT/musl.out"
+        if fast "$OUT/musl.out" unlisted; then pass "musl: a name outside every rule fails within 50 ms"
+        else flunk "musl: a name outside every rule fails within 50 ms"; fi
+        check "musl's sends are dns_stub records" \
+            grep -q '"action":"net.send","target":"127.53.53.53:53".*"rule":"dns_stub"' "$OUT/a.log"
+    else skip "musl (musl-gcc not installed)"; fi
+
+    sed 's/^/     upstream: /' "$OUT/q.log" | sort | uniq -c | head -20
+    if grep -q 'example.org' "$OUT/q.log"; then flunk "no question for a name outside every rule left the host"
+    else pass "no question for a name outside every rule left the host"; fi
+    if grep -q '^16 ' "$OUT/q.log"; then flunk "no TXT question left the host"
+    else pass "no TXT question left the host"; fi
+
+    # Exact names only: no stub, as in v1.24.
+    printf 'require warden 1.25\nallow host py.%s:%s\nallow path %s/ readonly\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\n' \
+        "$SFX" "$HP" "$W" > "$OUT/exact.policy"
+    env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$OUT/exact.policy" --dns-server "127.0.0.1:$PORT" \
+        -- /usr/bin/python3 "$W/v1250_client.py" "$HP" "py.$SFX" x.example.org > "$OUT/exact.out" 2> "$OUT/e.log"
+    check "a policy without wildcards has no stub (and still resolves its exact names)" \
+        sh -c "! grep -q 'dns_stub' '$OUT/e.log' && grep -q '^OK http 200 ' '$OUT/exact.out'"
+    rm -rf "$W"
+fi
 
 echo
 if [ "$fail" = 0 ]; then echo "test_v1250: PASS ($skips skipped)"; else echo "test_v1250: FAIL"; fi

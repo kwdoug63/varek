@@ -85,6 +85,12 @@ typedef struct {
     bool       pending;            /* a lookup is with the resolver helper */
     bool       ever_ok;            /* resolved to at least one address once */
     uint64_t   lookups;
+    /* v1.25: a name a wildcard rule matched, added when the agent asked for
+     * it (warden_stub.inc.c). It is looked up only when asked, never
+     * refreshed on its own: when its TTL passes with no new question, its
+     * addresses go into grace (wr_retire_due). Not in the hosts view. */
+    bool        dynamic;
+    wr_status_t st[2];             /* the last lookup's status, A and AAAA */
 } wr_entry_t;
 
 typedef struct wr_async wr_async_t;
@@ -107,6 +113,22 @@ int  wr_table_init(wr_table_t *t, const wr_config_t *cfg, char *why, size_t wn);
 /* Add a name (lowercase, no trailing dot; the policy parsers validated it).
  * A name already present is not added twice. Returns its index, or -1. */
 int  wr_table_add(wr_table_t *t, const char *name);
+
+/* v1.25: the index of name, or -1. */
+int  wr_table_find(const wr_table_t *t, const char *name);
+
+/* v1.25: add a dynamic entry (see wr_entry_t.dynamic), not yet looked up.
+ * A name already present is returned as it is. Its index, or -1. */
+int  wr_table_add_dynamic(wr_table_t *t, const char *name);
+
+/* v1.25: dynamic entries whose TTL has passed (and that no lookup is pending
+ * for): their current addresses go into grace (the TTL, at most grace_max)
+ * and they wait for the next question. Returns how many were retired; the
+ * generation is bumped if any address moved. */
+size_t wr_retire_due(wr_table_t *t, int64_t now);
+
+/* v1.25: is entry i's last answer still in force (looked up, TTL not past)? */
+bool wr_entry_fresh(const wr_entry_t *e, int64_t now);
 
 void wr_table_free(wr_table_t *t);
 
@@ -140,7 +162,8 @@ void wr_expire(wr_table_t *t, int64_t now);
  *   127.0.0.1 localhost
  *   ::1 localhost
  * then one line per current address of each name ("<address> <name>"), names
- * in table order, each name's IPv4 addresses before its IPv6 ones. Addresses in grace are left out (the agent may still connect
+ * in table order, each name's IPv4 addresses before its IPv6 ones. Dynamic
+ * entries (v1.25) are left out: the agent asks the stub for them. Addresses in grace are left out (the agent may still connect
  * to one it read before; it cannot look it up again). */
 void wr_hosts_view(const wr_table_t *t, FILE *f);
 
@@ -155,6 +178,7 @@ int  wr_ip_parse(const char *s, wr_ip_t *ip);
  *   {"event":"resolution","run":RUN,"name":N,"a":ST,"aaaa":ST,
  *    "addresses":[...],"grace":[...],"ttl":T,"refresh_s":R,
  *    "resolver":"...","generation":G,"timestamp_ns":TS}
+ * and, for a dynamic entry (v1.25), "dynamic":true before "timestamp_ns".
  * where ST is ok|nodata|nxdomain|fail, ttl the answer's smallest TTL (absent
  * when nothing answered), refresh_s the clamped TTL in force. */
 void wr_format_record(FILE *f, const char *run, const wr_table_t *t, size_t i,
@@ -180,6 +204,9 @@ int  wr_async_fd(const wr_table_t *t);
 /* False once the helper has exited or its socket failed: refreshes stopped. */
 bool wr_async_alive(const wr_table_t *t);
 void wr_async_schedule(wr_table_t *t, int64_t now);
+/* v1.25: hand entry i to the helper now (a dynamic entry the agent asked
+ * for). 0, or -1 (the helper is gone, or its socket is full). */
+int  wr_async_request(wr_table_t *t, size_t i);
 void wr_async_collect(wr_table_t *t, int64_t now,
                       void (*done)(void *ctx, size_t i, const wr_result_t *r), void *ctx);
 /* Close the socket; the helper exits after its current lookup. */
