@@ -103,7 +103,7 @@ hours, against these targets:
 |---|---|
 | Fastly | `https://pypi.org/robots.txt` |
 | Cloudflare | `https://www.cloudflare.com/cdn-cgi/trace` |
-| CloudFront | `https://d1.awsstatic.com/robots.txt` |
+| CloudFront | `https://aws.amazon.com/robots.txt` |
 
 The results to fill in from `report.txt`:
 - refused connects caused by a stale table (must be 0)
