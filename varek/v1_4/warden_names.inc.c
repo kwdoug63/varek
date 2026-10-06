@@ -165,15 +165,34 @@ static void view_serve(int notify_fd, const struct seccomp_notif *req, struct ac
 
 /* ---- section 4: candidates for a connect ---- */
 
-/* Fill a->cand with the numeric destination (a->resolved, "addr:port") and
- * name:port for each name the address belongs to. 0, or -1 when the address
- * belongs to more names than a connect can carry (refused: a name left out
- * could hold an earlier deny rule). */
+/* The candidates of the connect being decided: the numeric destination, then
+ * name:port for every name the address belongs to (v1.25: as many as there
+ * are; through v1.24 a connect was refused past 15 names, which per-tenant
+ * names under one suffix, served from one CDN address, reach at once). They
+ * live here, not in struct action, and are used before the connect is dialed
+ * or left pending. */
+#define NAMES_LISTED 16                   /* listed in the record up to this many (the address + 15) */
+/* g_cand, g_cand_cap, g_cand_idx: declared in warden.c (certify uses them) */
+
+/* Fill the candidates with the numeric destination (a->resolved, "addr:port")
+ * and name:port for each name the address belongs to; a->ncand is their
+ * number. 0, or -1 when memory for them runs out (refused). */
 static int names_candidates(struct action *a, int fam, const void *addr, unsigned port) {
     a->ncand = 0;
-    /* a numeric destination is at most 47 bytes ("[IPv6]:65535") */
-    snprintf(a->cand[a->ncand++], sizeof a->cand[0], "%.63s", a->resolved);
     snprintf(a->dialed, sizeof a->dialed, "%.63s", a->resolved);
+    size_t want = 1 + (g_names_on ? g_names.n : 0);
+    if (want > g_cand_cap) {
+        size_t nc = want < 64 ? 64 : want * 2;
+        cand_t *c = realloc(g_cand, nc * sizeof *c);
+        if (!c) return -1;
+        g_cand = c;
+        size_t *ix = realloc(g_cand_idx, nc * sizeof *ix);
+        if (!ix) return -1;
+        g_cand_idx = ix;
+        g_cand_cap = nc;
+    }
+    /* a numeric destination is at most 47 bytes ("[IPv6]:65535") */
+    snprintf(g_cand[a->ncand++], sizeof g_cand[0], "%.63s", a->resolved);
     if (!g_names_on) return 0;
     wr_ip_t ip;
     memset(&ip, 0, sizeof ip);
@@ -187,11 +206,10 @@ static int names_candidates(struct action *a, int fam, const void *addr, unsigne
         ip.fam = 4;
         memcpy(ip.a, addr, 4);
     }
-    size_t idx[NAMES_MAX_CAND];
-    size_t n = wr_names_for(&g_names, &ip, wr_now_ms(), idx, NAMES_MAX_CAND - 1);
-    if (n > NAMES_MAX_CAND - 1) return -1;
+    size_t n = wr_names_for(&g_names, &ip, wr_now_ms(), g_cand_idx, g_cand_cap - 1);
+    if (n > g_cand_cap - 1) return -1;               /* cannot happen: at most g_names.n */
     for (size_t k = 0; k < n; k++)
-        snprintf(a->cand[a->ncand++], sizeof a->cand[0], "%s:%u", g_names.e[idx[k]].name, port);
+        snprintf(g_cand[a->ncand++], sizeof g_cand[0], "%s:%u", g_names.e[g_cand_idx[k]].name, port);
     return 0;
 }
 
@@ -204,7 +222,7 @@ static decision_t names_decide(const struct policy *p, struct action *a) {
     decision_t best_d = DEC_UNKNOWN;
     const char *best_why = NULL;
     for (int c = 0; c < a->ncand; c++) {
-        snprintf(a->resolved, sizeof a->resolved, "%s", a->cand[c]);
+        snprintf(a->resolved, sizeof a->resolved, "%s", g_cand[c]);
         decision_t d = policy_decide(p, a);
         if (a->rule_index >= 0 && (best_ri < 0 || a->rule_index < best_ri)) {
             best = c;
@@ -214,24 +232,56 @@ static decision_t names_decide(const struct policy *p, struct action *a) {
         }
     }
     if (best < 0) {                       /* no rule holds on any candidate */
-        snprintf(a->resolved, sizeof a->resolved, "%s", a->cand[0]);
+        snprintf(a->resolved, sizeof a->resolved, "%s", g_cand[0]);
         return policy_decide(p, a);
     }
-    snprintf(a->resolved, sizeof a->resolved, "%s", a->cand[best]);
+    snprintf(a->resolved, sizeof a->resolved, "%s", g_cand[best]);
     a->rule_index = best_ri;
     a->policy_line = p->v.rules[best_ri].line;
     a->why = best_why;
     return best_d;
 }
 
-/* The record fields for a connect decided with names. */
+static int cand_cmp(const void *x, const void *y) {
+    return strcmp(*(const char *const *)x, *(const char *const *)y);
+}
+
+/* The record fields for a connect decided with names: every candidate, or
+ * (v1.25) past NAMES_LISTED of them their number and the SHA-256 of the
+ * candidates sorted bytewise and joined with '\n'. varek_audit.py rebuilds
+ * the candidates from the resolution records and checks either form. */
 static void names_record_fields(struct action *a) {
     if (!g_names_on || a->ncand == 0) return;     /* a Unix connect has no candidates */
+    if (a->ncand > NAMES_LISTED) {
+        const char **v = malloc((size_t)a->ncand * sizeof *v);
+        unsigned char h[crypto_hash_sha256_BYTES];
+        char hx[2 * crypto_hash_sha256_BYTES + 1];
+        if (!v) {
+            snprintf(a->extra, sizeof a->extra, "\"dialed\":\"%s\",\"candidates_n\":%d,", a->dialed, a->ncand);
+            return;
+        }
+        for (int c = 0; c < a->ncand; c++) v[c] = g_cand[c];
+        qsort(v, (size_t)a->ncand, sizeof *v, cand_cmp);
+        crypto_hash_sha256_state st;
+        crypto_hash_sha256_init(&st);
+        for (int c = 0; c < a->ncand; c++) {
+            if (c) crypto_hash_sha256_update(&st, (const unsigned char *)"\n", 1);
+            crypto_hash_sha256_update(&st, (const unsigned char *)v[c], strlen(v[c]));
+        }
+        crypto_hash_sha256_final(&st, h);
+        free(v);
+        sodium_bin2hex(hx, sizeof hx, h, sizeof h);
+        snprintf(a->extra, sizeof a->extra,
+                 "\"dialed\":\"%s\",\"candidates_n\":%d,\"candidates_sha256\":\"%s\","
+                 "\"resolution_generation\":%llu,",
+                 a->dialed, a->ncand, hx, (unsigned long long)g_names.generation);
+        return;
+    }
     size_t w = 0;
     int k = snprintf(a->extra, sizeof a->extra, "\"dialed\":\"%s\",\"candidates\":[", a->dialed);
     if (k > 0) w = (size_t)k;
     for (int c = 0; c < a->ncand && w < sizeof a->extra; c++) {
-        k = snprintf(a->extra + w, sizeof a->extra - w, "%s\"%s\"", c ? "," : "", a->cand[c]);
+        k = snprintf(a->extra + w, sizeof a->extra - w, "%s\"%s\"", c ? "," : "", g_cand[c]);
         if (k > 0) w += (size_t)k;
     }
     if (w < sizeof a->extra)

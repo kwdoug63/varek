@@ -48,6 +48,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     policy file, every charge against them, and that every name looked up on
     demand was asked for. `varek refusals` lists budget refusals;
     `varek policy show` shows each rule's budgets.
+  - Many names on one address: a connect is decided over every name its
+    address belongs to, with no limit (through v1.24 one past 15 was refused,
+    `too_many_names`, which per-tenant names behind one CDN address reach at
+    once). Past 15 the record carries `candidates_n` and
+    `candidates_sha256`, and `varek_audit.py` rebuilds the candidates from
+    the resolution records. A name looked up on demand whose TTL passes
+    unasked writes a `resolution` record (`"a":"retired"`). Without it, the
+    audit refused a later connect to that address under another name.
   - Tests: `make test-v1250`. As root it runs Python, curl, Node
     (`dns.lookup` and `dns.resolve4`), Go, Java and a static musl client
     through the stub, and a DNS-tunnel style client against the budgets.

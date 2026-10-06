@@ -56,6 +56,7 @@ typedef enum {
     WR_ST_NODATA,                  /* the name exists, no record of this type */
     WR_ST_NXDOMAIN,                /* the name does not exist */
     WR_ST_FAIL,                    /* timeout, SERVFAIL, refused, malformed */
+    WR_ST_RETIRED,                 /* v1.25, records only: a dynamic entry's TTL passed unasked */
 } wr_status_t;
 
 typedef struct {
@@ -123,9 +124,11 @@ int  wr_table_add_dynamic(wr_table_t *t, const char *name);
 
 /* v1.25: dynamic entries whose TTL has passed (and that no lookup is pending
  * for): their current addresses go into grace (the TTL, at most grace_max)
- * and they wait for the next question. Returns how many were retired; the
- * generation is bumped if any address moved. */
-size_t wr_retire_due(wr_table_t *t, int64_t now);
+ * and they wait for the next question. The generation is bumped for each
+ * entry whose addresses moved, and done (if not NULL) is called for each
+ * retired entry, after that, to write its record. Returns how many were
+ * retired. */
+size_t wr_retire_due(wr_table_t *t, int64_t now, void (*done)(void *ctx, size_t i), void *ctx);
 
 /* v1.25: is entry i's last answer still in force (looked up, TTL not past)? */
 bool wr_entry_fresh(const wr_entry_t *e, int64_t now);
@@ -179,7 +182,7 @@ int  wr_ip_parse(const char *s, wr_ip_t *ip);
  *    "addresses":[...],"grace":[...],"ttl":T,"refresh_s":R,
  *    "resolver":"...","generation":G,"timestamp_ns":TS}
  * and, for a dynamic entry (v1.25), "dynamic":true before "timestamp_ns".
- * where ST is ok|nodata|nxdomain|fail, ttl the answer's smallest TTL (absent
+ * where ST is ok|nodata|nxdomain|fail (or, v1.25, retired), ttl the answer's smallest TTL (absent
  * when nothing answered), refresh_s the clamped TTL in force. */
 void wr_format_record(FILE *f, const char *run, const wr_table_t *t, size_t i,
                       const wr_result_t *r, int64_t now);

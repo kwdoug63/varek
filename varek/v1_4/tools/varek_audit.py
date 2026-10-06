@@ -143,6 +143,9 @@ def check_dns(meta, policy, problems):
     for e in events:
         name, ts = e.get("name"), e.get("timestamp_ns")
         if e.get("event") == "resolution":
+            if e.get("a") == "retired":          # its TTL passed unasked: into grace, no lookup
+                latest[name] = e
+                continue
             if e.get("dynamic") is True:
                 if name not in asked:
                     problems.append(f"{name}: looked up on demand with no question asking for it")
@@ -204,6 +207,8 @@ def check_names(rec, pos, resolutions, problems):
     candidates other than the one decided on (for the earlier-rule check)."""
     seq = rec.get("seq")
     cands, dialed, res = rec.get("candidates"), rec.get("dialed"), rec.get("resolved")
+    if "candidates_sha256" in rec:
+        return check_names_hashed(rec, pos, resolutions, problems)
     if not (isinstance(cands, list) and cands and all(isinstance(c, str) for c in cands)
             and isinstance(dialed, str) and cands[0] == dialed and res in cands):
         problems.append(f"seq {seq}: a connect's candidates, dialed address and decided "
@@ -242,6 +247,60 @@ def check_names(rec, pos, resolutions, problems):
             problems.append(f"seq {seq}: {name} resolved to {addr} but is not a candidate: the "
                             f"connect was not decided on every name of its address")
     return [c for c in cands if c != res]
+
+
+def check_names_hashed(rec, pos, resolutions, problems):
+    """v1.25: a connect whose address belonged to more than 15 names records
+    their number and the SHA-256 of all its candidates (the address dialed
+    and name:port for each name), sorted and joined with newlines, instead of
+    listing them. The candidates are rebuilt here from the resolution records
+    before the connect: every name whose latest record lists the address, or
+    holds it in grace. A record gives grace in whole seconds, the Warden
+    keeps it to the millisecond, so a name within about a second of its grace
+    ending may be in or out: each way is tried. Returns the candidates other
+    than the one decided on."""
+    seq, dialed, res = rec.get("seq"), rec.get("dialed"), rec.get("resolved")
+    n, h, ts = rec.get("candidates_n"), rec.get("candidates_sha256"), rec.get("timestamp_ns")
+    if not (isinstance(dialed, str) and isinstance(n, int) and isinstance(h, str)
+            and isinstance(ts, int) and isinstance(res, str)):
+        problems.append(f"seq {seq}: a connect's hashed candidates are malformed")
+        return []
+    addr, port = _addr_of(dialed), dialed.rsplit(":", 1)[-1]
+    latest = {}
+    for p, r in resolutions:
+        if p > pos:
+            break
+        if isinstance(r.get("name"), str):
+            latest[r["name"]] = r
+    sure, maybe = set(), []
+    for name, r in latest.items():
+        if addr in (r.get("addresses") or []):
+            sure.add(name)
+            continue
+        for g in r.get("grace") or []:
+            if not (isinstance(g, dict) and g.get("address") == addr and isinstance(g.get("until_s"), int)
+                    and isinstance(r.get("timestamp_ns"), int)):
+                continue
+            end = r["timestamp_ns"] + g["until_s"] * 10**9
+            if ts <= end - 2 * 10**9:
+                sure.add(name)
+            elif ts <= end + 10**9:
+                maybe.append(name)
+    if len(maybe) > 12:
+        problems.append(f"seq {seq}: {len(maybe)} names of {addr} end their grace at once; "
+                        f"the hashed candidates cannot be checked")
+        return []
+    for mask in range(1 << len(maybe)):
+        names = sure | {m for i, m in enumerate(maybe) if mask >> i & 1}
+        cands = sorted([dialed] + [f"{x}:{port}" for x in names])
+        if len(cands) == n and hashlib.sha256("\n".join(cands).encode()).hexdigest() == h:
+            if res not in cands:
+                problems.append(f"seq {seq}: decided on {res!r}, which is not a candidate")
+                return []
+            return [c for c in cands if c != res]
+    problems.append(f"seq {seq}: the connect's {n} hashed candidates are not the address's names "
+                    f"by the resolution records (it was not decided on every name of {addr})")
+    return []
 
 
 def policy_ancestors(path):
@@ -705,7 +764,7 @@ def main(argv=None):
             continue
         lines.append(f"{'host' if is_conn else 'path'} {fl} {hx} {cr} {cw}")
         which.append(rec)
-        if is_conn and "candidates" in rec:
+        if is_conn and ("candidates" in rec or "candidates_sha256" in rec):
             others.append((rec, cr, check_names(rec, pos, resolutions, problems)))
 
     checked = 0

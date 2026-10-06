@@ -698,7 +698,7 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
             return;
         }
         if (g_any_name && port == 53) rule = "dns_refused";
-        else if (names_candidates(a, dial.ss_family, ad, port) < 0) rule = "too_many_names";
+        else if (names_candidates(a, dial.ss_family, ad, port) < 0) rule = "out_of_memory";
         if (rule) {
             close(ag);
             net_record(tid, a, DEC_DENY, DEC_DENY, rule, t0, EACCES);

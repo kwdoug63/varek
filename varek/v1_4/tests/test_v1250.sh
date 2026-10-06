@@ -30,6 +30,9 @@
 #      budgets; every question is a chained dns_question record; the audit
 #      accepts the run and refuses a removed question, budgets that are not
 #      the policy's, and a name charged past its budget
+#   4b. (as root) 40 names on one address all connect, recorded past 15 as a
+#      count and hash the audit rebuilds; a forged resolution fails it; a
+#      name that expires unasked is recorded ("retired") and audited so
 #
 # Usage: test_v1250.sh <vdp_check> <vdp_cert_check> <test_v1250_shared> [<warden>]
 set -u
@@ -419,6 +422,60 @@ PY
     tamper '(body.replace("\"rule\":\"wildcard_budget\",\"policy_line\":2,\"budget\":\"names\",", "\"rule\":\"policy_match\",\"policy_line\":2,\"new\":true,", 1) if not state["done"] and "\"budget\":\"names\"" in body and not state.update(done=True) else body)' "$OUT/t3.log"
     check "the audit refuses a sixth name charged to a names=5 rule" \
         refused_by_audit "$OUT/t3.log" "charged more than its 5 names"
+
+    echo "== 4b. many names on one address, and names that expire unasked =="
+    # 40 per-tenant names served from one address (as a CDN serves them):
+    # through v1.24 a connect was refused past 15 names (too_many_names).
+    printf '{' > "$OUT/zone.json"
+    for i in $(seq 0 39); do printf '"n%s.many.example.com": {"ttl": 300, "a": ["127.0.0.1"]},' "$i"; done >> "$OUT/zone.json"
+    printf '"x.short.example.com": {"ttl": 1, "a": ["127.0.0.1"]}, "y.short.example.com": {"ttl": 300, "a": ["127.0.0.1"]}}\n' >> "$OUT/zone.json"
+    POL5="$OUT/many.policy"
+    { printf 'require warden 1.25\n'
+      printf 'allow host *.many.example.com:%s names=100 rate=100\n' "$HP"   # 40 new names in seconds
+      printf 'allow host *.short.example.com:%s\n' "$HP"
+      printf 'allow path %s readonly\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\n' "$W/"
+    } > "$POL5"
+    NAMES=""
+    for i in $(seq 0 39); do NAMES="$NAMES n$i.many.example.com"; done
+    env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$POL5" --dns-server "127.0.0.1:$PORT" \
+        -- /usr/bin/python3 "$W/v1250_client.py" fetch "$HP" $NAMES > "$OUT/many.out" 2> "$OUT/m.log"
+    check "40 names on one address: every fetch succeeds" \
+        sh -c "[ \$(grep -c '^OK fetch n[0-9]*.many.example.com 200 ' '$OUT/many.out') = 40 ]"
+    check "past 15 names a connect records their number and hash" \
+        grep -q '"candidates_n":41,"candidates_sha256":"[0-9a-f]\{64\}"' "$OUT/m.log"
+    check "and the audit rebuilds them from the resolution records" \
+        python3 "$HERE/tools/varek_audit.py" --policy "$POL5" --checker "$CERT" "$OUT/m.log"
+    # Forged: one name's resolution moved to another address, chain recomputed.
+    python3 - "$OUT/m.log" "$OUT/m_forged.log" <<'PY'
+import hashlib, sys
+head = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
+out = []
+for line in open(sys.argv[1], encoding="utf-8", errors="surrogateescape"):
+    if line.startswith("{") and ',"chain":"' in line:
+        cut = line.index(',"chain":"')
+        body = line[:cut]
+        if '"event":"resolution"' in body and '"name":"n7.many.example.com"' in body:
+            body = body.replace('"addresses":["127.0.0.1"]', '"addresses":["127.0.0.9"]')
+        head = hashlib.sha256(head + body.encode("utf-8", "surrogateescape")).digest()
+        line = body + ',"chain":"' + head.hex() + line[cut + 10 + 64:]
+    out.append(line)
+open(sys.argv[2], "w", encoding="utf-8", errors="surrogateescape").write("".join(out))
+PY
+    if python3 "$HERE/tools/varek_audit.py" --policy "$POL5" --checker "$CERT" "$OUT/m_forged.log" > "$OUT/mf.out" 2>&1; then
+        flunk "the audit refuses hashed candidates that are not the address's names"
+    else check "the audit refuses hashed candidates that are not the address's names" \
+        grep -q 'hashed candidates are not' "$OUT/mf.out"; fi
+    # A name looked up on demand whose TTL passes unasked: its addresses go into
+    # grace, recorded ("retired"), and a later connect to the same address under
+    # another name is audited against that, not against the stale answer.
+    env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$POL5" --dns-server "127.0.0.1:$PORT" \
+        --dns-ttl-min 1 --dns-grace-max 1 -- /usr/bin/python3 "$W/v1250_client.py" fetch "$HP" \
+        x.short.example.com sleep:4 y.short.example.com > "$OUT/short.out" 2> "$OUT/s.log"
+    check "both fetches succeed"   sh -c "[ \$(grep -c '^OK fetch .* 200 ' '$OUT/short.out') = 2 ]"
+    check "a name that expired unasked is a resolution record (\"retired\")" \
+        grep -q '"name":"x.short.example.com","a":"retired","aaaa":"retired","addresses":\[\]' "$OUT/s.log"
+    check "and the audit accepts the later connect" \
+        python3 "$HERE/tools/varek_audit.py" --policy "$POL5" --checker "$CERT" "$OUT/s.log"
     rm -rf "$W"
 fi
 

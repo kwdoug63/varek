@@ -255,11 +255,17 @@ struct action {
     bool          path_null;            /* a NULL path pointer */
     bool          bad_flags;            /* flags the kernel would refuse (EINVAL) */
     /* v1.24: host names (warden_names.inc.c) */
-    int           ncand;                /* connect: candidate strings decided over */
-    char          cand[16][WR_NAME_MAX + 8];
+    int           ncand;                /* connect: candidate strings decided over (g_cand,
+                                           warden_names.inc.c) */
     char          dialed[64];           /* connect: the numeric destination dialed */
     char          extra[4608];          /* extra record fields, trusted text, each ending in ',' */
 };
+
+/* v1.25: the candidates of the connect being decided (warden_names.inc.c) */
+typedef char cand_t[WR_NAME_MAX + 8];
+static cand_t *g_cand;
+static size_t  g_cand_cap;
+static size_t *g_cand_idx;
 
 static const char *action_kind_name(action_kind_t k) {
     switch (k) {
@@ -906,11 +912,11 @@ static bool certify(const struct policy *p, struct action *a) {
      * that no earlier host rule holds on any other candidate. */
     if (a->kind == ACT_NET_CONNECT && a->ncand > 1) {
         for (int c = 0; c < a->ncand; c++) {
-            if (!strcmp(a->cand[c], s)) continue;
+            if (!strcmp(g_cand[c], s)) continue;
             for (int i = 0; i < cc.r; i++) {
                 vdpc_rule_info_t ri;
                 if (vdpc_rule_info(&p->c, (size_t)i, &ri) < 0 || ri.kind != VDPC_HOST) continue;
-                if (vdpc_holds(&p->c, (size_t)i, a->cand[c], strlen(a->cand[c])) == 1) {
+                if (vdpc_holds(&p->c, (size_t)i, g_cand[c], strlen(g_cand[c])) == 1) {
                     snprintf(a->check_why, sizeof a->check_why,
                              "an earlier rule (line %d) holds on another candidate", ri.line);
                     return false;
@@ -1666,6 +1672,19 @@ static void emit_resolution(void *ctx, size_t i, const wr_result_t *r) {
     wr_format_record(f, g_run_id, &g_names, i, r, wr_now_ms());
     rec_end(NULL);
     stub_resolved(i);                   /* v1.25: answer the agent's waiting questions */
+}
+
+/* v1.25: a dynamic entry's TTL passed with no new question; its addresses
+ * went into grace. A resolution record says so ("a" and "aaaa": "retired"),
+ * so the audit sees the addresses leave as the Warden's table did. */
+static void emit_retired(void *ctx, size_t i) {
+    (void)ctx;
+    wr_result_t r;
+    memset(&r, 0, sizeof r);
+    r.st[0] = r.st[1] = WR_ST_RETIRED;
+    FILE *f = rec_begin();
+    wr_format_record(f, g_run_id, &g_names, i, &r, wr_now_ms());
+    rec_end(NULL);
 }
 
 /* Resolve every name before the agent runs. A name that does not resolve is
@@ -2663,7 +2682,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         int to = maybe_checkpoint(), pto = pend_timeout_ms();
         if (pto >= 0 && (to < 0 || pto < to)) to = pto;
         if (g_names_on) {
-            wr_retire_due(&g_names, wr_now_ms());
+            wr_retire_due(&g_names, wr_now_ms(), emit_retired, NULL);
             wr_async_schedule(&g_names, wr_now_ms());
             int dto = wr_next_due_ms(&g_names, wr_now_ms());
             if (dto >= 0 && (to < 0 || dto < to)) to = dto;

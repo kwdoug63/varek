@@ -117,19 +117,20 @@ bool wr_entry_fresh(const wr_entry_t *e, int64_t now) {
     return e->lookups > 0 && e->next_ms != INT64_MAX && e->next_ms > now;
 }
 
-size_t wr_retire_due(wr_table_t *t, int64_t now) {
+size_t wr_retire_due(wr_table_t *t, int64_t now, void (*done)(void *ctx, size_t i), void *ctx) {
     size_t n = 0;
-    bool moved = false;
     for (size_t i = 0; i < t->n; i++) {
         wr_entry_t *e = &t->e[i];
         if (!e->dynamic || e->pending || e->next_ms == INT64_MAX || e->next_ms > now) continue;
         int64_t until = now + (int64_t)(e->ttl_eff < t->cfg.grace_max ? e->ttl_eff : t->cfg.grace_max) * 1000;
+        bool moved = false;
         for (size_t k = 0; k < e->n; k++)
             if (e->addrs[k].until_ms == 0) { e->addrs[k].until_ms = until; moved = true; }
         e->next_ms = INT64_MAX;
+        if (moved) t->generation++;
+        if (done) done(ctx, i);
         n++;
     }
-    if (moved) t->generation++;
     return n;
 }
 
@@ -403,6 +404,7 @@ static const char *st_name(wr_status_t s) {
         case WR_ST_OK:       return "ok";
         case WR_ST_NODATA:   return "nodata";
         case WR_ST_NXDOMAIN: return "nxdomain";
+        case WR_ST_RETIRED:  return "retired";
         default:             return "fail";
     }
 }

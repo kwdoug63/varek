@@ -14,6 +14,9 @@
 #   v1250_client.py ask <name> ...
 #       getaddrinfo each name in turn, as fast as it can (a DNS-tunnel style
 #       client: every name new); prints one line per name
+#   v1250_client.py fetch <port> <name|sleep:S> ...
+#       resolve and fetch http://<name>:<port>/ for each name in turn, or
+#       sleep S seconds; prints one line per name
 import http.client, os, socket, struct, sys, time
 
 
@@ -82,6 +85,18 @@ if sys.argv[1] == "raw":
 if sys.argv[1] == "ask":
     for n in sys.argv[2:]:
         case("ask " + n, lambda: ",".join(sorted({a[4][0] for a in socket.getaddrinfo(n, 80, proto=socket.IPPROTO_TCP)})))
+    sys.exit(0)
+if sys.argv[1] == "fetch":
+    fport = int(sys.argv[2])
+    for n in sys.argv[3:]:
+        if n.startswith("sleep:"):
+            time.sleep(float(n[6:]))
+            continue
+        def fetch1(h=n):
+            c = http.client.HTTPConnection(h, fport, timeout=3)
+            c.request("GET", "/")
+            return c.getresponse().status
+        case("fetch " + n, fetch1)
     sys.exit(0)
 if sys.argv[1] == "connect":
     case("connect %s:%s" % (sys.argv[2], sys.argv[3]),
