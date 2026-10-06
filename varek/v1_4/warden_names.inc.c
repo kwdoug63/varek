@@ -5,21 +5,26 @@
  * what each allowed name resolved to; this file uses it in two places.
  *
  * Section 3, the views. While the policy has a host name rule, a read-only
- * open of /etc/hosts, /etc/resolv.conf or /etc/nsswitch.conf is answered with
- * a read-only descriptor on a sealed memfd the Warden wrote, never the host's
+ * open of /etc/hosts, /etc/resolv.conf, /etc/nsswitch.conf or /etc/host.conf
+ * is answered with a read-only descriptor on a sealed memfd the Warden wrote, never the host's
  * file:
  *   /etc/hosts          localhost, then each allowed name's current addresses
  *   /etc/resolv.conf    a nameserver no one answers (192.0.2.1, reserved for
  *                       documentation), attempts:1 timeout:0 (musl, which
  *                       queries it, then gives up at once)
  *   /etc/nsswitch.conf  hosts: files (and files for passwd, group)
+ *   /etc/host.conf      multi on: without it (no file, or one the policy does
+ *                       not let the agent read) glibc returns only the first
+ *                       /etc/hosts line for a name, so the agent got a single
+ *                       address, possibly of a family it has no route for
  * The open is matched by the path the agent gave (when it is exactly one of
- * the three) or by the canonical path it resolves to (the three, or what each
+ * the four) or by the canonical path it resolves to (the four, or what each
  * resolved to on the host when the Warden started: /etc/resolv.conf is often
  * a symlink). It needs no allow rule; a deny rule that covers the path wins
  * (the agent then resolves nothing). Each open is a record (rule hosts_view,
- * resolv_view or nsswitch_view) with the hosts view's generation, so an audit
- * can tie what the agent could resolve to the resolution records. While the
+ * resolv_view, nsswitch_view or hostconf_view) with the hosts view's
+ * generation, so an audit can tie what the agent could resolve to the
+ * resolution records. While the
  * policy has a name rule every connect to port 53 is refused (rule
  * dns_refused), whatever the numeric rules say.
  *
@@ -42,11 +47,13 @@ static uint64_t ns_between(const struct timespec *a, const struct timespec *b);
 
 /* ---- section 3: the views ---- */
 
-enum { VIEW_HOSTS = 0, VIEW_RESOLV = 1, VIEW_NSSWITCH = 2, VIEW_N = 3 };
-static const char *const kViewPath[VIEW_N] = { "/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf" };
-static const char *const kViewRule[VIEW_N] = { "hosts_view", "resolv_view", "nsswitch_view" };
+enum { VIEW_HOSTS = 0, VIEW_RESOLV = 1, VIEW_NSSWITCH = 2, VIEW_HOSTCONF = 3, VIEW_N = 4 };
+static const char *const kViewPath[VIEW_N] = { "/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf",
+                                               "/etc/host.conf" };
+static const char *const kViewRule[VIEW_N] = { "hosts_view", "resolv_view", "nsswitch_view",
+                                               "hostconf_view" };
 static char     g_view_canon[VIEW_N][PATH_LIMIT];  /* realpath on the host at startup, or "" */
-static int      g_view_fd[VIEW_N] = { -1, -1, -1 };
+static int      g_view_fd[VIEW_N] = { -1, -1, -1, -1 };
 static uint64_t g_view_gen = UINT64_MAX;          /* g_names.generation the hosts memfd holds */
 
 /* At startup: what each view path resolves to on the host. */
@@ -85,7 +92,8 @@ static int view_memfd(int v) {
     if (!f) return -1;
     if (v == VIEW_HOSTS) wr_hosts_view(&g_names, f);
     else if (v == VIEW_RESOLV) fputs("nameserver 192.0.2.1\noptions attempts:1 timeout:0\n", f);
-    else fputs("passwd: files\ngroup: files\nhosts: files\n", f);
+    else if (v == VIEW_NSSWITCH) fputs("passwd: files\ngroup: files\nhosts: files\n", f);
+    else fputs("multi on\n", f);
     if (fclose(f) != 0) { free(buf); return -1; }
     int fd = memfd_create(kViewRule[v], MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (fd < 0) { free(buf); return -1; }

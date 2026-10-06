@@ -346,11 +346,17 @@ void wr_hosts_view(const wr_table_t *t, FILE *f) {
     char a[INET6_ADDRSTRLEN];
     for (size_t i = 0; i < t->n; i++) {
         const wr_entry_t *e = &t->e[i];
-        for (size_t k = 0; k < e->n; k++) {
-            if (e->addrs[k].until_ms != 0) continue;
-            wr_ip_str(&e->addrs[k].ip, a, sizeof a);
-            fprintf(f, "%s %s\n", a, e->name);
-        }
+        /* IPv4 before IPv6, whatever order the table holds them in. The
+         * table appends a new address after those it keeps, so after a
+         * rotation an IPv6 address could come first, and a client that takes
+         * only the first line (glibc without "multi on") would get an address
+         * the host may have no route for. */
+        for (int fam = 4; fam <= 6; fam += 2)
+            for (size_t k = 0; k < e->n; k++) {
+                if (e->addrs[k].until_ms != 0 || e->addrs[k].ip.fam != fam) continue;
+                wr_ip_str(&e->addrs[k].ip, a, sizeof a);
+                fprintf(f, "%s %s\n", a, e->name);
+            }
     }
 }
 

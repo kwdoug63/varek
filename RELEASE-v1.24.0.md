@@ -1,8 +1,9 @@
 # VAREK v1.24.0 — Host Names Without Agent DNS
 
-> **DRAFT, not released.** Two things stay open before this is tagged: the
-> independent review and the latency figures. Each is marked **PENDING**
-> below. The 24-hour soak run (§5 of the design) passed.
+> **DRAFT, not released.** Three things stay open before this is tagged: the
+> independent review, the latency figures, and a second 24-hour soak run on
+> the Warden with the fix the first run found. Each is marked **PENDING**
+> below.
 
 Released PENDING · MIT · github.com/kwdoug63/varek
 
@@ -36,10 +37,11 @@ query:
    chained `resolution` record, signed at the next checkpoint. Lookups run in a
    resolver helper process, so the supervisor never waits on DNS while an agent
    thread waits on an answer.
-3. **Views.** The agent reads `/etc/hosts`, `/etc/resolv.conf` and
-   `/etc/nsswitch.conf` from sealed memfds that the Warden writes. Its
-   `/etc/hosts` lists localhost and the allowed names' current addresses, and
-   nothing else. Its resolver configuration names a server that no one answers.
+3. **Views.** The agent reads `/etc/hosts`, `/etc/resolv.conf`,
+   `/etc/nsswitch.conf` and `/etc/host.conf` from sealed memfds that the Warden
+   writes. Its `/etc/hosts` lists localhost and the allowed names' current
+   addresses, IPv4 before IPv6, and nothing else. Its `/etc/host.conf` says
+   `multi on`, so glibc returns every address of a name. Its resolver configuration names a server that no one answers.
    Every connect to port 53 is refused (`dns_refused`), whatever the numeric
    rules say.
 4. **Connects decided on names.** A connect is decided on its address and on
@@ -96,6 +98,9 @@ name rules.
 
 ## 24 hours against CDN-hosted APIs
 
+**PENDING:** a second run, on the Warden with the `host.conf` fix below. The
+first run's results:
+
 `tests/soak_v1240/soak.sh` ran for 24.00 hours on a DigitalOcean droplet
 (Ubuntu 24.04, kernel 6.8, 1 vCPU, 1 GB), from 2026-10-05 to 2026-10-06. The
 agent fetched each URL by name once a minute:
@@ -122,8 +127,10 @@ agent fetched each URL by name once a minute:
   records. No fetch needed an address in its grace period.
 - **Each URL was served by the expected network**, judged from its response
   headers.
-- **Failures outside the Warden: 4 of 4,320 fetches**, all to
-  `aws.amazon.com` and all `OSError`. None was a refusal or a failed lookup.
+- **4 of 4,320 fetches failed**, all to `aws.amazon.com`, all
+  `OSError: [Errno 101] Network is unreachable`, within six minutes. The
+  checker counted them as outside the Warden, but they were a Warden bug (see
+  "Found in the soak" below), now fixed.
 - **Audit:** `varek_audit.py` PASS on the 47,972-record stream, with the hash
   chain intact. `soak_check` PASS.
 
@@ -155,8 +162,28 @@ belongs to.
   `run_start`; `resolution` records; and `dialed`, `candidates` and
   `resolution_generation` on connects.
 - New record rules: `hosts_view`, `resolv_view`, `nsswitch_view`,
+  `hostconf_view`,
   `dns_refused` and `too_many_names`.
 - New `vdp_cert_check` mode: `kinds`.
+
+## Found in the soak
+
+**The agent got one address per name, sometimes an unreachable one.** Each
+of the 4 failures dialed an IPv6 address, and the droplet has no IPv6 route.
+The resolution records show the table held the IPv4 addresses throughout. The
+cause was in the views:
+- The soak policy did not let the agent read `/etc/host.conf`. Without its
+  `multi on`, glibc returns only the first `/etc/hosts` line for a name.
+- The table appends a new address after the ones it keeps. When CloudFront
+  rotated its IPv4 addresses, an IPv6 address came first in the view.
+
+The Warden now serves `/etc/host.conf` as a fourth view (`multi on`,
+`hostconf_view`), and the hosts view lists each name's IPv4 addresses before
+its IPv6 ones. `make test-v1240` recreates the failure, with the A record
+appearing after the AAAA one: against the earlier v1.24 code the agent
+resolves only `2001:db8::10` and its fetch fails; with the fix it resolves
+both and connects. `soak_check.py` now reports failures by their full message
+rather than the exception type alone.
 
 ## Found in review
 
@@ -174,7 +201,7 @@ belongs to.
   v1.25.
 - **DNSSEC.** The Warden trusts the host's resolver and does not validate
   DNSSEC itself. Use `--dns-server` to point it at a validating resolver.
-- **Metadata on the view paths.** `stat` and `access` on the three view paths
+- **Metadata on the view paths.** `stat` and `access` on the four view paths
   are decided as before; only opens get the views. Every client tested
   resolves without them.
 - **Refresh changes and checkpoints.** A refresh that changes a name's

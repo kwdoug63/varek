@@ -33,7 +33,7 @@ policy file alone:
      Warden runs; it shares no code with the decision procedure).
   5. A stream from the test-only fault-injected Warden is refused.
   6. v1.24, host names: a view the Warden served for /etc/hosts,
-     /etc/resolv.conf or /etc/nsswitch.conf (no file opened, so no
+     /etc/resolv.conf, /etc/nsswitch.conf or /etc/host.conf (no file opened, so no
      certificate) is accepted only for that path, a read-only open, in a run
      whose policy has host name rules. A connect decided with the resolution
      table must name every candidate it was decided over: each name bound to
@@ -81,7 +81,7 @@ CONNECT_RULES = ("dialed_fd_injection", "dialed_in_progress", "dial_failed",
 # answered with a view the Warden wrote (no file is opened, so there is no
 # certificate): rule -> the path it answers.
 VIEW_RULES = {"hosts_view": "/etc/hosts", "resolv_view": "/etc/resolv.conf",
-              "nsswitch_view": "/etc/nsswitch.conf"}
+              "nsswitch_view": "/etc/nsswitch.conf", "hostconf_view": "/etc/host.conf"}
 O_CREAT, O_TRUNC = 0o100, 0o1000
 
 

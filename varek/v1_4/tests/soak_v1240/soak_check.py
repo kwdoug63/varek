@@ -115,7 +115,10 @@ def main():
     if other:
         kinds = {}
         for f in other:
-            k = f.get("error", f"HTTP {f.get('status')}").split(":")[0]
+            # the whole message, not only the type: four "OSError: [Errno 101]
+            # Network is unreachable" in the first 24-hour run were the Warden's
+            # (an IPv6-only hosts view on an IPv4-only host), not the network's
+            k = f.get("error", f"HTTP {f.get('status')}")[:80]
             kinds[k] = kinds.get(k, 0) + 1
         say(f"failures outside the Warden: {len(other)} ({', '.join(f'{k} x{v}' for k, v in kinds.items())})")
         if fetches and len(other) / len(fetches) > a.max_other_failures:
