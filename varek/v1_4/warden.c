@@ -132,6 +132,7 @@
 #include "checker/vdp_checker.h"   /* v1.15 independent certificate checker */
 #include "warden_lifecycle.h"   /* v1.9.3 supervisor/target lifecycle coupling */
 #include "warden_resolve.h"     /* v1.24 resolution table for host name rules */
+#include "shared_domains.h"     /* v1.25 wildcards over shared domains, refused at load */
 
 /* Kernel/libc compatibility shims --------------------------------- */
 #ifndef __NR_openat2
@@ -352,7 +353,7 @@ static int policy_load(const char *path, struct policy *p) {
             ci.kind != kind_to_c[r->kind] || ci.match != op_to_match[r->s.op] ||
             ci.clen != r->s.len || memcmp(ci.c, r->s.c, r->s.len) != 0 ||
             ci.mask != r->b.mask || ci.value != r->b.value || ci.line != r->line ||
-            ci.portless != r->s.portless || ci.name != r->s.name) {
+            ci.portless != r->s.portless || ci.name != r->s.name || ci.wild != r->s.wild) {
             fprintf(stderr, "[warden] policy %s:%d: the decision procedure and the certificate "
                     "checker read this rule differently; refusing to start\n", path, r->line);
             return -1;
@@ -1266,6 +1267,7 @@ static char     g_run_id[33];
 static wr_table_t g_names;           /* v1.24: the resolution table (see names_setup) */
 static bool       g_names_on = false;
 static bool       g_any_name = false;  /* v1.24: the policy has a host name rule (allow or deny) */
+static char       g_psl_sha[65], g_shared_sha[65];  /* v1.25: the lists wildcards were checked against */
 static uint64_t g_records = 0;       /* decision records emitted */
 static bool     g_relay_midline = false;
 
@@ -1527,6 +1529,9 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     if (g_anchor_fd >= 0) fputs("\"anchored\":true,", f);
     /* v1.24: the names the Warden resolves (each gets a resolution record). */
     if (g_any_name) fputs("\"host_name_rules\":true,", f);
+    /* v1.25: the lists the policy's wildcards were checked against */
+    if (g_psl_sha[0]) fprintf(f, "\"psl_sha256\":\"%s\",\"shared_domains_sha256\":\"%s\",",
+                              g_psl_sha, g_shared_sha);
     if (g_names_on) fprintf(f, "\"host_names\":%zu,\"resolver\":\"%s\",", g_names.n, g_names.resolver);
     fprintf(f, "\"timestamp_ns\":%lld}\n", (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end("run_start");
@@ -1545,7 +1550,8 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
     for (size_t i = 0; i < p->v.n; i++) {
         const vdp_rule_t *r = &p->v.rules[i];
         if (r->kind == VDP_KIND_HOST && r->s.name) g_any_name = true;
-        if (r->kind != VDP_KIND_HOST || !r->s.name || r->verb != VDP_ALLOW) continue;
+        /* v1.25: a wildcard names no host to resolve in advance */
+        if (r->kind != VDP_KIND_HOST || !r->s.name || r->s.wild || r->verb != VDP_ALLOW) continue;
         char name[WR_NAME_MAX + 1];
         const char *colon = memchr(r->s.c, ':', r->s.len);
         size_t nl = colon ? (size_t)(colon - r->s.c) : r->s.len;
@@ -1558,6 +1564,69 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
         }
     }
     g_names_on = g_names.n > 0;
+    return 0;
+}
+
+/* v1.25: an allow wildcard over a shared domain (a public suffix, an entry of
+ * the Public Suffix List's private section, or the VAREK list) is refused at
+ * load: anyone could register a name under it. The lists are pinned files
+ * (data/); their SHA-256 goes in run_start. 0, or -1 (the Warden does not
+ * start). */
+static int sha256_file_hex(const char *path, char out[65]) {
+    FILE *f = fopen(path, "re");
+    if (!f) return -1;
+    crypto_hash_sha256_state st;
+    crypto_hash_sha256_init(&st);
+    unsigned char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) crypto_hash_sha256_update(&st, buf, n);
+    int bad = ferror(f);
+    fclose(f);
+    if (bad) return -1;
+    unsigned char h[32];
+    crypto_hash_sha256_final(&st, h);
+    sodium_bin2hex(out, 65, h, sizeof h);
+    return 0;
+}
+
+static int wildcards_check(const char *path, const struct policy *p, const char *psl_arg,
+                           const char *shared_arg) {
+    bool any = false;
+    for (size_t i = 0; i < p->v.n; i++)
+        if (p->v.rules[i].kind == VDP_KIND_HOST && p->v.rules[i].s.wild) any = true;
+    if (!any) return 0;
+    char psl[PATH_MAX], var[PATH_MAX], why[512];
+    if (psl_arg) snprintf(psl, sizeof psl, "%s", psl_arg);
+    else if (sd_default_path("public_suffix_list.dat", psl, sizeof psl) < 0) {
+        fprintf(stderr, "[warden] the policy has wildcard host rules, and the Public Suffix List "
+                "(data/public_suffix_list.dat) was not found; give --psl\n");
+        return -1;
+    }
+    if (shared_arg) snprintf(var, sizeof var, "%s", shared_arg);
+    else if (sd_default_path("varek_shared_domains.txt", var, sizeof var) < 0) {
+        fprintf(stderr, "[warden] the policy has wildcard host rules, and the VAREK list of shared "
+                "domains (data/varek_shared_domains.txt) was not found; give --shared-domains\n");
+        return -1;
+    }
+    sd_lists_t *l = sd_load(psl, var, why, sizeof why);
+    if (!l) { fprintf(stderr, "[warden] %s; refusing to start\n", why); return -1; }
+    int refused = 0;
+    for (size_t i = 0; i < p->v.n; i++) {
+        const vdp_rule_t *r = &p->v.rules[i];
+        char suf[512];
+        if (r->kind != VDP_KIND_HOST || !r->s.wild || r->verb != VDP_ALLOW) continue;
+        if (sd_wildcard_suffix(r->s.c, suf, sizeof suf) == 0 && sd_refuses(l, suf, why, sizeof why)) {
+            fprintf(stderr, "[warden] policy %s:%d: allow host *.%s is refused: %s; write the exact "
+                    "names instead\n", path, r->line, suf, why);
+            refused++;
+        }
+    }
+    sd_free(l);
+    if (refused) return -1;
+    if (sha256_file_hex(psl, g_psl_sha) < 0 || sha256_file_hex(var, g_shared_sha) < 0) {
+        fprintf(stderr, "[warden] cannot read the shared-domain lists to record them\n");
+        return -1;
+    }
     return 0;
 }
 
@@ -3800,7 +3869,7 @@ static void usage(const char *argv0) {
         "              [--sign-key <key>]\n"
         "              [--anchor <path>] [--checkpoint-every <n>] [--run-as <user>]\n"
         "              [--dns-server <a.b.c.d[:port]>] [--dns-ttl-min <s>] [--dns-ttl-max <s>]\n"
-        "              [--dns-grace-max <s>]\n"
+        "              [--dns-grace-max <s>] [--psl <file>] [--shared-domains <file>]\n"
         "              -- <target> [args...]\n"
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
         "\n"
@@ -3934,6 +4003,7 @@ int main(int argc, char **argv) {
     const char *state_arg   = NULL;     /* v1.18.0 */
     const char *gstatus_arg = NULL;     /* v1.18.0 */
     wr_config_t dns_cfg;                /* v1.24 */
+    const char *psl_arg = NULL, *shared_arg = NULL;   /* v1.25 */
     wr_config_default(&dns_cfg);
     int sep_idx = -1;
 
@@ -3967,6 +4037,10 @@ int main(int argc, char **argv) {
                 return 2;
             }
             g_ckpt_every = n;
+        } else if (strcmp(argv[i], "--psl") == 0 && !psl_arg) {
+            psl_arg = argv[++i];                                            /* v1.25 */
+        } else if (strcmp(argv[i], "--shared-domains") == 0 && !shared_arg) {
+            shared_arg = argv[++i];                                         /* v1.25 */
         } else if (strcmp(argv[i], "--dns-server") == 0 && !dns_cfg.server) {
             dns_cfg.server = argv[++i];                                     /* v1.24 */
         } else if (strcmp(argv[i], "--dns-ttl-min") == 0 || strcmp(argv[i], "--dns-ttl-max") == 0 ||
@@ -4050,6 +4124,7 @@ int main(int argc, char **argv) {
     if (flow_path && flow_setup(&p, flow_path, state_arg, session_arg, gstatus_arg) < 0)
         return 1;                                                           /* v1.18.0 */
     if (names_setup(&p, &dns_cfg) < 0) return 1;                            /* v1.24 */
+    if (wildcards_check(policy_path, &p, psl_arg, shared_arg) < 0) return 1;            /* v1.25 */
     if (g_any_name) views_setup();
     if (g_check_only) {
         /* v1.24: resolve each allowed name and report the ones that fail (a

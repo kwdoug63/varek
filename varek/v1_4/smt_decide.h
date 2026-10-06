@@ -128,6 +128,7 @@ typedef struct {
     struct vdp_prog  *prog;                /* glob only: compiled at load */
     bool              portless;            /* host only: no port, so every port matches */
     bool              name;                /* host only (v1.24): a host name rule */
+    bool              wild;                /* host only (v1.25): a wildcard *.suffix rule, held as a glob */
 } vdp_str_atom_t;
 
 typedef struct {
@@ -325,6 +326,17 @@ bool vdp_host_constant_ok(const char *c, size_t cl, char *why, size_t wn);
  * it is in name form but invalid (the reason in why). */
 int vdp_host_name_form(const char *c, size_t cl, char *why, size_t wn);
 
+/* v1.25: a wildcard host constant, *.<suffix> or *.<suffix>:<port>, where
+ * <suffix> is a valid v1.24 name of at least two labels and <port> as for a
+ * name. *.example.com matches a name with one or more labels before
+ * .example.com, never example.com itself. It is held as the glob
+ *   ?*.<suffix>:<port>    or, without a port,    ?*.<suffix>:*
+ * (names hold no glob metacharacters, and the strings a connect is decided on
+ * are valid names, so the glob is exact), and decided, certified and analysed
+ * as any glob. Returns 1 and writes the glob to out (outn bytes), 0 if c does
+ * not start with "*.", or -1 if it is an invalid wildcard (the reason in why). */
+int vdp_host_wildcard_glob(const char *c, size_t cl, char *out, size_t outn, char *why, size_t wn);
+
 /* v1.24: can a connect ever match this host rule? A name rule (`require
  * warden 1.24` before it) can; a constant in name form without the directive
  * cannot, nor can a numeric constant vdp_host_constant_ok refuses. When not,
@@ -335,8 +347,10 @@ bool vdp_host_rule_ok(const vdp_rule_t *r, char *why, size_t wn);
  * v1.21: host rules take effect (decided connections), and a bracketed IPv6
  * constant without a port ("[::1]") matches every port.
  * v1.24: host names (`allow host api.example.com:443`); a name without a port
- * matches every port. Name rules need `require warden 1.24` before them. */
+ * matches every port. Name rules need `require warden 1.24` before them.
+ * v1.25: wildcard host names (`allow host *.example.com:443`), after
+ * `require warden 1.25`; see vdp_host_wildcard_glob. */
 #define VDP_WARDEN_MAJOR 1
-#define VDP_WARDEN_MINOR 24
+#define VDP_WARDEN_MINOR 25
 
 #endif /* VAREK_SMT_DECIDE_H */

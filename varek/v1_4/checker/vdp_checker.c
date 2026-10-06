@@ -136,6 +136,7 @@ struct vdpc_rule {
     int      line;
     bool     portless;                /* host: no port, so every port matches */
     bool     name;                    /* host (v1.24): a host name rule */
+    bool     wild;                    /* host (v1.25): a wildcard rule, held as a glob */
 };
 
 void vdpc_free(vdpc_policy_t *p) {
@@ -407,7 +408,33 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
          * in name form is matched exactly, as in v1.21. */
         const char *why = "";
         int nf = host_name_form(c, cl, &why);
-        if (nf != 0 && ver_ge(req_maj, req_min, 1, 24)) {
+        if (cl >= 2 && c[0] == '*' && c[1] == '.' && ver_ge(req_maj, req_min, 1, 24)) {
+            /* v1.25: *.<suffix>[:port], held as the glob ?*.<suffix>:<port>
+             * (or :* without a port). <suffix> is a valid name of at least
+             * two labels. */
+            if (!ver_ge(req_maj, req_min, 1, 25)) return fail(err, en, name, ln, "wildcard before 1.25");
+            if (host_name_form(c + 2, cl - 2, &why) != 1) return fail(err, en, name, ln, "bad wildcard");
+            size_t h = 2;
+            while (h < cl && c[h] != ':') h++;
+            if (!memchr(c + 2, '.', h - 2)) return fail(err, en, name, ln, "wildcard over one label");
+            size_t gl = 3 + (h - 2) + 1 + (h < cl ? cl - h - 1 : 1);
+            if (gl > VDPC_MAX_S) return fail(err, en, name, ln, "constant length");
+            char *g = malloc(gl + 1);
+            if (!g) return fail(err, en, name, ln, "out of memory");
+            memcpy(g, "?*.", 3);
+            memcpy(g + 3, c + 2, h - 2);
+            g[3 + h - 2] = ':';
+            if (h < cl) memcpy(g + 3 + (h - 2) + 1, c + h + 1, cl - h - 1);
+            else g[3 + (h - 2) + 1] = '*';
+            g[gl] = '\0';
+            free(r->c);
+            r->c = g;
+            r->clen = gl;
+            r->match = M_GLOB;
+            r->name = r->wild = true;
+            c = r->c;
+            cl = r->clen;
+        } else if (nf != 0 && ver_ge(req_maj, req_min, 1, 24)) {
             if (nf < 0) return fail(err, en, name, ln, "%s", why);
             r->name = true;
             r->portless = memchr(c, ':', cl) == NULL;
@@ -650,6 +677,7 @@ int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *o) {
     o->value = r->value;
     o->portless = r->portless;
     o->name = r->name;
+    o->wild = r->wild;
     return 0;
 }
 

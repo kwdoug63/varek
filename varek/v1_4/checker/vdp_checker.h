@@ -69,7 +69,7 @@
 // those rules test. A symbolic certificate that names one deciding rule (r >= 0)
 // carries that rule's witness, which is checked too; r = -1 carries none.
 //
-// The checker implements the policy grammar of VAREK 1.24 (smt_decide.h). A
+// The checker implements the policy grammar of VAREK 1.25 (smt_decide.h). A
 // policy it cannot parse is refused, so the Warden does not start.
 
 #ifndef VAREK_VDP_CHECKER_H
@@ -80,7 +80,7 @@
 #include <stdint.h>
 
 #define VDPC_GRAMMAR_MAJOR 1
-#define VDPC_GRAMMAR_MINOR 24
+#define VDPC_GRAMMAR_MINOR 25
 
 #define VDPC_MAX_S        4095
 #define VDPC_MAX_RULES    256
@@ -129,6 +129,7 @@ typedef struct {
     uint32_t    mask, value;
     bool        portless;             /* host: no port, so every port matches */
     bool        name;                 /* host (v1.24): a host name rule */
+    bool        wild;                 /* host (v1.25): a wildcard rule, held as a glob */
 } vdpc_rule_info_t;
 int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *out);
 

@@ -1,0 +1,20 @@
+# VAREK list of shared domains (v1.25): multi-tenant domains where each
+# customer, or anyone who signs up, gets names, and which the Public Suffix List
+# (data/public_suffix_list.dat) does not carry. A wildcard host rule over one of
+# these, or over a name under one, is refused at load, as for a Public Suffix
+# List entry: `allow host *.my.salesforce.com` would allow every company's
+# Salesforce org, not only the buyer's. Write the exact names instead.
+#
+# One domain per line, lowercase, A-labels; '#' starts a comment.
+# Reviewed per release; its SHA-256 is recorded in run_start.
+my.salesforce.com
+force.com
+salesforce-sites.com
+visualforce.com
+my.site.com
+amazonaws.com
+zendesk.com
+atlassian.net
+freshdesk.com
+service-now.com
+sharepoint.com

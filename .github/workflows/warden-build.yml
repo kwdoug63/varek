@@ -50,6 +50,8 @@ jobs:
           done
       - name: v1.24 host names (grammar, resolution table, the Warden as root)
         run: sudo make -C varek/v1_4 test-v1240
+      - name: v1.25 wildcard host names (grammar, shared-domain refusals)
+        run: sudo make -C varek/v1_4 test-v1250
       - name: Build and test the plan_verify CLI (v1_6, v1.16.3)
         run: make -C v1_6 plan_verify check check-plan-verify
       - name: Test the v1.7 layer (v1.18.0)

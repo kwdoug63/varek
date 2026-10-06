@@ -28,6 +28,7 @@
 #define _GNU_SOURCE
 #endif
 #include "../smt_decide.h"
+#include "../shared_domains.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -172,6 +173,31 @@ int main(int argc, char **argv) {
                     vdp_reach_unknown_text());
             }
         }
+        /* v1.25: an allow wildcard over a shared domain is refused at load
+         * (shared_domains.h), as the Warden refuses it; lint names the entry. */
+        int shared = 0;
+        for (size_t i = 0; i < g_pol.n; i++) {
+            const vdp_rule_t *r = &g_pol.rules[i];
+            if (r->kind != VDP_KIND_HOST || !r->s.wild || r->verb != VDP_ALLOW) continue;
+            static sd_lists_t *lists;
+            static int tried;
+            char why[512], psl[4096], var[4096], suf[512];
+            if (!tried) {
+                tried = 1;
+                if (sd_default_path("public_suffix_list.dat", psl, sizeof psl) < 0 ||
+                    sd_default_path("varek_shared_domains.txt", var, sizeof var) < 0)
+                    snprintf(why, sizeof why, "the shared-domain lists (data/) were not found");
+                else
+                    lists = sd_load(psl, var, why, sizeof why);
+                if (!lists) printf("%s: %s; wildcard host rules cannot be checked\n", argv[1], why);
+            }
+            if (!lists) { shared++; continue; }
+            if (sd_wildcard_suffix(r->s.c, suf, sizeof suf) == 0 &&
+                sd_refuses(lists, suf, why, sizeof why)) {
+                printf("%s:%d: allow host *.%s is refused: %s\n", argv[1], r->line, suf, why);
+                shared++;
+            }
+        }
         /* v1.16: the policy's glob size against the cap that bounds the work
          * of one decision (4,096 tokens x a 4,095-byte string). */
         printf("%s: glob tokens %zu of %d\n", argv[1], vdp_policy_glob_tokens(&g_pol),
@@ -181,7 +207,9 @@ int main(int argc, char **argv) {
                    argv[1], g_pol.n, dead, hostnever);
         else
             printf("%s: %zu rules, %d can never fire\n", argv[1], g_pol.n, dead);
-        return dead || hostnever ? 1 : 0;
+        if (shared)
+            printf("%s: %d wildcard host rules refused (shared domains)\n", argv[1], shared);
+        return dead || hostnever || shared ? 1 : 0;
     }
     fprintf(stderr, "unknown mode %s\n", argv[2]);
     return 2;

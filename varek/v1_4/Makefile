@@ -32,7 +32,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 crosscheck harness video-v112
+.PHONY: all deps deps-check preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -64,18 +64,18 @@ CHECKER := checker/vdp_checker.c checker/vdp_checker.h
 
 # v1.24: the resolution table (warden_resolve.c) runs a resolver thread and
 # uses the host's resolver library.
-RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c
+RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c shared_domains.c shared_domains.h
 
 warden: warden.c warden_net.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
-	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
+	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
 
 # v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
 # ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that
 # the certificate checker refuses the wrong verdict. Never deploy it.
 warden_faultinject: warden.c warden_net.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
-	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
+	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
 
 # v1.15: command-line front end to the certificate checker (policy digest,
 # batch certificate checks). Links the checker only, never smt_decide.c.
@@ -89,8 +89,8 @@ tools/varek_keygen: tools/varek_keygen.c
 
 # v1.13: command-line front end to the SMT decision procedure (lint, analyze,
 # batch queries); the same smt_decide.c the Warden runs.
-tools/vdp_check: tools/vdp_check.c smt_decide.c smt_decide.h
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/vdp_check.c smt_decide.c
+tools/vdp_check: shared_domains.c shared_domains.h tools/vdp_check.c smt_decide.c smt_decide.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/vdp_check.c smt_decide.c shared_domains.c
 
 target_demo: target_demo.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
@@ -326,6 +326,16 @@ test-v1240: warden tools/vdp_check tools/vdp_cert_check tests/test_v1240_resolve
 	@./tests/test_v1240.sh ./tools/vdp_check ./tools/vdp_cert_check ./tests/test_v1240_resolve \
 	    $(if $(filter 0,$(shell id -u)),./warden)
 
+# v1.25.0 (in progress): wildcard host names. The grammar in both parsers and
+# the shared-domain refusals (shared_domains.c against an independent Python
+# statement over the whole Public Suffix List). Needs no root; with root it
+# also checks run_start.
+tests/test_v1250_shared: tests/test_v1250_shared.c shared_domains.c shared_domains.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_v1250_shared.c shared_domains.c
+
+test-v1250: warden tools/vdp_check tools/vdp_cert_check tests/test_v1250_shared
+	@./tests/test_v1250.sh ./tools/vdp_check ./tools/vdp_cert_check ./tests/test_v1250_shared ./warden
+
 # Differential check of the decision procedure against an off-the-shelf SMT
 # solver (tools/requirements-crosscheck.txt) and,
 # for suffix / contains / glob reachability, a derivative-based oracle. These
@@ -361,7 +371,7 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared
 
 # v1.22: install the runtime and the `varek` command.
 #   sudo make install                  -> /opt/varek, plus /usr/local/bin/varek
@@ -374,7 +384,8 @@ INSTALL_TOOLS := tools/varek tools/vdp_check tools/vdp_cert_check tools/varek_ke
 	tools/varek_license.py tools/varek_bench.py tools/bench_workload
 
 install: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
-	install -d -m 0755 $(DESTDIR)$(PREFIX)/tools $(DESTDIR)$(PREFIX)/policies $(DESTDIR)$(BINDIR)
+	install -d -m 0755 $(DESTDIR)$(PREFIX)/tools $(DESTDIR)$(PREFIX)/policies $(DESTDIR)$(PREFIX)/data $(DESTDIR)$(BINDIR)
+	install -m 0644 data/public_suffix_list.dat data/varek_shared_domains.txt $(DESTDIR)$(PREFIX)/data/
 	install -m 0755 warden $(DESTDIR)$(PREFIX)/warden
 	install -m 0755 $(INSTALL_TOOLS) $(DESTDIR)$(PREFIX)/tools/
 	install -m 0644 policies/*.policy.txt $(DESTDIR)$(PREFIX)/policies/

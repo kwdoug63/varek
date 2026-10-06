@@ -10,6 +10,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Added
+- v1.25.0, in progress (opt-in wildcard host names,
+  `docs/security/v1.25-wildcard-host-names.md`), sections 1 and 2:
+  - Policy grammar: `allow host *.example.com[:port]` after
+    `require warden 1.25`, in the decision procedure, the certificate checker
+    and the cross-check oracle; held as a glob (`?*.example.com:443`), so it is
+    decided, certified and fuzzed like any glob. The policy-grammar version is
+    1.25.
+  - An allow wildcard over a shared domain is refused at load: a public suffix
+    (`*.com`), an entry of the Public Suffix List's private section or under
+    one (`*.s3.amazonaws.com`), or the VAREK list (`*.my.salesforce.com`). The
+    lists are pinned in `varek/v1_4/data/` (the Public Suffix List is MPL-2.0);
+    their SHA-256 goes in `run_start`; lint and the Warden name the entry.
+  - Tests: `make test-v1250`.
 - v1.24.0, in progress (host names without agent DNS,
   `docs/security/v1.21-stage2-host-names.md`), sections 1 and 2:
   - Policy grammar: `allow host api.example.com[:port]` and `deny host <name>`
