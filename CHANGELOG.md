@@ -22,6 +22,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     one (`*.s3.amazonaws.com`), or the VAREK list (`*.my.salesforce.com`). The
     lists are pinned in `varek/v1_4/data/` (the Public Suffix List is MPL-2.0);
     their SHA-256 goes in `run_start`; lint and the Warden name the entry.
+    The VAREK list holds 31 domains, among them blog and newsletter hosts
+    (`wordpress.com`, `substack.com`) and sign-up tenants (`slack.com`,
+    `okta.com`, `auth0.com`).
   - The stub resolver (`warden_stub.inc.c`): with a wildcard allow rule, the
     agent's `resolv.conf` view names `127.53.53.53`, a UDP and TCP stub the
     Warden binds in the agent's own network namespace, and `nsswitch.conf`

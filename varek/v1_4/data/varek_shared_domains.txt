@@ -18,3 +18,26 @@ atlassian.net
 freshdesk.com
 service-now.com
 sharepoint.com
+# Added 2026-10-06 (v1.25), found while choosing the section 5 workload: sites
+# anyone can create a name under (blogs, newsletters, wikis, hosting)
+wordpress.com
+substack.com
+fandom.com
+tumblr.com
+medium.com
+squarespace.com
+ghost.io
+beehiiv.com
+hashnode.dev
+livejournal.com
+neocities.org
+glitch.me
+railway.app
+hubspotpagebuilder.com
+# ... and per-company tenants anyone can sign up for (as my.salesforce.com)
+slack.com
+zoom.us
+okta.com
+auth0.com
+freshservice.com
+typeform.com
