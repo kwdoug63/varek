@@ -43,7 +43,12 @@ policy file alone:
      checker's own matchers).
   7. v1.25: a connect or send with rule dns_stub (to the Warden's own stub
      resolver, in the agent's network namespace) is accepted only to the stub
-     address run_start names.
+     address run_start names. The stub's dns_question records: run_start's
+     wildcard budgets are the policy file's; each name charged to a wildcard
+     rule is charged once and within its rule's names, rate (60 s) and label
+     budgets; budget refusals and questions no rule allows are NXDOMAIN and
+     charge nothing; every name looked up on demand was asked for first; a
+     NOERROR answer carries only addresses the name's latest resolution lists.
 
 Exit 0 only if all of these hold. The verdict stream is the Warden's stderr
 (`warden policy -- agent 2> verdicts.log`). The report's "integrity" line says
@@ -94,6 +99,100 @@ def _addr_of(dest):
     [IPv6]:port -> IPv6."""
     host = dest.rsplit(":", 1)[0]
     return host[1:-1] if host.startswith("[") else host
+
+
+DEFAULT_NAMES, DEFAULT_RATE, DEFAULT_LABEL = 256, 30, 63    # the Warden's, v1.25
+
+
+def policy_wildcards(path):
+    """v1.25: each wildcard allow rule of the policy file: line -> (suffix,
+    names, rate), the budgets as written or the defaults. Read here, apart
+    from the Warden's parsers, to check what run_start says it enforced."""
+    out = {}
+    with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+        for ln, line in enumerate(fh, 1):
+            t = line.split("#", 1)[0].split()
+            if len(t) >= 3 and t[0] == "allow" and t[1] == "host" and t[2].startswith("*."):
+                sfx = t[2][2:].rsplit(":", 1)[0] if ":" in t[2] else t[2][2:]
+                b = dict(x.split("=", 1) for x in t[3:] if "=" in x)
+                out[ln] = (sfx, int(b.get("names", DEFAULT_NAMES)), int(b.get("rate", DEFAULT_RATE)))
+    return out
+
+
+def check_dns(meta, policy, problems):
+    """v1.25: the stub resolver. run_start's budgets are the policy's; every
+    name charged to a wildcard rule ("new") stays within its rule's names,
+    rate and label budgets and is charged once; a budget refusal answered
+    NXDOMAIN; a question no rule allows answered NXDOMAIN and charged
+    nothing; every name looked up on demand ("dynamic" resolution) was asked
+    for first, and charged; and a NOERROR answer carried only addresses the
+    name's latest resolution listed. Returns (questions, budget refusals)."""
+    rs = meta.get("run_start", {})
+    events = meta.get("dns_events", [])
+    wild = policy_wildcards(policy)
+    budgets = rs.get("wildcard_budgets")
+    if wild or budgets is not None:
+        want = sorted([{"policy_line": ln, "names": n, "rate": r, "label": DEFAULT_LABEL}
+                       for ln, (_s, n, r) in wild.items()], key=lambda b: b["policy_line"])
+        got = sorted(budgets or [], key=lambda b: b.get("policy_line", 0) if isinstance(b, dict) else 0)
+        if got != want:
+            problems.append(f"run_start's wildcard budgets {got} are not the policy's {want}")
+    per = {b["policy_line"]: b for b in (budgets or []) if isinstance(b, dict) and "policy_line" in b}
+    charged, times, asked, latest = {}, {}, set(), {}
+    nq = nb = 0
+    for e in events:
+        name, ts = e.get("name"), e.get("timestamp_ns")
+        if e.get("event") == "resolution":
+            if e.get("dynamic") is True:
+                if name not in asked:
+                    problems.append(f"{name}: looked up on demand with no question asking for it")
+                if name not in charged:
+                    problems.append(f"{name}: looked up on demand but never charged to a rule")
+                asked.discard(name)
+            latest[name] = e
+            continue
+        nq += 1
+        rule, ans, line = e.get("rule"), e.get("answer"), e.get("policy_line")
+        if rule == "wildcard_budget":
+            nb += 1
+            if ans != "nxdomain" or e.get("budget") not in ("names", "rate", "label") or e.get("new"):
+                problems.append(f"{name}: a budget refusal that is not a plain NXDOMAIN")
+            continue
+        if rule in ("no_rule", "not_a_host_name", "malformed"):
+            if ans not in ("nxdomain", "formerr") or e.get("new"):
+                problems.append(f"{name!r}: a question no rule allows was answered {ans}")
+            continue
+        if e.get("new") is True:
+            b = per.get(line)
+            if rule != "policy_match" or b is None or line not in wild:
+                problems.append(f"{name}: charged to policy line {line}, not a wildcard allow rule")
+                continue
+            if name in charged:
+                problems.append(f"{name}: charged twice")
+            charged[name] = line
+            sfx = wild[line][0]
+            if not (isinstance(name, str) and name.endswith("." + sfx)) or \
+                    len(name) - len(sfx) - 1 > b["label"]:
+                problems.append(f"{name}: over policy line {line}'s label budget, or not under *.{sfx}")
+            t = times.setdefault(line, [])
+            t.append(ts if isinstance(ts, int) else 0)
+            if len(t) > b["names"]:
+                problems.append(f"{name}: policy line {line} charged more than its {b['names']} names")
+            # The Warden's window is on its monotonic clock, the records' times
+            # on the wall clock: count over 59 s, so a clock adjustment during
+            # the run cannot make the audit stricter than the Warden.
+            recent = [x for x in t if x > t[-1] - 59 * 10**9]
+            if len(recent) > b["rate"]:
+                problems.append(f"{name}: policy line {line} charged more than {b['rate']} names in a minute")
+        if ans == "lookup":
+            asked.add(name)
+        elif ans == "noerror" and isinstance(e.get("addresses"), list):
+            r = latest.get(name)
+            have = set((r or {}).get("addresses") or [])
+            extra = [x for x in e["addresses"] if x not in have]
+            if extra:
+                problems.append(f"{name}: answered {extra}, which its latest resolution does not list")
+    return nq, nb
 
 
 def check_names(rec, pos, resolutions, problems):
@@ -503,6 +602,11 @@ def main(argv=None):
     lines, which = [], []
     authorized = refused = lookups = connects = views = stubs = 0
     resolutions = meta.get("resolutions", [])
+    try:
+        questions, budget_hits = check_dns(meta, a.policy, problems)          # v1.25
+    except (OSError, ValueError) as e:
+        problems.append(f"cannot read the policy's wildcard rules: {e}")
+        questions = budget_hits = 0
     names_policy = meta.get("run_start", {}).get("host_name_rules") is True
     others = []                          # (rec, decided rule, other candidates)
     ancestors = None
@@ -648,6 +752,7 @@ def main(argv=None):
           f"{len(records)} records, {authorized} authorized file opens, {lookups} lookups, "
           f"{connects} authorized connects, "
           f"{views} host-name views, {stubs} stub resolver connects, "
+          f"{questions} stub questions ({budget_hits} over a budget), "
           f"{checked} certificates "
           f"re-checked, {refused} refused in-line")
     print(f"varek_audit: integrity: {integrity}")

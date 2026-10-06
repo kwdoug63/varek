@@ -130,6 +130,7 @@ typedef struct {
     bool        portless;             /* host: no port, so every port matches */
     bool        name;                 /* host (v1.24): a host name rule */
     bool        wild;                 /* host (v1.25): a wildcard rule, held as a glob */
+    uint32_t    names, rate;          /* host (v1.25): a wildcard allow rule's budgets, 0: not set */
 } vdpc_rule_info_t;
 int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *out);
 

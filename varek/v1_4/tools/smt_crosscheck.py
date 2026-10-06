@@ -517,7 +517,19 @@ def parse_lines(raw_lines, path):
                 if glob_tokens > GLOB_MAX_TOTAL:
                     raise PolicyError(f"{path}:{lineno}: glob tokens over the policy total")
             mask = value = 0
+            budgets = {}
             for t in toks[ci + 1:]:
+                bk, _, bv = t.partition("=")
+                if kind == "host" and bk in ("names", "rate") and _:
+                    # v1.25: a wildcard allow rule's budgets (no part of a decision)
+                    if not (wild and verb == "allow"):
+                        raise PolicyError(f"{path}:{lineno}: budget on a non-wildcard rule")
+                    if not re.fullmatch(r"[1-9][0-9]*", bv) or int(bv) > (100000 if bk == "names" else 10000):
+                        raise PolicyError(f"{path}:{lineno}: bad budget {t}")
+                    if bk in budgets:
+                        raise PolicyError(f"{path}:{lineno}: budget twice")
+                    budgets[bk] = int(bv)
+                    continue
                 if kind != "path":
                     raise PolicyError(f"{path}:{lineno}: flag clause on {kind}")
                 if t == "readonly":
@@ -1056,9 +1068,20 @@ def fuzz_policy(rng, path):
                  "example.com", "*.example.org", "1.2.3.4", "1.2.3.4:443"]
         bad = ["*.com", "*.example.com:0443", "a.*.example.com", "*.Example.com", "*"]
         lines.append("require warden 1.25")
+        # v1.25 section 4: budgets on wildcard allow rules (and, when the
+        # policy may be invalid, where they do not belong or out of range)
+        good_b = ["names=1", "names=64", "names=100000", "rate=1", "rate=10", "rate=10000"]
+        bad_b = ["names=0", "names=100001", "rate=10001", "names=05", "names=", "rate=x", "nams=5"]
         for _ in range(rng.randint(1, 8)):
             c = rng.choice(hosts + (bad if not valid and rng.random() < 0.3 else []))
-            lines.append(f"{rng.choice(['allow', 'deny'])} host {c}")
+            verb = rng.choice(['allow', 'deny'])
+            tail = ""
+            if rng.random() < 0.4 and (valid is False or (verb == "allow" and c.startswith("*."))):
+                opts = rng.sample(good_b, rng.randint(1, 2))
+                if not valid and rng.random() < 0.4:
+                    opts.append(rng.choice(bad_b + good_b))       # bad, or given twice
+                tail = " " + " ".join(opts)
+            lines.append(f"{verb} host {c}{tail}")
         with open(path, "w", encoding="latin-1", newline="") as fh:
             fh.write("\n".join(lines) + "\n")
         return

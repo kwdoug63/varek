@@ -137,6 +137,7 @@ struct vdpc_rule {
     bool     portless;                /* host: no port, so every port matches */
     bool     name;                    /* host (v1.24): a host name rule */
     bool     wild;                    /* host (v1.25): a wildcard rule, held as a glob */
+    uint32_t names, rate;             /* host (v1.25): a wildcard allow rule's budgets, 0: not set */
 };
 
 void vdpc_free(vdpc_policy_t *p) {
@@ -462,6 +463,25 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
     }
     for (int k = ci + 1; k < nt; k++) {
         const char *t = tok[k];
+        /* v1.25: the budgets of a wildcard allow rule (no part of any decision) */
+        if (r->kind == VDPC_HOST && (strncmp(t, "names=", 6) == 0 || strncmp(t, "rate=", 5) == 0)) {
+            int nm = t[0] == 'n';
+            const char *d = strchr(t, '=') + 1;
+            unsigned long lim = nm ? 100000UL : 10000UL, x = 0;
+            size_t dl = strlen(d);
+            if (!r->wild || !r->allow)
+                return fail(err, en, name, ln, "a budget on a rule that is not a wildcard allow");
+            if (dl == 0 || dl > 6 || d[0] == '0') return fail(err, en, name, ln, "bad budget");
+            for (size_t q = 0; q < dl; q++) {
+                if (d[q] < '0' || d[q] > '9') return fail(err, en, name, ln, "bad budget");
+                x = x * 10 + (unsigned long)(d[q] - '0');
+            }
+            if (x > lim) return fail(err, en, name, ln, "budget out of range");
+            uint32_t *slot = nm ? &r->names : &r->rate;
+            if (*slot) return fail(err, en, name, ln, "budget given twice");
+            *slot = (uint32_t)x;
+            continue;
+        }
         if (r->kind != VDPC_PATH) return fail(err, en, name, ln, "flag clause on a non-path rule");
         uint32_t m, v;
         if (!strcmp(t, "readonly"))       { m = ACCMODE | 0100 | 01000; v = 0; }
@@ -678,6 +698,8 @@ int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *o) {
     o->portless = r->portless;
     o->name = r->name;
     o->wild = r->wild;
+    o->names = r->names;
+    o->rate = r->rate;
     return 0;
 }
 

@@ -20,7 +20,7 @@
  *     agent's socket. Both are records with rule dns_stub. Every other
  *     connect to port 53 stays refused (dns_refused).
  *   - The stub answers one question per message, class IN. A name that is not
- *     one an allow rule can reach (stub_name_allowed) is answered NXDOMAIN at
+ *     one an allow rule can reach (stub_name_rule) is answered NXDOMAIN at
  *     once, and nothing leaves the host. A name an exact rule names is
  *     answered from the resolution table. A name a wildcard matches becomes a
  *     dynamic entry of the table: the resolver helper looks it up through the
@@ -29,6 +29,11 @@
  *     name get an empty answer and send nothing upstream.
  *   - Connects are decided as in v1.24: on the address dialed and name:port for
  *     every name (exact or dynamic) the table holds for it.
+ *   - Section 4: a name the table does not hold yet is charged to the wildcard
+ *     rule that allows it, within that rule's budgets (names= per run, rate=
+ *     per minute, 63 bytes before the suffix); past one, NXDOMAIN and no
+ *     lookup (rule wildcard_budget). Every question is a chained dns_question
+ *     record (stub_record), and run_start lists each rule's budgets.
  *
  * Without a network namespace of its own for the agent there is no stub: the
  * views stay as in v1.24 and wildcard-matched names cannot be resolved. */
@@ -38,7 +43,7 @@
 #define STUB_ADDR       STUB_ADDR_TEXT
 #define STUB_MAX_Q      128              /* questions waiting on the resolver helper */
 #define STUB_MAX_CONN   16               /* TCP connections to the stub */
-#define STUB_MAX_DYN    1024             /* dynamic names per run (section 4 adds budgets) */
+#define STUB_MAX_DYN    4096             /* dynamic names per run, all rules (a backstop) */
 #define STUB_MSG_MAX    512              /* a question, and an answer over UDP */
 
 static bool     g_stub_on = false;
@@ -53,6 +58,24 @@ struct stub_conn {
 };
 static struct stub_conn g_stub_conn[STUB_MAX_CONN];
 static int g_stub_nconn = 0;
+
+/* Section 4: each wildcard allow rule's budgets. A question that would add a
+ * name (one the table does not hold yet) is charged to the rule that allows
+ * it; past a budget it is answered NXDOMAIN and nothing is looked up:
+ *   names  distinct new names per run (names=, default STUB_DEFAULT_NAMES)
+ *   rate   distinct new names in any 60 s (rate=, default STUB_DEFAULT_RATE)
+ *   label  bytes matched by `*` (STUB_LABEL_MAX)
+ * A name asked again (even after its TTL passed) is not charged again. */
+struct stub_budget {
+    int      ri;                         /* the rule's index */
+    uint32_t names, rate, used;
+    int64_t *ts;                         /* when each of the last `rate` names was charged */
+    uint32_t head, cnt;
+    size_t   sfx_len;                    /* the suffix's length (*.<suffix>) */
+};
+static struct stub_budget *g_budget;
+static size_t g_nbudget;
+static bool   g_budget_init = false;
 
 struct stub_q {
     bool     used;
@@ -166,8 +189,10 @@ static void stub_setup(void) {
  * name:port would be, for every port a host rule names and one port no rule
  * names: if any of those is SATISFIED, the name may be resolved. (A glob over
  * ports is not expanded; a port only it allows is then not counted, which
- * answers NXDOMAIN: the safe side.) */
-static bool stub_name_allowed(const struct policy *p, const char *name) {
+ * answers NXDOMAIN: the safe side.) Returns the index of the rule the name is
+ * charged to: an exact (non-wildcard) allow rule if one decides some port,
+ * else the first wildcard rule that does; -1 if none. */
+static int stub_name_rule(const struct policy *p, const char *name) {
     unsigned ports[64];
     size_t np = 0;
     for (size_t i = 0; i < p->v.n && np < 63; i++) {
@@ -190,14 +215,107 @@ static bool stub_name_allowed(const struct policy *p, const char *name) {
         for (size_t k = 0; k < np; k++) if (ports[k] == other) { clash = true; other++; break; }
     }
     ports[np++] = other;
+    int best = -1;
     for (size_t k = 0; k < np; k++) {
         char s[WR_NAME_MAX + 8];
         snprintf(s, sizeof s, "%s:%u", name, ports[k]);
         int ri;
         vdp_why_t why;
-        if (vdp_decide(&p->v, VDP_KIND_HOST, s, 0, false, &ri, &why) == VDP_SATISFIED) return true;
+        if (vdp_decide(&p->v, VDP_KIND_HOST, s, 0, false, &ri, &why) != VDP_SATISFIED || ri < 0) continue;
+        if (!p->v.rules[ri].s.wild) return ri;
+        if (best < 0 || ri < best) best = ri;
     }
-    return false;
+    return best;
+}
+
+/* The budgets, from the policy (once). */
+static void stub_budget_init(const struct policy *p) {
+    if (g_budget_init) return;
+    g_budget_init = true;
+    g_budget = calloc(p->v.n ? p->v.n : 1, sizeof *g_budget);
+    if (!g_budget) return;
+    for (size_t i = 0; i < p->v.n; i++) {
+        const vdp_rule_t *r = &p->v.rules[i];
+        if (r->kind != VDP_KIND_HOST || !r->s.wild || r->verb != VDP_ALLOW) continue;
+        struct stub_budget *b = &g_budget[g_nbudget];
+        char sfx[WR_NAME_MAX + 1];
+        if (sd_wildcard_suffix(r->s.c, sfx, sizeof sfx) < 0) continue;
+        b->ri = (int)i;
+        b->names = r->names ? r->names : STUB_DEFAULT_NAMES;
+        b->rate = r->rate ? r->rate : STUB_DEFAULT_RATE;
+        b->sfx_len = strlen(sfx);
+        b->ts = calloc(b->rate, sizeof *b->ts);
+        if (!b->ts) continue;            /* not counted: questions it would allow get NXDOMAIN */
+        g_nbudget++;
+    }
+}
+
+static struct stub_budget *stub_budget_of(int ri) {
+    for (size_t k = 0; k < g_nbudget; k++) if (g_budget[k].ri == ri) return &g_budget[k];
+    return NULL;
+}
+
+/* Charge a new name to b at now: NULL, or the budget it would exceed. */
+static const char *stub_charge(struct stub_budget *b, const char *name, int64_t now) {
+    if (!b) return "names";
+    size_t nl = strlen(name);
+    if (nl <= b->sfx_len || nl - b->sfx_len - 1 > STUB_LABEL_MAX) return "label";
+    if (b->used >= b->names) return "names";
+    while (b->cnt && b->ts[b->head] <= now - 60000) {          /* older than a minute */
+        b->head = (b->head + 1) % b->rate;
+        b->cnt--;
+    }
+    if (b->cnt >= b->rate) return "rate";
+    b->ts[(b->head + b->cnt) % b->rate] = now;
+    b->cnt++;
+    b->used++;
+    return NULL;
+}
+
+/* The dns_question record: one per question the stub receives.
+ *   {"event":"dns_question","run":R,"name":N,"type":T,"transport":"udp|tcp",
+ *    "rule":"policy_match|exact_name|wildcard_budget|no_rule|not_a_host_name|malformed",
+ *    "policy_line":L,["budget":"names|rate|label",]["new":true,]
+ *    "answer":"noerror|nxdomain|servfail|formerr|lookup",["addresses":[...],]
+ *    "generation":G,"timestamp_ns":TS}
+ * "lookup": the resolver helper was asked; the resolution record that follows
+ * for the name is the answer. "new": the question added the name, charged to
+ * the rule on policy_line. "addresses": what a noerror answer carried. */
+static void stub_record(const char *name, uint16_t qtype, int conn_fd, const char *rule, int line,
+                        const char *budget, bool isnew, const char *answer, const wr_entry_t *e) {
+    FILE *f = rec_begin();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(f, "{\"event\":\"dns_question\",\"run\":\"%s\",\"name\":\"%s\",\"type\":%u,"
+               "\"transport\":\"%s\",\"rule\":\"%s\",\"policy_line\":%d,",
+            g_run_id, name, (unsigned)qtype, conn_fd < 0 ? "udp" : "tcp", rule, line);
+    if (budget) fprintf(f, "\"budget\":\"%s\",", budget);
+    if (isnew) fputs("\"new\":true,", f);
+    fprintf(f, "\"answer\":\"%s\",", answer);
+    if (e && !strcmp(answer, "noerror") && (qtype == 1 || qtype == 28)) {
+        fputs("\"addresses\":[", f);
+        bool first = true;
+        char a[INET6_ADDRSTRLEN];
+        for (size_t k = 0; k < e->n; k++) {
+            if (e->addrs[k].until_ms != 0 || e->addrs[k].ip.fam != (qtype == 1 ? 4 : 6)) continue;
+            wr_ip_str(&e->addrs[k].ip, a, sizeof a);
+            fprintf(f, "%s\"%s\"", first ? "" : ",", a);
+            first = false;
+        }
+        fputs("],", f);
+    }
+    fprintf(f, "\"generation\":%llu,\"timestamp_ns\":%lld}\n", (unsigned long long)g_names.generation,
+            (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+    rec_end(NULL);
+}
+
+static const char *stub_answer_word(int rcode) {
+    switch (rcode) {
+        case 0: return "noerror";
+        case 1: return "formerr";
+        case 3: return "nxdomain";
+        default: return "servfail";
+    }
 }
 
 /* ---- messages ---- */
@@ -301,7 +419,8 @@ static int stub_rcode(const wr_entry_t *e, uint16_t qtype) {
     return 0;
 }
 
-/* One question, from the UDP socket (conn_fd -1) or a TCP connection. */
+/* One question, from the UDP socket (conn_fd -1) or a TCP connection. Every
+ * question is a dns_question record. */
 static void stub_question(const struct policy *p, int conn_fd, const struct sockaddr_storage *from,
                           socklen_t fl, const uint8_t *m, size_t n) {
     char name[WR_NAME_MAX + 2];
@@ -309,6 +428,7 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
     size_t qend = 0;
     uint8_t out[2 * STUB_MSG_MAX];
     size_t outn = conn_fd < 0 ? STUB_MSG_MAX : sizeof out;
+    stub_budget_init(p);
     int pr = stub_parse(m, n, name, &qtype, &qend);
     if (pr == -2) return;
     if (pr == -1) {
@@ -317,6 +437,7 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
         hdr[4] = hdr[5] = 0;
         size_t l = stub_build(hdr, 12, 1, 0, NULL, 0, out, outn);       /* FORMERR */
         stub_send(conn_fd, from, fl, out, l);
+        stub_record("", 0, conn_fd, "malformed", -1, NULL, false, "formerr", NULL);
         return;
     }
     int64_t now = wr_now_ms();
@@ -324,32 +445,52 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
     if (vdp_host_name_form(name, strlen(name), why, sizeof why) != 1) {
         size_t l = stub_build(m, qend, 3, qtype, NULL, now, out, outn);  /* not a host name */
         stub_send(conn_fd, from, fl, out, l);
+        /* the name is not one (it may hold '_'): recorded as such, not quoted */
+        stub_record("", qtype, conn_fd, "not_a_host_name", -1, NULL, false, "nxdomain", NULL);
         return;
     }
     int i = wr_table_find(&g_names, name);
     bool exact = i >= 0 && !g_names.e[i].dynamic;
-    if (!exact && !stub_name_allowed(p, name)) {
+    int ri = stub_name_rule(p, name);
+    int line = ri >= 0 ? p->v.rules[ri].line : -1;
+    const char *rule = exact ? "exact_name" : "policy_match";
+    if (!exact && ri < 0) {
         size_t l = stub_build(m, qend, 3, qtype, NULL, now, out, outn);  /* NXDOMAIN */
         stub_send(conn_fd, from, fl, out, l);
+        stub_record(name, qtype, conn_fd, "no_rule", -1, NULL, false, "nxdomain", NULL);
         return;
     }
     if (!exact && qtype != 1 && qtype != 28) {
         size_t l = stub_build(m, qend, 0, qtype, NULL, now, out, outn);  /* nothing upstream */
         stub_send(conn_fd, from, fl, out, l);
+        stub_record(name, qtype, conn_fd, rule, line, NULL, false, "noerror", NULL);
         return;
     }
+    bool isnew = false;
     if (i < 0) {
+        /* A new name: charged to the wildcard rule that allows it. */
+        const char *over = p->v.rules[ri].s.wild ? stub_charge(stub_budget_of(ri), name, now) : NULL;
+        if (over) {
+            size_t l = stub_build(m, qend, 3, qtype, NULL, now, out, outn);
+            stub_send(conn_fd, from, fl, out, l);
+            stub_record(name, qtype, conn_fd, "wildcard_budget", line, over, false, "nxdomain", NULL);
+            return;
+        }
         if (g_stub_dyn >= STUB_MAX_DYN || (i = wr_table_add_dynamic(&g_names, name)) < 0) {
             size_t l = stub_build(m, qend, 2, qtype, NULL, now, out, outn);  /* SERVFAIL */
             stub_send(conn_fd, from, fl, out, l);
+            stub_record(name, qtype, conn_fd, rule, line, NULL, false, "servfail", NULL);
             return;
         }
         g_stub_dyn++;
+        isnew = true;
     }
     const wr_entry_t *e = &g_names.e[i];
     if (exact || wr_entry_fresh(e, now)) {
-        size_t l = stub_build(m, qend, e->lookups ? stub_rcode(e, qtype) : 2, qtype, e, now, out, outn);
+        int rc = e->lookups ? stub_rcode(e, qtype) : 2;
+        size_t l = stub_build(m, qend, rc, qtype, e, now, out, outn);
         stub_send(conn_fd, from, fl, out, l);
+        stub_record(name, qtype, conn_fd, rule, line, NULL, isnew, stub_answer_word(rc), e);
         return;
     }
     /* Look it up, and answer when the helper does. */
@@ -358,8 +499,10 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
     if (slot < 0 || wr_async_request(&g_names, (size_t)i) < 0) {
         size_t l = stub_build(m, qend, 2, qtype, NULL, now, out, outn);
         stub_send(conn_fd, from, fl, out, l);
+        stub_record(name, qtype, conn_fd, rule, line, NULL, isnew, "servfail", NULL);
         return;
     }
+    stub_record(name, qtype, conn_fd, rule, line, NULL, isnew, "lookup", NULL);
     struct stub_q *q = &g_stub_q[slot];
     q->used = true;
     q->conn_fd = conn_fd;

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 #
 # test_v1250.sh — v1.25.0, wildcard host names: the parts built so far
-# (docs/security/v1.25-wildcard-host-names.md, sections 1 to 3).
+# (docs/security/v1.25-wildcard-host-names.md, sections 1 to 4).
 #
 #   1. policy grammar: *.<suffix>[:port] after `require warden 1.25`, refused
 #      forms, the same answer from the decision procedure and the certificate
@@ -24,6 +24,12 @@
 #      upstream; any other port-53 connect is refused; the audit accepts the
 #      run and refuses a dns_stub record forged to another address; a policy
 #      with exact names only has no stub
+#   4. budgets (as root): names=, rate= and the label budget hold a DNS-tunnel
+#      style client to them (budget refusals are NXDOMAIN, recorded as
+#      wildcard_budget, and nothing is looked up); run_start records the
+#      budgets; every question is a chained dns_question record; the audit
+#      accepts the run and refuses a removed question, budgets that are not
+#      the policy's, and a name charged past its budget
 #
 # Usage: test_v1250.sh <vdp_check> <vdp_cert_check> <test_v1250_shared> [<warden>]
 set -u
@@ -79,6 +85,18 @@ refused "a U-label"                        "${R}allow host *.b\xc3\xbccher.examp
 refused "a trailing dot"                   "${R}allow host *.example.com.\n"       "trailing dot"
 refused "a bad port"                       "${R}allow host *.example.com:0443\n"   "port"
 refused "require 1.26"                     "require warden 1.26\n"                 "this is 1.25"
+# Section 4: budgets on a wildcard allow rule
+accepted "names= and rate= on a wildcard"  "${R}allow host *.example.com:443 names=64 rate=10\n"
+accepted "the largest budgets"             "${R}allow host *.example.com names=100000 rate=10000\n"
+refused "a budget on an exact name"        "${R}allow host api.example.com names=5\n"        "only to wildcard allow rules"
+refused "a budget on a deny wildcard"      "${R}deny host *.example.com rate=5\n"            "only to wildcard allow rules"
+refused "names=0"                          "${R}allow host *.example.com names=0\n"          "names must be 1 to 100000"
+refused "names over 100000"                "${R}allow host *.example.com names=100001\n"     "names must be 1 to 100000"
+refused "rate over 10000"                  "${R}allow host *.example.com rate=10001\n"       "rate must be 1 to 10000"
+refused "a leading zero"                   "${R}allow host *.example.com names=05\n"         "names must be 1 to 100000"
+refused "an empty budget"                  "${R}allow host *.example.com names=\n"           "names must be 1 to 100000"
+refused "a budget given twice"             "${R}allow host *.example.com names=5 names=6\n"  "given twice"
+refused "an unknown option"                "${R}allow host *.example.com nams=5\n"           "on a non-path rule"
 
 # Decisions: the procedure's verdict, and the checker on its certificate.
 hx() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
@@ -185,7 +203,7 @@ else
     SERVERS="$!"
     python3 -m http.server "$HP" --bind 127.0.0.1 > /dev/null 2>&1 &
     SERVERS="$SERVERS $!"
-    trap 'kill $SERVERS 2>/dev/null; rm -rf "$OUT" "$W"' EXIT
+    trap 'kill $SERVERS 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$OUT"; rm -rf "$W"' EXIT
     for _ in $(seq 50); do
         [ -e "$OUT/ready" ] && python3 -c "import socket; socket.create_connection(('127.0.0.1', $HP), 0.2)" 2>/dev/null && break
         sleep 0.1
@@ -320,6 +338,87 @@ PY
         -- /usr/bin/python3 "$W/v1250_client.py" "$HP" "py.$SFX" x.example.org > "$OUT/exact.out" 2> "$OUT/e.log"
     check "a policy without wildcards has no stub (and still resolves its exact names)" \
         sh -c "! grep -q 'dns_stub' '$OUT/e.log' && grep -q '^OK http 200 ' '$OUT/exact.out'"
+
+    echo "== 4. budgets: the name channel bounded =="
+    # Three wildcard rules: a names budget of 5, a rate budget of 3 a minute,
+    # and the defaults (256 names, 30 a minute, 63 bytes before the suffix).
+    printf '{"ok.d.example.com": {"ttl": 30, "a": ["127.0.0.1"]}}\n' > "$OUT/zone.json"
+    : > "$OUT/q.log"
+    POL4="$OUT/budget.policy"
+    { printf 'require warden 1.25\n'
+      printf 'allow host *.t.example.com:%s names=5 rate=100\n' "$HP"
+      printf 'allow host *.r.example.com:%s names=100 rate=3\n' "$HP"
+      printf 'allow host *.d.example.com:%s\n' "$HP"
+      printf 'allow path %s readonly\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\n' "$W/"
+    } > "$POL4"
+    # 63 bytes before the suffix (one label), and 64 (two labels: one label
+    # may not pass 63 bytes, so glibc would not even ask)
+    L63=$(printf 'a%.0s' $(seq 63)); L64="b.$(printf 'a%.0s' $(seq 62))"
+    ASK=""
+    for i in 0 1 2 3 4 5 6 7 8 9; do ASK="$ASK c$i.t.example.com"; done      # a tunnel: 10 new names
+    ASK="$ASK c0.t.example.com"                                             # asked again: no charge
+    for i in 0 1 2 3 4 5; do ASK="$ASK c$i.r.example.com"; done             # 6 in well under a minute
+    ASK="$ASK $L63.d.example.com $L64.d.example.com x.$L63.d.example.com ok.d.example.com"
+    env -i PATH=/usr/bin:/bin timeout 90 "$WARDEN" "$POL4" --dns-server "127.0.0.1:$PORT" \
+        -- /usr/bin/python3 "$W/v1250_client.py" ask $ASK > "$OUT/ask.out" 2> "$OUT/b.log"
+    budget() {   # budget <line> <names|rate|label>: distinct names refused (glibc asks A and AAAA)
+        grep "\"event\":\"dns_question\".*\"rule\":\"wildcard_budget\",\"policy_line\":$1,\"budget\":\"$2\"" "$OUT/b.log" |
+            grep -o '"name":"[^"]*"' | sort -u | wc -l | tr -d ' '
+    }
+    upstream() { grep -c "^1 .*\\.$1\\.example\\.com$" "$OUT/q.log"; }
+    check "run_start records each wildcard rule's budgets, defaults filled in" \
+        grep -q '"wildcard_budgets":\[{"policy_line":2,"names":5,"rate":100,"label":63},{"policy_line":3,"names":100,"rate":3,"label":63},{"policy_line":4,"names":256,"rate":30,"label":63}\]' "$OUT/b.log"
+    if [ "$(budget 2 names)" = 5 ] && [ "$(upstream t)" = 5 ]; then
+        pass "names=5: a tunnel of 10 new names gets 5 looked up, 5 refused (wildcard_budget)"
+    else flunk "names=5: 5 looked up, 5 refused (got $(upstream t) and $(budget 2 names))"; fi
+    if [ "$(grep -c '"name":"c0.t.example.com"' "$OUT/b.log")" -ge 3 ] && \
+       ! grep -q '"name":"c0.t.example.com".*"wildcard_budget"' "$OUT/b.log"; then
+        pass "a name asked again is not charged again"
+    else flunk "a name asked again is not charged again"; fi
+    if [ "$(budget 3 rate)" = 3 ] && [ "$(upstream r)" = 3 ]; then
+        pass "rate=3: 6 new names within a minute get 3 looked up, 3 refused"
+    else flunk "rate=3: 3 looked up, 3 refused (got $(upstream r) and $(budget 3 rate))"; fi
+    if [ "$(budget 4 label)" = 2 ] && grep -q "^1 $L63.d.example.com$" "$OUT/q.log" && \
+       grep -q '^1 ok.d.example.com$' "$OUT/q.log"; then
+        pass "the default label budget: 63 bytes before the suffix pass, 64 and more are refused"
+    else flunk "the default label budget (63 bytes)"; fi
+    check "a refused name gets NXDOMAIN at once"  grep -q "^ERR ask c9.t.example.com gaierror " "$OUT/ask.out"
+    check "a name within the budget resolves"    grep -q '^OK ask ok.d.example.com 127.0.0.1 ' "$OUT/ask.out"
+    check "every question is a chained dns_question record" \
+        sh -c "[ \$(grep -c '\"event\":\"dns_question\".*\"chain\":\"' '$OUT/b.log') -ge 22 ]"
+    check "the audit accepts the run, budgets and all" \
+        python3 "$HERE/tools/varek_audit.py" --policy "$POL4" --checker "$CERT" "$OUT/b.log"
+    tamper() {   # tamper <python expression on body> <out>: edit records, recompute the chain
+        python3 - "$OUT/b.log" "$2" "$1" <<'PY'
+import hashlib, sys
+src, dst, expr = sys.argv[1], sys.argv[2], sys.argv[3]
+head = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
+out, state = [], {"done": False}
+for line in open(src, encoding="utf-8", errors="surrogateescape"):
+    if line.startswith("{") and ',"chain":"' in line:
+        cut = line.index(',"chain":"')
+        body = eval(expr, {"body": line[:cut], "state": state})
+        if body is None:
+            continue
+        head = hashlib.sha256(head + body.encode("utf-8", "surrogateescape")).digest()
+        line = body + ',"chain":"' + head.hex() + line[cut + 10 + 64:]
+    out.append(line)
+open(dst, "w", encoding="utf-8", errors="surrogateescape").write("".join(out))
+PY
+    }
+    refused_by_audit() {   # refused_by_audit <forged log> <message>
+        if python3 "$HERE/tools/varek_audit.py" --policy "$POL4" --checker "$CERT" "$1" > "$1.out" 2>&1; then return 1; fi
+        grep -q "$2" "$1.out"
+    }
+    tamper '(None if "\"name\":\"c1.t.example.com\"" in body and "\"answer\":\"lookup\"" in body else body)' "$OUT/t1.log"
+    check "the audit refuses a stream with a question removed (a lookup nobody asked for)" \
+        refused_by_audit "$OUT/t1.log" "with no question asking for it"
+    tamper 'body.replace("\"names\":5,", "\"names\":50,")' "$OUT/t2.log"
+    check "the audit refuses run_start budgets that are not the policy's" \
+        refused_by_audit "$OUT/t2.log" "are not the policy's"
+    tamper '(body.replace("\"rule\":\"wildcard_budget\",\"policy_line\":2,\"budget\":\"names\",", "\"rule\":\"policy_match\",\"policy_line\":2,\"new\":true,", 1) if not state["done"] and "\"budget\":\"names\"" in body and not state.update(done=True) else body)' "$OUT/t3.log"
+    check "the audit refuses a sixth name charged to a names=5 rule" \
+        refused_by_audit "$OUT/t3.log" "charged more than its 5 names"
     rm -rf "$W"
 fi
 

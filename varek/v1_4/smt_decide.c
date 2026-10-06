@@ -859,6 +859,33 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
 
         for (int i = ci + 1; i < nt; i++) {
             const char *t = tok[i];
+            /* v1.25: names=N and rate=N, budgets of a wildcard allow rule */
+            if (r->kind == VDP_KIND_HOST && (!strncmp(t, "names=", 6) || !strncmp(t, "rate=", 5))) {
+                bool is_names = t[0] == 'n';
+                const char *v = t + (is_names ? 6 : 5);
+                uint32_t max = is_names ? 100000 : 10000, val = 0;
+                bool ok = v[0] >= '1' && v[0] <= '9';
+                for (const char *q = v; ok && *q; q++) {
+                    if (*q < '0' || *q > '9') ok = false;
+                    else if ((val = val * 10 + (uint32_t)(*q - '0')) > max) ok = false;
+                }
+                if (!r->s.wild || r->verb != VDP_ALLOW) {
+                    rc = perr(err, errlen, path, lineno,
+                              "'%s': names= and rate= apply only to wildcard allow rules", t);
+                    goto out;
+                }
+                if (!ok) {
+                    rc = perr(err, errlen, path, lineno, "'%s': %s must be 1 to %u", t,
+                              is_names ? "names" : "rate", max);
+                    goto out;
+                }
+                if (is_names ? r->names : r->rate) {
+                    rc = perr(err, errlen, path, lineno, "'%s' given twice", is_names ? "names=" : "rate=");
+                    goto out;
+                }
+                if (is_names) r->names = val; else r->rate = val;
+                continue;
+            }
             if (r->kind != VDP_KIND_PATH) {
                 rc = perr(err, errlen, path, lineno, "flag clause '%s' on a non-path rule", t); goto out;
             }

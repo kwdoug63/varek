@@ -353,7 +353,8 @@ static int policy_load(const char *path, struct policy *p) {
             ci.kind != kind_to_c[r->kind] || ci.match != op_to_match[r->s.op] ||
             ci.clen != r->s.len || memcmp(ci.c, r->s.c, r->s.len) != 0 ||
             ci.mask != r->b.mask || ci.value != r->b.value || ci.line != r->line ||
-            ci.portless != r->s.portless || ci.name != r->s.name || ci.wild != r->s.wild) {
+            ci.portless != r->s.portless || ci.name != r->s.name || ci.wild != r->s.wild ||
+            ci.names != r->names || ci.rate != r->rate) {
             fprintf(stderr, "[warden] policy %s:%d: the decision procedure and the certificate "
                     "checker read this rule differently; refusing to start\n", path, r->line);
             return -1;
@@ -1273,6 +1274,10 @@ static bool       g_any_name = false;  /* v1.24: the policy has a host name rule
 static bool       g_any_wild = false;  /* v1.25: the policy has a wildcard allow rule (warden_stub.inc.c) */
 static void       stub_resolved(size_t i);
 static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden_stub.inc.c) */
+/* v1.25 (section 4): a wildcard allow rule's budgets when it sets none */
+#define STUB_DEFAULT_NAMES 256           /* distinct new names per run */
+#define STUB_DEFAULT_RATE  30            /* distinct new names per minute */
+#define STUB_LABEL_MAX     63            /* bytes matched by `*` */
 static char       g_psl_sha[65], g_shared_sha[65];  /* v1.25: the lists wildcards were checked against */
 static uint64_t g_records = 0;       /* decision records emitted */
 static bool     g_relay_midline = false;
@@ -1542,6 +1547,20 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     /* v1.25: where the agent's questions go (connects and sends to it are
      * records with rule dns_stub) */
     if (g_any_wild) fputs("\"dns_stub\":\"127.53.53.53:53\",", f);
+    /* v1.25 (section 4): each wildcard allow rule's budgets, defaults filled in */
+    if (g_any_wild) {
+        fputs("\"wildcard_budgets\":[", f);
+        bool first = true;
+        for (size_t i = 0; i < p->v.n; i++) {
+            const vdp_rule_t *r = &p->v.rules[i];
+            if (r->kind != VDP_KIND_HOST || !r->s.wild || r->verb != VDP_ALLOW) continue;
+            fprintf(f, "%s{\"policy_line\":%d,\"names\":%u,\"rate\":%u,\"label\":%u}", first ? "" : ",",
+                    r->line, r->names ? r->names : STUB_DEFAULT_NAMES,
+                    r->rate ? r->rate : STUB_DEFAULT_RATE, STUB_LABEL_MAX);
+            first = false;
+        }
+        fputs("],", f);
+    }
     fprintf(f, "\"timestamp_ns\":%lld}\n", (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end("run_start");
 }

@@ -11,6 +11,9 @@
 #       resolv.conf view): prints the rcode, the answer count and addresses
 #   v1250_client.py connect <addr> <port>
 #       a plain connect (to some other port-53 server: must be refused)
+#   v1250_client.py ask <name> ...
+#       getaddrinfo each name in turn, as fast as it can (a DNS-tunnel style
+#       client: every name new); prints one line per name
 import http.client, os, socket, struct, sys, time
 
 
@@ -75,6 +78,10 @@ def raw(transport, qtype, name):
 
 if sys.argv[1] == "raw":
     case("raw-%s-%s" % (sys.argv[2], sys.argv[3]), lambda: raw(sys.argv[2], sys.argv[3], sys.argv[4]))
+    sys.exit(0)
+if sys.argv[1] == "ask":
+    for n in sys.argv[2:]:
+        case("ask " + n, lambda: ",".join(sorted({a[4][0] for a in socket.getaddrinfo(n, 80, proto=socket.IPPROTO_TCP)})))
     sys.exit(0)
 if sys.argv[1] == "connect":
     case("connect %s:%s" % (sys.argv[2], sys.argv[3]),

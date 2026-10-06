@@ -235,6 +235,12 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             if event == "resolution" and run is not None and rec.get("run") == run \
                     and meta is not None:
                 meta.setdefault("resolutions", []).append((len(records), rec))
+            # v1.25: the stub resolver's questions and the resolutions, in
+            # stream order (varek_audit.py checks the budgets and that every
+            # name looked up on demand was asked for first).
+            if event in ("resolution", "dns_question") and run is not None \
+                    and rec.get("run") == run and meta is not None:
+                meta.setdefault("dns_events", []).append(rec)
             continue
         if run is None:
             fail(lineno, "record before run_start (a pre-v1.12.1 log, or not a "

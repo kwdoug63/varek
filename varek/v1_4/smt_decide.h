@@ -142,6 +142,11 @@ typedef struct {
     vdp_str_atom_t s;
     vdp_bv_atom_t  b;
     int            line;   /* policy file line, for diagnostics and records */
+    /* v1.25 (section 4): a wildcard allow rule's budgets, `names=N` (distinct
+     * new names per run) and `rate=N` (distinct new names per minute); 0 when
+     * the rule does not set them (the Warden's defaults apply). They bound the
+     * Warden's stub resolver and do not take part in any decision. */
+    uint32_t       names, rate;
 } vdp_rule_t;
 
 typedef struct {

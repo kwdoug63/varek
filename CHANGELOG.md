@@ -11,7 +11,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 - v1.25.0, in progress (opt-in wildcard host names,
-  `docs/security/v1.25-wildcard-host-names.md`), sections 1 to 3:
+  `docs/security/v1.25-wildcard-host-names.md`), sections 1 to 4:
   - Policy grammar: `allow host *.example.com[:port]` after
     `require warden 1.25`, in the decision procedure, the certificate checker
     and the cross-check oracle; held as a glob (`?*.example.com:443`), so it is
@@ -36,9 +36,20 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     `varek_audit.py` accepts `dns_stub` records only to it. Two more empty
     views, `/etc/netsvc.conf` and `/etc/svc.conf`, keep c-ares (Node's
     `dns.resolve*`) from discarding its configuration.
+  - Budgets on the name channel: `allow host *.example.com:443 names=64
+    rate=10` (defaults 256 new names a run and 30 a minute, and at most 63
+    bytes before the suffix), parsed by all three parsers. A new name past a
+    budget gets NXDOMAIN and is not looked up (`wildcard_budget`). Every
+    question to the stub is a chained `dns_question` record, and `run_start`
+    lists the budgets. `varek_audit.py` checks the budgets against the
+    policy file, every charge against them, and that every name looked up on
+    demand was asked for. `varek refusals` lists budget refusals;
+    `varek policy show` shows each rule's budgets.
   - Tests: `make test-v1250`. As root it runs Python, curl, Node
     (`dns.lookup` and `dns.resolve4`), Go, Java and a static musl client
-    through the stub. 21 of its 31 stub checks fail without the stub.
+    through the stub, and a DNS-tunnel style client against the budgets.
+    Against the previous build, 21 of the 31 stub checks fail without the
+    stub, and 22 of the budget and budget-grammar checks fail.
 - v1.24.0, in progress (host names without agent DNS,
   `docs/security/v1.21-stage2-host-names.md`), sections 1 and 2:
   - Policy grammar: `allow host api.example.com[:port]` and `deny host <name>`
