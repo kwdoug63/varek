@@ -1,8 +1,9 @@
 # VAREK v1.24.0 — Host Names Without Agent DNS
 
 > **DRAFT, not released.** Three things stay open before this is tagged: the
-> 24-hour soak run (§5 of the design), the independent review, and the latency
-> figures. Each is marked **PENDING** below.
+> independent review, the latency figures, and a second 24-hour soak run on
+> the Warden with the fix the first run found. Each is marked **PENDING**
+> below.
 
 Released PENDING · MIT · github.com/kwdoug63/varek
 
@@ -36,10 +37,11 @@ query:
    chained `resolution` record, signed at the next checkpoint. Lookups run in a
    resolver helper process, so the supervisor never waits on DNS while an agent
    thread waits on an answer.
-3. **Views.** The agent reads `/etc/hosts`, `/etc/resolv.conf` and
-   `/etc/nsswitch.conf` from sealed memfds that the Warden writes. Its
-   `/etc/hosts` lists localhost and the allowed names' current addresses, and
-   nothing else. Its resolver configuration names a server that no one answers.
+3. **Views.** The agent reads `/etc/hosts`, `/etc/resolv.conf`,
+   `/etc/nsswitch.conf` and `/etc/host.conf` from sealed memfds that the Warden
+   writes. Its `/etc/hosts` lists localhost and the allowed names' current
+   addresses, IPv4 before IPv6, and nothing else. Its `/etc/host.conf` says
+   `multi on`, so glibc returns every address of a name. Its resolver configuration names a server that no one answers.
    Every connect to port 53 is refused (`dns_refused`), whatever the numeric
    rules say.
 4. **Connects decided on names.** A connect is decided on its address and on
@@ -96,21 +98,41 @@ name rules.
 
 ## 24 hours against CDN-hosted APIs
 
-**PENDING.** `tests/soak_v1240/soak.sh` fetches by name every minute for 24
-hours, against these targets:
+**PENDING:** a second run, on the Warden with the `host.conf` fix below. The
+first run's results:
 
-| Network | URL |
-|---|---|
-| Fastly | `https://pypi.org/robots.txt` |
-| Cloudflare | `https://www.cloudflare.com/cdn-cgi/trace` |
-| CloudFront | `https://aws.amazon.com/robots.txt` |
+`tests/soak_v1240/soak.sh` ran for 24.00 hours on a DigitalOcean droplet
+(Ubuntu 24.04, kernel 6.8, 1 vCPU, 1 GB), from 2026-10-05 to 2026-10-06. The
+agent fetched each URL by name once a minute:
 
-The results to fill in from `report.txt`:
-- refused connects caused by a stale table (must be 0)
-- resolution records per name, and how many times each answer changed
-- fetches that used an address in its grace period
-- failures outside the Warden
-- the audit result
+| Network | URL | Fetches | OK |
+|---|---|---|---|
+| Fastly | `https://pypi.org/robots.txt` | 1,440 | 1,440 |
+| Cloudflare | `https://www.cloudflare.com/cdn-cgi/trace` | 1,440 | 1,440 |
+| CloudFront | `https://aws.amazon.com/robots.txt` | 1,440 | 1,436 |
+
+- **Refused connects to the soak ports: 0.** No fetch failed because the
+  table was stale.
+- **Resolution:**
+
+  | Name | Resolution records | Refresh interval | Answer changes | Worst lateness |
+  |---|---|---|---|---|
+  | `aws.amazon.com` | 2,818 | 30–58 s | 2,015 | 4.0 s |
+  | `www.cloudflare.com` | 1,411 | 30–291 s | 0 | 0.0 s |
+  | `pypi.org` | 36 | 30–3,600 s | 0 | 0.0 s |
+
+  CloudFront changed `aws.amazon.com`'s answer 2,015 times in 24 hours, and
+  every fetch still reached an address the table held.
+- **Peers:** every peer the agent reached appears in the resolution
+  records. No fetch needed an address in its grace period.
+- **Each URL was served by the expected network**, judged from its response
+  headers.
+- **4 of 4,320 fetches failed**, all to `aws.amazon.com`, all
+  `OSError: [Errno 101] Network is unreachable`, within six minutes. The
+  checker counted them as outside the Warden, but they were a Warden bug (see
+  "Found in the soak" below), now fixed.
+- **Audit:** `varek_audit.py` PASS on the 47,972-record stream, with the hash
+  chain intact. `soak_check` PASS.
 
 ## Latency
 
@@ -140,8 +162,28 @@ belongs to.
   `run_start`; `resolution` records; and `dialed`, `candidates` and
   `resolution_generation` on connects.
 - New record rules: `hosts_view`, `resolv_view`, `nsswitch_view`,
+  `hostconf_view`,
   `dns_refused` and `too_many_names`.
 - New `vdp_cert_check` mode: `kinds`.
+
+## Found in the soak
+
+**The agent got one address per name, sometimes an unreachable one.** Each
+of the 4 failures dialed an IPv6 address, and the droplet has no IPv6 route.
+The resolution records show the table held the IPv4 addresses throughout. The
+cause was in the views:
+- The soak policy did not let the agent read `/etc/host.conf`. Without its
+  `multi on`, glibc returns only the first `/etc/hosts` line for a name.
+- The table appends a new address after the ones it keeps. When CloudFront
+  rotated its IPv4 addresses, an IPv6 address came first in the view.
+
+The Warden now serves `/etc/host.conf` as a fourth view (`multi on`,
+`hostconf_view`), and the hosts view lists each name's IPv4 addresses before
+its IPv6 ones. `make test-v1240` recreates the failure, with the A record
+appearing after the AAAA one: against the earlier v1.24 code the agent
+resolves only `2001:db8::10` and its fetch fails; with the fix it resolves
+both and connects. `soak_check.py` now reports failures by their full message
+rather than the exception type alone.
 
 ## Found in review
 
@@ -159,7 +201,7 @@ belongs to.
   v1.25.
 - **DNSSEC.** The Warden trusts the host's resolver and does not validate
   DNSSEC itself. Use `--dns-server` to point it at a validating resolver.
-- **Metadata on the view paths.** `stat` and `access` on the three view paths
+- **Metadata on the view paths.** `stat` and `access` on the four view paths
   are decided as before; only opens get the views. Every client tested
   resolves without them.
 - **Refresh changes and checkpoints.** A refresh that changes a name's

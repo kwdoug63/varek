@@ -356,6 +356,26 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
         python3 "$HERE/tools/varek_audit.py" --policy "$POL" --checker "$CERT" "$OUT/a.log"
     printf '%s\n' '{"api.example.com": {"ttl": 30, "a": ["127.0.0.1"]}}' > "$OUT/zone.json"
 
+    # Every address of a name reaches the agent, IPv4 first. Found by the
+    # 24-hour soak: the table appends a new address after those it keeps, so
+    # once CloudFront rotated its IPv4 addresses an IPv6 one came first in the
+    # hosts view; glibc, which the policy did not let read /etc/host.conf
+    # ("multi on"), returned that line only, and the host had no IPv6 route.
+    # Here the A record appears after the AAAA one.
+    printf '%s\n' '{"api.example.com": {"ttl": 1, "aaaa": ["2001:db8::10"]}}' > "$OUT/zone.json"
+    ( sleep 1
+      printf '%s\n' '{"api.example.com": {"ttl": 1, "a": ["127.0.0.1"], "aaaa": ["2001:db8::10"]}}' > "$OUT/zone.tmp"
+      mv "$OUT/zone.tmp" "$OUT/zone.json" ) &
+    agent --dns-ttl-min 1 -- /usr/bin/python3 "$W/v1240_client.py" late 3.5 "$HP" > "$OUT/late.out"
+    wait $! 2>/dev/null
+    sed 's/^/     /' "$OUT/late.out"
+    check "a name's addresses of both families all resolve (the host.conf view)" \
+        grep -q '^OK resolve 127.0.0.1,2001:db8::10 ' "$OUT/late.out"
+    check "and the agent connects although the IPv6 address was added first" \
+        grep -q '^OK http 200 ' "$OUT/late.out"
+    check "the host.conf view was served"      grep -q '"rule":"hostconf_view"' "$OUT/a.log"
+    printf '%s\n' '{"api.example.com": {"ttl": 30, "a": ["127.0.0.1"]}}' > "$OUT/zone.json"
+
     # A deny covering /etc/hosts wins: the agent resolves nothing.
     { printf 'require warden 1.24\ndeny path /etc/hosts\n'; tail -n +2 "$POL"; } > "$OUT/nohosts.policy"
     env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$OUT/nohosts.policy" --dns-server "127.0.0.1:$PORT" \

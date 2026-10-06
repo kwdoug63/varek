@@ -25,9 +25,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     result as a chained `resolution` record. `--check-startup` reports names
     that do not resolve.
   - Sections 3 and 4 (`warden_names.inc.c`): while the policy has a host name
-    rule, the agent's opens of `/etc/hosts`, `/etc/resolv.conf` and
-    `/etc/nsswitch.conf` get the Warden's views (only the allowed names; no
-    reachable nameserver; `hosts: files`), every connect to port 53 is refused,
+    rule, the agent's opens of `/etc/hosts`, `/etc/resolv.conf`,
+    `/etc/nsswitch.conf` and `/etc/host.conf` get the Warden's views (only the
+    allowed names, IPv4 first; no reachable nameserver; `hosts: files`;
+    `multi on`, so glibc returns every address of a name), every connect to port 53 is refused,
     and a connect is decided on its address and the names that resolved to it
     (the first rule over all of them decides; the checker confirms no earlier
     rule holds on another). Records carry `dialed`, `candidates` and the table
@@ -44,9 +45,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     its 88 checks against v1.23.1.
   - `tests/soak_v1240/`: the 24-hour soak test against Fastly-, Cloudflare-
     and CloudFront-hosted APIs (`soak.sh`, an agent, and a checker for the
-    design's section 5), to run on a host with outbound HTTPS.
-  - `RELEASE-v1.24.0.md`: draft release notes; the soak results, latency and
-    review findings are pending.
+    design's section 5), to run on a host with outbound HTTPS. It passed
+    24 hours on a DigitalOcean droplet: 4,320 fetches, 0 refused connects,
+    2,015 answer changes for `aws.amazon.com`, and the audit passing. Its 4
+    failed fetches were the Warden's: without a `host.conf` view, glibc gave
+    the agent only the first hosts line, an IPv6 address after a rotation, on
+    an IPv4-only host. Fixed, and `make test-v1240` recreates the failure.
+  - `RELEASE-v1.24.0.md`: draft release notes, with the soak results; latency
+    and the review findings are pending.
 - `docs/security/v1.27-program-launches.md`: the design for decided program
   launches (a Landlock execute ruleset built from the policy's `allow exec`
   rules, the Warden deciding and recording each launch, an identity check

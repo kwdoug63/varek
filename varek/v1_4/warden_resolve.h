@@ -139,8 +139,8 @@ void wr_expire(wr_table_t *t, int64_t now);
 /* v1.24 (section 3): the hosts view the agent reads as /etc/hosts:
  *   127.0.0.1 localhost
  *   ::1 localhost
- * then one line per current address of each name ("<address> <name>"), in
- * table order. Addresses in grace are left out (the agent may still connect
+ * then one line per current address of each name ("<address> <name>"), names
+ * in table order, each name's IPv4 addresses before its IPv6 ones. Addresses in grace are left out (the agent may still connect
  * to one it read before; it cannot look it up again). */
 void wr_hosts_view(const wr_table_t *t, FILE *f);
 

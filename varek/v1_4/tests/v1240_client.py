@@ -23,6 +23,13 @@ if sys.argv[1] == "timed":
         h, p = dest.rsplit(":", 1)
         case("at %s %s" % (at, dest), lambda: get(h, int(p)))
     sys.exit(0)
+if sys.argv[1] == "late":
+    # late <seconds> <port>: after a wait, resolve and fetch api.example.com
+    time.sleep(float(sys.argv[2]))
+    port = int(sys.argv[3])
+    case("resolve", lambda: ",".join(sorted({a[4][0] for a in socket.getaddrinfo("api.example.com", port, proto=socket.IPPROTO_TCP)})))
+    case("http", lambda: get("api.example.com"))
+    sys.exit(0)
 port = int(sys.argv[1])
 case("resolve", lambda: ",".join(sorted({a[4][0] for a in socket.getaddrinfo("api.example.com", port, proto=socket.IPPROTO_TCP)})))
 case("http", lambda: get("api.example.com"))
