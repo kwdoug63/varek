@@ -1,8 +1,8 @@
 # VAREK v1.24.0 — Host Names Without Agent DNS
 
-> **DRAFT, not released.** Three things stay open before this is tagged: the
-> 24-hour soak run (§5 of the design), the independent review, and the latency
-> figures. Each is marked **PENDING** below.
+> **DRAFT, not released.** Two things stay open before this is tagged: the
+> independent review and the latency figures. Each is marked **PENDING**
+> below. The 24-hour soak run (§5 of the design) passed.
 
 Released PENDING · MIT · github.com/kwdoug63/varek
 
@@ -96,21 +96,36 @@ name rules.
 
 ## 24 hours against CDN-hosted APIs
 
-**PENDING.** `tests/soak_v1240/soak.sh` fetches by name every minute for 24
-hours, against these targets:
+`tests/soak_v1240/soak.sh` ran for 24.00 hours on a DigitalOcean droplet
+(Ubuntu 24.04, kernel 6.8, 1 vCPU, 1 GB), from 2026-10-05 to 2026-10-06. The
+agent fetched each URL by name once a minute:
 
-| Network | URL |
-|---|---|
-| Fastly | `https://pypi.org/robots.txt` |
-| Cloudflare | `https://www.cloudflare.com/cdn-cgi/trace` |
-| CloudFront | `https://aws.amazon.com/robots.txt` |
+| Network | URL | Fetches | OK |
+|---|---|---|---|
+| Fastly | `https://pypi.org/robots.txt` | 1,440 | 1,440 |
+| Cloudflare | `https://www.cloudflare.com/cdn-cgi/trace` | 1,440 | 1,440 |
+| CloudFront | `https://aws.amazon.com/robots.txt` | 1,440 | 1,436 |
 
-The results to fill in from `report.txt`:
-- refused connects caused by a stale table (must be 0)
-- resolution records per name, and how many times each answer changed
-- fetches that used an address in its grace period
-- failures outside the Warden
-- the audit result
+- **Refused connects to the soak ports: 0.** No fetch failed because the
+  table was stale.
+- **Resolution:**
+
+  | Name | Resolution records | Refresh interval | Answer changes | Worst lateness |
+  |---|---|---|---|---|
+  | `aws.amazon.com` | 2,818 | 30–58 s | 2,015 | 4.0 s |
+  | `www.cloudflare.com` | 1,411 | 30–291 s | 0 | 0.0 s |
+  | `pypi.org` | 36 | 30–3,600 s | 0 | 0.0 s |
+
+  CloudFront changed `aws.amazon.com`'s answer 2,015 times in 24 hours, and
+  every fetch still reached an address the table held.
+- **Peers:** every peer the agent reached appears in the resolution
+  records. No fetch needed an address in its grace period.
+- **Each URL was served by the expected network**, judged from its response
+  headers.
+- **Failures outside the Warden: 4 of 4,320 fetches**, all to
+  `aws.amazon.com` and all `OSError`. None was a refusal or a failed lookup.
+- **Audit:** `varek_audit.py` PASS on the 47,972-record stream, with the hash
+  chain intact. `soak_check` PASS.
 
 ## Latency
 
