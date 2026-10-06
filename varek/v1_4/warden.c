@@ -2838,8 +2838,8 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * component, untracked dirfd, over-long path, deleted inode, missing
          * parent) is a hard deny before any policy match. */
         struct resolved_target rt = { .path_fd = -1, .parent_fd = -1 };
-        /* v1.24: /etc/hosts, /etc/resolv.conf and /etc/nsswitch.conf, named
-         * as such, are answered with the Warden's views while the policy has
+        /* v1.24: /etc/hosts, /etc/resolv.conf, /etc/nsswitch.conf and
+         * /etc/host.conf, named as such, are answered with the Warden's views while the policy has
          * a host name rule (warden_names.inc.c), whether or not the host has
          * the file. */
         if (g_any_name && act.kind == ACT_FILE_OPEN && view_open_readonly(&act) &&
