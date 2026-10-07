@@ -4,7 +4,7 @@
 > - the 24-hour soak report (Wikipedia, 40 names on one address);
 > - a review of the change;
 > - the latency of a lookup through the stub;
-> - the spec paper edition.
+> - the soak, review and latency figures in the spec paper's draft edition.
 
 Released PENDING · MIT · github.com/kwdoug63/varek
 
