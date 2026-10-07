@@ -603,9 +603,35 @@ static void stub_service(const struct policy *p, const struct pollfd *pfds, int 
 
 /* ---- the agent's side: connects and sends to the stub ---- */
 
+/* Answer a connect to the stub with err (0, EINPROGRESS or the connect's
+ * errno), and record it. */
+static void stub_connect_answer(int notify_fd, uint64_t id, pid_t tid, struct action *a,
+                                const struct timespec *t0, int err) {
+    net_record(tid, a, DEC_ALLOW, err && err != EINPROGRESS ? DEC_DENY : DEC_ALLOW, "dns_stub", t0, err);
+    if (err) send_errno(notify_fd, id, err);
+    else send_value(notify_fd, id, 0);
+}
+
+/* A pending stub connect is made on the agent's own socket, which was
+ * blocking: make it blocking again. */
+static void stub_pend_restore(struct pending_op *op) {
+    int fl = fcntl(op->sock, F_GETFL);
+    if (fl >= 0) (void)fcntl(op->sock, F_SETFL, fl & ~O_NONBLOCK);
+}
+
 /* A connect to the stub (stub_is_dest): connect the agent's own socket ag (a
  * TCP or UDP socket in the agent's namespace) to the Warden's copy of the
- * address, and answer what that connect returned. */
+ * address, and answer what that connect returned.
+ *
+ * v1.25 review: the connect never blocks the Warden. A TCP handshake to the
+ * stub's own listener normally completes at once, but the agent sets the
+ * socket's options, and with TCP_MD5SIG or a long TCP_SYNCNT it can keep the
+ * handshake from completing for minutes or hours. So the socket is made
+ * non-blocking for the connect; a blocking connect that is still in progress
+ * waits as a pending operation (warden_net.inc.c) and is answered when the
+ * socket is writable, or with EINPROGRESS when the agent's SO_SNDTIMEO runs
+ * out, as the kernel does. Until then other threads sharing the socket see it
+ * non-blocking. */
 static void stub_connect(int notify_fd, const struct seccomp_notif *req, struct action *a,
                          int ag, const struct sock_kind *k, const struct timespec *t0) {
     pid_t tid = (pid_t)req->pid;
@@ -614,12 +640,43 @@ static void stub_connect(int notify_fd, const struct seccomp_notif *req, struct 
     else {
         struct sockaddr_storage ss;
         socklen_t sl = stub_sockaddr(k->dom, &ss);
-        if (connect(ag, (struct sockaddr *)&ss, sl) < 0) err = errno;
+        int fl = fcntl(ag, F_GETFL);
+        bool blocking = fl >= 0 && !(fl & O_NONBLOCK);
+        if (blocking && fcntl(ag, F_SETFL, fl | O_NONBLOCK) < 0) err = errno;
+        else if (connect(ag, (struct sockaddr *)&ss, sl) < 0) err = errno;
+        if (blocking && err == EINPROGRESS) {
+            struct pollfd pf = { .fd = ag, .events = POLLOUT };
+            if (poll(&pf, 1, 0) == 1) {                /* done already, as on loopback */
+                socklen_t l = sizeof err;
+                if (getsockopt(ag, SOL_SOCKET, SO_ERROR, &err, &l) < 0) err = errno;
+            }
+        }
+        if (blocking && err == EINPROGRESS) {
+            struct stat st;
+            struct pending_op *op = fstat(ag, &st) == 0 ? pend_new() : NULL;
+            if (!op) {
+                (void)fcntl(ag, F_SETFL, fl);
+                close(ag);
+                stub_connect_answer(notify_fd, req->id, tid, a, t0, ENOBUFS);
+                return;
+            }
+            op->kind = PEND_STUB;
+            op->id = req->id;
+            op->tid = tid;
+            op->sock = ag;                      /* the agent's socket; closed by pend_free */
+            op->agent_fd = a->sock_fd;
+            op->ag_dev = st.st_dev;
+            op->ag_ino = st.st_ino;
+            op->t0 = *t0;
+            clock_gettime(CLOCK_MONOTONIC, &op->t_dial);
+            memcpy(op->act, a, sizeof *a);
+            op->has_deadline = sndtimeo_deadline(ag, &op->deadline);
+            return;
+        }
+        if (blocking) (void)fcntl(ag, F_SETFL, fl);
     }
     close(ag);                           /* EINPROGRESS: a non-blocking TCP socket */
-    net_record(tid, a, DEC_ALLOW, err && err != EINPROGRESS ? DEC_DENY : DEC_ALLOW, "dns_stub", t0, err);
-    if (err) send_errno(notify_fd, req->id, err);
-    else send_value(notify_fd, req->id, 0);
+    stub_connect_answer(notify_fd, req->id, tid, a, t0, err);
 }
 
 /* A sendto() naming the stub on a UDP socket: send the message (read once)

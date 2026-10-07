@@ -203,7 +203,7 @@ if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
 else
     W=/tmp/varek_v1250w
     rm -rf "$W"; mkdir -p "$W"; chmod 755 "$W"
-    cp "$T/v1250_client.py" "$T/v1250_client.js" "$W/"
+    cp "$T/v1250_client.py" "$T/v1250_client.js" "$T/v1250_stall.py" "$W/"
     chmod 644 "$W"/*
     PORT=$((20000 + RANDOM % 20000))
     HP=$((40000 + RANDOM % 5000))
@@ -291,6 +291,17 @@ PY
         grep -q '^OK raw-udp-A rcode=3 an=0 ' "$OUT/raw.out"
     check "a connect to another port-53 server is refused (dns_refused)" \
         grep -q '^ERR connect 127.0.0.1:53 ' "$OUT/raw.out"
+
+    # v1.25 review: a TCP connect to the stub that never completes (the agent
+    # sets TCP_MD5SIG, so the stub's listener drops its SYNs) must not hold up
+    # the Warden, and must end as the kernel's own would.
+    echo hi > "$W/f"; chmod 644 "$W/f"
+    agent -- /usr/bin/python3 "$W/v1250_stall.py" "$W/f" > "$OUT/stall.out"
+    sed 's/^/     /' "$OUT/stall.out"
+    check "opens are answered while a stub connect hangs" \
+        sh -c "[ \$(awk '\$1 == \"OPEN\" && \$2 < 0.5' '$OUT/stall.out' | wc -l) = 3 ]"
+    check "the hung stub connect times out as the kernel's would, blocking again" \
+        grep -q '^CONNECT ETIMEDOUT [0-9.]* blocking=1$' "$OUT/stall.out"
 
     if command -v curl > /dev/null; then
         agent -- /usr/bin/curl -s -o /dev/null -w '%{http_code}\n' --max-time 5 "http://curl.$SFX:$HP/" > "$OUT/curl.out"
