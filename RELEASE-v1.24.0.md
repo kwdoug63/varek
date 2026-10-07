@@ -1,8 +1,8 @@
 # VAREK v1.24.0 — Host Names Without Agent DNS
 
-> **DRAFT, not released.** Two things stay open before this is tagged: the
-> latency figures, and a second 24-hour soak run on the Warden with the fix
-> the first run found. Each is marked **PENDING** below. The AI-agent
+> **DRAFT, not released.** One thing stays open before this is tagged: a
+> second 24-hour soak run on the Warden with the fix the first run found. It
+> is marked **PENDING** below. The AI-agent
 > review is done, and its findings are fixed below. A human or third-party
 > review has not been done.
 
@@ -137,9 +137,38 @@ agent fetched each URL by name once a minute:
 
 ## Latency
 
-**PENDING.** Run `varek bench` on a name-decided connect against a numeric
-one. Deciding over the candidates adds one decision per name that the address
-belongs to.
+Deciding a connect on host names costs no time that can be measured end to
+end. `make latency-v1240` (`tests/latency_v1240.sh`) times 3,000 blocking TCP
+connects, one after another, to a listener on the machine's own address. It
+does this natively and under the Warden, with the connect allowed in three
+ways:
+- by a numeric rule;
+- by a rule on one name that resolves to the address (2 candidates);
+- with 15 allowed names all resolving to the address (16 candidates, the most
+  a v1.24 connect carries).
+
+The Warden's own time is its latency per connect minus the dial, read from its
+records. Results from three runs on a 4-vCPU cloud container
+(`varek/v1_4/tests/connect_latency_v1.24.0.txt`), microseconds:
+
+| Connect allowed by | Client p50 | Client p99 | Warden's own p50 | Warden's own p99 |
+|---|---|---|---|---|
+| Native (no Warden) | 13–16 | 88–171 | | |
+| A numeric rule | 179–206 | 456–524 | 105–124 | 289–317 |
+| One name (2 candidates) | 172–209 | 467–534 | 103–127 | 296–345 |
+| 15 names (16 candidates) | 166–194 | 322–486 | 102–116 | 215–328 |
+
+The three rows under the Warden overlap: run-to-run noise (about ±10 µs at
+p50) is larger than the difference.
+
+The decision procedure, timed on its own with the same 16-rule policy, takes
+about 0.5 µs per decision, including the batch tool's own input and output.
+So deciding over 16 candidates adds at most about 8 µs, and one name about
+1 µs.
+
+These figures are from a shared cloud container, not the dedicated 2-vCPU VM
+of the v1.22 table. They compare the three cases with each other, not with
+earlier releases.
 
 ## Also in this release
 
