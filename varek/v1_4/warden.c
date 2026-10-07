@@ -255,6 +255,7 @@ struct action {
     bool          bad_flags;            /* flags the kernel would refuse (EINVAL) */
     /* v1.24: host names (warden_names.inc.c) */
     int           ncand;                /* connect: candidate strings decided over */
+    bool          special_addr;         /* connect: a special address, decided as a number */
     char          cand[16][WR_NAME_MAX + 8];
     char          dialed[64];           /* connect: the numeric destination dialed */
     char          extra[4608];          /* extra record fields, trusted text, each ending in ',' */
@@ -299,7 +300,7 @@ static int policy_load(const char *path, struct policy *p) {
             "(warden_faultinject); never use it to supervise a real agent\n");
 #endif
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.21");
+    snprintf(p->version, sizeof(p->version), "1.24");
     char err[512];
     /* v1.15: read the file once. The decision procedure and the certificate
      * checker parse these same bytes, and their SHA-256 goes in run_start, so
@@ -1505,7 +1506,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.23.1\","
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.24.0\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
@@ -1542,19 +1543,29 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
         fprintf(stderr, "[warden] %s\n", why);
         return -1;
     }
-    for (size_t i = 0; i < p->v.n; i++) {
-        const vdp_rule_t *r = &p->v.rules[i];
-        if (r->kind == VDP_KIND_HOST && r->s.name) g_any_name = true;
-        if (r->kind != VDP_KIND_HOST || !r->s.name || r->verb != VDP_ALLOW) continue;
-        char name[WR_NAME_MAX + 1];
-        const char *colon = memchr(r->s.c, ':', r->s.len);
-        size_t nl = colon ? (size_t)(colon - r->s.c) : r->s.len;
-        if (nl > WR_NAME_MAX) return -1;            /* both parsers refuse it */
-        memcpy(name, r->s.c, nl);
-        name[nl] = '\0';
-        if (wr_table_add(&g_names, name) < 0) {
-            fprintf(stderr, "[warden] out of memory for the resolution table\n");
-            return -1;
+    /* Allow rules' names first (listed in the hosts view), then deny rules'
+     * names not already there (v1.24 review): resolved too, so a deny on a
+     * name holds on its addresses even when no allow rule names it, but kept
+     * out of the hosts view. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < p->v.n; i++) {
+            const vdp_rule_t *r = &p->v.rules[i];
+            if (r->kind == VDP_KIND_HOST && r->s.name) g_any_name = true;
+            if (r->kind != VDP_KIND_HOST || !r->s.name) continue;
+            if (r->verb != (pass == 0 ? VDP_ALLOW : VDP_DENY)) continue;
+            char name[WR_NAME_MAX + 1];
+            const char *colon = memchr(r->s.c, ':', r->s.len);
+            size_t nl = colon ? (size_t)(colon - r->s.c) : r->s.len;
+            if (nl > WR_NAME_MAX) return -1;            /* both parsers refuse it */
+            memcpy(name, r->s.c, nl);
+            name[nl] = '\0';
+            size_t before = g_names.n;
+            int ix = wr_table_add(&g_names, name);
+            if (ix < 0) {
+                fprintf(stderr, "[warden] out of memory for the resolution table\n");
+                return -1;
+            }
+            if (pass == 1 && g_names.n > before) g_names.e[ix].unlisted = true;
         }
     }
     g_names_on = g_names.n > 0;
@@ -1574,7 +1585,12 @@ static void emit_resolution(void *ctx, size_t i, const wr_result_t *r) {
 static void names_resolve_all(bool record) {
     for (size_t i = 0; i < g_names.n; i++) {
         wr_result_t r;
-        wr_lookup(&g_names, g_names.e[i].name, &r);
+        /* v1.24 review: through the resolver helper, so the Warden (which
+         * holds the signing key) never parses network data, at startup too */
+        if (wr_async_lookup(&g_names, i, &r) < 0) {
+            memset(&r, 0, sizeof r);
+            r.st[0] = r.st[1] = WR_ST_FAIL;
+        }
         wr_apply(&g_names, i, &r, wr_now_ms());
         if (record) emit_resolution(NULL, i, &r);
         size_t cur = 0;
@@ -2770,12 +2786,25 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * parent) is a hard deny before any policy match. */
         struct resolved_target rt = { .path_fd = -1, .parent_fd = -1 };
         /* v1.24: /etc/hosts, /etc/resolv.conf, /etc/nsswitch.conf and
-         * /etc/host.conf, named as such, are answered with the Warden's views while the policy has
-         * a host name rule (warden_names.inc.c), whether or not the host has
-         * the file. */
+         * /etc/host.conf, named as such, are answered with the Warden's views
+         * while the policy has a host name rule (warden_names.inc.c), whether
+         * or not the host has the file. */
         if (g_any_name && act.kind == ACT_FILE_OPEN && view_open_readonly(&act) &&
             view_by_target(act.target) >= 0) {
             view_serve(notify_fd, &req, &act, p, view_by_target(act.target), &t0);
+            continue;
+        }
+        /* v1.24 review: an open of those files that could write is refused,
+         * whatever the policy says. The Warden's resolver helper reads the
+         * host's resolv.conf on every lookup, so an agent that could write it
+         * would choose where allowed names lead. */
+        if (g_any_name && act.kind == ACT_FILE_OPEN && !view_open_readonly(&act) &&
+            view_by_target(act.target) >= 0) {
+            snprintf(act.resolved, sizeof act.resolved, "%s", act.target);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            emit_pathology(g_report_seq++, req.pid, &act, DEC_DENY, DEC_DENY, "view_write_refused",
+                           (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec), EACCES);
+            send_simple(notify_fd, req.id, DEC_DENY);
             continue;
         }
         if (act.kind == ACT_FILE_OPEN) {
@@ -2808,6 +2837,14 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                 int v = view_by_canonical(act.resolved);
                 resolved_target_close(&rt);
                 view_serve(notify_fd, &req, &act, p, v, &t0);
+                continue;
+            }
+            if (g_any_name && !view_open_readonly(&act) && view_by_canonical(act.resolved) >= 0) {
+                resolved_target_close(&rt);
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                emit_pathology(g_report_seq++, req.pid, &act, DEC_DENY, DEC_DENY, "view_write_refused",
+                               (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec), EACCES);
+                send_simple(notify_fd, req.id, DEC_DENY);
                 continue;
             }
         }
@@ -4054,7 +4091,14 @@ int main(int argc, char **argv) {
     if (g_check_only) {
         /* v1.24: resolve each allowed name and report the ones that fail (a
          * name that does not resolve does not stop the Warden). */
-        if (g_names_on) names_resolve_all(false);
+        if (g_names_on) {
+            if (wr_async_start(&g_names, "/proc/self/exe") < 0) {
+                fprintf(stderr, "[warden] cannot start the resolver helper (%s)\n", strerror(errno));
+                return 1;
+            }
+            names_resolve_all(false);
+            wr_async_stop(&g_names);
+        }
         fprintf(stderr, "[warden] startup checks passed: the policy%s%s%s%s would be accepted%s\n",
                 key_path ? ", the signing key" : "", anchor_path ? ", the anchor" : "",
                 flow_path ? ", the flow policy, the breaker state" : "",
@@ -4096,7 +4140,6 @@ int main(int argc, char **argv) {
      * PID namespace exists. Without it the table would go stale, so a failure
      * to start it stops the run. */
     if (g_names_on) {
-        names_resolve_all(true);
         if (wr_async_start(&g_names, "/proc/self/exe") < 0) {
             fprintf(stderr, "[warden] cannot start the resolver helper (%s); refusing to start\n",
                     strerror(errno));
@@ -4104,6 +4147,7 @@ int main(int argc, char **argv) {
             if (g_sk) sodium_free(g_sk);
             return 1;
         }
+        names_resolve_all(true);
     }
 
     /* v1.6 pre-execution plan verification. Fires before fork; on

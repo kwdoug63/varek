@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <arpa/nameser.h>
 #include <errno.h>
+#include <poll.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <fcntl.h>
@@ -114,6 +115,10 @@ static void query_one(res_state rs, const char *name, int type, wr_status_t *st,
     *nout = 0;
     *ttl = 0;
     int len = res_nquery(rs, name, ns_c_in, type, ans, sizeof ans);
+    /* res_nquery returns the answer's full length, which can be more than
+     * the buffer (a TCP answer after a truncated UDP one): the rest was not
+     * stored, and parsing to that length would read past the buffer. */
+    if (len > (int)sizeof ans) { *st = WR_ST_FAIL; return; }
     if (len < 0) {
         switch (rs->res_h_errno) {
             case HOST_NOT_FOUND: *st = WR_ST_NXDOMAIN; break;
@@ -209,6 +214,13 @@ void wr_lookup(const wr_table_t *t, const char *name, wr_result_t *r) {
     res_nclose(&rs);
 }
 
+/* The resolver helper's end (see "resolver helper" below). */
+struct wr_async {
+    int  fd;                       /* SOCK_SEQPACKET to the helper */
+    bool dead;
+    bool full;                     /* the last schedule found the socket full */
+};
+
 /* ------------------------------------------------------------------- table */
 
 static bool ip_eq(const wr_ip_t *x, const wr_ip_t *y) {
@@ -240,7 +252,7 @@ bool wr_apply(wr_table_t *t, size_t i, const wr_result_t *r, int64_t now) {
     e->pending = false;
     e->lookups++;
     wr_expire(t, now);
-    uint32_t old_ttl = e->ttl_eff;
+    uint32_t old_ttl = e->ttl_last ? e->ttl_last : e->ttl_eff;
     int64_t grace_until = now + (int64_t)(old_ttl < t->cfg.grace_max ? old_ttl : t->cfg.grace_max) * 1000;
     bool changed = false;
     bool any_answer = false;
@@ -282,6 +294,7 @@ bool wr_apply(wr_table_t *t, size_t i, const wr_result_t *r, int64_t now) {
     /* The next refresh: at the clamped TTL of what answered, or after ttl_min
      * when nothing answered (a failure, or a negative answer). */
     e->ttl_eff = (any_answer && minttl != UINT32_MAX) ? clamp_ttl(&t->cfg, minttl) : t->cfg.ttl_min;
+    if (any_answer && minttl != UINT32_MAX) e->ttl_last = e->ttl_eff;
     e->next_ms = now + (int64_t)e->ttl_eff * 1000;
     if (changed) t->generation++;
     return changed;
@@ -305,17 +318,33 @@ int wr_next_due_ms(const wr_table_t *t, int64_t now) {
         if (t->e[i].pending) continue;
         int64_t d = t->e[i].next_ms - now;
         if (d < 0) d = 0;
+        /* Due, but the helper's socket is full: its answers will wake the
+         * Warden; meanwhile do not spin (v1.24 review). */
+        if (d == 0 && t->async && t->async->full) d = 100;
         if (best < 0 || d < best) best = d;
     }
     if (best > INT32_MAX) best = INT32_MAX;
     return (int)best;
 }
 
+/* An IPv4-mapped IPv6 address as the IPv4 address it names. */
+static wr_ip_t ip_norm(const wr_ip_t *x) {
+    static const uint8_t pfx[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+    wr_ip_t y = *x;
+    if (x->fam == 6 && !memcmp(x->a, pfx, 12)) {
+        memset(&y, 0, sizeof y);
+        y.fam = 4;
+        memcpy(y.a, x->a + 12, 4);
+    }
+    return y;
+}
+
 bool wr_entry_has(const wr_entry_t *e, const wr_ip_t *ip, int64_t now) {
     for (size_t k = 0; k < e->n; k++) {
         const wr_addr_t *a = &e->addrs[k];
         if (a->until_ms != 0 && a->until_ms <= now) continue;
-        if (ip_eq(&a->ip, ip)) return true;
+        wr_ip_t x = ip_norm(&a->ip), y = ip_norm(ip);   /* an AAAA answer ::ffff:a.b.c.d is a.b.c.d */
+        if (ip_eq(&x, &y)) return true;
     }
     return false;
 }
@@ -346,6 +375,7 @@ void wr_hosts_view(const wr_table_t *t, FILE *f) {
     char a[INET6_ADDRSTRLEN];
     for (size_t i = 0; i < t->n; i++) {
         const wr_entry_t *e = &t->e[i];
+        if (e->unlisted) continue;         /* only a deny rule names it */
         /* IPv4 before IPv6, whatever order the table holds them in. The
          * table appends a new address after those it keeps, so after a
          * rotation an IPv6 address could come first, and a client that takes
@@ -419,10 +449,6 @@ void wr_format_record(FILE *f, const char *run, const wr_table_t *t, size_t i,
 struct wr_req { uint32_t idx; char name[WR_NAME_MAX + 1]; };
 struct wr_rsp { uint32_t idx; wr_result_t r; };
 
-struct wr_async {
-    int  fd;                       /* SOCK_SEQPACKET to the helper */
-    bool dead;
-};
 
 int wr_helper_main(int fd, const wr_config_t *cfg) {
     wr_table_t view;               /* config and resolver label only */
@@ -495,6 +521,34 @@ int wr_async_start(wr_table_t *t, const char *helper_exe) {
     return 0;
 }
 
+int wr_async_lookup(wr_table_t *t, size_t i, wr_result_t *r) {
+    wr_async_t *as = t->async;
+    if (!as || as->dead || i >= t->n) return -1;
+    struct wr_req q;
+    memset(&q, 0, sizeof q);
+    q.idx = (uint32_t)i;
+    memcpy(q.name, t->e[i].name, sizeof q.name);
+    if (send(as->fd, &q, sizeof q, MSG_NOSIGNAL) < 0) { as->dead = true; return -1; }
+    /* the helper's own bound: both types, every attempt, then some */
+    int64_t deadline = wr_now_ms() + ((int64_t)t->cfg.timeout_s * t->cfg.attempts * 2 + 5) * 1000;
+    for (;;) {
+        int64_t left = deadline - wr_now_ms();
+        if (left <= 0) return -1;
+        struct pollfd pf = { .fd = as->fd, .events = POLLIN };
+        int pr = poll(&pf, 1, (int)left);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr <= 0) return -1;
+        struct wr_rsp a;
+        ssize_t n = recv(as->fd, &a, sizeof a, MSG_DONTWAIT);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (n <= 0) { as->dead = true; return -1; }
+        if ((size_t)n != sizeof a || a.idx != i) continue;
+        for (int f = 0; f < 2; f++) if (a.r.n[f] > WR_MAX_ADDRS) a.r.n[f] = WR_MAX_ADDRS;
+        *r = a.r;
+        return 0;
+    }
+}
+
 int wr_async_fd(const wr_table_t *t) { return t->async && !t->async->dead ? t->async->fd : -1; }
 
 bool wr_async_alive(const wr_table_t *t) { return t->async && !t->async->dead; }
@@ -502,6 +556,7 @@ bool wr_async_alive(const wr_table_t *t) { return t->async && !t->async->dead; }
 void wr_async_schedule(wr_table_t *t, int64_t now) {
     wr_async_t *as = t->async;
     if (!as || as->dead) return;
+    as->full = false;
     for (size_t i = 0; i < t->n; i++) {
         if (t->e[i].pending || t->e[i].next_ms > now) continue;
         struct wr_req q;
@@ -509,7 +564,10 @@ void wr_async_schedule(wr_table_t *t, int64_t now) {
         q.idx = (uint32_t)i;
         memcpy(q.name, t->e[i].name, sizeof q.name);
         if (send(as->fd, &q, sizeof q, MSG_NOSIGNAL | MSG_DONTWAIT) < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;   /* next time */
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {   /* next time */
+                as->full = true;
+                return;
+            }
             as->dead = true;
             return;
         }

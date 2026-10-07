@@ -171,8 +171,8 @@ static int canon_for_open(const char *p, char out[PATH_MAX], int depth) {
 int main(int argc, char **argv) {
     if (argc != 3 || (strcmp(argv[2], "digest") && strcmp(argv[2], "batch") &&
                       strcmp(argv[2], "holds") && strcmp(argv[2], "openable") &&
-                      strcmp(argv[2], "kinds"))) {
-        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds\n", argv[0]);
+                      strcmp(argv[2], "kinds") && strcmp(argv[2], "rules"))) {
+        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds|rules\n", argv[0]);
         return 2;
     }
     FILE *f = fopen(argv[1], "rb");
@@ -214,6 +214,21 @@ int main(int argc, char **argv) {
             putchar(ri.kind == VDPC_PATH ? 'p' : ri.kind == VDPC_HOST ? 'h' : 'e');
         }
         putchar('\n');
+        vdpc_free(&pol);
+        return 0;
+    }
+
+    /* v1.24 review: each rule, one line: kind (p|h|e), verb (a|d), a host name
+     * rule (n|-), the flag clause's mask and value (hex). varek_audit.py reads
+     * the policy's name rules and view-path denies from here, not from the
+     * stream. */
+    if (!strcmp(argv[2], "rules")) {
+        for (size_t i = 0; i < pol.n; i++) {
+            vdpc_rule_info_t ri;
+            vdpc_rule_info(&pol, i, &ri);
+            printf("%c %c %c %x %x\n", ri.kind == VDPC_PATH ? 'p' : ri.kind == VDPC_HOST ? 'h' : 'e',
+                   ri.allow ? 'a' : 'd', ri.name ? 'n' : '-', (unsigned)ri.mask, (unsigned)ri.value);
+        }
         vdpc_free(&pol);
         return 0;
     }

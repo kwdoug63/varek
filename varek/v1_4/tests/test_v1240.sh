@@ -198,10 +198,14 @@ else
     cp "$T/v1240_client.py" "$T/v1240_client.js" "$W/"
     chmod 644 "$W"/*
     HP=$((20000 + RANDOM % 20000))
-    python3 -m http.server "$HP" --bind 127.0.0.1 > /dev/null 2>&1 &
+    # v1.24 review: a name never leads to a loopback, link-local, unspecified
+    # or multicast address (only a numeric rule reaches one), so the names
+    # here resolve to this machine's own address (private or public).
+    HOSTIP=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("10.255.255.255", 1)); print(s.getsockname()[0])')
+    python3 -m http.server "$HP" --bind 0.0.0.0 > /dev/null 2>&1 &
     SERVER="$SERVER $!"
-    printf '%s\n' '{"api.example.com": {"ttl": 3, "a": ["127.0.0.1"]},' \
-                  ' "blocked.example.com": {"ttl": 30, "a": ["127.0.0.1"]}}' > "$OUT/zone.json"
+    printf '{"api.example.com": {"ttl": 3, "a": ["%s"]}, "blocked.example.com": {"ttl": 30, "a": ["198.51.100.9"]}}\n' \
+        "$HOSTIP" > "$OUT/zone.json"
     # where the clients live (each prefix is allowed read-only)
     NODE=$(readlink -f "$(command -v node 2>/dev/null)" 2>/dev/null)
     # the distribution's OpenJDK when it is there (CI installs it), else java on PATH
@@ -213,8 +217,8 @@ else
     POL="$OUT/clients.policy"
     { printf 'require warden 1.24\n'
       printf 'deny  host api.example.com:%s\n' $((HP + 1))      # a name deny before a numeric allow
-      printf 'allow host 127.0.0.1:%s\n' $((HP + 1))
-      printf 'deny  host 127.0.0.1:%s\n' $((HP + 2))            # a numeric deny before a name allow
+      printf 'allow host %s:%s\n' "$HOSTIP" $((HP + 1))
+      printf 'deny  host %s:%s\n' "$HOSTIP" $((HP + 2))        # a numeric deny before a name allow
       printf 'allow host api.example.com\n'
       printf 'deny  host blocked.example.com\n'
       printf 'allow host 127.0.0.1:53\n'                         # refused anyway: port 53
@@ -224,7 +228,7 @@ else
       printf 'allow path /etc/ld.so.cache readonly\nallow path /tmp/hsperfdata_nobody/\n'
     } > "$POL"
     for _ in $(seq 50); do
-        python3 -c "import socket; socket.create_connection(('127.0.0.1', $HP), 0.2)" 2>/dev/null && break
+        python3 -c "import socket; socket.create_connection(('$HOSTIP', $HP), 0.2)" 2>/dev/null && break
         sleep 0.1
     done
     agent() { env -i PATH=/usr/bin:/bin timeout 90 "$WARDEN" "$POL" --dns-server "127.0.0.1:$PORT" "$@" 2> "$OUT/a.log"; }
@@ -234,21 +238,21 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
         "$W/s.sock" &
     SERVER="$SERVER $!"
     for _ in $(seq 50); do [ -S "$W/s.sock" ] && break; sleep 0.1; done
-    agent -- /usr/bin/python3 "$W/v1240_client.py" "$HP" "127.0.0.1:$((HP + 1))" \
+    agent -- /usr/bin/python3 "$W/v1240_client.py" "$HP" "$HOSTIP:$((HP + 1))" \
         "api.example.com:$((HP + 2))" "127.0.0.2:$HP" "unix:$W/s.sock" > "$OUT/py.out"
     sed 's/^/     /' "$OUT/py.out"
-    check "python: an allowed name resolves through the hosts view" grep -q '^OK resolve 127.0.0.1 ' "$OUT/py.out"
+    check "python: an allowed name resolves through the hosts view" grep -q "^OK resolve $HOSTIP " "$OUT/py.out"
     check "python: and connects"                                    grep -q '^OK http 200 ' "$OUT/py.out"
     check "the connect was decided on the name" \
         grep -q "\"resolved\":\"api.example.com:$HP\",\"decision_raw\":\"ALLOW\"" "$OUT/a.log"
     check "its record names the address dialed and every candidate" \
-        grep -qF "\"dialed\":\"127.0.0.1:$HP\",\"candidates\":[\"127.0.0.1:$HP\",\"api.example.com:$HP\"]" "$OUT/a.log"
+        grep -qF "\"dialed\":\"$HOSTIP:$HP\",\"candidates\":[\"$HOSTIP:$HP\",\"api.example.com:$HP\"]" "$OUT/a.log"
     if awk '$1 == "ERR" && $2 == "unlisted" && $4 < 100 {ok = 1} END {exit !ok}' "$OUT/py.out"; then
         pass "a name the policy does not allow fails to resolve within 100 ms"
     else flunk "a name the policy does not allow fails to resolve within 100 ms"; fi
     check "a name only a deny rule names does not resolve"     grep -q '^ERR denied-name ' "$OUT/py.out"
     check "a deny on a name wins over a later numeric allow of its address" \
-        grep -q "^ERR connect 127.0.0.1:$((HP + 1)) " "$OUT/py.out"
+        grep -q "^ERR connect $HOSTIP:$((HP + 1)) " "$OUT/py.out"
     check "an earlier numeric deny wins over a name allow" \
         grep -q "^ERR connect api.example.com:$((HP + 2)) " "$OUT/py.out"
     check "an address no allowed name resolved to is decided as a number" \
@@ -257,9 +261,10 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
     check "a Unix socket connect still works (no candidates)" grep -q "^OK connect unix:$W/s.sock connected" "$OUT/py.out"
     check "python: the audit accepts the run" \
         python3 "$HERE/tools/varek_audit.py" --policy "$POL" --checker "$CERT" "$OUT/a.log"
+    cp "$OUT/a.log" "$OUT/py.log"
     # A forged stream: a connect with one of its address's names left out,
     # the chain recomputed (an editor without the signing key can do that).
-    python3 "$T/v1240_forge.py" "$OUT/a.log" "$OUT/forged.log" "$HP"
+    python3 "$T/v1240_forge.py" "$OUT/a.log" "$OUT/forged.log" "$HP" "$HOSTIP"
     if python3 "$HERE/tools/varek_audit.py" --policy "$POL" --checker "$CERT" "$OUT/forged.log" \
             > "$OUT/forged.out" 2>&1; then
         flunk "the audit refuses a connect that left out a name of its address"
@@ -271,7 +276,7 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
     if [ -n "$NODE" ]; then
         agent -- "$NODE" "$W/v1240_client.js" "$HP" > "$OUT/node.out"
         sed 's/^/     /' "$OUT/node.out"
-        check "node: dns.lookup resolves an allowed name"  grep -q '^OK resolve 127.0.0.1 ' "$OUT/node.out"
+        check "node: dns.lookup resolves an allowed name"  grep -q "^OK resolve $HOSTIP " "$OUT/node.out"
         check "node: and http connects"                    grep -q '^OK http 200 ' "$OUT/node.out"
         check "node: dns.lookup of another name fails"     grep -q '^ERR unlisted ' "$OUT/node.out"
         check "node: dns.resolve4 (a DNS query) fails"     grep -q '^ERR resolve4 ' "$OUT/node.out"
@@ -283,7 +288,7 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
         chmod 755 "$W/v1240_client_go"
         agent -- "$W/v1240_client_go" "$HP" > "$OUT/go.out"
         sed 's/^/     /' "$OUT/go.out"
-        check "go (its own resolver): an allowed name resolves" grep -q '^OK resolve 127.0.0.1 ' "$OUT/go.out"
+        check "go (its own resolver): an allowed name resolves" grep -q "^OK resolve $HOSTIP " "$OUT/go.out"
         check "go: and http connects"                            grep -q '^OK http 200 ' "$OUT/go.out"
         check "go: another name fails"                           grep -q '^ERR unlisted ' "$OUT/go.out"
     else skip "go (not installed)"; fi
@@ -300,7 +305,7 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
             grep '^\[agent\]' "$OUT/a.log" | head -10 | sed 's/^/       /'
             grep '"decision_final":"DENY"' "$OUT/a.log" | sed -E 's/.*"action":"([^"]*)","target":"([^"]*)".*"rule":"([a-z_0-9]+)".*/       \1 \2 \3/' | sort | uniq -c | head -25
         fi
-        check "java: an allowed name resolves"   grep -q '^OK resolve 127.0.0.1 ' "$OUT/java.out"
+        check "java: an allowed name resolves"   grep -q "^OK resolve $HOSTIP " "$OUT/java.out"
         check "java: and http connects"          grep -q '^OK http 200 ' "$OUT/java.out"
         check "java: another name fails"         grep -q '^ERR unlisted ' "$OUT/java.out"
     else skip "java (no JDK)"; fi
@@ -308,7 +313,7 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
         chmod 755 "$W/v1240_client_musl"
         agent -- "$W/v1240_client_musl" "$HP" > "$OUT/musl.out"
         sed 's/^/     /' "$OUT/musl.out"
-        check "musl (static, its own resolver): an allowed name resolves" grep -q '^OK resolve 127.0.0.1 ' "$OUT/musl.out"
+        check "musl (static, its own resolver): an allowed name resolves" grep -q "^OK resolve $HOSTIP " "$OUT/musl.out"
         check "musl: and connects"                                         grep -q '^OK http 200 ' "$OUT/musl.out"
         if awk '$1 == "ERR" && $2 == "unlisted" && $4 < 100 {ok = 1} END {exit !ok}' "$OUT/musl.out"; then
             pass "musl: another name fails within 100 ms"
@@ -338,23 +343,25 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
         *) flunk "a resolver listening on 127.0.0.1:53 got no connection" ;;
     esac
 
-    # Grace: api.example.com moves to 127.0.0.2 one second in (TTL 3, so the
-    # Warden sees it at about 3 s); 127.0.0.1 then stays valid for 3 s more.
+    # Grace: api.example.com moves to 198.51.100.7 one second in (TTL 3, so
+    # the Warden sees it at about 3 s); its old address then stays valid for
+    # 3 s more.
     ( sleep 1
-      printf '%s\n' '{"api.example.com": {"ttl": 3, "a": ["127.0.0.2"]}}' > "$OUT/zone.tmp"
+      printf '%s\n' '{"api.example.com": {"ttl": 3, "a": ["198.51.100.7"]}}' > "$OUT/zone.tmp"
       mv "$OUT/zone.tmp" "$OUT/zone.json" ) &
     agent --dns-ttl-min 1 --dns-grace-max 10 -- /usr/bin/python3 "$W/v1240_client.py" timed \
-        "0@127.0.0.1:$HP" "4.5@127.0.0.1:$HP" "9@127.0.0.1:$HP" > "$OUT/grace.out"
+        "0@$HOSTIP:$HP" "4.5@$HOSTIP:$HP" "9@$HOSTIP:$HP" > "$OUT/grace.out"
     wait $! 2>/dev/null
     sed 's/^/     /' "$OUT/grace.out"
     check "an address in the current answer is reached (decided on the name)" \
-        grep -q "^OK at 0 127.0.0.1:$HP 200" "$OUT/grace.out"
+        grep -q "^OK at 0 $HOSTIP:$HP 200" "$OUT/grace.out"
     check "an address that left the answer is reached during its grace" \
-        grep -q "^OK at 4.5 127.0.0.1:$HP 200" "$OUT/grace.out"
-    check "and refused after it"            grep -q "^ERR at 9 127.0.0.1:$HP " "$OUT/grace.out"
+        grep -q "^OK at 4.5 $HOSTIP:$HP 200" "$OUT/grace.out"
+    check "and refused after it"            grep -q "^ERR at 9 $HOSTIP:$HP " "$OUT/grace.out"
     check "the audit accepts the grace run" \
         python3 "$HERE/tools/varek_audit.py" --policy "$POL" --checker "$CERT" "$OUT/a.log"
-    printf '%s\n' '{"api.example.com": {"ttl": 30, "a": ["127.0.0.1"]}}' > "$OUT/zone.json"
+    cp "$OUT/a.log" "$OUT/grace.log"
+    printf '{"api.example.com": {"ttl": 30, "a": ["%s"]}}\n' "$HOSTIP" > "$OUT/zone.json"
 
     # Every address of a name reaches the agent, IPv4 first. Found by the
     # 24-hour soak: the table appends a new address after those it keeps, so
@@ -364,17 +371,17 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
     # Here the A record appears after the AAAA one.
     printf '%s\n' '{"api.example.com": {"ttl": 1, "aaaa": ["2001:db8::10"]}}' > "$OUT/zone.json"
     ( sleep 1
-      printf '%s\n' '{"api.example.com": {"ttl": 1, "a": ["127.0.0.1"], "aaaa": ["2001:db8::10"]}}' > "$OUT/zone.tmp"
+      printf '{"api.example.com": {"ttl": 1, "a": ["%s"], "aaaa": ["2001:db8::10"]}}\n' "$HOSTIP" > "$OUT/zone.tmp"
       mv "$OUT/zone.tmp" "$OUT/zone.json" ) &
     agent --dns-ttl-min 1 -- /usr/bin/python3 "$W/v1240_client.py" late 3.5 "$HP" > "$OUT/late.out"
     wait $! 2>/dev/null
     sed 's/^/     /' "$OUT/late.out"
     check "a name's addresses of both families all resolve (the host.conf view)" \
-        grep -q '^OK resolve 127.0.0.1,2001:db8::10 ' "$OUT/late.out"
+        grep -q "^OK resolve $HOSTIP,2001:db8::10 " "$OUT/late.out"
     check "and the agent connects although the IPv6 address was added first" \
         grep -q '^OK http 200 ' "$OUT/late.out"
     check "the host.conf view was served"      grep -q '"rule":"hostconf_view"' "$OUT/a.log"
-    printf '%s\n' '{"api.example.com": {"ttl": 30, "a": ["127.0.0.1"]}}' > "$OUT/zone.json"
+    printf '{"api.example.com": {"ttl": 30, "a": ["%s"]}}\n' "$HOSTIP" > "$OUT/zone.json"
 
     # A deny covering /etc/hosts wins: the agent resolves nothing.
     { printf 'require warden 1.24\ndeny path /etc/hosts\n'; tail -n +2 "$POL"; } > "$OUT/nohosts.policy"
@@ -393,6 +400,87 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
     else flunk "the plan gate: a step to an allowed name passes"; fi
     "$WARDEN" "$POL" --dns-server "127.0.0.1:$PORT" --plan "$OUT/plan_no.txt" -- /bin/true > /dev/null 2> "$OUT/g2.err"
     check "the plan gate: a step to another name is rejected" grep -q 'plan rejected' "$OUT/g2.err"
+
+    echo "== 5. the v1.24 independent review's findings =="
+    # A name never leads to loopback, link-local (169.254.169.254, the cloud
+    # metadata service), unspecified or multicast addresses: whoever controls
+    # an allowed name's DNS could otherwise open the host's own services.
+    printf '{"loop.example.com": {"ttl": 30, "a": ["127.0.0.1"]}, "meta.example.com": {"ttl": 30, "a": ["169.254.169.254"]}, "evil.example.com": {"ttl": 30, "a": ["%s"]}, "mapped.example.com": {"ttl": 30, "aaaa": ["::ffff:%s"]}}\n' \
+        "$HOSTIP" "$HOSTIP" > "$OUT/zone.json"
+    base() { printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path %s readonly\n' "$W/"; }
+    { printf 'require warden 1.24\nallow host loop.example.com\nallow host meta.example.com\n'; base; } > "$OUT/sp.policy"
+    run5() {   # run5 <policy> <log> -- agent...
+        local pol="$1" log="$2"; shift 3
+        env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$pol" --dns-server "127.0.0.1:$PORT" -- "$@" 2> "$log"
+    }
+    run5 "$OUT/sp.policy" "$OUT/sp.log" -- /usr/bin/python3 "$W/v1240_client.py" "$HP" \
+        "loop.example.com:$HP" "meta.example.com:80" > "$OUT/sp.out"
+    check "a name that resolves to loopback does not reach it" grep -q "^ERR connect loop.example.com:$HP " "$OUT/sp.out"
+    check "nor one that resolves to 169.254.169.254" grep -q '^ERR connect meta.example.com:80 ' "$OUT/sp.out"
+    check "the connect is decided on the address alone (special_address)" \
+        grep -q "\"target\":\"127.0.0.1:$HP\",\"resolved\":\"127.0.0.1:$HP\",\"decision_raw\":\"UNKNOWN\",.*\"candidates\":\[\"127.0.0.1:$HP\"\],\"special_address\":true" "$OUT/sp.log"
+    { printf 'require warden 1.24\nallow host loop.example.com\nallow host 127.0.0.1:%s\n' "$HP"; base; } > "$OUT/sp2.policy"
+    run5 "$OUT/sp2.policy" "$OUT/sp2.log" -- /usr/bin/python3 "$W/v1240_client.py" "$HP" "loop.example.com:$HP" > "$OUT/sp2.out"
+    check "a numeric rule still allows it"  grep -q "^OK connect loop.example.com:$HP 200 " "$OUT/sp2.out"
+    check "and the audit accepts both runs" sh -c "python3 '$HERE/tools/varek_audit.py' --policy '$OUT/sp.policy' --checker '$CERT' '$OUT/sp.log' && python3 '$HERE/tools/varek_audit.py' --policy '$OUT/sp2.policy' --checker '$CERT' '$OUT/sp2.log'"
+
+    # A deny on a name no allow rule names: resolved too, so it holds on the
+    # name's address (it was never resolved, so it never fired).
+    { printf 'require warden 1.24\ndeny host evil.example.com\nallow host %s:%s\n' "$HOSTIP" "$HP"; base; } > "$OUT/dn.policy"
+    run5 "$OUT/dn.policy" "$OUT/dn.log" -- /usr/bin/python3 "$W/v1240_client.py" "$HP" "$HOSTIP:$HP" > "$OUT/dn.out"
+    check "a deny on a name no allow rule names holds on its address" grep -q "^ERR connect $HOSTIP:$HP " "$OUT/dn.out"
+    check "decided on that name, by that rule" \
+        grep -q "\"resolved\":\"evil.example.com:$HP\",\"decision_raw\":\"DENY\",\"decision_final\":\"DENY\",\"rule\":\"policy_match\",\"policy_line\":2" "$OUT/dn.log"
+    run5 "$OUT/dn.policy" "$OUT/dn2.log" -- /usr/bin/python3 -c 'print(open("/etc/hosts").read())' > "$OUT/dn.hosts"
+    if grep -q evil "$OUT/dn.hosts"; then flunk "and the denied name is not in the hosts view"
+    else pass "and the denied name is not in the hosts view"; fi
+
+    # An AAAA answer ::ffff:a.b.c.d is the address a.b.c.d.
+    { printf 'require warden 1.24\ndeny host mapped.example.com:%s\nallow host %s:%s\n' "$HP" "$HOSTIP" "$HP"; base; } > "$OUT/vm.policy"
+    run5 "$OUT/vm.policy" "$OUT/vm.log" -- /usr/bin/python3 "$W/v1240_client.py" "$HP" "$HOSTIP:$HP" > "$OUT/vm.out"
+    check "a v4-mapped AAAA answer binds its IPv4 address (the deny on the name holds)" \
+        grep -q "^ERR connect $HOSTIP:$HP " "$OUT/vm.out"
+
+    # An open of a resolver file that could write is refused, whatever the
+    # policy allows: the Warden's resolver reads the host's resolv.conf.
+    { printf 'require warden 1.24\nallow host loop.example.com\nallow path /etc/\n'; base; } > "$OUT/vw.policy"
+    run5 "$OUT/vw.policy" "$OUT/vw.log" -- /usr/bin/python3 -c '
+for p, m in (("/etc/hosts", "r+"), ("/etc/resolv.conf", "a"), ("/etc/hosts", "r")):
+    try:
+        open(p, m).close(); print("OK", p, m)
+    except OSError as e:
+        print("ERR", p, m, type(e).__name__)' > "$OUT/vw.out"
+    sed 's/^/     /' "$OUT/vw.out"
+    check "an open of /etc/hosts for writing is refused (view_write_refused)" \
+        sh -c "grep -q '^ERR /etc/hosts r+ PermissionError' '$OUT/vw.out' && grep -q '\"rule\":\"view_write_refused\"' '$OUT/vw.log'"
+    check "and of /etc/resolv.conf"           grep -q '^ERR /etc/resolv.conf a PermissionError' "$OUT/vw.out"
+    check "a read-only open still gets the view" grep -q '^OK /etc/hosts r' "$OUT/vw.out"
+
+    # The audit: forgeries the review made (edit, then recompute the chain).
+    forged() {   # forged <description> <log> <policy> <message> <tamper mode and args...>
+        local d="$1" log="$2" pol="$3" msg="$4"; shift 4
+        if ! python3 "$T/v1240_tamper.py" "$log" "$OUT/f.log" "$@" 2> "$OUT/f.err"; then
+            flunk "$d (could not forge: $(cat "$OUT/f.err"))"; return; fi
+        if python3 "$HERE/tools/varek_audit.py" --policy "$pol" --checker "$CERT" "$OUT/f.log" > "$OUT/f.out" 2>&1; then
+            flunk "$d (the audit passed it)"
+        elif grep -q Traceback "$OUT/f.out"; then flunk "$d (the audit crashed)"
+        elif ! grep -q "$msg" "$OUT/f.out"; then flunk "$d ($(grep -m1 PROBLEM "$OUT/f.out"))"
+        else pass "$d"; fi
+    }
+    forged "the audit refuses a connect stripped of its candidates" "$OUT/py.log" "$POL" \
+        "recorded without its candidates" nocands "$HOSTIP:$HP"
+    forged "the audit refuses a port spelt with a leading zero" "$OUT/py.log" "$POL" \
+        "not in the Warden's spelling" port0 "$HOSTIP:$HP"
+    forged "the audit refuses a connect that left out a name bound only by its grace" "$OUT/grace.log" "$POL" \
+        "is not a candidate" dropname "$HOSTIP:$HP" 2 api.example.com
+    forged "the audit refuses a stream missing a resolution record (the table generation)" "$OUT/grace.log" "$POL" \
+        "a resolution record is missing" droprecord '"addresses":["198.51.100.7"]'
+    forged "the audit refuses a view served although the policy denies its path" "$OUT/nh.log" "$OUT/nohosts.policy" \
+        "denies /etc/hosts" view /etc/hosts hosts_view
+    forged "the audit reads the name rules from the policy, not run_start" "$OUT/py.log" "$POL" \
+        "does not match the policy file" unstart host_name_rules
+    forged "a malformed resolution record fails the audit (no crash)" "$OUT/py.log" "$POL" \
+        "PROBLEM" badaddrs
     rm -rf "$W"
 fi
 
