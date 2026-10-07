@@ -401,7 +401,7 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
     "$WARDEN" "$POL" --dns-server "127.0.0.1:$PORT" --plan "$OUT/plan_no.txt" -- /bin/true > /dev/null 2> "$OUT/g2.err"
     check "the plan gate: a step to another name is rejected" grep -q 'plan rejected' "$OUT/g2.err"
 
-    echo "== 5. the v1.24 independent review's findings =="
+    echo "== 5. the v1.24 review's findings (AI review agents) =="
     # A name never leads to loopback, link-local (169.254.169.254, the cloud
     # metadata service), unspecified or multicast addresses: whoever controls
     # an allowed name's DNS could otherwise open the host's own services.

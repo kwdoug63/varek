@@ -94,8 +94,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     local test DNS server, and as root the Warden with Python, curl, Node, a
     static musl client, Go and Java as the agent); CI runs it. It fails 81 of
     its 88 checks against v1.23.1.
-  - The independent review's findings, all fixed (`RELEASE-v1.24.0.md`,
-    "Found in review"; section 5 of `make test-v1240`):
+  - The review's findings, all fixed. The review was done by four AI review
+    agents (Claude), separate from the session that wrote the code; it was
+    not a human or third-party review. See `RELEASE-v1.24.0.md`, "Found in
+    review", and section 5 of `make test-v1240`.
     - `varek_audit.py` refused none of five forgeries. It now:
       - requires the candidate fields on every connect when the policy file
         has name rules;
