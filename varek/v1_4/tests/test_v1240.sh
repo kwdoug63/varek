@@ -438,7 +438,7 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
     check "a name that resolves to 100.100.100.200 is decided on the address alone" \
         grep -q '"resolved":"100.100.100.200:80","decision_raw":"UNKNOWN","decision_final":"DENY".*"special_address":true' "$OUT/sp3.log"
     if python3 -c 'import socket; socket.socket(socket.AF_INET6)' 2>/dev/null; then
-        for t in '\[fd00:ec2::254\]:80' '\[64:ff9b::a9fe:a9fe\]:80' '\[::a9fe:a9fe\]:80'; do
+        for t in '\[fd00:ec2::254\]:80' '\[64:ff9b::a9fe:a9fe\]:80' '\[::169\.254\.169\.254\]:80'; do
             check "a name that resolves to $t is decided on the address alone" \
                 grep -q "\"resolved\":\"$t\",\"decision_raw\":\"UNKNOWN\",\"decision_final\":\"DENY\".*\"special_address\":true" "$OUT/sp3.log"
         done
