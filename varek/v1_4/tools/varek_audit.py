@@ -56,8 +56,10 @@ Usage:
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -92,13 +94,76 @@ def _addr_of(dest):
     return host[1:-1] if host.startswith("[") else host
 
 
+_PORT_RE = re.compile(r"(0|[1-9][0-9]{0,4})")
+
+
+def _ip(text):
+    """An address as an ipaddress object, an IPv4-mapped IPv6 address as the
+    IPv4 address it names; None if text is not an address."""
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
+def _canonical_dest(dest):
+    """(address, port) of a destination in the Warden's spelling
+    (net_decision_string: a.b.c.d:port, or [ipv6]:port in lowercase, no
+    leading zeros), or None. The v1.24 review: a port such as 07002 or +7002
+    is matched by a portless rule but by no rule written with the port, so a
+    forger could use it to slip past a deny."""
+    if not isinstance(dest, str) or ":" not in dest:
+        return None
+    host, _, port = dest.rpartition(":")
+    if not _PORT_RE.fullmatch(port) or int(port) > 65535:
+        return None
+    if host.startswith("[") and host.endswith("]"):
+        h = host[1:-1]
+        try:
+            ip = ipaddress.IPv6Address(h)
+        except ValueError:
+            return None
+        groups = [g for g in h.split(":") if g]
+        if h != h.lower() or any(len(g) > 1 and g.startswith("0") and "." not in g for g in groups):
+            return None
+        return ip, port
+    try:
+        ip = ipaddress.IPv4Address(host)
+    except ValueError:
+        return None
+    if str(ip) != host:
+        return None
+    return ip, port
+
+
+def _special(ip):
+    """warden_names.inc.c: special_address. A name never leads to these."""
+    if ip.version == 4:
+        o = ip.packed
+        return o[0] == 0 or o[0] == 127 or (o[0] == 169 and o[1] == 254) or o[0] >= 224
+    return ip.is_unspecified or ip.is_loopback or ip.is_link_local or ip.is_multicast
+
+
+def _addrs(r, key):
+    v = r.get(key)
+    return v if isinstance(v, list) else []
+
+
 def check_names(rec, pos, resolutions, problems):
     """v1.24: a connect decided with the resolution table. Its candidates are
-    the address dialed and name:port for each name that address belonged to;
-    each name must be bound to the address by the latest resolution record
-    before this record (current, or within its grace), and every name whose
-    latest record lists the address must be a candidate. Returns the
-    candidates other than the one decided on (for the earlier-rule check)."""
+    the address dialed and name:port for each name that address belonged to.
+    Each name must be bound to the address by the latest resolution record
+    before this record (current, or within its grace). Every name whose
+    latest record lists the address, or holds it in grace well before the
+    grace ends, must be a candidate. The dialed address and every candidate's
+    port must be spelt as the Warden spells them, and the dialed address must
+    be the connect's target. resolution_generation must be the latest
+    resolution record's. A special address (loopback, link-local, ...) is
+    decided on the address alone. Returns the candidates other than the one
+    decided on (for the earlier-rule check)."""
     seq = rec.get("seq")
     cands, dialed, res = rec.get("candidates"), rec.get("dialed"), rec.get("resolved")
     if not (isinstance(cands, list) and cands and all(isinstance(c, str) for c in cands)
@@ -106,14 +171,59 @@ def check_names(rec, pos, resolutions, problems):
         problems.append(f"seq {seq}: a connect's candidates, dialed address and decided "
                         f"destination do not agree")
         return []
-    addr, port = _addr_of(dialed), dialed.rsplit(":", 1)[-1]
+    cd, ct = _canonical_dest(dialed), _canonical_dest(rec.get("target"))
+    if cd is None:
+        problems.append(f"seq {seq}: the dialed address {dialed!r} is not in the Warden's spelling")
+        return []
+    if ct is None or _ip(str(ct[0])) != _ip(str(cd[0])) or ct[1] != cd[1]:
+        problems.append(f"seq {seq}: dialed {dialed!r}, but the connect's target was "
+                        f"{rec.get('target')!r}")
+        return []
+    addr, port = _ip(str(cd[0])), cd[1]
     ts = rec.get("timestamp_ns")
-    latest = {}
+    if not isinstance(ts, int):
+        problems.append(f"seq {seq}: a connect without its time")
+        return []
+    latest, last = {}, None
     for p, r in resolutions:
         if p > pos:
             break
         if isinstance(r.get("name"), str):
             latest[r["name"]] = r
+            last = r
+    if last is not None and rec.get("resolution_generation") != last.get("generation"):
+        problems.append(f"seq {seq}: decided at table generation {rec.get('resolution_generation')!r}, "
+                        f"but the latest resolution record before it is generation "
+                        f"{last.get('generation')!r} (a resolution record is missing)")
+
+    def binding(r):
+        """'current', 'grace' (surely inside it), 'edge' (within about a
+        second of its end, either way), or None."""
+        if any(_ip(x) == addr for x in _addrs(r, "addresses") if isinstance(x, str)):
+            return "current"
+        rt = r.get("timestamp_ns")
+        for g in _addrs(r, "grace"):
+            if not (isinstance(g, dict) and isinstance(g.get("address"), str)
+                    and isinstance(g.get("until_s"), int) and isinstance(rt, int)):
+                continue
+            if _ip(g["address"]) != addr:
+                continue
+            # until_s is rounded up to whole seconds: the Warden's grace ended
+            # within the second before `end`
+            end = rt + g["until_s"] * 10**9
+            if ts <= end - 1200 * 10**6:
+                return "grace"
+            if ts <= end + 10**9:
+                return "edge"
+        return None
+
+    if rec.get("special_address") is True or _special(addr):
+        if not _special(addr):
+            problems.append(f"seq {seq}: marked special_address, but {addr} is not special")
+        if rec.get("special_address") is not True or cands != [dialed]:
+            problems.append(f"seq {seq}: {addr} is a special address, decided on the address alone, "
+                            f"but the record does not say so")
+        return [c for c in cands if c != res]
     named = set()
     for c in cands[1:]:
         name, _, cport = c.rpartition(":")
@@ -125,17 +235,11 @@ def check_names(rec, pos, resolutions, problems):
         if r is None:
             problems.append(f"seq {seq}: candidate {c!r}: no resolution of {name} before it")
             continue
-        ok = addr in (r.get("addresses") or [])
-        for g in r.get("grace") or []:
-            if isinstance(g, dict) and g.get("address") == addr and isinstance(g.get("until_s"), int) \
-                    and isinstance(ts, int) and isinstance(r.get("timestamp_ns"), int) \
-                    and ts <= r["timestamp_ns"] + g["until_s"] * 10**9:
-                ok = True
-        if not ok:
+        if binding(r) is None:
             problems.append(f"seq {seq}: candidate {c!r}: {name} did not resolve to {addr} "
                             f"(by its resolution records)")
     for name, r in latest.items():
-        if addr in (r.get("addresses") or []) and name not in named:
+        if binding(r) in ("current", "grace") and name not in named:
             problems.append(f"seq {seq}: {name} resolved to {addr} but is not a candidate: the "
                             f"connect was not decided on every name of its address")
     return [c for c in cands if c != res]
@@ -499,7 +603,17 @@ def main(argv=None):
     lines, which = [], []
     authorized = refused = lookups = connects = views = 0
     resolutions = meta.get("resolutions", [])
-    names_policy = meta.get("run_start", {}).get("host_name_rules") is True
+    # v1.24 review: whether the policy has host name rules is read from the
+    # policy file (the checker's own parse), not taken from run_start.
+    rq = subprocess.run([a.checker, a.policy, "rules"], capture_output=True, text=True)
+    rules = [l.split() for l in rq.stdout.splitlines()] if rq.returncode == 0 else None
+    if rules is None or any(len(r) != 5 for r in rules):
+        problems.append(f"checker failed on the policy's rules: {rq.stderr.strip()}")
+        rules = []
+    names_policy = any(r[0] == "h" and r[2] == "n" for r in rules)
+    if (meta.get("run_start", {}).get("host_name_rules") is True) != names_policy:
+        problems.append("run_start's host_name_rules does not match the policy file")
+    view_recs = []                       # (rec, flags): asked of the policy below
     others = []                          # (rec, decided rule, other candidates)
     ancestors = None
     launches = 0
@@ -544,6 +658,8 @@ def main(argv=None):
                                 f"only read ({fl})")
             elif not isinstance(rec.get("view_generation"), int):
                 problems.append(f"seq {rec.get('seq')}: a view without its generation")
+            else:
+                view_recs.append((rec, flv))
             views += 1
             continue
         is_open = rec.get("action") == "file.open" and rec.get("rule") in AUTHORIZED_OPEN_RULES
@@ -566,6 +682,16 @@ def main(argv=None):
             continue
         s = rec.get("resolved", "")
         fl = rec.get("open_flags")
+        if not isinstance(s, str):
+            problems.append(f"seq {rec.get('seq')}: a malformed decided destination or path")
+            continue
+        if is_conn and names_policy and not str(rec.get("target", "")).startswith("unix:") \
+                and "candidates" not in rec and "candidates_sha256" not in rec:
+            # v1.24 review: every connect in a run with name rules is decided
+            # over its candidates and says so; one without them is not trusted.
+            problems.append(f"seq {rec.get('seq')}: a connect in a run with host name rules, "
+                            f"recorded without its candidates")
+            continue
         if is_conn:
             fl = "0x0"                   # host rules carry no flag clause
             if not s:
@@ -585,8 +711,31 @@ def main(argv=None):
             continue
         lines.append(f"{'host' if is_conn else 'path'} {fl} {hx} {cr} {cw}")
         which.append(rec)
-        if is_conn and "candidates" in rec:
-            others.append((rec, cr, check_names(rec, pos, resolutions, problems)))
+        if is_conn and ("candidates" in rec or "candidates_sha256" in rec):
+            try:
+                others.append((rec, cr, check_names(rec, pos, resolutions, problems)))
+            except (TypeError, ValueError, AttributeError, KeyError) as e:
+                problems.append(f"seq {rec.get('seq')}: malformed connect or resolution records ({e})")
+
+    # v1.24 review: a view is served unless an explicit deny in the policy
+    # holds on its path (and the open's flags): ask the checker which path
+    # rules hold, in order.
+    if view_recs and rules:
+        h = subprocess.run([a.checker, a.policy, "holds"],
+                           input="\n".join(VIEW_RULES[r["rule"]].encode().hex() for r, _ in view_recs) + "\n",
+                           capture_output=True, text=True)
+        rows = h.stdout.split()
+        if h.returncode != 0 or len(rows) != len(view_recs):
+            problems.append(f"checker failed: {h.stderr.strip()}")
+        else:
+            for (rec, flv), row in zip(view_recs, rows):
+                for i, r in enumerate(rules):
+                    if i < len(row) and row[i] == "1" and r[0] == "p" and \
+                            (flv & int(r[3], 16)) == int(r[4], 16):
+                        if r[1] == "d":
+                            problems.append(f"seq {rec.get('seq')}: a {rec['rule']} served, but policy "
+                                            f"rule {i} denies {VIEW_RULES[rec['rule']]}")
+                        break
 
     checked = 0
     if lines and not problems:

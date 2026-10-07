@@ -1,9 +1,10 @@
 # VAREK v1.24.0 — Host Names Without Agent DNS
 
-> **DRAFT, not released.** Three things stay open before this is tagged: the
-> independent review, the latency figures, and a second 24-hour soak run on
-> the Warden with the fix the first run found. Each is marked **PENDING**
-> below.
+> **DRAFT, not released.** One thing stays open before this is tagged: a
+> second 24-hour soak run on the Warden with the fix the first run found. It
+> is marked **PENDING** below. The AI-agent
+> review is done, and its findings are fixed below. A human or third-party
+> review has not been done.
 
 Released PENDING · MIT · github.com/kwdoug63/varek
 
@@ -136,9 +137,38 @@ agent fetched each URL by name once a minute:
 
 ## Latency
 
-**PENDING.** Run `varek bench` on a name-decided connect against a numeric
-one. Deciding over the candidates adds one decision per name that the address
-belongs to.
+Deciding a connect on host names costs no time that can be measured end to
+end. `make latency-v1240` (`tests/latency_v1240.sh`) times 3,000 blocking TCP
+connects, one after another, to a listener on the machine's own address. It
+does this natively and under the Warden, with the connect allowed in three
+ways:
+- by a numeric rule;
+- by a rule on one name that resolves to the address (2 candidates);
+- with 15 allowed names all resolving to the address (16 candidates, the most
+  a v1.24 connect carries).
+
+The Warden's own time is its latency per connect minus the dial, read from its
+records. Results from three runs on a 4-vCPU cloud container
+(`varek/v1_4/tests/connect_latency_v1.24.0.txt`), microseconds:
+
+| Connect allowed by | Client p50 | Client p99 | Warden's own p50 | Warden's own p99 |
+|---|---|---|---|---|
+| Native (no Warden) | 13–16 | 88–171 | | |
+| A numeric rule | 179–206 | 456–524 | 105–124 | 289–317 |
+| One name (2 candidates) | 172–209 | 467–534 | 103–127 | 296–345 |
+| 15 names (16 candidates) | 166–194 | 322–486 | 102–116 | 215–328 |
+
+The three rows under the Warden overlap: run-to-run noise (about ±10 µs at
+p50) is larger than the difference.
+
+The decision procedure, timed on its own with the same 16-rule policy, takes
+about 0.5 µs per decision, including the batch tool's own input and output.
+So deciding over 16 candidates adds at most about 8 µs, and one name about
+1 µs.
+
+These figures are from a shared cloud container, not the dedicated 2-vCPU VM
+of the v1.22 table. They compare the three cases with each other, not with
+earlier releases.
 
 ## Also in this release
 
@@ -159,12 +189,14 @@ belongs to.
 - New options: `--dns-ttl-min`, `--dns-ttl-max` and `--dns-grace-max`.
   `--check-startup` reports each allowed name that does not resolve.
 - New record fields: `host_name_rules`, `host_names` and `resolver` in
-  `run_start`; `resolution` records; and `dialed`, `candidates` and
-  `resolution_generation` on connects.
+  `run_start`; `resolution` records; and `dialed`, `candidates`,
+  `resolution_generation` and `special_address` on connects.
 - New record rules: `hosts_view`, `resolv_view`, `nsswitch_view`,
-  `hostconf_view`,
-  `dns_refused` and `too_many_names`.
-- New `vdp_cert_check` mode: `kinds`.
+  `hostconf_view`, `view_write_refused`, `dns_refused` and
+  `too_many_names`.
+- New `vdp_cert_check` modes: `kinds` and `rules`.
+- `run_start` reports the Warden as `1.24.0`, and the startup message reports
+  the policy grammar as v1.24.
 
 ## Found in the soak
 
@@ -187,7 +219,99 @@ rather than the exception type alone.
 
 ## Found in review
 
-**PENDING**: the independent review's findings.
+Four AI review agents (Claude), separate from the session that wrote the
+code, each reviewed one part of the change (v1.23.1 to this release) and had
+to reproduce every finding:
+- the resolver and the resolution table;
+- what the agent can do;
+- the three policy parsers;
+- the audit.
+
+The agents are the same kind of model that wrote much of this code, so this
+is not an independent human review. It found real defects, listed below, but
+it does not replace a human or third-party review.
+
+Every finding below is fixed, and `make test-v1240` covers it: section 5 of the suite, plus 5 new
+checks in the resolution table's unit test.
+
+**The audit accepted forged streams.** These are streams edited by someone
+who holds the log but not the signing key, with the hash chain recomputed.
+Two of them turned a refused connect into an allowed one.
+- **The name check could be skipped.** It ran only when a connect carried
+  `candidates`, so deleting that field skipped it. Now every connect in a run
+  whose policy has name rules must carry `dialed`, `candidates` and
+  `resolution_generation`. Whether the policy has name rules is read from the
+  policy file through the checker's new `rules` mode, no longer from
+  `run_start`.
+- **Names held in grace could be dropped.** Names bound to the address only
+  by their grace period could be left out of the candidates. They now count,
+  allowing for grace being rounded to whole seconds.
+- **Ports could be spelt otherwise.** A port written `07002` is matched by a
+  portless allow rule and by no rule written with the port. The dialed
+  address and every candidate must now be spelt as the Warden spells them,
+  and the dialed address must be the connect's target.
+- **The table generation was not checked**, so a resolution record could be
+  deleted. A connect's `resolution_generation` must now be the latest
+  resolution record's.
+- **A view could be forged against a deny.** A view could be claimed for a
+  path the policy explicitly denies. The checker now answers which path rules
+  hold on the view's path.
+- **Malformed fields crashed the audit** (`addresses`, `grace` or `resolved`
+  not of their type), so it gave no verdict. They are now problems in the
+  report.
+
+**The Warden.**
+- **A name could lead to the host's own services (medium).** Whoever
+  controls an allowed name's DNS could answer `127.0.0.1` or
+  `169.254.169.254`, and the Warden dials from the host's network namespace.
+  A review agent read a secret from a listener on the host's loopback that way.
+  - A connect to a loopback, link-local, unspecified or multicast address
+    is now decided on the address alone (`"special_address": true`), so only
+    a numeric rule can allow it.
+  - Private ranges stay reachable by name; see "Known limits".
+- **Writable opens reached the real resolver files (medium).** An open of
+  `/etc/hosts`, `/etc/resolv.conf`, `/etc/nsswitch.conf` or `/etc/host.conf`
+  that could write was not served a view. It went to the policy, so a policy
+  allowing `/etc/` let the agent write the host's `resolv.conf`. The
+  resolver helper reads that file on every lookup, so the agent could then
+  choose where allowed names lead.
+  - Such opens are now refused (`view_write_refused`), whatever the policy
+    says. That covers each of the four paths and what each resolved to at
+    startup.
+- **Oversized answers were read past the buffer (medium).** glibc retries a
+  truncated UDP answer over TCP and returns the answer's full length, even
+  past the buffer. The table's parser then read past its 8 KB buffer.
+  - Reproduced here: 60,834 bytes reported for an 8,192-byte buffer.
+  - Such an answer is now a failed lookup.
+  - The startup lookups ran inside the Warden itself. They now go through
+    the resolver helper like every refresh, so the process holding the
+    signing key never parses network data.
+- **A deny on a name no allow rule named did nothing (low–medium).** Only
+  allowed names were resolved. Deny rules' names are now resolved too, kept
+  out of the hosts view, so `deny host evil.example.com` holds on that
+  name's addresses.
+- **A v4-mapped AAAA answer never matched (low).** An answer
+  `::ffff:a.b.c.d` did not bind `a.b.c.d`, so a deny on that name was
+  skipped. It now binds `a.b.c.d`.
+- **Grace shrank after a failed refresh (low).** A failed refresh gave the
+  next rotated-out address 30 s of grace instead of its last TTL. Grace now
+  comes from the last answer's TTL.
+- **The Warden spun the CPU (low).** It ran at 100% CPU when the resolver
+  helper's request queue was full. It now waits for the helper's answers.
+- **The version.** `run_start` said `1.23.1`; it now says `1.24.0`.
+
+**The parsers: no disagreement.** The decision procedure, the certificate
+checker and the cross-check oracle agreed on:
+- about 200,000 name strings, covering every boundary of the name and port
+  rules;
+- 12,000 fuzzed policies;
+- the oracle's own run with the SMT decision procedure.
+
+**Not fixed in v1.24, for its own release.** The Warden opens a file as root
+for the agent. So a path the policy lets the agent write is writable even
+when the file is root-owned and mode 0644. This is older than v1.24, and
+changing it affects every file policy. It will be designed and released on
+its own, with the Warden opening files with the agent's uid and gid.
 
 ## Known limits
 
@@ -202,8 +326,17 @@ rather than the exception type alone.
 - **DNSSEC.** The Warden trusts the host's resolver and does not validate
   DNSSEC itself. Use `--dns-server` to point it at a validating resolver.
 - **Metadata on the view paths.** `stat` and `access` on the four view paths
-  are decided as before; only opens get the views. Every client tested
-  resolves without them.
+  are decided as before; only opens get the views. So `stat("/etc/hosts")`
+  reports the host's file, not the view. Every client tested resolves without
+  them.
+- **Private addresses.** A name may lead to a private address (10/8,
+  172.16/12, 192.168/16, fc00::/7). That is how internal APIs are reached by
+  name, so whoever controls an allowed name's DNS can point it at a private
+  address the Warden's host can reach. Loopback, link-local, unspecified and
+  multicast addresses are reached only by numeric rules.
+- **Local resolvers over Unix sockets.** A policy that allows nscd's socket,
+  systemd-resolved's or D-Bus gives the agent a resolver that sends DNS
+  itself. Allow such sockets only with that in mind.
 - **Refresh changes and checkpoints.** A refresh that changes a name's
   addresses is signed at the next scheduled checkpoint, not at once.
 

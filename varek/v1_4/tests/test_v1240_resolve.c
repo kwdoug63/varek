@@ -271,6 +271,61 @@ int main(int argc, char **argv) {
         wr_async_stop(&t);
         CHECK(!wr_async_alive(&t) && wr_async_fd(&t) == -1, "%s stopped", how);
     }
+    /* v1.24 review: an answer longer than the lookup's buffer (glibc retries
+     * a truncated UDP answer over TCP and reports the full length) is a
+     * failure, not parsed past the buffer */
+    {
+        zone("{\"big.example.test\": {\"big\": 1900}}");
+        wr_result_t r;
+        wr_lookup(&t, "big.example.test", &r);
+        CHECK(r.st[0] == WR_ST_FAIL && r.n[0] == 0, "an oversized answer is a failure (st %d, %zu addresses)",
+              (int)r.st[0], r.n[0]);
+    }
+    /* v1.24 review: the table, fed results directly */
+    {
+        wr_table_t u;
+        wr_config_t c;
+        wr_config_default(&c);
+        char why[160];
+        CHECK(wr_table_init(&u, &c, why, sizeof why) == 0, "table: %s", why);
+        int a = wr_table_add(&u, "grace.example.test"), m = wr_table_add(&u, "mapped.example.test"),
+            d = wr_table_add(&u, "denied.example.test");
+        wr_result_t r;
+        memset(&r, 0, sizeof r);
+        r.st[0] = WR_ST_OK; r.ttl[0] = 300; r.n[0] = 1; r.ip[0][0] = ip("192.0.2.70");
+        r.st[1] = WR_ST_NODATA;
+        int64_t now = wr_now_ms();
+        wr_apply(&u, (size_t)a, &r, now);
+        wr_result_t f;
+        memset(&f, 0, sizeof f);
+        f.st[0] = f.st[1] = WR_ST_FAIL;
+        wr_apply(&u, (size_t)a, &f, now + 1000);           /* a failed refresh */
+        r.ip[0][0] = ip("192.0.2.71");                     /* then the answer moves */
+        wr_apply(&u, (size_t)a, &r, now + 2000);
+        int64_t until = 0;
+        wr_ip_t old = ip("192.0.2.70");
+        for (size_t k = 0; k < u.e[a].n; k++)
+            if (!memcmp(u.e[a].addrs[k].ip.a, old.a, 4) && u.e[a].addrs[k].ip.fam == 4) until = u.e[a].addrs[k].until_ms;
+        CHECK(until - (now + 2000) >= 299000, "grace after a failed refresh is the last answer's TTL "
+              "(300 s), got %lld ms", (long long)(until - (now + 2000)));
+        memset(&r, 0, sizeof r);
+        r.st[0] = WR_ST_NODATA; r.st[1] = WR_ST_OK; r.ttl[1] = 60; r.n[1] = 1;
+        r.ip[1][0] = ip("::ffff:192.0.2.77");
+        wr_apply(&u, (size_t)m, &r, now);
+        wr_ip_t v4 = ip("192.0.2.77");
+        CHECK(wr_entry_has(&u.e[m], &v4, now), "an AAAA answer ::ffff:a.b.c.d binds a.b.c.d");
+        memset(&r, 0, sizeof r);
+        r.st[0] = WR_ST_OK; r.ttl[0] = 60; r.n[0] = 1; r.ip[0][0] = ip("192.0.2.88"); r.st[1] = WR_ST_NODATA;
+        wr_apply(&u, (size_t)d, &r, now);
+        u.e[d].unlisted = true;
+        char hv[1024];
+        FILE *hf = fmemopen(hv, sizeof hv, "w");
+        wr_hosts_view(&u, hf);
+        fclose(hf);
+        CHECK(!strstr(hv, "denied.example.test") && strstr(hv, "grace.example.test"),
+              "a name only a deny rule names is not in the hosts view: %s", hv);
+        wr_table_free(&u);
+    }
     /* a helper that dies is noticed (the Warden then stops the run) */
     {
         wr_config_t bad = t.cfg;

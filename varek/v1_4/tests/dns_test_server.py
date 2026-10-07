@@ -12,7 +12,11 @@ zone.json maps a name (lowercase, no trailing dot) to its records:
   {"api.example.test": {"ttl": 30, "a": ["192.0.2.10"], "aaaa": ["2001:db8::10"]},
    "www.example.test": {"ttl": 60, "cname": "api.example.test"},
    "flaky.example.test": {"rcode": "servfail"},
-   "slow.example.test": {"drop": true}}
+   "slow.example.test": {"drop": true},
+   "big.example.test": {"big": 1900}}
+
+"big": N answers A over UDP with the truncation bit and nothing else, and over
+TCP with N addresses (1900: about 61 KB, as one TCP message allows): the v1.24 review's oversized answer.
 
 A name not in the zone is NXDOMAIN. Each query is appended to the log as
 "<type> <name>" (the tests check which names reached the server).
@@ -84,7 +88,7 @@ class State:
             fh.write(f"{qtype} {name}\n")
 
 
-def answer(state, msg):
+def answer(state, msg, tcp=False):
     """The response bytes for one query, or None to drop it."""
     if len(msg) < 12:
         return None
@@ -111,6 +115,13 @@ def answer(state, msg):
             return None
         if ent.get("rcode"):
             rcode = RCODES[ent["rcode"]]
+            break
+        if ent.get("big") and qtype == T_A:
+            if not tcp:
+                rflags = 0x8000 | 0x0400 | 0x0200 | (flags & 0x0100)     # TC: ask over TCP
+                return struct.pack("!HHHHHH", qid, rflags, 1, 0, 0, 0) + question
+            answers = [rr(name, T_A, 30, bytes([10, (i >> 16) & 255, (i >> 8) & 255, i & 255]))
+                       for i in range(int(ent["big"]))]
             break
         ttl = int(ent.get("ttl", 30))
         if "cname" in ent and qtype != T_CNAME:
@@ -154,8 +165,8 @@ class TCP(socketserver.BaseRequestHandler):
                 if not chunk:
                     return
                 data += chunk
-            out = answer(self.server.state, data)
-            if out is not None:
+            out = answer(self.server.state, data, tcp=True)
+            if out is not None and len(out) <= 65535:
                 self.request.sendall(struct.pack("!H", len(out)) + out)
         except (OSError, ValueError, IndexError, struct.error):
             return
