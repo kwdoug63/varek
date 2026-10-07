@@ -292,7 +292,8 @@ FILE_ACTIONS = ("file.open", "file.stat", "file.access", "file.readlink")
 # reported apart from the decisions. varek_audit.py checks each view against
 # the policy.
 VIEW_RULES = {"hosts_view": "/etc/hosts", "resolv_view": "/etc/resolv.conf",
-              "nsswitch_view": "/etc/nsswitch.conf", "hostconf_view": "/etc/host.conf"}
+              "nsswitch_view": "/etc/nsswitch.conf", "hostconf_view": "/etc/host.conf",
+              "netsvc_view": "/etc/netsvc.conf", "svc_view": "/etc/svc.conf"}   # v1.25
 _O_ACCMODE, _O_CREAT, _O_TRUNC = 3, 0o100, 0o1000
 
 

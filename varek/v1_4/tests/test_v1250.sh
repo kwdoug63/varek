@@ -163,7 +163,11 @@ for c in "com refused" "co.uk refused" "s3.amazonaws.com refused" "bucket.s3.ama
          "cloudfront.net refused" "myorg.github.io refused" "x.compute.amazonaws.com refused" \
          "my.salesforce.com refused" "acme.my.salesforce.com refused" "amazonaws.com refused" \
          "foo.ck refused" "www.ck ok" "city.kawasaki.jp ok" "example.com ok" "example.co.uk ok" \
-         "salesforce.com ok" "api.salesforce.com ok"; do
+         "api.salesforce.com ok" \
+         "salesforce.com refused" "core.windows.net refused" "windows.net refused" "on.aws refused" \
+         "kawasaki.jp refused" "amazonaws.com.cn refused" "wikipedia.org ok" "google.com ok"; do
+    # v1.25 review: the last row - a wildcard over the parent of a shared
+    # domain covers it (*.salesforce.com covers evil.my.salesforce.com)
     set -- $c
     got=$(printf '%s\n' "$1" | "$SDT" "$PSL" "$VL" cases)
     if [ "$got" = "$2" ]; then pass "*.$1: $2"; else flunk "*.$1: $got (want $2)"; fi
@@ -174,6 +178,10 @@ check "lint refuses a wildcard over the private section, naming the entry" \
     grep -q 's.txt:3: allow host \*.s3.amazonaws.com is refused: s3.amazonaws.com is a shared domain .*private section' "$OUT/lint"
 check "lint refuses a wildcard under a VAREK-list entry, naming it" \
     grep -q 's.txt:4: allow host \*.acme.my.salesforce.com is refused: .*under my.salesforce.com.*VAREK list' "$OUT/lint"
+printf 'require warden 1.25\nallow host *.salesforce.com:443 acknowledge=dns-channel\n' > "$OUT/sp.txt"
+"$VDP" "$OUT/sp.txt" lint > "$OUT/lint2" 2>&1
+check "lint refuses a wildcard over the parent of a shared domain, naming it" \
+    grep -q 'sp.txt:2: allow host \*.salesforce.com is refused: my.salesforce.com is under salesforce.com.*would cover it' "$OUT/lint2"
 if grep -q 's.txt:[25]:' "$OUT/lint"; then flunk "an ordinary wildcard and a deny wildcard pass"
 else pass "an ordinary wildcard and a deny wildcard pass"; fi
 if [ -n "$WARDEN" ]; then
@@ -184,6 +192,23 @@ if [ -n "$WARDEN" ]; then
     check "the Warden accepts an ordinary wildcard" "$WARDEN" "$OUT/ok.txt" --check-startup
     "$WARDEN" "$OUT/s.txt" --psl /nonexistent --check-startup > "$OUT/wn" 2>&1
     check "a list it cannot read stops the Warden" grep -q 'cannot read /nonexistent' "$OUT/wn"
+    # v1.25 review: the lists are pinned. A list in data/ that is not the
+    # release's stops the Warden; one named with --psl/--shared-domains is
+    # used, and run_start says it is not pinned. A cut-off PSL is refused.
+    check "the pinned hashes are the shipped lists'" sh -c "
+        grep -q \"SD_PSL_SHA256 *\\\"\$(sha256sum '$PSL' | cut -c1-64)\\\"\" '$HERE/shared_domains.h' &&
+        grep -q \"SD_VAREK_SHA256 *\\\"\$(sha256sum '$VL' | cut -c1-64)\\\"\" '$HERE/shared_domains.h'"
+    mkdir -p "$OUT/inst/data"; cp "$WARDEN" "$OUT/inst/warden"; cp "$PSL" "$OUT/inst/data/"
+    grep -v '^my.salesforce.com$' "$VL" > "$OUT/inst/data/varek_shared_domains.txt"
+    "$OUT/inst/warden" "$OUT/ok.txt" --check-startup > "$OUT/wp" 2>&1
+    check "a list in data/ that is not the release's stops the Warden" \
+        grep -q 'varek_shared_domains.txt is not the list this release ships' "$OUT/wp"
+    "$WARDEN" "$OUT/ok.txt" --shared-domains "$OUT/inst/data/varek_shared_domains.txt" --check-startup > "$OUT/wq" 2>&1
+    check "a list named on the command line is used, and said to be unpinned" \
+        sh -c "grep -q 'startup checks passed' '$OUT/wq' && grep -q 'not the ones this release ships' '$OUT/wq'"
+    head -c 300000 "$PSL" > "$OUT/cut.dat"
+    "$WARDEN" "$OUT/ok.txt" --psl "$OUT/cut.dat" --check-startup > "$OUT/wc" 2>&1
+    check "a cut-off Public Suffix List is refused" grep -q 'is not a whole Public Suffix List' "$OUT/wc"
     if [ "$(id -u)" = 0 ]; then
         mkdir -p /tmp/varek_v1250 && chmod 755 /tmp/varek_v1250
         printf 'require warden 1.25\nallow host *.example.com:443 acknowledge=dns-channel\nallow path /tmp/varek_v1250/\n' > "$OUT/run.txt"
@@ -191,6 +216,7 @@ if [ -n "$WARDEN" ]; then
         psl=$(sha256sum "$PSL" | cut -c1-64); vl=$(sha256sum "$VL" | cut -c1-64)
         check "run_start records both lists' SHA-256" \
             grep -q "\"psl_sha256\":\"$psl\",\"shared_domains_sha256\":\"$vl\"" "$OUT/run.log"
+        check "and that they are the lists this release ships" grep -q '"shared_lists_pinned":true' "$OUT/run.log"
         check "run_start reports the Warden as 1.25.0" grep -q '"event":"run_start",[^}]*"warden":"1.25.0"' "$OUT/run.log"
         check "the policy grammar is reported as v1.25" grep -q 'loaded policy default v1.25 ' "$OUT/run.log"
         rm -rf /tmp/varek_v1250

@@ -23,6 +23,13 @@
 
 typedef struct sd_lists sd_lists_t;
 
+/* v1.25 review: the SHA-256 of the lists this release ships (data/). The
+ * Warden refuses a default-path list that differs (a partial or altered
+ * install), and records whether the lists it used are these. make test-v1250
+ * checks that these match the files, so a list change updates them. */
+#define SD_PSL_SHA256   "102b252c18b5f87f4c81f017e75282a82c18e00cd0c2e601b5b02a0f7a601f2c"
+#define SD_VAREK_SHA256 "f70f7da49db614da2ea20c101e741ba352d98df1afc0859ba709c1f144816244"
+
 /* Load the two lists. Returns the lists, or NULL with the reason in why. */
 sd_lists_t *sd_load(const char *psl_path, const char *varek_path, char *why, size_t wn);
 void        sd_free(sd_lists_t *l);

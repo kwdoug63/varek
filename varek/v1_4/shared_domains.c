@@ -16,11 +16,14 @@ enum {
     F_ICANN_EXC  = 4,      /* an ICANN rule "!x": x is not */
     F_PRIVATE    = 8,      /* a private rule "x" or "*.x": x and everything under it */
     F_VAREK      = 16,     /* the VAREK list: x and everything under it */
+    F_ABOVE      = 32,     /* v1.25 review: a shared domain lies under x */
 };
 
 typedef struct {
-    char    *key;
-    unsigned flags;
+    char       *key;
+    unsigned    flags;
+    const char *below;     /* F_ABOVE: one shared domain under key (another slot's key) */
+    unsigned    below_flags;
 } slot_t;
 
 struct sd_lists {
@@ -187,8 +190,9 @@ static int read_lines(const char *path, int psl, sd_lists_t *l, char *why, size_
     if (!f) { snprintf(why, wn, "cannot read %s", path); return -1; }
     char line[1024];
     int section = psl ? 0 : 2;          /* 0 ICANN, 1 private, 2 VAREK */
-    int seen_icann = 0, seen_private = 0;
+    int seen_icann = 0, seen_private = 0, seen_end = 0;
     while (fgets(line, sizeof line, f)) {
+        if (psl && strstr(line, "===END PRIVATE DOMAINS===")) { seen_end = 1; continue; }
         if (psl && strstr(line, "===BEGIN ICANN DOMAINS===")) { section = 0; seen_icann = 1; continue; }
         if (psl && strstr(line, "===BEGIN PRIVATE DOMAINS===")) { section = 1; seen_private = 1; continue; }
         char *p = line;
@@ -215,7 +219,43 @@ static int read_lines(const char *path, int psl, sd_lists_t *l, char *why, size_
         snprintf(why, wn, "%s is not the Public Suffix List (no ICANN and private sections)", path);
         return -1;
     }
+    /* v1.25 review: a cut-off list would silently refuse less */
+    if (psl && (!seen_end || l->count[0] < 1000 || l->count[1] < 100)) {
+        snprintf(why, wn, "%s is not a whole Public Suffix List (%s%zu ICANN and %zu private rules)",
+                 path, seen_end ? "" : "no END PRIVATE DOMAINS marker; ", l->count[0], l->count[1]);
+        return -1;
+    }
     return 0;
+}
+
+/* v1.25 review: a wildcard over a domain ABOVE a shared domain covers it too
+ * (*.salesforce.com covers evil.my.salesforce.com). Mark every proper
+ * ancestor of two or more labels of each entry, and the base x of each ICANN
+ * rule "*.x", with one entry under it, for the refusal's message. */
+static int mark_above(sd_lists_t *l) {
+    size_t n = 0;
+    for (size_t i = 0; i < l->cap; i++)
+        if (l->slot[i].key && (l->slot[i].flags & (F_ICANN | F_ICANN_WILD | F_PRIVATE | F_VAREK))) n++;
+    struct { const char *key; unsigned flags; } *e = calloc(n ? n : 1, sizeof *e);
+    if (!e) return -1;
+    n = 0;
+    for (size_t i = 0; i < l->cap; i++)
+        if (l->slot[i].key && (l->slot[i].flags & (F_ICANN | F_ICANN_WILD | F_PRIVATE | F_VAREK))) {
+            e[n].key = l->slot[i].key;          /* keys are never freed or moved until sd_free */
+            e[n++].flags = l->slot[i].flags;
+        }
+    int rc = 0;
+    for (size_t k = 0; k < n && rc == 0; k++) {
+        const char *from = (e[k].flags & F_ICANN_WILD) ? e[k].key : strchr(e[k].key, '.');
+        if (from && from != e[k].key) from++;
+        for (const char *a = from; a && strchr(a, '.'); a = strchr(a, '.') + 1) {
+            if (add(l, a, F_ABOVE) < 0) { rc = -1; break; }
+            slot_t *s = find(l, a);
+            if (!s->below) { s->below = e[k].key; s->below_flags = e[k].flags; }
+        }
+    }
+    free(e);
+    return rc;
 }
 
 sd_lists_t *sd_load(const char *psl_path, const char *varek_path, char *why, size_t wn) {
@@ -225,6 +265,7 @@ sd_lists_t *sd_load(const char *psl_path, const char *varek_path, char *why, siz
         sd_free(l);
         return NULL;
     }
+    if (mark_above(l) < 0) { sd_free(l); snprintf(why, wn, "out of memory"); return NULL; }
     return l;
 }
 
@@ -266,6 +307,20 @@ int sd_refuses(const sd_lists_t *l, const char *suffix, char *why, size_t wn) {
                          g & F_VAREK ? "VAREK list" : "Public Suffix List, private section");
             return 1;
         }
+    }
+    /* v1.25 review: a shared domain under suffix, which the wildcard covers */
+    slot_t *s = l->cap ? find(l, suffix) : NULL;
+    if (s && s->key && (s->flags & F_ABOVE) && s->below) {
+        const char *src = s->below_flags & F_VAREK ? "VAREK list"
+                        : s->below_flags & F_PRIVATE ? "Public Suffix List, private section"
+                        : "Public Suffix List";
+        if (s->below_flags & F_ICANN_WILD && !strcmp(s->below, suffix))
+            snprintf(why, wn, "every name directly under %s is a public suffix (Public Suffix List "
+                     "rule *.%s): the wildcard would cover names anyone can register", suffix, suffix);
+        else
+            snprintf(why, wn, "%s is under %s, a shared domain where anyone can register names "
+                     "(%s): the wildcard would cover it", s->below, suffix, src);
+        return 1;
     }
     return 0;
 }

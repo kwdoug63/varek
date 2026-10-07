@@ -1286,6 +1286,7 @@ static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden
 #define STUB_DEFAULT_RATE  30            /* distinct new names per minute */
 #define STUB_LABEL_MAX     63            /* bytes matched by `*` */
 static char       g_psl_sha[65], g_shared_sha[65];  /* v1.25: the lists wildcards were checked against */
+static bool       g_lists_pinned;                   /* v1.25 review: they are the release's */
 static uint64_t g_records = 0;       /* decision records emitted */
 static bool     g_relay_midline = false;
 
@@ -1548,8 +1549,9 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     /* v1.24: the names the Warden resolves (each gets a resolution record). */
     if (g_any_name) fputs("\"host_name_rules\":true,", f);
     /* v1.25: the lists the policy's wildcards were checked against */
-    if (g_psl_sha[0]) fprintf(f, "\"psl_sha256\":\"%s\",\"shared_domains_sha256\":\"%s\",",
-                              g_psl_sha, g_shared_sha);
+    if (g_psl_sha[0]) fprintf(f, "\"psl_sha256\":\"%s\",\"shared_domains_sha256\":\"%s\","
+                              "\"shared_lists_pinned\":%s,",
+                              g_psl_sha, g_shared_sha, g_lists_pinned ? "true" : "false");
     if (g_names_on) fprintf(f, "\"host_names\":%zu,\"resolver\":\"%s\",", g_names.n, g_names.resolver);
     /* v1.25: where the agent's questions go (connects and sends to it are
      * records with rule dns_stub) */
@@ -1655,6 +1657,25 @@ static int wildcards_check(const char *path, const struct policy *p, const char 
                 "domains (data/varek_shared_domains.txt) was not found; give --shared-domains\n");
         return -1;
     }
+    /* v1.25 review: the lists in data/ must be the ones this release ships;
+     * lists named with --psl or --shared-domains may differ, which run_start
+     * records (shared_lists_pinned). */
+    if (sha256_file_hex(psl, g_psl_sha) < 0 || sha256_file_hex(var, g_shared_sha) < 0) {
+        fprintf(stderr, "[warden] cannot read %s; refusing to start\n", g_psl_sha[0] ? var : psl);
+        return -1;
+    }
+    bool psl_ok = !strcmp(g_psl_sha, SD_PSL_SHA256), var_ok = !strcmp(g_shared_sha, SD_VAREK_SHA256);
+    if ((!psl_arg && !psl_ok) || (!shared_arg && !var_ok)) {
+        const char *which = !psl_arg && !psl_ok ? psl : var;
+        fprintf(stderr, "[warden] %s is not the list this release ships (SHA-256 %s); reinstall it, "
+                "or name a list with %s; refusing to start\n", which,
+                which == psl ? g_psl_sha : g_shared_sha, which == psl ? "--psl" : "--shared-domains");
+        return -1;
+    }
+    g_lists_pinned = psl_ok && var_ok;
+    if (!g_lists_pinned)
+        fprintf(stderr, "[warden] the shared-domain lists named on the command line are not the ones "
+                "this release ships; run_start records it (shared_lists_pinned false)\n");
     sd_lists_t *l = sd_load(psl, var, why, sizeof why);
     if (!l) { fprintf(stderr, "[warden] %s; refusing to start\n", why); return -1; }
     int refused = 0;
@@ -1670,10 +1691,6 @@ static int wildcards_check(const char *path, const struct policy *p, const char 
     }
     sd_free(l);
     if (refused) return -1;
-    if (sha256_file_hex(psl, g_psl_sha) < 0 || sha256_file_hex(var, g_shared_sha) < 0) {
-        fprintf(stderr, "[warden] cannot read the shared-domain lists to record them\n");
-        return -1;
-    }
     return 0;
 }
 

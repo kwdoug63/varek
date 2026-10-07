@@ -10,6 +10,7 @@ test_v1250.sh to compare shared_domains.c against.
       prints suffixes to test: every private-section entry, a name under it,
       and the ICANN rules' public suffixes, one per line
 """
+import bisect
 import sys
 
 
@@ -49,17 +50,33 @@ def load(psl, varek):
         line = line.split("#", 1)[0].strip()
         if line:
             shared.add(line)
-    return icann, icann_wild, icann_exc, shared
+    # v1.25 review: the domains a shared entry lies under. Stated here as a
+    # search over the entries sorted by their labels reversed, not as the C
+    # code's set of marked ancestors.
+    below = sorted(_rev(d) for d in icann | shared)
+    return icann, icann_wild, icann_exc, shared, below
 
 
-def refused(s, icann, icann_wild, icann_exc, shared):
+def _rev(d):
+    return ".".join(reversed(d.split("."))) + "."
+
+
+def refused(s, icann, icann_wild, icann_exc, shared, below):
     if s not in icann_exc:
         if s in icann:
             return True
         if "." in s and s.split(".", 1)[1] in icann_wild:
             return True
     labels = s.split(".")
-    return any(".".join(labels[i:]) in shared for i in range(len(labels)))
+    if any(".".join(labels[i:]) in shared for i in range(len(labels))):
+        return True
+    # v1.25 review: an entry strictly under s, which *.s covers; and a base
+    # of an ICANN "*.s" rule, whose every child is a public suffix
+    if s in icann_wild:
+        return True
+    k = _rev(s)
+    i = bisect.bisect_right(below, k)
+    return i < len(below) and below[i].startswith(k)
 
 
 def main():
@@ -70,8 +87,13 @@ def main():
             if s:
                 print("refused" if refused(s, *lists) else "ok")
     else:
-        icann, icann_wild, icann_exc, shared = lists
+        icann, icann_wild, icann_exc, shared, _ = lists
         out = set()
+        # v1.25 review: every domain above an entry, two labels or more
+        for d in icann | shared | icann_wild:
+            labs = d.split(".")
+            for i in range(1, len(labs) - 1):
+                out.add(".".join(labs[i:]))
         for d in shared:
             out.add(d)
             out.add("tenant." + d)

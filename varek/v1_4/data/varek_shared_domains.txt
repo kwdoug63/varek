@@ -41,3 +41,31 @@ okta.com
 auth0.com
 freshservice.com
 typeform.com
+# Added 2026-10-07 (v1.25 review): storage, databases, keys and AI endpoints
+# where anyone can create an account with its own name, and tunnels that give
+# anyone a public name
+amazonaws.com.cn
+table.core.windows.net
+queue.core.windows.net
+dfs.core.windows.net
+database.windows.net
+vault.azure.net
+azurecr.io
+openai.azure.com
+cognitiveservices.azure.com
+azuredatabricks.net
+cloud.databricks.com
+snowflakecomputing.com
+mongodb.net
+firebaseio.com
+r2.cloudflarestorage.com
+backblazeb2.com
+wasabisys.com
+onmicrosoft.com
+dynamics.com
+oktapreview.com
+okta-emea.com
+pipedream.net
+loca.lt
+serveo.net
+gradio.live
