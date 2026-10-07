@@ -41,8 +41,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     queries its nameserver after `/etc/hosts`, gives up at once.
   - Tests: `make test-v1240` (grammar in both parsers, the table against a
     local test DNS server, and as root the Warden with Python, curl, Node, a
-    static musl client, Go and Java as the agent); CI runs it. It fails 81 of
-    its 88 checks against v1.23.1.
+    static musl client, Go and Java as the agent); CI runs it. It fails 100
+    of its 108 checks against v1.23.1.
   - The review's findings, all fixed. The review was done by four AI review
     agents (Claude), separate from the session that wrote the code; it was
     not a human or third-party review. See `RELEASE-v1.24.0.md`, "Found in

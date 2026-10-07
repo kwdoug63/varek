@@ -63,10 +63,10 @@ unsafe action to SATISFIED**).
 
 ## Tested with real clients
 
-`make test-v1240` runs 88 checks; CI runs it, with the Warden as root.
+`make test-v1240` runs 108 checks; CI runs it, with the Warden as root.
 
 - **Grammar:** 28 accepted and refused forms, each in both parsers.
-- **Resolution table:** 81 checks against a local authoritative test server
+- **Resolution table:** 86 checks against a local authoritative test server
   (`tests/dns_test_server.py`) that rotates answers, follows CNAME chains,
   returns NXDOMAIN and SERVFAIL, and drops queries.
 - **Clients as the agent**, each resolving an allowed name through the views and
@@ -86,8 +86,8 @@ unsafe action to SATISFIED**).
 - **Other cases:** a deny on `/etc/hosts`, a Unix-socket connect, the plan gate,
   and a forged stream that the audit refuses.
 
-**Regression.** Against the v1.23.1 Warden and parsers, the same suite fails
-81 of its 88 checks. The 7 it passes do not test host names: a v1.21
+**Regression.** Against the v1.23.1 Warden, parsers and audit, the same suite
+fails 100 of its 108 checks. The 8 it passes do not test host names: a v1.21
 compatibility case, the table's unit test (which does not involve the Warden),
 and checks that pass trivially because the old Warden refuses the policy
 outright.
