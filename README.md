@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.23.1-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.24.0-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -52,7 +52,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.23.1.**
+   **Current release: v1.24.0.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -119,6 +119,7 @@ The runtime line has progressed well beyond simple syscall containment:
   "Never requires a human" becomes certified rather than hoped. Since v1.18.0 the
   Warden runs it on the `--flow-policy` at startup and refuses to start if it
   fails.
+- **v1.24.0 — host names without agent DNS.** Through v1.23 a host rule matched only a numeric address, so a policy either hard-coded addresses that a cloud provider or content network moves, or let the agent reach a DNS server, through which it can send data out in its questions. A policy can now name hosts (`allow host api.salesforce.com:443`, after `require warden 1.24`). The Warden resolves every named host itself, through a resolver helper process, refreshes each at its TTL and records every lookup in the verdict stream; the agent reads `/etc/hosts`, `resolv.conf`, `nsswitch.conf` and `host.conf` views the Warden writes, and every connect to port 53 is refused. A connect is decided on its address and on each allowed name that address belongs to, the certificate covers the deciding name, and `varek_audit.py` checks every name binding against the lookup records. It ran 24 hours against Fastly, Cloudflare and CloudFront with 4,320 of 4,320 fetches succeeding while CloudFront changed its answer 2,034 times. An AI review found and fixed names that could lead to the host's own loopback services, forged streams the audit accepted, and writable opens of the resolver files. See [`RELEASE-v1.24.0.md`](./RELEASE-v1.24.0.md).
 - **v1.22.0 — the `varek` command and `varek bench`.** One command runs and checks the Warden with shared settings in `/etc/varek/varek.conf`: `doctor`, `init`, `policy`, `preflight`, `run`, `refusals`, `audit`, `export` (signed CycloneDX 1.6) and `bench`; `sudo make install` puts it in `/usr/local/bin`. `varek bench` measures what mediation costs per call on the host it runs on, natively and under the Warden, and checks every verdict: on a 2-vCPU host an authorized open takes 70–80 µs under the Warden (2.4 natively), a refused open 53–57 µs, an allowed connect 143–148 µs (23–24 natively); the Warden's own time is 13–17, 56–66 and 114–118 µs ([results](./varek/v1_4/bench_results_v1_22_0.txt)). The "8 µs" median published with v1.14–v1.16 was the Warden's own time over a mix with no dialed connects, not what the agent waits. Also: the Core packs allow `/usr/lib64/` read-only (RHEL, Fedora, Amazon Linux), and the Warden builds on glibc 2.34. The Warden's decisions are unchanged. See [`RELEASE-v1.22.0.md`](./RELEASE-v1.22.0.md).
 - **v1.21.1 — plan steps say how they open.** A plan step had no open flags, so the `--plan` gate decided a `file_open` step with the flags unknown, and a path the policy allows only read-only (every shipped sector policy's libraries, and data in four of them) was UNKNOWN at the gate although the runtime allowed the read. A `file_open` step may now declare `open=read`, or an access mode and flags (`open=O_WRONLY|O_CREAT|O_TRUNC`), and the gate decides it with those flags; anything it does not understand is UNKNOWN. Also corrects the sample plan and the data-flow threat model, which still said every connect step is refused. See [`RELEASE-v1.21.1.md`](./RELEASE-v1.21.1.md).
 - **v1.21.0 — decided connections.** Through v1.20.0 a supervised agent had no network: every connect was refused, whatever the policy said, because letting an allowed connect continue in the kernel would let a second thread change the destination after the check. The Warden now decides each connect on the destination it copied once (the independent checker confirms any ALLOW), dials it itself from outside the agent's empty network namespace, and hands over the connected socket with `SECCOMP_IOCTL_NOTIF_ADDFD`, carrying over the socket options the agent set (the 58 the Warden knows; others set before the connect are not carried). TCP and connected UDP over IPv4 and IPv6, and Unix sockets decided on their canonical path (IPv6 decisions are tested; IPv6 dialing was not exercised on the release host, whose kernel has no IPv6, and the test reports it as SKIPPED there). The plan gate decides `net_connect` steps instead of refusing them. Tested with curl, Python `requests` and Node.js, and with a 2,000-attempt destination-swap race that reached the denied side 0 times. On a 2-vCPU test host a connect took about 75 to 125 µs longer than a native one at the median, and more at p99; a `requests.get` to a local server about 0.17 ms longer (1.21 → 1.38 ms). Figures in the release notes. Also: the sector policies' key and credential rules match in any case (`server.PEM`, `x.pem.bak`, `id_rsa` outside `.ssh` were allowed), Node.js runs under the Warden at all (`io_uring_setup` answers `ENOSYS`), and the preflight checks the plan gate's flow policy and count file. See [`RELEASE-v1.21.0.md`](./RELEASE-v1.21.0.md).
@@ -171,6 +172,7 @@ allow host 10.20.0.15:443              # an address and port
 allow host [2001:db8::15]:443          # IPv6
 allow host 127.0.0.1                   # any port on this address
 allow host unix:/run/fhir/gw.sock      # a Unix socket, by its canonical path
+allow host api.salesforce.com:443      # a host name (v1.24, after `require warden 1.24`)
 ```
 
 Covered: TCP and connected UDP over IPv4 and IPv6, Unix stream, datagram and
@@ -180,12 +182,17 @@ kernel has no IPv6), where `make test-v1210` reports that case as SKIPPED. Refus
 name their own destination (an unconnected datagram), inbound connections,
 abstract Unix addresses, raw and other socket kinds.
 
-Host rules match the numeric address the Warden dials. Host names
-(`allow host api.example.com:443`) are the next stage, planned for the v1.21
-line: the Warden will resolve the allowed names itself and serve the agent a
-hosts view of them, so the agent sends no DNS of its own
-([design](./docs/security/v1.21-stage2-host-names.md)). Until then, resolve a
-name outside the agent and allow its addresses.
+Host rules may name hosts (v1.24). The Warden resolves every name a host
+rule names itself, refreshes each at its TTL, and records every lookup in the
+verdict stream. The agent reads an `/etc/hosts` view that lists only the
+allowed names, and every connect to port 53 is refused, so the agent sends no
+DNS of its own. A connect is decided on its address and on each allowed name
+that address belongs to; a loopback, link-local, unspecified or multicast
+address is decided on the address alone, so only a numeric rule can allow it.
+A name decides where the agent connects, not which site it asks for there:
+an address on a shared content network also serves other sites, which the
+v1.26 egress proxy will close. See
+[`RELEASE-v1.24.0.md`](./RELEASE-v1.24.0.md).
 
 VAREK decides *where* an agent may connect. *What* it sends there is for your
 egress proxy or DLP tooling, which VAREK works alongside: an allowed host is a
@@ -446,7 +453,7 @@ different risks at different points in the stack.
 - [x] **v1.22.0** — The `varek` command (run, refusals, audit, signed export, policy packs) and `varek bench` (per-call cost of mediation on the host, every verdict checked)
 - [x] **v1.23.0** — VAREK Enterprise on AWS Marketplace (AMI with Enterprise policy packs and a License Manager check)
 - [x] **v1.23.1** — The Enterprise license check works with Marketplace contract entitlements; deployment guide for AWS
-- [ ] **v1.24.0** (v1.21 stage 2) — Host names without agent DNS: the Warden resolves allowed names and serves a hosts view ([design](./docs/security/v1.21-stage2-host-names.md))
+- [x] **v1.24.0** (v1.21 stage 2) — Host names without agent DNS: the Warden resolves allowed names and serves a hosts view ([design](./docs/security/v1.21-stage2-host-names.md))
 - [ ] **v1.25.0** — Wildcard host names, opt-in (`allow host *.example.com:443 acknowledge=dns-channel`): shared domains where anyone can register names refused at load, lookups answered by the Warden and bounded per rule ([design](./docs/security/v1.25-wildcard-host-names.md))
 - [ ] **v1.26.0** (v1.21 stage 3) — The egress proxy: decisions on the name the agent asks for (TLS SNI, HTTP Host), closing the shared-CDN gap with no agent DNS; opt-in inspecting mode with rules on method and path; chaining to a customer proxy ([design](./docs/security/v1.26-egress-proxy.md))
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
@@ -486,8 +493,8 @@ each with one named soundness obligation and the trusted code it introduces:
   cross-action data-flow subsystem, composed on the fragments above.
 
 Race-free network mediation (a supervisor-dials-and-injects path replacing the
-v1.9.1 deny-only posture for `connect`) shipped in v1.21.0; host names (stage 2,
-v1.24.0), wildcard names (v1.25.0) and the egress proxy with rules on request
+v1.9.1 deny-only posture for `connect`) shipped in v1.21.0 and host names (stage 2)
+in v1.24.0; wildcard names (v1.25.0) and the egress proxy with rules on request
 contents (stage 3, v1.26.0) remain on the roadmap. The default-deny
 syscall allowlist closing the alternate-ABI and variant-syscall bypass classes
 shipped in v1.9.2, and supervisor/target lifecycle coupling shipped in the live
@@ -562,9 +569,9 @@ platform-gating CI coverage (now macOS, Windows, Linux).
 
 ## Documentation
 
-- **Spec paper:** [`varek-spec-paper-v1.23.1.md`](./varek-spec-paper-v1.23.1.md) — language and runtime specification, design rationale, the verdict model
+- **Spec paper:** [`varek-spec-paper-v1.24.0.md`](./varek-spec-paper-v1.24.0.md) — language and runtime specification, design rationale, the verdict model
 - **VAREK Enterprise on AWS:** [`docs/aws-deployment-guide.md`](./docs/aws-deployment-guide.md) — deploying and operating the [AWS Marketplace](https://aws.amazon.com/marketplace/pp/prodview-6fdmjpuimvx64) image
-- **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`docs/security/bypass-classes.md`](./docs/security/bypass-classes.md), [`RELEASE-v1.17.0.md`](./RELEASE-v1.17.0.md), [`RELEASE-v1.12.1.md`](./RELEASE-v1.12.1.md), [`RELEASE-v1.12.0.md`](./RELEASE-v1.12.0.md), [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md), [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
+- **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`docs/security/bypass-classes.md`](./docs/security/bypass-classes.md), [`RELEASE-v1.24.0.md`](./RELEASE-v1.24.0.md), [`RELEASE-v1.17.0.md`](./RELEASE-v1.17.0.md), [`RELEASE-v1.12.1.md`](./RELEASE-v1.12.1.md), [`RELEASE-v1.12.0.md`](./RELEASE-v1.12.0.md), [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md), [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
 - **Verification notes:** [`docs/verification/`](./docs/verification/README.md) — the v1.10/v1.11 program
 - **Changelog:** [`CHANGELOG.md`](./CHANGELOG.md)
 - **Website:** [varek-lang.org](https://varek-lang.org)

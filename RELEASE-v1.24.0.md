@@ -1,10 +1,8 @@
 # VAREK v1.24.0 — Host Names Without Agent DNS
 
-> **DRAFT, not released.** One thing stays open before this is tagged: a
-> second 24-hour soak run on the Warden with the fix the first run found. It
-> is marked **PENDING** below. The AI-agent
-> review is done, and its findings are fixed below. A human or third-party
-> review has not been done.
+> **DRAFT, not released.** The second 24-hour soak passed. Before tagging:
+> a short soak trial on the Warden with the review's fixes. The review was done by AI
+> review agents; a human or third-party review has not been done.
 
 Released PENDING · MIT · github.com/kwdoug63/varek
 
@@ -64,10 +62,10 @@ unsafe action to SATISFIED**).
 
 ## Tested with real clients
 
-`make test-v1240` runs 88 checks; CI runs it, with the Warden as root.
+`make test-v1240` runs 108 checks; CI runs it, with the Warden as root.
 
 - **Grammar:** 28 accepted and refused forms, each in both parsers.
-- **Resolution table:** 81 checks against a local authoritative test server
+- **Resolution table:** 86 checks against a local authoritative test server
   (`tests/dns_test_server.py`) that rotates answers, follows CNAME chains,
   returns NXDOMAIN and SERVFAIL, and drops queries.
 - **Clients as the agent**, each resolving an allowed name through the views and
@@ -87,8 +85,8 @@ unsafe action to SATISFIED**).
 - **Other cases:** a deny on `/etc/hosts`, a Unix-socket connect, the plan gate,
   and a forged stream that the audit refuses.
 
-**Regression.** Against the v1.23.1 Warden and parsers, the same suite fails
-81 of its 88 checks. The 7 it passes do not test host names: a v1.21
+**Regression.** Against the v1.23.1 Warden, parsers and audit, the same suite
+fails 100 of its 108 checks. The 8 it passes do not test host names: a v1.21
 compatibility case, the table's unit test (which does not involve the Warden),
 and checks that pass trivially because the old Warden refuses the policy
 outright.
@@ -99,41 +97,47 @@ name rules.
 
 ## 24 hours against CDN-hosted APIs
 
-**PENDING:** a second run, on the Warden with the `host.conf` fix below. The
-first run's results:
-
-`tests/soak_v1240/soak.sh` ran for 24.00 hours on a DigitalOcean droplet
-(Ubuntu 24.04, kernel 6.8, 1 vCPU, 1 GB), from 2026-10-05 to 2026-10-06. The
-agent fetched each URL by name once a minute:
+`tests/soak_v1240/soak.sh` fetched each URL by name once a minute for 24
+hours on a DigitalOcean droplet (Ubuntu 24.04, kernel 6.8, 1 vCPU, 1 GB). It
+ran twice. The first run found a bug (see "Found in the soak" below). The
+second ran on the Warden with that bug fixed, from 2026-10-06 19:50 to
+2026-10-07 19:50 UTC, and passed with nothing failed:
 
 | Network | URL | Fetches | OK |
 |---|---|---|---|
 | Fastly | `https://pypi.org/robots.txt` | 1,440 | 1,440 |
 | Cloudflare | `https://www.cloudflare.com/cdn-cgi/trace` | 1,440 | 1,440 |
-| CloudFront | `https://aws.amazon.com/robots.txt` | 1,440 | 1,436 |
+| CloudFront | `https://aws.amazon.com/robots.txt` | 1,440 | 1,440 |
 
-- **Refused connects to the soak ports: 0.** No fetch failed because the
-  table was stale.
+- **Refused connects to the soak ports: 0.** No fetch failed, for any reason.
 - **Resolution:**
 
   | Name | Resolution records | Refresh interval | Answer changes | Worst lateness |
   |---|---|---|---|---|
-  | `aws.amazon.com` | 2,818 | 30–58 s | 2,015 | 4.0 s |
-  | `www.cloudflare.com` | 1,411 | 30–291 s | 0 | 0.0 s |
-  | `pypi.org` | 36 | 30–3,600 s | 0 | 0.0 s |
+  | `aws.amazon.com` | 2,812 | 30–59 s | 2,034 | 0.2 s |
+  | `www.cloudflare.com` | 1,470 | 30–284 s | 0 | 0.1 s |
+  | `pypi.org` | 37 | 30–3,600 s | 0 | 0.0 s |
 
-  CloudFront changed `aws.amazon.com`'s answer 2,015 times in 24 hours, and
+  CloudFront changed `aws.amazon.com`'s answer 2,034 times in 24 hours, and
   every fetch still reached an address the table held.
-- **Peers:** every peer the agent reached appears in the resolution
-  records. No fetch needed an address in its grace period.
+- **Peers:** every peer the agent reached appears in the resolution records.
+  No fetch needed an address in its grace period.
 - **Each URL was served by the expected network**, judged from its response
   headers.
-- **4 of 4,320 fetches failed**, all to `aws.amazon.com`, all
-  `OSError: [Errno 101] Network is unreachable`, within six minutes. The
-  checker counted them as outside the Warden, but they were a Warden bug (see
-  "Found in the soak" below), now fixed.
-- **Audit:** `varek_audit.py` PASS on the 47,972-record stream, with the hash
+- **Audit:** `varek_audit.py` PASS on the 114,279-record stream, with the hash
   chain intact. `soak_check` PASS.
+
+**The first run** (2026-10-05 to 2026-10-06) had the same shape:
+- 4,320 fetches, 0 refused connects, 2,015 answer changes for
+  `aws.amazon.com`, and the audit passing.
+- 4 fetches to `aws.amazon.com` failed with
+  `OSError: [Errno 101] Network is unreachable`. The checker counted them as
+  outside the Warden, but they were a Warden bug, fixed before the second
+  run.
+
+The second run used the Warden as of the `host.conf` fix, before the review's
+fixes. Those fixes do not change what the soak exercises (CDN addresses are
+not special addresses), and a short trial on the final Warden confirms it.
 
 ## Latency
 

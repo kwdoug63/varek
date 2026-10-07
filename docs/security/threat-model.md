@@ -1,6 +1,6 @@
 # VAREK — Threat Model
 
-Version: current as of v1.12.0 · MIT · github.com/kwdoug63/varek
+Version: current as of v1.24.0 · MIT · github.com/kwdoug63/varek
 
 This document states what VAREK defends, against whom, and what it explicitly
 does not defend. It is deliberately conservative: where a guarantee is
@@ -35,6 +35,10 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
   kernel mechanisms it relies on (seccomp user-notification and seccomp-BPF,
   PID namespaces, and capability restrictions). Landlock is on the v1.10 roadmap
   and is not wired into the current Warden.
+- **Trust boundary 4 (v1.24):** the host's DNS resolver, or the server named by
+  `--dns-server`. The Warden trusts its answers for the names a policy names
+  and does not validate DNSSEC itself. Whoever controls an allowed name's DNS
+  chooses which addresses the name allows (see §4, *Host names*, and §6).
 
 ## 3. Adversary models
 
@@ -161,6 +165,36 @@ Model-B techniques below, with the residual limits stated honestly.
   agent sends is for the service, or an egress proxy or DLP tool in front of
   it, which VAREK works alongside. Allowing a Unix socket also grants whatever
   its server does for the agent's uid, including descriptors it passes back.
+- **Host names without agent DNS (v1.24).** A host rule may name a host
+  (`allow host api.example.com:443`, after `require warden 1.24`).
+  - *The agent sends no DNS.* The Warden resolves every name a host rule names,
+    allow or deny, itself, A and AAAA, through a resolver helper process, so
+    the process holding the signing key never parses network data. It
+    refreshes each name at its TTL, clamped to [30 s, 1 h]; an address that
+    leaves an answer stays valid for its last TTL, at most 5 minutes. Every
+    lookup is a chained `resolution` record. The agent reads `/etc/hosts`,
+    `/etc/resolv.conf`, `/etc/nsswitch.conf` and `/etc/host.conf` from sealed
+    views the Warden writes; its hosts view lists only localhost and the
+    allowed names. Every connect to port 53 is refused (`dns_refused`), and a
+    writable open of any of the four paths is refused
+    (`view_write_refused`), whatever the policy says.
+  - *Decided on every name of the address.* A connect is decided on its
+    address and on `name:port` for every name, allowed or denied, that the
+    address belongs to, current or in grace; the first rule in policy order
+    that holds on any of them decides, so a deny on a name holds on its
+    addresses. The certificate covers the deciding name, and the checker
+    confirms that no earlier rule holds on another candidate. A loopback,
+    link-local, unspecified or multicast address is decided on the address
+    alone (`special_address`), so DNS cannot lead an allowed name to the
+    host's own services.
+  - *Audited.* `varek_audit.py` checks that each candidate was bound to the
+    address dialed by the resolution records, that no name of that address was
+    left out (grace included), that each connect names the latest table
+    generation, and that the dialed address and candidates are spelt as the
+    Warden spells them. A stream edited to drop a name fails, even with its
+    hash chain recomputed.
+  - *What a name does not decide.* A name decides which addresses the agent
+    may reach, not which site it asks for there (see §6).
 
 The per-class status of every known bypass class is maintained in
 `docs/security/bypass-classes.md`.
@@ -197,15 +231,33 @@ are claimed as solved.
   Path resolution is performed once by the supervisor (v1.12), but in-kernel,
   race-free filesystem restriction via Landlock remains roadmap (v1.10).
 - Network access (v1.21): outbound connects are decided and dialed by the
-  Warden; unconnected datagram sends stay refused. Host rules match numeric
-  addresses only: host names are v1.21 stage 2 (`v1.21-stage2-host-names.md`),
-  and until then a name must be resolved outside the agent. An allowed address
-  on a shared content network also reaches the other sites served from it.
-  Wildcard names are planned for v1.25.0 (`v1.25-wildcard-host-names.md`).
-  Deciding on the name the agent asks the server for, and rules on request
-  contents (method, path, body), are stage 3, through the v1.26.0 egress
-  proxy (`v1.26-egress-proxy.md`). *(Through v1.20.0 this read: network access is deny-only; a
-  mediated allow path is roadmap.)*
+  Warden; unconnected datagram sends stay refused. *(Through v1.20.0 this
+  read: network access is deny-only; a mediated allow path is roadmap.)*
+- Host names (v1.24, `v1.21-stage2-host-names.md`):
+  - *Shared addresses.* A name is decided by the addresses it resolves to. An
+    allowed name on a shared content network also reaches every other site
+    served from those addresses, by another name in TLS SNI or the HTTP `Host`
+    header. Deciding on the name the agent asks the server for, and rules on
+    request contents (method, path, body), are stage 3, through the v1.26.0
+    egress proxy (`v1.26-egress-proxy.md`).
+  - *DNS is trusted.* Whoever controls an allowed name's DNS, or the host's
+    resolver, chooses its addresses within what §4 allows: a private address
+    (10/8, 172.16/12, 192.168/16, fc00::/7) the Warden's host can reach is
+    reachable by name. Point `--dns-server` at a validating resolver where
+    that matters.
+  - *Unix-socket resolvers.* A policy that allows nscd's, systemd-resolved's
+    or D-Bus's socket gives the agent a resolver that sends DNS itself.
+  - *Metadata.* `stat` and `access` on the four view paths report the host's
+    files, not the views.
+  - *Signatures.* A refresh that changes a name's addresses is signed at the
+    next scheduled checkpoint, not at once.
+  - Wildcard names are refused at load; they are planned for v1.25.0
+    (`v1.25-wildcard-host-names.md`).
+- File opens run as root (pre-dates v1.24, found in the v1.24 review). The
+  Warden opens a file for the agent with its own credentials, so a path the
+  policy lets the agent write is writable even when the file is root-owned
+  and mode 0644. Opening with the agent's uid and gid is planned as its own
+  release; until then, allow writes only where the agent may write any file.
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).
 - An agent may probe for SATISFIED-but-harmful actions near a policy boundary;
