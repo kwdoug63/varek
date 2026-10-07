@@ -24,9 +24,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     one (`*.s3.amazonaws.com`), or the VAREK list (`*.my.salesforce.com`). The
     lists are pinned in `varek/v1_4/data/` (the Public Suffix List is MPL-2.0);
     their SHA-256 goes in `run_start`; lint and the Warden name the entry.
-    The VAREK list holds 31 domains, among them blog and newsletter hosts
-    (`wordpress.com`, `substack.com`) and sign-up tenants (`slack.com`,
-    `okta.com`, `auth0.com`).
+    The VAREK list holds 56 domains, among them blog and newsletter hosts
+    (`wordpress.com`, `substack.com`), sign-up tenants (`slack.com`,
+    `okta.com`, `auth0.com`) and accounts anyone can open (`vault.azure.net`,
+    `firebaseio.com`). A suffix with an entry under it is refused too
+    (`*.salesforce.com` covers `my.salesforce.com`). The lists are pinned:
+    lists in `data/` that are not the release's stop the Warden.
   - The stub resolver (`warden_stub.inc.c`): with a wildcard allow rule, the
     agent's `resolv.conf` view names `127.53.53.53`, a UDP and TCP stub the
     Warden binds in the agent's own network namespace, and `nsswitch.conf`
@@ -63,12 +66,22 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     through the stub, and a DNS-tunnel style client against the budgets.
     Against the previous build, 21 of the 31 stub checks fail without the
     stub, and 22 of the budget and budget-grammar checks fail.
-    The whole suite now runs 132 checks and fails 108 of them against the
-    v1.24 Warden, parsers and audit.
+    The whole suite now runs 161 checks and fails 129 of them against the
+    v1.24.0 Warden, parsers and audit.
+  - The review's findings, all fixed (four AI review agents, separate from
+    the session that wrote the code; not a human or third-party review):
+    wildcards over parents of shared domains, unpinned lists and missing
+    entries; re-asked names uncharged (every upstream lookup now counts
+    against `rate=`); a stub connect that could stall the Warden; grace an
+    agent could use to fail an honest audit (the Warden records
+    `grace_end`); and forged streams the audit accepted (a connect forged as
+    a stub connect, a denied name shown answered, a hidden question, a moved
+    rate window, a dropped answer, quadratic work, a bare CR, crashes). See
+    `RELEASE-v1.25.0.md`, "Found in review".
   - The Warden reports `1.25.0` in `run_start`, and the policy grammar as
     v1.25.
-  - `RELEASE-v1.25.0.md`: draft release notes; the soak, the review and
-    latency are pending.
+  - `RELEASE-v1.25.0.md`: draft release notes; the soak and latency are
+    pending.
 - v1.24.0, in progress (host names without agent DNS,
   `docs/security/v1.21-stage2-host-names.md`), sections 1 and 2:
   - Policy grammar: `allow host api.example.com[:port]` and `deny host <name>`

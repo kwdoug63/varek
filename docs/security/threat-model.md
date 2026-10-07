@@ -210,17 +210,19 @@ Model-B techniques below, with the residual limits stated honestly.
     reading the policy sees that the agent's lookups under it leave the host.
   - *Shared domains refused.* A wildcard allow over a public suffix, an entry
     of the Public Suffix List's private section or under one, or an entry of
-    the VAREK list is refused at load, naming the entry. Both lists are
-    pinned, and their SHA-256 is in `run_start`.
+    the VAREK list, or a domain above any of these, is refused at load,
+    naming the entry. Both lists are pinned, and their SHA-256 is in
+    `run_start`.
   - *One way to DNS.* The agent's lookups go to a stub resolver the Warden
     runs at `127.53.53.53:53` in the agent's own network namespace. A name no
     allow rule can reach gets NXDOMAIN, and no question leaves the host. A
     name a wildcard allows is looked up by the Warden's resolver helper
     when the agent asks, never on its own. Every other connect to port 53 is
     refused, as in v1.24.
-  - *Bounded.* Each wildcard allow rule has budgets of new names a run and a
-    minute (defaults 256 and 30) and 63 bytes before the suffix. A new name
-    past a budget gets NXDOMAIN and is not looked up.
+  - *Bounded.* Each wildcard allow rule has budgets of new names a run
+    (default 256), of lookups sent upstream a minute (default 30, a name
+    re-asked after its TTL included) and 63 bytes before the suffix. A
+    question past a budget gets NXDOMAIN and is not looked up.
   - *Recorded and audited.* Every question to the stub is a chained
     `dns_question` record. `varek_audit.py` checks the budgets against the
     policy file, every charge against them, and that every name looked up
@@ -288,15 +290,21 @@ are claimed as solved.
 - Wildcard host names (v1.25, `v1.25-wildcard-host-names.md`):
   - *The name channel is bounded, not closed.* Within a rule's budgets, the
     labels an agent chooses reach the host's resolver and the domain's DNS
-    servers. At the defaults that is at most about 41 bytes a name: about
-    10.5 KB a rule a run, and 1.2 KB a minute. Re-asking a name already
-    charged costs nothing, and its timing can carry a few bits that no
-    budget bounds. The v1.26 egress proxy decides on the name without a
-    lookup by the agent.
+    servers. At the defaults that is at most about 41 bytes a new name: about
+    10.5 KB a rule a run, at most 1.2 KB a minute. A name asked again after
+    its TTL goes upstream again and counts against `rate=`, so the choice of
+    names re-asked carries at most about 30 bytes a minute after that (about
+    43 KB a day a rule), and the timing of each lookup a few bits more. The
+    v1.26 egress proxy decides on the name without a lookup by the agent.
+  - *A deny wildcard holds on names only.* Its hosts cannot be resolved in
+    advance, so an allowed name that is a CNAME to one, or shares its
+    address, still connects. An exact deny holds on addresses.
   - *The lists are snapshots.* A domain where anyone can create a name, and
     that neither list holds, is not refused; such a wildcard allows the
     names an attacker registers there. The VAREK list is reviewed each
-    release.
+    release. The lists are pinned: lists in the Warden's `data/` that are
+    not the release's stop it, and lists an operator names are recorded as
+    such and checked again by the audit against the release's.
   - *No stub without a network namespace.* Without one of its own for the
     agent, names that only a wildcard allows do not resolve.
 - File opens run as root (pre-dates v1.24, found in the v1.24 review). The

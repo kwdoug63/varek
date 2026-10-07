@@ -1,10 +1,11 @@
 # VAREK v1.25.0 — Wildcard Host Names, Opt-In
 
-> **DRAFT, not released.** Still to come before tagging:
-> - the 24-hour soak report (Wikipedia, 40 names on one address);
-> - a review of the change;
+> **DRAFT, not released.** The review was done by AI review agents; a human
+> or third-party review has not been done. Still to come before tagging:
+> - the 24-hour soak report (Wikipedia, 40 names on one address), run on
+>   the Warden before the review's fixes, and a short trial on the final one;
 > - the latency of a lookup through the stub;
-> - the soak, review and latency figures in the spec paper's draft edition.
+> - the soak and latency figures in the spec paper's draft edition.
 
 Released PENDING · MIT · github.com/kwdoug63/varek
 
@@ -42,11 +43,15 @@ name, answers every lookup itself, and bounds and records them all.
    - a public suffix (`*.com`, `*.co.uk`);
    - an entry of the Public Suffix List's private section or under one
      (`*.s3.amazonaws.com`, `*.myorg.github.io`);
-   - on the VAREK list of 31 multi-tenant domains the Public Suffix List
-     lacks (`*.my.salesforce.com`, `*.slack.com`, `*.wordpress.com`).
+   - on the VAREK list of 56 multi-tenant domains the Public Suffix List
+     lacks (`*.my.salesforce.com`, `*.slack.com`, `*.vault.azure.net`), or
+     under one;
+   - above any of these, which the wildcard would cover too
+     (`*.salesforce.com` covers `my.salesforce.com`).
 
-   Both lists ship pinned with the release, and their SHA-256 is in
-   `run_start`.
+   Both lists ship pinned with the release: the Warden refuses lists in its
+   `data/` directory that are not the release's, and `run_start` records
+   their SHA-256 and whether they are.
 4. **The stub resolver.** With a wildcard allow rule, the agent's
    `resolv.conf` view names `127.53.53.53`. That is a UDP and TCP resolver the
    Warden runs inside the agent's own network namespace.
@@ -56,10 +61,12 @@ name, answers every lookup itself, and bounds and records them all.
      when the agent asks, and recorded as a `resolution` record.
    - Every other connect to port 53 is still refused.
 5. **Budgets on the name channel.** Each wildcard allow rule has a budget
-   of new names a run (`names=`, default 256) and a minute (`rate=`, default
-   30), and at most 63 bytes before the suffix. A new name past a budget
-   gets NXDOMAIN and is not looked up. At the defaults, the names an agent
-   chooses can carry at most about 10.5 KB a rule a run.
+   of new names a run (`names=`, default 256), of lookups sent upstream a
+   minute (`rate=`, default 30, counting a name asked again after its TTL),
+   and at most 63 bytes before the suffix. A question past a budget gets
+   NXDOMAIN and is not looked up. At the defaults the new names an agent
+   chooses carry at most about 10.5 KB a rule a run; after that, which
+   names it asks again carries at most about 30 bytes a minute.
 6. **Every question recorded.** Each question the stub receives is a
    chained `dns_question` record: the name, the rule that matched, the
    budget charged and the answer. `varek_audit.py` checks every charge
@@ -78,14 +85,17 @@ genuinely unsafe action to SATISFIED**).
 
 ## Tested with real clients
 
-`make test-v1250` runs 132 checks; CI runs it, with the Warden as root.
+`make test-v1250` runs 161 checks; CI runs it, with the Warden as root.
 
 - **Grammar:** 52 checks of accepted and refused forms, each in both
   parsers, including the acknowledgment and the budgets.
-- **Shared domains:** 29 checks. `shared_domains.c` agrees with an
-  independent Python statement of the rule on 17,840 suffixes, and encodes
-  all 440 Unicode labels in the list as Python does.
-- **The stub, with real clients as the agent:** 32 checks.
+- **Shared domains:** 44 checks. `shared_domains.c` agrees with an
+  independent Python statement of the rule on 18,293 suffixes, every parent
+  of a list entry among them, and encodes all 440 Unicode labels in the list
+  as Python does. The pinned lists, a list in `data/` that is not the
+  release's, a list named on the command line, a cut-off list, and the
+  audit's own check of each wildcard.
+- **The stub, with real clients as the agent:** 34 checks.
   - Clients: Python, curl, Node (`dns.lookup` and `dns.resolve4`), Go,
     Java and a static musl binary.
   - Each resolves a name a wildcard allows through the stub and connects,
@@ -93,20 +103,24 @@ genuinely unsafe action to SATISFIED**).
   - A name outside every rule fails within 50 ms, and a recording upstream
     server receives no question for it.
   - TXT questions, TCP fallback and a connect to 127.0.0.1:53 are covered.
-- **Budgets:** 12 checks. A DNS-tunnel style client is held to `names=`,
-  `rate=` and the label budget, every refusal is recorded, and edited
-  streams fail the audit.
-- **Many names on one address:** 7 checks. 40 names on one address all
+  - A TCP connect to the stub that never completes does not hold up the
+    Warden.
+- **Budgets:** 21 checks. A DNS-tunnel style client is held to `names=`,
+  `rate=` and the label budget, names re-asked after their TTL are held to
+  `rate=`, every refusal is recorded, and ten kinds of edited stream fail
+  the audit.
+- **Many names on one address:** 10 checks. 40 names on one address all
   fetch, their connects are recorded hashed, and the audit accepts the run.
   A forged resolution record fails the audit. A name that expires unasked
   is recorded as retired, and a later connect to its address under another
-  name is accepted.
+  name is accepted. 20 names whose grace ends together just before a
+  connect leave an honest run that passes the audit.
 
-**Regression.** Against the v1.24 Warden, parsers and audit, the suite fails
-108 of its 132 checks. Of the 24 it passes, 20 are the shared-domain unit
-test, which does not involve the Warden. The other 4 pass trivially because
-the old Warden refuses the policy: the oracle agrees on refusing it, a
-lint check on an ordinary wildcard, and two checks that no question left
+**Regression.** Against the v1.24.0 Warden, parsers and audit, the suite
+fails 129 of its 161 checks. Of the 32 it passes, 28 test the shared-domain
+lists and code, which do not involve the Warden. The other 4 pass trivially
+because the old Warden refuses the policy: the oracle agrees on refusing it,
+a lint check on an ordinary wildcard, and two checks that no question left
 the host.
 
 `make crosscheck` passes with 0 disagreements, with wildcards, budgets and
@@ -147,8 +161,12 @@ over 40 names on one address.
   - on resolution records: `dynamic`, and `"a":"retired"` for a name that
     expired unasked;
   - on connects: `candidates_n` and `candidates_sha256`, past 15 candidates.
-- New records and rules: `dns_question`, and the rules `dns_stub`,
-  `wildcard_budget`, `netsvc_view` and `svc_view`.
+- New records and rules: `dns_question` (with `new`, `upstream` and
+  `mono_ms`), and the rules `dns_stub`, `wildcard_budget`, `netsvc_view` and
+  `svc_view`. Resolution records may say `retired`, `grace_end` or
+  `unanswered`. `run_start` adds `shared_lists_pinned`.
+- `vdp_cert_check rules` prints five more columns: wildcard, policy line,
+  `names=`, `rate=` and the rule's constant.
 - `varek refusals` lists budget refusals as BUDGET. `varek policy show`
   lists each wildcard rule's budgets, and says the agent's lookups under
   it leave the host.
@@ -157,29 +175,136 @@ over 40 names on one address.
 
 ## Found in review
 
-PENDING.
+Four AI review agents (Claude), separate from the session that wrote the
+code, each reviewed one part of the change (v1.24 to this release) and had
+to reproduce every finding:
+- the stub resolver and the resolution table;
+- what a malicious agent can do;
+- the three policy parsers and the shared-domain lists;
+- the audit.
+
+The agents are the same kind of model that wrote much of this code, so this
+is not an independent human review. It found real defects, listed below, but
+it does not replace a human or third-party review. The stub reviewer's
+end-to-end tests were cut short; its one finding was reproduced here.
+
+Every finding below is fixed, and `make test-v1250` covers it. Against the
+code the review was given, 25 of its checks fail (one of them only because
+an audit message was reworded).
+
+**The shared-domain refusal.**
+- **A wildcard over the parent of a shared domain loaded (high).** Two
+  reviewers found it. `*.salesforce.com` covers `evil.my.salesforce.com`,
+  `*.core.windows.net` an attacker's blob account, `*.on.aws` anyone's
+  Lambda URL. 276 such parents were accepted, and the bases of the Public
+  Suffix List's `*.x` rules (`*.kawasaki.jp`). A suffix with any list entry
+  under it is now refused, naming the entry.
+- **The lists were not pinned (medium).** A cut-off or substituted list
+  quietly refused less, and nothing downstream noticed. The release's
+  SHA-256 values are now in the Warden: lists in `data/` that differ stop
+  it, lists named with `--psl` or `--shared-domains` are used and recorded
+  as not pinned, and a Public Suffix List without its end marker is
+  refused. The audit checks each wildcard again against the release's lists.
+- **Missing multi-tenant domains (medium).** The VAREK list gains 25: Azure
+  storage, key vault and OpenAI endpoints, Databricks, Snowflake, MongoDB
+  Atlas, Firebase, R2, B2, Wasabi, `onmicrosoft.com`, Okta previews,
+  tunnels such as `loca.lt`, and `amazonaws.com.cn`.
+
+**The Warden.**
+- **Re-asked names were an unbounded channel (medium).** A name asked again
+  after its TTL went upstream with no charge, so which names an agent
+  re-asked, and when, carried data out without end. A reviewer sent
+  `SECRET-KEY=hunter2` through a `names=4` rule this way. Every lookup sent
+  upstream now counts against `rate=`.
+- **The agent could stall the Warden (medium).** A TCP connect to the stub
+  was made on the agent's own blocking socket in the Warden's loop. With
+  `TCP_MD5SIG` (the stub's listener drops every SYN) and a long
+  `TCP_SYNCNT`, every other decision waited: 6.6 s here, hours with
+  `TCP_SYNCNT=127`. It failed closed. The connect is now non-blocking and,
+  if still in progress, finished as a pending operation, answered as the
+  kernel would.
+- **The agent could make an honest run fail the audit (low).** Grace was
+  recorded in whole seconds, so names ending their grace together near a
+  connect could not be told in or out. The Warden now records each end of
+  grace (`grace_end`) before the connect decided at that time, and a lookup
+  still out at the end of the run (`unanswered`).
+- **A spent budget on a failed add (low).** A new name the table could not
+  add kept its charge; it is now undone.
+
+**The audit accepted forged streams.** These are streams edited by someone
+who holds the log but not the signing key, with the hash chain recomputed.
+- **A connect forged as a stub connect passed (high).** The audit accepted
+  `dns_stub` to whatever address `run_start` named, with no certificate,
+  even in a policy with no wildcard. It is now accepted only with a wildcard
+  allow rule, and only to `127.53.53.53:53`.
+- **A denied name could be shown answered (medium).** The audit trusted
+  each question's rule and line; they are now asked of the checker, as the
+  stub decides them.
+- **A question and its charge could be hidden (medium)** by deleting the
+  questions and the resolution's `dynamic` mark. A resolution that is not
+  dynamic must now be of a name a host rule names.
+- **Rate refusals could become charges (medium)** by moving their
+  timestamps. The rate window is now counted on the Warden's own monotonic
+  time, which may not go back.
+- **Hostile streams took hours (medium).** The rate window was quadratic,
+  and hashed candidates tried up to 4,096 subsets each. Both are now linear.
+- **A lookup's answer could be dropped (low).** Every lookup sent upstream
+  must now be answered before `run_end`.
+- **A bare carriage return (low).** The audit and `varek policy show` split
+  policy lines on `\r` where the Warden does not, so they read different
+  budgets. Both now take the rules from the checker.
+- **Malformed fields crashed the audit (low)** and `varek refusals`; they
+  are now problems in the report.
+
+**Also fixed in v1.24.0.** Two defects the review found are in v1.24.0
+too, and are fixed there before its tag:
+- `varek_cyclonedx.py` refused every honest stream with host views (they
+  are now reported apart from the decisions);
+- the special addresses lacked cloud metadata services outside link-local
+  (`100.100.100.200`, `fd00:ec2::254`), `::/96` and NAT64 forms.
+
+**The parsers: no disagreement.** The decision procedure, the certificate
+checker and the cross-check oracle agreed on about 1,700 hand-written
+policies at every boundary of the grammar, and on 600 more fuzzed ones; an
+ASan/UBSan build of `shared_domains.c` read 300 hostile list files cleanly.
+
+**Not fixed, and stated.** A deny wildcard holds on names only (see Known
+limits). Two smaller notes were left as they are: each question scans up to
+4,096 dynamic names, and nothing limits how fast an agent adds question
+records (it can add records as fast with file opens).
 
 ## Known limits
 
 - **The name channel is bounded, not closed.** Within its budgets, the
   labels an agent chooses reach the domain's DNS servers and the host's
   resolver. The domain's DNS may be run by a provider other than the
-  party behind the API. At the defaults this is at most about 10.5 KB a
-  rule a run, and 1.2 KB a minute. The v1.26 egress proxy decides on the
-  name without a lookup by the agent.
+  party behind the API. At the defaults, per rule:
+  - new names carry at most about 10.5 KB a run, at most 1.2 KB a minute;
+  - after that, the choice of names asked again carries at most about 30
+    bytes a minute (8 bits a lookup, 30 lookups a minute), about 43 KB a
+    day;
+  - the timing of each lookup can carry a few bits more.
+
+  The v1.26 egress proxy decides on the name without a lookup by the agent.
+- **A deny wildcard holds on names only.** `deny host *.internal.example.com`
+  refuses names under it that the agent asks for, but its hosts cannot be
+  resolved in advance. So an allowed name that is a CNAME to one of them, or
+  shares an address with one, still connects. An exact deny holds on
+  addresses. For an address-level deny, write the names exactly, or deny the
+  addresses.
 - **Shared CDN addresses**, as in v1.24: a name decides which addresses
   the agent may reach, not which site it asks for there.
 - **The shared-domain lists are snapshots.** A domain where anyone can
   register names, and which neither list holds, is not refused. The VAREK
-  list is reviewed each release.
+  list is reviewed each release. Lists named with `--psl` or
+  `--shared-domains` are the operator's; `run_start` says so, and the
+  audit checks each wildcard against the release's lists anyway.
 - **Without a network namespace of its own** for the agent there is no
   stub, and names that only a wildcard allows do not resolve. The Warden
   says so at startup.
 - **A port that only a glob over ports allows** is not tried when the stub
   decides whether to answer a name. Such a name gets NXDOMAIN, the safe
   side.
-- **Timing.** Re-asking a name already charged costs nothing against the
-  budgets. Its timing can carry a few bits, which no budget bounds.
 
 ## Upgrading
 
