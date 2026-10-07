@@ -2,8 +2,9 @@
 
 > **DRAFT, not released.** Two things stay open before this is tagged: the
 > latency figures, and a second 24-hour soak run on the Warden with the fix
-> the first run found. Each is marked **PENDING** below. The independent
-> review is done; its findings are fixed below.
+> the first run found. Each is marked **PENDING** below. The AI-agent
+> review is done, and its findings are fixed below. A human or third-party
+> review has not been done.
 
 Released PENDING · MIT · github.com/kwdoug63/varek
 
@@ -189,15 +190,19 @@ rather than the exception type alone.
 
 ## Found in review
 
-Four reviewers each took one part of the v1.24 change (v1.23.1 to this
-release) and read it fresh:
+Four AI review agents (Claude), separate from the session that wrote the
+code, each reviewed one part of the change (v1.23.1 to this release) and had
+to reproduce every finding:
 - the resolver and the resolution table;
 - what the agent can do;
 - the three policy parsers;
 - the audit.
 
-Each was asked to reproduce what they reported. Every finding below is
-fixed, and `make test-v1240` covers it: section 5 of the suite, plus 5 new
+The agents are the same kind of model that wrote much of this code, so this
+is not an independent human review. It found real defects, listed below, but
+it does not replace a human or third-party review.
+
+Every finding below is fixed, and `make test-v1240` covers it: section 5 of the suite, plus 5 new
 checks in the resolution table's unit test.
 
 **The audit accepted forged streams.** These are streams edited by someone
@@ -230,7 +235,7 @@ Two of them turned a refused connect into an allowed one.
 - **A name could lead to the host's own services (medium).** Whoever
   controls an allowed name's DNS could answer `127.0.0.1` or
   `169.254.169.254`, and the Warden dials from the host's network namespace.
-  A reviewer read a secret from a listener on the host's loopback that way.
+  A review agent read a secret from a listener on the host's loopback that way.
   - A connect to a loopback, link-local, unspecified or multicast address
     is now decided on the address alone (`"special_address": true`), so only
     a numeric rule can allow it.
