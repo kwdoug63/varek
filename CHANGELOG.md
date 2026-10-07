@@ -12,9 +12,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Added
 - v1.25.0, in progress (opt-in wildcard host names,
   `docs/security/v1.25-wildcard-host-names.md`), sections 1 to 4:
-  - Policy grammar: `allow host *.example.com[:port]` after
-    `require warden 1.25`, in the decision procedure, the certificate checker
-    and the cross-check oracle; held as a glob (`?*.example.com:443`), so it is
+  - Policy grammar: `allow host *.example.com[:port] acknowledge=dns-channel`
+    after `require warden 1.25`, in the decision procedure, the certificate
+    checker and the cross-check oracle. Every wildcard allow rule must carry
+    `acknowledge=dns-channel`, so the policy itself shows that the agent's
+    lookups under it leave the host; without it the policy is refused; held as a glob (`?*.example.com:443`), so it is
     decided, certified and fuzzed like any glob. The policy-grammar version is
     1.25.
   - An allow wildcard over a shared domain is refused at load: a public suffix
@@ -40,7 +42,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     views, `/etc/netsvc.conf` and `/etc/svc.conf`, keep c-ares (Node's
     `dns.resolve*`) from discarding its configuration.
   - Budgets on the name channel: `allow host *.example.com:443 names=64
-    rate=10` (defaults 256 new names a run and 30 a minute, and at most 63
+    rate=10 acknowledge=dns-channel` (defaults 256 new names a run and 30 a minute, and at most 63
     bytes before the suffix), parsed by all three parsers. A new name past a
     budget gets NXDOMAIN and is not looked up (`wildcard_budget`). Every
     question to the stub is a chained `dns_question` record, and `run_start`

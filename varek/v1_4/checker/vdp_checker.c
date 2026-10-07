@@ -461,8 +461,18 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
         while (r->npre < r->ng && r->g[r->npre].type == G_LIT) r->npre++;
         while (r->nsuf < r->ng && r->g[r->ng - 1 - r->nsuf].type == G_LIT) r->nsuf++;
     }
+    int ack = 0;            /* v1.25: acknowledge=dns-channel */
     for (int k = ci + 1; k < nt; k++) {
         const char *t = tok[k];
+        /* v1.25: a wildcard allow rule must acknowledge the name channel */
+        if (r->kind == VDPC_HOST && strncmp(t, "acknowledge=", 12) == 0) {
+            if (strcmp(t + 12, "dns-channel") != 0) return fail(err, en, name, ln, "unknown acknowledgment");
+            if (!r->wild || !r->allow)
+                return fail(err, en, name, ln, "an acknowledgment on a rule that is not a wildcard allow");
+            if (ack) return fail(err, en, name, ln, "acknowledgment given twice");
+            ack = 1;
+            continue;
+        }
         /* v1.25: the budgets of a wildcard allow rule (no part of any decision) */
         if (r->kind == VDPC_HOST && (strncmp(t, "names=", 6) == 0 || strncmp(t, "rate=", 5) == 0)) {
             int nm = t[0] == 'n';
@@ -497,6 +507,8 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
         r->mask |= m;
         r->value |= v & m;
     }
+    if (r->kind == VDPC_HOST && r->wild && r->allow && !ack)
+        return fail(err, en, name, ln, "a wildcard allow without acknowledge=dns-channel");
     return 0;
 }
 

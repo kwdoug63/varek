@@ -9,7 +9,7 @@ under one suffix, fetching every minute. The run must show:
 
 | File | What it does |
 |---|---|
-| `soak.sh` | Runs the test: writes the policy (`allow host *.wikipedia.org:443`, default budgets), starts the Warden and the agent, then runs the checker. |
+| `soak.sh` | Runs the test: writes the policy (`allow host *.wikipedia.org:443 acknowledge=dns-channel`, default budgets), starts the Warden and the agent, then runs the checker. |
 | `soak_agent.py` | The agent: one fetch a minute, the names in turn, each resolved through the Warden's stub. |
 | `soak_check.py` | Judges the run and writes `report.txt`. |
 

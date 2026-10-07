@@ -857,8 +857,28 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
         }
         p->n++;             /* counted now so vdp_policy_free releases the glob */
 
+        bool ack = false;   /* v1.25: acknowledge=dns-channel */
         for (int i = ci + 1; i < nt; i++) {
             const char *t = tok[i];
+            /* v1.25: a wildcard allow rule must say it opens the name channel */
+            if (r->kind == VDP_KIND_HOST && !strncmp(t, "acknowledge=", 12)) {
+                if (strcmp(t + 12, "dns-channel") != 0) {
+                    rc = perr(err, errlen, path, lineno, "'%s': the only acknowledgment is "
+                              "acknowledge=dns-channel", t);
+                    goto out;
+                }
+                if (!r->s.wild || r->verb != VDP_ALLOW) {
+                    rc = perr(err, errlen, path, lineno,
+                              "'%s' applies only to wildcard allow rules", t);
+                    goto out;
+                }
+                if (ack) {
+                    rc = perr(err, errlen, path, lineno, "'%s' given twice", t);
+                    goto out;
+                }
+                ack = true;
+                continue;
+            }
             /* v1.25: names=N and rate=N, budgets of a wildcard allow rule */
             if (r->kind == VDP_KIND_HOST && (!strncmp(t, "names=", 6) || !strncmp(t, "rate=", 5))) {
                 bool is_names = t[0] == 'n';
@@ -909,6 +929,11 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             if (bv_add(&r->b, mask, value) < 0) {
                 rc = perr(err, errlen, path, lineno, "contradictory flag clause '%s'", t); goto out;
             }
+        }
+        if (r->kind == VDP_KIND_HOST && r->s.wild && r->verb == VDP_ALLOW && !ack) {
+            rc = perr(err, errlen, path, lineno, "a wildcard rule sends the agent's lookups out "
+                      "of the host; add acknowledge=dns-channel to allow it");
+            goto out;
         }
     }
 out:

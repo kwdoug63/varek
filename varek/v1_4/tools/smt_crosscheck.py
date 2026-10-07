@@ -518,8 +518,19 @@ def parse_lines(raw_lines, path):
                     raise PolicyError(f"{path}:{lineno}: glob tokens over the policy total")
             mask = value = 0
             budgets = {}
+            ack = False
             for t in toks[ci + 1:]:
                 bk, _, bv = t.partition("=")
+                if kind == "host" and bk == "acknowledge" and _:
+                    # v1.25: a wildcard allow rule acknowledges the name channel
+                    if bv != "dns-channel":
+                        raise PolicyError(f"{path}:{lineno}: unknown acknowledgment {t}")
+                    if not (wild and verb == "allow"):
+                        raise PolicyError(f"{path}:{lineno}: acknowledgment on a non-wildcard rule")
+                    if ack:
+                        raise PolicyError(f"{path}:{lineno}: acknowledgment twice")
+                    ack = True
+                    continue
                 if kind == "host" and bk in ("names", "rate") and _:
                     # v1.25: a wildcard allow rule's budgets (no part of a decision)
                     if not (wild and verb == "allow"):
@@ -546,6 +557,8 @@ def parse_lines(raw_lines, path):
                     raise PolicyError(f"{path}:{lineno}: contradictory")
                 mask |= m
                 value |= v & m
+            if kind == "host" and wild and verb == "allow" and not ack:
+                raise PolicyError(f"{path}:{lineno}: wildcard allow without acknowledge=dns-channel")
             portless = name = False
             if wild:
                 name = True
@@ -1044,6 +1057,11 @@ def fuzz_line(rng, prior, strings, wide):
                 clauses.append(rng.choice(FLAG_CLAUSES))
     elif rng.random() < 0.05:
         clauses.append("readonly")                     # must be refused on host/exec
+    if kind == "host" and rng.random() < (0.9 if c.startswith("*.") else 0.04):
+        # v1.25: the acknowledgment a wildcard allow needs (refused elsewhere)
+        clauses += rng.choice([["acknowledge=dns-channel"]] * 8 +
+                              [["acknowledge=dns"], ["acknowledge="],
+                               ["acknowledge=dns-channel", "acknowledge=dns-channel"]])
     line = " ".join([verb, kind] + ([matcher] if matcher else []) + [c] + clauses)
     if rng.random() < 0.05:
         line += "\r"                                   # CRLF
@@ -1075,12 +1093,23 @@ def fuzz_policy(rng, path):
         for _ in range(rng.randint(1, 8)):
             c = rng.choice(hosts + (bad if not valid and rng.random() < 0.3 else []))
             verb = rng.choice(['allow', 'deny'])
-            tail = ""
-            if rng.random() < 0.4 and (valid is False or (verb == "allow" and c.startswith("*."))):
+            opts = []
+            wild_allow = verb == "allow" and c.startswith("*.")
+            if rng.random() < 0.4 and (valid is False or wild_allow):
                 opts = rng.sample(good_b, rng.randint(1, 2))
                 if not valid and rng.random() < 0.4:
                     opts.append(rng.choice(bad_b + good_b))       # bad, or given twice
-                tail = " " + " ".join(opts)
+            # v1.25: the acknowledgment, where it is required and (when the
+            # policy may be invalid) missing, misspelt, twice or misplaced
+            if wild_allow and (valid or rng.random() < 0.7):
+                ack = ["acknowledge=dns-channel"]
+                if not valid and rng.random() < 0.2:
+                    ack.append(rng.choice(["acknowledge=dns-channel", "acknowledge=dns"]))
+                at = rng.randint(0, len(opts))
+                opts = opts[:at] + ack + opts[at:]
+            elif not valid and rng.random() < 0.1:
+                opts.append("acknowledge=dns-channel")
+            tail = (" " + " ".join(opts)) if opts else ""
             lines.append(f"{verb} host {c}{tail}")
         with open(path, "w", encoding="latin-1", newline="") as fh:
             fh.write("\n".join(lines) + "\n")

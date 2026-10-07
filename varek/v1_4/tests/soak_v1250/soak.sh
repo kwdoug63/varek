@@ -68,7 +68,7 @@ POL="$OUT/policy.txt"
 {
     echo "# v1.25 soak test policy (soak.sh)"
     echo "require warden 1.25"
-    echo "allow host *.$SUFFIX:$PORT"
+    echo "allow host *.$SUFFIX:$PORT acknowledge=dns-channel"
     for d in /usr/ /lib /etc/ssl/ /etc/ca-certificates/ /etc/pki/ "$AG/"; do echo "allow path $d readonly"; done
     echo "allow path /etc/ld.so.cache readonly"
 } > "$POL"

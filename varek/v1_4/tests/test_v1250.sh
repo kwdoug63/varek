@@ -71,39 +71,48 @@ refused() {
     else pass "refused: $1"; fi
 }
 R='require warden 1.25\n'
-accepted "a wildcard with a port"          "${R}allow host *.example.com:443\n"
-accepted "a wildcard without a port"       "${R}allow host *.example.com\n"
-accepted "a wildcard over three labels"    "${R}allow host *.api.example.com\n"
-accepted "a wildcard over an A-label"      "${R}allow host *.xn--bcher-kva.example\n"
-accepted "a deny wildcard"                 "${R}deny host *.internal.example.com\nallow host *.example.com\n"
+accepted "a wildcard with a port"          "${R}allow host *.example.com:443 acknowledge=dns-channel\n"
+accepted "a wildcard without a port"       "${R}allow host *.example.com acknowledge=dns-channel\n"
+accepted "a wildcard over three labels"    "${R}allow host *.api.example.com acknowledge=dns-channel\n"
+accepted "a wildcard over an A-label"      "${R}allow host *.xn--bcher-kva.example acknowledge=dns-channel\n"
+accepted "a deny wildcard"                 "${R}deny host *.internal.example.com\nallow host *.example.com acknowledge=dns-channel\n"
 accepted "v1.24 names still load"          "${R}allow host api.example.com:443\nallow host 10.0.0.1\n"
-refused "a wildcard before 1.25"           'require warden 1.24\nallow host *.example.com\n' "require warden 1.25"
-refused "a wildcard over one label"        "${R}allow host *.com\n"                "at least two labels"
+refused "a wildcard before 1.25"           'require warden 1.24\nallow host *.example.com acknowledge=dns-channel\n' "require warden 1.25"
+refused "a wildcard over one label"        "${R}allow host *.com acknowledge=dns-channel\n"                "at least two labels"
 refused "'*' inside a name"                "${R}allow host a.*.example.com\n"      "whole leftmost label"
 refused "'**.'"                            "${R}allow host **.example.com\n"       "whole leftmost label"
 refused "a bare '*'"                       "${R}allow host *\n"                    "whole leftmost label"
 refused "'*' as part of a label"           "${R}allow host *a.example.com\n"       "whole leftmost label"
-refused "uppercase"                        "${R}allow host *.Example.com\n"        "lowercase"
+refused "uppercase"                        "${R}allow host *.Example.com acknowledge=dns-channel\n"        "lowercase"
 refused "a U-label"                        "${R}allow host *.b\xc3\xbccher.example\n" "A-labels"
-refused "a trailing dot"                   "${R}allow host *.example.com.\n"       "trailing dot"
-refused "a bad port"                       "${R}allow host *.example.com:0443\n"   "port"
+refused "a trailing dot"                   "${R}allow host *.example.com. acknowledge=dns-channel\n"       "trailing dot"
+refused "a bad port"                       "${R}allow host *.example.com:0443 acknowledge=dns-channel\n"   "port"
 refused "require 1.26"                     "require warden 1.26\n"                 "this is 1.25"
 # Section 4: budgets on a wildcard allow rule
-accepted "names= and rate= on a wildcard"  "${R}allow host *.example.com:443 names=64 rate=10\n"
-accepted "the largest budgets"             "${R}allow host *.example.com names=100000 rate=10000\n"
+accepted "names= and rate= on a wildcard"  "${R}allow host *.example.com:443 names=64 rate=10 acknowledge=dns-channel\n"
+accepted "the largest budgets"             "${R}allow host *.example.com names=100000 rate=10000 acknowledge=dns-channel\n"
 refused "a budget on an exact name"        "${R}allow host api.example.com names=5\n"        "only to wildcard allow rules"
 refused "a budget on a deny wildcard"      "${R}deny host *.example.com rate=5\n"            "only to wildcard allow rules"
-refused "names=0"                          "${R}allow host *.example.com names=0\n"          "names must be 1 to 100000"
-refused "names over 100000"                "${R}allow host *.example.com names=100001\n"     "names must be 1 to 100000"
-refused "rate over 10000"                  "${R}allow host *.example.com rate=10001\n"       "rate must be 1 to 10000"
-refused "a leading zero"                   "${R}allow host *.example.com names=05\n"         "names must be 1 to 100000"
-refused "an empty budget"                  "${R}allow host *.example.com names=\n"           "names must be 1 to 100000"
-refused "a budget given twice"             "${R}allow host *.example.com names=5 names=6\n"  "given twice"
-refused "an unknown option"                "${R}allow host *.example.com nams=5\n"           "on a non-path rule"
+refused "names=0"                          "${R}allow host *.example.com names=0 acknowledge=dns-channel\n"          "names must be 1 to 100000"
+refused "names over 100000"                "${R}allow host *.example.com names=100001 acknowledge=dns-channel\n"     "names must be 1 to 100000"
+refused "rate over 10000"                  "${R}allow host *.example.com rate=10001 acknowledge=dns-channel\n"       "rate must be 1 to 10000"
+refused "a leading zero"                   "${R}allow host *.example.com names=05 acknowledge=dns-channel\n"         "names must be 1 to 100000"
+refused "an empty budget"                  "${R}allow host *.example.com names= acknowledge=dns-channel\n"           "names must be 1 to 100000"
+refused "a budget given twice"             "${R}allow host *.example.com names=5 names=6 acknowledge=dns-channel\n"  "given twice"
+refused "an unknown option"                "${R}allow host *.example.com nams=5 acknowledge=dns-channel\n"           "on a non-path rule"
+# acknowledge=dns-channel: every wildcard allow rule must carry it
+refused "a wildcard allow without the acknowledgment" "${R}allow host *.example.com:443\n"      "add acknowledge=dns-channel"
+refused "the acknowledgment missing on a second rule" "${R}allow host *.example.com acknowledge=dns-channel\nallow host *.example.org names=5\n" "add acknowledge=dns-channel"
+accepted "the acknowledgment before the budgets"      "${R}allow host *.example.com acknowledge=dns-channel names=5 rate=2\n"
+refused "another acknowledgment"           "${R}allow host *.example.com acknowledge=dns\n"          "the only acknowledgment is acknowledge=dns-channel"
+refused "the acknowledgment given twice"   "${R}allow host *.example.com acknowledge=dns-channel acknowledge=dns-channel\n" "given twice"
+refused "the acknowledgment on an exact name" "${R}allow host api.example.com acknowledge=dns-channel\n" "only to wildcard allow rules"
+refused "the acknowledgment on a deny"     "${R}deny host *.example.com acknowledge=dns-channel\n"   "only to wildcard allow rules"
+refused "the acknowledgment on a path rule" "${R}allow path /tmp/ acknowledge=dns-channel\n"         "unknown flag clause"
 
 # Decisions: the procedure's verdict, and the checker on its certificate.
 hx() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
-printf 'require warden 1.25\ndeny  host *.internal.example.com\nallow host a.example.com:80\nallow host *.example.com:443\nallow host *.example.org\n' > "$OUT/w.txt"
+printf 'require warden 1.25\ndeny  host *.internal.example.com\nallow host a.example.com:80\nallow host *.example.com:443 acknowledge=dns-channel\nallow host *.example.org acknowledge=dns-channel\n' > "$OUT/w.txt"
 for q in "a.example.com:443 SATISFIED" "x.y.example.com:443 SATISFIED" "example.com:443 UNKNOWN" \
          "a.example.com:80 SATISFIED" "b.example.com:80 UNKNOWN" "db.internal.example.com:443 UNSATISFIED" \
          "a.example.org:8080 SATISFIED" "example.org:8080 UNKNOWN" "aexample.com:443 UNKNOWN" \
@@ -159,7 +168,7 @@ for c in "com refused" "co.uk refused" "s3.amazonaws.com refused" "bucket.s3.ama
     got=$(printf '%s\n' "$1" | "$SDT" "$PSL" "$VL" cases)
     if [ "$got" = "$2" ]; then pass "*.$1: $2"; else flunk "*.$1: $got (want $2)"; fi
 done
-printf 'require warden 1.25\nallow host *.example.com:443\nallow host *.s3.amazonaws.com\nallow host *.acme.my.salesforce.com\ndeny host *.cloudfront.net\n' > "$OUT/s.txt"
+printf 'require warden 1.25\nallow host *.example.com:443 acknowledge=dns-channel\nallow host *.s3.amazonaws.com acknowledge=dns-channel\nallow host *.acme.my.salesforce.com acknowledge=dns-channel\ndeny host *.cloudfront.net\n' > "$OUT/s.txt"
 "$VDP" "$OUT/s.txt" lint > "$OUT/lint" 2>&1
 check "lint refuses a wildcard over the private section, naming the entry" \
     grep -q 's.txt:3: allow host \*.s3.amazonaws.com is refused: s3.amazonaws.com is a shared domain .*private section' "$OUT/lint"
@@ -171,13 +180,13 @@ if [ -n "$WARDEN" ]; then
     "$WARDEN" "$OUT/s.txt" --check-startup > "$OUT/ws" 2>&1
     check "the Warden refuses the policy at startup, naming the entry" \
         grep -q 'allow host \*.s3.amazonaws.com is refused' "$OUT/ws"
-    printf 'require warden 1.25\nallow host *.example.com:443\n' > "$OUT/ok.txt"
+    printf 'require warden 1.25\nallow host *.example.com:443 acknowledge=dns-channel\n' > "$OUT/ok.txt"
     check "the Warden accepts an ordinary wildcard" "$WARDEN" "$OUT/ok.txt" --check-startup
     "$WARDEN" "$OUT/s.txt" --psl /nonexistent --check-startup > "$OUT/wn" 2>&1
     check "a list it cannot read stops the Warden" grep -q 'cannot read /nonexistent' "$OUT/wn"
     if [ "$(id -u)" = 0 ]; then
         mkdir -p /tmp/varek_v1250 && chmod 755 /tmp/varek_v1250
-        printf 'require warden 1.25\nallow host *.example.com:443\nallow path /tmp/varek_v1250/\n' > "$OUT/run.txt"
+        printf 'require warden 1.25\nallow host *.example.com:443 acknowledge=dns-channel\nallow path /tmp/varek_v1250/\n' > "$OUT/run.txt"
         "$WARDEN" "$OUT/run.txt" -- /bin/true > /dev/null 2> "$OUT/run.log"
         psl=$(sha256sum "$PSL" | cut -c1-64); vl=$(sha256sum "$VL" | cut -c1-64)
         check "run_start records both lists' SHA-256" \
@@ -222,7 +231,7 @@ else
     [ -n "$JAVA" ] && PREFIXES="$PREFIXES $(dirname "$(dirname "$JAVA")")/ /etc/java-21-openjdk/ /etc/java-17-openjdk/"
     POL="$OUT/stub.policy"
     { printf 'require warden 1.25\n'
-      printf 'allow host *.%s:%s\n' "$SFX" "$HP"
+      printf 'allow host *.%s:%s acknowledge=dns-channel\n' "$SFX" "$HP"
       printf 'allow host 127.0.0.1:53\n'                    # refused anyway: not the stub
       for d in $PREFIXES; do printf 'allow path %s readonly\n' "$d"; done
       printf 'allow path /etc/ld.so.cache readonly\nallow path /tmp/hsperfdata_nobody/\n'
@@ -347,7 +356,7 @@ PY
     # A name a deny rule names under an allowed wildcard: the Warden resolves
     # it (so the deny holds on its addresses, v1.24 review), but the stub must
     # not answer it as if an allow rule named it.
-    printf 'require warden 1.25\ndeny host txt.%s\nallow host *.%s:%s\nallow path %s/ readonly\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\n' \
+    printf 'require warden 1.25\ndeny host txt.%s\nallow host *.%s:%s acknowledge=dns-channel\nallow path %s/ readonly\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\n' \
         "$SFX" "$SFX" "$HP" "$W" > "$OUT/denyw.policy"
     env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$OUT/denyw.policy" --dns-server "127.0.0.1:$PORT" \
         -- /usr/bin/python3 "$W/v1250_client.py" raw udp A "txt.$SFX" > "$OUT/denyw.out" 2> "$OUT/dw.log"
@@ -361,9 +370,9 @@ PY
     : > "$OUT/q.log"
     POL4="$OUT/budget.policy"
     { printf 'require warden 1.25\n'
-      printf 'allow host *.t.example.com:%s names=5 rate=100\n' "$HP"
-      printf 'allow host *.r.example.com:%s names=100 rate=3\n' "$HP"
-      printf 'allow host *.d.example.com:%s\n' "$HP"
+      printf 'allow host *.t.example.com:%s names=5 rate=100 acknowledge=dns-channel\n' "$HP"
+      printf 'allow host *.r.example.com:%s names=100 rate=3 acknowledge=dns-channel\n' "$HP"
+      printf 'allow host *.d.example.com:%s acknowledge=dns-channel\n' "$HP"
       printf 'allow path %s readonly\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\n' "$W/"
     } > "$POL4"
     # 63 bytes before the suffix (one label), and 64 (two labels: one label
@@ -443,8 +452,8 @@ PY
     printf '"x.short.example.com": {"ttl": 1, "a": ["%s"]}, "y.short.example.com": {"ttl": 300, "a": ["%s"]}}\n' "$HOSTIP" "$HOSTIP" >> "$OUT/zone.json"
     POL5="$OUT/many.policy"
     { printf 'require warden 1.25\n'
-      printf 'allow host *.many.example.com:%s names=100 rate=100\n' "$HP"   # 40 new names in seconds
-      printf 'allow host *.short.example.com:%s\n' "$HP"
+      printf 'allow host *.many.example.com:%s names=100 rate=100 acknowledge=dns-channel\n' "$HP"   # 40 new names in seconds
+      printf 'allow host *.short.example.com:%s acknowledge=dns-channel\n' "$HP"
       printf 'allow path %s readonly\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\n' "$W/"
     } > "$POL5"
     NAMES=""

@@ -647,7 +647,8 @@ def cmd_policy_show(args):
             if len(t) >= 3 and t[:2] == ["allow", "host"] and t[2].startswith("*."):
                 b = dict(x.split("=", 1) for x in t[3:] if "=" in x)
                 info(f"Wildcard {t[2]} (line {ln}): at most {b.get('names', '256')} new names a run, "
-                     f"{b.get('rate', '30')} a minute, 63 bytes before the suffix")
+                     f"{b.get('rate', '30')} a minute, 63 bytes before the suffix; "
+                     f"the agent's lookups under it leave the host (acknowledge=dns-channel)")
     info("Anything not allowed is UNKNOWN and refused.")
     return 0
 

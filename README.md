@@ -447,7 +447,7 @@ different risks at different points in the stack.
 - [x] **v1.23.0** — VAREK Enterprise on AWS Marketplace (AMI with Enterprise policy packs and a License Manager check)
 - [x] **v1.23.1** — The Enterprise license check works with Marketplace contract entitlements; deployment guide for AWS
 - [ ] **v1.24.0** (v1.21 stage 2) — Host names without agent DNS: the Warden resolves allowed names and serves a hosts view ([design](./docs/security/v1.21-stage2-host-names.md))
-- [ ] **v1.25.0** — Wildcard host names, opt-in (`allow host *.example.com:443`): shared domains where anyone can register names refused at load, lookups answered by the Warden and bounded per rule ([design](./docs/security/v1.25-wildcard-host-names.md))
+- [ ] **v1.25.0** — Wildcard host names, opt-in (`allow host *.example.com:443 acknowledge=dns-channel`): shared domains where anyone can register names refused at load, lookups answered by the Warden and bounded per rule ([design](./docs/security/v1.25-wildcard-host-names.md))
 - [ ] **v1.26.0** (v1.21 stage 3) — The egress proxy: decisions on the name the agent asks for (TLS SNI, HTTP Host), closing the shared-CDN gap with no agent DNS; opt-in inspecting mode with rules on method and path; chaining to a customer proxy ([design](./docs/security/v1.26-egress-proxy.md))
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
