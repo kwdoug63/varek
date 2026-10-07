@@ -245,12 +245,21 @@ def _canonical_dest(dest):
     return ip, port
 
 
+def _special_v4(o):
+    return (o[0] == 0 or o[0] == 127 or (o[0] == 169 and o[1] == 254) or o[0] >= 224
+            or o == bytes([100, 100, 100, 200]))
+
+
 def _special(ip):
     """warden_names.inc.c: special_address. A name never leads to these."""
+    o = ip.packed
     if ip.version == 4:
-        o = ip.packed
-        return o[0] == 0 or o[0] == 127 or (o[0] == 169 and o[1] == 254) or o[0] >= 224
-    return ip.is_unspecified or ip.is_loopback or ip.is_link_local or ip.is_multicast
+        return _special_v4(o)
+    if o[:12] == bytes(12) or ip == ipaddress.ip_address("fd00:ec2::254"):
+        return True
+    if o[:12] == bytes.fromhex("0064ff9b") + bytes(8) or o[:6] == bytes.fromhex("0064ff9b0001"):
+        return _special_v4(o[12:])
+    return ip.is_link_local or ip.is_multicast
 
 
 def _addrs(r, key):

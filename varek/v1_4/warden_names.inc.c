@@ -172,15 +172,7 @@ static void view_serve(int notify_fd, const struct seccomp_notif *req, struct ac
  * connect to one is decided on its address alone, so only a numeric rule can
  * allow it. Private ranges (10/8, 172.16/12, 192.168/16, fc00::/7) are not
  * here: internal APIs are reached by name there. */
-static bool special_address(const wr_ip_t *ip) {
-    const uint8_t *a = ip->a;
-    if (ip->fam == 4)
-        return a[0] == 0 || a[0] == 127 || (a[0] == 169 && a[1] == 254) || a[0] >= 224;
-    static const uint8_t zero[16];
-    if (!memcmp(a, zero, 15) && (a[15] == 0 || a[15] == 1)) return true;      /* ::, ::1 */
-    if (a[0] == 0xfe && (a[1] & 0xc0) == 0x80) return true;                  /* fe80::/10 */
-    return a[0] == 0xff;                                                       /* ff00::/8 */
-}
+static bool special_address(const wr_ip_t *ip) { return wr_special_address(ip); }
 
 /* The candidates of the connect being decided: the numeric destination, then
  * name:port for every name the address belongs to (v1.25: as many as there

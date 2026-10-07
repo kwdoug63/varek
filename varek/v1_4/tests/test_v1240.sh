@@ -261,6 +261,11 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
     check "a Unix socket connect still works (no candidates)" grep -q "^OK connect unix:$W/s.sock connected" "$OUT/py.out"
     check "python: the audit accepts the run" \
         python3 "$HERE/tools/varek_audit.py" --policy "$POL" --checker "$CERT" "$OUT/a.log"
+    # v1.25 review (also in v1.24.0): the views are answered with no rule
+    # (UNKNOWN -> ALLOW), and the exporter refused every such stream as
+    # breaking symmetric suppression. They are now reported apart.
+    check "python: the exporter accepts the run, views reported apart" \
+        sh -c "python3 '$HERE/tools/varek_cyclonedx.py' --log '$OUT/a.log' --policy '$POL' --output '$OUT/views.bom.json' && grep -q 'answered with the Warden.s views' '$OUT/views.bom.json' && ! grep -q '\"name\": \"/etc/hosts\"' '$OUT/views.bom.json'"
     cp "$OUT/a.log" "$OUT/py.log"
     # A forged stream: a connect with one of its address's names left out,
     # the chain recomputed (an editor without the signing key can do that).
@@ -405,7 +410,7 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
     # A name never leads to loopback, link-local (169.254.169.254, the cloud
     # metadata service), unspecified or multicast addresses: whoever controls
     # an allowed name's DNS could otherwise open the host's own services.
-    printf '{"loop.example.com": {"ttl": 30, "a": ["127.0.0.1"]}, "meta.example.com": {"ttl": 30, "a": ["169.254.169.254"]}, "evil.example.com": {"ttl": 30, "a": ["%s"]}, "mapped.example.com": {"ttl": 30, "aaaa": ["::ffff:%s"]}}\n' \
+    printf '{"loop.example.com": {"ttl": 30, "a": ["127.0.0.1"]}, "meta.example.com": {"ttl": 30, "a": ["169.254.169.254"]}, "evil.example.com": {"ttl": 30, "a": ["%s"]}, "mapped.example.com": {"ttl": 30, "aaaa": ["::ffff:%s"]}, "ali.example.com": {"ttl": 30, "a": ["100.100.100.200"]}, "ec2v6.example.com": {"ttl": 30, "aaaa": ["fd00:ec2::254"]}, "nat64.example.com": {"ttl": 30, "aaaa": ["64:ff9b::a9fe:a9fe"]}, "compat.example.com": {"ttl": 30, "aaaa": ["::a9fe:a9fe"]}}\n' \
         "$HOSTIP" "$HOSTIP" > "$OUT/zone.json"
     base() { printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path %s readonly\n' "$W/"; }
     { printf 'require warden 1.24\nallow host loop.example.com\nallow host meta.example.com\n'; base; } > "$OUT/sp.policy"
@@ -423,6 +428,32 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
     run5 "$OUT/sp2.policy" "$OUT/sp2.log" -- /usr/bin/python3 "$W/v1240_client.py" "$HP" "loop.example.com:$HP" > "$OUT/sp2.out"
     check "a numeric rule still allows it"  grep -q "^OK connect loop.example.com:$HP 200 " "$OUT/sp2.out"
     check "and the audit accepts both runs" sh -c "python3 '$HERE/tools/varek_audit.py' --policy '$OUT/sp.policy' --checker '$CERT' '$OUT/sp.log' && python3 '$HERE/tools/varek_audit.py' --policy '$OUT/sp2.policy' --checker '$CERT' '$OUT/sp2.log'"
+    # v1.25 review (also in v1.24.0): metadata services outside link-local
+    # (Alibaba's 100.100.100.200, AWS's fd00:ec2::254), and NAT64 or
+    # IPv4-compatible forms of 169.254.169.254, are special too. Each connect
+    # is decided before any dial, so this holds on a host with no IPv6 route.
+    { printf 'require warden 1.24\n'; for n in ali ec2v6 nat64 compat; do printf 'allow host %s.example.com\n' "$n"; done; base; } > "$OUT/sp3.policy"
+    run5 "$OUT/sp3.policy" "$OUT/sp3.log" -- /usr/bin/python3 "$W/v1240_client.py" "$HP" \
+        "ali.example.com:80" "ec2v6.example.com:80" "nat64.example.com:80" "compat.example.com:80" > "$OUT/sp3.out"
+    check "a name that resolves to 100.100.100.200 is decided on the address alone" \
+        grep -q '"resolved":"100.100.100.200:80","decision_raw":"UNKNOWN","decision_final":"DENY".*"special_address":true' "$OUT/sp3.log"
+    if python3 -c 'import socket; socket.socket(socket.AF_INET6)' 2>/dev/null; then
+        for t in '\[fd00:ec2::254\]:80' '\[64:ff9b::a9fe:a9fe\]:80' '\[::a9fe:a9fe\]:80'; do
+            check "a name that resolves to $t is decided on the address alone" \
+                grep -q "\"resolved\":\"$t\",\"decision_raw\":\"UNKNOWN\",\"decision_final\":\"DENY\".*\"special_address\":true" "$OUT/sp3.log"
+        done
+    else skip "IPv6 metadata and NAT64 names end to end (no IPv6 here; the table's unit test checks them)"; fi
+    check "the audit's special addresses are the Warden's" python3 -c "
+import ipaddress, sys
+sys.path.insert(0, '$HERE/tools')
+from varek_audit import _special
+cases = {'127.0.0.1': 1, '169.254.169.254': 1, '100.100.100.200': 1, '100.100.100.201': 0, '10.0.0.1': 0,
+         '::': 1, '::1': 1, '::a9fe:a9fe': 1, 'fe80::1': 1, 'ff02::1': 1, 'fd00:ec2::254': 1, 'fd00::1': 0,
+         '2001:db8::1': 0, '64:ff9b::a9fe:a9fe': 1, '64:ff9b::c000:202': 0, '64:ff9b:1::a9fe:a9fe': 1}
+bad = [a for a, w in cases.items() if bool(_special(ipaddress.ip_address(a))) != bool(w)]
+sys.exit(f'differ: {bad}' if bad else 0)"
+    check "and the audit accepts the run" \
+        python3 "$HERE/tools/varek_audit.py" --policy "$OUT/sp3.policy" --checker "$CERT" "$OUT/sp3.log"
 
     # A deny on a name no allow rule names: resolved too, so it holds on the
     # name's address (it was never resolved, so it never fired).

@@ -62,10 +62,12 @@ unsafe action to SATISFIED**).
 
 ## Tested with real clients
 
-`make test-v1240` runs 108 checks; CI runs it, with the Warden as root.
+`make test-v1240` runs 113 checks; CI runs it, with the Warden as root. On a
+host without IPv6, one of them (three IPv6 cases end to end) is skipped; the
+table's unit test checks those addresses instead.
 
 - **Grammar:** 28 accepted and refused forms, each in both parsers.
-- **Resolution table:** 86 checks against a local authoritative test server
+- **Resolution table:** 110 checks against a local authoritative test server
   (`tests/dns_test_server.py`) that rotates answers, follows CNAME chains,
   returns NXDOMAIN and SERVFAIL, and drops queries.
 - **Clients as the agent**, each resolving an allowed name through the views and
@@ -86,7 +88,7 @@ unsafe action to SATISFIED**).
   and a forged stream that the audit refuses.
 
 **Regression.** Against the v1.23.1 Warden, parsers and audit, the same suite
-fails 100 of its 108 checks. The 8 it passes do not test host names: a v1.21
+fails 104 of its 113 checks (one is skipped there, as here). The 8 it passes do not test host names: a v1.21
 compatibility case, the table's unit test (which does not involve the Warden),
 and checks that pass trivially because the old Warden refuses the policy
 outright.
@@ -304,6 +306,27 @@ Two of them turned a refused connect into an allowed one.
   helper's request queue was full. It now waits for the helper's answers.
 - **The version.** `run_start` said `1.23.1`; it now says `1.24.0`.
 
+**Found later, in the v1.25 review.** The same kind of review of v1.25 found
+two defects that v1.24.0 has too. Both are fixed here, before the tag:
+- **The exporter refused honest streams (medium).** A view is answered
+  with no rule, so its raw verdict is UNKNOWN and its final verdict ALLOW.
+  `varek_cyclonedx.py` took that as a broken symmetric-suppression invariant
+  and refused to export any run in which a glibc agent resolved a name,
+  unless the policy also allowed the resolver files. The audit passed the
+  same streams. The exporter now reports view answers apart from the
+  decisions ("answered with the Warden's views"), checks each is a
+  read-only open of its own path, and no longer lists `/etc/hosts` as an
+  authorized object.
+- **More addresses a name must not lead to (medium).** The special
+  addresses lacked cloud metadata services outside link-local (Alibaba
+  Cloud's `100.100.100.200`, AWS's IPv6 `fd00:ec2::254`), IPv4-compatible
+  addresses (`::/96`), and the NAT64 prefixes `64:ff9b::/96` and
+  `64:ff9b:1::/48` holding a special IPv4 address. Whoever controls an
+  allowed name's DNS could answer with one of them; each is now decided on
+  the address alone. `make test-v1240` checks
+  `100.100.100.200` end to end and every case in the table's unit test, and
+  that the audit's list is the Warden's.
+
 **The parsers: no disagreement.** The decision procedure, the certificate
 checker and the cross-check oracle agreed on:
 - about 200,000 name strings, covering every boundary of the name and port
@@ -336,8 +359,9 @@ its own, with the Warden opening files with the agent's uid and gid.
 - **Private addresses.** A name may lead to a private address (10/8,
   172.16/12, 192.168/16, fc00::/7). That is how internal APIs are reached by
   name, so whoever controls an allowed name's DNS can point it at a private
-  address the Warden's host can reach. Loopback, link-local, unspecified and
-  multicast addresses are reached only by numeric rules.
+  address the Warden's host can reach. Loopback, link-local, unspecified,
+  multicast and cloud metadata addresses (and their IPv4-compatible and
+  NAT64 forms) are reached only by numeric rules.
 - **Local resolvers over Unix sockets.** A policy that allows nscd's socket,
   systemd-resolved's or D-Bus gives the agent a resolver that sends DNS
   itself. Allow such sockets only with that in mind.

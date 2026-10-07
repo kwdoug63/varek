@@ -188,8 +188,8 @@ rule names itself, refreshes each at its TTL, and records every lookup in the
 verdict stream. The agent reads an `/etc/hosts` view that lists only the
 allowed names, and every connect to port 53 is refused, so the agent sends no
 DNS of its own. A connect is decided on its address and on each allowed name
-that address belongs to; a loopback, link-local, unspecified or multicast
-address is decided on the address alone, so only a numeric rule can allow it.
+that address belongs to; a loopback, link-local, unspecified, multicast
+or cloud metadata address is decided on the address alone, so only a numeric rule can allow it.
 A name decides where the agent connects, not which site it asks for there:
 an address on a shared content network also serves other sites, which the
 v1.26 egress proxy will close. See

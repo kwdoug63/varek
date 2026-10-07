@@ -7,6 +7,7 @@
 #include "../warden_resolve.h"
 
 #include <poll.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -344,6 +345,25 @@ int main(int argc, char **argv) {
         wr_async_stop(&t);
     }
     wr_table_free(&t);
+
+    /* v1.25 review: the special addresses, metadata and NAT64 forms included
+     * (the IPv6 ones cannot be dialed on a host without IPv6, so they are
+     * checked here). */
+    static const struct { const char *a; bool special; } sp[] = {
+        { "127.0.0.1", true }, { "169.254.169.254", true }, { "0.0.0.0", true },
+        { "224.0.0.1", true }, { "100.100.100.200", true }, { "100.100.100.201", false },
+        { "100.64.0.1", false }, { "10.0.0.1", false }, { "192.0.2.2", false },
+        { "::", true }, { "::1", true }, { "::a9fe:a9fe", true }, { "::c000:202", true },
+        { "fe80::1", true }, { "ff02::1", true }, { "fd00:ec2::254", true },
+        { "fd00:ec2::253", false }, { "fd00::1", false }, { "2001:db8::1", false },
+        { "64:ff9b::a9fe:a9fe", true }, { "64:ff9b::7f00:1", true }, { "64:ff9b::c000:202", false },
+        { "64:ff9b:1::a9fe:a9fe", true }, { "64:ff9b:1::c000:202", false },
+    };
+    for (size_t k = 0; k < sizeof sp / sizeof sp[0]; k++) {
+        wr_ip_t ip;
+        CHECK(wr_ip_parse(sp[k].a, &ip) == 0 && wr_special_address(&ip) == sp[k].special,
+              "special address %s: expected %d", sp[k].a, sp[k].special);
+    }
 
     printf("test_v1240_resolve: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

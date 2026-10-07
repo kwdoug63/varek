@@ -397,6 +397,31 @@ size_t wr_names_for(const wr_table_t *t, const wr_ip_t *ip, int64_t now, size_t 
     return k;
 }
 
+/* v1.24 review: the addresses a name never leads to (warden_names.inc.c):
+ * a connect to one is decided on the address alone. */
+static bool special_v4(const uint8_t *a) {
+    return a[0] == 0 || a[0] == 127 || (a[0] == 169 && a[1] == 254) || a[0] >= 224 ||
+           (a[0] == 100 && a[1] == 100 && a[2] == 100 && a[3] == 200);   /* Alibaba metadata */
+}
+
+/* v1.25 review: also the cloud metadata addresses outside link-local
+ * (100.100.100.200, fd00:ec2::254), IPv4-compatible addresses (::/96,
+ * deprecated, which some stacks reach as the IPv4 address), and NAT64
+ * prefixes (64:ff9b::/96, 64:ff9b:1::/48) holding a special IPv4 address. */
+bool wr_special_address(const wr_ip_t *ip) {
+    const uint8_t *a = ip->a;
+    if (ip->fam == 4) return special_v4(a);
+    static const uint8_t zero[12];
+    static const uint8_t nat64[12] = { 0x00, 0x64, 0xff, 0x9b };
+    static const uint8_t nat64l[6] = { 0x00, 0x64, 0xff, 0x9b, 0x00, 0x01 };
+    static const uint8_t ec2[16] = { 0xfd, 0x00, 0x0e, 0xc2, [14] = 0x02, [15] = 0x54 };
+    if (!memcmp(a, zero, 12)) return true;                                     /* ::/96: ::, ::1 */
+    if (!memcmp(a, ec2, 16)) return true;                                      /* fd00:ec2::254 */
+    if (!memcmp(a, nat64, 12) || !memcmp(a, nat64l, 6)) return special_v4(a + 12);
+    if (a[0] == 0xfe && (a[1] & 0xc0) == 0x80) return true;                  /* fe80::/10 */
+    return a[0] == 0xff;                                                       /* ff00::/8 */
+}
+
 void wr_ip_str(const wr_ip_t *ip, char *out, size_t n) {
     if (!inet_ntop(ip->fam == 4 ? AF_INET : AF_INET6, ip->a, out, (socklen_t)n) && n) out[0] = '\0';
 }
