@@ -1,6 +1,6 @@
 # VAREK — Threat Model
 
-Version: current as of v1.24.0 · MIT · github.com/kwdoug63/varek
+Version: current as of v1.25.0 · MIT · github.com/kwdoug63/varek
 
 This document states what VAREK defends, against whom, and what it explicitly
 does not defend. It is deliberately conservative: where a guarantee is
@@ -39,6 +39,12 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
   `--dns-server`. The Warden trusts its answers for the names a policy names
   and does not validate DNSSEC itself. Whoever controls an allowed name's DNS
   chooses which addresses the name allows (see §4, *Host names*, and §6).
+  From v1.25, under a wildcard rule, the agent's lookups reach that resolver
+  and the domain's DNS servers, which may be run by a DNS provider rather
+  than the party behind the API (see §4, *Wildcard host names*).
+- **Trust boundary 5 (v1.25):** the shared-domain lists shipped with the
+  release (the Public Suffix List and the VAREK list), which decide which
+  wildcard rules are refused at load.
 
 ## 3. Adversary models
 
@@ -195,6 +201,33 @@ Model-B techniques below, with the residual limits stated honestly.
     hash chain recomputed.
   - *What a name does not decide.* A name decides which addresses the agent
     may reach, not which site it asks for there (see §6).
+- **Wildcard host names, opt-in (v1.25).** A host rule may allow every name
+  under a domain (`allow host *.example.com:443 acknowledge=dns-channel`,
+  after `require warden 1.25`).
+  - *Opt-in, in the policy text.* Every wildcard allow rule must carry
+    `acknowledge=dns-channel`, or the policy is refused, so a reviewer
+    reading the policy sees that the agent's lookups under it leave the host.
+  - *Shared domains refused.* A wildcard allow over a public suffix, an entry
+    of the Public Suffix List's private section or under one, or an entry of
+    the VAREK list is refused at load, naming the entry. Both lists are
+    pinned, and their SHA-256 is in `run_start`.
+  - *One way to DNS.* The agent's lookups go to a stub resolver the Warden
+    runs at `127.53.53.53:53` in the agent's own network namespace. A name no
+    allow rule can reach gets NXDOMAIN, and no question leaves the host. A
+    name a wildcard allows is looked up by the Warden's resolver helper
+    when the agent asks, never on its own. Every other connect to port 53 is
+    refused, as in v1.24.
+  - *Bounded.* Each wildcard allow rule has budgets of new names a run and a
+    minute (defaults 256 and 30) and 63 bytes before the suffix. A new name
+    past a budget gets NXDOMAIN and is not looked up.
+  - *Recorded and audited.* Every question to the stub is a chained
+    `dns_question` record. `varek_audit.py` checks the budgets against the
+    policy file, every charge against them, and that every name looked up
+    was asked for.
+  - *Decided as in v1.24.* A connect is decided on its address and every
+    name it belongs to, with no limit on their number; past 15 the record
+    carries their count and SHA-256, and the audit rebuilds them from the
+    resolution records.
 
 The per-class status of every known bypass class is maintained in
 `docs/security/bypass-classes.md`.
@@ -251,8 +284,20 @@ are claimed as solved.
     files, not the views.
   - *Signatures.* A refresh that changes a name's addresses is signed at the
     next scheduled checkpoint, not at once.
-  - Wildcard names are refused at load; they are planned for v1.25.0
-    (`v1.25-wildcard-host-names.md`).
+- Wildcard host names (v1.25, `v1.25-wildcard-host-names.md`):
+  - *The name channel is bounded, not closed.* Within a rule's budgets, the
+    labels an agent chooses reach the host's resolver and the domain's DNS
+    servers. At the defaults that is at most about 41 bytes a name: about
+    10.5 KB a rule a run, and 1.2 KB a minute. Re-asking a name already
+    charged costs nothing, and its timing can carry a few bits that no
+    budget bounds. The v1.26 egress proxy decides on the name without a
+    lookup by the agent.
+  - *The lists are snapshots.* A domain where anyone can create a name, and
+    that neither list holds, is not refused; such a wildcard allows the
+    names an attacker registers there. The VAREK list is reviewed each
+    release.
+  - *No stub without a network namespace.* Without one of its own for the
+    agent, names that only a wildcard allows do not resolve.
 - File opens run as root (pre-dates v1.24, found in the v1.24 review). The
   Warden opens a file for the agent with its own credentials, so a path the
   policy lets the agent write is writable even when the file is root-owned
