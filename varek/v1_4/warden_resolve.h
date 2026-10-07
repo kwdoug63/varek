@@ -57,6 +57,8 @@ typedef enum {
     WR_ST_NXDOMAIN,                /* the name does not exist */
     WR_ST_FAIL,                    /* timeout, SERVFAIL, refused, malformed */
     WR_ST_RETIRED,                 /* v1.25, records only: a dynamic entry's TTL passed unasked */
+    WR_ST_GRACE_END,               /* v1.25 review, records only: an address's grace ended */
+    WR_ST_UNANSWERED,              /* v1.25 review, records only: a lookup the run ended before */
 } wr_status_t;
 
 typedef struct {
@@ -180,6 +182,9 @@ void wr_ip_str(const wr_ip_t *ip, char *out, size_t n);
  * link-local), IPv4-compatible (::/96), and NAT64 forms of these: a name never
  * leads to them, only a numeric rule does. */
 bool wr_special_address(const wr_ip_t *ip);
+/* v1.25 review: drop addresses whose grace ended by now; done(ctx, i) for each
+ * entry that changed (after the generation is bumped). Returns their number. */
+size_t wr_grace_due(wr_table_t *t, int64_t now, void (*done)(void *ctx, size_t i), void *ctx);
 
 /* Parse "a.b.c.d" or an IPv6 address (no brackets). 0 or -1. */
 int  wr_ip_parse(const char *s, wr_ip_t *ip);

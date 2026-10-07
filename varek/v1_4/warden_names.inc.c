@@ -220,7 +220,11 @@ static int names_candidates(struct action *a, int fam, const void *addr, unsigne
         a->special_addr = true;          /* decided as a number (special_address) */
         return 0;
     }
-    size_t n = wr_names_for(&g_names, &ip, wr_now_ms(), g_cand_idx, g_cand_cap - 1);
+    /* v1.25 review: record the grace that has ended before deciding, at the
+     * same time the decision uses */
+    int64_t now = wr_now_ms();
+    wr_grace_due(&g_names, now, emit_grace_end, &now);
+    size_t n = wr_names_for(&g_names, &ip, now, g_cand_idx, g_cand_cap - 1);
     if (n > g_cand_cap - 1) return -1;               /* cannot happen: at most g_names.n */
     for (size_t k = 0; k < n; k++)
         snprintf(g_cand[a->ncand++], sizeof g_cand[0], "%s:%u", g_names.e[g_cand_idx[k]].name, port);

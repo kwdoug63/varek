@@ -219,6 +219,16 @@ if [ -n "$WARDEN" ]; then
         check "and that they are the lists this release ships" grep -q '"shared_lists_pinned":true' "$OUT/run.log"
         check "run_start reports the Warden as 1.25.0" grep -q '"event":"run_start",[^}]*"warden":"1.25.0"' "$OUT/run.log"
         check "the policy grammar is reported as v1.25" grep -q 'loaded policy default v1.25 ' "$OUT/run.log"
+        # v1.25 review: the audit re-checks each wildcard against this
+        # release's lists. A Warden given a list without my.salesforce.com
+        # loads *.acme.my.salesforce.com; the audit says it must be refused.
+        printf 'require warden 1.25\nallow host *.acme.my.salesforce.com:443 acknowledge=dns-channel\nallow path /tmp/varek_v1250/\n' > "$OUT/sf.txt"
+        mkdir -p /tmp/varek_v1250 && chmod 755 /tmp/varek_v1250
+        "$WARDEN" "$OUT/sf.txt" --shared-domains "$OUT/inst/data/varek_shared_domains.txt" -- /bin/true > /dev/null 2> "$OUT/sf.log"
+        python3 "$HERE/tools/varek_audit.py" --policy "$OUT/sf.txt" --checker "$CERT" "$OUT/sf.log" > "$OUT/sf.out" 2>&1
+        check "the audit refuses a wildcard the release's lists refuse, whatever list the Warden had" \
+            sh -c "grep -q 'a wildcard the Warden must refuse' '$OUT/sf.out' && grep -q 'varek_audit: FAIL' '$OUT/sf.out'"
+        check "and notes the lists were the operator's" grep -q 'note: the Warden checked wildcards against shared-domain lists named' "$OUT/sf.out"
         rm -rf /tmp/varek_v1250
     else skip "run_start (needs root)"; fi
 else skip "the Warden's startup checks (no warden binary given)"; fi
@@ -451,8 +461,9 @@ PY
         sh -c "[ \$(grep -c '\"event\":\"dns_question\".*\"chain\":\"' '$OUT/b.log') -ge 22 ]"
     check "the audit accepts the run, budgets and all" \
         python3 "$HERE/tools/varek_audit.py" --policy "$POL4" --checker "$CERT" "$OUT/b.log"
-    tamper() {   # tamper <python expression on body> <out>: edit records, recompute the chain
-        python3 - "$OUT/b.log" "$2" "$1" <<'PY'
+    tamper() { tamper_from "$OUT/b.log" "$@"; }
+    tamper_from() {   # tamper_from <log> <python expression on body> <out>: edit records, recompute the chain
+        python3 - "$1" "$3" "$2" <<'PY'
 import hashlib, sys
 src, dst, expr = sys.argv[1], sys.argv[2], sys.argv[3]
 head = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
@@ -469,19 +480,59 @@ for line in open(src, encoding="utf-8", errors="surrogateescape"):
 open(dst, "w", encoding="utf-8", errors="surrogateescape").write("".join(out))
 PY
     }
-    refused_by_audit() {   # refused_by_audit <forged log> <message>
-        if python3 "$HERE/tools/varek_audit.py" --policy "$POL4" --checker "$CERT" "$1" > "$1.out" 2>&1; then return 1; fi
-        grep -q "$2" "$1.out"
+    refused_by_audit() {   # refused_by_audit <forged log> <message> [policy]
+        if python3 "$HERE/tools/varek_audit.py" --policy "${3:-$POL4}" --checker "$CERT" "$1" > "$1.out" 2>&1; then return 1; fi
+        grep -q "$2" "$1.out" && ! grep -q Traceback "$1.out"
     }
     tamper '(None if "\"name\":\"c1.t.example.com\"" in body and "\"answer\":\"lookup\"" in body else body)' "$OUT/t1.log"
     check "the audit refuses a stream with a question removed (a lookup nobody asked for)" \
-        refused_by_audit "$OUT/t1.log" "with no question asking for it"
+        refused_by_audit "$OUT/t1.log" "with no question sending it upstream"
     tamper 'body.replace("\"names\":5,", "\"names\":50,")' "$OUT/t2.log"
     check "the audit refuses run_start budgets that are not the policy's" \
         refused_by_audit "$OUT/t2.log" "are not the policy's"
     tamper '(body.replace("\"rule\":\"wildcard_budget\",\"policy_line\":2,\"budget\":\"names\",", "\"rule\":\"policy_match\",\"policy_line\":2,\"new\":true,", 1) if not state["done"] and "\"budget\":\"names\"" in body and not state.update(done=True) else body)' "$OUT/t3.log"
     check "the audit refuses a sixth name charged to a names=5 rule" \
         refused_by_audit "$OUT/t3.log" "charged more than its 5 names"
+    # v1.25 review: more forged streams the audit must refuse
+    tamper '(None if "\"name\":\"c1.t.example.com\"" in body and "dns_question" in body else body.replace("\"dynamic\":true,", "") if "\"name\":\"c1.t.example.com\"" in body else body)' "$OUT/t4.log"
+    check "the audit refuses a lookup hidden by dropping its questions and \"dynamic\"" \
+        refused_by_audit "$OUT/t4.log" "no host rule names it and no question asked"
+    tamper '(body[:body.index("\"mono_ms\":") + 10] + "0" + body[body.index(",", body.index("\"mono_ms\":")):] if "\"name\":\"c5.t.example.com\"" in body and "\"mono_ms\":" in body else body)' "$OUT/t5.log"
+    check "the audit refuses questions whose Warden time goes back (a moved rate window)" \
+        refused_by_audit "$OUT/t5.log" "earlier than the one before it"
+    tamper '(None if "\"event\":\"resolution\"" in body and "\"name\":\"ok.d.example.com\"" in body else body)' "$OUT/t6.log"
+    check "the audit refuses a lookup whose answer was removed" \
+        refused_by_audit "$OUT/t6.log" "was never answered"
+    tamper 'body.replace("\"wildcard_budgets\":[", "\"wildcard_budgets\":5,\"x\":[")' "$OUT/t7.log"
+    check "the audit gives a verdict, not a traceback, on a malformed field" \
+        refused_by_audit "$OUT/t7.log" "are not the policy's"
+    tamper_from "$OUT/e.log" '(body.replace("\"rule\":\"policy_match\"", "\"rule\":\"dns_stub\"") if "\"net.connect\"" in body else body.replace("\"host_name_rules\":true,", "\"host_name_rules\":true,\"dns_stub\":\"127.53.53.53:53\",") if "run_start" in body else body)' "$OUT/t8.log"
+    check "the audit refuses a connect forged as a stub connect, with no wildcard rule" \
+        refused_by_audit "$OUT/t8.log" "dns_stub" "$OUT/exact.policy"
+    tamper_from "$OUT/dw.log" '(body.replace("\"rule\":\"no_rule\",\"policy_line\":-1", "\"rule\":\"policy_match\",\"policy_line\":3").replace("\"answer\":\"nxdomain\"", "\"answer\":\"noerror\",\"addresses\":[]") if "dns_question" in body and "\"name\":\"txt." in body else body)' "$OUT/t9.log"
+    check "the audit refuses a denied name recorded as answered by the wildcard" \
+        refused_by_audit "$OUT/t9.log" "allows it by no rule" "$OUT/denyw.policy"
+
+    # v1.25 review: a name asked again after its TTL goes upstream again, and
+    # that lookup counts against the rule's rate. Through d69e330 it was not
+    # charged, so re-asking chosen names carried data out without a bound.
+    printf '{' > "$OUT/zone.json"
+    for i in 0 1 2 3; do printf '"n%s.rl.example.com": {"ttl": 1, "a": ["%s"]},' "$i" "$HOSTIP"; done >> "$OUT/zone.json"
+    printf '"ok.d.example.com": {"ttl": 30, "a": ["%s"]}}\n' "$HOSTIP" >> "$OUT/zone.json"
+    : > "$OUT/q.log"
+    { printf 'require warden 1.25\nallow host *.rl.example.com:%s names=10 rate=4 acknowledge=dns-channel\n' "$HP"
+      printf 'allow path %s readonly\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\n' "$W/"
+    } > "$OUT/rl.policy"
+    env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$OUT/rl.policy" --dns-server "127.0.0.1:$PORT" \
+        --dns-ttl-min 1 --dns-grace-max 1 -- /usr/bin/python3 "$W/v1250_client.py" ask \
+        n0.rl.example.com n1.rl.example.com n2.rl.example.com n3.rl.example.com sleep:2.2 \
+        n0.rl.example.com n1.rl.example.com n2.rl.example.com n3.rl.example.com > "$OUT/rl.out" 2> "$OUT/rl.log"
+    check "names asked again after their TTL charge rate=4: 4 lookups upstream in the minute, not 8" \
+        sh -c "[ \$(grep '^1 ' '$OUT/q.log' | grep -c '\.rl\.example\.com\$') = 4 ]"
+    check "and the re-asks past it are refused (wildcard_budget, rate)" \
+        grep -q '"rule":"wildcard_budget","policy_line":2,"budget":"rate"' "$OUT/rl.log"
+    check "the audit accepts the run" \
+        python3 "$HERE/tools/varek_audit.py" --policy "$OUT/rl.policy" --checker "$CERT" "$OUT/rl.log"
 
     echo "== 4b. many names on one address, and names that expire unasked =="
     # 40 per-tenant names served from one address (as a CDN serves them):
@@ -536,6 +587,24 @@ PY
         grep -q '"name":"x.short.example.com","a":"retired","aaaa":"retired","addresses":\[\]' "$OUT/s.log"
     check "and the audit accepts the later connect" \
         python3 "$HERE/tools/varek_audit.py" --policy "$POL5" --checker "$CERT" "$OUT/s.log"
+    # v1.25 review: an agent could make an honest run fail the audit. Grace
+    # was recorded in whole seconds, so names whose grace ended together near
+    # a connect could not be told in or out, and more than 12 such names was a
+    # problem. The Warden now records each end of grace (grace_end).
+    printf '{' > "$OUT/zone.json"
+    for i in $(seq 0 19); do printf '"e%s.edge.example.com": {"ttl": 1, "a": ["%s"]},' "$i" "$HOSTIP"; done >> "$OUT/zone.json"
+    printf '"y.edge.example.com": {"ttl": 300, "a": ["%s"]}}\n' "$HOSTIP" >> "$OUT/zone.json"
+    { printf 'require warden 1.25\nallow host *.edge.example.com:%s names=100 rate=100 acknowledge=dns-channel\n' "$HP"
+      printf 'allow path %s readonly\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\n' "$W/"
+    } > "$OUT/edge.policy"
+    EDGE=""; for i in $(seq 0 19); do EDGE="$EDGE e$i.edge.example.com"; done
+    for wait in 1.3 1.6 2.0; do
+        env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$OUT/edge.policy" --dns-server "127.0.0.1:$PORT" \
+            --dns-ttl-min 1 --dns-grace-max 1 -- /usr/bin/python3 "$W/v1250_client.py" fetch "$HP" $EDGE \
+            "sleep:$wait" y.edge.example.com > /dev/null 2> "$OUT/edge.log"
+        check "20 names ending their grace together $wait s before a connect: the audit accepts the run" \
+            python3 "$HERE/tools/varek_audit.py" --policy "$OUT/edge.policy" --checker "$CERT" "$OUT/edge.log"
+    done
     rm -rf "$W"
 fi
 

@@ -135,6 +135,26 @@ size_t wr_retire_due(wr_table_t *t, int64_t now, void (*done)(void *ctx, size_t 
     return n;
 }
 
+/* v1.25 review: drop the addresses whose grace has ended by now; for each
+ * entry that lost one, bump the generation and call done. So the records say
+ * exactly which names an address belongs to when a connect is decided, and
+ * the audit never has to guess from grace rounded to whole seconds. */
+size_t wr_grace_due(wr_table_t *t, int64_t now, void (*done)(void *ctx, size_t i), void *ctx) {
+    size_t n = 0;
+    for (size_t i = 0; i < t->n; i++) {
+        wr_entry_t *e = &t->e[i];
+        size_t w = 0;
+        for (size_t k = 0; k < e->n; k++)
+            if (e->addrs[k].until_ms == 0 || e->addrs[k].until_ms > now) e->addrs[w++] = e->addrs[k];
+        if (w == e->n) continue;
+        e->n = w;
+        t->generation++;
+        if (done) done(ctx, i);
+        n++;
+    }
+    return n;
+}
+
 void wr_table_free(wr_table_t *t) {
     if (t->async) wr_async_stop(t);
     for (size_t i = 0; i < t->n; i++) free(t->e[i].addrs);
@@ -288,7 +308,13 @@ bool wr_apply(wr_table_t *t, size_t i, const wr_result_t *r, int64_t now) {
     wr_entry_t *e = &t->e[i];
     e->pending = false;
     e->lookups++;
-    wr_expire(t, now);
+    /* v1.25 review: only this entry's ended grace is dropped here (its own
+     * resolution record follows); other entries keep theirs until
+     * wr_grace_due records the end, so no name leaves an address unrecorded */
+    size_t w = 0;
+    for (size_t k = 0; k < e->n; k++)
+        if (e->addrs[k].until_ms == 0 || e->addrs[k].until_ms > now) e->addrs[w++] = e->addrs[k];
+    e->n = w;
     uint32_t old_ttl = e->ttl_last ? e->ttl_last : e->ttl_eff;
     int64_t grace_until = now + (int64_t)(old_ttl < t->cfg.grace_max ? old_ttl : t->cfg.grace_max) * 1000;
     bool changed = false;
@@ -459,6 +485,8 @@ static const char *st_name(wr_status_t s) {
         case WR_ST_NODATA:   return "nodata";
         case WR_ST_NXDOMAIN: return "nxdomain";
         case WR_ST_RETIRED:  return "retired";
+        case WR_ST_GRACE_END: return "grace_end";
+        case WR_ST_UNANSWERED: return "unanswered";
         default:             return "fail";
     }
 }

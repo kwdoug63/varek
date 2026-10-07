@@ -255,12 +255,16 @@ static struct stub_budget *stub_budget_of(int ri) {
     return NULL;
 }
 
-/* Charge a new name to b at now: NULL, or the budget it would exceed. */
-static const char *stub_charge(struct stub_budget *b, const char *name, int64_t now) {
+/* Charge a lookup to b at now: NULL, or the budget it would exceed. A new
+ * name (isnew) is checked against the label and names budgets and counted in
+ * names; every lookup sent upstream, a new name's or (v1.25 review) a name's
+ * asked again after its TTL, counts against rate. Without that, re-asking
+ * chosen names after their TTL sent data upstream with no bound. */
+static const char *stub_charge(struct stub_budget *b, const char *name, int64_t now, bool isnew) {
     if (!b) return "names";
     size_t nl = strlen(name);
-    if (nl <= b->sfx_len || nl - b->sfx_len - 1 > STUB_LABEL_MAX) return "label";
-    if (b->used >= b->names) return "names";
+    if (isnew && (nl <= b->sfx_len || nl - b->sfx_len - 1 > STUB_LABEL_MAX)) return "label";
+    if (isnew && b->used >= b->names) return "names";
     while (b->cnt && b->ts[b->head] <= now - 60000) {          /* older than a minute */
         b->head = (b->head + 1) % b->rate;
         b->cnt--;
@@ -268,21 +272,36 @@ static const char *stub_charge(struct stub_budget *b, const char *name, int64_t 
     if (b->cnt >= b->rate) return "rate";
     b->ts[(b->head + b->cnt) % b->rate] = now;
     b->cnt++;
-    b->used++;
+    if (isnew) b->used++;
     return NULL;
+}
+
+/* Undo the last charge (the lookup was not sent, or the name not added). */
+static void stub_uncharge(struct stub_budget *b, bool isnew) {
+    if (!b) return;
+    if (b->cnt) b->cnt--;
+    if (isnew && b->used) b->used--;
 }
 
 /* The dns_question record: one per question the stub receives.
  *   {"event":"dns_question","run":R,"name":N,"type":T,"transport":"udp|tcp",
  *    "rule":"policy_match|exact_name|wildcard_budget|no_rule|not_a_host_name|malformed",
- *    "policy_line":L,["budget":"names|rate|label",]["new":true,]
+ *    "policy_line":L,["budget":"names|rate|label",]["new":true,]["upstream":true,]
  *    "answer":"noerror|nxdomain|servfail|formerr|lookup",["addresses":[...],]
  *    "generation":G,"timestamp_ns":TS}
  * "lookup": the resolver helper was asked; the resolution record that follows
  * for the name is the answer. "new": the question added the name, charged to
- * the rule on policy_line. "addresses": what a noerror answer carried. */
+ * the rule on policy_line. "upstream" (v1.25 review): the question sent a
+ * lookup upstream, charged to that rule's rate budget. "addresses": what a
+ * noerror answer carried. flags: STUB_NEW, STUB_UPSTREAM. */
+#define STUB_NEW      1u
+#define STUB_UPSTREAM 2u
+/* v1.25 review: the Warden's monotonic time (ms) of the question being
+ * answered, the clock the rate budget is charged on; recorded as "mono_ms" so
+ * the audit counts the rate window as the Warden did. */
+static int64_t g_stub_now;
 static void stub_record(const char *name, uint16_t qtype, int conn_fd, const char *rule, int line,
-                        const char *budget, bool isnew, const char *answer, const wr_entry_t *e) {
+                        const char *budget, unsigned flags, const char *answer, const wr_entry_t *e) {
     FILE *f = rec_begin();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -290,7 +309,8 @@ static void stub_record(const char *name, uint16_t qtype, int conn_fd, const cha
                "\"transport\":\"%s\",\"rule\":\"%s\",\"policy_line\":%d,",
             g_run_id, name, (unsigned)qtype, conn_fd < 0 ? "udp" : "tcp", rule, line);
     if (budget) fprintf(f, "\"budget\":\"%s\",", budget);
-    if (isnew) fputs("\"new\":true,", f);
+    if (flags & STUB_NEW) fputs("\"new\":true,", f);
+    if (flags & STUB_UPSTREAM) fputs("\"upstream\":true,", f);
     fprintf(f, "\"answer\":\"%s\",", answer);
     if (e && !strcmp(answer, "noerror") && (qtype == 1 || qtype == 28)) {
         fputs("\"addresses\":[", f);
@@ -304,7 +324,8 @@ static void stub_record(const char *name, uint16_t qtype, int conn_fd, const cha
         }
         fputs("],", f);
     }
-    fprintf(f, "\"generation\":%llu,\"timestamp_ns\":%lld}\n", (unsigned long long)g_names.generation,
+    fprintf(f, "\"generation\":%llu,\"mono_ms\":%lld,\"timestamp_ns\":%lld}\n",
+            (unsigned long long)g_names.generation, (long long)g_stub_now,
             (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
     rec_end(NULL);
 }
@@ -429,6 +450,7 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
     uint8_t out[2 * STUB_MSG_MAX];
     size_t outn = conn_fd < 0 ? STUB_MSG_MAX : sizeof out;
     stub_budget_init(p);
+    g_stub_now = wr_now_ms();
     int pr = stub_parse(m, n, name, &qtype, &qend);
     if (pr == -2) return;
     if (pr == -1) {
@@ -440,7 +462,7 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
         stub_record("", 0, conn_fd, "malformed", -1, NULL, false, "formerr", NULL);
         return;
     }
-    int64_t now = wr_now_ms();
+    int64_t now = g_stub_now;
     char why[8];
     if (vdp_host_name_form(name, strlen(name), why, sizeof why) != 1) {
         size_t l = stub_build(m, qend, 3, qtype, NULL, now, out, outn);  /* not a host name */
@@ -468,19 +490,22 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
         return;
     }
     bool isnew = false;
+    struct stub_budget *bud = ri >= 0 && p->v.rules[ri].s.wild ? stub_budget_of(ri) : NULL;
     if (i < 0) {
-        /* A new name: charged to the wildcard rule that allows it. */
-        const char *over = p->v.rules[ri].s.wild ? stub_charge(stub_budget_of(ri), name, now) : NULL;
+        /* A new name (never exact, so ri >= 0): charged to the wildcard rule
+         * that allows it. */
+        const char *over = p->v.rules[ri].s.wild ? stub_charge(bud, name, now, true) : NULL;
         if (over) {
             size_t l = stub_build(m, qend, 3, qtype, NULL, now, out, outn);
             stub_send(conn_fd, from, fl, out, l);
-            stub_record(name, qtype, conn_fd, "wildcard_budget", line, over, false, "nxdomain", NULL);
+            stub_record(name, qtype, conn_fd, "wildcard_budget", line, over, 0, "nxdomain", NULL);
             return;
         }
         if (g_stub_dyn >= STUB_MAX_DYN || (i = wr_table_add_dynamic(&g_names, name)) < 0) {
+            stub_uncharge(bud, true);                   /* v1.25 review: nothing was added */
             size_t l = stub_build(m, qend, 2, qtype, NULL, now, out, outn);  /* SERVFAIL */
             stub_send(conn_fd, from, fl, out, l);
-            stub_record(name, qtype, conn_fd, rule, line, NULL, false, "servfail", NULL);
+            stub_record(name, qtype, conn_fd, rule, line, NULL, 0, "servfail", NULL);
             return;
         }
         g_stub_dyn++;
@@ -491,19 +516,33 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
         int rc = e->lookups ? stub_rcode(e, qtype) : 2;
         size_t l = stub_build(m, qend, rc, qtype, e, now, out, outn);
         stub_send(conn_fd, from, fl, out, l);
-        stub_record(name, qtype, conn_fd, rule, line, NULL, isnew, stub_answer_word(rc), e);
+        stub_record(name, qtype, conn_fd, rule, line, NULL, isnew ? STUB_NEW : 0, stub_answer_word(rc), e);
         return;
     }
-    /* Look it up, and answer when the helper does. */
+    /* Look it up, and answer when the helper does. A lookup already on its
+     * way is shared and charges nothing more; a name asked again after its
+     * TTL charges the rule's rate (v1.25 review). */
+    bool send_up = !e->pending;
+    if (send_up && !isnew && bud) {
+        const char *over = stub_charge(bud, name, now, false);
+        if (over) {
+            size_t l = stub_build(m, qend, 3, qtype, NULL, now, out, outn);
+            stub_send(conn_fd, from, fl, out, l);
+            stub_record(name, qtype, conn_fd, "wildcard_budget", line, over, 0, "nxdomain", NULL);
+            return;
+        }
+    }
     int slot = -1;
     for (int k = 0; k < STUB_MAX_Q; k++) if (!g_stub_q[k].used) { slot = k; break; }
     if (slot < 0 || wr_async_request(&g_names, (size_t)i) < 0) {
+        if (send_up) stub_uncharge(bud, false);         /* nothing went upstream */
         size_t l = stub_build(m, qend, 2, qtype, NULL, now, out, outn);
         stub_send(conn_fd, from, fl, out, l);
-        stub_record(name, qtype, conn_fd, rule, line, NULL, isnew, "servfail", NULL);
+        stub_record(name, qtype, conn_fd, rule, line, NULL, isnew ? STUB_NEW : 0, "servfail", NULL);
         return;
     }
-    stub_record(name, qtype, conn_fd, rule, line, NULL, isnew, "lookup", NULL);
+    stub_record(name, qtype, conn_fd, rule, line, NULL,
+                (isnew ? STUB_NEW : 0) | (send_up ? STUB_UPSTREAM : 0), "lookup", NULL);
     struct stub_q *q = &g_stub_q[slot];
     q->used = true;
     q->conn_fd = conn_fd;

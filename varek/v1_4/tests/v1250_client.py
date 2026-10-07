@@ -84,6 +84,9 @@ if sys.argv[1] == "raw":
     sys.exit(0)
 if sys.argv[1] == "ask":
     for n in sys.argv[2:]:
+        if n.startswith("sleep:"):
+            time.sleep(float(n[6:]))
+            continue
         case("ask " + n, lambda: ",".join(sorted({a[4][0] for a in socket.getaddrinfo(n, 80, proto=socket.IPPROTO_TCP)})))
     sys.exit(0)
 if sys.argv[1] == "fetch":

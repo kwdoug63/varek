@@ -194,7 +194,7 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             continue
         try:
             rec = json.loads(raw)
-        except json.JSONDecodeError as e:
+        except ValueError as e:      # v1.25 review: also an integer past Python's digit limit
             fail(lineno, f"record is not valid JSON ({e}).")
         if not isinstance(rec, dict):
             fail(lineno, "record is not a JSON object.")
@@ -263,6 +263,7 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
 
     if meta is not None:
         meta["log"] = chained            # v1.16: None for an unchained (pre-1.16) stream
+        meta["run_end"] = ended          # v1.25 review: when the run ended, for the audit
     if run is None:
         fail(0, "no run_start record: not a v1.12.1+ Warden stream.")
     if ended is None and not allow_incomplete:

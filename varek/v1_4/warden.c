@@ -1705,6 +1705,18 @@ static void emit_resolution(void *ctx, size_t i, const wr_result_t *r) {
 /* v1.25: a dynamic entry's TTL passed with no new question; its addresses
  * went into grace. A resolution record says so ("a" and "aaaa": "retired"),
  * so the audit sees the addresses leave as the Warden's table did. */
+/* v1.25 review: an entry whose grace ended, written before the connect
+ * decided at that time */
+static void emit_grace_end(void *ctx, size_t i) {
+    wr_result_t r;
+    memset(&r, 0, sizeof r);
+    r.st[0] = r.st[1] = WR_ST_GRACE_END;
+    int64_t now = *(const int64_t *)ctx;
+    FILE *f = rec_begin();
+    wr_format_record(f, g_run_id, &g_names, i, &r, now);
+    rec_end(NULL);
+}
+
 static void emit_retired(void *ctx, size_t i) {
     (void)ctx;
     wr_result_t r;
@@ -1743,7 +1755,24 @@ static void names_resolve_all(bool record) {
     }
 }
 
+/* v1.25 review: a lookup on demand still out when the run ends is recorded
+ * as unanswered, so the audit can require an answer for every lookup sent
+ * upstream (a deleted answer is then missing, not merely late). */
+static void emit_unanswered(void) {
+    if (!g_names_on) return;
+    for (size_t i = 0; i < g_names.n; i++) {
+        if (!g_names.e[i].pending || !g_names.e[i].dynamic) continue;
+        wr_result_t r;
+        memset(&r, 0, sizeof r);
+        r.st[0] = r.st[1] = WR_ST_UNANSWERED;
+        FILE *f = rec_begin();
+        wr_format_record(f, g_run_id, &g_names, i, &r, wr_now_ms());
+        rec_end(NULL);
+    }
+}
+
 static void emit_run_end(int exit_status) {
+    emit_unanswered();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();

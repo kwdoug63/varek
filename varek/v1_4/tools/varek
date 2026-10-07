@@ -640,15 +640,19 @@ def cmd_policy_show(args):
     for verb in ("allow", "deny"):
         parts = ", ".join(f"{v} {k}" for k, v in sorted(counts[verb].items())) or "none"
         info(f"{verb.capitalize():8} {parts}")
-    # v1.25: each wildcard allow rule's budgets (the Warden's defaults filled in)
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        for ln, text in enumerate(fh, 1):
-            t = text.split("#", 1)[0].split()
-            if len(t) >= 3 and t[:2] == ["allow", "host"] and t[2].startswith("*."):
-                b = dict(x.split("=", 1) for x in t[3:] if "=" in x)
-                info(f"Wildcard {t[2]} (line {ln}): at most {b.get('names', '256')} new names a run, "
-                     f"{b.get('rate', '30')} a minute, 63 bytes before the suffix; "
-                     f"the agent's lookups under it leave the host (acknowledge=dns-channel)")
+    # v1.25: each wildcard allow rule's budgets (the Warden's defaults filled
+    # in), as the certificate checker parses the file (v1.25 review: not this
+    # tool's own reading, which split lines on a bare CR where the Warden does not)
+    rq = run_cmd([tool("vdp_cert_check"), path, "rules"], capture=True)
+    for ln in rq.stdout.splitlines() if rq.returncode == 0 else []:
+        f = ln.split()
+        if len(f) == 10 and f[0] == "h" and f[1] == "a" and f[5] == "w":
+            c = bytes.fromhex(f[9]).decode("latin-1")
+            sfx, _, port = c[3:].rpartition(":")
+            info(f"Wildcard *.{sfx}{'' if port == '*' else ':' + port} (line {f[6]}): at most "
+                 f"{f[7] if f[7] != '0' else '256'} new names a run, {f[8] if f[8] != '0' else '30'} "
+                 f"lookups upstream a minute, 63 bytes before the suffix; the agent's lookups under it "
+                 f"leave the host (acknowledge=dns-channel)")
     info("Anything not allowed is UNKNOWN and refused.")
     return 0
 
@@ -869,9 +873,11 @@ def cmd_refusals(args):
         line = r.get("policy_line", -1)
         if r.get("event") == "dns_question":
             text = policy_line_text(policy, line) if policy and isinstance(line, int) else None
+            b = r.get("budget")
             what = {"names": "its names= budget (new names per run) is spent",
-                    "rate": "its rate= budget (new names per minute) is spent",
-                    "label": "the part before the suffix is longer than 63 bytes"}.get(r.get("budget"), "a budget")
+                    "rate": "its rate= budget (lookups upstream per minute) is spent",
+                    "label": "the part before the suffix is longer than 63 bytes"}.get(
+                        b if isinstance(b, str) else "", "a budget")   # v1.25 review: no crash on a list
             info(f"  {'BUDGET':11}  {'dns.question':13}  {r.get('name', '')}")
             hint(f"policy line {line}" + (f": {text}" if text else "") + f"; {what}; the agent got NXDOMAIN")
             continue
