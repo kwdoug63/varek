@@ -1,8 +1,7 @@
 # VAREK v1.24.0 — Host Names Without Agent DNS
 
 > **DRAFT, not released.** The second 24-hour soak passed. Before tagging:
-> a short soak trial on the Warden with the review's fixes, and the spec
-> paper and site updates. The review was done by AI
+> a short soak trial on the Warden with the review's fixes. The review was done by AI
 > review agents; a human or third-party review has not been done.
 
 Released PENDING · MIT · github.com/kwdoug63/varek
