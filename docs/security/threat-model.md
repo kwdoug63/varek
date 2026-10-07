@@ -184,9 +184,10 @@ Model-B techniques below, with the residual limits stated honestly.
     that holds on any of them decides, so a deny on a name holds on its
     addresses. The certificate covers the deciding name, and the checker
     confirms that no earlier rule holds on another candidate. A loopback,
-    link-local, unspecified or multicast address is decided on the address
-    alone (`special_address`), so DNS cannot lead an allowed name to the
-    host's own services.
+    link-local, unspecified, multicast or cloud metadata address (including
+    IPv4-compatible and NAT64 forms) is decided on the address alone
+    (`special_address`), so DNS cannot lead an allowed name to the host's
+    own services.
   - *Audited.* `varek_audit.py` checks that each candidate was bound to the
     address dialed by the resolution records, that no name of that address was
     left out (grace included), that each connect names the latest table

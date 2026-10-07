@@ -41,8 +41,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     queries its nameserver after `/etc/hosts`, gives up at once.
   - Tests: `make test-v1240` (grammar in both parsers, the table against a
     local test DNS server, and as root the Warden with Python, curl, Node, a
-    static musl client, Go and Java as the agent); CI runs it. It fails 100
-    of its 108 checks against v1.23.1.
+    static musl client, Go and Java as the agent); CI runs it. It fails 104
+    of its 113 checks against v1.23.1.
   - The review's findings, all fixed. The review was done by four AI review
     agents (Claude), separate from the session that wrote the code; it was
     not a human or third-party review. See `RELEASE-v1.24.0.md`, "Found in
@@ -56,7 +56,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
       - asks the policy about view paths;
       - fails cleanly on malformed fields.
     - A name's answer no longer reaches loopback, link-local, unspecified or
-      multicast addresses (`special_address`; only numeric rules do).
+      multicast addresses (`special_address`; only numeric rules do). From
+      the v1.25 review: nor cloud metadata addresses outside link-local
+      (`100.100.100.200`, `fd00:ec2::254`), `::/96`, or NAT64 forms of a
+      special IPv4 address.
+    - From the v1.25 review: `varek_cyclonedx.py` refused every stream in
+      which a view was answered without a path rule (UNKNOWN, then ALLOW);
+      views are now reported apart from the decisions.
     - Writable opens of the resolver files are refused (`view_write_refused`).
     - An oversized TCP answer is a failed lookup, not parsed past the buffer.
       Startup lookups go through the resolver helper.
