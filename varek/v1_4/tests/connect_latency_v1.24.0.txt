@@ -1,0 +1,33 @@
+VAREK v1.24.0 connect latency on host names (2026-10-07T14:59Z; kernel 6.18.44-fc-v77; 4 vCPU)
+One blocking TCP connect after another to a listener on this machine's own address; percentiles in microseconds.
+'warden' is the client as the agent; 'records' are the Warden's connect records (its latency, the dial, its own time).
+native       native  tcp n=3000 errors=0 p50=13 p90=30 p99=94 max=718 mean=20 (us)
+numeric      warden  tcp n=3000 errors=0 p50=206 p90=278 p99=524 max=6163 mean=226 (us)
+numeric      records n=3000 candidates=[0] decided on ['192.0.2.2']; warden latency p50=170 p90=233 p99=421; dial p50=43 p99=124; Warden's own p50=124 p90=173 p99=317 (us)
+name1        warden  tcp n=3000 errors=0 p50=209 p90=281 p99=467 max=7136 mean=224 (us)
+name1        records n=3000 candidates=[2] decided on ['api.example.com']; warden latency p50=177 p90=239 p99=366; dial p50=45 p99=122; Warden's own p50=127 p90=178 p99=296 (us)
+name15       warden  tcp n=3000 errors=0 p50=194 p90=259 p99=486 max=2288 mean=210 (us)
+name15       records n=3000 candidates=[16] decided on ['api.example.com']; warden latency p50=156 p90=215 p99=403; dial p50=39 p99=110; Warden's own p50=116 p90=160 p99=328 (us)
+
+-- run 2
+native       native  tcp n=3000 errors=0 p50=16 p90=49 p99=171 max=10589 mean=31 (us)
+numeric      warden  tcp n=3000 errors=0 p50=195 p90=273 p99=456 max=3944 mean=211 (us)
+numeric      records n=3000 candidates=[0] decided on ['192.0.2.2']; warden latency p50=158 p90=228 p99=369; dial p50=39 p99=104; Warden's own p50=116 p90=170 p99=289 (us)
+name1        warden  tcp n=3000 errors=0 p50=207 p90=307 p99=507 max=5298 mean=230 (us)
+name1        records n=3000 candidates=[2] decided on ['api.example.com']; warden latency p50=171 p90=261 p99=428; dial p50=43 p99=126; Warden's own p50=125 p90=190 p99=345 (us)
+name15       warden  tcp n=3000 errors=0 p50=166 p90=218 p99=322 max=7086 mean=182 (us)
+name15       records n=3000 candidates=[16] decided on ['api.example.com']; warden latency p50=138 p90=180 p99=266; dial p50=34 p99=75; Warden's own p50=102 p90=135 p99=215 (us)
+
+-- run 3
+native       native  tcp n=3000 errors=0 p50=16 p90=39 p99=88 max=992 mean=22 (us)
+numeric      warden  tcp n=3000 errors=0 p50=179 p90=264 p99=478 max=7624 mean=203 (us)
+numeric      records n=3000 candidates=[0] decided on ['192.0.2.2']; warden latency p50=144 p90=217 p99=381; dial p50=37 p99=110; Warden's own p50=105 p90=158 p99=306 (us)
+name1        warden  tcp n=3000 errors=0 p50=172 p90=243 p99=534 max=6729 mean=195 (us)
+name1        records n=3000 candidates=[2] decided on ['api.example.com']; warden latency p50=141 p90=201 p99=359; dial p50=36 p99=89; Warden's own p50=103 p90=149 p99=297 (us)
+name15       warden  tcp n=3000 errors=0 p50=180 p90=271 p99=478 max=2491 mean=205 (us)
+name15       records n=3000 candidates=[16] decided on ['api.example.com']; warden latency p50=149 p90=230 p99=395; dial p50=38 p99=113; Warden's own p50=109 p90=171 p99=310 (us)
+
+The decision procedure alone (tools/vdp_check batch, the 16-rule policy of the 15-name run, 320,000 decisions, including the batch tool's own input and output):
+  one numeric candidate per decision: 0.44 and 0.46 us per decision (two runs)
+  the 16 candidates of a 15-name connect, in turn: 0.51 and 0.56 us per decision (two runs)
+  so deciding over 16 candidates costs at most about 8 us, and over 2 about 1 us

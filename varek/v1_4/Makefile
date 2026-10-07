@@ -322,6 +322,10 @@ test-v1162: warden tools/vdp_cert_check tools/varek_keygen tests/v1160_probe
 tests/test_v1240_resolve: tests/test_v1240_resolve.c $(RESOLVE)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_v1240_resolve.c warden_resolve.c -lresolv
 
+# v1.24.0: connect latency on host names (numeric, 1 name, 15 names); root
+latency-v1240: warden tests/v1210_bench
+	@sudo ./tests/latency_v1240.sh ./warden tests/v1210_bench 3000
+
 test-v1240: warden tools/vdp_check tools/vdp_cert_check tests/test_v1240_resolve
 	@./tests/test_v1240.sh ./tools/vdp_check ./tools/vdp_cert_check ./tests/test_v1240_resolve \
 	    $(if $(filter 0,$(shell id -u)),./warden)
