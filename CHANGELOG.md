@@ -67,14 +67,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     - The tests resolve names to the machine's own address, not loopback.
   - `tests/soak_v1240/`: the 24-hour soak test against Fastly-, Cloudflare-
     and CloudFront-hosted APIs (`soak.sh`, an agent, and a checker for the
-    design's section 5), to run on a host with outbound HTTPS. It passed
-    24 hours on a DigitalOcean droplet: 4,320 fetches, 0 refused connects,
-    2,015 answer changes for `aws.amazon.com`, and the audit passing. Its 4
-    failed fetches were the Warden's: without a `host.conf` view, glibc gave
-    the agent only the first hosts line, an IPv6 address after a rotation, on
-    an IPv4-only host. Fixed, and `make test-v1240` recreates the failure.
-  - `RELEASE-v1.24.0.md`: draft release notes, with the soak results; latency
-    and the review findings are pending.
+    design's section 5), to run on a host with outbound HTTPS. The first
+    24-hour run on a DigitalOcean droplet had 4 failed fetches, and they were
+    the Warden's: without a `host.conf` view, glibc gave the agent only the
+    first hosts line, an IPv6 address after a rotation, on an IPv4-only host.
+    Fixed, and `make test-v1240` recreates the failure. The second 24-hour
+    run passed: 4,320 of 4,320 fetches, 0 refused connects, 2,034 answer
+    changes for `aws.amazon.com`, and the audit PASS on 114,279 records.
+  - `RELEASE-v1.24.0.md`: draft release notes, with the soak results, the
+    latency figures and the review findings.
 - `docs/security/v1.27-program-launches.md`: the design for decided program
   launches (a Landlock execute ruleset built from the policy's `allow exec`
   rules, the Warden deciding and recording each launch, an identity check
