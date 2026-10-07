@@ -326,6 +326,11 @@ tests/test_v1240_resolve: tests/test_v1240_resolve.c $(RESOLVE)
 latency-v1240: warden tests/v1210_bench
 	@sudo ./tests/latency_v1240.sh ./warden tests/v1210_bench 3000
 
+# v1.25.0: lookups through the stub, and connects decided over 1 and 40
+# names on one address; root
+latency-v1250: warden
+	@sudo ./tests/latency_v1250.sh ./warden 1000
+
 test-v1240: warden tools/vdp_check tools/vdp_cert_check tests/test_v1240_resolve
 	@./tests/test_v1240.sh ./tools/vdp_check ./tools/vdp_cert_check ./tests/test_v1240_resolve \
 	    $(if $(filter 0,$(shell id -u)),./warden)
