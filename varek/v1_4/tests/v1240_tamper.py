@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""v1240_tamper.py — test_v1240.sh: the forgeries the v1.24 independent review
+"""v1240_tamper.py — test_v1240.sh: the forgeries the v1.24 review (AI agents)
 found the audit accepting, made the way someone who holds the log (but not
 the signing key) could: edit records, then recompute the hash chain.
 varek_audit.py must refuse each.
