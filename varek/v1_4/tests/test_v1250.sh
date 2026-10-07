@@ -191,6 +191,8 @@ if [ -n "$WARDEN" ]; then
         psl=$(sha256sum "$PSL" | cut -c1-64); vl=$(sha256sum "$VL" | cut -c1-64)
         check "run_start records both lists' SHA-256" \
             grep -q "\"psl_sha256\":\"$psl\",\"shared_domains_sha256\":\"$vl\"" "$OUT/run.log"
+        check "run_start reports the Warden as 1.25.0" grep -q '"event":"run_start",[^}]*"warden":"1.25.0"' "$OUT/run.log"
+        check "the policy grammar is reported as v1.25" grep -q 'loaded policy default v1.25 ' "$OUT/run.log"
         rm -rf /tmp/varek_v1250
     else skip "run_start (needs root)"; fi
 else skip "the Warden's startup checks (no warden binary given)"; fi

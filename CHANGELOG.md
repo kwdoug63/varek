@@ -16,9 +16,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     after `require warden 1.25`, in the decision procedure, the certificate
     checker and the cross-check oracle. Every wildcard allow rule must carry
     `acknowledge=dns-channel`, so the policy itself shows that the agent's
-    lookups under it leave the host; without it the policy is refused; held as a glob (`?*.example.com:443`), so it is
-    decided, certified and fuzzed like any glob. The policy-grammar version is
-    1.25.
+    lookups under it leave the host; without it the policy is refused. A
+    wildcard is held as a glob (`?*.example.com:443`), so it is decided,
+    certified and fuzzed like any glob. The policy-grammar version is 1.25.
   - An allow wildcard over a shared domain is refused at load: a public suffix
     (`*.com`), an entry of the Public Suffix List's private section or under
     one (`*.s3.amazonaws.com`), or the VAREK list (`*.my.salesforce.com`). The
@@ -63,6 +63,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     through the stub, and a DNS-tunnel style client against the budgets.
     Against the previous build, 21 of the 31 stub checks fail without the
     stub, and 22 of the budget and budget-grammar checks fail.
+    The whole suite now runs 132 checks and fails 108 of them against the
+    v1.24 Warden, parsers and audit.
+  - The Warden reports `1.25.0` in `run_start`, and the policy grammar as
+    v1.25.
+  - `RELEASE-v1.25.0.md`: draft release notes; the soak, the review and
+    latency are pending.
 - v1.24.0, in progress (host names without agent DNS,
   `docs/security/v1.21-stage2-host-names.md`), sections 1 and 2:
   - Policy grammar: `allow host api.example.com[:port]` and `deny host <name>`

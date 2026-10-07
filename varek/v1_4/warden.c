@@ -307,7 +307,7 @@ static int policy_load(const char *path, struct policy *p) {
             "(warden_faultinject); never use it to supervise a real agent\n");
 #endif
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.24");
+    snprintf(p->version, sizeof(p->version), "1.25");
     char err[512];
     /* v1.15: read the file once. The decision procedure and the certificate
      * checker parse these same bytes, and their SHA-256 goes in run_start, so
@@ -1525,7 +1525,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.24.0\","
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.25.0\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
