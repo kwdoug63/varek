@@ -450,7 +450,8 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
         return;
     }
     int i = wr_table_find(&g_names, name);
-    bool exact = i >= 0 && !g_names.e[i].dynamic;
+    /* a name only a deny rule names (v1.24 review) is in the table but allows nothing */
+    bool exact = i >= 0 && !g_names.e[i].dynamic && !g_names.e[i].unlisted;
     int ri = stub_name_rule(p, name);
     int line = ri >= 0 ? p->v.rules[ri].line : -1;
     const char *rule = exact ? "exact_name" : "policy_match";

@@ -165,6 +165,23 @@ static void view_serve(int notify_fd, const struct seccomp_notif *req, struct ac
 
 /* ---- section 4: candidates for a connect ---- */
 
+/* v1.24 review: addresses a name may not lead to. Whoever controls an
+ * allowed name's DNS could answer with one of these, and the Warden dials
+ * from the host's network namespace: loopback would reach the host's own
+ * services, link-local the cloud metadata service (169.254.169.254). A
+ * connect to one is decided on its address alone, so only a numeric rule can
+ * allow it. Private ranges (10/8, 172.16/12, 192.168/16, fc00::/7) are not
+ * here: internal APIs are reached by name there. */
+static bool special_address(const wr_ip_t *ip) {
+    const uint8_t *a = ip->a;
+    if (ip->fam == 4)
+        return a[0] == 0 || a[0] == 127 || (a[0] == 169 && a[1] == 254) || a[0] >= 224;
+    static const uint8_t zero[16];
+    if (!memcmp(a, zero, 15) && (a[15] == 0 || a[15] == 1)) return true;      /* ::, ::1 */
+    if (a[0] == 0xfe && (a[1] & 0xc0) == 0x80) return true;                  /* fe80::/10 */
+    return a[0] == 0xff;                                                       /* ff00::/8 */
+}
+
 /* The candidates of the connect being decided: the numeric destination, then
  * name:port for every name the address belongs to (v1.25: as many as there
  * are; through v1.24 a connect was refused past 15 names, which per-tenant
@@ -179,6 +196,7 @@ static void view_serve(int notify_fd, const struct seccomp_notif *req, struct ac
  * number. 0, or -1 when memory for them runs out (refused). */
 static int names_candidates(struct action *a, int fam, const void *addr, unsigned port) {
     a->ncand = 0;
+    a->special_addr = false;
     snprintf(a->dialed, sizeof a->dialed, "%.63s", a->resolved);
     size_t want = 1 + (g_names_on ? g_names.n : 0);
     if (want > g_cand_cap) {
@@ -205,6 +223,10 @@ static int names_candidates(struct action *a, int fam, const void *addr, unsigne
     } else {
         ip.fam = 4;
         memcpy(ip.a, addr, 4);
+    }
+    if (special_address(&ip)) {
+        a->special_addr = true;          /* decided as a number (special_address) */
+        return 0;
     }
     size_t n = wr_names_for(&g_names, &ip, wr_now_ms(), g_cand_idx, g_cand_cap - 1);
     if (n > g_cand_cap - 1) return -1;               /* cannot happen: at most g_names.n */
@@ -285,6 +307,7 @@ static void names_record_fields(struct action *a) {
         if (k > 0) w += (size_t)k;
     }
     if (w < sizeof a->extra)
-        snprintf(a->extra + w, sizeof a->extra - w, "],\"resolution_generation\":%llu,",
+        snprintf(a->extra + w, sizeof a->extra - w, "],%s\"resolution_generation\":%llu,",
+                 a->special_addr ? "\"special_address\":true," : "",
                  (unsigned long long)g_names.generation);
 }

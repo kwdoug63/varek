@@ -82,6 +82,8 @@ typedef struct {
     wr_addr_t *addrs;
     size_t     n, cap;
     uint32_t   ttl_eff;            /* the clamped TTL now in force (seconds) */
+    uint32_t   ttl_last;           /* the clamped TTL of the last answer (grace is
+                                      taken from it, not from a failure's retry) */
     int64_t    next_ms;            /* next refresh due (monotonic ms) */
     bool       pending;            /* a lookup is with the resolver helper */
     bool       ever_ok;            /* resolved to at least one address once */
@@ -92,6 +94,8 @@ typedef struct {
      * addresses go into grace (wr_retire_due). Not in the hosts view. */
     bool        dynamic;
     wr_status_t st[2];             /* the last lookup's status, A and AAAA */
+    bool       unlisted;           /* only a deny rule names it: resolved, so the deny
+                                      can match its addresses, but not in the hosts view */
 } wr_entry_t;
 
 typedef struct wr_async wr_async_t;
@@ -204,6 +208,10 @@ int  wr_helper_main(int fd, const wr_config_t *cfg);
  * "--resolver-helper". Returns the exit status. */
 int  wr_helper_exec_main(int argc, char **argv);
 int  wr_async_fd(const wr_table_t *t);
+/* Look entry i up through the helper and wait for the answer (at startup,
+ * with nothing else outstanding), so the Warden itself never parses network
+ * data. 0 with r filled, or -1 (the helper is gone, or no answer in time). */
+int  wr_async_lookup(wr_table_t *t, size_t i, wr_result_t *r);
 /* False once the helper has exited or its socket failed: refreshes stopped. */
 bool wr_async_alive(const wr_table_t *t);
 void wr_async_schedule(wr_table_t *t, int64_t now);

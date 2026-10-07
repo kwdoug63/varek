@@ -94,6 +94,26 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     local test DNS server, and as root the Warden with Python, curl, Node, a
     static musl client, Go and Java as the agent); CI runs it. It fails 81 of
     its 88 checks against v1.23.1.
+  - The independent review's findings, all fixed (`RELEASE-v1.24.0.md`,
+    "Found in review"; section 5 of `make test-v1240`):
+    - `varek_audit.py` refused none of five forgeries. It now:
+      - requires the candidate fields on every connect when the policy file
+        has name rules;
+      - counts names held in grace;
+      - requires the Warden's spelling of addresses and ports;
+      - checks the table generation;
+      - asks the policy about view paths;
+      - fails cleanly on malformed fields.
+    - A name's answer no longer reaches loopback, link-local, unspecified or
+      multicast addresses (`special_address`; only numeric rules do).
+    - Writable opens of the resolver files are refused (`view_write_refused`).
+    - An oversized TCP answer is a failed lookup, not parsed past the buffer.
+      Startup lookups go through the resolver helper.
+    - Deny rules' names are resolved, so they hold. A v4-mapped AAAA answer
+      binds its IPv4 address.
+    - Grace after a failed refresh keeps the last TTL. A full helper queue no
+      longer spins the CPU. `run_start` says `1.24.0`.
+    - The tests resolve names to the machine's own address, not loopback.
   - `tests/soak_v1240/`: the 24-hour soak test against Fastly-, Cloudflare-
     and CloudFront-hosted APIs (`soak.sh`, an agent, and a checker for the
     design's section 5), to run on a host with outbound HTTPS. It passed

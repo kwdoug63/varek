@@ -196,19 +196,22 @@ else
     chmod 644 "$W"/*
     PORT=$((20000 + RANDOM % 20000))
     HP=$((40000 + RANDOM % 5000))
+    # v1.24 review: a name never leads to loopback, so the names here resolve
+    # to this machine's own address (private or public)
+    HOSTIP=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("10.255.255.255", 1)); print(s.getsockname()[0])')
     SFX=svc.example.com
     printf '{' > "$OUT/zone.json"
-    for c in py node go java musl curl tcp txt; do printf '"%s.%s": {"ttl": 30, "a": ["127.0.0.1"]},' "$c" "$SFX"; done >> "$OUT/zone.json"
-    printf '"x.example.org": {"ttl": 30, "a": ["127.0.0.1"]}}\n' >> "$OUT/zone.json"
+    for c in py node go java musl curl tcp txt; do printf '"%s.%s": {"ttl": 30, "a": ["%s"]},' "$c" "$SFX" "$HOSTIP"; done >> "$OUT/zone.json"
+    printf '"x.example.org": {"ttl": 30, "a": ["%s"]}}\n' "$HOSTIP" >> "$OUT/zone.json"
     : > "$OUT/q.log"
     python3 "$T/dns_test_server.py" --port "$PORT" --zone "$OUT/zone.json" --log "$OUT/q.log" \
         --ready "$OUT/ready" > "$OUT/dns.out" 2>&1 &
     SERVERS="$!"
-    python3 -m http.server "$HP" --bind 127.0.0.1 > /dev/null 2>&1 &
+    python3 -m http.server "$HP" --bind 0.0.0.0 > /dev/null 2>&1 &
     SERVERS="$SERVERS $!"
     trap 'kill $SERVERS 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$OUT"; rm -rf "$W"' EXIT
     for _ in $(seq 50); do
-        [ -e "$OUT/ready" ] && python3 -c "import socket; socket.create_connection(('127.0.0.1', $HP), 0.2)" 2>/dev/null && break
+        [ -e "$OUT/ready" ] && python3 -c "import socket; socket.create_connection(('$HOSTIP', $HP), 0.2)" 2>/dev/null && break
         sleep 0.1
     done
     NODE=$(readlink -f "$(command -v node 2>/dev/null)" 2>/dev/null)
@@ -233,7 +236,7 @@ else
     sed 's/^/     /' "$OUT/py.out"
     check "run_start names the stub"                    grep -q '"dns_stub":"127.53.53.53:53"' "$OUT/a.log"
     check "python (glibc): a name only the wildcard allows resolves through the stub" \
-        grep -q '^OK resolve 127.0.0.1 ' "$OUT/py.out"
+        grep -q "^OK resolve $HOSTIP " "$OUT/py.out"
     check "python: and connects"                         grep -q '^OK http 200 ' "$OUT/py.out"
     check "the connect was decided on the name" \
         grep -q "\"resolved\":\"py.$SFX:$HP\",\"decision_raw\":\"ALLOW\"" "$OUT/a.log"
@@ -270,7 +273,7 @@ PY
     agent -- /usr/bin/python3 "$W/v1250_client.py" raw udp A x.example.org >> "$OUT/raw.out"
     agent -- /usr/bin/python3 "$W/v1250_client.py" connect 127.0.0.1 53 >> "$OUT/raw.out"
     sed 's/^/     /' "$OUT/raw.out"
-    check "a question over TCP is answered"             grep -q '^OK raw-tcp-A rcode=0 an=1 127.0.0.1 ' "$OUT/raw.out"
+    check "a question over TCP is answered"             grep -q "^OK raw-tcp-A rcode=0 an=1 $HOSTIP " "$OUT/raw.out"
     check "a TXT question for an allowed name: an empty answer" \
         grep -q '^OK raw-udp-TXT rcode=0 an=0 ' "$OUT/raw.out"
     check "a question for a name outside every rule: NXDOMAIN" \
@@ -286,10 +289,10 @@ PY
     if [ -n "$NODE" ]; then
         agent -- "$NODE" "$W/v1250_client.js" "$HP" "node.$SFX" x.example.org > "$OUT/node.out"
         sed 's/^/     /' "$OUT/node.out"
-        check "node: dns.lookup resolves"            grep -q '^OK resolve 127.0.0.1 ' "$OUT/node.out"
+        check "node: dns.lookup resolves"            grep -q "^OK resolve $HOSTIP " "$OUT/node.out"
         check "node: and http connects"              grep -q '^OK http 200 ' "$OUT/node.out"
         check "node: dns.resolve4 (its own question) resolves through the stub" \
-            grep -q '^OK resolve4 127.0.0.1 ' "$OUT/node.out"
+            grep -q "^OK resolve4 $HOSTIP " "$OUT/node.out"
         check "node: a name outside every rule fails (lookup and resolve4)" \
             sh -c "grep -q '^ERR unlisted ' '$OUT/node.out' && grep -q '^ERR resolve4-unlisted ' '$OUT/node.out'"
     else skip "node (not installed)"; fi
@@ -300,7 +303,7 @@ PY
         chmod 755 "$W/v1250_client_go"
         agent -- "$W/v1250_client_go" "$HP" "go.$SFX" x.example.org > "$OUT/go.out"
         sed 's/^/     /' "$OUT/go.out"
-        check "go (its own resolver, its own questions): resolves" grep -q '^OK resolve 127.0.0.1 ' "$OUT/go.out"
+        check "go (its own resolver, its own questions): resolves" grep -q "^OK resolve $HOSTIP " "$OUT/go.out"
         check "go: and http connects"                               grep -q '^OK http 200 ' "$OUT/go.out"
         if fast "$OUT/go.out" unlisted; then pass "go: a name outside every rule fails within 50 ms"
         else flunk "go: a name outside every rule fails within 50 ms"; fi
@@ -311,7 +314,7 @@ PY
         chmod -R a+rX "$W"
         agent -- "$JAVA" -Xshare:off -cp "$W" V1250Client "$HP" "java.$SFX" x.example.org > "$OUT/java.out"
         sed 's/^/     /' "$OUT/java.out"
-        check "java: resolves"                   grep -q '^OK resolve 127.0.0.1 ' "$OUT/java.out"
+        check "java: resolves"                   grep -q "^OK resolve $HOSTIP " "$OUT/java.out"
         check "java: and http connects"          grep -q '^OK http 200 ' "$OUT/java.out"
         check "java: a name outside every rule fails" grep -q '^ERR unlisted ' "$OUT/java.out"
     else skip "java (no JDK)"; fi
@@ -320,7 +323,7 @@ PY
         chmod 755 "$W/v1250_client_musl"
         agent -- "$W/v1250_client_musl" "$HP" "musl.$SFX" x.example.org > "$OUT/musl.out"
         sed 's/^/     /' "$OUT/musl.out"
-        check "musl (sendto, unconnected): resolves through the stub" grep -q '^OK resolve 127.0.0.1 ' "$OUT/musl.out"
+        check "musl (sendto, unconnected): resolves through the stub" grep -q "^OK resolve $HOSTIP " "$OUT/musl.out"
         check "musl: and connects"                                     grep -q '^OK http 200 ' "$OUT/musl.out"
         if fast "$OUT/musl.out" unlisted; then pass "musl: a name outside every rule fails within 50 ms"
         else flunk "musl: a name outside every rule fails within 50 ms"; fi
@@ -341,11 +344,20 @@ PY
         -- /usr/bin/python3 "$W/v1250_client.py" "$HP" "py.$SFX" x.example.org > "$OUT/exact.out" 2> "$OUT/e.log"
     check "a policy without wildcards has no stub (and still resolves its exact names)" \
         sh -c "! grep -q 'dns_stub' '$OUT/e.log' && grep -q '^OK http 200 ' '$OUT/exact.out'"
+    # A name a deny rule names under an allowed wildcard: the Warden resolves
+    # it (so the deny holds on its addresses, v1.24 review), but the stub must
+    # not answer it as if an allow rule named it.
+    printf 'require warden 1.25\ndeny host txt.%s\nallow host *.%s:%s\nallow path %s/ readonly\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\n' \
+        "$SFX" "$SFX" "$HP" "$W" > "$OUT/denyw.policy"
+    env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$OUT/denyw.policy" --dns-server "127.0.0.1:$PORT" \
+        -- /usr/bin/python3 "$W/v1250_client.py" raw udp A "txt.$SFX" > "$OUT/denyw.out" 2> "$OUT/dw.log"
+    check "a denied name under an allowed wildcard gets NXDOMAIN from the stub" \
+        grep -q '^OK raw-udp-A rcode=3 an=0 ' "$OUT/denyw.out"
 
     echo "== 4. budgets: the name channel bounded =="
     # Three wildcard rules: a names budget of 5, a rate budget of 3 a minute,
     # and the defaults (256 names, 30 a minute, 63 bytes before the suffix).
-    printf '{"ok.d.example.com": {"ttl": 30, "a": ["127.0.0.1"]}}\n' > "$OUT/zone.json"
+    printf '{"ok.d.example.com": {"ttl": 30, "a": ["%s"]}}\n' "$HOSTIP" > "$OUT/zone.json"
     : > "$OUT/q.log"
     POL4="$OUT/budget.policy"
     { printf 'require warden 1.25\n'
@@ -386,7 +398,7 @@ PY
         pass "the default label budget: 63 bytes before the suffix pass, 64 and more are refused"
     else flunk "the default label budget (63 bytes)"; fi
     check "a refused name gets NXDOMAIN at once"  grep -q "^ERR ask c9.t.example.com gaierror " "$OUT/ask.out"
-    check "a name within the budget resolves"    grep -q '^OK ask ok.d.example.com 127.0.0.1 ' "$OUT/ask.out"
+    check "a name within the budget resolves"    grep -q "^OK ask ok.d.example.com $HOSTIP " "$OUT/ask.out"
     check "every question is a chained dns_question record" \
         sh -c "[ \$(grep -c '\"event\":\"dns_question\".*\"chain\":\"' '$OUT/b.log') -ge 22 ]"
     check "the audit accepts the run, budgets and all" \
@@ -427,8 +439,8 @@ PY
     # 40 per-tenant names served from one address (as a CDN serves them):
     # through v1.24 a connect was refused past 15 names (too_many_names).
     printf '{' > "$OUT/zone.json"
-    for i in $(seq 0 39); do printf '"n%s.many.example.com": {"ttl": 300, "a": ["127.0.0.1"]},' "$i"; done >> "$OUT/zone.json"
-    printf '"x.short.example.com": {"ttl": 1, "a": ["127.0.0.1"]}, "y.short.example.com": {"ttl": 300, "a": ["127.0.0.1"]}}\n' >> "$OUT/zone.json"
+    for i in $(seq 0 39); do printf '"n%s.many.example.com": {"ttl": 300, "a": ["%s"]},' "$i" "$HOSTIP"; done >> "$OUT/zone.json"
+    printf '"x.short.example.com": {"ttl": 1, "a": ["%s"]}, "y.short.example.com": {"ttl": 300, "a": ["%s"]}}\n' "$HOSTIP" "$HOSTIP" >> "$OUT/zone.json"
     POL5="$OUT/many.policy"
     { printf 'require warden 1.25\n'
       printf 'allow host *.many.example.com:%s names=100 rate=100\n' "$HP"   # 40 new names in seconds
@@ -446,7 +458,7 @@ PY
     check "and the audit rebuilds them from the resolution records" \
         python3 "$HERE/tools/varek_audit.py" --policy "$POL5" --checker "$CERT" "$OUT/m.log"
     # Forged: one name's resolution moved to another address, chain recomputed.
-    python3 - "$OUT/m.log" "$OUT/m_forged.log" <<'PY'
+    python3 - "$OUT/m.log" "$OUT/m_forged.log" "$HOSTIP" <<'PY'
 import hashlib, sys
 head = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
 out = []
@@ -455,7 +467,7 @@ for line in open(sys.argv[1], encoding="utf-8", errors="surrogateescape"):
         cut = line.index(',"chain":"')
         body = line[:cut]
         if '"event":"resolution"' in body and '"name":"n7.many.example.com"' in body:
-            body = body.replace('"addresses":["127.0.0.1"]', '"addresses":["127.0.0.9"]')
+            body = body.replace('"addresses":["' + sys.argv[3] + '"]', '"addresses":["198.51.100.9"]')
         head = hashlib.sha256(head + body.encode("utf-8", "surrogateescape")).digest()
         line = body + ',"chain":"' + head.hex() + line[cut + 10 + 64:]
     out.append(line)
