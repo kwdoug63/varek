@@ -29,6 +29,19 @@
 #      requests are decided (step 6) an inspected host is refused
 #      (inspect_not_built) and a passthrough host relayed in SNI mode; the
 #      audit accepts the run and refuses forged trust records and decisions
+#   4. terminating TLS (as root): for an inspected host the proxy verifies the
+#      server (against --trust-bundle) before it meets the client, then
+#      completes the client's handshake with a leaf from the run's CA (the
+#      name only, serverAuth, kept for the run), http/1.1 only; until
+#      requests are decided (step 6) every request is answered 403 and the
+#      server is sent nothing; refused and recorded: a server whose name or
+#      issuer does not verify (server_tls), a client that does not trust the
+#      CA or offers only h2 (client_tls), plain HTTP to an inspected host;
+#      Python, curl, Node.js and Java trust the run's CA with no settings of
+#      their own (Java through the store's metadata, answered from the
+#      view); CONNECT clients and a Squid upstream; a passthrough host
+#      relayed in SNI mode; the audit accepts the runs and refuses forged
+#      inspected records
 #
 # Usage: test_v1261.sh <vdp_check> <vdp_cert_check> [<warden>]
 # (section 2 uses warden-proxy beside the warden binary: make warden-proxy)
@@ -453,9 +466,12 @@ JAVA
         else flunk "Java opens the trust store ($(cd "$OUT" && env -u JAVA_TOOL_OPTIONS java P12.java "$W/o/run-trust.p12" 2>&1 | tail -1))"; fi
     else skip "Java opening the trust store (no java)"; fi
     px() { grep '"action":"net.proxy"' "$OUT/c.log" | grep -q "\"target\":\"$1\",.*\"rule\":\"$2\""; }
-    if have "TLS inspected ALERT" && px "api.example.com:$TP" inspect_not_built
-    then pass "until requests are decided, an inspected host is refused (inspect_not_built)"
-    else flunk "an inspected host is refused (inspect_not_built)"; fi
+    # (step 4: an inspected host's TLS is terminated; this server's
+    # certificate is self-signed, so it does not verify: section 4 has more)
+    if have "TLS inspected ALERT" && px "api.example.com:$TP" proxy_dialed &&
+       grep '"event":"proxy_close"' "$OUT/c.log" | grep -q '"why":"server_tls".*"inspected":true'
+    then pass "an inspected host is passed on to be inspected (here, a server that does not verify: server_tls)"
+    else flunk "an inspected host is passed on to be inspected"; fi
     if have "TLS passthrough tls-ok pinned.example.net" && px "pinned.example.net:$TP" proxy_dialed
     then pass "a passthrough host is relayed in SNI mode"
     else flunk "a passthrough host is relayed in SNI mode"; fi
@@ -469,9 +485,286 @@ JAVA
     forge "$OUT/c.log" "$OUT/g3.log" '"mode":"inspect"' '"mode":"sni"'
     refuses "run_start's proxy in SNI mode under an inspecting policy" "$OUT/g3.log" "inspecting mode"
     PD=$(grep '"action":"net.proxy"' "$OUT/c.log" | grep -o '"target":"pinned.example.net:[0-9]*","resolved":"[^"]*","decision_raw":"ALLOW","decision_final":"ALLOW","rule":"proxy_dialed"' | head -1)
-    forge "$OUT/c.log" "$OUT/g4.log" "\"target\":\"api.example.com:$TP\",\"resolved\":\"api.example.com:$TP\",\"decision_raw\":\"ALLOW\",\"decision_final\":\"DENY\",\"rule\":\"inspect_not_built\"" \
-                                     "\"target\":\"api.example.com:$TP\",\"resolved\":\"api.example.com:$TP\",\"decision_raw\":\"ALLOW\",\"decision_final\":\"ALLOW\",\"rule\":\"proxy_dialed\""
-    refuses "an inspected host passed on before requests are decided" "$OUT/g4.log" "not a passthrough host, was passed on"
+    forge "$OUT/c.log" "$OUT/g4.log" '"proxy_kind":"tls","inspected":true,' '"proxy_kind":"tls",'
+    refuses "an inspected host passed on without being inspected" "$OUT/g4.log" "was not inspected, which it must be"
+    for pid in $SRV; do kill "$pid" 2>/dev/null; done
+    rm -rf "$W"
+fi
+
+echo "== 4. terminating TLS =="
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ] || [ ! -x "$WP" ] || ! command -v openssl > /dev/null; then
+    skip "terminating TLS (needs root, the warden binary, warden-proxy and openssl)"
+else
+    W=/tmp/varek_v1261t.$$
+    rm -rf "$W"; mkdir -p "$W/o"; chmod 755 "$W"; chmod 777 "$W/o"
+    HOSTIP=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("10.255.255.255", 1)); print(s.getsockname()[0])')
+    P1=$((42000 + RANDOM % 5000)); P2=$((P1 + 1)); P3=$((P1 + 2)); P4=$((P1 + 3))   # good, wrong name, self-signed, passthrough
+    # a test root, servers' certificates under it, and the trust bundle given the Warden
+    ( cd "$W" &&
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout tca.key -out tca.pem -days 2 \
+          -subj "/CN=VAREK test root" -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign" &&
+      for x in "good api.example.com" "wrong other.example.com" "pin pinned.example.net"; do
+          set -- $x
+          openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$1.key" -out "$1.csr" -subj "/CN=$2" &&
+          printf 'subjectAltName=DNS:%s\nextendedKeyUsage=serverAuth\n' "$2" > "$1.ext" &&
+          openssl x509 -req -in "$1.csr" -CA tca.pem -CAkey tca.key -CAcreateserial -out "$1.pem" -days 1 -extfile "$1.ext"
+      done &&
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout self.key -out self.pem -days 1 \
+          -subj "/CN=api.example.com" -addext "subjectAltName=DNS:api.example.com" ) > "$OUT/certs.log" 2>&1
+    BUNDLE="$W/bundle.pem"            # the proxy reads it, as its own user
+    cat "$(python3 -c 'import ssl; print(ssl.get_default_verify_paths().openssl_cafile)')" "$W/tca.pem" > "$BUNDLE"
+    chmod 644 "$BUNDLE" "$W"/*.pem
+    cat > "$OUT/srv.py" <<'PY'
+import socket, ssl, sys, threading
+ip, port, cert, key = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); l.bind((ip, port)); l.listen(16)
+def serve(c):
+    try:
+        s = ctx.wrap_socket(c, server_side=True)
+        d = s.recv(1000)
+        if d: print("GOT", d.split(b"\r\n")[0].decode(errors="replace"), flush=True)
+        s.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nserver"); s.close()
+    except Exception as e:
+        print("srv", type(e).__name__, flush=True)
+while True:
+    c, _ = l.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
+PY
+    SRV=""
+    for x in "$P1 good" "$P2 wrong" "$P3 self" "$P4 pin"; do
+        set -- $x
+        python3 "$OUT/srv.py" "$HOSTIP" "$1" "$W/$2.pem" "$W/$2.key" > "$OUT/srv$1.log" 2>&1 &
+        SRV="$SRV $!"
+    done
+    DPORT=$((20000 + RANDOM % 20000))
+    printf '{"api.example.com": {"ttl": 30, "a": ["%s"]}, "pinned.example.net": {"ttl": 30, "a": ["%s"]}}\n' \
+        "$HOSTIP" "$HOSTIP" > "$OUT/zone4.json"
+    rm -f "$OUT/ready4"
+    python3 "$HERE/tests/dns_test_server.py" --port "$DPORT" --zone "$OUT/zone4.json" --log "$OUT/q4.log" \
+        --ready "$OUT/ready4" > /dev/null 2>&1 &
+    SRV="$SRV $!"
+    for _ in $(seq 50); do
+        [ -e "$OUT/ready4" ] && python3 -c "import socket; [socket.create_connection(('$HOSTIP', p), 0.2) for p in ($P1, $P4)]" 2>/dev/null && break
+        sleep 0.1
+    done
+    cat > "$W/agent.py" <<'PY'
+import os, socket, ssl, sys
+P1, P2, P3, P4, O = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+def get(tag, ctxf, port=P1, name="api.example.com", connect=False):
+    try:
+        s = socket.create_connection((name, port), 10)
+        if connect:
+            s.sendall(b"CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n" % (name.encode(), port, name.encode(), port))
+            r = b""
+            while b"\r\n\r\n" not in r:
+                d = s.recv(1)
+                if not d: break
+                r += d
+        s = ctxf().wrap_socket(s, server_hostname=name)
+        v = s.version() in ("TLSv1.2", "TLSv1.3")
+        open(os.path.join(O, "leaf-%s.der" % tag), "wb").write(s.getpeercert(binary_form=True))
+        s.sendall(b"GET /v1/models HTTP/1.1\r\nHost: %s\r\n\r\n" % name.encode())
+        out = b""
+        while True:
+            d = s.recv(4096)
+            if not d: break
+            out += d
+        print("TLS", tag, v, s.selected_alpn_protocol(),
+              out.split(b"\r\n")[0].decode(), out.split(b"\r\n\r\n", 1)[-1].split(b";")[0].decode(), flush=True)
+    except ssl.SSLError as e:
+        print("TLS", tag, "SSLERR", "HANDSHAKE_FAILURE" in str(e).upper(), flush=True)
+    except OSError as e:
+        print("TLS", tag, "ERR", e, flush=True)
+def alpn(*p):
+    def f():
+        c = ssl.create_default_context(); c.set_alpn_protocols(list(p)); return c
+    return f
+def own_roots():                     # a client that trusts only the test root (pins)
+    c = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); c.load_verify_locations(sys.argv[6]); return c
+get("verified", ssl.create_default_context)
+get("again", ssl.create_default_context)
+get("alpn-both", alpn("h2", "http/1.1"))
+get("alpn-h2", alpn("h2"))
+get("pinning", own_roots)
+get("connect", ssl.create_default_context, connect=True)
+get("wrong-name", ssl.create_default_context, port=P2)
+get("self-signed", ssl.create_default_context, port=P3)
+get("passthrough", ssl.create_default_context, port=P4, name="pinned.example.net")
+try:
+    s = socket.create_connection(("api.example.com", P1), 10)
+    s.sendall(b"GET /v1/models HTTP/1.1\r\nHost: api.example.com:%d\r\nConnection: close\r\n\r\n" % P1)
+    print("HTTP", s.recv(100).split(b"\r\n")[0].decode(), flush=True)
+except OSError as e:
+    print("HTTP ERR", e, flush=True)
+st = os.stat("/etc/varek/run-trust.p12")
+print("STAT", oct(st.st_mode & 0o170000), st.st_size == len(open("/etc/varek/run-trust.p12", "rb").read()), flush=True)
+PY
+    chmod 644 "$W/agent.py"
+    POL4="$OUT/tls.policy"
+    { printf 'require warden 1.26\nproxy inspect\nproxy ports %s %s %s %s\nproxy passthrough host pinned.example.net\n' "$P1" "$P2" "$P3" "$P4"
+      printf 'allow host api.example.com\nallow host pinned.example.net:%s\n' "$P4"
+      printf 'allow request GET https://api.example.com:%s/v1/models\n' "$P1"
+      printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/\n' "$W"
+    } > "$POL4"
+    env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$POL4" --dns-server "127.0.0.1:$DPORT" --trust-bundle "$BUNDLE" -- \
+        /usr/bin/python3 "$W/agent.py" "$P1" "$P2" "$P3" "$P4" "$W/o" "$W/tca.pem" > "$OUT/t.out" 2> "$OUT/t.log"
+    sed 's/^/     /' "$OUT/t.out"
+    have() { grep -qxF -- "$1" "$OUT/t.out"; }
+    close_of() {   # close_of <target> -> the proxy_close of that target's connection
+        python3 - "$OUT/t.log" "$1" <<'PY'
+import json, sys
+recs = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+ids = [r["proxy_conn"] for r in recs if r.get("action") == "net.proxy" and r.get("target") == sys.argv[2]]
+for r in recs:
+    if r.get("event") == "proxy_close" and r.get("proxy_conn") in ids:
+        print(json.dumps(r, sort_keys=True))
+PY
+    }
+    NB="VAREK: this request was not sent"
+    if have "TLS verified True None HTTP/1.1 403 Forbidden $NB" && have "TLS again True None HTTP/1.1 403 Forbidden $NB"
+    then pass "a verifying client completes TLS with the run's CA, and its request is answered 403"
+    else flunk "a verifying client completes TLS with the run's CA (see above)"; fi
+    if ! grep -q '^GOT ' "$OUT/srv$P1.log"; then pass "the server was verified but sent no request"
+    else flunk "the server was sent no request ($(cat "$OUT/srv$P1.log"))"; fi
+    openssl x509 -inform DER -in "$W/o/leaf-verified.der" -noout -text > "$OUT/leaf.txt" 2>&1
+    if grep -q 'Issuer: O = VAREK Warden (this run only), CN = VAREK run CA' "$OUT/leaf.txt" &&
+       grep -A1 'Subject Alternative Name' "$OUT/leaf.txt" | tail -1 | grep -qx ' *DNS:api.example.com' &&
+       grep -A1 'Extended Key Usage' "$OUT/leaf.txt" | grep -q 'TLS Web Server Authentication' &&
+       grep -A1 'Basic Constraints: critical' "$OUT/leaf.txt" | grep -q 'CA:FALSE' &&
+       grep -A1 'Key Usage: critical' "$OUT/leaf.txt" | grep -q 'Digital Signature'
+    then pass "the leaf: issued by the run's CA, the name alone, serverAuth, not a CA"
+    else flunk "the leaf's form ($(head -c 300 "$OUT/leaf.txt"))"; fi
+    if cmp -s "$W/o/leaf-verified.der" "$W/o/leaf-again.der"; then pass "and kept for the run (the same leaf again)"
+    else flunk "and kept for the run"; fi
+    if have "TLS alpn-both True http/1.1 HTTP/1.1 403 Forbidden $NB" && have "TLS alpn-h2 SSLERR False" &&
+       close_of "api.example.com:$P1" | grep -q '"tls_error": "handshake: no application protocol"'
+    then pass "http/1.1 is chosen; a client offering only h2 is refused (client_tls)"
+    else flunk "ALPN (http/1.1 chosen, h2 alone refused)"; fi
+    if have "TLS pinning SSLERR False" && close_of "api.example.com:$P1" | grep -q '"tls_error": "handshake: tlsv1 alert unknown ca"'
+    then pass "a client that does not trust the run's CA fails its handshake, recorded (client_tls)"
+    else flunk "a client that does not trust the run's CA"; fi
+    if have "TLS connect True None HTTP/1.1 403 Forbidden $NB"; then pass "TLS inside a CONNECT is inspected too"
+    else flunk "TLS inside a CONNECT is inspected too"; fi
+    if have "TLS wrong-name SSLERR True" && close_of "api.example.com:$P2" | grep -q '"tls_error": "certificate: hostname mismatch"' &&
+       have "TLS self-signed SSLERR True" && close_of "api.example.com:$P3" | grep -q '"tls_error": "certificate: self-signed certificate"' &&
+       ! grep -q '^GOT ' "$OUT/srv$P2.log" "$OUT/srv$P3.log"
+    then pass "a server whose name or issuer does not verify is refused before the client's handshake (server_tls)"
+    else flunk "a server that does not verify is refused (server_tls)"; fi
+    if have "TLS passthrough True None HTTP/1.1 200 OK server" &&
+       grep '"action":"net.proxy"' "$OUT/t.log" | grep "\"target\":\"pinned.example.net:$P4\"" | grep -vq '"inspected"'
+    then pass "a passthrough host is relayed in SNI mode, not inspected"
+    else flunk "a passthrough host is relayed in SNI mode"; fi
+    if have "HTTP HTTP/1.1 403 Forbidden" &&
+       grep '"action":"net.proxy"' "$OUT/t.log" | grep "\"target\":\"api.example.com:$P1\"" | grep '"proxy_kind":"http"' | grep -q '"rule":"inspect_not_built"'
+    then pass "plain HTTP to an inspected host is refused until requests are decided"
+    else flunk "plain HTTP to an inspected host is refused"; fi
+    GSHA=$(openssl x509 -in "$W/good.pem" -outform DER | sha256sum | cut -d' ' -f1)
+    if close_of "api.example.com:$P1" | grep '"why": "inspect_not_built"' | grep -q "\"server_cert_sha256\": \"$GSHA\"" &&
+       ! close_of "api.example.com:$P1" | grep '"why": "inspect_not_built"' | grep -vq '"bytes_down": 0, "bytes_up": 0'
+    then pass "each inspected close records the server's certificate, and no bytes relayed"
+    else flunk "the inspected closes' records"; fi
+    if have "STAT 0o100000 True" && grep -q '"rule":"view_metadata"' "$OUT/t.log"
+    then pass "the trust store's metadata is the view's (a regular file, its size)"
+    else flunk "the trust store's metadata is the view's"; fi
+    if python3 "$HERE/tools/varek_audit.py" --policy "$POL4" --checker "$CERT" "$OUT/t.log" > "$OUT/au4.out" 2>&1
+    then pass "the audit accepts the run"
+    else flunk "the audit accepts the run ($(grep -m3 'PROBLEM' "$OUT/au4.out"))"; fi
+    POL="$POL4"
+    forge "$OUT/t.log" "$OUT/h1.log" '"why":"inspect_not_built","bytes_up":0,' '"why":"inspect_not_built","bytes_up":512,'
+    refuses "an inspected connection that relayed bytes before requests are decided" "$OUT/h1.log" "relayed bytes before requests are decided"
+    forge "$OUT/t.log" "$OUT/h2.log" ',"inspected":true,"server_cert_sha256"' ',"server_cert_sha256"'
+    refuses "an inspected connection's close not marked inspected" "$OUT/h2.log" "not marked inspected"
+    forge "$OUT/t.log" "$OUT/h3.log" "\"target\":\"pinned.example.net:$P4\"," "\"target\":\"pinned.example.net:$P4\",\"inspected\":true,"
+    refuses "a passthrough host's decision marked inspected" "$OUT/h3.log" "which only a host that is not passthrough is"
+
+    # Real clients: curl, Node.js and Java, each with no settings of its own
+    NODE=$(readlink -f "$(command -v node 2>/dev/null)" 2>/dev/null)
+    JAVA=$(ls /usr/lib/jvm/java-21-openjdk-*/bin/java 2>/dev/null | head -1)
+    [ -n "$JAVA" ] || JAVA=$(readlink -f "$(command -v java 2>/dev/null)" 2>/dev/null)
+    POLC="$OUT/clients.policy"
+    { printf 'require warden 1.26\nproxy inspect\nproxy ports %s\nallow host api.example.com\n' "$P1"
+      for d in /usr/ /lib /proc/ /sys/ "$W/" ${NODE:+$(dirname "$(dirname "$NODE")")/} \
+               ${JAVA:+$(dirname "$(dirname "$JAVA")")/} /etc/java-21-openjdk/ /etc/java-17-openjdk/; do
+          printf 'allow path %s readonly\n' "$d"; done
+      printf 'allow path /etc/ld.so.cache readonly\nallow path /etc/ssl/openssl.cnf readonly\nallow path /tmp/hsperfdata_nobody/\n'
+    } > "$POLC"
+    cl() { env -i PATH=/usr/bin:/bin timeout 90 "$WARDEN" "$POLC" --dns-server "127.0.0.1:$DPORT" --trust-bundle "$BUNDLE" -- "$@" 2> "$OUT/cl.log"; }
+    URL="https://api.example.com:$P1/v1/models"
+    if command -v curl > /dev/null; then
+        if cl /usr/bin/curl -sS "$URL" | grep -q "^$NB"; then pass "curl verifies the run's CA (CURL_CA_BUNDLE) and gets the 403"
+        else flunk "curl verifies the run's CA ($(grep '^\[agent\]' "$OUT/cl.log" | head -2))"; fi
+    else skip "curl (not installed)"; fi
+    if [ -n "$NODE" ]; then
+        out=$(cl "$NODE" -e 'require("https").get(process.argv[1], r => { let b = ""; r.on("data", d => b += d); r.on("end", () => console.log("NODE", r.statusCode, b.split(";")[0])); }).on("error", e => console.log("NODE ERR", e.message))' "$URL")
+        if [ "$out" = "NODE 403 $NB" ]; then pass "Node.js verifies the run's CA (NODE_EXTRA_CA_CERTS) and gets the 403"
+        else flunk "Node.js verifies the run's CA ($out)"; fi
+    else skip "Node.js (not installed)"; fi
+    JAVAC="$(dirname "$JAVA" 2>/dev/null)/javac"
+    if [ -n "$JAVA" ] && [ -x "$JAVAC" ]; then
+        cat > "$OUT/V1261Get.java" <<'JAVA'
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+public class V1261Get {
+    public static void main(String[] a) {
+        try {
+            HttpURLConnection c = (HttpURLConnection) new URL(a[0]).openConnection();
+            int code = c.getResponseCode();
+            InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+            System.out.println("JAVA " + code + " " + new String(in.readAllBytes()).split(";")[0]);
+        } catch (Exception e) { System.out.println("JAVA ERR " + e); }
+    }
+}
+JAVA
+        "$JAVAC" --release 11 -d "$W" "$OUT/V1261Get.java" > /dev/null 2>&1 && chmod 644 "$W/V1261Get.class"
+        out=$(cl "$JAVA" -Xshare:off -cp "$W" V1261Get "$URL")
+        if [ "$out" = "JAVA 403 $NB" ]; then pass "Java verifies the run's CA (the PKCS#12 store, JAVA_TOOL_OPTIONS) and gets the 403"
+        else flunk "Java verifies the run's CA ($out)"; fi
+    else skip "Java (no JDK)"; fi
+
+    # A Squid upstream: TLS to the server through its CONNECT tunnel
+    if ! command -v squid > /dev/null && [ ! -x /usr/sbin/squid ]; then
+        skip "inspecting through an upstream (Squid is not installed)"
+    else
+        SQUID=$(command -v squid || echo /usr/sbin/squid)
+        SQ=/tmp/varek_v1261sq.$$
+        rm -rf "$SQ"; mkdir -p "$SQ"; chmod 777 "$SQ"
+        SP=$((47500 + RANDOM % 2000))
+        printf '%s api.example.com\n' "$HOSTIP" > "$SQ/hosts"
+        { printf 'http_port %s:%s\nhttp_access allow all\n' "$HOSTIP" "$SP"
+          printf 'hosts_file %s/hosts\naccess_log %s/access.log\ncache_log %s/cache.log\npid_filename %s/squid.pid\n' "$SQ" "$SQ" "$SQ" "$SQ"
+          printf 'cache deny all\ncoredump_dir %s\nshutdown_lifetime 1 seconds\n' "$SQ"
+        } > "$SQ/squid.conf"
+        chmod 644 "$SQ"/*
+        ( cd "$SQ" && "$SQUID" -N -f "$SQ/squid.conf" > "$SQ/out.log" 2>&1 & )
+        for _ in $(seq 100); do python3 -c "import socket; socket.create_connection(('$HOSTIP', $SP), 0.2)" 2>/dev/null && break; sleep 0.1; done
+        { printf 'require warden 1.26\nproxy inspect\nproxy ports %s\nproxy upstream http://%s:%s\nallow host api.example.com:%s\n' "$P1" "$HOSTIP" "$SP" "$P1"
+          printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/\n' "$W"
+        } > "$OUT/up.policy"
+        cat > "$W/up.py" <<'PY'
+import socket, ssl, sys
+s = ssl.create_default_context().wrap_socket(socket.create_connection(("api.example.com", int(sys.argv[1])), 10),
+                                             server_hostname="api.example.com")
+s.sendall(b"GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+out = b""
+while True:
+    d = s.recv(4096)
+    if not d: break
+    out += d
+print("UP", out.split(b"\r\n")[0].decode(), flush=True)
+PY
+        chmod 644 "$W/up.py"
+        env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$OUT/up.policy" --dns-server "127.0.0.1:$DPORT" --trust-bundle "$BUNDLE" -- \
+            /usr/bin/python3 "$W/up.py" "$P1" > "$OUT/up.out" 2> "$OUT/up.log"
+        if grep -qx "UP HTTP/1.1 403 Forbidden" "$OUT/up.out" && grep -q "CONNECT api.example.com:$P1" "$SQ/access.log" &&
+           grep '"event":"proxy_close"' "$OUT/up.log" | grep -q '"why":"inspect_not_built".*"inspected":true,"server_cert_sha256"'
+        then pass "through a Squid upstream: the server verified inside its tunnel, the request answered 403"
+        else flunk "inspecting through a Squid upstream ($(cat "$OUT/up.out"); $(tail -2 "$SQ/access.log" 2>/dev/null))"; fi
+        if python3 "$HERE/tools/varek_audit.py" --policy "$OUT/up.policy" --checker "$CERT" "$OUT/up.log" > /dev/null 2>&1
+        then pass "the audit accepts the upstream run"; else flunk "the audit accepts the upstream run"; fi
+        pkill -9 -f "$SQ/squid.conf" 2>/dev/null
+        rm -rf "$SQ"
+    fi
     for pid in $SRV; do kill "$pid" 2>/dev/null; done
     rm -rf "$W"
 fi

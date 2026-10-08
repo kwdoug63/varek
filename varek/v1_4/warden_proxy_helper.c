@@ -8,6 +8,12 @@
 #include "proxy_parse.h"
 #include "proxy_ca.h"
 
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -39,7 +45,11 @@ static int64_t mono_ms(void) {
  * connections it holds. A held connection is read (step 5) until the parser
  * has a name, then waits for the Warden's verdict. */
 struct wp_ann  { bool used; uint32_t from_port; unsigned dport; uint64_t id; int64_t at; };
-enum { WH_READING = 0, WH_WAITING = 1, WH_RELAY = 2, WH_UPSTREAM = 3 };
+enum { WH_READING = 0, WH_WAITING = 1, WH_RELAY = 2, WH_UPSTREAM = 3, WH_TLS = 4 /* v1.26.1 */ };
+/* v1.26.1, step 4: an inspected connection's stages: the server's handshake
+ * (verified), then the client's (with a leaf from the run's CA), then its
+ * first request, then the answer flushed */
+enum { TS_SERVER = 0, TS_CLIENT = 1, TS_REQUEST = 2, TS_FLUSH = 3 };
 #define WP_RELAY_BUF   32768     /* each direction */
 #define WP_RELAY_IDLE  3600000   /* a relayed connection idle this long is closed */
 struct wp_held {
@@ -72,6 +82,14 @@ struct wp_held {
     uint64_t  body_left;
     pp_chunked_t ck;
     bool      refused;           /* a later request was refused: no more is read from the client */
+    /* v1.26.1, step 4: inspecting mode */
+    bool      inspect;           /* terminate its TLS */
+    int       tstage;            /* TS_* */
+    short     swant;             /* the server handshake waits for this (POLLIN, POLLOUT) */
+    SSL      *ss, *cs;           /* toward the server (on up), toward the client (memory BIOs) */
+    BIO      *crb, *cwb;         /* the client's TLS bytes in, out */
+    uint8_t   server_cert[32];   /* SHA-256 of the server's certificate */
+    char      tls_why[96];
 };
 enum { WG_OPEN = 0, WG_HEAD, WG_LENGTH, WG_CHUNKED };
 static struct wp_ann  g_ann[WP_MAX_ANNOUNCED];
@@ -92,6 +110,11 @@ static void report_close(const struct wp_held *h, const char *why) {
     int64_t d = mono_ms() - h->relay_at;
     m.ms = d > 0 ? (uint64_t)d : 0;
     snprintf(m.why, sizeof m.why, "%s", why);
+    if (h->inspect) {                                /* v1.26.1 */
+        m.inspected = 1;
+        memcpy(m.server_cert, h->server_cert, sizeof m.server_cert);
+        snprintf(m.tls_why, sizeof m.tls_why, "%s", h->tls_why);
+    }
     (void)send(g_ctl, &m, sizeof m, MSG_NOSIGNAL);   /* blocking: a close report is never dropped */
 }
 
@@ -99,11 +122,23 @@ static void held_drop(int k) {
     if (g_held[k].state == WH_UPSTREAM)            /* the run ended while asking the upstream */
         report_close(&g_held[k], g_held[k].why ? g_held[k].why : "upstream_refused");
     else if (g_held[k].state == WH_RELAY) report_close(&g_held[k], g_held[k].why ? g_held[k].why : "closed");
+    else if (g_held[k].state == WH_TLS) report_close(&g_held[k], g_held[k].why ? g_held[k].why : "reset");
+    if (g_held[k].ss && SSL_is_init_finished(g_held[k].ss))
+        (void)SSL_shutdown(g_held[k].ss);            /* v1.26.1: a close_notify to the server */
+    SSL_free(g_held[k].ss);                          /* (the client's SSL frees its BIOs) */
+    SSL_free(g_held[k].cs);
     close(g_held[k].fd);
     if (g_held[k].up >= 0) close(g_held[k].up);
     free(g_held[k].buf);
     free(g_held[k].down);
     g_held[k] = g_held[--g_nheld];
+}
+
+/* v1.26.1: an inspected client whose handshake has not begun: a fatal
+ * handshake_failure alert, in the clear */
+static void held_refuse_alert(struct wp_held *h) {
+    static const uint8_t alert[] = { 21, 3, 3, 0, 2, 2, 40 };
+    (void)send(h->fd, alert, sizeof alert, MSG_DONTWAIT | MSG_NOSIGNAL);
 }
 
 /* Tell the client no, in its own protocol, and close. */
@@ -186,6 +221,8 @@ static int held_relay_up(int k, int fd, const char *name, unsigned port) {
     return 0;
 }
 
+static bool tls_begin(int k);                     /* v1.26.1, below */
+
 /* Section 5: bytes from the upstream while waiting for its reply. False when
  * the connection is done (refused: reported, and the client refused). */
 static bool held_upstream(int k) {
@@ -208,6 +245,12 @@ static bool held_upstream(int k) {
     if (h->doff == h->dlen) h->doff = h->dlen = 0;
     h->state = WH_RELAY;
     h->since = h->relay_at = mono_ms();
+    /* v1.26.1: an inspected connection: TLS to the server through the tunnel
+     * (the server sends nothing before the ClientHello it is owed) */
+    if (h->inspect) {
+        if (h->dlen) { h->why = "server_tls"; snprintf(h->tls_why, sizeof h->tls_why, "the server spoke first"); }
+        return h->dlen == 0 && tls_begin(k);
+    }
     return true;
 }
 
@@ -343,6 +386,7 @@ static void ca_go(int ctl) {
         snprintf(d.why, sizeof d.why, "the setup messages were not as expected");
     else if (pca_init(&g_ca), pca_load_roots(&g_ca, g_ca_bundle, d.why, sizeof d.why) < 0) { }
     else if (pca_make_ca(&g_ca, g_ca_run, g_ca_names, g_ca_nnames, PCA_VALID_S, d.why, sizeof d.why) < 0) { }
+    else if (pca_tls_init(&g_ca, d.why, sizeof d.why) < 0) { }     /* step 4 */
     else if (pca_pem(&g_ca, &pem, &pl) < 0 || pca_p12(&g_ca, &p12, &ql) < 0 || pl > WP_BLOB_MAX || ql > WP_BLOB_MAX)
         snprintf(d.why, sizeof d.why, "encoding the CA and the trust store");
     else if (send_blob(ctl, WP_BLOB_CA_PEM, pem, pl) < 0 || send_blob(ctl, WP_BLOB_P12, p12, ql) < 0)
@@ -356,6 +400,178 @@ static void ca_go(int ctl) {
     free(pem);
     free(p12);
     (void)send(ctl, &d, sizeof d, MSG_NOSIGNAL);
+}
+
+
+/* ---- v1.26.1, step 4: terminating TLS on an inspected connection ---- */
+
+static void tls_err(struct wp_held *h, const char *why, const char *what) {
+    h->why = why;
+    unsigned long e = ERR_get_error();
+    char b[120] = "";
+    if (e) ERR_error_string_n(e, b, sizeof b);
+    const char *r = e ? ERR_reason_error_string(e) : NULL;
+    snprintf(h->tls_why, sizeof h->tls_why, "%.40s%s%.50s", what, r || e ? ": " : "", r ? r : b);
+    ERR_clear_error();
+}
+
+/* Move the client's TLS bytes: what OpenSSL wrote, out to the client; what
+ * the client sent, in. -1 on an error sending; sets eof_c. */
+static int tls_client_io(struct wp_held *h, short crev) {
+    while (h->dlen < WP_RELAY_BUF && BIO_ctrl_pending(h->cwb) > 0) {
+        int n = BIO_read(h->cwb, h->down + h->dlen, (int)(WP_RELAY_BUF - h->dlen));
+        if (n <= 0) break;
+        h->dlen += (size_t)n;
+    }
+    if (h->doff < h->dlen) {
+        ssize_t n = send(h->fd, h->down + h->doff, h->dlen - h->doff, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return -1;
+        if (n > 0) h->doff += (size_t)n;
+        if (h->doff == h->dlen) h->doff = h->dlen = 0;
+    }
+    if (!h->eof_c && (crev & (POLLIN | POLLHUP | POLLERR))) {
+        uint8_t b[16384];
+        ssize_t n = recv(h->fd, b, sizeof b, MSG_DONTWAIT);
+        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) h->eof_c = true;
+        else if (n > 0 && BIO_write(h->crb, b, (int)n) != (int)n) return -1;
+    }
+    return 0;
+}
+
+/* Start an inspected connection: the Warden dialed the server (h->up, after
+ * the upstream's CONNECT if there is one). The server's handshake comes
+ * first, so a server that cannot be verified never meets the client. */
+static bool tls_begin(int k) {
+    struct wp_held *h = &g_held[k];
+    h->state = WH_TLS;
+    h->tstage = TS_SERVER;
+    h->swant = POLLOUT;
+    h->since = h->relay_at = mono_ms();
+    h->why = "server_tls";
+    if (!g_ca_made || !(h->ss = SSL_new(g_ca.sctx)) || !SSL_set_fd(h->ss, h->up) ||
+        !SSL_set_tlsext_host_name(h->ss, h->name) || !SSL_set1_host(h->ss, h->name)) {
+        tls_err(h, "server_tls", "setting up TLS to the server");
+        return false;
+    }
+    SSL_set_hostflags(h->ss, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    SSL_set_connect_state(h->ss);
+    return true;
+}
+
+/* The server's certificate, as presented: its SHA-256. */
+static void tls_note_cert(struct wp_held *h) {
+    X509 *x = SSL_get0_peer_certificate(h->ss);
+    unsigned char *der = NULL;
+    int l = x ? i2d_X509(x, &der) : -1;
+    unsigned int ml = 0;
+    if (l > 0) (void)EVP_Digest(der, (size_t)l, h->server_cert, &ml, EVP_sha256(), NULL);
+    OPENSSL_free(der);
+}
+
+#define NOT_BUILT_BODY "VAREK: this request was not sent; inspecting mode does not decide requests yet.\n"
+static char kNotBuilt[256];                       /* the 403, its length computed (tls_step) */
+
+/* One pass over inspected connection k. False when it is done (h->why says
+ * why; held_drop reports it). */
+static bool tls_step(int k, short crev, short srev) {
+    struct wp_held *h = &g_held[k];
+    if ((crev | srev) & POLLNVAL) { h->why = "reset"; return false; }
+    if (h->tstage == TS_SERVER) {
+        if (!(srev & (POLLIN | POLLOUT | POLLHUP | POLLERR)) && h->swant) return true;
+        ERR_clear_error();
+        int r = SSL_do_handshake(h->ss);
+        if (r != 1) {
+            int e = SSL_get_error(h->ss, r);
+            if (e == SSL_ERROR_WANT_READ) { h->swant = POLLIN; return true; }
+            if (e == SSL_ERROR_WANT_WRITE) { h->swant = POLLOUT; return true; }
+            tls_note_cert(h);
+            long v = SSL_get_verify_result(h->ss);
+            if (v != X509_V_OK) {
+                h->why = "server_tls";
+                snprintf(h->tls_why, sizeof h->tls_why, "certificate: %s", X509_verify_cert_error_string(v));
+                ERR_clear_error();
+            } else tls_err(h, "server_tls", "handshake");
+            held_refuse_alert(h);
+            return false;
+        }
+        tls_note_cert(h);
+        const unsigned char *ap = NULL;
+        unsigned int al = 0;
+        SSL_get0_alpn_selected(h->ss, &ap, &al);
+        if (al && !(al == 8 && !memcmp(ap, "http/1.1", 8))) {
+            h->why = "server_tls";
+            snprintf(h->tls_why, sizeof h->tls_why, "the server chose a protocol other than http/1.1");
+            held_refuse_alert(h);
+            return false;
+        }
+        /* the client's handshake, from the ClientHello already read */
+        char why[96];
+        X509 *leaf = pca_leaf(&g_ca, h->name, why, sizeof why);
+        h->crb = BIO_new(BIO_s_mem());
+        h->cwb = BIO_new(BIO_s_mem());
+        if (!leaf || !h->crb || !h->cwb || !(h->cs = SSL_new(g_ca.cctx))) {
+            BIO_free(h->crb); BIO_free(h->cwb); h->crb = h->cwb = NULL;
+            h->why = "client_tls";
+            snprintf(h->tls_why, sizeof h->tls_why, "%s", leaf ? "setting up TLS to the client" : why);
+            held_refuse_alert(h);
+            return false;
+        }
+        SSL_set_bio(h->cs, h->crb, h->cwb);
+        if (!SSL_use_certificate(h->cs, leaf) || !SSL_use_PrivateKey(h->cs, g_ca.leaf_key) ||
+            BIO_write(h->crb, h->buf + h->skip, (int)(h->len - h->skip)) != (int)(h->len - h->skip)) {
+            tls_err(h, "client_tls", "setting up TLS to the client");
+            return false;
+        }
+        SSL_set_accept_state(h->cs);
+        h->len = h->skip = h->off = h->fwd = 0;      /* buf now holds the client's plaintext */
+        h->tstage = TS_CLIENT;
+        h->since = mono_ms();
+        crev |= POLLOUT;                              /* run the client's stage now */
+    }
+    if (tls_client_io(h, crev) < 0) { h->why = "reset"; return false; }
+    if (h->tstage == TS_CLIENT) {
+        ERR_clear_error();
+        int r = SSL_do_handshake(h->cs);
+        if (r == 1) {
+            h->tstage = TS_REQUEST;
+            h->since = mono_ms();
+        } else {
+            int e = SSL_get_error(h->cs, r);
+            if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) {
+                tls_err(h, "client_tls", "handshake");
+                (void)tls_client_io(h, 0);            /* its alert */
+                return false;
+            }
+            if (h->eof_c) {
+                h->why = "client_tls";
+                snprintf(h->tls_why, sizeof h->tls_why, "the client closed during the handshake");
+                return false;
+            }
+        }
+    }
+    if (h->tstage == TS_REQUEST) {
+        /* step 4: the first request's head is read, then answered 403 (step
+         * 6 decides each request instead); nothing reaches the server */
+        for (;;) {
+            ERR_clear_error();
+            int r = SSL_read(h->cs, h->buf + h->len, (int)(PP_HTTP_MAX - h->len));
+            if (r > 0) { h->len += (size_t)r; if (h->len < PP_HTTP_MAX) continue; }
+            break;
+        }
+        bool head = h->len >= PP_HTTP_MAX || memmem(h->buf, h->len, "\r\n\r\n", 4) != NULL;
+        if (!head && !h->eof_c) return true;
+        h->why = "inspect_not_built";
+        if (!kNotBuilt[0])
+            snprintf(kNotBuilt, sizeof kNotBuilt, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n"
+                     "Content-Length: %zu\r\nConnection: close\r\n\r\n%s", sizeof NOT_BUILT_BODY - 1, NOT_BUILT_BODY);
+        (void)SSL_write(h->cs, kNotBuilt, (int)strlen(kNotBuilt));
+        (void)SSL_shutdown(h->cs);
+        h->tstage = TS_FLUSH;
+        if (tls_client_io(h, 0) < 0) return false;
+    }
+    if (h->tstage == TS_FLUSH)
+        return BIO_ctrl_pending(h->cwb) > 0 || h->doff < h->dlen;
+    return true;
 }
 
 /* Read every control message waiting. Returns -1 when the Warden has gone. */
@@ -385,10 +601,15 @@ static int wp_drain_ctl(int ctl) {
                 if (passed) report_gone(m.v.id);
                 continue;
             }
+            /* v1.26.1: inspect, only with the run's CA made */
+            g_held[k].inspect = m.v.allow && m.v.inspect;
             if (!m.v.allow || fd < 0 || held_relay(k, fd) < 0) {
                 if (fd >= 0) close(fd);
                 if (passed) report_gone(m.v.id);
+                g_held[k].inspect = false;
                 held_refuse(k);
+            } else if (g_held[k].inspect && !tls_begin(k)) {
+                held_drop(k);                       /* reported: server_tls */
             }
             continue;
         }
@@ -403,6 +624,7 @@ static int wp_drain_ctl(int ctl) {
                 if (k >= 0 && g_held[k].state == WH_WAITING) held_refuse(k);
                 continue;
             }
+            g_held[k].inspect = m.u.allow && m.u.inspect;     /* v1.26.1 */
             if (!m.u.allow || fd < 0 || held_relay_up(k, fd, m.u.name, m.u.port) < 0) {
                 if (g_held[k].state == WH_UPSTREAM || g_held[k].up >= 0) {
                     g_held[k].state = WH_UPSTREAM;     /* reported as upstream_refused */
@@ -436,7 +658,8 @@ static int wp_drain_ctl(int ctl) {
         if (n == (ssize_t)sizeof(struct wp_msg) && m.type == WP_MSG_FLUSH) {
             /* the run is ending: close everything, reporting each relay */
             while (g_nheld) {
-                if (g_held[g_nheld - 1].state == WH_RELAY || g_held[g_nheld - 1].state == WH_UPSTREAM)
+                if (g_held[g_nheld - 1].state == WH_RELAY || g_held[g_nheld - 1].state == WH_UPSTREAM ||
+                    g_held[g_nheld - 1].state == WH_TLS)
                     g_held[g_nheld - 1].why = "run_end";
                 held_drop(g_nheld - 1);
             }
@@ -581,12 +804,19 @@ int wp_helper_main(int ctl) {
                 if (h->off < h->len) se |= POLLOUT;
             }
             if (h->state == WH_UPSTREAM) se = POLLIN;
+            if (h->state == WH_TLS) {                   /* v1.26.1 */
+                if (h->tstage == TS_SERVER) se = h->swant;
+                else {
+                    if (!h->eof_c && h->tstage != TS_FLUSH) ce |= POLLIN;
+                    if (h->doff < h->dlen || BIO_ctrl_pending(h->cwb) > 0) ce |= POLLOUT;
+                }
+            }
             pfc[k] = h->fd;
-            pfs[k] = h->state == WH_RELAY || h->state == WH_UPSTREAM ? h->up : -1;
+            pfs[k] = h->state == WH_RELAY || h->state == WH_UPSTREAM || h->state == WH_TLS ? h->up : -1;
             /* v1.26 review: a relay side that can make no progress is not
              * polled at all (its POLLHUP or POLLERR would wake the loop at
              * once, again and again); the relay is still visited each pass */
-            bool relay = h->state == WH_RELAY || h->state == WH_UPSTREAM;
+            bool relay = h->state == WH_RELAY || h->state == WH_UPSTREAM || h->state == WH_TLS;
             pf[2 + 2 * k] = (struct pollfd){ .fd = relay && !ce ? -1 : pfc[k], .events = ce };
             pf[3 + 2 * k] = (struct pollfd){ .fd = relay && !se ? -1 : pfs[k], .events = se };
         }
@@ -614,6 +844,16 @@ int wp_helper_main(int ctl) {
             if (h->state == WH_RELAY) {
                 if (pfs[j] != h->up) { srev = 0; crev = 0; }   /* became a relay just now */
                 if (!held_pump(k, crev, srev)) held_drop(k);
+                continue;
+            }
+            if (h->state == WH_TLS) {                       /* v1.26.1 */
+                if (pfs[j] != h->up) { srev = h->swant; crev = 0; }   /* began just now */
+                bool ok = tls_step(k, crev, srev);
+                if (ok && now - h->since > WP_READ_MS) {
+                    h->why = "tls_timeout";
+                    ok = false;
+                }
+                if (!ok) held_drop(k);
                 continue;
             }
             if (h->state == WH_READING && (crev & (POLLIN | POLLHUP | POLLERR))) {

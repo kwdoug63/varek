@@ -44,6 +44,7 @@ struct px_req {
     char          name[WR_NAME_MAX + 1];
     unsigned      port;
     bool          up;                    /* section 5: dialed to the upstream proxy */
+    bool          inspect;               /* v1.26.1: the proxy terminates its TLS */
     unsigned      dport;                 /* the port dialed (port, or the upstream's) */
     int           entry;                 /* in g_names (the upstream's: -1 for an address) */
     int           sock;                  /* the dial in progress, or -1 (waiting on the lookup) */
@@ -82,11 +83,11 @@ static void px_handed_off(uint64_t id, unsigned port) {
 
 /* Step 7: the connections passed to the proxy and not yet closed, and when
  * each was passed (monotonic ms). */
-struct px_open { uint64_t id; int64_t at; };
+struct px_open { uint64_t id; int64_t at; bool inspect; };
 static struct px_open *g_px_open;
 static size_t g_px_nopen, g_px_capopen;
 
-static void px_open_add(uint64_t id) {
+static void px_open_add(uint64_t id, bool inspect) {
     if (g_px_nopen == g_px_capopen) {
         size_t nc = g_px_capopen ? g_px_capopen * 2 : 64;
         struct px_open *o = realloc(g_px_open, nc * sizeof *o);
@@ -94,7 +95,7 @@ static void px_open_add(uint64_t id) {
         g_px_open = o;
         g_px_capopen = nc;
     }
-    g_px_open[g_px_nopen++] = (struct px_open){ id, wr_now_ms() };
+    g_px_open[g_px_nopen++] = (struct px_open){ id, wr_now_ms(), inspect };
 }
 
 /* The proxy_close record (step 7), chained like a resolution record:
@@ -114,6 +115,22 @@ static void px_close_record(uint64_t id, const char *why, const struct wp_close 
                    (unsigned long long)m->ms);
     if (m && !strcmp(why, "upstream_refused"))           /* section 5: what the upstream answered */
         fprintf(f, "\"upstream_status\":%u,", m->upstream_status);
+    /* v1.26.1: an inspected connection: the server's certificate, and why a
+     * handshake failed */
+    if (m && m->inspected) {
+        fputs("\"inspected\":true,", f);
+        static const uint8_t zero[32];
+        if (memcmp(m->server_cert, zero, sizeof zero)) {
+            char hx[65];
+            sodium_bin2hex(hx, sizeof hx, m->server_cert, sizeof m->server_cert);
+            fprintf(f, "\"server_cert_sha256\":\"%s\",", hx);
+        }
+        if (m->tls_why[0]) {
+            fputs("\"tls_error\":\"", f);
+            json_escape(f, m->tls_why);
+            fputs("\",", f);
+        }
+    }
     fprintf(f, "\"timestamp_ns\":%lld}\n", (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
     rec_end(NULL);
 }
@@ -122,13 +139,24 @@ static void px_close_record(uint64_t id, const char *why, const struct wp_close 
  * open, or a malformed report: the proxy is not behaving). */
 static int px_closed(const struct wp_close *m) {
     static const char *const kWhy[] = { "closed", "reset", "idle", "run_end", "upstream_refused",
-                                         "refused_request", "client_gone" };
+                                         "refused_request", "client_gone",
+                                         /* v1.26.1: an inspected connection only */
+                                         "server_tls", "client_tls", "tls_timeout", "inspect_not_built" };
     bool ok = false;
-    if (!memchr(m->why, 0, sizeof m->why)) return -1;
-    for (size_t k = 0; k < sizeof kWhy / sizeof *kWhy; k++) if (!strcmp(m->why, kWhy[k])) ok = true;
+    size_t wk = 0;
+    if (!memchr(m->why, 0, sizeof m->why) || !memchr(m->tls_why, 0, sizeof m->tls_why)) return -1;
+    for (size_t k = 0; k < sizeof kWhy / sizeof *kWhy; k++) if (!strcmp(m->why, kWhy[k])) { ok = true; wk = k; }
     if (!ok) return -1;
+    for (const char *t = m->tls_why; *t; t++) if ((unsigned char)*t < 0x20 || *t == 0x7f) return -1;
     for (size_t k = 0; k < g_px_nopen; k++)
         if (g_px_open[k].id == m->id) {
+            /* v1.26.1: the report says inspected exactly for a connection
+             * passed on to be inspected; the TLS reasons are an inspected
+             * one's; and until requests are decided (step 6) nothing was
+             * sent to an inspected connection's server */
+            if ((m->inspected != 0) != g_px_open[k].inspect || (wk >= 7 && !m->inspected) ||
+                (m->inspected && m->bytes_up != 0))
+                return -1;
             g_px_open[k] = g_px_open[--g_px_nopen];
             px_close_record(m->id, m->why, m);
             return 0;
@@ -138,8 +166,9 @@ static int px_closed(const struct wp_close *m) {
 
 static void px_record(struct px_req *q, decision_t d_raw, decision_t d_final, const char *rule, int err) {
     size_t el = strlen(q->a->extra);
-    snprintf(q->a->extra + el, sizeof q->a->extra - el, "\"proxy_conn\":%llu,\"proxy_kind\":\"%s\",",
-             (unsigned long long)q->id, pp_kind_name((pp_kind_t)q->kind));
+    snprintf(q->a->extra + el, sizeof q->a->extra - el, "\"proxy_conn\":%llu,\"proxy_kind\":\"%s\",%s",
+             (unsigned long long)q->id, pp_kind_name((pp_kind_t)q->kind),
+             q->inspect ? "\"inspected\":true," : "");
     if (q->up) {                                         /* section 5: the upstream used */
         el = strlen(q->a->extra);
         snprintf(q->a->extra + el, sizeof q->a->extra - el, "\"upstream\":\"%s:%u\",",
@@ -165,8 +194,8 @@ static void px_refuse(struct px_req *q, decision_t d_raw, const char *rule, int 
 }
 
 /* Pass the connected socket s to the proxy for request q. */
-static int px_pass(uint64_t id, int s) {
-    struct wp_verdict m = { .type = WP_MSG_VERDICT, .allow = 1, .id = id };
+static int px_pass(uint64_t id, int s, bool inspect) {
+    struct wp_verdict m = { .type = WP_MSG_VERDICT, .allow = 1, .id = id, .inspect = inspect };
     union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
     memset(&cb, 0, sizeof cb);
     struct iovec v = { &m, sizeof m };
@@ -181,13 +210,14 @@ static int px_pass(uint64_t id, int s) {
 
 /* Section 5: pass the socket dialed to the upstream proxy, with the name and
  * port the proxy is to ask it for (CONNECT). */
-static int px_pass_up(uint64_t id, int s, const char *name, unsigned port) {
+static int px_pass_up(uint64_t id, int s, const char *name, unsigned port, bool inspect) {
     struct wp_verdict_up m;
     memset(&m, 0, sizeof m);
     m.type = WP_MSG_VERDICT_UP;
     m.allow = 1;
     m.id = id;
     m.port = port;
+    m.inspect = inspect;
     snprintf(m.name, sizeof m.name, "%s", name);
     union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
     memset(&cb, 0, sizeof cb);
@@ -303,12 +333,13 @@ static void px_dialed(const struct policy *p, struct px_req *q, int so_error) {
         px_dial(p, q);
         return;
     }
-    if ((q->up ? px_pass_up(q->id, q->sock, q->name, q->port) : px_pass(q->id, q->sock)) < 0) {
+    if ((q->up ? px_pass_up(q->id, q->sock, q->name, q->port, q->inspect)
+               : px_pass(q->id, q->sock, q->inspect)) < 0) {
         (void)wp_verdict(&g_proxy, q->id, false);
         px_record(q, DEC_ALLOW, DEC_ALLOW, "proxy_dial_failed", EIO);
     } else {
         px_record(q, DEC_ALLOW, DEC_ALLOW, "proxy_dialed", 0);
-        px_open_add(q->id);              /* step 7: its proxy_close follows */
+        px_open_add(q->id, q->inspect);  /* step 7: its proxy_close follows */
     }
     px_free(q);
 }
@@ -364,13 +395,19 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
         px_refuse(q, d_raw, "certificate_refused", EACCES);
         return;
     }
-    /* v1.26.1 (until step 6 decides each request): in inspecting mode, a
-     * connection to a host that is not a passthrough host is refused, not
-     * relayed in SNI mode, which would let through requests the request
-     * rules refuse. Passthrough hosts are SNI mode by design. */
+    /* v1.26.1: in inspecting mode a host that is not a passthrough host is
+     * inspected: the proxy terminates its TLS (TLS, and TLS inside an
+     * answered CONNECT). Until each request is decided (step 6) it answers
+     * every request 403 and sends the server nothing. Plain HTTP has no TLS
+     * to terminate and is refused until then; relaying it as in SNI mode
+     * would let through requests the request rules refuse. Passthrough
+     * hosts are SNI mode by design. */
     if (p->v.proxy_inspect && !px_passthrough(p, q->name)) {
-        px_refuse(q, d_raw, "inspect_not_built", EACCES);
-        return;
+        if (q->kind == PP_KIND_HTTP) {
+            px_refuse(q, d_raw, "inspect_not_built", EACCES);
+            return;
+        }
+        q->inspect = true;
     }
     int i = wr_table_find(&g_names, q->name);
     if (i >= 0 && g_names.e[i].unlisted) i = -1;         /* only a deny rule names it */

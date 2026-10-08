@@ -78,6 +78,8 @@ struct wp_verdict {
     uint32_t type;               /* WP_MSG_VERDICT */
     uint32_t allow;
     uint64_t id;
+    uint32_t inspect;            /* v1.26.1: terminate TLS (inspecting mode, not a passthrough host) */
+    uint32_t pad;
 };
 
 /* Proxy -> Warden, step 7: a relayed connection ended (section 5: or the
@@ -96,6 +98,12 @@ struct wp_close {
     uint64_t bytes_down;         /* server -> client */
     uint64_t ms;                 /* how long it was relayed */
     char     why[24];            /* NUL-terminated */
+    /* v1.26.1, an inspected connection: the server's certificate (SHA-256
+     * of its DER; zero if none was presented), and for server_tls and
+     * client_tls why the handshake failed (OpenSSL's words) */
+    uint32_t inspected;
+    uint8_t  server_cert[32];
+    char     tls_why[96];        /* NUL-terminated */
 };
 /* Warden -> proxy, section 5: allow, with the socket the Warden dialed to
  * the upstream proxy (SCM_RIGHTS). The proxy asks it for name:port
@@ -106,7 +114,7 @@ struct wp_verdict_up {
     uint32_t allow;
     uint64_t id;
     uint32_t port;
-    uint32_t pad;
+    uint32_t inspect;            /* v1.26.1: as in struct wp_verdict */
     char     name[256];          /* NUL-terminated */
 };
 
@@ -180,6 +188,11 @@ int wp_announce(const wp_t *w, uint64_t id, unsigned from_port, pid_t tid, const
 
 /* Step 5: tell the proxy the verdict on connection id. Never blocks. 0 or -1. */
 int wp_verdict(const wp_t *w, uint64_t id, bool allow);
+/* v1.26.1, step 4: why a close report may give for an inspected connection,
+ * beyond the others: the server's certificate or handshake failed
+ * (server_tls), the client's handshake failed (client_tls), a handshake or
+ * the first request took over WP_READ_MS (tls_timeout), or the request was
+ * answered 403 because requests are not decided yet (inspect_not_built). */
 
 /* v1.26.1: inspecting mode's setup, before the agent starts (see struct
  * wp_inspect): send the run id, the trust bundle's path and the names, and

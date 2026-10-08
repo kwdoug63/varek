@@ -291,6 +291,8 @@ PROXY_ALLOW_RULES = ("proxy_dialed", "proxy_dial_failed")
 PROXY_KINDS = ("tls", "http", "connect")
 CLOSE_WHY = ("closed", "reset", "idle", "run_end", "unreported", "upstream_refused",
              "refused_request", "client_gone")       # v1.26 review: the last two
+# v1.26.1 (step 4): an inspected connection's own reasons
+TLS_CLOSE_WHY = ("server_tls", "client_tls", "tls_timeout", "inspect_not_built")
 
 
 HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -407,11 +409,13 @@ def check_closes(records, closes, complete, problems):
     "unreported"; and in a complete stream every connection passed on is
     closed. Returns the number of closes."""
     dialed, dialed_up = {}, {}           # proxy_conn -> its record's position; dialed to an upstream
+    inspected = {}                       # v1.26.1: proxy_conn -> passed on to be inspected
     for pos, rec in enumerate(records):
         if rec.get("action") == "net.proxy" and rec.get("rule") == "proxy_dialed" \
                 and rec.get("decision_final") == "ALLOW" and type(rec.get("proxy_conn")) is int:
             dialed.setdefault(rec["proxy_conn"], pos)
             dialed_up.setdefault(rec["proxy_conn"], "upstream" in rec)
+            inspected.setdefault(rec["proxy_conn"], rec.get("inspected") is True)
     closed = set()
     for pos, e in closes:
         cid, why = e.get("proxy_conn"), e.get("why")
@@ -422,7 +426,25 @@ def check_closes(records, closes, complete, problems):
             problems.append(f"connection {cid}: closed twice")
         closed.add(cid)
         counts = [e.get(k) for k in ("bytes_up", "bytes_down", "relay_ms")]
-        if why not in CLOSE_WHY:
+        # v1.26.1 (step 4): an inspected connection's close says so, with
+        # its own reasons; until requests are decided (step 6) nothing was
+        # sent to its server, or to its client from the server
+        insp = inspected.get(cid, False)
+        if why != "unreported" and (e.get("inspected") is True) != insp:
+            problems.append(f"connection {cid}: a close {'not ' if insp else ''}marked inspected, for a "
+                            f"connection {'' if insp else 'not '}passed on to be inspected")
+            continue
+        if why in TLS_CLOSE_WHY and not insp:
+            problems.append(f"connection {cid}: a close for {why!r}, which only an inspected connection has")
+            continue
+        if insp and why != "unreported" and (e.get("bytes_up") != 0 or e.get("bytes_down") != 0):
+            problems.append(f"connection {cid}: an inspected connection relayed bytes before requests are decided")
+            continue
+        if insp and ("server_cert_sha256" in e and not (isinstance(e["server_cert_sha256"], str) and
+                                                         HEX64.fullmatch(e["server_cert_sha256"]))):
+            problems.append(f"connection {cid}: a server certificate hash that is not one")
+            continue
+        if why not in CLOSE_WHY + TLS_CLOSE_WHY:
             problems.append(f"connection {cid}: a proxy_close for {why!r}")
         elif why == "unreported":
             if any(c is not None for c in counts):
@@ -486,16 +508,31 @@ def check_proxied(records, resolutions, handoff_all, problems, upstream=None, di
             continue
         # v1.26.1 (until step 6): in inspecting mode only a passthrough host's
         # connection is passed on; any other is refused, inspect_not_built
+        # v1.26.1: in inspecting mode a host is inspected unless it is a
+        # passthrough host; plain HTTP to an inspected host is refused until
+        # requests are decided (step 6), as nothing else is
         name = tgt.rsplit(":", 1)[0]
-        if passthrough is not None and dfin == "ALLOW" and name not in passthrough:
-            problems.append(f"seq {seq}: in inspecting mode, {name}, not a passthrough host, was passed on")
+        insp = rec.get("inspected") is True
+        if "inspected" in rec and not insp:
+            problems.append(f"seq {seq}: a malformed inspected mark")
             continue
-        if passthrough is not None and rule == "inspect_not_built" and name in passthrough:
-            problems.append(f"seq {seq}: {name}, a passthrough host, was refused as inspected")
+        if passthrough is None and (insp or rule == "inspect_not_built"):
+            problems.append(f"seq {seq}: a proxied decision inspected, or refused inspect_not_built, "
+                            f"outside inspecting mode")
             continue
-        if passthrough is None and rule == "inspect_not_built":
-            problems.append(f"seq {seq}: a proxied decision refused inspect_not_built outside inspecting mode")
-            continue
+        if passthrough is not None:
+            should = name not in passthrough
+            http = rec.get("proxy_kind") == "http"
+            if rule == "inspect_not_built" and not (should and http):
+                problems.append(f"seq {seq}: {name} refused inspect_not_built, which only plain HTTP to an "
+                                f"inspected host is")
+                continue
+            if insp != (should and not http and rule != "inspect_not_built" and
+                        rule not in ("policy_match", "default_deny_unknown", "certificate_refused",
+                                     "fragment_escape_flags", "fragment_escape_length")):
+                problems.append(f"seq {seq}: in inspecting mode, {name} was {'' if insp else 'not '}inspected, "
+                                f"which {'only a host that is not passthrough is' if insp else 'it must be'}")
+                continue
         # section 5: an allowed decision went to the policy's upstream, if it
         # names one (a refusal never reaches it, and carries none)
         up = rec.get("upstream")
@@ -1563,6 +1600,15 @@ def main(argv=None):
                 problems.append(f"seq {rec.get('seq')}: a view without its generation")
             else:
                 view_recs.append((rec, flv))
+            views += 1
+            continue
+        # v1.26.1: a read-type lookup of a trust view, answered from the view
+        if rec.get("action") in ("file.stat", "file.access") and rec.get("rule") == "view_metadata":
+            inspecting = (meta.get("run_start", {}).get("proxy") or {}).get("mode") == "inspect"
+            if not inspecting or rec.get("resolved") not in TRUST_VIEW_RULES["trust_view"] + \
+                    TRUST_VIEW_RULES["run_ca_view"] + TRUST_VIEW_RULES["trust_store_view"]:
+                problems.append(f"seq {rec.get('seq')}: a view's metadata answered for {rec.get('resolved')!r}, "
+                                f"which is not a trust view of a run in inspecting mode")
             views += 1
             continue
         is_open = rec.get("action") == "file.open" and rec.get("rule") in AUTHORIZED_OPEN_RULES

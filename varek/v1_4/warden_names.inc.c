@@ -188,6 +188,33 @@ static void view_serve(int notify_fd, const struct seccomp_notif *req, struct ac
                    err ? "view_failed" : kViewRule[v], ns_between(t0, &t1), err);
 }
 
+/* v1.26.1: a read-type lookup (stat, statx, access without W_OK or X_OK)
+ * of a trust view, named as such, is answered from the view itself, so a
+ * client that checks the file before opening it (Java does) finds a regular
+ * file of the view's size, whether or not the host has one there. As for
+ * view_serve, an explicit deny of the path wins. */
+static void view_meta(int notify_fd, const struct seccomp_notif *req, struct action *a,
+                      const struct policy *p, int v, const struct timespec *t0) {
+    snprintf(a->resolved, sizeof a->resolved, "%s", kViewPath[v]);
+    decision_t d_raw = policy_decide(p, a);
+    struct timespec t1;
+    if (d_raw == DEC_DENY) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        emit_pathology(g_report_seq++, req->pid, a, d_raw, DEC_DENY, decision_rule_id(a, d_raw),
+                       ns_between(t0, &t1), EACCES);
+        send_simple(notify_fd, req->id, DEC_DENY);
+        return;
+    }
+    int fd = view_open(v);
+    int64_t r = fd < 0 ? -EACCES : meta_answer(req->pid, notify_fd, req->id, a, fd, false);
+    if (fd >= 0) close(fd);
+    if (r < 0) send_errno(notify_fd, req->id, (int)-r);
+    else       send_value(notify_fd, req->id, r);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    emit_pathology(g_report_seq++, req->pid, a, d_raw, DEC_ALLOW, r < 0 ? "view_failed" : "view_metadata",
+                   ns_between(t0, &t1), r < 0 ? (int)-r : 0);
+}
+
 /* ---- section 4: candidates for a connect ---- */
 
 /* v1.24 review: addresses a name may not lead to. Whoever controls an

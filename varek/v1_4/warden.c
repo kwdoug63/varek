@@ -1329,6 +1329,7 @@ static bool       g_inspect_on = false;
 static unsigned char *g_trust_bundle, *g_ca_pem, *g_trust_p12;
 static size_t     g_trust_bundle_len, g_ca_pem_len, g_trust_p12_len;
 static char       g_trust_host_bundle[PATH_MAX];    /* the host's bundle the views start with */
+static const char *g_trust_bundle_arg;              /* v1.26.1: --trust-bundle, in its place */
 static char       g_trust_host_sha[65], g_ca_sha[65], g_trust_p12_sha[65];
 static int        g_trust_secure_heap, g_trust_nroots;
 static size_t     g_trust_nnames;
@@ -2979,6 +2980,13 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * the lookup no longer tells the agent what exists elsewhere. */
         if (is_meta_kind(act.kind)) {
             if (act.bad_flags) { send_errno(notify_fd, req.id, EINVAL); continue; }
+            /* v1.26.1: a trust view's metadata, from the view */
+            if (g_inspect_on && (act.kind == ACT_FILE_STAT ||
+                                 (act.kind == ACT_FILE_ACCESS && !(act.access_mode & (W_OK | X_OK)))) &&
+                view_by_target(act.target) >= VIEW_TRUST0) {
+                view_meta(notify_fd, &req, &act, p, view_by_target(act.target), &t0);
+                continue;
+            }
             int held = -1;
             if (meta_on_held_fd(req.pid, notify_fd, req.id, &act, &held) == 1) continue;
             int mfd = -1, missing = 0;
@@ -4136,7 +4144,7 @@ static void usage(const char *argv0) {
         "              [--sign-key <key>]\n"
         "              [--anchor <path>] [--checkpoint-every <n>] [--run-as <user>]\n"
         "              [--dns-server <a.b.c.d[:port]>] [--dns-ttl-min <s>] [--dns-ttl-max <s>]\n"
-        "              [--dns-grace-max <s>] [--psl <file>] [--shared-domains <file>]\n              [--proxy-as <user>] [--proxy-bin <warden-proxy>]\n"
+        "              [--dns-grace-max <s>] [--psl <file>] [--shared-domains <file>]\n              [--proxy-as <user>] [--proxy-bin <warden-proxy>] [--trust-bundle <pem>]\n"
         "              -- <target> [args...]\n"
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
         "\n"
@@ -4302,6 +4310,8 @@ int main(int argc, char **argv) {
             proxy_as_arg = argv[++i];
         } else if (strcmp(argv[i], "--proxy-bin") == 0 && !proxy_bin_arg) { /* v1.26.1 */
             proxy_bin_arg = argv[++i];
+        } else if (strcmp(argv[i], "--trust-bundle") == 0 && !g_trust_bundle_arg) { /* v1.26.1 */
+            g_trust_bundle_arg = argv[++i];
         } else if (strcmp(argv[i], "--checkpoint-every") == 0) {
             const char *v = argv[++i];
             uint64_t n = 0;

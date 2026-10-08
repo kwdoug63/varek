@@ -15,6 +15,7 @@
 #include <openssl/pem.h>
 #include <openssl/pkcs12.h>
 #include <openssl/rand.h>
+#include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <stdio.h>
@@ -184,3 +185,116 @@ done:
 }
 
 int pca_nroots(const pca_t *c) { return c->roots ? sk_X509_num(c->roots) : 0; }
+
+/* ---- v1.26.1, step 4: terminating TLS ---- */
+
+/* Toward the agent, only http/1.1 is offered: a client that offers ALPN
+ * without it (h2 alone, as gRPC) is refused; one that offers none is served. */
+static int alpn_select(SSL *s, const unsigned char **out, unsigned char *outlen, const unsigned char *in,
+                       unsigned int inlen, void *arg) {
+    (void)s; (void)arg;
+    for (unsigned i = 0; i < inlen;) {
+        unsigned l = in[i];
+        if (i + 1 + l > inlen) break;
+        if (l == 8 && !memcmp(in + i + 1, "http/1.1", 8)) { *out = in + i + 1; *outlen = 8; return SSL_TLSEXT_ERR_OK; }
+        i += 1 + l;
+    }
+    return SSL_TLSEXT_ERR_ALERT_FATAL;
+}
+
+int pca_tls_init(pca_t *c, char *why, size_t wn) {
+    EVP_PKEY_CTX *kc = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
+    if (!kc || EVP_PKEY_keygen_init(kc) <= 0 ||
+        EVP_PKEY_CTX_set_ec_paramgen_curve_nid(kc, NID_X9_62_prime256v1) <= 0 ||
+        EVP_PKEY_keygen(kc, &c->leaf_key) <= 0) {
+        EVP_PKEY_CTX_free(kc);
+        ossl_why(why, wn, "generating the leaf key");
+        return -1;
+    }
+    EVP_PKEY_CTX_free(kc);
+    c->cctx = SSL_CTX_new(TLS_server_method());
+    c->sctx = SSL_CTX_new(TLS_client_method());
+    X509_STORE *st = X509_STORE_new();
+    if (!c->cctx || !c->sctx || !st) { X509_STORE_free(st); ossl_why(why, wn, "the TLS contexts"); return -1; }
+    for (int i = 0; i < sk_X509_num(c->roots); i++) (void)X509_STORE_add_cert(st, sk_X509_value(c->roots, i));
+    ERR_clear_error();                            /* a root listed twice */
+    SSL_CTX_set_cert_store(c->sctx, st);
+    static const unsigned char h11[] = "\x08http/1.1";
+    if (!SSL_CTX_set_min_proto_version(c->cctx, TLS1_2_VERSION) ||
+        !SSL_CTX_set_min_proto_version(c->sctx, TLS1_2_VERSION) ||
+        SSL_CTX_set_alpn_protos(c->sctx, h11, sizeof h11 - 1) != 0 ||
+        !SSL_CTX_set_num_tickets(c->cctx, 0)) {
+        ossl_why(why, wn, "the TLS contexts' settings");
+        return -1;
+    }
+    SSL_CTX_set_options(c->cctx, SSL_OP_NO_TICKET | SSL_OP_NO_RENEGOTIATION);
+    SSL_CTX_set_options(c->sctx, SSL_OP_NO_TICKET | SSL_OP_NO_RENEGOTIATION);
+    SSL_CTX_set_session_cache_mode(c->cctx, SSL_SESS_CACHE_OFF);
+    SSL_CTX_set_session_cache_mode(c->sctx, SSL_SESS_CACHE_OFF);
+    SSL_CTX_set_alpn_select_cb(c->cctx, alpn_select, NULL);
+    SSL_CTX_set_verify(c->sctx, SSL_VERIFY_PEER, NULL);
+    c->leaf_name = calloc(PCA_MAX_LEAVES, sizeof *c->leaf_name);
+    c->leaf = calloc(PCA_MAX_LEAVES, sizeof *c->leaf);
+    if (!c->leaf_name || !c->leaf) { snprintf(why, wn, "out of memory"); return -1; }
+    return 0;
+}
+
+X509 *pca_leaf(pca_t *c, const char *name, char *why, size_t wn) {
+    for (size_t i = 0; i < c->nleaf; i++)
+        if (!strcmp(c->leaf_name[i], name)) {
+            if (X509_cmp_time(X509_get0_notAfter(c->leaf[i]), NULL) > 0) return c->leaf[i];
+            snprintf(why, wn, "the run's CA has expired");
+            return NULL;
+        }
+    if (X509_cmp_time(X509_get0_notAfter(c->cert), NULL) <= 0) {
+        snprintf(why, wn, "the run's CA has expired");
+        return NULL;
+    }
+    if (c->nleaf == PCA_MAX_LEAVES) {                 /* full: start again */
+        for (size_t i = 0; i < c->nleaf; i++) { free(c->leaf_name[i]); X509_free(c->leaf[i]); }
+        c->nleaf = 0;
+    }
+    X509 *x = X509_new();
+    unsigned char sb[16];
+    BIGNUM *bn = NULL;
+    ASN1_INTEGER *serial = NULL;
+    char *nm = strdup(name), *san = NULL;
+    if (!x || !nm || RAND_bytes(sb, sizeof sb) != 1) goto fail;
+    sb[0] = (unsigned char)((sb[0] & 0x7f) | 0x01);
+    bn = BN_bin2bn(sb, sizeof sb, NULL);
+    serial = bn ? BN_to_ASN1_INTEGER(bn, NULL) : NULL;
+    X509_NAME *sub = X509_get_subject_name(x);
+    if (!serial || !X509_set_version(x, 2) || !X509_set_serialNumber(x, serial) ||
+        !X509_NAME_add_entry_by_txt(sub, "O", MBSTRING_ASC, (const unsigned char *)"VAREK Warden (this run only)", -1, -1, 0) ||
+        (strlen(name) <= 64 && !X509_NAME_add_entry_by_txt(sub, "CN", MBSTRING_ASC, (const unsigned char *)name, -1, -1, 0)) ||
+        !X509_set_issuer_name(x, X509_get_subject_name(c->cert)) ||
+        !X509_gmtime_adj(X509_getm_notBefore(x), -PCA_BACKDATE_S) ||
+        !X509_set1_notAfter(x, X509_get0_notAfter(c->cert)) ||
+        !X509_set_pubkey(x, c->leaf_key))
+        goto fail;
+    X509V3_CTX ctx;
+    X509V3_set_ctx_nodb(&ctx);
+    X509V3_set_ctx(&ctx, c->cert, x, NULL, NULL, 0);
+    if (asprintf(&san, "DNS:%s", name) < 0) { san = NULL; goto fail; }
+    if (add_ext(x, &ctx, NID_basic_constraints, "critical,CA:FALSE") ||
+        add_ext(x, &ctx, NID_key_usage, "critical,digitalSignature") ||
+        add_ext(x, &ctx, NID_ext_key_usage, "serverAuth") ||
+        add_ext(x, &ctx, NID_subject_alt_name, san) ||
+        add_ext(x, &ctx, NID_authority_key_identifier, "keyid:always") ||
+        X509_sign(x, c->key, EVP_sha256()) <= 0)
+        goto fail;
+    BN_free(bn);
+    ASN1_INTEGER_free(serial);
+    free(san);
+    c->leaf_name[c->nleaf] = nm;
+    c->leaf[c->nleaf++] = x;
+    return x;
+fail:
+    ossl_why(why, wn, "making the leaf certificate");
+    BN_free(bn);
+    ASN1_INTEGER_free(serial);
+    free(san);
+    free(nm);
+    X509_free(x);
+    return NULL;
+}

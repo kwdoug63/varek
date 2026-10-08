@@ -89,7 +89,20 @@ static int trust_setup(const struct policy *p) {
     char why[512];
     struct stat st;
     g_trust_host_bundle[0] = '\0';
-    for (size_t i = 0; i < sizeof kHostBundles / sizeof kHostBundles[0]; i++)
+    /* --trust-bundle names the roots to trust in place of the host's (a
+     * corporate CA's bundle, or a test's): the views start with it, and the
+     * proxy verifies servers against it */
+    if (g_trust_bundle_arg) {
+        char *rp = realpath(g_trust_bundle_arg, NULL);
+        if (!rp || stat(rp, &st) < 0 || !S_ISREG(st.st_mode)) {
+            fprintf(stderr, "[warden] --trust-bundle %s is not a file; refusing to start\n", g_trust_bundle_arg);
+            free(rp);
+            return -1;
+        }
+        snprintf(g_trust_host_bundle, sizeof g_trust_host_bundle, "%s", rp);
+        free(rp);
+    }
+    for (size_t i = 0; !g_trust_host_bundle[0] && i < sizeof kHostBundles / sizeof kHostBundles[0]; i++)
         if (stat(kHostBundles[i], &st) == 0 && S_ISREG(st.st_mode)) {
             char *rp = realpath(kHostBundles[i], NULL);
             snprintf(g_trust_host_bundle, sizeof g_trust_host_bundle, "%s", rp ? rp : kHostBundles[i]);
