@@ -133,6 +133,7 @@ static void report_close(const struct wp_held *h, const char *why) {
         m.inspected = 1;
         memcpy(m.server_cert, h->server_cert, sizeof m.server_cert);
         snprintf(m.tls_why, sizeof m.tls_why, "%s", h->tls_why);
+        m.requests = h->seq;
     }
     (void)send(g_ctl, &m, sizeof m, MSG_NOSIGNAL);   /* blocking: a close report is never dropped */
 }

@@ -138,7 +138,7 @@ static void px_close_record(uint64_t id, const char *why, const struct wp_close 
     /* v1.26.1: an inspected connection: the server's certificate, and why a
      * handshake failed */
     if (m && m->inspected) {
-        fputs("\"inspected\":true,", f);
+        fprintf(f, "\"inspected\":true,\"requests\":%llu,", (unsigned long long)m->requests);
         static const uint8_t zero[32];
         if (memcmp(m->server_cert, zero, sizeof zero)) {
             char hx[65];
@@ -177,7 +177,9 @@ static int px_closed(const struct wp_close *m) {
              * sent to an inspected connection's server */
             if ((m->inspected != 0) != g_px_open[k].inspect || (wk >= 7 && !m->inspected) ||
                 (m->inspected && !g_px_open[k].allowed && m->bytes_up != 0) ||
-                (!strcmp(m->why, "max_body") != g_px_open[k].cut))
+                (!strcmp(m->why, "max_body") != g_px_open[k].cut) ||
+                /* step 7: the requests it counts are those it reported */
+                m->requests != (m->inspected ? g_px_open[k].next_seq - 1 : 0))
                 return -1;
             g_px_open[k] = g_px_open[--g_px_nopen];
             px_close_record(m->id, m->why, m);

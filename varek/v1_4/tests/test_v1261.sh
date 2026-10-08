@@ -727,7 +727,7 @@ PY
     POL="$POL4"
     forge "$OUT/t.log" "$OUT/h1.log" '"why":"refused_request","bytes_up":0,' '"why":"refused_request","bytes_up":512,'
     refuses "an inspected connection that relayed bytes though no request was allowed" "$OUT/h1.log" "though no request was allowed"
-    forge "$OUT/t.log" "$OUT/h2.log" ',"inspected":true,"server_cert_sha256"' ',"server_cert_sha256"'
+    forge "$OUT/t.log" "$OUT/h2.log" ',"inspected":true,"requests":' ',"requests":'
     refuses "an inspected connection's close not marked inspected" "$OUT/h2.log" "not marked inspected"
     forge "$OUT/t.log" "$OUT/h3.log" "\"target\":\"pinned.example.net:$P4\"," "\"target\":\"pinned.example.net:$P4\",\"inspected\":true,"
     refuses "a passthrough host's decision marked inspected" "$OUT/h3.log" "which only a host that is not passthrough is"
@@ -814,7 +814,7 @@ PY
         env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$OUT/up.policy" --dns-server "127.0.0.1:$DPORT" --trust-bundle "$BUNDLE" -- \
             /usr/bin/python3 "$W/up.py" "$P1" > "$OUT/up.out" 2> "$OUT/up.log"
         if grep -qx "UP HTTP/1.1 200 OK" "$OUT/up.out" && grep -q "CONNECT api.example.com:$P1" "$SQ/access.log" &&
-           grep '"event":"proxy_close"' "$OUT/up.log" | grep -q '"why":"closed".*"inspected":true,"server_cert_sha256"'
+           grep '"event":"proxy_close"' "$OUT/up.log" | grep -q '"why":"closed".*"inspected":true,"requests":1,"server_cert_sha256"'
         then pass "through a Squid upstream: the server verified inside its tunnel, the request decided and sent"
         else flunk "inspecting through a Squid upstream ($(cat "$OUT/up.out"); $(tail -2 "$SQ/access.log" 2>/dev/null))"; fi
         if python3 "$HERE/tools/varek_audit.py" --policy "$OUT/up.policy" --checker "$CERT" "$OUT/up.log" > /dev/null 2>&1
@@ -996,6 +996,68 @@ PY
     refuses "an allowed request without its rule's max_body" "$OUT/q3.log" "max_body is not its rule's"
     forge "$OUT/r.log" "$OUT/q4.log" '"request_seq":2,' '"request_seq":3,'
     refuses "requests out of order" "$OUT/q4.log" "out of order"
+
+    echo "== 6. audit and tools =="
+    # each inspected close counts the requests recorded on its connection
+    if python3 - "$OUT/r.log" <<'PY'
+import json, sys
+recs = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+closes = [r for r in recs if r.get("event") == "proxy_close" and r.get("inspected")]
+n = lambda c: sum(1 for r in recs if r.get("action") == "net.request" and r.get("proxy_conn") == c)
+sys.exit(not closes or any(c.get("requests") != n(c["proxy_conn"]) for c in closes))
+PY
+    then pass "each inspected proxy_close counts the requests recorded on its connection"
+    else flunk "each inspected proxy_close counts its requests"; fi
+    C1=$(grep -m1 -o '"inspected":true,"requests":[0-9]*,' "$OUT/r.log")
+    N1=${C1#*requests\":}; N1=${N1%,}
+    forge "$OUT/r.log" "$OUT/s1.log" "$C1" "\"inspected\":true,\"requests\":$((N1 + 1)),"
+    refuses "a close whose request count disagrees with the records" "$OUT/s1.log" "were recorded on it"
+    # each refusal is asked of the policy again
+    forge "$OUT/r.log" "$OUT/s2.log" '"rule":"policy_match","policy_line":8,' '"rule":"policy_match","policy_line":6,'
+    refuses "a refusal by a deny rule at a line that is not the rule deciding it" "$OUT/s2.log" "not the deny rule that decides it"
+    forge "$OUT/r.log" "$OUT/s3.log" "\"target\":\"GET $U/other\",\"resolved\":\"GET $U/other\"" \
+                                     "\"target\":\"GET $U/v1/models\",\"resolved\":\"GET $U/v1/models\""
+    refuses "a request refused as matching no rule, which a rule matches" "$OUT/s3.log" "but policy line 6 matches it"
+    forge "$OUT/r.log" "$OUT/s4.log" '"body_declared":2000,' '"body_declared":900,'
+    refuses "a max_body refusal of a body within the rule's max_body" "$OUT/s4.log" "does not limit it below"
+    # varek refusals explains each refused request and each connection the proxy ended
+    printf '[varek]\npolicy = %s\nlog_dir = %s\n' "$POL5" "$OUT" > "$OUT/varek.conf"
+    VAREK_CONFIG="$OUT/varek.conf" python3 "$HERE/tools/varek" refusals -n 500 "$OUT/r.log" > "$OUT/rf.out" 2>&1
+    VAREK_CONFIG="$OUT/varek.conf" python3 "$HERE/tools/varek" refusals -n 500 "$OUT/c.log" > "$OUT/rf4.out" 2>&1
+    rf() { grep -qF -- "$2" "$OUT/$1"; }
+    if rf rf.out "UNSATISFIED  net.request    GET $U/v1/admin/users/1" &&
+       rf rf.out "policy line 8: deny request * $U/v1/admin/**; the agent got 403 Forbidden" &&
+       rf rf.out "UNKNOWN      net.request    GET $U/other" && rf rf.out "no request rule allows it; the agent got 403" &&
+       rf rf.out "MAX_BODY     net.request    POST $U/v1/upload" && rf rf.out "(2000 bytes declared) is over that rule's max_body"
+    then pass "varek refusals: a deny rule's refusal with its line, a request no rule allows, a body over max_body"
+    else flunk "varek refusals explains refused requests ($(grep -m2 net.request "$OUT/rf.out"))"; fi
+    if rf rf.out "REFUSED      proxy_close" && rf rf.out "a Host other than the name and port the connection is for" &&
+       rf rf.out "the body passed max_body=1024; the connection was cut there" &&
+       rf rf4.out "SERVER_TLS   proxy_close" && rf rf4.out "the server failed verification: certificate: self-signed certificate" &&
+       [ "$(grep -c '^  REFUSED      proxy_close' "$OUT/rf.out")" = 1 ]
+    then pass "varek refusals: the connections the proxy ended (its parser, a cut body, a server failing verification), each once"
+    else flunk "varek refusals lists the connections the proxy ended"; fi
+    # the CycloneDX export carries inspecting mode
+    if python3 "$HERE/tools/varek_cyclonedx.py" --log "$OUT/r.log" --policy "$POL5" --output "$OUT/bom.json" > "$OUT/bom.out" 2>&1 &&
+       python3 - "$OUT/bom.json" "$OUT/r.log" <<'PY'
+import json, sys
+b = json.load(open(sys.argv[1]))
+recs = [json.loads(l) for l in open(sys.argv[2]) if l.startswith("{")]
+rs = next(r for r in recs if r.get("event") == "run_start")
+f = {p["name"]: p["value"] for p in b["metadata"]["component"]["properties"]}
+req = [r for r in recs if r.get("action") == "net.request"]
+ok = [r for r in req if r["decision_final"] == "ALLOW"]
+t = b["annotations"][0]["text"]
+names = {c["name"] for c in b["components"]}
+sys.exit(not (f["varek:proxy.mode"] == "inspect" and f["varek:proxy.binary.sha256"] == rs["proxy_binary_sha256"]
+              and f["varek:proxy.ca.sha256"] == rs["trust"]["ca_sha256"]
+              and f["varek:requests.total"] == str(len(req)) and f["varek:requests.allowed"] == str(len(ok))
+              and f["varek:requests.refused.max_body"] == "1" and f["varek:requests.bodies.cut"] == "1"
+              and "ran in inspecting mode" in t and "never their contents" in t
+              and all(r["target"] in names for r in ok)))
+PY
+    then pass "the CycloneDX export: the proxy's mode and hashes, the run's CA, request counts, each allowed request a component"
+    else flunk "the CycloneDX export carries inspecting mode ($(tail -2 "$OUT/bom.out"))"; fi
     for pid in $SRV; do kill "$pid" 2>/dev/null; done
     rm -rf "$W"
 fi

@@ -138,6 +138,8 @@ struct wp_close {
     uint32_t inspected;
     uint8_t  server_cert[32];
     char     tls_why[96];        /* NUL-terminated */
+    /* step 7: how many requests the proxy reported on it (WP_MSG_HTTPREQ) */
+    uint64_t requests;
 };
 /* Warden -> proxy, section 5: allow, with the socket the Warden dialed to
  * the upstream proxy (SCM_RIGHTS). The proxy asks it for name:port

@@ -332,7 +332,8 @@ def latest_log(cfg, given=None):
 def summarize(recs):
     s = {"run": None, "start": None, "complete": False, "warden": None, "policy": None,
          "policy_sha": None,
-         "allowed": 0, "refused": 0, "unknown": 0, "refusals": []}
+         "allowed": 0, "refused": 0, "unknown": 0, "refusals": [],
+         "proxy_targets": {}, "proxy_denied": set(), "proxy_ends": []}
     for r in recs:
         ev = r.get("event")
         if ev == "run_start":
@@ -345,12 +346,22 @@ def summarize(recs):
                 s["start"] = _dt.datetime.fromtimestamp(ts / 1e9).strftime("%Y-%m-%d %H:%M:%S")
         elif ev == "run_end":
             s["complete"] = True
+        elif ev == "proxy_close":
+            # v1.26.1 (step 7): a connection the proxy ended: its parser
+            # refused a request, a TLS handshake failed, or a body passed
+            # max_body (a refusal by the Warden is its net.request record)
+            if r.get("why") in ("refused_request", "server_tls", "client_tls", "tls_timeout", "max_body"):
+                s["proxy_ends"].append(r)
         elif ev == "dns_question" and r.get("rule") == "wildcard_budget":
             # v1.25: a name a wildcard rule's budget refused (NXDOMAIN)
             s["refused"] += 1
             s["refusals"].append(r)
         elif "decision_final" in r:
             d = r["decision_final"]
+            if r.get("action") == "net.proxy" and isinstance(r.get("proxy_conn"), int):
+                s["proxy_targets"].setdefault(r["proxy_conn"], r.get("target", ""))
+            if r.get("action") == "net.request" and d != "ALLOW":
+                s["proxy_denied"].add(r.get("proxy_conn"))
             if d == "ALLOW":
                 s["allowed"] += 1
             else:
@@ -893,12 +904,35 @@ def cmd_refusals(args):
     log = latest_log(cfg, args.log)
     s = summarize(read_records(log))
     policy = _policy_for_log(cfg, s)
-    if not s["refusals"]:
+    # v1.26.1: connections the proxy ended itself (a refusal by the Warden is
+    # its net.request record, listed with the others)
+    ends = [e for e in s["proxy_ends"]
+            if not (e.get("why") == "refused_request" and e.get("proxy_conn") in s["proxy_denied"])]
+    if not s["refusals"] and not ends:
         info(f"No refusals in {log}.")
         return 0
     info(f"{s['refused']} refused action(s) in {log}:\n")
     for r in s["refusals"][: args.n]:
         line = r.get("policy_line", -1)
+        if r.get("action") == "net.request":
+            # v1.26.1: a request on an inspected connection; the agent got a
+            # 403 and the connection ended after it
+            text = policy_line_text(policy, line) if policy and isinstance(line, int) and line >= 0 else None
+            rl = r.get("rule")
+            if rl == "max_body":
+                word = "MAX_BODY"
+                where = (f"policy line {line}" + (f": {text}" if text else "") + " allows it, but its body "
+                         f"({r.get('body_declared', '?')} bytes declared) is over that rule's max_body")
+            elif isinstance(line, int) and line >= 0:
+                word, where = verdict_word(r), f"policy line {line}" + (f": {text}" if text else
+                                                                        " (that policy file is no longer on this host)")
+            elif rl == "default_deny_unknown":
+                word, where = verdict_word(r), "no request rule allows it"
+            else:
+                word, where = verdict_word(r), RULE_WORDS.get(rl, rl or "no rule matched")
+            info(f"  {word:11}  {'net.request':13}  {r.get('target', '')}")
+            hint(f"{where}; the agent got 403 Forbidden and the connection ended")
+            continue
         if r.get("event") == "dns_question":
             text = policy_line_text(policy, line) if policy and isinstance(line, int) else None
             b = r.get("budget")
@@ -922,9 +956,31 @@ def cmd_refusals(args):
         hint(f"{where}; the agent got {r.get('kernel_verdict', '?')}")
     if s["refused"] > args.n:
         info(f"\n  ... and {s['refused'] - args.n} more (use -n to see them)")
+    if ends:
+        info(f"\n{len(ends)} connection(s) the proxy ended (inspecting mode):\n")
+        for e in ends[: args.n]:
+            why, cid = e.get("why"), e.get("proxy_conn")
+            err = e.get("request_error") or e.get("tls_error") or ""
+            label, what = {
+                "refused_request": ("REFUSED", "the proxy refused the request before deciding it"
+                                    f"{': ' + err if err else ''}; the agent got 403 Forbidden"),
+                "server_tls": ("SERVER_TLS", "the server failed verification"
+                               f"{': ' + err if err else ''}; nothing was sent, and the agent's handshake was refused"),
+                "client_tls": ("CLIENT_TLS", f"the agent's TLS handshake failed{': ' + err if err else ''} "
+                               "(does it trust the run's CA, and offer http/1.1?)"),
+                "tls_timeout": ("TLS_TIMEOUT", "a handshake, or the first request's head, took over 10 s"),
+                "max_body": ("MAX_BODY", f"{err or 'a body passed max_body'}; the connection was cut there"),
+            }[why]
+            info(f"  {label:11}  {'proxy_close':13}  connection {cid} "
+                 f"({s['proxy_targets'].get(cid, '?')})")
+            hint(what)
+        if len(ends) > args.n:
+            info(f"\n  ... and {len(ends) - args.n} more (use -n to see them)")
     info("\nUNSATISFIED: a deny rule matched.  UNKNOWN: no rule allowed it (refused by default).")
     if any(r.get("event") == "dns_question" for r in s["refusals"][: args.n]):
         info("BUDGET: a wildcard rule's budget refused a new name (raise it with names= or rate=).")
+    if any(r.get("rule") == "max_body" for r in s["refusals"][: args.n]):
+        info("MAX_BODY: a rule allowed the request, but its body is over the rule's max_body.")
     return 0
 
 

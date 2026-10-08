@@ -479,6 +479,43 @@ def check_requests(records, bodies, rules, problems):
     return n
 
 
+def check_refused_requests(checker, policy, rules, records, problems):
+    """v1.26.1 (step 7): each refused request is asked of the policy again.
+    The first request rule (policy order) that holds on its object decides:
+    policy_match must be a deny rule at its policy_line; default_deny_unknown
+    must have none; max_body must be an allow rule at its policy_line whose
+    max_body is under the declared length. (An allowed request is re-checked
+    by its certificate.) Asked of the checker."""
+    refused = [r for r in records if r.get("action") == "net.request" and r.get("decision_final") == "DENY"
+               and r.get("rule") in ("policy_match", "default_deny_unknown", "max_body")
+               and isinstance(r.get("target"), str)]
+    if not refused:
+        return
+    h = subprocess.run([checker, policy, "holds"], capture_output=True, text=True,
+                       input="\n".join(r["target"].encode().hex() for r in refused) + "\n")
+    rows = h.stdout.split()
+    if h.returncode != 0 or len(rows) != len(refused):
+        problems.append(f"checker failed on the refused requests: {h.stderr.strip()}")
+        return
+    reqs = [i for i, r in enumerate(rules) if r["kind"] == "r"]
+    for rec, row in zip(refused, rows):
+        seq, rule, line = rec.get("seq"), rec["rule"], rec.get("policy_line")
+        first = next((i for i in reqs if row[i] == "1"), None)
+        fr = rules[first] if first is not None else None
+        if rule == "default_deny_unknown":
+            if fr is not None:
+                problems.append(f"seq {seq}: a request refused as matching no rule, but policy line "
+                                f"{fr['line']} matches it")
+        elif rule == "policy_match":
+            if fr is None or fr["allow"] or fr["line"] != line:
+                problems.append(f"seq {seq}: a request refused by policy line {line!r}, which is not the "
+                                f"deny rule that decides it")
+        elif fr is None or not fr["allow"] or fr["line"] != line or not fr["max_body"] or \
+                type(rec.get("body_declared")) is not int or rec["body_declared"] <= fr["max_body"]:
+            problems.append(f"seq {seq}: a request refused for max_body, but the rule that allows it "
+                            f"(line {line!r}) does not limit it below its declared length")
+
+
 def check_closes(records, closes, complete, problems, bodies=()):
     """v1.26 (step 7): every proxy_close is of a connection the Warden passed
     to the proxy (proxy_dialed) before it, once; its byte counts and relay
@@ -526,6 +563,12 @@ def check_closes(records, closes, complete, problems, bodies=()):
         if insp and (why == "max_body") != exceeded:
             problems.append(f"connection {cid}: a close for {why!r}, but a body that passed max_body "
                             f"{'was' if exceeded else 'was not'} recorded")
+            continue
+        # step 7: the requests it counts are those recorded on it
+        nrq = sum(1 for r in records if r.get("action") == "net.request" and r.get("proxy_conn") == cid)
+        if why != "unreported" and ((insp and e.get("requests") != nrq) or (not insp and "requests" in e)):
+            problems.append(f"connection {cid}: a close counting {e.get('requests')!r} requests, "
+                            f"but {nrq} were recorded on it")
             continue
         if insp and ("server_cert_sha256" in e and not (isinstance(e["server_cert_sha256"], str) and
                                                          HEX64.fullmatch(e["server_cert_sha256"]))):
@@ -1866,6 +1909,8 @@ def main(argv=None):
     pcloses = check_closes(records, meta.get("proxy_closes", []), complete, problems,
                            meta.get("request_bodies", []))                       # step 7
     nreq = check_requests(records, meta.get("request_bodies", []), prules, problems)   # v1.26.1
+    if nreq:
+        check_refused_requests(a.checker, a.policy, prules, records, problems)            # step 7
     if proxied and proxy_ports is None:
         problems.append("proxied decisions, but the policy does not turn the proxy on")
     # v1.26: every connection id the Warden gave a hand-off is recorded once

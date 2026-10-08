@@ -305,12 +305,30 @@ FILE_ACTIONS = ("file.open", "file.stat", "file.access", "file.readlink")
 VIEW_RULES = {"hosts_view": "/etc/hosts", "resolv_view": "/etc/resolv.conf",
               "nsswitch_view": "/etc/nsswitch.conf", "hostconf_view": "/etc/host.conf",
               "netsvc_view": "/etc/netsvc.conf", "svc_view": "/etc/svc.conf"}   # v1.25
+# v1.26.1: in inspecting mode, the trust views (rule -> the paths it
+# answers), and a read-type lookup of one, answered from the view
+TRUST_VIEW_RULES = {"trust_view": ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+                                   "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", "/etc/ssl/cert.pem",
+                                   "/etc/varek/run-bundle.pem"),
+                    "run_ca_view": ("/etc/varek/run-ca.pem",),
+                    "trust_store_view": ("/etc/varek/run-trust.p12",)}
+_TRUST_PATHS = tuple(p for v in TRUST_VIEW_RULES.values() for p in v)
 _O_ACCMODE, _O_CREAT, _O_TRUNC = 3, 0o100, 0o1000
 
 
 def _is_view(r):
-    """A view answered: a read-only open of the view's own path."""
+    """A view answered: a read-only open of the view's own path (v1.26.1: or
+    a read-type lookup of a trust view)."""
     rule = r.get("rule")
+    if r.get("action") in ("file.stat", "file.access") and rule == "view_metadata":
+        return r.get("resolved") in _TRUST_PATHS and r.get("kernel_verdict") == "ALLOW"
+    if r.get("action") == "file.open" and rule in TRUST_VIEW_RULES:
+        try:
+            fl = int(r.get("open_flags"), 16)
+        except (TypeError, ValueError):
+            return False
+        return (r.get("resolved") in TRUST_VIEW_RULES[rule] and r.get("kernel_verdict") == "ALLOW"
+                and not fl & (_O_ACCMODE | _O_CREAT | _O_TRUNC))
     if r.get("action") != "file.open" or not isinstance(rule, str) or rule not in VIEW_RULES:
         return False
     try:
@@ -425,9 +443,68 @@ def attestation(records, authorized, refused, dist, policy, run_start, run_end,
     return " ".join(parts), facts
 
 
+def _proxy_text(records, pm):
+    """v1.26.1 (step 7): the proxy's facts and attestation sentences, from
+    run_start (its mode, its binary's hash, the run's CA) and the proxy's
+    records. Nothing without the proxy on."""
+    rs = pm.get("run_start") or {}
+    px = rs.get("proxy")
+    if not isinstance(px, dict):
+        return "", []
+    mode = "inspect" if px.get("mode") == "inspect" else "sni"
+    proxied = [r for r in records if r.get("action") == "net.proxy"]
+    closes = [e for _, e in pm.get("proxy_closes", [])]
+    facts = [("varek:proxy.mode", mode),
+             ("varek:proxy.binary.sha256", str(rs.get("proxy_binary_sha256", ""))),
+             ("varek:proxy.connections", str(len(proxied))),
+             ("varek:proxy.connections.allowed",
+              str(sum(1 for r in proxied if r.get("decision_final") == "ALLOW")))]
+    text = (f" The egress proxy ran in {'inspecting' if mode == 'inspect' else 'SNI'} mode "
+            f"(warden-proxy SHA-256 {rs.get('proxy_binary_sha256', 'not recorded')}): "
+            f"{len(proxied)} connection(s) decided on their name and port.")
+    if mode != "inspect":
+        return text, facts
+    tr = rs.get("trust") if isinstance(rs.get("trust"), dict) else {}
+    reqs = [r for r in records if r.get("action") == "net.request"]
+    allowed = [r for r in reqs if r.get("decision_final") == "ALLOW"]
+    over = [r for r in reqs if r.get("rule") == "max_body"]
+    bodies = [b for _, b in pm.get("request_bodies", [])]
+    cut = [b for b in bodies if b.get("exceeded_max_body") is True]
+    ends = [e for e in closes if e.get("why") in ("server_tls", "client_tls", "tls_timeout")]
+    parsed = [e for e in closes if e.get("why") == "refused_request" and "request_error" in e and
+              not any(r.get("proxy_conn") == e.get("proxy_conn") and r.get("decision_final") != "ALLOW"
+                      for r in reqs)]
+    facts += [("varek:proxy.ca.sha256", str(tr.get("ca_sha256", ""))),
+              ("varek:proxy.ca.names", str(tr.get("ca_names", ""))),
+              ("varek:proxy.ca.key_locked", "true" if tr.get("ca_key_locked") is True else "false"),
+              ("varek:proxy.trust_store.sha256", str(tr.get("trust_store_sha256", ""))),
+              ("varek:proxy.host_bundle.sha256", str(tr.get("host_bundle_sha256", ""))),
+              ("varek:proxy.passthrough", ",".join(str(h) for h in tr.get("passthrough") or [])),
+              ("varek:requests.total", str(len(reqs))),
+              ("varek:requests.allowed", str(len(allowed))),
+              ("varek:requests.refused", str(len(reqs) - len(allowed))),
+              ("varek:requests.refused.max_body", str(len(over))),
+              ("varek:requests.refused.parser", str(len(parsed))),
+              ("varek:requests.bodies", str(len(bodies))),
+              ("varek:requests.bodies.cut", str(len(cut))),
+              ("varek:proxy.tls_failures", str(len(ends)))]
+    text += (f" It terminated TLS with a CA made for this run (SHA-256 {tr.get('ca_sha256', 'not recorded')}, "
+             f"name-constrained to {tr.get('ca_names', '?')} name(s)), after verifying each server; "
+             f"{len(reqs)} request(s) were each decided on METHOD scheme://name:port/path?query "
+             f"before any of it was sent: {len(allowed)} allowed ("
+             f"{sum(1 for r in allowed if 'cert_rule' in r and r.get('check') == 'ok')} with a certificate "
+             f"the independent checker accepted), and "
+             f"{len(reqs) - len(allowed)} refused ({len(over)} for a body over max_body). "
+             f"The proxy's parser refused {len(parsed)} more before a decision, and "
+             f"{len(ends)} connection(s) ended in a failed TLS handshake. "
+             f"{len(bodies)} request body(ies) were recorded by length and SHA-256, never their "
+             f"contents" + (f"; {len(cut)} was cut at max_body." if cut else "."))
+    return text, facts
+
+
 def build_bom(records, agent, policy, serial, run_id="", complete=True,
               warden_version=VAREK_VERSION, policy_sha256="", log_info=None,
-              plan_gate=None, policy_check="not checked"):
+              plan_gate=None, policy_check="not checked", proxy_meta=None):
     # v1.12.2: the Warden component carries the version named in the stream's
     # run_start (the Warden that made the decisions), not this exporter's.
     now = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -524,9 +601,13 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
                                      run_start, run_end, warden_version, complete,
                                      log_info or {}, plan_gate, policy_check)
     if views:
-        attest_text += (f" {len(views)} open(s) of the resolver files were answered with the "
-                        f"Warden's views ({', '.join(sorted({r['rule'] for r in views}))}); no "
+        attest_text += (f" {len(views)} open(s) of the resolver files (and, in inspecting mode, the "
+                        f"trust files) were answered with the Warden's views ({', '.join(sorted({r['rule'] for r in views}))}); no "
                         f"file was opened, and they are not counted as decisions.")
+    # v1.26.1 (step 7): the egress proxy, and in inspecting mode its requests
+    pt, pfacts = _proxy_text(records, proxy_meta or {})
+    attest_text += pt
+    facts += pfacts
     agent_component["properties"] += [{"name": k, "value": v} for k, v in facts]
 
     annotation = {
@@ -802,7 +883,8 @@ def main(argv=None):
         policy_check = (f"{recorded_sha} as the Warden recorded it; the name given is not a "
                         f"file, so it was not compared" if recorded_sha else "not recorded")
     bom = build_bom(records, args.agent, args.policy, serial, run_id, complete,
-                    warden_version, recorded_sha, log_info, meta.get("plan_gate"), policy_check)
+                    warden_version, recorded_sha, log_info, meta.get("plan_gate"), policy_check,
+                    meta)
     if args.sign_key:
         sign_bom(bom, args.sign_key)
 
