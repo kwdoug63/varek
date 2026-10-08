@@ -2,9 +2,8 @@
 
 > **DRAFT, not released.** The review was done by AI review agents; a human
 > or third-party review has not been done. Still to come before tagging:
-> - the 24-hour soak report (Wikipedia, 40 names on one address), run on
->   the Warden before the review's fixes, and a short trial on the final one;
-> - the soak figures in the spec paper's draft edition.
+> - a short soak trial on the final Warden (the 24-hour soak ran on the
+>   Warden before the review's fixes).
 
 Released PENDING · MIT · github.com/kwdoug63/varek
 
@@ -128,15 +127,53 @@ twice and misplaced).
 
 ## 24 hours against Wikipedia
 
-PENDING. `tests/soak_v1250/soak.sh` fetches the Wikipedia API of 40
-language editions, `https://<lang>.wikipedia.org/`, one fetch a minute in
-turn, under `allow host *.wikipedia.org:443 acknowledge=dns-channel` at the
-default budgets. Every edition is served from the same addresses, as
-per-tenant names behind a CDN are, so each connect is decided over many
-names on one address. The run must show:
-- no refused connect caused by a stale table;
-- every question to the stub recorded;
-- no budget hit at the default budgets.
+`tests/soak_v1250/soak.sh` fetched the Wikipedia API of 40 language
+editions, `https://<lang>.wikipedia.org/`, one fetch a minute in turn, for
+24 hours, under `allow host *.wikipedia.org:443` at the default budgets.
+Every edition is served from the same addresses, as per-tenant names behind
+a CDN are, so connects are decided over several names on one address. It
+ran on the same DigitalOcean droplet as the v1.24 soak (Ubuntu 24.04,
+kernel 6.8, 1 vCPU, 1 GB), from 2026-10-07 01:28 to 2026-10-08 01:28 UTC.
+
+| | |
+|---|---|
+| Fetches | 1,440 of 1,440 OK, 0 failed |
+| Refused connects to port 443 | 0 |
+| Questions to the stub | 2,880, every one recorded; no fetch without its question |
+| Budget refusals | 0 |
+| Names charged | 40 of 256; at most 2 in any minute, of 30 |
+| Lookups on demand | 1,440, and 1,440 retirements |
+| Connects decided | 4,320; at most 5 candidates (4 names on one address) |
+| Peers | every peer the agent reached is in the resolution records |
+
+The defaults are far from the run's use: 40 of 256 names, and at most 2 a
+minute of 30. Names expired between fetches, 40 minutes apart, so at most 4
+were current on one address at once; the hashed form for more than 15 names
+is exercised by `make test-v1250` (40 names on one address), not here.
+
+**The run used the Warden before the review.** It was built from the v1.25
+branch as of section 5 (5ef3046), before the acknowledgment, the review's
+fixes and the version bump (its `run_start` says 1.23.1). Its policy has no
+`acknowledge=dns-channel`. A short trial on the final Warden confirms the
+release.
+
+## Found in the soak
+
+**The audit failed an honest stream (low).** `soak_check` reported FAIL:
+`varek_audit.py` refused 3 of the 4,320 connects, each because a name
+"did not resolve to 208.80.154.224". The stream shows why:
+- each name had been retired 30 or 60 s before, with that much grace, and
+  the connect was decided about 1 ms before the grace ended, so the Warden
+  rightly counted the name;
+- the record gives grace in whole seconds from the retirement record's
+  time, and the audit compared that with the connect record's time, written
+  3 to 5 ms after the decision (the dial), so it found the grace ended.
+
+The soak's checkout had the audit from before the v1.24 review, which allows
+for the rounding; the same stream passes the audit as of 9858835: `PASS`,
+24,969 decision records, the chain intact, 13,371 certificates re-checked.
+From the v1.25 review the Warden also records when each grace ends
+(`grace_end`), so the audit no longer works from rounded times at all.
 
 ## Latency
 

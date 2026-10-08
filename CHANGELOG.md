@@ -84,7 +84,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     and connects decided over 1 and 40 names on one address; results in
     `varek/v1_4/tests/latency_v1.25.0.txt`. A name in the table is answered in
     about 50 µs; deciding over 41 candidates costs about 1 to 2 µs a name.
-  - `RELEASE-v1.25.0.md`: draft release notes; the soak is pending.
+  - The 24-hour soak against Wikipedia (40 names on one address): 1,440 of
+    1,440 fetches, 0 refused connects, 2,880 questions all recorded, 0 budget
+    refusals, 40 of 256 names and at most 2 a minute of 30. Its audit failed
+    3 connects decided within 1 ms of a grace ending, from rounding the
+    soak's older audit did not allow for; the stream passes the audit as of
+    9858835, and the Warden now records each end of grace.
+  - `RELEASE-v1.25.0.md`: draft release notes.
 - v1.24.0, in progress (host names without agent DNS,
   `docs/security/v1.21-stage2-host-names.md`), sections 1 and 2:
   - Policy grammar: `allow host api.example.com[:port]` and `deny host <name>`
