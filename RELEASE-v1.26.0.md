@@ -2,7 +2,6 @@
 
 > **DRAFT, not released.** Still to come before tagging:
 > - the 24-hour soak on the droplet ("24 hours against three CDNs");
-> - the regression count against the v1.25.0 Warden ("Tested");
 > - the release date.
 >
 > The review was done by AI review agents; a human or third-party review
@@ -146,6 +145,14 @@ and 4,000,000 mutated inputs (ClientHellos, HTTP requests, CONNECTs,
 chunked bodies and upstream replies, cut at random lengths) under ASan and UBSan with no fault;
 CI runs it. A coverage-guided libFuzzer target is included for hosts whose
 clang has the runtime.
+
+**Regression.** Against the v1.25.0 Warden, parsers and audit, the suite
+fails 147 of its 156 checks. Seven are not run: they test the proxy's
+parsers, which v1.25.0 does not have. The other 2 pass trivially, because
+the old Warden refuses every `require warden 1.26` policy, so nothing in
+that run is asked upstream. Of the failures, 26 are grammar checks of
+refused forms: v1.25.0 refuses them too, but as a policy needing a newer
+Warden or a bad rule, not for the reason the check names.
 
 `make crosscheck` passes with 0 disagreements, with the proxy directives,
 upstreams among them, valid and malformed, in the fuzzed policies.
