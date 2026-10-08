@@ -173,6 +173,7 @@ struct vdp_prog {
      * whose set holds byte b; the tokens that are ONE, STAR, SEGS, and
      * STAR or SEGS (the forward skips). */
     uint64_t       *bm, *onem, *starm, *segsm, *skipm;
+    bool            noq;        /* v1.26.1 review: no SEGS run takes '?' (reachability of request rules) */
 };
 
 static inline bool bs_has(const bset_t *s, unsigned b) { return (s->w[b >> 6] >> (b & 63)) & 1; }
@@ -321,11 +322,20 @@ static struct vdp_prog *prog_from_atom(vdp_str_op_t op, const char *c, size_t le
 }
 
 /* Compile a glob. Returns NULL with a message in emsg on a malformed pattern
- * (or out of memory). */
+ * (or out of memory). v1.26.1 review: with noq, no wildcard takes '?' (a
+ * request rule without a query, for the reachability search: its language
+ * is the glob's strings without a '?'); with tail, the program then takes a
+ * '?' and anything after it (a deny rule's path with a query). */
+static struct vdp_prog *prog_glob_x(const char *c, size_t len, bool noq, bool tail, char *emsg, size_t en);
 static struct vdp_prog *prog_glob(const char *c, size_t len, char *emsg, size_t en) {
+    return prog_glob_x(c, len, false, false, emsg, en);
+}
+static struct vdp_prog *prog_glob_x(const char *c, size_t len, bool noq, bool tail, char *emsg, size_t en) {
     struct pbuild b;
     if (!prog_new(&b)) { snprintf(emsg, en, "out of memory"); return NULL; }
     bset_t any = bs_any(), ns = bs_notslash();
+    bset_t any_all = any;
+    if (noq) { any.w['?' >> 6] &= ~(1ull << ('?' & 63)); ns.w['?' >> 6] &= ~(1ull << ('?' & 63)); }
     bool after_slash = false;     /* previous token is an unescaped '/' (or SEGS) */
     int wild = 0;
     size_t i = 0;
@@ -397,6 +407,7 @@ static struct vdp_prog *prog_glob(const char *c, size_t len, char *emsg, size_t 
             if (neg) {
                 for (int w = 0; w < 4; w++) m.w[w] = ns.w[w] & ~m.w[w];
             }
+            if (noq) m.w['?' >> 6] &= ~(1ull << ('?' & 63));
             TOK(T_ONE, &m);
             wild++;
             after_slash = false;
@@ -409,9 +420,16 @@ static struct vdp_prog *prog_glob(const char *c, size_t len, char *emsg, size_t 
         }
         if (wild > VDP_GLOB_MAX_WILD) FAIL("more than %d wildcards in a glob", VDP_GLOB_MAX_WILD);
     }
+    if (tail) {
+        bset_t q = bs_one('?');
+        TOK(T_ONE, &q);
+        TOK(T_STAR, &any_all);
+    }
 #undef TOK
 #undef FAIL
-    return prog_done(&b);
+    struct vdp_prog *pr = prog_done(&b);
+    if (pr) pr->noq = noq;
+    return pr;
 }
 
 /* Automaton state sets. A set is 2 * w1 words: bits 0..ntok of the first half
@@ -461,6 +479,7 @@ static bool prog_step(const struct vdp_prog *p, const uint64_t *S, unsigned b, u
         uint64_t one = aw & p->onem[w];
         uint64_t segs = P[w] & p->segsm[w];
         uint64_t in = I[w] | segs;                 /* SEGS: any byte stays inside */
+        if (p->noq && b == '?') in = 0;            /* v1.26.1 review: but '?', in a request rule */
         TI[w] = in;
         TP[w] = (one << 1) | carry | (aw & p->starm[w]);
         carry = one >> 63;
@@ -2048,28 +2067,37 @@ static void refine(unsigned char *cls, size_t *ncls, const bset_t *s) {
     *ncls = nn;
 }
 
-static vdp_reach_t reach_automaton(const vdp_policy_t *p, size_t i, char *wit, size_t wcap,
-                                   size_t *wlen, uint32_t *wflags) {
+/* v1.26.1 review: a request rule without a query (qmode) holds on a language
+ * other than its glob's: an allow rule's is the glob's strings without a '?'
+ * (A); a deny rule's is A and A followed by '?' and anything (B). Each is
+ * searched as its own automaton: an earlier deny rule is two to avoid, and a
+ * deny rule i is searched once in A (variant 0) and once in B (1). */
+#define RA_MAX (2 * VDP_MAX_RULES)
+static vdp_reach_t reach_automaton_v(const vdp_policy_t *p, size_t i, int variant, char *wit, size_t wcap,
+                                     size_t *wlen, uint32_t *wflags) {
     const vdp_rule_t *ri = &p->rules[i];
     vdp_kind_t kind = ri->kind;
     const vdp_bv_atom_t *bi = &ri->b;
 
     /* Candidates: rule i, then earlier same-kind rules whose flag atom can hold
-     * together with B_i. */
-    int cand[VDP_MAX_RULES];
+     * together with B_i (a deny rule without a query twice: A, then B). */
+    int cand[RA_MAX], cvar[RA_MAX];
     size_t nc = 0;
+    cvar[nc] = variant;
     cand[nc++] = (int)i;
     for (size_t j = 0; j < i; j++) {
         const vdp_rule_t *r = &p->rules[j];
         if (r->kind != kind) continue;
         uint32_t ov = bi->mask & r->b.mask;
         if ((bi->value & ov) != (r->b.value & ov)) continue;
+        cvar[nc] = 0;
         cand[nc++] = (int)j;
+        if (r->s.qmode == VDP_Q_DENY) { cvar[nc] = 1; cand[nc++] = (int)j; }
     }
 
-    struct vdp_prog *owned[VDP_MAX_RULES] = { 0 };
-    const struct vdp_prog *pg[VDP_MAX_RULES];
-    struct ldfa L[VDP_MAX_RULES];
+    struct vdp_prog *owned[RA_MAX] = { 0 };
+    const struct vdp_prog *pg[RA_MAX];
+    struct ldfa L[RA_MAX];
     size_t nld = 0;
     vdp_reach_t res = VDP_REACH_UNKNOWN;
     const char *why = "state_budget";
@@ -2080,7 +2108,10 @@ static vdp_reach_t reach_automaton(const vdp_policy_t *p, size_t i, char *wit, s
 
     for (size_t k = 0; k < nc; k++) {
         const vdp_str_atom_t *a = &p->rules[cand[k]].s;
-        if (a->op == VDP_STR_GLOB) pg[k] = a->prog;
+        if (a->op == VDP_STR_GLOB && a->qmode) {
+            char em[64];
+            pg[k] = owned[k] = prog_glob_x(a->c, a->len, true, cvar[k] == 1, em, sizeof em);
+        } else if (a->op == VDP_STR_GLOB) pg[k] = a->prog;
         else pg[k] = owned[k] = prog_from_atom(a->op, a->c, a->len);
         if (!pg[k]) goto out;
     }
@@ -2104,7 +2135,7 @@ static vdp_reach_t reach_automaton(const vdp_policy_t *p, size_t i, char *wit, s
     /* J: candidates whose language meets L_i. A rule that never meets L_i is
      * left out of every search: its automaton may never reach the empty set
      * (a contains rule does not), so it would only multiply the product. */
-    int J[VDP_MAX_RULES];
+    int J[RA_MAX];
     size_t nj = 0;
     for (size_t k = 1; k < nc; k++) {
         struct ldfa *two[2] = { &L[0], &L[k] };
@@ -2113,7 +2144,7 @@ static vdp_reach_t reach_automaton(const vdp_policy_t *p, size_t i, char *wit, s
     }
 
     /* S_always: B_j holds whenever B_i does. */
-    struct ldfa *comp[VDP_MAX_RULES];
+    struct ldfa *comp[RA_MAX];
     size_t m = 0;
     comp[m++] = &L[0];
     uint32_t free_bits = 0;
@@ -2200,6 +2231,18 @@ out:
     for (size_t k = 0; k < nld; k++) ld_free(&L[k]);
     for (size_t k = 0; k < nc; k++) prog_free(owned[k]);
     return res;
+}
+
+static vdp_reach_t reach_automaton(const vdp_policy_t *p, size_t i, char *wit, size_t wcap,
+                                   size_t *wlen, uint32_t *wflags) {
+    if (p->rules[i].s.qmode != VDP_Q_DENY) return reach_automaton_v(p, i, 0, wit, wcap, wlen, wflags);
+    vdp_reach_t a = reach_automaton_v(p, i, 0, wit, wcap, wlen, wflags);
+    if (a == VDP_REACHABLE) return a;
+    const char *why = g_reach_why;
+    vdp_reach_t b = reach_automaton_v(p, i, 1, wit, wcap, wlen, wflags);
+    if (b == VDP_REACHABLE || (a == VDP_DEAD && b == VDP_DEAD)) return b;
+    if (a == VDP_REACH_UNKNOWN) g_reach_why = why;
+    return VDP_REACH_UNKNOWN;
 }
 
 vdp_reach_t vdp_rule_reachable_witness(const vdp_policy_t *p, size_t i,

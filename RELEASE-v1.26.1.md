@@ -331,8 +331,17 @@ a Go server: each executed exactly the requests the Warden allowed.
 
 **Stated, not changed.** A chunked body's framing counts against
 `max_body`; `run_start`'s `host_roots` and `ca_key_locked` are the Warden's
-reports of its host, which the audit cannot recompute; the reachability
-analysis of a request rule is over its glob.
+reports of its host, which the audit cannot recompute.
+
+**Found by the cross-check, after the review.** With the review's query
+rules, the reachability analysis (`vdp_check analyze`, lint's "can never
+fire") still read each request rule as its glob alone, so it called a deny
+rule dead behind an allow rule of the same glob, though the deny holds on
+the path with a query and the allow on no query. Decisions and certificates
+were not affected; lint could have told an operator a deny rule was dead.
+The analysis now searches each rule's actual language (a rule without a `?`
+as the glob's strings without one, and a deny rule also with a query
+after), and `make test-v1261` checks the case.
 
 ## Known limits
 

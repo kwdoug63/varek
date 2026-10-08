@@ -233,6 +233,14 @@ decide 'GET https://api.example.com:443/v1/secret?x=1'        UNSATISFIED "revie
 decide 'DELETE https://api.example.com:443/v1/projects/prod?' UNSATISFIED "review: ... for any method it names"
 decide 'GET https://api.example.com:443/v1/models?'           UNKNOWN     "review: an allow rule without a '?' allows no query, not even an empty one"
 decide 'GET https://api.example.com:443/q/a/b?x=1'            SATISFIED   "review: a rule with a query allows one, its path wildcards in the path"
+# reachability under the same rules: a deny rule after an allow of the same
+# glob still fires, on the path with a query (the allow takes none)
+printf 'require warden 1.26\nproxy inspect\nallow host a.example.com:443\nallow request PUT https://a.example.com/v1/**\ndeny request PUT https://a.example.com/v1/**\n' > "$OUT/qr.txt"
+QR="$("$VDP" "$OUT/qr.txt" analyze 2>/dev/null | grep '"line":5,')"
+QW="$(printf '%s' "$QR" | python3 -c 'import json, sys; print(bytes.fromhex(json.loads(sys.stdin.read() or "{}").get("witness", "")).decode())' 2>/dev/null)"
+if printf '%s' "$QR" | grep -q '"reach":"REACHABLE"' && case "$QW" in *\?*) true ;; *) false ;; esac
+then pass "review: a deny rule after an allow of the same glob is reachable, by a request with a query ($QW)"
+else flunk "review: the reachability of a deny rule after an allow of the same glob ($QR)"; fi
 unset RPOL
 refused "review: a request URL with a second '?'" "$(Q 'GET https://api.example.com/v1/x?a=1?b')" "at most one '?'"
 printf 'require warden 1.26\nproxy inspect\nallow host api.example.com:443\nallow host *.svc.example.org:443 acknowledge=dns-channel\nallow request GET https://*.other.example.net/x\nallow request GET https://*.example.com/y\nallow request GET https://*.example.org/w\n' > "$OUT/n2.txt"
