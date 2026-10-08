@@ -237,8 +237,9 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
                 meta.setdefault("resolutions", []).append((len(records), rec))
             # v1.25: the stub resolver's questions and the resolutions, in
             # stream order (varek_audit.py checks the budgets and that every
-            # name looked up on demand was asked for first).
-            if event in ("resolution", "dns_question") and run is not None \
+            # name looked up on demand was asked for first). v1.26: and the
+            # synthetic addresses given with the proxy on.
+            if event in ("resolution", "dns_question", "synthetic_address") and run is not None \
                     and rec.get("run") == run and meta is not None:
                 meta.setdefault("dns_events", []).append(rec)
             continue

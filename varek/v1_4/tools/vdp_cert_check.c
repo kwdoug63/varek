@@ -171,8 +171,8 @@ static int canon_for_open(const char *p, char out[PATH_MAX], int depth) {
 int main(int argc, char **argv) {
     if (argc != 3 || (strcmp(argv[2], "digest") && strcmp(argv[2], "batch") &&
                       strcmp(argv[2], "holds") && strcmp(argv[2], "openable") &&
-                      strcmp(argv[2], "kinds") && strcmp(argv[2], "rules"))) {
-        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds|rules\n", argv[0]);
+                      strcmp(argv[2], "kinds") && strcmp(argv[2], "rules") && strcmp(argv[2], "proxy"))) {
+        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds|rules|proxy\n", argv[0]);
         return 2;
     }
     FILE *f = fopen(argv[1], "rb");
@@ -233,6 +233,20 @@ int main(int argc, char **argv) {
                    ri.wild ? 'w' : '-', ri.line, (unsigned)ri.names, (unsigned)ri.rate);
             for (size_t k = 0; k < ri.clen; k++) printf("%02x", (unsigned char)ri.c[k]);
             printf("%s\n", ri.clen ? "" : "=");
+        }
+        vdpc_free(&pol);
+        return 0;
+    }
+
+    /* v1.26: the egress proxy, one line: "off", or "on" and the proxied
+     * ports in force (80 443 when the policy names none). */
+    if (!strcmp(argv[2], "proxy")) {
+        if (!pol.proxy) printf("off\n");
+        else if (!pol.proxy_nports) printf("on 80 443\n");
+        else {
+            printf("on");
+            for (size_t k = 0; k < pol.proxy_nports; k++) printf(" %u", pol.proxy_ports[k]);
+            printf("\n");
         }
         vdpc_free(&pol);
         return 0;

@@ -102,7 +102,8 @@ static int view_memfd(int v) {
     size_t len = 0;
     FILE *f = open_memstream(&buf, &len);
     if (!f) return -1;
-    if (v == VIEW_HOSTS) wr_hosts_view(&g_names, f);
+    if (v == VIEW_HOSTS && g_syn_on) syn_hosts_view(g_syn_p, f);      /* v1.26 */
+    else if (v == VIEW_HOSTS) wr_hosts_view(&g_names, f);
     /* v1.25: with the stub resolver up, the agent's questions go to it */
     else if (v == VIEW_RESOLV && g_stub_on) fputs("nameserver 127.53.53.53\noptions attempts:2 timeout:5\n", f);
     else if (v == VIEW_RESOLV) fputs("nameserver 192.0.2.1\noptions attempts:1 timeout:0\n", f);

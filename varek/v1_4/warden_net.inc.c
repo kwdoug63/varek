@@ -85,6 +85,15 @@ static uint64_t g_report_seq = 0;       /* report_id sequence (was supervise()'s
 /* v1.25: the stub resolver (warden_stub.inc.c, included after this file) */
 struct sock_kind;
 static bool stub_is_dest(const struct sockaddr_storage *dial);
+/* v1.26: is the address dialed (IPv4, or IPv4-mapped) a synthetic one? */
+static bool dial_synthetic(int fam, const void *addr) {
+    wr_ip_t ip;
+    memset(&ip, 0, sizeof ip);
+    if (fam == AF_INET6 && !IN6_IS_ADDR_V4MAPPED((const struct in6_addr *)addr)) return false;
+    ip.fam = 4;
+    memcpy(ip.a, fam == AF_INET6 ? (const unsigned char *)addr + 12 : (const unsigned char *)addr, 4);
+    return syn_is_addr(&ip);
+}
 static void stub_connect(int notify_fd, const struct seccomp_notif *req, struct action *a,
                          int ag, const struct sock_kind *k, const struct timespec *t0);
 
@@ -698,6 +707,7 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
             return;
         }
         if (g_any_name && port == 53) rule = "dns_refused";
+        else if (dial_synthetic(dial.ss_family, ad)) rule = "synthetic_address";   /* v1.26: until step 4 */
         else if (names_candidates(a, dial.ss_family, ad, port) < 0) rule = "out_of_memory";
         if (rule) {
             close(ag);

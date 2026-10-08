@@ -49,6 +49,11 @@ policy file alone:
      budgets; budget refusals and questions no rule allows are NXDOMAIN and
      charge nothing; every name looked up on demand was asked for first; a
      NOERROR answer carries only addresses the name's latest resolution lists.
+  8. v1.26, the egress proxy: with `proxy on`, a name host rules allow only
+     on proxied ports is answered with its synthetic address (A) or no data,
+     never looked up or charged; every synthetic_address record gives such a
+     name the next address of 198.18.0.0/15, each name and address once; and
+     no connect to a synthetic address is dialed.
 
 Exit 0 only if all of these hold. The verdict stream is the Warden's stderr
 (`warden policy -- agent 2> verdicts.log`). The report's "integrity" line says
@@ -226,6 +231,90 @@ def stub_rules(checker, policy, rules, names):
     return out
 
 
+def policy_proxy(checker, policy):
+    """v1.26: the proxied ports in force (80 and 443 when the policy names
+    none), or None without `proxy on`. Asked of the checker."""
+    rq = subprocess.run([checker, policy, "proxy"], capture_output=True, text=True)
+    f = rq.stdout.split()
+    if rq.returncode != 0 or not f or f[0] not in ("on", "off"):
+        raise ValueError("the checker failed on the policy's proxy directives")
+    return [int(x) for x in f[1:]] if f[0] == "on" else None
+
+
+SYN_NET = ipaddress.ip_network("198.18.0.0/15")   # the Warden's synthetic addresses (v1.26)
+SYN_MAX = 131070
+
+
+def proxied_only(checker, policy, rules, names, pports):
+    """v1.26: the names host rules allow only on proxied ports, as
+    warden_synth.inc.c's syn_qualifies decides: name:port for the ports host
+    rules name (as stub_rules collects them), the proxied ports, and one port
+    in neither; allowed (the first host rule that holds is an allow rule) on
+    some proxied port and on no other. A set of names. Asked of the checker."""
+    hosts = [i for i, r in enumerate(rules) if r["kind"] == "h"]
+    ports = []
+    for i in hosts:
+        p = _host_port(rules[i]["c"])
+        if p is not None and p not in ports:
+            ports.append(p)
+        if len(ports) >= 63:
+            break
+    ports += [p for p in pports if p not in ports]
+    other = 1
+    while other in ports and other < 65535:
+        other += 1
+    ports.append(other)
+    names = sorted(names)
+    strs = [f"{n}:{p}" for n in names for p in ports]
+    if not strs:
+        return set()
+    h = subprocess.run([checker, policy, "holds"], capture_output=True, text=True,
+                       input="\n".join(s.encode().hex() for s in strs) + "\n")
+    rows = h.stdout.split()
+    if h.returncode != 0 or len(rows) != len(strs):
+        raise ValueError("the checker failed on the synthetic names")
+    out = set()
+    for k, n in enumerate(names):
+        allowed = []
+        for j, port in enumerate(ports):
+            row = rows[k * len(ports) + j]
+            first = next((i for i in hosts if row[i] == "1"), None)
+            if first is not None and rules[first]["allow"]:
+                allowed.append(port)
+        if allowed and all(p in pports for p in allowed):
+            out.add(n)
+    return out
+
+
+def check_synthetic(e, given, taken, synth, by_rule, line_of, problems):
+    """v1.26: a synthetic_address record (given: name -> address so far, to
+    which it is added; taken: their addresses) gives a name allowed only on proxied ports, under the
+    rule the stub answers it by, the next address of 198.18.0.0/15 (from
+    198.18.0.1), which no other name was given, and the name no other
+    address."""
+    name, addr, line = e.get("name"), e.get("address"), e.get("policy_line")
+    try:
+        ip = ipaddress.IPv4Address(addr)
+    except (ValueError, TypeError):
+        problems.append(f"{name!r}: a synthetic address {addr!r} that is not an IPv4 address")
+        return
+    if ip not in SYN_NET or ip in (SYN_NET[0], SYN_NET[-1]):
+        problems.append(f"{name}: a synthetic address {addr} outside 198.18.0.1-198.19.255.254")
+    if int(ip) != int(SYN_NET[0]) + len(given) + 1:
+        problems.append(f"{name}: given {addr}, not the next synthetic address")
+    if name in given or addr in taken:
+        problems.append(f"{name}: a synthetic address given twice ({addr})")
+    if name not in synth:
+        problems.append(f"{name}: given a synthetic address, but the policy allows it off the "
+                        f"proxied ports (or not at all)")
+    want = by_rule.get(name)
+    if want is None or line != line_of(want):
+        problems.append(f"{name}: given a synthetic address under policy line {line}, not the "
+                        f"policy's")
+    given.setdefault(name, addr)
+    taken.add(addr)
+
+
 def check_dns(meta, checker, policy, rules, problems):
     """v1.25: the stub resolver. run_start's budgets and stub are the
     policy's; every question was answered by the rule the policy gives its
@@ -242,6 +331,7 @@ def check_dns(meta, checker, policy, rules, problems):
     rs = meta.get("run_start", {})
     events = meta.get("dns_events", [])
     wild = policy_wildcards(rules)
+    pports = policy_proxy(checker, policy)                      # v1.26
     exact_names = {r["c"].rsplit(":", 1)[0] if _host_port(r["c"]) is not None else r["c"]
                    for r in rules if r["kind"] == "h" and r["name"] and not r["wild"]}
     budgets = rs.get("wildcard_budgets")
@@ -255,15 +345,27 @@ def check_dns(meta, checker, policy, rules, problems):
         if got != want:
             problems.append(f"run_start's wildcard budgets {got!r} are not the policy's {want}")
     # v1.25 review: the stub exists exactly when the policy has a wildcard
-    # allow rule, and is always at the same address
-    if rs.get("dns_stub") != (STUB if wild else None):
+    # allow rule (v1.26: or the proxy on and a host name rule), and is always
+    # at the same address
+    stub = wild or (pports is not None and any(r["kind"] == "h" and r["name"] and not r["wild"]
+                                               for r in rules))
+    if rs.get("dns_stub") != (STUB if stub else None):
         problems.append(f"run_start's dns_stub {rs.get('dns_stub')!r} is not the policy's "
-                        f"({STUB if wild else 'none'})")
+                        f"({STUB if stub else 'none'})")
     per = {ln: {"names": n, "rate": r, "label": DEFAULT_LABEL} for ln, (_s, n, r) in wild.items()}
     asked_names = {e.get("name") for e in events if e.get("event") == "dns_question"
                    and isinstance(e.get("name"), str) and e.get("name")}
-    by_rule = stub_rules(checker, policy, rules, asked_names) if asked_names else {}
+    syn_names = {e.get("name") for e in events if e.get("event") == "synthetic_address"
+                 and isinstance(e.get("name"), str) and e.get("name")}
+    by_rule = stub_rules(checker, policy, rules, asked_names | syn_names) \
+        if asked_names | syn_names else {}
     line_of = lambda i: rules[i]["line"] if i is not None else -1    # noqa: E731
+    # v1.26: with the proxy on, the names allowed only on proxied ports
+    synth = proxied_only(checker, policy, rules, asked_names | syn_names, pports) \
+        if pports is not None else set()
+    if pports is None and syn_names:
+        problems.append("synthetic addresses given, but the policy does not turn the proxy on")
+    syn_given, syn_taken = {}, set()
     charged, used, window, pending, latest = {}, {}, {}, {}, {}
     last_mono = None
     nq = nb = 0
@@ -271,6 +373,9 @@ def check_dns(meta, checker, policy, rules, problems):
         name, ts = e.get("name"), e.get("timestamp_ns")
         if not isinstance(name, str) or (e.get("event") == "resolution" and not name):
             problems.append(f"a {e.get('event')} record without a name")
+            continue
+        if e.get("event") == "synthetic_address":
+            check_synthetic(e, syn_given, syn_taken, synth, by_rule, line_of, problems)
             continue
         if e.get("event") == "resolution":
             a = e.get("a")
@@ -319,6 +424,23 @@ def check_dns(meta, checker, policy, rules, problems):
             continue
         if rule == "exact_name" and (rules[want]["wild"] or name not in exact_names):
             problems.append(f"{name}: recorded as an exact name, but no exact rule allows it")
+            continue
+        # v1.26: a name allowed only on proxied ports is answered with its
+        # synthetic address (A) or no data, and nothing else is done for it
+        if (e.get("synthetic") is True) != (name in synth and rule in ("policy_match", "exact_name")):
+            problems.append(f"{name}: {'answered with' if e.get('synthetic') else 'not answered with'} "
+                            f"a synthetic address, but the policy allows it "
+                            f"{'off' if name not in synth else 'only on'} the proxied ports")
+            continue
+        if e.get("synthetic") is True:
+            want_a = [syn_given[name]] if e.get("type") == 1 and name in syn_given else []
+            if e.get("new") or e.get("upstream") or not (
+                    (ans == "noerror" and e.get("addresses") == want_a and
+                     (e.get("type") != 1 or name in syn_given)) or
+                    (ans == "servfail" and e.get("type") == 1 and name not in syn_given
+                     and len(syn_given) >= SYN_MAX)):
+                problems.append(f"{name}: a synthetic answer {ans} {e.get('addresses')!r} that is not "
+                                f"its synthetic address {want_a!r}, or that charged or sent anything")
             continue
         if rule == "wildcard_budget":
             nb += 1
@@ -966,6 +1088,15 @@ def main(argv=None):
     rules = [[r["kind"], "a" if r["allow"] else "d", "n" if r["name"] else "-", r["mask"], r["value"]]
              for r in prules]
     wild_policy = bool(policy_wildcards(prules))
+    # v1.26: the proxy's ports (None: off); the stub also runs with the proxy
+    # on and a host name rule
+    try:
+        proxy_ports = policy_proxy(a.checker, a.policy)
+    except (OSError, ValueError) as e:
+        problems.append(f"checker failed on the policy's proxy directives: {e}")
+        proxy_ports = None
+    stub_policy = wild_policy or (proxy_ports is not None and any(
+        r["kind"] == "h" and r["name"] and not r["wild"] for r in prules))
     if wild_policy:
         check_shared_lists(meta, a, problems)
     # v1.25 review: from 1.25 the Warden records the end of every grace
@@ -1012,9 +1143,9 @@ def main(argv=None):
             # v1.25 review: only with a wildcard allow rule in the policy, and
             # only to the stub's own address, by target and by what was reached
             ct = _canonical_dest(rec.get("target"))
-            if not wild_policy:
+            if not stub_policy:
                 problems.append(f"seq {rec.get('seq')}: a stub connect, but the policy has no "
-                                f"wildcard allow rule (no stub resolver)")
+                                f"wildcard allow rule and no proxy (no stub resolver)")
             elif rec.get("resolved") != STUB or ct is None or \
                     f"{_ip(str(ct[0]))}:{ct[1]}" != STUB:
                 problems.append(f"seq {rec.get('seq')}: a dns_stub record to "
@@ -1053,6 +1184,13 @@ def main(argv=None):
             lookups += 1
         elif is_conn:
             connects += 1
+            # v1.26: with the proxy on, the synthetic range is the Warden's: no
+            # connect to it is dialed (step 4 hands such a connect to the proxy)
+            dd = _canonical_dest(rec.get("dialed") or rec.get("resolved"))
+            if proxy_ports is not None and dd is not None and \
+                    dd[0] in SYN_NET:
+                problems.append(f"seq {rec.get('seq')}: a connect to the synthetic address "
+                                f"{dd[0]} was dialed")
         else:
             authorized += 1
         cr, cw = rec.get("cert_rule"), rec.get("cert_witness")

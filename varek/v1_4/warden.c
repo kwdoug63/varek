@@ -308,7 +308,7 @@ static int policy_load(const char *path, struct policy *p) {
             "(warden_faultinject); never use it to supervise a real agent\n");
 #endif
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.25");
+    snprintf(p->version, sizeof(p->version), "1.26");
     char err[512];
     /* v1.15: read the file once. The decision procedure and the certificate
      * checker parse these same bytes, and their SHA-256 goes in run_start, so
@@ -1297,6 +1297,14 @@ static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden
 #define STUB_LABEL_MAX     63            /* bytes matched by `*` */
 static char       g_psl_sha[65], g_shared_sha[65];  /* v1.25: the lists wildcards were checked against */
 static wp_t       g_proxy = { .ctl = -1 };          /* v1.26: the egress proxy, when `proxy on` */
+static bool       g_syn_on = false;    /* v1.26: `proxy on`: synthetic addresses (warden_synth.inc.c) */
+static const struct policy *g_syn_p;   /* v1.26: the policy, for the hosts view */
+/* v1.26: the stub runs with a wildcard allow rule (v1.25), or with the proxy
+ * on and any host name rule (synthetic addresses) */
+#define STUB_WANTED() (g_any_wild || (g_syn_on && g_names_on))
+#define SYN_BASE   0xc6120000u           /* 198.18.0.0 */
+#define SYN_MAX    131070u               /* synthetic addresses: 198.18.0.1 .. 198.19.255.254 */
+#define SYN_TTL    300u                  /* seconds, in answers (the address never changes) */
 static bool       g_lists_pinned;                   /* v1.25 review: they are the release's */
 static uint64_t g_records = 0;       /* decision records emitted */
 static bool     g_relay_midline = false;
@@ -1566,7 +1574,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     if (g_names_on) fprintf(f, "\"host_names\":%zu,\"resolver\":\"%s\",", g_names.n, g_names.resolver);
     /* v1.25: where the agent's questions go (connects and sends to it are
      * records with rule dns_stub) */
-    if (g_any_wild) fputs("\"dns_stub\":\"127.53.53.53:53\",", f);
+    if (STUB_WANTED()) fputs("\"dns_stub\":\"127.53.53.53:53\",", f);
     /* v1.26: the egress proxy: its listener, its user, the proxied ports */
     if (g_proxy.ctl >= 0) {
         fprintf(f, "\"proxy\":{\"mode\":\"sni\",\"listen\":\"127.0.0.1:%u\",\"uid\":%u,\"gid\":%u,\"ports\":[",
@@ -1634,6 +1642,8 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
     }
     /* v1.25: a wildcard adds names when the agent asks (the stub) */
     g_names_on = g_names.n > 0 || g_any_wild;
+    g_syn_on = p->v.proxy;               /* v1.26 */
+    g_syn_p = p;
     return 0;
 }
 
@@ -2717,9 +2727,16 @@ static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *mi
     return rc;
 }
 
+/* v1.26 (warden_synth.inc.c): synthetic addresses, used by the views, the
+ * connects and the stub */
+static bool syn_is_addr(const wr_ip_t *ip);
+static bool syn_qualifies(const struct policy *p, const char *name);
+static int  syn_assign(const char *name, int line, wr_ip_t *out);
+static void syn_hosts_view(const struct policy *p, FILE *f);
 #include "warden_names.inc.c"        /* v1.24: host-name views and candidates */
 #include "warden_net.inc.c"          /* v1.21: decided connections */
 #include "warden_stub.inc.c"         /* v1.25: the stub resolver for wildcard names */
+#include "warden_synth.inc.c"        /* v1.26: synthetic addresses with the proxy on */
 
 /* ---------------- receive loop ---------------- */
 
