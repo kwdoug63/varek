@@ -130,7 +130,13 @@ typedef struct {
     bool              portless;            /* host only: no port, so every port matches */
     bool              name;                /* host only (v1.24): a host name rule */
     bool              wild;                /* host only (v1.25): a wildcard *.suffix rule, held as a glob */
+    /* request only (v1.26.1 review): a rule whose URL has no query (no '?').
+     * VDP_Q_ALLOW: it holds on no object with a '?' (it allows no query);
+     * VDP_Q_DENY: it holds when its glob matches the object up to its first
+     * '?' (it denies its paths with any query). 0: the glob alone decides. */
+    uint8_t           qmode;
 } vdp_str_atom_t;
+enum { VDP_Q_ALLOW = 1, VDP_Q_DENY = 2 };
 
 typedef struct {
     uint32_t mask;      /* 0 = no constraint */
@@ -275,11 +281,22 @@ const char *vdp_kind_name(vdp_kind_t k);
 // neither '/', '\' nor an unreserved byte (A-Z a-z 0-9 - . _ ~); before the first
 // '?', no empty segment except a trailing one ('//' is refused) and no '.'
 // or '..' segment. '*', '**' and '[...]' in the path are glob wildcards as
-// above; '?' is the query's literal '?', never a wildcard. The rule is held
+// above; '?' is the query's literal '?', never a wildcard, and a URL has at
+// most one (v1.26.1 review: so has a request the proxy reads, so a rule's
+// '?' meets only the request's, and its path wildcards only the path).
+// A rule whose URL has no '?' (v1.26.1 review): an allow rule holds on no
+// request with a query (not even an empty one, "PATH?"); a deny rule holds on
+// a request whose path (the object up to its '?') its glob matches, whatever
+// the query. So `deny request GET https://h/v1/secret` refuses
+// /v1/secret?x=1 too, and `allow request GET https://h/v1/items/*/tag` does
+// not allow /v1/items/42?/tag. The rule is held
 // as a glob over the request object "METHOD scheme://host:port/path?query":
 //   <METHOD or *> <scheme>://<host, or ?*.<suffix>>:<port><path, each ? as \?>
 // max_body=N (allow rules only): N decimal (1 to 7 digits, no leading zero)
 // with an optional k (x1024) or m (x1048576), at most VDP_MAX_BODY_LIMIT.
+// It bounds the bytes of the body as sent: a chunked body's framing (chunk
+// sizes and line ends) counts, so it passes the limit before its data alone
+// would (review: stated, as the proxy counts and hashes what it sends).
 // Refused at the end of the file: request rules or passthrough hosts without
 // `proxy inspect`; a request rule on a port that is not proxied; a request
 // rule whose host is, or (a wildcard) covers, a passthrough host.

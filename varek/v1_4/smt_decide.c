@@ -593,6 +593,9 @@ int vdp_certificate(const vdp_policy_t *p, int rule_index, const char *s, vdp_ce
     }
     if (a->op == VDP_STR_GLOB) {
         size_t ns = 0;
+        const char *q = a->qmode ? memchr(s, '?', sl) : NULL;   /* v1.26.1 review */
+        if (q && a->qmode == VDP_Q_ALLOW) return -1;
+        if (q) sl = (size_t)(q - s);              /* a deny rule without a query: on the path */
         if (prog_witness(a->prog, s, sl, c->span, VDP_GLOB_MAX_WILD, &ns) != 1) return -1;
         c->wkind = VDP_WIT_SPANS;
         c->nspan = (uint32_t)ns;
@@ -863,7 +866,10 @@ static const char *request_parse(const char *method, const char *url, vdp_rule_t
             if (v == '/' || v == '\\' || unreserved(v))
                 return "a request path does not percent-encode '/', '\\' or an unreserved byte (A-Z a-z 0-9 - . _ ~)";
         }
-        if (c == '?') query = true;
+        if (c == '?') {
+            if (query) return "a request URL has at most one '?'";
+            query = true;
+        }
     }
     /* the glob */
     char g[VDP_STR_MAX + 1];
@@ -1076,6 +1082,8 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
                     }
             const char *why = request_parse(tok[2], tok[3], r);
             if (why) { rc = perr(err, errlen, path, lineno, "%s", why); break; }
+            /* review: a URL without a query (smt_decide.h) */
+            if (!strchr(tok[3], '?')) r->s.qmode = r->verb == VDP_ALLOW ? VDP_Q_ALLOW : VDP_Q_DENY;
             for (int i = 4; i < nt; i++) {
                 if (strncmp(tok[i], "max_body=", 9)) {
                     rc = perr(err, errlen, path, lineno, "unknown option '%s' on a request rule (max_body=N)", tok[i]);
@@ -1411,6 +1419,11 @@ static bool str_holds(const vdp_str_atom_t *a, const char *s, size_t sl) {
         case VDP_STR_CONTAINS:
             return memmem(s, sl, a->c, a->len) != NULL;
         case VDP_STR_GLOB:
+            if (a->qmode) {                      /* v1.26.1 review: a request rule without a query */
+                const char *q = memchr(s, '?', sl);
+                if (q && a->qmode == VDP_Q_ALLOW) return false;
+                if (q) sl = (size_t)(q - s);      /* VDP_Q_DENY: its path */
+            }
             return a->prog && prog_match(a->prog, s, sl);
     }
     return false;
@@ -2371,8 +2384,50 @@ size_t vdp_rule_advisory(const vdp_rule_t *r, char *buf, size_t n) {
     return w;
 }
 
+/* v1.26.1 review: a wildcard request rule *.<suffix> is reached when some name
+ * under the suffix is allowed on its port. The candidates, each decided as a
+ * connect would be: every exact host name rule's name under the suffix, and a
+ * name under both the suffix and each wildcard host rule's suffix where one is
+ * under the other. */
+static bool request_wild_reached(const vdp_policy_t *p, const vdp_rule_t *q) {
+    const char *sx = q->req_host;
+    size_t sxl = strlen(sx);
+    for (size_t k = 0; k < p->n; k++) {
+        const vdp_rule_t *h = &p->rules[k];
+        if (h->kind != VDP_KIND_HOST || h->verb != VDP_ALLOW || !h->s.name) continue;
+        char nm[256], cand[300];
+        const char *c = h->s.c;
+        if (h->s.wild) {                                   /* ?*.<S>:<port or *> */
+            const char *colon = strrchr(c, ':');
+            if (!colon || colon < c + 3) continue;
+            snprintf(nm, sizeof nm, "%.*s", (int)(colon - (c + 3)), c + 3);
+        } else {
+            const char *colon = strchr(c, ':');
+            snprintf(nm, sizeof nm, "%.*s", (int)(colon ? (size_t)(colon - c) : strlen(c)), c);
+        }
+        size_t nl = strlen(nm);
+        bool nm_under = nl > sxl && nm[nl - sxl - 1] == '.' && !strcmp(nm + nl - sxl, sx);
+        if (!h->s.wild) {
+            if (!nm_under) continue;
+            snprintf(cand, sizeof cand, "%s:%u", nm, q->req_port);
+        } else if (nm_under || !strcmp(nm, sx)) {
+            snprintf(cand, sizeof cand, "a.%s:%u", nm, q->req_port);
+        } else if (sxl > nl && sx[sxl - nl - 1] == '.' && !strcmp(sx + sxl - nl, nm)) {
+            snprintf(cand, sizeof cand, "a.%s:%u", sx, q->req_port);
+        } else continue;
+        if (vdp_decide(p, VDP_KIND_HOST, cand, 0, true, NULL, NULL) == VDP_SATISFIED) return true;
+    }
+    return false;
+}
+
 bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t wn) {
-    if (i >= p->n || p->rules[i].kind != VDP_KIND_REQUEST || p->rules[i].req_wild) return false;
+    if (i >= p->n || p->rules[i].kind != VDP_KIND_REQUEST) return false;
+    if (p->rules[i].req_wild) {
+        if (request_wild_reached(p, &p->rules[i])) return false;
+        snprintf(why, wn, "no host rule allows a name under %s on port %u", p->rules[i].req_host,
+                 p->rules[i].req_port);
+        return true;
+    }
     char hp[300];
     snprintf(hp, sizeof hp, "%s:%u", p->rules[i].req_host, p->rules[i].req_port);
     if (vdp_decide(p, VDP_KIND_HOST, hp, 0, true, NULL, NULL) == VDP_SATISFIED) return false;

@@ -595,6 +595,7 @@ static bool px_target_ok(const char *t) {
     bool query = false;
     const char *seg = t + 1;
     for (const char *c = t + 1;; c++) {
+        bool in_query = query;                            /* the query had begun before this byte */
         if (!query && (*c == '/' || *c == '?' || *c == 0)) {
             size_t sl = (size_t)(c - seg);
             if (sl == 0 && *c == '/') return false;                              /* // */
@@ -605,7 +606,7 @@ static bool px_target_ok(const char *t) {
         if (*c == 0) return true;
         unsigned char u = (unsigned char)*c;
         if (u < 0x21 || u > 0x7e || u == '\\' || u == ';' || u == '#') return false;
-        if (u == '?') query = true;
+        if (u == '?' && in_query) return false;           /* review: a second '?' */
         if (u == '%') {
             int h1 = isxdigit((unsigned char)c[1]) ? (isdigit((unsigned char)c[1]) ? c[1] - '0' : (c[1] | 0x20) - 'a' + 10) : -1;
             int h2 = h1 >= 0 && isxdigit((unsigned char)c[2]) ?
@@ -620,7 +621,7 @@ static bool px_target_ok(const char *t) {
 static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     struct px_open *o = NULL;
     for (size_t k = 0; k < g_px_nopen; k++) if (g_px_open[k].id == m->id) o = &g_px_open[k];
-    if (!o || !o->inspect || o->refused || o->body_seq || m->seq != o->next_seq || m->body > WP_BODY_CHUNKED ||
+    if (!o || !o->inspect || o->refused || o->cut || o->body_seq || m->seq != o->next_seq || m->body > WP_BODY_CHUNKED ||
         !memchr(m->object, 0, sizeof m->object))
         return -1;
     /* the object: METHOD scheme://name:port/..., the method 1 to 20 letters,
@@ -800,7 +801,14 @@ static void px_finish(void) {
                 struct pollfd pf = { .fd = g_proxy.ctl, .events = POLLIN };
                 int64_t left = until - wr_now_ms();
                 if (poll(&pf, 1, left > 0 ? (int)left : 0) <= 0) break;
-                if (proxy_service(g_syn_p) < 0) break;
+                if (proxy_service(g_syn_p) < 0) {
+                    /* review: not dropped silently: the run is marked (run_end,
+                     * the exit status) and its open connections unreported */
+                    g_px_failed = true;
+                    fprintf(stderr, "[warden] the egress proxy exited or sent a malformed report while the "
+                                    "run ended; its open connections are recorded unreported\n");
+                    break;
+                }
             }
         }
     }

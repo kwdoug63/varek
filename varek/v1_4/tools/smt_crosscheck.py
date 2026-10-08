@@ -430,6 +430,11 @@ def atom_rx(rx, r):
     if op == "contains":
         return rx.cats(rx.TOP, rx.lit(c), rx.TOP)
     if op == "glob":
+        q = r.get("qmode", 0)
+        if q:                                   # v1.26.1 review (see parse_lines)
+            noq = rx.neg(rx.cats(rx.TOP, rx.lit("?"), rx.TOP))
+            path = rx.conj(r["rx"], noq)
+            return path if q == 1 else rx.cat(path, rx.alt(rx.EPS, rx.cat(rx.lit("?"), rx.TOP)))
         return r["rx"]
     # host
     if not r["portless"]:
@@ -463,6 +468,8 @@ def request_glob(method, url, where):
     if host_name_form(name) != 1 or ":" in name or (wild and "." not in name):
         raise PolicyError(f"{where}: bad request host")
     path, q, query = rest.partition("?")
+    if "?" in query:                       # v1.26.1 review: at most one '?'
+        raise PolicyError(f"{where}: more than one '?' in a request URL")
     for i, b in enumerate(rest.encode("latin-1")):
         if b < 0x21 or b > 0x7E or b in b"\\;#":
             raise PolicyError(f"{where}: byte in request path")
@@ -591,6 +598,10 @@ def parse_lines(raw_lines, path):
                 r = {"verb": verb, "kind": kind, "op": "glob", "c": const, "rx": grx, "gtoks": gtoks,
                      "mask": 0, "value": 0, "line": lineno, "portless": False, "name": False,
                      "wild": False, "max_body": max_body, "rhost": rhost, "rwild": rwild, "rport": rport}
+                # v1.26.1 review: a URL without a query: an allow rule holds on
+                # no string with a '?'; a deny rule holds when its glob matches
+                # the string up to its first '?'
+                r["qmode"] = 0 if "?" in toks[3] else (1 if verb == "allow" else 2)
                 r["lang"] = atom_rx(rx, r)
                 rules.append(r)
                 continue
@@ -795,7 +806,15 @@ def str_atom(rx, r, s):
     if op == "contains":
         return smt.Contains(s, c)
     if op == "glob":
-        return smt.InRe(s, rx_to_smt(rx, r["rx"]))
+        g = rx_to_smt(rx, r["rx"])
+        q = r.get("qmode", 0)
+        if q == 1:                              # v1.26.1 review (see parse_lines)
+            return smt.And(smt.Not(smt.Contains(s, zstr("?"))), smt.InRe(s, g))
+        if q == 2:
+            i = smt.IndexOf(s, zstr("?"), 0)
+            return smt.Or(smt.And(i < 0, smt.InRe(s, g)),
+                          smt.And(i >= 0, smt.InRe(smt.SubString(s, 0, i), g)))
+        return smt.InRe(s, g)
     if not r["portless"]:
         return s == c
     return smt.Or(s == c, smt.PrefixOf(zstr(r["c"] + ":"), s))

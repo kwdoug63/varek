@@ -178,13 +178,13 @@ else flunk "the checker reports inspecting mode ($p)"; fi
 # Requests decided, then each SATISFIED certificate checked by the checker.
 decide() {   # decide "<object>" <verdict> <description>
     local o="$1" want="$2" d="$3" got cert
-    got="$(printf 'request - %s\n' "$(hex "$o")" | "$VDP" "$OUT/r.txt" batch 2>/dev/null)"
+    got="$(printf 'request - %s\n' "$(hex "$o")" | "$VDP" "${RPOL:-$OUT/r.txt}" batch 2>/dev/null)"
     if ! printf '%s' "$got" | grep -q "\"verdict\":\"$want\""; then flunk "$d ($got)"; return; fi
     if [ "$want" = SATISFIED ]; then
         local ri w
         ri="$(printf '%s' "$got" | sed -n 's/.*"rule":\([0-9-]*\).*/\1/p')"
         w="$(printf '%s' "$got" | sed -n 's/.*"w":"\([^"]*\)".*/\1/p')"
-        cert="$(printf 'request - %s %s %s\n' "$(hex "$o")" "$ri" "${w:-=}" | "$CERT" "$OUT/r.txt" batch 2>&1)"
+        cert="$(printf 'request - %s %s %s\n' "$(hex "$o")" "$ri" "${w:-=}" | "$CERT" "${RPOL:-$OUT/r.txt}" batch 2>&1)"
         if ! printf '%s' "$cert" | grep -q '"check":"ok"'; then flunk "$d (the checker: $cert)"; return; fi
     fi
     pass "$d"
@@ -196,7 +196,8 @@ decide 'GET https://api.example.com:443/v1/files?limit=10'   SATISFIED   "a quer
 decide 'GET https://api.example.com:443/v1/filesXlimit=10'   UNKNOWN     "'?' is not a wildcard"
 decide 'DELETE https://api.example.com:443/v1/admin/u/1'     UNSATISFIED "a deny over any method holds"
 decide 'GET https://api.example.com:80/v1/models'            UNKNOWN     "the port is part of the object"
-decide 'PUT https://a.svc.example.com:443/q/r?s=1'           SATISFIED   "a wildcard host's request allowed"
+decide 'PUT https://a.svc.example.com:443/q/r'               SATISFIED   "a wildcard host's request allowed"
+decide 'PUT https://a.svc.example.com:443/q/r?s=1'           UNKNOWN     "a ** path without a '?' allows no query (review)"
 decide 'PUT https://svc.example.com:443/q'                   UNKNOWN     "a wildcard does not match its suffix"
 decide 'GET http://api.example.com:443/v1/models'            UNKNOWN     "the scheme is part of the object"
 
@@ -205,6 +206,41 @@ printf 'require warden 1.26\nproxy inspect\nallow host a.example.com:443\nallow 
 if ! "$VDP" "$OUT/n.txt" lint > "$OUT/lint.out" 2>&1 && grep -q "can never fire: no host rule allows b.example.com:443" "$OUT/lint.out"
 then pass "lint reports a request rule no host rule reaches"
 else flunk "lint reports a request rule no host rule reaches ($(cat "$OUT/lint.out"))"; fi
+
+# The review by AI review agents: a wildcard in a rule's path must not match
+# across the query's '?', and a deny rule naming a path must hold whatever the
+# query (a rule without a '?' is an allow of no query, a deny of any).
+RPOL="$OUT/q.txt"
+printf '%s' 'require warden 1.26
+proxy inspect
+allow host api.example.com:443
+deny request GET https://api.example.com/v1/secret
+deny request DELETE https://api.example.com/v1/projects/prod
+allow request DELETE https://api.example.com/v1/items/*/tag
+allow request GET https://api.example.com/v1/user[!s]
+allow request GET https://api.example.com/a/**/info
+allow request DELETE https://api.example.com/v1/projects/*
+allow request GET https://api.example.com/v1/**
+allow request GET https://api.example.com/q/**?*
+' > "$RPOL"
+decide 'DELETE https://api.example.com:443/v1/items/42/tag'   SATISFIED   "review: /v1/items/*/tag allows /v1/items/42/tag"
+decide 'DELETE https://api.example.com:443/v1/items/42?/tag'  UNKNOWN     "review: ... but its * does not reach across the '?' (/v1/items/42?/tag)"
+decide 'GET https://api.example.com:443/v1/user?'             UNKNOWN     "review: [!s] and ** do not match the '?' (/v1/user?)"
+decide 'GET https://api.example.com:443/a/secret?x=/info'     UNKNOWN     "review: /**/ does not reach across the '?' (/a/secret?x=/info)"
+decide 'GET https://api.example.com:443/v1/secret'            UNSATISFIED "review: a deny rule naming a path holds"
+decide 'GET https://api.example.com:443/v1/secret?'           UNSATISFIED "review: ... with an empty query"
+decide 'GET https://api.example.com:443/v1/secret?x=1'        UNSATISFIED "review: ... and with any query, ahead of a broader allow"
+decide 'DELETE https://api.example.com:443/v1/projects/prod?' UNSATISFIED "review: ... for any method it names"
+decide 'GET https://api.example.com:443/v1/models?'           UNKNOWN     "review: an allow rule without a '?' allows no query, not even an empty one"
+decide 'GET https://api.example.com:443/q/a/b?x=1'            SATISFIED   "review: a rule with a query allows one, its path wildcards in the path"
+unset RPOL
+refused "review: a request URL with a second '?'" "$(Q 'GET https://api.example.com/v1/x?a=1?b')" "at most one '?'"
+printf 'require warden 1.26\nproxy inspect\nallow host api.example.com:443\nallow host *.svc.example.org:443 acknowledge=dns-channel\nallow request GET https://*.other.example.net/x\nallow request GET https://*.example.com/y\nallow request GET https://*.example.org/w\n' > "$OUT/n2.txt"
+"$VDP" "$OUT/n2.txt" lint > "$OUT/lint2.out" 2>&1
+if grep -q ":5: request rule can never fire: no host rule allows a name under other.example.net on port 443" "$OUT/lint2.out" &&
+   ! grep -q ":6: \|:7: " "$OUT/lint2.out"
+then pass "review: lint reports a wildcard request rule no host rule reaches, not one a name or wildcard reaches"
+else flunk "review: lint and wildcard request rules ($(cat "$OUT/lint2.out"))"; fi
 
 if python3 "$HERE/tools/varek" policy show "$OUT/r.txt" > "$OUT/show.out" 2>&1 &&
    grep -q '^Proxy    inspecting mode, ports 80, 443:' "$OUT/show.out" &&
@@ -908,6 +944,7 @@ PY
       printf 'deny request * https://api.example.com:%s/v1/admin/**\n' "$TP"                 # 8
       printf 'allow request * https://api.example.com:%s/v1/**\n' "$TP"                     # 9
       printf 'allow request GET http://api.example.com:%s/plain\n' "$HP"                     # 10
+      printf 'allow request GET https://api.example.com:%s/v1/**?*\n' "$TP"                 # 11: a query (review)
       printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/\n' "$W"
     } > "$POL5"
     env -i PATH=/usr/bin:/bin timeout 180 "$WARDEN" "$POL5" --dns-server "127.0.0.1:$DPORT" --trust-bundle "$BUNDLE" -- \
@@ -948,8 +985,8 @@ PY
        [ "$(nreq "GET $U/other" default_deny_unknown -)" = yes ]
     then pass "a request no rule allows is refused (default_deny_unknown)"
     else flunk "a request no rule allows is refused"; fi
-    if rhave "QUERY HTTP/1.1 200 OK | ok GET /v1/models?x=1 0 $E0" && [ "$(nreq "GET $U/v1/models?x=1" request_allowed 9)" = yes ]
-    then pass "a query is matched: /v1/models?x=1 is not the exact rule's (line 6) but /v1/**'s (line 9)"
+    if rhave "QUERY HTTP/1.1 200 OK | ok GET /v1/models?x=1 0 $E0" && [ "$(nreq "GET $U/v1/models?x=1" request_allowed 11)" = yes ]
+    then pass "a query is matched: /v1/models?x=1 is not the exact rule's (line 6) nor /v1/**'s (line 9, no query), but /v1/**?*'s (line 11)"
     else flunk "a query is matched"; fi
     if rhave "FRONT HTTP/1.1 200 OK | ok GET /v1/models 0 $E0" &&
        rhave "FRONT HTTP/1.1 403 Forbidden | VAREK: this request was refused: a Host other than the name and port the connection is for."
@@ -1153,6 +1190,9 @@ out, how = reads(s); print("HALF", out.split(b"\r\n")[0].decode(), flush=True)
 s = conn(); s.sendall(b"POST /part HTTP/1.1\r\nHost: %s\r\nContent-Length: 1000\r\n\r\n" % H.encode() + b"B" * 300)
 time.sleep(0.5); s.close(); print("PARTSENT", hashlib.sha256(b"B" * 300).hexdigest(), flush=True)
 time.sleep(0.5)
+# a target with a second '?': refused by the proxy's parser, never decided
+s = conn(); s.sendall(b"GET /v1/models?a?b HTTP/1.1\r\nHost: %s\r\n\r\n" % H.encode())
+out, how = reads(s); print("TWOQ", out.split(b"\r\n")[0].decode(), out.split(b"\r\n\r\n")[-1].decode().strip(), flush=True)
 PY
     POL7="$OUT/rv.policy"
     { printf 'require warden 1.26\nproxy inspect\nproxy ports %s %s\nallow host api.example.com\n' "$XP" "$CP"
@@ -1191,6 +1231,10 @@ PY
        grep -q "^RAW /part 300 $PSHA$" "$OUT/rv.log"
     then pass "a body cut short by the agent's close: what was sent recorded, marked incomplete"
     else flunk "a body cut short by the agent's close"; fi
+    if vhave "TWOQ HTTP/1.1 403 Forbidden VAREK: this request was refused: more than one '?' in the target." &&
+       ! grep '"action":"net.request"' "$OUT/rvw.log" | grep -q 'models?a?b'
+    then pass "a target with a second '?' is refused by the proxy, never decided"
+    else flunk "a target with a second '?' ($(grep TWOQ "$OUT/rv.out"))"; fi
     if python3 "$HERE/tools/varek_audit.py" --policy "$POL7" --checker "$CERT" "$OUT/rvw.log" > "$OUT/au7.out" 2>&1
     then pass "the audit accepts the run"
     else flunk "the audit accepts the review run ($(grep -m3 'PROBLEM' "$OUT/au7.out"))"; fi
@@ -1210,7 +1254,9 @@ PY
     refuses "an allowed body with no request_body" "$OUT/v3.log" "never recorded"
     QS=$(grep '"action":"net.request"' "$OUT/r.log" | grep "\"target\":\"GET $U/v1/models?x=1\"" | grep -o '"seq":[0-9]*,' | head -1)
     QC=$(grep '"action":"net.request"' "$OUT/r.log" | grep "\"target\":\"GET $U/v1/models?x=1\"" | grep -o '"proxy_conn":[0-9]*,' | head -1)
-    vforge "$OUT/r.log" "$OUT/v4.log" --move "$QS\"agent_pid\"" "\"event\":\"proxy_close\",\"run\":\"$(grep -o '"run":"[0-9a-f]*"' "$OUT/r.log" | head -1 | cut -d'"' -f4)\",$QC"
+    QN=${QS#\"seq\":}; QN=${QN%,}
+    # the connection's close moved to just before its request (closes carry no seq)
+    vforge "$OUT/r.log" "$OUT/v4.log" --move "\"event\":\"proxy_close\",\"run\":\"$(grep -o '"run":"[0-9a-f]*"' "$OUT/r.log" | head -1 | cut -d'"' -f4)\",$QC" "\"seq\":$((QN - 1)),\"agent_pid\""
     refuses "a request recorded after its connection's close" "$OUT/v4.log" "after its close"
     vforge "$OUT/r.log" "$OUT/v5.log" --sub '"ca_names":1,' '"ca_names":500,'
     refuses "run_start's CA claiming names the policy does not give it" "$OUT/v5.log" "may sign for 500"

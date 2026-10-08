@@ -141,6 +141,10 @@ struct vdpc_rule {
     uint32_t names, rate;             /* host (v1.25): a wildcard allow rule's budgets, 0: not set */
     uint32_t max_body;                /* request (v1.26.1): max_body=, 0: not set */
     char     rhost[254];              /* request (v1.26.1): the URL's host (a wildcard's suffix) */
+    /* request (v1.26.1 review): a URL without a query: 1, an allow rule (holds
+     * on no string with a '?'); 2, a deny rule (holds when the glob matches
+     * the string up to its first '?'); 0, the glob alone */
+    int      qmode;
     bool     rwild;
     unsigned rport;
 };
@@ -489,7 +493,7 @@ static int req_parse(const char *m, const char *u, vdpc_rule_t *r, const char **
         if (c == '\0') break;
         unsigned char b = (unsigned char)c;
         if (b <= 0x20 || b >= 0x7f || b == '\\' || b == ';' || b == '#') { *why = "byte not allowed in a request path"; return -1; }
-        if (b == '?') q = true;
+        if (b == '?') { *why = "more than one '?' in a request URL"; return -1; }   /* review */
         if (b == '%') {
             if (i + 2 >= pl) { *why = "bad percent escape"; return -1; }
             int d1 = hexd(p[i + 1]), d2 = hexd(p[i + 2]);
@@ -552,6 +556,7 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
                 if ((unsigned char)*q < 0x20 || *q == 0x7f) return fail(err, en, name, ln, "control byte in constant");
         const char *why = "";
         if (req_parse(tok[2], tok[3], r, &why) < 0) return fail(err, en, name, ln, "%s", why);
+        if (!strchr(tok[3], '?')) r->qmode = r->allow ? 1 : 2;      /* review: no query */
         const char *ge = parse_glob(r->c, r->clen, &r->g, &r->ng);
         if (ge) return fail(err, en, name, ln, "%s", ge);
         *glob_total += r->ng;
@@ -970,6 +975,11 @@ static bool str_holds(const vdpc_rule_t *r, const char *s, size_t sl) {
             if (!r->portless) return false;
             return sl > cl && memcmp(s, c, cl) == 0 && s[cl] == ':';
         case M_GLOB:
+            if (r->qmode) {                   /* v1.26.1 review: a request rule without a query */
+                const char *q = memchr(s, '?', sl);
+                if (q && r->qmode == 1) return false;
+                if (q) sl = (size_t)(q - s);
+            }
             if (sl < r->minlen || (r->fixed && sl != r->minlen)) return false;
             for (size_t k = 0; k < r->npre; k++)
                 if ((unsigned char)s[k] != r->g[k].byte) return false;
@@ -1022,6 +1032,11 @@ static bool witness_holds(const vdpc_rule_t *r, const char *s, size_t sl, const 
         return true;
     }
     if (c->wkind != 2) { *why = "glob rule without a span witness"; return false; }
+    if (r->qmode) {                           /* v1.26.1 review: a request rule without a query */
+        const char *q = memchr(s, '?', sl);
+        if (q && r->qmode == 1) { *why = "a request rule without a query, on a request with one"; return false; }
+        if (q) sl = (size_t)(q - s);          /* a deny rule: its witness is on the path */
+    }
     size_t pos = 0, k = 0;
     for (size_t j = 0; j < r->ng; j++) {
         const gtok_t *t = &r->g[j];

@@ -359,7 +359,8 @@ static const char *target_ok(const uint8_t *t, size_t n) {
         if (i == n) break;
         if (c < 0x21 || c > 0x7e) return "a byte outside 0x21-0x7e in the target";
         if (c == '\\' || c == ';' || c == '#') return "a '\\', ';' or '#' in the target";
-        if (c == '?') query = true;
+        /* v1.26.1 review: one '?' only, so a rule's '?' meets only it */
+        if (c == '?') return "more than one '?' in the target";
         if (c == '%') {
             int h1 = i + 1 < n ? hexd(t[i + 1]) : -1, h2 = i + 2 < n ? hexd(t[i + 2]) : -1;
             if (h1 < 0 || h2 < 0) return "a bad percent escape in the target";

@@ -1881,6 +1881,7 @@ static void emit_unanswered(void) {
 }
 
 static void px_finish(void);           /* v1.26 step 7 (warden_pxdecide.inc.c) */
+static bool g_px_failed;               /* v1.26.1 review: the proxy misbehaved while flushing */
 static void emit_run_end(int exit_status) {
     px_finish();                        /* v1.26: every relay's proxy_close */
     emit_unanswered();
@@ -1888,9 +1889,10 @@ static void emit_run_end(int exit_status) {
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
     fprintf(f, "{\"event\":\"run_end\",\"run\":\"%s\",\"records\":%" PRIu64 ","
-               "\"exit_status\":%d,%s\"timestamp_ns\":%lld}\n",
+               "\"exit_status\":%d,%s%s\"timestamp_ns\":%lld}\n",
             g_run_id, g_records, exit_status,
             g_anchor_errors ? "\"anchor_errors_seen\":true," : "",
+            g_px_failed ? "\"proxy_failed\":true," : "",
             (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end("run_end");
 }
@@ -4811,5 +4813,6 @@ int main(int argc, char **argv) {
     if (g_sk) sodium_free(g_sk);             /* zeroes it */
     close(target_pidfd);
     close(notify_fd);
+    if (g_px_failed && rc == 0) rc = 1;      /* v1.26.1 review: the run did not end cleanly */
     return rc;
 }

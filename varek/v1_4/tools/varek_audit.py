@@ -449,6 +449,8 @@ def target_problem(t):
     if not t.startswith("/"):
         return "a target that is not a path"
     path, q, query = t.partition("?")
+    if "?" in query:
+        return "more than one '?'"
     segs = path.split("/")[1:]
     for k, sg in enumerate(segs):
         if sg == "" and k < len(segs) - 1:
@@ -543,6 +545,8 @@ def check_requests(records, bodies, rules, problems, closes=(), order=None):
                 problems.append(f"connection {cid}: a body of {ln} bytes, where its request declared {decl}"
                                 + (" (said incomplete)" if inc else ""))
             st["body"] = None
+            if exc:
+                st["cut"] = True                         # review: the connection was cut there
             continue
         n += 1
         seq, rs = rec.get("seq"), rec.get("request_seq")
@@ -555,6 +559,9 @@ def check_requests(records, bodies, rules, problems, closes=(), order=None):
             continue
         if st["refused"]:
             problems.append(f"seq {seq}: a request of connection {cid} after one was refused")
+            continue
+        if st.get("cut"):
+            problems.append(f"seq {seq}: a request of connection {cid} after its body passed max_body (it was cut)")
             continue
         if rs != st["next"] or st["body"] is not None:
             problems.append(f"seq {seq}: request {rs!r} of connection {cid} out of order, or before the last body")
@@ -676,6 +683,12 @@ def check_closes(records, closes, complete, problems, bodies=()):
             problems.append(f"connection {cid}: an inspected connection relayed bytes though no request was allowed")
             continue
         exceeded = any(b.get("proxy_conn") == cid and b.get("exceeded_max_body") is True for _, b in bodies)
+        # review: the bodies recorded as sent fit in the bytes relayed to the server
+        sent = sum(b["body_len"] for _, b in bodies if b.get("proxy_conn") == cid and type(b.get("body_len")) is int)
+        if insp and why != "unreported" and type(e.get("bytes_up")) is int and sent > e["bytes_up"]:
+            problems.append(f"connection {cid}: request bodies of {sent} bytes recorded as sent, but "
+                            f"{e['bytes_up']} bytes relayed")
+            continue
         if insp and (why == "max_body") != exceeded:
             problems.append(f"connection {cid}: a close for {why!r}, but a body that passed max_body "
                             f"{'was' if exceeded else 'was not'} recorded")
@@ -2037,6 +2050,10 @@ def main(argv=None):
                           meta.get("proxy_closes", []), meta.get("lineno"))
     if nreq:
         check_refused_requests(a.checker, a.policy, prules, records, problems)            # step 7
+    re_ = meta.get("run_end")
+    if isinstance(re_, dict) and re_.get("proxy_failed") is True:                        # review
+        problems.append("run_end says the egress proxy exited or sent a malformed report as the run "
+                        "ended: its open connections were not reported")
     if proxied and proxy_ports is None:
         problems.append("proxied decisions, but the policy does not turn the proxy on")
     # v1.26: every connection id the Warden gave a hand-off is recorded once
