@@ -83,7 +83,7 @@ refused "an empty label"                   "${R}allow host api..example.com\n"  
 refused "a 64-byte label"                  "${R}allow host $(printf 'a%.0s' $(seq 64)).example\n" "63 bytes"
 refused "a name over 253 bytes"            "${R}allow host $(printf 'abcdefghi.%.0s' $(seq 26))com\n" "253 bytes"
 refused "a U-label"                        "${R}allow host b\xc3\xbccher.example\n" "A-labels"
-refused "a wildcard"                       "${R}allow host *.salesforce.com\n" "v1.25"
+refused "a wildcard (needs 1.25)"          "${R}allow host *.salesforce.com\n" "require warden 1.25"
 refused "a label starting with '-'"        "${R}allow host -api.example.com\n"  "start or end"
 refused "a label ending with '-'"          "${R}allow host api-.example.com\n"  "start or end"
 refused "an underscore"                    "${R}allow host api_x.example.com\n" "a-z, 0-9"
@@ -94,7 +94,7 @@ refused "a port with a leading zero"       "${R}allow host api.example.com:0443\
 refused "an empty port"                    "${R}allow host api.example.com:\n"  "port"
 refused "two ports"                        "${R}allow host api.example.com:1:2\n" "port"
 refused "require 1.24 after a host name"   "allow host api.example.com\nrequire warden 1.24\n" "before the host rules"
-refused "require 1.25"                     "require warden 1.25\n"              "this is 1.24"
+refused "require a later grammar"          "require warden 1.26\n"              "this is 1.25"
 
 # Decisions: a name without a port matches every port; with a port, only it.
 batch() { printf '%s\n' "$@" | "$VDP" "$T/v1240_names_policy.txt" batch; }

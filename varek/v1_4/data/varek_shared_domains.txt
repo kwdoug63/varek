@@ -1,0 +1,71 @@
+# VAREK list of shared domains (v1.25): multi-tenant domains where each
+# customer, or anyone who signs up, gets names, and which the Public Suffix List
+# (data/public_suffix_list.dat) does not carry. A wildcard host rule over one of
+# these, or over a name under one, is refused at load, as for a Public Suffix
+# List entry: `allow host *.my.salesforce.com` would allow every company's
+# Salesforce org, not only the buyer's. Write the exact names instead.
+#
+# One domain per line, lowercase, A-labels; '#' starts a comment.
+# Reviewed per release; its SHA-256 is recorded in run_start.
+my.salesforce.com
+force.com
+salesforce-sites.com
+visualforce.com
+my.site.com
+amazonaws.com
+zendesk.com
+atlassian.net
+freshdesk.com
+service-now.com
+sharepoint.com
+# Added 2026-10-06 (v1.25), found while choosing the section 5 workload: sites
+# anyone can create a name under (blogs, newsletters, wikis, hosting)
+wordpress.com
+substack.com
+fandom.com
+tumblr.com
+medium.com
+squarespace.com
+ghost.io
+beehiiv.com
+hashnode.dev
+livejournal.com
+neocities.org
+glitch.me
+railway.app
+hubspotpagebuilder.com
+# ... and per-company tenants anyone can sign up for (as my.salesforce.com)
+slack.com
+zoom.us
+okta.com
+auth0.com
+freshservice.com
+typeform.com
+# Added 2026-10-07 (v1.25 review): storage, databases, keys and AI endpoints
+# where anyone can create an account with its own name, and tunnels that give
+# anyone a public name
+amazonaws.com.cn
+table.core.windows.net
+queue.core.windows.net
+dfs.core.windows.net
+database.windows.net
+vault.azure.net
+azurecr.io
+openai.azure.com
+cognitiveservices.azure.com
+azuredatabricks.net
+cloud.databricks.com
+snowflakecomputing.com
+mongodb.net
+firebaseio.com
+r2.cloudflarestorage.com
+backblazeb2.com
+wasabisys.com
+onmicrosoft.com
+dynamics.com
+oktapreview.com
+okta-emea.com
+pipedream.net
+loca.lt
+serveo.net
+gradio.live

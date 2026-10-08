@@ -194,7 +194,7 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             continue
         try:
             rec = json.loads(raw)
-        except json.JSONDecodeError as e:
+        except ValueError as e:      # v1.25 review: also an integer past Python's digit limit
             fail(lineno, f"record is not valid JSON ({e}).")
         if not isinstance(rec, dict):
             fail(lineno, "record is not a JSON object.")
@@ -235,6 +235,12 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             if event == "resolution" and run is not None and rec.get("run") == run \
                     and meta is not None:
                 meta.setdefault("resolutions", []).append((len(records), rec))
+            # v1.25: the stub resolver's questions and the resolutions, in
+            # stream order (varek_audit.py checks the budgets and that every
+            # name looked up on demand was asked for first).
+            if event in ("resolution", "dns_question") and run is not None \
+                    and rec.get("run") == run and meta is not None:
+                meta.setdefault("dns_events", []).append(rec)
             continue
         if run is None:
             fail(lineno, "record before run_start (a pre-v1.12.1 log, or not a "
@@ -257,6 +263,7 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
 
     if meta is not None:
         meta["log"] = chained            # v1.16: None for an unchained (pre-1.16) stream
+        meta["run_end"] = ended          # v1.25 review: when the run ended, for the audit
     if run is None:
         fail(0, "no run_start record: not a v1.12.1+ Warden stream.")
     if ended is None and not allow_incomplete:
@@ -286,7 +293,8 @@ FILE_ACTIONS = ("file.open", "file.stat", "file.access", "file.readlink")
 # reported apart from the decisions. varek_audit.py checks each view against
 # the policy.
 VIEW_RULES = {"hosts_view": "/etc/hosts", "resolv_view": "/etc/resolv.conf",
-              "nsswitch_view": "/etc/nsswitch.conf", "hostconf_view": "/etc/host.conf"}
+              "nsswitch_view": "/etc/nsswitch.conf", "hostconf_view": "/etc/host.conf",
+              "netsvc_view": "/etc/netsvc.conf", "svc_view": "/etc/svc.conf"}   # v1.25
 _O_ACCMODE, _O_CREAT, _O_TRUNC = 3, 0o100, 0o1000
 
 

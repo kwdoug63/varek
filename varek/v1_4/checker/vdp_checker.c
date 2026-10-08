@@ -136,6 +136,8 @@ struct vdpc_rule {
     int      line;
     bool     portless;                /* host: no port, so every port matches */
     bool     name;                    /* host (v1.24): a host name rule */
+    bool     wild;                    /* host (v1.25): a wildcard rule, held as a glob */
+    uint32_t names, rate;             /* host (v1.25): a wildcard allow rule's budgets, 0: not set */
 };
 
 void vdpc_free(vdpc_policy_t *p) {
@@ -407,7 +409,33 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
          * in name form is matched exactly, as in v1.21. */
         const char *why = "";
         int nf = host_name_form(c, cl, &why);
-        if (nf != 0 && ver_ge(req_maj, req_min, 1, 24)) {
+        if (cl >= 2 && c[0] == '*' && c[1] == '.' && ver_ge(req_maj, req_min, 1, 24)) {
+            /* v1.25: *.<suffix>[:port], held as the glob ?*.<suffix>:<port>
+             * (or :* without a port). <suffix> is a valid name of at least
+             * two labels. */
+            if (!ver_ge(req_maj, req_min, 1, 25)) return fail(err, en, name, ln, "wildcard before 1.25");
+            if (host_name_form(c + 2, cl - 2, &why) != 1) return fail(err, en, name, ln, "bad wildcard");
+            size_t h = 2;
+            while (h < cl && c[h] != ':') h++;
+            if (!memchr(c + 2, '.', h - 2)) return fail(err, en, name, ln, "wildcard over one label");
+            size_t gl = 3 + (h - 2) + 1 + (h < cl ? cl - h - 1 : 1);
+            if (gl > VDPC_MAX_S) return fail(err, en, name, ln, "constant length");
+            char *g = malloc(gl + 1);
+            if (!g) return fail(err, en, name, ln, "out of memory");
+            memcpy(g, "?*.", 3);
+            memcpy(g + 3, c + 2, h - 2);
+            g[3 + h - 2] = ':';
+            if (h < cl) memcpy(g + 3 + (h - 2) + 1, c + h + 1, cl - h - 1);
+            else g[3 + (h - 2) + 1] = '*';
+            g[gl] = '\0';
+            free(r->c);
+            r->c = g;
+            r->clen = gl;
+            r->match = M_GLOB;
+            r->name = r->wild = true;
+            c = r->c;
+            cl = r->clen;
+        } else if (nf != 0 && ver_ge(req_maj, req_min, 1, 24)) {
             if (nf < 0) return fail(err, en, name, ln, "%s", why);
             r->name = true;
             r->portless = memchr(c, ':', cl) == NULL;
@@ -433,8 +461,37 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
         while (r->npre < r->ng && r->g[r->npre].type == G_LIT) r->npre++;
         while (r->nsuf < r->ng && r->g[r->ng - 1 - r->nsuf].type == G_LIT) r->nsuf++;
     }
+    int ack = 0;            /* v1.25: acknowledge=dns-channel */
     for (int k = ci + 1; k < nt; k++) {
         const char *t = tok[k];
+        /* v1.25: a wildcard allow rule must acknowledge the name channel */
+        if (r->kind == VDPC_HOST && strncmp(t, "acknowledge=", 12) == 0) {
+            if (strcmp(t + 12, "dns-channel") != 0) return fail(err, en, name, ln, "unknown acknowledgment");
+            if (!r->wild || !r->allow)
+                return fail(err, en, name, ln, "an acknowledgment on a rule that is not a wildcard allow");
+            if (ack) return fail(err, en, name, ln, "acknowledgment given twice");
+            ack = 1;
+            continue;
+        }
+        /* v1.25: the budgets of a wildcard allow rule (no part of any decision) */
+        if (r->kind == VDPC_HOST && (strncmp(t, "names=", 6) == 0 || strncmp(t, "rate=", 5) == 0)) {
+            int nm = t[0] == 'n';
+            const char *d = strchr(t, '=') + 1;
+            unsigned long lim = nm ? 100000UL : 10000UL, x = 0;
+            size_t dl = strlen(d);
+            if (!r->wild || !r->allow)
+                return fail(err, en, name, ln, "a budget on a rule that is not a wildcard allow");
+            if (dl == 0 || dl > 6 || d[0] == '0') return fail(err, en, name, ln, "bad budget");
+            for (size_t q = 0; q < dl; q++) {
+                if (d[q] < '0' || d[q] > '9') return fail(err, en, name, ln, "bad budget");
+                x = x * 10 + (unsigned long)(d[q] - '0');
+            }
+            if (x > lim) return fail(err, en, name, ln, "budget out of range");
+            uint32_t *slot = nm ? &r->names : &r->rate;
+            if (*slot) return fail(err, en, name, ln, "budget given twice");
+            *slot = (uint32_t)x;
+            continue;
+        }
         if (r->kind != VDPC_PATH) return fail(err, en, name, ln, "flag clause on a non-path rule");
         uint32_t m, v;
         if (!strcmp(t, "readonly"))       { m = ACCMODE | 0100 | 01000; v = 0; }
@@ -450,6 +507,8 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
         r->mask |= m;
         r->value |= v & m;
     }
+    if (r->kind == VDPC_HOST && r->wild && r->allow && !ack)
+        return fail(err, en, name, ln, "a wildcard allow without acknowledge=dns-channel");
     return 0;
 }
 
@@ -650,6 +709,9 @@ int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *o) {
     o->value = r->value;
     o->portless = r->portless;
     o->name = r->name;
+    o->wild = r->wild;
+    o->names = r->names;
+    o->rate = r->rate;
     return 0;
 }
 

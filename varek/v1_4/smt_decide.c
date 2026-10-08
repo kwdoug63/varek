@@ -816,7 +816,24 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
              * its v1.21 meaning (an exact string, which no connect produces). */
             char why[160];
             int nf = vdp_host_name_form(cs, cl, why, sizeof why);
-            if (nf != 0 && (req_maj > 1 || (req_maj == 1 && req_min >= 24))) {
+            /* v1.25: *.<suffix>[:port], after `require warden 1.25`. */
+            if (cl >= 2 && cs[0] == '*' && cs[1] == '.' && (req_maj > 1 || (req_maj == 1 && req_min >= 24))) {
+                if (!(req_maj > 1 || (req_maj == 1 && req_min >= 25))) {
+                    rc = perr(err, errlen, path, lineno, "a wildcard host name needs `require warden 1.25`");
+                    break;
+                }
+                char g[VDP_STR_MAX + 1];
+                if (vdp_host_wildcard_glob(cs, cl, g, sizeof g, why, sizeof why) < 0) {
+                    rc = perr(err, errlen, path, lineno, "bad wildcard host name: %s", why);
+                    break;
+                }
+                size_t gl = strlen(g);
+                memcpy(r->s.c, g, gl + 1);
+                r->s.len = gl;
+                r->s.op = VDP_STR_GLOB;
+                r->s.name = r->s.wild = true;
+                r->s.portless = false;
+            } else if (nf != 0 && (req_maj > 1 || (req_maj == 1 && req_min >= 24))) {
                 if (nf < 0) { rc = perr(err, errlen, path, lineno, "bad host name: %s", why); break; }
                 r->s.name = true;
                 r->s.portless = !memchr(cs, ':', cl);
@@ -840,8 +857,55 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
         }
         p->n++;             /* counted now so vdp_policy_free releases the glob */
 
+        bool ack = false;   /* v1.25: acknowledge=dns-channel */
         for (int i = ci + 1; i < nt; i++) {
             const char *t = tok[i];
+            /* v1.25: a wildcard allow rule must say it opens the name channel */
+            if (r->kind == VDP_KIND_HOST && !strncmp(t, "acknowledge=", 12)) {
+                if (strcmp(t + 12, "dns-channel") != 0) {
+                    rc = perr(err, errlen, path, lineno, "'%s': the only acknowledgment is "
+                              "acknowledge=dns-channel", t);
+                    goto out;
+                }
+                if (!r->s.wild || r->verb != VDP_ALLOW) {
+                    rc = perr(err, errlen, path, lineno,
+                              "'%s' applies only to wildcard allow rules", t);
+                    goto out;
+                }
+                if (ack) {
+                    rc = perr(err, errlen, path, lineno, "'%s' given twice", t);
+                    goto out;
+                }
+                ack = true;
+                continue;
+            }
+            /* v1.25: names=N and rate=N, budgets of a wildcard allow rule */
+            if (r->kind == VDP_KIND_HOST && (!strncmp(t, "names=", 6) || !strncmp(t, "rate=", 5))) {
+                bool is_names = t[0] == 'n';
+                const char *v = t + (is_names ? 6 : 5);
+                uint32_t max = is_names ? 100000 : 10000, val = 0;
+                bool ok = v[0] >= '1' && v[0] <= '9';
+                for (const char *q = v; ok && *q; q++) {
+                    if (*q < '0' || *q > '9') ok = false;
+                    else if ((val = val * 10 + (uint32_t)(*q - '0')) > max) ok = false;
+                }
+                if (!r->s.wild || r->verb != VDP_ALLOW) {
+                    rc = perr(err, errlen, path, lineno,
+                              "'%s': names= and rate= apply only to wildcard allow rules", t);
+                    goto out;
+                }
+                if (!ok) {
+                    rc = perr(err, errlen, path, lineno, "'%s': %s must be 1 to %u", t,
+                              is_names ? "names" : "rate", max);
+                    goto out;
+                }
+                if (is_names ? r->names : r->rate) {
+                    rc = perr(err, errlen, path, lineno, "'%s' given twice", is_names ? "names=" : "rate=");
+                    goto out;
+                }
+                if (is_names) r->names = val; else r->rate = val;
+                continue;
+            }
             if (r->kind != VDP_KIND_PATH) {
                 rc = perr(err, errlen, path, lineno, "flag clause '%s' on a non-path rule", t); goto out;
             }
@@ -865,6 +929,11 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             if (bv_add(&r->b, mask, value) < 0) {
                 rc = perr(err, errlen, path, lineno, "contradictory flag clause '%s'", t); goto out;
             }
+        }
+        if (r->kind == VDP_KIND_HOST && r->s.wild && r->verb == VDP_ALLOW && !ack) {
+            rc = perr(err, errlen, path, lineno, "a wildcard rule sends the agent's lookups out "
+                      "of the host; add acknowledge=dns-channel to allow it");
+            goto out;
         }
     }
 out:
@@ -918,7 +987,8 @@ int vdp_host_name_form(const char *c, size_t cl, char *why, size_t wn) {
     if (numeric) return 0;
 #define BAD(...) do { snprintf(why, wn, __VA_ARGS__); return -1; } while (0)
     if (memchr(c, '*', hl))
-        BAD("wildcards are not host names (wildcard rules are planned for v1.25; name each host)");
+        BAD("a '*' may only be the whole leftmost label of a wildcard (*.example.com), which "
+            "needs `require warden 1.25`");
     if (c[hl - 1] == '.') BAD("a trailing dot is not allowed (write the name without it)");
     for (size_t i = 0; i < hl; i++) {
         unsigned char ch = (unsigned char)c[i];
@@ -1842,6 +1912,27 @@ name:
     snprintf(why, wn, "not a numeric address: host rules match a.b.c.d[:port], [IPv6][:port], "
              "unix:/path, or a host name after `require warden 1.24`");
     return false;
+}
+
+int vdp_host_wildcard_glob(const char *c, size_t cl, char *out, size_t outn, char *why, size_t wn) {
+    if (cl < 2 || c[0] != '*' || c[1] != '.') return 0;
+    const char *rest = c + 2;
+    size_t rl = cl - 2;
+    if (vdp_host_name_form(rest, rl, why, wn) != 1) {
+        if (vdp_host_name_form(rest, rl, why, wn) == 0)
+            snprintf(why, wn, "the part after *. must be a host name");
+        return -1;
+    }
+    const char *colon = memchr(rest, ':', rl);
+    size_t hl = colon ? (size_t)(colon - rest) : rl;
+    if (!memchr(rest, '.', hl)) {
+        snprintf(why, wn, "*. must be followed by at least two labels (*.example.com, not *.com)");
+        return -1;
+    }
+    int n = colon ? snprintf(out, outn, "?*.%.*s:%s", (int)hl, rest, colon + 1)
+                  : snprintf(out, outn, "?*.%.*s:*", (int)hl, rest);
+    if (n < 0 || (size_t)n >= outn) { snprintf(why, wn, "too long"); return -1; }
+    return 1;
 }
 
 /* v1.24: can a connect ever match host rule r? Fills why when not. */

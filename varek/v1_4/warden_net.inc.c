@@ -52,6 +52,8 @@
  * (net_send_relay). */
 
 #include <linux/sockios.h>
+
+#define STUB_ADDR_TEXT "127.53.53.53"   /* v1.25: STUB_ADDR in warden_stub.inc.c */
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 
@@ -79,6 +81,12 @@ static int      g_host_netns  = -1;     /* the Warden's own network namespace */
 static int      g_agent_netns = -1;     /* the agent's (empty) one */
 static bool     g_netns_separate = false;
 static uint64_t g_report_seq = 0;       /* report_id sequence (was supervise()'s seq) */
+
+/* v1.25: the stub resolver (warden_stub.inc.c, included after this file) */
+struct sock_kind;
+static bool stub_is_dest(const struct sockaddr_storage *dial);
+static void stub_connect(int notify_fd, const struct seccomp_notif *req, struct action *a,
+                         int ag, const struct sock_kind *k, const struct timespec *t0);
 
 static uint64_t ns_between(const struct timespec *a, const struct timespec *b) {
     int64_t d = (int64_t)(b->tv_sec - a->tv_sec) * 1000000000LL + (b->tv_nsec - a->tv_nsec);
@@ -483,7 +491,7 @@ static int connect_as_agent(int s, const struct sockaddr *sa, socklen_t sl, uid_
 
 /* ---- connects and sends that finish later ---- */
 
-enum { PEND_CONNECT = 1, PEND_UNIX_RETRY, PEND_SEND };
+enum { PEND_CONNECT = 1, PEND_UNIX_RETRY, PEND_SEND, PEND_STUB };
 /* Each entry is an agent thread blocked in its call (a thread can wait in one
  * call at a time), holding one socket and, for a send, its data. Bounded by
  * count and by bytes held; past either, the call gets ENOBUFS. */
@@ -683,8 +691,14 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
             port = ntohs(d4->sin_port);
         }
         rule = NULL;
+        /* v1.25: the stub resolver's port 53 is the one that is reached */
+        if (stub_is_dest(&dial) && (!strcmp(k.name, "udp") || !strcmp(k.name, "tcp"))) {
+            snprintf(a->resolved, sizeof a->resolved, "%s:53", STUB_ADDR_TEXT);
+            stub_connect(notify_fd, req, a, ag, &k, t0);
+            return;
+        }
         if (g_any_name && port == 53) rule = "dns_refused";
-        else if (names_candidates(a, dial.ss_family, ad, port) < 0) rule = "too_many_names";
+        else if (names_candidates(a, dial.ss_family, ad, port) < 0) rule = "out_of_memory";
         if (rule) {
             close(ag);
             net_record(tid, a, DEC_DENY, DEC_DENY, rule, t0, EACCES);
@@ -722,7 +736,8 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
         /* A connect on this same socket still waiting in the Warden (another
          * thread's blocking connect): the kernel says EALREADY. */
         for (int i = 0; !again && i < g_npend; i++)
-            if ((g_pend[i]->kind == PEND_CONNECT || g_pend[i]->kind == PEND_UNIX_RETRY) &&
+            if ((g_pend[i]->kind == PEND_CONNECT || g_pend[i]->kind == PEND_UNIX_RETRY ||
+                 g_pend[i]->kind == PEND_STUB) &&
                 g_pend[i]->ag_dev == agst.st_dev && g_pend[i]->ag_ino == agst.st_ino)
                 again = EALREADY;
         else if (!strcmp(k.name, "tcp")) {
@@ -1076,6 +1091,11 @@ static void net_bind(int notify_fd, const struct seccomp_notif *req, struct acti
 
 /* ---- finishing what is pending ---- */
 
+/* v1.25: a pending connect to the stub resolver (warden_stub.inc.c) */
+static void stub_pend_restore(struct pending_op *op);
+static void stub_connect_answer(int notify_fd, uint64_t id, pid_t tid, struct action *a,
+                                const struct timespec *t0, int err);
+
 static void pend_finish_connect(int notify_fd, struct pending_op *op, int so_error, bool timed_out) {
     struct timespec tn;
     clock_gettime(CLOCK_MONOTONIC, &tn);
@@ -1105,6 +1125,7 @@ static void pend_service(int notify_fd, const short *rev, int n) {
         /* The agent's thread may have gone (killed, or its call interrupted
          * by a signal and restarted as a new request). */
         if (!notif_id_valid(notify_fd, op->id)) {
+            if (op->kind == PEND_STUB) stub_pend_restore(op);
             if (op->kind != PEND_SEND)
                 net_record(op->tid, op->act, op->d_raw, DEC_ALLOW, "requester_gone", &op->t0, 0);
             pend_free(i);
@@ -1137,6 +1158,16 @@ static void pend_service(int notify_fd, const short *rev, int n) {
                     pend_finish_connect(notify_fd, op, -rc, false);
                     pend_free(i);
                 }
+            }
+        } else if (op->kind == PEND_STUB) {
+            if (rev[i] & (POLLOUT | POLLERR | POLLHUP) || due) {
+                int so = 0;
+                socklen_t l = sizeof so;
+                if (!(rev[i] & (POLLOUT | POLLERR | POLLHUP))) so = EINPROGRESS;   /* SO_SNDTIMEO */
+                else if (getsockopt(op->sock, SOL_SOCKET, SO_ERROR, &so, &l) < 0) so = errno;
+                stub_pend_restore(op);
+                stub_connect_answer(notify_fd, op->id, op->tid, op->act, &op->t0, so);
+                pend_free(i);
             }
         } else if (op->kind == PEND_SEND) {
             if (rev[i] & (POLLOUT | POLLERR | POLLHUP)) {

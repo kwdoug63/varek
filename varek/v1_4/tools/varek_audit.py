@@ -41,6 +41,14 @@ policy file alone:
      in grace), every name such a record binds to that address present, and no
      host rule before the deciding one holding on any other candidate (the
      checker's own matchers).
+  7. v1.25: a connect or send with rule dns_stub (to the Warden's own stub
+     resolver, in the agent's network namespace) is accepted only to the stub
+     address run_start names. The stub's dns_question records: run_start's
+     wildcard budgets are the policy file's; each name charged to a wildcard
+     rule is charged once and within its rule's names, rate (60 s) and label
+     budgets; budget refusals and questions no rule allows are NXDOMAIN and
+     charge nothing; every name looked up on demand was asked for first; a
+     NOERROR answer carries only addresses the name's latest resolution lists.
 
 Exit 0 only if all of these hold. The verdict stream is the Warden's stderr
 (`warden policy -- agent 2> verdicts.log`). The report's "integrity" line says
@@ -55,6 +63,7 @@ Usage:
 """
 
 import argparse
+import collections
 import hashlib
 import ipaddress
 import json
@@ -64,7 +73,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from varek_cyclonedx import StreamError, _parse_log, LOG_SIG_DOMAIN  # noqa: E402
+from varek_cyclonedx import StreamError, _parse_log, _version_at_least, LOG_SIG_DOMAIN  # noqa: E402
 import varek_ed25519  # noqa: E402
 
 # Record rules for an authorized file open (the policy decided ALLOW).
@@ -83,7 +92,8 @@ CONNECT_RULES = ("dialed_fd_injection", "dialed_in_progress", "dial_failed",
 # answered with a view the Warden wrote (no file is opened, so there is no
 # certificate): rule -> the path it answers.
 VIEW_RULES = {"hosts_view": "/etc/hosts", "resolv_view": "/etc/resolv.conf",
-              "nsswitch_view": "/etc/nsswitch.conf", "hostconf_view": "/etc/host.conf"}
+              "nsswitch_view": "/etc/nsswitch.conf", "hostconf_view": "/etc/host.conf",
+              "netsvc_view": "/etc/netsvc.conf", "svc_view": "/etc/svc.conf"}
 O_CREAT, O_TRUNC = 0o100, 0o1000
 
 
@@ -92,6 +102,276 @@ def _addr_of(dest):
     [IPv6]:port -> IPv6."""
     host = dest.rsplit(":", 1)[0]
     return host[1:-1] if host.startswith("[") else host
+
+
+DEFAULT_NAMES, DEFAULT_RATE, DEFAULT_LABEL = 256, 30, 63    # the Warden's, v1.25
+
+
+STUB = "127.53.53.53:53"          # the Warden's stub resolver (warden_stub.inc.c)
+
+
+def policy_rules(checker, policy):
+    """The policy's rules as the certificate checker parses the file (its
+    "rules" mode), one dict each: kind (p|h|e), allow, name (a host name
+    rule), wild, line, names, rate (0: the default) and c (the constant).
+    v1.25 review: read from the checker, not from this tool's own reading of
+    the file, so a policy is read here exactly as the Warden reads it."""
+    rq = subprocess.run([checker, policy, "rules"], capture_output=True)
+    if rq.returncode != 0:
+        raise ValueError(rq.stderr.decode(errors="replace").strip() or "the checker failed")
+    out = []
+    for ln in rq.stdout.decode().splitlines():
+        f = ln.split()
+        if len(f) != 10:
+            raise ValueError(f"unexpected checker output {ln!r}")
+        out.append({"kind": f[0], "allow": f[1] == "a", "name": f[2] == "n", "mask": f[3],
+                     "value": f[4], "wild": f[5] == "w", "line": int(f[6]), "names": int(f[7]),
+                     "rate": int(f[8]), "c": "" if f[9] == "=" else bytes.fromhex(f[9]).decode("latin-1")})
+    return out
+
+
+def check_shared_lists(meta, a, problems):
+    """v1.25 review: the shared-domain lists. A wildcard allow rule over a
+    shared domain must have been refused, whatever lists the Warden was given:
+    each is checked again here against the lists this release ships (lint),
+    and the lists run_start names must be these unless it says they were not
+    (shared_lists_pinned false, an operator's own lists, reported)."""
+    rs = meta.get("run_start", {})
+    here = os.path.dirname(os.path.abspath(__file__))
+    data = os.path.join(here, "..", "data")
+    want = {}
+    for key, fn in (("psl_sha256", "public_suffix_list.dat"),
+                    ("shared_domains_sha256", "varek_shared_domains.txt")):
+        try:
+            with open(os.path.join(data, fn), "rb") as fh:
+                want[key] = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            problems.append(f"cannot read this release's {fn} to check the stream's lists")
+            return
+    differ = [k for k in want if rs.get(k) != want[k]]
+    if differ and rs.get("shared_lists_pinned") is False:
+        print(f"varek_audit: note: the Warden checked wildcards against shared-domain lists named "
+              f"on its command line, not this release's ({', '.join(differ)})")
+    elif differ or rs.get("shared_lists_pinned") is not True:
+        problems.append(f"run_start's shared-domain lists ({', '.join(differ) or 'shared_lists_pinned'}) "
+                        f"are not this release's, and it does not say so")
+    lint = os.path.join(os.path.dirname(os.path.abspath(a.checker)), "vdp_check")
+    r = subprocess.run([lint, a.policy, "lint"], capture_output=True, text=True)
+    for ln in (r.stdout + r.stderr).splitlines():
+        if " is refused: " in ln:
+            problems.append(f"the policy has a wildcard the Warden must refuse: {ln.split(': ', 1)[-1]}")
+
+
+def policy_wildcards(rules):
+    """v1.25: each wildcard allow rule: line -> (suffix, names, rate), the
+    budgets as written or the defaults. The constant is the glob the parsers
+    hold, ?*.<suffix>:<port|*>."""
+    out = {}
+    for r in rules:
+        if r["kind"] == "h" and r["allow"] and r["wild"] and r["c"].startswith("?*."):
+            out[r["line"]] = (r["c"][3:].rsplit(":", 1)[0], r["names"] or DEFAULT_NAMES,
+                              r["rate"] or DEFAULT_RATE)
+    return out
+
+
+def _host_port(c):
+    """The port a host rule's constant names, or None (portless, or a glob)."""
+    head, sep, port = c.rpartition(":")
+    if not sep or not port.isdigit() or int(port) > 65535 or (head.startswith("[") and not head.endswith("]")):
+        return None
+    return int(port)
+
+
+def stub_rules(checker, policy, rules, names):
+    """For each name, the rule the stub answers it by, as warden_stub.inc.c's
+    stub_name_rule decides: name:port for every port a host rule names and
+    for one no rule names, decided by the first host rule that holds; an
+    exact rule that allows any of them first, else the first wildcard rule
+    that allows any. name -> rule index, or None. Asked of the checker."""
+    hosts = [i for i, r in enumerate(rules) if r["kind"] == "h"]
+    ports = []
+    for i in hosts:
+        p = _host_port(rules[i]["c"])
+        if p is not None and p not in ports:
+            ports.append(p)
+        if len(ports) >= 63:
+            break
+    other = 1
+    while other in ports and other < 65535:
+        other += 1
+    ports.append(other)
+    names = sorted(names)
+    strs = [f"{n}:{p}" for n in names for p in ports]
+    if not strs:
+        return {}
+    h = subprocess.run([checker, policy, "holds"], capture_output=True, text=True,
+                       input="\n".join(s.encode().hex() for s in strs) + "\n")
+    rows = h.stdout.split()
+    if h.returncode != 0 or len(rows) != len(strs):
+        raise ValueError("the checker failed on the stub's names")
+    out = {}
+    for k, n in enumerate(names):
+        best = None
+        for j in range(len(ports)):
+            row = rows[k * len(ports) + j]
+            first = next((i for i in hosts if row[i] == "1"), None)
+            if first is None or not rules[first]["allow"]:
+                continue
+            if not rules[first]["wild"]:
+                best = first
+                break
+            if best is None or first < best:
+                best = first
+        out[n] = best
+    return out
+
+
+def check_dns(meta, checker, policy, rules, problems):
+    """v1.25: the stub resolver. run_start's budgets and stub are the
+    policy's; every question was answered by the rule the policy gives its
+    name (asked of the checker); every name charged to a wildcard rule
+    ("new") stays within its rule's names and label budgets and is charged
+    once; every lookup sent upstream ("upstream": a new name's, or one asked
+    again after its TTL) counts against its rule's rate, on the Warden's own
+    clock ("mono_ms"), and is answered by a resolution record; a budget
+    refusal answered NXDOMAIN; a question no rule allows answered NXDOMAIN and
+    charged nothing; a lookup on demand ("dynamic") was asked for and charged;
+    a resolution that is not dynamic is of a name a host rule names; and a
+    NOERROR answer carried only addresses the name's latest resolution listed.
+    Returns (questions, budget refusals)."""
+    rs = meta.get("run_start", {})
+    events = meta.get("dns_events", [])
+    wild = policy_wildcards(rules)
+    exact_names = {r["c"].rsplit(":", 1)[0] if _host_port(r["c"]) is not None else r["c"]
+                   for r in rules if r["kind"] == "h" and r["name"] and not r["wild"]}
+    budgets = rs.get("wildcard_budgets")
+    if wild or budgets is not None:
+        want = sorted([{"policy_line": ln, "names": n, "rate": r, "label": DEFAULT_LABEL}
+                       for ln, (_s, n, r) in wild.items()], key=lambda b: b["policy_line"])
+        ok = isinstance(budgets, list) and all(
+            isinstance(b, dict) and set(b) == {"policy_line", "names", "rate", "label"}
+            and all(type(v) is int for v in b.values()) for b in budgets)
+        got = sorted(budgets, key=lambda b: b["policy_line"]) if ok else budgets
+        if got != want:
+            problems.append(f"run_start's wildcard budgets {got!r} are not the policy's {want}")
+    # v1.25 review: the stub exists exactly when the policy has a wildcard
+    # allow rule, and is always at the same address
+    if rs.get("dns_stub") != (STUB if wild else None):
+        problems.append(f"run_start's dns_stub {rs.get('dns_stub')!r} is not the policy's "
+                        f"({STUB if wild else 'none'})")
+    per = {ln: {"names": n, "rate": r, "label": DEFAULT_LABEL} for ln, (_s, n, r) in wild.items()}
+    asked_names = {e.get("name") for e in events if e.get("event") == "dns_question"
+                   and isinstance(e.get("name"), str) and e.get("name")}
+    by_rule = stub_rules(checker, policy, rules, asked_names) if asked_names else {}
+    line_of = lambda i: rules[i]["line"] if i is not None else -1    # noqa: E731
+    charged, used, window, pending, latest = {}, {}, {}, {}, {}
+    last_mono = None
+    nq = nb = 0
+    for e in events:
+        name, ts = e.get("name"), e.get("timestamp_ns")
+        if not isinstance(name, str) or (e.get("event") == "resolution" and not name):
+            problems.append(f"a {e.get('event')} record without a name")
+            continue
+        if e.get("event") == "resolution":
+            a = e.get("a")
+            if a in ("retired", "grace_end"):    # no lookup: into grace, or out of it
+                latest[name] = e
+                continue
+            if a == "unanswered":                # the run ended before the helper answered
+                if name not in pending:
+                    problems.append(f"{name}: an unanswered lookup that was never sent")
+                pending.pop(name, None)
+                continue
+            if e.get("dynamic") is True:
+                if name not in pending:
+                    problems.append(f"{name}: looked up on demand with no question sending it upstream")
+                if name not in charged:
+                    problems.append(f"{name}: looked up on demand but never charged to a rule")
+                pending.pop(name, None)
+            elif name not in exact_names:
+                # v1.25 review: only a name a host rule names is resolved
+                # without a question (dropping "dynamic" must not hide one)
+                problems.append(f"{name}: resolved, but no host rule names it and no question asked")
+            latest[name] = e
+            continue
+        nq += 1
+        rule, ans, line, mono = e.get("rule"), e.get("answer"), e.get("policy_line"), e.get("mono_ms")
+        if type(mono) is not int or (last_mono is not None and mono < last_mono):
+            problems.append(f"{name!r}: a question whose Warden time {mono!r} is missing or earlier "
+                            f"than the one before it")
+            continue
+        last_mono = mono
+        if not isinstance(ans, str) or not isinstance(rule, str) or type(line) is not int:
+            problems.append(f"{name!r}: a malformed question record")
+            continue
+        if rule in ("no_rule", "not_a_host_name", "malformed"):
+            if ans not in ("nxdomain", "formerr") or e.get("new") or e.get("upstream"):
+                problems.append(f"{name!r}: a question no rule allows was answered {ans}")
+            if rule == "no_rule" and by_rule.get(name) is not None:
+                problems.append(f"{name}: recorded as allowed by no rule, but policy line "
+                                f"{line_of(by_rule[name])} allows it")
+            continue
+        # v1.25 review: the rule the question was answered by is the policy's
+        want = by_rule.get(name)
+        if want is None or line != line_of(want):
+            problems.append(f"{name}: answered by policy line {line}, but the policy "
+                            f"{'allows it by line ' + str(line_of(want)) if want is not None else 'allows it by no rule'}")
+            continue
+        if rule == "exact_name" and (rules[want]["wild"] or name not in exact_names):
+            problems.append(f"{name}: recorded as an exact name, but no exact rule allows it")
+            continue
+        if rule == "wildcard_budget":
+            nb += 1
+            if ans != "nxdomain" or e.get("budget") not in ("names", "rate", "label") or \
+                    e.get("new") or e.get("upstream") or line not in wild:
+                problems.append(f"{name}: a budget refusal that is not a plain NXDOMAIN of a wildcard rule")
+            continue
+        if rule != "policy_match" and rule != "exact_name":
+            problems.append(f"{name}: a question answered by rule {rule!r}")
+            continue
+        b, sfx = per.get(line), wild.get(line, ("",))[0]
+        if e.get("new") is True:
+            if rule != "policy_match" or b is None:
+                problems.append(f"{name}: charged to policy line {line}, not a wildcard allow rule")
+                continue
+            if name in charged:
+                problems.append(f"{name}: charged twice")
+            charged[name] = line
+            if not name.endswith("." + sfx) or len(name) - len(sfx) - 1 > b["label"]:
+                problems.append(f"{name}: over policy line {line}'s label budget, or not under *.{sfx}")
+            used[line] = used.get(line, 0) + 1
+            if used[line] > b["names"]:
+                problems.append(f"{name}: policy line {line} charged more than its {b['names']} names")
+        if e.get("upstream") is True:
+            if b is None or charged.get(name) != line or ans != "lookup":
+                problems.append(f"{name}: sent upstream but not charged to wildcard line {line}")
+                continue
+            if name in pending:
+                problems.append(f"{name}: sent upstream again while its lookup was outstanding")
+            pending[name] = ts if type(ts) is int else 0
+            # the Warden's sliding minute: lookups at most 60 s before this one
+            w = window.setdefault(line, collections.deque())
+            while w and w[0] <= mono - 60000:
+                w.popleft()
+            if len(w) >= b["rate"]:
+                problems.append(f"{name}: policy line {line} sent more than {b['rate']} lookups "
+                                f"upstream in a minute")
+            w.append(mono)
+        elif ans == "lookup" and name not in pending:
+            problems.append(f"{name}: waits on a lookup that was never sent")
+        if ans == "noerror" and isinstance(e.get("addresses"), list):
+            r = latest.get(name)
+            have = set((r or {}).get("addresses") or [])
+            extra = [x for x in e["addresses"] if not isinstance(x, str) or x not in have]
+            if extra:
+                problems.append(f"{name}: answered {extra}, which its latest resolution does not list")
+    # v1.25 review: the Warden answers every lookup it sent upstream with a
+    # resolution record, or records it unanswered when the run ends first
+    if isinstance(meta.get("run_end"), dict):
+        for name in pending:
+            problems.append(f"{name}: a lookup sent upstream was never answered (a resolution record "
+                            f"is missing)")
+    return nq, nb
 
 
 _PORT_RE = re.compile(r"(0|[1-9][0-9]{0,4})")
@@ -161,7 +441,7 @@ def _addrs(r, key):
     return v if isinstance(v, list) else []
 
 
-def check_names(rec, pos, resolutions, problems):
+def check_names(rec, pos, resolutions, problems, exact_grace=False):
     """v1.24: a connect decided with the resolution table. Its candidates are
     the address dialed and name:port for each name that address belonged to.
     Each name must be bound to the address by the latest resolution record
@@ -175,6 +455,8 @@ def check_names(rec, pos, resolutions, problems):
     decided on (for the earlier-rule check)."""
     seq = rec.get("seq")
     cands, dialed, res = rec.get("candidates"), rec.get("dialed"), rec.get("resolved")
+    if "candidates_sha256" in rec:
+        return check_names_hashed(rec, pos, resolutions, problems)  # v1.25: exact grace
     if not (isinstance(cands, list) and cands and all(isinstance(c, str) for c in cands)
             and isinstance(dialed, str) and cands[0] == dialed and res in cands):
         problems.append(f"seq {seq}: a connect's candidates, dialed address and decided "
@@ -217,6 +499,11 @@ def check_names(rec, pos, resolutions, problems):
                 continue
             if _ip(g["address"]) != addr:
                 continue
+            # v1.25 review: a 1.25 Warden writes a resolution record when an
+            # address's grace ends, before the connect decided at that time;
+            # so an address listed in grace is in grace
+            if exact_grace:
+                return "grace"
             # until_s is rounded up to whole seconds: the Warden's grace ended
             # within the second before `end`
             end = rt + g["until_s"] * 10**9
@@ -252,6 +539,63 @@ def check_names(rec, pos, resolutions, problems):
             problems.append(f"seq {seq}: {name} resolved to {addr} but is not a candidate: the "
                             f"connect was not decided on every name of its address")
     return [c for c in cands if c != res]
+
+
+def check_names_hashed(rec, pos, resolutions, problems):
+    """v1.25: a connect whose address belonged to more than 15 names records
+    their number and the SHA-256 of all its candidates (the address dialed
+    and name:port for each name), sorted and joined with newlines, instead of
+    listing them. The candidates are rebuilt here from the resolution records
+    before the connect: every name whose latest record lists the address, or
+    holds it in grace. v1.25 review: the Warden writes a resolution record
+    when an address's grace ends (a grace_end), before the connect decided at
+    that time, so an address its latest record lists in grace is in grace:
+    there is no guessing from grace rounded to whole seconds, which an agent
+    could use to make an honest stream fail. Returns the candidates other than
+    the one decided on."""
+    seq, dialed, res = rec.get("seq"), rec.get("dialed"), rec.get("resolved")
+    n, h, ts = rec.get("candidates_n"), rec.get("candidates_sha256"), rec.get("timestamp_ns")
+    if not (isinstance(dialed, str) and isinstance(n, int) and isinstance(h, str)
+            and isinstance(ts, int) and isinstance(res, str)):
+        problems.append(f"seq {seq}: a connect's hashed candidates are malformed")
+        return []
+    # as for listed candidates (check_names): the Warden's spelling, the
+    # target, the table generation; a special address has no names to hash
+    cd, ct = _canonical_dest(dialed), _canonical_dest(rec.get("target"))
+    if cd is None or ct is None or _ip(str(ct[0])) != _ip(str(cd[0])) or ct[1] != cd[1]:
+        problems.append(f"seq {seq}: dialed {dialed!r} is not in the Warden's spelling, or not the "
+                        f"connect's target {rec.get('target')!r}")
+        return []
+    addr, port = _ip(str(cd[0])), cd[1]
+    if _special(addr) or rec.get("special_address"):
+        problems.append(f"seq {seq}: hashed candidates for a special address, decided on the address alone")
+        return []
+    latest, last = {}, None
+    for p, r in resolutions:
+        if p > pos:
+            break
+        if isinstance(r.get("name"), str):
+            latest[r["name"]] = r
+            last = r
+    if last is not None and rec.get("resolution_generation") != last.get("generation"):
+        problems.append(f"seq {seq}: decided at table generation {rec.get('resolution_generation')!r}, "
+                        f"but the latest resolution record before it is generation "
+                        f"{last.get('generation')!r} (a resolution record is missing)")
+    names = set()
+    for name, r in latest.items():
+        if any(_ip(x) == addr for x in _addrs(r, "addresses") if isinstance(x, str)) or \
+                any(isinstance(g, dict) and isinstance(g.get("address"), str) and _ip(g["address"]) == addr
+                    for g in _addrs(r, "grace")):
+            names.add(name)
+    cands = sorted([dialed] + [f"{x}:{port}" for x in names])
+    if len(cands) == n and hashlib.sha256("\n".join(cands).encode()).hexdigest() == h:
+        if res not in cands:
+            problems.append(f"seq {seq}: decided on {res!r}, which is not a candidate")
+            return []
+        return [c for c in cands if c != res]
+    problems.append(f"seq {seq}: the connect's {n} hashed candidates are not the address's names "
+                    f"by the resolution records (it was not decided on every name of {addr})")
+    return []
 
 
 def policy_ancestors(path):
@@ -610,15 +954,27 @@ def main(argv=None):
         problems.append(f"the policy file hashes to {digest}, the Warden ran with {recorded}")
 
     lines, which = [], []
-    authorized = refused = lookups = connects = views = 0
+    authorized = refused = lookups = connects = views = stubs = 0
     resolutions = meta.get("resolutions", [])
     # v1.24 review: whether the policy has host name rules is read from the
     # policy file (the checker's own parse), not taken from run_start.
-    rq = subprocess.run([a.checker, a.policy, "rules"], capture_output=True, text=True)
-    rules = [l.split() for l in rq.stdout.splitlines()] if rq.returncode == 0 else None
-    if rules is None or any(len(r) != 5 for r in rules):
-        problems.append(f"checker failed on the policy's rules: {rq.stderr.strip()}")
-        rules = []
+    try:
+        prules = policy_rules(a.checker, a.policy)
+    except (OSError, ValueError) as e:
+        problems.append(f"checker failed on the policy's rules: {e}")
+        prules = []
+    rules = [[r["kind"], "a" if r["allow"] else "d", "n" if r["name"] else "-", r["mask"], r["value"]]
+             for r in prules]
+    wild_policy = bool(policy_wildcards(prules))
+    if wild_policy:
+        check_shared_lists(meta, a, problems)
+    # v1.25 review: from 1.25 the Warden records the end of every grace
+    exact_grace = _version_at_least(meta.get("run_start", {}).get("warden"), (1, 25))
+    try:
+        questions, budget_hits = check_dns(meta, a.checker, a.policy, prules, problems)  # v1.25
+    except Exception as e:      # v1.25 review: hostile input gives a verdict, never a traceback
+        problems.append(f"the stub resolver's records cannot be checked: {type(e).__name__}: {e}")
+        questions = budget_hits = 0
     names_policy = any(r[0] == "h" and r[2] == "n" for r in rules)
     if (meta.get("run_start", {}).get("host_name_rules") is True) != names_policy:
         problems.append("run_start's host_name_rules does not match the policy file")
@@ -649,6 +1005,21 @@ def main(argv=None):
                 problems.append(f"seq {rec.get('seq')}: a lookup answered as a directory the "
                                 f"policy leads to, but it asked for more than a read")
             lookups += 1
+            continue
+        if rec.get("rule") == "dns_stub" and rec.get("action") in ("net.connect", "net.send"):
+            # v1.25: a connect or send to the Warden's own stub resolver (no
+            # certificate: it reaches nothing outside the agent's namespace)
+            # v1.25 review: only with a wildcard allow rule in the policy, and
+            # only to the stub's own address, by target and by what was reached
+            ct = _canonical_dest(rec.get("target"))
+            if not wild_policy:
+                problems.append(f"seq {rec.get('seq')}: a stub connect, but the policy has no "
+                                f"wildcard allow rule (no stub resolver)")
+            elif rec.get("resolved") != STUB or ct is None or \
+                    f"{_ip(str(ct[0]))}:{ct[1]}" != STUB:
+                problems.append(f"seq {rec.get('seq')}: a dns_stub record to "
+                                f"{rec.get('target')!r} / {rec.get('resolved')!r}, not the stub at {STUB}")
+            stubs += 1
             continue
         if rec.get("action") == "file.open" and rec.get("rule") in VIEW_RULES:
             fl = rec.get("open_flags")
@@ -722,7 +1093,8 @@ def main(argv=None):
         which.append(rec)
         if is_conn and ("candidates" in rec or "candidates_sha256" in rec):
             try:
-                others.append((rec, cr, check_names(rec, pos, resolutions, problems)))
+                others.append((rec, cr, check_names(rec, pos, resolutions, problems,
+                                                    exact_grace=exact_grace)))
             except (TypeError, ValueError, AttributeError, KeyError) as e:
                 problems.append(f"seq {rec.get('seq')}: malformed connect or resolution records ({e})")
 
@@ -789,7 +1161,8 @@ def main(argv=None):
     print(f"varek_audit: run {run} (Warden {warden}, {'complete' if complete else 'INCOMPLETE'}), "
           f"{len(records)} records, {authorized} authorized file opens, {lookups} lookups, "
           f"{connects} authorized connects, "
-          f"{views} host-name views, "
+          f"{views} host-name views, {stubs} stub resolver connects, "
+          f"{questions} stub questions ({budget_hits} over a budget), "
           f"{checked} certificates "
           f"re-checked, {refused} refused in-line")
     print(f"varek_audit: integrity: {integrity}")
