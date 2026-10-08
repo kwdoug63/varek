@@ -33,7 +33,7 @@ OUTF="${3:-}"
 T="$(cd "$(dirname "$0")" && pwd)"
 [ "$(id -u)" = 0 ] || { echo "latency_v1260.sh: run as root"; exit 2; }
 OUT="$(mktemp -d)"
-D=/tmp/varek_lat1260
+D=/tmp/varek_lat1260.$$
 rm -rf "$D"; mkdir -p "$D"; chmod 755 "$D"
 cp "$T/v1260_latency.py" "$D/"; chmod 644 "$D/v1260_latency.py"
 HOSTIP=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("10.255.255.255", 1)); print(s.getsockname()[0])')
@@ -74,7 +74,7 @@ PY
 SERVERS="$SERVERS $!"
 SQ=""
 if command -v squid > /dev/null || [ -x /usr/sbin/squid ]; then
-    SQ=/tmp/varek_lat1260sq; rm -rf "$SQ"; mkdir -p "$SQ"; chmod 777 "$SQ"
+    SQ=/tmp/varek_lat1260sq.$$; rm -rf "$SQ"; mkdir -p "$SQ"; chmod 777 "$SQ"
     printf '%s api.example.com\n' "$HOSTIP" > "$SQ/hosts"
     printf 'http_port %s:%s\nhttp_access allow all\nhosts_file %s/hosts\naccess_log none\ncache_log %s/cache.log\npid_filename %s/squid.pid\ncache deny all\ncoredump_dir %s\nshutdown_lifetime 1 seconds\n' \
         "$HOSTIP" "$SP" "$SQ" "$SQ" "$SQ" "$SQ" > "$SQ/squid.conf"

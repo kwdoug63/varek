@@ -4,10 +4,6 @@
 > - the review by AI review agents (running; "Found in review" is empty);
 > - the 24-hour soak on the droplet ("24 hours against three CDNs");
 > - the regression count against the v1.25.0 Warden ("Tested");
-> - `run_start` and `varek version` reporting `1.26.0` (they say `1.25.0`);
-> - `varek policy show` naming the proxy, its ports and its upstream;
-> - `test_v1260.sh` using its own scratch paths, so two runs at once on one
->   host do not collide (they share `/tmp/varek_v1260*` today);
 > - the release date.
 >
 > A human or third-party review has not been done.
@@ -108,10 +104,12 @@ policy behaves as on v1.25.0.
 
 ## Tested with real clients
 
-`make test-v1260` runs 147 checks; CI runs it, with the Warden as root and
-Squid installed.
+`make test-v1260` runs 148 checks; CI runs it, with the Warden as root and
+Squid installed. Each run uses its own scratch paths and finds its own
+proxy by the pid `run_start` records, so two runs on one host do not
+collide (two at once were run to show it).
 
-- **Grammar:** 37 checks, each in both C parsers: the three directives,
+- **Grammar:** 38 checks, each in both C parsers, and `varek policy show`: the three directives,
   their refused forms (before 1.26, twice, bad or repeated ports, more than
   16, `proxy inspect`, an https upstream, credentials, a path, an IPv6
   address, ports or an upstream without `proxy on`).
@@ -159,7 +157,10 @@ ranges (CloudFront). The third fetch, and every tenth after it, is a probe:
 `pypi.org`'s address with SNI `example.org`, which must be refused.
 `soak_check.py` matches every fetch to its decision and close, and runs the
 audit. A 3-minute trial on the droplet fetched each API through the proxy
-and passed the audit; the harness's probe schedule was fixed after it.
+and passed the audit; the harness's probe schedule was fixed after it, and
+a second trial passed (2 fetches, 1 probe refused and recorded). The
+24-hour run started 2026-10-08 from commit 54e1b68, which reports itself
+as `1.25.0` (the version was raised to `1.26.0` after it started).
 
 ## Latency
 
@@ -202,7 +203,11 @@ relaying.
   Warden made to dial a proxied request.
 - `vdp_cert_check` has a `proxy` mode: `off`, or `on` with the proxied
   ports and the upstream.
-- The startup message reports the policy grammar as v1.26.
+- `varek policy show` names the proxy, its ports and its upstream, and says
+  when a wildcard's names leave the host with the proxy on.
+- `run_start`'s `proxy` carries the proxy's `pid`.
+- `run_start` reports the Warden as `1.26.0` (so does `varek version`),
+  and the startup message reports the policy grammar as v1.26.
 
 ## Found in review
 

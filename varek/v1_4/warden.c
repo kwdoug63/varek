@@ -1557,7 +1557,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.25.0\","
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.26.0\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
@@ -1589,8 +1589,8 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     if (STUB_WANTED()) fputs("\"dns_stub\":\"127.53.53.53:53\",", f);
     /* v1.26: the egress proxy: its listener, its user, the proxied ports */
     if (g_proxy.ctl >= 0) {
-        fprintf(f, "\"proxy\":{\"mode\":\"sni\",\"listen\":\"127.0.0.1:%u\",\"uid\":%u,\"gid\":%u,\"ports\":[",
-                g_proxy.port, (unsigned)g_proxy.uid, (unsigned)g_proxy.gid);
+        fprintf(f, "\"proxy\":{\"mode\":\"sni\",\"listen\":\"127.0.0.1:%u\",\"uid\":%u,\"gid\":%u,\"pid\":%d,\"ports\":[",
+                g_proxy.port, (unsigned)g_proxy.uid, (unsigned)g_proxy.gid, (int)g_proxy.pid);
         if (p->v.proxy_nports)
             for (size_t k = 0; k < p->v.proxy_nports; k++)
                 fprintf(f, "%s%u", k ? "," : "", p->v.proxy_ports[k]);

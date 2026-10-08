@@ -640,6 +640,17 @@ def cmd_policy_show(args):
     for verb in ("allow", "deny"):
         parts = ", ".join(f"{v} {k}" for k, v in sorted(counts[verb].items())) or "none"
         info(f"{verb.capitalize():8} {parts}")
+    # v1.26: the egress proxy, as the certificate checker reads it
+    pq = run_cmd([tool("vdp_cert_check"), path, "proxy"], capture=True)
+    pf = pq.stdout.split() if pq.returncode == 0 else []
+    proxy_on = bool(pf) and pf[0] == "on"
+    if proxy_on:
+        ports = pf[1:pf.index("upstream")] if "upstream" in pf else pf[1:]
+        up = pf[pf.index("upstream") + 1] if "upstream" in pf[:-1] else None
+        info(f"Proxy    on, SNI mode, ports {', '.join(ports)}: on those ports a name is reached only "
+             f"through the egress proxy, decided on the TLS SNI or HTTP Host the agent sends")
+        if up:
+            info(f"Upstream http://{up}: after the Warden decides, the proxy forwards through it (CONNECT)")
     # v1.25: each wildcard allow rule's budgets (the Warden's defaults filled
     # in), as the certificate checker parses the file (v1.25 review: not this
     # tool's own reading, which split lines on a bare CR where the Warden does not)
@@ -651,8 +662,10 @@ def cmd_policy_show(args):
             sfx, _, port = c[3:].rpartition(":")
             info(f"Wildcard *.{sfx}{'' if port == '*' else ':' + port} (line {f[6]}): at most "
                  f"{f[7] if f[7] != '0' else '256'} new names a run, {f[8] if f[8] != '0' else '30'} "
-                 f"lookups upstream a minute, 63 bytes before the suffix; the agent's lookups under it "
-                 f"leave the host (acknowledge=dns-channel)")
+                 f"lookups upstream a minute, 63 bytes before the suffix; " +
+                 ("names under it leave the host when the Warden looks them up to dial a request "
+                  "it allowed (acknowledge=dns-channel)" if proxy_on else
+                  "the agent's lookups under it leave the host (acknowledge=dns-channel)"))
     info("Anything not allowed is UNKNOWN and refused.")
     return 0
 

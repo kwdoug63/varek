@@ -136,6 +136,12 @@ refused "an upstream at an IPv6 address"     "${R}proxy on\nproxy upstream http:
 refused "an upstream twice"                  "${R}proxy on\nproxy upstream http://a.example:1\nproxy upstream http://b.example:2\n" "given twice"
 refused "an upstream without proxy on"       "${R}proxy upstream http://p.example:3128\n"         "without \`proxy on\`"
 
+printf 'require warden 1.26\nproxy on\nproxy ports 443 8443\nproxy upstream http://p.example:3128\nallow host api.example.com:443\n' > "$OUT/show.txt"
+if python3 "$HERE/tools/varek" policy show "$OUT/show.txt" > "$OUT/show.out" 2>&1 &&
+   grep -q '^Proxy    on, SNI mode, ports 443, 8443:' "$OUT/show.out" && grep -q '^Upstream http://p.example:3128:' "$OUT/show.out"; then
+    pass "varek policy show names the proxy, its ports and its upstream"
+else flunk "varek policy show names the proxy, its ports and its upstream ($(head -c 300 "$OUT/show.out"))"; fi
+
 if [ -n "$WARDEN" ]; then
     printf 'require warden 1.26\nproxy on\nproxy ports 443 8443\nallow host api.example.com:443\n' > "$OUT/w.txt"
     check "the Warden starts with the proxy directives" "$WARDEN" "$OUT/w.txt" --check-startup
@@ -145,7 +151,7 @@ echo "== 2. the proxy process =="
 if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
     skip "the proxy process (needs root and the warden binary)"
 else
-    W=/tmp/varek_v1260w
+    W=/tmp/varek_v1260w.$$
     rm -rf "$W"; mkdir -p "$W"; chmod 755 "$W"
     cat > "$W/agent.py" <<'PY'
 import os, socket, sys, time
@@ -166,7 +172,9 @@ PY
     chmod 644 "$W/agent.py"
     POL="$OUT/proxy.policy"
     printf 'require warden 1.26\nproxy on\nproxy ports 443 8443\nallow host api.example.com:443\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/ readonly\n' "$W" > "$POL"
-    proxy_pids() { pgrep -u 65532 -f -- '--proxy-helper'; }   # its own user: never this shell
+    # the proxy's pid, as run_start records it (not found by its user: another
+    # run on this host may have a proxy of the same user)
+    proxy_pid() { grep -o '"proxy":{[^}]*"pid":[0-9]*' "$1" 2>/dev/null | grep -o '[0-9]*$' | head -1; }
     # gone: no such process, or one that has exited and awaits its reaping
     # (it is not the Warden's child; init reaps it, and some containers' PID 1
     # does not)
@@ -179,9 +187,9 @@ PY
     PORT=$(grep -o '"listen":"127.0.0.1:[0-9]*' "$OUT/a.log" | grep -o '[0-9]*$')
     echo "$PORT" > "$W/port.tmp"; chmod 644 "$W/port.tmp"; mv "$W/port.tmp" "$W/port"
     sleep 1
-    PP=$(for p in $(proxy_pids); do grep -q '^State:[[:space:]]*Z' /proc/$p/status || echo $p; done | head -1)
-    check "run_start records the proxy, its user and its ports" \
-        grep -q '"proxy":{"mode":"sni","listen":"127.0.0.1:[0-9]*","uid":65532,"gid":65532,"ports":\[443,8443\]}' "$OUT/a.log"
+    PP=$(proxy_pid "$OUT/a.log")
+    check "run_start records the proxy, its user, its pid and its ports" \
+        grep -q '"proxy":{"mode":"sni","listen":"127.0.0.1:[0-9]*","uid":65532,"gid":65532,"pid":[0-9]*,"ports":\[443,8443\]}' "$OUT/a.log"
     check "one proxy runs, listening on that port" \
         sh -c "[ -n '$PP' ] && [ -e /proc/$PP/fd/4 ] && python3 -c 'import socket; socket.create_connection((\"127.0.0.1\", $PORT), 2)'"
     check "it runs as its own user, not the agent's" grep -q '^Uid:[[:space:]]*65532[[:space:]]65532[[:space:]]65532[[:space:]]65532$' "/proc/$PP/status"
@@ -194,14 +202,14 @@ PY
         sh -c "grep -q '^REFUSED ' '$OUT/a.out' && grep -q '\"target\":\"127.0.0.1:$PORT\",\"resolved\":\"127.0.0.1:$PORT\",\"decision_raw\":\"UNKNOWN\",\"decision_final\":\"DENY\"' '$OUT/a.log'"
     if gone "$PP"; then pass "the proxy is gone when the run ends"; else flunk "the proxy is gone when the run ends"; fi
     rm -f "$W/port"
-    env -i PATH=/usr/bin:/bin "$WARDEN" "$POL" -- /usr/bin/python3 -c 'import time; time.sleep(30)' > /dev/null 2> "$OUT/k.log" &
+    env -i PATH=/usr/bin:/bin "$WARDEN" "$POL" -- /usr/bin/python3 -c 'import time; time.sleep(30)' "v1260.$$" > /dev/null 2> "$OUT/k.log" &
     WPID=$!
     for _ in $(seq 50); do grep -q '"proxy":{' "$OUT/k.log" 2>/dev/null && break; sleep 0.1; done
-    PP=$(for p in $(proxy_pids); do grep -q '^State:[[:space:]]*Z' /proc/$p/status || echo $p; done | head -1)
+    PP=$(proxy_pid "$OUT/k.log")
     kill -9 "$WPID"; wait "$WPID" 2>/dev/null
     sleep 0.5
     if gone "$PP"; then pass "and when the Warden is killed outright"; else flunk "and when the Warden is killed outright"; fi
-    pkill -9 -f 'time.sleep\(30\)' 2>/dev/null
+    pkill -9 -f "time.sleep\\(30\\) v1260.$$" 2>/dev/null       # this run's agent only
     "$WARDEN" "$POL" --run-as 65532:65532 --check-startup > "$OUT/same.out" 2>&1
     check "the proxy may not run as the agent's user" grep -q 'may not run as the agent' "$OUT/same.out"
     "$WARDEN" "$POL" --proxy-as root --check-startup > "$OUT/root.out" 2>&1
@@ -213,7 +221,7 @@ echo "== 3. synthetic addresses =="
 if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
     skip "synthetic addresses (needs root and the warden binary)"
 else
-    W=/tmp/varek_v1260s
+    W=/tmp/varek_v1260s.$$
     rm -rf "$W"; mkdir -p "$W"; chmod 755 "$W"
     cat > "$W/agent.py" <<'PY'
 import socket, sys
@@ -328,7 +336,7 @@ echo "== 4. the hand-off =="
 if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
     skip "the hand-off (needs root and the warden binary)"
 else
-    W=/tmp/varek_v1260h
+    W=/tmp/varek_v1260h.$$
     rm -rf "$W"; mkdir -p "$W"; chmod 755 "$W"
     cat > "$W/agent.py" <<'PY'
 import socket, sys, time
@@ -473,7 +481,7 @@ fi
 if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
     skip "through the proxy (needs root and the warden binary)"
 else
-    W=/tmp/varek_v1260p
+    W=/tmp/varek_v1260p.$$
     rm -rf "$W"; mkdir -p "$W"; chmod 755 "$W"
     cat > "$W/agent.py" <<'PY'
 import socket, ssl
@@ -551,7 +559,7 @@ echo "== 6. the decision =="
 if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ] || ! command -v openssl > /dev/null; then
     skip "the decision (needs root, the warden binary and openssl)"
 else
-    W=/tmp/varek_v1260d
+    W=/tmp/varek_v1260d.$$
     rm -rf "$W"; mkdir -p "$W"; chmod 755 "$W"
     # a name never leads to loopback: the servers listen on this machine's own address
     HOSTIP=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("10.255.255.255", 1)); print(s.getsockname()[0])')
@@ -761,7 +769,8 @@ PY
     WPID=$!
     for _ in $(seq 100); do grep -q '"rule":"proxy_dialed"' "$OUT/k7.log" 2>/dev/null && break; sleep 0.1; done
     T0=$(date +%s)
-    pkill -9 -u 65532 -f -- '--proxy-helper'
+    KP=$(grep -o '"proxy":{[^}]*"pid":[0-9]*' "$OUT/k7.log" | grep -o '[0-9]*$' | head -1)
+    [ -n "$KP" ] && kill -9 "$KP"
     wait "$WPID"; WRC=$?
     check "the proxy killed mid-relay: the run stops at once (fail closed)" \
         sh -c "[ $WRC != 0 ] && [ \$(( \$(date +%s) - $T0 )) -lt 10 ] && grep -q 'the egress proxy exited' '$OUT/k7.log'"
@@ -817,7 +826,7 @@ PY
         skip "the upstream proxy (Squid is not installed)"
     else
         SQUID=$(command -v squid || echo /usr/sbin/squid)
-        SQ=/tmp/varek_v1260sq
+        SQ=/tmp/varek_v1260sq.$$
         rm -rf "$SQ"; mkdir -p "$SQ"; chmod 777 "$SQ"
         SP=$((45500 + RANDOM % 3000))
         printf '%s api.example.com\n%s blocked.example.com\n' "$HOSTIP" "$HOSTIP" > "$SQ/hosts"

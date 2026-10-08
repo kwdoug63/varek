@@ -217,7 +217,7 @@ if [ -n "$WARDEN" ]; then
         check "run_start records both lists' SHA-256" \
             grep -q "\"psl_sha256\":\"$psl\",\"shared_domains_sha256\":\"$vl\"" "$OUT/run.log"
         check "and that they are the lists this release ships" grep -q '"shared_lists_pinned":true' "$OUT/run.log"
-        check "run_start reports the Warden as 1.25.0" grep -q '"event":"run_start",[^}]*"warden":"1.25.0"' "$OUT/run.log"
+        check "run_start reports the Warden as 1.25.0 or later" grep -Eq '"event":"run_start",[^}]*"warden":"1\.(2[5-9]|[3-9][0-9])\.[0-9]+"' "$OUT/run.log"
         check "the policy grammar is reported as the Warden's (v1.25 or later)" grep -Eq 'loaded policy default v1\.(2[5-9]|[3-9][0-9]) ' "$OUT/run.log"
         # v1.25 review: the audit re-checks each wildcard against this
         # release's lists. A Warden given a list without my.salesforce.com
