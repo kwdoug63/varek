@@ -58,6 +58,8 @@ jobs:
         run: make -C varek/v1_4 fuzz-proxy-parse
       - name: v1.26 egress proxy (grammar, proxy process, synthetic addresses, hand-off, parsers, decisions, closes, audit, upstream)
         run: sudo make -C varek/v1_4 test-v1260
+      - name: v1.26.1 inspecting mode (grammar so far)
+        run: sudo make -C varek/v1_4 test-v1261
       - name: Build and test the plan_verify CLI (v1_6, v1.16.3)
         run: make -C v1_6 plan_verify check check-plan-verify
       - name: Test the v1.7 layer (v1.18.0)

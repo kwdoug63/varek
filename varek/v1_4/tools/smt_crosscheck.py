@@ -437,6 +437,52 @@ def atom_rx(rx, r):
     return rx.alt(rx.lit(c), rx.cat(rx.lit(c + ":"), rx.TOP))
 
 
+UNRESERVED = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+
+
+def request_glob(method, url, where):
+    """v1.26.1: a request rule's METHOD and URL as the glob over the request
+    object "METHOD scheme://host:port/path?query" (smt_decide.h), and its
+    host, whether that is a wildcard's suffix, and its port. Written from the
+    grammar, independently of both C parsers."""
+    if not (method == "*" or re.fullmatch(r"[A-Z]{1,20}", method)):
+        raise PolicyError(f"{where}: bad method")
+    m = re.fullmatch(r"(https?)://([^/]*)(/.*)", url, re.S)
+    if not m:
+        raise PolicyError(f"{where}: bad request URL")
+    scheme, auth, rest = m.groups()
+    host, sep, port = auth.partition(":")
+    if sep:
+        if not re.fullmatch(r"[1-9][0-9]{0,4}", port) or int(port) > 65535:
+            raise PolicyError(f"{where}: bad request port")
+        port = int(port)
+    else:
+        port = 443 if scheme == "https" else 80
+    wild = host.startswith("*.")
+    name = host[2:] if wild else host
+    if host_name_form(name) != 1 or ":" in name or (wild and "." not in name):
+        raise PolicyError(f"{where}: bad request host")
+    path, q, query = rest.partition("?")
+    for i, b in enumerate(rest.encode("latin-1")):
+        if b < 0x21 or b > 0x7E or b in b"\\;#":
+            raise PolicyError(f"{where}: byte in request path")
+    for mm in re.finditer(r"%(.{0,2})", rest, re.S):
+        h = mm.group(1)
+        if not re.fullmatch(r"[0-9A-Fa-f]{2}", h):
+            raise PolicyError(f"{where}: bad escape")
+        v = int(h, 16)
+        if v == 0x2F or v in UNRESERVED:
+            raise PolicyError(f"{where}: escape of / or an unreserved byte")
+    segs = path.split("/")[1:]
+    for k, sg in enumerate(segs):
+        if sg in (".", "..") or (sg == "" and k < len(segs) - 1):
+            raise PolicyError(f"{where}: bad request path segment")
+    glob = f"{method} {scheme}://{'?*.' if wild else ''}{name}:{port}" + rest.replace("?", "\\?")
+    if len(glob) > L:
+        raise PolicyError(f"{where}: request object over the bound")
+    return glob, name, wild, port
+
+
 def parse_policy(path):
     """Independent re-implementation of the policy grammar (smt_decide.h)."""
     with open(path, "rb") as fh:
@@ -451,6 +497,7 @@ def parse_lines(raw_lines, path):
     glob_tokens = 0
     proxy, proxy_ports = False, None   # v1.26: `proxy on`, `proxy ports`
     upstream = None                    # v1.26 section 5: `proxy upstream http://HOST:PORT`
+    inspect, passthrough = False, []   # v1.26.1: `proxy inspect`, `proxy passthrough host NAME`
     if True:
         for lineno, raw in enumerate(raw_lines, 1):
             if b"\0" in raw:
@@ -479,13 +526,19 @@ def parse_lines(raw_lines, path):
                 req = max(req, v)
                 continue
             if toks[0] == "proxy":
-                # v1.26: the egress proxy; `proxy inspect` is v1.26.1
+                # v1.26: the egress proxy; v1.26.1: inspecting mode
                 if req < (1, 26):
                     raise PolicyError(f"{path}:{lineno}: proxy before 1.26")
-                if toks[1:] == ["on"]:
+                if toks[1:] in (["on"], ["inspect"]):
                     if proxy:
-                        raise PolicyError(f"{path}:{lineno}: proxy on twice")
-                    proxy = True
+                        raise PolicyError(f"{path}:{lineno}: proxy mode twice")
+                    proxy, inspect = True, toks[1] == "inspect"
+                    continue
+                if len(toks) == 4 and toks[1:3] == ["passthrough", "host"]:
+                    h = toks[3]
+                    if ":" in h or "*" in h or host_name_form(h) != 1 or h in passthrough or len(passthrough) >= 64:
+                        raise PolicyError(f"{path}:{lineno}: bad passthrough host")
+                    passthrough.append(h)
                     continue
                 if len(toks) >= 3 and toks[1] == "ports" and proxy_ports is None and len(toks) - 2 <= 16:
                     ports = []
@@ -516,6 +569,31 @@ def parse_lines(raw_lines, path):
             verb, kind = toks[0], toks[1]
             if verb not in ("allow", "deny"):
                 raise PolicyError(f"{path}:{lineno}: verb")
+            if kind == "request":
+                # v1.26.1: <verb> request METHOD URL [max_body=N]
+                if req < (1, 26) or len(toks) < 4:
+                    raise PolicyError(f"{path}:{lineno}: bad request rule")
+                if len(rules) >= 256:
+                    raise PolicyError(f"{path}: more than 256 rules")
+                const, rhost, rwild, rport = request_glob(toks[2], toks[3], f"{path}:{lineno}")
+                grx, nt, gtoks = parse_glob(rx, const, f"{path}:{lineno}")
+                glob_tokens += nt
+                if glob_tokens > GLOB_MAX_TOTAL:
+                    raise PolicyError(f"{path}:{lineno}: glob tokens over the policy total")
+                max_body = 0
+                for t in toks[4:]:
+                    m = re.fullmatch(r"max_body=([1-9][0-9]{0,6})([km]?)", t)
+                    if not m or verb != "allow" or max_body:
+                        raise PolicyError(f"{path}:{lineno}: bad request rule option {t}")
+                    max_body = int(m.group(1)) * {"": 1, "k": 1024, "m": 1 << 20}[m.group(2)]
+                    if max_body > 1 << 30:
+                        raise PolicyError(f"{path}:{lineno}: max_body over 1 GiB")
+                r = {"verb": verb, "kind": kind, "op": "glob", "c": const, "rx": grx, "gtoks": gtoks,
+                     "mask": 0, "value": 0, "line": lineno, "portless": False, "name": False,
+                     "wild": False, "max_body": max_body, "rhost": rhost, "rwild": rwild, "rport": rport}
+                r["lang"] = atom_rx(rx, r)
+                rules.append(r)
+                continue
             if kind not in ("path", "host", "exec"):
                 raise PolicyError(f"{path}:{lineno}: kind")
             op = {"path": "prefix", "host": "host", "exec": "eq"}[kind]
@@ -615,6 +693,18 @@ def parse_lines(raw_lines, path):
         raise PolicyError(f"{path}: proxy ports without proxy on")
     if upstream is not None and not proxy:
         raise PolicyError(f"{path}: proxy upstream without proxy on")
+    # v1.26.1: what inspecting mode needs
+    if passthrough and not inspect:
+        raise PolicyError(f"{path}: passthrough without proxy inspect")
+    ports = proxy_ports or [80, 443]
+    for r in rules:
+        if r["kind"] != "request":
+            continue
+        if not inspect or r["rport"] not in ports:
+            raise PolicyError(f"{path}:{r['line']}: request rule without proxy inspect, or on an unproxied port")
+        for h in passthrough:
+            if (h.endswith("." + r["rhost"]) if r["rwild"] else h == r["rhost"]):
+                raise PolicyError(f"{path}:{r['line']}: request rule for a passthrough host")
     return rules, rx
 
 
@@ -956,13 +1046,13 @@ def sample(rx, a, rng, depth=0):
 
 
 def gen_queries(rules, rx, rng, n):
-    by_kind = {"path": [], "host": [], "exec": []}
+    by_kind = {"path": [], "host": [], "exec": [], "request": []}
     for r in rules:
         by_kind[r["kind"]].append(r)
     out = []
     alphabet = "/ab:.x"
     for _ in range(n):
-        kind = rng.choice(["path", "path", "path", "host", "exec"])
+        kind = rng.choice(["path", "path", "path", "host", "exec"] + (["request"] * 3 if by_kind["request"] else []))
         base = sample(rx, rng.choice(by_kind[kind])["lang"], rng) \
             if by_kind[kind] and rng.random() < 0.85 else ""
         choice = rng.random()
@@ -1116,6 +1206,68 @@ def fuzz_policy(rng, path):
     the rest may carry any number of malformed lines, for the parsers."""
     valid = rng.random() < 0.7
     lines = []
+    if rng.random() < 0.2:
+        # v1.26.1: an inspecting-mode policy: host rules, request rules over
+        # them (allow and deny, exact and wildcard hosts, globs in the path,
+        # queries), passthrough hosts, max_body, and (when the policy may be
+        # invalid) each refused form
+        lines.append("require warden 1.26")
+        lines.append("proxy inspect" if valid or rng.random() < 0.8 else rng.choice(["proxy on", ""]))
+        if rng.random() < 0.3:
+            lines.append("proxy ports " + rng.choice(["443", "80 443 8443", "8443"]))
+        if rng.random() < 0.3:
+            lines.append("proxy passthrough host " + rng.choice(["pinned.example.net", "p.example.com"]))
+        for h in ["api.example.com:443", "*.svc.example.com:443 acknowledge=dns-channel", "plain.example.com:80"]:
+            if rng.random() < 0.7:
+                lines.append("allow host " + h)
+        methods = ["GET", "POST", "*", "DELETE", "PUT"]
+        hosts = ["api.example.com", "*.svc.example.com", "a.svc.example.com", "plain.example.com",
+                 "api.example.com:8443", "p.example.com"]
+        paths = ["/v1/models", "/v1/chat/*", "/v1/**", "/", "/v1/files?limit=*", "/v1/admin/**",
+                 "/v1/[ab]*", "/x?y", "/v1/", "/a/*/b", "/%20x", "/v1/models?", "/**/b"]
+        bad_m = ["get", "G1", "", "GETGETGETGETGETGETGET", "**"]
+        bad_u = ["ftp://a.example.com/x", "https://api.example.com", "https://1.2.3.4/x",
+                 "https://api.example.com:0/x", "https://api.example.com:080/x",
+                 "https://api.example.com/a/../b", "https://api.example.com/a//b", "https://api.example.com/a/./b",
+                 "https://api.example.com/%41", "https://api.example.com/%2F", "https://api.example.com/%2",
+                 "https://api.example.com/a;b", "https://api.example.com/a\\b", "https://api.example.com/a#b",
+                 "https://API.example.com/x", "https://*.com/x", "https://a.*.example.com/x",
+                 "https://api.example.com/\xe9", "https://[::1]/x", "https://api.example.com:443:1/x"]
+        bad_o = ["max_body=0", "max_body=1g", "max_body=2048m", "max_body=05", "max_body=", "maxbody=5",
+                 "max_body=1k max_body=2k"]
+        for _ in range(rng.randint(1, 8)):
+            verb = rng.choice(["allow", "deny"])
+            meth = rng.choice(methods + (bad_m if not valid and rng.random() < 0.1 else []))
+            scheme = "http" if rng.random() < 0.2 else "https"
+            url = f"{scheme}://{rng.choice(hosts)}{rng.choice(paths)}"
+            if not valid and rng.random() < 0.15:
+                url = rng.choice(bad_u)
+            opts = []
+            if verb == "allow" and rng.random() < 0.3:
+                opts.append(rng.choice(["max_body=1", "max_body=256k", "max_body=1024m", "max_body=1048576"]))
+            if not valid and rng.random() < 0.08:
+                opts.append(rng.choice(bad_o))
+            line = " ".join([verb, "request", meth, url] + opts)
+            if valid:
+                try:
+                    request_glob(meth, url, "line")
+                except PolicyError:
+                    continue
+            lines.append(line)
+        # a valid policy: drop the request rules the end-of-file checks refuse
+        # (an unproxied port, a passthrough host), so most of these load
+        for _ in range(12 if valid else 0):
+            try:
+                parse_lines([x.encode("latin-1") for x in lines], "p")
+                break
+            except PolicyError as e:
+                m = re.match(r"p:(\d+):", str(e))
+                if not m or " request " not in lines[int(m.group(1)) - 1]:
+                    break
+                del lines[int(m.group(1)) - 1]
+        with open(path, "w", encoding="latin-1", newline="") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return
     if rng.random() < 0.15:
         # v1.25: a host-name policy: wildcards over and beside exact names and
         # addresses, allow and deny, with and without ports, so first-match
@@ -1504,6 +1656,8 @@ def check_policy(vdp, policy, rng, nq, stats, verbose, checker=None):
     stats["policies"] += 1
     if any(r["op"] in ("suffix", "contains", "glob") for r in rules):
         stats["string_policies"] += 1
+    if any(r["kind"] == "request" for r in rules):
+        stats["request_policies"] += 1      # v1.26.1
 
     # Reachability of every rule, and the witness of every REACHABLE answer.
     reach = [json.loads(l) for l in out.splitlines() if l.strip()]
@@ -1602,7 +1756,7 @@ def main():
     a = ap.parse_args()
 
     rng = random.Random(a.seed)
-    stats = {k: 0 for k in ("policies", "rejected_policies", "string_policies", "reach",
+    stats = {k: 0 for k in ("policies", "rejected_policies", "string_policies", "request_policies", "reach",
                             "reach_regex", "reach_solver_inconclusive", "reach_forced_checked",
                             "reach_unknown", "witnesses", "ground", "symbolic",
                             "bound_unknown", "bound_seen", "certs_emitted", "certs_forged",
@@ -1623,7 +1777,8 @@ def main():
                 break
     total = stats["reach"] + stats["reach_forced_checked"] + stats["ground"] + stats["symbolic"]
     print(f"smt_crosscheck: {stats['policies']} policies ({stats['string_policies']} with "
-          f"suffix/contains/glob rules; {stats['rejected_policies']} rejected by both parsers), "
+          f"suffix/contains/glob rules, {stats['request_policies']} with request rules; "
+          f"{stats['rejected_policies']} rejected by both parsers), "
           f"{total} checks: {stats['reach']} reachability (+{stats['reach_forced_checked']} "
           f"automaton-search re-checks), {stats['ground']} ground, {stats['symbolic']} "
           f"symbolic-flag; {stats['witnesses']} witnesses confirmed by the solver")

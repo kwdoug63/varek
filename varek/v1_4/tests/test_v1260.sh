@@ -6,8 +6,8 @@
 #
 #   1. policy grammar: `proxy on` and `proxy ports P...` after
 #      `require warden 1.26`, refused forms (before 1.26, twice, bad or
-#      repeated ports, more than 16, ports without `proxy on`, `proxy inspect`
-#      until v1.26.1), the same answer from the decision procedure and the
+#      repeated ports, more than 16, ports without `proxy on`; `proxy inspect`
+#      is v1.26.1's, tests/test_v1261.sh), the same answer from the decision procedure and the
 #      certificate checker on every case, and the Warden starting with them
 #   2. the proxy process (as root): started with the run, in the host's
 #      network namespace, as its own user with no capabilities and
@@ -120,7 +120,7 @@ refused "proxy ports with none"              "${R}proxy on\nproxy ports\n"      
 refused "proxy alone"                        "${R}proxy\n"                              "bad directive"
 refused "proxy off"                          "${R}proxy off\n"                          "bad directive"
 refused "proxy on with more"                 "${R}proxy on now\n"                       "bad directive"
-refused "proxy inspect (v1.26.1)"            "${R}proxy inspect\n"                      "planned for v1.26.1"
+refused "proxy inspect with more"            "${R}proxy inspect now\n"                  "bad directive"   # v1.26.1: tests/test_v1261.sh
 refused "require 1.27"                       'require warden 1.27\n'                    "this is 1.26"
 # section 5: the upstream proxy
 accepted "an upstream by name"               "${R}proxy on\nproxy upstream http://Proxy.Corp.example:3128\n${H}"

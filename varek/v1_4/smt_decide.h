@@ -100,7 +100,8 @@
  * this set is outside the fragment. */
 #define VDP_KNOWN_OFLAGS   0x007fffc3u  /* checked against <fcntl.h> in smt_decide.c */
 
-typedef enum { VDP_KIND_PATH = 0, VDP_KIND_HOST = 1, VDP_KIND_EXEC = 2 } vdp_kind_t;
+typedef enum { VDP_KIND_PATH = 0, VDP_KIND_HOST = 1, VDP_KIND_EXEC = 2,
+               VDP_KIND_REQUEST = 3 /* v1.26.1 */ } vdp_kind_t;
 typedef enum { VDP_ALLOW = 0, VDP_DENY = 1 } vdp_verb_t;
 typedef enum {
     VDP_STR_PREFIX = 0, VDP_STR_EQ = 1, VDP_STR_HOST = 2,          /* v1.13 */
@@ -147,9 +148,18 @@ typedef struct {
      * the rule does not set them (the Warden's defaults apply). They bound the
      * Warden's stub resolver and do not take part in any decision. */
     uint32_t       names, rate;
+    /* v1.26.1: a request rule's `max_body=N` (bytes; 0: none), and the host
+     * and port its URL names (for the load-time checks; the rule is decided
+     * by its glob alone). req_wild: req_host is the suffix of *.<suffix>. */
+    uint32_t       max_body;
+    char           req_host[254];
+    bool           req_wild;
+    unsigned       req_port;
 } vdp_rule_t;
 
 #define VDP_PROXY_MAX_PORTS 16
+#define VDP_PROXY_MAX_PASS  64
+#define VDP_MAX_BODY_LIMIT  1073741824u   /* max_body= at most 1 GiB */
 
 typedef struct {
     vdp_rule_t rules[VDP_MAX_RULES];
@@ -164,6 +174,11 @@ typedef struct {
      * host name (lowercase) or an IPv4 address. */
     char       proxy_up_host[254];
     unsigned   proxy_up_port;
+    /* v1.26.1: `proxy inspect` (inspecting mode; proxy is then true too) and
+     * `proxy passthrough host NAME`, the hosts kept in SNI mode. */
+    bool       proxy_inspect;
+    char       proxy_pass[VDP_PROXY_MAX_PASS][254];
+    size_t     proxy_npass;
 } vdp_policy_t;
 
 /* Why a verdict was reached (for records). */
@@ -242,6 +257,32 @@ const char *vdp_kind_name(vdp_kind_t k);
 // meaning (an exact string no connect produces; a load-time note says so), and
 // a `require warden 1.24` that follows such a rule is refused, so that one
 // policy cannot hold host names under both meanings.
+//
+// v1.26.1, inspecting mode (docs/security/v1.26.1-inspecting-mode.md), after
+// `require warden 1.26`:
+//   proxy inspect                       the proxy in inspecting mode (not with
+//                                       `proxy on`); `proxy ports` and `proxy
+//                                       upstream` apply to it as to `proxy on`
+//   proxy passthrough host NAME         NAME (a host name, no port, no
+//                                       wildcard) stays in SNI mode; at most
+//                                       VDP_PROXY_MAX_PASS
+//   <allow|deny> request METHOD URL [max_body=N]
+// METHOD is `*` or 1 to 20 bytes A-Z. URL is
+//   https:// or http://, then HOST[:PORT], then a path starting with '/'
+// HOST is a host name or *.<suffix> (as in host rules; no addresses), PORT
+// 1 to 65535 (default 443 or 80). The path (and query) is bytes 0x21-0x7e
+// other than '\', ';' and '#'; '%' must start an escape %XX that encodes
+// neither '/' nor an unreserved byte (A-Z a-z 0-9 - . _ ~); before the first
+// '?', no empty segment except a trailing one ('//' is refused) and no '.'
+// or '..' segment. '*', '**' and '[...]' in the path are glob wildcards as
+// above; '?' is the query's literal '?', never a wildcard. The rule is held
+// as a glob over the request object "METHOD scheme://host:port/path?query":
+//   <METHOD or *> <scheme>://<host, or ?*.<suffix>>:<port><path, each ? as \?>
+// max_body=N (allow rules only): N decimal (1 to 7 digits, no leading zero)
+// with an optional k (x1024) or m (x1048576), at most VDP_MAX_BODY_LIMIT.
+// Refused at the end of the file: request rules or passthrough hosts without
+// `proxy inspect`; a request rule on a port that is not proxied; a request
+// rule whose host is, or (a wildcard) covers, a passthrough host.
 int vdp_policy_load(const char *path, vdp_policy_t *p, char *err, size_t errlen);
 
 /* Decide a single action. s must be a NUL-terminated string. flags is used only
@@ -360,6 +401,11 @@ int vdp_host_wildcard_glob(const char *c, size_t cl, char *out, size_t outn, cha
  * writes the reason to why and returns false. */
 bool vdp_host_rule_ok(const vdp_rule_t *r, char *why, size_t wn);
 
+/* v1.26.1: is request rule i's host (an exact name) refused on its port by
+ * the host rules, so that no connection reaches the rule? true with the
+ * reason in why; false for a wildcard host or one some host rule allows. */
+bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t wn);
+
 /* The Warden version this procedure implements, for `require warden X.Y`.
  * v1.21: host rules take effect (decided connections), and a bracketed IPv6
  * constant without a port ("[::1]") matches every port.
@@ -368,7 +414,10 @@ bool vdp_host_rule_ok(const vdp_rule_t *r, char *why, size_t wn);
  * v1.25: wildcard host names (`allow host *.example.com:443`), after
  * `require warden 1.25`; see vdp_host_wildcard_glob.
  * v1.26: the egress proxy (`proxy on`, `proxy ports`, `proxy upstream`),
- * after `require warden 1.26`. */
+ * after `require warden 1.26`.
+ * v1.26.1: inspecting mode (`proxy inspect`, `proxy passthrough host`,
+ * request rules), also after `require warden 1.26`: a v1.26.0 Warden refuses
+ * each of them, so the policy fails closed there. */
 #define VDP_WARDEN_MAJOR 1
 #define VDP_WARDEN_MINOR 26
 

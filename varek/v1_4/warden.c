@@ -360,13 +360,14 @@ static int policy_load(const char *path, struct policy *p) {
         };
         static const int kind_to_c[] = {
             [VDP_KIND_PATH] = VDPC_PATH, [VDP_KIND_HOST] = VDPC_HOST, [VDP_KIND_EXEC] = VDPC_EXEC,
+            [VDP_KIND_REQUEST] = VDPC_REQUEST,
         };
         if (vdpc_rule_info(&p->c, i, &ci) < 0 || ci.allow != (r->verb == VDP_ALLOW) ||
             ci.kind != kind_to_c[r->kind] || ci.match != op_to_match[r->s.op] ||
             ci.clen != r->s.len || memcmp(ci.c, r->s.c, r->s.len) != 0 ||
             ci.mask != r->b.mask || ci.value != r->b.value || ci.line != r->line ||
             ci.portless != r->s.portless || ci.name != r->s.name || ci.wild != r->s.wild ||
-            ci.names != r->names || ci.rate != r->rate) {
+            ci.names != r->names || ci.rate != r->rate || ci.max_body != r->max_body) {
             fprintf(stderr, "[warden] policy %s:%d: the decision procedure and the certificate "
                     "checker read this rule differently; refusing to start\n", path, r->line);
             return -1;
@@ -378,6 +379,11 @@ static int policy_load(const char *path, struct policy *p) {
         proxy_same = p->v.proxy_ports[k] == p->c.proxy_ports[k];
     proxy_same = proxy_same && p->v.proxy_up_port == p->c.proxy_up_port &&
                  (!p->v.proxy_up_port || !strcmp(p->v.proxy_up_host, p->c.proxy_up_host));
+    /* v1.26.1: inspecting mode and its passthrough hosts */
+    proxy_same = proxy_same && p->v.proxy_inspect == (p->c.proxy_inspect != 0) &&
+                 p->v.proxy_npass == p->c.proxy_npass;
+    for (size_t k = 0; proxy_same && k < p->v.proxy_npass; k++)
+        proxy_same = !strcmp(p->v.proxy_pass[k], p->c.proxy_pass[k]);
     if (!proxy_same) {
         fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
                 "the proxy directives differently; refusing to start\n", path);
@@ -406,6 +412,15 @@ static int policy_load(const char *path, struct policy *p) {
             fprintf(stderr, "[warden] policy %s:%d: note: reachability not decided "
                     "(%s)\n", path, r->line,
                     vdp_reach_unknown_text());
+        }
+    }
+    /* v1.26.1: a request rule whose host no host rule allows on its port */
+    for (size_t i = 0; i < p->v.n; i++) {
+        char hw[300];
+        if (vdp_request_host_refused(&p->v, i, hw, sizeof hw)) {
+            dead++;
+            fprintf(stderr, "[warden] policy %s:%d: WARNING: request rule can never fire: %s\n",
+                    path, p->v.rules[i].line, hw);
         }
     }
     /* v1.21: host rules no connect can match (non-canonical spellings, and
@@ -4381,6 +4396,17 @@ int main(int argc, char **argv) {
                     "(--run-as); give it its own\n", pas);
             return 2;
         }
+    }
+    /* v1.26.1 (step 1): inspecting mode is parsed and checked, but this
+     * Warden cannot yet terminate TLS or decide requests, so it does not run
+     * such a policy as SNI mode, which would allow requests the request rules
+     * refuse; nor does --check-startup say it would (`vdp_check <policy>
+     * lint` checks such a policy). */
+    if (p.v.proxy_inspect) {
+        fprintf(stderr, "[warden] `proxy inspect`: inspecting mode is not built into this Warden yet "
+                "(v1.26.1 in progress); refusing to start\n");
+        if (g_sk) sodium_free(g_sk);
+        return 2;
     }
     /* v1.26 (step 8): with `proxy on`, names reach proxied ports only through
      * the proxy, which needs root to start as its own user: a Warden that

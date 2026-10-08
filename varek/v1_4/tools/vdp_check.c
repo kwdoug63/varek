@@ -47,6 +47,7 @@ static int parse_kind(const char *k, vdp_kind_t *out) {
     if (!strcmp(k, "path")) { *out = VDP_KIND_PATH; return 0; }
     if (!strcmp(k, "host")) { *out = VDP_KIND_HOST; return 0; }
     if (!strcmp(k, "exec")) { *out = VDP_KIND_EXEC; return 0; }
+    if (!strcmp(k, "request")) { *out = VDP_KIND_REQUEST; return 0; }     /* v1.26.1 */
     return -1;
 }
 
@@ -160,6 +161,13 @@ int main(int argc, char **argv) {
             if (g_pol.rules[i].kind == VDP_KIND_HOST &&
                 !vdp_host_rule_ok(&g_pol.rules[i], hw, sizeof hw))
                 hostnever++;
+            /* v1.26.1: a request rule whose exact host no host rule allows on
+             * its port is never reached: the connection is refused first */
+            if (g_pol.rules[i].kind == VDP_KIND_REQUEST && vdp_request_host_refused(&g_pol, i, hw, sizeof hw)) {
+                printf("%s:%d: request rule can never fire: %s\n", argv[1], g_pol.rules[i].line, hw);
+                dead++;
+                continue;
+            }
             vdp_reach_t rr = vdp_rule_reachable(&g_pol, i);
             if (rr == VDP_DEAD) {
                 const vdp_rule_t *r = &g_pol.rules[i];

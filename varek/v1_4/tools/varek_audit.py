@@ -121,8 +121,9 @@ STUB = "127.53.53.53:53"          # the Warden's stub resolver (warden_stub.inc.
 
 def policy_rules(checker, policy):
     """The policy's rules as the certificate checker parses the file (its
-    "rules" mode), one dict each: kind (p|h|e), allow, name (a host name
-    rule), wild, line, names, rate (0: the default) and c (the constant).
+    "rules" mode), one dict each: kind (p|h|e, r: a v1.26.1 request rule),
+    allow, name (a host name rule), wild, line, names, rate (0: the
+    default), max_body (0: none) and c (the constant).
     v1.25 review: read from the checker, not from this tool's own reading of
     the file, so a policy is read here exactly as the Warden reads it."""
     rq = subprocess.run([checker, policy, "rules"], capture_output=True)
@@ -131,11 +132,12 @@ def policy_rules(checker, policy):
     out = []
     for ln in rq.stdout.decode().splitlines():
         f = ln.split()
-        if len(f) != 10:
+        if len(f) != 11:
             raise ValueError(f"unexpected checker output {ln!r}")
         out.append({"kind": f[0], "allow": f[1] == "a", "name": f[2] == "n", "mask": f[3],
                      "value": f[4], "wild": f[5] == "w", "line": int(f[6]), "names": int(f[7]),
-                     "rate": int(f[8]), "c": "" if f[9] == "=" else bytes.fromhex(f[9]).decode("latin-1")})
+                     "rate": int(f[8]), "max_body": int(f[9]),
+                     "c": "" if f[10] == "=" else bytes.fromhex(f[10]).decode("latin-1")})
     return out
 
 

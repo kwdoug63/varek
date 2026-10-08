@@ -643,22 +643,37 @@ def cmd_policy_show(args):
     # v1.26: the egress proxy, as the certificate checker reads it
     pq = run_cmd([tool("vdp_cert_check"), path, "proxy"], capture=True)
     pf = pq.stdout.split() if pq.returncode == 0 else []
-    proxy_on = bool(pf) and pf[0] == "on"
+    proxy_on = bool(pf) and pf[0] in ("on", "inspect")
     if proxy_on:
-        ports = pf[1:pf.index("upstream")] if "upstream" in pf else pf[1:]
+        # v1.26.1: "inspect" (inspecting mode), then ports, upstream, passthrough
+        ends = [pf.index(w) for w in ("upstream", "passthrough") if w in pf]
+        ports = pf[1:min(ends)] if ends else pf[1:]
         up = pf[pf.index("upstream") + 1] if "upstream" in pf[:-1] else None
-        info(f"Proxy    on, SNI mode, ports {', '.join(ports)}: on those ports a name is reached only "
-             f"through the egress proxy, decided on the TLS SNI or HTTP Host the agent sends")
+        passthrough = pf[pf.index("passthrough") + 1:] if "passthrough" in pf else []
+        if pf[0] == "inspect":
+            info(f"Proxy    inspecting mode, ports {', '.join(ports)}: on those ports a name is reached only "
+                 f"through the egress proxy, which terminates TLS, and every request is decided by the "
+                 f"request rules (a request no rule allows is refused)")
+        else:
+            info(f"Proxy    on, SNI mode, ports {', '.join(ports)}: on those ports a name is reached only "
+                 f"through the egress proxy, decided on the TLS SNI or HTTP Host the agent sends")
         if up:
             info(f"Upstream http://{up}: after the Warden decides, the proxy forwards through it (CONNECT)")
+        for h in passthrough:
+            info(f"Passthrough {h}: kept in SNI mode, relayed without decrypting; its requests are not seen")
     # v1.25: each wildcard allow rule's budgets (the Warden's defaults filled
     # in), as the certificate checker parses the file (v1.25 review: not this
     # tool's own reading, which split lines on a bare CR where the Warden does not)
     rq = run_cmd([tool("vdp_cert_check"), path, "rules"], capture=True)
     for ln in rq.stdout.splitlines() if rq.returncode == 0 else []:
         f = ln.split()
-        if len(f) == 10 and f[0] == "h" and f[1] == "a" and f[5] == "w":
-            c = bytes.fromhex(f[9]).decode("latin-1")
+        if len(f) == 11 and f[0] == "r":
+            # v1.26.1: a request rule, from its glob over "METHOD scheme://host:port/path"
+            g = bytes.fromhex(f[10]).decode("latin-1").replace("\\?", "?").replace("://?*.", "://*.")
+            mb = f", bodies at most {int(f[9]):,} bytes" if f[9] != "0" else ""
+            info(f"Request  {'allow' if f[1] == 'a' else 'deny '} {g} (line {f[6]}){mb}")
+        if len(f) == 11 and f[0] == "h" and f[1] == "a" and f[5] == "w":
+            c = bytes.fromhex(f[10]).decode("latin-1")
             sfx, _, port = c[3:].rpartition(":")
             info(f"Wildcard *.{sfx}{'' if port == '*' else ':' + port} (line {f[6]}): at most "
                  f"{f[7] if f[7] != '0' else '256'} new names a run, {f[8] if f[8] != '0' else '30'} "
