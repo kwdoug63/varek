@@ -1,0 +1,48 @@
+VAREK v1.25.0 latency of wildcard host names (2026-10-08T01:30Z; kernel 6.18.44-fc-v80; 4 vCPU)
+n=1000 per lookup row, 1000 connects per connect row; percentiles in microseconds, measured by the client.
+Upstream is tests/dns_test_server.py on 127.0.0.1 (it re-reads its zone file on every question).
+raw direct       n=1000 p50=3339 p90=5468 p99=8080
+raw stub new     n=1000 p50=7760 p90=11404 p99=15322
+raw stub again   n=1000 p50=52 p90=73 p99=137
+gai exact        n=1000 p50=392 p90=492 p99=715
+gai new          n=1000 p50=8508 p90=11614 p99=16720
+gai again        n=1000 p50=515 p90=650 p99=1054
+native connect   n=1000 p50=20 p90=173 p99=323
+numeric          n=1000 p50=166 p90=254 p99=443
+numeric          records n=1000 candidates=[0] hashed=0; warden latency p50=135 p99=401; dial p50=35 p99=212; Warden's own p50=97 p90=149 p99=247 (us)
+1 name           n=1000 p50=184 p90=253 p99=423
+1 name           records n=1000 candidates=[2] hashed=0; warden latency p50=149 p99=370; dial p50=36 p99=198; Warden's own p50=110 p90=147 p99=226 (us)
+40 names         n=1000 p50=207 p90=296 p99=630
+40 names         records n=1000 candidates=[41] hashed=1000; warden latency p50=173 p99=530; dial p50=39 p99=181; Warden's own p50=134 p90=193 p99=357 (us)
+VAREK v1.25.0 latency of wildcard host names (2026-10-08T01:30Z; kernel 6.18.44-fc-v80; 4 vCPU)
+n=1000 per lookup row, 1000 connects per connect row; percentiles in microseconds, measured by the client.
+Upstream is tests/dns_test_server.py on 127.0.0.1 (it re-reads its zone file on every question).
+raw direct       n=1000 p50=3203 p90=5257 p99=7366
+raw stub new     n=1000 p50=7094 p90=10392 p99=14082
+raw stub again   n=1000 p50=51 p90=64 p99=115
+gai exact        n=1000 p50=358 p90=443 p99=755
+gai new          n=1000 p50=8433 p90=12135 p99=17237
+gai again        n=1000 p50=558 p90=736 p99=896
+native connect   n=1000 p50=16 p90=32 p99=72
+numeric          n=1000 p50=172 p90=236 p99=352
+numeric          records n=1000 candidates=[0] hashed=0; warden latency p50=140 p99=295; dial p50=35 p99=95; Warden's own p50=104 p90=141 p99=231 (us)
+1 name           n=1000 p50=176 p90=244 p99=421
+1 name           records n=1000 candidates=[2] hashed=0; warden latency p50=142 p99=368; dial p50=36 p99=105; Warden's own p50=106 p90=141 p99=300 (us)
+40 names         n=1000 p50=273 p90=369 p99=592
+40 names         records n=1000 candidates=[41] hashed=1000; warden latency p50=236 p99=440; dial p50=52 p99=116; Warden's own p50=183 p90=249 p99=374 (us)
+VAREK v1.25.0 latency of wildcard host names (2026-10-08T01:30Z; kernel 6.18.44-fc-v80; 4 vCPU)
+n=1000 per lookup row, 1000 connects per connect row; percentiles in microseconds, measured by the client.
+Upstream is tests/dns_test_server.py on 127.0.0.1 (it re-reads its zone file on every question).
+raw direct       n=1000 p50=3078 p90=4969 p99=6456
+raw stub new     n=1000 p50=7395 p90=10207 p99=13218
+raw stub again   n=1000 p50=52 p90=66 p99=117
+gai exact        n=1000 p50=410 p90=500 p99=645
+gai new          n=1000 p50=8392 p90=11095 p99=14899
+gai again        n=1000 p50=552 p90=689 p99=918
+native connect   n=1000 p50=18 p90=34 p99=68
+numeric          n=1000 p50=170 p90=257 p99=439
+numeric          records n=1000 candidates=[0] hashed=0; warden latency p50=139 p99=351; dial p50=35 p99=114; Warden's own p50=101 p90=152 p99=259 (us)
+1 name           n=1000 p50=213 p90=311 p99=438
+1 name           records n=1000 candidates=[2] hashed=0; warden latency p50=177 p99=400; dial p50=43 p99=135; Warden's own p50=129 p90=194 p99=285 (us)
+40 names         n=1000 p50=211 p90=274 p99=354
+40 names         records n=1000 candidates=[41] hashed=1000; warden latency p50=177 p99=302; dial p50=40 p99=88; Warden's own p50=135 p90=178 p99=245 (us)

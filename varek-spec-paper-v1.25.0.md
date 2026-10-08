@@ -219,7 +219,7 @@ Those names are known only when the agent asks for one, so under a wildcard the 
 6. **Records and audit.** Every question to the stub is a chained `dns_question` record. `varek_audit.py` checks the budgets against the policy file, every charge against them, and that every name looked up was asked for.
 7. **Many names on one address.** Per-tenant names behind a CDN share addresses. A connect is decided over every name its address belongs to, with no limit; past 15 names the record carries their count and SHA-256, and the audit rebuilds them from the resolution records.
 
-**Measured.** PENDING: a 24-hour run against 40 Wikipedia language editions served from one address, and the latency of a lookup through the stub.
+**Measured.** A name already in the table is answered by the stub in about 50 µs; a new name costs the two upstream questions (A and AAAA) plus 0.7 to 1.2 ms for the hand-off to the resolver helper and the records. A connect decided over 41 candidates on one address, hashed for the record, takes the Warden 34 to 79 µs more at the median than one allowed by a numeric rule, about 1 to 2 µs a name. PENDING: a 24-hour run against 40 Wikipedia language editions served from one address.
 
 **Scope.** The name channel is bounded, not closed: within the budgets, labels the agent chooses, and which names it asks again and when, reach the host's resolver and the domain's DNS servers, which a DNS provider rather than the API's owner may run. The lists are snapshots; a domain where anyone can create a name and which neither list holds is not refused. The v1.26 egress proxy decides on the name without a lookup by the agent (§8).
 

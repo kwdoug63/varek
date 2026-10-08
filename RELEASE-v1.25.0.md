@@ -4,8 +4,7 @@
 > or third-party review has not been done. Still to come before tagging:
 > - the 24-hour soak report (Wikipedia, 40 names on one address), run on
 >   the Warden before the review's fixes, and a short trial on the final one;
-> - the latency of a lookup through the stub;
-> - the soak and latency figures in the spec paper's draft edition.
+> - the soak figures in the spec paper's draft edition.
 
 Released PENDING · MIT · github.com/kwdoug63/varek
 
@@ -141,8 +140,46 @@ names on one address. The run must show:
 
 ## Latency
 
-PENDING: the time a lookup through the stub adds, and a connect decided
-over 40 names on one address.
+`make latency-v1250` (`tests/latency_v1250.sh`) times 1,000 lookups and
+1,000 blocking TCP connects of each kind, one after another, on a 4-vCPU
+cloud container with nothing else running. Results from three runs
+(`varek/v1_4/tests/latency_v1.25.0.txt`), microseconds, measured by the
+client.
+
+**Lookups.** The upstream server is `tests/dns_test_server.py`, which re-reads
+a zone of about 3,000 names on every question, so one upstream question
+costs about 3.1 to 3.3 ms here, much more than a real resolver's cache hit.
+
+| Lookup | p50 | p99 |
+|---|---|---|
+| One A question straight to the test server (no Warden) | 3,078–3,339 | 6,456–8,080 |
+| A new wildcard name, asked of the stub | 7,094–7,760 | 13,218–15,322 |
+| The same name again, answered from the table | 51–52 | 115–137 |
+| `getaddrinfo` of an exact name (the hosts view, as in v1.24) | 358–410 | 645–755 |
+| `getaddrinfo` of a new wildcard name | 8,392–8,508 | 14,899–17,237 |
+| `getaddrinfo` of the same wildcard name again | 515–558 | 896–1,054 |
+
+- A new name costs two upstream questions, since the resolver helper asks A
+  and AAAA one after the other, plus 0.7 to 1.2 ms of its own: the hand-off
+  to the helper and back, and the records.
+- A name already in the table is answered in about 50 µs. Through
+  `getaddrinfo` that is 120 to 200 µs more than an exact name, because glibc
+  reads the views and then asks the stub.
+
+**Connects** to a listener on the machine's own address. The Warden's own
+time is its latency per connect minus the dial, read from its records.
+
+| Connect allowed by | Client p50 | Client p99 | Warden's own p50 | Warden's own p99 |
+|---|---|---|---|---|
+| Native (no Warden) | 16–20 | 68–323 | | |
+| A numeric rule | 166–172 | 352–443 | 97–104 | 231–259 |
+| A wildcard, 1 name on the address (2 candidates) | 176–213 | 421–438 | 106–129 | 226–300 |
+| A wildcard, 40 names on the address (41 candidates, hashed) | 207–273 | 354–630 | 134–183 | 245–374 |
+
+Deciding over 41 candidates, hashing them for the record and checking each
+name's grace adds 34 to 79 µs at the median over a numeric rule, about 1 to
+2 µs a name. With 2 candidates the difference is within run-to-run
+noise.
 
 ## Compatibility
 

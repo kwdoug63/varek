@@ -80,8 +80,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     `RELEASE-v1.25.0.md`, "Found in review".
   - The Warden reports `1.25.0` in `run_start`, and the policy grammar as
     v1.25.
-  - `RELEASE-v1.25.0.md`: draft release notes; the soak and latency are
-    pending.
+  - `make latency-v1250` (`tests/latency_v1250.sh`): lookups through the stub
+    and connects decided over 1 and 40 names on one address; results in
+    `varek/v1_4/tests/latency_v1.25.0.txt`. A name in the table is answered in
+    about 50 µs; deciding over 41 candidates costs about 1 to 2 µs a name.
+  - `RELEASE-v1.25.0.md`: draft release notes; the soak is pending.
 - v1.24.0, in progress (host names without agent DNS,
   `docs/security/v1.21-stage2-host-names.md`), sections 1 and 2:
   - Policy grammar: `allow host api.example.com[:port]` and `deny host <name>`
