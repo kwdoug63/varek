@@ -2,8 +2,7 @@
 
 > **DRAFT, not released.** Still to come before tagging:
 > - the 24-hour soak on the droplet ("24 hours against three CDNs");
-> - the release date;
-> - the spec paper edition.
+> - the release date.
 >
 > The review was done by AI review agents; a human or third-party review
 > has not been done.
