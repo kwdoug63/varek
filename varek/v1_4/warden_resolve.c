@@ -98,6 +98,63 @@ int wr_table_add(wr_table_t *t, const char *name) {
     return (int)t->n++;
 }
 
+int wr_table_find(const wr_table_t *t, const char *name) {
+    for (size_t i = 0; i < t->n; i++)
+        if (!strcmp(t->e[i].name, name)) return (int)i;
+    return -1;
+}
+
+int wr_table_add_dynamic(wr_table_t *t, const char *name) {
+    int i = wr_table_find(t, name);
+    if (i >= 0) return i;
+    i = wr_table_add(t, name);
+    if (i < 0) return -1;
+    t->e[i].dynamic = true;
+    t->e[i].next_ms = INT64_MAX;            /* nothing due until it is looked up */
+    return i;
+}
+
+bool wr_entry_fresh(const wr_entry_t *e, int64_t now) {
+    return e->lookups > 0 && e->next_ms != INT64_MAX && e->next_ms > now;
+}
+
+size_t wr_retire_due(wr_table_t *t, int64_t now, void (*done)(void *ctx, size_t i), void *ctx) {
+    size_t n = 0;
+    for (size_t i = 0; i < t->n; i++) {
+        wr_entry_t *e = &t->e[i];
+        if (!e->dynamic || e->pending || e->next_ms == INT64_MAX || e->next_ms > now) continue;
+        int64_t until = now + (int64_t)(e->ttl_eff < t->cfg.grace_max ? e->ttl_eff : t->cfg.grace_max) * 1000;
+        bool moved = false;
+        for (size_t k = 0; k < e->n; k++)
+            if (e->addrs[k].until_ms == 0) { e->addrs[k].until_ms = until; moved = true; }
+        e->next_ms = INT64_MAX;
+        if (moved) t->generation++;
+        if (done) done(ctx, i);
+        n++;
+    }
+    return n;
+}
+
+/* v1.25 review: drop the addresses whose grace has ended by now; for each
+ * entry that lost one, bump the generation and call done. So the records say
+ * exactly which names an address belongs to when a connect is decided, and
+ * the audit never has to guess from grace rounded to whole seconds. */
+size_t wr_grace_due(wr_table_t *t, int64_t now, void (*done)(void *ctx, size_t i), void *ctx) {
+    size_t n = 0;
+    for (size_t i = 0; i < t->n; i++) {
+        wr_entry_t *e = &t->e[i];
+        size_t w = 0;
+        for (size_t k = 0; k < e->n; k++)
+            if (e->addrs[k].until_ms == 0 || e->addrs[k].until_ms > now) e->addrs[w++] = e->addrs[k];
+        if (w == e->n) continue;
+        e->n = w;
+        t->generation++;
+        if (done) done(ctx, i);
+        n++;
+    }
+    return n;
+}
+
 void wr_table_free(wr_table_t *t) {
     if (t->async) wr_async_stop(t);
     for (size_t i = 0; i < t->n; i++) free(t->e[i].addrs);
@@ -251,7 +308,13 @@ bool wr_apply(wr_table_t *t, size_t i, const wr_result_t *r, int64_t now) {
     wr_entry_t *e = &t->e[i];
     e->pending = false;
     e->lookups++;
-    wr_expire(t, now);
+    /* v1.25 review: only this entry's ended grace is dropped here (its own
+     * resolution record follows); other entries keep theirs until
+     * wr_grace_due records the end, so no name leaves an address unrecorded */
+    size_t w = 0;
+    for (size_t k = 0; k < e->n; k++)
+        if (e->addrs[k].until_ms == 0 || e->addrs[k].until_ms > now) e->addrs[w++] = e->addrs[k];
+    e->n = w;
     uint32_t old_ttl = e->ttl_last ? e->ttl_last : e->ttl_eff;
     int64_t grace_until = now + (int64_t)(old_ttl < t->cfg.grace_max ? old_ttl : t->cfg.grace_max) * 1000;
     bool changed = false;
@@ -259,6 +322,7 @@ bool wr_apply(wr_table_t *t, size_t i, const wr_result_t *r, int64_t now) {
     uint32_t minttl = UINT32_MAX;
     for (int f = 0; f < 2; f++) {
         uint8_t fam = f == 0 ? 4 : 6;
+        e->st[f] = r->st[f];
         if (r->st[f] == WR_ST_FAIL) continue;          /* keep this family's current set */
         any_answer = true;
         if (r->st[f] == WR_ST_OK && r->ttl[f] < minttl) minttl = r->ttl[f];
@@ -315,7 +379,7 @@ void wr_expire(wr_table_t *t, int64_t now) {
 int wr_next_due_ms(const wr_table_t *t, int64_t now) {
     int64_t best = -1;
     for (size_t i = 0; i < t->n; i++) {
-        if (t->e[i].pending) continue;
+        if (t->e[i].pending || t->e[i].next_ms == INT64_MAX) continue;
         int64_t d = t->e[i].next_ms - now;
         if (d < 0) d = 0;
         /* Due, but the helper's socket is full: its answers will wake the
@@ -400,7 +464,7 @@ void wr_hosts_view(const wr_table_t *t, FILE *f) {
     char a[INET6_ADDRSTRLEN];
     for (size_t i = 0; i < t->n; i++) {
         const wr_entry_t *e = &t->e[i];
-        if (e->unlisted) continue;         /* only a deny rule names it */
+        if (e->dynamic || e->unlisted) continue;   /* asked of the stub (v1.25), or only a deny rule names it */
         /* IPv4 before IPv6, whatever order the table holds them in. The
          * table appends a new address after those it keeps, so after a
          * rotation an IPv6 address could come first, and a client that takes
@@ -420,6 +484,9 @@ static const char *st_name(wr_status_t s) {
         case WR_ST_OK:       return "ok";
         case WR_ST_NODATA:   return "nodata";
         case WR_ST_NXDOMAIN: return "nxdomain";
+        case WR_ST_RETIRED:  return "retired";
+        case WR_ST_GRACE_END: return "grace_end";
+        case WR_ST_UNANSWERED: return "unanswered";
         default:             return "fail";
     }
 }
@@ -455,8 +522,9 @@ void wr_format_record(FILE *f, const char *run, const wr_table_t *t, size_t i,
     for (int k = 0; k < 2; k++)
         if (r->st[k] == WR_ST_OK && r->ttl[k] < ttl) ttl = r->ttl[k];
     if (ttl != UINT32_MAX) fprintf(f, "\"ttl\":%u,", ttl);
-    fprintf(f, "\"refresh_s\":%u,\"resolver\":\"%s\",\"generation\":%llu,\"timestamp_ns\":%lld}\n",
+    fprintf(f, "\"refresh_s\":%u,\"resolver\":\"%s\",\"generation\":%llu,%s\"timestamp_ns\":%lld}\n",
             e->ttl_eff, t->resolver, (unsigned long long)t->generation,
+            e->dynamic ? "\"dynamic\":true," : "",
             (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
 }
 
@@ -583,7 +651,7 @@ void wr_async_schedule(wr_table_t *t, int64_t now) {
     if (!as || as->dead) return;
     as->full = false;
     for (size_t i = 0; i < t->n; i++) {
-        if (t->e[i].pending || t->e[i].next_ms > now) continue;
+        if (t->e[i].pending || t->e[i].dynamic || t->e[i].next_ms > now) continue;
         struct wr_req q;
         memset(&q, 0, sizeof q);
         q.idx = (uint32_t)i;
@@ -598,6 +666,22 @@ void wr_async_schedule(wr_table_t *t, int64_t now) {
         }
         t->e[i].pending = true;
     }
+}
+
+int wr_async_request(wr_table_t *t, size_t i) {
+    wr_async_t *as = t->async;
+    if (!as || as->dead || i >= t->n) return -1;
+    if (t->e[i].pending) return 0;
+    struct wr_req q;
+    memset(&q, 0, sizeof q);
+    q.idx = (uint32_t)i;
+    memcpy(q.name, t->e[i].name, sizeof q.name);
+    if (send(as->fd, &q, sizeof q, MSG_NOSIGNAL | MSG_DONTWAIT) < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) as->dead = true;
+        return -1;
+    }
+    t->e[i].pending = true;
+    return 0;
 }
 
 void wr_async_collect(wr_table_t *t, int64_t now,

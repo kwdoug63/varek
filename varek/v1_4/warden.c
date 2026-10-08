@@ -132,6 +132,7 @@
 #include "checker/vdp_checker.h"   /* v1.15 independent certificate checker */
 #include "warden_lifecycle.h"   /* v1.9.3 supervisor/target lifecycle coupling */
 #include "warden_resolve.h"     /* v1.24 resolution table for host name rules */
+#include "shared_domains.h"     /* v1.25 wildcards over shared domains, refused at load */
 
 /* Kernel/libc compatibility shims --------------------------------- */
 #ifndef __NR_openat2
@@ -254,12 +255,18 @@ struct action {
     bool          path_null;            /* a NULL path pointer */
     bool          bad_flags;            /* flags the kernel would refuse (EINVAL) */
     /* v1.24: host names (warden_names.inc.c) */
-    int           ncand;                /* connect: candidate strings decided over */
+    int           ncand;                /* connect: candidate strings decided over (g_cand,
+                                           warden_names.inc.c) */
     bool          special_addr;         /* connect: a special address, decided as a number */
-    char          cand[16][WR_NAME_MAX + 8];
     char          dialed[64];           /* connect: the numeric destination dialed */
     char          extra[4608];          /* extra record fields, trusted text, each ending in ',' */
 };
+
+/* v1.25: the candidates of the connect being decided (warden_names.inc.c) */
+typedef char cand_t[WR_NAME_MAX + 8];
+static cand_t *g_cand;
+static size_t  g_cand_cap;
+static size_t *g_cand_idx;
 
 static const char *action_kind_name(action_kind_t k) {
     switch (k) {
@@ -300,7 +307,7 @@ static int policy_load(const char *path, struct policy *p) {
             "(warden_faultinject); never use it to supervise a real agent\n");
 #endif
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.24");
+    snprintf(p->version, sizeof(p->version), "1.25");
     char err[512];
     /* v1.15: read the file once. The decision procedure and the certificate
      * checker parse these same bytes, and their SHA-256 goes in run_start, so
@@ -353,7 +360,8 @@ static int policy_load(const char *path, struct policy *p) {
             ci.kind != kind_to_c[r->kind] || ci.match != op_to_match[r->s.op] ||
             ci.clen != r->s.len || memcmp(ci.c, r->s.c, r->s.len) != 0 ||
             ci.mask != r->b.mask || ci.value != r->b.value || ci.line != r->line ||
-            ci.portless != r->s.portless || ci.name != r->s.name) {
+            ci.portless != r->s.portless || ci.name != r->s.name || ci.wild != r->s.wild ||
+            ci.names != r->names || ci.rate != r->rate) {
             fprintf(stderr, "[warden] policy %s:%d: the decision procedure and the certificate "
                     "checker read this rule differently; refusing to start\n", path, r->line);
             return -1;
@@ -659,6 +667,9 @@ static int derive_intent(const struct seccomp_notif *req,
             memset(&ss, 0, sizeof(ss));
             socklen_t l = alen > sizeof(ss) ? sizeof(ss) : (socklen_t)alen;
             if (xproc_read_bytes(req->pid, addr, &ss, l) == 0) {
+                /* v1.25: the copy a send to the stub is made with */
+                memcpy(out->sa, &ss, l);
+                out->salen = (int)l;
                 if (ss.ss_family == AF_INET) {
                     struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
                     char ip[INET_ADDRSTRLEN] = {0};
@@ -902,11 +913,11 @@ static bool certify(const struct policy *p, struct action *a) {
      * that no earlier host rule holds on any other candidate. */
     if (a->kind == ACT_NET_CONNECT && a->ncand > 1) {
         for (int c = 0; c < a->ncand; c++) {
-            if (!strcmp(a->cand[c], s)) continue;
+            if (!strcmp(g_cand[c], s)) continue;
             for (int i = 0; i < cc.r; i++) {
                 vdpc_rule_info_t ri;
                 if (vdpc_rule_info(&p->c, (size_t)i, &ri) < 0 || ri.kind != VDPC_HOST) continue;
-                if (vdpc_holds(&p->c, (size_t)i, a->cand[c], strlen(a->cand[c])) == 1) {
+                if (vdpc_holds(&p->c, (size_t)i, g_cand[c], strlen(g_cand[c])) == 1) {
                     snprintf(a->check_why, sizeof a->check_why,
                              "an earlier rule (line %d) holds on another candidate", ri.line);
                     return false;
@@ -1267,6 +1278,15 @@ static char     g_run_id[33];
 static wr_table_t g_names;           /* v1.24: the resolution table (see names_setup) */
 static bool       g_names_on = false;
 static bool       g_any_name = false;  /* v1.24: the policy has a host name rule (allow or deny) */
+static bool       g_any_wild = false;  /* v1.25: the policy has a wildcard allow rule (warden_stub.inc.c) */
+static void       stub_resolved(size_t i);
+static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden_stub.inc.c) */
+/* v1.25 (section 4): a wildcard allow rule's budgets when it sets none */
+#define STUB_DEFAULT_NAMES 256           /* distinct new names per run */
+#define STUB_DEFAULT_RATE  30            /* distinct new names per minute */
+#define STUB_LABEL_MAX     63            /* bytes matched by `*` */
+static char       g_psl_sha[65], g_shared_sha[65];  /* v1.25: the lists wildcards were checked against */
+static bool       g_lists_pinned;                   /* v1.25 review: they are the release's */
 static uint64_t g_records = 0;       /* decision records emitted */
 static bool     g_relay_midline = false;
 
@@ -1506,7 +1526,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.24.0\","
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.25.0\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
@@ -1528,7 +1548,28 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     if (g_anchor_fd >= 0) fputs("\"anchored\":true,", f);
     /* v1.24: the names the Warden resolves (each gets a resolution record). */
     if (g_any_name) fputs("\"host_name_rules\":true,", f);
+    /* v1.25: the lists the policy's wildcards were checked against */
+    if (g_psl_sha[0]) fprintf(f, "\"psl_sha256\":\"%s\",\"shared_domains_sha256\":\"%s\","
+                              "\"shared_lists_pinned\":%s,",
+                              g_psl_sha, g_shared_sha, g_lists_pinned ? "true" : "false");
     if (g_names_on) fprintf(f, "\"host_names\":%zu,\"resolver\":\"%s\",", g_names.n, g_names.resolver);
+    /* v1.25: where the agent's questions go (connects and sends to it are
+     * records with rule dns_stub) */
+    if (g_any_wild) fputs("\"dns_stub\":\"127.53.53.53:53\",", f);
+    /* v1.25 (section 4): each wildcard allow rule's budgets, defaults filled in */
+    if (g_any_wild) {
+        fputs("\"wildcard_budgets\":[", f);
+        bool first = true;
+        for (size_t i = 0; i < p->v.n; i++) {
+            const vdp_rule_t *r = &p->v.rules[i];
+            if (r->kind != VDP_KIND_HOST || !r->s.wild || r->verb != VDP_ALLOW) continue;
+            fprintf(f, "%s{\"policy_line\":%d,\"names\":%u,\"rate\":%u,\"label\":%u}", first ? "" : ",",
+                    r->line, r->names ? r->names : STUB_DEFAULT_NAMES,
+                    r->rate ? r->rate : STUB_DEFAULT_RATE, STUB_LABEL_MAX);
+            first = false;
+        }
+        fputs("],", f);
+    }
     fprintf(f, "\"timestamp_ns\":%lld}\n", (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end("run_start");
 }
@@ -1546,12 +1587,14 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
     /* Allow rules' names first (listed in the hosts view), then deny rules'
      * names not already there (v1.24 review): resolved too, so a deny on a
      * name holds on its addresses even when no allow rule names it, but kept
-     * out of the hosts view. */
+     * out of the hosts view. v1.25: a wildcard names no host to resolve in
+     * advance (an allow wildcard's names come from the stub). */
     for (int pass = 0; pass < 2; pass++) {
         for (size_t i = 0; i < p->v.n; i++) {
             const vdp_rule_t *r = &p->v.rules[i];
             if (r->kind == VDP_KIND_HOST && r->s.name) g_any_name = true;
-            if (r->kind != VDP_KIND_HOST || !r->s.name) continue;
+            if (r->kind == VDP_KIND_HOST && r->s.wild && r->verb == VDP_ALLOW) g_any_wild = true;
+            if (r->kind != VDP_KIND_HOST || !r->s.name || r->s.wild) continue;
             if (r->verb != (pass == 0 ? VDP_ALLOW : VDP_DENY)) continue;
             char name[WR_NAME_MAX + 1];
             const char *colon = memchr(r->s.c, ':', r->s.len);
@@ -1568,7 +1611,86 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
             if (pass == 1 && g_names.n > before) g_names.e[ix].unlisted = true;
         }
     }
-    g_names_on = g_names.n > 0;
+    /* v1.25: a wildcard adds names when the agent asks (the stub) */
+    g_names_on = g_names.n > 0 || g_any_wild;
+    return 0;
+}
+
+/* v1.25: an allow wildcard over a shared domain (a public suffix, an entry of
+ * the Public Suffix List's private section, or the VAREK list) is refused at
+ * load: anyone could register a name under it. The lists are pinned files
+ * (data/); their SHA-256 goes in run_start. 0, or -1 (the Warden does not
+ * start). */
+static int sha256_file_hex(const char *path, char out[65]) {
+    FILE *f = fopen(path, "re");
+    if (!f) return -1;
+    crypto_hash_sha256_state st;
+    crypto_hash_sha256_init(&st);
+    unsigned char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) crypto_hash_sha256_update(&st, buf, n);
+    int bad = ferror(f);
+    fclose(f);
+    if (bad) return -1;
+    unsigned char h[32];
+    crypto_hash_sha256_final(&st, h);
+    sodium_bin2hex(out, 65, h, sizeof h);
+    return 0;
+}
+
+static int wildcards_check(const char *path, const struct policy *p, const char *psl_arg,
+                           const char *shared_arg) {
+    bool any = false;
+    for (size_t i = 0; i < p->v.n; i++)
+        if (p->v.rules[i].kind == VDP_KIND_HOST && p->v.rules[i].s.wild) any = true;
+    if (!any) return 0;
+    char psl[PATH_MAX], var[PATH_MAX], why[512];
+    if (psl_arg) snprintf(psl, sizeof psl, "%s", psl_arg);
+    else if (sd_default_path("public_suffix_list.dat", psl, sizeof psl) < 0) {
+        fprintf(stderr, "[warden] the policy has wildcard host rules, and the Public Suffix List "
+                "(data/public_suffix_list.dat) was not found; give --psl\n");
+        return -1;
+    }
+    if (shared_arg) snprintf(var, sizeof var, "%s", shared_arg);
+    else if (sd_default_path("varek_shared_domains.txt", var, sizeof var) < 0) {
+        fprintf(stderr, "[warden] the policy has wildcard host rules, and the VAREK list of shared "
+                "domains (data/varek_shared_domains.txt) was not found; give --shared-domains\n");
+        return -1;
+    }
+    /* v1.25 review: the lists in data/ must be the ones this release ships;
+     * lists named with --psl or --shared-domains may differ, which run_start
+     * records (shared_lists_pinned). */
+    if (sha256_file_hex(psl, g_psl_sha) < 0 || sha256_file_hex(var, g_shared_sha) < 0) {
+        fprintf(stderr, "[warden] cannot read %s; refusing to start\n", g_psl_sha[0] ? var : psl);
+        return -1;
+    }
+    bool psl_ok = !strcmp(g_psl_sha, SD_PSL_SHA256), var_ok = !strcmp(g_shared_sha, SD_VAREK_SHA256);
+    if ((!psl_arg && !psl_ok) || (!shared_arg && !var_ok)) {
+        const char *which = !psl_arg && !psl_ok ? psl : var;
+        fprintf(stderr, "[warden] %s is not the list this release ships (SHA-256 %s); reinstall it, "
+                "or name a list with %s; refusing to start\n", which,
+                which == psl ? g_psl_sha : g_shared_sha, which == psl ? "--psl" : "--shared-domains");
+        return -1;
+    }
+    g_lists_pinned = psl_ok && var_ok;
+    if (!g_lists_pinned)
+        fprintf(stderr, "[warden] the shared-domain lists named on the command line are not the ones "
+                "this release ships; run_start records it (shared_lists_pinned false)\n");
+    sd_lists_t *l = sd_load(psl, var, why, sizeof why);
+    if (!l) { fprintf(stderr, "[warden] %s; refusing to start\n", why); return -1; }
+    int refused = 0;
+    for (size_t i = 0; i < p->v.n; i++) {
+        const vdp_rule_t *r = &p->v.rules[i];
+        char suf[512];
+        if (r->kind != VDP_KIND_HOST || !r->s.wild || r->verb != VDP_ALLOW) continue;
+        if (sd_wildcard_suffix(r->s.c, suf, sizeof suf) == 0 && sd_refuses(l, suf, why, sizeof why)) {
+            fprintf(stderr, "[warden] policy %s:%d: allow host *.%s is refused: %s; write the exact "
+                    "names instead\n", path, r->line, suf, why);
+            refused++;
+        }
+    }
+    sd_free(l);
+    if (refused) return -1;
     return 0;
 }
 
@@ -1576,6 +1698,32 @@ static void emit_resolution(void *ctx, size_t i, const wr_result_t *r) {
     (void)ctx;
     FILE *f = rec_begin();
     wr_format_record(f, g_run_id, &g_names, i, r, wr_now_ms());
+    rec_end(NULL);
+    stub_resolved(i);                   /* v1.25: answer the agent's waiting questions */
+}
+
+/* v1.25: a dynamic entry's TTL passed with no new question; its addresses
+ * went into grace. A resolution record says so ("a" and "aaaa": "retired"),
+ * so the audit sees the addresses leave as the Warden's table did. */
+/* v1.25 review: an entry whose grace ended, written before the connect
+ * decided at that time */
+static void emit_grace_end(void *ctx, size_t i) {
+    wr_result_t r;
+    memset(&r, 0, sizeof r);
+    r.st[0] = r.st[1] = WR_ST_GRACE_END;
+    int64_t now = *(const int64_t *)ctx;
+    FILE *f = rec_begin();
+    wr_format_record(f, g_run_id, &g_names, i, &r, now);
+    rec_end(NULL);
+}
+
+static void emit_retired(void *ctx, size_t i) {
+    (void)ctx;
+    wr_result_t r;
+    memset(&r, 0, sizeof r);
+    r.st[0] = r.st[1] = WR_ST_RETIRED;
+    FILE *f = rec_begin();
+    wr_format_record(f, g_run_id, &g_names, i, &r, wr_now_ms());
     rec_end(NULL);
 }
 
@@ -1607,7 +1755,24 @@ static void names_resolve_all(bool record) {
     }
 }
 
+/* v1.25 review: a lookup on demand still out when the run ends is recorded
+ * as unanswered, so the audit can require an answer for every lookup sent
+ * upstream (a deleted answer is then missing, not merely late). */
+static void emit_unanswered(void) {
+    if (!g_names_on) return;
+    for (size_t i = 0; i < g_names.n; i++) {
+        if (!g_names.e[i].pending || !g_names.e[i].dynamic) continue;
+        wr_result_t r;
+        memset(&r, 0, sizeof r);
+        r.st[0] = r.st[1] = WR_ST_UNANSWERED;
+        FILE *f = rec_begin();
+        wr_format_record(f, g_run_id, &g_names, i, &r, wr_now_ms());
+        rec_end(NULL);
+    }
+}
+
 static void emit_run_end(int exit_status) {
+    emit_unanswered();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
@@ -2533,6 +2698,7 @@ static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *mi
 
 #include "warden_names.inc.c"        /* v1.24: host-name views and candidates */
 #include "warden_net.inc.c"          /* v1.21: decided connections */
+#include "warden_stub.inc.c"         /* v1.25: the stub resolver for wildcard names */
 
 /* ---------------- receive loop ---------------- */
 
@@ -2556,7 +2722,8 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         /* v1.21: also on the sockets of connects and sends still being
          * finished for the agent (warden_net.inc.c). */
         /* v1.24: also on the resolver helper's results. */
-        struct pollfd pfds[4 + MAX_PENDING] = {
+        /* v1.25: and on the stub resolver's sockets (warden_stub.inc.c). */
+        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN] = {
             { .fd = notify_fd,    .events = POLLIN },
             { .fd = target_pidfd, .events = POLLIN },
             { .fd = agent_err_fd, .events = POLLIN },
@@ -2573,14 +2740,16 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * likewise, refreshes are handed to the resolver helper here and
          * their results applied here; the lookups themselves never run in
          * the Warden. */
+        int nstub = stub_poll_fill(&pfds[4 + npoll]);
         int to = maybe_checkpoint(), pto = pend_timeout_ms();
         if (pto >= 0 && (to < 0 || pto < to)) to = pto;
         if (g_names_on) {
+            wr_retire_due(&g_names, wr_now_ms(), emit_retired, NULL);
             wr_async_schedule(&g_names, wr_now_ms());
             int dto = wr_next_due_ms(&g_names, wr_now_ms());
             if (dto >= 0 && (to < 0 || dto < to)) to = dto;
         }
-        int pr = poll(pfds, (nfds_t)(4 + npoll), to);
+        int pr = poll(pfds, (nfds_t)(4 + npoll + nstub), to);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -2590,6 +2759,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             for (int i = 0; i < npoll; i++) rev[i] = pfds[4 + i].revents;
             pend_service(notify_fd, rev, npoll);
         }
+        stub_service(p, &pfds[4 + npoll], nstub);
         if (g_names_on && (pfds[3].revents & (POLLIN | POLLHUP | POLLERR))) {
             wr_async_collect(&g_names, wr_now_ms(), emit_resolution, NULL);
             /* v1.24: without the helper the table would go stale; stop
@@ -2772,6 +2942,8 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             continue;
         }
         if (act.kind == ACT_NET_SEND && net_send_relay(notify_fd, &req, &act, &t0))
+            continue;
+        if (act.kind == ACT_NET_SEND && stub_sendto(notify_fd, &req, &act, &t0))   /* v1.25 */
             continue;
         if (act.kind == ACT_NET_BIND) {
             net_bind(notify_fd, &req, &act, &t0);
@@ -3837,7 +4009,7 @@ static void usage(const char *argv0) {
         "              [--sign-key <key>]\n"
         "              [--anchor <path>] [--checkpoint-every <n>] [--run-as <user>]\n"
         "              [--dns-server <a.b.c.d[:port]>] [--dns-ttl-min <s>] [--dns-ttl-max <s>]\n"
-        "              [--dns-grace-max <s>]\n"
+        "              [--dns-grace-max <s>] [--psl <file>] [--shared-domains <file>]\n"
         "              -- <target> [args...]\n"
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
         "\n"
@@ -3971,6 +4143,7 @@ int main(int argc, char **argv) {
     const char *state_arg   = NULL;     /* v1.18.0 */
     const char *gstatus_arg = NULL;     /* v1.18.0 */
     wr_config_t dns_cfg;                /* v1.24 */
+    const char *psl_arg = NULL, *shared_arg = NULL;   /* v1.25 */
     wr_config_default(&dns_cfg);
     int sep_idx = -1;
 
@@ -4004,6 +4177,10 @@ int main(int argc, char **argv) {
                 return 2;
             }
             g_ckpt_every = n;
+        } else if (strcmp(argv[i], "--psl") == 0 && !psl_arg) {
+            psl_arg = argv[++i];                                            /* v1.25 */
+        } else if (strcmp(argv[i], "--shared-domains") == 0 && !shared_arg) {
+            shared_arg = argv[++i];                                         /* v1.25 */
         } else if (strcmp(argv[i], "--dns-server") == 0 && !dns_cfg.server) {
             dns_cfg.server = argv[++i];                                     /* v1.24 */
         } else if (strcmp(argv[i], "--dns-ttl-min") == 0 || strcmp(argv[i], "--dns-ttl-max") == 0 ||
@@ -4087,6 +4264,7 @@ int main(int argc, char **argv) {
     if (flow_path && flow_setup(&p, flow_path, state_arg, session_arg, gstatus_arg) < 0)
         return 1;                                                           /* v1.18.0 */
     if (names_setup(&p, &dns_cfg) < 0) return 1;                            /* v1.24 */
+    if (wildcards_check(policy_path, &p, psl_arg, shared_arg) < 0) return 1;            /* v1.25 */
     if (g_any_name) views_setup();
     if (g_check_only) {
         /* v1.24: resolve each allowed name and report the ones that fail (a
@@ -4371,6 +4549,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         sockref_warm();
+        stub_setup();                   /* v1.25 */
     }
     /* v1.21: up to MAX_PENDING connects and sends can wait in the Warden, each
      * holding a socket: raise the Warden's own descriptor limit (after the

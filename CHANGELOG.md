@@ -10,6 +10,87 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Added
+- v1.25.0, in progress (opt-in wildcard host names,
+  `docs/security/v1.25-wildcard-host-names.md`), sections 1 to 4:
+  - Policy grammar: `allow host *.example.com[:port] acknowledge=dns-channel`
+    after `require warden 1.25`, in the decision procedure, the certificate
+    checker and the cross-check oracle. Every wildcard allow rule must carry
+    `acknowledge=dns-channel`, so the policy itself shows that the agent's
+    lookups under it leave the host; without it the policy is refused. A
+    wildcard is held as a glob (`?*.example.com:443`), so it is decided,
+    certified and fuzzed like any glob. The policy-grammar version is 1.25.
+  - An allow wildcard over a shared domain is refused at load: a public suffix
+    (`*.com`), an entry of the Public Suffix List's private section or under
+    one (`*.s3.amazonaws.com`), or the VAREK list (`*.my.salesforce.com`). The
+    lists are pinned in `varek/v1_4/data/` (the Public Suffix List is MPL-2.0);
+    their SHA-256 goes in `run_start`; lint and the Warden name the entry.
+    The VAREK list holds 56 domains, among them blog and newsletter hosts
+    (`wordpress.com`, `substack.com`), sign-up tenants (`slack.com`,
+    `okta.com`, `auth0.com`) and accounts anyone can open (`vault.azure.net`,
+    `firebaseio.com`). A suffix with an entry under it is refused too
+    (`*.salesforce.com` covers `my.salesforce.com`). The lists are pinned:
+    lists in `data/` that are not the release's stop the Warden.
+  - The stub resolver (`warden_stub.inc.c`): with a wildcard allow rule, the
+    agent's `resolv.conf` view names `127.53.53.53`, a UDP and TCP stub the
+    Warden binds in the agent's own network namespace, and `nsswitch.conf`
+    says `hosts: files dns`. A connect to it is made by the Warden on the
+    agent's own socket, and a musl-style `sendto` is relayed; both are
+    `dns_stub` records, and every other port-53 connect stays refused. A
+    name no allow rule can reach gets NXDOMAIN at once and sends nothing
+    upstream. A name a wildcard matches is looked up by the resolver helper
+    when asked (a `resolution` record with `"dynamic":true`) and expires
+    when its TTL passes with no new question. Connects are decided on the
+    name, as in v1.24. `run_start` names the stub (`dns_stub`), and
+    `varek_audit.py` accepts `dns_stub` records only to it. Two more empty
+    views, `/etc/netsvc.conf` and `/etc/svc.conf`, keep c-ares (Node's
+    `dns.resolve*`) from discarding its configuration.
+  - Budgets on the name channel: `allow host *.example.com:443 names=64
+    rate=10 acknowledge=dns-channel` (defaults 256 new names a run and 30 a minute, and at most 63
+    bytes before the suffix), parsed by all three parsers. A new name past a
+    budget gets NXDOMAIN and is not looked up (`wildcard_budget`). Every
+    question to the stub is a chained `dns_question` record, and `run_start`
+    lists the budgets. `varek_audit.py` checks the budgets against the
+    policy file, every charge against them, and that every name looked up on
+    demand was asked for. `varek refusals` lists budget refusals;
+    `varek policy show` shows each rule's budgets.
+  - Many names on one address: a connect is decided over every name its
+    address belongs to, with no limit (through v1.24 one past 15 was refused,
+    `too_many_names`, which per-tenant names behind one CDN address reach at
+    once). Past 15 the record carries `candidates_n` and
+    `candidates_sha256`, and `varek_audit.py` rebuilds the candidates from
+    the resolution records. A name looked up on demand whose TTL passes
+    unasked writes a `resolution` record (`"a":"retired"`). Without it, the
+    audit refused a later connect to that address under another name.
+  - Tests: `make test-v1250`. As root it runs Python, curl, Node
+    (`dns.lookup` and `dns.resolve4`), Go, Java and a static musl client
+    through the stub, and a DNS-tunnel style client against the budgets.
+    Against the previous build, 21 of the 31 stub checks fail without the
+    stub, and 22 of the budget and budget-grammar checks fail.
+    The whole suite now runs 161 checks and fails 129 of them against the
+    v1.24.0 Warden, parsers and audit.
+  - The review's findings, all fixed (four AI review agents, separate from
+    the session that wrote the code; not a human or third-party review):
+    wildcards over parents of shared domains, unpinned lists and missing
+    entries; re-asked names uncharged (every upstream lookup now counts
+    against `rate=`); a stub connect that could stall the Warden; grace an
+    agent could use to fail an honest audit (the Warden records
+    `grace_end`); and forged streams the audit accepted (a connect forged as
+    a stub connect, a denied name shown answered, a hidden question, a moved
+    rate window, a dropped answer, quadratic work, a bare CR, crashes). See
+    `RELEASE-v1.25.0.md`, "Found in review".
+  - The Warden reports `1.25.0` in `run_start`, and the policy grammar as
+    v1.25.
+  - `make latency-v1250` (`tests/latency_v1250.sh`): lookups through the stub
+    and connects decided over 1 and 40 names on one address; results in
+    `varek/v1_4/tests/latency_v1.25.0.txt`. A name in the table is answered in
+    about 50 µs; deciding over 41 candidates costs about 1 to 2 µs a name.
+  - The 24-hour soak against Wikipedia (40 names on one address): 1,440 of
+    1,440 fetches, 0 refused connects, 2,880 questions all recorded, 0 budget
+    refusals, 40 of 256 names and at most 2 a minute of 30. Its audit failed
+    3 connects decided within 1 ms of a grace ending, from rounding the
+    soak's older audit did not allow for; the stream passes the audit as of
+    9858835, and the Warden now records each end of grace.
+  - `RELEASE-v1.25.0.md`: draft release notes.
 - v1.24.0, in progress (host names without agent DNS,
   `docs/security/v1.21-stage2-host-names.md`), sections 1 and 2:
   - Policy grammar: `allow host api.example.com[:port]` and `deny host <name>`

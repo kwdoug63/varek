@@ -13,3 +13,10 @@ describe interoperability with the openly published CycloneDX format
 (standardized as ECMA-424); the format's schemas are Apache-2.0 licensed and may
 be implemented by anyone. All other product names, logos, and marks are the
 property of their respective owners.
+
+Third-party data
+----------------
+varek/v1_4/data/public_suffix_list.dat is the Public Suffix List
+(https://publicsuffix.org/), distributed under the Mozilla Public License,
+v. 2.0 (https://mozilla.org/MPL/2.0/); its license header is kept in the file.
+VAREK reads it to refuse wildcard host rules over shared domains.

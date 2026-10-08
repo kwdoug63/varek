@@ -13,6 +13,8 @@
  *                       documentation), attempts:1 timeout:0 (musl, which
  *                       queries it, then gives up at once)
  *   /etc/nsswitch.conf  hosts: files (and files for passwd, group)
+ *   (v1.25: with the stub resolver up, resolv.conf names it, 127.53.53.53,
+ *   and nsswitch.conf says hosts: files dns; see warden_stub.inc.c)
  *   /etc/host.conf      multi on: without it (no file, or one the policy does
  *                       not let the agent read) glibc returns only the first
  *                       /etc/hosts line for a name, so the agent got a single
@@ -47,13 +49,19 @@ static uint64_t ns_between(const struct timespec *a, const struct timespec *b);
 
 /* ---- section 3: the views ---- */
 
-enum { VIEW_HOSTS = 0, VIEW_RESOLV = 1, VIEW_NSSWITCH = 2, VIEW_HOSTCONF = 3, VIEW_N = 4 };
+/* v1.25: with the stub resolver up, /etc/netsvc.conf and /etc/svc.conf too,
+ * both empty. c-ares (Node's dns.resolve*) reads them after resolv.conf and
+ * nsswitch.conf, and takes a refused open of either (the Warden answers
+ * EACCES for a file it does not allow, whether or not it exists) as a broken
+ * configuration: it then drops what it read and asks 127.0.0.1. */
+enum { VIEW_HOSTS = 0, VIEW_RESOLV = 1, VIEW_NSSWITCH = 2, VIEW_HOSTCONF = 3, VIEW_NETSVC = 4,
+       VIEW_SVC = 5, VIEW_N = 6 };
 static const char *const kViewPath[VIEW_N] = { "/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf",
-                                               "/etc/host.conf" };
+                                               "/etc/host.conf", "/etc/netsvc.conf", "/etc/svc.conf" };
 static const char *const kViewRule[VIEW_N] = { "hosts_view", "resolv_view", "nsswitch_view",
-                                               "hostconf_view" };
+                                               "hostconf_view", "netsvc_view", "svc_view" };
 static char     g_view_canon[VIEW_N][PATH_LIMIT];  /* realpath on the host at startup, or "" */
-static int      g_view_fd[VIEW_N] = { -1, -1, -1, -1 };
+static int      g_view_fd[VIEW_N] = { -1, -1, -1, -1, -1, -1 };
 static uint64_t g_view_gen = UINT64_MAX;          /* g_names.generation the hosts memfd holds */
 
 /* At startup: what each view path resolves to on the host. */
@@ -66,14 +74,18 @@ static void views_setup(void) {
     }
 }
 
+/* Is view v served in this run? (The last two only with the stub resolver.) */
+static bool view_on(int v) { return v < VIEW_NETSVC || g_stub_on; }
+
 static int view_by_target(const char *target) {
-    for (int v = 0; v < VIEW_N; v++) if (!strcmp(target, kViewPath[v])) return v;
+    for (int v = 0; v < VIEW_N; v++) if (view_on(v) && !strcmp(target, kViewPath[v])) return v;
     return -1;
 }
 
 static int view_by_canonical(const char *resolved) {
     for (int v = 0; v < VIEW_N; v++)
-        if (!strcmp(resolved, kViewPath[v]) || (g_view_canon[v][0] && !strcmp(resolved, g_view_canon[v])))
+        if (view_on(v) &&
+            (!strcmp(resolved, kViewPath[v]) || (g_view_canon[v][0] && !strcmp(resolved, g_view_canon[v]))))
             return v;
     return -1;
 }
@@ -91,9 +103,13 @@ static int view_memfd(int v) {
     FILE *f = open_memstream(&buf, &len);
     if (!f) return -1;
     if (v == VIEW_HOSTS) wr_hosts_view(&g_names, f);
+    /* v1.25: with the stub resolver up, the agent's questions go to it */
+    else if (v == VIEW_RESOLV && g_stub_on) fputs("nameserver 127.53.53.53\noptions attempts:2 timeout:5\n", f);
     else if (v == VIEW_RESOLV) fputs("nameserver 192.0.2.1\noptions attempts:1 timeout:0\n", f);
-    else if (v == VIEW_NSSWITCH) fputs("passwd: files\ngroup: files\nhosts: files\n", f);
-    else fputs("multi on\n", f);
+    else if (v == VIEW_NSSWITCH) fputs(g_stub_on ? "passwd: files\ngroup: files\nhosts: files dns\n"
+                                                 : "passwd: files\ngroup: files\nhosts: files\n", f);
+    else if (v == VIEW_HOSTCONF) fputs("multi on\n", f);
+    /* VIEW_NETSVC, VIEW_SVC: empty */
     if (fclose(f) != 0) { free(buf); return -1; }
     int fd = memfd_create(kViewRule[v], MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (fd < 0) { free(buf); return -1; }
@@ -158,16 +174,35 @@ static void view_serve(int notify_fd, const struct seccomp_notif *req, struct ac
  * here: internal APIs are reached by name there. */
 static bool special_address(const wr_ip_t *ip) { return wr_special_address(ip); }
 
-/* Fill a->cand with the numeric destination (a->resolved, "addr:port") and
- * name:port for each name the address belongs to. 0, or -1 when the address
- * belongs to more names than a connect can carry (refused: a name left out
- * could hold an earlier deny rule). */
+/* The candidates of the connect being decided: the numeric destination, then
+ * name:port for every name the address belongs to (v1.25: as many as there
+ * are; through v1.24 a connect was refused past 15 names, which per-tenant
+ * names under one suffix, served from one CDN address, reach at once). They
+ * live here, not in struct action, and are used before the connect is dialed
+ * or left pending. */
+#define NAMES_LISTED 16                   /* listed in the record up to this many (the address + 15) */
+/* g_cand, g_cand_cap, g_cand_idx: declared in warden.c (certify uses them) */
+
+/* Fill the candidates with the numeric destination (a->resolved, "addr:port")
+ * and name:port for each name the address belongs to; a->ncand is their
+ * number. 0, or -1 when memory for them runs out (refused). */
 static int names_candidates(struct action *a, int fam, const void *addr, unsigned port) {
     a->ncand = 0;
     a->special_addr = false;
-    /* a numeric destination is at most 47 bytes ("[IPv6]:65535") */
-    snprintf(a->cand[a->ncand++], sizeof a->cand[0], "%.63s", a->resolved);
     snprintf(a->dialed, sizeof a->dialed, "%.63s", a->resolved);
+    size_t want = 1 + (g_names_on ? g_names.n : 0);
+    if (want > g_cand_cap) {
+        size_t nc = want < 64 ? 64 : want * 2;
+        cand_t *c = realloc(g_cand, nc * sizeof *c);
+        if (!c) return -1;
+        g_cand = c;
+        size_t *ix = realloc(g_cand_idx, nc * sizeof *ix);
+        if (!ix) return -1;
+        g_cand_idx = ix;
+        g_cand_cap = nc;
+    }
+    /* a numeric destination is at most 47 bytes ("[IPv6]:65535") */
+    snprintf(g_cand[a->ncand++], sizeof g_cand[0], "%.63s", a->resolved);
     if (!g_names_on) return 0;
     wr_ip_t ip;
     memset(&ip, 0, sizeof ip);
@@ -185,11 +220,14 @@ static int names_candidates(struct action *a, int fam, const void *addr, unsigne
         a->special_addr = true;          /* decided as a number (special_address) */
         return 0;
     }
-    size_t idx[NAMES_MAX_CAND];
-    size_t n = wr_names_for(&g_names, &ip, wr_now_ms(), idx, NAMES_MAX_CAND - 1);
-    if (n > NAMES_MAX_CAND - 1) return -1;
+    /* v1.25 review: record the grace that has ended before deciding, at the
+     * same time the decision uses */
+    int64_t now = wr_now_ms();
+    wr_grace_due(&g_names, now, emit_grace_end, &now);
+    size_t n = wr_names_for(&g_names, &ip, now, g_cand_idx, g_cand_cap - 1);
+    if (n > g_cand_cap - 1) return -1;               /* cannot happen: at most g_names.n */
     for (size_t k = 0; k < n; k++)
-        snprintf(a->cand[a->ncand++], sizeof a->cand[0], "%s:%u", g_names.e[idx[k]].name, port);
+        snprintf(g_cand[a->ncand++], sizeof g_cand[0], "%s:%u", g_names.e[g_cand_idx[k]].name, port);
     return 0;
 }
 
@@ -202,7 +240,7 @@ static decision_t names_decide(const struct policy *p, struct action *a) {
     decision_t best_d = DEC_UNKNOWN;
     const char *best_why = NULL;
     for (int c = 0; c < a->ncand; c++) {
-        snprintf(a->resolved, sizeof a->resolved, "%s", a->cand[c]);
+        snprintf(a->resolved, sizeof a->resolved, "%s", g_cand[c]);
         decision_t d = policy_decide(p, a);
         if (a->rule_index >= 0 && (best_ri < 0 || a->rule_index < best_ri)) {
             best = c;
@@ -212,24 +250,56 @@ static decision_t names_decide(const struct policy *p, struct action *a) {
         }
     }
     if (best < 0) {                       /* no rule holds on any candidate */
-        snprintf(a->resolved, sizeof a->resolved, "%s", a->cand[0]);
+        snprintf(a->resolved, sizeof a->resolved, "%s", g_cand[0]);
         return policy_decide(p, a);
     }
-    snprintf(a->resolved, sizeof a->resolved, "%s", a->cand[best]);
+    snprintf(a->resolved, sizeof a->resolved, "%s", g_cand[best]);
     a->rule_index = best_ri;
     a->policy_line = p->v.rules[best_ri].line;
     a->why = best_why;
     return best_d;
 }
 
-/* The record fields for a connect decided with names. */
+static int cand_cmp(const void *x, const void *y) {
+    return strcmp(*(const char *const *)x, *(const char *const *)y);
+}
+
+/* The record fields for a connect decided with names: every candidate, or
+ * (v1.25) past NAMES_LISTED of them their number and the SHA-256 of the
+ * candidates sorted bytewise and joined with '\n'. varek_audit.py rebuilds
+ * the candidates from the resolution records and checks either form. */
 static void names_record_fields(struct action *a) {
     if (!g_names_on || a->ncand == 0) return;     /* a Unix connect has no candidates */
+    if (a->ncand > NAMES_LISTED) {
+        const char **v = malloc((size_t)a->ncand * sizeof *v);
+        unsigned char h[crypto_hash_sha256_BYTES];
+        char hx[2 * crypto_hash_sha256_BYTES + 1];
+        if (!v) {
+            snprintf(a->extra, sizeof a->extra, "\"dialed\":\"%s\",\"candidates_n\":%d,", a->dialed, a->ncand);
+            return;
+        }
+        for (int c = 0; c < a->ncand; c++) v[c] = g_cand[c];
+        qsort(v, (size_t)a->ncand, sizeof *v, cand_cmp);
+        crypto_hash_sha256_state st;
+        crypto_hash_sha256_init(&st);
+        for (int c = 0; c < a->ncand; c++) {
+            if (c) crypto_hash_sha256_update(&st, (const unsigned char *)"\n", 1);
+            crypto_hash_sha256_update(&st, (const unsigned char *)v[c], strlen(v[c]));
+        }
+        crypto_hash_sha256_final(&st, h);
+        free(v);
+        sodium_bin2hex(hx, sizeof hx, h, sizeof h);
+        snprintf(a->extra, sizeof a->extra,
+                 "\"dialed\":\"%s\",\"candidates_n\":%d,\"candidates_sha256\":\"%s\","
+                 "\"resolution_generation\":%llu,",
+                 a->dialed, a->ncand, hx, (unsigned long long)g_names.generation);
+        return;
+    }
     size_t w = 0;
     int k = snprintf(a->extra, sizeof a->extra, "\"dialed\":\"%s\",\"candidates\":[", a->dialed);
     if (k > 0) w = (size_t)k;
     for (int c = 0; c < a->ncand && w < sizeof a->extra; c++) {
-        k = snprintf(a->extra + w, sizeof a->extra - w, "%s\"%s\"", c ? "," : "", a->cand[c]);
+        k = snprintf(a->extra + w, sizeof a->extra - w, "%s\"%s\"", c ? "," : "", g_cand[c]);
         if (k > 0) w += (size_t)k;
     }
     if (w < sizeof a->extra)

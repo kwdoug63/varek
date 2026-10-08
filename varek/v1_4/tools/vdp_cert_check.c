@@ -219,15 +219,20 @@ int main(int argc, char **argv) {
     }
 
     /* v1.24 review: each rule, one line: kind (p|h|e), verb (a|d), a host name
-     * rule (n|-), the flag clause's mask and value (hex). varek_audit.py reads
-     * the policy's name rules and view-path denies from here, not from the
-     * stream. */
+     * rule (n|-), the flag clause's mask and value (hex). v1.25 review: then a
+     * wildcard (w|-), the policy line, the names= and rate= budgets as
+     * written (0: the default), and the rule's constant in hex. varek_audit.py
+     * reads the policy's rules from here, as this parser reads the file, not
+     * from the stream or its own reading of the file. */
     if (!strcmp(argv[2], "rules")) {
         for (size_t i = 0; i < pol.n; i++) {
             vdpc_rule_info_t ri;
             vdpc_rule_info(&pol, i, &ri);
-            printf("%c %c %c %x %x\n", ri.kind == VDPC_PATH ? 'p' : ri.kind == VDPC_HOST ? 'h' : 'e',
-                   ri.allow ? 'a' : 'd', ri.name ? 'n' : '-', (unsigned)ri.mask, (unsigned)ri.value);
+            printf("%c %c %c %x %x %c %d %u %u ", ri.kind == VDPC_PATH ? 'p' : ri.kind == VDPC_HOST ? 'h' : 'e',
+                   ri.allow ? 'a' : 'd', ri.name ? 'n' : '-', (unsigned)ri.mask, (unsigned)ri.value,
+                   ri.wild ? 'w' : '-', ri.line, (unsigned)ri.names, (unsigned)ri.rate);
+            for (size_t k = 0; k < ri.clen; k++) printf("%02x", (unsigned char)ri.c[k]);
+            printf("%s\n", ri.clen ? "" : "=");
         }
         vdpc_free(&pol);
         return 0;

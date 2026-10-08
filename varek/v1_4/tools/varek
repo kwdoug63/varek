@@ -345,6 +345,10 @@ def summarize(recs):
                 s["start"] = _dt.datetime.fromtimestamp(ts / 1e9).strftime("%Y-%m-%d %H:%M:%S")
         elif ev == "run_end":
             s["complete"] = True
+        elif ev == "dns_question" and r.get("rule") == "wildcard_budget":
+            # v1.25: a name a wildcard rule's budget refused (NXDOMAIN)
+            s["refused"] += 1
+            s["refusals"].append(r)
         elif "decision_final" in r:
             d = r["decision_final"]
             if d == "ALLOW":
@@ -636,6 +640,19 @@ def cmd_policy_show(args):
     for verb in ("allow", "deny"):
         parts = ", ".join(f"{v} {k}" for k, v in sorted(counts[verb].items())) or "none"
         info(f"{verb.capitalize():8} {parts}")
+    # v1.25: each wildcard allow rule's budgets (the Warden's defaults filled
+    # in), as the certificate checker parses the file (v1.25 review: not this
+    # tool's own reading, which split lines on a bare CR where the Warden does not)
+    rq = run_cmd([tool("vdp_cert_check"), path, "rules"], capture=True)
+    for ln in rq.stdout.splitlines() if rq.returncode == 0 else []:
+        f = ln.split()
+        if len(f) == 10 and f[0] == "h" and f[1] == "a" and f[5] == "w":
+            c = bytes.fromhex(f[9]).decode("latin-1")
+            sfx, _, port = c[3:].rpartition(":")
+            info(f"Wildcard *.{sfx}{'' if port == '*' else ':' + port} (line {f[6]}): at most "
+                 f"{f[7] if f[7] != '0' else '256'} new names a run, {f[8] if f[8] != '0' else '30'} "
+                 f"lookups upstream a minute, 63 bytes before the suffix; the agent's lookups under it "
+                 f"leave the host (acknowledge=dns-channel)")
     info("Anything not allowed is UNKNOWN and refused.")
     return 0
 
@@ -854,6 +871,16 @@ def cmd_refusals(args):
     info(f"{s['refused']} refused action(s) in {log}:\n")
     for r in s["refusals"][: args.n]:
         line = r.get("policy_line", -1)
+        if r.get("event") == "dns_question":
+            text = policy_line_text(policy, line) if policy and isinstance(line, int) else None
+            b = r.get("budget")
+            what = {"names": "its names= budget (new names per run) is spent",
+                    "rate": "its rate= budget (lookups upstream per minute) is spent",
+                    "label": "the part before the suffix is longer than 63 bytes"}.get(
+                        b if isinstance(b, str) else "", "a budget")   # v1.25 review: no crash on a list
+            info(f"  {'BUDGET':11}  {'dns.question':13}  {r.get('name', '')}")
+            hint(f"policy line {line}" + (f": {text}" if text else "") + f"; {what}; the agent got NXDOMAIN")
+            continue
         if isinstance(line, int) and line >= 0:
             text = policy_line_text(policy, line) if policy else None
             where = f"policy line {line}" + (f": {text}" if text else
@@ -868,6 +895,8 @@ def cmd_refusals(args):
     if s["refused"] > args.n:
         info(f"\n  ... and {s['refused'] - args.n} more (use -n to see them)")
     info("\nUNSATISFIED: a deny rule matched.  UNKNOWN: no rule allowed it (refused by default).")
+    if any(r.get("event") == "dns_question" for r in s["refusals"][: args.n]):
+        info("BUDGET: a wildcard rule's budget refused a new name (raise it with names= or rate=).")
     return 0
 
 

@@ -470,7 +470,7 @@ def parse_lines(raw_lines, path):
                 if len(toks) != 3 or toks[1] != "warden" or not m:
                     raise PolicyError(f"{path}:{lineno}: bad directive")
                 v = (int(m.group(1)), int(m.group(2)))
-                if v > (1, 24):
+                if v > (1, 25):
                     raise PolicyError(f"{path}:{lineno}: requires newer Warden")
                 if legacy_name and v >= (1, 24):
                     raise PolicyError(f"{path}:{lineno}: require warden 1.24 after a host name")
@@ -498,6 +498,18 @@ def parse_lines(raw_lines, path):
                 raise PolicyError(f"{path}:{lineno}: control byte in constant")
             if len(rules) >= 256:
                 raise PolicyError(f"{path}: more than 256 rules")
+            wild = False
+            if kind == "host" and const.startswith("*.") and req >= (1, 24):
+                # v1.25: *.<suffix>[:port] -> the glob ?*.<suffix>:<port> (or :*)
+                if req < (1, 25):
+                    raise PolicyError(f"{path}:{lineno}: wildcard before 1.25")
+                if host_name_form(const[2:]) != 1:
+                    raise PolicyError(f"{path}:{lineno}: bad wildcard")
+                host, sep, port = const[2:].partition(":")
+                if "." not in host:
+                    raise PolicyError(f"{path}:{lineno}: wildcard over one label")
+                const = "?*." + host + ":" + (port if sep else "*")
+                op, wild = "glob", True
             grx, gtoks = None, None
             if op == "glob":
                 grx, nt, gtoks = parse_glob(rx, const, f"{path}:{lineno}")
@@ -505,7 +517,30 @@ def parse_lines(raw_lines, path):
                 if glob_tokens > GLOB_MAX_TOTAL:
                     raise PolicyError(f"{path}:{lineno}: glob tokens over the policy total")
             mask = value = 0
+            budgets = {}
+            ack = False
             for t in toks[ci + 1:]:
+                bk, _, bv = t.partition("=")
+                if kind == "host" and bk == "acknowledge" and _:
+                    # v1.25: a wildcard allow rule acknowledges the name channel
+                    if bv != "dns-channel":
+                        raise PolicyError(f"{path}:{lineno}: unknown acknowledgment {t}")
+                    if not (wild and verb == "allow"):
+                        raise PolicyError(f"{path}:{lineno}: acknowledgment on a non-wildcard rule")
+                    if ack:
+                        raise PolicyError(f"{path}:{lineno}: acknowledgment twice")
+                    ack = True
+                    continue
+                if kind == "host" and bk in ("names", "rate") and _:
+                    # v1.25: a wildcard allow rule's budgets (no part of a decision)
+                    if not (wild and verb == "allow"):
+                        raise PolicyError(f"{path}:{lineno}: budget on a non-wildcard rule")
+                    if not re.fullmatch(r"[1-9][0-9]*", bv) or int(bv) > (100000 if bk == "names" else 10000):
+                        raise PolicyError(f"{path}:{lineno}: bad budget {t}")
+                    if bk in budgets:
+                        raise PolicyError(f"{path}:{lineno}: budget twice")
+                    budgets[bk] = int(bv)
+                    continue
                 if kind != "path":
                     raise PolicyError(f"{path}:{lineno}: flag clause on {kind}")
                 if t == "readonly":
@@ -522,8 +557,12 @@ def parse_lines(raw_lines, path):
                     raise PolicyError(f"{path}:{lineno}: contradictory")
                 mask |= m
                 value |= v & m
+            if kind == "host" and wild and verb == "allow" and not ack:
+                raise PolicyError(f"{path}:{lineno}: wildcard allow without acknowledge=dns-channel")
             portless = name = False
-            if kind == "host":
+            if wild:
+                name = True
+            elif kind == "host":
                 nf = host_name_form(const)
                 if nf and req >= (1, 24):
                     if nf < 0:
@@ -533,7 +572,8 @@ def parse_lines(raw_lines, path):
                     legacy_name = legacy_name or nf != 0
                     portless = host_portless(const)
             r = {"verb": verb, "kind": kind, "op": op, "c": const, "rx": grx, "gtoks": gtoks,
-                 "mask": mask, "value": value, "line": lineno, "portless": portless, "name": name}
+                 "mask": mask, "value": value, "line": lineno, "portless": portless, "name": name,
+                 "wild": wild}
             r["lang"] = atom_rx(rx, r)
             rules.append(r)
     return rules, rx
@@ -903,7 +943,12 @@ def gen_queries(rules, rx, rng, n):
             sval = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 8)))
         if len(sval) > L + 3:
             sval = sval[: L + rng.randint(-2, 3)]
-        if kind == "host" and base and (host_portless(base) or (host_name_form(base) == 1 and ":" not in base)) \
+        if kind == "host" and rng.random() < 0.25:
+            # v1.25: the strings a connect is decided on: names with ports
+            sval = rng.choice(["a.example.com", "x.a.example.com", "example.com", "a.b.example.com",
+                               "x.a.b.example.com", "a.example.org", "1.2.3.4"]) + \
+                rng.choice([":443", ":80", ":8080"])
+        elif kind == "host" and base and (host_portless(base) or (host_name_form(base) == 1 and ":" not in base)) \
                 and rng.random() < 0.4:
             sval = base + ":" + str(rng.choice([80, 443, 8080]))
         if kind == "path":
@@ -940,7 +985,10 @@ def fuzz_line(rng, prior, strings, wide):
     frags = ["/a", "/a/", "/a/b", "/ab", "/b/", "/a/b/c", "x", "x:1", "/", "[::1]", "[a]", "[:]",
              "1.2.3.4", "1.2.3.4:5", "01.2.3.4", "256.1.1.1", "unix", "unix:/a"]
     # v1.24 host names, valid and not
-    names = ["api.example.com", "api.example.com:443", "a.b", "a-b.c0", "xn--bcher-kva.example",
+    names = ["api.example.com", "api.example.com:443",
+             # v1.25 wildcards, valid and not
+             "*.example.com", "*.example.com:443", "*.b.example.com", "*.com", "*.example.com:0",
+             "**.example.com", "a.*.example.com", "*.Example.com", "*", "*.example.com.", "a.b", "a-b.c0", "xn--bcher-kva.example",
              "localhost", "x", "a.b:0", "a.b:65535", "Api.example.com", "a.b.", "*.example.com",
              "a..b", "-a.b", "a-.b", "a.123", "1a.2", "a.b:65536", "a.b:080", "a.b:", "unix:80",
              "a_b.c", "a.b:1:2", "\xe9.example", "a" * 63 + ".b", "a" * 64 + ".b",
@@ -969,7 +1017,9 @@ def fuzz_line(rng, prior, strings, wide):
         if kind == "host" and rng.random() < 0.6:
             c = rng.choice(names) + rng.choice(["", "", "", ":443", "a"])
             if rng.random() < 0.6:
-                c = rng.choice(names[:8])              # valid names, with and without a port
+                c = rng.choice(["api.example.com", "api.example.com:443", "a.b", "a-b.c0",
+                                "xn--bcher-kva.example", "localhost", "*.example.com",
+                                "*.example.com:443", "*.b.example.com", "a.b.example.com"])
         if strings and kind != "host" and rng.random() < 0.7:
             matcher = rng.choice(["exact", "prefix", "suffix", "contains", "glob", "glob"])
         elif strings and kind == "host" and rng.random() < 0.03:
@@ -1007,6 +1057,11 @@ def fuzz_line(rng, prior, strings, wide):
                 clauses.append(rng.choice(FLAG_CLAUSES))
     elif rng.random() < 0.05:
         clauses.append("readonly")                     # must be refused on host/exec
+    if kind == "host" and rng.random() < (0.9 if c.startswith("*.") else 0.04):
+        # v1.25: the acknowledgment a wildcard allow needs (refused elsewhere)
+        clauses += rng.choice([["acknowledge=dns-channel"]] * 8 +
+                              [["acknowledge=dns"], ["acknowledge="],
+                               ["acknowledge=dns-channel", "acknowledge=dns-channel"]])
     line = " ".join([verb, kind] + ([matcher] if matcher else []) + [c] + clauses)
     if rng.random() < 0.05:
         line += "\r"                                   # CRLF
@@ -1022,15 +1077,52 @@ def fuzz_policy(rng, path):
     the rest may carry any number of malformed lines, for the parsers."""
     valid = rng.random() < 0.7
     lines = []
+    if rng.random() < 0.15:
+        # v1.25: a host-name policy: wildcards over and beside exact names and
+        # addresses, allow and deny, with and without ports, so first-match
+        # order between the forms is exercised.
+        hosts = ["*.example.com", "*.example.com:443", "*.b.example.com", "*.a.b.example.com:80",
+                 "a.example.com", "a.example.com:443", "b.example.com", "x.a.b.example.com",
+                 "example.com", "*.example.org", "1.2.3.4", "1.2.3.4:443"]
+        bad = ["*.com", "*.example.com:0443", "a.*.example.com", "*.Example.com", "*"]
+        lines.append("require warden 1.25")
+        # v1.25 section 4: budgets on wildcard allow rules (and, when the
+        # policy may be invalid, where they do not belong or out of range)
+        good_b = ["names=1", "names=64", "names=100000", "rate=1", "rate=10", "rate=10000"]
+        bad_b = ["names=0", "names=100001", "rate=10001", "names=05", "names=", "rate=x", "nams=5"]
+        for _ in range(rng.randint(1, 8)):
+            c = rng.choice(hosts + (bad if not valid and rng.random() < 0.3 else []))
+            verb = rng.choice(['allow', 'deny'])
+            opts = []
+            wild_allow = verb == "allow" and c.startswith("*.")
+            if rng.random() < 0.4 and (valid is False or wild_allow):
+                opts = rng.sample(good_b, rng.randint(1, 2))
+                if not valid and rng.random() < 0.4:
+                    opts.append(rng.choice(bad_b + good_b))       # bad, or given twice
+            # v1.25: the acknowledgment, where it is required and (when the
+            # policy may be invalid) missing, misspelt, twice or misplaced
+            if wild_allow and (valid or rng.random() < 0.7):
+                ack = ["acknowledge=dns-channel"]
+                if not valid and rng.random() < 0.2:
+                    ack.append(rng.choice(["acknowledge=dns-channel", "acknowledge=dns"]))
+                at = rng.randint(0, len(opts))
+                opts = opts[:at] + ack + opts[at:]
+            elif not valid and rng.random() < 0.1:
+                opts.append("acknowledge=dns-channel")
+            tail = (" " + " ".join(opts)) if opts else ""
+            lines.append(f"{verb} host {c}{tail}")
+        with open(path, "w", encoding="latin-1", newline="") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return
     if rng.random() < 0.3:
         lines.append(rng.choice(["require warden 1.14", "require warden 1.13", "require warden 01.14",
                                  "require warden 1.15", "require warden 1.16", "require warden 1.21",
-                                 "require warden 1.24", "require warden 1.24"] +
-                                ([] if valid else ["require warden 1.25", "require warden x",
+                                 "require warden 1.24", "require warden 1.24", "require warden 1.25"] +
+                                ([] if valid else ["require warden 1.26", "require warden x",
                                                    "require warden +1.14", "require warden 1.+14",
                                                    "require warden 1.1400000"])))
     elif rng.random() < 0.35:
-        lines.append("require warden 1.24")             # v1.24: host names take effect
+        lines.append(rng.choice(["require warden 1.24", "require warden 1.25"]))   # host names, wildcards
     wide = rng.random() < 0.15          # many distinct flag bits: reach the bound
     strings = rng.random() < 0.65       # use v1.14 matchers in this policy
     prior = []
