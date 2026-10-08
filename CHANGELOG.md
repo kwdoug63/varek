@@ -41,8 +41,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     queries its nameserver after `/etc/hosts`, gives up at once.
   - Tests: `make test-v1240` (grammar in both parsers, the table against a
     local test DNS server, and as root the Warden with Python, curl, Node, a
-    static musl client, Go and Java as the agent); CI runs it. It fails 81 of
-    its 88 checks against v1.23.1.
+    static musl client, Go and Java as the agent); CI runs it. It fails 104
+    of its 113 checks against v1.23.1.
   - The review's findings, all fixed. The review was done by four AI review
     agents (Claude), separate from the session that wrote the code; it was
     not a human or third-party review. See `RELEASE-v1.24.0.md`, "Found in
@@ -56,7 +56,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
       - asks the policy about view paths;
       - fails cleanly on malformed fields.
     - A name's answer no longer reaches loopback, link-local, unspecified or
-      multicast addresses (`special_address`; only numeric rules do).
+      multicast addresses (`special_address`; only numeric rules do). From
+      the v1.25 review: nor cloud metadata addresses outside link-local
+      (`100.100.100.200`, `fd00:ec2::254`), `::/96`, or NAT64 forms of a
+      special IPv4 address.
+    - From the v1.25 review: `varek_cyclonedx.py` refused every stream in
+      which a view was answered without a path rule (UNKNOWN, then ALLOW);
+      views are now reported apart from the decisions.
     - Writable opens of the resolver files are refused (`view_write_refused`).
     - An oversized TCP answer is a failed lookup, not parsed past the buffer.
       Startup lookups go through the resolver helper.
@@ -67,14 +73,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     - The tests resolve names to the machine's own address, not loopback.
   - `tests/soak_v1240/`: the 24-hour soak test against Fastly-, Cloudflare-
     and CloudFront-hosted APIs (`soak.sh`, an agent, and a checker for the
-    design's section 5), to run on a host with outbound HTTPS. It passed
-    24 hours on a DigitalOcean droplet: 4,320 fetches, 0 refused connects,
-    2,015 answer changes for `aws.amazon.com`, and the audit passing. Its 4
-    failed fetches were the Warden's: without a `host.conf` view, glibc gave
-    the agent only the first hosts line, an IPv6 address after a rotation, on
-    an IPv4-only host. Fixed, and `make test-v1240` recreates the failure.
-  - `RELEASE-v1.24.0.md`: draft release notes, with the soak results; latency
-    and the review findings are pending.
+    design's section 5), to run on a host with outbound HTTPS. The first
+    24-hour run on a DigitalOcean droplet had 4 failed fetches, and they were
+    the Warden's: without a `host.conf` view, glibc gave the agent only the
+    first hosts line, an IPv6 address after a rotation, on an IPv4-only host.
+    Fixed, and `make test-v1240` recreates the failure. The second 24-hour
+    run passed: 4,320 of 4,320 fetches, 0 refused connects, 2,034 answer
+    changes for `aws.amazon.com`, and the audit PASS on 114,279 records.
+  - `RELEASE-v1.24.0.md`: draft release notes, with the soak results, the
+    latency figures and the review findings.
 - `docs/security/v1.27-program-launches.md`: the design for decided program
   launches (a Landlock execute ruleset built from the policy's `allow exec`
   rules, the Warden deciding and recording each launch, an identity check

@@ -280,6 +280,28 @@ def _ts(records):
 
 FILE_ACTIONS = ("file.open", "file.stat", "file.access", "file.readlink")
 
+# v1.24: an open of a resolver file answered with a view the Warden wrote
+# (rule -> the path it answers). No file is opened and no rule decides it, so
+# its raw verdict is UNKNOWN; it is not an authorization of the file, and it is
+# reported apart from the decisions. varek_audit.py checks each view against
+# the policy.
+VIEW_RULES = {"hosts_view": "/etc/hosts", "resolv_view": "/etc/resolv.conf",
+              "nsswitch_view": "/etc/nsswitch.conf", "hostconf_view": "/etc/host.conf"}
+_O_ACCMODE, _O_CREAT, _O_TRUNC = 3, 0o100, 0o1000
+
+
+def _is_view(r):
+    """A view answered: a read-only open of the view's own path."""
+    rule = r.get("rule")
+    if r.get("action") != "file.open" or not isinstance(rule, str) or rule not in VIEW_RULES:
+        return False
+    try:
+        fl = int(r.get("open_flags"), 16)
+    except (TypeError, ValueError):
+        return False
+    return (r.get("resolved") == VIEW_RULES[rule] and r.get("kernel_verdict") == "ALLOW"
+            and not fl & (_O_ACCMODE | _O_CREAT | _O_TRUNC))
+
 
 def _scope(warden_version):
     """What the Warden records, by version: which calls it decides."""
@@ -393,6 +415,9 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
     now = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     run_start, run_end = _ts(records)
 
+    # v1.24: views answered are reported apart from the decisions
+    views = [r for r in records if _is_view(r)]
+    records = [r for r in records if not _is_view(r)]
     authorized = [r for r in records if r.get("decision_final") == "ALLOW"]
     refused = [r for r in records if r.get("decision_final") != "ALLOW"]
 
@@ -444,6 +469,7 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
             {"name": "varek:decisions.total", "value": str(len(records))},
             {"name": "varek:decisions.authorized", "value": str(len(authorized))},
             {"name": "varek:decisions.refused", "value": str(len(refused))},
+            {"name": "varek:views.answered", "value": str(len(views))},
         ],
     }
 
@@ -479,6 +505,10 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
     attest_text, facts = attestation(records, authorized, refused, dist, policy,
                                      run_start, run_end, warden_version, complete,
                                      log_info or {}, plan_gate, policy_check)
+    if views:
+        attest_text += (f" {len(views)} open(s) of the resolver files were answered with the "
+                        f"Warden's views ({', '.join(sorted({r['rule'] for r in views}))}); no "
+                        f"file was opened, and they are not counted as decisions.")
     agent_component["properties"] += [{"name": k, "value": v} for k, v in facts]
 
     annotation = {
