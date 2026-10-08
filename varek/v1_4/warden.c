@@ -4358,6 +4358,15 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
+    /* v1.26 (step 8): with `proxy on`, names reach proxied ports only through
+     * the proxy, which needs root to start as its own user: a Warden that
+     * cannot start it does not run the policy without it. */
+    if (p.v.proxy && geteuid() != 0 && !g_check_only) {
+        fprintf(stderr, "[warden] `proxy on` needs the Warden to run as root (the proxy runs as its "
+                "own user); refusing to start\n");
+        if (g_sk) sodium_free(g_sk);
+        return 2;
+    }
     if (p.v.proxy && geteuid() == 0) {
         if (wp_start(&g_proxy, "/proc/self/exe", pxa.uid, pxa.gid) < 0) {
             fprintf(stderr, "[warden] cannot start the egress proxy (%s); refusing to start\n",

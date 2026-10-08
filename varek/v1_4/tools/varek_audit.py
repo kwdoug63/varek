@@ -255,6 +255,61 @@ PROXY_KINDS = ("tls", "http", "connect")
 CLOSE_WHY = ("closed", "reset", "idle", "run_end", "unreported")
 
 
+def check_proxy_start(meta, proxy_ports, problems):
+    """v1.26 (step 8): with `proxy on` the Warden runs only with its proxy, so
+    run_start names it: SNI mode, its listener on 127.0.0.1, an unprivileged
+    user, and the policy's proxied ports; without `proxy on`, no proxy."""
+    pr = meta.get("run_start", {}).get("proxy")
+    if proxy_ports is None:
+        if pr is not None:
+            problems.append("run_start names a proxy, but the policy does not turn it on")
+        return
+    lst = pr.get("listen") if isinstance(pr, dict) else None
+    if not isinstance(pr, dict) or pr.get("mode") != "sni" or not isinstance(lst, str) or \
+            not lst.startswith("127.0.0.1:") or _host_port(lst) in (None, 0) or \
+            type(pr.get("uid")) is not int or type(pr.get("gid")) is not int or \
+            pr.get("uid") == 0 or pr.get("gid") == 0 or pr.get("ports") != proxy_ports:
+        problems.append(f"run_start's proxy {pr!r} is not the policy's (SNI mode, an unprivileged "
+                        f"user, ports {proxy_ports})")
+
+
+def check_handoff_rules(checker, policy, rules, handoffs, problems):
+    """v1.26 (step 8): a connect was handed to the proxy only as the Warden
+    decides: over its candidates (the address, then name:port for each name
+    it belongs to), the first host rule (policy order) that holds on any of
+    them must not be a deny, nor an allow that holds on the address itself (a
+    numeric rule: that connect is dialed directly). A synthetic address is
+    always handed over. Asked of the checker."""
+    work = [(rec, cands) for rec, cands in handoffs if cands]
+    strs = [c for _, cands in work for c in cands]
+    if not strs:
+        return
+    h = subprocess.run([checker, policy, "holds"], capture_output=True, text=True,
+                       input="\n".join(c.encode().hex() for c in strs) + "\n")
+    rows = h.stdout.split()
+    if h.returncode != 0 or len(rows) != len(strs):
+        problems.append(f"checker failed on the hand-offs' candidates: {h.stderr.strip()}")
+        return
+    hosts = [i for i, r in enumerate(rules) if r["kind"] == "h"]
+    it = iter(rows)
+    for rec, cands in work:
+        best = None                       # (rule index, candidate index)
+        for ci, _ in enumerate(cands):
+            row = next(it)
+            first = next((i for i in hosts if row[i] == "1"), None)
+            if first is not None and (best is None or first < best[0]):
+                best = (first, ci)
+        if best is None:
+            continue
+        r = rules[best[0]]
+        if not r["allow"]:
+            problems.append(f"seq {rec.get('seq')}: a connect policy line {r['line']} denies was handed "
+                            f"to the proxy")
+        elif best[1] == 0:
+            problems.append(f"seq {rec.get('seq')}: a connect policy line {r['line']} allows by its "
+                            f"address was handed to the proxy, not dialed")
+
+
 def check_closes(records, closes, complete, problems):
     """v1.26 (step 7): every proxy_close is of a connection the Warden passed
     to the proxy (proxy_dialed) before it, once; its byte counts and relay
@@ -1211,6 +1266,7 @@ def main(argv=None):
     if (meta.get("run_start", {}).get("host_name_rules") is True) != names_policy:
         problems.append("run_start's host_name_rules does not match the policy file")
     handoff_ids, handoffs = set(), 0     # v1.26: connects handed to the proxy
+    handoff_cands = []                   # v1.26 (step 8): (record, candidates), asked of the policy below
     proxied_ok = 0                       # v1.26: proxied names allowed
     view_recs = []                       # (rec, flags): asked of the policy below
     others = []                          # (rec, decided rule, other candidates)
@@ -1277,10 +1333,15 @@ def main(argv=None):
                     tgt[0] not in SYN_NET:
                 problems.append(f"seq {seq}: a connect policy line {rec.get('policy_line')} denies "
                                 f"was handed to the proxy")
+            elif tgt[0] not in SYN_NET and isinstance(rec.get("candidates"), list) and \
+                    (not rec["candidates"] or rec["candidates"][0] != rec.get("dialed")):
+                problems.append(f"seq {seq}: a hand-off whose candidates do not begin with its target")
             elif type(cid) is not int or cid < 1 or cid in handoff_ids:
                 problems.append(f"seq {seq}: a hand-off without a connection id of its own ({cid!r})")
             else:
                 handoff_ids.add(cid)
+                if tgt[0] not in SYN_NET and isinstance(rec.get("candidates"), list):
+                    handoff_cands.append((rec, [c for c in rec["candidates"] if isinstance(c, str)]))
             handoffs += 1
             continue
         if rec.get("action") == "file.open" and rec.get("rule") in VIEW_RULES:
@@ -1326,6 +1387,17 @@ def main(argv=None):
                     dd[0] in SYN_NET:
                 problems.append(f"seq {rec.get('seq')}: a connect to the synthetic address "
                                 f"{dd[0]} was dialed")
+            # v1.26 (step 8): with the proxy on, a connect on a proxied port is
+            # dialed directly only by a numeric rule, decided on the address
+            # itself (the certificate re-check below confirms the rule holds)
+            dl8 = rec.get("dialed") or rec.get("target")
+            td = _canonical_dest(dl8)
+            cr8 = rec.get("cert_rule")
+            if proxy_ports is not None and td is not None and int(td[1]) in proxy_ports and (
+                    rec.get("resolved") != dl8 or type(cr8) is not int or
+                    not 0 <= cr8 < len(prules) or prules[cr8]["name"]):
+                problems.append(f"seq {rec.get('seq')}: a connect to {rec.get('target')} on a proxied "
+                                f"port was dialed directly, not by a numeric rule")
         else:
             authorized += 1
         cr, cw = rec.get("cert_rule"), rec.get("cert_witness")
@@ -1435,6 +1507,10 @@ def main(argv=None):
                         if early:
                             problems.append(f"seq {rec.get('seq')}: rule {early[0]} holds on candidate "
                                             f"{c!r}, before the rule that decided the connect")
+    # v1.26 (step 8): the proxy as run_start names it, and each hand-off as the policy decides
+    check_proxy_start(meta, proxy_ports, problems)
+    if prules:
+        check_handoff_rules(a.checker, a.policy, prules, handoff_cands, problems)
     # v1.26 (step 6): the Warden's decisions on what the proxy read
     handoff_all = {r.get("proxy_conn") for r in records
                    if r.get("proxy_handoff") is True and type(r.get("proxy_conn")) is int}

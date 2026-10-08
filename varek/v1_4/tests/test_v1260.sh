@@ -47,6 +47,13 @@
 #      passed to the proxy has one proxy_close, with the proxy's byte counts
 #      (a CONNECT's own request not among them); one still open when the run
 #      ends is closed then ("run_end"); the audit refuses forged closes
+#   8. the audit's cross-checks (as root): on a proxied port a name reaches
+#      only the proxy (a UDP connect a name allows is refused, proxy_tcp_only;
+#      one a numeric rule allows is dialed); the Warden does not run `proxy
+#      on` without its proxy (not as root); and the audit refuses run_start
+#      without the proxy, a direct connect on a proxied port that no numeric
+#      rule decided, and a hand-off of a connect a numeric rule allows or a
+#      rule denies
 #
 # Usage: test_v1260.sh <vdp_check> <vdp_cert_check> [<warden>]
 # (section 5 also uses tests/proxy_parse_test: make tests/proxy_parse_test)
@@ -740,6 +747,48 @@ PY
         grep -q '"event":"proxy_close","run":"[0-9a-f]*","proxy_conn":1,"why":"unreported","timestamp_ns"' "$OUT/k7.log"
     check "the audit accepts that run" \
         python3 "$HERE/tools/varek_audit.py" --policy "$POL6" --checker "$CERT" "$OUT/k7.log"
+
+    echo "== 8. the audit's cross-checks =="
+    cat > "$W/udp.py" <<'PY'
+import socket, sys
+for host, port in (a.rsplit(":", 1) for a in sys.argv[1:]):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((host, int(port)))
+        print("UDP", host, port, "CONNECTED", flush=True)
+    except OSError as e:
+        print("UDP", host, port, "ERR", e.errno, flush=True)
+PY
+    chmod 644 "$W/udp.py"
+    POL8="$OUT/udp.policy"
+    { sed -n 1,3p "$POL6"; printf 'allow host %s:%s\n' "$HOSTIP" "$HOLDP"; sed -n '4,$p' "$POL6"; } > "$POL8"
+    env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$POL8" --dns-server "127.0.0.1:$PORT" -- \
+        /usr/bin/python3 "$W/udp.py" "$HOSTIP:$TP" "$HOSTIP:$HOLDP" > "$OUT/u.out" 2> "$OUT/u.log"
+    sed 's/^/     /' "$OUT/u.out"
+    check "a UDP connect on a proxied port that a name allows is refused (proxy_tcp_only: QUIC goes nowhere)" \
+        sh -c "grep -q '^UDP $HOSTIP $TP ERR 13$' '$OUT/u.out' && grep -q '\"target\":\"$HOSTIP:$TP\",[^}]*\"decision_final\":\"DENY\",\"rule\":\"proxy_tcp_only\"' '$OUT/u.log'"
+    check "one a numeric rule allows is dialed (UDP has no hand-off)" \
+        sh -c "grep -q '^UDP $HOSTIP $HOLDP CONNECTED$' '$OUT/u.out' && grep -q '\"target\":\"$HOSTIP:$HOLDP\",\"resolved\":\"$HOSTIP:$HOLDP\",\"decision_raw\":\"ALLOW\",\"decision_final\":\"ALLOW\",\"rule\":\"dialed_fd_injection\"' '$OUT/u.log'"
+    check "the audit accepts that run" \
+        python3 "$HERE/tools/varek_audit.py" --policy "$POL8" --checker "$CERT" "$OUT/u.log"
+    cp "$POL6" "$W/np.policy"; chmod 644 "$W/np.policy"
+    env VAREK_WARDEN_NO_PIDNS=1 setpriv --reuid=65534 --regid=65534 --clear-groups "$WARDEN" "$W/np.policy" -- /bin/true > "$OUT/np.out" 2>&1
+    check "the Warden does not run \`proxy on\` without its proxy (not as root)" \
+        grep -q 'proxy on. needs the Warden to run as root' "$OUT/np.out"
+    forge "$OUT/u.log" "$OUT/x1.log" '"proxy":\{[^}]*\},' '' re
+    refuses "a run_start without the proxy the policy turns on" "$POL8" "$OUT/x1.log" "run_start's proxy None is not the policy's"
+    forge "$OUT/u.log" "$OUT/x2.log" '"rule":"dialed_fd_injection","policy_line":4,"cert_rule":0,' \
+                                     '"rule":"dialed_fd_injection","policy_line":5,"cert_rule":1,'
+    refuses "a direct connect on a proxied port decided by a name rule" "$POL8" "$OUT/x2.log" "on a proxied port was dialed directly, not by a numeric rule"
+    # section 4's run: its directly dialed numeric connect, recast as a hand-off
+    forge "$OUT/h.log" "$OUT/x3.log" '("target":"192\.0\.2\.9:8443",)"resolved":"192\.0\.2\.9:8443",("decision_raw":"ALLOW","decision_final":"ALLOW",)"rule":"dial[a-z_]*",(.*)"resolution_generation":0,' \
+        '\1"resolved":"127.0.0.1:'"$LP"'",\2"rule":"proxy_handoff",\3"resolution_generation":0,"proxy_handoff":true,"proxy_conn":77,' re
+    refuses "a hand-off of a connect a numeric rule allows" "$POLH" "$OUT/x3.log" "allows by its address was handed to the proxy, not dialed"
+    forge "$OUT/h.log" "$OUT/x4.log" '"dialed":"192.0.2.7:443","candidates":["192.0.2.7:443"]' '"dialed":"192.0.2.7:443","candidates":["192.0.2.8:443"]'
+    refuses "a hand-off whose candidates are not its own" "$POLH" "$OUT/x4.log" "candidates do not begin with its target"
+    forge "$OUT/h.log" "$OUT/x5.log" '"dialed":"192.0.2.7:443","candidates":["192.0.2.7:443"],"resolution_generation":0,"proxy_handoff":true' \
+                                     '"dialed":"192.0.2.8:443","candidates":["192.0.2.8:443"],"resolution_generation":0,"proxy_handoff":true'
+    refuses "a hand-off of a connect a rule denies (the policy asked again)" "$POLH" "$OUT/x5.log" "denies was handed to the proxy"
     kill $SRV 2>/dev/null
     rm -rf "$W"
 fi

@@ -722,7 +722,7 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
      * (warden_names.inc.c). */
     /* v1.26 (step 4): may this connect be handed to the egress proxy? A TCP
      * connect on a proxied port, with the proxy running. */
-    bool handoff_ok = false, syn = false;
+    bool handoff_ok = false, syn = false, on_proxied = false;
     if (fam != AF_UNIX) {
         const void *ad;
         unsigned port;
@@ -742,7 +742,8 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
             stub_connect(notify_fd, req, a, ag, &k, t0);
             return;
         }
-        handoff_ok = g_proxy.ctl >= 0 && !strcmp(k.name, "tcp") && proxied_port(p, port);
+        on_proxied = g_proxy.ctl >= 0 && proxied_port(p, port);
+        handoff_ok = on_proxied && !strcmp(k.name, "tcp");
         syn = dial_synthetic(dial.ss_family, ad);
         if (g_any_name && port == 53) rule = "dns_refused";
         /* v1.26: a synthetic address reaches only the proxy (a UDP connect,
@@ -793,6 +794,17 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
                 dial_len = sizeof *d4;
             }
         }
+    }
+    /* v1.26 (step 8): on a proxied port only TCP goes to the proxy; anything
+     * else (UDP: QUIC) is dialed only if a numeric rule allows the address
+     * itself, so a name never reaches a proxied port around the proxy. */
+    if (on_proxied && !handoff_ok && d_final == DEC_ALLOW &&
+        !(a->ncand > 0 && !strcmp(a->resolved, g_cand[0]))) {
+        close(ag);
+        if (pin >= 0) close(pin);
+        net_record(tid, a, d_raw, DEC_DENY, "proxy_tcp_only", t0, EACCES);
+        send_simple(notify_fd, req->id, DEC_DENY);
+        return;
     }
     bool cert_refused = false;
     if (d_final == DEC_ALLOW && !a->proxy_handoff && !certify(p, a)) {
