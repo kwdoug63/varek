@@ -53,7 +53,11 @@ policy file alone:
      on proxied ports is answered with its synthetic address (A) or no data,
      never looked up or charged; every synthetic_address record gives such a
      name the next address of 198.18.0.0/15, each name and address once; and
-     no connect to a synthetic address is dialed.
+     no connect to a synthetic address is dialed. A connect on a proxied
+     port is handed to the proxy only as the policy allows; every name:port
+     the proxy read is decided once, for a hand-off, and certified when
+     allowed, dialing only an address of the name; every connection passed
+     to the proxy has one proxy_close after it.
 
 Exit 0 only if all of these hold. The verdict stream is the Warden's stderr
 (`warden policy -- agent 2> verdicts.log`). The report's "integrity" line says
@@ -248,6 +252,41 @@ HANDOFF_RULES = ("proxy_handoff", "proxy_handoff_in_progress", "proxy_handoff_fa
 # v1.26 (step 6): the Warden's decision on what the proxy read, when it allowed
 PROXY_ALLOW_RULES = ("proxy_dialed", "proxy_dial_failed")
 PROXY_KINDS = ("tls", "http", "connect")
+CLOSE_WHY = ("closed", "reset", "idle", "run_end", "unreported")
+
+
+def check_closes(records, closes, complete, problems):
+    """v1.26 (step 7): every proxy_close is of a connection the Warden passed
+    to the proxy (proxy_dialed) before it, once; its byte counts and relay
+    time (the proxy's report) are present and whole, or absent for
+    "unreported"; and in a complete stream every connection passed on is
+    closed. Returns the number of closes."""
+    dialed = {}                          # proxy_conn -> its record's position
+    for pos, rec in enumerate(records):
+        if rec.get("action") == "net.proxy" and rec.get("rule") == "proxy_dialed" \
+                and type(rec.get("proxy_conn")) is int:
+            dialed.setdefault(rec["proxy_conn"], pos)
+    closed = set()
+    for pos, e in closes:
+        cid, why = e.get("proxy_conn"), e.get("why")
+        if type(cid) is not int or cid not in dialed or dialed[cid] >= pos:
+            problems.append(f"a proxy_close of connection {cid!r}, which was not passed to the proxy before it")
+            continue
+        if cid in closed:
+            problems.append(f"connection {cid}: closed twice")
+        closed.add(cid)
+        counts = [e.get(k) for k in ("bytes_up", "bytes_down", "relay_ms")]
+        if why not in CLOSE_WHY:
+            problems.append(f"connection {cid}: a proxy_close for {why!r}")
+        elif why == "unreported":
+            if any(c is not None for c in counts):
+                problems.append(f"connection {cid}: an unreported close with counts")
+        elif not all(type(c) is int and c >= 0 for c in counts):
+            problems.append(f"connection {cid}: a proxy_close without whole byte counts and relay time")
+    if complete:
+        for cid in sorted(set(dialed) - closed):
+            problems.append(f"connection {cid}: passed to the proxy but never closed (a proxy_close is missing)")
+    return len(closes)
 
 
 def check_proxied(records, resolutions, handoff_all, problems):
@@ -1400,6 +1439,7 @@ def main(argv=None):
     handoff_all = {r.get("proxy_conn") for r in records
                    if r.get("proxy_handoff") is True and type(r.get("proxy_conn")) is int}
     proxied = check_proxied(records, resolutions, handoff_all, problems)
+    pcloses = check_closes(records, meta.get("proxy_closes", []), complete, problems)   # step 7
     if proxied and proxy_ports is None:
         problems.append("proxied decisions, but the policy does not turn the proxy on")
     # v1.26: every connection id the Warden gave a hand-off is recorded once
@@ -1409,7 +1449,7 @@ def main(argv=None):
           f"{len(records)} records, {authorized} authorized file opens, {lookups} lookups, "
           f"{connects} authorized connects, "
           f"{views} host-name views, {stubs} stub resolver connects, {handoffs} proxy hand-offs, "
-          f"{proxied} proxied decisions ({proxied_ok} allowed), "
+          f"{proxied} proxied decisions ({proxied_ok} allowed), {pcloses} proxy closes, "
           f"{questions} stub questions ({budget_hits} over a budget), "
           f"{checked} certificates "
           f"re-checked, {refused} refused in-line")

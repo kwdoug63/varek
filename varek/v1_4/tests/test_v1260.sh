@@ -43,6 +43,10 @@
 #      allow, one that resolves only to loopback or to an address a rule
 #      denies, and one past its wildcard's names budget; the audit accepts the
 #      run and refuses forged proxied decisions
+#   7. close records (as root, with section 6's run): every connection
+#      passed to the proxy has one proxy_close, with the proxy's byte counts
+#      (a CONNECT's own request not among them); one still open when the run
+#      ends is closed then ("run_end"); the audit refuses forged closes
 #
 # Usage: test_v1260.sh <vdp_check> <vdp_cert_check> [<warden>]
 # (section 5 also uses tests/proxy_parse_test: make tests/proxy_parse_test)
@@ -547,6 +551,16 @@ while True:
     c, _ = l.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
 PY
     SRV="$!"
+    HOLDP=$((TP + 1))                    # a server that reads nothing and never closes
+    python3 - "$HOSTIP" "$HOLDP" <<'PY' > /dev/null 2>&1 &
+import socket, sys, time
+l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+l.bind((sys.argv[1], int(sys.argv[2]))); l.listen(16)
+held = []
+while True:
+    c, _ = l.accept(); held.append(c)
+PY
+    SRV="$SRV $!"
     mkdir -p "$OUT/www"; echo "http-ok" > "$OUT/www/x.txt"
     python3 -m http.server "$HP" --bind "$HOSTIP" --directory "$OUT/www" > /dev/null 2>&1 &
     SRV="$SRV $!"
@@ -562,7 +576,7 @@ PY
         sleep 0.1
     done
     cat > "$W/agent.py" <<'PY'
-import socket, ssl, sys, urllib.request
+import socket, ssl, sys, time, urllib.request
 HP, TP = int(sys.argv[1]), int(sys.argv[2])
 ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
 def body(s):
@@ -620,17 +634,26 @@ tls("wild-over", "b.svc.example.com")
 tls("loopback", "lo.example.com")
 tls("denied-addr", "den.example.com")
 connect("connect", "api.example.com")
+# a relay still open when the run ends: a ClientHello to a server that never answers
+i, o = ssl.MemoryBIO(), ssl.MemoryBIO()
+b = ssl.create_default_context().wrap_bio(i, o, server_hostname="api.example.com")
+try: b.do_handshake()
+except ssl.SSLWantReadError: pass
+h = socket.create_connection(("api.example.com", int(sys.argv[3])), 10)
+h.sendall(o.read())
+time.sleep(1)
+print("HOLD sent", flush=True)
 PY
     chmod 644 "$W/agent.py"
     POL6="$OUT/decide.policy"
-    { printf 'require warden 1.26\nproxy on\nproxy ports %s %s\n' "$HP" "$TP"
-      printf 'allow host api.example.com:%s\nallow host api.example.com:%s\n' "$HP" "$TP"
+    { printf 'require warden 1.26\nproxy on\nproxy ports %s %s %s\n' "$HP" "$TP" "$HOLDP"
+      printf 'allow host api.example.com:%s\nallow host api.example.com:%s\nallow host api.example.com:%s\n' "$HP" "$TP" "$HOLDP"
       printf 'allow host lo.example.com:%s\ndeny host 192.0.2.77:%s\nallow host den.example.com:%s\n' "$TP" "$TP" "$TP"
       printf 'allow host *.svc.example.com:%s acknowledge=dns-channel names=2\n' "$TP"
       printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path /etc/ssl/ readonly\nallow path %s/ readonly\n' "$W"
     } > "$POL6"
     env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$POL6" --dns-server "127.0.0.1:$PORT" -- \
-        /usr/bin/python3 "$W/agent.py" "$HP" "$TP" > "$OUT/d.out" 2> "$OUT/d.log"
+        /usr/bin/python3 "$W/agent.py" "$HP" "$TP" "$HOLDP" > "$OUT/d.out" 2> "$OUT/d.log"
     sed 's/^/     /' "$OUT/d.out"
     px() {  # px <target> <rule>: the net.proxy record for target, decided by rule
         grep '"action":"net.proxy"' "$OUT/d.log" | grep -q "\"target\":\"$1\",.*\"rule\":\"$2\""; }
@@ -641,7 +664,7 @@ PY
     check "TLS by an exact name: relayed to the server, which saw the SNI" \
         sh -c "grep -q '^TLS exact tls-ok api.example.com$' '$OUT/d.out' && grep '\"action\":\"net.proxy\"' '$OUT/d.log' | grep -q '\"target\":\"api.example.com:$TP\",.*\"rule\":\"proxy_dialed\",.*\"proxy_kind\":\"tls\"'"
     check "TLS by a name a wildcard allows: looked up on demand (charged, a proxy question), relayed" \
-        sh -c "grep -q '^TLS wild tls-ok a.svc.example.com$' '$OUT/d.out' && grep -q '\"event\":\"dns_question\",\"run\":\"[0-9a-f]*\",\"name\":\"a.svc.example.com\",\"type\":1,\"transport\":\"proxy\",\"rule\":\"policy_match\",\"policy_line\":9,\"new\":true,\"upstream\":true,\"answer\":\"lookup\"' '$OUT/d.log' && grep -q '\"name\":\"a.svc.example.com\".*\"dynamic\":true' '$OUT/d.log'"
+        sh -c "grep -q '^TLS wild tls-ok a.svc.example.com$' '$OUT/d.out' && grep -q '\"event\":\"dns_question\",\"run\":\"[0-9a-f]*\",\"name\":\"a.svc.example.com\",\"type\":1,\"transport\":\"proxy\",\"rule\":\"policy_match\",\"policy_line\":10,\"new\":true,\"upstream\":true,\"answer\":\"lookup\"' '$OUT/d.log' && grep -q '\"name\":\"a.svc.example.com\".*\"dynamic\":true' '$OUT/d.log'"
     check "and asked again within its TTL: not looked up or charged again" \
         sh -c "grep -q '^TLS wild-again tls-ok a.svc.example.com$' '$OUT/d.out' && [ \$(grep -c '\"transport\":\"proxy\",[^}]*\"name\":\"a.svc\|\"name\":\"a.svc.example.com\",\"type\":1,\"transport\":\"proxy\"' '$OUT/d.log') = 1 ]"
     check "a wildcard's name that does not resolve: refused (resolution_failed)" \
@@ -665,6 +688,58 @@ PY
     forge "$OUT/d.log" "$OUT/e4.log" "\"target\":\"api.example.com:$TP\",\"resolved\":\"api.example.com:$TP\"" \
                                      "\"target\":\"evil.example.com:$TP\",\"resolved\":\"evil.example.com:$TP\""
     refuses "a proxied decision for a name the policy does not allow" "$POL6" "$OUT/e4.log" "certificate for 'evil.example.com:"
+
+    echo "== 7. close records =="
+    pclose() { grep -o '"event":"proxy_close",[^}]*' "$OUT/d.log"; }
+    pclose | sed 's/^/     /' | cut -c1-150
+    DIALED=$(grep '"action":"net.proxy"' "$OUT/d.log" | grep '"rule":"proxy_dialed"' | grep -o '"proxy_conn":[0-9]*' | sort)
+    CLOSED=$(pclose | grep -o '"proxy_conn":[0-9]*' | sort)
+    check "every connection passed to the proxy has one proxy_close" \
+        sh -c "[ -n '$DIALED' ] && [ '$DIALED' = '$CLOSED' ]"
+    check "with the proxy's byte counts each way and the relay's time" \
+        sh -c "[ \$(grep -o '\"event\":\"proxy_close\",[^}]*' '$OUT/d.log' | grep -c '\"why\":\"closed\",\"bytes_up\":[1-9][0-9]*,\"bytes_down\":[1-9][0-9]*,\"relay_ms\":[0-9]*,') -ge 5 ]"
+    HC=$(grep '"action":"net.proxy"' "$OUT/d.log" | grep "\"target\":\"api.example.com:$HOLDP\"" | grep -o '"proxy_conn":[0-9]*' | grep -o '[0-9]*$')
+    check "a relay still open when the run ends is closed then (run_end), with what it relayed" \
+        sh -c "[ -n '$HC' ] && grep -q '\"event\":\"proxy_close\",\"run\":\"[0-9a-f]*\",\"proxy_conn\":$HC,\"why\":\"run_end\",\"bytes_up\":[1-9][0-9]*,\"bytes_down\":0,' '$OUT/d.log'"
+    CC=$(grep '"action":"net.proxy"' "$OUT/d.log" | grep '"proxy_kind":"connect"' | grep -o '"proxy_conn":[0-9]*' | grep -o '[0-9]*$')
+    TC=$(grep '"action":"net.proxy"' "$OUT/d.log" | grep '"proxy_kind":"tls"' | grep '"rule":"proxy_dialed"' | grep "\"target\":\"api.example.com:$TP\"" | grep -o '"proxy_conn":[0-9]*' | head -1 | grep -o '[0-9]*$')
+    up() { grep -o "\"event\":\"proxy_close\",\"run\":\"[0-9a-f]*\",\"proxy_conn\":$1,[^}]*" "$OUT/d.log" | grep -o '"bytes_up":[0-9]*' | grep -o '[0-9]*$'; }
+    check "a CONNECT's own request is not counted as sent to the server" \
+        sh -c "[ -n '$CC' ] && [ -n '$TC' ] && [ \$(( $(up "$CC") - $(up "$TC") )) -lt 40 ]"
+    forge "$OUT/d.log" "$OUT/c1.log" "\"event\":\"proxy_close\",\"run\":\"([0-9a-f]*)\",\"proxy_conn\":$TC," \
+        "\"event\":\"proxy_close\",\"run\":\"\\1\",\"proxy_conn\":2," re
+    refuses "a close of a connection never passed to the proxy" "$POL6" "$OUT/c1.log" "which was not passed to the proxy before it"
+    refuses "a stream missing a close" "$POL6" "$OUT/c1.log" "never closed (a proxy_close is missing)"
+    forge "$OUT/d.log" "$OUT/c2.log" '"why":"closed","bytes_up"' '"why":"unreported","bytes_up"'
+    refuses "an unreported close with counts" "$POL6" "$OUT/c2.log" "an unreported close with counts"
+    forge "$OUT/d.log" "$OUT/c3.log" '"why":"closed",' '"why":"vanished",'
+    refuses "a close for no reason the proxy gives" "$POL6" "$OUT/c3.log" "a proxy_close for 'vanished'"
+    # the proxy killed with a relay open: the run stops (fail closed), and the
+    # relay is recorded unreported
+    cat > "$W/hold.py" <<'PY'
+import socket, ssl, sys, time
+i, o = ssl.MemoryBIO(), ssl.MemoryBIO()
+b = ssl.create_default_context().wrap_bio(i, o, server_hostname="api.example.com")
+try: b.do_handshake()
+except ssl.SSLWantReadError: pass
+h = socket.create_connection(("api.example.com", int(sys.argv[1])), 10)
+h.sendall(o.read())
+time.sleep(30)
+PY
+    chmod 644 "$W/hold.py"
+    env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$POL6" --dns-server "127.0.0.1:$PORT" -- \
+        /usr/bin/python3 "$W/hold.py" "$HOLDP" > /dev/null 2> "$OUT/k7.log" &
+    WPID=$!
+    for _ in $(seq 100); do grep -q '"rule":"proxy_dialed"' "$OUT/k7.log" 2>/dev/null && break; sleep 0.1; done
+    T0=$(date +%s)
+    pkill -9 -u 65532 -f -- '--proxy-helper'
+    wait "$WPID"; WRC=$?
+    check "the proxy killed mid-relay: the run stops at once (fail closed)" \
+        sh -c "[ $WRC != 0 ] && [ \$(( \$(date +%s) - $T0 )) -lt 10 ] && grep -q 'the egress proxy exited' '$OUT/k7.log'"
+    check "and the open relay is recorded unreported" \
+        grep -q '"event":"proxy_close","run":"[0-9a-f]*","proxy_conn":1,"why":"unreported","timestamp_ns"' "$OUT/k7.log"
+    check "the audit accepts that run" \
+        python3 "$HERE/tools/varek_audit.py" --policy "$POL6" --checker "$CERT" "$OUT/k7.log"
     kill $SRV 2>/dev/null
     rm -rf "$W"
 fi

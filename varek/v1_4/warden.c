@@ -1811,7 +1811,9 @@ static void emit_unanswered(void) {
     }
 }
 
+static void px_finish(void);           /* v1.26 step 7 (warden_pxdecide.inc.c) */
 static void emit_run_end(int exit_status) {
+    px_finish();                        /* v1.26: every relay's proxy_close */
     emit_unanswered();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

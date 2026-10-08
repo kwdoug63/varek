@@ -138,13 +138,30 @@ struct wp_held {
     bool      eof_c, eof_s;      /* the client's, the server's side has closed */
     bool      shut_s, shut_c;    /* the close was passed on to the server, the client */
     uint64_t  bytes_up, bytes_down;
+    int64_t   relay_at;          /* when relaying began */
+    const char *why;             /* step 7: why the relay ended */
 };
 static struct wp_ann  g_ann[WP_MAX_ANNOUNCED];
 static struct wp_held g_held[WP_MAX_HELD];
 static int g_nheld = 0;
 static int g_ctl = -1;
 
+/* Step 7: a relayed connection ends: report it (bytes each way, how long). */
+static void report_close(const struct wp_held *h, const char *why) {
+    struct wp_close m;
+    memset(&m, 0, sizeof m);
+    m.type = WP_MSG_CLOSED;
+    m.id = h->id;
+    m.bytes_up = h->bytes_up;
+    m.bytes_down = h->bytes_down;
+    int64_t d = mono_ms() - h->relay_at;
+    m.ms = d > 0 ? (uint64_t)d : 0;
+    snprintf(m.why, sizeof m.why, "%s", why);
+    (void)send(g_ctl, &m, sizeof m, MSG_NOSIGNAL);   /* blocking: a close report is never dropped */
+}
+
 static void held_drop(int k) {
+    if (g_held[k].state == WH_RELAY) report_close(&g_held[k], g_held[k].why ? g_held[k].why : "closed");
     close(g_held[k].fd);
     if (g_held[k].up >= 0) close(g_held[k].up);
     free(g_held[k].buf);
@@ -198,13 +215,14 @@ static int held_relay(int k, int fd) {
     h->up = fd;
     h->off = h->skip;
     h->state = WH_RELAY;
-    h->since = mono_ms();
+    h->since = h->relay_at = mono_ms();
     return 0;
 }
 
 /* Move what can be moved on relayed connection k; false when it is done. */
 static bool held_pump(int k, short crev, short srev) {
     struct wp_held *h = &g_held[k];
+    h->why = "reset";
     if ((crev | srev) & POLLNVAL) return false;
     bool moved = false;
     /* client -> server */
@@ -236,7 +254,9 @@ static bool held_pump(int k, short crev, short srev) {
     if (h->eof_s && h->doff == h->dlen && !h->shut_c) { shutdown(h->fd, SHUT_WR); h->shut_c = true; }
     int64_t now = mono_ms();
     if (moved) h->since = now;
+    h->why = "closed";
     if (h->shut_s && h->shut_c) return false;
+    h->why = "idle";
     return now - h->since <= WP_RELAY_IDLE;
 }
 
@@ -265,6 +285,16 @@ static int wp_drain_ctl(int ctl) {
             continue;
         }
         if (fd >= 0) close(fd);
+        if (n == (ssize_t)sizeof(struct wp_msg) && m.type == WP_MSG_FLUSH) {
+            /* the run is ending: close everything, reporting each relay */
+            while (g_nheld) {
+                if (g_held[g_nheld - 1].state == WH_RELAY) g_held[g_nheld - 1].why = "run_end";
+                held_drop(g_nheld - 1);
+            }
+            struct wp_msg f = { .type = WP_MSG_FLUSHED, .port = 0 };
+            (void)send(ctl, &f, sizeof f, MSG_NOSIGNAL);
+            continue;
+        }
         if (n != (ssize_t)sizeof m.c || m.type != WP_MSG_CONN || m.c.from_port == 0 || m.c.from_port > 65535)
             continue;                                   /* not one the Warden sends */
         const char *colon = strrchr(m.c.dest, ':');

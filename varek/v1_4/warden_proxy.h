@@ -34,7 +34,8 @@
 #include <sys/types.h>
 
 /* Control messages (SOCK_SEQPACKET, one per datagram). */
-enum { WP_MSG_READY = 1, WP_MSG_CONN = 2, WP_MSG_REQUEST = 3, WP_MSG_UNREADABLE = 4, WP_MSG_VERDICT = 5 };
+enum { WP_MSG_READY = 1, WP_MSG_CONN = 2, WP_MSG_REQUEST = 3, WP_MSG_UNREADABLE = 4, WP_MSG_VERDICT = 5,
+       WP_MSG_CLOSED = 6, WP_MSG_FLUSH = 7, WP_MSG_FLUSHED = 8 };
 
 struct wp_msg {                  /* proxy -> Warden: WP_MSG_READY */
     uint32_t type;
@@ -76,6 +77,23 @@ struct wp_verdict {
     uint32_t allow;
     uint64_t id;
 };
+
+/* Proxy -> Warden, step 7: a relayed connection ended. The byte counts are
+ * the proxy's own (it is not trusted to count them; they are recorded as its
+ * report). why: "closed" (both sides closed), "reset" (an error on either
+ * side), "idle", "run_end" (closed when the run ended, on WP_MSG_FLUSH). */
+struct wp_close {
+    uint32_t type;               /* WP_MSG_CLOSED */
+    uint32_t pad;
+    uint64_t id;
+    uint64_t bytes_up;           /* client -> server */
+    uint64_t bytes_down;         /* server -> client */
+    uint64_t ms;                 /* how long it was relayed */
+    char     why[16];            /* NUL-terminated */
+};
+/* Warden -> proxy, step 7: the run is ending: close every connection,
+ * report each relayed one (WP_MSG_CLOSED), then answer WP_MSG_FLUSHED (a
+ * struct wp_msg). */
 
 #define WP_READ_MS       10000   /* a whole request within this, or refused */
 #define WP_VERDICT_MS    60000   /* the Warden's verdict within this, or refused */

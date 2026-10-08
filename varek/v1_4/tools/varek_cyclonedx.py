@@ -239,6 +239,11 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             # stream order (varek_audit.py checks the budgets and that every
             # name looked up on demand was asked for first). v1.26: and the
             # synthetic addresses given with the proxy on.
+            # v1.26 (step 7): the proxy's close records, each with the number
+            # of decision records before it
+            if event == "proxy_close" and run is not None and rec.get("run") == run \
+                    and meta is not None:
+                meta.setdefault("proxy_closes", []).append((len(records), rec))
             if event in ("resolution", "dns_question", "synthetic_address") and run is not None \
                     and rec.get("run") == run and meta is not None:
                 meta.setdefault("dns_events", []).append(rec)

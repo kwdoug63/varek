@@ -53,6 +53,59 @@ struct px_req {
 };
 static struct px_req g_px[PX_MAX_DIAL];
 
+/* Step 7: the connections passed to the proxy and not yet closed, and when
+ * each was passed (monotonic ms). */
+struct px_open { uint64_t id; int64_t at; };
+static struct px_open *g_px_open;
+static size_t g_px_nopen, g_px_capopen;
+
+static void px_open_add(uint64_t id) {
+    if (g_px_nopen == g_px_capopen) {
+        size_t nc = g_px_capopen ? g_px_capopen * 2 : 64;
+        struct px_open *o = realloc(g_px_open, nc * sizeof *o);
+        if (!o) return;                  /* not tracked: its close is then refused as unknown */
+        g_px_open = o;
+        g_px_capopen = nc;
+    }
+    g_px_open[g_px_nopen++] = (struct px_open){ id, wr_now_ms() };
+}
+
+/* The proxy_close record (step 7), chained like a resolution record:
+ *   {"event":"proxy_close","run":R,"proxy_conn":N,"why":"closed|reset|idle|
+ *    run_end|unreported","bytes_up":U,"bytes_down":D,"relay_ms":M,
+ *    "timestamp_ns":TS}
+ * The byte counts and relay_ms are the proxy's report ("unreported": the
+ * proxy never said, and they are absent). */
+static void px_close_record(uint64_t id, const char *why, const struct wp_close *m) {
+    FILE *f = rec_begin();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(f, "{\"event\":\"proxy_close\",\"run\":\"%s\",\"proxy_conn\":%llu,\"why\":\"%s\",",
+            g_run_id, (unsigned long long)id, why);
+    if (m) fprintf(f, "\"bytes_up\":%llu,\"bytes_down\":%llu,\"relay_ms\":%llu,",
+                   (unsigned long long)m->bytes_up, (unsigned long long)m->bytes_down,
+                   (unsigned long long)m->ms);
+    fprintf(f, "\"timestamp_ns\":%lld}\n", (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+    rec_end(NULL);
+}
+
+/* A close report: 0, or -1 (not a connection passed to the proxy and still
+ * open, or a malformed report: the proxy is not behaving). */
+static int px_closed(const struct wp_close *m) {
+    static const char *const kWhy[] = { "closed", "reset", "idle", "run_end" };
+    bool ok = false;
+    if (!memchr(m->why, 0, sizeof m->why)) return -1;
+    for (size_t k = 0; k < sizeof kWhy / sizeof *kWhy; k++) if (!strcmp(m->why, kWhy[k])) ok = true;
+    if (!ok) return -1;
+    for (size_t k = 0; k < g_px_nopen; k++)
+        if (g_px_open[k].id == m->id) {
+            g_px_open[k] = g_px_open[--g_px_nopen];
+            px_close_record(m->id, m->why, m);
+            return 0;
+        }
+    return -1;
+}
+
 static void px_record(struct px_req *q, decision_t d_raw, decision_t d_final, const char *rule, int err) {
     size_t el = strlen(q->a->extra);
     snprintf(q->a->extra + el, sizeof q->a->extra - el, "\"proxy_conn\":%llu,\"proxy_kind\":\"%s\",",
@@ -179,6 +232,7 @@ static void px_dialed(const struct policy *p, struct px_req *q, int so_error) {
         px_record(q, DEC_ALLOW, DEC_ALLOW, "proxy_dial_failed", EIO);
     } else {
         px_record(q, DEC_ALLOW, DEC_ALLOW, "proxy_dialed", 0);
+        px_open_add(q->id);              /* step 7: its proxy_close follows */
     }
     px_free(q);
 }
@@ -331,14 +385,25 @@ static void px_service(const struct policy *p, const struct pollfd *pfds, int n)
     }
 }
 
-/* The proxy's reports (WP_MSG_REQUEST, WP_MSG_UNREADABLE). A report that is
+static bool g_px_flushed = false;
+
+/* The proxy's reports (WP_MSG_REQUEST, WP_MSG_UNREADABLE, and, step 7,
+ * WP_MSG_CLOSED and WP_MSG_FLUSHED). A report that is
  * not well formed means the proxy is not behaving: -1, and the run stops. */
 static int proxy_service(const struct policy *p) {
     for (;;) {
-        struct wp_req m;
-        ssize_t n = recv(g_proxy.ctl, &m, sizeof m, MSG_DONTWAIT);
+        union { struct wp_req r; struct wp_close c; struct wp_msg f; uint32_t type; } u;
+        ssize_t n = recv(g_proxy.ctl, &u, sizeof u, MSG_DONTWAIT);
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
         if (n <= 0) return -1;                                  /* the proxy is gone */
+        if (n == (ssize_t)sizeof u.c && u.type == WP_MSG_CLOSED) {
+            if (px_closed(&u.c) < 0) return -1;
+            continue;
+        }
+        if (n == (ssize_t)sizeof u.f && u.type == WP_MSG_FLUSHED) { g_px_flushed = true; continue; }
+        struct wp_req m;
+        if (n != (ssize_t)sizeof m) return -1;
+        memcpy(&m, &u.r, sizeof m);
         if (n != (ssize_t)sizeof m || (m.type != WP_MSG_REQUEST && m.type != WP_MSG_UNREADABLE) ||
             m.kind > PP_KIND_CONNECT || m.id == 0 || m.id > g_proxy_conns ||
             !memchr(m.name, 0, sizeof m.name) || !memchr(m.why, 0, sizeof m.why))
@@ -355,5 +420,34 @@ static int proxy_service(const struct policy *p) {
             fprintf(g_log, "[warden] proxy: connection %llu (%s) refused by the proxy: %s\n",
                     (unsigned long long)m.id, pp_kind_name((pp_kind_t)m.kind), m.why);
         }
+    }
+}
+
+/* Step 7: the run is ending (emit_run_end). Requests still waiting on a
+ * lookup or a dial are refused (rule run_ended); the proxy closes every
+ * connection and reports each relayed one, within 2 s; a relay it never
+ * reported is recorded "unreported". So every proxy_dialed has one
+ * proxy_close in a complete stream. */
+static void px_finish(void) {
+    for (int k = 0; k < PX_MAX_DIAL; k++)
+        if (g_px[k].used) px_refuse(&g_px[k], DEC_ALLOW, "run_ended", EACCES);
+    if (g_proxy.ctl >= 0 && g_px_nopen) {
+        struct wp_msg f = { .type = WP_MSG_FLUSH, .port = 0 };
+        if (send(g_proxy.ctl, &f, sizeof f, MSG_NOSIGNAL) == (ssize_t)sizeof f) {
+            int64_t until = wr_now_ms() + 2000;
+            g_px_flushed = false;
+            while (!g_px_flushed && wr_now_ms() < until) {
+                struct pollfd pf = { .fd = g_proxy.ctl, .events = POLLIN };
+                int64_t left = until - wr_now_ms();
+                if (poll(&pf, 1, left > 0 ? (int)left : 0) <= 0) break;
+                if (proxy_service(g_syn_p) < 0) break;
+            }
+        }
+    }
+    for (int k = 0; k < PX_MAX_DIAL; k++)      /* any the proxy sent while flushing */
+        if (g_px[k].used) px_refuse(&g_px[k], DEC_ALLOW, "run_ended", EACCES);
+    while (g_px_nopen) {
+        uint64_t id = g_px_open[--g_px_nopen].id;
+        px_close_record(id, "unreported", NULL);
     }
 }
