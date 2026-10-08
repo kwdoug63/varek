@@ -640,6 +640,38 @@ static const char *handover(int notify_fd, uint64_t id, pid_t tid, int s, int af
 
 /* ---- connect ---- */
 
+/* v1.26 (step 5): the proxy's reports. A request (the name and port a
+ * handed-off connection asks for) is refused for now: the decision is step
+ * 6. A connection the proxy could not read is refused by the proxy itself.
+ * Both are written to the log. A report that is not well formed means the
+ * proxy is not behaving: -1, and the run stops. */
+static int proxy_service(void) {
+    for (;;) {
+        struct wp_req m;
+        ssize_t n = recv(g_proxy.ctl, &m, sizeof m, MSG_DONTWAIT);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
+        if (n <= 0) return -1;                                  /* the proxy is gone */
+        if (n != (ssize_t)sizeof m || (m.type != WP_MSG_REQUEST && m.type != WP_MSG_UNREADABLE) ||
+            m.kind > PP_KIND_CONNECT || m.id == 0 || m.id > g_proxy_conns ||
+            !memchr(m.name, 0, sizeof m.name) || !memchr(m.why, 0, sizeof m.why))
+            return -1;
+        char why[8];
+        log_line_start();
+        if (m.type == WP_MSG_REQUEST) {
+            if (m.port == 0 || m.port > 65535 || vdp_host_name_form(m.name, strlen(m.name), why, sizeof why) != 1)
+                return -1;
+            fprintf(g_log, "[warden] proxy: connection %llu asks for %s:%u (%s); refused until the "
+                    "proxy's decisions are built (v1.26 step 6)\n", (unsigned long long)m.id, m.name, m.port,
+                    pp_kind_name((pp_kind_t)m.kind));
+            (void)wp_verdict(&g_proxy, m.id, false);
+        } else {
+            for (char *c = m.why; *c; c++) if (*c < ' ' || *c > '~' || *c == '"' || *c == '\\') *c = '?';
+            fprintf(g_log, "[warden] proxy: connection %llu (%s) refused by the proxy: %s\n",
+                    (unsigned long long)m.id, pp_kind_name((pp_kind_t)m.kind), m.why);
+        }
+    }
+}
+
 /* v1.26 (step 4): connect the Warden's socket s to the proxy's listener from
  * 127.0.0.1 (IPv4-mapped for an IPv6 socket), announcing the connection
  * first: bind, tell the proxy the local port, then connect. 0 or -errno. */

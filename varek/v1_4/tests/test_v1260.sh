@@ -28,8 +28,16 @@
 #      a synthetic address are refused; the proxy closes a connection the
 #      Warden did not announce; the audit accepts the run and refuses forged
 #      hand-off records
+#   5. what the proxy reads: the parsers' vectors and a short fuzz run under
+#      ASan and UBSan (tests/proxy_parse_test), real ClientHellos (Python,
+#      openssl s_client, curl, node where present) read for their SNI; then
+#      (as root) through the proxy: a ClientHello's SNI, an HTTP Host and a
+#      CONNECT's name reported to the Warden (refused until step 6, with a TLS
+#      alert or a 403), a ClientHello without SNI, junk, and a CONNECT that
+#      sends nothing more refused by the proxy itself
 #
 # Usage: test_v1260.sh <vdp_check> <vdp_cert_check> [<warden>]
+# (section 5 also uses tests/proxy_parse_test: make tests/proxy_parse_test)
 set -u
 
 VDP="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
@@ -302,8 +310,7 @@ for t in sys.argv[2:]:
             continue
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.connect((host, port))            # blocking, as most clients
-        s.sendall(b"hello")
-        s.settimeout(1)
+        s.settimeout(1)                    # sends nothing: the proxy holds it, waiting
         try:
             d = s.recv(10)
             print("CONNECTED", t, "EOF" if d == b"" else "DATA", flush=True)
@@ -357,6 +364,144 @@ PY
     refuses "a hand-off of a connect a rule denies" "$POLH" "$OUT/g4.log" "denies was handed to the proxy"
     printf 'require warden 1.26\nallow host api.example.com:443\nallow host 192.0.2.9:8443\ndeny host 192.0.2.8:443\nallow host 127.0.0.1\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/ readonly\n' "$W" > "$OUT/noproxy.policy"
     refuses "hand-offs under a policy without the proxy" "$OUT/noproxy.policy" "$OUT/h.log" "the proxy is not on"
+    rm -rf "$W"
+fi
+
+echo "== 5. what the proxy reads =="
+PPT="$HERE/tests/proxy_parse_test"
+if [ ! -x "$PPT" ]; then
+    skip "the parsers (build tests/proxy_parse_test)"
+else
+    check "the parsers' vectors (ASan, UBSan)" "$PPT" unit
+    check "200,000 fuzzed inputs, no fault (ASan, UBSan)" "$PPT" fuzz 100000 "$RANDOM"
+    # Real clients' first flights, captured by a listener that answers nothing
+    capture() {   # capture <out> <command...> (the command connects to 127.0.0.1:$CP)
+        local out="$1"; shift
+        CP=$((30000 + RANDOM % 20000))
+        python3 - "$CP" "$out" <<'PY' &
+import socket, sys, time
+l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+l.bind(("127.0.0.1", int(sys.argv[1]))); l.listen(1); l.settimeout(10)
+c, _ = l.accept(); c.settimeout(1); d = b""; t = time.time()
+while time.time() - t < 2:
+    try:
+        x = c.recv(65536)
+        if not x: break
+        d += x
+    except socket.timeout:
+        break
+open(sys.argv[2], "wb").write(d)
+PY
+        local lp=$!
+        sleep 0.3
+        CP=$CP "$@" > /dev/null 2>&1 &
+        local cp=$!
+        wait "$lp"; kill "$cp" 2>/dev/null; wait "$cp" 2>/dev/null
+    }
+    read_sni() {  # read_sni <description> <file> <want>
+        if [ "$("$PPT" file "$2" 443)" = "OK tls $3 443" ]; then pass "$1"
+        else flunk "$1 ($("$PPT" file "$2" 443))"; fi
+    }
+    python3 - "$OUT/py.ch" <<'PY'
+import ssl, sys
+ctx = ssl.create_default_context(); ctx.set_alpn_protocols(["h2", "http/1.1"])
+i, o = ssl.MemoryBIO(), ssl.MemoryBIO()
+s = ctx.wrap_bio(i, o, server_hostname="api.example.com")
+try: s.do_handshake()
+except ssl.SSLWantReadError: pass
+open(sys.argv[1], "wb").write(o.read())
+PY
+    read_sni "a Python (OpenSSL) ClientHello" "$OUT/py.ch" api.example.com
+    if command -v openssl > /dev/null; then
+        capture "$OUT/ossl.ch" sh -c 'openssl s_client -connect 127.0.0.1:$CP -servername api.example.com < /dev/null'
+        read_sni "an openssl s_client ClientHello" "$OUT/ossl.ch" api.example.com
+    else skip "openssl s_client (not installed)"; fi
+    if command -v curl > /dev/null; then
+        capture "$OUT/curl.ch" sh -c 'curl -sk --noproxy api.example.com,127.0.0.1 --max-time 3 --resolve api.example.com:$CP:127.0.0.1 https://api.example.com:$CP/'
+        read_sni "a curl ClientHello" "$OUT/curl.ch" api.example.com
+        capture "$OUT/curl.http" sh -c 'curl -s --noproxy api.example.com,127.0.0.1 --max-time 3 --resolve api.example.com:$CP:127.0.0.1 http://api.example.com:$CP/x'
+        if "$PPT" file "$OUT/curl.http" "$CP" | grep -q "^OK http api.example.com $CP$"; then pass "a curl HTTP request (Host with its port)"
+        else flunk "a curl HTTP request ($("$PPT" file "$OUT/curl.http" "$CP"))"; fi
+    else skip "curl (not installed)"; fi
+    NODE=$(command -v node 2>/dev/null)
+    if [ -n "$NODE" ]; then
+        capture "$OUT/node.ch" sh -c "'$NODE' -e 'require(\"tls\").connect({host:\"127.0.0.1\",port:+process.env.CP,servername:\"api.example.com\",rejectUnauthorized:false}).on(\"error\",()=>{})'"
+        read_sni "a node ClientHello" "$OUT/node.ch" api.example.com
+    else skip "node (not installed)"; fi
+fi
+
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
+    skip "through the proxy (needs root and the warden binary)"
+else
+    W=/tmp/varek_v1260p
+    rm -rf "$W"; mkdir -p "$W"; chmod 755 "$W"
+    cat > "$W/agent.py" <<'PY'
+import socket, ssl
+def hello(sni):
+    ctx = ssl.create_default_context()
+    i, o = ssl.MemoryBIO(), ssl.MemoryBIO()
+    s = ctx.wrap_bio(i, o, server_hostname=sni)
+    try: s.do_handshake()
+    except ssl.SSLWantReadError: pass
+    return o.read()
+def tls(sni):
+    ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+    s = socket.create_connection(("198.18.0.1", 443), 5)
+    try:
+        ctx.wrap_socket(s, server_hostname=sni)
+        print("TLS", sni, "HANDSHAKE", flush=True)
+    except ssl.SSLError as e:
+        print("TLS", sni, "ALERT" if "HANDSHAKE_FAILURE" in str(e).upper() else "OTHER", flush=True)
+def raw(tag, *parts, wait=3):
+    s = socket.create_connection(("198.18.0.1", 443), 5)
+    s.settimeout(wait)
+    out = b""
+    for p in parts:
+        s.sendall(p)
+        try:
+            while True:
+                d = s.recv(4096)
+                out += d
+                if not d or b"\r\n\r\n" in out or out[-7:-5] == b"\x15\x03": break
+        except OSError:
+            pass
+    print("RAW", tag, out.hex(), flush=True)
+tls("api.example.com")
+tls(None)
+raw("http", b"GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+raw("connect", b"CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n", hello("api.example.com"))
+raw("connect-other", b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n", hello("other.example.com"))
+raw("junk", b"\x01\x02junk")
+raw("idle", b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n", b"", wait=12)
+PY
+    chmod 644 "$W/agent.py"
+    POLP="$OUT/parse.policy"
+    printf 'require warden 1.26\nproxy on\nallow host api.example.com:443\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path /etc/ssl/ readonly\nallow path %s/ readonly\n' "$W" > "$POLP"
+    env -i PATH=/usr/bin:/bin timeout 90 "$WARDEN" "$POLP" -- /usr/bin/python3 "$W/agent.py" > "$OUT/p.out" 2> "$OUT/p.log"
+    sed 's/^/     /' "$OUT/p.out" | cut -c1-120
+    grep 'proxy: connection' "$OUT/p.log" | sed 's/^/     /'
+    OK200=$(printf 'HTTP/1.1 200 Connection established\r\n\r\n' | od -An -tx1 | tr -d ' \n')
+    ALERT=15030300020228                  # a fatal handshake_failure alert
+    check "a ClientHello's SNI is read and reported to the Warden" \
+        grep -q 'proxy: connection 1 asks for api.example.com:443 (tls)' "$OUT/p.log"
+    check "and, until the decision (step 6), refused with a handshake_failure alert" \
+        grep -q '^TLS api.example.com ALERT$' "$OUT/p.out"
+    check "a ClientHello without SNI is refused by the proxy" \
+        sh -c "grep -q 'proxy: connection 2 (tls) refused by the proxy: no SNI' '$OUT/p.log' && grep -q '^TLS None ALERT$' '$OUT/p.out'"
+    check "an HTTP request's Host is reported, and refused with a 403" \
+        sh -c "grep -q 'proxy: connection 3 asks for api.example.com:443 (http)' '$OUT/p.log' && grep -q '^RAW http $(printf 'HTTP/1.1 403' | od -An -tx1 | tr -d ' \n')' '$OUT/p.out'"
+    check "a CONNECT is answered 200, and the name is reported once the ClientHello inside agrees" \
+        sh -c "grep -q 'proxy: connection 4 asks for api.example.com:443 (connect)' '$OUT/p.log' && grep -q '^RAW connect $OK200$ALERT$' '$OUT/p.out'"
+    check "a CONNECT whose ClientHello names another host is refused by the proxy" \
+        sh -c "grep -q 'proxy: connection 5 (connect) refused by the proxy: an SNI that is not the CONNECT target' '$OUT/p.log' && grep -q '^RAW connect-other $OK200$ALERT$' '$OUT/p.out'"
+    check "neither TLS nor HTTP: closed by the proxy" \
+        sh -c "grep -q 'proxy: connection 6 (none) refused by the proxy: neither TLS nor HTTP' '$OUT/p.log' && grep -q '^RAW junk $' '$OUT/p.out'"
+    check "a client that sends nothing more is refused after 10 s" \
+        grep -q 'proxy: connection 7 (connect) refused by the proxy: no whole request within 10 s' "$OUT/p.log"
+    check "the names, not the bytes, reach the Warden: nothing else from the proxy in the log" \
+        sh -c "[ \$(grep -c 'proxy: connection' '$OUT/p.log') = 7 ]"
+    check "the audit accepts the run" \
+        python3 "$HERE/tools/varek_audit.py" --policy "$POLP" --checker "$CERT" "$OUT/p.log"
     rm -rf "$W"
 fi
 

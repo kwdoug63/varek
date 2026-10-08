@@ -52,7 +52,9 @@ jobs:
         run: sudo make -C varek/v1_4 test-v1240
       - name: v1.25 wildcard host names (grammar, shared-domain refusals)
         run: sudo make -C varek/v1_4 test-v1250
-      - name: v1.26 egress proxy (grammar, the proxy process, synthetic addresses)
+      - name: v1.26 the proxy's parsers under ASan/UBSan (vectors, then 2M fuzzed inputs)
+        run: make -C varek/v1_4 fuzz-proxy-parse
+      - name: v1.26 egress proxy (grammar, the proxy process, synthetic addresses, hand-off, parsers)
         run: sudo make -C varek/v1_4 test-v1260
       - name: Build and test the plan_verify CLI (v1_6, v1.16.3)
         run: make -C v1_6 plan_verify check check-plan-verify

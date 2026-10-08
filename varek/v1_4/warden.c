@@ -134,6 +134,7 @@
 #include "warden_resolve.h"     /* v1.24 resolution table for host name rules */
 #include "shared_domains.h"     /* v1.25 wildcards over shared domains, refused at load */
 #include "warden_proxy.h"       /* v1.26 the egress proxy process */
+#include "proxy_parse.h"        /* v1.26 what the proxy reads (pp_kind_name) */
 
 /* Kernel/libc compatibility shims --------------------------------- */
 #ifndef __NR_openat2
@@ -2763,7 +2764,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * finished for the agent (warden_net.inc.c). */
         /* v1.24: also on the resolver helper's results. */
         /* v1.25: and on the stub resolver's sockets (warden_stub.inc.c). */
-        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN] = {
+        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN + 1] = {
             { .fd = notify_fd,    .events = POLLIN },
             { .fd = target_pidfd, .events = POLLIN },
             { .fd = agent_err_fd, .events = POLLIN },
@@ -2781,6 +2782,9 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * their results applied here; the lookups themselves never run in
          * the Warden. */
         int nstub = stub_poll_fill(&pfds[4 + npoll]);
+        /* v1.26 (step 5): and on the egress proxy's reports */
+        int pxi = 4 + npoll + nstub;
+        pfds[pxi] = (struct pollfd){ .fd = g_proxy.ctl, .events = POLLIN };
         int to = maybe_checkpoint(), pto = pend_timeout_ms();
         if (pto >= 0 && (to < 0 || pto < to)) to = pto;
         if (g_names_on) {
@@ -2789,7 +2793,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             int dto = wr_next_due_ms(&g_names, wr_now_ms());
             if (dto >= 0 && (to < 0 || dto < to)) to = dto;
         }
-        int pr = poll(pfds, (nfds_t)(4 + npoll + nstub), to);
+        int pr = poll(pfds, (nfds_t)(pxi + 1), to);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -2800,6 +2804,11 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             pend_service(notify_fd, rev, npoll);
         }
         stub_service(p, &pfds[4 + npoll], nstub);
+        if (g_proxy.ctl >= 0 && (pfds[pxi].revents & (POLLIN | POLLHUP | POLLERR)) && proxy_service() < 0) {
+            /* fail closed, as for the resolver helper */
+            fprintf(stderr, "[warden] the egress proxy exited or sent a malformed report; stopping the run\n");
+            return false;
+        }
         if (g_names_on && (pfds[3].revents & (POLLIN | POLLHUP | POLLERR))) {
             wr_async_collect(&g_names, wr_now_ms(), emit_resolution, NULL);
             /* v1.24: without the helper the table would go stale; stop

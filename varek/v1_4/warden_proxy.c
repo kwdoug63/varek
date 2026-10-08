@@ -2,6 +2,7 @@
 // warden_proxy.c — v1.26: the egress proxy process. See warden_proxy.h.
 
 #include "warden_proxy.h"
+#include "proxy_parse.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -100,6 +101,12 @@ int wp_announce(const wp_t *w, uint64_t id, unsigned from_port, pid_t tid, const
     return 0;
 }
 
+int wp_verdict(const wp_t *w, uint64_t id, bool allow) {
+    if (w->ctl < 0) { errno = ENOTCONN; return -1; }
+    struct wp_verdict m = { .type = WP_MSG_VERDICT, .allow = allow ? 1u : 0u, .id = id };
+    return send(w->ctl, &m, sizeof m, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t)sizeof m ? 0 : -1;
+}
+
 static int64_t mono_ms(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -107,32 +114,94 @@ static int64_t mono_ms(void) {
 }
 
 /* The proxy's state: announcements waiting for their connection, and the
- * connections it holds. */
-struct wp_ann  { bool used; uint32_t from_port; uint64_t id; int64_t at; };
-struct wp_held { int fd; uint64_t id; int64_t last; };
+ * connections it holds. A held connection is read (step 5) until the parser
+ * has a name, then waits for the Warden's verdict. */
+struct wp_ann  { bool used; uint32_t from_port; unsigned dport; uint64_t id; int64_t at; };
+enum { WH_READING = 0, WH_WAITING = 1 };
+struct wp_held {
+    int       fd;
+    uint64_t  id;
+    unsigned  dport;             /* the port the agent connected to */
+    int       state;
+    bool      acked;             /* its CONNECT was answered */
+    pp_kind_t kind;
+    int64_t   since;             /* accepted, or (waiting) asked */
+    uint8_t  *buf;               /* what it sent, up to PP_IN_MAX */
+    size_t    len;
+};
 static struct wp_ann  g_ann[WP_MAX_ANNOUNCED];
 static struct wp_held g_held[WP_MAX_HELD];
 static int g_nheld = 0;
+static int g_ctl = -1;
+
+static void held_drop(int k) {
+    close(g_held[k].fd);
+    free(g_held[k].buf);
+    g_held[k] = g_held[--g_nheld];
+}
+
+/* Tell the client no, in its own protocol, and close. */
+static void held_refuse(int k) {
+    static const uint8_t alert[] = { 21, 3, 3, 0, 2, 2, 40 };          /* fatal handshake_failure */
+    static const char forbidden[] = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    struct wp_held *h = &g_held[k];
+    if (h->kind == PP_KIND_TLS || (h->kind == PP_KIND_CONNECT && h->acked))
+        (void)send(h->fd, alert, sizeof alert, MSG_DONTWAIT | MSG_NOSIGNAL);
+    else if (h->kind == PP_KIND_HTTP || h->kind == PP_KIND_CONNECT)
+        (void)send(h->fd, forbidden, sizeof forbidden - 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+    held_drop(k);
+}
+
+/* Report a connection to the Warden: its name (WP_MSG_REQUEST) or why it
+ * could not be read (WP_MSG_UNREADABLE). */
+static void report(const struct wp_held *h, uint32_t type, const pp_result_t *r, const char *why) {
+    struct wp_req m;
+    memset(&m, 0, sizeof m);
+    m.type = type;
+    m.kind = (uint32_t)(r ? r->kind : h->kind);
+    m.id = h->id;
+    if (type == WP_MSG_REQUEST) {
+        m.port = r->port;
+        snprintf(m.name, sizeof m.name, "%s", r->name);
+    } else {
+        snprintf(m.why, sizeof m.why, "%s", why);
+    }
+    (void)send(g_ctl, &m, sizeof m, MSG_DONTWAIT | MSG_NOSIGNAL);
+}
+
+static int held_find(uint64_t id) {
+    for (int k = 0; k < g_nheld; k++) if (g_held[k].id == id) return k;
+    return -1;
+}
 
 /* Read every control message waiting. Returns -1 when the Warden has gone. */
 static int wp_drain_ctl(int ctl) {
     for (;;) {
-        struct wp_conn m;
+        union { struct wp_conn c; struct wp_verdict v; uint32_t type; } m;
         ssize_t n = recv(ctl, &m, sizeof m, MSG_DONTWAIT);
         if (n == 0) return -1;
         if (n < 0) return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? 0 : -1;
-        if (n != (ssize_t)sizeof m || m.type != WP_MSG_CONN || m.from_port == 0 || m.from_port > 65535)
+        if (n == (ssize_t)sizeof m.v && m.type == WP_MSG_VERDICT) {
+            /* step 5: every verdict is a refusal (the decision is step 6) */
+            int k = held_find(m.v.id);
+            if (k >= 0 && g_held[k].state == WH_WAITING) held_refuse(k);
+            continue;
+        }
+        if (n != (ssize_t)sizeof m.c || m.type != WP_MSG_CONN || m.c.from_port == 0 || m.c.from_port > 65535)
             continue;                                   /* not one the Warden sends */
+        const char *colon = strrchr(m.c.dest, ':');
+        unsigned dport = colon ? (unsigned)strtoul(colon + 1, NULL, 10) : 0;
         int64_t now = mono_ms();
         int slot = -1, oldest = 0;
         for (int k = 0; k < WP_MAX_ANNOUNCED; k++) {
-            if (g_ann[k].used && (now - g_ann[k].at > WP_ANNOUNCE_MS || g_ann[k].from_port == m.from_port))
+            if (g_ann[k].used && (now - g_ann[k].at > WP_ANNOUNCE_MS || g_ann[k].from_port == m.c.from_port))
                 g_ann[k].used = false;                  /* expired, or its port is reused */
             if (!g_ann[k].used && slot < 0) slot = k;
             if (g_ann[k].at < g_ann[oldest].at) oldest = k;
         }
         if (slot < 0) slot = oldest;                    /* full: the oldest goes */
-        g_ann[slot] = (struct wp_ann){ .used = true, .from_port = m.from_port, .id = m.id, .at = now };
+        g_ann[slot] = (struct wp_ann){ .used = true, .from_port = m.c.from_port, .dport = dport,
+                                       .id = m.c.id, .at = now };
     }
 }
 
@@ -146,11 +215,50 @@ static void wp_accepted(int c, const struct sockaddr_in *peer) {
                 now - g_ann[k].at <= WP_ANNOUNCE_MS) { found = k; break; }
     if (found < 0 || g_nheld >= WP_MAX_HELD) { close(c); return; }
     g_ann[found].used = false;
-    g_held[g_nheld++] = (struct wp_held){ .fd = c, .id = g_ann[found].id, .last = now };
+    g_held[g_nheld++] = (struct wp_held){ .fd = c, .id = g_ann[found].id, .dport = g_ann[found].dport,
+                                          .state = WH_READING, .since = now };
+}
+
+/* Bytes arrived on held connection k (READING): read them and parse. */
+static void held_read(int k) {
+    struct wp_held *h = &g_held[k];
+    if (!h->buf && !(h->buf = malloc(PP_IN_MAX))) { held_drop(k); return; }
+    ssize_t n = recv(h->fd, h->buf + h->len, PP_IN_MAX - h->len, MSG_DONTWAIT);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return;
+    if (n <= 0) {
+        report(h, WP_MSG_UNREADABLE, NULL, h->len ? "closed before a whole request" : "closed before sending");
+        held_drop(k);
+        return;
+    }
+    h->len += (size_t)n;
+    pp_result_t r;
+    pp_status_t st = pp_parse(h->buf, h->len, h->dport, h->acked, &r);
+    if (r.kind != PP_KIND_NONE) h->kind = r.kind;
+    if (st == PP_MORE && h->len == PP_IN_MAX) { st = PP_REFUSE; r.why = "too much before a decision"; }
+    if (st == PP_MORE) return;
+    if (st == PP_ACK) {
+        static const char ok[] = "HTTP/1.1 200 Connection established\r\n\r\n";
+        if (send(h->fd, ok, sizeof ok - 1, MSG_DONTWAIT | MSG_NOSIGNAL) != (ssize_t)sizeof ok - 1) {
+            report(h, WP_MSG_UNREADABLE, NULL, "could not answer the CONNECT");
+            held_drop(k);
+            return;
+        }
+        h->acked = true;
+        return;
+    }
+    if (st == PP_REFUSE) {
+        report(h, WP_MSG_UNREADABLE, NULL, r.why);
+        held_refuse(k);
+        return;
+    }
+    report(h, WP_MSG_REQUEST, &r, NULL);
+    h->state = WH_WAITING;
+    h->since = mono_ms();
 }
 
 int wp_helper_main(int ctl) {
     signal(SIGPIPE, SIG_IGN);
+    g_ctl = ctl;
     int ls = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (ls < 0) { perror("[proxy] socket"); return 1; }
     struct sockaddr_in a;
@@ -180,13 +288,36 @@ int wp_helper_main(int ctl) {
     for (;;) {
         pf[0] = (struct pollfd){ .fd = ctl, .events = POLLIN };
         pf[1] = (struct pollfd){ .fd = ls, .events = POLLIN };
-        for (int k = 0; k < g_nheld; k++) pf[2 + k] = (struct pollfd){ .fd = g_held[k].fd, .events = POLLIN };
         int nh = g_nheld;
+        for (int k = 0; k < nh; k++)
+            pf[2 + k] = (struct pollfd){ .fd = g_held[k].fd,
+                                         .events = g_held[k].state == WH_READING ? POLLIN : 0 };
         if (poll(pf, (nfds_t)(2 + nh), 1000) < 0) {
             if (errno == EINTR) continue;
             return 1;
         }
         if (pf[0].revents && wp_drain_ctl(ctl) < 0) return 0;      /* the Warden went */
+        /* Held connections first (by fd: a verdict above may have dropped
+         * some, moving others), then new ones. */
+        int64_t now = mono_ms();
+        for (int j = 2; j < 2 + nh; j++) {
+            int k = -1;
+            for (int x = 0; x < g_nheld; x++) if (g_held[x].fd == pf[j].fd) { k = x; break; }
+            if (k < 0) continue;
+            struct wp_held *h = &g_held[k];
+            if (h->state == WH_READING && (pf[j].revents & (POLLIN | POLLHUP | POLLERR))) {
+                held_read(k);
+                continue;
+            }
+            if (h->state == WH_READING && now - h->since > WP_READ_MS) {
+                report(h, WP_MSG_UNREADABLE, NULL, "no whole request within 10 s");
+                held_refuse(k);
+            } else if (h->state == WH_WAITING && (pf[j].revents & (POLLHUP | POLLERR))) {
+                held_drop(k);                                       /* the client went */
+            } else if (h->state == WH_WAITING && now - h->since > WP_VERDICT_MS) {
+                held_refuse(k);                                     /* no verdict: refused */
+            }
+        }
         if (pf[1].revents & POLLIN) {
             /* The Warden announces a connection before making it: read the
              * control socket again first, so its announcement is here. */
@@ -195,25 +326,9 @@ int wp_helper_main(int ctl) {
                 struct sockaddr_in peer;
                 socklen_t pl = sizeof peer;
                 memset(&peer, 0, sizeof peer);
-                int c = accept4(ls, (struct sockaddr *)&peer, &pl, SOCK_CLOEXEC | SOCK_NONBLOCK);
-                if (c < 0) break;
-                wp_accepted(c, &peer);
-            }
-        }
-        /* Step 4: a held connection is read and discarded (step 5 parses
-         * it), and closed when the client closes it or after 60 s idle. */
-        int64_t now = mono_ms();
-        for (int k = nh - 1; k >= 0; k--) {
-            bool drop = now - g_held[k].last > 60000;
-            if (pf[2 + k].revents) {
-                char b[4096];
-                ssize_t n = recv(g_held[k].fd, b, sizeof b, MSG_DONTWAIT);
-                if (n > 0) g_held[k].last = now;
-                else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) drop = true;
-            }
-            if (drop) {
-                close(g_held[k].fd);
-                g_held[k] = g_held[--g_nheld];
+                int c2 = accept4(ls, (struct sockaddr *)&peer, &pl, SOCK_CLOEXEC | SOCK_NONBLOCK);
+                if (c2 < 0) break;
+                wp_accepted(c2, &peer);
             }
         }
     }

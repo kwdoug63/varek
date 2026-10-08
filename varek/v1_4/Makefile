@@ -32,7 +32,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 crosscheck harness video-v112
+.PHONY: all deps deps-check preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -64,18 +64,18 @@ CHECKER := checker/vdp_checker.c checker/vdp_checker.h
 
 # v1.24: the resolution table (warden_resolve.c) runs a resolver thread and
 # uses the host's resolver library.
-RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c warden_stub.inc.c warden_synth.inc.c shared_domains.c shared_domains.h warden_proxy.c warden_proxy.h
+RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c warden_stub.inc.c warden_synth.inc.c shared_domains.c shared_domains.h warden_proxy.c warden_proxy.h proxy_parse.c proxy_parse.h
 
 warden: warden.c warden_net.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
-	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
+	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c proxy_parse.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
 
 # v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
 # ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that
 # the certificate checker refuses the wrong verdict. Never deploy it.
 warden_faultinject: warden.c warden_net.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
-	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
+	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c proxy_parse.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
 
 # v1.15: command-line front end to the certificate checker (policy digest,
 # batch certificate checks). Links the checker only, never smt_decide.c.
@@ -346,8 +346,24 @@ test-v1250: warden tools/vdp_check tools/vdp_cert_check tests/test_v1250_shared
 	@./tests/test_v1250.sh ./tools/vdp_check ./tools/vdp_cert_check ./tests/test_v1250_shared ./warden
 
 # v1.26.0 (in progress): the egress proxy in SNI mode; the grammar so far
-test-v1260: warden tools/vdp_check tools/vdp_cert_check
+test-v1260: warden tools/vdp_check tools/vdp_cert_check tests/proxy_parse_test
 	@./tests/test_v1260.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
+
+# v1.26 step 5: the proxy's parsers, under ASan and UBSan: the vectors, then
+# FUZZ_N mutated inputs (make fuzz-proxy-parse FUZZ_N=50000000 for longer).
+FUZZ_N ?= 2000000
+tests/proxy_parse_test: tests/proxy_parse_test.c proxy_parse.c proxy_parse.h
+	$(CC) -O1 -g -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=all -o $@ tests/proxy_parse_test.c proxy_parse.c
+
+fuzz-proxy-parse: tests/proxy_parse_test
+	./tests/proxy_parse_test unit
+	./tests/proxy_parse_test fuzz $(FUZZ_N) 1
+
+# With a clang that has libFuzzer's runtime: coverage-guided, for FUZZ_S seconds.
+FUZZ_S ?= 60
+fuzz-proxy-parse-libfuzzer: tests/proxy_parse_test.c proxy_parse.c proxy_parse.h
+	clang -O1 -g -DPP_LIBFUZZER -fsanitize=fuzzer,address,undefined -o tests/proxy_parse_fuzzer tests/proxy_parse_test.c proxy_parse.c
+	./tests/proxy_parse_fuzzer -max_total_time=$(FUZZ_S) -max_len=40000
 
 # Differential check of the decision procedure against an off-the-shelf SMT
 # solver (tools/requirements-crosscheck.txt) and,
@@ -384,7 +400,7 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared tests/proxy_parse_test tests/proxy_parse_fuzzer
 
 # v1.22: install the runtime and the `varek` command.
 #   sudo make install                  -> /opt/varek, plus /usr/local/bin/varek

@@ -18,17 +18,23 @@
 // allows (or to a synthetic address) is not dialed. The Warden binds a socket
 // of the agent's kind to 127.0.0.1, announces the connection (WP_MSG_CONN),
 // connects it to the listener and hands it to the agent. The proxy holds an
-// announced connection (until step 5 reads what the client sends, it only
-// reads and discards) and closes any other.
+// announced connection and closes any other.
+//
+// Step 5: the proxy reads what the client sends with the bounded parsers of
+// proxy_parse.c (a ClientHello's SNI, an HTTP Host, a CONNECT), within 10 s,
+// and reports only the connection id, the kind, the name and the port
+// (WP_MSG_REQUEST), or why it could not read one (WP_MSG_UNREADABLE, and the
+// client is refused). It then waits for the Warden's verdict.
 
 #ifndef VAREK_WARDEN_PROXY_H
 #define VAREK_WARDEN_PROXY_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <sys/types.h>
 
 /* Control messages (SOCK_SEQPACKET, one per datagram). */
-enum { WP_MSG_READY = 1, WP_MSG_CONN = 2 };
+enum { WP_MSG_READY = 1, WP_MSG_CONN = 2, WP_MSG_REQUEST = 3, WP_MSG_UNREADABLE = 4, WP_MSG_VERDICT = 5 };
 
 struct wp_msg {                  /* proxy -> Warden: WP_MSG_READY */
     uint32_t type;
@@ -48,6 +54,30 @@ struct wp_conn {
     char     dest[64];           /* the agent's destination, as decided ("a.b.c.d:port") */
 };
 
+/* Proxy -> Warden, step 5: what a held connection asks for (WP_MSG_REQUEST:
+ * kind, name, port), or why it could not be read (WP_MSG_UNREADABLE: kind,
+ * why). Only these leave the proxy; never the bytes the client sent. */
+struct wp_req {
+    uint32_t type;
+    uint32_t kind;               /* pp_kind_t */
+    uint64_t id;
+    uint32_t port;
+    uint32_t pad;
+    char     name[256];          /* NUL-terminated, a host name (the Warden checks it again) */
+    char     why[96];            /* NUL-terminated */
+};
+
+/* Warden -> proxy: the decision on a WP_MSG_REQUEST. Step 5: allow is always
+ * 0, and the proxy refuses (a TLS handshake_failure alert, or an HTTP 403).
+ * Step 6 sends the dialed socket with it. */
+struct wp_verdict {
+    uint32_t type;               /* WP_MSG_VERDICT */
+    uint32_t allow;
+    uint64_t id;
+};
+
+#define WP_READ_MS       10000   /* a whole request within this, or refused */
+#define WP_VERDICT_MS    30000   /* the Warden's verdict within this, or refused */
 #define WP_MAX_ANNOUNCED 1024    /* announcements not yet accepted */
 #define WP_ANNOUNCE_MS   10000   /* an announcement not accepted by then is dropped */
 #define WP_MAX_HELD      1024    /* connections the proxy holds */
@@ -68,6 +98,9 @@ int wp_start(wp_t *w, const char *exe, uid_t uid, gid_t gid);
 /* Step 4: announce a hand-off (see struct wp_conn). Never blocks. 0, or -1
  * with errno set (the proxy is gone, or its control socket is full). */
 int wp_announce(const wp_t *w, uint64_t id, unsigned from_port, pid_t tid, const char *dest);
+
+/* Step 5: tell the proxy the verdict on connection id. Never blocks. 0 or -1. */
+int wp_verdict(const wp_t *w, uint64_t id, bool allow);
 
 /* The helper's own entry point, after it has dropped its privileges: serve
  * on the control socket fd until it closes. Returns the exit status. */
