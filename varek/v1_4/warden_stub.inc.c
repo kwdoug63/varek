@@ -314,7 +314,7 @@ static void stub_record(const char *name, uint16_t qtype, int conn_fd, const cha
     clock_gettime(CLOCK_REALTIME, &ts);
     fprintf(f, "{\"event\":\"dns_question\",\"run\":\"%s\",\"name\":\"%s\",\"type\":%u,"
                "\"transport\":\"%s\",\"rule\":\"%s\",\"policy_line\":%d,",
-            g_run_id, name, (unsigned)qtype, conn_fd < 0 ? "udp" : "tcp", rule, line);
+            g_run_id, name, (unsigned)qtype, conn_fd == -2 ? "proxy" : conn_fd < 0 ? "udp" : "tcp", rule, line);
     if (budget) fprintf(f, "\"budget\":\"%s\",", budget);
     if (flags & STUB_NEW) fputs("\"new\":true,", f);
     if (flags & STUB_UPSTREAM) fputs("\"upstream\":true,", f);

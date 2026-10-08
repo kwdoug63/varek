@@ -245,6 +245,59 @@ SYN_NET = ipaddress.ip_network("198.18.0.0/15")   # the Warden's synthetic addre
 SYN_MAX = 131070
 # v1.26 (step 4): the rules of a connect handed to the proxy
 HANDOFF_RULES = ("proxy_handoff", "proxy_handoff_in_progress", "proxy_handoff_failed")
+# v1.26 (step 6): the Warden's decision on what the proxy read, when it allowed
+PROXY_ALLOW_RULES = ("proxy_dialed", "proxy_dial_failed")
+PROXY_KINDS = ("tls", "http", "connect")
+
+
+def check_proxied(records, resolutions, handoff_all, problems):
+    """v1.26 (step 6): every net.proxy record (a name:port the proxy read,
+    decided by the Warden) is for a hand-off, once each, of a kind the proxy
+    reads, decided on the name:port it records; one the Warden dialed names
+    the address, which is neither special nor synthetic and is an address of
+    the name by the latest resolution record before it (current or in
+    grace). Returns their number."""
+    seen, n = set(), 0
+    for pos, rec in enumerate(records):
+        if rec.get("action") != "net.proxy":
+            continue
+        n += 1
+        seq, cid, tgt = rec.get("seq"), rec.get("proxy_conn"), rec.get("target")
+        if type(cid) is not int or cid not in handoff_all or cid in seen:
+            problems.append(f"seq {seq}: a proxied decision for connection {cid!r}, which is not "
+                            f"a hand-off or was decided already")
+        seen.add(cid)
+        if rec.get("proxy_kind") not in PROXY_KINDS or not isinstance(tgt, str) or \
+                tgt != rec.get("resolved") or _host_port(tgt) in (None, 0) or ":" not in tgt or \
+                tgt.startswith("["):
+            problems.append(f"seq {seq}: a malformed proxied decision ({tgt!r})")
+            continue
+        if rec.get("decision_final") != "ALLOW":
+            continue
+        dl = rec.get("dialed")
+        if rec.get("rule") == "proxy_dialed" and not isinstance(dl, str):
+            problems.append(f"seq {seq}: a proxied connection passed on without the address dialed")
+            continue
+        if dl is None:
+            continue
+        cd = _canonical_dest(dl)
+        if cd is None or int(cd[1]) != _host_port(tgt):
+            problems.append(f"seq {seq}: a proxied connection dialed {dl!r}, not on {tgt}'s port")
+            continue
+        if _special(cd[0]) or cd[0] in SYN_NET:
+            problems.append(f"seq {seq}: a proxied connection dialed {cd[0]}, a special or synthetic address")
+            continue
+        name = tgt.rsplit(":", 1)[0]
+        last = None
+        for p, r in resolutions:
+            if p > pos:
+                break
+            if r.get("name") == name:
+                last = r
+        if last is None or str(cd[0]) not in set(_addrs(last, "addresses")) | set(_addrs(last, "grace")):
+            problems.append(f"seq {seq}: a proxied connection dialed {cd[0]}, which the latest "
+                            f"resolution of {name} before it does not list")
+    return n
 
 
 def proxied_only(checker, policy, rules, names, pports):
@@ -429,7 +482,14 @@ def check_dns(meta, checker, policy, rules, problems):
             continue
         # v1.26: a name allowed only on proxied ports is answered with its
         # synthetic address (A) or no data, and nothing else is done for it
-        if (e.get("synthetic") is True) != (name in synth and rule in ("policy_match", "exact_name")):
+        # (v1.26 step 6: a lookup the Warden sent upstream to dial a proxied
+        # connection, "transport":"proxy", is charged as a question and never
+        # synthetic, and only of a name the proxy may reach)
+        if e.get("transport") == "proxy" and (e.get("synthetic") or pports is None):
+            problems.append(f"{name}: a proxied lookup that is synthetic, or with the proxy off")
+            continue
+        if e.get("transport") != "proxy" and \
+                (e.get("synthetic") is True) != (name in synth and rule in ("policy_match", "exact_name")):
             problems.append(f"{name}: {'answered with' if e.get('synthetic') else 'not answered with'} "
                             f"a synthetic address, but the policy allows it "
                             f"{'off' if name not in synth else 'only on'} the proxied ports")
@@ -1112,6 +1172,7 @@ def main(argv=None):
     if (meta.get("run_start", {}).get("host_name_rules") is True) != names_policy:
         problems.append("run_start's host_name_rules does not match the policy file")
     handoff_ids, handoffs = set(), 0     # v1.26: connects handed to the proxy
+    proxied_ok = 0                       # v1.26: proxied names allowed
     view_recs = []                       # (rec, flags): asked of the policy below
     others = []                          # (rec, decided rule, other candidates)
     ancestors = None
@@ -1207,12 +1268,16 @@ def main(argv=None):
         is_open = rec.get("action") == "file.open" and rec.get("rule") in AUTHORIZED_OPEN_RULES
         is_meta = rec.get("action") in META_ACTIONS and rec.get("rule") in META_RULES
         is_conn = rec.get("action") == "net.connect" and rec.get("rule") in CONNECT_RULES
-        if not (is_open or is_meta or is_conn):
+        # v1.26 (step 6): a name:port the proxy read, allowed: certified as a connect is
+        is_proxy = rec.get("action") == "net.proxy" and rec.get("rule") in PROXY_ALLOW_RULES
+        if not (is_open or is_meta or is_conn or is_proxy):
             problems.append(f"seq {rec.get('seq')}: an authorization that is not a certified "
                             f"file open, lookup or connect ({rec.get('action')}, rule {rec.get('rule')})")
             continue
         if is_meta:
             lookups += 1
+        elif is_proxy:
+            proxied_ok += 1
         elif is_conn:
             connects += 1
             # v1.26: with the proxy on, the synthetic range is the Warden's: no
@@ -1234,6 +1299,10 @@ def main(argv=None):
         if not isinstance(s, str):
             problems.append(f"seq {rec.get('seq')}: a malformed decided destination or path")
             continue
+        if is_proxy:
+            is_conn_like = True
+        else:
+            is_conn_like = is_conn
         if is_conn and names_policy and not str(rec.get("target", "")).startswith("unix:") \
                 and "candidates" not in rec and "candidates_sha256" not in rec:
             # v1.24 review: every connect in a run with name rules is decided
@@ -1241,7 +1310,7 @@ def main(argv=None):
             problems.append(f"seq {rec.get('seq')}: a connect in a run with host name rules, "
                             f"recorded without its candidates")
             continue
-        if is_conn:
+        if is_conn_like:
             fl = "0x0"                   # host rules carry no flag clause
             if not s:
                 problems.append(f"seq {rec.get('seq')}: authorized connect without the "
@@ -1258,7 +1327,7 @@ def main(argv=None):
         if " " in cw or not cw:
             problems.append(f"seq {rec.get('seq')}: malformed certificate witness")
             continue
-        lines.append(f"{'host' if is_conn else 'path'} {fl} {hx} {cr} {cw}")
+        lines.append(f"{'host' if is_conn_like else 'path'} {fl} {hx} {cr} {cw}")
         which.append(rec)
         if is_conn and ("candidates" in rec or "candidates_sha256" in rec):
             try:
@@ -1327,6 +1396,12 @@ def main(argv=None):
                         if early:
                             problems.append(f"seq {rec.get('seq')}: rule {early[0]} holds on candidate "
                                             f"{c!r}, before the rule that decided the connect")
+    # v1.26 (step 6): the Warden's decisions on what the proxy read
+    handoff_all = {r.get("proxy_conn") for r in records
+                   if r.get("proxy_handoff") is True and type(r.get("proxy_conn")) is int}
+    proxied = check_proxied(records, resolutions, handoff_all, problems)
+    if proxied and proxy_ports is None:
+        problems.append("proxied decisions, but the policy does not turn the proxy on")
     # v1.26: every connection id the Warden gave a hand-off is recorded once
     if complete and handoff_ids and handoff_ids != set(range(1, len(handoff_ids) + 1)):
         problems.append(f"the hand-offs' connection ids are not 1 to {len(handoff_ids)}: one is missing")
@@ -1334,6 +1409,7 @@ def main(argv=None):
           f"{len(records)} records, {authorized} authorized file opens, {lookups} lookups, "
           f"{connects} authorized connects, "
           f"{views} host-name views, {stubs} stub resolver connects, {handoffs} proxy hand-offs, "
+          f"{proxied} proxied decisions ({proxied_ok} allowed), "
           f"{questions} stub questions ({budget_hits} over a budget), "
           f"{checked} certificates "
           f"re-checked, {refused} refused in-line")

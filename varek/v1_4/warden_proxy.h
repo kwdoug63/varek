@@ -67,9 +67,10 @@ struct wp_req {
     char     why[96];            /* NUL-terminated */
 };
 
-/* Warden -> proxy: the decision on a WP_MSG_REQUEST. Step 5: allow is always
- * 0, and the proxy refuses (a TLS handshake_failure alert, or an HTTP 403).
- * Step 6 sends the dialed socket with it. */
+/* Warden -> proxy: the decision on a WP_MSG_REQUEST. allow 1 carries the
+ * socket the Warden dialed (SCM_RIGHTS): the proxy sends it what the client
+ * sent and relays both ways. allow 0: the proxy refuses the client (a TLS
+ * handshake_failure alert, or an HTTP 403). */
 struct wp_verdict {
     uint32_t type;               /* WP_MSG_VERDICT */
     uint32_t allow;
@@ -77,7 +78,7 @@ struct wp_verdict {
 };
 
 #define WP_READ_MS       10000   /* a whole request within this, or refused */
-#define WP_VERDICT_MS    30000   /* the Warden's verdict within this, or refused */
+#define WP_VERDICT_MS    60000   /* the Warden's verdict within this, or refused */
 #define WP_MAX_ANNOUNCED 1024    /* announcements not yet accepted */
 #define WP_ANNOUNCE_MS   10000   /* an announcement not accepted by then is dropped */
 #define WP_MAX_HELD      1024    /* connections the proxy holds */

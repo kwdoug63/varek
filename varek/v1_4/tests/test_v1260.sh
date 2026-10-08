@@ -32,9 +32,17 @@
 #      ASan and UBSan (tests/proxy_parse_test), real ClientHellos (Python,
 #      openssl s_client, curl, node where present) read for their SNI; then
 #      (as root) through the proxy: a ClientHello's SNI, an HTTP Host and a
-#      CONNECT's name reported to the Warden (refused until step 6, with a TLS
-#      alert or a 403), a ClientHello without SNI, junk, and a CONNECT that
-#      sends nothing more refused by the proxy itself
+#      CONNECT's name reported to the Warden and decided (refused here, by a
+#      policy that allows none of them: a TLS alert or a 403), a ClientHello
+#      without SNI, junk, and a CONNECT that sends nothing more refused by the
+#      proxy itself
+#   6. the decision (as root): names the policy allows are decided and
+#      certified, resolved (a wildcard's name on demand, charged to its
+#      budgets), dialed and relayed: HTTP, TLS and TLS inside CONNECT; refused:
+#      a Host other than the name connected to, a name the policy does not
+#      allow, one that resolves only to loopback or to an address a rule
+#      denies, and one past its wildcard's names budget; the audit accepts the
+#      run and refuses forged proxied decisions
 #
 # Usage: test_v1260.sh <vdp_check> <vdp_cert_check> [<warden>]
 # (section 5 also uses tests/proxy_parse_test: make tests/proxy_parse_test)
@@ -476,32 +484,188 @@ raw("idle", b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n", b"", wait=12)
 PY
     chmod 644 "$W/agent.py"
     POLP="$OUT/parse.policy"
-    printf 'require warden 1.26\nproxy on\nallow host api.example.com:443\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path /etc/ssl/ readonly\nallow path %s/ readonly\n' "$W" > "$POLP"
+    # no rule allows the names asked for: each request is read and refused
+    printf 'require warden 1.26\nproxy on\nallow host unused.example.com:443\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path /etc/ssl/ readonly\nallow path %s/ readonly\n' "$W" > "$POLP"
     env -i PATH=/usr/bin:/bin timeout 90 "$WARDEN" "$POLP" -- /usr/bin/python3 "$W/agent.py" > "$OUT/p.out" 2> "$OUT/p.log"
     sed 's/^/     /' "$OUT/p.out" | cut -c1-120
     grep 'proxy: connection' "$OUT/p.log" | sed 's/^/     /'
+    pxrec() { grep '"action":"net.proxy"' "$OUT/p.log" | grep "\"proxy_conn\":$1,\"proxy_kind\":\"$2\"" | grep -q "\"target\":\"$3\",\"resolved\":\"$3\",\"decision_raw\":\"UNKNOWN\",\"decision_final\":\"DENY\""; }
     OK200=$(printf 'HTTP/1.1 200 Connection established\r\n\r\n' | od -An -tx1 | tr -d ' \n')
     ALERT=15030300020228                  # a fatal handshake_failure alert
-    check "a ClientHello's SNI is read and reported to the Warden" \
-        grep -q 'proxy: connection 1 asks for api.example.com:443 (tls)' "$OUT/p.log"
-    check "and, until the decision (step 6), refused with a handshake_failure alert" \
+    check "a ClientHello's SNI is read, and decided by the Warden (a net.proxy record)" \
+        pxrec 1 tls api.example.com:443
+    check "and, refused by the policy, answered with a handshake_failure alert" \
         grep -q '^TLS api.example.com ALERT$' "$OUT/p.out"
     check "a ClientHello without SNI is refused by the proxy" \
         sh -c "grep -q 'proxy: connection 2 (tls) refused by the proxy: no SNI' '$OUT/p.log' && grep -q '^TLS None ALERT$' '$OUT/p.out'"
-    check "an HTTP request's Host is reported, and refused with a 403" \
-        sh -c "grep -q 'proxy: connection 3 asks for api.example.com:443 (http)' '$OUT/p.log' && grep -q '^RAW http $(printf 'HTTP/1.1 403' | od -An -tx1 | tr -d ' \n')' '$OUT/p.out'"
-    check "a CONNECT is answered 200, and the name is reported once the ClientHello inside agrees" \
-        sh -c "grep -q 'proxy: connection 4 asks for api.example.com:443 (connect)' '$OUT/p.log' && grep -q '^RAW connect $OK200$ALERT$' '$OUT/p.out'"
+    check "an HTTP request's Host is decided, and refused with a 403" \
+        sh -c "$(declare -f pxrec); OUT='$OUT'; pxrec 3 http api.example.com:443 && grep -q '^RAW http $(printf 'HTTP/1.1 403' | od -An -tx1 | tr -d ' \n')' '$OUT/p.out'"
+    check "a CONNECT is answered 200, and the name is decided once the ClientHello inside agrees" \
+        sh -c "$(declare -f pxrec); OUT='$OUT'; pxrec 4 connect api.example.com:443 && grep -q '^RAW connect $OK200$ALERT$' '$OUT/p.out'"
     check "a CONNECT whose ClientHello names another host is refused by the proxy" \
         sh -c "grep -q 'proxy: connection 5 (connect) refused by the proxy: an SNI that is not the CONNECT target' '$OUT/p.log' && grep -q '^RAW connect-other $OK200$ALERT$' '$OUT/p.out'"
     check "neither TLS nor HTTP: closed by the proxy" \
         sh -c "grep -q 'proxy: connection 6 (none) refused by the proxy: neither TLS nor HTTP' '$OUT/p.log' && grep -q '^RAW junk $' '$OUT/p.out'"
     check "a client that sends nothing more is refused after 10 s" \
         grep -q 'proxy: connection 7 (connect) refused by the proxy: no whole request within 10 s' "$OUT/p.log"
-    check "the names, not the bytes, reach the Warden: nothing else from the proxy in the log" \
-        sh -c "[ \$(grep -c 'proxy: connection' '$OUT/p.log') = 7 ]"
+    check "the names, not the bytes, reach the Warden: three decisions and four refusals by the proxy" \
+        sh -c "[ \$(grep -c '\"action\":\"net.proxy\"' '$OUT/p.log') = 3 ] && [ \$(grep -c 'proxy: connection' '$OUT/p.log') = 4 ]"
     check "the audit accepts the run" \
         python3 "$HERE/tools/varek_audit.py" --policy "$POLP" --checker "$CERT" "$OUT/p.log"
+    rm -rf "$W"
+fi
+
+echo "== 6. the decision =="
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ] || ! command -v openssl > /dev/null; then
+    skip "the decision (needs root, the warden binary and openssl)"
+else
+    W=/tmp/varek_v1260d
+    rm -rf "$W"; mkdir -p "$W"; chmod 755 "$W"
+    # a name never leads to loopback: the servers listen on this machine's own address
+    HOSTIP=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("10.255.255.255", 1)); print(s.getsockname()[0])')
+    HP=$((40000 + RANDOM % 5000)); TP=$((HP + 1))
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$OUT/key.pem" -out "$OUT/cert.pem" -days 1 \
+        -subj /CN=api.example.com > /dev/null 2>&1
+    python3 - "$HOSTIP" "$TP" "$OUT/cert.pem" "$OUT/key.pem" <<'PY' > "$OUT/tlssrv.out" 2>&1 &
+import socket, ssl, sys, threading
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(sys.argv[3], sys.argv[4])
+def sni(sock, name, c):
+    sock.seen = name                      # the SNI the server received
+ctx.sni_callback = sni
+l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+l.bind((sys.argv[1], int(sys.argv[2]))); l.listen(16)
+def serve(c):
+    try:
+        s = ctx.wrap_socket(c, server_side=True)
+        s.recv(1000)
+        body = ("tls-ok " + str(getattr(s, "seen", None))).encode()
+        s.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
+        s.close()
+    except Exception as e:
+        print("srv", e, flush=True)
+while True:
+    c, _ = l.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
+PY
+    SRV="$!"
+    mkdir -p "$OUT/www"; echo "http-ok" > "$OUT/www/x.txt"
+    python3 -m http.server "$HP" --bind "$HOSTIP" --directory "$OUT/www" > /dev/null 2>&1 &
+    SRV="$SRV $!"
+    PORT=$((20000 + RANDOM % 20000))
+    printf '{"api.example.com": {"ttl": 30, "a": ["%s"]}, "a.svc.example.com": {"ttl": 30, "a": ["%s"]}, "b.svc.example.com": {"ttl": 30, "a": ["%s"]}, "lo.example.com": {"ttl": 30, "a": ["127.0.0.1"]}, "den.example.com": {"ttl": 30, "a": ["192.0.2.77"]}}\n' \
+        "$HOSTIP" "$HOSTIP" "$HOSTIP" > "$OUT/zone6.json"
+    rm -f "$OUT/ready6"
+    python3 "$HERE/tests/dns_test_server.py" --port "$PORT" --zone "$OUT/zone6.json" --log "$OUT/q6.log" \
+        --ready "$OUT/ready6" > /dev/null 2>&1 &
+    SRV="$SRV $!"
+    for _ in $(seq 50); do
+        [ -e "$OUT/ready6" ] && python3 -c "import socket; socket.create_connection(('$HOSTIP', $HP), 0.2); socket.create_connection(('$HOSTIP', $TP), 0.2)" 2>/dev/null && break
+        sleep 0.1
+    done
+    cat > "$W/agent.py" <<'PY'
+import socket, ssl, sys, urllib.request
+HP, TP = int(sys.argv[1]), int(sys.argv[2])
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+def body(s):
+    out = b""
+    while True:
+        d = s.recv(4096)
+        if not d: break
+        out += d
+    return out.split(b"\r\n\r\n", 1)[-1].decode(errors="replace")
+def http(tag, name, host=None):
+    try:
+        s = socket.create_connection((name, HP), 10)
+        s.sendall(b"GET /x.txt HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % (host or name).encode())
+        out = b""
+        while True:
+            d = s.recv(4096)
+            if not d: break
+            out += d
+        print("HTTP", tag, out.split(b"\r\n")[0].decode(), out.split(b"\r\n\r\n", 1)[-1].decode().strip(), flush=True)
+    except OSError as e:
+        print("HTTP", tag, "ERR", e, flush=True)
+def tls(tag, name):
+    try:
+        s = ctx.wrap_socket(socket.create_connection((name, TP), 10), server_hostname=name)
+        s.sendall(b"GET / HTTP/1.1\r\nHost: %s\r\n\r\n" % name.encode())
+        print("TLS", tag, body(s), flush=True)
+    except ssl.SSLError as e:
+        print("TLS", tag, "ALERT" if "HANDSHAKE_FAILURE" in str(e).upper() else "SSLERR", flush=True)
+    except OSError as e:
+        print("TLS", tag, "ERR", e, flush=True)
+def connect(tag, name):
+    try:
+        s = socket.create_connection((name, TP), 10)
+        s.sendall(b"CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n" % (name.encode(), TP, name.encode(), TP))
+        r = b""
+        while b"\r\n\r\n" not in r:
+            d = s.recv(1)
+            if not d: break
+            r += d
+        t = ctx.wrap_socket(s, server_hostname=name)
+        t.sendall(b"GET / HTTP/1.1\r\nHost: %s\r\n\r\n" % name.encode())
+        print("CONNECT", tag, body(t), flush=True)
+    except (OSError, ssl.SSLError) as e:
+        print("CONNECT", tag, "ERR", type(e).__name__, flush=True)
+try:
+    print("URLLIB", urllib.request.urlopen("http://api.example.com:%d/x.txt" % HP, timeout=10).read().decode().strip(), flush=True)
+except Exception as e:
+    print("URLLIB ERR", e, flush=True)
+http("other-host", "api.example.com", "other.example.com")
+tls("exact", "api.example.com")
+tls("wild", "a.svc.example.com")
+tls("wild-again", "a.svc.example.com")
+tls("wild-nx", "c.svc.example.com")
+tls("wild-over", "b.svc.example.com")
+tls("loopback", "lo.example.com")
+tls("denied-addr", "den.example.com")
+connect("connect", "api.example.com")
+PY
+    chmod 644 "$W/agent.py"
+    POL6="$OUT/decide.policy"
+    { printf 'require warden 1.26\nproxy on\nproxy ports %s %s\n' "$HP" "$TP"
+      printf 'allow host api.example.com:%s\nallow host api.example.com:%s\n' "$HP" "$TP"
+      printf 'allow host lo.example.com:%s\ndeny host 192.0.2.77:%s\nallow host den.example.com:%s\n' "$TP" "$TP" "$TP"
+      printf 'allow host *.svc.example.com:%s acknowledge=dns-channel names=2\n' "$TP"
+      printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path /etc/ssl/ readonly\nallow path %s/ readonly\n' "$W"
+    } > "$POL6"
+    env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$POL6" --dns-server "127.0.0.1:$PORT" -- \
+        /usr/bin/python3 "$W/agent.py" "$HP" "$TP" > "$OUT/d.out" 2> "$OUT/d.log"
+    sed 's/^/     /' "$OUT/d.out"
+    px() {  # px <target> <rule>: the net.proxy record for target, decided by rule
+        grep '"action":"net.proxy"' "$OUT/d.log" | grep -q "\"target\":\"$1\",.*\"rule\":\"$2\""; }
+    check "HTTP by name (urllib): decided, certified, dialed and relayed" \
+        sh -c "grep -q '^URLLIB http-ok$' '$OUT/d.out' && grep '\"action\":\"net.proxy\"' '$OUT/d.log' | grep -q '\"target\":\"api.example.com:$HP\",\"resolved\":\"api.example.com:$HP\",\"decision_raw\":\"ALLOW\",\"decision_final\":\"ALLOW\",\"rule\":\"proxy_dialed\",.*\"check\":\"ok\",\"dialed\":\"$HOSTIP:$HP\",\"proxy_conn\":1,\"proxy_kind\":\"http\"'"
+    check "a Host other than the name connected to is decided on the Host, and refused (403)" \
+        sh -c "grep -q '^HTTP other-host HTTP/1.1 403 Forbidden' '$OUT/d.out' && grep '\"action\":\"net.proxy\"' '$OUT/d.log' | grep -q '\"target\":\"other.example.com:$HP\",.*\"decision_final\":\"DENY\"'"
+    check "TLS by an exact name: relayed to the server, which saw the SNI" \
+        sh -c "grep -q '^TLS exact tls-ok api.example.com$' '$OUT/d.out' && grep '\"action\":\"net.proxy\"' '$OUT/d.log' | grep -q '\"target\":\"api.example.com:$TP\",.*\"rule\":\"proxy_dialed\",.*\"proxy_kind\":\"tls\"'"
+    check "TLS by a name a wildcard allows: looked up on demand (charged, a proxy question), relayed" \
+        sh -c "grep -q '^TLS wild tls-ok a.svc.example.com$' '$OUT/d.out' && grep -q '\"event\":\"dns_question\",\"run\":\"[0-9a-f]*\",\"name\":\"a.svc.example.com\",\"type\":1,\"transport\":\"proxy\",\"rule\":\"policy_match\",\"policy_line\":9,\"new\":true,\"upstream\":true,\"answer\":\"lookup\"' '$OUT/d.log' && grep -q '\"name\":\"a.svc.example.com\".*\"dynamic\":true' '$OUT/d.log'"
+    check "and asked again within its TTL: not looked up or charged again" \
+        sh -c "grep -q '^TLS wild-again tls-ok a.svc.example.com$' '$OUT/d.out' && [ \$(grep -c '\"transport\":\"proxy\",[^}]*\"name\":\"a.svc\|\"name\":\"a.svc.example.com\",\"type\":1,\"transport\":\"proxy\"' '$OUT/d.log') = 1 ]"
+    check "a wildcard's name that does not resolve: refused (resolution_failed)" \
+        sh -c "grep -q '^TLS wild-nx ALERT$' '$OUT/d.out' && grep '\"action\":\"net.proxy\"' '$OUT/d.log' | grep -q '\"target\":\"c.svc.example.com:$TP\",.*\"rule\":\"resolution_failed\"'"
+    check "a name past its wildcard's names budget: refused, nothing looked up (wildcard_budget)" \
+        sh -c "grep -q '^TLS wild-over ALERT$' '$OUT/d.out' && grep '\"action\":\"net.proxy\"' '$OUT/d.log' | grep -q '\"target\":\"b.svc.example.com:$TP\",.*\"rule\":\"wildcard_budget\"' && ! grep -q 'b.svc.example.com' '$OUT/q6.log'"
+    check "a name that resolves only to loopback: refused (address_refused)" \
+        sh -c "grep -q '^TLS loopback ALERT$' '$OUT/d.out' && grep '\"action\":\"net.proxy\"' '$OUT/d.log' | grep -q '\"target\":\"lo.example.com:$TP\",.*\"rule\":\"address_refused\"'"
+    check "a name whose only address a rule denies: refused (address_refused)" \
+        sh -c "grep -q '^TLS denied-addr ALERT$' '$OUT/d.out' && grep '\"action\":\"net.proxy\"' '$OUT/d.log' | grep -q '\"target\":\"den.example.com:$TP\",.*\"rule\":\"address_refused\"'"
+    check "TLS inside CONNECT: decided on the CONNECT's name, relayed" \
+        sh -c "grep -q '^CONNECT connect tls-ok api.example.com$' '$OUT/d.out' && grep '\"action\":\"net.proxy\"' '$OUT/d.log' | grep -q '\"target\":\"api.example.com:$TP\",.*\"rule\":\"proxy_dialed\",.*\"proxy_kind\":\"connect\"'"
+    check "the audit accepts the run" \
+        python3 "$HERE/tools/varek_audit.py" --policy "$POL6" --checker "$CERT" "$OUT/d.log"
+    forge "$OUT/d.log" "$OUT/e1.log" "\"dialed\":\"$HOSTIP:$TP\"" '"dialed":"192.0.2.99:'"$TP"'"'
+    refuses "a proxied connection dialed to an address the name does not have" "$POL6" "$OUT/e1.log" "does not list"
+    forge "$OUT/d.log" "$OUT/e2.log" "\"dialed\":\"$HOSTIP:$TP\"" '"dialed":"127.0.0.1:'"$TP"'"'
+    refuses "a proxied connection dialed to loopback" "$POL6" "$OUT/e2.log" "a special or synthetic address"
+    forge "$OUT/d.log" "$OUT/e3.log" '"proxy_conn":1,"proxy_kind"' '"proxy_conn":99,"proxy_kind"'
+    refuses "a proxied decision for no hand-off" "$POL6" "$OUT/e3.log" "which is not a hand-off"
+    forge "$OUT/d.log" "$OUT/e4.log" "\"target\":\"api.example.com:$TP\",\"resolved\":\"api.example.com:$TP\"" \
+                                     "\"target\":\"evil.example.com:$TP\",\"resolved\":\"evil.example.com:$TP\""
+    refuses "a proxied decision for a name the policy does not allow" "$POL6" "$OUT/e4.log" "certificate for 'evil.example.com:"
+    kill $SRV 2>/dev/null
     rm -rf "$W"
 fi
 

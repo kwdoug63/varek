@@ -1,0 +1,359 @@
+/* ---------------- v1.26: the Warden's decisions for the proxy (plan step 6) ----------------
+ *
+ * docs/security/v1.26-egress-proxy.md, "Implementation plan", step 6.
+ * Included by warden.c after warden_synth.inc.c.
+ *
+ * The proxy reports what a handed-off connection asks for: a kind (tls, http,
+ * connect), a host name and a port (WP_MSG_REQUEST). The Warden:
+ *
+ *   1. decides name:port with the decision procedure, and has the
+ *      certificate checker accept the certificate, as for a connect;
+ *   2. finds the name's addresses in the resolution table. An exact name is
+ *      there (resolved at startup, refreshed at its TTL); a name a wildcard
+ *      rule allows is added when first asked for, and every lookup sent
+ *      upstream for it is charged to that rule's budgets as the stub charges
+ *      a question (a dns_question record with "transport":"proxy");
+ *   3. dials the first address it may: not a special address (loopback,
+ *      link-local, metadata, ...), not a synthetic one, and not one a rule
+ *      denies (decided as addr:port); IPv4 first, each for up to PX_DIAL_MS,
+ *      at most PX_MAX_TRIES of them, without blocking (a dial waits in the
+ *      supervise loop);
+ *   4. passes the connected socket to the proxy (SCM_RIGHTS, WP_MSG_VERDICT
+ *      allow), which sends what the client sent and then relays both ways;
+ *      or answers allow 0, and the proxy refuses the client.
+ *
+ * Each request is one record, written when its outcome is known:
+ *   "action":"net.proxy", "target" and "resolved" name:port, the decision and
+ *   its certificate, "proxy_conn" (the hand-off's id), "proxy_kind", and,
+ *   once dialed, "dialed" (addr:port). Rules: proxy_dialed (ALLOW, passed to
+ *   the proxy), proxy_dial_failed (ALLOW, nothing could be reached),
+ *   policy_match / default_deny_unknown (refused by the policy),
+ *   certificate_refused, wildcard_budget (a budget would be exceeded),
+ *   resolution_failed (no address), address_refused (every address special,
+ *   synthetic or denied). */
+
+#define PX_MAX_DIAL   64                 /* requests waiting on a lookup or a dial */
+#define PX_DIAL_MS    5000               /* per address */
+#define PX_MAX_TRIES  4                  /* addresses tried per request */
+#define PX_LOOKUP_MS  15000              /* a lookup the resolver helper has not answered */
+
+struct px_req {
+    bool          used;
+    uint64_t      id;
+    uint32_t      kind;                  /* pp_kind_t */
+    char          name[WR_NAME_MAX + 1];
+    unsigned      port;
+    int           entry;                 /* in g_names */
+    int           sock;                  /* the dial in progress, or -1 (waiting on the lookup) */
+    int           tries;
+    int64_t       deadline;              /* this dial's, or the lookup's (monotonic ms) */
+    wr_ip_t       tried[PX_MAX_TRIES];
+    struct timespec t0;
+    struct action *a;                    /* the record being built */
+};
+static struct px_req g_px[PX_MAX_DIAL];
+
+static void px_record(struct px_req *q, decision_t d_raw, decision_t d_final, const char *rule, int err) {
+    size_t el = strlen(q->a->extra);
+    snprintf(q->a->extra + el, sizeof q->a->extra - el, "\"proxy_conn\":%llu,\"proxy_kind\":\"%s\",",
+             (unsigned long long)q->id, pp_kind_name((pp_kind_t)q->kind));
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    emit_pathology(g_report_seq++, 0, q->a, d_raw, d_final, rule, ns_between(&q->t0, &t1), err);
+}
+
+static void px_free(struct px_req *q) {
+    if (q->sock >= 0) close(q->sock);
+    free(q->a);
+    memset(q, 0, sizeof *q);
+    q->sock = -1;
+}
+
+/* Refuse request q (the proxy refuses the client) and record it. */
+static void px_refuse(struct px_req *q, decision_t d_raw, const char *rule, int err) {
+    (void)wp_verdict(&g_proxy, q->id, false);
+    px_record(q, d_raw, DEC_DENY, rule, err);
+    px_free(q);
+}
+
+/* Pass the connected socket s to the proxy for request q. */
+static int px_pass(uint64_t id, int s) {
+    struct wp_verdict m = { .type = WP_MSG_VERDICT, .allow = 1, .id = id };
+    union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
+    memset(&cb, 0, sizeof cb);
+    struct iovec v = { &m, sizeof m };
+    struct msghdr mh = { .msg_iov = &v, .msg_iovlen = 1, .msg_control = cb.b, .msg_controllen = sizeof cb.b };
+    struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &s, sizeof s);
+    return sendmsg(g_proxy.ctl, &mh, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t)sizeof m ? 0 : -1;
+}
+
+/* The next address of q's entry to dial, or false. Counts what was passed
+ * over, so the record can say why none was dialed. */
+static bool px_next_addr(const struct policy *p, struct px_req *q, wr_ip_t *out, int *nskipped) {
+    const wr_entry_t *e = &g_names.e[q->entry];
+    for (int fam = 4; fam <= 6; fam += 2)
+        for (size_t k = 0; k < e->n; k++) {
+            const wr_ip_t *ip = &e->addrs[k].ip;
+            if (e->addrs[k].until_ms != 0 || ip->fam != fam) continue;
+            bool done = false;
+            for (int t = 0; t < q->tries; t++)
+                if (!memcmp(&q->tried[t], ip, sizeof *ip)) done = true;
+            if (done) continue;
+            if (wr_special_address(ip) || syn_is_addr(ip)) { (*nskipped)++; continue; }
+            /* a rule that denies the address itself holds (decided as addr:port) */
+            struct action na;
+            memset(&na, 0, sizeof na);
+            na.kind = ACT_NET_CONNECT;
+            char at[INET6_ADDRSTRLEN];
+            wr_ip_str(ip, at, sizeof at);
+            snprintf(na.resolved, sizeof na.resolved, fam == 6 ? "[%s]:%u" : "%s:%u", at, q->port);
+            if (policy_decide(p, &na) == DEC_DENY && na.rule_index >= 0) { (*nskipped)++; continue; }
+            *out = *ip;
+            return true;
+        }
+    return false;
+}
+
+/* Dial q's next address, or finish q if there is none. */
+static void px_dial(const struct policy *p, struct px_req *q) {
+    for (;;) {
+        wr_ip_t ip;
+        int skipped = 0;
+        if (q->tries >= PX_MAX_TRIES || !px_next_addr(p, q, &ip, &skipped)) {
+            (void)wp_verdict(&g_proxy, q->id, false);
+            if (q->tries) px_record(q, DEC_ALLOW, DEC_ALLOW, "proxy_dial_failed", ECONNREFUSED);
+            else px_record(q, DEC_ALLOW, DEC_DENY, skipped ? "address_refused" : "resolution_failed", EACCES);
+            px_free(q);
+            return;
+        }
+        q->tried[q->tries++] = ip;
+        struct sockaddr_storage ss;
+        memset(&ss, 0, sizeof ss);
+        socklen_t sl;
+        char at[INET6_ADDRSTRLEN];
+        wr_ip_str(&ip, at, sizeof at);
+        if (ip.fam == 4) {
+            struct sockaddr_in *d = (struct sockaddr_in *)&ss;
+            d->sin_family = AF_INET;
+            d->sin_port = htons((uint16_t)q->port);
+            memcpy(&d->sin_addr, ip.a, 4);
+            sl = sizeof *d;
+        } else {
+            struct sockaddr_in6 *d = (struct sockaddr_in6 *)&ss;
+            d->sin6_family = AF_INET6;
+            d->sin6_port = htons((uint16_t)q->port);
+            memcpy(&d->sin6_addr, ip.a, 16);
+            sl = sizeof *d;
+        }
+        size_t el = strlen(q->a->extra);
+        /* the last address tried is the one the record names */
+        char *dp = strstr(q->a->extra, "\"dialed\":");
+        if (dp) { *dp = '\0'; el = strlen(q->a->extra); }
+        snprintf(q->a->extra + el, sizeof q->a->extra - el, ip.fam == 6 ? "\"dialed\":\"[%s]:%u\"," :
+                 "\"dialed\":\"%s:%u\",", at, q->port);
+        int s = socket(ss.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (s < 0) continue;
+        if (connect(s, (struct sockaddr *)&ss, sl) == 0 || errno == EINPROGRESS) {
+            q->sock = s;
+            q->deadline = wr_now_ms() + PX_DIAL_MS;
+            return;
+        }
+        close(s);
+    }
+}
+
+/* The dial of q finished (so_error 0: connected). */
+static void px_dialed(const struct policy *p, struct px_req *q, int so_error) {
+    if (so_error) {
+        close(q->sock);
+        q->sock = -1;
+        px_dial(p, q);
+        return;
+    }
+    if (px_pass(q->id, q->sock) < 0) {
+        (void)wp_verdict(&g_proxy, q->id, false);
+        px_record(q, DEC_ALLOW, DEC_ALLOW, "proxy_dial_failed", EIO);
+    } else {
+        px_record(q, DEC_ALLOW, DEC_ALLOW, "proxy_dialed", 0);
+    }
+    px_free(q);
+}
+
+/* Entry q->entry has addresses to use, or a lookup to wait for. */
+static void px_resolve(const struct policy *p, struct px_req *q) {
+    const wr_entry_t *e = &g_names.e[q->entry];
+    bool fresh = !e->dynamic || wr_entry_fresh(e, wr_now_ms());
+    bool have = false;
+    for (size_t k = 0; k < e->n; k++) if (e->addrs[k].until_ms == 0) have = true;
+    if (fresh && (have || !e->pending)) { px_dial(p, q); return; }
+    q->deadline = wr_now_ms() + PX_LOOKUP_MS;          /* waits for px_resolved */
+}
+
+/* A request from the proxy. */
+static void px_request(const struct policy *p, const struct wp_req *m) {
+    struct px_req *q = NULL;
+    for (int k = 0; k < PX_MAX_DIAL; k++) if (!g_px[k].used) { q = &g_px[k]; break; }
+    struct action *a = calloc(1, sizeof *a);
+    if (!q || !a) {
+        free(a);
+        (void)wp_verdict(&g_proxy, m->id, false);
+        log_line_start();
+        fprintf(g_log, "[warden] proxy: connection %llu refused: %d requests already waiting\n",
+                (unsigned long long)m->id, PX_MAX_DIAL);
+        return;
+    }
+    memset(q, 0, sizeof *q);
+    q->used = true;
+    q->id = m->id;
+    q->kind = m->kind;
+    q->port = m->port;
+    q->sock = -1;
+    q->entry = -1;
+    q->a = a;
+    snprintf(q->name, sizeof q->name, "%s", m->name);
+    clock_gettime(CLOCK_MONOTONIC, &q->t0);
+    a->kind = ACT_NET_PROXY;
+    a->policy_line = -1;
+    snprintf(a->target, sizeof a->target, "%s:%u", q->name, q->port);
+    snprintf(a->resolved, sizeof a->resolved, "%s:%u", q->name, q->port);
+    decision_t d_raw = policy_decide(p, a);
+    if (d_raw != DEC_ALLOW) { px_refuse(q, d_raw, decision_rule_id(a, d_raw), EACCES); return; }
+    if (!certify(p, a)) {
+        log_line_start();
+        fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n", g_records, a->check_why);
+        px_refuse(q, d_raw, "certificate_refused", EACCES);
+        return;
+    }
+    int i = wr_table_find(&g_names, q->name);
+    if (i >= 0 && g_names.e[i].unlisted) i = -1;         /* only a deny rule names it */
+    if (i >= 0 && !g_names.e[i].dynamic) {                /* an exact name */
+        q->entry = i;
+        const wr_entry_t *e = &g_names.e[i];
+        bool have = false;
+        for (size_t k = 0; k < e->n; k++) if (e->addrs[k].until_ms == 0) have = true;
+        if (!have && !e->pending && wr_async_request(&g_names, (size_t)i) < 0) {
+            px_refuse(q, d_raw, "resolution_failed", EACCES);
+            return;
+        }
+        px_resolve(p, q);
+        return;
+    }
+    /* A name a wildcard allows: looked up through the resolver helper, each
+     * lookup sent upstream charged to the wildcard rule as the stub charges a
+     * question (warden_stub.inc.c), and recorded as one. */
+    stub_budget_init(p);
+    g_stub_now = wr_now_ms();
+    int ri = stub_name_rule(p, q->name);
+    int line = ri >= 0 ? p->v.rules[ri].line : -1;
+    struct stub_budget *bud = ri >= 0 && p->v.rules[ri].s.wild ? stub_budget_of(ri) : NULL;
+    if (ri < 0 || !p->v.rules[ri].s.wild) { px_refuse(q, d_raw, "resolution_failed", EACCES); return; }
+    bool isnew = i < 0;
+    if (isnew) {
+        const char *over = stub_charge(bud, q->name, g_stub_now, true);
+        if (over) {
+            stub_record(q->name, 1, -2, "wildcard_budget", line, over, 0, "nxdomain", NULL);
+            px_refuse(q, d_raw, "wildcard_budget", EACCES);
+            return;
+        }
+        if (g_stub_dyn >= STUB_MAX_DYN || (i = wr_table_add_dynamic(&g_names, q->name)) < 0) {
+            stub_uncharge(bud, true);
+            px_refuse(q, d_raw, "resolution_failed", EACCES);
+            return;
+        }
+        g_stub_dyn++;
+    }
+    q->entry = i;
+    const wr_entry_t *e = &g_names.e[i];
+    if (!isnew && wr_entry_fresh(e, g_stub_now)) { px_resolve(p, q); return; }
+    bool send_up = !e->pending;
+    if (send_up && !isnew) {
+        const char *over = stub_charge(bud, q->name, g_stub_now, false);
+        if (over) {
+            stub_record(q->name, 1, -2, "wildcard_budget", line, over, 0, "nxdomain", NULL);
+            px_refuse(q, d_raw, "wildcard_budget", EACCES);
+            return;
+        }
+    }
+    if (send_up && wr_async_request(&g_names, (size_t)i) < 0) {
+        stub_uncharge(bud, isnew);
+        stub_record(q->name, 1, -2, "policy_match", line, NULL, isnew ? STUB_NEW : 0, "servfail", NULL);
+        px_refuse(q, d_raw, "resolution_failed", EACCES);
+        return;
+    }
+    stub_record(q->name, 1, -2, "policy_match", line, NULL,
+                (isnew ? STUB_NEW : 0) | (send_up ? STUB_UPSTREAM : 0), "lookup", NULL);
+    q->deadline = wr_now_ms() + PX_LOOKUP_MS;
+}
+
+/* The resolver helper answered entry i (emit_resolution). */
+static void px_resolved(size_t i) {
+    if (!g_syn_p) return;
+    for (int k = 0; k < PX_MAX_DIAL; k++)
+        if (g_px[k].used && g_px[k].sock < 0 && g_px[k].entry == (int)i) px_dial(g_syn_p, &g_px[k]);
+}
+
+/* ---- the supervise loop ---- */
+
+static int px_poll_fill(struct pollfd *pfds) {
+    int n = 0;
+    for (int k = 0; k < PX_MAX_DIAL; k++)
+        pfds[n++] = (struct pollfd){ .fd = g_px[k].used ? g_px[k].sock : -1, .events = POLLOUT };
+    return n;
+}
+
+static int px_timeout_ms(void) {
+    int64_t now = wr_now_ms(), best = -1;
+    for (int k = 0; k < PX_MAX_DIAL; k++)
+        if (g_px[k].used && (best < 0 || g_px[k].deadline < best)) best = g_px[k].deadline;
+    if (best < 0) return -1;
+    return best <= now ? 0 : (int)(best - now);
+}
+
+static void px_service(const struct policy *p, const struct pollfd *pfds, int n) {
+    int64_t now = wr_now_ms();
+    for (int k = 0; k < n && k < PX_MAX_DIAL; k++) {
+        struct px_req *q = &g_px[k];
+        if (!q->used) continue;
+        if (q->sock >= 0 && (pfds[k].revents & (POLLOUT | POLLERR | POLLHUP))) {
+            int so = 0;
+            socklen_t l = sizeof so;
+            if (getsockopt(q->sock, SOL_SOCKET, SO_ERROR, &so, &l) < 0) so = errno;
+            px_dialed(p, q, so);
+        } else if (q->sock >= 0 && now >= q->deadline) {
+            px_dialed(p, q, ETIMEDOUT);
+        } else if (q->sock < 0 && now >= q->deadline) {
+            px_dial(p, q);                               /* no answer: whatever the table holds */
+        }
+    }
+}
+
+/* The proxy's reports (WP_MSG_REQUEST, WP_MSG_UNREADABLE). A report that is
+ * not well formed means the proxy is not behaving: -1, and the run stops. */
+static int proxy_service(const struct policy *p) {
+    for (;;) {
+        struct wp_req m;
+        ssize_t n = recv(g_proxy.ctl, &m, sizeof m, MSG_DONTWAIT);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
+        if (n <= 0) return -1;                                  /* the proxy is gone */
+        if (n != (ssize_t)sizeof m || (m.type != WP_MSG_REQUEST && m.type != WP_MSG_UNREADABLE) ||
+            m.kind > PP_KIND_CONNECT || m.id == 0 || m.id > g_proxy_conns ||
+            !memchr(m.name, 0, sizeof m.name) || !memchr(m.why, 0, sizeof m.why))
+            return -1;
+        if (m.type == WP_MSG_REQUEST) {
+            char why[8];
+            if (m.port == 0 || m.port > 65535 || m.kind == PP_KIND_NONE ||
+                vdp_host_name_form(m.name, strlen(m.name), why, sizeof why) != 1)
+                return -1;
+            px_request(p, &m);
+        } else {
+            for (char *c = m.why; *c; c++) if (*c < ' ' || *c > '~' || *c == '"' || *c == '\\') *c = '?';
+            log_line_start();
+            fprintf(g_log, "[warden] proxy: connection %llu (%s) refused by the proxy: %s\n",
+                    (unsigned long long)m.id, pp_kind_name((pp_kind_t)m.kind), m.why);
+        }
+    }
+}

@@ -211,6 +211,7 @@ typedef enum {
     ACT_FILE_STAT,       /* v1.17.0: newfstatat, statx */
     ACT_FILE_ACCESS,     /* v1.17.0: access, faccessat, faccessat2 */
     ACT_FILE_READLINK,   /* v1.17.0: readlink, readlinkat */
+    ACT_NET_PROXY,       /* v1.26: a name:port the egress proxy read from a client */
     ACT_OTHER,
 } action_kind_t;
 
@@ -281,6 +282,7 @@ static const char *action_kind_name(action_kind_t k) {
         case ACT_FILE_STAT:     return "file.stat";
         case ACT_FILE_ACCESS:   return "file.access";
         case ACT_FILE_READLINK: return "file.readlink";
+        case ACT_NET_PROXY:     return "net.proxy";
         case ACT_OTHER:        return "other";
     }
     return "invalid";
@@ -821,6 +823,7 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
             if (s[0] == '\0') { a->why = "no_resolved_path"; return DEC_UNKNOWN; }
             break;
         case ACT_NET_CONNECT:
+        case ACT_NET_PROXY:              /* v1.26: the name:port the proxy read */
             /* v1.21: decided on the destination the Warden will dial, in its
              * canonical spelling (net_decision_string), never the agent's. */
             kind = VDP_KIND_HOST;
@@ -880,6 +883,7 @@ static bool certify(const struct policy *p, struct action *a) {
         case ACT_FILE_ACCESS:
         case ACT_FILE_READLINK: kind = VDPC_PATH; s = a->resolved; break;
         case ACT_NET_CONNECT:  kind = VDPC_HOST; s = a->resolved; break;   /* v1.21 */
+        case ACT_NET_PROXY:    kind = VDPC_HOST; s = a->resolved; break;   /* v1.26 */
         case ACT_PROCESS_EXEC: kind = VDPC_EXEC; s = a->target;   break;
         default:
             snprintf(a->check_why, sizeof a->check_why, "no certificate for this action kind");
@@ -1292,6 +1296,7 @@ static bool       g_names_on = false;
 static bool       g_any_name = false;  /* v1.24: the policy has a host name rule (allow or deny) */
 static bool       g_any_wild = false;  /* v1.25: the policy has a wildcard allow rule (warden_stub.inc.c) */
 static void       stub_resolved(size_t i);
+static void       px_resolved(size_t i);  /* v1.26: proxied requests waiting on a lookup */
 static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden_stub.inc.c) */
 /* v1.25 (section 4): a wildcard allow rule's budgets when it sets none */
 #define STUB_DEFAULT_NAMES 256           /* distinct new names per run */
@@ -1734,6 +1739,7 @@ static void emit_resolution(void *ctx, size_t i, const wr_result_t *r) {
     wr_format_record(f, g_run_id, &g_names, i, r, wr_now_ms());
     rec_end(NULL);
     stub_resolved(i);                   /* v1.25: answer the agent's waiting questions */
+    px_resolved(i);                     /* v1.26: and dial the proxy's waiting requests */
 }
 
 /* v1.25: a dynamic entry's TTL passed with no new question; its addresses
@@ -2740,6 +2746,7 @@ static void syn_hosts_view(const struct policy *p, FILE *f);
 #include "warden_net.inc.c"          /* v1.21: decided connections */
 #include "warden_stub.inc.c"         /* v1.25: the stub resolver for wildcard names */
 #include "warden_synth.inc.c"        /* v1.26: synthetic addresses with the proxy on */
+#include "warden_pxdecide.inc.c"     /* v1.26: the Warden's decisions on what the proxy reads */
 
 /* ---------------- receive loop ---------------- */
 
@@ -2764,7 +2771,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * finished for the agent (warden_net.inc.c). */
         /* v1.24: also on the resolver helper's results. */
         /* v1.25: and on the stub resolver's sockets (warden_stub.inc.c). */
-        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN + 1] = {
+        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN + 1 + PX_MAX_DIAL] = {
             { .fd = notify_fd,    .events = POLLIN },
             { .fd = target_pidfd, .events = POLLIN },
             { .fd = agent_err_fd, .events = POLLIN },
@@ -2785,6 +2792,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         /* v1.26 (step 5): and on the egress proxy's reports */
         int pxi = 4 + npoll + nstub;
         pfds[pxi] = (struct pollfd){ .fd = g_proxy.ctl, .events = POLLIN };
+        int npx = px_poll_fill(&pfds[pxi + 1]);
         int to = maybe_checkpoint(), pto = pend_timeout_ms();
         if (pto >= 0 && (to < 0 || pto < to)) to = pto;
         if (g_names_on) {
@@ -2793,7 +2801,9 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             int dto = wr_next_due_ms(&g_names, wr_now_ms());
             if (dto >= 0 && (to < 0 || dto < to)) to = dto;
         }
-        int pr = poll(pfds, (nfds_t)(pxi + 1), to);
+        int xto = px_timeout_ms();
+        if (xto >= 0 && (to < 0 || xto < to)) to = xto;
+        int pr = poll(pfds, (nfds_t)(pxi + 1 + npx), to);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -2804,7 +2814,8 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             pend_service(notify_fd, rev, npoll);
         }
         stub_service(p, &pfds[4 + npoll], nstub);
-        if (g_proxy.ctl >= 0 && (pfds[pxi].revents & (POLLIN | POLLHUP | POLLERR)) && proxy_service() < 0) {
+        px_service(p, &pfds[pxi + 1], npx);
+        if (g_proxy.ctl >= 0 && (pfds[pxi].revents & (POLLIN | POLLHUP | POLLERR)) && proxy_service(p) < 0) {
             /* fail closed, as for the resolver helper */
             fprintf(stderr, "[warden] the egress proxy exited or sent a malformed report; stopping the run\n");
             return false;
