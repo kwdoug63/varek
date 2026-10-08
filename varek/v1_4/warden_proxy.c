@@ -8,6 +8,7 @@
 #include <sodium.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -24,7 +25,6 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <time.h>
 #include <unistd.h>
 
 int wp_start(wp_t *w, int exe_fd, uid_t uid, gid_t gid) {
@@ -183,5 +183,90 @@ int wp_load(const char *path, char sha256_hex[65], char *why, size_t wn) {
 fail:
     close(fd);
     close(m);
+    return -1;
+}
+
+/* v1.26.1: inspecting mode's setup (see warden_proxy.h). */
+int wp_inspect_setup(const wp_t *w, const char *run_id, const char *bundle, char *const *names,
+                     size_t nnames, unsigned char **pem, size_t *pem_len, unsigned char **p12,
+                     size_t *p12_len, int *secure_heap, int *nroots, char *why, size_t wn) {
+    *pem = *p12 = NULL;
+    *pem_len = *p12_len = 0;
+    struct wp_inspect in;
+    memset(&in, 0, sizeof in);
+    in.type = WP_MSG_INSPECT;
+    in.nnames = (uint32_t)nnames;
+    if (strlen(run_id) >= sizeof in.run_id || strlen(bundle) >= sizeof in.bundle) {
+        snprintf(why, wn, "run id or trust bundle path too long");
+        return -1;
+    }
+    strcpy(in.run_id, run_id);
+    strcpy(in.bundle, bundle);
+    if (send(w->ctl, &in, sizeof in, MSG_NOSIGNAL) != (ssize_t)sizeof in) goto gone;
+    for (size_t i = 0; i < nnames; i++) {
+        struct wp_ca_name cn;
+        memset(&cn, 0, sizeof cn);
+        cn.type = WP_MSG_CA_NAME;
+        snprintf(cn.name, sizeof cn.name, "%s", names[i]);
+        if (send(w->ctl, &cn, sizeof cn, MSG_NOSIGNAL) != (ssize_t)sizeof cn) goto gone;
+    }
+    struct wp_msg go = { .type = WP_MSG_CA_GO, .port = 0 };
+    if (send(w->ctl, &go, sizeof go, MSG_NOSIGNAL) != (ssize_t)sizeof go) goto gone;
+    /* the blobs, each in order, then the proxy's word */
+    unsigned char *buf[3] = { NULL, NULL, NULL };
+    size_t total[3] = { 0, 0, 0 }, have[3] = { 0, 0, 0 };
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        struct timespec t;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        long left = 15000 - ((t.tv_sec - t0.tv_sec) * 1000 + (t.tv_nsec - t0.tv_nsec) / 1000000);
+        struct pollfd pf = { .fd = w->ctl, .events = POLLIN };
+        int pr = left > 0 ? poll(&pf, 1, (int)left) : 0;
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr <= 0) { snprintf(why, wn, "the proxy did not make the run's CA within 15 s"); break; }
+        static union { struct wp_blob b; struct wp_ca_done d; uint32_t type; } m;
+        ssize_t n = recv(w->ctl, &m, sizeof m, 0);
+        if (n <= 0) goto gone_free;
+        if (n == (ssize_t)sizeof m.b && m.type == WP_MSG_BLOB) {
+            uint32_t k = m.b.kind;
+            if ((k != WP_BLOB_CA_PEM && k != WP_BLOB_P12) || m.b.total == 0 || m.b.total > WP_BLOB_MAX ||
+                m.b.len == 0 || m.b.len > WP_BLOB_CHUNK || m.b.off != have[k] ||
+                (have[k] && m.b.total != total[k]) || m.b.len > m.b.total - m.b.off) {
+                snprintf(why, wn, "the proxy sent a malformed blob");
+                break;
+            }
+            if (!buf[k]) {
+                total[k] = m.b.total;
+                if (!(buf[k] = malloc(total[k]))) { snprintf(why, wn, "out of memory"); break; }
+            }
+            memcpy(buf[k] + m.b.off, m.b.data, m.b.len);
+            have[k] += m.b.len;
+            continue;
+        }
+        if (n == (ssize_t)sizeof m.d && m.type == WP_MSG_CA_DONE) {
+            if (!memchr(m.d.why, 0, sizeof m.d.why)) { snprintf(why, wn, "the proxy sent a malformed answer"); break; }
+            if (!m.d.ok) { snprintf(why, wn, "the proxy could not make the run's CA: %s", m.d.why); break; }
+            if (!buf[1] || !buf[2] || have[1] != total[1] || have[2] != total[2]) {
+                snprintf(why, wn, "the proxy did not send the CA and the trust store");
+                break;
+            }
+            *pem = buf[1]; *pem_len = total[1];
+            *p12 = buf[2]; *p12_len = total[2];
+            *secure_heap = m.d.secure_heap != 0;
+            *nroots = (int)m.d.nroots;
+            return 0;
+        }
+        snprintf(why, wn, "the proxy sent an unexpected message");
+        break;
+    }
+    free(buf[1]);
+    free(buf[2]);
+    return -1;
+gone_free:
+    free(buf[1]);
+    free(buf[2]);
+gone:
+    snprintf(why, wn, "the proxy has gone");
     return -1;
 }

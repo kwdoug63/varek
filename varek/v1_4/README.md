@@ -124,10 +124,11 @@ Results for v1.21.1: [`bench_results_v1_21_1.txt`](bench_results_v1_21_1.txt).
   at startup and refuses to run without it, because it creates the
   target's PID namespace (see below). It also covers reading
   `/proc/<pid>/mem`.
-- libseccomp and, from v1.16, libsodium development headers:
-  `sudo apt-get install -y build-essential libseccomp-dev libsodium-dev`
+- libseccomp and, from v1.16, libsodium development headers, and from
+  v1.26.1 OpenSSL's (for `warden-proxy` only; the Warden does not link it):
+  `sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev`
   (Debian/Ubuntu) or `sudo dnf install -y gcc make libseccomp-devel
-  libsodium-devel` (Fedora/RHEL). `make deps` runs the right one; `make`
+  libsodium-devel openssl-devel` (Fedora/RHEL). `make deps` runs the right one; `make`
   stops with that command if they are missing.
 
 ## Lifecycle coupling (v1.9.3)

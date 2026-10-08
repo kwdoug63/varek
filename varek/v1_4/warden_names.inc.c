@@ -54,14 +54,29 @@ static uint64_t ns_between(const struct timespec *a, const struct timespec *b);
  * nsswitch.conf, and takes a refused open of either (the Warden answers
  * EACCES for a file it does not allow, whether or not it exists) as a broken
  * configuration: it then drops what it read and asks 127.0.0.1. */
+/* v1.26.1: in inspecting mode, the trust views (warden_trust.inc.c): the
+ * host's bundle with the run's CA after it, at the usual bundle paths and at
+ * /etc/varek/run-bundle.pem (SSL_CERT_FILE and the like name it); the CA
+ * alone at /etc/varek/run-ca.pem (NODE_EXTRA_CA_CERTS); and the PKCS#12
+ * trust store at /etc/varek/run-trust.p12 (Java). */
 enum { VIEW_HOSTS = 0, VIEW_RESOLV = 1, VIEW_NSSWITCH = 2, VIEW_HOSTCONF = 3, VIEW_NETSVC = 4,
-       VIEW_SVC = 5, VIEW_N = 6 };
+       VIEW_SVC = 5,
+       VIEW_TRUST0 = 6,                                     /* the bundle views, then the CA and the store */
+       VIEW_BUNDLE_DEB = 6, VIEW_BUNDLE_RH = 7, VIEW_BUNDLE_RH2 = 8, VIEW_BUNDLE_SSL = 9, VIEW_BUNDLE_RUN = 10,
+       VIEW_RUNCA = 11, VIEW_P12 = 12, VIEW_N = 13 };
 static const char *const kViewPath[VIEW_N] = { "/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf",
-                                               "/etc/host.conf", "/etc/netsvc.conf", "/etc/svc.conf" };
+                                               "/etc/host.conf", "/etc/netsvc.conf", "/etc/svc.conf",
+                                               "/etc/ssl/certs/ca-certificates.crt",
+                                               "/etc/pki/tls/certs/ca-bundle.crt",
+                                               "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+                                               "/etc/ssl/cert.pem", "/etc/varek/run-bundle.pem",
+                                               "/etc/varek/run-ca.pem", "/etc/varek/run-trust.p12" };
 static const char *const kViewRule[VIEW_N] = { "hosts_view", "resolv_view", "nsswitch_view",
-                                               "hostconf_view", "netsvc_view", "svc_view" };
+                                               "hostconf_view", "netsvc_view", "svc_view",
+                                               "trust_view", "trust_view", "trust_view", "trust_view",
+                                               "trust_view", "run_ca_view", "trust_store_view" };
 static char     g_view_canon[VIEW_N][PATH_LIMIT];  /* realpath on the host at startup, or "" */
-static int      g_view_fd[VIEW_N] = { -1, -1, -1, -1, -1, -1 };
+static int      g_view_fd[VIEW_N] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
 static uint64_t g_view_gen = UINT64_MAX;          /* g_names.generation the hosts memfd holds */
 
 /* At startup: what each view path resolves to on the host. */
@@ -74,8 +89,13 @@ static void views_setup(void) {
     }
 }
 
-/* Is view v served in this run? (The last two only with the stub resolver.) */
-static bool view_on(int v) { return v < VIEW_NETSVC || g_stub_on; }
+/* Is view v served in this run? The name views with a host name rule (the
+ * last two only with the stub resolver); v1.26.1: the trust views in
+ * inspecting mode. */
+static bool view_on(int v) {
+    if (v >= VIEW_TRUST0) return g_inspect_on;
+    return g_any_name && (v < VIEW_NETSVC || g_stub_on);
+}
 
 static int view_by_target(const char *target) {
     for (int v = 0; v < VIEW_N; v++) if (view_on(v) && !strcmp(target, kViewPath[v])) return v;
@@ -110,6 +130,10 @@ static int view_memfd(int v) {
     else if (v == VIEW_NSSWITCH) fputs(g_stub_on ? "passwd: files\ngroup: files\nhosts: files dns\n"
                                                  : "passwd: files\ngroup: files\nhosts: files\n", f);
     else if (v == VIEW_HOSTCONF) fputs("multi on\n", f);
+    /* v1.26.1: the trust views */
+    else if (v >= VIEW_TRUST0 && v < VIEW_RUNCA) fwrite(g_trust_bundle, 1, g_trust_bundle_len, f);
+    else if (v == VIEW_RUNCA) fwrite(g_ca_pem, 1, g_ca_pem_len, f);
+    else if (v == VIEW_P12) fwrite(g_trust_p12, 1, g_trust_p12_len, f);
     /* VIEW_NETSVC, VIEW_SVC: empty */
     if (fclose(f) != 0) { free(buf); return -1; }
     int fd = memfd_create(kViewRule[v], MFD_CLOEXEC | MFD_ALLOW_SEALING);

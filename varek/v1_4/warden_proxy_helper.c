@@ -6,6 +6,7 @@
 
 #include "warden_proxy.h"
 #include "proxy_parse.h"
+#include "proxy_ca.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -310,10 +311,58 @@ static bool held_pump(int k, short crev, short srev) {
     return now - h->since <= WP_RELAY_IDLE;
 }
 
+/* v1.26.1: inspecting mode. The run's CA, made once, on WP_MSG_CA_GO. */
+static pca_t g_ca;
+static bool  g_inspect, g_ca_made;
+static char  g_ca_run[48], g_ca_bundle[1024];
+static char *g_ca_names[PCA_MAX_NAMES];
+static size_t g_ca_nnames, g_ca_want;
+
+static int send_blob(int ctl, uint32_t kind, const unsigned char *d, size_t n) {
+    static struct wp_blob b;
+    for (size_t off = 0; off < n; off += WP_BLOB_CHUNK) {
+        memset(&b, 0, sizeof b);
+        b.type = WP_MSG_BLOB;
+        b.kind = kind;
+        b.total = (uint32_t)n;
+        b.off = (uint32_t)off;
+        b.len = (uint32_t)(n - off < WP_BLOB_CHUNK ? n - off : WP_BLOB_CHUNK);
+        memcpy(b.data, d + off, b.len);
+        if (send(ctl, &b, sizeof b, MSG_NOSIGNAL) != (ssize_t)sizeof b) return -1;
+    }
+    return 0;
+}
+
+static void ca_go(int ctl) {
+    struct wp_ca_done d;
+    memset(&d, 0, sizeof d);
+    d.type = WP_MSG_CA_DONE;
+    unsigned char *pem = NULL, *p12 = NULL;
+    size_t pl = 0, ql = 0;
+    if (!g_inspect || g_ca_made || g_ca_nnames != g_ca_want)
+        snprintf(d.why, sizeof d.why, "the setup messages were not as expected");
+    else if (pca_init(&g_ca), pca_load_roots(&g_ca, g_ca_bundle, d.why, sizeof d.why) < 0) { }
+    else if (pca_make_ca(&g_ca, g_ca_run, g_ca_names, g_ca_nnames, PCA_VALID_S, d.why, sizeof d.why) < 0) { }
+    else if (pca_pem(&g_ca, &pem, &pl) < 0 || pca_p12(&g_ca, &p12, &ql) < 0 || pl > WP_BLOB_MAX || ql > WP_BLOB_MAX)
+        snprintf(d.why, sizeof d.why, "encoding the CA and the trust store");
+    else if (send_blob(ctl, WP_BLOB_CA_PEM, pem, pl) < 0 || send_blob(ctl, WP_BLOB_P12, p12, ql) < 0)
+        snprintf(d.why, sizeof d.why, "sending the CA to the Warden");
+    else {
+        d.ok = 1;
+        d.secure_heap = (uint32_t)g_ca.secure_heap;
+        d.nroots = (uint32_t)pca_nroots(&g_ca);
+        g_ca_made = true;
+    }
+    free(pem);
+    free(p12);
+    (void)send(ctl, &d, sizeof d, MSG_NOSIGNAL);
+}
+
 /* Read every control message waiting. Returns -1 when the Warden has gone. */
 static int wp_drain_ctl(int ctl) {
     for (;;) {
-        union { struct wp_conn c; struct wp_verdict v; struct wp_verdict_up u; uint32_t type; } m;
+        union { struct wp_conn c; struct wp_verdict v; struct wp_verdict_up u; struct wp_inspect in;
+                struct wp_ca_name cn; uint32_t type; } m;
         union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
         struct iovec iv = { &m, sizeof m };
         struct msghdr mh = { .msg_iov = &iv, .msg_iovlen = 1, .msg_control = cb.b, .msg_controllen = sizeof cb.b };
@@ -366,6 +415,24 @@ static int wp_drain_ctl(int ctl) {
             continue;
         }
         if (fd >= 0) close(fd);
+        /* v1.26.1: inspecting mode's setup (once, before the agent runs) */
+        if (n == (ssize_t)sizeof m.in && m.type == WP_MSG_INSPECT && !g_inspect) {
+            if (!memchr(m.in.run_id, 0, sizeof m.in.run_id) || !memchr(m.in.bundle, 0, sizeof m.in.bundle) ||
+                m.in.nnames > PCA_MAX_NAMES)
+                continue;
+            g_inspect = true;
+            memcpy(g_ca_run, m.in.run_id, sizeof g_ca_run);
+            memcpy(g_ca_bundle, m.in.bundle, sizeof g_ca_bundle);
+            g_ca_want = m.in.nnames;
+            continue;
+        }
+        if (n == (ssize_t)sizeof m.cn && m.type == WP_MSG_CA_NAME) {
+            if (g_inspect && !g_ca_made && g_ca_nnames < g_ca_want && memchr(m.cn.name, 0, sizeof m.cn.name) &&
+                (g_ca_names[g_ca_nnames] = strdup(m.cn.name)) != NULL)
+                g_ca_nnames++;
+            continue;
+        }
+        if (n == (ssize_t)sizeof(struct wp_msg) && m.type == WP_MSG_CA_GO) { ca_go(ctl); continue; }
         if (n == (ssize_t)sizeof(struct wp_msg) && m.type == WP_MSG_FLUSH) {
             /* the run is ending: close everything, reporting each relay */
             while (g_nheld) {
@@ -453,6 +520,9 @@ static void held_read(int k) {
 
 int wp_helper_main(int ctl) {
     signal(SIGPIPE, SIG_IGN);
+    /* v1.26.1: not dumpable, so no process of the proxy's own user can read
+     * its memory (where the run's CA key is) or take a core of it */
+    (void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
     g_ctl = ctl;
     int ls = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (ls < 0) { perror("[proxy] socket"); return 1; }

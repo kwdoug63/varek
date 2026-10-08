@@ -32,26 +32,34 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden warden-proxy target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 latency-v1260 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck harness video-v112
+.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 latency-v1260 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck harness video-v112
 
 all: $(BINS)
 
-# v1.16.1: the Warden needs the libseccomp and (from v1.16) libsodium headers.
-# Checked when (and only when) the Warden or varek_keygen is about to be built,
-# naming the command that installs them; `make deps` runs that command.
+# v1.16.1: the Warden needs the libseccomp and (from v1.16) libsodium headers;
+# v1.26.1: warden-proxy needs OpenSSL's. Checked when (and only when) one of
+# them is about to be built, naming the command that installs them; `make
+# deps` runs that command.
 deps-check:
 	@printf '#include <seccomp.h>\n#include <sodium.h>\n' | $(CC) -E -x c - >/dev/null 2>&1 || { \
 	    echo "ERROR: the Warden needs the libseccomp and libsodium development headers."; \
-	    echo "  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libsodium-dev"; \
-	    echo "  Fedora/RHEL:   sudo dnf install -y gcc make libseccomp-devel libsodium-devel"; \
+	    echo "  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev"; \
+	    echo "  Fedora/RHEL:   sudo dnf install -y gcc make libseccomp-devel libsodium-devel openssl-devel"; \
+	    echo "  or run: make deps"; exit 1; }
+
+deps-check-ssl:
+	@printf '#include <openssl/ssl.h>\n#include <openssl/pkcs12.h>\n' | $(CC) -E -x c - >/dev/null 2>&1 || { \
+	    echo "ERROR: warden-proxy (the egress proxy) needs the OpenSSL development headers."; \
+	    echo "  Debian/Ubuntu: sudo apt-get install -y libssl-dev"; \
+	    echo "  Fedora/RHEL:   sudo dnf install -y openssl-devel"; \
 	    echo "  or run: make deps"; exit 1; }
 
 deps:
 	@if command -v apt-get >/dev/null 2>&1; then \
-	    sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libsodium-dev; \
+	    sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev; \
 	elif command -v dnf >/dev/null 2>&1; then \
-	    sudo dnf install -y gcc make libseccomp-devel libsodium-devel; \
-	else echo "install libseccomp and libsodium (development packages) with your package manager"; exit 1; fi
+	    sudo dnf install -y gcc make libseccomp-devel libsodium-devel openssl-devel; \
+	else echo "install libseccomp, libsodium and OpenSSL (development packages) with your package manager"; exit 1; fi
 
 # v1.16.1: check a deployment before running it (dependencies, build, policy,
 # the verdict stream / key / anchor locations the Warden refuses, and with
@@ -64,7 +72,7 @@ CHECKER := checker/vdp_checker.c checker/vdp_checker.h
 
 # v1.24: the resolution table (warden_resolve.c) runs a resolver thread and
 # uses the host's resolver library.
-RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c shared_domains.c shared_domains.h warden_proxy.c warden_proxy.h proxy_parse.h
+RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c shared_domains.c shared_domains.h warden_proxy.c warden_proxy.h proxy_parse.h
 
 warden: warden.c warden_net.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
@@ -72,9 +80,11 @@ warden: warden.c warden_net.inc.c warden_baseline_filter.c smt_decide.c smt_deci
 
 # v1.26.1: the egress proxy, its own program (the Warden starts it from a
 # sealed copy whose SHA-256 it records). It links neither libseccomp nor
-# libsodium, and never holds the signing key.
-warden-proxy: warden_proxy_helper.c warden_proxy.h proxy_parse.c proxy_parse.h
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_proxy_helper.c proxy_parse.c
+# libsodium, and never holds the signing key; v1.26.1 inspecting mode links
+# OpenSSL here, and only here.
+warden-proxy: warden_proxy_helper.c warden_proxy.h proxy_parse.c proxy_parse.h proxy_ca.c proxy_ca.h
+	@$(MAKE) -s --no-print-directory deps-check-ssl
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_proxy_helper.c proxy_parse.c proxy_ca.c -lssl -lcrypto
 
 # v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
 # ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that

@@ -324,6 +324,12 @@ static void px_resolve(const struct policy *p, struct px_req *q) {
 }
 
 /* A request from the proxy. */
+/* v1.26.1: is name a passthrough host (kept in SNI mode)? */
+static bool px_passthrough(const struct policy *p, const char *name) {
+    for (size_t k = 0; k < p->v.proxy_npass; k++) if (!strcmp(p->v.proxy_pass[k], name)) return true;
+    return false;
+}
+
 static void px_request(const struct policy *p, const struct wp_req *m) {
     struct px_req *q = NULL;
     for (int k = 0; k < PX_MAX_DIAL; k++) if (!g_px[k].used) { q = &g_px[k]; break; }
@@ -356,6 +362,14 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
         log_line_start();
         fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n", g_records, a->check_why);
         px_refuse(q, d_raw, "certificate_refused", EACCES);
+        return;
+    }
+    /* v1.26.1 (until step 6 decides each request): in inspecting mode, a
+     * connection to a host that is not a passthrough host is refused, not
+     * relayed in SNI mode, which would let through requests the request
+     * rules refuse. Passthrough hosts are SNI mode by design. */
+    if (p->v.proxy_inspect && !px_passthrough(p, q->name)) {
+        px_refuse(q, d_raw, "inspect_not_built", EACCES);
         return;
     }
     int i = wr_table_find(&g_names, q->name);

@@ -35,7 +35,9 @@
 
 /* Control messages (SOCK_SEQPACKET, one per datagram). */
 enum { WP_MSG_READY = 1, WP_MSG_CONN = 2, WP_MSG_REQUEST = 3, WP_MSG_UNREADABLE = 4, WP_MSG_VERDICT = 5,
-       WP_MSG_CLOSED = 6, WP_MSG_FLUSH = 7, WP_MSG_FLUSHED = 8, WP_MSG_VERDICT_UP = 9 };
+       WP_MSG_CLOSED = 6, WP_MSG_FLUSH = 7, WP_MSG_FLUSHED = 8, WP_MSG_VERDICT_UP = 9,
+       /* v1.26.1, inspecting mode */
+       WP_MSG_INSPECT = 10, WP_MSG_CA_NAME = 11, WP_MSG_CA_GO = 12, WP_MSG_BLOB = 13, WP_MSG_CA_DONE = 14 };
 
 struct wp_msg {                  /* proxy -> Warden: WP_MSG_READY */
     uint32_t type;
@@ -108,6 +110,41 @@ struct wp_verdict_up {
     char     name[256];          /* NUL-terminated */
 };
 
+/* v1.26.1, inspecting mode, before the agent starts. Warden -> proxy:
+ * WP_MSG_INSPECT (the run id, the host's trust bundle, how many names
+ * follow), that many WP_MSG_CA_NAME (the names the CA may sign for), then
+ * WP_MSG_CA_GO (a struct wp_msg). Proxy -> Warden: the CA certificate (PEM)
+ * and the PKCS#12 trust store, each as WP_MSG_BLOB chunks in order, then
+ * WP_MSG_CA_DONE. Only once a run. */
+struct wp_inspect {
+    uint32_t type;               /* WP_MSG_INSPECT */
+    uint32_t nnames;
+    char     run_id[48];         /* NUL-terminated */
+    char     bundle[1024];       /* the host's trust bundle, NUL-terminated */
+};
+struct wp_ca_name {
+    uint32_t type;               /* WP_MSG_CA_NAME */
+    uint32_t pad;
+    char     name[256];          /* NUL-terminated host name */
+};
+enum { WP_BLOB_CA_PEM = 1, WP_BLOB_P12 = 2 };
+#define WP_BLOB_CHUNK   16384
+#define WP_BLOB_MAX     (8u << 20)
+struct wp_blob {
+    uint32_t type;               /* WP_MSG_BLOB */
+    uint32_t kind;               /* WP_BLOB_* */
+    uint32_t total, off, len;    /* the whole blob's length; this chunk's offset and length */
+    uint32_t pad;
+    uint8_t  data[WP_BLOB_CHUNK];
+};
+struct wp_ca_done {
+    uint32_t type;               /* WP_MSG_CA_DONE */
+    uint32_t ok;
+    uint32_t secure_heap;        /* the CA key is in locked memory */
+    uint32_t nroots;             /* certificates read from the host's bundle */
+    char     why[160];           /* !ok: why, NUL-terminated */
+};
+
 /* Warden -> proxy, step 7: the run is ending: close every connection,
  * report each relayed one (WP_MSG_CLOSED), then answer WP_MSG_FLUSHED (a
  * struct wp_msg). */
@@ -143,6 +180,14 @@ int wp_announce(const wp_t *w, uint64_t id, unsigned from_port, pid_t tid, const
 
 /* Step 5: tell the proxy the verdict on connection id. Never blocks. 0 or -1. */
 int wp_verdict(const wp_t *w, uint64_t id, bool allow);
+
+/* v1.26.1: inspecting mode's setup, before the agent starts (see struct
+ * wp_inspect): send the run id, the trust bundle's path and the names, and
+ * receive the CA certificate (PEM) and the PKCS#12 trust store (malloc'd).
+ * Waits up to 15 s. 0, or -1 with why. */
+int wp_inspect_setup(const wp_t *w, const char *run_id, const char *bundle, char *const *names,
+                     size_t nnames, unsigned char **pem, size_t *pem_len, unsigned char **p12,
+                     size_t *p12_len, int *secure_heap, int *nroots, char *why, size_t wn);
 
 /* The helper's own entry point, after it has dropped its privileges: serve
  * on the control socket fd until it closes. Returns the exit status. */

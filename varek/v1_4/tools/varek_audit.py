@@ -103,6 +103,12 @@ CONNECT_RULES = ("dialed_fd_injection", "dialed_in_progress", "dial_failed",
 VIEW_RULES = {"hosts_view": "/etc/hosts", "resolv_view": "/etc/resolv.conf",
               "nsswitch_view": "/etc/nsswitch.conf", "hostconf_view": "/etc/host.conf",
               "netsvc_view": "/etc/netsvc.conf", "svc_view": "/etc/svc.conf"}
+# v1.26.1: in inspecting mode, the trust views: rule -> the paths it answers
+TRUST_VIEW_RULES = {"trust_view": ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+                                   "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", "/etc/ssl/cert.pem",
+                                   "/etc/varek/run-bundle.pem"),
+                    "run_ca_view": ("/etc/varek/run-ca.pem",),
+                    "trust_store_view": ("/etc/varek/run-trust.p12",)}
 O_CREAT, O_TRUNC = 0o100, 0o1000
 
 
@@ -242,12 +248,23 @@ def policy_proxy(checker, policy):
     none), or None without `proxy on`. Asked of the checker."""
     rq = subprocess.run([checker, policy, "proxy"], capture_output=True, text=True)
     f = rq.stdout.split()
-    if rq.returncode != 0 or not f or f[0] not in ("on", "off"):
+    if rq.returncode != 0 or not f or f[0] not in ("on", "off", "inspect"):
         raise ValueError("the checker failed on the policy's proxy directives")
     if f[0] == "off":
         return None
-    ports = f[1:f.index("upstream")] if "upstream" in f else f[1:]
+    ends = [f.index(w) for w in ("upstream", "passthrough") if w in f]
+    ports = f[1:min(ends)] if ends else f[1:]
     return [int(x) for x in ports]
+
+
+def policy_inspect(checker, policy):
+    """v1.26.1: the policy's passthrough hosts (a list) in inspecting mode,
+    or None when the policy does not turn inspecting mode on."""
+    rq = subprocess.run([checker, policy, "proxy"], capture_output=True, text=True)
+    f = rq.stdout.split()
+    if rq.returncode != 0 or not f or f[0] != "inspect":
+        return None
+    return f[f.index("passthrough") + 1:] if "passthrough" in f else []
 
 
 def policy_upstream(checker, policy):
@@ -267,7 +284,8 @@ HANDOFF_OTHER_RULES = ("already_connected", "socket_option_failed", "too_many_pe
 # v1.26 review: the rules of a proxied decision the Warden refused
 PROXY_REFUSE_RULES = ("policy_match", "default_deny_unknown", "fragment_escape_flags",
                       "fragment_escape_length", "certificate_refused", "wildcard_budget",
-                      "resolution_failed", "address_refused", "run_ended")
+                      "resolution_failed", "address_refused", "run_ended",
+                      "inspect_not_built")   # v1.26.1: until requests are decided (step 6)
 # v1.26 (step 6): the Warden's decision on what the proxy read, when it allowed
 PROXY_ALLOW_RULES = ("proxy_dialed", "proxy_dial_failed")
 PROXY_KINDS = ("tls", "http", "connect")
@@ -275,7 +293,32 @@ CLOSE_WHY = ("closed", "reset", "idle", "run_end", "unreported", "upstream_refus
              "refused_request", "client_gone")       # v1.26 review: the last two
 
 
-def check_proxy_start(meta, proxy_ports, problems, upstream=None):
+HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def check_trust(meta, passthrough, problems):
+    """v1.26.1 (step 3): in inspecting mode run_start records the trust the
+    agent was given: the host's bundle and its hash, the run's CA (the hash of
+    its DER) and how many names it may sign for, the trust store's hash,
+    whether the CA's key was in locked memory, and the policy's passthrough
+    hosts; without inspecting mode, none of it."""
+    tr = meta.get("run_start", {}).get("trust")
+    if passthrough is None:
+        if tr is not None:
+            problems.append("run_start records a trust setup, but the policy does not turn inspecting mode on")
+        return
+    ok = isinstance(tr, dict) and isinstance(tr.get("host_bundle"), str) and tr["host_bundle"].startswith("/") \
+        and all(isinstance(tr.get(k), str) and HEX64.fullmatch(tr[k])
+                for k in ("host_bundle_sha256", "ca_sha256", "trust_store_sha256")) \
+        and type(tr.get("host_roots")) is int and tr["host_roots"] > 0 \
+        and type(tr.get("ca_names")) is int and tr["ca_names"] >= 0 \
+        and type(tr.get("ca_key_locked")) is bool and tr.get("passthrough") == passthrough
+    if not ok:
+        problems.append(f"run_start's trust {tr!r} is not inspecting mode's (the host's bundle, the "
+                        f"run's CA, the trust store, passthrough {passthrough})")
+
+
+def check_proxy_start(meta, proxy_ports, problems, upstream=None, inspect=False):
     """v1.26 (step 8): with `proxy on` the Warden runs only with its proxy, so
     run_start names it: SNI mode, its listener on 127.0.0.1, an unprivileged
     user, and the policy's proxied ports; without `proxy on`, no proxy."""
@@ -291,13 +334,13 @@ def check_proxy_start(meta, proxy_ports, problems, upstream=None):
     if not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
         problems.append(f"run_start's proxy_binary_sha256 {sha!r} is not a SHA-256")
     lst = pr.get("listen") if isinstance(pr, dict) else None
-    if not isinstance(pr, dict) or pr.get("mode") != "sni" or not isinstance(lst, str) or \
+    if not isinstance(pr, dict) or pr.get("mode") != ("inspect" if inspect else "sni") or not isinstance(lst, str) or \
             not lst.startswith("127.0.0.1:") or _host_port(lst) in (None, 0) or \
             type(pr.get("uid")) is not int or type(pr.get("gid")) is not int or \
             pr.get("uid") == 0 or pr.get("gid") == 0 or pr.get("ports") != proxy_ports or \
             pr.get("upstream") != upstream:
-        problems.append(f"run_start's proxy {pr!r} is not the policy's (SNI mode, an unprivileged "
-                        f"user, ports {proxy_ports})")
+        problems.append(f"run_start's proxy {pr!r} is not the policy's ({'inspecting' if inspect else 'SNI'} "
+                        f"mode, an unprivileged user, ports {proxy_ports})")
 
 
 def check_handoff_rules(checker, policy, rules, handoffs, problems):
@@ -401,7 +444,7 @@ def check_closes(records, closes, complete, problems):
 
 
 def check_proxied(records, resolutions, handoff_all, problems, upstream=None, dialed_out=None,
-                  charged=None, exact=None, handoff_port=None):
+                  charged=None, exact=None, handoff_port=None, passthrough=None):
     """v1.26 (step 6): every net.proxy record (a name:port the proxy read,
     decided by the Warden) is for a hand-off, once each, of a kind the proxy
     reads, decided on the name:port it records; one the Warden dialed names
@@ -440,6 +483,18 @@ def check_proxied(records, resolutions, handoff_all, problems, upstream=None, di
                 handoff_port.get(cid) not in (None, _host_port(tgt)):
             problems.append(f"seq {seq}: a proxied decision on {tgt}, not on the port connection "
                             f"{cid} was handed over on ({handoff_port.get(cid)})")
+            continue
+        # v1.26.1 (until step 6): in inspecting mode only a passthrough host's
+        # connection is passed on; any other is refused, inspect_not_built
+        name = tgt.rsplit(":", 1)[0]
+        if passthrough is not None and dfin == "ALLOW" and name not in passthrough:
+            problems.append(f"seq {seq}: in inspecting mode, {name}, not a passthrough host, was passed on")
+            continue
+        if passthrough is not None and rule == "inspect_not_built" and name in passthrough:
+            problems.append(f"seq {seq}: {name}, a passthrough host, was refused as inspected")
+            continue
+        if passthrough is None and rule == "inspect_not_built":
+            problems.append(f"seq {seq}: a proxied decision refused inspect_not_built outside inspecting mode")
             continue
         # section 5: an allowed decision went to the policy's upstream, if it
         # names one (a refusal never reaches it, and carries none)
@@ -1480,16 +1535,25 @@ def main(argv=None):
                     handoff_cands.append((rec, [c for c in rec["candidates"] if isinstance(c, str)]))
             handoffs += 1
             continue
-        if rec.get("action") == "file.open" and rec.get("rule") in VIEW_RULES:
+        if rec.get("action") == "file.open" and (rec.get("rule") in VIEW_RULES or
+                                                 rec.get("rule") in TRUST_VIEW_RULES):
             fl = rec.get("open_flags")
             try:
                 flv = int(fl, 16)
             except (TypeError, ValueError):
                 flv = -1
-            if not names_policy:
+            trust = rec["rule"] in TRUST_VIEW_RULES        # v1.26.1
+            inspecting = (meta.get("run_start", {}).get("proxy") or {}).get("mode") == "inspect"
+            if trust and not inspecting:
+                problems.append(f"seq {rec.get('seq')}: a trust view answered, but run_start's proxy is not "
+                                f"in inspecting mode")
+            elif trust and rec.get("resolved") not in TRUST_VIEW_RULES[rec["rule"]]:
+                problems.append(f"seq {rec.get('seq')}: a {rec['rule']} answered an open of "
+                                f"{rec.get('resolved')!r}")
+            elif not trust and not names_policy:
                 problems.append(f"seq {rec.get('seq')}: a view answered, but run_start says the "
                                 f"policy has no host name rules")
-            elif rec.get("resolved") != VIEW_RULES[rec["rule"]]:
+            elif not trust and rec.get("resolved") != VIEW_RULES[rec["rule"]]:
                 problems.append(f"seq {rec.get('seq')}: a {rec['rule']} answered an open of "
                                 f"{rec.get('resolved')!r}")
             elif flv < 0 or flv & 3 or flv & (O_CREAT | O_TRUNC):
@@ -1588,7 +1652,7 @@ def main(argv=None):
     # rules hold, in order.
     if view_recs and rules:
         h = subprocess.run([a.checker, a.policy, "holds"],
-                           input="\n".join(VIEW_RULES[r["rule"]].encode().hex() for r, _ in view_recs) + "\n",
+                           input="\n".join(r["resolved"].encode().hex() for r, _ in view_recs) + "\n",
                            capture_output=True, text=True)
         rows = h.stdout.split()
         if h.returncode != 0 or len(rows) != len(view_recs):
@@ -1600,7 +1664,7 @@ def main(argv=None):
                             (flv & int(r[3], 16)) == int(r[4], 16):
                         if r[1] == "d":
                             problems.append(f"seq {rec.get('seq')}: a {rec['rule']} served, but policy "
-                                            f"rule {i} denies {VIEW_RULES[rec['rule']]}")
+                                            f"rule {i} denies {rec['resolved']}")
                         break
 
     checked = 0
@@ -1644,7 +1708,13 @@ def main(argv=None):
                             problems.append(f"seq {rec.get('seq')}: rule {early[0]} holds on candidate "
                                             f"{c!r}, before the rule that decided the connect")
     # v1.26 (step 8): the proxy as run_start names it, and each hand-off as the policy decides
-    check_proxy_start(meta, proxy_ports, problems, policy_upstream(a.checker, a.policy))
+    try:
+        passthrough = policy_inspect(a.checker, a.policy)                 # v1.26.1
+    except (OSError, ValueError):
+        passthrough = None
+    check_proxy_start(meta, proxy_ports, problems, policy_upstream(a.checker, a.policy),
+                      passthrough is not None)
+    check_trust(meta, passthrough, problems)
     if prules:
         check_handoff_rules(a.checker, a.policy, prules, handoff_cands, problems)
     # v1.26 (step 6): the Warden's decisions on what the proxy read
@@ -1665,7 +1735,7 @@ def main(argv=None):
                    for r in prules if r["kind"] == "h" and r["name"] and not r["wild"]}
     dialed_px = []
     proxied = check_proxied(records, resolutions, handoff_all, problems, upstream, dialed_px,
-                            charged_at, exact_hosts, handoff_port)
+                            charged_at, exact_hosts, handoff_port, passthrough)
     if prules:
         check_dialed_denies(a.checker, a.policy, prules, dialed_px, problems)
     pcloses = check_closes(records, meta.get("proxy_closes", []), complete, problems)   # step 7
