@@ -243,6 +243,8 @@ def policy_proxy(checker, policy):
 
 SYN_NET = ipaddress.ip_network("198.18.0.0/15")   # the Warden's synthetic addresses (v1.26)
 SYN_MAX = 131070
+# v1.26 (step 4): the rules of a connect handed to the proxy
+HANDOFF_RULES = ("proxy_handoff", "proxy_handoff_in_progress", "proxy_handoff_failed")
 
 
 def proxied_only(checker, policy, rules, names, pports):
@@ -1109,6 +1111,7 @@ def main(argv=None):
     names_policy = any(r[0] == "h" and r[2] == "n" for r in rules)
     if (meta.get("run_start", {}).get("host_name_rules") is True) != names_policy:
         problems.append("run_start's host_name_rules does not match the policy file")
+    handoff_ids, handoffs = set(), 0     # v1.26: connects handed to the proxy
     view_recs = []                       # (rec, flags): asked of the policy below
     others = []                          # (rec, decided rule, other candidates)
     ancestors = None
@@ -1151,6 +1154,34 @@ def main(argv=None):
                 problems.append(f"seq {rec.get('seq')}: a dns_stub record to "
                                 f"{rec.get('target')!r} / {rec.get('resolved')!r}, not the stub at {STUB}")
             stubs += 1
+            continue
+        if rec.get("proxy_handoff") is True or rec.get("rule") in HANDOFF_RULES:
+            # v1.26 (step 4): a connect handed to the egress proxy reaches only
+            # its listener (no certificate: the proxy's decision on the name
+            # the client sends is certified, step 6). Only with the proxy on,
+            # for a TCP connect on a proxied port, to the listener run_start
+            # names, with a connection id of its own; never one a rule denies.
+            seq = rec.get("seq")
+            pr = meta.get("run_start", {}).get("proxy")
+            tgt = _canonical_dest(rec.get("target"))
+            cid = rec.get("proxy_conn")
+            if proxy_ports is None or not isinstance(pr, dict):
+                problems.append(f"seq {seq}: a connect handed to the proxy, but the proxy is not on")
+            elif rec.get("proxy_handoff") is not True or rec.get("action") != "net.connect" or \
+                    rec.get("sock") != "tcp" or rec.get("resolved") != pr.get("listen"):
+                problems.append(f"seq {seq}: a hand-off that is not a TCP connect to the proxy's "
+                                f"listener {pr.get('listen')!r}")
+            elif tgt is None or int(tgt[1]) not in proxy_ports:
+                problems.append(f"seq {seq}: a hand-off of {rec.get('target')!r}, not on a proxied port")
+            elif rec.get("decision_raw") == "DENY" and rec.get("policy_line", -1) != -1 and \
+                    tgt[0] not in SYN_NET:
+                problems.append(f"seq {seq}: a connect policy line {rec.get('policy_line')} denies "
+                                f"was handed to the proxy")
+            elif type(cid) is not int or cid < 1 or cid in handoff_ids:
+                problems.append(f"seq {seq}: a hand-off without a connection id of its own ({cid!r})")
+            else:
+                handoff_ids.add(cid)
+            handoffs += 1
             continue
         if rec.get("action") == "file.open" and rec.get("rule") in VIEW_RULES:
             fl = rec.get("open_flags")
@@ -1296,10 +1327,13 @@ def main(argv=None):
                         if early:
                             problems.append(f"seq {rec.get('seq')}: rule {early[0]} holds on candidate "
                                             f"{c!r}, before the rule that decided the connect")
+    # v1.26: every connection id the Warden gave a hand-off is recorded once
+    if complete and handoff_ids and handoff_ids != set(range(1, len(handoff_ids) + 1)):
+        problems.append(f"the hand-offs' connection ids are not 1 to {len(handoff_ids)}: one is missing")
     print(f"varek_audit: run {run} (Warden {warden}, {'complete' if complete else 'INCOMPLETE'}), "
           f"{len(records)} records, {authorized} authorized file opens, {lookups} lookups, "
           f"{connects} authorized connects, "
-          f"{views} host-name views, {stubs} stub resolver connects, "
+          f"{views} host-name views, {stubs} stub resolver connects, {handoffs} proxy hand-offs, "
           f"{questions} stub questions ({budget_hits} over a budget), "
           f"{checked} certificates "
           f"re-checked, {refused} refused in-line")

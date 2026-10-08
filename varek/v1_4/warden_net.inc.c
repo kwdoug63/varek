@@ -85,6 +85,13 @@ static uint64_t g_report_seq = 0;       /* report_id sequence (was supervise()'s
 /* v1.25: the stub resolver (warden_stub.inc.c, included after this file) */
 struct sock_kind;
 static bool stub_is_dest(const struct sockaddr_storage *dial);
+/* v1.26: is port one the proxy takes? (`proxy ports`, else 80 and 443) */
+static bool proxied_port(const struct policy *p, unsigned port) {
+    if (!p->v.proxy_nports) return port == 80 || port == 443;
+    for (size_t k = 0; k < p->v.proxy_nports; k++) if (p->v.proxy_ports[k] == port) return true;
+    return false;
+}
+
 /* v1.26: is the address dialed (IPv4, or IPv4-mapped) a synthetic one? */
 static bool dial_synthetic(int fam, const void *addr) {
     wr_ip_t ip;
@@ -104,6 +111,12 @@ static uint64_t ns_between(const struct timespec *a, const struct timespec *b) {
 
 static void net_record(pid_t pid, struct action *a, decision_t d_raw, decision_t d_final,
                        const char *rule, const struct timespec *t0, int kerr) {
+    /* v1.26: a connect handed to the proxy is recorded as that */
+    if (a->proxy_handoff && rule) {
+        if (!strcmp(rule, "dialed_fd_injection")) rule = "proxy_handoff";
+        else if (!strcmp(rule, "dialed_in_progress")) rule = "proxy_handoff_in_progress";
+        else if (!strcmp(rule, "dial_failed")) rule = "proxy_handoff_failed";
+    }
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     emit_pathology(g_report_seq++, pid, a, d_raw, d_final, rule, ns_between(t0, &t1), kerr);
@@ -627,6 +640,26 @@ static const char *handover(int notify_fd, uint64_t id, pid_t tid, int s, int af
 
 /* ---- connect ---- */
 
+/* v1.26 (step 4): connect the Warden's socket s to the proxy's listener from
+ * 127.0.0.1 (IPv4-mapped for an IPv6 socket), announcing the connection
+ * first: bind, tell the proxy the local port, then connect. 0 or -errno. */
+static int proxy_dial(int s, int dom, const struct sockaddr_storage *to, socklen_t tl, pid_t tid,
+                      struct action *a) {
+    struct sockaddr_storage me;
+    memcpy(&me, to, sizeof me);
+    if (dom == AF_INET6) ((struct sockaddr_in6 *)&me)->sin6_port = 0;
+    else ((struct sockaddr_in *)&me)->sin_port = 0;
+    socklen_t ml = tl;
+    if (bind(s, (struct sockaddr *)&me, ml) < 0 || getsockname(s, (struct sockaddr *)&me, &ml) < 0)
+        return -errno;
+    unsigned from = ntohs(dom == AF_INET6 ? ((struct sockaddr_in6 *)&me)->sin6_port
+                                          : ((struct sockaddr_in *)&me)->sin_port);
+    size_t el = strlen(a->extra);
+    snprintf(a->extra + el, sizeof a->extra - el, "\"proxy_from\":%u,", from);
+    if (wp_announce(&g_proxy, g_proxy_conns, from, tid, a->dialed) < 0) return -(errno ? errno : EIO);
+    return connect(s, (const struct sockaddr *)to, tl) < 0 ? -errno : 0;
+}
+
 static void net_connect(int notify_fd, const struct seccomp_notif *req, struct action *a,
                         const struct policy *p, const struct timespec *t0) {
     pid_t tid = (pid_t)req->pid;
@@ -687,6 +720,9 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
      * DNS server (the agent resolves only through the Warden's views), and a
      * destination is decided on its address and the names it belongs to
      * (warden_names.inc.c). */
+    /* v1.26 (step 4): may this connect be handed to the egress proxy? A TCP
+     * connect on a proxied port, with the proxy running. */
+    bool handoff_ok = false, syn = false;
     if (fam != AF_UNIX) {
         const void *ad;
         unsigned port;
@@ -706,8 +742,12 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
             stub_connect(notify_fd, req, a, ag, &k, t0);
             return;
         }
+        handoff_ok = g_proxy.ctl >= 0 && !strcmp(k.name, "tcp") && proxied_port(p, port);
+        syn = dial_synthetic(dial.ss_family, ad);
         if (g_any_name && port == 53) rule = "dns_refused";
-        else if (dial_synthetic(dial.ss_family, ad)) rule = "synthetic_address";   /* v1.26: until step 4 */
+        /* v1.26: a synthetic address reaches only the proxy (a UDP connect,
+         * another port, or no proxy running: refused) */
+        else if (syn && !handoff_ok) rule = "synthetic_address";
         else if (names_candidates(a, dial.ss_family, ad, port) < 0) rule = "out_of_memory";
         if (rule) {
             close(ag);
@@ -719,8 +759,43 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
     decision_t d_raw = names_decide(p, a);
     names_record_fields(a);
     decision_t d_final = d_raw == DEC_ALLOW ? DEC_ALLOW : DEC_DENY;
+    /* v1.26 (step 4): on a proxied port, a connect is handed to the proxy,
+     * which decides on the name the client sends (step 6), unless a numeric
+     * rule allows the address itself (dialed directly, as in v1.21) or a rule
+     * denies it. A synthetic address is always handed over. The hand-off
+     * authorizes nothing beyond the proxy's listener, so it carries no
+     * certificate. */
+    if (handoff_ok && fam != AF_UNIX) {
+        bool numeric_allow = d_raw == DEC_ALLOW && a->ncand > 0 && !strcmp(a->resolved, g_cand[0]);
+        bool denied = d_raw == DEC_DENY && a->rule_index >= 0;
+        if (syn || (!numeric_allow && !denied)) {
+            a->proxy_handoff = true;
+            d_final = DEC_ALLOW;
+            size_t el = strlen(a->extra);
+            snprintf(a->extra + el, sizeof a->extra - el, "\"proxy_handoff\":true,\"proxy_conn\":%llu,",
+                     (unsigned long long)++g_proxy_conns);
+            snprintf(a->resolved, sizeof a->resolved, "127.0.0.1:%u", g_proxy.port);
+            /* the listener, in the socket's family */
+            memset(&dial, 0, sizeof dial);
+            if (k.dom == AF_INET6) {
+                struct sockaddr_in6 *d6 = (struct sockaddr_in6 *)&dial;
+                d6->sin6_family = AF_INET6;
+                d6->sin6_port = htons((uint16_t)g_proxy.port);
+                d6->sin6_addr.s6_addr[10] = d6->sin6_addr.s6_addr[11] = 0xff;
+                d6->sin6_addr.s6_addr[12] = 127;
+                d6->sin6_addr.s6_addr[15] = 1;
+                dial_len = sizeof *d6;
+            } else {
+                struct sockaddr_in *d4 = (struct sockaddr_in *)&dial;
+                d4->sin_family = AF_INET;
+                d4->sin_port = htons((uint16_t)g_proxy.port);
+                d4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                dial_len = sizeof *d4;
+            }
+        }
+    }
     bool cert_refused = false;
-    if (d_final == DEC_ALLOW && !certify(p, a)) {
+    if (d_final == DEC_ALLOW && !a->proxy_handoff && !certify(p, a)) {
         d_final = DEC_DENY;
         cert_refused = true;
         log_line_start();
@@ -819,6 +894,8 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
         snprintf(un.sun_path, sizeof un.sun_path, "/proc/self/fd/%d", pin);
         un_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(un.sun_path) + 1);
         rc = connect_as_agent(s, (struct sockaddr *)&un, un_len, uid, gid);
+    } else if (a->proxy_handoff) {
+        rc = proxy_dial(s, k.dom, &dial, dial_len, tid, a);
     } else {
         rc = connect(s, (struct sockaddr *)&dial, dial_len) < 0 ? -errno : 0;
     }

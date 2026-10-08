@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <stdbool.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,6 +86,69 @@ int wp_start(wp_t *w, const char *exe, uid_t uid, gid_t gid) {
     return 0;
 }
 
+int wp_announce(const wp_t *w, uint64_t id, unsigned from_port, pid_t tid, const char *dest) {
+    if (w->ctl < 0) { errno = ENOTCONN; return -1; }
+    struct wp_conn m;
+    memset(&m, 0, sizeof m);
+    m.type = WP_MSG_CONN;
+    m.from_port = from_port;
+    m.id = id;
+    m.tid = (int32_t)tid;
+    snprintf(m.dest, sizeof m.dest, "%s", dest);
+    ssize_t n = send(w->ctl, &m, sizeof m, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (n != (ssize_t)sizeof m) { if (n >= 0) errno = EMSGSIZE; return -1; }
+    return 0;
+}
+
+static int64_t mono_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* The proxy's state: announcements waiting for their connection, and the
+ * connections it holds. */
+struct wp_ann  { bool used; uint32_t from_port; uint64_t id; int64_t at; };
+struct wp_held { int fd; uint64_t id; int64_t last; };
+static struct wp_ann  g_ann[WP_MAX_ANNOUNCED];
+static struct wp_held g_held[WP_MAX_HELD];
+static int g_nheld = 0;
+
+/* Read every control message waiting. Returns -1 when the Warden has gone. */
+static int wp_drain_ctl(int ctl) {
+    for (;;) {
+        struct wp_conn m;
+        ssize_t n = recv(ctl, &m, sizeof m, MSG_DONTWAIT);
+        if (n == 0) return -1;
+        if (n < 0) return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? 0 : -1;
+        if (n != (ssize_t)sizeof m || m.type != WP_MSG_CONN || m.from_port == 0 || m.from_port > 65535)
+            continue;                                   /* not one the Warden sends */
+        int64_t now = mono_ms();
+        int slot = -1, oldest = 0;
+        for (int k = 0; k < WP_MAX_ANNOUNCED; k++) {
+            if (g_ann[k].used && (now - g_ann[k].at > WP_ANNOUNCE_MS || g_ann[k].from_port == m.from_port))
+                g_ann[k].used = false;                  /* expired, or its port is reused */
+            if (!g_ann[k].used && slot < 0) slot = k;
+            if (g_ann[k].at < g_ann[oldest].at) oldest = k;
+        }
+        if (slot < 0) slot = oldest;                    /* full: the oldest goes */
+        g_ann[slot] = (struct wp_ann){ .used = true, .from_port = m.from_port, .id = m.id, .at = now };
+    }
+}
+
+/* A connection accepted: hold it if the Warden announced it, else close it. */
+static void wp_accepted(int c, const struct sockaddr_in *peer) {
+    int64_t now = mono_ms();
+    int found = -1;
+    if (peer->sin_family == AF_INET && peer->sin_addr.s_addr == htonl(INADDR_LOOPBACK))
+        for (int k = 0; k < WP_MAX_ANNOUNCED; k++)
+            if (g_ann[k].used && g_ann[k].from_port == ntohs(peer->sin_port) &&
+                now - g_ann[k].at <= WP_ANNOUNCE_MS) { found = k; break; }
+    if (found < 0 || g_nheld >= WP_MAX_HELD) { close(c); return; }
+    g_ann[found].used = false;
+    g_held[g_nheld++] = (struct wp_held){ .fd = c, .id = g_ann[found].id, .last = now };
+}
+
 int wp_helper_main(int ctl) {
     signal(SIGPIPE, SIG_IGN);
     int ls = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
@@ -112,21 +176,45 @@ int wp_helper_main(int ctl) {
     c->cmsg_len = CMSG_LEN(sizeof cr);
     memcpy(CMSG_DATA(c), &cr, sizeof cr);
     if (sendmsg(ctl, &mh, MSG_NOSIGNAL) != (ssize_t)sizeof m) return 1;
+    static struct pollfd pf[2 + WP_MAX_HELD];
     for (;;) {
-        struct pollfd pf[2] = { { .fd = ctl, .events = POLLIN }, { .fd = ls, .events = POLLIN } };
-        if (poll(pf, 2, -1) < 0) {
+        pf[0] = (struct pollfd){ .fd = ctl, .events = POLLIN };
+        pf[1] = (struct pollfd){ .fd = ls, .events = POLLIN };
+        for (int k = 0; k < g_nheld; k++) pf[2 + k] = (struct pollfd){ .fd = g_held[k].fd, .events = POLLIN };
+        int nh = g_nheld;
+        if (poll(pf, (nfds_t)(2 + nh), 1000) < 0) {
             if (errno == EINTR) continue;
             return 1;
         }
-        if (pf[0].revents) {
-            char b[64];
-            ssize_t n = recv(ctl, b, sizeof b, MSG_DONTWAIT);
-            if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) return 0;  /* the Warden went */
-        }
+        if (pf[0].revents && wp_drain_ctl(ctl) < 0) return 0;      /* the Warden went */
         if (pf[1].revents & POLLIN) {
-            /* step 2: no hand-off yet; a connection is accepted and closed */
-            int c;
-            while ((c = accept4(ls, NULL, NULL, SOCK_CLOEXEC)) >= 0) close(c);
+            /* The Warden announces a connection before making it: read the
+             * control socket again first, so its announcement is here. */
+            if (wp_drain_ctl(ctl) < 0) return 0;
+            for (;;) {
+                struct sockaddr_in peer;
+                socklen_t pl = sizeof peer;
+                memset(&peer, 0, sizeof peer);
+                int c = accept4(ls, (struct sockaddr *)&peer, &pl, SOCK_CLOEXEC | SOCK_NONBLOCK);
+                if (c < 0) break;
+                wp_accepted(c, &peer);
+            }
+        }
+        /* Step 4: a held connection is read and discarded (step 5 parses
+         * it), and closed when the client closes it or after 60 s idle. */
+        int64_t now = mono_ms();
+        for (int k = nh - 1; k >= 0; k--) {
+            bool drop = now - g_held[k].last > 60000;
+            if (pf[2 + k].revents) {
+                char b[4096];
+                ssize_t n = recv(g_held[k].fd, b, sizeof b, MSG_DONTWAIT);
+                if (n > 0) g_held[k].last = now;
+                else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) drop = true;
+            }
+            if (drop) {
+                close(g_held[k].fd);
+                g_held[k] = g_held[--g_nheld];
+            }
         }
     }
 }

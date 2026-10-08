@@ -260,6 +260,7 @@ struct action {
                                            warden_names.inc.c) */
     bool          special_addr;         /* connect: a special address, decided as a number */
     char          dialed[64];           /* connect: the numeric destination dialed */
+    bool          proxy_handoff;        /* v1.26: a connect handed to the egress proxy */
     char          extra[4608];          /* extra record fields, trusted text, each ending in ',' */
 };
 
@@ -1302,6 +1303,7 @@ static const struct policy *g_syn_p;   /* v1.26: the policy, for the hosts view 
 /* v1.26: the stub runs with a wildcard allow rule (v1.25), or with the proxy
  * on and any host name rule (synthetic addresses) */
 #define STUB_WANTED() (g_any_wild || (g_syn_on && g_names_on))
+static uint64_t   g_proxy_conns = 0;   /* v1.26: connections handed to the proxy (proxy_conn ids) */
 #define SYN_BASE   0xc6120000u           /* 198.18.0.0 */
 #define SYN_MAX    131070u               /* synthetic addresses: 198.18.0.1 .. 198.19.255.254 */
 #define SYN_TTL    300u                  /* seconds, in answers (the address never changes) */

@@ -18,9 +18,16 @@
 #      wildcard rule; a name allowed only on proxied ports gets a stable
 #      address from 198.18.0.0/15 (A; AAAA has no data), in the hosts view
 #      and from the stub, recorded, never looked up and never charged; a name
-#      allowed on another port keeps its real addresses; a connect to a
-#      synthetic address is refused until the hand-off (step 4); the audit
-#      accepts the run and refuses forged synthetic records
+#      allowed on another port keeps its real addresses; the audit accepts
+#      the run and refuses forged synthetic records
+#   4. the hand-off (as root): a TCP connect on a proxied port, to a
+#      synthetic address or to an address no numeric rule allows, reaches the
+#      proxy's listener and is held there (recorded proxy_handoff, with its
+#      connection id); a connect a numeric rule allows is dialed directly; one
+#      a rule denies, one on another port, and a UDP or other-port connect to
+#      a synthetic address are refused; the proxy closes a connection the
+#      Warden did not announce; the audit accepts the run and refuses forged
+#      hand-off records
 #
 # Usage: test_v1260.sh <vdp_check> <vdp_cert_check> [<warden>]
 set -u
@@ -204,8 +211,8 @@ PY
     check "a name allowed on another port keeps its real address" grep -q '^OK A ssh.example.com 10.9.9.2$' "$OUT/s.out"
     check "and so does a name allowed on a proxied port and another" grep -q '^OK A both.example.com 10.9.9.3$' "$OUT/s.out"
     check "a name outside every rule: NXDOMAIN" grep -q '^ERR A nope.example.com -2$' "$OUT/s.out"
-    check "a connect to the synthetic address is refused until the hand-off (synthetic_address)" \
-        sh -c "grep -q '^REFUSED 13$' '$OUT/s.out' && grep -q '\"target\":\"198.18.0.1:443\",[^}]*\"decision_final\":\"DENY\",\"rule\":\"synthetic_address\"' '$OUT/s.log'"
+    check "a connect to the synthetic address on a proxied port is handed to the proxy" \
+        sh -c "grep -q '^CONNECTED$' '$OUT/s.out' && grep -q '\"target\":\"198.18.0.1:443\",\"resolved\":\"127.0.0.1:[0-9]*\",[^}]*\"decision_final\":\"ALLOW\",\"rule\":\"proxy_handoff' '$OUT/s.log'"
     check "the audit accepts the run" \
         python3 "$HERE/tools/varek_audit.py" --policy "$POL" --checker "$CERT" "$OUT/s.log"
     cp "$OUT/s.log" "$OUT/s1.log"
@@ -227,16 +234,19 @@ PY
     check "the audit accepts the run" \
         python3 "$HERE/tools/varek_audit.py" --policy "$POLW" --checker "$CERT" "$OUT/w.log"
 
-    forge() {   # forge <in> <out> <python expression on body>: rewrite the first record matching, rechain
-        python3 - "$1" "$2" "$3" "$4" <<'PY'
-import hashlib, sys
+    forge() {   # forge <in> <out> <from> <to> [re]: rewrite the first record holding <from>, rechain
+        python3 - "$1" "$2" "$3" "$4" "${5:-}" <<'PY'
+import hashlib, re, sys
 head = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
 out, done = [], False
 for line in open(sys.argv[1], encoding="utf-8", errors="surrogateescape"):
     if line.startswith("{") and ',"chain":"' in line:
         cut = line.index(',"chain":"')
         body = line[:cut]
-        if not done and sys.argv[3] in body:
+        if not done and sys.argv[5] == "re" and re.search(sys.argv[3], body):
+            body = re.sub(sys.argv[3], sys.argv[4], body, count=1)
+            done = True
+        elif not done and sys.argv[5] != "re" and sys.argv[3] in body:
             body = body.replace(sys.argv[3], sys.argv[4])
             done = True
         head = hashlib.sha256(head + body.encode("utf-8", "surrogateescape")).digest()
@@ -259,10 +269,94 @@ PY
     forge "$OUT/s1.log" "$OUT/f3.log" '"name":"ssh.example.com","type":28,"transport":"udp","rule":"exact_name","policy_line":4,' \
                                       '"name":"ssh.example.com","type":28,"transport":"udp","rule":"exact_name","policy_line":4,"synthetic":true,'
     refuses "a synthetic answer for a name allowed off the proxied ports" "$POL" "$OUT/f3.log" "allows it off the proxied ports"
-    forge "$OUT/s1.log" "$OUT/f4.log" '"target":"198.18.0.1:443","resolved":"198.18.0.1:443","decision_raw":"DENY","decision_final":"DENY","rule":"synthetic_address"' \
-                                      '"target":"198.18.0.1:443","resolved":"198.18.0.1:443","decision_raw":"ALLOW","decision_final":"ALLOW","rule":"dialed_fd_injection"'
+    forge "$OUT/s1.log" "$OUT/f4.log" '("target":"198\.18\.0\.1:443",)"resolved":"127\.0\.0\.1:[0-9]*",("decision_raw":"[A-Z]*","decision_final":"ALLOW",)"rule":"proxy_handoff[a-z_]*",(.*)"proxy_handoff":true,' \
+                                      '\1"resolved":"198.18.0.1:443",\2"rule":"dialed_fd_injection",\3' re
     refuses "a dialed connect to a synthetic address" "$POL" "$OUT/f4.log" "a connect to the synthetic address 198.18.0.1 was dialed"
     kill "$DNSPID" 2>/dev/null
+    rm -rf "$W"
+fi
+
+echo "== 4. the hand-off =="
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
+    skip "the hand-off (needs root and the warden binary)"
+else
+    W=/tmp/varek_v1260h
+    rm -rf "$W"; mkdir -p "$W"; chmod 755 "$W"
+    cat > "$W/agent.py" <<'PY'
+import socket, sys, time
+# argv: the file the test writes the proxy's port to, then proto:host:port...
+for _ in range(100):
+    try:
+        lport = int(open(sys.argv[1]).read())
+        break
+    except (OSError, ValueError):
+        time.sleep(0.1)
+for t in sys.argv[2:]:
+    proto, host, port = t.split(":")
+    port = lport if port == "L" else int(port)
+    try:
+        if proto == "udp":
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((host, port))
+            print("CONNECTED", t, flush=True)
+            continue
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((host, port))            # blocking, as most clients
+        s.sendall(b"hello")
+        s.settimeout(1)
+        try:
+            d = s.recv(10)
+            print("CONNECTED", t, "EOF" if d == b"" else "DATA", flush=True)
+        except socket.timeout:
+            print("CONNECTED", t, "HELD", flush=True)
+        except OSError as e:
+            print("CONNECTED", t, "EOF", flush=True)   # reset: closed too
+    except OSError as e:
+        print("ERR", t, e.errno, flush=True)
+PY
+    chmod 644 "$W/agent.py"
+    POLH="$OUT/handoff.policy"
+    printf 'require warden 1.26\nproxy on\nproxy ports 443 8443\nallow host api.example.com:443\nallow host 192.0.2.9:8443\ndeny host 192.0.2.8:443\nallow host 127.0.0.1\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/ readonly\n' "$W" > "$POLH"
+    rm -f "$W/port"
+    env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$POLH" -- /usr/bin/python3 "$W/agent.py" "$W/port" \
+        tcp:198.18.0.1:443 tcp:192.0.2.7:443 tcp:192.0.2.7:8443 tcp:192.0.2.8:443 tcp:192.0.2.9:8443 \
+        tcp:192.0.2.7:22 tcp:198.18.0.1:22 udp:198.18.0.1:443 tcp:127.0.0.1:L \
+        > "$OUT/h.out" 2> "$OUT/h.log" &
+    WPID=$!
+    for _ in $(seq 50); do grep -q '"proxy":{' "$OUT/h.log" 2>/dev/null && break; sleep 0.1; done
+    LP=$(grep -o '"listen":"127.0.0.1:[0-9]*' "$OUT/h.log" | grep -o '[0-9]*$')
+    echo "$LP" > "$W/port.tmp"; chmod 644 "$W/port.tmp"; mv "$W/port.tmp" "$W/port"
+    wait "$WPID"
+    sed 's/^/     /' "$OUT/h.out"
+    check "a connect to a synthetic address on a proxied port reaches the proxy, which holds it" \
+        sh -c "grep -q '^CONNECTED tcp:198.18.0.1:443 HELD$' '$OUT/h.out' && grep '\"target\":\"198.18.0.1:443\"' '$OUT/h.log' | grep -q '\"resolved\":\"127.0.0.1:$LP\",\"decision_raw\":\"UNKNOWN\",\"decision_final\":\"ALLOW\",\"rule\":\"proxy_handoff\"'"
+    check "recorded with its connection id and the port the Warden dialed from" \
+        sh -c "grep '\"target\":\"198.18.0.1:443\"' '$OUT/h.log' | grep -q '\"dialed\":\"198.18.0.1:443\",.*\"proxy_handoff\":true,\"proxy_conn\":1,\"proxy_from\":[1-9][0-9]*,'"
+    check "so does a connect to an address no rule allows, on either proxied port" \
+        sh -c "grep -q '^CONNECTED tcp:192.0.2.7:443 HELD$' '$OUT/h.out' && grep -q '^CONNECTED tcp:192.0.2.7:8443 HELD$' '$OUT/h.out'"
+    check "a connect a rule denies is refused, not handed over" \
+        sh -c "grep -q '^ERR tcp:192.0.2.8:443 13$' '$OUT/h.out' && grep '\"target\":\"192.0.2.8:443\"' '$OUT/h.log' | grep -q '\"decision_final\":\"DENY\",\"rule\":\"policy_match\"'"
+    check "a connect a numeric rule allows is dialed directly (certified)" \
+        sh -c "grep '\"target\":\"192.0.2.9:8443\"' '$OUT/h.log' | grep -q '\"resolved\":\"192.0.2.9:8443\",\"decision_raw\":\"ALLOW\",\"decision_final\":\"ALLOW\",\"rule\":\"dial[a-z_]*\".*\"check\":\"ok\"' && ! grep '\"target\":\"192.0.2.9:8443\"' '$OUT/h.log' | grep -q proxy_handoff"
+    check "a connect on a port that is not proxied is decided as before (refused)" \
+        grep -q '^ERR tcp:192.0.2.7:22 13$' "$OUT/h.out"
+    check "a synthetic address on another port, or over UDP, is refused (synthetic_address)" \
+        sh -c "grep -q '^ERR tcp:198.18.0.1:22 13$' '$OUT/h.out' && grep -q '^ERR udp:198.18.0.1:443 13$' '$OUT/h.out' && [ \$(grep -c '\"rule\":\"synthetic_address\"' '$OUT/h.log') = 2 ]"
+    check "the proxy closes a connection the Warden did not announce" \
+        grep -q '^CONNECTED tcp:127.0.0.1:L EOF$' "$OUT/h.out"
+    check "the audit accepts the run" \
+        python3 "$HERE/tools/varek_audit.py" --policy "$POLH" --checker "$CERT" "$OUT/h.log"
+    forge "$OUT/h.log" "$OUT/g1.log" '"proxy_handoff":true,' ''
+    refuses "a hand-off record without its flag" "$POLH" "$OUT/g1.log" "not a TCP connect to the proxy's listener"
+    forge "$OUT/h.log" "$OUT/g2.log" '"target":"198.18.0.1:443"' '"target":"198.18.0.1:22"'
+    refuses "a hand-off on a port that is not proxied" "$POLH" "$OUT/g2.log" "not on a proxied port"
+    forge "$OUT/h.log" "$OUT/g3.log" '"proxy_conn":2,' '"proxy_conn":1,'
+    refuses "two hand-offs with one connection id" "$POLH" "$OUT/g3.log" "without a connection id of its own"
+    forge "$OUT/h.log" "$OUT/g4.log" '"target":"192.0.2.8:443","resolved":"192.0.2.8:443","decision_raw":"DENY","decision_final":"DENY","rule":"policy_match",' \
+                                     '"target":"192.0.2.8:443","resolved":"127.0.0.1:'"$LP"'","decision_raw":"DENY","decision_final":"ALLOW","rule":"proxy_handoff","proxy_handoff":true,"proxy_conn":9,'
+    refuses "a hand-off of a connect a rule denies" "$POLH" "$OUT/g4.log" "denies was handed to the proxy"
+    printf 'require warden 1.26\nallow host api.example.com:443\nallow host 192.0.2.9:8443\ndeny host 192.0.2.8:443\nallow host 127.0.0.1\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/ readonly\n' "$W" > "$OUT/noproxy.policy"
+    refuses "hand-offs under a policy without the proxy" "$OUT/noproxy.policy" "$OUT/h.log" "the proxy is not on"
     rm -rf "$W"
 fi
 
