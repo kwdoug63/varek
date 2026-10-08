@@ -2,8 +2,7 @@
 
 > **DRAFT, not released.** The review was done by AI review agents; a human
 > or third-party review has not been done. Still to come before tagging:
-> - a short soak trial on the final Warden (the 24-hour soak ran on the
->   Warden before the review's fixes).
+> - the release date.
 
 Released PENDING · MIT · github.com/kwdoug63/varek
 
@@ -154,8 +153,9 @@ is exercised by `make test-v1250` (40 names on one address), not here.
 **The run used the Warden before the review.** It was built from the v1.25
 branch as of section 5 (5ef3046), before the acknowledgment, the review's
 fixes and the version bump (its `run_start` says 1.23.1). Its policy has no
-`acknowledge=dns-channel`. A short trial on the final Warden confirms the
-release.
+`acknowledge=dns-channel`. A 3-minute trial on the final Warden, on the same
+droplet, passed: 3 fetches over 3 names, 0 refused, every question
+recorded, no budget refusal, and `varek_audit.py` PASS.
 
 ## Found in the soak
 

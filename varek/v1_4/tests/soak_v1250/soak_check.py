@@ -144,9 +144,11 @@ def main():
 
     # 5. peers bound by the resolution records
     res = [r for r in recs if r.get("event") == "resolution"]
-    lookups = sum(1 for r in res if r.get("dynamic") and r.get("a") != "retired")
+    # (v1.25 review: grace_end and unanswered records are not lookups either)
+    lookups = sum(1 for r in res if r.get("dynamic") and r.get("a") not in ("retired", "grace_end", "unanswered"))
     retired = sum(1 for r in res if r.get("a") == "retired")
-    say(f"resolution records: {lookups} lookups on demand, {retired} retirements")
+    ended = sum(1 for r in res if r.get("a") == "grace_end")
+    say(f"resolution records: {lookups} lookups on demand, {retired} retirements, {ended} ends of grace")
 
     def bound(name, addr, t_ns):
         latest = None
