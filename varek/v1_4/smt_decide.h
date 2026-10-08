@@ -149,9 +149,16 @@ typedef struct {
     uint32_t       names, rate;
 } vdp_rule_t;
 
+#define VDP_PROXY_MAX_PORTS 16
+
 typedef struct {
     vdp_rule_t rules[VDP_MAX_RULES];
     size_t     n;
+    /* v1.26: `proxy on` (the egress proxy, SNI mode) and `proxy ports P...`
+     * (0 ports: the default, 80 and 443). Not part of any decision. */
+    bool       proxy;
+    unsigned   proxy_ports[VDP_PROXY_MAX_PORTS];
+    size_t     proxy_nports;
 } vdp_policy_t;
 
 /* Why a verdict was reached (for records). */
@@ -354,8 +361,10 @@ bool vdp_host_rule_ok(const vdp_rule_t *r, char *why, size_t wn);
  * v1.24: host names (`allow host api.example.com:443`); a name without a port
  * matches every port. Name rules need `require warden 1.24` before them.
  * v1.25: wildcard host names (`allow host *.example.com:443`), after
- * `require warden 1.25`; see vdp_host_wildcard_glob. */
+ * `require warden 1.25`; see vdp_host_wildcard_glob.
+ * v1.26: the egress proxy (`proxy on`, `proxy ports`), after
+ * `require warden 1.26`. */
 #define VDP_WARDEN_MAJOR 1
-#define VDP_WARDEN_MINOR 25
+#define VDP_WARDEN_MINOR 26
 
 #endif /* VAREK_SMT_DECIDE_H */

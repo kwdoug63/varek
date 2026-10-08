@@ -80,7 +80,7 @@
 #include <stdint.h>
 
 #define VDPC_GRAMMAR_MAJOR 1
-#define VDPC_GRAMMAR_MINOR 25
+#define VDPC_GRAMMAR_MINOR 26
 
 #define VDPC_MAX_S        4095
 #define VDPC_MAX_RULES    256
@@ -95,6 +95,9 @@ typedef struct {
     vdpc_rule_t  *rules;
     size_t        n;
     unsigned char sha256[32];         /* of the policy bytes as loaded */
+    int           proxy;              /* v1.26: `proxy on` */
+    unsigned      proxy_ports[16];    /* v1.26: `proxy ports`, in order; none: the default */
+    size_t        proxy_nports;
 } vdpc_policy_t;
 
 typedef struct {

@@ -449,6 +449,7 @@ def parse_lines(raw_lines, path):
     req = (0, 0)                   # highest `require warden` so far
     legacy_name = False            # v1.24: a host name read before `require warden 1.24`
     glob_tokens = 0
+    proxy, proxy_ports = False, None   # v1.26: `proxy on`, `proxy ports`
     if True:
         for lineno, raw in enumerate(raw_lines, 1):
             if b"\0" in raw:
@@ -470,12 +471,30 @@ def parse_lines(raw_lines, path):
                 if len(toks) != 3 or toks[1] != "warden" or not m:
                     raise PolicyError(f"{path}:{lineno}: bad directive")
                 v = (int(m.group(1)), int(m.group(2)))
-                if v > (1, 25):
+                if v > (1, 26):
                     raise PolicyError(f"{path}:{lineno}: requires newer Warden")
                 if legacy_name and v >= (1, 24):
                     raise PolicyError(f"{path}:{lineno}: require warden 1.24 after a host name")
                 req = max(req, v)
                 continue
+            if toks[0] == "proxy":
+                # v1.26: the egress proxy; `proxy inspect` is v1.26.1
+                if req < (1, 26):
+                    raise PolicyError(f"{path}:{lineno}: proxy before 1.26")
+                if toks[1:] == ["on"]:
+                    if proxy:
+                        raise PolicyError(f"{path}:{lineno}: proxy on twice")
+                    proxy = True
+                    continue
+                if len(toks) >= 3 and toks[1] == "ports" and proxy_ports is None and len(toks) - 2 <= 16:
+                    ports = []
+                    for t in toks[2:]:
+                        if not re.fullmatch(r"[1-9][0-9]{0,4}", t) or int(t) > 65535 or int(t) in ports:
+                            raise PolicyError(f"{path}:{lineno}: bad proxy port {t!r}")
+                        ports.append(int(t))
+                    proxy_ports = ports
+                    continue
+                raise PolicyError(f"{path}:{lineno}: bad proxy directive")
             if len(toks) < 3:
                 raise PolicyError(f"{path}:{lineno}: bad rule")
             verb, kind = toks[0], toks[1]
@@ -576,6 +595,8 @@ def parse_lines(raw_lines, path):
                  "wild": wild}
             r["lang"] = atom_rx(rx, r)
             rules.append(r)
+    if proxy_ports is not None and not proxy:
+        raise PolicyError(f"{path}: proxy ports without proxy on")
     return rules, rx
 
 
@@ -1085,7 +1106,21 @@ def fuzz_policy(rng, path):
                  "a.example.com", "a.example.com:443", "b.example.com", "x.a.b.example.com",
                  "example.com", "*.example.org", "1.2.3.4", "1.2.3.4:443"]
         bad = ["*.com", "*.example.com:0443", "a.*.example.com", "*.Example.com", "*"]
-        lines.append("require warden 1.25")
+        # v1.26: the proxy directives, valid and (when the policy may be
+        # invalid) misplaced, repeated or malformed
+        v126 = rng.random() < 0.4
+        lines.append("require warden 1.26" if v126 else "require warden 1.25")
+        if v126 or (not valid and rng.random() < 0.2):
+            lines.append("proxy on")
+            if rng.random() < 0.5:
+                lines.append("proxy ports " + " ".join(rng.sample(["80", "443", "8443", "8080", "1", "65535"],
+                                                                rng.randint(1, 3))))
+            if not valid and rng.random() < 0.3:
+                lines.append(rng.choice(["proxy on", "proxy inspect", "proxy ports 0", "proxy ports 443 443",
+                                         "proxy ports 65536", "proxy ports 080", "proxy", "proxy off",
+                                         "proxy ports " + " ".join(["1"] + [str(i) for i in range(2, 18)])]))
+        elif not valid and rng.random() < 0.1:
+            lines.append(rng.choice(["proxy on", "proxy ports 443"]))      # before 1.26, or alone
         # v1.25 section 4: budgets on wildcard allow rules (and, when the
         # policy may be invalid, where they do not belong or out of range)
         good_b = ["names=1", "names=64", "names=100000", "rate=1", "rate=10", "rate=10000"]
@@ -1118,7 +1153,7 @@ def fuzz_policy(rng, path):
         lines.append(rng.choice(["require warden 1.14", "require warden 1.13", "require warden 01.14",
                                  "require warden 1.15", "require warden 1.16", "require warden 1.21",
                                  "require warden 1.24", "require warden 1.24", "require warden 1.25"] +
-                                ([] if valid else ["require warden 1.26", "require warden x",
+                                ([] if valid else ["require warden 1.27", "require warden x",
                                                    "require warden +1.14", "require warden 1.+14",
                                                    "require warden 1.1400000"])))
     elif rng.random() < 0.35:

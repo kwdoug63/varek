@@ -562,6 +562,30 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
                 else if (legacy_name && ver_ge(a, b, 1, 24))
                     rc = fail(err, en, name, ln, "require warden after a host name it would change");
                 else if (ver_ge(a, b, req_maj, req_min)) { req_maj = a; req_min = b; }
+            } else if (!strcmp(tok[0], "proxy")) {
+                /* v1.26: proxy on | proxy ports P... (inspect: v1.26.1) */
+                if (!ver_ge(req_maj, req_min, 1, 26))
+                    rc = fail(err, en, name, ln, "proxy before require warden 1.26");
+                else if (nt == 2 && !strcmp(tok[1], "on")) {
+                    if (p->proxy) rc = fail(err, en, name, ln, "proxy on twice");
+                    p->proxy = 1;
+                } else if (nt >= 3 && !strcmp(tok[1], "ports") && !p->proxy_nports && nt - 2 <= 16) {
+                    for (int k = 2; k < nt && rc == 0; k++) {
+                        const char *d = tok[k];
+                        size_t dl = strlen(d);
+                        unsigned long x = 0;
+                        if (dl == 0 || dl > 5 || d[0] == '0') rc = fail(err, en, name, ln, "bad port");
+                        for (size_t q = 0; rc == 0 && q < dl; q++) {
+                            if (d[q] < '0' || d[q] > '9') rc = fail(err, en, name, ln, "bad port");
+                            x = x * 10 + (unsigned long)(d[q] - '0');
+                        }
+                        if (rc == 0 && x > 65535) rc = fail(err, en, name, ln, "bad port");
+                        for (size_t q = 0; rc == 0 && q < p->proxy_nports; q++)
+                            if (p->proxy_ports[q] == x) rc = fail(err, en, name, ln, "port twice");
+                        if (rc == 0) p->proxy_ports[p->proxy_nports++] = (unsigned)x;
+                    }
+                } else
+                    rc = fail(err, en, name, ln, "bad proxy directive");
             } else if (nt < 3) {
                 rc = fail(err, en, name, ln, "bad rule");
             } else if (p->n == VDPC_MAX_RULES) {
@@ -574,6 +598,10 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
         }
         free(heap);
         if (rc < 0) { vdpc_free(p); return -1; }
+    }
+    if (p->proxy_nports && !p->proxy) {
+        vdpc_free(p);
+        return fail(err, en, name, ln, "proxy ports without proxy on");
     }
     return 0;
 }

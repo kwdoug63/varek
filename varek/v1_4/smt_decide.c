@@ -747,6 +747,50 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             if (maj > req_maj || (maj == req_maj && mn > req_min)) { req_maj = maj; req_min = mn; }
             continue;
         }
+        /* v1.26: the egress proxy. `proxy on` (SNI mode); `proxy ports P...`
+         * (the ports whose connects go to it, default 80 and 443). Inspecting
+         * mode (`proxy inspect`) is planned for v1.26.1. */
+        if (!strcmp(tok[0], "proxy")) {
+            if (!(req_maj > 1 || (req_maj == 1 && req_min >= 26))) {
+                rc = perr(err, errlen, path, lineno, "`proxy` needs `require warden 1.26` before it");
+                break;
+            }
+            if (nt == 2 && !strcmp(tok[1], "on")) {
+                if (p->proxy) { rc = perr(err, errlen, path, lineno, "`proxy on` given twice"); break; }
+                p->proxy = true;
+                continue;
+            }
+            if (nt >= 2 && !strcmp(tok[1], "inspect")) {
+                rc = perr(err, errlen, path, lineno, "`proxy inspect` (inspecting mode) is planned for "
+                          "v1.26.1; use `proxy on`");
+                break;
+            }
+            if (nt >= 3 && !strcmp(tok[1], "ports")) {
+                if (p->proxy_nports) { rc = perr(err, errlen, path, lineno, "`proxy ports` given twice"); break; }
+                if (nt - 2 > VDP_PROXY_MAX_PORTS) {
+                    rc = perr(err, errlen, path, lineno, "`proxy ports` names more than %d ports",
+                              VDP_PROXY_MAX_PORTS);
+                    break;
+                }
+                for (int i = 2; i < nt && rc == 0; i++) {
+                    const char *v = tok[i];
+                    unsigned long x = 0;
+                    bool ok = v[0] >= '1' && v[0] <= '9' && strlen(v) <= 5;
+                    for (const char *q = v; ok && *q; q++) {
+                        if (*q < '0' || *q > '9') ok = false;
+                        else x = x * 10 + (unsigned long)(*q - '0');
+                    }
+                    if (!ok || x > 65535) rc = perr(err, errlen, path, lineno, "'%s': a port is 1 to 65535", v);
+                    for (size_t k = 0; rc == 0 && k < p->proxy_nports; k++)
+                        if (p->proxy_ports[k] == x) rc = perr(err, errlen, path, lineno, "port %lu given twice", x);
+                    if (rc == 0) p->proxy_ports[p->proxy_nports++] = (unsigned)x;
+                }
+                if (rc) break;
+                continue;
+            }
+            rc = perr(err, errlen, path, lineno, "bad directive (need: proxy on, or proxy ports <port>...)");
+            break;
+        }
         if (nt < 3) { rc = perr(err, errlen, path, lineno, "bad rule (need: verb kind constant)"); break; }
         if (p->n >= VDP_MAX_RULES) {
             rc = perr(err, errlen, path, lineno,
@@ -936,6 +980,8 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             goto out;
         }
     }
+    if (rc == 0 && p->proxy_nports && !p->proxy)
+        rc = perr(err, errlen, path, lineno, "`proxy ports` without `proxy on`");
 out:
     free(line);
     fclose(f);

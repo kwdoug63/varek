@@ -94,7 +94,7 @@ refused "a port with a leading zero"       "${R}allow host api.example.com:0443\
 refused "an empty port"                    "${R}allow host api.example.com:\n"  "port"
 refused "two ports"                        "${R}allow host api.example.com:1:2\n" "port"
 refused "require 1.24 after a host name"   "allow host api.example.com\nrequire warden 1.24\n" "before the host rules"
-refused "require a later grammar"          "require warden 1.26\n"              "this is 1.25"
+refused "require a later grammar"          "require warden 1.27\n"              "this is 1.26"
 
 # Decisions: a name without a port matches every port; with a port, only it.
 batch() { printf '%s\n' "$@" | "$VDP" "$T/v1240_names_policy.txt" batch; }

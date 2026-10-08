@@ -367,6 +367,15 @@ static int policy_load(const char *path, struct policy *p) {
             return -1;
         }
     }
+    /* v1.26: and the proxy directives */
+    bool proxy_same = p->v.proxy == (p->c.proxy != 0) && p->v.proxy_nports == p->c.proxy_nports;
+    for (size_t k = 0; proxy_same && k < p->v.proxy_nports; k++)
+        proxy_same = p->v.proxy_ports[k] == p->c.proxy_ports[k];
+    if (!proxy_same) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
+                "the proxy directives differently; refusing to start\n", path);
+        return -1;
+    }
     /* v1.13: load-time analysis. The decision procedure decides, for every
      * rule, whether ANY action can reach it as the first matching rule. A rule
      * that can never fire is almost always a policy bug (typically a deny
