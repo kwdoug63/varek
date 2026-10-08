@@ -503,6 +503,23 @@ JAVA
     refuses "an inspected host passed on without being inspected" "$OUT/g4.log" "was not inspected, which it must be"
     for pid in $SRV; do kill "$pid" 2>/dev/null; done
     rm -rf "$W"
+
+    echo "== 7. bench =="
+    # varek bench --proxy: requests natively, in SNI mode and in inspecting
+    # mode, every outcome checked; and no delayed-ACK stall on a new
+    # inspected connection (before step 8, about 40 ms: the proxy sends
+    # nothing after the client's Finished, with no session tickets)
+    if NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 "$HERE/tools/varek" bench --proxy -n 30 --warmup 3 --rounds 1 \
+           -o "$OUT/bench.json" > "$OUT/bench.out" 2>&1 &&
+       python3 - "$OUT/bench.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+k = r["kinds"]
+sys.exit(not (r["ok"] and k["https"]["added_p50_us"]["inspect"] < 30000 and
+              k["request"]["added_p50_us"]["inspect"] < 10000 and r["warden_us"]["request_allowed"]["n"] >= 29))
+PY
+    then pass "varek bench --proxy: every check passed; inspecting mode adds $(python3 -c "import json; k = json.load(open('$OUT/bench.json'))['kinds']; print(f\"{k['https']['added_p50_us']['inspect'] / 1000:.1f} ms to a new connection, {k['request']['added_p50_us']['inspect']:.0f} us to a kept-alive request\")")"
+    else flunk "varek bench --proxy ($(grep -m3 'FAIL\|varek:' "$OUT/bench.out"))"; fi
 fi
 
 echo "== 4. terminating TLS =="

@@ -32,7 +32,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden warden-proxy target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 latency-v1260 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck harness video-v112
+.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 latency-v1260 latency-v1261 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -352,6 +352,10 @@ latency-v1250: warden
 latency-v1260: warden warden-proxy
 	@sudo ./tests/latency_v1260.sh ./warden 1000
 
+# v1.26.1, step 8: the same table in SNI and inspecting mode, with kept-alive rows
+latency-v1261: warden warden-proxy
+	@sudo ./tests/latency_v1261.sh ./warden 1000
+
 test-v1240: warden tools/vdp_check tools/vdp_cert_check tests/test_v1240_resolve
 	@./tests/test_v1240.sh ./tools/vdp_check ./tools/vdp_cert_check ./tests/test_v1240_resolve \
 	    $(if $(filter 0,$(shell id -u)),./warden)
@@ -435,7 +439,8 @@ BINDIR ?= /usr/local/bin
 INSTALL_TOOLS := tools/varek tools/vdp_check tools/vdp_cert_check tools/varek_keygen \
 	tools/varek_audit.py tools/varek_cyclonedx.py tools/varek_ed25519.py \
 	tools/varek_preflight.sh tools/varek_anchor_forward.py tools/varek_anchor_receiver.sh \
-	tools/varek_license.py tools/varek_bench.py tools/bench_workload
+	tools/varek_license.py tools/varek_bench.py tools/varek_bench_proxy.py tools/bench_proxy_client.py \
+	tools/bench_workload
 
 install: warden warden-proxy tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/tools $(DESTDIR)$(PREFIX)/policies $(DESTDIR)$(PREFIX)/data $(DESTDIR)$(BINDIR)
@@ -454,4 +459,4 @@ uninstall:
 	@echo "removed $(PREFIX); settings in /etc/varek and logs in /var/log/varek were kept"
 
 test-cli: warden warden-proxy tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
-	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_license.py tests/test_varek_bench.py
+	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_license.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py

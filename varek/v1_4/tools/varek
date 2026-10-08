@@ -1043,9 +1043,68 @@ def cmd_export(args):
     return rc
 
 
+def cmd_bench_proxy(args, cfg):
+    """v1.26.1: `varek bench --proxy`."""
+    import varek_bench_proxy        # only here: the rest of the command does not need it
+    if args.policy or args.bare:
+        raise CliError("--proxy measures with the bench's own policies; --policy and --bare do not apply")
+    args.n = 200 if args.n is None else args.n
+    args.warmup = 20 if args.warmup is None else args.warmup
+    args.rounds = 3 if args.rounds is None else args.rounds
+    if args.n < 10 or args.rounds < 1 or args.warmup < 0:
+        raise CliError("use -n of at least 10, --rounds of at least 1 and --warmup of 0 or more")
+    run_as = args.run_as or (cfg["run_as"] if cfg else "nobody")
+    sign_key = cfg["sign_key"] if cfg and cfg["sign_key"] and not args.no_sign else None
+    if args.output and not os.access(os.path.dirname(os.path.abspath(args.output)), os.W_OK):
+        raise CliError(f"cannot write {args.output}", fix="give -o a path in a writable directory")
+    if SHOW_COMMANDS:
+        print(_paint("2", f"$ {warden_bin()} <bench policy> --dns-server <bench> --run-as {run_as} -- "
+                          f"python3 bench_proxy_client.py ...  (SNI and inspecting mode, and natively)"),
+              file=sys.stderr)
+    progress = (lambda m: None) if args.json else (
+        lambda m: print(_paint("2", f"[varek] bench --proxy {m}"), file=sys.stderr))
+    try:
+        res = varek_bench_proxy.run(warden_bin(), tool("vdp_cert_check"), n=args.n, warmup=args.warmup,
+                                    rounds=args.rounds, run_as=run_as, sign_key=sign_key,
+                                    progress=progress, keep=args.keep)
+    except varek_bench.BenchError as e:
+        raise CliError(str(e), fix=e.fix)
+    res["varek_command"] = CLI_VERSION
+    budget_fail = []
+    if args.max_added_p50 is not None:
+        budget_fail = [f"{k} ({m})" for k, r in res["kinds"].items()
+                       for m, v in r["added_p50_us"].items() if k != "denied" and v > args.max_added_p50]
+        res["budget"] = {"max_added_p50_us": args.max_added_p50, "over": budget_fail}
+    if args.output:
+        try:
+            with open(args.output, "w") as fh:
+                json.dump(res, fh, indent=2)
+                fh.write("\n")
+        except OSError as e:
+            warn(f"could not write {args.output}: {e}")
+            args.output = None
+    if args.json:
+        print(json.dumps(res, indent=2))
+    else:
+        sys.stdout.write(varek_bench_proxy.format_report(res, CLI_VERSION))
+        if budget_fail:
+            fail(f"added p50 over {args.max_added_p50} us: " + ", ".join(budget_fail))
+        if args.output:
+            ok(f"results written to {args.output}")
+        if res.get("kept"):
+            info(f"  kept: the bench's files in {res['kept'][0]}; its policies and verdict "
+                 f"streams in {res['kept'][1]}")
+    return 0 if res["ok"] and not budget_fail else 1
+
+
 def cmd_bench(args):
     need_root("bench")
     cfg = load_config(required=False)
+    if args.proxy:
+        return cmd_bench_proxy(args, cfg)
+    args.n = 2000 if args.n is None else args.n
+    args.warmup = 200 if args.warmup is None else args.warmup
+    args.rounds = 5 if args.rounds is None else args.rounds
     if args.bare and args.policy:
         raise CliError("--bare and --policy cannot be combined",
                        fix="--bare measures the bench's own rules only; --policy adds a policy's rules")
@@ -1234,13 +1293,17 @@ def build_parser():
                     "reports per-call times, the time the Warden adds and its own decision "
                     "time, and checks every verdict. Uses the active policy's rules plus the "
                     "bench's own (or only the bench's own with --bare). Exit 1 if a check "
-                    "fails or --max-added-p50 is exceeded.")
+                    "fails or --max-added-p50 is exceeded. With --proxy: HTTPS requests "
+                    "natively, through the egress proxy in SNI mode and in inspecting mode.")
+    sp.add_argument("--proxy", action="store_true",
+                    help="measure the egress proxy instead: HTTPS requests natively, in SNI mode and "
+                         "in inspecting mode (defaults -n 200 --warmup 20 --rounds 3)")
     sp.add_argument("--policy", help="measure with this pack or policy file's rules instead of the active policy")
     sp.add_argument("--bare", action="store_true", help="the bench's own rules only, no policy")
-    sp.add_argument("-n", type=int, default=2000,
+    sp.add_argument("-n", type=int, default=None,
                     help="timed calls of each kind per run (default 2000)")
-    sp.add_argument("--warmup", type=int, default=200, help="untimed calls of each kind first (default 200)")
-    sp.add_argument("--rounds", type=int, default=5,
+    sp.add_argument("--warmup", type=int, default=None, help="untimed calls of each kind first (default 200)")
+    sp.add_argument("--rounds", type=int, default=None,
                     help="native and Warden runs, alternating (default 5 of each)")
     sp.add_argument("--run-as", help="user the workload runs as (default from settings, or nobody)")
     sp.add_argument("--no-sign", action="store_true", help="do not sign the bench's verdict streams")

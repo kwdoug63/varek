@@ -20,6 +20,7 @@
 #include <grp.h>
 #include <linux/capability.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <signal.h>
@@ -574,6 +575,13 @@ static void s_shut(struct wp_held *h) {
  * HTTP: relaying, each request decided, from what the client sent. */
 static bool tls_begin(int k) {
     struct wp_held *h = &g_held[k];
+    /* step 8: the proxy writes its own records on both sides (a handshake's
+     * flights, a request's head then its body, a 403): send each at once.
+     * With Nagle's algorithm a small write waits for the peer's delayed ACK
+     * of the one before, about 40 ms, on every new connection. */
+    static const int one = 1;
+    (void)setsockopt(h->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    (void)setsockopt(h->up, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     h->state = WH_TLS;
     h->since = h->relay_at = mono_ms();
     h->ig = IG_HEAD;
@@ -801,6 +809,14 @@ static bool tls_step(int k, short crev, short srev) {
                 return false;
             }
             if (c_flush(h) < 0) { h->why = "reset"; return false; }
+            /* step 8: acknowledge the client's next segments at once. With
+             * no session tickets the proxy sends nothing after the client's
+             * Finished, so its ACK would wait the delayed-ACK time (about
+             * 40 ms), and a client whose request follows its Finished in a
+             * second small write (Nagle) waits for that ACK before sending
+             * it. A server that sends tickets acknowledges with them. */
+            static const int one = 1;
+            (void)setsockopt(h->fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof one);
             if (h->c_sock_eof && !BIO_ctrl_pending(h->crb)) {
                 h->why = "client_tls";
                 snprintf(h->tls_why, sizeof h->tls_why, "the client closed during the handshake");
