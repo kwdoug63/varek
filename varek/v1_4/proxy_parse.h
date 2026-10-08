@@ -61,6 +61,13 @@ typedef struct {
  * acked: the proxy has answered its CONNECT). */
 pp_status_t pp_parse(const uint8_t *in, size_t n, unsigned dport, bool acked, pp_result_t *r);
 
+/* Section 5: the upstream proxy's reply to the proxy's CONNECT: a status
+ * line "HTTP/1.x DDD ..." and headers, within PP_HTTP_MAX bytes, CRLF only.
+ * PP_OK for a 2xx status (len: the reply's length; what follows it is the
+ * server's), PP_REFUSE for any other (status set, or 0 if unreadable; why
+ * set), PP_MORE to read more. */
+pp_status_t pp_upstream_reply(const uint8_t *in, size_t n, unsigned *status, size_t *len, const char **why);
+
 /* The kind's word in records ("tls", "http", "connect"). */
 const char *pp_kind_name(pp_kind_t k);
 

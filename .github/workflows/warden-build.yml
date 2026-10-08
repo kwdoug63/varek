@@ -30,6 +30,8 @@ jobs:
           # v1.24: test_v1240.sh runs a Java client as the agent, with the
           # distribution's OpenJDK (the runner's preinstalled JDKs differ)
           sudo apt-get install -y openjdk-21-jdk-headless musl-tools
+          # v1.26 section 5: test_v1260.sh chains the proxy to a Squid upstream
+          sudo apt-get install -y --no-install-recommends squid
       - name: Build the Warden and its tools
         run: make -C varek/v1_4 all
       - name: Check the deployment scripts parse
@@ -54,7 +56,7 @@ jobs:
         run: sudo make -C varek/v1_4 test-v1250
       - name: v1.26 the proxy's parsers under ASan/UBSan (vectors, then 2M fuzzed inputs)
         run: make -C varek/v1_4 fuzz-proxy-parse
-      - name: v1.26 egress proxy (grammar, the proxy process, synthetic addresses, hand-off, parsers)
+      - name: v1.26 egress proxy (grammar, proxy process, synthetic addresses, hand-off, parsers, decisions, closes, audit, upstream)
         run: sudo make -C varek/v1_4 test-v1260
       - name: Build and test the plan_verify CLI (v1_6, v1.16.3)
         run: make -C v1_6 plan_verify check check-plan-verify

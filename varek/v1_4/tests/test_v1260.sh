@@ -54,6 +54,14 @@
 #      without the proxy, a direct connect on a proxied port that no numeric
 #      rule decided, and a hand-off of a connect a numeric rule allows or a
 #      rule denies
+#   9. the upstream proxy (section 5; as root, with Squid where installed):
+#      `proxy upstream http://host:port` in the grammar; decided names are
+#      asked of the upstream with CONNECT and relayed through it (TLS, and
+#      HTTP inside the tunnel); the upstream's own refusal reaches the client
+#      and is recorded with its status; a name the policy refuses never
+#      reaches the upstream; an upstream named by host name is resolved by
+#      the Warden and kept out of the agent's views; the audit accepts the
+#      runs and refuses forged upstream records
 #
 # Usage: test_v1260.sh <vdp_check> <vdp_cert_check> [<warden>]
 # (section 5 also uses tests/proxy_parse_test: make tests/proxy_parse_test)
@@ -114,6 +122,19 @@ refused "proxy off"                          "${R}proxy off\n"                  
 refused "proxy on with more"                 "${R}proxy on now\n"                       "bad directive"
 refused "proxy inspect (v1.26.1)"            "${R}proxy inspect\n"                      "planned for v1.26.1"
 refused "require 1.27"                       'require warden 1.27\n'                    "this is 1.26"
+# section 5: the upstream proxy
+accepted "an upstream by name"               "${R}proxy on\nproxy upstream http://Proxy.Corp.example:3128\n${H}"
+accepted "an upstream by address, a slash"   "${R}proxy on\nproxy upstream http://10.0.0.5:8080/\n${H}"
+accepted "an upstream on loopback"           "${R}proxy upstream http://127.0.0.1:3128\nproxy on\n${H}"
+refused "an https upstream"                  "${R}proxy on\nproxy upstream https://p.example:3128\n" "https:// upstream is not taken"
+refused "an upstream with credentials"       "${R}proxy on\nproxy upstream http://u:pw@p.example:3128\n" "credentials"
+refused "an upstream without a port"         "${R}proxy on\nproxy upstream http://p.example\n"    "needs a port"
+refused "an upstream on port 0"              "${R}proxy on\nproxy upstream http://p.example:0\n"  "port is 1 to 65535"
+refused "an upstream with a path"            "${R}proxy on\nproxy upstream http://p.example:3128/x\n" "http://host:port"
+refused "an upstream at a bad address"       "${R}proxy on\nproxy upstream http://256.1.1.1:3128\n" "not a host name or an IPv4"
+refused "an upstream at an IPv6 address"     "${R}proxy on\nproxy upstream http://[::1]:3128\n"   "http://host:port"
+refused "an upstream twice"                  "${R}proxy on\nproxy upstream http://a.example:1\nproxy upstream http://b.example:2\n" "given twice"
+refused "an upstream without proxy on"       "${R}proxy upstream http://p.example:3128\n"         "without \`proxy on\`"
 
 if [ -n "$WARDEN" ]; then
     printf 'require warden 1.26\nproxy on\nproxy ports 443 8443\nallow host api.example.com:443\n' > "$OUT/w.txt"
@@ -577,7 +598,8 @@ PY
     rm -f "$OUT/ready6"
     python3 "$HERE/tests/dns_test_server.py" --port "$PORT" --zone "$OUT/zone6.json" --log "$OUT/q6.log" \
         --ready "$OUT/ready6" > /dev/null 2>&1 &
-    SRV="$SRV $!"
+    DNSP=$!
+    SRV="$SRV $DNSP"
     for _ in $(seq 50); do
         [ -e "$OUT/ready6" ] && python3 -c "import socket; socket.create_connection(('$HOSTIP', $HP), 0.2); socket.create_connection(('$HOSTIP', $TP), 0.2)" 2>/dev/null && break
         sleep 0.1
@@ -789,6 +811,116 @@ PY
     forge "$OUT/h.log" "$OUT/x5.log" '"dialed":"192.0.2.7:443","candidates":["192.0.2.7:443"],"resolution_generation":0,"proxy_handoff":true' \
                                      '"dialed":"192.0.2.8:443","candidates":["192.0.2.8:443"],"resolution_generation":0,"proxy_handoff":true'
     refuses "a hand-off of a connect a rule denies (the policy asked again)" "$POLH" "$OUT/x5.log" "denies was handed to the proxy"
+
+    echo "== 9. the upstream proxy =="
+    if ! command -v squid > /dev/null && [ ! -x /usr/sbin/squid ]; then
+        skip "the upstream proxy (Squid is not installed)"
+    else
+        SQUID=$(command -v squid || echo /usr/sbin/squid)
+        SQ=/tmp/varek_v1260sq
+        rm -rf "$SQ"; mkdir -p "$SQ"; chmod 777 "$SQ"
+        SP=$((45500 + RANDOM % 3000))
+        printf '%s api.example.com\n%s blocked.example.com\n' "$HOSTIP" "$HOSTIP" > "$SQ/hosts"
+        { printf 'http_port %s:%s\n' "$HOSTIP" "$SP"
+          printf 'acl blocked dstdomain blocked.example.com\nhttp_access deny blocked\nhttp_access allow all\n'
+          printf 'hosts_file %s/hosts\naccess_log %s/access.log\ncache_log %s/cache.log\npid_filename %s/squid.pid\n' "$SQ" "$SQ" "$SQ" "$SQ"
+          printf 'cache deny all\ncoredump_dir %s\nshutdown_lifetime 1 seconds\n' "$SQ"
+        } > "$SQ/squid.conf"
+        chmod 644 "$SQ"/*
+        ( cd "$SQ" && "$SQUID" -N -f "$SQ/squid.conf" > "$SQ/out.log" 2>&1 & )
+        for _ in $(seq 100); do python3 -c "import socket; socket.create_connection(('$HOSTIP', $SP), 0.2)" 2>/dev/null && break; sleep 0.1; done
+        cat > "$W/up.py" <<'PY'
+import socket, ssl, sys, urllib.request
+TP, HP = int(sys.argv[1]), int(sys.argv[2])
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+def tls(tag, where, sni):
+    try:
+        s = ctx.wrap_socket(socket.create_connection((where, TP), 10), server_hostname=sni)
+        s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        out = b""
+        while True:
+            d = s.recv(4096)
+            if not d: break
+            out += d
+        print("TLS", tag, out.split(b"\r\n\r\n", 1)[-1].decode(), flush=True)
+    except ssl.SSLError as e:
+        print("TLS", tag, "ALERT" if "HANDSHAKE_FAILURE" in str(e).upper() else "SSLERR", flush=True)
+    except OSError as e:
+        print("TLS", tag, "ERR", e.errno, flush=True)
+tls("allowed", "api.example.com", "api.example.com")
+tls("upstream-refuses", "blocked.example.com", "blocked.example.com")
+tls("policy-refuses", "api.example.com", "evil.example.com")     # api's address, another SNI
+try:
+    print("URLLIB", urllib.request.urlopen("http://api.example.com:%d/x.txt" % HP, timeout=10).read().decode().strip(), flush=True)
+except Exception as e:
+    print("URLLIB ERR", e, flush=True)
+try:
+    socket.getaddrinfo("squid.example.com", 80)
+    print("SQUIDNAME resolves", flush=True)
+except OSError:
+    print("SQUIDNAME hidden", flush=True)
+PY
+        chmod 644 "$W/up.py"
+        upol() {   # upol <upstream>: the policy chained to it
+            printf 'require warden 1.26\nproxy on\nproxy ports %s %s\nproxy upstream %s\n' "$TP" "$HP" "$1"
+            printf 'allow host api.example.com:%s\nallow host api.example.com:%s\nallow host blocked.example.com:%s\n' "$TP" "$HP" "$TP"
+            printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path /etc/ssl/ readonly\nallow path %s/ readonly\n' "$W"
+        }
+        POLU="$OUT/up.policy"
+        upol "http://$HOSTIP:$SP" > "$POLU"
+        env -i PATH=/usr/bin:/bin timeout 90 "$WARDEN" "$POLU" --dns-server "127.0.0.1:$PORT" -- \
+            /usr/bin/python3 "$W/up.py" "$TP" "$HP" > "$OUT/up.out" 2> "$OUT/up.log"
+        sed 's/^/     /' "$OUT/up.out"
+        sed 's/^/     squid: /' "$SQ/access.log" | cut -c1-110
+        upx() { grep '"action":"net.proxy"' "$OUT/up.log" | grep "\"target\":\"$1\""; }
+        check "run_start names the upstream" grep -q "\"proxy\":{[^}]*\"upstream\":\"$HOSTIP:$SP\"}" "$OUT/up.log"
+        check "a name the policy allows is decided, asked of the upstream (CONNECT) and relayed through it" \
+            sh -c "grep -q '^TLS allowed tls-ok api.example.com$' '$OUT/up.out' && grep -q 'TCP_TUNNEL/200 [0-9]* CONNECT api.example.com:$TP ' '$SQ/access.log'"
+        check "recorded with the upstream used and its address dialed" \
+            sh -c "$(declare -f upx); OUT='$OUT'; upx api.example.com:$TP | grep -q '\"rule\":\"proxy_dialed\",.*\"check\":\"ok\",\"dialed\":\"$HOSTIP:$SP\",\"proxy_conn\":[0-9]*,\"proxy_kind\":\"tls\",\"upstream\":\"$HOSTIP:$SP\"'"
+        check "HTTP inside the tunnel" grep -q '^URLLIB http-ok$' "$OUT/up.out"
+        check "the upstream's own refusal reaches the client and is recorded with its status (403)" \
+            sh -c "grep -q '^TLS upstream-refuses ALERT$' '$OUT/up.out' && grep -q '\"why\":\"upstream_refused\",\"bytes_up\":0,\"bytes_down\":0,\"relay_ms\":[0-9]*,\"upstream_status\":403,' '$OUT/up.log'"
+        check "a name the policy refuses never reaches the upstream" \
+            sh -c "grep -q '^TLS policy-refuses ALERT$' '$OUT/up.out' && ! grep -q evil '$SQ/access.log' && grep '\"action\":\"net.proxy\"' '$OUT/up.log' | grep '\"target\":\"evil.example.com:$TP\"' | grep -q '\"decision_final\":\"DENY\"'"
+        check "the audit accepts the run" \
+            python3 "$HERE/tools/varek_audit.py" --policy "$POLU" --checker "$CERT" "$OUT/up.log"
+        # the upstream by host name: the Warden resolves it (through its own
+        # resolver), and the agent cannot look it up
+        python3 - "$OUT/zone6.json" "$HOSTIP" <<'PY'
+import json, sys
+z = json.load(open(sys.argv[1])); z["squid.example.com"] = {"ttl": 30, "a": [sys.argv[2]]}
+json.dump(z, open(sys.argv[1], "w"))
+PY
+        kill $DNSP 2>/dev/null
+        rm -f "$OUT/ready6"
+        python3 "$HERE/tests/dns_test_server.py" --port "$PORT" --zone "$OUT/zone6.json" --log "$OUT/q6.log" \
+            --ready "$OUT/ready6" > /dev/null 2>&1 &
+        DNSP=$!
+        SRV="$SRV $DNSP"
+        for _ in $(seq 50); do [ -e "$OUT/ready6" ] && break; sleep 0.1; done
+        POLN="$OUT/upname.policy"
+        upol "http://squid.example.com:$SP" > "$POLN"
+        env -i PATH=/usr/bin:/bin timeout 90 "$WARDEN" "$POLN" --dns-server "127.0.0.1:$PORT" -- \
+            /usr/bin/python3 "$W/up.py" "$TP" "$HP" > "$OUT/un.out" 2> "$OUT/un.log"
+        check "an upstream by host name: resolved by the Warden (a resolution record), dialed by its address" \
+            sh -c "grep -q '^TLS allowed tls-ok api.example.com$' '$OUT/un.out' && grep -q '\"event\":\"resolution\",\"run\":\"[0-9a-f]*\",\"name\":\"squid.example.com\",\"a\":\"ok\"' '$OUT/un.log' && grep '\"action\":\"net.proxy\"' '$OUT/un.log' | grep -q '\"dialed\":\"$HOSTIP:$SP\",.*\"upstream\":\"squid.example.com:$SP\"'"
+        check "and kept out of the agent's views (it cannot look the upstream up)" grep -q '^SQUIDNAME hidden$' "$OUT/un.out"
+        check "the audit accepts that run" \
+            python3 "$HERE/tools/varek_audit.py" --policy "$POLN" --checker "$CERT" "$OUT/un.log"
+        forge "$OUT/up.log" "$OUT/v1.log" "\"proxy_kind\":\"tls\",\"upstream\":\"$HOSTIP:$SP\"" "\"proxy_kind\":\"tls\",\"upstream\":\"192.0.2.66:$SP\""
+        refuses "a proxied connection via another upstream" "$POLU" "$OUT/v1.log" "not the policy's"
+        forge "$OUT/up.log" "$OUT/v2.log" "\"dialed\":\"$HOSTIP:$SP\"" "\"dialed\":\"$HOSTIP:$TP\""
+        refuses "a proxied connection dialed past the upstream" "$POLU" "$OUT/v2.log" "not the upstream"
+        forge "$OUT/up.log" "$OUT/v3.log" '"upstream_status":403,' ''
+        refuses "an upstream refusal without its status" "$POLU" "$OUT/v3.log" "without the upstream's status"
+        forge "$OUT/up.log" "$OUT/v4.log" ",\"upstream\":\"$HOSTIP:$SP\"}" "}"
+        refuses "a run_start without the policy's upstream" "$POLU" "$OUT/v4.log" "run_start's proxy"
+        kill "$(cat "$SQ/squid.pid" 2>/dev/null)" 2>/dev/null
+        for _ in $(seq 30); do pgrep -f "$SQ/squid.conf" > /dev/null || break; sleep 0.2; done
+        pkill -9 -f "$SQ/squid.conf" 2>/dev/null
+        rm -rf "$SQ"
+    fi
     kill $SRV 2>/dev/null
     rm -rf "$W"
 fi

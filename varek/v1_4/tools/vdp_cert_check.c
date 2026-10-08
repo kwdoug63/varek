@@ -239,13 +239,18 @@ int main(int argc, char **argv) {
     }
 
     /* v1.26: the egress proxy, one line: "off", or "on" and the proxied
-     * ports in force (80 443 when the policy names none). */
+     * ports in force (80 443 when the policy names none), then (section 5)
+     * "upstream HOST:PORT" if the policy names one. */
     if (!strcmp(argv[2], "proxy")) {
         if (!pol.proxy) printf("off\n");
-        else if (!pol.proxy_nports) printf("on 80 443\n");
         else {
-            printf("on");
-            for (size_t k = 0; k < pol.proxy_nports; k++) printf(" %u", pol.proxy_ports[k]);
+            if (!pol.proxy_nports) printf("on 80 443");
+            else {
+                printf("on");
+                for (size_t k = 0; k < pol.proxy_nports; k++) printf(" %u", pol.proxy_ports[k]);
+            }
+            /* v1.26 section 5: then the upstream, if any */
+            if (pol.proxy_up_port) printf(" upstream %s:%u", pol.proxy_up_host, pol.proxy_up_port);
             printf("\n");
         }
         vdpc_free(&pol);

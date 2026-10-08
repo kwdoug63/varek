@@ -376,6 +376,8 @@ static int policy_load(const char *path, struct policy *p) {
     bool proxy_same = p->v.proxy == (p->c.proxy != 0) && p->v.proxy_nports == p->c.proxy_nports;
     for (size_t k = 0; proxy_same && k < p->v.proxy_nports; k++)
         proxy_same = p->v.proxy_ports[k] == p->c.proxy_ports[k];
+    proxy_same = proxy_same && p->v.proxy_up_port == p->c.proxy_up_port &&
+                 (!p->v.proxy_up_port || !strcmp(p->v.proxy_up_host, p->c.proxy_up_host));
     if (!proxy_same) {
         fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
                 "the proxy directives differently; refusing to start\n", path);
@@ -1310,6 +1312,8 @@ static const struct policy *g_syn_p;   /* v1.26: the policy, for the hosts view 
  * on and any host name rule (synthetic addresses) */
 #define STUB_WANTED() (g_any_wild || (g_syn_on && g_names_on))
 static uint64_t   g_proxy_conns = 0;   /* v1.26: connections handed to the proxy (proxy_conn ids) */
+static int        g_up_entry = -1;     /* v1.26 section 5: the upstream proxy's name in g_names, or -1 */
+static wr_ip_t    g_up_ip;             /* v1.26 section 5: the upstream given as an address */
 #define SYN_BASE   0xc6120000u           /* 198.18.0.0 */
 #define SYN_MAX    131070u               /* synthetic addresses: 198.18.0.1 .. 198.19.255.254 */
 #define SYN_TTL    300u                  /* seconds, in answers (the address never changes) */
@@ -1591,7 +1595,10 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
             for (size_t k = 0; k < p->v.proxy_nports; k++)
                 fprintf(f, "%s%u", k ? "," : "", p->v.proxy_ports[k]);
         else fputs("80,443", f);
-        fputs("]},", f);
+        fputs("]", f);
+        if (p->v.proxy_up_port)                  /* section 5 */
+            fprintf(f, ",\"upstream\":\"%s:%u\"", p->v.proxy_up_host, p->v.proxy_up_port);
+        fputs("},", f);
     }
     /* v1.25 (section 4): each wildcard allow rule's budgets, defaults filled in */
     if (g_any_wild) {
@@ -1646,6 +1653,21 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
                 return -1;
             }
             if (pass == 1 && g_names.n > before) g_names.e[ix].unlisted = true;
+        }
+    }
+    /* v1.26 section 5: the upstream proxy's name is resolved and refreshed
+     * like a deny rule's (unlisted: never in the agent's views); an address
+     * is dialed as it is. */
+    if (p->v.proxy_up_port) {
+        if (wr_ip_parse(p->v.proxy_up_host, &g_up_ip) == 0) g_up_entry = -1;
+        else {
+            size_t before = g_names.n;
+            g_up_entry = wr_table_add(&g_names, p->v.proxy_up_host);
+            if (g_up_entry < 0) {
+                fprintf(stderr, "[warden] out of memory for the resolution table\n");
+                return -1;
+            }
+            if (g_names.n > before) g_names.e[g_up_entry].unlisted = true;
         }
     }
     /* v1.25: a wildcard adds names when the agent asks (the stub) */

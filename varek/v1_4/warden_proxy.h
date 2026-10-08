@@ -35,7 +35,7 @@
 
 /* Control messages (SOCK_SEQPACKET, one per datagram). */
 enum { WP_MSG_READY = 1, WP_MSG_CONN = 2, WP_MSG_REQUEST = 3, WP_MSG_UNREADABLE = 4, WP_MSG_VERDICT = 5,
-       WP_MSG_CLOSED = 6, WP_MSG_FLUSH = 7, WP_MSG_FLUSHED = 8 };
+       WP_MSG_CLOSED = 6, WP_MSG_FLUSH = 7, WP_MSG_FLUSHED = 8, WP_MSG_VERDICT_UP = 9 };
 
 struct wp_msg {                  /* proxy -> Warden: WP_MSG_READY */
     uint32_t type;
@@ -78,19 +78,33 @@ struct wp_verdict {
     uint64_t id;
 };
 
-/* Proxy -> Warden, step 7: a relayed connection ended. The byte counts are
+/* Proxy -> Warden, step 7: a relayed connection ended (section 5: or the
+ * upstream proxy refused it, "upstream_refused"). The byte counts are
  * the proxy's own (it is not trusted to count them; they are recorded as its
  * report). why: "closed" (both sides closed), "reset" (an error on either
  * side), "idle", "run_end" (closed when the run ended, on WP_MSG_FLUSH). */
 struct wp_close {
     uint32_t type;               /* WP_MSG_CLOSED */
-    uint32_t pad;
+    uint32_t upstream_status;    /* section 5, why "upstream_refused": its status (0: no reply) */
     uint64_t id;
     uint64_t bytes_up;           /* client -> server */
     uint64_t bytes_down;         /* server -> client */
     uint64_t ms;                 /* how long it was relayed */
-    char     why[16];            /* NUL-terminated */
+    char     why[24];            /* NUL-terminated */
 };
+/* Warden -> proxy, section 5: allow, with the socket the Warden dialed to
+ * the upstream proxy (SCM_RIGHTS). The proxy asks it for name:port
+ * (CONNECT), relays on a 2xx reply, and otherwise refuses the client and
+ * reports the close as "upstream_refused" with the status. */
+struct wp_verdict_up {
+    uint32_t type;               /* WP_MSG_VERDICT_UP */
+    uint32_t allow;
+    uint64_t id;
+    uint32_t port;
+    uint32_t pad;
+    char     name[256];          /* NUL-terminated */
+};
+
 /* Warden -> proxy, step 7: the run is ending: close every connection,
  * report each relayed one (WP_MSG_CLOSED), then answer WP_MSG_FLUSHED (a
  * struct wp_msg). */

@@ -117,7 +117,7 @@ static int64_t mono_ms(void) {
  * connections it holds. A held connection is read (step 5) until the parser
  * has a name, then waits for the Warden's verdict. */
 struct wp_ann  { bool used; uint32_t from_port; unsigned dport; uint64_t id; int64_t at; };
-enum { WH_READING = 0, WH_WAITING = 1, WH_RELAY = 2 };
+enum { WH_READING = 0, WH_WAITING = 1, WH_RELAY = 2, WH_UPSTREAM = 3 };
 #define WP_RELAY_BUF   32768     /* each direction */
 #define WP_RELAY_IDLE  3600000   /* a relayed connection idle this long is closed */
 struct wp_held {
@@ -138,6 +138,7 @@ struct wp_held {
     bool      eof_c, eof_s;      /* the client's, the server's side has closed */
     bool      shut_s, shut_c;    /* the close was passed on to the server, the client */
     uint64_t  bytes_up, bytes_down;
+    unsigned  up_status;         /* section 5: the upstream's reply status */
     int64_t   relay_at;          /* when relaying began */
     const char *why;             /* step 7: why the relay ended */
 };
@@ -151,6 +152,7 @@ static void report_close(const struct wp_held *h, const char *why) {
     struct wp_close m;
     memset(&m, 0, sizeof m);
     m.type = WP_MSG_CLOSED;
+    m.upstream_status = h->up_status;
     m.id = h->id;
     m.bytes_up = h->bytes_up;
     m.bytes_down = h->bytes_down;
@@ -161,7 +163,9 @@ static void report_close(const struct wp_held *h, const char *why) {
 }
 
 static void held_drop(int k) {
-    if (g_held[k].state == WH_RELAY) report_close(&g_held[k], g_held[k].why ? g_held[k].why : "closed");
+    if (g_held[k].state == WH_UPSTREAM)            /* the run ended while asking the upstream */
+        report_close(&g_held[k], g_held[k].why ? g_held[k].why : "upstream_refused");
+    else if (g_held[k].state == WH_RELAY) report_close(&g_held[k], g_held[k].why ? g_held[k].why : "closed");
     close(g_held[k].fd);
     if (g_held[k].up >= 0) close(g_held[k].up);
     free(g_held[k].buf);
@@ -219,6 +223,45 @@ static int held_relay(int k, int fd) {
     return 0;
 }
 
+/* Section 5: the Warden dialed the upstream proxy for held connection k:
+ * ask it for name:port; relaying starts when it answers 2xx (held_upstream). */
+static int held_relay_up(int k, int fd, const char *name, unsigned port) {
+    if (held_relay(k, fd) < 0) return -1;
+    struct wp_held *h = &g_held[k];
+    char req[600];
+    int rl = snprintf(req, sizeof req, "CONNECT %s:%u HTTP/1.1\r\nHost: %s:%u\r\n\r\n", name, port, name, port);
+    if (rl <= 0 || (size_t)rl >= sizeof req ||
+        send(h->up, req, (size_t)rl, MSG_DONTWAIT | MSG_NOSIGNAL) != rl) return -1;
+    h->state = WH_UPSTREAM;
+    h->since = mono_ms();
+    return 0;
+}
+
+/* Section 5: bytes from the upstream while waiting for its reply. False when
+ * the connection is done (refused: reported, and the client refused). */
+static bool held_upstream(int k) {
+    struct wp_held *h = &g_held[k];
+    ssize_t n = recv(h->up, h->down + h->dlen, WP_RELAY_BUF - h->dlen, MSG_DONTWAIT);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return true;
+    if (n > 0) h->dlen += (size_t)n;
+    unsigned st;
+    size_t len;
+    const char *why;
+    pp_status_t ps = n <= 0 ? PP_REFUSE : pp_upstream_reply(h->down, h->dlen, &st, &len, &why);
+    if (n <= 0) st = 0;
+    if (ps == PP_MORE && h->dlen < WP_RELAY_BUF) return true;
+    if (ps != PP_OK) {
+        h->up_status = st;
+        return false;                                  /* held_drop reports upstream_refused */
+    }
+    h->up_status = st;
+    h->doff = len;                                     /* what follows the reply is the server's */
+    if (h->doff == h->dlen) h->doff = h->dlen = 0;
+    h->state = WH_RELAY;
+    h->since = h->relay_at = mono_ms();
+    return true;
+}
+
 /* Move what can be moved on relayed connection k; false when it is done. */
 static bool held_pump(int k, short crev, short srev) {
     struct wp_held *h = &g_held[k];
@@ -263,7 +306,7 @@ static bool held_pump(int k, short crev, short srev) {
 /* Read every control message waiting. Returns -1 when the Warden has gone. */
 static int wp_drain_ctl(int ctl) {
     for (;;) {
-        union { struct wp_conn c; struct wp_verdict v; uint32_t type; } m;
+        union { struct wp_conn c; struct wp_verdict v; struct wp_verdict_up u; uint32_t type; } m;
         union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
         struct iovec iv = { &m, sizeof m };
         struct msghdr mh = { .msg_iov = &iv, .msg_iovlen = 1, .msg_control = cb.b, .msg_controllen = sizeof cb.b };
@@ -284,11 +327,28 @@ static int wp_drain_ctl(int ctl) {
             }
             continue;
         }
+        if (n == (ssize_t)sizeof m.u && m.type == WP_MSG_VERDICT_UP) {
+            /* section 5: allow, dialed to the upstream proxy */
+            int k = held_find(m.u.id);
+            if (k < 0 || g_held[k].state != WH_WAITING) { if (fd >= 0) close(fd); continue; }
+            m.u.name[sizeof m.u.name - 1] = '\0';
+            if (!m.u.allow || fd < 0 || held_relay_up(k, fd, m.u.name, m.u.port) < 0) {
+                if (g_held[k].state == WH_UPSTREAM || g_held[k].up >= 0) {
+                    g_held[k].state = WH_UPSTREAM;     /* reported as upstream_refused */
+                    held_refuse(k);
+                } else {
+                    if (fd >= 0) close(fd);
+                    held_refuse(k);
+                }
+            }
+            continue;
+        }
         if (fd >= 0) close(fd);
         if (n == (ssize_t)sizeof(struct wp_msg) && m.type == WP_MSG_FLUSH) {
             /* the run is ending: close everything, reporting each relay */
             while (g_nheld) {
-                if (g_held[g_nheld - 1].state == WH_RELAY) g_held[g_nheld - 1].why = "run_end";
+                if (g_held[g_nheld - 1].state == WH_RELAY || g_held[g_nheld - 1].state == WH_UPSTREAM)
+                    g_held[g_nheld - 1].why = "run_end";
                 held_drop(g_nheld - 1);
             }
             struct wp_msg f = { .type = WP_MSG_FLUSHED, .port = 0 };
@@ -409,7 +469,9 @@ int wp_helper_main(int ctl) {
                 if (h->off < h->len) se |= POLLOUT;
             }
             pf[2 + 2 * k] = (struct pollfd){ .fd = h->fd, .events = ce };
-            pf[3 + 2 * k] = (struct pollfd){ .fd = h->state == WH_RELAY ? h->up : -1, .events = se };
+            if (h->state == WH_UPSTREAM) se = POLLIN;
+            pf[3 + 2 * k] = (struct pollfd){ .fd = h->state == WH_RELAY || h->state == WH_UPSTREAM ? h->up : -1,
+                                             .events = se };
         }
         if (poll(pf, (nfds_t)(2 + 2 * nh), 1000) < 0) {
             if (errno == EINTR) continue;
@@ -425,6 +487,12 @@ int wp_helper_main(int ctl) {
             if (k < 0) continue;
             struct wp_held *h = &g_held[k];
             short crev = pf[2 + 2 * j].revents, srev = pf[3 + 2 * j].revents;
+            if (h->state == WH_UPSTREAM) {
+                bool ok = pf[3 + 2 * j].fd != h->up || !(srev & (POLLIN | POLLHUP | POLLERR)) || held_upstream(k);
+                if (ok && h->state == WH_UPSTREAM && now - h->since > WP_READ_MS) ok = false;
+                if (!ok) held_refuse(k);                            /* reported, then refused */
+                continue;
+            }
             if (h->state == WH_RELAY) {
                 if (pf[3 + 2 * j].fd != h->up) { srev = 0; crev = 0; }   /* became a relay just now */
                 if (!held_pump(k, crev, srev)) held_drop(k);

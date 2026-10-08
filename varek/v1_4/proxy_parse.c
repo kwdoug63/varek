@@ -343,3 +343,27 @@ pp_status_t pp_parse(const uint8_t *in, size_t n, unsigned dport, bool acked, pp
     if (in[0] >= 'A' && in[0] <= 'Z') return http(in, n, dport, r);
     return refuse(r, "neither TLS nor HTTP");
 }
+
+/* ---- section 5: the upstream proxy's reply ---- */
+
+pp_status_t pp_upstream_reply(const uint8_t *in, size_t n, unsigned *status, size_t *len, const char **why) {
+    *status = 0;
+    *len = 0;
+    *why = NULL;
+    long end = head_end(in, n);
+    if (end < 0) { *why = "a malformed reply from the upstream"; return PP_REFUSE; }
+    if (end == 0) {
+        if (n >= PP_HTTP_MAX) { *why = "a reply from the upstream over 8 KB"; return PP_REFUSE; }
+        return PP_MORE;
+    }
+    if (end < 14 || memcmp(in, "HTTP/1.", 7) || (in[7] != '0' && in[7] != '1') || in[8] != ' ' ||
+        in[9] < '1' || in[9] > '5' || in[10] < '0' || in[10] > '9' || in[11] < '0' || in[11] > '9' ||
+        (in[12] != ' ' && in[12] != '\r')) {
+        *why = "a malformed reply from the upstream";
+        return PP_REFUSE;
+    }
+    *status = (unsigned)((in[9] - '0') * 100 + (in[10] - '0') * 10 + (in[11] - '0'));
+    *len = (size_t)end;
+    if (*status < 200 || *status > 299) { *why = "the upstream refused"; return PP_REFUSE; }
+    return PP_OK;
+}

@@ -251,6 +251,34 @@ static int unit(void) {
         printf("  %s   every proper prefix of a ClientHello, a request or a CONNECT asks for more\n", all ? "PASS" : "FAIL");
         if (!all) fails = 1;
     }
+    {
+        /* section 5: the upstream proxy's reply to the proxy's CONNECT */
+        struct { const char *in; pp_status_t want; unsigned st; size_t len; } v[] = {
+            { "HTTP/1.1 200 Connection established\r\n\r\n", PP_OK, 200, 39 },
+            { "HTTP/1.0 200 OK\r\nVia: squid\r\n\r\nXY", PP_OK, 200, 31 },
+            { "HTTP/1.1 204\r\n\r\n", PP_OK, 204, 16 },
+            { "HTTP/1.1 403 Forbidden\r\n\r\n", PP_REFUSE, 403, 28 },
+            { "HTTP/1.1 407 Proxy Authentication Required\r\n\r\n", PP_REFUSE, 407, 49 },
+            { "HTTP/1.1 200 OK\r\n", PP_MORE, 0, 0 },
+            { "HTTP/1.1 2", PP_MORE, 0, 0 },
+            { "HTTP/2 200\r\n\r\n", PP_REFUSE, 0, 0 },
+            { "HTTP/1.1 600 X\r\n\r\n", PP_REFUSE, 0, 0 },
+            { "HTTP/1.1 20 X\r\n\r\n", PP_REFUSE, 0, 0 },
+            { "HTTP/1.1 200 OK\nX: y\n\n", PP_REFUSE, 0, 0 },
+            { "SSH-2.0-OpenSSH\r\n\r\n", PP_REFUSE, 0, 0 },
+        };
+        bool all = true;
+        for (size_t k = 0; k < sizeof v / sizeof *v; k++) {
+            unsigned st; size_t len; const char *why;
+            pp_status_t got = pp_upstream_reply((const uint8_t *)v[k].in, strlen(v[k].in), &st, &len, &why);
+            bool ok = got == v[k].want && st == v[k].st && (got != PP_OK || len == v[k].len) &&
+                      (got != PP_REFUSE || why);
+            if (!ok) { printf("         upstream reply %zu: got %d status %u len %zu\n", k, got, st, len); all = false; }
+        }
+        printf("  %s   the upstream's reply: 2xx relays, anything else (or malformed) refuses, partial waits\n",
+               all ? "PASS" : "FAIL");
+        if (!all) fails = 1;
+    }
     printf("proxy_parse unit: %s\n", fails ? "FAIL" : "PASS");
     return fails;
 }
@@ -287,6 +315,10 @@ static int fuzz(unsigned long iters, unsigned long seed) {
     sl[2] = strlen(h); memcpy(seeds[2], h, sl[2]);
     const char *c = "CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
     sl[3] = strlen(c); memcpy(seeds[3], c, sl[3]);
+    if (rnd() % 2) {                                  /* section 5: an upstream's reply in place of seed 2 */
+        const char *u = "HTTP/1.1 200 Connection established\r\nVia: 1.1 squid\r\n\r\n";
+        sl[2] = strlen(u); memcpy(seeds[2], u, sl[2]);
+    }
     memcpy(seeds[4], c, sl[3]);
     sl[4] = sl[3] + client_hello(seeds[4] + sl[3], "api.example.com", 1, NULL, 0, 50);
     uint8_t ech[] = { 0xfe, 0x0d, 0, 1, 0 };
@@ -325,6 +357,9 @@ static int fuzz(unsigned long iters, unsigned long seed) {
             pp_result_t r;
             pp_status_t st = pp_parse(buf, cut, dport, acked, &r);
             invariants(buf, cut, dport, acked, st, &r);
+            unsigned us; size_t ul; const char *uw;        /* section 5: the upstream's reply */
+            pp_status_t ust = pp_upstream_reply(buf, cut, &us, &ul, &uw);
+            if ((ust == PP_OK && (us < 200 || us > 299 || ul == 0 || ul > cut)) || (ust == PP_REFUSE && !uw)) abort();
             if (st == PP_OK || st == PP_ACK) ok++;
             else if (st == PP_REFUSE) refused++;
             else more++;

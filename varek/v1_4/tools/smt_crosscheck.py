@@ -450,6 +450,7 @@ def parse_lines(raw_lines, path):
     legacy_name = False            # v1.24: a host name read before `require warden 1.24`
     glob_tokens = 0
     proxy, proxy_ports = False, None   # v1.26: `proxy on`, `proxy ports`
+    upstream = None                    # v1.26 section 5: `proxy upstream http://HOST:PORT`
     if True:
         for lineno, raw in enumerate(raw_lines, 1):
             if b"\0" in raw:
@@ -493,6 +494,21 @@ def parse_lines(raw_lines, path):
                             raise PolicyError(f"{path}:{lineno}: bad proxy port {t!r}")
                         ports.append(int(t))
                     proxy_ports = ports
+                    continue
+                if len(toks) == 3 and toks[1] == "upstream" and upstream is None:
+                    m = re.fullmatch(r"http://([^:/@?#\[]+):([1-9][0-9]{0,4})/?", toks[2])
+                    host = m.group(1) if m else ""
+                    if re.fullmatch(r"[0-9.]+", host):
+                        ok = re.fullmatch(r"(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}"
+                                          r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])", host)
+                    else:
+                        labels = host.split(".")
+                        ok = len(host) <= 253 and all(
+                            re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", lb) for lb in labels) \
+                            and not labels[-1].isdigit()
+                    if not m or not ok or int(m.group(2)) > 65535:
+                        raise PolicyError(f"{path}:{lineno}: bad proxy upstream")
+                    upstream = (host.lower(), int(m.group(2)))
                     continue
                 raise PolicyError(f"{path}:{lineno}: bad proxy directive")
             if len(toks) < 3:
@@ -597,6 +613,8 @@ def parse_lines(raw_lines, path):
             rules.append(r)
     if proxy_ports is not None and not proxy:
         raise PolicyError(f"{path}: proxy ports without proxy on")
+    if upstream is not None and not proxy:
+        raise PolicyError(f"{path}: proxy upstream without proxy on")
     return rules, rx
 
 
@@ -1115,12 +1133,23 @@ def fuzz_policy(rng, path):
             if rng.random() < 0.5:
                 lines.append("proxy ports " + " ".join(rng.sample(["80", "443", "8443", "8080", "1", "65535"],
                                                                 rng.randint(1, 3))))
+            if rng.random() < 0.3:      # v1.26 section 5
+                lines.append("proxy upstream " + rng.choice(["http://proxy.corp:3128", "http://10.0.0.5:8080/",
+                                                             "http://Proxy.Example.com:65535", "http://127.0.0.1:3128"]))
+            if not valid and rng.random() < 0.3:
+                lines.append(rng.choice(["proxy upstream https://p:3128", "proxy upstream http://u:p@h:3128",
+                                         "proxy upstream http://h", "proxy upstream http://h:0",
+                                         "proxy upstream http://h:3128/x", "proxy upstream http://1.2.3:80",
+                                         "proxy upstream http://256.1.1.1:80", "proxy upstream http://01.1.1.1:80",
+                                         "proxy upstream http://a.123:80", "proxy upstream http://-a.b:80",
+                                         "proxy upstream http://[::1]:80", "proxy upstream http://a_b.c:80",
+                                         "proxy upstream http://p:3128 http://q:3128"]))
             if not valid and rng.random() < 0.3:
                 lines.append(rng.choice(["proxy on", "proxy inspect", "proxy ports 0", "proxy ports 443 443",
                                          "proxy ports 65536", "proxy ports 080", "proxy", "proxy off",
                                          "proxy ports " + " ".join(["1"] + [str(i) for i in range(2, 18)])]))
         elif not valid and rng.random() < 0.1:
-            lines.append(rng.choice(["proxy on", "proxy ports 443"]))      # before 1.26, or alone
+            lines.append(rng.choice(["proxy on", "proxy ports 443", "proxy upstream http://p:3128"]))  # before 1.26, or alone
         # v1.25 section 4: budgets on wildcard allow rules (and, when the
         # policy may be invalid, where they do not belong or out of range)
         good_b = ["names=1", "names=64", "names=100000", "rate=1", "rate=10", "rate=10000"]

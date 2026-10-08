@@ -159,6 +159,11 @@ typedef struct {
     bool       proxy;
     unsigned   proxy_ports[VDP_PROXY_MAX_PORTS];
     size_t     proxy_nports;
+    /* v1.26 section 5: `proxy upstream http://HOST:PORT`, the customer's proxy
+     * the Warden's proxy forwards to after deciding (port 0: none). HOST is a
+     * host name (lowercase) or an IPv4 address. */
+    char       proxy_up_host[254];
+    unsigned   proxy_up_port;
 } vdp_policy_t;
 
 /* Why a verdict was reached (for records). */
@@ -362,8 +367,8 @@ bool vdp_host_rule_ok(const vdp_rule_t *r, char *why, size_t wn);
  * matches every port. Name rules need `require warden 1.24` before them.
  * v1.25: wildcard host names (`allow host *.example.com:443`), after
  * `require warden 1.25`; see vdp_host_wildcard_glob.
- * v1.26: the egress proxy (`proxy on`, `proxy ports`), after
- * `require warden 1.26`. */
+ * v1.26: the egress proxy (`proxy on`, `proxy ports`, `proxy upstream`),
+ * after `require warden 1.26`. */
 #define VDP_WARDEN_MAJOR 1
 #define VDP_WARDEN_MINOR 26
 

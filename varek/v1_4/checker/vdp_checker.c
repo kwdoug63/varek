@@ -13,6 +13,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------------ */
@@ -285,6 +286,62 @@ static int fail(char *err, size_t n, const char *name, int line, const char *fmt
         }
     }
     return -1;
+}
+
+/* v1.26 section 5: "http://HOST:PORT" (one trailing '/'), HOST a host name
+ * (LDH labels 1-63, at most 253, last label not all digits) or a dotted IPv4
+ * address without leading zeros, PORT 1-65535. 0 (host lowercased), or -1. */
+static int up_parse(const char *v, char host[254], unsigned *port) {
+    if (strncmp(v, "http://", 7) != 0) return -1;
+    const char *a = v + 7;
+    size_t n = strlen(a);
+    if (n > 0 && a[n - 1] == '/') n--;
+    size_t c = n;
+    while (c > 0 && a[c - 1] != ':') c--;
+    if (c == 0) return -1;
+    size_t hl = c - 1, pl = n - c;
+    if (pl < 1 || pl > 5 || a[c] == '0') return -1;
+    unsigned long x = 0;
+    for (size_t i = c; i < n; i++) {
+        if (!isdigit((unsigned char)a[i])) return -1;
+        x = x * 10 + (unsigned long)(a[i] - '0');
+    }
+    if (x < 1 || x > 65535 || hl < 1 || hl > 253) return -1;
+    int dots = 0, alpha = 0;
+    for (size_t i = 0; i < hl; i++) {
+        unsigned char ch = (unsigned char)a[i];
+        if (ch == '.') dots++;
+        else if (isalpha(ch) || ch == '-') alpha++;
+        else if (!isdigit(ch)) return -1;
+    }
+    if (!alpha) {                                     /* an IPv4 address */
+        if (dots != 3) return -1;
+        size_t i = 0;
+        for (int part = 0; part < 4; part++) {
+            size_t st = i;
+            unsigned long o = 0;
+            while (i < hl && a[i] != '.') o = o * 10 + (unsigned long)(a[i++] - '0');
+            if (i == st || i - st > 3 || (i - st > 1 && a[st] == '0') || o > 255) return -1;
+            i++;
+        }
+    } else {                                          /* a host name */
+        size_t st = 0;
+        for (size_t i = 0; i <= hl; i++) {
+            if (i < hl && a[i] != '.') continue;
+            size_t ll = i - st;
+            if (ll < 1 || ll > 63 || a[st] == '-' || a[i - 1] == '-') return -1;
+            st = i + 1;
+        }
+        size_t last = hl;
+        while (last > 0 && a[last - 1] != '.') last--;
+        bool all_digits = true;
+        for (size_t i = last; i < hl; i++) if (!isdigit((unsigned char)a[i])) all_digits = false;
+        if (all_digits) return -1;
+    }
+    for (size_t i = 0; i < hl; i++) host[i] = (char)tolower((unsigned char)a[i]);
+    host[hl] = '\0';
+    *port = (unsigned)x;
+    return 0;
 }
 
 static bool is_ws(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f'; }
@@ -584,6 +641,12 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
                             if (p->proxy_ports[q] == x) rc = fail(err, en, name, ln, "port twice");
                         if (rc == 0) p->proxy_ports[p->proxy_nports++] = (unsigned)x;
                     }
+                } else if (nt == 3 && !strcmp(tok[1], "upstream") && !p->proxy_up_port) {
+                    /* v1.26 section 5: proxy upstream http://HOST:PORT */
+                    if (up_parse(tok[2], p->proxy_up_host, &p->proxy_up_port) < 0) {
+                        p->proxy_up_port = 0;
+                        rc = fail(err, en, name, ln, "bad proxy upstream");
+                    }
                 } else
                     rc = fail(err, en, name, ln, "bad proxy directive");
             } else if (nt < 3) {
@@ -602,6 +665,10 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
     if (p->proxy_nports && !p->proxy) {
         vdpc_free(p);
         return fail(err, en, name, ln, "proxy ports without proxy on");
+    }
+    if (p->proxy_up_port && !p->proxy) {
+        vdpc_free(p);
+        return fail(err, en, name, ln, "proxy upstream without proxy on");
     }
     return 0;
 }

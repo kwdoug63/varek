@@ -638,6 +638,75 @@ static int perr(char *err, size_t errlen, const char *path, int line,
     return -1;
 }
 
+/* v1.26 section 5: `http://HOST:PORT` (one trailing '/' allowed): HOST a host
+ * name (LDH labels of 1 to 63 bytes, at most 253 in all, not ending in a
+ * numeric label; lowercased) or a dotted IPv4 address (no leading zeros);
+ * PORT 1 to 65535. NULL, with host and port written, or the reason. */
+static const char *upstream_parse(const char *v, char host[254], unsigned *port) {
+    if (!strncmp(v, "https://", 8))
+        return "an https:// upstream is not taken (v1.26.0: http://host:port)";
+    if (strncmp(v, "http://", 7)) return "the upstream must be http://host:port";
+    const char *a = v + 7;
+    size_t n = strlen(a);
+    if (n && a[n - 1] == '/') n--;
+    if (memchr(a, '@', n)) return "an upstream with credentials (they are not taken in a policy file)";
+    const char *colon = NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (a[i] == '/' || a[i] == '?' || a[i] == '#' || a[i] == '[') return "the upstream must be http://host:port";
+        if (a[i] == ':') colon = a + i;
+    }
+    if (!colon) return "the upstream needs a port (http://host:port)";
+    size_t hl = (size_t)(colon - a), pl = n - hl - 1;
+    unsigned long x = 0;
+    if (pl == 0 || pl > 5 || colon[1] == '0') return "the upstream's port is 1 to 65535";
+    for (size_t i = 0; i < pl; i++) {
+        if (colon[1 + i] < '0' || colon[1 + i] > '9') return "the upstream's port is 1 to 65535";
+        x = x * 10 + (unsigned long)(colon[1 + i] - '0');
+    }
+    if (x == 0 || x > 65535) return "the upstream's port is 1 to 65535";
+    if (hl == 0 || hl > 253) return "the upstream's host is not a host name or an IPv4 address";
+    bool numeric = true;
+    for (size_t i = 0; i < hl; i++) if (!(a[i] == '.' || (a[i] >= '0' && a[i] <= '9'))) numeric = false;
+    if (numeric) {
+        int parts = 0;
+        size_t i = 0;
+        while (i <= hl && parts < 5) {
+            size_t s0 = i;
+            unsigned long o = 0;
+            while (i < hl && a[i] != '.') { o = o * 10 + (unsigned long)(a[i] - '0'); i++; }
+            size_t dl = i - s0;
+            if (dl == 0 || dl > 3 || (dl > 1 && a[s0] == '0') || o > 255)
+                return "the upstream's host is not a host name or an IPv4 address";
+            parts++;
+            i++;
+        }
+        if (parts != 4) return "the upstream's host is not a host name or an IPv4 address";
+    } else {
+        size_t label = 0;
+        bool digits = true;
+        for (size_t i = 0; i < hl; i++) {
+            char c = a[i];
+            if (c == '.') {
+                if (label == 0 || a[i - 1] == '-') return "the upstream's host is not a host name or an IPv4 address";
+                label = 0;
+                digits = true;
+                continue;
+            }
+            bool d = c >= '0' && c <= '9';
+            if (!(d || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-') ||
+                (c == '-' && label == 0) || ++label > 63)
+                return "the upstream's host is not a host name or an IPv4 address";
+            if (!d) digits = false;
+        }
+        if (label == 0 || a[hl - 1] == '-' || digits)
+            return "the upstream's host is not a host name or an IPv4 address";
+    }
+    for (size_t i = 0; i < hl; i++) host[i] = (char)(a[i] >= 'A' && a[i] <= 'Z' ? a[i] + 32 : a[i]);
+    host[hl] = '\0';
+    *port = (unsigned)x;
+    return NULL;
+}
+
 /* "<digits>.<digits>", nothing else (sscanf would also take signs and
  * spaces); -1 otherwise. */
 static int parse_version(const char *s, int *maj, int *mn) {
@@ -788,7 +857,17 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
                 if (rc) break;
                 continue;
             }
-            rc = perr(err, errlen, path, lineno, "bad directive (need: proxy on, or proxy ports <port>...)");
+            if (nt >= 2 && !strcmp(tok[1], "upstream")) {
+                /* v1.26 section 5: proxy upstream http://HOST:PORT */
+                const char *why = NULL;
+                if (p->proxy_up_port) why = "`proxy upstream` given twice";
+                else if (nt != 3) why = "need: proxy upstream http://host:port";
+                else why = upstream_parse(tok[2], p->proxy_up_host, &p->proxy_up_port);
+                if (why) { p->proxy_up_port = 0; rc = perr(err, errlen, path, lineno, "%s", why); break; }
+                continue;
+            }
+            rc = perr(err, errlen, path, lineno, "bad directive (need: proxy on, proxy ports <port>..., "
+                      "or proxy upstream http://host:port)");
             break;
         }
         if (nt < 3) { rc = perr(err, errlen, path, lineno, "bad rule (need: verb kind constant)"); break; }
@@ -982,6 +1061,8 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
     }
     if (rc == 0 && p->proxy_nports && !p->proxy)
         rc = perr(err, errlen, path, lineno, "`proxy ports` without `proxy on`");
+    if (rc == 0 && p->proxy_up_port && !p->proxy)
+        rc = perr(err, errlen, path, lineno, "`proxy upstream` without `proxy on`");
 out:
     free(line);
     fclose(f);

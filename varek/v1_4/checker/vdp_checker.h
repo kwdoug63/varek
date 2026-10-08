@@ -98,6 +98,8 @@ typedef struct {
     int           proxy;              /* v1.26: `proxy on` */
     unsigned      proxy_ports[16];    /* v1.26: `proxy ports`, in order; none: the default */
     size_t        proxy_nports;
+    char          proxy_up_host[254]; /* v1.26 section 5: `proxy upstream http://HOST:PORT` */
+    unsigned      proxy_up_port;      /* 0: none */
 } vdpc_policy_t;
 
 typedef struct {

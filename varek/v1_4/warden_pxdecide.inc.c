@@ -43,7 +43,9 @@ struct px_req {
     uint32_t      kind;                  /* pp_kind_t */
     char          name[WR_NAME_MAX + 1];
     unsigned      port;
-    int           entry;                 /* in g_names */
+    bool          up;                    /* section 5: dialed to the upstream proxy */
+    unsigned      dport;                 /* the port dialed (port, or the upstream's) */
+    int           entry;                 /* in g_names (the upstream's: -1 for an address) */
     int           sock;                  /* the dial in progress, or -1 (waiting on the lookup) */
     int           tries;
     int64_t       deadline;              /* this dial's, or the lookup's (monotonic ms) */
@@ -85,6 +87,8 @@ static void px_close_record(uint64_t id, const char *why, const struct wp_close 
     if (m) fprintf(f, "\"bytes_up\":%llu,\"bytes_down\":%llu,\"relay_ms\":%llu,",
                    (unsigned long long)m->bytes_up, (unsigned long long)m->bytes_down,
                    (unsigned long long)m->ms);
+    if (m && !strcmp(why, "upstream_refused"))           /* section 5: what the upstream answered */
+        fprintf(f, "\"upstream_status\":%u,", m->upstream_status);
     fprintf(f, "\"timestamp_ns\":%lld}\n", (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
     rec_end(NULL);
 }
@@ -92,7 +96,7 @@ static void px_close_record(uint64_t id, const char *why, const struct wp_close 
 /* A close report: 0, or -1 (not a connection passed to the proxy and still
  * open, or a malformed report: the proxy is not behaving). */
 static int px_closed(const struct wp_close *m) {
-    static const char *const kWhy[] = { "closed", "reset", "idle", "run_end" };
+    static const char *const kWhy[] = { "closed", "reset", "idle", "run_end", "upstream_refused" };
     bool ok = false;
     if (!memchr(m->why, 0, sizeof m->why)) return -1;
     for (size_t k = 0; k < sizeof kWhy / sizeof *kWhy; k++) if (!strcmp(m->why, kWhy[k])) ok = true;
@@ -110,6 +114,11 @@ static void px_record(struct px_req *q, decision_t d_raw, decision_t d_final, co
     size_t el = strlen(q->a->extra);
     snprintf(q->a->extra + el, sizeof q->a->extra - el, "\"proxy_conn\":%llu,\"proxy_kind\":\"%s\",",
              (unsigned long long)q->id, pp_kind_name((pp_kind_t)q->kind));
+    if (q->up) {                                         /* section 5: the upstream used */
+        el = strlen(q->a->extra);
+        snprintf(q->a->extra + el, sizeof q->a->extra - el, "\"upstream\":\"%s:%u\",",
+                 g_syn_p->v.proxy_up_host, g_syn_p->v.proxy_up_port);
+    }
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     emit_pathology(g_report_seq++, 0, q->a, d_raw, d_final, rule, ns_between(&q->t0, &t1), err);
@@ -144,9 +153,41 @@ static int px_pass(uint64_t id, int s) {
     return sendmsg(g_proxy.ctl, &mh, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t)sizeof m ? 0 : -1;
 }
 
+/* Section 5: pass the socket dialed to the upstream proxy, with the name and
+ * port the proxy is to ask it for (CONNECT). */
+static int px_pass_up(uint64_t id, int s, const char *name, unsigned port) {
+    struct wp_verdict_up m;
+    memset(&m, 0, sizeof m);
+    m.type = WP_MSG_VERDICT_UP;
+    m.allow = 1;
+    m.id = id;
+    m.port = port;
+    snprintf(m.name, sizeof m.name, "%s", name);
+    union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
+    memset(&cb, 0, sizeof cb);
+    struct iovec v = { &m, sizeof m };
+    struct msghdr mh = { .msg_iov = &v, .msg_iovlen = 1, .msg_control = cb.b, .msg_controllen = sizeof cb.b };
+    struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &s, sizeof s);
+    return sendmsg(g_proxy.ctl, &mh, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t)sizeof m ? 0 : -1;
+}
+
+/* Section 5: names a wildcard allows that were sent to the upstream, each
+ * charged once to the wildcard's names budget (the upstream resolves them). */
+static char (*g_up_names)[WR_NAME_MAX + 1];
+static size_t g_up_nnames;
+
 /* The next address of q's entry to dial, or false. Counts what was passed
  * over, so the record can say why none was dialed. */
 static bool px_next_addr(const struct policy *p, struct px_req *q, wr_ip_t *out, int *nskipped) {
+    if (q->up && q->entry < 0) {                       /* an upstream given as an address */
+        if (q->tries) return false;
+        *out = g_up_ip;
+        return true;
+    }
     const wr_entry_t *e = &g_names.e[q->entry];
     for (int fam = 4; fam <= 6; fam += 2)
         for (size_t k = 0; k < e->n; k++) {
@@ -156,14 +197,18 @@ static bool px_next_addr(const struct policy *p, struct px_req *q, wr_ip_t *out,
             for (int t = 0; t < q->tries; t++)
                 if (!memcmp(&q->tried[t], ip, sizeof *ip)) done = true;
             if (done) continue;
-            if (wr_special_address(ip) || syn_is_addr(ip)) { (*nskipped)++; continue; }
+            if (syn_is_addr(ip)) { (*nskipped)++; continue; }
+            /* the upstream is the operator's: it may be on loopback or a
+             * private address, and no rule is asked about it */
+            if (q->up) { *out = *ip; return true; }
+            if (wr_special_address(ip)) { (*nskipped)++; continue; }
             /* a rule that denies the address itself holds (decided as addr:port) */
             struct action na;
             memset(&na, 0, sizeof na);
             na.kind = ACT_NET_CONNECT;
             char at[INET6_ADDRSTRLEN];
             wr_ip_str(ip, at, sizeof at);
-            snprintf(na.resolved, sizeof na.resolved, fam == 6 ? "[%s]:%u" : "%s:%u", at, q->port);
+            snprintf(na.resolved, sizeof na.resolved, fam == 6 ? "[%s]:%u" : "%s:%u", at, q->dport);
             if (policy_decide(p, &na) == DEC_DENY && na.rule_index >= 0) { (*nskipped)++; continue; }
             *out = *ip;
             return true;
@@ -192,13 +237,13 @@ static void px_dial(const struct policy *p, struct px_req *q) {
         if (ip.fam == 4) {
             struct sockaddr_in *d = (struct sockaddr_in *)&ss;
             d->sin_family = AF_INET;
-            d->sin_port = htons((uint16_t)q->port);
+            d->sin_port = htons((uint16_t)q->dport);
             memcpy(&d->sin_addr, ip.a, 4);
             sl = sizeof *d;
         } else {
             struct sockaddr_in6 *d = (struct sockaddr_in6 *)&ss;
             d->sin6_family = AF_INET6;
-            d->sin6_port = htons((uint16_t)q->port);
+            d->sin6_port = htons((uint16_t)q->dport);
             memcpy(&d->sin6_addr, ip.a, 16);
             sl = sizeof *d;
         }
@@ -207,7 +252,7 @@ static void px_dial(const struct policy *p, struct px_req *q) {
         char *dp = strstr(q->a->extra, "\"dialed\":");
         if (dp) { *dp = '\0'; el = strlen(q->a->extra); }
         snprintf(q->a->extra + el, sizeof q->a->extra - el, ip.fam == 6 ? "\"dialed\":\"[%s]:%u\"," :
-                 "\"dialed\":\"%s:%u\",", at, q->port);
+                 "\"dialed\":\"%s:%u\",", at, q->dport);
         int s = socket(ss.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (s < 0) continue;
         if (connect(s, (struct sockaddr *)&ss, sl) == 0 || errno == EINPROGRESS) {
@@ -227,7 +272,7 @@ static void px_dialed(const struct policy *p, struct px_req *q, int so_error) {
         px_dial(p, q);
         return;
     }
-    if (px_pass(q->id, q->sock) < 0) {
+    if ((q->up ? px_pass_up(q->id, q->sock, q->name, q->port) : px_pass(q->id, q->sock)) < 0) {
         (void)wp_verdict(&g_proxy, q->id, false);
         px_record(q, DEC_ALLOW, DEC_ALLOW, "proxy_dial_failed", EIO);
     } else {
@@ -264,7 +309,7 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
     q->used = true;
     q->id = m->id;
     q->kind = m->kind;
-    q->port = m->port;
+    q->port = q->dport = m->port;
     q->sock = -1;
     q->entry = -1;
     q->a = a;
@@ -284,6 +329,50 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
     }
     int i = wr_table_find(&g_names, q->name);
     if (i >= 0 && g_names.e[i].unlisted) i = -1;         /* only a deny rule names it */
+    if (p->v.proxy_up_port) {
+        /* Section 5: decided here, dialed to the customer's proxy, which
+         * resolves the name. A name only a wildcard allows is charged to
+         * that wildcard's budgets once (recorded as a question answered
+         * "upstream"); nothing is looked up here. */
+        if (i < 0 || g_names.e[i].dynamic) {
+            bool seen = false;
+            for (size_t k = 0; k < g_up_nnames; k++) if (!strcmp(g_up_names[k], q->name)) seen = true;
+            if (!seen) {
+                stub_budget_init(p);
+                g_stub_now = wr_now_ms();
+                int ri = stub_name_rule(p, q->name);
+                int line = ri >= 0 ? p->v.rules[ri].line : -1;
+                struct stub_budget *bud = ri >= 0 && p->v.rules[ri].s.wild ? stub_budget_of(ri) : NULL;
+                const char *over = ri >= 0 && p->v.rules[ri].s.wild && g_up_nnames < STUB_MAX_DYN
+                                   ? stub_charge(bud, q->name, g_stub_now, true) : "names";
+                if (over) {
+                    stub_record(q->name, 1, -2, "wildcard_budget", line, over, 0, "nxdomain", NULL);
+                    px_refuse(q, d_raw, "wildcard_budget", EACCES);
+                    return;
+                }
+                void *nn = realloc(g_up_names, (g_up_nnames + 1) * sizeof *g_up_names);
+                if (nn) {
+                    g_up_names = nn;
+                    snprintf(g_up_names[g_up_nnames++], sizeof *g_up_names, "%s", q->name);
+                }
+                stub_record(q->name, 1, -2, "policy_match", line, NULL, STUB_NEW, "upstream", NULL);
+            }
+        }
+        q->up = true;
+        q->dport = p->v.proxy_up_port;
+        q->entry = g_up_entry;
+        if (q->entry < 0) { px_dial(p, q); return; }
+        i = q->entry;
+        const wr_entry_t *e = &g_names.e[i];
+        bool have = false;
+        for (size_t k = 0; k < e->n; k++) if (e->addrs[k].until_ms == 0) have = true;
+        if (!have && !e->pending && wr_async_request(&g_names, (size_t)i) < 0) {
+            px_refuse(q, d_raw, "resolution_failed", EACCES);
+            return;
+        }
+        px_resolve(p, q);
+        return;
+    }
     if (i >= 0 && !g_names.e[i].dynamic) {                /* an exact name */
         q->entry = i;
         const wr_entry_t *e = &g_names.e[i];
