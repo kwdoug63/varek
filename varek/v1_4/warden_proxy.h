@@ -82,7 +82,10 @@ struct wp_verdict {
  * upstream proxy refused it, "upstream_refused"). The byte counts are
  * the proxy's own (it is not trusted to count them; they are recorded as its
  * report). why: "closed" (both sides closed), "reset" (an error on either
- * side), "idle", "run_end" (closed when the run ended, on WP_MSG_FLUSH). */
+ * side), "idle", "run_end" (closed when the run ended, on WP_MSG_FLUSH); v1.26
+ * review: "refused_request" (a later HTTP request for another host, or not
+ * a request, refused), "client_gone" (allowed, but the client had gone
+ * before relaying began: nothing relayed). */
 struct wp_close {
     uint32_t type;               /* WP_MSG_CLOSED */
     uint32_t upstream_status;    /* section 5, why "upstream_refused": its status (0: no reply) */

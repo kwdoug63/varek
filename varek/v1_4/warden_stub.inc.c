@@ -514,27 +514,31 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
         stub_record(name, qtype, conn_fd, rule, line, NULL, false, "noerror", NULL);
         return;
     }
-    bool isnew = false;
+    bool isnew = false, charged_q = false;   /* charged_q: this question was charged already */
     struct stub_budget *bud = ri >= 0 && p->v.rules[ri].s.wild ? stub_budget_of(ri) : NULL;
     if (i < 0) {
         /* A new name (never exact, so ri >= 0): charged to the wildcard rule
          * that allows it. */
-        const char *over = p->v.rules[ri].s.wild ? stub_charge(bud, name, now, true) : NULL;
+        /* v1.26 review: a name already sent to the upstream proxy was
+         * charged as new then; asked now, it is charged only to rate= */
+        bool fresh = !px_up_charged(name);
+        const char *over = p->v.rules[ri].s.wild ? stub_charge(bud, name, now, fresh) : NULL;
         if (over) {
             size_t l = stub_build(m, qend, 3, qtype, NULL, now, out, outn);
             stub_send(conn_fd, from, fl, out, l);
             stub_record(name, qtype, conn_fd, "wildcard_budget", line, over, 0, "nxdomain", NULL);
             return;
         }
+        charged_q = true;
         if (g_stub_dyn >= STUB_MAX_DYN || (i = wr_table_add_dynamic(&g_names, name)) < 0) {
-            stub_uncharge(bud, true);                   /* v1.25 review: nothing was added */
+            stub_uncharge(bud, fresh);                  /* v1.25 review: nothing was added */
             size_t l = stub_build(m, qend, 2, qtype, NULL, now, out, outn);  /* SERVFAIL */
             stub_send(conn_fd, from, fl, out, l);
             stub_record(name, qtype, conn_fd, rule, line, NULL, 0, "servfail", NULL);
             return;
         }
         g_stub_dyn++;
-        isnew = true;
+        isnew = fresh;
     }
     const wr_entry_t *e = &g_names.e[i];
     if (exact || wr_entry_fresh(e, now)) {
@@ -548,7 +552,7 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
      * way is shared and charges nothing more; a name asked again after its
      * TTL charges the rule's rate (v1.25 review). */
     bool send_up = !e->pending;
-    if (send_up && !isnew && bud) {
+    if (send_up && !charged_q && bud) {
         const char *over = stub_charge(bud, name, now, false);
         if (over) {
             size_t l = stub_build(m, qend, 3, qtype, NULL, now, out, outn);

@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -141,10 +142,21 @@ struct wp_held {
     unsigned  up_status;         /* section 5: the upstream's reply status */
     int64_t   relay_at;          /* when relaying began */
     const char *why;             /* step 7: why the relay ended */
+    /* v1.26 review: plain HTTP is checked request by request. Client bytes
+     * are passed on only up to fwd: the heads read so far (each for the
+     * name and port decided) and their bodies. */
+    char      name[PP_NAME_MAX + 1]; /* the name decided */
+    int       gate;              /* WG_OPEN (TLS, CONNECT: not read), WG_HEAD, WG_LENGTH, WG_CHUNKED */
+    size_t    fwd;
+    uint64_t  body_left;
+    pp_chunked_t ck;
+    bool      refused;           /* a later request was refused: no more is read from the client */
 };
+enum { WG_OPEN = 0, WG_HEAD, WG_LENGTH, WG_CHUNKED };
 static struct wp_ann  g_ann[WP_MAX_ANNOUNCED];
 static struct wp_held g_held[WP_MAX_HELD];
 static int g_nheld = 0;
+static int g_max_held = WP_MAX_HELD;   /* v1.26 review: fewer if the descriptor limit is lower */
 static int g_ctl = -1;
 
 /* Step 7: a relayed connection ends: report it (bytes each way, how long). */
@@ -199,7 +211,21 @@ static void report(const struct wp_held *h, uint32_t type, const pp_result_t *r,
     } else {
         snprintf(m.why, sizeof m.why, "%s", why);
     }
-    (void)send(g_ctl, &m, sizeof m, MSG_DONTWAIT | MSG_NOSIGNAL);
+    /* v1.26 review: blocking, as report_close: a report the control socket
+     * had no room for was dropped, and its connection waited, unrecorded */
+    (void)send(g_ctl, &m, sizeof m, MSG_NOSIGNAL);
+}
+
+/* v1.26 review: an allowed connection the proxy could not relay (the client
+ * had gone, or relaying could not start): the Warden counted it open, so
+ * report its close, with nothing relayed. */
+static void report_gone(uint64_t id) {
+    struct wp_close m;
+    memset(&m, 0, sizeof m);
+    m.type = WP_MSG_CLOSED;
+    m.id = id;
+    snprintf(m.why, sizeof m.why, "client_gone");
+    (void)send(g_ctl, &m, sizeof m, MSG_NOSIGNAL);
 }
 
 static int held_find(uint64_t id) {
@@ -218,6 +244,8 @@ static int held_relay(int k, int fd) {
     if (!h->buf && !(h->buf = malloc(PP_IN_MAX))) return -1;
     h->up = fd;
     h->off = h->skip;
+    h->fwd = h->kind == PP_KIND_HTTP ? h->skip : h->len;   /* HTTP: each head read before it is sent */
+    h->gate = h->kind == PP_KIND_HTTP ? WG_HEAD : WG_OPEN;
     h->state = WH_RELAY;
     h->since = h->relay_at = mono_ms();
     return 0;
@@ -262,23 +290,78 @@ static bool held_upstream(int k) {
     return true;
 }
 
+/* v1.26 review: a request the gate refuses. What came before it is still
+ * sent, and the server's reply to it relayed; nothing after it is: the
+ * client is treated as closed there, and the close is recorded as
+ * "refused_request". */
+static void gate_refuse(struct wp_held *h) {
+    h->refused = true;
+    h->len = h->fwd;
+    h->eof_c = true;
+}
+
+/* v1.26 review: let through the client's bytes that are whole requests for
+ * the name and port decided: each head is read (as the first was) before a
+ * byte of it is sent, and its body is passed as its framing says. A request
+ * for another host, or one that cannot be read, stops it (gate_refuse). */
+static bool held_gate(struct wp_held *h) {
+    while (h->fwd < h->len) {
+        if (h->gate == WG_OPEN) { h->fwd = h->len; break; }
+        if (h->gate == WG_HEAD) {
+            pp_result_t r;
+            pp_status_t st = pp_parse(h->buf + h->fwd, h->len - h->fwd, h->dport, false, &r);
+            if (st == PP_MORE) {
+                if (h->len - h->fwd >= PP_HTTP_MAX) gate_refuse(h);
+                break;
+            }
+            if (st != PP_OK || r.kind != PP_KIND_HTTP || strcmp(r.name, h->name) || r.port != h->dport) {
+                gate_refuse(h);                         /* another host, or not a request */
+                break;
+            }
+            h->fwd += r.head_len;
+            h->gate = r.body == PP_BODY_LENGTH && r.body_len ? WG_LENGTH :
+                      r.body == PP_BODY_CHUNKED ? WG_CHUNKED : WG_HEAD;
+            h->body_left = r.body_len;
+            memset(&h->ck, 0, sizeof h->ck);
+        } else if (h->gate == WG_LENGTH) {
+            uint64_t take = h->len - h->fwd < h->body_left ? h->len - h->fwd : h->body_left;
+            h->fwd += (size_t)take;
+            h->body_left -= take;
+            if (!h->body_left) h->gate = WG_HEAD;
+        } else {
+            bool done;
+            long c = pp_chunked_feed(&h->ck, h->buf + h->fwd, h->len - h->fwd, &done);
+            if (c < 0) { gate_refuse(h); break; }
+            h->fwd += (size_t)c;
+            if (done) h->gate = WG_HEAD;
+        }
+    }
+    return true;
+}
+
 /* Move what can be moved on relayed connection k; false when it is done. */
 static bool held_pump(int k, short crev, short srev) {
     struct wp_held *h = &g_held[k];
     h->why = "reset";
     if ((crev | srev) & POLLNVAL) return false;
     bool moved = false;
-    /* client -> server */
-    if (h->off < h->len) {
-        ssize_t n = send(h->up, h->buf + h->off, h->len - h->off, MSG_DONTWAIT | MSG_NOSIGNAL);
+    /* client -> server: only what the gate let through (up to fwd) */
+    if (!held_gate(h)) return false;
+    if (h->off < h->fwd) {
+        ssize_t n = send(h->up, h->buf + h->off, h->fwd - h->off, MSG_DONTWAIT | MSG_NOSIGNAL);
         if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return false;
         if (n > 0) { h->off += (size_t)n; h->bytes_up += (uint64_t)n; moved = true; }
-        if (h->off == h->len) h->off = h->len = 0;
+    }
+    if (h->off > 0 && h->off == h->fwd) {          /* sent: keep only what is not yet let through */
+        memmove(h->buf, h->buf + h->off, h->len - h->off);
+        h->len -= h->off;
+        h->fwd -= h->off;
+        h->off = 0;
     }
     if (!h->eof_c && h->len < PP_IN_MAX && (crev & (POLLIN | POLLHUP | POLLERR))) {
         ssize_t n = recv(h->fd, h->buf + h->len, PP_IN_MAX - h->len, MSG_DONTWAIT);
         if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) h->eof_c = true;
-        else if (n > 0) { h->len += (size_t)n; moved = true; }
+        else if (n > 0) { h->len += (size_t)n; moved = true; if (!held_gate(h)) return false; }
     }
     /* server -> client */
     if (h->doff < h->dlen) {
@@ -294,10 +377,14 @@ static bool held_pump(int k, short crev, short srev) {
     }
     /* a side that closed, once what it sent is passed on, closes the other's write side */
     if (h->eof_c && h->off == h->len && !h->shut_s) { shutdown(h->up, SHUT_WR); h->shut_s = true; }
+    if (h->eof_c && h->len > h->fwd && h->off == h->fwd) {
+        gate_refuse(h);                              /* closed in the middle of a request */
+        if (!h->shut_s) { shutdown(h->up, SHUT_WR); h->shut_s = true; }
+    }
     if (h->eof_s && h->doff == h->dlen && !h->shut_c) { shutdown(h->fd, SHUT_WR); h->shut_c = true; }
     int64_t now = mono_ms();
     if (moved) h->since = now;
-    h->why = "closed";
+    h->why = h->refused ? "refused_request" : "closed";
     if (h->shut_s && h->shut_c) return false;
     h->why = "idle";
     return now - h->since <= WP_RELAY_IDLE;
@@ -317,12 +404,21 @@ static int wp_drain_ctl(int ctl) {
         for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c))
             if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS && c->cmsg_len == CMSG_LEN(sizeof(int)))
                 memcpy(&fd, CMSG_DATA(c), sizeof fd);
+        /* v1.26 review: a socket that could not be received (no descriptor
+         * free) leaves an allow without one: refused below, and reported */
+        bool ctrunc = mh.msg_flags & MSG_CTRUNC;
         if (n == (ssize_t)sizeof m.v && m.type == WP_MSG_VERDICT) {
             /* step 6: allow carries the socket the Warden dialed */
             int k = held_find(m.v.id);
-            if (k < 0 || g_held[k].state != WH_WAITING) { if (fd >= 0) close(fd); continue; }
+            bool passed = m.v.allow && (fd >= 0 || ctrunc);  /* the Warden counted it open */
+            if (k < 0 || g_held[k].state != WH_WAITING) {
+                if (fd >= 0) close(fd);
+                if (passed) report_gone(m.v.id);
+                continue;
+            }
             if (!m.v.allow || fd < 0 || held_relay(k, fd) < 0) {
                 if (fd >= 0) close(fd);
+                if (passed) report_gone(m.v.id);
                 held_refuse(k);
             }
             continue;
@@ -330,8 +426,14 @@ static int wp_drain_ctl(int ctl) {
         if (n == (ssize_t)sizeof m.u && m.type == WP_MSG_VERDICT_UP) {
             /* section 5: allow, dialed to the upstream proxy */
             int k = held_find(m.u.id);
-            if (k < 0 || g_held[k].state != WH_WAITING) { if (fd >= 0) close(fd); continue; }
-            m.u.name[sizeof m.u.name - 1] = '\0';
+            bool passed = m.u.allow && (fd >= 0 || ctrunc);
+            if (k < 0 || g_held[k].state != WH_WAITING || fd < 0 || m.u.port == 0 || m.u.port > 65535 ||
+                !memchr(m.u.name, 0, sizeof m.u.name)) {
+                if (fd >= 0) close(fd);
+                if (passed) report_gone(m.u.id);
+                if (k >= 0 && g_held[k].state == WH_WAITING) held_refuse(k);
+                continue;
+            }
             if (!m.u.allow || fd < 0 || held_relay_up(k, fd, m.u.name, m.u.port) < 0) {
                 if (g_held[k].state == WH_UPSTREAM || g_held[k].up >= 0) {
                     g_held[k].state = WH_UPSTREAM;     /* reported as upstream_refused */
@@ -357,8 +459,11 @@ static int wp_drain_ctl(int ctl) {
         }
         if (n != (ssize_t)sizeof m.c || m.type != WP_MSG_CONN || m.c.from_port == 0 || m.c.from_port > 65535)
             continue;                                   /* not one the Warden sends */
+        if (!memchr(m.c.dest, 0, sizeof m.c.dest)) continue;
         const char *colon = strrchr(m.c.dest, ':');
-        unsigned dport = colon ? (unsigned)strtoul(colon + 1, NULL, 10) : 0;
+        unsigned long dpl = colon ? strtoul(colon + 1, NULL, 10) : 0;
+        if (dpl == 0 || dpl > 65535) continue;
+        unsigned dport = (unsigned)dpl;
         int64_t now = mono_ms();
         int slot = -1, oldest = 0;
         for (int k = 0; k < WP_MAX_ANNOUNCED; k++) {
@@ -381,7 +486,7 @@ static void wp_accepted(int c, const struct sockaddr_in *peer) {
         for (int k = 0; k < WP_MAX_ANNOUNCED; k++)
             if (g_ann[k].used && g_ann[k].from_port == ntohs(peer->sin_port) &&
                 now - g_ann[k].at <= WP_ANNOUNCE_MS) { found = k; break; }
-    if (found < 0 || g_nheld >= WP_MAX_HELD) { close(c); return; }
+    if (found < 0 || g_nheld >= g_max_held) { close(c); return; }
     g_ann[found].used = false;
     g_held[g_nheld++] = (struct wp_held){ .fd = c, .id = g_ann[found].id, .dport = g_ann[found].dport,
                                           .state = WH_READING, .since = now, .up = -1 };
@@ -420,6 +525,7 @@ static void held_read(int k) {
         return;
     }
     report(h, WP_MSG_REQUEST, &r, NULL);
+    snprintf(h->name, sizeof h->name, "%s", r.name);       /* later requests must name it too */
     if (r.kind == PP_KIND_CONNECT) h->skip = r.connect_len;   /* the server gets what follows it */
     h->state = WH_WAITING;
     h->since = mono_ms();
@@ -454,6 +560,22 @@ int wp_helper_main(int ctl) {
     memcpy(CMSG_DATA(c), &cr, sizeof cr);
     if (sendmsg(ctl, &mh, MSG_NOSIGNAL) != (ssize_t)sizeof m) return 1;
     static struct pollfd pf[2 + 2 * WP_MAX_HELD];
+    static int pfc[WP_MAX_HELD], pfs[WP_MAX_HELD];   /* each held connection's fds as polled */
+    /* v1.26 review: room for every held connection's two sockets, beyond
+     * the inherited limit (often 1024); held connections are capped to it */
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        rlim_t want = 2 * WP_MAX_HELD + 64;
+        if (rl.rlim_cur < want) {
+            rl.rlim_cur = rl.rlim_max < want ? rl.rlim_max : want;
+            (void)setrlimit(RLIMIT_NOFILE, &rl);
+            (void)getrlimit(RLIMIT_NOFILE, &rl);
+        }
+        long cap = ((long)rl.rlim_cur - 64) / 2;
+        g_max_held = cap < 1 ? 1 : cap < WP_MAX_HELD ? (int)cap : WP_MAX_HELD;
+    }
+    int reserve = open("/dev/null", O_RDONLY | O_CLOEXEC);   /* freed to refuse a connection at EMFILE */
+    int64_t listen_pause = 0;
     for (;;) {
         pf[0] = (struct pollfd){ .fd = ctl, .events = POLLIN };
         pf[1] = (struct pollfd){ .fd = ls, .events = POLLIN };
@@ -468,11 +590,17 @@ int wp_helper_main(int ctl) {
                 if (!h->eof_s && h->dlen < WP_RELAY_BUF) se |= POLLIN;
                 if (h->off < h->len) se |= POLLOUT;
             }
-            pf[2 + 2 * k] = (struct pollfd){ .fd = h->fd, .events = ce };
             if (h->state == WH_UPSTREAM) se = POLLIN;
-            pf[3 + 2 * k] = (struct pollfd){ .fd = h->state == WH_RELAY || h->state == WH_UPSTREAM ? h->up : -1,
-                                             .events = se };
+            pfc[k] = h->fd;
+            pfs[k] = h->state == WH_RELAY || h->state == WH_UPSTREAM ? h->up : -1;
+            /* v1.26 review: a relay side that can make no progress is not
+             * polled at all (its POLLHUP or POLLERR would wake the loop at
+             * once, again and again); the relay is still visited each pass */
+            bool relay = h->state == WH_RELAY || h->state == WH_UPSTREAM;
+            pf[2 + 2 * k] = (struct pollfd){ .fd = relay && !ce ? -1 : pfc[k], .events = ce };
+            pf[3 + 2 * k] = (struct pollfd){ .fd = relay && !se ? -1 : pfs[k], .events = se };
         }
+        pf[1].fd = mono_ms() < listen_pause ? -1 : ls;
         if (poll(pf, (nfds_t)(2 + 2 * nh), 1000) < 0) {
             if (errno == EINTR) continue;
             return 1;
@@ -482,25 +610,30 @@ int wp_helper_main(int ctl) {
          * some, moving others), then new ones. */
         int64_t now = mono_ms();
         for (int j = 0; j < nh; j++) {
-            int cfd = pf[2 + 2 * j].fd, k = -1;
+            int cfd = pfc[j], k = -1;
             for (int x = 0; x < g_nheld; x++) if (g_held[x].fd == cfd) { k = x; break; }
             if (k < 0) continue;
             struct wp_held *h = &g_held[k];
             short crev = pf[2 + 2 * j].revents, srev = pf[3 + 2 * j].revents;
             if (h->state == WH_UPSTREAM) {
-                bool ok = pf[3 + 2 * j].fd != h->up || !(srev & (POLLIN | POLLHUP | POLLERR)) || held_upstream(k);
+                bool ok = pfs[j] != h->up || !(srev & (POLLIN | POLLHUP | POLLERR)) || held_upstream(k);
                 if (ok && h->state == WH_UPSTREAM && now - h->since > WP_READ_MS) ok = false;
                 if (!ok) held_refuse(k);                            /* reported, then refused */
                 continue;
             }
             if (h->state == WH_RELAY) {
-                if (pf[3 + 2 * j].fd != h->up) { srev = 0; crev = 0; }   /* became a relay just now */
+                if (pfs[j] != h->up) { srev = 0; crev = 0; }   /* became a relay just now */
                 if (!held_pump(k, crev, srev)) held_drop(k);
                 continue;
             }
             if (h->state == WH_READING && (crev & (POLLIN | POLLHUP | POLLERR))) {
                 held_read(k);
-                continue;
+                /* v1.26 review: the deadline holds for a client that sends
+                 * a byte at a time, too */
+                k = -1;
+                for (int x = 0; x < g_nheld; x++) if (g_held[x].fd == cfd) { k = x; break; }
+                if (k < 0 || g_held[k].state != WH_READING) continue;
+                h = &g_held[k];
             }
             if (h->state == WH_READING && now - h->since > WP_READ_MS) {
                 report(h, WP_MSG_UNREADABLE, NULL, "no whole request within 10 s");
@@ -520,6 +653,17 @@ int wp_helper_main(int ctl) {
                 socklen_t pl = sizeof peer;
                 memset(&peer, 0, sizeof peer);
                 int c2 = accept4(ls, (struct sockaddr *)&peer, &pl, SOCK_CLOEXEC | SOCK_NONBLOCK);
+                if (c2 < 0 && (errno == EMFILE || errno == ENFILE) && reserve >= 0) {
+                    /* v1.26 review: no descriptor free: refuse the
+                     * connection (the agent's connect fails rather than
+                     * hangs) with the one held in reserve */
+                    close(reserve);
+                    c2 = accept4(ls, NULL, NULL, SOCK_CLOEXEC);
+                    if (c2 >= 0) close(c2);
+                    reserve = open("/dev/null", O_RDONLY | O_CLOEXEC);
+                    if (reserve < 0) listen_pause = mono_ms() + 100;
+                    continue;
+                }
                 if (c2 < 0) break;
                 wp_accepted(c2, &peer);
             }

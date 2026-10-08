@@ -55,7 +55,27 @@ typedef struct {
     unsigned    port;
     size_t      connect_len;         /* PP_ACK and after: the CONNECT request's length */
     const char *why;                 /* PP_REFUSE: a short reason (static text) */
+    /* v1.26 review, HTTP: the request head's length and its body's framing,
+     * so the proxy can check every request on a kept-alive connection */
+    size_t      head_len;
+    int         body;                /* PP_BODY_NONE, _LENGTH (body_len bytes) or _CHUNKED */
+    uint64_t    body_len;
 } pp_result_t;
+
+enum { PP_BODY_NONE = 0, PP_BODY_LENGTH = 1, PP_BODY_CHUNKED = 2 };
+
+/* v1.26 review: a chunked request body, read as it arrives. */
+typedef struct {
+    int      st;
+    uint64_t left;                   /* data bytes left in this chunk */
+    unsigned digits, line, lines;
+} pp_chunked_t;
+
+/* Read n bytes of a chunked body (c zeroed at its start). Returns how many
+ * belong to the body (<= n; *done set when its last byte has been read), or
+ * -1 if it is malformed (bare LF, a chunk size over 15 hex digits, a line
+ * over 4 KB, more than 64 trailer lines). */
+long pp_chunked_feed(pp_chunked_t *c, const uint8_t *in, size_t n, bool *done);
 
 /* Parse the n bytes a client has sent (dport: the port it connected to;
  * acked: the proxy has answered its CONNECT). */

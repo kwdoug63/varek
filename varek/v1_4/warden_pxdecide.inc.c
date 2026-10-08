@@ -55,6 +55,31 @@ struct px_req {
 };
 static struct px_req g_px[PX_MAX_DIAL];
 
+/* v1.26 review: each hand-off's state, by its id: 1 announced to the proxy
+ * (with the port the agent connected to), 2 reported on. The proxy may
+ * report on a hand-off once, so it can never make the Warden decide or dial
+ * one twice. */
+static uint8_t  *g_ho_state;
+static uint16_t *g_ho_port;
+static size_t    g_ho_cap;
+
+static void px_handed_off(uint64_t id, unsigned port) {
+    if (id >= g_ho_cap) {
+        size_t nc = g_ho_cap ? g_ho_cap * 2 : 1024;
+        while (nc <= id) nc *= 2;
+        uint8_t *st = realloc(g_ho_state, nc);
+        if (!st) return;                         /* not recorded: its report is refused */
+        g_ho_state = st;
+        uint16_t *pt = realloc(g_ho_port, nc * sizeof *pt);
+        if (!pt) return;
+        g_ho_port = pt;
+        memset(g_ho_state + g_ho_cap, 0, nc - g_ho_cap);
+        g_ho_cap = nc;
+    }
+    g_ho_state[id] = 1;
+    g_ho_port[id] = (uint16_t)port;
+}
+
 /* Step 7: the connections passed to the proxy and not yet closed, and when
  * each was passed (monotonic ms). */
 struct px_open { uint64_t id; int64_t at; };
@@ -96,7 +121,8 @@ static void px_close_record(uint64_t id, const char *why, const struct wp_close 
 /* A close report: 0, or -1 (not a connection passed to the proxy and still
  * open, or a malformed report: the proxy is not behaving). */
 static int px_closed(const struct wp_close *m) {
-    static const char *const kWhy[] = { "closed", "reset", "idle", "run_end", "upstream_refused" };
+    static const char *const kWhy[] = { "closed", "reset", "idle", "run_end", "upstream_refused",
+                                         "refused_request", "client_gone" };
     bool ok = false;
     if (!memchr(m->why, 0, sizeof m->why)) return -1;
     for (size_t k = 0; k < sizeof kWhy / sizeof *kWhy; k++) if (!strcmp(m->why, kWhy[k])) ok = true;
@@ -179,6 +205,11 @@ static int px_pass_up(uint64_t id, int s, const char *name, unsigned port) {
  * charged once to the wildcard's names budget (the upstream resolves them). */
 static char (*g_up_names)[WR_NAME_MAX + 1];
 static size_t g_up_nnames;
+
+static bool px_up_charged(const char *name) {
+    for (size_t k = 0; k < g_up_nnames; k++) if (!strcmp(g_up_names[k], name)) return true;
+    return false;
+}
 
 /* The next address of q's entry to dial, or false. Counts what was passed
  * over, so the record can say why none was dialed. */
@@ -335,8 +366,9 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
          * that wildcard's budgets once (recorded as a question answered
          * "upstream"); nothing is looked up here. */
         if (i < 0 || g_names.e[i].dynamic) {
-            bool seen = false;
-            for (size_t k = 0; k < g_up_nnames; k++) if (!strcmp(g_up_names[k], q->name)) seen = true;
+            /* v1.26 review: charged once, whether first by the stub (a
+             * dynamic entry) or here */
+            bool seen = i >= 0 || px_up_charged(q->name);
             if (!seen) {
                 stub_budget_init(p);
                 g_stub_now = wr_now_ms();
@@ -497,6 +529,12 @@ static int proxy_service(const struct policy *p) {
             m.kind > PP_KIND_CONNECT || m.id == 0 || m.id > g_proxy_conns ||
             !memchr(m.name, 0, sizeof m.name) || !memchr(m.why, 0, sizeof m.why))
             return -1;
+        /* v1.26 review: one report per hand-off, and (TLS, HTTP) on the port
+         * the agent connected to; anything else and the proxy is not
+         * behaving */
+        if (m.id >= g_ho_cap || g_ho_state[m.id] != 1) return -1;
+        if (m.type == WP_MSG_REQUEST && m.kind != PP_KIND_CONNECT && m.port != g_ho_port[m.id]) return -1;
+        g_ho_state[m.id] = 2;
         if (m.type == WP_MSG_REQUEST) {
             char why[8];
             if (m.port == 0 || m.port > 65535 || m.kind == PP_KIND_NONE ||
@@ -522,7 +560,9 @@ static void px_finish(void) {
         if (g_px[k].used) px_refuse(&g_px[k], DEC_ALLOW, "run_ended", EACCES);
     if (g_proxy.ctl >= 0 && g_px_nopen) {
         struct wp_msg f = { .type = WP_MSG_FLUSH, .port = 0 };
-        if (send(g_proxy.ctl, &f, sizeof f, MSG_NOSIGNAL) == (ssize_t)sizeof f) {
+        /* v1.26 review: never blocks (a proxy that stopped reading would
+         * hold the run's end); on failure every open relay is unreported */
+        if (send(g_proxy.ctl, &f, sizeof f, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t)sizeof f) {
             int64_t until = wr_now_ms() + 2000;
             g_px_flushed = false;
             while (!g_px_flushed && wr_now_ms() < until) {

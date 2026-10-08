@@ -279,6 +279,65 @@ static int unit(void) {
                all ? "PASS" : "FAIL");
         if (!all) fails = 1;
     }
+    {
+        /* v1.26 review: each request's head length and body framing */
+        pp_result_t r;
+        const char *a = "POST /x HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 5\r\n\r\nhelloGET";
+        bool ok = pp_parse((const uint8_t *)a, strlen(a), 80, false, &r) == PP_OK && r.head_len == strlen(a) - 8 &&
+                  r.body == PP_BODY_LENGTH && r.body_len == 5;
+        const char *b = "POST /x HTTP/1.1\r\nHost: api.example.com\r\nTransfer-Encoding: Chunked\r\n\r\n";
+        ok = ok && pp_parse((const uint8_t *)b, strlen(b), 80, false, &r) == PP_OK && r.body == PP_BODY_CHUNKED;
+        const char *g = "GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+        ok = ok && pp_parse((const uint8_t *)g, strlen(g), 80, false, &r) == PP_OK && r.body == PP_BODY_NONE &&
+             r.head_len == strlen(g);
+        printf("  %s   HTTP: the head's length and its body's framing (Content-Length, chunked, none)\n", ok ? "PASS" : "FAIL");
+        if (!ok) fails = 1;
+    }
+    expect_s("HTTP: Content-Length and Transfer-Encoding", "POST / HTTP/1.1\r\nHost: a.example.com\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n",
+             80, PP_REFUSE, "both Content-Length");
+    expect_s("HTTP: Content-Length twice", "POST / HTTP/1.1\r\nHost: a.example.com\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\n",
+             80, PP_REFUSE, "twice");
+    expect_s("HTTP: a Content-Length that is not a number", "POST / HTTP/1.1\r\nHost: a.example.com\r\nContent-Length: +3\r\n\r\n",
+             80, PP_REFUSE, "not a number");
+    expect_s("HTTP: gzip, chunked", "POST / HTTP/1.1\r\nHost: a.example.com\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+             80, PP_REFUSE, "other than chunked");
+    expect_s("HTTP: a protocol upgrade", "GET / HTTP/1.1\r\nHost: a.example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+             80, PP_REFUSE, "protocol upgrade");
+    {
+        /* v1.26 review: chunked bodies, whole and a byte at a time */
+        struct { const char *in; long want; bool done; } v[] = {
+            { "5\r\nhello\r\n0\r\n\r\nGET", 15, true },
+            { "5;ext=1\r\nhello\r\n0\r\nX-T: 1\r\n\r\n", 29, true },
+            { "5\r\nhel", 6, false },
+            { "5\nhello\r\n0\r\n\r\n", -1, false },
+            { "g\r\n", -1, false },
+            { "1234567890abcdef0\r\n", -1, false },
+            { "5\r\nhelloX", -1, false },
+        };
+        bool all = true;
+        for (size_t k = 0; k < sizeof v / sizeof *v; k++) {
+            pp_chunked_t c;
+            memset(&c, 0, sizeof c);
+            bool done;
+            long got = pp_chunked_feed(&c, (const uint8_t *)v[k].in, strlen(v[k].in), &done);
+            if (got != v[k].want || (got >= 0 && done != v[k].done)) {
+                printf("         chunked %zu: got %ld done %d\n", k, got, done); all = false;
+            }
+            if (v[k].want >= 0 && v[k].done) {          /* the same, one byte at a time */
+                memset(&c, 0, sizeof c);
+                long tot = 0;
+                done = false;
+                for (size_t j = 0; j < strlen(v[k].in) && !done; j++) {
+                    long g1 = pp_chunked_feed(&c, (const uint8_t *)v[k].in + j, 1, &done);
+                    if (g1 < 0) { tot = -1; break; }
+                    tot += g1;
+                }
+                if (tot != v[k].want || !done) { printf("         chunked %zu bytewise: %ld\n", k, tot); all = false; }
+            }
+        }
+        printf("  %s   chunked bodies: whole, a byte at a time, and malformed ones refused\n", all ? "PASS" : "FAIL");
+        if (!all) fails = 1;
+    }
     printf("proxy_parse unit: %s\n", fails ? "FAIL" : "PASS");
     return fails;
 }
@@ -315,6 +374,10 @@ static int fuzz(unsigned long iters, unsigned long seed) {
     sl[2] = strlen(h); memcpy(seeds[2], h, sl[2]);
     const char *c = "CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
     sl[3] = strlen(c); memcpy(seeds[3], c, sl[3]);
+    if (rnd() % 3 == 0) {                             /* v1.26 review: a chunked body in place of seed 1 */
+        const char *ckb = "1a;x=y\r\nabcdefghijklmnopqrstuvwxyz\r\n3\r\nabc\r\n0\r\nT: v\r\n\r\n";
+        sl[1] = strlen(ckb); memcpy(seeds[1], ckb, sl[1]);
+    }
     if (rnd() % 2) {                                  /* section 5: an upstream's reply in place of seed 2 */
         const char *u = "HTTP/1.1 200 Connection established\r\nVia: 1.1 squid\r\n\r\n";
         sl[2] = strlen(u); memcpy(seeds[2], u, sl[2]);
@@ -357,6 +420,14 @@ static int fuzz(unsigned long iters, unsigned long seed) {
             pp_result_t r;
             pp_status_t st = pp_parse(buf, cut, dport, acked, &r);
             invariants(buf, cut, dport, acked, st, &r);
+            {                                            /* v1.26 review: chunked bodies */
+                pp_chunked_t ck;
+                memset(&ck, 0, sizeof ck);
+                bool cdone;
+                long cg = pp_chunked_feed(&ck, buf, cut, &cdone);
+                if (cg > (long)cut || cg < -1) abort();
+                if (st == PP_OK && r.kind == PP_KIND_HTTP && (r.head_len == 0 || r.head_len > cut)) abort();
+            }
             unsigned us; size_t ul; const char *uw;        /* section 5: the upstream's reply */
             pp_status_t ust = pp_upstream_reply(buf, cut, &us, &ul, &uw);
             if ((ust == PP_OK && (us < 200 || us > 299 || ul == 0 || ul > cut)) || (ust == PP_REFUSE && !uw)) abort();

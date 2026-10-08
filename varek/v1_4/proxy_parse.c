@@ -4,6 +4,7 @@
 #include "proxy_parse.h"
 
 #include <string.h>
+#include <strings.h>
 
 const char *pp_kind_name(pp_kind_t k) {
     switch (k) {
@@ -251,6 +252,53 @@ static int host_header(const uint8_t *in, size_t hdr, size_t end, const uint8_t 
     return found;
 }
 
+/* v1.26 review: how the request's body is framed (RFC 9112 6.3): a
+ * Content-Length, Transfer-Encoding: chunked, or none. Refused: both, either
+ * twice, a Content-Length that is not digits, any other transfer coding, and
+ * a protocol upgrade (WebSocket, h2c), whose bytes the proxy could not read
+ * as requests. The head is well formed (host_header read it). 0, or -1. */
+static int framing(const uint8_t *in, size_t hdr, size_t end, pp_result_t *r) {
+    int cl = 0, te = 0;
+    r->body = PP_BODY_NONE;
+    r->body_len = 0;
+    size_t i = hdr;
+    while (i + 2 <= end - 2) {
+        size_t ls = i;
+        while (in[i] != '\r') i++;
+        size_t le = i;
+        i += 2;
+        if (le == ls) break;
+        size_t c = ls;
+        while (c < le && in[c] != ':') c++;
+        size_t nl = c - ls, a = c + 1, b = le;
+        while (a < b && (in[a] == ' ' || in[a] == '\t')) a++;
+        while (b > a && (in[b - 1] == ' ' || in[b - 1] == '\t')) b--;
+        #define HN(s) (nl == sizeof(s) - 1 && !strncasecmp((const char *)in + ls, s, nl))
+        if (HN("content-length")) {
+            if (cl++ || b == a || b - a > 18) { r->why = "a Content-Length twice, or too long"; return -1; }
+            uint64_t v = 0;
+            for (size_t k = a; k < b; k++) {
+                if (in[k] < '0' || in[k] > '9') { r->why = "a Content-Length that is not a number"; return -1; }
+                v = v * 10 + (uint64_t)(in[k] - '0');
+            }
+            r->body = PP_BODY_LENGTH;
+            r->body_len = v;
+        } else if (HN("transfer-encoding")) {
+            if (te++ || b - a != 7 || strncasecmp((const char *)in + a, "chunked", 7)) {
+                r->why = "a transfer coding other than chunked";
+                return -1;
+            }
+        } else if (HN("upgrade")) {
+            r->why = "a protocol upgrade (not read in SNI mode)";
+            return -1;
+        }
+        #undef HN
+    }
+    if (cl && te) { r->why = "both Content-Length and Transfer-Encoding"; return -1; }
+    if (te) { r->body = PP_BODY_CHUNKED; r->body_len = 0; }
+    return 0;
+}
+
 static pp_status_t http(const uint8_t *in, size_t n, unsigned dport, pp_result_t *r) {
     long end = head_end(in, n);
     if (end < 0) return refuse(r, "a malformed HTTP request (CR, LF or NUL)");
@@ -280,6 +328,8 @@ static pp_status_t http(const uint8_t *in, size_t n, unsigned dport, pp_result_t
                                         !memcmp(q.method, "OPTIONS", 7)))) {
         return refuse(r, "a request target the proxy does not take");
     }
+    if (framing(in, q.hdr, (size_t)end, r) < 0) return PP_REFUSE;
+    r->head_len = (size_t)end;
     r->port = dport;
     return PP_OK;
 }
@@ -366,4 +416,93 @@ pp_status_t pp_upstream_reply(const uint8_t *in, size_t n, unsigned *status, siz
     *len = (size_t)end;
     if (*status < 200 || *status > 299) { *why = "the upstream refused"; return PP_REFUSE; }
     return PP_OK;
+}
+
+/* ---- v1.26 review: a chunked request body ---- */
+
+enum { CK_SIZE, CK_EXT, CK_SIZE_LF, CK_DATA, CK_DATA_CR, CK_DATA_LF, CK_TR_START, CK_TR_LINE, CK_TR_LF, CK_END_LF };
+
+static int hexv(uint8_t c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+long pp_chunked_feed(pp_chunked_t *c, const uint8_t *in, size_t n, bool *done) {
+    *done = false;
+    size_t i = 0;
+    while (i < n) {
+        uint8_t b = in[i];
+        switch (c->st) {
+        case CK_SIZE: {
+            int v = hexv(b);
+            if (v >= 0) {
+                if (++c->digits > 15) return -1;
+                c->left = c->left * 16 + (uint64_t)v;
+                i++;
+                break;
+            }
+            if (c->digits == 0) return -1;
+            if (b == '\r') { c->st = CK_SIZE_LF; i++; break; }
+            if (b == ';' || b == ' ' || b == '\t') { c->st = CK_EXT; c->line = 0; i++; break; }
+            return -1;
+        }
+        case CK_EXT:
+            if (b == '\n' || b == 0) return -1;
+            if (b == '\r') c->st = CK_SIZE_LF;
+            else if (++c->line > 4096) return -1;
+            i++;
+            break;
+        case CK_SIZE_LF:
+            if (b != '\n') return -1;
+            i++;
+            c->digits = 0;
+            c->st = c->left ? CK_DATA : CK_TR_START;
+            break;
+        case CK_DATA: {
+            size_t take = n - i < c->left ? n - i : (size_t)c->left;
+            i += take;
+            c->left -= take;
+            if (!c->left) c->st = CK_DATA_CR;
+            break;
+        }
+        case CK_DATA_CR:
+            if (b != '\r') return -1;
+            c->st = CK_DATA_LF;
+            i++;
+            break;
+        case CK_DATA_LF:
+            if (b != '\n') return -1;
+            c->st = CK_SIZE;
+            c->left = 0;
+            i++;
+            break;
+        case CK_TR_START:
+            if (b == '\r') { c->st = CK_END_LF; i++; break; }
+            if (b == '\n' || b == 0 || ++c->lines > 64) return -1;
+            c->st = CK_TR_LINE;
+            c->line = 0;
+            break;
+        case CK_TR_LINE:
+            if (b == '\n' || b == 0) return -1;
+            if (b == '\r') c->st = CK_TR_LF;
+            else if (++c->line > 4096) return -1;
+            i++;
+            break;
+        case CK_TR_LF:
+            if (b != '\n') return -1;
+            c->st = CK_TR_START;
+            i++;
+            break;
+        case CK_END_LF:
+            if (b != '\n') return -1;
+            i++;
+            *done = true;
+            return (long)i;
+        default:
+            return -1;
+        }
+    }
+    return (long)i;
 }

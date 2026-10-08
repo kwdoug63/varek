@@ -179,8 +179,9 @@ void wr_hosts_view(const wr_table_t *t, FILE *f);
 /* An address as text ("192.0.2.1", "2001:db8::1"). */
 void wr_ip_str(const wr_ip_t *ip, char *out, size_t n);
 /* Loopback, link-local, unspecified, multicast, cloud metadata (also outside
- * link-local), IPv4-compatible (::/96), and NAT64 forms of these: a name never
- * leads to them, only a numeric rule does. */
+ * link-local), IPv4-compatible (::/96), and NAT64 forms of these; v1.26
+ * review: and every IPv4-mapped or IPv4-translated address (::ffff:0:0/96,
+ * ::ffff:0:0:0/96). A name never leads to them, only a numeric rule does. */
 bool wr_special_address(const wr_ip_t *ip);
 /* v1.25 review: drop addresses whose grace ended by now; done(ctx, i) for each
  * entry that changed (after the generation is bumped). Returns their number. */

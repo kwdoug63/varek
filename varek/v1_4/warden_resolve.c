@@ -442,6 +442,14 @@ bool wr_special_address(const wr_ip_t *ip) {
     static const uint8_t nat64l[6] = { 0x00, 0x64, 0xff, 0x9b, 0x00, 0x01 };
     static const uint8_t ec2[16] = { 0xfd, 0x00, 0x0e, 0xc2, [14] = 0x02, [15] = 0x54 };
     if (!memcmp(a, zero, 12)) return true;                                     /* ::/96: ::, ::1 */
+    /* v1.26 review: IPv4-mapped (::ffff:0:0/96) and IPv4-translated
+     * (::ffff:0:0:0/96) addresses. An AAAA answer in these forms reaches an
+     * IPv4 address over an IPv6 socket, past every check made on the IPv4
+     * form (loopback, metadata, a rule that denies the address): never
+     * dialed for a name. */
+    static const uint8_t mapped[12] = { [10] = 0xff, [11] = 0xff };
+    static const uint8_t transl[12] = { [8] = 0xff, [9] = 0xff };
+    if (!memcmp(a, mapped, 12) || !memcmp(a, transl, 12)) return true;
     if (!memcmp(a, ec2, 16)) return true;                                      /* fd00:ec2::254 */
     if (!memcmp(a, nat64, 12) || !memcmp(a, nat64l, 6)) return special_v4(a + 12);
     if (a[0] == 0xfe && (a[1] & 0xc0) == 0x80) return true;                  /* fe80::/10 */

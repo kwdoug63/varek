@@ -259,10 +259,18 @@ SYN_NET = ipaddress.ip_network("198.18.0.0/15")   # the Warden's synthetic addre
 SYN_MAX = 131070
 # v1.26 (step 4): the rules of a connect handed to the proxy
 HANDOFF_RULES = ("proxy_handoff", "proxy_handoff_in_progress", "proxy_handoff_failed")
+# a hand-off that ended otherwise (as a dialed connect can)
+HANDOFF_OTHER_RULES = ("already_connected", "socket_option_failed", "too_many_pending", "requester_gone",
+                       "injection_failed", "dialed_descriptor_replaced")
+# v1.26 review: the rules of a proxied decision the Warden refused
+PROXY_REFUSE_RULES = ("policy_match", "default_deny_unknown", "fragment_escape_flags",
+                      "fragment_escape_length", "certificate_refused", "wildcard_budget",
+                      "resolution_failed", "address_refused", "run_ended")
 # v1.26 (step 6): the Warden's decision on what the proxy read, when it allowed
 PROXY_ALLOW_RULES = ("proxy_dialed", "proxy_dial_failed")
 PROXY_KINDS = ("tls", "http", "connect")
-CLOSE_WHY = ("closed", "reset", "idle", "run_end", "unreported", "upstream_refused")
+CLOSE_WHY = ("closed", "reset", "idle", "run_end", "unreported", "upstream_refused",
+             "refused_request", "client_gone")       # v1.26 review: the last two
 
 
 def check_proxy_start(meta, proxy_ports, problems, upstream=None):
@@ -321,6 +329,26 @@ def check_handoff_rules(checker, policy, rules, handoffs, problems):
                             f"address was handed to the proxy, not dialed")
 
 
+def check_dialed_denies(checker, policy, rules, dialed, problems):
+    """v1.26 review: the Warden dials no address a rule denies: for each
+    address a proxied connection dialed (addr:port), the first host rule that
+    holds on it must not be a deny. Asked of the checker."""
+    if not dialed:
+        return
+    h = subprocess.run([checker, policy, "holds"], capture_output=True, text=True,
+                       input="\n".join(d.encode().hex() for _, d in dialed) + "\n")
+    rows = h.stdout.split()
+    if h.returncode != 0 or len(rows) != len(dialed):
+        problems.append(f"checker failed on the addresses dialed: {h.stderr.strip()}")
+        return
+    hosts = [i for i, r in enumerate(rules) if r["kind"] == "h"]
+    for (rec, d), row in zip(dialed, rows):
+        first = next((i for i in hosts if row[i] == "1"), None)
+        if first is not None and not rules[first]["allow"]:
+            problems.append(f"seq {rec.get('seq')}: a proxied connection dialed {d}, which policy line "
+                            f"{rules[first]['line']} denies")
+
+
 def check_closes(records, closes, complete, problems):
     """v1.26 (step 7): every proxy_close is of a connection the Warden passed
     to the proxy (proxy_dialed) before it, once; its byte counts and relay
@@ -330,7 +358,7 @@ def check_closes(records, closes, complete, problems):
     dialed, dialed_up = {}, {}           # proxy_conn -> its record's position; dialed to an upstream
     for pos, rec in enumerate(records):
         if rec.get("action") == "net.proxy" and rec.get("rule") == "proxy_dialed" \
-                and type(rec.get("proxy_conn")) is int:
+                and rec.get("decision_final") == "ALLOW" and type(rec.get("proxy_conn")) is int:
             dialed.setdefault(rec["proxy_conn"], pos)
             dialed_up.setdefault(rec["proxy_conn"], "upstream" in rec)
     closed = set()
@@ -364,7 +392,8 @@ def check_closes(records, closes, complete, problems):
     return len(closes)
 
 
-def check_proxied(records, resolutions, handoff_all, problems, upstream=None):
+def check_proxied(records, resolutions, handoff_all, problems, upstream=None, dialed_out=None,
+                  charged=None, exact=None, handoff_port=None):
     """v1.26 (step 6): every net.proxy record (a name:port the proxy read,
     decided by the Warden) is for a hand-off, once each, of a kind the proxy
     reads, decided on the name:port it records; one the Warden dialed names
@@ -380,16 +409,34 @@ def check_proxied(records, resolutions, handoff_all, problems, upstream=None):
         if type(cid) is not int or cid not in handoff_all or cid in seen:
             problems.append(f"seq {seq}: a proxied decision for connection {cid!r}, which is not "
                             f"a hand-off or was decided already")
+            if type(cid) is not int:
+                continue                  # v1.26 review: no crash on a malformed id
         seen.add(cid)
         if rec.get("proxy_kind") not in PROXY_KINDS or not isinstance(tgt, str) or \
                 tgt != rec.get("resolved") or _host_port(tgt) in (None, 0) or ":" not in tgt or \
                 tgt.startswith("["):
             problems.append(f"seq {seq}: a malformed proxied decision ({tgt!r})")
             continue
+        # v1.26 review: the decision and its rule agree; a refusal dialed
+        # nothing (one refused when the run ended may have been dialing)
+        dfin, rule = rec.get("decision_final"), rec.get("rule")
+        if not ((dfin == "ALLOW" and rule in PROXY_ALLOW_RULES) or
+                (dfin == "DENY" and rule in PROXY_REFUSE_RULES and
+                 ("dialed" not in rec or rule == "run_ended"))):
+            problems.append(f"seq {seq}: a proxied decision {dfin!r} with rule {rule!r}, which the "
+                            f"Warden does not write")
+            continue
+        # v1.26 review: decided on the port the agent connected to (a CONNECT
+        # names its own)
+        if rec.get("proxy_kind") != "connect" and handoff_port is not None and \
+                handoff_port.get(cid) not in (None, _host_port(tgt)):
+            problems.append(f"seq {seq}: a proxied decision on {tgt}, not on the port connection "
+                            f"{cid} was handed over on ({handoff_port.get(cid)})")
+            continue
         # section 5: an allowed decision went to the policy's upstream, if it
         # names one (a refusal never reaches it, and carries none)
         up = rec.get("upstream")
-        if rec.get("decision_final") != "ALLOW":
+        if dfin != "ALLOW":
             if up is not None:
                 problems.append(f"seq {seq}: a refused proxied decision that names an upstream")
             continue
@@ -412,7 +459,19 @@ def check_proxied(records, resolutions, handoff_all, problems, upstream=None):
             if cd is None or cd[1] != uport or cd[0] in SYN_NET:
                 problems.append(f"seq {seq}: a proxied connection dialed {dl!r}, not the upstream {upstream}")
                 continue
+            # v1.26 review: a name only a wildcard allows reached the upstream
+            # charged to that wildcard (a question recorded before it)
+            name = tgt.rsplit(":", 1)[0]
+            if charged is not None and exact is not None and name not in exact and \
+                    not any(t <= rec.get("timestamp_ns", 0) for t in charged.get(name, [])):
+                problems.append(f"seq {seq}: {name} reached the upstream, but was never charged to a "
+                                f"wildcard's budget")
             if str(cd[0]) == uhost:
+                continue
+            if re.fullmatch(r"[0-9.]+", uhost):
+                # v1.26 review: an upstream given as an address is dialed as it is
+                problems.append(f"seq {seq}: a proxied connection dialed {cd[0]}, not the upstream's "
+                                f"address {uhost}")
                 continue
             last = None
             for p, r in resolutions:
@@ -430,6 +489,8 @@ def check_proxied(records, resolutions, handoff_all, problems, upstream=None):
         if _special(cd[0]) or cd[0] in SYN_NET:
             problems.append(f"seq {seq}: a proxied connection dialed {cd[0]}, a special or synthetic address")
             continue
+        if dialed_out is not None:        # v1.26 review: asked of the policy below (no deny on it)
+            dialed_out.append((rec, dl))
         name = tgt.rsplit(":", 1)[0]
         last = None
         for p, r in resolutions:
@@ -533,8 +594,8 @@ def check_dns(meta, checker, policy, rules, problems):
     upstream = policy_upstream(checker, policy)                 # v1.26 section 5
     exact_names = {r["c"].rsplit(":", 1)[0] if _host_port(r["c"]) is not None else r["c"]
                    for r in rules if r["kind"] == "h" and r["name"] and not r["wild"]}
-    if upstream is not None:          # v1.26 section 5: the upstream's name is resolved like one
-        exact_names.add(upstream.rsplit(":", 1)[0])
+    if upstream is not None and not re.fullmatch(r"[0-9.]+", upstream.rsplit(":", 1)[0]):
+        exact_names.add(upstream.rsplit(":", 1)[0])   # v1.26 section 5: its name is resolved like one
     budgets = rs.get("wildcard_budgets")
     if wild or budgets is not None:
         want = sorted([{"policy_line": ln, "names": n, "rate": r, "label": DEFAULT_LABEL}
@@ -761,6 +822,10 @@ def _special(ip):
     if ip.version == 4:
         return _special_v4(o)
     if o[:12] == bytes(12) or ip == ipaddress.ip_address("fd00:ec2::254"):
+        return True
+    # v1.26 review: IPv4-mapped and IPv4-translated addresses, whatever the
+    # IPv4 address (an IPv6 socket to one reaches the IPv4 address)
+    if o[:12] in (bytes(10) + b"\xff\xff", bytes(8) + b"\xff\xff\x00\x00"):
         return True
     if o[:12] == bytes.fromhex("0064ff9b") + bytes(8) or o[:6] == bytes.fromhex("0064ff9b0001"):
         return _special_v4(o[12:])
@@ -1386,6 +1451,16 @@ def main(argv=None):
                     tgt[0] not in SYN_NET:
                 problems.append(f"seq {seq}: a connect policy line {rec.get('policy_line')} denies "
                                 f"was handed to the proxy")
+            elif rec.get("rule") not in HANDOFF_RULES + HANDOFF_OTHER_RULES or \
+                    _canonical_dest(rec.get("dialed")) is None or \
+                    _canonical_dest(rec.get("dialed"))[1] != tgt[1]:
+                # v1.26 review: a hand-off's own rule, and the address it was decided on
+                problems.append(f"seq {seq}: a hand-off with rule {rec.get('rule')!r} or dialed "
+                                f"{rec.get('dialed')!r}, not one the Warden writes")
+            elif tgt[0] not in SYN_NET and not isinstance(rec.get("candidates"), list) and \
+                    not isinstance(rec.get("candidates_sha256"), str):
+                # v1.26 review: every hand-off of a real address is decided over its candidates
+                problems.append(f"seq {seq}: a hand-off recorded without its candidates")
             elif tgt[0] not in SYN_NET and isinstance(rec.get("candidates"), list) and \
                     (not rec["candidates"] or rec["candidates"][0] != rec.get("dialed")):
                 problems.append(f"seq {seq}: a hand-off whose candidates do not begin with its target")
@@ -1571,7 +1646,20 @@ def main(argv=None):
         upstream = policy_upstream(a.checker, a.policy)               # section 5
     except (OSError, ValueError):
         upstream = None
-    proxied = check_proxied(records, resolutions, handoff_all, problems, upstream)
+    handoff_port = {r.get("proxy_conn"): _host_port(str(r.get("target", ""))) for r in records
+                    if r.get("proxy_handoff") is True and type(r.get("proxy_conn")) is int}
+    charged_at = {}                     # name -> when a question charged it as new
+    for e in meta.get("dns_events", []):
+        if e.get("event") == "dns_question" and e.get("new") is True and isinstance(e.get("name"), str) \
+                and type(e.get("timestamp_ns")) is int:
+            charged_at.setdefault(e["name"], []).append(e["timestamp_ns"])
+    exact_hosts = {r["c"].rsplit(":", 1)[0] if _host_port(r["c"]) is not None else r["c"]
+                   for r in prules if r["kind"] == "h" and r["name"] and not r["wild"]}
+    dialed_px = []
+    proxied = check_proxied(records, resolutions, handoff_all, problems, upstream, dialed_px,
+                            charged_at, exact_hosts, handoff_port)
+    if prules:
+        check_dialed_denies(a.checker, a.policy, prules, dialed_px, problems)
     pcloses = check_closes(records, meta.get("proxy_closes", []), complete, problems)   # step 7
     if proxied and proxy_ports is None:
         problems.append("proxied decisions, but the policy does not turn the proxy on")

@@ -1,12 +1,12 @@
 # VAREK v1.26.0 — The Egress Proxy, SNI Mode
 
 > **DRAFT, not released.** Still to come before tagging:
-> - the review by AI review agents (running; "Found in review" is empty);
 > - the 24-hour soak on the droplet ("24 hours against three CDNs");
 > - the regression count against the v1.25.0 Warden ("Tested");
 > - the release date.
 >
-> A human or third-party review has not been done.
+> The review was done by AI review agents; a human or third-party review
+> has not been done.
 
 Released PENDING · MIT · github.com/kwdoug63/varek
 
@@ -104,7 +104,7 @@ policy behaves as on v1.25.0.
 
 ## Tested with real clients
 
-`make test-v1260` runs 148 checks; CI runs it, with the Warden as root and
+`make test-v1260` runs 156 checks; CI runs it, with the Warden as root and
 Squid installed. Each run uses its own scratch paths and finds its own
 proxy by the pid `run_start` records, so two runs on one host do not
 collide (two at once were run to show it).
@@ -120,28 +120,30 @@ collide (two at once were run to show it).
 - **Synthetic addresses:** 20 checks, including a wildcard name past its
   `names=1` budget (no charge), nothing asked upstream, and four forged
   streams the audit refuses.
-- **The hand-off:** 14 checks: synthetic and unallowed addresses on both
+- **The hand-off:** 15 checks: synthetic and unallowed addresses on both
   proxied ports, a denied address, a numeric rule dialed directly, an
-  unproxied port, UDP, an unannounced connection, and five forged streams.
-- **What the proxy reads:** 17 checks, with real ClientHellos from Python,
-  `openssl s_client`, curl and Node, and each outcome through the proxy.
-- **The decision:** 15 checks against real TLS and HTTP servers: urllib,
+  unproxied port, UDP, an unannounced connection, and six forged streams.
+- **What the proxy reads:** 18 checks, with real ClientHellos from Python,
+  `openssl s_client`, curl and Node, each outcome through the proxy, and a
+  client sending a byte at a time.
+- **The decision:** 20 checks against real TLS and HTTP servers: urllib,
   TLS by an exact and a wildcard name (the server sees the SNI), TLS inside
-  CONNECT; a `Host` other than the name connected to, a name that does not
-  resolve, one past its budget, one resolving only to loopback, one whose
-  address a rule denies; four forged streams.
+  CONNECT, pipelined HTTP requests (one for another host is not sent); a
+  `Host` the policy refuses, a name that does not resolve, one past its
+  budget, one resolving only to loopback, one whose address a rule denies,
+  two whose only answers are IPv4-mapped; seven forged streams.
 - **Close records:** 11 checks, including a relay held open past the run's
   end, the proxy killed mid-relay, and four forged streams.
 - **The audit's cross-checks:** 9 checks, including a UDP connect a name
   allows (refused) and one a numeric rule allows (dialed), the Warden
   refusing `proxy on` unprivileged, and five forged streams.
-- **The upstream:** 14 checks chained to Squid 6: TLS and HTTP through the
+- **The upstream:** 15 checks chained to Squid 6: TLS and HTTP through the
   tunnel, Squid's own 403, a name the policy refuses that Squid never sees,
-  an upstream by host name, and four forged streams.
+  an upstream by host name, and five forged streams.
 
-**The parsers under sanitizers.** `make fuzz-proxy-parse` runs 58 vector checks
-and 4,000,000 mutated inputs (ClientHellos, HTTP requests, CONNECTs and
-upstream replies, cut at random lengths) under ASan and UBSan with no fault;
+**The parsers under sanitizers.** `make fuzz-proxy-parse` runs 65 vector checks
+and 4,000,000 mutated inputs (ClientHellos, HTTP requests, CONNECTs,
+chunked bodies and upstream replies, cut at random lengths) under ASan and UBSan with no fault;
 CI runs it. A coverage-guided libFuzzer target is included for hosts whose
 clang has the runtime.
 
@@ -160,7 +162,9 @@ audit. A 3-minute trial on the droplet fetched each API through the proxy
 and passed the audit; the harness's probe schedule was fixed after it, and
 a second trial passed (2 fetches, 1 probe refused and recorded). The
 24-hour run started 2026-10-08 from commit 54e1b68, which reports itself
-as `1.25.0` (the version was raised to `1.26.0` after it started).
+as `1.25.0` (the version was raised to `1.26.0` after it started). It is the
+code before the review's fixes; its request gate on plain HTTP, the
+mapped-address refusal and the proxy's hardening are not in it.
 
 ## Latency
 
@@ -211,16 +215,127 @@ relaying.
 
 ## Found in review
 
-PENDING: the AI review agents' findings, and what was fixed.
+Four AI review agents (Claude), separate from the session that wrote the
+code, each reviewed one part of v1.26 at commit 54e1b68 and had to
+reproduce every finding:
+- the proxy process and its parsers;
+- the Warden's decision path and the hand-off;
+- the three policy parsers and the audit;
+- the design's stated protections, end to end.
+
+The agents are the same kind of model that wrote much of this code, so this
+is not an independent human review. It found real defects, listed below,
+but it does not replace a human or third-party review.
+
+Every finding below is fixed unless it says otherwise. `make test-v1260` or
+`make fuzz-proxy-parse` covers each where a test can, and each was re-run
+against the reviewers' own harnesses after the fix. The three it cannot
+easily stage (a proxy that misbehaves, one that stops reading, a relay that
+spins) were checked with those harnesses.
+
+**Reaching what the policy refuses.**
+- **An IPv4-mapped AAAA answer passed every address check (high; found by
+  two agents).** A name whose AAAA answer is `::ffff:a.b.c.d` was dialed
+  over an IPv6 socket, which reaches the IPv4 address, after the loopback,
+  metadata and deny-rule checks had looked at the IPv6 form. Whoever
+  controls an allowed name's DNS (any name under a wildcard) could have
+  pointed the Warden at the host's loopback or the metadata service.
+  IPv4-mapped and IPv4-translated addresses are now special: a name never
+  leads to them, and the audit refuses a dial to one.
+- **Plain HTTP was checked on its first request only (high).** Later
+  requests on the same connection, pipelined or kept alive, reached the
+  server with any `Host`. The proxy now reads every request: each head must
+  name the host and port decided, and each body is passed as its framing
+  says (`Content-Length` or chunked; both, either twice, another transfer
+  coding, or a protocol upgrade is refused). At a request for another host
+  the proxy stops: what came before is answered, nothing after is sent, and
+  the close is recorded `refused_request`.
+
+**The proxy, which the Warden trusts less than itself.**
+- **One report could be decided many times (medium).** The Warden checked
+  only that a report's connection id had been given out, so a misbehaving
+  proxy could make it decide and dial one hand-off over and over (2,035
+  dials in 30 s in the reviewer's run). The Warden now keeps each hand-off's
+  state and port: one report each, on the port the agent connected to (a
+  CONNECT names its own); anything else stops the run.
+- **The run-end flush could hang the Warden (medium).** It was the one send
+  to the proxy that blocked; a proxy that stopped reading held the run's
+  end forever. It no longer blocks; on failure the open relays are recorded
+  `unreported`.
+- **A busy loop (medium).** A relay whose server had closed or reset, with
+  a client not reading, woke the proxy's loop again and again, for up to an
+  hour. A side that can make no progress is no longer polled.
+- **Descriptors (medium).** The proxy kept the inherited limit, often
+  1,024, below the two each relay needs; at the limit it spun and agents'
+  connects hung. It now raises its own limit (and holds fewer connections
+  if it cannot), and refuses a connection it has no descriptor for, using
+  one held in reserve, so the agent's connect fails rather than hangs.
+- **A byte at a time defeated the 10 s limit (low).** The deadline is now
+  checked on every pass.
+- **Reports dropped (low).** A report the control socket had no room for
+  was dropped, and its connection waited unrecorded. Reports now block, as
+  close reports do; the Warden reads them on every pass of its loop and
+  never blocks sending to the proxy.
+- **An allowed connection whose client had gone left no close (low).** It
+  was recorded `unreported` at the end, as if the proxy had failed; it is
+  now reported `client_gone`.
+
+**Budgets.**
+- **A wildcard's name could be charged twice (low).** The stub and the
+  upstream path kept separate lists of the names charged, so a name charged
+  by one was charged again as new by the other. It failed closed. They now
+  share one.
+
+**The audit accepted forged streams.** These are streams edited by someone
+who can recompute the chain, as in the v1.25 review.
+- **A refused decision recorded as dialed (high).** A `net.proxy` record
+  that said DENY, with the rule and close of a dialed connection, passed.
+  The decision and its rule must now agree, and only an allowed decision
+  counts as passed on.
+- **A dial to an address a rule denies (high).** Each address a proxied
+  connection dialed is now asked of the policy.
+- **A wildcard's name sent to an upstream uncharged (high).** With an
+  upstream there is no resolution record to tie a name to its question;
+  each such name must now have been charged before its decision.
+- **An upstream given as an address, "resolved" to another (medium).** It
+  must be dialed as given.
+- **A hand-off without its candidates (medium).** The policy could not be
+  asked again; candidates are now required.
+- **Smaller:** a malformed connection id crashed the audit; a decision on
+  another port than its hand-off's, and hand-offs with a rule or address the
+  Warden does not write, passed. All are refused now.
+
+**The parsers: no disagreement.** The decision procedure, the certificate
+checker and the cross-check oracle agreed on 230,000 mutated policies
+(about 6,000 accepted, the upstream forms among them), under ASan and
+UBSan.
+
+**Documented, not changed.**
+- With an upstream, the address checks are the upstream's (Known limits).
+- The proxy decides on the `Host` (or SNI) the client sends, not on the
+  name the agent looked up. The design said a differing `Host` was refused.
+  The name decided is the name dialed, so no other host is reached; the
+  design now says so.
+- The shared-address gap is closed on proxied ports only (Known limits).
+- A hand-off recorded with hashed candidates is still not asked of the
+  policy again by the audit (Known limits).
+
+**The test suite.** Two agents' runs collided with each other's on the
+shared host, through `test_v1260.sh`'s fixed paths and its search for the
+proxy by its user. Both were fixed before the review ended (85d67c6).
 
 ## Known limits
 
-- **SNI mode reads the first request only.** Inside TLS, a request can
-  carry a `Host` for another site on the same content network (domain
-  fronting); a client that keeps a connection open can send later requests
-  with another `Host`. Both reach only the server the allowed name resolved
+- **Inside TLS, SNI mode reads only the ClientHello.** A request inside
+  TLS can carry a `Host` for another site on the same content network
+  (domain fronting), and later requests on a kept-open TLS connection can
+  name another host. Both reach only the server the allowed name resolved
   to. Most CDNs refuse a `Host` that does not match the SNI; inspecting mode
-  (v1.26.1) decides every request.
+  (v1.26.1) decides every request. Plain HTTP is read request by request
+  (each must name the host decided), and a protocol upgrade (WebSocket,
+  h2c) over plain HTTP is refused.
+- **The shared-address gap is closed on proxied ports only.** On other ports
+  connects are decided on addresses, as in v1.24.
 - **QUIC is refused on proxied ports** unless a numeric rule allows the
   address; only TCP is handed to the proxy. Clients fall back to TCP.
 - **Encrypted Client Hello is refused**: the proxy cannot see the name. So
@@ -231,6 +346,11 @@ PENDING: the AI review agents' findings, and what was fixed.
   not encrypted, and an upstream that needs authentication must allow the
   host by address. Every kind goes through `CONNECT`, so the upstream must
   allow `CONNECT` to the proxied ports (Squid's default allows only 443).
+- **With an upstream, address checks are the upstream's.** The Warden
+  never sees the address the upstream dials, so its refusal of loopback,
+  link-local and metadata addresses, and deny rules on addresses, do not
+  apply to names sent to an upstream; the decision on the name and every
+  deny on a name do. Configure the upstream to refuse those addresses.
 - **With an upstream, exact names are still resolved by the Warden at
   startup** (direct connects and deny rules use them). Where only the
   upstream can resolve them, the Warden reports them as not resolving and

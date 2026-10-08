@@ -1299,6 +1299,8 @@ static bool       g_any_name = false;  /* v1.24: the policy has a host name rule
 static bool       g_any_wild = false;  /* v1.25: the policy has a wildcard allow rule (warden_stub.inc.c) */
 static void       stub_resolved(size_t i);
 static void       px_resolved(size_t i);  /* v1.26: proxied requests waiting on a lookup */
+static bool       px_up_charged(const char *name);  /* v1.26 review: sent to the upstream, charged */
+static void       px_handed_off(uint64_t id, unsigned port);  /* v1.26 review: a hand-off announced */
 static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden_stub.inc.c) */
 /* v1.25 (section 4): a wildcard allow rule's budgets when it sets none */
 #define STUB_DEFAULT_NAMES 256           /* distinct new names per run */

@@ -195,8 +195,10 @@ PY
     check "it runs as its own user, not the agent's" grep -q '^Uid:[[:space:]]*65532[[:space:]]65532[[:space:]]65532[[:space:]]65532$' "/proc/$PP/status"
     check "with no capabilities, an empty bounding set and no-new-privileges" \
         sh -c "grep -q '^CapEff:[[:space:]]*0*$' /proc/$PP/status && grep -q '^CapBnd:[[:space:]]*0*$' /proc/$PP/status && grep -q '^NoNewPrivs:[[:space:]]*1$' /proc/$PP/status"
+    # 0-2 /dev/null, 3 the control socket, the listener, and (v1.26 review)
+    # one /dev/null in reserve, freed to refuse a connection at EMFILE
     check "and holds only /dev/null, its control socket and its listener (not the verdict stream)" \
-        sh -c "[ \$(ls /proc/$PP/fd | wc -l) = 5 ] && [ \$(readlink /proc/$PP/fd/2) = /dev/null ]"
+        sh -c "[ \$(ls /proc/$PP/fd | wc -l) = 6 ] && [ \$(readlink /proc/$PP/fd/2) = /dev/null ] && [ \$(ls -l /proc/$PP/fd | grep -c /dev/null) = 4 ] && [ \$(ls -l /proc/$PP/fd | grep -c socket:) = 2 ]"
     wait "$WPID"
     check "the agent cannot reach the listener directly (the connect is decided and refused)" \
         sh -c "grep -q '^REFUSED ' '$OUT/a.out' && grep -q '\"target\":\"127.0.0.1:$PORT\",\"resolved\":\"127.0.0.1:$PORT\",\"decision_raw\":\"UNKNOWN\",\"decision_final\":\"DENY\"' '$OUT/a.log'"
@@ -412,6 +414,8 @@ PY
     refuses "a hand-off of a connect a rule denies" "$POLH" "$OUT/g4.log" "denies was handed to the proxy"
     printf 'require warden 1.26\nallow host api.example.com:443\nallow host 192.0.2.9:8443\ndeny host 192.0.2.8:443\nallow host 127.0.0.1\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/ readonly\n' "$W" > "$OUT/noproxy.policy"
     refuses "hand-offs under a policy without the proxy" "$OUT/noproxy.policy" "$OUT/h.log" "the proxy is not on"
+    forge "$OUT/h.log" "$OUT/g5.log" '"candidates":["192.0.2.7:443"],' ''
+    refuses "a hand-off without its candidates (v1.26 review)" "$POLH" "$OUT/g5.log" "recorded without its candidates"
     rm -rf "$W"
 fi
 
@@ -521,6 +525,18 @@ raw("connect", b"CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:4
 raw("connect-other", b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n", hello("other.example.com"))
 raw("junk", b"\x01\x02junk")
 raw("idle", b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n", b"", wait=12)
+# v1.26 review: a byte every 0.2 s never makes a whole request: refused at 10 s
+import time
+s = socket.create_connection(("198.18.0.1", 443), 5)
+s.sendall(b"\x16\x03\x01\x02\x00")
+t0 = time.time()
+try:
+    while time.time() - t0 < 14:
+        s.sendall(b"\x01")
+        time.sleep(0.2)
+    print("DRIP open", flush=True)
+except OSError:
+    print("DRIP closed %.0f" % (time.time() - t0), flush=True)
 PY
     chmod 644 "$W/agent.py"
     POLP="$OUT/parse.policy"
@@ -548,8 +564,10 @@ PY
         sh -c "grep -q 'proxy: connection 6 (none) refused by the proxy: neither TLS nor HTTP' '$OUT/p.log' && grep -q '^RAW junk $' '$OUT/p.out'"
     check "a client that sends nothing more is refused after 10 s" \
         grep -q 'proxy: connection 7 (connect) refused by the proxy: no whole request within 10 s' "$OUT/p.log"
-    check "the names, not the bytes, reach the Warden: three decisions and four refusals by the proxy" \
-        sh -c "[ \$(grep -c '\"action\":\"net.proxy\"' '$OUT/p.log') = 3 ] && [ \$(grep -c 'proxy: connection' '$OUT/p.log') = 4 ]"
+    check "a client sending a byte at a time is refused at 10 s all the same" \
+        sh -c "grep -Eq 'proxy: connection 8 \((none|tls)\) refused by the proxy: no whole request within 10 s' '$OUT/p.log' && grep -q '^DRIP closed 1[0-3]$' '$OUT/p.out'"
+    check "the names, not the bytes, reach the Warden: three decisions and five refusals by the proxy" \
+        sh -c "[ \$(grep -c '\"action\":\"net.proxy\"' '$OUT/p.log') = 3 ] && [ \$(grep -c 'proxy: connection' '$OUT/p.log') = 5 ]"
     check "the audit accepts the run" \
         python3 "$HERE/tools/varek_audit.py" --policy "$POLP" --checker "$CERT" "$OUT/p.log"
     rm -rf "$W"
@@ -598,10 +616,10 @@ while True:
 PY
     SRV="$SRV $!"
     mkdir -p "$OUT/www"; echo "http-ok" > "$OUT/www/x.txt"
-    python3 -m http.server "$HP" --bind "$HOSTIP" --directory "$OUT/www" > /dev/null 2>&1 &
+    python3 -m http.server "$HP" --bind "$HOSTIP" --directory "$OUT/www" --protocol HTTP/1.1 > "$OUT/http6.log" 2>&1 &
     SRV="$SRV $!"
     PORT=$((20000 + RANDOM % 20000))
-    printf '{"api.example.com": {"ttl": 30, "a": ["%s"]}, "a.svc.example.com": {"ttl": 30, "a": ["%s"]}, "b.svc.example.com": {"ttl": 30, "a": ["%s"]}, "lo.example.com": {"ttl": 30, "a": ["127.0.0.1"]}, "den.example.com": {"ttl": 30, "a": ["192.0.2.77"]}}\n' \
+    printf '{"api.example.com": {"ttl": 30, "a": ["%s"]}, "a.svc.example.com": {"ttl": 30, "a": ["%s"]}, "b.svc.example.com": {"ttl": 30, "a": ["%s"]}, "lo.example.com": {"ttl": 30, "a": ["127.0.0.1"]}, "den.example.com": {"ttl": 30, "a": ["192.0.2.77"]}, "m6.example.com": {"ttl": 30, "aaaa": ["::ffff:127.0.0.1"]}, "d6.example.com": {"ttl": 30, "aaaa": ["::ffff:192.0.2.77"]}}\n' \
         "$HOSTIP" "$HOSTIP" "$HOSTIP" > "$OUT/zone6.json"
     rm -f "$OUT/ready6"
     python3 "$HERE/tests/dns_test_server.py" --port "$PORT" --zone "$OUT/zone6.json" --log "$OUT/q6.log" \
@@ -670,7 +688,23 @@ tls("wild-nx", "c.svc.example.com")
 tls("wild-over", "b.svc.example.com")
 tls("loopback", "lo.example.com")
 tls("denied-addr", "den.example.com")
+tls("mapped-loop", "m6.example.com")
+tls("mapped-denied", "d6.example.com")
 connect("connect", "api.example.com")
+# v1.26 review: pipelined requests: two for the host decided, then one for another
+try:
+    s = socket.create_connection(("api.example.com", HP), 10)
+    s.settimeout(10)
+    q = lambda h: b"GET /x.txt HTTP/1.1\r\nHost: %s:%d\r\n\r\n" % (h, HP)
+    s.sendall(q(b"api.example.com") + q(b"api.example.com") + q(b"other.example.com"))
+    out = b""
+    while True:
+        d = s.recv(4096)
+        if not d: break
+        out += d
+    print("PIPE", out.count(b"HTTP/1.0 200") + out.count(b"HTTP/1.1 200"), flush=True)
+except OSError as e:
+    print("PIPE ERR", e, flush=True)
 # a relay still open when the run ends: a ClientHello to a server that never answers
 i, o = ssl.MemoryBIO(), ssl.MemoryBIO()
 b = ssl.create_default_context().wrap_bio(i, o, server_hostname="api.example.com")
@@ -687,6 +721,7 @@ PY
       printf 'allow host api.example.com:%s\nallow host api.example.com:%s\nallow host api.example.com:%s\n' "$HP" "$TP" "$HOLDP"
       printf 'allow host lo.example.com:%s\ndeny host 192.0.2.77:%s\nallow host den.example.com:%s\n' "$TP" "$TP" "$TP"
       printf 'allow host *.svc.example.com:%s acknowledge=dns-channel names=2\n' "$TP"
+      printf 'allow host m6.example.com:%s\nallow host d6.example.com:%s\n' "$TP" "$TP"
       printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path /etc/ssl/ readonly\nallow path %s/ readonly\n' "$W"
     } > "$POL6"
     env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$POL6" --dns-server "127.0.0.1:$PORT" -- \
@@ -712,6 +747,10 @@ PY
         sh -c "grep -q '^TLS loopback ALERT$' '$OUT/d.out' && grep '\"action\":\"net.proxy\"' '$OUT/d.log' | grep -q '\"target\":\"lo.example.com:$TP\",.*\"rule\":\"address_refused\"'"
     check "a name whose only address a rule denies: refused (address_refused)" \
         sh -c "grep -q '^TLS denied-addr ALERT$' '$OUT/d.out' && grep '\"action\":\"net.proxy\"' '$OUT/d.log' | grep -q '\"target\":\"den.example.com:$TP\",.*\"rule\":\"address_refused\"'"
+    check "a name whose only answer is IPv4-mapped (::ffff:127.0.0.1, ::ffff:a denied address): refused (address_refused)" \
+        sh -c "grep -q '^TLS mapped-loop ALERT$' '$OUT/d.out' && grep -q '^TLS mapped-denied ALERT$' '$OUT/d.out' && [ \$(grep '\"action\":\"net.proxy\"' '$OUT/d.log' | grep -c '\"target\":\"[md]6.example.com:$TP\",.*\"rule\":\"address_refused\"') = 2 ]"
+    check "pipelined HTTP: the requests for the host decided are relayed, one for another host is not" \
+        sh -c "grep -q '^PIPE 2$' '$OUT/d.out' && [ \$(grep -c 'GET /x.txt' '$OUT/http6.log') -ge 3 ] && grep -q '\"why\":\"refused_request\"' '$OUT/d.log'"
     check "TLS inside CONNECT: decided on the CONNECT's name, relayed" \
         sh -c "grep -q '^CONNECT connect tls-ok api.example.com$' '$OUT/d.out' && grep '\"action\":\"net.proxy\"' '$OUT/d.log' | grep -q '\"target\":\"api.example.com:$TP\",.*\"rule\":\"proxy_dialed\",.*\"proxy_kind\":\"connect\"'"
     check "the audit accepts the run" \
@@ -725,6 +764,16 @@ PY
     forge "$OUT/d.log" "$OUT/e4.log" "\"target\":\"api.example.com:$TP\",\"resolved\":\"api.example.com:$TP\"" \
                                      "\"target\":\"evil.example.com:$TP\",\"resolved\":\"evil.example.com:$TP\""
     refuses "a proxied decision for a name the policy does not allow" "$POL6" "$OUT/e4.log" "certificate for 'evil.example.com:"
+    # v1.26 review: the audit's own findings
+    forge "$OUT/d.log" "$OUT/e5.log" '("target":"other\.example\.com:[0-9]*",[^}]*"decision_final":"DENY","rule":)"default_deny_unknown"' \
+        '\1"proxy_dialed"' re
+    refuses "a refused proxied decision recorded as dialed" "$POL6" "$OUT/e5.log" "which the Warden does not write"
+    forge "$OUT/d.log" "$OUT/e6.log" '("target":"den\.example\.com:[0-9]*",.*"decision_final":)"DENY","rule":"address_refused",(.*)"proxy_conn"' \
+        '\1"ALLOW","rule":"proxy_dialed",\2"dialed":"192.0.2.77:'"$TP"'","proxy_conn"' re
+    refuses "a proxied connection dialed to an address a rule denies" "$POL6" "$OUT/e6.log" "which policy line"
+    forge "$OUT/d.log" "$OUT/e7.log" "\"target\":\"api.example.com:$TP\",\"resolved\":\"api.example.com:$TP\"" \
+        "\"target\":\"api.example.com:$HOLDP\",\"resolved\":\"api.example.com:$HOLDP\""
+    refuses "a proxied decision on another port than its hand-off's" "$POL6" "$OUT/e7.log" "not on the port connection"
 
     echo "== 7. close records =="
     pclose() { grep -o '"event":"proxy_close",[^}]*' "$OUT/d.log"; }
@@ -925,6 +974,8 @@ PY
         refuses "an upstream refusal without its status" "$POLU" "$OUT/v3.log" "without the upstream's status"
         forge "$OUT/up.log" "$OUT/v4.log" ",\"upstream\":\"$HOSTIP:$SP\"}" "}"
         refuses "a run_start without the policy's upstream" "$POLU" "$OUT/v4.log" "run_start's proxy"
+        forge "$OUT/up.log" "$OUT/v5.log" "\"dialed\":\"$HOSTIP:$SP\"" "\"dialed\":\"192.0.2.99:$SP\""
+        refuses "a dial to another address than an upstream given as one (v1.26 review)" "$POLU" "$OUT/v5.log" "not the upstream's address"
         kill "$(cat "$SQ/squid.pid" 2>/dev/null)" 2>/dev/null
         for _ in $(seq 30); do pgrep -f "$SQ/squid.conf" > /dev/null || break; sleep 0.2; done
         pkill -9 -f "$SQ/squid.conf" 2>/dev/null
