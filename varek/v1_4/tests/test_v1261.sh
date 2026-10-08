@@ -440,10 +440,12 @@ PY
        grep -q 'CN = VAREK run CA '"$(grep -o '"run":"[0-9a-f]*"' "$OUT/c.log" | head -1 | cut -d'"' -f4)" "$OUT/ca.txt"
     then pass "the CA: ECDSA P-256, CA:TRUE pathlen 0, signing certificates only, named for the run"
     else flunk "the CA's form ($(head -c 400 "$OUT/ca.txt"))"; fi
-    if grep -A4 'Name Constraints: critical' "$OUT/ca.txt" | grep -q 'DNS:api.example.com' &&
-       grep -A4 'Name Constraints: critical' "$OUT/ca.txt" | grep -q 'DNS:svc.example.com' &&
-       ! grep -q 'DNS:pinned.example.net' "$OUT/ca.txt"
-    then pass "critical name constraints: the inspected names and the wildcard's suffix, not the passthrough host"
+    NCP=$(sed -n '/Name Constraints: critical/,/Excluded:/p' "$OUT/ca.txt")
+    NCX=$(sed -n '/Excluded:/,/X509v3\|Signature/p' "$OUT/ca.txt")
+    if grep -q 'DNS:api.example.com' <<< "$NCP" && grep -q 'DNS:svc.example.com' <<< "$NCP" &&
+       ! grep -q 'DNS:pinned.example.net' <<< "$NCP" && grep -q 'DNS:pinned.example.net' <<< "$NCX" &&
+       grep -q 'IP:0.0.0.0/0.0.0.0' <<< "$NCX" && grep -q 'IP:0:0:0:0:0:0:0:0/0:0:0:0:0:0:0:0' <<< "$NCX"
+    then pass "critical name constraints: the inspected names and the wildcard's suffix permitted; the passthrough host and every IP address excluded"
     else flunk "the CA's name constraints"; fi
     nb=$(date -u -d "$(openssl x509 -in "$W/o/run-ca.pem" -noout -startdate | cut -d= -f2)" +%s)
     na=$(date -u -d "$(openssl x509 -in "$W/o/run-ca.pem" -noout -enddate | cut -d= -f2)" +%s)
@@ -504,22 +506,6 @@ JAVA
     for pid in $SRV; do kill "$pid" 2>/dev/null; done
     rm -rf "$W"
 
-    echo "== 7. bench =="
-    # varek bench --proxy: requests natively, in SNI mode and in inspecting
-    # mode, every outcome checked; and no delayed-ACK stall on a new
-    # inspected connection (before step 8, about 40 ms: the proxy sends
-    # nothing after the client's Finished, with no session tickets)
-    if NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 "$HERE/tools/varek" bench --proxy -n 30 --warmup 3 --rounds 1 \
-           -o "$OUT/bench.json" > "$OUT/bench.out" 2>&1 &&
-       python3 - "$OUT/bench.json" <<'PY'
-import json, sys
-r = json.load(open(sys.argv[1]))
-k = r["kinds"]
-sys.exit(not (r["ok"] and k["https"]["added_p50_us"]["inspect"] < 30000 and
-              k["request"]["added_p50_us"]["inspect"] < 10000 and r["warden_us"]["request_allowed"]["n"] >= 29))
-PY
-    then pass "varek bench --proxy: every check passed; inspecting mode adds $(python3 -c "import json; k = json.load(open('$OUT/bench.json'))['kinds']; print(f\"{k['https']['added_p50_us']['inspect'] / 1000:.1f} ms to a new connection, {k['request']['added_p50_us']['inspect']:.0f} us to a kept-alive request\")")"
-    else flunk "varek bench --proxy ($(grep -m3 'FAIL\|varek:' "$OUT/bench.out"))"; fi
 fi
 
 echo "== 4. terminating TLS =="
@@ -1075,8 +1061,202 @@ sys.exit(not (f["varek:proxy.mode"] == "inspect" and f["varek:proxy.binary.sha25
 PY
     then pass "the CycloneDX export: the proxy's mode and hashes, the run's CA, request counts, each allowed request a component"
     else flunk "the CycloneDX export carries inspecting mode ($(tail -2 "$OUT/bom.out"))"; fi
+
+    echo "== 7. review fixes =="
+    # the v1.26.1 review by AI review agents: each finding, fixed, checked here
+    XP=$((TP + 20)); CP=$((TP + 21))
+    ( cd "$W" && openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout cn.key -out cn.csr \
+          -subj "/CN=api.example.com" && printf 'extendedKeyUsage=serverAuth\n' > cn.ext &&
+      openssl x509 -req -in cn.csr -CA tca.pem -CAkey tca.key -CAcreateserial -out cn.pem -days 1 -extfile cn.ext ) \
+        >> "$OUT/certs.log" 2>&1
+    chmod 644 "$W/cn.pem"
+    rm -f "$OUT/rv.log"; touch "$OUT/rv.log"; chmod 666 "$OUT/rv.log"
+    cat > "$OUT/rvsrv.py" <<'PY'
+import hashlib, socket, ssl, sys, threading
+ip, port, cert, key, log = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+def note(t):
+    with open(log, "a") as f: f.write(t + "\n")
+def serve(c):
+    try:
+        s = ctx.wrap_socket(c, server_side=True)
+        buf = b""
+        while True:
+            while b"\r\n\r\n" not in buf:
+                d = s.recv(65536)
+                if not d: return
+                buf += d
+            head, _, buf = buf.partition(b"\r\n\r\n")
+            path = head.split(b" ")[1].decode()
+            if path == "/trunc":            # an answer, then the TCP connection dropped: no close_notify
+                s.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nPARTIAL")
+                raw = socket.socket(fileno=s.detach()); raw.shutdown(socket.SHUT_RDWR); raw.close()
+                return
+            if path in ("/raw", "/part"):   # what follows the head, to the connection's end
+                while True:
+                    d = s.recv(65536)
+                    if not d: break
+                    buf += d
+                note(f"RAW {path} {len(buf)} {hashlib.sha256(buf).hexdigest()}")
+                return
+            note(f"GOT {path}")
+            s.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+    except (OSError, ssl.SSLError):
+        pass
+l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); l.bind((ip, port)); l.listen(16)
+while True:
+    c, _ = l.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
+PY
+    python3 "$OUT/rvsrv.py" "$HOSTIP" "$XP" "$W/good.pem" "$W/good.key" "$OUT/rv.log" > /dev/null 2>&1 &
+    SRV="$SRV $!"
+    python3 "$OUT/rvsrv.py" "$HOSTIP" "$CP" "$W/cn.pem" "$W/cn.key" "$OUT/rv.log" > /dev/null 2>&1 &
+    SRV="$SRV $!"
+    for _ in $(seq 50); do python3 -c "import socket; [socket.create_connection(('$HOSTIP', p), 0.2) for p in ($XP, $CP)]" 2>/dev/null && break; sleep 0.1; done
+    cat > "$W/rv.py" <<'PY'
+import hashlib, os, socket, ssl, sys, time
+XP, CP = int(sys.argv[1]), int(sys.argv[2])
+H = "api.example.com"
+ctx = ssl.create_default_context()
+def conn(port=None):
+    return ctx.wrap_socket(socket.create_connection((H, port or XP), 10), server_hostname=H,
+                           suppress_ragged_eofs=False)
+def reads(s):
+    out = b""
+    s.settimeout(15)
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d: return out, "clean"
+            out += d
+    except (OSError, ssl.SSLError) as e:
+        return out, type(e).__name__
+# a server that drops its connection without close_notify: the agent must see it
+s = conn(); s.sendall(b"GET /trunc HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % H.encode())
+out, how = reads(s); print("TRUNC", how, out.split(b"\r\n\r\n")[-1].decode(), flush=True)
+# a server certificate with the name in its CN alone (no subject alternative name)
+try:
+    s = conn(CP); s.close(); print("CNONLY connected", flush=True)
+except (OSError, ssl.SSLError) as e:
+    print("CNONLY", type(e).__name__, flush=True)
+# the views' metadata: read-only files, read-type lookups only
+print("MODE", oct(os.stat("/etc/varek/run-ca.pem").st_mode), os.access("/etc/varek/run-ca.pem", os.R_OK), flush=True)
+# a chunked body over max_body=100, sent with its head in one write: the
+# server gets the head and the body up to the limit, then the cut
+body = b"12c\r\n" + b"A" * 300 + b"\r\n0\r\n\r\n"
+s = conn(); s.sendall(b"POST /raw HTTP/1.1\r\nHost: %s\r\nTransfer-Encoding: chunked\r\n\r\n" % H.encode() + body)
+reads(s); print("CUTSENT", hashlib.sha256(body[:100]).hexdigest(), flush=True)
+# a request, then the agent's TCP half-close: the answer still comes back
+s = conn(); s.sendall(b"GET /v1/models HTTP/1.1\r\nHost: %s\r\n\r\n" % H.encode())
+socket.socket.shutdown(s, socket.SHUT_WR)
+out, how = reads(s); print("HALF", out.split(b"\r\n")[0].decode(), flush=True)
+# a body declared at 1000 bytes, 300 sent, then the connection closed
+s = conn(); s.sendall(b"POST /part HTTP/1.1\r\nHost: %s\r\nContent-Length: 1000\r\n\r\n" % H.encode() + b"B" * 300)
+time.sleep(0.5); s.close(); print("PARTSENT", hashlib.sha256(b"B" * 300).hexdigest(), flush=True)
+time.sleep(0.5)
+PY
+    POL7="$OUT/rv.policy"
+    { printf 'require warden 1.26\nproxy inspect\nproxy ports %s %s\nallow host api.example.com\n' "$XP" "$CP"
+      printf 'allow request GET https://api.example.com:%s/trunc\n' "$XP"
+      printf 'allow request POST https://api.example.com:%s/raw max_body=100\n' "$XP"
+      printf 'allow request POST https://api.example.com:%s/part max_body=10k\n' "$XP"
+      printf 'allow request GET https://api.example.com:%s/v1/models\n' "$XP"
+      printf 'allow request GET https://api.example.com:%s/\n' "$CP"
+      printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/\n' "$W"
+    } > "$POL7"
+    env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$POL7" --dns-server "127.0.0.1:$DPORT" --trust-bundle "$BUNDLE" -- \
+        /usr/bin/python3 "$W/rv.py" "$XP" "$CP" > "$OUT/rv.out" 2> "$OUT/rvw.log"
+    sed 's/^/     /' "$OUT/rv.out"; sed 's/^/     server /' "$OUT/rv.log"
+    vhave() { grep -qxF -- "$1" "$OUT/rv.out"; }
+    rvrec() { grep "$1" "$OUT/rvw.log" | grep -q -- "$2"; }
+    if grep -q '^TRUNC SSLEOFError PARTIAL$' "$OUT/rv.out" &&
+       rvrec '"event":"proxy_close"' "\"tls_error\":\"the server's TLS ended without close_notify\""
+    then pass "a server that drops its TLS without close_notify: the agent's TLS sees the cut (no clean close), recorded"
+    else flunk "a server's TLS dropped without close_notify ($(grep TRUNC "$OUT/rv.out"))"; fi
+    if vhave "CNONLY SSLError" && rvrec '"why":"server_tls"' 'hostname mismatch'
+    then pass "a server certificate naming the host in its CN alone is refused (server_tls)"
+    else flunk "a CN-only server certificate is refused ($(grep CNONLY "$OUT/rv.out"))"; fi
+    if vhave "MODE 0o100444 True"
+    then pass "a view's metadata: a read-only regular file (0444)"
+    else flunk "a view's metadata mode ($(grep MODE "$OUT/rv.out"))"; fi
+    CUTSHA=$(grep '^CUTSENT ' "$OUT/rv.out" | cut -d' ' -f2)
+    if grep -q "^RAW /raw 100 $CUTSHA$" "$OUT/rv.log" &&
+       rvrec '"event":"request_body"' "\"body_len\":100,\"body_sha256\":\"$CUTSHA\",\"exceeded_max_body\":true"
+    then pass "a chunked body cut at max_body: the server gets what was let through, the bytes and SHA-256 recorded"
+    else flunk "a chunked body cut at max_body ($(grep RAW "$OUT/rv.log"))"; fi
+    if vhave "HALF HTTP/1.1 200 OK"
+    then pass "an agent that half-closes after its request still gets the answer"
+    else flunk "a half-closing agent's answer ($(grep HALF "$OUT/rv.out"))"; fi
+    PSHA=$(grep '^PARTSENT ' "$OUT/rv.out" | cut -d' ' -f2)
+    if rvrec '"event":"request_body"' "\"body_len\":300,\"body_sha256\":\"$PSHA\",\"incomplete\":true" &&
+       grep -q "^RAW /part 300 $PSHA$" "$OUT/rv.log"
+    then pass "a body cut short by the agent's close: what was sent recorded, marked incomplete"
+    else flunk "a body cut short by the agent's close"; fi
+    if python3 "$HERE/tools/varek_audit.py" --policy "$POL7" --checker "$CERT" "$OUT/rvw.log" > "$OUT/au7.out" 2>&1
+    then pass "the audit accepts the run"
+    else flunk "the audit accepts the review run ($(grep -m3 'PROBLEM' "$OUT/au7.out"))"; fi
+    if openssl x509 -in "$W/cn.pem" -noout -ext subjectAltName 2>&1 | grep -q DNS; then
+        flunk "the CN-only certificate has no subject alternative name"; fi
+    # the forged streams the review found the audit (or the export) accepted
+    vforge() { python3 "$HERE/tests/v1261_forge.py" "$@" || flunk "forging $2"; }
+    POL="$POL5"
+    vforge "$OUT/r.log" "$OUT/v1.log" --sub '"body":"length","body_declared":512,"max_body":1024,' \
+                                           '"body":"length","body_declared":50000,"max_body":1024,'
+    refuses "an allowed request declaring a body over its rule's max_body" "$OUT/v1.log" "over its rule's max_body"
+    vforge "$OUT/r.log" "$OUT/v2.log" --sub "\"target\":\"GET $U/v1/models?x=1\",\"resolved\":\"GET $U/v1/models?x=1\"" \
+                                            "\"target\":\"GET $U/v1/%61dmin/users/1\",\"resolved\":\"GET $U/v1/%61dmin/users/1\""
+    refuses "an allowed request whose path is in a form the proxy must refuse (%61dmin)" "$OUT/v2.log" "which the proxy must refuse"
+    UB=$(grep -m1 -o '"event":"request_body","run":"[0-9a-f]*","proxy_conn":[0-9]*,' "$OUT/r.log")
+    vforge "$OUT/r.log" "$OUT/v3.log" --drop "$UB"
+    refuses "an allowed body with no request_body" "$OUT/v3.log" "never recorded"
+    QS=$(grep '"action":"net.request"' "$OUT/r.log" | grep "\"target\":\"GET $U/v1/models?x=1\"" | grep -o '"seq":[0-9]*,' | head -1)
+    QC=$(grep '"action":"net.request"' "$OUT/r.log" | grep "\"target\":\"GET $U/v1/models?x=1\"" | grep -o '"proxy_conn":[0-9]*,' | head -1)
+    vforge "$OUT/r.log" "$OUT/v4.log" --move "$QS\"agent_pid\"" "\"event\":\"proxy_close\",\"run\":\"$(grep -o '"run":"[0-9a-f]*"' "$OUT/r.log" | head -1 | cut -d'"' -f4)\",$QC"
+    refuses "a request recorded after its connection's close" "$OUT/v4.log" "after its close"
+    vforge "$OUT/r.log" "$OUT/v5.log" --sub '"ca_names":1,' '"ca_names":500,'
+    refuses "run_start's CA claiming names the policy does not give it" "$OUT/v5.log" "may sign for 500"
+    POL="$POL7"
+    VA=$(grep '"rule":"view_metadata"' "$OUT/rvw.log" | grep -o '"action":"file.access".*"access_mode":"4"' | head -1)
+    vforge "$OUT/rvw.log" "$OUT/v6.log" --sub "$VA" "${VA%\"4\"}\"2\""
+    refuses "a view's metadata answering access(W_OK)" "$OUT/v6.log" "not read-type"
+    vforge "$OUT/rvw.log" "$OUT/v7.log" --sub '"mode":"inspect"' '"mode":"sni"'
+    if python3 "$HERE/tools/varek_cyclonedx.py" --log "$OUT/v7.log" --policy "$POL7" > /dev/null 2> "$OUT/v7.out"; then
+        flunk "the export refuses trust views in a run not in inspecting mode"
+    elif grep -q "UNKNOWN verdict into ALLOW" "$OUT/v7.out"; then
+        pass "the export refuses trust views in a run not in inspecting mode"
+    else flunk "the export refuses trust views in a run not in inspecting mode ($(cat "$OUT/v7.out"))"; fi
+    UN=${UB##*\"proxy_conn\":}; UN=${UN%,}
+    vforge "$OUT/r.log" "$OUT/v8.log" --sub "$UB" "${UB%\"proxy_conn\":*}\"proxy_conn\":[$UN],"
+    POL="$POL5"
+    python3 "$HERE/tools/varek_audit.py" --policy "$POL5" --checker "$CERT" "$OUT/v8.log" > "$OUT/v8.out" 2>&1
+    VC=$?
+    NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 "$HERE/tools/varek" refusals "$OUT/v8.log" > "$OUT/v8r.out" 2>&1
+    if [ "$VC" != 0 ] && grep -q "malformed connection id" "$OUT/v8.out" && ! grep -q Traceback "$OUT/v8.out" "$OUT/v8r.out"
+    then pass "a malformed connection id: the audit refuses it, and neither the audit nor varek refusals crashes"
+    else flunk "a malformed connection id ($(grep -h -m2 'Error\|PASS' "$OUT/v8.out" "$OUT/v8r.out"))"; fi
     for pid in $SRV; do kill "$pid" 2>/dev/null; done
     rm -rf "$W"
+fi
+
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ] || [ ! -x "$WP" ]; then
+    echo "== 8. bench =="
+    skip "the proxied bench (needs root, the warden binary and warden-proxy)"
+else
+    echo "== 8. bench =="
+    # varek bench --proxy: requests natively, in SNI mode and in inspecting
+    # mode, every outcome checked; and no delayed-ACK stall on a new
+    # inspected connection (before step 8, about 40 ms: the proxy sends
+    # nothing after the client's Finished, with no session tickets)
+    if NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 "$HERE/tools/varek" bench --proxy -n 30 --warmup 3 --rounds 1 \
+           -o "$OUT/bench.json" > "$OUT/bench.out" 2>&1 &&
+       python3 - "$OUT/bench.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+k = r["kinds"]
+sys.exit(not (r["ok"] and k["https"]["added_p50_us"]["inspect"] < 30000 and
+              k["request"]["added_p50_us"]["inspect"] < 10000 and r["warden_us"]["request_allowed"]["n"] >= 29))
+PY
+    then pass "varek bench --proxy: every check passed; inspecting mode adds $(python3 -c "import json; k = json.load(open('$OUT/bench.json'))['kinds']; print(f\"{k['https']['added_p50_us']['inspect'] / 1000:.1f} ms to a new connection, {k['request']['added_p50_us']['inspect']:.0f} us to a kept-alive request\")")"
+    else flunk "varek bench --proxy ($(grep -m3 'FAIL\|varek:' "$OUT/bench.out"))"; fi
 fi
 
 echo

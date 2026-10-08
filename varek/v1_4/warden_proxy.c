@@ -188,7 +188,7 @@ fail:
 
 /* v1.26.1: inspecting mode's setup (see warden_proxy.h). */
 int wp_inspect_setup(const wp_t *w, const char *run_id, const char *bundle, char *const *names,
-                     size_t nnames, unsigned char **pem, size_t *pem_len, unsigned char **p12,
+                     size_t nnames, const char (*excl)[254], size_t nexcl, unsigned char **pem, size_t *pem_len, unsigned char **p12,
                      size_t *p12_len, int *secure_heap, int *nroots, char *why, size_t wn) {
     *pem = *p12 = NULL;
     *pem_len = *p12_len = 0;
@@ -208,6 +208,14 @@ int wp_inspect_setup(const wp_t *w, const char *run_id, const char *bundle, char
         memset(&cn, 0, sizeof cn);
         cn.type = WP_MSG_CA_NAME;
         snprintf(cn.name, sizeof cn.name, "%s", names[i]);
+        if (send(w->ctl, &cn, sizeof cn, MSG_NOSIGNAL) != (ssize_t)sizeof cn) goto gone;
+    }
+    for (size_t i = 0; i < nexcl; i++) {               /* review: the names the CA excludes */
+        struct wp_ca_name cn;
+        memset(&cn, 0, sizeof cn);
+        cn.type = WP_MSG_CA_NAME;
+        cn.excluded = 1;
+        snprintf(cn.name, sizeof cn.name, "%s", excl[i]);
         if (send(w->ctl, &cn, sizeof cn, MSG_NOSIGNAL) != (ssize_t)sizeof cn) goto gone;
     }
     struct wp_msg go = { .type = WP_MSG_CA_GO, .port = 0 };

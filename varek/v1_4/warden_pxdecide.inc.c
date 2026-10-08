@@ -94,6 +94,8 @@ struct px_open {
     uint64_t next_seq;                   /* the next request's seq (from 1) */
     uint64_t body_seq;                   /* an allowed request whose body is still to be reported (0: none) */
     uint64_t max_body;                   /* its rule's max_body (0: none) */
+    uint32_t body_kind;                  /* review: its framing (WP_BODY_*), and the length declared */
+    uint64_t body_declared;
     bool     refused;                    /* a request was refused: no more come */
     bool     allowed;                    /* some request was allowed (so bytes may pass) */
     bool     cut;                        /* a body passed max_body */
@@ -179,7 +181,9 @@ static int px_closed(const struct wp_close *m) {
                 (m->inspected && !g_px_open[k].allowed && m->bytes_up != 0) ||
                 (!strcmp(m->why, "max_body") != g_px_open[k].cut) ||
                 /* step 7: the requests it counts are those it reported */
-                m->requests != (m->inspected ? g_px_open[k].next_seq - 1 : 0))
+                m->requests != (m->inspected ? g_px_open[k].next_seq - 1 : 0) ||
+                /* review: and every allowed body was reported before it */
+                g_px_open[k].body_seq)
                 return -1;
             g_px_open[k] = g_px_open[--g_px_nopen];
             px_close_record(m->id, m->why, m);
@@ -582,6 +586,37 @@ static bool g_px_flushed = false;
  * object with the decision procedure, certified by the checker, recorded
  * (net.request), and answered. 0, or -1 (a report the proxy should not have
  * sent: the run stops). */
+/* v1.26.1 review: a request target (/path?query) in a form the proxy must
+ * have refused (section 2: a server could read it as another path), as
+ * proxy_parse.c's target_ok, written again here: the Warden does not take the
+ * proxy's word for it. */
+static bool px_target_ok(const char *t) {
+    if (t[0] != '/') return false;
+    bool query = false;
+    const char *seg = t + 1;
+    for (const char *c = t + 1;; c++) {
+        if (!query && (*c == '/' || *c == '?' || *c == 0)) {
+            size_t sl = (size_t)(c - seg);
+            if (sl == 0 && *c == '/') return false;                              /* // */
+            if ((sl == 1 && seg[0] == '.') || (sl == 2 && seg[0] == '.' && seg[1] == '.')) return false;
+            seg = c + 1;
+            if (*c == '?') query = true;
+        }
+        if (*c == 0) return true;
+        unsigned char u = (unsigned char)*c;
+        if (u < 0x21 || u > 0x7e || u == '\\' || u == ';' || u == '#') return false;
+        if (u == '?') query = true;
+        if (u == '%') {
+            int h1 = isxdigit((unsigned char)c[1]) ? (isdigit((unsigned char)c[1]) ? c[1] - '0' : (c[1] | 0x20) - 'a' + 10) : -1;
+            int h2 = h1 >= 0 && isxdigit((unsigned char)c[2]) ?
+                     (isdigit((unsigned char)c[2]) ? c[2] - '0' : (c[2] | 0x20) - 'a' + 10) : -1;
+            if (h2 < 0) return false;
+            int v = h1 * 16 + h2;
+            if (v == '/' || v == '\\' || isalnum(v) || v == '-' || v == '.' || v == '_' || v == '~') return false;
+        }
+    }
+}
+
 static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     struct px_open *o = NULL;
     for (size_t k = 0; k < g_px_nopen; k++) if (g_px_open[k].id == m->id) o = &g_px_open[k];
@@ -598,6 +633,7 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     int pl = snprintf(pre, sizeof pre, " %s://%s:%u/", o->scheme, o->name, o->port);
     if (ml == 0 || ml > 20 || ol > VDP_STR_MAX || pl < 0 || strncmp(ob + ml, pre, (size_t)pl)) return -1;
     for (size_t i = ml + 1; i < ol; i++) if ((unsigned char)ob[i] < 0x21 || (unsigned char)ob[i] > 0x7e) return -1;
+    if (!px_target_ok(ob + ml + pl - 1)) return -1;      /* review: a form the proxy must refuse */
     o->next_seq++;
     struct action *a = calloc(1, sizeof *a);
     if (!a) return -1;
@@ -655,7 +691,12 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     snprintf(v.why, sizeof v.why, "%s", why);
     if (d_final == DEC_ALLOW) {
         o->allowed = true;
-        if (m->body != WP_BODY_NONE) { o->body_seq = m->seq; o->max_body = maxb; }
+        if (m->body != WP_BODY_NONE) {
+            o->body_seq = m->seq;
+            o->max_body = maxb;
+            o->body_kind = m->body;
+            o->body_declared = m->body_len;
+        }
     } else o->refused = true;
     (void)send(g_proxy.ctl, &v, sizeof v, MSG_DONTWAIT | MSG_NOSIGNAL);
     return 0;
@@ -666,11 +707,17 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
 static int px_httpbody(const struct wp_httpbody *m) {
     struct px_open *o = NULL;
     for (size_t k = 0; k < g_px_nopen; k++) if (g_px_open[k].id == m->id) o = &g_px_open[k];
-    if (!o || !o->body_seq || m->seq != o->body_seq || m->exceeded > 1) return -1;
-    /* passed max_body exactly when it says so (it stops at the limit) */
-    if (m->exceeded ? !o->max_body || m->len != o->max_body : o->max_body && m->len > o->max_body) return -1;
+    if (!o || !o->body_seq || m->seq != o->body_seq || m->exceeded > 2) return -1;
+    /* passed max_body exactly when it says so (it stops at the limit; only a
+     * chunked body can: a declared length over it was refused) */
+    if (m->exceeded == 1 ? o->body_kind != WP_BODY_CHUNKED || !o->max_body || m->len != o->max_body
+                         : o->max_body && m->len > o->max_body)
+        return -1;
+    /* review: a declared length is sent whole, or (the connection ended) less */
+    if (o->body_kind == WP_BODY_LENGTH && (m->exceeded == 2 ? m->len >= o->body_declared : m->len != o->body_declared))
+        return -1;
     o->body_seq = 0;
-    if (m->exceeded) o->cut = true;
+    if (m->exceeded == 1) o->cut = true;
     char hx[65];
     sodium_bin2hex(hx, sizeof hx, m->sha256, sizeof m->sha256);
     FILE *f = rec_begin();
@@ -679,7 +726,8 @@ static int px_httpbody(const struct wp_httpbody *m) {
     fprintf(f, "{\"event\":\"request_body\",\"run\":\"%s\",\"proxy_conn\":%llu,\"request_seq\":%llu,"
             "\"body_len\":%llu,\"body_sha256\":\"%s\",%s\"timestamp_ns\":%lld}\n", g_run_id,
             (unsigned long long)m->id, (unsigned long long)m->seq, (unsigned long long)m->len, hx,
-            m->exceeded ? "\"exceeded_max_body\":true," : "", (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+            m->exceeded == 1 ? "\"exceeded_max_body\":true," : m->exceeded == 2 ? "\"incomplete\":true," : "",
+            (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
     rec_end(NULL);
     return 0;
 }

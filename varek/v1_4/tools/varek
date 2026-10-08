@@ -350,7 +350,8 @@ def summarize(recs):
             # v1.26.1 (step 7): a connection the proxy ended: its parser
             # refused a request, a TLS handshake failed, or a body passed
             # max_body (a refusal by the Warden is its net.request record)
-            if r.get("why") in ("refused_request", "server_tls", "client_tls", "tls_timeout", "max_body"):
+            if r.get("why") in ("refused_request", "server_tls", "client_tls", "tls_timeout", "max_body") \
+                    and type(r.get("proxy_conn")) is int:
                 s["proxy_ends"].append(r)
         elif ev == "dns_question" and r.get("rule") == "wildcard_budget":
             # v1.25: a name a wildcard rule's budget refused (NXDOMAIN)
@@ -360,8 +361,8 @@ def summarize(recs):
             d = r["decision_final"]
             if r.get("action") == "net.proxy" and isinstance(r.get("proxy_conn"), int):
                 s["proxy_targets"].setdefault(r["proxy_conn"], r.get("target", ""))
-            if r.get("action") == "net.request" and d != "ALLOW":
-                s["proxy_denied"].add(r.get("proxy_conn"))
+            if r.get("action") == "net.request" and d != "ALLOW" and type(r.get("proxy_conn")) is int:
+                s["proxy_denied"].add(r["proxy_conn"])
             if d == "ALLOW":
                 s["allowed"] += 1
             else:

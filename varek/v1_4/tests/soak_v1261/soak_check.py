@@ -155,7 +155,7 @@ def main():
         if rec.get("decision_final") != "ALLOW" or rec.get("inspected") is not True or \
                 any(r.get("decision_final") != "ALLOW" for r in mine):
             refused_allowed.append((f, rec if rec.get("decision_final") != "ALLOW" else
-                                    next(r for r in mine if r.get("decision_final") != "ALLOW") if mine else rec))
+                                    next((r for r in mine if r.get("decision_final") != "ALLOW"), rec)))
             continue
         if rec.get("rule") == "proxy_dialed" and (close is None or close.get("requests") != len(rq)):
             unrecorded.append(f)

@@ -109,6 +109,7 @@ struct wp_held {
     bool      s_shut;            /* the server was told no more (close_notify, or SHUT_WR) */
     bool      c_sock_eof;        /* TLS: the client's socket has closed */
     bool      cut;               /* the connection is cut (max_body): no close_notify */
+    bool      s_trunc;           /* review: the server's TLS ended without close_notify */
     int64_t   stop_at;           /* the gate stopped (a refusal): when */
 };
 enum { WG_OPEN = 0, WG_HEAD, WG_LENGTH, WG_CHUNKED };
@@ -139,7 +140,12 @@ static void report_close(const struct wp_held *h, const char *why) {
     (void)send(g_ctl, &m, sizeof m, MSG_NOSIGNAL);   /* blocking: a close report is never dropped */
 }
 
+static void report_body(struct wp_held *h, int exceeded);
+
 static void held_drop(int k) {
+    /* review: an allowed body still being sent when the connection ends: what
+     * was sent of it, reported before the close (the Warden requires it) */
+    if (g_held[k].bh) report_body(&g_held[k], 2);
     if (g_held[k].state == WH_UPSTREAM)            /* the run ended while asking the upstream */
         report_close(&g_held[k], g_held[k].why ? g_held[k].why : "upstream_refused");
     else if (g_held[k].state == WH_RELAY) report_close(&g_held[k], g_held[k].why ? g_held[k].why : "closed");
@@ -383,6 +389,8 @@ static bool  g_inspect, g_ca_made;
 static char  g_ca_run[48], g_ca_bundle[1024];
 static char *g_ca_names[PCA_MAX_NAMES];
 static size_t g_ca_nnames, g_ca_want;
+static char *g_ca_excl[PCA_MAX_NAMES];            /* review: the names the CA excludes */
+static size_t g_ca_nexcl;
 
 static int send_blob(int ctl, uint32_t kind, const unsigned char *d, size_t n) {
     static struct wp_blob b;
@@ -408,7 +416,8 @@ static void ca_go(int ctl) {
     if (!g_inspect || g_ca_made || g_ca_nnames != g_ca_want)
         snprintf(d.why, sizeof d.why, "the setup messages were not as expected");
     else if (pca_init(&g_ca), pca_load_roots(&g_ca, g_ca_bundle, d.why, sizeof d.why) < 0) { }
-    else if (pca_make_ca(&g_ca, g_ca_run, g_ca_names, g_ca_nnames, PCA_VALID_S, d.why, sizeof d.why) < 0) { }
+    else if (pca_make_ca(&g_ca, g_ca_run, g_ca_names, g_ca_nnames, g_ca_excl, g_ca_nexcl, PCA_VALID_S,
+                         d.why, sizeof d.why) < 0) { }
     else if (pca_tls_init(&g_ca, d.why, sizeof d.why) < 0) { }     /* step 4 */
     else if (pca_pem(&g_ca, &pem, &pl) < 0 || pca_p12(&g_ca, &p12, &ql) < 0 || pl > WP_BLOB_MAX || ql > WP_BLOB_MAX)
         snprintf(d.why, sizeof d.why, "encoding the CA and the trust store");
@@ -474,6 +483,11 @@ static void c_read(struct wp_held *h, short crev) {
         }
         if (h->tstage != TS_RELAY) return;
         while (h->len < PP_IN_MAX) {
+            /* review: the client's socket closed (perhaps only its sending
+             * half) and all it sent is read: done reading, without the
+             * SSL_read that would fail on the EOF and leave the connection
+             * unable to send the client the server's answers */
+            if (h->c_sock_eof && !BIO_ctrl_pending(h->crb) && !SSL_pending(h->cs)) { h->eof_c = true; break; }
             ERR_clear_error();
             int r = SSL_read(h->cs, h->buf + h->len, (int)(PP_IN_MAX - h->len));
             if (r > 0) { h->len += (size_t)r; continue; }
@@ -548,7 +562,18 @@ static void s_read(struct wp_held *h, short srev) {
             int r = SSL_read(h->ss, h->down + h->dlen, (int)(WP_RELAY_BUF - h->dlen));
             if (r > 0) { h->dlen += (size_t)r; continue; }
             int e = SSL_get_error(h->ss, r);
-            if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) h->eof_s = true;
+            if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) {
+                h->eof_s = true;
+                /* review: the server's TLS ended without close_notify (a
+                 * crash, or a FIN or RST forged on the path): what it sent
+                 * may be cut short, so the client must not get a clean close
+                 * either */
+                if (e != SSL_ERROR_ZERO_RETURN) {
+                    h->s_trunc = true;
+                    if (!h->tls_why[0])
+                        snprintf(h->tls_why, sizeof h->tls_why, "the server's TLS ended without close_notify");
+                }
+            }
             break;
         }
         ERR_clear_error();
@@ -600,7 +625,9 @@ static bool tls_begin(int k) {
         return false;
     }
     SSL_set_mode(h->ss, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-    SSL_set_hostflags(h->ss, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    /* review: the name from a DNS subject alternative name only, never the
+     * subject's CN (as browsers and Go check it) */
+    SSL_set_hostflags(h->ss, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS | X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
     SSL_set_connect_state(h->ss);
     return true;
 }
@@ -641,7 +668,7 @@ static void report_httpreq(const struct wp_held *h, const pp_req_t *q) {
     (void)send(g_ctl, &m, sizeof m, MSG_NOSIGNAL);     /* blocking, as every report */
 }
 
-static void report_body(struct wp_held *h, bool exceeded) {
+static void report_body(struct wp_held *h, int exceeded) {
     struct wp_httpbody m;
     memset(&m, 0, sizeof m);
     m.type = WP_MSG_HTTPBODY;
@@ -673,7 +700,7 @@ static void gate_verdict(struct wp_held *h, const struct wp_reqverdict *v) {
     if (h->pend_body != WP_BODY_NONE) {
         h->bh = EVP_MD_CTX_new();
         if (!h->bh || !EVP_DigestInit_ex(h->bh, EVP_sha256(), NULL)) { gate_stop(h, "the proxy is out of memory"); return; }
-        if (h->ig == IG_HEAD) report_body(h, false);          /* Content-Length: 0 */
+        if (h->ig == IG_HEAD) report_body(h, 0);              /* Content-Length: 0 */
     }
 }
 
@@ -715,17 +742,17 @@ static void gate_run(struct wp_held *h) {
             size_t before = h->fwd;
             if (!body_take(h, (size_t)take)) { h->cut = true; break; }
             h->body_left -= h->fwd - before;
-            if (!h->body_left) { report_body(h, false); h->ig = IG_HEAD; }
+            if (!h->body_left) { report_body(h, 0); h->ig = IG_HEAD; }
         } else {                                       /* IG_CHUNKED */
             bool done;
             long c = pp_chunked_feed(&h->ck, h->buf + h->fwd, h->len - h->fwd, &done);
             if (c < 0) { gate_stop(h, "a malformed chunked body"); break; }
             if (!body_take(h, (size_t)c)) { h->cut = true; break; }
-            if (done) { report_body(h, false); h->ig = IG_HEAD; }
+            if (done) { report_body(h, 0); h->ig = IG_HEAD; }
         }
     }
     if (h->cut && h->ig != IG_STOP) {                  /* max_body: the connection is cut */
-        report_body(h, true);
+        report_body(h, 1);
         h->ig = IG_STOP;
         h->why = "max_body";
         snprintf(h->tls_why, sizeof h->tls_why, "the body passed max_body=%llu", (unsigned long long)h->max_body);
@@ -828,7 +855,12 @@ static bool tls_step(int k, short crev, short srev) {
     if (h->tstage == TS_RELAY) {
         int64_t was = (int64_t)(h->bytes_up + h->bytes_down);
         if (h->ig != IG_STOP && !h->cut) gate_run(h);
-        if (h->cut) return false;                     /* max_body: cut, reported */
+        if (h->cut) {                                 /* max_body: cut, reported */
+            /* review: first send what was let through (the head, and the
+             * body up to max_body), so the server gets what the record says */
+            if (s_write(h) < 0 || h->off == h->fwd || mono_ms() - h->since > WP_READ_MS) return false;
+            return true;
+        }
         if (s_write(h) < 0) { h->why = "reset"; return false; }
         s_read(h, srev);
         if (c_write(h) < 0) { h->why = "reset"; return false; }
@@ -848,7 +880,11 @@ static bool tls_step(int k, short crev, short srev) {
                 if (h->cs) (void)SSL_write(h->cs, kRefused, (int)strlen(kRefused));
                 else (void)send(h->fd, kRefused, strlen(kRefused), MSG_DONTWAIT | MSG_NOSIGNAL);
             }
-            if (h->cs) (void)SSL_shutdown(h->cs);
+            /* review: a server that ended without close_notify gets the
+             * client none either (its TLS can tell a cut-short answer);
+             * the close says why (tls_error) */
+            if (h->s_trunc && h->ig != IG_STOP) { }
+            else if (h->cs) (void)SSL_shutdown(h->cs);
             else (void)shutdown(h->fd, SHUT_WR);
             h->tstage = TS_FINAL;
         } else if (h->ig == IG_WAIT && mono_ms() - h->since > WP_VERDICT_MS) {
@@ -949,8 +985,10 @@ static int wp_drain_ctl(int ctl) {
             continue;
         }
         if (n == (ssize_t)sizeof m.cn && m.type == WP_MSG_CA_NAME) {
-            if (g_inspect && !g_ca_made && g_ca_nnames < g_ca_want && memchr(m.cn.name, 0, sizeof m.cn.name) &&
-                (g_ca_names[g_ca_nnames] = strdup(m.cn.name)) != NULL)
+            if (!g_inspect || g_ca_made || !memchr(m.cn.name, 0, sizeof m.cn.name) || m.cn.excluded > 1) continue;
+            if (m.cn.excluded) {
+                if (g_ca_nexcl < PCA_MAX_NAMES && (g_ca_excl[g_ca_nexcl] = strdup(m.cn.name)) != NULL) g_ca_nexcl++;
+            } else if (g_ca_nnames < g_ca_want && (g_ca_names[g_ca_nnames] = strdup(m.cn.name)) != NULL)
                 g_ca_nnames++;
             continue;
         }

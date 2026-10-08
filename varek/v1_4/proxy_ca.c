@@ -68,7 +68,8 @@ static int add_ext(X509 *cert, X509V3_CTX *ctx, int nid, const char *value) {
     return ok ? 0 : -1;
 }
 
-int pca_make_ca(pca_t *c, const char *run_id, char *const *names, size_t n, long valid_s,
+int pca_make_ca(pca_t *c, const char *run_id, char *const *names, size_t n, char *const *excl, size_t nx,
+                long valid_s,
                 char *why, size_t wn) {
     EVP_PKEY_CTX *kc = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
     if (!kc || EVP_PKEY_keygen_init(kc) <= 0 ||
@@ -112,13 +113,19 @@ int pca_make_ca(pca_t *c, const char *run_id, char *const *names, size_t n, long
     /* the policy's names: a dNSName subtree covers the name and every name
      * under it (a wildcard's suffix covers its names); with none, only the
      * reserved name "invalid", so the CA can sign for nothing */
-    size_t cap = 64;
+    size_t cap = 128;
     for (size_t i = 0; i < n; i++) cap += strlen(names[i]) + 16;
+    for (size_t i = 0; i < nx; i++) cap += strlen(excl[i]) + 16;
     char *nc = malloc(cap);
     if (!nc) { snprintf(why, wn, "out of memory"); return -1; }
     size_t off = (size_t)snprintf(nc, cap, "critical");
     for (size_t i = 0; i < n; i++) off += (size_t)snprintf(nc + off, cap - off, ",permitted;DNS:%s", names[i]);
-    if (n == 0) snprintf(nc + off, cap - off, ",permitted;DNS:invalid");
+    if (n == 0) off += (size_t)snprintf(nc + off, cap - off, ",permitted;DNS:invalid");
+    /* review: constraints bind only the name types they name, so a leaf for
+     * an IP address would not be constrained: exclude every one; and the
+     * passthrough hosts, which a wildcard's suffix permits */
+    for (size_t i = 0; i < nx; i++) off += (size_t)snprintf(nc + off, cap - off, ",excluded;DNS:%s", excl[i]);
+    snprintf(nc + off, cap - off, ",excluded;IP:0.0.0.0/0.0.0.0,excluded;IP:::/::");
     int bad = add_ext(x, &ctx, NID_basic_constraints, "critical,CA:TRUE,pathlen:0") ||
               add_ext(x, &ctx, NID_key_usage, "critical,keyCertSign,cRLSign") ||
               add_ext(x, &ctx, NID_subject_key_identifier, "hash") ||

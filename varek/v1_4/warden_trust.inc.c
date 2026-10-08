@@ -137,7 +137,8 @@ static int trust_setup(const struct policy *p) {
     g_trust_nnames = trust_names(p, &names);
     unsigned char *pem = NULL, *p12 = NULL;
     size_t pl = 0, ql = 0;
-    int rc = wp_inspect_setup(&g_proxy, g_run_id, g_trust_host_bundle, names, g_trust_nnames, &pem, &pl,
+    int rc = wp_inspect_setup(&g_proxy, g_run_id, g_trust_host_bundle, names, g_trust_nnames,
+                              (const char (*)[254])p->v.proxy_pass, p->v.proxy_npass, &pem, &pl,
                               &p12, &ql, &g_trust_secure_heap, &g_trust_nroots, why, sizeof why);
     for (size_t i = 0; names && i < g_trust_nnames; i++) free(names[i]);
     free(names);

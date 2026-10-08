@@ -138,7 +138,8 @@ static int view_memfd(int v) {
     if (fclose(f) != 0) { free(buf); return -1; }
     int fd = memfd_create(kViewRule[v], MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (fd < 0) { free(buf); return -1; }
-    bool ok = write_all(fd, buf, len) == 0 &&
+    /* review: a stat of a view answers a read-only file (memfd_create makes it 0777) */
+    bool ok = fchmod(fd, 0444) == 0 && write_all(fd, buf, len) == 0 &&
               fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) == 0;
     free(buf);
     if (!ok) { close(fd); return -1; }

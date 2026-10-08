@@ -198,6 +198,8 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             fail(lineno, f"record is not valid JSON ({e}).")
         if not isinstance(rec, dict):
             fail(lineno, "record is not a JSON object.")
+        if meta is not None:             # v1.26.1 review: each record's place in the stream
+            meta.setdefault("lineno", {})[id(rec)] = lineno
         event = rec.get("event")
         if event == "run_start" or (run is not None and rec.get("run") == run):
             if chained is not None or (event == "run_start" and run is None
@@ -316,13 +318,16 @@ _TRUST_PATHS = tuple(p for v in TRUST_VIEW_RULES.values() for p in v)
 _O_ACCMODE, _O_CREAT, _O_TRUNC = 3, 0o100, 0o1000
 
 
-def _is_view(r):
-    """A view answered: a read-only open of the view's own path (v1.26.1: or
-    a read-type lookup of a trust view)."""
+def _is_view(r, inspecting=False):
+    """A view answered: a read-only open of the view's own path (v1.26.1: or,
+    in a run in inspecting mode, an open or read-type lookup of a trust
+    view)."""
     rule = r.get("rule")
     if r.get("action") in ("file.stat", "file.access") and rule == "view_metadata":
-        return r.get("resolved") in _TRUST_PATHS and r.get("kernel_verdict") == "ALLOW"
+        return inspecting and r.get("resolved") in _TRUST_PATHS and r.get("kernel_verdict") == "ALLOW"
     if r.get("action") == "file.open" and rule in TRUST_VIEW_RULES:
+        if not inspecting:
+            return False
         try:
             fl = int(r.get("open_flags"), 16)
         except (TypeError, ValueError):
@@ -479,7 +484,8 @@ def _proxy_text(records, pm):
               ("varek:proxy.ca.key_locked", "true" if tr.get("ca_key_locked") is True else "false"),
               ("varek:proxy.trust_store.sha256", str(tr.get("trust_store_sha256", ""))),
               ("varek:proxy.host_bundle.sha256", str(tr.get("host_bundle_sha256", ""))),
-              ("varek:proxy.passthrough", ",".join(str(h) for h in tr.get("passthrough") or [])),
+              ("varek:proxy.passthrough", ",".join(str(h) for h in tr.get("passthrough"))
+               if isinstance(tr.get("passthrough"), list) else ""),
               ("varek:requests.total", str(len(reqs))),
               ("varek:requests.allowed", str(len(allowed))),
               ("varek:requests.refused", str(len(reqs) - len(allowed))),
@@ -511,8 +517,10 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
     run_start, run_end = _ts(records)
 
     # v1.24: views answered are reported apart from the decisions
-    views = [r for r in records if _is_view(r)]
-    records = [r for r in records if not _is_view(r)]
+    rs = (proxy_meta or {}).get("run_start") or {}
+    insp = isinstance(rs.get("proxy"), dict) and rs["proxy"].get("mode") == "inspect"   # review
+    views = [r for r in records if _is_view(r, insp)]
+    records = [r for r in records if not _is_view(r, insp)]
     authorized = [r for r in records if r.get("decision_final") == "ALLOW"]
     refused = [r for r in records if r.get("decision_final") != "ALLOW"]
 

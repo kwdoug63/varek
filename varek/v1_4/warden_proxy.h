@@ -66,7 +66,8 @@ struct wp_reqverdict {
 };
 struct wp_httpbody {
     uint32_t type;               /* WP_MSG_HTTPBODY */
-    uint32_t exceeded;           /* the body passed max_body: the connection was cut */
+    uint32_t exceeded;           /* 1: the body passed max_body: the connection was cut; review: 2, the
+                                    connection ended before the body did (what was sent of it) */
     uint64_t id;
     uint64_t seq;
     uint64_t len;                /* bytes of the body as sent (a chunked body's framing included) */
@@ -168,7 +169,7 @@ struct wp_inspect {
 };
 struct wp_ca_name {
     uint32_t type;               /* WP_MSG_CA_NAME */
-    uint32_t pad;
+    uint32_t excluded;           /* review: 1, a name the CA excludes (a passthrough host); 0, one it permits */
     char     name[256];          /* NUL-terminated host name */
 };
 enum { WP_BLOB_CA_PEM = 1, WP_BLOB_P12 = 2 };
@@ -234,7 +235,7 @@ int wp_verdict(const wp_t *w, uint64_t id, bool allow);
  * receive the CA certificate (PEM) and the PKCS#12 trust store (malloc'd).
  * Waits up to 15 s. 0, or -1 with why. */
 int wp_inspect_setup(const wp_t *w, const char *run_id, const char *bundle, char *const *names,
-                     size_t nnames, unsigned char **pem, size_t *pem_len, unsigned char **p12,
+                     size_t nnames, const char (*excl)[254], size_t nexcl, unsigned char **pem, size_t *pem_len, unsigned char **p12,
                      size_t *p12_len, int *secure_heap, int *nroots, char *why, size_t wn);
 
 /* The helper's own entry point, after it has dropped its privileges: serve

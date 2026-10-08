@@ -17,7 +17,12 @@
 #   sudo varek/v1_4/tests/soak_v1261/soak.sh [--hours 24] [--interval 60] \
 #        [--out DIR] [--sign-key KEY] [--dns-server A:P] [--upstream URL] \
 #        [--trust-bundle PEM] [--rules 'name:port,...'] [--requests 'METHOD URL,...'] \
-#        [--urls URL,...] [--probe-via NAME] [--insecure]
+#        [--urls URL,...] [--probe-via NAME --probe-path P --denied-path P --unlisted-path P]
+#        [--insecure]
+#
+# The probes go to --probe-via (pypi.org): --probe-path must be a path a
+# request rule allows there, --denied-path one the --deny rule refuses, and
+# --unlisted-path one no rule allows; change them with --probe-via or --deny.
 #
 # The run writes DIR/verdicts.log, DIR/agent.jsonl, DIR/policy.txt and, at
 # the end, DIR/report.txt. It holds the terminal for the whole run: start it
@@ -33,7 +38,7 @@ RULES='pypi.org:443,api.cloudflare.com:443,ip-ranges.amazonaws.com:443,www.cloud
 # host), and the deny rule the "denied" probe meets
 REQUESTS='GET https://pypi.org/pypi/sampleproject/json,GET https://api.cloudflare.com/client/v4/ips,GET https://*.cloudflare.com/cdn-cgi/trace,GET https://ip-ranges.amazonaws.com/ip-ranges.json,GET http://www.cloudflare.com/cdn-cgi/trace'
 DENY='* https://pypi.org/simple/**'
-PROBE_VIA=pypi.org
+PROBE_VIA=pypi.org PROBE_PATH=/pypi/sampleproject/json DENIED_PATH=/simple/pip/ UNLISTED_PATH=/pypi/pip/json
 while [ $# -gt 0 ]; do
     case "$1" in
         --hours) HOURS="$2"; shift 2 ;;
@@ -48,6 +53,9 @@ while [ $# -gt 0 ]; do
         --requests) REQUESTS="$2"; shift 2 ;;
         --deny) DENY="$2"; shift 2 ;;
         --probe-via) PROBE_VIA="$2"; shift 2 ;;
+        --probe-path) PROBE_PATH="$2"; shift 2 ;;       # an allowed path of --probe-via
+        --denied-path) DENIED_PATH="$2"; shift 2 ;;     # one --deny refuses there
+        --unlisted-path) UNLISTED_PATH="$2"; shift 2 ;; # one no rule allows there
         --insecure) INSECURE=--insecure; shift ;;
         *) echo "unknown option $1"; exit 2 ;;
     esac
@@ -90,7 +98,8 @@ echo "soak.sh: $HOURS h, one of ${#ULIST[@]} URLs every $INTERVAL s (every tenth
 "$V14/warden" "$POL" "${WOPTS[@]}" --check-startup || { echo "soak.sh: the Warden would not start"; exit 1; }
 env -i PATH=/usr/bin:/bin "$V14/warden" "$POL" "${WOPTS[@]}" -- \
     /usr/bin/python3 "$AG/soak_agent.py" --interval "$INTERVAL" --seconds "$SECS" \
-    --probe-via "$PROBE_VIA" $INSECURE "${ULIST[@]}" > "$OUT/agent.jsonl" 2> "$OUT/verdicts.log"
+    --probe-via "$PROBE_VIA" --probe-path "$PROBE_PATH" --denied-path "$DENIED_PATH" \
+    --unlisted-path "$UNLISTED_PATH" $INSECURE "${ULIST[@]}" > "$OUT/agent.jsonl" 2> "$OUT/verdicts.log"
 echo "soak.sh: the agent finished (exit $?); checking"
 
 PK=()

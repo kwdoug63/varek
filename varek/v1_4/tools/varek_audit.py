@@ -297,7 +297,32 @@ TLS_CLOSE_WHY = ("server_tls", "client_tls", "tls_timeout", "max_body")   # step
 HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
-def check_trust(meta, passthrough, problems):
+def trust_names(rules, proxy_ports, passthrough):
+    """v1.26.1 review: the names the run's CA may sign for, as the Warden's
+    trust_names takes them: each allow host name rule's name (a wildcard's
+    suffix) reachable on a proxied port, once each, without the passthrough
+    hosts (named exactly)."""
+    out = []
+    for r in rules:
+        if r["kind"] != "h" or not r["allow"] or not r["name"]:
+            continue
+        c = r["c"]
+        if r["wild"]:
+            head, colon, port = c.rpartition(":")
+            if not colon or not head.startswith("?*."):
+                continue
+            name = head[3:]
+        else:
+            name, colon, port = c.partition(":")
+        if colon and port != "*" and not (port.isdigit() and int(port) in (proxy_ports or [])):
+            continue
+        if (not r["wild"] and name in (passthrough or [])) or name in out:
+            continue
+        out.append(name)
+    return out
+
+
+def check_trust(meta, passthrough, problems, rules=(), proxy_ports=None):
     """v1.26.1 (step 3): in inspecting mode run_start records the trust the
     agent was given: the host's bundle and its hash, the run's CA (the hash of
     its DER) and how many names it may sign for, the trust store's hash,
@@ -317,6 +342,15 @@ def check_trust(meta, passthrough, problems):
     if not ok:
         problems.append(f"run_start's trust {tr!r} is not inspecting mode's (the host's bundle, the "
                         f"run's CA, the trust store, passthrough {passthrough})")
+    elif rules and tr["ca_names"] != len(trust_names(rules, proxy_ports, passthrough)):
+        problems.append(f"run_start's CA may sign for {tr['ca_names']} name(s), but the policy gives it "
+                        f"{len(trust_names(rules, proxy_ports, passthrough))}")
+
+
+def _inspecting(meta):
+    """run_start's proxy is in inspecting mode (review: no crash on a malformed one)."""
+    pr = meta.get("run_start", {}).get("proxy")
+    return isinstance(pr, dict) and pr.get("mode") == "inspect"
 
 
 def check_proxy_start(meta, proxy_ports, problems, upstream=None, inspect=False):
@@ -405,50 +439,120 @@ REQUEST_REFUSE_RULES = ("policy_match", "default_deny_unknown", "certificate_ref
                         "fragment_escape_length")
 
 
-def check_requests(records, bodies, rules, problems):
+UNRESERVED = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+
+
+def target_problem(t):
+    """v1.26.1 review: why a request's target (/path?query) is one the proxy
+    must refuse (section 2: a server could read it as another path), or None.
+    As proxy_parse.c's target_ok, written again here."""
+    if not t.startswith("/"):
+        return "a target that is not a path"
+    path, q, query = t.partition("?")
+    segs = path.split("/")[1:]
+    for k, sg in enumerate(segs):
+        if sg == "" and k < len(segs) - 1:
+            return "an empty path segment ('//')"
+        if sg in (".", ".."):
+            return "a '.' or '..' path segment"
+    for i, ch in enumerate(t):
+        c = ord(ch)
+        if c < 0x21 or c > 0x7e:
+            return "a byte outside 0x21-0x7e"
+        if ch in "\\;#":
+            return "a '\\', ';' or '#'"
+        if ch == "%":
+            hx = t[i + 1:i + 3]
+            if len(hx) != 2 or any(x not in "0123456789abcdefABCDEF" for x in hx):
+                return "a bad percent escape"
+            v = int(hx, 16)
+            if v in (0x2f, 0x5c) or v in UNRESERVED:
+                return "a percent escape of '/', '\\' or an unreserved byte"
+    return None
+
+
+def check_requests(records, bodies, rules, problems, closes=(), order=None):
     """v1.26.1 (step 6): every net.request is a request of a connection passed
     on to be inspected, before its close, numbered 1, 2, ... on it, with none
     after a refusal; its object is METHOD scheme://name:port/... for that
-    connection's name and port (https, or http for plain HTTP); an allowed
-    one's max_body is its deciding rule's, and one refused for max_body
-    declared a longer body. Each request_body follows an allowed request
-    with a body, once, and stays within max_body unless it says it passed it
-    (then it stopped at it). Returns the number of requests."""
+    connection's name and port (https, or http for plain HTTP), in a target
+    form the proxy reads one way (review); an allowed one's max_body is its
+    deciding rule's, its declared length within it, and one refused for
+    max_body declared a longer body. Each allowed request with a body has
+    one request_body, after it and before its connection's close: a
+    declared length sent whole (or "incomplete": less, the connection
+    ended), within max_body unless it says it passed it (then it stopped at
+    it). Returns the number of requests.
+    order: each record's line in the stream (by id), to put requests,
+    bodies and closes in stream order."""
     conns = {}                       # proxy_conn -> (position, name:port, scheme)
     for pos, rec in enumerate(records):
         if rec.get("action") == "net.proxy" and rec.get("rule") == "proxy_dialed" and \
                 rec.get("inspected") is True and type(rec.get("proxy_conn")) is int:
             conns.setdefault(rec["proxy_conn"], (pos, rec.get("target"),
                                                   "http" if rec.get("proxy_kind") == "http" else "https"))
-    state = {}                       # proxy_conn -> {"next", "refused", "body": (seq, max_body) or None}
+    state = {}                       # proxy_conn -> {"next", "refused", "closed", "body": pending or None}
     n = 0
-    # requests and bodies in stream order (a body's position is the number
-    # of decision records before it)
-    events = sorted([(pos, 1, rec) for pos, rec in enumerate(records) if rec.get("action") == "net.request"] +
-                    [(bpos - 0.5, 0, b) for bpos, b in bodies], key=lambda e: (e[0], e[1]))
-    for pos, isreq, rec in events:
-        if not isreq:
-            b = rec
-            cid, rs = b.get("proxy_conn"), b.get("request_seq")
+    # requests, bodies and closes in stream order (without the lines, a
+    # body's or close's position is the number of decision records before it)
+    if order is not None:
+        key = lambda x: order.get(id(x), 0)
+        events = [(key(r), 1, r) for r in records if r.get("action") == "net.request"] + \
+                 [(key(b), 0, b) for _, b in bodies] + [(key(c), 2, c) for _, c in closes]
+    else:
+        events = [(pos, 1, r) for pos, r in enumerate(records) if r.get("action") == "net.request"] + \
+                 [(bpos - 0.5, 0, b) for bpos, b in bodies]
+    pos_of = {id(r): p for p, r in enumerate(records)}
+    for _, what, rec in sorted(events, key=lambda e: (e[0], e[1])):
+        cid = rec.get("proxy_conn")
+        if type(cid) is not int:
+            problems.append(f"a {'net.request' if what == 1 else rec.get('event')} record with a malformed "
+                            f"connection id {cid!r}")
+            continue
+        if what == 2:                                   # a close
             st = state.get(cid)
+            if st and st["body"] is not None and rec.get("why") != "unreported":
+                problems.append(f"connection {cid}: closed with the body of request {st['body'][0]} never "
+                                f"recorded (a request_body is missing)")
+            if st:
+                st["closed"] = True
+            else:
+                state[cid] = {"next": 1, "refused": False, "closed": True, "body": None}
+            continue
+        if what == 0:                                   # a body
+            b = rec
+            rs = b.get("request_seq")
+            st = state.get(cid)
+            if st and st["closed"]:
+                problems.append(f"connection {cid}: a request_body after the connection's close")
+                continue
             if not st or st["body"] is None or st["body"][0] != rs:
                 problems.append(f"a request_body for connection {cid!r} request {rs!r}, which has no body pending")
                 continue
-            mb, ln = st["body"][1], b.get("body_len")
-            if type(ln) is not int or not (isinstance(b.get("body_sha256"), str) and HEX64.fullmatch(b["body_sha256"])):
+            _, mb, kind, decl = st["body"]
+            ln, exc, inc = b.get("body_len"), b.get("exceeded_max_body") is True, b.get("incomplete") is True
+            if type(ln) is not int or ln < 0 or \
+                    not (isinstance(b.get("body_sha256"), str) and HEX64.fullmatch(b["body_sha256"])):
                 problems.append(f"connection {cid}: a request_body without a length and a SHA-256")
-            elif b.get("exceeded_max_body") is True and not (mb and ln == mb):
-                problems.append(f"connection {cid}: a body said to pass max_body, at {ln}, not at the rule's {mb}")
-            elif b.get("exceeded_max_body") is not True and mb and ln > mb:
+            elif exc and (inc or kind != "chunked" or not (mb and ln == mb)):
+                problems.append(f"connection {cid}: a body said to pass max_body, at {ln}, not a chunked body "
+                                f"stopped at the rule's {mb}")
+            elif not exc and mb and ln > mb:
                 problems.append(f"connection {cid}: a body of {ln} bytes, over its rule's max_body={mb}")
+            elif kind == "length" and not exc and (ln >= decl if inc else ln != decl):
+                problems.append(f"connection {cid}: a body of {ln} bytes, where its request declared {decl}"
+                                + (" (said incomplete)" if inc else ""))
             st["body"] = None
             continue
         n += 1
-        seq, cid, rs = rec.get("seq"), rec.get("proxy_conn"), rec.get("request_seq")
-        if type(cid) is not int or cid not in conns or conns[cid][0] >= pos:
+        seq, rs = rec.get("seq"), rec.get("request_seq")
+        if cid not in conns or conns[cid][0] >= pos_of.get(id(rec), -1):
             problems.append(f"seq {seq}: a request of connection {cid!r}, which was not passed on to be inspected")
             continue
-        st = state.setdefault(cid, {"next": 1, "refused": False, "body": None})
+        st = state.setdefault(cid, {"next": 1, "refused": False, "closed": False, "body": None})
+        if st["closed"]:
+            problems.append(f"seq {seq}: a request of connection {cid} after its close")
+            continue
         if st["refused"]:
             problems.append(f"seq {seq}: a request of connection {cid} after one was refused")
             continue
@@ -461,6 +565,14 @@ def check_requests(records, bodies, rules, problems):
         if not m or obj != rec.get("resolved") or rec.get("body") not in ("none", "length", "chunked"):
             problems.append(f"seq {seq}: a request object {obj!r} that is not one of connection {cid} ({scheme}://{hp})")
             continue
+        bad = target_problem(m.group(2))
+        if bad:
+            problems.append(f"seq {seq}: a request object {obj!r} with {bad}, which the proxy must refuse")
+            continue
+        decl = rec.get("body_declared")
+        if (rec["body"] == "length") != (type(decl) is int and decl >= 0):
+            problems.append(f"seq {seq}: a request whose body is {rec['body']!r} with a declared length {decl!r}")
+            continue
         dfin, rule = rec.get("decision_final"), rec.get("rule")
         if dfin == "ALLOW" and rule == "request_allowed":
             cr = rec.get("cert_rule")
@@ -468,11 +580,15 @@ def check_requests(records, bodies, rules, problems):
             if want is None or rules[cr]["kind"] != "r" or rec.get("max_body", 0) != want:
                 problems.append(f"seq {seq}: an allowed request whose max_body is not its rule's")
                 continue
+            if want and rec["body"] == "length" and decl > want:
+                problems.append(f"seq {seq}: an allowed request declaring a body of {decl} bytes, over its "
+                                f"rule's max_body={want}")
+                continue
             if rec["body"] != "none":
-                st["body"] = (rs, want)
+                st["body"] = (rs, want, rec["body"], decl)
         elif dfin == "DENY" and rule in REQUEST_REFUSE_RULES:
             st["refused"] = True
-            if rule == "max_body" and not (rec.get("body") == "length" and type(rec.get("body_declared")) is int):
+            if rule == "max_body" and rec.get("body") != "length":
                 problems.append(f"seq {seq}: a request refused for max_body without a declared length")
         else:
             problems.append(f"seq {seq}: a request decision {dfin!r} with rule {rule!r}, which the Warden does not write")
@@ -1700,7 +1816,7 @@ def main(argv=None):
             except (TypeError, ValueError):
                 flv = -1
             trust = rec["rule"] in TRUST_VIEW_RULES        # v1.26.1
-            inspecting = (meta.get("run_start", {}).get("proxy") or {}).get("mode") == "inspect"
+            inspecting = _inspecting(meta)
             if trust and not inspecting:
                 problems.append(f"seq {rec.get('seq')}: a trust view answered, but run_start's proxy is not "
                                 f"in inspecting mode")
@@ -1724,11 +1840,20 @@ def main(argv=None):
             continue
         # v1.26.1: a read-type lookup of a trust view, answered from the view
         if rec.get("action") in ("file.stat", "file.access") and rec.get("rule") == "view_metadata":
-            inspecting = (meta.get("run_start", {}).get("proxy") or {}).get("mode") == "inspect"
+            inspecting = _inspecting(meta)
             if not inspecting or rec.get("resolved") not in TRUST_VIEW_RULES["trust_view"] + \
                     TRUST_VIEW_RULES["run_ca_view"] + TRUST_VIEW_RULES["trust_store_view"]:
                 problems.append(f"seq {rec.get('seq')}: a view's metadata answered for {rec.get('resolved')!r}, "
                                 f"which is not a trust view of a run in inspecting mode")
+            # review: only a read-type lookup is answered (access without
+            # W_OK or X_OK), and, as for an open, not where a deny rule holds
+            elif rec.get("open_flags") != "0x0" or (rec["action"] == "file.access" and not (
+                    isinstance(rec.get("access_mode"), str) and rec["access_mode"].isdigit() and
+                    int(rec["access_mode"]) & 3 == 0)):
+                problems.append(f"seq {rec.get('seq')}: a view's metadata answered for a lookup that is not "
+                                f"read-type ({rec.get('open_flags')!r}, access {rec.get('access_mode')!r})")
+            else:
+                view_recs.append((rec, 0))
             views += 1
             continue
         is_open = rec.get("action") == "file.open" and rec.get("rule") in AUTHORIZED_OPEN_RULES
@@ -1882,7 +2007,7 @@ def main(argv=None):
         passthrough = None
     check_proxy_start(meta, proxy_ports, problems, policy_upstream(a.checker, a.policy),
                       passthrough is not None)
-    check_trust(meta, passthrough, problems)
+    check_trust(meta, passthrough, problems, prules, proxy_ports)
     if prules:
         check_handoff_rules(a.checker, a.policy, prules, handoff_cands, problems)
     # v1.26 (step 6): the Warden's decisions on what the proxy read
@@ -1908,7 +2033,8 @@ def main(argv=None):
         check_dialed_denies(a.checker, a.policy, prules, dialed_px, problems)
     pcloses = check_closes(records, meta.get("proxy_closes", []), complete, problems,
                            meta.get("request_bodies", []))                       # step 7
-    nreq = check_requests(records, meta.get("request_bodies", []), prules, problems)   # v1.26.1
+    nreq = check_requests(records, meta.get("request_bodies", []), prules, problems,       # v1.26.1
+                          meta.get("proxy_closes", []), meta.get("lineno"))
     if nreq:
         check_refused_requests(a.checker, a.policy, prules, records, problems)            # step 7
     if proxied and proxy_ports is None:

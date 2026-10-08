@@ -39,9 +39,11 @@ int pca_init(pca_t *c);
 /* Read the host's trust bundle (PEM). 0, or -1 with why. */
 int pca_load_roots(pca_t *c, const char *bundle, char *why, size_t wn);
 /* Make the CA, valid from PCA_BACKDATE_S ago for valid_s, permitting the n
- * names (host names; a name covers the names under it). 0, or -1 with why. */
-int pca_make_ca(pca_t *c, const char *run_id, char *const *names, size_t n, long valid_s,
-                char *why, size_t wn);
+ * names (host names; a name covers the names under it) and excluding the
+ * nx names in excl (review: the passthrough hosts, which a permitted
+ * wildcard's suffix would cover) and every IP address. 0, or -1 with why. */
+int pca_make_ca(pca_t *c, const char *run_id, char *const *names, size_t n, char *const *excl, size_t nx,
+                long valid_s, char *why, size_t wn);
 /* The CA certificate in PEM, and the PKCS#12 trust store (malloc'd). 0 or -1. */
 int pca_pem(const pca_t *c, unsigned char **out, size_t *len);
 int pca_p12(const pca_t *c, unsigned char **out, size_t *len);
