@@ -212,6 +212,7 @@ typedef enum {
     ACT_FILE_ACCESS,     /* v1.17.0: access, faccessat, faccessat2 */
     ACT_FILE_READLINK,   /* v1.17.0: readlink, readlinkat */
     ACT_NET_PROXY,       /* v1.26: a name:port the egress proxy read from a client */
+    ACT_NET_REQUEST,     /* v1.26.1: a request of an inspected connection (its object) */
     ACT_OTHER,
 } action_kind_t;
 
@@ -283,6 +284,7 @@ static const char *action_kind_name(action_kind_t k) {
         case ACT_FILE_ACCESS:   return "file.access";
         case ACT_FILE_READLINK: return "file.readlink";
         case ACT_NET_PROXY:     return "net.proxy";
+        case ACT_NET_REQUEST:   return "net.request";
         case ACT_OTHER:        return "other";
     }
     return "invalid";
@@ -848,6 +850,7 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
             if (s[0] == '\0') { a->why = "no_resolved_destination"; return DEC_UNKNOWN; }
             break;
         case ACT_PROCESS_EXEC: kind = VDP_KIND_EXEC; s = a->target; break;
+        case ACT_NET_REQUEST: kind = VDP_KIND_REQUEST; s = a->resolved; break;      /* v1.26.1 */
         default:
             a->why = "not_in_fragment";
             return DEC_UNKNOWN;
@@ -901,6 +904,7 @@ static bool certify(const struct policy *p, struct action *a) {
         case ACT_FILE_READLINK: kind = VDPC_PATH; s = a->resolved; break;
         case ACT_NET_CONNECT:  kind = VDPC_HOST; s = a->resolved; break;   /* v1.21 */
         case ACT_NET_PROXY:    kind = VDPC_HOST; s = a->resolved; break;   /* v1.26 */
+        case ACT_NET_REQUEST:  kind = VDPC_REQUEST; s = a->resolved; break; /* v1.26.1 */
         case ACT_PROCESS_EXEC: kind = VDPC_EXEC; s = a->target;   break;
         default:
             snprintf(a->check_why, sizeof a->check_why, "no certificate for this action kind");

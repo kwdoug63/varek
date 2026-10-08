@@ -25,23 +25,36 @@
 #      can read; the agent is served the host's bundle with the CA after it
 #      at the usual bundle paths and /etc/varek/run-bundle.pem, the CA alone,
 #      and a PKCS#12 trust store Java opens without a password, all read-only,
-#      and its environment names them; run_start records every hash; until
-#      requests are decided (step 6) an inspected host is refused
-#      (inspect_not_built) and a passthrough host relayed in SNI mode; the
+#      and its environment names them; run_start records every hash; an
+#      inspected host is passed on to be inspected and a passthrough host
+#      relayed in SNI mode; the
 #      audit accepts the run and refuses forged trust records and decisions
 #   4. terminating TLS (as root): for an inspected host the proxy verifies the
 #      server (against --trust-bundle) before it meets the client, then
 #      completes the client's handshake with a leaf from the run's CA (the
-#      name only, serverAuth, kept for the run), http/1.1 only; until
-#      requests are decided (step 6) every request is answered 403 and the
-#      server is sent nothing; refused and recorded: a server whose name or
-#      issuer does not verify (server_tls), a client that does not trust the
-#      CA or offers only h2 (client_tls), plain HTTP to an inspected host;
+#      name only, serverAuth, kept for the run), http/1.1 only; an allowed
+#      request reaches the server, decided first (section 5 has the
+#      decisions); refused and recorded: a server whose name or issuer does
+#      not verify (server_tls), a client that does not trust the CA or offers
+#      only h2 (client_tls), a request the parser refuses, plain HTTP no
+#      rule allows;
 #      Python, curl, Node.js and Java trust the run's CA with no settings of
 #      their own (Java through the store's metadata, answered from the
 #      view); CONNECT clients and a Squid upstream; a passthrough host
 #      relayed in SNI mode; the audit accepts the runs and refuses forged
 #      inspected records
+#   5. request decisions (as root, with section 4's root and servers): each
+#      request of an inspected connection is decided on its object, certified
+#      and recorded (net.request) before a byte of it is sent: allowed ones
+#      reach the server, on one kept-alive connection and pipelined; at a
+#      refused one (a deny rule, no rule, the request parser) the proxy stops,
+#      earlier answers still reach the client, then a 403 says why, and
+#      nothing after it is sent; a query only where a rule names one; a body
+#      declared over max_body is refused before it is sent, a chunked one
+#      passing it is cut there (max_body), and each body's length and SHA-256
+#      are recorded (request_body) and are the server's; plain HTTP decided
+#      on http:// objects; the audit accepts the run and refuses forged
+#      request records
 #
 # Usage: test_v1261.sh <vdp_check> <vdp_cert_check> [<warden>]
 # (section 2 uses warden-proxy beside the warden binary: make warden-proxy)
@@ -524,7 +537,9 @@ def serve(c):
     try:
         s = ctx.wrap_socket(c, server_side=True)
         d = s.recv(1000)
-        if d: print("GOT", d.split(b"\r\n")[0].decode(errors="replace"), flush=True)
+        if not d:
+            s.close(); return
+        print("GOT", d.split(b"\r\n")[0].decode(errors="replace"), flush=True)
         s.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nserver"); s.close()
     except Exception as e:
         print("srv", type(e).__name__, flush=True)
@@ -638,12 +653,14 @@ for r in recs:
         print(json.dumps(r, sort_keys=True))
 PY
     }
-    NB="VAREK: this request was not sent"
-    if have "TLS verified True None HTTP/1.1 403 Forbidden $NB" && have "TLS again True None HTTP/1.1 403 Forbidden $NB"
-    then pass "a verifying client completes TLS with the run's CA, and its request is answered 403"
+    NB="VAREK: this request was refused"
+    if have "TLS verified True None HTTP/1.1 200 OK server" && have "TLS again True None HTTP/1.1 200 OK server"
+    then pass "a verifying client completes TLS with the run's CA, and its allowed request reaches the server"
     else flunk "a verifying client completes TLS with the run's CA (see above)"; fi
-    if ! grep -q '^GOT ' "$OUT/srv$P1.log"; then pass "the server was verified but sent no request"
-    else flunk "the server was sent no request ($(cat "$OUT/srv$P1.log"))"; fi
+    # verified, again, alpn-both, connect, absolute: the five allowed requests, and only they
+    if [ "$(grep -c '^GOT GET ' "$OUT/srv$P1.log")" = 5 ] && [ "$(grep -c '^GOT ' "$OUT/srv$P1.log")" = 5 ]
+    then pass "the server got the allowed requests, and nothing of the refused ones"
+    else flunk "the server got only the allowed requests ($(cat "$OUT/srv$P1.log"))"; fi
     openssl x509 -inform DER -in "$W/o/leaf-verified.der" -noout -text > "$OUT/leaf.txt" 2>&1
     if grep -q 'Issuer: O = VAREK Warden (this run only), CN = VAREK run CA' "$OUT/leaf.txt" &&
        grep -A1 'Subject Alternative Name' "$OUT/leaf.txt" | tail -1 | grep -qx ' *DNS:api.example.com' &&
@@ -654,14 +671,14 @@ PY
     else flunk "the leaf's form ($(head -c 300 "$OUT/leaf.txt"))"; fi
     if cmp -s "$W/o/leaf-verified.der" "$W/o/leaf-again.der"; then pass "and kept for the run (the same leaf again)"
     else flunk "and kept for the run"; fi
-    if have "TLS alpn-both True http/1.1 HTTP/1.1 403 Forbidden $NB" && have "TLS alpn-h2 SSLERR False" &&
+    if have "TLS alpn-both True http/1.1 HTTP/1.1 200 OK server" && have "TLS alpn-h2 SSLERR False" &&
        close_of "api.example.com:$P1" | grep -q '"tls_error": "handshake: no application protocol"'
     then pass "http/1.1 is chosen; a client offering only h2 is refused (client_tls)"
     else flunk "ALPN (http/1.1 chosen, h2 alone refused)"; fi
     if have "TLS pinning SSLERR False" && close_of "api.example.com:$P1" | grep -q '"tls_error": "handshake: tlsv1 alert unknown ca"'
     then pass "a client that does not trust the run's CA fails its handshake, recorded (client_tls)"
     else flunk "a client that does not trust the run's CA"; fi
-    if have "TLS connect True None HTTP/1.1 403 Forbidden $NB"; then pass "TLS inside a CONNECT is inspected too"
+    if have "TLS connect True None HTTP/1.1 200 OK server"; then pass "TLS inside a CONNECT is inspected too"
     else flunk "TLS inside a CONNECT is inspected too"; fi
     if have "TLS wrong-name SSLERR True" && close_of "api.example.com:$P2" | grep -q '"tls_error": "certificate: hostname mismatch"' &&
        have "TLS self-signed SSLERR True" && close_of "api.example.com:$P3" | grep -q '"tls_error": "certificate: self-signed certificate"' &&
@@ -686,20 +703,20 @@ PY
        [ "$(reqx "a '.' or '..' path segment")" = yes ]
     then pass "a '..' segment and an escaped letter are refused, recorded"
     else flunk "a '..' segment and an escaped letter are refused"; fi
-    if grep -qF "REQ absolute HTTP/1.1 403 Forbidden $NB" "$OUT/t.out"; then pass "an absolute-form request for the connection's own authority is read (then answered 403 until step 6)"
+    if have "REQ absolute HTTP/1.1 200 OK server"; then pass "an absolute-form request for the connection's own authority is read, decided and sent"
     else flunk "an absolute-form request is read"; fi
     if have "TLS passthrough True None HTTP/1.1 200 OK server" &&
        grep '"action":"net.proxy"' "$OUT/t.log" | grep "\"target\":\"pinned.example.net:$P4\"" | grep -vq '"inspected"'
     then pass "a passthrough host is relayed in SNI mode, not inspected"
     else flunk "a passthrough host is relayed in SNI mode"; fi
-    if have "HTTP HTTP/1.1 403 Forbidden" &&
-       grep '"action":"net.proxy"' "$OUT/t.log" | grep "\"target\":\"api.example.com:$P1\"" | grep '"proxy_kind":"http"' | grep -q '"rule":"inspect_not_built"'
-    then pass "plain HTTP to an inspected host is refused until requests are decided"
-    else flunk "plain HTTP to an inspected host is refused"; fi
+    if grep '"action":"net.request"' "$OUT/t.log" | grep "\"target\":\"GET http://api.example.com:$P1/v1/models\"" |
+           grep -q '"decision_final":"DENY","rule":"default_deny_unknown"'
+    then pass "plain HTTP to an inspected host is decided too (an http:// object no rule allows: refused)"
+    else flunk "plain HTTP to an inspected host is decided"; fi
     GSHA=$(openssl x509 -in "$W/good.pem" -outform DER | sha256sum | cut -d' ' -f1)
-    if close_of "api.example.com:$P1" | grep '"why": "inspect_not_built"' | grep -q "\"server_cert_sha256\": \"$GSHA\"" &&
-       ! close_of "api.example.com:$P1" | grep '"why": "inspect_not_built"' | grep -vq '"bytes_down": 0, "bytes_up": 0'
-    then pass "each inspected close records the server's certificate, and no bytes relayed"
+    if close_of "api.example.com:$P1" | grep '"why": "closed"' | grep -q "\"server_cert_sha256\": \"$GSHA\"" &&
+       ! close_of "api.example.com:$P1" | grep '"why": "refused_request"' | grep -v '"bytes_up": 0,' | grep -q https
+    then pass "each inspected close records the server's certificate, and a refused request sends no bytes"
     else flunk "the inspected closes' records"; fi
     if have "STAT 0o100000 True" && grep -q '"rule":"view_metadata"' "$OUT/t.log"
     then pass "the trust store's metadata is the view's (a regular file, its size)"
@@ -708,8 +725,8 @@ PY
     then pass "the audit accepts the run"
     else flunk "the audit accepts the run ($(grep -m3 'PROBLEM' "$OUT/au4.out"))"; fi
     POL="$POL4"
-    forge "$OUT/t.log" "$OUT/h1.log" '"why":"inspect_not_built","bytes_up":0,' '"why":"inspect_not_built","bytes_up":512,'
-    refuses "an inspected connection that relayed bytes before requests are decided" "$OUT/h1.log" "relayed bytes before requests are decided"
+    forge "$OUT/t.log" "$OUT/h1.log" '"why":"refused_request","bytes_up":0,' '"why":"refused_request","bytes_up":512,'
+    refuses "an inspected connection that relayed bytes though no request was allowed" "$OUT/h1.log" "though no request was allowed"
     forge "$OUT/t.log" "$OUT/h2.log" ',"inspected":true,"server_cert_sha256"' ',"server_cert_sha256"'
     refuses "an inspected connection's close not marked inspected" "$OUT/h2.log" "not marked inspected"
     forge "$OUT/t.log" "$OUT/h3.log" "\"target\":\"pinned.example.net:$P4\"," "\"target\":\"pinned.example.net:$P4\",\"inspected\":true,"
@@ -721,6 +738,7 @@ PY
     [ -n "$JAVA" ] || JAVA=$(readlink -f "$(command -v java 2>/dev/null)" 2>/dev/null)
     POLC="$OUT/clients.policy"
     { printf 'require warden 1.26\nproxy inspect\nproxy ports %s\nallow host api.example.com\n' "$P1"
+      printf 'allow request GET https://api.example.com:%s/v1/models\n' "$P1"
       for d in /usr/ /lib /proc/ /sys/ "$W/" ${NODE:+$(dirname "$(dirname "$NODE")")/} \
                ${JAVA:+$(dirname "$(dirname "$JAVA")")/} /etc/java-21-openjdk/ /etc/java-17-openjdk/; do
           printf 'allow path %s readonly\n' "$d"; done
@@ -729,12 +747,12 @@ PY
     cl() { env -i PATH=/usr/bin:/bin timeout 90 "$WARDEN" "$POLC" --dns-server "127.0.0.1:$DPORT" --trust-bundle "$BUNDLE" -- "$@" 2> "$OUT/cl.log"; }
     URL="https://api.example.com:$P1/v1/models"
     if command -v curl > /dev/null; then
-        if cl /usr/bin/curl -sS "$URL" | grep -q "^$NB"; then pass "curl verifies the run's CA (CURL_CA_BUNDLE) and gets the 403"
+        if [ "$(cl /usr/bin/curl -sS "$URL")" = server ]; then pass "curl verifies the run's CA (CURL_CA_BUNDLE), its request decided and sent"
         else flunk "curl verifies the run's CA ($(grep '^\[agent\]' "$OUT/cl.log" | head -2))"; fi
     else skip "curl (not installed)"; fi
     if [ -n "$NODE" ]; then
         out=$(cl "$NODE" -e 'require("https").get(process.argv[1], r => { let b = ""; r.on("data", d => b += d); r.on("end", () => console.log("NODE", r.statusCode, b.split(";")[0])); }).on("error", e => console.log("NODE ERR", e.message))' "$URL")
-        if [ "$out" = "NODE 403 $NB" ]; then pass "Node.js verifies the run's CA (NODE_EXTRA_CA_CERTS) and gets the 403"
+        if [ "$out" = "NODE 200 server" ]; then pass "Node.js verifies the run's CA (NODE_EXTRA_CA_CERTS), its request decided and sent"
         else flunk "Node.js verifies the run's CA ($out)"; fi
     else skip "Node.js (not installed)"; fi
     JAVAC="$(dirname "$JAVA" 2>/dev/null)/javac"
@@ -756,7 +774,7 @@ public class V1261Get {
 JAVA
         "$JAVAC" --release 11 -d "$W" "$OUT/V1261Get.java" > /dev/null 2>&1 && chmod 644 "$W/V1261Get.class"
         out=$(cl "$JAVA" -Xshare:off -cp "$W" V1261Get "$URL")
-        if [ "$out" = "JAVA 403 $NB" ]; then pass "Java verifies the run's CA (the PKCS#12 store, JAVA_TOOL_OPTIONS) and gets the 403"
+        if [ "$out" = "JAVA 200 server" ]; then pass "Java verifies the run's CA (the PKCS#12 store, JAVA_TOOL_OPTIONS), its request decided and sent"
         else flunk "Java verifies the run's CA ($out)"; fi
     else skip "Java (no JDK)"; fi
 
@@ -777,6 +795,7 @@ JAVA
         ( cd "$SQ" && "$SQUID" -N -f "$SQ/squid.conf" > "$SQ/out.log" 2>&1 & )
         for _ in $(seq 100); do python3 -c "import socket; socket.create_connection(('$HOSTIP', $SP), 0.2)" 2>/dev/null && break; sleep 0.1; done
         { printf 'require warden 1.26\nproxy inspect\nproxy ports %s\nproxy upstream http://%s:%s\nallow host api.example.com:%s\n' "$P1" "$HOSTIP" "$SP" "$P1"
+          printf 'allow request GET https://api.example.com:%s/\n' "$P1"
           printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/\n' "$W"
         } > "$OUT/up.policy"
         cat > "$W/up.py" <<'PY'
@@ -794,15 +813,189 @@ PY
         chmod 644 "$W/up.py"
         env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$OUT/up.policy" --dns-server "127.0.0.1:$DPORT" --trust-bundle "$BUNDLE" -- \
             /usr/bin/python3 "$W/up.py" "$P1" > "$OUT/up.out" 2> "$OUT/up.log"
-        if grep -qx "UP HTTP/1.1 403 Forbidden" "$OUT/up.out" && grep -q "CONNECT api.example.com:$P1" "$SQ/access.log" &&
-           grep '"event":"proxy_close"' "$OUT/up.log" | grep -q '"why":"inspect_not_built".*"inspected":true,"server_cert_sha256"'
-        then pass "through a Squid upstream: the server verified inside its tunnel, the request answered 403"
+        if grep -qx "UP HTTP/1.1 200 OK" "$OUT/up.out" && grep -q "CONNECT api.example.com:$P1" "$SQ/access.log" &&
+           grep '"event":"proxy_close"' "$OUT/up.log" | grep -q '"why":"closed".*"inspected":true,"server_cert_sha256"'
+        then pass "through a Squid upstream: the server verified inside its tunnel, the request decided and sent"
         else flunk "inspecting through a Squid upstream ($(cat "$OUT/up.out"); $(tail -2 "$SQ/access.log" 2>/dev/null))"; fi
         if python3 "$HERE/tools/varek_audit.py" --policy "$OUT/up.policy" --checker "$CERT" "$OUT/up.log" > /dev/null 2>&1
         then pass "the audit accepts the upstream run"; else flunk "the audit accepts the upstream run"; fi
         pkill -9 -f "$SQ/squid.conf" 2>/dev/null
         rm -rf "$SQ"
     fi
+
+    echo "== 5. request decisions =="
+    TP=$((P1 + 10)); HP=$((P1 + 11))
+    rm -f "$OUT/echo.log"; touch "$OUT/echo.log"; chmod 666 "$OUT/echo.log"
+    python3 "$HERE/tests/v1261_echo_server.py" "$HOSTIP" "$TP" "$OUT/echo.log" "$W/good.pem" "$W/good.key" > /dev/null 2>&1 &
+    SRV="$SRV $!"
+    python3 "$HERE/tests/v1261_echo_server.py" "$HOSTIP" "$HP" "$OUT/echo.log" > /dev/null 2>&1 &
+    SRV="$SRV $!"
+    for _ in $(seq 50); do python3 -c "import socket; [socket.create_connection(('$HOSTIP', p), 0.2) for p in ($TP, $HP)]" 2>/dev/null && break; sleep 0.1; done
+    cat > "$W/req.py" <<'PY'
+import hashlib, socket, ssl, sys, time
+TP, HP = int(sys.argv[1]), int(sys.argv[2])
+H = "api.example.com"
+def conn(tls=True):
+    s = socket.create_connection((H, TP if tls else HP), 10)
+    return ssl.create_default_context().wrap_socket(s, server_hostname=H) if tls else s
+def reads(s):
+    out = b""
+    s.settimeout(15)
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d: break
+            out += d
+    except (OSError, ssl.SSLError):
+        pass
+    return out
+def answers(out):
+    """each response: its status line and body (Content-Length framed)"""
+    res = []
+    while out:
+        head, _, rest = out.partition(b"\r\n\r\n")
+        lines = head.split(b"\r\n")
+        cl = next((int(l.split(b":")[1]) for l in lines if l.lower().startswith(b"content-length:")), 0)
+        res.append(lines[0].decode() + " | " + rest[:cl].decode(errors="replace").strip())
+        out = rest[cl:]
+    return res
+def run(tag, data, tls=True, close=True):
+    s = conn(tls)
+    s.sendall(data)
+    if close and tls:
+        pass
+    for a in answers(reads(s)):
+        print(tag, a, flush=True)
+def get(path, host=H, extra=b""):
+    return b"GET %s HTTP/1.1\r\nHost: %s\r\n%s\r\n" % (path.encode(), host.encode(), extra)
+def post(path, body, chunked=False, method="POST"):
+    if chunked:
+        b = b"".join(b"%x\r\n%s\r\n" % (len(body[i:i + 700]), body[i:i + 700]) for i in range(0, len(body), 700)) + b"0\r\n\r\n"
+        return b"%s %s HTTP/1.1\r\nHost: %s\r\nTransfer-Encoding: chunked\r\n\r\n%s" % (method.encode(), path.encode(), H.encode(), b)
+    return b"%s %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\n\r\n%s" % (method.encode(), path.encode(), H.encode(), len(body), body)
+# one kept-alive connection: two allowed, one a rule denies, one after it
+s = conn()
+for req in (get("/v1/models"), get("/v1/files?limit=5"), get("/v1/admin/users/1", extra=b"X-Method: DELETE\r\n"), get("/v1/models")):
+    s.sendall(req)
+    time.sleep(0.3)
+for a in answers(reads(s)):
+    print("KEEP", a, flush=True)
+run("PIPE", get("/v1/models") + get("/v1/models") + get("/other"))
+run("NORULE", get("/other"))
+run("QUERY", get("/v1/models?x=1"))
+run("FRONT", get("/v1/models") + get("/v1/models", host="other.example.com"))
+body = bytes(range(256)) * 2                                   # 512 bytes
+print("SHA512", hashlib.sha256(body).hexdigest(), flush=True)
+run("UPLOAD", post("/v1/upload", body))
+run("OVER", post("/v1/upload", b"x" * 2000))
+big = b"y" * 3000
+run("CUT", post("/v1/upload", big, chunked=True))
+data = b"z" * 5000
+print("SHA5000", hashlib.sha256(data).hexdigest(), flush=True)
+run("CHUNKED", post("/v1/data", data, chunked=True, method="PUT"))
+run("PLAIN", get("/plain"), tls=False)
+run("PLAINNO", get("/other"), tls=False)
+PY
+    chmod 644 "$W/req.py"
+    POL5="$OUT/req.policy"
+    { printf 'require warden 1.26\nproxy inspect\nproxy ports %s %s\nallow host api.example.com\n' "$TP" "$HP"
+      printf 'allow request POST https://api.example.com:%s/v1/upload max_body=1k\n' "$TP"   # line 5
+      printf 'allow request GET https://api.example.com:%s/v1/models\n' "$TP"                # 6
+      printf 'allow request GET https://api.example.com:%s/v1/files?limit=*\n' "$TP"         # 7
+      printf 'deny request * https://api.example.com:%s/v1/admin/**\n' "$TP"                 # 8
+      printf 'allow request * https://api.example.com:%s/v1/**\n' "$TP"                     # 9
+      printf 'allow request GET http://api.example.com:%s/plain\n' "$HP"                     # 10
+      printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/\n' "$W"
+    } > "$POL5"
+    env -i PATH=/usr/bin:/bin timeout 180 "$WARDEN" "$POL5" --dns-server "127.0.0.1:$DPORT" --trust-bundle "$BUNDLE" -- \
+        /usr/bin/python3 "$W/req.py" "$TP" "$HP" > "$OUT/r.out" 2> "$OUT/r.log"
+    sed 's/^/     /' "$OUT/r.out"
+    sed 's/^/     server /' "$OUT/echo.log"
+    rhave() { grep -qxF -- "$1" "$OUT/r.out"; }
+    ehave() { grep -qxF -- "$1" "$OUT/echo.log"; }
+    E0=$(printf '' | sha256sum | cut -d' ' -f1)
+    nreq() { python3 - "$OUT/r.log" "$1" "$2" "$3" <<'PY'
+import json, sys
+for l in open(sys.argv[1]):
+    if l.startswith("{"):
+        r = json.loads(l)
+        if r.get("action") == "net.request" and r.get("target") == sys.argv[2] and r.get("rule") == sys.argv[3] and \
+                (sys.argv[4] == "-" or str(r.get("policy_line")) == sys.argv[4]) and \
+                (r.get("decision_final") != "ALLOW" or r.get("check") == "ok"):
+            print("yes"); break
+PY
+    }
+    U="https://api.example.com:$TP"
+    if rhave "KEEP HTTP/1.1 200 OK | ok GET /v1/models 0 $E0" && rhave "KEEP HTTP/1.1 200 OK | ok GET /v1/files?limit=5 0 $E0" &&
+       rhave "KEEP HTTP/1.1 403 Forbidden | VAREK: this request was refused: the policy denies it (line 8)." &&
+       [ "$(grep -c '^KEEP' "$OUT/r.out")" = 3 ]
+    then pass "on one kept-alive connection: two requests allowed and answered, then one a deny rule refuses: 403, and nothing after"
+    else flunk "a kept-alive connection's requests"; fi
+    if [ "$(nreq "GET $U/v1/models" request_allowed 6)" = yes ] && [ "$(nreq "GET $U/v1/files?limit=5" request_allowed 7)" = yes ] &&
+       [ "$(nreq "GET $U/v1/admin/users/1" policy_match 8)" = yes ]
+    then pass "each request recorded (net.request) with its rule, the allowed ones certified"
+    else flunk "each request recorded with its rule"; fi
+    if ! grep -q "/v1/admin" "$OUT/echo.log"; then pass "the refused request never reached the server"
+    else flunk "the refused request never reached the server"; fi
+    if [ "$(grep -c '^PIPE HTTP/1.1 200 OK | ok GET /v1/models' "$OUT/r.out")" = 2 ] &&
+       rhave "PIPE HTTP/1.1 403 Forbidden | VAREK: this request was refused: no request rule allows it."
+    then pass "pipelined requests: each decided in turn; the third, which no rule allows, refused after the first two's answers"
+    else flunk "pipelined requests"; fi
+    if rhave "NORULE HTTP/1.1 403 Forbidden | VAREK: this request was refused: no request rule allows it." &&
+       [ "$(nreq "GET $U/other" default_deny_unknown -)" = yes ]
+    then pass "a request no rule allows is refused (default_deny_unknown)"
+    else flunk "a request no rule allows is refused"; fi
+    if rhave "QUERY HTTP/1.1 200 OK | ok GET /v1/models?x=1 0 $E0" && [ "$(nreq "GET $U/v1/models?x=1" request_allowed 9)" = yes ]
+    then pass "a query is matched: /v1/models?x=1 is not the exact rule's (line 6) but /v1/**'s (line 9)"
+    else flunk "a query is matched"; fi
+    if rhave "FRONT HTTP/1.1 200 OK | ok GET /v1/models 0 $E0" &&
+       rhave "FRONT HTTP/1.1 403 Forbidden | VAREK: this request was refused: a Host other than the name and port the connection is for."
+    then pass "a later request for another Host on the same connection: refused by the parser, not sent"
+    else flunk "a later request for another Host"; fi
+    S512=$(grep '^SHA512 ' "$OUT/r.out" | cut -d' ' -f2); S5000=$(grep '^SHA5000 ' "$OUT/r.out" | cut -d' ' -f2)
+    body_rec() { python3 - "$OUT/r.log" "$1" <<'PY'
+import json, sys
+recs = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+req = [r for r in recs if r.get("action") == "net.request" and r.get("target") == sys.argv[2]]
+for b in recs:
+    if b.get("event") == "request_body" and any(b["proxy_conn"] == r["proxy_conn"] and b["request_seq"] == r["request_seq"] for r in req):
+        print(b["body_len"], b["body_sha256"], b.get("exceeded_max_body", False))
+PY
+    }
+    if rhave "UPLOAD HTTP/1.1 200 OK | ok POST /v1/upload 512 $S512" && ehave "GOT POST /v1/upload 512 $S512" &&
+       [ "$(body_rec "POST $U/v1/upload" | head -1)" = "512 $S512 False" ]
+    then pass "an allowed body (512 bytes, within max_body=1k): sent, and its length and SHA-256 recorded are the server's"
+    else flunk "an allowed body's record ($(body_rec "POST $U/v1/upload"))"; fi
+    if rhave "OVER HTTP/1.1 403 Forbidden | VAREK: this request was refused: its body is over max_body=1024 (policy line 5)." &&
+       [ "$(nreq "POST $U/v1/upload" max_body 5)" = yes ] && ! ehave "GOT POST /v1/upload 2000 $(printf 'x%.0s' $(seq 2000) | sha256sum | cut -d' ' -f1)"
+    then pass "a body declared over max_body is refused before a byte is sent (max_body)"
+    else flunk "a body declared over max_body is refused"; fi
+    if ! grep -q "^CUT HTTP/1.1 200" "$OUT/r.out" && body_rec "POST $U/v1/upload" | grep -q "^1024 [0-9a-f]* True$" &&
+       grep '"event":"proxy_close"' "$OUT/r.log" | grep -q '"why":"max_body"' && ! grep -q "^GOT POST /v1/upload 3000" "$OUT/echo.log"
+    then pass "a chunked body passing max_body is cut there: recorded at 1,024 bytes, the connection ended (max_body)"
+    else flunk "a chunked body passing max_body is cut"; fi
+    if rhave "CHUNKED HTTP/1.1 200 OK | ok PUT /v1/data 5000 $S5000" &&
+       body_rec "PUT $U/v1/data" | grep -q "^5[0-9][0-9][0-9] [0-9a-f]* False$"
+    then pass "a chunked body with no max_body: sent whole, its bytes as sent recorded"
+    else flunk "a chunked body with no max_body ($(body_rec "PUT $U/v1/data"))"; fi
+    if rhave "PLAIN HTTP/1.1 200 OK | ok GET /plain 0 $E0" &&
+       rhave "PLAINNO HTTP/1.1 403 Forbidden | VAREK: this request was refused: no request rule allows it." &&
+       [ "$(nreq "GET http://api.example.com:$HP/plain" request_allowed 10)" = yes ]
+    then pass "plain HTTP: each request decided on its http:// object"
+    else flunk "plain HTTP: each request decided"; fi
+    if python3 "$HERE/tools/varek_audit.py" --policy "$POL5" --checker "$CERT" "$OUT/r.log" > "$OUT/au5.out" 2>&1
+    then pass "the audit accepts the run ($(grep -o '[0-9]* inspected requests' "$OUT/au5.out"))"
+    else flunk "the audit accepts the run ($(grep -m3 'PROBLEM' "$OUT/au5.out"))"; fi
+    POL="$POL5"
+    forge "$OUT/r.log" "$OUT/q1.log" "\"target\":\"GET $U/v1/files?limit=5\",\"resolved\":\"GET $U/v1/files?limit=5\"" \
+                                     "\"target\":\"GET $U/v1/admin/x\",\"resolved\":\"GET $U/v1/admin/x\""
+    refuses "an allowed request whose object the policy denies (its certificate fails)" "$OUT/q1.log" "refused"
+    forge "$OUT/r.log" "$OUT/q2.log" '"body_len":512,' '"body_len":1500,'
+    refuses "a body over its rule's max_body recorded as sent" "$OUT/q2.log" "over its rule's max_body"
+    forge "$OUT/r.log" "$OUT/q3.log" '"body":"length","body_declared":512,"max_body":1024,' '"body":"length","body_declared":512,'
+    refuses "an allowed request without its rule's max_body" "$OUT/q3.log" "max_body is not its rule's"
+    forge "$OUT/r.log" "$OUT/q4.log" '"request_seq":2,' '"request_seq":3,'
+    refuses "requests out of order" "$OUT/q4.log" "out of order"
     for pid in $SRV; do kill "$pid" 2>/dev/null; done
     rm -rf "$W"
 fi

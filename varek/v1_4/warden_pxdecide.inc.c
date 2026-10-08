@@ -83,11 +83,25 @@ static void px_handed_off(uint64_t id, unsigned port) {
 
 /* Step 7: the connections passed to the proxy and not yet closed, and when
  * each was passed (monotonic ms). */
-struct px_open { uint64_t id; int64_t at; bool inspect; };
+struct px_open {
+    uint64_t id;
+    int64_t  at;
+    bool     inspect;
+    /* v1.26.1, step 6: an inspected connection's requests */
+    char     scheme[6];                  /* https, or http (plain HTTP) */
+    char     name[WR_NAME_MAX + 1];
+    unsigned port;
+    uint64_t next_seq;                   /* the next request's seq (from 1) */
+    uint64_t body_seq;                   /* an allowed request whose body is still to be reported (0: none) */
+    uint64_t max_body;                   /* its rule's max_body (0: none) */
+    bool     refused;                    /* a request was refused: no more come */
+    bool     allowed;                    /* some request was allowed (so bytes may pass) */
+    bool     cut;                        /* a body passed max_body */
+};
 static struct px_open *g_px_open;
 static size_t g_px_nopen, g_px_capopen;
 
-static void px_open_add(uint64_t id, bool inspect) {
+static void px_open_add(uint64_t id, bool inspect, const struct px_req *q) {
     if (g_px_nopen == g_px_capopen) {
         size_t nc = g_px_capopen ? g_px_capopen * 2 : 64;
         struct px_open *o = realloc(g_px_open, nc * sizeof *o);
@@ -95,7 +109,13 @@ static void px_open_add(uint64_t id, bool inspect) {
         g_px_open = o;
         g_px_capopen = nc;
     }
-    g_px_open[g_px_nopen++] = (struct px_open){ id, wr_now_ms(), inspect };
+    struct px_open o = { .id = id, .at = wr_now_ms(), .inspect = inspect, .next_seq = 1 };
+    if (q) {
+        snprintf(o.scheme, sizeof o.scheme, "%s", q->kind == PP_KIND_HTTP ? "http" : "https");
+        snprintf(o.name, sizeof o.name, "%s", q->name);
+        o.port = q->port;
+    }
+    g_px_open[g_px_nopen++] = o;
 }
 
 /* The proxy_close record (step 7), chained like a resolution record:
@@ -142,7 +162,7 @@ static int px_closed(const struct wp_close *m) {
     static const char *const kWhy[] = { "closed", "reset", "idle", "run_end", "upstream_refused",
                                          "refused_request", "client_gone",
                                          /* v1.26.1: an inspected connection only */
-                                         "server_tls", "client_tls", "tls_timeout", "inspect_not_built" };
+                                         "server_tls", "client_tls", "tls_timeout", "max_body" };
     bool ok = false;
     size_t wk = 0;
     if (!memchr(m->why, 0, sizeof m->why) || !memchr(m->tls_why, 0, sizeof m->tls_why)) return -1;
@@ -156,7 +176,8 @@ static int px_closed(const struct wp_close *m) {
              * one's; and until requests are decided (step 6) nothing was
              * sent to an inspected connection's server */
             if ((m->inspected != 0) != g_px_open[k].inspect || (wk >= 7 && !m->inspected) ||
-                (m->inspected && m->bytes_up != 0))
+                (m->inspected && !g_px_open[k].allowed && m->bytes_up != 0) ||
+                (!strcmp(m->why, "max_body") != g_px_open[k].cut))
                 return -1;
             g_px_open[k] = g_px_open[--g_px_nopen];
             px_close_record(m->id, m->why, m);
@@ -340,7 +361,7 @@ static void px_dialed(const struct policy *p, struct px_req *q, int so_error) {
         px_record(q, DEC_ALLOW, DEC_ALLOW, "proxy_dial_failed", EIO);
     } else {
         px_record(q, DEC_ALLOW, DEC_ALLOW, "proxy_dialed", 0);
-        px_open_add(q->id, q->inspect);  /* step 7: its proxy_close follows */
+        px_open_add(q->id, q->inspect, q);  /* step 7: its proxy_close follows */
     }
     px_free(q);
 }
@@ -398,18 +419,10 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
     }
     /* v1.26.1: in inspecting mode a host that is not a passthrough host is
      * inspected: the proxy terminates its TLS (TLS, and TLS inside an
-     * answered CONNECT). Until each request is decided (step 6) it answers
-     * every request 403 and sends the server nothing. Plain HTTP has no TLS
-     * to terminate and is refused until then; relaying it as in SNI mode
-     * would let through requests the request rules refuse. Passthrough
-     * hosts are SNI mode by design. */
-    if (p->v.proxy_inspect && !px_passthrough(p, q->name)) {
-        if (q->kind == PP_KIND_HTTP) {
-            px_refuse(q, d_raw, "inspect_not_built", EACCES);
-            return;
-        }
-        q->inspect = true;
-    }
+     * answered CONNECT), or reads its plain HTTP, and each request is decided
+     * here (px_httpreq) before a byte of it is sent. Passthrough hosts are
+     * SNI mode by design. */
+    if (p->v.proxy_inspect && !px_passthrough(p, q->name)) q->inspect = true;
     int i = wr_table_find(&g_names, q->name);
     if (i >= 0 && g_names.e[i].unlisted) i = -1;         /* only a deny rule names it */
     if (p->v.proxy_up_port) {
@@ -563,12 +576,128 @@ static bool g_px_flushed = false;
 /* The proxy's reports (WP_MSG_REQUEST, WP_MSG_UNREADABLE, and, step 7,
  * WP_MSG_CLOSED and WP_MSG_FLUSHED). A report that is
  * not well formed means the proxy is not behaving: -1, and the run stops. */
+/* v1.26.1, step 6: a request of an inspected connection. Decided on its
+ * object with the decision procedure, certified by the checker, recorded
+ * (net.request), and answered. 0, or -1 (a report the proxy should not have
+ * sent: the run stops). */
+static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
+    struct px_open *o = NULL;
+    for (size_t k = 0; k < g_px_nopen; k++) if (g_px_open[k].id == m->id) o = &g_px_open[k];
+    if (!o || !o->inspect || o->refused || o->body_seq || m->seq != o->next_seq || m->body > WP_BODY_CHUNKED ||
+        !memchr(m->object, 0, sizeof m->object))
+        return -1;
+    /* the object: METHOD scheme://name:port/..., the method 1 to 20 letters,
+     * the rest the connection's, every byte printable (the proxy's parser
+     * refused the rest) */
+    const char *ob = m->object;
+    size_t ml = 0, ol = strlen(ob);
+    while (ob[ml] >= 'A' && ob[ml] <= 'Z') ml++;
+    char pre[300];
+    int pl = snprintf(pre, sizeof pre, " %s://%s:%u/", o->scheme, o->name, o->port);
+    if (ml == 0 || ml > 20 || ol > VDP_STR_MAX || pl < 0 || strncmp(ob + ml, pre, (size_t)pl)) return -1;
+    for (size_t i = ml + 1; i < ol; i++) if ((unsigned char)ob[i] < 0x21 || (unsigned char)ob[i] > 0x7e) return -1;
+    o->next_seq++;
+    struct action *a = calloc(1, sizeof *a);
+    if (!a) return -1;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    a->kind = ACT_NET_REQUEST;
+    a->policy_line = -1;
+    memcpy(a->target, ob, ol + 1);
+    memcpy(a->resolved, ob, ol + 1);
+    decision_t d_raw = policy_decide(p, a);
+    decision_t d_final = d_raw == DEC_ALLOW ? DEC_ALLOW : DEC_DENY;
+    const char *rule = d_raw == DEC_ALLOW ? "request_allowed" : decision_rule_id(a, d_raw);
+    uint64_t maxb = 0;
+    char why[96];
+    if (d_final == DEC_ALLOW && !certify(p, a)) {
+        d_final = DEC_DENY;
+        rule = "certificate_refused";
+        log_line_start();
+        fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n", g_records, a->check_why);
+    }
+    if (d_final == DEC_ALLOW) {
+        maxb = p->v.rules[a->rule_index].max_body;
+        if (maxb && m->body == WP_BODY_LENGTH && m->body_len > maxb) {
+            d_final = DEC_DENY;
+            rule = "max_body";
+        }
+    }
+    if (d_final == DEC_ALLOW) snprintf(why, sizeof why, "allowed");
+    else if (!strcmp(rule, "max_body"))
+        snprintf(why, sizeof why, "its body is over max_body=%llu (policy line %d)", (unsigned long long)maxb,
+                 a->policy_line);
+    else if (d_raw == DEC_DENY) snprintf(why, sizeof why, "the policy denies it (line %d)", a->policy_line);
+    else snprintf(why, sizeof why, "no request rule allows it");
+    static const char *const kBody[] = { "none", "length", "chunked" };
+    snprintf(a->extra, sizeof a->extra, "\"proxy_conn\":%llu,\"request_seq\":%llu,\"body\":\"%s\",",
+             (unsigned long long)m->id, (unsigned long long)m->seq, kBody[m->body]);
+    if (m->body == WP_BODY_LENGTH) {
+        size_t el = strlen(a->extra);
+        snprintf(a->extra + el, sizeof a->extra - el, "\"body_declared\":%llu,", (unsigned long long)m->body_len);
+    }
+    if (d_final == DEC_ALLOW && maxb) {
+        size_t el = strlen(a->extra);
+        snprintf(a->extra + el, sizeof a->extra - el, "\"max_body\":%llu,", (unsigned long long)maxb);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    emit_pathology(g_report_seq++, 0, a, d_raw, d_final, rule, ns_between(&t0, &t1), d_final == DEC_ALLOW ? 0 : EACCES);
+    free(a);
+    struct wp_reqverdict v;
+    memset(&v, 0, sizeof v);
+    v.type = WP_MSG_REQVERDICT;
+    v.allow = d_final == DEC_ALLOW;
+    v.id = m->id;
+    v.seq = m->seq;
+    v.max_body = d_final == DEC_ALLOW ? maxb : 0;
+    snprintf(v.why, sizeof v.why, "%s", why);
+    if (d_final == DEC_ALLOW) {
+        o->allowed = true;
+        if (m->body != WP_BODY_NONE) { o->body_seq = m->seq; o->max_body = maxb; }
+    } else o->refused = true;
+    (void)send(g_proxy.ctl, &v, sizeof v, MSG_DONTWAIT | MSG_NOSIGNAL);
+    return 0;
+}
+
+/* v1.26.1, step 6: an allowed request's body, as the proxy sent it: its
+ * length and SHA-256 (the proxy's report), chained as request_body. */
+static int px_httpbody(const struct wp_httpbody *m) {
+    struct px_open *o = NULL;
+    for (size_t k = 0; k < g_px_nopen; k++) if (g_px_open[k].id == m->id) o = &g_px_open[k];
+    if (!o || !o->body_seq || m->seq != o->body_seq || m->exceeded > 1) return -1;
+    /* passed max_body exactly when it says so (it stops at the limit) */
+    if (m->exceeded ? !o->max_body || m->len != o->max_body : o->max_body && m->len > o->max_body) return -1;
+    o->body_seq = 0;
+    if (m->exceeded) o->cut = true;
+    char hx[65];
+    sodium_bin2hex(hx, sizeof hx, m->sha256, sizeof m->sha256);
+    FILE *f = rec_begin();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(f, "{\"event\":\"request_body\",\"run\":\"%s\",\"proxy_conn\":%llu,\"request_seq\":%llu,"
+            "\"body_len\":%llu,\"body_sha256\":\"%s\",%s\"timestamp_ns\":%lld}\n", g_run_id,
+            (unsigned long long)m->id, (unsigned long long)m->seq, (unsigned long long)m->len, hx,
+            m->exceeded ? "\"exceeded_max_body\":true," : "", (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+    rec_end(NULL);
+    return 0;
+}
+
 static int proxy_service(const struct policy *p) {
     for (;;) {
-        union { struct wp_req r; struct wp_close c; struct wp_msg f; uint32_t type; } u;
+        static union { struct wp_req r; struct wp_close c; struct wp_msg f; struct wp_httpreq hr;
+                       struct wp_httpbody hb; uint32_t type; } u;
         ssize_t n = recv(g_proxy.ctl, &u, sizeof u, MSG_DONTWAIT);
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
         if (n <= 0) return -1;                                  /* the proxy is gone */
+        /* v1.26.1, step 6 */
+        if (n == (ssize_t)sizeof u.hr && u.type == WP_MSG_HTTPREQ) {
+            if (px_httpreq(p, &u.hr) < 0) return -1;
+            continue;
+        }
+        if (n == (ssize_t)sizeof u.hb && u.type == WP_MSG_HTTPBODY) {
+            if (px_httpbody(&u.hb) < 0) return -1;
+            continue;
+        }
         if (n == (ssize_t)sizeof u.c && u.type == WP_MSG_CLOSED) {
             if (px_closed(&u.c) < 0) return -1;
             continue;

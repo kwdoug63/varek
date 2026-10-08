@@ -49,7 +49,11 @@ enum { WH_READING = 0, WH_WAITING = 1, WH_RELAY = 2, WH_UPSTREAM = 3, WH_TLS = 4
 /* v1.26.1, step 4: an inspected connection's stages: the server's handshake
  * (verified), then the client's (with a leaf from the run's CA), then its
  * first request, then the answer flushed */
-enum { TS_SERVER = 0, TS_CLIENT = 1, TS_REQUEST = 2, TS_FLUSH = 3 };
+enum { TS_SERVER = 0, TS_CLIENT = 1, TS_RELAY = 2, TS_FINAL = 3 };
+/* step 6: the request gate of an inspected connection: read a request's
+ * head, wait for the Warden's verdict, pass its body as framed */
+enum { IG_HEAD = 0, IG_WAIT = 1, IG_LENGTH = 2, IG_CHUNKED = 3, IG_STOP = 4 };
+#define WP_COUT_BUF 65536        /* TLS bytes to the client, waiting for the socket */
 #define WP_RELAY_BUF   32768     /* each direction */
 #define WP_RELAY_IDLE  3600000   /* a relayed connection idle this long is closed */
 struct wp_held {
@@ -91,6 +95,20 @@ struct wp_held {
     BIO      *crb, *cwb;         /* the client's TLS bytes in, out */
     uint8_t   server_cert[32];   /* SHA-256 of the server's certificate */
     char      tls_why[96];
+    /* step 6: relaying, each request decided */
+    uint8_t  *cout;              /* TLS bytes for the client */
+    size_t    colen, cooff;
+    int       ig;                /* IG_* */
+    uint64_t  seq;               /* requests reported */
+    size_t    pend_head;         /* the request waiting for its verdict: its head's length */
+    int       pend_body;         /* its framing (WP_BODY_*) */
+    uint64_t  pend_blen;
+    uint64_t  max_body, body_n;  /* the allowed request's max_body, its body's bytes so far */
+    EVP_MD_CTX *bh;              /* their SHA-256 */
+    bool      s_shut;            /* the server was told no more (close_notify, or SHUT_WR) */
+    bool      c_sock_eof;        /* TLS: the client's socket has closed */
+    bool      cut;               /* the connection is cut (max_body): no close_notify */
+    int64_t   stop_at;           /* the gate stopped (a refusal): when */
 };
 enum { WG_OPEN = 0, WG_HEAD, WG_LENGTH, WG_CHUNKED };
 static struct wp_ann  g_ann[WP_MAX_ANNOUNCED];
@@ -124,8 +142,10 @@ static void held_drop(int k) {
         report_close(&g_held[k], g_held[k].why ? g_held[k].why : "upstream_refused");
     else if (g_held[k].state == WH_RELAY) report_close(&g_held[k], g_held[k].why ? g_held[k].why : "closed");
     else if (g_held[k].state == WH_TLS) report_close(&g_held[k], g_held[k].why ? g_held[k].why : "reset");
-    if (g_held[k].ss && SSL_is_init_finished(g_held[k].ss))
+    if (g_held[k].ss && SSL_is_init_finished(g_held[k].ss) && !g_held[k].cut && !g_held[k].s_shut)
         (void)SSL_shutdown(g_held[k].ss);            /* v1.26.1: a close_notify to the server */
+    EVP_MD_CTX_free(g_held[k].bh);
+    free(g_held[k].cout);
     SSL_free(g_held[k].ss);                          /* (the client's SSL frees its BIOs) */
     SSL_free(g_held[k].cs);
     close(g_held[k].fd);
@@ -404,7 +424,7 @@ static void ca_go(int ctl) {
 }
 
 
-/* ---- v1.26.1, step 4: terminating TLS on an inspected connection ---- */
+/* ---- v1.26.1, steps 4 and 6: an inspected connection ---- */
 
 static void tls_err(struct wp_held *h, const char *why, const char *what) {
     h->why = why;
@@ -416,44 +436,161 @@ static void tls_err(struct wp_held *h, const char *why, const char *what) {
     ERR_clear_error();
 }
 
-/* Move the client's TLS bytes: what OpenSSL wrote, out to the client; what
- * the client sent, in. -1 on an error sending; sets eof_c. */
-static int tls_client_io(struct wp_held *h, short crev) {
-    while (h->dlen < WP_RELAY_BUF && BIO_ctrl_pending(h->cwb) > 0) {
-        int n = BIO_read(h->cwb, h->down + h->dlen, (int)(WP_RELAY_BUF - h->dlen));
+/* The client's TLS bytes out: OpenSSL's output into cout, cout to the
+ * socket. -1 on an error sending. */
+static int c_flush(struct wp_held *h) {
+    if (!h->cs) return 0;
+    if (h->cooff == h->colen) h->cooff = h->colen = 0;
+    while (h->colen < WP_COUT_BUF && BIO_ctrl_pending(h->cwb) > 0) {
+        int n = BIO_read(h->cwb, h->cout + h->colen, (int)(WP_COUT_BUF - h->colen));
         if (n <= 0) break;
-        h->dlen += (size_t)n;
+        h->colen += (size_t)n;
     }
-    if (h->doff < h->dlen) {
-        ssize_t n = send(h->fd, h->down + h->doff, h->dlen - h->doff, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (h->cooff < h->colen) {
+        ssize_t n = send(h->fd, h->cout + h->cooff, h->colen - h->cooff, MSG_DONTWAIT | MSG_NOSIGNAL);
         if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return -1;
-        if (n > 0) h->doff += (size_t)n;
-        if (h->doff == h->dlen) h->doff = h->dlen = 0;
-    }
-    if (!h->eof_c && (crev & (POLLIN | POLLHUP | POLLERR))) {
-        uint8_t b[16384];
-        ssize_t n = recv(h->fd, b, sizeof b, MSG_DONTWAIT);
-        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) h->eof_c = true;
-        else if (n > 0 && BIO_write(h->crb, b, (int)n) != (int)n) return -1;
+        if (n > 0) h->cooff += (size_t)n;
     }
     return 0;
 }
 
+static bool c_pending(const struct wp_held *h) {
+    return h->cs ? h->cooff < h->colen || BIO_ctrl_pending(h->cwb) > 0 : h->doff < h->dlen;
+}
+
+/* The client's bytes in (TLS: through its memory BIO), as plaintext into buf. */
+static void c_read(struct wp_held *h, short crev) {
+    if (h->eof_c) return;
+    if (h->cs) {
+        if ((crev & (POLLIN | POLLHUP | POLLERR)) && BIO_ctrl_pending(h->crb) < 65536) {
+            uint8_t b[16384];
+            ssize_t n = recv(h->fd, b, sizeof b, MSG_DONTWAIT);
+            if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                h->c_sock_eof = true;
+                BIO_set_mem_eof_return(h->crb, 0);    /* what is buffered is still read */
+            } else if (n > 0) (void)BIO_write(h->crb, b, (int)n);
+        }
+        if (h->tstage != TS_RELAY) return;
+        while (h->len < PP_IN_MAX) {
+            ERR_clear_error();
+            int r = SSL_read(h->cs, h->buf + h->len, (int)(PP_IN_MAX - h->len));
+            if (r > 0) { h->len += (size_t)r; continue; }
+            int e = SSL_get_error(h->cs, r);
+            if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) h->eof_c = true;
+            break;
+        }
+        ERR_clear_error();
+        return;
+    }
+    if (!(crev & (POLLIN | POLLHUP | POLLERR)) || h->len >= PP_IN_MAX) return;
+    ssize_t n = recv(h->fd, h->buf + h->len, PP_IN_MAX - h->len, MSG_DONTWAIT);
+    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) h->eof_c = true;
+    else if (n > 0) h->len += (size_t)n;
+}
+
+/* The server's bytes (plaintext) to the client. -1 on an error. */
+static int c_write(struct wp_held *h) {
+    if (h->doff < h->dlen) {
+        if (h->cs) {
+            if (BIO_ctrl_pending(h->cwb) < WP_COUT_BUF) {
+                ERR_clear_error();
+                int r = SSL_write(h->cs, h->down + h->doff, (int)(h->dlen - h->doff));
+                if (r > 0) { h->doff += (size_t)r; h->bytes_down += (uint64_t)r; }
+                else {
+                    int e = SSL_get_error(h->cs, r);
+                    if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) return -1;
+                }
+            }
+        } else {
+            ssize_t n = send(h->fd, h->down + h->doff, h->dlen - h->doff, MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return -1;
+            if (n > 0) { h->doff += (size_t)n; h->bytes_down += (uint64_t)n; }
+        }
+        if (h->doff == h->dlen) h->doff = h->dlen = 0;
+    }
+    return c_flush(h);
+}
+
+/* The client's bytes the gate let through (buf[off, fwd)) to the server. */
+static int s_write(struct wp_held *h) {
+    if (h->off < h->fwd) {
+        if (h->ss) {
+            ERR_clear_error();
+            int r = SSL_write(h->ss, h->buf + h->off, (int)(h->fwd - h->off));
+            if (r > 0) { h->off += (size_t)r; h->bytes_up += (uint64_t)r; }
+            else {
+                int e = SSL_get_error(h->ss, r);
+                if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) return -1;
+            }
+        } else {
+            ssize_t n = send(h->up, h->buf + h->off, h->fwd - h->off, MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return -1;
+            if (n > 0) { h->off += (size_t)n; h->bytes_up += (uint64_t)n; }
+        }
+    }
+    if (h->off > 0 && h->off == h->fwd) {              /* sent: keep what is not yet let through */
+        memmove(h->buf, h->buf + h->off, h->len - h->off);
+        h->len -= h->off;
+        h->fwd -= h->off;
+        h->off = 0;
+    }
+    return 0;
+}
+
+/* The server's plaintext into down. */
+static void s_read(struct wp_held *h, short srev) {
+    if (h->eof_s || h->dlen >= WP_RELAY_BUF) return;
+    if (h->ss) {
+        while (h->dlen < WP_RELAY_BUF) {
+            ERR_clear_error();
+            int r = SSL_read(h->ss, h->down + h->dlen, (int)(WP_RELAY_BUF - h->dlen));
+            if (r > 0) { h->dlen += (size_t)r; continue; }
+            int e = SSL_get_error(h->ss, r);
+            if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) h->eof_s = true;
+            break;
+        }
+        ERR_clear_error();
+        return;
+    }
+    if (!(srev & (POLLIN | POLLHUP | POLLERR))) return;
+    ssize_t n = recv(h->up, h->down + h->dlen, WP_RELAY_BUF - h->dlen, MSG_DONTWAIT);
+    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) h->eof_s = true;
+    else if (n > 0) h->dlen += (size_t)n;
+}
+
+/* Tell the server no more requests are coming. */
+static void s_shut(struct wp_held *h) {
+    if (h->s_shut) return;
+    h->s_shut = true;
+    if (h->ss) (void)SSL_shutdown(h->ss);
+    else (void)shutdown(h->up, SHUT_WR);
+    ERR_clear_error();
+}
+
 /* Start an inspected connection: the Warden dialed the server (h->up, after
- * the upstream's CONNECT if there is one). The server's handshake comes
- * first, so a server that cannot be verified never meets the client. */
+ * the upstream's CONNECT if there is one). TLS: the server's handshake comes
+ * first, so a server that cannot be verified never meets the client. Plain
+ * HTTP: relaying, each request decided, from what the client sent. */
 static bool tls_begin(int k) {
     struct wp_held *h = &g_held[k];
     h->state = WH_TLS;
+    h->since = h->relay_at = mono_ms();
+    h->ig = IG_HEAD;
+    if (h->kind == PP_KIND_HTTP) {
+        h->tstage = TS_RELAY;
+        h->off = h->fwd = 0;
+        h->why = "closed";
+        return true;
+    }
     h->tstage = TS_SERVER;
     h->swant = POLLOUT;
-    h->since = h->relay_at = mono_ms();
     h->why = "server_tls";
-    if (!g_ca_made || !(h->ss = SSL_new(g_ca.sctx)) || !SSL_set_fd(h->ss, h->up) ||
-        !SSL_set_tlsext_host_name(h->ss, h->name) || !SSL_set1_host(h->ss, h->name)) {
+    if (!g_ca_made || !(h->cout = malloc(WP_COUT_BUF)) || !(h->ss = SSL_new(g_ca.sctx)) ||
+        !SSL_set_fd(h->ss, h->up) || !SSL_set_tlsext_host_name(h->ss, h->name) || !SSL_set1_host(h->ss, h->name)) {
         tls_err(h, "server_tls", "setting up TLS to the server");
         return false;
     }
+    SSL_set_mode(h->ss, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
     SSL_set_hostflags(h->ss, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
     SSL_set_connect_state(h->ss);
     return true;
@@ -469,8 +606,125 @@ static void tls_note_cert(struct wp_held *h) {
     OPENSSL_free(der);
 }
 
-#define NOT_BUILT_BODY "VAREK: this request was not sent; inspecting mode does not decide requests yet.\n"
-static char kNotBuilt[256];                       /* the 403, its length computed (tls_step) */
+/* Step 6: the gate stops at a refused request (by the request parser or the
+ * Warden). Nothing after it is sent; what was let through before it is
+ * still sent, and the server's answers to it relayed; then the client gets
+ * a 403 saying why, and the connection ends (refused_request). */
+static void gate_stop(struct wp_held *h, const char *why) {
+    if (h->ig == IG_STOP) return;
+    h->ig = IG_STOP;
+    h->len = h->fwd;
+    h->eof_c = true;
+    h->why = "refused_request";
+    h->stop_at = mono_ms();
+    snprintf(h->tls_why, sizeof h->tls_why, "%s", why);
+}
+
+static void report_httpreq(const struct wp_held *h, const pp_req_t *q) {
+    static struct wp_httpreq m;
+    memset(&m, 0, sizeof m);
+    m.type = WP_MSG_HTTPREQ;
+    m.id = h->id;
+    m.seq = h->seq;
+    m.body = q->body == PP_BODY_LENGTH ? WP_BODY_LENGTH : q->body == PP_BODY_CHUNKED ? WP_BODY_CHUNKED : WP_BODY_NONE;
+    m.body_len = q->body_len;
+    memcpy(m.object, q->object, q->object_len + 1);
+    (void)send(g_ctl, &m, sizeof m, MSG_NOSIGNAL);     /* blocking, as every report */
+}
+
+static void report_body(struct wp_held *h, bool exceeded) {
+    struct wp_httpbody m;
+    memset(&m, 0, sizeof m);
+    m.type = WP_MSG_HTTPBODY;
+    m.exceeded = exceeded;
+    m.id = h->id;
+    m.seq = h->seq;
+    m.len = h->body_n;
+    unsigned int ml = 0;
+    if (h->bh) (void)EVP_DigestFinal_ex(h->bh, m.sha256, &ml);
+    EVP_MD_CTX_free(h->bh);
+    h->bh = NULL;
+    (void)send(g_ctl, &m, sizeof m, MSG_NOSIGNAL);
+}
+
+/* Step 6: the Warden's verdict on the request waiting. */
+static void gate_verdict(struct wp_held *h, const struct wp_reqverdict *v) {
+    if (h->ig != IG_WAIT || v->seq != h->seq) return;       /* not the one waiting: ignored */
+    if (!v->allow) {
+        gate_stop(h, memchr(v->why, 0, sizeof v->why) && v->why[0] ? v->why : "refused by the policy");
+        return;
+    }
+    h->fwd += h->pend_head;
+    h->max_body = v->max_body;
+    h->body_n = 0;
+    h->ig = h->pend_body == WP_BODY_LENGTH && h->pend_blen ? IG_LENGTH :
+            h->pend_body == WP_BODY_CHUNKED ? IG_CHUNKED : IG_HEAD;
+    h->body_left = h->pend_blen;
+    memset(&h->ck, 0, sizeof h->ck);
+    if (h->pend_body != WP_BODY_NONE) {
+        h->bh = EVP_MD_CTX_new();
+        if (!h->bh || !EVP_DigestInit_ex(h->bh, EVP_sha256(), NULL)) { gate_stop(h, "the proxy is out of memory"); return; }
+        if (h->ig == IG_HEAD) report_body(h, false);          /* Content-Length: 0 */
+    }
+}
+
+/* Body bytes [fwd, fwd + take) are let through: hashed and counted. False if
+ * they pass max_body (then only what fits is let through). */
+static bool body_take(struct wp_held *h, size_t take) {
+    bool over = h->max_body && h->body_n + take > h->max_body;
+    if (over) take = (size_t)(h->max_body - h->body_n);
+    if (take && h->bh) (void)EVP_DigestUpdate(h->bh, h->buf + h->fwd, take);
+    h->body_n += take;
+    h->fwd += take;
+    return !over;
+}
+
+/* Let through what the gate allows of buf[fwd, len). */
+static void gate_run(struct wp_held *h) {
+    while (h->fwd < h->len && h->ig != IG_STOP && !h->cut) {
+        if (h->ig == IG_WAIT) break;
+        if (h->ig == IG_HEAD) {
+            pp_req_t q;
+            pp_status_t st = pp_request(h->buf + h->fwd, h->len - h->fwd, h->cs || h->ss ? "https" : "http",
+                                        h->name, h->rport, &q);
+            if (st == PP_MORE) {
+                if (h->len - h->fwd >= PP_HTTP_MAX) gate_stop(h, "HTTP headers over 8 KB");
+                break;
+            }
+            if (st == PP_REFUSE) { gate_stop(h, q.why); break; }
+            h->seq++;
+            h->pend_head = q.head_len;
+            h->pend_body = q.body == PP_BODY_LENGTH ? WP_BODY_LENGTH : q.body == PP_BODY_CHUNKED ? WP_BODY_CHUNKED : WP_BODY_NONE;
+            h->pend_blen = q.body_len;
+            h->ig = IG_WAIT;
+            h->since = mono_ms();
+            report_httpreq(h, &q);
+            break;
+        }
+        if (h->ig == IG_LENGTH) {
+            uint64_t take = h->len - h->fwd < h->body_left ? h->len - h->fwd : h->body_left;
+            size_t before = h->fwd;
+            if (!body_take(h, (size_t)take)) { h->cut = true; break; }
+            h->body_left -= h->fwd - before;
+            if (!h->body_left) { report_body(h, false); h->ig = IG_HEAD; }
+        } else {                                       /* IG_CHUNKED */
+            bool done;
+            long c = pp_chunked_feed(&h->ck, h->buf + h->fwd, h->len - h->fwd, &done);
+            if (c < 0) { gate_stop(h, "a malformed chunked body"); break; }
+            if (!body_take(h, (size_t)c)) { h->cut = true; break; }
+            if (done) { report_body(h, false); h->ig = IG_HEAD; }
+        }
+    }
+    if (h->cut && h->ig != IG_STOP) {                  /* max_body: the connection is cut */
+        report_body(h, true);
+        h->ig = IG_STOP;
+        h->why = "max_body";
+        snprintf(h->tls_why, sizeof h->tls_why, "the body passed max_body=%llu", (unsigned long long)h->max_body);
+    }
+}
+
+static char kRefused[512];
+static bool g_moved;                               /* the last pass moved something (main loop) */
 
 /* One pass over inspected connection k. False when it is done (h->why says
  * why; held_drop reports it). */
@@ -518,6 +772,7 @@ static bool tls_step(int k, short crev, short srev) {
             return false;
         }
         SSL_set_bio(h->cs, h->crb, h->cwb);
+        SSL_set_mode(h->cs, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
         if (!SSL_use_certificate(h->cs, leaf) || !SSL_use_PrivateKey(h->cs, g_ca.leaf_key) ||
             BIO_write(h->crb, h->buf + h->skip, (int)(h->len - h->skip)) != (int)(h->len - h->skip)) {
             tls_err(h, "client_tls", "setting up TLS to the client");
@@ -527,67 +782,69 @@ static bool tls_step(int k, short crev, short srev) {
         h->len = h->skip = h->off = h->fwd = 0;      /* buf now holds the client's plaintext */
         h->tstage = TS_CLIENT;
         h->since = mono_ms();
-        crev |= POLLOUT;                              /* run the client's stage now */
     }
-    if (tls_client_io(h, crev) < 0) { h->why = "reset"; return false; }
+    c_read(h, crev);
     if (h->tstage == TS_CLIENT) {
         ERR_clear_error();
         int r = SSL_do_handshake(h->cs);
         if (r == 1) {
-            h->tstage = TS_REQUEST;
+            h->tstage = TS_RELAY;
             h->since = mono_ms();
+            h->why = "closed";
+            c_read(h, 0);                             /* a request sent with the handshake */
         } else {
             int e = SSL_get_error(h->cs, r);
             if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) {
                 tls_err(h, "client_tls", "handshake");
-                (void)tls_client_io(h, 0);            /* its alert */
+                (void)c_flush(h);                     /* its alert */
                 return false;
             }
-            if (h->eof_c) {
+            if (c_flush(h) < 0) { h->why = "reset"; return false; }
+            if (h->c_sock_eof && !BIO_ctrl_pending(h->crb)) {
                 h->why = "client_tls";
                 snprintf(h->tls_why, sizeof h->tls_why, "the client closed during the handshake");
                 return false;
             }
+            return true;
         }
     }
-    if (h->tstage == TS_REQUEST) {
-        /* step 4: the first request's head is read, then answered 403 (step
-         * 6 decides each request instead); nothing reaches the server */
-        for (;;) {
-            ERR_clear_error();
-            int r = SSL_read(h->cs, h->buf + h->len, (int)(PP_HTTP_MAX - h->len));
-            if (r > 0) { h->len += (size_t)r; if (h->len < PP_HTTP_MAX) continue; }
-            break;
-        }
-        /* step 5: read with the request parser; one it refuses is answered
-         * 403 with the reason, and recorded refused_request */
-        pp_req_t q;
-        pp_status_t st = pp_request(h->buf, h->len, "https", h->name, h->rport, &q);
-        if (st == PP_MORE && !h->eof_c) return true;
-        if (st == PP_OK) {
-            h->why = "inspect_not_built";
-            if (!kNotBuilt[0])
-                snprintf(kNotBuilt, sizeof kNotBuilt, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n"
-                         "Content-Length: %zu\r\nConnection: close\r\n\r\n%s", sizeof NOT_BUILT_BODY - 1,
-                         NOT_BUILT_BODY);
-            (void)SSL_write(h->cs, kNotBuilt, (int)strlen(kNotBuilt));
+    if (h->tstage == TS_RELAY) {
+        int64_t was = (int64_t)(h->bytes_up + h->bytes_down);
+        if (h->ig != IG_STOP && !h->cut) gate_run(h);
+        if (h->cut) return false;                     /* max_body: cut, reported */
+        if (s_write(h) < 0) { h->why = "reset"; return false; }
+        s_read(h, srev);
+        if (c_write(h) < 0) { h->why = "reset"; return false; }
+        if ((int64_t)(h->bytes_up + h->bytes_down) != was) h->since = mono_ms();
+        /* the client is done (closed, or stopped at a refusal) and all it may
+         * send is sent: the server is told; when the server is done and what
+         * it sent is passed on, the client is told */
+        bool c_done = h->eof_c && h->off == h->fwd && (h->ig == IG_HEAD || h->ig == IG_STOP);
+        if (c_done) s_shut(h);
+        bool stop_wait = h->ig == IG_STOP && mono_ms() - h->stop_at > WP_READ_MS;   /* the server lingers */
+        if ((h->eof_s || stop_wait) && h->dlen == h->doff) {
+            if (h->ig == IG_STOP && !strcmp(h->why, "refused_request")) {
+                char body[200];
+                int bl = snprintf(body, sizeof body, "VAREK: this request was refused: %s.\n", h->tls_why);
+                snprintf(kRefused, sizeof kRefused, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n"
+                         "Content-Length: %d\r\nConnection: close\r\n\r\n%s", bl, body);
+                if (h->cs) (void)SSL_write(h->cs, kRefused, (int)strlen(kRefused));
+                else (void)send(h->fd, kRefused, strlen(kRefused), MSG_DONTWAIT | MSG_NOSIGNAL);
+            }
+            if (h->cs) (void)SSL_shutdown(h->cs);
+            else (void)shutdown(h->fd, SHUT_WR);
+            h->tstage = TS_FINAL;
+        } else if (h->ig == IG_WAIT && mono_ms() - h->since > WP_VERDICT_MS) {
+            gate_stop(h, "no verdict from the Warden");
         } else {
-            const char *w = st == PP_MORE ? "the client closed before a whole request" : q.why;
-            char ans[400];
-            int bl = snprintf(ans + 200, 200, "VAREK: this request was refused: %s.\n", w);
-            int al = snprintf(ans, 200, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
-                              "Connection: close\r\n\r\n", bl);
-            memmove(ans + al, ans + 200, (size_t)bl + 1);
-            h->why = "refused_request";
-            snprintf(h->tls_why, sizeof h->tls_why, "%s", w);
-            (void)SSL_write(h->cs, ans, (int)strlen(ans));
+            if (mono_ms() - h->since > WP_RELAY_IDLE) { h->why = "idle"; return false; }
+            return true;
         }
-        (void)SSL_shutdown(h->cs);
-        h->tstage = TS_FLUSH;
-        if (tls_client_io(h, 0) < 0) return false;
     }
-    if (h->tstage == TS_FLUSH)
-        return BIO_ctrl_pending(h->cwb) > 0 || h->doff < h->dlen;
+    if (h->tstage == TS_FINAL) {
+        if (c_flush(h) < 0) return false;
+        return h->cs ? (h->cooff < h->colen || BIO_ctrl_pending(h->cwb) > 0) : false;
+    }
     return true;
 }
 
@@ -595,7 +852,7 @@ static bool tls_step(int k, short crev, short srev) {
 static int wp_drain_ctl(int ctl) {
     for (;;) {
         union { struct wp_conn c; struct wp_verdict v; struct wp_verdict_up u; struct wp_inspect in;
-                struct wp_ca_name cn; uint32_t type; } m;
+                struct wp_ca_name cn; struct wp_reqverdict rv; uint32_t type; } m;
         union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
         struct iovec iv = { &m, sizeof m };
         struct msghdr mh = { .msg_iov = &iv, .msg_iovlen = 1, .msg_control = cb.b, .msg_controllen = sizeof cb.b };
@@ -654,6 +911,15 @@ static int wp_drain_ctl(int ctl) {
             continue;
         }
         if (fd >= 0) close(fd);
+        /* v1.26.1, step 6: the verdict on an inspected request */
+        if (n == (ssize_t)sizeof m.rv && m.type == WP_MSG_REQVERDICT) {
+            int k = held_find(m.rv.id);
+            if (k >= 0 && g_held[k].state == WH_TLS && g_held[k].tstage == TS_RELAY) {
+                gate_verdict(&g_held[k], &m.rv);
+                g_moved = true;
+            }
+            continue;
+        }
         /* v1.26.1: inspecting mode's setup (once, before the agent runs) */
         if (n == (ssize_t)sizeof m.in && m.type == WP_MSG_INSPECT && !g_inspect) {
             if (!memchr(m.in.run_id, 0, sizeof m.in.run_id) || !memchr(m.in.bundle, 0, sizeof m.in.bundle) ||
@@ -825,8 +1091,12 @@ int wp_helper_main(int ctl) {
             if (h->state == WH_TLS) {                   /* v1.26.1 */
                 if (h->tstage == TS_SERVER) se = h->swant;
                 else {
-                    if (!h->eof_c && h->tstage != TS_FLUSH) ce |= POLLIN;
-                    if (h->doff < h->dlen || BIO_ctrl_pending(h->cwb) > 0) ce |= POLLOUT;
+                    if (!h->eof_c && h->tstage != TS_FINAL && h->len < PP_IN_MAX) ce |= POLLIN;
+                    if (c_pending(h)) ce |= POLLOUT;
+                    if (h->tstage == TS_RELAY) {
+                        if (!h->eof_s && h->dlen < WP_RELAY_BUF) se |= POLLIN;
+                        if (h->off < h->fwd) se |= POLLOUT;
+                    }
                 }
             }
             pfc[k] = h->fd;
@@ -839,10 +1109,14 @@ int wp_helper_main(int ctl) {
             pf[3 + 2 * k] = (struct pollfd){ .fd = relay && !se ? -1 : pfs[k], .events = se };
         }
         pf[1].fd = mono_ms() < listen_pause ? -1 : ls;
-        if (poll(pf, (nfds_t)(2 + 2 * nh), 1000) < 0) {
+        /* v1.26.1: a pass that moved something on an inspected connection
+         * comes round again at once (TLS keeps bytes of its own, which no
+         * socket event announces) */
+        if (poll(pf, (nfds_t)(2 + 2 * nh), g_moved ? 0 : 1000) < 0) {
             if (errno == EINTR) continue;
             return 1;
         }
+        g_moved = false;
         if (pf[0].revents && wp_drain_ctl(ctl) < 0) return 0;      /* the Warden went */
         /* Held connections first (by fd: a verdict above may have dropped
          * some, moving others), then new ones. */
@@ -866,11 +1140,16 @@ int wp_helper_main(int ctl) {
             }
             if (h->state == WH_TLS) {                       /* v1.26.1 */
                 if (pfs[j] != h->up) { srev = h->swant; crev = 0; }   /* began just now */
+                uint64_t mark = h->bytes_up + h->bytes_down + h->len + h->fwd + (uint64_t)h->tstage +
+                                (uint64_t)h->ig + h->seq;
                 bool ok = tls_step(k, crev, srev);
-                if (ok && now - h->since > WP_READ_MS) {
-                    h->why = "tls_timeout";
+                if (ok && h->tstage <= TS_CLIENT && now - h->since > WP_READ_MS) {
+                    h->why = "tls_timeout";              /* a handshake: 10 s */
                     ok = false;
                 }
+                if (ok && h->bytes_up + h->bytes_down + h->len + h->fwd + (uint64_t)h->tstage +
+                          (uint64_t)h->ig + h->seq != mark)
+                    g_moved = true;
                 if (!ok) held_drop(k);
                 continue;
             }

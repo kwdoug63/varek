@@ -37,7 +37,41 @@
 enum { WP_MSG_READY = 1, WP_MSG_CONN = 2, WP_MSG_REQUEST = 3, WP_MSG_UNREADABLE = 4, WP_MSG_VERDICT = 5,
        WP_MSG_CLOSED = 6, WP_MSG_FLUSH = 7, WP_MSG_FLUSHED = 8, WP_MSG_VERDICT_UP = 9,
        /* v1.26.1, inspecting mode */
-       WP_MSG_INSPECT = 10, WP_MSG_CA_NAME = 11, WP_MSG_CA_GO = 12, WP_MSG_BLOB = 13, WP_MSG_CA_DONE = 14 };
+       WP_MSG_INSPECT = 10, WP_MSG_CA_NAME = 11, WP_MSG_CA_GO = 12, WP_MSG_BLOB = 13, WP_MSG_CA_DONE = 14,
+       WP_MSG_HTTPREQ = 15, WP_MSG_REQVERDICT = 16, WP_MSG_HTTPBODY = 17 };
+
+/* v1.26.1, step 6: each request of an inspected connection is decided
+ * before a byte of it is sent. Proxy -> Warden: WP_MSG_HTTPREQ, the request's
+ * object (pp_request) and its body's framing, seq 1, 2, ... on the
+ * connection. Warden -> proxy: WP_MSG_REQVERDICT for it. Proxy -> Warden,
+ * after an allowed request's body (if it has one): WP_MSG_HTTPBODY, its
+ * length and SHA-256, or that it passed max_body (then the connection is
+ * cut). After a refusal the connection sends no more requests. */
+enum { WP_BODY_NONE = 0, WP_BODY_LENGTH = 1, WP_BODY_CHUNKED = 2 };
+struct wp_httpreq {
+    uint32_t type;               /* WP_MSG_HTTPREQ */
+    uint32_t body;               /* WP_BODY_* */
+    uint64_t id;
+    uint64_t seq;
+    uint64_t body_len;           /* WP_BODY_LENGTH: the Content-Length */
+    char     object[4096];       /* "METHOD scheme://name:port/path?query", NUL-terminated */
+};
+struct wp_reqverdict {
+    uint32_t type;               /* WP_MSG_REQVERDICT */
+    uint32_t allow;
+    uint64_t id;
+    uint64_t seq;
+    uint64_t max_body;           /* the allowing rule's max_body= (0: none) */
+    char     why[96];            /* a refusal: why, for the client's 403 (NUL-terminated) */
+};
+struct wp_httpbody {
+    uint32_t type;               /* WP_MSG_HTTPBODY */
+    uint32_t exceeded;           /* the body passed max_body: the connection was cut */
+    uint64_t id;
+    uint64_t seq;
+    uint64_t len;                /* bytes of the body as sent (a chunked body's framing included) */
+    uint8_t  sha256[32];         /* of those bytes (exceeded: of those sent) */
+};
 
 struct wp_msg {                  /* proxy -> Warden: WP_MSG_READY */
     uint32_t type;
@@ -188,11 +222,10 @@ int wp_announce(const wp_t *w, uint64_t id, unsigned from_port, pid_t tid, const
 
 /* Step 5: tell the proxy the verdict on connection id. Never blocks. 0 or -1. */
 int wp_verdict(const wp_t *w, uint64_t id, bool allow);
-/* v1.26.1, step 4: why a close report may give for an inspected connection,
- * beyond the others: the server's certificate or handshake failed
- * (server_tls), the client's handshake failed (client_tls), a handshake or
- * the first request took over WP_READ_MS (tls_timeout), or the request was
- * answered 403 because requests are not decided yet (inspect_not_built). */
+/* v1.26.1: why a close report may give for an inspected connection, beyond
+ * the others: the server's certificate or handshake failed (server_tls), the
+ * client's handshake failed (client_tls), a handshake took over WP_READ_MS
+ * (tls_timeout), or a body passed its rule's max_body (max_body: cut). */
 
 /* v1.26.1: inspecting mode's setup, before the agent starts (see struct
  * wp_inspect): send the run id, the trust bundle's path and the names, and

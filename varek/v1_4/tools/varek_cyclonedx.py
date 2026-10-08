@@ -244,6 +244,10 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             if event == "proxy_close" and run is not None and rec.get("run") == run \
                     and meta is not None:
                 meta.setdefault("proxy_closes", []).append((len(records), rec))
+            # v1.26.1 (step 6): an inspected request's body (its length and SHA-256)
+            if event == "request_body" and run is not None and rec.get("run") == run \
+                    and meta is not None:
+                meta.setdefault("request_bodies", []).append((len(records), rec))
             if event in ("resolution", "dns_question", "synthetic_address") and run is not None \
                     and rec.get("run") == run and meta is not None:
                 meta.setdefault("dns_events", []).append(rec)
