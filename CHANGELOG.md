@@ -9,15 +9,20 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.24.0] - 2026-10-07 — Host names without agent DNS
+
+A policy can name hosts; the Warden resolves them itself and the agent sends
+no DNS. See `RELEASE-v1.24.0.md`. The Warden reports version 1.24.0.
+
 ### Added
-- v1.24.0, in progress (host names without agent DNS,
-  `docs/security/v1.21-stage2-host-names.md`), sections 1 and 2:
+- Host names without agent DNS
+  (`docs/security/v1.21-stage2-host-names.md`):
   - Policy grammar: `allow host api.example.com[:port]` and `deny host <name>`
     after `require warden 1.24`, in the decision procedure, the certificate
     checker and the cross-check oracle; malformed names, wildcards (v1.25) and
     a `require warden 1.24` after a host name are refused at load. Without the
     directive a name keeps its v1.21 meaning. The policy-grammar version is
-    1.24. No connect matches a name rule yet (section 4).
+    1.24.
   - The resolution table (`warden_resolve.c`): the Warden resolves every
     allowed name before the agent runs and refreshes each at its TTL (clamped,
     `--dns-ttl-min` / `--dns-ttl-max`) in a resolver helper process, keeps a
@@ -80,8 +85,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     Fixed, and `make test-v1240` recreates the failure. The second 24-hour
     run passed: 4,320 of 4,320 fetches, 0 refused connects, 2,034 answer
     changes for `aws.amazon.com`, and the audit PASS on 114,279 records.
-  - `RELEASE-v1.24.0.md`: draft release notes, with the soak results, the
-    latency figures and the review findings.
+  - `RELEASE-v1.24.0.md`: the release notes, with the soak results, the
+    latency figures and the review findings. A 3-minute trial on the
+    released Warden passed.
 - `docs/security/v1.27-program-launches.md`: the design for decided program
   launches (a Landlock execute ruleset built from the policy's `allow exec`
   rules, the Warden deciding and recording each launch, an identity check
