@@ -14,7 +14,7 @@ import pytest
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # varek/v1_4
 VAREK = os.path.join(HERE, "tools", "varek")
 BUILT = all(os.access(os.path.join(HERE, b), os.X_OK)
-            for b in ("warden", "tools/vdp_check", "tools/vdp_cert_check", "tools/varek_keygen"))
+            for b in ("warden", "warden-proxy", "tools/vdp_check", "tools/vdp_cert_check", "tools/varek_keygen"))
 ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
 needs_runtime = pytest.mark.skipif(not (BUILT and ROOT and sys.platform.startswith("linux")),
                                    reason="needs Linux, root and a built runtime")

@@ -12,8 +12,15 @@
 #      (a query only where a rule names one, '?' never a wildcard); a request
 #      rule no connection can reach reported; `varek policy show`; and the
 #      Warden refusing to run inspecting mode until it is built
+#   2. warden-proxy, the proxy's own program (as root): it will not run by
+#      hand; it links neither libseccomp nor libsodium; the Warden runs it
+#      from a sealed in-memory copy whose SHA-256 run_start records (the
+#      file's own), so replacing the file mid-run changes nothing that runs;
+#      the Warden refuses a proxy binary that is missing, writable by others,
+#      or not a program, and the audit refuses run_start without the hash
 #
 # Usage: test_v1261.sh <vdp_check> <vdp_cert_check> [<warden>]
+# (section 2 uses warden-proxy beside the warden binary: make warden-proxy)
 set -u
 
 VDP="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
@@ -179,6 +186,96 @@ if [ -n "$WARDEN" ]; then
     then pass "the Warden warns about a request rule no host rule reaches"
     else flunk "the Warden warns about a request rule no host rule reaches"; fi
 else skip "the Warden's startup check (no warden binary given)"; skip "the Warden's warning"; fi
+
+echo "== 2. warden-proxy =="
+WP="$(dirname "${WARDEN:-/nonexistent/x}")/warden-proxy"
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ] || [ ! -x "$WP" ]; then
+    skip "warden-proxy (needs root, the warden binary and warden-proxy beside it)"
+else
+    "$WP" > "$OUT/hand.out" 2>&1; rc=$?
+    if [ "$rc" = 2 ] && grep -q "not run by hand" "$OUT/hand.out"; then pass "warden-proxy will not run by hand"
+    else flunk "warden-proxy will not run by hand (rc=$rc)"; fi
+    "$WP" 65532:65532 > "$OUT/hand2.out" 2>&1 3>&-; rc=$?
+    if [ "$rc" = 2 ]; then pass "nor without the Warden's control socket"; else flunk "nor without the Warden's control socket (rc=$rc)"; fi
+    if ldd "$WP" 2>/dev/null | grep -qE 'libseccomp|libsodium'; then flunk "warden-proxy links neither libseccomp nor libsodium"
+    else pass "warden-proxy links neither libseccomp nor libsodium"; fi
+    if grep -qa -- "--proxy-helper" "$WARDEN"; then flunk "the Warden no longer has a --proxy-helper mode"
+    else pass "the Warden no longer has a --proxy-helper mode"; fi
+
+    W=/tmp/varek_v1261w.$$
+    rm -rf "$W"; mkdir -p "$W"; chmod 755 "$W"
+    POL="$OUT/proxy.policy"
+    printf 'require warden 1.26\nproxy on\nallow host api.example.com:443\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\n' > "$POL"
+    proxy_pid() { grep -o '"proxy":{[^}]*"pid":[0-9]*' "$1" 2>/dev/null | grep -o '[0-9]*$' | head -1; }
+    # a copy of the proxy binary the test can replace mid-run
+    cp "$WP" "$W/warden-proxy"; chmod 755 "$W/warden-proxy"
+    SHA=$(sha256sum "$W/warden-proxy" | cut -d' ' -f1)
+    env -i PATH=/usr/bin:/bin "$WARDEN" "$POL" --proxy-bin "$W/warden-proxy" -- /bin/sleep 3 > /dev/null 2> "$OUT/a.log" &
+    WPID=$!
+    for _ in $(seq 50); do grep -q '"proxy":{' "$OUT/a.log" 2>/dev/null && break; sleep 0.1; done
+    PP=$(proxy_pid "$OUT/a.log")
+    if grep -q "\"proxy_binary_sha256\":\"$SHA\"" "$OUT/a.log"; then pass "run_start records the proxy binary's SHA-256 (the file's own)"
+    else flunk "run_start records the proxy binary's SHA-256 ($(grep -o '"proxy_binary_sha256":"[^"]*"' "$OUT/a.log"))"; fi
+    exe=$(readlink "/proc/$PP/exe" 2>/dev/null)
+    case "$exe" in "/memfd:warden-proxy"*) pass "the proxy runs from the sealed copy ($exe)";;
+                   *) flunk "the proxy runs from the sealed copy ($exe)";; esac
+    if [ -n "$PP" ] && [ "$(ls /proc/$PP/fd | wc -l)" = 6 ]; then pass "the copy's descriptor is not left open in the proxy"
+    else flunk "the copy's descriptor is not left open in the proxy ($(ls -l /proc/$PP/fd 2>&1 | tail -n +2 | awk '{print $9 $10 $11}' | tr '\n' ' '))"; fi
+    printf '#!/bin/sh\nexit 0\n' > "$W/warden-proxy"        # the file changes mid-run (to a script)
+    if [ "$(sha256sum "/proc/$PP/exe" 2>/dev/null | cut -d' ' -f1)" = "$SHA" ]; then pass "replacing the file mid-run does not change what runs"
+    else flunk "replacing the file mid-run does not change what runs"; fi
+    wait "$WPID"
+    "$WARDEN" "$POL" --proxy-bin "$W/warden-proxy" --check-startup > "$OUT/b.out" 2>&1; rc=$?
+    if [ "$rc" != 0 ] && grep -q "not an ELF executable" "$OUT/b.out"; then pass "a proxy binary that is not a program is refused"
+    else flunk "a proxy binary that is not a program is refused (rc=$rc; $(tail -1 "$OUT/b.out"))"; fi
+    cp "$WP" "$W/warden-proxy"; chmod 775 "$W/warden-proxy"
+    "$WARDEN" "$POL" --proxy-bin "$W/warden-proxy" --check-startup > "$OUT/c.out" 2>&1; rc=$?
+    if [ "$rc" != 0 ] && grep -q "writable by its group or by others" "$OUT/c.out"; then pass "a proxy binary others may write is refused"
+    else flunk "a proxy binary others may write is refused (rc=$rc)"; fi
+    "$WARDEN" "$POL" --proxy-bin "$W/none" --check-startup > "$OUT/d.out" 2>&1; rc=$?
+    if [ "$rc" != 0 ] && grep -q "make warden-proxy" "$OUT/d.out"; then pass "a missing proxy binary is refused, naming how to build it"
+    else flunk "a missing proxy binary is refused (rc=$rc)"; fi
+    printf 'require warden 1.26\nallow host api.example.com:443\n' > "$OUT/np.policy"
+    "$WARDEN" "$OUT/np.policy" --proxy-bin "$W/none" --check-startup > "$OUT/e.out" 2>&1; rc=$?
+    if [ "$rc" = 0 ]; then pass "without the proxy, no proxy binary is needed"; else flunk "without the proxy, no proxy binary is needed (rc=$rc)"; fi
+
+    # the audit: run_start without the binary's hash, or with a bad one
+    RUN="$OUT/run.log"
+    env -i PATH=/usr/bin:/bin "$WARDEN" "$POL" -- /bin/true > /dev/null 2> "$RUN"
+    if python3 "$HERE/tools/varek_audit.py" --policy "$POL" --checker "$CERT" "$RUN" > "$OUT/au.out" 2>&1
+    then pass "the audit accepts the run"
+    else flunk "the audit accepts the run ($(tail -3 "$OUT/au.out"))"; fi
+    forge() {   # forge <in> <out> <from> <to>: rewrite the first record holding <from>, rechain
+        python3 - "$1" "$2" "$3" "$4" <<'PY'
+import hashlib, sys
+head = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
+out, done = [], False
+for line in open(sys.argv[1], encoding="utf-8", errors="surrogateescape"):
+    if line.startswith("{") and ',"chain":"' in line:
+        cut = line.index(',"chain":"')
+        body = line[:cut]
+        if not done and sys.argv[3] in body:
+            body = body.replace(sys.argv[3], sys.argv[4])
+            done = True
+        head = hashlib.sha256(head + body.encode("utf-8", "surrogateescape")).digest()
+        line = body + ',"chain":"' + head.hex() + line[cut + 10 + 64:]
+    out.append(line)
+open(sys.argv[2], "w", encoding="utf-8", errors="surrogateescape").write("".join(out))
+PY
+    }
+    refuses() {   # refuses <description> <log> <message>
+        if python3 "$HERE/tools/varek_audit.py" --policy "$POL" --checker "$CERT" "$2" > "$OUT/f.out" 2>&1; then
+            flunk "the audit refuses $1"
+        elif grep -qF "$3" "$OUT/f.out"; then pass "the audit refuses $1"
+        else flunk "the audit refuses $1 ($(grep -m1 'problem\|FAIL' "$OUT/f.out"))"; fi
+    }
+    RS=$(grep -o '"proxy_binary_sha256":"[0-9a-f]*",' "$RUN")
+    forge "$RUN" "$OUT/f1.log" "$RS" ""
+    refuses "run_start without the proxy binary's hash" "$OUT/f1.log" "is not a SHA-256"
+    forge "$RUN" "$OUT/f2.log" "$RS" '"proxy_binary_sha256":"x",'
+    refuses "run_start with a hash that is not one" "$OUT/f2.log" "is not a SHA-256"
+    rm -rf "$W"
+fi
 
 echo
 if [ "$fail" = 0 ]; then echo "test_v1261: PASS ($skips skipped)"; else echo "test_v1261: FAIL"; fi

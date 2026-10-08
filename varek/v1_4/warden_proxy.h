@@ -126,10 +126,16 @@ typedef struct {
     gid_t    gid;
 } wp_t;
 
-/* Start the proxy as uid:gid (exe: the Warden's binary, run with
- * --proxy-helper). Waits up to 5 s for it to report its listener. 0, or -1
- * with errno set. */
-int wp_start(wp_t *w, const char *exe, uid_t uid, gid_t gid);
+/* Start the proxy as uid:gid. exe_fd: the warden-proxy binary, as the sealed
+ * in-memory copy the Warden hashed (v1.26.1: see wp_load). Waits up to 5 s
+ * for it to report its listener. 0, or -1 with errno set. */
+int wp_start(wp_t *w, int exe_fd, uid_t uid, gid_t gid);
+
+/* v1.26.1: read the warden-proxy binary at path into a sealed memfd (so what
+ * runs is exactly what was hashed, whatever happens to the file after), with
+ * its SHA-256 in hex. The file must be a regular file that neither its group
+ * nor others may write. Returns the memfd, or -1 with the reason in why. */
+int wp_load(const char *path, char sha256_hex[65], char *why, size_t wn);
 
 /* Step 4: announce a hand-off (see struct wp_conn). Never blocks. 0, or -1
  * with errno set (the proxy is gone, or its control socket is full). */

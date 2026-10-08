@@ -67,7 +67,7 @@ fi
 say "Removing the compiler and headers"
 dnf -y remove gcc make libseccomp-devel libsodium-devel glibc-static
 dnf -y autoremove
-if ldd "$PREFIX/warden" "$PREFIX/tools/vdp_check" "$PREFIX/tools/vdp_cert_check" \
+if ldd "$PREFIX/warden" "$PREFIX/warden-proxy" "$PREFIX/tools/vdp_check" "$PREFIX/tools/vdp_cert_check" \
         "$PREFIX/tools/varek_keygen" | grep -q 'not found'; then
     die "a runtime library went missing with the build packages"
 fi

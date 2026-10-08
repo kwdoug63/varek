@@ -280,10 +280,16 @@ def check_proxy_start(meta, proxy_ports, problems, upstream=None):
     run_start names it: SNI mode, its listener on 127.0.0.1, an unprivileged
     user, and the policy's proxied ports; without `proxy on`, no proxy."""
     pr = meta.get("run_start", {}).get("proxy")
+    # v1.26.1: and the SHA-256 of the warden-proxy that ran, exactly with it
+    sha = meta.get("run_start", {}).get("proxy_binary_sha256")
     if proxy_ports is None:
         if pr is not None:
             problems.append("run_start names a proxy, but the policy does not turn it on")
+        if sha is not None:
+            problems.append("run_start names a proxy binary, but the policy does not turn the proxy on")
         return
+    if not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
+        problems.append(f"run_start's proxy_binary_sha256 {sha!r} is not a SHA-256")
     lst = pr.get("listen") if isinstance(pr, dict) else None
     if not isinstance(pr, dict) or pr.get("mode") != "sni" or not isinstance(lst, str) or \
             not lst.startswith("127.0.0.1:") or _host_port(lst) in (None, 0) or \

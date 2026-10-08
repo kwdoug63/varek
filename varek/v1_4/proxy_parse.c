@@ -6,15 +6,6 @@
 #include <string.h>
 #include <strings.h>
 
-const char *pp_kind_name(pp_kind_t k) {
-    switch (k) {
-        case PP_KIND_TLS:     return "tls";
-        case PP_KIND_HTTP:    return "http";
-        case PP_KIND_CONNECT: return "connect";
-        default:              return "none";
-    }
-}
-
 static pp_status_t refuse(pp_result_t *r, const char *why) {
     r->why = why;
     return PP_REFUSE;

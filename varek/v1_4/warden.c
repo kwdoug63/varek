@@ -1323,6 +1323,7 @@ static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden
 #define STUB_LABEL_MAX     63            /* bytes matched by `*` */
 static char       g_psl_sha[65], g_shared_sha[65];  /* v1.25: the lists wildcards were checked against */
 static wp_t       g_proxy = { .ctl = -1 };          /* v1.26: the egress proxy, when `proxy on` */
+static char       g_proxy_sha[65];                  /* v1.26.1: the SHA-256 of the warden-proxy that ran */
 static bool       g_syn_on = false;    /* v1.26: `proxy on`: synthetic addresses (warden_synth.inc.c) */
 static const struct policy *g_syn_p;   /* v1.26: the policy, for the hosts view */
 /* v1.26: the stub runs with a wildcard allow rule (v1.25), or with the proxy
@@ -1616,6 +1617,9 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
         if (p->v.proxy_up_port)                  /* section 5 */
             fprintf(f, ",\"upstream\":\"%s:%u\"", p->v.proxy_up_host, p->v.proxy_up_port);
         fputs("},", f);
+        /* v1.26.1: the SHA-256 of the warden-proxy binary that runs (the
+         * sealed copy it was started from) */
+        fprintf(f, "\"proxy_binary_sha256\":\"%s\",", g_proxy_sha);
     }
     /* v1.25 (section 4): each wildcard allow rule's budgets, defaults filled in */
     if (g_any_wild) {
@@ -4110,7 +4114,7 @@ static void usage(const char *argv0) {
         "              [--sign-key <key>]\n"
         "              [--anchor <path>] [--checkpoint-every <n>] [--run-as <user>]\n"
         "              [--dns-server <a.b.c.d[:port]>] [--dns-ttl-min <s>] [--dns-ttl-max <s>]\n"
-        "              [--dns-grace-max <s>] [--psl <file>] [--shared-domains <file>]\n"
+        "              [--dns-grace-max <s>] [--psl <file>] [--shared-domains <file>]\n              [--proxy-as <user>] [--proxy-bin <warden-proxy>]\n"
         "              -- <target> [args...]\n"
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
         "\n"
@@ -4219,17 +4223,8 @@ int main(int argc, char **argv) {
     /* v1.24: the resolver helper is this program re-executed (a clean address
      * space, without the signing key); see warden_resolve.h. */
     if (argc >= 2 && !strcmp(argv[1], "--resolver-helper")) return wr_helper_exec_main(argc, argv);
-    /* v1.26: the egress proxy, likewise; it drops to its own user at once */
-    if (argc == 3 && !strcmp(argv[1], "--proxy-helper")) {
-        struct run_as pa;
-        if (parse_run_as(argv[2], &pa) < 0 || !pa.drop) return 2;
-        int e = drop_privileges(&pa);
-        if (e < 0 || prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
-            fprintf(stderr, "[proxy] cannot drop to %s (%s)\n", argv[2], strerror(e < 0 ? -e : errno));
-            return 2;
-        }
-        return wp_helper_main(3);
-    }
+    /* v1.26.1: the egress proxy is its own program, warden-proxy (see
+     * proxy_bin below); this binary no longer has a --proxy-helper mode. */
     /* Positional parse with optional --plan between policy_path and --.
      * Accepted forms:
      *   warden policy.txt -- target [args...]
@@ -4251,6 +4246,7 @@ int main(int argc, char **argv) {
     const char *anchor_path = NULL;     /* v1.16 */
     const char *run_as_arg  = NULL;     /* v1.17.0 */
     const char *proxy_as_arg = NULL;    /* v1.26: the egress proxy's user */
+    const char *proxy_bin_arg = NULL;   /* v1.26.1: the warden-proxy binary */
     const char *flow_path   = NULL;     /* v1.18.0 */
     const char *session_arg = NULL;     /* v1.18.0 */
     const char *state_arg   = NULL;     /* v1.18.0 */
@@ -4282,6 +4278,8 @@ int main(int argc, char **argv) {
             run_as_arg = argv[++i];
         } else if (strcmp(argv[i], "--proxy-as") == 0 && !proxy_as_arg) {   /* v1.26 */
             proxy_as_arg = argv[++i];
+        } else if (strcmp(argv[i], "--proxy-bin") == 0 && !proxy_bin_arg) { /* v1.26.1 */
+            proxy_bin_arg = argv[++i];
         } else if (strcmp(argv[i], "--checkpoint-every") == 0) {
             const char *v = argv[++i];
             uint64_t n = 0;
@@ -4417,8 +4415,31 @@ int main(int argc, char **argv) {
         if (g_sk) sodium_free(g_sk);
         return 2;
     }
+    /* v1.26.1: the proxy is warden-proxy, beside this binary unless
+     * --proxy-bin names it. It is copied into a sealed memfd and hashed, and
+     * that copy is what runs, so run_start's hash is of what ran. */
+    int proxy_fd = -1;
+    if (p.v.proxy) {
+        char pb[PATH_MAX], why[PATH_MAX + 128];
+        if (proxy_bin_arg) snprintf(pb, sizeof pb, "%s", proxy_bin_arg);
+        else {
+            ssize_t n = readlink("/proc/self/exe", pb, sizeof pb - 16);
+            if (n <= 0) { fprintf(stderr, "[warden] cannot find this binary's directory\n"); return 1; }
+            pb[n] = '\0';
+            char *sl = strrchr(pb, '/');
+            snprintf(sl ? sl + 1 : pb, sizeof pb - (size_t)(sl ? sl + 1 - pb : 0), "warden-proxy");
+        }
+        proxy_fd = wp_load(pb, g_proxy_sha, why, sizeof why);
+        if (proxy_fd < 0) {
+            fprintf(stderr, "[warden] the egress proxy: %s; build it (make warden-proxy) or name it with "
+                    "--proxy-bin; refusing to start\n", why);
+            if (g_sk) sodium_free(g_sk);
+            return 1;
+        }
+        fprintf(stderr, "[warden] egress proxy binary %s, SHA-256 %s\n", pb, g_proxy_sha);
+    }
     if (p.v.proxy && geteuid() == 0) {
-        if (wp_start(&g_proxy, "/proc/self/exe", pxa.uid, pxa.gid) < 0) {
+        if (wp_start(&g_proxy, proxy_fd, pxa.uid, pxa.gid) < 0) {
             fprintf(stderr, "[warden] cannot start the egress proxy (%s); refusing to start\n",
                     strerror(errno));
             if (g_sk) sodium_free(g_sk);
@@ -4427,6 +4448,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[warden] egress proxy (SNI mode) on 127.0.0.1:%u as %u:%u\n",
                 g_proxy.port, (unsigned)g_proxy.uid, (unsigned)g_proxy.gid);
     }
+    if (proxy_fd >= 0) close(proxy_fd);
     if (g_check_only) {
         /* v1.24: resolve each allowed name and report the ones that fail (a
          * name that does not resolve does not stop the Warden). */

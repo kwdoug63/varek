@@ -47,7 +47,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ "$(id -u)" = 0 ] || { echo "soak.sh: run as root (the Warden and its proxy need it)"; exit 2; }
-for b in warden tools/vdp_cert_check; do
+for b in warden warden-proxy tools/vdp_cert_check; do
     [ -x "$V14/$b" ] || { echo "soak.sh: build first: make -C $V14 all"; exit 2; }
 done
 OUT="${OUT:-/var/tmp/varek-soak126-$(date -u +%Y%m%dT%H%M%SZ)}"

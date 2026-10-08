@@ -414,7 +414,7 @@ def cmd_doctor(args):
     else:
         warn("cgroups v2 not detected (needed by the Python sandbox, not by the Warden)")
 
-    missing = [n for n in ("warden", "tools/vdp_check", "tools/vdp_cert_check", "tools/varek_keygen")
+    missing = [n for n in ("warden", "warden-proxy", "tools/vdp_check", "tools/vdp_cert_check", "tools/varek_keygen")
                if not os.access(os.path.join(varek_home(), n), os.X_OK)]
     if missing:
         fail("runtime not built: " + ", ".join(missing))

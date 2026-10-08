@@ -1,5 +1,6 @@
 # build artifacts
 warden
+warden-proxy
 target_demo
 bench_target
 tools/bench_workload

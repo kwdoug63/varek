@@ -88,7 +88,15 @@ pp_status_t pp_parse(const uint8_t *in, size_t n, unsigned dport, bool acked, pp
  * set), PP_MORE to read more. */
 pp_status_t pp_upstream_reply(const uint8_t *in, size_t n, unsigned *status, size_t *len, const char **why);
 
-/* The kind's word in records ("tls", "http", "connect"). */
-const char *pp_kind_name(pp_kind_t k);
+/* The kind's word in records ("tls", "http", "connect"). Inline (v1.26.1),
+ * so the Warden, which does not link the parsers, has it too. */
+static inline const char *pp_kind_name(pp_kind_t k) {
+    switch (k) {
+        case PP_KIND_TLS:     return "tls";
+        case PP_KIND_HTTP:    return "http";
+        case PP_KIND_CONNECT: return "connect";
+        default:              return "none";
+    }
+}
 
 #endif /* VAREK_PROXY_PARSE_H */
