@@ -144,7 +144,7 @@ def main():
         f"refused and recorded: {len(probes) - len(probe_bad)}")
     for f, r in probe_bad[:20]:
         problems.append(f"probe at {f['t']}: {'reached the server' if f.get('ok') else 'no DENY record of ' + f['sni']}")
-    if not probes and a.hours >= 0.05:
+    if not probes and len(fetches) >= 3:
         problems.append("no probes ran")
 
     # what the proxy costs, and what it relayed

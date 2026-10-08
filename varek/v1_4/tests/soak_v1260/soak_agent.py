@@ -8,7 +8,7 @@ one URL, taking them in turn, and prints one JSON line per fetch:
    "ok": true|false, "status": 200, "peer": "198.18.0.1", "ms": 41,
    "error": "..."}
 
-Every <probe-every>-th fetch is instead a probe the policy must refuse: a TLS
+The third fetch, and every <probe-every>-th after it, is instead a probe the policy must refuse: a TLS
 connection to an allowed name's address whose SNI names a host no rule
 allows (domain fronting). Its line has "probe": true and "sni".
 
@@ -93,7 +93,9 @@ def main():
     i = j = 0
     while time.time() < end:
         i += 1
-        if a.probe_every and i % a.probe_every == 0:
+        # the third fetch is a probe, then every probe_every-th: even a
+        # 3-minute trial at one a minute runs one
+        if a.probe_every and i >= 3 and (i - 3) % a.probe_every == 0:
             rec = probe(a.probe_via, a.probe_sni, pctx)
         else:
             rec = fetch(a.urls[j % len(a.urls)], ctx)

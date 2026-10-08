@@ -6,7 +6,8 @@ CloudFront with the egress proxy on (SNI mode). The run must show:
 - no refused request that the policy allows;
 - every request recorded: a decision for each, and a close for each
   connection the proxy relayed;
-- the refusals the policy asks for still made: every tenth fetch is a probe
+- the refusals the policy asks for still made: the third fetch, and every
+  tenth after it, is a probe
   that connects to an allowed name's address with an SNI no rule allows
   (domain fronting), and each must be refused and recorded.
 
