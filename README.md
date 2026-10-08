@@ -477,7 +477,7 @@ different risks at different points in the stack.
 - [x] **v1.24.0** (v1.21 stage 2) — Host names without agent DNS: the Warden resolves allowed names and serves a hosts view ([design](./docs/security/v1.21-stage2-host-names.md))
 - [x] **v1.25.0** — Wildcard host names, opt-in (`allow host *.example.com:443 acknowledge=dns-channel`): shared domains where anyone can register names refused at load, lookups answered by the Warden and bounded per rule ([design](./docs/security/v1.25-wildcard-host-names.md))
 - [x] **v1.26.0** (v1.21 stage 3) — The egress proxy, SNI mode (`proxy on`): decisions on the name the agent asks for (TLS SNI, HTTP Host), closing the shared-CDN gap on proxied ports with no agent DNS; chaining to a customer proxy (`proxy upstream`) ([design](./docs/security/v1.26-egress-proxy.md))
-- [ ] **v1.26.1** — The egress proxy's opt-in inspecting mode: rules on method and path, every request inside TLS decided
+- [ ] **v1.26.1** — The egress proxy's opt-in inspecting mode: rules on method and path, every request inside TLS decided ([design](./docs/security/v1.26.1-inspecting-mode.md))
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
 
