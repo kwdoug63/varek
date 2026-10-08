@@ -133,6 +133,7 @@
 #include "warden_lifecycle.h"   /* v1.9.3 supervisor/target lifecycle coupling */
 #include "warden_resolve.h"     /* v1.24 resolution table for host name rules */
 #include "shared_domains.h"     /* v1.25 wildcards over shared domains, refused at load */
+#include "warden_proxy.h"       /* v1.26 the egress proxy process */
 
 /* Kernel/libc compatibility shims --------------------------------- */
 #ifndef __NR_openat2
@@ -1295,6 +1296,7 @@ static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden
 #define STUB_DEFAULT_RATE  30            /* distinct new names per minute */
 #define STUB_LABEL_MAX     63            /* bytes matched by `*` */
 static char       g_psl_sha[65], g_shared_sha[65];  /* v1.25: the lists wildcards were checked against */
+static wp_t       g_proxy = { .ctl = -1 };          /* v1.26: the egress proxy, when `proxy on` */
 static bool       g_lists_pinned;                   /* v1.25 review: they are the release's */
 static uint64_t g_records = 0;       /* decision records emitted */
 static bool     g_relay_midline = false;
@@ -1565,6 +1567,16 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     /* v1.25: where the agent's questions go (connects and sends to it are
      * records with rule dns_stub) */
     if (g_any_wild) fputs("\"dns_stub\":\"127.53.53.53:53\",", f);
+    /* v1.26: the egress proxy: its listener, its user, the proxied ports */
+    if (g_proxy.ctl >= 0) {
+        fprintf(f, "\"proxy\":{\"mode\":\"sni\",\"listen\":\"127.0.0.1:%u\",\"uid\":%u,\"gid\":%u,\"ports\":[",
+                g_proxy.port, (unsigned)g_proxy.uid, (unsigned)g_proxy.gid);
+        if (p->v.proxy_nports)
+            for (size_t k = 0; k < p->v.proxy_nports; k++)
+                fprintf(f, "%s%u", k ? "," : "", p->v.proxy_ports[k]);
+        else fputs("80,443", f);
+        fputs("]},", f);
+    }
     /* v1.25 (section 4): each wildcard allow rule's budgets, defaults filled in */
     if (g_any_wild) {
         fputs("\"wildcard_budgets\":[", f);
@@ -4127,6 +4139,17 @@ int main(int argc, char **argv) {
     /* v1.24: the resolver helper is this program re-executed (a clean address
      * space, without the signing key); see warden_resolve.h. */
     if (argc >= 2 && !strcmp(argv[1], "--resolver-helper")) return wr_helper_exec_main(argc, argv);
+    /* v1.26: the egress proxy, likewise; it drops to its own user at once */
+    if (argc == 3 && !strcmp(argv[1], "--proxy-helper")) {
+        struct run_as pa;
+        if (parse_run_as(argv[2], &pa) < 0 || !pa.drop) return 2;
+        int e = drop_privileges(&pa);
+        if (e < 0 || prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
+            fprintf(stderr, "[proxy] cannot drop to %s (%s)\n", argv[2], strerror(e < 0 ? -e : errno));
+            return 2;
+        }
+        return wp_helper_main(3);
+    }
     /* Positional parse with optional --plan between policy_path and --.
      * Accepted forms:
      *   warden policy.txt -- target [args...]
@@ -4147,6 +4170,7 @@ int main(int argc, char **argv) {
     const char *key_path    = NULL;     /* v1.16 */
     const char *anchor_path = NULL;     /* v1.16 */
     const char *run_as_arg  = NULL;     /* v1.17.0 */
+    const char *proxy_as_arg = NULL;    /* v1.26: the egress proxy's user */
     const char *flow_path   = NULL;     /* v1.18.0 */
     const char *session_arg = NULL;     /* v1.18.0 */
     const char *state_arg   = NULL;     /* v1.18.0 */
@@ -4176,6 +4200,8 @@ int main(int argc, char **argv) {
             anchor_path = argv[++i];
         } else if (strcmp(argv[i], "--run-as") == 0 && !run_as_arg) {
             run_as_arg = argv[++i];
+        } else if (strcmp(argv[i], "--proxy-as") == 0 && !proxy_as_arg) {   /* v1.26 */
+            proxy_as_arg = argv[++i];
         } else if (strcmp(argv[i], "--checkpoint-every") == 0) {
             const char *v = argv[++i];
             uint64_t n = 0;
@@ -4275,6 +4301,32 @@ int main(int argc, char **argv) {
     if (names_setup(&p, &dns_cfg) < 0) return 1;                            /* v1.24 */
     if (wildcards_check(policy_path, &p, psl_arg, shared_arg) < 0) return 1;            /* v1.25 */
     if (g_any_name) views_setup();
+    /* v1.26: the egress proxy runs as its own user, never the agent's: the
+     * default is varek-proxy where that user exists, else 65532:65532. */
+    struct run_as pxa = { .drop = false };
+    if (p.v.proxy) {
+        const char *pas = proxy_as_arg ? proxy_as_arg : getpwnam("varek-proxy") ? "varek-proxy" : "65532:65532";
+        if (parse_run_as(pas, &pxa) < 0 || !pxa.drop) {
+            fprintf(stderr, "[warden] --proxy-as %s: give an unprivileged user (name, uid or uid:gid) "
+                    "with a non-root group\n", pas);
+            return 2;
+        }
+        if (pxa.uid == ra.uid) {
+            fprintf(stderr, "[warden] --proxy-as %s: the proxy may not run as the agent's user "
+                    "(--run-as); give it its own\n", pas);
+            return 2;
+        }
+    }
+    if (p.v.proxy && geteuid() == 0) {
+        if (wp_start(&g_proxy, "/proc/self/exe", pxa.uid, pxa.gid) < 0) {
+            fprintf(stderr, "[warden] cannot start the egress proxy (%s); refusing to start\n",
+                    strerror(errno));
+            if (g_sk) sodium_free(g_sk);
+            return 1;
+        }
+        fprintf(stderr, "[warden] egress proxy (SNI mode) on 127.0.0.1:%u as %u:%u\n",
+                g_proxy.port, (unsigned)g_proxy.uid, (unsigned)g_proxy.gid);
+    }
     if (g_check_only) {
         /* v1.24: resolve each allowed name and report the ones that fail (a
          * name that does not resolve does not stop the Warden). */
