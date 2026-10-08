@@ -126,7 +126,8 @@ static void px_close_record(uint64_t id, const char *why, const struct wp_close 
             fprintf(f, "\"server_cert_sha256\":\"%s\",", hx);
         }
         if (m->tls_why[0]) {
-            fputs("\"tls_error\":\"", f);
+            /* step 5: a request the proxy's parser refused says why */
+            fputs(!strcmp(why, "refused_request") ? "\"request_error\":\"" : "\"tls_error\":\"", f);
             json_escape(f, m->tls_why);
             fputs("\",", f);
         }

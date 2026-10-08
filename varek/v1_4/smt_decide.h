@@ -272,7 +272,7 @@ const char *vdp_kind_name(vdp_kind_t k);
 // HOST is a host name or *.<suffix> (as in host rules; no addresses), PORT
 // 1 to 65535 (default 443 or 80). The path (and query) is bytes 0x21-0x7e
 // other than '\', ';' and '#'; '%' must start an escape %XX that encodes
-// neither '/' nor an unreserved byte (A-Z a-z 0-9 - . _ ~); before the first
+// neither '/', '\' nor an unreserved byte (A-Z a-z 0-9 - . _ ~); before the first
 // '?', no empty segment except a trailing one ('//' is refused) and no '.'
 // or '..' segment. '*', '**' and '[...]' in the path are glob wildcards as
 // above; '?' is the query's literal '?', never a wildcard. The rule is held

@@ -84,6 +84,7 @@ struct wp_held {
     bool      refused;           /* a later request was refused: no more is read from the client */
     /* v1.26.1, step 4: inspecting mode */
     bool      inspect;           /* terminate its TLS */
+    unsigned  rport;             /* the port decided (a CONNECT's own) */
     int       tstage;            /* TS_* */
     short     swant;             /* the server handshake waits for this (POLLIN, POLLOUT) */
     SSL      *ss, *cs;           /* toward the server (on up), toward the client (memory BIOs) */
@@ -558,13 +559,29 @@ static bool tls_step(int k, short crev, short srev) {
             if (r > 0) { h->len += (size_t)r; if (h->len < PP_HTTP_MAX) continue; }
             break;
         }
-        bool head = h->len >= PP_HTTP_MAX || memmem(h->buf, h->len, "\r\n\r\n", 4) != NULL;
-        if (!head && !h->eof_c) return true;
-        h->why = "inspect_not_built";
-        if (!kNotBuilt[0])
-            snprintf(kNotBuilt, sizeof kNotBuilt, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n"
-                     "Content-Length: %zu\r\nConnection: close\r\n\r\n%s", sizeof NOT_BUILT_BODY - 1, NOT_BUILT_BODY);
-        (void)SSL_write(h->cs, kNotBuilt, (int)strlen(kNotBuilt));
+        /* step 5: read with the request parser; one it refuses is answered
+         * 403 with the reason, and recorded refused_request */
+        pp_req_t q;
+        pp_status_t st = pp_request(h->buf, h->len, "https", h->name, h->rport, &q);
+        if (st == PP_MORE && !h->eof_c) return true;
+        if (st == PP_OK) {
+            h->why = "inspect_not_built";
+            if (!kNotBuilt[0])
+                snprintf(kNotBuilt, sizeof kNotBuilt, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n"
+                         "Content-Length: %zu\r\nConnection: close\r\n\r\n%s", sizeof NOT_BUILT_BODY - 1,
+                         NOT_BUILT_BODY);
+            (void)SSL_write(h->cs, kNotBuilt, (int)strlen(kNotBuilt));
+        } else {
+            const char *w = st == PP_MORE ? "the client closed before a whole request" : q.why;
+            char ans[400];
+            int bl = snprintf(ans + 200, 200, "VAREK: this request was refused: %s.\n", w);
+            int al = snprintf(ans, 200, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
+                              "Connection: close\r\n\r\n", bl);
+            memmove(ans + al, ans + 200, (size_t)bl + 1);
+            h->why = "refused_request";
+            snprintf(h->tls_why, sizeof h->tls_why, "%s", w);
+            (void)SSL_write(h->cs, ans, (int)strlen(ans));
+        }
         (void)SSL_shutdown(h->cs);
         h->tstage = TS_FLUSH;
         if (tls_client_io(h, 0) < 0) return false;
@@ -736,6 +753,7 @@ static void held_read(int k) {
     }
     report(h, WP_MSG_REQUEST, &r, NULL);
     snprintf(h->name, sizeof h->name, "%s", r.name);       /* later requests must name it too */
+    h->rport = r.port;                                     /* v1.26.1: an inspected request's object */
     if (r.kind == PP_KIND_CONNECT) h->skip = r.connect_len;   /* the server gets what follows it */
     h->state = WH_WAITING;
     h->since = mono_ms();

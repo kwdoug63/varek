@@ -3,6 +3,7 @@
 
 #include "proxy_parse.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <strings.h>
 
@@ -197,7 +198,7 @@ static int request_line(const uint8_t *in, size_t end, struct req *q) {
     q->method = in;
     while (i < end && in[i] >= 'A' && in[i] <= 'Z') i++;
     q->ml = i;
-    if (q->ml == 0 || q->ml > 16 || i >= end || in[i] != ' ') return 0;
+    if (q->ml == 0 || q->ml > PP_METHOD_MAX || i >= end || in[i] != ' ') return 0;   /* v1.26.1: 20, was 16 */
     q->target = in + ++i;
     while (i < end && in[i] > ' ' && in[i] < 0x7f) i++;
     q->tl = (size_t)(in + i - q->target);
@@ -280,7 +281,7 @@ static int framing(const uint8_t *in, size_t hdr, size_t end, pp_result_t *r) {
                 return -1;
             }
         } else if (HN("upgrade")) {
-            r->why = "a protocol upgrade (not read in SNI mode)";
+            r->why = "a protocol upgrade (its bytes are not read as requests)";
             return -1;
         }
         #undef HN
@@ -322,6 +323,114 @@ static pp_status_t http(const uint8_t *in, size_t n, unsigned dport, pp_result_t
     if (framing(in, q.hdr, (size_t)end, r) < 0) return PP_REFUSE;
     r->head_len = (size_t)end;
     r->port = dport;
+    return PP_OK;
+}
+
+/* ---- v1.26.1, step 5: a request inside terminated TLS ---- */
+
+static bool unreserved(unsigned c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+           c == '-' || c == '.' || c == '_' || c == '~';
+}
+
+static int hexd(uint8_t c) {
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
+         : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+/* Is the target (path, then '?' and the query) one every server reads as
+ * the matcher does? NULL, or why not. */
+static const char *target_ok(const uint8_t *t, size_t n) {
+    if (n == 0 || t[0] != '/') return "a target that is not a path";
+    bool query = false;
+    size_t seg = 1;                                     /* the current segment's start */
+    for (size_t i = 1; i <= n; i++) {
+        uint8_t c = i < n ? t[i] : 0;
+        if (!query && (i == n || c == '/' || c == '?')) {
+            size_t sl = i - seg;
+            if (sl == 0 && c == '/') return "an empty path segment ('//')";
+            if ((sl == 1 && t[seg] == '.') || (sl == 2 && t[seg] == '.' && t[seg + 1] == '.'))
+                return "a '.' or '..' path segment";
+            seg = i + 1;
+            if (c == '?') query = true;
+            if (i == n) break;
+            continue;
+        }
+        if (i == n) break;
+        if (c < 0x21 || c > 0x7e) return "a byte outside 0x21-0x7e in the target";
+        if (c == '\\' || c == ';' || c == '#') return "a '\\', ';' or '#' in the target";
+        if (c == '?') query = true;
+        if (c == '%') {
+            int h1 = i + 1 < n ? hexd(t[i + 1]) : -1, h2 = i + 2 < n ? hexd(t[i + 2]) : -1;
+            if (h1 < 0 || h2 < 0) return "a bad percent escape in the target";
+            unsigned v = (unsigned)(h1 * 16 + h2);
+            if (v == '/' || v == '\\' || unreserved(v))
+                return "a percent escape of '/', '\\' or an unreserved byte";
+        }
+    }
+    return NULL;
+}
+
+pp_status_t pp_request(const uint8_t *in, size_t n, const char *scheme, const char *name, unsigned port,
+                       pp_req_t *q) {
+    memset(q, 0, sizeof *q);
+    long end = head_end(in, n);
+    if (end < 0) { q->why = "a malformed HTTP request (CR, LF or NUL)"; return PP_REFUSE; }
+    if (end == 0) {
+        if (n >= PP_HTTP_MAX) { q->why = "HTTP headers over 8 KB"; return PP_REFUSE; }
+        return PP_MORE;
+    }
+    struct req rl;
+    if (!request_line(in, (size_t)end, &rl)) { q->why = "a malformed HTTP request line"; return PP_REFUSE; }
+    if (rl.ml == 7 && !memcmp(rl.method, "CONNECT", 7)) { q->why = "a CONNECT inside TLS"; return PP_REFUSE; }
+    const uint8_t *v = NULL;
+    size_t vl = 0;
+    int h = host_header(in, rl.hdr, (size_t)end, &v, &vl);
+    if (h < 0) { q->why = "malformed headers, or more than one Host"; return PP_REFUSE; }
+    if (h == 0) { q->why = "no Host header"; return PP_REFUSE; }
+    char hn[PP_NAME_MAX + 1];
+    unsigned hp;
+    if (!authority(v, vl, hn, &hp)) { q->why = "a Host that is not a host name"; return PP_REFUSE; }
+    if (strcmp(hn, name) || (hp && hp != port)) {
+        q->why = "a Host other than the name and port the connection is for";
+        return PP_REFUSE;
+    }
+    const uint8_t *t = rl.target;
+    size_t tl = rl.tl, sl = strlen(scheme);
+    if (tl > sl + 3 && !memcmp(t, scheme, sl) && !memcmp(t + sl, "://", 3)) {
+        /* absolute-form: the connection's own scheme and authority, read as its path */
+        const uint8_t *a = t + sl + 3, *e = t + tl, *s2 = a;
+        while (s2 < e && *s2 != '/' && *s2 != '?' && *s2 != '#') s2++;
+        char an[PP_NAME_MAX + 1];
+        unsigned ap;
+        unsigned def = !strcmp(scheme, "https") ? 443 : 80;
+        if (!authority(a, (size_t)(s2 - a), an, &ap) || strcmp(an, name) || (ap ? ap : def) != port) {
+            q->why = "an absolute target for another authority";
+            return PP_REFUSE;
+        }
+        if (s2 == e || *s2 != '/') { q->why = "an absolute target without a path"; return PP_REFUSE; }
+        t = s2;
+        tl = (size_t)(e - s2);
+    }
+    const char *bad = target_ok(t, tl);
+    if (bad) { q->why = bad; return PP_REFUSE; }
+    pp_result_t fr;
+    memset(&fr, 0, sizeof fr);
+    if (framing(in, rl.hdr, (size_t)end, &fr) < 0) { q->why = fr.why; return PP_REFUSE; }
+    memcpy(q->method, rl.method, rl.ml);
+    q->method[rl.ml] = '\0';
+    int ol = snprintf(q->object, sizeof q->object, "%s %s://%s:%u", q->method, scheme, name, port);
+    if (ol < 0 || (size_t)ol + tl > PP_OBJ_MAX) {
+        memset(q->object, 0, sizeof q->object);
+        q->why = "a request object over 4,095 bytes";
+        return PP_REFUSE;
+    }
+    memcpy(q->object + ol, t, tl);
+    q->object_len = (size_t)ol + tl;
+    q->object[q->object_len] = '\0';
+    q->head_len = (size_t)end;
+    q->body = fr.body;
+    q->body_len = fr.body_len;
     return PP_OK;
 }
 

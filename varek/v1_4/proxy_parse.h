@@ -88,6 +88,39 @@ pp_status_t pp_parse(const uint8_t *in, size_t n, unsigned dport, bool acked, pp
  * set), PP_MORE to read more. */
 pp_status_t pp_upstream_reply(const uint8_t *in, size_t n, unsigned *status, size_t *len, const char **why);
 
+/* v1.26.1, step 5: one request of an inspected connection, after its TLS
+ * is terminated (docs/security/v1.26.1-inspecting-mode.md, section 2). The
+ * Warden decides its object,
+ *     METHOD scheme://name:port/path?query
+ * where scheme, name and port are the connection's (https, the SNI name,
+ * the port connected to) and the method and target are the request's own
+ * bytes. The head is read as for plain HTTP (CRLF only, within PP_HTTP_MAX,
+ * one Host, the body framed by Content-Length or chunked, no upgrade).
+ * Refused besides: a method that is not 1 to 20 letters A-Z, CONNECT, a Host
+ * that is not the connection's name (and port, if it gives one), a target
+ * neither origin-form (/...) nor absolute-form naming the connection's own
+ * scheme and authority (then read as its path), and a target a server could
+ * read as another path than the matcher does: a '.' or '..' segment, an
+ * empty segment ('//'), '\', ';' or '#', a byte outside 0x21-0x7e, a bad
+ * percent escape, or an escape of '/', '\' or an unreserved byte (A-Z a-z
+ * 0-9 - . _ ~). An object over PP_OBJ_MAX bytes is refused, not cut. */
+#define PP_OBJ_MAX     4095
+#define PP_METHOD_MAX  20
+
+typedef struct {
+    char        method[PP_METHOD_MAX + 1];
+    char        object[PP_OBJ_MAX + 1];
+    size_t      object_len;
+    size_t      head_len;            /* the request line and headers */
+    int         body;                /* PP_BODY_NONE, _LENGTH (body_len bytes) or _CHUNKED */
+    uint64_t    body_len;
+    const char *why;                 /* PP_REFUSE */
+} pp_req_t;
+
+/* PP_OK (q set), PP_MORE, or PP_REFUSE (q->why). */
+pp_status_t pp_request(const uint8_t *in, size_t n, const char *scheme, const char *name, unsigned port,
+                       pp_req_t *q);
+
 /* The kind's word in records ("tls", "http", "connect"). Inline (v1.26.1),
  * so the Warden, which does not link the parsers, has it too. */
 static inline const char *pp_kind_name(pp_kind_t k) {

@@ -495,7 +495,7 @@ static int req_parse(const char *m, const char *u, vdpc_rule_t *r, const char **
             int d1 = hexd(p[i + 1]), d2 = hexd(p[i + 2]);
             if (d1 < 0 || d2 < 0) { *why = "bad percent escape"; return -1; }
             unsigned v = (unsigned)(d1 * 16 + d2);
-            if (v == '/' || (v >= '0' && v <= '9') || (v >= 'A' && v <= 'Z') || (v >= 'a' && v <= 'z') ||
+            if (v == '/' || v == '\\' || (v >= '0' && v <= '9') || (v >= 'A' && v <= 'Z') || (v >= 'a' && v <= 'z') ||
                 v == '-' || v == '.' || v == '_' || v == '~') {
                 *why = "percent escape of '/' or an unreserved byte"; return -1;
             }

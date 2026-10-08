@@ -127,6 +127,7 @@ refused "a non-ASCII byte"                   "$(Q 'GET https://api.example.com/\
 refused "%41, an unreserved byte"            "$(Q 'GET https://api.example.com/v1/%61dmin')" "unreserved"
 refused "%2F, a slash"                       "$(Q 'GET https://api.example.com/a%2Fb')" "unreserved"
 refused "%2f, a slash"                       "$(Q 'GET https://api.example.com/a%2fb')" "unreserved"
+refused "%5C, a backslash"                   "$(Q 'GET https://api.example.com/a%5Cb')" "unreserved"
 refused "a bad escape"                       "$(Q 'GET https://api.example.com/a%4')" "escape %XX"
 refused "a bad glob"                         "$(Q 'GET https://api.example.com/[/]')" "glob class"
 refused "max_body=0"                         "$(Q 'POST https://api.example.com/x max_body=0')" "max_body is 1 to"
@@ -590,6 +591,23 @@ get("connect", ssl.create_default_context, connect=True)
 get("wrong-name", ssl.create_default_context, port=P2)
 get("self-signed", ssl.create_default_context, port=P3)
 get("passthrough", ssl.create_default_context, port=P4, name="pinned.example.net")
+def raw(tag, head):                  # step 5: a request inside TLS, as written
+    try:
+        s = ssl.create_default_context().wrap_socket(socket.create_connection(("api.example.com", P1), 10),
+                                                     server_hostname="api.example.com")
+        s.sendall(head)
+        out = b""
+        while True:
+            d = s.recv(4096)
+            if not d: break
+            out += d
+        print("REQ", tag, out.split(b"\r\n")[0].decode(), out.split(b"\r\n\r\n", 1)[-1].decode().strip(), flush=True)
+    except (OSError, ssl.SSLError) as e:
+        print("REQ", tag, "ERR", e, flush=True)
+raw("fronting", b"GET / HTTP/1.1\r\nHost: other.example.com\r\n\r\n")
+raw("dotdot", b"GET /v1/../admin HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+raw("escaped", b"GET /v1/%61dmin HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+raw("absolute", b"GET https://api.example.com:%d/v1/models HTTP/1.1\r\nHost: api.example.com:%d\r\n\r\n" % (P1, P1))
 try:
     s = socket.create_connection(("api.example.com", P1), 10)
     s.sendall(b"GET /v1/models HTTP/1.1\r\nHost: api.example.com:%d\r\nConnection: close\r\n\r\n" % P1)
@@ -650,6 +668,26 @@ PY
        ! grep -q '^GOT ' "$OUT/srv$P2.log" "$OUT/srv$P3.log"
     then pass "a server whose name or issuer does not verify is refused before the client's handshake (server_tls)"
     else flunk "a server that does not verify is refused (server_tls)"; fi
+    reqx() { python3 - "$OUT/t.log" "$1" <<'PY'
+import json, sys
+for l in open(sys.argv[1]):
+    if l.startswith("{"):
+        r = json.loads(l)
+        if r.get("event") == "proxy_close" and r.get("why") == "refused_request" and r.get("request_error") == sys.argv[2]:
+            print("yes"); break
+PY
+    }
+    if have "REQ fronting HTTP/1.1 403 Forbidden VAREK: this request was refused: a Host other than the name and port the connection is for." &&
+       [ "$(reqx 'a Host other than the name and port the connection is for')" = yes ]
+    then pass "inside TLS, a request whose Host is not the SNI name (domain fronting) is refused, recorded with its reason"
+    else flunk "inside TLS, a fronting request is refused"; fi
+    if have "REQ dotdot HTTP/1.1 403 Forbidden VAREK: this request was refused: a '.' or '..' path segment." &&
+       have "REQ escaped HTTP/1.1 403 Forbidden VAREK: this request was refused: a percent escape of '/', '\\' or an unreserved byte." &&
+       [ "$(reqx "a '.' or '..' path segment")" = yes ]
+    then pass "a '..' segment and an escaped letter are refused, recorded"
+    else flunk "a '..' segment and an escaped letter are refused"; fi
+    if grep -qF "REQ absolute HTTP/1.1 403 Forbidden $NB" "$OUT/t.out"; then pass "an absolute-form request for the connection's own authority is read (then answered 403 until step 6)"
+    else flunk "an absolute-form request is read"; fi
     if have "TLS passthrough True None HTTP/1.1 200 OK server" &&
        grep '"action":"net.proxy"' "$OUT/t.log" | grep "\"target\":\"pinned.example.net:$P4\"" | grep -vq '"inspected"'
     then pass "a passthrough host is relayed in SNI mode, not inspected"

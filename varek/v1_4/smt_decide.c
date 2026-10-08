@@ -860,8 +860,8 @@ static const char *request_parse(const char *method, const char *url, vdp_rule_t
             int h1 = i + 1 < pl ? hexval(path[i + 1]) : -1, h2 = i + 2 < pl ? hexval(path[i + 2]) : -1;
             if (h1 < 0 || h2 < 0) return "a '%' in a request path starts an escape %XX";
             unsigned v = (unsigned)(h1 * 16 + h2);
-            if (v == '/' || unreserved(v))
-                return "a request path does not percent-encode '/' or an unreserved byte (A-Z a-z 0-9 - . _ ~)";
+            if (v == '/' || v == '\\' || unreserved(v))
+                return "a request path does not percent-encode '/', '\\' or an unreserved byte (A-Z a-z 0-9 - . _ ~)";
         }
         if (c == '?') query = true;
     }

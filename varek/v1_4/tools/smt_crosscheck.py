@@ -471,7 +471,7 @@ def request_glob(method, url, where):
         if not re.fullmatch(r"[0-9A-Fa-f]{2}", h):
             raise PolicyError(f"{where}: bad escape")
         v = int(h, 16)
-        if v == 0x2F or v in UNRESERVED:
+        if v in (0x2F, 0x5C) or v in UNRESERVED:
             raise PolicyError(f"{where}: escape of / or an unreserved byte")
     segs = path.split("/")[1:]
     for k, sg in enumerate(segs):

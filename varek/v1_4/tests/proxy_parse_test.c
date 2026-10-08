@@ -34,6 +34,35 @@ static void invariants(const uint8_t *in, size_t n, unsigned dport, bool acked, 
     if (st == PP_OK && r->kind != PP_KIND_CONNECT && r->port != dport) { fprintf(stderr, "port\n"); abort(); }
 }
 
+/* v1.26.1, step 5: what every pp_request result must satisfy. */
+static void req_invariants(const uint8_t *in, size_t n, pp_status_t st, const pp_req_t *q) {
+    (void)in;
+    if (st == PP_REFUSE && !q->why) { fprintf(stderr, "request refusal without a reason\n"); abort(); }
+    if (st != PP_OK) return;
+    static const char pre[] = " https://api.example.com:443/";
+    size_t ml = strlen(q->method);
+    if (ml == 0 || ml > PP_METHOD_MAX || q->object_len != strlen(q->object) || q->object_len > PP_OBJ_MAX ||
+        strncmp(q->object, q->method, ml) || strncmp(q->object + ml, pre, sizeof pre - 1) ||
+        q->head_len == 0 || q->head_len > n) {
+        fprintf(stderr, "bad request result %s\n", q->object);
+        abort();
+    }
+    for (size_t i = 0; i < ml; i++) if (q->method[i] < 'A' || q->method[i] > 'Z') abort();
+    /* the target: printable, no space, no '\\' ';' '#', no "//", "/./" or "/../" before the query */
+    const char *t = q->object + ml + sizeof pre - 2;
+    const char *qm = strchr(t, '?');
+    size_t pl = qm ? (size_t)(qm - t) : strlen(t);
+    for (const char *c = t; *c; c++)
+        if (*c < 0x21 || *c > 0x7e || *c == '\\' || *c == ';' || *c == '#') { fprintf(stderr, "target byte\n"); abort(); }
+    for (size_t i = 0; i + 1 < pl; i++) {
+        if (t[i] == '/' && t[i + 1] == '/') { fprintf(stderr, "//\n"); abort(); }
+        if (t[i] == '/' && t[i + 1] == '.' && (i + 2 == pl || t[i + 2] == '/' ||
+                                              (t[i + 2] == '.' && (i + 3 == pl || t[i + 3] == '/')))) {
+            fprintf(stderr, "dot segment\n"); abort();
+        }
+    }
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *d, size_t n) {
     if (n < 3) return 0;
     bool acked = d[0] & 1;
@@ -42,6 +71,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *d, size_t n) {
     pp_result_t r;
     pp_status_t st = pp_parse(d + 3, n - 3, dport, acked, &r);
     invariants(d + 3, n - 3, dport, acked, st, &r);
+    pp_req_t q;                                         /* v1.26.1 */
+    pp_status_t qs = pp_request(d + 3, n - 3, "https", "api.example.com", 443, &q);
+    req_invariants(d + 3, n - 3, qs, &q);
     return 0;
 }
 
@@ -338,6 +370,103 @@ static int unit(void) {
         printf("  %s   chunked bodies: whole, a byte at a time, and malformed ones refused\n", all ? "PASS" : "FAIL");
         if (!all) fails = 1;
     }
+    {
+        /* v1.26.1, step 5: requests inside terminated TLS (connection
+         * https://api.example.com:443) */
+        struct { const char *what, *in; pp_status_t want; const char *x; } v[] = {
+            { "a GET", "GET /v1/models HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_OK,
+              "GET https://api.example.com:443/v1/models" },
+            { "a query, kept as sent", "GET /v1/files?limit=10&q=a%20b HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n", PP_OK,
+              "GET https://api.example.com:443/v1/files?limit=10&q=a%20b" },
+            { "a Host in capitals, with a trailing dot", "GET / HTTP/1.1\r\nHost: API.Example.com.\r\n\r\n", PP_OK,
+              "GET https://api.example.com:443/" },
+            { "absolute-form, read as its path", "GET https://api.example.com/v1/x?y HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+              PP_OK, "GET https://api.example.com:443/v1/x?y" },
+            { "a 20-letter method", "ABCDEFGHIJKLMNOPQRST /x HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_OK,
+              "ABCDEFGHIJKLMNOPQRST https://api.example.com:443/x" },
+            { "a trailing slash, '..' inside a segment", "GET /a/b../..c/ HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_OK,
+              "GET https://api.example.com:443/a/b../..c/" },
+            { "a reserved escape (%3F), kept", "GET /a%3Fb HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_OK,
+              "GET https://api.example.com:443/a%3Fb" },
+            { "a '//' in the query", "GET /a?u=https://x HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_OK,
+              "GET https://api.example.com:443/a?u=https://x" },
+            { "a body: Content-Length", "POST /a HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 5\r\n\r\nhello", PP_OK,
+              "POST https://api.example.com:443/a" },
+            { "not whole yet", "GET /v1/models HTTP/1.1\r\nHost: api.exa", PP_MORE, NULL },
+            { "a 21-letter method", "ABCDEFGHIJKLMNOPQRSTU /x HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "request line" },
+            { "a lowercase method", "get /x HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "request line" },
+            { "CONNECT", "CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "CONNECT inside" },
+            { "another Host (fronting)", "GET / HTTP/1.1\r\nHost: other.example.com\r\n\r\n", PP_REFUSE, "Host other than" },
+            { "another Host port", "GET / HTTP/1.1\r\nHost: api.example.com:8443\r\n\r\n", PP_REFUSE, "Host other than" },
+            { "no Host", "GET / HTTP/1.1\r\nX: y\r\n\r\n", PP_REFUSE, "no Host" },
+            { "two Hosts", "GET / HTTP/1.1\r\nHost: api.example.com\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "more than one Host" },
+            { "absolute-form for another host", "GET https://other.example.com/x HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+              PP_REFUSE, "another authority" },
+            { "absolute-form, another scheme", "GET http://api.example.com/x HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+              PP_REFUSE, "not a path" },
+            { "absolute-form without a path", "GET https://api.example.com HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+              PP_REFUSE, "without a path" },
+            { "OPTIONS *", "OPTIONS * HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "not a path" },
+            { "a '..' segment", "GET /v1/../admin HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "'..' path segment" },
+            { "a trailing '..'", "GET /v1/.. HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "'..' path segment" },
+            { "a '.' segment", "GET /v1/./admin HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "'..' path segment" },
+            { "'..' before the query", "GET /v1/..?x HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "'..' path segment" },
+            { "an empty segment", "GET /v1//admin HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "('//')" },
+            { "a ';'", "GET /v1/admin;x/y HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "';'" },
+            { "a backslash", "GET /v1\\admin HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "';'" },
+            { "a '#'", "GET /v1#x HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "';'" },
+            { "an escaped letter (%61dmin)", "GET /v1/%61dmin HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "unreserved" },
+            { "an escaped '.' (%2e%2e)", "GET /v1/%2e%2e/admin HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "unreserved" },
+            { "an escaped '/' (%2F)", "GET /v1%2Fadmin HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "unreserved" },
+            { "an escaped '\\' (%5c)", "GET /v1%5cadmin HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "unreserved" },
+            { "an escaped letter in the query", "GET /a?x=%41 HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "unreserved" },
+            { "a bad escape", "GET /a%4 HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "bad percent" },
+            { "a bad escape, not hex", "GET /a%zz HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "bad percent" },
+            { "a byte over 0x7e", "GET /a\xe9 HTTP/1.1\r\nHost: api.example.com\r\n\r\n", PP_REFUSE, "request line" },
+            { "a protocol upgrade", "GET / HTTP/1.1\r\nHost: api.example.com\r\nUpgrade: websocket\r\n\r\n", PP_REFUSE, "upgrade" },
+            { "both framings", "POST / HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+              PP_REFUSE, "both" },
+            { "a bare LF", "GET / HTTP/1.1\nHost: api.example.com\r\n\r\n", PP_REFUSE, "malformed" },
+        };
+        bool all = true;
+        for (size_t k = 0; k < sizeof v / sizeof *v; k++) {
+            pp_req_t q;
+            pp_status_t st = pp_request((const uint8_t *)v[k].in, strlen(v[k].in), "https", "api.example.com", 443, &q);
+            req_invariants((const uint8_t *)v[k].in, strlen(v[k].in), st, &q);
+            bool ok = st == v[k].want && (st != PP_OK || !strcmp(q.object, v[k].x)) &&
+                      (st != PP_REFUSE || strstr(q.why, v[k].x));
+            if (!ok) {
+                printf("         request: %s: got %d (%s)\n", v[k].what, st, st == PP_OK ? q.object : st == PP_REFUSE ? q.why : "more");
+                all = false;
+            }
+        }
+        /* an object at the bound, and one byte over it */
+        static char big[PP_HTTP_MAX];
+        size_t pre = strlen("GET https://api.example.com:443");
+        for (int over = 0; over < 2; over++) {
+            size_t tl = PP_OBJ_MAX - pre + (size_t)over;
+            int l = snprintf(big, sizeof big, "GET /");
+            memset(big + l, 'a', tl - 1);
+            l += (int)tl - 1;
+            l += snprintf(big + l, sizeof big - (size_t)l, " HTTP/1.1\r\nHost: api.example.com\r\n\r\n");
+            pp_req_t q;
+            pp_status_t st = pp_request((const uint8_t *)big, (size_t)l, "https", "api.example.com", 443, &q);
+            if (over ? st != PP_REFUSE : (st != PP_OK || q.object_len != PP_OBJ_MAX)) {
+                printf("         request: an object of %zu bytes: %d\n", pre + tl, st); all = false;
+            }
+        }
+        /* each accepted request, read a byte at a time, asks for more until whole */
+        const char *one = "POST /v1/chat?x=1 HTTP/1.1\r\nHost: api.example.com\r\nTransfer-Encoding: chunked\r\n\r\n";
+        for (size_t j = 1; j < strlen(one); j++) {
+            pp_req_t q;
+            if (pp_request((const uint8_t *)one, j, "https", "api.example.com", 443, &q) != PP_MORE) {
+                printf("         request: a prefix of %zu bytes was not asked for more\n", j); all = false; break;
+            }
+        }
+        printf("  %s   requests inside TLS: the object, the Host, the target forms a server could read otherwise refused\n",
+               all ? "PASS" : "FAIL");
+        if (!all) fails = 1;
+    }
     printf("proxy_parse unit: %s\n", fails ? "FAIL" : "PASS");
     return fails;
 }
@@ -381,13 +510,17 @@ static int fuzz(unsigned long iters, unsigned long seed) {
     if (rnd() % 2) {                                  /* section 5: an upstream's reply in place of seed 2 */
         const char *u = "HTTP/1.1 200 Connection established\r\nVia: 1.1 squid\r\n\r\n";
         sl[2] = strlen(u); memcpy(seeds[2], u, sl[2]);
+    } else if (rnd() % 2) {                           /* v1.26.1: a request inside TLS in its place */
+        const char *q = "POST /v1/chat/completions?model=a%20b&x=1 HTTP/1.1\r\nHost: api.example.com:443\r\n"
+                        "Content-Length: 2\r\nX-Trace: ../a//b;c\r\n\r\n{}";
+        sl[2] = strlen(q); memcpy(seeds[2], q, sl[2]);
     }
     memcpy(seeds[4], c, sl[3]);
     sl[4] = sl[3] + client_hello(seeds[4] + sl[3], "api.example.com", 1, NULL, 0, 50);
     uint8_t ech[] = { 0xfe, 0x0d, 0, 1, 0 };
     sl[5] = client_hello(seeds[5], "x.example.com", 1, ech, sizeof ech, 0);
     static uint8_t buf[PP_IN_MAX + 4096];
-    unsigned long ok = 0, refused = 0, more = 0;
+    unsigned long ok = 0, refused = 0, more = 0, reqs_ok = 0;
     for (unsigned long it = 0; it < iters; it++) {
         int s = (int)(rnd() % 6);
         size_t n = sl[s];
@@ -428,6 +561,12 @@ static int fuzz(unsigned long iters, unsigned long seed) {
                 if (cg > (long)cut || cg < -1) abort();
                 if (st == PP_OK && r.kind == PP_KIND_HTTP && (r.head_len == 0 || r.head_len > cut)) abort();
             }
+            {                                            /* v1.26.1: a request inside TLS */
+                pp_req_t q;
+                pp_status_t qs = pp_request(buf, cut, "https", "api.example.com", 443, &q);
+                req_invariants(buf, cut, qs, &q);
+                if (qs == PP_OK) reqs_ok++;
+            }
             unsigned us; size_t ul; const char *uw;        /* section 5: the upstream's reply */
             pp_status_t ust = pp_upstream_reply(buf, cut, &us, &ul, &uw);
             if ((ust == PP_OK && (us < 200 || us > 299 || ul == 0 || ul > cut)) || (ust == PP_REFUSE && !uw)) abort();
@@ -436,8 +575,8 @@ static int fuzz(unsigned long iters, unsigned long seed) {
             else more++;
         }
     }
-    printf("proxy_parse fuzz: %lu inputs (seed %lu): %lu read, %lu refused, %lu asked for more; no fault\n",
-           iters * 2, seed, ok, refused, more);
+    printf("proxy_parse fuzz: %lu inputs (seed %lu): %lu read, %lu refused, %lu asked for more; %lu requests "
+           "read as inside TLS; no fault\n", iters * 2, seed, ok, refused, more, reqs_ok);
     return 0;
 }
 
