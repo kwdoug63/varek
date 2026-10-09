@@ -1,10 +1,9 @@
 # VAREK v1.24.0 — Host Names Without Agent DNS
 
-> **DRAFT, not released.** The second 24-hour soak passed. Before tagging:
-> a short soak trial on the Warden with the review's fixes. The review was done by AI
-> review agents; a human or third-party review has not been done.
+Released 2026-10-07 · MIT · github.com/kwdoug63/varek
 
-Released PENDING · MIT · github.com/kwdoug63/varek
+> The review of this release was done by AI review agents; a human or
+> third-party review has not been done.
 
 ## Summary
 
@@ -139,7 +138,10 @@ second ran on the Warden with that bug fixed, from 2026-10-06 19:50 to
 
 The second run used the Warden as of the `host.conf` fix, before the review's
 fixes. Those fixes do not change what the soak exercises (CDN addresses are
-not special addresses), and a short trial on the final Warden confirms it.
+not special addresses). A 3-minute trial of the same soak on the released
+Warden (main at 3c179a1, the same droplet, 2026-10-07) passed: 9 of 9 fetches
+through Fastly, Cloudflare and CloudFront, 0 refused connects, every peer in
+the resolution records, and `varek_audit.py` PASS.
 
 ## Latency
 
