@@ -1,9 +1,10 @@
 # VAREK v1.24.0 — Host Names Without Agent DNS
 
-> The second 24-hour soak passed. The review was done by AI review agents; a
-> human or third-party review has not been done.
+> **DRAFT, not released.** The second 24-hour soak passed. Before tagging:
+> a short soak trial on the Warden with the review's fixes. The review was done by AI
+> review agents; a human or third-party review has not been done.
 
-Released 2026-10-09 · MIT · github.com/kwdoug63/varek
+Released PENDING · MIT · github.com/kwdoug63/varek
 
 ## Summary
 
@@ -138,8 +139,7 @@ second ran on the Warden with that bug fixed, from 2026-10-06 19:50 to
 
 The second run used the Warden as of the `host.conf` fix, before the review's
 fixes. Those fixes do not change what the soak exercises (CDN addresses are
-not special addresses). A short soak trial on the final Warden was planned
-to confirm it; it is not recorded here.
+not special addresses), and a short trial on the final Warden confirms it.
 
 ## Latency
 

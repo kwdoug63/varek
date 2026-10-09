@@ -1,9 +1,10 @@
 # VAREK v1.25.0 — Wildcard Host Names, Opt-In
 
-> The review was done by AI review agents; a human or third-party review has
-> not been done.
+> **DRAFT, not released.** The review was done by AI review agents; a human
+> or third-party review has not been done. Still to come before tagging:
+> - the release date.
 
-Released 2026-10-09 · MIT · github.com/kwdoug63/varek
+Released PENDING · MIT · github.com/kwdoug63/varek
 
 ## Summary
 
