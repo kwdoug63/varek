@@ -9,9 +9,37 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+- v1.26.1, the egress proxy's inspecting mode (`proxy inspect`): see
+  `RELEASE-v1.26.1.md` (draft) and `docs/security/v1.26.1-inspecting-mode.md`.
+
+## [1.26.0] - 2026-10-09 — The egress proxy, SNI mode
+
+With `proxy on` (after `require warden 1.26`), connects on the proxied ports
+(80 and 443, or `proxy ports`) are decided on the name the client asks for,
+the TLS SNI or the HTTP `Host`, read by a separate, unprivileged proxy; the
+Warden decides that name with the SMT decision procedure, certifies it,
+dials only an address the name resolves to and passes the socket to the
+proxy to relay. Names allowed only on proxied ports get synthetic
+addresses, so the agent sends no DNS for them. Plain HTTP is checked request
+by request; Encrypted Client Hello and QUIC on proxied ports are refused.
+`proxy upstream http://HOST:PORT` chains to a customer's egress proxy. Every
+hand-off, decision and close is a chained record the audit checks. The
+Warden reports version 1.26.0.
+
+Reviewed by four AI review agents (not a human or third-party review); a
+24-hour soak against three CDNs passed. See `RELEASE-v1.26.0.md` for the
+grammar, tests, latency, the review's findings, compatibility and known
+limits, and `docs/security/v1.26-egress-proxy.md` for the design.
+
+v1.26.0 builds on the host-name (v1.24.0) and wildcard (v1.25.0) releases below.
+
+## [1.25.0] - 2026-10-09 — Wildcard host names, opt-in
+
+See `RELEASE-v1.25.0.md`. Reviewed by four AI review agents (not a human or
+third-party review).
+
 ### Added
-- v1.25.0, in progress (opt-in wildcard host names,
-  `docs/security/v1.25-wildcard-host-names.md`), sections 1 to 4:
+- Opt-in wildcard host names (`docs/security/v1.25-wildcard-host-names.md`):
   - Policy grammar: `allow host *.example.com[:port] acknowledge=dns-channel`
     after `require warden 1.25`, in the decision procedure, the certificate
     checker and the cross-check oracle. Every wildcard allow rule must carry
@@ -90,9 +118,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     3 connects decided within 1 ms of a grace ending, from rounding the
     soak's older audit did not allow for; the stream passes the audit as of
     9858835, and the Warden now records each end of grace.
-  - `RELEASE-v1.25.0.md`: draft release notes.
-- v1.24.0, in progress (host names without agent DNS,
-  `docs/security/v1.21-stage2-host-names.md`), sections 1 and 2:
+  - `RELEASE-v1.25.0.md`: release notes.
+## [1.24.0] - 2026-10-09 — Host names without agent DNS
+
+See `RELEASE-v1.24.0.md`. Reviewed by four AI review agents (not a human or
+third-party review).
+
+### Added
+- Host names without agent DNS (`docs/security/v1.21-stage2-host-names.md`):
   - Policy grammar: `allow host api.example.com[:port]` and `deny host <name>`
     after `require warden 1.24`, in the decision procedure, the certificate
     checker and the cross-check oracle; malformed names, wildcards (v1.25) and
@@ -178,28 +211,6 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   sizing, prerequisites and the launch steps say so, and that only the listed
   types launch. Troubleshooting covers the Free plan (which cannot launch AWS
   Marketplace AMIs) and an instance type the listing does not offer.
-
-## [1.26.0] - 2026-10-09 — The egress proxy, SNI mode
-
-With `proxy on` (after `require warden 1.26`), connects on the proxied ports
-(80 and 443, or `proxy ports`) are decided on the name the client asks for,
-the TLS SNI or the HTTP `Host`, read by a separate, unprivileged proxy; the
-Warden decides that name with the SMT decision procedure, certifies it,
-dials only an address the name resolves to and passes the socket to the
-proxy to relay. Names allowed only on proxied ports get synthetic
-addresses, so the agent sends no DNS for them. Plain HTTP is checked request
-by request; Encrypted Client Hello and QUIC on proxied ports are refused.
-`proxy upstream http://HOST:PORT` chains to a customer's egress proxy. Every
-hand-off, decision and close is a chained record the audit checks. The
-Warden reports version 1.26.0.
-
-Reviewed by four AI review agents (not a human or third-party review); a
-24-hour soak against three CDNs passed. See `RELEASE-v1.26.0.md` for the
-grammar, tests, latency, the review's findings, compatibility and known
-limits, and `docs/security/v1.26-egress-proxy.md` for the design.
-
-v1.26.0 builds on the host-name (v1.24.0) and wildcard (v1.25.0) work listed
-under Unreleased above; their own release notes are still drafts.
 
 ## [1.23.1] - 2026-10-04 — Enterprise license check fix
 
