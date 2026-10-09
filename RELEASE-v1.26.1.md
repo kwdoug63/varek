@@ -3,7 +3,6 @@
 > **DRAFT, not released.** Still to come before tagging:
 > - the 24-hour soak in inspecting mode on the droplet ("24 hours against
 >   three CDNs");
-> - the Warden's version raised to `1.26.1` (it still reports `1.26.0`);
 > - the release date.
 >
 > The review was done by AI review agents; a human or third-party review
@@ -135,7 +134,7 @@ behaves as on v1.26.0; `proxy on` is SNI mode, as before.
 
 ## Tested with real clients
 
-`make test-v1261` runs 192 checks; CI runs it, with the Warden as root. It
+`make test-v1261` runs 193 checks; CI runs it, with the Warden as root. It
 uses local TLS and HTTP servers that log and hash what reaches them, so each
 check compares what the policy decided with what the server got:
 
@@ -190,7 +189,7 @@ random targets.
 
 **Regression.** Against the v1.26.0 Warden, parsers and audit (with this
 release's `warden-proxy` beside it, so that no section is skipped), the
-suite fails 187 of its 192 checks. v1.26.0 refuses every `proxy inspect`
+suite fails 188 of its 193 checks. v1.26.0 refuses every `proxy inspect`
 policy, so nothing is decided, no CA is made and no view is served. 51 of
 the failures are grammar checks of refused forms, which v1.26.0 refuses as
 an unknown kind or directive rather than for the reason the check names.
@@ -269,6 +268,9 @@ sends its own records at once; tickets stay off.
   `tls_timeout` and `max_body`; `run_end`'s `proxy_failed`; the trust
   views' `trust_view`, `run_ca_view`, `trust_store_view` and
   `view_metadata` rules.
+- `run_start` reports the Warden as `1.26.1` (so does `varek version`).
+  The policy grammar is still 1.26: inspecting mode needs `require warden
+  1.26`, as SNI mode does.
 - `vdp_cert_check`'s `proxy` mode prints `inspect` and the passthrough
   hosts; its `rules` mode has an eleventh field, a request rule's
   `max_body` (kind `r`).

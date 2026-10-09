@@ -578,7 +578,7 @@ answers `ENOSYS` rather than killing, so Node.js runs). Decided connections
 destination-swap race: 2,000 attempts, 0 reached the denied side (`make
 test-v1210`). Inspecting mode (v1.26.1) is tested with Python, curl, Node.js
 and Java against servers that log what reaches them, and with forged
-streams the audit must refuse (`make test-v1261`, 192 checks). Build and run with `make check`
+streams the audit must refuse (`make test-v1261`, 193 checks). Build and run with `make check`
 in the relevant version directory. Containment verification: `python
 verify_guardrails.py` (see above).
 
