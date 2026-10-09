@@ -1,8 +1,6 @@
 # VAREK v1.26.0 — The Egress Proxy, SNI Mode
 
-> **DRAFT, not released.** Still to come before tagging:
-> - the 24-hour soak on the droplet ("24 hours against three CDNs");
-> - the release date.
+> **DRAFT, not released.** Still to come before tagging: the release date.
 >
 > The review was done by AI review agents; a human or third-party review
 > has not been done.
@@ -159,7 +157,7 @@ upstreams among them, valid and malformed, in the fuzzed policies.
 
 ## 24 hours against three CDNs
 
-PENDING. `tests/soak_v1260/soak.sh` fetches, one request a minute for 24
+Passed. `tests/soak_v1260/soak.sh` fetches, one request a minute for 24
 hours, PyPI's JSON API (Fastly), Cloudflare's IP list API and trace endpoint
 over HTTPS (one by a wildcard rule) and plain HTTP (Cloudflare), and AWS's IP
 ranges (CloudFront). The third fetch, and every tenth after it, is a probe:
@@ -172,6 +170,29 @@ a second trial passed (2 fetches, 1 probe refused and recorded). The
 as `1.25.0` (the version was raised to `1.26.0` after it started). It is the
 code before the review's fixes; its request gate on plain HTTP, the
 mapped-address refusal and the proxy's hardening are not in it.
+
+It ran 24.00 hours on a 1-vCPU, 1 GB droplet and `soak_check.py` passed:
+
+- 1,296 fetches, all 1,296 succeeded; 21,245 records.
+- No fetch the policy allows was refused, and none lacks its decision or
+  its close: 1,440 hand-offs and 1,440 proxied decisions, 1,296 closes
+  (all `closed`), relaying 956,561 bytes up and 27,129,035 down.
+- 144 probes (`pypi.org`'s address, SNI `example.org`): all 144 refused and
+  recorded.
+- `varek_audit.py` passed on the whole stream.
+
+Per name, the Warden's time from the proxy's report to the socket passed
+back (the decision, the certificate, and the dial to the CDN, which the
+local latency test below does not include) and the agent's whole request,
+p50 / p99:
+
+| Name | Fetches | Warden, decision and dial | Agent's request |
+|---|---|---|---|
+| `api.cloudflare.com:443` | 259 | 2,891 / 7,782 µs | 88 / 215 ms |
+| `ip-ranges.amazonaws.com:443` | 259 | 2,912 / 7,981 µs | 54 / 70 ms |
+| `pypi.org:443` | 260 | 2,324 / 7,737 µs | 52 / 67 ms |
+| `www.cloudflare.com:443` (wildcard rule) | 259 | 2,857 / 6,344 µs | 60 / 79 ms |
+| `www.cloudflare.com:80` (plain HTTP) | 259 | 2,803 / 7,109 µs | 8 / 20 ms |
 
 ## Latency
 
