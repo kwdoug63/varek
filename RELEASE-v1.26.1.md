@@ -4,7 +4,7 @@
 > - the 24-hour soak in inspecting mode on the droplet ("24 hours against
 >   three CDNs");
 > - the Warden's version raised to `1.26.1` (it still reports `1.26.0`);
-> - the spec paper edition and the release date.
+> - the release date.
 >
 > The review was done by AI review agents; a human or third-party review
 > has not been done.
