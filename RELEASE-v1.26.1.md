@@ -1,9 +1,6 @@
 # VAREK v1.26.1 — The Egress Proxy's Inspecting Mode
 
-> **DRAFT, not released.** Still to come before tagging:
-> - the 24-hour soak in inspecting mode on the droplet ("24 hours against
->   three CDNs");
-> - the release date.
+> **DRAFT, not released.** Still to come before tagging: the release date.
 >
 > The review was done by AI review agents; a human or third-party review
 > has not been done.
@@ -200,7 +197,7 @@ refused request never reached the server" holds trivially. Three test
 
 ## 24 hours against three CDNs
 
-PENDING. `tests/soak_v1261/soak.sh` runs v1.26.0's soak in inspecting mode:
+Passed. `tests/soak_v1261/soak.sh` runs v1.26.0's soak in inspecting mode:
 one request a minute for 24 hours to PyPI's JSON API (Fastly), Cloudflare's
 IP list API and trace endpoint over HTTPS (one by a wildcard host and a
 wildcard request rule) and plain HTTP (Cloudflare), and AWS's IP ranges
@@ -211,7 +208,36 @@ segment, a path a deny rule refuses, and a path no rule allows.
 `soak_check.py` requires each fetch's connection, certified request and
 close with its count, and runs the audit. A local trial (the same URLs,
 policy and probes, served by local servers) passed: 32 fetches, 4 probes
-refused, the audit passed.
+refused, the audit passed. A 3-minute trial on the droplet passed (2
+fetches, 1 probe refused and recorded). The 24-hour run started 2026-10-09
+from the branch at aafcd68, which reports itself as `1.26.1`, with
+`warden-proxy` SHA-256 `f8d5a945...`.
+
+It ran 24.00 hours on a 1-vCPU, 1 GB droplet and `soak_check.py` passed:
+
+- 1,296 fetches, all 1,296 succeeded; 19,658 records.
+- No fetch the policy allows was refused, and none lacks its connection,
+  its certified request, or its close and count: 1,440 proxied decisions,
+  1,353 request decisions, 1,411 closes (1,296 `closed`, 115
+  `refused_request`) counting 1,353 requests, relaying 290,562 bytes up and
+  23,180,862 down.
+- 144 probes, all refused and recorded where they must be: 29 fronted
+  SNIs (the name refused), 29 fronted `Host`s and 29 `/./` paths (refused
+  by the proxy's parser, nothing decided), 29 paths the deny rule refuses
+  (`policy_match`) and 28 paths no rule allows (`default_deny_unknown`).
+- `varek_audit.py` passed on the whole stream.
+
+Per name, the Warden's time on the connection (the decision, the
+certificate, and the dial to the CDN) and on the request (decided and
+certified), and the agent's whole fetch, p50 / p99:
+
+| Name | Fetches | Warden, connection | Warden, request | Agent's fetch |
+|---|---|---|---|---|
+| `api.cloudflare.com:443` | 259 | 2,739 / 5,430 µs | 15 / 38 µs | 41 / 76 ms |
+| `ip-ranges.amazonaws.com:443` | 259 | 2,823 / 4,387 µs | 17 / 36 µs | 17 / 23 ms |
+| `pypi.org:443` | 260 | 2,254 / 4,213 µs | 16 / 35 µs | 15 / 26 ms |
+| `www.cloudflare.com:443` (wildcard rules) | 259 | 2,715 / 5,819 µs | 18 / 36 µs | 19 / 27 ms |
+| `www.cloudflare.com:80` (plain HTTP) | 259 | 2,607 / 4,503 µs | 15 / 35 µs | 8 / 12 ms |
 
 ## Latency
 
