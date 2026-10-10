@@ -9,8 +9,24 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-- v1.26.1, the egress proxy's inspecting mode (`proxy inspect`): see
-  `RELEASE-v1.26.1.md` (draft) and `docs/security/v1.26.1-inspecting-mode.md`.
+## [1.26.1] - 2026-10-10 — The egress proxy, inspecting mode
+
+With `proxy inspect`, the proxy (now its own binary, `warden-proxy`, loaded
+into a sealed memfd and hashed in `run_start`) verifies each server,
+terminates the agent's TLS with a CA made for the run and name-constrained
+to the policy's names, and reports every request; the Warden decides its
+method, path and query against `allow|deny request METHOD URL [max_body=N]`
+rules with the SMT decision procedure and certifies it before a byte of it
+is sent. Requests a server could read as another path are refused, bodies
+are bounded by `max_body` and recorded by length and SHA-256, and
+`proxy passthrough host` keeps pinned clients in SNI mode. Every request is
+a chained record the audit checks; `varek refusals`, the CycloneDX export
+and `varek bench --proxy` cover it. The Warden reports version 1.26.1.
+
+Reviewed by AI review agents (not a human or third-party review); a 24-hour
+soak in inspecting mode against three CDNs passed. See `RELEASE-v1.26.1.md`
+for the grammar, tests, latency, the review's findings, compatibility and
+known limits, and `docs/security/v1.26.1-inspecting-mode.md` for the design.
 
 ## [1.26.0] - 2026-10-09 — The egress proxy, SNI mode
 

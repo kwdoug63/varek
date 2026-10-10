@@ -2,7 +2,7 @@
 
 # VAREK — Technical Specification
 
-**Version 1.26.1** (October 2026, draft). Supersedes the v1.26.0 edition. Corrections made to earlier editions are folded into the text and listed in Appendix B.
+**Version 1.26.1** (October 2026). Supersedes the v1.26.0 edition. Corrections made to earlier editions are folded into the text and listed in Appendix B.
 
 *Deterministic runtime verification of autonomous AI agents using formal methods.*
 
