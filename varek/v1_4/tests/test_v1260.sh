@@ -359,7 +359,13 @@ for t in sys.argv[2:]:
             print("CONNECTED", t, flush=True)
             continue
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect((host, port))            # blocking, as most clients
+        if host == "192.0.2.9":            # dialed directly: a network may drop it, not refuse it
+            s.settimeout(3)
+        try:
+            s.connect((host, port))
+        except socket.timeout:
+            print("ERR", t, "timeout", flush=True)
+            continue
         s.settimeout(1)                    # sends nothing: the proxy holds it, waiting
         try:
             d = s.recv(10)
@@ -851,8 +857,12 @@ PY
         sh -c "grep -q '^UDP $HOSTIP $HOLDP CONNECTED$' '$OUT/u.out' && grep -q '\"target\":\"$HOSTIP:$HOLDP\",\"resolved\":\"$HOSTIP:$HOLDP\",\"decision_raw\":\"ALLOW\",\"decision_final\":\"ALLOW\",\"rule\":\"dialed_fd_injection\"' '$OUT/u.log'"
     check "the audit accepts that run" \
         python3 "$HERE/tools/varek_audit.py" --policy "$POL8" --checker "$CERT" "$OUT/u.log"
-    cp "$POL6" "$W/np.policy"; chmod 644 "$W/np.policy"
-    env VAREK_WARDEN_NO_PIDNS=1 setpriv --reuid=65534 --regid=65534 --clear-groups "$WARDEN" "$W/np.policy" -- /bin/true > "$OUT/np.out" 2>&1
+    # no wildcard rule: the copy below has no data/ beside it
+    printf 'require warden 1.26\nproxy on\nallow host api.example.com:443\nallow path /usr/ readonly\n' > "$W/np.policy"
+    chmod 644 "$W/np.policy"
+    # a copy the user can reach (a CI runner's home is not open to others)
+    cp "$WARDEN" "$W/warden-np"; chmod 755 "$W/warden-np"
+    env VAREK_WARDEN_NO_PIDNS=1 setpriv --reuid=65534 --regid=65534 --clear-groups "$W/warden-np" "$W/np.policy" -- /bin/true > "$OUT/np.out" 2>&1
     check "the Warden does not run \`proxy on\` without its proxy (not as root)" \
         grep -q 'proxy on. needs the Warden to run as root' "$OUT/np.out"
     forge "$OUT/u.log" "$OUT/x1.log" '"proxy":\{[^}]*\},' '' re
