@@ -60,7 +60,7 @@ jobs:
         run: sudo make -C varek/v1_4 test-v1260
       - name: v1.26.1 inspecting mode (grammar, warden-proxy, the run's CA, terminating TLS, request decisions, audit and tools, review fixes, bench)
         run: sudo make -C varek/v1_4 test-v1261
-      - name: v1.27 decided program launches (grammar and opt-in, the launch set, deciding launches, the identity check, audit and tools)
+      - name: v1.27 decided program launches (grammar and opt-in, the launch set, deciding launches, the identity check, audit and tools, what launching needs)
         run: sudo make -C varek/v1_4 test-v1270
       - name: Build and test the plan_verify CLI (v1_6, v1.16.3)
         run: make -C v1_6 plan_verify check check-plan-verify
