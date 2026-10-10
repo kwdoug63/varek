@@ -9,6 +9,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+- v1.27.0, decided program launches (in progress): the plan in
+  `docs/security/v1.27-program-launches.md` is revised with what was measured
+  on Landlock (a plain memfd and the dynamic loader get past an execute
+  ruleset; the first is already closed by the hard-deny set, the second by
+  an identity check before any call of a launched process is answered), the
+  opt-in (`require warden 1.27`), and the implementation steps.
+
 ## [1.26.1] - 2026-10-10 — The egress proxy, inspecting mode
 
 With `proxy inspect`, the proxy (now its own binary, `warden-proxy`, loaded
