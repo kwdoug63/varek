@@ -23,6 +23,16 @@
 #      SHA-256 (checked against the file), the agent running in the domain,
 #      a run without the opt-in and one without Landlock, all accepted by the
 #      audit
+#   3. deciding a launch (as root): each launch after the first is decided on
+#      its name (absolute: a relative path, "..", execveat by descriptor),
+#      certified, and continued only onto a file of the set: an allowed launch
+#      runs, onto the set's entry it is recorded with; refused: no rule, a deny
+#      rule, a file written during the run whose name is allowed
+#      (exec_not_in_ruleset), any launch without Landlock (exec_no_landlock)
+#      or without the opt-in (as in v1.26); a script whose interpreter is not
+#      in the set is allowed by the Warden and refused by the kernel; a
+#      launched program's own calls are mediated; the audit accepts the runs
+#      and refuses forged launch records
 #
 # Usage: test_v1270.sh <vdp_check> <vdp_cert_check> [<warden>]
 set -u
@@ -251,6 +261,180 @@ PY
     for n in r1 r2 r3 r4 r5; do
         check "the audit accepts run $n" python3 "$HERE/tools/varek_audit.py" --policy "$W/$n.policy" --checker "$CERT" "$OUT/log/$n.log"
     done
+fi
+
+echo "== 3. deciding a launch =="
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
+    skip "section 3 (needs root and the warden binary)"
+else
+    D=/tmp/varek_v1270d.$$
+    rm -rf "$D"; mkdir -p "$D/bin/sub" "$D/run"; chmod 755 "$D" "$D/bin" "$D/bin/sub"; chmod 777 "$D/run"
+    trap '[ -n "${KEEP:-}" ] && echo "kept $OUT ${W:-} $D" || rm -rf "$OUT" "${W:-}" "$D"' EXIT
+    printf '#!/bin/sh\necho SH\n' > "$D/bin/sh.sh"
+    printf '#!/usr/bin/python3\nprint("PYSCRIPT", flush=True)\n' > "$D/bin/py.sh"
+    chmod 755 "$D/bin/sh.sh" "$D/bin/py.sh"
+    ln -s /usr/bin/git "$D/bin/gitlink"
+    # the agent: each argument is "label:mode:path[:arg]", tried in turn
+    cat > "$D/agent.py" <<'PY'
+import os, subprocess, sys
+for spec in sys.argv[1:]:
+    label, mode, path, *arg = spec.split(":")
+    try:
+        if mode == "run":
+            r = subprocess.run([path] + arg, capture_output=True, text=True, timeout=20)
+            print(label, "RAN", r.returncode, (r.stdout.strip().splitlines() or [""])[0][:60], flush=True)
+        elif mode == "write":                       # a file made now, then launched
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o755)
+            os.write(fd, open("/usr/bin/true", "rb").read()); os.close(fd)
+            r = subprocess.run([path], timeout=20)
+            print(label, "RAN", r.returncode, flush=True)
+        elif mode == "fd":                          # execveat(fd, "", AT_EMPTY_PATH)
+            pid = os.fork()
+            if pid == 0:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.execve(fd, [path] + arg, {})
+                except OSError as e:
+                    os._exit(100 + e.errno)
+            _, st = os.waitpid(pid, 0)
+            c = os.waitstatus_to_exitcode(st)
+            print(label, "ERR" if c >= 100 else "RAN", c - 100 if c >= 100 else c, flush=True)
+    except OSError as e:
+        print(label, "ERR", e.errno, flush=True)
+PY
+    chmod 644 "$D/agent.py"
+    POL3="require warden 1.27
+deny exec /usr/bin/env
+allow exec /usr/bin/git
+allow exec /usr/bin/python3
+allow exec $D/bin/sh.sh
+allow exec $D/bin/py.sh
+allow exec $D/bin/gitlink
+allow exec prefix $D/run/
+deny exec /usr/bin/truncate
+allow exec prefix /usr/bin/tru
+allow path $D/run/
+allow path /usr/ readonly
+allow path /lib readonly
+allow path /etc/ readonly
+allow path /dev/null
+allow path $D/ readonly
+"
+    printf '%s' "$POL3" | grep -v '/usr/bin/tru' > "$D/p3"; chmod 644 "$D/p3"
+    (cd "$D" && env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$D/p3" -- /usr/bin/python3 "$D/agent.py" \
+        git:run:/usr/bin/git:--version false:run:/usr/bin/false env:run:/usr/bin/env \
+        written:write:"$D/run/new" shscript:run:"$D/bin/sh.sh" pyscript:run:"$D/bin/py.sh" \
+        relative:run:./bin/py.sh dotdot:run:"$D/bin/sub/../py.sh" link:run:"$D/bin/gitlink":--version \
+        byfd:fd:/usr/bin/git:--version child:run:/usr/bin/python3:-c \
+        > "$OUT/x.out" 2> "$OUT/x.log")
+    xrec() {   # xrec <python expression over the process.exec records, by resolved name: e, run_start: rs>
+        python3 - "$OUT/x.log" "$1" <<'PY'
+import json, sys
+recs = [json.loads(l[l.index("{"):]) for l in open(sys.argv[1], errors="replace") if l.startswith("{")]
+rs = next(r for r in recs if r.get("event") == "run_start")
+ex = [r for r in recs if r.get("action") == "process.exec" and r.get("rule") != "bootstrap_exec_allow"]
+def e(name): return [r for r in ex if r.get("resolved") == name]
+def by_target(t): return [r for r in ex if r.get("target") == t]
+sys.exit(0 if eval(sys.argv[2]) else 1)
+PY
+    }
+    check "an allowed launch runs (git --version)" grep -q '^git RAN 0 git version' "$OUT/x.out"
+    check "decided on its name, certified, recorded with its file of the set" \
+        xrec "(lambda r: r['decision_final'] == 'ALLOW' and r['rule'] == 'exec_allowed' and r['check'] == 'ok' and rs['exec_ruleset'][r['exec_set']]['ino'] == r['exec_ino'] and rs['exec_ruleset'][r['exec_set']]['name'] == '/usr/bin/git')(e('/usr/bin/git')[0])"
+    check "a launch no rule allows is refused (EACCES, default_deny_unknown)" \
+        sh -c "grep -q '^false ERR 13$' '$OUT/x.out'" 
+    check "and recorded so" xrec "e('/usr/bin/false')[0]['rule'] == 'default_deny_unknown'"
+    check "a launch a deny rule refuses (policy_match)" \
+        sh -c "grep -q '^env ERR 13$' '$OUT/x.out'"
+    check "recorded with the deny rule's line" xrec "e('/usr/bin/env')[0]['rule'] == 'policy_match' and e('/usr/bin/env')[0]['policy_line'] == 2"
+    check "a file written during the run, though its name is allowed, is refused (exec_not_in_ruleset)" \
+        sh -c "grep -q '^written ERR 13$' '$OUT/x.out'"
+    check "recorded so" xrec "e('$D/run/new')[0]['rule'] == 'exec_not_in_ruleset' and e('$D/run/new')[0]['decision_raw'] == 'ALLOW'"
+    check "a script whose interpreter is not in the set: allowed by the Warden, refused by the kernel (Landlock)" \
+        sh -c "grep -q '^shscript ERR 13$' '$OUT/x.out'"
+    check "the Warden's record of it" xrec "e('$D/bin/sh.sh')[0]['rule'] == 'exec_allowed'"
+    check "a script whose interpreter is allowed runs" grep -q '^pyscript RAN 0 PYSCRIPT' "$OUT/x.out"
+    check "a relative path is decided on its absolute name" \
+        sh -c "grep -q '^relative RAN 0 PYSCRIPT' '$OUT/x.out'"
+    check "recorded as the agent wrote it, and the name" xrec "by_target('./bin/py.sh')[0]['resolved'] == '$D/bin/py.sh'"
+    check "a path through .. is decided on the name it reaches" xrec "by_target('$D/bin/sub/../py.sh')[0]['resolved'] == '$D/bin/py.sh'"
+    check "a symlink is decided on its own name, onto its file" \
+        sh -c "grep -q '^link RAN 0 git version' '$OUT/x.out'"
+    check "and recorded so" xrec "(lambda r: r['rule'] == 'exec_allowed' and rs['exec_ruleset'][r['exec_set']]['path'] == '$(readlink -f /usr/bin/git)')(e('$D/bin/gitlink')[0])"
+    check "execveat by descriptor is decided on the descriptor's file" \
+        sh -c "grep -q '^byfd RAN 0' '$OUT/x.out'"
+    check "recorded with an empty path and the file's name" xrec "(lambda r: r['target'] == '' and r['resolved'] == '$(readlink -f /usr/bin/git)' and r['rule'] == 'exec_allowed')([r for r in ex if r.get('target') == ''][0])"
+    check "a launched program is still mediated (its own records, its own pid)" \
+        xrec "len({r['agent_pid'] for r in recs if r.get('action') == 'file.open'}) >= 2"
+    check "the audit accepts the run" python3 "$HERE/tools/varek_audit.py" --policy "$D/p3" --checker "$CERT" "$OUT/x.log"
+
+    # a prefix rule, with a deny rule before it
+    printf '%s' "$POL3" > "$D/p3b"; chmod 644 "$D/p3b"
+    (cd "$D" && env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$D/p3b" -- /usr/bin/python3 "$D/agent.py" \
+        true:run:/usr/bin/true trunc:run:/usr/bin/truncate > "$OUT/y.out" 2> "$OUT/y.log")
+    check "a prefix rule: a file it admits runs" grep -q '^true RAN 0' "$OUT/y.out"
+    check "and the deny before it still holds" grep -q '^trunc ERR 13$' "$OUT/y.out"
+    # without Landlock, or without the opt-in
+    (cd "$D" && env -i PATH=/usr/bin:/bin VAREK_WARDEN_TEST_NO_LANDLOCK=1 timeout 120 "$WARDEN" "$D/p3" -- \
+        /usr/bin/python3 "$D/agent.py" git:run:/usr/bin/git:--version > "$OUT/z.out" 2> "$OUT/z.log")
+    check "without Landlock an allowed launch is refused (exec_no_landlock)" \
+        sh -c "grep -q '^git ERR 13$' '$OUT/z.out' && grep -q '\"rule\":\"exec_no_landlock\"' '$OUT/z.log'"
+    check "the audit accepts that run" python3 "$HERE/tools/varek_audit.py" --policy "$D/p3" --checker "$CERT" "$OUT/z.log"
+    sed 's/require warden 1.27/require warden 1.26/' "$D/p3" > "$D/p3c"; chmod 644 "$D/p3c"
+    (cd "$D" && env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$D/p3c" -- \
+        /usr/bin/python3 "$D/agent.py" git:run:/usr/bin/git:--version > "$OUT/w.out" 2> "$OUT/w.log")
+    check "without the opt-in every later launch is refused as in v1.26 (deny_only_nonfile_v191)" \
+        sh -c "grep -q '^git ERR 13$' '$OUT/w.out' && grep -q '\"rule\":\"deny_only_nonfile_v191\"' '$OUT/w.log'"
+    # forged streams the audit must refuse
+    xseq() { python3 -c "
+import json,sys
+for l in open(sys.argv[1], errors='replace'):
+    if l.startswith('{'):
+        r=json.loads(l)
+        if r.get('action')=='process.exec' and r.get('resolved')==sys.argv[2]: print(r['seq']); break" "$OUT/x.log" "$1"; }
+    refuses() {   # refuses <description> <policy> <log> <message>
+        if python3 "$HERE/tools/varek_audit.py" --policy "$2" --checker "$CERT" "$3" > "$OUT/f.out" 2>&1; then
+            flunk "the audit refuses $1"
+        elif grep -qF "$4" "$OUT/f.out"; then pass "the audit refuses $1"
+        else flunk "the audit refuses $1 ($(grep -m1 'PROBLEM' "$OUT/f.out"))"; fi
+    }
+    GS=$(xseq /usr/bin/git); FS=$(xseq /usr/bin/false); WS=$(xseq "$D/run/new")
+    python3 - "$OUT/x.log" "$OUT" "$GS" "$FS" "$WS" <<'PY'
+import hashlib, json, sys
+src, out, gs, fs, ws = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+lines = open(src, errors="surrogateescape").read().splitlines(True)
+def rechain(recs, name):
+    head = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
+    with open(f"{out}/{name}", "w", errors="surrogateescape") as f:
+        for l in recs:
+            if l.startswith("{") and ',"chain":"' in l:
+                body = l[:l.index(',"chain":"')]
+                head = hashlib.sha256(head + body.encode("utf-8", "surrogateescape")).digest()
+                l = body + ',"chain":"' + head.hex() + '"}\n'
+            f.write(l)
+def edit(seq, fn, name):
+    res = []
+    for l in lines:
+        if l.startswith("{") and f'"seq":{seq},' in l:
+            r = json.loads(l); fn(r); r.pop("chain", None)
+            l = json.dumps(r, separators=(",", ":")) + ',"chain":"x"}\n'
+            l = l[:l.rindex("}", 0, l.rindex(',"chain"'))] + l[l.rindex(',"chain"'):]
+        res.append(l)
+    rechain(res, name)
+def allow(r): r.update(decision_raw="ALLOW", decision_final="ALLOW", rule="exec_allowed", kernel_verdict="ALLOW", errno=0)
+def setidx(r, k): r["exec_set"] = k
+g = next(json.loads(l) for l in lines if l.startswith("{") and f'"seq":{gs},' in l)
+edit(fs, lambda r: (allow(r), r.update({k: g[k] for k in ("exec_set", "exec_dev", "exec_ino", "exec_sha256",
+                                                          "cert_rule", "cert_witness", "check")})), "f1.log")
+edit(ws, lambda r: (allow(r), r.update(exec_set=0, cert_rule=7, cert_witness="-", check="ok")), "f2.log")
+edit(gs, lambda r: r.update(exec_ino=r["exec_ino"] + 1), "f3.log")
+edit(gs, lambda r: r.update(exec_set=999), "f4.log")
+PY
+    refuses "an allowed launch of a name the policy does not allow" "$D/p3" "$OUT/f1.log" "certificate for '/usr/bin/false' refused"
+    refuses "an allowed launch onto a file outside the set" "$D/p3" "$OUT/f2.log" "a launch allowed onto"
+    refuses "an allowed launch whose file is not the set's entry" "$D/p3" "$OUT/f3.log" "not a file of the launch set"
+    refuses "an allowed launch naming no entry" "$D/p3" "$OUT/f4.log" "not a file of the launch set"
+    refuses "an allowed launch under a policy without the opt-in" "$D/p3c" "$OUT/x.log" "does not turn launches on"
 fi
 
 echo

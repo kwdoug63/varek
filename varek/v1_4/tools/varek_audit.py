@@ -257,6 +257,36 @@ def policy_proxy(checker, policy):
     return [int(x) for x in ports]
 
 
+def policy_launches(checker, policy):
+    """v1.27: whether launches after the first are decided (require warden
+    1.27), as the checker reads the policy."""
+    rq = subprocess.run([checker, policy, "launches"], capture_output=True, text=True)
+    f = rq.stdout.split()
+    if rq.returncode != 0 or f not in (["on"], ["off"]):
+        raise ValueError("the checker failed on the policy's launches")
+    return f == ["on"]
+
+
+def check_exec_set(meta, launches, problems):
+    """v1.27: with launches on, run_start records Landlock (its ABI, or null
+    without it) and the launch set; without, neither."""
+    rs = meta.get("run_start", {})
+    has = "exec_ruleset" in rs or "landlock" in rs
+    if not launches:
+        if has:
+            problems.append("run_start records a launch set or Landlock, but the policy does not turn "
+                            "launches on (require warden 1.27)")
+        return
+    ll, ex = rs.get("landlock", "missing"), rs.get("exec_ruleset")
+    if not (ll is None or (isinstance(ll, dict) and type(ll.get("abi")) is int and ll["abi"] >= 1)):
+        problems.append(f"run_start's landlock {ll!r} is neither null nor an ABI")
+    if not isinstance(ex, list) or not all(
+            isinstance(e, dict) and isinstance(e.get("name"), str) and isinstance(e.get("path"), str) and
+            type(e.get("dev")) is int and type(e.get("ino")) is int and isinstance(e.get("sha256"), str) and
+            e.get("why") in ("rule", "loader", "bootstrap", "interpreter") for e in ex):
+        problems.append("run_start's exec_ruleset is missing or malformed")
+
+
 def policy_inspect(checker, policy):
     """v1.26.1: the policy's passthrough hosts (a list) in inspecting mode,
     or None when the policy does not turn inspecting mode on."""
@@ -1718,6 +1748,14 @@ def main(argv=None):
     except (OSError, ValueError) as e:
         problems.append(f"checker failed on the policy's proxy directives: {e}")
         proxy_ports = None
+    # v1.27: launches after the first decided (require warden 1.27)
+    try:
+        launches_policy = policy_launches(a.checker, a.policy)
+    except (OSError, ValueError) as e:
+        problems.append(f"checker failed on the policy's launches: {e}")
+        launches_policy = False
+    check_exec_set(meta, launches_policy, problems)
+    exec_ok = 0
     stub_policy = wild_policy or (proxy_ports is not None and any(
         r["kind"] == "h" and r["name"] and not r["wild"] for r in prules))
     if wild_policy:
@@ -1869,6 +1907,31 @@ def main(argv=None):
                 view_recs.append((rec, 0))
             views += 1
             continue
+        # v1.27 (step 3): a launch the policy allows by its name, onto a file of
+        # the launch set (the entry it names: same device, inode and hash), in a
+        # run that Landlock holds; certified on the name like an open
+        is_exec = rec.get("action") == "process.exec" and rec.get("rule") == "exec_allowed"
+        if is_exec:
+            seq = rec.get("seq")
+            rs = meta.get("run_start", {})
+            ex = rs.get("exec_ruleset") if isinstance(rs.get("exec_ruleset"), list) else []
+            k = rec.get("exec_set")
+            ent = ex[k] if type(k) is int and 0 <= k < len(ex) and isinstance(ex[k], dict) else None
+            if not launches_policy:
+                problems.append(f"seq {seq}: a launch allowed, but the policy does not turn launches on")
+                continue
+            if not isinstance(rs.get("landlock"), dict):
+                problems.append(f"seq {seq}: a launch allowed, but run_start records no Landlock")
+                continue
+            if ent is None or rec.get("exec_dev") != ent.get("dev") or rec.get("exec_ino") != ent.get("ino") \
+                    or rec.get("exec_sha256") != ent.get("sha256"):
+                problems.append(f"seq {seq}: a launch allowed onto {k!r}, not a file of the launch set "
+                                f"as run_start records it")
+                continue
+            if not isinstance(rec.get("resolved"), str) or not rec["resolved"].startswith("/"):
+                problems.append(f"seq {seq}: a launch allowed without the absolute name it was decided on")
+                continue
+            exec_ok += 1
         is_open = rec.get("action") == "file.open" and rec.get("rule") in AUTHORIZED_OPEN_RULES
         is_meta = rec.get("action") in META_ACTIONS and rec.get("rule") in META_RULES
         is_conn = rec.get("action") == "net.connect" and rec.get("rule") in CONNECT_RULES
@@ -1876,12 +1939,14 @@ def main(argv=None):
         is_proxy = rec.get("action") == "net.proxy" and rec.get("rule") in PROXY_ALLOW_RULES
         # v1.26.1 (step 6): an inspected request, allowed: certified on its object
         is_req = rec.get("action") == "net.request" and rec.get("rule") == "request_allowed"
-        if not (is_open or is_meta or is_conn or is_proxy or is_req):
+        if not (is_open or is_meta or is_conn or is_proxy or is_req or is_exec):
             problems.append(f"seq {rec.get('seq')}: an authorization that is not a certified "
                             f"file open, lookup or connect ({rec.get('action')}, rule {rec.get('rule')})")
             continue
         if is_meta:
             lookups += 1
+        elif is_exec:
+            pass                               # v1.27: counted above
         elif is_proxy:
             proxied_ok += 1
         elif is_conn:
@@ -1916,7 +1981,7 @@ def main(argv=None):
         if not isinstance(s, str):
             problems.append(f"seq {rec.get('seq')}: a malformed decided destination or path")
             continue
-        if is_proxy or is_req:                 # v1.26.1: a request carries no flags either
+        if is_proxy or is_req or is_exec:      # v1.26.1, v1.27: no flags either
             is_conn_like = True
         else:
             is_conn_like = is_conn
@@ -1944,7 +2009,8 @@ def main(argv=None):
         if " " in cw or not cw:
             problems.append(f"seq {rec.get('seq')}: malformed certificate witness")
             continue
-        lines.append(f"{'request' if is_req else 'host' if is_conn_like else 'path'} {fl} {hx} {cr} {cw}")
+        lines.append(f"{'request' if is_req else 'exec' if is_exec else 'host' if is_conn_like else 'path'} "
+                     f"{fl} {hx} {cr} {cw}")
         which.append(rec)
         if is_conn and ("candidates" in rec or "candidates_sha256" in rec):
             try:

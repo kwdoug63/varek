@@ -82,6 +82,9 @@ static const char *kAdmit[] = {
     "read", "write", "readv", "writev", "pread64", "pwrite64", "preadv2",
     "pwritev2", "close", "close_range", "lseek", "fstat",
     "fsync", "fdatasync", "dup", "dup3", "fcntl", "pipe2", "eventfd2",
+    // v1.27: dup2, which glibc calls for dup2() on x86_64 and every launcher
+    // uses to give a child its stdin/stdout/stderr; it does what dup3 does
+    "dup2",
     "getdents64", "getcwd",
     // v1.17.0: newfstatat, statx, readlink, readlinkat, access, faccessat and
     // faccessat2 are NO LONGER admitted. They reveal whether any file exists,
@@ -96,6 +99,12 @@ static const char *kAdmit[] = {
     // os.system() failed after the child had already run. Both only reap
     // children of the caller; neither reaches outside the agent's own tree.
     "wait4", "waitid",
+    // v1.27 (decided launches): vfork, which CPython's subprocess and
+    // posix_spawn use; it is clone(CLONE_VM|CLONE_VFORK|SIGCHLD), and can set
+    // no namespace bit. kill, which subprocess uses to stop a child on a
+    // timeout: the agent runs as its own user in its own PID namespace, so it
+    // reaches only its own processes, as tgkill (admitted) already does.
+    "vfork", "kill",
     "epoll_create1", "epoll_ctl", "epoll_pwait", "epoll_pwait2",
     // time / sched / ids
     "clock_gettime", "clock_nanosleep", "nanosleep", "gettimeofday", "time",

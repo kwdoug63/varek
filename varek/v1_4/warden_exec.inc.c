@@ -417,3 +417,127 @@ static void exec_ruleset_record(FILE *f) {
     }
     fputs("],", f);
 }
+
+/* ---- v1.27 step 3: deciding a launch (design section 3) ---- */
+
+/* The name a launch is decided on, and the file it reaches. The name is the
+ * path as the agent wrote it, made absolute: a relative path joined to the
+ * canonical path of the directory it is relative to (the agent's cwd, or
+ * execveat's dirfd), "." and empty segments dropped, and the part through a
+ * last ".." segment replaced by the directory it resolves to. A final
+ * symlink keeps its own name, as the policy writes names (/usr/bin/python3).
+ * execveat(fd, "", AT_EMPTY_PATH) is named by the descriptor's file. The file
+ * is opened (O_PATH, following symlinks as the launch would, no magic links)
+ * and its device and inode returned. 0, or -1 (refused: exec_unresolved). */
+static int exec_name(const struct seccomp_notif *req, struct action *a, struct stat *st) {
+    a->resolved[0] = '\0';
+    pid_t tid = (pid_t)req->pid;
+    bool at = req->data.nr == __NR_execveat;
+    int dirfd = at ? (int)(int32_t)req->data.args[0] : AT_FDCWD;
+    uint64_t flags = at ? req->data.args[4] : 0;
+    if (flags & ~(uint64_t)(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW)) return -1;
+    char bp[64];
+    int base;
+    if (dirfd == AT_FDCWD) snprintf(bp, sizeof bp, "/proc/%d/cwd", tid);
+    else if (dirfd >= 0) snprintf(bp, sizeof bp, "/proc/%d/fd/%d", tid, dirfd);
+    else return -1;
+    if ((flags & AT_EMPTY_PATH) && a->target[0] == '\0') {
+        /* by descriptor: the file it refers to */
+        int fd = open(bp, O_PATH | O_CLOEXEC);
+        if (fd < 0) return -1;
+        int ok = fstat(fd, st) == 0 && S_ISREG(st->st_mode) &&
+                 fd_canonical_path(fd, a->resolved, sizeof a->resolved) == 0;
+        close(fd);
+        if (!ok) { a->resolved[0] = '\0'; return -1; }
+        return 0;
+    }
+    if (a->target[0] == '\0') return -1;
+    base = open(bp, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (base < 0) return -1;
+    /* the file */
+    int fd = openat2_path(base, a->target, (flags & AT_SYMLINK_NOFOLLOW) ? (uint64_t)O_NOFOLLOW : 0);
+    if (fd < 0 || fstat(fd, st) < 0 || !S_ISREG(st->st_mode)) {
+        if (fd >= 0) close(fd);
+        close(base);
+        return -1;
+    }
+    close(fd);
+    /* the name */
+    char joined[PATH_LIMIT * 2];
+    if (a->target[0] == '/') snprintf(joined, sizeof joined, "%s", a->target);
+    else {
+        char dir[PATH_LIMIT];
+        if (fd_canonical_path(base, dir, sizeof dir) < 0) { close(base); return -1; }
+        snprintf(joined, sizeof joined, "%s/%s", dir, a->target);
+    }
+    /* through the last ".." segment: the directory it resolves to */
+    const char *rest = joined;
+    char head[PATH_LIMIT] = "";
+    for (const char *q = joined; (q = strstr(q, "/..")); q++)
+        if (q[3] == '/' || q[3] == '\0') rest = q + 3;
+    if (rest != joined) {
+        char pre[PATH_LIMIT * 2];
+        snprintf(pre, sizeof pre, "%.*s", (int)(rest - joined), joined);
+        int dfd = openat2_path(base, pre, (uint64_t)O_DIRECTORY);
+        if (dfd < 0 || fd_canonical_path(dfd, head, sizeof head) < 0) {
+            if (dfd >= 0) close(dfd);
+            close(base);
+            return -1;
+        }
+        close(dfd);
+        if (!strcmp(head, "/")) head[0] = '\0';
+    }
+    close(base);
+    /* drop "." and empty segments */
+    size_t n = strlen(head);
+    char seg[PATH_LIMIT * 2];
+    snprintf(seg, sizeof seg, "%s", rest);
+    char *save = NULL;
+    for (char *t = strtok_r(seg, "/", &save); t; t = strtok_r(NULL, "/", &save)) {
+        if (!strcmp(t, ".")) continue;
+        size_t tl = strlen(t);
+        if (n + 1 + tl >= sizeof a->resolved) { a->resolved[0] = '\0'; return -1; }
+        head[n++] = '/';
+        memcpy(head + n, t, tl);
+        n += tl;
+        head[n] = '\0';
+    }
+    if (n == 0) return -1;
+    memcpy(a->resolved, head, n + 1);
+    return 0;
+}
+
+/* A launch after the first, with `require warden 1.27`: decided on its name
+ * (certified), then CONTINUE only if Landlock holds the agent and the file
+ * is one of the set (by device and inode). Recorded before it is answered. */
+static void exec_launch(int notify_fd, const struct seccomp_notif *req, struct action *a,
+                        const struct policy *p, const struct timespec *t0) {
+    struct stat st;
+    const struct exec_file *ef = NULL;
+    const char *rule = NULL;
+    decision_t d_raw = DEC_UNKNOWN, d_final = DEC_DENY;
+    if (exec_name(req, a, &st) < 0) {
+        rule = "exec_unresolved";
+    } else {
+        d_raw = policy_decide(p, a);
+        d_final = d_raw == DEC_ALLOW ? DEC_ALLOW : DEC_DENY;
+        if (d_final == DEC_ALLOW && !certify(p, a)) { d_final = DEC_DENY; rule = "certificate_refused"; }
+        else if (d_final == DEC_ALLOW && g_ll_abi < 1) { d_final = DEC_DENY; rule = "exec_no_landlock"; }
+        else if (d_final == DEC_ALLOW && !(ef = exec_rs_find(st.st_dev, st.st_ino))) {
+            d_final = DEC_DENY;
+            rule = "exec_not_in_ruleset";
+        }
+        if (!rule) rule = d_final == DEC_ALLOW ? "exec_allowed" : decision_rule_id(a, d_raw);
+    }
+    if (ef) {
+        size_t k = (size_t)(ef - g_exec_rs);
+        snprintf(a->extra, sizeof a->extra, "\"exec_set\":%zu,\"exec_dev\":%llu,\"exec_ino\":%llu,"
+                 "\"exec_sha256\":\"%s\",", k, (unsigned long long)ef->dev, (unsigned long long)ef->ino, ef->sha);
+    }
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint64_t lat = (uint64_t)(t1.tv_sec - t0->tv_sec) * 1000000000ULL + (uint64_t)(t1.tv_nsec - t0->tv_nsec);
+    emit_pathology(g_report_seq++, (pid_t)req->pid, a, d_raw, d_final, rule, lat,
+                   d_final == DEC_ALLOW ? 0 : EACCES);
+    send_simple(notify_fd, req->id, d_final);
+}

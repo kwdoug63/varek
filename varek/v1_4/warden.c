@@ -862,7 +862,9 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
             s = a->resolved;
             if (s[0] == '\0') { a->why = "no_resolved_destination"; return DEC_UNKNOWN; }
             break;
-        case ACT_PROCESS_EXEC: kind = VDP_KIND_EXEC; s = a->target; break;
+        /* v1.27: on the name exec_name made (absolute), when launches are
+         * decided; before 1.27, on the path as written */
+        case ACT_PROCESS_EXEC: kind = VDP_KIND_EXEC; s = a->resolved[0] ? a->resolved : a->target; break;
         case ACT_NET_REQUEST: kind = VDP_KIND_REQUEST; s = a->resolved; break;      /* v1.26.1 */
         default:
             a->why = "not_in_fragment";
@@ -919,7 +921,7 @@ static bool certify(const struct policy *p, struct action *a) {
         case ACT_NET_CONNECT:  kind = VDPC_HOST; s = a->resolved; break;   /* v1.21 */
         case ACT_NET_PROXY:    kind = VDPC_HOST; s = a->resolved; break;   /* v1.26 */
         case ACT_NET_REQUEST:  kind = VDPC_REQUEST; s = a->resolved; break; /* v1.26.1 */
-        case ACT_PROCESS_EXEC: kind = VDPC_EXEC; s = a->target;   break;
+        case ACT_PROCESS_EXEC: kind = VDPC_EXEC; s = a->resolved[0] ? a->resolved : a->target; break;
         default:
             snprintf(a->check_why, sizeof a->check_why, "no certificate for this action kind");
             return false;
@@ -2990,6 +2992,14 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             emit_pathology(g_report_seq++, req.pid, &act, DEC_ALLOW, DEC_ALLOW,
                            "bootstrap_exec_allow", lat_b, 0);
             send_simple(notify_fd, req.id, DEC_ALLOW);
+            continue;
+        }
+
+        /* v1.27: with `require warden 1.27`, a launch after the first is
+         * decided on its name and allowed only onto a file of the launch set,
+         * which Landlock holds the agent to (warden_exec.inc.c) */
+        if (act.kind == ACT_PROCESS_EXEC && p->v.launches) {
+            exec_launch(notify_fd, &req, &act, p, &t0);
             continue;
         }
 
