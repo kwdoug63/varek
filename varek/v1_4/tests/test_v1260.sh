@@ -121,7 +121,7 @@ refused "proxy alone"                        "${R}proxy\n"                      
 refused "proxy off"                          "${R}proxy off\n"                          "bad directive"
 refused "proxy on with more"                 "${R}proxy on now\n"                       "bad directive"
 refused "proxy inspect with more"            "${R}proxy inspect now\n"                  "bad directive"   # v1.26.1: tests/test_v1261.sh
-refused "require 1.27"                       'require warden 1.27\n'                    "this is 1.26"
+refused "require 1.28"                       'require warden 1.28\n'                    "this is 1.27"
 # section 5: the upstream proxy
 accepted "an upstream by name"               "${R}proxy on\nproxy upstream http://Proxy.Corp.example:3128\n${H}"
 accepted "an upstream by address, a slash"   "${R}proxy on\nproxy upstream http://10.0.0.5:8080/\n${H}"

@@ -83,7 +83,7 @@
 #include <stdint.h>
 
 #define VDPC_GRAMMAR_MAJOR 1
-#define VDPC_GRAMMAR_MINOR 26
+#define VDPC_GRAMMAR_MINOR 27
 
 #define VDPC_MAX_S        4095
 #define VDPC_MAX_RULES    256
@@ -106,6 +106,7 @@ typedef struct {
     int           proxy_inspect;      /* v1.26.1: `proxy inspect` (proxy is then 1 too) */
     char          proxy_pass[64][254];/* v1.26.1: `proxy passthrough host NAME`, in order */
     size_t        proxy_npass;
+    int           launches;           /* v1.27: `require warden 1.27` (launches decided) */
 } vdpc_policy_t;
 
 typedef struct {

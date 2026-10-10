@@ -1310,6 +1310,8 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
     /* v1.26.1: what inspecting mode needs */
     if (rc == 0 && p->proxy_npass && !p->proxy_inspect)
         rc = perr(err, errlen, path, lineno, "`proxy passthrough` without `proxy inspect`");
+    /* v1.27: launches after the first are decided only after this directive */
+    p->launches = req_maj > 1 || (req_maj == 1 && req_min >= 27);
     for (size_t i = 0; rc == 0 && i < p->n; i++) {
         const vdp_rule_t *r = &p->rules[i];
         if (r->kind != VDP_KIND_REQUEST) continue;
@@ -2476,4 +2478,56 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
     if (vdp_decide(p, VDP_KIND_HOST, hp, 0, true, NULL, NULL) == VDP_SATISFIED) return false;
     snprintf(why, wn, "no host rule allows %s", hp);
     return true;
+}
+
+/* v1.27: shells and general-purpose interpreters, by basename; a trailing
+ * version (python3.12, perl5.36, lua5.4) is allowed after the name. */
+bool vdp_exec_is_interpreter(const char *path) {
+    static const char *const kInterp[] = {
+        "sh", "bash", "dash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "ash", "busybox",
+        "python", "python2", "python3", "pypy", "pypy3", "perl", "ruby", "node", "nodejs",
+        "deno", "bun", "php", "lua", "luajit", "tclsh", "wish", "pwsh", "Rscript", "R",
+        "julia", "guile", "awk", "gawk", "mawk", "nawk", "java", "jshell", "osascript", NULL
+    };
+    const char *b = strrchr(path, '/');
+    b = b ? b + 1 : path;
+    for (size_t i = 0; kInterp[i]; i++) {
+        size_t k = strlen(kInterp[i]);
+        if (strncmp(b, kInterp[i], k)) continue;
+        const char *t = b + k;
+        while (*t && (isdigit((unsigned char)*t) || *t == '.')) t++;
+        if (!*t) return true;
+    }
+    return false;
+}
+
+size_t vdp_exec_advisory(const vdp_policy_t *p, size_t i, char *buf, size_t n) {
+    if (!n) return 0;
+    buf[0] = '\0';
+    if (i >= p->n) return 0;
+    const vdp_rule_t *r = &p->rules[i];
+    if (r->kind != VDP_KIND_EXEC || r->verb != VDP_ALLOW) return 0;
+    size_t w = 0;
+#define EADD(...) do { int k_ = snprintf(buf + w, n - w, __VA_ARGS__); \
+                       if (k_ > 0) w = (w + (size_t)k_ < n) ? w + (size_t)k_ : n - 1; } while (0)
+    if (r->s.op == VDP_STR_EQ && vdp_exec_is_interpreter(r->s.c))
+        EADD("%s is a shell or general-purpose interpreter: the agent can run any code it "
+             "can read with it (the file and network rules still hold)", r->s.c);
+    if (r->s.op == VDP_STR_EQ) {
+        /* writable: any open for writing the policy allows (symbolic flags
+         * beyond the access mode would be decided per open; these are the
+         * plain ones an editor or a copy makes) */
+        static const uint32_t kW[] = { 1u, 2u, 1u | K_O_TRUNC, 2u | K_O_TRUNC,
+                                       1u | K_O_CREAT | K_O_TRUNC };
+        for (size_t k = 0; k < sizeof kW / sizeof kW[0]; k++) {
+            if (vdp_decide(p, VDP_KIND_PATH, r->s.c, kW[k], true, NULL, NULL) == VDP_SATISFIED) {
+                EADD("%s%s may be both launched and written by the agent: a launch runs the "
+                     "file as it is then, not as the Warden hashed it at startup",
+                     w ? "; " : "", r->s.c);
+                break;
+            }
+        }
+    }
+#undef EADD
+    return w;
 }

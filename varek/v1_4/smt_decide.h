@@ -185,6 +185,11 @@ typedef struct {
     bool       proxy_inspect;
     char       proxy_pass[VDP_PROXY_MAX_PASS][254];
     size_t     proxy_npass;
+    /* v1.27 (docs/security/v1.27-program-launches.md): `require warden 1.27`
+     * (or later) was given, so launches after the first are decided by the
+     * exec rules. Without it every later launch is refused, as in v1.26,
+     * whatever the exec rules say. Not part of any decision. */
+    bool       launches;
 } vdp_policy_t;
 
 /* Why a verdict was reached (for records). */
@@ -297,6 +302,13 @@ const char *vdp_kind_name(vdp_kind_t k);
 // It bounds the bytes of the body as sent: a chunked body's framing (chunk
 // sizes and line ends) counts, so it passes the limit before its data alone
 // would (review: stated, as the proxy counts and hashes what it sends).
+// v1.27, decided program launches (docs/security/v1.27-program-launches.md):
+//   require warden 1.27
+// turns on the exec rules for launches after the first (the agent's own
+// launch is allowed by being named). Without it, as in v1.26, every later
+// launch is refused whatever the exec rules say. The rules themselves are
+// unchanged: `<allow|deny> exec [matcher] CONSTANT`, exact by default.
+//
 // Refused at the end of the file: request rules or passthrough hosts without
 // `proxy inspect`; a request rule on a port that is not proxied; a request
 // rule whose host is, or (a wildcard) covers, a passthrough host.
@@ -434,8 +446,24 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * after `require warden 1.26`.
  * v1.26.1: inspecting mode (`proxy inspect`, `proxy passthrough host`,
  * request rules), also after `require warden 1.26`: a v1.26.0 Warden refuses
- * each of them, so the policy fails closed there. */
+ * each of them, so the policy fails closed there.
+ * v1.27: decided program launches, opt-in: `require warden 1.27` turns on
+ * the exec rules for launches after the first (vdp_policy_t.launches). The
+ * grammar of exec rules is unchanged; a v1.26 Warden refuses the directive,
+ * so a policy that relies on launches fails closed there. */
 #define VDP_WARDEN_MAJOR 1
-#define VDP_WARDEN_MINOR 26
+#define VDP_WARDEN_MINOR 27
+
+/* v1.27: a note on exec rule i, for lint and the Warden's load-time notes,
+ * in buf (empty: none); returns its length. An allow exec rule naming a shell
+ * or a general-purpose interpreter (any code it can read runs), and an exact
+ * allow exec rule whose path the policy also lets the agent open for writing
+ * (the file could be changed after the Warden hashed it). Matcher rules are
+ * checked per file when the Warden expands them at startup. */
+size_t vdp_exec_advisory(const vdp_policy_t *p, size_t i, char *buf, size_t n);
+
+/* v1.27: is the basename of path a shell or general-purpose interpreter
+ * (sh, bash, python3.12, node, ...)? */
+bool vdp_exec_is_interpreter(const char *path);
 
 #endif /* VAREK_SMT_DECIDE_H */

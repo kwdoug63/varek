@@ -314,7 +314,8 @@ static int policy_load(const char *path, struct policy *p) {
             "(warden_faultinject); never use it to supervise a real agent\n");
 #endif
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.26");
+    /* the grammar this Warden implements (v1.27: from smt_decide.h, not a copy) */
+    snprintf(p->version, sizeof(p->version), "%d.%d", VDP_WARDEN_MAJOR, VDP_WARDEN_MINOR);
     char err[512];
     /* v1.15: read the file once. The decision procedure and the certificate
      * checker parse these same bytes, and their SHA-256 goes in run_start, so
@@ -403,6 +404,10 @@ static int policy_load(const char *path, struct policy *p) {
         char adv[512];
         if (vdp_rule_advisory(r, adv, sizeof adv))
             fprintf(stderr, "[warden] policy %s:%d: note: %s\n", path, r->line, adv);
+        /* v1.27: an interpreter or shell allowed to launch, a file both
+         * launched and written */
+        if (vdp_exec_advisory(&p->v, i, adv, sizeof adv))
+            fprintf(stderr, "[warden] policy %s:%d: note: %s\n", path, r->line, adv);
         if (rr == VDP_DEAD) {
             dead++;
             fprintf(stderr, "[warden] policy %s:%d: WARNING: %s %s rule can never "
@@ -416,6 +421,14 @@ static int policy_load(const char *path, struct policy *p) {
                     vdp_reach_unknown_text());
         }
     }
+    /* v1.27: exec rules without the opt-in decide only the agent's own launch */
+    for (size_t i = 0; !p->v.launches && i < p->v.n; i++)
+        if (p->v.rules[i].kind == VDP_KIND_EXEC && p->v.rules[i].verb == VDP_ALLOW) {
+            fprintf(stderr, "[warden] policy %s:%d: note: exec rules take effect for launches after "
+                    "the first only with `require warden 1.27`; without it every later launch is "
+                    "refused\n", path, p->v.rules[i].line);
+            break;
+        }
     /* v1.26.1: a request rule whose host no host rule allows on its port */
     for (size_t i = 0; i < p->v.n; i++) {
         char hw[300];

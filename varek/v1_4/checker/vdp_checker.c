@@ -866,6 +866,8 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
                         "port, and a host that is not passthrough)");
         }
     }
+    /* v1.27: launches after the first are decided only after require warden 1.27 */
+    p->launches = ver_ge(req_maj, req_min, 1, 27);
     return 0;
 }
 

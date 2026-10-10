@@ -526,7 +526,7 @@ def parse_lines(raw_lines, path):
                 if len(toks) != 3 or toks[1] != "warden" or not m:
                     raise PolicyError(f"{path}:{lineno}: bad directive")
                 v = (int(m.group(1)), int(m.group(2)))
-                if v > (1, 26):
+                if v > (1, 27):
                     raise PolicyError(f"{path}:{lineno}: requires newer Warden")
                 if legacy_name and v >= (1, 24):
                     raise PolicyError(f"{path}:{lineno}: require warden 1.24 after a host name")
@@ -716,6 +716,8 @@ def parse_lines(raw_lines, path):
         for h in passthrough:
             if (h.endswith("." + r["rhost"]) if r["rwild"] else h == r["rhost"]):
                 raise PolicyError(f"{path}:{r['line']}: request rule for a passthrough host")
+    # v1.27: launches after the first are decided only after require warden 1.27
+    parse_policy.launches = req >= (1, 27)
     return rules, rx
 
 
@@ -1352,8 +1354,9 @@ def fuzz_policy(rng, path):
     if rng.random() < 0.3:
         lines.append(rng.choice(["require warden 1.14", "require warden 1.13", "require warden 01.14",
                                  "require warden 1.15", "require warden 1.16", "require warden 1.21",
-                                 "require warden 1.24", "require warden 1.24", "require warden 1.25"] +
-                                ([] if valid else ["require warden 1.27", "require warden x",
+                                 "require warden 1.24", "require warden 1.24", "require warden 1.25",
+                                 "require warden 1.27"] +
+                                ([] if valid else ["require warden 1.28", "require warden x",
                                                    "require warden +1.14", "require warden 1.+14",
                                                    "require warden 1.1400000"])))
     elif rng.random() < 0.35:
@@ -1673,6 +1676,15 @@ def check_policy(vdp, policy, rng, nq, stats, verbose, checker=None):
         stats["rejected_policies"] += 1
         return fails
     stats["policies"] += 1
+    # v1.27: the three parsers agree on whether launches are decided
+    want_l = "on" if parse_policy.launches else "off"
+    got_l = [run_vdp(vdp, policy, "launches")[1].strip()]
+    if checker:
+        got_l.append(subprocess.run([checker, policy, "launches"], capture_output=True, text=True).stdout.strip())
+    if any(g != want_l for g in got_l):
+        fails.append(f"{policy}: launches disagreement (oracle {want_l}, C {got_l})")
+    if want_l == "on":
+        stats["launch_policies"] += 1
     if any(r["op"] in ("suffix", "contains", "glob") for r in rules):
         stats["string_policies"] += 1
     if any(r["kind"] == "request" for r in rules):
@@ -1775,7 +1787,7 @@ def main():
     a = ap.parse_args()
 
     rng = random.Random(a.seed)
-    stats = {k: 0 for k in ("policies", "rejected_policies", "string_policies", "request_policies", "reach",
+    stats = {k: 0 for k in ("policies", "rejected_policies", "string_policies", "request_policies", "launch_policies", "reach",
                             "reach_regex", "reach_solver_inconclusive", "reach_forced_checked",
                             "reach_unknown", "witnesses", "ground", "symbolic",
                             "bound_unknown", "bound_seen", "certs_emitted", "certs_forged",
@@ -1796,7 +1808,7 @@ def main():
                 break
     total = stats["reach"] + stats["reach_forced_checked"] + stats["ground"] + stats["symbolic"]
     print(f"smt_crosscheck: {stats['policies']} policies ({stats['string_policies']} with "
-          f"suffix/contains/glob rules, {stats['request_policies']} with request rules; "
+          f"suffix/contains/glob rules, {stats['request_policies']} with request rules, {stats['launch_policies']} with launches; "
           f"{stats['rejected_policies']} rejected by both parsers), "
           f"{total} checks: {stats['reach']} reachability (+{stats['reach_forced_checked']} "
           f"automaton-search re-checks), {stats['ground']} ground, {stats['symbolic']} "

@@ -115,7 +115,7 @@ static const char *reach_name(vdp_reach_t r) {
 
 int main(int argc, char **argv) {
     if (argc != 3 && !(argc == 4 && !strcmp(argv[2], "analyze") && !strcmp(argv[3], "automaton"))) {
-        fprintf(stderr, "usage: %s <policy> lint|analyze [automaton]|batch\n", argv[0]);
+        fprintf(stderr, "usage: %s <policy> lint|analyze [automaton]|batch|launches\n", argv[0]);
         return 2;
     }
     if (argc == 4) vdp_reach_force_automaton = true;
@@ -127,6 +127,11 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (!strcmp(argv[2], "batch")) return do_batch();
+    /* v1.27: are launches after the first decided (require warden 1.27)? */
+    if (!strcmp(argv[2], "launches")) {
+        printf("%s\n", g_pol.launches ? "on" : "off");
+        return 0;
+    }
     if (!strcmp(argv[2], "analyze")) {
         static char wit[VDP_STR_MAX + 1];
         for (size_t i = 0; i < g_pol.n; i++) {
@@ -153,6 +158,10 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < g_pol.n; i++) {
             char adv[512], hw[160];
             if (vdp_rule_advisory(&g_pol.rules[i], adv, sizeof adv))
+                printf("%s:%d: note: %s\n", argv[1], g_pol.rules[i].line, adv);
+            /* v1.27: an interpreter or shell allowed to launch, or a file both
+             * launched and written */
+            if (vdp_exec_advisory(&g_pol, i, adv, sizeof adv))
                 printf("%s:%d: note: %s\n", argv[1], g_pol.rules[i].line, adv);
             /* v1.21: a host rule whose constant no connect can produce (a
              * non-canonical spelling, or a v1.24 host name without `require
@@ -206,6 +215,14 @@ int main(int argc, char **argv) {
                 shared++;
             }
         }
+        /* v1.27: exec rules without the opt-in decide only the first launch */
+        for (size_t i = 0; !g_pol.launches && i < g_pol.n; i++)
+            if (g_pol.rules[i].kind == VDP_KIND_EXEC && g_pol.rules[i].verb == VDP_ALLOW) {
+                printf("%s:%d: note: exec rules take effect for launches after the first only with "
+                       "`require warden 1.27`; without it every later launch is refused\n",
+                       argv[1], g_pol.rules[i].line);
+                break;
+            }
         /* v1.16: the policy's glob size against the cap that bounds the work
          * of one decision (4,096 tokens x a 4,095-byte string). */
         printf("%s: glob tokens %zu of %d\n", argv[1], vdp_policy_glob_tokens(&g_pol),

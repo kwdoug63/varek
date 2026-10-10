@@ -673,6 +673,17 @@ def cmd_policy_show(args):
             info(f"Upstream http://{up}: after the Warden decides, the proxy forwards through it (CONNECT)")
         for h in passthrough:
             info(f"Passthrough {h}: kept in SNI mode, relayed without decrypting; its requests are not seen")
+    # v1.27: launches after the first, as the certificate checker reads the policy
+    lq = run_cmd([tool("vdp_cert_check"), path, "launches"], capture=True)
+    has_exec = counts["allow"].get("exec", 0) > 0
+    if lq.returncode == 0 and lq.stdout.strip() == "on":
+        info("Launches decided by the exec rules (require warden 1.27): a program the policy allows "
+             "can be launched, enforced by the kernel's Landlock ruleset built at startup"
+             if has_exec else "Launches decided (require warden 1.27), but no exec rule allows one: "
+             "every launch after the agent's own is refused")
+    elif has_exec:
+        info("Launches after the agent's own are refused: exec rules take effect for them only "
+             "with `require warden 1.27`")
     # v1.25: each wildcard allow rule's budgets (the Warden's defaults filled
     # in), as the certificate checker parses the file (v1.25 review: not this
     # tool's own reading, which split lines on a bare CR where the Warden does not)
