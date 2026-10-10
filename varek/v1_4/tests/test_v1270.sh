@@ -38,6 +38,12 @@
 #      process found running anything else (forced by a test hook) is killed
 #      before its call is answered, recorded, and run_end and the exit status
 #      say so; the rest of the agent goes on
+#   5. the audit and the tools (as root, with sections 3 and 4's runs): the
+#      audit counts launches, fails a run with a killed process, and refuses
+#      forged launch sets, launch refusals and exec_result records; varek
+#      refusals explains launch refusals and kills; the CycloneDX export
+#      states Landlock, the launch set and the launches; varek doctor and the
+#      preflight report Landlock; varek policy show lists the launch set
 #
 # Usage: test_v1270.sh <vdp_check> <vdp_cert_check> [<warden>]
 set -u
@@ -464,6 +470,92 @@ else
     check "the agent goes on (only that process is killed)" grep -q '^after ' "$OUT/m.out"
     check "run_end says so, and the Warden exits 1" \
         sh -c "grep -q '\"event\":\"run_end\".*\"exec_identity_mismatch\":true' '$OUT/m.log' && [ $mrc = 1 ]"
+fi
+
+echo "== 5. the audit and the tools =="
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ] || [ -z "${D:-}" ]; then
+    skip "section 5 (needs root, the warden binary and sections 3 and 4)"
+else
+    audit() { python3 "$HERE/tools/varek_audit.py" --policy "$1" --checker "$CERT" "$2" > "$OUT/a.out" 2>&1; }
+    check "the audit counts the launches it checked" \
+        sh -c "$(declare -f audit); CERT='$CERT' HERE='$HERE' OUT='$OUT'; audit '$D/p3' '$OUT/x.log' && grep -q '8 launches allowed (3 refused)' '$OUT/a.out'"
+    refuses "a run in which a process was killed by the identity check" "$D/p3" "$OUT/m.log" "not a program the Warden decided to run"
+    F="$HERE/tests/v1270_forge.py"
+    fx() { python3 "$F" "$OUT/x.log" "$OUT/$1" "$2" || flunk "forging $1"; }
+    RS='rs = next(r for r in recs if isinstance(r, dict) and r.get("event") == "run_start")'
+    EX='ex = lambda n: next(r for r in recs if isinstance(r, dict) and r.get("action") == "process.exec" and r.get("resolved") == n)'
+    fx g1.log "$RS; e = next(e for e in rs['exec_ruleset'] if e['why'] == 'rule'); e['policy_line'] = 2"
+    refuses "a launch set entry admitted by a line that does not allow it" "$D/p3" "$OUT/g1.log" "which does not allow it"
+    fx g2.log "$RS; rs['exec_ruleset'].append(dict(rs['exec_ruleset'][0], why='bootstrap', ino=1)); rs['exec_ruleset'].append(dict(rs['exec_ruleset'][0], why='bootstrap', ino=2))"
+    refuses "a launch set with two bootstrap entries" "$D/p3" "$OUT/g2.log" "more than one bootstrap"
+    fx g3.log "$RS; rs['exec_ruleset'].append(dict(rs['exec_ruleset'][0]))"
+    refuses "a launch set holding a file twice" "$D/p3" "$OUT/g3.log" "holds a file twice"
+    fx g4.log "$EX; ex('/usr/bin/env')['policy_line'] = 3"
+    refuses "a launch refused by a line that is not the deny rule deciding it" "$D/p3" "$OUT/g4.log" "which is not the deny rule"
+    fx g5.log "$EX; ex('/usr/bin/false')['resolved'] = '/usr/bin/git'"
+    refuses "a launch refused as matching no rule, which a rule matches" "$D/p3" "$OUT/g5.log" "as matching no rule, but line"
+    fx g6.log "$EX; ex('/usr/bin/false')['rule'] = 'exec_not_in_ruleset'"
+    refuses "a launch refused as not in the set, whose name the policy does not allow" "$D/p3" "$OUT/g6.log" "does not allow its name"
+    fx g7.log "$EX; ex('/usr/bin/false')['rule'] = 'exec_no_landlock'"
+    refuses "a launch refused for want of Landlock in a run that has it" "$D/p3" "$OUT/g7.log" "for want of Landlock"
+    fx g8.log "$EX; ex('/usr/bin/false')['rule'] = 'deny_only_nonfile_v191'"
+    refuses "a launch refused as before 1.27 in a run that decides launches" "$D/p3" "$OUT/g8.log" "refused as before 1.27"
+    fx g9.log "i = next(i for i, r in enumerate(recs) if isinstance(r, dict) and r.get('event') == 'exec_result'); del recs[i]"
+    refuses "an allowed launch without its exec_result" "$D/p3" "$OUT/g9.log" "with 0 exec_result records"
+    fx g10.log "i = next(i for i, r in enumerate(recs) if isinstance(r, dict) and r.get('event') == 'exec_result'); recs.insert(i, dict(recs[i]))"
+    refuses "an allowed launch with two" "$D/p3" "$OUT/g10.log" "with 2 exec_result records"
+    fx g11.log "$EX; e = next(r for r in recs if isinstance(r, dict) and r.get('event') == 'exec_result'); e['decision_seq'] = ex('/usr/bin/false')['seq']"
+    refuses "an exec_result for a launch that was refused" "$D/p3" "$OUT/g11.log" "not after an allowed launch"
+    fx g12.log "e = next(r for r in recs if isinstance(r, dict) and r.get('event') == 'exec_result'); e['result'] = 'maybe'"
+    refuses "an exec_result with a result the Warden does not write" "$D/p3" "$OUT/g12.log" "says 'maybe'"
+    python3 "$F" "$OUT/m.log" "$OUT/g13.log" "e = next(r for r in recs if isinstance(r, dict) and r.get('event') == 'run_end'); e.pop('exec_identity_mismatch')" || flunk "forging g13"
+    refuses "a killed process run_end does not mention" "$D/p3" "$OUT/g13.log" "run_end's exec_identity_mismatch does not match"
+    fx g14.log "$RS; b = next(r for r in recs if isinstance(r, dict) and r.get('rule') == 'bootstrap_exec_allow'); rs['exec_ruleset'].append({'name': '/usr/bin/true', 'path': '/usr/bin/true', 'dev': 1, 'ino': 1, 'sha256': '0' * 64, 'why': 'bootstrap'})"
+    refuses "a bootstrap entry that is not the agent's own launch" "$D/p3" "$OUT/g14.log" "names the bootstrap"
+
+    # varek refusals
+    printf '[varek]\npolicy = %s\nlog_dir = %s\n' "$D/p3" "$OUT" > "$OUT/varek.conf"
+    NO_COLOR=1 VAREK_CONFIG="$OUT/varek.conf" python3 "$HERE/tools/varek" refusals -n 500 "$OUT/x.log" > "$OUT/rf.out" 2>&1
+    NO_COLOR=1 VAREK_CONFIG="$OUT/varek.conf" python3 "$HERE/tools/varek" refusals -n 500 "$OUT/m.log" > "$OUT/rfm.out" 2>&1
+    check "varek refusals: a launch a deny rule refuses, with its line" grep -q 'policy line 2: deny exec /usr/bin/env' "$OUT/rf.out"
+    check "varek refusals: a file not in the launch set (NOT_IN_SET), with the rule allowing its name" \
+        sh -c "grep -q 'NOT_IN_SET   process.exec   $D/run/new' '$OUT/rf.out' && grep -q 'allows the name, but that file was not in the launch set' '$OUT/rf.out'"
+    check "varek refusals: a process the identity check killed (KILLED), with what it ran" \
+        sh -c "grep -q 'KILLED .*pid [0-9]* ran /usr/bin/git' '$OUT/rfm.out' && grep -q '^KILLED: ' '$OUT/rfm.out'"
+    # the export
+    python3 "$HERE/tools/varek_cyclonedx.py" --log "$OUT/x.log" --policy "$D/p3" --output "$OUT/bom.json" > /dev/null 2>&1
+    bom() { python3 - "$OUT/bom.json" "$1" <<'PY'
+import json, sys
+b = json.load(open(sys.argv[1]))
+props = {}
+def walk(o):
+    if isinstance(o, dict):
+        if isinstance(o.get("name"), str) and "value" in o: props.setdefault(o["name"], []).append(o["value"])
+        for v in o.values(): walk(v)
+    elif isinstance(o, list):
+        for v in o: walk(v)
+walk(b)
+text = " ".join(a.get("text", "") for a in b.get("annotations", []))
+sys.exit(0 if eval(sys.argv[2]) else 1)
+PY
+    }
+    check "the export: Landlock's ABI, the launch set's size and digest" \
+        bom "int(props['varek:launches.landlock_abi'][0]) >= 1 and props['varek:launches.set.files'][0] != '0' and len(props['varek:launches.set.sha256'][0]) == 64"
+    check "the export: launches decided, allowed, seen running, refused" \
+        bom "props['varek:launches.allowed'] == ['8'] and props['varek:launches.refused'] == ['3'] and int(props['varek:launches.launched'][0]) >= 1"
+    check "the export: each launched program with the SHA-256 of its file" \
+        bom "'$(sha256sum /usr/bin/git | cut -c1-64)' in props['varek:exec.sha256']"
+    check "the export's attestation says launches were decided" bom "'Launches after the agent' in text and 'Landlock' in text"
+    # doctor, preflight, policy show
+    NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 "$HERE/tools/varek" doctor > "$OUT/doc.out" 2>&1
+    check "varek doctor reports Landlock's ABI" grep -q 'OK    Landlock ABI [0-9]' "$OUT/doc.out"
+    bash "$HERE/tools/varek_preflight.sh" "$D/p3" > "$OUT/pf.out" 2>&1
+    check "the preflight checks Landlock for a policy that decides launches" grep -q 'PASS  Landlock ABI [0-9]*: launches the policy allows can run' "$OUT/pf.out"
+    bash "$HERE/tools/varek_preflight.sh" "$D/p3c" > "$OUT/pf2.out" 2>&1
+    check "and not for one that does not" sh -c "! grep -q Landlock '$OUT/pf2.out'"
+    NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 "$HERE/tools/varek" policy show "$D/p3" > "$OUT/ps.out" 2>&1
+    check "varek policy show lists the launch set this host would build" \
+        sh -c "grep -q '^Launch set on this host: [0-9]* files, held by Landlock' '$OUT/ps.out' && grep -q '^  /usr/bin/git, sha256' '$OUT/ps.out'"
 fi
 
 echo

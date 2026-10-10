@@ -403,6 +403,22 @@ def _policy_for_log(cfg, s):
 
 # ------------------------------------------------------------- subcommands --
 
+def landlock_abi():
+    """v1.27: (the Landlock ABI, "") or (0, why), probed as the Warden does
+    (landlock_create_ruleset with LANDLOCK_CREATE_RULESET_VERSION)."""
+    if platform.system() != "Linux" or platform.machine() != "x86_64":
+        return 0, "not Linux on x86_64"
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    r = libc.syscall(ctypes.c_long(444), None, ctypes.c_size_t(0), ctypes.c_uint32(1))
+    if r >= 1:
+        return int(r), ""
+    e = ctypes.get_errno()
+    return 0, {38: "the kernel has no Landlock (5.13 or later is needed)",
+               95: "Landlock is not enabled (it is not in the kernel's LSM list)"}.get(e, os.strerror(e))
+
+
 def cmd_doctor(args):
     info("VAREK doctor: is this host ready to run the Warden?\n")
     bad = 0
@@ -420,6 +436,16 @@ def cmd_doctor(args):
         fail(f"kernel {platform.release()} is older than 5.14")
         hint("use Amazon Linux 2023, RHEL 9, Ubuntu 22.04 or later")
         bad += 1
+
+    # v1.27: decided program launches need Landlock (the kernel holds the
+    # agent to the launch set); without it such launches are refused
+    abi, why = landlock_abi()
+    if abi:
+        ok(f"Landlock ABI {abi} (launches a policy allows with `require warden 1.27` can run)")
+    else:
+        warn(f"Landlock is not available ({why}): with `require warden 1.27` every launch after the "
+             f"agent's own is refused")
+        hint("Linux 5.13 or later with `landlock` in /sys/kernel/security/lsm (the kernel's lsm= list)")
 
     if os.path.isdir("/sys/fs/cgroup") and os.path.exists("/sys/fs/cgroup/cgroup.controllers"):
         ok("cgroups v2 mounted")
@@ -681,6 +707,20 @@ def cmd_policy_show(args):
              "can be launched, enforced by the kernel's Landlock ruleset built at startup"
              if has_exec else "Launches decided (require warden 1.27), but no exec rule allows one: "
              "every launch after the agent's own is refused")
+        # the set the Warden would build on this host (its own expansion of the rules)
+        w = os.path.join(varek_home(), "warden")
+        if has_exec and os.access(w, os.X_OK):
+            r = subprocess.run([w, path, "--check-startup"], capture_output=True, text=True)
+            files = [ln[len("[warden]   "):] for ln in r.stderr.splitlines() if ln.startswith("[warden]   ")]
+            head = next((ln[len("[warden] "):] for ln in r.stderr.splitlines()
+                         if ln.startswith("[warden] launch set:")), None)
+            if r.returncode != 0:
+                why = next((ln for ln in r.stderr.splitlines() if "refusing to start" in ln), "")
+                info(f"Launch set: the Warden would not start with this policy here: {why or r.returncode}")
+            elif head:
+                info(f"Launch set on this host: {head[len('launch set: '):]}")
+                for ln in files:
+                    info(f"  {ln}")
     elif has_exec:
         info("Launches after the agent's own are refused: exec rules take effect for them only "
              "with `require warden 1.27`")
@@ -908,6 +948,17 @@ RULE_WORDS = {
     "unix_abstract_refused": "abstract Unix sockets are never allowed",
     "scope_id_refused": "IPv6 scope ids are never allowed",
     "bind_refused": "the agent may not bind sockets",
+    # v1.27: launches
+    "deny_only_nonfile_v191": "a launch after the agent's own: refused without `require warden 1.27`",
+    "exec_unresolved": "the launch's path could not be resolved to a program file",
+}
+
+# v1.27: the launch refusals varek refusals spells out (word, explanation)
+EXEC_WORDS = {
+    "exec_not_in_ruleset": ("NOT_IN_SET", "allows the name, but that file was not in the launch set at "
+                            "startup (written or replaced during the run); the kernel would refuse it too"),
+    "exec_no_landlock": ("NO_LANDLOCK", "allows it, but this host has no Landlock, so launches after the "
+                         "agent's own are refused"),
 }
 
 
@@ -944,6 +995,19 @@ def cmd_refusals(args):
                 word, where = verdict_word(r), RULE_WORDS.get(rl, rl or "no rule matched")
             info(f"  {word:11}  {'net.request':13}  {r.get('target', '')}")
             hint(f"{where}; the agent got 403 Forbidden and the connection ended")
+            continue
+        rl = r.get("rule")
+        if rl == "exec_identity_mismatch":
+            # v1.27: a process found running a program the Warden did not decide to run
+            info(f"  {'KILLED':11}  {r.get('action', '?'):13}  pid {r.get('agent_pid')} ran {r.get('exe', '?')}")
+            hint("not a program the Warden decided to run (a launch's path changed after its decision, "
+                 "or a kernel fault); the process was killed before this call was answered")
+            continue
+        if r.get("action") == "process.exec" and rl in EXEC_WORDS:
+            word, what = EXEC_WORDS[rl]
+            text = policy_line_text(policy, line) if policy and isinstance(line, int) and line >= 0 else None
+            info(f"  {word:11}  {'process.exec':13}  {r.get('resolved') or r.get('target', '')}")
+            hint(f"policy line {line}" + (f": {text}" if text else "") + f" {what}; the agent got EACCES")
             continue
         if r.get("event") == "dns_question":
             text = policy_line_text(policy, line) if policy and isinstance(line, int) else None
@@ -991,6 +1055,12 @@ def cmd_refusals(args):
     info("\nUNSATISFIED: a deny rule matched.  UNKNOWN: no rule allowed it (refused by default).")
     if any(r.get("event") == "dns_question" for r in s["refusals"][: args.n]):
         info("BUDGET: a wildcard rule's budget refused a new name (raise it with names= or rate=).")
+    if any(r.get("rule") == "exec_not_in_ruleset" for r in s["refusals"][: args.n]):
+        info("NOT_IN_SET: the policy allows the program's name, but only files present at startup can be launched.")
+    if any(r.get("rule") == "exec_no_landlock" for r in s["refusals"][: args.n]):
+        info("NO_LANDLOCK: launches need Landlock (Linux 5.13 or later, enabled); varek doctor says why it is missing.")
+    if any(r.get("rule") == "exec_identity_mismatch" for r in s["refusals"][: args.n]):
+        info("KILLED: a process ran a program the Warden did not decide to run; the audit fails such a run.")
     if any(r.get("rule") == "max_body" for r in s["refusals"][: args.n]):
         info("MAX_BODY: a rule allowed the request, but its body is over the rule's max_body.")
     return 0
