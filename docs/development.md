@@ -63,8 +63,8 @@ The Warden runtime (`varek/v1_4/`) builds on Linux with a C compiler and the
 libseccomp and libsodium development headers (libsodium since v1.16):
 
 ```bash
-sudo apt-get install -y build-essential libseccomp-dev libsodium-dev   # Debian/Ubuntu
-sudo dnf install -y gcc make libseccomp-devel libsodium-devel          # Fedora/RHEL
+sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev   # Debian/Ubuntu
+sudo dnf install -y gcc make libseccomp-devel libsodium-devel openssl-devel   # Fedora/RHEL
 make -C varek/v1_4                                                       # or: make -C varek/v1_4 deps
 ```
 

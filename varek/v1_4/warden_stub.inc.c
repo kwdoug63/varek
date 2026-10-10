@@ -35,6 +35,10 @@
  *     lookup (rule wildcard_budget). Every question is a chained dns_question
  *     record (stub_record), and run_start lists each rule's budgets.
  *
+ * v1.26: the stub also runs with `proxy on` and a host name rule, and answers
+ * a name allowed only on proxied ports with a synthetic address
+ * (warden_synth.inc.c).
+ *
  * Without a network namespace of its own for the agent there is no stub: the
  * views stay as in v1.24 and wildcard-matched names cannot be resolved. */
 
@@ -127,10 +131,11 @@ static socklen_t stub_sockaddr(int dom, struct sockaddr_storage *ss) {
  * up and bind the stub there. A failure leaves the stub off (wildcard names
  * then do not resolve) and says so. */
 static void stub_setup(void) {
-    if (!g_any_wild) return;
+    if (!STUB_WANTED()) return;          /* v1.26: also with the proxy on */
     if (!g_netns_separate) {
         fprintf(stderr, "[warden] the agent has no network namespace of its own: no stub "
-                "resolver, so names that only a wildcard rule allows will not resolve\n");
+                "resolver, so names that only a wildcard rule allows will not resolve%s\n",
+                g_syn_on ? ", and names are not given synthetic addresses by the stub" : "");
         return;
     }
     inet_pton(AF_INET, STUB_ADDR, &g_stub_in);
@@ -182,7 +187,8 @@ static void stub_setup(void) {
     g_stub_on = true;
     for (int i = 0; i < STUB_MAX_CONN; i++) g_stub_conn[i].fd = -1;
     fprintf(stderr, "[warden] stub resolver at %s:53 in the agent's network namespace "
-            "(names matched by wildcard rules are resolved when asked)\n", STUB_ADDR);
+            "(%s)\n", STUB_ADDR, g_syn_on ? "names allowed only on proxied ports get synthetic addresses"
+                                         : "names matched by wildcard rules are resolved when asked");
 }
 
 /* Can a connect to name reach an allow rule? Decided as a connect to
@@ -296,6 +302,7 @@ static void stub_uncharge(struct stub_budget *b, bool isnew) {
  * noerror answer carried. flags: STUB_NEW, STUB_UPSTREAM. */
 #define STUB_NEW      1u
 #define STUB_UPSTREAM 2u
+#define STUB_SYNTH    4u                 /* v1.26: answered with a synthetic address */
 /* v1.25 review: the Warden's monotonic time (ms) of the question being
  * answered, the clock the rate budget is charged on; recorded as "mono_ms" so
  * the audit counts the rate window as the Warden did. */
@@ -307,10 +314,11 @@ static void stub_record(const char *name, uint16_t qtype, int conn_fd, const cha
     clock_gettime(CLOCK_REALTIME, &ts);
     fprintf(f, "{\"event\":\"dns_question\",\"run\":\"%s\",\"name\":\"%s\",\"type\":%u,"
                "\"transport\":\"%s\",\"rule\":\"%s\",\"policy_line\":%d,",
-            g_run_id, name, (unsigned)qtype, conn_fd < 0 ? "udp" : "tcp", rule, line);
+            g_run_id, name, (unsigned)qtype, conn_fd == -2 ? "proxy" : conn_fd < 0 ? "udp" : "tcp", rule, line);
     if (budget) fprintf(f, "\"budget\":\"%s\",", budget);
     if (flags & STUB_NEW) fputs("\"new\":true,", f);
     if (flags & STUB_UPSTREAM) fputs("\"upstream\":true,", f);
+    if (flags & STUB_SYNTH) fputs("\"synthetic\":true,", f);
     fprintf(f, "\"answer\":\"%s\",", answer);
     if (e && !strcmp(answer, "noerror") && (qtype == 1 || qtype == 28)) {
         fputs("\"addresses\":[", f);
@@ -483,33 +491,54 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
         stub_record(name, qtype, conn_fd, "no_rule", -1, NULL, false, "nxdomain", NULL);
         return;
     }
+    /* v1.26: a name allowed only on proxied ports gets its synthetic address
+     * (A), or no data (any other type). Nothing is looked up or charged. */
+    if (ri >= 0 && syn_qualifies(p, name)) {
+        wr_addr_t sa = { .until_ms = 0 };
+        wr_entry_t te;
+        memset(&te, 0, sizeof te);
+        te.addrs = &sa;
+        te.n = 1;
+        te.next_ms = now + (int64_t)SYN_TTL * 1000;
+        int rc = 0;
+        if (qtype == 1 && syn_assign(name, line, &sa.ip) < 0) rc = 2;          /* the space is used up */
+        else if (qtype != 1) te.n = 0;
+        size_t l = stub_build(m, qend, rc, qtype, rc ? NULL : &te, now, out, outn);
+        stub_send(conn_fd, from, fl, out, l);
+        stub_record(name, qtype, conn_fd, rule, line, NULL, STUB_SYNTH, stub_answer_word(rc), rc ? NULL : &te);
+        return;
+    }
     if (!exact && qtype != 1 && qtype != 28) {
         size_t l = stub_build(m, qend, 0, qtype, NULL, now, out, outn);  /* nothing upstream */
         stub_send(conn_fd, from, fl, out, l);
         stub_record(name, qtype, conn_fd, rule, line, NULL, false, "noerror", NULL);
         return;
     }
-    bool isnew = false;
+    bool isnew = false, charged_q = false;   /* charged_q: this question was charged already */
     struct stub_budget *bud = ri >= 0 && p->v.rules[ri].s.wild ? stub_budget_of(ri) : NULL;
     if (i < 0) {
         /* A new name (never exact, so ri >= 0): charged to the wildcard rule
          * that allows it. */
-        const char *over = p->v.rules[ri].s.wild ? stub_charge(bud, name, now, true) : NULL;
+        /* v1.26 review: a name already sent to the upstream proxy was
+         * charged as new then; asked now, it is charged only to rate= */
+        bool fresh = !px_up_charged(name);
+        const char *over = p->v.rules[ri].s.wild ? stub_charge(bud, name, now, fresh) : NULL;
         if (over) {
             size_t l = stub_build(m, qend, 3, qtype, NULL, now, out, outn);
             stub_send(conn_fd, from, fl, out, l);
             stub_record(name, qtype, conn_fd, "wildcard_budget", line, over, 0, "nxdomain", NULL);
             return;
         }
+        charged_q = true;
         if (g_stub_dyn >= STUB_MAX_DYN || (i = wr_table_add_dynamic(&g_names, name)) < 0) {
-            stub_uncharge(bud, true);                   /* v1.25 review: nothing was added */
+            stub_uncharge(bud, fresh);                  /* v1.25 review: nothing was added */
             size_t l = stub_build(m, qend, 2, qtype, NULL, now, out, outn);  /* SERVFAIL */
             stub_send(conn_fd, from, fl, out, l);
             stub_record(name, qtype, conn_fd, rule, line, NULL, 0, "servfail", NULL);
             return;
         }
         g_stub_dyn++;
-        isnew = true;
+        isnew = fresh;
     }
     const wr_entry_t *e = &g_names.e[i];
     if (exact || wr_entry_fresh(e, now)) {
@@ -523,7 +552,7 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
      * way is shared and charges nothing more; a name asked again after its
      * TTL charges the rule's rate (v1.25 review). */
     bool send_up = !e->pending;
-    if (send_up && !isnew && bud) {
+    if (send_up && !charged_q && bud) {
         const char *over = stub_charge(bud, name, now, false);
         if (over) {
             size_t l = stub_build(m, qend, 3, qtype, NULL, now, out, outn);

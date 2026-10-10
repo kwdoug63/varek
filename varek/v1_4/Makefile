@@ -30,28 +30,36 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
              $(V1_7_DIR)/plan_policy_config.c $(V1_7_DIR)/plan_breaker.c \
              $(V1_7_DIR)/plan_progress.c
 
-BINS := warden target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
+BINS := warden warden-proxy target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 crosscheck harness video-v112
+.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 latency-v1260 latency-v1261 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck harness video-v112
 
 all: $(BINS)
 
-# v1.16.1: the Warden needs the libseccomp and (from v1.16) libsodium headers.
-# Checked when (and only when) the Warden or varek_keygen is about to be built,
-# naming the command that installs them; `make deps` runs that command.
+# v1.16.1: the Warden needs the libseccomp and (from v1.16) libsodium headers;
+# v1.26.1: warden-proxy needs OpenSSL's. Checked when (and only when) one of
+# them is about to be built, naming the command that installs them; `make
+# deps` runs that command.
 deps-check:
 	@printf '#include <seccomp.h>\n#include <sodium.h>\n' | $(CC) -E -x c - >/dev/null 2>&1 || { \
 	    echo "ERROR: the Warden needs the libseccomp and libsodium development headers."; \
-	    echo "  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libsodium-dev"; \
-	    echo "  Fedora/RHEL:   sudo dnf install -y gcc make libseccomp-devel libsodium-devel"; \
+	    echo "  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev"; \
+	    echo "  Fedora/RHEL:   sudo dnf install -y gcc make libseccomp-devel libsodium-devel openssl-devel"; \
+	    echo "  or run: make deps"; exit 1; }
+
+deps-check-ssl:
+	@printf '#include <openssl/ssl.h>\n#include <openssl/pkcs12.h>\n' | $(CC) -E -x c - >/dev/null 2>&1 || { \
+	    echo "ERROR: warden-proxy (the egress proxy) needs the OpenSSL development headers."; \
+	    echo "  Debian/Ubuntu: sudo apt-get install -y libssl-dev"; \
+	    echo "  Fedora/RHEL:   sudo dnf install -y openssl-devel"; \
 	    echo "  or run: make deps"; exit 1; }
 
 deps:
 	@if command -v apt-get >/dev/null 2>&1; then \
-	    sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libsodium-dev; \
+	    sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev; \
 	elif command -v dnf >/dev/null 2>&1; then \
-	    sudo dnf install -y gcc make libseccomp-devel libsodium-devel; \
-	else echo "install libseccomp and libsodium (development packages) with your package manager"; exit 1; fi
+	    sudo dnf install -y gcc make libseccomp-devel libsodium-devel openssl-devel; \
+	else echo "install libseccomp, libsodium and OpenSSL (development packages) with your package manager"; exit 1; fi
 
 # v1.16.1: check a deployment before running it (dependencies, build, policy,
 # the verdict stream / key / anchor locations the Warden refuses, and with
@@ -64,18 +72,26 @@ CHECKER := checker/vdp_checker.c checker/vdp_checker.h
 
 # v1.24: the resolution table (warden_resolve.c) runs a resolver thread and
 # uses the host's resolver library.
-RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c warden_stub.inc.c shared_domains.c shared_domains.h
+RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c shared_domains.c shared_domains.h warden_proxy.c warden_proxy.h proxy_parse.h
 
 warden: warden.c warden_net.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
-	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
+	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
+
+# v1.26.1: the egress proxy, its own program (the Warden starts it from a
+# sealed copy whose SHA-256 it records). It links neither libseccomp nor
+# libsodium, and never holds the signing key; v1.26.1 inspecting mode links
+# OpenSSL here, and only here.
+warden-proxy: warden_proxy_helper.c warden_proxy.h proxy_parse.c proxy_parse.h proxy_ca.c proxy_ca.h
+	@$(MAKE) -s --no-print-directory deps-check-ssl
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_proxy_helper.c proxy_parse.c proxy_ca.c -lssl -lcrypto
 
 # v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
 # ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that
 # the certificate checker refuses the wrong verdict. Never deploy it.
 warden_faultinject: warden.c warden_net.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
-	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
+	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
 
 # v1.15: command-line front end to the certificate checker (policy digest,
 # batch certificate checks). Links the checker only, never smt_decide.c.
@@ -331,6 +347,15 @@ latency-v1240: warden tests/v1210_bench
 latency-v1250: warden
 	@sudo ./tests/latency_v1250.sh ./warden 1000
 
+# v1.26.0: whole requests through the egress proxy (SNI mode), against
+# direct dials and no Warden, and through Squid where installed; root
+latency-v1260: warden warden-proxy
+	@sudo ./tests/latency_v1260.sh ./warden 1000
+
+# v1.26.1, step 8: the same table in SNI and inspecting mode, with kept-alive rows
+latency-v1261: warden warden-proxy
+	@sudo ./tests/latency_v1261.sh ./warden 1000
+
 test-v1240: warden tools/vdp_check tools/vdp_cert_check tests/test_v1240_resolve
 	@./tests/test_v1240.sh ./tools/vdp_check ./tools/vdp_cert_check ./tests/test_v1240_resolve \
 	    $(if $(filter 0,$(shell id -u)),./warden)
@@ -344,6 +369,30 @@ tests/test_v1250_shared: tests/test_v1250_shared.c shared_domains.c shared_domai
 
 test-v1250: warden tools/vdp_check tools/vdp_cert_check tests/test_v1250_shared
 	@./tests/test_v1250.sh ./tools/vdp_check ./tools/vdp_cert_check ./tests/test_v1250_shared ./warden
+
+# v1.26.0 (in progress): the egress proxy in SNI mode; the grammar so far
+test-v1260: warden warden-proxy tools/vdp_check tools/vdp_cert_check tests/proxy_parse_test
+	@./tests/test_v1260.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
+
+# v1.26.1: the egress proxy's inspecting mode (step 1: the grammar)
+test-v1261: warden warden-proxy tools/vdp_check tools/vdp_cert_check
+	@./tests/test_v1261.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
+
+# v1.26 step 5: the proxy's parsers, under ASan and UBSan: the vectors, then
+# FUZZ_N mutated inputs (make fuzz-proxy-parse FUZZ_N=50000000 for longer).
+FUZZ_N ?= 2000000
+tests/proxy_parse_test: tests/proxy_parse_test.c proxy_parse.c proxy_parse.h
+	$(CC) -O1 -g -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=all -o $@ tests/proxy_parse_test.c proxy_parse.c
+
+fuzz-proxy-parse: tests/proxy_parse_test
+	./tests/proxy_parse_test unit
+	./tests/proxy_parse_test fuzz $(FUZZ_N) 1
+
+# With a clang that has libFuzzer's runtime: coverage-guided, for FUZZ_S seconds.
+FUZZ_S ?= 60
+fuzz-proxy-parse-libfuzzer: tests/proxy_parse_test.c proxy_parse.c proxy_parse.h
+	clang -O1 -g -DPP_LIBFUZZER -fsanitize=fuzzer,address,undefined -o tests/proxy_parse_fuzzer tests/proxy_parse_test.c proxy_parse.c
+	./tests/proxy_parse_fuzzer -max_total_time=$(FUZZ_S) -max_len=40000
 
 # Differential check of the decision procedure against an off-the-shelf SMT
 # solver (tools/requirements-crosscheck.txt) and,
@@ -380,7 +429,7 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared tests/proxy_parse_test tests/proxy_parse_fuzzer
 
 # v1.22: install the runtime and the `varek` command.
 #   sudo make install                  -> /opt/varek, plus /usr/local/bin/varek
@@ -390,12 +439,13 @@ BINDIR ?= /usr/local/bin
 INSTALL_TOOLS := tools/varek tools/vdp_check tools/vdp_cert_check tools/varek_keygen \
 	tools/varek_audit.py tools/varek_cyclonedx.py tools/varek_ed25519.py \
 	tools/varek_preflight.sh tools/varek_anchor_forward.py tools/varek_anchor_receiver.sh \
-	tools/varek_license.py tools/varek_bench.py tools/bench_workload
+	tools/varek_license.py tools/varek_bench.py tools/varek_bench_proxy.py tools/bench_proxy_client.py \
+	tools/bench_workload
 
-install: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
+install: warden warden-proxy tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/tools $(DESTDIR)$(PREFIX)/policies $(DESTDIR)$(PREFIX)/data $(DESTDIR)$(BINDIR)
 	install -m 0644 data/public_suffix_list.dat data/varek_shared_domains.txt $(DESTDIR)$(PREFIX)/data/
-	install -m 0755 warden $(DESTDIR)$(PREFIX)/warden
+	install -m 0755 warden warden-proxy $(DESTDIR)$(PREFIX)/
 	install -m 0755 $(INSTALL_TOOLS) $(DESTDIR)$(PREFIX)/tools/
 	install -m 0644 policies/*.policy.txt $(DESTDIR)$(PREFIX)/policies/
 	if [ -d tools/systemd ]; then install -d -m 0755 $(DESTDIR)$(PREFIX)/tools/systemd && \
@@ -408,5 +458,5 @@ uninstall:
 	rm -rf $(DESTDIR)$(PREFIX)
 	@echo "removed $(PREFIX); settings in /etc/varek and logs in /var/log/varek were kept"
 
-test-cli: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
-	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_license.py tests/test_varek_bench.py
+test-cli: warden warden-proxy tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
+	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_license.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py

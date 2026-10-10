@@ -1,6 +1,6 @@
 # VAREK — Threat Model
 
-Version: current as of v1.25.0 · MIT · github.com/kwdoug63/varek
+Version: current as of v1.26.1 · MIT · github.com/kwdoug63/varek
 
 This document states what VAREK defends, against whom, and what it explicitly
 does not defend. It is deliberately conservative: where a guarantee is
@@ -45,6 +45,32 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
 - **Trust boundary 5 (v1.25):** the shared-domain lists shipped with the
   release (the Public Suffix List and the VAREK list), which decide which
   wildcard rules are refused at load.
+- **Trust boundary 6 (v1.26):** the egress proxy process. It parses what the
+  agent sends, so the Warden trusts it less than itself: it runs as its own
+  unprivileged user with no capabilities, and tells the Warden only a
+  connection id, a kind, a name and a port. The Warden validates each report
+  (one per hand-off, on the hand-off's port) and stops the run on anything
+  else. The proxy can refuse or drop a connection the Warden would allow; it
+  cannot make the Warden dial a name the policy refuses. Its byte counts in
+  close records are its own claims. From v1.26.1 it is its own binary,
+  `warden-proxy`, which the Warden copies into a sealed memfd, hashes into
+  `run_start` and starts with `fexecve`, so what runs is what was hashed.
+  In inspecting mode it holds the run's CA key, sees the plaintext of every
+  inspected connection, and reports each request's object; the Warden checks
+  the object's form again itself, decides it, and requires a report for every
+  allowed body. The proxy cannot make the Warden allow a request the policy
+  refuses; the lengths and SHA-256s of bodies are its claims.
+- **Trust boundary 7 (v1.26):** the customer's upstream proxy, when the
+  policy names one (`proxy upstream`). It dials the names the Warden allowed,
+  so the address checks for those names are its own (see §6).
+- **Trust boundary 8 (v1.26.1):** in inspecting mode, the trust the agent and
+  the proxy are given. The agent trusts a CA made for the run (its trust
+  views and environment); the proxy verifies servers against the host's
+  bundle, or a bundle the operator names (`--trust-bundle`, for example with
+  a corporate CA), and a server any root in that bundle vouches for is
+  believed. The CA's name constraints permit only the names the policy lets
+  the agent reach on proxied ports, and exclude the passthrough hosts and
+  every IP address.
 
 ## 3. Adversary models
 
@@ -232,6 +258,94 @@ Model-B techniques below, with the residual limits stated honestly.
     carries their count and SHA-256, and the audit rebuilds them from the
     resolution records.
 
+- **Egress proxy, SNI mode (v1.26).** With `proxy on` (after `require
+  warden 1.26`), connects on the proxied ports (default 80 and 443) are
+  decided on the name the client sends, not on the address.
+  - *Decided on the name asked for.* The proxy reads the TLS ClientHello's
+    SNI, the HTTP `Host`, or a `CONNECT host:port` (whose ClientHello must
+    carry the same name). The Warden decides `name:port` with the SMT
+    decision procedure, the certificate checker must accept the
+    certificate, and the Warden dials only an address that name resolves
+    to. Another site on a shared content network is not reached by naming
+    it, which closes v1.24's shared-address gap on the proxied ports.
+  - *No agent DNS for proxied names.* A name allowed only on proxied ports
+    is given a synthetic address from 198.18.0.0/15, recorded once; nothing
+    is looked up when the agent asks, and no wildcard budget is charged.
+  - *Only through the proxy.* A TCP connect on a proxied port is handed to
+    the proxy unless a numeric rule allows the address (dialed directly) or
+    a rule denies it (refused). The proxy closes any connection the Warden
+    did not announce, and the agent cannot reach its listener. A UDP connect
+    on a proxied port that only a name allows is refused (QUIC).
+  - *Bounded parsers.* The parsers allocate nothing and read at most 16 KB
+    of ClientHello in 64 records, or 8 KB of request headers. They refuse
+    what they cannot read exactly: no SNI, two names, an IP literal,
+    Encrypted Client Hello and ESNI, a repeated extension, a `Host` port
+    other than the one connected to. Fuzzed under ASan and UBSan in CI.
+  - *Addresses the Warden refuses.* Special addresses (loopback,
+    link-local, unspecified, multicast, cloud metadata, IPv4-mapped and
+    IPv4-translated IPv6), synthetic addresses and addresses a rule denies
+    are never dialed for a name.
+  - *Plain HTTP request by request.* Every request on a connection must name
+    the host and port decided, and each body is passed as its framing says;
+    ambiguous framing and protocol upgrades are refused. At a request for
+    another host the proxy stops.
+  - *A less trusted proxy.* See trust boundary 6. The proxy is started
+    before the agent, proves its user with `SCM_CREDENTIALS`, and exits with
+    the Warden; if it dies mid-run, the run stops. The Warden never blocks
+    sending to it.
+  - *Recorded and audited.* Each hand-off, decision (`net.proxy`) and close
+    (`proxy_close`) is a chained record. `varek_audit.py` asks each hand-off
+    and each dialed address of the policy again, checks one certified
+    decision per hand-off and a close for each connection passed on, and
+    that no connect on a proxied port was dialed directly except by a
+    numeric rule.
+  - *Chained to a customer's proxy.* With `proxy upstream`, the Warden
+    decides first, so a refused name never reaches the upstream; the
+    upstream's own refusal is recorded (`upstream_refused`).
+
+- **Egress proxy, inspecting mode (v1.26.1).** With `proxy inspect`, a
+  connection is decided on its name as in SNI mode, then every request on it
+  is decided before any of it is sent.
+  - *Each request decided.* The object `METHOD scheme://name:port/path?query`
+    (the name and port the connection's, never the request's `Host`, which
+    must equal them) is decided against `allow|deny request METHOD URL`
+    rules with the SMT decision procedure, first match, and the certificate
+    checker must accept the certificate. A request no request rule allows is
+    refused. An allow rule without a `?` allows no query; a deny rule without
+    one denies its path with any query; a request has at most one `?`, so a
+    rule's wildcards never stretch from the path into the query.
+  - *Read one way.* The proxy refuses a target a server could read as
+    another path (`.` and `..` segments, `//`, `\`, `;`, control and
+    non-ASCII bytes, percent-encoded `/`, `\` or unreserved bytes, bad
+    escapes, a second `?`), anything but origin-form or absolute-form for
+    the connection's own authority, and ambiguous framing; the Warden checks
+    the object's form again before deciding.
+  - *Nothing before the verdict.* The proxy's gate lets no byte of a request
+    through until the Warden allows it; after a refusal nothing more of the
+    connection is sent, and the agent gets a 403.
+  - *Servers verified first.* TLS 1.2 or later to the server, its name
+    checked against the subject alternative name (no partial wildcards, no
+    CN), before the agent's handshake is answered; a server that fails is
+    refused and recorded (`server_tls`). A server's TLS that ends without
+    close_notify ends the agent's without one too.
+  - *The run's CA.* ECDSA P-256, made in the proxy for this run, its key in
+    OpenSSL's secure heap where the memory-lock limit allows, the proxy not
+    dumpable, nothing written to disk; valid seven days; name-constrained as
+    in trust boundary 8. Leaf certificates are made per name, no session
+    tickets, ALPN `http/1.1` only.
+  - *Bodies bounded and hashed, not stored.* `max_body` bounds what is sent
+    (a declared length over it is refused before a byte is sent; a chunked
+    body is cut at it); each body's length and SHA-256 are recorded.
+  - *Passthrough hosts* (`proxy passthrough host NAME`, for clients that pin
+    certificates) stay in SNI mode and are recorded as not inspected.
+  - *Recorded and audited.* Each request is a chained `net.request` record,
+    each body a `request_body`, each close counts its requests; `run_start`
+    records the CA's, trust store's and `warden-proxy`'s SHA-256.
+    `varek_audit.py` checks each request belongs to an inspected connection,
+    in order, in a form the proxy must accept, certified again when
+    allowed and asked of the policy again when refused, each body within its
+    rule, and each close's count.
+
 The per-class status of every known bypass class is maintained in
 `docs/security/bypass-classes.md`.
 
@@ -273,9 +387,10 @@ are claimed as solved.
   - *Shared addresses.* A name is decided by the addresses it resolves to. An
     allowed name on a shared content network also reaches every other site
     served from those addresses, by another name in TLS SNI or the HTTP `Host`
-    header. Deciding on the name the agent asks the server for, and rules on
-    request contents (method, path, body), are stage 3, through the v1.26.0
-    egress proxy (`v1.26-egress-proxy.md`).
+    header. From v1.26.0, `proxy on` closes this on the proxied ports (§4,
+    *Egress proxy*); on other ports, and without the proxy, it holds. From
+    v1.26.1, `proxy inspect` also decides each request's method, path and
+    query (§4, *Egress proxy, inspecting mode*).
   - *DNS is trusted.* Whoever controls an allowed name's DNS, or the host's
     resolver, chooses its addresses within what §4 allows: a private address
     (10/8, 172.16/12, 192.168/16, fc00::/7) the Warden's host can reach is
@@ -284,7 +399,8 @@ are claimed as solved.
   - *Unix-socket resolvers.* A policy that allows nscd's, systemd-resolved's
     or D-Bus's socket gives the agent a resolver that sends DNS itself.
   - *Metadata.* `stat` and `access` on the four view paths report the host's
-    files, not the views.
+    files, not the views. (The v1.26.1 trust views answer read-type lookups
+    from the view: a read-only file of the view's size.)
   - *Signatures.* A refresh that changes a name's addresses is signed at the
     next scheduled checkpoint, not at once.
 - Wildcard host names (v1.25, `v1.25-wildcard-host-names.md`):
@@ -295,7 +411,10 @@ are claimed as solved.
     its TTL goes upstream again and counts against `rate=`, so the choice of
     names re-asked carries at most about 30 bytes a minute after that (about
     43 KB a day a rule), and the timing of each lookup a few bits more. The
-    v1.26 egress proxy decides on the name without a lookup by the agent.
+    With the v1.26 egress proxy on, a name the proxy decides is looked up by
+    the Warden only when it dials a request the policy allowed, charged to
+    the same budgets; names the agent asks the stub for get synthetic
+    addresses and are not looked up.
   - *A deny wildcard holds on names only.* Its hosts cannot be resolved in
     advance, so an allowed name that is a CNAME to one, or shares its
     address, still connects. An exact deny holds on addresses.
@@ -307,6 +426,66 @@ are claimed as solved.
     such and checked again by the audit against the release's.
   - *No stub without a network namespace.* Without one of its own for the
     agent, names that only a wildcard allows do not resolve.
+- Egress proxy, SNI mode (v1.26, `v1.26-egress-proxy.md`):
+  - *Inside TLS only the ClientHello is read.* A request inside TLS can carry
+    a `Host` for another site on the same content network (domain fronting),
+    and later requests on a kept-open TLS connection can name another host.
+    Both reach only the server the allowed name resolved to; most CDNs refuse
+    a `Host` that does not match the SNI. Inspecting mode (v1.26.1) decides
+    every request, except on passthrough hosts.
+  - *Proxied ports only.* On other ports connects are decided on addresses,
+    as in v1.24.
+  - *With an upstream, address checks are the upstream's.* The Warden never
+    sees the address the upstream dials, so its refusal of special addresses
+    and its deny rules on addresses do not apply to names sent there; the
+    decision on the name and every deny on a name do. The hop to the
+    upstream is `http://` and unencrypted. Configure the upstream to refuse
+    those addresses.
+  - *Byte counts are claims.* The close records' counts are the proxy's
+    report, not measured by the Warden, and say how much was relayed, not
+    what.
+  - *Refused, not decided.* Encrypted Client Hello, a ClientHello without
+    SNI and QUIC on proxied ports are refused; clients that cannot fall back
+    fail.
+  - *Hashed candidates.* A hand-off whose address has more than 16 names is
+    recorded with their hash, and the audit does not ask it of the policy
+    again; it reaches only the proxy's listener, and the decision on the name
+    it asks for is certified on its own.
+  - *Review.* v1.26 was reviewed by AI review agents, not by a human or
+    third party.
+- Egress proxy, inspecting mode (v1.26.1, `v1.26.1-inspecting-mode.md`):
+  - *What is decided is the request line.* Method, path and query are
+    decided; headers are not (beyond `Host` and framing), and bodies only
+    by length. Data the agent puts in an allowed request's headers, query
+    or body reaches the server the policy allows; a DLP tool behind
+    `proxy upstream` sees only TLS, so inspecting mode does not replace one
+    that terminates TLS itself.
+  - *The proxy sees plaintext.* It holds the run's CA key and every
+    inspected request and response in memory. It runs as its own user, not
+    dumpable, and exits with the run; the CA is name-constrained and lives
+    seven days, so a key taken from it signs only for the policy's names.
+  - *Secrets in URLs are recorded.* The path and query are recorded as
+    sent, as file paths are; an API key in a query is in the stream. Bodies
+    are never recorded.
+  - *Clients that do not trust the run's CA fail.* A client with its own
+    trust store (a pinned certificate, a `CApath` directory instead of a
+    bundle file, an application-bundled store) fails its handshake
+    (`client_tls`), unless its host is a passthrough host.
+  - *HTTP/1.1 only.* A client that offers only h2 is refused; one that
+    offers both is answered in HTTP/1.1. WebSocket and other upgrades are
+    refused.
+  - *Passthrough hosts are not inspected.* Their requests, including a
+    fronted `Host` for an inspected name on the same content network, are
+    relayed as in SNI mode.
+  - *The trust bundle is believed.* A server that any root in the host's
+    bundle, or in `--trust-bundle`, vouches for is believed to be the name
+    decided.
+  - *Framing counts.* `max_body` bounds a body as sent, so a chunked body's
+    framing counts against it.
+  - *Runs longer than seven days* get their new leaf certificates refused
+    once the CA expires.
+  - *Review.* v1.26.1 was reviewed by AI review agents, not by a human or
+    third party; its findings are listed in the design note.
 - File opens run as root (pre-dates v1.24, found in the v1.24 review). The
   Warden opens a file for the agent with its own credentials, so a path the
   policy lets the agent write is writable even when the file is root-owned

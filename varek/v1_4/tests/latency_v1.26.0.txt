@@ -1,0 +1,13 @@
+VAREK v1.26.0 latency of the egress proxy, SNI mode (2026-10-08T08:27Z; kernel 6.18.44-fc-v80; 4 vCPU)
+n=1000 requests per row, one after another; percentiles in microseconds, measured by the client;
+each request is a new connection (TLS: a full handshake, RSA 2048), to servers on this machine's own address.
+native tls       n=1000 p50=3852 p90=5164 p99=9484 failed=0
+direct tls       n=1000 p50=4310 p90=5629 p99=10472 failed=0
+proxied tls      n=1000 p50=5277 p90=6881 p99=9405 failed=0
+proxied tls      records: decided and dialed n=1000 p50=105 p90=149 p99=234; hand-off n=1000 p50=275 p99=1319 (us)
+native http      n=1000 p50=524 p90=715 p99=1329 failed=0
+proxied http     n=1000 p50=875 p90=1192 p99=2724 failed=0
+proxied http     records: decided and dialed n=1000 p50=78 p90=119 p99=204; hand-off n=1000 p50=210 p99=531 (us)
+via squid        n=1000 p50=6180 p90=8092 p99=16431 failed=0
+via squid        records: decided and dialed n=1000 p50=99 p90=144 p99=279; hand-off n=1000 p50=269 p99=730 (us)
+hand-off only    n=1000 p50=272 p90=390 p99=564 failed=0

@@ -133,6 +133,8 @@
 #include "warden_lifecycle.h"   /* v1.9.3 supervisor/target lifecycle coupling */
 #include "warden_resolve.h"     /* v1.24 resolution table for host name rules */
 #include "shared_domains.h"     /* v1.25 wildcards over shared domains, refused at load */
+#include "warden_proxy.h"       /* v1.26 the egress proxy process */
+#include "proxy_parse.h"        /* v1.26 what the proxy reads (pp_kind_name) */
 
 /* Kernel/libc compatibility shims --------------------------------- */
 #ifndef __NR_openat2
@@ -209,6 +211,8 @@ typedef enum {
     ACT_FILE_STAT,       /* v1.17.0: newfstatat, statx */
     ACT_FILE_ACCESS,     /* v1.17.0: access, faccessat, faccessat2 */
     ACT_FILE_READLINK,   /* v1.17.0: readlink, readlinkat */
+    ACT_NET_PROXY,       /* v1.26: a name:port the egress proxy read from a client */
+    ACT_NET_REQUEST,     /* v1.26.1: a request of an inspected connection (its object) */
     ACT_OTHER,
 } action_kind_t;
 
@@ -259,6 +263,7 @@ struct action {
                                            warden_names.inc.c) */
     bool          special_addr;         /* connect: a special address, decided as a number */
     char          dialed[64];           /* connect: the numeric destination dialed */
+    bool          proxy_handoff;        /* v1.26: a connect handed to the egress proxy */
     char          extra[4608];          /* extra record fields, trusted text, each ending in ',' */
 };
 
@@ -278,6 +283,8 @@ static const char *action_kind_name(action_kind_t k) {
         case ACT_FILE_STAT:     return "file.stat";
         case ACT_FILE_ACCESS:   return "file.access";
         case ACT_FILE_READLINK: return "file.readlink";
+        case ACT_NET_PROXY:     return "net.proxy";
+        case ACT_NET_REQUEST:   return "net.request";
         case ACT_OTHER:        return "other";
     }
     return "invalid";
@@ -307,7 +314,7 @@ static int policy_load(const char *path, struct policy *p) {
             "(warden_faultinject); never use it to supervise a real agent\n");
 #endif
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.25");
+    snprintf(p->version, sizeof(p->version), "1.26");
     char err[512];
     /* v1.15: read the file once. The decision procedure and the certificate
      * checker parse these same bytes, and their SHA-256 goes in run_start, so
@@ -355,17 +362,34 @@ static int policy_load(const char *path, struct policy *p) {
         };
         static const int kind_to_c[] = {
             [VDP_KIND_PATH] = VDPC_PATH, [VDP_KIND_HOST] = VDPC_HOST, [VDP_KIND_EXEC] = VDPC_EXEC,
+            [VDP_KIND_REQUEST] = VDPC_REQUEST,
         };
         if (vdpc_rule_info(&p->c, i, &ci) < 0 || ci.allow != (r->verb == VDP_ALLOW) ||
             ci.kind != kind_to_c[r->kind] || ci.match != op_to_match[r->s.op] ||
             ci.clen != r->s.len || memcmp(ci.c, r->s.c, r->s.len) != 0 ||
             ci.mask != r->b.mask || ci.value != r->b.value || ci.line != r->line ||
             ci.portless != r->s.portless || ci.name != r->s.name || ci.wild != r->s.wild ||
-            ci.names != r->names || ci.rate != r->rate) {
+            ci.names != r->names || ci.rate != r->rate || ci.max_body != r->max_body) {
             fprintf(stderr, "[warden] policy %s:%d: the decision procedure and the certificate "
                     "checker read this rule differently; refusing to start\n", path, r->line);
             return -1;
         }
+    }
+    /* v1.26: and the proxy directives */
+    bool proxy_same = p->v.proxy == (p->c.proxy != 0) && p->v.proxy_nports == p->c.proxy_nports;
+    for (size_t k = 0; proxy_same && k < p->v.proxy_nports; k++)
+        proxy_same = p->v.proxy_ports[k] == p->c.proxy_ports[k];
+    proxy_same = proxy_same && p->v.proxy_up_port == p->c.proxy_up_port &&
+                 (!p->v.proxy_up_port || !strcmp(p->v.proxy_up_host, p->c.proxy_up_host));
+    /* v1.26.1: inspecting mode and its passthrough hosts */
+    proxy_same = proxy_same && p->v.proxy_inspect == (p->c.proxy_inspect != 0) &&
+                 p->v.proxy_npass == p->c.proxy_npass;
+    for (size_t k = 0; proxy_same && k < p->v.proxy_npass; k++)
+        proxy_same = !strcmp(p->v.proxy_pass[k], p->c.proxy_pass[k]);
+    if (!proxy_same) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
+                "the proxy directives differently; refusing to start\n", path);
+        return -1;
     }
     /* v1.13: load-time analysis. The decision procedure decides, for every
      * rule, whether ANY action can reach it as the first matching rule. A rule
@@ -390,6 +414,15 @@ static int policy_load(const char *path, struct policy *p) {
             fprintf(stderr, "[warden] policy %s:%d: note: reachability not decided "
                     "(%s)\n", path, r->line,
                     vdp_reach_unknown_text());
+        }
+    }
+    /* v1.26.1: a request rule whose host no host rule allows on its port */
+    for (size_t i = 0; i < p->v.n; i++) {
+        char hw[300];
+        if (vdp_request_host_refused(&p->v, i, hw, sizeof hw)) {
+            dead++;
+            fprintf(stderr, "[warden] policy %s:%d: WARNING: request rule can never fire: %s\n",
+                    path, p->v.rules[i].line, hw);
         }
     }
     /* v1.21: host rules no connect can match (non-canonical spellings, and
@@ -809,6 +842,7 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
             if (s[0] == '\0') { a->why = "no_resolved_path"; return DEC_UNKNOWN; }
             break;
         case ACT_NET_CONNECT:
+        case ACT_NET_PROXY:              /* v1.26: the name:port the proxy read */
             /* v1.21: decided on the destination the Warden will dial, in its
              * canonical spelling (net_decision_string), never the agent's. */
             kind = VDP_KIND_HOST;
@@ -816,6 +850,7 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
             if (s[0] == '\0') { a->why = "no_resolved_destination"; return DEC_UNKNOWN; }
             break;
         case ACT_PROCESS_EXEC: kind = VDP_KIND_EXEC; s = a->target; break;
+        case ACT_NET_REQUEST: kind = VDP_KIND_REQUEST; s = a->resolved; break;      /* v1.26.1 */
         default:
             a->why = "not_in_fragment";
             return DEC_UNKNOWN;
@@ -868,6 +903,8 @@ static bool certify(const struct policy *p, struct action *a) {
         case ACT_FILE_ACCESS:
         case ACT_FILE_READLINK: kind = VDPC_PATH; s = a->resolved; break;
         case ACT_NET_CONNECT:  kind = VDPC_HOST; s = a->resolved; break;   /* v1.21 */
+        case ACT_NET_PROXY:    kind = VDPC_HOST; s = a->resolved; break;   /* v1.26 */
+        case ACT_NET_REQUEST:  kind = VDPC_REQUEST; s = a->resolved; break; /* v1.26.1 */
         case ACT_PROCESS_EXEC: kind = VDPC_EXEC; s = a->target;   break;
         default:
             snprintf(a->check_why, sizeof a->check_why, "no certificate for this action kind");
@@ -1280,12 +1317,37 @@ static bool       g_names_on = false;
 static bool       g_any_name = false;  /* v1.24: the policy has a host name rule (allow or deny) */
 static bool       g_any_wild = false;  /* v1.25: the policy has a wildcard allow rule (warden_stub.inc.c) */
 static void       stub_resolved(size_t i);
+static void       px_resolved(size_t i);  /* v1.26: proxied requests waiting on a lookup */
+static bool       px_up_charged(const char *name);  /* v1.26 review: sent to the upstream, charged */
+static void       px_handed_off(uint64_t id, unsigned port);  /* v1.26 review: a hand-off announced */
 static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden_stub.inc.c) */
 /* v1.25 (section 4): a wildcard allow rule's budgets when it sets none */
 #define STUB_DEFAULT_NAMES 256           /* distinct new names per run */
 #define STUB_DEFAULT_RATE  30            /* distinct new names per minute */
 #define STUB_LABEL_MAX     63            /* bytes matched by `*` */
 static char       g_psl_sha[65], g_shared_sha[65];  /* v1.25: the lists wildcards were checked against */
+static wp_t       g_proxy = { .ctl = -1 };          /* v1.26: the egress proxy, when `proxy on` */
+static char       g_proxy_sha[65];                  /* v1.26.1: the SHA-256 of the warden-proxy that ran */
+/* v1.26.1, inspecting mode: the run's CA and the trust views (warden_trust.inc.c) */
+static bool       g_inspect_on = false;
+static unsigned char *g_trust_bundle, *g_ca_pem, *g_trust_p12;
+static size_t     g_trust_bundle_len, g_ca_pem_len, g_trust_p12_len;
+static char       g_trust_host_bundle[PATH_MAX];    /* the host's bundle the views start with */
+static const char *g_trust_bundle_arg;              /* v1.26.1: --trust-bundle, in its place */
+static char       g_trust_host_sha[65], g_ca_sha[65], g_trust_p12_sha[65];
+static int        g_trust_secure_heap, g_trust_nroots;
+static size_t     g_trust_nnames;
+static bool       g_syn_on = false;    /* v1.26: `proxy on`: synthetic addresses (warden_synth.inc.c) */
+static const struct policy *g_syn_p;   /* v1.26: the policy, for the hosts view */
+/* v1.26: the stub runs with a wildcard allow rule (v1.25), or with the proxy
+ * on and any host name rule (synthetic addresses) */
+#define STUB_WANTED() (g_any_wild || (g_syn_on && g_names_on))
+static uint64_t   g_proxy_conns = 0;   /* v1.26: connections handed to the proxy (proxy_conn ids) */
+static int        g_up_entry = -1;     /* v1.26 section 5: the upstream proxy's name in g_names, or -1 */
+static wr_ip_t    g_up_ip;             /* v1.26 section 5: the upstream given as an address */
+#define SYN_BASE   0xc6120000u           /* 198.18.0.0 */
+#define SYN_MAX    131070u               /* synthetic addresses: 198.18.0.1 .. 198.19.255.254 */
+#define SYN_TTL    300u                  /* seconds, in answers (the address never changes) */
 static bool       g_lists_pinned;                   /* v1.25 review: they are the release's */
 static uint64_t g_records = 0;       /* decision records emitted */
 static bool     g_relay_midline = false;
@@ -1526,7 +1588,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.25.0\","
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.26.1\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
@@ -1555,7 +1617,36 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     if (g_names_on) fprintf(f, "\"host_names\":%zu,\"resolver\":\"%s\",", g_names.n, g_names.resolver);
     /* v1.25: where the agent's questions go (connects and sends to it are
      * records with rule dns_stub) */
-    if (g_any_wild) fputs("\"dns_stub\":\"127.53.53.53:53\",", f);
+    if (STUB_WANTED()) fputs("\"dns_stub\":\"127.53.53.53:53\",", f);
+    /* v1.26: the egress proxy: its listener, its user, the proxied ports */
+    if (g_proxy.ctl >= 0) {
+        fprintf(f, "\"proxy\":{\"mode\":\"%s\",\"listen\":\"127.0.0.1:%u\",\"uid\":%u,\"gid\":%u,\"pid\":%d,\"ports\":[",
+                g_inspect_on ? "inspect" : "sni",
+                g_proxy.port, (unsigned)g_proxy.uid, (unsigned)g_proxy.gid, (int)g_proxy.pid);
+        if (p->v.proxy_nports)
+            for (size_t k = 0; k < p->v.proxy_nports; k++)
+                fprintf(f, "%s%u", k ? "," : "", p->v.proxy_ports[k]);
+        else fputs("80,443", f);
+        fputs("]", f);
+        if (p->v.proxy_up_port)                  /* section 5 */
+            fprintf(f, ",\"upstream\":\"%s:%u\"", p->v.proxy_up_host, p->v.proxy_up_port);
+        fputs("},", f);
+        /* v1.26.1: the SHA-256 of the warden-proxy binary that runs (the
+         * sealed copy it was started from) */
+        fprintf(f, "\"proxy_binary_sha256\":\"%s\",", g_proxy_sha);
+        /* v1.26.1: inspecting mode's trust: the host's bundle, the run's CA
+         * (the SHA-256 of its DER), the trust store, the passthrough hosts */
+        if (g_inspect_on) {
+            fprintf(f, "\"trust\":{\"host_bundle\":\"");
+            json_escape(f, g_trust_host_bundle);
+            fprintf(f, "\",\"host_bundle_sha256\":\"%s\",\"host_roots\":%d,\"ca_sha256\":\"%s\","
+                    "\"ca_names\":%zu,\"trust_store_sha256\":\"%s\",\"ca_key_locked\":%s,\"passthrough\":[",
+                    g_trust_host_sha, g_trust_nroots, g_ca_sha, g_trust_nnames, g_trust_p12_sha,
+                    g_trust_secure_heap ? "true" : "false");
+            for (size_t k = 0; k < p->v.proxy_npass; k++) fprintf(f, "%s\"%s\"", k ? "," : "", p->v.proxy_pass[k]);
+            fputs("]},", f);
+        }
+    }
     /* v1.25 (section 4): each wildcard allow rule's budgets, defaults filled in */
     if (g_any_wild) {
         fputs("\"wildcard_budgets\":[", f);
@@ -1611,8 +1702,25 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
             if (pass == 1 && g_names.n > before) g_names.e[ix].unlisted = true;
         }
     }
+    /* v1.26 section 5: the upstream proxy's name is resolved and refreshed
+     * like a deny rule's (unlisted: never in the agent's views); an address
+     * is dialed as it is. */
+    if (p->v.proxy_up_port) {
+        if (wr_ip_parse(p->v.proxy_up_host, &g_up_ip) == 0) g_up_entry = -1;
+        else {
+            size_t before = g_names.n;
+            g_up_entry = wr_table_add(&g_names, p->v.proxy_up_host);
+            if (g_up_entry < 0) {
+                fprintf(stderr, "[warden] out of memory for the resolution table\n");
+                return -1;
+            }
+            if (g_names.n > before) g_names.e[g_up_entry].unlisted = true;
+        }
+    }
     /* v1.25: a wildcard adds names when the agent asks (the stub) */
     g_names_on = g_names.n > 0 || g_any_wild;
+    g_syn_on = p->v.proxy;               /* v1.26 */
+    g_syn_p = p;
     return 0;
 }
 
@@ -1700,6 +1808,7 @@ static void emit_resolution(void *ctx, size_t i, const wr_result_t *r) {
     wr_format_record(f, g_run_id, &g_names, i, r, wr_now_ms());
     rec_end(NULL);
     stub_resolved(i);                   /* v1.25: answer the agent's waiting questions */
+    px_resolved(i);                     /* v1.26: and dial the proxy's waiting requests */
 }
 
 /* v1.25: a dynamic entry's TTL passed with no new question; its addresses
@@ -1771,15 +1880,19 @@ static void emit_unanswered(void) {
     }
 }
 
+static void px_finish(void);           /* v1.26 step 7 (warden_pxdecide.inc.c) */
+static bool g_px_failed;               /* v1.26.1 review: the proxy misbehaved while flushing */
 static void emit_run_end(int exit_status) {
+    px_finish();                        /* v1.26: every relay's proxy_close */
     emit_unanswered();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
     fprintf(f, "{\"event\":\"run_end\",\"run\":\"%s\",\"records\":%" PRIu64 ","
-               "\"exit_status\":%d,%s\"timestamp_ns\":%lld}\n",
+               "\"exit_status\":%d,%s%s\"timestamp_ns\":%lld}\n",
             g_run_id, g_records, exit_status,
             g_anchor_errors ? "\"anchor_errors_seen\":true," : "",
+            g_px_failed ? "\"proxy_failed\":true," : "",
             (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end("run_end");
 }
@@ -2696,9 +2809,18 @@ static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *mi
     return rc;
 }
 
+/* v1.26 (warden_synth.inc.c): synthetic addresses, used by the views, the
+ * connects and the stub */
+static bool syn_is_addr(const wr_ip_t *ip);
+static bool syn_qualifies(const struct policy *p, const char *name);
+static int  syn_assign(const char *name, int line, wr_ip_t *out);
+static void syn_hosts_view(const struct policy *p, FILE *f);
 #include "warden_names.inc.c"        /* v1.24: host-name views and candidates */
 #include "warden_net.inc.c"          /* v1.21: decided connections */
 #include "warden_stub.inc.c"         /* v1.25: the stub resolver for wildcard names */
+#include "warden_synth.inc.c"        /* v1.26: synthetic addresses with the proxy on */
+#include "warden_pxdecide.inc.c"     /* v1.26: the Warden's decisions on what the proxy reads */
+#include "warden_trust.inc.c"        /* v1.26.1: the run's CA and the trust views */
 
 /* ---------------- receive loop ---------------- */
 
@@ -2723,7 +2845,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * finished for the agent (warden_net.inc.c). */
         /* v1.24: also on the resolver helper's results. */
         /* v1.25: and on the stub resolver's sockets (warden_stub.inc.c). */
-        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN] = {
+        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN + 1 + PX_MAX_DIAL] = {
             { .fd = notify_fd,    .events = POLLIN },
             { .fd = target_pidfd, .events = POLLIN },
             { .fd = agent_err_fd, .events = POLLIN },
@@ -2741,6 +2863,10 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * their results applied here; the lookups themselves never run in
          * the Warden. */
         int nstub = stub_poll_fill(&pfds[4 + npoll]);
+        /* v1.26 (step 5): and on the egress proxy's reports */
+        int pxi = 4 + npoll + nstub;
+        pfds[pxi] = (struct pollfd){ .fd = g_proxy.ctl, .events = POLLIN };
+        int npx = px_poll_fill(&pfds[pxi + 1]);
         int to = maybe_checkpoint(), pto = pend_timeout_ms();
         if (pto >= 0 && (to < 0 || pto < to)) to = pto;
         if (g_names_on) {
@@ -2749,7 +2875,9 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             int dto = wr_next_due_ms(&g_names, wr_now_ms());
             if (dto >= 0 && (to < 0 || dto < to)) to = dto;
         }
-        int pr = poll(pfds, (nfds_t)(4 + npoll + nstub), to);
+        int xto = px_timeout_ms();
+        if (xto >= 0 && (to < 0 || xto < to)) to = xto;
+        int pr = poll(pfds, (nfds_t)(pxi + 1 + npx), to);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -2760,6 +2888,12 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             pend_service(notify_fd, rev, npoll);
         }
         stub_service(p, &pfds[4 + npoll], nstub);
+        px_service(p, &pfds[pxi + 1], npx);
+        if (g_proxy.ctl >= 0 && (pfds[pxi].revents & (POLLIN | POLLHUP | POLLERR)) && proxy_service(p) < 0) {
+            /* fail closed, as for the resolver helper */
+            fprintf(stderr, "[warden] the egress proxy exited or sent a malformed report; stopping the run\n");
+            return false;
+        }
         if (g_names_on && (pfds[3].revents & (POLLIN | POLLHUP | POLLERR))) {
             wr_async_collect(&g_names, wr_now_ms(), emit_resolution, NULL);
             /* v1.24: without the helper the table would go stale; stop
@@ -2852,6 +2986,13 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * the lookup no longer tells the agent what exists elsewhere. */
         if (is_meta_kind(act.kind)) {
             if (act.bad_flags) { send_errno(notify_fd, req.id, EINVAL); continue; }
+            /* v1.26.1: a trust view's metadata, from the view */
+            if (g_inspect_on && (act.kind == ACT_FILE_STAT ||
+                                 (act.kind == ACT_FILE_ACCESS && !(act.access_mode & (W_OK | X_OK)))) &&
+                view_by_target(act.target) >= VIEW_TRUST0) {
+                view_meta(notify_fd, &req, &act, p, view_by_target(act.target), &t0);
+                continue;
+            }
             int held = -1;
             if (meta_on_held_fd(req.pid, notify_fd, req.id, &act, &held) == 1) continue;
             int mfd = -1, missing = 0;
@@ -2961,7 +3102,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * /etc/host.conf, named as such, are answered with the Warden's views
          * while the policy has a host name rule (warden_names.inc.c), whether
          * or not the host has the file. */
-        if (g_any_name && act.kind == ACT_FILE_OPEN && view_open_readonly(&act) &&
+        if ((g_any_name || g_inspect_on) && act.kind == ACT_FILE_OPEN && view_open_readonly(&act) &&
             view_by_target(act.target) >= 0) {
             view_serve(notify_fd, &req, &act, p, view_by_target(act.target), &t0);
             continue;
@@ -2970,7 +3111,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * whatever the policy says. The Warden's resolver helper reads the
          * host's resolv.conf on every lookup, so an agent that could write it
          * would choose where allowed names lead. */
-        if (g_any_name && act.kind == ACT_FILE_OPEN && !view_open_readonly(&act) &&
+        if ((g_any_name || g_inspect_on) && act.kind == ACT_FILE_OPEN && !view_open_readonly(&act) &&
             view_by_target(act.target) >= 0) {
             snprintf(act.resolved, sizeof act.resolved, "%s", act.target);
             clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -3005,13 +3146,13 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             }
             /* v1.24: the same views, reached by another spelling (a symlink,
              * "..", /etc/resolv.conf's own target). */
-            if (g_any_name && view_open_readonly(&act) && view_by_canonical(act.resolved) >= 0) {
+            if ((g_any_name || g_inspect_on) && view_open_readonly(&act) && view_by_canonical(act.resolved) >= 0) {
                 int v = view_by_canonical(act.resolved);
                 resolved_target_close(&rt);
                 view_serve(notify_fd, &req, &act, p, v, &t0);
                 continue;
             }
-            if (g_any_name && !view_open_readonly(&act) && view_by_canonical(act.resolved) >= 0) {
+            if ((g_any_name || g_inspect_on) && !view_open_readonly(&act) && view_by_canonical(act.resolved) >= 0) {
                 resolved_target_close(&rt);
                 clock_gettime(CLOCK_MONOTONIC, &t1);
                 emit_pathology(g_report_seq++, req.pid, &act, DEC_DENY, DEC_DENY, "view_write_refused",
@@ -4009,7 +4150,7 @@ static void usage(const char *argv0) {
         "              [--sign-key <key>]\n"
         "              [--anchor <path>] [--checkpoint-every <n>] [--run-as <user>]\n"
         "              [--dns-server <a.b.c.d[:port]>] [--dns-ttl-min <s>] [--dns-ttl-max <s>]\n"
-        "              [--dns-grace-max <s>] [--psl <file>] [--shared-domains <file>]\n"
+        "              [--dns-grace-max <s>] [--psl <file>] [--shared-domains <file>]\n              [--proxy-as <user>] [--proxy-bin <warden-proxy>] [--trust-bundle <pem>]\n"
         "              -- <target> [args...]\n"
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
         "\n"
@@ -4118,6 +4259,8 @@ int main(int argc, char **argv) {
     /* v1.24: the resolver helper is this program re-executed (a clean address
      * space, without the signing key); see warden_resolve.h. */
     if (argc >= 2 && !strcmp(argv[1], "--resolver-helper")) return wr_helper_exec_main(argc, argv);
+    /* v1.26.1: the egress proxy is its own program, warden-proxy (see
+     * proxy_bin below); this binary no longer has a --proxy-helper mode. */
     /* Positional parse with optional --plan between policy_path and --.
      * Accepted forms:
      *   warden policy.txt -- target [args...]
@@ -4138,6 +4281,8 @@ int main(int argc, char **argv) {
     const char *key_path    = NULL;     /* v1.16 */
     const char *anchor_path = NULL;     /* v1.16 */
     const char *run_as_arg  = NULL;     /* v1.17.0 */
+    const char *proxy_as_arg = NULL;    /* v1.26: the egress proxy's user */
+    const char *proxy_bin_arg = NULL;   /* v1.26.1: the warden-proxy binary */
     const char *flow_path   = NULL;     /* v1.18.0 */
     const char *session_arg = NULL;     /* v1.18.0 */
     const char *state_arg   = NULL;     /* v1.18.0 */
@@ -4167,6 +4312,12 @@ int main(int argc, char **argv) {
             anchor_path = argv[++i];
         } else if (strcmp(argv[i], "--run-as") == 0 && !run_as_arg) {
             run_as_arg = argv[++i];
+        } else if (strcmp(argv[i], "--proxy-as") == 0 && !proxy_as_arg) {   /* v1.26 */
+            proxy_as_arg = argv[++i];
+        } else if (strcmp(argv[i], "--proxy-bin") == 0 && !proxy_bin_arg) { /* v1.26.1 */
+            proxy_bin_arg = argv[++i];
+        } else if (strcmp(argv[i], "--trust-bundle") == 0 && !g_trust_bundle_arg) { /* v1.26.1 */
+            g_trust_bundle_arg = argv[++i];
         } else if (strcmp(argv[i], "--checkpoint-every") == 0) {
             const char *v = argv[++i];
             uint64_t n = 0;
@@ -4265,7 +4416,67 @@ int main(int argc, char **argv) {
         return 1;                                                           /* v1.18.0 */
     if (names_setup(&p, &dns_cfg) < 0) return 1;                            /* v1.24 */
     if (wildcards_check(policy_path, &p, psl_arg, shared_arg) < 0) return 1;            /* v1.25 */
-    if (g_any_name) views_setup();
+    g_inspect_on = p.v.proxy_inspect;                                      /* v1.26.1 */
+    if (g_any_name || g_inspect_on) views_setup();
+    /* v1.26: the egress proxy runs as its own user, never the agent's: the
+     * default is varek-proxy where that user exists, else 65532:65532. */
+    struct run_as pxa = { .drop = false };
+    if (p.v.proxy) {
+        const char *pas = proxy_as_arg ? proxy_as_arg : getpwnam("varek-proxy") ? "varek-proxy" : "65532:65532";
+        if (parse_run_as(pas, &pxa) < 0 || !pxa.drop) {
+            fprintf(stderr, "[warden] --proxy-as %s: give an unprivileged user (name, uid or uid:gid) "
+                    "with a non-root group\n", pas);
+            return 2;
+        }
+        if (pxa.uid == ra.uid) {
+            fprintf(stderr, "[warden] --proxy-as %s: the proxy may not run as the agent's user "
+                    "(--run-as); give it its own\n", pas);
+            return 2;
+        }
+    }
+    /* v1.26 (step 8): with `proxy on`, names reach proxied ports only through
+     * the proxy, which needs root to start as its own user: a Warden that
+     * cannot start it does not run the policy without it. */
+    if (p.v.proxy && geteuid() != 0 && !g_check_only) {
+        fprintf(stderr, "[warden] `proxy on` needs the Warden to run as root (the proxy runs as its "
+                "own user); refusing to start\n");
+        if (g_sk) sodium_free(g_sk);
+        return 2;
+    }
+    /* v1.26.1: the proxy is warden-proxy, beside this binary unless
+     * --proxy-bin names it. It is copied into a sealed memfd and hashed, and
+     * that copy is what runs, so run_start's hash is of what ran. */
+    int proxy_fd = -1;
+    if (p.v.proxy) {
+        char pb[PATH_MAX], why[PATH_MAX + 128];
+        if (proxy_bin_arg) snprintf(pb, sizeof pb, "%s", proxy_bin_arg);
+        else {
+            ssize_t n = readlink("/proc/self/exe", pb, sizeof pb - 16);
+            if (n <= 0) { fprintf(stderr, "[warden] cannot find this binary's directory\n"); return 1; }
+            pb[n] = '\0';
+            char *sl = strrchr(pb, '/');
+            snprintf(sl ? sl + 1 : pb, sizeof pb - (size_t)(sl ? sl + 1 - pb : 0), "warden-proxy");
+        }
+        proxy_fd = wp_load(pb, g_proxy_sha, why, sizeof why);
+        if (proxy_fd < 0) {
+            fprintf(stderr, "[warden] the egress proxy: %s; build it (make warden-proxy) or name it with "
+                    "--proxy-bin; refusing to start\n", why);
+            if (g_sk) sodium_free(g_sk);
+            return 1;
+        }
+        fprintf(stderr, "[warden] egress proxy binary %s, SHA-256 %s\n", pb, g_proxy_sha);
+    }
+    if (p.v.proxy && geteuid() == 0) {
+        if (wp_start(&g_proxy, proxy_fd, pxa.uid, pxa.gid) < 0) {
+            fprintf(stderr, "[warden] cannot start the egress proxy (%s); refusing to start\n",
+                    strerror(errno));
+            if (g_sk) sodium_free(g_sk);
+            return 1;
+        }
+        fprintf(stderr, "[warden] egress proxy (%s) on 127.0.0.1:%u as %u:%u\n",
+                p.v.proxy_inspect ? "inspecting mode" : "SNI mode", g_proxy.port, (unsigned)g_proxy.uid, (unsigned)g_proxy.gid);
+    }
+    if (proxy_fd >= 0) close(proxy_fd);
     if (g_check_only) {
         /* v1.24: resolve each allowed name and report the ones that fail (a
          * name that does not resolve does not stop the Warden). */
@@ -4310,6 +4521,12 @@ int main(int argc, char **argv) {
                 "stdout will be mixed into the verdict stream. Keep them separate "
                 "(e.g. 2> run.log) for an attestable log.\n");
         }
+    }
+    /* v1.26.1: inspecting mode: the run's CA, made by the proxy, and the
+     * trust views, before run_start records them */
+    if (g_inspect_on && trust_setup(&p) < 0) {
+        if (g_sk) sodium_free(g_sk);
+        return 1;
     }
     emit_run_start(policy_path, &p);
     /* v1.24: every allowed host name is resolved before the agent runs.
@@ -4596,5 +4813,6 @@ int main(int argc, char **argv) {
     if (g_sk) sodium_free(g_sk);             /* zeroes it */
     close(target_pidfd);
     close(notify_fd);
+    if (g_px_failed && rc == 0) rc = 1;      /* v1.26.1 review: the run did not end cleanly */
     return rc;
 }

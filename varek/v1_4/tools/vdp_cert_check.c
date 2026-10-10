@@ -171,8 +171,8 @@ static int canon_for_open(const char *p, char out[PATH_MAX], int depth) {
 int main(int argc, char **argv) {
     if (argc != 3 || (strcmp(argv[2], "digest") && strcmp(argv[2], "batch") &&
                       strcmp(argv[2], "holds") && strcmp(argv[2], "openable") &&
-                      strcmp(argv[2], "kinds") && strcmp(argv[2], "rules"))) {
-        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds|rules\n", argv[0]);
+                      strcmp(argv[2], "kinds") && strcmp(argv[2], "rules") && strcmp(argv[2], "proxy"))) {
+        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds|rules|proxy\n", argv[0]);
         return 2;
     }
     FILE *f = fopen(argv[1], "rb");
@@ -211,7 +211,7 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < pol.n; i++) {
             vdpc_rule_info_t ri;
             vdpc_rule_info(&pol, i, &ri);
-            putchar(ri.kind == VDPC_PATH ? 'p' : ri.kind == VDPC_HOST ? 'h' : 'e');
+            putchar(ri.kind == VDPC_PATH ? 'p' : ri.kind == VDPC_HOST ? 'h' : ri.kind == VDPC_REQUEST ? 'r' : 'e');
         }
         putchar('\n');
         vdpc_free(&pol);
@@ -221,18 +221,47 @@ int main(int argc, char **argv) {
     /* v1.24 review: each rule, one line: kind (p|h|e), verb (a|d), a host name
      * rule (n|-), the flag clause's mask and value (hex). v1.25 review: then a
      * wildcard (w|-), the policy line, the names= and rate= budgets as
-     * written (0: the default), and the rule's constant in hex. varek_audit.py
+     * written (0: the default), (v1.26.1) a request rule's max_body= (0: none),
+     * and the rule's constant in hex (a request rule's: its glob). Kind r is a
+     * request rule (v1.26.1). varek_audit.py
      * reads the policy's rules from here, as this parser reads the file, not
      * from the stream or its own reading of the file. */
     if (!strcmp(argv[2], "rules")) {
         for (size_t i = 0; i < pol.n; i++) {
             vdpc_rule_info_t ri;
             vdpc_rule_info(&pol, i, &ri);
-            printf("%c %c %c %x %x %c %d %u %u ", ri.kind == VDPC_PATH ? 'p' : ri.kind == VDPC_HOST ? 'h' : 'e',
+            printf("%c %c %c %x %x %c %d %u %u %u ", ri.kind == VDPC_PATH ? 'p' : ri.kind == VDPC_HOST ? 'h' : ri.kind == VDPC_REQUEST ? 'r' : 'e',
                    ri.allow ? 'a' : 'd', ri.name ? 'n' : '-', (unsigned)ri.mask, (unsigned)ri.value,
-                   ri.wild ? 'w' : '-', ri.line, (unsigned)ri.names, (unsigned)ri.rate);
+                   ri.wild ? 'w' : '-', ri.line, (unsigned)ri.names, (unsigned)ri.rate,
+                   (unsigned)ri.max_body);
             for (size_t k = 0; k < ri.clen; k++) printf("%02x", (unsigned char)ri.c[k]);
             printf("%s\n", ri.clen ? "" : "=");
+        }
+        vdpc_free(&pol);
+        return 0;
+    }
+
+    /* v1.26: the egress proxy, one line: "off", or "on" and the proxied
+     * ports in force (80 443 when the policy names none), then (section 5)
+     * "upstream HOST:PORT" if the policy names one. v1.26.1: "inspect" in
+     * place of "on" in inspecting mode, and last "passthrough NAME..." if
+     * the policy names passthrough hosts. */
+    if (!strcmp(argv[2], "proxy")) {
+        if (!pol.proxy) printf("off\n");
+        else {
+            const char *mode = pol.proxy_inspect ? "inspect" : "on";
+            if (!pol.proxy_nports) printf("%s 80 443", mode);
+            else {
+                printf("%s", mode);
+                for (size_t k = 0; k < pol.proxy_nports; k++) printf(" %u", pol.proxy_ports[k]);
+            }
+            /* v1.26 section 5: then the upstream, if any */
+            if (pol.proxy_up_port) printf(" upstream %s:%u", pol.proxy_up_host, pol.proxy_up_port);
+            if (pol.proxy_npass) {
+                printf(" passthrough");
+                for (size_t k = 0; k < pol.proxy_npass; k++) printf(" %s", pol.proxy_pass[k]);
+            }
+            printf("\n");
         }
         vdpc_free(&pol);
         return 0;
@@ -293,7 +322,7 @@ int main(int argc, char **argv) {
         char *ws = strtok_r(NULL, " ", &save);
         if (hx && !strcmp(hx, "=")) hx = (char *)"";   /* empty string */
         int kind = !k ? -1 : !strcmp(k, "path") ? VDPC_PATH : !strcmp(k, "host") ? VDPC_HOST
-                 : !strcmp(k, "exec") ? VDPC_EXEC : -1;
+                 : !strcmp(k, "exec") ? VDPC_EXEC : !strcmp(k, "request") ? VDPC_REQUEST : -1;
         vdpc_cert_t c;
         memset(&c, 0, sizeof c);
         if (kind < 0 || !fl || !hx || !rs || !ws || parse_witness(ws, &c) < 0) {

@@ -13,6 +13,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------------ */
@@ -138,6 +139,14 @@ struct vdpc_rule {
     bool     name;                    /* host (v1.24): a host name rule */
     bool     wild;                    /* host (v1.25): a wildcard rule, held as a glob */
     uint32_t names, rate;             /* host (v1.25): a wildcard allow rule's budgets, 0: not set */
+    uint32_t max_body;                /* request (v1.26.1): max_body=, 0: not set */
+    char     rhost[254];              /* request (v1.26.1): the URL's host (a wildcard's suffix) */
+    /* request (v1.26.1 review): a URL without a query: 1, an allow rule (holds
+     * on no string with a '?'); 2, a deny rule (holds when the glob matches
+     * the string up to its first '?'); 0, the glob alone */
+    int      qmode;
+    bool     rwild;
+    unsigned rport;
 };
 
 void vdpc_free(vdpc_policy_t *p) {
@@ -287,6 +296,62 @@ static int fail(char *err, size_t n, const char *name, int line, const char *fmt
     return -1;
 }
 
+/* v1.26 section 5: "http://HOST:PORT" (one trailing '/'), HOST a host name
+ * (LDH labels 1-63, at most 253, last label not all digits) or a dotted IPv4
+ * address without leading zeros, PORT 1-65535. 0 (host lowercased), or -1. */
+static int up_parse(const char *v, char host[254], unsigned *port) {
+    if (strncmp(v, "http://", 7) != 0) return -1;
+    const char *a = v + 7;
+    size_t n = strlen(a);
+    if (n > 0 && a[n - 1] == '/') n--;
+    size_t c = n;
+    while (c > 0 && a[c - 1] != ':') c--;
+    if (c == 0) return -1;
+    size_t hl = c - 1, pl = n - c;
+    if (pl < 1 || pl > 5 || a[c] == '0') return -1;
+    unsigned long x = 0;
+    for (size_t i = c; i < n; i++) {
+        if (!isdigit((unsigned char)a[i])) return -1;
+        x = x * 10 + (unsigned long)(a[i] - '0');
+    }
+    if (x < 1 || x > 65535 || hl < 1 || hl > 253) return -1;
+    int dots = 0, alpha = 0;
+    for (size_t i = 0; i < hl; i++) {
+        unsigned char ch = (unsigned char)a[i];
+        if (ch == '.') dots++;
+        else if (isalpha(ch) || ch == '-') alpha++;
+        else if (!isdigit(ch)) return -1;
+    }
+    if (!alpha) {                                     /* an IPv4 address */
+        if (dots != 3) return -1;
+        size_t i = 0;
+        for (int part = 0; part < 4; part++) {
+            size_t st = i;
+            unsigned long o = 0;
+            while (i < hl && a[i] != '.') o = o * 10 + (unsigned long)(a[i++] - '0');
+            if (i == st || i - st > 3 || (i - st > 1 && a[st] == '0') || o > 255) return -1;
+            i++;
+        }
+    } else {                                          /* a host name */
+        size_t st = 0;
+        for (size_t i = 0; i <= hl; i++) {
+            if (i < hl && a[i] != '.') continue;
+            size_t ll = i - st;
+            if (ll < 1 || ll > 63 || a[st] == '-' || a[i - 1] == '-') return -1;
+            st = i + 1;
+        }
+        size_t last = hl;
+        while (last > 0 && a[last - 1] != '.') last--;
+        bool all_digits = true;
+        for (size_t i = last; i < hl; i++) if (!isdigit((unsigned char)a[i])) all_digits = false;
+        if (all_digits) return -1;
+    }
+    for (size_t i = 0; i < hl; i++) host[i] = (char)tolower((unsigned char)a[i]);
+    host[hl] = '\0';
+    *port = (unsigned)x;
+    return 0;
+}
+
 static bool is_ws(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f'; }
 
 static bool is_clause(const char *t) {
@@ -365,6 +430,110 @@ static int host_name_form(const char *c, size_t n, const char **why) {
     return 1;
 }
 
+/* v1.26.1: METHOD and URL of a request rule (smt_decide.h has the grammar),
+ * as the glob over "METHOD scheme://host:port/path?query" (each '?' of the
+ * URL escaped). 0 with r->c set, or -1 with *why. */
+static int hexd(char c) {
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
+         : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+static int req_parse(const char *m, const char *u, vdpc_rule_t *r, const char **why) {
+    *why = "";
+    size_t ml = strlen(m);
+    if (!(ml == 1 && m[0] == '*')) {
+        if (ml < 1 || ml > 20) { *why = "bad method"; return -1; }
+        for (size_t i = 0; i < ml; i++) if (m[i] < 'A' || m[i] > 'Z') { *why = "bad method"; return -1; }
+    }
+    size_t sl;
+    unsigned port;
+    if (strncmp(u, "https://", 8) == 0) { sl = 5; port = 443; }
+    else if (strncmp(u, "http://", 7) == 0) { sl = 4; port = 80; }
+    else { *why = "bad request URL scheme"; return -1; }
+    const char *a = u + sl + 3;
+    size_t al = 0;
+    while (a[al] && a[al] != '/') al++;
+    if (!a[al]) { *why = "request URL without a path"; return -1; }
+    size_t hl = 0;
+    while (hl < al && a[hl] != ':') hl++;
+    if (hl < al) {
+        size_t pl = al - hl - 1;
+        unsigned long x = 0;
+        if (pl < 1 || pl > 5 || a[hl + 1] == '0') { *why = "bad request URL port"; return -1; }
+        for (size_t i = hl + 1; i < al; i++) {
+            if (a[i] < '0' || a[i] > '9') { *why = "bad request URL port"; return -1; }
+            x = x * 10 + (unsigned long)(a[i] - '0');
+        }
+        if (x < 1 || x > 65535) { *why = "bad request URL port"; return -1; }
+        port = (unsigned)x;
+    }
+    bool wild = hl >= 2 && a[0] == '*' && a[1] == '.';
+    const char *h = wild ? a + 2 : a;
+    size_t hn = wild ? hl - 2 : hl;
+    if (hn < 1 || hn > 253) { *why = "bad request URL host"; return -1; }
+    if (host_name_form(h, hn, why) != 1) { if (!**why) *why = "bad request URL host"; return -1; }
+    if (wild && !memchr(h, '.', hn)) { *why = "wildcard over one label"; return -1; }
+    /* path and query */
+    const char *p = a + al;
+    size_t pl = strlen(p);
+    bool q = false;
+    size_t segst = 1;
+    for (size_t i = 1; i <= pl; i++) {
+        char c = i < pl ? p[i] : '\0';
+        if (!q && (c == '/' || c == '?' || c == '\0')) {
+            size_t n = i - segst;
+            if (n == 0 && c == '/') { *why = "empty path segment"; return -1; }
+            if (n == 1 && p[segst] == '.') { *why = "dot segment"; return -1; }
+            if (n == 2 && p[segst] == '.' && p[segst + 1] == '.') { *why = "dot segment"; return -1; }
+            segst = i + 1;
+            if (c == '?') q = true;
+            if (c == '\0') break;
+            continue;
+        }
+        if (c == '\0') break;
+        unsigned char b = (unsigned char)c;
+        if (b <= 0x20 || b >= 0x7f || b == '\\' || b == ';' || b == '#') { *why = "byte not allowed in a request path"; return -1; }
+        if (b == '?') { *why = "more than one '?' in a request URL"; return -1; }   /* review */
+        if (b == '%') {
+            if (i + 2 >= pl) { *why = "bad percent escape"; return -1; }
+            int d1 = hexd(p[i + 1]), d2 = hexd(p[i + 2]);
+            if (d1 < 0 || d2 < 0) { *why = "bad percent escape"; return -1; }
+            unsigned v = (unsigned)(d1 * 16 + d2);
+            if (v == '/' || v == '\\' || (v >= '0' && v <= '9') || (v >= 'A' && v <= 'Z') || (v >= 'a' && v <= 'z') ||
+                v == '-' || v == '.' || v == '_' || v == '~') {
+                *why = "percent escape of '/' or an unreserved byte"; return -1;
+            }
+        }
+    }
+    if (p[0] != '/') { *why = "request path"; return -1; }
+    /* the glob */
+    char head[300];
+    int n = snprintf(head, sizeof head, "%.*s %.*s://%s%.*s:%u", (int)ml, m, (int)sl, u,
+                     wild ? "?*." : "", (int)hn, h, port);
+    if (n < 0 || (size_t)n >= sizeof head) { *why = "request object over the bound"; return -1; }
+    size_t nq = 0;
+    for (size_t i = 0; i < pl; i++) if (p[i] == '?') nq++;
+    size_t gl = (size_t)n + pl + nq;
+    if (gl > VDPC_MAX_S) { *why = "request object over the bound"; return -1; }
+    char *g = malloc(gl + 1);
+    if (!g) { *why = "out of memory"; return -1; }
+    memcpy(g, head, (size_t)n);
+    size_t k = (size_t)n;
+    for (size_t i = 0; i < pl; i++) {
+        if (p[i] == '?') g[k++] = '\\';
+        g[k++] = p[i];
+    }
+    g[k] = '\0';
+    r->c = g;
+    r->clen = k;
+    r->match = M_GLOB;
+    memcpy(r->rhost, h, hn);
+    r->rhost[hn] = '\0';
+    r->rwild = wild;
+    r->rport = port;
+    return 0;
+}
+
 /* One line: tokens (NUL-terminated copies in `line`). Returns -1 on error. */
 static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj, int req_min,
                       int *legacy_name, size_t *glob_total, vdpc_rule_t *r, char *err, size_t en) {
@@ -375,7 +544,51 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
     if (!strcmp(tok[1], "path"))      { r->kind = VDPC_PATH; r->match = M_PREFIX; }
     else if (!strcmp(tok[1], "host")) { r->kind = VDPC_HOST; r->match = M_HOST; }
     else if (!strcmp(tok[1], "exec")) { r->kind = VDPC_EXEC; r->match = M_EXACT; }
+    else if (!strcmp(tok[1], "request")) r->kind = VDPC_REQUEST;      /* v1.26.1 */
     else return fail(err, en, name, ln, "unknown kind");
+
+    if (r->kind == VDPC_REQUEST) {
+        /* v1.26.1: <verb> request METHOD URL [max_body=N] */
+        if (!ver_ge(req_maj, req_min, 1, 26)) return fail(err, en, name, ln, "request rule before 1.26");
+        if (nt < 4) return fail(err, en, name, ln, "bad request rule");
+        for (int k = 2; k < 4; k++)
+            for (const char *q = tok[k]; *q; q++)
+                if ((unsigned char)*q < 0x20 || *q == 0x7f) return fail(err, en, name, ln, "control byte in constant");
+        const char *why = "";
+        if (req_parse(tok[2], tok[3], r, &why) < 0) return fail(err, en, name, ln, "%s", why);
+        if (!strchr(tok[3], '?')) r->qmode = r->allow ? 1 : 2;      /* review: no query */
+        const char *ge = parse_glob(r->c, r->clen, &r->g, &r->ng);
+        if (ge) return fail(err, en, name, ln, "%s", ge);
+        *glob_total += r->ng;
+        if (*glob_total > VDPC_GLOB_MAX_TOTAL) return fail(err, en, name, ln, "glob tokens over the policy total");
+        r->fixed = true;
+        for (size_t k = 0; k < r->ng; k++) {
+            if (r->g[k].type == G_LIT || r->g[k].type == G_SET) r->minlen++;
+            else r->fixed = false;
+        }
+        while (r->npre < r->ng && r->g[r->npre].type == G_LIT) r->npre++;
+        while (r->nsuf < r->ng && r->g[r->ng - 1 - r->nsuf].type == G_LIT) r->nsuf++;
+        for (int k = 4; k < nt; k++) {
+            const char *t = tok[k];
+            if (strncmp(t, "max_body=", 9) != 0) return fail(err, en, name, ln, "unknown request rule option");
+            if (!r->allow) return fail(err, en, name, ln, "max_body on a deny rule");
+            if (r->max_body) return fail(err, en, name, ln, "max_body given twice");
+            const char *d = t + 9;
+            size_t dl = strlen(d);
+            unsigned long long mul = 1, x = 0;
+            if (dl > 0 && d[dl - 1] == 'k') { mul = 1024; dl--; }
+            else if (dl > 0 && d[dl - 1] == 'm') { mul = 1024 * 1024; dl--; }
+            if (dl < 1 || dl > 7 || d[0] == '0') return fail(err, en, name, ln, "bad max_body");
+            for (size_t q = 0; q < dl; q++) {
+                if (d[q] < '0' || d[q] > '9') return fail(err, en, name, ln, "bad max_body");
+                x = x * 10 + (unsigned long long)(d[q] - '0');
+            }
+            x *= mul;
+            if (x > 1073741824ULL) return fail(err, en, name, ln, "bad max_body");
+            r->max_body = (uint32_t)x;
+        }
+        return 0;
+    }
 
     static const struct { const char *kw; int m; } KW[] = {
         { "exact", M_EXACT }, { "prefix", M_PREFIX }, { "suffix", M_SUFFIX },
@@ -562,6 +775,48 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
                 else if (legacy_name && ver_ge(a, b, 1, 24))
                     rc = fail(err, en, name, ln, "require warden after a host name it would change");
                 else if (ver_ge(a, b, req_maj, req_min)) { req_maj = a; req_min = b; }
+            } else if (!strcmp(tok[0], "proxy")) {
+                /* v1.26: proxy on | proxy ports P... (inspect: v1.26.1) */
+                if (!ver_ge(req_maj, req_min, 1, 26))
+                    rc = fail(err, en, name, ln, "proxy before require warden 1.26");
+                else if (nt == 2 && (!strcmp(tok[1], "on") || !strcmp(tok[1], "inspect"))) {
+                    /* v1.26.1: proxy inspect, inspecting mode, never with proxy on */
+                    if (p->proxy) rc = fail(err, en, name, ln, "proxy mode given twice");
+                    p->proxy = 1;
+                    p->proxy_inspect = tok[1][0] == 'i';
+                } else if (nt == 4 && !strcmp(tok[1], "passthrough") && !strcmp(tok[2], "host")) {
+                    /* v1.26.1: proxy passthrough host NAME, a name without a port */
+                    const char *why = "";
+                    size_t hl = strlen(tok[3]);
+                    if (memchr(tok[3], ':', hl) || host_name_form(tok[3], hl, &why) != 1 || hl > 253)
+                        rc = fail(err, en, name, ln, "bad passthrough host");
+                    for (size_t q = 0; rc == 0 && q < p->proxy_npass; q++)
+                        if (!strcmp(p->proxy_pass[q], tok[3])) rc = fail(err, en, name, ln, "passthrough host twice");
+                    if (rc == 0 && p->proxy_npass == 64) rc = fail(err, en, name, ln, "more than 64 passthrough hosts");
+                    if (rc == 0) memcpy(p->proxy_pass[p->proxy_npass++], tok[3], hl + 1);
+                } else if (nt >= 3 && !strcmp(tok[1], "ports") && !p->proxy_nports && nt - 2 <= 16) {
+                    for (int k = 2; k < nt && rc == 0; k++) {
+                        const char *d = tok[k];
+                        size_t dl = strlen(d);
+                        unsigned long x = 0;
+                        if (dl == 0 || dl > 5 || d[0] == '0') rc = fail(err, en, name, ln, "bad port");
+                        for (size_t q = 0; rc == 0 && q < dl; q++) {
+                            if (d[q] < '0' || d[q] > '9') rc = fail(err, en, name, ln, "bad port");
+                            x = x * 10 + (unsigned long)(d[q] - '0');
+                        }
+                        if (rc == 0 && x > 65535) rc = fail(err, en, name, ln, "bad port");
+                        for (size_t q = 0; rc == 0 && q < p->proxy_nports; q++)
+                            if (p->proxy_ports[q] == x) rc = fail(err, en, name, ln, "port twice");
+                        if (rc == 0) p->proxy_ports[p->proxy_nports++] = (unsigned)x;
+                    }
+                } else if (nt == 3 && !strcmp(tok[1], "upstream") && !p->proxy_up_port) {
+                    /* v1.26 section 5: proxy upstream http://HOST:PORT */
+                    if (up_parse(tok[2], p->proxy_up_host, &p->proxy_up_port) < 0) {
+                        p->proxy_up_port = 0;
+                        rc = fail(err, en, name, ln, "bad proxy upstream");
+                    }
+                } else
+                    rc = fail(err, en, name, ln, "bad proxy directive");
             } else if (nt < 3) {
                 rc = fail(err, en, name, ln, "bad rule");
             } else if (p->n == VDPC_MAX_RULES) {
@@ -574,6 +829,42 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
         }
         free(heap);
         if (rc < 0) { vdpc_free(p); return -1; }
+    }
+    if (p->proxy_nports && !p->proxy) {
+        vdpc_free(p);
+        return fail(err, en, name, ln, "proxy ports without proxy on");
+    }
+    if (p->proxy_up_port && !p->proxy) {
+        vdpc_free(p);
+        return fail(err, en, name, ln, "proxy upstream without proxy on");
+    }
+    /* v1.26.1: passthrough hosts and request rules need inspecting mode;
+     * request rules only on proxied ports, and never on a passthrough host */
+    if (p->proxy_npass && !p->proxy_inspect) {
+        vdpc_free(p);
+        return fail(err, en, name, ln, "proxy passthrough without proxy inspect");
+    }
+    for (size_t i = 0; i < p->n; i++) {
+        const vdpc_rule_t *r = &p->rules[i];
+        if (r->kind != VDPC_REQUEST) continue;
+        int bad = !p->proxy_inspect;
+        bool on = false;
+        if (p->proxy_nports == 0) on = r->rport == 80 || r->rport == 443;
+        for (size_t q = 0; q < p->proxy_nports; q++) on = on || p->proxy_ports[q] == r->rport;
+        if (!on) bad = 1;
+        for (size_t q = 0; q < p->proxy_npass; q++) {
+            const char *h = p->proxy_pass[q];
+            size_t hn = strlen(h), sn = strlen(r->rhost);
+            if (r->rwild ? (hn > sn && h[hn - sn - 1] == '.' && memcmp(h + hn - sn, r->rhost, sn) == 0)
+                         : strcmp(h, r->rhost) == 0)
+                bad = 1;
+        }
+        if (bad) {
+            int l = r->line;
+            vdpc_free(p);
+            return fail(err, en, name, l, "request rule not allowed here (needs proxy inspect, a proxied "
+                        "port, and a host that is not passthrough)");
+        }
     }
     return 0;
 }
@@ -684,6 +975,11 @@ static bool str_holds(const vdpc_rule_t *r, const char *s, size_t sl) {
             if (!r->portless) return false;
             return sl > cl && memcmp(s, c, cl) == 0 && s[cl] == ':';
         case M_GLOB:
+            if (r->qmode) {                   /* v1.26.1 review: a request rule without a query */
+                const char *q = memchr(s, '?', sl);
+                if (q && r->qmode == 1) return false;
+                if (q) sl = (size_t)(q - s);
+            }
             if (sl < r->minlen || (r->fixed && sl != r->minlen)) return false;
             for (size_t k = 0; k < r->npre; k++)
                 if ((unsigned char)s[k] != r->g[k].byte) return false;
@@ -712,6 +1008,7 @@ int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *o) {
     o->wild = r->wild;
     o->names = r->names;
     o->rate = r->rate;
+    o->max_body = r->max_body;
     return 0;
 }
 
@@ -735,6 +1032,11 @@ static bool witness_holds(const vdpc_rule_t *r, const char *s, size_t sl, const 
         return true;
     }
     if (c->wkind != 2) { *why = "glob rule without a span witness"; return false; }
+    if (r->qmode) {                           /* v1.26.1 review: a request rule without a query */
+        const char *q = memchr(s, '?', sl);
+        if (q && r->qmode == 1) { *why = "a request rule without a query, on a request with one"; return false; }
+        if (q) sl = (size_t)(q - s);          /* a deny rule: its witness is on the path */
+    }
     size_t pos = 0, k = 0;
     for (size_t j = 0; j < r->ng; j++) {
         const gtok_t *t = &r->g[j];
@@ -772,7 +1074,8 @@ static int reject(char *why, size_t n, const char *msg) {
 int vdpc_check(const vdpc_policy_t *p, int kind, const char *s, size_t sl,
                uint32_t f, bool has_flags, const vdpc_cert_t *c, char *why, size_t wn) {
     if (why && wn) why[0] = '\0';
-    if (kind != VDPC_PATH && kind != VDPC_HOST && kind != VDPC_EXEC) return reject(why, wn, "bad kind");
+    if (kind != VDPC_PATH && kind != VDPC_HOST && kind != VDPC_EXEC && kind != VDPC_REQUEST)
+        return reject(why, wn, "bad kind");
     if (sl > VDPC_MAX_S) return reject(why, wn, "string over the length bound");
     if (memchr(s, '\0', sl)) return reject(why, wn, "NUL byte in the string");
     if (kind != VDPC_PATH) { f = 0; has_flags = true; }

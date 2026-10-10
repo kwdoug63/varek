@@ -1,0 +1,24 @@
+VAREK v1.26.1 latency of the egress proxy, SNI and inspecting mode (2026-10-08T13:56Z; kernel 6.18.44-fc-v80; 4 vCPU)
+n=1000 requests per row, one after another; percentiles in microseconds, measured by the client;
+tls/http: a new connection each (TLS: a full handshake, RSA 2048 at the server); ka: on one kept-alive connection;
+servers on this machine's own address. In inspecting mode every request is decided before any of it is sent.
+native tls         n=1000 p50=3722 p90=5446 p99=13248 failed=0
+sni tls            n=1000 p50=5829 p90=7504 p99=11305 failed=0
+sni tls            records: decided and dialed n=1000 p50=112 p99=294; hand-off p50=296 p99=1199 (us)
+inspect tls        n=1000 p50=6648 p90=8417 p99=11970 failed=0
+inspect tls        records: decided and dialed n=1000 p50=111 p99=356; request decided n=1000 p50=10 p99=49; hand-off p50=309 p99=890 (us)
+native tls ka      n=1000 p50=101 p90=158 p99=441 failed=0
+sni tls ka         n=1000 p50=161 p90=222 p99=435 failed=0
+inspect tls ka     n=1000 p50=369 p90=539 p99=1637 failed=0
+inspect tls ka     records: decided and dialed n=1 p50=107 p99=107; request decided n=1000 p50=3 p99=26; hand-off p50=326 p99=326 (us)
+native http        n=1000 p50=500 p90=641 p99=1936 failed=0
+sni http           n=1000 p50=921 p90=1361 p99=3919 failed=0
+inspect http       n=1000 p50=846 p90=1052 p99=1338 failed=0
+inspect http       records: decided and dialed n=1000 p50=81 p99=186; request decided n=1000 p50=4 p99=14; hand-off p50=239 p99=429 (us)
+native http ka     n=1000 p50=56 p90=84 p99=140 failed=0
+sni http ka        n=1000 p50=120 p90=167 p99=319 failed=0
+inspect http ka    n=1000 p50=217 p90=293 p99=428 failed=0
+via squid sni      n=1000 p50=7193 p90=8798 p99=11010 failed=0
+via squid inspect  n=1000 p50=8028 p90=9924 p99=17856 failed=0
+via squid inspect  records: decided and dialed n=1000 p50=123 p99=250; request decided n=1000 p50=13 p99=57; hand-off p50=351 p99=1109 (us)
+hand-off only      n=1000 p50=310 p90=381 p99=519 failed=0

@@ -69,7 +69,10 @@
 // those rules test. A symbolic certificate that names one deciding rule (r >= 0)
 // carries that rule's witness, which is checked too; r = -1 carries none.
 //
-// The checker implements the policy grammar of VAREK 1.25 (smt_decide.h). A
+// v1.26.1: a request is (request, s) with s the request object
+// "METHOD scheme://host:port/path?query"; request rules are globs over it.
+//
+// The checker implements the policy grammar of VAREK 1.26.1 (smt_decide.h). A
 // policy it cannot parse is refused, so the Warden does not start.
 
 #ifndef VAREK_VDP_CHECKER_H
@@ -80,14 +83,14 @@
 #include <stdint.h>
 
 #define VDPC_GRAMMAR_MAJOR 1
-#define VDPC_GRAMMAR_MINOR 25
+#define VDPC_GRAMMAR_MINOR 26
 
 #define VDPC_MAX_S        4095
 #define VDPC_MAX_RULES    256
 #define VDPC_MAX_STRETCH  32          /* a glob has at most 32 wildcards */
 #define VDPC_GLOB_MAX_TOTAL 4096      /* glob tokens per policy (v1.16; was 65536) */
 
-enum { VDPC_PATH = 0, VDPC_HOST = 1, VDPC_EXEC = 2 };
+enum { VDPC_PATH = 0, VDPC_HOST = 1, VDPC_EXEC = 2, VDPC_REQUEST = 3 /* v1.26.1 */ };
 
 typedef struct vdpc_rule vdpc_rule_t;
 
@@ -95,6 +98,14 @@ typedef struct {
     vdpc_rule_t  *rules;
     size_t        n;
     unsigned char sha256[32];         /* of the policy bytes as loaded */
+    int           proxy;              /* v1.26: `proxy on` */
+    unsigned      proxy_ports[16];    /* v1.26: `proxy ports`, in order; none: the default */
+    size_t        proxy_nports;
+    char          proxy_up_host[254]; /* v1.26 section 5: `proxy upstream http://HOST:PORT` */
+    unsigned      proxy_up_port;      /* 0: none */
+    int           proxy_inspect;      /* v1.26.1: `proxy inspect` (proxy is then 1 too) */
+    char          proxy_pass[64][254];/* v1.26.1: `proxy passthrough host NAME`, in order */
+    size_t        proxy_npass;
 } vdpc_policy_t;
 
 typedef struct {
@@ -131,6 +142,7 @@ typedef struct {
     bool        name;                 /* host (v1.24): a host name rule */
     bool        wild;                 /* host (v1.25): a wildcard rule, held as a glob */
     uint32_t    names, rate;          /* host (v1.25): a wildcard allow rule's budgets, 0: not set */
+    uint32_t    max_body;             /* request (v1.26.1): max_body=, 0: not set */
 } vdpc_rule_info_t;
 int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *out);
 

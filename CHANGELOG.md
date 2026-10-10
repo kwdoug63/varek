@@ -9,6 +9,46 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.26.1] - 2026-10-10 — The egress proxy, inspecting mode
+
+With `proxy inspect`, the proxy (now its own binary, `warden-proxy`, loaded
+into a sealed memfd and hashed in `run_start`) verifies each server,
+terminates the agent's TLS with a CA made for the run and name-constrained
+to the policy's names, and reports every request; the Warden decides its
+method, path and query against `allow|deny request METHOD URL [max_body=N]`
+rules with the SMT decision procedure and certifies it before a byte of it
+is sent. Requests a server could read as another path are refused, bodies
+are bounded by `max_body` and recorded by length and SHA-256, and
+`proxy passthrough host` keeps pinned clients in SNI mode. Every request is
+a chained record the audit checks; `varek refusals`, the CycloneDX export
+and `varek bench --proxy` cover it. The Warden reports version 1.26.1.
+
+Reviewed by AI review agents (not a human or third-party review); a 24-hour
+soak in inspecting mode against three CDNs passed. See `RELEASE-v1.26.1.md`
+for the grammar, tests, latency, the review's findings, compatibility and
+known limits, and `docs/security/v1.26.1-inspecting-mode.md` for the design.
+
+## [1.26.0] - 2026-10-09 — The egress proxy, SNI mode
+
+With `proxy on` (after `require warden 1.26`), connects on the proxied ports
+(80 and 443, or `proxy ports`) are decided on the name the client asks for,
+the TLS SNI or the HTTP `Host`, read by a separate, unprivileged proxy; the
+Warden decides that name with the SMT decision procedure, certifies it,
+dials only an address the name resolves to and passes the socket to the
+proxy to relay. Names allowed only on proxied ports get synthetic
+addresses, so the agent sends no DNS for them. Plain HTTP is checked request
+by request; Encrypted Client Hello and QUIC on proxied ports are refused.
+`proxy upstream http://HOST:PORT` chains to a customer's egress proxy. Every
+hand-off, decision and close is a chained record the audit checks. The
+Warden reports version 1.26.0.
+
+Reviewed by four AI review agents (not a human or third-party review); a
+24-hour soak against three CDNs passed. See `RELEASE-v1.26.0.md` for the
+grammar, tests, latency, the review's findings, compatibility and known
+limits, and `docs/security/v1.26-egress-proxy.md` for the design.
+
+v1.26.0 builds on the v1.24.0 and v1.25.0 releases below.
+
 ## [1.25.0] - 2026-10-07 — Wildcard host names, opt-in
 
 A policy can allow every name under a domain

@@ -54,14 +54,29 @@ static uint64_t ns_between(const struct timespec *a, const struct timespec *b);
  * nsswitch.conf, and takes a refused open of either (the Warden answers
  * EACCES for a file it does not allow, whether or not it exists) as a broken
  * configuration: it then drops what it read and asks 127.0.0.1. */
+/* v1.26.1: in inspecting mode, the trust views (warden_trust.inc.c): the
+ * host's bundle with the run's CA after it, at the usual bundle paths and at
+ * /etc/varek/run-bundle.pem (SSL_CERT_FILE and the like name it); the CA
+ * alone at /etc/varek/run-ca.pem (NODE_EXTRA_CA_CERTS); and the PKCS#12
+ * trust store at /etc/varek/run-trust.p12 (Java). */
 enum { VIEW_HOSTS = 0, VIEW_RESOLV = 1, VIEW_NSSWITCH = 2, VIEW_HOSTCONF = 3, VIEW_NETSVC = 4,
-       VIEW_SVC = 5, VIEW_N = 6 };
+       VIEW_SVC = 5,
+       VIEW_TRUST0 = 6,                                     /* the bundle views, then the CA and the store */
+       VIEW_BUNDLE_DEB = 6, VIEW_BUNDLE_RH = 7, VIEW_BUNDLE_RH2 = 8, VIEW_BUNDLE_SSL = 9, VIEW_BUNDLE_RUN = 10,
+       VIEW_RUNCA = 11, VIEW_P12 = 12, VIEW_N = 13 };
 static const char *const kViewPath[VIEW_N] = { "/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf",
-                                               "/etc/host.conf", "/etc/netsvc.conf", "/etc/svc.conf" };
+                                               "/etc/host.conf", "/etc/netsvc.conf", "/etc/svc.conf",
+                                               "/etc/ssl/certs/ca-certificates.crt",
+                                               "/etc/pki/tls/certs/ca-bundle.crt",
+                                               "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+                                               "/etc/ssl/cert.pem", "/etc/varek/run-bundle.pem",
+                                               "/etc/varek/run-ca.pem", "/etc/varek/run-trust.p12" };
 static const char *const kViewRule[VIEW_N] = { "hosts_view", "resolv_view", "nsswitch_view",
-                                               "hostconf_view", "netsvc_view", "svc_view" };
+                                               "hostconf_view", "netsvc_view", "svc_view",
+                                               "trust_view", "trust_view", "trust_view", "trust_view",
+                                               "trust_view", "run_ca_view", "trust_store_view" };
 static char     g_view_canon[VIEW_N][PATH_LIMIT];  /* realpath on the host at startup, or "" */
-static int      g_view_fd[VIEW_N] = { -1, -1, -1, -1, -1, -1 };
+static int      g_view_fd[VIEW_N] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
 static uint64_t g_view_gen = UINT64_MAX;          /* g_names.generation the hosts memfd holds */
 
 /* At startup: what each view path resolves to on the host. */
@@ -74,8 +89,13 @@ static void views_setup(void) {
     }
 }
 
-/* Is view v served in this run? (The last two only with the stub resolver.) */
-static bool view_on(int v) { return v < VIEW_NETSVC || g_stub_on; }
+/* Is view v served in this run? The name views with a host name rule (the
+ * last two only with the stub resolver); v1.26.1: the trust views in
+ * inspecting mode. */
+static bool view_on(int v) {
+    if (v >= VIEW_TRUST0) return g_inspect_on;
+    return g_any_name && (v < VIEW_NETSVC || g_stub_on);
+}
 
 static int view_by_target(const char *target) {
     for (int v = 0; v < VIEW_N; v++) if (view_on(v) && !strcmp(target, kViewPath[v])) return v;
@@ -102,18 +122,24 @@ static int view_memfd(int v) {
     size_t len = 0;
     FILE *f = open_memstream(&buf, &len);
     if (!f) return -1;
-    if (v == VIEW_HOSTS) wr_hosts_view(&g_names, f);
+    if (v == VIEW_HOSTS && g_syn_on) syn_hosts_view(g_syn_p, f);      /* v1.26 */
+    else if (v == VIEW_HOSTS) wr_hosts_view(&g_names, f);
     /* v1.25: with the stub resolver up, the agent's questions go to it */
     else if (v == VIEW_RESOLV && g_stub_on) fputs("nameserver 127.53.53.53\noptions attempts:2 timeout:5\n", f);
     else if (v == VIEW_RESOLV) fputs("nameserver 192.0.2.1\noptions attempts:1 timeout:0\n", f);
     else if (v == VIEW_NSSWITCH) fputs(g_stub_on ? "passwd: files\ngroup: files\nhosts: files dns\n"
                                                  : "passwd: files\ngroup: files\nhosts: files\n", f);
     else if (v == VIEW_HOSTCONF) fputs("multi on\n", f);
+    /* v1.26.1: the trust views */
+    else if (v >= VIEW_TRUST0 && v < VIEW_RUNCA) fwrite(g_trust_bundle, 1, g_trust_bundle_len, f);
+    else if (v == VIEW_RUNCA) fwrite(g_ca_pem, 1, g_ca_pem_len, f);
+    else if (v == VIEW_P12) fwrite(g_trust_p12, 1, g_trust_p12_len, f);
     /* VIEW_NETSVC, VIEW_SVC: empty */
     if (fclose(f) != 0) { free(buf); return -1; }
     int fd = memfd_create(kViewRule[v], MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (fd < 0) { free(buf); return -1; }
-    bool ok = write_all(fd, buf, len) == 0 &&
+    /* review: a stat of a view answers a read-only file (memfd_create makes it 0777) */
+    bool ok = fchmod(fd, 0444) == 0 && write_all(fd, buf, len) == 0 &&
               fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) == 0;
     free(buf);
     if (!ok) { close(fd); return -1; }
@@ -161,6 +187,33 @@ static void view_serve(int notify_fd, const struct seccomp_notif *req, struct ac
     clock_gettime(CLOCK_MONOTONIC, &t1);
     emit_pathology(g_report_seq++, req->pid, a, d_raw, DEC_ALLOW,
                    err ? "view_failed" : kViewRule[v], ns_between(t0, &t1), err);
+}
+
+/* v1.26.1: a read-type lookup (stat, statx, access without W_OK or X_OK)
+ * of a trust view, named as such, is answered from the view itself, so a
+ * client that checks the file before opening it (Java does) finds a regular
+ * file of the view's size, whether or not the host has one there. As for
+ * view_serve, an explicit deny of the path wins. */
+static void view_meta(int notify_fd, const struct seccomp_notif *req, struct action *a,
+                      const struct policy *p, int v, const struct timespec *t0) {
+    snprintf(a->resolved, sizeof a->resolved, "%s", kViewPath[v]);
+    decision_t d_raw = policy_decide(p, a);
+    struct timespec t1;
+    if (d_raw == DEC_DENY) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        emit_pathology(g_report_seq++, req->pid, a, d_raw, DEC_DENY, decision_rule_id(a, d_raw),
+                       ns_between(t0, &t1), EACCES);
+        send_simple(notify_fd, req->id, DEC_DENY);
+        return;
+    }
+    int fd = view_open(v);
+    int64_t r = fd < 0 ? -EACCES : meta_answer(req->pid, notify_fd, req->id, a, fd, false);
+    if (fd >= 0) close(fd);
+    if (r < 0) send_errno(notify_fd, req->id, (int)-r);
+    else       send_value(notify_fd, req->id, r);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    emit_pathology(g_report_seq++, req->pid, a, d_raw, DEC_ALLOW, r < 0 ? "view_failed" : "view_metadata",
+                   ns_between(t0, &t1), r < 0 ? (int)-r : 0);
 }
 
 /* ---- section 4: candidates for a connect ---- */
