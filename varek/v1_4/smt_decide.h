@@ -463,7 +463,8 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
 size_t vdp_exec_advisory(const vdp_policy_t *p, size_t i, char *buf, size_t n);
 
 /* v1.27: is the basename of path a shell or general-purpose interpreter
- * (sh, bash, python3.12, node, ...)? */
+ * (sh, bash, python3.12, node, ...), or the dynamic loader (ld-linux*,
+ * ld-musl*, ld.so), which runs any ELF file it can read? */
 bool vdp_exec_is_interpreter(const char *path);
 
 #endif /* VAREK_SMT_DECIDE_H */

@@ -897,6 +897,7 @@ static const char *decision_rule_id(const struct action *a, decision_t d_raw) {
 static FILE *g_log;
 static void log_line_start(void);
 static void json_escape(FILE *f, const char *s);
+static void exec_ruleset_record(FILE *f);     /* v1.27: warden_exec.inc.c */
 
 /* v1.15: before a SATISFIED verdict authorizes anything, the procedure emits a
  * certificate (the deciding rule and a witness that its constant matches) and
@@ -1660,6 +1661,8 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
             fputs("]},", f);
         }
     }
+    /* v1.27: Landlock and the launch set (require warden 1.27) */
+    if (p->v.launches) exec_ruleset_record(f);
     /* v1.25 (section 4): each wildcard allow rule's budgets, defaults filled in */
     if (g_any_wild) {
         fputs("\"wildcard_budgets\":[", f);
@@ -2834,6 +2837,7 @@ static void syn_hosts_view(const struct policy *p, FILE *f);
 #include "warden_synth.inc.c"        /* v1.26: synthetic addresses with the proxy on */
 #include "warden_pxdecide.inc.c"     /* v1.26: the Warden's decisions on what the proxy reads */
 #include "warden_trust.inc.c"        /* v1.26.1: the run's CA and the trust views */
+#include "warden_exec.inc.c"         /* v1.27: the launch set and its Landlock ruleset */
 
 /* ---------------- receive loop ---------------- */
 
@@ -4490,6 +4494,25 @@ int main(int argc, char **argv) {
                 p.v.proxy_inspect ? "inspecting mode" : "SNI mode", g_proxy.port, (unsigned)g_proxy.uid, (unsigned)g_proxy.gid);
     }
     if (proxy_fd >= 0) close(proxy_fd);
+    /* v1.27: with `require warden 1.27`, the files the agent may launch and
+     * the Landlock ruleset that holds it to them (warden_exec.inc.c) */
+    if (p.v.launches) {
+        if (exec_ruleset_build(&p, target_argv ? boot_path : NULL) < 0) {
+            if (g_sk) sodium_free(g_sk);
+            return 1;
+        }
+        fprintf(stderr, "[warden] launch set: %zu files, %s\n", g_exec_n,
+                g_ll_abi >= 1 ? "held by Landlock" : "no Landlock: later launches refused");
+        if (g_check_only)
+            for (size_t k = 0; k < g_exec_n; k++) {
+                const struct exec_file *e = &g_exec_rs[k];
+                bool same = !strcmp(e->name, e->path);
+                fprintf(stderr, "[warden]   %s%s%s, sha256 %.16s..., %s", e->name, same ? "" : " -> ",
+                        same ? "" : e->path, e->sha, e->why);
+                if (e->line) fprintf(stderr, " (line %d)", e->line);
+                fputc('\n', stderr);
+            }
+    }
     if (g_check_only) {
         /* v1.24: resolve each allowed name and report the ones that fail (a
          * name that does not resolve does not stop the Warden). */
@@ -4622,6 +4645,7 @@ int main(int argc, char **argv) {
 
     pid_t target = fork();
     if (target < 0) { perror("fork"); return 1; }
+    if (target > 0 && g_ll_fd >= 0) { close(g_ll_fd); g_ll_fd = -1; }   /* v1.27: the agent holds it */
 
     if (target == 0) {
         signal(SIGPIPE, SIG_DFL);       /* v1.16: an ignored signal survives execve */
@@ -4670,6 +4694,14 @@ int main(int argc, char **argv) {
         if (crc < 0) {
             fprintf(stderr, "[warden-target] lifecycle coupling failed (%s); "
                             "refusing to run unsupervised\n", strerror(-crc));
+            _exit(1);
+        }
+        /* v1.27: the agent enters the launch set's Landlock domain before
+         * its filter is installed (the filter does not admit the call) and
+         * before its own launch, which the set holds */
+        if (exec_ruleset_apply() < 0) {
+            fprintf(stderr, "[warden-target] cannot enter the Landlock domain (%s); refusing to run\n",
+                    strerror(errno));
             _exit(1);
         }
         int notify_fd =

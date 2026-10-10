@@ -2491,6 +2491,8 @@ bool vdp_exec_is_interpreter(const char *path) {
     };
     const char *b = strrchr(path, '/');
     b = b ? b + 1 : path;
+    /* the dynamic loader runs any ELF file it can read (ld.so FILE) */
+    if (!strncmp(b, "ld-linux", 8) || !strncmp(b, "ld-musl", 7) || !strcmp(b, "ld.so")) return true;
     for (size_t i = 0; kInterp[i]; i++) {
         size_t k = strlen(kInterp[i]);
         if (strncmp(b, kInterp[i], k)) continue;
