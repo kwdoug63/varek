@@ -44,6 +44,12 @@
 #      refusals explains launch refusals and kills; the CycloneDX export
 #      states Landlock, the launch set and the launches; varek doctor and the
 #      preflight report Landlock; varek policy show lists the launch set
+#   6. what launching needs (as root): with the opt-in, access(X_OK) answers
+#      whether a launch would be allowed (a directory: search, as a read), and
+#      an open of a missing file the policy would let the agent read answers
+#      ENOENT (open_not_found), under a missing directory too; without the
+#      opt-in both refused as before; a compile (cc, cc1, as, collect2, ld)
+#      runs under the Warden with each launch decided
 #
 # Usage: test_v1270.sh <vdp_check> <vdp_cert_check> [<warden>]
 set -u
@@ -556,6 +562,64 @@ PY
     NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 "$HERE/tools/varek" policy show "$D/p3" > "$OUT/ps.out" 2>&1
     check "varek policy show lists the launch set this host would build" \
         sh -c "grep -q '^Launch set on this host: [0-9]* files, held by Landlock' '$OUT/ps.out' && grep -q '^  /usr/bin/git, sha256' '$OUT/ps.out'"
+fi
+
+echo "== 6. what launching needs =="
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ] || [ -z "${D:-}" ]; then
+    skip "section 6 (needs root, the warden binary and section 3)"
+else
+    mkdir -p "$D/w"; chmod 777 "$D/w"
+    cat > "$D/probe.py" <<'PY'
+import errno, os, sys
+d = sys.argv[1]
+def acc(label, path):
+    print(label, "OK" if os.access(path, os.X_OK) else "NO", flush=True)
+def opn(label, path):
+    try:
+        open(path).close(); print(label, "OPENED", flush=True)
+    except OSError as e:
+        print(label, errno.errorcode.get(e.errno, e.errno), flush=True)
+acc("x_allowed", "/usr/bin/git")
+acc("x_unallowed", "/usr/bin/false")
+acc("x_dir", d + "/bin")
+opn("missing_inside", "/usr/no-such-file-v1270")
+opn("missing_parent", "/usr/no-such-dir-v1270/f")
+opn("missing_outside", "/opt/no-such-file-v1270")
+PY
+    chmod 644 "$D/probe.py"
+    (cd "$D" && env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$D/p3" -- /usr/bin/python3 "$D/probe.py" "$D" \
+        > "$OUT/n.out" 2> "$OUT/n.log")
+    (cd "$D" && env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$D/p3c" -- /usr/bin/python3 "$D/probe.py" "$D" \
+        > "$OUT/n0.out" 2> "$OUT/n0.log")
+    check "access(X_OK): granted for a program a launch of which is allowed" grep -qx 'x_allowed OK' "$OUT/n.out"
+    check "refused for one the policy does not allow" grep -qx 'x_unallowed NO' "$OUT/n.out"
+    check "and granted for a directory (search, decided as a read)" grep -qx 'x_dir OK' "$OUT/n.out"
+    check "without the opt-in, X_OK refused as before" \
+        sh -c "grep -qx 'x_allowed NO' '$OUT/n0.out' && grep -qx 'x_dir NO' '$OUT/n0.out'"
+    check "an open of a missing file the policy would let it read: ENOENT (open_not_found, certified)" \
+        sh -c "grep -qx 'missing_inside ENOENT' '$OUT/n.out' && grep -q '\"rule\":\"open_not_found\".*\"check\":\"ok\"' '$OUT/n.log'"
+    check "under a missing directory too" grep -qx 'missing_parent ENOENT' "$OUT/n.out"
+    check "outside the policy: EACCES" grep -qx 'missing_outside EACCES' "$OUT/n.out"
+    check "without the opt-in, refused as before (EACCES)" \
+        sh -c "grep -qx 'missing_inside EACCES' '$OUT/n0.out' && grep -qx 'missing_parent EACCES' '$OUT/n0.out'"
+    check "the audit accepts both runs" sh -c "python3 '$HERE/tools/varek_audit.py' --policy '$D/p3' --checker '$CERT' '$OUT/n.log' >/dev/null && python3 '$HERE/tools/varek_audit.py' --policy '$D/p3c' --checker '$CERT' '$OUT/n0.log' >/dev/null"
+    # a compile: the compiler's own launches (cc1, as, collect2, ld), each decided
+    CCP=/usr/libexec/gcc/x86_64-linux-gnu/$(cc -dumpversion 2>/dev/null | cut -d. -f1)
+    if [ -x /usr/bin/cc ] && [ -x "$CCP/cc1" ] && [ -x /usr/bin/as ] && [ -x /usr/bin/ld ]; then
+        printf 'int main(void) { return 0; }\n' > "$D/t.c"; chmod 644 "$D/t.c"
+        printf 'import subprocess, sys\nr = subprocess.run(["/usr/bin/cc", "-o", sys.argv[1] + "/w/t", sys.argv[1] + "/t.c"])\nprint("CC", r.returncode, flush=True)\n' > "$D/cc.py"
+        chmod 644 "$D/cc.py"
+        { printf 'require warden 1.27\nallow exec /usr/bin/python3\nallow exec /usr/bin/cc\nallow exec /usr/bin/as\nallow exec /usr/bin/ld\nallow exec prefix %s/\n' "$CCP"
+          printf 'allow path %s/w/\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ readonly\nallow path /dev/null\nallow path %s/ readonly\n' "$D" "$D"; } > "$D/pcc"
+        chmod 644 "$D/pcc"
+        (cd "$D/w" && env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$D/pcc" -- /usr/bin/python3 "$D/cc.py" "$D" \
+            > "$OUT/cc.out" 2> "$OUT/cc.log")
+        check "a compile under the Warden: cc, cc1, as, collect2 and ld each launched and decided" \
+            sh -c "grep -qx 'CC 0' '$OUT/cc.out' && [ -s '$D/w/t' ] && for p in /usr/bin/cc '$CCP/cc1' /usr/bin/as '$CCP/collect2' /usr/bin/ld; do grep -q \"\\\"resolved\\\":\\\"\$p\\\",[^}]*\\\"rule\\\":\\\"exec_allowed\\\"\" '$OUT/cc.log' || exit 1; done"
+        check "the audit accepts the compile's run" python3 "$HERE/tools/varek_audit.py" --policy "$D/pcc" --checker "$CERT" "$OUT/cc.log"
+    else
+        skip "a compile (no cc, cc1, as and ld here)"
+    fi
 fi
 
 echo

@@ -263,6 +263,7 @@ static int exec_walk(const struct policy *p, const char *dir, const char *must, 
  * not start, the reason printed). */
 static int exec_ruleset_build(const struct policy *p, const char *boot_path) {
     char err[600] = "";
+    g_exec_policy = p;
     g_exec_rs = calloc(EXEC_RS_MAX, sizeof *g_exec_rs);
     size_t *admitted = calloc(p->v.n ? p->v.n : 1, sizeof *admitted);
     if (!g_exec_rs || !admitted) { fprintf(stderr, "[warden] out of memory\n"); return -1; }
@@ -709,4 +710,26 @@ static bool exec_identity(int notify_fd, const struct seccomp_notif *req, struct
 /* At the run's end: launches never seen */
 static void exec_finish(void) {
     while (g_nxp) exec_pend_drop(g_nxp - 1, "gone");
+}
+
+/* ---- v1.27: access(X_OK), answered for what launches allow ---- */
+
+/* Before 1.27 nothing may be launched after the agent's own launch, so X_OK
+ * is refused (v1.17). With launches decided: a directory's X_OK is search,
+ * granted as the read the policy already decided; a file's is granted when a
+ * launch of that name would be allowed now: the policy allows the name (the
+ * path as written when absolute, else the resolved one), the file is in the
+ * launch set, and it has an execute bit. 0 or -EACCES. */
+static int exec_access_x(int ofd, const struct action *a) {
+    if (!g_exec_checking || !g_exec_policy) return -EACCES;
+    struct stat st;
+    if (fstat(ofd, &st) < 0) return -EACCES;
+    if (S_ISDIR(st.st_mode)) return 0;
+    if (!S_ISREG(st.st_mode) || !(st.st_mode & 0111) || g_ll_abi < 1) return -EACCES;
+    const struct exec_file *e = exec_rs_find(st.st_dev, st.st_ino);
+    if (!e) return -EACCES;
+    const char *name = a->target[0] == '/' && !strstr(a->target, "/.") ? a->target : a->resolved;
+    if (!name[0]) return -EACCES;
+    return vdp_decide(&g_exec_policy->v, VDP_KIND_EXEC, name, 0, false, NULL, NULL) == VDP_SATISFIED
+           ? 0 : -EACCES;
 }

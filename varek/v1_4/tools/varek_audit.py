@@ -86,7 +86,8 @@ from varek_cyclonedx import StreamError, _parse_log, _version_at_least, LOG_SIG_
 import varek_ed25519  # noqa: E402
 
 # Record rules for an authorized file open (the policy decided ALLOW).
-AUTHORIZED_OPEN_RULES = ("resolved_fd_injection", "allowed_open_failed", "injection_failed")
+AUTHORIZED_OPEN_RULES = ("resolved_fd_injection", "allowed_open_failed", "injection_failed",
+                         "open_not_found")   # v1.27: a missing file where the policy allows the read
 # v1.17.0: metadata and link lookups (stat, access, readlink) are decided like a
 # read-only open and certified the same way.
 META_ACTIONS = ("file.stat", "file.access", "file.readlink")

@@ -900,6 +900,8 @@ static FILE *g_log;
 static void log_line_start(void);
 static void json_escape(FILE *f, const char *s);
 static void exec_ruleset_record(FILE *f);     /* v1.27: warden_exec.inc.c */
+struct action;
+static int exec_access_x(int ofd, const struct action *a);   /* v1.27: warden_exec.inc.c */
 
 /* v1.15: before a SATISFIED verdict authorizes anything, the procedure emits a
  * certificate (the deciding rule and a witness that its constant matches) and
@@ -2695,7 +2697,9 @@ static int64_t meta_answer(pid_t tid, int notify_fd, uint64_t id,
          * behalf (decided above). Nothing may be executed after the launch
          * (deny-only), so X_OK is refused. */
         if (a->access_mode & ~(F_OK | R_OK | W_OK | X_OK)) return -EINVAL;
-        if (a->access_mode & X_OK) return -EACCES;
+        /* v1.27: with launches decided, X_OK says whether a launch of it would
+         * be allowed (a file), or grants search like a read (a directory) */
+        if (a->access_mode & X_OK) return exec_access_x(ofd, a);
         return 0;
     }
     /* readlink: the kernel takes the size as an int. */
@@ -2751,6 +2755,40 @@ static int meta_on_held_fd(pid_t tid, int notify_fd, uint64_t id, const struct a
  * exist, *ofd is -1, a->resolved is <canonical parent>/<name> and *missing is
  * the errno the agent's own call would have seen, so the decision is made on
  * where it would be. Returns 0, or -1 to fail closed. */
+/* v1.27: a lookup whose path leaves the filesystem before its last name
+ * (a parent is missing too). Walk it one name at a time, as the kernel does
+ * ("." skipped, ".." to the real parent, symlinks followed, no magic links),
+ * to the first name that does not exist: that is where the kernel's lookup
+ * stops with ENOENT. 0 with *pfd (its directory) and name, or -1. */
+static const struct policy *g_exec_policy;   /* set with launches decided (warden_exec.inc.c) */
+static int meta_first_missing(int base, const char *path, int *pfd, char *name, size_t nn) {
+    int cur = path[0] == '/' ? open("/", O_PATH | O_DIRECTORY | O_CLOEXEC) : dup(base);
+    if (cur < 0) return -1;
+    char buf[PATH_LIMIT];
+    snprintf(buf, sizeof buf, "%s", path);
+    char *save = NULL;
+    for (char *c = strtok_r(buf, "/", &save); c; c = strtok_r(NULL, "/", &save)) {
+        if (!strcmp(c, ".")) continue;
+        int nx = openat2_path(cur, c, 0);
+        if (nx < 0) {
+            struct stat st;
+            if (errno == ENOENT && strcmp(c, "..") && strlen(c) < nn &&
+                fstatat(cur, c, &st, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT) {
+                snprintf(name, nn, "%s", c);
+                *pfd = cur;
+                return 0;
+            }
+            break;                         /* a dangling link, a refusal: fail closed */
+        }
+        struct stat st;
+        if (fstat(nx, &st) < 0 || !S_ISDIR(st.st_mode)) { close(nx); break; }
+        close(cur);
+        cur = nx;
+    }
+    close(cur);
+    return -1;
+}
+
 static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *missing) {
     *ofd = -1;
     *missing = 0;
@@ -2806,8 +2844,16 @@ static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *mi
     else if (slash == path) snprintf(dir, sizeof(dir), "/");
     else                    snprintf(dir, sizeof(dir), "%.*s", (int)(slash - path), path);
     int pfd = openat2_path(base, dir, (uint64_t)O_DIRECTORY);
+    /* the parent is missing too: fail closed, as before 1.27; with launches
+     * decided (a coding agent's compiler looks up include directories under
+     * missing ones), decide on where the kernel's lookup stops */
+    if (pfd < 0 && errno == ENOENT && g_exec_policy && g_exec_policy->v.launches) {
+        static char nm[256];
+        int q = -1;
+        if (meta_first_missing(base, path, &q, nm, sizeof nm) == 0) { pfd = q; name = nm; }
+    }
     close(base);
-    if (pfd < 0) return -1;              /* the parent is missing too: fail closed */
+    if (pfd < 0) return -1;
     /* Only a name that truly does not exist is decided on where it would be.
      * If it exists (a trailing slash on a file, ENOTDIR; or a symlink whose
      * target is missing), failing here would answer for an object the
@@ -3159,6 +3205,26 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         }
         if (act.kind == ACT_FILE_OPEN) {
             if (resolve_target(req.pid, &act, &rt) < 0) {
+                /* v1.27: with launches decided, an open (not creating) of a
+                 * name that does not exist is decided on where it would be,
+                 * as a lookup is (v1.17): ENOENT where the policy allows the
+                 * read, EACCES elsewhere. Before 1.27, refused as before. */
+                int mofd = -1, miss = 0;
+                if (g_exec_policy && g_exec_policy->v.launches && !(act.open_flags & O_CREAT) &&
+                    resolve_meta(req.pid, &act, -1, &mofd, &miss) == 0 && mofd < 0 && miss == ENOENT &&
+                    in_protected_dir(act.resolved, -1) == 0) {
+                    decision_t nr = policy_decide(p, &act);
+                    bool nok = nr == DEC_ALLOW && certify(p, &act);
+                    clock_gettime(CLOCK_MONOTONIC, &t1);
+                    emit_pathology(g_report_seq++, req.pid, &act, nr, nok ? DEC_ALLOW : DEC_DENY,
+                                   nok ? "open_not_found" : nr == DEC_ALLOW ? "certificate_refused"
+                                                                         : decision_rule_id(&act, nr),
+                                   (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec),
+                                   nok ? ENOENT : EACCES);
+                    send_errno(notify_fd, req.id, nok ? ENOENT : EACCES);
+                    continue;
+                }
+                if (mofd >= 0) close(mofd);
                 clock_gettime(CLOCK_MONOTONIC, &t1);
                 uint64_t lat_r = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                                + (t1.tv_nsec - t0.tv_nsec);
