@@ -1900,17 +1900,21 @@ static void emit_unanswered(void) {
 
 static void px_finish(void);           /* v1.26 step 7 (warden_pxdecide.inc.c) */
 static bool g_px_failed;               /* v1.26.1 review: the proxy misbehaved while flushing */
+static unsigned g_exec_mismatch;       /* v1.27: processes killed by the identity check */
+static void exec_finish(void);         /* v1.27: warden_exec.inc.c */
 static void emit_run_end(int exit_status) {
     px_finish();                        /* v1.26: every relay's proxy_close */
+    exec_finish();                      /* v1.27: launches never seen */
     emit_unanswered();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
     fprintf(f, "{\"event\":\"run_end\",\"run\":\"%s\",\"records\":%" PRIu64 ","
-               "\"exit_status\":%d,%s%s\"timestamp_ns\":%lld}\n",
+               "\"exit_status\":%d,%s%s%s\"timestamp_ns\":%lld}\n",
             g_run_id, g_records, exit_status,
             g_anchor_errors ? "\"anchor_errors_seen\":true," : "",
             g_px_failed ? "\"proxy_failed\":true," : "",
+            g_exec_mismatch ? "\"exec_identity_mismatch\":true," : "",
             (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end("run_end");
 }
@@ -2957,6 +2961,11 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             continue;
         }
 
+        /* v1.27 (step 4): with launches decided, before anything is
+         * answered, the calling process must run a program the Warden
+         * decided to run (warden_exec.inc.c) */
+        if (exec_identity(notify_fd, &req, &act, &t0)) continue;
+
         /* Bootstrap launch: the target's own first execve of the operator-
          * specified binary is authorized by the act of launching it, and is
          * answered with CONTINUE. That is sound only while nothing else can
@@ -2985,6 +2994,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             if (boot_by_fd)
                 snprintf(act.target, sizeof act.target, "%s", bootstrap_path);
             bootstrap_done = true;
+            g_exec_checking = p->v.launches;   /* v1.27 step 4: from here on */
             if (ctx) ctx->launched = true;
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat_b = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
@@ -4869,5 +4879,6 @@ int main(int argc, char **argv) {
     close(target_pidfd);
     close(notify_fd);
     if (g_px_failed && rc == 0) rc = 1;      /* v1.26.1 review: the run did not end cleanly */
+    if (g_exec_mismatch && rc == 0) rc = 1;  /* v1.27: a process ran what was not decided */
     return rc;
 }

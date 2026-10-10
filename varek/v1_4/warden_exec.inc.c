@@ -53,7 +53,12 @@ struct exec_file {
     char   sha[65];       /* SHA-256 at startup */
     const char *why;      /* "rule", "loader", "bootstrap", "interpreter" */
     int    line;          /* the deciding rule's policy line (why "rule"), else 0 */
+    bool   image;         /* step 4: a program the Warden decided to run (a process may run it) */
 };
+
+static int exec_image_of(const char *path, dev_t *dev, ino_t *ino);      /* step 4, below */
+static void exec_mark_image(dev_t dev, ino_t ino);
+static int exec_pend_add(pid_t tid, dev_t edev, ino_t eino, uint64_t seq);
 
 static struct exec_file *g_exec_rs;
 static size_t g_exec_n;
@@ -325,6 +330,11 @@ static int exec_ruleset_build(const struct policy *p, const char *boot_path) {
         fprintf(stderr, "[warden] the launch set: %s; refusing to start\n", err);
         return -1;
     }
+    /* step 4: the agent's own launch runs the bootstrap's image */
+    if (boot_path) {
+        dev_t d; ino_t i;
+        if (exec_image_of(boot_path, &d, &i) == 0) exec_mark_image(d, i);
+    }
     /* notes on what the set holds */
     for (size_t k = 0; k < g_exec_n; k++) {
         const struct exec_file *f = &g_exec_rs[k];
@@ -534,10 +544,169 @@ static void exec_launch(int notify_fd, const struct seccomp_notif *req, struct a
         snprintf(a->extra, sizeof a->extra, "\"exec_set\":%zu,\"exec_dev\":%llu,\"exec_ino\":%llu,"
                  "\"exec_sha256\":\"%s\",", k, (unsigned long long)ef->dev, (unsigned long long)ef->ino, ef->sha);
     }
+    /* step 4: the image the launch runs becomes one a process may run, and
+     * the launch is pending until the Warden sees it (exec_identity) */
+    if (d_final == DEC_ALLOW) {
+        dev_t idev = 0; ino_t iino = 0;
+        static int mismatch_test = -1;      /* make test-v1270: force a mismatch */
+        if (mismatch_test < 0) mismatch_test = getenv("VAREK_WARDEN_TEST_EXEC_MISMATCH") != NULL;
+        if (!mismatch_test && exec_image_of(ef->path, &idev, &iino) == 0) exec_mark_image(idev, iino);
+        if (mismatch_test) { idev = 0; iino = 0; }
+        if (exec_pend_add((pid_t)req->pid, idev, iino, g_records) < 0) {
+            d_final = DEC_DENY;
+            rule = "exec_unresolved";
+            a->extra[0] = '\0';
+        }
+    }
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     uint64_t lat = (uint64_t)(t1.tv_sec - t0->tv_sec) * 1000000000ULL + (uint64_t)(t1.tv_nsec - t0->tv_nsec);
     emit_pathology(g_report_seq++, (pid_t)req->pid, a, d_raw, d_final, rule, lat,
                    d_final == DEC_ALLOW ? 0 : EACCES);
     send_simple(notify_fd, req->id, d_final);
+}
+
+/* ---- v1.27 step 4: the identity check (design section 3) ---- */
+
+#ifndef __NR_pidfd_send_signal
+#define __NR_pidfd_send_signal 424
+#endif
+#define EXEC_PEND_MAX 512
+
+/* A launch continued and not yet seen: the image it should become (the
+ * decided file, or the interpreter a script names), and the image the process
+ * ran when it asked. */
+struct exec_pend {
+    pid_t    tid, tgid;
+    dev_t    edev, odev;
+    ino_t    eino, oino;
+    uint64_t seq;          /* the exec_allowed record */
+    int      pidfd;        /* the thread group, to tell it from a later one with its pid */
+};
+static struct exec_pend g_xp[EXEC_PEND_MAX];
+static size_t g_nxp;
+static bool g_exec_checking;     /* launches on and the agent's own launch done */
+
+/* The image a launch of path runs: the file itself, or for a script the
+ * interpreter its #! names (followed up to 4 levels, as the kernel does). 0
+ * with dev/ino, or -1. */
+static int exec_image_of(const char *path, dev_t *dev, ino_t *ino) {
+    char cur[PATH_MAX];
+    snprintf(cur, sizeof cur, "%s", path);
+    for (int depth = 0; depth < 5; depth++) {
+        int fd = open(cur, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        struct stat st;
+        if (fd < 0 || fstat(fd, &st) < 0) { if (fd >= 0) close(fd); return -1; }
+        char interp[PATH_MAX];
+        int r = exec_script_interp(fd, interp, sizeof interp);
+        close(fd);
+        if (r != 1) { *dev = st.st_dev; *ino = st.st_ino; return 0; }
+        snprintf(cur, sizeof cur, "%s", interp);
+    }
+    return -1;
+}
+
+static void exec_mark_image(dev_t dev, ino_t ino) {
+    for (size_t k = 0; k < g_exec_n; k++)
+        if (g_exec_rs[k].dev == dev && g_exec_rs[k].ino == ino) g_exec_rs[k].image = true;
+}
+
+static void exec_result(const struct exec_pend *x, const char *result) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    FILE *f = rec_begin();
+    fprintf(f, "{\"event\":\"exec_result\",\"run\":\"%s\",\"decision_seq\":%" PRIu64 ",\"agent_pid\":%d,"
+               "\"result\":\"%s\",\"timestamp_ns\":%lld}\n",
+            g_run_id, x->seq, (int)x->tgid, result, (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+    rec_end(NULL);
+}
+
+static void exec_pend_drop(size_t k, const char *result) {
+    if (result) exec_result(&g_xp[k], result);
+    if (g_xp[k].pidfd >= 0) close(g_xp[k].pidfd);
+    g_xp[k] = g_xp[--g_nxp];
+}
+
+/* Register a continued launch, before it is answered. 0, or -1 (refuse it). */
+static int exec_pend_add(pid_t tid, dev_t edev, ino_t eino, uint64_t seq) {
+    if (g_nxp == EXEC_PEND_MAX) return -1;
+    char ep[64];
+    struct stat ost;
+    snprintf(ep, sizeof ep, "/proc/%d/exe", tid);
+    pid_t tgid = task_tgid(tid);
+    if (tgid < 0 || stat(ep, &ost) < 0) return -1;
+    int pidfd = (int)syscall(__NR_pidfd_open, tgid, 0);
+    if (pidfd < 0) return -1;
+    g_xp[g_nxp++] = (struct exec_pend){ .tid = tid, .tgid = tgid, .edev = edev, .eino = eino,
+                                        .odev = ost.st_dev, .oino = ost.st_ino, .seq = seq, .pidfd = pidfd };
+    return 0;
+}
+
+/* Before any call of the agent is answered (launches on, after its own
+ * launch): the calling process must run a program the Warden decided to run,
+ * and a process with a launch pending must run either the image it asked
+ * from (the launch has not happened, or failed) or the one decided. Else it
+ * is killed and the call refused (exec_identity_mismatch). true when the call
+ * was answered here. */
+static bool exec_identity(int notify_fd, const struct seccomp_notif *req, struct action *a,
+                          const struct timespec *t0) {
+    if (!g_exec_checking) return false;
+    pid_t tid = (pid_t)req->pid;
+    /* launches whose process has gone without a call seen */
+    for (size_t k = 0; k < g_nxp; )
+        if (syscall(__NR_pidfd_send_signal, g_xp[k].pidfd, 0, NULL, 0) < 0 && errno == ESRCH)
+            exec_pend_drop(k, "gone");
+        else k++;
+    char ep[64];
+    struct stat st;
+    snprintf(ep, sizeof ep, "/proc/%d/exe", tid);
+    const char *why = NULL;
+    if (stat(ep, &st) < 0) why = "exec_identity_unreadable";
+    for (size_t k = 0; !why && k < g_nxp; ) {
+        struct exec_pend *x = &g_xp[k];
+        if (x->tid != tid && x->tgid != tid) { k++; continue; }
+        if (st.st_dev == x->edev && st.st_ino == x->eino) { exec_pend_drop(k, "launched"); continue; }
+        if (st.st_dev == x->odev && st.st_ino == x->oino) {
+            if (tid == x->tid) { exec_pend_drop(k, "failed"); continue; }   /* the launching thread, back */
+            k++;
+            continue;
+        }
+        why = "exec_identity_mismatch";
+    }
+    const struct exec_file *e = why ? NULL : exec_rs_find(st.st_dev, st.st_ino);
+    if (!why && !(e && e->image)) why = "exec_identity_mismatch";
+    if (!why) return false;
+    /* kill the process (it is blocked in this call, so its pid is its own) */
+    pid_t tgid = task_tgid(tid);
+    int pfd = tgid > 0 ? (int)syscall(__NR_pidfd_open, tgid, 0) : -1;
+    if (pfd >= 0) { (void)syscall(__NR_pidfd_send_signal, pfd, SIGKILL, NULL, 0); close(pfd); }
+    for (size_t k = 0; k < g_nxp; )
+        if (g_xp[k].tgid == tgid || g_xp[k].tid == tid) exec_pend_drop(k, "killed"); else k++;
+    g_exec_mismatch++;
+    char canon[PATH_MAX] = "";
+    ssize_t n = readlink(ep, canon, sizeof canon - 1);
+    if (n > 0) canon[n] = '\0';
+    int w = snprintf(a->extra, sizeof a->extra, "\"exe_dev\":%llu,\"exe_ino\":%llu,\"exe\":\"",
+                     (unsigned long long)st.st_dev, (unsigned long long)st.st_ino);
+    for (const char *c = canon; *c && w < (int)sizeof a->extra - 8; c++) {   /* a path: escape for JSON */
+        unsigned char u = (unsigned char)*c;
+        if (u == '"' || u == '\\') { a->extra[w++] = '\\'; a->extra[w++] = (char)u; }
+        else if (u < 0x20 || u >= 0x7f) w += snprintf(a->extra + w, sizeof a->extra - (size_t)w, "\\u%04x", u);
+        else a->extra[w++] = (char)u;
+    }
+    snprintf(a->extra + w, sizeof a->extra - (size_t)w, "\",");
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint64_t lat = (uint64_t)(t1.tv_sec - t0->tv_sec) * 1000000000ULL + (uint64_t)(t1.tv_nsec - t0->tv_nsec);
+    log_line_start();
+    fprintf(g_log, "[warden] %s: pid %d runs %s, not a program the Warden decided to run; killed\n",
+            why, (int)tid, canon[0] ? canon : "(unreadable)");
+    emit_pathology(g_report_seq++, tid, a, DEC_DENY, DEC_DENY, why, lat, EACCES);
+    send_simple(notify_fd, req->id, DEC_DENY);
+    return true;
+}
+
+/* At the run's end: launches never seen */
+static void exec_finish(void) {
+    while (g_nxp) exec_pend_drop(g_nxp - 1, "gone");
 }

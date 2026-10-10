@@ -33,6 +33,11 @@
 #      in the set is allowed by the Warden and refused by the kernel; a
 #      launched program's own calls are mediated; the audit accepts the runs
 #      and refuses forged launch records
+#   4. the identity check (as root): each allowed launch gets one exec_result
+#      (launched when its process is seen running the decided file); a
+#      process found running anything else (forced by a test hook) is killed
+#      before its call is answered, recorded, and run_end and the exit status
+#      say so; the rest of the agent goes on
 #
 # Usage: test_v1270.sh <vdp_check> <vdp_cert_check> [<warden>]
 set -u
@@ -435,6 +440,30 @@ PY
     refuses "an allowed launch whose file is not the set's entry" "$D/p3" "$OUT/f3.log" "not a file of the launch set"
     refuses "an allowed launch naming no entry" "$D/p3" "$OUT/f4.log" "not a file of the launch set"
     refuses "an allowed launch under a policy without the opt-in" "$D/p3c" "$OUT/x.log" "does not turn launches on"
+fi
+
+echo "== 4. the identity check =="
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ] || [ -z "${D:-}" ]; then
+    skip "section 4 (needs root, the warden binary and section 3)"
+else
+    check "an allowed launch seen running its file: exec_result launched" \
+        xrec "any(r.get('event') == 'exec_result' and r['result'] == 'launched' and r['decision_seq'] == e('/usr/bin/git')[0]['seq'] for r in recs)"
+    check "a launch the kernel refused (a script without its interpreter) is not recorded as launched" \
+        xrec "any(r.get('event') == 'exec_result' and r['decision_seq'] == e('$D/bin/sh.sh')[0]['seq'] and r['result'] in ('failed', 'gone') for r in recs)"
+    check "every allowed launch has one exec_result" \
+        xrec "sorted(r['decision_seq'] for r in recs if r.get('event') == 'exec_result') == sorted(r['seq'] for r in ex if r['rule'] == 'exec_allowed')"
+    check "no process was killed in an ordinary run" xrec "not any(r.get('rule') == 'exec_identity_mismatch' for r in recs) and not any(r.get('exec_identity_mismatch') for r in recs)"
+    # the test hook: the Warden takes the next allowed launch's image to be another file
+    (cd "$D" && env -i PATH=/usr/bin:/bin VAREK_WARDEN_TEST_EXEC_MISMATCH=1 timeout 120 "$WARDEN" "$D/p3" -- \
+        /usr/bin/python3 "$D/agent.py" first:run:/usr/bin/git:--version after:run:/usr/bin/git:--version \
+        > "$OUT/m.out" 2> "$OUT/m.log"); mrc=$?
+    check "a launched process not running what was decided is killed before its call is answered" \
+        sh -c "grep -q '\"rule\":\"exec_identity_mismatch\"' '$OUT/m.log' && grep -q '^first RAN -9' '$OUT/m.out'"
+    check "the record names the program it ran" grep -q '"rule":"exec_identity_mismatch".*"exe":"/' "$OUT/m.log"
+    check "its launch's exec_result says killed" grep -q '"event":"exec_result".*"result":"killed"' "$OUT/m.log"
+    check "the agent goes on (only that process is killed)" grep -q '^after ' "$OUT/m.out"
+    check "run_end says so, and the Warden exits 1" \
+        sh -c "grep -q '\"event\":\"run_end\".*\"exec_identity_mismatch\":true' '$OUT/m.log' && [ $mrc = 1 ]"
 fi
 
 echo
