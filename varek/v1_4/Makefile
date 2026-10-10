@@ -76,6 +76,10 @@ RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c warden_stub.inc.
 
 warden: warden.c warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c warden_exec.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
+	@# v1.27: Landlock does not govern a memfd, so the agent must never make one
+	@# (docs/security/v1.27-program-launches.md): memfd_create stays hard-denied
+	@awk '/^static const char \*kHardDeny\[\]/,/NULL/' warden_baseline_filter.c | grep -q '"memfd_create"' || \
+	    { echo "warden: memfd_create must stay in the filter's hard-deny set (v1.27)"; exit 1; }
 	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
 
 # v1.26.1: the egress proxy, its own program (the Warden starts it from a
