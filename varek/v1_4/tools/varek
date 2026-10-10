@@ -1125,6 +1125,43 @@ def cmd_export(args):
     return rc
 
 
+def cmd_bench_launch(args, cfg):
+    """v1.27: `varek bench --launches`."""
+    import varek_bench_launch       # only here: the rest of the command does not need it
+    if args.policy or args.bare:
+        raise CliError("--launches measures with the bench's own policies; --policy and --bare do not apply")
+    args.n = 200 if args.n is None else args.n
+    args.warmup = 20 if args.warmup is None else args.warmup
+    args.rounds = 3 if args.rounds is None else args.rounds
+    if args.n < 10 or args.rounds < 1 or args.warmup < 0:
+        raise CliError("use -n of at least 10, --rounds of at least 1 and --warmup of 0 or more")
+    run_as = args.run_as or (cfg["run_as"] if cfg else "nobody")
+    sign_key = cfg["sign_key"] if cfg and cfg["sign_key"] and not args.no_sign else None
+    if args.output and not os.access(os.path.dirname(os.path.abspath(args.output)), os.W_OK):
+        raise CliError(f"cannot write {args.output}", fix="give -o a path in a writable directory")
+    progress = (lambda m: None) if args.json else (
+        lambda m: print(_paint("2", f"[varek] bench --launches {m}"), file=sys.stderr))
+    try:
+        res = varek_bench_launch.run(warden_bin(), tool("bench_workload"), tool("vdp_cert_check"),
+                                     tool("varek_audit.py"), n=args.n, warmup=args.warmup, rounds=args.rounds,
+                                     run_as=run_as, sign_key=sign_key, progress=progress, keep=args.keep)
+    except varek_bench.BenchError as e:
+        raise CliError(str(e), fix=e.fix)
+    res["varek_command"] = CLI_VERSION
+    if args.output:
+        try:
+            with open(args.output, "w") as fh:
+                json.dump(res, fh, indent=2)
+                fh.write("\n")
+        except OSError as e:
+            warn(f"could not write {args.output}: {e}")
+    if args.json:
+        print(json.dumps(res, indent=2))
+    else:
+        sys.stdout.write(varek_bench_launch.format_report(res, CLI_VERSION))
+    return 0 if res["ok"] else 1
+
+
 def cmd_bench_proxy(args, cfg):
     """v1.26.1: `varek bench --proxy`."""
     import varek_bench_proxy        # only here: the rest of the command does not need it
@@ -1184,6 +1221,8 @@ def cmd_bench(args):
     cfg = load_config(required=False)
     if args.proxy:
         return cmd_bench_proxy(args, cfg)
+    if args.launches:
+        return cmd_bench_launch(args, cfg)
     args.n = 2000 if args.n is None else args.n
     args.warmup = 200 if args.warmup is None else args.warmup
     args.rounds = 5 if args.rounds is None else args.rounds
@@ -1380,6 +1419,9 @@ def build_parser():
     sp.add_argument("--proxy", action="store_true",
                     help="measure the egress proxy instead: HTTPS requests natively, in SNI mode and "
                          "in inspecting mode (defaults -n 200 --warmup 20 --rounds 3)")
+    sp.add_argument("--launches", action="store_true",
+                    help="measure decided program launches instead (v1.27): launches and an open "
+                         "natively, with launches off and on (defaults -n 200 --warmup 20 --rounds 3)")
     sp.add_argument("--policy", help="measure with this pack or policy file's rules instead of the active policy")
     sp.add_argument("--bare", action="store_true", help="the bench's own rules only, no policy")
     sp.add_argument("-n", type=int, default=None,

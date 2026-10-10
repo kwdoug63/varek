@@ -35,6 +35,20 @@
  *         SAMPLES <kind> <us> <us> ...       (the n timed calls, warm-up dropped)
  *         END
  *
+ *   bench_workload launch <dir> <n> <warmup>          (v1.27, varek bench --launches)
+ *       Makes warmup + n of each, round-robin, timed around the whole call:
+ *         launch_allowed  vfork, execve(<dir>/bin/ok, "noop"), wait: a launch the
+ *                         policy allows (the program exits at once)
+ *         launch_denied   the same with <dir>/bin/denied, which a deny rule
+ *                         refuses (natively it runs like the other)
+ *         open_allowed    openat(<dir>/allowed/f, O_RDONLY), to measure what
+ *                         deciding launches adds to an ordinary call
+ *       A launch whose execve fails exits 100 + errno, which is the call's
+ *       errno here. Prints as `run` does.
+ *
+ *   bench_workload noop
+ *       Exits 0 at once: the program the launches above run.
+ *
  * Built static where the host has a static libc, so a run under the Warden
  * has no loader opens: the calls above are the only mediated ones. Sockets are
  * closed with SO_LINGER 0, so thousands of connections leave no TIME_WAIT
@@ -57,6 +71,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -328,8 +343,77 @@ static int run(int argc, char **argv) {
     return 0;
 }
 
+/* ----------------------------------------------------------------- launch */
+
+/* vfork, execve(path), wait: the whole launch, timed. ok when the child
+ * exited 0; else e is the execve errno (exit 100 + errno), or -1. */
+static double timed_launch(const char *path, int *ok, int *e) {
+    char *const av[] = { (char *)path, (char *)"noop", NULL };
+    char *const ev[] = { NULL };
+    double t0 = now_us();
+    pid_t pid = vfork();
+    if (pid == 0) {
+        execve(path, av, ev);
+        _exit(100 + (errno & 0x7f));
+    }
+    int st = 0;
+    if (pid < 0 || waitpid(pid, &st, 0) < 0) { *ok = 0; *e = errno; return now_us() - t0; }
+    double us = now_us() - t0;
+    *ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    *e = *ok ? 0 : WIFEXITED(st) && WEXITSTATUS(st) >= 100 ? WEXITSTATUS(st) - 100 : -1;
+    return us;
+}
+
+static int launch(int argc, char **argv) {
+    if (argc != 5) { fprintf(stderr, "usage: bench_workload launch <dir> <n> <warmup>\n"); return 2; }
+    const char *dir = argv[2];
+    int n = atoi(argv[3]), w = atoi(argv[4]);
+    if (n <= 0 || w < 0 || n > 1000000 || w > 1000000) {
+        fprintf(stderr, "bench_workload: bad arguments\n");
+        return 2;
+    }
+    enum { L_OK, L_DENIED, L_OPEN, NL };
+    static const char *LK[NL] = { "launch_allowed", "launch_denied", "open_allowed" };
+    char ok_p[4096], den_p[4096], open_p[4096];
+    snprintf(ok_p, sizeof ok_p, "%s/bin/ok", dir);
+    snprintf(den_p, sizeof den_p, "%s/bin/denied", dir);
+    snprintf(open_p, sizeof open_p, "%s/allowed/f", dir);
+    double *t[NL];
+    struct outcome out[NL];
+    memset(out, 0, sizeof out);
+    for (int k = 0; k < NL; k++) {
+        t[k] = calloc((size_t)n, sizeof(double));
+        if (!t[k]) { fprintf(stderr, "bench_workload: out of memory\n"); return 1; }
+    }
+    for (int i = 0; i < w + n; i++) {
+        for (int k = 0; k < NL; k++) {
+            int ok = 0, e = 0;
+            double us = k == L_OK ? timed_launch(ok_p, &ok, &e) : k == L_DENIED ? timed_launch(den_p, &ok, &e)
+                                  : timed_open(open_p, &ok, &e);
+            note(&out[k], ok, e);
+            if (i >= w) t[k][i - w] = us;
+        }
+    }
+    printf("BENCHW 1 n=%d warmup=%d\n", n, w);
+    for (int k = 0; k < NL; k++) {
+        printf("CLASS %s ok=%lu fail=%lu errnos=", LK[k], out[k].ok, out[k].fail);
+        for (int j = 0; j < 8 && out[k].errn[j]; j++) printf("%s%d:%lu", j ? "," : "", out[k].err[j], out[k].errn[j]);
+        printf("\n");
+    }
+    for (int k = 0; k < NL; k++) {
+        printf("SAMPLES %s", LK[k]);
+        for (int i = 0; i < n; i++) printf(" %.1f", t[k][i]);
+        printf("\n");
+    }
+    printf("END\n");
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
+    if (argc >= 2 && !strcmp(argv[1], "noop")) return 0;                   /* v1.27 */
+    if (argc >= 2 && !strcmp(argv[1], "launch")) return launch(argc, argv);  /* v1.27 */
     if (argc >= 2 && !strcmp(argv[1], "serve")) return serve();
     if (argc >= 2 && !strcmp(argv[1], "run")) return run(argc, argv);
     fprintf(stderr, "usage: %s serve | run <dir> <port-allowed> <port-denied> <port-request> <n> <warmup>\n",
