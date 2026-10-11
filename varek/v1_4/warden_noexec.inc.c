@@ -250,7 +250,29 @@ static int noexec_mount(void) {
             return -1;
         }
     }
+    /* v1.27.1 review: the working directory (which the agent inherits) was
+     * taken before the mounts, so it still points into the mount beneath a
+     * new one, and a relative lookup from it would stay there. Enter it again
+     * by its name, through the new mounts. */
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof cwd) || chdir(cwd) < 0) {
+        fprintf(stderr, "[warden] noexec: cannot enter the working directory again after the mounts "
+                "(%s); refusing to start\n", strerror(errno));
+        return -1;
+    }
     return 0;
+}
+
+/* v1.27.1 review: a descriptor the Warden is about to hand the agent for a
+ * path under a writable directory must be on a noexec mount, however the
+ * path was reached. true when it is not (the open is refused). */
+static bool noexec_breach(const char *resolved, int fd) {
+    if (g_writable_exec || !g_nx_n || !resolved || resolved[0] != '/') return false;
+    bool under = false;
+    for (size_t k = 0; k < g_nx_n && !under; k++) under = noexec_under(resolved, g_nx[k].path);
+    if (!under) return false;
+    struct statvfs sv;
+    return fstatvfs(fd, &sv) < 0 || !(sv.f_flag & ST_NOEXEC);
 }
 
 /* ---- step 4: the record ---- */

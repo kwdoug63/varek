@@ -92,3 +92,22 @@ CMP = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTE
 arr = (ctypes.c_int * 5)(5, 1, 4, 2, 3)
 libc.qsort(arr, 5, ctypes.sizeof(ctypes.c_int), CMP(lambda a, b: a[0] - b[0]))
 say("CALLBACK", "ok" if list(arr) == [1, 2, 3, 4, 5] else "wrong")
+
+# v1.27.1 review: from a working directory inside the writable directory, by
+# a relative name (the working directory must not lead around the mount)
+if os.path.realpath(os.getcwd()) == os.path.realpath(W):
+    try:
+        shutil.copyfile(src, "rel-" + lib)
+        try:
+            ctypes.CDLL("./rel-" + lib)
+            say("REL_LIB_COPY", "loaded")
+        except OSError:
+            say("REL_LIB_COPY", "refused")
+        fd = os.open("rel-" + lib, os.O_RDONLY)
+        try:
+            mmap.mmap(fd, 4096, prot=mmap.PROT_READ | mmap.PROT_EXEC, flags=mmap.MAP_PRIVATE)
+            say("REL_MMAP_EXEC", "mapped")
+        except OSError as e:
+            say("REL_MMAP_EXEC", err(e))
+    except OSError as e:
+        say("REL_OPEN", err(e))

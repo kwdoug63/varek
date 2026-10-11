@@ -911,6 +911,7 @@ static void log_line_start(void);
 static void json_escape(FILE *f, const char *s);
 static void exec_ruleset_record(FILE *f);     /* v1.27: warden_exec.inc.c */
 static void noexec_record(FILE *f);           /* v1.27.1: warden_noexec.inc.c */
+static bool noexec_breach(const char *resolved, int fd);
 struct action;
 static int exec_access_x(int ofd, const struct action *a);   /* v1.27: warden_exec.inc.c */
 
@@ -2533,6 +2534,13 @@ static int materialize_target(pid_t target_pid, const struct action *a,
         return -EACCES;
     }
     if (fd < 0) return -errno;
+    if (noexec_breach(a->resolved, fd)) {          /* v1.27.1 review: fail closed */
+        close(fd);
+        log_line_start();
+        fprintf(g_log, "[warden] noexec: %s is under a writable directory but was reached through a "
+                "mount that is not noexec; refused\n", a->resolved);
+        return -EACCES;
+    }
 
     if (!(want & O_NONBLOCK)) {
         int fl = fcntl(fd, F_GETFL);

@@ -153,6 +153,10 @@ else
     check "a ctypes callback (libffi) works" got on "CALLBACK ok"
     check "the agent goes on, and the Warden exits 0" sh -c "[ \$(wc -l < '$OUT/on.out') -eq 8 ] && grep -q 'noexec: 1 writable directory mounted noexec' '$OUT/on.log'"
     check "the audit accepts the run" python3 "$HERE/tools/varek_audit.py" --policy "$A/p.txt" --checker "$CERT" "$OUT/on.log"
+    # v1.27.1 review: the Warden (and so the agent) started inside the writable directory
+    (cd "$A/w" && env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$A/p.txt" -- /usr/bin/python3 "$A/v1271_probe.py" "$A/w" > "$OUT/cw.out" 2> "$OUT/cw.log")
+    check "from a working directory inside it, a copy by a relative name cannot be loaded or mapped either" \
+        sh -c "grep -qx 'REL_LIB_COPY refused' '$OUT/cw.out' && grep -qx 'REL_MMAP_EXEC refused Operation not permitted' '$OUT/cw.out' && grep -qx 'LIB_COPY refused' '$OUT/cw.out'"
     probe off "allow path $A/w/\n" --writable-exec
     check "with --writable-exec the copy loads, as on v1.27.0" sh -c "grep -qx 'LIB_COPY loaded' '$OUT/off.out' && grep -qx 'MMAP_EXEC mapped' '$OUT/off.out'"
     # a file of the launch set under a writable directory: allowed, but the kernel refuses it
