@@ -97,6 +97,39 @@ else
     check "the Warden reports 1.27.1" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | grep -q 'VAREK Warden  1.27.1'"
 fi
 
+echo "== 2. the mounts =="
+if [ "$(id -u)" != 0 ] || [ -z "$WARDEN" ]; then
+    skip "section 2 (needs root and the warden binary)"
+else
+    M="$(mktemp -d /tmp/varek_v1271m.XXXXXX)"; chmod 755 "$M"
+    mkdir -p "$M/w" "$M/s" "$M/ns" "$M/e"; : > "$M/e/f"; chmod -R 755 "$M"
+    mount -t tmpfs -o size=1m tmpfs "$M/s" && mkdir -p "$M/s/in" && mount -t tmpfs -o size=1m tmpfs "$M/s/in"
+    mount -t tmpfs -o size=1m,nosuid tmpfs "$M/ns"
+    chmod 755 "$M/s" "$M/s/in" "$M/ns"
+    trap 'umount "$M/s/in" "$M/s" "$M/ns" 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $OUT" || rm -rf "$OUT" "${W:-}" "$M"' EXIT
+    # mi <policy body> [warden options]: the agent's /proc/self/mountinfo in $OUT/mi.out
+    mi() { local b="$1"; shift
+           printf 'require warden 1.27\n%ballow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path /proc/ readonly\n' "$b" > "$M/p.txt"
+           chmod 644 "$M/p.txt"
+           (cd "$M" && env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$M/p.txt" "$@" -- /usr/bin/cat /proc/self/mountinfo > "$OUT/mi.out" 2> "$OUT/mi.log"); }
+    opts() { awk -v m="$1" '$5 == m { print $6 }' "$OUT/mi.out" | tail -1; }
+    grep -v " $M" /proc/self/mountinfo | awk '{print $5, $6}' | sort > "$OUT/host.before"
+    mi "allow path $M/w/\nallow path $M/s/\nallow path $M/ns/\nallow path exact $M/e/f\n"
+    check "the agent sees each writable directory mounted noexec" sh -c "awk -v m='$M/w' '\$5 == m' '$OUT/mi.out' | grep -q noexec"
+    check "a mount beneath one is mounted noexec too" sh -c "awk -v m='$M/s/in' '\$5 == m' '$OUT/mi.out' | tail -1 | grep -q noexec"
+    check "a mount's own flags are kept (nosuid)" sh -c "awk -v m='$M/ns' '\$5 == m' '$OUT/mi.out' | tail -1 | grep -q 'nosuid.*noexec\|noexec.*nosuid'"
+    check "an exact path that is a file: the file itself, noexec" sh -c "awk -v m='$M/e/f' '\$5 == m' '$OUT/mi.out' | grep -q noexec"
+    check "the Warden says what it mounted" grep -q 'noexec: 4 writable directories mounted noexec' "$OUT/mi.log"
+    check "a read-only path is not touched" sh -c "! awk -v m='/usr' '\$5 == m' '$OUT/mi.out' | grep -q noexec || awk '\$5 == \"/usr\"' /proc/self/mountinfo | grep -q noexec"
+    grep -v " $M" /proc/self/mountinfo | awk '{print $5, $6}' | sort > "$OUT/host.after"
+    check "the host's mounts are unchanged by the run" sh -c "cmp -s '$OUT/host.before' '$OUT/host.after' && ! grep -q ' $M/w ' /proc/self/mountinfo"
+    mi "allow path $M/w/\n" --writable-exec
+    check "--writable-exec: no noexec mount" sh -c "! awk -v m='$M/w' '\$5 == m' '$OUT/mi.out' | grep -q ."
+    printf 'require warden 1.26\nallow path %s/w/\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path /proc/ readonly\n' "$M" > "$M/p26.txt"; chmod 644 "$M/p26.txt"
+    (cd "$M" && env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$M/p26.txt" -- /usr/bin/cat /proc/self/mountinfo > "$OUT/mi.out" 2> "$OUT/mi.log")
+    check "without the opt-in: no noexec mount" sh -c "! awk -v m='$M/w' '\$5 == m' '$OUT/mi.out' | grep -q ."
+fi
+
 echo
 if [ "$fail" = 0 ]; then echo "test_v1271: PASS ($skips skipped)"; exit 0; fi
 echo "test_v1271: FAIL"; exit 1

@@ -100,6 +100,8 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/vfs.h>
+#include <sys/mount.h>     /* v1.27.1: writable directories mounted noexec */
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -4625,8 +4627,12 @@ int main(int argc, char **argv) {
                 if (g_sk) sodium_free(g_sk);
                 return 1;
             }
-            fprintf(stderr, "[warden] noexec: %zu writable director%s to mount noexec\n", g_nx_n,
-                    g_nx_n == 1 ? "y" : "ies");
+            if (!g_check_only && noexec_mount() < 0) {      /* step 2: before the agent is forked */
+                if (g_sk) sodium_free(g_sk);
+                return 1;
+            }
+            fprintf(stderr, "[warden] noexec: %zu writable director%s %s noexec\n", g_nx_n,
+                    g_nx_n == 1 ? "y" : "ies", g_check_only ? "to mount" : "mounted");
             if (g_check_only)
                 for (size_t k = 0; k < g_nx_n; k++)
                     fprintf(stderr, "[warden]   noexec %s%s (line %d)\n", g_nx[k].path,

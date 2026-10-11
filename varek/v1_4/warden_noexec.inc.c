@@ -171,3 +171,84 @@ static int noexec_build(const struct policy *p, const char *boot_path) {
             }
     return 0;
 }
+
+/* ---- step 2: the mounts ---- */
+
+/* The flags a mount already has, to keep on a remount (a remount may not drop
+ * a locked flag such as nosuid or nodev). */
+static unsigned long noexec_keep_flags(const char *mp) {
+    struct statvfs sv;
+    if (statvfs(mp, &sv) < 0) return 0;
+    unsigned long f = 0;
+    if (sv.f_flag & ST_RDONLY)      f |= MS_RDONLY;
+    if (sv.f_flag & ST_NOSUID)      f |= MS_NOSUID;
+    if (sv.f_flag & ST_NODEV)       f |= MS_NODEV;
+    if (sv.f_flag & ST_NOATIME)     f |= MS_NOATIME;
+    if (sv.f_flag & ST_NODIRATIME)  f |= MS_NODIRATIME;
+    if (sv.f_flag & ST_RELATIME)    f |= MS_RELATIME;
+    return f;
+}
+
+/* A mount point as /proc/self/mountinfo writes it (\040 for a space ...). */
+static void noexec_unescape(char *s) {
+    char *w = s;
+    for (char *r = s; *r; ) {
+        if (r[0] == '\\' && r[1] >= '0' && r[1] <= '3' && r[2] >= '0' && r[2] <= '7' && r[3] >= '0' && r[3] <= '7') {
+            *w++ = (char)((r[1] - '0') * 64 + (r[2] - '0') * 8 + (r[3] - '0'));
+            r += 4;
+        } else *w++ = *r++;
+    }
+    *w = '\0';
+}
+
+/* Remount noexec every mount at or under root (the bind just made, and the
+ * mounts beneath it). 0, or -1 with errno. */
+static int noexec_remount_tree(const char *root) {
+    FILE *mi = fopen("/proc/self/mountinfo", "re");
+    if (!mi) return -1;
+    char line[8192];
+    int rc = 0, done = 0;
+    while (rc == 0 && fgets(line, sizeof line, mi)) {
+        /* id parent major:minor root mountpoint ... */
+        char *save = NULL, *tok = strtok_r(line, " ", &save);
+        for (int k = 0; tok && k < 4; k++) tok = strtok_r(NULL, " ", &save);
+        if (!tok) continue;
+        noexec_unescape(tok);
+        if (!noexec_under(tok, root)) continue;
+        if (mount(NULL, tok, NULL, MS_BIND | MS_REMOUNT | MS_NOEXEC | noexec_keep_flags(tok), NULL) < 0)
+            rc = -1;
+        else done++;
+    }
+    int e = errno;
+    fclose(mi);
+    errno = e;
+    if (rc == 0 && done == 0) { errno = ENOENT; return -1; }
+    return rc;
+}
+
+/* The Warden's own mount namespace, private, with each listed directory
+ * re-mounted noexec. Done before the agent is forked (it inherits the view)
+ * and while the Warden is single-threaded. The host's namespace is not
+ * touched. 0, or -1 with the reason printed (the Warden does not start). */
+static int noexec_mount(void) {
+    if (!g_nx_n) return 0;
+    if (unshare(CLONE_NEWNS) < 0) {
+        fprintf(stderr, "[warden] noexec: cannot make a mount namespace (%s); run as root, or with "
+                "--writable-exec; refusing to start\n", strerror(errno));
+        return -1;
+    }
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
+        fprintf(stderr, "[warden] noexec: cannot make the mount namespace private (%s); refusing to "
+                "start\n", strerror(errno));
+        return -1;
+    }
+    for (size_t k = 0; k < g_nx_n; k++) {
+        const char *d = g_nx[k].path;
+        if (mount(d, d, NULL, MS_BIND | MS_REC, NULL) < 0 || noexec_remount_tree(d) < 0) {
+            fprintf(stderr, "[warden] noexec: cannot mount %s noexec (%s); refusing to start\n", d,
+                    strerror(errno));
+            return -1;
+        }
+    }
+    return 0;
+}
