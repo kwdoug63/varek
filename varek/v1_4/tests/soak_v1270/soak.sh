@@ -75,5 +75,5 @@ echo "soak.sh: $HOURS h, one task every $INTERVAL s (every tenth a probe that mu
 echo "soak.sh: the agent finished (exit $?); checking"
 PK=()
 [ -n "$KEY" ] && [ -e "$KEY.pub" ] && PK=(--pubkey "$KEY.pub")
-python3 "$HERE/soak_check.py" --dir "$OUT" --policy "$POL" --checker "$V14/tools/vdp_cert_check" \
+python3 "$HERE/soak_check.py" --dir "$OUT" --policy "$POL" --checker "$V14/tools/vdp_cert_check" --work "$WK" \
     --hours "$HOURS" --interval "$INTERVAL" "${PK[@]}"

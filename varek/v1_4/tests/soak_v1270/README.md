@@ -31,6 +31,10 @@ must refuse. The run must show:
 | `unlisted` | `/usr/bin/false` | refused, no rule allows it (`default_deny_unknown`) |
 | `denied` | `/usr/bin/env` | refused by the deny rule (`policy_match`) |
 | `written` | a program the agent writes now into a directory whose names a rule allows | refused, not in the launch set (`exec_not_in_ruleset`) |
+| `library` (v1.27.1) | nothing: the agent copies `libm.so.6` into the work directory and tries to load it | refused: the work directory is mounted `noexec` (no record; the kernel refuses the mapping). On v1.27.0 it loads, and the probe fails |
+
+From v1.27.1, `soak_check.py` also requires `run_start`'s `noexec` to hold
+the work directory.
 
 ## Running it
 
