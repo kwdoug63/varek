@@ -3,7 +3,7 @@
 > The review was done by AI review agents; a human or third-party review
 > has not been done.
 
-Draft, not released · MIT · github.com/kwdoug63/varek
+Released 2026-10-11 · MIT · github.com/kwdoug63/varek
 
 ## Summary
 
