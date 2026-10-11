@@ -255,6 +255,10 @@ PY
     check "a run with require warden 1.27: the agent runs in the Landlock domain" grep -qx 'AGENT ok' "$OUT/log/r1.out"
     check "run_start records the Landlock ABI" rs "$OUT/log/r1.log" 'r["landlock"]["abi"] >= 1'
     check "run_start names this Warden (1.27.0)" rs "$OUT/log/r1.log" 'r["warden"] == "1.27.0"'
+    printf 'import os\nfor p in (0, -1):\n    try:\n        os.kill(p, 0); print("KILL", p, "ok")\n    except OSError as e:\n        print("KILL", p, "refused")\nos.kill(os.getpid(), 0); print("KILL self ok", flush=True)\n' > "$W/k.py"; chmod 644 "$W/k.py"
+    run rk "$POLR" /usr/bin/python3 "$W/k.py"
+    check "kill: the agent may signal a process by pid, not its group or every process (0, -1)" \
+        sh -c "grep -qx 'KILL 0 refused' '$OUT/log/rk.out' && grep -qx 'KILL -1 refused' '$OUT/log/rk.out' && grep -qx 'KILL self ok' '$OUT/log/rk.out'"
     check "and each file: its name, canonical path, device, inode and SHA-256" \
         rs "$OUT/log/r1.log" "(lambda e, st: e and e['path'] == '$W/bin/a1' and e['dev'] == st.st_dev and e['ino'] == st.st_ino and e['sha256'] == sha('$W/bin/a1') and e['why'] == 'rule' and e['policy_line'] == 3)(ent('$W/bin/a1'), os.stat('$W/bin/a1'))"
     check "a symlink's name with its file's path" \
@@ -466,6 +470,19 @@ else
     check "every allowed launch has one exec_result" \
         xrec "sorted(r['decision_seq'] for r in recs if r.get('event') == 'exec_result') == sorted(r['seq'] for r in ex if r['rule'] == 'exec_allowed')"
     check "no process was killed in an ordinary run" xrec "not any(r.get('rule') == 'exec_identity_mismatch' for r in recs) and not any(r.get('exec_identity_mismatch') for r in recs)"
+    # v1.27 review: two threads of one process launching two allowed programs at
+    # once (one launch wins and ends the other thread) must not be a mismatch
+    if cc -O2 -pthread -o "$D/two" "$HERE/tests/v1270_two_threads.c" 2>/dev/null; then
+        chmod 755 "$D/two"
+        printf 'require warden 1.27\nallow exec /usr/bin/echo\nallow exec /usr/bin/true\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/two readonly\n' "$D" > "$D/p2t"
+        chmod 644 "$D/p2t"
+        (cd "$D" && env -i PATH=/usr/bin:/bin timeout 300 "$WARDEN" "$D/p2t" -- "$D/two" > "$OUT/two.out" 2> "$OUT/two.log"); trc=$?
+        check "two threads launching allowed programs at once: none killed, the Warden exits 0" \
+            sh -c "[ $trc -eq 0 ] && grep -qx 'RESULT ok 100 killed 0 other 0' '$OUT/two.out' && ! grep -q '\"rule\":\"exec_identity_mismatch\"' '$OUT/two.log'"
+        check "and the audit accepts the run" python3 "$HERE/tools/varek_audit.py" --policy "$D/p2t" --checker "$CERT" "$OUT/two.log"
+    else
+        skip "two threads launching at once (no C compiler)"
+    fi
     # the test hook: the Warden takes the next allowed launch's image to be another file
     (cd "$D" && env -i PATH=/usr/bin:/bin VAREK_WARDEN_TEST_EXEC_MISMATCH=1 timeout 120 "$WARDEN" "$D/p3" -- \
         /usr/bin/python3 "$D/agent.py" first:run:/usr/bin/git:--version after:run:/usr/bin/git:--version \

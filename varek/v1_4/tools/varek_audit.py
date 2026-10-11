@@ -289,7 +289,10 @@ def check_exec_set(meta, launches, problems):
 
 
 EXEC_REFUSALS = ("policy_match", "default_deny_unknown", "certificate_refused", "exec_no_landlock",
-                 "exec_not_in_ruleset", "exec_unresolved")
+                 "exec_not_in_ruleset", "exec_unresolved",
+                 # v1.27 review: a launch by a thread another thread's launch is ending:
+                 # its path cannot be read, or its image (the call is refused, nothing run)
+                 "intent_derivation_failed", "exec_identity_unreadable")
 EXEC_RESULTS = ("launched", "failed", "gone", "killed")
 
 

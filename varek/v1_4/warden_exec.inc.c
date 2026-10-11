@@ -663,13 +663,33 @@ static bool exec_identity(int notify_fd, const struct seccomp_notif *req, struct
     snprintf(ep, sizeof ep, "/proc/%d/exe", tid);
     const char *why = NULL;
     if (stat(ep, &st) < 0) why = "exec_identity_unreadable";
-    for (size_t k = 0; !why && k < g_nxp; ) {
+    /* The process's pending launches (one per thread that asked). If it now
+     * runs the file one of them decided, that launch happened, and the others
+     * cannot have (a launch ends every other thread): launched, and failed.
+     * Else each must still run the image it asked from: a launch whose own
+     * thread is back, or gone, failed; one whose thread is still in its
+     * launch is kept. Anything else is a mismatch. */
+    bool group = false, hit = false, seen = false;
+    for (size_t k = 0; k < g_nxp; k++) {
+        struct exec_pend *x = &g_xp[k];
+        if (x->tid != tid && x->tgid != tid) continue;
+        group = true;
+        if (st.st_dev == x->edev && st.st_ino == x->eino) hit = true;
+    }
+    for (size_t k = 0; !why && group && k < g_nxp; ) {
         struct exec_pend *x = &g_xp[k];
         if (x->tid != tid && x->tgid != tid) { k++; continue; }
-        if (st.st_dev == x->edev && st.st_ino == x->eino) { exec_pend_drop(k, "launched"); continue; }
+        if (hit) {                            /* one launch happened; any others failed */
+            bool mine = !seen && st.st_dev == x->edev && st.st_ino == x->eino;
+            if (mine) seen = true;
+            exec_pend_drop(k, mine ? "launched" : "failed");
+            continue;
+        }
         if (st.st_dev == x->odev && st.st_ino == x->oino) {
-            if (tid == x->tid) { exec_pend_drop(k, "failed"); continue; }   /* the launching thread, back */
-            k++;
+            char tp[64];
+            snprintf(tp, sizeof tp, "/proc/%d/task/%d", (int)x->tgid, (int)x->tid);
+            if (tid == x->tid || access(tp, F_OK) != 0) { exec_pend_drop(k, "failed"); continue; }
+            k++;                              /* its thread is still in its launch */
             continue;
         }
         why = "exec_identity_mismatch";
@@ -677,6 +697,18 @@ static bool exec_identity(int notify_fd, const struct seccomp_notif *req, struct
     const struct exec_file *e = why ? NULL : exec_rs_find(st.st_dev, st.st_ino);
     if (!why && !(e && e->image)) why = "exec_identity_mismatch";
     if (!why) return false;
+    if (!strcmp(why, "exec_identity_unreadable")) {
+        /* A live process's image is always readable here (the Warden is
+         * root); it is not only while the thread is being torn down, as
+         * another thread's launch ends it. Refuse the call; nothing to kill. */
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        uint64_t lat = (uint64_t)(t1.tv_sec - t0->tv_sec) * 1000000000ULL + (uint64_t)(t1.tv_nsec - t0->tv_nsec);
+        a->extra[0] = '\0';
+        emit_pathology(g_report_seq++, tid, a, DEC_DENY, DEC_DENY, why, lat, EACCES);
+        send_simple(notify_fd, req->id, DEC_DENY);
+        return true;
+    }
     /* kill the process (it is blocked in this call, so its pid is its own) */
     pid_t tgid = task_tgid(tid);
     int pfd = tgid > 0 ? (int)syscall(__NR_pidfd_open, tgid, 0) : -1;
