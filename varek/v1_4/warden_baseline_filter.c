@@ -413,11 +413,11 @@ static int build(scmp_filter_ctx *out_ctx, int observe) {
     if ((rc = add_sends(ctx)) < 0) goto fail;                 // v1.21
     if ((rc = add_setsockopt(ctx)) < 0) goto fail;            // v1.21
     // v1.27: kill, which subprocess uses to stop a child on a timeout, for a
-    // pid of 1 to 2^31-1 only (the int the kernel reads). The agent has no PID
-    // namespace of its own: kill(0), kill(-1) and kill(-pgid) would signal
-    // every process of its user (nobody by default) or a whole group, and fall
-    // to the default refusal. A positive pid reaches what tgkill, admitted
-    // since v1.12, already reaches: a process of the agent's own user.
+    // pid of 1 to 2^31-1 only (the int the kernel reads). The agent runs as
+    // init of its own PID namespace (v1.9.3) and in its own process group, so
+    // any kill reaches only its own processes; kill(0), kill(-1) and
+    // kill(-pgid) fall to the default refusal all the same, for a run with
+    // VAREK_WARDEN_NO_PIDNS=1, where -1 would reach every process of its user.
     if ((rc = allow_int_range(ctx, SCMP_SYS(kill), 0, 1, 0x7fffffffull, NULL)) < 0) goto fail;
     if ((rc = add_list(ctx, kAdmit, SCMP_ACT_ALLOW)) < 0) goto fail;
     if ((rc = deny_ns_bits(ctx, SCMP_SYS(clone))) < 0) goto fail;

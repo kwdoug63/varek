@@ -34,9 +34,11 @@ directories leading to an allowed path, and of descriptors the agent already
 holds, are answered without a decision. Since v1.21.0 a connect is decided on the
 destination the Warden copied once, and an allowed one is dialed by the Warden
 and handed to the agent as a connected socket; the agent's own network namespace
-stays empty. A datagram send that names a destination, and every launch after the
-agent's own, are refused whatever the policy says; a send with no destination
-goes to the peer of a connect the Warden decided. Every verdict is one of three — **SATISFIED**,
+stays empty. A datagram send that names a destination is refused whatever the
+policy says; a send with no destination goes to the peer of a connect the Warden
+decided. Every launch after the agent's own is refused too, unless the policy
+opts in with `require warden 1.27` (v1.27.0): then each is decided, and the
+kernel's Landlock holds the agent to the programs the policy allows. Every verdict is one of three — **SATISFIED**,
 **UNSATISFIED**, or **UNKNOWN** — and it fails closed: a paused call that cannot
 be proven allowed never runs. System calls the kernel filter admits without
 asking (memory, time, threads, and reads and writes on descriptors the agent
@@ -119,6 +121,7 @@ The runtime line has progressed well beyond simple syscall containment:
   "Never requires a human" becomes certified rather than hoped. Since v1.18.0 the
   Warden runs it on the `--flow-policy` at startup and refuses to start if it
   fails.
+- **v1.27.0 — decided program launches (release candidate).** Through v1.26.1 every launch after the agent's own was refused, so an agent could not run `git`, `python3` or a compiler even where the policy named them. With `require warden 1.27`, `allow exec` rules take effect: at startup the Warden expands them to the files they admit (with each dynamic program's loader) and the agent runs in a Landlock domain that lets it launch those files and no others; each launch is decided on its name by the SMT decision procedure, with a certificate, and recorded with the file's startup hash; before the Warden answers any call of a launched process it checks the process runs a program it decided to run, and kills it otherwise. Without Landlock, launches stay refused. gcc compiles and links under the Warden; a 24-hour soak passed. Libraries are not decided (planned for v1.27.1). See [`RELEASE-v1.27.0.md`](./RELEASE-v1.27.0.md).
 - **v1.26.1 — the egress proxy's inspecting mode.** In SNI mode the Warden decides which site the agent connects to, but not what it asks there: inside TLS a request for any path, or with a `Host` for another site on the same CDN, went through. With `proxy inspect`, the proxy (now its own binary, `warden-proxy`, loaded into a sealed memfd and recorded by hash) verifies each server, terminates the agent's TLS with a CA made for the run and name-constrained to the policy's names, and reports every request; the Warden decides its method, path and query against `allow|deny request METHOD URL [max_body=N]` rules with the SMT decision procedure and certifies it before a byte of it is sent. Requests a server could read as another path are refused, bodies are bounded by `max_body` and recorded by length and SHA-256 (never stored), and hosts whose clients pin certificates can stay in SNI mode (`proxy passthrough host`). The agent's usual clients (Python, curl, Node.js, Java) trust the run's CA without changes. Every request is a chained record the audit asks of the policy again; `varek refusals`, the CycloneDX export and `varek bench --proxy` cover it. Reviewed by AI review agents. See [`RELEASE-v1.26.1.md`](./RELEASE-v1.26.1.md).
 - **v1.26.0 — the egress proxy, SNI mode.** v1.24 and v1.25 decide a connect on its address, so an allowed name on a shared CDN address also reached every other site there. With `proxy on` (after `require warden 1.26`), connects on ports 80 and 443 (or `proxy ports`) are decided on the name the client asks for: a separate, unprivileged proxy reads the TLS SNI, the HTTP `Host` or a `CONNECT`, and the Warden decides that name with the SMT decision procedure, certifies it, dials only an address the name resolves to, and passes the socket to the proxy to relay. Names allowed only on proxied ports get synthetic addresses, so the agent sends no DNS for them. Plain HTTP is checked request by request; Encrypted Client Hello and QUIC on proxied ports are refused. `proxy upstream http://HOST:PORT` chains to a customer's egress proxy after the Warden decides. Every hand-off, decision and close is a chained record the audit checks. Reviewed by AI review agents. See [`RELEASE-v1.26.0.md`](./RELEASE-v1.26.0.md).
 - **v1.25.0 — wildcard host names, opt-in.** v1.24 needed every name listed in advance, so an agent that reaches per-tenant names (`acme.api.example.com`) could not be supported. A policy can now allow every name under a domain: `allow host *.example.com:443 acknowledge=dns-channel`, after `require warden 1.25`. Under a wildcard the agent's lookups have to leave the host, so the rule is opt-in and says so: without `acknowledge=dns-channel` the policy is refused. A wildcard over a domain where anyone can create a name (a public suffix, the Public Suffix List's private section, or a VAREK list of 56 multi-tenant domains such as `my.salesforce.com` and `slack.com`, or a domain above one of these) is refused at load. The agent's lookups go to a stub resolver the Warden runs in the agent's own network namespace: a name no rule allows gets NXDOMAIN and nothing leaves the host, and a name a wildcard allows is looked up by the Warden and recorded. Each wildcard rule has budgets (256 new names a run and 30 lookups upstream a minute by default), every question is a chained record, and the audit checks every charge. A connect is decided over every name its address belongs to, with no limit. See [`RELEASE-v1.25.0.md`](./RELEASE-v1.25.0.md).
@@ -153,7 +156,7 @@ The runtime line has progressed well beyond simple syscall containment:
   1,889 times in 20,000 attempts on a 2-vCPU host, re-measured for v1.18.0; the
   510 quoted here before has no record); the resolve-and-inject strategy leaked 0. `connect`/`execve`
   are deny-only (fail closed) pending the v1.10 dial-and-inject path
-  (connects: shipped in v1.21.0; launches after the first stay refused). See
+  (connects: shipped in v1.21.0; launches, opt-in, in v1.27.0). See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
 See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.17.0 history.
@@ -499,7 +502,7 @@ different risks at different points in the stack.
 - [x] **v1.25.0** — Wildcard host names, opt-in (`allow host *.example.com:443 acknowledge=dns-channel`): shared domains where anyone can register names refused at load, lookups answered by the Warden and bounded per rule ([design](./docs/security/v1.25-wildcard-host-names.md))
 - [x] **v1.26.0** (v1.21 stage 3) — The egress proxy, SNI mode (`proxy on`): decisions on the name the agent asks for (TLS SNI, HTTP Host), closing the shared-CDN gap on proxied ports with no agent DNS; chaining to a customer proxy (`proxy upstream`) ([design](./docs/security/v1.26-egress-proxy.md))
 - [x] **v1.26.1** — The egress proxy's opt-in inspecting mode (`proxy inspect`): TLS terminated with a name-constrained CA made for the run, servers verified, every request's method, path and query decided by request rules before it is sent, `max_body`, passthrough hosts for pinned clients ([design](./docs/security/v1.26.1-inspecting-mode.md))
-- [ ] **v1.27.0** (in progress) — Decided program launches, opt-in with `require warden 1.27`: `allow exec` rules take effect, enforced by a Landlock execute ruleset built from the policy, each launch decided and recorded by the Warden and checked against the file decided ([design](./docs/security/v1.27-program-launches.md))
+- [ ] **v1.27.0** (release candidate) — Decided program launches, opt-in with `require warden 1.27`: `allow exec` rules take effect, enforced by a Landlock execute ruleset built from the policy, each launch decided and recorded by the Warden and checked against the file decided ([design](./docs/security/v1.27-program-launches.md))
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
 
@@ -540,7 +543,8 @@ Race-free network mediation (a supervisor-dials-and-injects path replacing the
 v1.9.1 deny-only posture for `connect`) shipped in v1.21.0 and host names (stage 2)
 in v1.24.0, wildcard names in v1.25.0, and the egress proxy in SNI mode
 (stage 3) in v1.26.0, and its inspecting mode, with rules on each request's
-method, path and query, in v1.26.1. The default-deny
+method, path and query, in v1.26.1. Decided program launches, held by a
+Landlock execute ruleset built from the policy, follow in v1.27.0. The default-deny
 syscall allowlist closing the alternate-ABI and variant-syscall bypass classes
 shipped in v1.9.2, and supervisor/target lifecycle coupling shipped in the live
 Warden in v1.9.3.
@@ -579,7 +583,10 @@ answers `ENOSYS` rather than killing, so Node.js runs). Decided connections
 destination-swap race: 2,000 attempts, 0 reached the denied side (`make
 test-v1210`). Inspecting mode (v1.26.1) is tested with Python, curl, Node.js
 and Java against servers that log what reaches them, and with forged
-streams the audit must refuse (`make test-v1261`, 193 checks). Build and run with `make check`
+streams the audit must refuse (`make test-v1261`, 193 checks). Decided launches
+(v1.27.0) are tested with real launches, a compile, a measured table of what the
+kernel's Landlock refuses, two threads launching at once, and forged streams
+(`make test-v1270`, 164 checks). Build and run with `make check`
 in the relevant version directory. Containment verification: `python
 verify_guardrails.py` (see above).
 
@@ -618,7 +625,7 @@ platform-gating CI coverage (now macOS, Windows, Linux).
 
 - **Spec paper:** [`varek-spec-paper-v1.26.1.md`](./varek-spec-paper-v1.26.1.md) — language and runtime specification, design rationale, the verdict model
 - **VAREK Enterprise on AWS:** [`docs/aws-deployment-guide.md`](./docs/aws-deployment-guide.md) — deploying and operating the [AWS Marketplace](https://aws.amazon.com/marketplace/pp/prodview-6fdmjpuimvx64) image
-- **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`docs/security/bypass-classes.md`](./docs/security/bypass-classes.md), [`RELEASE-v1.26.1.md`](./RELEASE-v1.26.1.md), [`RELEASE-v1.26.0.md`](./RELEASE-v1.26.0.md), [`RELEASE-v1.25.0.md`](./RELEASE-v1.25.0.md), [`RELEASE-v1.24.0.md`](./RELEASE-v1.24.0.md), [`RELEASE-v1.17.0.md`](./RELEASE-v1.17.0.md), [`RELEASE-v1.12.1.md`](./RELEASE-v1.12.1.md), [`RELEASE-v1.12.0.md`](./RELEASE-v1.12.0.md), [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md), [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
+- **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`docs/security/bypass-classes.md`](./docs/security/bypass-classes.md), [`RELEASE-v1.27.0.md`](./RELEASE-v1.27.0.md), [`RELEASE-v1.26.1.md`](./RELEASE-v1.26.1.md), [`RELEASE-v1.26.0.md`](./RELEASE-v1.26.0.md), [`RELEASE-v1.25.0.md`](./RELEASE-v1.25.0.md), [`RELEASE-v1.24.0.md`](./RELEASE-v1.24.0.md), [`RELEASE-v1.17.0.md`](./RELEASE-v1.17.0.md), [`RELEASE-v1.12.1.md`](./RELEASE-v1.12.1.md), [`RELEASE-v1.12.0.md`](./RELEASE-v1.12.0.md), [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md), [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
 - **Verification notes:** [`docs/verification/`](./docs/verification/README.md) — the v1.10/v1.11 program
 - **Changelog:** [`CHANGELOG.md`](./CHANGELOG.md)
 - **Website:** [varek-lang.org](https://varek-lang.org)
