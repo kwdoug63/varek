@@ -130,6 +130,40 @@ else
     check "without the opt-in: no noexec mount" sh -c "! awk -v m='$M/w' '\$5 == m' '$OUT/mi.out' | grep -q ."
 fi
 
+echo "== 3. what the agent sees =="
+if [ "$(id -u)" != 0 ] || [ -z "$WARDEN" ]; then
+    skip "section 3 (needs root and the warden binary)"
+else
+    A="$(mktemp -d /tmp/varek_v1271a.XXXXXX)"; chmod 755 "$A"; mkdir -p "$A/w" "$A/bin"; chmod 755 "$A/w" "$A/bin"
+    cp "$HERE/tests/v1271_probe.py" "$A/"; chmod 644 "$A/v1271_probe.py"
+    trap 'umount "${M:-/nonexistent}/s/in" "${M:-/nonexistent}/s" "${M:-/nonexistent}/ns" 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $OUT" || rm -rf "$OUT" "${W:-}" "${M:-}" "$A"' EXIT
+    BASE="allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path /proc/ readonly\nallow path $A/v1271_probe.py readonly\n"
+    probe() { local o="$1" b="$2"; shift 2
+              rm -rf "$A/w"/*; printf 'require warden 1.27\n%b%b' "$b" "$BASE" > "$A/p.txt"; chmod 644 "$A/p.txt"
+              (cd "$A" && env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$A/p.txt" "$@" -- /usr/bin/python3 "$A/v1271_probe.py" "$A/w" > "$OUT/$o.out" 2> "$OUT/$o.log"); }
+    probe on "allow path $A/w/\n"
+    got() { grep -qx "$2" "$OUT/$1.out"; }
+    check "a system library at its own path loads" got on "LIB_ORIGINAL loaded"
+    check "a copy of it in a writable directory cannot be loaded" got on "LIB_COPY refused"
+    check "a copy of a Python extension module cannot be imported" sh -c "grep -qx 'EXT_COPY refused' '$OUT/on.out' || grep -qx 'EXT_COPY skipped' '$OUT/on.out'"
+    check "a pure-Python module written there imports" got on "PURE_PY imported"
+    check "mmap with PROT_EXEC of a file there: EPERM" got on "MMAP_EXEC refused Operation not permitted"
+    check "mprotect adding PROT_EXEC to a mapping of it: EACCES" got on "MPROTECT_EXEC refused Permission denied"
+    check "anonymous memory may still be made executable" got on "ANON_EXEC mapped"
+    check "a ctypes callback (libffi) works" got on "CALLBACK ok"
+    check "the agent goes on, and the Warden exits 0" sh -c "[ \$(wc -l < '$OUT/on.out') -eq 8 ] && grep -q 'noexec: 1 writable directory mounted noexec' '$OUT/on.log'"
+    check "the audit accepts the run" python3 "$HERE/tools/varek_audit.py" --policy "$A/p.txt" --checker "$CERT" "$OUT/on.log"
+    probe off "allow path $A/w/\n" --writable-exec
+    check "with --writable-exec the copy loads, as on v1.27.0" sh -c "grep -qx 'LIB_COPY loaded' '$OUT/off.out' && grep -qx 'MMAP_EXEC mapped' '$OUT/off.out'"
+    # a file of the launch set under a writable directory: allowed, but the kernel refuses it
+    cp /usr/bin/true "$A/bin/t"; chmod 755 "$A/bin/t"
+    printf 'import subprocess\ntry:\n    print("LAUNCH", subprocess.run(["%s/bin/t"]).returncode, flush=True)\nexcept OSError as e:\n    print("LAUNCH refused", e.errno, flush=True)\n' "$A" > "$A/v1271_probe.py"
+    printf 'require warden 1.27\nallow exec %s/bin/t\nallow path %s/bin/\n%b' "$A" "$A" "$BASE" > "$A/p.txt"; chmod 644 "$A/p.txt"
+    (cd "$A" && env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$A/p.txt" -- /usr/bin/python3 "$A/v1271_probe.py" > "$OUT/l.out" 2> "$OUT/l.log")
+    check "a launch-set file under a writable directory: reported, and the kernel refuses its launch (EACCES)" \
+        sh -c "grep -qx 'LAUNCH refused 13' '$OUT/l.out' && grep -q 'it will not launch' '$OUT/l.log' && grep -Eq '\"result\":\"(failed|gone)\"' '$OUT/l.log'"
+fi
+
 echo
 if [ "$fail" = 0 ]; then echo "test_v1271: PASS ($skips skipped)"; exit 0; fi
 echo "test_v1271: FAIL"; exit 1
