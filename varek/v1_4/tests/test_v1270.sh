@@ -50,6 +50,12 @@
 #      ENOENT (open_not_found), under a missing directory too; without the
 #      opt-in both refused as before; a compile (cc, cc1, as, collect2, ld)
 #      runs under the Warden with each launch decided
+#   7. the measured table (as root; open item 1, from the review): in a
+#      Landlock domain granting execute on one program, the kernel refuses a
+#      program not in the set, a file written during the run, an O_TMPFILE or
+#      unlinked file through /proc/self/fd or execveat, a file in /dev/shm,
+#      and the loader given a written file; an agent under the Warden cannot
+#      make a memfd (tests/landlock_table.sh)
 #
 # Usage: test_v1270.sh <vdp_check> <vdp_cert_check> [<warden>]
 set -u
@@ -675,6 +681,19 @@ PY
         check "the audit accepts the compile's run" python3 "$HERE/tools/varek_audit.py" --policy "$D/pcc" --checker "$CERT" "$OUT/cc.log"
     else
         skip "a compile (no cc, cc1, as and ld here)"
+    fi
+fi
+
+echo "== 7. the measured table =="
+if [ "$(id -u)" != 0 ] || [ -z "$WARDEN" ]; then
+    skip "section 7 (needs root and the warden binary)"
+else
+    "$HERE/tests/landlock_table.sh" "$WARDEN" > "$OUT/llt.out" 2>&1; lrc=$?
+    if [ $lrc = 2 ]; then skip "the measured table ($(tail -1 "$OUT/llt.out"))"
+    else
+        check "the kernel refuses every launch outside the set the table names (open item 1)" \
+            sh -c "[ $lrc = 0 ] && ! grep -q 'FAIL' '$OUT/llt.out'"
+        check "an agent under the Warden cannot make a memfd" grep -q 'verdict|ok' "$OUT/llt.out"
     fi
 fi
 
