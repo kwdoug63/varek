@@ -48,6 +48,38 @@ def load(path):
     return out
 
 
+KEEP = ("seq", "resolved", "rule", "decision_final", "timestamp_ns", "latency_us", "exe")
+
+
+def load_verdicts(path):
+    """The Warden's stream, a line at a time, keeping only what is judged:
+    run_start, run_end, the launches (a few fields each), exec_result and any
+    kill. A day's stream does not fit in a small host's memory whole, and the
+    audit runs after this, in its own process."""
+    v = {"start": None, "end": None, "launches": [], "results": {}, "killed": [], "n": 0}
+    with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+        for line in fh:
+            if not line.startswith("{"):
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            v["n"] += 1
+            ev = r.get("event")
+            if ev == "run_start" and v["start"] is None:
+                v["start"] = r
+            elif ev == "run_end":
+                v["end"] = r
+            elif ev == "exec_result":
+                v["results"][r.get("decision_seq")] = r.get("result")
+            if r.get("action") == "process.exec" and r.get("rule") != "bootstrap_exec_allow":
+                v["launches"].append({k: r.get(k) for k in KEEP})
+            if r.get("rule") == "exec_identity_mismatch":
+                v["killed"].append({k: r.get(k) for k in KEEP})
+    return v
+
+
 def pct(v, q):
     v = sorted(v)
     return v[min(len(v) - 1, int(len(v) * q))] if v else -1
@@ -65,19 +97,18 @@ def main():
     a = ap.parse_args()
     out, problems = [], []
     say = out.append
-    recs = load(os.path.join(a.dir, "verdicts.log"))
+    vd = load_verdicts(os.path.join(a.dir, "verdicts.log"))
     turns = load(os.path.join(a.dir, "agent.jsonl"))
 
     # 1. duration, cadence, Landlock and the launch set
-    start = next((r for r in recs if r.get("event") == "run_start"), None)
-    end = next((r for r in recs if r.get("event") == "run_end"), None)
+    start, end = vd["start"], vd["end"]
     dur = (end["timestamp_ns"] - start["timestamp_ns"]) / 1e9 if start and end else 0.0
     if not start or not end:
         problems.append("the stream has no run_start or no run_end (the run did not finish)")
     tasks = [t for t in turns if "task" in t]
     probes = [t for t in turns if "probe" in t]
     say(f"run: {dur / 3600:.2f} h (asked {a.hours:g} h); {len(tasks)} tasks ({sum(1 for t in tasks if t.get('ok'))} ok) "
-        f"and {len(probes)} probes; {len(recs)} records")
+        f"and {len(probes)} probes; {vd['n']} records")
     if start:
         ll, ex = start.get("landlock"), start.get("exec_ruleset")
         if not isinstance(ll, dict) or not isinstance(ex, list):
@@ -94,11 +125,7 @@ def main():
     if len(turns) < want * 0.98:
         problems.append(f"{len(turns)} turns, fewer than the {want:.0f} expected")
 
-    launches = [r for r in recs if r.get("action") == "process.exec" and r.get("rule") != "bootstrap_exec_allow"]
-    results = {}
-    for r in recs:
-        if r.get("event") == "exec_result":
-            results[r.get("decision_seq")] = r.get("result")
+    launches, results = vd["launches"], vd["results"]
 
     # 2. tasks: each of their launches allowed and seen; probes are judged below
     probe_paths = {t["path"] for t in probes}
@@ -153,7 +180,7 @@ def main():
         problems.append("no probes ran")
 
     # 4. no kill, and the Warden's time per program
-    killed = [r for r in recs if r.get("rule") == "exec_identity_mismatch"]
+    killed = vd["killed"]
     if killed:
         problems.append(f"{len(killed)} process(es) killed by the identity check (first: {killed[0].get('exe')!r})")
     lat = {}

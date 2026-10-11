@@ -1602,11 +1602,16 @@ static int relay_agent_stderr(int fd, bool drain_all) {
     return 0;
 }
 
+#define WARDEN_VSTR_(x) #x
+#define WARDEN_VSTR(x) WARDEN_VSTR_(x)
+#define WARDEN_VERSION WARDEN_VSTR(VDP_WARDEN_MAJOR) "." WARDEN_VSTR(VDP_WARDEN_MINOR) ".0"
+
 static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.26.1\","
+    /* the version is one literal, so `varek version` can read it from the binary */
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"" WARDEN_VERSION "\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,

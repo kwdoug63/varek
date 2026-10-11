@@ -254,6 +254,7 @@ PY
     run r1 "$POLR" /usr/bin/python3 "$W/a.py"
     check "a run with require warden 1.27: the agent runs in the Landlock domain" grep -qx 'AGENT ok' "$OUT/log/r1.out"
     check "run_start records the Landlock ABI" rs "$OUT/log/r1.log" 'r["landlock"]["abi"] >= 1'
+    check "run_start names this Warden (1.27.0)" rs "$OUT/log/r1.log" 'r["warden"] == "1.27.0"'
     check "and each file: its name, canonical path, device, inode and SHA-256" \
         rs "$OUT/log/r1.log" "(lambda e, st: e and e['path'] == '$W/bin/a1' and e['dev'] == st.st_dev and e['ino'] == st.st_ino and e['sha256'] == sha('$W/bin/a1') and e['why'] == 'rule' and e['policy_line'] == 3)(ent('$W/bin/a1'), os.stat('$W/bin/a1'))"
     check "a symlink's name with its file's path" \
