@@ -12,8 +12,10 @@
 
 struct noexec_dir {
     char *path;            /* canonical, absolute; a directory, or a file (an exact rule's) */
+    char *target;          /* the rule's own directory (or file), as noexec_target computes it */
     int   line;            /* the policy line that makes it writable */
     bool  file;            /* a file, bind-mounted on itself */
+    bool  missing;         /* v1.27.1 review: not there at start; nothing mounted, opens refused */
 };
 static struct noexec_dir g_nx[NOEXEC_MAX];
 static size_t g_nx_n;
@@ -52,10 +54,14 @@ static void noexec_parent(char *s) {
 
 /* The directory (or file) one writable rule asks to mount, into out, or
  * an empty string to skip the rule (a constant that matches no absolute
- * path). -1: a rule that cannot be bounded (suffix, contains). */
-static int noexec_target(const vdp_rule_t *r, char *out, size_t on) {
+ * path). -1: a rule that cannot be bounded (suffix, contains, a glob that
+ * starts with a wildcard). *exact: the rule names one path (an exact rule,
+ * or a glob with no wildcard), so a file may be the target, or, if it is not
+ * there yet, its directory (D3). */
+static int noexec_target(const vdp_rule_t *r, char *out, size_t on, bool *exact) {
     const char *c = r->s.c;
     out[0] = '\0';
+    *exact = false;
     switch (r->s.op) {
     case VDP_STR_SUFFIX:
     case VDP_STR_CONTAINS:
@@ -63,6 +69,7 @@ static int noexec_target(const vdp_rule_t *r, char *out, size_t on) {
     case VDP_STR_EQ:
         if (c[0] != '/') return 0;
         snprintf(out, on, "%s", c);
+        *exact = true;
         return 0;
     case VDP_STR_PREFIX: {
         if (c[0] != '/') return 0;
@@ -77,19 +84,38 @@ static int noexec_target(const vdp_rule_t *r, char *out, size_t on) {
         for (; c[k] && c[k] != '*' && c[k] != '?' && c[k] != '[' && c[k] != '\\' && k < on - 1; k++)
             out[k] = c[k];
         out[k] = '\0';
-        if (out[0] != '/') { out[0] = '\0'; return -1; }     /* a glob from a wildcard: anywhere */
+        if (k == 0) return -1;                              /* a glob from a wildcard: anywhere */
+        if (out[0] != '/') { out[0] = '\0'; return 0; }      /* relative: matches no absolute path */
         if (c[k]) {                                          /* to the directory before the wildcard */
             char *sl = strrchr(out, '/');
             if (sl == out) out[1] = '\0'; else *sl = '\0';
         } else {
             size_t n = strlen(out);                          /* a glob with no wildcard: an exact path */
             if (n > 1 && out[n - 1] == '/') out[n - 1] = '\0';
+            *exact = true;                                   /* v1.27.1 review: as an exact rule */
         }
         return 0;
     }
     default:
         return 0;
     }
+}
+
+/* A path that is not there: its nearest existing ancestor, canonical, and
+ * the rest of the name after it. 0, or -1. */
+static int noexec_canon_missing(const char *t, char *out, size_t on) {
+    char head[PATH_MAX], real[PATH_MAX];
+    snprintf(head, sizeof head, "%s", t);
+    for (;;) {
+        char *sl = strrchr(head, '/');
+        if (!sl) return -1;
+        if (sl == head) { head[0] = '\0'; snprintf(real, sizeof real, "/"); break; }
+        *sl = '\0';
+        if (realpath(head, real)) break;
+    }
+    const char *rest = t + strlen(head);                     /* starts with '/' */
+    if ((size_t)snprintf(out, on, "%s%s", strcmp(real, "/") ? real : "", rest) >= on) return -1;
+    return 0;
 }
 
 /* Build the list (launches on, the mounts not turned off). 0, or -1 with
@@ -100,7 +126,8 @@ static int noexec_build(const struct policy *p, const char *boot_path) {
         const vdp_rule_t *r = &p->v.rules[i];
         if (!noexec_rule_writable(r)) continue;
         char t[PATH_MAX];
-        if (noexec_target(r, t, sizeof t) < 0) {
+        bool exact;
+        if (noexec_target(r, t, sizeof t, &exact) < 0) {
             fprintf(stderr, "[warden] noexec: policy line %d lets the agent write paths no directory "
                     "bounds (a suffix, contains, or a glob that starts with a wildcard); name a "
                     "directory, or run with --writable-exec; refusing to start\n", r->line);
@@ -109,17 +136,31 @@ static int noexec_build(const struct policy *p, const char *boot_path) {
         if (!t[0]) continue;
         char real[PATH_MAX];
         struct stat st;
-        bool file = false;
-        if (r->s.op == VDP_STR_EQ && realpath(t, real) && stat(real, &st) == 0 && !S_ISDIR(st.st_mode)) {
+        bool file = false, missing = false;
+        if (exact && realpath(t, real) && stat(real, &st) == 0 && !S_ISDIR(st.st_mode)) {
             file = true;                                     /* an existing file: itself (D3) */
         } else if (!realpath(t, real)) {
-            if (r->s.op == VDP_STR_EQ) noexec_parent(t);     /* not there yet: its directory (D3) */
-            if (r->s.op != VDP_STR_EQ || !realpath(t, real)) {
-                fprintf(stderr, "[warden] note: noexec: policy line %d: %s does not exist; nothing "
-                        "is mounted for it\n", r->line, t);
-                continue;
+            if (exact) noexec_parent(t);                     /* not there yet: its directory (D3) */
+            if (!exact || !realpath(t, real)) {
+                /* v1.27.1 review: listed all the same. Nothing is mounted for
+                 * it, and if it appears during the run (the host makes it),
+                 * every open the agent asks for under it is refused, since
+                 * none reaches it through a noexec mount (noexec_breach). */
+                if (noexec_canon_missing(t, real, sizeof real) < 0) {
+                    fprintf(stderr, "[warden] noexec: policy line %d: cannot place %s; refusing to "
+                            "start\n", r->line, t);
+                    return -1;
+                }
+                missing = true;
+                fprintf(stderr, "[warden] note: noexec: policy line %d: %s does not exist; nothing is "
+                        "mounted for it, and if it appears during the run the agent's opens under it "
+                        "are refused\n", r->line, t);
             }
         }
+        if (strcmp(real, t))
+            fprintf(stderr, "[warden] note: noexec: policy line %d names %s, which is %s here; the "
+                    "rule matches no path the Warden resolves, and the audit refuses such a record; "
+                    "name the directory itself\n", r->line, t, real);
         if (!strcmp(real, "/")) {
             fprintf(stderr, "[warden] noexec: policy line %d lets the agent write under /, which "
                     "cannot be mounted noexec; narrow the rule, or run with --writable-exec; "
@@ -132,9 +173,11 @@ static int noexec_build(const struct policy *p, const char *boot_path) {
             return -1;
         }
         g_nx[g_nx_n].path = strdup(real);
+        g_nx[g_nx_n].target = strdup(t);
         g_nx[g_nx_n].line = r->line;
         g_nx[g_nx_n].file = file;
-        if (!g_nx[g_nx_n].path) { fprintf(stderr, "[warden] out of memory\n"); return -1; }
+        g_nx[g_nx_n].missing = missing;
+        if (!g_nx[g_nx_n].path || !g_nx[g_nx_n].target) { fprintf(stderr, "[warden] out of memory\n"); return -1; }
         g_nx_n++;
     }
     /* drop one inside another (keep the outer, the first line naming it) */
@@ -144,6 +187,7 @@ static int noexec_build(const struct policy *p, const char *boot_path) {
             if (noexec_under(g_nx[b].path, g_nx[a].path) &&
                 (strcmp(g_nx[a].path, g_nx[b].path) || a < b)) {
                 free(g_nx[b].path);
+                free(g_nx[b].target);
                 g_nx[b].path = NULL;
             }
         }
@@ -160,10 +204,19 @@ static int noexec_build(const struct policy *p, const char *boot_path) {
                         "--writable-exec; refusing to start\n", breal, g_nx[k].path, g_nx[k].line);
                 return -1;
             }
-    /* a file of the launch set under one stays in the set but cannot launch (D4) */
+    /* a file of the launch set under one stays in the set but cannot launch
+     * (D4). v1.27.1 review: the program's own interpreter, or a loader, under
+     * one would stop the program itself, so as for the program: refused. */
     for (size_t e = 0; e < g_exec_n; e++)
         for (size_t k = 0; k < g_nx_n; k++)
-            if (noexec_under(g_exec_rs[e].path, g_nx[k].path) && strcmp(g_exec_rs[e].why, "bootstrap")) {
+            if (noexec_under(g_exec_rs[e].path, g_nx[k].path) &&
+                (!strcmp(g_exec_rs[e].why, "interpreter") || !strcmp(g_exec_rs[e].why, "loader"))) {
+                fprintf(stderr, "[warden] noexec: %s, the %s a launch needs, is under %s, which policy "
+                        "line %d lets the agent write; it could not be launched; move it, or run with "
+                        "--writable-exec; refusing to start\n", g_exec_rs[e].path, g_exec_rs[e].why,
+                        g_nx[k].path, g_nx[k].line);
+                return -1;
+            } else if (noexec_under(g_exec_rs[e].path, g_nx[k].path) && strcmp(g_exec_rs[e].why, "bootstrap")) {
                 fprintf(stderr, "[warden] note: noexec: %s (in the launch set) is under %s, which policy "
                         "line %d lets the agent write; it will not launch\n", g_exec_rs[e].path,
                         g_nx[k].path, g_nx[k].line);
@@ -173,6 +226,13 @@ static int noexec_build(const struct policy *p, const char *boot_path) {
 }
 
 /* ---- step 2: the mounts ---- */
+
+#ifndef ST_NOSYMFOLLOW
+#define ST_NOSYMFOLLOW 8192
+#endif
+#ifndef MS_NOSYMFOLLOW
+#define MS_NOSYMFOLLOW 256
+#endif
 
 /* The flags a mount already has, to keep on a remount (a remount may not drop
  * a locked flag such as nosuid or nodev). */
@@ -186,6 +246,7 @@ static unsigned long noexec_keep_flags(const char *mp) {
     if (sv.f_flag & ST_NOATIME)     f |= MS_NOATIME;
     if (sv.f_flag & ST_NODIRATIME)  f |= MS_NODIRATIME;
     if (sv.f_flag & ST_RELATIME)    f |= MS_RELATIME;
+    if (sv.f_flag & ST_NOSYMFOLLOW) f |= MS_NOSYMFOLLOW;      /* v1.27.1 review */
     return f;
 }
 
@@ -202,24 +263,34 @@ static void noexec_unescape(char *s) {
 }
 
 /* Remount noexec every mount at or under root (the bind just made, and the
- * mounts beneath it). 0, or -1 with errno. */
-static int noexec_remount_tree(const char *root) {
+ * mounts beneath it); with check, remount nothing and confirm instead that
+ * each is noexec. 0, or -1 with errno. v1.27.1 review: a line of any length
+ * (getline), and the second pass, so no mount beneath is left exec-allowed
+ * however its line reads. */
+static int noexec_remount_tree(const char *root, bool check) {
     FILE *mi = fopen("/proc/self/mountinfo", "re");
     if (!mi) return -1;
-    char line[8192];
+    char *line = NULL;
+    size_t cap = 0;
     int rc = 0, done = 0;
-    while (rc == 0 && fgets(line, sizeof line, mi)) {
+    while (rc == 0 && getline(&line, &cap, mi) > 0) {
         /* id parent major:minor root mountpoint ... */
         char *save = NULL, *tok = strtok_r(line, " ", &save);
         for (int k = 0; tok && k < 4; k++) tok = strtok_r(NULL, " ", &save);
-        if (!tok) continue;
+        if (!tok) { errno = EINVAL; rc = -1; break; }
         noexec_unescape(tok);
         if (!noexec_under(tok, root)) continue;
-        if (mount(NULL, tok, NULL, MS_BIND | MS_REMOUNT | MS_NOEXEC | noexec_keep_flags(tok), NULL) < 0)
+        struct statvfs sv;
+        if (check) {
+            if (statvfs(tok, &sv) < 0) rc = -1;
+            else if (!(sv.f_flag & ST_NOEXEC)) { errno = EPERM; rc = -1; }
+            else done++;
+        } else if (mount(NULL, tok, NULL, MS_BIND | MS_REMOUNT | MS_NOEXEC | noexec_keep_flags(tok), NULL) < 0)
             rc = -1;
         else done++;
     }
     int e = errno;
+    free(line);
     fclose(mi);
     errno = e;
     if (rc == 0 && done == 0) { errno = ENOENT; return -1; }
@@ -244,7 +315,9 @@ static int noexec_mount(void) {
     }
     for (size_t k = 0; k < g_nx_n; k++) {
         const char *d = g_nx[k].path;
-        if (mount(d, d, NULL, MS_BIND | MS_REC, NULL) < 0 || noexec_remount_tree(d) < 0) {
+        if (g_nx[k].missing) continue;
+        if (mount(d, d, NULL, MS_BIND | MS_REC, NULL) < 0 || noexec_remount_tree(d, false) < 0 ||
+            noexec_remount_tree(d, true) < 0) {
             fprintf(stderr, "[warden] noexec: cannot mount %s noexec (%s); refusing to start\n", d,
                     strerror(errno));
             return -1;
@@ -258,6 +331,39 @@ static int noexec_mount(void) {
     if (!getcwd(cwd, sizeof cwd) || chdir(cwd) < 0) {
         fprintf(stderr, "[warden] noexec: cannot enter the working directory again after the mounts "
                 "(%s); refusing to start\n", strerror(errno));
+        return -1;
+    }
+    /* v1.27.1 review: a descriptor the agent will inherit (its standard
+     * input, or one the operator's shell left open) was opened before the
+     * mounts too. One open for reading on a file under a listed directory
+     * could be mapped executable: refused. */
+    DIR *fds = opendir("/proc/self/fd");
+    if (!fds) {
+        fprintf(stderr, "[warden] noexec: cannot list the open descriptors (%s); refusing to start\n",
+                strerror(errno));
+        return -1;
+    }
+    int self = dirfd(fds), bad = -1;
+    char badpath[PATH_MAX] = "";
+    for (struct dirent *de; bad < 0 && (de = readdir(fds)); ) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        int fd = atoi(de->d_name), fl = fcntl(fd, F_GETFL), fdf = fcntl(fd, F_GETFD);
+        struct stat st;
+        if (fd == self || fl < 0 || fdf < 0 || (fdf & FD_CLOEXEC) || (fl & O_PATH) ||
+            (fl & O_ACCMODE) == O_WRONLY || fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) continue;
+        char link[64], path[PATH_MAX];
+        snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+        ssize_t n = readlink(link, path, sizeof path - 1);
+        if (n <= 0) continue;
+        path[n] = '\0';
+        if (noexec_breach(path, fd)) { bad = fd; snprintf(badpath, sizeof badpath, "%s", path); }
+    }
+    closedir(fds);
+    if (bad >= 0) {
+        fprintf(stderr, "[warden] noexec: descriptor %d, which the agent would inherit, is open for "
+                "reading on %s, under a directory the agent may write, from before the mounts (it "
+                "could be mapped executable); give the agent another file, or run with "
+                "--writable-exec; refusing to start\n", bad, badpath);
         return -1;
     }
     return 0;
@@ -278,15 +384,20 @@ static bool noexec_breach(const char *resolved, int fd) {
 /* ---- step 4: the record ---- */
 
 /* run_start's "noexec": each directory (or file) mounted noexec, with the
- * policy line that makes it writable; null when --writable-exec turned the
- * mounts off. Written with launches on only. */
+ * policy line that makes it writable and the rule's own directory (target);
+ * "missing" for one not there at start (nothing mounted, opens under it
+ * refused); null when --writable-exec turned the mounts off. Written with
+ * launches on only. */
 static void noexec_record(FILE *f) {
     if (g_writable_exec) { fputs("\"noexec\":null,", f); return; }
     fputs("\"noexec\":[", f);
     for (size_t k = 0; k < g_nx_n; k++) {
         fprintf(f, "%s{\"path\":\"", k ? "," : "");
         json_escape(f, g_nx[k].path);
-        fprintf(f, "\",\"policy_line\":%d%s}", g_nx[k].line, g_nx[k].file ? ",\"file\":true" : "");
+        fputs("\",\"target\":\"", f);                    /* v1.27.1 review: for the audit */
+        json_escape(f, g_nx[k].target);
+        fprintf(f, "\",\"policy_line\":%d%s%s}", g_nx[k].line, g_nx[k].file ? ",\"file\":true" : "",
+                g_nx[k].missing ? ",\"missing\":true" : "");
     }
     fputs("],", f);
 }

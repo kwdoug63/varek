@@ -4640,12 +4640,18 @@ int main(int argc, char **argv) {
                 if (g_sk) sodium_free(g_sk);
                 return 1;
             }
-            fprintf(stderr, "[warden] noexec: %zu writable director%s %s noexec\n", g_nx_n,
-                    g_nx_n == 1 ? "y" : "ies", g_check_only ? "to mount" : "mounted");
+            size_t gone = 0;
+            for (size_t k = 0; k < g_nx_n; k++) gone += g_nx[k].missing;
+            fprintf(stderr, "[warden] noexec: %zu writable director%s %s noexec", g_nx_n - gone,
+                    g_nx_n - gone == 1 ? "y" : "ies", g_check_only ? "to mount" : "mounted");
+            if (gone) fprintf(stderr, ", %zu not there (opens under %s refused if it appears)", gone,
+                              gone == 1 ? "it" : "one");
+            fputc('\n', stderr);
             if (g_check_only)
                 for (size_t k = 0; k < g_nx_n; k++)
                     fprintf(stderr, "[warden]   noexec %s%s (line %d)\n", g_nx[k].path,
-                            g_nx[k].file ? " (a file)" : "", g_nx[k].line);
+                            g_nx[k].missing ? " (not there; opens under it refused if it appears)"
+                            : g_nx[k].file ? " (a file)" : "", g_nx[k].line);
         }
     }
     if (g_check_only) {

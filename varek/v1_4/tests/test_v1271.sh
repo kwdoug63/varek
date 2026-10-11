@@ -69,8 +69,21 @@ else
     nx "allow path $W/a/sub/\nallow path $W/a/\n"
     check "one inside another is dropped, the outer kept" sh -c "$(declare -f has count); OUT='$OUT'; count 1 && has '$W/a' 3"
     nx "allow path $W/missing/\n"
-    check "a directory that does not exist: reported, none mounted" \
-        sh -c "grep -q 'noexec: policy line 2: $W/missing does not exist' '$OUT/nx.out' && grep -q 'noexec: 0 writable directories' '$OUT/nx.out' && grep -qx 0 '$OUT/nx.rc'"
+    check "a directory that does not exist: reported, listed as not there, none mounted" \
+        sh -c "grep -q 'noexec: policy line 2: $W/missing does not exist' '$OUT/nx.out' && grep -q 'noexec: 0 writable directories to mount noexec, 1 not there' '$OUT/nx.out' && grep -qx '\[warden\]   noexec $W/missing (not there; opens under it refused if it appears) (line 2)' '$OUT/nx.out' && grep -qx 0 '$OUT/nx.rc'"
+    # v1.27.1 review: a glob with no wildcard is an exact path; a relative glob matches nothing
+    nx "allow path glob $W/g/new.so\n"
+    check "a glob with no wildcard, not there yet: its directory, as an exact path" has "$W/g" 2
+    nx "allow path glob $W/f.txt\n"
+    check "a glob with no wildcard naming a file: the file itself" hasf "$W/f.txt" 2
+    nx "allow path glob rel/*.so\n"
+    check "a relative glob matches no absolute path: nothing, and the start goes on" sh -c "grep -qx 0 '$OUT/nx.rc' && grep -q 'noexec: 0 writable directories' '$OUT/nx.out'"
+    # v1.27.1 review: the interpreter of the agent's own program under a writable directory
+    printf '#!%s/bin/t\n' "$W" > "$OUT/s.sh"; chmod 755 "$OUT/s.sh"
+    printf 'require warden 1.27\nallow path %s/bin/\n' "$W" > "$W/p.txt"
+    "$WARDEN" "$W/p.txt" --check-startup -- "$OUT/s.sh" > "$OUT/it.out" 2>&1; echo $? > "$OUT/it.rc"
+    check "the interpreter the agent's own program needs, under a writable directory, refuses the start" \
+        sh -c "grep -qx 1 '$OUT/it.rc' && grep -q 'the interpreter a launch needs, is under $W/bin' '$OUT/it.out'"
     nx "allow path suffix .log\n"
     check "a writable suffix rule refuses the start" \
         sh -c "grep -qx 1 '$OUT/nx.rc' && grep -q 'line 2 lets the agent write paths no directory bounds' '$OUT/nx.out'"
@@ -123,6 +136,17 @@ else
     check "a read-only path is not touched" sh -c "! awk -v m='/usr' '\$5 == m' '$OUT/mi.out' | grep -q noexec || awk '\$5 == \"/usr\"' /proc/self/mountinfo | grep -q noexec"
     grep -v " $M" /proc/self/mountinfo | awk '{print $5, $6}' | sort > "$OUT/host.after"
     check "the host's mounts are unchanged by the run" sh -c "cmp -s '$OUT/host.before' '$OUT/host.after' && ! grep -q ' $M/w ' /proc/self/mountinfo"
+    # v1.27.1 review: nosymfollow kept; a mount beneath whose mountinfo line is long
+    mkdir -p "$M/y/nsf" "$M/l/sub"; chmod -R 755 "$M/y" "$M/l"
+    mount -t tmpfs -o size=1m,nosymfollow tmpfs "$M/y/nsf" && chmod 755 "$M/y/nsf"
+    LONG="$M/deep"; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do LONG="$LONG/$(printf '%200s' '')"; done
+    mkdir -p "$LONG" && chmod -R 755 "$M/deep" && mount --bind "$LONG" "$M/l/sub"
+    trap 'umount "$M/s/in" "$M/s" "$M/ns" "$M/y/nsf" "$M/l/sub" 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $OUT" || rm -rf "$OUT" "${W:-}" "$M"' EXIT
+    mi "allow path $M/y/\nallow path $M/l/\n"
+    check "a mount's nosymfollow is kept" sh -c "awk -v m='$M/y/nsf' '\$5 == m' '$OUT/mi.out' | tail -1 | grep -q 'noexec.*nosymfollow\|nosymfollow.*noexec'"
+    check "a mount beneath one whose mountinfo line is over 8 KB is mounted noexec too" \
+        sh -c "[ \$(grep ' $M/l/sub ' /proc/self/mountinfo | wc -c) -gt 8192 ] && awk -v m='$M/l/sub' '\$5 == m' '$OUT/mi.out' | tail -1 | grep -q noexec"
+    umount "$M/y/nsf" "$M/l/sub" 2>/dev/null
     mi "allow path $M/w/\n" --writable-exec
     check "--writable-exec: no noexec mount" sh -c "! awk -v m='$M/w' '\$5 == m' '$OUT/mi.out' | grep -q ."
     printf 'require warden 1.26\nallow path %s/w/\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path /proc/ readonly\n' "$M" > "$M/p26.txt"; chmod 644 "$M/p26.txt"
@@ -157,6 +181,28 @@ else
     (cd "$A/w" && env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$A/p.txt" -- /usr/bin/python3 "$A/v1271_probe.py" "$A/w" > "$OUT/cw.out" 2> "$OUT/cw.log")
     check "from a working directory inside it, a copy by a relative name cannot be loaded or mapped either" \
         sh -c "grep -qx 'REL_LIB_COPY refused' '$OUT/cw.out' && grep -qx 'REL_MMAP_EXEC refused Operation not permitted' '$OUT/cw.out' && grep -qx 'LIB_COPY refused' '$OUT/cw.out'"
+    # v1.27.1 review: a writable directory the host makes during the run, and
+    # a file an exact rule names that the host replaces during the run: the
+    # agent's opens there are refused (they reach no noexec mount)
+    rm -rf "$A/late"; : > "$A/w/f.txt"; chmod 666 "$A/w/f.txt"
+    printf 'require warden 1.27\nallow path %s/late/\nallow path exact %s/w/f.txt\n%b' "$A" "$A" "$BASE" > "$A/p.txt"; chmod 644 "$A/p.txt"
+    LATE='import time
+def op(n, p, m):
+    try:
+        open(p, m).close(); print(n, "opened", flush=True)
+    except OSError as e:
+        print(n, "refused", e.errno, flush=True)
+op("BOUND_BEFORE", "'"$A/w/f.txt"'", "r")
+time.sleep(3)
+op("LATE", "'"$A/late/x"'", "w")
+op("BOUND_AFTER", "'"$A/w/f.txt"'", "r")'
+    ( sleep 1; mkdir -m 777 "$A/late"; : > "$A/f.new"; chmod 666 "$A/f.new"; mv "$A/f.new" "$A/w/f.txt" ) &
+    (cd "$A" && env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$A/p.txt" -- /usr/bin/python3 -c "$LATE" > "$OUT/late.out" 2> "$OUT/late.log")
+    wait
+    check "a writable directory missing at start: listed, and if the host makes it during the run the agent's opens there are refused" \
+        sh -c "grep -qx 'LATE refused 13' '$OUT/late.out' && grep -q 'reached through a mount that is not noexec' '$OUT/late.log'"
+    check "a file an exact rule names, replaced by the host during the run: opened before, refused after" \
+        sh -c "grep -qx 'BOUND_BEFORE opened' '$OUT/late.out' && grep -qx 'BOUND_AFTER refused 13' '$OUT/late.out'"
     probe off "allow path $A/w/\n" --writable-exec
     check "with --writable-exec the copy loads, as on v1.27.0" sh -c "grep -qx 'LIB_COPY loaded' '$OUT/off.out' && grep -qx 'MMAP_EXEC mapped' '$OUT/off.out'"
     # a file of the launch set under a writable directory: allowed, but the kernel refuses it
@@ -184,8 +230,16 @@ sys.exit(0 if eval(sys.argv[2]) else 1)
 PY
     }
     check "run_start records each directory mounted noexec, with its policy line" \
-        rs "$OUT/r.log" "r['noexec'] == [{'path': '$R/w', 'policy_line': 2}] and r['warden'] == '1.27.1'"
+        rs "$OUT/r.log" "r['noexec'] == [{'path': '$R/w', 'target': '$R/w', 'policy_line': 2}] and r['warden'] == '1.27.1'"
     check "with --writable-exec, run_start records noexec null" rs "$OUT/rx.log" "r['noexec'] is None"
+    # v1.27.1 review: a descriptor the agent would inherit, open for reading on a file there
+    : > "$R/w/in"; chmod 644 "$R/w/in"
+    (cd "$R" && env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$R/p.txt" -- /usr/bin/true < "$R/w/in" > /dev/null 2> "$OUT/in.log"); echo $? > "$OUT/in.rc"
+    check "standard input open on a file in a writable directory refuses the start" \
+        sh -c "! grep -qx 0 '$OUT/in.rc' && grep -q 'descriptor 0, which the agent would inherit' '$OUT/in.log'"
+    (cd "$R" && env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$R/p.txt" -- /usr/bin/true < /dev/null >> "$R/w/out" 2> "$OUT/in2.log"); echo $? > "$OUT/in2.rc"
+    check "output appended to a file there does not (it cannot be read)" grep -qx 0 "$OUT/in2.rc"
+    rm -f "$R/w/in" "$R/w/out"
     audit() { python3 "$HERE/tools/varek_audit.py" --policy "$R/p.txt" --checker "$CERT" "$1" > "$OUT/a.out" 2>&1; }
     check "the audit accepts the run" audit "$OUT/r.log"
     check "the audit accepts a --writable-exec run, and says so" \
