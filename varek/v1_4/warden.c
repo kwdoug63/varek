@@ -1612,7 +1612,8 @@ static int relay_agent_stderr(int fd, bool drain_all) {
 
 #define WARDEN_VSTR_(x) #x
 #define WARDEN_VSTR(x) WARDEN_VSTR_(x)
-#define WARDEN_VERSION WARDEN_VSTR(VDP_WARDEN_MAJOR) "." WARDEN_VSTR(VDP_WARDEN_MINOR) ".0"
+#define WARDEN_VERSION WARDEN_VSTR(VDP_WARDEN_MAJOR) "." WARDEN_VSTR(VDP_WARDEN_MINOR) "." \
+                       WARDEN_VSTR(VDP_WARDEN_PATCH)
 
 static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
@@ -2903,6 +2904,7 @@ static void syn_hosts_view(const struct policy *p, FILE *f);
 #include "warden_pxdecide.inc.c"     /* v1.26: the Warden's decisions on what the proxy reads */
 #include "warden_trust.inc.c"        /* v1.26.1: the run's CA and the trust views */
 #include "warden_exec.inc.c"         /* v1.27: the launch set and its Landlock ruleset */
+#include "warden_noexec.inc.c"       /* v1.27.1: writable directories mounted noexec */
 
 /* ---------------- receive loop ---------------- */
 
@@ -4267,6 +4269,7 @@ static void usage(const char *argv0) {
         "              [--anchor <path>] [--checkpoint-every <n>] [--run-as <user>]\n"
         "              [--dns-server <a.b.c.d[:port]>] [--dns-ttl-min <s>] [--dns-ttl-max <s>]\n"
         "              [--dns-grace-max <s>] [--psl <file>] [--shared-domains <file>]\n              [--proxy-as <user>] [--proxy-bin <warden-proxy>] [--trust-bundle <pem>]\n"
+        "              [--writable-exec]\n"
         "              -- <target> [args...]\n"
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
         "\n"
@@ -4426,6 +4429,8 @@ int main(int argc, char **argv) {
             key_path = argv[++i];
         } else if (strcmp(argv[i], "--anchor") == 0 && !anchor_path) {
             anchor_path = argv[++i];
+        } else if (strcmp(argv[i], "--writable-exec") == 0) {            /* v1.27.1 */
+            g_writable_exec = true;
         } else if (strcmp(argv[i], "--run-as") == 0 && !run_as_arg) {
             run_as_arg = argv[++i];
         } else if (strcmp(argv[i], "--proxy-as") == 0 && !proxy_as_arg) {   /* v1.26 */
@@ -4611,6 +4616,22 @@ int main(int argc, char **argv) {
                 if (e->line) fprintf(stderr, " (line %d)", e->line);
                 fputc('\n', stderr);
             }
+        /* v1.27.1: the directories the agent may write, mounted noexec */
+        if (g_writable_exec) {
+            fprintf(stderr, "[warden] noexec: off (--writable-exec): files the agent writes may be "
+                    "mapped executable\n");
+        } else {
+            if (noexec_build(&p, target_argv ? boot_path : NULL) < 0) {
+                if (g_sk) sodium_free(g_sk);
+                return 1;
+            }
+            fprintf(stderr, "[warden] noexec: %zu writable director%s to mount noexec\n", g_nx_n,
+                    g_nx_n == 1 ? "y" : "ies");
+            if (g_check_only)
+                for (size_t k = 0; k < g_nx_n; k++)
+                    fprintf(stderr, "[warden]   noexec %s%s (line %d)\n", g_nx[k].path,
+                            g_nx[k].file ? " (a file)" : "", g_nx[k].line);
+        }
     }
     if (g_check_only) {
         /* v1.24: resolve each allowed name and report the ones that fail (a
