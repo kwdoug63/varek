@@ -131,6 +131,12 @@ lint "require warden 1.27\nallow exec /usr/bin/git\nallow path /usr/bin/git\nall
 check "lint notes a file both launched and written" grep -q ':2: note: /usr/bin/git may be both launched and written' "$OUT/n.out"
 check "not one the policy opens only to read" sh -c "! grep -q ':4: note' '$OUT/n.out'"
 check "and one writable only (access=wo)" grep -q ':6: note: /usr/bin/cc may be both launched and written' "$OUT/n.out"
+# v1.27 review: lint says what the Warden would refuse at start, and fails
+lint "require warden 1.27\nallow exec suffix /python3\nallow exec glob */x\nallow exec /usr/../usr/bin/true\n"
+check "lint refuses allow exec rules the Warden cannot expand (suffix, a glob from a wildcard, a .. segment)" \
+    sh -c "grep -qx 1 '$OUT/n.rc' && [ \$(grep -c 'refused by the Warden at start' '$OUT/n.out') -eq 3 ]"
+lint "require warden 1.27\nallow exec /lib/ld-2.31.so\n"
+check "the loader under its glibc-before-2.34 name gets the interpreter note" grep -q 'ld-2.31.so is a shell or general-purpose interpreter' "$OUT/n.out"
 lint "require warden 1.26\nallow exec /usr/bin/git\nallow exec /usr/bin/make\nallow path /usr/ readonly\n"
 check "without the opt-in, lint says exec rules decide only the first launch (once)" \
     sh -c "[ \$(grep -c 'only with .require warden 1.27.' '$OUT/n.out') = 1 ] && grep -q ':2: note: exec rules take effect' '$OUT/n.out'"
@@ -571,6 +577,9 @@ else
     NO_COLOR=1 VAREK_CONFIG="$OUT/varek.conf" python3 "$HERE/tools/varek" refusals -n 500 "$OUT/x.log" > "$OUT/rf.out" 2>&1
     NO_COLOR=1 VAREK_CONFIG="$OUT/varek.conf" python3 "$HERE/tools/varek" refusals -n 500 "$OUT/m.log" > "$OUT/rfm.out" 2>&1
     check "varek refusals: a launch a deny rule refuses, with its line" grep -q 'policy line 2: deny exec /usr/bin/env' "$OUT/rf.out"
+    { head -n 20 "$OUT/x.log"; printf '{"seq":\n'; tail -n +21 "$OUT/x.log"; } > "$OUT/cut.log"
+    check "varek refusals: a stream with a damaged record is refused, not summarized" \
+        sh -c "! NO_COLOR=1 VAREK_CONFIG='$OUT/varek.conf' python3 '$HERE/tools/varek' refusals '$OUT/cut.log' > '$OUT/rfc.out' 2>&1 && grep -q 'cannot be read' '$OUT/rfc.out'"
     check "varek refusals: a file not in the launch set (NOT_IN_SET), with the rule allowing its name" \
         sh -c "grep -q 'NOT_IN_SET   process.exec   $D/run/new' '$OUT/rf.out' && grep -q 'allows the name, but that file was not in the launch set' '$OUT/rf.out'"
     check "varek refusals: a process the identity check killed (KILLED), with what it ran" \

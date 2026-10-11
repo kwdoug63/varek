@@ -72,7 +72,7 @@
 // v1.26.1: a request is (request, s) with s the request object
 // "METHOD scheme://host:port/path?query"; request rules are globs over it.
 //
-// The checker implements the policy grammar of VAREK 1.26.1 (smt_decide.h). A
+// The checker implements the policy grammar of VAREK 1.27 (smt_decide.h). A
 // policy it cannot parse is refused, so the Warden does not start.
 
 #ifndef VAREK_VDP_CHECKER_H

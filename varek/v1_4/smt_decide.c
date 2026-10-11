@@ -2487,12 +2487,15 @@ bool vdp_exec_is_interpreter(const char *path) {
         "sh", "bash", "dash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "ash", "busybox",
         "python", "python2", "python3", "pypy", "pypy3", "perl", "ruby", "node", "nodejs",
         "deno", "bun", "php", "lua", "luajit", "tclsh", "wish", "pwsh", "Rscript", "R",
-        "julia", "guile", "awk", "gawk", "mawk", "nawk", "java", "jshell", "osascript", NULL
+        "julia", "guile", "awk", "gawk", "mawk", "nawk", "java", "jshell", "osascript",
+        "rbash", "toybox", "ipython", "ipython3", "gdb", "expect", NULL
     };
     const char *b = strrchr(path, '/');
     b = b ? b + 1 : path;
     /* the dynamic loader runs any ELF file it can read (ld.so FILE) */
     if (!strncmp(b, "ld-linux", 8) || !strncmp(b, "ld-musl", 7) || !strcmp(b, "ld.so")) return true;
+    /* v1.27 review: glibc before 2.34 names its loader ld-2.31.so */
+    if (!strncmp(b, "ld-", 3) && isdigit((unsigned char)b[3]) && strstr(b, ".so")) return true;
     for (size_t i = 0; kInterp[i]; i++) {
         size_t k = strlen(kInterp[i]);
         if (strncmp(b, kInterp[i], k)) continue;

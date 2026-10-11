@@ -296,15 +296,26 @@ def policy_rules(path):
 
 
 def read_records(log):
-    recs = []
+    """The records of a verdict stream. v1.27 review: a line that looks like a
+    record but is not one is never dropped silently; a stream with any is
+    refused (a summary of part of a stream would mislead)."""
+    recs, bad, other = [], 0, 0
     with open(log, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
+        for raw in fh:
+            line = raw.strip()
             if line.startswith("{"):
                 try:
                     recs.append(json.loads(line))
                 except ValueError:
-                    pass
+                    if raw.endswith("\n"):
+                        bad += 1             # (a last line still being written is not counted)
+            elif line and not line.startswith("[warden"):
+                other += 1
+    if not recs and other:
+        raise CliError(f"{log}: not a verdict stream (no records)")
+    if bad:
+        raise CliError(f"{log}: {bad} line(s) look like records but cannot be read; the stream is damaged or "
+            f"not a verdict stream (varek audit says more)")
     return recs
 
 
@@ -675,6 +686,7 @@ def cmd_policy_show(args):
     info(f"About    {pack_summary(path)}")
     info(f"SHA-256  {digest}   (recorded in every run's run_start)")
     info(f"Needs    Warden {require or 'any version'}")
+    show_rc = 0
     for verb in ("allow", "deny"):
         parts = ", ".join(f"{v} {k}" for k, v in sorted(counts[verb].items())) or "none"
         info(f"{verb.capitalize():8} {parts}")
@@ -703,21 +715,25 @@ def cmd_policy_show(args):
     lq = run_cmd([tool("vdp_cert_check"), path, "launches"], capture=True)
     has_exec = counts["allow"].get("exec", 0) > 0
     if lq.returncode == 0 and lq.stdout.strip() == "on":
-        info("Launches decided by the exec rules (require warden 1.27): a program the policy allows "
-             "can be launched, enforced by the kernel's Landlock ruleset built at startup"
-             if has_exec else "Launches decided (require warden 1.27), but no exec rule allows one: "
-             "every launch after the agent's own is refused")
         # the set the Warden would build on this host (its own expansion of the rules)
         w = os.path.join(varek_home(), "warden")
-        if has_exec and os.access(w, os.X_OK):
-            r = subprocess.run([w, path, "--check-startup"], capture_output=True, text=True)
+        r = subprocess.run([w, path, "--check-startup"], capture_output=True, text=True) \
+            if has_exec and os.access(w, os.X_OK) else None
+        if r is not None and r.returncode != 0:
+            # v1.27 review: say first that it would not start, and claim nothing it would allow
+            why = next((ln for ln in r.stderr.splitlines() if "refusing to start" in ln), "")
+            warn(f"The Warden would not start with this policy here: {why or r.returncode}")
+            show_rc = 1
+        else:
+            info("Launches decided by the exec rules (require warden 1.27): a program the policy allows "
+                 "can be launched, enforced by the kernel's Landlock ruleset built at startup"
+                 if has_exec else "Launches decided (require warden 1.27), but no exec rule allows one: "
+                 "every launch after the agent's own is refused")
+        if r is not None and r.returncode == 0:
             files = [ln[len("[warden]   "):] for ln in r.stderr.splitlines() if ln.startswith("[warden]   ")]
             head = next((ln[len("[warden] "):] for ln in r.stderr.splitlines()
                          if ln.startswith("[warden] launch set:")), None)
-            if r.returncode != 0:
-                why = next((ln for ln in r.stderr.splitlines() if "refusing to start" in ln), "")
-                info(f"Launch set: the Warden would not start with this policy here: {why or r.returncode}")
-            elif head:
+            if head:
                 info(f"Launch set on this host: {head[len('launch set: '):]}")
                 for ln in files:
                     info(f"  {ln}")
@@ -745,7 +761,7 @@ def cmd_policy_show(args):
                   "it allowed (acknowledge=dns-channel)" if proxy_on else
                   "the agent's lookups under it leave the host (acknowledge=dns-channel)"))
     info("Anything not allowed is UNKNOWN and refused.")
-    return 0
+    return show_rc
 
 
 def cmd_policy_check(args):
