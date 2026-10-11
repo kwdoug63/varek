@@ -106,14 +106,15 @@ _CHAIN_TAIL = re.compile(rb',"chain":"([0-9a-f]{64})"(?:,"sig":"([0-9a-f]{128})"
 
 
 def _version_at_least(v, want):
-    """True if v (e.g. "1.16.0") is at least want (e.g. (1, 16))."""
+    """True if v (e.g. "1.16.0") is at least want (e.g. (1, 16), or (1, 27, 1))."""
     if not isinstance(v, str):
         return False
     parts = v.split(".")
     try:
-        return tuple(int(x) for x in parts[:2]) >= want
+        p = [int(x) for x in parts[:len(want)]]
     except ValueError:
         return False
+    return tuple(p + [0] * (len(want) - len(p))) >= want
 
 
 def _chain_step(st, raw, rec, lineno, ndecisions, fail):
@@ -543,6 +544,19 @@ def _launch_text(records, pm):
             f"{len(allowed)} allowed ({ran} seen running the program decided), "
             f"{len(launches) - len(allowed)} refused" +
             (f"; {len(killed)} process(es) found running a program not decided were killed." if killed else "."))
+    # v1.27.1: the directories the agent could write, mounted noexec
+    if "noexec" in rs:
+        nx = rs.get("noexec")
+        if nx is None:
+            facts.append(("varek:noexec.off", "true"))
+            text += (" The writable directories were not mounted noexec (--writable-exec): files the agent "
+                     "wrote could be mapped executable.")
+        elif isinstance(nx, list):
+            facts.append(("varek:noexec.dirs", str(len(nx))))
+            facts.append(("varek:noexec.sha256", hashlib.sha256(json.dumps(nx, sort_keys=True,
+                          separators=(",", ":")).encode()).hexdigest()))
+            text += (f" The {len(nx)} director(ies) the agent could write were mounted noexec: no file written "
+                     f"there could be launched or mapped executable.")
     return text, facts
 
 

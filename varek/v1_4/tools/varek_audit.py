@@ -314,6 +314,64 @@ def check_exec_set(meta, launches, problems, records=()):
         problems.append("run_start's launch set holds a SHA-256 that is not 64 hex digits")
 
 
+O_ACCMODE, O_TRUNC, O_CREAT = 3, 0o1000, 0o100
+
+
+def path_rule_writable(r):
+    """v1.27.1: does an allow path rule let the agent open for writing (an
+    access mode of write or read-write, O_TRUNC or O_CREAT)? As the Warden
+    reads it (warden_noexec.inc.c): the flags the rule requires, the rest
+    free."""
+    if r["kind"] != "p" or not r["allow"]:
+        return False
+    mask, value = int(r["mask"], 16), int(r["value"], 16)      # the checker prints them in hex
+    for c in (1, 2, O_TRUNC, O_CREAT, 1 | O_TRUNC, 2 | O_TRUNC, 1 | O_CREAT, 2 | O_CREAT,
+              O_CREAT | O_TRUNC, 1 | O_CREAT | O_TRUNC, 2 | O_CREAT | O_TRUNC):
+        f = (c & ~mask) | value
+        if (f & O_ACCMODE) in (1, 2) or f & (O_TRUNC | O_CREAT):
+            return True
+    return False
+
+
+def check_noexec(meta, rules, launches, problems):
+    """v1.27.1: with launches on, a Warden of 1.27.1 or later records in
+    run_start the directories it mounted noexec ("noexec"), each with the
+    policy line of a rule that lets the agent write; null when the operator
+    turned the mounts off (--writable-exec), which is reported, not failed.
+    Without launches on, no such record."""
+    rs = meta.get("run_start", {})
+    has = "noexec" in rs
+    if not launches:
+        if has:
+            problems.append("run_start records noexec mounts, but the policy does not turn launches on")
+        return
+    if not has:
+        if _version_at_least(rs.get("warden"), (1, 27, 1)):
+            problems.append(f"run_start names the Warden {rs.get('warden')!r}, which records its noexec "
+                            f"mounts, but has none")
+        return
+    nx = rs["noexec"]
+    if nx is None:
+        print("varek_audit: note: the Warden ran with --writable-exec: files the agent could write "
+              "were not mounted noexec, so they could be mapped executable")
+        return
+    if not isinstance(nx, list) or not all(isinstance(e, dict) and isinstance(e.get("path"), str)
+                                           and e["path"].startswith("/") and type(e.get("policy_line")) is int
+                                           for e in nx):
+        problems.append("run_start's noexec is malformed")
+        return
+    paths = [e["path"] for e in nx]
+    if len(set(paths)) != len(paths):
+        problems.append("run_start's noexec names a directory twice")
+    writable = {r["line"] for r in rules if path_rule_writable(r)}
+    for e in nx:
+        if e["policy_line"] not in writable:
+            problems.append(f"run_start's noexec mounts {e['path']!r} for policy line {e['policy_line']}, "
+                            f"which does not let the agent write")
+        if e["path"] == "/":
+            problems.append("run_start's noexec mounts /, which the Warden refuses")
+
+
 EXEC_REFUSALS = ("policy_match", "default_deny_unknown", "certificate_refused", "exec_no_landlock",
                  "exec_not_in_ruleset", "exec_unresolved",
                  # v1.27 review: a launch by a thread another thread's launch is ending:
@@ -1924,6 +1982,10 @@ def main(argv=None):
         problems.append(f"checker failed on the policy's launches: {e}")
         launches_policy = False
     check_exec_set(meta, launches_policy, problems, records)
+    try:
+        check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, problems)   # v1.27.1
+    except (OSError, ValueError) as e:
+        problems.append(f"checker failed on the policy's rules: {e}")
     exec_ok = 0
     stub_policy = wild_policy or (proxy_ports is not None and any(
         r["kind"] == "h" and r["name"] and not r["wild"] for r in prules))

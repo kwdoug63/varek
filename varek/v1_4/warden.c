@@ -910,6 +910,7 @@ static FILE *g_log;
 static void log_line_start(void);
 static void json_escape(FILE *f, const char *s);
 static void exec_ruleset_record(FILE *f);     /* v1.27: warden_exec.inc.c */
+static void noexec_record(FILE *f);           /* v1.27.1: warden_noexec.inc.c */
 struct action;
 static int exec_access_x(int ofd, const struct action *a);   /* v1.27: warden_exec.inc.c */
 
@@ -1682,7 +1683,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
         }
     }
     /* v1.27: Landlock and the launch set (require warden 1.27) */
-    if (p->v.launches) exec_ruleset_record(f);
+    if (p->v.launches) { exec_ruleset_record(f); noexec_record(f); }   /* v1.27, v1.27.1 */
     /* v1.25 (section 4): each wildcard allow rule's budgets, defaults filled in */
     if (g_any_wild) {
         fputs("\"wildcard_budgets\":[", f);

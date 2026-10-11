@@ -164,6 +164,66 @@ else
         sh -c "grep -qx 'LAUNCH refused 13' '$OUT/l.out' && grep -q 'it will not launch' '$OUT/l.log' && grep -Eq '\"result\":\"(failed|gone)\"' '$OUT/l.log'"
 fi
 
+echo "== 4. records, audit and tools =="
+if [ "$(id -u)" != 0 ] || [ -z "$WARDEN" ]; then
+    skip "section 4 (needs root and the warden binary)"
+else
+    R="$(mktemp -d /tmp/varek_v1271r.XXXXXX)"; chmod 755 "$R"; mkdir -p "$R/w" "$R/ro"; chmod 755 "$R/w" "$R/ro"
+    trap 'umount "${M:-/nonexistent}/s/in" "${M:-/nonexistent}/s" "${M:-/nonexistent}/ns" 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $OUT" || rm -rf "$OUT" "${W:-}" "${M:-}" "${A:-}" "$R"' EXIT
+    printf 'require warden 1.27\nallow path %s/w/\nallow path %s/ro/ readonly\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\n' "$R" "$R" > "$R/p.txt"; chmod 644 "$R/p.txt"
+    (cd "$R" && env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$R/p.txt" -- /usr/bin/true 2> "$OUT/r.log")
+    (cd "$R" && env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$R/p.txt" --writable-exec -- /usr/bin/true 2> "$OUT/rx.log")
+    rs() { python3 - "$1" "$2" <<'PY'
+import json, sys
+r = next(json.loads(l[l.index("{"):]) for l in open(sys.argv[1], errors="replace") if '"event":"run_start"' in l)
+sys.exit(0 if eval(sys.argv[2]) else 1)
+PY
+    }
+    check "run_start records each directory mounted noexec, with its policy line" \
+        rs "$OUT/r.log" "r['noexec'] == [{'path': '$R/w', 'policy_line': 2}] and r['warden'] == '1.27.1'"
+    check "with --writable-exec, run_start records noexec null" rs "$OUT/rx.log" "r['noexec'] is None"
+    audit() { python3 "$HERE/tools/varek_audit.py" --policy "$R/p.txt" --checker "$CERT" "$1" > "$OUT/a.out" 2>&1; }
+    check "the audit accepts the run" audit "$OUT/r.log"
+    check "the audit accepts a --writable-exec run, and says so" \
+        sh -c "$(declare -f audit); HERE='$HERE' R='$R' CERT='$CERT' OUT='$OUT'; audit '$OUT/rx.log' && grep -q 'note: the Warden ran with --writable-exec' '$OUT/a.out'"
+    F="$HERE/tests/v1270_forge.py"
+    RS='rs = next(r for r in recs if isinstance(r, dict) and r.get("event") == "run_start")'
+    refuses() { if python3 "$HERE/tools/varek_audit.py" --policy "$R/p.txt" --checker "$CERT" "$2" > "$OUT/f.out" 2>&1; then
+                    flunk "the audit refuses $1"
+                elif grep -qF "$3" "$OUT/f.out"; then pass "the audit refuses $1"
+                else flunk "the audit refuses $1 ($(grep -m1 PROBLEM "$OUT/f.out"))"; fi; }
+    python3 "$F" "$OUT/r.log" "$OUT/n1.log" "$RS; rs['noexec'][0]['policy_line'] = 3"
+    refuses "a directory mounted for a line that does not let the agent write" "$OUT/n1.log" "which does not let the agent write"
+    python3 "$F" "$OUT/r.log" "$OUT/n2.log" "$RS; del rs['noexec']"
+    refuses "a 1.27.1 run with no noexec record" "$OUT/n2.log" "records its noexec mounts, but has none"
+    python3 "$F" "$OUT/r.log" "$OUT/n3.log" "$RS; rs['noexec'] = [{'path': 'w', 'policy_line': 2}]"
+    refuses "a noexec record that is not absolute paths" "$OUT/n3.log" "noexec is malformed"
+    python3 "$F" "$OUT/r.log" "$OUT/n4.log" "$RS; rs['noexec'].append(dict(rs['noexec'][0]))"
+    refuses "a directory named twice" "$OUT/n4.log" "names a directory twice"
+    python3 "$F" "$OUT/r.log" "$OUT/n5.log" "$RS; rs['noexec'] = [{'path': '/', 'policy_line': 2}]"
+    refuses "/ mounted noexec" "$OUT/n5.log" "mounts /, which the Warden refuses"
+    NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 "$HERE/tools/varek" policy show "$R/p.txt" > "$OUT/ps.out" 2>&1
+    check "varek policy show lists the directories it would mount noexec" \
+        sh -c "grep -q 'Mounted noexec (v1.27.1)' '$OUT/ps.out' && grep -qx '  $R/w (line 2)' '$OUT/ps.out'"
+    NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 "$HERE/tools/varek" doctor > "$OUT/dr.out" 2>&1
+    check "varek doctor checks the Warden can make a mount namespace" grep -q 'OK    Mount namespaces' "$OUT/dr.out"
+    python3 "$HERE/tools/varek_cyclonedx.py" --log "$OUT/r.log" --policy "$R/p.txt" --output "$OUT/bom.json" > /dev/null 2>&1
+    python3 "$HERE/tools/varek_cyclonedx.py" --log "$OUT/rx.log" --policy "$R/p.txt" --output "$OUT/bomx.json" > /dev/null 2>&1
+    bomfact() { python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+def walk(o):
+    if isinstance(o, dict):
+        if o.get("name") == sys.argv[2] and "value" in o: yield o["value"]
+        for v in o.values(): yield from walk(v)
+    elif isinstance(o, list):
+        for v in o: yield from walk(v)
+sys.exit(0 if sys.argv[3] in walk(json.load(open(sys.argv[1]))) else 1)
+PY
+    }
+    check "the CycloneDX export carries the noexec facts (varek:noexec.dirs, varek:noexec.off)" \
+        sh -c "$(declare -f bomfact); bomfact '$OUT/bom.json' varek:noexec.dirs 1 && bomfact '$OUT/bomx.json' varek:noexec.off true"
+fi
+
 echo
 if [ "$fail" = 0 ]; then echo "test_v1271: PASS ($skips skipped)"; exit 0; fi
 echo "test_v1271: FAIL"; exit 1

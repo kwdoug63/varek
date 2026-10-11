@@ -163,6 +163,16 @@ if [ "$("$VDP" "$POLICY" launches 2>/dev/null)" = on ]; then
         [1-9]*) pass "Landlock ABI $ll: launches the policy allows can run" ;;
         *)      warn "the policy decides launches (require warden 1.27), but Landlock is not available here (${ll:-no python3 to probe it}): every launch after the agent's own will be refused" ;;
     esac
+    # v1.27.1: the Warden mounts the policy's writable directories noexec in a mount namespace of its own
+    if [ "$(id -u)" = 0 ]; then
+        if python3 -c 'import ctypes,os,sys; pid=os.fork()
+if pid == 0: os._exit(0 if ctypes.CDLL(None).unshare(0x20000) == 0 else 1)
+sys.exit(os.waitpid(pid, 0)[1] != 0)' 2>/dev/null; then
+            pass "mount namespaces: the Warden can mount the writable directories noexec"
+        else
+            warn "the Warden cannot make a mount namespace here: a run of this policy refuses to start unless given --writable-exec"
+        fi
+    fi
 fi
 
 echo "== 3. what the Warden refuses at startup"

@@ -252,3 +252,19 @@ static int noexec_mount(void) {
     }
     return 0;
 }
+
+/* ---- step 4: the record ---- */
+
+/* run_start's "noexec": each directory (or file) mounted noexec, with the
+ * policy line that makes it writable; null when --writable-exec turned the
+ * mounts off. Written with launches on only. */
+static void noexec_record(FILE *f) {
+    if (g_writable_exec) { fputs("\"noexec\":null,", f); return; }
+    fputs("\"noexec\":[", f);
+    for (size_t k = 0; k < g_nx_n; k++) {
+        fprintf(f, "%s{\"path\":\"", k ? "," : "");
+        json_escape(f, g_nx[k].path);
+        fprintf(f, "\",\"policy_line\":%d%s}", g_nx[k].line, g_nx[k].file ? ",\"file\":true" : "");
+    }
+    fputs("],", f);
+}
