@@ -140,8 +140,12 @@ the run). It passed:
 | Records | 282,662; `varek_audit` passed |
 | The Warden's decision, an allowed launch | 104 to 195 us p50 by program (p99 156 to 381) |
 
-The soak ran the build from before the review's fixes (below); a short
-trial on the released build is to be recorded here before release. The soak
+The soak ran the build from before the review's fixes (below). On the same
+droplet, the reviewed build (Warden 1.27.0) then ran 6 minutes with a task
+every 5 seconds, on 2026-10-11, and passed: 65 tasks all ok (21 compiles,
+22 `git`, 22 `python3`), 7 probes of all three kinds each refused and
+recorded, 178 launches decided and 171 allowed, each seen running, no
+process killed, 14,256 records, and `varek_audit` passed. The soak
 found two things, fixed: `soak_check.py` held the whole stream in memory
 and was killed on the 1 GB host (it now reads it a line at a time); and the
 Warden named itself 1.26.1 in `run_start` (and `varek version` said 1.21.1).
