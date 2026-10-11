@@ -534,7 +534,8 @@ are claimed as solved.
     library may run inside an allowed program (`LD_PRELOAD`, `dlopen`, an
     interpreter's native extension), held still by the file and network
     rules. Not verified under the Warden; v1.27.1 is planned to mount the
-    policy's writable paths `noexec` in the agent's mount namespace.
+    policy's writable paths `noexec` in the Warden's own mount namespace,
+    where it opens files for the agent (`v1.27.1-writable-noexec.md`).
   - *Arguments are not decided* or recorded: `allow exec /usr/bin/git`
     allows `git` with any arguments.
   - *Interpreters and shells are broad.* Allowing one lets the agent run any
