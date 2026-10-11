@@ -268,15 +268,35 @@ def policy_launches(checker, policy):
     return f == ["on"]
 
 
-def check_exec_set(meta, launches, problems):
+V127_RULES = ("exec_allowed", "exec_not_in_ruleset", "exec_no_landlock", "exec_identity_mismatch",
+              "exec_identity_unreadable", "open_not_found")
+
+
+def check_exec_set(meta, launches, problems, records=()):
     """v1.27: with launches on, run_start records Landlock (its ABI, or null
-    without it) and the launch set; without, neither."""
+    without it) and the launch set, and names a Warden of 1.27 or later;
+    without, none of them, and no record or event only launches on writes
+    (review findings 4 and 5)."""
     rs = meta.get("run_start", {})
     has = "exec_ruleset" in rs or "landlock" in rs
+    w = rs.get("warden")
+    if "warden" in rs and not (isinstance(w, str) and re.fullmatch(r"\d+\.\d+\.\d+", w)):
+        problems.append(f"run_start names the Warden {w!r}, not a version")
+    elif (launches or has) and not _version_at_least(w, (1, 27)):
+        problems.append(f"run_start names the Warden {w!r}, but only 1.27 or later decides launches")
     if not launches:
         if has:
             problems.append("run_start records a launch set or Landlock, but the policy does not turn "
                             "launches on (require warden 1.27)")
+        bad = [r for r in records if r.get("rule") in V127_RULES]
+        if bad:
+            problems.append(f"seq {bad[0].get('seq')}: a record with rule {bad[0].get('rule')!r}, which "
+                            f"only a run with launches on (require warden 1.27) writes")
+        if meta.get("exec_results"):
+            problems.append("exec_result events, which only a run with launches on writes")
+        re_ = meta.get("run_end")
+        if isinstance(re_, dict) and "exec_identity_mismatch" in re_:
+            problems.append("run_end says exec_identity_mismatch, which only a run with launches on writes")
         return
     ll, ex = rs.get("landlock", "missing"), rs.get("exec_ruleset")
     if not (ll is None or (isinstance(ll, dict) and type(ll.get("abi")) is int and ll["abi"] >= 1)):
@@ -286,6 +306,12 @@ def check_exec_set(meta, launches, problems):
             type(e.get("dev")) is int and type(e.get("ino")) is int and isinstance(e.get("sha256"), str) and
             e.get("why") in ("rule", "loader", "bootstrap", "interpreter") for e in ex):
         problems.append("run_start's exec_ruleset is missing or malformed")
+        return
+    names = [e["name"] for e in ex]
+    if len(set(names)) != len(names):
+        problems.append("run_start's launch set holds a name twice")
+    if any(not re.fullmatch(r"[0-9a-f]{64}", e["sha256"]) for e in ex):
+        problems.append("run_start's launch set holds a SHA-256 that is not 64 hex digits")
 
 
 EXEC_REFUSALS = ("policy_match", "default_deny_unknown", "certificate_refused", "exec_no_landlock",
@@ -317,6 +343,12 @@ def check_launches(checker, policy, rules, meta, records, complete, problems):
     exec_rules = [i for i, r in enumerate(rules) if r["kind"] == "e"]
     boot = next((r for r in records if r.get("action") == "process.exec"
                  and r.get("rule") == "bootstrap_exec_allow"), None)
+    # review finding 1: the agent's own launch is the run's first record, and the
+    # only one; any other is a launch decided like every later one
+    if records and (boot is None or records[0] is not boot or boot.get("seq") != 0):
+        problems.append("the agent's own launch (bootstrap_exec_allow) is not the run's first record")
+    if sum(1 for r in records if r.get("rule") == "bootstrap_exec_allow") > 1:
+        problems.append("more than one record of the agent's own launch")
     ids = [(e.get("dev"), e.get("ino")) for e in ex]
     if len(set(ids)) != len(ids):
         problems.append("run_start's launch set holds a file twice")
@@ -335,9 +367,14 @@ def check_launches(checker, policy, rules, meta, records, complete, problems):
     ruled = [e for e in ex if e.get("why") == "rule"]
     launches = [r for r in records if r.get("action") == "process.exec" and r.get("rule") != "bootstrap_exec_allow"]
     refused = [r for r in launches if r.get("decision_final") != "ALLOW"]
+    ASKED = ("policy_match", "default_deny_unknown", "exec_not_in_ruleset", "exec_no_landlock",
+             "certificate_refused")
+    for r in refused:                     # review finding 1: every such refusal is asked of the policy
+        if r.get("rule") in ASKED and not (isinstance(r.get("resolved"), str) and r["resolved"]):
+            problems.append(f"seq {r.get('seq')}: a launch refused as {r.get('rule')!r} without the name "
+                            f"it was decided on")
     asked = [(e["name"], e) for e in ruled] + \
-            [(r.get("resolved"), r) for r in refused if r.get("rule") in ("policy_match", "default_deny_unknown",
-                                                                          "exec_not_in_ruleset")
+            [(r.get("resolved"), r) for r in refused if r.get("rule") in ASKED
              and isinstance(r.get("resolved"), str) and r["resolved"]]
     if asked:
         h = subprocess.run([checker, policy, "holds"], capture_output=True, text=True,
@@ -360,8 +397,9 @@ def check_launches(checker, policy, rules, meta, records, complete, problems):
             elif rule == "policy_match" and (fr is None or fr["allow"] or fr["line"] != line):
                 problems.append(f"seq {seq}: a launch refused by line {line!r}, which is not the deny rule "
                                 f"that decides it")
-            elif rule == "exec_not_in_ruleset" and (fr is None or not fr["allow"]):
-                problems.append(f"seq {seq}: a launch refused as not in the set, but the policy does not "
+            elif rule in ("exec_not_in_ruleset", "exec_no_landlock", "certificate_refused") and \
+                    (fr is None or not fr["allow"]):
+                problems.append(f"seq {seq}: a launch refused as {rule!r}, but the policy does not "
                                 f"allow its name")
     for r in refused:
         seq, rule = r.get("seq"), r.get("rule")
@@ -369,6 +407,16 @@ def check_launches(checker, policy, rules, meta, records, complete, problems):
             problems.append(f"seq {seq}: a launch refused as before 1.27, but the policy decides launches")
         elif rule == "exec_no_landlock" and rs.get("landlock") is not None:
             problems.append(f"seq {seq}: a launch refused for want of Landlock, but run_start records it")
+        elif rule == "exec_not_in_ruleset" and rs.get("landlock") is None:      # review finding 5
+            problems.append(f"seq {seq}: a launch refused as not in the set, but without Landlock the "
+                            f"Warden refuses every launch for that")
+        if rule in ("exec_not_in_ruleset", "exec_no_landlock", "certificate_refused") and \
+                r.get("decision_raw") != "ALLOW":
+            problems.append(f"seq {seq}: a launch refused as {rule!r}, which follows only a decision to "
+                            f"allow it, but the decision was {r.get('decision_raw')!r}")
+        elif rule == "exec_unresolved" and r.get("decision_raw") not in ("UNKNOWN", "ALLOW"):
+            problems.append(f"seq {seq}: a launch refused as unresolved after a decision of "
+                            f"{r.get('decision_raw')!r}")
         elif rule == "exec_identity_mismatch":
             pass
         elif rule not in EXEC_REFUSALS:
@@ -389,6 +437,10 @@ def check_launches(checker, policy, rules, meta, records, complete, problems):
         if n > 1 or (complete and n == 0):
             problems.append(f"seq {r.get('seq')}: an allowed launch with {n} exec_result records, not one")
     mism = [r for r in records if r.get("rule") == "exec_identity_mismatch"]
+    killed = sum(1 for _, e in results if e.get("result") == "killed")    # review finding 2
+    if killed and not mism:
+        problems.append(f"{killed} exec_result records say killed, but no process was killed by the "
+                        f"identity check")
     re_ = meta.get("run_end")
     flag = isinstance(re_, dict) and re_.get("exec_identity_mismatch") is True
     if complete and bool(mism) != flag:
@@ -1871,7 +1923,7 @@ def main(argv=None):
     except (OSError, ValueError) as e:
         problems.append(f"checker failed on the policy's launches: {e}")
         launches_policy = False
-    check_exec_set(meta, launches_policy, problems)
+    check_exec_set(meta, launches_policy, problems, records)
     exec_ok = 0
     stub_policy = wild_policy or (proxy_ports is not None and any(
         r["kind"] == "h" and r["name"] and not r["wild"] for r in prules))
@@ -2050,6 +2102,17 @@ def main(argv=None):
                 continue
             exec_ok += 1
         is_open = rec.get("action") == "file.open" and rec.get("rule") in AUTHORIZED_OPEN_RULES
+        if is_open and rec.get("rule") == "open_not_found":                  # review finding 3
+            try:
+                fl = int(str(rec.get("open_flags")), 16)
+            except ValueError:
+                fl = os.O_CREAT
+            if not launches_policy or fl & os.O_CREAT or rec.get("errno") != 2 \
+                    or rec.get("kernel_verdict") == "ALLOW":
+                problems.append(f"seq {rec.get('seq')}: an open recorded as not found, which the Warden "
+                                f"writes only with launches on, for an open that does not create, "
+                                f"answered ENOENT")
+                continue
         is_meta = rec.get("action") in META_ACTIONS and rec.get("rule") in META_RULES
         is_conn = rec.get("action") == "net.connect" and rec.get("rule") in CONNECT_RULES
         # v1.26 (step 6): a name:port the proxy read, allowed: certified as a connect is
