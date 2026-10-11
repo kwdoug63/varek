@@ -1,0 +1,27 @@
+# v1.27.0 latency (tests/latency_v1270.sh, N=1000), 2026-10-10T18:10:40Z
+
+## 1. launches
+VAREK bench --launches (varek 1.2.0), 2026-10-10T18:10:55Z
+Host: Intel(R) Xeon(R) Processor @ 2.10GHz, 4 CPUs, kernel 6.18.44-fc-v114; Landlock ABI 7
+Warden 1.26.1 (8ab2fc2270c97ea0...); 1000 calls of each kind per run, 50 warm-up, 3 rounds, as nobody
+
+microseconds, p50 / p99                                       native    launches off     launches on
+a launch the policy allows (spawn, launch, wait)          934 / 2321       117 / 502     1258 / 2996
+a launch a deny rule refuses                              939 / 2173       116 / 462      306 / 1110
+an allowed open, between launches                            10 / 42        61 / 265       112 / 383
+
+a launch the policy allows (spawn, launch, wait): launches on add +324 us at p50 over native; the Warden decides it in 72 us (p99 203)
+a launch a deny rule refuses: launches on add -633 us at p50 over native; the Warden decides it in 46 us (p99 143)
+an allowed open, between launches: launches on add +102 us at p50 over native; the Warden decides it in 84 us (p99 358)
+An allowed open between launches takes +51 us at p50 with launches on than off; that includes what a real launch does to the host's caches. `varek bench --policy` with a `require warden 1.27` base measures the identity check alone.
+(With launches off, every launch is refused; its row is the time to be refused.)
+
+All 27 checks passed.
+
+## 2. the identity check alone (varek bench, p50 us: the agent's call / the Warden's decision)
+round 1, require warden 1.26: checks passed open_allowed 53.6 / 43; open_denied 43.7 / 10; open_unknown 45.0 / 10; connect_allowed 114.6 / 93; connect_denied 44.3 / 10; request 183.9 / 91
+round 1, require warden 1.27: checks passed open_allowed 53.1 / 42; open_denied 41.8 / 10; open_unknown 44.7 / 11; connect_allowed 111.4 / 88; connect_denied 44.6 / 11; request 179.6 / 87
+round 2, require warden 1.26: checks passed open_allowed 51.9 / 41; open_denied 41.0 / 9; open_unknown 43.7 / 9; connect_allowed 109.1 / 85; connect_denied 43.4 / 9; request 168.6 / 84
+round 2, require warden 1.27: checks passed open_allowed 54.3 / 44; open_denied 44.5 / 12; open_unknown 44.9 / 12; connect_allowed 113.1 / 91; connect_denied 44.7 / 11; request 180.1 / 90
+round 3, require warden 1.26: checks passed open_allowed 52.2 / 41; open_denied 41.2 / 9; open_unknown 43.6 / 10; connect_allowed 110.5 / 89; connect_denied 42.7 / 9; request 173.5 / 87
+round 3, require warden 1.27: checks passed open_allowed 52.8 / 41; open_denied 40.9 / 10; open_unknown 44.4 / 10; connect_allowed 111.0 / 88; connect_denied 44.5 / 10; request 173.7 / 86

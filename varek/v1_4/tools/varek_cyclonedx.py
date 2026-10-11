@@ -250,6 +250,10 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             if event == "request_body" and run is not None and rec.get("run") == run \
                     and meta is not None:
                 meta.setdefault("request_bodies", []).append((len(records), rec))
+            # v1.27 (step 4): each allowed launch's outcome, after its record
+            if event == "exec_result" and run is not None and rec.get("run") == run \
+                    and meta is not None:
+                meta.setdefault("exec_results", []).append((len(records), rec))
             if event in ("resolution", "dns_question", "synthetic_address") and run is not None \
                     and rec.get("run") == run and meta is not None:
                 meta.setdefault("dns_events", []).append(rec)
@@ -508,6 +512,40 @@ def _proxy_text(records, pm):
     return text, facts
 
 
+def _launch_text(records, pm):
+    """v1.27 (step 5): decided launches, from run_start (Landlock and the
+    launch set) and the launch records. Nothing when the run did not decide
+    launches (no launch set in run_start)."""
+    rs = pm.get("run_start") or {}
+    ex = rs.get("exec_ruleset")
+    if not isinstance(ex, list):
+        return "", []
+    ll = rs.get("landlock")
+    abi = str(ll.get("abi")) if isinstance(ll, dict) else "none"
+    digest = hashlib.sha256(json.dumps(ex, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    launches = [r for r in records if r.get("action") == "process.exec" and r.get("rule") != "bootstrap_exec_allow"]
+    allowed = [r for r in launches if r.get("rule") == "exec_allowed"]
+    results = [e for _, e in pm.get("exec_results", [])]
+    ran = sum(1 for e in results if e.get("result") == "launched")
+    killed = [r for r in records if r.get("rule") == "exec_identity_mismatch"]
+    facts = [("varek:launches.landlock_abi", abi),
+             ("varek:launches.set.files", str(len(ex))),
+             ("varek:launches.set.sha256", digest),
+             ("varek:launches.total", str(len(launches))),
+             ("varek:launches.allowed", str(len(allowed))),
+             ("varek:launches.launched", str(ran)),
+             ("varek:launches.refused", str(len(launches) - len(allowed))),
+             ("varek:launches.refused.not_in_set", str(sum(1 for r in launches if r.get("rule") == "exec_not_in_ruleset"))),
+             ("varek:launches.killed", str(len(killed)))]
+    text = (f" Launches after the agent's own were decided by the policy's exec rules"
+            f"{f', the agent held by Landlock (ABI {abi})' if abi != 'none' else ' (no Landlock: all refused)'} "
+            f"to a launch set of {len(ex)} file(s) fixed at startup: {len(launches)} launch(es) decided, "
+            f"{len(allowed)} allowed ({ran} seen running the program decided), "
+            f"{len(launches) - len(allowed)} refused" +
+            (f"; {len(killed)} process(es) found running a program not decided were killed." if killed else "."))
+    return text, facts
+
+
 def build_bom(records, agent, policy, serial, run_id="", complete=True,
               warden_version=VAREK_VERSION, policy_sha256="", log_info=None,
               plan_gate=None, policy_check="not checked", proxy_meta=None):
@@ -601,7 +639,11 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
                 {"name": "varek:certificate.rule", "value": str(r["cert_rule"])},
                 {"name": "varek:certificate.witness", "value": str(r.get("cert_witness", ""))},
                 {"name": "varek:certificate.check", "value": str(r.get("check", ""))},
-            ] if "cert_rule" in r else []),
+            ] if "cert_rule" in r else []) + ([
+                # v1.27: a launched program: the file of the launch set it ran,
+                # by its SHA-256 at startup
+                {"name": "varek:exec.sha256", "value": str(r["exec_sha256"])},
+            ] if r.get("action") == "process.exec" and isinstance(r.get("exec_sha256"), str) else []),
         }
         components.append(comp)
 
@@ -616,6 +658,9 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
     pt, pfacts = _proxy_text(records, proxy_meta or {})
     attest_text += pt
     facts += pfacts
+    lt, lfacts = _launch_text(records, proxy_meta or {})       # v1.27
+    attest_text += lt
+    facts += lfacts
     agent_component["properties"] += [{"name": k, "value": v} for k, v in facts]
 
     annotation = {

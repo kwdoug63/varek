@@ -9,6 +9,31 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.27.0] - 2026-10-11 — Decided program launches
+
+With `require warden 1.27`, `allow exec` rules take effect for every launch
+after the agent's own. At startup the Warden expands them to the files they
+admit (an exact path, a prefix or a glob; each dynamic program's loader; a
+deny on a file's own path keeps it out), records each file's device, inode
+and SHA-256 in `run_start`, and runs the agent in a Landlock domain that
+lets it launch those files and no others. Each launch is decided on its name
+by the SMT decision procedure, certified, and recorded; before the Warden
+answers any call of a launched process it checks the process runs a program
+it decided to run, and kills it otherwise. Without Landlock, launches stay
+refused. With the opt-in, `access(X_OK)`, lookups under missing directories
+and opens of missing files are answered as a compile needs; gcc compiles
+and links under the Warden. `vfork`, `dup2` and `kill` (a positive pid) are
+admitted; `memfd_create` stays refused. The audit, `varek refusals`, the
+CycloneDX export, `varek doctor`, the preflight, `varek policy show` and
+`varek bench --launches` cover it. The Warden reports version 1.27.0.
+
+Reviewed by AI review agents (not a human or third-party review; three of
+the five were stopped partway by a safety classifier); a 24-hour soak on a
+1 GB host passed, and a trial of the reviewed build. Shared libraries are
+not decided (planned for v1.27.1). See `RELEASE-v1.27.0.md` for the tests,
+latency, the review's findings, compatibility and known limits, and
+`docs/security/v1.27-program-launches.md` for the design.
+
 ## [1.26.1] - 2026-10-10 — The egress proxy, inspecting mode
 
 With `proxy inspect`, the proxy (now its own binary, `warden-proxy`, loaded

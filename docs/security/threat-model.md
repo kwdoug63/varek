@@ -33,8 +33,9 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
   Base document for per-component status).
 - **Trust boundary 3:** the enforcement layer — the Warden supervisor and the
   kernel mechanisms it relies on (seccomp user-notification and seccomp-BPF,
-  PID namespaces, and capability restrictions). Landlock is on the v1.10 roadmap
-  and is not wired into the current Warden.
+  PID namespaces, and capability restrictions; from v1.27, under `require
+  warden 1.27`, Landlock, which holds the set of files the agent may
+  launch).
 - **Trust boundary 4 (v1.24):** the host's DNS resolver, or the server named by
   `--dns-server`. The Warden trusts its answers for the names a policy names
   and does not validate DNSSEC itself. Whoever controls an allowed name's DNS
@@ -71,6 +72,13 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
   believed. The CA's name constraints permit only the names the policy lets
   the agent reach on proxied ports, and exclude the passthrough hosts and
   every IP address.
+- **Trust boundary 9 (v1.27):** under `require warden 1.27`, the files the
+  launch set holds, as they are at startup. The Warden decides which files
+  the policy allows and records each one's device, inode and SHA-256; the
+  kernel's Landlock then lets the agent launch those files and no others.
+  A file in the set that is changed in place keeps its inode, and the
+  record's hash is the one taken at startup. The dynamic loader is in the
+  set whenever a dynamic program is, though the policy need not allow it.
 
 ## 3. Adversary models
 
@@ -346,6 +354,39 @@ Model-B techniques below, with the residual limits stated honestly.
     allowed and asked of the policy again when refused, each body within its
     rule, and each close's count.
 
+- **Decided program launches (v1.27).** With `require warden 1.27`, each
+  launch after the agent's own is decided before it happens; without it,
+  every later launch is refused as before.
+  - *Decided on its name.* An `execve` or `execveat` is decided on the path
+    as written, made absolute, with `.` and `..` resolved and a final
+    symlink keeping its name (`execveat(fd, "", AT_EMPTY_PATH)` on the
+    descriptor's file), by the SMT decision procedure, with a certificate
+    the checker must accept; the checker's own reading of the opt-in must
+    also turn launches on.
+  - *Only the set can launch.* An allowed launch must name a file of the
+    launch set built at startup (same device and inode); the kernel's
+    Landlock domain, applied to the agent before its own launch and
+    inherited by every process it starts, refuses any other file: one not
+    in the set, one written during the run, an `O_TMPFILE` or unlinked file
+    through `/proc/self/fd` or `execveat`, a file in `/dev/shm`. The agent
+    cannot make a memfd (`memfd_create` is in the hard-deny set; a build
+    check keeps it there), which Landlock would not govern.
+  - *What runs is what was decided.* A swap of the path after the decision
+    can reach only a file in the set; before the Warden answers any call
+    of a process that has launched, `/proc/<pid>/exe` must be a program it
+    decided to run (a file in the set only as a loader never is), and a
+    process that is not is killed before its call is answered, recorded,
+    and fails the run.
+  - *Fail closed.* Without Landlock, every launch after the agent's own is
+    refused (`exec_no_landlock`), as before. A policy the Warden cannot turn
+    into a set of files (a rule it cannot expand, a malformed program, more
+    than 256 files a rule) refuses the start.
+  - *Recorded and audited.* `run_start` records Landlock's ABI and each
+    file of the set; each allowed launch records the file and its startup
+    hash, and has one `exec_result`. `varek_audit.py` asks the policy again
+    about the set and each launch and refusal, and fails a run in which a
+    process was killed.
+
 The per-class status of every known bypass class is maintained in
 `docs/security/bypass-classes.md`.
 
@@ -486,6 +527,26 @@ are claimed as solved.
     once the CA expires.
   - *Review.* v1.26.1 was reviewed by AI review agents, not by a human or
     third party; its findings are listed in the design note.
+- Decided program launches (v1.27):
+  - *Libraries are not decided.* Landlock governs what the kernel launches,
+    not the executable mappings of shared libraries. Where a policy lets the
+    agent both write and read a directory, code it writes there as a shared
+    library may run inside an allowed program (`LD_PRELOAD`, `dlopen`, an
+    interpreter's native extension), held still by the file and network
+    rules. Not verified under the Warden; v1.27.1 is planned to mount the
+    policy's writable paths `noexec` in the agent's mount namespace.
+  - *Arguments are not decided* or recorded: `allow exec /usr/bin/git`
+    allows `git` with any arguments.
+  - *Interpreters and shells are broad.* Allowing one lets the agent run any
+    code it can read with it; lint and the Warden say so.
+  - *A swap between allowed programs is killed, not prevented.* The program
+    swapped in may run until its first mediated call. The planned
+    20,000-swap race test was not built.
+  - *A file changed in place* after startup is launched as it now is; the
+    record's hash is the one from startup.
+  - *Review.* v1.27 was reviewed by AI review agents, not by a human or
+    third party; three of the five were stopped partway by a safety
+    classifier. Its findings are listed in the design note.
 - File opens run as root (pre-dates v1.24, found in the v1.24 review). The
   Warden opens a file for the agent with its own credentials, so a path the
   policy lets the agent write is writable even when the file is root-owned

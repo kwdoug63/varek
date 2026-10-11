@@ -314,7 +314,8 @@ static int policy_load(const char *path, struct policy *p) {
             "(warden_faultinject); never use it to supervise a real agent\n");
 #endif
     snprintf(p->name,    sizeof(p->name),    "default");
-    snprintf(p->version, sizeof(p->version), "1.26");
+    /* the grammar this Warden implements (v1.27: from smt_decide.h, not a copy) */
+    snprintf(p->version, sizeof(p->version), "%d.%d", VDP_WARDEN_MAJOR, VDP_WARDEN_MINOR);
     char err[512];
     /* v1.15: read the file once. The decision procedure and the certificate
      * checker parse these same bytes, and their SHA-256 goes in run_start, so
@@ -391,6 +392,14 @@ static int policy_load(const char *path, struct policy *p) {
                 "the proxy directives differently; refusing to start\n", path);
         return -1;
     }
+    /* v1.27 review: and whether launches after the first are decided, so the
+     * checker's own reading gates them too (exec_launch requires it) */
+    if (p->v.launches != (p->c.launches != 0)) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
+                "require warden differently (launches %s and %s); refusing to start\n", path,
+                p->v.launches ? "on" : "off", p->c.launches ? "on" : "off");
+        return -1;
+    }
     /* v1.13: load-time analysis. The decision procedure decides, for every
      * rule, whether ANY action can reach it as the first matching rule. A rule
      * that can never fire is almost always a policy bug (typically a deny
@@ -402,6 +411,10 @@ static int policy_load(const char *path, struct policy *p) {
         const vdp_rule_t *r = &p->v.rules[i];
         char adv[512];
         if (vdp_rule_advisory(r, adv, sizeof adv))
+            fprintf(stderr, "[warden] policy %s:%d: note: %s\n", path, r->line, adv);
+        /* v1.27: an interpreter or shell allowed to launch, a file both
+         * launched and written */
+        if (vdp_exec_advisory(&p->v, i, adv, sizeof adv))
             fprintf(stderr, "[warden] policy %s:%d: note: %s\n", path, r->line, adv);
         if (rr == VDP_DEAD) {
             dead++;
@@ -416,6 +429,14 @@ static int policy_load(const char *path, struct policy *p) {
                     vdp_reach_unknown_text());
         }
     }
+    /* v1.27: exec rules without the opt-in decide only the agent's own launch */
+    for (size_t i = 0; !p->v.launches && i < p->v.n; i++)
+        if (p->v.rules[i].kind == VDP_KIND_EXEC && p->v.rules[i].verb == VDP_ALLOW) {
+            fprintf(stderr, "[warden] policy %s:%d: note: exec rules take effect for launches after "
+                    "the first only with `require warden 1.27`; without it every later launch is "
+                    "refused\n", path, p->v.rules[i].line);
+            break;
+        }
     /* v1.26.1: a request rule whose host no host rule allows on its port */
     for (size_t i = 0; i < p->v.n; i++) {
         char hw[300];
@@ -849,7 +870,9 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
             s = a->resolved;
             if (s[0] == '\0') { a->why = "no_resolved_destination"; return DEC_UNKNOWN; }
             break;
-        case ACT_PROCESS_EXEC: kind = VDP_KIND_EXEC; s = a->target; break;
+        /* v1.27: on the name exec_name made (absolute), when launches are
+         * decided; before 1.27, on the path as written */
+        case ACT_PROCESS_EXEC: kind = VDP_KIND_EXEC; s = a->resolved[0] ? a->resolved : a->target; break;
         case ACT_NET_REQUEST: kind = VDP_KIND_REQUEST; s = a->resolved; break;      /* v1.26.1 */
         default:
             a->why = "not_in_fragment";
@@ -884,6 +907,9 @@ static const char *decision_rule_id(const struct action *a, decision_t d_raw) {
 static FILE *g_log;
 static void log_line_start(void);
 static void json_escape(FILE *f, const char *s);
+static void exec_ruleset_record(FILE *f);     /* v1.27: warden_exec.inc.c */
+struct action;
+static int exec_access_x(int ofd, const struct action *a);   /* v1.27: warden_exec.inc.c */
 
 /* v1.15: before a SATISFIED verdict authorizes anything, the procedure emits a
  * certificate (the deciding rule and a witness that its constant matches) and
@@ -905,7 +931,7 @@ static bool certify(const struct policy *p, struct action *a) {
         case ACT_NET_CONNECT:  kind = VDPC_HOST; s = a->resolved; break;   /* v1.21 */
         case ACT_NET_PROXY:    kind = VDPC_HOST; s = a->resolved; break;   /* v1.26 */
         case ACT_NET_REQUEST:  kind = VDPC_REQUEST; s = a->resolved; break; /* v1.26.1 */
-        case ACT_PROCESS_EXEC: kind = VDPC_EXEC; s = a->target;   break;
+        case ACT_PROCESS_EXEC: kind = VDPC_EXEC; s = a->resolved[0] ? a->resolved : a->target; break;
         default:
             snprintf(a->check_why, sizeof a->check_why, "no certificate for this action kind");
             return false;
@@ -1584,11 +1610,16 @@ static int relay_agent_stderr(int fd, bool drain_all) {
     return 0;
 }
 
+#define WARDEN_VSTR_(x) #x
+#define WARDEN_VSTR(x) WARDEN_VSTR_(x)
+#define WARDEN_VERSION WARDEN_VSTR(VDP_WARDEN_MAJOR) "." WARDEN_VSTR(VDP_WARDEN_MINOR) ".0"
+
 static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
-    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"1.26.1\","
+    /* the version is one literal, so `varek version` can read it from the binary */
+    fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"" WARDEN_VERSION "\","
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
@@ -1647,6 +1678,8 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
             fputs("]},", f);
         }
     }
+    /* v1.27: Landlock and the launch set (require warden 1.27) */
+    if (p->v.launches) exec_ruleset_record(f);
     /* v1.25 (section 4): each wildcard allow rule's budgets, defaults filled in */
     if (g_any_wild) {
         fputs("\"wildcard_budgets\":[", f);
@@ -1882,17 +1915,21 @@ static void emit_unanswered(void) {
 
 static void px_finish(void);           /* v1.26 step 7 (warden_pxdecide.inc.c) */
 static bool g_px_failed;               /* v1.26.1 review: the proxy misbehaved while flushing */
+static unsigned g_exec_mismatch;       /* v1.27: processes killed by the identity check */
+static void exec_finish(void);         /* v1.27: warden_exec.inc.c */
 static void emit_run_end(int exit_status) {
     px_finish();                        /* v1.26: every relay's proxy_close */
+    exec_finish();                      /* v1.27: launches never seen */
     emit_unanswered();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
     fprintf(f, "{\"event\":\"run_end\",\"run\":\"%s\",\"records\":%" PRIu64 ","
-               "\"exit_status\":%d,%s%s\"timestamp_ns\":%lld}\n",
+               "\"exit_status\":%d,%s%s%s\"timestamp_ns\":%lld}\n",
             g_run_id, g_records, exit_status,
             g_anchor_errors ? "\"anchor_errors_seen\":true," : "",
             g_px_failed ? "\"proxy_failed\":true," : "",
+            g_exec_mismatch ? "\"exec_identity_mismatch\":true," : "",
             (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end("run_end");
 }
@@ -2673,7 +2710,9 @@ static int64_t meta_answer(pid_t tid, int notify_fd, uint64_t id,
          * behalf (decided above). Nothing may be executed after the launch
          * (deny-only), so X_OK is refused. */
         if (a->access_mode & ~(F_OK | R_OK | W_OK | X_OK)) return -EINVAL;
-        if (a->access_mode & X_OK) return -EACCES;
+        /* v1.27: with launches decided, X_OK says whether a launch of it would
+         * be allowed (a file), or grants search like a read (a directory) */
+        if (a->access_mode & X_OK) return exec_access_x(ofd, a);
         return 0;
     }
     /* readlink: the kernel takes the size as an int. */
@@ -2729,6 +2768,40 @@ static int meta_on_held_fd(pid_t tid, int notify_fd, uint64_t id, const struct a
  * exist, *ofd is -1, a->resolved is <canonical parent>/<name> and *missing is
  * the errno the agent's own call would have seen, so the decision is made on
  * where it would be. Returns 0, or -1 to fail closed. */
+/* v1.27: a lookup whose path leaves the filesystem before its last name
+ * (a parent is missing too). Walk it one name at a time, as the kernel does
+ * ("." skipped, ".." to the real parent, symlinks followed, no magic links),
+ * to the first name that does not exist: that is where the kernel's lookup
+ * stops with ENOENT. 0 with *pfd (its directory) and name, or -1. */
+static const struct policy *g_exec_policy;   /* set with launches decided (warden_exec.inc.c) */
+static int meta_first_missing(int base, const char *path, int *pfd, char *name, size_t nn) {
+    int cur = path[0] == '/' ? open("/", O_PATH | O_DIRECTORY | O_CLOEXEC) : dup(base);
+    if (cur < 0) return -1;
+    char buf[PATH_LIMIT];
+    snprintf(buf, sizeof buf, "%s", path);
+    char *save = NULL;
+    for (char *c = strtok_r(buf, "/", &save); c; c = strtok_r(NULL, "/", &save)) {
+        if (!strcmp(c, ".")) continue;
+        int nx = openat2_path(cur, c, 0);
+        if (nx < 0) {
+            struct stat st;
+            if (errno == ENOENT && strcmp(c, "..") && strlen(c) < nn &&
+                fstatat(cur, c, &st, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT) {
+                snprintf(name, nn, "%s", c);
+                *pfd = cur;
+                return 0;
+            }
+            break;                         /* a dangling link, a refusal: fail closed */
+        }
+        struct stat st;
+        if (fstat(nx, &st) < 0 || !S_ISDIR(st.st_mode)) { close(nx); break; }
+        close(cur);
+        cur = nx;
+    }
+    close(cur);
+    return -1;
+}
+
 static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *missing) {
     *ofd = -1;
     *missing = 0;
@@ -2784,8 +2857,16 @@ static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *mi
     else if (slash == path) snprintf(dir, sizeof(dir), "/");
     else                    snprintf(dir, sizeof(dir), "%.*s", (int)(slash - path), path);
     int pfd = openat2_path(base, dir, (uint64_t)O_DIRECTORY);
+    /* the parent is missing too: fail closed, as before 1.27; with launches
+     * decided (a coding agent's compiler looks up include directories under
+     * missing ones), decide on where the kernel's lookup stops */
+    if (pfd < 0 && errno == ENOENT && g_exec_policy && g_exec_policy->v.launches) {
+        static char nm[256];
+        int q = -1;
+        if (meta_first_missing(base, path, &q, nm, sizeof nm) == 0) { pfd = q; name = nm; }
+    }
     close(base);
-    if (pfd < 0) return -1;              /* the parent is missing too: fail closed */
+    if (pfd < 0) return -1;
     /* Only a name that truly does not exist is decided on where it would be.
      * If it exists (a trailing slash on a file, ENOTDIR; or a symlink whose
      * target is missing), failing here would answer for an object the
@@ -2821,6 +2902,7 @@ static void syn_hosts_view(const struct policy *p, FILE *f);
 #include "warden_synth.inc.c"        /* v1.26: synthetic addresses with the proxy on */
 #include "warden_pxdecide.inc.c"     /* v1.26: the Warden's decisions on what the proxy reads */
 #include "warden_trust.inc.c"        /* v1.26.1: the run's CA and the trust views */
+#include "warden_exec.inc.c"         /* v1.27: the launch set and its Landlock ruleset */
 
 /* ---------------- receive loop ---------------- */
 
@@ -2938,6 +3020,11 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             continue;
         }
 
+        /* v1.27 (step 4): with launches decided, before anything is
+         * answered, the calling process must run a program the Warden
+         * decided to run (warden_exec.inc.c) */
+        if (exec_identity(notify_fd, &req, &act, &t0)) continue;
+
         /* Bootstrap launch: the target's own first execve of the operator-
          * specified binary is authorized by the act of launching it, and is
          * answered with CONTINUE. That is sound only while nothing else can
@@ -2966,6 +3053,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             if (boot_by_fd)
                 snprintf(act.target, sizeof act.target, "%s", bootstrap_path);
             bootstrap_done = true;
+            g_exec_checking = p->v.launches;   /* v1.27 step 4: from here on */
             if (ctx) ctx->launched = true;
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat_b = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
@@ -2973,6 +3061,14 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             emit_pathology(g_report_seq++, req.pid, &act, DEC_ALLOW, DEC_ALLOW,
                            "bootstrap_exec_allow", lat_b, 0);
             send_simple(notify_fd, req.id, DEC_ALLOW);
+            continue;
+        }
+
+        /* v1.27: with `require warden 1.27`, a launch after the first is
+         * decided on its name and allowed only onto a file of the launch set,
+         * which Landlock holds the agent to (warden_exec.inc.c) */
+        if (act.kind == ACT_PROCESS_EXEC && p->v.launches) {
+            exec_launch(notify_fd, &req, &act, p, &t0);
             continue;
         }
 
@@ -3122,6 +3218,26 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         }
         if (act.kind == ACT_FILE_OPEN) {
             if (resolve_target(req.pid, &act, &rt) < 0) {
+                /* v1.27: with launches decided, an open (not creating) of a
+                 * name that does not exist is decided on where it would be,
+                 * as a lookup is (v1.17): ENOENT where the policy allows the
+                 * read, EACCES elsewhere. Before 1.27, refused as before. */
+                int mofd = -1, miss = 0;
+                if (g_exec_policy && g_exec_policy->v.launches && !(act.open_flags & O_CREAT) &&
+                    resolve_meta(req.pid, &act, -1, &mofd, &miss) == 0 && mofd < 0 && miss == ENOENT &&
+                    in_protected_dir(act.resolved, -1) == 0) {
+                    decision_t nr = policy_decide(p, &act);
+                    bool nok = nr == DEC_ALLOW && certify(p, &act);
+                    clock_gettime(CLOCK_MONOTONIC, &t1);
+                    emit_pathology(g_report_seq++, req.pid, &act, nr, nok ? DEC_ALLOW : DEC_DENY,
+                                   nok ? "open_not_found" : nr == DEC_ALLOW ? "certificate_refused"
+                                                                         : decision_rule_id(&act, nr),
+                                   (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec),
+                                   nok ? ENOENT : EACCES);
+                    send_errno(notify_fd, req.id, nok ? ENOENT : EACCES);
+                    continue;
+                }
+                if (mofd >= 0) close(mofd);
                 clock_gettime(CLOCK_MONOTONIC, &t1);
                 uint64_t lat_r = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                                + (t1.tv_nsec - t0.tv_nsec);
@@ -4477,6 +4593,25 @@ int main(int argc, char **argv) {
                 p.v.proxy_inspect ? "inspecting mode" : "SNI mode", g_proxy.port, (unsigned)g_proxy.uid, (unsigned)g_proxy.gid);
     }
     if (proxy_fd >= 0) close(proxy_fd);
+    /* v1.27: with `require warden 1.27`, the files the agent may launch and
+     * the Landlock ruleset that holds it to them (warden_exec.inc.c) */
+    if (p.v.launches) {
+        if (exec_ruleset_build(&p, target_argv ? boot_path : NULL) < 0) {
+            if (g_sk) sodium_free(g_sk);
+            return 1;
+        }
+        fprintf(stderr, "[warden] launch set: %zu files, %s\n", g_exec_n,
+                g_ll_abi >= 1 ? "held by Landlock" : "no Landlock: later launches refused");
+        if (g_check_only)
+            for (size_t k = 0; k < g_exec_n; k++) {
+                const struct exec_file *e = &g_exec_rs[k];
+                bool same = !strcmp(e->name, e->path);
+                fprintf(stderr, "[warden]   %s%s%s, sha256 %.16s..., %s", e->name, same ? "" : " -> ",
+                        same ? "" : e->path, e->sha, e->why);
+                if (e->line) fprintf(stderr, " (line %d)", e->line);
+                fputc('\n', stderr);
+            }
+    }
     if (g_check_only) {
         /* v1.24: resolve each allowed name and report the ones that fail (a
          * name that does not resolve does not stop the Warden). */
@@ -4609,6 +4744,7 @@ int main(int argc, char **argv) {
 
     pid_t target = fork();
     if (target < 0) { perror("fork"); return 1; }
+    if (target > 0 && g_ll_fd >= 0) { close(g_ll_fd); g_ll_fd = -1; }   /* v1.27: the agent holds it */
 
     if (target == 0) {
         signal(SIGPIPE, SIG_DFL);       /* v1.16: an ignored signal survives execve */
@@ -4657,6 +4793,14 @@ int main(int argc, char **argv) {
         if (crc < 0) {
             fprintf(stderr, "[warden-target] lifecycle coupling failed (%s); "
                             "refusing to run unsupervised\n", strerror(-crc));
+            _exit(1);
+        }
+        /* v1.27: the agent enters the launch set's Landlock domain before
+         * its filter is installed (the filter does not admit the call) and
+         * before its own launch, which the set holds */
+        if (exec_ruleset_apply() < 0) {
+            fprintf(stderr, "[warden-target] cannot enter the Landlock domain (%s); refusing to run\n",
+                    strerror(errno));
             _exit(1);
         }
         int notify_fd =
@@ -4814,5 +4958,6 @@ int main(int argc, char **argv) {
     close(target_pidfd);
     close(notify_fd);
     if (g_px_failed && rc == 0) rc = 1;      /* v1.26.1 review: the run did not end cleanly */
+    if (g_exec_mismatch && rc == 0) rc = 1;  /* v1.27: a process ran what was not decided */
     return rc;
 }

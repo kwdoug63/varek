@@ -115,7 +115,7 @@ static const char *reach_name(vdp_reach_t r) {
 
 int main(int argc, char **argv) {
     if (argc != 3 && !(argc == 4 && !strcmp(argv[2], "analyze") && !strcmp(argv[3], "automaton"))) {
-        fprintf(stderr, "usage: %s <policy> lint|analyze [automaton]|batch\n", argv[0]);
+        fprintf(stderr, "usage: %s <policy> lint|analyze [automaton]|batch|launches\n", argv[0]);
         return 2;
     }
     if (argc == 4) vdp_reach_force_automaton = true;
@@ -127,6 +127,11 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (!strcmp(argv[2], "batch")) return do_batch();
+    /* v1.27: are launches after the first decided (require warden 1.27)? */
+    if (!strcmp(argv[2], "launches")) {
+        printf("%s\n", g_pol.launches ? "on" : "off");
+        return 0;
+    }
     if (!strcmp(argv[2], "analyze")) {
         static char wit[VDP_STR_MAX + 1];
         for (size_t i = 0; i < g_pol.n; i++) {
@@ -153,6 +158,10 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < g_pol.n; i++) {
             char adv[512], hw[160];
             if (vdp_rule_advisory(&g_pol.rules[i], adv, sizeof adv))
+                printf("%s:%d: note: %s\n", argv[1], g_pol.rules[i].line, adv);
+            /* v1.27: an interpreter or shell allowed to launch, or a file both
+             * launched and written */
+            if (vdp_exec_advisory(&g_pol, i, adv, sizeof adv))
                 printf("%s:%d: note: %s\n", argv[1], g_pol.rules[i].line, adv);
             /* v1.21: a host rule whose constant no connect can produce (a
              * non-canonical spelling, or a v1.24 host name without `require
@@ -206,6 +215,35 @@ int main(int argc, char **argv) {
                 shared++;
             }
         }
+        /* v1.27 review: with launches on, an allow exec rule the Warden cannot
+         * expand to a set of files refuses its start; say so here, and fail */
+        int noexpand = 0;
+        for (size_t i = 0; g_pol.launches && i < g_pol.n; i++) {
+            const vdp_rule_t *r = &g_pol.rules[i];
+            if (r->kind != VDP_KIND_EXEC || r->verb != VDP_ALLOW) continue;
+            const char *c = r->s.c, *why = NULL;
+            size_t cl = strlen(c);
+            if (r->s.op != VDP_STR_EQ && r->s.op != VDP_STR_PREFIX && r->s.op != VDP_STR_GLOB)
+                why = "a suffix or contains rule cannot be expanded to the files it admits";
+            else if (r->s.op == VDP_STR_GLOB && c[0] != '/')
+                why = "a glob must start with a directory (\"/...\") to be expanded";
+            else if (c[0] == '/' && (strstr(c, "/./") || strstr(c, "/../") || strstr(c, "//") ||
+                     (cl >= 2 && !strcmp(c + cl - 2, "/.")) || (cl >= 3 && !strcmp(c + cl - 3, "/.."))))
+                why = "its path holds a \".\" or \"..\" segment or \"//\"; launches are decided on names "
+                      "without them";
+            if (why) {
+                printf("%s:%d: allow exec is refused by the Warden at start: %s\n", argv[1], r->line, why);
+                noexpand++;
+            }
+        }
+        /* v1.27: exec rules without the opt-in decide only the first launch */
+        for (size_t i = 0; !g_pol.launches && i < g_pol.n; i++)
+            if (g_pol.rules[i].kind == VDP_KIND_EXEC && g_pol.rules[i].verb == VDP_ALLOW) {
+                printf("%s:%d: note: exec rules take effect for launches after the first only with "
+                       "`require warden 1.27`; without it every later launch is refused\n",
+                       argv[1], g_pol.rules[i].line);
+                break;
+            }
         /* v1.16: the policy's glob size against the cap that bounds the work
          * of one decision (4,096 tokens x a 4,095-byte string). */
         printf("%s: glob tokens %zu of %d\n", argv[1], vdp_policy_glob_tokens(&g_pol),
@@ -217,7 +255,7 @@ int main(int argc, char **argv) {
             printf("%s: %zu rules, %d can never fire\n", argv[1], g_pol.n, dead);
         if (shared)
             printf("%s: %d wildcard host rules refused (shared domains)\n", argv[1], shared);
-        return dead || hostnever || shared ? 1 : 0;
+        return dead || hostnever || shared || noexpand ? 1 : 0;
     }
     fprintf(stderr, "unknown mode %s\n", argv[2]);
     return 2;

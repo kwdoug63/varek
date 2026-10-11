@@ -156,6 +156,15 @@ else
 fi
 [ "$rc" -eq 1 ] && warn "lint: $(grep -c ' can never fire (' <<<"$o") rule(s) can never fire and $(grep -c 'so this rule can never match' <<<"$o") host rule(s) can never match a connect (tools/vdp_check $POLICY lint)"
 
+# v1.27: a policy that decides launches needs Landlock for any to run
+if [ "$("$VDP" "$POLICY" launches 2>/dev/null)" = on ]; then
+    ll="$(python3 -c 'import ctypes; l=ctypes.CDLL(None, use_errno=True); l.syscall.restype=ctypes.c_long; r=l.syscall(ctypes.c_long(444), None, ctypes.c_size_t(0), ctypes.c_uint32(1)); print(r if r >= 1 else "errno %d" % ctypes.get_errno())' 2>/dev/null)"
+    case "$ll" in
+        [1-9]*) pass "Landlock ABI $ll: launches the policy allows can run" ;;
+        *)      warn "the policy decides launches (require warden 1.27), but Landlock is not available here (${ll:-no python3 to probe it}): every launch after the agent's own will be refused" ;;
+    esac
+fi
+
 echo "== 3. what the Warden refuses at startup"
 # The canonical path an open would reach, and whether the agent could open it.
 openable() { printf '%s\n' "$1" | "$CERT" "$POLICY" openable | head -1; }

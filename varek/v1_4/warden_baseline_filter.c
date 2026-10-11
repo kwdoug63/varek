@@ -82,6 +82,9 @@ static const char *kAdmit[] = {
     "read", "write", "readv", "writev", "pread64", "pwrite64", "preadv2",
     "pwritev2", "close", "close_range", "lseek", "fstat",
     "fsync", "fdatasync", "dup", "dup3", "fcntl", "pipe2", "eventfd2",
+    // v1.27: dup2, which glibc calls for dup2() on x86_64 and every launcher
+    // uses to give a child its stdin/stdout/stderr; it does what dup3 does
+    "dup2",
     "getdents64", "getcwd",
     // v1.17.0: newfstatat, statx, readlink, readlinkat, access, faccessat and
     // faccessat2 are NO LONGER admitted. They reveal whether any file exists,
@@ -96,6 +99,10 @@ static const char *kAdmit[] = {
     // os.system() failed after the child had already run. Both only reap
     // children of the caller; neither reaches outside the agent's own tree.
     "wait4", "waitid",
+    // v1.27 (decided launches): vfork, which CPython's subprocess and
+    // posix_spawn use; it is clone(CLONE_VM|CLONE_VFORK|SIGCHLD), and can set
+    // no namespace bit. kill is admitted below for a pid above 0 only.
+    "vfork",
     "epoll_create1", "epoll_ctl", "epoll_pwait", "epoll_pwait2",
     // time / sched / ids
     "clock_gettime", "clock_nanosleep", "nanosleep", "gettimeofday", "time",
@@ -405,6 +412,13 @@ static int build(scmp_filter_ctx *out_ctx, int observe) {
     if ((rc = add_list(ctx, kMediate, SCMP_ACT_NOTIFY)) < 0) goto fail;
     if ((rc = add_sends(ctx)) < 0) goto fail;                 // v1.21
     if ((rc = add_setsockopt(ctx)) < 0) goto fail;            // v1.21
+    // v1.27: kill, which subprocess uses to stop a child on a timeout, for a
+    // pid of 1 to 2^31-1 only (the int the kernel reads). The agent runs as
+    // init of its own PID namespace (v1.9.3) and in its own process group, so
+    // any kill reaches only its own processes; kill(0), kill(-1) and
+    // kill(-pgid) fall to the default refusal all the same, for a run with
+    // VAREK_WARDEN_NO_PIDNS=1, where -1 would reach every process of its user.
+    if ((rc = allow_int_range(ctx, SCMP_SYS(kill), 0, 1, 0x7fffffffull, NULL)) < 0) goto fail;
     if ((rc = add_list(ctx, kAdmit, SCMP_ACT_ALLOW)) < 0) goto fail;
     if ((rc = deny_ns_bits(ctx, SCMP_SYS(clone))) < 0) goto fail;
     if ((rc = deny_ns_bits(ctx, SCMP_SYS(unshare))) < 0) goto fail;

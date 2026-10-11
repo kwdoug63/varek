@@ -171,8 +171,9 @@ static int canon_for_open(const char *p, char out[PATH_MAX], int depth) {
 int main(int argc, char **argv) {
     if (argc != 3 || (strcmp(argv[2], "digest") && strcmp(argv[2], "batch") &&
                       strcmp(argv[2], "holds") && strcmp(argv[2], "openable") &&
-                      strcmp(argv[2], "kinds") && strcmp(argv[2], "rules") && strcmp(argv[2], "proxy"))) {
-        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds|rules|proxy\n", argv[0]);
+                      strcmp(argv[2], "kinds") && strcmp(argv[2], "rules") && strcmp(argv[2], "proxy") &&
+                      strcmp(argv[2], "launches"))) {
+        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds|rules|proxy|launches\n", argv[0]);
         return 2;
     }
     FILE *f = fopen(argv[1], "rb");
@@ -203,6 +204,14 @@ int main(int argc, char **argv) {
         char hex[65];
         vdpc_digest_hex(&pol, hex);
         printf("%s\n", hex);
+        vdpc_free(&pol);
+        return 0;
+    }
+
+    /* v1.27: "on" when launches after the first are decided (require warden
+     * 1.27), else "off". varek_audit.py reads it from here. */
+    if (!strcmp(argv[2], "launches")) {
+        printf("%s\n", pol.launches ? "on" : "off");
         vdpc_free(&pol);
         return 0;
     }
