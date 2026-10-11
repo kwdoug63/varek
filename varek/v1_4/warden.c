@@ -392,6 +392,14 @@ static int policy_load(const char *path, struct policy *p) {
                 "the proxy directives differently; refusing to start\n", path);
         return -1;
     }
+    /* v1.27 review: and whether launches after the first are decided, so the
+     * checker's own reading gates them too (exec_launch requires it) */
+    if (p->v.launches != (p->c.launches != 0)) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
+                "require warden differently (launches %s and %s); refusing to start\n", path,
+                p->v.launches ? "on" : "off", p->c.launches ? "on" : "off");
+        return -1;
+    }
     /* v1.13: load-time analysis. The decision procedure decides, for every
      * rule, whether ANY action can reach it as the first matching rule. A rule
      * that can never fire is almost always a policy bug (typically a deny

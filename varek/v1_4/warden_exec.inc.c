@@ -128,14 +128,24 @@ static int exec_elf_interp(int fd, char *out, size_t outn) {
 /* A script's interpreter: the first word after "#!", 1 with it, 0 for a
  * file that is not a script, -1 for a malformed line. */
 static int exec_script_interp(int fd, char *out, size_t outn) {
-    char b[PATH_MAX + 8];
-    ssize_t n = pread(fd, b, sizeof b - 1, 0);
+    /* v1.27 review: read as fs/binfmt_script.c does. The kernel reads the
+     * first 256 bytes (BINPRM_BUF_SIZE); the line ends at a newline or at the
+     * end of what it read; the name ends at a space, tab, NUL or that end. A
+     * name the 256 bytes cut short, or no name at all, is ENOEXEC: no script
+     * (0). A #! line ending at the end of the file runs. */
+    char b[256 + 1];
+    ssize_t n = pread(fd, b, 256, 0);
     if (n < 2 || b[0] != '#' || b[1] != '!') return 0;
     b[n] = '\0';
+    char *nl = memchr(b, '\n', (size_t)n);
+    char *end = nl ? nl : b + n;
     char *s = b + 2;
-    while (*s == ' ' || *s == '\t') s++;
-    size_t k = strcspn(s, " \t\n");
-    if (k == 0 || k >= outn || s[0] != '/' || (s[k] != ' ' && s[k] != '\t' && s[k] != '\n')) return -1;
+    while (s < end && (*s == ' ' || *s == '\t')) s++;
+    size_t k = 0;
+    while (s + k < end && s[k] != ' ' && s[k] != '\t' && s[k] != '\0') k++;
+    if (k == 0) return 0;
+    if (!nl && s + k == b + n && n == 256) return 0;      /* the name runs past what the kernel reads */
+    if (k >= outn || s[0] != '/') return -1;
     memcpy(out, s, k);
     out[k] = '\0';
     return 1;
@@ -165,15 +175,27 @@ static const struct exec_file *exec_rs_find(dev_t dev, ino_t ino) {
     return NULL;
 }
 
-/* Add the file name names (following symlinks) with its loader. 1 added (or
- * already there), 0 not a launchable file (missing, not regular, no execute
- * bit), -1 an error that stops the run (why in err). */
+/* Add the file name names (following symlinks) with its loader. 1 added, 2
+ * already there, 0 not a launchable file (missing, not regular, no execute
+ * bit), -1 an error that stops the run (why in err). The loader is added as
+ * the kernel uses it: its own PT_INTERP is not followed (v1.27 review). */
 static int exec_rs_add(const char *name, const char *why, int line, char *err, size_t en) {
-    int fd = open(name, O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
-    if (fd < 0) return 0;
+    /* v1.27 review: look before opening it to read: a FIFO or a device a rule
+     * names is never opened for reading (opening some has effects) */
+    int pfd = open(name, O_PATH | O_CLOEXEC);
+    if (pfd < 0) return 0;
     struct stat st;
-    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || !(st.st_mode & 0111)) { close(fd); return 0; }
-    if (exec_rs_find(st.st_dev, st.st_ino)) { close(fd); return 1; }
+    if (fstat(pfd, &st) < 0 || !S_ISREG(st.st_mode) || !(st.st_mode & 0111)) { close(pfd); return 0; }
+    if (exec_rs_find(st.st_dev, st.st_ino)) { close(pfd); return 2; }
+    char pp[64];
+    snprintf(pp, sizeof pp, "/proc/self/fd/%d", pfd);
+    int fd = open(pp, O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);   /* the same file */
+    close(pfd);
+    struct stat st2;
+    if (fd < 0 || fstat(fd, &st2) < 0 || st2.st_dev != st.st_dev || st2.st_ino != st.st_ino) {
+        if (fd >= 0) close(fd);
+        return 0;
+    }
     if (g_exec_n == EXEC_RS_MAX) {
         close(fd);
         snprintf(err, en, "the launch set would hold more than %d files", EXEC_RS_MAX);
@@ -200,7 +222,7 @@ static int exec_rs_add(const char *name, const char *why, int line, char *err, s
     int ir = exec_elf_interp(fd, interp, sizeof interp);
     close(fd);
     if (ir < 0) { snprintf(err, en, "%s: a malformed ELF header", name); return -1; }
-    if (ir == 1) {
+    if (ir == 1 && strcmp(why, "loader") != 0) {
         int lr = exec_rs_add(interp, "loader", 0, err, en);
         if (lr < 0) return -1;
         if (lr == 0) {
@@ -217,9 +239,20 @@ static int exec_consider(const struct policy *p, const char *cand, size_t *admit
     int ri = -1;
     vdp_why_t why;
     if (vdp_decide(&p->v, VDP_KIND_EXEC, cand, 0, false, &ri, &why) != VDP_SATISFIED || ri < 0) return 0;
+    /* v1.27 review: a deny exec rule on the file's own path keeps it out,
+     * whatever other name an allow rule reaches it by (a symlink) */
+    char real[PATH_MAX];
+    int dri = -1;
+    if (realpath(cand, real) && strcmp(real, cand) != 0 &&
+        vdp_decide(&p->v, VDP_KIND_EXEC, real, 0, false, &dri, &why) == VDP_UNSATISFIED &&
+        dri >= 0 && p->v.rules[dri].verb == VDP_DENY) {
+        fprintf(stderr, "[warden] note: launch set: %s (line %d) is %s, which line %d denies; it is not "
+                "in the launch set\n", cand, p->v.rules[ri].line, real, p->v.rules[dri].line);
+        return 0;
+    }
     int r = exec_rs_add(cand, "rule", p->v.rules[ri].line, err, en);
     if (r < 0) return -1;
-    if (r > 0 && ++admitted[ri] > EXEC_RULE_MAX_FILES) {
+    if (r == 1 && ++admitted[ri] > EXEC_RULE_MAX_FILES) {
         snprintf(err, en, "line %d admits more than %d files to launch; name them, or narrow the rule",
                  p->v.rules[ri].line, EXEC_RULE_MAX_FILES);
         return -1;
@@ -274,6 +307,20 @@ static int exec_ruleset_build(const struct policy *p, const char *boot_path) {
         /* an exact or prefix constant not starting with '/' matches no
          * launch (the Warden decides on absolute paths; lint notes it) */
         if ((r->s.op == VDP_STR_EQ || r->s.op == VDP_STR_PREFIX) && r->s.c[0] != '/') continue;
+        /* v1.27 review: a launch is decided on its name made absolute, with
+         * "." and ".." segments resolved; a constant holding them would admit
+         * a file no launch could ever be allowed by */
+        {
+            const char *c = r->s.c;
+            size_t cl = strlen(c);
+            if (strstr(c, "/./") || strstr(c, "/../") || strstr(c, "//") ||
+                (cl >= 2 && !strcmp(c + cl - 2, "/.")) || (cl >= 3 && !strcmp(c + cl - 3, "/.."))) {
+                snprintf(err, sizeof err, "line %d: an allow exec rule's path holds a \".\" or \"..\" "
+                         "segment or \"//\"; launches are decided on names without them", r->line);
+                rc = -1;
+                break;
+            }
+        }
         if (r->s.op == VDP_STR_EQ) {
             struct stat st;
             if (stat(r->s.c, &st) < 0 || !S_ISREG(st.st_mode) || !(st.st_mode & 0111))
@@ -284,8 +331,11 @@ static int exec_ruleset_build(const struct policy *p, const char *boot_path) {
             continue;
         }
         if (r->s.op != VDP_STR_PREFIX && r->s.op != VDP_STR_GLOB) {
-            snprintf(err, sizeof err, "line %d: an allow exec rule with %s cannot be expanded to the "
-                     "files it admits; use an exact path, prefix or glob", r->line, vdp_matcher_prefix(r));
+            const char *mp = vdp_matcher_prefix(r);
+            int ml = (int)strlen(mp);
+            while (ml > 0 && mp[ml - 1] == ' ') ml--;
+            snprintf(err, sizeof err, "line %d: an allow exec rule with %.*s cannot be expanded to the "
+                     "files it admits; use an exact path, prefix or glob", r->line, ml, mp);
             rc = -1;
             break;
         }
@@ -532,7 +582,10 @@ static void exec_launch(int notify_fd, const struct seccomp_notif *req, struct a
     } else {
         d_raw = policy_decide(p, a);
         d_final = d_raw == DEC_ALLOW ? DEC_ALLOW : DEC_DENY;
-        if (d_final == DEC_ALLOW && !certify(p, a)) { d_final = DEC_DENY; rule = "certificate_refused"; }
+        /* v1.27 review: the checker's own reading of the opt-in gates every launch too */
+        if (d_final == DEC_ALLOW && (!p->c.launches || !certify(p, a))) {
+            d_final = DEC_DENY; rule = "certificate_refused";
+        }
         else if (d_final == DEC_ALLOW && g_ll_abi < 1) { d_final = DEC_DENY; rule = "exec_no_landlock"; }
         else if (d_final == DEC_ALLOW && !(ef = exec_rs_find(st.st_dev, st.st_ino))) {
             d_final = DEC_DENY;
@@ -608,8 +661,11 @@ static int exec_image_of(const char *path, dev_t *dev, ino_t *ino) {
 }
 
 static void exec_mark_image(dev_t dev, ino_t ino) {
+    /* v1.27 review: a file in the set only as a loader is never a process's
+     * image, even when a script's #! names it */
     for (size_t k = 0; k < g_exec_n; k++)
-        if (g_exec_rs[k].dev == dev && g_exec_rs[k].ino == ino) g_exec_rs[k].image = true;
+        if (g_exec_rs[k].dev == dev && g_exec_rs[k].ino == ino && strcmp(g_exec_rs[k].why, "loader") != 0)
+            g_exec_rs[k].image = true;
 }
 
 static void exec_result(const struct exec_pend *x, const char *result) {
@@ -709,6 +765,10 @@ static bool exec_identity(int notify_fd, const struct seccomp_notif *req, struct
         send_simple(notify_fd, req->id, DEC_DENY);
         return true;
     }
+    /* what it runs, read before the kill (v1.27 review: after, it may be gone) */
+    char canon[PATH_MAX] = "";
+    ssize_t n = readlink(ep, canon, sizeof canon - 1);
+    if (n > 0) canon[n] = '\0';
     /* kill the process (it is blocked in this call, so its pid is its own) */
     pid_t tgid = task_tgid(tid);
     int pfd = tgid > 0 ? (int)syscall(__NR_pidfd_open, tgid, 0) : -1;
@@ -716,9 +776,6 @@ static bool exec_identity(int notify_fd, const struct seccomp_notif *req, struct
     for (size_t k = 0; k < g_nxp; )
         if (g_xp[k].tgid == tgid || g_xp[k].tid == tid) exec_pend_drop(k, "killed"); else k++;
     g_exec_mismatch++;
-    char canon[PATH_MAX] = "";
-    ssize_t n = readlink(ep, canon, sizeof canon - 1);
-    if (n > 0) canon[n] = '\0';
     int w = snprintf(a->extra, sizeof a->extra, "\"exe_dev\":%llu,\"exe_ino\":%llu,\"exe\":\"",
                      (unsigned long long)st.st_dev, (unsigned long long)st.st_ino);
     for (const char *c = canon; *c && w < (int)sizeof a->extra - 8; c++) {   /* a path: escape for JSON */

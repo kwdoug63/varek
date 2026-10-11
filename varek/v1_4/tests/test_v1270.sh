@@ -178,7 +178,7 @@ else
     ln -s "$TRUE" "$W/bin/lnk"; ln -s /usr/bin "$W/bin/dlink"
     printf '#!/bin/sh\necho hi\n' > "$W/bin/s.sh"; chmod 755 "$W/bin/s.sh"
     cp "$TRUE" "$W/many/t0"; chmod 755 "$W/many/t0"
-    for i in $(seq 1 256); do ln "$W/many/t0" "$W/many/t$i"; done
+    for i in $(seq 1 256); do cp "$W/many/t0" "$W/many/t$i"; done
     python3 -c "
 import struct,sys
 e=b'\x7fELF'+bytes([2,1,1])+bytes(9)+struct.pack('<HHIQQQIHHHHHH',2,62,1,0,64,0,0,64,56,1000,64,0,0)
@@ -197,6 +197,13 @@ open(sys.argv[1],'wb').write(e)" "$W/bad/elf"; chmod 755 "$W/bad/elf"
     check "a script whose interpreter the policy does not allow: a note" \
         grep -q "note: launch set: $W/bin/s.sh is a script for /bin/sh, which the policy does not allow" "$OUT/set.out"
     check "the report counts the files and says Landlock holds them" grep -q 'launch set: [0-9]* files, held by Landlock' "$OUT/set.out"
+    # v1.27 review: a deny rule on a file's own path holds against an allowed symlink to it
+    set_of "deny exec $(readlink -f "$TRUE")\nallow exec prefix $W/bin/\n"
+    check "a file reached by an allowed symlink, but denied by its own path, is kept out" \
+        bash -c "$(declare -f in_set); ! in_set '$W/bin/lnk' && grep -q 'lnk (line 3) is .*, which line 2 denies' '$OUT/set.out'"
+    set_of "allow exec $W/bin/../bin/a1\n"
+    check "an allow exec path with a .. segment: the Warden refuses to start" \
+        sh -c "[ \$(cat '$OUT/set.rc') -ne 0 ] && grep -q 'segment or \"//\"' '$OUT/set.out'"
     set_of "allow exec prefix $W/bin/\ndeny exec $W/bin/a2\n"
     check "a deny rule after the allow does not remove it (first match)" bash -c "$(declare -f in_set); in_set '$W/bin/a2'"
     set_of "allow exec glob $W/bin/a[12]\n"
@@ -257,6 +264,12 @@ PY
     check "run_start names this Warden (1.27.0)" rs "$OUT/log/r1.log" 'r["warden"] == "1.27.0"'
     printf 'import os\nfor p in (0, -1):\n    try:\n        os.kill(p, 0); print("KILL", p, "ok")\n    except OSError as e:\n        print("KILL", p, "refused")\nos.kill(os.getpid(), 0); print("KILL self ok", flush=True)\n' > "$W/k.py"; chmod 644 "$W/k.py"
     run rk "$POLR" /usr/bin/python3 "$W/k.py"
+    # v1.27 review: a #! line that ends at the end of the file (no newline) runs, as the kernel runs it
+    printf '#!/usr/bin/python3' > "$W/noeol"; chmod 755 "$W/noeol"
+    printf 'import subprocess\nprint("NOEOL", subprocess.run(["%s/noeol"]).returncode, flush=True)\n' "$W" > "$W/ne.py"; chmod 644 "$W/ne.py"
+    run rne "require warden 1.27\nallow exec /usr/bin/python3\nallow exec $W/noeol\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path $W/ readonly\n" /usr/bin/python3 "$W/ne.py"
+    check "a script whose #! line has no newline: launched, not killed" \
+        sh -c "grep -qx 'NOEOL 0' '$OUT/log/rne.out' && grep -q '\"result\":\"launched\"' '$OUT/log/rne.log' && ! grep -q exec_identity_mismatch '$OUT/log/rne.log'"
     check "kill: the agent may signal a process by pid, not its group or every process (0, -1)" \
         sh -c "grep -qx 'KILL 0 refused' '$OUT/log/rk.out' && grep -qx 'KILL -1 refused' '$OUT/log/rk.out' && grep -qx 'KILL self ok' '$OUT/log/rk.out'"
     check "and each file: its name, canonical path, device, inode and SHA-256" \
