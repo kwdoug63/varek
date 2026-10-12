@@ -185,8 +185,12 @@ def main():
         pk[t["probe"]] = pk.get(t["probe"], 0) + 1
         if t["probe"] == "library":
             # v1.27.1: no launch, no record; the kernel refuses the mapping
+            # (v1.27.1 review: that refusal, in the loader's words, not any failure)
             if not t.get("refused"):
                 bad.append((t, f"a copy of a library in the work directory loaded ({t.get('out')!r})"))
+            elif "failed to map segment from shared object" not in str(t.get("out")):
+                bad.append((t, f"a copy of a library failed to load, but not because its mapping was "
+                               f"refused ({t.get('out')!r})"))
             continue
         mine = [r for r in launches if r.get("resolved") == t["path"]
                 and abs(r.get("timestamp_ns", 0) / 1e9 - t["t"]) < 60]

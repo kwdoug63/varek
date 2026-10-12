@@ -258,11 +258,36 @@ PY
     refuses "a noexec record that is not absolute paths" "$OUT/n3.log" "noexec is malformed"
     python3 "$F" "$OUT/r.log" "$OUT/n4.log" "$RS; rs['noexec'].append(dict(rs['noexec'][0]))"
     refuses "a directory named twice" "$OUT/n4.log" "names a directory twice"
-    python3 "$F" "$OUT/r.log" "$OUT/n5.log" "$RS; rs['noexec'] = [{'path': '/', 'policy_line': 2}]"
+    python3 "$F" "$OUT/r.log" "$OUT/n5.log" "$RS; rs['noexec'] = [{'path': '/', 'target': '/', 'policy_line': 2}]"
     refuses "/ mounted noexec" "$OUT/n5.log" "mounts /, which the Warden refuses"
+    # v1.27.1 review: each entry against its rule, and the list against the writes recorded
+    python3 "$F" "$OUT/r.log" "$OUT/n6.log" "$RS; rs['noexec'][0]['path'] = '/etc'"
+    refuses "another directory named for a writable rule's" "$OUT/n6.log" "matches no path the Warden resolves"
+    python3 "$F" "$OUT/r.log" "$OUT/n7.log" "$RS; rs['noexec'] = [{'path': '$R/ro', 'target': '$R/ro', 'policy_line': 2}]"
+    refuses "a read-only directory named in place of the writable one" "$OUT/n7.log" "the rule's is '$R/w'"
+    python3 "$F" "$OUT/r.log" "$OUT/n8.log" "$RS; rs['noexec'][0]['path'] = rs['noexec'][0]['target'] = '$R/w/.'"
+    refuses "a directory not spelled canonically" "$OUT/n8.log" "not spelled as a canonical path"
+    python3 "$F" "$OUT/r.log" "$OUT/n9.log" "$RS; rs['noexec'].append({'path': '$R/w/sub', 'target': '$R/w', 'policy_line': 2})"
+    refuses "one directory inside another" "$OUT/n9.log" "inside '$R/w'"
+    python3 "$F" "$OUT/r.log" "$OUT/n10.log" "$RS; rs['noexec'][0]['file'] = True"
+    refuses "a file named for a rule that names a directory" "$OUT/n10.log" "names no single file there"
+    python3 "$F" "$OUT/r.log" "$OUT/n11.log" "$RS; rs['warden'] = '1.27.0'"
+    refuses "a noexec record from a Warden before 1.27.1" "$OUT/n11.log" "which mounts nothing noexec"
+    (cd "$R" && env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$R/p.txt" -- /usr/bin/touch "$R/w/made" 2> "$OUT/r2.log")
+    check "the audit accepts a run that writes in the directory it lists" \
+        python3 "$HERE/tools/varek_audit.py" --policy "$R/p.txt" --checker "$CERT" "$OUT/r2.log"
+    python3 "$F" "$OUT/r2.log" "$OUT/n12.log" "$RS; rs['noexec'] = []"
+    refuses "an empty list when the stream records a write" "$OUT/n12.log" "for writing, under no directory"
+    python3 "$F" "$OUT/r.log" "$OUT/n13.log" "$RS; rs['noexec'] = []"
+    refuses "a list that leaves out a writable rule's directory" "$OUT/n13.log" "which run_start's noexec does not list"
+    rm -f "$R/w/made"
     NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 "$HERE/tools/varek" policy show "$R/p.txt" > "$OUT/ps.out" 2>&1
     check "varek policy show lists the directories it would mount noexec" \
         sh -c "grep -q 'Mounted noexec (v1.27.1)' '$OUT/ps.out' && grep -qx '  $R/w (line 2)' '$OUT/ps.out'"
+    printf 'require warden 1.27\nallow path %s/missing/\n' "$R" > "$R/pm.txt"; chmod 644 "$R/pm.txt"
+    NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 "$HERE/tools/varek" policy show "$R/pm.txt" > "$OUT/pm.out" 2>&1
+    check "varek policy show names a writable directory missing on this host, not \"nowhere\"" \
+        sh -c "grep -q '  $R/missing (not there; opens under it refused if it appears) (line 2)' '$OUT/pm.out' && ! grep -q 'write nowhere' '$OUT/pm.out'"
     NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 "$HERE/tools/varek" doctor > "$OUT/dr.out" 2>&1
     check "varek doctor checks the Warden can make a mount namespace" grep -q 'OK    Mount namespaces' "$OUT/dr.out"
     python3 "$HERE/tools/varek_cyclonedx.py" --log "$OUT/r.log" --policy "$R/p.txt" --output "$OUT/bom.json" > /dev/null 2>&1

@@ -37,6 +37,12 @@ mkdir -p "$OUT"; chmod 755 "$OUT"
 AG=/opt/varek-soak1270-agent                 # the agent's script, read-only to it
 WK=/var/tmp/varek-soak1270-work              # its work directory (written)
 rm -rf "$WK"; mkdir -p "$AG" "$WK/run"; chmod 755 "$AG"; chmod 777 "$WK" "$WK/run"
+# v1.27.1 review: the library probe shows the Warden's noexec mount only where
+# the host has not mounted the work directory noexec already
+if findmnt -no OPTIONS --target "$WK" 2>/dev/null | tr , '\n' | grep -qx noexec; then
+    echo "soak: $WK is on a mount the host already has noexec; the library probe would show nothing" >&2
+    exit 2
+fi
 cp "$HERE/soak_agent.py" "$AG/"; chmod 644 "$AG/soak_agent.py"
 printf 'int main(void) { return 0; }\n' > "$WK/t.c"; chmod 644 "$WK/t.c"
 CC="" CCP=""

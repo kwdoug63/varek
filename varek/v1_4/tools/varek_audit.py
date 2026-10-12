@@ -136,6 +136,11 @@ def policy_rules(checker, policy):
     rq = subprocess.run([checker, policy, "rules"], capture_output=True)
     if rq.returncode != 0:
         raise ValueError(rq.stderr.decode(errors="replace").strip() or "the checker failed")
+    # v1.27.1 review: each rule's matcher too (prefix, exact, glob ...), in the same order
+    mq = subprocess.run([checker, policy, "matches"], capture_output=True)
+    if mq.returncode != 0:
+        raise ValueError(mq.stderr.decode(errors="replace").strip() or "the checker failed")
+    matches = mq.stdout.decode().split()
     out = []
     for ln in rq.stdout.decode().splitlines():
         f = ln.split()
@@ -145,6 +150,10 @@ def policy_rules(checker, policy):
                      "value": f[4], "wild": f[5] == "w", "line": int(f[6]), "names": int(f[7]),
                      "rate": int(f[8]), "max_body": int(f[9]),
                      "c": "" if f[10] == "=" else bytes.fromhex(f[10]).decode("latin-1")})
+    if len(matches) != len(out):
+        raise ValueError("the checker's matches and rules differ in number")
+    for r, m in zip(out, matches):
+        r["match"] = m
     return out
 
 
@@ -333,12 +342,66 @@ def path_rule_writable(r):
     return False
 
 
-def check_noexec(meta, rules, launches, problems):
+def _nx_under(p, d):
+    """Is p inside d (or d itself)? As warden_noexec.inc.c's noexec_under."""
+    return d == "/" or p == d or p.startswith(d + "/")
+
+
+def _nx_parent(s):
+    sl = s.rfind("/")
+    return "/" if sl == 0 else s[:sl] if sl > 0 else s
+
+
+def noexec_target(r):
+    """v1.27.1 review: the directory (or file) a writable path rule's noexec
+    mount is for, as warden_noexec.inc.c's noexec_target works it out:
+    (target, exact). target None: a rule no directory bounds (the Warden
+    refuses to start); "": a rule matching no absolute path (none). exact:
+    the rule names one path, so the Warden mounts it, or its directory if it
+    is not there (D3)."""
+    c, m = r["c"], r.get("match")
+    if m in ("suffix", "contains"):
+        return None, False
+    if m == "exact":
+        return (c, True) if c.startswith("/") else ("", False)
+    if m == "prefix":
+        if not c.startswith("/"):
+            return "", False
+        return (c[:-1] if len(c) > 1 and c.endswith("/") else _nx_parent(c)), False
+    if m == "glob":
+        k = 0
+        while k < len(c) and c[k] not in "*?[\\":
+            k += 1
+        if k == 0:
+            return None, False
+        out = c[:k]
+        if not out.startswith("/"):
+            return "", False
+        if k < len(c):
+            sl = out.rfind("/")
+            return (out[:1] if sl == 0 else out[:sl]), False
+        return (out[:-1] if len(out) > 1 and out.endswith("/") else out), True
+    return "", False
+
+
+def _open_writes(flags):
+    return (flags & O_ACCMODE) in (1, 2) or bool(flags & (O_TRUNC | O_CREAT))
+
+
+def check_noexec(meta, rules, launches, problems, records=()):
     """v1.27.1: with launches on, a Warden of 1.27.1 or later records in
     run_start the directories it mounted noexec ("noexec"), each with the
-    policy line of a rule that lets the agent write; null when the operator
-    turned the mounts off (--writable-exec), which is reported, not failed.
-    Without launches on, no such record."""
+    policy line of a rule that lets the agent write and that rule's own
+    directory (target); null when the operator turned the mounts off
+    (--writable-exec), which is reported, not failed. Without launches on,
+    no such record.
+    v1.27.1 review: each entry is checked against its rule (the directory
+    the rule names, spelled canonically, none inside another, "file" only
+    for a rule naming one file), every writable rule must be covered by an
+    entry, and every open the stream records the agent making for writing
+    under a policy rule must be under a listed directory. What the Warden's
+    realpath found on the run's host cannot be repeated offline: an entry
+    whose path is not its rule's directory as written is refused."""
     rs = meta.get("run_start", {})
     has = "noexec" in rs
     if not launches:
@@ -350,26 +413,82 @@ def check_noexec(meta, rules, launches, problems):
             problems.append(f"run_start names the Warden {rs.get('warden')!r}, which records its noexec "
                             f"mounts, but has none")
         return
+    if not _version_at_least(rs.get("warden"), (1, 27, 1)):
+        problems.append(f"run_start records noexec mounts, but names the Warden {rs.get('warden')!r}, "
+                        f"which mounts nothing noexec")
+        return
     nx = rs["noexec"]
     if nx is None:
         print("varek_audit: note: the Warden ran with --writable-exec: files the agent could write "
               "were not mounted noexec, so they could be mapped executable")
         return
-    if not isinstance(nx, list) or not all(isinstance(e, dict) and isinstance(e.get("path"), str)
-                                           and e["path"].startswith("/") and type(e.get("policy_line")) is int
-                                           for e in nx):
+    keys = {"path", "target", "policy_line", "file", "missing"}
+    if not isinstance(nx, list) or not all(
+            isinstance(e, dict) and set(e) <= keys and isinstance(e.get("path"), str)
+            and e["path"].startswith("/") and isinstance(e.get("target"), str)
+            and e["target"].startswith("/") and type(e.get("policy_line")) is int
+            and e.get("file", True) is True and e.get("missing", True) is True
+            for e in nx):
         problems.append("run_start's noexec is malformed")
         return
     paths = [e["path"] for e in nx]
     if len(set(paths)) != len(paths):
         problems.append("run_start's noexec names a directory twice")
-    writable = {r["line"] for r in rules if path_rule_writable(r)}
     for e in nx:
-        if e["policy_line"] not in writable:
-            problems.append(f"run_start's noexec mounts {e['path']!r} for policy line {e['policy_line']}, "
+        p = e["path"]
+        if os.path.normpath(p) != p or p.startswith("//"):
+            problems.append(f"run_start's noexec names {p!r}, which is not spelled as a canonical path")
+        for o in nx:
+            if o is not e and o["path"] != p and _nx_under(p, o["path"]):
+                problems.append(f"run_start's noexec names {p!r} inside {o['path']!r} (the Warden keeps "
+                                f"only the outer)")
+    writable = {r["line"]: r for r in rules if path_rule_writable(r)}
+    for e in nx:
+        p, line = e["path"], e["policy_line"]
+        r = writable.get(line)
+        if r is None:
+            problems.append(f"run_start's noexec mounts {p!r} for policy line {line}, "
                             f"which does not let the agent write")
-        if e["path"] == "/":
+            continue
+        if p == "/":
             problems.append("run_start's noexec mounts /, which the Warden refuses")
+        t, exact = noexec_target(r)
+        if not t:
+            continue                      # reported below, once a rule
+        if e["target"] not in ({t, _nx_parent(t)} if exact else {t}):
+            problems.append(f"run_start's noexec gives policy line {line}'s directory as "
+                            f"{e['target']!r}; the rule's is {t!r}")
+        elif e.get("file") and not (exact and e["target"] == t):
+            problems.append(f"run_start's noexec marks {p!r} a file, but policy line {line} names no "
+                            f"single file there")
+        elif e.get("file") and e.get("missing"):
+            problems.append(f"run_start's noexec marks {p!r} both a file and not there")
+        elif p != e["target"]:
+            problems.append(f"run_start's noexec mounts {p!r} for policy line {line}, whose directory is "
+                            f"{e['target']!r}: a rule that names its directory through a link (or . or "
+                            f"..) matches no path the Warden resolves; name the directory itself")
+    for line, r in sorted(writable.items()):
+        t, _ = noexec_target(r)
+        if t is None:
+            problems.append(f"policy line {line} lets the agent write paths no directory bounds, "
+                            f"and the Warden refuses to start with it")
+        elif t and not any(_nx_under(t, e["target"]) or _nx_under(t, e["path"]) for e in nx):
+            problems.append(f"policy line {line} lets the agent write under {t!r}, which run_start's "
+                            f"noexec does not list")
+    for rec in records:
+        if rec.get("action") != "file.open" or type(rec.get("policy_line")) is not int or \
+                rec["policy_line"] < 1 or \
+                not (rec.get("decision_final") == "ALLOW" or rec.get("kernel_verdict") == "ALLOW"):
+            continue
+        try:
+            flags = int(rec.get("open_flags", "0x0"), 16)
+        except (TypeError, ValueError):
+            continue
+        res = rec.get("resolved")
+        if _open_writes(flags) and isinstance(res, str) and res.startswith("/") and \
+                not any(_nx_under(res, e["path"]) for e in nx):
+            problems.append(f"seq {rec.get('seq')}: the agent opened {res!r} for writing, under no "
+                            f"directory run_start's noexec lists")
 
 
 EXEC_REFUSALS = ("policy_match", "default_deny_unknown", "certificate_refused", "exec_no_landlock",
@@ -1983,7 +2102,7 @@ def main(argv=None):
         launches_policy = False
     check_exec_set(meta, launches_policy, problems, records)
     try:
-        check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, problems)   # v1.27.1
+        check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, problems, records)   # v1.27.1
     except (OSError, ValueError) as e:
         problems.append(f"checker failed on the policy's rules: {e}")
     exec_ok = 0

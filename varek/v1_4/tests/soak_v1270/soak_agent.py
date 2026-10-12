@@ -97,6 +97,8 @@ while True:
         path, (rc, out, err, ms) = probe(kind, npb)
         npb += 1
         rec.update(probe=kind, path=path, rc=rc, errno=err, ms=round(ms, 1), refused=err == 13)
+        if kind == "library":
+            rec["out"] = out                 # v1.27.1 review: the loader's own words
     else:
         kind = tasks[nt % len(tasks)]
         nt += 1
