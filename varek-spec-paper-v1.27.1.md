@@ -418,6 +418,7 @@ The v1.10/v1.11 verification program has one goal: move cases out of UNKNOWN int
 
 Next, stated as direction and not claimed as shipped:
 
+- **The releases after v1.27.1** (`docs/roadmap/v1.28-v1.31.md`): v1.28.0, credential release (the agent holds placeholder secrets; the egress proxy swaps in the real credential only for a request decided SATISFIED, with the on-behalf-of chain recorded and `varek revoke`); v1.29.0, `varek run` with a built-in baseline policy and a non-enforcing dry run; v1.30.0, macOS through a Linux VM; v1.31.0, OCSF export and MCP.
 - **Bounded sequence fragment (v1.11, candidate).** Element-level reasoning for the cross-action data-flow subsystem, composed on top of the string and bitvector fragments so its soundness inherits theirs.
 - **A customer baseline** for the verdict-distribution harness, on a design partner's workload and policy.
 - **The v1.10 architecture track:** race-free filesystem enforcement and trusted-base reduction via a kernel-native sandbox (Landlock, used for launches from v1.27.0; `noexec` mounts for written files from v1.27.1); acquisition-time mediation tiering with a latency gate; an optional post-grant re-mediation mode; an escalation ladder for UNKNOWN at the kernel edge; and a trusted base reduced to a minimal supervisor, a small proof checker and the kernel.
@@ -475,6 +476,7 @@ VAREK is released under the **MIT license**. Three provisional patent applicatio
 | v1.26.1 | The egress proxy's inspecting mode (`proxy inspect`): `warden-proxy` as its own hashed binary, TLS terminated with a name-constrained CA made for the run, servers verified first, every request's method, path and query decided by request rules and certified before it is sent, `max_body`, passthrough hosts, every request and body recorded and audited. |
 | v1.27.0 | Decided program launches (`require warden 1.27`): `allow exec` rules expanded to a launch set held by Landlock, each launch decided on its name and certified, the identity check, launch records and their audit; what a compile needs. |
 | **v1.27.1** | **Nothing written during the run is mapped executable: under `require warden 1.27` the policy's writable directories mounted `noexec` where the Warden opens files, a descriptor not coming through such a mount refused, each directory recorded and audited against its rule; `--writable-exec` to turn it off for a run.** |
+| v1.28.0 to v1.31.0 (planned) | Credential release; `varek run` with a baseline policy and a dry run; macOS through a Linux VM; OCSF and MCP. |
 | v1.11 (candidate) | Bounded sequence fragment for cross-action data flow. |
 
 ---
