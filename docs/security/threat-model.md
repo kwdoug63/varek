@@ -1,6 +1,6 @@
 # VAREK — Threat Model
 
-Version: current as of v1.26.1 · MIT · github.com/kwdoug63/varek
+Version: current as of v1.27.1 · MIT · github.com/kwdoug63/varek
 
 This document states what VAREK defends, against whom, and what it explicitly
 does not defend. It is deliberately conservative: where a guarantee is
@@ -35,7 +35,8 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
   kernel mechanisms it relies on (seccomp user-notification and seccomp-BPF,
   PID namespaces, and capability restrictions; from v1.27, under `require
   warden 1.27`, Landlock, which holds the set of files the agent may
-  launch).
+  launch; from v1.27.1, under the same opt-in, the Warden's own mount
+  namespace, whose `noexec` mounts hold the files the agent may write).
 - **Trust boundary 4 (v1.24):** the host's DNS resolver, or the server named by
   `--dns-server`. The Warden trusts its answers for the names a policy names
   and does not validate DNSSEC itself. Whoever controls an allowed name's DNS
@@ -386,6 +387,29 @@ Model-B techniques below, with the residual limits stated honestly.
     hash, and has one `exec_result`. `varek_audit.py` asks the policy again
     about the set and each launch and refusal, and fails a run in which a
     process was killed.
+- **Nothing written during the run is mapped executable (v1.27.1).** Under
+  `require warden 1.27`, unless the operator runs the Warden with
+  `--writable-exec`:
+  - *Every writable directory is `noexec` where the Warden opens.* At
+    startup, before it starts any helper or the agent, the Warden makes a
+    private mount namespace and re-mounts each directory a path rule lets
+    the agent write (its prefix, the directory before a glob's first
+    wildcard, an exact rule's file or its directory) on itself `noexec`,
+    with every mount beneath it, and confirms each. The Warden opens every
+    file it allows for the agent, so a file under one can be neither
+    launched nor mapped executable (`mmap` with `PROT_EXEC`: `EPERM`;
+    `mprotect` adding it: `EACCES`). The host's mounts are untouched.
+  - *Fail closed.* A descriptor for a path under a listed directory that
+    does not come through a `noexec` mount is refused (a directory the
+    host makes during the run, a file the host replaces, a lookup from an
+    old working directory). A writable rule no directory bounds, a writable
+    `/`, the agent's own program, its interpreter or a loader under a
+    writable directory, an inherited descriptor open for reading on a file
+    there, and a mount that fails each refuse the start.
+  - *Recorded and audited.* `run_start` records each directory, its policy
+    line and its rule's directory, or `null` with `--writable-exec`;
+    `varek_audit.py` checks each entry against its rule, every writable
+    rule against the list, and every recorded write against the list.
 
 The per-class status of every known bypass class is maintained in
 `docs/security/bypass-classes.md`.
@@ -528,14 +552,12 @@ are claimed as solved.
   - *Review.* v1.26.1 was reviewed by AI review agents, not by a human or
     third party; its findings are listed in the design note.
 - Decided program launches (v1.27):
-  - *Libraries are not decided.* Landlock governs what the kernel launches,
-    not the executable mappings of shared libraries. Where a policy lets the
-    agent both write and read a directory, code it writes there as a shared
-    library may run inside an allowed program (`LD_PRELOAD`, `dlopen`, an
-    interpreter's native extension), held still by the file and network
-    rules. Not verified under the Warden; v1.27.1 is planned to mount the
-    policy's writable paths `noexec` in the Warden's own mount namespace,
-    where it opens files for the agent (`v1.27.1-writable-noexec.md`).
+  - *Libraries* written during the run cannot be mapped executable from
+    v1.27.1 (below). Through v1.27.0, and from v1.27.1 with
+    `--writable-exec` or without `require warden 1.27`, a shared library
+    the agent writes to a directory it may also read may run inside an
+    allowed program (`LD_PRELOAD`, `dlopen`, an interpreter's native
+    extension), held still by the file and network rules.
   - *Arguments are not decided* or recorded: `allow exec /usr/bin/git`
     allows `git` with any arguments.
   - *Interpreters and shells are broad.* Allowing one lets the agent run any
@@ -548,6 +570,22 @@ are claimed as solved.
   - *Review.* v1.27 was reviewed by AI review agents, not by a human or
     third party; three of the five were stopped partway by a safety
     classifier. Its findings are listed in the design note.
+- Writable directories mounted `noexec` (v1.27.1,
+  `v1.27.1-writable-noexec.md`):
+  - *Code written into memory is not covered.* The agent may still make
+    anonymous memory executable (as a JIT needs) and run code it writes
+    there, under the same filter, Landlock domain and rules.
+  - *Another mount of a writable directory made by the host before the
+    run* is not under a listed directory, so a read through it is not
+    checked; the policy must also allow that path.
+  - *A rule naming its directory through a link* matches no path the
+    Warden resolves; the Warden mounts the real directory and says so, and
+    the audit, which cannot repeat the Warden's `realpath`, refuses the
+    record.
+  - *`--writable-exec`* turns the mounts off for a run (recorded, noted by
+    the audit); compiled packages installed during a run need it.
+  - *Review.* v1.27.1 was reviewed by AI review agents, not by a human or
+    third party. Its findings are listed in the design note.
 - File opens run as root (pre-dates v1.24, found in the v1.24 review). The
   Warden opens a file for the agent with its own credentials, so a path the
   policy lets the agent write is writable even when the file is root-owned
