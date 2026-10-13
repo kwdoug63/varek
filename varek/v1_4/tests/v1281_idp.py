@@ -117,6 +117,10 @@ def serve(d):
 
     jwks = {"keys": [jwk("rsa1"), jwk("ec1"), jwk("ed1")]}
     jwks_two = {"keys": [jwk("rsa1"), jwk("rsa2")]}
+    # review cases: keys whose use or alg cannot be read (passed over), and one
+    # kid on keys of two types (the one of the token's type is used)
+    odd = [dict(jwk("ec1"), kid="odd-use", use=["enc"]), dict(jwk("ec1"), kid="odd-alg", alg="ES256" + "x" * 40)]
+    shared = [dict(jwk("rsa1"), kid="ec1"), jwk("ec1")]
     log = open(os.path.join(d, "requests.log"), "a", buffering=1)
 
     class H(http.server.BaseHTTPRequestHandler):
@@ -135,6 +139,13 @@ def serve(d):
                 body = jwks
             elif self.path == "/jwks-two":
                 body = jwks_two
+            elif self.path == "/jwks-odd":
+                body = {"keys": odd}
+            elif self.path == "/jwks-shared":
+                body = {"keys": shared}
+            elif self.path.startswith("/slow/"):
+                time.sleep(40)                  # longer than the Warden waits
+                body = {"issuer": base + "/slow", "jwks_uri": base + "/jwks"}
             if body is None:
                 self.send_response(404)
                 self.send_header("Content-Length", "0")
@@ -227,6 +238,12 @@ def mint(d, case, iss):
         del c["sub"]
     elif case == "sub-ctl":
         c["sub"] = "alice\u0007"
+    elif case == "longkey":                 # a claim name over 255 bytes before exp
+        c = {k: v for k, v in c.items() if k != "exp"}
+        c["k" * 300] = 1
+        c["exp"] = t + 3600
+    elif case in ("odd-use", "odd-alg"):
+        kid = case
     elif case == "crit":
         hdr = {"crit": ["x-varek"], "x-varek": 1}
     elif case == "exchange":                # RFC 8693: two actors, the current one outermost
@@ -275,6 +292,19 @@ def svid(d):
     write("two-uris", cert("agent", k, an, ak, False, uris=[agent, "spiffe://example.test/x"], ku=ku()), k)
     write("ca-leaf", cert("agent", k, an, ak, True, uris=[agent], ku=ku(cert_sign=True)), k)
     write("not-spiffe", cert("agent", k, an, ak, False, uris=["https://example.test/agent"], ku=ku()), k)
+    # review cases: a leaf with no basicConstraints; a second key that cannot be read
+    nb = (x509.CertificateBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "agent")]))
+          .issuer_name(an).public_key(k.public_key()).serial_number(x509.random_serial_number())
+          .not_valid_before(now() - datetime.timedelta(minutes=5)).not_valid_after(now() + datetime.timedelta(days=1))
+          .add_extension(x509.SubjectKeyIdentifier.from_public_key(k.public_key()), critical=False)
+          .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ak.public_key()), critical=False)
+          .add_extension(x509.SubjectAlternativeName([x509.UniformResourceIdentifier(agent)]), critical=False)
+          .add_extension(ku(), critical=True).sign(ak, hashes.SHA256()))
+    write("no-bcons", nb, k)
+    enc = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+        PEM, serialization.PrivateFormat.PKCS8, serialization.BestAvailableEncryption(b"pw"))
+    open(os.path.join(d, "svid-two-keys.pem"), "wb").write(
+        cert("agent", k, an, ak, False, uris=[agent], ku=ku()).public_bytes(PEM) + key_pem(k) + enc)
     # through an intermediate in the file
     ik = ec.generate_private_key(ec.SECP256R1())
     inn = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "example.test intermediate")])

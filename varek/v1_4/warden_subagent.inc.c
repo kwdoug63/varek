@@ -27,10 +27,17 @@
  *     process, while it is moved): a threaded one is refused
  *     (subagent_threaded);
  *   - until it is known, a sub-agent is pending. The first call from any
- *     process in its group settles it: a process that runs the image the
- *     launch was decided for shows it happened (launched); one that runs
- *     anything else shows it failed (it is the launching process back from
- *     a failed launch, or one it started after);
+ *     process in its group settles it (v1.28.1 review): the kernel's
+ *     process events (the proc connector, NETLINK_CONNECTOR) report each
+ *     launch that succeeded, before the process runs again; a sub-agent
+ *     whose launcher launched is launched, else its launch failed (the
+ *     launching process is back from it, running what it ran). Where the
+ *     connector cannot be used (checked at the start with a launch of its
+ *     own), the image a process runs is compared with the one the launch
+ *     was decided for, and a launch of the image the launcher already runs
+ *     (which could not be told from a failed one) is refused
+ *     (subagent_same_image). Each sub-agent's settling is recorded
+ *     (subagent_settled);
  *   - a failed sub-agent's group is frozen (cgroup.freeze), every process in
  *     it moved back to the launcher's group, and the group removed; a
  *     process that cannot be moved is still attributed to the launcher.
@@ -39,6 +46,9 @@
  */
 
 #include <sys/vfs.h>
+#include <linux/cn_proc.h>
+#include <linux/connector.h>
+#include <linux/netlink.h>
 #ifndef CGROUP2_SUPER_MAGIC
 #define CGROUP2_SUPER_MAGIC 0x63677270
 #endif
@@ -82,7 +92,9 @@ struct subject {
     dev_t    edev;                   /* the image the launch was decided for */
     ino_t    eino;
     char     obo[SUB_MAX_DEPTH * 48 + 16];   /* its chain after "agent": ,"subagent:a#1",... */
-    uint64_t cgid;                   /* its group's id (the directory's inode number) */
+    uint64_t cgid;                   /* its group's id (the directory's inode number); 0 once removed */
+    pid_t    tgid;                   /* the launching process */
+    bool     exec_seen;              /* the kernel reported its launch (proc connector) */
 };
 
 static struct subject *g_sub;
@@ -91,6 +103,84 @@ static char g_cg_dir[PATH_MAX];      /* the run's group, on the filesystem */
 static struct { char name[33]; uint32_t n; } g_sub_count[VDP_MAX_RULES];
 static bool g_sub_froze;             /* a group was frozen while attributing this call */
 static bool g_sub_pidfd;             /* the kernel tells a thread's cgroup id through a pidfd */
+static long long mono_ms_sub(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+static int  g_cn = -1;               /* v1.28.1 review: the proc connector, for launches that succeed */
+static bool g_cn_lost;               /* it overflowed: an event may be missing */
+
+/* Read every queued process event; mark the pending sub-agents whose
+ * launcher launched. */
+static void sub_cn_drain(void) {
+    if (g_cn < 0) return;
+    char buf[16384] __attribute__((aligned(NLMSG_ALIGNTO)));
+    for (;;) {
+        ssize_t n = recv(g_cn, buf, sizeof buf, MSG_DONTWAIT);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && errno == ENOBUFS) { g_cn_lost = true; continue; }
+        if (n <= 0) return;
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, (size_t)n); h = NLMSG_NEXT(h, n)) {
+            if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(struct proc_event))) continue;
+            struct cn_msg *cm = NLMSG_DATA(h);
+            struct proc_event *ev = (struct proc_event *)cm->data;
+            if (cm->id.idx != CN_IDX_PROC || ev->what != PROC_EVENT_EXEC) continue;
+            pid_t tg = ev->event_data.exec.process_tgid;
+            for (size_t i = 1; i < g_nsub; i++)
+                if (g_sub[i].state == SUB_PENDING && g_sub[i].tgid == tg) g_sub[i].exec_seen = true;
+        }
+    }
+}
+
+/* Open the connector and check it reports a launch of our own: 0, or -1 */
+static int sub_cn_open(void) {
+    if (getenv("VAREK_WARDEN_TEST_NO_PROC_CONNECTOR")) return -1;
+    int s = socket(PF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, NETLINK_CONNECTOR);
+    if (s < 0) return -1;
+    struct sockaddr_nl sa = { .nl_family = AF_NETLINK, .nl_groups = CN_IDX_PROC };
+    int big = 8 << 20;
+    (void)setsockopt(s, SOL_SOCKET, SO_RCVBUFFORCE, &big, sizeof big);
+    char m[NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(enum proc_cn_mcast_op))] __attribute__((aligned(NLMSG_ALIGNTO)));
+    memset(m, 0, sizeof m);
+    struct nlmsghdr *h = (struct nlmsghdr *)m;
+    struct cn_msg *cm = NLMSG_DATA(h);
+    enum proc_cn_mcast_op op = PROC_CN_MCAST_LISTEN;
+    h->nlmsg_len = sizeof m;
+    h->nlmsg_type = NLMSG_DONE;
+    cm->id.idx = CN_IDX_PROC;
+    cm->id.val = CN_VAL_PROC;
+    cm->len = sizeof op;
+    memcpy(cm->data, &op, sizeof op);
+    if (bind(s, (struct sockaddr *)&sa, sizeof sa) < 0 || send(s, m, sizeof m, 0) != (ssize_t)sizeof m) {
+        close(s);
+        return -1;
+    }
+    /* a launch of our own, reported with its pid as this process sees it */
+    const char *t = access("/usr/bin/true", X_OK) == 0 ? "/usr/bin/true" : "/bin/true";
+    pid_t c = fork();
+    if (c == 0) { execl(t, "true", (char *)NULL); _exit(127); }
+    if (c < 0) { close(s); return -1; }
+    int st = 0;
+    while (waitpid(c, &st, 0) < 0 && errno == EINTR) { }
+    bool seen = false;
+    long long end = mono_ms_sub() + 2000;
+    while (!seen && mono_ms_sub() < end) {
+        struct pollfd pf = { .fd = s, .events = POLLIN };
+        if (poll(&pf, 1, 100) != 1) continue;
+        char buf[8192] __attribute__((aligned(NLMSG_ALIGNTO)));
+        ssize_t n = recv(s, buf, sizeof buf, MSG_DONTWAIT);
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; n > 0 && NLMSG_OK(h, (size_t)n); h = NLMSG_NEXT(h, n)) {
+            if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(struct proc_event))) continue;
+            struct proc_event *ev = (struct proc_event *)((struct cn_msg *)NLMSG_DATA(h))->data;
+            if (ev->what == PROC_EVENT_EXEC && ev->event_data.exec.process_tgid == c) seen = true;
+        }
+    }
+    if (!seen || !WIFEXITED(st) || WEXITSTATUS(st) != 0) { close(s); return -1; }
+    g_cn = s;
+    return 0;
+}
 
 /* tid's cgroup id through a pidfd, or 0 */
 static uint64_t sub_cgid_of(pid_t tid) {
@@ -236,11 +326,14 @@ static int sub_setup(const struct policy *p, bool check_only, bool agent_root) {
         return -1;
     }
     g_sub[0].cgid = sub_dir_id(g_cg_dir);
+    bool cn = sub_cn_open() == 0;
     /* the cheaper way to read a caller's group, when this kernel has it */
     g_sub_pidfd = g_sub[0].cgid != 0 && sub_cgid_of((pid_t)syscall(SYS_gettid)) != 0 &&
                   !getenv("VAREK_WARDEN_TEST_NO_PIDFD_INFO");
-    fprintf(stderr, "[warden] sub-agents: the run's control group %s (each call's group read %s)\n", g_cg_dir,
-            g_sub_pidfd ? "through a pidfd" : "from /proc");
+    fprintf(stderr, "[warden] sub-agents: the run's control group %s (each call's group read %s; launches "
+            "known %s)\n", g_cg_dir, g_sub_pidfd ? "through a pidfd" : "from /proc",
+            cn ? "from the kernel's process events" : "by the image a process runs (no process events here: a "
+            "sub-agent of the image its launcher runs is refused)");
     return 0;
 }
 
@@ -279,12 +372,24 @@ static int sub_effective(int s) {
     return s;
 }
 
+/* subagent_settled: how a sub-agent's launch came out (once) */
+static void sub_settled_record(int s, const char *result) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    FILE *f = rec_begin();
+    fprintf(f, "{\"event\":\"subagent_settled\",\"run\":\"%s\",\"subagent\":\"%s#%u\",\"result\":\"%s\","
+            "\"how\":\"%s\",\"timestamp_ns\":%lld}\n", g_run_id, g_sub[s].name, g_sub[s].n, result,
+            g_cn >= 0 && !g_cn_lost ? "process_events" : "image", (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+    rec_end(NULL);
+}
+
 /* A failed sub-agent: freeze its group, move each process to the launcher's,
  * remove the group */
 static void sub_fail(int s) {
     if (s <= 0 || g_sub[s].state == SUB_FAILED) return;
     g_sub[s].state = SUB_FAILED;
     g_sub_froze = true;
+    sub_settled_record(s, "failed");
     int to = sub_effective(s);
     char dir[PATH_MAX + SUB_REL_MAX], dst[PATH_MAX + SUB_REL_MAX], f[PATH_MAX + SUB_REL_MAX + 32];
     sub_dir(s, dir, sizeof dir);
@@ -319,42 +424,67 @@ static void sub_fail(int s) {
     snprintf(f, sizeof f, "%s/cgroup.freeze", dir);
     fz = open(f, O_WRONLY | O_CLOEXEC);
     if (fz >= 0) { (void)!write(fz, "0", 1); close(fz); }
-    (void)rmdir(dir);
+    if (rmdir(dir) == 0) g_sub[s].cgid = 0;          /* review: a removed group's id never matches */
 }
 
-/* The launch's outcome, from exec_pend_drop (warden_exec.inc.c) */
-static void sub_pend_end(int s, const char *result) {
-    if (s <= 0 || (size_t)s >= g_nsub || g_sub[s].state != SUB_PENDING) return;
-    if (!strcmp(result, "launched")) g_sub[s].state = SUB_LAUNCHED;
-    else if (!strcmp(result, "failed") || !strcmp(result, "killed")) sub_fail(s);
-    /* "gone": the launching process ended unseen; the first call from its
-     * group settles it */
+/* Settle a pending sub-agent. With the connector: launched if its launcher
+ * launched (the event is queued before the process runs again), else failed.
+ * Without: by the image tid runs (the launch's, or not); tid 0 (the
+ * launcher gone unseen) leaves it pending. Returns its state. */
+static int sub_settle(int s, pid_t tid) {
+    if (g_sub[s].state != SUB_PENDING) return g_sub[s].state;
+    sub_cn_drain();
+    if (g_cn >= 0 && !g_cn_lost) {
+        if (g_sub[s].exec_seen) { g_sub[s].state = SUB_LAUNCHED; sub_settled_record(s, "launched"); }
+        else sub_fail(s);
+        return g_sub[s].state;
+    }
+    if (!tid) return SUB_PENDING;
+    char p[64];
+    struct stat st;
+    snprintf(p, sizeof p, "/proc/%d/exe", (int)tid);
+    if (stat(p, &st) == 0 && st.st_dev == g_sub[s].edev && st.st_ino == g_sub[s].eino) {
+        g_sub[s].state = SUB_LAUNCHED;
+        sub_settled_record(s, "launched");
+    } else sub_fail(s);
+    return g_sub[s].state;
 }
 
-/* The calling thread's subject, or -1 (in no group of the run) */
+/* The launch's outcome, from exec_pend_drop (warden_exec.inc.c): what the
+ * launch's exec_result says, which for a sub-agent is how it settled (the
+ * image comparison there cannot tell a failed launch of the image the
+ * launcher runs from one that happened) */
+static const char *sub_pend_end(int s, pid_t tid, const char *result) {
+    if (s <= 0 || (size_t)s >= g_nsub) return result;
+    if (!strcmp(result, "killed")) { if (g_sub[s].state == SUB_PENDING) sub_fail(s); return result; }
+    int st = sub_settle(s, strcmp(result, "gone") ? tid : 0);
+    return st == SUB_LAUNCHED ? "launched" : st == SUB_FAILED ? "failed" : result;
+}
+
+/* The calling thread's subject, -1 (in no group of the run) or -2 (its
+ * group could not be read: the thread has gone) */
 static int sub_attribute(pid_t tid) {
     if (!g_sub_on) return 0;
     char p[64], buf[PATH_MAX + 64];
     int s = -1;
     if (g_sub_pidfd) {
         uint64_t id = sub_cgid_of(tid);
-        if (!id) return -1;
+        if (!id) return -2;                                  /* the thread has gone: unreadable */
         for (size_t i = 0; i < g_nsub; i++)
             if (g_sub[i].cgid == id) { s = (int)i; break; }     /* a failed one's: its launcher's, below */
         if (s < 0) return -1;
         goto found;
     }
     snprintf(p, sizeof p, "/proc/%d/cgroup", (int)tid);
-    int fd = open(p, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -1;
-    ssize_t n = read(fd, buf, sizeof buf - 1);
-    close(fd);
-    if (n <= 0) return -1;
-    buf[n] = '\0';
-    char *l = buf;
-    while (l && strncmp(l, "0::", 3)) { l = strchr(l, '\n'); if (l) l++; }
-    if (!l) return -1;
-    l += 3;
+    /* review: line by line (a hybrid host's v1 lines come first, and may be long) */
+    FILE *cf = fopen(p, "re");
+    if (!cf) return -2;
+    char *l = NULL;
+    bool got = false;
+    while (fgets(buf, sizeof buf, cf))
+        if (!strncmp(buf, "0::", 3)) { l = buf + 3; got = true; break; }
+    fclose(cf);
+    if (!got) return -2;
     l[strcspn(l, "\n")] = '\0';
     size_t bl = strlen(g_cg_self);
     if (strncmp(l, g_cg_self, bl) || (l[bl] && l[bl] != '/')) return -1;
@@ -362,13 +492,7 @@ static int sub_attribute(pid_t tid) {
     for (size_t i = 0; i < g_nsub; i++) if (!strcmp(g_sub[i].rel, rel)) { s = (int)i; break; }
     if (s < 0) return -1;
 found:
-    if (g_sub[s].state == SUB_PENDING) {
-        /* the first call from its group settles the launch (see above) */
-        struct stat st;
-        snprintf(p, sizeof p, "/proc/%d/exe", (int)tid);
-        if (stat(p, &st) == 0 && st.st_dev == g_sub[s].edev && st.st_ino == g_sub[s].eino) g_sub[s].state = SUB_LAUNCHED;
-        else sub_fail(s);
-    }
+    sub_settle(s, tid);                  /* the first call from its group settles the launch */
     return sub_effective(s);
 }
 
@@ -391,6 +515,14 @@ static int sub_launch(pid_t tid, int from, const char *name, dev_t edev, ino_t e
     while (sf && fgets(line, sizeof line, sf)) if (sscanf(line, "Threads: %d", &threads) == 1) break;
     if (sf) fclose(sf);
     if (threads != 1) { *rule = "subagent_threaded"; return -1; }
+    /* without process events a launch of the image the launcher runs could
+     * not be told from a failed one (v1.28.1 review) */
+    if (g_cn < 0) {
+        struct stat xs;
+        snprintf(sp, sizeof sp, "/proc/%d/exe", (int)tgid);
+        if (stat(sp, &xs) < 0 || (xs.st_dev == edev && xs.st_ino == eino)) { *rule = "subagent_same_image"; return -1; }
+    }
+    sub_cn_drain();                      /* events from before this launch are not its */
     size_t c = 0;
     while (c < g_nsub_count && strcmp(g_sub_count[c].name, name)) c++;
     if (c == g_nsub_count) {
@@ -408,6 +540,7 @@ static int sub_launch(pid_t tid, int from, const char *name, dev_t edev, ino_t e
     s->seq = seq;
     s->edev = edev;
     s->eino = eino;
+    s->tgid = tgid;
     char rel[SUB_REL_MAX + 48], obo[sizeof s->obo + 64];
     int rl = snprintf(rel, sizeof rel, "%s/%s-%u", g_sub[from].rel, name, s->n);
     int ol = snprintf(obo, sizeof obo, "%s,\"subagent:%s#%u\"", g_sub[from].obo, name, s->n);
@@ -435,8 +568,20 @@ static void sub_obo(FILE *f, int s) {
 /* A sub-agent's launch record: which one, and its group */
 static void sub_launch_fields(struct action *a, int s) {
     size_t el = strlen(a->extra);
-    snprintf(a->extra + el, sizeof a->extra - el, "\"subagent\":\"%s#%u\",\"cgroup\":\"%s%s\",",
-             g_sub[s].name, g_sub[s].n, g_cg_self, g_sub[s].rel);
+    int w = snprintf(a->extra + el, sizeof a->extra - el, "\"subagent\":\"%s#%u\",\"cgroup\":\"",
+                     g_sub[s].name, g_sub[s].n);
+    if (w < 0 || (size_t)w >= sizeof a->extra - el) return;
+    el += (size_t)w;
+    /* review: the Warden's own group's path may hold any byte: escaped for JSON */
+    char path[PATH_MAX + SUB_REL_MAX];
+    snprintf(path, sizeof path, "%s%s", g_cg_self, g_sub[s].rel);
+    for (const char *c = path; *c && el + 8 < sizeof a->extra; c++) {
+        unsigned char u = (unsigned char)*c;
+        if (u == '"' || u == '\\') { a->extra[el++] = '\\'; a->extra[el++] = (char)u; }
+        else if (u < 0x20 || u >= 0x7f) el += (size_t)snprintf(a->extra + el, sizeof a->extra - el, "\\u%04x", u);
+        else a->extra[el++] = (char)u;
+    }
+    snprintf(a->extra + el, sizeof a->extra - el, "\",");
 }
 
 /* The Warden opens nothing for writing on a control group's filesystem for

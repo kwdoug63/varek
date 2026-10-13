@@ -94,15 +94,23 @@ static size_t g_arena_len;
 static struct { size_t off, len; } g_val[WS_MAX_CREDS];
 static char *g_vault_token;           /* the arena's last page */
 static char *g_user_token;            /* v1.28.1: the user's token, after it (WS_MAX_TOKEN + 1) */
+/* v1.28.1 review: and its decoded parts, while it is checked */
+#define HDR_MAX 4096
+#define SIG_MAX 1024
+static char *g_hdr, *g_pay;
+static unsigned char *g_sig;
 
 static int arena_init(void) {
-    g_arena_len = VALUES_LEN + TOKEN_MAX + WS_MAX_TOKEN + 1;
+    g_arena_len = VALUES_LEN + TOKEN_MAX + WS_MAX_TOKEN + 1 + HDR_MAX + WS_MAX_TOKEN + SIG_MAX;
     g_arena = mmap(NULL, g_arena_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (g_arena == MAP_FAILED) { g_arena = NULL; return -1; }
     if (mlock(g_arena, g_arena_len) < 0) return -1;
     (void)madvise(g_arena, g_arena_len, MADV_DONTDUMP);
     g_vault_token = (char *)g_arena + VALUES_LEN;
     g_user_token = g_vault_token + TOKEN_MAX;
+    g_hdr = g_user_token + WS_MAX_TOKEN + 1;
+    g_pay = g_hdr + HDR_MAX;
+    g_sig = (unsigned char *)g_pay + WS_MAX_TOKEN;
     return 0;
 }
 
@@ -190,6 +198,15 @@ static int read_file(const char *path, uint32_t kind, unsigned char *buf, size_t
     char *sl = strrchr(dir, '/');
     if (sl == dir) sl[1] = '\0'; else *sl = '\0';
     if (!realpath(dir, real)) { snprintf(why, wn, "cannot open %.300s: %s", path, strerror(errno)); return -1; }
+    /* v1.28.1 review: the file is opened in the directory that was checked
+     * (its resolved path), not through the name given, which a symlink
+     * above it could point elsewhere after the check */
+    char checked[PATH_MAX + 2];
+    const char *base = strrchr(path, '/') + 1;
+    if (!*base || (size_t)snprintf(checked, sizeof checked, "%s/%s", strcmp(real, "/") ? real : "", base) >= sizeof checked) {
+        snprintf(why, wn, "%.300s is not a file's path", path);
+        return -1;
+    }
     for (char *c = real + strlen(real); ; ) {
         struct stat ds;
         if (stat(real[0] ? real : "/", &ds) < 0 || ds.st_uid != 0 ||
@@ -202,7 +219,8 @@ static int read_file(const char *path, uint32_t kind, unsigned char *buf, size_t
         while (c > real && *c != '/') c--;
         *c = '\0';                                       /* up one ("" is /) */
     }
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY);
+    /* review: O_NONBLOCK, so a FIFO put at the name cannot hold the helper */
+    int fd = open(checked, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) { snprintf(why, wn, "cannot open %s: %s", path, strerror(errno)); return -1; }
     struct stat st;
     if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
@@ -377,6 +395,16 @@ static long long mono_ms(void) {
     return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
+/* v1.28.1 review: the start's network work ends by one deadline, inside the
+ * Warden's 30 s wait, so a slow server is named (0: none, after the start) */
+static long long g_deadline;
+
+static int io_ms(void) {
+    if (!g_deadline) return IO_TIMEOUT_MS;
+    long long left = g_deadline - mono_ms();
+    return left <= 0 ? 0 : left < IO_TIMEOUT_MS ? (int)left : IO_TIMEOUT_MS;
+}
+
 static int tcp_connect(const struct url *u, char *why, size_t wn) {
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM }, *res = NULL;
     int e = getaddrinfo(u->host, u->port, &hints, &res);
@@ -390,7 +418,8 @@ static int tcp_connect(const struct url *u, char *why, size_t wn) {
             struct pollfd pf = { .fd = fd, .events = POLLOUT };
             int soerr = 0;
             socklen_t sl = sizeof soerr;
-            if (poll(&pf, 1, IO_TIMEOUT_MS) == 1 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0 && soerr == 0)
+            if (io_ms() > 0 && poll(&pf, 1, io_ms()) == 1 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0 &&
+                soerr == 0)
                 break;
         }
         close(fd);
@@ -400,7 +429,8 @@ static int tcp_connect(const struct url *u, char *why, size_t wn) {
     if (fd < 0) { snprintf(why, wn, "cannot connect to %.100s:%s", u->host, u->port); return -1; }
     int fl = fcntl(fd, F_GETFL);
     fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
-    struct timeval tv = { .tv_sec = IO_TIMEOUT_MS / 1000 };
+    int ms = io_ms() > 0 ? io_ms() : 1;
+    struct timeval tv = { .tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     return fd;
@@ -409,6 +439,53 @@ static int tcp_connect(const struct url *u, char *why, size_t wn) {
 /* One request; the response's status and body (chunked or not), at most
  * RESP_MAX. ca: a PEM bundle, or NULL for the host's trust store. allow_plain:
  * plain HTTP to this host is allowed. 0, or -1 with why. */
+/* v1.28.1 review: each CA file the configuration names, read as root as a
+ * trusted file (root-owned, writable by no other user, reported to the
+ * Warden, which refuses a policy that lets the agent write it) and kept
+ * here; a connection is verified against the one its key names */
+static struct { char path[4096]; X509_STORE *store; } g_ca[3];
+
+static X509_STORE *ca_store(const char *path) {
+    for (size_t i = 0; i < sizeof g_ca / sizeof g_ca[0]; i++)
+        if (g_ca[i].store && !strcmp(g_ca[i].path, path)) return g_ca[i].store;
+    return NULL;
+}
+
+static int no_passphrase(char *buf, int size, int rw, void *u);
+
+/* Read a CA bundle (as root): 0, or -1 with why */
+static int ca_load(const char *path, char *why, size_t wn) {
+    if (ca_store(path)) return 0;
+    size_t slot = 0;
+    while (slot < sizeof g_ca / sizeof g_ca[0] && g_ca[slot].store) slot++;
+    if (slot == sizeof g_ca / sizeof g_ca[0] || strlen(path) >= sizeof g_ca[0].path) {
+        snprintf(why, wn, "too many CA files, or a path too long");
+        return -1;
+    }
+    static unsigned char buf[1 << 20];
+    size_t bl = 0;
+    char rw[512];
+    if (read_file(path, WS_FILE_TRUSTED, buf, sizeof buf, &bl, NULL, rw, sizeof rw) < 0) {
+        snprintf(why, wn, "its CA file: %.400s", rw);
+        return -1;
+    }
+    X509_STORE *st = X509_STORE_new();
+    BIO *b = BIO_new_mem_buf(buf, (int)bl);
+    int n = 0;
+    for (X509 *x; st && b && (x = PEM_read_bio_X509(b, NULL, no_passphrase, NULL)); X509_free(x))
+        n += X509_STORE_add_cert(st, x) == 1;
+    BIO_free(b);
+    ERR_clear_error();
+    if (!n) {
+        X509_STORE_free(st);
+        snprintf(why, wn, "the CA %.300s holds no certificate", path);
+        return -1;
+    }
+    memcpy(g_ca[slot].path, path, strlen(path) + 1);
+    g_ca[slot].store = st;
+    return 0;
+}
+
 static int http_do(const struct url *u, const char *ca, bool allow_plain, const char *method, const char *path,
                    const char *headers, const char *body, size_t blen, int *status, char **out, size_t *olen,
                    char *why, size_t wn) {
@@ -428,7 +505,8 @@ static int http_do(const struct url *u, const char *ca, bool allow_plain, const 
     if (u->tls) {
         ctx = SSL_CTX_new(TLS_client_method());
         if (!ctx || !SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION)) { snprintf(why, wn, "TLS setup failed"); goto done; }
-        if (ca ? SSL_CTX_load_verify_locations(ctx, ca, NULL) != 1 : SSL_CTX_set_default_verify_paths(ctx) != 1) {
+        if (ca && ca_store(ca)) SSL_CTX_set1_cert_store(ctx, ca_store(ca));
+        if (ca ? !ca_store(ca) : SSL_CTX_set_default_verify_paths(ctx) != 1) {
             snprintf(why, wn, "cannot load the CA %s", ca ? ca : "(the host's trust store)");
             goto done;
         }
@@ -467,7 +545,7 @@ static int http_do(const struct url *u, const char *ca, bool allow_plain, const 
     buf = malloc(RESP_MAX + 1);
     if (!buf) { snprintf(why, wn, "out of memory"); goto done; }
     size_t got = 0;
-    long long end = mono_ms() + IO_TIMEOUT_MS;
+    long long end = mono_ms() + (io_ms() > 0 ? io_ms() : 1);
     for (;;) {
         if (got == RESP_MAX) { snprintf(why, wn, "the response from %.100s is over 1 MiB", u->host); goto done; }
         int r = u->tls ? SSL_read(ssl, buf + got, (int)(RESP_MAX - got)) : (int)recv(fd, buf + got, RESP_MAX - got, 0);
@@ -1073,6 +1151,9 @@ static long b64url(const char *s, size_t n, unsigned char *out, size_t cap) {
             out[o++] = (unsigned char)(acc >> bits);
         }
     }
+    /* v1.28.1 review: the bits left over are zero (one encoding for each
+     * value, so a token's hash names it) */
+    if (bits && (acc & ((1u << bits) - 1))) return -1;
     return (long)o;
 }
 
@@ -1087,8 +1168,9 @@ static int jcount(const char *p, const char *e, const char *key) {
         char k[256];
         long kl = jstr(p, e, k, sizeof k - 1);
         const char *ke = jskip(p, e, 0);
-        if (!ke) return -1;
-        if (kl >= 0) { k[kl] = '\0'; if ((size_t)kl == strlen(key) && !strcmp(k, key)) n++; }
+        if (!ke || kl < 0) return -1;            /* review: a key jget could not read: unreadable */
+        k[kl] = '\0';
+        if ((size_t)kl == strlen(key) && !strcmp(k, key)) n++;
         p = jws(ke, e);
         if (p >= e || *p != ':') return -1;
         p = jskip(p + 1, e, 0);
@@ -1119,7 +1201,8 @@ static int jgetn(const char *o, const char *e, const char *key, int64_t *out) {
     int c = jcount(o, e, key);
     if (c == 0) return 0;
     if (c != 1) return -1;
-    const char *v = jws(jget(o, e, key), e);
+    const char *g = jget(o, e, key);
+    const char *v = g ? jws(g, e) : NULL;
     if (!v || v >= e || !isdigit((unsigned char)*v)) return -1;
     int64_t n = 0;
     const char *q = v;
@@ -1129,6 +1212,8 @@ static int jgetn(const char *o, const char *e, const char *key, int64_t *out) {
     }
     if (q < e && *q == '.') for (q++; q < e && isdigit((unsigned char)*q); q++) { }
     if (q < e && (*q == 'e' || *q == 'E')) return -1;
+    q = jws(q, e);                              /* review: nothing more in the number */
+    if (q < e && *q != ',' && *q != '}') return -1;
     if (n >= (int64_t)1 << 53) return -1;
     *out = n;
     return 1;
@@ -1167,7 +1252,12 @@ static const char *shown(const char *s, char *buf, size_t cap) {
 static int get_json(const char *url, char **out, size_t *ol, char *why, size_t wn) {
     struct url u;
     char sb[128];
-    if (url_parse(url, &u) < 0 || !u.tls) { snprintf(why, wn, "%s is not an https URL", shown(url, sb, sizeof sb)); return -1; }
+    bool odd = false;
+    for (const char *c = url; *c; c++) odd |= *c <= 0x20 || *c >= 0x7f;     /* review: no space, CR or LF */
+    if (odd || strlen(url) >= 1024 || url_parse(url, &u) < 0 || !u.tls) {
+        snprintf(why, wn, "%s is not an https URL", shown(url, sb, sizeof sb));
+        return -1;
+    }
     int st = 0;
     if (http_do(&u, g_conf.oidc_ca[0] ? g_conf.oidc_ca : NULL, false, "GET", u.path[0] ? u.path : "/",
                 "Accept: application/json\r\n", "", 0, &st, out, ol, why, wn) < 0)
@@ -1282,9 +1372,6 @@ static int jws_verify(EVP_PKEY *pk, int alg, const char *in, size_t inl, const u
 
 /* The user's token (g_user_token), as its own user. 0 with g_id filled, or
  * -1 with why (the check that failed). */
-static char g_hdr[4096], g_pay[WS_MAX_TOKEN];
-static unsigned char g_sig[1024];
-
 static int verify_token_parts(char *why, size_t wn) {
     char sb[128], sb2[128];
     const char *tok = g_user_token;
@@ -1296,9 +1383,9 @@ static int verify_token_parts(char *why, size_t wn) {
     }
     char *hdr = g_hdr, *pay = g_pay;
     unsigned char *sig = g_sig;
-    long hl = b64url(tok, (size_t)(d1 - tok), (unsigned char *)hdr, sizeof g_hdr - 1);
-    long pl = b64url(d1 + 1, (size_t)(d2 - d1 - 1), (unsigned char *)pay, sizeof g_pay - 1);
-    long sl = b64url(d2 + 1, tl - (size_t)(d2 + 1 - tok), sig, sizeof g_sig);
+    long hl = b64url(tok, (size_t)(d1 - tok), (unsigned char *)hdr, HDR_MAX - 1);
+    long pl = b64url(d1 + 1, (size_t)(d2 - d1 - 1), (unsigned char *)pay, WS_MAX_TOKEN - 1);
+    long sl = b64url(d2 + 1, tl - (size_t)(d2 + 1 - tok), sig, SIG_MAX);
     if (hl <= 0 || pl <= 0 || sl < 0) { snprintf(why, wn, "a part is not base64url"); return -1; }
     hdr[hl] = pay[pl] = '\0';
     const char *he = hdr + hl, *pe = pay + pl;
@@ -1306,6 +1393,12 @@ static int verify_token_parts(char *why, size_t wn) {
     if (memchr(hdr, '\0', (size_t)hl) || memchr(pay, '\0', (size_t)pl) || !hx || !px ||
         *jws(hdr, he) != '{' || jws(hx, he) != he || *jws(pay, pe) != '{' || jws(px, pe) != pe) {
         snprintf(why, wn, "its header or claims are not one JSON object");
+        return -1;
+    }
+    /* v1.28.1 review: every member name readable (at most 255 bytes, its
+     * escapes valid), so a claim is found the same way it is counted */
+    if (jcount(hdr, he, "") < 0 || jcount(pay, pe, "") < 0) {
+        snprintf(why, wn, "its header or claims hold a member name over 255 bytes, or one that cannot be read");
         return -1;
     }
     /* the algorithm, before any key */
@@ -1365,12 +1458,12 @@ static int verify_token_parts(char *why, size_t wn) {
         char kk[256], kty[16], use[16], kalg[32];
         if (*jws(k, ke) != '{') continue;
         int r = jgets(k, ke, "kid", kk, sizeof kk);
-        if (jgets(k, ke, "kty", kty, sizeof kty) != 1 || strcmp(kty, kKty[ai])) {
-            if (kid[0] && r == 1 && !strcmp(kk, kid)) { pick = k; break; }   /* named, but of another type: refused below */
-            continue;
-        }
-        if (jgets(k, ke, "use", use, sizeof use) == 1 && strcmp(use, "sig")) continue;
-        if (jgets(k, ke, "alg", kalg, sizeof kalg) == 1 && strcmp(kalg, alg)) continue;
+        /* review: a key named by kid but of another type is passed over (one
+         * kid may name keys of several types); none of the right type: refused below */
+        if (jgets(k, ke, "kty", kty, sizeof kty) != 1 || strcmp(kty, kKty[ai])) continue;
+        /* review: use and alg, when given, must be readable and match */
+        int ru = jgets(k, ke, "use", use, sizeof use), ra = jgets(k, ke, "alg", kalg, sizeof kalg);
+        if (ru < 0 || (ru == 1 && strcmp(use, "sig")) || ra < 0 || (ra == 1 && strcmp(kalg, alg))) continue;
         if (kid[0]) {
             if (r == 1 && !strcmp(kk, kid)) { pick = k; break; }
         } else {
@@ -1401,7 +1494,8 @@ static int verify_token_parts(char *why, size_t wn) {
     int c = jcount(pay, pe, "aud");
     bool aud_ok = false;
     if (c == 1) {
-        const char *av = jws(jget(pay, pe, "aud"), pe);
+        const char *ag = jget(pay, pe, "aud");
+        const char *av = ag ? jws(ag, pe) : NULL;
         if (av && *av == '"') aud_ok = jgets(pay, pe, "aud", aud, sizeof aud) == 1 && !strcmp(aud, g_iss[ix].aud);
         else for (const char *x = jarr_first(av, pe); x && !aud_ok; x = jarr_next(x, pe)) {
             long n = jstr(x, pe, aud, sizeof aud - 1);
@@ -1433,8 +1527,9 @@ static int verify_token_parts(char *why, size_t wn) {
         if (n == 0) break;
         if (n != 1) { snprintf(why, wn, "an act claim is given twice"); return -1; }
         if (depth == WS_MAX_ACTORS) { snprintf(why, wn, "its act chain is nested deeper than %d", WS_MAX_ACTORS); return -1; }
-        o = jws(jget(o, pe, "act"), pe);
-        if (!o || *o != '{') { snprintf(why, wn, "an act claim is not an object"); return -1; }
+        const char *ag = jget(o, pe, "act");
+        o = ag ? jws(ag, pe) : NULL;
+        if (!o || o >= pe || *o != '{') { snprintf(why, wn, "an act claim is not an object"); return -1; }
         struct ws_actor *ac = &g_id.act[depth];
         if (jgets(o, pe, "sub", ac->sub, sizeof ac->sub) != 1 || !ac->sub[0] || !printable(ac->sub)) {
             snprintf(why, wn, "actor %u of its act chain has no printable subject (sub)", depth + 1);
@@ -1460,9 +1555,9 @@ static int verify_token_parts(char *why, size_t wn) {
 /* ... and nothing of it stays, whatever came of the checks */
 static int verify_token(char *why, size_t wn) {
     int rc = verify_token_parts(why, wn);
-    OPENSSL_cleanse(g_hdr, sizeof g_hdr);
-    OPENSSL_cleanse(g_pay, sizeof g_pay);
-    OPENSSL_cleanse(g_sig, sizeof g_sig);
+    OPENSSL_cleanse(g_hdr, HDR_MAX);
+    OPENSSL_cleanse(g_pay, WS_MAX_TOKEN);
+    OPENSSL_cleanse(g_sig, SIG_MAX);
     return rc;
 }
 
@@ -1514,10 +1609,19 @@ static int verify_svid(const char *path, char *why, size_t wn) {
     if (bio) key = PEM_read_bio_PrivateKey(bio, NULL, no_passphrase, NULL);
     EVP_PKEY *key2 = key && bio ? PEM_read_bio_PrivateKey(bio, NULL, no_passphrase, NULL) : NULL;
     BIO_free(bio);
+    /* review: one private key block, counted by its header (a second one that
+     * cannot be read is still a second key) */
+    int nkeys = 0;
+    for (size_t i = 0; i + 11 <= bl; i++)
+        if (!memcmp(buf + i, "-----BEGIN ", 11)) {
+            const unsigned char *eol = memchr(buf + i, '\n', bl - i);
+            size_t ll = eol ? (size_t)(eol - (buf + i)) : bl - i;
+            if (memmem(buf + i, ll, "PRIVATE KEY-----", 16)) nkeys++;
+        }
     OPENSSL_cleanse(buf, sizeof buf);
     ERR_clear_error();
     if (!leaf) { snprintf(why, wn, "%.300s holds no certificate", path); goto out; }
-    if (!key || key2) { snprintf(why, wn, "%.300s must hold exactly one private key (unencrypted)", path); goto out; }
+    if (!key || key2 || nkeys != 1) { snprintf(why, wn, "%.300s must hold exactly one private key (unencrypted)", path); goto out; }
     /* its SPIFFE ID: the one URI SAN */
     san = X509_get_ext_d2i(leaf, NID_subject_alt_name, NULL, NULL);
     const char *id = NULL;
@@ -1543,8 +1647,14 @@ static int verify_svid(const char *path, char *why, size_t wn) {
     idc[idl] = '\0';
     if (sx == g_nspf) { snprintf(why, wn, "its trust domain (%s) is not one the policy trusts", shown(idc, sb, sizeof sb)); goto out; }
     if (X509_check_ca(leaf) != 0) { snprintf(why, wn, "its certificate is a CA's"); goto out; }
+    /* review: an X.509-SVID's leaf has basicConstraints (CA false) and a key
+     * usage with digitalSignature (the SPIFFE X.509-SVID standard) */
+    if (!(X509_get_extension_flags(leaf) & EXFLAG_BCONS)) {
+        snprintf(why, wn, "its certificate has no basicConstraints (an SVID's says CA:false)");
+        goto out;
+    }
     uint32_t ku = X509_get_key_usage(leaf);
-    if (ku != UINT32_MAX && ((ku & (KU_KEY_CERT_SIGN | KU_CRL_SIGN)) || !(ku & KU_DIGITAL_SIGNATURE))) {
+    if (ku == UINT32_MAX || (ku & (KU_KEY_CERT_SIGN | KU_CRL_SIGN)) || !(ku & KU_DIGITAL_SIGNATURE)) {
         snprintf(why, wn, "its certificate's key usage is not an SVID's (digitalSignature, no certificate or CRL signing)");
         goto out;
     }
@@ -1672,6 +1782,7 @@ int main(int argc, char **argv) {
     /* v1.28.1: an issuer's CA may be named in it; with no credential that
      * needs it, a configuration that is not there is not needed */
     bool conf_failed = false;
+    char idwhy_ca[512] = "";
     if (su.conf[0] && (need_vault || need_aws || (su.token[0] && access(su.conf, F_OK) == 0))) {
         if (read_private(su.conf, fbuf, sizeof fbuf - 1, &fl, NULL, why, sizeof why) < 0 ||
             (fbuf[fl] = '\0', kv_parse((char *)fbuf, su.conf, conf_key, why, sizeof why) < 0)) {
@@ -1679,6 +1790,22 @@ int main(int argc, char **argv) {
                 if (cr[i].store != STORE_FILE) report(i, false, NULL, 0, why);
             failed = true;
             conf_failed = true;
+        }
+    }
+    /* v1.28.1 review: the CA files, as root, as trusted files */
+    if (!failed) {
+        const char *cas[3] = { need_vault ? g_conf.vault_ca : "", need_aws ? g_conf.aws_ca : "",
+                               su.token[0] ? g_conf.oidc_ca : "" };
+        for (int k = 0; k < 3; k++) {
+            if (!cas[k][0] || ca_load(cas[k], why, sizeof why) == 0) continue;
+            if (k == 2) {
+                if (!conf_failed) { conf_failed = true; }
+                if (want_id) snprintf(idwhy_ca, sizeof idwhy_ca, "the user's token: %.450s", why);
+            } else {
+                for (uint32_t i = 0; i < su.ncreds; i++)
+                    if (cr[i].store == (k == 0 ? STORE_VAULT : STORE_AWSSM)) report(i, false, NULL, 0, why);
+                failed = true;
+            }
         }
     }
     if (!failed && need_vault && g_conf.vault_token_file[0]) {
@@ -1710,7 +1837,8 @@ int main(int argc, char **argv) {
     char idwhy[512] = "";
     bool id_failed = false;
     if (conf_failed && want_id) {                /* v1.28.1: say so, though no credential needed it */
-        snprintf(idwhy, sizeof idwhy, "%s: %.450s", su.token[0] ? "the user's token" : "the agent's SVID", why);
+        if (idwhy_ca[0]) snprintf(idwhy, sizeof idwhy, "%s", idwhy_ca);
+        else snprintf(idwhy, sizeof idwhy, "%s: %.450s", su.token[0] ? "the user's token" : "the agent's SVID", why);
         id_failed = true;
     }
     if (!failed && su.token[0]) {
@@ -1752,6 +1880,7 @@ int main(int argc, char **argv) {
     /* its own user, then the network: the identity first, so no store is
      * asked anything (no lease made) for a run that will not start */
     if (drop_to(u, g) < 0) return 2;
+    g_deadline = mono_ms() + 25000;           /* v1.28.1 review: inside the Warden's 30 s */
     if (want_id && (!failed || id_failed)) {
         if (!id_failed && su.token[0]) {
             char w[480];
@@ -1783,6 +1912,7 @@ int main(int argc, char **argv) {
             ctl_send(&y, sizeof y);
         }
     }
+    g_deadline = 0;                           /* renewals and revocations: each its own timeout */
     /* step 3: hand the values to warden-proxy, over the socket the Warden
      * gives, then clear them here; step 4: renew leases when due, revoke
      * them when asked; until the control socket closes */

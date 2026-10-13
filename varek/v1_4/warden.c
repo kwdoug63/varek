@@ -1683,7 +1683,9 @@ static void emit_on_behalf_of(FILE *f, const struct policy *p) {
         if (id->iat >= 0) fprintf(f, "\"issued_at\":%lld,", (long long)id->iat);
         if (id->nbf >= 0) fprintf(f, "\"not_before\":%lld,", (long long)id->nbf);
         if (id->jti[0]) { fputs("\"jti\":\"", f); json_escape(f, id->jti); fputs("\",", f); }
-        fprintf(f, "\"algorithm\":\"%s\",", id->alg);
+        fputs("\"algorithm\":\"", f);
+        json_escape(f, id->alg);
+        fputs("\",", f);
         if (id->kid[0]) { fputs("\"key_id\":\"", f); json_escape(f, id->kid); fputs("\",", f); }
         fprintf(f, "\"token_sha256\":\"%s\",\"policy_line\":%d,\"verified\":true,\"on_expiry\":\"%s\"},",
                 id->token_sha256, is->line, g_obo_on_expiry ? "record" : "revoke");
@@ -3088,7 +3090,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * finished for the agent (warden_net.inc.c). */
         /* v1.24: also on the resolver helper's results. */
         /* v1.25: and on the stub resolver's sockets (warden_stub.inc.c). */
-        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN + 1 + PX_MAX_DIAL + 2] = {
+        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN + 1 + PX_MAX_DIAL + 3] = {
             { .fd = notify_fd,    .events = POLLIN },
             { .fd = target_pidfd, .events = POLLIN },
             { .fd = agent_err_fd, .events = POLLIN },
@@ -3124,11 +3126,13 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         int rvi = pxi + 1 + npx;
         pfds[rvi] = (struct pollfd){ .fd = g_ctl_listen, .events = POLLIN };
         pfds[rvi + 1] = (struct pollfd){ .fd = g_secrets.ctl, .events = POLLIN };
+        pfds[rvi + 2] = (struct pollfd){ .fd = g_cn, .events = POLLIN };     /* v1.28.1 review: process events */
         /* v1.28.1 step 4: and the user's token's expiry */
         int oto = obo_timeout_ms();
         if (oto >= 0 && (to < 0 || oto < to)) to = oto;
-        int pr = poll(pfds, (nfds_t)(rvi + 2), to);
+        int pr = poll(pfds, (nfds_t)(rvi + 3), to);
         if (pr >= 0) obo_check(notify_fd);
+        if (pr > 0 && (pfds[rvi + 2].revents & POLLIN)) sub_cn_drain();
         if (pr < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -4964,6 +4968,21 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[warden] --agent-svid: the policy trusts no SPIFFE trust domain (`trust spiffe DOMAIN "
                 "bundle PATH`), so no SVID can be verified; refusing to start\n");
         return 2;
+    }
+    /* v1.28.1 review: every bundle the policy trusts, whether this run checks
+     * an SVID against it or not, is out of the agent's reach for writing (by
+     * its name, its resolved name, or a second one): a bundle changed in one
+     * run is trusted in the next */
+    for (size_t k = 0; k < p.v.nspiffe; k++) {
+        const char *b = p.v.spiffe[k].bundle;
+        char rb[PATH_MAX];
+        if (vdpc_path_writable(&p.c, b, strlen(b)) ||
+            (realpath(b, rb) && vdpc_path_writable(&p.c, rb, strlen(rb)))) {
+            fprintf(stderr, "[warden] the policy lets the agent write %s, the trust bundle for %s (line %d); "
+                    "refusing to start\n", b, p.v.spiffe[k].domain, p.v.spiffe[k].line);
+            return 1;
+        }
+        if (access(b, F_OK) == 0 && refuse_secret_reachable(&p, b, true) < 0) return 1;
     }
     if (p.v.ncreds || obo_arg || svid_arg) {
         static const char *const kStore[] = { "", "file", "vault", "aws-sm" };

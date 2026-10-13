@@ -96,10 +96,14 @@ static bool identity_ok(const struct ws_identity *m, const ws_idreq_t *idr) {
     if (!m->ok) return true;
     if (m->has_user != (idr->token != NULL) || m->has_svid != (idr->svid != NULL)) return false;
     if (m->has_user) {
+        /* v1.28.1 review: the algorithm one of the four, the times NumericDates
+         * the helper can produce (under 2^53) */
         if (m->issuer >= idr->nissuers || !printable_field(m->sub, sizeof m->sub, true) ||
             !printable_field(m->jti, sizeof m->jti, false) || !printable_field(m->alg, sizeof m->alg, true) ||
             !printable_field(m->kid, sizeof m->kid, false) || !hex64(m->token_sha256) || m->nact > WS_MAX_ACTORS ||
-            m->exp <= 0)
+            m->exp <= 0 || m->exp >= (int64_t)1 << 53 || m->iat < -1 || m->iat >= (int64_t)1 << 53 ||
+            m->nbf < -1 || m->nbf >= (int64_t)1 << 53 ||
+            (strcmp(m->alg, "RS256") && strcmp(m->alg, "PS256") && strcmp(m->alg, "ES256") && strcmp(m->alg, "EdDSA")))
             return false;
         for (uint32_t i = 0; i < m->nact; i++)
             if (!printable_field(m->act[i].sub, sizeof m->act[i].sub, true) ||

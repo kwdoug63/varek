@@ -695,8 +695,9 @@ static void exec_result(const struct exec_pend *x, const char *result) {
 }
 
 static void exec_pend_drop(size_t k, const char *result) {
+    /* v1.28.1: a sub-agent's launch says how it settled */
+    if (result && g_xp[k].sub > 0) result = sub_pend_end(g_xp[k].sub, g_xp[k].tid, result);
     if (result) exec_result(&g_xp[k], result);
-    if (result && g_xp[k].sub > 0) sub_pend_end(g_xp[k].sub, result);      /* v1.28.1 */
     if (g_xp[k].pidfd >= 0) close(g_xp[k].pidfd);
     g_xp[k] = g_xp[--g_nxp];
 }

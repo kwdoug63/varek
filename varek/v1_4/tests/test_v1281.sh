@@ -237,12 +237,42 @@ CASES
     refuse "an issuer that cannot be reached" down "the issuer's discovery document: cannot connect to 127.0.0.1:1"
     printf 'oidc_ca = /nonexistent/ca.pem\n' > "$T/conf_noca"; chmod 600 "$T/conf_noca"
     mint es256; (cd "$T" && timeout 60 "$WARDEN" "$T/p.txt" --secrets-conf "$T/conf_noca" --on-behalf-of "$T/tok" -- /usr/bin/true > "$OUT/noca.out" 2>&1); echo $? > "$OUT/noca.rc"
-    refuse "an issuer whose TLS the helper cannot verify (oidc_ca)" noca "cannot load the CA /nonexistent/ca.pem"
+    refuse "an issuer whose CA file (oidc_ca) is not there" noca "its CA file: cannot open /nonexistent/ca.pem"
 
     printf 'oidc_ca = %s/ca.pem\n' "$T" > "$T/conf644"; chmod 644 "$T/conf644"
     (cd "$T" && timeout 60 "$WARDEN" "$T/p.txt" --secrets-conf "$T/conf644" --on-behalf-of "$T/tok" -- /usr/bin/true > "$OUT/c644.out" 2>&1); echo $? > "$OUT/c644.rc"
     refuse "a configuration others can read, with a token and no credential: at once" c644 "the user's token: $T/conf644 must be owned by root"
     check "... not after the helper's 30 s" sh -c "! grep -q 'did not answer' '$OUT/c644.out'"
+
+    # v1.28.1 review
+    mint longkey; go longkey "$T/p.txt" --on-behalf-of "$T/tok"
+    refuse "a signed token with a claim name over 255 bytes (no crash)" longkey "the user's token: its header or claims hold a member name over 255 bytes"
+    check "... the helper did not crash" sh -c "! grep -q 'ended before it was ready' '$OUT/longkey.out'"
+    mint es256; python3 -c 'import sys
+t = open(sys.argv[1]).read().strip(); h, p, s = t.split(".")
+a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+s = s[:-1] + a[a.index(s[-1]) ^ 1]                  # an unused low bit of the last character
+open(sys.argv[1], "w").write(".".join((h, p, s)) + "\n")' "$T/tok"
+    go noncanon "$T/p.txt" --on-behalf-of "$T/tok"
+    refuse "a token whose base64url is not canonical (another hash for one token)" noncanon "the user's token: a part is not base64url"
+    printf '%b' "require warden 1.28\ntrust issuer $ISS audience varek-agent jwks $ISS/jwks-odd\n$LIBS" > "$T/podd.txt"
+    for c in odd-use odd-alg; do mint "$c"; go "$c" "$T/podd.txt" --on-behalf-of "$T/tok"; done
+    refuse "a key whose use cannot be read" odd-use "its key odd-use is not among the issuer's keys"
+    refuse "a key whose alg cannot be read" odd-alg "its key odd-alg is not among the issuer's keys"
+    printf '%b' "require warden 1.28\ntrust issuer $ISS audience varek-agent jwks $ISS/jwks-shared\n$LIBS" > "$T/pshared.txt"
+    mint es256; go shared "$T/pshared.txt" --on-behalf-of "$T/tok"
+    check "one kid on keys of two types: the one of the token's type verifies it" sh -c "grep -qx 0 '$OUT/shared.rc' && grep -q 'token verified (ES256, key ec1)' '$OUT/shared.out'"
+    printf '%b' "require warden 1.28\ntrust issuer $ISS/slow audience varek-agent\n$LIBS" > "$T/pslow.txt"
+    mint es256 "$ISS/slow"; s0=$(date +%s); go slow "$T/pslow.txt" --on-behalf-of "$T/tok"; s1=$(date +%s)
+    check "an issuer too slow to answer: refused for that, before the Warden's 30 s" sh -c "[ $((s1 - s0)) -lt 29 ] && grep -q 'the issuer.s discovery document: ' '$OUT/slow.out' && ! grep -q 'did not answer within' '$OUT/slow.out'"
+    mint es256; mkdir -p "$T/cadir"; cp "$T/ca.pem" "$T/cadir/ca.pem"; chmod 644 "$T/cadir/ca.pem"
+    printf 'oidc_ca = %s/cadir/ca.pem\n' "$T" > "$T/conf_cadir"; chmod 600 "$T/conf_cadir"
+    printf '%b' "${ID}allow path $T/cadir/\n$LIBS" > "$T/pca.txt"
+    (cd "$T" && timeout 60 "$WARDEN" "$T/pca.txt" --secrets-conf "$T/conf_cadir" --on-behalf-of "$T/tok" -- /usr/bin/true > "$OUT/caw.out" 2>&1); echo $? > "$OUT/caw.rc"
+    refuse "a policy that lets the agent write the issuers' CA (oidc_ca)" caw "lets the agent write $T/cadir/ca.pem"
+    chown 65534 "$T/cadir/ca.pem"
+    (cd "$T" && timeout 60 "$WARDEN" "$T/p.txt" --secrets-conf "$T/conf_cadir" --on-behalf-of "$T/tok" -- /usr/bin/true > "$OUT/cao.out" 2>&1); echo $? > "$OUT/cao.rc"
+    refuse "an issuers' CA another user owns" cao "must be owned by root and writable by no group or other user"
 
     # the token file and the policy
     mint es256; chmod 644 "$T/tok"; go mode "$T/p.txt" --on-behalf-of "$T/tok"
@@ -297,6 +327,7 @@ key-mismatch|a key that does not match the SVID|its key does not match its certi
 two-uris|two URI names|its certificate has 2 URI names
 ca-leaf|a CA certificate as the SVID|its certificate is a CA's
 not-spiffe|a URI name that is not a SPIFFE ID|its URI name is not a SPIFFE ID
+no-bcons|a leaf with no basicConstraints (review)|its certificate has no basicConstraints
 CASES
     chmod 644 "$T/svid-good.pem"; go svmode "$T/s.txt" --agent-svid "$T/svid-good.pem"; chmod 600 "$T/svid-good.pem"
     refuse "an SVID file others can read (it holds the key)" svmode "readable by no group or other user"
@@ -314,6 +345,18 @@ CASES
     printf '%b' "require warden 1.28\ntrust spiffe example.test bundle $T/missing.pem\n$LIBS" > "$T/s5.txt"
     go bmiss "$T/s5.txt" --agent-svid "$T/svid-good.pem"
     refuse "a bundle that is not there" bmiss "the bundle for example.test: cannot open $T/missing.pem"
+    go s_two-keys "$T/s.txt" --agent-svid "$T/svid-two-keys.pem"
+    refuse "a second key, one that cannot be read (review)" s_two-keys "the agent's SVID: $T/svid-two-keys.pem must hold exactly one private key"
+    mkdir -p "$T/b2"; cp "$T/bundle-other.pem" "$T/b2/other.pem"; chmod 644 "$T/b2/other.pem"
+    printf '%b' "require warden 1.28\ntrust spiffe example.test bundle $T/bundle.pem\ntrust spiffe other.test bundle $T/b2/other.pem\nallow path $T/b2/\n$LIBS" > "$T/s7.txt"
+    go bother "$T/s7.txt" --agent-svid "$T/svid-good.pem"
+    refuse "a policy that lets the agent write a bundle this run's SVID does not use (review)" bother "lets the agent write $T/b2/other.pem"
+    go bnosvid "$T/s7.txt"
+    refuse "... or with no SVID at all" bnosvid "lets the agent write $T/b2/other.pem"
+    mkfifo "$T/fifo.pem"
+    printf '%b' "require warden 1.28\ntrust spiffe example.test bundle $T/fifo.pem\n$LIBS" > "$T/s8.txt"
+    s0=$(date +%s); go bfifo "$T/s8.txt" --agent-svid "$T/svid-good.pem"; s1=$(date +%s)
+    check "a FIFO where a bundle should be: refused at once, the helper not held (review)" sh -c "[ $((s1 - s0)) -lt 10 ] && grep -q 'is not a regular file' '$OUT/bfifo.out' && ! pgrep -fx 'warden-secrets [0-9]+:[0-9]+'"
     go nospf "$T/p.txt" --agent-svid "$T/svid-good.pem"
     refuse "an SVID when the policy trusts no trust domain" nospf "the policy trusts no SPIFFE trust domain"
     printf '%b' "require warden 1.28\ntrust issuer $ISS audience varek-agent\ntrust spiffe example.test bundle $T/bundle.pem\n$LIBS" > "$T/s6.txt"
@@ -380,6 +423,31 @@ for l in open(sys.argv[1]):
     [ "$(obos e2big)" = "agent" ] && [ "$(opens e2big | wc -l)" = 2 ] \
         && pass "... the process and the child it forked after are the agent's again" || flunk "after a failed launch ($(opens e2big | tr '\n' ';'))"
     check "... and no call is refused for it" sh -c "! grep -q 'intent_derivation_failed' '$OUT/e2big.out'"
+    # v1.28.1 review: a launch of the image the launcher already runs
+    printf '%b' "require warden 1.28\nallow exec $B/agent subagent=self\nallow path $B/f readonly\n$SL" > "$B/ps.txt"
+    POL="$B/ps.txt" sgo same e2big "$B/f" "$B/agent"
+    [ "$(obos same)" = "agent" ] && grep -q '"event":"subagent_settled".*"subagent":"self#1","result":"failed","how":"process_events"' "$OUT/same.out" \
+        && pass "a failed launch of the image the launcher runs: settled failed by the kernel's process events, the agent's (review)" \
+        || flunk "a failed same-image launch ($(obos same))"
+    POL="$B/ps.txt" sgo same2 exec "$B/agent" open "$B/f"
+    [ "$(obos same2)" = "agent+subagent:self#1" ] && pass "... and one that happened: the sub-agent's" || flunk "a same-image launch ($(obos same2))"
+    VAREK_WARDEN_TEST_NO_PROC_CONNECTOR=1 POL="$B/ps.txt" sgo samefb exec "$B/agent" open "$B/f"
+    check "... without process events, refused (subagent_same_image)" sh -c "grep -q '\"rule\":\"subagent_same_image\"' '$OUT/samefb.out' && grep -q 'no process events here' '$OUT/samefb.out'"
+    check "each sub-agent's launch is settled once, before its decisions (subagent_settled)" python3 -c 'import json,sys
+for f in sys.argv[1:]:
+    L = [json.loads(l) for l in open(f) if l.startswith("{")]
+    st = [i for i, r in enumerate(L) if r.get("event") == "subagent_settled"]
+    first = [i for i, r in enumerate(L) if any(x.startswith("subagent:") for x in r.get("obo", []))]
+    if not st or (first and min(first) < min(st)) or any(L[i]["how"] != "process_events" for i in st): sys.exit(1)' \
+        "$OUT/fork.out" "$OUT/nest.out"
+    # the Warden's own group's name in a record, escaped (review)
+    mkdir -p "$CGM/v1281 q\"x"
+    sh -c "echo \$\$ > '$CGM/v1281 q\"x/cgroup.procs' && exec timeout 60 '$WARDEN' '$B/p.txt' -- '$B/agent' exec '$B/a' open '$B/f'" > /dev/null 2> "$OUT/cgq.out"
+    rmdir "$CGM/v1281 q\"x"/varek-* 2>/dev/null; rmdir "$CGM/v1281 q\"x" 2>/dev/null
+    check "a Warden in a group whose name holds a quote: every record is still JSON" python3 -c 'import json,sys
+L = [l for l in open(sys.argv[1]) if l.startswith("{")]
+[json.loads(l) for l in L]
+sys.exit(0 if any("\"subagent\":\"alpha#1\"" in l for l in L) else 1)' "$OUT/cgq.out"
     check "every decision record carries obo" python3 -c 'import json,sys
 rs=[json.loads(l) for f in sys.argv[1:] for l in open(f) if l.startswith("{\"report_id\"")]
 sys.exit(0 if rs and all(isinstance(r.get("obo"), list) and r["obo"][:1] == ["agent"] for r in rs) else 1)' \
@@ -508,6 +576,51 @@ for r in recs:
     refuses "a revocation by the expiry with no expiry recorded" "$B/pe.txt" "$OUT/g11.log" "no expiry that revokes is recorded before it"
     python3 "$F" "$OUT/fork.out" "$OUT/g12.log" "$RS; del rs['on_behalf_of']['agent']['cgroup']"
     refuses "a run with sub-agents whose run_start names no control group" "$B/p.txt" "$OUT/g12.log" "has no control group"
+    # v1.28.1 review: forgeries the first audit accepted
+    ALLOWIFY="dr = [r for r in recs if isinstance(r, dict) and 'report_id' in r]
+ok = [r for r in dr if r['decision_final'] == 'ALLOW' and r['action'] == 'file.open'][-1]
+keep = ('report_id', 'run', 'seq', 'agent_pid', 'obo', 'timestamp_ns', 'latency_us')
+for r in dr:
+    if r.get('rule') == 'revoked':
+        for k in list(r):
+            if k not in keep: del r[k]
+        for k, v in ok.items():
+            if k not in keep: r[k] = v"
+    python3 "$F" "$OUT/exp_rv.out" "$OUT/g13.log" "ev = [r for r in recs if isinstance(r, dict) and r.get('event') in ('on_behalf_of_expired', 'revoked')]
+for e in ev: recs.remove(e)
+$ALLOWIFY
+i = [k for k, r in enumerate(recs) if isinstance(r, dict) and r.get('event') == 'run_end'][0]
+recs[i:i] = ev"
+    refuses "an expiry and its revocation recorded late, the calls between allowed" "$B/pe.txt" "$OUT/g13.log" "not in time order"
+    python3 "$F" "$OUT/exp_rv.out" "$OUT/g14.log" "recs[:] = [r for r in recs if not (isinstance(r, dict) and r.get('event') in ('on_behalf_of_expired', 'revoked', 'run_end'))]
+$ALLOWIFY"
+    if python3 "$AUD" --allow-incomplete --policy "$B/pe.txt" --checker "$CERT" "$OUT/g14.log" > "$OUT/f.out" 2>&1; then flunk "the audit refuses an incomplete stream past the expiry with none recorded"
+    elif grep -q "allowed after the user's token expired" "$OUT/f.out"; then pass "the audit refuses an incomplete stream past the expiry with none recorded"
+    else flunk "the audit refuses an incomplete stream past the expiry ($(grep -m1 PROBLEM "$OUT/f.out"))"; fi
+    python3 "$F" "$OUT/e2big.out" "$OUT/g15.log" "$DR
+for r in recs:
+    if isinstance(r, dict) and r.get('event') in ('exec_result', 'subagent_settled'): r.pop('subagent', None)
+dr[-1]['obo'] = ['agent', 'subagent:alpha#1']"
+    refuses "a failed launch with its sub-agent stripped from its results" "$B/p.txt" "$OUT/g15.log" "subagent_settled event that is malformed"
+    python3 "$F" "$OUT/e2big.out" "$OUT/g16.log" "ex = [r for r in recs if isinstance(r, dict) and r.get('event') in ('exec_result', 'subagent_settled')]
+for e in ex: recs.remove(e)
+i = [k for k, r in enumerate(recs) if isinstance(r, dict) and r.get('event') == 'run_end'][0]; recs[i:i] = ex
+$DR
+dr[-1]['obo'] = ['agent', 'subagent:alpha#1']"
+    refuses "a sub-agent's decision before its launch settled" "$B/p.txt" "$OUT/g16.log" "before its launch is known to have happened"
+    python3 "$F" "$OUT/exp_rv.out" "$OUT/g17.log" "$RS; rs['warden'] = '1.28.0'
+for k in ('on_behalf_of', 'operator', 'secrets_binary_sha256'): rs.pop(k, None)
+recs[:] = [r for r in recs if not (isinstance(r, dict) and r.get('event') in ('on_behalf_of_expired', 'revoked'))]
+$ALLOWIFY
+for r in recs:
+    if isinstance(r, dict): r.pop('obo', None)"
+    refuses "a run claiming a Warden that predates the chain, under a policy that trusts an issuer" "$B/pe.txt" "$OUT/g17.log" "which only a Warden of 1.28.1 or later reads"
+    for code in "rs['on_behalf_of'] = 'x'" "rs['on_behalf_of']['user']['issuer'] = ['a']" "rs['on_behalf_of']['user']['expires'] = 'xx'"; do
+        python3 "$F" "$OUT/exp_rv.out" "$OUT/g18.log" "$RS; $code"
+        python3 "$AUD" --policy "$B/pe.txt" --checker "$CERT" "$OUT/g18.log" > "$OUT/f.out" 2>&1
+        grep -q Traceback "$OUT/f.out" && flunk "the audit answers a malformed run_start ($code) without a traceback" \
+            || pass "the audit answers a malformed run_start ($code) without a traceback"
+    done
     # the tools
     for n in user nest es256 plain; do cp "$OUT/$n.out" "$OUT/verdicts-$n.log"; done
     printf '[varek]\npolicy = %s\nlog_dir = %s\n' "$B/pu.txt" "$OUT" > "$OUT/varek5.conf"
@@ -523,6 +636,12 @@ for r in recs:
     check "varek refusals --user: a run for someone else says so" grep -q 'This run was not on behalf of bob (it was on behalf of alice@example.test)' "$OUT/rf3.out"
     V refusals "$OUT/exp_rv.out" > "$OUT/rf4.out" 2>&1
     check "varek refusals: the token expired and the run was revoked" sh -c "grep -q 'expired during the run (the run was revoked)' '$OUT/rf4.out' && grep -q '(the user.s token expired): every call after it was refused' '$OUT/rf4.out'"
+    { cat "$OUT/user.out"; printf '%s\n' '{"event":"on_behalf_of_expired","action":"revoke"}' '{"event":"revoked","by":"on_behalf_of_expiry"}'; } > "$OUT/fake.log"
+    V refusals "$OUT/fake.log" > "$OUT/rf5.out" 2>&1
+    check "varek refusals ignores lines with no run id (the agent's output in the same file)" sh -c "! grep -q 'expired\|was revoked' '$OUT/rf5.out'"
+    python3 "$F" "$OUT/user.out" "$OUT/g19.log" "$RS; rs['on_behalf_of']['user']['verified'] = False"
+    V refusals "$OUT/g19.log" > "$OUT/rf6.out" 2>&1
+    check "varek refusals does not call an unverified user verified" grep -q 'NOT marked verified' "$OUT/rf6.out"
     V policy show "$B/pu.txt" > "$OUT/ps.out" 2>&1
     check "varek policy show: the trusted issuer and the sub-agents" sh -c "grep -q '^Issuer   $ISS: a user.s token it issued for varek-agent' '$OUT/ps.out' && grep -q '^  alpha: line 2: allow exec $B/a subagent=alpha' '$OUT/ps.out'"
     python3 "$HERE/tools/varek_cyclonedx.py" --log "$OUT/user.out" --policy "$B/pu.txt" --output "$OUT/u.cdx.json" > /dev/null 2>&1

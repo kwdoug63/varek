@@ -354,6 +354,10 @@ def summarize(recs):
         # another run, which the audit ignores too)
         if s["run"] is not None and ev != "run_start" and "run" in r and r.get("run") != s["run"]:
             continue
+        # v1.28.1 review: a line with no run id is not the Warden's (the agent's
+        # stdout can share the file)
+        if ev != "run_start" and "run" not in r:
+            continue
         if ev == "run_start":
             if s["run"] is not None:
                 continue
@@ -1290,7 +1294,8 @@ def cmd_refusals(args):
             if not (e.get("why") == "refused_request" and e.get("proxy_conn") in s["proxy_denied"])]
     if s["user"] or s["subagents"]:                                                 # v1.28.1
         u = s["user"]
-        info(("On behalf of " + f"{u.get('subject')} (token from {u.get('issuer')}, verified)" if u else
+        info(("On behalf of " + f"{u.get('subject')} (token from {u.get('issuer')}, "
+              f"{'verified' if u.get('verified') is True else 'NOT marked verified'})" if u else
               "On behalf of no user (no token was given)") +
              (f"; sub-agents: {', '.join(f'{t} ({n} decisions)' for t, n in sorted(s['subagents'].items()))}"
               if s["subagents"] else "") + ".")

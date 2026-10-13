@@ -859,9 +859,9 @@ def check_chain(ident, meta, records, run, problems):
         if "on_behalf_of" in rs or any("obo" in r for r in records):
             problems.append("run_start or a record names who a decision was for, but only a Warden of 1.28.1 "
                             "or later records it")
-        if req or subrules:
-            problems.append("the policy requires a user or names a sub-agent, which only a Warden of 1.28.1 "
-                            "or later attributes")
+        if req or subrules or iss or dom:
+            problems.append("the policy trusts an issuer or a trust domain, requires a user or names a "
+                            "sub-agent, which only a Warden of 1.28.1 or later reads")
         return None
     obo = rs.get("on_behalf_of")
     if not isinstance(obo, dict) or not isinstance(obo.get("agent"), dict) or obo["agent"].get("run") != run:
@@ -873,7 +873,7 @@ def check_chain(ident, meta, records, run, problems):
             problems.append("run_start's user is not an object")
             user = {}
         i = user.get("issuer")
-        if i not in iss:
+        if not isinstance(i, str) or i not in iss:
             problems.append(f"run_start's user is vouched for by {i!r}, an issuer the policy does not trust")
         elif user.get("audience") != iss[i][0]:
             problems.append(f"run_start's user has the audience {user.get('audience')!r}, not the one the policy "
@@ -902,7 +902,7 @@ def check_chain(ident, meta, records, run, problems):
         problems.append("run_start lists actors, but no user")
     if "spiffe_id" in agent:
         d = agent.get("trust_domain")
-        if d not in dom:
+        if not isinstance(d, str) or d not in dom:
             problems.append(f"the agent's SVID is in {d!r}, a trust domain the policy does not trust")
         elif not (isinstance(agent["spiffe_id"], str) and agent["spiffe_id"].startswith(f"spiffe://{d}/")):
             problems.append("the agent's SPIFFE ID is not in its trust domain")
@@ -921,10 +921,15 @@ def check_chain(ident, meta, records, run, problems):
     lines = meta.get("lineno", {})
     at = lambda r: lines.get(id(r), 0)
     started = {}                     # "NAME#n" -> (line of its launch record, the launcher's chain, cgroup)
-    failed = {}                      # "NAME#n" -> line of its exec_result failed
-    for _, e in meta.get("exec_results", []):
-        if isinstance(e.get("subagent"), str) and e.get("result") in ("failed", "killed"):
-            failed.setdefault(e["subagent"], at(e))
+    # v1.28.1 review: how each launch settled (subagent_settled, once, after
+    # its launch); a decision for a sub-agent only after it settled launched
+    settled = {}                     # "NAME#n" -> (line, "launched" | "failed")
+    for _, e in meta.get("subagent_events", []):
+        tag = e.get("subagent")
+        if not isinstance(tag, str) or e.get("result") not in ("launched", "failed") or tag in settled:
+            problems.append(f"a subagent_settled event that is malformed, or a second for {tag!r}")
+            continue
+        settled[tag] = (at(e), e["result"])
     count, per_name, conn_obo = {}, {}, {}
     for r in sorted(records, key=at):
         ob = r.get("obo")
@@ -932,6 +937,11 @@ def check_chain(ident, meta, records, run, problems):
         if r.get("rule") == "subagent_unattributed":
             if ob != [] or r.get("decision_final") != "DENY":
                 problems.append(f"seq {seq}: refused as in no group of the run, but not with an empty obo")
+            continue
+        # v1.28.1 review: a call refused because its thread had gone, whose
+        # group could not be read either
+        if ob == [] and r.get("decision_final") == "DENY" and \
+                r.get("rule") in ("intent_derivation_failed", "exec_identity_unreadable", "exec_identity_mismatch"):
             continue
         if not (isinstance(ob, list) and all(isinstance(x, str) for x in ob) and ob[:len(base)] == base):
             problems.append(f"seq {seq}: obo {ob!r} does not begin with {base!r}")
@@ -952,7 +962,12 @@ def check_chain(ident, meta, records, run, problems):
             if st[1] != ob[:len(base) + k]:
                 problems.append(f"seq {seq}: sub-agent {tag} in a chain other than the one that launched it")
                 break
-            if tag in failed and failed[tag] < at(r):
+            se = settled.get(tag)
+            if se is None or se[0] > at(r):
+                problems.append(f"seq {seq}: a decision for sub-agent {tag} before its launch is known to have "
+                                f"happened (subagent_settled)")
+                break
+            if se[1] != "launched":
                 problems.append(f"seq {seq}: a decision for sub-agent {tag} after its launch failed")
                 break
             tags.append(tag)
@@ -991,10 +1006,22 @@ def check_chain(ident, meta, records, run, problems):
             if want is not None and ob != want:
                 problems.append(f"seq {seq}: the proxy's decision on connection {r['proxy_conn']} is for {ob!r}, "
                                 f"not {want!r}, whom the agent's connect was for")
+    # each launch's exec_result is its own: the sub-agent its launch record
+    # names (by decision_seq), and, once settled, the same outcome
+    by_seq = {r.get("seq"): r for r in records}
     for _, e in meta.get("exec_results", []):
         tag = e.get("subagent")
-        if tag is not None and tag not in started:
-            problems.append(f"an exec_result names sub-agent {tag!r}, which no launch started")
+        launch = by_seq.get(e.get("decision_seq"))
+        want = launch.get("subagent") if isinstance(launch, dict) else None
+        if tag != want:
+            problems.append(f"an exec_result for the launch at seq {e.get('decision_seq')} names sub-agent "
+                            f"{tag!r}, but that launch started {want!r}")
+        elif tag is not None and tag in settled and e.get("result") in ("launched", "failed") \
+                and e["result"] != settled[tag][1]:
+            problems.append(f"sub-agent {tag}'s exec_result says {e['result']}, but it settled {settled[tag][1]}")
+    for tag, (line, _) in settled.items():
+        if tag not in started or started[tag][0] > line:
+            problems.append(f"sub-agent {tag} settled, but no launch started it before")
     return count
 
 
@@ -1064,7 +1091,8 @@ def check_credentials(creds, cred_rules, meta, records, complete, problems, note
                 or e.get("action") != user.get("on_expiry", "revoke"):
             problems.append("on_behalf_of_expired does not match the user run_start names (subject, expiry, "
                             "what is done)")
-        elif type(e.get("timestamp_ns")) is not int or e["timestamp_ns"] < user["expires"] * 1000000000:
+        elif type(e.get("timestamp_ns")) is not int or type(user.get("expires")) is not int \
+                or e["timestamp_ns"] < user["expires"] * 1000000000:
             problems.append("on_behalf_of_expired is recorded before the token expired")
     by_expiry = bool(rv) and rv[0].get("by") == "on_behalf_of_expiry"
     if rv and by_expiry:
@@ -1076,11 +1104,36 @@ def check_credentials(creds, cred_rules, meta, records, complete, problems, note
     if ex and ex[0].get("action") == "revoke" and not rv:
         problems.append("the user's token expired and the run should have been revoked, but no revocation "
                         "is recorded")
-    re_ = meta.get("run_end") or {}
-    if user is not None and not ex and type(user.get("expires")) is int and type(re_.get("timestamp_ns")) is int \
-            and re_["timestamp_ns"] > (user["expires"] + 2) * 1000000000:
-        problems.append("the user's token expired during the run, but its expiry is not recorded "
-                        "(on_behalf_of_expired)")
+    # v1.28.1 review: the records are in time order (1 s of slack for the
+    # clock); the expiry is recorded as soon as the token expired, its
+    # revocation next, with nothing between; nothing is allowed after the
+    # expiry unless it says the run goes on; and a stream, whole or not,
+    # that runs past the expiry records it
+    stamped = sorted((at(x), x["timestamp_ns"]) for x in list(records) + events +
+                     [e for _, e in meta.get("exec_results", [])] + [e for _, e in meta.get("subagent_events", [])]
+                     if type(x.get("timestamp_ns")) is int)
+    for (l1, t1), (l2, t2) in zip(stamped, stamped[1:]):
+        if t2 < t1 - 1000000000:
+            problems.append(f"line {l2}: a record timestamped before the one before it (the stream is not in "
+                            f"time order)")
+            break
+    exp_ns = user["expires"] * 1000000000 if user is not None and type(user.get("expires")) is int else None
+    if ex and rv and by_expiry:
+        between = [x for x in list(records) + events if at(ex[0]) < at(x) < rline]
+        if between:
+            problems.append("records between the token's expiry and the revocation it made (it is made at once)")
+    if exp_ns is not None:
+        goes_on = ex and ex[0].get("action") == "record"
+        for rec in records:
+            if rec.get("decision_final") == "ALLOW" and type(rec.get("timestamp_ns")) is int \
+                    and rec["timestamp_ns"] > exp_ns + 2000000000 and not (goes_on and at(rec) > at(ex[0])):
+                problems.append(f"seq {rec.get('seq')}: allowed after the user's token expired, with no expiry "
+                                f"recorded before it that lets the run go on")
+                break
+        last = max((t for _, t in stamped), default=None)
+        if not ex and last is not None and last > exp_ns + 2000000000:
+            problems.append("the user's token expired during the run, but its expiry is not recorded "
+                            "(on_behalf_of_expired)")
     carried = 0
     allowed_with = {}                # (proxy_conn, request_seq) -> (credential, line)
     after = lambda r: rline is not None and at(r) > rline
@@ -2902,7 +2955,8 @@ def main(argv=None):
         print(f"varek_audit: credentials: {len(pcreds)} named, {ncarried} requests carried one, "
               f"{nswap_refused} swaps refused{', the run was revoked' if revoked else ''}")
     if per_sub is not None:                                                               # v1.28.1
-        u = meta.get("run_start", {}).get("on_behalf_of", {}).get("user")
+        ob_ = meta.get("run_start", {}).get("on_behalf_of")
+        u = ob_.get("user") if isinstance(ob_, dict) else None
         who = f"on behalf of {u.get('subject')} ({u.get('issuer')})" if isinstance(u, dict) else "no user"
         subs = ", ".join(f"{t} {n}" for t, n in sorted(per_sub.items())) if per_sub else "none"
         print(f"varek_audit: chain: {who}; sub-agents (decisions): {subs}")

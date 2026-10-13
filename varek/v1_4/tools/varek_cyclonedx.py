@@ -260,6 +260,10 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             if event == "exec_result" and run is not None and rec.get("run") == run \
                     and meta is not None:
                 meta.setdefault("exec_results", []).append((len(records), rec))
+            # v1.28.1 review: how each sub-agent's launch settled
+            if event == "subagent_settled" and run is not None and rec.get("run") == run \
+                    and meta is not None:
+                meta.setdefault("subagent_events", []).append((len(records), rec))
             # v1.28: credentials and revocation, each with the number of
             # decision records before it
             if event in CRED_EVENTS and run is not None and rec.get("run") == run and meta is not None:
@@ -649,7 +653,8 @@ def _obo_text(records, pm):
         if actors:
             facts.append(("varek:on_behalf_of.actors", ",".join(str(a.get("subject", "")) for a in actors)))
         text += (f" The run acted on behalf of {user.get('subject')}, whose token {user.get('issuer')} issued "
-                 f"(verified against its keys at the start; the token is not in this evidence)"
+                 + ("(verified against its keys at the start" if user.get("verified") is True
+                    else "(recorded as NOT verified") + "; the token is not in this evidence)"
                  + (f", delegated through {len(actors)} actor(s)" if actors else "") + ".")
     else:
         text += " No user's token was given: the run acted for the agent alone."
