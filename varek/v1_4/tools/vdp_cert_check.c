@@ -7,7 +7,7 @@
 //       Print the policy's SHA-256 (the digest the Warden records in run_start).
 //   vdp_cert_check <policy> batch
 //       Read certificates from stdin, one per line:
-//           <path|host|exec> <flags|-> <hex string> <rule> <witness>
+//           <path|host|exec|request|mcp> <flags|-> <hex string> <rule> <witness> [@<subject>]
 //       flags is 0x-hex or decimal, '-' for a symbolic (any-flags) claim; the
 //       hex string is '=' for the empty string;
 //       witness is '-' (none), 'c:<offset>' (contains) or 'g:<a>-<b>,...'
@@ -240,6 +240,11 @@ int main(int argc, char **argv) {
                 printf("rule %d %s %s %s\n", ri.line, pol.creds[ri.cred - 1].name, ri.cred_hdr,
                        ri.cred_scheme[0] ? ri.cred_scheme : "-");
         }
+        /* v1.31: an MCP access token's audience */
+        for (size_t k = 0; k < pol.ncreds; k++)
+            if (pol.creds[k].audience[0])
+                printf("audience %s %s %s\n", pol.creds[k].name, pol.creds[k].audience,
+                       pol.creds[k].opaque ? "opaque" : "-");
         vdpc_free(&pol);
         return 0;
     }
@@ -258,6 +263,20 @@ int main(int argc, char **argv) {
             if (ri.subagent && ri.subagent[0]) printf("subagent %d %s\n", ri.line, ri.subagent);
         }
         if (pol.require_obo) printf("require on-behalf-of\n");
+        /* v1.31: the confined subjects, the rules for each, the MCP resources */
+        for (size_t k = 0; k < pol.nsubjects; k++) {
+            vdpc_rule_info_t ri;
+            vdpc_rule_info(&pol, (size_t)pol.subjects[k].rule, &ri);
+            printf("confined %zu %s %s %d %s\n", k + 1, pol.subjects[k].name, pol.subjects[k].mcp ? "mcp" : "subagent",
+                   ri.line, ri.sha256 && ri.sha256[0] ? ri.sha256 : "-");
+        }
+        for (size_t i = 0; i < pol.n; i++) {
+            vdpc_rule_info_t ri;
+            vdpc_rule_info(&pol, i, &ri);
+            if (ri.subj) printf("for %d %d\n", ri.line, ri.subj);
+        }
+        for (size_t k = 0; k < pol.nmcpres; k++)
+            printf("mcp-resource %s %s\n", pol.mcpres[k].url, pol.mcpres[k].aud[0] ? pol.mcpres[k].aud : "-");
         vdpc_free(&pol);
         return 0;
     }
@@ -266,7 +285,7 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < pol.n; i++) {
             vdpc_rule_info_t ri;
             vdpc_rule_info(&pol, i, &ri);
-            putchar(ri.kind == VDPC_PATH ? 'p' : ri.kind == VDPC_HOST ? 'h' : ri.kind == VDPC_REQUEST ? 'r' : 'e');
+            putchar(ri.kind == VDPC_PATH ? 'p' : ri.kind == VDPC_HOST ? 'h' : ri.kind == VDPC_REQUEST ? 'r' : ri.kind == VDPC_MCP ? 'm' : 'e');
         }
         putchar('\n');
         vdpc_free(&pol);
@@ -285,7 +304,7 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < pol.n; i++) {
             vdpc_rule_info_t ri;
             vdpc_rule_info(&pol, i, &ri);
-            printf("%c %c %c %x %x %c %d %u %u %u ", ri.kind == VDPC_PATH ? 'p' : ri.kind == VDPC_HOST ? 'h' : ri.kind == VDPC_REQUEST ? 'r' : 'e',
+            printf("%c %c %c %x %x %c %d %u %u %u ", ri.kind == VDPC_PATH ? 'p' : ri.kind == VDPC_HOST ? 'h' : ri.kind == VDPC_REQUEST ? 'r' : ri.kind == VDPC_MCP ? 'm' : 'e',
                    ri.allow ? 'a' : 'd', ri.name ? 'n' : '-', (unsigned)ri.mask, (unsigned)ri.value,
                    ri.wild ? 'w' : '-', ri.line, (unsigned)ri.names, (unsigned)ri.rate,
                    (unsigned)ri.max_body);
@@ -390,9 +409,17 @@ int main(int argc, char **argv) {
         char *hx = strtok_r(NULL, " ", &save);
         char *rs = strtok_r(NULL, " ", &save);
         char *ws = strtok_r(NULL, " ", &save);
+        char *sj = strtok_r(NULL, " ", &save);          /* v1.31: @N, the calling subject (default @0) */
         if (hx && !strcmp(hx, "=")) hx = (char *)"";   /* empty string */
         int kind = !k ? -1 : !strcmp(k, "path") ? VDPC_PATH : !strcmp(k, "host") ? VDPC_HOST
-                 : !strcmp(k, "exec") ? VDPC_EXEC : !strcmp(k, "request") ? VDPC_REQUEST : -1;
+                 : !strcmp(k, "exec") ? VDPC_EXEC : !strcmp(k, "request") ? VDPC_REQUEST
+                 : !strcmp(k, "mcp") ? VDPC_MCP : -1;
+        uint32_t subj = 0;
+        const char *send;
+        if (sj && (sj[0] != '@' || parse_u32(sj + 1, &send, &subj) < 0 || *send || subj > 1000)) {
+            printf("{\"check\":\"error\",\"why\":\"bad subject\"}\n");
+            continue;
+        }
         vdpc_cert_t c;
         memset(&c, 0, sizeof c);
         if (kind < 0 || !fl || !hx || !rs || !ws || parse_witness(ws, &c) < 0) {
@@ -422,7 +449,7 @@ int main(int argc, char **argv) {
             continue;
         }
         char why[160];
-        if (vdpc_check(&pol, kind, s, sl, flags, has_flags, &c, why, sizeof why)) {
+        if (vdpc_check_subj(&pol, (int)subj, kind, s, sl, flags, has_flags, &c, why, sizeof why)) {
             printf("{\"check\":\"ok\"}\n");
         } else {
             printf("{\"check\":\"reject\",\"why\":\"");

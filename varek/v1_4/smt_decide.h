@@ -101,7 +101,7 @@
 #define VDP_KNOWN_OFLAGS   0x007fffc3u  /* checked against <fcntl.h> in smt_decide.c */
 
 typedef enum { VDP_KIND_PATH = 0, VDP_KIND_HOST = 1, VDP_KIND_EXEC = 2,
-               VDP_KIND_REQUEST = 3 /* v1.26.1 */ } vdp_kind_t;
+               VDP_KIND_REQUEST = 3 /* v1.26.1 */, VDP_KIND_MCP = 4 /* v1.31 */ } vdp_kind_t;
 typedef enum { VDP_ALLOW = 0, VDP_DENY = 1 } vdp_verb_t;
 typedef enum {
     VDP_STR_PREFIX = 0, VDP_STR_EQ = 1, VDP_STR_HOST = 2,          /* v1.13 */
@@ -173,6 +173,18 @@ typedef struct {
      * rule's `subagent=NAME` ("" : none); the program it admits is a
      * sub-agent. Not part of any decision. */
     char           subagent[33];
+    /* v1.31 (docs/security/v1.31-standards.md, section 2): the subject whose
+     * calls the rule decides: 0, the agent (and every sub-agent that is not
+     * confined); k > 0, the confined subject vdp_policy_t.subjects[k - 1]
+     * (`for=NAME`). A call is decided by its subject's rules only. */
+    int            subj;
+    /* v1.31: this allow exec rule launches a confined subject: an `mcp server`
+     * line (mcp_server), or `subagent=NAME confined`. confined_subj is the
+     * subject it starts (1 + its index), 0 if none. sha256: the launch file's
+     * pin (`mcp server ... sha256=HEX`, lowercase hex), "" if none. */
+    int            confined_subj;
+    bool           mcp_server;
+    char           sha256[65];
 } vdp_rule_t;
 
 #define VDP_PROXY_MAX_PORTS 16
@@ -197,6 +209,10 @@ typedef struct {
     int  store;                 /* VDP_CRED_* */
     char ref[1025];             /* after "STORE:" */
     int  line;
+    /* v1.31: `audience=URL [opaque]`: an MCP access token for the server at
+     * URL, held in canonical form (vdp_mcp_url); "" : none */
+    char audience[VDP_STR_MAX + 1];
+    bool opaque;
 } vdp_cred_t;
 
 /* v1.28.1: the identities a run accepts, after `require warden 1.28`.
@@ -225,6 +241,29 @@ typedef struct {
     char bundle[1025];
     int  line;
 } vdp_spiffe_t;
+
+/* v1.31: `trust mcp-resource URL [audience AUD]`: an issuer of the run's user
+ * token found through the protected resource metadata of the MCP server at
+ * URL (an https URL in canonical form, at most 255 bytes as written); AUD the
+ * audience its tokens must carry ("" : URL itself). Each URL once, at most
+ * VDP_MAX_MCPRES. Not part of any decision. */
+#define VDP_MAX_MCPRES 8
+typedef struct {
+    char url[256];              /* as written */
+    char aud[256];
+    int  line;
+} vdp_mcpres_t;
+
+/* v1.31: a confined subject, declared by `mcp server NAME exec PATH` or by an
+ * allow exec rule with `subagent=NAME confined`. Its calls are decided by the
+ * rules marked `for=NAME` only. At most VDP_MAX_SUBJECTS. */
+#define VDP_MAX_SUBJECTS 32
+typedef struct {
+    char name[33];
+    int  rule;                  /* the rule that launches it */
+    bool mcp;                   /* declared by `mcp server` */
+    int  line;
+} vdp_subject_t;
 
 typedef struct {
     vdp_rule_t rules[VDP_MAX_RULES];
@@ -264,6 +303,12 @@ typedef struct {
     vdp_spiffe_t spiffe[VDP_MAX_SPIFFE];
     size_t       nspiffe;
     bool         require_obo;
+    /* v1.31: the confined subjects (subject k is subjects[k - 1]) and the
+     * MCP resources trusted for the user's token */
+    vdp_subject_t subjects[VDP_MAX_SUBJECTS];
+    size_t        nsubjects;
+    vdp_mcpres_t  mcpres[VDP_MAX_MCPRES];
+    size_t        nmcpres;
 } vdp_policy_t;
 
 /* Why a verdict was reached (for records). */
@@ -383,10 +428,74 @@ const char *vdp_kind_name(vdp_kind_t k);
 // launch is refused whatever the exec rules say. The rules themselves are
 // unchanged: `<allow|deny> exec [matcher] CONSTANT`, exact by default.
 //
-// Refused at the end of the file: request rules or passthrough hosts without
-// `proxy inspect`; a request rule on a port that is not proxied; a request
-// rule whose host is, or (a wildcard) covers, a passthrough host.
+// v1.31 (docs/security/v1.31-standards.md), each after `require warden 1.31`:
+//   mcp server NAME exec PATH [sha256=HEX]
+//       declares a confined subject NAME (a lowercase letter, then up to 31
+//       lowercase letters, digits or '_'), and is the rule `allow exec PATH
+//       subagent=NAME` at its place among the agent's rules. PATH is an
+//       absolute path (at most 1024 bytes; no ".", "..", "//" or trailing
+//       "/") whose basename is not a shell, an interpreter, the loader or a
+//       launcher (npx, uvx, docker, env, ...: vdp_exec_is_interpreter and
+//       exec_is_launcher). sha256= pins the file (64 lowercase hex digits).
+//   <allow> exec ... subagent=NAME confined
+//       declares a confined sub-agent. A name is confined everywhere or
+//       nowhere: a confined name may not also be an unconfined subagent=, and
+//       each confined subject is declared once (at most VDP_MAX_SUBJECTS).
+//   for=NAME   on any rule (path, host, exec, request, mcp): the rule decides
+//       the calls of the confined subject NAME, declared on an earlier line,
+//       and no one else's. A rule without it decides the agent's (and every
+//       unconfined sub-agent's). A subject's calls are decided by its own
+//       rules only (vdp_decide_subj).
+//   <allow|deny> mcp URL METHOD [NAME] [max_body=N] [credential=C [header=H[:S]]] [for=NAME]
+//       URL as vdp_mcp_url (held in canonical form); METHOD 1 to 128 of
+//       A-Z a-z 0-9 '_' '.' '/' '-', '*' a wildcard; NAME a glob as for path
+//       globs over the tool, prompt or resource the call names, bytes 0x21 to
+//       0x7e (a NAME starting with "max_body=", "credential=", "header=" or
+//       "for=" is written with a leading '\'). No NAME: any name, or none.
+//       The rule is the glob  <canonical URL>#<METHOD>#<NAME or **>  over the
+//       object vdp_mcp_object builds; neither a method nor a name the Warden
+//       decides contains '#', so the two '#' split the object unambiguously.
+//       max_body=, credential= and header= on allow rules only, as for
+//       request rules; without header=, a credential goes in
+//       Authorization: Bearer. credential= only on an https:// URL.
+//   credential NAME from STORE:REF [audience=URL [opaque]]
+//       audience=: the credential is an MCP access token for the server at
+//       URL (https only); only an allow mcp rule for that URL may carry it,
+//       in Authorization: Bearer (a request rule may not). opaque: it is not
+//       a JWT (its audience cannot be read).
+//   trust mcp-resource URL [audience AUD]   (vdp_mcpres_t)
+//
+// Refused at the end of the file: request or mcp rules or passthrough hosts
+// without `proxy inspect`; a request or mcp rule on a port that is not
+// proxied; a request or mcp rule whose host is, or (a wildcard) covers, a
+// passthrough host.
 int vdp_policy_load(const char *path, vdp_policy_t *p, char *err, size_t errlen);
+
+/* v1.31: as vdp_decide, for the calls of subject subj (0: the agent; k > 0:
+ * the confined subject subjects[k - 1]): only the rules whose subj is subj
+ * take part. vdp_decide is vdp_decide_subj with subj 0. A subj out of range
+ * is UNKNOWN (VDP_WHY_NO_RULE). */
+vdp_verdict_t vdp_decide_subj(const vdp_policy_t *p, int subj, vdp_kind_t kind, const char *s,
+                              uint32_t flags, bool has_flags,
+                              int *rule_index, vdp_why_t *why);
+
+/* v1.31: the object an MCP call is decided on,
+ *   <canonical URL>#<method>#<name>
+ * (the name empty when the call names none), written to out. The URL is
+ * canonical (vdp_mcp_url); the method is 1 to 128 bytes of A-Z a-z 0-9 and
+ * "_./-"; the name at most 4095 bytes of 0x20 to 0x7e other than '#'. Returns
+ * the object's length, or -1 if a part is outside these forms or the object
+ * does not fit (the call is then outside the fragment: UNKNOWN). */
+int vdp_mcp_object(const char *url, const char *method, const char *name, char *out, size_t outn);
+
+/* v1.31: the canonical form of an MCP server's URL: "https://" or "http://",
+ * a host name (lowercase, as in host rules; no address, no wildcard), ':' and
+ * the port (443 or 80 by default), and the path ("/" when none); no query,
+ * fragment, userinfo, '*', '?', '[', ']', '\', ';', '#', "." or ".."
+ * segment, "//", and '%' only as an escape that encodes neither '/', '\'
+ * nor an unreserved byte. https_only refuses http://. NULL and the form in
+ * out, or the reason. */
+const char *vdp_mcp_url(const char *u, bool https_only, char *out, size_t outn);
 
 /* Decide a single action. s must be a NUL-terminated string. flags is used only
  * for VDP_KIND_PATH when has_flags is true; with has_flags false the flags are
@@ -529,10 +638,14 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * request rule's `credential=NAME header=HEADER[:SCHEME]`; a v1.27 Warden
  * refuses both, so the policy fails closed there.
  * v1.29: `require warden 1.29` has the Warden open files as the agent; a
- * v1.28 Warden refuses the directive, so the policy fails closed there. */
+ * v1.28 Warden refuses the directive, so the policy fails closed there.
+ * v1.31 (docs/security/v1.31-standards.md): MCP servers and confined
+ * subjects, MCP rules, MCP credentials and `trust mcp-resource`, each after
+ * `require warden 1.31`; a v1.29 Warden refuses each, so the policy fails
+ * closed there. (v1.30 adds no lines.) */
 #define VDP_WARDEN_MAJOR 1
-#define VDP_WARDEN_MINOR 29
-#define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's (v1.29.0) */
+#define VDP_WARDEN_MINOR 31
+#define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's (v1.31.0) */
 
 /* v1.27: a note on exec rule i, for lint and the Warden's load-time notes,
  * in buf (empty: none); returns its length. An allow exec rule naming a shell

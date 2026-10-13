@@ -502,7 +502,7 @@ static int policy_load(const char *path, struct policy *p) {
         };
         static const int kind_to_c[] = {
             [VDP_KIND_PATH] = VDPC_PATH, [VDP_KIND_HOST] = VDPC_HOST, [VDP_KIND_EXEC] = VDPC_EXEC,
-            [VDP_KIND_REQUEST] = VDPC_REQUEST,
+            [VDP_KIND_REQUEST] = VDPC_REQUEST, [VDP_KIND_MCP] = VDPC_MCP,
         };
         if (vdpc_rule_info(&p->c, i, &ci) < 0 || ci.allow != (r->verb == VDP_ALLOW) ||
             ci.kind != kind_to_c[r->kind] || ci.match != op_to_match[r->s.op] ||
@@ -513,7 +513,10 @@ static int policy_load(const char *path, struct policy *p) {
             /* v1.28: the credential a request rule carries, and where */
             ci.cred != r->cred || strcmp(ci.cred_hdr, r->cred_hdr) || strcmp(ci.cred_scheme, r->cred_scheme) ||
             /* v1.28.1: the sub-agent an exec rule names */
-            strcmp(ci.subagent, r->subagent)) {
+            strcmp(ci.subagent, r->subagent) ||
+            /* v1.31: the subject a rule decides for, the confined subject it launches, an mcp server's pin */
+            ci.subj != r->subj || ci.confined_subj != r->confined_subj || ci.mcp_server != r->mcp_server ||
+            strcmp(ci.sha256, r->sha256)) {
             fprintf(stderr, "[warden] policy %s:%d: the decision procedure and the certificate "
                     "checker read this rule differently; refusing to start\n", path, r->line);
             return -1;
@@ -555,7 +558,10 @@ static int policy_load(const char *path, struct policy *p) {
     for (size_t k = 0; creds_same && k < p->v.ncreds; k++)
         creds_same = !strcmp(p->v.creds[k].name, p->c.creds[k].name) &&
                      p->v.creds[k].store == p->c.creds[k].store &&
-                     !strcmp(p->v.creds[k].ref, p->c.creds[k].ref) && p->v.creds[k].line == p->c.creds[k].line;
+                     !strcmp(p->v.creds[k].ref, p->c.creds[k].ref) && p->v.creds[k].line == p->c.creds[k].line &&
+                     /* v1.31: an MCP access token's audience */
+                     !strcmp(p->v.creds[k].audience, p->c.creds[k].audience) &&
+                     p->v.creds[k].opaque == (p->c.creds[k].opaque != 0);
     if (!creds_same) {
         fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
                 "the credentials differently; refusing to start\n", path);
@@ -570,10 +576,37 @@ static int policy_load(const char *path, struct policy *p) {
     for (size_t k = 0; id_same && k < p->v.nspiffe; k++)
         id_same = !strcmp(p->v.spiffe[k].domain, p->c.spiffe[k].domain) &&
                   !strcmp(p->v.spiffe[k].bundle, p->c.spiffe[k].bundle) && p->v.spiffe[k].line == p->c.spiffe[k].line;
+    /* v1.31: the MCP resources trusted for the user's token, and the confined subjects */
+    id_same = id_same && p->v.nmcpres == p->c.nmcpres && p->v.nsubjects == p->c.nsubjects;
+    for (size_t k = 0; id_same && k < p->v.nmcpres; k++)
+        id_same = !strcmp(p->v.mcpres[k].url, p->c.mcpres[k].url) && !strcmp(p->v.mcpres[k].aud, p->c.mcpres[k].aud) &&
+                  p->v.mcpres[k].line == p->c.mcpres[k].line;
+    for (size_t k = 0; id_same && k < p->v.nsubjects; k++)
+        id_same = !strcmp(p->v.subjects[k].name, p->c.subjects[k].name) &&
+                  p->v.subjects[k].rule == p->c.subjects[k].rule &&
+                  p->v.subjects[k].mcp == (p->c.subjects[k].mcp != 0) && p->v.subjects[k].line == p->c.subjects[k].line;
     if (!id_same) {
         fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
-                "the trusted identities differently; refusing to start\n", path);
+                "the trusted identities or the confined subjects differently; refusing to start\n", path);
         return -1;
+    }
+    /* v1.31 (docs/security/v1.31-standards.md): the grammar is read (step 2);
+     * the Warden does not yet decide by subject (step 3), MCP calls (step 4)
+     * or MCP tokens (step 5). Until it does, a policy that uses them is
+     * refused rather than run with them ignored. */
+    {
+        const char *later = NULL;
+        if (p->v.nsubjects) later = "confined subjects (mcp server, subagent=NAME confined, for=)";
+        for (size_t i = 0; !later && i < p->v.n; i++)
+            if (p->v.rules[i].kind == VDP_KIND_MCP) later = "mcp rules";
+        for (size_t k = 0; !later && k < p->v.ncreds; k++)
+            if (p->v.creds[k].audience[0]) later = "MCP access tokens (audience=)";
+        if (!later && p->v.nmcpres) later = "trust mcp-resource";
+        if (later) {
+            fprintf(stderr, "[warden] policy %s: %s are read but not yet enforced by this build; "
+                    "refusing to start\n", path, later);
+            return -1;
+        }
     }
     /* v1.13: load-time analysis. The decision procedure decides, for every
      * rule, whether ANY action can reach it as the first matching rule. A rule

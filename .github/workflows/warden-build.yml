@@ -73,6 +73,8 @@ jobs:
         run: sudo make -C varek/v1_4 test-v1281
       - name: v1.29 varek run (opening as the agent, the baseline and profiles, changes by name, the dry run, policy suggest)
         run: sudo make -C varek/v1_4 test-v1290
+      - name: v1.31 standards (the grammar of MCP servers, confined subjects and mcp rules)
+        run: sudo make -C varek/v1_4 test-v1310
       - name: Build and test the plan_verify CLI (v1_6, v1.16.3)
         run: make -C v1_6 plan_verify check check-plan-verify
       - name: Test the v1.7 layer (v1.18.0)

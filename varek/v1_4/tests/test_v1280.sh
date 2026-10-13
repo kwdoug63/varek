@@ -108,7 +108,7 @@ refused "require warden 1.99"           'require warden 1.99\n'                 
 refused "a credential on an http:// rule" "${R}${C}allow host api.example.com:80\nallow request GET http://api.example.com/x credential=k header=X-K\n" "only on an https:// rule"
 
 printf 'require warden 1.28\nproxy inspect\nallow host api.example.com:443\n%bcredential unused from file:/u\nallow request GET https://api.example.com/x credential=k header=X\n' "$C" > "$OUT/l.txt"
-check "lint notes a credential no rule carries" sh -c "'$VDP' '$OUT/l.txt' lint | grep -q ':5: note: credential unused is named, but no request rule carries it'"
+check "lint notes a credential no rule carries" sh -c "'$VDP' '$OUT/l.txt' lint | grep -q ':5: note: credential unused is named, but no request or mcp rule carries it'"
 check "lint is silent on a credential a rule carries" sh -c "! '$VDP' '$OUT/l.txt' lint | grep -q 'credential k is named'"
 
 if [ -z "$WARDEN" ]; then

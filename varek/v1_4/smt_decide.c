@@ -121,6 +121,7 @@ const char *vdp_kind_name(vdp_kind_t k) {
         case VDP_KIND_HOST: return "host";
         case VDP_KIND_EXEC: return "exec";
         case VDP_KIND_REQUEST: return "request";
+        case VDP_KIND_MCP: return "mcp";
     }
     return "?";
 }
@@ -1021,6 +1022,147 @@ static int max_body_parse(const char *v, uint32_t *out) {
     return 0;
 }
 
+/* v1.31: the canonical form of an MCP server's URL (smt_decide.h). The host
+ * and port are also written to host (256 bytes) and *port when not NULL. */
+static const char *mcp_url_x(const char *u, bool https_only, char *out, size_t outn,
+                             char *host, unsigned *portp) {
+    const char *scheme, *a;
+    unsigned port;
+    if (!strncmp(u, "https://", 8)) { scheme = "https"; port = 443; a = u + 8; }
+    else if (!strncmp(u, "http://", 7) && !https_only) { scheme = "http"; port = 80; a = u + 7; }
+    else return https_only ? "an MCP server's URL here starts with https://"
+                           : "an MCP server's URL starts with https:// or http://";
+    const char *slash = strchr(a, '/');
+    size_t al = slash ? (size_t)(slash - a) : strlen(a);
+    const char *colon = memchr(a, ':', al);
+    size_t hl = colon ? (size_t)(colon - a) : al;
+    if (colon) {
+        size_t pl = al - hl - 1;
+        unsigned long x = 0;
+        if (pl == 0 || pl > 5 || colon[1] == '0') return "an MCP server's port is 1 to 65535";
+        for (size_t i = 0; i < pl; i++) {
+            if (colon[1 + i] < '0' || colon[1 + i] > '9') return "an MCP server's port is 1 to 65535";
+            x = x * 10 + (unsigned long)(colon[1 + i] - '0');
+        }
+        if (x == 0 || x > 65535) return "an MCP server's port is 1 to 65535";
+        port = (unsigned)x;
+    }
+    if (hl == 0 || hl > 253) return "an MCP server's host is a host name";
+    char h[256], why[160];
+    memcpy(h, a, hl);
+    h[hl] = '\0';
+    if (memchr(h, '@', hl)) return "an MCP server's URL has no user information";
+    if (memchr(h, '*', hl)) return "an MCP server's host is a host name, not a wildcard";
+    int nf = vdp_host_name_form(h, hl, why, sizeof why);
+    if (nf == 0) return "an MCP server's host is a host name, not an address";
+    if (nf < 0) return "an MCP server's host is not a valid host name";
+    const char *path = slash ? slash : "/";
+    size_t pl = strlen(path);
+    size_t seg = 1;
+    for (size_t i = 0; i <= pl; i++) {
+        unsigned char c = i < pl ? (unsigned char)path[i] : 0;
+        if (i == pl || c == '/') {
+            if (i > 0) {
+                size_t sl = i - seg;
+                if (sl == 0 && i != pl) return "an MCP server's path has no empty segment ('//')";
+                if ((sl == 1 && path[seg] == '.') || (sl == 2 && path[seg] == '.' && path[seg + 1] == '.'))
+                    return "an MCP server's path has no '.' or '..' segment";
+            }
+            seg = i + 1;
+            continue;
+        }
+        if (c < 0x21 || c > 0x7e) return "an MCP server's path is bytes 0x21 to 0x7e";
+        if (strchr("\\;#?*[]", c)) return "an MCP server's path has no query, fragment, wildcard, '\\' or ';'";
+        if (c == '%') {
+            int h1 = i + 1 < pl ? hexval(path[i + 1]) : -1, h2 = i + 2 < pl ? hexval(path[i + 2]) : -1;
+            if (h1 < 0 || h2 < 0) return "a '%' in an MCP server's path starts an escape %XX";
+            unsigned v = (unsigned)(h1 * 16 + h2);
+            if (v == '/' || v == '\\' || unreserved(v))
+                return "an MCP server's path does not percent-encode '/', '\\' or an unreserved byte";
+        }
+    }
+    int n = snprintf(out, outn, "%s://%s:%u%s", scheme, h, port, path);
+    if (n < 0 || (size_t)n >= outn) return "an MCP server's URL is too long";
+    if (host) memcpy(host, h, hl + 1);
+    if (portp) *portp = port;
+    return NULL;
+}
+
+const char *vdp_mcp_url(const char *u, bool https_only, char *out, size_t outn) {
+    return mcp_url_x(u, https_only, out, outn, NULL, NULL);
+}
+
+/* v1.31: an MCP method as a call names it (smt_decide.h) */
+static bool mcp_method_ok(const char *m, size_t ml, bool glob) {
+    if (ml < 1 || ml > 128) return false;
+    for (size_t i = 0; i < ml; i++) {
+        char c = m[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+              c == '_' || c == '.' || c == '/' || c == '-' || (glob && c == '*')))
+            return false;
+    }
+    return true;
+}
+
+int vdp_mcp_object(const char *url, const char *method, const char *name, char *out, size_t outn) {
+    char cu[VDP_STR_MAX + 1];
+    if (vdp_mcp_url(url, false, cu, sizeof cu) || strcmp(cu, url)) return -1;
+    if (!mcp_method_ok(method, strlen(method), false)) return -1;
+    for (const char *q = name; *q; q++)
+        if ((unsigned char)*q < 0x20 || (unsigned char)*q > 0x7e || *q == '#') return -1;
+    int n = snprintf(out, outn, "%s#%s#%s", url, method, name);
+    if (n < 0 || (size_t)n >= outn || (size_t)n > VDP_STR_MAX) return -1;
+    return n;
+}
+
+/* v1.31: launchers that fetch or start another program (npx, uvx, docker,
+ * ...), which an `mcp server` line may not name: a rule on one would make
+ * whatever it starts the server */
+static bool exec_is_launcher(const char *path) {
+    static const char *const kLaunch[] = {
+        "npx", "npm", "pnpm", "pnpx", "yarn", "bunx", "corepack", "uvx", "uv", "pipx", "pip", "pip3",
+        "docker", "podman", "nerdctl", "ctr", "env", "sudo", "doas", "su", "nix", "nix-shell",
+        "flatpak", "snap", "xargs", "nohup", "setsid", "timeout", "stdbuf", "nice", "ionice",
+        "chroot", "unshare", "nsenter", "systemd-run", "runuser", "sg", NULL
+    };
+    const char *b = strrchr(path, '/');
+    b = b ? b + 1 : path;
+    for (size_t i = 0; kLaunch[i]; i++)
+        if (!strcmp(b, kLaunch[i])) return true;
+    return vdp_exec_is_interpreter(path);
+}
+
+/* v1.31: the subject a `for=NAME` names (1 + its index), or 0 */
+static int subject_by_name(const vdp_policy_t *p, const char *n) {
+    for (size_t k = 0; k < p->nsubjects; k++)
+        if (!strcmp(p->subjects[k].name, n)) return (int)k + 1;
+    return 0;
+}
+
+/* v1.31: is n the name of a sub-agent that is not confined (an earlier
+ * `subagent=n` without `confined`; rule skip, the one being registered,
+ * aside)? */
+static bool open_subagent_named(const vdp_policy_t *p, const char *n, int skip) {
+    for (size_t i = 0; i < p->n; i++)
+        if ((int)i != skip && p->rules[i].subagent[0] && !p->rules[i].confined_subj &&
+            !strcmp(p->rules[i].subagent, n)) return true;
+    return false;
+}
+
+/* v1.31: register a confined subject launched by rule r (index ri) */
+static const char *subject_add(vdp_policy_t *p, const char *name, int ri, bool mcp, int line) {
+    if (subject_by_name(p, name)) return "a confined subject's name is given once";
+    if (open_subagent_named(p, name, ri)) return "a sub-agent of that name is not confined; a name is confined everywhere or nowhere";
+    if (p->nsubjects >= VDP_MAX_SUBJECTS) return "more than 32 confined subjects";
+    vdp_subject_t *sj = &p->subjects[p->nsubjects++];
+    snprintf(sj->name, sizeof sj->name, "%s", name);
+    sj->rule = ri;
+    sj->mcp = mcp;
+    sj->line = line;
+    p->rules[ri].confined_subj = (int)p->nsubjects;
+    return NULL;
+}
+
 static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, char *err, size_t errlen) {
 
     char *line = NULL;
@@ -1237,7 +1379,44 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
                 sp->line = lineno;
                 continue;
             }
-            rc = perr(err, errlen, path, lineno, "bad directive (need: trust issuer ... or trust spiffe ...)");
+            /* v1.31: trust mcp-resource URL [audience AUD] */
+            if (nt >= 2 && !strcmp(tok[1], "mcp-resource")) {
+                if (!(req_maj > 1 || (req_maj == 1 && req_min >= 31))) {
+                    rc = perr(err, errlen, path, lineno, "`trust mcp-resource` needs `require warden 1.31` before it");
+                    break;
+                }
+                if (!(nt == 3 || (nt == 5 && !strcmp(tok[3], "audience")))) {
+                    rc = perr(err, errlen, path, lineno, "need: trust mcp-resource <https URL> [audience <audience>]");
+                    break;
+                }
+                char cu[VDP_STR_MAX + 1];
+                const char *why = strlen(tok[2]) > 255 ? "an MCP resource's URL is at most 255 bytes"
+                                                       : vdp_mcp_url(tok[2], true, cu, sizeof cu);
+                if (why) { rc = perr(err, errlen, path, lineno, "%s", why); break; }
+                if (nt == 5) {
+                    size_t al = strlen(tok[4]);
+                    bool aok = al >= 1 && al <= 255;
+                    for (size_t i = 0; aok && i < al; i++)
+                        aok = (unsigned char)tok[4][i] >= 0x21 && (unsigned char)tok[4][i] <= 0x7e;
+                    if (!aok) { rc = perr(err, errlen, path, lineno, "an audience is 1 to 255 printable bytes"); break; }
+                }
+                for (size_t k = 0; rc == 0 && k < p->nmcpres; k++)
+                    if (!strcmp(p->mcpres[k].url, tok[2]))
+                        rc = perr(err, errlen, path, lineno, "MCP resource %s trusted twice (line %d)", tok[2],
+                                  p->mcpres[k].line);
+                if (rc) break;
+                if (p->nmcpres >= VDP_MAX_MCPRES) {
+                    rc = perr(err, errlen, path, lineno, "more than %d trusted MCP resources", VDP_MAX_MCPRES);
+                    break;
+                }
+                vdp_mcpres_t *mr = &p->mcpres[p->nmcpres++];
+                snprintf(mr->url, sizeof mr->url, "%s", tok[2]);
+                snprintf(mr->aud, sizeof mr->aud, "%s", nt == 5 ? tok[4] : "");
+                mr->line = lineno;
+                continue;
+            }
+            rc = perr(err, errlen, path, lineno, "bad directive (need: trust issuer ..., trust spiffe ... or "
+                      "trust mcp-resource ...)");
             break;
         }
         /* v1.28: credential NAME from STORE:REF */
@@ -1246,9 +1425,20 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
                 rc = perr(err, errlen, path, lineno, "`credential` needs `require warden 1.28` before it");
                 break;
             }
-            if (nt != 4 || strcmp(tok[2], "from")) {
-                rc = perr(err, errlen, path, lineno, "need: credential <name> from <store>:<reference>");
+            if (nt < 4 || nt > 6 || strcmp(tok[2], "from") || (nt >= 5 && strncmp(tok[4], "audience=", 9)) ||
+                (nt == 6 && strcmp(tok[5], "opaque"))) {
+                rc = perr(err, errlen, path, lineno, "need: credential <name> from <store>:<reference> "
+                          "[audience=<https URL> [opaque]]");
                 break;
+            }
+            char aud[VDP_STR_MAX + 1] = "";
+            if (nt >= 5) {
+                if (!(req_maj > 1 || (req_maj == 1 && req_min >= 31))) {
+                    rc = perr(err, errlen, path, lineno, "audience= needs `require warden 1.31` before it");
+                    break;
+                }
+                const char *why = vdp_mcp_url(tok[4] + 9, true, aud, sizeof aud);
+                if (why) { rc = perr(err, errlen, path, lineno, "audience=: %s", why); break; }
             }
             if (!cred_name_ok(tok[1])) {
                 rc = perr(err, errlen, path, lineno, "'%s': a credential's name is a lowercase letter, then up "
@@ -1273,6 +1463,66 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             snprintf(cr->ref, sizeof cr->ref, "%s", ref);
             cr->store = store;
             cr->line = lineno;
+            snprintf(cr->audience, sizeof cr->audience, "%s", aud);
+            cr->opaque = nt == 6;
+            continue;
+        }
+        /* v1.31: mcp server NAME exec PATH [sha256=HEX] */
+        if (!strcmp(tok[0], "mcp")) {
+            if (!(req_maj > 1 || (req_maj == 1 && req_min >= 31))) {
+                rc = perr(err, errlen, path, lineno, "`mcp server` needs `require warden 1.31` before it");
+                break;
+            }
+            if (!((nt == 5 || nt == 6) && !strcmp(tok[1], "server") && !strcmp(tok[3], "exec") &&
+                  (nt == 5 || !strncmp(tok[5], "sha256=", 7)))) {
+                rc = perr(err, errlen, path, lineno, "need: mcp server <name> exec <path> [sha256=<hex>]");
+                break;
+            }
+            if (!cred_name_ok(tok[2])) {
+                rc = perr(err, errlen, path, lineno, "'%s': a server's name is a lowercase letter, then up to 31 "
+                          "lowercase letters, digits or '_'", tok[2]);
+                break;
+            }
+            int st = 0;
+            const char *ref = NULL;
+            char fb[1100];
+            if (strlen(tok[4]) > 1024 || (snprintf(fb, sizeof fb, "file:%s", tok[4]), cred_ref_parse(fb, &st, &ref))) {
+                rc = perr(err, errlen, path, lineno, "a server's file is an absolute path (at most 1024 bytes), "
+                          "without \".\", \"..\", \"//\" or a trailing \"/\"");
+                break;
+            }
+            if (exec_is_launcher(tok[4])) {
+                rc = perr(err, errlen, path, lineno, "%s is an interpreter or a launcher: name the server's own "
+                          "launch file (a binary, or a script with #!), or every program it starts would be "
+                          "the server", tok[4]);
+                break;
+            }
+            char sha[65] = "";
+            if (nt == 6) {
+                const char *h = tok[5] + 7;
+                bool ok = strlen(h) == 64;
+                for (size_t i = 0; ok && i < 64; i++) ok = (h[i] >= '0' && h[i] <= '9') || (h[i] >= 'a' && h[i] <= 'f');
+                if (!ok) { rc = perr(err, errlen, path, lineno, "sha256= is 64 lowercase hex digits"); break; }
+                memcpy(sha, h, 65);
+            }
+            if (p->n >= VDP_MAX_RULES) {
+                rc = perr(err, errlen, path, lineno, "more than %d rules; refusing to drop any", VDP_MAX_RULES);
+                break;
+            }
+            vdp_rule_t *r = &p->rules[p->n];
+            memset(r, 0, sizeof(*r));
+            r->line = lineno;
+            r->verb = VDP_ALLOW;
+            r->kind = VDP_KIND_EXEC;
+            r->s.op = VDP_STR_EQ;
+            r->s.len = strlen(tok[4]);
+            memcpy(r->s.c, tok[4], r->s.len + 1);
+            snprintf(r->subagent, sizeof r->subagent, "%s", tok[2]);
+            r->mcp_server = true;
+            memcpy(r->sha256, sha, sizeof sha);
+            const char *why = subject_add(p, tok[2], (int)p->n, true, lineno);
+            if (why) { rc = perr(err, errlen, path, lineno, "%s: %s", tok[2], why); break; }
+            p->n++;
             continue;
         }
         if (nt < 3) { rc = perr(err, errlen, path, lineno, "bad rule (need: verb kind constant)"); break; }
@@ -1293,7 +1543,144 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
         else if (!strcmp(tok[1], "host")) { r->kind = VDP_KIND_HOST; r->s.op = VDP_STR_HOST; }
         else if (!strcmp(tok[1], "exec")) { r->kind = VDP_KIND_EXEC; r->s.op = VDP_STR_EQ; }
         else if (!strcmp(tok[1], "request")) r->kind = VDP_KIND_REQUEST;
+        else if (!strcmp(tok[1], "mcp")) r->kind = VDP_KIND_MCP;
         else { rc = perr(err, errlen, path, lineno, "unknown kind %s", tok[1]); break; }
+
+        /* v1.31: <verb> mcp URL METHOD [NAME] [max_body=N] [credential=C [header=H[:S]]] [for=NAME] */
+        if (r->kind == VDP_KIND_MCP) {
+            if (!(req_maj > 1 || (req_maj == 1 && req_min >= 31))) {
+                rc = perr(err, errlen, path, lineno, "an mcp rule needs `require warden 1.31` before it");
+                break;
+            }
+            if (nt < 4) { rc = perr(err, errlen, path, lineno, "need: %s mcp <url> <method> [<name>]", tok[0]); break; }
+            char cu[VDP_STR_MAX + 1];
+            const char *why = mcp_url_x(tok[2], false, cu, sizeof cu, r->req_host, &r->req_port);
+            if (why) { rc = perr(err, errlen, path, lineno, "%s", why); break; }
+            if (!mcp_method_ok(tok[3], strlen(tok[3]), true)) {
+                rc = perr(err, errlen, path, lineno, "'%s': a method is 1 to 128 of A-Z a-z 0-9 '_' '.' '/' '-', "
+                          "with '*' as a wildcard", tok[3]);
+                break;
+            }
+            int oi = 4;
+            const char *name = NULL;
+            if (nt > 4 && strncmp(tok[4], "max_body=", 9) && strncmp(tok[4], "credential=", 11) &&
+                strncmp(tok[4], "header=", 7) && strncmp(tok[4], "for=", 4)) {
+                name = tok[4];
+                oi = 5;
+                for (const char *q = name; *q; q++)
+                    if ((unsigned char)*q < 0x21 || (unsigned char)*q > 0x7e) {
+                        rc = perr(err, errlen, path, lineno, "a name is bytes 0x21 to 0x7e"); goto out;
+                    }
+            }
+            char g[VDP_STR_MAX + 2];
+            int gn = snprintf(g, sizeof g, "%s#%s#%s", cu, tok[3], name ? name : "**");
+            if (gn < 0 || (size_t)gn > VDP_STR_MAX) {
+                rc = perr(err, errlen, path, lineno, "an mcp rule's object is over 4,095 bytes"); break;
+            }
+            memcpy(r->s.c, g, (size_t)gn + 1);
+            r->s.len = (size_t)gn;
+            r->s.op = VDP_STR_GLOB;
+            bool has_hdr = false;
+            for (int i = oi; i < nt; i++) {
+                const char *t = tok[i];
+                if (!strncmp(t, "for=", 4)) {
+                    if (r->subj) { rc = perr(err, errlen, path, lineno, "for= given twice"); goto out; }
+                    if (!(r->subj = subject_by_name(p, t + 4))) {
+                        rc = perr(err, errlen, path, lineno, "for=%s: no confined subject of that name before "
+                                  "this line (`mcp server` or `subagent=NAME confined`)", t + 4);
+                        goto out;
+                    }
+                    continue;
+                }
+                bool is_cred = !strncmp(t, "credential=", 11), is_hdr = !strncmp(t, "header=", 7);
+                bool is_mb = !strncmp(t, "max_body=", 9);
+                if (!is_cred && !is_hdr && !is_mb) {
+                    rc = perr(err, errlen, path, lineno, "unknown option '%s' on an mcp rule (max_body=N, "
+                              "credential=NAME, header=HEADER[:SCHEME], for=NAME)", t);
+                    goto out;
+                }
+                if (r->verb != VDP_ALLOW) {
+                    rc = perr(err, errlen, path, lineno, "%s applies only to allow mcp rules",
+                              is_cred ? "credential=" : is_hdr ? "header=" : "max_body=");
+                    goto out;
+                }
+                if (is_cred) {
+                    if (r->cred) { rc = perr(err, errlen, path, lineno, "credential= given twice"); goto out; }
+                    for (size_t k = 0; !r->cred && k < p->ncreds; k++)
+                        if (!strcmp(p->creds[k].name, t + 11)) r->cred = (int)k + 1;
+                    if (!r->cred) {
+                        rc = perr(err, errlen, path, lineno, "unknown credential '%s' (name it with `credential` "
+                                  "before the rule)", t + 11);
+                        goto out;
+                    }
+                } else if (is_hdr) {
+                    const char *v = t + 7, *c = strchr(v, ':');
+                    size_t hl = c ? (size_t)(c - v) : strlen(v);
+                    if (has_hdr) { rc = perr(err, errlen, path, lineno, "header= given twice"); goto out; }
+                    if (!http_token_ok(v, hl, 64) || (c && !http_token_ok(c + 1, strlen(c + 1), 32))) {
+                        rc = perr(err, errlen, path, lineno, "'%s': header=NAME or header=NAME:SCHEME, each an "
+                                  "HTTP token (a name of at most 64 bytes, a scheme of at most 32)", t);
+                        goto out;
+                    }
+                    memcpy(r->cred_hdr, v, hl);
+                    r->cred_hdr[hl] = '\0';
+                    if (c) snprintf(r->cred_scheme, sizeof r->cred_scheme, "%s", c + 1);
+                    if (header_framing(r->cred_hdr)) {
+                        rc = perr(err, errlen, path, lineno, "header=%s frames the request; a credential cannot "
+                                  "go in it", r->cred_hdr);
+                        goto out;
+                    }
+                    has_hdr = true;
+                } else {
+                    if (r->max_body) { rc = perr(err, errlen, path, lineno, "max_body= given twice"); goto out; }
+                    if (max_body_parse(t + 9, &r->max_body) < 0) {
+                        rc = perr(err, errlen, path, lineno, "'%s': max_body is 1 to 1073741824 bytes, written "
+                                  "N, Nk or Nm", t);
+                        goto out;
+                    }
+                }
+            }
+            if (has_hdr && !r->cred) {
+                rc = perr(err, errlen, path, lineno, "header= needs credential=");
+                break;
+            }
+            if (r->cred) {
+                const vdp_cred_t *cr = &p->creds[r->cred - 1];
+                if (strncmp(cu, "https://", 8)) {
+                    rc = perr(err, errlen, path, lineno, "credential= only on an https:// rule (a value is never "
+                              "sent in the clear)");
+                    break;
+                }
+                /* without header=, Authorization: Bearer (an MCP access token's header) */
+                if (!has_hdr) {
+                    snprintf(r->cred_hdr, sizeof r->cred_hdr, "Authorization");
+                    snprintf(r->cred_scheme, sizeof r->cred_scheme, "Bearer");
+                }
+                if (cr->audience[0] && strcmp(cr->audience, cu)) {
+                    rc = perr(err, errlen, path, lineno, "credential %s is a token for %s, not for this server",
+                              cr->name, cr->audience);
+                    break;
+                }
+                if (cr->audience[0] && (strcasecmp(r->cred_hdr, "Authorization") || strcasecmp(r->cred_scheme, "Bearer"))) {
+                    rc = perr(err, errlen, path, lineno, "credential %s is an MCP access token: it goes in "
+                              "header=Authorization:Bearer", cr->name);
+                    break;
+                }
+            }
+            char gm[160] = "out of memory";
+            r->s.prog = prog_glob(r->s.c, r->s.len, gm, sizeof gm);
+            if (!r->s.prog) { rc = perr(err, errlen, path, lineno, "%s", gm); break; }
+            glob_tokens += r->s.prog->ntok;
+            p->n++;
+            if (glob_tokens > VDP_GLOB_MAX_TOTAL) {
+                rc = perr(err, errlen, path, lineno,
+                          "glob patterns total more than %d tokens (bounds the work per decision)",
+                          VDP_GLOB_MAX_TOTAL);
+                break;
+            }
+            continue;
+        }
+
 
         /* v1.26.1: <verb> request METHOD URL [max_body=N] */
         if (r->kind == VDP_KIND_REQUEST) {
@@ -1315,6 +1702,20 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             if (!strchr(tok[3], '?')) r->s.qmode = r->verb == VDP_ALLOW ? VDP_Q_ALLOW : VDP_Q_DENY;
             bool has_hdr = false;
             for (int i = 4; i < nt; i++) {
+                /* v1.31: for=NAME */
+                if (!strncmp(tok[i], "for=", 4)) {
+                    if (!(req_maj > 1 || (req_maj == 1 && req_min >= 31))) {
+                        rc = perr(err, errlen, path, lineno, "for= needs `require warden 1.31` before it");
+                        goto out;
+                    }
+                    if (r->subj) { rc = perr(err, errlen, path, lineno, "for= given twice"); goto out; }
+                    if (!(r->subj = subject_by_name(p, tok[i] + 4))) {
+                        rc = perr(err, errlen, path, lineno, "for=%s: no confined subject of that name before "
+                                  "this line (`mcp server` or `subagent=NAME confined`)", tok[i] + 4);
+                        goto out;
+                    }
+                    continue;
+                }
                 /* v1.28: credential=NAME header=HEADER[:SCHEME] */
                 bool is_cred = !strncmp(tok[i], "credential=", 11), is_hdr = !strncmp(tok[i], "header=", 7);
                 if (is_cred || is_hdr) {
@@ -1379,6 +1780,12 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             }
             if (!r->cred != !has_hdr) {
                 rc = perr(err, errlen, path, lineno, "credential= and header= go together");
+                break;
+            }
+            /* v1.31: an MCP access token goes only to its server, by an mcp rule */
+            if (r->cred && p->creds[r->cred - 1].audience[0]) {
+                rc = perr(err, errlen, path, lineno, "credential %s is an MCP access token (audience=): only an "
+                          "mcp rule for its server may carry it", p->creds[r->cred - 1].name);
                 break;
             }
             /* v1.28 step 3: a value only inside TLS */
@@ -1493,6 +1900,7 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
         p->n++;             /* counted now so vdp_policy_free releases the glob */
 
         bool ack = false;   /* v1.25: acknowledge=dns-channel */
+        bool confined = false;  /* v1.31 */
         for (int i = ci + 1; i < nt; i++) {
             const char *t = tok[i];
             /* v1.25: a wildcard allow rule must say it opens the name channel */
@@ -1539,6 +1947,27 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
                     goto out;
                 }
                 if (is_names) r->names = val; else r->rate = val;
+                continue;
+            }
+            /* v1.31: for=NAME (the rule decides that confined subject's calls) and
+             * confined (the sub-agent this rule launches is decided by its own rules) */
+            if (!strncmp(t, "for=", 4) || !strcmp(t, "confined")) {
+                if (!(req_maj > 1 || (req_maj == 1 && req_min >= 31))) {
+                    rc = perr(err, errlen, path, lineno, "%s needs `require warden 1.31` before it",
+                              t[0] == 'f' ? "for=" : "confined");
+                    goto out;
+                }
+                if (t[0] == 'c') {
+                    if (confined) { rc = perr(err, errlen, path, lineno, "confined given twice"); goto out; }
+                    confined = true;
+                    continue;
+                }
+                if (r->subj) { rc = perr(err, errlen, path, lineno, "for= given twice"); goto out; }
+                if (!(r->subj = subject_by_name(p, t + 4))) {
+                    rc = perr(err, errlen, path, lineno, "for=%s: no confined subject of that name before "
+                              "this line (`mcp server` or `subagent=NAME confined`)", t + 4);
+                    goto out;
+                }
                 continue;
             }
             /* v1.28.1: subagent=NAME on an allow exec rule */
@@ -1589,6 +2018,19 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
                       "of the host; add acknowledge=dns-channel to allow it");
             goto out;
         }
+        /* v1.31: a confined sub-agent is a subject of its own */
+        if (confined && !r->subagent[0]) {
+            rc = perr(err, errlen, path, lineno, "confined applies only to a rule with subagent=");
+            goto out;
+        }
+        if (confined) {
+            const char *why = subject_add(p, r->subagent, (int)(r - p->rules), false, lineno);
+            if (why) { rc = perr(err, errlen, path, lineno, "%s: %s", r->subagent, why); goto out; }
+        } else if (r->subagent[0] && subject_by_name(p, r->subagent)) {
+            rc = perr(err, errlen, path, lineno, "%s is a confined subject (line %d): a name is confined "
+                      "everywhere or nowhere", r->subagent, p->subjects[subject_by_name(p, r->subagent) - 1].line);
+            goto out;
+        }
     }
     if (rc == 0 && p->proxy_nports && !p->proxy)
         rc = perr(err, errlen, path, lineno, "`proxy ports` without `proxy on`");
@@ -1603,17 +2045,18 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
     p->open_as_agent = req_maj > 1 || (req_maj == 1 && req_min >= 29);
     for (size_t i = 0; rc == 0 && i < p->n; i++) {
         const vdp_rule_t *r = &p->rules[i];
-        if (r->kind != VDP_KIND_REQUEST) continue;
+        if (r->kind != VDP_KIND_REQUEST && r->kind != VDP_KIND_MCP) continue;
         if (!p->proxy_inspect) {
-            rc = perr(err, errlen, path, r->line, "a request rule without `proxy inspect` (requests are "
-                      "seen only in inspecting mode)");
+            rc = perr(err, errlen, path, r->line, "%s rule without `proxy inspect` (requests are "
+                      "seen only in inspecting mode)", r->kind == VDP_KIND_MCP ? "an mcp" : "a request");
             break;
         }
         bool proxied = false;
         if (!p->proxy_nports) proxied = r->req_port == 80 || r->req_port == 443;
         for (size_t k = 0; k < p->proxy_nports; k++) if (p->proxy_ports[k] == r->req_port) proxied = true;
         if (!proxied) {
-            rc = perr(err, errlen, path, r->line, "a request rule on port %u, which is not proxied", r->req_port);
+            rc = perr(err, errlen, path, r->line, "%s rule on port %u, which is not proxied",
+                      r->kind == VDP_KIND_MCP ? "an mcp" : "a request", r->req_port);
             break;
         }
         for (size_t k = 0; rc == 0 && k < p->proxy_npass; k++) {
@@ -1622,8 +2065,8 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             bool covers = r->req_wild ? hl > sl + 1 && h[hl - sl - 1] == '.' && !strcmp(h + hl - sl, r->req_host)
                                       : !strcmp(h, r->req_host);
             if (covers)
-                rc = perr(err, errlen, path, r->line, "a request rule for %s, a passthrough host (its "
-                          "requests are not seen)", h);
+                rc = perr(err, errlen, path, r->line, "%s rule for %s, a passthrough host (its "
+                          "requests are not seen)", r->kind == VDP_KIND_MCP ? "an mcp" : "a request", h);
         }
     }
 out:
@@ -1787,10 +2230,17 @@ static bool sym_cb(uint32_t f, void *ud) {
 vdp_verdict_t vdp_decide(const vdp_policy_t *p, vdp_kind_t kind, const char *s,
                          uint32_t flags, bool has_flags,
                          int *rule_index, vdp_why_t *why) {
+    return vdp_decide_subj(p, 0, kind, s, flags, has_flags, rule_index, why);
+}
+
+vdp_verdict_t vdp_decide_subj(const vdp_policy_t *p, int subj, vdp_kind_t kind, const char *s,
+                              uint32_t flags, bool has_flags,
+                              int *rule_index, vdp_why_t *why) {
     int dummy_idx; vdp_why_t dummy_why;
     if (!rule_index) rule_index = &dummy_idx;
     if (!why) why = &dummy_why;
     *rule_index = -1;
+    if (subj < 0 || (size_t)subj > p->nsubjects) { *why = VDP_WHY_NO_RULE; return VDP_UNKNOWN; }
 
     size_t sl = strnlen(s, VDP_STR_MAX + 1);
     if (sl > VDP_STR_MAX) { *why = VDP_WHY_LENGTH_GUARD; return VDP_UNKNOWN; }
@@ -1802,7 +2252,7 @@ vdp_verdict_t vdp_decide(const vdp_policy_t *p, vdp_kind_t kind, const char *s,
      * certificate checker, not the procedure, has the last word. */
     if (kind == VDP_KIND_PATH && sl >= 8 && !memcmp(s + sl - 8, "/.inject", 8)) {
         for (size_t i = p->n; i-- > 0;) {
-            if (p->rules[i].kind == VDP_KIND_PATH && p->rules[i].verb == VDP_ALLOW) {
+            if (p->rules[i].kind == VDP_KIND_PATH && p->rules[i].verb == VDP_ALLOW && p->rules[i].subj == subj) {
                 *rule_index = (int)i;
                 *why = VDP_WHY_RULE;
                 return VDP_SATISFIED;
@@ -1825,7 +2275,7 @@ vdp_verdict_t vdp_decide(const vdp_policy_t *p, vdp_kind_t kind, const char *s,
     if (ground) {
         for (size_t i = 0; i < p->n; i++) {
             const vdp_rule_t *r = &p->rules[i];
-            if (r->kind != kind) continue;
+            if (r->kind != kind || r->subj != subj) continue;
             if (str_holds(&r->s, s, sl) && bv_holds(&r->b, flags)) {
                 *rule_index = (int)i;
                 *why = VDP_WHY_RULE;
@@ -1842,7 +2292,7 @@ vdp_verdict_t vdp_decide(const vdp_policy_t *p, vdp_kind_t kind, const char *s,
     uint32_t bits = 0;
     for (size_t i = 0; i < p->n; i++) {
         const vdp_rule_t *r = &p->rules[i];
-        if (r->kind != kind || !str_holds(&r->s, s, sl)) continue;
+        if (r->kind != kind || r->subj != subj || !str_holds(&r->s, s, sl)) continue;
         cand[n++] = (int)i;
         bits |= r->b.mask;
         if (r->b.mask == 0) break;          /* holds for every f: later rules unreachable */
@@ -1982,7 +2432,7 @@ static vdp_reach_t reach_trie(const vdp_policy_t *p, size_t i, char *wit, size_t
     struct dset D = {0};
     for (size_t j = 0; j <= i; j++) {
         const vdp_rule_t *r = &p->rules[j];
-        if (r->kind != kind) continue;
+        if (r->kind != kind || r->subj != ri->subj) continue;
         if (dset_add(&D, r->s.c, r->s.len) < 0) { dset_free(&D); return VDP_REACH_UNKNOWN; }
         if (r->s.op == VDP_STR_HOST && r->s.portless) {
             char tmp[VDP_STR_MAX + 2];
@@ -2027,7 +2477,7 @@ static vdp_reach_t reach_trie(const vdp_policy_t *p, size_t i, char *wit, size_t
         size_t nj = 0;
         for (size_t j = 0; j < i; j++) {
             const vdp_rule_t *r = &p->rules[j];
-            if (r->kind == kind && str_holds(&r->s, s, sl)) J[nj++] = (int)j;
+            if (r->kind == kind && r->subj == ri->subj && str_holds(&r->s, s, sl)) J[nj++] = (int)j;
         }
         uint32_t f = 0;
         int b = bv_first_possible(p, i, J, nj, &f);
@@ -2378,7 +2828,7 @@ static vdp_reach_t reach_automaton_v(const vdp_policy_t *p, size_t i, int varian
     cand[nc++] = (int)i;
     for (size_t j = 0; j < i; j++) {
         const vdp_rule_t *r = &p->rules[j];
-        if (r->kind != kind) continue;
+        if (r->kind != kind || r->subj != ri->subj) continue;
         uint32_t ov = bi->mask & r->b.mask;
         if ((bi->value & ov) != (r->b.value & ov)) continue;
         cvar[nc] = 0;
@@ -2549,7 +2999,7 @@ vdp_reach_t vdp_rule_reachable_witness(const vdp_policy_t *p, size_t i,
         automaton = vdp_reach_force_automaton;
         for (size_t j = 0; j <= i && !automaton; j++) {
             const vdp_rule_t *r = &p->rules[j];
-            if (r->kind == kind && (r->s.op == VDP_STR_SUFFIX || r->s.op == VDP_STR_CONTAINS ||
+            if (r->kind == kind && r->subj == p->rules[i].subj && (r->s.op == VDP_STR_SUFFIX || r->s.op == VDP_STR_CONTAINS ||
                                     r->s.op == VDP_STR_GLOB))
                 automaton = true;
         }
@@ -2728,7 +3178,7 @@ static bool request_wild_reached(const vdp_policy_t *p, const vdp_rule_t *q) {
     size_t sxl = strlen(sx);
     for (size_t k = 0; k < p->n; k++) {
         const vdp_rule_t *h = &p->rules[k];
-        if (h->kind != VDP_KIND_HOST || h->verb != VDP_ALLOW || !h->s.name) continue;
+        if (h->kind != VDP_KIND_HOST || h->verb != VDP_ALLOW || !h->s.name || h->subj != q->subj) continue;
         char nm[256], cand[300];
         const char *c = h->s.c;
         if (h->s.wild) {                                   /* ?*.<S>:<port or *> */
@@ -2749,13 +3199,13 @@ static bool request_wild_reached(const vdp_policy_t *p, const vdp_rule_t *q) {
         } else if (sxl > nl && sx[sxl - nl - 1] == '.' && !strcmp(sx + sxl - nl, nm)) {
             snprintf(cand, sizeof cand, "a.%s:%u", sx, q->req_port);
         } else continue;
-        if (vdp_decide(p, VDP_KIND_HOST, cand, 0, true, NULL, NULL) == VDP_SATISFIED) return true;
+        if (vdp_decide_subj(p, q->subj, VDP_KIND_HOST, cand, 0, true, NULL, NULL) == VDP_SATISFIED) return true;
     }
     return false;
 }
 
 bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t wn) {
-    if (i >= p->n || p->rules[i].kind != VDP_KIND_REQUEST) return false;
+    if (i >= p->n || (p->rules[i].kind != VDP_KIND_REQUEST && p->rules[i].kind != VDP_KIND_MCP)) return false;
     if (p->rules[i].req_wild) {
         if (request_wild_reached(p, &p->rules[i])) return false;
         snprintf(why, wn, "no host rule allows a name under %s on port %u", p->rules[i].req_host,
@@ -2764,7 +3214,7 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
     }
     char hp[300];
     snprintf(hp, sizeof hp, "%s:%u", p->rules[i].req_host, p->rules[i].req_port);
-    if (vdp_decide(p, VDP_KIND_HOST, hp, 0, true, NULL, NULL) == VDP_SATISFIED) return false;
+    if (vdp_decide_subj(p, p->rules[i].subj, VDP_KIND_HOST, hp, 0, true, NULL, NULL) == VDP_SATISFIED) return false;
     snprintf(why, wn, "no host rule allows %s", hp);
     return true;
 }

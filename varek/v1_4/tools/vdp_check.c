@@ -17,7 +17,7 @@
 //       runs both methods on the same policies).
 //   vdp_check <policy> batch
 //       Reads queries from stdin, one per line:
-//           <path|host|exec> <flags|-> <hex-encoded string, or '=' if empty>
+//           <path|host|exec|request|mcp> <flags|-> <hex-encoded string, or '=' if empty> [@<subject>]
 //       flags is a decimal or 0x-hex 32-bit value, or '-' for symbolic flags.
 //       Writes one JSON line per query: {"verdict","rule","line","why"}, and
 //       for a SATISFIED verdict (v1.15) its certificate's witness "w" in the
@@ -48,6 +48,7 @@ static int parse_kind(const char *k, vdp_kind_t *out) {
     if (!strcmp(k, "host")) { *out = VDP_KIND_HOST; return 0; }
     if (!strcmp(k, "exec")) { *out = VDP_KIND_EXEC; return 0; }
     if (!strcmp(k, "request")) { *out = VDP_KIND_REQUEST; return 0; }     /* v1.26.1 */
+    if (!strcmp(k, "mcp")) { *out = VDP_KIND_MCP; return 0; }             /* v1.31 */
     return -1;
 }
 
@@ -63,7 +64,14 @@ static int do_batch(void) {
         char *k = strtok_r(line, " ", &save);
         char *fl = strtok_r(NULL, " ", &save);
         char *hx = strtok_r(NULL, " ", &save);
+        char *sj = strtok_r(NULL, " ", &save);  /* v1.31: @N, the calling subject (default @0) */
         if (!hx || !strcmp(hx, "=")) hx = "";   /* empty string (absent, or '=') */
+        char *send = NULL;
+        long subj = sj ? (sj[0] == '@' ? strtol(sj + 1, &send, 10) : -1) : 0;
+        if (sj && (subj < 0 || subj > 1000 || !send || *send || send == sj + 1)) {
+            printf("{\"error\":\"bad subject\"}\n");
+            continue;
+        }
         vdp_kind_t kind;
         if (!k || !fl || parse_kind(k, &kind) < 0) {
             printf("{\"error\":\"bad query\"}\n");
@@ -87,7 +95,7 @@ static int do_batch(void) {
         if (bad || memchr(s, '\0', sl)) { printf("{\"error\":\"bad hex\"}\n"); continue; }
         int ri;
         vdp_why_t why;
-        vdp_verdict_t v = vdp_decide(&g_pol, kind, s, flags, has_flags, &ri, &why);
+        vdp_verdict_t v = vdp_decide_subj(&g_pol, (int)subj, kind, s, flags, has_flags, &ri, &why);
         printf("{\"verdict\":\"%s\",\"rule\":%d,\"line\":%d,\"why\":\"%s\"",
                vdp_verdict_name(v), ri, ri >= 0 ? g_pol.rules[ri].line : -1,
                vdp_why_name(why));
@@ -150,6 +158,11 @@ int main(int argc, char **argv) {
                 printf("rule %d %s %s %s\n", r->line, g_pol.creds[r->cred - 1].name, r->cred_hdr,
                        r->cred_scheme[0] ? r->cred_scheme : "-");
         }
+        /* v1.31: an MCP access token's audience */
+        for (size_t k = 0; k < g_pol.ncreds; k++)
+            if (g_pol.creds[k].audience[0])
+                printf("audience %s %s %s\n", g_pol.creds[k].name, g_pol.creds[k].audience,
+                       g_pol.creds[k].opaque ? "opaque" : "-");
         return 0;
     }
     /* v1.28.1: the identities the run trusts and the sub-agents, as this
@@ -163,6 +176,16 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < g_pol.n; i++)
             if (g_pol.rules[i].subagent[0]) printf("subagent %d %s\n", g_pol.rules[i].line, g_pol.rules[i].subagent);
         if (g_pol.require_obo) printf("require on-behalf-of\n");
+        /* v1.31: the confined subjects, the rules for each, the MCP resources */
+        for (size_t k = 0; k < g_pol.nsubjects; k++) {
+            const vdp_rule_t *r = &g_pol.rules[g_pol.subjects[k].rule];
+            printf("confined %zu %s %s %d %s\n", k + 1, g_pol.subjects[k].name,
+                   g_pol.subjects[k].mcp ? "mcp" : "subagent", r->line, r->sha256[0] ? r->sha256 : "-");
+        }
+        for (size_t i = 0; i < g_pol.n; i++)
+            if (g_pol.rules[i].subj) printf("for %d %d\n", g_pol.rules[i].line, g_pol.rules[i].subj);
+        for (size_t k = 0; k < g_pol.nmcpres; k++)
+            printf("mcp-resource %s %s\n", g_pol.mcpres[k].url, g_pol.mcpres[k].aud[0] ? g_pol.mcpres[k].aud : "-");
         return 0;
     }
     if (!strcmp(argv[2], "analyze")) {
@@ -205,8 +228,10 @@ int main(int argc, char **argv) {
                 hostnever++;
             /* v1.26.1: a request rule whose exact host no host rule allows on
              * its port is never reached: the connection is refused first */
-            if (g_pol.rules[i].kind == VDP_KIND_REQUEST && vdp_request_host_refused(&g_pol, i, hw, sizeof hw)) {
-                printf("%s:%d: request rule can never fire: %s\n", argv[1], g_pol.rules[i].line, hw);
+            if ((g_pol.rules[i].kind == VDP_KIND_REQUEST || g_pol.rules[i].kind == VDP_KIND_MCP) &&
+                vdp_request_host_refused(&g_pol, i, hw, sizeof hw)) {
+                printf("%s:%d: %s rule can never fire: %s\n", argv[1], g_pol.rules[i].line,
+                       vdp_kind_name(g_pol.rules[i].kind), hw);
                 dead++;
                 continue;
             }
@@ -222,6 +247,15 @@ int main(int argc, char **argv) {
                 printf("%s:%d: reachability not decided (%s)\n", argv[1], g_pol.rules[i].line,
                     vdp_reach_unknown_text());
             }
+        }
+        /* v1.31: a confined subject no rule is written for: every call it makes
+         * is refused (a note; a server needs at least its loader and libraries) */
+        for (size_t k = 0; k < g_pol.nsubjects; k++) {
+            bool any = false;
+            for (size_t i = 0; i < g_pol.n && !any; i++) any = g_pol.rules[i].subj == (int)k + 1;
+            if (!any)
+                printf("%s:%d: note: no rule is written for %s (for=%s): every call it makes is refused\n",
+                       argv[1], g_pol.subjects[k].line, g_pol.subjects[k].name, g_pol.subjects[k].name);
         }
         /* v1.25: an allow wildcard over a shared domain is refused at load
          * (shared_domains.h), as the Warden refuses it; lint names the entry. */
@@ -282,7 +316,7 @@ int main(int argc, char **argv) {
             bool used = false;
             for (size_t i = 0; !used && i < g_pol.n; i++) used = g_pol.rules[i].cred == (int)k + 1;
             if (!used)
-                printf("%s:%d: note: credential %s is named, but no request rule carries it\n",
+                printf("%s:%d: note: credential %s is named, but no request or mcp rule carries it\n",
                        argv[1], g_pol.creds[k].line, g_pol.creds[k].name);
         }
         /* v1.28.1: `require on-behalf-of` with no trusted issuer: no token can
