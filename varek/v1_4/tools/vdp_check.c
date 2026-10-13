@@ -322,7 +322,7 @@ int main(int argc, char **argv) {
         /* v1.28.1: `require on-behalf-of` with no trusted issuer: no token can
          * be verified, so no run can start; and a `trust issuer` line without
          * `require on-behalf-of` is used only when the operator gives a token */
-        if (g_pol.require_obo && !g_pol.nissuers)
+        if (g_pol.require_obo && !g_pol.nissuers && !g_pol.nmcpres)       /* v1.31: or an MCP resource */
             printf("%s: note: require on-behalf-of, but no issuer is trusted (trust issuer ...): no run can "
                    "start\n", argv[1]);
         /* v1.16: the policy's glob size against the cap that bounds the work

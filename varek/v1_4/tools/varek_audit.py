@@ -1028,11 +1028,12 @@ def check_handoff_rules(checker, policy, rules, handoffs, problems):
 def policy_credentials(checker, policy):
     """v1.28: the policy's credentials [(name, store, ref)] and the request
     rules that carry one {policy line: (name, header, scheme or None)}, as
-    the checker reads them."""
+    the checker reads them; v1.31: and the MCP tokens' audiences {name:
+    (URL, opaque)}."""
     q = subprocess.run([checker, policy, "credentials"], capture_output=True, text=True)
     if q.returncode != 0:
         raise ValueError(q.stderr.strip() or "the checker has no credentials mode")
-    creds, rules = [], {}
+    creds, rules, auds = [], {}, {}
     for line in q.stdout.splitlines():
         f = line.split(" ")
         if len(f) == 4 and f[0] == "credential":
@@ -1040,20 +1041,21 @@ def policy_credentials(checker, policy):
         elif len(f) == 5 and f[0] == "rule" and f[1].isdigit():
             rules[int(f[1])] = (f[2], f[3], None if f[4] == "-" else f[4])
         elif len(f) == 4 and f[0] == "audience":
-            pass                                   # v1.31: an MCP access token's audience (step 5)
+            auds[f[1]] = (f[2], f[3] == "opaque")     # v1.31: an MCP access token's audience
         elif line.strip():
             raise ValueError(f"an unexpected line from the checker: {line!r}")
-    return creds, rules
+    return creds, rules, auds
 
 
 def policy_identity(checker, policy):
     """v1.28.1: the policy's trusted issuers {iss: (aud, jwks or None)}, trust
     domains {domain: bundle}, sub-agent rules {policy line: name} and
-    whether it requires a user, as the checker reads them."""
+    whether it requires a user, as the checker reads them; v1.31: and the
+    MCP resources trusted for the user's token {url: (aud or None, line)}."""
     q = subprocess.run([checker, policy, "identity"], capture_output=True, text=True)
     if q.returncode != 0:
         raise ValueError(q.stderr.strip() or "the checker has no identity mode")
-    iss, dom, sub, req = {}, {}, {}, False
+    iss, dom, sub, req, mres = {}, {}, {}, False, {}
     for line in q.stdout.splitlines():
         f = line.split(" ")
         if len(f) == 4 and f[0] == "issuer":
@@ -1064,11 +1066,13 @@ def policy_identity(checker, policy):
             sub[int(f[1])] = f[2]
         elif line == "require on-behalf-of":
             req = True
-        elif f[0] in ("confined", "for", "mcp-resource") and len(f) in (3, 6):
+        elif f[0] == "mcp-resource" and len(f) == 3:                  # v1.31
+            mres[f[1]] = None if f[2] == "-" else f[2]
+        elif f[0] in ("confined", "for") and len(f) in (3, 6):
             pass                                   # v1.31: policy_confined reads them
         elif line.strip():
             raise ValueError(f"an unexpected line from the checker: {line!r}")
-    return iss, dom, sub, req
+    return iss, dom, sub, req, mres
 
 
 def policy_confined(checker, policy):
@@ -1118,7 +1122,7 @@ def check_chain(ident, meta, records, run, problems):
     never after its launch failed; the proxy's records are their hand-off's.
     Returns {sub-agent: decisions}, or None when the Warden predates the
     chain."""
-    iss, dom, subrules, req = ident
+    iss, dom, subrules, req, mres = ident
     rs = meta.get("run_start", {})
     if not _version_at_least(rs.get("warden"), (1, 28, 1)):
         if "on_behalf_of" in rs or any("obo" in r for r in records):
@@ -1137,8 +1141,20 @@ def check_chain(ident, meta, records, run, problems):
         if not isinstance(user, dict):
             problems.append("run_start's user is not an object")
             user = {}
-        i = user.get("issuer")
-        if not isinstance(i, str) or i not in iss:
+        i, mr = user.get("issuer"), user.get("mcp_resource")
+        if mr is not None:
+            # v1.31: an issuer found through a trusted MCP resource (the
+            # discovery is the helper's; what it found is checked against the
+            # policy's line): the line's audience, or its URL as written
+            if not isinstance(mr, str) or mr not in mres:
+                problems.append(f"run_start's user was found through MCP resource {mr!r}, which the policy "
+                                f"does not trust")
+            elif not (isinstance(i, str) and i.startswith("https://")):
+                problems.append(f"run_start's user's issuer {i!r}, found through {mr}, is not an https URL")
+            elif user.get("audience") != (mres[mr] or mr):
+                problems.append(f"run_start's user has the audience {user.get('audience')!r}, not the one "
+                                f"trust mcp-resource {mr} names")
+        elif not isinstance(i, str) or i not in iss:
             problems.append(f"run_start's user is vouched for by {i!r}, an issuer the policy does not trust")
         elif user.get("audience") != iss[i][0]:
             problems.append(f"run_start's user has the audience {user.get('audience')!r}, not the one the policy "
@@ -1290,7 +1306,7 @@ def check_chain(ident, meta, records, run, problems):
     return count
 
 
-def check_credentials(creds, cred_rules, meta, records, complete, problems, notes):
+def check_credentials(creds, cred_rules, meta, records, complete, problems, notes, auds=None):
     """v1.28 (section 5): run_start lists the policy's credentials (name,
     store, reference, in order; a version, a length, a placeholder's SHA-256;
     the helper's SHA-256), and none when the policy names none. Every
@@ -1330,6 +1346,22 @@ def check_credentials(creds, cred_rules, meta, records, complete, problems, note
                                 f"line or a placeholder's SHA-256 of its own")
                 break
             seen_ph.add(ph)
+            # v1.31: an MCP token says its server; a JWT one, its expiry
+            # (in the future when the run started), an opaque one, opaque
+            aud = (auds or {}).get(c[0])
+            t0 = rs.get("timestamp_ns")
+            if aud is None:
+                if any(k in e for k in ("audience", "opaque", "expires")):
+                    problems.append(f"run_start's credential {c[0]} is listed as an MCP token, which its line "
+                                    f"does not say")
+            elif e.get("audience") != aud[0] or (e.get("opaque") is True) != aud[1]:
+                problems.append(f"run_start's credential {c[0]} is listed for another server than its line's "
+                                f"{aud[0]}, or opaque where its line is not (or the reverse)")
+            elif not aud[1] and not (type(e.get("expires")) is int and type(t0) is int and
+                                     e["expires"] * 1000000000 > t0):
+                problems.append(f"run_start's MCP token {c[0]} has no expiry, or had expired when the run started")
+            elif aud[1] and "expires" in e:
+                problems.append(f"run_start's opaque MCP token {c[0]} is listed with an expiry")
     # v1.28 review: ordered by each record's line in the stream, not by the
     # number of decisions before it (an event right next to the record it
     # must follow has the same count)
@@ -1424,6 +1456,11 @@ def check_credentials(creds, cred_rules, meta, records, complete, problems, note
                                 f"deciding rule (line {rec.get('policy_line')!r}) does not name")
                 continue
             carried += 1
+            # v1.31: an MCP token is not released past its expiry
+            ex = next((e.get("expires") for e in (rs.get("credentials") or []) if isinstance(e, dict)
+                       and e.get("name") == rec.get("credential") and "audience" in e), None)
+            if type(ex) is int and type(rec.get("timestamp_ns")) is int and rec["timestamp_ns"] >= (ex + 1) * 1000000000:
+                problems.append(f"seq {rec.get('seq')}: MCP token {rec.get('credential')} released after its expiry")
             key = (rec.get("proxy_conn"), rec.get("request_seq"))
             if all(type(k) is int for k in key):
                 allowed_with[key] = (rec["credential"], at(rec))
@@ -1520,7 +1557,11 @@ REQUEST_REFUSE_RULES = ("policy_match", "default_deny_unknown", "certificate_ref
 # Mcp-Name header disagrees with its body (mcp_header_mismatch), or whose
 # body is over the limit (max_body)
 MCP_REFUSE_RULES = ("policy_match", "default_deny_unknown", "certificate_refused", "max_body",
-                    "fragment_escape_length", "revoked", "mcp_unreadable", "mcp_header_mismatch")
+                    "fragment_escape_length", "revoked", "mcp_unreadable", "mcp_header_mismatch",
+                    # step 5: the agent's own bearer token (D6), a credential past its expiry
+                    "mcp_token_user", "mcp_token_audience", "mcp_token_expired", "mcp_token_malformed",
+                    "credential_expired")
+MCP_TOKEN_KINDS = ("placeholder", "jwt", "opaque", "malformed")
 MCP_BODY_DEFAULT = 1 << 20                 # an mcp rule without max_body=
 
 
@@ -1735,6 +1776,14 @@ def check_mcp_call(rec, rules, st, conn, problems):
     bl, bh = rec.get("body_len"), rec.get("body_sha256")
     if type(bl) is not int or bl < 0 or not (isinstance(bh, str) and HEX64.fullmatch(bh)):
         problems.append(f"seq {seq}: an MCP call without its body's length and SHA-256")
+        return
+    tk = rec.get("token")
+    if (tk is not None and tk not in MCP_TOKEN_KINDS) or \
+            (rec.get("rule", "").startswith("mcp_token_") and tk not in ("jwt", "opaque", "malformed")) or \
+            (rec.get("rule") == "mcp_token_malformed") != (tk == "malformed") or \
+            (rec.get("rule") in ("mcp_token_audience", "mcp_token_expired") and tk != "jwt"):
+        problems.append(f"seq {seq}: an MCP call whose bearer token ({tk!r}) is not one its rule "
+                        f"{rec.get('rule')!r} is written for")
         return
     dfin, rule = rec.get("decision_final"), rec.get("rule")
     if dfin == "ALLOW" and rule == "mcp_allowed":
@@ -3340,17 +3389,17 @@ def main(argv=None):
         check_refused_requests(a.checker, a.policy, prules, records, problems)            # step 7
     cnotes = []                                                                            # v1.28
     try:
-        pcreds, pcred_rules = policy_credentials(a.checker, a.policy)
+        pcreds, pcred_rules, pcred_auds = policy_credentials(a.checker, a.policy)
     except (OSError, ValueError) as e:
         problems.append(f"checker failed on the policy's credentials: {e}")
-        pcreds, pcred_rules = [], {}
+        pcreds, pcred_rules, pcred_auds = [], {}, {}
     ncarried, nswap_refused, revoked = check_credentials(pcreds, pcred_rules, meta, records, complete,
-                                                         problems, cnotes)
+                                                         problems, cnotes, pcred_auds)
     try:                                                                                   # v1.28.1
         ident = policy_identity(a.checker, a.policy)
     except (OSError, ValueError) as e:
         problems.append(f"checker failed on the policy's identities: {e}")
-        ident = ({}, {}, {}, False)
+        ident = ({}, {}, {}, False, {})
     per_sub = check_chain(ident, meta, records, run, problems)
     nlaunch = nlaunch_refused = 0
     if launches_policy and prules:                                                         # v1.27

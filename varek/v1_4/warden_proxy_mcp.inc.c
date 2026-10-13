@@ -140,6 +140,41 @@ static void mcp_report(struct wp_held *h, const char *fail, uint32_t code) {
             ok = WP_MCP_HEADERS;
         }
     }
+    /* v1.31 step 5: the bearer token, if any (read from the head as sent) */
+    if (!why[0]) {
+        int r = mcp_header(h, "Authorization", &pv, &pvn);
+        if (r < 0) {
+            snprintf(why, sizeof why, "the call has two Authorization headers");
+            ok = WP_MCP_HEADERS;
+        } else if (r == 1 && pvn > 7 && !strncasecmp((const char *)pv, "Bearer ", 7)) {
+            const char *t = (const char *)pv + 7;
+            size_t tn = pvn - 7;
+            while (tn && *t == ' ') { t++; tn--; }
+            for (unsigned k = 0; k < WS_MAX_CREDS && !m.token; k++)
+                if (g_ph[k][0] && strlen(g_ph[k]) == tn && !memcmp(g_ph[k], t, tn)) m.token = WP_TOK_PLACEHOLDER;
+            if (!m.token) {
+                unsigned tl = 0;
+                (void)EVP_Digest(t, tn, m.token_sha256, &tl, EVP_sha256(), NULL);
+                mj_jwt_t *j = calloc(1, sizeof *j);
+                char jw[72] = "";
+                int jr = j ? mj_jwt(t, tn, j, jw, sizeof jw) : -1;
+                if (!j) snprintf(jw, sizeof jw, "the proxy is out of memory");
+                if (jr == 1) {
+                    m.token = WP_TOK_JWT;
+                    m.naud = j->naud;
+                    m.aud_over = j->aud_over;
+                    m.has_exp = j->has_exp;
+                    m.exp = j->exp;
+                    for (uint32_t k = 0; k < j->naud && k < WP_AUD_MAX; k++) snprintf(m.aud[k], sizeof m.aud[k], "%s", j->aud[k]);
+                } else if (jr == 0) m.token = WP_TOK_OPAQUE;
+                else {
+                    m.token = WP_TOK_MALFORMED;
+                    snprintf(m.token_why, sizeof m.token_why, "%s", jw);
+                }
+                free(j);
+            }
+        }
+    }
     if (!why[0]) {
         m.ok = WP_MCP_OK;
         memcpy(m.method, c->method, sizeof m.method);

@@ -98,7 +98,11 @@ static bool identity_ok(const struct ws_identity *m, const ws_idreq_t *idr) {
     if (m->has_user) {
         /* v1.28.1 review: the algorithm one of the four, the times NumericDates
          * the helper can produce (under 2^53) */
-        if (m->issuer >= idr->nissuers || !printable_field(m->sub, sizeof m->sub, true) ||
+        /* v1.31: found through a trusted MCP resource, or the policy's issuer */
+        if (m->mcp_resource > idr->nmcpres || (m->mcp_resource == 0 && m->issuer >= idr->nissuers) ||
+            (m->mcp_resource && (m->issuer != 0 || !printable_field(m->found_iss, sizeof m->found_iss, true) ||
+                                 !printable_field(m->found_aud, sizeof m->found_aud, true))) ||
+            !printable_field(m->sub, sizeof m->sub, true) ||
             !printable_field(m->jti, sizeof m->jti, false) || !printable_field(m->alg, sizeof m->alg, true) ||
             !printable_field(m->kid, sizeof m->kid, false) || !hex64(m->token_sha256) || m->nact > WS_MAX_ACTORS ||
             m->exp <= 0 || m->exp >= (int64_t)1 << 53 || m->iat < -1 || m->iat >= (int64_t)1 << 53 ||
@@ -128,7 +132,7 @@ int ws_fetch_id(ws_t *w, const char *conf, size_t n, const int *store, const cha
                 int timeout_ms, char *why, size_t wn) {
     *nfiles = 0;
     bool want_id = idr && (idr->token || idr->svid), got_id = false;
-    if (idr && (idr->nissuers > WS_MAX_ISSUERS || idr->nspiffe > WS_MAX_SPIFFE)) {
+    if (idr && (idr->nissuers > WS_MAX_ISSUERS || idr->nspiffe > WS_MAX_SPIFFE || idr->nmcpres > WS_MAX_MCPRES)) {
         snprintf(why, wn, "too many trusted issuers or trust domains");
         return -1;
     }
@@ -148,6 +152,7 @@ int ws_fetch_id(ws_t *w, const char *conf, size_t n, const int *store, const cha
         if (idr->svid) memcpy(su.svid, idr->svid, strlen(idr->svid) + 1);
         su.nissuers = (uint32_t)idr->nissuers;
         su.nspiffe = (uint32_t)idr->nspiffe;
+        su.nmcpres = (uint32_t)idr->nmcpres;
     }
     if (!send_all(w->ctl, &su, sizeof su)) { snprintf(why, wn, "the helper did not take its setup"); return -1; }
     for (size_t i = 0; want_id && i < idr->nissuers; i++) {
@@ -162,13 +167,24 @@ int ws_fetch_id(ws_t *w, const char *conf, size_t n, const int *store, const cha
         m.index = (uint32_t)i;
         if (!send_all(w->ctl, &m, sizeof m)) { snprintf(why, wn, "the helper did not take trust domain %zu", i); return -1; }
     }
+    for (size_t i = 0; want_id && i < idr->nmcpres; i++) {
+        struct ws_mcpres m = idr->mcpres[i];
+        m.type = WS_MSG_MCPRES;
+        m.index = (uint32_t)i;
+        if (!send_all(w->ctl, &m, sizeof m)) { snprintf(why, wn, "the helper did not take MCP resource %zu", i); return -1; }
+    }
     for (size_t i = 0; i < n; i++) {
-        struct ws_cred c;
+        static struct ws_cred c;
         memset(&c, 0, sizeof c);
         c.type = WS_MSG_CRED;
         c.index = (uint32_t)i;
         c.store = (uint32_t)store[i];
         snprintf(c.ref, sizeof c.ref, "%s", ref[i]);
+        if (idr && idr->audience && idr->audience[i][0]) {             /* v1.31 */
+            if (strlen(idr->audience[i]) >= sizeof c.audience) { snprintf(why, wn, "credential %zu's audience is too long", i); return -1; }
+            snprintf(c.audience, sizeof c.audience, "%s", idr->audience[i]);
+            c.opaque = idr->opaque && idr->opaque[i];
+        }
         if (!send_all(w->ctl, &c, sizeof c)) { snprintf(why, wn, "the helper did not take credential %zu", i); return -1; }
     }
     bool got[WS_MAX_CREDS] = { false };
@@ -218,11 +234,15 @@ int ws_fetch_id(ws_t *w, const char *conf, size_t n, const int *store, const cha
                 snprintf(why, wn, "credential %u: %s", m.r.index, m.r.why);
                 return -1;
             }
-            if (m.r.len == 0 || m.r.len > WS_MAX_VALUE) goto bad;
+            if (m.r.len == 0 || m.r.len > WS_MAX_VALUE || m.r.exp < -1 || m.r.exp >= (int64_t)1 << 53) goto bad;
+            /* v1.31: an expiry only for an MCP token that is a JWT */
+            if ((m.r.exp != -1) != (idr && idr->audience && idr->audience[m.r.index][0] && !(idr->opaque && idr->opaque[m.r.index])))
+                goto bad;
             got[m.r.index] = true;
             ngot++;
             memcpy(meta[m.r.index].version, m.r.version, sizeof meta[m.r.index].version);
             meta[m.r.index].len = m.r.len;
+            meta[m.r.index].exp = m.r.exp;
         } else if (m.type == WS_MSG_READY && k == (ssize_t)sizeof m.y) {
             /* the helper proves who it runs as (SCM_CREDENTIALS, checked by
              * the kernel against the sender) */

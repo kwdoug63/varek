@@ -592,21 +592,16 @@ static int policy_load(const char *path, struct policy *p) {
                 "the trusted identities or the confined subjects differently; refusing to start\n", path);
         return -1;
     }
-    /* v1.31 (docs/security/v1.31-standards.md): the grammar is read (step 2)
-     * confined subjects are decided by subject (step 3) and MCP calls over
-     * HTTP (step 4); the Warden does not yet check MCP tokens (step 5). Until it does, a policy that uses them is
-     * refused rather than run with them ignored. */
-    {
-        const char *later = NULL;
-        for (size_t k = 0; !later && k < p->v.ncreds; k++)
-            if (p->v.creds[k].audience[0]) later = "MCP access tokens (audience=)";
-        if (!later && p->v.nmcpres) later = "trust mcp-resource";
-        if (later) {
-            fprintf(stderr, "[warden] policy %s: %s are read but not yet enforced by this build; "
-                    "refusing to start\n", path, later);
+    /* v1.31 (docs/security/v1.31-standards.md): every new line is enforced:
+     * confined subjects (step 3), MCP calls over HTTP (step 4), MCP tokens and
+     * trust mcp-resource (step 5). An audience= URL the helper is sent is at
+     * most 1024 bytes. */
+    for (size_t k = 0; k < p->v.ncreds; k++)
+        if (strlen(p->v.creds[k].audience) > 1024) {
+            fprintf(stderr, "[warden] policy %s: credential %s's audience is over 1024 bytes; refusing to start\n",
+                    path, p->v.creds[k].name);
             return -1;
         }
-    }
     /* v1.13: load-time analysis. The decision procedure decides, for every
      * rule, whether ANY action can reach it as the first matching rule. A rule
      * that can never fire is almost always a policy bug (typically a deny
@@ -1892,11 +1887,17 @@ static void emit_on_behalf_of(FILE *f, const struct policy *p) {
     const struct ws_identity *id = &g_identity;
     fputs("\"on_behalf_of\":{", f);
     if (id->has_user) {
-        const vdp_issuer_t *is = &p->v.issuers[id->issuer];
+        /* v1.31: the issuer is the policy's, or found through a trusted MCP resource */
+        const vdp_issuer_t *is = id->mcp_resource ? NULL : &p->v.issuers[id->issuer];
+        const vdp_mcpres_t *mr = id->mcp_resource ? &p->v.mcpres[id->mcp_resource - 1] : NULL;
         fputs("\"user\":{\"issuer\":\"", f);
-        json_escape(f, is->iss);
+        json_escape(f, is ? is->iss : id->found_iss);
         fputs("\",\"audience\":\"", f);
-        json_escape(f, is->aud);
+        json_escape(f, is ? is->aud : id->found_aud);
+        if (mr) {
+            fputs("\",\"mcp_resource\":\"", f);
+            json_escape(f, mr->url);
+        }
         fputs("\",\"subject\":\"", f);
         json_escape(f, id->sub);
         fprintf(f, "\",\"expires\":%lld,", (long long)id->exp);
@@ -1908,7 +1909,7 @@ static void emit_on_behalf_of(FILE *f, const struct policy *p) {
         fputs("\",", f);
         if (id->kid[0]) { fputs("\"key_id\":\"", f); json_escape(f, id->kid); fputs("\",", f); }
         fprintf(f, "\"token_sha256\":\"%s\",\"policy_line\":%d,\"verified\":true,\"on_expiry\":\"%s\"},",
-                id->token_sha256, is->line, g_obo_on_expiry ? "record" : "revoke");
+                id->token_sha256, is ? is->line : mr->line, g_obo_on_expiry ? "record" : "revoke");
         if (id->nact) {
             fputs("\"actors\":[", f);
             for (uint32_t k = 0; k < id->nact; k++) {
@@ -2074,7 +2075,15 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
             json_escape(f, c->ref);
             fputs("\",\"version\":\"", f);
             json_escape(f, g_cred_meta[k].version);
-            fprintf(f, "\",\"length\":%u,\"placeholder_sha256\":\"%s\"}", g_cred_meta[k].len, g_cred_ph_sha[k]);
+            fprintf(f, "\",\"length\":%u,\"placeholder_sha256\":\"%s\"", g_cred_meta[k].len, g_cred_ph_sha[k]);
+            if (c->audience[0]) {                       /* v1.31: an MCP token, for this server */
+                fputs(",\"audience\":\"", f);
+                json_escape(f, c->audience);
+                fputc('"', f);
+                if (c->opaque) fputs(",\"opaque\":true", f);
+                else fprintf(f, ",\"expires\":%lld", (long long)g_cred_meta[k].exp);
+            }
+            fputc('}', f);
         }
         fputs("],", f);
     }
@@ -3390,6 +3399,7 @@ static void syn_hosts_view(const struct policy *p, FILE *f);
 #include "warden_net.inc.c"          /* v1.21: decided connections */
 #include "warden_stub.inc.c"         /* v1.25: the stub resolver for wildcard names */
 #include "warden_synth.inc.c"        /* v1.26: synthetic addresses with the proxy on */
+#include "mcp_aud.h"                /* v1.31 step 5 */
 #include "warden_pxdecide.inc.c"     /* v1.26: the Warden's decisions on what the proxy reads */
 #include "warden_revoke.inc.c"       /* v1.28 step 4: revoking a run */
 #include "warden_trust.inc.c"        /* v1.26.1: the run's CA and the trust views */
@@ -5338,9 +5348,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[warden] --on-behalf-of-expiry: there is no user's token (--on-behalf-of) to expire\n");
         return 2;
     }
-    if (obo_arg && !p.v.nissuers) {
-        fprintf(stderr, "[warden] --on-behalf-of: the policy trusts no issuer (`trust issuer URL audience AUD`), "
-                "so no token can be verified; refusing to start\n");
+    if (obo_arg && !p.v.nissuers && !p.v.nmcpres) {         /* v1.31: or an MCP resource's servers */
+        fprintf(stderr, "[warden] --on-behalf-of: the policy trusts no issuer (`trust issuer URL audience AUD` or "
+                "`trust mcp-resource URL`), so no token can be verified; refusing to start\n");
         return 2;
     }
     if (svid_arg && !p.v.nspiffe) {
@@ -5442,8 +5452,18 @@ int main(int argc, char **argv) {
                 memcpy(wspf[k].domain, p.v.spiffe[k].domain, sizeof wspf[k].domain);
                 memcpy(wspf[k].bundle, p.v.spiffe[k].bundle, sizeof wspf[k].bundle);
             }
+            /* v1.31: each credential's audience=, and the MCP resources trusted */
+            static const char *caud[WS_MAX_CREDS];
+            static bool copq[WS_MAX_CREDS];
+            for (size_t k = 0; k < p.v.ncreds; k++) { caud[k] = p.v.creds[k].audience; copq[k] = p.v.creds[k].opaque; }
+            static struct ws_mcpres wmr[VDP_MAX_MCPRES];
+            for (size_t k = 0; k < p.v.nmcpres; k++) {
+                memcpy(wmr[k].url, p.v.mcpres[k].url, sizeof wmr[k].url);
+                memcpy(wmr[k].aud, p.v.mcpres[k].aud, sizeof wmr[k].aud);
+            }
             ws_idreq_t idr = { .token = obo_arg, .svid = svid_arg, .issuers = wiss, .nissuers = p.v.nissuers,
-                               .spiffe = wspf, .nspiffe = p.v.nspiffe, .id = &g_identity, .kinds = fkind };
+                               .spiffe = wspf, .nspiffe = p.v.nspiffe, .id = &g_identity, .kinds = fkind,
+                               .audience = caud, .opaque = copq, .mcpres = wmr, .nmcpres = p.v.nmcpres };
             int fr = ws_fetch_id(&g_secrets, conf, p.v.ncreds, store, ref, g_cred_meta, files, &nfiles, &idr, 30000,
                                  why, sizeof why);
             /* every local file the helper read, whatever came of it: the
@@ -5490,7 +5510,9 @@ int main(int argc, char **argv) {
             if (g_identity.has_user) {
                 const struct ws_identity *id = &g_identity;
                 fprintf(stderr, "[warden] on behalf of %s (issuer %s, line %d): token verified (%s%s%s), expires in "
-                        "%lld s (then %s), SHA-256 %s\n", id->sub, p.v.issuers[id->issuer].iss, p.v.issuers[id->issuer].line,
+                        "%lld s (then %s), SHA-256 %s\n", id->sub,
+                        id->mcp_resource ? id->found_iss : p.v.issuers[id->issuer].iss,       /* v1.31 */
+                        id->mcp_resource ? p.v.mcpres[id->mcp_resource - 1].line : p.v.issuers[id->issuer].line,
                         id->alg, id->kid[0] ? ", key " : "", id->kid, (long long)(id->exp - time(NULL)),
                         g_obo_on_expiry ? "recorded" : "the run is revoked", id->token_sha256);
                 for (uint32_t k = 0; k < id->nact; k++)

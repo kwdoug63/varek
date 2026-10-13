@@ -7,6 +7,8 @@
 #   v1310_mcp_agent.py PORT          every call below
 #   v1310_mcp_agent.py PORT TAG      one tools/call get_issue with the
 #                                    placeholder as a bearer token
+#   v1310_mcp_agent.py PORT tokens F section 4: each token in F (JSON) as a
+#                                    bearer token, then credential mt's placeholder
 import base64, json, os, socket, ssl, sys
 
 P = int(sys.argv[1])
@@ -74,6 +76,17 @@ def call(i, method, params=None):
 V0618 = [("MCP-Protocol-Version", "2025-06-18")]
 V0728 = [("MCP-Protocol-Version", "2026-07-28")]
 BEARER = [("Authorization", "Bearer " + TOK)]
+if len(sys.argv) > 3 and sys.argv[2] == "tokens":
+    # section 4: tools/list with each token of the JSON file {tag: token} as
+    # a bearer token; then credential mt's placeholder where its rule names
+    # it, on another endpoint, and on a plain request
+    for tag, t in json.load(open(sys.argv[3])).items():
+        send(tag, post(call(30, "tools/list"), hdrs=V0618 + [("Authorization", "Bearer " + t)]))
+    MT = [("Authorization", "Bearer " + os.environ.get("VAREK_CRED_MT", ""))]
+    send("ph_get", post(call(31, "tools/call", {"name": "get_issue"}), hdrs=V0618 + MT))
+    send("ph_other", post(call(32, "tools/list"), path="/other", hdrs=V0618 + MT))
+    send("ph_plain", ("GET /plain HTTP/1.1\r\nHost: %s:%d\r\nAuthorization: %s\r\n\r\n" % (H, P, MT[0][1])).encode())
+    sys.exit(0)
 if len(sys.argv) > 2:
     send(sys.argv[2], post(call(3, "tools/call", {"name": "get_issue"}), hdrs=V0618 + BEARER))
     sys.exit(0)

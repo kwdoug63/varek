@@ -125,6 +125,12 @@ struct wp_reqverdict {
  * (as sent: a chunked one with its framing) is reported by length and
  * SHA-256. Every string is NUL-terminated. */
 enum { WP_MCP_UNREADABLE = 0, WP_MCP_OK = 1, WP_MCP_HEADERS = 2, WP_MCP_OVER = 3 };
+/* v1.31 step 5: the bearer token in the call's Authorization header: none
+ * (or another scheme), a credential's placeholder (the swap's), a JWT (its
+ * claims read, its signature not checked: they can only refuse), an opaque
+ * token, or one in a JWT's form whose parts cannot be read */
+enum { WP_TOK_NONE = 0, WP_TOK_PLACEHOLDER = 1, WP_TOK_JWT = 2, WP_TOK_OPAQUE = 3, WP_TOK_MALFORMED = 4 };
+#define WP_AUD_MAX 8
 struct wp_mcpreq {
     uint32_t type;               /* WP_MSG_MCPREQ */
     uint32_t ok;
@@ -139,6 +145,15 @@ struct wp_mcpreq {
     char     rpc_id[160];        /* the JSON-RPC id as written ("" : a notification) */
     char     traceparent[64];
     char     proto[64];          /* the MCP-Protocol-Version header ("" : none) */
+    /* v1.31 step 5: the bearer token (never the token itself) */
+    uint32_t token;              /* WP_TOK_* */
+    uint32_t naud;               /* a JWT's audiences read */
+    uint32_t aud_over;           /* more than WP_AUD_MAX, one too long, or one not a string */
+    uint32_t has_exp;
+    int64_t  exp;
+    uint8_t  token_sha256[32];   /* of the token (WP_TOK_JWT, _OPAQUE, _MALFORMED) */
+    char     token_why[72];      /* WP_TOK_MALFORMED: why */
+    char     aud[WP_AUD_MAX][512];
 };
 /* v1.31: Warden -> proxy, the decision on an MCP call. Allowed: the head
  * (with the credential, as for WP_MSG_REQVERDICT) and the body are sent;

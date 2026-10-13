@@ -93,9 +93,9 @@ warden-proxy: warden_proxy_helper.c warden_proxy_mcp.inc.c warden_proxy.h proxy_
 # v1.28: warden-secrets, the helper that fetches the credentials a policy
 # names (file, HashiCorp Vault, AWS Secrets Manager). Its own program, as
 # the proxy is, so the Warden links no TLS code; it never sees a value.
-warden-secrets: warden_secrets_helper.c warden_secrets.h
+warden-secrets: warden_secrets_helper.c warden_secrets.h mcp_json.c mcp_json.h mcp_aud.h
 	@$(MAKE) -s --no-print-directory deps-check-ssl
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_secrets_helper.c -lssl -lcrypto
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_secrets_helper.c mcp_json.c -lssl -lcrypto
 
 # v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
 # ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that
@@ -436,7 +436,7 @@ test-v1290: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_ch
 tests/v1310_peek: tests/v1310_peek.c
 	$(CC) -O2 -Wall -Wextra -o $@ $<
 
-test-v1310: warden warden-proxy tools/vdp_check tools/vdp_cert_check tests/v1281_sub tests/v1310_peek
+test-v1310: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check tests/v1281_sub tests/v1310_peek
 	@./tests/test_v1310.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
 
 # v1.31: the strict JSON parser for MCP calls (mcp_json.c), under ASan and

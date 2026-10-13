@@ -27,6 +27,14 @@
 #      rule allows (and a credential for= an MCP server only in the
 #      server's calls), the records, and the audit (and the forgeries it
 #      refuses).
+#   4. MCP tokens: a credential's audience= checked at fetch (another
+#      server, expired, near expiry, no expiry, opaque with and without
+#      `opaque`); the agent's own bearer tokens (another audience, expired,
+#      malformed, the user's token; a good one and an opaque one allowed);
+#      the run's MCP token only in the calls its rule names; the user found
+#      through `trust mcp-resource` (RFC 9728, RFC 8414, OpenID discovery, an
+#      issuer that is not its identifier, metadata for another resource,
+#      another audience, the line's audience); no token in any record.
 #
 #   test_v1310.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
@@ -225,10 +233,8 @@ else
     check "the Warden starts a policy with mcp rules (step 4)" "$WARDEN" "$OUT/w3.txt" --check-startup
     for form in "${R}credential gh from file:/x audience=$U\n" "${R}trust mcp-resource $U\n"; do
         printf '%b' "$form" > "$OUT/w2.txt"
-        "$WARDEN" "$OUT/w2.txt" --check-startup > "$OUT/w2.out" 2>&1
-        rc=$?
-        check "the Warden refuses, until a later step builds it: $(printf '%b' "$form" | sed -n 2p | cut -c1-48)" \
-            sh -c "[ $rc != 0 ] && grep -q 'read but not yet enforced by this build' '$OUT/w2.out'"
+        check "the Warden starts a policy with it (step 5): $(printf '%b' "$form" | sed -n 2p | cut -c1-48)" \
+            "$WARDEN" "$OUT/w2.txt" --check-startup
     done
 fi
 
@@ -468,6 +474,133 @@ M = [json.loads(l) for l in open('$OUT/f2.log') if l.startswith('{') and '\"net.
 sys.exit(0 if len(M) == 1 and M[0]['obo'] == ['agent', 'subagent:files#1'] and M[0].get('cert_subject') == 1 and M[0]['credential'] == 'tok' else 1)"
         check "the audit accepts both runs" sh -c "python3 '$AUD' --policy '$POLF' --checker '$CERT' '$OUT/f1.log' > /dev/null && python3 '$AUD' --policy '$POLF' --checker '$CERT' '$OUT/f2.log' > /dev/null"
     fi
+fi
+
+echo "== 4. MCP tokens: the run's, the agent's, and the user found through MCP =="
+SECRETS="$(dirname "${WARDEN:-/nonexistent}")/warden-secrets"
+if [ -z "${PS:-}" ] || [ ! -x "$SECRETS" ] || ! python3 -c 'import cryptography' 2>/dev/null; then
+    skip "section 4 (needs section 3's servers, warden-secrets and python3-cryptography)"
+else
+    A="$(mktemp -d /tmp/varek_v1310a.XXXXXX)"; chmod 755 "$A"
+    python3 "$HERE/tests/v1310_as.py" serve "$A" > "$A/serve.out" 2>&1 &
+    SRV="$SRV $!"
+    trap 'kill $SRV 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $OUT ${B:-} $X $A" || rm -rf "$OUT" "${B:-}" "$X" "$A"' EXIT
+    for _ in $(seq 100); do [ -f "$A/port" ] && break; sleep 0.1; done
+    AP="$(cat "$A/port")"; AB="https://localhost:$AP"
+    chmod 644 "$A/ca.pem"
+    printf 'oidc_ca = %s/ca.pem\n' "$A" > "$A/conf"; chmod 600 "$A/conf"
+    tok() { python3 "$HERE/tests/v1310_as.py" mint "$A" "$@"; }
+    put() { printf '%s\n' "$2" > "$1"; chmod 600 "$1"; }
+    LIBS='allow path /usr/ readonly\nallow path /lib readonly\nallow path /lib64 readonly\nallow path /etc/ld.so.cache readonly\n'
+    # g4 <name> <policy text> [warden options]: a run of /usr/bin/true
+    g4() { local n="$1"; printf '%b' "$2" > "$OUT/$n.pol"; shift 2
+           timeout 90 "$WARDEN" "$OUT/$n.pol" --secrets-conf "$A/conf" --dns-server "127.0.0.1:$DP" \
+               --trust-bundle "$X/bundle.pem" "$@" -- /usr/bin/true > "$OUT/$n.out" 2>&1; echo $? > "$OUT/$n.rc"; }
+    ok4() { grep -qx 0 "$OUT/$1.rc"; }
+    no4() { ! grep -qx 0 "$OUT/$1.rc" && grep -qF -- "$2" "$OUT/$1.out"; }
+    rs4() { python3 -c 'import json,sys
+for l in open(sys.argv[1]):
+    if l.startswith("{\"event\":\"run_start\""): sys.exit(0 if eval(sys.argv[2], {"r": json.loads(l)}) else 1)
+sys.exit(1)' "$OUT/$1.out" "$2"; }
+    # the run's MCP token (audience=), checked when it is fetched
+    FT="require warden 1.31\nproxy inspect\nproxy ports $PS\ncredential mt from file:$X/mt audience=$U\nallow host mcp.example.com\nallow mcp $U tools/call get_* credential=mt\n$LIBS"
+    put "$X/mt" "$(tok "$AB/as" "$U" 3600)"
+    g4 ft_ok "$FT"
+    check "an MCP token for its server, not near expiry: fetched, the run starts" ok4 ft_ok
+    check "run_start lists it with its server and its expiry (never its value)" \
+        rs4 ft_ok "[(c['audience'], type(c.get('expires'))) for c in r['credentials']] == [('$U', int)]"
+    put "$X/mt" "$(tok "$AB/as" "https://mcp.example.com/mcp" 3600)"
+    g4 ft_aud "$FT"
+    check "an MCP token for another server (the port left out of a URL that needs it) is refused" no4 ft_aud "does not name $U"
+    put "$X/mt" "$(tok "$AB/as" "$U" -60)"
+    g4 ft_exp "$FT"
+    check "an expired MCP token is refused" no4 ft_exp "it expired"
+    put "$X/mt" "$(tok "$AB/as" "$U" 30)"
+    g4 ft_near "$FT"
+    check "an MCP token expiring in under 60 s is refused" no4 ft_near "under 60 s"
+    put "$X/mt" "$(tok "$AB/as" "$U" -)"
+    g4 ft_noexp "$FT"
+    check "an MCP token without an expiry is refused" no4 ft_noexp "without an expiry"
+    put "$X/mt" "opaque-mcp-token-0123456789"
+    g4 ft_opq "$FT"
+    check "an opaque MCP token, its line not saying opaque, is refused" no4 ft_opq "does not say opaque"
+    g4 ft_opq2 "$(printf '%s' "$FT" | sed "s|audience=$U|audience=$U opaque|")"
+    check "... and with opaque: fetched, listed as opaque, no expiry" \
+        sh -c "$(declare -f ok4 rs4); OUT='$OUT'; ok4 ft_opq2 && rs4 ft_opq2 \"r['credentials'][0].get('opaque') is True and 'expires' not in r['credentials'][0]\""
+    # the user, found through an MCP server's metadata
+    MR="require warden 1.31\ntrust mcp-resource $AB/mcp\n$LIBS"
+    put "$A/utok" "$(tok "$AB/as" "$AB/mcp" 3600)"
+    g4 mr_as "$MR" --on-behalf-of "$A/utok"
+    check "a user token from an authorization server the resource's metadata names (RFC 9728, RFC 8414): verified" ok4 mr_as
+    check "run_start names the issuer found, the resource it was found through, and its URL as the audience" \
+        rs4 mr_as "(lambda u: (u['issuer'], u['mcp_resource'], u['audience'], u['policy_line']))(r['on_behalf_of']['user']) == ('$AB/as', '$AB/mcp', '$AB/mcp', 2)"
+    check "the audit accepts it" python3 "$HERE/tools/varek_audit.py" --policy "$OUT/mr_as.pol" --checker "$CERT" "$OUT/mr_as.out"
+    put "$A/utok" "$(tok "$AB/oidc" "$AB/mcp" 3600)"
+    g4 mr_oidc "$MR" --on-behalf-of "$A/utok"
+    check "... from one with OpenID discovery only: verified" ok4 mr_oidc
+    put "$A/utok" "$(tok "$AB/liar" "$AB/mcp" 3600)"
+    g4 mr_liar "$MR" --on-behalf-of "$A/utok"
+    check "metadata whose issuer is not the identifier it was fetched for: refused" no4 mr_liar "$AB/liar: its metadata names another issuer"
+    put "$A/utok" "$(tok "$AB/as" "$AB/other" 3600)"
+    g4 mr_aud "$MR" --on-behalf-of "$A/utok"
+    check "a user token for another audience: refused" no4 mr_aud "does not hold $AB/mcp"
+    put "$A/utok" "$(tok "$AB/as2" "$AB/bad" 3600)"
+    g4 mr_bad "require warden 1.31\ntrust mcp-resource $AB/bad\n$LIBS" --on-behalf-of "$A/utok"
+    check "resource metadata naming another resource: its servers are not trusted" no4 mr_bad "names another resource"
+    put "$A/utok" "$(tok "$AB/as" "api://mcp-tools" 3600)"
+    g4 mr_audline "require warden 1.31\ntrust mcp-resource $AB/mcp audience api://mcp-tools\n$LIBS" --on-behalf-of "$A/utok"
+    check "with the line's audience: a token for it is verified" \
+        sh -c "$(declare -f ok4 rs4); OUT='$OUT'; ok4 mr_audline && rs4 mr_audline \"r['on_behalf_of']['user']['audience'] == 'api://mcp-tools'\""
+    F4="$HERE/tests/v1270_forge.py"; AUD4="$HERE/tools/varek_audit.py"
+    python3 "$F4" "$OUT/mr_as.out" "$OUT/g41.log" "u = next(r for r in recs if isinstance(r, dict) and r.get('event') == 'run_start')['on_behalf_of']['user']; u['mcp_resource'] = 'https://localhost:1/x'"
+    check "the audit refuses a user found through a resource the policy does not trust" \
+        sh -c "! python3 '$AUD4' --policy '$OUT/mr_as.pol' --checker '$CERT' '$OUT/g41.log' > '$OUT/g41.aud' 2>&1 && grep -q 'which the policy does not trust' '$OUT/g41.aud'"
+    # the agent's own bearer tokens, and the run's MCP token on its calls only
+    MTV="$(tok "$AB/as" "$U" 3600)"; put "$X/mt" "$MTV"
+    put "$A/utok" "$(tok "$AB/as" "$AB/mcp" 3600)"
+    python3 - "$X/toks.json" "$(tok "$AB/as" "$U" 600)" "$(tok "$AB/as" "https://mcp.example.com:$PS/other" 600)" \
+        "$(tok "$AB/as" "$U" -60)" "$(cat "$A/utok")" <<'PY'
+import base64, json, sys
+b = lambda s: base64.urlsafe_b64encode(s.encode()).rstrip(b"=").decode()
+json.dump({"t_good": sys.argv[2], "t_other": sys.argv[3], "t_expired": sys.argv[4], "t_opaque": "opaque-abc-123",
+           "t_malformed": b('{"alg":"ES256"}') + "." + b('{"aud":"a","aud":"b"}') + ".c2ln", "t_user": sys.argv[5]},
+          open(sys.argv[1], "w"))
+PY
+    chmod 644 "$X/toks.json"
+    POL4="$OUT/tok.policy"
+    { printf 'require warden 1.31\nproxy inspect\nproxy ports %s\ncredential mt from file:%s/mt audience=%s\n' "$PS" "$X" "$U"
+      printf 'trust mcp-resource %s/mcp\nallow host mcp.example.com\n' "$AB"
+      printf 'allow mcp %s tools/call get_* credential=mt\nallow mcp %s tools/list\n' "$U" "$U"
+      printf 'allow mcp https://mcp.example.com:%s/other tools/list\nallow request GET https://mcp.example.com:%s/plain\n' "$PS" "$PS"
+      printf '%b' "$LIBS"; printf 'allow path exact %s/agent.py readonly\nallow path exact %s/toks.json readonly\n' "$X" "$X"
+    } > "$POL4"
+    : > "$OUT/got.jsonl"
+    env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$POL4" --secrets-conf "$A/conf" --on-behalf-of "$A/utok" \
+        --dns-server "127.0.0.1:$DP" --trust-bundle "$X/bundle.pem" -- \
+        /usr/bin/python3 "$X/agent.py" "$PS" tokens "$X/toks.json" > "$OUT/t4.out" 2> "$OUT/t4.log"
+    cut -c1-150 "$OUT/t4.out" | sed 's/^/     /'
+    for t in t_good t_opaque ph_get ph_other ph_plain; do check "allowed ($t)" said_in t4 "$t" "HTTP/1.1 200 OK"; done
+    for t in t_other t_expired t_malformed t_user; do check "refused ($t): 403" said_in t4 "$t" "HTTP/1.1 403 Forbidden"; done
+    r4() { python3 -c 'import json,sys
+M = {}
+for l in open(sys.argv[1], errors="replace"):
+    if l.startswith("{") and "\"net.mcp\"" in l:
+        r = json.loads(l); M.setdefault(r.get("rpc_id"), []).append(r)
+sys.exit(0 if eval(sys.argv[2], {"M": M}) else 1)' "$OUT/t4.log" "$1"; }
+    check "the refusals' rules: another audience, expired, malformed, the user's token" \
+        r4 "sorted(r['rule'] for r in M['30'] if r['decision_final'] == 'DENY') == ['mcp_token_audience', 'mcp_token_expired', 'mcp_token_malformed', 'mcp_token_user']"
+    check "each call records what kind of token it carried, never the token" \
+        r4 "sorted(r['token'] for r in M['30']) == ['jwt', 'jwt', 'jwt', 'jwt', 'malformed', 'opaque'] and all(r['token'] == 'placeholder' for r in M['31'] + M['32'])"
+    check "the run's MCP token reached the server once: in the call its rule names" \
+        sh -c "[ \"\$(grep -c -- '$MTV' '$OUT/got.jsonl')\" = 1 ] && grep -- '$MTV' '$OUT/got.jsonl' | grep -q 'tools/call'"
+    check "... not on another MCP endpoint or a plain request (they got the placeholder)" \
+        sh -c "grep '/other' '$OUT/got.jsonl' | grep -q 'Bearer varek_ph_mt_' && grep 'GET /plain' '$OUT/got.jsonl' | grep -q 'Bearer varek_ph_mt_'"
+    check "no token value is in the verdict stream (the run's, the user's, the agent's)" \
+        python3 -c "import json,sys; log = open('$OUT/t4.log').read(); vals = list(json.load(open('$X/toks.json')).values()) + ['$MTV', open('$A/utok').read().strip()]; sys.exit(1 if any(v in log for v in vals) else 0)"
+    check "the audit accepts the run" python3 "$HERE/tools/varek_audit.py" --policy "$POL4" --checker "$CERT" "$OUT/t4.log"
+    python3 "$F4" "$OUT/t4.log" "$OUT/g42.log" "g = next(r for r in recs if isinstance(r, dict) and r.get('rule') == 'mcp_token_audience'); g['token'] = 'placeholder'"
+    check "the audit refuses a token refusal on a call that carried no token of that kind" \
+        sh -c "! python3 '$AUD4' --policy '$POL4' --checker '$CERT' '$OUT/g42.log' > '$OUT/g42.aud' 2>&1 && grep -q 'is not one its rule' '$OUT/g42.aud'"
 fi
 
 echo

@@ -39,6 +39,17 @@ static void hdr(const char *label, const char *v, int ok, const char *want_v) {
     }
 }
 
+/* v1.31 step 5: a bearer token read as a JWT (rc 1), opaque (0) or refused (-1) */
+static void jwt(const char *label, const char *t, int rc, uint32_t naud, const char *aud0, long long exp, int over) {
+    mj_jwt_t j;
+    char why[128] = "";
+    int r = mj_jwt(t, strlen(t), &j, why, sizeof why);
+    checks++;
+    bool good = r == rc && (r != 1 || (j.naud == naud && (!aud0 || !strcmp(j.aud[0], aud0)) &&
+                                       (exp < 0 ? !j.has_exp : j.has_exp && j.exp == exp) && j.aud_over == (over != 0)));
+    if (!good) { printf("  FAIL   %s (rc %d, %s)\n", label, r, why); fails++; }
+}
+
 int main(int argc, char **argv) {
     long n = argc > 1 ? atol(argv[1]) : 200000;
     const char *C = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"get_issue\",\"arguments\":{\"n\":1}}}";
@@ -110,6 +121,21 @@ int main(int argc, char **argv) {
         want("nesting of 66", deep, 0, 0, 0, 0);
     }
 
+    jwt("a JWT, aud a string", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJodHRwczovL21jcC5leGFtcGxlLmNvbS9tY3AiLCJleHAiOjE5MDAwMDAwMDB9.c2ln", 1, 1, "https://mcp.example.com/mcp", 1900000000LL, 0);
+    jwt("a JWT, aud an array", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiYSIsImh0dHBzOi8vbWNwLmV4YW1wbGUuY29tL21jcCJdLCJleHAiOjV9.c2ln", 1, 2, "a", 5LL, 0);
+    jwt("a JWT without exp or aud", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1In0.c2ln", 1, 0, NULL, -1LL, 0);
+    jwt("a JWT, an aud of nine", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiMSIsIjIiLCIzIiwiNCIsIjUiLCI2IiwiNyIsIjgiLCI5Il19.c2ln", 1, 8, "1", -1LL, 1);
+    jwt("a JWT, aud a number", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOjd9.c2ln", 1, 0, NULL, -1LL, 1);
+    jwt("a JWT, an empty signature", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJ4In0.", 1, 1, "x", -1LL, 0);
+    jwt("a JWT, two aud", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhIiwiYXVkIjoiYiJ9.c2ln", -1, 0, NULL, -1LL, 0);
+    jwt("a JWT, aud through an escape", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhIiwiXHUwMDYxdWQiOiJiIn0.c2ln", -1, 0, NULL, -1LL, 0);
+    jwt("a JWT, exp a fraction", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjEuNX0.c2ln", -1, 0, NULL, -1LL, 0);
+    jwt("a JWT, claims not an object", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.WzFd.c2ln", -1, 0, NULL, -1LL, 0);
+    jwt("a JWT, a header without alg", "eyJ0eXAiOiJKV1QifQ.e30.c2ln", -1, 0, NULL, -1LL, 0);
+    jwt("a JWT, padding in a part", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhIjoxfQ==.x", 0, 0, NULL, -1LL, 0);
+    jwt("opaque: no dots", "abcdef0123", 0, 0, NULL, -1LL, 0);
+    jwt("opaque: three parts, not JSON", "abcd.efgh.ijkl", 0, 0, NULL, -1LL, 0);
+    jwt("opaque: four parts", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.e30.c2ln.x", 0, 0, NULL, -1LL, 0);
     hdr("plain", "get_issue", 1, "get_issue");
     hdr("base64", "=?base64?SGVsbG8sIOS4lueVjA==?=", 1, "Hello, \xe4\xb8\x96\xe7\x95\x8c");
     hdr("base64 of the sentinel itself", "=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?=", 1, "=?base64?literal?=");
@@ -152,6 +178,30 @@ int main(int argc, char **argv) {
         }
     }
     free(b);
+    /* step 5: mutated tokens: no crash, and a JWT read keeps its bounds */
+    {
+        static const char T[] = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiYSIsImh0dHBzOi8vbWNwLmV4YW1wbGUuY29tL21jcCJdLCJleHAiOjV9.c2ln";
+        char t[sizeof T + 64];
+        static const char al[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.=";
+        for (long k = 0; k < n / 4; k++) {
+            size_t tl = sizeof T - 1;
+            memcpy(t, T, tl);
+            int m = 1 + rand() % 3;
+            for (int j = 0; j < m; j++) {
+                size_t at = (size_t)rand() % tl;
+                int op = rand() % 3;
+                if (op == 0) t[at] = al[rand() % (sizeof al - 1)];
+                else if (op == 1 && tl > 1) { memmove(t + at, t + at + 1, tl - at - 1); tl--; }
+                else if (tl < sizeof t - 1) { memmove(t + at + 1, t + at, tl - at); t[at] = al[rand() % (sizeof al - 1)]; tl++; }
+            }
+            mj_jwt_t jw;
+            char why[128];
+            if (mj_jwt(t, tl, &jw, why, sizeof why) == 1) {
+                checks++;
+                if (jw.naud > MJ_AUD_MAX) { printf("  FAIL   token mutation %ld: %u audiences\n", k, jw.naud); fails++; }
+            }
+        }
+    }
     printf("mcp_json_test: %d checks, %ld mutated inputs (%ld still calls), %s\n", checks, n, accepted,
            fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;

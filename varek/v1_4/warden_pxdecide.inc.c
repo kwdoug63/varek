@@ -861,6 +861,38 @@ static const char *px_json_str(const char *s, size_t cap, bool *cut) {
  * headers disagree with its body, or whose body is over the limit is
  * refused. 0, or -1 (a report the proxy should not have sent: the run
  * stops). */
+/* v1.31 step 5 (D6): the bearer token the agent sends on an MCP call, as
+ * the proxy read it (its claims unverified: they can only refuse). The
+ * rule that refuses it, or NULL (a placeholder is the swap's; an opaque
+ * token is decided by the rules alone). */
+static const char *px_token_refused(const struct px_open *o, const struct wp_mcpreq *m, char *why, size_t wn) {
+    if (m->token == WP_TOK_NONE || m->token == WP_TOK_PLACEHOLDER) return NULL;
+    if (g_identity.has_user) {                /* a copy of the run's user token would be passthrough */
+        char hx[65];
+        sodium_bin2hex(hx, sizeof hx, m->token_sha256, sizeof m->token_sha256);
+        if (!strcmp(hx, g_identity.token_sha256)) {
+            snprintf(why, wn, "its bearer token is the run's user token, which no call may pass on");
+            return "mcp_token_user";
+        }
+    }
+    if (m->token == WP_TOK_MALFORMED) {
+        snprintf(why, wn, "its bearer token is not a readable JWT: %.50s", m->token_why);
+        return "mcp_token_malformed";
+    }
+    if (m->token != WP_TOK_JWT) return NULL;
+    bool named = false;
+    for (uint32_t k = 0; k < m->naud && !named; k++) named = mcp_aud_names(o->mcp_url, m->aud[k]);
+    if (!named) {
+        snprintf(why, wn, "its bearer token is not for this server (its audience does not name it)");
+        return "mcp_token_audience";
+    }
+    if (m->has_exp && m->exp <= (int64_t)time(NULL)) {
+        snprintf(why, wn, "its bearer token has expired");
+        return "mcp_token_expired";
+    }
+    return NULL;
+}
+
 static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
     struct px_open *o = NULL;
     for (size_t k = 0; k < g_px_nopen; k++) if (g_px_open[k].id == m->id) o = &g_px_open[k];
@@ -868,8 +900,12 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
         !memchr(m->why, 0, sizeof m->why) || !memchr(m->method, 0, sizeof m->method) ||
         !memchr(m->name, 0, sizeof m->name) || !memchr(m->rpc_id, 0, sizeof m->rpc_id) ||
         !memchr(m->traceparent, 0, sizeof m->traceparent) || !memchr(m->proto, 0, sizeof m->proto) ||
-        (m->ok == WP_MCP_OK && m->body_len > o->mcp_limit))
+        (m->ok == WP_MCP_OK && m->body_len > o->mcp_limit) ||
+        /* step 5: the token's report */
+        m->token > WP_TOK_MALFORMED || m->naud > WP_AUD_MAX || m->aud_over > 1 || m->has_exp > 1 ||
+        !memchr(m->token_why, 0, sizeof m->token_why) || (m->token != WP_TOK_JWT && (m->naud || m->has_exp)))
         return -1;
+    for (uint32_t k = 0; k < WP_AUD_MAX; k++) if (!memchr(m->aud[k], 0, sizeof m->aud[k])) return -1;
     o->mcp_seq = 0;
     struct action *a = calloc(1, sizeof *a);
     if (!a) return -1;
@@ -894,10 +930,14 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
     char why[96];
     uint64_t maxb = 0;
     for (char *c = m->why; *c; c++) if (*c < ' ' || *c > '~' || *c == '"' || *c == '\\') *c = '?';
+    const char *tok_rule = m->ok == WP_MCP_OK ? px_token_refused(o, m, why, sizeof why) : NULL;
     if (m->ok != WP_MCP_OK) {
         d_raw = d_final = DEC_DENY;
         rule = m->ok == WP_MCP_HEADERS ? "mcp_header_mismatch" : m->ok == WP_MCP_OVER ? "max_body" : "mcp_unreadable";
         snprintf(why, sizeof why, "%s", m->why[0] ? m->why : "the call could not be read");
+    } else if (tok_rule) {
+        d_raw = d_final = DEC_DENY;
+        rule = tok_rule;
     } else {
         d_raw = policy_decide(p, a);
         d_final = d_raw == DEC_ALLOW ? DEC_ALLOW : DEC_DENY;
@@ -915,12 +955,22 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
                 rule = "max_body";
             }
         }
+        /* v1.31 step 5: an MCP token past its expiry is not released (the
+         * store is to hold a current one; VAREK does not refresh it, D8) */
+        int ce = d_final == DEC_ALLOW ? p->v.rules[a->rule_index].cred : 0;
+        if (ce > 0 && p->v.creds[ce - 1].audience[0] && g_cred_meta[ce - 1].exp > 0 &&
+            g_cred_meta[ce - 1].exp <= (int64_t)time(NULL)) {
+            d_final = DEC_DENY;
+            rule = "credential_expired";
+        }
         if (d_final == DEC_ALLOW) snprintf(why, sizeof why, "allowed");
         else if (!strcmp(rule, "max_body"))
             snprintf(why, sizeof why, "its body is over max_body=%llu (policy line %d)", (unsigned long long)maxb,
                      a->policy_line);
         else if (!strcmp(rule, "revoked")) snprintf(why, sizeof why, "the run was revoked (varek revoke)");
         else if (!strcmp(rule, "certificate_refused")) snprintf(why, sizeof why, "its certificate was refused");
+        else if (!strcmp(rule, "credential_expired"))
+            snprintf(why, sizeof why, "the MCP token its rule (line %d) names has expired", a->policy_line);
         else if (d_raw == DEC_DENY) snprintf(why, sizeof why, "the policy denies it (line %d)", a->policy_line);
         else snprintf(why, sizeof why, "no mcp rule allows it");
     }
@@ -951,6 +1001,15 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
     } else {
         el = strlen(a->extra);
         snprintf(a->extra + el, sizeof a->extra - el, "\"mcp_error\":\"%s\",", m->why);
+    }
+    if (m->token) {                                      /* step 5: what kind of token, never the token */
+        static const char *const kTok[] = { "", "placeholder", "jwt", "opaque", "malformed" };
+        el = strlen(a->extra);
+        snprintf(a->extra + el, sizeof a->extra - el, "\"token\":\"%s\",", kTok[m->token]);
+        if (m->has_exp) {
+            el = strlen(a->extra);
+            snprintf(a->extra + el, sizeof a->extra - el, "\"token_expires\":%lld,", (long long)m->exp);
+        }
     }
     if (m->proto[0]) {
         el = strlen(a->extra);

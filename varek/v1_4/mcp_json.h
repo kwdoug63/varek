@@ -49,6 +49,26 @@ typedef struct {
  * phrase, printable ASCII). */
 int mj_call(const uint8_t *body, size_t n, mj_call_t *out, char *why, size_t wn);
 
+/* v1.31 step 5: a bearer token's claims, read without checking its
+ * signature (what they say can only refuse a call) */
+#define MJ_AUD_MAX 8
+#define MJ_AUD_LEN 512
+typedef struct {
+    uint32_t naud;                  /* the audiences read ("aud" a string: 1) */
+    bool     aud_over;              /* more than MJ_AUD_MAX, one of MJ_AUD_LEN bytes or more, or not a string */
+    bool     has_exp;
+    int64_t  exp;
+    char     aud[MJ_AUD_MAX][MJ_AUD_LEN];
+} mj_jwt_t;
+
+/* Read token tok[0, n) as a JWT. 1: it is one (three base64url parts, the
+ * first decoding to a JSON object), and its header (naming "alg") and
+ * claims are each one JSON object, read as strictly as a call: no
+ * duplicate members, UTF-8 only, at most 64 deep; "exp", if given, a whole
+ * number. 0: it is not in a JWT's form (an opaque token). -1: it is in a
+ * JWT's form but cannot be read so (why). */
+int mj_jwt(const char *tok, size_t n, mj_jwt_t *out, char *why, size_t wn);
+
 /* Decode an Mcp-Name or Mcp-Method header value as the transport says:
  * "=?base64?B64?=" is the Base64 of the value (padding required, no other
  * bytes); anything else is the value itself. The value written to out is

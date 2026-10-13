@@ -43,6 +43,8 @@
 // below.
 
 #include "warden_secrets.h"
+#include "mcp_json.h"             /* v1.31: an MCP token's claims */
+#include "mcp_aud.h"
 
 #include <ctype.h>
 #include <stddef.h>
@@ -80,6 +82,7 @@
 #define STORE_AWSSM 3
 
 #define RESP_MAX    (1u << 20)        /* a store's response, at most 1 MiB */
+#define LEEWAY_S    60                /* v1.28.1: a token's times; v1.31: an MCP token's expiry */
 #define IO_TIMEOUT_MS 10000
 
 static int g_ctl = 3;
@@ -164,11 +167,58 @@ static void report_file(const char *path, uint32_t kind) {
     ctl_send(&f, sizeof f);
 }
 
+/* v1.31 step 5: each credential that is an MCP token: its server's URL
+ * (canonical) and whether it is opaque */
+static struct { char aud[1025]; bool opaque; } g_mcpcred[WS_MAX_CREDS];
+
+/* v1.31 step 5: an MCP token, as fetched (credential idx's value): a JWT whose
+ * aud names its server and whose exp is at least 60 s away (its signature is
+ * the server's to check; an opaque one is checked by none of this). NULL and
+ * its exp (-1: opaque), or why not. */
+static const char *mcp_token_check(unsigned idx, int64_t *exp) {
+    static char w[256];
+    *exp = -1;
+    if (g_mcpcred[idx].opaque) return NULL;
+    mj_jwt_t *j = calloc(1, sizeof *j);
+    if (!j) return "out of memory";
+    char jw[72] = "";
+    int r = mj_jwt((const char *)g_arena + g_val[idx].off, g_val[idx].len, j, jw, sizeof jw);
+    const char *bad = NULL;
+    int64_t now = (int64_t)time(NULL);
+    bool named = false;
+    for (uint32_t k = 0; r == 1 && k < j->naud && !named; k++) named = mcp_aud_names(g_mcpcred[idx].aud, j->aud[k]);
+    if (r == 0) bad = "it is an MCP token (audience=) that is not a JWT, and its line does not say opaque";
+    else if (r < 0) { snprintf(w, sizeof w, "it is an MCP token in a JWT's form that cannot be read: %s", jw); bad = w; }
+    else if (!named) { snprintf(w, sizeof w, "its audience (aud) does not name %.200s", g_mcpcred[idx].aud); bad = w; }
+    else if (!j->has_exp) bad = "it is an MCP token without an expiry (exp)";
+    else if (j->exp <= now) { snprintf(w, sizeof w, "it expired %lld s ago", (long long)(now - j->exp)); bad = w; }
+    else if (j->exp < now + LEEWAY_S) { snprintf(w, sizeof w, "it expires in %lld s, under 60 s", (long long)(j->exp - now)); bad = w; }
+    else if (j->exp >= (int64_t)1 << 53) bad = "its expiry (exp) is past any date this Warden records";
+    else *exp = j->exp;
+    free(j);
+    return bad;
+}
+
 static void report(unsigned idx, bool ok, const char *version, size_t len, const char *why) {
     struct ws_result r;
     memset(&r, 0, sizeof r);
     r.type = WS_MSG_RESULT;
     r.index = idx;
+    r.exp = -1;
+    /* v1.31: an MCP token is checked before it is reported fetched; one
+     * that fails is cleared and reported as not */
+    if (ok && idx < WS_MAX_CREDS && g_mcpcred[idx].aud[0]) {
+        const char *bad = mcp_token_check(idx, &r.exp);
+        if (bad) {
+            OPENSSL_cleanse(g_arena + g_val[idx].off, WS_MAX_VALUE);
+            g_val[idx].len = 0;
+            ok = false;
+            why = bad;
+            version = NULL;
+            len = 0;
+            r.exp = -1;
+        }
+    }
     r.ok = ok;
     r.len = (uint32_t)len;
     if (version) snprintf(r.version, sizeof r.version, "%s", version);
@@ -1124,9 +1174,16 @@ static int leases_wait(void) {
 static struct ws_issuer g_iss[WS_MAX_ISSUERS];
 static struct ws_spiffe g_spf[WS_MAX_SPIFFE];
 static uint32_t g_niss, g_nspf;
+/* v1.31: the MCP resources trusted for the user's token, and the
+ * authorization servers found through them */
+static struct ws_mcpres g_mcpres[WS_MAX_MCPRES];
+static uint32_t g_nmcpres;
+#define AS_PER_RESOURCE 4
+static struct { char iss[256]; char jwks[1025]; uint32_t res; } g_found[WS_MAX_MCPRES * AS_PER_RESOURCE];
+static uint32_t g_nfound;
+static char g_found_why[400];             /* the first thing that failed, for a token none of them issued */
+static void discover_mcp(void);
 static struct ws_identity g_id;
-
-#define LEEWAY_S 60
 
 /* base64url, unpadded, strict; the decoded length, or -1 */
 static long b64url(const char *s, size_t n, unsigned char *out, size_t cap) {
@@ -1418,15 +1475,26 @@ static int verify_token_parts(char *why, size_t wn) {
     if (jgets(pay, pe, "iss", iss, sizeof iss) != 1) { snprintf(why, wn, "it has no issuer (iss)"); return -1; }
     uint32_t ix = g_niss;
     for (uint32_t i = 0; i < g_niss; i++) if (!strcmp(g_iss[i].iss, iss)) { ix = i; break; }
-    if (ix == g_niss) {
-        snprintf(why, wn, "its issuer %s is not one the policy trusts", shown(iss, sb, sizeof sb));
+    /* v1.31: else an authorization server of a trusted MCP resource */
+    int fx = -1;
+    if (ix == g_niss && g_nmcpres) {
+        discover_mcp();
+        for (uint32_t i = 0; i < g_nfound && fx < 0; i++) if (!strcmp(g_found[i].iss, iss)) fx = (int)i;
+    }
+    if (ix == g_niss && fx < 0) {
+        snprintf(why, wn, "its issuer %s is not one the policy trusts%s%.300s%s", shown(iss, sb, sizeof sb),
+                 g_found_why[0] ? " (trust mcp-resource: " : "", g_found_why, g_found_why[0] ? ")" : "");
         return -1;
     }
-    /* its keys: the policy's jwks URL, or the discovery document's */
+    const char *want_aud = fx >= 0 ? (g_mcpres[g_found[fx].res].aud[0] ? g_mcpres[g_found[fx].res].aud
+                                                                      : g_mcpres[g_found[fx].res].url)
+                                   : g_iss[ix].aud;
+    /* its keys: the policy's jwks URL, or the discovery document's (v1.31:
+     * or the authorization server's metadata's) */
     char *doc = NULL, *ks = NULL;
     size_t dl = 0, kl = 0;
     char jwks[1100];
-    snprintf(jwks, sizeof jwks, "%s", g_iss[ix].jwks);
+    snprintf(jwks, sizeof jwks, "%s", fx >= 0 ? g_found[fx].jwks : g_iss[ix].jwks);
     if (!jwks[0]) {
         char disc[400], ub[1100];
         size_t il = strlen(iss);
@@ -1496,13 +1564,13 @@ static int verify_token_parts(char *why, size_t wn) {
     if (c == 1) {
         const char *ag = jget(pay, pe, "aud");
         const char *av = ag ? jws(ag, pe) : NULL;
-        if (av && *av == '"') aud_ok = jgets(pay, pe, "aud", aud, sizeof aud) == 1 && !strcmp(aud, g_iss[ix].aud);
+        if (av && *av == '"') aud_ok = jgets(pay, pe, "aud", aud, sizeof aud) == 1 && !strcmp(aud, want_aud);
         else for (const char *x = jarr_first(av, pe); x && !aud_ok; x = jarr_next(x, pe)) {
             long n = jstr(x, pe, aud, sizeof aud - 1);
-            if (n >= 0) { aud[n] = '\0'; aud_ok = (size_t)n == strlen(g_iss[ix].aud) && !strcmp(aud, g_iss[ix].aud); }
+            if (n >= 0) { aud[n] = '\0'; aud_ok = (size_t)n == strlen(want_aud) && !strcmp(aud, want_aud); }
         }
     }
-    if (!aud_ok) { snprintf(why, wn, "its audience (aud) does not hold %s", g_iss[ix].aud); return -1; }
+    if (!aud_ok) { snprintf(why, wn, "its audience (aud) does not hold %s", want_aud); return -1; }
     int64_t exp = 0, nbf = -1, iat = -1, now = (int64_t)time(NULL);
     if (jgetn(pay, pe, "exp", &exp) != 1) { snprintf(why, wn, "it has no expiry (exp)"); return -1; }
     if (exp <= now) { snprintf(why, wn, "it expired %lld s ago", (long long)(now - exp)); return -1; }
@@ -1542,7 +1610,12 @@ static int verify_token_parts(char *why, size_t wn) {
         g_id.nact = depth + 1;
     }
     g_id.has_user = 1;
-    g_id.issuer = ix;
+    g_id.issuer = fx >= 0 ? 0 : ix;
+    if (fx >= 0) {                                       /* v1.31 */
+        g_id.mcp_resource = g_found[fx].res + 1;
+        snprintf(g_id.found_iss, sizeof g_id.found_iss, "%s", iss);
+        snprintf(g_id.found_aud, sizeof g_id.found_aud, "%s", want_aud);
+    }
     g_id.exp = exp;
     g_id.iat = iat;
     g_id.nbf = nbf;
@@ -1550,6 +1623,94 @@ static int verify_token_parts(char *why, size_t wn) {
     snprintf(g_id.kid, sizeof g_id.kid, "%s", kid);
     sha256_hex(tok, tl, g_id.token_sha256);
     return 0;
+}
+
+/* v1.31 step 5: a .well-known URL for id (an https URL with no query):
+ * the well-known path inserted between its authority and its path (RFC 9728
+ * section 3.1, RFC 8414 section 3.1), or appended (OpenID discovery). */
+static int well_known(const char *id, const char *wk, bool append, char *out, size_t cap) {
+    const char *auth = strncmp(id, "https://", 8) ? NULL : id + 8;
+    if (!auth) return -1;
+    const char *path = strchr(auth, '/');
+    size_t al = path ? (size_t)(path - id) : strlen(id);
+    if (!path || !strcmp(path, "/")) path = "";
+    int n;
+    if (append) {
+        size_t il = strlen(id);
+        while (il && id[il - 1] == '/') il--;
+        n = snprintf(out, cap, "%.*s/.well-known/%s", (int)il, id, wk);
+    } else n = snprintf(out, cap, "%.*s/.well-known/%s%s", (int)al, id, wk, path);
+    return n > 0 && (size_t)n < cap ? 0 : -1;
+}
+
+/* v1.31 step 5: the authorization servers of each trusted MCP resource:
+ * its protected resource metadata (RFC 9728), whose "resource" must be the
+ * URL as written; for each of its first AS_PER_RESOURCE
+ * authorization_servers, its metadata (RFC 8414, else OpenID discovery),
+ * whose "issuer" must be identical to the identifier it was fetched for,
+ * and its jwks_uri. What fails is kept for the refusal's reason. */
+static void discover_mcp(void) {
+    char sb[128];
+    for (uint32_t k = 0; k < g_nmcpres; k++) {
+        const char *url = g_mcpres[k].url;
+        char prm[1100], ub[1100];
+        char *doc = NULL;
+        size_t dl = 0;
+        if (well_known(url, "oauth-protected-resource", false, prm, sizeof prm) < 0) continue;
+        if (get_json(prm, &doc, &dl, ub, sizeof ub) < 0) {
+            if (!g_found_why[0]) snprintf(g_found_why, sizeof g_found_why, "%.120s: its metadata: %.250s", url, ub);
+            continue;
+        }
+        char res[300];
+        int rr = jgets(doc, doc + dl, "resource", res, sizeof res);
+        if (rr != 1 || strcmp(res, url)) {
+            if (!g_found_why[0]) snprintf(g_found_why, sizeof g_found_why, "%.120s: its metadata names another resource (%s)",
+                                          url, rr == 1 ? shown(res, sb, sizeof sb) : "none");
+            free(doc);
+            continue;
+        }
+        const char *ar = jget(doc, doc + dl, "authorization_servers");
+        int nas = 0;
+        for (const char *x = ar ? jarr_first(ar, doc + dl) : NULL; x && nas < AS_PER_RESOURCE; x = jarr_next(x, doc + dl), nas++) {
+            char as[256], amd[1100], aw[1100];
+            long al = jstr(x, doc + dl, as, sizeof as - 1);
+            if (al <= 0) continue;
+            as[al] = '\0';
+            if (!printable(as)) continue;
+            char *md = NULL;
+            size_t ml = 0;
+            bool got = false;
+            for (int pass = 0; pass < 2 && !got; pass++) {
+                if (well_known(as, pass ? "openid-configuration" : "oauth-authorization-server", pass == 1, amd, sizeof amd) < 0)
+                    break;
+                got = get_json(amd, &md, &ml, aw, sizeof aw) == 0;
+            }
+            if (!got) {
+                if (!g_found_why[0]) snprintf(g_found_why, sizeof g_found_why, "authorization server %.100s: %.250s",
+                                              shown(as, sb, sizeof sb), aw);
+                continue;
+            }
+            char iss[256], jwks[1025];
+            int r1 = jgets(md, md + ml, "issuer", iss, sizeof iss), r2 = jgets(md, md + ml, "jwks_uri", jwks, sizeof jwks);
+            free(md);
+            if (r1 != 1 || strcmp(iss, as)) {
+                if (!g_found_why[0]) snprintf(g_found_why, sizeof g_found_why, "authorization server %.100s: its metadata "
+                                              "names another issuer", shown(as, sb, sizeof sb));
+                continue;
+            }
+            if (r2 != 1) {
+                if (!g_found_why[0]) snprintf(g_found_why, sizeof g_found_why, "authorization server %.100s: its metadata "
+                                              "has no jwks_uri", shown(as, sb, sizeof sb));
+                continue;
+            }
+            if (g_nfound < sizeof g_found / sizeof *g_found) {
+                snprintf(g_found[g_nfound].iss, sizeof g_found[g_nfound].iss, "%s", iss);
+                snprintf(g_found[g_nfound].jwks, sizeof g_found[g_nfound].jwks, "%s", jwks);
+                g_found[g_nfound++].res = k;
+            }
+        }
+        free(doc);
+    }
 }
 
 /* ... and nothing of it stays, whatever came of the checks */
@@ -1749,7 +1910,8 @@ int main(int argc, char **argv) {
     static struct ws_setup su;
     if (ctl_recv(&su, sizeof su) != (ssize_t)sizeof su || su.type != WS_MSG_SETUP || su.ncreds > WS_MAX_CREDS ||
         !memchr(su.conf, '\0', sizeof su.conf) || !memchr(su.token, '\0', sizeof su.token) ||
-        !memchr(su.svid, '\0', sizeof su.svid) || su.nissuers > WS_MAX_ISSUERS || su.nspiffe > WS_MAX_SPIFFE)
+        !memchr(su.svid, '\0', sizeof su.svid) || su.nissuers > WS_MAX_ISSUERS || su.nspiffe > WS_MAX_SPIFFE ||
+        su.nmcpres > WS_MAX_MCPRES || (su.nmcpres && !su.token[0] && !su.svid[0]))
         return 2;
     /* v1.28.1: the trusted issuers and trust domains */
     g_niss = su.nissuers;
@@ -1764,13 +1926,22 @@ int main(int argc, char **argv) {
             g_spf[i].index != i || !memchr(g_spf[i].domain, '\0', sizeof g_spf[i].domain) ||
             !memchr(g_spf[i].bundle, '\0', sizeof g_spf[i].bundle))
             return 2;
+    g_nmcpres = su.nmcpres;                   /* v1.31 */
+    for (uint32_t i = 0; i < g_nmcpres; i++)
+        if (ctl_recv(&g_mcpres[i], sizeof g_mcpres[i]) != (ssize_t)sizeof g_mcpres[i] || g_mcpres[i].type != WS_MSG_MCPRES ||
+            g_mcpres[i].index != i || !memchr(g_mcpres[i].url, '\0', sizeof g_mcpres[i].url) ||
+            !memchr(g_mcpres[i].aud, '\0', sizeof g_mcpres[i].aud))
+            return 2;
     bool want_id = su.token[0] || su.svid[0];
     static struct ws_cred cr[WS_MAX_CREDS];
     bool need_vault = false, need_aws = false;
     for (uint32_t i = 0; i < su.ncreds; i++) {
         if (ctl_recv(&cr[i], sizeof cr[i]) != (ssize_t)sizeof cr[i] || cr[i].type != WS_MSG_CRED || cr[i].index != i ||
-            !memchr(cr[i].ref, '\0', sizeof cr[i].ref) || cr[i].store < STORE_FILE || cr[i].store > STORE_AWSSM)
+            !memchr(cr[i].ref, '\0', sizeof cr[i].ref) || cr[i].store < STORE_FILE || cr[i].store > STORE_AWSSM ||
+            !memchr(cr[i].audience, '\0', sizeof cr[i].audience) || cr[i].opaque > 1 || (cr[i].opaque && !cr[i].audience[0]))
             return 2;
+        memcpy(g_mcpcred[i].aud, cr[i].audience, sizeof g_mcpcred[i].aud);      /* v1.31 */
+        g_mcpcred[i].opaque = cr[i].opaque;
         need_vault |= cr[i].store == STORE_VAULT;
         need_aws |= cr[i].store == STORE_AWSSM;
     }

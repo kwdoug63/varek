@@ -9,13 +9,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { CAP_NONE = 0, CAP_PARAMS, CAP_META };
+enum { CAP_NONE = 0, CAP_PARAMS, CAP_META, CAP_JHDR, CAP_CLAIMS };      /* v1.31 step 5: a JWT's parts */
 
 struct mj {
     const uint8_t *s;
     size_t n, i;
     const char *why;
     mj_call_t *out;
+    mj_jwt_t *jwt;               /* step 5: a token's claims (mj_jwt) */
     char *sb;                    /* a decoded string */
     size_t sl, scap;
     int depth;
@@ -215,8 +216,50 @@ static int keys_add(struct keys *k, const char *s, size_t n) {
 }
 
 static int value(struct mj *p, int cap);
+static int array(struct mj *p);
 
-enum { M_OTHER = 0, M_JSONRPC, M_METHOD, M_ID, M_PARAMS, M_NAME, M_URI, M_META, M_TP };
+/* step 5: a token's "aud": a string, or an array of strings; each kept
+ * (MJ_AUD_MAX of them, each under MJ_AUD_LEN bytes), or aud_over set */
+static void aud_keep(struct mj *p) {
+    mj_jwt_t *j = p->jwt;
+    if (j->naud >= MJ_AUD_MAX || p->sl >= MJ_AUD_LEN || memchr(p->sb, 0, p->sl)) { j->aud_over = true; return; }
+    memcpy(j->aud[j->naud++], p->sb, p->sl + 1);
+}
+
+static int aud(struct mj *p) {
+    uint8_t c = p->s[p->i];
+    if (c == '"') {
+        if (string(p) < 0) return -1;
+        aud_keep(p);
+        return 0;
+    }
+    if (c != '[') {                          /* not a string or an array: no audience can be read */
+        p->jwt->aud_over = true;
+        return value(p, CAP_NONE);
+    }
+    if (++p->depth > MJ_MAX_DEPTH) return fail(p, "nesting over 64 deep");
+    p->i++;
+    ws(p);
+    if (p->i < p->n && p->s[p->i] == ']') { p->i++; p->depth--; return 0; }
+    for (;;) {
+        ws(p);
+        if (p->i < p->n && p->s[p->i] == '"') {
+            if (string(p) < 0) return -1;
+            aud_keep(p);
+        } else {
+            p->jwt->aud_over = true;
+            if (value(p, CAP_NONE) < 0) return -1;
+        }
+        ws(p);
+        if (p->i < p->n && p->s[p->i] == ',') { p->i++; continue; }
+        if (p->i < p->n && p->s[p->i] == ']') { p->i++; break; }
+        return fail(p, "an array without ',' or ']'");
+    }
+    p->depth--;
+    return 0;
+}
+
+enum { M_OTHER = 0, M_JSONRPC, M_METHOD, M_ID, M_PARAMS, M_NAME, M_URI, M_META, M_TP, M_ALG, M_AUD, M_EXP };
 
 /* What member name sb is, at this level */
 static int member_kind(const struct mj *p, int cap) {
@@ -234,6 +277,11 @@ static int member_kind(const struct mj *p, int cap) {
         if (IS("_meta")) return M_META;
     } else if (cap == CAP_META) {
         if (IS("traceparent")) return M_TP;
+    } else if (cap == CAP_JHDR) {
+        if (IS("alg")) return M_ALG;
+    } else if (cap == CAP_CLAIMS) {
+        if (IS("aud")) return M_AUD;
+        if (IS("exp")) return M_EXP;
     }
 #undef IS
     return M_OTHER;
@@ -245,12 +293,13 @@ static int object(struct mj *p, int cap) {
     if (++p->depth > MJ_MAX_DEPTH) return fail(p, "nesting over 64 deep");
     struct keys ks = { 0 };
     int rc = 0;
-    bool seen_jsonrpc = false, seen_method = false;
+    bool seen_jsonrpc = false, seen_method = false, seen_alg = false;
     p->i++;
     ws(p);
     if (p->i < p->n && p->s[p->i] == '}') {
         p->i++;
         if (cap == -1) rc = fail(p, "an empty object, not a call");
+        if (cap == CAP_JHDR) rc = fail(p, "a token header naming no algorithm");
         goto done;
     }
     for (;;) {
@@ -306,6 +355,22 @@ static int object(struct mj *p, int cap) {
             bool ok = p->sl >= 1 && p->sl < sizeof o->traceparent;
             for (size_t q = 0; ok && q < p->sl; q++) ok = (uint8_t)p->sb[q] >= 0x21 && (uint8_t)p->sb[q] <= 0x7e;
             if (ok) memcpy(o->traceparent, p->sb, p->sl + 1);
+        } else if (mk == M_ALG) {
+            if (c != '"' || string(p) < 0) { rc = fail(p, "a token's \"alg\" is not a string"); break; }
+            seen_alg = true;
+        } else if (mk == M_AUD) {
+            if (aud(p) < 0) { rc = -1; break; }
+        } else if (mk == M_EXP) {
+            if (!(c == '-' || (c >= '0' && c <= '9')) || number(p) < 0) { rc = fail(p, "a token's \"exp\" is not a number"); break; }
+            int64_t v = 0;
+            bool neg = p->s[vst] == '-';
+            for (size_t q = vst + neg; q < p->i; q++) {
+                if (p->s[q] < '0' || p->s[q] > '9' || v > (INT64_MAX - 9) / 10) { rc = fail(p, "a token's \"exp\" is not a whole number of seconds"); break; }
+                v = v * 10 + (p->s[q] - '0');
+            }
+            if (rc) break;
+            p->jwt->exp = neg ? -v : v;
+            p->jwt->has_exp = true;
         } else if (value(p, CAP_NONE) < 0) { rc = -1; break; }
         ws(p);
         if (p->i < p->n && p->s[p->i] == ',') { p->i++; continue; }
@@ -313,6 +378,7 @@ static int object(struct mj *p, int cap) {
         rc = fail(p, "an object without ',' or '}'");
         break;
     }
+    if (rc == 0 && cap == CAP_JHDR && !seen_alg) rc = fail(p, "a token header naming no algorithm");
     if (rc == 0 && cap == -1 && (!seen_jsonrpc || !seen_method))
         rc = fail(p, seen_jsonrpc ? "no \"method\" (a JSON-RPC response, or not a call)" : "no \"jsonrpc\": \"2.0\"");
 done:
@@ -428,4 +494,72 @@ int mj_header_value(const char *v, size_t vn, char *out, size_t outn) {
     memcpy(out, v, vn);
     out[vn] = '\0';
     return 0;
+}
+
+/* v1.31 step 5: base64url without padding, strict (the unused bits of the
+ * last digit zero); the decoded length, or -1 */
+static long b64url(const char *s, size_t n, uint8_t *out, size_t cap) {
+    size_t o = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    if (n % 4 == 1) return -1;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = (uint8_t)s[i];
+        int v = c >= 'A' && c <= 'Z' ? c - 'A' : c >= 'a' && c <= 'z' ? c - 'a' + 26 : c >= '0' && c <= '9' ? c - '0' + 52 :
+                c == '-' ? 62 : c == '_' ? 63 : -1;
+        if (v < 0) return -1;
+        acc = acc << 6 | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (o >= cap) return -1;
+            out[o++] = (uint8_t)(acc >> bits);
+        }
+    }
+    if (bits && (acc & ((1u << bits) - 1))) return -1;
+    return (long)o;
+}
+
+/* one part, decoded, as one JSON object read strictly (cap: whose members are kept) */
+static int jwt_part(const char *s, size_t n, int cap, mj_jwt_t *out, const char **why) {
+    uint8_t *b = malloc(n ? n : 1);
+    if (!b) { *why = "out of memory"; return -1; }
+    long bl = b64url(s, n, b, n);
+    if (bl < 0) { free(b); *why = "a part that is not base64url"; return -1; }
+    struct mj p = { .s = b, .n = (size_t)bl, .jwt = out };
+    ws(&p);
+    int rc;
+    if (p.i >= p.n || b[p.i] != '{') rc = fail(&p, cap == CAP_JHDR ? "a header that is not a JSON object" : "claims that are not a JSON object");
+    else {
+        rc = object(&p, cap);
+        if (rc == 0) { ws(&p); if (p.i != p.n) rc = fail(&p, "bytes after a part's JSON object"); }
+    }
+    free(p.sb);
+    free(b);
+    if (rc < 0) *why = p.why;
+    return rc;
+}
+
+int mj_jwt(const char *tok, size_t n, mj_jwt_t *out, char *why, size_t wn) {
+    memset(out, 0, sizeof *out);
+    const char *d1 = memchr(tok, '.', n), *d2 = d1 ? memchr(d1 + 1, '.', n - (size_t)(d1 + 1 - tok)) : NULL;
+    if (!d1 || !d2 || d1 == tok || d2 == d1 + 1 || memchr(d2 + 1, '.', n - (size_t)(d2 + 1 - tok))) return 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = tok[i];
+        if (!(c == '.' || c == '-' || c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')))
+            return 0;
+    }
+    /* in a JWT's form: its header must decode to an object (else: opaque) */
+    uint8_t first[3];
+    size_t hl = (size_t)(d1 - tok);
+    if (b64url(tok, hl < 4 ? hl : 4, first, sizeof first) < 1 || first[0] != '{') return 0;
+    const char *w = NULL;
+    if (jwt_part(tok, hl, CAP_JHDR, out, &w) < 0 ||
+        jwt_part(d1 + 1, (size_t)(d2 - d1 - 1), CAP_CLAIMS, out, &w) < 0) {
+        if (wn) { size_t l = strlen(w); if (l >= wn) l = wn - 1; memcpy(why, w, l); why[l] = '\0'; }
+        mj_jwt_t z = { 0 };
+        *out = z;
+        return -1;
+    }
+    return 1;
 }
