@@ -298,6 +298,116 @@ CHANGE_FLAGS = {
 CHANGE_RULES = ("change_done", "change_failed", "chdir_continued")
 
 
+# v1.29 (section 3, D2): refusals a dry run never lets through; a record of
+# one marked "enforced":false is not the Warden's
+DRY_NEVER_LET = ("protected_object", "raw_device", "view_write_refused", "change_on_kernel_fs",
+                 "resolution_failed", "revoked", "subagent_unattributed", "subagent_threaded",
+                 "subagent_same_image", "subagent_limit", "subagent_depth", "subagent_failed",
+                 "intent_derivation_failed", "rename_directory_refused", "bad_descriptor",
+                 "bad_address", "family_refused", "unspec_refused", "dns_refused")
+
+
+def check_dry(meta, records, problems):
+    """v1.29 (section 5, D10): a dry run's stream. True if it is one.
+
+    Every record with "enforced":false is in a stream whose run_start says
+    mode dry_run, refuses (DENY: the policy's verdict, which the dry run let
+    through), and is not of a kind a dry run never lets through; none comes
+    after a revocation; run_end says the same mode and counts them. In a
+    stream that is not a dry run, no record says enforced:false."""
+    rs = meta.get("run_start", {})
+    dry = rs.get("mode") == "dry_run"
+    if rs.get("mode") not in (None, "dry_run"):
+        problems.append(f"run_start's mode {rs.get('mode')!r} is not one the Warden writes")
+    end = [meta["run_end"]] if isinstance(meta.get("run_end"), dict) else []
+    if end and end[-1].get("mode") != rs.get("mode"):
+        problems.append(f"run_end's mode {end[-1].get('mode')!r} is not run_start's {rs.get('mode')!r}")
+    # the revocation is one of the credential events; order by stream line
+    lines = meta.get("lineno", {})
+    at = lambda r: lines.get(id(r), 0)
+    rv = [at(e) for _, e in meta.get("cred_events", []) if e.get("event") == "revoked"]
+    rline = min(rv) if rv else None
+    n = 0
+    for r in list(records) + list(meta.get("dns_events", [])):
+        if not isinstance(r, dict) or "enforced" not in r:
+            continue
+        seq = r.get("seq", r.get("name"))
+        if r.get("enforced") is not False:
+            problems.append(f"seq {seq}: \"enforced\" is {r.get('enforced')!r}; the Warden writes only false")
+            continue
+        n += 1
+        if not dry:
+            problems.append(f"seq {seq}: a record not enforced, in a run that is not a dry run")
+            continue
+        if r.get("event") == "dns_question":
+            if r.get("rule") not in ("no_rule", "wildcard_budget"):
+                problems.append(f"seq {seq}: a stub question not enforced with rule {r.get('rule')!r}")
+        elif r.get("decision_final") != "DENY":
+            problems.append(f"seq {seq}: a record not enforced whose verdict is {r.get('decision_final')!r}: "
+                            f"a dry run lets through only what the policy refused")
+        if r.get("rule") in DRY_NEVER_LET:
+            problems.append(f"seq {seq}: {r.get('rule')} let through: a dry run never lets it through")
+        if rline is not None and at(r) > rline:
+            problems.append(f"seq {seq}: a call let through after the run was revoked")
+    if dry and end and end[-1].get("not_enforced") != n:
+        problems.append(f"run_end counts {end[-1].get('not_enforced')!r} calls not enforced; the stream holds {n}")
+    if not dry and end and "not_enforced" in end[-1]:
+        problems.append("run_end counts calls not enforced in a run that is not a dry run")
+    return dry
+
+
+def check_open_as(meta, openas_policy, problems):
+    """v1.29 (section 1): run_start's open_as against the policy and the run"""
+    rs = meta.get("run_start", {})
+    oa = rs.get("open_as")
+    if not openas_policy:
+        if oa is not None:
+            problems.append("run_start says files were opened as the agent, but the policy does not say "
+                            "require warden 1.29")
+        return
+    if not isinstance(oa, dict):
+        problems.append("the policy says require warden 1.29, but run_start does not say whom files were "
+                        "opened as")
+    elif oa.get("agent") is True:
+        if not (type(oa.get("uid")) is int and type(oa.get("gid")) is int and oa["uid"] > 0 and oa["gid"] > 0
+                and isinstance(oa.get("groups"), list) and all(type(g) is int and g > 0 for g in oa["groups"])):
+            problems.append(f"run_start's open_as {oa!r} is malformed (or names root)")
+    elif oa != {"agent": False, "why": "run_as_root"}:
+        problems.append(f"run_start's open_as {oa!r} is malformed")
+
+
+def check_baseline(meta, policy, problems):
+    """v1.29 (section 2): a baseline's #@ header and run_start's baseline agree"""
+    rs = meta.get("run_start", {})
+    b = rs.get("baseline")
+    try:
+        with open(policy, encoding="utf-8", errors="replace") as fh:
+            head = [ln.rstrip("\n") for ln in fh.readlines()[:8]]
+    except OSError:
+        head = []
+    hdr = {}
+    if head and head[0] == "#@ varek baseline 1":
+        for ln in head[1:]:
+            if not ln.startswith("#@ "):
+                break
+            k, _, v = ln[3:].partition(" ")
+            hdr[k] = v
+    if not hdr and b is None:
+        return
+    if not hdr:
+        problems.append("run_start names a baseline, but the policy file is not one")
+        return
+    if not isinstance(b, dict):
+        problems.append("the policy is a baseline, but run_start does not say so")
+        return
+    prof = hdr.get("profile", "").split(" ")
+    want = {"format": 1, "profile": prof[0] if prof else "", "cwd": hdr.get("cwd"), "home": hdr.get("home"),
+            "user": hdr.get("user"), "tmp": hdr.get("tmp"),
+            "profile_sha256": prof[1] if len(prof) > 1 and prof[1] != "-" else ""}
+    if b != want:
+        problems.append(f"run_start's baseline {b!r} is not the policy file's header {want!r}")
+
+
 def check_changes(records, openas_policy, problems):
     """v1.29: every change by name is in a run whose policy says require
     warden 1.29; an allowed one carries the flags its kind is decided as; a
@@ -1821,7 +1931,7 @@ def check_dns(meta, checker, policy, rules, problems):
     # allow rule (v1.26: or the proxy on and a host name rule), and is always
     # at the same address
     stub = wild or (pports is not None and any(r["kind"] == "h" and r["name"] and not r["wild"]
-                                               for r in rules))
+                                               for r in rules)) or rs.get("mode") == "dry_run"   # v1.29
     if rs.get("dns_stub") != (STUB if stub else None):
         problems.append(f"run_start's dns_stub {rs.get('dns_stub')!r} is not the policy's "
                         f"({STUB if stub else 'none'})")
@@ -1840,6 +1950,8 @@ def check_dns(meta, checker, policy, rules, problems):
         problems.append("synthetic addresses given, but the policy does not turn the proxy on")
     syn_given, syn_taken = {}, set()
     charged, used, window, pending, latest = {}, {}, {}, {}, {}
+    dry = rs.get("mode") == "dry_run"                           # v1.29
+    dry_sent = set()        # names a dry run looked up that the policy refuses (charged to nothing)
     last_mono = None
     nq = nb = 0
     for e in events:
@@ -1863,7 +1975,7 @@ def check_dns(meta, checker, policy, rules, problems):
             if e.get("dynamic") is True:
                 if name not in pending:
                     problems.append(f"{name}: looked up on demand with no question sending it upstream")
-                if name not in charged:
+                if name not in charged and name not in dry_sent:
                     problems.append(f"{name}: looked up on demand but never charged to a rule")
                 pending.pop(name, None)
             elif name not in exact_names:
@@ -1885,6 +1997,26 @@ def check_dns(meta, checker, policy, rules, problems):
         if rule == "revoked":                    # v1.28 review: after `varek revoke`, refused, nothing looked up
             if ans != "refused" or e.get("new") or e.get("upstream") or e.get("synthetic"):
                 problems.append(f"{name!r}: a question after the revocation was answered {ans}")
+            continue
+        if e.get("enforced") is False:
+            # v1.29: a dry run answers a name the policy refuses (no rule, or
+            # past a wildcard's budget) as it would an allowed one: looked up
+            # (sent upstream, charged to no rule) or from what was looked up
+            # (check_dry checks the run is a dry run)
+            if not dry or rule not in ("no_rule", "wildcard_budget") or e.get("synthetic") or \
+                    (rule == "no_rule" and (line != -1 or by_rule.get(name) is not None)) or \
+                    (rule == "wildcard_budget" and line not in wild) or \
+                    (e.get("upstream") is True) != (ans == "lookup") or ans == "nxdomain":
+                problems.append(f"{name!r}: a question let through by a dry run that is not an answer to "
+                                f"a name the policy refuses")
+                continue
+            if rule == "wildcard_budget":
+                nb += 1
+            if e.get("upstream") is True:
+                if name in pending:
+                    problems.append(f"{name}: sent upstream again while its lookup was outstanding")
+                pending[name] = ts if type(ts) is int else 0
+            dry_sent.add(name)
             continue
         if rule in ("no_rule", "not_a_host_name", "malformed"):
             if ans not in ("nxdomain", "formerr") or e.get("new") or e.get("upstream"):
@@ -2597,13 +2729,17 @@ def main(argv=None):
         problems.append(f"checker failed on the policy's openas: {e}")
         openas_policy = False
     check_changes(records, openas_policy, problems)
+    check_open_as(meta, openas_policy, problems)                     # v1.29
+    check_baseline(meta, a.policy, problems)
+    dry_run = check_dry(meta, records, problems)
     try:
         check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, problems, records)   # v1.27.1
     except (OSError, ValueError) as e:
         problems.append(f"checker failed on the policy's rules: {e}")
     exec_ok = 0
     stub_policy = wild_policy or (proxy_ports is not None and any(
-        r["kind"] == "h" and r["name"] and not r["wild"] for r in prules))
+        r["kind"] == "h" and r["name"] and not r["wild"] for r in prules)) or \
+        meta.get("run_start", {}).get("mode") == "dry_run"          # v1.29: the stub runs in a dry run
     if wild_policy:
         check_shared_lists(meta, a, problems)
     # v1.25 review: from 1.25 the Warden records the end of every grace
@@ -2720,7 +2856,7 @@ def main(argv=None):
             elif trust and rec.get("resolved") not in TRUST_VIEW_RULES[rec["rule"]]:
                 problems.append(f"seq {rec.get('seq')}: a {rec['rule']} answered an open of "
                                 f"{rec.get('resolved')!r}")
-            elif not trust and not names_policy:
+            elif not trust and not names_policy and not dry_run:    # v1.29: a dry run's views
                 problems.append(f"seq {rec.get('seq')}: a view answered, but run_start says the "
                                 f"policy has no host name rules")
             elif not trust and rec.get("resolved") != VIEW_RULES[rec["rule"]]:
@@ -3033,6 +3169,14 @@ def main(argv=None):
               f"(policy {meta['run_start'].get('policy_path')!r})")
     for pr in problems[:50]:
         print(f"  PROBLEM {pr}")
+    # v1.29 (D10): a dry run that passes is verified and NOT ENFORCED, with
+    # an exit code of its own, so a script that reads 0 as "enforced" cannot
+    # mistake it
+    if dry_run and not problems:
+        nd = sum(1 for r in list(records) + list(meta.get("dns_events", []))
+                 if isinstance(r, dict) and r.get("enforced") is False)
+        print(f"varek_audit: VERIFIED: DRY RUN, NOT ENFORCED ({nd} call(s) the policy refuses were let through)")
+        return 3
     print(f"varek_audit: {'PASS' if not problems else 'FAIL'}")
     return 0 if not problems else 1
 

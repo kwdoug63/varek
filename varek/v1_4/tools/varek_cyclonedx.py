@@ -701,6 +701,12 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
     records = [r for r in records if not _is_view(r, insp)]
     authorized = [r for r in records if r.get("decision_final") == "ALLOW"]
     refused = [r for r in records if r.get("decision_final") != "ALLOW"]
+    # v1.29 (section 5): a dry run is said to be one everywhere: in the
+    # metadata, on every authorization listed, and in the attestation; what
+    # it let through is counted apart ("would refuse")
+    dry = rs.get("mode") == "dry_run"
+    not_enforced = [r for r in records + list((proxy_meta or {}).get("dns_events", []))
+                    if isinstance(r, dict) and r.get("enforced") is False]          # the stub's too
 
     # Distinct resolved objects the agent was authorized to reach. Prefer the
     # canonical 'resolved' path (v1.12+); fall back to 'target' for older logs
@@ -736,6 +742,7 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
         "version": run_start,
         "description": "Autonomous agent run supervised under VAREK Authorization-Before-Execution.",
         "properties": [
+            {"name": "varek:mode", "value": "dry_run" if dry else "enforcing"},     # v1.29
             {"name": "varek:policy", "value": policy},
             # v1.15: the SHA-256 of the policy bytes the Warden decided with
             {"name": "varek:policy.sha256", "value": policy_sha256},
@@ -751,7 +758,7 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
             {"name": "varek:decisions.authorized", "value": str(len(authorized))},
             {"name": "varek:decisions.refused", "value": str(len(refused))},
             {"name": "varek:views.answered", "value": str(len(views))},
-        ],
+        ] + ([{"name": "varek:decisions.would_refuse", "value": str(len(not_enforced))}] if dry else []),
     }
 
     # Verdict distribution over the RAW verdict (before suppression), so an
@@ -768,7 +775,7 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
             "bom-ref": bomref("authorized-object", path),
             "name": path,
             "description": f"Object the agent was authorized to reach via {r.get('action','?')}.",
-            "properties": [
+            "properties": ([{"name": "varek:mode", "value": "dry_run"}] if dry else []) + [
                 {"name": "varek:action", "value": str(r.get("action", ""))},
                 {"name": "varek:rule", "value": str(r.get("rule", ""))},
                 {"name": "varek:requested", "value": str(r.get("target", ""))},
@@ -808,6 +815,10 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
     attest_text += ot
     facts += ofacts
     agent_component["properties"] += [{"name": k, "value": v} for k, v in facts]
+    if dry:                                                       # v1.29
+        attest_text = (f"DRY RUN, NOT ENFORCING: every call was decided and recorded, and the "
+                       f"{len(not_enforced)} call(s) the policy refused were let through (\"enforced\":false); "
+                       f"this run is evidence of what the policy would decide, not of enforcement. ") + attest_text
 
     annotation = {
         "bom-ref": "authorization-attestation",
@@ -830,7 +841,7 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
             "lifecycles": [{"phase": "operations"}],
             "tools": {"components": [warden_tool]},
             "component": agent_component,
-            "properties": [
+            "properties": [{"name": "varek:mode", "value": "dry_run" if dry else "enforcing"}] + [
                 {"name": f"varek:verdict.{k.lower()}", "value": str(v)}
                 for k, v in sorted(dist.items())
             ],

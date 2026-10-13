@@ -419,8 +419,10 @@ def summarize(recs):
             if r.get("why") in ("refused_request", "server_tls", "client_tls", "tls_timeout", "max_body") \
                     and type(r.get("proxy_conn")) is int:
                 s["proxy_ends"].append(r)
-        elif ev == "dns_question" and r.get("rule") == "wildcard_budget":
-            # v1.25: a name a wildcard rule's budget refused (NXDOMAIN)
+        elif ev == "dns_question" and (r.get("rule") == "wildcard_budget" or
+                                       (r.get("rule") == "no_rule" and r.get("enforced") is False)):
+            # v1.25: a name a wildcard rule's budget refused (NXDOMAIN);
+            # v1.29: or, in a dry run, a name looked up that would be refused
             s["refused"] += 1
             s["refusals"].append(r)
         elif "decision_final" in r:
@@ -619,6 +621,24 @@ def cmd_doctor(args):
         warn("The Warden cannot make a mount namespace here: a `require warden 1.27` run refuses to "
              "start unless given --writable-exec")
         hint("run the Warden as root (it needs CAP_SYS_ADMIN), outside a container that forbids unshare")
+
+    # v1.29: a dry run lets a refused call through with CONTINUE (5.5, within
+    # the 5.14 above); the baseline runs the agent as the user who ran sudo
+    if m and (int(m.group(1)), int(m.group(2))) >= (5, 14):
+        ok("dry runs available (`varek run --dry-run` records what the policy would refuse, enforcing nothing)")
+    pw, ra, why_user = varek_baseline.agent_user(None)
+    if pw is None:
+        warn(f"the agent's user ({ra}, {why_user}) has no passwd entry: `varek run` with no settings will "
+             f"not start")
+    elif pw.pw_uid == 0:
+        fail("the agent's user would be root")
+        bad += 1
+    elif not os.path.isdir(pw.pw_dir) and ra != "nobody":
+        warn(f"the agent's user {ra} ({why_user}) has no home directory {pw.pw_dir}: the baseline "
+             f"gives it none")
+    else:
+        ok(f"the baseline runs the agent as {ra} ({why_user})" +
+           ("; run `sudo varek run` from your own account to run it as you" if ra == "nobody" else ""))
 
     cg2 = cgroup2_mount()                                                         # v1.28.1
     if cg2:
@@ -879,6 +899,13 @@ def cmd_policy_show(args):
     info(f"About    {pack_summary(path)}")
     info(f"SHA-256  {digest}   (recorded in every run's run_start)")
     info(f"Needs    Warden {require or 'any version'}")
+    hdr = baseline_header(path)                                                     # v1.29
+    if hdr:
+        prof = hdr.get("profile", "none -").split()
+        info(f"Baseline written by `varek run` (format {hdr.get('varek baseline', '?')}) for user "
+             f"{hdr.get('user', '?')}, working directory {hdr.get('cwd', '?')}, home {hdr.get('home', '?')}, "
+             f"temporary directory {hdr.get('tmp', '?')}; profile " +
+             (f"{prof[0]} (sha256 {prof[1][:16]}...)" if prof and prof[0] != "none" and len(prof) > 1 else "none"))
     show_rc = 0
     for verb in ("allow", "deny"):
         parts = ", ".join(f"{v} {k}" for k, v in sorted(counts[verb].items())) or "none"
@@ -1007,6 +1034,25 @@ def cmd_policy_show(args):
             info(f"  {name}: line {line}" + (f": {text}" if text else ""))
     info("Anything not allowed is UNKNOWN and refused.")
     return show_rc
+
+
+def baseline_header(path):
+    """v1.29: a baseline's `#@ key value` lines (a dict), else {}"""
+    h = {}
+    try:
+        with open(path, errors="replace") as f:
+            for ln in f:
+                if not ln.startswith("#@ "):
+                    break
+                body = ln[3:].rstrip("\n")
+                if body.startswith("varek baseline "):
+                    h["varek baseline"] = body[len("varek baseline "):]
+                else:
+                    k, _, v = body.partition(" ")
+                    h[k] = v
+    except OSError:
+        return {}
+    return h if "varek baseline" in h else {}
 
 
 def cmd_policy_suggest(args):
@@ -1289,6 +1335,8 @@ def cmd_status(args):
         s = summarize(read_records(logs[0]))
         info(f"Last run   {s['start'] or '?'}  {s['allowed']} allowed, {s['refused']} refused"
              f"{'' if s['complete'] else '  (no run_end: still running or cut short)'}")
+        if s["dry"]:                                                               # v1.29
+            info(f"           a DRY RUN, NOT ENFORCED: {s['not_enforced']} call(s) the policy refuses were let through")
         info(f"           {logs[0]}")
     else:
         info("Last run   none yet")
@@ -1320,11 +1368,11 @@ def cmd_runs(args):
     if not logs:
         info(f"No runs in {cfg['log_dir']}.")
         return 0
-    info(f"{'STARTED':19}  {'ALLOWED':>7}  {'REFUSED':>7}  {'DONE':4}  {'FOR':33}  LOG")
+    info(f"{'STARTED':19}  {'MODE':7}  {'ALLOWED':>7}  {'REFUSED':>7}  {'DONE':4}  {'FOR':33}  LOG")
     for log in logs:
         s = summarize(read_records(log))
-        info(f"{(s['start'] or '?'):19}  {s['allowed']:>7}  {s['refused']:>7}  "
-             f"{'yes' if s['complete'] else 'no':4}  {run_for(s):33}  {log}")
+        info(f"{(s['start'] or '?'):19}  {'dry run' if s['dry'] else 'enforce':7}  {s['allowed']:>7}  "
+             f"{s['refused']:>7}  {'yes' if s['complete'] else 'no':4}  {run_for(s):33}  {log}")
     return 0
 
 
@@ -1472,12 +1520,26 @@ def cmd_refusals(args):
         how = ("the user's token expired" if rv.get("by") == "on_behalf_of_expiry"        # v1.28.1
                else f"varek revoke, by uid {rv.get('by_uid', '?')}")
         info(f"The run was revoked at {when} ({how}): every call after it was refused.\n")
+    if s["dry"]:                                                                    # v1.29
+        info(_paint("1;33", f"DRY RUN, NOT ENFORCING: {s['not_enforced']} call(s) the policy refuses were let "
+                            "through (listed as WOULD REFUSE); calls refused all the same are listed as "
+                            "refused.") + "\n")
+    if args.enforced or args.not_enforced:                                          # v1.29: filters
+        keep = (lambda r: r.get("enforced") is not False) if args.enforced else (lambda r: r.get("enforced") is False)
+        s["refusals"] = [r for r in s["refusals"] if keep(r)]
+        s["refused"] = len(s["refusals"])
+        if args.not_enforced:
+            ends, s["cred_refused"] = [], []                   # always enforced: not shown
     if not s["refusals"] and not ends and not s["cred_refused"]:
-        info(f"No refusals in {log}" + (f" for sub-agent {args.subagent}" if args.subagent else "") + ".")
+        info(f"No {'refusals' if not args.not_enforced else 'calls let through'} in {log}" +
+             (f" for sub-agent {args.subagent}" if args.subagent else "") + ".")
         return 0
-    info(f"{s['refused']} refused action(s) in {log}:\n")
+    info(f"{s['refused']} refused action(s) in {log}" +
+         (f" ({sum(1 for r in s['refusals'] if r.get('enforced') is False)} not enforced)" if s["dry"] else "") +
+         ":\n")
     for r in s["refusals"][: args.n]:
         line = r.get("policy_line", -1)
+        dry = r.get("enforced") is False                                            # v1.29
         if r.get("action") == "net.request":
             # v1.26.1: a request on an inspected connection; the agent got a
             # 403 and the connection ended after it
@@ -1496,8 +1558,9 @@ def cmd_refusals(args):
                 word, where = verdict_word(r), "no request rule allows it"
             else:
                 word, where = verdict_word(r), RULE_WORDS.get(rl, rl or "no rule matched")
-            info(f"  {word:11}  {'net.request':13}  {r.get('target', '')}")
-            hint(f"{where}; the agent got 403 Forbidden and the connection ended")
+            info(f"  {'WOULD_REFUSE' if dry else word:11}  {'net.request':13}  {r.get('target', '')}")
+            hint(f"{where}; " + ("let through (dry run: not enforced)" if dry else
+                                 "the agent got 403 Forbidden and the connection ended"))
             continue
         rl = r.get("rule")
         if rl == "exec_identity_mismatch":
@@ -1509,8 +1572,13 @@ def cmd_refusals(args):
         if r.get("action") == "process.exec" and rl in EXEC_WORDS:
             word, what = EXEC_WORDS[rl]
             text = policy_line_text(policy, line) if policy and isinstance(line, int) and line >= 0 else None
-            info(f"  {word:11}  {'process.exec':13}  {r.get('resolved') or r.get('target', '')}")
-            hint(f"policy line {line}" + (f": {text}" if text else "") + f" {what}; the agent got EACCES")
+            info(f"  {'WOULD_REFUSE' if dry else word:11}  {'process.exec':13}  {r.get('resolved') or r.get('target', '')}")
+            hint(f"policy line {line}" + (f": {text}" if text else "") + f" {what}; " +
+                 ("let through (dry run: not enforced)" if dry else "the agent got EACCES"))
+            continue
+        if r.get("event") == "dns_question" and r.get("rule") == "no_rule":         # v1.29: a dry run
+            info(f"  {'WOULD_REFUSE':11}  {'dns.question':13}  {r.get('name', '')}")
+            hint("no rule names it; looked up all the same (dry run: not enforced)")
             continue
         if r.get("event") == "dns_question":
             text = policy_line_text(policy, line) if policy and isinstance(line, int) else None
@@ -1519,8 +1587,9 @@ def cmd_refusals(args):
                     "rate": "its rate= budget (lookups upstream per minute) is spent",
                     "label": "the part before the suffix is longer than 63 bytes"}.get(
                         b if isinstance(b, str) else "", "a budget")   # v1.25 review: no crash on a list
-            info(f"  {'BUDGET':11}  {'dns.question':13}  {r.get('name', '')}")
-            hint(f"policy line {line}" + (f": {text}" if text else "") + f"; {what}; the agent got NXDOMAIN")
+            info(f"  {'WOULD_REFUSE' if dry else 'BUDGET':11}  {'dns.question':13}  {r.get('name', '')}")
+            hint(f"policy line {line}" + (f": {text}" if text else "") + f"; {what}; " +
+                 ("looked up all the same (dry run: not enforced)" if dry else "the agent got NXDOMAIN"))
             continue
         if rl == "revoked":                                                         # v1.28
             info(f"  {'REVOKED':11}  {str(r.get('action', '?')):13}  {r.get('resolved') or r.get('target', '')}")
@@ -1535,9 +1604,10 @@ def cmd_refusals(args):
         else:
             where = r.get("rule", "no rule matched")
         target = r.get("resolved") or r.get("target", "")
-        info(f"  {verdict_word(r):11}  {r.get('action', '?'):13}  {target}")
+        info(f"  {'WOULD_REFUSE' if dry else verdict_word(r):11}  {r.get('action', '?'):13}  {target}")
         ch = obo_text(r)                                                           # v1.28.1
-        hint(f"{where}; {'sub-agent ' + ch if ch else 'the agent'} got {r.get('kernel_verdict', '?')}")
+        hint(f"{where}; " + ("let through (dry run: not enforced)" if dry else
+                             f"{'sub-agent ' + ch if ch else 'the agent'} got {r.get('kernel_verdict', '?')}"))
     if s["refused"] > args.n:
         info(f"\n  ... and {s['refused'] - args.n} more (use -n to see them)")
     if ends:
@@ -1573,6 +1643,9 @@ def cmd_refusals(args):
         if len(cf) > args.n:
             info(f"\n  ... and {len(cf) - args.n} more (use -n to see them)")
     info("\nUNSATISFIED: a deny rule matched.  UNKNOWN: no rule allowed it (refused by default).")
+    if any(r.get("enforced") is False for r in s["refusals"][: args.n]):
+        info("WOULD_REFUSE: the policy refuses it, but this was a dry run (varek run --dry-run): it was let "
+             "through. `varek policy suggest` writes the rules that would allow it.")
     if cf:
         info("CREDENTIAL: the header the rule names must hold the credential's placeholder (VAREK_CRED_<NAME>), "
              "once, alone or after the rule's scheme.")
@@ -2049,6 +2122,10 @@ def build_parser():
     sp.add_argument("-n", type=int, default=25, help="how many to show (default 25)")
     sp.add_argument("--subagent", metavar="NAME", help="only the calls made for this sub-agent (v1.28.1)")
     sp.add_argument("--user", metavar="SUB", help="only if the run was on behalf of this user (v1.28.1)")
+    g = sp.add_mutually_exclusive_group()
+    g.add_argument("--enforced", action="store_true", help="only the calls refused (in a dry run, v1.29)")
+    g.add_argument("--not-enforced", action="store_true",
+                   help="only the calls a dry run let through that the policy refuses (v1.29)")
 
     sp = add("audit", cmd_audit, "re-check a run's certificates, chain and signatures")
     sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")

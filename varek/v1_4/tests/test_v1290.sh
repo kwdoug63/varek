@@ -721,6 +721,130 @@ open('$Z/sub.txt', 'w').write(t)"
     kill "$ZH" 2>/dev/null
 fi
 
+echo "== 5. audit, export and tools for the dry run and the baseline =="
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
+    skip "the audit, export and tools (they read runs that run as root)"
+else
+    Q="$OUT/q"
+    mkdir -p "$Q/w" "$Q/o" "$Q/log"
+    chmod 755 "$Q" "$Q/o"; chmod 1777 "$Q/w"
+    echo hi > "$Q/o/f"; chmod 644 "$Q/o/f"
+    # a policy with a baseline's header (the Warden copies it into run_start)
+    printf '#@ varek baseline 1\n#@ profile none -\n#@ cwd %s/w\n#@ home /nonexistent\n#@ user nobody\n#@ tmp /tmp\nrequire warden 1.29\nallow path /usr/ readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/w/\nallow exec /usr/bin/python3\n' "$Q" "$Q" > "$Q/b.txt"
+    QA='import sys
+for p in ("'"$Q"'/o/f", sys.argv[1]):
+    try: open(p).read(1); print("read ok")
+    except OSError as e: print("read", e.errno)'
+    "$WARDEN" "$Q/b.txt" --run-as nobody -- /usr/bin/python3 -c "$QA" "$Q/e.log" > "$Q/e.out" 2> "$Q/e.log"
+    "$WARDEN" "$Q/b.txt" --dry-run --run-as nobody -- /usr/bin/python3 -c "$QA" "$Q/d.log" > "$Q/d.out" 2> "$Q/d.log"
+    QN="$(python3 -c "import json; print([json.loads(l) for l in open('$Q/d.log') if l.startswith('{\"event\":\"run_end\"')][0]['not_enforced'])")"
+    AUD() { python3 "$HERE/tools/varek_audit.py" --policy "$Q/b.txt" --checker "$CERT" "$@"; }
+    AUD "$Q/e.log" > "$Q/ae.out" 2>&1; QE=$?
+    AUD "$Q/d.log" > "$Q/ad.out" 2>&1; QD=$?
+    check "the audit passes an enforcing run under a baseline (exit 0)"   sh -c "[ $QE = 0 ] && grep -q 'PASS' '$Q/ae.out'"
+    check "the audit verifies a dry run, exit 3: VERIFIED: DRY RUN, NOT ENFORCED" \
+        sh -c "[ $QD = 3 ] && grep -q '^varek_audit: VERIFIED: DRY RUN, NOT ENFORCED ($QN call(s)' '$Q/ad.out' && ! grep -q 'PASS' '$Q/ad.out'"
+    if [ -s "$Y/r.log" ]; then
+        python3 "$HERE/tools/varek_audit.py" --policy "$Y/p.txt" --checker "$CERT" "$Y/r.log" > "$Q/ar.out" 2>&1; QR=$?
+        check "... and a dry run that was revoked (exit 3)" sh -c "[ $QR = 3 ]"
+        python3 "$HERE/tools/varek_audit.py" --policy "$Y/p.txt" --checker "$CERT" "$Y/d.log" > "$Q/ay.out" 2>&1; QR=$?
+        check "... and section 3's dry run: stub questions, connects, launches, changes (exit 3)" sh -c "[ $QR = 3 ]"
+    else skip "a dry run that was revoked (section 3 did not run it)"; fi
+    F="$HERE/tests/v1270_forge.py"
+    qforged() {   # qforged LABEL STREAM PYTHON WORDS: the audit fails the forged stream (exit 1), naming WORDS
+        python3 "$F" "$2" "$Q/f.log" "$3" >/dev/null 2>&1
+        AUD "$Q/f.log" > "$Q/f.out" 2>&1
+        local rc=$?
+        if [ "$rc" != 1 ]; then flunk "forged: $1 (the audit exited $rc)"
+        elif grep -qF -- "$4" "$Q/f.out"; then pass "forged: $1"
+        else flunk "forged: $1 (not for its own reason: $(grep '^  PROBLEM' "$Q/f.out" | head -2 | tr '\n' ' '))"; fi
+    }
+    NE="[r for r in recs if isinstance(r, dict) and r.get('enforced') is False]"
+    RS="[r for r in recs if isinstance(r, dict) and r.get('event') == 'run_start'][0]"
+    RE="[r for r in recs if isinstance(r, dict) and r.get('event') == 'run_end'][0]"
+    qforged "a record let through that says ALLOW" "$Q/d.log" \
+        "$NE[0]['decision_final'] = 'ALLOW'" "a dry run lets through only what the policy refused"
+    qforged "the protected object let through" "$Q/d.log" \
+        "r = [r for r in recs if isinstance(r, dict) and r.get('rule') == 'protected_object'][0]; r['enforced'] = False; $RE['not_enforced'] += 1" \
+        "protected_object let through"
+    qforged "\"enforced\":true (the Warden writes only false)" "$Q/d.log" \
+        "$NE[0]['enforced'] = True; $RE['not_enforced'] -= 1" "the Warden writes only false"
+    qforged "run_start's mode dropped (a dry run passed off as enforcing)" "$Q/d.log" \
+        "$RS.pop('mode'); $RE.pop('mode')" "a record not enforced, in a run that is not a dry run"
+    qforged "run_end's mode dropped" "$Q/d.log" "$RE.pop('mode')" "run_end's mode None is not run_start's 'dry_run'"
+    qforged "run_end's count of calls not enforced, one short" "$Q/d.log" "$RE['not_enforced'] -= 1" "calls not enforced; the stream holds $QN"
+    qforged "a call let through after a revocation" "$Q/d.log" \
+        "i = recs.index($NE[-1]); recs.insert(i, {'event': 'revoked', 'run': $RS['run'], 'by_uid': 0, 'by_pid': 1, 'timestamp_ns': recs[i].get('timestamp_ns', 0)})" \
+        "a call let through after the run was revoked"
+    qforged "enforced:false in an enforcing run" "$Q/e.log" \
+        "[r for r in recs if isinstance(r, dict) and r.get('decision_final') == 'DENY' and r.get('rule') == 'default_deny_unknown'][0]['enforced'] = False" \
+        "a record not enforced, in a run that is not a dry run"
+    qforged "run_end counting calls not enforced in an enforcing run" "$Q/e.log" "$RE['not_enforced'] = 0" \
+        "run_end counts calls not enforced in a run that is not a dry run"
+    qforged "open_as dropped from run_start" "$Q/e.log" "$RS.pop('open_as')" "does not say whom files were opened as"
+    qforged "open_as naming root" "$Q/e.log" "$RS['open_as']['uid'] = 0" "malformed (or names root)"
+    qforged "the baseline's user changed in run_start" "$Q/e.log" "$RS['baseline']['user'] = 'root'" "is not the policy file's header"
+    qforged "the baseline dropped from run_start" "$Q/e.log" "$RS.pop('baseline')" "the policy is a baseline, but run_start does not say so"
+    # the export
+    python3 "$HERE/tools/varek_cyclonedx.py" --log "$Q/d.log" --policy "$Q/b.txt" --agent t --output "$Q/d.cdx.json" > /dev/null 2>&1
+    python3 "$HERE/tools/varek_cyclonedx.py" --log "$Q/e.log" --policy "$Q/b.txt" --agent t --output "$Q/e.cdx.json" > /dev/null 2>&1
+    check "the export marks a dry run: mode, would_refuse, on each component, and the attestation" python3 -c "
+import json, sys
+b = json.load(open('$Q/d.cdx.json'))
+p = {x['name']: x['value'] for x in b['metadata']['properties']}
+c = {x['name']: x['value'] for x in b['metadata']['component']['properties']}
+comps = [x for x in b.get('components', []) if any(y['name'] == 'varek:action' for y in x.get('properties', []))]
+ok = (p.get('varek:mode') == 'dry_run' and c.get('varek:mode') == 'dry_run' and c.get('varek:decisions.would_refuse') == '$QN'
+      and comps and all(any(y == {'name': 'varek:mode', 'value': 'dry_run'} for y in x['properties']) for x in comps)
+      and any(a.get('text', '').startswith('DRY RUN, NOT ENFORCING') for a in b.get('annotations', [])))
+sys.exit(0 if ok else 1)"
+    check "... and an enforcing run as enforcing, with no would_refuse" python3 -c "
+import json, sys
+b = json.load(open('$Q/e.cdx.json'))
+p = {x['name']: x['value'] for x in b['metadata']['properties']}
+c = {x['name']: x['value'] for x in b['metadata']['component']['properties']}
+sys.exit(0 if p.get('varek:mode') == 'enforcing' and c.get('varek:mode') == 'enforcing' and 'varek:decisions.would_refuse' not in c
+         and not any(a.get('text', '').startswith('DRY RUN') for a in b.get('annotations', [])) else 1)"
+    if [ -s "$Y/d.log" ]; then
+        python3 "$HERE/tools/varek_cyclonedx.py" --log "$Y/d.log" --policy "$Y/p.txt" --agent t --output "$Q/y.cdx.json" > /dev/null 2>&1
+        check "... would_refuse counts what run_end counts, the stub's questions included" python3 -c "
+import json, sys
+b = json.load(open('$Q/y.cdx.json'))
+c = {x['name']: x['value'] for x in b['metadata']['component']['properties']}
+end = [json.loads(l) for l in open('$Y/d.log') if l.startswith('{\"event\":\"run_end\"')][0]
+q = sum(1 for l in open('$Y/d.log') if l.startswith('{\"event\":\"dns_question\"') and '\"enforced\":false' in l)
+sys.exit(0 if q > 0 and c.get('varek:decisions.would_refuse') == str(end['not_enforced']) else 1)"
+    else skip "would_refuse with the stub's questions (section 3 did not run)"; fi
+    # the tools
+    cp "$Q/e.log" "$Q/log/verdicts-1.log"; touch -d '2 minutes ago' "$Q/log/verdicts-1.log"
+    cp "$Q/d.log" "$Q/log/verdicts-2.log"
+    VQ() { VAREK_CONFIG="$Q/none/varek.conf" VAREK_LOG_DIR="$Q/log" python3 "$HERE/tools/varek" "$@"; }
+    VQ refusals > "$Q/rf.out" 2>&1
+    check "varek refusals: a dry run says DRY RUN, NOT ENFORCING, with the count" grep -q "DRY RUN, NOT ENFORCING: $QN call(s) the policy refuses were let through" "$Q/rf.out"
+    check "... lists a call let through as WOULD_REFUSE, and why"  sh -c "grep -q '^  WOULD_REFUSE  file.open  *$Q/o/f\$' '$Q/rf.out' && grep -q 'let through (dry run: not enforced)' '$Q/rf.out'"
+    check "... and a call refused all the same as refused (the stream)" sh -c "grep '  file.open  *$Q/d.log\$' '$Q/rf.out' | grep -qv WOULD_REFUSE"
+    VQ refusals --not-enforced > "$Q/rn.out" 2>&1
+    VQ refusals --enforced > "$Q/rx.out" 2>&1
+    check "varek refusals --not-enforced: only the calls let through" sh -c "grep -q 'WOULD_REFUSE' '$Q/rn.out' && ! grep -q '$Q/d.log' '$Q/rn.out'"
+    check "varek refusals --enforced: only the calls refused"         sh -c "! grep -q 'WOULD_REFUSE' '$Q/rx.out' && grep -q '$Q/d.log\$' '$Q/rx.out'"
+    VQ refusals "$Q/log/verdicts-1.log" > "$Q/re.out" 2>&1
+    check "... an enforcing run: no dry-run header, no WOULD_REFUSE" sh -c "! grep -q 'DRY RUN\|WOULD_REFUSE' '$Q/re.out' && grep -q '$Q/o/f' '$Q/re.out'"
+    VQ runs > "$Q/runs.out" 2>&1
+    check "varek runs: a MODE column, dry run and enforce" sh -c "grep -q '^STARTED  *MODE ' '$Q/runs.out' && grep -q ' dry run .*verdicts-2.log\$' '$Q/runs.out' && grep -q ' enforce .*verdicts-1.log\$' '$Q/runs.out'"
+    VQ status > "$Q/st.out" 2>&1
+    check "varek status: the last run was a dry run, not enforced" grep -q "a DRY RUN, NOT ENFORCED: $QN call(s)" "$Q/st.out"
+    VQ audit > "$Q/au.out" 2>&1; QU=$?
+    check "varek audit: exit 3 for a dry run" sh -c "[ $QU = 3 ] && grep -q 'VERIFIED: DRY RUN, NOT ENFORCED' '$Q/au.out'"
+    VQ policy show "$Q/b.txt" > "$Q/ps.out" 2>&1
+    check "varek policy show: a baseline's header" grep -q "^Baseline written by \`varek run\` (format 1) for user nobody, working directory $Q/w, home /nonexistent, temporary directory /tmp; profile none" "$Q/ps.out"
+    printf 'require warden 1.29\nallow path /usr/ readonly\n' > "$Q/plain.txt"
+    VQ policy show "$Q/plain.txt" > "$Q/pp.out" 2>&1
+    check "... and none for a policy that is not a baseline" sh -c "grep -q '^Policy ' '$Q/pp.out' && ! grep -q '^Baseline' '$Q/pp.out'"
+    env -u SUDO_UID -u SUDO_USER VAREK_CONFIG="$Q/none/varek.conf" python3 "$HERE/tools/varek" doctor > "$Q/doc.out" 2>&1
+    check "varek doctor: the dry run is available"                 grep -q "dry runs available" "$Q/doc.out"
+    check "varek doctor: with no sudo user, the agent runs as nobody" grep -q "the baseline runs the agent as nobody (no sudo user)" "$Q/doc.out"
+fi
+
 echo
 if [ "$fail" = 0 ]; then echo "test_v1290: all checks passed ($skips skipped)"; else echo "test_v1290: FAILURES"; fi
 exit "$fail"
