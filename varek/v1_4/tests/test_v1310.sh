@@ -18,6 +18,15 @@
 #      forgeries it refuses), the server out of the agent's /proc, and the
 #      start refused for a pinned file with another hash or a server file
 #      that any subject may write (or a directory above it).
+#   3. MCP calls over HTTP: a stand-in server (both revisions), each call
+#      decided on the body the server acts on (escaped names, a chunked
+#      body, two calls on one connection, a notification), the refusals
+#      (a deny rule, no rule, duplicate keys, a batch, deep nesting, invalid
+#      UTF-8, headers that disagree with the body, a body over the limit, a
+#      query) and their JSON-RPC error, a credential only in the calls its
+#      rule allows (and a credential for= an MCP server only in the
+#      server's calls), the records, and the audit (and the forgeries it
+#      refuses).
 #
 #   test_v1310.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
@@ -212,7 +221,9 @@ else
     check "the Warden reports 1.31.0 or later" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | python3 -c 'import re,sys; m=re.search(r\"VAREK Warden  (\\d+)\\.(\\d+)\\.(\\d+)\", sys.stdin.read()); sys.exit(0 if m and tuple(map(int, m.groups())) >= (1, 31, 0) else 1)'"
     printf '%b' "${R}allow path /usr/\n" > "$OUT/w1.txt"
     check "the Warden starts a require warden 1.31 policy" "$WARDEN" "$OUT/w1.txt" --check-startup
-    for form in "${P}allow mcp $U tools/list\n" "${R}credential gh from file:/x audience=$U\n" "${R}trust mcp-resource $U\n"; do
+    printf '%b' "${P}allow mcp $U tools/list\n" > "$OUT/w3.txt"
+    check "the Warden starts a policy with mcp rules (step 4)" "$WARDEN" "$OUT/w3.txt" --check-startup
+    for form in "${R}credential gh from file:/x audience=$U\n" "${R}trust mcp-resource $U\n"; do
         printf '%b' "$form" > "$OUT/w2.txt"
         "$WARDEN" "$OUT/w2.txt" --check-startup > "$OUT/w2.out" 2>&1
         rc=$?
@@ -303,6 +314,160 @@ for l in open(sys.argv[1]):
         st no "require warden 1.31\nmcp server files exec $B/nothere\n$SL" "is not a launchable file"
     check "a confined sub-agent is checked the same way" \
         st no "require warden 1.31\nallow exec $B/srv subagent=h confined\nallow path $B/ access=rw\n$SL" "could be replaced"
+fi
+
+echo "== 3. MCP calls over HTTP: the body read, its call decided =="
+WP="$(dirname "${WARDEN:-.}")/warden-proxy"
+if [ "$(id -u)" != 0 ] || [ -z "$WARDEN" ] || [ ! -x "$WP" ] || ! command -v openssl > /dev/null; then
+    skip "section 3 (needs root, the warden, warden-proxy and openssl)"
+else
+    X="$(mktemp -d /tmp/varek_v1310m.XXXXXX)"; chmod 755 "$X"
+    trap 'kill $SRV 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $OUT ${B:-} $X" || rm -rf "$OUT" "${B:-}" "$X"' EXIT
+    HOSTIP=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("10.255.255.255", 1)); print(s.getsockname()[0])')
+    PS=$((43000 + RANDOM % 5000))
+    ( cd "$X" &&
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout tca.key -out tca.pem -days 2 \
+          -subj "/CN=VAREK v1.31 test root" -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign" &&
+      openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout s.key -out s.csr -subj "/CN=mcp.example.com" &&
+      printf 'subjectAltName=DNS:mcp.example.com\nextendedKeyUsage=serverAuth\n' > s.ext &&
+      openssl x509 -req -in s.csr -CA tca.pem -CAkey tca.key -CAcreateserial -out s.pem -days 1 -extfile s.ext ) > "$OUT/certs3.log" 2>&1
+    cat "$(python3 -c 'import ssl; print(ssl.get_default_verify_paths().openssl_cafile)')" "$X/tca.pem" > "$X/bundle.pem"
+    chmod 644 "$X"/*.pem
+    python3 "$HERE/tests/v1310_mcp_server.py" "$HOSTIP" "$PS" "$X/s.pem" "$X/s.key" "$OUT/got.jsonl" > "$OUT/srv.log" 2>&1 &
+    SRV=$!
+    DP=$((20000 + RANDOM % 20000))
+    printf '{"mcp.example.com": {"ttl": 30, "a": ["%s"]}}\n' "$HOSTIP" > "$OUT/zone3.json"
+    python3 "$HERE/tests/dns_test_server.py" --port "$DP" --zone "$OUT/zone3.json" --log "$OUT/q3.log" --ready "$OUT/ready3" > /dev/null 2>&1 &
+    SRV="$SRV $!"
+    for _ in $(seq 50); do
+        [ -e "$OUT/ready3" ] && python3 -c "import socket; socket.create_connection(('$HOSTIP', $PS), 0.2)" 2>/dev/null && break
+        sleep 0.1
+    done
+    TOKV="mcp-token-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    printf '%s\n' "$TOKV" > "$X/tok"; chmod 600 "$X/tok"
+    cp "$HERE/tests/v1310_mcp_agent.py" "$X/agent.py"; chmod 644 "$X/agent.py"
+    U="https://mcp.example.com:$PS/mcp"
+    POL="$OUT/mcp.policy"
+    { printf 'require warden 1.31\nproxy inspect\nproxy ports %s\ncredential tok from file:%s/tok\n' "$PS" "$X"
+      printf 'allow host mcp.example.com\n'
+      printf 'allow mcp %s initialize\n' "$U"
+      printf 'allow mcp %s notifications/initialized\n' "$U"
+      printf 'allow mcp %s tools/list\n' "$U"
+      printf 'deny mcp %s tools/call delete_*\n' "$U"
+      printf 'allow mcp %s tools/call get_* credential=tok\n' "$U"
+      printf 'allow mcp %s resources/read file:///projects/app/** max_body=300\n' "$U"
+      printf 'allow mcp %s2 tools/list max_body=1000\n' "$U"
+      printf 'allow request GET %s\n' "$U"
+      printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path exact %s/agent.py readonly\n' "$X"
+    } > "$POL"
+    env -i PATH=/usr/bin:/bin timeout 180 "$WARDEN" "$POL" --dns-server "127.0.0.1:$DP" --trust-bundle "$X/bundle.pem" -- \
+        /usr/bin/python3 "$X/agent.py" "$PS" > "$OUT/m.out" 2> "$OUT/m.log"
+    cut -c1-150 "$OUT/m.out" | sed 's/^/     /'
+    said() { grep -q "^CALL $1 $2" "$OUT/m.out"; }
+    said_in() { grep -q "^CALL $2 $3" "$OUT/$1.out"; }
+    got() { python3 - "$OUT/got.jsonl" "$1" "${2:-1}" <<'PY'
+import json, sys
+n = 0
+for l in open(sys.argv[1]):
+    r = json.loads(l)
+    n += bool(eval(sys.argv[2], {"h": r["head"], "b": r["body"], "json": json}))
+sys.exit(0 if n == int(sys.argv[3] if len(sys.argv) > 3 else "1") else 1)
+PY
+    }
+    rec() { python3 - "$OUT/m.log" "$1" <<'PY'
+import json, sys
+recs = [json.loads(l[l.index("{"):]) for l in open(sys.argv[1], errors="replace") if l.startswith("{")]
+M = [r for r in recs if r.get("action") == "net.mcp"]
+sys.exit(0 if eval(sys.argv[2], {"json": json, "R": recs, "M": M, "by": lambda i: [r for r in M if r.get("rpc_id") == i]}) else 1)
+PY
+    }
+    for t in init list get getesc small chunked trace; do
+        check "allowed ($t): the server answered it" said "$t" "HTTP/1.1 200 OK"
+    done
+    check "a notification is allowed (the server's 202)" said notify "HTTP/1.1 202 Accepted"
+    check "the 2025-06-18 and 2026-07-28 revisions both reached the server" \
+        sh -c "grep -q '\"protocol\": \"2025-06-18\"' '$OUT/m.out' && grep -q '\"protocol\": \"2026-07-28\"' '$OUT/m.out'"
+    check "a GET on the endpoint is decided by request rules (allowed)" said get_stream "HTTP/1.1 200 OK | ok"
+    check "two calls on one connection: both answered, in order" \
+        sh -c "grep -c '^CALL two HTTP/1.1 200 OK' '$OUT/m.out' | grep -qx 2 && grep '^CALL two' '$OUT/m.out' | head -1 | grep -q '\"id\": 18'"
+    for t in delete unlisted dup batch hdrmis namemis big huge query nodeep badutf8; do
+        check "refused ($t): 403" said "$t" "HTTP/1.1 403 Forbidden"
+    done
+    check "a refused call gets a JSON-RPC error with its id and code -32000" \
+        sh -c "grep '^CALL delete ' '$OUT/m.out' | grep -q '\"id\":5,\"error\":{\"code\":-32000,\"message\":\"VAREK: this call was refused: the policy denies it (line 9)\"' && grep '^CALL unlisted ' '$OUT/m.out' | grep -q '\"id\":\"six\",\"error\":{\"code\":-32000'"
+    check "a call that could not be read gets id null" sh -c "grep '^CALL batch ' '$OUT/m.out' | grep -q '\"id\":null,\"error\":{\"code\":-32000'"
+    check "nothing refused reached the server" \
+        got "'delete_repo' in b or 'other_tool' in b or '\"id\": 7' in b or b.startswith('[') or '\"id\": 9,' in b or '\"id\": 10,' in b or '\"id\": 13,' in b or '\"id\": 14,' in b or '?x=1' in h or '\"id\": 20,' in b or '\"id\": 21,' in b" 0
+    check "the credential reached the server in the calls its rule allows (get, getesc, b64), as Authorization: Bearer" \
+        got "'Authorization: Bearer $TOKV' in h and ('tools/call' in b or 'tools\\\\/call' in b)" 3
+    check "and nowhere else" got "'$TOKV' in h + b" 3
+    check "a body comes after its head intact (a chunked one with its framing)" \
+        got "'Transfer-Encoding: chunked' in h and b == json.dumps({'jsonrpc': '2.0', 'id': 15, 'method': 'tools/list'})"
+    check "the escaped name was decided as get_issue" \
+        rec "[r['resolved'] for r in by('4')] == ['$U#tools/call#get_issue'] and by('4')[0]['decision_final'] == 'ALLOW'"
+    check "each call is recorded (net.mcp): method, name, id, body length and SHA-256, protocol version" \
+        rec "(lambda r: r['mcp_method'] == 'tools/call' and r['mcp_name'] == 'get_issue' and r['protocol_version'] == '2025-06-18' and r['body_len'] > 0 and len(r['body_sha256']) == 64 and r['rule'] == 'mcp_allowed' and r['credential'] == 'tok' and r['credential_header'] == 'Authorization' and r['max_body'] == 1048576 and r['check'] == 'ok')(by('3')[0])"
+    check "the body's SHA-256 is of the body as sent" \
+        rec "__import__('hashlib').sha256(json.dumps({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}).encode()).hexdigest() == by('2')[0]['body_sha256']"
+    check "a notification is recorded as one, a string id as written" \
+        rec "any(r.get('notification') is True and r['mcp_method'] == 'notifications/initialized' for r in M) and by('\"six\"')[0]['rule'] == 'default_deny_unknown'"
+    check "the traceparent from _meta is recorded" rec "by('16')[0]['traceparent'] == '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'"
+    check "the refusals' rules: policy_match, mcp_unreadable, mcp_header_mismatch, max_body" \
+        rec "[r['rule'] for r in by('5')] == ['policy_match'] and sum(r['rule'] == 'mcp_unreadable' for r in M) == 4 and sum(r['rule'] == 'mcp_header_mismatch' for r in M) == 2 and sum(r['rule'] == 'max_body' for r in M) == 2"
+    check "a body over the deciding rule's max_body: refused by that rule's limit" \
+        rec "[(r['rule'], r['policy_line']) for r in by('13')] == [('max_body', 11)]"
+    check "a POST with a query to the endpoint is refused (net.request, mcp_query)" \
+        rec "any(r.get('action') == 'net.request' and r['rule'] == 'mcp_query' and '?x=1' in r['target'] for r in R)"
+    check "no call's value is in the verdict stream" sh -c "! grep -qF -- '$TOKV' '$OUT/m.log'"
+    AUD="$HERE/tools/varek_audit.py"
+    check "the audit accepts the run" python3 "$AUD" --policy "$POL" --checker "$CERT" "$OUT/m.log"
+    F="$HERE/tests/v1270_forge.py"
+    refuses() { if python3 "$AUD" --policy "$2" --checker "$CERT" "$3" > "$OUT/f.out" 2>&1; then flunk "the audit refuses $1"
+                elif grep -qF -- "$4" "$OUT/f.out"; then pass "the audit refuses $1"
+                else flunk "the audit refuses $1 ($(grep -m1 PROBLEM "$OUT/f.out"))"; fi; }
+    G='g = next(r for r in recs if isinstance(r, dict) and r.get("action") == "net.mcp" and r.get("rpc_id") == "3")'
+    python3 "$F" "$OUT/m.log" "$OUT/g1.log" "$G; g['target'] = g['resolved'] = g['resolved'].replace('get_issue', 'delete_repo')"
+    refuses "an allowed call passed off as another" "$POL" "$OUT/g1.log" "refused"
+    python3 "$F" "$OUT/m.log" "$OUT/g2.log" "$G; g['max_body'] = 99"
+    refuses "an allowed call whose max_body is not its rule's" "$POL" "$OUT/g2.log" "whose max_body is not its rule's"
+    python3 "$F" "$OUT/m.log" "$OUT/g3.log" "$G; g['action'] = 'net.request'; g['rule'] = 'request_allowed'; g['target'] = g['resolved'] = 'POST $U'; g['body'] = 'length'; g['body_declared'] = g['body_len']"
+    refuses "a POST to the endpoint recorded as a request" "$POL" "$OUT/g3.log" "decided as a request, not as an MCP call"
+    python3 "$F" "$OUT/m.log" "$OUT/g4.log" "$G; del g['credential'], g['credential_header']"
+    refuses "an allowed call without the credential its rule names" "$POL" "$OUT/g4.log" "recorded without it"
+    python3 "$F" "$OUT/m.log" "$OUT/g5.log" "g = next(r for r in recs if isinstance(r, dict) and r.get('action') == 'net.mcp' and r.get('rpc_id') == '5'); g['rule'] = 'default_deny_unknown'"
+    refuses "a call refused as matching no rule that a deny rule decides" "$POL" "$OUT/g5.log" "but policy line 9 matches it"
+    python3 "$F" "$OUT/m.log" "$OUT/g6.log" "$G; g['mcp_url'] = 'https://mcp.example.com:$PS/other'"
+    refuses "a call to a URL that is not an MCP endpoint" "$POL" "$OUT/g6.log" "which is not an MCP endpoint"
+    # a credential for= a confined MCP server: released only into its calls
+    if [ ! -x "$SUBP" ] || [ -z "$CGM" ]; then
+        skip "a credential for= an MCP server (needs tests/v1281_sub and a cgroup2 mount)"
+    else
+        cp "$SUBP" "$X/srv"; cp "$SUBP" "$X/sagent"; chmod 755 "$X/srv" "$X/sagent"
+        PYR="$(readlink -f /usr/bin/python3)"
+        SLX='allow path /usr/ readonly\nallow path /lib readonly\nallow path /lib64 readonly\nallow path /etc/ld.so.cache readonly\nallow path exact '"$X"'/agent.py readonly\n'
+        POLF="$OUT/mcpf.policy"
+        { printf 'require warden 1.31\nproxy inspect\nproxy ports %s\ncredential tok from file:%s/tok\n' "$PS" "$X"
+          printf 'mcp server files exec %s/srv\nallow exec %s for=files\n' "$X" "$PYR"
+          printf 'allow host mcp.example.com\nallow host mcp.example.com for=files\n'
+          printf 'allow mcp %s tools/list\n' "$U"
+          printf 'allow mcp %s tools/call get_* credential=tok for=files\n' "$U"
+          printf '%b' "$SLX"; printf '%b' "$SLX" | sed 's/$/ for=files/'
+        } > "$POLF"
+        : > "$OUT/got.jsonl"
+        env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$POLF" --dns-server "127.0.0.1:$DP" --trust-bundle "$X/bundle.pem" -- \
+            "$PYR" "$X/agent.py" "$PS" server > "$OUT/f1.out" 2> "$OUT/f1.log"
+        env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$POLF" --dns-server "127.0.0.1:$DP" --trust-bundle "$X/bundle.pem" -- \
+            "$X/sagent" spawn "$X/agent.py" "$X/srv" exec "$PYR" "$X/agent.py" "$PS" server > "$OUT/f2.out" 2> "$OUT/f2.log"
+        sed 's/^/     /' "$OUT/f1.out" "$OUT/f2.out"
+        check "the agent's own call, which only the server's rule allows, is refused" said_in f1 server "HTTP/1.1 403 Forbidden"
+        check "the server's call is allowed, and carries the credential its rule names" \
+            sh -c "grep -q '^CALL server HTTP/1.1 200 OK' '$OUT/f2.out' && [ \"\$(grep -c 'Bearer $TOKV' '$OUT/got.jsonl')\" = 1 ]"
+        check "the server's call is recorded as its own (its chain, certificate subject 1, the credential)" \
+            python3 -c "import json,sys
+M = [json.loads(l) for l in open('$OUT/f2.log') if l.startswith('{') and '\"net.mcp\"' in l]
+sys.exit(0 if len(M) == 1 and M[0]['obo'] == ['agent', 'subagent:files#1'] and M[0].get('cert_subject') == 1 and M[0]['credential'] == 'tok' else 1)"
+        check "the audit accepts both runs" sh -c "python3 '$AUD' --policy '$POLF' --checker '$CERT' '$OUT/f1.log' > /dev/null && python3 '$AUD' --policy '$POLF' --checker '$CERT' '$OUT/f2.log' > /dev/null"
+    fi
 fi
 
 echo

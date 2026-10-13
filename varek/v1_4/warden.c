@@ -219,6 +219,7 @@ typedef enum {
     ACT_NET_PROXY,       /* v1.26: a name:port the egress proxy read from a client */
     ACT_NET_REQUEST,     /* v1.26.1: a request of an inspected connection (its object) */
     ACT_FILE_CHANGE,     /* v1.29: a change by name (warden_change.inc.c): chg_op says which */
+    ACT_NET_MCP,         /* v1.31: an MCP call over HTTP (warden_pxdecide.inc.c): its object */
     ACT_OTHER,
 } action_kind_t;
 
@@ -309,6 +310,7 @@ static const char *action_kind_name(action_kind_t k) {
         case ACT_NET_PROXY:     return "net.proxy";
         case ACT_NET_REQUEST:   return "net.request";
         case ACT_FILE_CHANGE:   return "file.change";
+        case ACT_NET_MCP:       return "net.mcp";
         case ACT_OTHER:        return "other";
     }
     return "invalid";
@@ -591,13 +593,11 @@ static int policy_load(const char *path, struct policy *p) {
         return -1;
     }
     /* v1.31 (docs/security/v1.31-standards.md): the grammar is read (step 2)
-     * and confined subjects are decided by subject (step 3); the Warden does
-     * not yet decide MCP calls (step 4) or MCP tokens (step 5). Until it does, a policy that uses them is
+     * confined subjects are decided by subject (step 3) and MCP calls over
+     * HTTP (step 4); the Warden does not yet check MCP tokens (step 5). Until it does, a policy that uses them is
      * refused rather than run with them ignored. */
     {
         const char *later = NULL;
-        for (size_t i = 0; !later && i < p->v.n; i++)
-            if (p->v.rules[i].kind == VDP_KIND_MCP) later = "mcp rules";
         for (size_t k = 0; !later && k < p->v.ncreds; k++)
             if (p->v.creds[k].audience[0]) later = "MCP access tokens (audience=)";
         if (!later && p->v.nmcpres) later = "trust mcp-resource";
@@ -1118,6 +1118,11 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
          * decided; before 1.27, on the path as written */
         case ACT_PROCESS_EXEC: kind = VDP_KIND_EXEC; s = a->resolved[0] ? a->resolved : a->target; break;
         case ACT_NET_REQUEST: kind = VDP_KIND_REQUEST; s = a->resolved; break;      /* v1.26.1 */
+        case ACT_NET_MCP:                /* v1.31: an object vdp_mcp_object built, or none */
+            kind = VDP_KIND_MCP;
+            s = a->resolved;
+            if (s[0] == '\0') { a->why = "not_in_fragment"; return DEC_UNKNOWN; }
+            break;
         default:
             a->why = "not_in_fragment";
             return DEC_UNKNOWN;
@@ -1180,6 +1185,7 @@ static bool certify(const struct policy *p, struct action *a) {
         case ACT_NET_CONNECT:  kind = VDPC_HOST; s = a->resolved; break;   /* v1.21 */
         case ACT_NET_PROXY:    kind = VDPC_HOST; s = a->resolved; break;   /* v1.26 */
         case ACT_NET_REQUEST:  kind = VDPC_REQUEST; s = a->resolved; break; /* v1.26.1 */
+        case ACT_NET_MCP:      kind = VDPC_MCP; s = a->resolved; break;     /* v1.31 */
         case ACT_PROCESS_EXEC: kind = VDPC_EXEC; s = a->resolved[0] ? a->resolved : a->target; break;
         default:
             snprintf(a->check_why, sizeof a->check_why, "no certificate for this action kind");

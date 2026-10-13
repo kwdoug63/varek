@@ -1266,7 +1266,7 @@ def check_chain(ident, meta, records, run, problems):
         # the proxy's records are for whom the hand-off was
         if r.get("proxy_handoff") is True and type(r.get("proxy_conn")) is int:
             conn_obo[r["proxy_conn"]] = ob
-        elif r.get("action") in ("net.proxy", "net.request") and type(r.get("proxy_conn")) is int:
+        elif r.get("action") in ("net.proxy", "net.request", "net.mcp") and type(r.get("proxy_conn")) is int:
             want = conn_obo.get(r["proxy_conn"])
             if want is not None and ob != want:
                 problems.append(f"seq {seq}: the proxy's decision on connection {r['proxy_conn']} is for {ob!r}, "
@@ -1411,10 +1411,11 @@ def check_credentials(creds, cred_rules, meta, records, complete, problems, note
         if rec.get("rule") == "revoked" and not after(rec):
             problems.append(f"seq {rec.get('seq')}: refused as revoked, but no revocation is recorded before it")
             continue
-        if rec.get("action") != "net.request":
+        if rec.get("action") not in ("net.request", "net.mcp"):          # v1.31: an MCP call too
             continue
         has = "credential" in rec or "credential_header" in rec
-        allowed = rec.get("decision_final") == "ALLOW" and rec.get("rule") == "request_allowed"
+        allowed = rec.get("decision_final") == "ALLOW" and \
+            rec.get("rule") == ("mcp_allowed" if rec.get("action") == "net.mcp" else "request_allowed")
         want = cred_rules.get(rec.get("policy_line")) if allowed else None
         if has:
             if not allowed or want is None or (rec.get("credential"), rec.get("credential_header")) != want[:2]:
@@ -1511,7 +1512,24 @@ def check_dialed_denies(checker, policy, rules, dialed, problems):
 
 
 REQUEST_REFUSE_RULES = ("policy_match", "default_deny_unknown", "certificate_refused", "max_body",
-                        "fragment_escape_length", "revoked")       # v1.28: revoked
+                        "fragment_escape_length", "revoked",       # v1.28: revoked
+                        "mcp_query")                               # v1.31: a POST to an MCP endpoint with a query
+
+# v1.31 (section 3): an MCP call's refusals (net.mcp): by the policy, or a
+# call the proxy could not read (mcp_unreadable), whose Mcp-Method or
+# Mcp-Name header disagrees with its body (mcp_header_mismatch), or whose
+# body is over the limit (max_body)
+MCP_REFUSE_RULES = ("policy_match", "default_deny_unknown", "certificate_refused", "max_body",
+                    "fragment_escape_length", "revoked", "mcp_unreadable", "mcp_header_mismatch")
+MCP_BODY_DEFAULT = 1 << 20                 # an mcp rule without max_body=
+
+
+def mcp_endpoint(rules, url):
+    """v1.31: the most of a body the proxy reads for a POST to url, if an mcp
+    rule (any subject's) names url, else None. An mcp rule's constant is
+    <canonical URL>#<METHOD>#<NAME>."""
+    ls = [r["max_body"] or MCP_BODY_DEFAULT for r in rules if r["kind"] == "m" and r["c"].startswith(url + "#")]
+    return max(ls) if ls else None
 
 
 UNRESERVED = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
@@ -1574,10 +1592,10 @@ def check_requests(records, bodies, rules, problems, closes=(), order=None):
     # body's or close's position is the number of decision records before it)
     if order is not None:
         key = lambda x: order.get(id(x), 0)
-        events = [(key(r), 1, r) for r in records if r.get("action") == "net.request"] + \
+        events = [(key(r), 1, r) for r in records if r.get("action") in ("net.request", "net.mcp")] + \
                  [(key(b), 0, b) for _, b in bodies] + [(key(c), 2, c) for _, c in closes]
     else:
-        events = [(pos, 1, r) for pos, r in enumerate(records) if r.get("action") == "net.request"] + \
+        events = [(pos, 1, r) for pos, r in enumerate(records) if r.get("action") in ("net.request", "net.mcp")] + \
                  [(bpos - 0.5, 0, b) for bpos, b in bodies]
     pos_of = {id(r): p for p, r in enumerate(records)}
     for _, what, rec in sorted(events, key=lambda e: (e[0], e[1])):
@@ -1642,6 +1660,9 @@ def check_requests(records, bodies, rules, problems, closes=(), order=None):
             problems.append(f"seq {seq}: request {rs!r} of connection {cid} out of order, or before the last body")
             continue
         st["next"] += 1
+        if rec.get("action") == "net.mcp":                 # v1.31
+            check_mcp_call(rec, rules, st, conns[cid], problems)
+            continue
         obj, (_, hp, scheme) = rec.get("target"), conns[cid]
         m = re.fullmatch(r"([A-Z]{1,20}) " + re.escape(f"{scheme}://{hp}") + r"(/[\x21-\x7e]*)", str(obj))
         if not m or obj != rec.get("resolved") or rec.get("body") not in ("none", "length", "chunked"):
@@ -1650,6 +1671,20 @@ def check_requests(records, bodies, rules, problems, closes=(), order=None):
         bad = target_problem(m.group(2))
         if bad:
             problems.append(f"seq {seq}: a request object {obj!r} with {bad}, which the proxy must refuse")
+            continue
+        # v1.31: every POST to an MCP endpoint is an MCP call (net.mcp); one
+        # with a query is refused as such, and only that is mcp_query
+        url, qm, _ = obj.partition(" ")[2].partition("?")
+        ep = m.group(1) == "POST" and mcp_endpoint(rules, url) is not None
+        if ep and not qm:
+            problems.append(f"seq {seq}: a POST to the MCP endpoint {url} decided as a request, not as an MCP call")
+            continue
+        if rec.get("rule") == "mcp_query" and not ep:
+            problems.append(f"seq {seq}: a request refused as a POST with a query to an MCP endpoint, which it is not")
+            continue
+        if ep and rec.get("rule") != "mcp_query":
+            problems.append(f"seq {seq}: a POST with a query to the MCP endpoint {url} decided by request rules "
+                            f"(it is refused, mcp_query)")
             continue
         decl = rec.get("body_declared")
         if (rec["body"] == "length") != (type(decl) is int and decl >= 0):
@@ -1669,12 +1704,57 @@ def check_requests(records, bodies, rules, problems, closes=(), order=None):
             if rec["body"] != "none":
                 st["body"] = (rs, want, rec["body"], decl)
         elif dfin == "DENY" and rule in REQUEST_REFUSE_RULES:
-            st["refused"] = True
+            st["refused"] = rec.get("enforced") is not False    # v1.29: a dry run let it through
             if rule == "max_body" and rec.get("body") != "length":
                 problems.append(f"seq {seq}: a request refused for max_body without a declared length")
         else:
             problems.append(f"seq {seq}: a request decision {dfin!r} with rule {rule!r}, which the Warden does not write")
     return n
+
+
+def check_mcp_call(rec, rules, st, conn, problems):
+    """v1.31 (section 3): a net.mcp record, in its connection's sequence. Its
+    URL is an MCP endpoint of the connection (scheme://name:port/path, no
+    query); its target is URL#METHOD#NAME, and the object decided (resolved)
+    is the target, or "" for a call that could not be read; its body's
+    length and SHA-256 are recorded. Allowed (mcp_allowed): by an mcp rule
+    (the certificate re-check confirms it holds), with that rule's max_body
+    (MCP_BODY_DEFAULT when it has none) and a body within it. Refused: one
+    of MCP_REFUSE_RULES, and the connection takes no more requests."""
+    seq, (_, hp, scheme) = rec.get("seq"), conn
+    url, tg, rs = rec.get("mcp_url"), rec.get("target"), rec.get("resolved")
+    if not isinstance(url, str) or not re.fullmatch(re.escape(f"{scheme}://{hp}") + r"/[\x21-\x7e]*", url) or \
+            "?" in url or target_problem(url[len(f"{scheme}://{hp}"):]) or mcp_endpoint(rules, url) is None:
+        problems.append(f"seq {seq}: an MCP call to {url!r}, which is not an MCP endpoint of connection "
+                        f"{rec.get('proxy_conn')} ({scheme}://{hp})")
+        return
+    if not isinstance(tg, str) or not tg.startswith(url + "#") or tg.count("#") < 2 or \
+            not isinstance(rs, str) or (rs and rs != tg):
+        problems.append(f"seq {seq}: an MCP call whose object {tg!r} (decided as {rs!r}) is not one of {url}")
+        return
+    bl, bh = rec.get("body_len"), rec.get("body_sha256")
+    if type(bl) is not int or bl < 0 or not (isinstance(bh, str) and HEX64.fullmatch(bh)):
+        problems.append(f"seq {seq}: an MCP call without its body's length and SHA-256")
+        return
+    dfin, rule = rec.get("decision_final"), rec.get("rule")
+    if dfin == "ALLOW" and rule == "mcp_allowed":
+        cr = rec.get("cert_rule")
+        r = rules[cr] if isinstance(cr, int) and 0 <= cr < len(rules) else None
+        want = (r["max_body"] or MCP_BODY_DEFAULT) if r is not None else None
+        if r is None or r["kind"] != "m" or not rs or rec.get("max_body") != want:
+            problems.append(f"seq {seq}: an allowed MCP call whose rule is not an mcp rule, or whose max_body "
+                            f"is not its rule's")
+        elif bl > want:
+            problems.append(f"seq {seq}: an allowed MCP call with a body of {bl} bytes, over its rule's "
+                            f"max_body={want}")
+    elif dfin == "DENY" and rule in MCP_REFUSE_RULES:
+        st["refused"] = rec.get("enforced") is not False
+        unread = rule in ("mcp_unreadable", "mcp_header_mismatch")
+        if unread and (rs or not isinstance(rec.get("mcp_error"), str) or rec.get("enforced") is False):
+            problems.append(f"seq {seq}: an MCP call refused as {rule} with an object decided, or without why, "
+                            f"or let through")
+    else:
+        problems.append(f"seq {seq}: an MCP call decision {dfin!r} with rule {rule!r}, which the Warden does not write")
 
 
 def check_refused_requests(checker, policy, rules, records, problems):
@@ -1684,20 +1764,31 @@ def check_refused_requests(checker, policy, rules, records, problems):
     must have none; max_body must be an allow rule at its policy_line whose
     max_body is under the declared length. (An allowed request is re-checked
     by its certificate.) Asked of the checker."""
-    refused = [r for r in records if r.get("action") == "net.request" and r.get("decision_final") == "DENY"
+    # v1.31: an MCP call too (on the object decided), each by the rules of
+    # the subject it was decided for
+    refused = [r for r in records if r.get("action") in ("net.request", "net.mcp") and r.get("decision_final") == "DENY"
                and r.get("rule") in ("policy_match", "default_deny_unknown", "max_body")
-               and isinstance(r.get("target"), str)]
+               and isinstance(r.get("resolved" if r.get("action") == "net.mcp" else "target"), str)
+               and (r.get("action") == "net.request" or r.get("resolved"))]
     if not refused:
         return
+    try:
+        confined, forl = policy_confined(checker, policy)
+    except ValueError as e:
+        problems.append(f"checker failed: {e}")
+        return
+    obj = lambda r: r["resolved"] if r.get("action") == "net.mcp" else r["target"]
     h = subprocess.run([checker, policy, "holds"], capture_output=True, text=True,
-                       input="\n".join(r["target"].encode().hex() for r in refused) + "\n")
+                       input="\n".join(obj(r).encode().hex() for r in refused) + "\n")
     rows = h.stdout.split()
     if h.returncode != 0 or len(rows) != len(refused):
         problems.append(f"checker failed on the refused requests: {h.stderr.strip()}")
         return
-    reqs = [i for i, r in enumerate(rules) if r["kind"] == "r"]
     for rec, row in zip(refused, rows):
         seq, rule, line = rec.get("seq"), rec["rule"], rec.get("policy_line")
+        ks = expected_subject(rec.get("obo"), confined)
+        kind = "m" if rec.get("action") == "net.mcp" else "r"
+        reqs = [i for i, r in enumerate(rules) if r["kind"] == kind and forl.get(r["line"], 0) == ks]
         first = next((i for i in reqs if row[i] == "1"), None)
         fr = rules[first] if first is not None else None
         if rule == "default_deny_unknown":
@@ -1708,6 +1799,11 @@ def check_refused_requests(checker, policy, rules, records, problems):
             if fr is None or fr["allow"] or fr["line"] != line:
                 problems.append(f"seq {seq}: a request refused by policy line {line!r}, which is not the "
                                 f"deny rule that decides it")
+        elif kind == "m":                                  # v1.31: the body read, over the rule's limit
+            if fr is None or not fr["allow"] or fr["line"] != line or type(rec.get("body_len")) is not int or \
+                    rec["body_len"] <= (fr["max_body"] or MCP_BODY_DEFAULT):
+                problems.append(f"seq {seq}: an MCP call refused for max_body, but the rule that allows it "
+                                f"(line {line!r}) does not limit it below its body's length")
         elif fr is None or not fr["allow"] or fr["line"] != line or not fr["max_body"] or \
                 type(rec.get("body_declared")) is not int or rec["body_declared"] <= fr["max_body"]:
             problems.append(f"seq {seq}: a request refused for max_body, but the rule that allows it "
@@ -1752,8 +1848,8 @@ def check_closes(records, closes, complete, problems, bodies=()):
         # v1.26.1 (step 6): an inspected connection sends its server bytes
         # only after a request was allowed; it is cut (max_body) only after
         # a body that passed its rule's max_body
-        allowed = any(r.get("action") == "net.request" and r.get("proxy_conn") == cid and
-                      r.get("decision_final") == "ALLOW" for r in records)
+        allowed = any(r.get("action") in ("net.request", "net.mcp") and r.get("proxy_conn") == cid and
+                      (r.get("decision_final") == "ALLOW" or r.get("enforced") is False) for r in records)
         if insp and why != "unreported" and not allowed and e.get("bytes_up") != 0:
             problems.append(f"connection {cid}: an inspected connection relayed bytes though no request was allowed")
             continue
@@ -1769,7 +1865,7 @@ def check_closes(records, closes, complete, problems, bodies=()):
                             f"{'was' if exceeded else 'was not'} recorded")
             continue
         # step 7: the requests it counts are those recorded on it
-        nrq = sum(1 for r in records if r.get("action") == "net.request" and r.get("proxy_conn") == cid)
+        nrq = sum(1 for r in records if r.get("action") in ("net.request", "net.mcp") and r.get("proxy_conn") == cid)
         if why != "unreported" and ((insp and e.get("requests") != nrq) or (not insp and "requests" in e)):
             problems.append(f"connection {cid}: a close counting {e.get('requests')!r} requests, "
                             f"but {nrq} were recorded on it")
@@ -3044,6 +3140,8 @@ def main(argv=None):
         is_proxy = rec.get("action") == "net.proxy" and rec.get("rule") in PROXY_ALLOW_RULES
         # v1.26.1 (step 6): an inspected request, allowed: certified on its object
         is_req = rec.get("action") == "net.request" and rec.get("rule") == "request_allowed"
+        is_mcp = rec.get("action") == "net.mcp" and rec.get("rule") == "mcp_allowed"       # v1.31
+        is_req = is_req or is_mcp
         if not (is_open or is_meta or is_conn or is_proxy or is_req or is_exec):
             problems.append(f"seq {rec.get('seq')}: an authorization that is not a certified "
                             f"file open, lookup or connect ({rec.get('action')}, rule {rec.get('rule')})")
@@ -3127,7 +3225,7 @@ def main(argv=None):
             problems.append(f"seq {rec.get('seq')}: certificate recorded for subject {rec.get('cert_subject', 0)!r}, "
                             f"but the decision was for subject {ks} (its chain {rec.get('obo')!r})")
             continue
-        lines.append(f"{'request' if is_req else 'exec' if is_exec else 'host' if is_conn_like else 'path'} "
+        lines.append(f"{'mcp' if is_mcp else 'request' if is_req else 'exec' if is_exec else 'host' if is_conn_like else 'path'} "
                      f"{fl} {hx} {cr} {cw}" + (f" @{ks}" if ks else ""))
         which.append(rec)
         if is_conn and ("candidates" in rec or "candidates_sha256" in rec):
