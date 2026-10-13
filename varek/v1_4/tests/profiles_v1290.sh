@@ -66,6 +66,8 @@ vr() {
         VAREK_CONFIG="$CONF/varek.conf" VAREK_LIB_DIR="$LIB" VAREK_LOG_DIR="$LOGD" \
         timeout -s INT 100 python3 "$HERE/tools/varek" run "$@" < /dev/null > "$OUT/$n.out" 2> "$OUT/$n.err")
     echo $? > "$OUT/$n.rc"
+    # the agent's stderr is kept in the run's log ("[agent] " lines), and shown after the run
+    sed -n 's/^\[agent\] //p' "$(ls -t "$LOGD"/verdicts-*.log | head -1)" > "$OUT/$n.agent"
 }
 direct() {
     local n="$1"; shift
@@ -75,10 +77,11 @@ direct() {
     echo $? > "$OUT/$n.rc"
 }
 reset_proj() { as_user git -C "$H/proj" checkout -q .; as_user git -C "$H/proj" clean -qfdx; }
-# the agent's own lines, as the comparison reads them (no VAREK lines, no
-# times, session ids or temporary names)
+# the agent's own lines, as the comparison reads them: its stdout, then its
+# stderr (under VAREK, from the log); no times, session ids or the warnings
+# for what VAREK refuses
 norm() {
-    cat "$1.out" "$1.err" 2> /dev/null | sed 's/^\[agent\] //' | grep -v '^\[varek\]\|^\[warden\]\|^   \[warden\]\|^{' |
+    { cat "$1.out"; if [ -e "$1.agent" ]; then cat "$1.agent"; else cat "$1.err"; fi; } 2> /dev/null |
         sed -E 's/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z//g; s/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ID/g' |
         grep -v 'Permission denied\|could not create PATH aliases' | head -20
 }
