@@ -59,6 +59,7 @@ struct exec_file {
 static int exec_image_of(const char *path, dev_t *dev, ino_t *ino);      /* step 4, below */
 static void exec_mark_image(dev_t dev, ino_t ino);
 static int exec_pend_add(pid_t tid, dev_t edev, ino_t eino, uint64_t seq);
+static void exec_pend_last_sub(int s);                                   /* v1.28.1 */
 
 static struct exec_file *g_exec_rs;
 static size_t g_exec_n;
@@ -610,6 +611,19 @@ static void exec_launch(int notify_fd, const struct seccomp_notif *req, struct a
             d_final = DEC_DENY;
             rule = "exec_unresolved";
             a->extra[0] = '\0';
+        } else if (a->rule_index >= 0 && p->v.rules[a->rule_index].subagent[0]) {
+            /* v1.28.1: a sub-agent: its group made, the process moved, before the answer */
+            const char *srule = NULL;
+            int s = sub_launch((pid_t)req->pid, a->subject, p->v.rules[a->rule_index].subagent, idev, iino,
+                               g_records, &srule);
+            exec_pend_last_sub(s);               /* refused: the pending launch goes */
+            if (s < 0) {
+                d_final = DEC_DENY;
+                rule = srule;
+                a->extra[0] = '\0';
+            } else {
+                sub_launch_fields(a, s);
+            }
         }
     }
     struct timespec t1;
@@ -636,6 +650,7 @@ struct exec_pend {
     ino_t    eino, oino;
     uint64_t seq;          /* the exec_allowed record */
     int      pidfd;        /* the thread group, to tell it from a later one with its pid */
+    int      sub;          /* v1.28.1: the sub-agent it starts (0: none) */
 };
 static struct exec_pend g_xp[EXEC_PEND_MAX];
 static size_t g_nxp;
@@ -673,15 +688,25 @@ static void exec_result(const struct exec_pend *x, const char *result) {
     clock_gettime(CLOCK_REALTIME, &ts);
     FILE *f = rec_begin();
     fprintf(f, "{\"event\":\"exec_result\",\"run\":\"%s\",\"decision_seq\":%" PRIu64 ",\"agent_pid\":%d,"
-               "\"result\":\"%s\",\"timestamp_ns\":%lld}\n",
-            g_run_id, x->seq, (int)x->tgid, result, (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+               "\"result\":\"%s\",", g_run_id, x->seq, (int)x->tgid, result);
+    if (x->sub > 0) fprintf(f, "\"subagent\":\"%s#%u\",", g_sub[x->sub].name, g_sub[x->sub].n);   /* v1.28.1 */
+    fprintf(f, "\"timestamp_ns\":%lld}\n", (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end(NULL);
 }
 
 static void exec_pend_drop(size_t k, const char *result) {
     if (result) exec_result(&g_xp[k], result);
+    if (result && g_xp[k].sub > 0) sub_pend_end(g_xp[k].sub, result);      /* v1.28.1 */
     if (g_xp[k].pidfd >= 0) close(g_xp[k].pidfd);
     g_xp[k] = g_xp[--g_nxp];
+}
+
+/* v1.28.1: the launch just registered starts sub-agent s; or, s < 0, it was
+ * refused after all (no record: it never happened) */
+static void exec_pend_last_sub(int s) {
+    if (!g_nxp) return;
+    if (s < 0) exec_pend_drop(g_nxp - 1, NULL);
+    else g_xp[g_nxp - 1].sub = s;
 }
 
 /* Register a continued launch, before it is answered. 0, or -1 (refuse it). */

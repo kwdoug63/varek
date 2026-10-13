@@ -267,6 +267,8 @@ struct action {
     bool          special_addr;         /* connect: a special address, decided as a number */
     char          dialed[64];           /* connect: the numeric destination dialed */
     bool          proxy_handoff;        /* v1.26: a connect handed to the egress proxy */
+    int           subject;              /* v1.28.1: who the call is for (warden_subagent.inc.c): 0 the
+                                           agent, a sub-agent, or -1 (in no group of the run) */
     char          extra[4608];          /* extra record fields, trusted text, each ending in ',' */
 };
 
@@ -432,15 +434,6 @@ static int policy_load(const char *path, struct policy *p) {
                 "the trusted identities differently; refusing to start\n", path);
         return -1;
     }
-    /* v1.28.1 (docs/security/v1.28.1-delegation-chain.md): sub-agents are
-     * attributed from step 3; until then a policy that names one is refused,
-     * so no run claims attribution it does not have. */
-    for (size_t i = 0; i < p->v.n; i++)
-        if (p->v.rules[i].subagent[0]) {
-            fprintf(stderr, "[warden] policy %s:%d: subagent=: attributing a sub-agent's calls is not built "
-                    "in this Warden yet (v1.28.1 step 3); refusing to start\n", path, p->v.rules[i].line);
-            return -1;
-        }
     /* v1.13: load-time analysis. The decision procedure decides, for every
      * rule, whether ANY action can reach it as the first matching rule. A rule
      * that can never fire is almost always a policy bug (typically a deny
@@ -1392,7 +1385,7 @@ static bool       g_any_wild = false;  /* v1.25: the policy has a wildcard allow
 static void       stub_resolved(size_t i);
 static void       px_resolved(size_t i);  /* v1.26: proxied requests waiting on a lookup */
 static bool       px_up_charged(const char *name);  /* v1.26 review: sent to the upstream, charged */
-static void       px_handed_off(uint64_t id, unsigned port);  /* v1.26 review: a hand-off announced */
+static void       px_handed_off(uint64_t id, unsigned port, int subject);  /* v1.26 review: a hand-off announced */
 static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden_stub.inc.c) */
 /* v1.25 (section 4): a wildcard allow rule's budgets when it sets none */
 #define STUB_DEFAULT_NAMES 256           /* distinct new names per run */
@@ -1404,6 +1397,11 @@ static ws_t       g_secrets = { .ctl = -1 };        /* v1.28: warden-secrets, wh
 static char       g_secrets_sha[65];                /* v1.28: the SHA-256 of the warden-secrets that ran */
 static ws_meta_t  g_cred_meta[WS_MAX_CREDS];        /* v1.28: each credential's version and length (never its value) */
 static struct ws_identity g_identity;               /* v1.28.1: the verified user and agent (has_user, has_svid) */
+/* v1.28.1 step 3: sub-agents (warden_subagent.inc.c) */
+static bool g_sub_on;                               /* the policy names a sub-agent */
+static char g_cg_self[PATH_MAX];                    /* the run's group as /proc/<pid>/cgroup shows it */
+static void sub_obo(FILE *f, int s);
+static bool sub_cgroup_write(int fd, int flags);
 static char       g_cred_ph[WS_MAX_CREDS][WP_PH_MAX]; /* v1.28: each credential's placeholder (not a secret) */
 static char       g_cred_ph_sha[WS_MAX_CREDS][65];  /* v1.28: its SHA-256, for the record */
 static char       g_proxy_sha[65];                  /* v1.26.1: the SHA-256 of the warden-proxy that ran */
@@ -1700,6 +1698,7 @@ static void emit_on_behalf_of(FILE *f, const struct policy *p) {
         }
     }
     fprintf(f, "\"agent\":{\"run\":\"%s\"", g_run_id);
+    if (g_sub_on) { fputs(",\"cgroup\":\"", f); json_escape(f, g_cg_self); fputs("\"", f); }
     if (id->has_svid) {
         const vdp_spiffe_t *sp = &p->v.spiffe[id->spiffe];
         fputs(",\"spiffe_id\":\"", f);
@@ -2134,13 +2133,13 @@ static void emit_pathology(uint64_t seq,
         "{\"report_id\":\"pr-%ld.%09ld-%" PRIu64 "\","
         "\"run\":\"%s\","
         "\"seq\":%" PRIu64 ","
-        "\"agent_pid\":%d,"
-        "\"action\":\"%s\","
-        "\"target\":\"",
+        "\"agent_pid\":%d,",
         (long)ts.tv_sec, ts.tv_nsec, seq,
         g_run_id, g_records,
-        (int)pid,
-        action_kind_name(a->kind));
+        (int)pid);
+    /* v1.28.1: who it was for */
+    sub_obo(f, a->subject);
+    fprintf(f, "\"action\":\"%s\",\"target\":\"", action_kind_name(a->kind));
     json_escape(f, a->target);
     fputs("\",\"resolved\":\"", f);
     json_escape(f, a->resolved[0] ? a->resolved : "");
@@ -2679,6 +2678,13 @@ static int materialize_target(pid_t target_pid, const struct action *a,
                 "mount that is not noexec; refused\n", a->resolved);
         return -EACCES;
     }
+    if (sub_cgroup_write(fd, want)) {              /* v1.28.1: the control groups stay out of reach */
+        close(fd);
+        log_line_start();
+        fprintf(g_log, "[warden] sub-agents: %s is on a control group filesystem; opening it to write is "
+                "refused\n", a->resolved);
+        return -EACCES;
+    }
 
     if (!(want & O_NONBLOCK)) {
         int fl = fcntl(fd, F_GETFL);
@@ -3053,6 +3059,7 @@ static void syn_hosts_view(const struct policy *p, FILE *f);
 #include "warden_pxdecide.inc.c"     /* v1.26: the Warden's decisions on what the proxy reads */
 #include "warden_revoke.inc.c"       /* v1.28 step 4: revoking a run */
 #include "warden_trust.inc.c"        /* v1.26.1: the run's CA and the trust views */
+#include "warden_subagent.inc.c"     /* v1.28.1: sub-agents' control groups and attribution */
 #include "warden_exec.inc.c"         /* v1.27: the launch set and its Landlock ruleset */
 #include "warden_noexec.inc.c"       /* v1.27.1: writable directories mounted noexec */
 
@@ -3171,8 +3178,18 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         struct exec_ctx *ctx = ctx_get(req.pid);
         if (ctx) ctx->seq++;
 
+        /* v1.28.1: who the call is for, read before it is decided (the id
+         * is checked valid below: the thread read was the caller) */
+        g_sub_froze = false;
+        int subj = sub_attribute((pid_t)req.pid);
         struct action act;
-        if (derive_intent(&req, &act) < 0 || !notif_id_valid(notify_fd, req.id)) {
+        int dr = derive_intent(&req, &act);
+        act.subject = subj;
+        /* a failed sub-agent's group was frozen to move its processes back:
+         * that interrupts the caller's call, which the kernel restarts (and
+         * notifies again); this one is void, and not a decision */
+        if (g_sub_froze && !notif_id_valid(notify_fd, req.id)) continue;
+        if (dr < 0 || !notif_id_valid(notify_fd, req.id)) {
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                          + (t1.tv_nsec - t0.tv_nsec);
@@ -3186,6 +3203,15 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * answered, the calling process must run a program the Warden
          * decided to run (warden_exec.inc.c) */
         if (exec_identity(notify_fd, &req, &act, &t0)) continue;
+        /* v1.28.1: a launch settled there may have failed: its processes are the launcher's */
+        if (act.subject > 0) act.subject = sub_effective(act.subject);
+        if (g_sub_on && act.subject < 0) {
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            emit_pathology(g_report_seq++, req.pid, &act, DEC_DENY, DEC_DENY, "subagent_unattributed",
+                           (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec), EACCES);
+            send_simple(notify_fd, req.id, DEC_DENY);
+            continue;
+        }
 
         /* v1.28 step 4: after `varek revoke`, every call is refused */
         if (g_revoked) {
@@ -5171,6 +5197,8 @@ int main(int argc, char **argv) {
                             : g_nx[k].file ? " (a file)" : "", g_nx[k].line);
         }
     }
+    /* v1.28.1 step 3: sub-agents need cgroup v2 (a check makes no group) */
+    if (g_check_only && sub_setup(&p, true, !ra.drop) < 0) return 1;
     if (g_check_only) {
         /* v1.24: resolve each allowed name and report the ones that fail (a
          * name that does not resolve does not stop the Warden). */
@@ -5202,6 +5230,9 @@ int main(int argc, char **argv) {
                 strerror(errno));
         return 1;
     }
+    /* v1.28.1 step 3: the run's control group, named after the run */
+    if (sub_setup(&p, false, !ra.drop) < 0) return 1;
+    if (g_sub_on) atexit(sub_finish);
     /* v1.12.1: if stdout and stderr are the same file (2>&1), the agent's
      * stdout lands in the verdict stream unprefixed. Records stay
      * authenticated by run id and seq, and the exporter refuses a stream
@@ -5308,6 +5339,12 @@ int main(int argc, char **argv) {
 
     if (target == 0) {
         signal(SIGPIPE, SIG_DFL);       /* v1.16: an ignored signal survives execve */
+        /* v1.28.1: into the run's control group, while still root */
+        if (sub_enter_run() < 0) {
+            fprintf(stderr, "[warden-target] cannot enter the run's control group (%s); refusing to run\n",
+                    strerror(errno));
+            _exit(1);
+        }
         close(sv[0]);
         close(live[1]);
         close(errpipe[0]);

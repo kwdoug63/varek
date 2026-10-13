@@ -16,3 +16,4 @@ tests/test_v193_lifecycle
 tests/test_v1240_resolve
 tests/test_v1250_shared
 warden-secrets
+tests/v1281_sub

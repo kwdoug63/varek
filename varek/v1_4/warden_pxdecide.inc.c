@@ -62,9 +62,13 @@ static struct px_req g_px[PX_MAX_DIAL];
  * one twice. */
 static uint8_t  *g_ho_state;
 static uint16_t *g_ho_port;
+static int      *g_ho_subj;                    /* v1.28.1: whom the agent's connect was for */
 static size_t    g_ho_cap;
 
-static void px_handed_off(uint64_t id, unsigned port) {
+/* v1.28.1: the subject of hand-off id's connect (the proxy's records are its) */
+static int px_subject(uint64_t id) { return id < g_ho_cap && g_ho_subj ? g_ho_subj[id] : 0; }
+
+static void px_handed_off(uint64_t id, unsigned port, int subject) {
     if (id >= g_ho_cap) {
         size_t nc = g_ho_cap ? g_ho_cap * 2 : 1024;
         while (nc <= id) nc *= 2;
@@ -74,11 +78,15 @@ static void px_handed_off(uint64_t id, unsigned port) {
         uint16_t *pt = realloc(g_ho_port, nc * sizeof *pt);
         if (!pt) return;
         g_ho_port = pt;
+        int *sj = realloc(g_ho_subj, nc * sizeof *sj);
+        if (!sj) return;
+        g_ho_subj = sj;
         memset(g_ho_state + g_ho_cap, 0, nc - g_ho_cap);
         g_ho_cap = nc;
     }
     g_ho_state[id] = 1;
     g_ho_port[id] = (uint16_t)port;
+    g_ho_subj[id] = subject;
 }
 
 /* Step 7: the connections passed to the proxy and not yet closed, and when
@@ -412,6 +420,7 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
     q->sock = -1;
     q->entry = -1;
     q->a = a;
+    a->subject = px_subject(m->id);
     snprintf(q->name, sizeof q->name, "%s", m->name);
     clock_gettime(CLOCK_MONOTONIC, &q->t0);
     a->kind = ACT_NET_PROXY;
@@ -645,6 +654,7 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
     a->kind = ACT_NET_REQUEST;
     a->policy_line = -1;
+    a->subject = px_subject(m->id);
     memcpy(a->target, ob, ol + 1);
     memcpy(a->resolved, ob, ol + 1);
     decision_t d_raw = policy_decide(p, a);

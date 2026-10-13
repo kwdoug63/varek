@@ -74,7 +74,7 @@ CHECKER := checker/vdp_checker.c checker/vdp_checker.h
 # uses the host's resolver library.
 RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c shared_domains.c shared_domains.h warden_proxy.c warden_proxy.h proxy_parse.h warden_secrets.c warden_secrets.h warden_revoke.inc.c
 
-warden: warden.c warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c warden_exec.inc.c warden_noexec.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
+warden: warden.c warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c warden_exec.inc.c warden_noexec.inc.c warden_subagent.inc.c warden_revoke.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
 	@# v1.27: Landlock does not govern a memfd, so the agent must never make one
 	@# (docs/security/v1.27-program-launches.md): memfd_create stays hard-denied
@@ -406,7 +406,11 @@ test-v1280: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_ch
 	@./tests/test_v1280.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
 
 # v1.28.1: the on-behalf-of chain (docs/security/v1.28.1-delegation-chain.md)
-test-v1281: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check
+# v1.28.1 step 3: the sub-agent test program
+tests/v1281_sub: tests/v1281_sub.c
+	$(CC) -O2 -Wall -Wextra -pthread -o $@ $<
+
+test-v1281: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check tests/v1281_sub
 	@./tests/test_v1281.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
 
 # v1.26 step 5: the proxy's parsers, under ASan and UBSan: the vectors, then
@@ -460,7 +464,7 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared tests/proxy_parse_test tests/proxy_parse_fuzzer
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared tests/proxy_parse_test tests/proxy_parse_fuzzer tests/v1281_sub
 
 # v1.22: install the runtime and the `varek` command.
 #   sudo make install                  -> /opt/varek, plus /usr/local/bin/varek

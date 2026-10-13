@@ -15,6 +15,9 @@
 #      HTTPS, tokens of each algorithm and each failing check) and the agent's
 #      X.509-SVID (--agent-svid) against a trust bundle; run_start records
 #      on_behalf_of and the operator; the token is in no output.
+#   3. sub-agents: a control group per sub-agent launch (tests/v1281_sub);
+#      every call attributed (obo), through forks, a double fork, threads,
+#      nesting and a launch that fails; the groups out of the agent's reach.
 #
 #   test_v1281.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
@@ -120,10 +123,6 @@ else
     "$WARDEN" "$OUT/w2.txt" --check-startup > "$OUT/w2.out" 2>&1; echo $? > "$OUT/w2.rc"
     check "require on-behalf-of with no token refuses the start, saying so" \
         sh -c "! grep -qx 0 '$OUT/w2.rc' && grep -q 'give the user.s token with --on-behalf-of FILE' '$OUT/w2.out'"
-    printf '%b' "${R}allow exec /usr/bin/true subagent=a\nallow path /usr/ readonly\n" > "$OUT/w3.txt"
-    "$WARDEN" "$OUT/w3.txt" --check-startup > "$OUT/w3.out" 2>&1; echo $? > "$OUT/w3.rc"
-    check "until step 3, subagent= refuses the start, saying so" \
-        sh -c "! grep -qx 0 '$OUT/w3.rc' && grep -q 'not built in this Warden yet (v1.28.1 step 3)' '$OUT/w3.out'"
 fi
 
 echo "== 2. verifying the identities: warden-secrets =="
@@ -314,6 +313,98 @@ CASES
     printf '%b' "require warden 1.28\ntrust issuer $ISS audience varek-agent\ntrust spiffe example.test bundle $T/bundle.pem\n$LIBS" > "$T/s6.txt"
     go both "$T/s6.txt" --on-behalf-of "$T/tok" --agent-svid "$T/svid-good.pem"
     check "a user and an agent's SVID: both in on_behalf_of" sh -c "grep -qx 0 '$OUT/both.rc' && grep -q '\"user\":{\"issuer\":\"$ISS\"' '$OUT/both.out' && grep -q '\"spiffe_id\":\"spiffe://example.test/agents/coder\"' '$OUT/both.out'"
+fi
+
+echo "== 3. sub-agents: a control group each, every call attributed =="
+SUBP="$HERE/tests/v1281_sub"
+CGM="$(awk '$3 == "cgroup2" { print $2; exit }' /proc/self/mounts)"
+if [ "$(id -u)" != 0 ] || [ -z "$WARDEN" ] || [ ! -x "$SUBP" ] || [ -z "$CGM" ]; then
+    skip "section 3 (needs root, the warden, tests/v1281_sub and a cgroup2 mount)"
+else
+    B="$(mktemp -d /tmp/varek_v1281s.XXXXXX)"; chmod 755 "$B"
+    trap 'kill ${IDP:-} 2>/dev/null; rmdir "$CGM/v1281-other" 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $OUT ${T:-} $B" || rm -rf "$OUT" ${T:+"$T"} "$B"' EXIT
+    for n in agent a b; do cp "$SUBP" "$B/$n"; chmod 755 "$B/$n"; done
+    ln -s "$B/a" "$B/plain"; echo hi > "$B/f"; chmod 644 "$B/f"
+    SL='allow path /usr/ readonly\nallow path /lib readonly\nallow path /lib64 readonly\nallow path /etc/ld.so.cache readonly\n'
+    SP="require warden 1.28\nallow exec $B/a subagent=alpha\nallow exec $B/b subagent=beta\nallow exec $B/plain\nallow path $B/f readonly\n"
+    printf '%b' "$SP$SL" > "$B/p.txt"
+    # sgo <name> <agent args>: the agent's stream in $OUT/<name>.out, its stdout in $OUT/<name>.so
+    sgo() { local n="$1"; shift; timeout 60 "$WARDEN" "${POL:-$B/p.txt}" "${SOPT[@]}" -- "$B/agent" "$@" > "$OUT/$n.so" 2> "$OUT/$n.out"; echo $? > "$OUT/$n.rc"; }
+    SOPT=()
+    # opens <name>: each open of $B/f, as "pid obo" (obo joined with +), in order
+    opens() { python3 -c 'import json,sys
+for l in open(sys.argv[1]):
+    if l.startswith("{\"report_id\""):
+        r = json.loads(l)
+        if r["target"] == sys.argv[2] and r["action"] == "file.open": print(r["agent_pid"], "+".join(r["obo"]), r["decision_final"])' "$OUT/$1.out" "$B/f"; }
+    obos() { opens "$1" | awk '{print $2}' | sort -u | tr '\n' ' ' | sed 's/ $//'; }
+    sgo fork exec "$B/a" fork "$B/f"
+    [ "$(opens fork | awk '{print $1}' | sort -u | wc -l)" = 2 ] && pass "a sub-agent and the child it forks: two processes" \
+        || flunk "a sub-agent and the child it forks ($(opens fork | tr '\n' ';'))"
+    [ "$(obos fork)" = "agent+subagent:alpha#1" ] && pass "... attributed to it: agent+subagent:alpha#1" || flunk "... attributed to it ($(obos fork))"
+    check "its launch record names the sub-agent and its group" \
+        sh -c "grep -q '\"target\":\"$B/a\".*\"rule\":\"exec_allowed\"' '$OUT/fork.out' && grep -q '\"subagent\":\"alpha#1\",\"cgroup\":\"[^\"]*/varek-[0-9a-f]\{32\}/alpha-1\"' '$OUT/fork.out'"
+    check "the launch is recorded launched, for the sub-agent" grep -q '"result":"launched","subagent":"alpha#1"' "$OUT/fork.out"
+    check "its launch record is the agent's (who launched it)" \
+        sh -c "grep '\"target\":\"$B/a\"' '$OUT/fork.out' | grep -q '\"obo\":\\[\"agent\"\\]'"
+    sgo dfork exec "$B/a" doublefork "$B/f"
+    [ "$(obos dfork)" = "agent+subagent:alpha#1" ] && pass "a double fork that reparents the grandchild: still the sub-agent's" || flunk "a double fork ($(obos dfork))"
+    sgo thread exec "$B/a" thread "$B/f"
+    [ "$(obos thread)" = "agent+subagent:alpha#1" ] && pass "a thread of the sub-agent: the sub-agent's" || flunk "a thread ($(obos thread))"
+    sgo nest exec "$B/a" exec "$B/b" open "$B/f"
+    [ "$(obos nest)" = "agent+subagent:alpha#1+subagent:beta#1" ] && pass "a sub-agent launched by a sub-agent: the chain grows by one" || flunk "nested ($(obos nest))"
+    check "... its group under its launcher's" grep -q '"subagent":"beta#1","cgroup":"[^"]*/alpha-1/beta-1"' "$OUT/nest.out"
+    sgo two spawn "$B/f" "$B/a" open "$B/f"
+    [ "$(opens two | awk '{print $2}' | tr '\n' ' ')" = "agent+subagent:alpha#1 agent " ] \
+        && pass "the agent's own calls stay the agent's, after a sub-agent's" || flunk "the agent's own calls ($(opens two | tr '\n' ';'))"
+    sgo again spawn "$B/f" "$B/a" spawn "$B/f" "$B/a" open "$B/f"
+    check "two launches of one program: alpha#1, then alpha#2 (nested)" grep -q '"subagent":"alpha#2"' "$OUT/again.out"
+    sgo plain spawn "$B/f" "$B/plain" open "$B/f"
+    [ "$(obos plain)" = "agent" ] && pass "the same program launched by a rule without subagent=: the agent's" || flunk "plain ($(obos plain))"
+    sgo thr threaded "$B/a" open "$B/f"
+    check "a threaded process may not launch a sub-agent (subagent_threaded)" \
+        sh -c "grep -q '\"target\":\"$B/a\".*\"decision_final\":\"DENY\",\"rule\":\"subagent_threaded\"' '$OUT/thr.out' && grep -q 'launch refused: Permission denied' '$OUT/thr.so'"
+    sgo e2big e2big "$B/f" "$B/a"
+    check "a launch allowed and then failed by the kernel (E2BIG): recorded failed" \
+        sh -c "grep -q 'Argument list too long' '$OUT/e2big.so' && grep -q '\"result\":\"failed\",\"subagent\":\"alpha#1\"' '$OUT/e2big.out'"
+    [ "$(obos e2big)" = "agent" ] && [ "$(opens e2big | wc -l)" = 2 ] \
+        && pass "... the process and the child it forked after are the agent's again" || flunk "after a failed launch ($(opens e2big | tr '\n' ';'))"
+    check "... and no call is refused for it" sh -c "! grep -q 'intent_derivation_failed' '$OUT/e2big.out'"
+    check "every decision record carries obo" python3 -c 'import json,sys
+rs=[json.loads(l) for f in sys.argv[1:] for l in open(f) if l.startswith("{\"report_id\"")]
+sys.exit(0 if rs and all(isinstance(r.get("obo"), list) and r["obo"][:1] == ["agent"] for r in rs) else 1)' \
+        "$OUT/fork.out" "$OUT/nest.out" "$OUT/e2big.out" "$OUT/plain.out"
+    check "run_start names the run's control group" grep -q '"agent":{"run":"[0-9a-f]\{32\}","cgroup":"[^"]*/varek-[0-9a-f]\{32\}"}' "$OUT/fork.out"
+    check "the run's control groups are removed at its end" sh -c "! ls '$CGM' | grep -q '^varek-'"
+    # the groups out of the agent's reach
+    mkdir -p "$CGM/v1281-other"
+    printf '%b' "${SP}allow path $CGM/v1281-other/\n$SL" > "$B/pw.txt"
+    POL="$B/pw.txt" sgo esc write "$CGM/v1281-other/cgroup.procs"
+    check "the agent cannot write another control group's cgroup.procs, whatever the policy allows" \
+        sh -c "grep -q 'write open: Permission denied' '$OUT/esc.so' && grep -q 'is on a control group filesystem; opening it to write is refused' '$OUT/esc.out'"
+    printf '%b' "${SP}allow path /sys/\n$SL" > "$B/pw2.txt"
+    POL="$B/pw2.txt" sgo wpol open "$B/f"
+    check "refused: a policy that lets the agent write the control groups" \
+        sh -c "! grep -qx 0 '$OUT/wpol.rc' && grep -q 'the control groups must be out of the agent.s reach' '$OUT/wpol.out'"
+    VAREK_WARDEN_TEST_NO_CGROUP2=1 timeout 30 "$WARDEN" "$B/p.txt" -- "$B/agent" open "$B/f" > /dev/null 2> "$OUT/nocg.out"; echo $? > "$OUT/nocg.rc"
+    check "refused: sub-agents without cgroup v2" \
+        sh -c "! grep -qx 0 '$OUT/nocg.rc' && grep -q 'names a sub-agent, which needs cgroup v2' '$OUT/nocg.out'"
+    "$WARDEN" "$B/p.txt" --run-as root --check-startup > "$OUT/root.out" 2>&1; echo $? > "$OUT/root.rc"
+    check "refused: sub-agents with the agent as root" sh -c "! grep -qx 0 '$OUT/root.rc' && grep -q 'agent runs as root' '$OUT/root.out'"
+    "$WARDEN" "$B/p.txt" --check-startup > "$OUT/cs3.out" 2>&1
+    check "--check-startup: where the groups would go, and none made" \
+        sh -c "grep -q 'sub-agents: a run.s control groups go under $CGM' '$OUT/cs3.out' && ! ls '$CGM' | grep -q '^varek-'"
+    printf 'require warden 1.28\nallow path /usr/ readonly\n%b' "$SL" > "$B/none.txt"
+    POL="$B/none.txt" sgo none open "$B/f"
+    check "no sub-agent named: no control group, obo the agent" sh -c "! grep -q 'control group' '$OUT/none.out' && grep -q '\"obo\":\\[\"agent\"\\]' '$OUT/none.out'"
+    if [ -n "${ISS:-}" ]; then
+        printf '%b' "${SP}trust issuer $ISS audience varek-agent\n$SL" > "$B/pu.txt"
+        mint es256
+        SOPT=(--secrets-conf "$T/conf" --on-behalf-of "$T/tok")
+        POL="$B/pu.txt" sgo user exec "$B/a" open "$B/f"
+        SOPT=()
+        [ "$(obos user)" = "user+agent+subagent:alpha#1" ] && pass "with a verified user: user, agent, sub-agent" || flunk "with a user ($(obos user))"
+    else skip "obo with a user (section 2 did not run)"; fi
 fi
 
 echo
