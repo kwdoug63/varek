@@ -665,7 +665,8 @@ PROXY_REFUSE_RULES = ("policy_match", "default_deny_unknown", "fragment_escape_f
 PROXY_ALLOW_RULES = ("proxy_dialed", "proxy_dial_failed")
 PROXY_KINDS = ("tls", "http", "connect")
 CLOSE_WHY = ("closed", "reset", "idle", "run_end", "unreported", "upstream_refused",
-             "refused_request", "client_gone")       # v1.26 review: the last two
+             "refused_request", "client_gone",       # v1.26 review: the last two
+             "revoked")                              # v1.28 step 4
 # v1.26.1 (step 4): an inspected connection's own reasons
 TLS_CLOSE_WHY = ("server_tls", "client_tls", "tls_timeout", "max_body")   # step 6: max_body
 

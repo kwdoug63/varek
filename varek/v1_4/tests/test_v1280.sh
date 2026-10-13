@@ -12,6 +12,9 @@
 #   2. fetching: warden-secrets and each store, against stand-ins.
 #   3. the swap: placeholders in the agent's environment, the value put in
 #      by warden-proxy where an allowing rule names it, and nowhere else.
+#   4. revocation: `varek revoke` in mid-run; what is refused after, what is
+#      recorded, the proxy's values cleared, the Vault leases revoked; lease
+#      renewal.
 #
 #   test_v1280.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
@@ -356,6 +359,134 @@ PY
         rec "sum(1 for r in R if r.get('action') == 'net.request' and r.get('credential') == 'c1' and r.get('credential_header') == 'Authorization') >= 6"
     check "each refused swap is recorded (credential_refused, with why)" \
         rec "sum(1 for r in R if r.get('event') == 'credential_refused' and r.get('credential') in ('c1',) and r.get('why')) == 5"
+fi
+
+echo "== 4. revocation =="
+if [ -z "${SRV:-}" ] || [ -z "${S3:-}" ] || ! command -v setpriv > /dev/null; then
+    skip "section 4 (needs sections 2 and 3, and setpriv)"
+else
+    # the agent: a request with a credential, a connection it holds open, an
+    # address it resolved; then it waits on stdin while the run is revoked,
+    # and tries a request on the held connection, a file open and a connect
+    cat > "$X/agent4.py" <<'PY'
+import os, socket, ssl, sys
+P = int(sys.argv[1])
+ph = os.environ.get("VAREK_CRED_C1", "").encode()
+ctx = ssl.create_default_context()
+def conn(addr=("api.example.com", P)):
+    return ctx.wrap_socket(socket.create_connection(addr, 10), server_hostname="api.example.com")
+def req(tag, s):
+    try:
+        s.sendall(b"GET /v1/a HTTP/1.1\r\nHost: api.example.com:%d\r\nAuthorization: Bearer %s\r\n\r\n" % (P, ph))
+        out = b""
+        while True:
+            d = s.recv(4096)
+            if not d: break
+            out += d
+        print("REQ", tag, out.split(b"\r\n")[0].decode() or "EOF", flush=True)
+    except (OSError, ssl.SSLError) as e:
+        print("REQ", tag, "ERR", type(e).__name__, flush=True)
+def opn(tag):
+    try:
+        open("/usr/bin/true", "rb").close(); print("OPEN", tag, "ok", flush=True)
+    except OSError as e:
+        print("OPEN", tag, e.errno, flush=True)
+addr = socket.getaddrinfo("api.example.com", P, socket.AF_INET, socket.SOCK_STREAM)[0][4]
+req("before", conn(addr))
+opn("before")
+held = conn(addr)
+print("READY", flush=True)
+sys.stdin.readline()
+req("held", held)
+opn("after")
+try:
+    socket.create_connection(addr, 10).close(); print("CONNECT after ok", flush=True)
+except OSError as e:
+    print("CONNECT after", type(e).__name__, flush=True)
+PY
+    chmod 644 "$X/agent4.py"
+    POL4="$OUT/revoke.policy"
+    { printf 'require warden 1.28\nproxy inspect\nproxy ports %s\n' "$PS"
+      printf 'credential c1 from file:%s/v1\n' "$X"
+      printf 'credential sh from vault:database/creds/short#password\ncredential sk from vault:database/creds/stuck#password\n'
+      printf 'allow host api.example.com\n'
+      printf 'allow request GET https://api.example.com:%s/v1/a credential=c1 header=Authorization:Bearer\n' "$PS"
+      printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path exact %s/agent4.py readonly\n' "$X"
+    } > "$POL4"
+    n3=$(wc -l < "$OUT/got.jsonl")
+    : > "$SD/requests.log"
+    rm -f "$X/go"; mkfifo "$X/go"; exec 7<> "$X/go"
+    env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$POL4" --secrets-conf "$T/conf" --dns-server "127.0.0.1:$DP" \
+        --trust-bundle "$X/bundle.pem" -- /usr/bin/python3 "$X/agent4.py" "$PS" < "$X/go" > "$OUT/a4.out" 2> "$OUT/a4.log" &
+    W4=$!
+    for _ in $(seq 600); do grep -q READY "$OUT/a4.out" 2>/dev/null && break; sleep 0.1; done
+    # a renewal of the short lease is due at 2 s of its 3
+    for _ in $(seq 100); do grep -q 'renew database/creds/stuck' "$SD/requests.log" && grep -q 'renew database/creds/short' "$SD/requests.log" && break; sleep 0.1; done
+    RUN=$(sed -n 's/^.*revocation: varek revoke \([0-9a-f]\{32\}\) .*$/\1/p' "$OUT/a4.log" | head -1)
+    VK="$HERE/tools/varek"
+    check "the Warden names how to revoke the run, and its control socket is root's alone" \
+        sh -c "[ -n '$RUN' ] && [ \"\$(stat -c '%u %a' /run/varek/$RUN.ctl)\" = '0 600' ] && [ \"\$(stat -c '%u %a' /run/varek)\" = '0 700' ]"
+    setpriv --reuid 65534 --regid 65534 --clear-groups python3 "$VK" revoke "$RUN" > "$OUT/rv0.out" 2>&1; echo $? > "$OUT/rv0.rc"
+    check "refused: varek revoke by a user who is not root" sh -c "grep -q 'needs root' '$OUT/rv0.out' && ! grep -qx 0 '$OUT/rv0.rc'"
+    check "refused: a connection to the control socket by a user who is not root (the kernel)" \
+        setpriv --reuid 65534 --regid 65534 --clear-groups python3 -c "
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+try:
+    s.connect('/run/varek/$RUN.ctl')
+except PermissionError:
+    sys.exit(0)
+sys.exit(1)"
+    python3 "$VK" revoke "$RUN" > "$OUT/rv1.out" 2>&1; echo $? > "$OUT/rv1.rc"
+    check "varek revoke <run>: revoked" sh -c "grep -q '$RUN: revoked' '$OUT/rv1.out' && grep -qx 0 '$OUT/rv1.rc'"
+    python3 "$VK" revoke --all > "$OUT/rv2.out" 2>&1
+    check "varek revoke --all: that run is already revoked" grep -q "$RUN: already revoked" "$OUT/rv2.out"
+    for _ in $(seq 50); do grep -q 'revocation_leases' "$OUT/a4.log" && grep -q 'revocation_proxy' "$OUT/a4.log" && break; sleep 0.1; done
+    echo go >&7
+    wait $W4; echo $? > "$OUT/a4.rc"
+    exec 7>&-
+    sed 's/^/     /' "$OUT/a4.out"
+    check "before: the request with its credential, and the file open, were allowed" \
+        sh -c "grep -qx 'REQ before HTTP/1.1 200 OK' '$OUT/a4.out' && grep -qx 'OPEN before ok' '$OUT/a4.out'"
+    check "after: the connection the proxy held is closed; the request on it never reaches the server" \
+        sh -c "grep -Eqx 'REQ held (EOF|ERR .*)' '$OUT/a4.out' && [ \$(wc -l < '$OUT/got.jsonl') -eq \$(($n3 + 1)) ]"
+    check "after: the file open is refused (EACCES)" grep -qx "OPEN after 13" "$OUT/a4.out"
+    check "after: the connect is refused" grep -qx "CONNECT after PermissionError" "$OUT/a4.out"
+    check "the run is not ended by the revocation: the agent finished" sh -c "grep -qx 0 '$OUT/a4.rc'"
+    rec4() { python3 - "$OUT/a4.log" "$1" <<'PY'
+import json, sys
+recs = [json.loads(l[l.index("{"):]) for l in open(sys.argv[1], errors="replace") if l.lstrip().startswith("{") or ' {"' in l]
+sys.exit(0 if eval(sys.argv[2], {"R": recs}) else 1)
+PY
+    }
+    check "recorded: revoked, by uid 0" rec4 "any(r.get('event') == 'revoked' and r.get('by_uid') == 0 and r.get('by_pid', 0) > 0 for r in R)"
+    check "recorded: the file open and the connect after it, refused with rule revoked" \
+        rec4 "{r.get('action') for r in R if r.get('rule') == 'revoked' and r.get('decision_final') == 'DENY'} >= {'file.open', 'net.connect'}"
+    check "recorded: the proxy holds no value after (revocation_proxy, values_held 0)" \
+        rec4 "any(r.get('event') == 'revocation_proxy' and r.get('values_held') == 0 for r in R)"
+    check "recorded: the proxy closed the held connection (revoked)" \
+        rec4 "any(r.get('close_reason', r.get('why')) == 'revoked' for r in R)"
+    check "recorded: both Vault leases revoked (revocation_leases, 2 and 0 failed)" \
+        rec4 "any(r.get('event') == 'revocation_leases' and r.get('revoked') == 2 and r.get('failed') == 0 for r in R)"
+    check "the stand-in got each lease's revoke, with the token" \
+        sh -c "grep -q 'vault PUT revoke database/creds/short/Rn7 token=ok' '$SD/requests.log' && grep -q 'vault PUT revoke database/creds/stuck/Fx2 token=ok' '$SD/requests.log'"
+    check "a leased secret renewed at two thirds of its lease (lease_renewed, ttl 3; the stand-in got increment=3)" \
+        sh -c "grep -q 'vault PUT renew database/creds/short/Rn7 token=ok increment=3' '$SD/requests.log'" 
+    check "recorded: lease_renewed for sh" rec4 "any(r.get('event') == 'lease_renewed' and r.get('credential') == 'sh' and r.get('ttl') == 3 for r in R)"
+    check "recorded: a renewal Vault refuses (lease_renewal_failed, why), not retried" \
+        sh -c "python3 - '$OUT/a4.log' <<'PY' && [ \$(grep -c 'renew database/creds/stuck' '$SD/requests.log') -eq 1 ]
+import json, sys
+recs = [json.loads(l[l.index('{'):]) for l in open(sys.argv[1], errors='replace') if ' {\"' in l or l.lstrip().startswith('{')]
+sys.exit(0 if any(r.get('event') == 'lease_renewal_failed' and r.get('credential') == 'sk' and 'vault answered 400' in r.get('why', '') for r in recs) else 1)
+PY"
+    check "no renewal after the revocation" \
+        sh -c "! sed -n '/vault PUT revoke/,\$p' '$SD/requests.log' | grep -q 'PUT renew'"
+    check "no value is in the verdict stream" sh -c "! grep -Eq 'db-short|db-stuck|long-val' '$OUT/a4.log'"
+    check "the control socket is gone with the run" sh -c "[ ! -e /run/varek/$RUN.ctl ]"
+    python3 "$VK" revoke "$RUN" > "$OUT/rv3.out" 2>&1; echo $? > "$OUT/rv3.rc"
+    check "refused: a revoke for a run that has ended" sh -c "grep -q 'no such run is running' '$OUT/rv3.out' && ! grep -qx 0 '$OUT/rv3.rc'"
+    python3 "$VK" revoke 0123456789abcdef0123456789abcdef > "$OUT/rv4.out" 2>&1
+    check "refused: a revoke for a run that never was" grep -q "no such run is running" "$OUT/rv4.out"
 fi
 
 echo

@@ -168,6 +168,12 @@ int ws_hand_to(ws_t *w, int fd) {
     return r == (ssize_t)sizeof m ? 0 : -1;
 }
 
+int ws_revoke(ws_t *w) {
+    if (w->ctl < 0) { errno = ENOTCONN; return -1; }
+    struct ws_ready m = { .type = WS_MSG_REVOKE, .n = 0 };
+    return send_all(w->ctl, &m, sizeof m) ? 0 : -1;
+}
+
 void ws_stop(ws_t *w) {
     if (w->ctl >= 0) close(w->ctl);
     w->ctl = -1;

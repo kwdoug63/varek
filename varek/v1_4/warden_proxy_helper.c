@@ -131,6 +131,7 @@ static unsigned char *g_cv;
 static size_t g_cv_len[WS_MAX_CREDS];
 static char g_ph[WS_MAX_CREDS][WP_PH_MAX];
 static bool g_cv_locked;
+static bool g_px_revoked;            /* v1.28 step 4: the run was revoked */
 
 /* Step 7: a relayed connection ends: report it (bytes each way, how long). */
 static void report_close(const struct wp_held *h, const char *why) {
@@ -706,6 +707,7 @@ static void report_body(struct wp_held *h, int exceeded) {
  * is replaced by the value. NULL, or why not (nothing is changed). */
 static const char *cred_swap(struct wp_held *h, const struct wp_reqverdict *v) {
     unsigned idx = v->cred - 1;
+    if (g_px_revoked) return "the run was revoked";
     if (idx >= WS_MAX_CREDS || !g_cv || !g_cv_len[idx] || !g_ph[idx][0]) return "the credential is not held";
     if (!memchr(v->hdr, 0, sizeof v->hdr) || !memchr(v->scheme, 0, sizeof v->scheme) || !v->hdr[0])
         return "a malformed verdict";
@@ -1097,6 +1099,31 @@ static int wp_drain_ctl(int ctl) {
             continue;
         }
         if (fd >= 0) close(fd);
+        /* v1.28 step 4: the run is revoked: clear every value and
+         * placeholder, close every connection, say how many values remain */
+        if (n == (ssize_t)sizeof(struct wp_msg) && m.type == WP_MSG_REVOKE) {
+            if (g_cv) OPENSSL_cleanse(g_cv, (size_t)WS_MAX_CREDS * WS_MAX_VALUE);
+            memset(g_cv_len, 0, sizeof g_cv_len);
+            OPENSSL_cleanse(g_ph, sizeof g_ph);
+            g_px_revoked = true;
+            while (g_nheld) {
+                struct wp_held *h = &g_held[g_nheld - 1];
+                if (h->state == WH_RELAY || h->state == WH_UPSTREAM || h->state == WH_TLS) h->why = "revoked";
+                held_drop(g_nheld - 1);
+            }
+            /* what the memory holds, not what the table says: each value's
+             * slot, any byte not zero */
+            uint32_t held = 0;
+            for (size_t i = 0; g_cv && i < WS_MAX_CREDS; i++) {
+                const unsigned char *v = g_cv + i * WS_MAX_VALUE;
+                unsigned char any = 0;
+                for (size_t k = 0; k < WS_MAX_VALUE; k++) any |= v[k];
+                held += any != 0;
+            }
+            struct wp_creds r = { .type = WP_MSG_REVOKED, .n = held };
+            (void)send(ctl, &r, sizeof r, MSG_NOSIGNAL);
+            continue;
+        }
         /* v1.26.1, step 6: the verdict on an inspected request */
         if (n == (ssize_t)sizeof m.rv && m.type == WP_MSG_REQVERDICT) {
             int k = held_find(m.rv.id);

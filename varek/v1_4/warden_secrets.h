@@ -38,6 +38,10 @@ enum {
     WS_MSG_READY,
     WS_MSG_PROXY,                     /* v1.28 step 3: Warden -> helper, SCM_RIGHTS: the socket to warden-proxy */
     WS_MSG_VALUE,                     /* helper -> warden-proxy, on that socket: one value */
+    /* step 4 */
+    WS_MSG_REVOKE,                    /* Warden -> helper (struct ws_ready): revoke the run's leases */
+    WS_MSG_REVOKED,                   /* helper -> Warden (struct ws_revoked) */
+    WS_MSG_RENEWED,                   /* helper -> Warden (struct ws_renewed): a lease renewed, or not */
 };
 
 #define WS_MAX_CREDS   32
@@ -79,6 +83,24 @@ struct ws_ready {
     uint32_t n;                       /* credentials fetched */
 };
 
+/* Step 4: the run's Vault leases revoked (how many, how many could not be) */
+struct ws_revoked {
+    uint32_t type;                    /* WS_MSG_REVOKED */
+    uint32_t revoked;
+    uint32_t failed;
+    uint32_t pad;
+};
+
+/* Step 4: a leased secret renewed before its lease ended (ok, its new
+ * lease in seconds), or not (why) */
+struct ws_renewed {
+    uint32_t type;                    /* WS_MSG_RENEWED */
+    uint32_t index;
+    uint32_t ok;
+    uint32_t ttl;
+    char     why[160];
+};
+
 /* Step 3: one value, helper -> warden-proxy (never through the Warden) */
 struct ws_value {
     uint32_t      type;               /* WS_MSG_VALUE */
@@ -117,6 +139,10 @@ int ws_fetch(ws_t *w, const char *conf, size_t n, const int *store, const char *
 /* Step 3: give the helper one end of a socket to warden-proxy; it writes
  * each value there, then clears its own copies. 0, or -1. */
 int ws_hand_to(ws_t *w, int fd);
+
+/* Step 4: ask the helper to revoke the run's leases (its answer comes on
+ * the control socket: WS_MSG_REVOKED). 0, or -1. */
+int ws_revoke(ws_t *w);
 
 /* Close the control socket: the helper clears its values and exits. */
 void ws_stop(ws_t *w);

@@ -33,7 +33,7 @@ AWS_ID, AWS_SECRET = "AKIDV1280TEST", "v1280-test-secret-key/abc"
 ROLE_ID, ROLE_SECRET, ROLE_TOKEN = "ASIAROLEV1280", "role-secret-v1280", "role-session-token-v1280"
 VALUES = {                                     # what each store holds (test values, not secrets)
     "vault2": "vault-kv2-value-7f3a", "vault1": "vault-kv1-value-91c2", "lease": "db-password-5d8e",
-    "aws": "aws-sm-value-c4b1",
+    "short": "db-short-6b1f", "stuck": "db-stuck-0c4a", "aws": "aws-sm-value-c4b1",
 }
 LOG = open(os.path.join(D, "requests.log"), "a", buffering=1)
 
@@ -126,6 +126,12 @@ class Stores(http.server.BaseHTTPRequestHandler):
             if p == "/v1/database/creds/ro":
                 return self.send(200, {"lease_id": "database/creds/ro/AbC123", "lease_duration": 3600,
                                        "renewable": True, "data": {"password": VALUES["lease"], "username": "u"}})
+            if p == "/v1/database/creds/short":                       # v1.28 step 4: renewed at 2 s
+                return self.send(200, {"lease_id": "database/creds/short/Rn7", "lease_duration": 3,
+                                       "renewable": True, "data": {"password": VALUES["short"], "username": "u"}})
+            if p == "/v1/database/creds/stuck":                       # its renewal is refused
+                return self.send(200, {"lease_id": "database/creds/stuck/Fx2", "lease_duration": 3,
+                                       "renewable": True, "data": {"password": VALUES["stuck"], "username": "u"}})
             if p == "/v1/secret/data/agents/nl":
                 return self.send(200, {"data": {"data": {"token": "two\nlines"}, "metadata": {"version": 1}}})
             return self.send(404, {"errors": []})
@@ -145,6 +151,23 @@ class Stores(http.server.BaseHTTPRequestHandler):
         self.send(404, b"")
 
     def do_PUT(self):
+        if self.path in ("/v1/sys/leases/revoke", "/v1/sys/leases/renew"):      # v1.28 step 4
+            ok = self.headers.get("X-Vault-Token") == VAULT_TOKEN
+            try:
+                j = json.loads(self.body() or b"{}")
+            except ValueError:
+                j = {}
+            op = self.path.rsplit("/", 1)[1]
+            lid = j.get("lease_id", "-")
+            LOG.write(f"vault PUT {op} {lid} token={'ok' if ok else 'bad'}"
+                      + (f" increment={j.get('increment')}" if op == "renew" else "") + "\n")
+            if not ok:
+                return self.send(403, {"errors": ["permission denied"]})
+            if op == "revoke":
+                return self.send(204, b"")
+            if lid.endswith("/Fx2"):
+                return self.send(400, {"errors": ["lease is not renewable"]})
+            return self.send(200, {"lease_id": lid, "lease_duration": 3, "renewable": True, "data": None})
         if self.path == "/latest/api/token" and self.headers.get("X-aws-ec2-metadata-token-ttl-seconds"):
             LOG.write("imds PUT token\n")
             b = b"imds-token-v1280"

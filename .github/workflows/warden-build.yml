@@ -66,7 +66,7 @@ jobs:
         run: sudo make -C varek/v1_4 test-v1270
       - name: v1.27.1 nothing written during the run is mapped executable (the writable directories, the mounts, what the agent sees, records and tools)
         run: sudo make -C varek/v1_4 test-v1271
-      - name: v1.28 credential release (the grammar, fetching with warden-secrets, the swap)
+      - name: v1.28 credential release (the grammar, fetching with warden-secrets, the swap, revocation)
         run: sudo make -C varek/v1_4 test-v1280
       - name: Build and test the plan_verify CLI (v1_6, v1.16.3)
         run: make -C v1_6 plan_verify check check-plan-verify

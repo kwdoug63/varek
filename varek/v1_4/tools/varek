@@ -33,6 +33,7 @@ import platform
 import re
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -974,6 +975,67 @@ def cmd_runs(args):
     return 0
 
 
+# v1.28 step 4: revoking a running run, through the control socket the
+# Warden opens for it (root's, /run/varek/<run>.ctl)
+CTL_DIR = "/run/varek"
+RUN_ID_RX = re.compile(r"^[0-9a-f]{32}$")
+
+
+def revoke_one(run):
+    """The Warden's answer, or None when no run by that id is running."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    s.settimeout(30)
+    try:
+        s.connect(os.path.join(CTL_DIR, run + ".ctl"))
+        s.send(b"revoke")
+        return s.recv(256).decode("ascii", "replace") or "refused: no answer"
+    except (FileNotFoundError, ConnectionRefusedError):
+        return None
+    except OSError as e:
+        return f"refused: {e.strerror or e}"
+    finally:
+        s.close()
+
+
+def cmd_revoke(args):
+    need_root("revoke")
+    if args.all:
+        if args.run:
+            raise CliError("give a run or --all, not both")
+        try:
+            runs = sorted(f[:-4] for f in os.listdir(CTL_DIR) if f.endswith(".ctl") and RUN_ID_RX.match(f[:-4]))
+        except FileNotFoundError:
+            runs = []
+        if not runs:
+            info("No run is running that can be revoked.")
+            return 0
+    elif not args.run:
+        raise CliError("which run?", fix="`varek revoke <run>` (the Warden prints it at the start), "
+                       "a verdict log, or `varek revoke --all`")
+    else:
+        run = args.run
+        if os.path.isfile(run):
+            first = next((r for r in read_records(run) if r.get("event") == "run_start"), {})
+            run = first.get("run", "")
+        if not RUN_ID_RX.match(run):
+            raise CliError(f"not a run id: {args.run}", fix="a run id is 32 hex digits; the Warden prints it at the start")
+        runs = [run]
+    rc = 0
+    for run in runs:
+        ans = revoke_one(run)
+        if ans is None and args.all:
+            info(f"  {run}: has ended (a control socket left behind)")
+        elif ans is None:
+            fail(f"{run}: no such run is running (it has ended, or never had a control socket)")
+            rc = 1
+        elif ans in ("revoked", "already revoked"):
+            ok(f"{run}: {ans}")
+        else:
+            fail(f"{run}: {ans}")
+            rc = 1
+    return rc
+
+
 def policy_line_text(path, n):
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
@@ -1000,6 +1062,8 @@ RULE_WORDS = {
     # v1.27: launches
     "deny_only_nonfile_v191": "a launch after the agent's own: refused without `require warden 1.27`",
     "exec_unresolved": "the launch's path could not be resolved to a program file",
+    # v1.28
+    "revoked": "the run was revoked (varek revoke): every call after that is refused",
 }
 
 # v1.27: the launch refusals varek refusals spells out (word, explanation)
@@ -1438,6 +1502,14 @@ def build_parser():
 
     sp = add("runs", cmd_runs, "list recent runs")
     sp.add_argument("-n", type=int, default=10, help="how many (default 10)")
+
+    sp = add("revoke", cmd_revoke, "revoke a running run: every later call is refused (root)",
+             epilog="The Warden records `revoked`, refuses every later file open, connect and request, "
+                    "the egress proxy clears every credential value it holds, and warden-secrets "
+                    "revokes the run's Vault leases. What was already sent stays sent; the run goes "
+                    "on, held to refusals, and ends as it would.")
+    sp.add_argument("run", nargs="?", help="the run id (or a running run's verdict log)")
+    sp.add_argument("--all", action="store_true", help="revoke every running run")
 
     sp = add("refusals", cmd_refusals, "list the actions refused in a run, and why")
     sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")

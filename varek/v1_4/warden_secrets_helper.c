@@ -13,7 +13,15 @@
 // instance metadata service for AWS credentials.
 //
 // Values are kept in one locked, non-dumped arena, never sent to the
-// Warden, never written; when the control socket closes they are cleared.
+// Warden, never written; once handed to warden-proxy, or when the control
+// socket closes, they are cleared.
+//
+// Step 4 (section 4 of the plan): a Vault secret with a lease is renewed at
+// two thirds of its lease (WS_MSG_RENEWED, each time, renewed or not; a
+// renewal that fails is not retried), and on WS_MSG_REVOKE every lease of
+// the run is revoked (WS_MSG_REVOKED). For that the Vault token stays, in
+// the arena's last page, while the run holds a lease; else it is cleared
+// after the fetch.
 //
 // The configuration (the Warden's --secrets-conf, default
 // /etc/varek/secrets.conf), one `key = value` a line, `#` comments:
@@ -66,22 +74,39 @@ static int g_ctl = 3;
 
 /* ---- the arena: every value, locked and not dumped ---- */
 
+#define VALUES_LEN  ((size_t)WS_MAX_CREDS * WS_MAX_VALUE)
+#define TOKEN_MAX   4096
+
 static unsigned char *g_arena;
 static size_t g_arena_len;
 static struct { size_t off, len; } g_val[WS_MAX_CREDS];
+static char *g_vault_token;           /* the arena's last page */
 
 static int arena_init(void) {
-    g_arena_len = (size_t)WS_MAX_CREDS * WS_MAX_VALUE;
+    g_arena_len = VALUES_LEN + TOKEN_MAX;
     g_arena = mmap(NULL, g_arena_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (g_arena == MAP_FAILED) { g_arena = NULL; return -1; }
     if (mlock(g_arena, g_arena_len) < 0) return -1;
     (void)madvise(g_arena, g_arena_len, MADV_DONTDUMP);
+    g_vault_token = (char *)g_arena + VALUES_LEN;
     return 0;
 }
 
 static void arena_clear(void) {
-    if (g_arena) OPENSSL_cleanse(g_arena, g_arena_len);
+    if (g_arena) OPENSSL_cleanse(g_arena, VALUES_LEN);
 }
+
+static void token_clear(void) {
+    if (g_vault_token) OPENSSL_cleanse(g_vault_token, TOKEN_MAX);
+}
+
+/* Step 4: the run's Vault leases (a credential's index is its slot) */
+static struct {
+    char id[140];
+    uint32_t ttl;                     /* seconds */
+    long long due_ms;                 /* the next renewal (mono_ms) */
+    bool live, renewable;
+} g_lease[WS_MAX_CREDS];
 
 /* A value goes in one header: 1 to WS_MAX_VALUE bytes, no CR, LF or NUL. */
 static const char *value_store(unsigned idx, const unsigned char *v, size_t n) {
@@ -184,7 +209,6 @@ static struct {
     char aws_region[64], aws_endpoint[512], aws_ca[4096], aws_credentials_file[4096], aws_imds[512];
 } g_conf;
 
-static char g_vault_token[4096];
 static struct { char id[256], secret[256], token[4096]; bool have; } g_aws;
 
 static char *trim(char *s) {
@@ -576,7 +600,9 @@ static void vault_fetch(unsigned idx, const char *ref) {
     }
     OPENSSL_cleanse(hdr, sizeof hdr);
     const char *e = body + bl;
-    char version[160] = "";
+    char version[160] = "", lease[140] = "";
+    uint32_t lttl = 0;
+    bool lrenew = false;
     const char *data = status == 200 ? jget(body, e, "data") : NULL;
     const char *inner = data ? jget(data, e, "data") : NULL, *meta = data ? jget(data, e, "metadata") : NULL;
     const char *fv = NULL;
@@ -590,10 +616,20 @@ static void vault_fetch(unsigned idx, const char *ref) {
     } else if (data) {                                                       /* KV version 1, or a lease */
         fv = jget(data, e, h + 1);
         const char *lid = jget(body, e, "lease_id");
-        char lease[140] = "";
         long ll = lid ? jstr(lid, e, lease, sizeof lease - 1) : -1;
-        if (ll > 0) { lease[ll] = '\0'; snprintf(version, sizeof version, "lease:%s", lease); }
-        else snprintf(version, sizeof version, "kv1");
+        if (ll > 0) {
+            lease[ll] = '\0';
+            snprintf(version, sizeof version, "lease:%s", lease);
+            const char *ld = jget(body, e, "lease_duration"), *rn = jget(body, e, "renewable");
+            if (ld && isdigit((unsigned char)*ld)) {
+                unsigned long long t = strtoull(ld, NULL, 10);
+                lttl = t > 86400ULL * 3650 ? 86400u * 3650 : (uint32_t)t;
+            }
+            lrenew = rn && e - rn >= 4 && !strncmp(rn, "true", 4);
+        } else {
+            lease[0] = '\0';
+            snprintf(version, sizeof version, "kv1");
+        }
     }
     char *val = malloc(WS_MAX_VALUE + 1);
     long vl = fv && val ? jstr(fv, e, val, WS_MAX_VALUE + 1) : -1;
@@ -604,10 +640,20 @@ static void vault_fetch(unsigned idx, const char *ref) {
     } else if (!data) bad = "vault's answer has no data";
     else if (!fv) bad = "vault's answer has no such field";
     else if (vl < 0) bad = "the field is not a string, or is longer than 8192 bytes";
+    else if (lease[0] && strspn(lease, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/._-") !=
+             strlen(lease))
+        bad = "vault's lease id holds a character outside A-Z a-z 0-9 / . _ -";
     else bad = value_store(idx, (unsigned char *)val, (size_t)vl);
     if (val) { OPENSSL_cleanse(val, WS_MAX_VALUE + 1); free(val); }
     OPENSSL_cleanse(body, bl);
     free(body);
+    if (!bad && lease[0]) {                                                  /* step 4 */
+        memcpy(g_lease[idx].id, lease, sizeof lease);
+        g_lease[idx].ttl = lttl;
+        g_lease[idx].renewable = lrenew && lttl > 0;
+        g_lease[idx].due_ms = mono_ms() + (long long)lttl * 2000 / 3;
+        g_lease[idx].live = true;
+    }
     if (bad) report(idx, false, NULL, 0, bad);
     else report(idx, true, version, (size_t)vl, NULL);
 }
@@ -806,6 +852,86 @@ static int drop_to(uid_t u, gid_t g) {
     return 0;
 }
 
+/* ---- step 4: the run's Vault leases ---- */
+
+/* PUT /v1/sys/leases/OP with the run's token */
+static int lease_put(const char *op, unsigned idx, uint32_t increment, int *status, char **out, size_t *ol,
+                     char *why, size_t wn) {
+    struct url u;
+    if (url_parse(g_conf.vault_addr, &u) < 0) { snprintf(why, wn, "vault_addr is not an http(s) URL"); return -1; }
+    char path[1100], hdr[TOKEN_MAX + 128], json[200];
+    snprintf(path, sizeof path, "%s/v1/sys/leases/%s", u.path, op);
+    snprintf(hdr, sizeof hdr, "X-Vault-Token: %s\r\nContent-Type: application/json\r\nAccept: application/json\r\n",
+             g_vault_token);
+    if (increment) snprintf(json, sizeof json, "{\"lease_id\":\"%s\",\"increment\":%u}", g_lease[idx].id, increment);
+    else snprintf(json, sizeof json, "{\"lease_id\":\"%s\"}", g_lease[idx].id);
+    int rc = http_do(&u, g_conf.vault_ca[0] ? g_conf.vault_ca : NULL, false, "PUT", path, hdr, json, strlen(json),
+                     status, out, ol, why, wn);
+    OPENSSL_cleanse(hdr, sizeof hdr);
+    return rc;
+}
+
+/* WS_MSG_REVOKE: revoke every lease the run holds; then the token goes */
+static void leases_revoke(void) {
+    struct ws_revoked r = { .type = WS_MSG_REVOKED };
+    for (unsigned i = 0; i < WS_MAX_CREDS; i++) {
+        if (!g_lease[i].live) continue;
+        char why[256], *o = NULL;
+        size_t ol = 0;
+        int st = 0;
+        if (lease_put("revoke", i, 0, &st, &o, &ol, why, sizeof why) == 0 && (st == 200 || st == 204)) r.revoked++;
+        else r.failed++;
+        if (o) { OPENSSL_cleanse(o, ol); free(o); }
+        g_lease[i].live = false;
+    }
+    token_clear();
+    ctl_send(&r, sizeof r);
+}
+
+/* Renew each renewable lease that is due, at two thirds of its lease; a
+ * renewal that fails is reported and not retried (the secret is not
+ * fetched again: the lease ends when Vault says) */
+static void leases_renew(void) {
+    long long now = mono_ms();
+    for (unsigned i = 0; i < WS_MAX_CREDS; i++) {
+        if (!g_lease[i].live || !g_lease[i].renewable || g_lease[i].due_ms > now) continue;
+        struct ws_renewed m = { .type = WS_MSG_RENEWED, .index = i };
+        char *o = NULL;
+        size_t ol = 0;
+        int st = 0;
+        if (lease_put("renew", i, g_lease[i].ttl, &st, &o, &ol, m.why, sizeof m.why) < 0) {
+        } else if (st != 200) {
+            snprintf(m.why, sizeof m.why, "vault answered %d", st);
+        } else {
+            const char *ld = jget(o, o + ol, "lease_duration");
+            if (!ld || !isdigit((unsigned char)*ld)) snprintf(m.why, sizeof m.why, "vault's answer has no lease_duration");
+            else {
+                unsigned long long t = strtoull(ld, NULL, 10);
+                m.ok = 1;
+                m.ttl = t > 86400ULL * 3650 ? 86400u * 3650 : (uint32_t)t;
+            }
+        }
+        if (o) { OPENSSL_cleanse(o, ol); free(o); }
+        if (m.ok && m.ttl > 0) {
+            g_lease[i].ttl = m.ttl;
+            g_lease[i].due_ms = mono_ms() + (long long)m.ttl * 2000 / 3;
+        } else {
+            g_lease[i].renewable = false;         /* at its longest, or failed: no more renewals */
+        }
+        ctl_send(&m, sizeof m);
+    }
+}
+
+/* How long until the next renewal is due: -1 for none */
+static int leases_wait(void) {
+    long long next = -1, now = mono_ms();
+    for (unsigned i = 0; i < WS_MAX_CREDS; i++)
+        if (g_lease[i].live && g_lease[i].renewable && (next < 0 || g_lease[i].due_ms < next)) next = g_lease[i].due_ms;
+    if (next < 0) return -1;
+    if (next <= now) return 0;
+    return next - now > 3600000 ? 3600000 : (int)(next - now);
+}
+
 static ssize_t ctl_recv(void *m, size_t n) {
     ssize_t r;
     while ((r = recv(g_ctl, m, n, 0)) < 0 && errno == EINTR) { }
@@ -850,7 +976,7 @@ int main(int argc, char **argv) {
         }
     }
     if (!failed && need_vault && g_conf.vault_token_file[0]) {
-        if (read_private(g_conf.vault_token_file, fbuf, sizeof g_vault_token - 1, &fl, NULL, why, sizeof why) < 0) {
+        if (read_private(g_conf.vault_token_file, fbuf, TOKEN_MAX - 1, &fl, NULL, why, sizeof why) < 0) {
             for (uint32_t i = 0; i < su.ncreds; i++) if (cr[i].store == STORE_VAULT) report(i, false, NULL, 0, why);
             failed = true;
         } else {
@@ -894,7 +1020,10 @@ int main(int argc, char **argv) {
         if (cr[i].store == STORE_VAULT) vault_fetch(i, cr[i].ref);
         else if (cr[i].store == STORE_AWSSM) aws_fetch(i, cr[i].ref);
     }
-    OPENSSL_cleanse(g_vault_token, sizeof g_vault_token);
+    bool leased = false;
+    for (uint32_t i = 0; i < su.ncreds; i++) leased |= g_lease[i].live;
+    if (failed) memset(g_lease, 0, sizeof g_lease);       /* no run: the leases end when Vault says */
+    if (failed || !leased) token_clear();
     OPENSSL_cleanse(&g_aws, sizeof g_aws);
     if (!failed) {
         size_t n = 0;
@@ -905,8 +1034,14 @@ int main(int argc, char **argv) {
         }
     }
     /* step 3: hand the values to warden-proxy, over the socket the Warden
-     * gives, then clear them here; wait until the control socket closes */
+     * gives, then clear them here; step 4: renew leases when due, revoke
+     * them when asked; until the control socket closes */
     for (;;) {
+        struct pollfd pf = { .fd = g_ctl, .events = POLLIN };
+        int pr = poll(&pf, 1, leases_wait());
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr < 0) break;
+        if (pr == 0) { leases_renew(); continue; }
         struct ws_ready m;
         union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
         struct iovec v = { &m, sizeof m };
@@ -918,6 +1053,11 @@ int main(int argc, char **argv) {
         for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c))
             if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS && c->cmsg_len == CMSG_LEN(sizeof(int)))
                 memcpy(&fd, CMSG_DATA(c), sizeof fd);
+        if (r == (ssize_t)sizeof m && m.type == WS_MSG_REVOKE && fd < 0) {
+            arena_clear();
+            leases_revoke();
+            continue;
+        }
         if (r != (ssize_t)sizeof m || m.type != WS_MSG_PROXY || fd < 0 || failed) {
             if (fd >= 0) close(fd);
             continue;
@@ -938,5 +1078,6 @@ int main(int argc, char **argv) {
         arena_clear();                       /* handed: no copy stays here */
     }
     arena_clear();
+    token_clear();
     return 0;
 }

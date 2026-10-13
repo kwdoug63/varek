@@ -165,6 +165,7 @@ static void px_close_record(uint64_t id, const char *why, const struct wp_close 
 static int px_closed(const struct wp_close *m) {
     static const char *const kWhy[] = { "closed", "reset", "idle", "run_end", "upstream_refused",
                                          "refused_request", "client_gone",
+                                         "revoked",           /* v1.28 step 4 */
                                          /* v1.26.1: an inspected connection only */
                                          "server_tls", "client_tls", "tls_timeout", "max_body" };
     bool ok = false;
@@ -179,7 +180,7 @@ static int px_closed(const struct wp_close *m) {
              * passed on to be inspected; the TLS reasons are an inspected
              * one's; and until requests are decided (step 6) nothing was
              * sent to an inspected connection's server */
-            if ((m->inspected != 0) != g_px_open[k].inspect || (wk >= 7 && !m->inspected) ||
+            if ((m->inspected != 0) != g_px_open[k].inspect || (wk >= 8 && !m->inspected) ||
                 (m->inspected && !g_px_open[k].allowed && m->bytes_up != 0) ||
                 (!strcmp(m->why, "max_body") != g_px_open[k].cut) ||
                 /* step 7: the requests it counts are those it reported */
@@ -668,6 +669,7 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     else if (!strcmp(rule, "max_body"))
         snprintf(why, sizeof why, "its body is over max_body=%llu (policy line %d)", (unsigned long long)maxb,
                  a->policy_line);
+    else if (!strcmp(rule, "revoked")) snprintf(why, sizeof why, "the run was revoked (varek revoke)");
     else if (d_raw == DEC_DENY) snprintf(why, sizeof why, "the policy denies it (line %d)", a->policy_line);
     else snprintf(why, sizeof why, "no request rule allows it");
     static const char *const kBody[] = { "none", "length", "chunked" };
@@ -777,7 +779,7 @@ static int px_credfail(const struct policy *p, struct wp_credfail *m) {
 static int proxy_service(const struct policy *p) {
     for (;;) {
         static union { struct wp_req r; struct wp_close c; struct wp_msg f; struct wp_httpreq hr;
-                       struct wp_httpbody hb; struct wp_credfail cf; uint32_t type; } u;
+                       struct wp_httpbody hb; struct wp_credfail cf; struct wp_creds cr; uint32_t type; } u;
         ssize_t n = recv(g_proxy.ctl, &u, sizeof u, MSG_DONTWAIT);
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
         if (n <= 0) return -1;                                  /* the proxy is gone */
@@ -792,6 +794,10 @@ static int proxy_service(const struct policy *p) {
         }
         if (n == (ssize_t)sizeof u.cf && u.type == WP_MSG_CREDFAIL) {          /* v1.28 */
             if (px_credfail(p, &u.cf) < 0) return -1;
+            continue;
+        }
+        if (n == (ssize_t)sizeof u.cr && u.type == WP_MSG_REVOKED) {           /* v1.28 step 4 */
+            revoked_proxy_record(u.cr.n);
             continue;
         }
         if (n == (ssize_t)sizeof u.c && u.type == WP_MSG_CLOSED) {

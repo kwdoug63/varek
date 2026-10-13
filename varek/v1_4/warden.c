@@ -855,6 +855,7 @@ static int derive_intent(const struct seccomp_notif *req,
 
 /* ---------------- Policy Decision ---------------- */
 
+static bool g_revoked;               /* v1.28 step 4: warden_revoke.inc.c */
 static decision_t policy_decide(const struct policy *p, struct action *a)
 {
     /* v1.13: every decision is made by the SMT decision procedure
@@ -867,6 +868,8 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
     a->policy_line = -1;
     a->rule_index = -1;
     a->why = NULL;
+    /* v1.28 step 4: after `varek revoke`, nothing more is allowed */
+    if (g_revoked) { a->why = "revoked"; return DEC_DENY; }
     vdp_kind_t kind;
     const char *s;
     switch (a->kind) {
@@ -912,6 +915,7 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
 /* v1.13: the record's rule id for a policy decision. An UNKNOWN because the
  * action lies outside the decision procedure's fragment is named as such. */
 static const char *decision_rule_id(const struct action *a, decision_t d_raw) {
+    if (a->why && !strcmp(a->why, "revoked")) return "revoked";          /* v1.28 step 4 */
     if (d_raw != DEC_UNKNOWN) return "policy_match";
     if (a->why && (!strcmp(a->why, "unknown_flag_bits") ||
                    !strcmp(a->why, "access_mode_3")))  return "fragment_escape_flags";
@@ -1938,10 +1942,13 @@ static void emit_unanswered(void) {
 }
 
 static void px_finish(void);           /* v1.26 step 7 (warden_pxdecide.inc.c) */
+static void revoked_proxy_record(uint32_t held); /* v1.28 step 4 (warden_revoke.inc.c) */
 static bool g_px_failed;               /* v1.26.1 review: the proxy misbehaved while flushing */
 static unsigned g_exec_mismatch;       /* v1.27: processes killed by the identity check */
 static void exec_finish(void);         /* v1.27: warden_exec.inc.c */
+static void ctl_close(void);
 static void emit_run_end(int exit_status) {
+    ctl_close();                        /* v1.28 step 4: no revocation after the end */
     px_finish();                        /* v1.26: every relay's proxy_close */
     exec_finish();                      /* v1.27: launches never seen */
     emit_unanswered();
@@ -2932,6 +2939,7 @@ static void syn_hosts_view(const struct policy *p, FILE *f);
 #include "warden_stub.inc.c"         /* v1.25: the stub resolver for wildcard names */
 #include "warden_synth.inc.c"        /* v1.26: synthetic addresses with the proxy on */
 #include "warden_pxdecide.inc.c"     /* v1.26: the Warden's decisions on what the proxy reads */
+#include "warden_revoke.inc.c"       /* v1.28 step 4: revoking a run */
 #include "warden_trust.inc.c"        /* v1.26.1: the run's CA and the trust views */
 #include "warden_exec.inc.c"         /* v1.27: the launch set and its Landlock ruleset */
 #include "warden_noexec.inc.c"       /* v1.27.1: writable directories mounted noexec */
@@ -2959,7 +2967,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * finished for the agent (warden_net.inc.c). */
         /* v1.24: also on the resolver helper's results. */
         /* v1.25: and on the stub resolver's sockets (warden_stub.inc.c). */
-        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN + 1 + PX_MAX_DIAL] = {
+        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN + 1 + PX_MAX_DIAL + 2] = {
             { .fd = notify_fd,    .events = POLLIN },
             { .fd = target_pidfd, .events = POLLIN },
             { .fd = agent_err_fd, .events = POLLIN },
@@ -2991,7 +2999,11 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         }
         int xto = px_timeout_ms();
         if (xto >= 0 && (to < 0 || xto < to)) to = xto;
-        int pr = poll(pfds, (nfds_t)(pxi + 1 + npx), to);
+        /* v1.28 step 4: the run's control socket, and warden-secrets' reports */
+        int rvi = pxi + 1 + npx;
+        pfds[rvi] = (struct pollfd){ .fd = g_ctl_listen, .events = POLLIN };
+        pfds[rvi + 1] = (struct pollfd){ .fd = g_secrets.ctl, .events = POLLIN };
+        int pr = poll(pfds, (nfds_t)(rvi + 2), to);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -3003,6 +3015,12 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         }
         stub_service(p, &pfds[4 + npoll], nstub);
         px_service(p, &pfds[pxi + 1], npx);
+        if (g_ctl_listen >= 0 && (pfds[rvi].revents & POLLIN)) ctl_service();        /* v1.28 step 4 */
+        if (g_secrets.ctl >= 0 && (pfds[rvi + 1].revents & (POLLIN | POLLHUP | POLLERR)) && secrets_service(p) < 0) {
+            log_line_start();
+            fprintf(g_log, "[warden] warden-secrets has gone: leased secrets will not be renewed or revoked\n");
+            ws_stop(&g_secrets);
+        }
         if (g_proxy.ctl >= 0 && (pfds[pxi].revents & (POLLIN | POLLHUP | POLLERR)) && proxy_service(p) < 0) {
             /* fail closed, as for the resolver helper */
             fprintf(stderr, "[warden] the egress proxy exited or sent a malformed report; stopping the run\n");
@@ -3056,6 +3074,15 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * answered, the calling process must run a program the Warden
          * decided to run (warden_exec.inc.c) */
         if (exec_identity(notify_fd, &req, &act, &t0)) continue;
+
+        /* v1.28 step 4: after `varek revoke`, every call is refused */
+        if (g_revoked) {
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            emit_pathology(g_report_seq++, req.pid, &act, DEC_DENY, DEC_DENY, "revoked",
+                           (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec), EACCES);
+            send_simple(notify_fd, req.id, DEC_DENY);
+            continue;
+        }
 
         /* Bootstrap launch: the target's own first execve of the operator-
          * specified binary is authorized by the act of launching it, and is
@@ -4856,6 +4883,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     emit_run_start(policy_path, &p);
+    ctl_open();                                                            /* v1.28 step 4 */
     /* v1.24: every allowed host name is resolved before the agent runs.
      * Refreshes then run in a resolver helper process (warden_resolve.c),
      * started now: while the Warden is single-threaded and before the agent's

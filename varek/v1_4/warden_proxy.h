@@ -40,7 +40,13 @@ enum { WP_MSG_READY = 1, WP_MSG_CONN = 2, WP_MSG_REQUEST = 3, WP_MSG_UNREADABLE 
        WP_MSG_INSPECT = 10, WP_MSG_CA_NAME = 11, WP_MSG_CA_GO = 12, WP_MSG_BLOB = 13, WP_MSG_CA_DONE = 14,
        WP_MSG_HTTPREQ = 15, WP_MSG_REQVERDICT = 16, WP_MSG_HTTPBODY = 17,
        /* v1.28, credential release */
-       WP_MSG_PH = 18, WP_MSG_CREDS = 19, WP_MSG_CREDS_OK = 20, WP_MSG_CREDFAIL = 21 };
+       WP_MSG_PH = 18, WP_MSG_CREDS = 19, WP_MSG_CREDS_OK = 20, WP_MSG_CREDFAIL = 21,
+       /* v1.28 step 4: the run is revoked. Warden -> proxy: WP_MSG_REVOKE (a
+        * struct wp_msg); the proxy clears every value and placeholder it
+        * holds and closes every connection (each reported, why "revoked"),
+        * then answers WP_MSG_REVOKED (a struct wp_creds; n: values it still
+        * holds, 0) */
+       WP_MSG_REVOKE = 22, WP_MSG_REVOKED = 23 };
 
 /* v1.28 (docs/security/v1.28-credential-release.md, section 3). Before the
  * agent starts, Warden -> proxy: WP_MSG_PH, each credential's placeholder
