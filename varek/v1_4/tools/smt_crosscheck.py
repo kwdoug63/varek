@@ -1606,12 +1606,13 @@ def fuzz_v131(rng, lines, valid, cred_names):
                "ftp://mcp.example.com/x", "https://mcp.example.com/a//b", "https://mcp.example.com/a/../b",
                "https://mcp.example.com/%41", "https://mcp.example.com/a*", "https://mcp.example.com:0/x",
                "https://mcp.example.com/a\\b", "https://mcp.example.com/a;b", "https://mcp.example.com/[x]", "mcp.example.com"]
-    tok_names = []
+    tok_names, tok_aud = [], {}
     for _ in range(rng.randint(0, 2)):
         n = rng.choice(["mc", "mo", "tok_1"])
         if n in cred_names + tok_names:
             continue
         aud = rng.choice(mcp_url[:3] + mcp_url[4:5])
+        tok_aud[n] = mcp_canon(aud, True, "x")[0]
         line = f"credential {n} from file:/etc/varek/creds/{n} audience={aud}" + (" opaque" if rng.random() < 0.3 else "")
         if bad():
             line = rng.choice([f"credential {n} from file:/x audience=" + rng.choice(bad_url + ["http://mcp.example.com/mcp"]),
@@ -1620,17 +1621,23 @@ def fuzz_v131(rng, lines, valid, cred_names):
                                f"credential {n} from file:/x audiences=https://mcp.example.com/mcp"])
         lines.append(line)
         tok_names.append(n)
+    seen_res = set()
     for _ in range(rng.randint(0, 2)):
         t = rng.choice(["trust mcp-resource https://mcp.example.com/mcp", "trust mcp-resource https://api.example.com audience api://x",
                         "trust mcp-resource https://mcp.example.com:8443/a/b audience a|b"])
+        if valid and t.split()[2] in seen_res:
+            continue
+        seen_res.add(t.split()[2])
         if bad():
             t = rng.choice(["trust mcp-resource http://mcp.example.com/mcp", "trust mcp-resource https://mcp.example.com/mcp audience",
                             "trust mcp-resource https://mcp.example.com/mcp aud x", "trust mcp-resource " + rng.choice(bad_url),
                             "trust mcp-resource https://mcp.example.com/" + "x" * 250, "trust mcp-resource"])
         lines.append(t)
     subjects = []
-    for _ in range(rng.randint(0, 3)):
+    for _ in range(rng.randint(1, 3)):
         n = rng.choice(["files", "gh", "helper", "s_2"])
+        if valid and n in subjects:
+            continue
         if rng.random() < 0.6:
             line = f"mcp server {n} exec " + rng.choice(["/opt/mcp/bin/fs", "/opt/mcp/bin/github-mcp-server", "/usr/local/bin/m-1"]) + \
                 (" sha256=" + "%064x" % rng.getrandbits(256) if rng.random() < 0.4 else "")
@@ -1654,15 +1661,19 @@ def fuzz_v131(rng, lines, valid, cred_names):
     meths = ["tools/call", "tools/list", "tools/*", "resources/read", "*", "server/discover", "notifications/x-y.z"]
     for _ in range(rng.randint(1, 6)):
         verb = rng.choice(["allow", "deny"])
-        toks = [verb, "mcp", rng.choice(mcp_url), rng.choice(meths)]
+        url = rng.choice(mcp_url)
+        toks = [verb, "mcp", url, rng.choice(meths)]
         if rng.random() < 0.7:
             toks.append(rng.choice(names))
         if verb == "allow" and rng.random() < 0.25:
             toks.append(rng.choice(["max_body=1m", "max_body=4k"]))
-        if verb == "allow" and (tok_names or cred_names) and rng.random() < 0.35:
-            toks.append("credential=" + rng.choice(tok_names + cred_names))
+        cu = mcp_canon(url, False, "x")[0]
+        usable = [t for t in tok_names if tok_aud.get(t) == cu] + (cred_names if cu.startswith("https://") else [])
+        if verb == "allow" and (usable or not valid and tok_names) and rng.random() < 0.35:
+            toks.append("credential=" + rng.choice(usable if valid or not tok_names else tok_names + cred_names))
             if rng.random() < 0.3:
-                toks.append("header=" + rng.choice(["Authorization:Bearer", "authorization:bearer", "X-Api-Key"]))
+                toks.append("header=" + rng.choice(["Authorization:Bearer", "authorization:bearer"] +
+                                                   ([] if valid else ["X-Api-Key"])))
         if subjects and rng.random() < 0.5:
             toks.append("for=" + rng.choice(subjects))
         if bad():
@@ -1699,14 +1710,14 @@ def fuzz_policy(rng, path):
     the rest may carry any number of malformed lines, for the parsers."""
     valid = rng.random() < 0.7
     lines = []
-    if rng.random() < 0.2:
+    if rng.random() < 0.3:
         # v1.26.1: an inspecting-mode policy: host rules, request rules over
         # them (allow and deny, exact and wildcard hosts, globs in the path,
         # queries), passthrough hosts, max_body, and (when the policy may be
         # invalid) each refused form
         # v1.28: credentials, named and carried by allow request rules
-        v128 = rng.random() < 0.5
-        v131 = v128 and rng.random() < 0.6           # v1.31: MCP servers, confined subjects, mcp rules
+        v128 = rng.random() < 0.6
+        v131 = v128 and rng.random() < 0.7           # v1.31: MCP servers, confined subjects, mcp rules
         lines.append("require warden 1.31" if v131 else "require warden 1.28" if v128 else "require warden 1.26")
         lines.append("proxy inspect" if valid or rng.random() < 0.8 else rng.choice(["proxy on", ""]))
         cred_names = []
@@ -2403,6 +2414,7 @@ def main():
     total = stats["reach"] + stats["reach_forced_checked"] + stats["ground"] + stats["symbolic"]
     print(f"smt_crosscheck: {stats['policies']} policies ({stats['string_policies']} with "
           f"suffix/contains/glob rules, {stats['request_policies']} with request rules, {stats['launch_policies']} with launches, {stats['open_as_agent_policies']} opening as the agent; "
+          f"{stats.get('mcp_policies', 0)} with mcp rules, {stats.get('subject_policies', 0)} with confined subjects; "
           f"{stats['rejected_policies']} rejected by both parsers), "
           f"{total} checks: {stats['reach']} reachability (+{stats['reach_forced_checked']} "
           f"automaton-search re-checks), {stats['ground']} ground, {stats['symbolic']} "
