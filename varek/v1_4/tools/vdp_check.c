@@ -115,7 +115,7 @@ static const char *reach_name(vdp_reach_t r) {
 
 int main(int argc, char **argv) {
     if (argc != 3 && !(argc == 4 && !strcmp(argv[2], "analyze") && !strcmp(argv[3], "automaton"))) {
-        fprintf(stderr, "usage: %s <policy> lint|analyze [automaton]|batch|launches\n", argv[0]);
+        fprintf(stderr, "usage: %s <policy> lint|analyze [automaton]|batch|launches|credentials\n", argv[0]);
         return 2;
     }
     if (argc == 4) vdp_reach_force_automaton = true;
@@ -130,6 +130,21 @@ int main(int argc, char **argv) {
     /* v1.27: are launches after the first decided (require warden 1.27)? */
     if (!strcmp(argv[2], "launches")) {
         printf("%s\n", g_pol.launches ? "on" : "off");
+        return 0;
+    }
+    /* v1.28: the credentials and the rules that carry them, as this parser
+     * read them (the certificate checker and the cross-check oracle print the
+     * same lines; the cross-check compares them) */
+    if (!strcmp(argv[2], "credentials")) {
+        static const char *const kStore[] = { "", "file", "vault", "aws-sm" };
+        for (size_t k = 0; k < g_pol.ncreds; k++)
+            printf("credential %s %s %s\n", g_pol.creds[k].name, kStore[g_pol.creds[k].store], g_pol.creds[k].ref);
+        for (size_t i = 0; i < g_pol.n; i++) {
+            const vdp_rule_t *r = &g_pol.rules[i];
+            if (r->cred)
+                printf("rule %d %s %s %s\n", r->line, g_pol.creds[r->cred - 1].name, r->cred_hdr,
+                       r->cred_scheme[0] ? r->cred_scheme : "-");
+        }
         return 0;
     }
     if (!strcmp(argv[2], "analyze")) {
@@ -244,6 +259,14 @@ int main(int argc, char **argv) {
                        argv[1], g_pol.rules[i].line);
                 break;
             }
+        /* v1.28: a credential no request rule carries is fetched for nothing */
+        for (size_t k = 0; k < g_pol.ncreds; k++) {
+            bool used = false;
+            for (size_t i = 0; !used && i < g_pol.n; i++) used = g_pol.rules[i].cred == (int)k + 1;
+            if (!used)
+                printf("%s:%d: note: credential %s is named, but no request rule carries it\n",
+                       argv[1], g_pol.creds[k].line, g_pol.creds[k].name);
+        }
         /* v1.16: the policy's glob size against the cap that bounds the work
          * of one decision (4,096 tokens x a 4,095-byte string). */
         printf("%s: glob tokens %zu of %d\n", argv[1], vdp_policy_glob_tokens(&g_pol),

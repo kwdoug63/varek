@@ -161,11 +161,39 @@ typedef struct {
     char           req_host[254];
     bool           req_wild;
     unsigned       req_port;
+    /* v1.28 (docs/security/v1.28-credential-release.md): an allow request
+     * rule's `credential=NAME header=HEADER[:SCHEME]`: the credential the
+     * request may carry (1 + its index in vdp_policy_t.creds; 0: none), the
+     * header it goes in and the scheme word before it ("" : the whole value).
+     * Not part of any decision. */
+    int            cred;
+    char           cred_hdr[65];
+    char           cred_scheme[33];
 } vdp_rule_t;
 
 #define VDP_PROXY_MAX_PORTS 16
 #define VDP_PROXY_MAX_PASS  64
 #define VDP_MAX_BODY_LIMIT  1073741824u   /* max_body= at most 1 GiB */
+
+/* v1.28: `credential NAME from STORE:REF`, after `require warden 1.28`.
+ * NAME is [a-z][a-z0-9_]{0,31}, each once, at most VDP_MAX_CREDS. STORE:REF
+ * is one of
+ *   file:PATH         an absolute path, no "." or ".." segment, no "//", not
+ *                     ending in "/";
+ *   vault:PATH#FIELD  one '#'; PATH not starting with '/'; FIELD of
+ *                     [A-Za-z0-9_.-];
+ *   aws-sm:ARN        starting "arn:" and holding ":secretsmanager:";
+ * REF is 1 to 1024 bytes of 0x21 to 0x7e. A credential must be named before
+ * a request rule uses it. The certificate checker and the cross-check oracle
+ * read it the same way. Not part of any decision. */
+#define VDP_MAX_CREDS 32
+enum { VDP_CRED_FILE = 1, VDP_CRED_VAULT = 2, VDP_CRED_AWSSM = 3 };
+typedef struct {
+    char name[33];
+    int  store;                 /* VDP_CRED_* */
+    char ref[1025];             /* after "STORE:" */
+    int  line;
+} vdp_cred_t;
 
 typedef struct {
     vdp_rule_t rules[VDP_MAX_RULES];
@@ -190,6 +218,9 @@ typedef struct {
      * exec rules. Without it every later launch is refused, as in v1.26,
      * whatever the exec rules say. Not part of any decision. */
     bool       launches;
+    /* v1.28: the credentials the policy names, in order */
+    vdp_cred_t creds[VDP_MAX_CREDS];
+    size_t     ncreds;
 } vdp_policy_t;
 
 /* Why a verdict was reached (for records). */
@@ -450,10 +481,13 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * v1.27: decided program launches, opt-in: `require warden 1.27` turns on
  * the exec rules for launches after the first (vdp_policy_t.launches). The
  * grammar of exec rules is unchanged; a v1.26 Warden refuses the directive,
- * so a policy that relies on launches fails closed there. */
+ * so a policy that relies on launches fails closed there.
+ * v1.28: credential release, `credential NAME from STORE:REF` and an allow
+ * request rule's `credential=NAME header=HEADER[:SCHEME]`; a v1.27 Warden
+ * refuses both, so the policy fails closed there. */
 #define VDP_WARDEN_MAJOR 1
-#define VDP_WARDEN_MINOR 27
-#define VDP_WARDEN_PATCH 1      /* v1.27.1: the Warden's version; the grammar stays 1.27 */
+#define VDP_WARDEN_MINOR 28
+#define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's */
 
 /* v1.27: a note on exec rule i, for lint and the Warden's load-time notes,
  * in buf (empty: none); returns its length. An allow exec rule naming a shell

@@ -372,7 +372,9 @@ static int policy_load(const char *path, struct policy *p) {
             ci.clen != r->s.len || memcmp(ci.c, r->s.c, r->s.len) != 0 ||
             ci.mask != r->b.mask || ci.value != r->b.value || ci.line != r->line ||
             ci.portless != r->s.portless || ci.name != r->s.name || ci.wild != r->s.wild ||
-            ci.names != r->names || ci.rate != r->rate || ci.max_body != r->max_body) {
+            ci.names != r->names || ci.rate != r->rate || ci.max_body != r->max_body ||
+            /* v1.28: the credential a request rule carries, and where */
+            ci.cred != r->cred || strcmp(ci.cred_hdr, r->cred_hdr) || strcmp(ci.cred_scheme, r->cred_scheme)) {
             fprintf(stderr, "[warden] policy %s:%d: the decision procedure and the certificate "
                     "checker read this rule differently; refusing to start\n", path, r->line);
             return -1;
@@ -400,6 +402,25 @@ static int policy_load(const char *path, struct policy *p) {
         fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
                 "require warden differently (launches %s and %s); refusing to start\n", path,
                 p->v.launches ? "on" : "off", p->c.launches ? "on" : "off");
+        return -1;
+    }
+    /* v1.28: and the credentials (name, store, reference), in order */
+    bool creds_same = p->v.ncreds == p->c.ncreds;
+    for (size_t k = 0; creds_same && k < p->v.ncreds; k++)
+        creds_same = !strcmp(p->v.creds[k].name, p->c.creds[k].name) &&
+                     p->v.creds[k].store == p->c.creds[k].store &&
+                     !strcmp(p->v.creds[k].ref, p->c.creds[k].ref) && p->v.creds[k].line == p->c.creds[k].line;
+    if (!creds_same) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
+                "the credentials differently; refusing to start\n", path);
+        return -1;
+    }
+    /* v1.28 step 1: the grammar only. Until warden-secrets and the swap are
+     * built (steps 2 and 3), a policy that names a credential would run with
+     * nothing to put in its place: refused. */
+    if (p->v.ncreds) {
+        fprintf(stderr, "[warden] policy %s:%d: credential release is not built in this Warden yet; "
+                "refusing to start\n", path, p->v.creds[0].line);
         return -1;
     }
     /* v1.13: load-time analysis. The decision procedure decides, for every

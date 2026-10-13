@@ -83,7 +83,7 @@
 #include <stdint.h>
 
 #define VDPC_GRAMMAR_MAJOR 1
-#define VDPC_GRAMMAR_MINOR 27
+#define VDPC_GRAMMAR_MINOR 28
 
 #define VDPC_MAX_S        4095
 #define VDPC_MAX_RULES    256
@@ -93,6 +93,15 @@
 enum { VDPC_PATH = 0, VDPC_HOST = 1, VDPC_EXEC = 2, VDPC_REQUEST = 3 /* v1.26.1 */ };
 
 typedef struct vdpc_rule vdpc_rule_t;
+
+/* v1.28: `credential NAME from STORE:REF` (smt_decide.h has the form) */
+#define VDPC_MAX_CREDS 32
+typedef struct {
+    char name[33];
+    int  store;                       /* 1 file, 2 vault, 3 aws-sm */
+    char ref[1025];
+    int  line;
+} vdpc_cred_t;
 
 typedef struct {
     vdpc_rule_t  *rules;
@@ -107,6 +116,8 @@ typedef struct {
     char          proxy_pass[64][254];/* v1.26.1: `proxy passthrough host NAME`, in order */
     size_t        proxy_npass;
     int           launches;           /* v1.27: `require warden 1.27` (launches decided) */
+    vdpc_cred_t   creds[VDPC_MAX_CREDS]; /* v1.28: the credentials, in order */
+    size_t        ncreds;
 } vdpc_policy_t;
 
 typedef struct {
@@ -144,6 +155,9 @@ typedef struct {
     bool        wild;                 /* host (v1.25): a wildcard rule, held as a glob */
     uint32_t    names, rate;          /* host (v1.25): a wildcard allow rule's budgets, 0: not set */
     uint32_t    max_body;             /* request (v1.26.1): max_body=, 0: not set */
+    int         cred;                 /* request (v1.28): 1 + the credential's index, 0: none */
+    const char *cred_hdr;             /* request (v1.28): header=NAME ("" : none) */
+    const char *cred_scheme;          /* request (v1.28): header=NAME:SCHEME ("" : none) */
 } vdpc_rule_info_t;
 int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *out);
 
