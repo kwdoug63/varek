@@ -3,7 +3,7 @@
 > The review was done by AI review agents; a human or third-party review
 > has not been done.
 
-Draft, not released · MIT · github.com/kwdoug63/varek
+Released 2026-10-13 · MIT · github.com/kwdoug63/varek
 
 ## Summary
 
@@ -130,14 +130,27 @@ the work directory, which the agent then tries to load. The check requires
 the loader's own words for the refusal ("failed to map segment from shared
 object"), and `run_start`'s `noexec` must hold the work directory.
 
-A 6-minute trial on the 1 vCPU, 1 GB droplet (Landlock ABI 4) on
-2026-10-11, of the build before the review, passed: 65 tasks all ok, 7
-probes of all four kinds each refused, 177 launches decided, 14,290
-records, the audit passed. A 3-minute trial of the reviewed build here
-passed, with the audit's new check over every write it recorded.
+The reviewed build (c7849dc) ran for 24 hours on a 1 vCPU, 1 GB droplet
+(Landlock ABI 4), 2026-10-12 to 2026-10-13: a task a minute in turn
+(`git`, `python3`, a compile with gcc), every tenth a probe that must be
+refused (a program no rule allows, one a deny rule refuses, a program
+written during the run, a library written during the run). It passed:
 
-*The 24-hour soak of the reviewed build (c7849dc) is running on the
-droplet; its result goes here.*
+| | |
+|---|---|
+| Duration | 24.00 h |
+| `noexec` | 2 directories mounted, the work directory among them; Warden 1.27.1 |
+| Tasks | 1,296, all ok (432 each; p50 10 ms git, 54 ms python3, 94 ms compile) |
+| Probes | 144 (36 of each kind), each refused and recorded; every library copy refused by the loader ("failed to map segment") |
+| Launches | 3,564 decided, 3,456 allowed, each with its `exec_result` `launched` |
+| Records | 282,917; `varek_audit` passed, with its new checks over every write |
+| The Warden's decision, an allowed launch | 106 to 199 us p50 by program (p99 164 to 455) |
+
+The audit was first killed for lack of memory on the 1 GB host: it holds
+the stream in memory (about 700 MB for these 282,917 records). With 4 GB
+of swap it passed on the same stream. Before it, a 6-minute trial of the
+build before the review passed on the same droplet, and a 3-minute trial
+of the reviewed build in a container.
 
 ## Latency
 
@@ -243,6 +256,8 @@ writable. Fixed before it was committed.
   repeat the Warden's `realpath`. Name the directory itself.
 - **A directory missing at start** is not mounted; if it appears during the
   run the agent's opens under it are refused. Make it before the run.
+- **The audit holds a run's stream in memory:** about 700 MB for a
+  24-hour stream of 283,000 records. On a 1 GB host, give it swap.
 - **Compiled packages installed during the run** cannot be loaded from a
   writable directory without `--writable-exec`.
 - **Only with `require warden 1.27`.** A policy without it keeps v1.26.1
