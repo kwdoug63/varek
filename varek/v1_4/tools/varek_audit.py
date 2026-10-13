@@ -495,7 +495,10 @@ EXEC_REFUSALS = ("policy_match", "default_deny_unknown", "certificate_refused", 
                  "exec_not_in_ruleset", "exec_unresolved",
                  # v1.27 review: a launch by a thread another thread's launch is ending:
                  # its path cannot be read, or its image (the call is refused, nothing run)
-                 "intent_derivation_failed", "exec_identity_unreadable")
+                 "intent_derivation_failed", "exec_identity_unreadable",
+                 # v1.28.1 step 3: a sub-agent's launch the Warden could not make one
+                 "subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed")
+SUBAGENT_REFUSALS = ("subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed")
 EXEC_RESULTS = ("launched", "failed", "gone", "killed")
 
 
@@ -545,7 +548,7 @@ def check_launches(checker, policy, rules, meta, records, complete, problems):
     launches = [r for r in records if r.get("action") == "process.exec" and r.get("rule") != "bootstrap_exec_allow"]
     refused = [r for r in launches if r.get("decision_final") != "ALLOW"]
     ASKED = ("policy_match", "default_deny_unknown", "exec_not_in_ruleset", "exec_no_landlock",
-             "certificate_refused")
+             "certificate_refused") + SUBAGENT_REFUSALS
     for r in refused:                     # review finding 1: every such refusal is asked of the policy
         if r.get("rule") in ASKED and not (isinstance(r.get("resolved"), str) and r["resolved"]):
             problems.append(f"seq {r.get('seq')}: a launch refused as {r.get('rule')!r} without the name "
@@ -574,8 +577,8 @@ def check_launches(checker, policy, rules, meta, records, complete, problems):
             elif rule == "policy_match" and (fr is None or fr["allow"] or fr["line"] != line):
                 problems.append(f"seq {seq}: a launch refused by line {line!r}, which is not the deny rule "
                                 f"that decides it")
-            elif rule in ("exec_not_in_ruleset", "exec_no_landlock", "certificate_refused") and \
-                    (fr is None or not fr["allow"]):
+            elif rule in ("exec_not_in_ruleset", "exec_no_landlock", "certificate_refused") + SUBAGENT_REFUSALS \
+                    and (fr is None or not fr["allow"]):
                 problems.append(f"seq {seq}: a launch refused as {rule!r}, but the policy does not "
                                 f"allow its name")
     for r in refused:
@@ -587,7 +590,7 @@ def check_launches(checker, policy, rules, meta, records, complete, problems):
         elif rule == "exec_not_in_ruleset" and rs.get("landlock") is None:      # review finding 5
             problems.append(f"seq {seq}: a launch refused as not in the set, but without Landlock the "
                             f"Warden refuses every launch for that")
-        if rule in ("exec_not_in_ruleset", "exec_no_landlock", "certificate_refused") and \
+        if rule in ("exec_not_in_ruleset", "exec_no_landlock", "certificate_refused") + SUBAGENT_REFUSALS and \
                 r.get("decision_raw") != "ALLOW":
             problems.append(f"seq {seq}: a launch refused as {rule!r}, which follows only a decision to "
                             f"allow it, but the decision was {r.get('decision_raw')!r}")
@@ -809,6 +812,190 @@ def policy_credentials(checker, policy):
         elif line.strip():
             raise ValueError(f"an unexpected line from the checker: {line!r}")
     return creds, rules
+
+
+def policy_identity(checker, policy):
+    """v1.28.1: the policy's trusted issuers {iss: (aud, jwks or None)}, trust
+    domains {domain: bundle}, sub-agent rules {policy line: name} and
+    whether it requires a user, as the checker reads them."""
+    q = subprocess.run([checker, policy, "identity"], capture_output=True, text=True)
+    if q.returncode != 0:
+        raise ValueError(q.stderr.strip() or "the checker has no identity mode")
+    iss, dom, sub, req = {}, {}, {}, False
+    for line in q.stdout.splitlines():
+        f = line.split(" ")
+        if len(f) == 4 and f[0] == "issuer":
+            iss[f[1]] = (f[2], None if f[3] == "-" else f[3])
+        elif len(f) == 3 and f[0] == "spiffe":
+            dom[f[1]] = f[2]
+        elif len(f) == 3 and f[0] == "subagent" and f[1].isdigit():
+            sub[int(f[1])] = f[2]
+        elif line == "require on-behalf-of":
+            req = True
+        elif line.strip():
+            raise ValueError(f"an unexpected line from the checker: {line!r}")
+    return iss, dom, sub, req
+
+
+SUBAGENT_TAG = re.compile(r"subagent:([a-z][a-z0-9_]{0,31})#([1-9][0-9]{0,9})")
+JWT_ALGS = ("RS256", "PS256", "ES256", "EdDSA")
+
+
+def check_chain(ident, meta, records, run, problems):
+    """v1.28.1 (section 5): who each decision was for. run_start's
+    on_behalf_of: a user only verified by an issuer the policy trusts, with
+    its audience, not expired at the start (and one if the policy requires
+    it); an agent of this run, its SPIFFE ID verified in a trust domain the
+    policy trusts, its control group when the policy names a sub-agent; the
+    operator, unverified. Every decision record's obo resolves: "user" only
+    with a user, then "agent", then each sub-agent after the launch that
+    started it (by a rule with that subagent=, from the chain before it),
+    never after its launch failed; the proxy's records are their hand-off's.
+    Returns {sub-agent: decisions}, or None when the Warden predates the
+    chain."""
+    iss, dom, subrules, req = ident
+    rs = meta.get("run_start", {})
+    if not _version_at_least(rs.get("warden"), (1, 28, 1)):
+        if "on_behalf_of" in rs or any("obo" in r for r in records):
+            problems.append("run_start or a record names who a decision was for, but only a Warden of 1.28.1 "
+                            "or later records it")
+        if req or subrules:
+            problems.append("the policy requires a user or names a sub-agent, which only a Warden of 1.28.1 "
+                            "or later attributes")
+        return None
+    obo = rs.get("on_behalf_of")
+    if not isinstance(obo, dict) or not isinstance(obo.get("agent"), dict) or obo["agent"].get("run") != run:
+        problems.append("run_start has no on_behalf_of naming this run's agent")
+        return {}
+    user, agent, actors = obo.get("user"), obo["agent"], obo.get("actors")
+    if user is not None:
+        if not isinstance(user, dict):
+            problems.append("run_start's user is not an object")
+            user = {}
+        i = user.get("issuer")
+        if i not in iss:
+            problems.append(f"run_start's user is vouched for by {i!r}, an issuer the policy does not trust")
+        elif user.get("audience") != iss[i][0]:
+            problems.append(f"run_start's user has the audience {user.get('audience')!r}, not the one the policy "
+                            f"names for {i}")
+        if user.get("verified") is not True:
+            problems.append("run_start's user is not marked verified")
+        if not (isinstance(user.get("subject"), str) and user["subject"]):
+            problems.append("run_start's user has no subject")
+        if user.get("algorithm") not in JWT_ALGS:
+            problems.append(f"run_start's user was verified with {user.get('algorithm')!r}, not one of "
+                            f"{', '.join(JWT_ALGS)}")
+        if not (isinstance(user.get("token_sha256"), str) and HEX64.fullmatch(user["token_sha256"])):
+            problems.append("run_start's user has no token SHA-256")
+        t0, exp = rs.get("timestamp_ns"), user.get("expires")
+        if type(exp) is not int or type(t0) is not int or exp * 1000000000 <= t0:
+            problems.append("run_start's user's token had expired when the run started (or has no expiry)")
+        if user.get("on_expiry", "revoke") not in ("revoke", "record"):
+            problems.append(f"run_start's user says {user.get('on_expiry')!r} on expiry, not revoke or record")
+        if actors is not None and not (isinstance(actors, list) and 0 < len(actors) <= 8 and
+                                       all(isinstance(a_, dict) and isinstance(a_.get("subject"), str)
+                                           and a_["subject"] for a_ in actors)):
+            problems.append("run_start's actors are not a list of 1 to 8, each with a subject")
+    elif req:
+        problems.append("the policy requires on-behalf-of, but run_start names no user")
+    elif actors is not None:
+        problems.append("run_start lists actors, but no user")
+    if "spiffe_id" in agent:
+        d = agent.get("trust_domain")
+        if d not in dom:
+            problems.append(f"the agent's SVID is in {d!r}, a trust domain the policy does not trust")
+        elif not (isinstance(agent["spiffe_id"], str) and agent["spiffe_id"].startswith(f"spiffe://{d}/")):
+            problems.append("the agent's SPIFFE ID is not in its trust domain")
+        if agent.get("verified") is not True or not (isinstance(agent.get("svid_sha256"), str)
+                                                       and HEX64.fullmatch(agent["svid_sha256"])):
+            problems.append("the agent's SVID is not marked verified, or has no SHA-256")
+    cg = agent.get("cgroup")
+    if bool(subrules) != isinstance(cg, str):
+        problems.append("run_start's agent names a control group, but the policy names no sub-agent" if cg else
+                        "the policy names a sub-agent, but run_start's agent has no control group")
+    op = rs.get("operator")
+    if not (isinstance(op, dict) and type(op.get("uid")) is int and op.get("verified") is False):
+        problems.append("run_start has no operator (its uid, marked not verified)")
+    # each record's chain
+    base = ["user", "agent"] if user is not None else ["agent"]
+    lines = meta.get("lineno", {})
+    at = lambda r: lines.get(id(r), 0)
+    started = {}                     # "NAME#n" -> (line of its launch record, the launcher's chain, cgroup)
+    failed = {}                      # "NAME#n" -> line of its exec_result failed
+    for _, e in meta.get("exec_results", []):
+        if isinstance(e.get("subagent"), str) and e.get("result") in ("failed", "killed"):
+            failed.setdefault(e["subagent"], at(e))
+    count, per_name, conn_obo = {}, {}, {}
+    for r in sorted(records, key=at):
+        ob = r.get("obo")
+        seq = r.get("seq")
+        if r.get("rule") == "subagent_unattributed":
+            if ob != [] or r.get("decision_final") != "DENY":
+                problems.append(f"seq {seq}: refused as in no group of the run, but not with an empty obo")
+            continue
+        if not (isinstance(ob, list) and all(isinstance(x, str) for x in ob) and ob[:len(base)] == base):
+            problems.append(f"seq {seq}: obo {ob!r} does not begin with {base!r}")
+            continue
+        chain = ob[len(base):]
+        tags = []
+        for k, x in enumerate(chain):
+            m = SUBAGENT_TAG.fullmatch(x)
+            if not m:
+                problems.append(f"seq {seq}: obo names {x!r}, not a sub-agent")
+                break
+            tag = f"{m.group(1)}#{m.group(2)}"
+            st = started.get(tag)
+            if st is None or st[0] > at(r):
+                problems.append(f"seq {seq}: a decision for sub-agent {tag} before (or without) a launch that "
+                                f"started it")
+                break
+            if st[1] != ob[:len(base) + k]:
+                problems.append(f"seq {seq}: sub-agent {tag} in a chain other than the one that launched it")
+                break
+            if tag in failed and failed[tag] < at(r):
+                problems.append(f"seq {seq}: a decision for sub-agent {tag} after its launch failed")
+                break
+            tags.append(tag)
+        else:
+            if tags:
+                count[tags[-1]] = count.get(tags[-1], 0) + 1
+        if r.get("rule") in SUBAGENT_REFUSALS and not subrules.get(r.get("policy_line")):
+            problems.append(f"seq {seq}: a launch refused as {r.get('rule')!r}, but policy line "
+                            f"{r.get('policy_line')} names no sub-agent")
+        # a sub-agent's launch: by a rule with that subagent=, numbered in order
+        if "subagent" in r:
+            tag, line = r.get("subagent"), r.get("policy_line")
+            m = SUBAGENT_TAG.fullmatch(f"subagent:{tag}") if isinstance(tag, str) else None
+            if not (r.get("action") == "process.exec" and r.get("rule") == "exec_allowed" and m):
+                problems.append(f"seq {seq}: names a sub-agent {tag!r}, but is not an allowed launch")
+            elif subrules.get(line) != m.group(1):
+                problems.append(f"seq {seq}: starts sub-agent {tag}, but policy line {line} names "
+                                f"{subrules.get(line) or 'no sub-agent'}")
+            elif int(m.group(2)) != per_name.get(m.group(1), 0) + 1 or tag in started:
+                problems.append(f"seq {seq}: sub-agent {tag} is not the next launch of {m.group(1)}")
+            else:
+                per_name[m.group(1)] = int(m.group(2))
+                want = (cg or "") + "".join("/" + t.replace("#", "-") for t in tags + [tag])
+                if r.get("cgroup") != want:
+                    problems.append(f"seq {seq}: sub-agent {tag}'s control group is {r.get('cgroup')!r}, not {want!r}")
+                started[tag] = (at(r), ob, r.get("cgroup"))
+                count.setdefault(tag, 0)
+        elif r.get("action") == "process.exec" and r.get("rule") == "exec_allowed" and subrules.get(r.get("policy_line")):
+            problems.append(f"seq {seq}: a launch allowed by policy line {r.get('policy_line')}, which names "
+                            f"sub-agent {subrules[r.get('policy_line')]}, started none")
+        # the proxy's records are for whom the hand-off was
+        if r.get("proxy_handoff") is True and type(r.get("proxy_conn")) is int:
+            conn_obo[r["proxy_conn"]] = ob
+        elif r.get("action") in ("net.proxy", "net.request") and type(r.get("proxy_conn")) is int:
+            want = conn_obo.get(r["proxy_conn"])
+            if want is not None and ob != want:
+                problems.append(f"seq {seq}: the proxy's decision on connection {r['proxy_conn']} is for {ob!r}, "
+                                f"not {want!r}, whom the agent's connect was for")
+    for _, e in meta.get("exec_results", []):
+        tag = e.get("subagent")
+        if tag is not None and tag not in started:
+            problems.append(f"an exec_result names sub-agent {tag!r}, which no launch started")
+    return count
 
 
 def check_credentials(creds, cred_rules, meta, records, complete, problems, notes):
@@ -2683,6 +2870,12 @@ def main(argv=None):
         pcreds, pcred_rules = [], {}
     ncarried, nswap_refused, revoked = check_credentials(pcreds, pcred_rules, meta, records, complete,
                                                          problems, cnotes)
+    try:                                                                                   # v1.28.1
+        ident = policy_identity(a.checker, a.policy)
+    except (OSError, ValueError) as e:
+        problems.append(f"checker failed on the policy's identities: {e}")
+        ident = ({}, {}, {}, False)
+    per_sub = check_chain(ident, meta, records, run, problems)
     nlaunch = nlaunch_refused = 0
     if launches_policy and prules:                                                         # v1.27
         nlaunch, nlaunch_refused = check_launches(a.checker, a.policy, prules, meta, records, complete,
@@ -2708,6 +2901,11 @@ def main(argv=None):
     if pcreds or revoked:                                                                 # v1.28
         print(f"varek_audit: credentials: {len(pcreds)} named, {ncarried} requests carried one, "
               f"{nswap_refused} swaps refused{', the run was revoked' if revoked else ''}")
+    if per_sub is not None:                                                               # v1.28.1
+        u = meta.get("run_start", {}).get("on_behalf_of", {}).get("user")
+        who = f"on behalf of {u.get('subject')} ({u.get('issuer')})" if isinstance(u, dict) else "no user"
+        subs = ", ".join(f"{t} {n}" for t, n in sorted(per_sub.items())) if per_sub else "none"
+        print(f"varek_audit: chain: {who}; sub-agents (decisions): {subs}")
     for n_ in cnotes:
         print(f"varek_audit: note: {n_}")
     print(f"varek_audit: integrity: {integrity}")

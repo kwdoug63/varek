@@ -605,7 +605,9 @@ def _cred_text(records, pm):
     facts.append(("varek:run.revoked", "true" if revoked else "false"))
     if revoked:
         rp, rl = one("revocation_proxy"), one("revocation_leases")
-        facts += [("varek:revocation.by_uid", str(revoked.get("by_uid", ""))),
+        facts += [("varek:revocation.by", "on_behalf_of_expiry" if revoked.get("by") == "on_behalf_of_expiry"
+                   else "varek revoke"),                                       # v1.28.1
+                  ("varek:revocation.by_uid", str(revoked.get("by_uid", ""))),
                   ("varek:revocation.proxy.values_held", str(rp.get("values_held", "not reported"))),
                   ("varek:revocation.leases.revoked", str(rl.get("revoked", "not reported"))),
                   ("varek:revocation.leases.failed", str(rl.get("failed", "not reported")))]
@@ -614,12 +616,68 @@ def _cred_text(records, pm):
         rline = lines.get(id(revoked), 0)
         late = sum(1 for r in records if lines.get(id(r), 0) > rline and r.get("decision_final") != "DENY")
         facts.append(("varek:revocation.allowed_after", str(late)))
-        text += (" The run was revoked (varek revoke): "
+        text += (" The run was revoked (" + ("the user's token expired" if revoked.get("by") == "on_behalf_of_expiry"
+                                           else "varek revoke") + "): "
                  + ("every decision after it was UNSATISFIED" if not late else
                     f"{late} decision(s) after it were NOT refused (the audit fails such a stream)")
                  + (f", the proxy held {rp['values_held']} credential value(s) after it" if "values_held" in rp else "")
                  + (f", and {rl['revoked']} Vault lease(s) were revoked ({rl['failed']} could not be)"
                     if "revoked" in rl else "") + ".")
+    return text, facts
+
+
+def _obo_text(records, pm):
+    """v1.28.1 (section 5): who the run acted for, from run_start's
+    on_behalf_of (the user an issuer vouched for, the actors of a delegation,
+    the agent's SPIFFE ID; never the token) and the records' obo: the
+    decisions made for each sub-agent. Nothing for a Warden before 1.28.1."""
+    rs = pm.get("run_start") or {}
+    obo = rs.get("on_behalf_of")
+    if not isinstance(obo, dict):
+        return "", []
+    user = obo.get("user") if isinstance(obo.get("user"), dict) else None
+    agent = obo.get("agent") if isinstance(obo.get("agent"), dict) else {}
+    actors = [a for a in obo.get("actors") or [] if isinstance(a, dict)] if isinstance(obo.get("actors"), list) else []
+    facts, text = [], ""
+    if user:
+        facts += [("varek:on_behalf_of.user.issuer", str(user.get("issuer", ""))),
+                  ("varek:on_behalf_of.user.subject", str(user.get("subject", ""))),
+                  ("varek:on_behalf_of.user.audience", str(user.get("audience", ""))),
+                  ("varek:on_behalf_of.user.expires", str(user.get("expires", ""))),
+                  ("varek:on_behalf_of.user.token_sha256", str(user.get("token_sha256", ""))),
+                  ("varek:on_behalf_of.user.on_expiry", str(user.get("on_expiry", "revoke")))]
+        if actors:
+            facts.append(("varek:on_behalf_of.actors", ",".join(str(a.get("subject", "")) for a in actors)))
+        text += (f" The run acted on behalf of {user.get('subject')}, whose token {user.get('issuer')} issued "
+                 f"(verified against its keys at the start; the token is not in this evidence)"
+                 + (f", delegated through {len(actors)} actor(s)" if actors else "") + ".")
+    else:
+        text += " No user's token was given: the run acted for the agent alone."
+    if "spiffe_id" in agent:
+        facts.append(("varek:on_behalf_of.agent.spiffe_id", str(agent.get("spiffe_id", ""))))
+        text += f" The agent's SPIFFE ID {agent.get('spiffe_id')} was verified against its trust domain's bundle."
+    op = rs.get("operator")
+    if isinstance(op, dict):
+        facts.append(("varek:on_behalf_of.operator", f"uid {op.get('uid')}" + (f" ({op['login']})" if op.get("login") else "")
+                      + " (not verified)"))
+    exp = next((e for _, e in pm.get("cred_events", []) if e.get("event") == "on_behalf_of_expired"), None)
+    if exp:
+        facts.append(("varek:on_behalf_of.expired", str(exp.get("action", ""))))
+        text += (" The user's token expired during the run, and the run was "
+                 + ("revoked." if exp.get("action") == "revoke" else "let go on (--on-behalf-of-expiry record)."))
+    per = {}
+    for r in records:
+        ob = r.get("obo")
+        if isinstance(ob, list) and ob and isinstance(ob[-1], str) and ob[-1].startswith("subagent:"):
+            per[ob[-1][len("subagent:"):]] = per.get(ob[-1][len("subagent:"):], 0) + 1
+    for _, e in pm.get("exec_results", []):
+        if isinstance(e.get("subagent"), str):
+            per.setdefault(e["subagent"], 0)
+    if per:
+        facts.append(("varek:on_behalf_of.subagents", str(len(per))))
+        facts += [(f"varek:on_behalf_of.subagent.{t}.decisions", str(n)) for t, n in sorted(per.items())]
+        text += (f" {len(per)} sub-agent(s) ran, each in its own control group; each decision names whom it "
+                 f"was for: " + ", ".join(f"{t} {n}" for t, n in sorted(per.items())) + ".")
     return text, facts
 
 
@@ -741,6 +799,9 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
     ct, cfacts = _cred_text(records, proxy_meta or {})         # v1.28
     attest_text += ct
     facts += cfacts
+    ot, ofacts = _obo_text(records, proxy_meta or {})          # v1.28.1
+    attest_text += ot
+    facts += ofacts
     agent_component["properties"] += [{"name": k, "value": v} for k, v in facts]
 
     annotation = {

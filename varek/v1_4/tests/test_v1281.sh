@@ -20,6 +20,8 @@
 #      nesting and a launch that fails; the groups out of the agent's reach.
 #   4. the user's token expires during the run: recorded, and the run
 #      revoked (or, with --on-behalf-of-expiry record, recorded only).
+#   5. the audit (forged streams it refuses), the export, varek runs,
+#      refusals (--subagent, --user), policy show and doctor's issuer check.
 #
 #   test_v1281.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
@@ -456,6 +458,90 @@ sys.exit(0 if after and all(r["decision_final"]=="DENY" and r["rule"]=="revoked"
     check "record: the expiry is recorded, the run goes on, nothing refused" sh -c \
         "grep -q '\"event\":\"on_behalf_of_expired\".*\"action\":\"record\"' '$OUT/exp_rc.out' && ! grep -q '^{\"event\":\"revoked\"' '$OUT/exp_rc.out' && grep -q 'opened 300 refused 0' '$OUT/exp_rc.so'"
     check "... and the audit accepts the run" python3 "$HERE/tools/varek_audit.py" --policy "$B/pe.txt" --checker "$CERT" "$OUT/exp_rc.out"
+fi
+
+echo "== 5. audit, export and tools =="
+if [ -z "${ISS:-}" ] || [ -z "${B:-}" ] || [ ! -s "$OUT/exp_rv.out" ]; then
+    skip "section 5 (needs sections 2 to 4)"
+else
+    F="$HERE/tests/v1270_forge.py"
+    RS='rs = next(r for r in recs if isinstance(r, dict) and r.get("event") == "run_start")'
+    DR='dr = [r for r in recs if isinstance(r, dict) and "report_id" in r]'
+    AUD="$HERE/tools/varek_audit.py"
+    refuses() { if python3 "$AUD" --policy "$2" --checker "$CERT" "$3" > "$OUT/f.out" 2>&1; then
+                    flunk "the audit refuses $1"
+                elif grep -qF -- "$4" "$OUT/f.out"; then pass "the audit refuses $1"
+                else flunk "the audit refuses $1 ($(grep -m1 PROBLEM "$OUT/f.out"))"; fi; }
+    check "the audit reports whom the run was for, and each sub-agent's decisions" sh -c \
+        "python3 '$AUD' --policy '$B/pu.txt' --checker '$CERT' '$OUT/user.out' | grep -q 'chain: on behalf of alice@example.test ($ISS); sub-agents (decisions): alpha#1 [0-9]'"
+    python3 "$F" "$OUT/user.out" "$OUT/g1.log" "$RS; rs['on_behalf_of']['user']['issuer'] = 'https://idp.elsewhere.test'"
+    refuses "a user vouched for by an issuer the policy does not trust" "$B/pu.txt" "$OUT/g1.log" "an issuer the policy does not trust"
+    python3 "$F" "$OUT/user.out" "$OUT/g2.log" "$RS; rs['on_behalf_of']['user']['verified'] = False"
+    refuses "a user not marked verified" "$B/pu.txt" "$OUT/g2.log" "is not marked verified"
+    python3 "$F" "$OUT/user.out" "$OUT/g3.log" "$RS; rs['on_behalf_of']['user']['expires'] = rs['timestamp_ns'] // 10**9 - 5"
+    refuses "a user's token expired before the run started" "$B/pu.txt" "$OUT/g3.log" "had expired when the run started"
+    python3 "$F" "$OUT/user.out" "$OUT/g4.log" "$DR; dr[1]['obo'] = ['user', 'agent', 'subagent:alpha#1']"
+    refuses "a sub-agent's decision before its launch" "$B/pu.txt" "$OUT/g4.log" "before (or without) a launch that started it"
+    python3 "$F" "$OUT/user.out" "$OUT/g5.log" "import json
+for r in recs:
+    if isinstance(r, dict):
+        if r.get('subagent') == 'alpha#1': r['subagent'] = 'gamma#1'
+        if 'cgroup' in r and 'report_id' in r: r['cgroup'] = r['cgroup'].replace('alpha-1', 'gamma-1')
+        if isinstance(r.get('obo'), list): r['obo'] = [x.replace('alpha#1', 'gamma#1') for x in r['obo']]"
+    refuses "a sub-agent the policy does not name" "$B/pu.txt" "$OUT/g5.log" "names alpha"
+    python3 "$F" "$OUT/user.out" "$OUT/g6.log" "$DR; dr[-1]['obo'] = ['agent']"
+    refuses "a decision whose chain drops the user" "$B/pu.txt" "$OUT/g6.log" "does not begin with ['user', 'agent']"
+    python3 "$F" "$OUT/user.out" "$OUT/g7.log" "$DR; dr[-1]['obo'] = dr[-1]['obo'] + ['subagent:beta#1']"
+    refuses "a sub-agent no launch started" "$B/pu.txt" "$OUT/g7.log" "before (or without) a launch that started it"
+    python3 "$F" "$OUT/e2big.out" "$OUT/g8.log" "$DR; dr[-1]['obo'] = ['agent', 'subagent:alpha#1']"
+    refuses "a decision for a sub-agent after its launch failed" "$B/p.txt" "$OUT/g8.log" "after its launch failed"
+    python3 "$F" "$OUT/req1.out" "$OUT/g9.log" "$RS; del rs['on_behalf_of']['user']
+for r in recs:
+    if isinstance(r, dict) and isinstance(r.get('obo'), list): r['obo'] = [x for x in r['obo'] if x != 'user']"
+    refuses "a run of a policy that requires a user, with none" "$T/p6.txt" "$OUT/g9.log" "requires on-behalf-of, but run_start names no user"
+    python3 "$F" "$OUT/exp_rv.out" "$OUT/g10.log" "$DR; dr[-1]['decision_final'] = 'ALLOW'"
+    refuses "an allowed decision after the token expired and the run was revoked" "$B/pe.txt" "$OUT/g10.log" "after the run was revoked"
+    python3 "$F" "$OUT/exp_rv.out" "$OUT/g11.log" "recs[:] = [r for r in recs if not (isinstance(r, dict) and r.get('event') == 'on_behalf_of_expired')]"
+    refuses "a revocation by the expiry with no expiry recorded" "$B/pe.txt" "$OUT/g11.log" "no expiry that revokes is recorded before it"
+    python3 "$F" "$OUT/fork.out" "$OUT/g12.log" "$RS; del rs['on_behalf_of']['agent']['cgroup']"
+    refuses "a run with sub-agents whose run_start names no control group" "$B/p.txt" "$OUT/g12.log" "has no control group"
+    # the tools
+    for n in user nest es256 plain; do cp "$OUT/$n.out" "$OUT/verdicts-$n.log"; done
+    printf '[varek]\npolicy = %s\nlog_dir = %s\n' "$B/pu.txt" "$OUT" > "$OUT/varek5.conf"
+    V() { NO_COLOR=1 VAREK_CONFIG="$OUT/varek5.conf" python3 "$HERE/tools/varek" "$@"; }
+    V runs -n 10 > "$OUT/runs.out" 2>&1
+    check "varek runs: whom each run was for, and its sub-agents" sh -c "grep -q 'alice@example.test +1 sub-agent .*verdicts-user.log' '$OUT/runs.out' && grep -q 'agent +2 sub-agents .*verdicts-nest.log' '$OUT/runs.out' && grep -q ' agent  .*verdicts-plain.log' '$OUT/runs.out'"
+    V refusals "$OUT/user.out" > "$OUT/rf1.out" 2>&1
+    check "varek refusals: on behalf of whom, the sub-agents, and who got each refusal" sh -c \
+        "grep -q 'On behalf of alice@example.test (token from $ISS, verified); sub-agents: alpha#1' '$OUT/rf1.out' && grep -q 'sub-agent alpha#1 got EACCES' '$OUT/rf1.out' && grep -q 'the agent got EACCES' '$OUT/rf1.out'"
+    V refusals --subagent alpha "$OUT/user.out" > "$OUT/rf2.out" 2>&1
+    check "varek refusals --subagent: that sub-agent's refusals only" sh -c "grep -q 'sub-agent alpha#1 got' '$OUT/rf2.out' && ! grep -q 'the agent got' '$OUT/rf2.out'"
+    V refusals --user bob "$OUT/user.out" > "$OUT/rf3.out" 2>&1
+    check "varek refusals --user: a run for someone else says so" grep -q 'This run was not on behalf of bob (it was on behalf of alice@example.test)' "$OUT/rf3.out"
+    V refusals "$OUT/exp_rv.out" > "$OUT/rf4.out" 2>&1
+    check "varek refusals: the token expired and the run was revoked" sh -c "grep -q 'expired during the run (the run was revoked)' '$OUT/rf4.out' && grep -q '(the user.s token expired): every call after it was refused' '$OUT/rf4.out'"
+    V policy show "$B/pu.txt" > "$OUT/ps.out" 2>&1
+    check "varek policy show: the trusted issuer and the sub-agents" sh -c "grep -q '^Issuer   $ISS: a user.s token it issued for varek-agent' '$OUT/ps.out' && grep -q '^  alpha: line 2: allow exec $B/a subagent=alpha' '$OUT/ps.out'"
+    python3 "$HERE/tools/varek_cyclonedx.py" --log "$OUT/user.out" --policy "$B/pu.txt" --output "$OUT/u.cdx.json" > /dev/null 2>&1
+    check "the export carries varek:on_behalf_of.* (the user, the operator, each sub-agent's decisions)" python3 -c 'import json,sys
+P={}
+def walk(o):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k == "properties": P.update({p["name"]: p["value"] for p in v})
+            else: walk(v)
+    elif isinstance(o, list):
+        for x in o: walk(x)
+walk(json.load(open(sys.argv[1])))
+sys.exit(0 if P.get("varek:on_behalf_of.user.subject") == "alice@example.test" and P.get("varek:on_behalf_of.user.issuer") == sys.argv[2]
+         and "not verified" in P.get("varek:on_behalf_of.operator", "") and P.get("varek:on_behalf_of.subagents") == "1"
+         and int(P.get("varek:on_behalf_of.subagent.alpha#1.decisions", "0")) > 0 else 1)' "$OUT/u.cdx.json" "$ISS"
+    check "the export holds no token" sh -c "! grep -qF -- '$TOKSIG' '$OUT/u.cdx.json'"
+    VL() { python3 -c 'import importlib.machinery,sys
+m = importlib.machinery.SourceFileLoader("varekcli", sys.argv[1]).load_module()
+print(*m.issuer_keys(sys.argv[2], None, sys.argv[3]))' "$HERE/tools/varek" "$@"; }
+    check "varek doctor's issuer check: the stand-in's keys" sh -c "$(declare -f VL); HERE='$HERE' VL '$ISS' '$T/conf' | grep -q '^True 3 key(s) (EC, OKP, RSA) at $ISS/jwks'"
+    check "... and an issuer whose discovery names another" sh -c "$(declare -f VL); HERE='$HERE' VL '$ISS/liar' '$T/conf' | grep -q 'names another issuer'"
 fi
 
 echo
