@@ -3,8 +3,7 @@
 > The review was done by AI review agents; a human or third-party review
 > has not been done.
 
-**Draft.** Pending: the 24-hour soak of the reviewed build, the latency
-figures, and the date.
+**Draft.** Pending: the 24-hour soak of the reviewed build and the date.
 
 MIT · github.com/kwdoug63/varek
 
@@ -151,8 +150,22 @@ passed; memory flat. The 24-hour run of the reviewed build: (to come).
 
 ## Latency
 
-(to come: `varek bench --proxy`, a request carrying a credential against
-one on the same kept-alive connection without one.)
+`varek bench --proxy` gains a kind: a request on a kept-alive connection
+that carries a credential (natively the client sends the value; in
+inspecting mode it sends the placeholder and the proxy swaps it in, and the
+server answers 200 only to the value). Measured on the reviewed build, a
+4-vCPU container, 3 rounds of 200 requests of each kind after 20 warm-up:
+
+| | native | inspecting mode | added (p50) |
+|---|---|---|---|
+| a request on a kept-alive connection | 106 us | 439 us | +334 us |
+| the same, carrying a credential | 120 us | 507 us | +386 us |
+| the Warden's decision on it (p50 / p99) | | 4 / 14 us; with a credential 5 / 18 us | |
+
+So the swap adds about 50 us to a request at the median, on top of what
+inspecting mode already adds; a real server's network time is not in these
+numbers. All 45 of the bench's checks passed, among them every request with
+a credential answered by the server only to its value.
 
 ## Compatibility
 
