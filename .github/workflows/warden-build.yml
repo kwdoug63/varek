@@ -71,7 +71,7 @@ jobs:
         run: sudo make -C varek/v1_4 test-v1280
       - name: v1.28.1 the on-behalf-of chain (the grammar, verifying the user's token and the agent's SVID)
         run: sudo make -C varek/v1_4 test-v1281
-      - name: v1.29 opening files as the agent (require warden 1.29)
+      - name: v1.29 varek run (opening as the agent, the baseline and profiles, changes by name, the dry run, policy suggest)
         run: sudo make -C varek/v1_4 test-v1290
       - name: Build and test the plan_verify CLI (v1_6, v1.16.3)
         run: make -C v1_6 plan_verify check check-plan-verify
