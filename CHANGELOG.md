@@ -9,7 +9,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [1.27.1] - 2026-10-13 — Nothing written during the run is mapped executable
+## [1.27.1] - 2026-10-12 — Nothing written during the run is mapped executable
 
 Under `require warden 1.27`, every directory the policy lets the agent
 write (a path rule whose flag clause admits writes) is mounted `noexec` in
