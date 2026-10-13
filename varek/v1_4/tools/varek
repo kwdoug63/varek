@@ -1906,6 +1906,156 @@ def cmd_bench_subagents(args, cfg):
     return 0 if res["ok"] else 1
 
 
+def _bench_bases(args, cfg, bases, what):
+    """v1.29: the bench's own calls (opens and connects) under each of
+    several base policies (label -> text, the bench's rules after each),
+    alternated round by round, so the differences are what each base costs.
+    The medians of the rounds' p50s, per kind and base."""
+    import statistics
+    import tempfile
+    if args.policy or args.bare:
+        raise CliError(f"--{what} measures with the bench's own policies; --policy and --bare do not apply")
+    n = 2000 if args.n is None else args.n
+    warmup = 200 if args.warmup is None else args.warmup
+    rounds = 3 if args.rounds is None else args.rounds
+    if n < 100 or rounds < 1 or warmup < 0:
+        raise CliError("use -n of at least 100, --rounds of at least 1 and --warmup of 0 or more")
+    run_as = args.run_as or (cfg["run_as"] if cfg else "nobody")
+    sign_key = cfg["sign_key"] if cfg and cfg["sign_key"] and not args.no_sign else None
+    if args.output and not os.access(os.path.dirname(os.path.abspath(args.output)), os.W_OK):
+        raise CliError(f"cannot write {args.output}", fix="give -o a path in a writable directory")
+    progress = (lambda m: None) if args.json else (
+        lambda m: print(_paint("2", f"[varek] bench --{what} {m}"), file=sys.stderr))
+    d = tempfile.mkdtemp(prefix=f"varek-bench-{what}-")
+    os.chmod(d, 0o755)
+    paths, per = {}, {m: [] for m in bases}
+    for i, (m, text) in enumerate(bases.items()):
+        paths[m] = os.path.join(d, f"base-{i}.policy.txt")
+        with open(paths[m], "w") as fh:
+            fh.write(text)
+        os.chmod(paths[m], 0o644)
+    labels = list(bases)
+    try:
+        for rnd in range(rounds):
+            for m in (labels if rnd % 2 == 0 else labels[::-1]):
+                progress(f"round {rnd + 1}/{rounds}: {m}")
+                try:
+                    per[m].append(varek_bench.run(warden_bin(), tool("bench_workload"), base_policy=paths[m],
+                                                  base_label=m, n=n, warmup=warmup, rounds=1,
+                                                  run_as=run_as, sign_key=sign_key, keep=False))
+                except varek_bench.BenchError as e:
+                    raise CliError(f"{m}: {e}", fix=e.fix)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    med = lambda xs: round(statistics.median(xs), 1) if xs else None
+    kinds = {}
+    for k, label in varek_bench.KINDS:
+        row = {"label": label}
+        for m in bases:
+            row[m] = {"call_p50_us": med([r["kinds"][k]["warden"]["p50"] for r in per[m]]),
+                      "decision_p50_us": med([r["kinds"][k]["warden_decision_us"]["p50"] for r in per[m]]),
+                      "native_p50_us": med([r["kinds"][k]["native"]["p50"] for r in per[m]])}
+        kinds[k] = row
+    first = per[labels[0]][0]
+    res = {f"varek_bench_{what.replace('-', '_')}": 1, "varek_command": CLI_VERSION,
+           "date": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "host": first["host"], "warden": first["warden"],
+           "settings": {"calls_per_kind_per_run": n, "warmup": warmup, "rounds": rounds, "run_as": run_as,
+                        "signing": bool(sign_key)},
+           "bases": {m: {"rules": varek_bench.count_rules(text)} for m, text in bases.items()},
+           "kinds": kinds, "ok": all(r["ok"] for m in per for r in per[m])}
+    if args.output:
+        try:
+            with open(args.output, "w") as fh:
+                json.dump(res, fh, indent=2)
+                fh.write("\n")
+        except OSError as e:
+            warn(f"could not write {args.output}: {e}")
+    return res
+
+
+def _bench_head(what, res):
+    h, s = res["host"], res["settings"]
+    print(f"varek bench --{what} ({CLI_VERSION}), Warden {res['warden'].get('version')}, {res['date']}")
+    print(f"host: {h.get('cpu_model') or '?'}, {h.get('cpus', '?')} CPU(s), {h.get('memory') or '?'}, "
+          f"kernel {h.get('kernel', '?')}")
+    print(f"{s['calls_per_kind_per_run']} calls of each kind a run, {s['warmup']} warm-up, {s['rounds']} round(s) "
+          f"of each, alternated; medians of the rounds' p50s, in microseconds")
+    print()
+
+
+def cmd_bench_open_as(args, cfg):
+    """v1.29: `varek bench --open-as`: what opening files as the agent costs.
+    The bench's calls under `require warden 1.28` (opened as root, as before)
+    and `require warden 1.29` (each open walked and made as the agent, by a
+    thread that takes on the agent's ids), alternated."""
+    res = _bench_bases(args, cfg, {"off": "require warden 1.28\n", "on": "require warden 1.29\n"}, "open-as")
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return 0 if res["ok"] else 1
+    _bench_head("open-as", res)
+    print(f"{'call':34} {'native':>7} {'call off':>9} {'call on':>8} {'decide off':>11} {'decide on':>10} {'added':>7}")
+    for k, row in res["kinds"].items():
+        added = row["on"]["decision_p50_us"] - row["off"]["decision_p50_us"]
+        print(f"{row['label']:34} {_fmt_us(row['off']['native_p50_us']):>7} {_fmt_us(row['off']['call_p50_us']):>9} "
+              f"{_fmt_us(row['on']['call_p50_us']):>8} {_fmt_us(row['off']['decision_p50_us']):>11} "
+              f"{_fmt_us(row['on']['decision_p50_us']):>10} {added:>+7.1f}")
+    print()
+    print("off: require warden 1.28 (files opened as root). on: require warden 1.29 (opened as the agent). "
+          "added: decide on minus decide off (the Warden's own time per decision, from the verdict records).")
+    print("checks: " + ("every run's outcomes as expected" if res["ok"] else "SOME CHECKS FAILED (run with --json)"))
+    return 0 if res["ok"] else 1
+
+
+def cmd_bench_baseline(args, cfg):
+    """v1.29: `varek bench --baseline`: what the baseline and each profile
+    cost a decision, against a sector pack. Each is the policy `varek run`
+    writes (for the bench's user, in a working directory of its own), all
+    under `require warden 1.29`, the bench's rules last: every bench call is
+    decided after every rule of the base."""
+    import pwd
+    import tempfile
+    try:
+        pw = pwd.getpwnam(args.run_as or (cfg["run_as"] if cfg else "nobody"))
+    except KeyError:
+        raise CliError("--run-as: no such user")
+    packs = builtin_packs()
+    pack = args.pack or "healthcare"
+    if pack not in packs:
+        raise CliError(f"no built-in pack {pack!r}", fix="`varek policy list` shows them")
+    with open(packs[pack], encoding="utf-8") as fh:
+        ptext = fh.read()
+    ptext = re.sub(r"(?m)^require warden \S+\s*$", "", ptext)
+    bases = {f"pack {pack}": "require warden 1.29\n" + ptext}
+    proj = tempfile.mkdtemp(prefix="varek-bench-proj-")
+    os.chmod(proj, 0o755)
+    try:
+        tmp = f"/tmp/varek-{pw.pw_uid}"
+        bases["baseline"] = varek_baseline.generate(proj, pw, tmp, None)
+        for name, prof in sorted(varek_baseline.all_profiles(varek_home()).items()):
+            bases[f"baseline + {name}"] = varek_baseline.generate(proj, pw, tmp, prof)
+        res = _bench_bases(args, cfg, bases, "baseline")
+    finally:
+        shutil.rmtree(proj, ignore_errors=True)
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return 0 if res["ok"] else 1
+    _bench_head("baseline", res)
+    cols = [k for k, _ in varek_bench.KINDS]
+    short = {"open_allowed": "open ok", "open_denied": "open deny", "open_unknown": "open none",
+             "connect_allowed": "conn ok", "connect_denied": "conn deny", "request": "request"}
+    print("the Warden's own time per decision (p50, us), by base policy:")
+    print(f"{'base':22} {'rules':>5} " + " ".join(f"{short.get(k, k[:9]):>9}" for k in cols))
+    for m, b in res["bases"].items():
+        print(f"{m:22} {b['rules']:>5} " +
+              " ".join(f"{_fmt_us(res['kinds'][k][m]['decision_p50_us']):>9}" for k in cols))
+    print()
+    print("each base: require warden 1.29 (opened as the agent), then the bench's own rules. The pack's own "
+          "require line is replaced. rules: the base's allow and deny lines.")
+    print("checks: " + ("every run's outcomes as expected" if res["ok"] else "SOME CHECKS FAILED (run with --json)"))
+    return 0 if res["ok"] else 1
+
+
 def _fmt_us(v):
     return "-" if v is None else (f"{v:.0f}" if v >= 10 else f"{v:.1f}")
 
@@ -1915,6 +2065,10 @@ def cmd_bench(args):
     cfg = load_config(required=False)
     if getattr(args, "subagents", False):                                          # v1.28.1
         return cmd_bench_subagents(args, cfg)
+    if getattr(args, "open_as", False):                                            # v1.29
+        return cmd_bench_open_as(args, cfg)
+    if getattr(args, "baseline", False):
+        return cmd_bench_baseline(args, cfg)
     if args.proxy:
         return cmd_bench_proxy(args, cfg)
     if args.launches:
@@ -2154,6 +2308,11 @@ def build_parser():
                          "in inspecting mode (defaults -n 200 --warmup 20 --rounds 3)")
     sp.add_argument("--subagents", action="store_true",
                     help="v1.28.1: what attributing each call to its control group costs (sub-agents named or not)")
+    sp.add_argument("--open-as", action="store_true",
+                    help="v1.29: what opening files as the agent costs (require warden 1.28 and 1.29)")
+    sp.add_argument("--baseline", action="store_true",
+                    help="v1.29: the decision time under the baseline and each profile, against a pack")
+    sp.add_argument("--pack", metavar="NAME", help="with --baseline: the pack to compare with (default healthcare)")
     sp.add_argument("--launches", action="store_true",
                     help="measure decided program launches instead (v1.27): launches and an open "
                          "natively, with launches off and on (defaults -n 200 --warmup 20 --rounds 3)")

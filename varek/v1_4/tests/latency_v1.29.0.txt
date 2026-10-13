@@ -1,0 +1,49 @@
+# v1.29.0 latency (tests/latency_v1290.sh, N=2000, K=20, R=3, RL=5), 2026-10-13T17:30:42Z
+
+## 1. opening as the agent: varek bench --open-as
+varek bench --open-as (1.3.0), Warden 1.29.0, 2026-10-13T17:31:01Z
+host: Intel(R) Xeon(R) Processor @ 2.80GHz, 4 CPU(s), 16093 MiB, kernel 6.18.44-fc-v114
+2000 calls of each kind a run, 200 warm-up, 3 round(s) of each, alternated; medians of the rounds' p50s, in microseconds
+
+call                                native  call off  call on  decide off  decide on   added
+open, allowed (read)                   3.4       104      120          83         94   +11.0
+open, denied by a rule                 1.3        81       80          23         29    +6.0
+open, no rule (UNKNOWN)                1.2        75       81          24         29    +5.0
+connect, allowed (dialed)               28       216      208         180        169   -11.0
+connect, denied by a rule               27        80       76          26         23    -3.0
+request (connect + 1 KiB reply)        105       337      333         177        165   -12.0
+
+off: require warden 1.28 (files opened as root). on: require warden 1.29 (opened as the agent). added: decide on minus decide off (the Warden's own time per decision, from the verdict records).
+checks: every run's outcomes as expected
+
+## 2. the baseline and the profiles against a pack: varek bench --baseline
+varek bench --baseline (1.3.0), Warden 1.29.0, 2026-10-13T17:32:40Z
+host: Intel(R) Xeon(R) Processor @ 2.80GHz, 4 CPU(s), 16093 MiB, kernel 6.18.44-fc-v114
+2000 calls of each kind a run, 200 warm-up, 3 round(s) of each, alternated; medians of the rounds' p50s, in microseconds
+
+the Warden's own time per decision (p50, us), by base policy:
+base                   rules   open ok open deny open none   conn ok conn deny   request
+pack healthcare           34       135        44        44       188        28       187
+baseline                 205       143        49        48       203        32       199
+baseline + aider         217       140        50        47       196        31       194
+baseline + claude        221       135        43        43       191        30       190
+baseline + codex         216       119        37        37       179        27       174
+baseline + gemini        211       121        38        37       180        27       175
+baseline + node          211       140        49        47       198        31       194
+baseline + python        210       117        36        35       174        26       171
+
+each base: require warden 1.29 (opened as the agent), then the bench's own rules. The pack's own require line is replaced. rules: the base's allow and deny lines.
+checks: every run's outcomes as expected
+
+## 3. a dry run: a call outside the allowlist, and an allowed open (as the agent sees them; medians of 5 rounds, each mode alternated within a round)
+getpriority, natively:                    p50    0.3 us, p90    0.3 us (2000 of 2000 calls succeeded)
+getpriority, enforcing (EPERM, kernel):   p50    0.4 us, p90    0.6 us (0 of 2000 calls succeeded)
+getpriority, dry run (to the Warden):     p50   51.4 us, p90   67.9 us (2000 of 2000 calls succeeded)
+open, allowed, natively:                  p50    1.5 us, p90    1.5 us (2000 of 2000 calls succeeded)
+open, allowed, enforcing:                 p50  104.6 us, p90  148.7 us (2000 of 2000 calls succeeded)
+open, allowed, dry run:                   p50   92.0 us, p90  140.8 us (2000 of 2000 calls succeeded)
+
+## 4. startup: warden POLICY -- /usr/bin/true, wall time (the launch set read and hashed at start)
+pack healthcare (34 rules):           p50 73.0 ms, p90 95.9 ms (20 runs)
+the baseline (205 rules):             p50 229.2 ms, p90 284.3 ms (20 runs)
+the baseline + claude (221 rules):    p50 916.9 ms, p90 1156.7 ms (20 runs)
