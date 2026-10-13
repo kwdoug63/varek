@@ -149,6 +149,11 @@ def _chain_step(st, raw, rec, lineno, ndecisions, fail):
                                     "errno": rec.get("errno")})
 
 
+# v1.28: the events of credential release and revocation (varek_audit.py)
+CRED_EVENTS = ("credential_refused", "revoked", "revocation_proxy", "revocation_leases", "lease_renewed",
+               "lease_renewal_failed")
+
+
 def _parse_log(stream, allow_incomplete=False, meta=None):
     """Read a Warden verdict stream and return (run, records, complete).
 
@@ -255,6 +260,10 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             if event == "exec_result" and run is not None and rec.get("run") == run \
                     and meta is not None:
                 meta.setdefault("exec_results", []).append((len(records), rec))
+            # v1.28: credentials and revocation, each with the number of
+            # decision records before it
+            if event in CRED_EVENTS and run is not None and rec.get("run") == run and meta is not None:
+                meta.setdefault("cred_events", []).append((len(records), rec))
             if event in ("resolution", "dns_question", "synthetic_address") and run is not None \
                     and rec.get("run") == run and meta is not None:
                 meta.setdefault("dns_events", []).append(rec)
@@ -560,6 +569,53 @@ def _launch_text(records, pm):
     return text, facts
 
 
+def _cred_text(records, pm):
+    """v1.28 (section 5): credential release and revocation, from run_start
+    (each credential's source and version, never a value) and the stream's
+    events. Nothing when the run held no credential and was not revoked."""
+    rs = pm.get("run_start") or {}
+    creds = [c for c in rs.get("credentials") or [] if isinstance(c, dict)] \
+        if isinstance(rs.get("credentials"), list) else []
+    evs = [e for _, e in pm.get("cred_events", [])]
+    revoked = next((e for e in evs if e.get("event") == "revoked"), None)
+    if not creds and not revoked:
+        return "", []
+    one = lambda n: next((e for e in evs if e.get("event") == n), {})
+    carried = [r for r in records if r.get("action") == "net.request" and r.get("credential")]
+    refused = [e for e in evs if e.get("event") == "credential_refused"]
+    renewed = [e for e in evs if e.get("event") == "lease_renewed"]
+    unrenewed = [e for e in evs if e.get("event") == "lease_renewal_failed"]
+    facts = [("varek:credentials.count", str(len(creds)))]
+    text = ""
+    if creds:
+        facts += [("varek:credentials.names", ",".join(str(c.get("name", "")) for c in creds)),
+                  ("varek:credentials.secrets_binary.sha256", str(rs.get("secrets_binary_sha256", ""))),
+                  ("varek:credentials.sha256", hashlib.sha256(json.dumps(creds, sort_keys=True,
+                   separators=(",", ":")).encode()).hexdigest())]
+        facts += [(f"varek:credentials.{c.get('name')}", f"{c.get('store')}:{c.get('ref')} version "
+                   f"{c.get('version')}") for c in creds]
+        facts += [("varek:credentials.requests", str(len(carried))),
+                  ("varek:credentials.refused", str(len(refused))),
+                  ("varek:credentials.leases.renewed", str(len(renewed))),
+                  ("varek:credentials.leases.renewal_failed", str(len(unrenewed)))]
+        text += (f" {len(creds)} credential(s) were fetched at startup and held by the egress proxy; the agent "
+                 f"held only placeholders. {len(carried)} request(s) carried one, each where its deciding rule "
+                 f"names it; {len(refused)} were refused because the request did not hold its placeholder "
+                 f"where the rule names it. No value is in this evidence or in the verdict stream.")
+    facts.append(("varek:run.revoked", "true" if revoked else "false"))
+    if revoked:
+        rp, rl = one("revocation_proxy"), one("revocation_leases")
+        facts += [("varek:revocation.by_uid", str(revoked.get("by_uid", ""))),
+                  ("varek:revocation.proxy.values_held", str(rp.get("values_held", "not reported"))),
+                  ("varek:revocation.leases.revoked", str(rl.get("revoked", "not reported"))),
+                  ("varek:revocation.leases.failed", str(rl.get("failed", "not reported")))]
+        text += (" The run was revoked (varek revoke): every decision after it was UNSATISFIED"
+                 + (f", the proxy held {rp['values_held']} credential value(s) after it" if "values_held" in rp else "")
+                 + (f", and {rl['revoked']} Vault lease(s) were revoked ({rl['failed']} could not be)"
+                    if "revoked" in rl else "") + ".")
+    return text, facts
+
+
 def build_bom(records, agent, policy, serial, run_id="", complete=True,
               warden_version=VAREK_VERSION, policy_sha256="", log_info=None,
               plan_gate=None, policy_check="not checked", proxy_meta=None):
@@ -675,6 +731,9 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
     lt, lfacts = _launch_text(records, proxy_meta or {})       # v1.27
     attest_text += lt
     facts += lfacts
+    ct, cfacts = _cred_text(records, proxy_meta or {})         # v1.28
+    attest_text += ct
+    facts += cfacts
     agent_component["properties"] += [{"name": k, "value": v} for k, v in facts]
 
     annotation = {

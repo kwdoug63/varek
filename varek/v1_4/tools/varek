@@ -345,7 +345,8 @@ def summarize(recs):
     s = {"run": None, "start": None, "complete": False, "warden": None, "policy": None,
          "policy_sha": None,
          "allowed": 0, "refused": 0, "unknown": 0, "refusals": [],
-         "proxy_targets": {}, "proxy_denied": set(), "proxy_ends": []}
+         "proxy_targets": {}, "proxy_denied": set(), "proxy_ends": [],
+         "cred_refused": [], "revoked": None, "credentials": []}
     for r in recs:
         ev = r.get("event")
         if ev == "run_start":
@@ -356,8 +357,16 @@ def summarize(recs):
             ts = r.get("timestamp_ns")
             if ts:
                 s["start"] = _dt.datetime.fromtimestamp(ts / 1e9).strftime("%Y-%m-%d %H:%M:%S")
+            if isinstance(r.get("credentials"), list):               # v1.28
+                s["credentials"] = [c for c in r["credentials"] if isinstance(c, dict)]
         elif ev == "run_end":
             s["complete"] = True
+        elif ev == "credential_refused":
+            # v1.28: a request the rule allowed with a credential, where the
+            # proxy could not put the value in (the agent got a 403)
+            s["cred_refused"].append(r)
+        elif ev == "revoked" and s["revoked"] is None:
+            s["revoked"] = r
         elif ev == "proxy_close":
             # v1.26.1 (step 7): a connection the proxy ended: its parser
             # refused a request, a TLS handshake failed, or a body passed
@@ -448,6 +457,29 @@ def landlock_abi():
                95: "Landlock is not enabled (it is not in the kernel's LSM list)"}.get(e, os.strerror(e))
 
 
+def policy_credential_names(path):
+    """v1.28: the credentials a policy names, as the certificate checker reads it."""
+    q = run_cmd([tool("vdp_cert_check"), path, "credentials"], capture=True)
+    return [ln.split(" ")[1] for ln in q.stdout.splitlines()
+            if q.returncode == 0 and ln.startswith("credential ")]
+
+
+def check_credentials(path):
+    """v1.28: fetch each credential the policy names, as a run would (root:
+    `warden --check-credentials`; values are not kept, a Vault lease the
+    check makes is revoked). [(ok, text)] for each credential, or one line
+    saying why the check could not finish."""
+    r = subprocess.run([warden_bin(), path, "--check-credentials"], capture_output=True, text=True)
+    got = [ln[len("[warden] credential "):] for ln in r.stderr.splitlines()
+           if ln.startswith("[warden] credential ") and ": fetched, " in ln]
+    out = [(True, g) for g in got]
+    if r.returncode != 0:
+        why = next((ln[len("[warden] "):] for ln in r.stderr.splitlines() if "refusing to start" in ln),
+                   (r.stderr.strip().splitlines() or [f"exit {r.returncode}"])[-1])
+        out.append((False, why))
+    return out
+
+
 def cmd_doctor(args):
     info("VAREK doctor: is this host ready to run the Warden?\n")
     bad = 0
@@ -518,6 +550,19 @@ def cmd_doctor(args):
             rc, out = lint_policy(cfg["policy"]) if not missing else (1, "runtime not built")
             if rc == 0:
                 ok(f"policy {cfg['policy']} loads and lints")
+                # v1.28: each credential the policy names can be fetched
+                names = policy_credential_names(cfg["policy"])
+                if names and os.geteuid() != 0:
+                    warn(f"the policy names {len(names)} credential(s); run `sudo varek doctor` to fetch each "
+                         f"(warden-secrets needs root)")
+                elif names:
+                    for good, text in check_credentials(cfg["policy"]):
+                        if good:
+                            ok(f"credential {text}")
+                        else:
+                            fail(f"credentials: {text}")
+                            hint("/etc/varek/secrets.conf names the stores (docs/security/v1.28-credential-release.md)")
+                            bad += 1
             else:
                 fail(f"policy {cfg['policy']} does not lint: {out.splitlines()[-1] if out else rc}")
                 hint("`varek policy check` shows every problem")
@@ -794,6 +839,25 @@ def cmd_policy_show(args):
                  ("names under it leave the host when the Warden looks them up to dial a request "
                   "it allowed (acknowledge=dns-channel)" if proxy_on else
                   "the agent's lookups under it leave the host (acknowledge=dns-channel)"))
+    # v1.28: credential release, as the certificate checker reads the policy
+    cq = run_cmd([tool("vdp_cert_check"), path, "credentials"], capture=True)
+    creds, crules = [], []
+    for ln in cq.stdout.splitlines() if cq.returncode == 0 else []:
+        f = ln.split(" ")
+        if len(f) == 4 and f[0] == "credential":
+            creds.append(f[1:])
+        elif len(f) == 5 and f[0] == "rule":
+            crules.append(f[1:])
+    if creds:
+        info(f"Credentials ({len(creds)}): fetched at startup by warden-secrets; the agent gets a placeholder in "
+             f"VAREK_CRED_<NAME>, and the proxy puts the value in only where a rule below names it")
+        for name, store, ref in creds:
+            used = [r for r in crules if r[1] == name]
+            info(f"  {name} from {store}:{ref}")
+            for line, _, hdr, scheme in used:
+                info(f"    line {line}: in {hdr}" + (f" after {scheme}" if scheme != "-" else ""))
+            if not used:
+                info("    no rule carries it (fetched, never sent)")
     info("Anything not allowed is UNKNOWN and refused.")
     return show_rc
 
@@ -1084,7 +1148,13 @@ def cmd_refusals(args):
     # its net.request record, listed with the others)
     ends = [e for e in s["proxy_ends"]
             if not (e.get("why") == "refused_request" and e.get("proxy_conn") in s["proxy_denied"])]
-    if not s["refusals"] and not ends:
+    if s["revoked"]:                                                                # v1.28
+        rv = s["revoked"]
+        ts = rv.get("timestamp_ns")
+        when = _dt.datetime.fromtimestamp(ts / 1e9).strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, int) else "?"
+        info(f"The run was revoked at {when} (varek revoke, by uid {rv.get('by_uid', '?')}): every call "
+             f"after it was refused.\n")
+    if not s["refusals"] and not ends and not s["cred_refused"]:
         info(f"No refusals in {log}.")
         return 0
     info(f"{s['refused']} refused action(s) in {log}:\n")
@@ -1099,6 +1169,8 @@ def cmd_refusals(args):
                 word = "MAX_BODY"
                 where = (f"policy line {line}" + (f": {text}" if text else "") + " allows it, but its body "
                          f"({r.get('body_declared', '?')} bytes declared) is over that rule's max_body")
+            elif rl == "revoked":
+                word, where = "REVOKED", RULE_WORDS["revoked"]
             elif isinstance(line, int) and line >= 0:
                 word, where = verdict_word(r), f"policy line {line}" + (f": {text}" if text else
                                                                         " (that policy file is no longer on this host)")
@@ -1131,6 +1203,10 @@ def cmd_refusals(args):
                         b if isinstance(b, str) else "", "a budget")   # v1.25 review: no crash on a list
             info(f"  {'BUDGET':11}  {'dns.question':13}  {r.get('name', '')}")
             hint(f"policy line {line}" + (f": {text}" if text else "") + f"; {what}; the agent got NXDOMAIN")
+            continue
+        if rl == "revoked":                                                         # v1.28
+            info(f"  {'REVOKED':11}  {r.get('action', '?'):13}  {r.get('resolved') or r.get('target', '')}")
+            hint(f"{RULE_WORDS['revoked']}; the agent got {r.get('kernel_verdict', '?')}")
             continue
         if isinstance(line, int) and line >= 0:
             text = policy_line_text(policy, line) if policy else None
@@ -1165,7 +1241,23 @@ def cmd_refusals(args):
             hint(what)
         if len(ends) > args.n:
             info(f"\n  ... and {len(ends) - args.n} more (use -n to see them)")
+    cf = s["cred_refused"]
+    if cf:                                                                          # v1.28
+        info(f"\n{len(cf)} request(s) allowed with a credential, refused by the proxy (credential release):\n")
+        for e in cf[: args.n]:
+            cid = e.get("proxy_conn")
+            info(f"  {'CREDENTIAL':11}  {'net.request':13}  connection {cid} "
+                 f"({s['proxy_targets'].get(cid, '?')}), request {e.get('request_seq', '?')}")
+            hint(f"credential {e.get('credential', '?')}: {e.get('why', '?')}; nothing was sent to the server, "
+                 f"and the agent got 403 Forbidden")
+        if len(cf) > args.n:
+            info(f"\n  ... and {len(cf) - args.n} more (use -n to see them)")
     info("\nUNSATISFIED: a deny rule matched.  UNKNOWN: no rule allowed it (refused by default).")
+    if cf:
+        info("CREDENTIAL: the header the rule names must hold the credential's placeholder (VAREK_CRED_<NAME>), "
+             "once, alone or after the rule's scheme.")
+    if s["revoked"]:
+        info("REVOKED: the run was revoked (varek revoke); calls after that are refused, whatever the policy says.")
     if any(r.get("event") == "dns_question" for r in s["refusals"][: args.n]):
         info("BUDGET: a wildcard rule's budget refused a new name (raise it with names= or rate=).")
     if any(r.get("rule") == "exec_not_in_ruleset" for r in s["refusals"][: args.n]):

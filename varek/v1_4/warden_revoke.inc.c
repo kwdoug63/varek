@@ -76,7 +76,24 @@ static void ctl_close(void) {
     g_ctl_path[0] = '\0';
 }
 
-static void revoke_run(uid_t uid, pid_t pid) {
+/* What was decided before the revocation and is not yet answered (a connect
+ * the Warden is still dialing, for the agent or for the proxy) is refused
+ * now, recorded with rule `revoked`: no decision is recorded as allowed
+ * after `revoked`. A send on a connection already allowed goes on. */
+static void revoke_pending(int notify_fd) {
+    for (int i = g_npend - 1; i >= 0; i--) {
+        struct pending_op *op = g_pend[i];
+        if (op->kind == PEND_SEND) continue;
+        if (op->kind == PEND_STUB) stub_pend_restore(op);
+        send_errno(notify_fd, op->id, EACCES);
+        net_record(op->tid, op->act, op->d_raw, DEC_DENY, "revoked", &op->t0, EACCES);
+        pend_free(i);
+    }
+    for (int k = 0; k < PX_MAX_DIAL; k++)
+        if (g_px[k].used) px_refuse(&g_px[k], DEC_ALLOW, "revoked", EACCES);
+}
+
+static void revoke_run(uid_t uid, pid_t pid, int notify_fd) {
     g_revoked = true;
     FILE *f = rec_begin();
     struct timespec ts;
@@ -84,6 +101,7 @@ static void revoke_run(uid_t uid, pid_t pid) {
     fprintf(f, "{\"event\":\"revoked\",\"run\":\"%s\",\"by_uid\":%u,\"by_pid\":%d,\"timestamp_ns\":%lld}\n",
             g_run_id, (unsigned)uid, (int)pid, (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
     rec_end(NULL);
+    revoke_pending(notify_fd);
     log_line_start();
     fprintf(g_log, "[warden] the run is revoked (by uid %u, pid %d): every later call is refused\n",
             (unsigned)uid, (int)pid);
@@ -102,7 +120,7 @@ static void revoke_run(uid_t uid, pid_t pid) {
 }
 
 /* A peer on the control socket: one request, one answer. */
-static void ctl_service(void) {
+static void ctl_service(int notify_fd) {
     int c = accept4(g_ctl_listen, NULL, NULL, SOCK_CLOEXEC);
     if (c < 0) return;
     struct ucred cr;
@@ -119,7 +137,7 @@ static void ctl_service(void) {
         req[n] = '\0';
         if (strcmp(req, "revoke")) ans = "refused: unknown request";
         else if (g_revoked) ans = "already revoked";
-        else { revoke_run(cr.uid, cr.pid); ans = "revoked"; }
+        else { revoke_run(cr.uid, cr.pid, notify_fd); ans = "revoked"; }
     }
     (void)send(c, ans, strlen(ans), MSG_DONTWAIT | MSG_NOSIGNAL);
     close(c);

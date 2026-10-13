@@ -1708,6 +1708,23 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     }
     /* v1.27: Landlock and the launch set (require warden 1.27) */
     if (p->v.launches) { exec_ruleset_record(f); noexec_record(f); }   /* v1.27, v1.27.1 */
+    /* v1.28: the credentials the proxy holds for this run: where each came
+     * from, its version and length, its placeholder's SHA-256 (never a
+     * value, never a placeholder), and the warden-secrets that fetched them */
+    if (p->v.ncreds && g_secrets_sha[0]) {
+        static const char *const kSt[] = { "", "file", "vault", "aws-sm" };
+        fprintf(f, "\"secrets_binary_sha256\":\"%s\",\"credentials\":[", g_secrets_sha);
+        for (size_t k = 0; k < p->v.ncreds; k++) {
+            const vdp_cred_t *c = &p->v.creds[k];
+            fprintf(f, "%s{\"name\":\"%s\",\"policy_line\":%d,\"store\":\"%s\",\"ref\":\"", k ? "," : "", c->name,
+                    c->line, kSt[c->store]);
+            json_escape(f, c->ref);
+            fputs("\",\"version\":\"", f);
+            json_escape(f, g_cred_meta[k].version);
+            fprintf(f, "\",\"length\":%u,\"placeholder_sha256\":\"%s\"}", g_cred_meta[k].len, g_cred_ph_sha[k]);
+        }
+        fputs("],", f);
+    }
     /* v1.25 (section 4): each wildcard allow rule's budgets, defaults filled in */
     if (g_any_wild) {
         fputs("\"wildcard_budgets\":[", f);
@@ -3015,7 +3032,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         }
         stub_service(p, &pfds[4 + npoll], nstub);
         px_service(p, &pfds[pxi + 1], npx);
-        if (g_ctl_listen >= 0 && (pfds[rvi].revents & POLLIN)) ctl_service();        /* v1.28 step 4 */
+        if (g_ctl_listen >= 0 && (pfds[rvi].revents & POLLIN)) ctl_service(notify_fd);   /* v1.28 step 4 */
         if (g_secrets.ctl >= 0 && (pfds[rvi + 1].revents & (POLLIN | POLLHUP | POLLERR)) && secrets_service(p) < 0) {
             log_line_start();
             fprintf(g_log, "[warden] warden-secrets has gone: leased secrets will not be renewed or revoked\n");
@@ -3828,6 +3845,7 @@ static char g_state_tmp[NAME_MAX + 1];
 static const char *g_breaker_path;      /* for messages */
 static const char *g_session = "default";
 static bool g_check_only = false;       /* v1.21: --check-startup */
+static bool g_check_creds = false;      /* v1.28: --check-credentials (fetch each, then stop) */
 static int  g_gate_status_fd = -1;      /* --gate-status */
 
 enum { GATE_PASS = 0, GATE_ERROR = 1, GATE_RETRYABLE = 3, GATE_TERMINAL_DENY = 4,
@@ -4333,6 +4351,8 @@ static void usage(const char *argv0) {
         "\n"
         "  Privileged seccomp-unotify supervisor (VAREK Warden v1.4).\n"
         "  --check-startup runs the startup checks and exits (0: would start).\n"
+        "  --check-credentials (v1.28, root) does too, and fetches each credential the policy names\n"
+        "      with warden-secrets (versions and lengths only; a Vault lease it makes is revoked).\n"
         "\n"
         "  Requires CAP_SYS_ADMIN (run as root or via sudo): the target runs\n"
         "  as init of its own PID namespace so it, and everything it spawns,\n"
@@ -4451,6 +4471,7 @@ int main(int argc, char **argv) {
      * no verdict stream is written. tools/varek_preflight.sh uses it. */
     for (int i = 2; i < argc && strcmp(argv[i], "--"); i++)
         if (!strcmp(argv[i], "--check-startup")) g_check_only = true;
+        else if (!strcmp(argv[i], "--check-credentials")) g_check_only = g_check_creds = true;   /* v1.28 */
     if (argc < (g_check_only ? 3 : 4)) { usage(argv[0]); return 2; }
 
     const char *policy_path = argv[1];
@@ -4472,7 +4493,7 @@ int main(int argc, char **argv) {
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) { sep_idx = i; break; }
-        if (strcmp(argv[i], "--check-startup") == 0) continue;
+        if (strcmp(argv[i], "--check-startup") == 0 || strcmp(argv[i], "--check-credentials") == 0) continue;
         if (i + 1 >= argc) { usage(argv[0]); return 2; }
         if (strcmp(argv[i], "--plan") == 0 && !plan_path) {
             plan_path = argv[++i];
@@ -4672,7 +4693,7 @@ int main(int argc, char **argv) {
     if (p.v.ncreds) {
         static const char *const kStore[] = { "", "file", "vault", "aws-sm" };
         const char *conf = secrets_conf_arg ? secrets_conf_arg : "/etc/varek/secrets.conf";
-        if (g_check_only) {
+        if (g_check_only && !g_check_creds) {
             for (size_t k = 0; k < p.v.ncreds; k++)
                 fprintf(stderr, "[warden]   credential %s from %s:%s (line %d)\n", p.v.creds[k].name,
                         kStore[p.v.creds[k].store], p.v.creds[k].ref, p.v.creds[k].line);
@@ -4751,39 +4772,60 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[warden] credential %s from %s:%s: fetched, %u bytes, version %s\n",
                         p.v.creds[k].name, kStore[p.v.creds[k].store], p.v.creds[k].ref,
                         g_cred_meta[k].len, g_cred_meta[k].version);
-            /* step 3: a placeholder for each, made for this run (32 random
-             * bytes), in the agent's environment as VAREK_CRED_<NAME>; the
-             * proxy gets the placeholders from the Warden and the values from
-             * warden-secrets, over a socket the Warden only passes on */
-            for (size_t k = 0; k < p.v.ncreds; k++) {
-                unsigned char rnd[32], dg[32];
-                char b64[64], env[48];
-                randombytes_buf(rnd, sizeof rnd);
-                sodium_bin2base64(b64, sizeof b64, rnd, sizeof rnd, sodium_base64_VARIANT_URLSAFE_NO_PADDING);
-                snprintf(g_cred_ph[k], sizeof g_cred_ph[k], "varek_ph_%s_%s", p.v.creds[k].name, b64);
-                crypto_hash_sha256(dg, (const unsigned char *)g_cred_ph[k], strlen(g_cred_ph[k]));
-                sodium_bin2hex(g_cred_ph_sha[k], sizeof g_cred_ph_sha[k], dg, sizeof dg);
-                int el = snprintf(env, sizeof env, "VAREK_CRED_%s", p.v.creds[k].name);
-                for (int q = 11; q < el; q++) env[q] = (char)toupper((unsigned char)env[q]);
-                if (setenv(env, g_cred_ph[k], 1) < 0) {
-                    fprintf(stderr, "[warden] cannot set %s (%s); refusing to start\n", env, strerror(errno));
+            if (g_check_creds) {
+                /* v1.28: a check fetches and hands nothing on: the leases it
+                 * made are revoked, the helper clears the values and ends */
+                struct ws_revoked rv = { 0 };
+                struct pollfd pf = { .fd = g_secrets.ctl, .events = POLLIN };
+                bool answered = ws_revoke(&g_secrets) == 0 && poll(&pf, 1, 15000) == 1 &&
+                                recv(g_secrets.ctl, &rv, sizeof rv, 0) == (ssize_t)sizeof rv &&
+                                rv.type == WS_MSG_REVOKED;
+                ws_stop(&g_secrets);
+                if (!answered || rv.failed) {
+                    fprintf(stderr, "[warden] credentials: fetched, but %s; refusing to start\n",
+                            answered ? "a Vault lease the check made could not be revoked" :
+                            "warden-secrets did not answer the check's revocation");
+                    return 1;
+                }
+                if (rv.revoked)
+                    fprintf(stderr, "[warden] credentials: the %u Vault lease(s) the check made are revoked\n",
+                            rv.revoked);
+                fprintf(stderr, "[warden] credentials: each one fetched (its value not kept)\n");
+            } else {
+                /* step 3: a placeholder for each, made for this run (32 random
+                 * bytes), in the agent's environment as VAREK_CRED_<NAME>; the
+                 * proxy gets the placeholders from the Warden and the values from
+                 * warden-secrets, over a socket the Warden only passes on */
+                for (size_t k = 0; k < p.v.ncreds; k++) {
+                    unsigned char rnd[32], dg[32];
+                    char b64[64], env[48];
+                    randombytes_buf(rnd, sizeof rnd);
+                    sodium_bin2base64(b64, sizeof b64, rnd, sizeof rnd, sodium_base64_VARIANT_URLSAFE_NO_PADDING);
+                    snprintf(g_cred_ph[k], sizeof g_cred_ph[k], "varek_ph_%s_%s", p.v.creds[k].name, b64);
+                    crypto_hash_sha256(dg, (const unsigned char *)g_cred_ph[k], strlen(g_cred_ph[k]));
+                    sodium_bin2hex(g_cred_ph_sha[k], sizeof g_cred_ph_sha[k], dg, sizeof dg);
+                    int el = snprintf(env, sizeof env, "VAREK_CRED_%s", p.v.creds[k].name);
+                    for (int q = 11; q < el; q++) env[q] = (char)toupper((unsigned char)env[q]);
+                    if (setenv(env, g_cred_ph[k], 1) < 0) {
+                        fprintf(stderr, "[warden] cannot set %s (%s); refusing to start\n", env, strerror(errno));
+                        ws_stop(&g_secrets);
+                        return 1;
+                    }
+                    sodium_memzero(rnd, sizeof rnd);
+                }
+                int vs[2];
+                if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, vs) < 0 || ws_hand_to(&g_secrets, vs[0]) < 0 ||
+                    wp_creds(&g_proxy, p.v.ncreds, g_cred_ph, vs[1], 10000, why, sizeof why) < 0) {
+                    fprintf(stderr, "[warden] credentials: %s; refusing to start\n",
+                            g_proxy.ctl < 0 ? "the proxy is not running" : why);
                     ws_stop(&g_secrets);
                     return 1;
                 }
-                sodium_memzero(rnd, sizeof rnd);
+                close(vs[0]);
+                close(vs[1]);
+                fprintf(stderr, "[warden] credentials: %zu held by the proxy; the agent has placeholders "
+                        "(VAREK_CRED_<NAME>)\n", p.v.ncreds);
             }
-            int vs[2];
-            if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, vs) < 0 || ws_hand_to(&g_secrets, vs[0]) < 0 ||
-                wp_creds(&g_proxy, p.v.ncreds, g_cred_ph, vs[1], 10000, why, sizeof why) < 0) {
-                fprintf(stderr, "[warden] credentials: %s; refusing to start\n",
-                        g_proxy.ctl < 0 ? "the proxy is not running" : why);
-                ws_stop(&g_secrets);
-                return 1;
-            }
-            close(vs[0]);
-            close(vs[1]);
-            fprintf(stderr, "[warden] credentials: %zu held by the proxy; the agent has placeholders "
-                    "(VAREK_CRED_<NAME>)\n", p.v.ncreds);
         }
     }
     /* v1.27: with `require warden 1.27`, the files the agent may launch and

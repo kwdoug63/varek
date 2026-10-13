@@ -14,7 +14,9 @@
 #      by warden-proxy where an allowing rule names it, and nowhere else.
 #   4. revocation: `varek revoke` in mid-run; what is refused after, what is
 #      recorded, the proxy's values cleared, the Vault leases revoked; lease
-#      renewal.
+#      renewal. Sections 3 and 4 also audit their runs, and forged streams.
+#   5. records and tools: --check-credentials and the preflight, varek
+#      policy show, varek refusals, the CycloneDX export.
 #
 #   test_v1280.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
@@ -359,6 +361,37 @@ PY
         rec "sum(1 for r in R if r.get('action') == 'net.request' and r.get('credential') == 'c1' and r.get('credential_header') == 'Authorization') >= 6"
     check "each refused swap is recorded (credential_refused, with why)" \
         rec "sum(1 for r in R if r.get('event') == 'credential_refused' and r.get('credential') in ('c1',) and r.get('why')) == 5"
+    # step 5: run_start, and the audit
+    check "run_start lists each credential: store, reference, version, length, placeholder's SHA-256; and the helper's SHA-256" \
+        rec "[(c['name'], c['store'], c['ref'], c['length'], len(c['placeholder_sha256']), c['version'][:6]) for r in R if r.get('event') == 'run_start' for c in r['credentials']] == [('c1', 'file', '$X/v1', 200, 64, 'inode:'), ('c2', 'file', '$X/v2', 8, 64, 'inode:')] and any(len(r.get('secrets_binary_sha256', '')) == 64 for r in R)"
+    check "no placeholder is in the verdict stream, but in a request object the agent sent" \
+        sh -c "! grep -v '\"action\":\"net.request\"' '$OUT/a3.log' | grep -q 'varek_ph_c[12]_[A-Za-z0-9_-]\{43\}'"
+    AUD3() { python3 "$HERE/tools/varek_audit.py" --policy "$POL3" --checker "$CERT" "$1" > "$OUT/aud3.out" 2>&1; }
+    check "the audit accepts the run, and counts what was carried and refused" \
+        sh -c "$(declare -f AUD3); HERE='$HERE' POL3='$POL3' CERT='$CERT' OUT='$OUT'; AUD3 '$OUT/a3.log' && grep -q 'credentials: 2 named, 8 requests carried one, 5 swaps refused' '$OUT/aud3.out'"
+    F="$HERE/tests/v1270_forge.py"
+    RS='rs = next(r for r in recs if isinstance(r, dict) and r.get("event") == "run_start")'
+    RQ='rq = [r for r in recs if isinstance(r, dict) and r.get("action") == "net.request" and r.get("credential")]'
+    refuses() { if python3 "$HERE/tools/varek_audit.py" --policy "$2" --checker "$CERT" "$3" > "$OUT/f.out" 2>&1; then
+                    flunk "the audit refuses $1"
+                elif grep -qF -- "$4" "$OUT/f.out"; then pass "the audit refuses $1"
+                else flunk "the audit refuses $1 ($(grep -m1 PROBLEM "$OUT/f.out"))"; fi; }
+    python3 "$F" "$OUT/a3.log" "$OUT/g1.log" "$RQ; rq[0]['credential'] = 'c2'"
+    refuses "a credential on a rule that names another" "$POL3" "$OUT/g1.log" "which its deciding rule (line"
+    python3 "$F" "$OUT/a3.log" "$OUT/g2.log" "$RQ; rq[0]['credential_header'] = 'X-Api-Key'"
+    refuses "a credential in another header than its rule's" "$POL3" "$OUT/g2.log" "which its deciding rule (line"
+    python3 "$F" "$OUT/a3.log" "$OUT/g3.log" "$RQ; del rq[0]['credential'], rq[0]['credential_header']"
+    refuses "an allowed request without the credential its rule names" "$POL3" "$OUT/g3.log" "recorded without it"
+    python3 "$F" "$OUT/a3.log" "$OUT/g4.log" "$RQ; c = rq[0]['proxy_conn']; [r.update(inspected=False) for r in recs if isinstance(r, dict) and r.get('action') == 'net.proxy' and r.get('proxy_conn') == c]"
+    refuses "a credential on a connection not inspected (passthrough)" "$POL3" "$OUT/g4.log" "which was not passed on to be inspected"
+    python3 "$F" "$OUT/a3.log" "$OUT/g5.log" "$RS; del rs['credentials']"
+    refuses "a run_start without the credentials" "$POL3" "$OUT/g5.log" "does not list the policy's 2 credential(s)"
+    python3 "$F" "$OUT/a3.log" "$OUT/g6.log" "$RS; rs['credentials'][1]['ref'] = '/etc/other'"
+    refuses "a run_start naming another reference" "$POL3" "$OUT/g6.log" "are not the policy's"
+    python3 "$F" "$OUT/a3.log" "$OUT/g7.log" "$RS; rs['credentials'][1]['placeholder_sha256'] = rs['credentials'][0]['placeholder_sha256']"
+    refuses "two credentials with one placeholder" "$POL3" "$OUT/g7.log" "a placeholder's SHA-256 of its own"
+    python3 "$F" "$OUT/a3.log" "$OUT/g8.log" "cf = next(r for r in recs if isinstance(r, dict) and r.get('event') == 'credential_refused'); cf['request_seq'] = 99"
+    refuses "a refused swap of a request never allowed" "$POL3" "$OUT/g8.log" "follows no allowed request"
 fi
 
 echo "== 4. revocation =="
@@ -487,6 +520,67 @@ PY"
     check "refused: a revoke for a run that has ended" sh -c "grep -q 'no such run is running' '$OUT/rv3.out' && ! grep -qx 0 '$OUT/rv3.rc'"
     python3 "$VK" revoke 0123456789abcdef0123456789abcdef > "$OUT/rv4.out" 2>&1
     check "refused: a revoke for a run that never was" grep -q "no such run is running" "$OUT/rv4.out"
+    # step 5: the audit
+    python3 "$HERE/tools/varek_audit.py" --policy "$POL4" --checker "$CERT" "$OUT/a4.log" > "$OUT/aud4.out" 2>&1; echo $? > "$OUT/aud4.rc"
+    check "the audit accepts the revoked run, says it was revoked, and notes the renewal Vault refused" \
+        sh -c "grep -qx 0 '$OUT/aud4.rc' && grep -q 'the run was revoked' '$OUT/aud4.out' && grep -q 'note: the lease of credential sk could not be renewed' '$OUT/aud4.out'"
+    EV='ev = lambda n: next(i for i, r in enumerate(recs) if isinstance(r, dict) and r.get("event") == n)'
+    python3 "$F" "$OUT/a4.log" "$OUT/h1.log" "$EV; i = ev('revoked'); r = next(r for r in recs[i:] if isinstance(r, dict) and r.get('action') == 'file.open'); r['decision_final'] = 'ALLOW'"
+    refuses "an allowed decision after revoked" "$POL4" "$OUT/h1.log" "after the run was revoked"
+    python3 "$F" "$OUT/a4.log" "$OUT/h2.log" "$EV; i = ev('revoked'); r = recs.pop(i); j = next(k for k, x in enumerate(recs) if isinstance(x, dict) and x.get('credential')); recs.insert(j, r)"
+    refuses "a credential carried after revoked" "$POL4" "$OUT/h2.log" "after the run was revoked"
+    python3 "$F" "$OUT/a4.log" "$OUT/h3.log" "$EV; recs[ev('revoked')]['by_uid'] = 1000"
+    refuses "a revocation by a peer that is not root" "$POL4" "$OUT/h3.log" "by a peer that is not root"
+    python3 "$F" "$OUT/a4.log" "$OUT/h4.log" "$EV; recs[ev('revocation_proxy')]['values_held'] = 2"
+    refuses "a proxy that still held values" "$POL4" "$OUT/h4.log" "the proxy still held 2"
+    python3 "$F" "$OUT/a4.log" "$OUT/h5.log" "$EV; r = dict(recs[ev('lease_renewed')]); recs.insert(ev('revocation_leases') + 1, r)"
+    refuses "a lease renewed after the leases were revoked" "$POL4" "$OUT/h5.log" "after the helper revoked the run's leases"
+    python3 "$F" "$OUT/a4.log" "$OUT/h6.log" "$EV; del recs[ev('revoked')]"
+    refuses "a revocation's answers without the revocation" "$POL4" "$OUT/h6.log" "without the run being revoked before it"
+    python3 "$F" "$OUT/a4.log" "$OUT/h7.log" "$EV; r = dict(recs[ev('lease_renewal_failed')]); r['event'] = 'lease_renewed'; r['ttl'] = 3; recs.insert(ev('lease_renewal_failed') + 1, r)"
+    refuses "a renewal retried after it failed" "$POL4" "$OUT/h7.log" "after its renewal failed"
+fi
+
+echo "== 5. records and tools =="
+if [ -z "${SRV:-}" ] || [ -z "${S3:-}" ] || [ ! -s "$OUT/a4.log" ]; then
+    skip "section 5 (needs sections 2 to 4)"
+else
+    printf 'require warden 1.28\nproxy inspect\ncredential c from file:%s/k\ncredential db from vault:database/creds/ro#password\nallow host api.example.com:443\nallow request GET https://api.example.com/x credential=c header=X-K\n' "$T" > "$T/cc.txt"
+    : > "$SD/requests.log"
+    "$WARDEN" "$T/cc.txt" --secrets-conf "$T/conf" --check-credentials > "$OUT/cc.out" 2>&1; echo $? > "$OUT/cc.rc"
+    check "--check-credentials fetches each one (version and length, no value), revokes the lease it made, and passes" \
+        sh -c "grep -qx 0 '$OUT/cc.rc' && grep -q 'credential db from vault:database/creds/ro#password: fetched, 16 bytes, version lease:' '$OUT/cc.out' && grep -q 'the 1 Vault lease(s) the check made are revoked' '$OUT/cc.out' && grep -q 'vault PUT revoke database/creds/ro/AbC123 token=ok' '$SD/requests.log' && ! grep -q 'db-password' '$OUT/cc.out'"
+    "$WARDEN" "$T/cc.txt" --secrets-conf "$T/cv" --check-credentials > "$OUT/cc2.out" 2>&1; echo $? > "$OUT/cc2.rc"
+    check "--check-credentials fails with the store's reason" \
+        sh -c "! grep -qx 0 '$OUT/cc2.rc' && grep -q 'credential db (line 4): vault answered 403' '$OUT/cc2.out'"
+    "$HERE/tools/varek_preflight.sh" "$T/cc.txt" --secrets-conf "$T/conf" > "$OUT/pf.out" 2>&1
+    check "the preflight fetches each credential" \
+        sh -c "grep -q 'PASS  credential c from file:$T/k: fetched' '$OUT/pf.out' && grep -q 'PASS  credential db from vault:database/creds/ro#password: fetched' '$OUT/pf.out'"
+    "$HERE/tools/varek_preflight.sh" "$T/cc.txt" --secrets-conf "$T/cv" > "$OUT/pf2.out" 2>&1
+    check "the preflight fails when a credential cannot be fetched" grep -q "FAIL  credentials: .*vault answered 403" "$OUT/pf2.out"
+    NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 "$HERE/tools/varek" policy show "$POL4" > "$OUT/ps4.out" 2>&1
+    check "varek policy show lists the credentials, and the rules that carry each" \
+        sh -c "grep -q '^Credentials (3)' '$OUT/ps4.out' && grep -qx '  c1 from file:$X/v1' '$OUT/ps4.out' && grep -qx '    line 8: in Authorization after Bearer' '$OUT/ps4.out' && grep -qx '    no rule carries it (fetched, never sent)' '$OUT/ps4.out'"
+    printf '[varek]\npolicy = %s\nlog_dir = %s\n' "$POL4" "$OUT" > "$OUT/varek4.conf"
+    printf '[varek]\npolicy = %s\nlog_dir = %s\n' "$POL3" "$OUT" > "$OUT/varek3.conf"
+    NO_COLOR=1 VAREK_CONFIG="$OUT/varek4.conf" python3 "$HERE/tools/varek" refusals -n 500 "$OUT/a4.log" > "$OUT/rf4.out" 2>&1
+    check "varek refusals says the run was revoked, and marks each call refused after it REVOKED" \
+        sh -c "grep -q '^The run was revoked at .* by uid 0' '$OUT/rf4.out' && grep -Eq '^  REVOKED +file.open +/usr/bin/true' '$OUT/rf4.out' && grep -Eq '^  REVOKED +net.connect' '$OUT/rf4.out'"
+    NO_COLOR=1 VAREK_CONFIG="$OUT/varek3.conf" python3 "$HERE/tools/varek" refusals -n 500 "$OUT/a3.log" > "$OUT/rf3.out" 2>&1
+    check "varek refusals explains each refused swap (credential, why)" \
+        sh -c "grep -q '^5 request(s) allowed with a credential, refused by the proxy' '$OUT/rf3.out' && [ \$(grep -c '^  CREDENTIAL' '$OUT/rf3.out') -eq 5 ] && grep -q 'credential c1: the request has no header for its credential' '$OUT/rf3.out'"
+    python3 "$HERE/tools/varek_cyclonedx.py" --log "$OUT/a4.log" --policy "$POL4" --output "$OUT/a4.cdx.json" > /dev/null 2>&1
+    cdx() { python3 - "$OUT/a4.cdx.json" "$1" <<'PY'
+import json, sys
+b = json.load(open(sys.argv[1]))
+P = {p["name"]: p["value"] for c in b.get("components", []) + [b["metadata"].get("component", {})]
+     for p in c.get("properties", [])}
+sys.exit(0 if eval(sys.argv[2], {"P": P, "b": b}) else 1)
+PY
+    }
+    check "the export carries varek:credentials.* and the revocation" \
+        cdx "P['varek:credentials.count'] == '3' and P['varek:credentials.names'] == 'c1,sh,sk' and P['varek:credentials.requests'] == '1' and P['varek:credentials.sh'].startswith('vault:database/creds/short#password version lease:') and P['varek:run.revoked'] == 'true' and P['varek:revocation.proxy.values_held'] == '0' and P['varek:revocation.leases.revoked'] == '2' and P['varek:credentials.leases.renewal_failed'] == '1'"
+    check "no value is in the export" sh -c "! grep -Eq 'db-short|db-stuck|long-val' '$OUT/a4.cdx.json'"
 fi
 
 echo

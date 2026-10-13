@@ -660,7 +660,7 @@ HANDOFF_OTHER_RULES = ("already_connected", "socket_option_failed", "too_many_pe
 # v1.26 review: the rules of a proxied decision the Warden refused
 PROXY_REFUSE_RULES = ("policy_match", "default_deny_unknown", "fragment_escape_flags",
                       "fragment_escape_length", "certificate_refused", "wildcard_budget",
-                      "resolution_failed", "address_refused", "run_ended")
+                      "resolution_failed", "address_refused", "run_ended", "revoked")   # v1.28: revoked
 # v1.26 (step 6): the Warden's decision on what the proxy read, when it allowed
 PROXY_ALLOW_RULES = ("proxy_dialed", "proxy_dial_failed")
 PROXY_KINDS = ("tls", "http", "connect")
@@ -792,6 +792,143 @@ def check_handoff_rules(checker, policy, rules, handoffs, problems):
                             f"address was handed to the proxy, not dialed")
 
 
+def policy_credentials(checker, policy):
+    """v1.28: the policy's credentials [(name, store, ref)] and the request
+    rules that carry one {policy line: (name, header, scheme or None)}, as
+    the checker reads them."""
+    q = subprocess.run([checker, policy, "credentials"], capture_output=True, text=True)
+    if q.returncode != 0:
+        raise ValueError(q.stderr.strip() or "the checker has no credentials mode")
+    creds, rules = [], {}
+    for line in q.stdout.splitlines():
+        f = line.split(" ")
+        if len(f) == 4 and f[0] == "credential":
+            creds.append((f[1], f[2], f[3]))
+        elif len(f) == 5 and f[0] == "rule" and f[1].isdigit():
+            rules[int(f[1])] = (f[2], f[3], None if f[4] == "-" else f[4])
+        elif line.strip():
+            raise ValueError(f"an unexpected line from the checker: {line!r}")
+    return creds, rules
+
+
+def check_credentials(creds, cred_rules, meta, records, complete, problems, notes):
+    """v1.28 (section 5): run_start lists the policy's credentials (name,
+    store, reference, in order; a version, a length, a placeholder's SHA-256;
+    the helper's SHA-256), and none when the policy names none. Every
+    request that carried a credential was allowed by a rule that names that
+    credential and header, and every request such a rule allowed carried it;
+    each refused swap follows the allowed request it refused. After
+    `revoked` (by root, once) every decision is UNSATISFIED; the proxy's and
+    the helper's answers follow it, the proxy holding no value; no lease is
+    renewed after the helper revoked them. Returns (carried, swaps refused,
+    revoked)."""
+    rs = meta.get("run_start", {})
+    listed = rs.get("credentials")
+    names = {c[0]: c for c in creds}
+    if not creds:
+        if listed is not None or "secrets_binary_sha256" in rs:
+            problems.append("run_start lists credentials, but the policy names none")
+    elif not isinstance(listed, list) or len(listed) != len(creds):
+        problems.append(f"run_start does not list the policy's {len(creds)} credential(s)")
+    else:
+        if not (isinstance(rs.get("secrets_binary_sha256"), str) and HEX64.fullmatch(rs["secrets_binary_sha256"])):
+            problems.append("run_start has credentials but not warden-secrets' SHA-256")
+        seen_ph = set()
+        for c, e in zip(creds, listed):
+            if not isinstance(e, dict) or (e.get("name"), e.get("store"), e.get("ref")) != c:
+                problems.append(f"run_start's credentials are not the policy's (at {c[0]})")
+                break
+            ph = e.get("placeholder_sha256")
+            ln = e.get("length")
+            if not (isinstance(e.get("version"), str) and e["version"] and isinstance(e.get("policy_line"), int)
+                    and type(ln) is int and 1 <= ln <= 8192 and isinstance(ph, str) and HEX64.fullmatch(ph)
+                    and ph not in seen_ph):
+                problems.append(f"run_start's credential {c[0]} without a version, a length, its policy "
+                                f"line or a placeholder's SHA-256 of its own")
+                break
+            seen_ph.add(ph)
+    events = sorted(meta.get("cred_events", []), key=lambda x: x[0])
+    rv = [(pos, e) for pos, e in events if e.get("event") == "revoked"]
+    rpos = rv[0][0] if rv else None
+    if len(rv) > 1:
+        problems.append("the run is recorded revoked more than once")
+    if rv and not (rv[0][1].get("by_uid") == 0 and type(rv[0][1].get("by_pid")) is int and rv[0][1]["by_pid"] > 0):
+        problems.append("the run is recorded revoked by a peer that is not root, or without who asked")
+    carried = 0
+    allowed_with = {}                # (proxy_conn, request_seq) -> credential
+    for pos, rec in enumerate(records):
+        if rpos is not None and pos >= rpos and rec.get("decision_final") != "DENY":
+            problems.append(f"seq {rec.get('seq')}: a decision {rec.get('decision_final')!r} after the run was "
+                            f"revoked (every decision after it is UNSATISFIED)")
+            continue
+        if rec.get("action") != "net.request":
+            continue
+        has = "credential" in rec or "credential_header" in rec
+        allowed = rec.get("decision_final") == "ALLOW" and rec.get("rule") == "request_allowed"
+        want = cred_rules.get(rec.get("policy_line")) if allowed else None
+        if has:
+            if not allowed or want is None or (rec.get("credential"), rec.get("credential_header")) != want[:2]:
+                problems.append(f"seq {rec.get('seq')}: a request that carried credential "
+                                f"{rec.get('credential')!r} in {rec.get('credential_header')!r}, which its "
+                                f"deciding rule (line {rec.get('policy_line')!r}) does not name")
+                continue
+            carried += 1
+            allowed_with[(rec.get("proxy_conn"), rec.get("request_seq"))] = rec["credential"]
+        elif want is not None:
+            problems.append(f"seq {rec.get('seq')}: an allowed request whose rule (line {rec.get('policy_line')}) "
+                            f"names credential {want[0]}, recorded without it")
+    refused_swaps = 0
+    rp = rl = None
+    failed_renewal = set()
+    for pos, e in events:
+        ev = e.get("event")
+        if ev == "credential_refused":
+            key = (e.get("proxy_conn"), e.get("request_seq"))
+            if allowed_with.get(key) != e.get("credential") or not isinstance(e.get("why"), str) or \
+                    not any(p <= pos for p, r in enumerate(records)
+                            if (r.get("proxy_conn"), r.get("request_seq")) == key and r.get("action") == "net.request"):
+                problems.append(f"a credential_refused for connection {key[0]!r} request {key[1]!r} that follows "
+                                f"no allowed request carrying {e.get('credential')!r}")
+            refused_swaps += 1
+        elif ev in ("revocation_proxy", "revocation_leases"):
+            if rpos is None or pos < rpos:
+                problems.append(f"{ev} without the run being revoked before it")
+                continue
+            if ev == "revocation_proxy":
+                if rp is not None:
+                    problems.append("revocation_proxy recorded more than once")
+                rp = e
+                if e.get("values_held") != 0:
+                    problems.append(f"after the revocation the proxy still held {e.get('values_held')!r} "
+                                    f"credential value(s)")
+            else:
+                if rl is not None:
+                    problems.append("revocation_leases recorded more than once")
+                rl = pos
+                if type(e.get("revoked")) is not int or type(e.get("failed")) is not int:
+                    problems.append("a malformed revocation_leases record")
+                elif e["failed"]:
+                    notes.append(f"{e['failed']} Vault lease(s) could not be revoked (they end at their "
+                                 f"duration)")
+        elif ev in ("lease_renewed", "lease_renewal_failed"):
+            c = names.get(e.get("credential"))
+            if c is None or c[1] != "vault":
+                problems.append(f"{ev} for {e.get('credential')!r}, which is not one of the policy's Vault "
+                                f"credentials")
+            elif rl is not None:
+                problems.append(f"{ev} for {c[0]} after the helper revoked the run's leases")
+            elif c[0] in failed_renewal:
+                problems.append(f"{ev} for {c[0]} after its renewal failed (a failed renewal is not retried)")
+            elif ev == "lease_renewed" and type(e.get("ttl")) is not int:
+                problems.append(f"lease_renewed for {c[0]} without its new duration")
+            elif ev == "lease_renewal_failed":
+                failed_renewal.add(c[0])
+                notes.append(f"the lease of credential {c[0]} could not be renewed: {e.get('why')}")
+    if rpos is not None and complete and creds and rp is None:
+        notes.append("the run was revoked, but the proxy never answered that it cleared its values")
+    return carried, refused_swaps, rpos is not None
+
+
 def check_dialed_denies(checker, policy, rules, dialed, problems):
     """v1.26 review: the Warden dials no address a rule denies: for each
     address a proxied connection dialed (addr:port), the first host rule that
@@ -813,7 +950,7 @@ def check_dialed_denies(checker, policy, rules, dialed, problems):
 
 
 REQUEST_REFUSE_RULES = ("policy_match", "default_deny_unknown", "certificate_refused", "max_body",
-                        "fragment_escape_length")
+                        "fragment_escape_length", "revoked")       # v1.28: revoked
 
 
 UNRESERVED = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
@@ -1131,7 +1268,7 @@ def check_proxied(records, resolutions, handoff_all, problems, upstream=None, di
         dfin, rule = rec.get("decision_final"), rec.get("rule")
         if not ((dfin == "ALLOW" and rule in PROXY_ALLOW_RULES) or
                 (dfin == "DENY" and rule in PROXY_REFUSE_RULES and
-                 ("dialed" not in rec or rule == "run_ended"))):
+                 ("dialed" not in rec or rule in ("run_ended", "revoked")))):
             problems.append(f"seq {seq}: a proxied decision {dfin!r} with rule {rule!r}, which the "
                             f"Warden does not write")
             continue
@@ -2478,6 +2615,14 @@ def main(argv=None):
                           meta.get("proxy_closes", []), meta.get("lineno"))
     if nreq:
         check_refused_requests(a.checker, a.policy, prules, records, problems)            # step 7
+    cnotes = []                                                                            # v1.28
+    try:
+        pcreds, pcred_rules = policy_credentials(a.checker, a.policy)
+    except (OSError, ValueError) as e:
+        problems.append(f"checker failed on the policy's credentials: {e}")
+        pcreds, pcred_rules = [], {}
+    ncarried, nswap_refused, revoked = check_credentials(pcreds, pcred_rules, meta, records, complete,
+                                                         problems, cnotes)
     nlaunch = nlaunch_refused = 0
     if launches_policy and prules:                                                         # v1.27
         nlaunch, nlaunch_refused = check_launches(a.checker, a.policy, prules, meta, records, complete,
@@ -2500,6 +2645,11 @@ def main(argv=None):
           f"{questions} stub questions ({budget_hits} over a budget), "
           f"{checked} certificates "
           f"re-checked, {refused} refused in-line")
+    if pcreds or revoked:                                                                 # v1.28
+        print(f"varek_audit: credentials: {len(pcreds)} named, {ncarried} requests carried one, "
+              f"{nswap_refused} swaps refused{', the run was revoked' if revoked else ''}")
+    for n_ in cnotes:
+        print(f"varek_audit: note: {n_}")
     print(f"varek_audit: integrity: {integrity}")
     t0 = meta.get("run_start", {}).get("timestamp_ns")
     if isinstance(t0, int):
