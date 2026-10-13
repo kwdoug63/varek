@@ -110,7 +110,7 @@ refused "subagent= twice"                    "$(X '/usr/bin/x subagent=a subagen
 refused "an empty sub-agent name"            "$(X '/usr/bin/x subagent=')"                                            "a sub-agent's name"
 refused "a sub-agent name with a capital"    "$(X '/usr/bin/x subagent=Helper')"                                      "a sub-agent's name"
 refused "a sub-agent name of 33 bytes"       "$(X '/usr/bin/x subagent=a23456789012345678901234567890123')"           "a sub-agent's name"
-refused "require warden 1.29"                'require warden 1.29\n'                                                  "this is 1.28"
+refused "require warden 1.99"                'require warden 1.99\n'                                                  "requires Warden 1.99"
 
 printf 'require warden 1.28\nrequire on-behalf-of\nallow path /usr/ readonly\n' > "$OUT/l.txt"
 check "lint notes require on-behalf-of with no trusted issuer" sh -c "'$VDP' '$OUT/l.txt' lint | grep -q 'require on-behalf-of, but no issuer is trusted'"
@@ -120,7 +120,7 @@ check "lint is silent when an issuer is trusted" sh -c "! '$VDP' '$OUT/l2.txt' l
 if [ -z "$WARDEN" ]; then
     skip "the Warden's checks (no warden binary given)"
 else
-    check "the Warden reports 1.28.1" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | grep -q 'VAREK Warden  1.28.1'"
+    check "the Warden reports 1.28.1 or later" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | python3 -c 'import re,sys; m=re.search(r\"VAREK Warden  (\\d+)\\.(\\d+)\\.(\\d+)\", sys.stdin.read()); sys.exit(0 if m and tuple(map(int, m.groups())) >= (1, 28, 1) else 1)'"
     printf '%b' "${R}${I}trust spiffe example.org bundle /etc/varek/b.pem\nallow path /usr/ readonly\n" > "$OUT/w1.txt"
     check "the Warden starts a policy that trusts an issuer and a trust domain" "$WARDEN" "$OUT/w1.txt" --check-startup
     printf '%b' "${R}${I}require on-behalf-of\nallow path /usr/ readonly\n" > "$OUT/w2.txt"

@@ -104,7 +104,7 @@ refused "a vault path from /"           "${R}credential k from vault:/secret/k#f
 refused "a vault field with !"          "${R}credential k from vault:secret/k#f!\n"                         "a vault field"
 refused "an aws-sm reference not an ARN" "${R}credential k from aws-sm:my-secret\n"                         "Secrets Manager ARN"
 refused "a reference with a high byte"  "${R}credential k from file:/k\xe9\n"                               "printable ASCII"
-refused "require warden 1.29"           'require warden 1.29\n'                                             "this is 1.28"
+refused "require warden 1.99"           'require warden 1.99\n'                                             "requires Warden 1.99"
 refused "a credential on an http:// rule" "${R}${C}allow host api.example.com:80\nallow request GET http://api.example.com/x credential=k header=X-K\n" "only on an https:// rule"
 
 printf 'require warden 1.28\nproxy inspect\nallow host api.example.com:443\n%bcredential unused from file:/u\nallow request GET https://api.example.com/x credential=k header=X\n' "$C" > "$OUT/l.txt"
@@ -114,7 +114,7 @@ check "lint is silent on a credential a rule carries" sh -c "! '$VDP' '$OUT/l.tx
 if [ -z "$WARDEN" ]; then
     skip "the Warden's checks (no warden binary given)"
 else
-    check "the Warden reports 1.28 (1.28.0 or a later patch)" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | grep -Eq 'VAREK Warden  1\.28\.[0-9]+'"
+    check "the Warden reports 1.28.0 or later" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | python3 -c 'import re,sys; m=re.search(r\"VAREK Warden  (\\d+)\\.(\\d+)\\.(\\d+)\", sys.stdin.read()); sys.exit(0 if m and tuple(map(int, m.groups())) >= (1, 28, 0) else 1)'"
     printf '%b' "$(Q 'credential=k header=Authorization:Bearer')" > "$OUT/w.txt"
     "$WARDEN" "$OUT/w.txt" --check-startup > "$OUT/w.out" 2>&1; echo $? > "$OUT/w.rc"
     check "--check-startup accepts a policy that names a credential, and lists it" \

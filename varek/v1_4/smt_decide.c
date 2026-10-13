@@ -1599,6 +1599,8 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
         rc = perr(err, errlen, path, lineno, "`proxy passthrough` without `proxy inspect`");
     /* v1.27: launches after the first are decided only after this directive */
     p->launches = req_maj > 1 || (req_maj == 1 && req_min >= 27);
+    /* v1.29: files opened with the agent's credentials after this directive */
+    p->open_as_agent = req_maj > 1 || (req_maj == 1 && req_min >= 29);
     for (size_t i = 0; rc == 0 && i < p->n; i++) {
         const vdp_rule_t *r = &p->rules[i];
         if (r->kind != VDP_KIND_REQUEST) continue;

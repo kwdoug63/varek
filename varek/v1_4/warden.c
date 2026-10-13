@@ -409,6 +409,13 @@ static int policy_load(const char *path, struct policy *p) {
                 p->v.launches ? "on" : "off", p->c.launches ? "on" : "off");
         return -1;
     }
+    /* v1.29: and whether files are opened as the agent */
+    if (p->v.open_as_agent != (p->c.open_as_agent != 0)) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
+                "require warden differently (opening as the agent %s and %s); refusing to start\n", path,
+                p->v.open_as_agent ? "on" : "off", p->c.open_as_agent ? "on" : "off");
+        return -1;
+    }
     /* v1.28: and the credentials (name, store, reference), in order */
     bool creds_same = p->v.ncreds == p->c.ncreds;
     for (size_t k = 0; creds_same && k < p->v.ncreds; k++)
@@ -1734,6 +1741,7 @@ static void emit_on_behalf_of(FILE *f, const struct policy *p) {
     fprintf(f, "\"source\":\"%s\",\"verified\":false},", src);
 }
 
+static void as_agent_record(FILE *f);   /* v1.29: warden_asagent.inc.c */
 static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -1800,6 +1808,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     }
     /* v1.27: Landlock and the launch set (require warden 1.27) */
     if (p->v.launches) { exec_ruleset_record(f); noexec_record(f); }   /* v1.27, v1.27.1 */
+    as_agent_record(f);                  /* v1.29: who files are opened as */
     /* v1.28.1: who the run acts for (docs/security/v1.28.1-delegation-chain.md,
      * section 4): the user a trusted issuer vouched for, the actors of a
      * delegation, the agent; with no token, the agent alone. Then the
@@ -2402,6 +2411,8 @@ struct resolved_target {
     int  path_fd;          /* O_PATH fd on the object, or -1 when creating */
     int  parent_fd;        /* O_PATH fd on the parent directory when creating */
     char name[256];        /* final component when creating */
+    int  agent_err;        /* v1.29: the walk as the agent failed with this errno (the
+                            * object was then pinned as root, for the decision only) */
 };
 
 static void resolved_target_close(struct resolved_target *r) {
@@ -2514,6 +2525,25 @@ static int check_proc_object(int fd, pid_t tid, pid_t *tgid_cache,
     return 0;
 }
 
+#include "warden_asagent.inc.c"      /* v1.29 step 1 */
+
+/* v1.29: a step of the resolution's walk, as the agent when opening as the
+ * agent. A walk the agent's user may not make (EACCES, EPERM: a directory it
+ * cannot search) is made again as root, so the decision is still made on the
+ * object, and the agent's error is kept for the open (materialize_target
+ * returns it): an allowed open the agent's user could not make fails as the
+ * kernel would have failed it. */
+static int resolve_openat2(int dirfd, const char *path, uint64_t extra, int *agent_err) {
+    if (!g_as.on) return openat2_path(dirfd, path, extra);
+    int fd = openat2_path_agent(dirfd, path, extra);
+    if (fd < 0 && (errno == EACCES || errno == EPERM)) {
+        int e = errno;
+        fd = openat2_path(dirfd, path, extra);   /* root's errno when it fails too */
+        if (fd >= 0) *agent_err = e;
+    }
+    return fd;
+}
+
 /* Returns 0 with r filled and a->resolved set, or -1 (fail closed). Nothing
  * on the filesystem is opened, created or modified. */
 static int resolve_target(pid_t target_pid, struct action *a,
@@ -2522,6 +2552,7 @@ static int resolve_target(pid_t target_pid, struct action *a,
     a->resolved[0] = '\0';
     r->path_fd = r->parent_fd = -1;
     r->name[0] = '\0';
+    r->agent_err = 0;
 
     if (a->open_dirfd != VAREK_AT_FDCWD && a->target[0] != '/')
         return -1;   /* relative open against a dirfd we do not track */
@@ -2548,9 +2579,9 @@ static int resolve_target(pid_t target_pid, struct action *a,
     int cwd_fd = open(proc_cwd, O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (cwd_fd < 0) return -1;
 
-    int fd = openat2_path(cwd_fd, path,
-                          (uint64_t)a->open_flags &
-                          ((uint64_t)O_DIRECTORY | (uint64_t)O_NOFOLLOW));
+    int fd = resolve_openat2(cwd_fd, path,
+                             (uint64_t)a->open_flags &
+                             ((uint64_t)O_DIRECTORY | (uint64_t)O_NOFOLLOW), &r->agent_err);
     if (fd >= 0) {
         close(cwd_fd);
         struct stat st;
@@ -2586,7 +2617,8 @@ static int resolve_target(pid_t target_pid, struct action *a,
     else if (slash == t) snprintf(dir, sizeof(dir), "/");
     else                 snprintf(dir, sizeof(dir), "%.*s", (int)(slash - t), t);
 
-    int pfd = openat2_path(cwd_fd, dir, (uint64_t)O_DIRECTORY);
+    r->agent_err = 0;
+    int pfd = resolve_openat2(cwd_fd, dir, (uint64_t)O_DIRECTORY, &r->agent_err);
     close(cwd_fd);
     if (pfd < 0) return -1;
 
@@ -2640,6 +2672,9 @@ static int materialize_target(pid_t target_pid, const struct action *a,
     int want = a->open_flags;
     int fd;
 
+    /* v1.29: the agent's user could not walk to it: its error, as the
+     * kernel would have given it */
+    if (r->agent_err) return -r->agent_err;
     if (r->path_fd >= 0) {
         if (want & O_PATH) {
             fd = fcntl(r->path_fd, F_DUPFD_CLOEXEC, 0);
@@ -2656,18 +2691,24 @@ static int materialize_target(pid_t target_pid, const struct action *a,
             /* O_TMPFILE creates an unnamed file in the pinned directory:
              * apply the agent's mode and umask, as for O_CREAT. */
             mode_t old = umask(target_umask(target_pid));
+            if (as_agent_enter() < 0) { umask(old); return -EACCES; }
             fd = open(self, flags, (mode_t)(a->open_mode & 07777));
+            as_agent_leave();
             int saved = errno;
             umask(old);
             errno = saved;
         } else {
+            if (as_agent_enter() < 0) return -EACCES;    /* v1.29: as the agent */
             fd = open(self, flags, 0);
+            as_agent_leave();
         }
     } else if (r->parent_fd >= 0) {
         if (want & O_PATH) return -ENOENT;
         int flags = want | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
         mode_t old = umask(target_umask(target_pid));
+        if (as_agent_enter() < 0) { umask(old); return -EACCES; }
         fd = openat(r->parent_fd, r->name, flags, (mode_t)(a->open_mode & 07777));
+        as_agent_leave();
         int saved = errno;
         umask(old);
         errno = saved;
@@ -5240,6 +5281,9 @@ int main(int argc, char **argv) {
                             : g_nx[k].file ? " (a file)" : "", g_nx[k].line);
         }
     }
+    /* v1.29 step 1: files opened as the agent (require warden 1.29) */
+    if (as_agent_setup(p.v.open_as_agent, ra.drop, ra.uid, ra.gid, run_as_arg ? run_as_arg : "nobody") < 0)
+        return 1;
     /* v1.28.1 step 3: sub-agents need cgroup v2 (a check makes no group) */
     if (g_check_only && sub_setup(&p, true, !ra.drop) < 0) return 1;
     if (g_check_only) {
