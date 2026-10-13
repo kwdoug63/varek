@@ -1,6 +1,6 @@
 # VAREK — Threat Model
 
-Version: current as of v1.28.0 · MIT · github.com/kwdoug63/varek
+Version: current as of v1.28.1 · MIT · github.com/kwdoug63/varek
 
 This document states what VAREK defends, against whom, and what it explicitly
 does not defend. It is deliberately conservative: where a guarantee is
@@ -97,6 +97,26 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
   reach. The proxy writes the value only into a request to it; what that
   server does with the value, including sending it back in a response the
   agent reads, is outside the Warden's reach (§6).
+- **Trust boundary 12 (v1.28.1):** the identity providers and SPIFFE trust
+  domains the policy names. An issuer the policy trusts (`trust issuer`) is
+  trusted to sign tokens only for users it has authenticated; its keys are
+  fetched by `warden-secrets` at each start over HTTPS verified against the
+  host's store or the root-owned `oidc_ca`, from its discovery document
+  (whose `issuer` must match) or the policy's `jwks` URL. A trust domain's
+  bundle (`trust spiffe`) is a root-owned file the agent cannot write,
+  trusted to hold only that domain's authorities. Whoever holds an issuer's
+  signing key, or a bundle's CA key, can name any user or any agent: the
+  chain is as good as the identity providers behind it. The operator's
+  login is recorded as the host reports it, not verified.
+- **Trust boundary 13 (v1.28.1):** the kernel's control groups and process
+  events, for attributing calls to sub-agents. Each sub-agent runs in a
+  cgroup v2 group the Warden made at its launch, under the Warden's own
+  group; the Warden attributes each call by the group the kernel reports for
+  the calling process (through a pidfd, or `/proc`), and counts a launch
+  only once the kernel's process events (the proc connector) say it
+  happened. The agent runs unprivileged and cannot write a control-group
+  file: the Warden opens none for writing on its behalf and refuses a
+  policy that would.
 
 ## 3. Adversary models
 
@@ -459,6 +479,44 @@ Model-B techniques below, with the residual limits stated honestly.
     and header, each refused swap against its request, and the order of
     the revocation's records.
 
+- **Who each decision was for (v1.28.1).** After `require warden 1.28`,
+  with `trust issuer`, `trust spiffe`, `require on-behalf-of` or
+  `subagent=` in the policy:
+  - *The user is verified, not asserted.* The token given with
+    `--on-behalf-of` (a root-owned file) is checked by `warden-secrets`:
+    a signature by the trusted issuer's key (RS256, PS256, ES256 or EdDSA;
+    `none`, every HMAC algorithm, `crit`, and keys the token carries or
+    points to refused), the issuer, the audience, at least 60 s before
+    its expiry, `nbf` and `iat`, a canonical encoding, an `act` chain at
+    most 8 deep. Only the verified claims reach the Warden; the token
+    itself reaches no output, stream, export or agent environment. With
+    `require on-behalf-of`, a run without a verified user does not start.
+  - *The agent is verified.* An X.509-SVID given with `--agent-svid` must
+    chain to its trust domain's bundle, name exactly one SPIFFE ID in that
+    domain, not be a CA, and match its key. Every bundle, the token, the
+    SVID and the issuers' CA must be out of the agent's reach for writing,
+    by any name.
+  - *A sub-agent's calls are its own.* A program launched by an `allow
+    exec ... subagent=NAME` rule runs in a group of its own from the
+    moment its launch is answered, and everything it starts stays in that
+    group or one nested below it. A call is attributed by the group the
+    kernel reports, never by anything the process says. A launch the
+    kernel did not carry out is moved back to its launcher. A call whose
+    group cannot be read or is outside the run, a launch from a threaded
+    process, and (where the kernel's process events cannot be used) a
+    launch of the image its launcher already runs are refused.
+  - *Expiry.* When the user's token expires during the run, the run is
+    revoked as by `varek revoke` (unless `--on-behalf-of-expiry record`),
+    and every later decision is UNSATISFIED.
+  - *Recorded and audited.* `run_start` records the verified chain and
+    every decision record its `obo`; `varek_audit.py` checks the chain
+    against the policy's issuers and trust domains, every record's `obo`
+    against the launch that started its sub-agent, the records' time
+    order, and the expiry and its revocation.
+  - *Recorded, not enforced.* No rule depends on the chain (D6): it says
+    whom a decision was for, and no extension may move a genuinely unsafe
+    action to SATISFIED on its account.
+
 The per-class status of every known bypass class is maintained in
 `docs/security/bypass-classes.md`.
 
@@ -659,6 +717,27 @@ are claimed as solved.
   - *A second name made outside the run's mounts* (a host mount namespace
     other than the Warden's) is not seen by the check at start.
   - *Review.* v1.28.0 was reviewed by AI review agents, not by a human or
+    third party. Its findings are listed in the design note.
+- The on-behalf-of chain (v1.28.1, `v1.28.1-delegation-chain.md`):
+  - *Checked at the start.* A token its issuer revokes during the run is
+    not noticed; its expiry is. Issuer keys are fetched at each start and
+    not cached (D9), so a run cannot start while its issuer is unreachable.
+  - *Any token for the audience.* The token's `typ` is not checked: an ID
+    token the issuer signs for the agent's audience is accepted as the
+    user's.
+  - *The identity providers.* A compromised issuer or trust-domain CA can
+    name any user or agent (trust boundary 12).
+  - *Not every record.* Records that are not a process's call
+    (resolutions, the stub resolver's questions, `proxy_close`) carry no
+    `obo`.
+  - *Sub-agents.* A threaded process cannot launch one. Where the kernel's
+    process events cannot be used (some containers), a launch of the image
+    the launcher already runs is refused, since its outcome could not be
+    told.
+  - *The operator* is recorded as the host reports it, not verified.
+  - *SPIFFE.* An X.509-SVID from a file only; JWT-SVIDs and the Workload
+    API are not supported.
+  - *Review.* v1.28.1 was reviewed by AI review agents, not by a human or
     third party. Its findings are listed in the design note.
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).
