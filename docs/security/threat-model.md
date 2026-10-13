@@ -1,6 +1,6 @@
 # VAREK — Threat Model
 
-Version: current as of v1.27.1 · MIT · github.com/kwdoug63/varek
+Version: current as of v1.28.0 · MIT · github.com/kwdoug63/varek
 
 This document states what VAREK defends, against whom, and what it explicitly
 does not defend. It is deliberately conservative: where a guarantee is
@@ -80,6 +80,23 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
   A file in the set that is changed in place keeps its inode, and the
   record's hash is the one taken at startup. The dynamic loader is in the
   set whenever a dynamic program is, though the policy need not allow it.
+- **Trust boundary 10 (v1.28):** the credential stores and `warden-secrets`.
+  The stores the operator names (a root-owned file, HashiCorp Vault, AWS
+  Secrets Manager, and for AWS the instance's role through the metadata
+  service) are trusted to return the right value; each is reached over
+  verified HTTPS (plain HTTP only to a loopback address or the metadata
+  service's own). `warden-secrets` is its own binary, loaded into a sealed
+  memfd and hashed into `run_start` like `warden-proxy`; it reads its
+  configuration and local stores as root, then runs as its own user, with
+  no capability, no new privileges and not dumpable. It holds the values
+  only until it hands them to the proxy, and the Vault token only while the
+  run holds a lease. The Warden learns each value's version and length,
+  never the value. `warden-proxy` then holds the values in locked memory
+  for the run.
+- **Trust boundary 11 (v1.28):** a server the policy lets a credential
+  reach. The proxy writes the value only into a request to it; what that
+  server does with the value, including sending it back in a response the
+  agent reads, is outside the Warden's reach (§6).
 
 ## 3. Adversary models
 
@@ -411,6 +428,37 @@ Model-B techniques below, with the residual limits stated honestly.
     `varek_audit.py` checks each entry against its rule, every writable
     rule against the list, and every recorded write against the list.
 
+- **The agent holds only placeholders (v1.28.0).** For each `credential NAME
+  from STORE:REF` (after `require warden 1.28`):
+  - *Not in the agent, the Warden or the stream.* The agent gets a
+    placeholder made for the run (`varek_ph_<name>_` and 32 random bytes) in
+    `VAREK_CRED_<NAME>`. The value goes from `warden-secrets` to
+    `warden-proxy` over a socket the Warden passes on without reading;
+    `run_start` records each credential's store, reference, version, length
+    and the placeholder's SHA-256.
+  - *Only where a rule names it.* In inspecting mode, on a request an allow
+    rule with `credential=NAME header=HEADER[:SCHEME]` decides SATISFIED (an
+    `https://` rule only; framing headers refused), the proxy replaces the
+    placeholder in that header, which must occur once and hold exactly the
+    placeholder, after the scheme if one is named. Anything else is refused
+    with a 403 before a byte is sent (`credential_refused`). A placeholder
+    elsewhere (a query, a body, another header, a request no such rule
+    allows) is sent as it is.
+  - *The files behind it.* The Warden refuses to start when the policy would
+    let the agent open any file `warden-secrets` read, by its own path or by
+    another name (a hard link, a bind mount), or when a directory above it
+    is writable by another user.
+  - *Revocation.* `varek revoke <run>` (root, through a control socket only
+    root can reach) makes every later mediated call of the run UNSATISFIED,
+    connects in progress and the stub resolver's answers included; the
+    proxy clears every value and closes every connection; `warden-secrets`
+    revokes the run's Vault leases. Each step is recorded; the audit holds
+    every decision after `revoked` to UNSATISFIED.
+  - *Audited.* `varek_audit.py` checks the credentials `run_start` lists
+    against the policy, every request that carried one against its rule
+    and header, each refused swap against its request, and the order of
+    the revocation's records.
+
 The per-class status of every known bypass class is maintained in
 `docs/security/bypass-classes.md`.
 
@@ -591,6 +639,27 @@ are claimed as solved.
   policy lets the agent write is writable even when the file is root-owned
   and mode 0644. Opening with the agent's uid and gid is planned as its own
   release; until then, allow writes only where the agent may write any file.
+- Credential release (v1.28.0, `v1.28-credential-release.md`):
+  - *A server that echoes the value back.* A server the policy lets a
+    credential reach can return the request's headers in a response the
+    agent reads (reproduced in review). The policy must not allow such an
+    endpoint with a credential; the proxy does not scan responses, which
+    could not see through compression or an encoding.
+  - *What was sent stays sent.* Revocation stops what follows it. A
+    connection the agent opened outside the proxy before the revocation
+    stays open (later connects are refused).
+  - *Leases.* A renewal Vault refuses is recorded and not retried, so the
+    value lapses when Vault says. The helper does not renew its own Vault
+    token; a token shorter-lived than a lease ends renewals early (Vault
+    then revokes the lease).
+  - *The proxy holds the values.* A flaw in `warden-proxy` that lets a
+    server or the agent read its memory would reach them; it runs as its
+    own user, with locked, non-dumped memory, and clears each value's bytes
+    once sent.
+  - *A second name made outside the run's mounts* (a host mount namespace
+    other than the Warden's) is not seen by the check at start.
+  - *Review.* v1.28.0 was reviewed by AI review agents, not by a human or
+    third party. Its findings are listed in the design note.
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).
 - An agent may probe for SATISFIED-but-harmful actions near a policy boundary;
