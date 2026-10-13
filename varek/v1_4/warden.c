@@ -432,15 +432,9 @@ static int policy_load(const char *path, struct policy *p) {
                 "the trusted identities differently; refusing to start\n", path);
         return -1;
     }
-    /* v1.28.1 (docs/security/v1.28.1-delegation-chain.md): the user's token is
-     * verified from step 2 and sub-agents are attributed from step 3; until
-     * then a policy that depends on either is refused, so no run claims
-     * attribution it does not have. `trust` lines alone change nothing. */
-    if (p->v.require_obo) {
-        fprintf(stderr, "[warden] policy %s: `require on-behalf-of`: verifying a user's token is not built "
-                "in this Warden yet (v1.28.1 step 2); refusing to start\n", path);
-        return -1;
-    }
+    /* v1.28.1 (docs/security/v1.28.1-delegation-chain.md): sub-agents are
+     * attributed from step 3; until then a policy that names one is refused,
+     * so no run claims attribution it does not have. */
     for (size_t i = 0; i < p->v.n; i++)
         if (p->v.rules[i].subagent[0]) {
             fprintf(stderr, "[warden] policy %s:%d: subagent=: attributing a sub-agent's calls is not built "
@@ -1409,6 +1403,7 @@ static wp_t       g_proxy = { .ctl = -1 };          /* v1.26: the egress proxy, 
 static ws_t       g_secrets = { .ctl = -1 };        /* v1.28: warden-secrets, when the policy names credentials */
 static char       g_secrets_sha[65];                /* v1.28: the SHA-256 of the warden-secrets that ran */
 static ws_meta_t  g_cred_meta[WS_MAX_CREDS];        /* v1.28: each credential's version and length (never its value) */
+static struct ws_identity g_identity;               /* v1.28.1: the verified user and agent (has_user, has_svid) */
 static char       g_cred_ph[WS_MAX_CREDS][WP_PH_MAX]; /* v1.28: each credential's placeholder (not a secret) */
 static char       g_cred_ph_sha[WS_MAX_CREDS][65];  /* v1.28: its SHA-256, for the record */
 static char       g_proxy_sha[65];                  /* v1.26.1: the SHA-256 of the warden-proxy that ran */
@@ -1673,6 +1668,69 @@ static int relay_agent_stderr(int fd, bool drain_all) {
 #define WARDEN_VERSION WARDEN_VSTR(VDP_WARDEN_MAJOR) "." WARDEN_VSTR(VDP_WARDEN_MINOR) "." \
                        WARDEN_VSTR(VDP_WARDEN_PATCH)
 
+/* v1.28.1: run_start's on_behalf_of and operator */
+static void emit_on_behalf_of(FILE *f, const struct policy *p) {
+    const struct ws_identity *id = &g_identity;
+    fputs("\"on_behalf_of\":{", f);
+    if (id->has_user) {
+        const vdp_issuer_t *is = &p->v.issuers[id->issuer];
+        fputs("\"user\":{\"issuer\":\"", f);
+        json_escape(f, is->iss);
+        fputs("\",\"audience\":\"", f);
+        json_escape(f, is->aud);
+        fputs("\",\"subject\":\"", f);
+        json_escape(f, id->sub);
+        fprintf(f, "\",\"expires\":%lld,", (long long)id->exp);
+        if (id->iat >= 0) fprintf(f, "\"issued_at\":%lld,", (long long)id->iat);
+        if (id->nbf >= 0) fprintf(f, "\"not_before\":%lld,", (long long)id->nbf);
+        if (id->jti[0]) { fputs("\"jti\":\"", f); json_escape(f, id->jti); fputs("\",", f); }
+        fprintf(f, "\"algorithm\":\"%s\",", id->alg);
+        if (id->kid[0]) { fputs("\"key_id\":\"", f); json_escape(f, id->kid); fputs("\",", f); }
+        fprintf(f, "\"token_sha256\":\"%s\",\"policy_line\":%d,\"verified\":true},", id->token_sha256, is->line);
+        if (id->nact) {
+            fputs("\"actors\":[", f);
+            for (uint32_t k = 0; k < id->nact; k++) {
+                fputs(k ? ",{\"subject\":\"" : "{\"subject\":\"", f);
+                json_escape(f, id->act[k].sub);
+                fputs("\"", f);
+                if (id->act[k].iss[0]) { fputs(",\"issuer\":\"", f); json_escape(f, id->act[k].iss); fputs("\"", f); }
+                fputs("}", f);
+            }
+            fputs("],", f);
+        }
+    }
+    fprintf(f, "\"agent\":{\"run\":\"%s\"", g_run_id);
+    if (id->has_svid) {
+        const vdp_spiffe_t *sp = &p->v.spiffe[id->spiffe];
+        fputs(",\"spiffe_id\":\"", f);
+        json_escape(f, id->spiffe_id);
+        fputs("\",\"trust_domain\":\"", f);
+        json_escape(f, sp->domain);
+        fprintf(f, "\",\"svid_sha256\":\"%s\",\"svid_not_after\":%lld,\"policy_line\":%d,\"verified\":true",
+                id->svid_sha256, (long long)id->svid_not_after, sp->line);
+    }
+    fputs("}},", f);
+    /* the operator: the user sudo names, when root was reached through it */
+    uid_t ou = getuid();
+    const char *login = NULL, *src = "process";
+    const char *su = getenv("SUDO_UID"), *sn = getenv("SUDO_USER");
+    if (ou == 0 && su && *su && strspn(su, "0123456789") == strlen(su) && strlen(su) < 11) {
+        ou = (uid_t)strtoul(su, NULL, 10);
+        login = sn;
+        src = "sudo";
+    } else {
+        struct passwd *pw = getpwuid(ou);
+        login = pw ? pw->pw_name : NULL;
+    }
+    fprintf(f, "\"operator\":{\"uid\":%u,", (unsigned)ou);
+    if (login && *login && strlen(login) <= 64) {
+        bool ok = true;
+        for (const char *c = login; *c; c++) ok &= *c > 0x20 && *c < 0x7f;
+        if (ok) { fputs("\"login\":\"", f); json_escape(f, login); fputs("\",", f); }
+    }
+    fprintf(f, "\"source\":\"%s\",\"verified\":false},", src);
+}
+
 static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -1739,9 +1797,15 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     }
     /* v1.27: Landlock and the launch set (require warden 1.27) */
     if (p->v.launches) { exec_ruleset_record(f); noexec_record(f); }   /* v1.27, v1.27.1 */
+    /* v1.28.1: who the run acts for (docs/security/v1.28.1-delegation-chain.md,
+     * section 4): the user a trusted issuer vouched for, the actors of a
+     * delegation, the agent; with no token, the agent alone. Then the
+     * operator who started it, as the host says (not verified: D1). */
+    emit_on_behalf_of(f, p);
     /* v1.28: the credentials the proxy holds for this run: where each came
      * from, its version and length, its placeholder's SHA-256 (never a
      * value, never a placeholder), and the warden-secrets that fetched them */
+    if (g_secrets_sha[0] && !p->v.ncreds) fprintf(f, "\"secrets_binary_sha256\":\"%s\",", g_secrets_sha);
     if (p->v.ncreds && g_secrets_sha[0]) {
         static const char *const kSt[] = { "", "file", "vault", "aws-sm" };
         fprintf(f, "\"secrets_binary_sha256\":\"%s\",\"credentials\":[", g_secrets_sha);
@@ -3528,8 +3592,10 @@ static int refuse_if_agent_can_open(const struct policy *p, int fd, const char *
  * shows it at a second path, which the agent's allowed opens (made by the
  * Warden, as root) would reach. Every mount of the file's filesystem
  * (/proc/self/mountinfo, the same device) whose root holds the file gives
- * that path; each is asked of the checker. 0, or -1 with the reason printed. */
-static int refuse_secret_reachable(const struct policy *p, const char *path) {
+ * that path; each is asked of the checker. 0, or -1 with the reason printed.
+ * v1.28.1: trusted (a SPIFFE trust bundle, which the agent may read): the
+ * same, for opens that write. */
+static int refuse_secret_reachable(const struct policy *p, const char *path, bool trusted) {
     int fd = open(path, O_PATH | O_CLOEXEC);
     if (fd < 0) {
         fprintf(stderr, "[warden] credentials: cannot open %s to check it (%s); refusing to start\n", path,
@@ -3538,7 +3604,21 @@ static int refuse_secret_reachable(const struct policy *p, const char *path) {
     }
     struct stat st;
     char rp[PATH_MAX];
-    int rc = refuse_if_agent_can_open(p, fd, path, "file warden-secrets read");
+    int rc = 0;
+    #define REACH(s_) (trusted ? vdpc_path_writable(&p->c, (s_), strlen(s_)) : vdpc_path_openable(&p->c, (s_), strlen(s_)))
+    if (!trusted) rc = refuse_if_agent_can_open(p, fd, path, "file warden-secrets read");
+    else if (fstat(fd, &st) < 0 || fd_path(fd, rp, sizeof rp) < 0) {
+        fprintf(stderr, "[warden] trust bundle %s: cannot determine its path; refusing to start\n", path);
+        rc = -1;
+    } else if (S_ISREG(st.st_mode) && st.st_nlink != 1) {
+        fprintf(stderr, "[warden] the trust bundle %s has %lu names (hard links); the agent could write it "
+                "through another. Refusing to start.\n", rp, (unsigned long)st.st_nlink);
+        rc = -1;
+    } else if (REACH(rp)) {
+        fprintf(stderr, "[warden] the policy lets the agent write %s, the trust bundle warden-secrets checks the "
+                "agent's SVID against; refusing to start\n", rp);
+        rc = -1;
+    }
     if (rc == 0 && (fstat(fd, &st) < 0 || fd_path(fd, rp, sizeof rp) < 0)) rc = -1;
     close(fd);
     if (rc < 0) return -1;
@@ -3593,14 +3673,15 @@ static int refuse_secret_reachable(const struct policy *p, const char *path) {
             const char *rest = !strcmp(m[i].root, "/") ? rel : rel + strlen(m[i].root);
             if (snprintf(alt, sizeof alt, "%s%s", !strcmp(m[i].mp, "/") ? "" : m[i].mp, rest) >= (int)sizeof alt)
                 continue;
-            if (strcmp(alt, rp) && vdpc_path_openable(&p->c, alt, strlen(alt))) {
+            if (strcmp(alt, rp) && REACH(alt)) {
                 fprintf(stderr, "[warden] credentials: %s, which warden-secrets reads, is also mounted at %s, "
-                        "which the policy lets the agent open; refusing to start\n", rp, alt);
+                        "which the policy lets the agent %s; refusing to start\n", rp, alt, trusted ? "write" : "open");
                 rc = -1;
             }
         }
     }
     #undef UNDER
+    #undef REACH
     for (size_t i = 0; i < n; i++) { free(m[i].root); free(m[i].mp); }
     free(m);
     return rc;
@@ -4460,6 +4541,7 @@ static void usage(const char *argv0) {
         "              [--dns-server <a.b.c.d[:port]>] [--dns-ttl-min <s>] [--dns-ttl-max <s>]\n"
         "              [--dns-grace-max <s>] [--psl <file>] [--shared-domains <file>]\n              [--proxy-as <user>] [--proxy-bin <warden-proxy>] [--trust-bundle <pem>]\n"
         "              [--secrets-as <user>] [--secrets-bin <warden-secrets>] [--secrets-conf <file>]\n"
+        "              [--on-behalf-of <token file>] [--agent-svid <svid file>]\n"
         "              [--writable-exec]\n"
         "              -- <target> [args...]\n"
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
@@ -4468,6 +4550,7 @@ static void usage(const char *argv0) {
         "  --check-startup runs the startup checks and exits (0: would start).\n"
         "  --check-credentials (v1.28, root) does too, and fetches each credential the policy names\n"
         "      with warden-secrets (versions and lengths only; a Vault lease it makes is revoked).\n"
+
         "\n"
         "  Requires CAP_SYS_ADMIN (run as root or via sudo): the target runs\n"
         "  as init of its own PID namespace so it, and everything it spawns,\n"
@@ -4520,6 +4603,13 @@ static void usage(const char *argv0) {
         "  Warden performs), other socket kinds.\n"
         "\n"
         , argv0, argv0);
+    fputs(
+        "  --on-behalf-of (v1.28.1, root): the user's token (a JWT in a root-owned file) the run acts\n"
+        "      for, verified by warden-secrets against an issuer the policy trusts (`trust issuer`);\n"
+        "      --agent-svid: the agent's X.509-SVID and key, verified against `trust spiffe`'s bundle.\n"
+        "      run_start records what was verified (never the token).\n"
+        "\n"
+        , stderr);
     fputs(
         "  v1.24 host names (with `require warden 1.24`): the Warden resolves\n"
         "  every name an allow rule names, A and AAAA, before the agent runs, and\n"
@@ -4597,6 +4687,7 @@ int main(int argc, char **argv) {
     const char *proxy_as_arg = NULL;    /* v1.26: the egress proxy's user */
     const char *proxy_bin_arg = NULL;   /* v1.26.1: the warden-proxy binary */
     const char *secrets_bin_arg = NULL, *secrets_as_arg = NULL, *secrets_conf_arg = NULL;   /* v1.28 */
+    const char *obo_arg = NULL, *svid_arg = NULL;                                        /* v1.28.1 */
     const char *flow_path   = NULL;     /* v1.18.0 */
     const char *session_arg = NULL;     /* v1.18.0 */
     const char *state_arg   = NULL;     /* v1.18.0 */
@@ -4638,6 +4729,10 @@ int main(int argc, char **argv) {
             secrets_as_arg = argv[++i];
         } else if (strcmp(argv[i], "--secrets-conf") == 0 && !secrets_conf_arg) { /* v1.28 */
             secrets_conf_arg = argv[++i];
+        } else if (strcmp(argv[i], "--on-behalf-of") == 0 && !obo_arg) {      /* v1.28.1 */
+            obo_arg = argv[++i];
+        } else if (strcmp(argv[i], "--agent-svid") == 0 && !svid_arg) {       /* v1.28.1 */
+            svid_arg = argv[++i];
         } else if (strcmp(argv[i], "--trust-bundle") == 0 && !g_trust_bundle_arg) { /* v1.26.1 */
             g_trust_bundle_arg = argv[++i];
         } else if (strcmp(argv[i], "--checkpoint-every") == 0) {
@@ -4804,21 +4899,48 @@ int main(int argc, char **argv) {
      * as its own user, fetches each one; the Warden learns each one's
      * version and length and the local files the helper read, never a
      * value. A fetch that fails, or a file the policy would let the agent
-     * open, refuses the start. */
-    if (p.v.ncreds) {
+     * open, refuses the start.
+     * v1.28.1: the same helper verifies the user's token and the agent's
+     * SVID (docs/security/v1.28.1-delegation-chain.md, section 2), first. */
+    if (p.v.require_obo && !obo_arg) {
+        fprintf(stderr, "[warden] the policy has `require on-behalf-of`: give the user's token with "
+                "--on-behalf-of FILE; refusing to start\n");
+        return 2;
+    }
+    if (obo_arg && !p.v.nissuers) {
+        fprintf(stderr, "[warden] --on-behalf-of: the policy trusts no issuer (`trust issuer URL audience AUD`), "
+                "so no token can be verified; refusing to start\n");
+        return 2;
+    }
+    if (svid_arg && !p.v.nspiffe) {
+        fprintf(stderr, "[warden] --agent-svid: the policy trusts no SPIFFE trust domain (`trust spiffe DOMAIN "
+                "bundle PATH`), so no SVID can be verified; refusing to start\n");
+        return 2;
+    }
+    if (p.v.ncreds || obo_arg || svid_arg) {
         static const char *const kStore[] = { "", "file", "vault", "aws-sm" };
         const char *conf = secrets_conf_arg ? secrets_conf_arg : "/etc/varek/secrets.conf";
         /* v1.28 review: the helper reads absolute paths only */
-        static char conf_abs[PATH_MAX];
+        static char conf_abs[PATH_MAX], obo_abs[PATH_MAX], svid_abs[PATH_MAX];
         if (conf[0] != '/' && realpath(conf, conf_abs)) conf = conf_abs;
+        char cwd[PATH_MAX];
+        if (obo_arg && obo_arg[0] != '/' && getcwd(cwd, sizeof cwd) &&
+            (size_t)snprintf(obo_abs, sizeof obo_abs, "%s/%s", cwd, obo_arg) < sizeof obo_abs)
+            obo_arg = obo_abs;
+        if (svid_arg && svid_arg[0] != '/' && getcwd(cwd, sizeof cwd) &&
+            (size_t)snprintf(svid_abs, sizeof svid_abs, "%s/%s", cwd, svid_arg) < sizeof svid_abs)
+            svid_arg = svid_abs;
         if (g_check_only && !g_check_creds) {
             for (size_t k = 0; k < p.v.ncreds; k++)
                 fprintf(stderr, "[warden]   credential %s from %s:%s (line %d)\n", p.v.creds[k].name,
                         kStore[p.v.creds[k].store], p.v.creds[k].ref, p.v.creds[k].line);
+            if (obo_arg) fprintf(stderr, "[warden]   the user's token %s (--check-credentials verifies it)\n", obo_arg);
+            if (svid_arg) fprintf(stderr, "[warden]   the agent's SVID %s (--check-credentials verifies it)\n", svid_arg);
         } else {
             if (geteuid() != 0) {
-                fprintf(stderr, "[warden] credentials need the Warden to run as root (warden-secrets runs as "
-                        "its own user); refusing to start\n");
+                fprintf(stderr, "[warden] %s need the Warden to run as root (warden-secrets runs as "
+                        "its own user); refusing to start\n",
+                        p.v.ncreds ? "credentials" : "the user's token and the agent's SVID");
                 return 2;
             }
             struct run_as sca = { .drop = false };
@@ -4859,14 +4981,39 @@ int main(int argc, char **argv) {
             const char *ref[WS_MAX_CREDS];
             for (size_t k = 0; k < p.v.ncreds; k++) { store[k] = p.v.creds[k].store; ref[k] = p.v.creds[k].ref; }
             static char files[WS_MAX_FILES][4096];
+            static uint32_t fkind[WS_MAX_FILES];
             size_t nfiles = 0;
-            int fr = ws_fetch(&g_secrets, conf, p.v.ncreds, store, ref, g_cred_meta, files, &nfiles, 30000,
-                              why, sizeof why);
+            /* v1.28.1: the identities, with the policy's issuers and domains */
+            static struct ws_issuer wiss[VDP_MAX_ISSUERS];
+            static struct ws_spiffe wspf[VDP_MAX_SPIFFE];
+            for (size_t k = 0; k < p.v.nissuers; k++) {
+                memcpy(wiss[k].iss, p.v.issuers[k].iss, sizeof wiss[k].iss);
+                memcpy(wiss[k].aud, p.v.issuers[k].aud, sizeof wiss[k].aud);
+                memcpy(wiss[k].jwks, p.v.issuers[k].jwks, sizeof wiss[k].jwks);
+            }
+            for (size_t k = 0; k < p.v.nspiffe; k++) {
+                memcpy(wspf[k].domain, p.v.spiffe[k].domain, sizeof wspf[k].domain);
+                memcpy(wspf[k].bundle, p.v.spiffe[k].bundle, sizeof wspf[k].bundle);
+            }
+            ws_idreq_t idr = { .token = obo_arg, .svid = svid_arg, .issuers = wiss, .nissuers = p.v.nissuers,
+                               .spiffe = wspf, .nspiffe = p.v.nspiffe, .id = &g_identity, .kinds = fkind };
+            int fr = ws_fetch_id(&g_secrets, conf, p.v.ncreds, store, ref, g_cred_meta, files, &nfiles, &idr, 30000,
+                                 why, sizeof why);
             /* every local file the helper read, whatever came of it: the
-             * agent must not be able to open one */
+             * agent must not be able to open one (v1.28.1: a trust bundle,
+             * to write one) */
             for (size_t k = 0; k < nfiles; k++) {
                 char real[PATH_MAX];
                 const char *f = realpath(files[k], real) ? real : files[k];
+                if (fkind[k] == WS_FILE_TRUSTED) {
+                    /* one the helper could not find: its own refusal says so */
+                    if (fr < 0 && access(files[k], F_OK) < 0 && errno == ENOENT) continue;
+                    if (refuse_secret_reachable(&p, files[k], true) < 0) {
+                        ws_stop(&g_secrets);
+                        return 1;
+                    }
+                    continue;
+                }
                 if (vdpc_path_openable(&p.c, f, strlen(f))) {
                     fprintf(stderr, "[warden] credentials: the policy lets the agent open %s, which warden-secrets "
                             "reads; refusing to start\n", f);
@@ -4874,7 +5021,7 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 /* v1.28 review: nor through a second name (a hard link, a bind mount) */
-                if (refuse_secret_reachable(&p, files[k]) < 0) {
+                if (refuse_secret_reachable(&p, files[k], false) < 0) {
                     ws_stop(&g_secrets);
                     return 1;
                 }
@@ -4886,16 +5033,35 @@ int main(int argc, char **argv) {
                 if (sscanf(why, "credential %u: ", &idx) == 1 && idx < p.v.ncreds && (rest = strchr(why, ':')))
                     fprintf(stderr, "[warden] credential %s (line %d): %s; refusing to start\n",
                             p.v.creds[idx].name, p.v.creds[idx].line, rest + 2);
+                else if (!strncmp(why, "the user's token: ", 18) || !strncmp(why, "the agent's SVID: ", 18))
+                    fprintf(stderr, "[warden] %s; refusing to start\n", why);
                 else
                     fprintf(stderr, "[warden] credentials: %s; refusing to start\n", why);
                 ws_stop(&g_secrets);
                 return 1;
             }
+            if (g_identity.has_user) {
+                const struct ws_identity *id = &g_identity;
+                fprintf(stderr, "[warden] on behalf of %s (issuer %s, line %d): token verified (%s%s%s), expires in "
+                        "%lld s, SHA-256 %s\n", id->sub, p.v.issuers[id->issuer].iss, p.v.issuers[id->issuer].line,
+                        id->alg, id->kid[0] ? ", key " : "", id->kid, (long long)(id->exp - time(NULL)), id->token_sha256);
+                for (uint32_t k = 0; k < id->nact; k++)
+                    fprintf(stderr, "[warden]   actor %u: %s%s%s\n", k + 1, id->act[k].sub,
+                            id->act[k].iss[0] ? ", issuer " : "", id->act[k].iss);
+            }
+            if (g_identity.has_svid)
+                fprintf(stderr, "[warden] agent %s: SVID verified against the bundle for %s (line %d), SHA-256 %s\n",
+                        g_identity.spiffe_id, p.v.spiffe[g_identity.spiffe].domain, p.v.spiffe[g_identity.spiffe].line,
+                        g_identity.svid_sha256);
             for (size_t k = 0; k < p.v.ncreds; k++)
                 fprintf(stderr, "[warden] credential %s from %s:%s: fetched, %u bytes, version %s\n",
                         p.v.creds[k].name, kStore[p.v.creds[k].store], p.v.creds[k].ref,
                         g_cred_meta[k].len, g_cred_meta[k].version);
-            if (g_check_creds) {
+            if (!p.v.ncreds) {
+                /* identities only: the helper's work is done */
+                ws_stop(&g_secrets);
+                if (g_check_creds) fprintf(stderr, "[warden] identities: verified\n");
+            } else if (g_check_creds) {
                 /* v1.28: a check fetches and hands nothing on: the leases it
                  * made are revoked, the helper clears the values and ends */
                 struct ws_revoked rv = { 0 };

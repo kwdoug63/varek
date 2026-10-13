@@ -187,6 +187,10 @@ int vdpc_holds(const vdpc_policy_t *p, size_t i, const char *s, size_t sl);
  * decided by an allow rule (the agent could open s), 0 if none is. */
 int vdpc_path_openable(const vdpc_policy_t *p, const char *s, size_t sl);
 
+/* v1.28.1: 1 if some admissible flags value that writes (O_WRONLY, O_RDWR or
+ * O_TRUNC) of an open of path s is decided by an allow rule, 0 if none is. */
+int vdpc_path_writable(const vdpc_policy_t *p, const char *s, size_t sl);
+
 /* Hex form of the policy digest (65 bytes with the NUL). */
 void vdpc_digest_hex(const vdpc_policy_t *p, char out[65]);
 

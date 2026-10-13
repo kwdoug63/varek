@@ -1373,7 +1373,19 @@ int vdpc_check(const vdpc_policy_t *p, int kind, const char *s, size_t sl,
  * refuses to run a policy that would let the agent open either. Same
  * enumeration as the symbolic claim above: only the flag bits of the rules
  * whose string atom holds on s matter. */
+static int path_openable_if(const vdpc_policy_t *p, const char *s, size_t sl, bool writing);
+
 int vdpc_path_openable(const vdpc_policy_t *p, const char *s, size_t sl) {
+    return path_openable_if(p, s, sl, false);
+}
+
+/* v1.28.1: as vdpc_path_openable, for the flags that write: an access mode
+ * of O_WRONLY or O_RDWR, or O_TRUNC (which truncates whatever the mode). */
+int vdpc_path_writable(const vdpc_policy_t *p, const char *s, size_t sl) {
+    return path_openable_if(p, s, sl, true);
+}
+
+static int path_openable_if(const vdpc_policy_t *p, const char *s, size_t sl, bool writing) {
     if (sl > VDPC_MAX_S || memchr(s, '\0', sl)) return 0;   /* outside the fragment: refused */
     size_t hold[VDPC_MAX_RULES], nh = 0;
     uint32_t bits = 0;
@@ -1386,7 +1398,12 @@ int vdpc_path_openable(const vdpc_policy_t *p, const char *s, size_t sl) {
     }
     uint32_t sub = 0;
     for (;;) {
-        if ((sub & ACCMODE) != ACCMODE) {
+        /* writing: some flags value with these rule bits writes. Bits no
+         * rule names are free: O_TRUNC, or an access-mode bit that makes
+         * O_WRONLY or O_RDWR (never 3) */
+        bool writes = (sub & ACCMODE) || (sub & 01000) || !(bits & 01000) ||
+                      (!(bits & 1u) && !(sub & 2u)) || (!(bits & 2u) && !(sub & 1u));
+        if ((sub & ACCMODE) != ACCMODE && (!writing || writes)) {
             for (size_t k = 0; k < nh; k++) {
                 const vdpc_rule_t *e = &p->rules[hold[k]];
                 if (flag_holds(e, sub)) {

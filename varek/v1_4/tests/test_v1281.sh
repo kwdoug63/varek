@@ -10,6 +10,11 @@
 #      (vdp_cert_check), each form and each refusal; lint; the Warden
 #      reports 1.28.1, compares the two readings at load, and refuses what
 #      later steps build.
+#   2. verifying: warden-secrets checks the user's token (--on-behalf-of)
+#      against a stand-in issuer (tests/v1281_idp.py: discovery and keys over
+#      HTTPS, tokens of each algorithm and each failing check) and the agent's
+#      X.509-SVID (--agent-svid) against a trust bundle; run_start records
+#      on_behalf_of and the operator; the token is in no output.
 #
 #   test_v1281.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
@@ -113,12 +118,202 @@ else
     check "the Warden starts a policy that trusts an issuer and a trust domain" "$WARDEN" "$OUT/w1.txt" --check-startup
     printf '%b' "${R}${I}require on-behalf-of\nallow path /usr/ readonly\n" > "$OUT/w2.txt"
     "$WARDEN" "$OUT/w2.txt" --check-startup > "$OUT/w2.out" 2>&1; echo $? > "$OUT/w2.rc"
-    check "until step 2, require on-behalf-of refuses the start, saying so" \
-        sh -c "! grep -qx 0 '$OUT/w2.rc' && grep -q 'not built in this Warden yet (v1.28.1 step 2)' '$OUT/w2.out'"
+    check "require on-behalf-of with no token refuses the start, saying so" \
+        sh -c "! grep -qx 0 '$OUT/w2.rc' && grep -q 'give the user.s token with --on-behalf-of FILE' '$OUT/w2.out'"
     printf '%b' "${R}allow exec /usr/bin/true subagent=a\nallow path /usr/ readonly\n" > "$OUT/w3.txt"
     "$WARDEN" "$OUT/w3.txt" --check-startup > "$OUT/w3.out" 2>&1; echo $? > "$OUT/w3.rc"
     check "until step 3, subagent= refuses the start, saying so" \
         sh -c "! grep -qx 0 '$OUT/w3.rc' && grep -q 'not built in this Warden yet (v1.28.1 step 3)' '$OUT/w3.out'"
+fi
+
+echo "== 2. verifying the identities: warden-secrets =="
+SECRETS="$(dirname "${WARDEN:-/nonexistent}")/warden-secrets"
+if [ "$(id -u)" != 0 ] || [ -z "$WARDEN" ] || [ ! -x "$SECRETS" ] || ! python3 -c 'import cryptography' 2>/dev/null; then
+    skip "section 2 (needs root, the warden and warden-secrets binaries, and python3-cryptography)"
+else
+    T="$(mktemp -d /tmp/varek_v1281.XXXXXX)"; chmod 755 "$T"
+    python3 "$HERE/tests/v1281_idp.py" serve "$T" > "$T/serve.out" 2>&1 &
+    IDP=$!
+    trap 'kill $IDP 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $OUT $T" || rm -rf "$OUT" "$T"' EXIT
+    for _ in $(seq 100); do [ -f "$T/port" ] && break; sleep 0.1; done
+    P="$(cat "$T/port")"; ISS="https://127.0.0.1:$P"
+    python3 "$HERE/tests/v1281_idp.py" svid "$T"
+    chmod 644 "$T/ca.pem" "$T"/bundle*.pem                       # the CA: read by the helper's own user
+    printf 'oidc_ca = %s/ca.pem\n' "$T" > "$T/conf"; chmod 600 "$T/conf" "$T"/svid-*.pem
+    mint() { python3 "$HERE/tests/v1281_idp.py" mint "$T" "$@" > "$T/tok"; chmod 600 "$T/tok"; }
+    LIBS='allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\n'
+    ID="require warden 1.28\ntrust issuer $ISS audience varek-agent\n"
+    printf '%b' "$ID$LIBS" > "$T/p.txt"
+    # go <name> <policy> [warden options]: a run of /usr/bin/true; output in $OUT/<name>.out
+    go() { local n="$1" pol="$2"; shift 2
+           (cd "$T" && timeout 60 "$WARDEN" "$pol" --secrets-conf "$T/conf" "$@" -- /usr/bin/true > "$OUT/$n.out" 2>&1)
+           echo $? > "$OUT/$n.rc"; }
+    has() { grep -qF -- "$2" "$OUT/$1.out"; }
+    ok()  { grep -qx 0 "$OUT/$1.rc"; }
+    # rs <name> <python expression on r, run_start>: prints it
+    rs()  { python3 -c 'import json,sys
+for l in open(sys.argv[1]):
+    if l.startswith("{\"event\":\"run_start\""): print(eval(sys.argv[2], {"r": json.loads(l)}))' "$OUT/$1.out" "$2"; }
+    refuse() { local d="$1" n="$2" w="$3"; if has "$n" "$w" && ! ok "$n"; then pass "refused: $d"; else flunk "refused: $d ($(grep -m1 'refusing' "$OUT/$n.out"))"; fi; }
+
+    # the user's token, each algorithm
+    mint es256; go es256 "$T/p.txt" --on-behalf-of "$T/tok"
+    TOKSHA="$(tr -d '\n' < "$T/tok" | sha256sum | cut -c1-64)"
+    check "an ES256 token from a trusted issuer: verified, the run starts" sh -c "grep -qx 0 '$OUT/es256.rc' && grep -q 'on behalf of alice@example.test (issuer $ISS, line 2): token verified (ES256, key ec1)' '$OUT/es256.out'"
+    check "run_start's on_behalf_of: the user the issuer vouched for" \
+        sh -c "[ \"\$(python3 -c 'import json,sys
+for l in open(sys.argv[1]):
+    if l.startswith(\"{\\\"event\\\":\\\"run_start\\\"\"):
+        u = json.loads(l)[\"on_behalf_of\"][\"user\"]
+        print(u[\"issuer\"], u[\"audience\"], u[\"subject\"], u[\"algorithm\"], u[\"key_id\"], u[\"jti\"], u[\"verified\"], u[\"policy_line\"])' '$OUT/es256.out')\" = '$ISS varek-agent alice@example.test ES256 ec1 jti-es256 True 2' ]"
+    check "its token_sha256 is the token's SHA-256" sh -c "[ \"\$(python3 -c 'import json,sys
+for l in open(sys.argv[1]):
+    if l.startswith(\"{\\\"event\\\":\\\"run_start\\\"\"): print(json.loads(l)[\"on_behalf_of\"][\"user\"][\"token_sha256\"])' '$OUT/es256.out')\" = '$TOKSHA' ]"
+    check "its expiry, issue time and not-before are the token's" sh -c "[ \"\$(python3 -c 'import json,sys
+for l in open(sys.argv[1]):
+    if l.startswith(\"{\\\"event\\\":\\\"run_start\\\"\"):
+        u = json.loads(l)[\"on_behalf_of\"][\"user\"]; print(u[\"expires\"] - u[\"issued_at\"], u[\"issued_at\"] == u[\"not_before\"])' '$OUT/es256.out')\" = '3610 True' ]"
+    check "the agent: this run" sh -c "grep -q '\"agent\":{\"run\":\"[0-9a-f]\{32\}\"}' '$OUT/es256.out'"
+    TOK="$(cat "$T/tok")"; TOKSIG="${TOK##*.}"; TOKPAY="$(echo "$TOK" | cut -d. -f2)"
+    check "the token is nowhere in the Warden's output or the stream (neither its claims nor its signature)" \
+        sh -c "! grep -qF -- '$TOKSIG' '$OUT/es256.out' && ! grep -qF -- '$TOKPAY' '$OUT/es256.out'"
+    (cd "$T" && timeout 60 "$WARDEN" "$T/p.txt" --secrets-conf "$T/conf" --on-behalf-of "$T/tok" -- /usr/bin/env > "$OUT/env.out" 2> "$OUT/env.err")
+    check "nor in the agent's environment" sh -c "grep -q '^PATH=' '$OUT/env.out' && ! grep -qF -- '$TOKSIG' '$OUT/env.out' && ! grep -qF -- '$TOKPAY' '$OUT/env.out'"
+    check "the helper is gone once the identities are verified" sh -c "! pgrep -fx 'warden-secrets [0-9]+:[0-9]+'"
+    for c in rs256:RS256:rsa1 ps256:PS256:rsa1 eddsa:EdDSA:ed1; do
+        n="${c%%:*}"; a="$(echo "$c" | cut -d: -f2)"; k="${c##*:}"
+        mint "$n"; go "$n" "$T/p.txt" --on-behalf-of "$T/tok"
+        check "a $a token: verified with the issuer's key $k" sh -c "grep -qx 0 '$OUT/$n.rc' && grep -q 'token verified ($a, key $k)' '$OUT/$n.out'"
+    done
+    mint es256-nokid; go nokid "$T/p.txt" --on-behalf-of "$T/tok"
+    check "a token naming no key, with one key for its algorithm: verified" sh -c "grep -qx 0 '$OUT/nokid.rc' && grep -q 'token verified (ES256)' '$OUT/nokid.out'"
+    check "the keys from the issuer's discovery document" sh -c "grep -q 'GET /.well-known/openid-configuration' '$T/requests.log' && grep -q 'GET /jwks$' '$T/requests.log'"
+    mint aud-array; go audarr "$T/p.txt" --on-behalf-of "$T/tok"
+    check "an audience array holding the policy's audience: verified" ok audarr
+    mint exchange; go exch "$T/p.txt" --on-behalf-of "$T/tok"
+    check "a token from token exchange: its two actors in run_start, the current one first" \
+        sh -c "[ \"\$(python3 -c 'import json,sys
+for l in open(sys.argv[1]):
+    if l.startswith(\"{\\\"event\\\":\\\"run_start\\\"\"): print(json.dumps(json.loads(l)[\"on_behalf_of\"][\"actors\"]))' '$OUT/exch.out')\" = '[{\"subject\": \"agent-orchestrator\", \"issuer\": \"$ISS\"}, {\"subject\": \"ci-runner\"}]' ]"
+    mint act8; go act8 "$T/p.txt" --on-behalf-of "$T/tok"
+    check "an act chain 8 deep: verified, 8 actors" sh -c "grep -qx 0 '$OUT/act8.rc' && [ \"\$(grep -c 'actor [0-9]: actor-' '$OUT/act8.out')\" = 8 ]"
+
+    # each check failing on its own
+    while IFS='|' read -r c d w; do
+        mint "$c"; go "t_$c" "$T/p.txt" --on-behalf-of "$T/tok"
+        refuse "$d" "t_$c" "the user's token: $w"
+    done <<'CASES'
+none|algorithm none|algorithm none is refused
+hs256|an HMAC token signed with the issuer's public key as its secret|algorithm HS256 is refused
+badsig|a signature by another key|its signature does not verify with the issuer's key
+unknown-kid|a key id not in the issuer's keys|its key nope is not among the issuer's keys
+wrong-iss|an issuer the policy does not trust|its issuer https://idp.elsewhere.test is not one the policy trusts
+wrong-aud|another audience|its audience (aud) does not hold varek-agent
+expired|expired an hour ago|it expired
+near-expiry|expiring in 20 s (under 60)|it expires in 20 s, under 60 s
+nbf-future|not valid for 10 minutes (nbf)|it is not valid for
+iat-future|issued 10 minutes ahead (iat)|it was issued
+no-exp|no expiry|it has no expiry (exp)
+no-sub|no subject|it has no subject (sub)
+sub-ctl|a subject with a control byte|its subject (sub) is not printable ASCII
+crit|a crit header|its header has crit
+act9|an act chain 9 deep|its act chain is nested deeper than 8
+CASES
+    check "a refused token starts no agent and records no run_start" sh -c "! grep -q run_start '$OUT/t_badsig.out'"
+    printf '%b' "require warden 1.28\ntrust issuer $ISS audience varek-agent jwks $ISS/jwks-two\n$LIBS" > "$T/p2.txt"
+    : > "$T/requests.log"; mint rs256-nokid; go two "$T/p2.txt" --on-behalf-of "$T/tok"
+    refuse "a token naming no key when the issuer has two for its algorithm" two "it names no key (kid) and the issuer has 2 keys for RS256"
+    check "the policy's jwks URL is used, not the discovery document" sh -c "grep -q 'GET /jwks-two' '$T/requests.log' && ! grep -q well-known '$T/requests.log'"
+    printf '%b' "require warden 1.28\ntrust issuer $ISS/liar audience varek-agent\n$LIBS" > "$T/p3.txt"
+    mint es256 "$ISS/liar"; go liar "$T/p3.txt" --on-behalf-of "$T/tok"
+    refuse "a discovery document naming another issuer" liar "the issuer's discovery document names another issuer ($ISS)"
+    printf 'require warden 1.28\ntrust issuer https://127.0.0.1:1 audience varek-agent\n' > "$T/p4.txt"
+    mint es256 "https://127.0.0.1:1"; go down "$T/p4.txt" --on-behalf-of "$T/tok"
+    refuse "an issuer that cannot be reached" down "the issuer's discovery document: cannot connect to 127.0.0.1:1"
+    printf 'oidc_ca = /nonexistent/ca.pem\n' > "$T/conf_noca"; chmod 600 "$T/conf_noca"
+    mint es256; (cd "$T" && timeout 60 "$WARDEN" "$T/p.txt" --secrets-conf "$T/conf_noca" --on-behalf-of "$T/tok" -- /usr/bin/true > "$OUT/noca.out" 2>&1); echo $? > "$OUT/noca.rc"
+    refuse "an issuer whose TLS the helper cannot verify (oidc_ca)" noca "cannot load the CA /nonexistent/ca.pem"
+
+    printf 'oidc_ca = %s/ca.pem\n' "$T" > "$T/conf644"; chmod 644 "$T/conf644"
+    (cd "$T" && timeout 60 "$WARDEN" "$T/p.txt" --secrets-conf "$T/conf644" --on-behalf-of "$T/tok" -- /usr/bin/true > "$OUT/c644.out" 2>&1); echo $? > "$OUT/c644.rc"
+    refuse "a configuration others can read, with a token and no credential: at once" c644 "the user's token: $T/conf644 must be owned by root"
+    check "... not after the helper's 30 s" sh -c "! grep -q 'did not answer' '$OUT/c644.out'"
+
+    # the token file and the policy
+    mint es256; chmod 644 "$T/tok"; go mode "$T/p.txt" --on-behalf-of "$T/tok"
+    refuse "a token file others can read" mode "readable by no group or other user"
+    chmod 600 "$T/tok"
+    printf 'eyJhbGciOiJFUzI1NiJ9 not a token\n' > "$T/tok_bad"; chmod 600 "$T/tok_bad"; go notjwt "$T/p.txt" --on-behalf-of "$T/tok_bad"
+    refuse "a token file that is not one JWT" notjwt "is not one JWT"
+    printf '%b' "${ID}allow path exact $T/tok readonly\n$LIBS" > "$T/p5.txt"; go open "$T/p5.txt" --on-behalf-of "$T/tok"
+    refuse "a policy that lets the agent open the token file" open "lets the agent open $T/tok"
+    printf '%b' "require warden 1.28\nrequire on-behalf-of\ntrust issuer $ISS audience varek-agent\n$LIBS" > "$T/p6.txt"
+    go req0 "$T/p6.txt"
+    refuse "require on-behalf-of with no token" req0 "give the user's token with --on-behalf-of FILE"
+    go req1 "$T/p6.txt" --on-behalf-of "$T/tok"
+    check "require on-behalf-of with a verified token: the run starts" ok req1
+    printf '%b' "require warden 1.28\n$LIBS" > "$T/p7.txt"; go noiss "$T/p7.txt" --on-behalf-of "$T/tok"
+    refuse "a token when the policy trusts no issuer" noiss "the policy trusts no issuer"
+    go none "$T/p.txt"
+    check "no token: on_behalf_of is the agent alone" sh -c "grep -qx 0 '$OUT/none.rc' && grep -q '\"on_behalf_of\":{\"agent\":{\"run\":\"[0-9a-f]\{32\}\"}}' '$OUT/none.out'"
+    check "the operator, from the process (not verified)" sh -c "grep -q '\"operator\":{\"uid\":0,\"login\":\"root\",\"source\":\"process\",\"verified\":false}' '$OUT/none.out'"
+    (cd "$T" && SUDO_UID=1000 SUDO_USER=kenneth timeout 60 "$WARDEN" "$T/p.txt" -- /usr/bin/true > "$OUT/sudo.out" 2>&1)
+    check "the operator sudo names, when the Warden runs under sudo" sh -c "grep -q '\"operator\":{\"uid\":1000,\"login\":\"kenneth\",\"source\":\"sudo\",\"verified\":false}' '$OUT/sudo.out'"
+    "$WARDEN" "$T/p.txt" --on-behalf-of "$T/tok" --check-startup > "$OUT/cs.out" 2>&1
+    check "--check-startup names the token, not verifying it" sh -c "grep -q '(--check-credentials verifies it)' '$OUT/cs.out' && ! grep -q 'token verified' '$OUT/cs.out'"
+    "$WARDEN" "$T/p.txt" --secrets-conf "$T/conf" --on-behalf-of "$T/tok" --check-credentials > "$OUT/cc.out" 2>&1
+    check "--check-credentials verifies it" sh -c "grep -q 'token verified (ES256' '$OUT/cc.out' && grep -q 'identities: verified' '$OUT/cc.out'"
+    printf 'file-value-1281\n' > "$T/k"; chmod 600 "$T/k"
+    printf '%b' "require warden 1.28\nproxy inspect\ntrust issuer $ISS audience varek-agent\ncredential c from file:$T/k\nallow host api.example.com:443\nallow request GET https://api.example.com/x credential=c header=X-K\n" > "$T/p8.txt"
+    "$WARDEN" "$T/p8.txt" --secrets-conf "$T/conf" --on-behalf-of "$T/tok" --check-credentials > "$OUT/both.out" 2>&1
+    check "a token and a credential together: both from one helper" sh -c "grep -q 'token verified' '$OUT/both.out' && grep -q 'credential c from file:$T/k: fetched, 15 bytes' '$OUT/both.out'"
+
+    # the agent's SVID
+    printf '%b' "require warden 1.28\ntrust spiffe example.test bundle $T/bundle.pem\n$LIBS" > "$T/s.txt"
+    go svid "$T/s.txt" --agent-svid "$T/svid-good.pem"
+    LEAFSHA="$(python3 -c 'import sys,hashlib; from cryptography import x509; from cryptography.hazmat.primitives.serialization import Encoding; print(hashlib.sha256(x509.load_pem_x509_certificate(open(sys.argv[1],"rb").read()).public_bytes(Encoding.DER)).hexdigest())' "$T/svid-good.pem")"
+    check "an X.509-SVID that chains to the bundle: verified, the run starts" sh -c "grep -qx 0 '$OUT/svid.rc' && grep -q 'agent spiffe://example.test/agents/coder: SVID verified against the bundle for example.test (line 2)' '$OUT/svid.out'"
+    check "run_start's agent: its SPIFFE ID, trust domain and the leaf's SHA-256" \
+        sh -c "[ \"\$(python3 -c 'import json,sys
+for l in open(sys.argv[1]):
+    if l.startswith(\"{\\\"event\\\":\\\"run_start\\\"\"):
+        a = json.loads(l)[\"on_behalf_of\"][\"agent\"]; print(a[\"spiffe_id\"], a[\"trust_domain\"], a[\"svid_sha256\"], a[\"verified\"], a[\"svid_not_after\"] > 0)' '$OUT/svid.out')\" = 'spiffe://example.test/agents/coder example.test $LEAFSHA True True' ]"
+    check "no private key in the output" sh -c "! grep -q 'PRIVATE KEY' '$OUT/svid.out'"
+    go svidchain "$T/s.txt" --agent-svid "$T/svid-chain.pem"
+    check "an SVID through an intermediate in its file: verified" ok svidchain
+    while IFS='|' read -r c d w; do
+        go "s_$c" "$T/s.txt" --agent-svid "$T/svid-$c.pem"
+        refuse "$d" "s_$c" "the agent's SVID: $w"
+    done <<'CASES'
+expired|an expired SVID|it does not chain to the bundle for example.test: certificate has expired
+other-domain|an SVID from a trust domain the policy does not trust|its trust domain (spiffe://other.test/agents/coder) is not one the policy trusts
+wrong-ca|an SVID in the right domain from another authority|it does not chain to the bundle for example.test
+key-mismatch|a key that does not match the SVID|its key does not match its certificate
+two-uris|two URI names|its certificate has 2 URI names
+ca-leaf|a CA certificate as the SVID|its certificate is a CA's
+not-spiffe|a URI name that is not a SPIFFE ID|its URI name is not a SPIFFE ID
+CASES
+    chmod 644 "$T/svid-good.pem"; go svmode "$T/s.txt" --agent-svid "$T/svid-good.pem"; chmod 600 "$T/svid-good.pem"
+    refuse "an SVID file others can read (it holds the key)" svmode "readable by no group or other user"
+    cp "$T/bundle.pem" "$T/bundle-w.pem"; chmod 666 "$T/bundle-w.pem"
+    printf '%b' "require warden 1.28\ntrust spiffe example.test bundle $T/bundle-w.pem\n$LIBS" > "$T/s2.txt"
+    go bw "$T/s2.txt" --agent-svid "$T/svid-good.pem"
+    refuse "a bundle others can write" bw "must be owned by root and writable by no group or other user"
+    mkdir -p "$T/b"; cp "$T/bundle.pem" "$T/b/bundle.pem"; chmod 644 "$T/b/bundle.pem"
+    printf '%b' "require warden 1.28\ntrust spiffe example.test bundle $T/b/bundle.pem\nallow path $T/b/\n$LIBS" > "$T/s3.txt"
+    go bpol "$T/s3.txt" --agent-svid "$T/svid-good.pem"
+    refuse "a policy that lets the agent write the bundle" bpol "lets the agent write $T/b/bundle.pem"
+    printf '%b' "require warden 1.28\ntrust spiffe example.test bundle $T/b/bundle.pem\nallow path $T/b/ readonly\n$LIBS" > "$T/s4.txt"
+    go bro "$T/s4.txt" --agent-svid "$T/svid-good.pem"
+    check "a policy that lets the agent read the bundle only: the run starts" ok bro
+    printf '%b' "require warden 1.28\ntrust spiffe example.test bundle $T/missing.pem\n$LIBS" > "$T/s5.txt"
+    go bmiss "$T/s5.txt" --agent-svid "$T/svid-good.pem"
+    refuse "a bundle that is not there" bmiss "the bundle for example.test: cannot open $T/missing.pem"
+    go nospf "$T/p.txt" --agent-svid "$T/svid-good.pem"
+    refuse "an SVID when the policy trusts no trust domain" nospf "the policy trusts no SPIFFE trust domain"
+    printf '%b' "require warden 1.28\ntrust issuer $ISS audience varek-agent\ntrust spiffe example.test bundle $T/bundle.pem\n$LIBS" > "$T/s6.txt"
+    go both "$T/s6.txt" --on-behalf-of "$T/tok" --agent-svid "$T/svid-good.pem"
+    check "a user and an agent's SVID: both in on_behalf_of" sh -c "grep -qx 0 '$OUT/both.rc' && grep -q '\"user\":{\"issuer\":\"$ISS\"' '$OUT/both.out' && grep -q '\"spiffe_id\":\"spiffe://example.test/agents/coder\"' '$OUT/both.out'"
 fi
 
 echo

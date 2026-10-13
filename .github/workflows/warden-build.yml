@@ -33,6 +33,7 @@ jobs:
           # v1.26 section 5: test_v1260.sh chains the proxy to a Squid upstream
           sudo apt-get install -y --no-install-recommends squid
           # v1.28: test_v1280.sh's stand-in Vault and AWS servers make a test CA
+          # and test_v1281.sh's stand-in issuer and SPIFFE authority sign with it
           sudo apt-get install -y --no-install-recommends python3-cryptography
       - name: Build the Warden and its tools
         run: make -C varek/v1_4 all
@@ -68,7 +69,7 @@ jobs:
         run: sudo make -C varek/v1_4 test-v1271
       - name: v1.28 credential release (the grammar, fetching with warden-secrets, the swap, revocation)
         run: sudo make -C varek/v1_4 test-v1280
-      - name: v1.28.1 the on-behalf-of chain (the grammar)
+      - name: v1.28.1 the on-behalf-of chain (the grammar, verifying the user's token and the agent's SVID)
         run: sudo make -C varek/v1_4 test-v1281
       - name: Build and test the plan_verify CLI (v1_6, v1.16.3)
         run: make -C v1_6 plan_verify check check-plan-verify
