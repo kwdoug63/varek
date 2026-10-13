@@ -163,6 +163,21 @@ static const char *kMediate[] = {
     "access", "faccessat", "faccessat2", NULL
 };
 
+// v1.29 (docs/security/v1.29-varek-run.md, D12): under `require warden 1.29`
+// the changes by name go to the supervisor, which decides each as a write on
+// every path it names and carries it out as the agent (warden_change.inc.c).
+// Without it they fall to the default refusal, as before. link, linkat,
+// symlink and symlinkat are in neither list: a second name for a file is how
+// a deny rule would be escaped.
+static const char *kChange[] = {
+    "unlink", "unlinkat", "rmdir", "mkdir", "mkdirat", "rename", "renameat", "renameat2",
+    "chmod", "fchmod", "fchmodat", "fchmodat2", "utimensat", "truncate", "ftruncate", "chdir",
+    NULL
+};
+// fchdir: the agent's working directory becomes a directory it already holds
+// (an open the Warden decided); its later relative names are each decided.
+static const char *kChangeAdmit[] = { "fchdir", NULL };
+
 // HARD-DENY: never admissible (classes 3-6). KILL in strict mode, even in
 // observe mode.
 static const char *kHardDeny[] = {
@@ -384,7 +399,7 @@ static int add_io_uring_setup(scmp_filter_ctx ctx) {
 }
 
 // Build the filter. default_action is EPERM (enforce) or LOG (observe).
-static int build(scmp_filter_ctx *out_ctx, int observe) {
+static int build(scmp_filter_ctx *out_ctx, int observe, int file_changes) {
     uint32_t def = observe ? SCMP_ACT_LOG : SCMP_ACT_ERRNO(EPERM);
     scmp_filter_ctx ctx = seccomp_init(def);
     if (!ctx) return -ENOMEM;
@@ -410,6 +425,10 @@ static int build(scmp_filter_ctx *out_ctx, int observe) {
         if (rc < 0) goto fail;
     }
     if ((rc = add_list(ctx, kMediate, SCMP_ACT_NOTIFY)) < 0) goto fail;
+    if (file_changes) {                                       // v1.29
+        if ((rc = add_list(ctx, kChange, SCMP_ACT_NOTIFY)) < 0) goto fail;
+        if ((rc = add_list(ctx, kChangeAdmit, SCMP_ACT_ALLOW)) < 0) goto fail;
+    }
     if ((rc = add_sends(ctx)) < 0) goto fail;                 // v1.21
     if ((rc = add_setsockopt(ctx)) < 0) goto fail;            // v1.21
     // v1.27: kill, which subprocess uses to stop a child on a timeout, for a
@@ -447,10 +466,14 @@ fail:
 }
 
 int install_baseline_user_notif_filter(int observe) {
+    return install_baseline_user_notif_filter_ex(observe, 0);
+}
+
+int install_baseline_user_notif_filter_ex(int observe, int file_changes) {
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) return -1;
 
     scmp_filter_ctx ctx;
-    if (build(&ctx, observe) < 0) return -1;
+    if (build(&ctx, observe, file_changes) < 0) return -1;
 
     if (seccomp_load(ctx) < 0) { seccomp_release(ctx); return -1; }
 

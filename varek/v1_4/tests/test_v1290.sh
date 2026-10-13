@@ -20,6 +20,12 @@
 #      SHA-256, run_start's baseline, credential stores refused, the profile's
 #      directory and API host reached, launches by every name; the audit,
 #      refusals and runs with no configuration; a Node.js agent.
+#   2b. changes by name (D12): unlink, rmdir, mkdir, rename (both names; a
+#      directory refused with EXDEV), chmod, utimensat, truncate, ftruncate,
+#      fchmod and chdir decided as writes (chdir a read) with the flags their
+#      kind is decided as, carried out as the agent, recorded and audited
+#      (four forged streams); links refused; a v1.28 policy as before; git,
+#      mv, rm -r and Python's tempfile under the baseline.
 #   6. the agent's user (the user who ran sudo, else nobody; never root) and
 #      environment (a clean one; --env by name; recorded by name only), and
 #      the agent's /tmp/varek-<uid>.
@@ -41,7 +47,7 @@ check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else flu
 TUSER=varek1290u TGROUP=varek1290g MADE_USER= MADE_BU=
 cleanup() {
     if [ -n "$MADE_USER" ]; then userdel "$TUSER" >/dev/null 2>&1; groupdel "$TGROUP" >/dev/null 2>&1; fi
-    if [ -n "$MADE_BU" ]; then userdel varek1290r >/dev/null 2>&1; fi
+    if [ -n "$MADE_BU" ]; then rm -rf "/tmp/varek-$(id -u varek1290r 2>/dev/null)"; userdel varek1290r >/dev/null 2>&1; fi
     [ -n "${KEEP:-}" ] && echo "kept $OUT" || rm -rf "$OUT"
 }
 trap cleanup EXIT
@@ -364,6 +370,118 @@ JSA
         rm -rf "/tmp/varek-$BUID"
     else
         skip "varek run with the baseline (cannot add a test user here)"
+    fi
+fi
+
+echo "== 2b. changing files by name (D12) =="
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
+    skip "changes by name (they run as root: the agent runs as another user)"
+else
+    C="$OUT/c"
+    mkdir -p "$C/w/ro" "$C/w/ao" "$C/w/keep" "$C/w/dir1/sub" "$C/w/d2" "$C/out" "$C/bin"
+    cp "$HERE/tests/v1290_open" "$C/bin/"
+    chmod 755 "$C" "$C/bin"; chmod 1777 "$C/w" "$C/w/ro" "$C/w/ao" "$C/w/keep" "$C/w/dir1" "$C/w/d2"; chmod 777 "$C/w/dir1/sub"
+    echo r > "$C/w/ro/f"; echo a > "$C/w/ao/f"; echo s > "$C/w/keep/.env"; chmod 666 "$C/w/ro/f" "$C/w/ao/f" "$C/w/keep/.env"
+    mkdir -m 700 "$C/out/secret"
+    cpol() {   # cpol FILE VERSION
+        # first match wins, and a rule whose flag clause fails does not match:
+        # a read-only (or append-only) tree is a read rule, then a deny
+        printf 'require warden %s\nallow path /usr/ readonly\nallow path /etc/ld.so.cache readonly\ndeny path glob /**/.[eE][nN][vV]\nallow path %s/w/ro/ readonly\ndeny path %s/w/ro/\nallow path %s/w/ao/ access=wo -O_TRUNC\ndeny path %s/w/ao/\nallow path exact %s/w readonly\nallow path %s/w/\nallow path /proc/self/ readonly\n' \
+            "$2" "$C" "$C" "$C" "$C" "$C" "$C" > "$1"
+    }
+    cpol "$C/p129.txt" 1.29
+    cpol "$C/p128.txt" 1.28
+    W="$C/w"
+    (cd "$W" && umask 027 && "$WARDEN" "$C/p129.txt" --run-as nobody -- "$C/bin/v1290_open" \
+        create "$W/f" chmod "$W/f" utime "$W/f" fchmod "$W/f" truncate "$W/f" ftruncate "$W/f" \
+        create "$W/x" rename "$W/x:$W/y" create "$W/z" exchange "$W/y:$W/z" \
+        rename "$W/y:$W/ro/y" rename "$W/keep/.env:$W/e2" rename "$W/dir1:$W/dir9" \
+        unlink "$W/ro/f" unlink "$W/ao/f" mkdir "$W/m" rmdir "$W/m" mkdir "$W/m2" \
+        create "$W/d2/g" unlinkat "$W/d2:g" unlink "$W/f" \
+        chdir "$W/d2" chdir "$C/out" symlink "$W/sl" link "$W/z" \
+        truncate /proc/self/oom_score_adj unlink "$W/nosuch" > "$C/a.out" 2> "$C/a.log")
+    co() { grep -qx "$1" "$C/a.out"; }
+    # recc ACTION RESOLVED FINAL RULE [FLAGS]: a record of the run says so
+    recc() { rec "$C/a.log" "r.get('action') == '$1' and r.get('resolved') == '$2' and r['decision_final'] == '$3' and r['rule'] == '$4'${5:+ and r.get('open_flags') == '$5'}"; }
+    check "chmod by name, as the agent, on its own file"                  co "chmod ok"
+    check "... recorded file.chmod, decided as a write (0x1), done"       recc file.chmod "$W/f" ALLOW change_done 0x1
+    check "utimensat sets the times"                                      sh -c "co() { grep -qx \"\$1\" '$C/a.out'; }; co 'utime ok'"
+    check "fchmod on a descriptor, decided on its file"                   sh -c "grep -qx 'fchmod ok' '$C/a.out' && grep -q '\"action\":\"file.chmod\",\"target\":\"fd:3\",\"resolved\":\"$W/f\"' '$C/a.log'"
+    check "truncate and ftruncate, decided as O_WRONLY|O_TRUNC (0x201)"   sh -c "grep -qx 'truncate ok' '$C/a.out' && grep -qx 'ftruncate ok' '$C/a.out'"
+    check "... recorded so"                                               recc file.truncate "$W/f" ALLOW change_done 0x201
+    check "a rename: both names decided and recorded"                     sh -c "grep -qx 'rename ok' '$C/a.out' && [ -e '$W/y' ] && [ ! -e '$W/x' ]"
+    check "... file.rename_from (0x201)"                                  recc file.rename_from "$W/x" ALLOW change_done 0x201
+    check "... file.rename_to (0x241)"                                    recc file.rename_to "$W/y" ALLOW change_done 0x241
+    check "RENAME_EXCHANGE: both names decided as replaced (0x241)"      sh -c "grep -qx 'exchange ok' '$C/a.out'" 
+    check "... recorded so"                                               recc file.rename_from "$W/y" ALLOW change_done 0x241
+    check "a rename into a read-only tree is refused, the file stays"     sh -c "[ \"\$(sed -n '/^rename/p' '$C/a.out' | sed -n 2p)\" = 'rename Permission denied' ] && [ -e '$W/y' ] && [ ! -e '$W/ro/y' ]"
+    check "... recorded: the new name refused"                            recc file.rename_to "$W/ro/y" DENY policy_match
+    check "a rename of a file a deny rule names (.env) is refused"        sh -c "[ -e '$W/keep/.env' ] && [ ! -e '$W/e2' ]"
+    check "... recorded on its old name"                                  recc file.rename_from "$W/keep/.env" DENY policy_match
+    check "a directory is never renamed: EXDEV"                           sh -c "grep -qx 'rename Invalid cross-device link' '$C/a.out' && [ -d '$W/dir1/sub' ] && [ ! -e '$W/dir9' ]"
+    check "... recorded rename_directory_refused, errno 18"              rec "$C/a.log" "r.get('action') == 'file.rename_from' and r.get('resolved') == '$W/dir1' and r['rule'] == 'rename_directory_refused' and r['errno'] == 18"
+    check "unlink under a read-only rule is refused, the file stays"      sh -c "[ -e '$W/ro/f' ]"
+    check "... decided as 0x201 and refused"                              recc file.unlink "$W/ro/f" DENY policy_match 0x201
+    check "unlink under a rule that refuses O_TRUNC (append-only) is refused" sh -c "[ -e '$W/ao/f' ]"
+    check "mkdir, as the agent, under its umask (0777 & ~027)"            sh -c "[ \"\$(stat -c '%U %a' '$W/m2')\" = 'nobody 750' ]"
+    check "... recorded file.mkdir (0xc1)"                                recc file.mkdir "$W/m2" ALLOW change_done 0xc1
+    check "rmdir"                                                         sh -c "[ ! -e '$W/m' ] && grep -qx 'rmdir ok' '$C/a.out'"
+    check "unlinkat relative to a directory descriptor"                   sh -c "grep -qx 'unlinkat ok' '$C/a.out' && [ ! -e '$W/d2/g' ]"
+    check "unlink"                                                        sh -c "[ ! -e '$W/f' ]"
+    check "chdir into an allowed directory (the kernel does it, as the agent)" sh -c "grep -qx 'cwd $W/d2' '$C/a.out'"
+    check "... recorded chdir_continued (0x10000)"                        recc file.chdir "$W/d2" ALLOW chdir_continued 0x10000
+    check "chdir outside the policy is refused"                           recc file.chdir "$C/out" DENY default_deny_unknown
+    check "a symbolic link stays refused (EPERM, the filter)"            sh -c "grep -qx 'symlink Operation not permitted' '$C/a.out' && [ ! -e '$W/sl' ]"
+    check "a hard link stays refused (EPERM, the filter)"                sh -c "grep -qx 'link Operation not permitted' '$C/a.out' && [ ! -e '$W/z.l' ]"
+    check "a change on procfs is refused whatever the policy says"        rec "$C/a.log" "r.get('action') == 'file.truncate' and r['rule'] == 'change_on_kernel_fs'"
+    check "a name that does not exist: the kernel's ENOENT, recorded"     recc file.unlink "$W/nosuch" ALLOW change_failed
+    check "the agent's changes are its own (the renamed file is nobody's)" sh -c "[ \"\$(stat -c %U '$W/y')\" = nobody ]"
+    check "the audit passes the run" python3 "$HERE/tools/varek_audit.py" --policy "$C/p129.txt" --checker "$CERT" "$C/a.log"
+    F="$HERE/tests/v1270_forge.py"
+    forged() {   # forged LABEL PYTHON WORDS: the audit refuses the forged stream, naming WORDS
+        python3 "$F" "$C/a.log" "$C/f.log" "$2" >/dev/null 2>&1
+        if python3 "$HERE/tools/varek_audit.py" --policy "$C/p129.txt" --checker "$CERT" "$C/f.log" > "$C/f.out" 2>&1; then
+            flunk "forged: $1 (the audit passed it)"
+        elif grep -qF -- "$3" "$C/f.out"; then pass "forged: $1"
+        else flunk "forged: $1 (not for its own reason: $(grep -v '^varek_audit: \(integrity\|run started\)' "$C/f.out" | head -2 | tr '\n' ' '))"; fi
+    }
+    forged "a chmod recorded with flags other than its kind's" \
+        "[r.__setitem__('open_flags', '0x0') for r in recs if isinstance(r, dict) and r.get('action') == 'file.chmod' and r.get('rule') == 'change_done']" \
+        "not as its kind is decided"
+    forged "a rename with its new name dropped" \
+        "i = [k for k, r in enumerate(recs) if isinstance(r, dict) and r.get('action') == 'file.rename_to' and r.get('rule') == 'change_done'][0]; recs.pop(i); [r.__setitem__('seq', r['seq'] - 1) for r in recs[i:] if isinstance(r, dict) and 'seq' in r]; [r.__setitem__('records', r['records'] - 1) for r in recs if isinstance(r, dict) and r.get('event') == 'run_end']" \
+        "without its new name decided and recorded next"
+    forged "a rename's new name with its old name dropped" \
+        "i = [k for k, r in enumerate(recs) if isinstance(r, dict) and r.get('action') == 'file.rename_from' and r.get('rule') == 'change_done'][0]; recs.pop(i); [r.__setitem__('seq', r['seq'] - 1) for r in recs[i:] if isinstance(r, dict) and 'seq' in r]; [r.__setitem__('records', r['records'] - 1) for r in recs if isinstance(r, dict) and r.get('event') == 'run_end']" \
+        "without its old name before it"
+    forged "a chdir allowed with a rule other than chdir_continued" \
+        "[r.__setitem__('rule', 'change_done') for r in recs if isinstance(r, dict) and r.get('action') == 'file.chdir' and r.get('decision_final') == 'ALLOW']" \
+        "allowed with rule"
+    # under a v1.28 policy the changes are not sent to the Warden: EPERM, as before
+    rm -f "$W/q"; echo q > "$W/q"; chmod 666 "$W/q"
+    (cd "$W" && "$WARDEN" "$C/p128.txt" --run-as nobody -- "$C/bin/v1290_open" unlink "$W/q" mkdir "$W/m3" chdir "$W/d2" > "$C/b.out" 2> "$C/b.log")
+    check "require warden 1.28: unlink, mkdir and chdir are refused by the filter (EPERM), as before" \
+        sh -c "grep -qx 'unlink Operation not permitted' '$C/b.out' && grep -qx 'mkdir Operation not permitted' '$C/b.out' && grep -qx 'chdir Operation not permitted' '$C/b.out' && [ -e '$W/q' ]"
+    check "... and nothing is recorded for them" sh -c "! grep -q '\"action\":\"file\.\(unlink\|mkdir\|chdir\)\"' '$C/b.log'"
+    # tools an agent uses, through varek run with the baseline (the section-2 user)
+    if [ -n "${MADE_BU:-}" ] && id varek1290r >/dev/null 2>&1; then
+        cat > "$BH/proj/tools.sh" <<'SHT'
+export GIT_AUTHOR_NAME=a GIT_AUTHOR_EMAIL=a@b GIT_COMMITTER_NAME=a GIT_COMMITTER_EMAIL=a@b
+git init -q repo && cd repo && echo hi > f && git add f && git commit -qm one && echo "git-commit ok"
+[ "$(git log --oneline | wc -l)" = 1 ] && echo "git-log ok"
+cd .. && mkdir -p d/e && echo x > d/e/g && mv d d2 2>/dev/null; [ -f d2/e/g ] && [ ! -e d ] && echo "mv-dir ok"
+rm -r d2 && [ ! -e d2 ] && echo "rm-r ok"
+python3 -c "import tempfile; tempfile.NamedTemporaryFile().write(b'x'); tempfile.TemporaryDirectory().cleanup(); print('tempfile ok')"
+SHT
+        chown varek1290r "$BH/proj/tools.sh"
+        vrun "$OUT/tools.out" python3 "$HERE/tools/varek" run --profile python -- sh tools.sh
+        for w in git-commit git-log mv-dir rm-r tempfile; do
+            check "with the baseline: $w" grep -qx "$w ok" "$OUT/tools.out"
+        done
+        vrun "$OUT/tools.audit" python3 "$HERE/tools/varek" audit
+        check "... and the audit passes that run" grep -q PASS "$OUT/tools.audit"
+    else
+        skip "git, mv, rm -r and tempfile with the baseline (no section-2 user)"
     fi
 fi
 

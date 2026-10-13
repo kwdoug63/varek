@@ -346,6 +346,11 @@ def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH):
     L.append(f"allow path exact {tmp} readonly")
     L.append(f"allow path {tmp}/")
     L.append("")
+    L.append("# --- the user's git settings (name, email, ignore rules), read-only; stored")
+    L.append("# credentials (.git-credentials) are refused above ---")
+    L.append(f"allow path exact {home}/.gitconfig readonly")
+    L.append(f"allow path {home}/.config/git/ readonly")
+    L.append("")
     L.append("# --- programs the agent may launch (each file named; lint notes the shells and")
     L.append("# interpreters: with one, the agent can run any code it can read) ---")
     progs = []

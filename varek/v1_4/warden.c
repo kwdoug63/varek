@@ -216,8 +216,13 @@ typedef enum {
     ACT_FILE_READLINK,   /* v1.17.0: readlink, readlinkat */
     ACT_NET_PROXY,       /* v1.26: a name:port the egress proxy read from a client */
     ACT_NET_REQUEST,     /* v1.26.1: a request of an inspected connection (its object) */
+    ACT_FILE_CHANGE,     /* v1.29: a change by name (warden_change.inc.c): chg_op says which */
     ACT_OTHER,
 } action_kind_t;
+
+/* v1.29 (warden_change.inc.c): the changes by name */
+enum { CHG_UNLINK = 1, CHG_RMDIR, CHG_MKDIR, CHG_RENAME_FROM, CHG_RENAME_TO, CHG_CHMOD,
+       CHG_UTIME, CHG_TRUNCATE, CHG_CHDIR };
 
 /* v1.17.0: the metadata and link lookups, mediated like opens. */
 static bool is_meta_kind(action_kind_t k) {
@@ -269,6 +274,16 @@ struct action {
     bool          proxy_handoff;        /* v1.26: a connect handed to the egress proxy */
     int           subject;              /* v1.28.1: who the call is for (warden_subagent.inc.c): 0 the
                                            agent, a sub-agent, or -1 (in no group of the run) */
+    /* v1.29: a change by name (warden_change.inc.c) */
+    int           chg_op;               /* CHG_* */
+    char          target2[PATH_LIMIT];  /* a rename's new name */
+    int           chg_dirfd, chg_dirfd2;
+    unsigned      chg_flags;            /* unlinkat's, renameat2's, utimensat's */
+    unsigned      chg_mode;
+    int64_t       chg_len;
+    int           chg_fd;               /* the descriptor of ftruncate, fchmod, futimens */
+    struct timespec chg_times[2];
+    bool          chg_times_null;
     char          extra[4608];          /* extra record fields, trusted text, each ending in ',' */
 };
 
@@ -290,6 +305,7 @@ static const char *action_kind_name(action_kind_t k) {
         case ACT_FILE_READLINK: return "file.readlink";
         case ACT_NET_PROXY:     return "net.proxy";
         case ACT_NET_REQUEST:   return "net.request";
+        case ACT_FILE_CHANGE:   return "file.change";
         case ACT_OTHER:        return "other";
     }
     return "invalid";
@@ -676,12 +692,17 @@ static int read_all(int fd, void *buf, size_t len) {
 
 /* ---------------- Semantic Derivation ---------------- */
 
+static int change_derive(const struct seccomp_notif *req, struct action *out);   /* v1.29 */
+static const char *change_op_name(int op);
 static int derive_intent(const struct seccomp_notif *req,
                          struct action *out)
 {
     memset(out, 0, sizeof(*out));
     out->policy_line = -1;
     int nr = (int)req->data.nr;
+    /* v1.29: the changes by name (warden_change.inc.c) */
+    int cr = change_derive(req, out);
+    if (cr) return cr < 0 ? -1 : 0;
 
     if (nr == __NR_openat) {
         out->kind = ACT_FILE_OPEN;
@@ -983,6 +1004,7 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
         case ACT_FILE_STAT:
         case ACT_FILE_ACCESS:
         case ACT_FILE_READLINK:
+        case ACT_FILE_CHANGE:            /* v1.29: as a write (or chdir: a read) */
             kind = VDP_KIND_PATH;
             s = a->resolved;
             if (s[0] == '\0') { a->why = "no_resolved_path"; return DEC_UNKNOWN; }
@@ -1055,7 +1077,8 @@ static bool certify(const struct policy *p, struct action *a) {
         case ACT_FILE_OPEN:
         case ACT_FILE_STAT:
         case ACT_FILE_ACCESS:
-        case ACT_FILE_READLINK: kind = VDPC_PATH; s = a->resolved; break;
+        case ACT_FILE_READLINK:
+        case ACT_FILE_CHANGE:  kind = VDPC_PATH; s = a->resolved; break;   /* v1.29 */
         case ACT_NET_CONNECT:  kind = VDPC_HOST; s = a->resolved; break;   /* v1.21 */
         case ACT_NET_PROXY:    kind = VDPC_HOST; s = a->resolved; break;   /* v1.26 */
         case ACT_NET_REQUEST:  kind = VDPC_REQUEST; s = a->resolved; break; /* v1.26.1 */
@@ -2238,7 +2261,7 @@ static void emit_pathology(uint64_t seq,
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     char flags_json[40] = "";
-    if ((a->kind == ACT_FILE_OPEN || is_meta_kind(a->kind)) && a->flags_known)
+    if ((a->kind == ACT_FILE_OPEN || is_meta_kind(a->kind) || a->kind == ACT_FILE_CHANGE) && a->flags_known)
         snprintf(flags_json, sizeof flags_json, "0x%x", (unsigned)a->open_flags);
     /* v1.17.0: what an access() asked, so an audit can tell F_OK/R_OK from
      * W_OK/X_OK. */
@@ -2265,7 +2288,8 @@ static void emit_pathology(uint64_t seq,
         (int)pid);
     /* v1.28.1: who it was for */
     sub_obo(f, a->subject);
-    fprintf(f, "\"action\":\"%s\",\"target\":\"", action_kind_name(a->kind));
+    fprintf(f, "\"action\":\"%s\",\"target\":\"",
+            a->kind == ACT_FILE_CHANGE ? change_op_name(a->chg_op) : action_kind_name(a->kind));
     json_escape(f, a->target);
     fputs("\",\"resolved\":\"", f);
     json_escape(f, a->resolved[0] ? a->resolved : "");
@@ -2639,6 +2663,7 @@ static int check_proc_object(int fd, pid_t tid, pid_t *tgid_cache,
 }
 
 #include "warden_asagent.inc.c"      /* v1.29 step 1 */
+static int agent_fd(pid_t tid, int fd);   /* v1.21: the agent's descriptor, or -errno */
 
 /* v1.29: a step of the resolution's walk, as the agent when opening as the
  * agent. A walk the agent's user may not make (EACCES, EPERM: a directory it
@@ -2667,8 +2692,11 @@ static int resolve_target(pid_t target_pid, struct action *a,
     r->name[0] = '\0';
     r->agent_err = 0;
 
-    if (a->open_dirfd != VAREK_AT_FDCWD && a->target[0] != '/')
-        return -1;   /* relative open against a dirfd we do not track */
+    /* a relative open against a directory descriptor: from v1.29 (require
+     * warden 1.29), resolved from the agent's own descriptor (agent_fd, the
+     * caller's table), as lookups are; before, refused */
+    if (a->open_dirfd != VAREK_AT_FDCWD && a->target[0] != '/' && !g_as.policy)
+        return -1;
 
     /* tgid is needed only for a /proc/self path (before resolution) or a procfs
      * object (after). Compute it lazily so an ordinary open never reads
@@ -2687,9 +2715,7 @@ static int resolve_target(pid_t target_pid, struct action *a,
             return -1;
     }
 
-    char proc_cwd[64];
-    snprintf(proc_cwd, sizeof(proc_cwd), "/proc/%d/cwd", target_pid);
-    int cwd_fd = open(proc_cwd, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    int cwd_fd = agent_fd(target_pid, path[0] == '/' ? VAREK_AT_FDCWD : a->open_dirfd);
     if (cwd_fd < 0) return -1;
 
     int fd = resolve_openat2(cwd_fd, path,
@@ -3220,6 +3246,7 @@ static void syn_hosts_view(const struct policy *p, FILE *f);
 #include "warden_subagent.inc.c"     /* v1.28.1: sub-agents' control groups and attribution */
 #include "warden_exec.inc.c"         /* v1.27: the launch set and its Landlock ruleset */
 #include "warden_noexec.inc.c"       /* v1.27.1: writable directories mounted noexec */
+#include "warden_change.inc.c"       /* v1.29: changes by name */
 
 /* ---------------- receive loop ---------------- */
 
@@ -3441,6 +3468,12 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * decision, like read() on it. A name that does not exist is decided
          * on where it would be: ENOENT inside the policy, EACCES outside, so
          * the lookup no longer tells the agent what exists elsewhere. */
+        /* v1.29: a change by name (unlink, rename, mkdir, chmod, ...): decided
+         * as a write on each path, carried out as the agent */
+        if (act.kind == ACT_FILE_CHANGE) {
+            change_handle(notify_fd, &req, &act, p, &t0);
+            continue;
+        }
         if (is_meta_kind(act.kind)) {
             if (act.bad_flags) { send_errno(notify_fd, req.id, EINVAL); continue; }
             /* v1.26.1: a trust view's metadata, from the view */
@@ -3584,7 +3617,8 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                  * as a lookup is (v1.17): ENOENT where the policy allows the
                  * read, EACCES elsewhere. Before 1.27, refused as before. */
                 int mofd = -1, miss = 0;
-                if (g_exec_policy && g_exec_policy->v.launches && !(act.open_flags & O_CREAT) &&
+                if (g_exec_policy && g_exec_policy->v.launches &&
+                    (!(act.open_flags & O_CREAT) || p->v.open_as_agent) &&   /* v1.29: creates too */
                     resolve_meta(req.pid, &act, -1, &mofd, &miss) == 0 && mofd < 0 && miss == ENOENT &&
                     in_protected_dir(act.resolved, -1) == 0) {
                     decision_t nr = policy_decide(p, &act);
@@ -5601,7 +5635,8 @@ int main(int argc, char **argv) {
             _exit(1);
         }
         int notify_fd =
-            install_baseline_user_notif_filter(getenv("VAREK_WARDEN_OBSERVE") != NULL);
+            install_baseline_user_notif_filter_ex(getenv("VAREK_WARDEN_OBSERVE") != NULL,
+                                                  p.v.open_as_agent);   /* v1.29: changes by name */
         if (notify_fd < 0) { perror("seccomp"); _exit(1); }
         /* v1.12: hand the fd NUMBER to the supervisor and wait for it to pull
          * the fd via pidfd_getfd(). write()/read() are admitted; no sendmsg. */

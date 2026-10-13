@@ -277,6 +277,58 @@ def policy_launches(checker, policy):
     return f == ["on"]
 
 
+def policy_openas(checker, policy):
+    """v1.29: whether files are opened, and changed by name, as the agent
+    (require warden 1.29), as the checker reads the policy."""
+    rq = subprocess.run([checker, policy, "openas"], capture_output=True, text=True)
+    f = rq.stdout.split()
+    if rq.returncode != 0 or f not in (["on"], ["off"]):
+        raise ValueError("the checker failed on the policy's openas")
+    return f == ["on"]
+
+
+# v1.29 (D12): the changes by name, each decided as a path with these flags
+# (warden_change.inc.c), and the rules of an allowed one
+CHANGE_FLAGS = {
+    "file.unlink": ("0x201",), "file.rmdir": ("0x201",), "file.mkdir": ("0xc1",),
+    "file.rename_from": ("0x201", "0x241"), "file.rename_to": ("0x241",),
+    "file.chmod": ("0x1",), "file.utime": ("0x1",), "file.truncate": ("0x201",),
+    "file.chdir": ("0x10000",),
+}
+CHANGE_RULES = ("change_done", "change_failed", "chdir_continued")
+
+
+def check_changes(records, openas_policy, problems):
+    """v1.29: every change by name is in a run whose policy says require
+    warden 1.29; an allowed one carries the flags its kind is decided as; a
+    rename's old and new names are recorded together (seq n and n+1, the same
+    process and outcome), never one without the other."""
+    allowed = [r for r in records if r.get("action") in CHANGE_FLAGS and r.get("decision_final") == "ALLOW"]
+    if not openas_policy:
+        for r in records:
+            if r.get("action") in CHANGE_FLAGS:
+                problems.append(f"seq {r.get('seq')}: a change by name ({r.get('action')}) in a run whose "
+                                f"policy does not say require warden 1.29")
+        return
+    by_seq = {r.get("seq"): r for r in records if type(r.get("seq")) is int}
+    for r in allowed:
+        act, seq = r["action"], r.get("seq")
+        if r.get("open_flags") not in CHANGE_FLAGS[act]:
+            problems.append(f"seq {seq}: {act} allowed as open flags {r.get('open_flags')!r}, not as its "
+                            f"kind is decided ({'/'.join(CHANGE_FLAGS[act])})")
+        if (act == "file.chdir") != (r.get("rule") == "chdir_continued"):
+            problems.append(f"seq {seq}: {act} allowed with rule {r.get('rule')!r}")
+        if act == "file.rename_from":
+            nx = by_seq.get(seq + 1) if type(seq) is int else None
+            if not nx or nx.get("action") != "file.rename_to" or nx.get("decision_final") != "ALLOW" or \
+                    nx.get("agent_pid") != r.get("agent_pid") or nx.get("rule") != r.get("rule"):
+                problems.append(f"seq {seq}: a rename allowed without its new name decided and recorded next")
+        if act == "file.rename_to":
+            pv = by_seq.get(seq - 1) if type(seq) is int else None
+            if not pv or pv.get("action") != "file.rename_from" or pv.get("decision_final") != "ALLOW":
+                problems.append(f"seq {seq}: a rename's new name allowed without its old name before it")
+
+
 V127_RULES = ("exec_allowed", "exec_not_in_ruleset", "exec_no_landlock", "exec_identity_mismatch",
               "exec_identity_unreadable", "open_not_found")
 
@@ -2540,6 +2592,12 @@ def main(argv=None):
         launches_policy = False
     check_exec_set(meta, launches_policy, problems, records)
     try:
+        openas_policy = policy_openas(a.checker, a.policy)          # v1.29
+    except (OSError, ValueError) as e:
+        problems.append(f"checker failed on the policy's openas: {e}")
+        openas_policy = False
+    check_changes(records, openas_policy, problems)
+    try:
         check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, problems, records)   # v1.27.1
     except (OSError, ValueError) as e:
         problems.append(f"checker failed on the policy's rules: {e}")
@@ -2726,13 +2784,17 @@ def main(argv=None):
                 fl = int(str(rec.get("open_flags")), 16)
             except ValueError:
                 fl = os.O_CREAT
-            if not launches_policy or fl & os.O_CREAT or rec.get("errno") != 2 \
+            # v1.29: under require warden 1.29 a create whose directory is missing too
+            if not launches_policy or (fl & os.O_CREAT and not openas_policy) or rec.get("errno") != 2 \
                     or rec.get("kernel_verdict") == "ALLOW":
                 problems.append(f"seq {rec.get('seq')}: an open recorded as not found, which the Warden "
                                 f"writes only with launches on, for an open that does not create, "
                                 f"answered ENOENT")
                 continue
         is_meta = rec.get("action") in META_ACTIONS and rec.get("rule") in META_RULES
+        # v1.29: a change by name, decided as a path with its flags (check_changes)
+        is_change = rec.get("action") in CHANGE_FLAGS and rec.get("rule") in CHANGE_RULES
+        is_meta = is_meta or is_change
         is_conn = rec.get("action") == "net.connect" and rec.get("rule") in CONNECT_RULES
         # v1.26 (step 6): a name:port the proxy read, allowed: certified as a connect is
         is_proxy = rec.get("action") == "net.proxy" and rec.get("rule") in PROXY_ALLOW_RULES

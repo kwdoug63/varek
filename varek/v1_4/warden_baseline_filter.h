@@ -12,4 +12,10 @@
 // the target's required syscalls before enforcing. Hard-deny still kills.
 int install_baseline_user_notif_filter(int observe);
 
+// v1.29: file_changes != 0 (under `require warden 1.29`) also sends the
+// changes by name (unlink, rename, mkdir, rmdir, chmod, utimensat, truncate,
+// chdir and their *at and descriptor forms) to the supervisor, and admits
+// fchdir. Hard and symbolic links stay refused.
+int install_baseline_user_notif_filter_ex(int observe, int file_changes);
+
 #endif
