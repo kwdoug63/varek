@@ -1,0 +1,12 @@
+#@ profile claude
+#@ about Claude Code (Anthropic)
+#@ commands claude claude-code
+#@ programs node rg
+# A first profile, to be checked in step 6 with a dry run of the CLI and
+# `varek policy suggest`. ${HOME} is the agent user's home directory.
+allow path ${HOME}/.claude                          # its settings, sessions and ~/.claude.json
+allow path ${HOME}/.config/claude/
+allow path ${HOME}/.cache/claude/
+allow path ${HOME}/.local/share/claude/ readonly    # the native install
+allow exec prefix ${HOME}/.local/share/claude/versions/
+allow host api.anthropic.com:443                    # the model API

@@ -41,8 +41,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import varek_license  # noqa: E402
 import varek_bench  # noqa: E402
+import varek_baseline  # noqa: E402
 
-CLI_VERSION = "1.2.0"
+CLI_VERSION = "1.3.0"
 DEFAULT_CONFIG = "/etc/varek/varek.conf"
 DEFAULT_ETC = "/etc/varek"
 DEFAULT_LOG_DIR = "/var/log/varek"
@@ -139,7 +140,25 @@ def load_config(required=True):
         "spool": c.get("spool", "").strip(),
         "run_as": c.get("run_as", "nobody").strip() or "nobody",
         "packs_dir": c.get("packs_dir", os.path.join(etc, "packs")),
+        "implicit": False,
     }
+
+
+def default_config():
+    """v1.29: the settings `varek run` uses with no configuration (nothing
+    set up first): the default log directory (VAREK_LOG_DIR), the signing
+    key next to where varek.conf would be, no anchor."""
+    etc = os.path.dirname(os.path.abspath(config_path()))
+    key = os.path.join(etc, "log.key")
+    return {"path": None, "etc": etc, "policy": "",
+            "log_dir": os.environ.get("VAREK_LOG_DIR", DEFAULT_LOG_DIR),
+            "sign_key": key if os.path.exists(key) else "", "anchor": "", "spool": "",
+            "run_as": "", "packs_dir": os.path.join(etc, "packs"), "implicit": True}
+
+
+def config_or_defaults():
+    """The settings, or (v1.29) the defaults when there are none"""
+    return load_config(required=False) or default_config()
 
 
 def write_config(path, cfg):
@@ -268,6 +287,8 @@ def pack_summary(path):
         with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 s = line.strip()
+                if s.startswith("#@"):           # v1.29: a baseline's header
+                    continue
                 if s.startswith("#") and len(s) > 2 and not set(s[1:].strip()) <= set("-=_ "):
                     return s.lstrip("# ").strip()
     except OSError:
@@ -434,7 +455,8 @@ def _policy_for_log(cfg, s):
     want = s.get("policy_sha")
     cands = [s.get("policy"), cfg["policy"]]
     cands += list(installed_packs(cfg).values()) + list(builtin_packs().values())
-    cands += sorted(glob.glob(cfg["policy"] + ".bak-*"), reverse=True)
+    if cfg["policy"]:
+        cands += sorted(glob.glob(cfg["policy"] + ".bak-*"), reverse=True)
     seen = set()
     for c in cands:
         if not c or c in seen or not os.path.isfile(c):
@@ -1062,18 +1084,91 @@ def cmd_preflight(args):
     return run_cmd(argv, check=False).returncode
 
 
+def first_use(cfg):
+    """v1.29: with no configuration, make what a run needs, each step said:
+    the log directory and (unless it exists) a signing key. No varek.conf."""
+    d = cfg["log_dir"]
+    if not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+        os.chmod(d, 0o750)
+        print(_paint("2", f"[varek] log directory {d} (750), made on first use"), file=sys.stderr)
+    key = os.path.join(cfg["etc"], "log.key")
+    if not os.path.exists(key):
+        os.makedirs(cfg["etc"], exist_ok=True)
+        os.chmod(cfg["etc"], 0o755)
+        run_cmd([tool("varek_keygen"), key], capture=True)
+        print(_paint("2", f"[varek] signing key {key} (600) and {key}.pub, made on first use"), file=sys.stderr)
+    cfg["sign_key"] = key
+
+
+def baseline_for_run(args, cmd, make):
+    """v1.29: the baseline for this run: (policy text, passwd entry, --run-as
+    value, the temporary directory, the profile's name, notes)"""
+    try:
+        pw, ra, why_user = varek_baseline.agent_user(args.run_as)
+        if pw is None:
+            raise CliError(f"--run-as {ra}: no such user (the baseline needs a passwd entry for its home)")
+        if pw.pw_uid == 0:
+            raise CliError("the agent would run as root",
+                           fix="run it with sudo as yourself, or pass --run-as USER")
+        profiles = varek_baseline.all_profiles(varek_home())
+        prof, why_prof = varek_baseline.choose_profile(cmd, profiles, args.profile)
+        cwd = varek_baseline.check_cwd(os.getcwd(), pw.pw_dir)
+        tmp = varek_baseline.tmp_dir(pw, make=make)
+        path = varek_baseline.agent_path(cmd, os.environ)
+        text = varek_baseline.generate(cwd, pw, tmp, prof, path=path)
+    except varek_baseline.BaselineError as e:
+        raise CliError(str(e))
+    notes = [f"the agent runs as {pw.pw_name} ({why_user})",
+             f"profile {prof['name']} ({why_prof})" if prof else f"no profile ({why_prof}): the baseline alone"]
+    return text, pw, ra, tmp, (prof["name"] if prof else None), notes, path
+
+
 def cmd_run(args):
-    need_root("run")
-    cfg = load_config()
     cmd = args.command
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd:
         raise CliError("no agent command given",
                        fix="put it after --, e.g. `sudo varek run -- python3 agent.py`")
-    policy = resolve_pack(args.policy, cfg) if args.policy else cfg["policy"]
-    if args.policy:
-        require_entitlement(policy)
+    cfg = load_config(required=False)
+    baseline = args.baseline or (cfg is None and not args.policy)
+    if args.policy and args.baseline:
+        raise CliError("--policy and --baseline together", fix="choose one")
+    if (args.profile or args.env) and not baseline:
+        raise CliError("--profile and --env go with the baseline policy",
+                       fix="run with no configuration, or pass --baseline")
+    if args.show_policy:
+        if not baseline:
+            raise CliError("--show-policy prints the baseline policy", fix="pass --baseline")
+        text, _, _, _, _, notes, _ = baseline_for_run(args, cmd, make=False)
+        sys.stdout.write(text)
+        for n in notes:
+            print(_paint("2", f"[varek] {n}"), file=sys.stderr)
+        return 0
+    need_root("run")
+    if cfg is None:
+        cfg = default_config()
+        first_use(cfg)
+    env = None
+    if baseline:
+        text, pw, run_as, tmp, prof, notes, path = baseline_for_run(args, cmd, make=True)
+        try:
+            policy = varek_baseline.store(text)
+            env = varek_baseline.agent_env(pw, tmp, args.env or [], os.environ, path)
+        except (varek_baseline.BaselineError, OSError) as e:
+            raise CliError(str(e))
+        label = f"the baseline policy for {os.getcwd()}" + (f", profile {prof}" if prof else "")
+        for n in notes:
+            print(_paint("2", f"[varek] {n}"), file=sys.stderr)
+        print(_paint("2", f"[varek] policy {policy} (`varek run --baseline --show-policy -- ...` prints it)"),
+              file=sys.stderr)
+    else:
+        policy = resolve_pack(args.policy, cfg) if args.policy else cfg["policy"]
+        if args.policy:
+            require_entitlement(policy)
+        run_as = args.run_as or cfg["run_as"] or "nobody"
+        label = pack_summary(policy) or os.path.basename(policy)
     os.makedirs(cfg["log_dir"], exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     log = args.log or os.path.join(cfg["log_dir"], f"verdicts-{stamp}.log")
@@ -1089,14 +1184,15 @@ def cmd_run(args):
         argv += ["--sign-key", cfg["sign_key"]]
     if cfg["anchor"]:
         argv += ["--anchor", cfg["anchor"]]
-    argv += ["--run-as", args.run_as or cfg["run_as"], "--"] + cmd
+    if args.writable_exec:
+        argv += ["--writable-exec"]
+    argv += ["--run-as", run_as, "--"] + cmd
 
     fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
-    label = pack_summary(policy) or os.path.basename(policy)
     print(_paint("2", f"[varek] supervising `{' '.join(cmd)}` under {label}; "
                       f"verdicts -> {log}"), file=sys.stderr)
     with os.fdopen(fd, "w") as err:
-        r = run_cmd(argv, check=False, stderr=err)
+        r = run_cmd(argv, check=False, stderr=err, env=env)
 
     agent_err = []
     with open(log, encoding="utf-8", errors="replace") as fh:
@@ -1122,9 +1218,14 @@ def cmd_run(args):
 
 
 def cmd_status(args):
-    cfg = load_config()
-    info(f"Settings   {cfg['path']}")
-    if os.path.isfile(cfg["policy"]):
+    cfg = config_or_defaults()
+    if cfg["implicit"]:
+        info(f"Settings   none ({config_path()} does not exist): `varek run` uses the baseline policy")
+    else:
+        info(f"Settings   {cfg['path']}")
+    if cfg["implicit"]:
+        pass
+    elif os.path.isfile(cfg["policy"]):
         counts, _ = policy_rules(cfg["policy"])
         n = sum(sum(v.values()) for v in counts.values())
         info(f"Policy     {cfg['policy']} ({n} rules) - {pack_summary(cfg['policy'])}")
@@ -1132,7 +1233,7 @@ def cmd_status(args):
         info(f"Policy     {cfg['policy']} (MISSING)")
     info(f"Signing    {cfg['sign_key'] or 'off (chained, unsigned)'}")
     info(f"Anchor     {cfg['anchor'] or 'none'}")
-    info(f"Agent user {cfg['run_as']}")
+    info(f"Agent user {cfg['run_as'] or 'the user who ran sudo (the baseline)'}")
     info(f"Logs       {cfg['log_dir']}")
     logs = run_logs(cfg)
     if logs:
@@ -1165,7 +1266,7 @@ def obo_text(r):
 
 
 def cmd_runs(args):
-    cfg = load_config()
+    cfg = config_or_defaults()
     logs = run_logs(cfg)[: args.n]
     if not logs:
         info(f"No runs in {cfg['log_dir']}.")
@@ -1284,7 +1385,7 @@ EXEC_WORDS = {
 
 
 def cmd_refusals(args):
-    cfg = load_config()
+    cfg = config_or_defaults()
     log = latest_log(cfg, args.log)
     s = summarize(read_records(log))
     policy = _policy_for_log(cfg, s)
@@ -1442,7 +1543,7 @@ def cmd_refusals(args):
 
 
 def cmd_audit(args):
-    cfg = load_config()
+    cfg = config_or_defaults()
     log = latest_log(cfg, args.log)
     s = summarize(read_records(log))
     policy = _policy_for_log(cfg, s)
@@ -1472,7 +1573,7 @@ def cmd_export(args):
                            fix="pass --pubkey /etc/varek/log.key.pub")
         return run_cmd([sys.executable, tool("varek_cyclonedx.py"),
                         "--verify", args.verify, "--pubkey", pub], check=False).returncode
-    cfg = load_config()
+    cfg = config_or_defaults()
     log = latest_log(cfg, args.log)
     s = summarize(read_records(log))
     out = args.output or re.sub(r"\.log$", "", log) + ".cdx.json"
@@ -1850,8 +1951,22 @@ def build_parser():
     sp = add("run", cmd_run, "run an agent under the Warden (root)",
              usage="varek run [options] -- <agent command> [args...]")
     sp.add_argument("--policy", help="use this pack or file instead of the active policy")
+    sp.add_argument("--baseline", action="store_true",
+                    help="v1.29: use the baseline policy for this directory even with settings "
+                         "(the default when there are none)")
+    sp.add_argument("--profile", metavar="NAME|FILE|none",
+                    help="v1.29: the agent profile the baseline adds (default: chosen by the command's name)")
+    sp.add_argument("--env", action="append", metavar="NAME",
+                    help="v1.29: pass this variable to the agent (repeatable; recorded by name only). "
+                         "With the baseline the agent gets a clean environment otherwise")
+    sp.add_argument("--show-policy", action="store_true",
+                    help="v1.29: print the baseline policy this run would use, and stop")
+    sp.add_argument("--writable-exec", action="store_true",
+                    help="let the agent launch files in the directories it may write (the Warden's "
+                         "--writable-exec; recorded)")
     sp.add_argument("--plan", help="check this action-graph plan before the agent starts")
-    sp.add_argument("--run-as", help="unprivileged user for the agent (default from settings)")
+    sp.add_argument("--run-as", help="unprivileged user for the agent (default from settings; with the "
+                                     "baseline, the user who ran sudo)")
     sp.add_argument("--log", help="write the verdict stream here instead of a new file")
     sp.add_argument("--stderr-lines", type=int, default=20, metavar="N",
                     help="after the run, show the last N lines the agent wrote to stderr "

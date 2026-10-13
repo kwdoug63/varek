@@ -52,7 +52,11 @@ def test_policy_check_rejects_a_bad_policy(tmp_path):
 
 
 def test_commands_without_settings_explain_init(tmp_path):
-    r = varek("status", config=str(tmp_path / "none.conf"))
+    # v1.29: commands that read runs work without settings (`varek run` then
+    # uses the baseline); one that changes the active policy still needs init
+    r = varek("status", config=str(tmp_path / "none.conf"), check=0)
+    assert "uses the baseline policy" in r.stdout
+    r = varek("policy", "show", config=str(tmp_path / "none.conf"))
     assert r.returncode == 2
     assert "varek init" in r.stderr
 

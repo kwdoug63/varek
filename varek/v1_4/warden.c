@@ -302,13 +302,89 @@ static const char *action_kind_name(action_kind_t k) {
  * path/host/exec constant, a 32-bit bitvector for open flags), the verdict
  * semantics, and the soundness obligations. v1.14 adds the bounded string
  * fragment: exact, prefix, suffix, contains and glob matchers. */
+/* v1.29 (docs/security/v1.29-varek-run.md, section 2): a baseline `varek
+ * run` wrote says, in its first lines, what it was made for:
+ *   #@ varek baseline 1
+ *   #@ profile NAME SHA256        (or: #@ profile none -)
+ *   #@ cwd PATH   #@ home PATH   #@ user NAME   #@ tmp PATH
+ * Comments to the parsers; the Warden reads them from the same bytes it
+ * hashes and copies them into run_start's `baseline`. */
+struct baseline_hdr {
+    bool on;
+    char profile[33], profile_sha[65];
+    char cwd[PATH_MAX], home[PATH_MAX], user[64], tmp[PATH_MAX];
+};
+
 struct policy {
     char          name[64];
     char          version[16];
     vdp_policy_t  v;
     vdpc_policy_t c;                    /* v1.15: the checker's own parse */
     char          sha256[65];           /* v1.15: of the policy bytes both parsed */
+    struct baseline_hdr base;           /* v1.29 */
 };
+
+/* v1.29: 0 (b->on says whether the policy is a baseline), or -1 with why */
+static int baseline_parse(const char *buf, size_t len, struct baseline_hdr *b, char *why, size_t wn) {
+    static const char kHead[] = "#@ varek baseline ";
+    memset(b, 0, sizeof *b);
+    if (len < sizeof kHead - 1 || memcmp(buf, kHead, sizeof kHead - 1)) return 0;
+    size_t pos = 0;
+    int line = 0;
+    bool seen[5] = { false };
+    while (pos < len && len - pos >= 3 && !memcmp(buf + pos, "#@ ", 3)) {
+        const char *nl = memchr(buf + pos, '\n', len - pos);
+        size_t ll = nl ? (size_t)(nl - (buf + pos)) : len - pos;
+        char l[PATH_MAX + 32];
+        if (ll >= sizeof l) { snprintf(why, wn, "baseline header line %d is too long", line + 1); return -1; }
+        memcpy(l, buf + pos, ll);
+        l[ll] = '\0';
+        pos += ll + (nl ? 1 : 0);
+        line++;
+        for (size_t i = 3; i < ll; i++)
+            if ((unsigned char)l[i] < 0x20 || (unsigned char)l[i] > 0x7e) {
+                snprintf(why, wn, "baseline header line %d holds a byte outside printable ASCII", line);
+                return -1;
+            }
+        if (line == 1) {
+            if (strcmp(l, "#@ varek baseline 1")) {
+                snprintf(why, wn, "a baseline of a format this Warden does not know (%.40s)", l + 3);
+                return -1;
+            }
+            continue;
+        }
+        char *key = l + 3, *val = strchr(key, ' ');
+        if (!val || !val[1]) { snprintf(why, wn, "baseline header line %d has no value", line); return -1; }
+        *val++ = '\0';
+        static const char *const kKeys[] = { "profile", "cwd", "home", "user", "tmp" };
+        int k = -1;
+        for (int i = 0; i < 5; i++) if (!strcmp(key, kKeys[i])) k = i;
+        if (k < 0) { snprintf(why, wn, "baseline header line %d: unknown key %.32s", line, key); return -1; }
+        if (seen[k]) { snprintf(why, wn, "baseline header: %.16s given twice", key); return -1; }
+        seen[k] = true;
+        if (k == 0) {
+            char nm[64], sh[80];
+            if (sscanf(val, "%63s %79s", nm, sh) != 2 || strlen(nm) > 32 || strlen(sh) > 64 ||
+                (strcmp(nm, "none") && strlen(sh) != 64) || (!strcmp(nm, "none") && strcmp(sh, "-"))) {
+                snprintf(why, wn, "baseline header: need `#@ profile NAME SHA256` or `#@ profile none -`");
+                return -1;
+            }
+            snprintf(b->profile, sizeof b->profile, "%s", nm);
+            snprintf(b->profile_sha, sizeof b->profile_sha, "%s", strcmp(nm, "none") ? sh : "");
+        } else if (k == 3) {
+            if (strlen(val) >= sizeof b->user) { snprintf(why, wn, "baseline header: user too long"); return -1; }
+            snprintf(b->user, sizeof b->user, "%s", val);
+        } else {
+            if (val[0] != '/') { snprintf(why, wn, "baseline header: %.16s is not an absolute path", key); return -1; }
+            char *dst = k == 1 ? b->cwd : k == 2 ? b->home : b->tmp;
+            snprintf(dst, PATH_MAX, "%s", val);
+        }
+    }
+    for (int i = 0; i < 5; i++)
+        if (!seen[i]) { snprintf(why, wn, "baseline header: a line is missing (profile, cwd, home, user, tmp)"); return -1; }
+    b->on = true;
+    return 0;
+}
 
 #define POLICY_MAX_BYTES (16u << 20)
 
@@ -334,6 +410,11 @@ static int policy_load(const char *path, struct policy *p) {
     if (rd_err || len > POLICY_MAX_BYTES) {
         fprintf(stderr, "[warden] policy %s: %s\n", path,
                 rd_err ? "read error" : "larger than 16 MiB");
+        free(buf);
+        return -1;
+    }
+    if (baseline_parse(buf, len, &p->base, err, sizeof err) < 0) {     /* v1.29 */
+        fprintf(stderr, "[warden] policy %s: %s; refusing to start\n", path, err);
         free(buf);
         return -1;
     }
@@ -1809,6 +1890,38 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     /* v1.27: Landlock and the launch set (require warden 1.27) */
     if (p->v.launches) { exec_ruleset_record(f); noexec_record(f); }   /* v1.27, v1.27.1 */
     as_agent_record(f);                  /* v1.29: who files are opened as */
+    /* v1.29: the baseline this policy is (section 2), and the names (never
+     * the values) of the agent's environment, under require warden 1.29 */
+    if (p->base.on) {
+        fputs("\"baseline\":{\"format\":1,\"profile\":\"", f);
+        json_escape(f, p->base.profile);
+        fprintf(f, "\",\"profile_sha256\":\"%s\",\"cwd\":\"", p->base.profile_sha);
+        json_escape(f, p->base.cwd);
+        fputs("\",\"home\":\"", f);
+        json_escape(f, p->base.home);
+        fputs("\",\"user\":\"", f);
+        json_escape(f, p->base.user);
+        fputs("\",\"tmp\":\"", f);
+        json_escape(f, p->base.tmp);
+        fputs("\"},", f);
+    }
+    if (p->v.open_as_agent) {
+        extern char **environ;
+        fputs("\"agent_env\":[", f);
+        bool first = true;
+        for (char **e = environ; e && *e; e++) {
+            const char *eq = strchr(*e, '=');
+            if (!eq || eq == *e || (size_t)(eq - *e) > 255) continue;
+            char nm[256];
+            memcpy(nm, *e, (size_t)(eq - *e));
+            nm[eq - *e] = '\0';
+            fputs(first ? "\"" : ",\"", f);
+            json_escape(f, nm);
+            fputs("\"", f);
+            first = false;
+        }
+        fputs("],", f);
+    }
     /* v1.28.1: who the run acts for (docs/security/v1.28.1-delegation-chain.md,
      * section 4): the user a trusted issuer vouched for, the actors of a
      * delegation, the agent; with no token, the agent alone. Then the

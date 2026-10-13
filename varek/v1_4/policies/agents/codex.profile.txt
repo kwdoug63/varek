@@ -1,0 +1,7 @@
+#@ profile codex
+#@ about OpenAI Codex CLI
+#@ commands codex
+#@ programs node rg
+# A first profile, to be checked in step 6 with a dry run of the CLI.
+allow path ${HOME}/.codex/                          # its configuration and sessions
+allow host api.openai.com:443                       # the model API

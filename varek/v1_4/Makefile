@@ -486,6 +486,7 @@ INSTALL_TOOLS := tools/varek tools/vdp_check tools/vdp_cert_check tools/varek_ke
 	tools/varek_audit.py tools/varek_cyclonedx.py tools/varek_ed25519.py \
 	tools/varek_preflight.sh tools/varek_anchor_forward.py tools/varek_anchor_receiver.sh \
 	tools/varek_license.py tools/varek_bench.py tools/varek_bench_proxy.py tools/bench_proxy_client.py tools/varek_bench_launch.py \
+	tools/varek_baseline.py \
 	tools/bench_workload
 
 install: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
@@ -494,6 +495,8 @@ install: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check
 	install -m 0755 warden warden-proxy warden-secrets $(DESTDIR)$(PREFIX)/
 	install -m 0755 $(INSTALL_TOOLS) $(DESTDIR)$(PREFIX)/tools/
 	install -m 0644 policies/*.policy.txt $(DESTDIR)$(PREFIX)/policies/
+	install -d -m 0755 $(DESTDIR)$(PREFIX)/policies/agents
+	install -m 0644 policies/agents/*.profile.txt $(DESTDIR)$(PREFIX)/policies/agents/
 	if [ -d tools/systemd ]; then install -d -m 0755 $(DESTDIR)$(PREFIX)/tools/systemd && \
 	    install -m 0644 tools/systemd/* $(DESTDIR)$(PREFIX)/tools/systemd/; fi
 	ln -sf $(PREFIX)/tools/varek $(DESTDIR)$(BINDIR)/varek

@@ -1,0 +1,6 @@
+#@ profile node
+#@ about a Node.js agent (no rules of its own beyond the user's packages)
+#@ commands
+#@ programs node npm
+allow path ${HOME}/.npm/ readonly                   # npm's cache
+allow path ${HOME}/.node_modules/ readonly

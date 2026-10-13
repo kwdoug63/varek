@@ -1,0 +1,6 @@
+#@ profile python
+#@ about a Python agent (no rules of its own beyond the user's packages)
+#@ commands
+#@ programs python3
+allow path ${HOME}/.local/lib/ readonly             # packages installed for the user (pip --user)
+allow path ${HOME}/.cache/pip/ readonly

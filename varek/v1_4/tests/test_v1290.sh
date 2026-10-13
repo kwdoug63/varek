@@ -12,6 +12,17 @@
 #      file is the agent's, a file the agent's user could not open is not
 #      opened whatever the policy allows (the kernel's error, recorded with
 #      the decision), and a v1.28 policy opens as root, as before.
+#   2. the baseline policy (tools/varek_baseline.py) and the agents' profiles
+#      (policies/agents/): the profile chosen by each spelling of a command;
+#      the working directories refused; every profile's baseline lints, loads
+#      in both parsers and in the Warden, and the cross-check agrees; `varek
+#      run` with no configuration: first-use setup, the policy stored by its
+#      SHA-256, run_start's baseline, credential stores refused, the profile's
+#      directory and API host reached, launches by every name; the audit,
+#      refusals and runs with no configuration; a Node.js agent.
+#   6. the agent's user (the user who ran sudo, else nobody; never root) and
+#      environment (a clean one; --env by name; recorded by name only), and
+#      the agent's /tmp/varek-<uid>.
 #
 #   test_v1290.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
@@ -27,9 +38,10 @@ pass()  { printf '  PASS   %s\n' "$1"; }
 flunk() { printf '  FAIL   %s\n' "$1"; fail=1; }
 skip()  { printf '  SKIP   %s\n' "$1"; skips=$((skips + 1)); }
 check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else flunk "$d"; fi; }
-TUSER=varek1290u TGROUP=varek1290g MADE_USER=
+TUSER=varek1290u TGROUP=varek1290g MADE_USER= MADE_BU=
 cleanup() {
     if [ -n "$MADE_USER" ]; then userdel "$TUSER" >/dev/null 2>&1; groupdel "$TGROUP" >/dev/null 2>&1; fi
+    if [ -n "$MADE_BU" ]; then userdel varek1290r >/dev/null 2>&1; fi
     [ -n "${KEEP:-}" ] && echo "kept $OUT" || rm -rf "$OUT"
 }
 trap cleanup EXIT
@@ -158,6 +170,200 @@ PY
             sh -c "'$WARDEN' '$OUT/p129.txt' --run-as '$TUSER' -- /usr/bin/id -G 2>/dev/null | grep -qx '$PG'"
     else
         skip "supplementary groups (cannot add a test user and group here)"
+    fi
+fi
+
+echo "== 2. the baseline policy and the agents' profiles; 6. the agent's user and environment =="
+VB="$HERE/tools/varek_baseline.py"
+# py EXPR...: a Python check against varek_baseline (exit 0 when it holds)
+py() { PYTHONPATH="$HERE/tools" python3 -c "import sys, varek_baseline as b; $1"; }
+check "a profile by the command's name: claude"            py "p=b.all_profiles('$HERE'); sys.exit(b.choose_profile(['claude','-p','hi'],p)[0]['name']!='claude')"
+check "... through npx and a scoped package with a version" py "p=b.all_profiles('$HERE'); sys.exit(b.choose_profile(['npx','-y','@anthropic-ai/claude-code@1.2'],p)[0]['name']!='claude')"
+check "... after env and its assignments"                   py "p=b.all_profiles('$HERE'); sys.exit(b.choose_profile(['env','A=1','codex'],p)[0]['name']!='codex')"
+check "... a module run by an interpreter (python3 -m aider)" py "p=b.all_profiles('$HERE'); sys.exit(b.choose_profile(['/usr/bin/python3.11','-m','aider'],p)[0]['name']!='aider')"
+check "... an unknown Python script: the python profile"    py "p=b.all_profiles('$HERE'); sys.exit(b.choose_profile(['python3','agent.py'],p)[0]['name']!='python')"
+check "... an unknown Node script: the node profile"        py "p=b.all_profiles('$HERE'); sys.exit(b.choose_profile(['node','x/run.mjs'],p)[0]['name']!='node')"
+check "... an unknown program: the baseline alone"          py "p=b.all_profiles('$HERE'); sys.exit(b.choose_profile(['./myagent'],p)[0] is not None)"
+check "... --profile none: the baseline alone"              py "p=b.all_profiles('$HERE'); sys.exit(b.choose_profile(['claude'],p,'none')[0] is not None)"
+check "... --profile with an unknown name is refused"       py "p=b.all_profiles('$HERE')
+try: b.choose_profile(['x'],p,'nosuch')
+except b.BaselineError: sys.exit(0)
+sys.exit(1)"
+for d in / /etc /usr /tmp /home /root; do
+    check "the working directory $d is refused" py "
+try: b.check_cwd('$d','/home/x')
+except b.BaselineError: sys.exit(0)
+sys.exit(1)"
+done
+mkdir -p "$OUT/sp ace"
+check "a working directory with a space is refused (a policy line cannot hold it)" py "
+try: b.check_cwd('$OUT/sp ace','/home/x')
+except b.BaselineError: sys.exit(0)
+sys.exit(1)"
+check "the home directory itself is refused as the working directory" py "
+try: b.check_cwd('$OUT','$OUT')
+except b.BaselineError: sys.exit(0)
+sys.exit(1)"
+
+# every shipped profile: its baseline lints, both parsers load it, the cross-check agrees
+mkdir -p "$OUT/gen" "$OUT/gproj"
+for prof in $(ls "$HERE/policies/agents/" | sed 's/\.profile\.txt$//') none; do
+    PYTHONPATH="$HERE/tools" python3 -c "
+import pwd, varek_baseline as b
+pw = pwd.getpwnam('nobody')
+p = None if '$prof' == 'none' else b.all_profiles('$HERE')['$prof']
+open('$OUT/gen/$prof.txt', 'w').write(b.generate('$OUT/gproj', pw, '/tmp/varek-65534', p))"
+    check "the baseline with profile $prof lints with no dead rule" sh -c "'$VDP' '$OUT/gen/$prof.txt' lint | grep -q ' 0 can never fire'"
+    check "... the certificate checker loads it, and both open as the agent" sh -c "[ \"\$('$VDP' '$OUT/gen/$prof.txt' openas)\" = on ] && [ \"\$('$CERT' '$OUT/gen/$prof.txt' openas)\" = on ]"
+done
+# the cross-check on the largest one (the profiles add a few rules each; its
+# reachability queries over the baseline's globs take minutes, so 2 queries)
+if python3 "$HERE/tools/smt_crosscheck.py" --vdp "$VDP" --cert "$CERT" --queries 2 "$OUT/gen/claude.txt" > "$OUT/cc.out" 2>&1; then
+    pass "the cross-check: the three parsers agree on the claude baseline"
+else flunk "the cross-check: the three parsers agree on the claude baseline ($(tail -1 "$OUT/cc.out"))"; fi
+check "the credential stores come before any allow rule" sh -c "awk '/^allow /{a=NR} /contains \\/\\.ssh\\//{d=NR} END{exit !(d && (!a || d < a))}' '$OUT/gen/none.txt' && [ \"\$(grep -n '^allow ' '$OUT/gen/none.txt' | head -1 | cut -d: -f1)\" -gt \"\$(grep -n '^deny ' '$OUT/gen/none.txt' | tail -1 | cut -d: -f1)\" ]"
+check "the header says what the baseline was made for" sh -c "head -6 '$OUT/gen/claude.txt' | grep -q '^#@ profile claude [0-9a-f]\{64\}$' && grep -qx '#@ cwd $OUT/gproj' '$OUT/gen/claude.txt' && grep -qx '#@ user nobody' '$OUT/gen/claude.txt'"
+check "the claude profile's \${HOME} becomes the user's home" grep -q "^allow path /nonexistent/.claude " "$OUT/gen/claude.txt"
+check "programs are named by every path they are called by (/bin/sh and its file)" sh -c "grep -qx 'allow exec /bin/sh' '$OUT/gen/none.txt' && grep -qx \"allow exec \$(readlink -f /bin/sh)\" '$OUT/gen/none.txt'"
+
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
+    skip "varek run with the baseline (it runs as root)"
+else
+    for prof in $(ls "$OUT/gen/" | sed 's/\.txt$//'); do
+        check "the Warden starts the baseline with profile $prof" "$WARDEN" "$OUT/gen/$prof.txt" --check-startup
+    done
+    BU=varek1290r BH="$OUT/home"
+    if useradd -m -d "$BH" -s /bin/sh "$BU" >/dev/null 2>&1; then
+        MADE_BU=1
+        chmod 755 "$BH"
+        BUID="$(id -u "$BU")" BGID="$(id -g "$BU")"
+        su "$BU" -s /bin/sh -c "mkdir -p '$BH/proj' '$BH/.ssh' '$BH/.aws' '$BH/.claude' '$BH/.testagent' && echo key > '$BH/.ssh/id_rsa' && echo k > '$BH/.aws/credentials' && echo c > '$BH/.claude/settings.json' && echo t > '$BH/.testagent/conf' && echo TOKEN=1 > '$BH/proj/.env' && echo ok > '$BH/proj/README'"
+        cat > "$BH/proj/agent.py" <<'PYA'
+import os, subprocess, sys, urllib.request
+def t(what, f):
+    try:
+        f(); print(what, "ok")
+    except Exception as e:
+        print(what, type(e).__name__, getattr(e, "errno", ""))
+t("write-cwd", lambda: open("out.txt", "w").write("hi"))
+t("read-readme", lambda: open("README").read())
+t("read-ssh", lambda: open(os.path.expanduser("~/.ssh/id_rsa")).read())
+t("read-aws", lambda: open(os.path.expanduser("~/.aws/credentials")).read())
+t("read-env", lambda: open(".env").read())
+t("read-claude", lambda: open(os.path.expanduser("~/.claude/settings.json")).read())
+t("read-testagent", lambda: open(os.path.expanduser("~/.testagent/conf")).read())
+t("write-tmpdir", lambda: open(os.path.join(os.environ["TMPDIR"], "t"), "w").write("x"))
+t("git", lambda: subprocess.run(["git", "--version"], check=True, capture_output=True))
+t("sh", lambda: subprocess.run(["sh", "-c", "true"], check=True))
+t("binsh", lambda: subprocess.run(["/bin/sh", "-c", "true"], check=True))
+t("system", lambda: (os.system("true") == 0) or 1/0)
+if len(sys.argv) > 1:
+    t("api", lambda: urllib.request.urlopen(sys.argv[1], timeout=5).read())
+for k in ("HOME", "USER", "LOGNAME", "TMPDIR", "SECRET1290", "OTHER1290"):
+    print("env", k, os.environ.get(k, "-"))
+print("path", os.environ.get("PATH"))
+print("uid", os.getuid(), os.getgid())
+PYA
+        chown "$BU" "$BH/proj/agent.py"
+        # a stand-in for a model API on the loopback, and a test profile naming it
+        python3 -m http.server 0 --bind 127.0.0.1 --directory "$BH/proj" > "$OUT/http.out" 2>&1 &
+        HPID=$!
+        for _ in $(seq 1 50); do PORT="$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$OUT/http.out" | head -1)"; [ -n "$PORT" ] && break; sleep 0.1; done
+        printf '#@ profile testapi\n#@ about a test agent\n#@ commands testagent\n#@ programs python3\nallow path ${HOME}/.testagent/\nallow host 127.0.0.1:%s\n' "$PORT" > "$OUT/testapi.profile.txt"
+        VENV="VAREK_CONFIG=$OUT/etc/varek.conf VAREK_LIB_DIR=$OUT/lib VAREK_LOG_DIR=$OUT/log"
+        vrun() {   # vrun OUTFILE [env assignments] -- varek args...: in the project, as root with sudo's variables
+            local o="$1"; shift
+            (cd "$BH/proj" && env SUDO_UID="$BUID" SUDO_GID="$BGID" SUDO_USER="$BU" $VENV "$@" > "$o" 2> "$o.err")
+        }
+        vrun "$OUT/r1.out" SECRET1290=s3cr3t-1290 OTHER1290=x python3 "$HERE/tools/varek" run --env SECRET1290 \
+            --profile "$OUT/testapi.profile.txt" -- python3 agent.py "http://127.0.0.1:$PORT/README"
+        L1="$(ls "$OUT"/log/verdicts-*.log 2>/dev/null | head -1)"
+        o() { grep -qx "$1" "$OUT/r1.out"; }
+        check "varek run with no configuration ran the agent" o "write-cwd ok"
+        check "first use: the log directory and a signing key made; no varek.conf" sh -c "[ -d '$OUT/log' ] && [ -f '$OUT/etc/log.key' ] && [ -f '$OUT/etc/log.key.pub' ] && [ ! -e '$OUT/etc/varek.conf' ]"
+        check "... and it says so" grep -q "signing key .* made on first use" "$OUT/r1.out.err"
+        check "the agent runs as the user who ran sudo" o "uid $BUID $BGID"
+        check "... and says why" grep -q "the agent runs as $BU (the user who ran sudo)" "$OUT/r1.out.err"
+        check "a file it writes in the working directory is its user's" sh -c "[ \"\$(stat -c '%u %g' '$BH/proj/out.txt')\" = '$BUID $BGID' ]"
+        check "it reads the working directory" o "read-readme ok"
+        check "~/.ssh is refused" o "read-ssh PermissionError 13"
+        check "~/.aws is refused" o "read-aws PermissionError 13"
+        check "a .env in the working directory is refused" o "read-env PermissionError 13"
+        check "a home directory no profile names is refused (~/.claude, no claude profile)" o "read-claude PermissionError 13"
+        check "the profile's own directory is read (\${HOME}/.testagent)" o "read-testagent ok"
+        check "TMPDIR is the user's /tmp/varek-<uid>, 0700, and writable" sh -c "grep -qx 'write-tmpdir ok' '$OUT/r1.out' && grep -qx 'env TMPDIR /tmp/varek-$BUID' '$OUT/r1.out' && [ \"\$(stat -c '%U %a' /tmp/varek-$BUID)\" = '$BU 700' ]"
+        check "git launches" o "git ok"
+        check "sh (by PATH) launches" o "sh ok"
+        check "/bin/sh launches" o "binsh ok"
+        check "system() (/bin/sh -c) works" o "system ok"
+        check "the profile's API host is reached" o "api ok"
+        check "HOME, USER and LOGNAME are the agent user's" sh -c "grep -qx 'env HOME $BH' '$OUT/r1.out' && grep -qx 'env USER $BU' '$OUT/r1.out' && grep -qx 'env LOGNAME $BU' '$OUT/r1.out'"
+        check "--env passes the named variable" o "env SECRET1290 s3cr3t-1290"
+        check "a variable not named is not passed" o "env OTHER1290 -"
+        check "PATH is the system's (root's own PATH not passed)" sh -c "grep '^path ' '$OUT/r1.out' | grep -qv '/root/'"
+        check "the policy is stored by its SHA-256, root's, 0644" sh -c "f=\$(ls '$OUT'/lib/policies/*.policy.txt | head -1); [ \"\$(basename \"\$f\" .policy.txt)\" = \"\$(sha256sum < \"\$f\" | cut -c1-64)\" ] && [ \"\$(stat -c '%u %a' \"\$f\")\" = '0 644' ]"
+        check "run_start records the baseline: profile, its SHA-256, cwd, home, user, tmp" \
+            rec "$L1" "r.get('event') == 'run_start' and r['baseline']['profile'] == 'testapi' and len(r['baseline']['profile_sha256']) == 64 and r['baseline']['cwd'] == '$BH/proj' and r['baseline']['home'] == '$BH' and r['baseline']['user'] == '$BU' and r['baseline']['tmp'] == '/tmp/varek-$BUID'"
+        check "run_start lists the agent environment's names: SECRET1290, not OTHER1290" \
+            rec "$L1" "r.get('event') == 'run_start' and 'SECRET1290' in r['agent_env'] and 'OTHER1290' not in r['agent_env'] and 'TMPDIR' in r['agent_env']"
+        check "the variable's value is nowhere in the stream" sh -c "! grep -q 's3cr3t-1290' '$L1'"
+        check "run_start says files are opened as the agent" rec "$L1" "r.get('event') == 'run_start' and r['open_as']['uid'] == $BUID"
+        vrun "$OUT/a.out" python3 "$HERE/tools/varek" audit
+        check "varek audit passes the run, with no configuration" grep -q "PASS" "$OUT/a.out"
+        vrun "$OUT/rf.out" python3 "$HERE/tools/varek" refusals
+        check "varek refusals reads it, with no configuration" grep -q "id_rsa" "$OUT/rf.out"
+        vrun "$OUT/rs.out" python3 "$HERE/tools/varek" runs
+        check "varek runs lists it" grep -qF "$L1" "$OUT/rs.out"
+        N1="$(ls "$OUT"/lib/policies | wc -l)"
+        vrun "$OUT/r2.out" python3 "$HERE/tools/varek" run --profile "$OUT/testapi.profile.txt" -- python3 agent.py
+        check "a second run in the same place reuses the same policy file" sh -c "[ \"\$(ls '$OUT'/lib/policies | wc -l)\" = '$N1' ]"
+        f="$(ls "$OUT"/lib/policies/*.policy.txt | head -1)"; cp "$f" "$OUT/saved"; echo "# changed" >> "$f"
+        vrun "$OUT/r3.out" python3 "$HERE/tools/varek" run --profile "$OUT/testapi.profile.txt" -- python3 agent.py
+        check "a stored policy that was changed is not reused or rewritten" sh -c "grep -q 'exists with other contents' '$OUT/r3.out.err' && tail -1 '$f' | grep -q changed"
+        cp "$OUT/saved" "$f"
+        vrun "$OUT/sp.out" python3 "$HERE/tools/varek" run --show-policy -- claude
+        check "--show-policy prints the baseline (the claude profile) and runs nothing" sh -c "grep -q '^#@ profile claude ' '$OUT/sp.out' && grep -q '^allow path $BH/.claude ' '$OUT/sp.out'"
+        vrun "$OUT/e1.out" python3 "$HERE/tools/varek" run --env NOT_SET_1290 -- python3 agent.py
+        check "--env with a variable that is not set is refused" grep -q "not set in varek's environment" "$OUT/e1.out.err"
+        vrun "$OUT/e2.out" python3 "$HERE/tools/varek" run --env 'A-B' -- python3 agent.py
+        check "--env with a bad name is refused" grep -q "not a variable name" "$OUT/e2.out.err"
+        (cd "$BH/proj" && env $VENV python3 "$HERE/tools/varek" run --show-policy -- python3 agent.py > "$OUT/n.out" 2> "$OUT/n.err")
+        check "with no sudo user, the agent is nobody" grep -q "the agent runs as nobody (no sudo user)" "$OUT/n.err"
+        (cd "$BH/proj" && env SUDO_UID=0 SUDO_USER=root $VENV python3 "$HERE/tools/varek" run --show-policy -- python3 agent.py > "$OUT/n0.out" 2> "$OUT/n0.err")
+        check "sudo from root: the agent is nobody, not root" grep -q "the agent runs as nobody" "$OUT/n0.err"
+        vrun "$OUT/rr.out" python3 "$HERE/tools/varek" run --run-as root -- python3 agent.py
+        check "--run-as root is refused with the baseline" grep -q "the agent would run as root" "$OUT/rr.out.err"
+        mv "/tmp/varek-$BUID" "$OUT/tmpkeep"; ln -s /etc "/tmp/varek-$BUID"
+        vrun "$OUT/tl.out" python3 "$HERE/tools/varek" run -- python3 agent.py
+        check "a /tmp/varek-<uid> that is a link is refused" grep -q "not a directory of $BU's with mode 0700" "$OUT/tl.out.err"
+        rm -f "/tmp/varek-$BUID"; mkdir -m 777 "/tmp/varek-$BUID"
+        vrun "$OUT/tm.out" python3 "$HERE/tools/varek" run -- python3 agent.py
+        check "a /tmp/varek-<uid> of another mode (or owner) is refused" grep -q "not a directory of $BU's with mode 0700" "$OUT/tm.out.err"
+        rmdir "/tmp/varek-$BUID"
+        (cd "$BH" && env SUDO_UID="$BUID" SUDO_GID="$BGID" SUDO_USER="$BU" $VENV python3 "$HERE/tools/varek" run -- python3 proj/agent.py > "$OUT/hd.out" 2> "$OUT/hd.err")
+        check "varek run from the home directory itself is refused" grep -q "not /, a system directory or a home directory itself" "$OUT/hd.err"
+        # a Node.js agent with the node profile
+        cat > "$BH/proj/agent.js" <<'JSA'
+const fs = require("fs"), cp = require("child_process");
+fs.writeFileSync("node-out.txt", "hi");
+console.log("node-write ok");
+try { cp.execSync("sh -c true"); console.log("node-sh ok"); } catch (e) { console.log("node-sh " + e.message); }
+try { fs.readFileSync(process.env.HOME + "/.ssh/id_rsa"); console.log("node-ssh read"); } catch (e) { console.log("node-ssh " + e.code); }
+JSA
+        chown "$BU" "$BH/proj/agent.js"
+        if command -v node >/dev/null 2>&1; then
+            vrun "$OUT/nd.out" python3 "$HERE/tools/varek" run -- node agent.js
+            check "a Node.js agent gets the node profile" grep -q "profile node (the interpreter \`node\`)" "$OUT/nd.out.err"
+            check "... writes in the working directory" grep -qx "node-write ok" "$OUT/nd.out"
+            check "... launches sh" grep -qx "node-sh ok" "$OUT/nd.out"
+            check "... and is refused ~/.ssh" grep -qx "node-ssh EACCES" "$OUT/nd.out"
+        else
+            skip "a Node.js agent (node is not installed)"
+        fi
+        kill "$HPID" 2>/dev/null
+        rm -rf "/tmp/varek-$BUID"
+    else
+        skip "varek run with the baseline (cannot add a test user here)"
     fi
 fi
 

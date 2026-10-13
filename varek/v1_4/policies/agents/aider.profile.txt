@@ -1,0 +1,9 @@
+#@ profile aider
+#@ about Aider
+#@ commands aider aider-chat
+#@ programs python3
+# A first profile, to be checked in step 6 with a dry run of the CLI.
+allow path ${HOME}/.aider                           # its history and caches (~/.aider*)
+allow path ${HOME}/.local/lib/ readonly             # packages installed for the user
+allow host api.openai.com:443
+allow host api.anthropic.com:443
