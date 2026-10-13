@@ -16,11 +16,15 @@ the Warden with the proxy on, its synthetic address; natively, <addr>):
   denied     a new connection each time, GET /denied: under the Warden in
              inspecting mode a deny rule refuses it (403); natively the
              server answers it
+  credential (v1.28) GET /cred on one kept-alive connection, with
+             "Authorization: Bearer $VAREK_CRED_BENCH": under the Warden a
+             placeholder the proxy replaces; natively the value itself
 
 Prints, for each kind, "CLASS <kind> ok=<k> fail=<k> status=<code>:<count>,..."
 and "SAMPLES <kind> <us> ..." (the timed calls, microseconds), then "END".
 """
 
+import os
 import socket
 import ssl
 import sys
@@ -66,9 +70,12 @@ def main():
         s = socket.create_connection((addr, port), 10)
         return ctx.wrap_socket(s, server_hostname=name)
 
+    auth = b"Authorization: Bearer %s\r\n" % os.environ.get("VAREK_CRED_BENCH", "").encode()
+
     def get(s, path, keep):
-        s.sendall(b"GET %s HTTP/1.1\r\nHost: %s\r\n%s\r\n" %
-                  (path, name.encode(), b"" if keep else b"Connection: close\r\n"))
+        s.sendall(b"GET %s HTTP/1.1\r\nHost: %s\r\n%s%s\r\n" %
+                  (path, name.encode(), auth if path == b"/cred" else b"",
+                   b"" if keep else b"Connection: close\r\n"))
         return read_reply(s)
 
     for kind in kinds:
@@ -77,11 +84,11 @@ def main():
         for i in range(warmup + n):
             t0 = time.perf_counter_ns()
             try:
-                if kind == "request":
+                if kind in ("request", "credential"):
                     if ka is None:
                         ka = connect()
                         t0 = time.perf_counter_ns()
-                    code = get(ka, b"/ok", True)
+                    code = get(ka, b"/ok" if kind == "request" else b"/cred", True)
                     if code != 200:
                         ka.close()
                         ka = None
@@ -91,7 +98,7 @@ def main():
                     s.close()
             except (OSError, ssl.SSLError):
                 code = 0
-                if kind == "request" and ka is not None:
+                if kind in ("request", "credential") and ka is not None:
                     ka.close()
                     ka = None
             dt = time.perf_counter_ns() - t0

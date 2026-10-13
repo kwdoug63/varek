@@ -16,8 +16,12 @@ inspecting mode, rounds alternating, and the report gives for each kind:
 
 Kinds: an HTTPS request on a new connection (connect, handshake, GET, the
 reply), a request on a kept-alive connection (the per-request cost once a
-connection is open), and a request a deny rule refuses (inspecting mode
-only; natively the server answers it).
+connection is open), a request a deny rule refuses (inspecting mode only;
+natively the server answers it), and (v1.28) a request on a kept-alive
+connection that carries a credential: natively the client sends the value,
+in inspecting mode the agent holds a placeholder and the proxy puts the
+value in (a file store, fetched by warden-secrets); the server answers 200
+only to the value.
 
 Every request's outcome is checked: allowed ones answered 200, each
 connection decided and certified, in inspecting mode each request decided and
@@ -52,6 +56,7 @@ KINDS = [
     ("https", "HTTPS request, new connection", ("native", "sni", "inspect")),
     ("request", "request on a kept-alive connection", ("native", "sni", "inspect")),
     ("denied", "request a deny rule refuses", ("native", "inspect")),
+    ("credential", "request carrying a credential", ("native", "inspect")),   # v1.28
 ]
 LABEL = {k: lab for k, lab, _ in KINDS}
 MODES = ("native", "sni", "inspect")
@@ -92,18 +97,21 @@ def parse_client(text, kinds, n):
 
 # ------------------------------------------------------------------ policy --
 
-def compose_policy(mode, port, bench_dir):
+def compose_policy(mode, port, bench_dir, cred_file=None):
     """The policy of a run under the Warden: the proxy on (SNI mode) or
     inspecting, the bench's name, in inspecting mode a request rule for
-    /ok and a deny rule for /denied, and read-only paths for Python."""
+    /ok, a deny rule for /denied and (v1.28) a rule for /cred carrying the
+    credential from cred_file, and read-only paths for Python."""
     lines = ["# varek bench --proxy: the bench's own rules only",
-             "require warden 1.26",
+             "require warden 1.28" if mode == "inspect" else "require warden 1.26",
              "proxy inspect" if mode == "inspect" else "proxy on",
              f"proxy ports {port}",
              f"allow host {NAME}:{port}"]
     if mode == "inspect":
-        lines += [f"deny request GET https://{NAME}:{port}/denied",
-                  f"allow request GET https://{NAME}:{port}/ok"]
+        lines += [f"credential bench from file:{cred_file}",
+                  f"deny request GET https://{NAME}:{port}/denied",
+                  f"allow request GET https://{NAME}:{port}/ok",
+                  f"allow request GET https://{NAME}:{port}/cred credential=bench header=Authorization:Bearer"]
     lines += [f"allow path {d} readonly" for d in ("/usr/", "/lib/", "/lib64/", "/etc/ld.so.cache",
                                                     "/etc/ssl/", "/proc/self/", f"{bench_dir}/")]
     return "\n".join(lines) + "\n"
@@ -135,10 +143,11 @@ def check_mode(mode, run, recs, calls, denied_seen):
     bad = [r for r in px if r.get("rule") != "proxy_dialed" or r.get("decision_final") != "ALLOW"
            or r.get("check") != "ok" or (r.get("inspected") is True) != (mode == "inspect")]
     want = calls * (2 if mode == "inspect" else 1)          # https (+ denied), each a connection
-    ok = not bad and want + 1 <= len(px) <= want + 1 + calls   # + the kept-alive one(s)
+    keep = 2 if mode == "inspect" else 1                    # the kept-alive one(s): request (+ credential)
+    ok = not bad and want + keep <= len(px) <= want + keep + calls
     out.append((f"{mode}: each connection decided by name, dialed and certified"
                 + (", and inspected" if mode == "inspect" else ""), ok,
-                "" if ok else f"{len(px)} connection decisions for {want + 1} connections, "
+                "" if ok else f"{len(px)} connection decisions for {want + keep} connections, "
                               f"{len(bad)} not allowed, certified and "
                               f"{'inspected' if mode == 'inspect' else 'in SNI mode'}"))
     rq = [r for r in recs if r.get("action") == "net.request"]
@@ -147,11 +156,16 @@ def check_mode(mode, run, recs, calls, denied_seen):
                    and r.get("check") == "ok" and r.get("target", "").endswith("/ok")]
         refused = [r for r in rq if r.get("rule") == "policy_match" and r.get("decision_final") == "DENY"
                    and r.get("target", "").endswith("/denied")]
-        ok = len(allowed) == 2 * calls and len(refused) == calls and len(rq) == 3 * calls
+        cred = [r for r in rq if r.get("rule") == "request_allowed" and r.get("decision_final") == "ALLOW"
+                and r.get("check") == "ok" and r.get("target", "").endswith("/cred")
+                and r.get("credential") == "bench" and r.get("credential_header") == "Authorization"]
+        ok = len(allowed) == 2 * calls and len(refused) == calls and len(cred) == calls and len(rq) == 4 * calls
         out.append(("inspect: each request decided: the allowed ones certified, the denied ones by "
-                    "the deny rule", ok,
+                    "the deny rule, the credential's carrying it", ok,
                     "" if ok else f"{len(allowed)} allowed and certified, {len(refused)} denied, "
-                                  f"of {len(rq)} for {3 * calls} requests"))
+                                  f"{len(cred)} with the credential, of {len(rq)} for {4 * calls} requests"))
+        sw = [r for r in recs if r.get("event") == "credential_refused"]
+        out.append(("inspect: no swap refused", not sw, "" if not sw else f"{len(sw)} credential_refused"))
         out.append(("inspect: the server never saw a denied request", denied_seen == 0,
                     "" if denied_seen == 0 else f"it saw {denied_seen}"))
     else:
@@ -227,7 +241,10 @@ class _Server:
 
     REPLY = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n%s\r\nok"
 
-    def __init__(self, addr, cert, key):
+    REFUSE = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n%s\r\nno"
+
+    def __init__(self, addr, cert, key, cred=b""):
+        self.cred = b"authorization: bearer " + cred.lower()      # v1.28: what /cred must carry
         self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.ctx.load_cert_chain(cert, key)
         self.l = socket.socket()
@@ -269,7 +286,9 @@ class _Server:
                 with self.lock:
                     self.seen[path] = self.seen.get(path, 0) + 1
                 close = any(ln.lower() == b"connection: close" for ln in lines[1:])
-                c.sendall(self.REPLY % (b"Connection: close\r\n" if close else b""))
+                good = path != "/cred" or [ln.lower() for ln in lines[1:]
+                                           if ln.lower().startswith(b"authorization:")] == [self.cred]
+                c.sendall((self.REPLY if good else self.REFUSE) % (b"Connection: close\r\n" if close else b""))
                 if close:
                     return
         except (OSError, ssl.SSLError):
@@ -301,6 +320,8 @@ def run(warden, checker, *, n=200, warmup=20, rounds=3, run_as="nobody", sign_ke
     for path, what, fix in ((warden, "Warden", "build the runtime: `make`"),
                             (os.path.join(os.path.dirname(warden), "warden-proxy"), "warden-proxy",
                              "build it: `make warden-proxy`"),
+                            (os.path.join(os.path.dirname(warden), "warden-secrets"), "warden-secrets",
+                             "build it: `make warden-secrets`"),
                             (checker, "certificate checker", "build it: `make tools/vdp_cert_check`")):
         if not os.access(path, os.X_OK):
             raise vb.BenchError(f"no {what} at {path}", fix=fix)
@@ -320,19 +341,26 @@ def run(warden, checker, *, n=200, warmup=20, rounds=3, run_as="nobody", sign_ke
         cert, key = _make_cert(priv)
         shutil.copyfile(cert, os.path.join(d, "server.pem"))
         os.chmod(os.path.join(d, "server.pem"), 0o644)
+        # v1.28: the credential, a file store root's alone (the policy lets
+        # the agent open nothing in priv)
+        cred = os.urandom(24).hex().encode()
+        cred_file = os.path.join(priv, "credential.key")
+        fd = os.open(cred_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(fd, cred + b"\n")
+        os.close(fd)
         dns = _Dns(addr)
-        server = _Server(addr, cert, key)
+        server = _Server(addr, cert, key, cred)
         policies = {}
         for mode in ("sni", "inspect"):
             policies[mode] = os.path.join(priv, f"{mode}.policy.txt")
             with open(policies[mode], "w") as fh:
-                fh.write(compose_policy(mode, server.port, d))
+                fh.write(compose_policy(mode, server.port, d, cred_file))
             os.chmod(policies[mode], 0o644)
         calls = n + warmup
         samples = {m: {k: [] for k, _, _ in KINDS} for m in MODES}
         round_p50 = {m: {k: [] for k, _, _ in KINDS} for m in MODES}
         conn_us = {m: [] for m in ("sni", "inspect")}
-        req_us = {"request": [], "denied": []}
+        req_us = {"request": [], "denied": [], "credential": []}
         checks, run_start = [], None
         audit = os.path.join(here, "varek_audit.py")
         for rnd in range(rounds):
@@ -344,8 +372,10 @@ def run(warden, checker, *, n=200, warmup=20, rounds=3, run_as="nobody", sign_ke
                          "default" if mode == "inspect" else os.path.join(d, "server.pem"),
                          str(n), str(warmup)] + kinds
                 if mode == "native":
+                    # natively the client holds the value itself
                     r = subprocess.run(cargs, capture_output=True, text=True, timeout=RUN_TIMEOUT,
-                                       user=uid, group=gid, extra_groups=[])
+                                       user=uid, group=gid, extra_groups=[],
+                                       env=dict(os.environ, VAREK_CRED_BENCH=cred.decode()))
                     if r.returncode != 0:
                         raise vb.BenchError("the client failed natively: " + r.stderr.strip()[-300:])
                     out = parse_client(r.stdout, kinds, n)
@@ -387,10 +417,12 @@ def run(warden, checker, *, n=200, warmup=20, rounds=3, run_as="nobody", sign_ke
                     conn_us[mode] += [x["latency_us"] for x in px[warmup:]]
                     if mode == "inspect":
                         rq = [x for x in recs if x.get("action") == "net.request" and "latency_us" in x]
-                        ka = [x for x in rq if x.get("request_seq", 0) > 1]
+                        ka = [x for x in rq if x.get("request_seq", 0) > 1 and not x.get("credential")]
                         dn = [x for x in rq if x.get("rule") == "policy_match"]
+                        cr = [x for x in rq if x.get("request_seq", 0) > 1 and x.get("credential")]
                         req_us["request"] += [x["latency_us"] for x in ka[warmup:]]
                         req_us["denied"] += [x["latency_us"] for x in dn[warmup:]]
+                        req_us["credential"] += [x["latency_us"] for x in cr[warmup:]]
                 for k in kinds:
                     samples[mode][k] += out["samples"][k]
                     round_p50[mode][k].append(vb.stats(out["samples"][k])["p50"])
@@ -420,7 +452,8 @@ def run(warden, checker, *, n=200, warmup=20, rounds=3, run_as="nobody", sign_ke
             "warden_us": {"connection_sni": vb.stats(conn_us["sni"]),
                           "connection_inspect": vb.stats(conn_us["inspect"]),
                           "request_allowed": vb.stats(req_us["request"]),
-                          "request_denied": vb.stats(req_us["denied"])},
+                          "request_denied": vb.stats(req_us["denied"]),
+                          "request_credential": vb.stats(req_us["credential"])},
             "checks": [{"check": c, "ok": ok, "detail": det} for c, ok, det in checks],
             "ok": all(ok for _, ok, _ in checks),
             "kept": [d, priv] if keep else None,
@@ -475,8 +508,10 @@ def format_report(res, cli_version=""):
     for key, label in (("connection_sni", "a connection decided and dialed, SNI mode"),
                        ("connection_inspect", "a connection decided and dialed, inspecting"),
                        ("request_allowed", "a request decided and certified"),
-                       ("request_denied", "a request refused by a deny rule")):
-        L.append(f"    {label:46} {f(w[key].get('p50')):>6} {f(w[key].get('p99')):>6}")
+                       ("request_denied", "a request refused by a deny rule"),
+                       ("request_credential", "a request carrying a credential (v1.28)")):
+        if key in w:
+            L.append(f"    {label:46} {f(w[key].get('p50')):>6} {f(w[key].get('p99')):>6}")
     L.append("")
     failed = [c for c in res["checks"] if not c["ok"]]
     if failed:
@@ -485,7 +520,8 @@ def format_report(res, cli_version=""):
             L.append(f"    FAIL  {c['check']}: {c['detail']}")
     else:
         L.append(f"  Verdicts  all {len(res['checks'])} checks passed: every allowed request was answered and")
-        L.append("            certified, every denied one refused by the proxy and never sent, and the audit")
+        L.append("            certified, every denied one refused by the proxy and never sent, every one")
+        L.append("            with a credential answered by the server only to its value, and the audit")
         L.append("            accepted every stream.")
     L.append("")
     L.append("  Notes")
@@ -494,6 +530,9 @@ def format_report(res, cli_version=""):
     L.append("    the request's own decision is added.")
     L.append("  - Natively the denied request is answered by the server; under the Warden it is")
     L.append("    refused before a byte of it is sent, so its row is not a like-for-like cost.")
+    L.append("  - The credential's row is a kept-alive request like the row above it, carrying a header;")
+    L.append("    in inspecting mode the proxy puts the value in place of the agent's placeholder, so the")
+    L.append("    difference between the two rows' added times is the cost of the swap.")
     L.append("  - The server is on this host: a real server's network time is not in these numbers,")
     L.append("    so the share the proxy adds to a real request is smaller.")
     return "\n".join(L) + "\n"

@@ -69,9 +69,9 @@ def test_parse_client_rejects_incomplete_output():
 
 
 def test_kinds_per_mode():
-    assert bp.kinds_for("native") == ["https", "request", "denied"]
+    assert bp.kinds_for("native") == ["https", "request", "denied", "credential"]
     assert bp.kinds_for("sni") == ["https", "request"]
-    assert bp.kinds_for("inspect") == ["https", "request", "denied"]
+    assert bp.kinds_for("inspect") == ["https", "request", "denied", "credential"]
 
 
 # ------------------------------------------------------------------ policy --
@@ -85,13 +85,18 @@ def test_policies_name_the_mode_and_the_request_rules():
     assert insp.index("deny request GET https://bench.example.com:4433/denied") < \
         insp.index("allow request GET https://bench.example.com:4433/ok")
     assert "allow path /tmp/x/ readonly" in insp
+    # v1.28: the credential, and the rule that carries it, in inspecting mode only
+    insp = bp.compose_policy("inspect", 4433, "/tmp/x", "/run/b/credential.key")
+    assert "require warden 1.28\n" in insp and "credential bench from file:/run/b/credential.key\n" in insp
+    assert "allow request GET https://bench.example.com:4433/cred credential=bench header=Authorization:Bearer" in insp
+    assert "credential" not in sni
 
 
 @pytest.mark.skipif(not os.access(CERT, os.X_OK), reason="needs tools/vdp_cert_check")
 def test_policies_parse_as_the_warden_reads_them(tmp_path):
     for mode, want in (("sni", "on"), ("inspect", "inspect")):
         p = tmp_path / f"{mode}.policy"
-        p.write_text(bp.compose_policy(mode, 4433, str(tmp_path)))
+        p.write_text(bp.compose_policy(mode, 4433, str(tmp_path), "/run/varek-bench/credential.key"))
         r = subprocess.run([CERT, str(p), "proxy"], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
         assert r.stdout.split()[:2] == [want, "4433"]
@@ -99,9 +104,9 @@ def test_policies_parse_as_the_warden_reads_them(tmp_path):
 
 # ------------------------------------------------------------------ checks --
 
-def recs_for(mode, calls, ka_conns=1):
+def recs_for(mode, calls, ka_conns=None):
     insp = mode == "inspect"
-    conns = calls * (2 if insp else 1) + ka_conns
+    conns = calls * (2 if insp else 1) + (ka_conns or (2 if insp else 1))
     recs = [{"action": "net.proxy", "rule": "proxy_dialed", "decision_final": "ALLOW", "check": "ok",
              "latency_us": 100, **({"inspected": True} if insp else {})} for _ in range(conns)]
     if insp:
@@ -109,6 +114,9 @@ def recs_for(mode, calls, ka_conns=1):
                   "target": "GET https://bench.example.com:1/ok", "latency_us": 3} for _ in range(2 * calls)]
         recs += [{"action": "net.request", "rule": "policy_match", "decision_final": "DENY",
                   "target": "GET https://bench.example.com:1/denied", "latency_us": 5} for _ in range(calls)]
+        recs += [{"action": "net.request", "rule": "request_allowed", "decision_final": "ALLOW", "check": "ok",
+                  "target": "GET https://bench.example.com:1/cred", "credential": "bench",
+                  "credential_header": "Authorization", "latency_us": 3} for _ in range(calls)]
     return recs
 
 
@@ -231,3 +239,13 @@ def test_bench_proxy_end_to_end(tmp_path):
     # a delayed-ACK stall (about 40 ms before quick ACKs during the handshake)
     assert res["kinds"]["https"]["added_p50_us"]["inspect"] < 30000
     assert "VAREK bench --proxy" in r.stdout
+
+
+def test_checks_fail_on_a_credential_not_carried_or_a_swap_refused():
+    # v1.28: each /cred request records the credential; no swap is refused
+    recs = recs_for("inspect", 5)
+    del next(r for r in recs if r.get("credential"))["credential"]
+    assert any(not ok for _, ok, _ in bp.check_mode("inspect", run_for("inspect", 5), recs, 5, 0))
+    recs = recs_for("inspect", 5) + [{"event": "credential_refused", "credential": "bench"}]
+    assert [c for c, ok, _ in bp.check_mode("inspect", run_for("inspect", 5), recs, 5, 0) if not ok] == \
+        ["inspect: no swap refused"]

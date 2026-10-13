@@ -10,7 +10,8 @@ over HTTPS with a CA made for the test; the metadata service over HTTP.
 
 writes DIR/ca.pem, then serves and writes DIR/ports ("HTTPS_PORT IMDS_PORT")
 when ready; each request it answers is logged to DIR/requests.log (method,
-path, and for Vault whether the token matched; never a value).
+path, and for Vault whether the token matched; never a value). Its
+certificates last V1280_CERT_HOURS (default 2); tests/soak_v1280 sets it.
 """
 import datetime
 import hashlib
@@ -28,12 +29,13 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 D = sys.argv[1]
+CERT_HOURS = float(os.environ.get("V1280_CERT_HOURS", "2"))     # the soak needs longer
 VAULT_TOKEN = "s.test-token-v1280"
 AWS_ID, AWS_SECRET = "AKIDV1280TEST", "v1280-test-secret-key/abc"
 ROLE_ID, ROLE_SECRET, ROLE_TOKEN = "ASIAROLEV1280", "role-secret-v1280", "role-session-token-v1280"
 VALUES = {                                     # what each store holds (test values, not secrets)
     "vault2": "vault-kv2-value-7f3a", "vault1": "vault-kv1-value-91c2", "lease": "db-password-5d8e",
-    "short": "db-short-6b1f", "stuck": "db-stuck-0c4a", "aws": "aws-sm-value-c4b1",
+    "short": "db-short-6b1f", "stuck": "db-stuck-0c4a", "soak": "db-soak-3e9d", "aws": "aws-sm-value-c4b1",
 }
 LOG = open(os.path.join(D, "requests.log"), "a", buffering=1)
 
@@ -44,7 +46,7 @@ def make_tls():
     cn = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "v1280 test CA")])
     ca = (x509.CertificateBuilder().subject_name(cn).issuer_name(cn).public_key(ck.public_key())
           .serial_number(x509.random_serial_number()).not_valid_before(now - datetime.timedelta(minutes=5))
-          .not_valid_after(now + datetime.timedelta(hours=2))
+          .not_valid_after(now + datetime.timedelta(hours=CERT_HOURS))
           .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
           .sign(ck, hashes.SHA256()))
     sk = ec.generate_private_key(ec.SECP256R1())
@@ -52,7 +54,7 @@ def make_tls():
     leaf = (x509.CertificateBuilder()
             .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
             .issuer_name(cn).public_key(sk.public_key()).serial_number(x509.random_serial_number())
-            .not_valid_before(now - datetime.timedelta(minutes=5)).not_valid_after(now + datetime.timedelta(hours=2))
+            .not_valid_before(now - datetime.timedelta(minutes=5)).not_valid_after(now + datetime.timedelta(hours=CERT_HOURS))
             .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost"),
                                                         x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
                            critical=False)
@@ -129,6 +131,9 @@ class Stores(http.server.BaseHTTPRequestHandler):
             if p == "/v1/database/creds/short":                       # v1.28 step 4: renewed at 2 s
                 return self.send(200, {"lease_id": "database/creds/short/Rn7", "lease_duration": 3,
                                        "renewable": True, "data": {"password": VALUES["short"], "username": "u"}})
+            if p == "/v1/database/creds/soak":                        # the soak (tests/soak_v1280): 60 s
+                return self.send(200, {"lease_id": "database/creds/soak/Sk1", "lease_duration": 60,
+                                       "renewable": True, "data": {"password": VALUES["soak"], "username": "u"}})
             if p == "/v1/database/creds/stuck":                       # its renewal is refused
                 return self.send(200, {"lease_id": "database/creds/stuck/Fx2", "lease_duration": 3,
                                        "renewable": True, "data": {"password": VALUES["stuck"], "username": "u"}})
@@ -167,7 +172,8 @@ class Stores(http.server.BaseHTTPRequestHandler):
                 return self.send(204, b"")
             if lid.endswith("/Fx2"):
                 return self.send(400, {"errors": ["lease is not renewable"]})
-            return self.send(200, {"lease_id": lid, "lease_duration": 3, "renewable": True, "data": None})
+            ttl = 60 if lid.endswith("/Sk1") else 3
+            return self.send(200, {"lease_id": lid, "lease_duration": ttl, "renewable": True, "data": None})
         if self.path == "/latest/api/token" and self.headers.get("X-aws-ec2-metadata-token-ttl-seconds"):
             LOG.write("imds PUT token\n")
             b = b"imds-token-v1280"
