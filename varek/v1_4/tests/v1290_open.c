@@ -18,6 +18,11 @@
 //     link PATH (a hard link of PATH to PATH.l),
 //     rename OLD:NEW, exchange A:B (renameat2 RENAME_EXCHANGE),
 //     unlinkat DIR:NAME (relative to a descriptor on DIR)
+//   v1.29 step 6:
+//     rstat PATH, rlstat PATH   the raw stat(2) and lstat(2), as musl calls them
+//                               ("rstat ok" or "rstat ERR")
+//     admits FILE               the calls admitted under 1.29, each "NAME ok" or
+//                               "NAME ERR" (FILE: a file it may read)
 //   ERR is strerror's text of the call's errno.
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -27,8 +32,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <linux/capability.h>
+#include <sys/file.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static void res(const char *op, int r) {
@@ -96,6 +109,39 @@ int main(int argc, char **argv) {
                 close(d);
             }
             continue;
+        } else if (!strcmp(op, "rstat") || !strcmp(op, "rlstat")) {
+            res(op, (int)syscall(op[1] == 's' ? SYS_stat : SYS_lstat, path, &st));
+            continue;
+        } else if (!strcmp(op, "admits")) {
+            struct rusage ru;
+            struct statfs sf;
+            struct itimerval it;
+            struct __user_cap_header_struct ch = { _LINUX_CAPABILITY_VERSION_3, 0 };
+            struct __user_cap_data_struct cd[2];
+            char nm[16];
+            fd = open(path, O_RDONLY | O_CLOEXEC);
+            res("getrusage", getrusage(RUSAGE_SELF, &ru));
+            res("getpgrp", getpgrp() < 0 ? -1 : 0);
+            res("setpgid", setpgid(0, 0));
+            res("getsid", getsid(0) < 0 ? -1 : 0);
+            res("capget", (int)syscall(SYS_capget, &ch, cd));
+            res("fadvise64", (errno = posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) ? -1 : 0);
+            res("flock", flock(fd, LOCK_SH));
+            res("fstatfs", fstatfs(fd, &sf));
+            res("getitimer", getitimer(ITIMER_REAL, &it));
+            errno = 0; alarm(0); res("alarm", errno ? -1 : 0);
+            errno = 0; mode_t old = umask(077); res("umask", errno ? -1 : 0); umask(old);
+            res("prctl_set_name", prctl(PR_SET_NAME, "v1290", 0, 0, 0));
+            res("prctl_get_name", prctl(PR_GET_NAME, nm, 0, 0, 0));
+            res("prctl_set_dumpable", prctl(PR_SET_DUMPABLE, 0, 0, 0, 0));      /* refused */
+            int pfd = (int)syscall(SYS_pidfd_open, getpid(), 0);
+            res("pidfd_open", pfd < 0 ? -1 : 0);
+            pid_t c = fork();
+            if (c == 0) _exit(setsid() < 0 ? 1 : 0);
+            int ws = 0;
+            waitpid(c, &ws, 0);
+            printf("setsid %s\n", WIFEXITED(ws) && WEXITSTATUS(ws) == 0 ? "ok" : "refused");
+            if (pfd >= 0) close(pfd);
         } else {
             printf("%s: unknown\n", op);
             continue;

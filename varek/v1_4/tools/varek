@@ -1522,7 +1522,7 @@ def cmd_refusals(args):
         info(f"The run was revoked at {when} ({how}): every call after it was refused.\n")
     if s["dry"]:                                                                    # v1.29
         info(_paint("1;33", f"DRY RUN, NOT ENFORCING: {s['not_enforced']} call(s) the policy refuses were let "
-                            "through (listed as WOULD REFUSE); calls refused all the same are listed as "
+                            "through (listed as WOULD_REFUSE); calls refused all the same are listed as "
                             "refused.") + "\n")
     if args.enforced or args.not_enforced:                                          # v1.29: filters
         keep = (lambda r: r.get("enforced") is not False) if args.enforced else (lambda r: r.get("enforced") is False)

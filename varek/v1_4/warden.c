@@ -728,6 +728,11 @@ static int read_all(int fd, void *buf, size_t len) {
 /* ---------------- Semantic Derivation ---------------- */
 
 static int change_derive(const struct seccomp_notif *req, struct action *out);   /* v1.29 */
+/* v1.29: the policy says `require warden 1.29`, so the filter sends the
+ * changes by name and stat/lstat here. Otherwise (a dry run of an earlier
+ * policy sends every unlisted call) they are derived as other calls, recorded
+ * syscall_not_admitted, as enforcing refuses them. */
+static bool g_changes_on;
 static const char *change_op_name(int op);
 static int derive_intent(const struct seccomp_notif *req,
                          struct action *out)
@@ -736,7 +741,7 @@ static int derive_intent(const struct seccomp_notif *req,
     out->policy_line = -1;
     int nr = (int)req->data.nr;
     /* v1.29: the changes by name (warden_change.inc.c) */
-    int cr = change_derive(req, out);
+    int cr = g_changes_on ? change_derive(req, out) : 0;
     if (cr) return cr < 0 ? -1 : 0;
 
     if (nr == __NR_openat) {
@@ -929,6 +934,27 @@ static int derive_intent(const struct seccomp_notif *req,
      * existed, its size and owner, and read where any link (including the
      * Warden's own /proc/<pid>/fd entries) pointed, with no record. They are
      * now decided like a read-only open of the same object. */
+    /* v1.29 (step 6): under `require warden 1.29` the legacy stat(2) and
+     * lstat(2) come here too (the filter sends them only then): musl calls
+     * them, and with them a statically linked agent (the Codex CLI) looked
+     * nothing up. Each is newfstatat(AT_FDCWD, path, buf, 0 or
+     * AT_SYMLINK_NOFOLLOW), answered with the same struct stat. */
+    if (g_changes_on && (nr == __NR_stat || nr == __NR_lstat)) {
+        out->kind = ACT_FILE_STAT;
+        out->meta_nr = __NR_newfstatat;
+        out->open_dirfd = VAREK_AT_FDCWD;
+        out->out_addr = req->data.args[1];
+        out->at_flags = nr == __NR_lstat ? AT_SYMLINK_NOFOLLOW : 0;
+        if (req->data.args[0] == 0) {
+            out->path_null = true;
+            out->target[0] = '\0';
+        } else if (xproc_read_str(req->pid, req->data.args[0], out->target, sizeof(out->target)) < 0) {
+            return -1;
+        }
+        out->open_flags = O_RDONLY;
+        out->flags_known = true;
+        return 0;
+    }
     if (nr == __NR_newfstatat || nr == __NR_statx || nr == __NR_access ||
         nr == __NR_faccessat || nr == __NR_faccessat2 ||
         nr == __NR_readlink || nr == __NR_readlinkat) {
@@ -3166,7 +3192,12 @@ static int meta_on_held_fd(pid_t tid, int notify_fd, uint64_t id, const struct a
  * to the first name that does not exist: that is where the kernel's lookup
  * stops with ENOENT. 0 with *pfd (its directory) and name, or -1. */
 static const struct policy *g_exec_policy;   /* set with launches decided (warden_exec.inc.c) */
-static int meta_first_missing(int base, const char *path, int *pfd, char *name, size_t nn) {
+/* v1.29 (step 6): rest, when given, gets the names after the missing one,
+ * joined by single slashes, or stays empty if one of them is "." or "..",
+ * where the name the kernel would reach is not the path written. */
+static int meta_first_missing(int base, const char *path, int *pfd, char *name, size_t nn,
+                              char *rest, size_t rn) {
+    if (rest && rn) rest[0] = '\0';
     int cur = path[0] == '/' ? open("/", O_PATH | O_DIRECTORY | O_CLOEXEC) : dup(base);
     if (cur < 0) return -1;
     char buf[PATH_LIMIT];
@@ -3181,6 +3212,17 @@ static int meta_first_missing(int base, const char *path, int *pfd, char *name, 
                 fstatat(cur, c, &st, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT) {
                 snprintf(name, nn, "%s", c);
                 *pfd = cur;
+                if (rest && rn) {
+                    size_t k = 0;
+                    bool ok = true;
+                    for (char *d = strtok_r(NULL, "/", &save); d && ok; d = strtok_r(NULL, "/", &save)) {
+                        if (!strcmp(d, ".") || !strcmp(d, "..")) { ok = false; break; }
+                        int w = snprintf(rest + k, rn - k, "%s%s", k ? "/" : "", d);
+                        if (w < 0 || (size_t)w >= rn - k) { ok = false; break; }
+                        k += (size_t)w;
+                    }
+                    if (!ok) rest[0] = '\0';
+                }
                 return 0;
             }
             break;                         /* a dangling link, a refusal: fail closed */
@@ -3252,10 +3294,17 @@ static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *mi
     /* the parent is missing too: fail closed, as before 1.27; with launches
      * decided (a coding agent's compiler looks up include directories under
      * missing ones), decide on where the kernel's lookup stops */
+    char tail[PATH_LIMIT] = "";
     if (pfd < 0 && errno == ENOENT && g_exec_policy && g_exec_policy->v.launches) {
         static char nm[256];
         int q = -1;
-        if (meta_first_missing(base, path, &q, nm, sizeof nm) == 0) { pfd = q; name = nm; }
+        /* v1.29 (step 6): under `require warden 1.29`, decided on the whole
+         * name asked for (~/.config/git/config, ~/.config missing), not on
+         * the first missing directory: the answer is ENOENT either way,
+         * and where the policy allows that name nothing outside it is told */
+        if (meta_first_missing(base, path, &q, nm, sizeof nm, g_changes_on ? tail : NULL, sizeof tail) == 0) {
+            pfd = q; name = nm;
+        }
     }
     close(base);
     if (pfd < 0) return -1;
@@ -3273,8 +3322,8 @@ static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *mi
     int rc = -1;
     if (fd_canonical_path(pfd, parent, sizeof(parent)) == 0 &&
         check_proc_object(pfd, tid, &tgid, parent, sizeof(parent)) == 0) {
-        int n = snprintf(a->resolved, sizeof(a->resolved), "%s%s%s",
-                         parent, strcmp(parent, "/") ? "/" : "", name);
+        int n = snprintf(a->resolved, sizeof(a->resolved), "%s%s%s%s%s",
+                         parent, strcmp(parent, "/") ? "/" : "", name, tail[0] ? "/" : "", tail);
         if (n > 0 && (size_t)n < sizeof(a->resolved)) { *missing = e; rc = 0; }
         else a->resolved[0] = '\0';
     }
@@ -5516,6 +5565,7 @@ int main(int argc, char **argv) {
         }
     }
     /* v1.29 step 1: files opened as the agent (require warden 1.29) */
+    g_changes_on = p.v.open_as_agent;                                /* v1.29 */
     if (as_agent_setup(p.v.open_as_agent, ra.drop, ra.uid, ra.gid, run_as_arg ? run_as_arg : "nobody") < 0)
         return 1;
     /* v1.28.1 step 3: sub-agents need cgroup v2 (a check makes no group) */

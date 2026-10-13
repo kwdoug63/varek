@@ -41,8 +41,26 @@ BASE_PROGRAMS = [
     "zcat", "bzip2", "xz", "unzip", "zip", "git", "rg", "fd", "jq", "make", "less", "more",
 ]
 
+# v1.29 step 6: the certificate authorities, read-only, before the key
+# patterns below refuse every *.pem: several systems keep the bundle as one
+# (/etc/ssl/cert.pem, /etc/pki/tls/cert.pem), and refused there TLS fails.
+# These directories hold public certificates (private keys are under
+# /etc/ssl/private/, refused).
+TRUST_READS = [
+    ("allow path exact /etc/ssl/cert.pem readonly", "the CA bundle (BSD, macOS, Alpine, Fedora)"),
+    ("allow path exact /etc/ssl/ca-bundle.pem readonly", "(openSUSE)"),
+    ("allow path exact /etc/pki/tls/cert.pem readonly", "(RHEL, Amazon Linux)"),
+    ("allow path /etc/ssl/certs/ readonly", "public certificates"),
+    ("allow path /etc/pki/tls/certs/ readonly", ""),
+    ("allow path /etc/pki/ca-trust/extracted/ readonly", ""),
+    ("allow path exact /usr/local/ssl/cert.pem readonly", "OpenSSL's built-in default (static builds)"),
+    ("allow path /usr/local/ssl/certs/ readonly", ""),
+    ("allow path glob /**/certifi/cacert.pem readonly", "Python's certifi bundle (requests, httpx)"),
+]
+
 # Credential stores and keys, refused wherever they appear (first in the
-# file: no later rule reaches them). The key patterns are the packs' own.
+# file after the trust store: no later rule reaches them). The key patterns
+# are the packs' own.
 CREDENTIAL_DENIES = [
     ("deny  path contains /.ssh/", "SSH keys and configuration"),
     ("deny  path contains /.aws/", "AWS credentials"),
@@ -85,6 +103,17 @@ SYSTEM_READS = [
     ("allow path exact /proc/meminfo readonly", ""),
     ("allow path exact /proc/stat readonly", ""),
     ("allow path /sys/devices/system/cpu/ readonly", "CPU count and topology"),
+    # v1.29 step 6: what language runtimes (Node.js, Bun, Python, Go, Rust)
+    # read about the machine at startup
+    ("allow path /sys/devices/system/node/ readonly", "NUMA nodes"),
+    ("allow path /sys/fs/cgroup/ readonly", "the CPU and memory limits of the control group"),
+    ("allow path /sys/kernel/mm/transparent_hugepage/ readonly", ""),
+    ("allow path exact /proc/sys/vm/overcommit_memory readonly", ""),
+    ("allow path exact /proc/sys/vm/mmap_min_addr readonly", ""),
+    ("allow path exact /proc/sys/crypto/fips_enabled readonly", "OpenSSL's FIPS check"),
+    ("allow path exact /proc/version readonly", ""), ("allow path exact /proc/version_signature readonly", ""),
+    ("allow path exact /proc/filesystems readonly", ""), ("allow path exact /proc/uptime readonly", ""),
+    ("allow path exact /proc/loadavg readonly", ""),
     ("allow path exact /dev/null", ""), ("allow path exact /dev/zero readonly", ""),
     ("allow path exact /dev/urandom readonly", ""), ("allow path exact /dev/random readonly", ""),
     ("allow path exact /dev/tty", "an interactive agent's terminal"),
@@ -328,6 +357,10 @@ def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH):
     L.append("# with `varek run --policy FILE` (a dry run first: `--dry-run`).")
     L.append("require warden 1.29")
     L.append("")
+    L.append("# --- the certificate authorities (public), read-only, before the key patterns ---")
+    for r, c in TRUST_READS:
+        L.append(f"{r:<52} # {c}" if c else r)
+    L.append("")
     L.append("# --- credential stores and keys, refused wherever they are ---")
     for r, c in CREDENTIAL_DENIES:
         L.append(f"{r:<52} # {c}" if c else r)
@@ -360,6 +393,17 @@ def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH):
                 progs.append(r)
     for r in progs:
         L.append(f"allow exec {r}")
+    # v1.29 step 6: git runs its helpers (git-remote-https for a clone or
+    # fetch over HTTPS) from its own directory
+    for d in ("/usr/lib/git-core/", "/usr/libexec/git-core/"):
+        if os.path.isdir(d) and _root_only(d.rstrip("/")) and any(r.endswith("/git") for r in progs):
+            L.append(f"allow exec prefix {d}")
+    # v1.29 step 6: the directory of the agent's own command, when its PATH
+    # gains it (agent_path: an install in ~/.local/bin), read-only, so a
+    # lookup there is answered (a missing name ENOENT, not EACCES)
+    for d in path.split(":"):
+        if d and d not in SYSTEM_PATH.split(":") and d.startswith("/"):
+            L.append(f"allow path {d.rstrip('/')}/ readonly")
     if profile:
         L.append("")
         L.append(f"# --- profile {profile['name']}: {profile['about']} ---")

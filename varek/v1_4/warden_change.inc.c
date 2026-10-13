@@ -404,6 +404,35 @@ static void change_handle(int notify_fd, const struct seccomp_notif *req, struct
         change_close(&x);
         return;
     }
+    /* v1.29 (step 6): a mkdir of a name that is there is answered EEXIST, as
+     * the kernel would, where the agent may look the name up: the policy
+     * allows reading it, or it is a directory the policy leads to. A
+     * recursive mkdir walks the names above what it makes (Bun's from the
+     * home directory, Python's from the working directory), and refused
+     * there with EACCES it stops. Nothing changes; the record says it was
+     * decided as a lookup (flags 0x0). */
+    if (a->chg_op == CHG_MKDIR && !x.agent_err) {
+        struct stat es;
+        if (fstatat(x.fd, x.name, &es, AT_SYMLINK_NOFOLLOW) == 0) {
+            int saved = a->open_flags;
+            const char *erule = NULL;
+            decision_t eraw = DEC_UNKNOWN;
+            a->open_flags = O_RDONLY;
+            if (S_ISDIR(es.st_mode) && is_ancestor(a->resolved) && !ancestor_denied(p, a->resolved)) {
+                erule = "mkdir_exists_ancestor";
+                eraw = DEC_ALLOW;
+            } else if (!change_decide(p, a, &eraw)) {
+                erule = "mkdir_exists";
+            }
+            if (erule) {
+                change_close(&x);
+                emit_pathology(g_report_seq++, pid, a, eraw, DEC_ALLOW, erule, change_lat(t0), EEXIST);
+                send_errno(notify_fd, req->id, EEXIST);
+                return;
+            }
+            a->open_flags = saved;
+        }
+    }
     /* a rename: the new name, and never a directory */
     struct action b;
     if (a->chg_op == CHG_RENAME_FROM) {

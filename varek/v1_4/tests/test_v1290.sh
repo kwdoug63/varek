@@ -239,9 +239,16 @@ done
 if python3 "$HERE/tools/smt_crosscheck.py" --vdp "$VDP" --cert "$CERT" --queries 2 "$OUT/gen/claude.txt" > "$OUT/cc.out" 2>&1; then
     pass "the cross-check: the three parsers agree on the claude baseline"
 else flunk "the cross-check: the three parsers agree on the claude baseline ($(tail -1 "$OUT/cc.out"))"; fi
-check "the credential stores come before any allow rule" sh -c "awk '/^allow /{a=NR} /contains \\/\\.ssh\\//{d=NR} END{exit !(d && (!a || d < a))}' '$OUT/gen/none.txt' && [ \"\$(grep -n '^allow ' '$OUT/gen/none.txt' | head -1 | cut -d: -f1)\" -gt \"\$(grep -n '^deny ' '$OUT/gen/none.txt' | tail -1 | cut -d: -f1)\" ]"
+# v1.29 step 6: but for the certificate authorities' bundles (read-only), which a key pattern (*.pem) would refuse
+check "the credential stores come before any allow rule but the CA bundles'" python3 -c "
+import sys
+L = [l.split('#')[0].strip() for l in open('$OUT/gen/none.txt')]
+last_deny = max(k for k, l in enumerate(L) if l.startswith('deny '))
+early = [l for l in L[:last_deny] if l.startswith('allow ')]
+ok = all(l.endswith(' readonly') and any(s in l for s in ('/etc/ssl/', '/etc/pki/', '/usr/local/ssl/', '/certifi/')) for l in early)
+sys.exit(0 if early and ok and any('contains /.ssh/' in l for l in L[:last_deny + 1]) else 1)"
 check "the header says what the baseline was made for" sh -c "head -6 '$OUT/gen/claude.txt' | grep -q '^#@ profile claude [0-9a-f]\{64\}$' && grep -qx '#@ cwd $OUT/gproj' '$OUT/gen/claude.txt' && grep -qx '#@ user nobody' '$OUT/gen/claude.txt'"
-check "the claude profile's \${HOME} becomes the user's home" grep -q "^allow path /nonexistent/.claude " "$OUT/gen/claude.txt"
+check "the claude profile's \${HOME} becomes the user's home" grep -q "^allow path /nonexistent/.claude/ " "$OUT/gen/claude.txt"
 check "programs are named by every path they are called by (/bin/sh and its file)" sh -c "grep -qx 'allow exec /bin/sh' '$OUT/gen/none.txt' && grep -qx \"allow exec \$(readlink -f /bin/sh)\" '$OUT/gen/none.txt'"
 
 if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
@@ -340,7 +347,7 @@ PYA
         check "a stored policy that was changed is not reused or rewritten" sh -c "grep -q 'exists with other contents' '$OUT/r3.out.err' && tail -1 '$f' | grep -q changed"
         cp "$OUT/saved" "$f"
         vrun "$OUT/sp.out" python3 "$HERE/tools/varek" run --show-policy -- claude
-        check "--show-policy prints the baseline (the claude profile) and runs nothing" sh -c "grep -q '^#@ profile claude ' '$OUT/sp.out' && grep -q '^allow path $BH/.claude ' '$OUT/sp.out'"
+        check "--show-policy prints the baseline (the claude profile) and runs nothing" sh -c "grep -q '^#@ profile claude ' '$OUT/sp.out' && grep -q '^allow path $BH/.claude/ ' '$OUT/sp.out'"
         vrun "$OUT/e1.out" python3 "$HERE/tools/varek" run --env NOT_SET_1290 -- python3 agent.py
         check "--env with a variable that is not set is refused" grep -q "not set in varek's environment" "$OUT/e1.out.err"
         vrun "$OUT/e2.out" python3 "$HERE/tools/varek" run --env 'A-B' -- python3 agent.py
@@ -826,7 +833,7 @@ sys.exit(0 if q > 0 and c.get('varek:decisions.would_refuse') == str(end['not_en
     VQ refusals --not-enforced > "$Q/rn.out" 2>&1
     VQ refusals --enforced > "$Q/rx.out" 2>&1
     check "varek refusals --not-enforced: only the calls let through" sh -c "grep -q 'WOULD_REFUSE' '$Q/rn.out' && ! grep -q '$Q/d.log' '$Q/rn.out'"
-    check "varek refusals --enforced: only the calls refused"         sh -c "! grep -q 'WOULD_REFUSE' '$Q/rx.out' && grep -q '$Q/d.log\$' '$Q/rx.out'"
+    check "varek refusals --enforced: only the calls refused"         sh -c "! grep -q '^  WOULD_REFUSE' '$Q/rx.out' && grep -q '$Q/d.log\$' '$Q/rx.out'"
     VQ refusals "$Q/log/verdicts-1.log" > "$Q/re.out" 2>&1
     check "... an enforcing run: no dry-run header, no WOULD_REFUSE" sh -c "! grep -q 'DRY RUN\|WOULD_REFUSE' '$Q/re.out' && grep -q '$Q/o/f' '$Q/re.out'"
     VQ runs > "$Q/runs.out" 2>&1
@@ -843,6 +850,104 @@ sys.exit(0 if q > 0 and c.get('varek:decisions.would_refuse') == str(end['not_en
     env -u SUDO_UID -u SUDO_USER VAREK_CONFIG="$Q/none/varek.conf" python3 "$HERE/tools/varek" doctor > "$Q/doc.out" 2>&1
     check "varek doctor: the dry run is available"                 grep -q "dry runs available" "$Q/doc.out"
     check "varek doctor: with no sudo user, the agent runs as nobody" grep -q "the baseline runs the agent as nobody (no sudo user)" "$Q/doc.out"
+fi
+
+echo "== 7. what the agents' dry runs found (step 6) =="
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
+    skip "what the agents' dry runs found (it runs as root: the agent runs as another user)"
+else
+    G="$OUT/g7"
+    mkdir -p "$G/bin" "$G/w" "$G/o/sub/d2" "$G/closed"
+    chmod 755 "$G" "$G/bin" "$G/o" "$G/o/sub" "$G/o/sub/d2"; chmod 1777 "$G/w"; chmod 700 "$G/closed"
+    cp "$HERE/tests/v1290_open" "$G/bin/"; chmod 755 "$G/bin/v1290_open"
+    echo r > "$G/o/r"; echo s > "$G/o/secret"; chmod 644 "$G/o/r" "$G/o/secret"
+    ln -s /etc/hostname "$G/o/link"
+    gpol() {   # gpol FILE VERSION
+        printf 'require warden %s\nallow path /usr/ readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/w/\nallow path exact %s/o/r readonly\nallow path exact %s/o/link readonly\nallow path %s/o/sub/ readonly\nallow path %s/mi/x/ readonly\n' \
+            "$2" "$G" "$G" "$G" "$G" "$G" > "$1"
+    }
+    gpol "$G/p129.txt" 1.29
+    gpol "$G/p128.txt" 1.28
+    G7=(rstat "$G/o/r" rstat "$G/o/secret" rstat "$G/w/nosuch" rlstat "$G/o/link"
+        rstat "$G/mi/x/y" rstat "$G/mi/z/y" rstat "$G/mi/../mi/x/y" read "$G/mi/x/y"
+        mkdir "$G/o/sub/d2" mkdir "$G/o" mkdir "$G/closed" mkdir "$G/w/new" admits "$G/o/r")
+    (cd "$G/w" && "$WARDEN" "$G/p129.txt" --run-as nobody -- "$G/bin/v1290_open" "${G7[@]}" > "$G/a.out" 2> "$G/a.log")
+    (cd "$G/w" && "$WARDEN" "$G/p128.txt" --run-as nobody -- "$G/bin/v1290_open" "${G7[@]}" > "$G/b.out" 2> "$G/b.log")
+    go() { grep -qx "$1" "$G/a.out"; }
+    bo() { grep -qx "$1" "$G/b.out"; }
+    check "stat(2), as musl calls it: an allowed file is answered"                 go "rstat ok"
+    check "... recorded as a lookup (file.stat), metadata_answered"                 rec "$G/a.log" "r.get('action') == 'file.stat' and r.get('resolved') == '$G/o/r' and r['rule'] == 'metadata_answered'"
+    check "... a file the policy does not name: EACCES"                             go "rstat Permission denied"
+    check "... a missing file where the policy allows it: ENOENT"                    go "rstat No such file or directory"
+    check "lstat(2) answers the link itself"                                        rec "$G/a.log" "r.get('action') == 'file.stat' and r.get('resolved') == '$G/o/link' and r['rule'] == 'metadata_answered'"
+    check "under require warden 1.28, stat(2) is refused by the filter (EPERM), as before" bo "rstat Operation not permitted"
+    check "a lookup under a missing directory, of a name the policy allows: ENOENT" sh -c "grep -q 'rstat No such file or directory' '$G/a.out' && [ \"\$(grep -c '^rstat No such file or directory' '$G/a.out')\" = 2 ]"
+    check "... decided on the whole name asked for"                                 rec "$G/a.log" "r.get('action') == 'file.stat' and r.get('resolved') == '$G/mi/x/y' and r['rule'] == 'metadata_not_found'"
+    check "... a name it does not allow: EACCES, on the first missing directory"    rec "$G/a.log" "r.get('action') == 'file.stat' and r.get('target') == '$G/mi/z/y' and r.get('resolved') == '$G/mi/z/y' and r['decision_final'] == 'DENY'"
+    check "... a name with .. after the missing directory: decided there (EACCES)"  rec "$G/a.log" "r.get('action') == 'file.stat' and r.get('target') == '$G/mi/../mi/x/y' and r.get('resolved') == '$G/mi' and r['decision_final'] == 'DENY'"
+    check "... an open of it too: ENOENT"                                           go "read No such file or directory"
+    check "mkdir of a directory the policy allows reading: EEXIST, nothing changed" sh -c "grep -qx 'mkdir File exists' '$G/a.out' && [ \"\$(grep -c '^mkdir File exists' '$G/a.out')\" = 2 ]"
+    check "... recorded mkdir_exists, decided as a lookup (0x0)"                     rec "$G/a.log" "r.get('action') == 'file.mkdir' and r.get('resolved') == '$G/o/sub/d2' and r['rule'] == 'mkdir_exists' and r.get('open_flags') == '0x0' and r.get('errno') == 17"
+    check "... of a directory the policy leads to: mkdir_exists_ancestor"           rec "$G/a.log" "r.get('action') == 'file.mkdir' and r.get('resolved') == '$G/o' and r['rule'] == 'mkdir_exists_ancestor' and r.get('errno') == 17"
+    check "... of a directory it may not look up: EACCES, as before"                go "mkdir Permission denied"
+    check "... and a new one is made"                                               sh -c "grep -qx 'mkdir ok' '$G/a.out' && [ -d '$G/w/new' ]"
+    for c in getrusage getpgrp setpgid getsid capget fadvise64 flock fstatfs getitimer alarm umask prctl_set_name prctl_get_name pidfd_open setsid; do
+        check "admitted under 1.29: $c"                                             go "$c ok"
+    done
+    check "prctl with any other option stays refused (PR_SET_DUMPABLE)"              go "prctl_set_dumpable Operation not permitted"
+    check "under 1.28 they are refused, as before (getrusage, pidfd_open, setsid)"  sh -c "grep -qx 'getrusage Operation not permitted' '$G/b.out' && grep -qx 'pidfd_open Operation not permitted' '$G/b.out' && grep -qx 'setsid refused' '$G/b.out'"
+    check "the audit passes the run" python3 "$HERE/tools/varek_audit.py" --policy "$G/p129.txt" --checker "$CERT" "$G/a.log"
+    # a dry run of an earlier policy: what enforcing refuses in the filter is
+    # recorded as a call outside the allowlist, not decided
+    (cd "$G/w" && "$WARDEN" "$G/p128.txt" --dry-run --run-as nobody -- "$G/bin/v1290_open" rstat "$G/o/secret" mkdir "$G/w/n2" > /dev/null 2> "$G/d.log")
+    check "a dry run under 1.28: stat(2) and mkdir are syscall_not_admitted, not decided" sh -c "
+        python3 -c \"import json,sys; R=[json.loads(l) for l in open('$G/d.log') if l.startswith('{')]; t={r.get('target') for r in R if r.get('rule') == 'syscall_not_admitted'}; sys.exit(0 if 'syscall:4' in t and t & {'syscall:83','syscall:258'} and not any(r.get('action') == 'file.mkdir' for r in R) else 1)\""
+    # noexec: a place inside a writable directory that keeps exec
+    H7="$G/h"
+    mkdir -p "$H7/inst/bin"; chmod 1777 "$H7"; chmod 755 "$H7/inst" "$H7/inst/bin"
+    cp "$G/bin/v1290_open" "$H7/inst/bin/"; chmod 755 "$H7/inst/bin/v1290_open"
+    printf 'require warden 1.29\nallow path /usr/ readonly\nallow path /etc/ld.so.cache readonly\nallow path glob %s/.cfg*\nallow path %s/inst/ readonly\n' "$H7" "$H7" > "$G/n129.txt"
+    printf 'require warden 1.29\nallow path /usr/ readonly\nallow path /etc/ld.so.cache readonly\nallow path glob %s/in*\nallow path %s/inst/ readonly\n' "$H7" "$H7" > "$G/nreach.txt"
+    sed 's/^require warden 1.29/require warden 1.28/' "$G/n129.txt" > "$G/n128.txt"
+    (cd "$H7" && "$WARDEN" "$G/n129.txt" --run-as nobody -- "$H7/inst/bin/v1290_open" create "$H7/.cfgA" > "$G/n.out" 2> "$G/n.log")
+    check "the agent's own program inside a directory it may write runs, its place kept executable" sh -c "grep -q '^create ok' '$G/n.out'"
+    check "... run_start lists the directory noexec and the place kept executable" rec "$G/n.log" "r.get('event') == 'run_start' and [e['path'] for e in r['noexec']] == ['$H7'] and r['noexec_exec'] == [{'path': '$H7/inst', 'in': '$H7'}]"
+    check "... the audit passes it" python3 "$HERE/tools/varek_audit.py" --policy "$G/n129.txt" --checker "$CERT" "$G/n.log"
+    (cd "$H7" && "$WARDEN" "$G/nreach.txt" --run-as nobody -- "$H7/inst/bin/v1290_open" create "$H7/.cfgB" > /dev/null 2> "$G/r.log")
+    check "a rule that could write there (glob in*): refused to start, as before" grep -q "noexec: the agent's own program $H7/inst/bin/v1290_open is under $H7" "$G/r.log"
+    (cd "$H7" && "$WARDEN" "$G/n128.txt" --run-as nobody -- "$H7/inst/bin/v1290_open" create "$H7/.cfgC" > /dev/null 2> "$G/o.log")
+    check "under 1.28: refused to start, as before"                                 grep -q "noexec: the agent's own program $H7/inst/bin/v1290_open is under $H7" "$G/o.log"
+    qforge() {   # qforge LABEL STREAM POLICY PYTHON WORDS: the audit fails the forged stream for its reason
+        python3 "$HERE/tests/v1270_forge.py" "$2" "$G/f.log" "$4" >/dev/null 2>&1
+        if python3 "$HERE/tools/varek_audit.py" --policy "$3" --checker "$CERT" "$G/f.log" > "$G/f.out" 2>&1; then
+            flunk "forged: $1 (the audit passed it)"
+        elif grep -qF -- "$5" "$G/f.out"; then pass "forged: $1"
+        else flunk "forged: $1 (not for its own reason: $(grep '^  PROBLEM' "$G/f.out" | head -2 | tr '\n' ' '))"; fi
+    }
+    NRS="[r for r in recs if isinstance(r, dict) and r.get('event') == 'run_start'][0]"
+    qforge "a place kept executable that a writable rule reaches" "$G/n.log" "$G/n129.txt" "$NRS['noexec_exec'].append({'path': '$H7/.cfgdir', 'in': '$H7'})" "lets the agent write there"
+    qforge "a place kept executable outside the noexec directories" "$G/n.log" "$G/n129.txt" "$NRS['noexec_exec'][0]['in'] = '/usr'" "which is not a directory run_start's noexec mounts"
+    qforge "the places kept executable dropped" "$G/n.log" "$G/n129.txt" "$NRS.pop('noexec_exec')" "noexec_exec is missing or malformed"
+    qforge "a mkdir answered EEXIST recorded with the flags of a create" "$G/a.log" "$G/p129.txt" "[r.__setitem__('open_flags', '0xc1') for r in recs if isinstance(r, dict) and r.get('rule') == 'mkdir_exists']" "which the Warden writes only for a mkdir decided as a lookup"
+    qforge "a mkdir answered EEXIST as an ancestor that is not one" "$G/a.log" "$G/p129.txt" "[r.__setitem__('resolved', '$G/closed') for r in recs if isinstance(r, dict) and r.get('rule') == 'mkdir_exists_ancestor']" "is not one"
+    # the baseline (6b)
+    py7() { PYTHONPATH="$HERE/tools" python3 -c "import pwd, varek_baseline as b; $1"; }
+    py7 "open('$G/base.txt','w').write(b.generate('$G/w', pwd.getpwnam('nobody'), '/tmp/varek-65534', None, path=b.SYSTEM_PATH + ':$G/bin'))"
+    check "the baseline lets the agent read the CA bundles, before the key patterns" sh -c "a=\$(grep -n '^allow path /etc/ssl/certs/ readonly' '$G/base.txt' | cut -d: -f1); d=\$(grep -n '^deny  path glob /\*\*/\*.\[pP\]' '$G/base.txt' | head -1 | cut -d: -f1); [ -n \"\$a\" ] && [ -n \"\$d\" ] && [ \"\$a\" -lt \"\$d\" ] && grep -q '^allow path glob /\*\*/certifi/cacert.pem readonly' '$G/base.txt' && grep -q '^allow path exact /etc/pki/tls/cert.pem readonly' '$G/base.txt'"
+    check "... what language runtimes read at startup (/proc/version, cgroup limits)" sh -c "grep -q '^allow path exact /proc/version readonly' '$G/base.txt' && grep -q '^allow path /sys/fs/cgroup/ readonly' '$G/base.txt'"
+    check "... the directory its PATH gains for the agent's command, read-only" grep -qx "allow path $G/bin/ readonly" "$G/base.txt"
+    if [ -d /usr/lib/git-core ] && command -v git >/dev/null; then
+        check "... git's helpers (/usr/lib/git-core/)" grep -qx "allow exec prefix /usr/lib/git-core/" "$G/base.txt"
+    else skip "git's helpers (no /usr/lib/git-core here)"; fi
+    check "the baseline lints" "$VDP" "$G/base.txt" lint
+    # the profiles (6c): none lets the agent write a name in the home itself
+    # by a bare prefix (the whole home noexec, and agents installed there
+    # could not start); exact names and globs are bounded, directories end in /
+    check "no shipped profile has a writable prefix rule without a trailing slash" sh -c "! grep -h '^allow path \${HOME}/' '$HERE'/policies/agents/*.profile.txt | grep -v ' readonly' | grep -v '^allow path \(exact\|glob\) ' | awk '{print \$3}' | grep -v '/\$'"
+    for prof in claude codex gemini aider python node; do
+        py7 "p=b.load_profile('$HERE/policies/agents/$prof.profile.txt'); open('$G/prof-$prof.txt','w').write(b.generate('$G/w', pwd.getpwnam('nobody'), '/tmp/varek-65534', p))"
+        check "the $prof profile's baseline lints and loads in the checker" sh -c "'$VDP' '$G/prof-$prof.txt' lint > /dev/null && '$CERT' '$G/prof-$prof.txt' digest > /dev/null"
+    done
 fi
 
 echo

@@ -296,6 +296,10 @@ CHANGE_FLAGS = {
     "file.chdir": ("0x10000",),
 }
 CHANGE_RULES = ("change_done", "change_failed", "chdir_continued")
+# v1.29 (step 6): a mkdir of a name that is there, answered EEXIST as the
+# kernel would, decided as a lookup (flags 0x0): one the policy allows
+# reading (certified), or a directory the policy leads to
+MKDIR_EXISTS_RULES = ("mkdir_exists", "mkdir_exists_ancestor")
 
 
 # v1.29 (section 3, D2): refusals a dry run never lets through; a record of
@@ -423,6 +427,11 @@ def check_changes(records, openas_policy, problems):
     by_seq = {r.get("seq"): r for r in records if type(r.get("seq")) is int}
     for r in allowed:
         act, seq = r["action"], r.get("seq")
+        if r.get("rule") in MKDIR_EXISTS_RULES:                       # step 6
+            if act != "file.mkdir" or r.get("open_flags") != "0x0" or r.get("errno") != 17:
+                problems.append(f"seq {seq}: {act} recorded {r.get('rule')}, which the Warden writes only for "
+                                f"a mkdir decided as a lookup (0x0) and answered EEXIST")
+            continue
         if r.get("open_flags") not in CHANGE_FLAGS[act]:
             problems.append(f"seq {seq}: {act} allowed as open flags {r.get('open_flags')!r}, not as its "
                             f"kind is decided ({'/'.join(CHANGE_FLAGS[act])})")
@@ -544,6 +553,65 @@ def noexec_target(r):
             return (out[:1] if sl == 0 else out[:sl]), False
         return (out[:-1] if len(out) > 1 and out.endswith("/") else out), True
     return "", False
+
+
+def noexec_rule_reaches(r, s, file):
+    """v1.29 (step 6): may writable rule r match s, or (a directory) a path
+    inside it? As warden_noexec.inc.c's noexec_rule_reaches: every path a
+    rule matches starts with its constant before the first wildcard."""
+    c, m = r["c"], r.get("match")
+    if m == "exact":
+        return c.startswith("/") and (c == s if file else _nx_under(c, s))
+    if m == "prefix":
+        if not c.startswith("/"):
+            return False
+        stem = c
+    elif m == "glob":
+        k = 0
+        while k < len(c) and c[k] not in "*?[\\":
+            k += 1
+        if k == 0:
+            return True
+        stem = c[:k]
+        if not stem.startswith("/"):
+            return False
+    else:
+        return True
+    return s.startswith(stem) or (not file and stem.startswith(s + "/"))
+
+
+def check_noexec_exec(meta, rules, openas, problems):
+    """v1.29 (step 6): under `require warden 1.29`, run_start's noexec_exec:
+    each place inside a directory mounted noexec that keeps exec (for the
+    agent's own program or a file of the launch set). Each must be inside
+    one listed directory, spelled canonically, and reached by no rule that
+    lets the agent write; none of them is recorded under an earlier policy."""
+    rs = meta.get("run_start", {})
+    nx, ne = rs.get("noexec"), rs.get("noexec_exec")
+    if not openas or not isinstance(nx, list):
+        if ne is not None:
+            problems.append("run_start records places kept executable inside the noexec mounts, but the "
+                            "policy does not say require warden 1.29 (or nothing is mounted noexec)")
+        return
+    if not isinstance(ne, list) or not all(
+            isinstance(e, dict) and set(e) <= {"path", "in", "file"} and isinstance(e.get("path"), str)
+            and isinstance(e.get("in"), str) and e.get("file", True) is True for e in ne):
+        problems.append("run_start's noexec_exec is missing or malformed")
+        return
+    listed = {e["path"] for e in nx if not e.get("missing")}
+    writable = [r for r in rules if path_rule_writable(r)]
+    for e in ne:
+        p, d = e["path"], e["in"]
+        if os.path.normpath(p) != p or p.startswith("//") or not p.startswith("/"):
+            problems.append(f"run_start's noexec_exec names {p!r}, which is not spelled as a canonical path")
+        elif d not in listed or p == d or not _nx_under(p, d):
+            problems.append(f"run_start's noexec_exec keeps {p!r} executable inside {d!r}, which is not a "
+                            f"directory run_start's noexec mounts, or does not hold it")
+        else:
+            hit = [r["line"] for r in writable if noexec_rule_reaches(r, p, bool(e.get("file")))]
+            if hit:
+                problems.append(f"run_start's noexec_exec keeps {p!r} executable, but policy line {hit[0]} "
+                                f"lets the agent write there")
 
 
 def _open_writes(flags):
@@ -2734,6 +2802,7 @@ def main(argv=None):
     dry_run = check_dry(meta, records, problems)
     try:
         check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, problems, records)   # v1.27.1
+        check_noexec_exec(meta, policy_rules(a.checker, a.policy), openas_policy, problems)          # v1.29
     except (OSError, ValueError) as e:
         problems.append(f"checker failed on the policy's rules: {e}")
     exec_ok = 0
@@ -2770,7 +2839,9 @@ def main(argv=None):
             if launches > 1:
                 problems.append(f"seq {rec.get('seq')}: a second launch exec")
             continue
-        if rec.get("action") in META_ACTIONS and rec.get("rule") == "metadata_ancestor":
+        if rec.get("action") in META_ACTIONS + ("file.mkdir",) and \
+                rec.get("rule") == ("mkdir_exists_ancestor" if rec.get("action") == "file.mkdir"
+                                    else "metadata_ancestor"):
             if ancestors is None:
                 ancestors = policy_ancestors(a.policy)
             if rec.get("resolved") not in ancestors:
@@ -2927,7 +2998,8 @@ def main(argv=None):
                                 f"writes only with launches on, for an open that does not create, "
                                 f"answered ENOENT")
                 continue
-        is_meta = rec.get("action") in META_ACTIONS and rec.get("rule") in META_RULES
+        is_meta = (rec.get("action") in META_ACTIONS and rec.get("rule") in META_RULES) or \
+                  (rec.get("action") == "file.mkdir" and rec.get("rule") == "mkdir_exists")   # v1.29
         # v1.29: a change by name, decided as a path with its flags (check_changes)
         is_change = rec.get("action") in CHANGE_FLAGS and rec.get("rule") in CHANGE_RULES
         is_meta = is_meta or is_change

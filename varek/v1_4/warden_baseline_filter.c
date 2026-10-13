@@ -181,6 +181,41 @@ static const char *kChange[] = {
 // (an open the Warden decided); its later relative names are each decided.
 static const char *kChangeAdmit[] = { "fchdir", NULL };
 
+// v1.29 (step 6: dry runs of the coding agents' CLIs, then the same runs
+// enforcing): what they need that the lists above lack, under `require
+// warden 1.29` only (before it, refused as before).
+// stat and lstat, which musl calls (a statically linked agent, the Codex
+// CLI, looked nothing up), decided as newfstatat (warden.c).
+static const char *kMediate129[] = { "stat", "lstat", NULL };
+// Each acts on the caller, its own descriptors, or processes of its own PID
+// namespace (the agent runs as its init): its resource use (getrusage), a
+// system call the kernel restarts after a signal (restart_syscall), its
+// capabilities, read (capget), process groups and sessions (setpgid,
+// getpgid, getpgrp, getsid, setsid: shells and job control), a read-ahead
+// hint and an advisory lock on a descriptor it holds (fadvise64, flock), the
+// filesystem of a descriptor it holds (fstatfs), its timers (getitimer,
+// setitimer, alarm), its file creation mask (umask: the Warden reads it from
+// /proc when it creates a file for the agent), its own memory's NUMA policy
+// (mbind), and a descriptor for one of its processes (pidfd_open: the
+// descriptor can be waited on; pidfd_getfd is hard-denied and
+// pidfd_send_signal is not admitted).
+static const char *kAdmit129[] = {
+    "getrusage", "restart_syscall", "capget", "setpgid", "getpgid", "getpgrp", "getsid", "setsid",
+    "fadvise64", "flock", "fstatfs", "getitimer", "setitimer", "alarm", "umask", "mbind", "pidfd_open",
+    NULL
+};
+// prctl, for these options only (compared on the full 64-bit argument, as
+// ioctl's are): a thread's name, the signal at its parent's death, reading
+// whether it is dumpable, whether no_new_privs is set, its bounding set and
+// its securebits, and naming an anonymous mapping. Every other option (the
+// seccomp, dumpable, ptracer, capability and memory-map setters among them)
+// stays refused. PR_CAP_AMBIENT is admitted for PR_CAP_AMBIENT_IS_SET only.
+static const unsigned long kPrctlAdmit[] = {
+    PR_SET_NAME, PR_GET_NAME, PR_SET_PDEATHSIG, PR_GET_PDEATHSIG, PR_GET_DUMPABLE,
+    PR_GET_NO_NEW_PRIVS, PR_CAPBSET_READ, PR_GET_SECUREBITS,
+    0x53564d41UL,                 // PR_SET_VMA (Linux 5.17; anon_vma_name)
+};
+
 // HARD-DENY: never admissible (classes 3-6). KILL in strict mode, even in
 // observe mode.
 static const char *kHardDeny[] = {
@@ -241,6 +276,8 @@ static bool in_list(const char **names, const char *n) {
 
 static const char *kChange[];
 static const char *kChangeAdmit[];
+static const char *kMediate129[];
+static const char *kAdmit129[];
 static const char *kMediate[];
 static const char *kHardDeny[];
 static const char *kAdmit[];
@@ -259,7 +296,9 @@ static int add_dry_rest(scmp_filter_ctx ctx, int file_changes) {
         if (!n) continue;
         bool named = in_list(kHardDeny, n) || in_list(kMediate, n) || in_list(kAdmit, n) ||
                      in_list((const char **)kConditional, n) ||
-                     (file_changes && (in_list(kChange, n) || in_list(kChangeAdmit, n)));
+                     (file_changes && (in_list(kChange, n) || in_list(kChangeAdmit, n) ||
+                                       in_list(kMediate129, n) || in_list(kAdmit129, n) ||
+                                       !strcmp(n, "prctl")));
         free(n);
         if (named) continue;
         int rc = seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, nr, 0);
@@ -467,6 +506,17 @@ static int build(scmp_filter_ctx *out_ctx, int observe, int flags) {
     if (file_changes) {                                       // v1.29
         if ((rc = add_list(ctx, kChange, SCMP_ACT_NOTIFY)) < 0) goto fail;
         if ((rc = add_list(ctx, kChangeAdmit, SCMP_ACT_ALLOW)) < 0) goto fail;
+        if ((rc = add_list(ctx, kMediate129, SCMP_ACT_NOTIFY)) < 0) goto fail;   // step 6
+        if ((rc = add_list(ctx, kAdmit129, SCMP_ACT_ALLOW)) < 0) goto fail;
+        for (size_t i = 0; i < sizeof kPrctlAdmit / sizeof kPrctlAdmit[0]; ++i) {
+            rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(prctl), 1,
+                                  SCMP_A0(SCMP_CMP_EQ, (scmp_datum_t)kPrctlAdmit[i]));
+            if (rc < 0) goto fail;
+        }
+        rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(prctl), 2,
+                              SCMP_A0(SCMP_CMP_EQ, (scmp_datum_t)PR_CAP_AMBIENT),
+                              SCMP_A1(SCMP_CMP_EQ, (scmp_datum_t)PR_CAP_AMBIENT_IS_SET));
+        if (rc < 0) goto fail;
     }
     if ((rc = add_sends(ctx)) < 0) goto fail;                 // v1.21
     if ((rc = add_setsockopt(ctx)) < 0) goto fail;            // v1.21
