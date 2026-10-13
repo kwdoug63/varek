@@ -1394,9 +1394,10 @@ def fuzz_policy(rng, path):
                 t = rng.choice(good_t)
                 if not valid and rng.random() < 0.3:
                     t = rng.choice(bad_t + [t])
-                if valid and t.split()[1] in seen_t:
+                key = " ".join(t.split()[:2])      # (a malformed line may be one word)
+                if valid and key in seen_t:
                     continue
-                seen_t.add(t.split()[1])
+                seen_t.add(key)
                 lines.append("trust " + t)
             if rng.random() < 0.5:
                 lines.append(rng.choice(["require on-behalf-of"] * 4 + ([] if valid else
