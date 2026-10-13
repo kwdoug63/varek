@@ -32,6 +32,8 @@ jobs:
           sudo apt-get install -y openjdk-21-jdk-headless musl-tools
           # v1.26 section 5: test_v1260.sh chains the proxy to a Squid upstream
           sudo apt-get install -y --no-install-recommends squid
+          # v1.28: test_v1280.sh's stand-in Vault and AWS servers make a test CA
+          sudo apt-get install -y --no-install-recommends python3-cryptography
       - name: Build the Warden and its tools
         run: make -C varek/v1_4 all
       - name: Check the deployment scripts parse
@@ -64,7 +66,7 @@ jobs:
         run: sudo make -C varek/v1_4 test-v1270
       - name: v1.27.1 nothing written during the run is mapped executable (the writable directories, the mounts, what the agent sees, records and tools)
         run: sudo make -C varek/v1_4 test-v1271
-      - name: v1.28 credential release (the grammar)
+      - name: v1.28 credential release (the grammar, fetching with warden-secrets)
         run: sudo make -C varek/v1_4 test-v1280
       - name: Build and test the plan_verify CLI (v1_6, v1.16.3)
         run: make -C v1_6 plan_verify check check-plan-verify

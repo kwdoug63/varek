@@ -136,6 +136,7 @@
 #include "warden_resolve.h"     /* v1.24 resolution table for host name rules */
 #include "shared_domains.h"     /* v1.25 wildcards over shared domains, refused at load */
 #include "warden_proxy.h"       /* v1.26 the egress proxy process */
+#include "warden_secrets.h"     /* v1.28 the credentials' helper, warden-secrets */
 #include "proxy_parse.h"        /* v1.26 what the proxy reads (pp_kind_name) */
 
 /* Kernel/libc compatibility shims --------------------------------- */
@@ -413,14 +414,6 @@ static int policy_load(const char *path, struct policy *p) {
     if (!creds_same) {
         fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
                 "the credentials differently; refusing to start\n", path);
-        return -1;
-    }
-    /* v1.28 step 1: the grammar only. Until warden-secrets and the swap are
-     * built (steps 2 and 3), a policy that names a credential would run with
-     * nothing to put in its place: refused. */
-    if (p->v.ncreds) {
-        fprintf(stderr, "[warden] policy %s:%d: credential release is not built in this Warden yet; "
-                "refusing to start\n", path, p->v.creds[0].line);
         return -1;
     }
     /* v1.13: load-time analysis. The decision procedure decides, for every
@@ -1378,6 +1371,9 @@ static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden
 #define STUB_LABEL_MAX     63            /* bytes matched by `*` */
 static char       g_psl_sha[65], g_shared_sha[65];  /* v1.25: the lists wildcards were checked against */
 static wp_t       g_proxy = { .ctl = -1 };          /* v1.26: the egress proxy, when `proxy on` */
+static ws_t       g_secrets = { .ctl = -1 };        /* v1.28: warden-secrets, when the policy names credentials */
+static char       g_secrets_sha[65];                /* v1.28: the SHA-256 of the warden-secrets that ran */
+static ws_meta_t  g_cred_meta[WS_MAX_CREDS];        /* v1.28: each credential's version and length (never its value) */
 static char       g_proxy_sha[65];                  /* v1.26.1: the SHA-256 of the warden-proxy that ran */
 /* v1.26.1, inspecting mode: the run's CA and the trust views (warden_trust.inc.c) */
 static bool       g_inspect_on = false;
@@ -4301,6 +4297,7 @@ static void usage(const char *argv0) {
         "              [--anchor <path>] [--checkpoint-every <n>] [--run-as <user>]\n"
         "              [--dns-server <a.b.c.d[:port]>] [--dns-ttl-min <s>] [--dns-ttl-max <s>]\n"
         "              [--dns-grace-max <s>] [--psl <file>] [--shared-domains <file>]\n              [--proxy-as <user>] [--proxy-bin <warden-proxy>] [--trust-bundle <pem>]\n"
+        "              [--secrets-as <user>] [--secrets-bin <warden-secrets>] [--secrets-conf <file>]\n"
         "              [--writable-exec]\n"
         "              -- <target> [args...]\n"
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
@@ -4434,6 +4431,7 @@ int main(int argc, char **argv) {
     const char *run_as_arg  = NULL;     /* v1.17.0 */
     const char *proxy_as_arg = NULL;    /* v1.26: the egress proxy's user */
     const char *proxy_bin_arg = NULL;   /* v1.26.1: the warden-proxy binary */
+    const char *secrets_bin_arg = NULL, *secrets_as_arg = NULL, *secrets_conf_arg = NULL;   /* v1.28 */
     const char *flow_path   = NULL;     /* v1.18.0 */
     const char *session_arg = NULL;     /* v1.18.0 */
     const char *state_arg   = NULL;     /* v1.18.0 */
@@ -4469,6 +4467,12 @@ int main(int argc, char **argv) {
             proxy_as_arg = argv[++i];
         } else if (strcmp(argv[i], "--proxy-bin") == 0 && !proxy_bin_arg) { /* v1.26.1 */
             proxy_bin_arg = argv[++i];
+        } else if (strcmp(argv[i], "--secrets-bin") == 0 && !secrets_bin_arg) { /* v1.28 */
+            secrets_bin_arg = argv[++i];
+        } else if (strcmp(argv[i], "--secrets-as") == 0 && !secrets_as_arg) {   /* v1.28 */
+            secrets_as_arg = argv[++i];
+        } else if (strcmp(argv[i], "--secrets-conf") == 0 && !secrets_conf_arg) { /* v1.28 */
+            secrets_conf_arg = argv[++i];
         } else if (strcmp(argv[i], "--trust-bundle") == 0 && !g_trust_bundle_arg) { /* v1.26.1 */
             g_trust_bundle_arg = argv[++i];
         } else if (strcmp(argv[i], "--checkpoint-every") == 0) {
@@ -4630,6 +4634,103 @@ int main(int argc, char **argv) {
                 p.v.proxy_inspect ? "inspecting mode" : "SNI mode", g_proxy.port, (unsigned)g_proxy.uid, (unsigned)g_proxy.gid);
     }
     if (proxy_fd >= 0) close(proxy_fd);
+    /* v1.28: the credentials (docs/security/v1.28-credential-release.md,
+     * section 2). warden-secrets, from a sealed copy hashed for run_start,
+     * as its own user, fetches each one; the Warden learns each one's
+     * version and length and the local files the helper read, never a
+     * value. A fetch that fails, or a file the policy would let the agent
+     * open, refuses the start. */
+    if (p.v.ncreds) {
+        static const char *const kStore[] = { "", "file", "vault", "aws-sm" };
+        const char *conf = secrets_conf_arg ? secrets_conf_arg : "/etc/varek/secrets.conf";
+        if (g_check_only) {
+            for (size_t k = 0; k < p.v.ncreds; k++)
+                fprintf(stderr, "[warden]   credential %s from %s:%s (line %d)\n", p.v.creds[k].name,
+                        kStore[p.v.creds[k].store], p.v.creds[k].ref, p.v.creds[k].line);
+        } else {
+            if (geteuid() != 0) {
+                fprintf(stderr, "[warden] credentials need the Warden to run as root (warden-secrets runs as "
+                        "its own user); refusing to start\n");
+                return 2;
+            }
+            struct run_as sca = { .drop = false };
+            const char *sas = secrets_as_arg ? secrets_as_arg : getpwnam("varek-secrets") ? "varek-secrets" : "65531:65531";
+            if (parse_run_as(sas, &sca) < 0 || !sca.drop) {
+                fprintf(stderr, "[warden] --secrets-as %s: give an unprivileged user (name, uid or uid:gid) "
+                        "with a non-root group\n", sas);
+                return 2;
+            }
+            if (sca.uid == ra.uid || (p.v.proxy && sca.uid == pxa.uid)) {
+                fprintf(stderr, "[warden] --secrets-as %s: warden-secrets may not run as the agent's user or "
+                        "the proxy's; give it its own\n", sas);
+                return 2;
+            }
+            char sb[PATH_MAX], why[PATH_MAX + 256];
+            if (secrets_bin_arg) snprintf(sb, sizeof sb, "%s", secrets_bin_arg);
+            else {
+                ssize_t n = readlink("/proc/self/exe", sb, sizeof sb - 16);
+                if (n <= 0) { fprintf(stderr, "[warden] cannot find this binary's directory\n"); return 1; }
+                sb[n] = '\0';
+                char *sl = strrchr(sb, '/');
+                snprintf(sl ? sl + 1 : sb, sizeof sb - (size_t)(sl ? sl + 1 - sb : 0), "warden-secrets");
+            }
+            int sfd = wp_load(sb, g_secrets_sha, why, sizeof why);
+            if (sfd < 0) {
+                fprintf(stderr, "[warden] warden-secrets: %s; build it (make warden-secrets) or name it with "
+                        "--secrets-bin; refusing to start\n", why);
+                return 1;
+            }
+            fprintf(stderr, "[warden] credentials' helper %s, SHA-256 %s\n", sb, g_secrets_sha);
+            if (ws_start(&g_secrets, sfd, sca.uid, sca.gid) < 0) {
+                close(sfd);
+                fprintf(stderr, "[warden] cannot start warden-secrets (%s); refusing to start\n", strerror(errno));
+                return 1;
+            }
+            close(sfd);
+            int store[WS_MAX_CREDS];
+            const char *ref[WS_MAX_CREDS];
+            for (size_t k = 0; k < p.v.ncreds; k++) { store[k] = p.v.creds[k].store; ref[k] = p.v.creds[k].ref; }
+            static char files[WS_MAX_FILES][4096];
+            size_t nfiles = 0;
+            int fr = ws_fetch(&g_secrets, conf, p.v.ncreds, store, ref, g_cred_meta, files, &nfiles, 30000,
+                              why, sizeof why);
+            /* every local file the helper read, whatever came of it: the
+             * agent must not be able to open one */
+            for (size_t k = 0; k < nfiles; k++) {
+                char real[PATH_MAX];
+                const char *f = realpath(files[k], real) ? real : files[k];
+                if (vdpc_path_openable(&p.c, f, strlen(f))) {
+                    fprintf(stderr, "[warden] credentials: the policy lets the agent open %s, which warden-secrets "
+                            "reads; refusing to start\n", f);
+                    ws_stop(&g_secrets);
+                    return 1;
+                }
+            }
+            if (fr < 0) {
+                /* name the credential, not its index */
+                unsigned idx;
+                const char *rest = why;
+                if (sscanf(why, "credential %u: ", &idx) == 1 && idx < p.v.ncreds && (rest = strchr(why, ':')))
+                    fprintf(stderr, "[warden] credential %s (line %d): %s; refusing to start\n",
+                            p.v.creds[idx].name, p.v.creds[idx].line, rest + 2);
+                else
+                    fprintf(stderr, "[warden] credentials: %s; refusing to start\n", why);
+                ws_stop(&g_secrets);
+                return 1;
+            }
+            for (size_t k = 0; k < p.v.ncreds; k++)
+                fprintf(stderr, "[warden] credential %s from %s:%s: fetched, %u bytes, version %s\n",
+                        p.v.creds[k].name, kStore[p.v.creds[k].store], p.v.creds[k].ref,
+                        g_cred_meta[k].len, g_cred_meta[k].version);
+        }
+        /* v1.28 steps 2 of 8: the swap into requests (step 3) is not built
+         * yet, so a run with a credential would have nothing to put in its
+         * place: refused, after the fetch. */
+        fprintf(stderr, "[warden] policy %s:%d: credential release is not built in this Warden yet; "
+                "refusing to start\n", policy_path, p.v.creds[0].line);
+        ws_stop(&g_secrets);
+        return 1;
+    }
     /* v1.27: with `require warden 1.27`, the files the agent may launch and
      * the Landlock ruleset that holds it to them (warden_exec.inc.c) */
     if (p.v.launches) {
