@@ -32,6 +32,12 @@
 #      rights still applying, and what still refuses (a protected object, a
 #      Unix socket, a hard-denied call, revocation); the labels and counts;
 #      the same agent enforcing; what a dry run is refused with.
+#   4. varek policy suggest: from a dry run, a draft with an exact rule per
+#      object refused (a read, a write, a launch, a connect), a directory
+#      alternative commented out, each never-active case commented out with
+#      its reason, system calls as notes; deterministic; it lints; a second
+#      dry run under it refuses none of what it suggested; an enforcing
+#      run's stream; a sub-agent named.
 #   6. the agent's user (the user who ran sudo, else nobody; never root) and
 #      environment (a clean one; --env by name; recorded by name only), and
 #      the agent's /tmp/varek-<uid>.
@@ -610,6 +616,109 @@ print('opened', ok, 'refused', no)" > "$Y/r.out" 2> "$Y/r.log" &
         --run-as nobody -- /usr/bin/python3 -c "print(open('$Y/o/f').read().strip())" > "$Y/v.out" 2> "$Y/v.err")
     check "varek run --dry-run says DRY RUN: NOT ENFORCING before and after" sh -c "[ \"\$(grep -c 'DRY RUN: NOT ENFORCING' '$Y/v.err')\" -ge 2 ] && grep -q 'call(s) the policy refuses were let through' '$Y/v.err' && grep -qx hi '$Y/v.out'"
     kill "$YH" "$YU" 2>/dev/null
+fi
+
+echo "== 4. varek policy suggest =="
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
+    skip "varek policy suggest on real runs (they run as root)"
+else
+    Z="$OUT/z"
+    mkdir -p "$Z/w" "$Z/o/many" "$Z/o/.ssh"
+    chmod 755 "$Z"; chmod 1777 "$Z/w" "$Z/o"
+    echo hi > "$Z/o/f"; echo d > "$Z/o/denied"; echo k > "$Z/o/.ssh/id_rsa"
+    for i in 1 2 3 4 5 6; do echo "$i" > "$Z/o/many/f$i"; done
+    chmod -R a+rX "$Z/o"; chmod 644 "$Z/o/.ssh/id_rsa"
+    printf 'require warden 1.29\nallow path /usr/ readonly\nallow path /etc/ld.so.cache readonly\ndeny path %s/o/denied\nallow path %s/w/\nallow exec /usr/bin/python3\n' "$Z" "$Z" > "$Z/p.txt"
+    python3 -m http.server 0 --bind 127.0.0.1 --directory "$Z/w" > "$Z/http.out" 2>&1 &
+    ZH=$!
+    for _ in $(seq 1 50); do ZP="$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$Z/http.out" | head -1)"; [ -n "$ZP" ] && break; sleep 0.1; done
+    SUDO="$(command -v sudo 2>/dev/null)"
+    cat > "$Z/w/a.py" <<PYZ
+import os, shutil, socket, subprocess
+for p in ["$Z/o/f", "$Z/o/denied", "$Z/o/.ssh/id_rsa", "/root/.profile"] + ["$Z/o/many/f%d" % i for i in range(1, 7)]:
+    try: open(p).read()
+    except OSError: pass
+open("$Z/o/new", "w").write("x")
+os.unlink("$Z/o/new")
+try: open("/etc/varek-suggest-test", "w")
+except OSError: pass
+subprocess.run(["/usr/bin/id"], capture_output=True)
+shutil.copy("/bin/sh", "$Z/w/mysh"); os.chmod("$Z/w/mysh", 0o755)
+subprocess.run(["$Z/w/mysh", "-c", "true"])
+if "$SUDO":
+    subprocess.run(["$SUDO", "-n", "true"], capture_output=True)
+try:
+    s = socket.create_connection(("127.0.0.1", $ZP)); s.sendall(b"GET / HTTP/1.0\\r\\n\\r\\n"); s.recv(10)
+except OSError: pass
+PYZ
+    chmod 644 "$Z/w/a.py"
+    "$WARDEN" "$Z/p.txt" --dry-run --run-as nobody -- /usr/bin/python3 "$Z/w/a.py" > /dev/null 2> "$Z/d.log"
+    rm -f "$Z/w/mysh"
+    VS() { VAREK_CONFIG="$Z/none/varek.conf" VAREK_LOG_DIR="$Z/log" python3 "$HERE/tools/varek" policy suggest "$@"; }
+    VS "$Z/d.log" -o "$Z/d1.txt" > /dev/null 2> "$Z/s.err"
+    VS "$Z/d.log" > "$Z/d2.txt" 2> /dev/null
+    dl() { grep -qF -- "$1" "$Z/d1.txt"; }
+    check "varek policy suggest writes a draft (-o), and says how many rules"     sh -c "[ -s '$Z/d1.txt' ] && grep -q 'rule(s) suggested' '$Z/s.err'"
+    check "the draft says it is a draft from one run, with its run and mode"      sh -c "head -1 '$Z/d1.txt' | grep -q '^# DRAFT POLICY' && grep -q '^# run [0-9a-f]*, dry run (not enforcing)' '$Z/d1.txt'"
+    check "the same stream gives the same draft, byte for byte"                   cmp -s "$Z/d1.txt" "$Z/d2.txt"
+    check "the policy is kept as it was, its deny rule included"                  sh -c "grep -qx 'deny path $Z/o/denied' '$Z/d1.txt' && grep -qx 'allow path $Z/w/' '$Z/d1.txt'"
+    check "a read: an exact readonly rule"                                        dl "
+allow path exact $Z/o/f readonly    # "
+    check "a write and a removal: an exact rule, its flags noted"                 sh -c "grep -q '^allow path exact $Z/o/new    # 2 times; .*flags 0x201,' '$Z/d1.txt'"
+    check "a launch: by the name used"                                            dl "
+allow exec /usr/bin/id    # "
+    check "a connect: the host and port"                                          dl "
+allow host 127.0.0.1:$ZP    # "
+    check "five or more under one directory: a directory rule, commented out"     dl "# allow path $Z/o/many/ readonly    # ALTERNATIVE (not active)"
+    check "never active: an object a deny rule refuses"                           dl "# allow path exact $Z/o/denied readonly    # NOT SUGGESTED: a deny rule of the policy (line 4)"
+    check "never active: a key"                                                   dl "# allow path exact $Z/o/.ssh/id_rsa readonly    # NOT SUGGESTED: a credential store or key"
+    check "never active: another user's home"                                     dl "# allow path exact /root/.profile readonly    # NOT SUGGESTED: in another user's home"
+    check "never active: a write under /etc/"                                     dl "# allow path exact /etc/varek-suggest-test    # NOT SUGGESTED: a write under a system directory"
+    check "never active: a program the agent wrote (a shell copied as mysh)"      dl "# allow exec $Z/w/mysh    # NOT SUGGESTED: a program the agent wrote in this run"
+    if [ -n "$SUDO" ]; then
+        check "never active: sudo"                                                dl "# allow exec $SUDO    # NOT SUGGESTED: sudo runs programs as another user"
+    else skip "never active: sudo (not installed)"; fi
+    check "a system call outside the allowlist is a note, not a rule"             sh -c "grep -q '^# system call [0-9]* (.*) is outside the Warden' '$Z/d1.txt' && ! grep -q '^allow .*syscall' '$Z/d1.txt'"
+    check "the draft lints"                                                       "$VDP" "$Z/d1.txt" lint
+    check "the draft loads in the certificate checker"                           "$CERT" "$Z/d1.txt" digest
+    "$WARDEN" "$Z/d1.txt" --dry-run --run-as nobody -- /usr/bin/python3 "$Z/w/a.py" > /dev/null 2> "$Z/d3.log"
+    rm -f "$Z/w/mysh"
+    check "a second dry run under the draft: what it suggested is no longer refused" python3 -c "
+import json, sys
+recs = [json.loads(l) for l in open('$Z/d3.log') if l.startswith('{')]
+bad = [r for r in recs if r.get('enforced') is False and (r.get('resolved') in ('$Z/o/f', '$Z/o/new', '/usr/bin/id') or
+       str(r.get('resolved', '')).startswith('$Z/o/many/') or r.get('target') == '127.0.0.1:$ZP')]
+sys.exit(1 if bad or not recs else 0)"
+    check "... while what it did not suggest still is (the denied file, the key)" python3 -c "
+import json, sys
+recs = [json.loads(l) for l in open('$Z/d3.log') if l.startswith('{')]
+got = {r.get('resolved') for r in recs if r.get('enforced') is False}
+sys.exit(0 if '$Z/o/denied' in got and '$Z/o/.ssh/id_rsa' in got else 1)"
+    # an enforcing run's refusals
+    "$WARDEN" "$Z/p.txt" --run-as nobody -- /usr/bin/python3 "$Z/w/a.py" > /dev/null 2> "$Z/e.log"
+    rm -f "$Z/w/mysh"
+    VS "$Z/e.log" > "$Z/e1.txt" 2> /dev/null
+    check "from an enforcing run: a draft, and the read it was refused"           sh -c "grep -q '^# run [0-9a-f]*, enforcing' '$Z/e1.txt' && grep -q '^allow path exact $Z/o/f readonly' '$Z/e1.txt'"
+    check "-o does not overwrite a file without --force" sh -c "! VAREK_CONFIG='$Z/none/varek.conf' python3 '$HERE/tools/varek' policy suggest '$Z/d.log' -o '$Z/d1.txt' 2>/dev/null"
+    # a stream with sub-agents: the sub-agent named on the rule's comment
+    python3 - "$Z/d.log" "$Z/sub.log" <<'PYS'
+import json, sys
+out = open(sys.argv[2], "w")
+for line in open(sys.argv[1]):
+    if line.startswith("{"):
+        r = json.loads(line)
+        if r.get("resolved", "").endswith("/o/f"):
+            r["obo"] = ["agent", "subagent:helper#1"]
+        line = json.dumps(r) + "\n"
+    out.write(line)
+PYS
+    PYTHONPATH="$HERE/tools" python3 -c "
+import json, varek_suggest as v
+recs = [json.loads(l) for l in open('$Z/sub.log') if l.startswith('{')]
+t, a, c = v.suggest(recs, open('$Z/p.txt').read(), '$Z/p.txt', 'x', '$VDP')
+open('$Z/sub.txt', 'w').write(t)"
+    check "a sub-agent's refusal: the rule's comment names it" grep -q "^allow path exact $Z/o/f readonly    # .*sub-agent helper#1" "$Z/sub.txt"
+    kill "$ZH" 2>/dev/null
 fi
 
 echo

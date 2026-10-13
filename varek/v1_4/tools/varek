@@ -42,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import varek_license  # noqa: E402
 import varek_bench  # noqa: E402
 import varek_baseline  # noqa: E402
+import varek_suggest  # noqa: E402
 
 CLI_VERSION = "1.3.0"
 DEFAULT_CONFIG = "/etc/varek/varek.conf"
@@ -1008,6 +1009,38 @@ def cmd_policy_show(args):
     return show_rc
 
 
+def cmd_policy_suggest(args):
+    """v1.29: a draft policy from a run's refusals (varek_suggest.py)"""
+    cfg = config_or_defaults()
+    log = latest_log(cfg, args.log)
+    recs = read_records(log)
+    s = summarize(recs)
+    pol = _policy_for_log(cfg, s)
+    if not pol:
+        raise CliError(f"the policy {log}'s run used (sha256 {s.get('policy_sha') or '?'}) was not found",
+                       fix="the run's policy file must still be where it was, or among the packs")
+    with open(pol, encoding="utf-8", errors="surrogateescape") as fh:
+        text = fh.read()
+    try:
+        draft, active, commented = varek_suggest.suggest(recs, text, pol, s.get("policy_sha") or "?",
+                                                         tool("vdp_check"))
+    except (ValueError, RuntimeError) as e:
+        raise CliError(str(e))
+    if args.output:
+        if os.path.exists(args.output) and not args.force:
+            raise CliError(f"{args.output} exists", fix="choose another file, or pass --force")
+        with open(args.output, "w", encoding="utf-8", errors="surrogateescape") as fh:
+            fh.write(draft)
+        ok(f"draft written to {args.output}")
+    else:
+        sys.stdout.write(draft)
+    print(_paint("2", f"[varek] a DRAFT from run {s['run'] or '?'}"
+                      f"{' (a dry run)' if s.get('dry') else ''}: {active} rule(s) suggested, {commented} "
+                      f"written commented out with the reason; read each before `varek policy use`"),
+          file=sys.stderr)
+    return 0
+
+
 def cmd_policy_check(args):
     cfg = load_config(required=not args.file)
     path = resolve_pack(args.file, cfg) if args.file else cfg["policy"]
@@ -1953,6 +1986,12 @@ def build_parser():
     x.add_argument("--explain", action="store_true",
                    help="also show, for each rule, an example it decides")
     x.set_defaults(fn=cmd_policy_check)
+    x = psub.add_parser("suggest", help="v1.29: draft a policy from a run's refusals (a dry run's, or an "
+                                         "enforcing run's); installs nothing")
+    x.add_argument("log", nargs="?", help="a verdict log (default: the last run)")
+    x.add_argument("-o", "--output", help="write the draft here instead of to stdout")
+    x.add_argument("--force", action="store_true", help="overwrite --output if it exists")
+    x.set_defaults(fn=cmd_policy_suggest)
     x = psub.add_parser("use", help="make a pack or file the active policy (root)")
     x.add_argument("pack")
     x.set_defaults(fn=cmd_policy_use)
