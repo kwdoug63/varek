@@ -213,6 +213,8 @@ def mint(d, case, iss):
         c["aud"] = ["someone-else", AUD]
     elif case == "expired":
         c["exp"] = t - 3600
+    elif case.startswith("exp") and case[3:].isdigit():     # expiring N s from now (step 4)
+        c["exp"] = t + int(case[3:])
     elif case == "near-expiry":
         c["exp"] = t + 20
     elif case == "nbf-future":

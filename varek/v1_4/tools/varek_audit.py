@@ -826,7 +826,11 @@ def check_credentials(creds, cred_rules, meta, records, complete, problems, note
     listed = rs.get("credentials")
     names = {c[0]: c for c in creds}
     if not creds:
-        if listed is not None or "secrets_binary_sha256" in rs:
+        # v1.28.1: the helper also runs to verify the user's token or the
+        # agent's SVID, and is then recorded without credentials
+        obo = rs.get("on_behalf_of") if isinstance(rs.get("on_behalf_of"), dict) else {}
+        verified = "user" in obo or (isinstance(obo.get("agent"), dict) and "spiffe_id" in obo["agent"])
+        if listed is not None or ("secrets_binary_sha256" in rs and not verified):
             problems.append("run_start lists credentials, but the policy names none")
     elif not isinstance(listed, list) or len(listed) != len(creds):
         problems.append(f"run_start does not list the policy's {len(creds)} credential(s)")
@@ -857,8 +861,39 @@ def check_credentials(creds, cred_rules, meta, records, complete, problems, note
     rline = at(rv[0]) if rv else None
     if len(rv) > 1:
         problems.append("the run is recorded revoked more than once")
-    if rv and not (rv[0].get("by_uid") == 0 and type(rv[0].get("by_pid")) is int and rv[0]["by_pid"] > 0):
+    # v1.28.1 step 4: the user's token's expiry. Once at most, for the user
+    # run_start names, at or after its expiry, doing what run_start says; a
+    # revocation it makes follows it (unless the run was revoked already).
+    ex = [e for e in events if e.get("event") == "on_behalf_of_expired"]
+    obo = rs.get("on_behalf_of") if isinstance(rs.get("on_behalf_of"), dict) else {}
+    user = obo.get("user") if isinstance(obo.get("user"), dict) else None
+    if len(ex) > 1:
+        problems.append("the user's token is recorded expired more than once")
+    if ex:
+        e = ex[0]
+        if user is None:
+            problems.append("on_behalf_of_expired, but run_start names no user")
+        elif e.get("expires") != user.get("expires") or e.get("subject") != user.get("subject") \
+                or e.get("action") != user.get("on_expiry", "revoke"):
+            problems.append("on_behalf_of_expired does not match the user run_start names (subject, expiry, "
+                            "what is done)")
+        elif type(e.get("timestamp_ns")) is not int or e["timestamp_ns"] < user["expires"] * 1000000000:
+            problems.append("on_behalf_of_expired is recorded before the token expired")
+    by_expiry = bool(rv) and rv[0].get("by") == "on_behalf_of_expiry"
+    if rv and by_expiry:
+        if not ex or ex[0].get("action") != "revoke" or at(ex[0]) > rline:
+            problems.append("the run is recorded revoked for the user's token's expiry, but no expiry that "
+                            "revokes is recorded before it")
+    elif rv and not (rv[0].get("by_uid") == 0 and type(rv[0].get("by_pid")) is int and rv[0]["by_pid"] > 0):
         problems.append("the run is recorded revoked by a peer that is not root, or without who asked")
+    if ex and ex[0].get("action") == "revoke" and not rv:
+        problems.append("the user's token expired and the run should have been revoked, but no revocation "
+                        "is recorded")
+    re_ = meta.get("run_end") or {}
+    if user is not None and not ex and type(user.get("expires")) is int and type(re_.get("timestamp_ns")) is int \
+            and re_["timestamp_ns"] > (user["expires"] + 2) * 1000000000:
+        problems.append("the user's token expired during the run, but its expiry is not recorded "
+                        "(on_behalf_of_expired)")
     carried = 0
     allowed_with = {}                # (proxy_conn, request_seq) -> (credential, line)
     after = lambda r: rline is not None and at(r) > rline

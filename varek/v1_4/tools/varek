@@ -1166,8 +1166,9 @@ def cmd_refusals(args):
             when = _dt.datetime.fromtimestamp(ts / 1e9).strftime("%Y-%m-%d %H:%M:%S")
         except (TypeError, ValueError, OverflowError, OSError):      # v1.28 review: no crash on a bad time
             when = "?"
-        info(f"The run was revoked at {when} (varek revoke, by uid {rv.get('by_uid', '?')}): every call "
-             f"after it was refused.\n")
+        how = ("the user's token expired" if rv.get("by") == "on_behalf_of_expiry"        # v1.28.1
+               else f"varek revoke, by uid {rv.get('by_uid', '?')}")
+        info(f"The run was revoked at {when} ({how}): every call after it was refused.\n")
     if not s["refusals"] and not ends and not s["cred_refused"]:
         info(f"No refusals in {log}.")
         return 0

@@ -18,6 +18,8 @@
 #   3. sub-agents: a control group per sub-agent launch (tests/v1281_sub);
 #      every call attributed (obo), through forks, a double fork, threads,
 #      nesting and a launch that fails; the groups out of the agent's reach.
+#   4. the user's token expires during the run: recorded, and the run
+#      revoked (or, with --on-behalf-of-expiry record, recorded only).
 #
 #   test_v1281.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
@@ -173,6 +175,8 @@ for l in open(sys.argv[1]):
     if l.startswith(\"{\\\"event\\\":\\\"run_start\\\"\"):
         u = json.loads(l)[\"on_behalf_of\"][\"user\"]; print(u[\"expires\"] - u[\"issued_at\"], u[\"issued_at\"] == u[\"not_before\"])' '$OUT/es256.out')\" = '3610 True' ]"
     check "the agent: this run" sh -c "grep -q '\"agent\":{\"run\":\"[0-9a-f]\{32\}\"}' '$OUT/es256.out'"
+    check "the audit accepts a run with a verified user (and the helper, no credential)" \
+        python3 "$HERE/tools/varek_audit.py" --policy "$T/p.txt" --checker "$CERT" "$OUT/es256.out"
     TOK="$(cat "$T/tok")"; TOKSIG="${TOK##*.}"; TOKPAY="$(echo "$TOK" | cut -d. -f2)"
     check "the token is nowhere in the Warden's output or the stream (neither its claims nor its signature)" \
         sh -c "! grep -qF -- '$TOKSIG' '$OUT/es256.out' && ! grep -qF -- '$TOKPAY' '$OUT/es256.out'"
@@ -347,6 +351,7 @@ for l in open(sys.argv[1]):
     check "the launch is recorded launched, for the sub-agent" grep -q '"result":"launched","subagent":"alpha#1"' "$OUT/fork.out"
     check "its launch record is the agent's (who launched it)" \
         sh -c "grep '\"target\":\"$B/a\"' '$OUT/fork.out' | grep -q '\"obo\":\\[\"agent\"\\]'"
+    check "the audit accepts a run with a sub-agent" python3 "$HERE/tools/varek_audit.py" --policy "$B/p.txt" --checker "$CERT" "$OUT/fork.out"
     sgo dfork exec "$B/a" doublefork "$B/f"
     [ "$(obos dfork)" = "agent+subagent:alpha#1" ] && pass "a double fork that reparents the grandchild: still the sub-agent's" || flunk "a double fork ($(obos dfork))"
     sgo thread exec "$B/a" thread "$B/f"
@@ -405,6 +410,52 @@ sys.exit(0 if rs and all(isinstance(r.get("obo"), list) and r["obo"][:1] == ["ag
         SOPT=()
         [ "$(obos user)" = "user+agent+subagent:alpha#1" ] && pass "with a verified user: user, agent, sub-agent" || flunk "with a user ($(obos user))"
     else skip "obo with a user (section 2 did not run)"; fi
+fi
+
+echo "== 4. the user's token expires during the run =="
+if [ -z "${ISS:-}" ] || [ -z "${B:-}" ]; then
+    skip "section 4 (needs sections 2 and 3: the stand-in issuer and the test program)"
+else
+    printf '%b' "require warden 1.28\ntrust issuer $ISS audience varek-agent\nallow path $B/f readonly\n$SL" > "$B/pe.txt"
+    # a token that expires 65 s after it is made (60 s is the least the Warden starts with); the
+    # agent opens a file every 250 ms for 75 s
+    mint exp65; cp "$T/tok" "$T/tok_rv"; cp "$T/tok" "$T/tok_rc"; chmod 600 "$T/tok_rv" "$T/tok_rc"
+    timeout 120 "$WARDEN" "$B/pe.txt" --secrets-conf "$T/conf" --on-behalf-of "$T/tok_rv" -- "$B/agent" loop "$B/f" 75 \
+        > "$OUT/exp_rv.so" 2> "$OUT/exp_rv.out" &
+    E1=$!
+    timeout 120 "$WARDEN" "$B/pe.txt" --secrets-conf "$T/conf" --on-behalf-of "$T/tok_rc" --on-behalf-of-expiry record \
+        -- "$B/agent" loop "$B/f" 75 > "$OUT/exp_rc.so" 2> "$OUT/exp_rc.out" &
+    E2=$!
+    "$WARDEN" "$B/pe.txt" --on-behalf-of-expiry record --check-startup > "$OUT/x1.out" 2>&1; echo $? > "$OUT/x1.rc"
+    check "refused: --on-behalf-of-expiry with no token" sh -c "! grep -qx 0 '$OUT/x1.rc' && grep -q 'there is no user.s token' '$OUT/x1.out'"
+    "$WARDEN" "$B/pe.txt" --on-behalf-of "$T/tok" --on-behalf-of-expiry ignore --check-startup > "$OUT/x2.out" 2>&1; echo $? > "$OUT/x2.rc"
+    check "refused: --on-behalf-of-expiry other than revoke or record" sh -c "! grep -qx 0 '$OUT/x2.rc' && grep -q 'takes revoke (the default) or record' '$OUT/x2.out'"
+    "$WARDEN" "$B/pe.txt" --on-behalf-of "$T/tok" --check-startup > "$OUT/x3.out" 2>&1
+    check "--check-startup says what the expiry will do" grep -q 'when it expires: the run is revoked' "$OUT/x3.out"
+    wait $E1 $E2
+    # ev <name> <event>: that event's records, one JSON a line
+    ev() { grep "^{\"event\":\"$2\"" "$OUT/$1.out"; }
+    check "revoke (the default): run_start says so" grep -q '"verified":true,"on_expiry":"revoke"}' "$OUT/exp_rv.out"
+    check "... the expiry is recorded, at or after the token's exp" python3 -c 'import json,sys
+L=[json.loads(l) for l in open(sys.argv[1]) if l.startswith("{\"event\":")]
+u=[r for r in L if r["event"]=="run_start"][0]["on_behalf_of"]["user"]
+e=[r for r in L if r["event"]=="on_behalf_of_expired"]
+sys.exit(0 if len(e)==1 and e[0]["action"]=="revoke" and e[0]["expires"]==u["expires"] and e[0]["subject"]==u["subject"]
+         and e[0]["timestamp_ns"] >= u["expires"]*10**9 else 1)' "$OUT/exp_rv.out"
+    ev exp_rv revoked | grep -q '"by":"on_behalf_of_expiry"' && pass "... then the run is revoked, by the expiry" \
+        || flunk "... then the run is revoked, by the expiry ($(ev exp_rv revoked))"
+    check "... every open after it refused, as revoked; the agent saw both" python3 -c 'import json,sys,re
+L=[l for l in open(sys.argv[1]) if l.startswith("{")]
+i=[k for k,l in enumerate(L) if l.startswith("{\"event\":\"revoked\"")][0]
+after=[json.loads(l) for l in L[i+1:] if l.startswith("{\"report_id\"")]
+before=[json.loads(l) for l in L[:i] if l.startswith("{\"report_id\"") and sys.argv[3] in l]
+m=re.search(r"opened (\d+) refused (\d+)", open(sys.argv[2]).read())
+sys.exit(0 if after and all(r["decision_final"]=="DENY" and r["rule"]=="revoked" for r in after)
+         and before and m and int(m.group(1)) > 0 and int(m.group(2)) > 0 else 1)' "$OUT/exp_rv.out" "$OUT/exp_rv.so" "$B/f"
+    check "... and the audit accepts the run" python3 "$HERE/tools/varek_audit.py" --policy "$B/pe.txt" --checker "$CERT" "$OUT/exp_rv.out"
+    check "record: the expiry is recorded, the run goes on, nothing refused" sh -c \
+        "grep -q '\"event\":\"on_behalf_of_expired\".*\"action\":\"record\"' '$OUT/exp_rc.out' && ! grep -q '^{\"event\":\"revoked\"' '$OUT/exp_rc.out' && grep -q 'opened 300 refused 0' '$OUT/exp_rc.so'"
+    check "... and the audit accepts the run" python3 "$HERE/tools/varek_audit.py" --policy "$B/pe.txt" --checker "$CERT" "$OUT/exp_rc.out"
 fi
 
 echo

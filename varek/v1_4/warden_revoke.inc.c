@@ -16,7 +16,13 @@
  * What was sent before stays sent; the run is not ended (decision D6).
  *
  * The helper's reports on leased secrets it renewed (or could not) are
- * recorded here too: `lease_renewed`, `lease_renewal_failed`. */
+ * recorded here too: `lease_renewed`, `lease_renewal_failed`.
+ *
+ * v1.28.1 step 4 (docs/security/v1.28.1-delegation-chain.md, section 4, D5):
+ * when the user's token (--on-behalf-of) expires during the run, the Warden
+ * records `on_behalf_of_expired` and, by default, revokes the run as above,
+ * the revocation recorded `"by":"on_behalf_of_expiry"`;
+ * `--on-behalf-of-expiry record` records it and lets the run go on. */
 
 static bool g_revoked;
 static int  g_ctl_listen = -1;
@@ -101,18 +107,24 @@ static void revoke_pending(int notify_fd) {
         if (g_px[k].used) px_refuse(&g_px[k], DEC_ALLOW, "revoked", EACCES);
 }
 
-static void revoke_run(uid_t uid, pid_t pid, int notify_fd) {
+/* by: NULL for `varek revoke` (the peer's uid and pid), else what revoked it */
+static void revoke_run_by(const char *by, uid_t uid, pid_t pid, int notify_fd) {
     g_revoked = true;
     FILE *f = rec_begin();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    fprintf(f, "{\"event\":\"revoked\",\"run\":\"%s\",\"by_uid\":%u,\"by_pid\":%d,\"timestamp_ns\":%lld}\n",
-            g_run_id, (unsigned)uid, (int)pid, (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+    if (by)
+        fprintf(f, "{\"event\":\"revoked\",\"run\":\"%s\",\"by\":\"%s\",\"timestamp_ns\":%lld}\n",
+                g_run_id, by, (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+    else
+        fprintf(f, "{\"event\":\"revoked\",\"run\":\"%s\",\"by_uid\":%u,\"by_pid\":%d,\"timestamp_ns\":%lld}\n",
+                g_run_id, (unsigned)uid, (int)pid, (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
     rec_end(NULL);
     revoke_pending(notify_fd);
     log_line_start();
-    fprintf(g_log, "[warden] the run is revoked (by uid %u, pid %d): every later call is refused\n",
-            (unsigned)uid, (int)pid);
+    if (by) fprintf(g_log, "[warden] the run is revoked (%s): every later call is refused\n", by);
+    else fprintf(g_log, "[warden] the run is revoked (by uid %u, pid %d): every later call is refused\n",
+                 (unsigned)uid, (int)pid);
     if (g_proxy.ctl >= 0) {
         struct wp_msg m = { .type = WP_MSG_REVOKE, .port = 0 };
         if (send(g_proxy.ctl, &m, sizeof m, MSG_DONTWAIT | MSG_NOSIGNAL) != (ssize_t)sizeof m) {
@@ -125,6 +137,45 @@ static void revoke_run(uid_t uid, pid_t pid, int notify_fd) {
         log_line_start();
         fprintf(g_log, "[warden] could not tell warden-secrets to revoke the run's leases (%s)\n", strerror(errno));
     }
+}
+
+static void revoke_run(uid_t uid, pid_t pid, int notify_fd) { revoke_run_by(NULL, uid, pid, notify_fd); }
+
+/* v1.28.1 step 4: the user's token's expiry */
+static bool g_obo_expired;
+
+static long long realtime_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* How long until the token expires (poll's timeout): -1 for no token, or
+ * once it has */
+static int obo_timeout_ms(void) {
+    if (!g_identity.has_user || g_obo_expired) return -1;
+    long long d = (long long)g_identity.exp * 1000 - realtime_ms();
+    return d <= 0 ? 0 : d > 3600000 ? 3600000 : (int)d;
+}
+
+/* Before anything else each round: the token has expired (its `exp`, no
+ * leeway) */
+static void obo_check(int notify_fd) {
+    if (!g_identity.has_user || g_obo_expired || realtime_ms() < (long long)g_identity.exp * 1000) return;
+    g_obo_expired = true;
+    FILE *f = rec_begin();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(f, "{\"event\":\"on_behalf_of_expired\",\"run\":\"%s\",\"subject\":\"", g_run_id);
+    json_escape(f, g_identity.sub);
+    fprintf(f, "\",\"expires\":%lld,\"action\":\"%s\",\"timestamp_ns\":%lld}\n", (long long)g_identity.exp,
+            g_obo_on_expiry ? "record" : "revoke", (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+    rec_end(NULL);
+    log_line_start();
+    fprintf(g_log, "[warden] the user's token (%s) has expired%s\n", g_identity.sub,
+            g_obo_on_expiry ? "; the run goes on (--on-behalf-of-expiry record)" :
+            g_revoked ? "; the run was already revoked" : "; revoking the run");
+    if (!g_obo_on_expiry && !g_revoked) revoke_run_by("on_behalf_of_expiry", 0, 0, notify_fd);
 }
 
 /* A peer on the control socket: one request, one answer. */

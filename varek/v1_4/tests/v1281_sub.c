@@ -18,6 +18,8 @@
 //                                     the kernel: E2BIG); fork: the child
 //                                     opens FILE; the parent opens it too
 //   v1281_sub write FILE              open FILE for writing; print the result
+//   v1281_sub loop FILE SECONDS       open FILE every 250 ms for SECONDS; print
+//                                     how many opens worked and how many not
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -97,6 +99,16 @@ int main(int argc, char **argv) {
         if (c == 0) { touch(f); _exit(0); }
         waitpid(c, NULL, 0);
         touch(f);
+        return 0;
+    }
+    if (!strcmp(m, "loop") && argc >= 4) {
+        int ok = 0, no = 0, n = atoi(argv[3]) * 4;
+        for (int i = 0; i < n; i++) {
+            int fd = open(f, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) { ok++; close(fd); } else no++;
+            usleep(250000);
+        }
+        printf("opened %d refused %d\n", ok, no);
         return 0;
     }
     if (!strcmp(m, "write")) {

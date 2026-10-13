@@ -151,7 +151,7 @@ def _chain_step(st, raw, rec, lineno, ndecisions, fail):
 
 # v1.28: the events of credential release and revocation (varek_audit.py)
 CRED_EVENTS = ("credential_refused", "revoked", "revocation_proxy", "revocation_leases", "lease_renewed",
-               "lease_renewal_failed")
+               "lease_renewal_failed", "on_behalf_of_expired")      # v1.28.1: the user's token's expiry
 
 
 def _parse_log(stream, allow_incomplete=False, meta=None):

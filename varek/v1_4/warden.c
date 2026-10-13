@@ -1397,6 +1397,7 @@ static ws_t       g_secrets = { .ctl = -1 };        /* v1.28: warden-secrets, wh
 static char       g_secrets_sha[65];                /* v1.28: the SHA-256 of the warden-secrets that ran */
 static ws_meta_t  g_cred_meta[WS_MAX_CREDS];        /* v1.28: each credential's version and length (never its value) */
 static struct ws_identity g_identity;               /* v1.28.1: the verified user and agent (has_user, has_svid) */
+static int g_obo_on_expiry;                         /* v1.28.1 step 4: 0 revoke the run when the token expires, 1 record only */
 /* v1.28.1 step 3: sub-agents (warden_subagent.inc.c) */
 static bool g_sub_on;                               /* the policy names a sub-agent */
 static char g_cg_self[PATH_MAX];                    /* the run's group as /proc/<pid>/cgroup shows it */
@@ -1684,7 +1685,8 @@ static void emit_on_behalf_of(FILE *f, const struct policy *p) {
         if (id->jti[0]) { fputs("\"jti\":\"", f); json_escape(f, id->jti); fputs("\",", f); }
         fprintf(f, "\"algorithm\":\"%s\",", id->alg);
         if (id->kid[0]) { fputs("\"key_id\":\"", f); json_escape(f, id->kid); fputs("\",", f); }
-        fprintf(f, "\"token_sha256\":\"%s\",\"policy_line\":%d,\"verified\":true},", id->token_sha256, is->line);
+        fprintf(f, "\"token_sha256\":\"%s\",\"policy_line\":%d,\"verified\":true,\"on_expiry\":\"%s\"},",
+                id->token_sha256, is->line, g_obo_on_expiry ? "record" : "revoke");
         if (id->nact) {
             fputs("\"actors\":[", f);
             for (uint32_t k = 0; k < id->nact; k++) {
@@ -3122,7 +3124,11 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         int rvi = pxi + 1 + npx;
         pfds[rvi] = (struct pollfd){ .fd = g_ctl_listen, .events = POLLIN };
         pfds[rvi + 1] = (struct pollfd){ .fd = g_secrets.ctl, .events = POLLIN };
+        /* v1.28.1 step 4: and the user's token's expiry */
+        int oto = obo_timeout_ms();
+        if (oto >= 0 && (to < 0 || oto < to)) to = oto;
         int pr = poll(pfds, (nfds_t)(rvi + 2), to);
+        if (pr >= 0) obo_check(notify_fd);
         if (pr < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -4567,10 +4573,13 @@ static void usage(const char *argv0) {
         "              [--dns-server <a.b.c.d[:port]>] [--dns-ttl-min <s>] [--dns-ttl-max <s>]\n"
         "              [--dns-grace-max <s>] [--psl <file>] [--shared-domains <file>]\n              [--proxy-as <user>] [--proxy-bin <warden-proxy>] [--trust-bundle <pem>]\n"
         "              [--secrets-as <user>] [--secrets-bin <warden-secrets>] [--secrets-conf <file>]\n"
-        "              [--on-behalf-of <token file>] [--agent-svid <svid file>]\n"
+        "              [--on-behalf-of <token file> [--on-behalf-of-expiry revoke|record]]\n"
+        "              [--agent-svid <svid file>]\n"
         "              [--writable-exec]\n"
         "              -- <target> [args...]\n"
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
+        , argv0, argv0);
+    fprintf(stderr,
         "\n"
         "  Privileged seccomp-unotify supervisor (VAREK Warden v1.4).\n"
         "  --check-startup runs the startup checks and exits (0: would start).\n"
@@ -4628,12 +4637,14 @@ static void usage(const char *argv0) {
         "  TCP or UDP socket to the wildcard address and port 0 (which the\n"
         "  Warden performs), other socket kinds.\n"
         "\n"
-        , argv0, argv0);
+        );
     fputs(
         "  --on-behalf-of (v1.28.1, root): the user's token (a JWT in a root-owned file) the run acts\n"
         "      for, verified by warden-secrets against an issuer the policy trusts (`trust issuer`);\n"
         "      --agent-svid: the agent's X.509-SVID and key, verified against `trust spiffe`'s bundle.\n"
-        "      run_start records what was verified (never the token).\n"
+        "      run_start records what was verified (never the token). When the token expires during\n"
+        "      the run it is recorded (on_behalf_of_expired) and the run revoked, as by varek revoke;\n"
+        "      --on-behalf-of-expiry record lets the run go on.\n"
         "\n"
         , stderr);
     fputs(
@@ -4713,7 +4724,7 @@ int main(int argc, char **argv) {
     const char *proxy_as_arg = NULL;    /* v1.26: the egress proxy's user */
     const char *proxy_bin_arg = NULL;   /* v1.26.1: the warden-proxy binary */
     const char *secrets_bin_arg = NULL, *secrets_as_arg = NULL, *secrets_conf_arg = NULL;   /* v1.28 */
-    const char *obo_arg = NULL, *svid_arg = NULL;                                        /* v1.28.1 */
+    const char *obo_arg = NULL, *svid_arg = NULL, *obo_exp_arg = NULL;                  /* v1.28.1 */
     const char *flow_path   = NULL;     /* v1.18.0 */
     const char *session_arg = NULL;     /* v1.18.0 */
     const char *state_arg   = NULL;     /* v1.18.0 */
@@ -4759,6 +4770,13 @@ int main(int argc, char **argv) {
             obo_arg = argv[++i];
         } else if (strcmp(argv[i], "--agent-svid") == 0 && !svid_arg) {       /* v1.28.1 */
             svid_arg = argv[++i];
+        } else if (strcmp(argv[i], "--on-behalf-of-expiry") == 0 && !obo_exp_arg) {   /* v1.28.1 step 4 */
+            obo_exp_arg = argv[++i];
+            if (strcmp(obo_exp_arg, "revoke") && strcmp(obo_exp_arg, "record")) {
+                fprintf(stderr, "[warden] --on-behalf-of-expiry takes revoke (the default) or record\n");
+                return 2;
+            }
+            g_obo_on_expiry = !strcmp(obo_exp_arg, "record");
         } else if (strcmp(argv[i], "--trust-bundle") == 0 && !g_trust_bundle_arg) { /* v1.26.1 */
             g_trust_bundle_arg = argv[++i];
         } else if (strcmp(argv[i], "--checkpoint-every") == 0) {
@@ -4933,6 +4951,10 @@ int main(int argc, char **argv) {
                 "--on-behalf-of FILE; refusing to start\n");
         return 2;
     }
+    if (obo_exp_arg && !obo_arg) {
+        fprintf(stderr, "[warden] --on-behalf-of-expiry: there is no user's token (--on-behalf-of) to expire\n");
+        return 2;
+    }
     if (obo_arg && !p.v.nissuers) {
         fprintf(stderr, "[warden] --on-behalf-of: the policy trusts no issuer (`trust issuer URL audience AUD`), "
                 "so no token can be verified; refusing to start\n");
@@ -4960,7 +4982,8 @@ int main(int argc, char **argv) {
             for (size_t k = 0; k < p.v.ncreds; k++)
                 fprintf(stderr, "[warden]   credential %s from %s:%s (line %d)\n", p.v.creds[k].name,
                         kStore[p.v.creds[k].store], p.v.creds[k].ref, p.v.creds[k].line);
-            if (obo_arg) fprintf(stderr, "[warden]   the user's token %s (--check-credentials verifies it)\n", obo_arg);
+            if (obo_arg) fprintf(stderr, "[warden]   the user's token %s (--check-credentials verifies it); when it "
+                                 "expires: %s\n", obo_arg, g_obo_on_expiry ? "recorded, the run goes on" : "the run is revoked");
             if (svid_arg) fprintf(stderr, "[warden]   the agent's SVID %s (--check-credentials verifies it)\n", svid_arg);
         } else {
             if (geteuid() != 0) {
@@ -5069,8 +5092,9 @@ int main(int argc, char **argv) {
             if (g_identity.has_user) {
                 const struct ws_identity *id = &g_identity;
                 fprintf(stderr, "[warden] on behalf of %s (issuer %s, line %d): token verified (%s%s%s), expires in "
-                        "%lld s, SHA-256 %s\n", id->sub, p.v.issuers[id->issuer].iss, p.v.issuers[id->issuer].line,
-                        id->alg, id->kid[0] ? ", key " : "", id->kid, (long long)(id->exp - time(NULL)), id->token_sha256);
+                        "%lld s (then %s), SHA-256 %s\n", id->sub, p.v.issuers[id->issuer].iss, p.v.issuers[id->issuer].line,
+                        id->alg, id->kid[0] ? ", key " : "", id->kid, (long long)(id->exp - time(NULL)),
+                        g_obo_on_expiry ? "recorded" : "the run is revoked", id->token_sha256);
                 for (uint32_t k = 0; k < id->nact; k++)
                     fprintf(stderr, "[warden]   actor %u: %s%s%s\n", k + 1, id->act[k].sub,
                             id->act[k].iss[0] ? ", issuer " : "", id->act[k].iss);
