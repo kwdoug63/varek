@@ -60,6 +60,8 @@ static int exec_image_of(const char *path, dev_t *dev, ino_t *ino);      /* step
 static void exec_mark_image(dev_t dev, ino_t ino);
 static int exec_pend_add(pid_t tid, dev_t edev, ino_t eino, uint64_t seq);
 static void exec_pend_last_sub(int s);                                   /* v1.28.1 */
+static void exec_dry_image(dev_t dev, ino_t ino);                       /* v1.29 */
+static bool exec_is_dry_image(dev_t dev, ino_t ino);
 
 static struct exec_file *g_exec_rs;
 static size_t g_exec_n;
@@ -629,9 +631,17 @@ static void exec_launch(int notify_fd, const struct seccomp_notif *req, struct a
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     uint64_t lat = (uint64_t)(t1.tv_sec - t0->tv_sec) * 1000000000ULL + (uint64_t)(t1.tv_nsec - t0->tv_nsec);
+    /* v1.29: a dry run lets a launch the policy refuses through to the
+     * kernel (no Landlock holds it), and remembers its image, which the
+     * identity check then lets run */
+    bool let = d_final != DEC_ALLOW && dry_let(a, rule);
+    dev_t ddev = 0;
+    ino_t dino = 0;
+    if (let && exec_image_of(a->resolved[0] ? a->resolved : a->target, &ddev, &dino) == 0)
+        exec_dry_image(ddev, dino);
     emit_pathology(g_report_seq++, (pid_t)req->pid, a, d_raw, d_final, rule, lat,
-                   d_final == DEC_ALLOW ? 0 : EACCES);
-    send_simple(notify_fd, req->id, d_final);
+                   d_final == DEC_ALLOW || let ? 0 : EACCES);
+    send_simple(notify_fd, req->id, let ? DEC_ALLOW : d_final);
 }
 
 /* ---- v1.27 step 4: the identity check (design section 3) ---- */
@@ -681,6 +691,23 @@ static void exec_mark_image(dev_t dev, ino_t ino) {
     for (size_t k = 0; k < g_exec_n; k++)
         if (g_exec_rs[k].dev == dev && g_exec_rs[k].ino == ino && strcmp(g_exec_rs[k].why, "loader") != 0)
             g_exec_rs[k].image = true;
+}
+
+/* v1.29: the images of launches a dry run let through (the identity check
+ * lets a process run one). At most 1024; past that, a mismatch is recorded. */
+static struct { dev_t dev; ino_t ino; } g_dry_img[1024];
+static size_t g_dry_nimg;
+static void exec_dry_image(dev_t dev, ino_t ino) {
+    for (size_t k = 0; k < g_dry_nimg; k++) if (g_dry_img[k].dev == dev && g_dry_img[k].ino == ino) return;
+    if (g_dry_nimg < sizeof g_dry_img / sizeof g_dry_img[0]) {
+        g_dry_img[g_dry_nimg].dev = dev;
+        g_dry_img[g_dry_nimg].ino = ino;
+        g_dry_nimg++;
+    }
+}
+static bool exec_is_dry_image(dev_t dev, ino_t ino) {
+    for (size_t k = 0; k < g_dry_nimg; k++) if (g_dry_img[k].dev == dev && g_dry_img[k].ino == ino) return true;
+    return false;
 }
 
 static void exec_result(const struct exec_pend *x, const char *result) {
@@ -778,6 +805,9 @@ static bool exec_identity(int notify_fd, const struct seccomp_notif *req, struct
     }
     const struct exec_file *e = why ? NULL : exec_rs_find(st.st_dev, st.st_ino);
     if (!why && !(e && e->image)) why = "exec_identity_mismatch";
+    /* v1.29: in a dry run, an image a refused launch let through runs on */
+    if (why && !strcmp(why, "exec_identity_mismatch") && g_dry && exec_is_dry_image(st.st_dev, st.st_ino))
+        return false;
     if (!why) return false;
     if (!strcmp(why, "exec_identity_unreadable")) {
         /* A live process's image is always readable here (the Warden is

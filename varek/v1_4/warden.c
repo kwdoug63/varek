@@ -284,6 +284,7 @@ struct action {
     int           chg_fd;               /* the descriptor of ftruncate, fchmod, futimens */
     struct timespec chg_times[2];
     bool          chg_times_null;
+    bool          dry;                  /* v1.29: a refusal a dry run let through (not enforced) */
     char          extra[4608];          /* extra record fields, trusted text, each ending in ',' */
 };
 
@@ -309,6 +310,40 @@ static const char *action_kind_name(action_kind_t k) {
         case ACT_OTHER:        return "other";
     }
     return "invalid";
+}
+
+/* ---------------- v1.29: the dry run (docs/security/v1.29-varek-run.md, section 3) ----------------
+ *
+ * `--dry-run`, given per run on the command line only (D3): every call is
+ * decided, certified and recorded as when enforcing; a call the POLICY
+ * refuses is then let through (D1) and its record says "enforced":false:
+ * a file open, lookup, change or launch goes to the kernel as the agent's own
+ * user (CONTINUE), a connect is dialed by the Warden as an allowed one is, the
+ * stub answers a name no rule reaches, the proxy relays a request no rule
+ * allows (with no credential), and a system call outside the allowlist,
+ * which the filter then sends here, goes to the kernel. Refused all the same
+ * (D2), recorded as enforced: the hard-denied system calls (the filter), the
+ * protected objects, raw devices, the views, kernel filesystems, anything the
+ * Warden could not resolve, the sub-agents' attribution, and every call after
+ * `varek revoke` or the user token's expiry. */
+static bool     g_dry = false;
+static uint64_t g_dry_unenforced = 0;
+
+/* the record rules of a refusal the policy made (a dry run lets those through) */
+static bool dry_policy_rule(const char *rule) {
+    static const char *const kLet[] = {
+        "policy_match", "default_deny_unknown", "fragment_escape_flags", "fragment_escape_length",
+        "certificate_refused", "exec_not_in_ruleset", "exec_no_landlock", "syscall_not_admitted",
+        "rename_to_refused", "max_body", NULL };
+    for (int i = 0; rule && kLet[i]; i++) if (!strcmp(rule, kLet[i])) return true;
+    return false;
+}
+
+/* In a dry run, a refusal by rule is let through: mark a, true. */
+static bool dry_let(struct action *a, const char *rule) {
+    if (!g_dry || !dry_policy_rule(rule)) return false;
+    a->dry = true;
+    return true;
 }
 
 /* ---------------- Policy ---------------- */
@@ -977,6 +1012,7 @@ static int derive_intent(const struct seccomp_notif *req,
         return 0;
     }
     out->kind = ACT_OTHER;
+    snprintf(out->target, sizeof out->target, "syscall:%d", nr);   /* v1.29: named in the record */
     return 0;
 }
 
@@ -1492,6 +1528,7 @@ static char     g_run_id[33];
 static wr_table_t g_names;           /* v1.24: the resolution table (see names_setup) */
 static bool       g_names_on = false;
 static bool       g_any_name = false;  /* v1.24: the policy has a host name rule (allow or deny) */
+static bool       g_policy_any_name = false;  /* v1.29: so, before a dry run's views */
 static bool       g_any_wild = false;  /* v1.25: the policy has a wildcard allow rule (warden_stub.inc.c) */
 static void       stub_resolved(size_t i);
 static void       px_resolved(size_t i);  /* v1.26: proxied requests waiting on a lookup */
@@ -1530,7 +1567,7 @@ static bool       g_syn_on = false;    /* v1.26: `proxy on`: synthetic addresses
 static const struct policy *g_syn_p;   /* v1.26: the policy, for the hosts view */
 /* v1.26: the stub runs with a wildcard allow rule (v1.25), or with the proxy
  * on and any host name rule (synthetic addresses) */
-#define STUB_WANTED() (g_any_wild || (g_syn_on && g_names_on))
+#define STUB_WANTED() (g_any_wild || (g_syn_on && g_names_on) || g_dry)   /* v1.29: a dry run */
 static uint64_t   g_proxy_conns = 0;   /* v1.26: connections handed to the proxy (proxy_conn ids) */
 static int        g_up_entry = -1;     /* v1.26 section 5: the upstream proxy's name in g_names, or -1 */
 static wr_ip_t    g_up_ip;             /* v1.26 section 5: the upstream given as an address */
@@ -1872,7 +1909,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
         fprintf(f, "\"checkpoint_every\":%" PRIu64 ",", g_ckpt_every);
     if (g_anchor_fd >= 0) fputs("\"anchored\":true,", f);
     /* v1.24: the names the Warden resolves (each gets a resolution record). */
-    if (g_any_name) fputs("\"host_name_rules\":true,", f);
+    if (g_policy_any_name) fputs("\"host_name_rules\":true,", f);
     /* v1.25: the lists the policy's wildcards were checked against */
     if (g_psl_sha[0]) fprintf(f, "\"psl_sha256\":\"%s\",\"shared_domains_sha256\":\"%s\","
                               "\"shared_lists_pinned\":%s,",
@@ -1913,6 +1950,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     /* v1.27: Landlock and the launch set (require warden 1.27) */
     if (p->v.launches) { exec_ruleset_record(f); noexec_record(f); }   /* v1.27, v1.27.1 */
     as_agent_record(f);                  /* v1.29: who files are opened as */
+    if (g_dry) fputs("\"mode\":\"dry_run\",", f);   /* v1.29: not enforcing (section 3) */
     /* v1.29: the baseline this policy is (section 2), and the names (never
      * the values) of the agent's environment, under require warden 1.29 */
     if (p->base.on) {
@@ -2040,6 +2078,10 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
     }
     /* v1.25: a wildcard adds names when the agent asks (the stub) */
     g_names_on = g_names.n > 0 || g_any_wild;
+    g_policy_any_name = g_any_name;
+    /* v1.29: a dry run serves the agent the name views and the stub, which
+     * answers every name (warden_stub.inc.c), whatever the policy names */
+    if (g_dry) { g_any_name = true; g_names_on = true; }
     g_syn_on = p->v.proxy;               /* v1.26 */
     g_syn_p = p;
     return 0;
@@ -2214,15 +2256,23 @@ static void emit_run_end(int exit_status) {
     emit_unanswered();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
+    char dry_count[48] = "";
+    if (g_dry) snprintf(dry_count, sizeof dry_count, "\"not_enforced\":%" PRIu64 ",", g_dry_unenforced);
     FILE *f = rec_begin();
     fprintf(f, "{\"event\":\"run_end\",\"run\":\"%s\",\"records\":%" PRIu64 ","
-               "\"exit_status\":%d,%s%s%s\"timestamp_ns\":%lld}\n",
-            g_run_id, g_records, exit_status,
+               "\"exit_status\":%d,%s%s%s%s%s\"timestamp_ns\":%lld}\n",
+            g_run_id, g_records, exit_status, dry_count,
+            g_dry ? "\"mode\":\"dry_run\"," : "",
             g_anchor_errors ? "\"anchor_errors_seen\":true," : "",
             g_px_failed ? "\"proxy_failed\":true," : "",
             g_exec_mismatch ? "\"exec_identity_mismatch\":true," : "",
             (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end("run_end");
+    if (g_dry) {                                                           /* v1.29 */
+        log_line_start();
+        fprintf(g_log, "[warden] DRY RUN: NOT ENFORCING: %" PRIu64 " call(s) the policy refuses were let "
+                "through (\"enforced\":false)\n", g_dry_unenforced);
+    }
 }
 
 /* v1.18.0: the name of an errno the Warden answers a refused call with, for
@@ -2258,6 +2308,7 @@ static void emit_pathology(uint64_t seq,
                            int kernel_errno)
 {
     if (!g_log) return;
+    if (a->dry) d_final = DEC_DENY;      /* v1.29: a call a dry run let through was refused by the policy */
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     char flags_json[40] = "";
@@ -2288,6 +2339,7 @@ static void emit_pathology(uint64_t seq,
         (int)pid);
     /* v1.28.1: who it was for */
     sub_obo(f, a->subject);
+    if (a->dry) { fputs("\"enforced\":false,", f); g_dry_unenforced++; }   /* v1.29 */
     fprintf(f, "\"action\":\"%s\",\"target\":\"",
             a->kind == ACT_FILE_CHANGE ? change_op_name(a->chg_op) : action_kind_name(a->kind));
     json_escape(f, a->target);
@@ -3538,10 +3590,10 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                 if (mfd >= 0) close(mfd);
                 uint64_t lat_m = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                                + (t1.tv_nsec - t0.tv_nsec);
-                emit_pathology(g_report_seq++, req.pid, &act, m_raw, m_final,
-                               m_cert_refused ? "certificate_refused" : decision_rule_id(&act, m_raw),
-                               lat_m, EACCES);
-                send_simple(notify_fd, req.id, DEC_DENY);
+                const char *mrule = m_cert_refused ? "certificate_refused" : decision_rule_id(&act, m_raw);
+                bool mlet = dry_let(&act, mrule);                   /* v1.29: to the kernel */
+                emit_pathology(g_report_seq++, req.pid, &act, m_raw, m_final, mrule, lat_m, mlet ? 0 : EACCES);
+                send_simple(notify_fd, req.id, mlet ? DEC_ALLOW : DEC_DENY);
                 continue;
             }
             int64_t r;
@@ -3624,12 +3676,14 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                     decision_t nr = policy_decide(p, &act);
                     bool nok = nr == DEC_ALLOW && certify(p, &act);
                     clock_gettime(CLOCK_MONOTONIC, &t1);
-                    emit_pathology(g_report_seq++, req.pid, &act, nr, nok ? DEC_ALLOW : DEC_DENY,
-                                   nok ? "open_not_found" : nr == DEC_ALLOW ? "certificate_refused"
-                                                                         : decision_rule_id(&act, nr),
+                    const char *nrule = nok ? "open_not_found" : nr == DEC_ALLOW ? "certificate_refused"
+                                                                                : decision_rule_id(&act, nr);
+                    bool nlet = !nok && dry_let(&act, nrule);          /* v1.29: to the kernel */
+                    emit_pathology(g_report_seq++, req.pid, &act, nr, nok ? DEC_ALLOW : DEC_DENY, nrule,
                                    (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec),
-                                   nok ? ENOENT : EACCES);
-                    send_errno(notify_fd, req.id, nok ? ENOENT : EACCES);
+                                   nok ? ENOENT : nlet ? 0 : EACCES);
+                    if (nlet) send_simple(notify_fd, req.id, DEC_ALLOW);
+                    else send_errno(notify_fd, req.id, nok ? ENOENT : EACCES);
                     continue;
                 }
                 if (mofd >= 0) close(mofd);
@@ -3716,10 +3770,10 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat_d = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                            + (t1.tv_nsec - t0.tv_nsec);
-            emit_pathology(g_report_seq++, req.pid, &act, d_raw, d_final,
-                           cert_refused ? "certificate_refused" : decision_rule_id(&act, d_raw),
-                           lat_d, EACCES);
-            send_simple(notify_fd, req.id, d_final);
+            const char *orule = cert_refused ? "certificate_refused" : decision_rule_id(&act, d_raw);
+            bool olet = dry_let(&act, orule);       /* v1.29: to the kernel, as the agent */
+            emit_pathology(g_report_seq++, req.pid, &act, d_raw, d_final, orule, lat_d, olet ? 0 : EACCES);
+            send_simple(notify_fd, req.id, olet ? DEC_ALLOW : d_final);
             continue;
         }
 
@@ -3738,6 +3792,17 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             continue;
         }
 
+        /* v1.29: in a dry run the filter sends a system call outside its
+         * allowlist here (when enforcing it is refused there, EPERM): the
+         * kernel carries it out, recorded as not enforced */
+        if (act.kind == ACT_OTHER && g_dry) {
+            act.dry = true;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            emit_pathology(g_report_seq++, req.pid, &act, DEC_UNKNOWN, DEC_DENY, "syscall_not_admitted",
+                           (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec), 0);
+            send_simple(notify_fd, req.id, DEC_ALLOW);
+            continue;
+        }
         send_simple(notify_fd, req.id, d_final);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         uint64_t lat = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
@@ -4944,6 +5009,8 @@ int main(int argc, char **argv) {
             key_path = argv[++i];
         } else if (strcmp(argv[i], "--anchor") == 0 && !anchor_path) {
             anchor_path = argv[++i];
+        } else if (strcmp(argv[i], "--dry-run") == 0) {                  /* v1.29 */
+            g_dry = true;
         } else if (strcmp(argv[i], "--writable-exec") == 0) {            /* v1.27.1 */
             g_writable_exec = true;
         } else if (strcmp(argv[i], "--run-as") == 0 && !run_as_arg) {
@@ -5053,6 +5120,25 @@ int main(int argc, char **argv) {
     /* ~1 MB (256 rules x 4 KB constants): static, not on the stack. */
     static struct policy p;
     if (policy_load(policy_path, &p) < 0) return 1;
+    /* v1.29: a dry run (section 3), on the command line only (D3). Not with
+     * a plan (the plan gate refuses before the agent starts; checking a plan
+     * is `varek policy check`'s job), with credentials (it would hand the
+     * proxy real values for an agent whose policy is not settled: D2), or
+     * with sub-agents (their attribution rests on launches being held). */
+    if (g_dry) {
+        bool subs = false;
+        for (size_t i = 0; i < p.v.n; i++) if (p.v.rules[i].subagent[0]) subs = true;
+        const char *no = plan_path ? "--plan" : p.v.ncreds ? "a policy that names credentials"
+                       : subs ? "a policy that names sub-agents (subagent=)" : NULL;
+        if (no) {
+            fprintf(stderr, "[warden] --dry-run with %s is refused\n", no);
+            return 2;
+        }
+        fprintf(stderr, "[warden] DRY RUN: NOT ENFORCING. Every call is decided and recorded; a call the "
+                "policy refuses is let through (\"enforced\":false). The protected objects, the hard-denied "
+                "system calls and revocation still refuse.\n");
+        g_writable_exec = true;          /* no noexec mounts: launches are not held */
+    }
 
     /* v1.16: log integrity. */
     if (sodium_init() < 0) {
@@ -5391,6 +5477,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         fprintf(stderr, "[warden] launch set: %zu files, %s\n", g_exec_n,
+                g_dry ? "not held (dry run)" :
                 g_ll_abi >= 1 ? "held by Landlock" : "no Landlock: later launches refused");
         if (g_check_only)
             for (size_t k = 0; k < g_exec_n; k++) {
@@ -5629,14 +5716,15 @@ int main(int argc, char **argv) {
         /* v1.27: the agent enters the launch set's Landlock domain before
          * its filter is installed (the filter does not admit the call) and
          * before its own launch, which the set holds */
-        if (exec_ruleset_apply() < 0) {
+        if (!g_dry && exec_ruleset_apply() < 0) {      /* v1.29: a dry run holds no launch */
             fprintf(stderr, "[warden-target] cannot enter the Landlock domain (%s); refusing to run\n",
                     strerror(errno));
             _exit(1);
         }
         int notify_fd =
             install_baseline_user_notif_filter_ex(getenv("VAREK_WARDEN_OBSERVE") != NULL,
-                                                  p.v.open_as_agent);   /* v1.29: changes by name */
+                                                  (p.v.open_as_agent ? WD_FILTER_CHANGES : 0) |
+                                                  (g_dry ? WD_FILTER_DRY : 0));   /* v1.29 */
         if (notify_fd < 0) { perror("seccomp"); _exit(1); }
         /* v1.12: hand the fd NUMBER to the supervisor and wait for it to pull
          * the fd via pidfd_getfd(). write()/read() are admitted; no sendmsg. */

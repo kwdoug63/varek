@@ -37,6 +37,9 @@
 #define _GNU_SOURCE
 #endif
 #include "warden_baseline_filter.h"
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include <seccomp.h>
 #include <sched.h>
@@ -231,6 +234,40 @@ static int add_list(scmp_filter_ctx ctx, const char **names, uint32_t action) {
     return 0;
 }
 
+static bool in_list(const char **names, const char *n) {
+    for (size_t i = 0; names[i]; ++i) if (!strcmp(names[i], n)) return true;
+    return false;
+}
+
+static const char *kChange[];
+static const char *kChangeAdmit[];
+static const char *kMediate[];
+static const char *kHardDeny[];
+static const char *kAdmit[];
+
+// v1.29: a dry run sends every native system call the filter names nowhere
+// to the supervisor (which records it and lets the kernel carry it out),
+// instead of the default refusal. (The kernel takes no NOTIFY default.) A call
+// with argument rules (ioctl's commands, kill of a group, clone's namespace
+// bits, setsockopt's routing options, sendto, unshare, clone3,
+// io_uring_setup) keeps them: what they refuse stays refused.
+static int add_dry_rest(scmp_filter_ctx ctx, int file_changes) {
+    static const char *const kConditional[] = { "clone", "clone3", "ioctl", "kill", "sendto", "setsockopt",
+                                                "unshare", "io_uring_setup", NULL };
+    for (int nr = 0; nr < 1024; nr++) {
+        char *n = seccomp_syscall_resolve_num_arch(SCMP_ARCH_NATIVE, nr);
+        if (!n) continue;
+        bool named = in_list(kHardDeny, n) || in_list(kMediate, n) || in_list(kAdmit, n) ||
+                     in_list((const char **)kConditional, n) ||
+                     (file_changes && (in_list(kChange, n) || in_list(kChangeAdmit, n)));
+        free(n);
+        if (named) continue;
+        int rc = seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, nr, 0);
+        if (rc < 0 && rc != -EEXIST) return rc;
+    }
+    return 0;
+}
+
 static int deny_ns_bits(scmp_filter_ctx ctx, int sysnr) {
     for (size_t i = 0; i < sizeof kCloneNsBits / sizeof kCloneNsBits[0]; ++i) {
         scmp_datum_t bit = (scmp_datum_t)kCloneNsBits[i];
@@ -399,7 +436,8 @@ static int add_io_uring_setup(scmp_filter_ctx ctx) {
 }
 
 // Build the filter. default_action is EPERM (enforce) or LOG (observe).
-static int build(scmp_filter_ctx *out_ctx, int observe, int file_changes) {
+static int build(scmp_filter_ctx *out_ctx, int observe, int flags) {
+    int file_changes = flags & WD_FILTER_CHANGES;
     uint32_t def = observe ? SCMP_ACT_LOG : SCMP_ACT_ERRNO(EPERM);
     scmp_filter_ctx ctx = seccomp_init(def);
     if (!ctx) return -ENOMEM;
@@ -425,6 +463,7 @@ static int build(scmp_filter_ctx *out_ctx, int observe, int file_changes) {
         if (rc < 0) goto fail;
     }
     if ((rc = add_list(ctx, kMediate, SCMP_ACT_NOTIFY)) < 0) goto fail;
+    if ((flags & WD_FILTER_DRY) && (rc = add_dry_rest(ctx, file_changes)) < 0) goto fail;   // v1.29
     if (file_changes) {                                       // v1.29
         if ((rc = add_list(ctx, kChange, SCMP_ACT_NOTIFY)) < 0) goto fail;
         if ((rc = add_list(ctx, kChangeAdmit, SCMP_ACT_ALLOW)) < 0) goto fail;
@@ -469,11 +508,11 @@ int install_baseline_user_notif_filter(int observe) {
     return install_baseline_user_notif_filter_ex(observe, 0);
 }
 
-int install_baseline_user_notif_filter_ex(int observe, int file_changes) {
+int install_baseline_user_notif_filter_ex(int observe, int flags) {
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) return -1;
 
     scmp_filter_ctx ctx;
-    if (build(&ctx, observe, file_changes) < 0) return -1;
+    if (build(&ctx, observe, flags) < 0) return -1;
 
     if (seccomp_load(ctx) < 0) { seccomp_release(ctx); return -1; }
 

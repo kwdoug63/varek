@@ -428,6 +428,13 @@ static void change_handle(int notify_fd, const struct seccomp_notif *req, struct
     }
     decision_t raw;
     why = change_decide(p, a, &raw);
+    if (why && dry_let(a, why)) {             /* v1.29: a dry run: to the kernel, as the agent */
+        change_close(&x);
+        change_close(&y);
+        emit_pathology(g_report_seq++, pid, a, raw, DEC_DENY, why, change_lat(t0), 0);
+        send_simple(notify_fd, req->id, DEC_ALLOW);
+        return;
+    }
     if (why) {
         emit_pathology(g_report_seq++, pid, a, raw, DEC_DENY, why, change_lat(t0), EACCES);
         send_errno(notify_fd, req->id, EACCES);
@@ -438,6 +445,15 @@ static void change_handle(int notify_fd, const struct seccomp_notif *req, struct
     decision_t raw2 = DEC_ALLOW;
     if (a->chg_op == CHG_RENAME_FROM) {
         const char *w2 = change_decide(p, &b, &raw2);
+        if (w2 && dry_let(&b, w2)) {          /* v1.29: a dry run */
+            a->dry = true;
+            change_close(&x);
+            change_close(&y);
+            emit_pathology(g_report_seq++, pid, a, raw, DEC_DENY, "rename_to_refused", change_lat(t0), 0);
+            emit_pathology(g_report_seq++, pid, &b, raw2, DEC_DENY, w2, change_lat(t0), 0);
+            send_simple(notify_fd, req->id, DEC_ALLOW);
+            return;
+        }
         if (w2) {
             emit_pathology(g_report_seq++, pid, a, raw, DEC_DENY, "rename_to_refused", change_lat(t0), EACCES);
             emit_pathology(g_report_seq++, pid, &b, raw2, DEC_DENY, w2, change_lat(t0), EACCES);

@@ -26,6 +26,12 @@
 #      kind is decided as, carried out as the agent, recorded and audited
 #      (four forged streams); links refused; a v1.28 policy as before; git,
 #      mv, rm -r and Python's tempfile under the baseline.
+#   3. the dry run: each kind of call the policy refuses let through and
+#      recorded enforced:false (an open, a write, a lookup, a change, a call
+#      outside the allowlist, a connect, a launch, a name), the agent's own
+#      rights still applying, and what still refuses (a protected object, a
+#      Unix socket, a hard-denied call, revocation); the labels and counts;
+#      the same agent enforcing; what a dry run is refused with.
 #   6. the agent's user (the user who ran sudo, else nobody; never root) and
 #      environment (a clean one; --env by name; recorded by name only), and
 #      the agent's /tmp/varek-<uid>.
@@ -483,6 +489,127 @@ SHT
     else
         skip "git, mv, rm -r and tempfile with the baseline (no section-2 user)"
     fi
+fi
+
+echo "== 3. the dry run =="
+if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
+    skip "the dry run (it runs as root: the agent runs as another user)"
+else
+    Y="$OUT/y"
+    mkdir -p "$Y/w" "$Y/o" "$Y/u"
+    chmod 755 "$Y"; chmod 1777 "$Y/w" "$Y/o"
+    echo hi > "$Y/o/f"; chmod 644 "$Y/o/f"
+    echo s > "$Y/o/secret"; chmod 600 "$Y/o/secret"
+    printf 'require warden 1.29\nallow path /usr/ readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/w/\nallow exec /usr/bin/python3\n' "$Y" > "$Y/p.txt"
+    python3 -m http.server 0 --bind 127.0.0.1 --directory "$Y/w" > "$Y/http.out" 2>&1 &
+    YH=$!
+    for _ in $(seq 1 50); do YP="$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$Y/http.out" | head -1)"; [ -n "$YP" ] && break; sleep 0.1; done
+    python3 -c "
+import socket, os, time
+s = socket.socket(socket.AF_UNIX); s.bind('$Y/u/sock'); os.chmod('$Y/u/sock', 0o777); s.listen(4)
+time.sleep(60)" & YU=$!
+    YN="$(hostname)"           # a name the host resolves (its /etc/hosts), not in the agent's hosts view
+    cat > "$Y/w/agent.py" <<PYD
+import ctypes, os, socket, subprocess, sys
+def t(what, f):
+    try:
+        r = f(); print(what, "ok" if r is None else r)
+    except Exception as e:
+        print(what, type(e).__name__, getattr(e, "errno", ""))
+t("read-outside", lambda: open("$Y/o/f").read().strip())
+t("write-outside", lambda: open("$Y/o/new", "w").write("x") and None)
+t("read-root-only", lambda: open("$Y/o/secret").read())
+t("stat-outside", lambda: os.stat("$Y/o/f").st_size)
+t("own", lambda: open("$Y/o/mine", "w").write("m") and None)
+t("link", lambda: os.link("$Y/o/mine", "$Y/w/hl"))
+t("unlink-outside", lambda: os.unlink("$Y/o/mine"))
+def conn():
+    s = socket.create_connection(("127.0.0.1", $YP), timeout=5); s.sendall(b"GET / HTTP/1.0\r\n\r\n"); return s.recv(12).decode()
+t("connect", conn)
+t("launch", lambda: subprocess.run(["/usr/bin/id", "-u"], capture_output=True, text=True).stdout.strip())
+t("stream", lambda: open(sys.argv[1]).read(1))
+def unix():
+    s = socket.socket(socket.AF_UNIX); s.connect("$Y/u/sock")
+t("unix", unix)
+t("name", lambda: socket.getaddrinfo("$YN", $YP, socket.AF_INET)[0][4][0])
+PYD
+    chmod 644 "$Y/w/agent.py"
+    "$WARDEN" "$Y/p.txt" --dry-run --run-as nobody -- /usr/bin/python3 "$Y/w/agent.py" "$Y/d.log" > "$Y/d.out" 2> "$Y/d.log"
+    yo() { grep -qx "$1" "$Y/d.out"; }
+    # recd ACTION-or-EVENT SUBSTRING RULE: a record not enforced, DENY, with that rule
+    recd() { rec "$Y/d.log" "r.get('enforced') is False and r.get('decision_final', 'DENY') == 'DENY' and (r.get('action') == '$1' or r.get('event') == '$1') and '$2' in str(r.get('target', r.get('name', ''))) and r.get('rule') == '$3'"; }
+    check "the Warden says DRY RUN: NOT ENFORCING at the start"          grep -q '^\[warden\] DRY RUN: NOT ENFORCING\. ' "$Y/d.log"
+    check "... and at the end, with the count"                            grep -q '^\[warden\] DRY RUN: NOT ENFORCING: [0-9]* call(s)' "$Y/d.log"
+    check "run_start says mode dry_run"                                   rec "$Y/d.log" "r.get('event') == 'run_start' and r.get('mode') == 'dry_run'"
+    check "run_end says mode dry_run and counts the records not enforced" python3 -c "
+import json, sys
+recs = [json.loads(l) for l in open('$Y/d.log') if l.startswith('{')]
+end = [r for r in recs if r.get('event') == 'run_end'][0]
+n = sum(1 for r in recs if r.get('enforced') is False)
+sys.exit(0 if end.get('mode') == 'dry_run' and end.get('not_enforced') == n and n > 0 else 1)"
+    check "no record not enforced says ALLOW"                             python3 -c "
+import json, sys
+sys.exit(any(json.loads(l).get('enforced') is False and json.loads(l).get('decision_final') == 'ALLOW' for l in open('$Y/d.log') if l.startswith('{')))"
+    check "a read the policy refuses is let through"                      yo "read-outside hi"
+    check "... recorded DENY, enforced:false"                             recd file.open "$Y/o/f" default_deny_unknown
+    check "a write the policy refuses is let through, as the agent's user" sh -c "grep -qx 'write-outside ok' '$Y/d.out' && [ \"\$(stat -c %U '$Y/o/new')\" = nobody ]"
+    check "a root-only file stays unreadable: the kernel decides as the agent, never as root" yo "read-root-only PermissionError 13"
+    check "a lookup the policy refuses is let through"                    yo "stat-outside 3"
+    check "a call outside the allowlist (link) goes to the kernel"        sh -c "grep -qx 'link ok' '$Y/d.out' && [ -e '$Y/w/hl' ]"
+    check "... recorded syscall_not_admitted, enforced:false"             recd other syscall:86 syscall_not_admitted
+    check "a change by name the policy refuses is let through"            sh -c "grep -qx 'unlink-outside ok' '$Y/d.out' && [ ! -e '$Y/o/mine' ]"
+    check "a connect the policy refuses is dialed by the Warden"          yo "connect HTTP/1.0 200"
+    check "... recorded DENY, enforced:false (dialed: at once or in progress)" \
+        rec "$Y/d.log" "r.get('enforced') is False and r.get('decision_final') == 'DENY' and r.get('action') == 'net.connect' and r.get('target') == '127.0.0.1:$YP' and r.get('rule') in ('dialed_fd_injection', 'dialed_in_progress')"
+    check "a launch outside the launch set runs (no Landlock in a dry run)" yo "launch 65534"
+    check "... recorded, enforced:false"                                  recd process.exec /usr/bin/id default_deny_unknown
+    # the stub looks the name up through the host's resolver: whether it is
+    # found depends on the host; that it was asked and looked up does not
+    check "a name no rule reaches is asked of the stub and looked up, not refused" \
+        rec "$Y/d.log" "r.get('event') == 'dns_question' and r.get('name') == '$YN' and r.get('rule') == 'no_rule' and r.get('enforced') is False and r.get('answer') == 'lookup'"
+    check "the verdict stream (a protected object) is still refused"      yo "stream PermissionError 13"
+    check "... recorded protected_object, enforced"                       rec "$Y/d.log" "r.get('rule') == 'protected_object' and 'enforced' not in r"
+    check "a Unix socket connect stays refused (the Warden would reach it as root)" yo "unix PermissionError 13"
+    check "... recorded, enforced"                                        rec "$Y/d.log" "r.get('action') == 'net.connect' and str(r.get('target')).startswith('unix:') and 'enforced' not in r"
+    # the same agent enforcing: each of those refused
+    rm -f "$Y/o/new" "$Y/w/hl"; echo m > "$Y/o/mine"; chmod 666 "$Y/o/mine"
+    "$WARDEN" "$Y/p.txt" --run-as nobody -- /usr/bin/python3 "$Y/w/agent.py" "$Y/e.log" > "$Y/e.out" 2> "$Y/e.log"
+    check "enforcing, the same agent is refused each of them" sh -c "grep -qx 'read-outside PermissionError 13' '$Y/e.out' && grep -qx 'write-outside PermissionError 13' '$Y/e.out' && grep -qx 'link PermissionError 1' '$Y/e.out' && grep -q '^connect PermissionError' '$Y/e.out' && grep -q '^launch PermissionError' '$Y/e.out' && [ ! -e '$Y/o/new' ]"
+    check "... and no record of it says enforced:false, nor run_start dry_run" sh -c "! grep -q '\"enforced\":false\|\"mode\":\"dry_run\"' '$Y/e.log'"
+    # a hard-denied call still refuses in a dry run (the strict build kills)
+    "$WARDEN" "$Y/p.txt" --dry-run --run-as nobody -- /usr/bin/python3 -c "
+import ctypes; libc = ctypes.CDLL(None, use_errno=True)
+r = libc.syscall(101, 0, 0, 0, 0)          # ptrace(PTRACE_TRACEME)
+print('ptrace', r, ctypes.get_errno())" > "$Y/h.out" 2> "$Y/h.log"
+    check "a hard-denied call (ptrace) is still refused in a dry run" sh -c "! grep -qx 'ptrace 0 0' '$Y/h.out' && ! grep -q 'syscall:101' '$Y/h.log'"
+    # revocation still refuses in a dry run
+    "$WARDEN" "$Y/p.txt" --dry-run --run-as nobody -- /usr/bin/python3 -c "
+import time
+ok = no = 0
+for i in range(24):
+    try: open('$Y/o/f').read(); ok += 1
+    except OSError: no += 1
+    time.sleep(0.25)
+print('opened', ok, 'refused', no)" > "$Y/r.out" 2> "$Y/r.log" &
+    YW=$!
+    for _ in $(seq 1 50); do RID="$(sed -n 's/.*"event":"run_start","run":"\([0-9a-f]*\)".*/\1/p' "$Y/r.log" | head -1)"; [ -n "$RID" ] && break; sleep 0.1; done
+    sleep 2; python3 "$HERE/tools/varek" revoke "$RID" > /dev/null 2>&1
+    wait "$YW"
+    check "after varek revoke a dry run refuses: opens let through before, refused after" sh -c "grep -q 'opened [1-9][0-9]* refused [1-9]' '$Y/r.out'"
+    check "... the refusals after it recorded revoked, enforced" rec "$Y/r.log" "r.get('rule') == 'revoked' and 'enforced' not in r and r.get('decision_final') == 'DENY'"
+    # what a dry run is refused with
+    printf 'require warden 1.29\nallow path /usr/ readonly\nallow exec /usr/bin/python3 subagent=helper\n' > "$Y/ps.txt"
+    check "--dry-run with sub-agents is refused" sh -c "'$WARDEN' '$Y/ps.txt' --dry-run --run-as nobody -- /bin/true 2>&1 | grep -q 'dry-run with a policy that names sub-agents'"
+    printf 'require warden 1.29\nproxy inspect\ncredential k from file:/etc/varek/k\nallow path /usr/ readonly\n' > "$Y/pc.txt"
+    check "--dry-run with credentials is refused" sh -c "'$WARDEN' '$Y/pc.txt' --dry-run --run-as nobody -- /bin/true 2>&1 | grep -q 'dry-run with a policy that names credentials'"
+    printf 'step 1 file_open /usr/lib/os-release\n' > "$Y/plan.txt"
+    check "--dry-run with --plan is refused" sh -c "'$WARDEN' '$Y/p.txt' --plan '$Y/plan.txt' --dry-run --run-as nobody -- /bin/true 2>&1 | grep -q 'dry-run with --plan is refused'"
+    check "a policy cannot ask for a dry run (no such directive)" sh -c "printf 'require warden 1.29\ndry run\n' > '$Y/pd.txt'; ! '$VDP' '$Y/pd.txt' analyze >/dev/null 2>&1"
+    # varek run --dry-run
+    (cd "$Y" && VAREK_CONFIG="$Y/none/varek.conf" VAREK_LOG_DIR="$Y/log" python3 "$HERE/tools/varek" run --dry-run --policy "$Y/p.txt" \
+        --run-as nobody -- /usr/bin/python3 -c "print(open('$Y/o/f').read().strip())" > "$Y/v.out" 2> "$Y/v.err")
+    check "varek run --dry-run says DRY RUN: NOT ENFORCING before and after" sh -c "[ \"\$(grep -c 'DRY RUN: NOT ENFORCING' '$Y/v.err')\" -ge 2 ] && grep -q 'call(s) the policy refuses were let through' '$Y/v.err' && grep -qx hi '$Y/v.out'"
+    kill "$YH" "$YU" 2>/dev/null
 fi
 
 echo

@@ -317,6 +317,13 @@ static void stub_record(const char *name, uint16_t qtype, int conn_fd, const cha
             g_run_id, name, (unsigned)qtype, conn_fd == -2 ? "proxy" : conn_fd < 0 ? "udp" : "tcp", rule, line);
     if (budget) fprintf(f, "\"budget\":\"%s\",", budget);
     if (flags & STUB_NEW) fputs("\"new\":true,", f);
+    /* v1.29: in a dry run, a name no rule reaches, or past a budget, is
+     * looked up all the same: not enforced */
+    if (g_dry && rule && (!strcmp(rule, "no_rule") || !strcmp(rule, "wildcard_budget")) &&
+        answer && strcmp(answer, "nxdomain")) {
+        fputs("\"enforced\":false,", f);
+        g_dry_unenforced++;
+    }
     if (flags & STUB_UPSTREAM) fputs("\"upstream\":true,", f);
     if (flags & STUB_SYNTH) fputs("\"synthetic\":true,", f);
     fprintf(f, "\"answer\":\"%s\",", answer);
@@ -494,7 +501,10 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
     int ri = stub_name_rule(p, name);
     int line = ri >= 0 ? p->v.rules[ri].line : -1;
     const char *rule = exact ? "exact_name" : "policy_match";
-    if (!exact && ri < 0) {
+    /* v1.29: a dry run looks up a name no rule reaches, as a wildcard's,
+     * and records the question as not enforced (stub_record) */
+    if (!exact && ri < 0 && g_dry) rule = "no_rule";
+    if (!exact && ri < 0 && !g_dry) {
         size_t l = stub_build(m, qend, 3, qtype, NULL, now, out, outn);  /* NXDOMAIN */
         stub_send(conn_fd, from, fl, out, l);
         stub_record(name, qtype, conn_fd, "no_rule", -1, NULL, false, "nxdomain", NULL);
@@ -531,7 +541,8 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
         /* v1.26 review: a name already sent to the upstream proxy was
          * charged as new then; asked now, it is charged only to rate= */
         bool fresh = !px_up_charged(name);
-        const char *over = p->v.rules[ri].s.wild ? stub_charge(bud, name, now, fresh) : NULL;
+        const char *over = ri >= 0 && p->v.rules[ri].s.wild ? stub_charge(bud, name, now, fresh) : NULL;
+        if (over && g_dry) { rule = "wildcard_budget"; over = NULL; }   /* v1.29: counted, not acting */
         if (over) {
             size_t l = stub_build(m, qend, 3, qtype, NULL, now, out, outn);
             stub_send(conn_fd, from, fl, out, l);
@@ -563,6 +574,7 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
     bool send_up = !e->pending;
     if (send_up && !charged_q && bud) {
         const char *over = stub_charge(bud, name, now, false);
+        if (over && g_dry) { rule = "wildcard_budget"; over = NULL; }   /* v1.29 */
         if (over) {
             size_t l = stub_build(m, qend, 3, qtype, NULL, now, out, outn);
             stub_send(conn_fd, from, fl, out, l);

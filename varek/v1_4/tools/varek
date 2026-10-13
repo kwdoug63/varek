@@ -368,9 +368,12 @@ def summarize(recs):
          "allowed": 0, "refused": 0, "unknown": 0, "refusals": [],
          "proxy_targets": {}, "proxy_denied": set(), "proxy_ends": [],
          "cred_refused": [], "revoked": None, "credentials": [],
-         "user": None, "spiffe_id": None, "subagents": {}, "expired": None}
+         "user": None, "spiffe_id": None, "subagents": {}, "expired": None,
+         "dry": False, "not_enforced": 0}
     for r in recs:
         ev = r.get("event")
+        if r.get("enforced") is False and (s["run"] is None or r.get("run") == s["run"]):
+            s["not_enforced"] += 1                                   # v1.29: a dry run let it through
         # v1.28 review: only this run's records (a stream can hold lines of
         # another run, which the audit ignores too)
         if s["run"] is not None and ev != "run_start" and "run" in r and r.get("run") != s["run"]:
@@ -386,6 +389,7 @@ def summarize(recs):
             s["warden"] = r.get("warden")
             s["policy"] = r.get("policy_path")
             s["policy_sha"] = r.get("policy_sha256")
+            s["dry"] = r.get("mode") == "dry_run"                    # v1.29
             ts = r.get("timestamp_ns")
             if ts:
                 s["start"] = _dt.datetime.fromtimestamp(ts / 1e9).strftime("%Y-%m-%d %H:%M:%S")
@@ -1186,9 +1190,17 @@ def cmd_run(args):
         argv += ["--anchor", cfg["anchor"]]
     if args.writable_exec:
         argv += ["--writable-exec"]
+    if args.dry_run:                                                  # v1.29
+        if args.plan:
+            raise CliError("--dry-run with --plan is refused",
+                           fix="check a plan with `varek policy check`; dry-run the agent without --plan")
+        argv += ["--dry-run"]
     argv += ["--run-as", run_as, "--"] + cmd
 
     fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+    if args.dry_run:
+        print(_paint("1;33", "[varek] DRY RUN: NOT ENFORCING. Every call is decided and recorded; what the "
+                             "policy refuses is let through."), file=sys.stderr)
     print(_paint("2", f"[varek] supervising `{' '.join(cmd)}` under {label}; "
                       f"verdicts -> {log}"), file=sys.stderr)
     with os.fdopen(fd, "w") as err:
@@ -1206,7 +1218,11 @@ def cmd_run(args):
     print(_paint("2", f"[varek] run {s['run'] or '?'} ended (exit {r.returncode}): "
                       f"{s['allowed']} allowed, {s['refused']} refused "
                       f"({s['unknown']} UNKNOWN)"), file=sys.stderr)
-    if s["refused"]:
+    if s["dry"] or args.dry_run:
+        print(_paint("1;33", f"[varek] DRY RUN: NOT ENFORCING: {s['not_enforced']} call(s) the policy refuses "
+                             f"were let through; `varek refusals` lists them, and `varek policy suggest` "
+                             f"drafts rules for them"), file=sys.stderr)
+    elif s["refused"]:
         print(_paint("2", "[varek] see why with `varek refusals`"), file=sys.stderr)
     if s["run"] is None:
         with open(log, encoding="utf-8", errors="replace") as fh:
@@ -1961,6 +1977,9 @@ def build_parser():
                          "With the baseline the agent gets a clean environment otherwise")
     sp.add_argument("--show-policy", action="store_true",
                     help="v1.29: print the baseline policy this run would use, and stop")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="v1.29: NOT ENFORCING: decide and record every call, and let through what the policy "
+                         "refuses (the Warden's own files, the hard-denied calls and revocation still refuse)")
     sp.add_argument("--writable-exec", action="store_true",
                     help="let the agent launch files in the directories it may write (the Warden's "
                          "--writable-exec; recorded)")
