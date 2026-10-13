@@ -32,7 +32,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden warden-proxy warden-secrets target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 latency-v1260 latency-v1261 latency-v1270 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck harness video-v112
+.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 latency-v1260 latency-v1261 latency-v1270 latency-v1281 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -406,6 +406,10 @@ test-v1280: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_ch
 	@./tests/test_v1280.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
 
 # v1.28.1: the on-behalf-of chain (docs/security/v1.28.1-delegation-chain.md)
+# v1.28.1 step 7: attribution's cost per decision, and startup with a token
+latency-v1281: warden warden-secrets tools/vdp_check tools/vdp_cert_check tools/bench_workload
+	@./tests/latency_v1281.sh
+
 # v1.28.1 step 3: the sub-agent test program
 tests/v1281_sub: tests/v1281_sub.c
 	$(CC) -O2 -Wall -Wextra -pthread -o $@ $<

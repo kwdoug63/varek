@@ -361,6 +361,9 @@ for l in open(sys.argv[1]):
     sgo nest exec "$B/a" exec "$B/b" open "$B/f"
     [ "$(obos nest)" = "agent+subagent:alpha#1+subagent:beta#1" ] && pass "a sub-agent launched by a sub-agent: the chain grows by one" || flunk "nested ($(obos nest))"
     check "... its group under its launcher's" grep -q '"subagent":"beta#1","cgroup":"[^"]*/alpha-1/beta-1"' "$OUT/nest.out"
+    VAREK_WARDEN_TEST_NO_PIDFD_INFO=1 sgo nestp exec "$B/a" exec "$B/b" open "$B/f"
+    [ "$(obos nestp)" = "agent+subagent:alpha#1+subagent:beta#1" ] && grep -q 'each call.s group read from /proc' "$OUT/nestp.out" \
+        && pass "... the same with each call's group read from /proc (a kernel before 6.13)" || flunk "nested, from /proc ($(obos nestp))"
     sgo two spawn "$B/f" "$B/a" open "$B/f"
     [ "$(opens two | awk '{print $2}' | tr '\n' ' ')" = "agent+subagent:alpha#1 agent " ] \
         && pass "the agent's own calls stay the agent's, after a sub-agent's" || flunk "the agent's own calls ($(opens two | tr '\n' ';'))"

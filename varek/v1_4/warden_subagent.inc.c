@@ -51,6 +51,20 @@
 #endif
 static void noexec_unescape(char *s);        /* warden_noexec.inc.c */
 
+/* Linux 6.13: a pidfd tells its process's cgroup id (the group directory's
+ * inode number), without /proc's text */
+#ifndef PIDFD_THREAD
+#define PIDFD_THREAD O_EXCL
+#endif
+struct sub_pidfd_info {
+    uint64_t mask, cgroupid;
+    uint32_t pid, tgid, ppid, ruid, rgid, euid, egid, suid, sgid, fsuid, fsgid;
+    int32_t  exit_code;
+    uint32_t coredump_mask, pad;
+};
+#define SUB_PIDFD_GET_INFO _IOWR(0xFF, 11, struct sub_pidfd_info)
+#define SUB_PIDFD_INFO_CGROUPID (1UL << 2)
+
 #define SUB_MAX       1024           /* sub-agent launches a run may make */
 #define SUB_MAX_DEPTH 8              /* sub-agents nested in sub-agents */
 #define SUB_REL_MAX   512            /* a group's path under the run's: 8 x "/NAME-n" */
@@ -68,6 +82,7 @@ struct subject {
     dev_t    edev;                   /* the image the launch was decided for */
     ino_t    eino;
     char     obo[SUB_MAX_DEPTH * 48 + 16];   /* its chain after "agent": ,"subagent:a#1",... */
+    uint64_t cgid;                   /* its group's id (the directory's inode number) */
 };
 
 static struct subject *g_sub;
@@ -75,6 +90,24 @@ static size_t g_nsub;
 static char g_cg_dir[PATH_MAX];      /* the run's group, on the filesystem */
 static struct { char name[33]; uint32_t n; } g_sub_count[VDP_MAX_RULES];
 static bool g_sub_froze;             /* a group was frozen while attributing this call */
+static bool g_sub_pidfd;             /* the kernel tells a thread's cgroup id through a pidfd */
+
+/* tid's cgroup id through a pidfd, or 0 */
+static uint64_t sub_cgid_of(pid_t tid) {
+    int fd = (int)syscall(__NR_pidfd_open, tid, PIDFD_THREAD);
+    if (fd < 0) return 0;
+    struct sub_pidfd_info in;
+    memset(&in, 0, sizeof in);
+    in.mask = SUB_PIDFD_INFO_CGROUPID;
+    int r = ioctl(fd, SUB_PIDFD_GET_INFO, &in);
+    close(fd);
+    return r == 0 && (in.mask & SUB_PIDFD_INFO_CGROUPID) ? in.cgroupid : 0;
+}
+
+static uint64_t sub_dir_id(const char *dir) {
+    struct stat st;
+    return stat(dir, &st) == 0 ? (uint64_t)st.st_ino : 0;
+}
 static size_t g_nsub_count;
 
 /* The cgroup2 mount (its mount point and root), and this process's group in
@@ -202,7 +235,12 @@ static int sub_setup(const struct policy *p, bool check_only, bool agent_root) {
         rmdir(g_cg_dir);
         return -1;
     }
-    fprintf(stderr, "[warden] sub-agents: the run's control group %s\n", g_cg_dir);
+    g_sub[0].cgid = sub_dir_id(g_cg_dir);
+    /* the cheaper way to read a caller's group, when this kernel has it */
+    g_sub_pidfd = g_sub[0].cgid != 0 && sub_cgid_of((pid_t)syscall(SYS_gettid)) != 0 &&
+                  !getenv("VAREK_WARDEN_TEST_NO_PIDFD_INFO");
+    fprintf(stderr, "[warden] sub-agents: the run's control group %s (each call's group read %s)\n", g_cg_dir,
+            g_sub_pidfd ? "through a pidfd" : "from /proc");
     return 0;
 }
 
@@ -297,6 +335,15 @@ static void sub_pend_end(int s, const char *result) {
 static int sub_attribute(pid_t tid) {
     if (!g_sub_on) return 0;
     char p[64], buf[PATH_MAX + 64];
+    int s = -1;
+    if (g_sub_pidfd) {
+        uint64_t id = sub_cgid_of(tid);
+        if (!id) return -1;
+        for (size_t i = 0; i < g_nsub; i++)
+            if (g_sub[i].cgid == id) { s = (int)i; break; }     /* a failed one's: its launcher's, below */
+        if (s < 0) return -1;
+        goto found;
+    }
     snprintf(p, sizeof p, "/proc/%d/cgroup", (int)tid);
     int fd = open(p, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
@@ -312,9 +359,9 @@ static int sub_attribute(pid_t tid) {
     size_t bl = strlen(g_cg_self);
     if (strncmp(l, g_cg_self, bl) || (l[bl] && l[bl] != '/')) return -1;
     const char *rel = l + bl;
-    int s = -1;
     for (size_t i = 0; i < g_nsub; i++) if (!strcmp(g_sub[i].rel, rel)) { s = (int)i; break; }
     if (s < 0) return -1;
+found:
     if (g_sub[s].state == SUB_PENDING) {
         /* the first call from its group settles the launch (see above) */
         struct stat st;
@@ -370,6 +417,7 @@ static int sub_launch(pid_t tid, int from, const char *name, dev_t edev, ino_t e
     char dir[PATH_MAX + SUB_REL_MAX];
     sub_dir((int)g_nsub, dir, sizeof dir);
     if (mkdir(dir, 0755) < 0) return -1;
+    s->cgid = sub_dir_id(dir);
     int pidfd = (int)syscall(__NR_pidfd_open, tgid, 0);
     int ok = pidfd >= 0 ? sub_move(tgid, pidfd, dir) : -1;
     if (pidfd >= 0) close(pidfd);

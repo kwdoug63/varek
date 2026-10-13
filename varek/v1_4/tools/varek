@@ -1586,9 +1586,107 @@ def cmd_bench_proxy(args, cfg):
     return 0 if res["ok"] and not budget_fail else 1
 
 
+def cmd_bench_subagents(args, cfg):
+    """v1.28.1: `varek bench --subagents`: what attributing every call to its
+    process's control group costs. The bench's own calls (opens and connects)
+    under two base policies, alternated round by round: `require warden 1.28`
+    (launches decided, no sub-agent named) and the same naming one (every
+    call's group is then read before it is decided). The calls are the
+    agent's own in both; a sub-agent's are attributed the same way, with one
+    more comparison per sub-agent the run has started."""
+    import statistics
+    import tempfile
+    if args.policy or args.bare:
+        raise CliError("--subagents measures with the bench's own policies; --policy and --bare do not apply")
+    n = 2000 if args.n is None else args.n
+    warmup = 200 if args.warmup is None else args.warmup
+    rounds = 3 if args.rounds is None else args.rounds
+    if n < 100 or rounds < 1 or warmup < 0:
+        raise CliError("use -n of at least 100, --rounds of at least 1 and --warmup of 0 or more")
+    run_as = args.run_as or (cfg["run_as"] if cfg else "nobody")
+    sign_key = cfg["sign_key"] if cfg and cfg["sign_key"] and not args.no_sign else None
+    if args.output and not os.access(os.path.dirname(os.path.abspath(args.output)), os.W_OK):
+        raise CliError(f"cannot write {args.output}", fix="give -o a path in a writable directory")
+    progress = (lambda m: None) if args.json else (
+        lambda m: print(_paint("2", f"[varek] bench --subagents {m}"), file=sys.stderr))
+    d = tempfile.mkdtemp(prefix="varek-bench-sub-")
+    os.chmod(d, 0o755)
+    bases = {"off": "require warden 1.28\n",
+             "on": "require warden 1.28\nallow exec /usr/bin/true subagent=bench\n"}
+    paths = {}
+    for m, text in bases.items():
+        paths[m] = os.path.join(d, f"base-{m}.policy.txt")
+        with open(paths[m], "w") as fh:
+            fh.write(text)
+        os.chmod(paths[m], 0o644)
+    per = {m: [] for m in bases}
+    try:
+        for rnd in range(rounds):
+            for m in (("off", "on") if rnd % 2 == 0 else ("on", "off")):
+                progress(f"round {rnd + 1}/{rounds}: sub-agents {m}")
+                try:
+                    per[m].append(varek_bench.run(warden_bin(), tool("bench_workload"), base_policy=paths[m],
+                                                  base_label=f"sub-agents {m}", n=n, warmup=warmup, rounds=1,
+                                                  run_as=run_as, sign_key=sign_key, keep=False))
+                except varek_bench.BenchError as e:
+                    raise CliError(str(e), fix=e.fix)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    med = lambda xs: round(statistics.median(xs), 1) if xs else None
+    kinds = {}
+    for k, label in varek_bench.KINDS:
+        row = {"label": label}
+        for m in bases:
+            row[m] = {"call_p50_us": med([r["kinds"][k]["warden"]["p50"] for r in per[m]]),
+                      "decision_p50_us": med([r["kinds"][k]["warden_decision_us"]["p50"] for r in per[m]]),
+                      "native_p50_us": med([r["kinds"][k]["native"]["p50"] for r in per[m]])}
+        row["added_decision_p50_us"] = round(row["on"]["decision_p50_us"] - row["off"]["decision_p50_us"], 1)
+        row["added_call_p50_us"] = round(row["on"]["call_p50_us"] - row["off"]["call_p50_us"], 1)
+        kinds[k] = row
+    res = {"varek_bench_subagents": 1, "varek_command": CLI_VERSION,
+           "date": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "host": per["off"][0]["host"], "warden": per["off"][0]["warden"],
+           "settings": {"calls_per_kind_per_run": n, "warmup": warmup, "rounds": rounds, "run_as": run_as,
+                        "signing": bool(sign_key)},
+           "kinds": kinds, "ok": all(r["ok"] for m in per for r in per[m])}
+    if args.output:
+        try:
+            with open(args.output, "w") as fh:
+                json.dump(res, fh, indent=2)
+                fh.write("\n")
+        except OSError as e:
+            warn(f"could not write {args.output}: {e}")
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return 0 if res["ok"] else 1
+    h = res["host"]
+    print(f"varek bench --subagents ({CLI_VERSION}), Warden {res['warden'].get('version')}, {res['date']}")
+    print(f"host: {h.get('cpu_model') or '?'}, {h.get('cpus', '?')} CPU(s), {h.get('memory') or '?'}, kernel {h.get('kernel', '?')}")
+    print(f"{n} calls of each kind a run, {warmup} warm-up, {rounds} round(s) of each, alternated; medians of "
+          f"the rounds' p50s, in microseconds")
+    print()
+    print(f"{'call':34} {'native':>7} {'call off':>9} {'call on':>8} {'decide off':>11} {'decide on':>10} {'added':>7}")
+    for k, row in kinds.items():
+        print(f"{row['label']:34} {_fmt_us(row['off']['native_p50_us']):>7} {_fmt_us(row['off']['call_p50_us']):>9} "
+              f"{_fmt_us(row['on']['call_p50_us']):>8} {_fmt_us(row['off']['decision_p50_us']):>11} "
+              f"{_fmt_us(row['on']['decision_p50_us']):>10} {row['added_decision_p50_us']:>+7.1f}")
+    print()
+    print("off: require warden 1.28, no sub-agent named. on: the same naming one, so every call's control group "
+          "is read before it is decided. added: decide on minus decide off (the Warden's own time per decision, "
+          "from the verdict records).")
+    print("checks: " + ("every run's outcomes as expected" if res["ok"] else "SOME CHECKS FAILED (run with --json)"))
+    return 0 if res["ok"] else 1
+
+
+def _fmt_us(v):
+    return "-" if v is None else (f"{v:.0f}" if v >= 10 else f"{v:.1f}")
+
+
 def cmd_bench(args):
     need_root("bench")
     cfg = load_config(required=False)
+    if getattr(args, "subagents", False):                                          # v1.28.1
+        return cmd_bench_subagents(args, cfg)
     if args.proxy:
         return cmd_bench_proxy(args, cfg)
     if args.launches:
@@ -1799,6 +1897,8 @@ def build_parser():
     sp.add_argument("--proxy", action="store_true",
                     help="measure the egress proxy instead: HTTPS requests natively, in SNI mode and "
                          "in inspecting mode (defaults -n 200 --warmup 20 --rounds 3)")
+    sp.add_argument("--subagents", action="store_true",
+                    help="v1.28.1: what attributing each call to its control group costs (sub-agents named or not)")
     sp.add_argument("--launches", action="store_true",
                     help="measure decided program launches instead (v1.27): launches and an open "
                          "natively, with launches off and on (defaults -n 200 --warmup 20 --rounds 3)")
