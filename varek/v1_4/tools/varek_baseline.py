@@ -400,10 +400,16 @@ def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH):
             L.append(f"allow exec prefix {d}")
     # v1.29 step 6: the directory of the agent's own command, when its PATH
     # gains it (agent_path: an install in ~/.local/bin), read-only, so a
-    # lookup there is answered (a missing name ENOENT, not EACCES)
+    # lookup there is answered (a missing name ENOENT, not EACCES). Step 9
+    # review: only a directory named bin that is not a system directory,
+    # the home directory or the working directory (a command at /home/x
+    # would have made every home readable)
     for d in path.split(":"):
-        if d and d not in SYSTEM_PATH.split(":") and d.startswith("/"):
-            L.append(f"allow path {d.rstrip('/')}/ readonly")
+        d = os.path.normpath(d) if d.startswith("/") else ""
+        if d and d not in SYSTEM_PATH.split(":") and os.path.basename(d) == "bin" and \
+                d not in REFUSED_CWDS and d != os.path.normpath(home) and d != os.path.normpath(cwd) and \
+                not os.path.normpath(cwd).startswith(d + "/"):
+            L.append(f"allow path {d}/ readonly")
     if profile:
         L.append("")
         L.append(f"# --- profile {profile['name']}: {profile['about']} ---")

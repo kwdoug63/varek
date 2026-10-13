@@ -16,7 +16,7 @@
 # Run as root.
 set -eu
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-N="${N:-2000}" K="${K:-20}" R="${R:-3}"
+N="${N:-2000}" K="${K:-20}" R="${R:-5}"
 OUT="${OUT:-$HERE/tests/latency_v1.29.0.txt}"
 T="$(mktemp -d /tmp/varek_lat1290.XXXXXX)"; chmod 755 "$T"
 trap 'rm -rf "$T"' EXIT

@@ -1,6 +1,6 @@
 # VAREK — Threat Model
 
-Version: current as of v1.28.1 · MIT · github.com/kwdoug63/varek
+Version: current as of v1.29.0 (release candidate) · MIT · github.com/kwdoug63/varek
 
 This document states what VAREK defends, against whom, and what it explicitly
 does not defend. It is deliberately conservative: where a guarantee is
@@ -117,6 +117,15 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
   happened. The agent runs unprivileged and cannot write a control-group
   file: the Warden opens none for writing on its behalf and refuses a
   policy that would.
+- **Trust boundary 14 (v1.29.0):** the agent's own user, and the kernel's
+  permission checks for it. Under `require warden 1.29` the Warden walks and
+  opens every path, and carries out every change by name, as the agent's
+  user (its uid, gid and groups), so the policy and the kernel's permissions
+  must both allow a call: a file the agent's user cannot read stays
+  unreadable whatever the policy says. The baseline `varek run` writes is
+  made from the host as it is at the start (the user who ran sudo, their
+  home, the working directory, PATH, the programs root owns, the shipped
+  profiles); a profile is trusted to name only what its agent needs.
 
 ## 3. Adversary models
 
@@ -517,6 +526,52 @@ Model-B techniques below, with the residual limits stated honestly.
     whom a decision was for, and no extension may move a genuinely unsafe
     action to SATISFIED on its account.
 
+- **`varek run` with nothing set up, a dry run, and `varek policy suggest`
+  (v1.29.0).** After `require warden 1.29`:
+  - *Files are opened as the agent.* Each open's walk and the open itself
+    are made by a Warden thread holding the agent's uid, gid and groups
+    (setfsuid, setfsgid, setgroups on that thread only), so a file is
+    reachable only if the policy allows it and the agent's user could open
+    it; a file the agent creates is its own, with its mode and umask.
+  - *Changes by name are decided.* unlink, rmdir, mkdir, rename (both
+    names), chmod, utimes, truncate and chdir are decided as writes on each
+    name and carried out as the agent; link and symlink stay refused, and
+    a directory rename is answered EXDEV. A mkdir of a name that is there
+    is answered EEXIST only where the agent may look the name up.
+  - *Lookups under a missing directory* are decided on the whole name
+    asked for: ENOENT only where the policy allows that name.
+  - *The baseline.* With no settings, `varek run` writes a policy for the
+    run (root's, by its SHA-256, under `/var/lib/varek/policies`): the
+    credential stores and keys refused first (after the certificate
+    authorities' public bundles), the system read-only, the working
+    directory and a private temporary directory writable, the agent's home
+    closed but for its profile's directories, launches of root's programs by
+    name, no network but the profile's hosts. The agent runs as the user who
+    ran sudo (never root), with a clean environment and only the variables
+    named with `--env`. `run_start` records the baseline's header, and the
+    audit checks it against the policy file.
+  - *A dry run enforces nothing.* Every call is decided and recorded; one
+    the policy refuses is let through (the kernel carries it out as the
+    agent, or the Warden dials it) and recorded `"enforced":false`. The
+    hard-denied system calls, the protected objects, Unix-socket connects
+    and revocation still refuse; a dry run is refused with a plan,
+    credentials or sub-agents. `run_start` and `run_end` say `dry_run`;
+    the audit verifies such a stream but exits 3, never 0, and the export
+    and every tool say it was not enforced.
+  - *`varek policy suggest` writes a draft.* It proposes exact rules for
+    what a run refused, each re-decided by the decision procedure, and
+    comments out (never makes active) anything a deny rule refuses, a
+    credential store or key, another user's home, a write under a system
+    directory, a launch of sudo, su, doas or pkexec, and any program the
+    agent wrote. A person reviews the draft before it is used.
+  - *Programs the agent can write cannot run.* A place inside a directory
+    mounted noexec keeps exec only where no rule that lets the agent write
+    reaches it (`noexec_exec` in `run_start`, checked by the audit).
+  - No extension may move a genuinely unsafe action to SATISFIED: the
+    baseline, the profiles and the drafts are ordinary policies, decided by
+    the same SMT decision procedure and checked by the same certificate
+    checker.
+
 The per-class status of every known bypass class is maintained in
 `docs/security/bypass-classes.md`.
 
@@ -739,6 +794,33 @@ are claimed as solved.
     API are not supported.
   - *Review.* v1.28.1 was reviewed by AI review agents, not by a human or
     third party. Its findings are listed in the design note.
+- `varek run`, the dry run and `suggest` (v1.29.0, `v1.29-varek-run.md`):
+  - *A dry run is not a sandbox.* It lets through what the policy refuses:
+    in a dry run the agent can do anything its own user can, outside the
+    D2 refusals. Run one only where that is acceptable, never with
+    credentials (refused) or on a host where the agent's user can reach
+    what it must not.
+  - *The baseline reads the certificate authorities' bundles ahead of the
+    key patterns*: a private key placed under `/etc/ssl/certs/`,
+    `/etc/pki/tls/certs/` or as a file named `certifi/cacert.pem` is
+    readable by the agent (if its user can read it).
+  - *Programs root does not own* (Node.js under nvm, a tree another user
+    owns) are not named by a profile's programs, so launching them is
+    refused; such a host needs its own policy (a dry run and `suggest`).
+  - *Calls still refused* under the baseline: inotify, statfs(2) on a path,
+    link and symlink, listening sockets; agents fall back or report it.
+  - *A lookup through a file* (`dir/file/x`) is EACCES, not ENOTDIR; the
+    working directory's ancestors and the shell's start-up files are not
+    readable.
+  - *libcrypto in the Warden.* From v1.29.0 the Warden links OpenSSL's
+    libcrypto for the launch set's SHA-256 only, initialised so that it
+    reads no configuration file (no provider or module is loaded).
+  - *Review.* v1.29.0 had a correctness review (the code read, GCC's
+    static analyzer, the suite under ASan and UBSan) and dry runs of four
+    real agents. The adversarial review by AI review agents the ship gates
+    call for (a dry run used to reach what the agent's user could not; a
+    dry run's stream passed off as enforcing; `suggest` led to an active
+    rule for a credential store) has not been done yet.
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).
 - An agent may probe for SATISFIED-but-harmful actions near a policy boundary;

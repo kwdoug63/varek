@@ -107,6 +107,8 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/file.h>
+#include <openssl/crypto.h>   /* v1.29: SHA-256 of the launch set (warden_exec.inc.c) */
+#include <openssl/evp.h>
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -5190,6 +5192,12 @@ int main(int argc, char **argv) {
     }
 
     /* v1.16: log integrity. */
+    /* v1.29 (step 9): libcrypto only hashes the launch set; it reads no
+     * configuration file, so no module or provider one names is loaded */
+    if (OPENSSL_init_crypto(OPENSSL_INIT_NO_LOAD_CONFIG, NULL) != 1) {
+        fprintf(stderr, "[warden] libcrypto failed to initialize\n");
+        return 1;
+    }
     if (sodium_init() < 0) {
         fprintf(stderr, "[warden] libsodium failed to initialize\n");
         return 1;

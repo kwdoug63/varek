@@ -930,12 +930,22 @@ else
     qforge "the places kept executable dropped" "$G/n.log" "$G/n129.txt" "$NRS.pop('noexec_exec')" "noexec_exec is missing or malformed"
     qforge "a mkdir answered EEXIST recorded with the flags of a create" "$G/a.log" "$G/p129.txt" "[r.__setitem__('open_flags', '0xc1') for r in recs if isinstance(r, dict) and r.get('rule') == 'mkdir_exists']" "which the Warden writes only for a mkdir decided as a lookup"
     qforge "a mkdir answered EEXIST as an ancestor that is not one" "$G/a.log" "$G/p129.txt" "[r.__setitem__('resolved', '$G/closed') for r in recs if isinstance(r, dict) and r.get('rule') == 'mkdir_exists_ancestor']" "is not one"
+    # step 9: the launch set is hashed by libcrypto, which reads no
+    # configuration (a file naming a provider that is not there would stop it)
+    printf 'openssl_conf = oc\n[oc]\nproviders = pv\n[pv]\nbad = bp\n[bp]\nmodule = /nonexistent/varek-test-provider.so\nactivate = 1\n' > "$G/bad.cnf"
+    (cd "$H7" && OPENSSL_CONF="$G/bad.cnf" "$WARDEN" "$G/n129.txt" --run-as nobody -- "$H7/inst/bin/v1290_open" read "$H7/inst/bin/v1290_open" > "$G/ssl.out" 2> "$G/ssl.log")
+    check "the launch set's SHA-256 (libcrypto) reads no OpenSSL configuration" grep -qx 'read ok' "$G/ssl.out"
+    check "... and each file's is the file's" rec "$G/ssl.log" "r.get('event') == 'run_start' and r['exec_ruleset'] and all(__import__('hashlib').sha256(open(e['path'], 'rb').read()).hexdigest() == e['sha256'] for e in r['exec_ruleset'])"
     # the baseline (6b)
     py7() { PYTHONPATH="$HERE/tools" python3 -c "import pwd, varek_baseline as b; $1"; }
     py7 "open('$G/base.txt','w').write(b.generate('$G/w', pwd.getpwnam('nobody'), '/tmp/varek-65534', None, path=b.SYSTEM_PATH + ':$G/bin'))"
     check "the baseline lets the agent read the CA bundles, before the key patterns" sh -c "a=\$(grep -n '^allow path /etc/ssl/certs/ readonly' '$G/base.txt' | cut -d: -f1); d=\$(grep -n '^deny  path glob /\*\*/\*.\[pP\]' '$G/base.txt' | head -1 | cut -d: -f1); [ -n \"\$a\" ] && [ -n \"\$d\" ] && [ \"\$a\" -lt \"\$d\" ] && grep -q '^allow path glob /\*\*/certifi/cacert.pem readonly' '$G/base.txt' && grep -q '^allow path exact /etc/pki/tls/cert.pem readonly' '$G/base.txt'"
     check "... what language runtimes read at startup (/proc/version, cgroup limits)" sh -c "grep -q '^allow path exact /proc/version readonly' '$G/base.txt' && grep -q '^allow path /sys/fs/cgroup/ readonly' '$G/base.txt'"
     check "... the directory its PATH gains for the agent's command, read-only" grep -qx "allow path $G/bin/ readonly" "$G/base.txt"
+    check "... but not a directory that is not a bin (a command at /home/x)" py7 "
+import sys
+t = b.generate('$G/w', pwd.getpwnam('nobody'), '/tmp/varek-65534', None, path=b.SYSTEM_PATH + ':/home:$G')
+sys.exit(1 if [l for l in t.splitlines() if l in ('allow path /home/ readonly', 'allow path $G/ readonly')] else 0)"
     if [ -d /usr/lib/git-core ] && command -v git >/dev/null; then
         check "... git's helpers (/usr/lib/git-core/)" grep -qx "allow exec prefix /usr/lib/git-core/" "$G/base.txt"
     else skip "git's helpers (no /usr/lib/git-core here)"; fi

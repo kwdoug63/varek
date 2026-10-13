@@ -154,21 +154,33 @@ static int exec_script_interp(int fd, char *out, size_t outn) {
     return 1;
 }
 
+/* v1.29 (step 9): SHA-256 by OpenSSL's libcrypto, which uses the CPU's
+ * SHA extensions (or AVX2) where it has them: libsodium's portable code
+ * took about 0.6 s on a 123 MB Node.js at every start. Only the digest is
+ * used; OpenSSL's configuration file is never read (no module or provider
+ * it names is loaded into the Warden: warden.c calls OPENSSL_init_crypto
+ * with OPENSSL_INIT_NO_LOAD_CONFIG first), and the built-in default
+ * provider's SHA-256 is fetched once. */
+static EVP_MD *g_sha256;
+
 static int exec_hash_fd(int fd, char out[65]) {
-    crypto_hash_sha256_state st;
-    crypto_hash_sha256_init(&st);
-    unsigned char buf[65536];
+    if (!g_sha256 && !(g_sha256 = EVP_MD_fetch(NULL, "SHA2-256", "provider=default"))) return -1;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx || EVP_DigestInit_ex(ctx, g_sha256, NULL) != 1) { EVP_MD_CTX_free(ctx); return -1; }
+    static unsigned char buf[1 << 20];
     off_t at = 0;
     for (;;) {
         ssize_t n = pread(fd, buf, sizeof buf, at);
-        if (n < 0) return -1;
+        if (n < 0 || (n > 0 && EVP_DigestUpdate(ctx, buf, (size_t)n) != 1)) { EVP_MD_CTX_free(ctx); return -1; }
         if (n == 0) break;
-        crypto_hash_sha256_update(&st, buf, (size_t)n);
         at += n;
     }
-    unsigned char h[32];
-    crypto_hash_sha256_final(&st, h);
-    sodium_bin2hex(out, 65, h, sizeof h);
+    unsigned char h[EVP_MAX_MD_SIZE];
+    unsigned int hl = 0;
+    int ok = EVP_DigestFinal_ex(ctx, h, &hl) == 1 && hl == 32;
+    EVP_MD_CTX_free(ctx);
+    if (!ok) return -1;
+    sodium_bin2hex(out, 65, h, 32);
     return 0;
 }
 
