@@ -100,11 +100,15 @@ static bool syn_qualifies(const struct policy *p, const char *name) {
         snprintf(s, sizeof s, "%s:%u", name, ports[k]);
         int ri;
         vdp_why_t why;
-        if (vdp_decide(&p->v, VDP_KIND_HOST, s, 0, false, &ri, &why) != VDP_SATISFIED || ri < 0) continue;
-        bool proxied = false;
-        for (size_t j = 0; j < npp; j++) if (pp[j] == ports[k]) proxied = true;
-        if (!proxied) return false;                    /* allowed off the proxied ports */
-        proxied_ok = true;
+        /* v1.31: by any subject's rules */
+        for (size_t sj = 0; sj <= p->v.nsubjects; sj++) {
+            if (vdp_decide_subj(&p->v, (int)sj, VDP_KIND_HOST, s, 0, false, &ri, &why) != VDP_SATISFIED || ri < 0)
+                continue;
+            bool proxied = false;
+            for (size_t j = 0; j < npp; j++) if (pp[j] == ports[k]) proxied = true;
+            if (!proxied) return false;                /* allowed off the proxied ports */
+            proxied_ok = true;
+        }
     }
     return proxied_ok;
 }

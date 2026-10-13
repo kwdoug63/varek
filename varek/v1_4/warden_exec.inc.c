@@ -248,18 +248,71 @@ static int exec_rs_add(const char *name, const char *why, int line, char *err, s
     return 1;
 }
 
+/* v1.31: the subject whose allow exec rule is being expanded */
+static int g_exec_subj;
+
+/* v1.31 (docs/security/v1.31-standards.md, section 2): a confined subject's
+ * launch file. Refused at the start: an `mcp server` line's file that is not
+ * in the launch set, or (sha256=) has another hash; a file a confined
+ * subject is launched from, or a directory above it, that any subject's
+ * rules let be written (the agent could rewrite the server it is confined
+ * from). 0, or -1 with the reason printed. */
+static int exec_confined_checks(const struct policy *p) {
+    for (size_t i = 0; i < p->v.n; i++) {
+        const vdp_rule_t *r = &p->v.rules[i];
+        if (!r->confined_subj) continue;
+        bool found = false;
+        for (size_t k = 0; k < g_exec_n; k++) {
+            const struct exec_file *f = &g_exec_rs[k];
+            if (strcmp(f->why, "rule") || f->line != r->line) continue;
+            found = true;
+            if (r->sha256[0] && strcmp(f->sha, r->sha256)) {
+                fprintf(stderr, "[warden] policy line %d: %s has SHA-256 %s, not the %s the line pins; "
+                        "refusing to start\n", r->line, f->name, f->sha, r->sha256);
+                return -1;
+            }
+            const char *names[2] = { f->name, f->path };
+            for (int n = 0; n < 2; n++) {
+                char d[PATH_MAX];
+                snprintf(d, sizeof d, "%s", names[n]);
+                for (;;) {
+                    if (vdpc_path_writable(&p->c, d, strlen(d))) {
+                        fprintf(stderr, "[warden] policy line %d: the policy lets %s be written, so %s, "
+                                "which %s is launched from, could be replaced; refusing to start\n",
+                                r->line, d, f->path, r->subagent);
+                        return -1;
+                    }
+                    char *sl = strrchr(d, '/');
+                    if (!sl) break;
+                    if (sl == d) { if (!d[1]) break; d[1] = '\0'; continue; }
+                    *sl = '\0';
+                }
+            }
+        }
+        if (r->mcp_server && !found) {
+            fprintf(stderr, "[warden] policy line %d: MCP server %s (%s) is not a launchable file on this "
+                    "host; refusing to start\n", r->line, r->subagent, r->s.c);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* Expanding allow exec rules: each candidate the walk finds is decided like a
- * launch of that name. Counts per deciding rule in admitted[]. */
+ * launch of that name, by the subject whose rule it is (v1.31: the launch
+ * set holds what any subject may launch; each launch is still decided by its
+ * caller's rules). Counts per deciding rule in admitted[]. */
 static int exec_consider(const struct policy *p, const char *cand, size_t *admitted, char *err, size_t en) {
     int ri = -1;
     vdp_why_t why;
-    if (vdp_decide(&p->v, VDP_KIND_EXEC, cand, 0, false, &ri, &why) != VDP_SATISFIED || ri < 0) return 0;
+    if (vdp_decide_subj(&p->v, g_exec_subj, VDP_KIND_EXEC, cand, 0, false, &ri, &why) != VDP_SATISFIED || ri < 0)
+        return 0;
     /* v1.27 review: a deny exec rule on the file's own path keeps it out,
      * whatever other name an allow rule reaches it by (a symlink) */
     char real[PATH_MAX];
     int dri = -1;
     if (realpath(cand, real) && strcmp(real, cand) != 0 &&
-        vdp_decide(&p->v, VDP_KIND_EXEC, real, 0, false, &dri, &why) == VDP_UNSATISFIED &&
+        vdp_decide_subj(&p->v, g_exec_subj, VDP_KIND_EXEC, real, 0, false, &dri, &why) == VDP_UNSATISFIED &&
         dri >= 0 && p->v.rules[dri].verb == VDP_DENY) {
         fprintf(stderr, "[warden] note: launch set: %s (line %d) is %s, which line %d denies; it is not "
                 "in the launch set\n", cand, p->v.rules[ri].line, real, p->v.rules[dri].line);
@@ -319,6 +372,7 @@ static int exec_ruleset_build(const struct policy *p, const char *boot_path) {
     for (size_t i = 0; rc == 0 && i < p->v.n; i++) {
         const vdp_rule_t *r = &p->v.rules[i];
         if (r->kind != VDP_KIND_EXEC || r->verb != VDP_ALLOW) continue;
+        g_exec_subj = r->subj;               /* v1.31 */
         /* an exact or prefix constant not starting with '/' matches no
          * launch (the Warden decides on absolute paths; lint notes it) */
         if ((r->s.op == VDP_STR_EQ || r->s.op == VDP_STR_PREFIX) && r->s.c[0] != '/') continue;
@@ -413,13 +467,15 @@ static int exec_ruleset_build(const struct policy *p, const char *boot_path) {
             fprintf(stderr, "[warden] note: launch set: %s (line %d) is a shell or general-purpose "
                     "interpreter: the agent can run any code it can read with it\n", f->name, f->line);
         static const uint32_t kW[] = { O_WRONLY, O_RDWR, O_WRONLY | O_TRUNC, O_RDWR | O_TRUNC };
-        for (size_t w = 0; w < sizeof kW / sizeof kW[0]; w++)
-            if (vdp_decide(&p->v, VDP_KIND_PATH, f->path, kW[w], true, NULL, NULL) == VDP_SATISFIED) {
-                fprintf(stderr, "[warden] note: launch set: %s (%s) may be both launched and written by "
-                        "the agent: a launch runs the file as it is then, not as hashed now\n",
-                        f->name, f->path);
-                break;
-            }
+        /* v1.31: by any subject's rules */
+        bool wr = false;
+        for (size_t w = 0; w < sizeof kW / sizeof kW[0] && !wr; w++)
+            for (size_t sj = 0; sj <= p->v.nsubjects && !wr; sj++)
+                wr = vdp_decide_subj(&p->v, (int)sj, VDP_KIND_PATH, f->path, kW[w], true, NULL, NULL) == VDP_SATISFIED;
+        if (wr)
+            fprintf(stderr, "[warden] note: launch set: %s (%s) may be both launched and written by "
+                    "the agent: a launch runs the file as it is then, not as hashed now\n",
+                    f->name, f->path);
         int fd = open(f->path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
         char interp[PATH_MAX];
         if (fd >= 0 && exec_script_interp(fd, interp, sizeof interp) == 1) {
@@ -628,7 +684,8 @@ static void exec_launch(int notify_fd, const struct seccomp_notif *req, struct a
         } else if (a->rule_index >= 0 && p->v.rules[a->rule_index].subagent[0]) {
             /* v1.28.1: a sub-agent: its group made, the process moved, before the answer */
             const char *srule = NULL;
-            int s = sub_launch((pid_t)req->pid, a->subject, p->v.rules[a->rule_index].subagent, idev, iino,
+            const vdp_rule_t *lr = &p->v.rules[a->rule_index];
+            int s = sub_launch((pid_t)req->pid, a->subject, lr->subagent, lr->confined_subj, lr->mcp_server, idev, iino,
                                g_records, &srule);
             exec_pend_last_sub(s);               /* refused: the pending launch goes */
             if (s < 0) {
@@ -887,6 +944,6 @@ static int exec_access_x(int ofd, const struct action *a) {
     if (!e) return -EACCES;
     const char *name = a->target[0] == '/' && !strstr(a->target, "/.") ? a->target : a->resolved;
     if (!name[0]) return -EACCES;
-    return vdp_decide(&g_exec_policy->v, VDP_KIND_EXEC, name, 0, false, NULL, NULL) == VDP_SATISFIED
-           ? 0 : -EACCES;
+    return vdp_decide_subj(&g_exec_policy->v, sub_policy_subject(a->subject), VDP_KIND_EXEC, name, 0, false,
+                           NULL, NULL) == VDP_SATISFIED ? 0 : -EACCES;     /* v1.31: by the caller's rules */
 }

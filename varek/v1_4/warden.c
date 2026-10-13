@@ -590,13 +590,12 @@ static int policy_load(const char *path, struct policy *p) {
                 "the trusted identities or the confined subjects differently; refusing to start\n", path);
         return -1;
     }
-    /* v1.31 (docs/security/v1.31-standards.md): the grammar is read (step 2);
-     * the Warden does not yet decide by subject (step 3), MCP calls (step 4)
-     * or MCP tokens (step 5). Until it does, a policy that uses them is
+    /* v1.31 (docs/security/v1.31-standards.md): the grammar is read (step 2)
+     * and confined subjects are decided by subject (step 3); the Warden does
+     * not yet decide MCP calls (step 4) or MCP tokens (step 5). Until it does, a policy that uses them is
      * refused rather than run with them ignored. */
     {
         const char *later = NULL;
-        if (p->v.nsubjects) later = "confined subjects (mcp server, subagent=NAME confined, for=)";
         for (size_t i = 0; !later && i < p->v.n; i++)
             if (p->v.rules[i].kind == VDP_KIND_MCP) later = "mcp rules";
         for (size_t k = 0; !later && k < p->v.ncreds; k++)
@@ -1080,6 +1079,7 @@ static int derive_intent(const struct seccomp_notif *req,
 /* ---------------- Policy Decision ---------------- */
 
 static bool g_revoked;               /* v1.28 step 4: warden_revoke.inc.c */
+static int sub_policy_subject(int s);  /* v1.31: warden_subagent.inc.c */
 static decision_t policy_decide(const struct policy *p, struct action *a)
 {
     /* v1.13: every decision is made by the SMT decision procedure
@@ -1124,9 +1124,10 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
     }
     int ri;
     vdp_why_t why;
-    vdp_verdict_t v = vdp_decide(&p->v, kind, s, (uint32_t)a->open_flags,
-                                 kind == VDP_KIND_PATH && a->flags_known,
-                                 &ri, &why);
+    /* v1.31: by the calling subject's rules (the Warden's attribution) */
+    vdp_verdict_t v = vdp_decide_subj(&p->v, sub_policy_subject(a->subject), kind, s, (uint32_t)a->open_flags,
+                                      kind == VDP_KIND_PATH && a->flags_known,
+                                      &ri, &why);
     a->why = vdp_why_name(why);
     a->rule_index = ri;
     if (ri >= 0) a->policy_line = p->v.rules[ri].line;
@@ -1212,9 +1213,13 @@ static bool certify(const struct policy *p, struct action *a) {
             n += snprintf(a->cert + n, sizeof a->cert - (size_t)n, "%s%u-%u", k ? "," : "",
                           cc.span[k][0], cc.span[k][1]);
     } else n += snprintf(a->cert + n, sizeof a->cert - (size_t)n, "-");
-    if ((size_t)n < sizeof a->cert) snprintf(a->cert + n, sizeof a->cert - (size_t)n, "\"");
-    if (!vdpc_check(&p->c, kind, s, strlen(s), (uint32_t)a->open_flags, has_flags, &cc,
-                    a->check_why, sizeof a->check_why)) {
+    if ((size_t)n < sizeof a->cert) n += snprintf(a->cert + n, sizeof a->cert - (size_t)n, "\"");
+    /* v1.31: the subject the certificate is checked as, from the Warden's own
+     * attribution (not the procedure's), recorded when it is not the agent */
+    int subj = sub_policy_subject(a->subject);
+    if (subj && (size_t)n < sizeof a->cert) snprintf(a->cert + n, sizeof a->cert - (size_t)n, ",\"cert_subject\":%d", subj);
+    if (!vdpc_check_subj(&p->c, subj, kind, s, strlen(s), (uint32_t)a->open_flags, has_flags, &cc,
+                         a->check_why, sizeof a->check_why)) {
         for (char *q = a->check_why; *q; q++)          /* recorded inside a JSON string */
             if (*q == '"' || *q == '\\' || (unsigned char)*q < 0x20) *q = '\'';
         return false;
@@ -1227,7 +1232,7 @@ static bool certify(const struct policy *p, struct action *a) {
             if (!strcmp(g_cand[c], s)) continue;
             for (int i = 0; i < cc.r; i++) {
                 vdpc_rule_info_t ri;
-                if (vdpc_rule_info(&p->c, (size_t)i, &ri) < 0 || ri.kind != VDPC_HOST) continue;
+                if (vdpc_rule_info(&p->c, (size_t)i, &ri) < 0 || ri.kind != VDPC_HOST || ri.subj != subj) continue;
                 if (vdpc_holds(&p->c, (size_t)i, g_cand[c], strlen(g_cand[c])) == 1) {
                     snprintf(a->check_why, sizeof a->check_why,
                              "an earlier rule (line %d) holds on another candidate", ri.line);
@@ -3018,15 +3023,16 @@ static int inject_fd(int notify_fd, uint64_t id, int resolved)
  * component's lstat/readlink would be refused. */
 #define MAX_ANCESTORS 2048
 static char  *g_ancestors[MAX_ANCESTORS];
+static int    g_ancestor_subj[MAX_ANCESTORS];   /* v1.31: the subject whose rule leads there */
 static size_t g_nancestors = 0;
 
-static void add_ancestor(const char *s, size_t n) {
+static void add_ancestor(const char *s, size_t n, int subj) {
     if (n == 0) { s = "/"; n = 1; }
     for (size_t i = 0; i < g_nancestors; i++)
-        if (strlen(g_ancestors[i]) == n && !memcmp(g_ancestors[i], s, n)) return;
+        if (g_ancestor_subj[i] == subj && strlen(g_ancestors[i]) == n && !memcmp(g_ancestors[i], s, n)) return;
     if (g_nancestors < MAX_ANCESTORS) {
         char *c = strndup(s, n);
-        if (c) g_ancestors[g_nancestors++] = c;
+        if (c) { g_ancestor_subj[g_nancestors] = subj; g_ancestors[g_nancestors++] = c; }
     }
 }
 
@@ -3044,21 +3050,23 @@ static void load_ancestors(const struct policy *p) {
          * plus the literal itself when it ends in '/' (the named directory). */
         for (size_t i = 1; i <= lit; i++)
             if (i == lit ? ru->s.c[i - 1] == '/' : ru->s.c[i] == '/')
-                add_ancestor(ru->s.c, i == lit ? i - 1 : i);
-        add_ancestor("/", 1);
+                add_ancestor(ru->s.c, i == lit ? i - 1 : i, ru->subj);
+        add_ancestor("/", 1, ru->subj);
     }
 }
 
-static bool is_ancestor(const char *canon) {
+/* v1.31: of subj's rules (a directory one subject's rules lead to is not
+ * answered to another without a decision) */
+static bool is_ancestor(const char *canon, int subj) {
     for (size_t i = 0; i < g_nancestors; i++)
-        if (!strcmp(g_ancestors[i], canon)) return true;
+        if (g_ancestor_subj[i] == subj && !strcmp(g_ancestors[i], canon)) return true;
     return false;
 }
 
 /* An ancestor a deny rule covers (the directory, or what is inside it) is not
  * answered: `deny path /home/` before `allow path /home/bob/work/` leaves
  * /home and /home/bob to the policy, which refuses them. */
-static bool ancestor_denied(const struct policy *p, const char *dir) {
+static bool ancestor_denied(const struct policy *p, const char *dir, int subj) {
     char withslash[PATH_LIMIT];
     const char *cands[2] = { dir, withslash };
     int nc = 1;
@@ -3067,7 +3075,7 @@ static bool ancestor_denied(const struct policy *p, const char *dir) {
     for (int k = 0; k < nc; k++) {
         int ri;
         vdp_why_t why;
-        if (vdp_decide(&p->v, VDP_KIND_PATH, cands[k], O_RDONLY, true, &ri, &why) == VDP_UNSATISFIED)
+        if (vdp_decide_subj(&p->v, subj, VDP_KIND_PATH, cands[k], O_RDONLY, true, &ri, &why) == VDP_UNSATISFIED)
             return true;
     }
     return false;
@@ -3645,8 +3653,9 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             if (mfd >= 0 &&
                 !(act.kind == ACT_FILE_ACCESS && (act.access_mode & (W_OK | X_OK)))) {
                 struct stat ast;
-                if (fstat(mfd, &ast) == 0 && S_ISDIR(ast.st_mode) && is_ancestor(act.resolved) &&
-                    !ancestor_denied(p, act.resolved)) {
+                if (fstat(mfd, &ast) == 0 && S_ISDIR(ast.st_mode) &&
+                    is_ancestor(act.resolved, sub_policy_subject(act.subject)) &&
+                    !ancestor_denied(p, act.resolved, sub_policy_subject(act.subject))) {
                     int64_t r = meta_answer(req.pid, notify_fd, req.id, &act, mfd, true);
                     close(mfd);
                     if (r < 0) send_errno(notify_fd, req.id, (int)-r);
@@ -5562,7 +5571,8 @@ int main(int argc, char **argv) {
     /* v1.27: with `require warden 1.27`, the files the agent may launch and
      * the Landlock ruleset that holds it to them (warden_exec.inc.c) */
     if (p.v.launches) {
-        if (exec_ruleset_build(&p, target_argv ? boot_path : NULL) < 0) {
+        if (exec_ruleset_build(&p, target_argv ? boot_path : NULL) < 0 ||
+            exec_confined_checks(&p) < 0) {              /* v1.31 */
             if (g_sk) sodium_free(g_sk);
             return 1;
         }

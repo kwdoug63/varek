@@ -95,6 +95,12 @@ struct subject {
     uint64_t cgid;                   /* its group's id (the directory's inode number); 0 once removed */
     pid_t    tgid;                   /* the launching process */
     bool     exec_seen;              /* the kernel reported its launch (proc connector) */
+    /* v1.31: the policy subject its calls are decided as (smt_decide.h): the
+     * confined subject its launch rule declares, else its launcher's (0: the
+     * agent's rules); and whether an `mcp server` line launched it */
+    int      psubj;
+    bool     mcp;
+    bool     confined;               /* v1.31: its launch rule declares it a confined subject */
 };
 
 static struct subject *g_sub;
@@ -499,8 +505,8 @@ found:
 /* A launch the policy allows by a rule with subagent=name, from a process of
  * subject from: the sub-agent made, its group made and the process moved.
  * The subject, or -1 with the rule that refuses it. */
-static int sub_launch(pid_t tid, int from, const char *name, dev_t edev, ino_t eino, uint64_t seq,
-                      const char **rule) {
+static int sub_launch(pid_t tid, int from, const char *name, int csubj, bool mcp, dev_t edev, ino_t eino,
+                      uint64_t seq, const char **rule) {
     *rule = "subagent_failed";
     if (from < 0 || (size_t)from >= g_nsub) return -1;
     if (g_nsub > SUB_MAX) { *rule = "subagent_limit"; return -1; }
@@ -541,6 +547,9 @@ static int sub_launch(pid_t tid, int from, const char *name, dev_t edev, ino_t e
     s->edev = edev;
     s->eino = eino;
     s->tgid = tgid;
+    s->psubj = csubj > 0 ? csubj : g_sub[from].psubj;      /* v1.31 */
+    s->mcp = mcp;
+    s->confined = csubj > 0;
     char rel[SUB_REL_MAX + 48], obo[sizeof s->obo + 64];
     int rl = snprintf(rel, sizeof rel, "%s/%s-%u", g_sub[from].rel, name, s->n);
     int ol = snprintf(obo, sizeof obo, "%s,\"subagent:%s#%u\"", g_sub[from].obo, name, s->n);
@@ -559,6 +568,12 @@ static int sub_launch(pid_t tid, int from, const char *name, dev_t edev, ino_t e
     return (int)g_nsub++;
 }
 
+/* v1.31: the policy subject the calls of runtime subject s are decided as
+ * (0, the agent's rules, when no sub-agent is named or s is not one) */
+static int sub_policy_subject(int s) {
+    return g_sub_on && g_sub && s > 0 && (size_t)s < g_nsub ? g_sub[s].psubj : 0;
+}
+
 /* "obo":[...], for a record of subject s */
 static void sub_obo(FILE *f, int s) {
     if (s < 0) { fputs("\"obo\":[],", f); return; }      /* refused: in no group of the run */
@@ -568,8 +583,9 @@ static void sub_obo(FILE *f, int s) {
 /* A sub-agent's launch record: which one, and its group */
 static void sub_launch_fields(struct action *a, int s) {
     size_t el = strlen(a->extra);
-    int w = snprintf(a->extra + el, sizeof a->extra - el, "\"subagent\":\"%s#%u\",\"cgroup\":\"",
-                     g_sub[s].name, g_sub[s].n);
+    int w = snprintf(a->extra + el, sizeof a->extra - el, "\"subagent\":\"%s#%u\",%s%s\"cgroup\":\"",
+                     g_sub[s].name, g_sub[s].n, g_sub[s].mcp ? "\"mcp_server\":true," : "",
+                     g_sub[s].confined ? "\"confined\":true," : "");
     if (w < 0 || (size_t)w >= sizeof a->extra - el) return;
     el += (size_t)w;
     /* review: the Warden's own group's path may hold any byte: escaped for JSON */

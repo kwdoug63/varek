@@ -12,6 +12,12 @@
 #      checked against the calling subject's rules; lint; the Warden reports
 #      1.31.0, compares the two readings at load, and refuses what later
 #      steps build.
+#   2. confined subjects in the Warden: an MCP server decided by its own
+#      rules and the agent by its own (files, a fork, a program the server
+#      launches), records and certificates by subject, the audit (and the
+#      forgeries it refuses), the server out of the agent's /proc, and the
+#      start refused for a pinned file with another hash or a server file
+#      that any subject may write (or a directory above it).
 #
 #   test_v1310.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
@@ -206,14 +212,97 @@ else
     check "the Warden reports 1.31.0 or later" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | python3 -c 'import re,sys; m=re.search(r\"VAREK Warden  (\\d+)\\.(\\d+)\\.(\\d+)\", sys.stdin.read()); sys.exit(0 if m and tuple(map(int, m.groups())) >= (1, 31, 0) else 1)'"
     printf '%b' "${R}allow path /usr/\n" > "$OUT/w1.txt"
     check "the Warden starts a require warden 1.31 policy" "$WARDEN" "$OUT/w1.txt" --check-startup
-    for form in "${R}${S}" "${R}allow exec /opt/h subagent=h confined\n" "${P}allow mcp $U tools/list\n" \
-                "${R}credential gh from file:/x audience=$U\n" "${R}trust mcp-resource $U\n"; do
+    for form in "${P}allow mcp $U tools/list\n" "${R}credential gh from file:/x audience=$U\n" "${R}trust mcp-resource $U\n"; do
         printf '%b' "$form" > "$OUT/w2.txt"
         "$WARDEN" "$OUT/w2.txt" --check-startup > "$OUT/w2.out" 2>&1
         rc=$?
         check "the Warden refuses, until a later step builds it: $(printf '%b' "$form" | sed -n 2p | cut -c1-48)" \
             sh -c "[ $rc != 0 ] && grep -q 'read but not yet enforced by this build' '$OUT/w2.out'"
     done
+fi
+
+echo "== 2. confined subjects: each decided by its own rules =="
+SUBP="$HERE/tests/v1281_sub"; PEEK="$HERE/tests/v1310_peek"
+CGM="$(awk '$3 == "cgroup2" { print $2; exit }' /proc/self/mounts)"
+if [ "$(id -u)" != 0 ] || [ -z "$WARDEN" ] || [ ! -x "$SUBP" ] || [ ! -x "$PEEK" ] || [ -z "$CGM" ]; then
+    skip "section 2 (needs root, the warden, tests/v1281_sub, tests/v1310_peek and a cgroup2 mount)"
+else
+    B="$(mktemp -d /tmp/varek_v1310s.XXXXXX)"; chmod 755 "$B"
+    trap '[ -n "${KEEP:-}" ] && echo "kept $OUT $B" || rm -rf "$OUT" "$B"' EXIT
+    for n in agent srv tool; do cp "$SUBP" "$B/$n"; chmod 755 "$B/$n"; done
+    cp "$PEEK" "$B/peek"; chmod 755 "$B/peek"
+    for f in fa fs fb; do echo hi > "$B/$f"; chmod 644 "$B/$f"; done
+    SL='allow path /usr/ readonly\nallow path /lib readonly\nallow path /lib64 readonly\nallow path /etc/ld.so.cache readonly\n'
+    SLF="$(printf '%b' "$SL" | sed 's/$/ for=files/')\n"
+    SP="require warden 1.31\nmcp server files exec $B/srv\nallow exec $B/tool for=files\nallow exec $B/peek for=files\n"
+    SP="${SP}allow path $B/fa readonly\nallow path $B/fb readonly\nallow path $B/fs readonly for=files\nallow path $B/fb readonly for=files\n"
+    printf '%b' "$SP$SL$SLF" > "$B/p.txt"
+    sgo() { local n="$1"; shift; timeout 60 "$WARDEN" "${POL:-$B/p.txt}" -- "$B/agent" "$@" > "$OUT/$n.so" 2> "$OUT/$n.out"; echo $? > "$OUT/$n.rc"; }
+    # dec <name> <file>: each decision on <file>, as "action obo decision rule", in order
+    dec() { python3 -c 'import json,sys
+for l in open(sys.argv[1]):
+    if l.startswith("{\"report_id\""):
+        r = json.loads(l)
+        if r["target"] == sys.argv[2]: print(r["action"], "+".join(r["obo"]), r["decision_final"], r.get("cert_subject", 0))' "$OUT/$1.out" "$2"; }
+    sgo own spawn "$B/fa" "$B/srv" open "$B/fs"
+    check "the server opens what its own rules allow (ALLOW, certificate checked as subject 1)" \
+        sh -c "$(declare -f dec); OUT='$OUT' dec own '$B/fs' | grep -qx 'file.open agent+subagent:files#1 ALLOW 1'"
+    check "... the agent's own open after it is the agent's (ALLOW, subject 0)" \
+        sh -c "$(declare -f dec); OUT='$OUT' dec own '$B/fa' | grep -qx 'file.open agent ALLOW 0'"
+    check "the server's launch record says it is an MCP server and confined" \
+        grep -q '"subagent":"files#1","mcp_server":true,"confined":true,"cgroup":' "$OUT/own.out"
+    check "the audit accepts a run with a confined MCP server" python3 "$HERE/tools/varek_audit.py" --policy "$B/p.txt" --checker "$CERT" "$OUT/own.out"
+    sgo notmine spawn "$B/fs" "$B/srv" open "$B/fa"
+    check "the server is refused what only the agent's rules allow" \
+        sh -c "$(declare -f dec); OUT='$OUT' dec notmine '$B/fa' | grep -qx 'file.open agent+subagent:files#1 DENY 0'"
+    check "the agent is refused what only the server's rules allow" \
+        sh -c "$(declare -f dec); OUT='$OUT' dec notmine '$B/fs' | grep -qx 'file.open agent DENY 0'"
+    sgo both spawn "$B/fb" "$B/srv" open "$B/fb"
+    check "a file both sets of rules allow: each allowed by its own rule" \
+        sh -c "$(declare -f dec); OUT='$OUT' dec both '$B/fb' | tr '\n' ';' | grep -qx 'file.open agent+subagent:files#1 ALLOW 1;file.open agent ALLOW 0;'"
+    sgo fork spawn "$B/fa" "$B/srv" fork "$B/fs"
+    check "the server's child (a fork) is decided by the server's rules" \
+        sh -c "[ \"\$($(declare -f dec); OUT='$OUT' dec fork '$B/fs' | grep -c 'agent+subagent:files#1 ALLOW 1')\" = 2 ]"
+    sgo tool spawn "$B/fa" "$B/srv" spawn "$B/fs" "$B/tool" open "$B/fs"
+    check "a program the server launches by its own rule runs, decided as the server" \
+        sh -c "$(declare -f dec); OUT='$OUT' dec tool '$B/tool' | grep -qx 'process.exec agent+subagent:files#1 ALLOW 1' && [ \"\$($(declare -f dec); OUT='$OUT' dec tool '$B/fs' | grep -c 'agent+subagent:files#1 ALLOW 1')\" = 2 ]"
+    check "the audit accepts it" python3 "$HERE/tools/varek_audit.py" --policy "$B/p.txt" --checker "$CERT" "$OUT/tool.out"
+    sgo atool spawn "$B/fa" "$B/tool" open "$B/fs"
+    check "the agent may not launch what only the server's rules allow" \
+        sh -c "$(declare -f dec); OUT='$OUT' dec atool '$B/tool' | grep -q '^process.exec agent DENY'"
+    sgo peek spawn "$B/fa" "$B/srv" exec "$B/peek" environ mem fd/0 cwd/.
+    check "the server cannot open the agent's /proc entries (environ, mem, fd, cwd)" \
+        sh -c "grep -qx 'environ refused EACCES' '$OUT/peek.so' && grep -qx 'mem refused EACCES' '$OUT/peek.so' && grep -qx 'fd/0 refused EACCES' '$OUT/peek.so' && grep -qx 'cwd/. refused EACCES' '$OUT/peek.so'"
+    # forged streams the audit refuses
+    F="$HERE/tests/v1270_forge.py"; AUD="$HERE/tools/varek_audit.py"
+    refuses() { if python3 "$AUD" --policy "$2" --checker "$CERT" "$3" > "$OUT/f.out" 2>&1; then flunk "the audit refuses $1"
+                elif grep -qF -- "$4" "$OUT/f.out"; then pass "the audit refuses $1"
+                else flunk "the audit refuses $1 ($(grep -m1 PROBLEM "$OUT/f.out"))"; fi; }
+    SV='sv = next(r for r in recs if isinstance(r, dict) and r.get("cert_subject") == 1)'
+    python3 "$F" "$OUT/own.out" "$OUT/g1.log" "$SV; sv.pop('cert_subject')"
+    refuses "a server's decision whose certificate is recorded as the agent's" "$B/p.txt" "$OUT/g1.log" "but the decision was for subject 1"
+    python3 "$F" "$OUT/own.out" "$OUT/g2.log" "$SV; sv['obo'] = ['agent']"
+    refuses "a server's decision passed off as the agent's" "$B/p.txt" "$OUT/g2.log" "but the decision was for subject 0"
+    AG='ag = next(r for r in recs if isinstance(r, dict) and r.get("target") == "'"$B"'/fa" and r.get("decision_final") == "ALLOW")'
+    python3 "$F" "$OUT/own.out" "$OUT/g3.log" "$AG; ag['cert_subject'] = 1; ag['obo'] = ['agent', 'subagent:files#1']"
+    refuses "the agent's allowed open passed off as the server's" "$B/p.txt" "$OUT/g3.log" "refused"
+    # the start
+    H0="$(sha256sum "$B/srv" | cut -d' ' -f1)"
+    st() { printf '%b' "$2" > "$B/s.txt"; "$WARDEN" "$B/s.txt" --check-startup > "$OUT/st.out" 2>&1; local rc=$?
+           if [ "$1" = ok ]; then [ $rc = 0 ]; else [ $rc != 0 ] && grep -qF -- "$3" "$OUT/st.out"; fi; }
+    check "a server pinned by its SHA-256 starts" st ok "require warden 1.31\nmcp server files exec $B/srv sha256=$H0\n$SL"
+    check "a server whose file has another SHA-256 is refused at the start" \
+        st no "require warden 1.31\nmcp server files exec $B/srv sha256=$(printf '0%.0s' $(seq 1 64))\n$SL" "not the 0000"
+    check "a server whose file the agent may write is refused" \
+        st no "require warden 1.31\nmcp server files exec $B/srv\nallow path $B/srv access=rw\n$SL" "could be replaced"
+    check "a server under a directory the agent may write is refused" \
+        st no "require warden 1.31\nmcp server files exec $B/srv\nallow path $B/\n$SL" "could be replaced"
+    check "a server whose file another subject may write is refused" \
+        st no "require warden 1.31\nmcp server files exec $B/srv\nmcp server two exec $B/tool\nallow path $B/srv access=wo for=two\n$SL" "could be replaced"
+    check "a server that is not there is refused" \
+        st no "require warden 1.31\nmcp server files exec $B/nothere\n$SL" "is not a launchable file"
+    check "a confined sub-agent is checked the same way" \
+        st no "require warden 1.31\nallow exec $B/srv subagent=h confined\nallow path $B/ access=rw\n$SL" "could be replaced"
 fi
 
 echo

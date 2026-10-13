@@ -1039,6 +1039,8 @@ def policy_credentials(checker, policy):
             creds.append((f[1], f[2], f[3]))
         elif len(f) == 5 and f[0] == "rule" and f[1].isdigit():
             rules[int(f[1])] = (f[2], f[3], None if f[4] == "-" else f[4])
+        elif len(f) == 4 and f[0] == "audience":
+            pass                                   # v1.31: an MCP access token's audience (step 5)
         elif line.strip():
             raise ValueError(f"an unexpected line from the checker: {line!r}")
     return creds, rules
@@ -1062,9 +1064,42 @@ def policy_identity(checker, policy):
             sub[int(f[1])] = f[2]
         elif line == "require on-behalf-of":
             req = True
+        elif f[0] in ("confined", "for", "mcp-resource") and len(f) in (3, 6):
+            pass                                   # v1.31: policy_confined reads them
         elif line.strip():
             raise ValueError(f"an unexpected line from the checker: {line!r}")
     return iss, dom, sub, req
+
+
+def policy_confined(checker, policy):
+    """v1.31: the policy's confined subjects {name: subject number}, as the
+    checker reads them (`identity`: "confined K NAME mcp|subagent LINE SHA"),
+    and the subject each rule is for {policy line: subject number} ("for LINE
+    K"; a rule not listed is the agent's, 0)."""
+    q = subprocess.run([checker, policy, "identity"], capture_output=True, text=True)
+    if q.returncode != 0:
+        raise ValueError(q.stderr.strip() or "the checker has no identity mode")
+    out, forl = {}, {}
+    for line in q.stdout.splitlines():
+        f = line.split(" ")
+        if len(f) == 6 and f[0] == "confined" and f[1].isdigit():
+            out[f[2]] = int(f[1])
+        elif len(f) == 3 and f[0] == "for" and f[1].isdigit() and f[2].isdigit():
+            forl[int(f[1])] = int(f[2])
+    return out, forl
+
+
+def expected_subject(obo, confined):
+    """v1.31: the subject a decision for this chain is made as: the
+    innermost sub-agent in it that is confined, else the agent (0). (The
+    Warden's attribution: a sub-agent's subject is the one its launch rule
+    declares, else its launcher's.)"""
+    k = 0
+    for t in obo if isinstance(obo, list) else []:
+        m = SUBAGENT_TAG.fullmatch(t) if isinstance(t, str) else None
+        if m and m.group(1) in confined:
+            k = confined[m.group(1)]
+    return k
 
 
 SUBAGENT_TAG = re.compile(r"subagent:([a-z][a-z0-9_]{0,31})#([1-9][0-9]{0,9})")
@@ -2765,6 +2800,7 @@ def main(argv=None):
         problems.append(f"the policy file hashes to {digest}, the Warden ran with {recorded}")
 
     lines, which = [], []
+    confined, for_lines = None, {}        # v1.31: read when a certificate is first checked
     authorized = refused = lookups = connects = views = stubs = 0
     resolutions = meta.get("resolutions", [])
     # v1.24 review: whether the policy has host name rules is read from the
@@ -3078,8 +3114,21 @@ def main(argv=None):
         if " " in cw or not cw:
             problems.append(f"seq {rec.get('seq')}: malformed certificate witness")
             continue
+        # v1.31: the certificate is checked as the subject the record's chain
+        # makes it (from the policy, not the record), and the record must say so
+        if confined is None:
+            try:
+                confined, for_lines = policy_confined(a.checker, a.policy)
+            except ValueError as e:
+                problems.append(f"checker failed: {e}")
+                confined, for_lines = {}, {}
+        ks = expected_subject(rec.get("obo"), confined)
+        if rec.get("cert_subject", 0) != ks:
+            problems.append(f"seq {rec.get('seq')}: certificate recorded for subject {rec.get('cert_subject', 0)!r}, "
+                            f"but the decision was for subject {ks} (its chain {rec.get('obo')!r})")
+            continue
         lines.append(f"{'request' if is_req else 'exec' if is_exec else 'host' if is_conn_like else 'path'} "
-                     f"{fl} {hx} {cr} {cw}")
+                     f"{fl} {hx} {cr} {cw}" + (f" @{ks}" if ks else ""))
         which.append(rec)
         if is_conn and ("candidates" in rec or "candidates_sha256" in rec):
             try:
@@ -3087,6 +3136,8 @@ def main(argv=None):
                                                     exact_grace=exact_grace)))
             except (TypeError, ValueError, AttributeError, KeyError) as e:
                 problems.append(f"seq {rec.get('seq')}: malformed connect or resolution records ({e})")
+        if is_conn and others and others[-1][0] is rec:
+            others[-1] = others[-1] + (ks,)          # v1.31: the subject it was decided as
 
     # v1.24 review: a view is served unless an explicit deny in the policy
     # holds on its path (and the open's flags): ask the checker which path
@@ -3141,10 +3192,14 @@ def main(argv=None):
                 problems.append(f"checker failed: {h.stderr.strip()}")
             else:
                 it = iter(rows)
-                for rec, cr, oc in others:
+                # v1.31: a rule's subject, by its policy line
+                rline = [r["line"] for r in prules]
+                for rec, cr, oc, *ksub in others:
+                    ksub = ksub[0] if ksub else 0
                     for c in oc:
                         row = next(it)
-                        early = [i for i in range(min(cr, len(row))) if kinds[i] == "h" and row[i] == "1"]
+                        early = [i for i in range(min(cr, len(row))) if kinds[i] == "h" and row[i] == "1"
+                                 and (for_lines.get(rline[i], 0) if i < len(rline) else 0) == ksub]
                         if early:
                             problems.append(f"seq {rec.get('seq')}: rule {early[0]} holds on candidate "
                                             f"{c!r}, before the rule that decided the connect")

@@ -433,7 +433,10 @@ test-v1290: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_ch
 	@./tests/test_v1290.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
 
 # v1.31 (docs/security/v1.31-standards.md)
-test-v1310: warden tools/vdp_check tools/vdp_cert_check
+tests/v1310_peek: tests/v1310_peek.c
+	$(CC) -O2 -Wall -Wextra -o $@ $<
+
+test-v1310: warden tools/vdp_check tools/vdp_cert_check tests/v1281_sub tests/v1310_peek
 	@./tests/test_v1310.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
 
 # v1.26 step 5: the proxy's parsers, under ASan and UBSan: the vectors, then

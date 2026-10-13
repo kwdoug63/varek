@@ -418,7 +418,8 @@ static void change_handle(int notify_fd, const struct seccomp_notif *req, struct
             const char *erule = NULL;
             decision_t eraw = DEC_UNKNOWN;
             a->open_flags = O_RDONLY;
-            if (S_ISDIR(es.st_mode) && is_ancestor(a->resolved) && !ancestor_denied(p, a->resolved)) {
+            if (S_ISDIR(es.st_mode) && is_ancestor(a->resolved, sub_policy_subject(a->subject)) &&
+                !ancestor_denied(p, a->resolved, sub_policy_subject(a->subject))) {
                 erule = "mkdir_exists_ancestor";
                 eraw = DEC_ALLOW;
             } else if (!change_decide(p, a, &eraw)) {
