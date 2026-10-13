@@ -124,7 +124,13 @@ decided SATISFIED.
 The earlier suites (`test-v1240` to `test-v1271`) and `make test-cli` (72
 tests) pass. The cross-check's generator writes credential policies, valid
 and malformed: four batches of 400 before the review and two after it, 0
-disagreements among the three parsers. **Against v1.27.1:** (to come).
+disagreements among the three parsers. **Against v1.27.1** (its own tree,
+with this suite and its stand-ins copied in, and the v1.28 `warden-secrets`
+beside it so the sections run rather than skip; the v1.27.1 Warden never
+starts it): 155 of the 168 checks fail, 13 pass (each checks that something
+does not happen: no value in an output, no helper or socket left behind, no
+renewal after a revocation, no secret quoted; with nothing fetched they hold
+trivially).
 
 ## 24 hours on a small host
 
