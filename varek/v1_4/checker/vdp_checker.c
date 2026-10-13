@@ -149,6 +149,7 @@ struct vdpc_rule {
     unsigned rport;
     int      cred;                    /* request (v1.28): 1 + credential index, 0: none */
     char     hdr[65], scheme[33];     /* request (v1.28): header=NAME[:SCHEME] */
+    char     subagent[33];            /* exec (v1.28.1): subagent=NAME ("" : none) */
 };
 
 void vdpc_free(vdpc_policy_t *p) {
@@ -570,6 +571,82 @@ static bool framing_header(const char *h) {
     return false;
 }
 
+/* v1.28.1: [a-z][a-z0-9_]{0,31}, a credential's or a sub-agent's name */
+static bool short_name(const char *n) {
+    size_t nl = strlen(n);
+    if (nl < 1 || nl > 32 || n[0] < 'a' || n[0] > 'z') return false;
+    for (size_t i = 1; i < nl; i++)
+        if (!((n[i] >= 'a' && n[i] <= 'z') || (n[i] >= '0' && n[i] <= '9') || n[i] == '_')) return false;
+    return true;
+}
+
+/* v1.28.1: an absolute path with no empty, "." or ".." segment */
+static bool clean_abs_path(const char *r) {
+    size_t rl = strlen(r);
+    if (r[0] != '/' || rl < 2) return false;
+    const char *seg = r + 1;
+    for (;;) {
+        const char *e = strchr(seg, '/');
+        size_t sl = e ? (size_t)(e - seg) : strlen(seg);
+        if (sl == 0 || (sl == 1 && seg[0] == '.') || (sl == 2 && seg[0] == '.' && seg[1] == '.')) return false;
+        if (!e) return true;
+        seg = e + 1;
+    }
+}
+
+/* v1.28.1: bytes 0x21 to 0x7e, lo to hi of them */
+static bool printable(const char *v, size_t lo, size_t hi) {
+    size_t l = strlen(v);
+    if (l < lo || l > hi) return false;
+    for (size_t i = 0; i < l; i++)
+        if ((unsigned char)v[i] <= 0x20 || (unsigned char)v[i] >= 0x7f) return false;
+    return true;
+}
+
+/* v1.28.1: an https URL with a host, at most hi bytes */
+static bool https_with_host(const char *u, size_t hi) {
+    return printable(u, 9, hi) && !strncmp(u, "https://", 8) && u[8] != '/' && u[8] != '?' && u[8] != '#';
+}
+
+/* v1.28.1: trust issuer URL audience AUD [jwks URL] | trust spiffe DOMAIN bundle PATH */
+static int parse_trust(const char *name, int ln, char **tok, int nt, vdpc_policy_t *p, char *err, size_t en) {
+    if (nt >= 2 && !strcmp(tok[1], "issuer")) {
+        if (!((nt == 5 || nt == 7) && !strcmp(tok[3], "audience") && (nt == 5 || !strcmp(tok[5], "jwks"))))
+            return fail(err, en, name, ln, "bad trust issuer directive");
+        if (!https_with_host(tok[2], 255) || !printable(tok[4], 1, 255) ||
+            (nt == 7 && !https_with_host(tok[6], 1024)))
+            return fail(err, en, name, ln, "bad issuer, audience or jwks");
+        for (size_t k = 0; k < p->nissuers; k++)
+            if (!strcmp(p->issuers[k].iss, tok[2])) return fail(err, en, name, ln, "issuer trusted twice");
+        if (p->nissuers == VDPC_MAX_ISSUERS) return fail(err, en, name, ln, "more than 8 issuers");
+        vdpc_issuer_t *is = &p->issuers[p->nissuers++];
+        memcpy(is->iss, tok[2], strlen(tok[2]) + 1);
+        memcpy(is->aud, tok[4], strlen(tok[4]) + 1);
+        if (nt == 7) memcpy(is->jwks, tok[6], strlen(tok[6]) + 1);
+        is->line = ln;
+        return 0;
+    }
+    if (nt >= 2 && !strcmp(tok[1], "spiffe")) {
+        if (nt != 5 || strcmp(tok[3], "bundle")) return fail(err, en, name, ln, "bad trust spiffe directive");
+        const char *d = tok[2];
+        size_t dl = strlen(d);
+        bool ok = dl >= 1 && dl <= 255 && ((d[0] >= 'a' && d[0] <= 'z') || (d[0] >= '0' && d[0] <= '9'));
+        for (size_t i = 0; ok && i < dl; i++)
+            ok = (d[i] >= 'a' && d[i] <= 'z') || (d[i] >= '0' && d[i] <= '9') || strchr("._-", d[i]);
+        if (!ok) return fail(err, en, name, ln, "bad trust domain");
+        if (!printable(tok[4], 2, 1024) || !clean_abs_path(tok[4])) return fail(err, en, name, ln, "bad bundle path");
+        for (size_t k = 0; k < p->nspiffe; k++)
+            if (!strcmp(p->spiffe[k].domain, d)) return fail(err, en, name, ln, "trust domain twice");
+        if (p->nspiffe == VDPC_MAX_SPIFFE) return fail(err, en, name, ln, "more than 8 trust domains");
+        vdpc_spiffe_t *sp = &p->spiffe[p->nspiffe++];
+        memcpy(sp->domain, d, dl + 1);
+        memcpy(sp->bundle, tok[4], strlen(tok[4]) + 1);
+        sp->line = ln;
+        return 0;
+    }
+    return fail(err, en, name, ln, "bad trust directive");
+}
+
 /* v1.28: credential NAME from STORE:REF; 0, or -1 (the reason in err) */
 static int parse_credential(const char *name, int ln, char **tok, int nt, vdpc_policy_t *p,
                             char *err, size_t en) {
@@ -826,6 +903,15 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
             *slot = (uint32_t)x;
             continue;
         }
+        /* v1.28.1: subagent=NAME on an allow exec rule */
+        if (!strncmp(t, "subagent=", 9)) {
+            if (!ver_ge(req_maj, req_min, 1, 28)) return fail(err, en, name, ln, "subagent before 1.28");
+            if (r->kind != VDPC_EXEC || !r->allow) return fail(err, en, name, ln, "subagent on a rule that is not allow exec");
+            if (r->subagent[0]) return fail(err, en, name, ln, "subagent given twice");
+            if (!short_name(t + 9)) return fail(err, en, name, ln, "bad sub-agent name");
+            memcpy(r->subagent, t + 9, strlen(t + 9) + 1);
+            continue;
+        }
         if (r->kind != VDPC_PATH) return fail(err, en, name, ln, "flag clause on a non-path rule");
         uint32_t m, v;
         if (!strcmp(t, "readonly"))       { m = ACCMODE | 0100 | 01000; v = 0; }
@@ -887,7 +973,13 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
             if (*q) *q++ = '\0';
         }
         if (rc == 0 && nt > 0) {
-            if (!strcmp(tok[0], "require")) {
+            if (!strcmp(tok[0], "require") && nt >= 2 && !strcmp(tok[1], "on-behalf-of")) {
+                /* v1.28.1 */
+                if (nt != 2) rc = fail(err, en, name, ln, "bad require on-behalf-of");
+                else if (!ver_ge(req_maj, req_min, 1, 28)) rc = fail(err, en, name, ln, "on-behalf-of before 1.28");
+                else if (p->require_obo) rc = fail(err, en, name, ln, "on-behalf-of twice");
+                else p->require_obo = 1;
+            } else if (!strcmp(tok[0], "require")) {
                 int a, b;
                 if (nt != 3 || strcmp(tok[1], "warden") || !parse_ver(tok[2], &a, &b))
                     rc = fail(err, en, name, ln, "bad directive");
@@ -938,6 +1030,12 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
                     }
                 } else
                     rc = fail(err, en, name, ln, "bad proxy directive");
+            } else if (!strcmp(tok[0], "trust")) {
+                /* v1.28.1 */
+                if (!ver_ge(req_maj, req_min, 1, 28))
+                    rc = fail(err, en, name, ln, "trust before require warden 1.28");
+                else
+                    rc = parse_trust(name, ln, tok, nt, p, err, en);
             } else if (!strcmp(tok[0], "credential")) {
                 /* v1.28 */
                 if (!ver_ge(req_maj, req_min, 1, 28))
@@ -1141,6 +1239,7 @@ int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *o) {
     o->cred = r->cred;
     o->cred_hdr = r->hdr;
     o->cred_scheme = r->scheme;
+    o->subagent = r->subagent;
     return 0;
 }
 

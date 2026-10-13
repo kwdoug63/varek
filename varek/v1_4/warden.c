@@ -375,7 +375,9 @@ static int policy_load(const char *path, struct policy *p) {
             ci.portless != r->s.portless || ci.name != r->s.name || ci.wild != r->s.wild ||
             ci.names != r->names || ci.rate != r->rate || ci.max_body != r->max_body ||
             /* v1.28: the credential a request rule carries, and where */
-            ci.cred != r->cred || strcmp(ci.cred_hdr, r->cred_hdr) || strcmp(ci.cred_scheme, r->cred_scheme)) {
+            ci.cred != r->cred || strcmp(ci.cred_hdr, r->cred_hdr) || strcmp(ci.cred_scheme, r->cred_scheme) ||
+            /* v1.28.1: the sub-agent an exec rule names */
+            strcmp(ci.subagent, r->subagent)) {
             fprintf(stderr, "[warden] policy %s:%d: the decision procedure and the certificate "
                     "checker read this rule differently; refusing to start\n", path, r->line);
             return -1;
@@ -416,6 +418,35 @@ static int policy_load(const char *path, struct policy *p) {
                 "the credentials differently; refusing to start\n", path);
         return -1;
     }
+    /* v1.28.1: and the identities the run trusts */
+    bool id_same = p->v.nissuers == p->c.nissuers && p->v.nspiffe == p->c.nspiffe &&
+                   p->v.require_obo == (p->c.require_obo != 0);
+    for (size_t k = 0; id_same && k < p->v.nissuers; k++)
+        id_same = !strcmp(p->v.issuers[k].iss, p->c.issuers[k].iss) && !strcmp(p->v.issuers[k].aud, p->c.issuers[k].aud) &&
+                  !strcmp(p->v.issuers[k].jwks, p->c.issuers[k].jwks) && p->v.issuers[k].line == p->c.issuers[k].line;
+    for (size_t k = 0; id_same && k < p->v.nspiffe; k++)
+        id_same = !strcmp(p->v.spiffe[k].domain, p->c.spiffe[k].domain) &&
+                  !strcmp(p->v.spiffe[k].bundle, p->c.spiffe[k].bundle) && p->v.spiffe[k].line == p->c.spiffe[k].line;
+    if (!id_same) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
+                "the trusted identities differently; refusing to start\n", path);
+        return -1;
+    }
+    /* v1.28.1 (docs/security/v1.28.1-delegation-chain.md): the user's token is
+     * verified from step 2 and sub-agents are attributed from step 3; until
+     * then a policy that depends on either is refused, so no run claims
+     * attribution it does not have. `trust` lines alone change nothing. */
+    if (p->v.require_obo) {
+        fprintf(stderr, "[warden] policy %s: `require on-behalf-of`: verifying a user's token is not built "
+                "in this Warden yet (v1.28.1 step 2); refusing to start\n", path);
+        return -1;
+    }
+    for (size_t i = 0; i < p->v.n; i++)
+        if (p->v.rules[i].subagent[0]) {
+            fprintf(stderr, "[warden] policy %s:%d: subagent=: attributing a sub-agent's calls is not built "
+                    "in this Warden yet (v1.28.1 step 3); refusing to start\n", path, p->v.rules[i].line);
+            return -1;
+        }
     /* v1.13: load-time analysis. The decision procedure decides, for every
      * rule, whether ANY action can reach it as the first matching rule. A rule
      * that can never fire is almost always a policy bug (typically a deny

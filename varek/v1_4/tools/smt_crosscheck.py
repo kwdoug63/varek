@@ -521,6 +521,44 @@ def credential_parse(toks, names, where):
     return (name, CRED_STORES[store], ref)
 
 
+def https_with_host(u, hi):
+    """v1.28.1: an https:// URL of at most hi bytes, printable, with a host."""
+    return 9 <= len(u) <= hi and u.startswith("https://") and u[8] not in "/?#" and \
+        all(0x21 <= ord(ch) <= 0x7e for ch in u)
+
+
+def trust_parse(toks, issuers, spiffe, where):
+    """v1.28.1: `trust issuer URL audience AUD [jwks URL]` or `trust spiffe
+    DOMAIN bundle PATH`, appended to issuers or spiffe; or PolicyError."""
+    if len(toks) >= 2 and toks[1] == "issuer":
+        if not (len(toks) in (5, 7) and toks[3] == "audience" and (len(toks) == 5 or toks[5] == "jwks")):
+            raise PolicyError(f"{where}: bad trust issuer")
+        aud = toks[4]
+        jwks = toks[6] if len(toks) == 7 else ""
+        if not https_with_host(toks[2], 255) or not 1 <= len(aud) <= 255 or \
+                any(not 0x21 <= ord(ch) <= 0x7e for ch in aud) or (jwks and not https_with_host(jwks, 1024)):
+            raise PolicyError(f"{where}: bad issuer, audience or jwks")
+        if any(i[0] == toks[2] for i in issuers) or len(issuers) >= 8:
+            raise PolicyError(f"{where}: issuer twice, or more than 8")
+        issuers.append((toks[2], aud, jwks))
+        return
+    if len(toks) >= 2 and toks[1] == "spiffe":
+        if len(toks) != 5 or toks[3] != "bundle":
+            raise PolicyError(f"{where}: bad trust spiffe")
+        d, b = toks[2], toks[4]
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._\-]{0,254}", d):
+            raise PolicyError(f"{where}: bad trust domain")
+        segs = b.split("/")
+        if len(b) > 1024 or any(not 0x21 <= ord(ch) <= 0x7e for ch in b) or segs[0] != "" or len(segs) < 2 or \
+                any(sg in ("", ".", "..") for sg in segs[1:]):
+            raise PolicyError(f"{where}: bad bundle path")
+        if any(x[0] == d for x in spiffe) or len(spiffe) >= 8:
+            raise PolicyError(f"{where}: trust domain twice, or more than 8")
+        spiffe.append((d, b))
+        return
+    raise PolicyError(f"{where}: bad trust directive")
+
+
 def parse_policy(path):
     """Independent re-implementation of the policy grammar (smt_decide.h)."""
     with open(path, "rb") as fh:
@@ -537,6 +575,7 @@ def parse_lines(raw_lines, path):
     upstream = None                    # v1.26 section 5: `proxy upstream http://HOST:PORT`
     inspect, passthrough = False, []   # v1.26.1: `proxy inspect`, `proxy passthrough host NAME`
     creds = []                         # v1.28: (name, store, ref), in order
+    issuers, spiffe, require_obo = [], [], False   # v1.28.1
     if True:
         for lineno, raw in enumerate(raw_lines, 1):
             if b"\0" in raw:
@@ -553,6 +592,18 @@ def parse_lines(raw_lines, path):
                 continue
             if len(toks) > MAX_TOKENS:
                 raise PolicyError(f"{path}:{lineno}: too many tokens")
+            if toks[0] == "require" and len(toks) >= 2 and toks[1] == "on-behalf-of":
+                # v1.28.1
+                if len(toks) != 2 or req < (1, 28) or require_obo:
+                    raise PolicyError(f"{path}:{lineno}: bad require on-behalf-of")
+                require_obo = True
+                continue
+            if toks[0] == "trust":
+                # v1.28.1
+                if req < (1, 28):
+                    raise PolicyError(f"{path}:{lineno}: trust before 1.28")
+                trust_parse(toks, issuers, spiffe, f"{path}:{lineno}")
+                continue
             if toks[0] == "require":
                 m = re.fullmatch(r"([0-9]{1,6})\.([0-9]{1,6})", toks[2]) if len(toks) == 3 else None
                 if len(toks) != 3 or toks[1] != "warden" or not m:
@@ -703,8 +754,16 @@ def parse_lines(raw_lines, path):
             mask = value = 0
             budgets = {}
             ack = False
+            subagent = ""                  # v1.28.1
             for t in toks[ci + 1:]:
                 bk, _, bv = t.partition("=")
+                if bk == "subagent" and _:
+                    # v1.28.1: subagent=NAME on an allow exec rule
+                    if req < (1, 28) or kind != "exec" or verb != "allow" or subagent or \
+                            not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", bv):
+                        raise PolicyError(f"{path}:{lineno}: bad subagent=")
+                    subagent = bv
+                    continue
                 if kind == "host" and bk == "acknowledge" and _:
                     # v1.25: a wildcard allow rule acknowledges the name channel
                     if bv != "dns-channel":
@@ -757,7 +816,7 @@ def parse_lines(raw_lines, path):
                     portless = host_portless(const)
             r = {"verb": verb, "kind": kind, "op": op, "c": const, "rx": grx, "gtoks": gtoks,
                  "mask": mask, "value": value, "line": lineno, "portless": portless, "name": name,
-                 "wild": wild}
+                 "wild": wild, "subagent": subagent}
             r["lang"] = atom_rx(rx, r)
             rules.append(r)
     if proxy_ports is not None and not proxy:
@@ -779,6 +838,7 @@ def parse_lines(raw_lines, path):
     # v1.27: launches after the first are decided only after require warden 1.27
     parse_policy.launches = req >= (1, 27)
     parse_policy.creds = creds                     # v1.28
+    parse_policy.identity = (issuers, spiffe, require_obo)   # v1.28.1
     return rules, rx
 
 
@@ -1316,6 +1376,42 @@ def fuzz_policy(rng, path):
                     continue
                 lines.append("credential " + c)
                 cred_names.append(c.split()[0])
+        # v1.28.1: trusted identities, require on-behalf-of, sub-agents on exec rules
+        if v128 and rng.random() < 0.6:
+            good_t = ["issuer https://idp.example.com/ audience varek-agent",
+                      "issuer https://login.example.org audience api://varek jwks https://login.example.org/keys",
+                      "issuer https://a.example.net/realms/x audience aud|1 jwks https://a.example.net/certs?x=1",
+                      "spiffe example.org bundle /etc/varek/spiffe.pem", "spiffe prod.example_x-1 bundle /b"]
+            bad_t = ["issuer http://idp.example.com audience a", "issuer https:// audience a",
+                     "issuer https:///x audience a", "issuer https://i.example.com aud a",
+                     "issuer https://i.example.com audience", "issuer https://i.example.com audience a jwks",
+                     "issuer https://i.example.com audience a jwks http://k", "issuer https://i.example.com audience a keys https://k",
+                     "issuer https://" + "x" * 250 + " audience a", "issuer https://i.example.com audience " + "a" * 256,
+                     "spiffe Example.org bundle /b", "spiffe -x bundle /b", "spiffe x bundle b", "spiffe x bundle /a/../b",
+                     "spiffe x bundle /a//b", "spiffe x pem /b", "spiffe x bundle", "spiffe", "issuer", "domain x"]
+            seen_t = set()
+            for _ in range(rng.randint(1, 3)):
+                t = rng.choice(good_t)
+                if not valid and rng.random() < 0.3:
+                    t = rng.choice(bad_t + [t])
+                if valid and t.split()[1] in seen_t:
+                    continue
+                seen_t.add(t.split()[1])
+                lines.append("trust " + t)
+            if rng.random() < 0.5:
+                lines.append(rng.choice(["require on-behalf-of"] * 4 + ([] if valid else
+                             ["require on-behalf-of x", "require on-behalf-of\nrequire on-behalf-of"])))
+            for _ in range(rng.randint(0, 3)):
+                sa = rng.choice(["helper", "tool_runner", "a1", "x" * 32])
+                e = rng.choice(["allow exec /usr/bin/python3 subagent=" + sa,
+                                "allow exec prefix /opt/tools/ subagent=" + sa,
+                                "allow exec glob /opt/*/run subagent=" + sa])
+                if not valid and rng.random() < 0.3:
+                    e = rng.choice(["deny exec /usr/bin/x subagent=a", "allow path /tmp/ subagent=a",
+                                    "allow exec /usr/bin/x subagent=A", "allow exec /usr/bin/x subagent=",
+                                    "allow exec /usr/bin/x subagent=a subagent=b", "allow exec /usr/bin/x subagent=" + "y" * 33,
+                                    "allow host api.example.com:443 subagent=a", e])
+                lines.append(e)
         if rng.random() < 0.3:
             lines.append("proxy ports " + rng.choice(["443", "80 443 8443", "8443"]))
         if rng.random() < 0.3:
@@ -1792,6 +1888,18 @@ def check_policy(vdp, policy, rng, nq, stats, verbose, checker=None):
         fails.append(f"{policy}: credentials disagreement (oracle {want_c}, C {got_c})")
     if want_c:
         stats["credential_policies"] = stats.get("credential_policies", 0) + 1
+    # v1.28.1: and on the trusted identities and the sub-agents
+    iss, spf, robo = parse_policy.identity
+    want_i = [f"issuer {a} {b} {c or '-'}" for a, b, c in iss] + [f"spiffe {d} {b}" for d, b in spf]
+    want_i += [f"subagent {r['line']} {r['subagent']}" for r in rules if r.get("subagent")]
+    want_i += ["require on-behalf-of"] if robo else []
+    got_i = [run_vdp(vdp, policy, "identity")[1].splitlines()]
+    if checker:
+        got_i.append(subprocess.run([checker, policy, "identity"], capture_output=True, text=True).stdout.splitlines())
+    if any(g != want_i for g in got_i):
+        fails.append(f"{policy}: identity disagreement (oracle {want_i}, C {got_i})")
+    if want_i:
+        stats["identity_policies"] = stats.get("identity_policies", 0) + 1
     if any(r["op"] in ("suffix", "contains", "glob") for r in rules):
         stats["string_policies"] += 1
     if any(r["kind"] == "request" for r in rules):

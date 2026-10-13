@@ -173,9 +173,9 @@ int main(int argc, char **argv) {
                       strcmp(argv[2], "holds") && strcmp(argv[2], "openable") &&
                       strcmp(argv[2], "kinds") && strcmp(argv[2], "rules") && strcmp(argv[2], "proxy") &&
                       strcmp(argv[2], "launches") && strcmp(argv[2], "matches") &&
-                      strcmp(argv[2], "credentials"))) {
+                      strcmp(argv[2], "credentials") && strcmp(argv[2], "identity"))) {
         fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds|rules|matches|proxy|launches|"
-                "credentials\n", argv[0]);
+                "credentials|identity\n", argv[0]);
         return 2;
     }
     FILE *f = fopen(argv[1], "rb");
@@ -232,6 +232,24 @@ int main(int argc, char **argv) {
                 printf("rule %d %s %s %s\n", ri.line, pol.creds[ri.cred - 1].name, ri.cred_hdr,
                        ri.cred_scheme[0] ? ri.cred_scheme : "-");
         }
+        vdpc_free(&pol);
+        return 0;
+    }
+
+    /* v1.28.1: the identities and the sub-agents (vdp_check's `identity`
+     * prints the same lines from the decision procedure's reading) */
+    if (!strcmp(argv[2], "identity")) {
+        for (size_t k = 0; k < pol.nissuers; k++)
+            printf("issuer %s %s %s\n", pol.issuers[k].iss, pol.issuers[k].aud,
+                   pol.issuers[k].jwks[0] ? pol.issuers[k].jwks : "-");
+        for (size_t k = 0; k < pol.nspiffe; k++)
+            printf("spiffe %s %s\n", pol.spiffe[k].domain, pol.spiffe[k].bundle);
+        for (size_t i = 0; i < pol.n; i++) {
+            vdpc_rule_info_t ri;
+            vdpc_rule_info(&pol, i, &ri);
+            if (ri.subagent && ri.subagent[0]) printf("subagent %d %s\n", ri.line, ri.subagent);
+        }
+        if (pol.require_obo) printf("require on-behalf-of\n");
         vdpc_free(&pol);
         return 0;
     }

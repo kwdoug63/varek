@@ -103,6 +103,18 @@ typedef struct {
     int  line;
 } vdpc_cred_t;
 
+/* v1.28.1: `trust issuer`, `trust spiffe` (smt_decide.h has the forms) */
+#define VDPC_MAX_ISSUERS 8
+#define VDPC_MAX_SPIFFE  8
+typedef struct {
+    char iss[256], aud[256], jwks[1025];
+    int  line;
+} vdpc_issuer_t;
+typedef struct {
+    char domain[256], bundle[1025];
+    int  line;
+} vdpc_spiffe_t;
+
 typedef struct {
     vdpc_rule_t  *rules;
     size_t        n;
@@ -118,6 +130,11 @@ typedef struct {
     int           launches;           /* v1.27: `require warden 1.27` (launches decided) */
     vdpc_cred_t   creds[VDPC_MAX_CREDS]; /* v1.28: the credentials, in order */
     size_t        ncreds;
+    vdpc_issuer_t issuers[VDPC_MAX_ISSUERS]; /* v1.28.1 */
+    size_t        nissuers;
+    vdpc_spiffe_t spiffe[VDPC_MAX_SPIFFE];
+    size_t        nspiffe;
+    int           require_obo;        /* v1.28.1: `require on-behalf-of` */
 } vdpc_policy_t;
 
 typedef struct {
@@ -158,6 +175,7 @@ typedef struct {
     int         cred;                 /* request (v1.28): 1 + the credential's index, 0: none */
     const char *cred_hdr;             /* request (v1.28): header=NAME ("" : none) */
     const char *cred_scheme;          /* request (v1.28): header=NAME:SCHEME ("" : none) */
+    const char *subagent;             /* exec (v1.28.1): subagent=NAME ("" : none) */
 } vdpc_rule_info_t;
 int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *out);
 

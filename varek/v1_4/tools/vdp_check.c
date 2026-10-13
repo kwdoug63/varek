@@ -115,7 +115,7 @@ static const char *reach_name(vdp_reach_t r) {
 
 int main(int argc, char **argv) {
     if (argc != 3 && !(argc == 4 && !strcmp(argv[2], "analyze") && !strcmp(argv[3], "automaton"))) {
-        fprintf(stderr, "usage: %s <policy> lint|analyze [automaton]|batch|launches|credentials\n", argv[0]);
+        fprintf(stderr, "usage: %s <policy> lint|analyze [automaton]|batch|launches|credentials|identity\n", argv[0]);
         return 2;
     }
     if (argc == 4) vdp_reach_force_automaton = true;
@@ -145,6 +145,19 @@ int main(int argc, char **argv) {
                 printf("rule %d %s %s %s\n", r->line, g_pol.creds[r->cred - 1].name, r->cred_hdr,
                        r->cred_scheme[0] ? r->cred_scheme : "-");
         }
+        return 0;
+    }
+    /* v1.28.1: the identities the run trusts and the sub-agents, as this
+     * parser read them (vdp_cert_check and the oracle print the same) */
+    if (!strcmp(argv[2], "identity")) {
+        for (size_t k = 0; k < g_pol.nissuers; k++)
+            printf("issuer %s %s %s\n", g_pol.issuers[k].iss, g_pol.issuers[k].aud,
+                   g_pol.issuers[k].jwks[0] ? g_pol.issuers[k].jwks : "-");
+        for (size_t k = 0; k < g_pol.nspiffe; k++)
+            printf("spiffe %s %s\n", g_pol.spiffe[k].domain, g_pol.spiffe[k].bundle);
+        for (size_t i = 0; i < g_pol.n; i++)
+            if (g_pol.rules[i].subagent[0]) printf("subagent %d %s\n", g_pol.rules[i].line, g_pol.rules[i].subagent);
+        if (g_pol.require_obo) printf("require on-behalf-of\n");
         return 0;
     }
     if (!strcmp(argv[2], "analyze")) {
@@ -267,6 +280,12 @@ int main(int argc, char **argv) {
                 printf("%s:%d: note: credential %s is named, but no request rule carries it\n",
                        argv[1], g_pol.creds[k].line, g_pol.creds[k].name);
         }
+        /* v1.28.1: `require on-behalf-of` with no trusted issuer: no token can
+         * be verified, so no run can start; and a `trust issuer` line without
+         * `require on-behalf-of` is used only when the operator gives a token */
+        if (g_pol.require_obo && !g_pol.nissuers)
+            printf("%s: note: require on-behalf-of, but no issuer is trusted (trust issuer ...): no run can "
+                   "start\n", argv[1]);
         /* v1.16: the policy's glob size against the cap that bounds the work
          * of one decision (4,096 tokens x a 4,095-byte string). */
         printf("%s: glob tokens %zu of %d\n", argv[1], vdp_policy_glob_tokens(&g_pol),
