@@ -273,7 +273,7 @@ PY
     run r1 "$POLR" /usr/bin/python3 "$W/a.py"
     check "a run with require warden 1.27: the agent runs in the Landlock domain" grep -qx 'AGENT ok' "$OUT/log/r1.out"
     check "run_start records the Landlock ABI" rs "$OUT/log/r1.log" 'r["landlock"]["abi"] >= 1'
-    check "run_start names this Warden (1.27.0)" rs "$OUT/log/r1.log" 'r["warden"] == "1.27.0"'
+    check "run_start names this Warden (1.27.x)" rs "$OUT/log/r1.log" '__import__("re").fullmatch(r"1\.27\.[0-9]+", r["warden"])'
     printf 'import os\nfor p in (0, -1):\n    try:\n        os.kill(p, 0); print("KILL", p, "ok")\n    except OSError as e:\n        print("KILL", p, "refused")\nos.kill(os.getpid(), 0); print("KILL self ok", flush=True)\n' > "$W/k.py"; chmod 644 "$W/k.py"
     run rk "$POLR" /usr/bin/python3 "$W/k.py"
     # v1.27 review: a #! line that ends at the end of the file (no newline) runs, as the kernel runs it

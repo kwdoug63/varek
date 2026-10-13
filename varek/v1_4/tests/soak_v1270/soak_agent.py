@@ -7,13 +7,16 @@ printing one JSON line on stdout:
   python   python3 -c 'print(sum(range(1000)))'
   compile  cc -o <work>/t <work>/t.c (only with --cc): cc, cc1, as, collect2, ld
 
-and every tenth turn, from the third, a probe the policy must refuse, three
+and every tenth turn, from the third, a probe the policy must refuse, four
 kinds in turn:
 
   unlisted  /usr/bin/false, which no rule allows (default_deny_unknown)
   denied    /usr/bin/env, which a deny rule refuses (policy_match)
   written   a program the agent writes now into <work>/run/, whose names a
             rule allows but which is not in the launch set (exec_not_in_ruleset)
+  library   (v1.27.1) a copy of libm.so.6 the agent writes now into <work>/,
+            which it then tries to load: refused, as the work directory is
+            mounted noexec (no record: the kernel refuses the mapping)
 """
 import argparse
 import json
@@ -30,7 +33,7 @@ ap.add_argument("--cc", action="store_true")
 a = ap.parse_args()
 
 tasks = ["git", "python"] + (["compile"] if a.cc else [])
-probes = ["unlisted", "denied", "written"]
+probes = ["unlisted", "denied", "written", "library"]
 
 
 def run(argv):
@@ -61,6 +64,19 @@ def probe(kind, n):
         return "/usr/bin/false", run(["/usr/bin/false"])
     if kind == "denied":
         return "/usr/bin/env", run(["/usr/bin/env"])
+    if kind == "library":
+        import ctypes
+        import shutil
+        p = f"{a.work}/lib{n}.so"
+        src = next(d + "/libm.so.6" for d in ("/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu",
+                                              "/lib64", "/usr/lib64") if os.path.exists(d + "/libm.so.6"))
+        shutil.copyfile(src, p)
+        t0 = time.monotonic()
+        try:
+            ctypes.CDLL(p)
+            return p, (0, "loaded", None, (time.monotonic() - t0) * 1000)
+        except OSError as e:
+            return p, (None, str(e)[:160], 13, (time.monotonic() - t0) * 1000)
     p = f"{a.work}/run/w{n}"
     fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o755)
     with open("/usr/bin/true", "rb") as src:
@@ -81,6 +97,8 @@ while True:
         path, (rc, out, err, ms) = probe(kind, npb)
         npb += 1
         rec.update(probe=kind, path=path, rc=rc, errno=err, ms=round(ms, 1), refused=err == 13)
+        if kind == "library":
+            rec["out"] = out                 # v1.27.1 review: the loader's own words
     else:
         kind = tasks[nt % len(tasks)]
         nt += 1

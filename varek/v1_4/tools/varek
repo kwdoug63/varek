@@ -414,6 +414,23 @@ def _policy_for_log(cfg, s):
 
 # ------------------------------------------------------------- subcommands --
 
+def mount_ns_ok():
+    """v1.27.1: can this process make a mount namespace, as the Warden does
+    (in a child, so this process keeps its own)? True, False, or None when
+    not root (the Warden runs as root; nothing to learn as another user)."""
+    if os.geteuid() != 0:
+        return None
+    import ctypes
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os._exit(0 if ctypes.CDLL(None).unshare(0x20000) == 0 else 1)    # CLONE_NEWNS
+        except Exception:
+            os._exit(1)
+    _, st = os.waitpid(pid, 0)
+    return os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0
+
+
 def landlock_abi():
     """v1.27: (the Landlock ABI, "") or (0, why), probed as the Warden does
     (landlock_create_ruleset with LANDLOCK_CREATE_RULESET_VERSION)."""
@@ -457,6 +474,15 @@ def cmd_doctor(args):
         warn(f"Landlock is not available ({why}): with `require warden 1.27` every launch after the "
              f"agent's own is refused")
         hint("Linux 5.13 or later with `landlock` in /sys/kernel/security/lsm (the kernel's lsm= list)")
+    # v1.27.1: with `require warden 1.27` the Warden mounts the writable
+    # directories noexec in a mount namespace of its own
+    mns = mount_ns_ok()
+    if mns is True:
+        ok("Mount namespaces: the Warden can mount writable directories noexec (require warden 1.27)")
+    elif mns is False:
+        warn("The Warden cannot make a mount namespace here: a `require warden 1.27` run refuses to "
+             "start unless given --writable-exec")
+        hint("run the Warden as root (it needs CAP_SYS_ADMIN), outside a container that forbids unshare")
 
     if os.path.isdir("/sys/fs/cgroup") and os.path.exists("/sys/fs/cgroup/cgroup.controllers"):
         ok("cgroups v2 mounted")
@@ -718,7 +744,7 @@ def cmd_policy_show(args):
         # the set the Warden would build on this host (its own expansion of the rules)
         w = os.path.join(varek_home(), "warden")
         r = subprocess.run([w, path, "--check-startup"], capture_output=True, text=True) \
-            if has_exec and os.access(w, os.X_OK) else None
+            if os.access(w, os.X_OK) else None       # v1.27.1: the noexec list too, exec rules or not
         if r is not None and r.returncode != 0:
             # v1.27 review: say first that it would not start, and claim nothing it would allow
             why = next((ln for ln in r.stderr.splitlines() if "refusing to start" in ln), "")
@@ -730,13 +756,20 @@ def cmd_policy_show(args):
                  if has_exec else "Launches decided (require warden 1.27), but no exec rule allows one: "
                  "every launch after the agent's own is refused")
         if r is not None and r.returncode == 0:
-            files = [ln[len("[warden]   "):] for ln in r.stderr.splitlines() if ln.startswith("[warden]   ")]
+            sub = [ln[len("[warden]   "):] for ln in r.stderr.splitlines() if ln.startswith("[warden]   ")]
+            files = [ln for ln in sub if not ln.startswith("noexec ")]
             head = next((ln[len("[warden] "):] for ln in r.stderr.splitlines()
                          if ln.startswith("[warden] launch set:")), None)
-            if head:
+            if head and has_exec:
                 info(f"Launch set on this host: {head[len('launch set: '):]}")
                 for ln in files:
                     info(f"  {ln}")
+            # v1.27.1: the directories the agent may write, mounted noexec
+            nx = [ln[len("noexec "):] for ln in sub if ln.startswith("noexec ")]
+            info("Mounted noexec (v1.27.1): files the agent may write can be neither launched nor "
+                 "mapped executable" + (":" if nx else ": none (the policy lets the agent write nowhere)"))
+            for ln in nx:
+                info(f"  {ln}")
     elif has_exec:
         info("Launches after the agent's own are refused: exec rules take effect for them only "
              "with `require warden 1.27`")

@@ -172,8 +172,8 @@ int main(int argc, char **argv) {
     if (argc != 3 || (strcmp(argv[2], "digest") && strcmp(argv[2], "batch") &&
                       strcmp(argv[2], "holds") && strcmp(argv[2], "openable") &&
                       strcmp(argv[2], "kinds") && strcmp(argv[2], "rules") && strcmp(argv[2], "proxy") &&
-                      strcmp(argv[2], "launches"))) {
-        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds|rules|proxy|launches\n", argv[0]);
+                      strcmp(argv[2], "launches") && strcmp(argv[2], "matches"))) {
+        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds|rules|matches|proxy|launches\n", argv[0]);
         return 2;
     }
     FILE *f = fopen(argv[1], "rb");
@@ -245,6 +245,21 @@ int main(int argc, char **argv) {
                    (unsigned)ri.max_body);
             for (size_t k = 0; k < ri.clen; k++) printf("%02x", (unsigned char)ri.c[k]);
             printf("%s\n", ri.clen ? "" : "=");
+        }
+        vdpc_free(&pol);
+        return 0;
+    }
+
+    /* v1.27.1 review: each rule's matcher, one line a rule in the order of
+     * "rules": prefix, exact, suffix, contains, glob, host. varek_audit.py
+     * works out from it the directory each writable rule's noexec mount is
+     * for, as the Warden does (warden_noexec.inc.c). */
+    if (!strcmp(argv[2], "matches")) {
+        static const char *names[] = { "prefix", "exact", "suffix", "contains", "glob", "host" };
+        for (size_t i = 0; i < pol.n; i++) {
+            vdpc_rule_info_t ri;
+            vdpc_rule_info(&pol, i, &ri);
+            printf("%s\n", ri.match >= 0 && ri.match <= VDPC_M_HOST ? names[ri.match] : "?");
         }
         vdpc_free(&pol);
         return 0;

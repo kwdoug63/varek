@@ -9,6 +9,36 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.27.1] - 2026-10-13 — Nothing written during the run is mapped executable
+
+Under `require warden 1.27`, every directory the policy lets the agent
+write (a path rule whose flag clause admits writes) is mounted `noexec` in
+the Warden's own private mount namespace, made before any helper or the
+agent starts, with every mount beneath it, and each confirmed. The Warden
+opens every file it hands the agent, so a file there can be neither
+launched nor mapped executable (`mmap` with `PROT_EXEC`: `EPERM`;
+`mprotect` adding it: `EACCES`): a library the agent writes cannot be
+loaded into an allowed program. A descriptor for a path under a listed
+directory that does not come through a `noexec` mount is refused. A
+writable rule no directory bounds, a writable `/`, the agent's program,
+its interpreter or a loader under a writable directory, and an inherited
+descriptor open for reading on a file there refuse the start.
+`--writable-exec` turns the mounts off for a run (recorded, noted by the
+audit). Anonymous executable memory is unchanged. `run_start` records each
+directory, its policy line and its rule's directory; `varek_audit.py`
+checks each against the policy, every writable rule against the list and
+every recorded write against it; `vdp_cert_check` gains a `matches` mode;
+`varek policy show`, `varek doctor`, the preflight and the CycloneDX export
+cover it. The Warden reports version 1.27.1; the grammar stays 1.27.
+
+Reviewed by AI review agents (not a human or third-party review); a
+24-hour soak on a 1 GB host passed, every library the agent wrote refused.
+The README's headline and the repository's description now read
+"Kernel-enforced, proof-checked authorization for what an AI agent's
+process actually does." See `RELEASE-v1.27.1.md` for the tests, latency,
+the review's findings, compatibility and known limits, and
+`docs/security/v1.27.1-writable-noexec.md` for the design.
+
 ## [1.27.0] - 2026-10-11 — Decided program launches
 
 With `require warden 1.27`, `allow exec` rules take effect for every launch

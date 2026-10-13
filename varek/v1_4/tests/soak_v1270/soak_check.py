@@ -33,6 +33,13 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(HERE, "..", "..", "tools")
+def _ver(v):
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except ValueError:
+        return (0,)
+
+
 PROBE_RULE = {"unlisted": "default_deny_unknown", "denied": "policy_match", "written": "exec_not_in_ruleset"}
 
 
@@ -94,6 +101,7 @@ def main():
     ap.add_argument("--interval", type=float, default=60)
     ap.add_argument("--max-other-failures", type=float, default=0.01)
     ap.add_argument("--pubkey")
+    ap.add_argument("--work", default="/var/tmp/varek-soak1270-work")     # v1.27.1
     a = ap.parse_args()
     out, problems = [], []
     say = out.append
@@ -119,6 +127,16 @@ def main():
                 whys[e.get("why")] = whys.get(e.get("why"), 0) + 1
             say(f"Landlock ABI {ll.get('abi')}; launch set: {len(ex)} files ("
                 + ", ".join(f"{v} {k}" for k, v in sorted(whys.items())) + f"); Warden {start.get('warden')}")
+    # v1.27.1: the work directory mounted noexec, as run_start records it
+    if start and _ver(start.get("warden")) >= (1, 27, 1):
+        nx = start.get("noexec")
+        work = os.path.realpath(a.work)
+        if not isinstance(nx, list) or not any(isinstance(e, dict) and isinstance(e.get("path"), str) and
+                                               (work == e["path"] or work.startswith(e["path"].rstrip("/") + "/"))
+                                               for e in nx):
+            problems.append(f"run_start's noexec ({nx!r}) does not hold the work directory")
+        else:
+            say(f"noexec: {len(nx)} director(ies) mounted, the work directory among them")
     if dur < a.hours * 3600 * 0.99:
         problems.append(f"the run lasted {dur / 3600:.2f} h, less than {a.hours:g} h")
     want = a.hours * 3600 / a.interval
@@ -165,6 +183,15 @@ def main():
     pk = {}
     for t in probes:
         pk[t["probe"]] = pk.get(t["probe"], 0) + 1
+        if t["probe"] == "library":
+            # v1.27.1: no launch, no record; the kernel refuses the mapping
+            # (v1.27.1 review: that refusal, in the loader's words, not any failure)
+            if not t.get("refused"):
+                bad.append((t, f"a copy of a library in the work directory loaded ({t.get('out')!r})"))
+            elif "failed to map segment from shared object" not in str(t.get("out")):
+                bad.append((t, f"a copy of a library failed to load, but not because its mapping was "
+                               f"refused ({t.get('out')!r})"))
+            continue
         mine = [r for r in launches if r.get("resolved") == t["path"]
                 and abs(r.get("timestamp_ns", 0) / 1e9 - t["t"]) < 60]
         rule = PROBE_RULE[t["probe"]]
