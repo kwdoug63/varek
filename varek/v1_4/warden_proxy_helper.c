@@ -1088,6 +1088,7 @@ static int wp_drain_ctl(int ctl) {
                     OPENSSL_cleanse(&wv, sizeof wv);
                     if (!good) break;
                 }
+                OPENSSL_cleanse(&wv, sizeof wv);         /* v1.28 review: a short read too */
             }
             if (fd >= 0) close(fd);
             ok.n = got == m.cr.n ? got : 0;

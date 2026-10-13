@@ -3491,6 +3491,90 @@ static int refuse_if_agent_can_open(const struct policy *p, int fd, const char *
     return 0;
 }
 
+/* v1.28 review: a file warden-secrets read must have one name only (as the
+ * signing key), and no other name the agent could open through another mount
+ * of its filesystem: a bind mount of the file, or of a directory above it,
+ * shows it at a second path, which the agent's allowed opens (made by the
+ * Warden, as root) would reach. Every mount of the file's filesystem
+ * (/proc/self/mountinfo, the same device) whose root holds the file gives
+ * that path; each is asked of the checker. 0, or -1 with the reason printed. */
+static int refuse_secret_reachable(const struct policy *p, const char *path) {
+    int fd = open(path, O_PATH | O_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr, "[warden] credentials: cannot open %s to check it (%s); refusing to start\n", path,
+                strerror(errno));
+        return -1;
+    }
+    struct stat st;
+    char rp[PATH_MAX];
+    int rc = refuse_if_agent_can_open(p, fd, path, "file warden-secrets read");
+    if (rc == 0 && (fstat(fd, &st) < 0 || fd_path(fd, rp, sizeof rp) < 0)) rc = -1;
+    close(fd);
+    if (rc < 0) return -1;
+    FILE *mi = fopen("/proc/self/mountinfo", "re");
+    if (!mi) {
+        fprintf(stderr, "[warden] credentials: cannot read the mounts (%s); refusing to start\n", strerror(errno));
+        return -1;
+    }
+    struct mnt { unsigned maj, min; char *root, *mp; } *m = NULL;
+    size_t n = 0, cap = 0;
+    char *line = NULL;
+    size_t lc = 0;
+    while (getline(&line, &lc, mi) > 0) {
+        /* id parent major:minor root mountpoint ... */
+        char *save = NULL, *f[5];
+        int k = 0;
+        for (char *t = strtok_r(line, " ", &save); t && k < 5; t = strtok_r(NULL, " ", &save)) f[k++] = t;
+        unsigned maj, min;
+        if (k < 5 || sscanf(f[2], "%u:%u", &maj, &min) != 2) continue;
+        if (maj != major(st.st_dev) || min != minor(st.st_dev)) continue;
+        if (n == cap) {
+            cap = cap ? 2 * cap : 16;
+            struct mnt *nm = realloc(m, cap * sizeof *m);
+            if (!nm) break;
+            m = nm;
+        }
+        noexec_unescape(f[3]);
+        noexec_unescape(f[4]);
+        m[n].maj = maj;
+        m[n].min = min;
+        m[n].root = strdup(f[3]);
+        m[n].mp = strdup(f[4]);
+        if (!m[n].root || !m[n].mp) { free(m[n].root); free(m[n].mp); break; }
+        n++;
+    }
+    free(line);
+    fclose(mi);
+    /* the mount the file was reached through: the longest mount point above it */
+    #define UNDER(a, b) (!strcmp(b, "/") || (!strncmp(a, b, strlen(b)) && (a[strlen(b)] == '/' || !a[strlen(b)])))
+    size_t own = n, best = 0;
+    for (size_t i = 0; i < n; i++)
+        if (UNDER(rp, m[i].mp) && strlen(m[i].mp) >= best) { own = i; best = strlen(m[i].mp); }
+    if (own < n) {
+        /* the file's path inside its filesystem */
+        char rel[PATH_MAX];
+        const char *tail = !strcmp(m[own].mp, "/") ? rp : rp + strlen(m[own].mp);
+        snprintf(rel, sizeof rel, "%s%s", !strcmp(m[own].root, "/") ? "" : m[own].root, tail);
+        if (!rel[0]) snprintf(rel, sizeof rel, "/");
+        for (size_t i = 0; rc == 0 && i < n; i++) {
+            if (i == own || !UNDER(rel, m[i].root)) continue;
+            char alt[PATH_MAX];
+            const char *rest = !strcmp(m[i].root, "/") ? rel : rel + strlen(m[i].root);
+            if (snprintf(alt, sizeof alt, "%s%s", !strcmp(m[i].mp, "/") ? "" : m[i].mp, rest) >= (int)sizeof alt)
+                continue;
+            if (strcmp(alt, rp) && vdpc_path_openable(&p->c, alt, strlen(alt))) {
+                fprintf(stderr, "[warden] credentials: %s, which warden-secrets reads, is also mounted at %s, "
+                        "which the policy lets the agent open; refusing to start\n", rp, alt);
+                rc = -1;
+            }
+        }
+    }
+    #undef UNDER
+    for (size_t i = 0; i < n; i++) { free(m[i].root); free(m[i].mp); }
+    free(m);
+    return rc;
+}
+
 /* Raw access to a disk reads (or writes) every file on it, whatever the path
  * rules say: with a signing key or an anchor, refuse a policy that would let
  * the agent open any block device under /dev, /dev/mem, /dev/kmem, /dev/port,
@@ -4693,6 +4777,9 @@ int main(int argc, char **argv) {
     if (p.v.ncreds) {
         static const char *const kStore[] = { "", "file", "vault", "aws-sm" };
         const char *conf = secrets_conf_arg ? secrets_conf_arg : "/etc/varek/secrets.conf";
+        /* v1.28 review: the helper reads absolute paths only */
+        static char conf_abs[PATH_MAX];
+        if (conf[0] != '/' && realpath(conf, conf_abs)) conf = conf_abs;
         if (g_check_only && !g_check_creds) {
             for (size_t k = 0; k < p.v.ncreds; k++)
                 fprintf(stderr, "[warden]   credential %s from %s:%s (line %d)\n", p.v.creds[k].name,
@@ -4755,6 +4842,11 @@ int main(int argc, char **argv) {
                     ws_stop(&g_secrets);
                     return 1;
                 }
+                /* v1.28 review: nor through a second name (a hard link, a bind mount) */
+                if (refuse_secret_reachable(&p, files[k]) < 0) {
+                    ws_stop(&g_secrets);
+                    return 1;
+                }
             }
             if (fr < 0) {
                 /* name the credential, not its index */
@@ -4777,9 +4869,18 @@ int main(int argc, char **argv) {
                  * made are revoked, the helper clears the values and ends */
                 struct ws_revoked rv = { 0 };
                 struct pollfd pf = { .fd = g_secrets.ctl, .events = POLLIN };
-                bool answered = ws_revoke(&g_secrets) == 0 && poll(&pf, 1, 15000) == 1 &&
-                                recv(g_secrets.ctl, &rv, sizeof rv, 0) == (ssize_t)sizeof rv &&
-                                rv.type == WS_MSG_REVOKED;
+                bool answered = false;
+                if (ws_revoke(&g_secrets) == 0) {
+                    /* review: a renewal due at once may be reported first */
+                    union { struct ws_revoked r; struct ws_renewed n; uint32_t type; } m;
+                    while (!answered && poll(&pf, 1, 15000) == 1) {
+                        ssize_t k = recv(g_secrets.ctl, &m, sizeof m, 0);
+                        if (k == (ssize_t)sizeof m.n && m.type == WS_MSG_RENEWED) continue;
+                        if (k != (ssize_t)sizeof m.r || m.type != WS_MSG_REVOKED) break;
+                        rv = m.r;
+                        answered = true;
+                    }
+                }
                 ws_stop(&g_secrets);
                 if (!answered || rv.failed) {
                     fprintf(stderr, "[warden] credentials: fetched, but %s; refusing to start\n",

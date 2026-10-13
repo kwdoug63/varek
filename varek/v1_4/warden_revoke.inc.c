@@ -84,7 +84,15 @@ static void revoke_pending(int notify_fd) {
     for (int i = g_npend - 1; i >= 0; i--) {
         struct pending_op *op = g_pend[i];
         if (op->kind == PEND_SEND) continue;
-        if (op->kind == PEND_STUB) stub_pend_restore(op);
+        if (op->kind == PEND_STUB) {
+            /* review: a connect to the stub is made on the agent's own
+             * socket; dissolve it, so the socket is not left connected after
+             * the agent is told EACCES (the stub refuses every question now
+             * in any case) */
+            struct sockaddr un = { .sa_family = AF_UNSPEC };
+            (void)connect(op->sock, &un, sizeof un);
+            stub_pend_restore(op);
+        }
         send_errno(notify_fd, op->id, EACCES);
         net_record(op->tid, op->act, op->d_raw, DEC_DENY, "revoked", &op->t0, EACCES);
         pend_free(i);

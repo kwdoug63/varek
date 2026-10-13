@@ -349,7 +349,13 @@ def summarize(recs):
          "cred_refused": [], "revoked": None, "credentials": []}
     for r in recs:
         ev = r.get("event")
+        # v1.28 review: only this run's records (a stream can hold lines of
+        # another run, which the audit ignores too)
+        if s["run"] is not None and ev != "run_start" and "run" in r and r.get("run") != s["run"]:
+            continue
         if ev == "run_start":
+            if s["run"] is not None:
+                continue
             s["run"] = r.get("run")
             s["warden"] = r.get("warden")
             s["policy"] = r.get("policy_path")
@@ -1088,7 +1094,12 @@ def cmd_revoke(args):
     for run in runs:
         ans = revoke_one(run)
         if ans is None and args.all:
-            info(f"  {run}: has ended (a control socket left behind)")
+            # v1.28 review: no Warden listens on it (it was killed): remove it
+            try:
+                os.unlink(os.path.join(CTL_DIR, run + ".ctl"))
+                info(f"  {run}: has ended; removed the control socket it left behind")
+            except OSError as e:
+                info(f"  {run}: has ended (its control socket is left behind: {e.strerror})")
         elif ans is None:
             fail(f"{run}: no such run is running (it has ended, or never had a control socket)")
             rc = 1
@@ -1151,7 +1162,10 @@ def cmd_refusals(args):
     if s["revoked"]:                                                                # v1.28
         rv = s["revoked"]
         ts = rv.get("timestamp_ns")
-        when = _dt.datetime.fromtimestamp(ts / 1e9).strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, int) else "?"
+        try:
+            when = _dt.datetime.fromtimestamp(ts / 1e9).strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError, OverflowError, OSError):      # v1.28 review: no crash on a bad time
+            when = "?"
         info(f"The run was revoked at {when} (varek revoke, by uid {rv.get('by_uid', '?')}): every call "
              f"after it was refused.\n")
     if not s["refusals"] and not ends and not s["cred_refused"]:
@@ -1205,7 +1219,7 @@ def cmd_refusals(args):
             hint(f"policy line {line}" + (f": {text}" if text else "") + f"; {what}; the agent got NXDOMAIN")
             continue
         if rl == "revoked":                                                         # v1.28
-            info(f"  {'REVOKED':11}  {r.get('action', '?'):13}  {r.get('resolved') or r.get('target', '')}")
+            info(f"  {'REVOKED':11}  {str(r.get('action', '?')):13}  {r.get('resolved') or r.get('target', '')}")
             hint(f"{RULE_WORDS['revoked']}; the agent got {r.get('kernel_verdict', '?')}")
             continue
         if isinstance(line, int) and line >= 0:
@@ -1246,8 +1260,9 @@ def cmd_refusals(args):
         info(f"\n{len(cf)} request(s) allowed with a credential, refused by the proxy (credential release):\n")
         for e in cf[: args.n]:
             cid = e.get("proxy_conn")
+            target = s["proxy_targets"].get(cid, "?") if type(cid) is int else "?"
             info(f"  {'CREDENTIAL':11}  {'net.request':13}  connection {cid} "
-                 f"({s['proxy_targets'].get(cid, '?')}), request {e.get('request_seq', '?')}")
+                 f"({target}), request {e.get('request_seq', '?')}")
             hint(f"credential {e.get('credential', '?')}: {e.get('why', '?')}; nothing was sent to the server, "
                  f"and the agent got 403 Forbidden")
         if len(cf) > args.n:

@@ -45,6 +45,7 @@
 #include <linux/capability.h>
 #include <netdb.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -146,6 +147,10 @@ static void report(unsigned idx, bool ok, const char *version, size_t len, const
     r.len = (uint32_t)len;
     if (version) snprintf(r.version, sizeof r.version, "%s", version);
     if (why) snprintf(r.why, sizeof r.why, "%s", why);
+    /* v1.28 review: a store's text (a version id) is printed by the Warden:
+     * printable ASCII only, no quote or backslash */
+    for (char *c = r.version; *c; c++) if (*c < 0x20 || *c > 0x7e || *c == '"' || *c == '\\') *c = '?';
+    for (char *c = r.why; *c; c++) if (*c < 0x20 || *c > 0x7e || *c == '"' || *c == '\\') *c = '?';
     ctl_send(&r, sizeof r);
 }
 
@@ -157,6 +162,27 @@ static void report(unsigned idx, bool ok, const char *version, size_t len, const
 static int read_private(const char *path, unsigned char *buf, size_t cap, size_t *len, struct stat *out,
                         char *why, size_t wn) {
     report_file(path);
+    /* v1.28 review: every directory above it root's, and writable by no other
+     * user unless sticky (as /tmp): no one else can put another file at the
+     * name between the policy's checks and this read */
+    if (path[0] != '/') { snprintf(why, wn, "%.300s is not an absolute path", path); return -1; }
+    char dir[PATH_MAX], real[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *sl = strrchr(dir, '/');
+    if (sl == dir) sl[1] = '\0'; else *sl = '\0';
+    if (!realpath(dir, real)) { snprintf(why, wn, "cannot open %.300s: %s", path, strerror(errno)); return -1; }
+    for (char *c = real + strlen(real); ; ) {
+        struct stat ds;
+        if (stat(real[0] ? real : "/", &ds) < 0 || ds.st_uid != 0 ||
+            ((ds.st_mode & 022) && !(ds.st_mode & S_ISVTX))) {
+            snprintf(why, wn, "%.200s: the directory %.200s must be root's and writable by no other user",
+                     path, real[0] ? real : "/");
+            return -1;
+        }
+        if (!real[0]) break;
+        while (c > real && *c != '/') c--;
+        *c = '\0';                                       /* up one ("" is /) */
+    }
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY);
     if (fd < 0) { snprintf(why, wn, "cannot open %s: %s", path, strerror(errno)); return -1; }
     struct stat st;
@@ -238,6 +264,15 @@ static int kv_parse(char *text, const char *path, int (*cb)(const char *k, const
     return 0;
 }
 
+/* v1.28 review: a key is named in a refusal only if it looks like one: a
+ * line missing its " = " may hold a secret before its first '=' */
+static void unknown_key(const char *k, char *why, size_t wn) {
+    if (strlen(k) <= 32 && strspn(k, "abcdefghijklmnopqrstuvwxyz_") == strlen(k))
+        snprintf(why, wn, "unknown key %s", k);
+    else
+        snprintf(why, wn, "a line that is not key = value with a known key (its text is not shown)");
+}
+
 static int conf_key(const char *k, const char *v, char *why, size_t wn) {
     static const struct { const char *key; size_t off, cap; } kKeys[] = {
 #define K(f) { #f, offsetof(__typeof__(g_conf), f), sizeof g_conf.f }
@@ -253,7 +288,7 @@ static int conf_key(const char *k, const char *v, char *why, size_t wn) {
         memcpy(dst, v, strlen(v) + 1);
         return 0;
     }
-    snprintf(why, wn, "unknown key %s", k);
+    unknown_key(k, why, wn);
     return -1;
 }
 
@@ -261,7 +296,7 @@ static int aws_key(const char *k, const char *v, char *why, size_t wn) {
     char *dst = !strcmp(k, "aws_access_key_id") ? g_aws.id : !strcmp(k, "aws_secret_access_key") ? g_aws.secret :
                 !strcmp(k, "aws_session_token") ? g_aws.token : NULL;
     size_t cap = dst == g_aws.token ? sizeof g_aws.token : sizeof g_aws.id;
-    if (!dst) { snprintf(why, wn, "unknown key %s", k); return -1; }
+    if (!dst) { unknown_key(k, why, wn); return -1; }
     if (!*v || strlen(v) >= cap) { snprintf(why, wn, "%s: empty or too long", k); return -1; }
     memcpy(dst, v, strlen(v) + 1);
     return 0;
@@ -363,6 +398,7 @@ static int http_do(const struct url *u, const char *ca, bool allow_plain, const 
     SSL *ssl = NULL;
     int rc = -1;
     char *req = NULL, *buf = NULL;
+    size_t rl = 0;
     if (u->tls) {
         ctx = SSL_CTX_new(TLS_client_method());
         if (!ctx || !SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION)) { snprintf(why, wn, "TLS setup failed"); goto done; }
@@ -384,7 +420,7 @@ static int http_do(const struct url *u, const char *ca, bool allow_plain, const 
             goto done;
         }
     }
-    size_t rl = strlen(method) + strlen(path) + strlen(u->host) + strlen(headers) + 256;
+    rl = strlen(method) + strlen(path) + strlen(u->host) + strlen(headers) + 256;
     req = malloc(rl);
     if (!req) { snprintf(why, wn, "out of memory"); goto done; }
     bool defport = (u->tls && !strcmp(u->port, "443")) || (!u->tls && !strcmp(u->port, "80"));
@@ -449,7 +485,7 @@ static int http_do(const struct url *u, const char *ca, bool allow_plain, const 
     rc = 0;
 done:
     if (buf) { OPENSSL_cleanse(buf, RESP_MAX + 1); free(buf); }
-    if (req) free(req);
+    if (req) { OPENSSL_cleanse(req, rl); free(req); }     /* v1.28 review: it held a token */
     if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
     if (ctx) SSL_CTX_free(ctx);
     close(fd);
@@ -690,13 +726,15 @@ static int imds_credentials(char *why, size_t wn) {
     size_t tl = 0, rl = 0, cl = 0;
     char p[1400], h[700];
     int rc = -1;
+    /* v1.28 review: plain HTTP only to the metadata service's own address */
+    bool imds = !strcmp(u.host, "169.254.169.254") || !strcmp(u.host, "fd00:ec2::254");
     snprintf(p, sizeof p, "%s/latest/api/token", u.path);
-    if (http_do(&u, NULL, true, "PUT", p, "X-aws-ec2-metadata-token-ttl-seconds: 60\r\n", "", 0, &st, &tok, &tl, why, wn) < 0)
+    if (http_do(&u, NULL, imds, "PUT", p, "X-aws-ec2-metadata-token-ttl-seconds: 60\r\n", "", 0, &st, &tok, &tl, why, wn) < 0)
         return -1;
     if (st != 200 || tl == 0 || tl > 512 || strpbrk(tok, "\r\n")) { snprintf(why, wn, "the metadata service gave no token"); goto out; }
     snprintf(h, sizeof h, "X-aws-ec2-metadata-token: %s\r\n", tok);
     snprintf(p, sizeof p, "%s/latest/meta-data/iam/security-credentials/", u.path);
-    if (http_do(&u, NULL, true, "GET", p, h, "", 0, &st, &role, &rl, why, wn) < 0) goto out;
+    if (http_do(&u, NULL, imds, "GET", p, h, "", 0, &st, &role, &rl, why, wn) < 0) goto out;
     char *nl = strchr(role, '\n');
     if (nl) *nl = '\0';
     if (st != 200 || !role[0] || strlen(role) > 128 || strpbrk(role, "/ ")) {
@@ -704,7 +742,7 @@ static int imds_credentials(char *why, size_t wn) {
         goto out;
     }
     snprintf(p, sizeof p, "%s/latest/meta-data/iam/security-credentials/%s", u.path, role);
-    if (http_do(&u, NULL, true, "GET", p, h, "", 0, &st, &cred, &cl, why, wn) < 0) goto out;
+    if (http_do(&u, NULL, imds, "GET", p, h, "", 0, &st, &cred, &cl, why, wn) < 0) goto out;
     const char *e = cred + cl, *a = jget(cred, e, "AccessKeyId"), *s = jget(cred, e, "SecretAccessKey"),
                *t = jget(cred, e, "Token");
     long al = a ? jstr(a, e, g_aws.id, sizeof g_aws.id - 1) : -1;
@@ -720,6 +758,17 @@ out:
     if (cred) { OPENSSL_cleanse(cred, cl); free(cred); }
     OPENSSL_cleanse(h, sizeof h);
     return rc;
+}
+
+/* v1.28 review: the key material goes into request headers: printable
+ * ASCII only (the metadata service's JSON, or a key file, could carry an
+ * escaped or inner CR/LF) */
+static bool aws_creds_ok(void) {
+    const char *f[] = { g_aws.id, g_aws.secret, g_aws.token };
+    for (size_t i = 0; i < 3; i++)
+        for (const char *c = f[i]; *c; c++)
+            if (*c < 0x21 || *c > 0x7e) return false;
+    return g_aws.id[0] && g_aws.secret[0];
 }
 
 static void aws_fetch(unsigned idx, const char *arn) {
@@ -740,6 +789,10 @@ static void aws_fetch(unsigned idx, const char *arn) {
     struct url u;
     if (url_parse(ep, &u) < 0) { report(idx, false, NULL, 0, "aws_endpoint is not an http(s) URL"); return; }
     if (!g_aws.have && imds_credentials(why, sizeof why) < 0) { report(idx, false, NULL, 0, why); return; }
+    if (!aws_creds_ok()) {
+        report(idx, false, NULL, 0, "the AWS key, secret or session token holds a character that is not printable");
+        return;
+    }
     /* the request */
     char body[1200];
     int bl = snprintf(body, sizeof body, "{\"SecretId\":\"%s\"}", arn);    /* the ARN has no '"' or '\\' (printable, checked) */
@@ -752,7 +805,9 @@ static void aws_fetch(unsigned idx, const char *arn) {
     strftime(day, sizeof day, "%Y%m%d", &tm);
     bool defport = (u.tls && !strcmp(u.port, "443")) || (!u.tls && !strcmp(u.port, "80"));
     char hosthdr[300];
-    snprintf(hosthdr, sizeof hosthdr, "%s%s%s", u.host, defport ? "" : ":", defport ? "" : u.port);
+    bool v6 = strchr(u.host, ':') != NULL;                /* review: as http_do sends it */
+    snprintf(hosthdr, sizeof hosthdr, "%s%s%s%s%s", v6 ? "[" : "", u.host, v6 ? "]" : "", defport ? "" : ":",
+             defport ? "" : u.port);
     char bodyhash[65];
     sha256_hex(body, (size_t)bl, bodyhash);
     bool tok = g_aws.token[0] != '\0';
@@ -795,6 +850,7 @@ static void aws_fetch(unsigned idx, const char *arn) {
     int r = http_do(&u, g_conf.aws_ca[0] ? g_conf.aws_ca : NULL, false, "POST", path, hdrs, body, (size_t)bl,
                     &status, &resp, &rl, why, sizeof why);
     OPENSSL_cleanse(hdrs, 16384);
+    OPENSSL_cleanse(canon, 16384);                       /* v1.28 review: the session token */
     free(canon); free(sts); free(hdrs);
     if (r < 0) { report(idx, false, NULL, 0, why); return; }
     const char *e = resp + rl;
@@ -871,20 +927,25 @@ static int lease_put(const char *op, unsigned idx, uint32_t increment, int *stat
     return rc;
 }
 
-/* WS_MSG_REVOKE: revoke every lease the run holds; then the token goes */
-static void leases_revoke(void) {
-    struct ws_revoked r = { .type = WS_MSG_REVOKED };
+/* Revoke every lease the run holds; then the token goes. */
+static void leases_revoke_all(struct ws_revoked *r) {
     for (unsigned i = 0; i < WS_MAX_CREDS; i++) {
         if (!g_lease[i].live) continue;
         char why[256], *o = NULL;
         size_t ol = 0;
         int st = 0;
-        if (lease_put("revoke", i, 0, &st, &o, &ol, why, sizeof why) == 0 && (st == 200 || st == 204)) r.revoked++;
-        else r.failed++;
+        if (lease_put("revoke", i, 0, &st, &o, &ol, why, sizeof why) == 0 && (st == 200 || st == 204)) r->revoked++;
+        else r->failed++;
         if (o) { OPENSSL_cleanse(o, ol); free(o); }
         g_lease[i].live = false;
     }
     token_clear();
+}
+
+/* WS_MSG_REVOKE: the run is revoked; say how it went */
+static void leases_revoke(void) {
+    struct ws_revoked r = { .type = WS_MSG_REVOKED };
+    leases_revoke_all(&r);
     ctl_send(&r, sizeof r);
 }
 
@@ -947,6 +1008,9 @@ int main(int argc, char **argv) {
         return 2;
     }
     (void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+    /* v1.28 review: a store that resets the connection must not kill the
+     * helper (SIGPIPE): it reports the failure instead */
+    (void)signal(SIGPIPE, SIG_IGN);
     if (arena_init() < 0) return 2;
     /* the setup and the credentials */
     struct ws_setup su;
@@ -1022,7 +1086,8 @@ int main(int argc, char **argv) {
     }
     bool leased = false;
     for (uint32_t i = 0; i < su.ncreds; i++) leased |= g_lease[i].live;
-    if (failed) memset(g_lease, 0, sizeof g_lease);       /* no run: the leases end when Vault says */
+    /* v1.28 review: no run: the leases made are revoked at once */
+    if (failed && leased) { struct ws_revoked r = { 0 }; leases_revoke_all(&r); }
     if (failed || !leased) token_clear();
     OPENSSL_cleanse(&g_aws, sizeof g_aws);
     if (!failed) {
@@ -1078,6 +1143,10 @@ int main(int argc, char **argv) {
         arena_clear();                       /* handed: no copy stays here */
     }
     arena_clear();
+    /* v1.28 review: the run has ended (or the Warden refused it, or has gone):
+     * its leases are revoked, not left to their duration */
+    struct ws_revoked r = { 0 };
+    leases_revoke_all(&r);
     token_clear();
     return 0;
 }

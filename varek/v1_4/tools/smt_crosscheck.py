@@ -1350,7 +1350,9 @@ def fuzz_policy(rng, path):
                 opts.append(rng.choice(["max_body=1", "max_body=256k", "max_body=1024m", "max_body=1048576"]))
             if cred_names and (verb == "allow" or not valid) and rng.random() < 0.5:
                 # v1.28: credential= and header=, in either order
-                hdrs = ["Authorization:Bearer", "X-Api-Key", "authorization:token", "X_K:Basic", "a:B~c"]
+                # (v1.28 review: '|' is a token character, and a framing name may sit beside it)
+                hdrs = ["Authorization:Bearer", "X-Api-Key", "authorization:token", "X_K:Basic", "a:B~c",
+                        "te|trailer", "Connection|Upgrade", "keep-alive|proxy-connection", "|te|", "host|"]
                 cr = ["credential=" + rng.choice(cred_names), "header=" + rng.choice(hdrs)]
                 rng.shuffle(cr)
                 opts += cr

@@ -560,11 +560,14 @@ static bool framing_header(const char *h) {
     size_t n = strlen(h);
     if (n >= sizeof low) return false;
     for (size_t i = 0; i <= n; i++) low[i] = (char)((h[i] >= 'A' && h[i] <= 'Z') ? h[i] + 32 : h[i]);
-    const char *list = "|host|content-length|transfer-encoding|connection|upgrade|te|trailer|keep-alive|"
-                       "proxy-connection|proxy-authorization|";
-    char probe[68];
-    snprintf(probe, sizeof probe, "|%s|", low);
-    return strstr(list, probe) != NULL;
+    /* v1.28 review: each name compared whole ('|' is a token character, so
+     * a search in a '|'-joined list matched "te|trailer") */
+    static const char *const kFraming[] = { "host", "content-length", "transfer-encoding", "connection",
+                                            "upgrade", "te", "trailer", "keep-alive", "proxy-connection",
+                                            "proxy-authorization" };
+    for (size_t i = 0; i < sizeof kFraming / sizeof *kFraming; i++)
+        if (!strcmp(low, kFraming[i])) return true;
+    return false;
 }
 
 /* v1.28: credential NAME from STORE:REF; 0, or -1 (the reason in err) */

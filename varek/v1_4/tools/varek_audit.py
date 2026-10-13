@@ -847,19 +847,29 @@ def check_credentials(creds, cred_rules, meta, records, complete, problems, note
                                 f"line or a placeholder's SHA-256 of its own")
                 break
             seen_ph.add(ph)
-    events = sorted(meta.get("cred_events", []), key=lambda x: x[0])
-    rv = [(pos, e) for pos, e in events if e.get("event") == "revoked"]
-    rpos = rv[0][0] if rv else None
+    # v1.28 review: ordered by each record's line in the stream, not by the
+    # number of decisions before it (an event right next to the record it
+    # must follow has the same count)
+    lines = meta.get("lineno", {})
+    at = lambda r: lines.get(id(r), 0)
+    events = sorted((e for _, e in meta.get("cred_events", [])), key=at)
+    rv = [e for e in events if e.get("event") == "revoked"]
+    rline = at(rv[0]) if rv else None
     if len(rv) > 1:
         problems.append("the run is recorded revoked more than once")
-    if rv and not (rv[0][1].get("by_uid") == 0 and type(rv[0][1].get("by_pid")) is int and rv[0][1]["by_pid"] > 0):
+    if rv and not (rv[0].get("by_uid") == 0 and type(rv[0].get("by_pid")) is int and rv[0]["by_pid"] > 0):
         problems.append("the run is recorded revoked by a peer that is not root, or without who asked")
     carried = 0
-    allowed_with = {}                # (proxy_conn, request_seq) -> credential
-    for pos, rec in enumerate(records):
-        if rpos is not None and pos >= rpos and rec.get("decision_final") != "DENY":
+    allowed_with = {}                # (proxy_conn, request_seq) -> (credential, line)
+    after = lambda r: rline is not None and at(r) > rline
+    for rec in records:
+        if after(rec) and rec.get("decision_final") != "DENY":
             problems.append(f"seq {rec.get('seq')}: a decision {rec.get('decision_final')!r} after the run was "
                             f"revoked (every decision after it is UNSATISFIED)")
+            continue
+        # v1.28 review: a refusal for the revocation follows it
+        if rec.get("rule") == "revoked" and not after(rec):
+            problems.append(f"seq {rec.get('seq')}: refused as revoked, but no revocation is recorded before it")
             continue
         if rec.get("action") != "net.request":
             continue
@@ -873,25 +883,26 @@ def check_credentials(creds, cred_rules, meta, records, complete, problems, note
                                 f"deciding rule (line {rec.get('policy_line')!r}) does not name")
                 continue
             carried += 1
-            allowed_with[(rec.get("proxy_conn"), rec.get("request_seq"))] = rec["credential"]
+            key = (rec.get("proxy_conn"), rec.get("request_seq"))
+            if all(type(k) is int for k in key):
+                allowed_with[key] = (rec["credential"], at(rec))
         elif want is not None:
             problems.append(f"seq {rec.get('seq')}: an allowed request whose rule (line {rec.get('policy_line')}) "
                             f"names credential {want[0]}, recorded without it")
     refused_swaps = 0
     rp = rl = None
     failed_renewal = set()
-    for pos, e in events:
+    for e in events:
         ev = e.get("event")
         if ev == "credential_refused":
             key = (e.get("proxy_conn"), e.get("request_seq"))
-            if allowed_with.get(key) != e.get("credential") or not isinstance(e.get("why"), str) or \
-                    not any(p <= pos for p, r in enumerate(records)
-                            if (r.get("proxy_conn"), r.get("request_seq")) == key and r.get("action") == "net.request"):
+            got = allowed_with.get(key) if all(type(k) is int for k in key) else None
+            if got is None or got[0] != e.get("credential") or got[1] >= at(e) or not isinstance(e.get("why"), str):
                 problems.append(f"a credential_refused for connection {key[0]!r} request {key[1]!r} that follows "
                                 f"no allowed request carrying {e.get('credential')!r}")
             refused_swaps += 1
         elif ev in ("revocation_proxy", "revocation_leases"):
-            if rpos is None or pos < rpos:
+            if not after(e):
                 problems.append(f"{ev} without the run being revoked before it")
                 continue
             if ev == "revocation_proxy":
@@ -904,7 +915,7 @@ def check_credentials(creds, cred_rules, meta, records, complete, problems, note
             else:
                 if rl is not None:
                     problems.append("revocation_leases recorded more than once")
-                rl = pos
+                rl = at(e)
                 if type(e.get("revoked")) is not int or type(e.get("failed")) is not int:
                     problems.append("a malformed revocation_leases record")
                 elif e["failed"]:
@@ -915,7 +926,7 @@ def check_credentials(creds, cred_rules, meta, records, complete, problems, note
             if c is None or c[1] != "vault":
                 problems.append(f"{ev} for {e.get('credential')!r}, which is not one of the policy's Vault "
                                 f"credentials")
-            elif rl is not None:
+            elif rl is not None and at(e) > rl:
                 problems.append(f"{ev} for {c[0]} after the helper revoked the run's leases")
             elif c[0] in failed_renewal:
                 problems.append(f"{ev} for {c[0]} after its renewal failed (a failed renewal is not retried)")
@@ -924,9 +935,19 @@ def check_credentials(creds, cred_rules, meta, records, complete, problems, note
             elif ev == "lease_renewal_failed":
                 failed_renewal.add(c[0])
                 notes.append(f"the lease of credential {c[0]} could not be renewed: {e.get('why')}")
-    if rpos is not None and complete and creds and rp is None:
+    # v1.28 review: the proxy's and the stub's refusals for the revocation
+    # follow it, and after it the stub looks nothing up
+    for _, c in meta.get("proxy_closes", []):
+        if c.get("why") == "revoked" and not after(c):
+            problems.append(f"connection {c.get('proxy_conn')!r} closed as revoked, but no revocation is "
+                            f"recorded before it")
+    for q in meta.get("dns_events", []):
+        if q.get("event") == "dns_question" and (q.get("rule") == "revoked") != after(q):
+            problems.append(f"a stub question {'refused as revoked before' if q.get('rule') == 'revoked' else 'answered after'} "
+                            f"the revocation")
+    if rline is not None and complete and creds and rp is None:
         notes.append("the run was revoked, but the proxy never answered that it cleared its values")
-    return carried, refused_swaps, rpos is not None
+    return carried, refused_swaps, rline is not None
 
 
 def check_dialed_denies(checker, policy, rules, dialed, problems):
@@ -1533,6 +1554,10 @@ def check_dns(meta, checker, policy, rules, problems):
         last_mono = mono
         if not isinstance(ans, str) or not isinstance(rule, str) or type(line) is not int:
             problems.append(f"{name!r}: a malformed question record")
+            continue
+        if rule == "revoked":                    # v1.28 review: after `varek revoke`, refused, nothing looked up
+            if ans != "refused" or e.get("new") or e.get("upstream") or e.get("synthetic"):
+                problems.append(f"{name!r}: a question after the revocation was answered {ans}")
             continue
         if rule in ("no_rule", "not_a_host_name", "malformed"):
             if ans not in ("nxdomain", "formerr") or e.get("new") or e.get("upstream"):

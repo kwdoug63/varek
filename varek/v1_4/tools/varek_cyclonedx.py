@@ -609,7 +609,14 @@ def _cred_text(records, pm):
                   ("varek:revocation.proxy.values_held", str(rp.get("values_held", "not reported"))),
                   ("varek:revocation.leases.revoked", str(rl.get("revoked", "not reported"))),
                   ("varek:revocation.leases.failed", str(rl.get("failed", "not reported")))]
-        text += (" The run was revoked (varek revoke): every decision after it was UNSATISFIED"
+        # v1.28 review: say what the stream shows, counted here, not what it should show
+        lines = pm.get("lineno", {})
+        rline = lines.get(id(revoked), 0)
+        late = sum(1 for r in records if lines.get(id(r), 0) > rline and r.get("decision_final") != "DENY")
+        facts.append(("varek:revocation.allowed_after", str(late)))
+        text += (" The run was revoked (varek revoke): "
+                 + ("every decision after it was UNSATISFIED" if not late else
+                    f"{late} decision(s) after it were NOT refused (the audit fails such a stream)")
                  + (f", the proxy held {rp['values_held']} credential value(s) after it" if "values_held" in rp else "")
                  + (f", and {rl['revoked']} Vault lease(s) were revoked ({rl['failed']} could not be)"
                     if "revoked" in rl else "") + ".")

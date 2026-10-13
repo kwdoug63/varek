@@ -117,6 +117,11 @@ int ws_fetch(ws_t *w, const char *conf, size_t n, const int *store, const char *
             if (m.r.index >= n || got[m.r.index] || !memchr(m.r.version, '\0', sizeof m.r.version) ||
                 !memchr(m.r.why, '\0', sizeof m.r.why))
                 goto bad;
+            /* v1.28 review: both are printed, and the version recorded:
+             * printable ASCII, no quote or backslash, or the message is not
+             * the helper's */
+            for (const char *c = m.r.version; *c; c++) if (*c < 0x20 || *c > 0x7e || *c == '"' || *c == '\\') goto bad;
+            for (const char *c = m.r.why; *c; c++) if (*c < 0x20 || *c > 0x7e) goto bad;
             if (!m.r.ok) {
                 snprintf(why, wn, "credential %u: %s", m.r.index, m.r.why);
                 return -1;

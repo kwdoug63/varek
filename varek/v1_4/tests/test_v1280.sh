@@ -16,6 +16,9 @@
 #      renewal. Sections 3 and 4 also audit their runs, and forged streams.
 #   5. records and tools: --check-credentials and the preflight, varek
 #      policy show, varek refusals, the CycloneDX export.
+#   6. the review's fixes: second names of the files warden-secrets reads,
+#      their directories, its hardening, a Vault that resets, leases revoked
+#      at the end, the stub after a revocation, forged orders, the tools.
 #
 #   test_v1280.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
@@ -349,6 +352,10 @@ PY
     check "a placeholder where no rule names its credential is sent as it is (query, another header, a rule without one)" \
         got "h.startswith('GET /v1/plain?q=varek_ph_c1_') and 'Authorization: Bearer varek_ph_c1_' in h and 'X-Other: varek_ph_c2_' in h"
     check "no value is in the agent's environment" sh -c "! grep -qF -- '$V2' '$X/o/env' && ! grep -qF -- 'long-val' '$X/o/env'"
+    check "the server got a value only where a rule names it: never in the request no rule gives a credential" \
+        got "h.startswith('GET /v1/plain') and '$V2' not in h + b and 'long-val' not in h + b"
+    check "and in each swapped request, nowhere but its header" \
+        got "h.startswith('GET /v1/b ') and h.count('$V2') == 1 and '$V2' not in b and 'long-val' not in h + b"
     check "no value is in the verdict stream" sh -c "! grep -qF -- '$V2' '$OUT/a3.log' && ! grep -qF -- 'long-val' '$OUT/a3.log'"
     rec() { python3 - "$OUT/a3.log" "$1" <<'PY'
 import json, sys
@@ -454,6 +461,7 @@ PY
     for _ in $(seq 600); do grep -q READY "$OUT/a4.out" 2>/dev/null && break; sleep 0.1; done
     # a renewal of the short lease is due at 2 s of its 3
     for _ in $(seq 100); do grep -q 'renew database/creds/stuck' "$SD/requests.log" && grep -q 'renew database/creds/short' "$SD/requests.log" && break; sleep 0.1; done
+    sleep 3        # review: long enough after the failed renewal that a retry (every 2 s) would show
     RUN=$(sed -n 's/^.*revocation: varek revoke \([0-9a-f]\{32\}\) .*$/\1/p' "$OUT/a4.log" | head -1)
     VK="$HERE/tools/varek"
     check "the Warden names how to revoke the run, and its control socket is root's alone" \
@@ -474,6 +482,7 @@ sys.exit(1)"
     python3 "$VK" revoke --all > "$OUT/rv2.out" 2>&1
     check "varek revoke --all: that run is already revoked" grep -q "$RUN: already revoked" "$OUT/rv2.out"
     for _ in $(seq 50); do grep -q 'revocation_leases' "$OUT/a4.log" && grep -q 'revocation_proxy' "$OUT/a4.log" && break; sleep 0.1; done
+    sleep 3        # review: long enough after the revocation that a renewal left live (every 2 s) would show
     echo go >&7
     wait $W4; echo $? > "$OUT/a4.rc"
     exec 7>&-
@@ -580,6 +589,142 @@ PY
     check "the export carries varek:credentials.* and the revocation" \
         cdx "P['varek:credentials.count'] == '3' and P['varek:credentials.names'] == 'c1,sh,sk' and P['varek:credentials.requests'] == '1' and P['varek:credentials.sh'].startswith('vault:database/creds/short#password version lease:') and P['varek:run.revoked'] == 'true' and P['varek:revocation.proxy.values_held'] == '0' and P['varek:revocation.leases.revoked'] == '2' and P['varek:credentials.leases.renewal_failed'] == '1'"
     check "no value is in the export" sh -c "! grep -Eq 'db-short|db-stuck|long-val' '$OUT/a4.cdx.json'"
+fi
+
+echo "== 6. the review's fixes =="
+# (each check fails on the build the review read, ee198c6)
+printf 'require warden 1.28\nproxy inspect\ncredential k from file:/etc/varek/k\nallow request GET https://api.example.com/x credential=k header=te|trailer\n' > "$OUT/pipe.txt"
+check "a header name holding '|' beside a framing name is read alike by the decision procedure and the checker" \
+    sh -c "'$VDP' '$OUT/pipe.txt' credentials > '$OUT/pipe.vdp' 2>&1 && '$CERT' '$OUT/pipe.txt' credentials > '$OUT/pipe.cert' 2>&1 && cmp -s '$OUT/pipe.vdp' '$OUT/pipe.cert'"
+if [ -z "${SRV:-}" ] || [ -z "${S3:-}" ] || [ ! -s "$OUT/a4.log" ]; then
+    skip "the rest of section 6 (needs sections 2 to 4)"
+else
+    # a file warden-secrets reads, with a second name the agent could open
+    mkdir -p "$T/priv" "$T/shared" "$T/vpriv" "$T/view"; chmod 700 "$T/priv" "$T/vpriv"; chmod 755 "$T/shared" "$T/view"
+    printf 'second-name-value\n' > "$T/priv/k"; chmod 600 "$T/priv/k"; ln -f "$T/priv/k" "$T/shared/notes"
+    printf 'require warden 1.28\nproxy inspect\ncredential c from file:%s/priv/k\nallow path %s/shared/ readonly\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow host api.example.com:443\nallow request GET https://api.example.com/x credential=c header=X-K\n' "$T" "$T" > "$T/hl.txt"; chmod 644 "$T/hl.txt"
+    (cd "$T" && timeout 60 "$WARDEN" "$T/hl.txt" --run-as nobody -- /usr/bin/cat "$T/shared/notes" > "$OUT/hl.out" 2> "$OUT/hl.err"); echo $? > "$OUT/hl.rc"
+    check "refused: a file store with a hard link where the agent may read (and the agent reads nothing)" \
+        sh -c "! grep -qx 0 '$OUT/hl.rc' && grep -q 'has 2 names (hard links)' '$OUT/hl.err' && ! grep -q second-name-value '$OUT/hl.out'"
+    rm -f "$T/shared/notes"
+    printf 's.test-token-v1280\n' > "$T/vpriv/token"; chmod 600 "$T/vpriv/token"
+    printf 'vault_addr = https://127.0.0.1:%s\nvault_token_file = %s/vpriv/token\nvault_ca = %s/ca.pem\n' "$HP" "$T" "$T" > "$T/bconf"; chmod 600 "$T/bconf"
+    printf 'require warden 1.28\nproxy inspect\ncredential c from vault:secret/data/agents/gh#token\nallow path %s/view/ readonly\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow host api.example.com:443\nallow request GET https://api.example.com/x credential=c header=X-K\n' "$T" > "$T/bm.txt"; chmod 644 "$T/bm.txt"
+    if mount --bind "$T/vpriv" "$T/view" 2>/dev/null; then
+        (cd "$T" && timeout 60 "$WARDEN" "$T/bm.txt" --secrets-conf "$T/bconf" -- /usr/bin/cat "$T/view/token" > "$OUT/bm.out" 2> "$OUT/bm.err"); echo $? > "$OUT/bm.rc"
+        umount "$T/view"
+        check "refused: a Vault token file bind-mounted where the agent may read" \
+            sh -c "! grep -qx 0 '$OUT/bm.rc' && grep -q 'is also mounted at $T/view/token' '$OUT/bm.err' && ! grep -q s.test-token '$OUT/bm.out'"
+    else
+        skip "a bind-mounted token file (no mount here)"
+    fi
+    mkdir -p "$T/gw"; chmod 775 "$T/gw"; chgrp 65534 "$T/gw" 2>/dev/null
+    printf 'v\n' > "$T/gw/k"; chmod 600 "$T/gw/k"
+    run gw "credential c from file:$T/gw/k\n"
+    refuse "a file store in a directory another user may write" gw "the directory $T/gw must be root's and writable by no other user"
+    put awsbad2 'aws_access_key_id = AKIDV1280TEST\naws_secret_access_key = v1280-test-secret-key/abc\naws_session_token FwoGSECRETSESSION==\n'
+    put caws2 "${CONF}aws_credentials_file = $T/awsbad2\n"
+    run kq "credential c from aws-sm:$ARN:stripe-AbCdEf\n" --secrets-conf "$T/caws2"
+    refuse "a key file line without its ' = ', and its text is not quoted" kq "its text is not shown"
+    check "no secret from that line is in the Warden's output" sh -c "! grep -q FwoGSECRET '$OUT/kq.out'"
+    (cd "$T" && timeout 60 "$WARDEN" "$T/all.txt" --secrets-conf conf --check-credentials > "$OUT/rel.out" 2>&1); echo $? > "$OUT/rel.rc"
+    check "a relative --secrets-conf is read from the working directory" sh -c "grep -qx 0 '$OUT/rel.rc' && grep -q 'each one fetched' '$OUT/rel.out'"
+    # the helper as it runs: its own user, no capabilities, no new privileges, not dumpable
+    printf 'require warden 1.28\nproxy inspect\ncredential c from file:%s/k\nallow host api.example.com:443\nallow request GET https://api.example.com/x credential=c header=X-K\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\n' "$T" > "$T/hz.txt"; chmod 644 "$T/hz.txt"
+    (cd "$T" && timeout 60 "$WARDEN" "$T/hz.txt" -- /usr/bin/sleep 4 > "$OUT/hz.out" 2>&1) &
+    HZ=$!
+    hp=""; for _ in $(seq 40); do hp=$(pgrep -fx 'warden-secrets [0-9]+:[0-9]+' | head -1); [ -n "$hp" ] && break; sleep 0.1; done
+    sleep 1
+    check "warden-secrets runs as its own user, with no capability and no new privileges, and is not dumpable" \
+        sh -c "[ -n '$hp' ] && grep -Eq '^Uid:\s+65531\s+65531\s+65531\s+65531' /proc/$hp/status && grep -q '^NoNewPrivs:\s*1' /proc/$hp/status && grep -q '^CapEff:\s*0000000000000000' /proc/$hp/status && grep -q '^CapPrm:\s*0000000000000000' /proc/$hp/status && [ \"\$(stat -c %u /proc/$hp/environ)\" = 0 ]"
+    wait $HZ
+    # a Vault that resets the connection: the helper reports it and lives
+    RV="$OUT/rv"; mkdir -p "$RV"; chmod 755 "$RV"
+    python3 "$HERE/tests/v1280_rstvault.py" "$RV" > /dev/null 2>&1 &
+    RVP=$!
+    for _ in $(seq 50); do [ -s "$RV/port" ] && break; sleep 0.1; done
+    cp "$RV/ca.pem" "$T/rca.pem"; chmod 644 "$T/rca.pem"
+    put crst "vault_addr = https://127.0.0.1:$(cat "$RV/port")\nvault_token_file = $T/vt\nvault_ca = $T/rca.pem\n"
+    printf 'require warden 1.28\nproxy inspect\ncredential c from vault:database/creds/x#password\nallow host api.example.com:443\nallow request GET https://api.example.com/x credential=c header=X-K\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\n' > "$T/rs.txt"; chmod 644 "$T/rs.txt"
+    (cd "$T" && timeout 60 "$WARDEN" "$T/rs.txt" --secrets-conf "$T/crst" -- /usr/bin/sleep 5 > "$OUT/rs.out" 2>&1)
+    kill $RVP 2>/dev/null
+    check "a Vault that resets the connection: the renewal is recorded as failed, and warden-secrets does not die" \
+        sh -c "grep -q '\"event\":\"lease_renewal_failed\"' '$OUT/rs.out' && ! grep -q 'warden-secrets has gone' '$OUT/rs.out'"
+    # leases are revoked when a run ends, and when a start is refused after a lease was made
+    : > "$SD/requests.log"
+    run le "credential c from vault:database/creds/ro#password\n" --secrets-conf "$T/conf"
+    for _ in $(seq 50); do grep -q 'PUT revoke database/creds/ro/AbC123' "$SD/requests.log" && break; sleep 0.1; done
+    check "the run's lease is revoked when the run ends" grep -q 'vault PUT revoke database/creds/ro/AbC123 token=ok' "$SD/requests.log"
+    : > "$SD/requests.log"
+    run lf "credential c from vault:database/creds/ro#password\ncredential d from vault:secret/data/agents/gh#nope\n" --secrets-conf "$T/conf"
+    for _ in $(seq 50); do grep -q 'PUT revoke' "$SD/requests.log" && break; sleep 0.1; done
+    check "a lease made for a start that is then refused is revoked" \
+        sh -c "! grep -qx 0 '$OUT/lf.rc' && grep -q 'vault PUT revoke database/creds/ro/AbC123 token=ok' '$SD/requests.log'"
+    # the stub resolver after a revocation: refused, nothing looked up
+    printf '{"before.example.com": {"ttl": 30, "a": ["192.0.2.1"]}, "after-udp.example.com": {"ttl": 30, "a": ["192.0.2.2"]}, "after-tcp.example.com": {"ttl": 30, "a": ["192.0.2.3"]}}\n' > "$OUT/zone6.json"
+    DP6=$((20000 + RANDOM % 20000))
+    python3 "$HERE/tests/dns_test_server.py" --port "$DP6" --zone "$OUT/zone6.json" --log "$OUT/q6.log" --ready "$OUT/ready6" > /dev/null 2>&1 &
+    DNS6=$!
+    for _ in $(seq 50); do [ -e "$OUT/ready6" ] && break; sleep 0.1; done
+    cat > "$X/stub6.py" <<'PY'
+import socket, struct, sys
+def q(name):
+    return struct.pack(">HHHHHH", 7, 0x0100, 1, 0, 0, 0) + b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0" + struct.pack(">HH", 1, 1)
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.connect(("127.53.53.53", 53))
+t = socket.socket(socket.AF_INET, socket.SOCK_STREAM); t.connect(("127.53.53.53", 53))
+u.send(q("before.example.com")); r = u.recv(512); print("BEFORE", r[3] & 15, flush=True)
+print("READY", flush=True); sys.stdin.readline()
+u.send(q("after-udp.example.com")); u.settimeout(5); r = u.recv(512); print("UDP", r[3] & 15, flush=True)
+m = q("after-tcp.example.com"); t.sendall(struct.pack(">H", len(m)) + m); t.settimeout(5)
+n = struct.unpack(">H", t.recv(2))[0]; r = t.recv(n); print("TCP", r[3] & 15, flush=True)
+PY
+    chmod 644 "$X/stub6.py"
+    printf 'require warden 1.28\nallow host *.example.com:443 acknowledge=dns-channel\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path exact %s/stub6.py readonly\n' "$X" > "$OUT/stub6.policy"
+    rm -f "$X/go6"; mkfifo "$X/go6"; exec 8<> "$X/go6"
+    env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$OUT/stub6.policy" --dns-server "127.0.0.1:$DP6" -- /usr/bin/python3 "$X/stub6.py" < "$X/go6" > "$OUT/s6.out" 2> "$OUT/s6.log" &
+    W6=$!
+    for _ in $(seq 300); do grep -q READY "$OUT/s6.out" 2>/dev/null && break; sleep 0.1; done
+    R6=$(sed -n 's/^.*revocation: varek revoke \([0-9a-f]\{32\}\) .*$/\1/p' "$OUT/s6.log" | head -1)
+    python3 "$VK" revoke "$R6" > /dev/null 2>&1
+    echo go >&8; wait $W6; exec 8>&-; kill $DNS6 2>/dev/null
+    check "after a revocation the stub refuses questions on sockets connected before it, and looks nothing up" \
+        sh -c "grep -qx 'UDP 5' '$OUT/s6.out' && grep -qx 'TCP 5' '$OUT/s6.out' && ! grep -q after- '$OUT/q6.log'"
+    check "and records them refused as revoked; the audit accepts the run" \
+        sh -c "[ \$(grep -c '\"rule\":\"revoked\",\"policy_line\":-1' '$OUT/s6.log') -ge 2 ] && python3 '$HERE/tools/varek_audit.py' --policy '$OUT/stub6.policy' --checker '$CERT' '$OUT/s6.log' > /dev/null"
+    python3 "$F" "$OUT/s6.log" "$OUT/k1.log" "q = [r for r in recs if isinstance(r, dict) and r.get('rule') == 'revoked' and r.get('event') == 'dns_question'][0]; q.update(rule='policy_match', answer='lookup')"
+    refuses "a stub question answered after the revocation" "$OUT/stub6.policy" "$OUT/k1.log" "answered after the revocation"
+    # forged orders the audit refuses
+    python3 "$F" "$OUT/a4.log" "$OUT/k2.log" "recs[:] = [r for r in recs if not (isinstance(r, dict) and r.get('event') in ('revoked', 'revocation_proxy', 'revocation_leases'))]"
+    refuses "refusals marked revoked with the revocation's records deleted" "$POL4" "$OUT/k2.log" "no revocation is recorded before it"
+    python3 "$F" "$OUT/a4.log" "$OUT/k3.log" "mv = [r for r in recs if isinstance(r, dict) and r.get('event') in ('revoked', 'revocation_proxy', 'revocation_leases')]; recs[:] = [r for r in recs if not any(r is m for m in mv)]; i = next(i for i, r in enumerate(recs) if isinstance(r, dict) and r.get('event') == 'run_end'); recs[i:i] = mv"
+    refuses "the revocation's records moved after the refusals they explain" "$POL4" "$OUT/k3.log" "no revocation is recorded before it"
+    python3 "$F" "$OUT/a4.log" "$OUT/k4.log" "rp = next(r for r in recs if isinstance(r, dict) and r.get('event') == 'revocation_proxy'); recs.remove(rp); i = next(i for i, r in enumerate(recs) if isinstance(r, dict) and r.get('event') == 'revoked'); recs.insert(i, rp)"
+    refuses "the proxy's answer just before the revocation" "$POL4" "$OUT/k4.log" "revocation_proxy without the run being revoked before it"
+    python3 "$F" "$OUT/a3.log" "$OUT/k5.log" "cf = next(r for r in recs if isinstance(r, dict) and r.get('event') == 'credential_refused'); recs.remove(cf); i = next(i for i, r in enumerate(recs) if isinstance(r, dict) and r.get('action') == 'net.request' and r.get('proxy_conn') == cf['proxy_conn'] and r.get('request_seq') == cf['request_seq']); recs.insert(i, cf)"
+    refuses "a refused swap just before the request it refused" "$POL3" "$OUT/k5.log" "follows no allowed request"
+    python3 "$F" "$OUT/a3.log" "$OUT/k6.log" "r = next(r for r in recs if isinstance(r, dict) and r.get('decision_final') == 'DENY' and r.get('action') == 'file.open'); r['rule'] = 'revoked'"
+    refuses "a refusal marked revoked in a run never revoked" "$POL3" "$OUT/k6.log" "no revocation is recorded before it"
+    # the tools on hostile and foreign lines
+    python3 "$F" "$OUT/a4.log" "$OUT/k7.log" "r = next(r for r in recs if isinstance(r, dict) and r.get('event') == 'revoked'); r['timestamp_ns'] = 10**30"
+    python3 "$F" "$OUT/a3.log" "$OUT/k8.log" "r = next(r for r in recs if isinstance(r, dict) and r.get('event') == 'credential_refused'); r['proxy_conn'] = [1]"
+    NO_COLOR=1 VAREK_CONFIG="$OUT/varek4.conf" python3 "$HERE/tools/varek" refusals "$OUT/k7.log" > "$OUT/k7.out" 2>&1
+    NO_COLOR=1 VAREK_CONFIG="$OUT/varek3.conf" python3 "$HERE/tools/varek" refusals "$OUT/k8.log" > "$OUT/k8.out" 2>&1
+    python3 "$HERE/tools/varek_audit.py" --policy "$POL3" --checker "$CERT" "$OUT/k8.log" > "$OUT/k8a.out" 2>&1
+    check "varek refusals and the audit give no traceback on malformed revocation and swap records" \
+        sh -c "! grep -q Traceback '$OUT/k7.out' '$OUT/k8.out' '$OUT/k8a.out' && grep -q 'PROBLEM' '$OUT/k8a.out'"
+    cp "$OUT/a3.log" "$OUT/k9.log"
+    printf '{"event":"revoked","run":"00000000000000000000000000000000","by_uid":0,"by_pid":1,"timestamp_ns":1}\n' >> "$OUT/k9.log"
+    NO_COLOR=1 VAREK_CONFIG="$OUT/varek3.conf" python3 "$HERE/tools/varek" refusals "$OUT/k9.log" > "$OUT/k9.out" 2>&1
+    check "varek refusals ignores a revocation of another run" sh -c "! grep -q 'was revoked' '$OUT/k9.out'"
+    python3 "$HERE/tools/varek_cyclonedx.py" --log "$OUT/h1.log" --policy "$POL4" --output "$OUT/h1.cdx.json" > /dev/null 2>&1
+    check "the export counts a decision allowed after the revocation, and does not say every one was refused" \
+        sh -c "grep -q '\"varek:revocation.allowed_after\"' '$OUT/h1.cdx.json' && ! grep -q 'every decision after it was UNSATISFIED' '$OUT/h1.cdx.json'"
+    # a control socket left by a Warden that was killed: varek revoke --all removes it
+    STALE=/run/varek/ffffffffffffffffffffffffffffffff.ctl
+    python3 -c "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET); s.bind('$STALE')"
+    python3 "$VK" revoke --all > "$OUT/stale.out" 2>&1
+    check "varek revoke --all removes a control socket no Warden listens on" \
+        sh -c "[ ! -e '$STALE' ] && grep -q 'removed the control socket' '$OUT/stale.out'"
 fi
 
 echo
