@@ -215,7 +215,7 @@ unknown-kid|a key id not in the issuer's keys|its key nope is not among the issu
 wrong-iss|an issuer the policy does not trust|its issuer https://idp.elsewhere.test is not one the policy trusts
 wrong-aud|another audience|its audience (aud) does not hold varek-agent
 expired|expired an hour ago|it expired
-near-expiry|expiring in 20 s (under 60)|it expires in 20 s, under 60 s
+near-expiry|expiring in 20 s (under 60)|it expires in
 nbf-future|not valid for 10 minutes (nbf)|it is not valid for
 iat-future|issued 10 minutes ahead (iat)|it was issued
 no-exp|no expiry|it has no expiry (exp)
@@ -224,6 +224,8 @@ sub-ctl|a subject with a control byte|its subject (sub) is not printable ASCII
 crit|a crit header|its header has crit
 act9|an act chain 9 deep|its act chain is nested deeper than 8
 CASES
+    # minted a moment before: 20 s less the second boundaries crossed since
+    check "... the reason, with what is left of the 20 s" grep -Eq "the user's token: it expires in (18|19|20) s, under 60 s" "$OUT/t_near-expiry.out"
     check "a refused token starts no agent and records no run_start" sh -c "! grep -q run_start '$OUT/t_badsig.out'"
     printf '%b' "require warden 1.28\ntrust issuer $ISS audience varek-agent jwks $ISS/jwks-two\n$LIBS" > "$T/p2.txt"
     : > "$T/requests.log"; mint rs256-nokid; go two "$T/p2.txt" --on-behalf-of "$T/tok"
