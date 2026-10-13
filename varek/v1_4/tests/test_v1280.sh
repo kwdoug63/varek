@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # test_v1280.sh — VAREK v1.28.0: credential release, the agent holds only
-# placeholders (docs/security/v1.28-credential-release.md). The parts built
-# so far:
+# placeholders (docs/security/v1.28-credential-release.md):
 #   1. the grammar: `credential NAME from STORE:REF` and an allow request
 #      rule's `credential=NAME header=HEADER[:SCHEME]`, after `require warden
 #      1.28`, read the same way by the decision procedure (vdp_check) and the
