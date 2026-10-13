@@ -99,6 +99,8 @@ struct px_open {
     bool     refused;                    /* a request was refused: no more come */
     bool     allowed;                    /* some request was allowed (so bytes may pass) */
     bool     cut;                        /* a body passed max_body */
+    uint64_t cred_seq;                   /* v1.28: the last allowed request that carries a credential */
+    uint32_t cred;                       /* its credential (1 + index) */
 };
 static struct px_open *g_px_open;
 static size_t g_px_nopen, g_px_capopen;
@@ -679,6 +681,15 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
         size_t el = strlen(a->extra);
         snprintf(a->extra + el, sizeof a->extra - el, "\"max_body\":%llu,", (unsigned long long)maxb);
     }
+    /* v1.28: the credential the allowing rule lets the request carry, and
+     * where; the proxy puts it there, or refuses (credential_refused) */
+    const vdp_rule_t *cr = d_final == DEC_ALLOW && a->rule_index >= 0 ? &p->v.rules[a->rule_index] : NULL;
+    if (cr && !cr->cred) cr = NULL;
+    if (cr) {
+        size_t el = strlen(a->extra);
+        snprintf(a->extra + el, sizeof a->extra - el, "\"credential\":\"%s\",\"credential_header\":\"%s\",",
+                 p->v.creds[cr->cred - 1].name, cr->cred_hdr);
+    }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     emit_pathology(g_report_seq++, 0, a, d_raw, d_final, rule, ns_between(&t0, &t1), d_final == DEC_ALLOW ? 0 : EACCES);
     free(a);
@@ -690,6 +701,13 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     v.seq = m->seq;
     v.max_body = d_final == DEC_ALLOW ? maxb : 0;
     snprintf(v.why, sizeof v.why, "%s", why);
+    if (cr) {
+        v.cred = (uint32_t)cr->cred;
+        snprintf(v.hdr, sizeof v.hdr, "%s", cr->cred_hdr);
+        snprintf(v.scheme, sizeof v.scheme, "%s", cr->cred_scheme);
+        o->cred_seq = m->seq;
+        o->cred = v.cred;
+    }
     if (d_final == DEC_ALLOW) {
         o->allowed = true;
         if (m->body != WP_BODY_NONE) {
@@ -733,10 +751,33 @@ static int px_httpbody(const struct wp_httpbody *m) {
     return 0;
 }
 
+/* v1.28: the proxy refused to put a credential into an allowed request (its
+ * header did not hold exactly the placeholder): recorded, and the
+ * connection takes no more requests. The why is the proxy's, made safe. */
+static int px_credfail(const struct policy *p, struct wp_credfail *m) {
+    struct px_open *o = NULL;
+    for (size_t k = 0; k < g_px_nopen; k++) if (g_px_open[k].id == m->id) o = &g_px_open[k];
+    if (!o || !o->cred_seq || m->seq != o->cred_seq || m->cred != o->cred || m->cred > p->v.ncreds ||
+        !memchr(m->why, 0, sizeof m->why))
+        return -1;
+    o->cred_seq = 0;
+    o->refused = true;
+    for (char *c = m->why; *c; c++) if (*c < ' ' || *c > '~' || *c == '"' || *c == '\\') *c = '?';
+    FILE *f = rec_begin();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(f, "{\"event\":\"credential_refused\",\"run\":\"%s\",\"proxy_conn\":%llu,\"request_seq\":%llu,"
+            "\"credential\":\"%s\",\"why\":\"%s\",\"timestamp_ns\":%lld}\n", g_run_id, (unsigned long long)m->id,
+            (unsigned long long)m->seq, p->v.creds[m->cred - 1].name, m->why,
+            (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+    rec_end(NULL);
+    return 0;
+}
+
 static int proxy_service(const struct policy *p) {
     for (;;) {
         static union { struct wp_req r; struct wp_close c; struct wp_msg f; struct wp_httpreq hr;
-                       struct wp_httpbody hb; uint32_t type; } u;
+                       struct wp_httpbody hb; struct wp_credfail cf; uint32_t type; } u;
         ssize_t n = recv(g_proxy.ctl, &u, sizeof u, MSG_DONTWAIT);
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
         if (n <= 0) return -1;                                  /* the proxy is gone */
@@ -747,6 +788,10 @@ static int proxy_service(const struct policy *p) {
         }
         if (n == (ssize_t)sizeof u.hb && u.type == WP_MSG_HTTPBODY) {
             if (px_httpbody(&u.hb) < 0) return -1;
+            continue;
+        }
+        if (n == (ssize_t)sizeof u.cf && u.type == WP_MSG_CREDFAIL) {          /* v1.28 */
+            if (px_credfail(p, &u.cf) < 0) return -1;
             continue;
         }
         if (n == (ssize_t)sizeof u.c && u.type == WP_MSG_CLOSED) {

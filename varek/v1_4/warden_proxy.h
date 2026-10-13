@@ -38,7 +38,38 @@ enum { WP_MSG_READY = 1, WP_MSG_CONN = 2, WP_MSG_REQUEST = 3, WP_MSG_UNREADABLE 
        WP_MSG_CLOSED = 6, WP_MSG_FLUSH = 7, WP_MSG_FLUSHED = 8, WP_MSG_VERDICT_UP = 9,
        /* v1.26.1, inspecting mode */
        WP_MSG_INSPECT = 10, WP_MSG_CA_NAME = 11, WP_MSG_CA_GO = 12, WP_MSG_BLOB = 13, WP_MSG_CA_DONE = 14,
-       WP_MSG_HTTPREQ = 15, WP_MSG_REQVERDICT = 16, WP_MSG_HTTPBODY = 17 };
+       WP_MSG_HTTPREQ = 15, WP_MSG_REQVERDICT = 16, WP_MSG_HTTPBODY = 17,
+       /* v1.28, credential release */
+       WP_MSG_PH = 18, WP_MSG_CREDS = 19, WP_MSG_CREDS_OK = 20, WP_MSG_CREDFAIL = 21 };
+
+/* v1.28 (docs/security/v1.28-credential-release.md, section 3). Before the
+ * agent starts, Warden -> proxy: WP_MSG_PH, each credential's placeholder
+ * (not a secret); then WP_MSG_CREDS with, as SCM_RIGHTS, one end of a
+ * socket whose other end warden-secrets holds: the proxy reads n values
+ * from it (struct ws_value, warden_secrets.h) into memory it locked before
+ * dropping to its user, and answers WP_MSG_CREDS_OK (n: how many it holds;
+ * 0: it failed). The Warden never sees a value. On an allowed request whose
+ * rule names a credential, the verdict says which, and the header and
+ * scheme; the proxy swaps the placeholder for the value there, or refuses
+ * the request (WP_MSG_CREDFAIL, why) when the header does not hold exactly
+ * the placeholder. */
+#define WP_PH_MAX 128
+struct wp_ph {
+    uint32_t type;               /* WP_MSG_PH */
+    uint32_t index;
+    char     ph[WP_PH_MAX];      /* NUL-terminated */
+};
+struct wp_creds {
+    uint32_t type;               /* WP_MSG_CREDS, WP_MSG_CREDS_OK */
+    uint32_t n;
+};
+struct wp_credfail {
+    uint32_t type;               /* WP_MSG_CREDFAIL */
+    uint32_t cred;               /* 1 + the credential's index */
+    uint64_t id;
+    uint64_t seq;
+    char     why[96];            /* NUL-terminated */
+};
 
 /* v1.26.1, step 6: each request of an inspected connection is decided
  * before a byte of it is sent. Proxy -> Warden: WP_MSG_HTTPREQ, the request's
@@ -63,6 +94,11 @@ struct wp_reqverdict {
     uint64_t seq;
     uint64_t max_body;           /* the allowing rule's max_body= (0: none) */
     char     why[96];            /* a refusal: why, for the client's 403 (NUL-terminated) */
+    /* v1.28: the credential the allowing rule names (1 + its index; 0: none),
+     * the header it goes in, and the scheme before it ("" : the whole value) */
+    uint32_t cred;
+    char     hdr[65];
+    char     scheme[33];
 };
 struct wp_httpbody {
     uint32_t type;               /* WP_MSG_HTTPBODY */
@@ -218,6 +254,11 @@ int wp_start(wp_t *w, int exe_fd, uid_t uid, gid_t gid);
  * its SHA-256 in hex. The file must be a regular file that neither its group
  * nor others may write. Returns the memfd, or -1 with the reason in why. */
 int wp_load(const char *path, char sha256_hex[65], char *why, size_t wn);
+
+/* v1.28: give the proxy each credential's placeholder, then one end of the
+ * socket warden-secrets writes the values to, and wait (up to timeout_ms)
+ * for it to say it holds all n. 0, or -1 with why. */
+int wp_creds(const wp_t *w, size_t n, char (*const ph)[WP_PH_MAX], int fd, int timeout_ms, char *why, size_t wn);
 
 /* Step 4: announce a hand-off (see struct wp_conn). Never blocks. 0, or -1
  * with errno set (the proxy is gone, or its control socket is full). */

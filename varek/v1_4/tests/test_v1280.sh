@@ -7,9 +7,11 @@
 #      rule's `credential=NAME header=HEADER[:SCHEME]`, after `require warden
 #      1.28`, read the same way by the decision procedure (vdp_check) and the
 #      certificate checker (vdp_cert_check), each form and each refusal; lint
-#      notes a credential no rule carries; the Warden reports 1.28.0, compares
-#      the two readings at load, and (until the swap is built) refuses to
-#      start a policy that names a credential.
+#      notes a credential no rule carries; the Warden reports 1.28.0 and
+#      compares the two readings at load.
+#   2. fetching: warden-secrets and each store, against stand-ins.
+#   3. the swap: placeholders in the agent's environment, the value put in
+#      by warden-proxy where an allowing rule names it, and nowhere else.
 #
 #   test_v1280.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
@@ -96,6 +98,7 @@ refused "a vault field with !"          "${R}credential k from vault:secret/k#f!
 refused "an aws-sm reference not an ARN" "${R}credential k from aws-sm:my-secret\n"                         "Secrets Manager ARN"
 refused "a reference with a high byte"  "${R}credential k from file:/k\xe9\n"                               "printable ASCII"
 refused "require warden 1.29"           'require warden 1.29\n'                                             "this is 1.28"
+refused "a credential on an http:// rule" "${R}${C}allow host api.example.com:80\nallow request GET http://api.example.com/x credential=k header=X-K\n" "only on an https:// rule"
 
 printf 'require warden 1.28\nproxy inspect\nallow host api.example.com:443\n%bcredential unused from file:/u\nallow request GET https://api.example.com/x credential=k header=X\n' "$C" > "$OUT/l.txt"
 check "lint notes a credential no rule carries" sh -c "'$VDP' '$OUT/l.txt' lint | grep -q ':5: note: credential unused is named, but no request rule carries it'"
@@ -107,8 +110,8 @@ else
     check "the Warden reports 1.28.0" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | grep -q 'VAREK Warden  1.28.0'"
     printf '%b' "$(Q 'credential=k header=Authorization:Bearer')" > "$OUT/w.txt"
     "$WARDEN" "$OUT/w.txt" --check-startup > "$OUT/w.out" 2>&1; echo $? > "$OUT/w.rc"
-    check "the Warden refuses, for now, a policy that names a credential" \
-        sh -c "! grep -qx 0 '$OUT/w.rc' && grep -q 'credential release is not built in this Warden yet' '$OUT/w.out'"
+    check "--check-startup accepts a policy that names a credential, and lists it" \
+        sh -c "grep -qx 0 '$OUT/w.rc' && grep -q 'credential k from file:/etc/varek/creds/k (line 4)' '$OUT/w.out'"
     printf 'require warden 1.28\nproxy inspect\nallow host api.example.com:443\nallow request GET https://api.example.com/x\n' > "$OUT/w2.txt"
     check "the Warden starts a 1.28 policy with no credential" "$WARDEN" "$OUT/w2.txt" --check-startup
 fi
@@ -149,7 +152,7 @@ else
     check "AWS Secrets Manager with a key file: fetched, the version id; the stand-in checked the signature" \
         sh -c "grep -qF 'version aws:a1b2c3d4-5678-90ab-cdef-EXAMPLE11111' '$OUT/all.out' && grep -q 'key=AKIDV1280TEST signature=ok' '$SD/requests.log'"
     check "the helper's binary is hashed" sh -c "grep -Eq \"credentials' helper .*warden-secrets, SHA-256 [0-9a-f]{64}\" '$OUT/all.out'"
-    check "then, the swap being step 3, the start is refused" sh -c "has() { grep -qF -- \"\$2\" '$OUT/'\"\$1\".out; }; has all 'credential release is not built in this Warden yet' && ! grep -qx 0 '$OUT/all.rc'"
+    check "then the proxy holds all five values (step 3)" has all "credentials: 5 held by the proxy"
     check "no value is in the Warden's output" sh -c "! grep -Eq 'file-value-1234|vault-kv2-value|vault-kv1-value|db-password|aws-sm-value' '$OUT/all.out'"
     check "the helper is gone once the Warden is" sh -c "! pgrep -fx 'warden-secrets [0-9]+:[0-9]+'"
     run imds "credential c from aws-sm:$ARN:stripe-AbCdEf\n" --secrets-conf "$T/conf_imds"
@@ -208,6 +211,151 @@ else
     "$WARDEN" "$T/cs.txt" --check-startup --secrets-conf "$T/conf" > "$OUT/cs.out" 2>&1
     check "--check-startup lists the credentials and fetches nothing" \
         sh -c "grep -q 'credential c from vault:secret/data/agents/gh#token (line 3)' '$OUT/cs.out' && [ ! -s '$SD/requests.log' ]"
+fi
+
+echo "== 3. the swap =="
+WP="$(dirname "$WARDEN")/warden-proxy"
+if [ "$(id -u)" != 0 ] || [ -z "$WARDEN" ] || [ ! -x "$SECRETS" ] || [ ! -x "$WP" ] || ! command -v openssl > /dev/null; then
+    skip "section 3 (needs root, warden, warden-proxy, warden-secrets and openssl)"
+else
+    X=/tmp/varek_v1280x.$$
+    rm -rf "$X"; mkdir -p "$X/o"; chmod 755 "$X"; chmod 777 "$X/o"
+    trap 'kill $SRV $S3 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $OUT ${T:-} $X" || rm -rf "$OUT" "${T:-}" "$X"' EXIT
+    HOSTIP=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("10.255.255.255", 1)); print(s.getsockname()[0])')
+    PS=$((43000 + RANDOM % 5000))
+    ( cd "$X" &&
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout tca.key -out tca.pem -days 2 \
+          -subj "/CN=VAREK v1.28 test root" -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign" &&
+      openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout s.key -out s.csr -subj "/CN=api.example.com" &&
+      printf 'subjectAltName=DNS:api.example.com\nextendedKeyUsage=serverAuth\n' > s.ext &&
+      openssl x509 -req -in s.csr -CA tca.pem -CAkey tca.key -CAcreateserial -out s.pem -days 1 -extfile s.ext ) > "$OUT/certs3.log" 2>&1
+    cat "$(python3 -c 'import ssl; print(ssl.get_default_verify_paths().openssl_cafile)')" "$X/tca.pem" > "$X/bundle.pem"
+    chmod 644 "$X"/*.pem
+    # the server logs each request's head and body as it got them (JSON lines)
+    cat > "$OUT/srv3.py" <<'PY'
+import json, socket, ssl, sys, threading
+ip, port, cert, key, log = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); l.bind((ip, port)); l.listen(16)
+lk = threading.Lock()
+def serve(c):
+    try:
+        s = ctx.wrap_socket(c, server_side=True)
+        d = b""
+        while b"\r\n\r\n" not in d:
+            x = s.recv(65536)
+            if not x: return
+            d += x
+        head, body = d.split(b"\r\n\r\n", 1)
+        n = 0
+        for h in head.split(b"\r\n")[1:]:
+            if h.lower().startswith(b"content-length:"): n = int(h.split(b":", 1)[1])
+        while len(body) < n:
+            x = s.recv(65536)
+            if not x: break
+            body += x
+        with lk, open(log, "a") as f:
+            f.write(json.dumps({"head": head.decode("latin-1"), "body": body.decode("latin-1")}) + "\n")
+        s.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"); s.close()
+    except Exception as e:
+        print("srv", type(e).__name__, e, flush=True)
+while True:
+    c, _ = l.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
+PY
+    python3 "$OUT/srv3.py" "$HOSTIP" "$PS" "$X/s.pem" "$X/s.key" "$OUT/got.jsonl" > "$OUT/srv3.log" 2>&1 &
+    S3=$!
+    DP=$((20000 + RANDOM % 20000))
+    printf '{"api.example.com": {"ttl": 30, "a": ["%s"]}}\n' "$HOSTIP" > "$OUT/zone3.json"
+    python3 "$HERE/tests/dns_test_server.py" --port "$DP" --zone "$OUT/zone3.json" --log "$OUT/q3.log" --ready "$OUT/ready3" > /dev/null 2>&1 &
+    S3="$S3 $!"
+    for _ in $(seq 50); do
+        [ -e "$OUT/ready3" ] && python3 -c "import socket; socket.create_connection(('$HOSTIP', $PS), 0.2)" 2>/dev/null && break
+        sleep 0.1
+    done
+    # the values: one longer than its placeholder (200 bytes), one shorter
+    V1="$(python3 -c 'print("L" * 191 + "-long-val")')"; V2="short-v2"
+    printf '%s\n' "$V1" > "$X/v1"; printf '%s\n' "$V2" > "$X/v2"; chmod 600 "$X/v1" "$X/v2"
+    cat > "$X/agent.py" <<'PY'
+import os, socket, ssl, sys
+P, O = int(sys.argv[1]), sys.argv[2]
+ph1, ph2 = os.environ.get("VAREK_CRED_C1", ""), os.environ.get("VAREK_CRED_C2", "")
+print("ENV", ph1.startswith("varek_ph_c1_"), ph2.startswith("varek_ph_c2_"), len(ph1), flush=True)
+with open(os.path.join(O, "env"), "w") as f:
+    f.write("\n".join(f"{k}={v}" for k, v in os.environ.items()))
+def req(tag, head, body=b""):
+    try:
+        s = ssl.create_default_context().wrap_socket(socket.create_connection(("api.example.com", P), 10),
+                                                     server_hostname="api.example.com")
+        s.sendall(head + body)                      # head and body in one write
+        out = b""
+        while True:
+            d = s.recv(4096)
+            if not d: break
+            out += d
+        print("REQ", tag, out.split(b"\r\n")[0].decode(), flush=True)
+    except (OSError, ssl.SSLError) as e:
+        print("REQ", tag, "ERR", type(e).__name__, flush=True)
+H = b"Host: api.example.com:%d\r\n" % P
+e1, e2 = ph1.encode(), ph2.encode()
+body = b"body holds " + e1 + b" as sent"
+req("bearer", b"POST /v1/a HTTP/1.1\r\n" + H + b"Authorization: Bearer " + e1 + b"\r\nContent-Length: %d\r\n\r\n" % len(body), body)
+req("key", b"GET /v1/b HTTP/1.1\r\n" + H + b"X-Api-Key: " + e2 + b"\r\n\r\n")
+req("case", b"GET /v1/a HTTP/1.1\r\n" + H + b"authorization:   bearer " + e1 + b"  \r\n\r\n")
+req("missing", b"GET /v1/a HTTP/1.1\r\n" + H + b"\r\n")
+req("twice", b"GET /v1/a HTTP/1.1\r\n" + H + b"Authorization: Bearer " + e1 + b"\r\nAuthorization: Bearer " + e1 + b"\r\n\r\n")
+req("other", b"GET /v1/a HTTP/1.1\r\n" + H + b"Authorization: Bearer " + e2 + b"\r\n\r\n")
+req("extra", b"GET /v1/a HTTP/1.1\r\n" + H + b"Authorization: Bearer " + e1 + b" x\r\n\r\n")
+req("noscheme", b"GET /v1/a HTTP/1.1\r\n" + H + b"Authorization: " + e1 + b"\r\n\r\n")
+req("plain", b"GET /v1/plain?q=" + e1 + b" HTTP/1.1\r\n" + H + b"Authorization: Bearer " + e1 + b"\r\nX-Other: " + e2 + b"\r\n\r\n")
+PY
+    chmod 644 "$X/agent.py"
+    POL3="$OUT/swap.policy"
+    { printf 'require warden 1.28\nproxy inspect\nproxy ports %s\n' "$PS"
+      printf 'credential c1 from file:%s/v1\ncredential c2 from file:%s/v2\n' "$X" "$X"
+      printf 'allow host api.example.com\n'
+      printf 'allow request POST https://api.example.com:%s/v1/a credential=c1 header=Authorization:Bearer\n' "$PS"
+      printf 'allow request GET https://api.example.com:%s/v1/a credential=c1 header=Authorization:Bearer\n' "$PS"
+      printf 'allow request GET https://api.example.com:%s/v1/b credential=c2 header=X-Api-Key\n' "$PS"
+      printf 'allow request GET https://api.example.com:%s/v1/plain?q=*\n' "$PS"
+      printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path exact %s/agent.py readonly\nallow path %s/o/\n' "$X" "$X"
+    } > "$POL3"
+    env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$POL3" --dns-server "127.0.0.1:$DP" --trust-bundle "$X/bundle.pem" -- \
+        /usr/bin/python3 "$X/agent.py" "$PS" "$X/o" > "$OUT/a3.out" 2> "$OUT/a3.log"
+    sed 's/^/     /' "$OUT/a3.out"
+    got() { python3 - "$OUT/got.jsonl" "$1" <<'PY'
+import json, sys
+for l in open(sys.argv[1]):
+    r = json.loads(l)
+    if eval(sys.argv[2], {"h": r["head"], "b": r["body"]}):
+        sys.exit(0)
+sys.exit(1)
+PY
+    }
+    check "the agent's environment has a placeholder for each credential" grep -qx 'ENV True True 55' "$OUT/a3.out"
+    check "a value longer than its placeholder, after a scheme: the server got it; the body after the head is intact" \
+        got "h.startswith('POST /v1/a ') and 'Authorization: Bearer $V1\r\n' in h + '\r\n' and b.startswith('body holds varek_ph_c1_')"
+    check "a value shorter than its placeholder, the whole header value: the server got it" \
+        got "h.startswith('GET /v1/b ') and 'X-Api-Key: $V2' in h"
+    check "a scheme in another case, with spaces around: swapped" \
+        got "h.startswith('GET /v1/a ') and 'authorization:   bearer $V1' in h"
+    for t in missing twice other extra noscheme; do
+        check "refused ($t): 403, nothing reaches the server" grep -qx "REQ $t HTTP/1.1 403 Forbidden" "$OUT/a3.out"
+    done
+    check "four requests reached the server: the three swapped and the plain one" sh -c "[ \$(wc -l < '$OUT/got.jsonl') -eq 4 ]"
+    check "a placeholder where no rule names its credential is sent as it is (query, another header, a rule without one)" \
+        got "h.startswith('GET /v1/plain?q=varek_ph_c1_') and 'Authorization: Bearer varek_ph_c1_' in h and 'X-Other: varek_ph_c2_' in h"
+    check "no value is in the agent's environment" sh -c "! grep -qF -- '$V2' '$X/o/env' && ! grep -qF -- 'long-val' '$X/o/env'"
+    check "no value is in the verdict stream" sh -c "! grep -qF -- '$V2' '$OUT/a3.log' && ! grep -qF -- 'long-val' '$OUT/a3.log'"
+    rec() { python3 - "$OUT/a3.log" "$1" <<'PY'
+import json, sys
+recs = [json.loads(l[l.index("{"):]) for l in open(sys.argv[1], errors="replace") if l.lstrip().startswith("{") or ' {"' in l]
+sys.exit(0 if eval(sys.argv[2], {"R": recs}) else 1)
+PY
+    }
+    check "each allowed request with a credential records its name and header" \
+        rec "sum(1 for r in R if r.get('action') == 'net.request' and r.get('credential') == 'c1' and r.get('credential_header') == 'Authorization') >= 6"
+    check "each refused swap is recorded (credential_refused, with why)" \
+        rec "sum(1 for r in R if r.get('event') == 'credential_refused' and r.get('credential') in ('c1',) and r.get('why')) == 5"
 fi
 
 echo

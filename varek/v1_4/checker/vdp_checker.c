@@ -704,6 +704,7 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
             r->max_body = (uint32_t)x;
         }
         if ((r->cred != 0) != hdr) return fail(err, en, name, ln, "credential and header go together");
+        if (r->cred && strncmp(tok[3], "https://", 8) != 0) return fail(err, en, name, ln, "credential on http");
         return 0;
     }
 

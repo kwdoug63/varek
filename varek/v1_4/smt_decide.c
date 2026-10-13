@@ -1275,6 +1275,12 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
                 rc = perr(err, errlen, path, lineno, "credential= and header= go together");
                 break;
             }
+            /* v1.28 step 3: a value only inside TLS */
+            if (r->cred && strncmp(tok[3], "https://", 8)) {
+                rc = perr(err, errlen, path, lineno, "credential= only on an https:// rule (a value is never "
+                          "sent in the clear)");
+                break;
+            }
             char gm[160] = "out of memory";
             r->s.prog = prog_glob(r->s.c, r->s.len, gm, sizeof gm);
             if (!r->s.prog) { rc = perr(err, errlen, path, lineno, "%s", gm); break; }

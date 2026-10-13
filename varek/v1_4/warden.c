@@ -1374,6 +1374,8 @@ static wp_t       g_proxy = { .ctl = -1 };          /* v1.26: the egress proxy, 
 static ws_t       g_secrets = { .ctl = -1 };        /* v1.28: warden-secrets, when the policy names credentials */
 static char       g_secrets_sha[65];                /* v1.28: the SHA-256 of the warden-secrets that ran */
 static ws_meta_t  g_cred_meta[WS_MAX_CREDS];        /* v1.28: each credential's version and length (never its value) */
+static char       g_cred_ph[WS_MAX_CREDS][WP_PH_MAX]; /* v1.28: each credential's placeholder (not a secret) */
+static char       g_cred_ph_sha[WS_MAX_CREDS][65];  /* v1.28: its SHA-256, for the record */
 static char       g_proxy_sha[65];                  /* v1.26.1: the SHA-256 of the warden-proxy that ran */
 /* v1.26.1, inspecting mode: the run's CA and the trust views (warden_trust.inc.c) */
 static bool       g_inspect_on = false;
@@ -4722,14 +4724,40 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[warden] credential %s from %s:%s: fetched, %u bytes, version %s\n",
                         p.v.creds[k].name, kStore[p.v.creds[k].store], p.v.creds[k].ref,
                         g_cred_meta[k].len, g_cred_meta[k].version);
+            /* step 3: a placeholder for each, made for this run (32 random
+             * bytes), in the agent's environment as VAREK_CRED_<NAME>; the
+             * proxy gets the placeholders from the Warden and the values from
+             * warden-secrets, over a socket the Warden only passes on */
+            for (size_t k = 0; k < p.v.ncreds; k++) {
+                unsigned char rnd[32], dg[32];
+                char b64[64], env[48];
+                randombytes_buf(rnd, sizeof rnd);
+                sodium_bin2base64(b64, sizeof b64, rnd, sizeof rnd, sodium_base64_VARIANT_URLSAFE_NO_PADDING);
+                snprintf(g_cred_ph[k], sizeof g_cred_ph[k], "varek_ph_%s_%s", p.v.creds[k].name, b64);
+                crypto_hash_sha256(dg, (const unsigned char *)g_cred_ph[k], strlen(g_cred_ph[k]));
+                sodium_bin2hex(g_cred_ph_sha[k], sizeof g_cred_ph_sha[k], dg, sizeof dg);
+                int el = snprintf(env, sizeof env, "VAREK_CRED_%s", p.v.creds[k].name);
+                for (int q = 11; q < el; q++) env[q] = (char)toupper((unsigned char)env[q]);
+                if (setenv(env, g_cred_ph[k], 1) < 0) {
+                    fprintf(stderr, "[warden] cannot set %s (%s); refusing to start\n", env, strerror(errno));
+                    ws_stop(&g_secrets);
+                    return 1;
+                }
+                sodium_memzero(rnd, sizeof rnd);
+            }
+            int vs[2];
+            if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, vs) < 0 || ws_hand_to(&g_secrets, vs[0]) < 0 ||
+                wp_creds(&g_proxy, p.v.ncreds, g_cred_ph, vs[1], 10000, why, sizeof why) < 0) {
+                fprintf(stderr, "[warden] credentials: %s; refusing to start\n",
+                        g_proxy.ctl < 0 ? "the proxy is not running" : why);
+                ws_stop(&g_secrets);
+                return 1;
+            }
+            close(vs[0]);
+            close(vs[1]);
+            fprintf(stderr, "[warden] credentials: %zu held by the proxy; the agent has placeholders "
+                    "(VAREK_CRED_<NAME>)\n", p.v.ncreds);
         }
-        /* v1.28 steps 2 of 8: the swap into requests (step 3) is not built
-         * yet, so a run with a credential would have nothing to put in its
-         * place: refused, after the fetch. */
-        fprintf(stderr, "[warden] policy %s:%d: credential release is not built in this Warden yet; "
-                "refusing to start\n", policy_path, p.v.creds[0].line);
-        ws_stop(&g_secrets);
-        return 1;
     }
     /* v1.27: with `require warden 1.27`, the files the agent may launch and
      * the Landlock ruleset that holds it to them (warden_exec.inc.c) */

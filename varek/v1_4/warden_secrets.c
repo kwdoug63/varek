@@ -151,6 +151,23 @@ bad:
     return -1;
 }
 
+int ws_hand_to(ws_t *w, int fd) {
+    if (w->ctl < 0) { errno = ENOTCONN; return -1; }
+    struct ws_ready m = { .type = WS_MSG_PROXY, .n = 0 };
+    union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
+    memset(&cb, 0, sizeof cb);
+    struct iovec v = { &m, sizeof m };
+    struct msghdr mh = { .msg_iov = &v, .msg_iovlen = 1, .msg_control = cb.b, .msg_controllen = sizeof cb.b };
+    struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &fd, sizeof fd);
+    ssize_t r;
+    while ((r = sendmsg(w->ctl, &mh, MSG_NOSIGNAL)) < 0 && errno == EINTR) { }
+    return r == (ssize_t)sizeof m ? 0 : -1;
+}
+
 void ws_stop(ws_t *w) {
     if (w->ctl >= 0) close(w->ctl);
     w->ctl = -1;

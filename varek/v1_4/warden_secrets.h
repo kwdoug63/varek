@@ -36,6 +36,8 @@ enum {
     WS_MSG_FILE,
     WS_MSG_RESULT,
     WS_MSG_READY,
+    WS_MSG_PROXY,                     /* v1.28 step 3: Warden -> helper, SCM_RIGHTS: the socket to warden-proxy */
+    WS_MSG_VALUE,                     /* helper -> warden-proxy, on that socket: one value */
 };
 
 #define WS_MAX_CREDS   32
@@ -73,8 +75,17 @@ struct ws_result {
 };
 
 struct ws_ready {
-    uint32_t type;                    /* WS_MSG_READY */
+    uint32_t type;                    /* WS_MSG_READY, WS_MSG_PROXY */
     uint32_t n;                       /* credentials fetched */
+};
+
+/* Step 3: one value, helper -> warden-proxy (never through the Warden) */
+struct ws_value {
+    uint32_t      type;               /* WS_MSG_VALUE */
+    uint32_t      index;
+    uint32_t      len;
+    uint32_t      pad;
+    unsigned char value[WS_MAX_VALUE];
 };
 
 /* The Warden's side (warden_secrets.c). */
@@ -102,6 +113,10 @@ int ws_start(ws_t *w, int exe_fd, uid_t uid, gid_t gid);
 int ws_fetch(ws_t *w, const char *conf, size_t n, const int *store, const char *const *ref,
              ws_meta_t *meta, char (*files)[4096], size_t *nfiles, int timeout_ms,
              char *why, size_t wn);
+
+/* Step 3: give the helper one end of a socket to warden-proxy; it writes
+ * each value there, then clears its own copies. 0, or -1. */
+int ws_hand_to(ws_t *w, int fd);
 
 /* Close the control socket: the helper clears its values and exits. */
 void ws_stop(ws_t *w);

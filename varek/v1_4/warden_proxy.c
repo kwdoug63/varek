@@ -186,6 +186,52 @@ fail:
     return -1;
 }
 
+/* v1.28: placeholders and values (see warden_proxy.h). */
+int wp_creds(const wp_t *w, size_t n, char (*const ph)[WP_PH_MAX], int fd, int timeout_ms, char *why, size_t wn) {
+    if (w->ctl < 0) { snprintf(why, wn, "the proxy is not running"); return -1; }
+    for (size_t i = 0; i < n; i++) {
+        struct wp_ph m;
+        memset(&m, 0, sizeof m);
+        m.type = WP_MSG_PH;
+        m.index = (uint32_t)i;
+        snprintf(m.ph, sizeof m.ph, "%s", ph[i]);
+        if (send(w->ctl, &m, sizeof m, MSG_NOSIGNAL) != (ssize_t)sizeof m) {
+            snprintf(why, wn, "the proxy did not take a placeholder");
+            return -1;
+        }
+    }
+    struct wp_creds c = { .type = WP_MSG_CREDS, .n = (uint32_t)n };
+    union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
+    memset(&cb, 0, sizeof cb);
+    struct iovec v = { &c, sizeof c };
+    struct msghdr mh = { .msg_iov = &v, .msg_iovlen = 1, .msg_control = cb.b, .msg_controllen = sizeof cb.b };
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
+    cm->cmsg_level = SOL_SOCKET;
+    cm->cmsg_type = SCM_RIGHTS;
+    cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &fd, sizeof fd);
+    if (sendmsg(w->ctl, &mh, MSG_NOSIGNAL) != (ssize_t)sizeof c) {
+        snprintf(why, wn, "the proxy did not take the values' socket");
+        return -1;
+    }
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long left = timeout_ms - (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+        if (left <= 0) { snprintf(why, wn, "the proxy did not take the values in time"); return -1; }
+        struct pollfd pf = { .fd = w->ctl, .events = POLLIN };
+        if (poll(&pf, 1, (int)left) != 1) continue;
+        struct wp_creds r;
+        ssize_t k = recv(w->ctl, &r, sizeof r, MSG_DONTWAIT);
+        if (k == 0) { snprintf(why, wn, "the proxy ended"); return -1; }
+        if (k != (ssize_t)sizeof r || r.type != WP_MSG_CREDS_OK) continue;   /* nothing else is due now */
+        if (r.n != n) { snprintf(why, wn, "the proxy could not hold the values (its memory could not be locked, or a value was malformed)"); return -1; }
+        return 0;
+    }
+}
+
 /* v1.26.1: inspecting mode's setup (see warden_proxy.h). */
 int wp_inspect_setup(const wp_t *w, const char *run_id, const char *bundle, char *const *names,
                      size_t nnames, const char (*excl)[254], size_t nexcl, unsigned char **pem, size_t *pem_len, unsigned char **p12,

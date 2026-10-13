@@ -402,7 +402,7 @@ test-v1271: warden tools/vdp_check tools/vdp_cert_check
 	@./tests/test_v1271.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
 
 # v1.28 (docs/security/v1.28-credential-release.md): credential release
-test-v1280: warden warden-secrets tools/vdp_check tools/vdp_cert_check
+test-v1280: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check
 	@./tests/test_v1280.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
 
 # v1.26 step 5: the proxy's parsers, under ASan and UBSan: the vectors, then

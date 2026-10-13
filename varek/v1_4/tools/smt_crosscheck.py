@@ -652,6 +652,8 @@ def parse_lines(raw_lines, path):
                         raise PolicyError(f"{path}:{lineno}: max_body over 1 GiB")
                 if (cred is None) != (header is None):
                     raise PolicyError(f"{path}:{lineno}: credential= and header= go together")
+                if cred is not None and not toks[3].startswith("https://"):
+                    raise PolicyError(f"{path}:{lineno}: credential= on an http:// rule")
                 r = {"verb": verb, "kind": kind, "op": "glob", "c": const, "rx": grx, "gtoks": gtoks,
                      "mask": 0, "value": 0, "line": lineno, "portless": False, "name": False,
                      "wild": False, "max_body": max_body, "rhost": rhost, "rwild": rwild, "rport": rport,

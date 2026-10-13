@@ -904,10 +904,39 @@ int main(int argc, char **argv) {
             ctl_send(&y, sizeof y);
         }
     }
-    /* hold the values until the control socket closes (step 3: hand them to
-     * warden-proxy) */
-    char sink[64];
-    while (ctl_recv(sink, sizeof sink) > 0) { }
+    /* step 3: hand the values to warden-proxy, over the socket the Warden
+     * gives, then clear them here; wait until the control socket closes */
+    for (;;) {
+        struct ws_ready m;
+        union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
+        struct iovec v = { &m, sizeof m };
+        struct msghdr mh = { .msg_iov = &v, .msg_iovlen = 1, .msg_control = cb.b, .msg_controllen = sizeof cb.b };
+        ssize_t r = recvmsg(g_ctl, &mh, MSG_CMSG_CLOEXEC);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        int fd = -1;
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c))
+            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS && c->cmsg_len == CMSG_LEN(sizeof(int)))
+                memcpy(&fd, CMSG_DATA(c), sizeof fd);
+        if (r != (ssize_t)sizeof m || m.type != WS_MSG_PROXY || fd < 0 || failed) {
+            if (fd >= 0) close(fd);
+            continue;
+        }
+        static struct ws_value wv;
+        for (uint32_t i = 0; i < su.ncreds; i++) {
+            memset(&wv, 0, sizeof wv);
+            wv.type = WS_MSG_VALUE;
+            wv.index = i;
+            wv.len = (uint32_t)g_val[i].len;
+            memcpy(wv.value, g_arena + g_val[i].off, g_val[i].len);
+            ssize_t w;
+            while ((w = send(fd, &wv, sizeof wv, MSG_NOSIGNAL)) < 0 && errno == EINTR) { }
+            OPENSSL_cleanse(&wv, sizeof wv);
+            if (w != (ssize_t)sizeof wv) break;
+        }
+        close(fd);
+        arena_clear();                       /* handed: no copy stays here */
+    }
     arena_clear();
     return 0;
 }
