@@ -461,14 +461,23 @@ def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH, servers=()):
         L.append("")
         L.append(f"# --- MCP server {name}'s own rules: the system read-only, the working directory")
         L.append(f"# read-only; the agent's rules above do not apply to it ---")
-        for group in (TRUST_READS, CREDENTIAL_DENIES, SYSTEM_DENIES, SYSTEM_READS):
-            for r, c in group:
-                rr = f"{r} for={name}"
-                L.append(f"{rr:<52} # {c}" if c else rr)
-        L.append(f"allow path exact {cwd} readonly for={name}")
-        L.append(f"allow path {cwd}/ readonly for={name}")
+        L += server_rules(name, cwd)
     L.append("")
     return "\n".join(L)
+
+
+def server_rules(name, cwd):
+    """v1.31: an MCP server's own copy of the baseline's trust, credential,
+    system-deny and system-read rules (for=NAME), and the working directory
+    read-only (also `varek bench --for`)."""
+    L = []
+    for group in (TRUST_READS, CREDENTIAL_DENIES, SYSTEM_DENIES, SYSTEM_READS):
+        for r, c in group:
+            rr = f"{r} for={name}"
+            L.append(f"{rr:<52} # {c}" if c else rr)
+    L.append(f"allow path exact {cwd} readonly for={name}")
+    L.append(f"allow path {cwd}/ readonly for={name}")
+    return L
 
 
 def store(text):

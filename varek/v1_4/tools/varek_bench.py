@@ -30,6 +30,7 @@ import math
 import os
 import platform
 import pwd
+import re
 import shutil
 import subprocess
 import tempfile
@@ -59,6 +60,7 @@ EXPECT = {
 REFUSED = {"open_denied", "open_unknown", "connect_denied"}
 DIALED = {"connect_allowed", "request"}   # the Warden dials these; dial_us is reported
 EACCES = 13
+SERVER_NAME = "bench"                     # v1.31: the confined subject of `varek bench --for`
 RUN_TIMEOUT = 900                         # seconds, per run; a stuck run fails the bench
 
 # Read-only loader paths, added only when the workload is dynamically linked
@@ -187,23 +189,42 @@ def bench_rules(bench_dir, ports):
     ]
 
 
-def compose_policy(bench_dir, ports, base_text=None, dynamic=False):
+def compose_policy(bench_dir, ports, base_text=None, dynamic=False, subject=None):
     """The policy a bench run uses. With a base policy, its rules come first and
     the bench's rules last: rules are matched first to last, so each bench call
     is decided only after every rule of the base policy has been considered (the
     cost a real policy adds is in the numbers), and if a base rule matches a
     bench call first, the checks report the different verdict. A dynamically
-    linked workload also gets read-only loader rules, after the base policy's."""
+    linked workload also gets read-only loader rules, after the base policy's.
+
+    v1.31 (`varek bench --for`): with a subject, the agent launches a copy of
+    the workload that makes the calls: "agent", a copy no server line names
+    (it runs as the agent, under the rules without for=); "server", the copy
+    an `mcp server` line names (it runs confined, and the bench's rules are
+    written for=bench: its calls are decided against the for=bench rules
+    only, whatever the base gives the agent)."""
     lines = []
+    server = f"mcp server {SERVER_NAME} exec {bench_dir}/srv/server"
     if base_text is not None:
-        lines.append(base_text.rstrip("\n"))
+        text = base_text.rstrip("\n")
+        if subject:
+            # the server's line after the base's require line: before any
+            # for= rule (the base may have some) and any exec rule
+            text, k = re.subn(r"(?m)^(require warden \S+[ \t]*)$", lambda m: m.group(1) + "\n" + server,
+                              text, count=1)
+            if not k:
+                raise BenchError("a base policy for --for must say `require warden 1.31`")
+        lines.append(text)
         lines.append("")
         lines.append("# ---- varek bench: rules for the bench's own files and listeners ----")
     else:
         lines.append("# varek bench: the bench's own rules only")
-    if dynamic:
-        lines += LOADER_RULES
-    lines += bench_rules(bench_dir, ports)
+        if subject:
+            lines += ["require warden 1.31", server]
+    if subject:
+        lines.append(f"allow exec {bench_dir}/srv/agent")
+    own = (LOADER_RULES if dynamic else []) + bench_rules(bench_dir, ports)
+    lines += [f"{r} for={SERVER_NAME}" for r in own] if subject == "server" else own
     return "\n".join(lines) + "\n"
 
 
@@ -397,8 +418,11 @@ class _Server:
 
 
 def run(warden, workload, *, base_policy=None, base_label=None, n=2000, warmup=200, rounds=5,
-        run_as="nobody", sign_key=None, progress=None, keep=False):
-    """Run the bench. Returns the result dictionary (see the module docstring)."""
+        run_as="nobody", sign_key=None, progress=None, keep=False, subject=None):
+    """Run the bench. Returns the result dictionary (see the module docstring).
+    v1.31: subject "agent" or "server" (compose_policy) for `varek bench --for`."""
+    if subject not in (None, "agent", "server"):
+        raise BenchError(f"no bench subject {subject!r}")
     if not os.access(warden, os.X_OK):
         raise BenchError(f"no Warden at {warden}", fix="build the runtime: `make`")
     if not os.access(workload, os.X_OK):
@@ -418,7 +442,15 @@ def run(warden, workload, *, base_policy=None, base_label=None, n=2000, warmup=2
         priv = _private_dir()
         server = _Server(workload, uid, gid)
         ports = server.ports
-        policy_text = compose_policy(d, ports, base_text, dynamic)
+        launch = []
+        if subject:
+            # v1.31: two copies of the workload, root's, read-only to the agent
+            os.mkdir(os.path.join(d, "srv"), 0o755)
+            for c in ("agent", "server"):
+                shutil.copyfile(workload, os.path.join(d, "srv", c))
+                os.chmod(os.path.join(d, "srv", c), 0o755)
+            launch = [workload, "spawn", os.path.join(d, "srv", subject)]
+        policy_text = compose_policy(d, ports, base_text, dynamic, subject)
         policy = os.path.join(priv, "bench.policy.txt")
         with open(policy, "w") as fh:
             fh.write(policy_text)
@@ -454,7 +486,7 @@ def run(warden, workload, *, base_policy=None, base_label=None, n=2000, warmup=2
                 argv = [warden, policy]
                 if sign_key:
                     argv += ["--sign-key", sign_key]
-                argv += ["--run-as", run_as, "--"] + wl_args
+                argv += ["--run-as", run_as, "--"] + (launch + wl_args[1:] if launch else wl_args)
                 with open(log, "w") as err:
                     r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=err, text=True,
                                        timeout=RUN_TIMEOUT)
@@ -476,6 +508,18 @@ def run(warden, workload, *, base_policy=None, base_label=None, n=2000, warmup=2
                 all_by_kind, by_kind = records_by_kind(recs, d, ports, warmup)
                 checks += [(f"round {rnd + 1} Warden: {c}", ok, det)
                            for c, ok, det in check_warden(wl, all_by_kind, n + warmup)]
+                if subject:
+                    # v1.31: every call made, and decided, as the subject asked for
+                    mine = [x for v in all_by_kind.values() for x in v]
+                    if subject == "server":
+                        bad = [x for x in mine if not str((x.get("obo") or [""])[-1]).startswith(
+                            f"subagent:{SERVER_NAME}#") or (x.get("decision_final") == "ALLOW"
+                                                            and x.get("cert_subject") != 1)]
+                    else:
+                        bad = [x for x in mine if x.get("obo") != ["agent"] or x.get("cert_subject", 0) != 0]
+                    checks.append((f"round {rnd + 1} Warden: every call decided as the {subject}", not bad,
+                                   "" if not bad else f"{len(bad)} of {len(mine)} decided as "
+                                                      f"{bad[0].get('obo')} subject {bad[0].get('cert_subject', 0)}"))
                 reached = after["denied"] - before["denied"]
                 checks.append((f"round {rnd + 1} Warden: the denied listener was never reached",
                                reached == 0, "" if reached == 0 else f"{reached} connection(s) reached it"))
@@ -517,7 +561,7 @@ def run(warden, workload, *, base_policy=None, base_label=None, n=2000, warmup=2
                 "sha256": hashlib.sha256(policy_text.encode()).hexdigest(),
             },
             "settings": {"calls_per_kind_per_run": n, "warmup": warmup, "rounds": rounds,
-                         "run_as": run_as, "signing": bool(sign_key)},
+                         "run_as": run_as, "signing": bool(sign_key), "subject": subject},
             "kinds": kinds,
             "checks": [{"check": c, "ok": ok, "detail": det} for c, ok, det in checks],
             "ok": all(ok for _, ok, _ in checks),

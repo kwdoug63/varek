@@ -49,6 +49,12 @@
  *   bench_workload noop
  *       Exits 0 at once: the program the launches above run.
  *
+ *   bench_workload spawn <prog> <args>...             (v1.31, varek bench --for)
+ *       Forks; the child launches <prog> <args> (another copy of this program,
+ *       declared an MCP server or not), which writes to the same output; the
+ *       parent waits and exits with the child's status. So the calls of `run`
+ *       are made by a confined subject or by the agent, with the same launch.
+ *
  * Built static where the host has a static libc, so a run under the Warden
  * has no loader opens: the calls above are the only mediated ones. Sockets are
  * closed with SO_LINGER 0, so thousands of connections leave no TIME_WAIT
@@ -410,8 +416,26 @@ static int launch(int argc, char **argv) {
     return 0;
 }
 
+/* v1.31: launch argv[2..] in a child and exit with its status */
+static int spawn(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: bench_workload spawn <prog> <args>...\n"); return 2; }
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid < 0) { perror("bench_workload: fork"); return 1; }
+    if (pid == 0) {
+        execv(argv[2], argv + 2);
+        perror("bench_workload: execv");
+        _exit(127);
+    }
+    int st;
+    while (waitpid(pid, &st, 0) < 0)
+        if (errno != EINTR) { perror("bench_workload: waitpid"); return 1; }
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
+    if (argc >= 2 && !strcmp(argv[1], "spawn")) return spawn(argc, argv);    /* v1.31 */
     if (argc >= 2 && !strcmp(argv[1], "noop")) return 0;                   /* v1.27 */
     if (argc >= 2 && !strcmp(argv[1], "launch")) return launch(argc, argv);  /* v1.27 */
     if (argc >= 2 && !strcmp(argv[1], "serve")) return serve();
