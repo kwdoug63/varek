@@ -107,7 +107,7 @@ else
     printf 'allow path %s/a/\n' "$W" > "$W/p26.txt"; chmod 644 "$W/p26.txt"
     "$WARDEN" "$W/p26.txt" --check-startup > "$OUT/nx.out" 2>&1
     check "without the opt-in (require warden 1.26 or none): no list" sh -c "! grep -q noexec '$OUT/nx.out'"
-    check "the Warden reports 1.27.1" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | grep -q 'VAREK Warden  1.27.1'"
+    check "the Warden reports 1.27.1 or later" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | python3 -c 'import re,sys; m=re.search(r\"VAREK Warden  (\\d+)\\.(\\d+)\\.(\\d+)\", sys.stdin.read()); sys.exit(0 if m and tuple(map(int, m.groups())) >= (1, 27, 1) else 1)'"
 fi
 
 echo "== 2. the mounts =="
@@ -230,7 +230,7 @@ sys.exit(0 if eval(sys.argv[2]) else 1)
 PY
     }
     check "run_start records each directory mounted noexec, with its policy line" \
-        rs "$OUT/r.log" "r['noexec'] == [{'path': '$R/w', 'target': '$R/w', 'policy_line': 2}] and r['warden'] == '1.27.1'"
+        rs "$OUT/r.log" "r['noexec'] == [{'path': '$R/w', 'target': '$R/w', 'policy_line': 2}] and tuple(map(int, r['warden'].split('.'))) >= (1, 27, 1)"
     check "with --writable-exec, run_start records noexec null" rs "$OUT/rx.log" "r['noexec'] is None"
     # v1.27.1 review: a descriptor the agent would inherit, open for reading on a file there
     : > "$R/w/in"; chmod 644 "$R/w/in"

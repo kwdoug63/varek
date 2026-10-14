@@ -453,7 +453,7 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * so a policy that relies on launches fails closed there. */
 #define VDP_WARDEN_MAJOR 1
 #define VDP_WARDEN_MINOR 27
-#define VDP_WARDEN_PATCH 1      /* v1.27.1: the Warden's version; the grammar stays 1.27 */
+#define VDP_WARDEN_PATCH 2      /* v1.27.2: the Warden's version; the grammar stays 1.27 */
 
 /* v1.27: a note on exec rule i, for lint and the Warden's load-time notes,
  * in buf (empty: none); returns its length. An allow exec rule naming a shell

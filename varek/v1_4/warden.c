@@ -1972,6 +1972,12 @@ static void emit_pathology(uint64_t seq,
                            int kernel_errno)
 {
     if (!g_log) return;
+    /* v1.27.2: a checkpoint seals at most checkpoint_every decision records.
+     * It is written between notifications (maybe_checkpoint), but one pass
+     * over the proxy's reports (a burst of requests) can write several
+     * records; when this record would pass the bound, the checkpoint comes
+     * first, here. */
+    if (checkpoints_on() && g_since_ckpt >= g_ckpt_every) emit_checkpoint();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     char flags_json[40] = "";
