@@ -814,8 +814,8 @@ PY
         python3 -c "import sys,hashlib; L = open('$OUT/bl7.txt').read().splitlines(); m = [i for i, l in enumerate(L) if l.startswith('mcp server files exec $X/srv sha256=' + hashlib.sha256(open('$X/srv','rb').read()).hexdigest())]; e = [i for i, l in enumerate(L) if l.startswith('allow exec ')]; sys.exit(0 if m and e and m[0] < e[0] and 'require warden 1.31' in L else 1)"
     check "... with the server's own rules (for=files), the system and the working directory read-only" \
         sh -c "grep -q '^allow path /usr/ readonly for=files' '$OUT/bl7.txt' && grep -q '^allow path $PJ/ readonly for=files' '$OUT/bl7.txt' && grep -q '^deny  path contains /.ssh/ for=files' '$OUT/bl7.txt'"
-    check "... it lints, and the Warden would start it (the 512-rule cap)" \
-        sh -c "'$VDP' '$OUT/bl7.txt' lint > '$OUT/bl7.lint' && '$WARDEN' '$OUT/bl7.txt' --check-startup > /dev/null 2>&1"
+    check "... it lints, and the Warden would start it: over 256 rules (the cap is 512 from v1.31)" \
+        sh -c "grep -q '^mcp server files ' '$OUT/bl7.txt' && [ \$(grep -c '^\\(allow\\|deny\\|mcp\\) ' '$OUT/bl7.txt') -gt 256 ] && '$VDP' '$OUT/bl7.txt' lint > '$OUT/bl7.lint' && '$WARDEN' '$OUT/bl7.txt' --check-startup > /dev/null 2>&1"
     touch "$PJ/srv"; chmod 755 "$PJ/srv"
     check "... a server under the working directory (which the agent may write) is refused" \
         sh -c "cd '$PJ' && $(declare -f v7); V7='$V7'; ! v7 run --baseline --show-policy --mcp files='$PJ/srv' --run-as nobody -- /bin/true 2>&1 | grep -q '^mcp server' && cd '$PJ' && v7 run --baseline --show-policy --mcp files='$PJ/srv' --run-as nobody -- /bin/true 2>&1 | grep -q 'which the agent may write'"

@@ -3396,7 +3396,7 @@ def main(argv=None):
     if others and not problems:
         k = subprocess.run([a.checker, a.policy, "kinds"], capture_output=True, text=True)
         kinds = k.stdout.strip() if k.returncode == 0 else ""
-        strs = [c for _, _, oc in others for c in oc]
+        strs = [c for _, _, oc, *_ in others for c in oc]
         if not kinds:
             problems.append(f"checker failed: {k.stderr.strip()}")
         elif strs:
