@@ -495,7 +495,11 @@ PY
     VK="$HERE/tools/varek"
     check "the Warden names how to revoke the run, and its control socket is root's alone" \
         sh -c "[ -n '$RUN' ] && [ \"\$(stat -c '%u %a' /run/varek/$RUN.ctl)\" = '0 600' ] && [ \"\$(stat -c '%u %a' /run/varek)\" = '0 700' ]"
-    setpriv --reuid 65534 --regid 65534 --clear-groups python3 "$VK" revoke "$RUN" > "$OUT/rv0.out" 2>&1; echo $? > "$OUT/rv0.rc"
+    # nobody runs a copy of the tools: the checkout may be where nobody cannot
+    # reach (under /root, 0700)
+    VKN="$(mktemp -d /tmp/varek_v1280vk.XXXXXX)"; cp -r "$HERE/tools/." "$VKN/"; chmod -R a+rX "$VKN"
+    setpriv --reuid 65534 --regid 65534 --clear-groups python3 "$VKN/varek" revoke "$RUN" > "$OUT/rv0.out" 2>&1; echo $? > "$OUT/rv0.rc"
+    rm -r "$VKN"
     check "refused: varek revoke by a user who is not root" sh -c "grep -q 'needs root' '$OUT/rv0.out' && ! grep -qx 0 '$OUT/rv0.rc'"
     check "refused: a connection to the control socket by a user who is not root (the kernel)" \
         setpriv --reuid 65534 --regid 65534 --clear-groups python3 -c "
