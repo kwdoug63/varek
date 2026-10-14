@@ -1,0 +1,57 @@
+# v1.31.0 latency (tests/latency_v1310.sh, N=2000, NM=100, K=20, R=5), 2026-10-14T02:45:20Z
+
+## 1. a confined MCP server's decisions against the agent's: varek bench --for
+varek bench --for (1.3.0), Warden 1.31.0, 2026-10-14T02:46:15Z
+host: Intel(R) Xeon(R) Processor @ 2.80GHz, 4 CPU(s), 16093 MiB, kernel 6.18.44-fc-v114
+2000 calls of each kind a run, 200 warm-up, 5 round(s) of each, alternated; medians of the rounds' p50s, in microseconds
+
+the Warden's own time per decision (p50, us), by who makes the calls:
+calls made by          rules   open ok open deny open none   conn ok conn deny   request
+agent                    210       126        46        43       180        33       180
+server                     5       103        38        37       174        31       173
+server + own              72       130        46        44       186        34       182
+
+agent: the calls are the agent's, after the baseline's rules. server: the agent launches an MCP server (mcp server bench), which makes them; its rules are the bench's only (for=bench). server + own: it also has its own copy of the baseline, as varek run --mcp writes it. rules: the rules each call is decided against (the subject's own, the bench's included).
+checks: every run's outcomes as expected, each call decided as its subject
+
+## 2. MCP calls over HTTP, 1 KiB to 1 MiB: varek bench --mcp
+VAREK bench --mcp: what deciding an MCP call over HTTP costs on this host
+
+  Warden    1.31.0  (sha256 8af2d478c39f; warden-proxy b1487dbb2ba4)   varek command 1.3.0
+  Host      Linux 6.18.44-fc-v114 x86_64, 4 CPU, Intel(R) Xeon(R) Processor @ 2.80GHz, 16093 MiB
+  Date      2026-10-14T02:46:49Z
+  Server    a stand-in MCP server, HTTPS on this host's own address 192.0.2.2
+  Runs      5 each natively, under a request rule and as MCP calls, alternating; 100 timed calls of each size per run, after 10 warm-up,
+            each size on one kept-alive connection
+
+  Microseconds per tools/call, as the client measured it (p50 / p99), the p50 the proxy adds,
+  and what holding and parsing the body adds (MCP rule minus request rule):
+
+  body            native    request rule    added        MCP rule    added       held
+  1 KiB       127    485      491   1003     +364      484   1092     +357       -6.9
+  16 KiB      176    658      632   1280     +456      806   1188     +631       +174
+  256 KiB     581   1282     2246   4423    +1665     4562   7837    +3981      +2316
+  1 MiB      2110   4229     8100  14164    +5990    17718  32792   +15608      +9618
+
+  The Warden's own time per decision, from its records (p50 / p99 us):
+    body        a request decided    an MCP call decided
+    1 KiB           4.0        14          8.0        40
+    16 KiB          4.0       8.0           10        50
+    256 KiB         9.0        38           26        70
+    1 MiB            13        48           29        74
+
+  Verdicts  all 50 checks passed: every call was answered with its own id,
+            each decided and certified (as an MCP call with its body's length and SHA-256
+            under the MCP rule), and the audit accepted every stream.
+
+  Notes
+  - Under a request rule the proxy decides the request on its head and streams the body;
+    under an MCP rule it holds the body until it has read and parsed all of it, then
+    decides the call and sends it, so the held column grows with the body.
+  - 1 MiB is the default max_body of an MCP rule; a larger call needs max_body= on its rule.
+  - The server is on this host: a real server's network time is not in these numbers.
+
+## 3. startup: warden POLICY -- /usr/bin/true, wall time (each server's file hashed and checked at start)
+the baseline (205 rules):                   p50 167.7 ms, p90 209.8 ms (20 runs)
+the baseline + 1 MCP server (272 rules):    p50 251.7 ms, p90 291.9 ms (20 runs)
+the baseline + 4 MCP servers (473 rules):   p50 416.2 ms, p90 471.1 ms (20 runs)
