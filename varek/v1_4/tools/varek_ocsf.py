@@ -54,8 +54,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -211,6 +213,8 @@ class Exporter:
         ev["disposition_id"], ev["disposition"] = (1, "Allowed") if allowed else \
             ((15, "Detected") if dry else (2, "Blocked"))
         kv = rec.get("kernel_verdict")
+        if dry and rec.get("errno") == 0:
+            kv = "ALLOW"                   # review: a dry run let it through; the call was carried out
         ev["status_id"], ev["status"] = (1, "Success") if kv == "ALLOW" else (2, "Failure")
         if kv != "ALLOW":
             ev["status_detail"] = str(kv)
@@ -322,6 +326,8 @@ class Exporter:
             self.last_ts = rec["timestamp_ns"]
         ev_name = rec.get("event")
         out_ev, wait = None, None
+        if "decision_final" in rec:
+            ev_name = None                 # review: a decision is one, whatever else the record says
         if ev_name == "run_start":
             self.rs = rec
             boot = [e for e in rec.get("exec_ruleset", []) if isinstance(e, dict) and e.get("why") == "bootstrap"]
@@ -345,7 +351,7 @@ class Exporter:
             out_ev["query"] = {"hostname": str(rec.get("name") or ""), "type": DNS_TYPES.get(t, str(t))}
             out_ev["dst_endpoint"] = _endpoint("127.53.53.53:53")
             out_ev["src_endpoint"] = {"name": self.device["name"]}
-            ok = rec.get("rule") == "policy_match"
+            ok = rec.get("rule") in ("policy_match", "exact_name")     # review: an exact rule's name answered
             dry = rec.get("enforced") is False
             out_ev["action_id"], out_ev["action"] = (1, "Allowed") if ok else (2, "Denied")
             out_ev["disposition_id"], out_ev["disposition"] = (1, "Allowed") if ok else \
@@ -434,6 +440,18 @@ def dumps(ev):
     return json.dumps(ev, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
+def private_copy(path):
+    """review: the stream read once, into a file of the exporter's own, so the
+    audit and the export read the same bytes (a stream still being written,
+    or a file replaced between two reads, is not exported unaudited).
+    Returns (path of the copy, its directory)."""
+    d = tempfile.mkdtemp(prefix="varek-ocsf-")
+    cp = os.path.join(d, "stream.log")
+    with open(path, "rb") as src, open(cp, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    return cp, d
+
+
 def run_records(path, allow_incomplete):
     """The run's records in stream order, the stream checked (chain, seq,
     run id) by the CycloneDX exporter's parser first"""
@@ -473,11 +491,19 @@ def check_policy(exporter, rs):
 
 
 def cmd_batch(args):
-    ok, problems, text, dry = audit(args, args.log)
+    log, d = private_copy(args.log)
+    try:
+        return _batch(args, log)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _batch(args, log):
+    ok, problems, text, dry = audit(args, log)
     if not ok:
         sys.stderr.write(text)
         raise ExportError("the audit refuses this stream; no events are written")
-    recs, _ = run_records(args.log, args.allow_incomplete)
+    recs, _ = run_records(log, args.allow_incomplete)
     ex = Exporter(args.policy, args.device)
     events = []
     for r in recs:
@@ -517,7 +543,7 @@ def cmd_follow(args):
         while not ended:
             chunk = fh.readline()
             if not chunk:
-                if time.monotonic() - last > args.idle:
+                if args.idle and time.monotonic() - last > args.idle:
                     problems.append(f"the stream stopped growing for {args.idle:g} s with no run_end "
                                     f"(the run ended early, or the Warden was killed)")
                     break
@@ -531,7 +557,10 @@ def cmd_follow(args):
             last = time.monotonic()
             if not raw.startswith("{"):
                 continue
-            rec = json.loads(raw)
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                fail(lineno, "a line that is not JSON")
             if not isinstance(rec, dict):
                 fail(lineno, "a record that is not a JSON object")
             if run is None:
@@ -546,13 +575,22 @@ def cmd_follow(args):
                 if rec.get("seq") != ndec:
                     fail(lineno, f"seq {rec.get('seq')} where {ndec} was expected")
                 ndec += 1
-            for ev in ex.feed(rec):
+            try:
+                evs = ex.feed(rec)
+            except (KeyError, TypeError, ValueError, AttributeError, IndexError) as e:
+                fail(lineno, f"a record the exporter cannot read ({type(e).__name__}: {e})")
+            if rec.get("event") == "run_start" and "decision_final" not in rec:
+                check_policy(ex, rec)           # review: before its event is written
+            for ev in evs:
                 out.write(dumps(ev) + "\n")
             out.flush()
-            if rec.get("event") == "run_start":
-                check_policy(ex, rec)
             if rec.get("event") == "run_end":
                 ended = True
+    except ExportError as e:
+        # review: whatever stops the follow, the last event says so
+        if ex is None:
+            raise
+        problems.append(str(e))
     finally:
         fh.close()
     if ex is None:
@@ -571,6 +609,14 @@ def cmd_follow(args):
 
 
 def cmd_verify(args):
+    log, d = private_copy(args.log)
+    try:
+        return _verify(args, log)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _verify(args, log):
     evs = []
     for i, line in enumerate(open(args.verify, encoding="utf-8"), 1):
         if line.strip():
@@ -581,7 +627,13 @@ def cmd_verify(args):
     if not evs:
         raise ExportError(f"{args.verify}: no events")
     device = ((evs[0].get("device") or {}).get("name")) or ""
-    recs, _ = run_records(args.log, args.allow_incomplete)
+    # review: the stream itself is audited (signatures, certificates, every
+    # check), not only its chain, which anyone can recompute
+    ok, _, text, dry = audit(args, log)
+    if not ok:
+        sys.stderr.write(text)
+        raise ExportError("the audit refuses the stream: its events cannot be the evidence of a run")
+    recs, _ = run_records(log, args.allow_incomplete)
     ex = Exporter(args.policy, device)
     want = []
     for r in recs:
@@ -590,10 +642,16 @@ def cmd_verify(args):
             check_policy(ex, r)
     want += ex.finish()
     last = evs[-1]
-    if (last.get("unmapped") or {}).get("varek", {}).get("event") != "audit":
+    v = (last.get("unmapped") or {}).get("varek", {}) if isinstance(last.get("unmapped"), dict) else {}
+    if not isinstance(v, dict) or v.get("event") != "audit" or not isinstance(v.get("audit"), dict):
         raise ExportError("the last event is not the audit's verdict (events were cut off, or added)")
-    if last["unmapped"]["varek"]["audit"].get("passed") is not True:
+    if v["audit"].get("passed") is not True:
         raise ExportError("the audit's verdict in the events is that the stream did not pass")
+    # review: the verdict event is compared too, as the exporter writes it
+    mode = v["audit"].get("mode")
+    if mode not in ("batch", "follow") or last != audit_event(ex, True, mode, [], dry):
+        raise ExportError("the audit's verdict event is not the one the exporter writes for this stream "
+                          "(it was edited)")
     got = evs[:-1]
     for i, (g, w) in enumerate(zip(got, want), 1):
         if g != w:
@@ -619,17 +677,18 @@ def main(argv=None):
     ap.add_argument("--anchor")
     ap.add_argument("--allow-incomplete", action="store_true")
     ap.add_argument("--device", default=os.uname().nodename, help="the host's name in each event's device")
-    ap.add_argument("--idle", type=float, default=30.0, help="--follow: seconds without a new record before "
-                                                             "the run is taken to have ended early")
+    ap.add_argument("--idle", type=float, default=0.0, help="--follow: seconds without a new record before "
+                                                            "the run is taken to have ended early (default 0: "
+                                                            "wait for run_end; an agent may be quiet for long)")
     ap.add_argument("--output", "-o")
     args = ap.parse_args(argv)
     try:
+        if not args.checker:
+            ap.error("exporting and --verify need --checker (the stream is audited)")
         if args.verify:
             if not args.log:
                 ap.error("--verify needs --log")
             return cmd_verify(args)
-        if not args.checker:
-            ap.error("exporting needs --checker (the stream is audited first)")
         if args.follow:
             return cmd_follow(args)
         if not args.log:

@@ -1533,12 +1533,25 @@ def check_server_files(path):
             out.append((False, f"{what}: owned by uid {st.st_uid}, mode {stat.S_IMODE(st.st_mode):o}: anyone but "
                                f"root who can write it can replace the server"))
             continue
-        d, weak = os.path.dirname(os.path.realpath(f)), None
-        while d and weak is None:
-            ds = os.stat(d)
+        # v1.31 review: the directories of the path as written (a symlink's own
+        # directory) and of the file it reaches, each as it is (lstat)
+        dirs, weak = [], None
+        for start in (os.path.dirname(os.path.abspath(f)), os.path.dirname(os.path.realpath(f))):
+            d = start
+            while d and d not in dirs:
+                dirs.append(d)
+                d = "" if d == "/" else os.path.dirname(d)
+        for d in dirs:
+            try:
+                ds = os.lstat(d)
+            except OSError:
+                weak = d
+                break
+            if stat.S_ISLNK(ds.st_mode):
+                ds = os.stat(d)            # a link to a directory: the directory it names (its own is above)
             if ds.st_mode & 0o022 and not ds.st_mode & stat.S_ISVTX or ds.st_uid not in (0,):
                 weak = d
-            d = "" if d == "/" else os.path.dirname(d)
+                break
         if weak:
             out.append((False, f"{what}: {weak} is writable by others or not root's: the file can be replaced"))
             continue
@@ -1606,7 +1619,18 @@ def cmd_refusals(args):
             info(f"This run was not on behalf of {args.user}" +
                  (f" (it was on behalf of {s['user'].get('subject')})." if s["user"] else " (no user)."))
             return 0
-        if args.subagent is not None:
+        if args.subagent is not None and getattr(args, "for_", None) and policy:
+            # v1.31 review: --for NAME: the refusals decided as that confined
+            # subject (the innermost one in each chain), as suggest --for
+            conf = varek_suggest.confined_subjects(tool("vdp_check"), policy)
+            want = conf.get(args.for_)
+            if want is None:
+                raise CliError(f"{args.for_} is not a confined subject of the policy this run used",
+                               fix="`varek policy show` lists its MCP servers and confined sub-agents")
+            s["refusals"] = [r for r in s["refusals"] if varek_suggest.subject_of(r, conf) == want]
+            s["refused"] = len(s["refusals"])
+            ends, s["cred_refused"] = [], []
+        elif args.subagent is not None:
             s["refusals"] = [r for r in s["refusals"] if isinstance(r.get("obo"), list) and
                              any(isinstance(x, str) and x.startswith(f"subagent:{args.subagent}#") for x in r["obo"])]
             s["refused"] = len(s["refusals"])
@@ -1833,19 +1857,23 @@ def cmd_export_ocsf(args):
     if not policy:
         raise CliError("the policy file this run used is not on this host",
                        fix="restore it, or give it with --policy; the events name the policy the run used")
-    argv = [sys.executable, tool("varek_ocsf.py"), "--policy", policy]
+    argv = [sys.executable, tool("varek_ocsf.py"), "--policy", policy, "--checker", tool("vdp_cert_check")]
+    # review: the key given, else the configured one; the stream is audited
+    # with it for --verify too
+    pub = args.pubkey or _pubkey(cfg)
+    if pub:
+        argv += ["--pubkey", pub]
+    if cfg["anchor"] and os.path.isfile(cfg["anchor"]):
+        argv += ["--anchor", cfg["anchor"]]
     if args.verify:
         argv += ["--verify", args.verify, "--log", log]
     else:
-        argv += ["--checker", tool("vdp_cert_check")]
         argv += ["--follow", log] if args.follow else ["--log", log]
         out = args.output or (None if args.follow else re.sub(r"\.log$", "", log) + ".ocsf.jsonl")
         if out:
             argv += ["--output", out]
-        if _pubkey(cfg):
-            argv += ["--pubkey", _pubkey(cfg)]
-        if cfg["anchor"] and os.path.isfile(cfg["anchor"]):
-            argv += ["--anchor", cfg["anchor"]]
+        if args.follow and args.idle:
+            argv += ["--idle", str(args.idle)]
     if args.allow_incomplete:
         argv.append("--allow-incomplete")
     rc = run_cmd(argv, check=False).returncode
@@ -2594,6 +2622,9 @@ def build_parser():
     sp.add_argument("--follow", metavar="STREAM", help="ocsf: tail a live run's stream, writing each event "
                     "as its record is chained (to stdout, or -o)")
     sp.add_argument("--policy", help="ocsf: the policy file the run used (default: found from the log)")
+    sp.add_argument("--idle", type=float, default=0, metavar="SECONDS",
+                    help="ocsf --follow: end, with a failed verdict, after this long with no new record "
+                         "(default: wait for the run's end)")
     sp.add_argument("-o", "--output", help="output file (default: next to the log, .cdx.json or .ocsf.jsonl)")
     sp.add_argument("--agent", default="agent", help="name of the agent, for the evidence")
     sp.add_argument("--no-sign", action="store_true", help="do not sign the evidence")

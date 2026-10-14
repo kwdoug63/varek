@@ -231,6 +231,10 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             if meta is not None:
                 meta["run_start"] = rec      # v1.15: policy_sha256, for the audit
             continue
+        if "decision_final" in rec and event is not None:
+            # v1.31 review: a decision record carries no event (the exporters
+            # would read it as the event it names)
+            fail(lineno, f"a decision record that also says it is a {event!r} event.")
         if "decision_final" not in rec and event != "run_end":
             # e.g. a pre-launch plan record; carries no authorization. v1.18.0:
             # this run's plan_gate record (chained above) goes to the attestation.

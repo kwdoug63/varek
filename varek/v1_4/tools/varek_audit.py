@@ -1133,7 +1133,13 @@ def check_subjects(records, confined, forl, problems):
     attribution), the rule's the policy's, as the checker reads it."""
     for rec in records:
         line = rec.get("policy_line")
-        if not isinstance(line, int) or line <= 0 or "decision_final" not in rec:
+        if "decision_final" not in rec:
+            continue
+        if type(line) is not int:
+            # v1.31 review: a line given as a string or a float would pass the check below unseen
+            problems.append(f"seq {rec.get('seq')}: a decision whose policy_line {line!r} is not an integer")
+            continue
+        if line <= 0:
             continue
         ks = expected_subject(rec.get("obo"), confined)
         kr = forl.get(line, 0)
@@ -1144,7 +1150,10 @@ def check_subjects(records, confined, forl, problems):
 
 
 # v1.31 (section 6): a JWT in compact form, as an MCP or user token is
-JWT_RX = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*")
+# (v1.31 review: its JSON may start "{ ", "{\n", "{\r" or "{\t", and a JWE has five parts)
+_B64_OBJ = r"(?:eyJ|eyA|ewo|ew0|ewk)[A-Za-z0-9_-]{6,}"
+JWT_RX = re.compile(_B64_OBJ + r"\." + _B64_OBJ + r"\.[A-Za-z0-9_-]*|" +
+                    _B64_OBJ + r"\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
 # fields that hold what the agent sent (its paths, requests, MCP calls and
 # names), where a token the agent itself chose to send is its own business
 AGENT_FIELDS = ("target", "resolved", "mcp_name", "mcp_url", "rpc_id", "traceparent", "mcp_error", "name",
@@ -1180,8 +1189,11 @@ def check_token_values(path, run, problems):
                 continue
             if not isinstance(rec, dict) or rec.get("run") != run:
                 continue
+            # v1.31 review: only a decision (or a DNS question) echoes what the
+            # agent sent; the Warden's other records are its own words
+            echo = "decision_final" in rec or rec.get("event") == "dns_question"
             for k, x in rec.items():
-                walk(x, k, True, f"line {i}")
+                walk(x, k, echo, f"line {i}")
 JWT_ALGS = ("RS256", "PS256", "ES256", "EdDSA")
 
 
@@ -1538,7 +1550,7 @@ def check_credentials(creds, cred_rules, meta, records, complete, problems, note
                                 f"on {'a call to ' + str(rec.get('mcp_url')) if rec.get('action') == 'net.mcp' else 'a request'}")
                 continue
             # v1.31: an MCP token is not released past its expiry
-            ex = next((e.get("expires") for e in (rs.get("credentials") or []) if isinstance(e, dict)
+            ex = next((e.get("expires") for e in (rs.get("credentials") if isinstance(rs.get("credentials"), list) else []) if isinstance(e, dict)
                        and e.get("name") == rec.get("credential") and "audience" in e), None)
             if type(ex) is int and type(rec.get("timestamp_ns")) is int and rec["timestamp_ns"] >= (ex + 1) * 1000000000:
                 problems.append(f"seq {rec.get('seq')}: MCP token {rec.get('credential')} released after its expiry")
@@ -1862,6 +1874,9 @@ def check_mcp_call(rec, rules, st, conn, problems):
     of MCP_REFUSE_RULES, and the connection takes no more requests."""
     seq, (_, hp, scheme) = rec.get("seq"), conn
     url, tg, rs = rec.get("mcp_url"), rec.get("target"), rec.get("resolved")
+    if not isinstance(rec.get("rule"), str):                      # v1.31 review: no crash on a malformed rule
+        problems.append(f"seq {seq}: an MCP call whose rule {rec.get('rule')!r} is not a name")
+        return
     if not isinstance(url, str) or not re.fullmatch(re.escape(f"{scheme}://{hp}") + r"/[\x21-\x7e]*", url) or \
             "?" in url or target_problem(url[len(f"{scheme}://{hp}"):]) or mcp_endpoint(rules, url) is None:
         problems.append(f"seq {seq}: an MCP call to {url!r}, which is not an MCP endpoint of connection "
@@ -1871,17 +1886,30 @@ def check_mcp_call(rec, rules, st, conn, problems):
             not isinstance(rs, str) or (rs and rs != tg):
         problems.append(f"seq {seq}: an MCP call whose object {tg!r} (decided as {rs!r}) is not one of {url}")
         return
+    # v1.31 review: only a call that could not be read, or one over the
+    # endpoint's own limit before any rule, is recorded with no object decided
+    if not rs and not (rec["rule"] in ("mcp_unreadable", "mcp_header_mismatch") or
+                       (rec["rule"] == "max_body" and rec.get("policy_line") == -1)):
+        problems.append(f"seq {seq}: an MCP call refused as {rec['rule']!r} with no object decided")
+        return
     bl, bh = rec.get("body_len"), rec.get("body_sha256")
     if type(bl) is not int or bl < 0 or not (isinstance(bh, str) and HEX64.fullmatch(bh)):
         problems.append(f"seq {seq}: an MCP call without its body's length and SHA-256")
         return
     tk = rec.get("token")
     if (tk is not None and tk not in MCP_TOKEN_KINDS) or \
-            (rec.get("rule", "").startswith("mcp_token_") and tk not in ("jwt", "opaque", "malformed")) or \
+            (rec["rule"].startswith("mcp_token_") and tk not in ("jwt", "opaque", "malformed")) or \
             (rec.get("rule") == "mcp_token_malformed") != (tk == "malformed") or \
             (rec.get("rule") in ("mcp_token_audience", "mcp_token_expired") and tk != "jwt"):
         problems.append(f"seq {seq}: an MCP call whose bearer token ({tk!r}) is not one its rule "
                         f"{rec.get('rule')!r} is written for")
+        return
+    # v1.31 review: the agent's own JWT's expiry, against the decision
+    te, ts = rec.get("token_expires"), rec.get("timestamp_ns")
+    if tk == "jwt" and type(te) is int and type(ts) is int and (
+            (rec["rule"] != "mcp_token_expired" and rec.get("decision_final") == "ALLOW" and te * 10**9 + 10**9 <= ts)
+            or (rec["rule"] == "mcp_token_expired" and te * 10**9 > ts + 10**9)):
+        problems.append(f"seq {seq}: an MCP call {'allowed with a bearer token that had expired' if rec['rule'] != 'mcp_token_expired' else 'refused as expired with a token that had not'}")
         return
     dfin, rule = rec.get("decision_final"), rec.get("rule")
     if dfin == "ALLOW" and rule == "mcp_allowed":
@@ -3047,6 +3075,7 @@ def main(argv=None):
         problems.append(f"the policy file hashes to {digest}, the Warden ran with {recorded}")
 
     lines, which = [], []
+    cited = []                             # v1.31 review: reported after the certificates are re-checked
     confined, for_lines = None, {}        # v1.31: read when a certificate is first checked
     authorized = refused = lookups = connects = views = stubs = 0
     resolutions = meta.get("resolutions", [])
@@ -3330,6 +3359,12 @@ def main(argv=None):
             problems.append(f"seq {rec.get('seq')}: authorized open of {rec.get('resolved')!r} "
                             f"without an accepted certificate")
             continue
+        if prules and (type(cr) is not int or not 0 <= cr < len(prules) or
+                       rec.get("policy_line") != prules[cr]["line"]):
+            # v1.31 review: the line a decision cites is its certificate's rule's
+            cited.append(f"seq {rec.get('seq')}: a decision citing policy line {rec.get('policy_line')!r}, "
+                            f"but its certificate's rule is "
+                            f"{'line ' + str(prules[cr]['line']) if type(cr) is int and 0 <= cr < len(prules) else repr(cr)}")
         s = rec.get("resolved", "")
         fl = rec.get("open_flags")
         if not isinstance(s, str):
@@ -3426,6 +3461,7 @@ def main(argv=None):
 
     # v1.24: no earlier host rule holds on any other candidate of a connect
     # decided with names (the checker's own parse and matchers).
+    problems += cited
     if others and not problems:
         k = subprocess.run([a.checker, a.policy, "kinds"], capture_output=True, text=True)
         kinds = k.stdout.strip() if k.returncode == 0 else ""

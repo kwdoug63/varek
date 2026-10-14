@@ -488,8 +488,10 @@ def run(warden, workload, *, base_policy=None, base_label=None, n=2000, warmup=2
                     argv += ["--sign-key", sign_key]
                 argv += ["--run-as", run_as, "--"] + (launch + wl_args[1:] if launch else wl_args)
                 with open(log, "w") as err:
+                    # a clean environment, as varek run gives an agent (v1.31: a
+                    # confined server's may name no code, and the caller's may)
                     r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=err, text=True,
-                                       timeout=RUN_TIMEOUT)
+                                       timeout=RUN_TIMEOUT, env={"PATH": "/usr/bin:/bin"})
                 after = server.accepts()
                 with open(log, encoding="utf-8", errors="replace") as fh:
                     log_text = fh.read()

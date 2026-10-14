@@ -697,7 +697,7 @@ sys.exit(0 if ids == want else 1)"
             sh -c "python3 '$OV' '$OUT/f2.ev' > /dev/null && $(declare -f ev); ev '$OUT/f2.ev' \"any(e.get('ai_agent', {}).get('type') == 'mcp_server' and e['ai_agent']['name'] == 'files' for e in E) and any(e.get('ai_agent', {}).get('name') == 'sagent' and e['ai_agent']['type'] == 'Other' for e in E)\""
     fi
     # the link back, checked
-    check "--verify: the events are the stream's" python3 "$OX" --verify "$OUT/m.ev" --log "$OUT/m.log" --policy "$POL"
+    check "--verify: the events are the stream's" python3 "$OX" --verify "$OUT/m.ev" --log "$OUT/m.log" --policy "$POL" --checker "$CERT"
     python3 - "$OUT/m.ev" "$OUT" <<'PY'
 import json, sys
 L = open(sys.argv[1]).read().splitlines()
@@ -709,11 +709,24 @@ open(d + "/m_swap.ev", "w").write("\n".join(L[:20] + [L[21], L[20]] + L[22:]) + 
 open(d + "/m_cut.ev", "w").write("\n".join(L[:-1]) + "\n")
 PY
     for f in edit drop swap cut; do
-        check "--verify finds an event $f (events: ${f}ed)" sh -c "! python3 '$OX' --verify '$OUT/m_$f.ev' --log '$OUT/m.log' --policy '$POL' > '$OUT/v_$f.out' 2>&1"
+        check "--verify finds an event $f (events: ${f}ed)" sh -c "! python3 '$OX' --verify '$OUT/m_$f.ev' --log '$OUT/m.log' --policy '$POL' --checker '$CERT' > '$OUT/v_$f.out' 2>&1"
     done
     sed '0,/"action":"net.mcp"/s/"rule":"mcp_allowed"/"rule":"mcp_allowed "/' "$OUT/m.log" > "$OUT/m_broken.log"
+    # review: a forged stream, followed (a failed verdict), its verdict then edited to passed
+    python3 "$HERE/tests/v1270_forge.py" "$OUT/m.log" "$OUT/x1.log" "g = next(r for r in recs if isinstance(r, dict) and r.get('action') == 'net.mcp' and r.get('rule') == 'policy_match'); g.update(decision_raw='ALLOW', decision_final='ALLOW', rule='mcp_allowed')"
+    python3 "$OX" --policy "$POL" --checker "$CERT" --follow "$OUT/x1.log" > "$OUT/x1.ev" 2> /dev/null
+    python3 -c 'import json,sys
+L = open(sys.argv[1]).read().splitlines(); e = json.loads(L[-1]); e["unmapped"]["varek"]["audit"].update(passed=True, problems=[]); e.pop("severity_id"); e.pop("severity")
+open(sys.argv[2], "w").write("\n".join(L[:-1] + [json.dumps(e, separators=(",", ":"))]) + "\n")' "$OUT/x1.ev" "$OUT/x1f.ev"
+    check "--verify audits the stream: a forged one's events, the verdict edited to passed, are refused (review)" \
+        sh -c "grep -q '\"passed\":false' '$OUT/x1.ev' && ! python3 '$OX' --verify '$OUT/x1f.ev' --log '$OUT/x1.log' --policy '$POL' --checker '$CERT' > '$OUT/x1v.out' 2>&1 && grep -q 'the audit refuses the stream' '$OUT/x1v.out'"
+    python3 -c 'import json,sys
+L = open(sys.argv[1]).read().splitlines(); e = json.loads(L[-1]); e["unmapped"]["varek"]["audit"]["not_enforced"] = True
+open(sys.argv[2], "w").write("\n".join(L[:-1] + [json.dumps(e, separators=(",", ":"))]) + "\n")' "$OUT/m.ev" "$OUT/m_verdict.ev"
+    check "--verify compares the verdict event too: an edited one is refused (review)" \
+        sh -c "! python3 '$OX' --verify '$OUT/m_verdict.ev' --log '$OUT/m.log' --policy '$POL' --checker '$CERT' > '$OUT/mv.out' 2>&1 && grep -q 'verdict event is not the one' '$OUT/mv.out'"
     check "a stream edited after the fact: not exported, and --verify refuses it (its chain)" \
-        sh -c "! python3 '$OX' --policy '$POL' --checker '$CERT' --log '$OUT/m_broken.log' -o '$OUT/b.ev' > /dev/null 2>&1 && [ ! -s '$OUT/b.ev' ] && ! python3 '$OX' --verify '$OUT/m.ev' --log '$OUT/m_broken.log' --policy '$POL' > /dev/null 2>&1"
+        sh -c "! python3 '$OX' --policy '$POL' --checker '$CERT' --log '$OUT/m_broken.log' -o '$OUT/b.ev' > /dev/null 2>&1 && [ ! -s '$OUT/b.ev' ] && ! python3 '$OX' --verify '$OUT/m.ev' --log '$OUT/m_broken.log' --policy '$POL' --checker '$CERT' > /dev/null 2>&1"
     python3 "$HERE/tests/v1270_forge.py" "$OUT/m.log" "$OUT/m_forged.log" "g = next(r for r in recs if isinstance(r, dict) and r.get('action') == 'net.mcp' and r.get('rule') == 'policy_match'); g['decision_final'] = 'ALLOW'; g['rule'] = 'mcp_allowed'"
     check "a stream the audit refuses (rechained, so its chain holds) is not exported" \
         sh -c "! python3 '$OX' --policy '$POL' --checker '$CERT' --log '$OUT/m_forged.log' -o '$OUT/fg.ev' > '$OUT/fg.out' 2>&1 && grep -q 'the audit refuses this stream' '$OUT/fg.out' && [ ! -s '$OUT/fg.ev' ]"
@@ -777,6 +790,29 @@ else
     fi
     python3 "$F7" "$OUT/own.out" "$OUT/h5.log" "next(r for r in recs if isinstance(r, dict) and r.get('event') == 'run_start')['note'] = 'eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl'"
     refuses7 "a token value in the stream" "$B/p.txt" "$OUT/h5.log" "a token value in the stream (field 'note')"
+    # review: forged shapes the audit refuses (or once crashed on)
+    G8="g = next(r for r in recs if isinstance(r, dict) and r.get('cert_subject') == 1 and r.get('target') == '$B/fs')"
+    python3 "$F7" "$OUT/own.out" "$OUT/h6.log" "$G8; g['policy_line'] = '$LA'"
+    refuses7 "a decision whose policy_line is a string (review)" "$B/p.txt" "$OUT/h6.log" "is not an integer"
+    LS2="$(grep -n "^allow path $B/fb readonly for=files\$" "$B/p.txt" | cut -d: -f1)"
+    python3 "$F7" "$OUT/own.out" "$OUT/h7.log" "$G8; g['policy_line'] = $LS2"
+    refuses7 "a certified decision citing another rule of its subject than its certificate's (review)" "$B/p.txt" "$OUT/h7.log" "but its certificate's rule is line $LS"
+    MD="g = next(r for r in recs if isinstance(r, dict) and r.get('action') == 'net.mcp' and r.get('rule') == 'policy_match')"
+    python3 "$F7" "$OUT/m.log" "$OUT/h8.log" "$MD; g['rule'] = None"
+    refuses7 "an MCP call whose rule is null, without a crash (review)" "$POL" "$OUT/h8.log" "is not a name"
+    python3 "$F7" "$OUT/m.log" "$OUT/h9.log" "$MD; g['resolved'] = ''"
+    refuses7 "an MCP refusal by the policy with no object decided (review)" "$POL" "$OUT/h9.log" "with no object decided"
+    python3 "$F7" "$OUT/m.log" "$OUT/h10.log" "$MD; g['event'] = 'dns_question'"
+    refuses7 "a decision record that also names an event (review)" "$POL" "$OUT/h10.log" "also says it is a 'dns_question' event"
+    if [ -f "$OUT/t4.log" ]; then
+        python3 "$F7" "$OUT/t4.log" "$OUT/h11.log" "g = next(r for r in recs if isinstance(r, dict) and r.get('action') == 'net.mcp' and r.get('token') == 'jwt' and r.get('decision_final') == 'ALLOW'); g['token_expires'] = 1000"
+        refuses7 "an MCP call allowed with a bearer token that had expired (review)" "$POL4" "$OUT/h11.log" "allowed with a bearer token that had expired"
+        python3 "$F7" "$OUT/t4.log" "$OUT/h12.log" "next(r for r in recs if isinstance(r, dict) and r.get('event') == 'run_start')['credentials'] = 1"
+        check "run_start credentials that are not a list: refused, no crash (review)" \
+            sh -c "! python3 '$AUD7' --policy '$POL4' --checker '$CERT' '$OUT/h12.log' > '$OUT/h12.out' 2>&1 && ! grep -q Traceback '$OUT/h12.out'"
+    fi
+    python3 "$F7" "$OUT/own.out" "$OUT/h13.log" "next(r for r in recs if isinstance(r, dict) and r.get('event') == 'run_start')['note'] = 'ewogICJhbGciOiAiRVMyNTYiCn0.ewogICJzdWIiOiAiYWxpY2UiCn0.c2ln'"
+    refuses7 "a token value whose JSON starts with whitespace (review)" "$B/p.txt" "$OUT/h13.log" "a token value in the stream (field 'note')"
     check "the audit still accepts the agent's own token sent in a request it made (its own business)" \
         python3 "$AUD7" --policy "$POL" --checker "$CERT" "$OUT/m.log"
     # the tools
