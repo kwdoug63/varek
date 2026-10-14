@@ -537,7 +537,11 @@ RUNS_OTHERS_INTERP = ["sh", "bash", "dash", "zsh", "ksh", "mksh", "csh", "tcsh",
 RUNS_OTHERS_LAUNCH = {"npx", "npm", "pnpm", "pnpx", "yarn", "bunx", "corepack", "uvx", "uv", "pipx", "pip", "pip3",
                       "docker", "podman", "nerdctl", "ctr", "env", "sudo", "doas", "su", "nix", "nix-shell",
                       "flatpak", "snap", "xargs", "nohup", "setsid", "timeout", "stdbuf", "nice", "ionice",
-                      "chroot", "unshare", "nsenter", "systemd-run", "runuser", "sg"}
+                      "chroot", "unshare", "nsenter", "systemd-run", "runuser", "sg",
+                      # v1.31 review
+                      "time", "taskset", "setpriv", "strace", "ltrace", "flock", "bwrap", "firejail", "chrt",
+                      "prlimit", "script", "watch", "xvfb-run", "start-stop-daemon", "tsx", "ts-node", "valgrind",
+                      "numactl", "torsocks", "proxychains", "proxychains4"}
 
 
 def runs_others(path):
@@ -762,6 +766,8 @@ def parse_lines(raw_lines, path):
                             (len(toks) == 6 and toks[5] != "opaque"):
                         raise PolicyError(f"{path}:{lineno}: bad credential audience")
                     aud = mcp_canon(toks[4][9:], True, f"{path}:{lineno}")[0]
+                    if len(aud) > L:                          # v1.31 review: as the decision procedure
+                        raise PolicyError(f"{path}:{lineno}: an MCP server's URL is too long")
                     opq = len(toks) == 6
                     toks = toks[:4]
                 creds.append(credential_parse(toks, [c[0] for c in creds], f"{path}:{lineno}"))
@@ -864,7 +870,7 @@ def parse_lines(raw_lines, path):
                 rest, nm = toks[4:], "**"
                 if rest and not rest[0].startswith(("max_body=", "credential=", "header=", "for=")):
                     nm = rest[0]
-                    if any(not 0x21 <= ord(ch) <= 0x7e for ch in nm):
+                    if any(not 0x21 <= ord(ch) <= 0x7e for ch in nm) or "#" in nm:     # v1.31 review: no '#'
                         raise PolicyError(f"{where}: bad MCP name")
                     rest = rest[1:]
                 const = f"{cu}#{toks[3]}#{nm}"

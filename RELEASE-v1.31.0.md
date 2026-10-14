@@ -3,10 +3,11 @@
 > v1.31.0 had a review by AI review agents: six, each on one area (confined
 > subjects, MCP calls over HTTP, MCP tokens, the grammar in the three
 > parsers, the audit, export and tools, and the Agent Baseline mapping
-> against the code). A human or third-party review has not been done.
+> against the code); its findings are fixed (below). A human or
+> third-party review has not been done.
 
-**Draft.** Pending: the review's fixes, the shared 24-hour soak (with
-v1.28.1 and v1.29.0) and the date.
+**Draft.** Pending: the shared 24-hour soak (with v1.28.1 and v1.29.0) and
+the date.
 
 MIT · github.com/kwdoug63/varek
 
@@ -102,30 +103,30 @@ genuinely unsafe action to SATISFIED, and none does here.
 
 ## Tested
 
-`make test-v1310` runs 271 checks; CI runs it as root:
+`make test-v1310` runs 317 checks; CI runs it as root:
 
-- **The grammar** (section 1, 119): each new form and each refusal in the
+- **The grammar** (section 1, 127): each new form and each refusal in the
   decision procedure, the certificate checker and the oracle; lint.
-- **Confined subjects** (2, 22): a server allowed what its rules allow and
+- **Confined subjects** (2, 31): a server allowed what its rules allow and
   refused what only the agent's do, and the reverse; a server's fork,
   double fork and launched program decided as the server; the agent's
   `/proc` entries closed to the server; the start refused for a pin that
   does not match, a server file any subject may write, or under a
   directory one may; forged streams the audit refuses.
-- **MCP calls over HTTP** (3, 48): allowed and refused calls; both
+- **MCP calls over HTTP** (3, 59): allowed and refused calls; both
   revisions; chunked bodies; a call that cannot be read, a batch, a
   duplicate key, mismatched headers, a body over `max_body`, a query on the
   endpoint; nothing refused reaching the server; the credential only in
   the calls its rule allows; the records.
-- **MCP tokens** (4, 33): an audience-bound token released to its server
+- **MCP tokens** (4, 41): an audience-bound token released to its server
   only; each accepted spelling of its audience and the ones refused; an
   expired or opaque token; the agent's own tokens; the user found through
   a server's protected resource metadata.
-- **The OCSF export** (5, 25): every event validated against the vendored
+- **The OCSF export** (5, 27): every event validated against the vendored
   schema (profiles, required attributes, types, enumerations); the mapping
   of each kind; a dry run; `--verify` on edited, removed, reordered and cut
   events; `--follow` against the batch export.
-- **Audit and tools** (6, 24): five forged streams the audit refuses; each
+- **Audit and tools** (6, 32): thirteen forged streams the audit refuses; each
   tool's output; the baseline with `--mcp` linting and accepted by the
   Warden.
 
@@ -186,11 +187,67 @@ of the stream and adds nothing to a decision.
   `on_behalf_of` user's `mcp_resource`. New rules: `mcp_allowed`,
   `mcp_unreadable`, `mcp_header_mismatch`, `mcp_query`, `mcp_token_user`,
   `mcp_token_audience`, `mcp_token_expired`, `mcp_token_malformed`,
-  `credential_expired`.
+  `credential_expired`, `mcp_endpoint_variant`, `subagent_env`. A
+  confined server is launched only with an environment that names no code
+  (`varek run` gives the agent a clean one; under a bare `warden`, the
+  agent's own environment must not carry such a variable). An MCP call's
+  body must be `application/json` in UTF-8.
 
 ## Found in review
 
-To be written from the review's findings and their fixes.
+Six AI review agents each reviewed one area, reading the code and running
+experiments; every finding below was confirmed and fixed, with checks
+(test_v1310 grew from 271 to 317).
+
+- **A confined server ran code its launcher chose** (high). A launch was
+  decided on the file alone, so the agent could start a `#!` server with
+  `PYTHONPATH` (or `NODE_OPTIONS`, `LD_PRELOAD`, `BASH_ENV`, ...) naming a
+  directory it writes, and the server's interpreter ran the agent's code
+  under the server's rules. A confined launch whose environment sets a
+  variable that names code is now refused (`subagent_env`): checked in the
+  launcher's memory at the decision and again in the new image's own copy
+  before any of its calls is answered. Settings that name no code
+  (`PYTHONUNBUFFERED`, a `NODE_OPTIONS` heap size, the Warden's own
+  `JAVA_TOOL_OPTIONS` trust store) are allowed.
+- **An MCP call's body read one way and decoded another** (high, for a
+  server that honours a charset). The body must now be sent as UTF-8 JSON:
+  one Content-Type, `application/json` with no charset but UTF-8, and no
+  Content-Encoding.
+- **Another spelling of an MCP endpoint** (`/MCP`, `/mcp/`) was decided by
+  request rules, its body unread. A POST to it is now refused
+  (`mcp_endpoint_variant`).
+- **Bearer tokens in a lenient form** (padding, a tab after the scheme)
+  were taken for opaque tokens and decided by the rules alone, and the
+  run's user token signed again (ECDSA's other `s`, which needs no key)
+  passed as another token. A token in a JWT's form must now be a strict
+  compact JWS, the scheme is read with any whitespace (and DPoP's), and
+  the user's token is also recognized by its signing input.
+- **The OCSF `--verify`** checked only the chain and that the last event
+  said "passed": a forged stream followed, its failed verdict edited to
+  passed, verified. It now audits the stream and compares the verdict
+  event; the export and `--verify` read the stream once; a decision record
+  that names an event is refused.
+- **The audit** let a decision cite a policy line by a string or another
+  rule of its subject; refused MCP calls with no object decided were not
+  asked of the checker; two malformed shapes crashed it. Each is checked.
+- **Smaller:** a server file that is a symlink to an interpreter; more
+  launchers refused as a server's file (`time`, `strace`, `bwrap`, `tsx`,
+  ...); lint fails a server file the agent may write, and notes a METHOD
+  glob `*` (which matches no method with a '/'); a `#` in an mcp rule's
+  NAME; a long `audience=` that crashed the certificate checker; an empty
+  body, chunked trailers, a duplicate empty member name; discovery of an
+  identifier ending in '/', an authorization server two resources share,
+  an `opaque` line whose value is a JWT; `--follow` stopping on a quiet
+  run; `refusals --for`, `doctor` on a symlink, and the export's DNS and
+  dry-run outcomes.
+- **The Agent Baseline mapping** said v1.31.0 was planned, claimed a lint
+  note that did not exist (AUT-03), and stated several limits too
+  narrowly; corrected (13 items).
+
+Not changed, and stated as limits below: a server program that reads code
+from a file it may read that another subject may write (a `.git/config`
+in the project, a script); the environment check is a list of variables
+that name code, not an allowlist.
 
 ## Known limits
 
@@ -202,6 +259,13 @@ To be written from the review's findings and their fixes.
 - **Tokens come from stores.** VAREK does not run the OAuth flow, register
   clients or refresh tokens; something outside it keeps the token in its
   store current (D8). Token introspection (RFC 7662) is not used (D7).
+- **A confined server shares what both subjects' rules let them reach.**
+  A server that reads code or settings from a file the agent may write
+  (`varek run --mcp` gives a server the working directory read-only, which
+  holds `.git/config`) runs what the agent wrote there, under the server's
+  rules. Its launch environment is checked against a list of variables
+  that name code; a program that takes code from another variable is the
+  operator's to know.
 - **A large MCP call is held whole**, up to `max_body=` (1 MiB by default),
   before it is sent.
 - **The OCSF export is 1.9.0 only** (D9). It carries no `record_integrity`

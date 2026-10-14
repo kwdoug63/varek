@@ -29,6 +29,7 @@
 #endif
 #include "../smt_decide.h"
 #include "../shared_domains.h"
+#include <fcntl.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -257,6 +258,54 @@ int main(int argc, char **argv) {
                 printf("%s:%d: note: no rule is written for %s (for=%s): every call it makes is refused\n",
                        argv[1], g_pol.subjects[k].line, g_pol.subjects[k].name, g_pol.subjects[k].name);
         }
+        /* v1.31 review: a confined subject's file, or a directory above it, that
+         * any subject's rules let be written: the Warden refuses to start (the
+         * file could be replaced); say so here, and fail */
+        int replaceable = 0;
+        for (size_t i = 0; i < g_pol.n; i++) {
+            const vdp_rule_t *r = &g_pol.rules[i];
+            if (!r->confined_subj || r->kind != VDP_KIND_EXEC || r->s.c[0] != '/') continue;
+            char d[VDP_STR_MAX + 1];
+            snprintf(d, sizeof d, "%s", r->s.c);
+            bool hit = false;
+            for (;;) {
+                static const uint32_t kW[] = { O_WRONLY, O_RDWR, O_WRONLY | O_CREAT | O_TRUNC, O_RDWR | O_CREAT };
+                for (size_t j = 0; j <= g_pol.nsubjects && !hit; j++)
+                    for (size_t f = 0; f < sizeof kW / sizeof kW[0] && !hit; f++) {
+                        int ri = -1;
+                        vdp_why_t wy;
+                        hit = vdp_decide_subj(&g_pol, (int)j, VDP_KIND_PATH, d, kW[f], true, &ri, &wy) == VDP_SATISFIED;
+                    }
+                if (hit) break;
+                char *sl = strrchr(d, '/');
+                if (!sl) break;
+                if (sl == d) { if (!d[1]) break; d[1] = '\0'; continue; }
+                *sl = '\0';
+            }
+            if (hit) {
+                printf("%s:%d: %s's file %s could be replaced: the policy lets %s be written; the Warden "
+                       "refuses to start\n", argv[1], r->line, r->subagent, r->s.c, d);
+                replaceable++;
+            }
+        }
+        /* v1.31 review: an mcp rule's METHOD is a path glob, so '*' does not
+         * match '/': `deny mcp URL * NAME` misses tools/call (a note) */
+        for (size_t i = 0; i < g_pol.n; i++) {
+            const vdp_rule_t *r = &g_pol.rules[i];
+            if (r->kind != VDP_KIND_MCP) continue;
+            const char *m = strchr(r->s.c, '#');
+            const char *e = m ? strchr(m + 1, '#') : NULL;
+            if (!m || !e) continue;
+            bool star = false, slash = false, dstar = false;
+            for (const char *q = m + 1; q < e; q++) {
+                star |= *q == '*';
+                slash |= *q == '/';
+                dstar |= q[0] == '*' && q + 1 < e && q[1] == '*';
+            }
+            if (star && !slash && !dstar)
+                printf("%s:%d: note: the method %.*s matches no method with a '/' (tools/call, resources/read): "
+                       "'*' does not match '/'; write ** or the method\n", argv[1], r->line, (int)(e - m - 1), m + 1);
+        }
         /* v1.25: an allow wildcard over a shared domain is refused at load
          * (shared_domains.h), as the Warden refuses it; lint names the entry. */
         int shared = 0;
@@ -336,7 +385,7 @@ int main(int argc, char **argv) {
             printf("%s: %zu rules, %d can never fire\n", argv[1], g_pol.n, dead);
         if (shared)
             printf("%s: %d wildcard host rules refused (shared domains)\n", argv[1], shared);
-        return dead || hostnever || shared || noexpand ? 1 : 0;
+        return dead || hostnever || shared || noexpand || replaceable ? 1 : 0;
     }
     fprintf(stderr, "unknown mode %s\n", argv[2]);
     return 2;

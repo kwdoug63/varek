@@ -448,10 +448,14 @@ const char *vdp_kind_name(vdp_kind_t k);
 //       rules only (vdp_decide_subj).
 //   <allow|deny> mcp URL METHOD [NAME] [max_body=N] [credential=C [header=H[:S]]] [for=NAME]
 //       URL as vdp_mcp_url (held in canonical form); METHOD 1 to 128 of
-//       A-Z a-z 0-9 '_' '.' '/' '-', '*' a wildcard; NAME a glob as for path
-//       globs over the tool, prompt or resource the call names, bytes 0x21 to
-//       0x7e (a NAME starting with "max_body=", "credential=", "header=" or
-//       "for=" is written with a leading '\'). No NAME: any name, or none.
+//       A-Z a-z 0-9 '_' '.' '/' '-', '*' a wildcard (a path glob: '*' does not
+//       match '/', so `*` is no method with a '/', such as tools/call, and
+//       `**` is every method; lint notes a method glob that matches none
+//       with a '/'); NAME a glob as for path globs over the tool, prompt or
+//       resource the call names, bytes 0x21 to 0x7e but '#' (v1.31 review:
+//       no object has one there, so a NAME with one could never match) (a
+//       NAME starting with "max_body=", "credential=", "header=" or "for=" is
+//       written with a leading '\'). No NAME: any name, or none.
 //       The rule is the glob  <canonical URL>#<METHOD>#<NAME or **>  over the
 //       object vdp_mcp_object builds; neither a method nor a name the Warden
 //       decides contains '#', so the two '#' split the object unambiguously.
@@ -659,5 +663,9 @@ size_t vdp_exec_advisory(const vdp_policy_t *p, size_t i, char *buf, size_t n);
  * (sh, bash, python3.12, node, ...), or the dynamic loader (ld-linux*,
  * ld-musl*, ld.so), which runs any ELF file it can read? */
 bool vdp_exec_is_interpreter(const char *path);
+/* v1.31: an interpreter (above), or a launcher that fetches or starts another
+ * program (npx, uvx, docker, env, time, strace, ...), by basename: what an
+ * `mcp server` line may not name, as written or as the file it reaches */
+bool vdp_exec_is_launcher(const char *path);
 
 #endif /* VAREK_SMT_DECIDE_H */

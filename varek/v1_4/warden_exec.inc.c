@@ -266,6 +266,13 @@ static int exec_confined_checks(const struct policy *p) {
             const struct exec_file *f = &g_exec_rs[k];
             if (strcmp(f->why, "rule") || f->line != r->line) continue;
             found = true;
+            /* v1.31 review: by the file it reaches too (a symlink to python3) */
+            if (vdp_exec_is_launcher(f->path)) {
+                fprintf(stderr, "[warden] policy line %d: %s is %s, an interpreter or a launcher: as an MCP "
+                        "server or confined sub-agent, whatever it is given to run would be decided by %s's "
+                        "rules; refusing to start\n", r->line, f->name, f->path, r->subagent);
+                return -1;
+            }
             if (r->sha256[0] && strcmp(f->sha, r->sha256)) {
                 fprintf(stderr, "[warden] policy line %d: %s has SHA-256 %s, not the %s the line pins; "
                         "refusing to start\n", r->line, f->name, f->sha, r->sha256);
@@ -290,8 +297,18 @@ static int exec_confined_checks(const struct policy *p) {
             }
         }
         if (r->mcp_server && !found) {
-            fprintf(stderr, "[warden] policy line %d: MCP server %s (%s) is not a launchable file on this "
-                    "host; refusing to start\n", r->line, r->subagent, r->s.c);
+            /* review: or an earlier exec rule decides it (it would run unconfined) */
+            bool earlier = false;
+            for (size_t k = 0; k < g_exec_n && !earlier; k++)
+                earlier = !strcmp(g_exec_rs[k].why, "rule") && g_exec_rs[k].line < r->line &&
+                          !strcmp(g_exec_rs[k].name, r->s.c);
+            if (earlier)
+                fprintf(stderr, "[warden] policy line %d: MCP server %s (%s) is launched by an earlier exec rule, "
+                        "so it would run unconfined: put its mcp server line first; refusing to start\n",
+                        r->line, r->subagent, r->s.c);
+            else
+                fprintf(stderr, "[warden] policy line %d: MCP server %s (%s) is not a launchable file on this "
+                        "host; refusing to start\n", r->line, r->subagent, r->s.c);
             return -1;
         }
     }

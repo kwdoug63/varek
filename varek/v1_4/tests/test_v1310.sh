@@ -130,10 +130,15 @@ refused "confined before 1.31"                    'require warden 1.29\nallow ex
 refused "audience= before 1.31"                   'require warden 1.29\ncredential a from file:/x audience=https://m.example.com/\n' "audience= needs"
 refused "trust mcp-resource before 1.31"          "require warden 1.29\ntrust mcp-resource $U\n"                       "needs \`require warden 1.31\`"
 refused "require warden 1.32"                     'require warden 1.32\n'                                                "requires Warden 1.32"
-for launcher in /usr/bin/node /usr/bin/npx /usr/local/bin/uvx /usr/bin/docker /usr/bin/env /usr/bin/python3.12 /bin/sh /lib64/ld-linux-x86-64.so.2; do
+for launcher in /usr/bin/node /usr/bin/npx /usr/local/bin/uvx /usr/bin/docker /usr/bin/env /usr/bin/python3.12 /bin/sh /lib64/ld-linux-x86-64.so.2 \
+                /usr/bin/time /usr/bin/strace /usr/bin/bwrap /usr/bin/setpriv /usr/local/bin/tsx; do       # review: more launchers
     refused "an MCP server that is $(basename "$launcher")" "${R}mcp server a exec $launcher\n" "an interpreter or a launcher"
 done
 refused "an MCP server's name in capitals"        "${R}mcp server Files exec /opt/x\n"                                  "a server's name"
+refused "an mcp rule's NAME with a '#' (review: it could never match)" "${P}allow mcp $U tools/call a#b\n"  "never '#'"
+refused "an mcp rule's NAME with an escaped '#' (review)" "${P}allow mcp $U tools/call [#]x\n"              "never '#'"
+LONGU="https://mcp.example.com/$(head -c 4100 /dev/zero | tr '\0' a)"
+refused "an audience= over 4,095 bytes (review: the checker refuses it too)" "${R}credential c from file:/x audience=$LONGU\n" "too long"
 refused "an MCP server's relative path"           "${R}mcp server a exec opt/x\n"                                       "absolute path"
 refused "an MCP server's path ending in /"        "${R}mcp server a exec /opt/x/\n"                                     "absolute path"
 refused "an MCP server's path with .."            "${R}mcp server a exec /opt/../x\n"                                   "absolute path"
@@ -301,9 +306,12 @@ for l in open(sys.argv[1]):
     sgo atool spawn "$B/fa" "$B/tool" open "$B/fs"
     check "the agent may not launch what only the server's rules allow" \
         sh -c "$(declare -f dec); OUT='$OUT' dec atool '$B/tool' | grep -q '^process.exec agent DENY'"
-    sgo peek spawn "$B/fa" "$B/srv" exec "$B/peek" environ mem fd/0 cwd/.
-    check "the server cannot open the agent's /proc entries (environ, mem, fd, cwd)" \
-        sh -c "grep -qx 'environ refused EACCES' '$OUT/peek.so' && grep -qx 'mem refused EACCES' '$OUT/peek.so' && grep -qx 'fd/0 refused EACCES' '$OUT/peek.so' && grep -qx 'cwd/. refused EACCES' '$OUT/peek.so'"
+    # review: under rules that let the server read /proc, so it is the
+    # Warden's own refusal of another process's entries that is tested
+    { cat "$B/p.txt"; printf 'allow path /proc/ readonly for=files\n'; } > "$B/pp.txt"
+    POL="$B/pp.txt" sgo peek spawn "$B/fa" "$B/srv" exec "$B/peek" self:status environ mem fd/0 cwd/.
+    check "the server cannot open the agent's /proc entries (environ, mem, fd, cwd), though its rules allow /proc" \
+        sh -c "grep -qx 'self:status ok' '$OUT/peek.so' && grep -qx 'environ refused EACCES' '$OUT/peek.so' && grep -qx 'mem refused EACCES' '$OUT/peek.so' && grep -qx 'fd/0 refused EACCES' '$OUT/peek.so' && grep -qx 'cwd/. refused EACCES' '$OUT/peek.so'"
     # v1.31 review: the environment the agent launches a confined server with
     # names no code (a #! script's interpreter would load it, under the
     # server's rules); checked at the launch, and in the new image's own copy
@@ -361,6 +369,11 @@ for l in open(sys.argv[1]):
         st no "require warden 1.31\nmcp server files exec $B/srv\nallow path $B/\n$SL" "could be replaced"
     check "a server whose file another subject may write is refused" \
         st no "require warden 1.31\nmcp server files exec $B/srv\nmcp server two exec $B/tool\nallow path $B/srv access=wo for=two\n$SL" "could be replaced"
+    ln -sf /usr/bin/python3 "$B/pyl"
+    check "a server file that is a symlink to an interpreter is refused at the start (review)" \
+        st no "require warden 1.31\nmcp server files exec $B/pyl\n$SL" "an interpreter or a launcher"
+    check "a server an earlier exec rule decides is refused, saying so (review)" \
+        st no "require warden 1.31\nallow exec $B/srv\nmcp server files exec $B/srv\n$SL" "launched by an earlier exec rule"
     check "a server that is not there is refused" \
         st no "require warden 1.31\nmcp server files exec $B/nothere\n$SL" "is not a launchable file"
     check "a confined sub-agent is checked the same way" \

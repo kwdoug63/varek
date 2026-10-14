@@ -1118,12 +1118,16 @@ int vdp_mcp_object(const char *url, const char *method, const char *name, char *
 /* v1.31: launchers that fetch or start another program (npx, uvx, docker,
  * ...), which an `mcp server` line may not name: a rule on one would make
  * whatever it starts the server */
-static bool exec_is_launcher(const char *path) {
+bool vdp_exec_is_launcher(const char *path) {
     static const char *const kLaunch[] = {
         "npx", "npm", "pnpm", "pnpx", "yarn", "bunx", "corepack", "uvx", "uv", "pipx", "pip", "pip3",
         "docker", "podman", "nerdctl", "ctr", "env", "sudo", "doas", "su", "nix", "nix-shell",
         "flatpak", "snap", "xargs", "nohup", "setsid", "timeout", "stdbuf", "nice", "ionice",
-        "chroot", "unshare", "nsenter", "systemd-run", "runuser", "sg", NULL
+        "chroot", "unshare", "nsenter", "systemd-run", "runuser", "sg",
+        /* v1.31 review */
+        "time", "taskset", "setpriv", "strace", "ltrace", "flock", "bwrap", "firejail", "chrt", "prlimit",
+        "script", "watch", "xvfb-run", "start-stop-daemon", "tsx", "ts-node", "valgrind", "numactl",
+        "torsocks", "proxychains", "proxychains4", NULL
     };
     const char *b = strrchr(path, '/');
     b = b ? b + 1 : path;
@@ -1491,7 +1495,7 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
                           "without \".\", \"..\", \"//\" or a trailing \"/\"");
                 break;
             }
-            if (exec_is_launcher(tok[4])) {
+            if (vdp_exec_is_launcher(tok[4])) {
                 rc = perr(err, errlen, path, lineno, "%s is an interpreter or a launcher: name the server's own "
                           "launch file (a binary, or a script with #!), or every program it starts would be "
                           "the server", tok[4]);
@@ -1568,8 +1572,10 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
                 name = tok[4];
                 oi = 5;
                 for (const char *q = name; *q; q++)
-                    if ((unsigned char)*q < 0x21 || (unsigned char)*q > 0x7e) {
-                        rc = perr(err, errlen, path, lineno, "a name is bytes 0x21 to 0x7e"); goto out;
+                    if ((unsigned char)*q < 0x21 || (unsigned char)*q > 0x7e || *q == '#') {
+                        /* v1.31 review: no '#' (the object the Warden builds never has one there, so
+                         * a rule with one could never fire) */
+                        rc = perr(err, errlen, path, lineno, "a name is bytes 0x21 to 0x7e, never '#'"); goto out;
                     }
             }
             char g[VDP_STR_MAX + 2];

@@ -702,7 +702,11 @@ static bool runs_others(const char *path) {
         "npx", "npm", "pnpm", "pnpx", "yarn", "bunx", "corepack", "uvx", "uv", "pipx", "pip", "pip3",
         "docker", "podman", "nerdctl", "ctr", "env", "sudo", "doas", "su", "nix", "nix-shell",
         "flatpak", "snap", "xargs", "nohup", "setsid", "timeout", "stdbuf", "nice", "ionice",
-        "chroot", "unshare", "nsenter", "systemd-run", "runuser", "sg", NULL
+        "chroot", "unshare", "nsenter", "systemd-run", "runuser", "sg",
+        /* v1.31 review */
+        "time", "taskset", "setpriv", "strace", "ltrace", "flock", "bwrap", "firejail", "chrt", "prlimit",
+        "script", "watch", "xvfb-run", "start-stop-daemon", "tsx", "ts-node", "valgrind", "numactl",
+        "torsocks", "proxychains", "proxychains4", NULL
     };
     const char *b = strrchr(path, '/');
     b = b ? b + 1 : path;
@@ -785,7 +789,7 @@ static int parse_mcp_rule(const char *name, int ln, char **tok, int nt, int req_
     const char *nm = "**";
     if (nt > 4 && strncmp(tok[4], "max_body=", 9) && strncmp(tok[4], "credential=", 11) &&
         strncmp(tok[4], "header=", 7) && strncmp(tok[4], "for=", 4)) {
-        if (!printable(tok[4], 1, 4095)) return fail(err, en, name, ln, "bad MCP name");
+        if (!printable(tok[4], 1, 4095) || strchr(tok[4], '#')) return fail(err, en, name, ln, "bad MCP name");
         nm = tok[4];
         k = 5;
     }
@@ -930,6 +934,8 @@ static int parse_credential(const char *name, int ln, char **tok, int nt, vdpc_p
             return fail(err, en, name, ln, "bad credential directive");
         if (mcp_canon(tok[4] + 9, 1, aud, sizeof aud, NULL, NULL) < 0)
             return fail(err, en, name, ln, "bad audience URL");
+        if (strlen(aud) >= sizeof p->creds[0].audience)      /* v1.31 review: as the decision procedure */
+            return fail(err, en, name, ln, "an MCP server's URL is too long");
     }
     const char *n = tok[1];
     size_t nl = strlen(n);
