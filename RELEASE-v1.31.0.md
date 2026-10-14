@@ -269,7 +269,8 @@ older than v1.31; each is fixed, with a check:
   before a record that would pass the bound (`test_v1290` section 2b: 300
   renames, signed; `test_v1280` section 3: requests in bursts of 32,
   signed; the audit passing). The fix is ported to the v1.28.0, v1.28.1
-  and v1.29.0 branches.
+  and v1.29.0 branches, and to v1.27.1 as v1.27.2 (the fault is in v1.26.1
+  to v1.27.1 too, reproduced on v1.27.1).
 - **The audit refused a run in which a launch came after the run was
   revoked.** The Warden refuses it with rule `revoked`, as every call
   after a revocation, but that rule was not among the launch refusals the
