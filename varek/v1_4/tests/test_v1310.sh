@@ -732,7 +732,11 @@ sys.exit(0 if ids == want else 1)"
 import json, sys
 L = open(sys.argv[1]).read().splitlines()
 d = sys.argv[2]
-e = json.loads(L[20]); e["unmapped"]["varek"]["decision"] = "SATISFIED"; e["action_id"] = 1
+# an event's decision changed, whatever it was (which event is 20th depends on
+# the architecture: what the agent does at startup differs)
+e = json.loads(L[20]); v = e["unmapped"]["varek"]
+v["decision"] = "UNSATISFIED" if v.get("decision") == "SATISFIED" else "SATISFIED"
+e["action_id"] = 2 if e.get("action_id") == 1 else 1
 open(d + "/m_edit.ev", "w").write("\n".join(L[:20] + [json.dumps(e)] + L[21:]) + "\n")
 open(d + "/m_drop.ev", "w").write("\n".join(L[:20] + L[21:]) + "\n")
 open(d + "/m_swap.ev", "w").write("\n".join(L[:20] + [L[21], L[20]] + L[22:]) + "\n")

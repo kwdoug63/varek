@@ -291,7 +291,7 @@ print("uid", os.getuid(), os.getgid())
 PYA
         chown "$BU" "$BH/proj/agent.py"
         # a stand-in for a model API on the loopback, and a test profile naming it
-        python3 -m http.server 0 --bind 127.0.0.1 --directory "$BH/proj" > "$OUT/http.out" 2>&1 &
+        python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$BH/proj" > "$OUT/http.out" 2>&1 &
         HPID=$!
         for _ in $(seq 1 50); do PORT="$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$OUT/http.out" | head -1)"; [ -n "$PORT" ] && break; sleep 0.1; done
         printf '#@ profile testapi\n#@ about a test agent\n#@ commands testagent\n#@ programs python3\nallow path ${HOME}/.testagent/\nallow host 127.0.0.1:%s\n' "$PORT" > "$OUT/testapi.profile.txt"
@@ -352,7 +352,7 @@ PYA
         check "--env with a variable that is not set is refused" grep -q "not set in varek's environment" "$OUT/e1.out.err"
         vrun "$OUT/e2.out" python3 "$HERE/tools/varek" run --env 'A-B' -- python3 agent.py
         check "--env with a bad name is refused" grep -q "not a variable name" "$OUT/e2.out.err"
-        (cd "$BH/proj" && env $VENV python3 "$HERE/tools/varek" run --show-policy -- python3 agent.py > "$OUT/n.out" 2> "$OUT/n.err")
+        (cd "$BH/proj" && env -u SUDO_UID -u SUDO_GID -u SUDO_USER $VENV python3 "$HERE/tools/varek" run --show-policy -- python3 agent.py > "$OUT/n.out" 2> "$OUT/n.err")
         check "with no sudo user, the agent is nobody" grep -q "the agent runs as nobody (no sudo user)" "$OUT/n.err"
         (cd "$BH/proj" && env SUDO_UID=0 SUDO_USER=root $VENV python3 "$HERE/tools/varek" run --show-policy -- python3 agent.py > "$OUT/n0.out" 2> "$OUT/n0.err")
         check "sudo from root: the agent is nobody, not root" grep -q "the agent runs as nobody" "$OUT/n0.err"
@@ -525,7 +525,7 @@ else
     echo hi > "$Y/o/f"; chmod 644 "$Y/o/f"
     echo s > "$Y/o/secret"; chmod 600 "$Y/o/secret"
     printf 'require warden 1.29\nallow path /usr/ readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/w/\nallow exec /usr/bin/python3\n' "$Y" > "$Y/p.txt"
-    python3 -m http.server 0 --bind 127.0.0.1 --directory "$Y/w" > "$Y/http.out" 2>&1 &
+    python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$Y/w" > "$Y/http.out" 2>&1 &
     YH=$!
     for _ in $(seq 1 50); do YP="$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$Y/http.out" | head -1)"; [ -n "$YP" ] && break; sleep 0.1; done
     python3 -c "
@@ -580,7 +580,9 @@ sys.exit(any(json.loads(l).get('enforced') is False and json.loads(l).get('decis
     check "a root-only file stays unreadable: the kernel decides as the agent, never as root" yo "read-root-only PermissionError 13"
     check "a lookup the policy refuses is let through"                    yo "stat-outside 3"
     check "a call outside the allowlist (link) goes to the kernel"        sh -c "grep -qx 'link ok' '$Y/d.out' && [ -e '$Y/w/hl' ]"
-    check "... recorded syscall_not_admitted, enforced:false"             recd other syscall:86 syscall_not_admitted
+    # link(2): x86_64's 86; arm64 has only linkat(2), 37 (v1.30)
+    YL=86; [ "$(uname -m)" = aarch64 ] && YL=37
+    check "... recorded syscall_not_admitted, enforced:false"             recd other "syscall:$YL" syscall_not_admitted
     check "a change by name the policy refuses is let through"            sh -c "grep -qx 'unlink-outside ok' '$Y/d.out' && [ ! -e '$Y/o/mine' ]"
     check "a connect the policy refuses is dialed by the Warden"          yo "connect HTTP/1.0 200"
     check "... recorded DENY, enforced:false (dialed: at once or in progress)" \
@@ -647,7 +649,7 @@ else
     for i in 1 2 3 4 5 6; do echo "$i" > "$Z/o/many/f$i"; done
     chmod -R a+rX "$Z/o"; chmod 644 "$Z/o/.ssh/id_rsa"
     printf 'require warden 1.29\nallow path /usr/ readonly\nallow path /etc/ld.so.cache readonly\ndeny path %s/o/denied\nallow path %s/w/\nallow exec /usr/bin/python3\n' "$Z" "$Z" > "$Z/p.txt"
-    python3 -m http.server 0 --bind 127.0.0.1 --directory "$Z/w" > "$Z/http.out" 2>&1 &
+    python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$Z/w" > "$Z/http.out" 2>&1 &
     ZH=$!
     for _ in $(seq 1 50); do ZP="$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$Z/http.out" | head -1)"; [ -n "$ZP" ] && break; sleep 0.1; done
     SUDO="$(command -v sudo 2>/dev/null)"
@@ -891,7 +893,12 @@ else
     check "... a file the policy does not name: EACCES"                             go "rstat Permission denied"
     check "... a missing file where the policy allows it: ENOENT"                    go "rstat No such file or directory"
     check "lstat(2) answers the link itself"                                        rec "$G/a.log" "r.get('action') == 'file.stat' and r.get('resolved') == '$G/o/link' and r['rule'] == 'metadata_answered'"
-    check "under require warden 1.28, stat(2) is refused by the filter (EPERM), as before" bo "rstat Operation not permitted"
+    # v1.30: arm64 has no stat(2); its newfstatat(2) is decided under 1.28 as before
+    if [ "$(uname -m)" = aarch64 ]; then
+        skip "under require warden 1.28, stat(2) is refused by the filter (arm64 has no stat(2))"
+    else
+        check "under require warden 1.28, stat(2) is refused by the filter (EPERM), as before" bo "rstat Operation not permitted"
+    fi
     check "a lookup under a missing directory, of a name the policy allows: ENOENT" sh -c "grep -q 'rstat No such file or directory' '$G/a.out' && [ \"\$(grep -c '^rstat No such file or directory' '$G/a.out')\" = 2 ]"
     check "... decided on the whole name asked for"                                 rec "$G/a.log" "r.get('action') == 'file.stat' and r.get('resolved') == '$G/mi/x/y' and r['rule'] == 'metadata_not_found'"
     check "... a name it does not allow: EACCES, on the first missing directory"    rec "$G/a.log" "r.get('action') == 'file.stat' and r.get('target') == '$G/mi/z/y' and r.get('resolved') == '$G/mi/z/y' and r['decision_final'] == 'DENY'"
@@ -911,8 +918,10 @@ else
     # a dry run of an earlier policy: what enforcing refuses in the filter is
     # recorded as a call outside the allowlist, not decided
     (cd "$G/w" && "$WARDEN" "$G/p128.txt" --dry-run --run-as nobody -- "$G/bin/v1290_open" rstat "$G/o/secret" mkdir "$G/w/n2" > /dev/null 2> "$G/d.log")
+    # x86_64: stat(2) 4, mkdir(2) 83 or mkdirat(2) 258; arm64: no stat(2), mkdirat(2) 34 (v1.30)
+    if [ "$(uname -m)" = aarch64 ]; then GS="set()" GM="{'syscall:34'}"; else GS="{'syscall:4'}" GM="{'syscall:83','syscall:258'}"; fi
     check "a dry run under 1.28: stat(2) and mkdir are syscall_not_admitted, not decided" sh -c "
-        python3 -c \"import json,sys; R=[json.loads(l) for l in open('$G/d.log') if l.startswith('{')]; t={r.get('target') for r in R if r.get('rule') == 'syscall_not_admitted'}; sys.exit(0 if 'syscall:4' in t and t & {'syscall:83','syscall:258'} and not any(r.get('action') == 'file.mkdir' for r in R) else 1)\""
+        python3 -c \"import json,sys; R=[json.loads(l) for l in open('$G/d.log') if l.startswith('{')]; t={r.get('target') for r in R if r.get('rule') == 'syscall_not_admitted'}; sys.exit(0 if $GS <= t and t & $GM and not any(r.get('action') == 'file.mkdir' for r in R) else 1)\""
     # noexec: a place inside a writable directory that keeps exec
     H7="$G/h"
     mkdir -p "$H7/inst/bin"; chmod 1777 "$H7"; chmod 755 "$H7/inst" "$H7/inst/bin"

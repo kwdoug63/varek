@@ -77,7 +77,25 @@ PRIVILEGED = ("sudo", "su", "doas", "pkexec")
 O_ACCMODE, O_CREAT, O_TRUNC = 3, 0x40, 0x200
 
 
-def _syscall_names():
+def _syscall_names(arch="x86_64"):
+    """the system calls' names by number, for the architecture the run was
+    recorded on (run_start's arch, v1.30; x86_64 before it)"""
+    if arch == "aarch64":
+        # arm64's are the generic table: numbers, and names defined by another
+        # (__NR_fstat __NR3264_fstat), the 64-bit one first
+        try:
+            with open("/usr/include/asm-generic/unistd.h") as fh:
+                t = fh.read()
+        except OSError:
+            return {}
+        n3264 = {m.group(1): int(m.group(2)) for m in re.finditer(r"#define __NR3264_(\w+)\s+(\d+)", t)}
+        names = {}
+        for m in re.finditer(r"#define __NR_(\w+)\s+(\d+|__NR3264_\w+)\b", t):
+            v = m.group(2)
+            n = int(v) if v.isdigit() else n3264.get(v[len("__NR3264_"):])
+            if n is not None and m.group(1) != "syscalls":
+                names.setdefault(n, m.group(1))
+        return names
     for p in ("/usr/include/x86_64-linux-gnu/asm/unistd_64.h", "/usr/include/asm/unistd_64.h"):
         try:
             with open(p) as fh:
@@ -150,7 +168,7 @@ def collect(records, keep=None):
         rule = r.get("rule")
         if rule == "syscall_not_admitted":
             if sysnames is None:
-                sysnames = _syscall_names()
+                sysnames = _syscall_names(rs.get("arch", "x86_64"))
             t = str(r.get("target", ""))
             n = int(t.split(":")[1]) if t.startswith("syscall:") and t.split(":")[1].isdigit() else -1
             key = ("syscall", n)

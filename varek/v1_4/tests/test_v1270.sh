@@ -666,7 +666,7 @@ PY
         sh -c "grep -qx 'missing_inside EACCES' '$OUT/n0.out' && grep -qx 'missing_parent EACCES' '$OUT/n0.out'"
     check "the audit accepts both runs" sh -c "python3 '$HERE/tools/varek_audit.py' --policy '$D/p3' --checker '$CERT' '$OUT/n.log' >/dev/null && python3 '$HERE/tools/varek_audit.py' --policy '$D/p3c' --checker '$CERT' '$OUT/n0.log' >/dev/null"
     # a compile: the compiler's own launches (cc1, as, collect2, ld), each decided
-    CCP=/usr/libexec/gcc/x86_64-linux-gnu/$(cc -dumpversion 2>/dev/null | cut -d. -f1)
+    CCP=/usr/libexec/gcc/$(cc -dumpmachine 2>/dev/null)/$(cc -dumpversion 2>/dev/null | cut -d. -f1)
     if [ -x /usr/bin/cc ] && [ -x "$CCP/cc1" ] && [ -x /usr/bin/as ] && [ -x /usr/bin/ld ]; then
         printf 'int main(void) { return 0; }\n' > "$D/t.c"; chmod 644 "$D/t.c"
         printf 'import subprocess, sys\nr = subprocess.run(["/usr/bin/cc", "-o", sys.argv[1] + "/w/t", sys.argv[1] + "/t.c"])\nprint("CC", r.returncode, flush=True)\n' > "$D/cc.py"

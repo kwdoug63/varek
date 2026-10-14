@@ -500,8 +500,8 @@ def mount_ns_ok():
 def landlock_abi():
     """v1.27: (the Landlock ABI, "") or (0, why), probed as the Warden does
     (landlock_create_ruleset with LANDLOCK_CREATE_RULESET_VERSION)."""
-    if platform.system() != "Linux" or platform.machine() != "x86_64":
-        return 0, "not Linux on x86_64"
+    if platform.system() != "Linux" or platform.machine() not in ("x86_64", "aarch64"):
+        return 0, "not Linux on x86_64 or arm64"
     import ctypes
     libc = ctypes.CDLL(None, use_errno=True)
     libc.syscall.restype = ctypes.c_long
@@ -593,10 +593,10 @@ def cmd_doctor(args):
     info("VAREK doctor: is this host ready to run the Warden?\n")
     bad = 0
 
-    if platform.system() == "Linux" and platform.machine() == "x86_64":
-        ok(f"Linux x86_64 ({platform.release()})")
+    if platform.system() == "Linux" and platform.machine() in ("x86_64", "aarch64"):
+        ok(f"Linux {platform.machine()} ({platform.release()})")
     else:
-        fail(f"{platform.system()} {platform.machine()}: the Warden needs Linux on x86_64")
+        fail(f"{platform.system()} {platform.machine()}: the Warden needs Linux on x86_64 or arm64 (aarch64)")
         bad += 1
 
     m = re.match(r"(\d+)\.(\d+)", platform.release())

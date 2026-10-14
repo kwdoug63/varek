@@ -10,8 +10,9 @@
 #
 #   sudo varek/v1_4/tests/arm64_sweep.sh [--deps] [--out DIR] [SUITE...]
 #
-# --deps installs what the suites need first (the packages CI installs, and
-# z3 and the CycloneDX validator for the cross-check and v1.18's suite). With
+# --deps installs what the suites need first (the packages CI installs,
+# pytest for test-cli, and z3 and the CycloneDX validator for the cross-check
+# and v1.18's suite). With
 # no SUITE, every `make test-*` target and `make crosscheck` run. Nothing else
 # under the Warden should run on the host meanwhile (test_v1280.sh revokes
 # every run).
@@ -27,13 +28,16 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ "$(id -u)" = 0 ] || { echo "arm64_sweep.sh: run as root"; exit 2; }
+# the suites run as root itself: a root shell reached by sudo -i would
+# otherwise name its user as the operator, and varek run its user as the agent
+unset SUDO_UID SUDO_GID SUDO_USER SUDO_COMMAND
 [ "$(uname -m)" = aarch64 ] || echo "arm64_sweep.sh: note: this host is $(uname -m), not aarch64"
 OUT="${OUT:-/var/tmp/varek-arm64-sweep-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$OUT"
 if [ "$DEPS" = 1 ]; then
     apt-get update -q &&
     apt-get install -y -q build-essential libseccomp-dev libsodium-dev libssl-dev openjdk-21-jdk-headless \
-        musl-tools python3-cryptography python3-pip python3-venv git openssl &&
+        musl-tools python3-cryptography python3-pip python3-pytest python3-yaml python3-venv git openssl &&
     apt-get install -y -q --no-install-recommends squid || { echo "arm64_sweep.sh: apt-get failed"; exit 1; }
     # --ignore-installed: beside Ubuntu's own copies (its jsonschema cannot be
     # uninstalled by pip, and the CycloneDX validator needs a newer one)

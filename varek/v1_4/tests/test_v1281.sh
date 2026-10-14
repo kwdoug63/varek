@@ -25,6 +25,9 @@
 #
 #   test_v1281.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
+# the operator is the user sudo names when there is one: run as root itself
+# (a root shell reached by sudo -i would otherwise name its user)
+unset SUDO_UID SUDO_GID SUDO_USER SUDO_COMMAND
 
 VDP="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 CERT="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
