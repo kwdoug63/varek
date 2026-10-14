@@ -32,7 +32,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden warden-proxy warden-secrets target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-v1300-oflags test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
+.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-v1300-oflags test-v1300 test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
 
 all: $(BINS)
 
@@ -450,6 +450,11 @@ tests/v1300_oflags: tests/v1300_oflags.c smt_decide.c smt_decide.h
 
 test-v1300-oflags: tests/v1300_oflags
 	@./tests/v1300_oflags
+
+# v1.30: the Warden on x86_64 and arm64 (the open flags in a run, records,
+# certificates, run_start's architecture and the audit); run on each
+test-v1300: warden tools/vdp_cert_check tests/v1300_oflags
+	@sudo ./tests/test_v1300.sh ./tools/vdp_cert_check ./warden
 
 # v1.31: the strict JSON parser for MCP calls (mcp_json.c), under ASan and
 # UBSan: its vectors, then MJ_N mutated inputs

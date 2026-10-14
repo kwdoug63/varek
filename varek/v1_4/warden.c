@@ -185,9 +185,11 @@ struct open_how_local {
 
 #if defined(__x86_64__)
 #define ARCH_NR     AUDIT_ARCH_X86_64
+#define WARDEN_ARCH "x86_64"            /* run_start's arch (v1.30) */
 #define WARDEN_O_LARGEFILE 0100000      /* the kernel's bit (glibc's O_LARGEFILE is 0) */
 #elif defined(__aarch64__)
 #define ARCH_NR     AUDIT_ARCH_AARCH64
+#define WARDEN_ARCH "aarch64"
 #define WARDEN_O_LARGEFILE 0400000
 #else
 #error "VAREK Warden supports x86_64 and aarch64"
@@ -2005,6 +2007,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     FILE *f = rec_begin();
     /* the version is one literal, so `varek version` can read it from the binary */
     fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"" WARDEN_VERSION "\","
+               "\"arch\":\"" WARDEN_ARCH "\","        /* v1.30 */
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,

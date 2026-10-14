@@ -324,6 +324,10 @@ def check_dry(meta, records, problems):
     dry = rs.get("mode") == "dry_run"
     if rs.get("mode") not in (None, "dry_run"):
         problems.append(f"run_start's mode {rs.get('mode')!r} is not one the Warden writes")
+    # v1.30: the architecture the Warden ran on (from v1.30; open flags are
+    # recorded in VAREK's encoding, x86_64's, on both)
+    if "arch" in rs and rs.get("arch") not in ("x86_64", "aarch64"):
+        problems.append(f"run_start's arch {rs.get('arch')!r} is not one the Warden writes")
     end = [meta["run_end"]] if isinstance(meta.get("run_end"), dict) else []
     if end and end[-1].get("mode") != rs.get("mode"):
         problems.append(f"run_end's mode {end[-1].get('mode')!r} is not run_start's {rs.get('mode')!r}")
@@ -3583,6 +3587,8 @@ def main(argv=None):
     for n_ in cnotes:
         print(f"varek_audit: note: {n_}")
     print(f"varek_audit: integrity: {integrity}")
+    if isinstance(meta.get("run_start", {}).get("arch"), str):                          # v1.30
+        print(f"varek_audit: architecture: {meta['run_start']['arch']}")
     t0 = meta.get("run_start", {}).get("timestamp_ns")
     if isinstance(t0, int):
         import datetime
