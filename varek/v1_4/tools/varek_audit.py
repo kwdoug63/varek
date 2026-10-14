@@ -727,7 +727,10 @@ EXEC_REFUSALS = ("policy_match", "default_deny_unknown", "certificate_refused", 
                  # its path cannot be read, or its image (the call is refused, nothing run)
                  "intent_derivation_failed", "exec_identity_unreadable",
                  # v1.28.1 step 3: a sub-agent's launch the Warden could not make one
-                 "subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed")
+                 "subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed",
+                 # the shared soak (v1.31, ported): a launch after the run was revoked
+                 # (checked against the revocation with every other call refused as revoked)
+                 "revoked")
 SUBAGENT_REFUSALS = ("subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed")
 EXEC_RESULTS = ("launched", "failed", "gone", "killed")
 

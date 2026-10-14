@@ -199,6 +199,25 @@ them started enforcing until the noexec places, stat(2) and the admitted
 calls were in, and the audit read a dry run's stub questions wrongly; each
 was fixed with checks (sections 5 and 7).
 
+## Found by the shared soak's trial
+
+The harness for the shared 24-hour soak of v1.28.1, v1.29.0 and v1.31.0
+(`tests/soak_shared/`, on v1.31's branch) found two faults in its first
+short runs that are in this release too; both are fixed here, with checks:
+
+- **A signed stream could fail its own audit.** Checkpoints were written
+  only between calls, but a call that writes two records (a rename, decided on both its names) or one pass over the egress proxy's reports
+  (a burst of requests) can write several records at once: 65 or more
+  could stand between two signatures, and the audit, which reads more than
+  `checkpoint_every` as checkpoints removed, failed the run. The checkpoint
+  now comes before a record that would pass the bound (`test_v1280`
+  section 3: requests in bursts of 32, signed, the audit passing; `test_v1290` section 2b: 300 renames).
+- **The audit refused a run in which a launch came after the run was
+  revoked.** The Warden refuses it with rule `revoked`, as every call after
+  a revocation, but the audit did not know that rule for a launch. It does
+  now, checked against the revocation like every other `revoked` record
+  (`test_v1280` section 4: a launch after `varek revoke`).
+
 ## Known limits
 
 - **A dry run is not a sandbox.** It lets through what the policy refuses:
