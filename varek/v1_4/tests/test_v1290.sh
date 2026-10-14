@@ -291,7 +291,7 @@ print("uid", os.getuid(), os.getgid())
 PYA
         chown "$BU" "$BH/proj/agent.py"
         # a stand-in for a model API on the loopback, and a test profile naming it
-        python3 -m http.server 0 --bind 127.0.0.1 --directory "$BH/proj" > "$OUT/http.out" 2>&1 &
+        python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$BH/proj" > "$OUT/http.out" 2>&1 &
         HPID=$!
         for _ in $(seq 1 50); do PORT="$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$OUT/http.out" | head -1)"; [ -n "$PORT" ] && break; sleep 0.1; done
         printf '#@ profile testapi\n#@ about a test agent\n#@ commands testagent\n#@ programs python3\nallow path ${HOME}/.testagent/\nallow host 127.0.0.1:%s\n' "$PORT" > "$OUT/testapi.profile.txt"
@@ -352,7 +352,7 @@ PYA
         check "--env with a variable that is not set is refused" grep -q "not set in varek's environment" "$OUT/e1.out.err"
         vrun "$OUT/e2.out" python3 "$HERE/tools/varek" run --env 'A-B' -- python3 agent.py
         check "--env with a bad name is refused" grep -q "not a variable name" "$OUT/e2.out.err"
-        (cd "$BH/proj" && env $VENV python3 "$HERE/tools/varek" run --show-policy -- python3 agent.py > "$OUT/n.out" 2> "$OUT/n.err")
+        (cd "$BH/proj" && env -u SUDO_UID -u SUDO_GID -u SUDO_USER $VENV python3 "$HERE/tools/varek" run --show-policy -- python3 agent.py > "$OUT/n.out" 2> "$OUT/n.err")
         check "with no sudo user, the agent is nobody" grep -q "the agent runs as nobody (no sudo user)" "$OUT/n.err"
         (cd "$BH/proj" && env SUDO_UID=0 SUDO_USER=root $VENV python3 "$HERE/tools/varek" run --show-policy -- python3 agent.py > "$OUT/n0.out" 2> "$OUT/n0.err")
         check "sudo from root: the agent is nobody, not root" grep -q "the agent runs as nobody" "$OUT/n0.err"
@@ -525,7 +525,7 @@ else
     echo hi > "$Y/o/f"; chmod 644 "$Y/o/f"
     echo s > "$Y/o/secret"; chmod 600 "$Y/o/secret"
     printf 'require warden 1.29\nallow path /usr/ readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/w/\nallow exec /usr/bin/python3\n' "$Y" > "$Y/p.txt"
-    python3 -m http.server 0 --bind 127.0.0.1 --directory "$Y/w" > "$Y/http.out" 2>&1 &
+    python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$Y/w" > "$Y/http.out" 2>&1 &
     YH=$!
     for _ in $(seq 1 50); do YP="$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$Y/http.out" | head -1)"; [ -n "$YP" ] && break; sleep 0.1; done
     python3 -c "
@@ -647,7 +647,7 @@ else
     for i in 1 2 3 4 5 6; do echo "$i" > "$Z/o/many/f$i"; done
     chmod -R a+rX "$Z/o"; chmod 644 "$Z/o/.ssh/id_rsa"
     printf 'require warden 1.29\nallow path /usr/ readonly\nallow path /etc/ld.so.cache readonly\ndeny path %s/o/denied\nallow path %s/w/\nallow exec /usr/bin/python3\n' "$Z" "$Z" > "$Z/p.txt"
-    python3 -m http.server 0 --bind 127.0.0.1 --directory "$Z/w" > "$Z/http.out" 2>&1 &
+    python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$Z/w" > "$Z/http.out" 2>&1 &
     ZH=$!
     for _ in $(seq 1 50); do ZP="$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$Z/http.out" | head -1)"; [ -n "$ZP" ] && break; sleep 0.1; done
     SUDO="$(command -v sudo 2>/dev/null)"
