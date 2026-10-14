@@ -730,7 +730,10 @@ EXEC_REFUSALS = ("policy_match", "default_deny_unknown", "certificate_refused", 
                  # v1.28.1 step 3: a sub-agent's launch the Warden could not make one
                  "subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed",
                  # v1.31 review: a confined subject launched with a variable that names code
-                 "subagent_env")
+                 "subagent_env",
+                 # v1.31 (the shared soak): a launch after the run was revoked (checked
+                 # against the revocation with every other call refused as revoked)
+                 "revoked")
 SUBAGENT_REFUSALS = ("subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed", "subagent_env")
 EXEC_RESULTS = ("launched", "failed", "gone", "killed")
 

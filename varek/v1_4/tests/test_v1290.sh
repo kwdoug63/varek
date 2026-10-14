@@ -482,6 +482,17 @@ else
     check "require warden 1.28: unlink, mkdir and chdir are refused by the filter (EPERM), as before" \
         sh -c "grep -qx 'unlink Operation not permitted' '$C/b.out' && grep -qx 'mkdir Operation not permitted' '$C/b.out' && grep -qx 'chdir Operation not permitted' '$C/b.out' && [ -e '$W/q' ]"
     check "... and nothing is recorded for them" sh -c "! grep -q '\"action\":\"file\.\(unlink\|mkdir\|chdir\)\"' '$C/b.log'"
+    # v1.31 (the shared soak): a rename writes two records from one call; in
+    # a signed stream no checkpoint may seal more than checkpoint_every (a
+    # create and a rename, 300 times: the records go up by 1 and 2, so a
+    # rename's two straddle the 64th)
+    mkdir -p "$C/rn"; chmod 1777 "$C/rn"
+    printf 'require warden 1.29\nallow path /usr/ readonly\nallow path /etc/ld.so.cache readonly\nallow path exact %s/rn readonly\nallow path %s/rn/\n' "$C" "$C" > "$C/prn.txt"
+    "$HERE/tools/varek_keygen" "$C/rk" > /dev/null 2>&1
+    RA=(); for i in $(seq 300); do RA+=(create "$C/rn/x$i" rename "$C/rn/x$i:$C/rn/y$i"); done
+    (cd "$C/rn" && "$WARDEN" "$C/prn.txt" --run-as nobody --sign-key "$C/rk" -- "$C/bin/v1290_open" "${RA[@]}" > "$C/rn.out" 2> "$C/rn.log")
+    check "a signed run of 300 renames: each one made, and no checkpoint seals more than checkpoint_every (the audit passes)" \
+        sh -c "[ \"\$(grep -cx 'rename ok' '$C/rn.out')\" = 300 ] && python3 '$HERE/tools/varek_audit.py' --policy '$C/prn.txt' --checker '$CERT' --pubkey '$C/rk.pub' '$C/rn.log' > '$C/rn.aud' && grep -q 'integrity: signed' '$C/rn.aud'"
     # tools an agent uses, through varek run with the baseline (the section-2 user)
     if [ -n "${MADE_BU:-}" ] && id varek1290r >/dev/null 2>&1; then
         cat > "$BH/proj/tools.sh" <<'SHT'

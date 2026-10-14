@@ -2389,6 +2389,13 @@ static void emit_pathology(uint64_t seq,
                            int kernel_errno)
 {
     if (!g_log) return;
+    /* v1.31 (the shared soak): a checkpoint seals at most checkpoint_every
+     * decision records. It is written between notifications
+     * (maybe_checkpoint), but one notification or one pass over the proxy's
+     * reports can write several records (a rename's two names, a batch of
+     * requests); when this record would pass the bound, the checkpoint comes
+     * first, here. */
+    if (checkpoints_on() && g_since_ckpt >= g_ckpt_every) emit_checkpoint();
     if (a->dry) d_final = DEC_DENY;      /* v1.29: a call a dry run let through was refused by the policy */
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

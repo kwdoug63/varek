@@ -250,6 +250,36 @@ from a file it may read that another subject may write (a `.git/config`
 in the project, a script); the environment check is a list of variables
 that name code, not an allowlist.
 
+## Found by the shared soak's trial
+
+The harness for the shared 24-hour soak (`tests/soak_shared/`, with
+v1.28.1 and v1.29.0) found two faults in its first short runs, both
+older than v1.31; each is fixed, with a check:
+
+- **A signed stream that renames files could fail its own audit.** A
+  rename is decided on both its names, two records from one call, and
+  checkpoints were written only between calls (as one pass over the
+  proxy's reports can write several records too): when a rename's first
+  record was the 64th since the last checkpoint, 65 stood between two
+  signatures, and the audit, which reads more than `checkpoint_every` as
+  checkpoints removed, failed the run. A run of `git commit` under `varek
+  run` (signed with the key made on first use) was enough. The checkpoint
+  now comes before a record that would pass the bound (`test_v1290`
+  section 2b: 300 renames, signed, the audit passing).
+- **The audit refused a run in which a launch came after the run was
+  revoked.** The Warden refuses it with rule `revoked`, as every call
+  after a revocation, but that rule was not among the launch refusals the
+  audit knows, so `varek_audit` (and the OCSF export's `--verify`) failed
+  a genuine stream. It is now, checked like every other `revoked` record
+  against the revocation before it (`test_v1280` section 4: a launch after
+  `varek revoke`).
+
+With both fixed, the harness's 6-minute trial on the test host (a turn
+every 3 s, signed) passes: in run A, every task and probe before the
+user's token expired, the token only in `gh`'s allowed calls, nothing
+after the revocation, the audit, and the OCSF events verified and valid;
+B's work and probes, and its audit; C's dry run, draft and second dry run.
+
 ## Known limits
 
 - **The agent's calls to a stdio MCP server are not decided** (D4): they

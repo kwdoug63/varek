@@ -408,7 +408,7 @@ else
     # address it resolved; then it waits on stdin while the run is revoked,
     # and tries a request on the held connection, a file open and a connect
     cat > "$X/agent4.py" <<'PY'
-import os, socket, ssl, sys
+import os, socket, ssl, subprocess, sys
 P = int(sys.argv[1])
 ph = os.environ.get("VAREK_CRED_C1", "").encode()
 ctx = ssl.create_default_context()
@@ -442,6 +442,10 @@ try:
     socket.create_connection(addr, 10).close(); print("CONNECT after ok", flush=True)
 except OSError as e:
     print("CONNECT after", type(e).__name__, flush=True)
+try:
+    subprocess.run(["/usr/bin/true"], check=True); print("EXEC after ok", flush=True)
+except OSError as e:
+    print("EXEC after", type(e).__name__, flush=True)
 PY
     chmod 644 "$X/agent4.py"
     POL4="$OUT/revoke.policy"
@@ -450,6 +454,7 @@ PY
       printf 'credential sh from vault:database/creds/short#password\ncredential sk from vault:database/creds/stuck#password\n'
       printf 'allow host api.example.com\n'
       printf 'allow request GET https://api.example.com:%s/v1/a credential=c1 header=Authorization:Bearer\n' "$PS"
+      printf 'allow exec /usr/bin/true\n'       # v1.31 (the shared soak): launches decided, one refused after the revocation
       printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path exact %s/agent4.py readonly\n' "$X"
     } > "$POL4"
     n3=$(wc -l < "$OUT/got.jsonl")
@@ -493,6 +498,7 @@ sys.exit(1)"
         sh -c "grep -Eqx 'REQ held (EOF|ERR .*)' '$OUT/a4.out' && [ \$(wc -l < '$OUT/got.jsonl') -eq \$(($n3 + 1)) ]"
     check "after: the file open is refused (EACCES)" grep -qx "OPEN after 13" "$OUT/a4.out"
     check "after: the connect is refused" grep -qx "CONNECT after PermissionError" "$OUT/a4.out"
+    check "after: a launch the policy allows is refused (EACCES)" grep -qx "EXEC after PermissionError" "$OUT/a4.out"
     check "the run is not ended by the revocation: the agent finished" sh -c "grep -qx 0 '$OUT/a4.rc'"
     rec4() { python3 - "$OUT/a4.log" "$1" <<'PY'
 import json, sys
@@ -501,8 +507,8 @@ sys.exit(0 if eval(sys.argv[2], {"R": recs}) else 1)
 PY
     }
     check "recorded: revoked, by uid 0" rec4 "any(r.get('event') == 'revoked' and r.get('by_uid') == 0 and r.get('by_pid', 0) > 0 for r in R)"
-    check "recorded: the file open and the connect after it, refused with rule revoked" \
-        rec4 "{r.get('action') for r in R if r.get('rule') == 'revoked' and r.get('decision_final') == 'DENY'} >= {'file.open', 'net.connect'}"
+    check "recorded: the file open, the connect and the launch after it, refused with rule revoked" \
+        rec4 "{r.get('action') for r in R if r.get('rule') == 'revoked' and r.get('decision_final') == 'DENY'} >= {'file.open', 'net.connect', 'process.exec'}"
     check "recorded: the proxy holds no value after (revocation_proxy, values_held 0)" \
         rec4 "any(r.get('event') == 'revocation_proxy' and r.get('values_held') == 0 for r in R)"
     check "recorded: the proxy closed the held connection (revoked)" \
