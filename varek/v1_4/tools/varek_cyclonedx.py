@@ -726,9 +726,10 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
         "publisher": "Sober Agentic Infrastructure, Inc.",
         "name": "VAREK Warden",
         "version": warden_version,
-        "description": "Pre-execution authorization runtime for autonomous AI agents "
-                       "(Authorization-Before-Execution; kernel-enforced via seccomp-BPF "
-                       "and seccomp user-notify).",
+        "description": "Kernel-enforced, proof-checked authorization for what an AI "
+                       "agent's process actually does: each file open, lookup, connect, "
+                       "program launch and datagram send is decided at the kernel "
+                       "(seccomp-BPF and seccomp user-notify).",
         "licenses": [{"license": {"id": "MIT"}}],
         "properties": [{"name": n, "value": v} for n, v in PATENTS] + [
             {"name": "varek:status", "value": "patent-pending"},
@@ -740,7 +741,8 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
         "bom-ref": "agent-run",
         "name": agent,
         "version": run_start,
-        "description": "Autonomous agent run supervised under VAREK Authorization-Before-Execution.",
+        "description": "Autonomous agent run whose process's actions the VAREK Warden "
+                       "decided at the kernel.",
         "properties": [
             {"name": "varek:mode", "value": "dry_run" if dry else "enforcing"},     # v1.29
             {"name": "varek:policy", "value": policy},
