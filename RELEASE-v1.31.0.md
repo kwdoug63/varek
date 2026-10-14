@@ -6,8 +6,9 @@
 > against the code); its findings are fixed (below). A human or
 > third-party review has not been done.
 
-**Draft.** Pending: the shared 24-hour soak (with v1.28.1 and v1.29.0) and
-the date.
+**Draft.** Pending: the shared 24-hour soak (with v1.28.1 and v1.29.0), the
+date, and the CHANGELOG entry and README's current release (written in the
+release commit, after v1.28.0, v1.28.1 and v1.29.0's, as for each release).
 
 MIT · github.com/kwdoug63/varek
 
