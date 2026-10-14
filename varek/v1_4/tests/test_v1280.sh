@@ -398,6 +398,30 @@ PY
     refuses "two credentials with one placeholder" "$POL3" "$OUT/g7.log" "a placeholder's SHA-256 of its own"
     python3 "$F" "$OUT/a3.log" "$OUT/g8.log" "cf = next(r for r in recs if isinstance(r, dict) and r.get('event') == 'credential_refused'); cf['request_seq'] = 99"
     refuses "a refused swap of a request never allowed" "$POL3" "$OUT/g8.log" "follows no allowed request"
+    # v1.31 (the shared soak): one pass over the proxy's reports can write
+    # several records; in a signed stream no checkpoint may seal more than
+    # checkpoint_every (20 bursts of 32 requests at once)
+    cat > "$X/burst.py" <<'PY'
+import socket, ssl, sys, threading
+P = int(sys.argv[1]); ctx = ssl.create_default_context(); ok = []
+def one():
+    try:
+        s = ctx.wrap_socket(socket.create_connection(("api.example.com", P), 15), server_hostname="api.example.com")
+        s.sendall(b"GET /v1/burst HTTP/1.1\r\nHost: api.example.com:%d\r\n\r\n" % P); s.recv(100); s.close(); ok.append(1)
+    except (OSError, ssl.SSLError):
+        pass
+for _ in range(20):
+    ts = [threading.Thread(target=one) for _ in range(32)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+print("BURST", len(ok), flush=True)
+PY
+    chmod 644 "$X/burst.py"
+    printf 'require warden 1.28\nproxy inspect\nproxy ports %s\nallow host api.example.com\nallow request GET https://api.example.com:%s/v1/burst\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path exact %s/burst.py readonly\n' "$PS" "$PS" "$X" > "$OUT/burst.policy"
+    "$HERE/tools/varek_keygen" "$X/bk" > /dev/null 2>&1
+    env -i PATH=/usr/bin:/bin timeout 180 "$WARDEN" "$OUT/burst.policy" --sign-key "$X/bk" --dns-server "127.0.0.1:$DP" \
+        --trust-bundle "$X/bundle.pem" -- /usr/bin/python3 "$X/burst.py" "$PS" > "$OUT/burst.out" 2> "$OUT/burst.log"
+    check "a signed run of requests in bursts of 32: no checkpoint seals more than checkpoint_every (the audit passes)" \
+        sh -c "grep -q '^BURST [1-9]' '$OUT/burst.out' && python3 '$HERE/tools/varek_audit.py' --policy '$OUT/burst.policy' --checker '$CERT' --pubkey '$X/bk.pub' '$OUT/burst.log' > '$OUT/burst.aud' && grep -q 'integrity: signed' '$OUT/burst.aud'"
 fi
 
 echo "== 4. revocation =="

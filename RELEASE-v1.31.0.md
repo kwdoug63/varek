@@ -263,16 +263,20 @@ older than v1.31; each is fixed, with a check:
   record was the 64th since the last checkpoint, 65 stood between two
   signatures, and the audit, which reads more than `checkpoint_every` as
   checkpoints removed, failed the run. A run of `git commit` under `varek
-  run` (signed with the key made on first use) was enough. The checkpoint
-  now comes before a record that would pass the bound (`test_v1290`
-  section 2b: 300 renames, signed, the audit passing).
+  run` (signed with the key made on first use) was enough, and so was a
+  burst of requests through the inspecting proxy (reproduced on v1.28.0's
+  build: 65 to 73 records between signatures). The checkpoint now comes
+  before a record that would pass the bound (`test_v1290` section 2b: 300
+  renames, signed; `test_v1280` section 3: requests in bursts of 32,
+  signed; the audit passing). The fix is ported to the v1.28.0, v1.28.1
+  and v1.29.0 branches.
 - **The audit refused a run in which a launch came after the run was
   revoked.** The Warden refuses it with rule `revoked`, as every call
   after a revocation, but that rule was not among the launch refusals the
   audit knows, so `varek_audit` (and the OCSF export's `--verify`) failed
   a genuine stream. It is now, checked like every other `revoked` record
   against the revocation before it (`test_v1280` section 4: a launch after
-  `varek revoke`).
+  `varek revoke`). Ported to the same three branches.
 
 With both fixed, the harness's 6-minute trial on the test host (a turn
 every 3 s, signed) passes: in run A, every task and probe before the
