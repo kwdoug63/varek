@@ -6,7 +6,8 @@
 # logged to OUT/<suite>.log, then a table of each suite's result.
 #
 # Run as root on the arm64 host (an AWS Graviton instance, Ubuntu 24.04), from
-# a checkout of the v1.30 branch:
+# a checkout of the v1.30 branch where the user nobody can read it (/opt, not
+# /root):
 #
 #   sudo varek/v1_4/tests/arm64_sweep.sh [--deps] [--out DIR] [SUITE...]
 #
@@ -28,6 +29,14 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ "$(id -u)" = 0 ] || { echo "arm64_sweep.sh: run as root"; exit 2; }
+# the bench tests (test-cli) run their workload as nobody, and other checks
+# run the tools as nobody: the checkout must be reachable by nobody (not
+# under /root, which is 0700)
+if ! setpriv --reuid 65534 --regid 65534 --clear-groups test -r "$HERE/tools/varek" 2>/dev/null; then
+    echo "arm64_sweep.sh: nobody cannot read $HERE (under a directory closed to other users, such as /root):"
+    echo "  clone it where nobody can, e.g. git clone -b $(git -C "$HERE" branch --show-current 2>/dev/null) https://github.com/kwdoug63/varek.git /opt/varek130"
+    exit 2
+fi
 # the suites run as root itself: a root shell reached by sudo -i would
 # otherwise name its user as the operator, and varek run its user as the agent
 unset SUDO_UID SUDO_GID SUDO_USER SUDO_COMMAND

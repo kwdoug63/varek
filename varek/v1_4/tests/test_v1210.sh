@@ -164,8 +164,11 @@ if grep -q 'names.txt:[26]: note' "$OUT/lint.out"; then flunk "canonical constan
 "$WARDEN" "$HERE/policy.txt" -- /bin/true > /dev/null 2> "$OUT/sample.err"
 if grep -Eq '^[[:space:]]*(allow|deny)[[:space:]]+host[[:space:]]+[a-z]' "$HERE/policy.txt" "$HERE/policies/"*.txt; then
     flunk "no shipped policy has a host-name rule"; else pass "no shipped policy has a host-name rule"; fi
-"$HERE/tools/vdp_check" "$HERE/policy.txt" lint 2>&1 | grep -q 'note:' && flunk "the sample policy lints without notes" \
-    || pass "the sample policy lints without notes"
+# its host rules, that is: from v1.27 its exec rules draw notes of their own
+# (interpreters, and launches after the first needing require warden 1.27)
+HL="$(grep -nE '^[[:space:]]*(allow|deny)[[:space:]]+host[[:space:]]' "$HERE/policy.txt" | cut -d: -f1 | sed 's/^/policy.txt:/; s/$/: note/' )"
+"$HERE/tools/vdp_check" "$HERE/policy.txt" lint 2>&1 | grep -qF "$HL" && flunk "the sample policy's host rules lint without notes" \
+    || pass "the sample policy's host rules lint without notes"
 
 echo "== 4b. the sector policies' name rules match in any case =="
 python3 - "$HERE" <<'PY' > "$OUT/sector.out"
