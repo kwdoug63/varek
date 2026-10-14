@@ -244,6 +244,25 @@ was accepted; the Warden took any printable algorithm name from the helper;
 the tools crashed on malformed values, read lines with no run id, and
 called an unverified user verified.
 
+## Found by the shared soak's trial
+
+The harness for the shared 24-hour soak of v1.28.1, v1.29.0 and v1.31.0
+(`tests/soak_shared/`, on v1.31's branch) found two faults in its first
+short runs that are in this release too; both are fixed here, with checks:
+
+- **A signed stream could fail its own audit.** Checkpoints were written
+  only between calls, but one pass over the egress proxy's reports
+  (a burst of requests) can write several records at once: 65 or more
+  could stand between two signatures, and the audit, which reads more than
+  `checkpoint_every` as checkpoints removed, failed the run. The checkpoint
+  now comes before a record that would pass the bound (`test_v1280`
+  section 3: requests in bursts of 32, signed, the audit passing).
+- **The audit refused a run in which a launch came after the run was
+  revoked.** The Warden refuses it with rule `revoked`, as every call after
+  a revocation, but the audit did not know that rule for a launch. It does
+  now, checked against the revocation like every other `revoked` record
+  (`test_v1280` section 4: a launch after `varek revoke`).
+
 ## Known limits
 
 - **The chain is recorded, not enforced.** No rule depends on the user, an
