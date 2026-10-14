@@ -35,7 +35,7 @@ static bool mcp_body_put(struct wp_held *h, const uint8_t *b, size_t n) {
 }
 
 /* A chunked body (already checked by pp_chunked_feed) without its framing,
- * into out (malloc'd). The length, or -1. */
+ * into out (malloc'd). The length, -1 (malformed) or -2 (it has trailers). */
 static long mcp_dechunk(const uint8_t *b, size_t n, uint8_t **out) {
     uint8_t *o = malloc(n ? n : 1);
     size_t i = 0, ol = 0;
@@ -52,7 +52,11 @@ static long mcp_dechunk(const uint8_t *b, size_t n, uint8_t **out) {
         while (i + 1 < n && !(b[i] == '\r' && b[i + 1] == '\n')) i++;     /* chunk extensions */
         if (i + 1 >= n) { free(o); return -1; }
         i += 2;
-        if (sz == 0) break;                                                 /* trailers are not read */
+        if (sz == 0) {
+            /* review: trailers are bytes the decision never read; refused */
+            if (i + 1 >= n || b[i] != '\r' || b[i + 1] != '\n') { free(o); return -2; }
+            break;
+        }
         if (sz > n - i || n - i - sz < 2) { free(o); return -1; }
         memcpy(o + ol, b + i, sz);
         ol += sz;
@@ -89,6 +93,31 @@ static int mcp_header(const struct wp_held *h, const char *name, const uint8_t *
     return found;
 }
 
+/* review: a Content-Type that says application/json in UTF-8: the media
+ * type (any case), then at most a charset parameter of utf-8 (quoted or not,
+ * any case), spaces and tabs around ';' and '=' allowed */
+static bool mcp_json_type(const uint8_t *v, size_t n) {
+    static const char kType[] = "application/json";
+    size_t tl = sizeof kType - 1, i = tl;
+    if (n < tl || strncasecmp((const char *)v, kType, tl)) return false;
+    while (i < n && (v[i] == ' ' || v[i] == '\t')) i++;
+    if (i == n) return true;
+    if (v[i++] != ';') return false;
+    while (i < n && (v[i] == ' ' || v[i] == '\t')) i++;
+    if (n - i < 7 || strncasecmp((const char *)v + i, "charset", 7)) return false;
+    i += 7;
+    while (i < n && (v[i] == ' ' || v[i] == '\t')) i++;
+    if (i == n || v[i++] != '=') return false;
+    while (i < n && (v[i] == ' ' || v[i] == '\t')) i++;
+    bool q = i < n && v[i] == '"';
+    if (q) i++;
+    if (n - i < 5 || strncasecmp((const char *)v + i, "utf-8", 5)) return false;
+    i += 5;
+    if (q && (i == n || v[i++] != '"')) return false;
+    while (i < n && (v[i] == ' ' || v[i] == '\t')) i++;
+    return i == n;
+}
+
 /* Parse the body read, check the headers, and report the call (or why it
  * could not be read: fail, with ok code, WP_MCP_*). The gate then waits for
  * the verdict. */
@@ -117,12 +146,28 @@ static void mcp_report(struct wp_held *h, const char *fail, uint32_t code) {
         uint8_t *json = h->mbody;
         long jl = (long)h->mlen;
         if (h->pend_body == WP_BODY_CHUNKED && (jl = mcp_dechunk(h->mbody, h->mlen, &json)) < 0)
-            snprintf(why, sizeof why, "a malformed chunked body");
+            snprintf(why, sizeof why, "%s", jl == -2 ? "a chunked body with trailers" : "a malformed chunked body");
         else {
             char jwhy[72];
             if (mj_call(json ? json : (const uint8_t *)"", (size_t)jl, c, jwhy, sizeof jwhy) < 0)
                 snprintf(why, sizeof why, "not one JSON-RPC call: %s", jwhy);
             if (json != h->mbody) free(json);
+        }
+    }
+    if (!why[0]) {
+        /* review: the body is read as UTF-8 JSON, so it must be sent as that:
+         * one Content-Type, application/json, no charset but UTF-8, and no
+         * content coding (a server that decodes by the charset or the coding
+         * would read other bytes than the ones decided) */
+        int r = mcp_header(h, "Content-Type", &pv, &pvn);
+        if (r != 1 || !mcp_json_type(pv, pvn)) {
+            snprintf(why, sizeof why, "the Content-Type is not application/json in UTF-8");
+            ok = WP_MCP_HEADERS;
+        }
+        r = why[0] ? 0 : mcp_header(h, "Content-Encoding", &pv, &pvn);
+        if (r < 0 || (r == 1 && !(pvn == 8 && !strncasecmp((const char *)pv, "identity", 8)))) {
+            snprintf(why, sizeof why, "the body has a Content-Encoding");
+            ok = WP_MCP_HEADERS;
         }
     }
     if (!why[0]) {
@@ -207,7 +252,8 @@ static void mcp_begin(struct wp_held *h, const struct wp_reqverdict *v) {
     h->mlen = 0;
     h->body_left = h->pend_blen;
     memset(&h->ck, 0, sizeof h->ck);
-    if (h->pend_body == WP_BODY_NONE) mcp_report(h, NULL, 0);              /* an empty body: refused as such */
+    if (h->pend_body == WP_BODY_NONE || (h->pend_body == WP_BODY_LENGTH && !h->pend_blen))
+        mcp_report(h, NULL, 0);                                             /* an empty body: refused as such */
     else if (h->pend_body == WP_BODY_LENGTH && h->pend_blen > h->mlimit) {
         char w[96];
         snprintf(w, sizeof w, "a body of %llu bytes, over the limit of %llu", (unsigned long long)h->pend_blen,

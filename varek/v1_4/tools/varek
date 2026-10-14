@@ -1684,6 +1684,17 @@ def cmd_refusals(args):
                                 f"{'sub-agent ' + ch if ch else 'the agent'} got a JSON-RPC error in a 403"))
             continue
         rl = r.get("rule")
+        if rl == "subagent_env":
+            # v1.31 review: a confined subject launched with a variable that names code
+            if r.get("action") == "process.exec":
+                info(f"  {verdict_word(r):11}  {'process.exec':13}  {r.get('resolved') or r.get('target', '?')}")
+                hint(f"a confined subject's launch with {r.get('env', '?')} set, which names code its launcher "
+                     f"chose (it would run under the subject's rules); launch it without that variable")
+            else:
+                info(f"  {'KILLED':11}  {r.get('action', '?'):13}  pid {r.get('agent_pid')} ({r.get('exe', '?')})")
+                hint(f"launched as a confined subject with {r.get('env', '?')} set after its launch was decided; "
+                     f"the process was killed before this call was answered")
+            continue
         if rl == "exec_identity_mismatch":
             # v1.27: a process found running a program the Warden did not decide to run
             info(f"  {'KILLED':11}  {r.get('action', '?'):13}  pid {r.get('agent_pid')} ran {r.get('exe', '?')}")

@@ -541,7 +541,8 @@ def _launch_text(records, pm):
     allowed = [r for r in launches if r.get("rule") == "exec_allowed"]
     results = [e for _, e in pm.get("exec_results", [])]
     ran = sum(1 for e in results if e.get("result") == "launched")
-    killed = [r for r in records if r.get("rule") == "exec_identity_mismatch"]
+    killed = [r for r in records if r.get("rule") == "exec_identity_mismatch" or
+              (r.get("rule") == "subagent_env" and r.get("action") != "process.exec")]
     facts = [("varek:launches.landlock_abi", abi),
              ("varek:launches.set.files", str(len(ex))),
              ("varek:launches.set.sha256", digest),

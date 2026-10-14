@@ -681,6 +681,23 @@ static bool px_mcp_endpoint(const struct policy *p, const char *url, uint64_t *l
     return any;
 }
 
+/* review: a URL that is an MCP endpoint's but for ASCII case or a trailing
+ * '/' (a server's router may take it for the endpoint): a POST to it is
+ * refused (mcp_endpoint_variant), not decided as an ordinary request */
+static bool px_mcp_variant(const struct policy *p, const char *url) {
+    size_t ul = strlen(url);
+    if (ul && url[ul - 1] == '/') ul--;
+    for (size_t k = 0; k < p->v.n; k++) {
+        const vdp_rule_t *r = &p->v.rules[k];
+        if (r->kind != VDP_KIND_MCP) continue;
+        const char *hash = strchr(r->s.c, '#');
+        size_t el = hash ? (size_t)(hash - r->s.c) : strlen(r->s.c);
+        if (el && r->s.c[el - 1] == '/') el--;
+        if (el == ul && !strncasecmp(r->s.c, url, ul)) return true;
+    }
+    return false;
+}
+
 static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     struct px_open *o = NULL;
     for (size_t k = 0; k < g_px_nopen; k++) if (g_px_open[k].id == m->id) o = &g_px_open[k];
@@ -704,13 +721,14 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
      * it makes decided (px_mcpreq); one with a query is refused (an endpoint
      * is a URL without one, and a server could act on it) */
     uint64_t mcp_limit = 0;
-    bool mcp_ep = false;
+    bool mcp_ep = false, mcp_var = false;
     if (ml == 4 && !memcmp(ob, "POST", 4)) {
         char url[VDP_STR_MAX + 1];
         snprintf(url, sizeof url, "%s", ob + 5);
         char *qm = strchr(url, '?');
         if (qm) *qm = '\0';
         mcp_ep = px_mcp_endpoint(p, url, &mcp_limit);
+        mcp_var = !mcp_ep && px_mcp_variant(p, url);
         if (mcp_ep && !qm) {
             struct wp_reqverdict v;
             memset(&v, 0, sizeof v);
@@ -736,9 +754,10 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     a->subject = px_subject(m->id);
     memcpy(a->target, ob, ol + 1);
     memcpy(a->resolved, ob, ol + 1);
-    decision_t d_raw = mcp_ep ? DEC_DENY : policy_decide(p, a);
+    decision_t d_raw = mcp_ep || mcp_var ? DEC_DENY : policy_decide(p, a);
     decision_t d_final = d_raw == DEC_ALLOW ? DEC_ALLOW : DEC_DENY;
-    const char *rule = mcp_ep ? "mcp_query" : d_raw == DEC_ALLOW ? "request_allowed" : decision_rule_id(a, d_raw);
+    const char *rule = mcp_ep ? "mcp_query" : mcp_var ? "mcp_endpoint_variant"
+                     : d_raw == DEC_ALLOW ? "request_allowed" : decision_rule_id(a, d_raw);
     uint64_t maxb = 0;
     char why[96];
     if (d_final == DEC_ALLOW && !certify(p, a)) {
@@ -763,6 +782,7 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
                  a->policy_line);
     else if (!strcmp(rule, "revoked")) snprintf(why, sizeof why, "the run was revoked (varek revoke)");
     else if (mcp_ep) snprintf(why, sizeof why, "an MCP endpoint takes no query");
+    else if (mcp_var) snprintf(why, sizeof why, "another spelling of an MCP endpoint (its case or a trailing /)");
     else if (d_raw == DEC_DENY) snprintf(why, sizeof why, "the policy denies it (line %d)", a->policy_line);
     else snprintf(why, sizeof why, "no request rule allows it");
     static const char *const kBody[] = { "none", "length", "chunked" };

@@ -195,7 +195,7 @@ static int keys_add(struct keys *k, const char *s, size_t n) {
     uint64_t h = fnv(s, n) | 1;
     size_t j = h & (k->cap - 1);
     while (k->t[j].h) {
-        if (k->t[j].h == h && k->t[j].len == n && !memcmp(k->store + k->t[j].off, s, n)) return 0;
+        if (k->t[j].h == h && k->t[j].len == n && (!n || !memcmp(k->store + k->t[j].off, s, n))) return 0;
         j = (j + 1) & (k->cap - 1);
     }
     if (k->sl + n > k->scap) {

@@ -308,7 +308,8 @@ DRY_NEVER_LET = ("protected_object", "raw_device", "view_write_refused", "change
                  "resolution_failed", "revoked", "subagent_unattributed", "subagent_threaded",
                  "subagent_same_image", "subagent_limit", "subagent_depth", "subagent_failed",
                  "intent_derivation_failed", "rename_directory_refused", "bad_descriptor",
-                 "bad_address", "family_refused", "unspec_refused", "dns_refused")
+                 "bad_address", "family_refused", "unspec_refused", "dns_refused",
+                 "subagent_env")                                        # v1.31 review
 
 
 def check_dry(meta, records, problems):
@@ -449,7 +450,7 @@ def check_changes(records, openas_policy, problems):
 
 
 V127_RULES = ("exec_allowed", "exec_not_in_ruleset", "exec_no_landlock", "exec_identity_mismatch",
-              "exec_identity_unreadable", "open_not_found")
+              "exec_identity_unreadable", "open_not_found", "subagent_env")
 
 
 def check_exec_set(meta, launches, problems, records=()):
@@ -727,8 +728,10 @@ EXEC_REFUSALS = ("policy_match", "default_deny_unknown", "certificate_refused", 
                  # its path cannot be read, or its image (the call is refused, nothing run)
                  "intent_derivation_failed", "exec_identity_unreadable",
                  # v1.28.1 step 3: a sub-agent's launch the Warden could not make one
-                 "subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed")
-SUBAGENT_REFUSALS = ("subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed")
+                 "subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed",
+                 # v1.31 review: a confined subject launched with a variable that names code
+                 "subagent_env")
+SUBAGENT_REFUSALS = ("subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed", "subagent_env")
 EXEC_RESULTS = ("launched", "failed", "gone", "killed")
 
 
@@ -847,14 +850,27 @@ def check_launches(checker, policy, rules, meta, records, complete, problems):
         if n > 1 or (complete and n == 0):
             problems.append(f"seq {r.get('seq')}: an allowed launch with {n} exec_result records, not one")
     mism = [r for r in records if r.get("rule") == "exec_identity_mismatch"]
+    # v1.31 review: a confined subject whose own environment names code is
+    # killed at its first call (its launcher changed it after the decision)
+    envk = [r for r in records if r.get("rule") == "subagent_env" and r.get("action") != "process.exec"]
     killed = sum(1 for _, e in results if e.get("result") == "killed")    # review finding 2
-    if killed and not mism:
+    if killed and not mism and not envk:
         problems.append(f"{killed} exec_result records say killed, but no process was killed by the "
                         f"identity check")
     re_ = meta.get("run_end")
     flag = isinstance(re_, dict) and re_.get("exec_identity_mismatch") is True
     if complete and bool(mism) != flag:
         problems.append("run_end's exec_identity_mismatch does not match the records")
+    for r in envk:
+        if r.get("decision_final") != "DENY":
+            problems.append(f"seq {r.get('seq')}: a subagent_env record that is not a refusal")
+        problems.append(f"seq {r.get('seq')}: pid {r.get('agent_pid')} was launched as a confined subject with "
+                        f"{r.get('env')!r} set (it names code), after its launch was decided; it was killed")
+        later = [x for x in records[r["seq"] + 1:] if x.get("agent_pid") == r.get("agent_pid")
+                 and x.get("decision_final") == "ALLOW"] if type(r.get("seq")) is int else []
+        if later:
+            problems.append(f"seq {later[0].get('seq')}: pid {r.get('agent_pid')} was allowed a call after "
+                            f"it was killed")
     for r in mism:
         problems.append(f"seq {r.get('seq')}: pid {r.get('agent_pid')} ran {r.get('exe')!r}, not a program "
                         f"the Warden decided to run; it was killed (exec_identity_mismatch)")
@@ -1615,7 +1631,8 @@ def check_dialed_denies(checker, policy, rules, dialed, problems):
 
 REQUEST_REFUSE_RULES = ("policy_match", "default_deny_unknown", "certificate_refused", "max_body",
                         "fragment_escape_length", "revoked",       # v1.28: revoked
-                        "mcp_query")                               # v1.31: a POST to an MCP endpoint with a query
+                        "mcp_query",                               # v1.31: a POST to an MCP endpoint with a query
+                        "mcp_endpoint_variant")                    # review: to another spelling of one
 
 # v1.31 (section 3): an MCP call's refusals (net.mcp): by the policy, or a
 # call the proxy could not read (mcp_unreadable), whose Mcp-Method or
@@ -1628,6 +1645,16 @@ MCP_REFUSE_RULES = ("policy_match", "default_deny_unknown", "certificate_refused
                     "credential_expired")
 MCP_TOKEN_KINDS = ("placeholder", "jwt", "opaque", "malformed")
 MCP_BODY_DEFAULT = 1 << 20                 # an mcp rule without max_body=
+
+
+def mcp_variant(rules, url):
+    """v1.31 review: url is an mcp rule's URL but for ASCII case or a
+    trailing '/' (and is not that URL): the Warden refuses a POST to it
+    (mcp_endpoint_variant). As warden_pxdecide.inc.c's px_mcp_variant."""
+    if mcp_endpoint(rules, url) is not None:
+        return False
+    key = lambda u: (u[:-1] if u.endswith("/") else u).lower()          # noqa: E731
+    return any(r["kind"] == "m" and key(r["c"].split("#", 1)[0]) == key(url) for r in rules)
 
 
 def mcp_endpoint(rules, url):
@@ -1791,6 +1818,12 @@ def check_requests(records, bodies, rules, problems, closes=(), order=None):
         if ep and rec.get("rule") != "mcp_query":
             problems.append(f"seq {seq}: a POST with a query to the MCP endpoint {url} decided by request rules "
                             f"(it is refused, mcp_query)")
+            continue
+        var = m.group(1) == "POST" and mcp_variant(rules, url)
+        if var != (rec.get("rule") == "mcp_endpoint_variant") or (var and rec.get("decision_final") != "DENY"):
+            problems.append(f"seq {seq}: a request to {url} " + (
+                "decided by request rules, but it is another spelling of an MCP endpoint (it is refused, "
+                "mcp_endpoint_variant)" if var else "refused as another spelling of an MCP endpoint, which it is not"))
             continue
         decl = rec.get("body_declared")
         if (rec["body"] == "length") != (type(decl) is int and decl >= 0):

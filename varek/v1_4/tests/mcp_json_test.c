@@ -84,6 +84,8 @@ int main(int argc, char **argv) {
     want("a duplicate name in params", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"x\",\"params\":{\"name\":\"a\",\"name\":\"b\"}}", 0, 0, 0, 0);
     want("a duplicate through an escape", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"a\",\"m\\u0065thod\":\"b\"}", 0, 0, 0, 0);
     want("a duplicate deep inside", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"x\",\"params\":{\"arguments\":{\"q\":{\"k\":1,\"k\":2}}}}", 0, 0, 0, 0);
+    want("a duplicate empty name (review: UB before)", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{\"\":1,\"\":2}}", 0, 0, 0, 0);
+    want("one empty name", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{\"\":1}}", 1, "tools/list", 0, "1");
     want("name and uri", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"x\",\"params\":{\"name\":\"a\",\"uri\":\"b\"}}", 0, 0, 0, 0);
     want("a name that is not a string", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"x\",\"params\":{\"name\":1}}", 0, 0, 0, 0);
     want("a batch", "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"x\"}]", 0, 0, 0, 0);

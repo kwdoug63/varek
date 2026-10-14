@@ -266,7 +266,9 @@ else
     SP="require warden 1.31\nmcp server files exec $B/srv\nallow exec $B/tool for=files\nallow exec $B/peek for=files\n"
     SP="${SP}allow path $B/fa readonly\nallow path $B/fb readonly\nallow path $B/fs readonly for=files\nallow path $B/fb readonly for=files\n"
     printf '%b' "$SP$SL$SLF" > "$B/p.txt"
-    sgo() { local n="$1"; shift; timeout 60 "$WARDEN" "${POL:-$B/p.txt}" -- "$B/agent" "$@" > "$OUT/$n.so" 2> "$OUT/$n.out"; echo $? > "$OUT/$n.rc"; }
+    # the agent's environment as varek run gives it (v1.31 review: a confined
+    # server's environment may name no code, and this host's may)
+    sgo() { local n="$1"; shift; env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "${POL:-$B/p.txt}" -- "$B/agent" "$@" > "$OUT/$n.so" 2> "$OUT/$n.out"; echo $? > "$OUT/$n.rc"; }
     # dec <name> <file>: each decision on <file>, as "action obo decision rule", in order
     dec() { python3 -c 'import json,sys
 for l in open(sys.argv[1]):
@@ -302,6 +304,37 @@ for l in open(sys.argv[1]):
     sgo peek spawn "$B/fa" "$B/srv" exec "$B/peek" environ mem fd/0 cwd/.
     check "the server cannot open the agent's /proc entries (environ, mem, fd, cwd)" \
         sh -c "grep -qx 'environ refused EACCES' '$OUT/peek.so' && grep -qx 'mem refused EACCES' '$OUT/peek.so' && grep -qx 'fd/0 refused EACCES' '$OUT/peek.so' && grep -qx 'cwd/. refused EACCES' '$OUT/peek.so'"
+    # v1.31 review: the environment the agent launches a confined server with
+    # names no code (a #! script's interpreter would load it, under the
+    # server's rules); checked at the launch, and in the new image's own copy
+    mkdir -p "$B/work"; chmod 777 "$B/work"
+    printf '#!/usr/bin/python3\nimport sys\nprint("server ran", flush=True)\n' > "$B/srv.py"; chmod 755 "$B/srv.py"
+    printf 'print("INJECTED", flush=True)\n' > "$B/work/sitecustomize.py"; chmod 644 "$B/work/sitecustomize.py"
+    EP="require warden 1.31\nmcp server py exec $B/srv.py\nallow path $B/work/\nallow path $B/fa readonly\n"
+    EP="${EP}allow path $B/work/ readonly for=py\nallow path exact $B/srv.py readonly for=py\nallow exec /usr/bin/python3 for=py\n"
+    printf '%b' "$EP$SL$(printf '%b' "$SL" | sed 's/$/ for=py/')\n" > "$B/pe.txt"
+    envgo() { local n="$1"; shift; timeout 60 env -i PATH=/usr/bin:/bin "$@" "$WARDEN" "$B/pe.txt" -- "$B/agent" spawn "$B/fa" "$B/srv.py" > "$OUT/$n.so" 2> "$OUT/$n.out"; echo $? > "$OUT/$n.rc"; }
+    envgo eok PYTHONUNBUFFERED=1
+    check "a confined Python server starts with a setting that names no code (PYTHONUNBUFFERED)" \
+        sh -c "grep -qx 'server ran' '$OUT/eok.so' && ! grep -q INJECTED '$OUT/eok.so'"
+    envgo epath PYTHONPATH="$B/work"
+    check "launched with PYTHONPATH set, it is refused at the launch (subagent_env), and nothing of it runs" \
+        sh -c "grep -q '\"action\":\"process.exec\".*\"rule\":\"subagent_env\"' '$OUT/epath.out' && grep -q '\"env\":\"PYTHONPATH\"' '$OUT/epath.out' && ! grep -q 'INJECTED\|server ran' '$OUT/epath.so'"
+    check "... the audit accepts that run (a refusal)" python3 "$HERE/tools/varek_audit.py" --policy "$B/pe.txt" --checker "$CERT" "$OUT/epath.out"
+    envgo elate VAREK_WARDEN_TEST_ENV_LATE=1 PYTHONPATH="$B/work"
+    check "and when only the new image's copy shows it, the server is killed at its first call, before anything of it runs" \
+        sh -c "grep -q '\"rule\":\"subagent_env\"' '$OUT/elate.out' && grep -q 'was launched as a confined subject with PYTHONPATH set' '$OUT/elate.out' && ! grep -q 'INJECTED\|server ran' '$OUT/elate.so'"
+    check "... and the audit reports it" sh -c "! python3 '$HERE/tools/varek_audit.py' --policy '$B/pe.txt' --checker '$CERT' '$OUT/elate.out' > '$OUT/elate.aud' 2>&1 && grep -q 'with .PYTHONPATH. set (it names code)' '$OUT/elate.aud'"
+    evbad=""
+    envgo eopt NODE_OPTIONS="--max-old-space-size=4096 --no-warnings" JAVA_TOOL_OPTIONS="-Djavax.net.ssl.trustStore=/x -Xmx1g" GIT_TERMINAL_PROMPT=0 LD_PRELOAD=
+    check "options that load no code (NODE_OPTIONS heap, JAVA_TOOL_OPTIONS trust store, GIT_TERMINAL_PROMPT, an empty LD_PRELOAD) start it" \
+        grep -qx 'server ran' "$OUT/eopt.so"
+    for v in LD_PRELOAD=/x NODE_OPTIONS=--require=/x "NODE_OPTIONS=--no-warnings -r /x" JAVA_TOOL_OPTIONS=-javaagent:/x BASH_ENV=/x BASH_FUNC_f%%=x GIT_SSH_COMMAND=x GLIBC_TUNABLES=x PERL5LIB=/x; do
+        envgo ev "$v"
+        grep -q '"rule":"subagent_env"' "$OUT/ev.out" || evbad="$evbad ${v%%=*}"
+    done
+    check "each of LD_PRELOAD, NODE_OPTIONS (--require, -r), JAVA_TOOL_OPTIONS (-javaagent), BASH_ENV, BASH_FUNC_*, GIT_SSH_COMMAND, GLIBC_TUNABLES, PERL5LIB refused at a confined launch${evbad:+ (not:$evbad)}" \
+        test -z "$evbad"
     # forged streams the audit refuses
     F="$HERE/tests/v1270_forge.py"; AUD="$HERE/tools/varek_audit.py"
     refuses() { if python3 "$AUD" --policy "$2" --checker "$CERT" "$3" > "$OUT/f.out" 2>&1; then flunk "the audit refuses $1"
@@ -376,6 +409,7 @@ else
       printf 'allow mcp %s resources/read file:///projects/app/** max_body=300\n' "$U"
       printf 'allow mcp %s2 tools/list max_body=1000\n' "$U"
       printf 'allow request GET %s\n' "$U"
+      printf 'allow request POST https://mcp.example.com:%s/**\n' "$PS"     # review: not for an endpoint's other spellings
       printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path exact %s/agent.py readonly\n' "$X"
     } > "$POL"
     env -i PATH=/usr/bin:/bin timeout 180 "$WARDEN" "$POL" --dns-server "127.0.0.1:$DP" --trust-bundle "$X/bundle.pem" -- \
@@ -399,7 +433,7 @@ M = [r for r in recs if r.get("action") == "net.mcp"]
 sys.exit(0 if eval(sys.argv[2], {"json": json, "R": recs, "M": M, "by": lambda i: [r for r in M if r.get("rpc_id") == i]}) else 1)
 PY
     }
-    for t in init list get getesc small chunked trace; do
+    for t in init list get getesc small chunked trace ctutf8; do
         check "allowed ($t): the server answered it" said "$t" "HTTP/1.1 200 OK"
     done
     check "a notification is allowed (the server's 202)" said notify "HTTP/1.1 202 Accepted"
@@ -408,14 +442,14 @@ PY
     check "a GET on the endpoint is decided by request rules (allowed)" said get_stream "HTTP/1.1 200 OK | ok"
     check "two calls on one connection: both answered, in order" \
         sh -c "grep -c '^CALL two HTTP/1.1 200 OK' '$OUT/m.out' | grep -qx 2 && grep '^CALL two' '$OUT/m.out' | head -1 | grep -q '\"id\": 18'"
-    for t in delete unlisted dup batch hdrmis namemis big huge query nodeep badutf8; do
+    for t in delete unlisted dup batch hdrmis namemis big huge query nodeep badutf8 charset noctype gzip empty trailer upper slash; do
         check "refused ($t): 403" said "$t" "HTTP/1.1 403 Forbidden"
     done
     check "a refused call gets a JSON-RPC error with its id and code -32000" \
         sh -c "grep '^CALL delete ' '$OUT/m.out' | grep -q '\"id\":5,\"error\":{\"code\":-32000,\"message\":\"VAREK: this call was refused: the policy denies it (line 9)\"' && grep '^CALL unlisted ' '$OUT/m.out' | grep -q '\"id\":\"six\",\"error\":{\"code\":-32000'"
     check "a call that could not be read gets id null" sh -c "grep '^CALL batch ' '$OUT/m.out' | grep -q '\"id\":null,\"error\":{\"code\":-32000'"
     check "nothing refused reached the server" \
-        got "'delete_repo' in b or 'other_tool' in b or '\"id\": 7' in b or b.startswith('[') or '\"id\": 9,' in b or '\"id\": 10,' in b or '\"id\": 13,' in b or '\"id\": 14,' in b or '?x=1' in h or '\"id\": 20,' in b or '\"id\": 21,' in b" 0
+        got "'delete_repo' in b or 'other_tool' in b or '\"id\": 7' in b or b.startswith('[') or '\"id\": 9,' in b or '\"id\": 10,' in b or '\"id\": 13,' in b or '\"id\": 14,' in b or '?x=1' in h or '\"id\": 20,' in b or '\"id\": 21,' in b or any('\"id\": %d,' % i in b for i in (22, 24, 25, 26, 27, 28)) or 'Content-Length: 0' in h" 0
     check "the credential reached the server in the calls its rule allows (get, getesc, b64), as Authorization: Bearer" \
         got "'Authorization: Bearer $TOKV' in h and ('tools/call' in b or 'tools\\\\/call' in b)" 3
     check "and nowhere else" got "'$TOKV' in h + b" 3
@@ -431,9 +465,15 @@ PY
         rec "any(r.get('notification') is True and r['mcp_method'] == 'notifications/initialized' for r in M) and by('\"six\"')[0]['rule'] == 'default_deny_unknown'"
     check "the traceparent from _meta is recorded" rec "by('16')[0]['traceparent'] == '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'"
     check "the refusals' rules: policy_match, mcp_unreadable, mcp_header_mismatch, max_body" \
-        rec "[r['rule'] for r in by('5')] == ['policy_match'] and sum(r['rule'] == 'mcp_unreadable' for r in M) == 4 and sum(r['rule'] == 'mcp_header_mismatch' for r in M) == 2 and sum(r['rule'] == 'max_body' for r in M) == 2"
+        rec "[r['rule'] for r in by('5')] == ['policy_match'] and sum(r['rule'] == 'mcp_unreadable' for r in M) == 6 and sum(r['rule'] == 'mcp_header_mismatch' for r in M) == 5 and sum(r['rule'] == 'max_body' for r in M) == 2"
     check "a body over the deciding rule's max_body: refused by that rule's limit" \
         rec "[(r['rule'], r['policy_line']) for r in by('13')] == [('max_body', 11)]"
+    check "a body sent other than as UTF-8 JSON is refused: a charset, no Content-Type, a Content-Encoding (review)" \
+        rec "[r.get('mcp_error') for r in M if r['rule'] == 'mcp_header_mismatch' and r['decision_final'] == 'DENY'].count('the Content-Type is not application/json in UTF-8') == 2 and sum(r.get('mcp_error') == 'the body has a Content-Encoding' for r in M) == 1 and by('23')[0]['rule'] == 'mcp_allowed'"
+    check "an empty body is refused at once, and a chunked body with trailers (review)" \
+        rec "any(r['rule'] == 'mcp_unreadable' and r.get('mcp_error') == 'not one JSON-RPC call: an empty body' for r in M) and any(r['rule'] == 'mcp_unreadable' and r.get('mcp_error') == 'a chunked body with trailers' for r in M)"
+    check "a POST to another spelling of the endpoint (its case, a trailing /) is refused, not decided by a request rule (review)" \
+        rec "sorted(r['target'].rsplit('/', 1)[1] if not r['target'].endswith('/') else '/' for r in R if r.get('action') == 'net.request' and r.get('rule') == 'mcp_endpoint_variant' and r['decision_final'] == 'DENY') == ['/', 'MCP']"
     check "a POST with a query to the endpoint is refused (net.request, mcp_query)" \
         rec "any(r.get('action') == 'net.request' and r['rule'] == 'mcp_query' and '?x=1' in r['target'] for r in R)"
     check "no call's value is in the verdict stream" sh -c "! grep -qF -- '$TOKV' '$OUT/m.log'"

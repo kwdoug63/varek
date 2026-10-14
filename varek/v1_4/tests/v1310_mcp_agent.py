@@ -51,17 +51,20 @@ def send(tag, raw, n=1):
         print("CALL", tag, "ERR", type(e).__name__, flush=True)
 
 
-def post(body, path="/mcp", hdrs=(), chunked=False):
+def post(body, path="/mcp", hdrs=(), chunked=False, ctype="application/json", trailer=False):
     if isinstance(body, (dict, list)):
         body = json.dumps(body)
     b = body.encode() if isinstance(body, str) else body
-    h = "POST %s HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: application/json\r\n" % (path, H, P)
+    h = "POST %s HTTP/1.1\r\nHost: %s:%d\r\n" % (path, H, P)
+    if ctype is not None:
+        h += "Content-Type: %s\r\n" % ctype
     h += "Accept: application/json, text/event-stream\r\n"
     for k, v in hdrs:
         h += "%s: %s\r\n" % (k, v)
     if chunked:
         mid = len(b) // 2
-        framed = b"%x\r\n" % mid + b[:mid] + b"\r\n" + b"%x;ext=1\r\n" % (len(b) - mid) + b[mid:] + b"\r\n0\r\n\r\n"
+        framed = b"%x\r\n" % mid + b[:mid] + b"\r\n" + b"%x;ext=1\r\n" % (len(b) - mid) + b[mid:] + b"\r\n0\r\n" + \
+            (b"X-Trailer: 1\r\n" if trailer else b"") + b"\r\n"
         return (h + "Transfer-Encoding: chunked\r\n\r\n").encode() + framed
     return (h + "Content-Length: %d\r\n\r\n" % len(b)).encode() + b
 
@@ -119,3 +122,12 @@ send("get_stream", ("GET /mcp HTTP/1.1\r\nHost: %s:%d\r\nAccept: text/event-stre
 send("two", post(call(18, "tools/list"), hdrs=V0618) + post(call(19, "initialize", {}), hdrs=V0618), n=2)
 send("nodeep", post('{"jsonrpc":"2.0","id":20,"method":"tools/list","params":{"a":' + "[" * 80 + "]" * 80 + "}}"))
 send("badutf8", post(b'{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"get_\xc0\xaf"}}'))
+# v1.31 review: the body as the server would decode it, and the endpoint's other spellings
+send("charset", post(call(22, "tools/list"), hdrs=V0618, ctype="application/json; charset=utf-7"))
+send("ctutf8", post(call(23, "tools/list"), hdrs=V0618, ctype='Application/JSON ; charset="UTF-8"'))
+send("noctype", post(call(24, "tools/list"), hdrs=V0618, ctype=None))
+send("gzip", post(call(25, "tools/list"), hdrs=V0618 + [("Content-Encoding", "gzip")]))
+send("empty", post(b"", hdrs=V0618))
+send("trailer", post(call(26, "tools/list"), hdrs=V0618, chunked=True, trailer=True))
+send("upper", post(call(27, "tools/list"), path="/MCP", hdrs=V0618))
+send("slash", post(call(28, "tools/list"), path="/mcp/", hdrs=V0618))
