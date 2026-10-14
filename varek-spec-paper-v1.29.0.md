@@ -135,7 +135,7 @@ A decision is only as sound as the identity of the object it is made about, and 
 
 From v1.12.1 the supervised agent cannot forge, drop or reorder a record. From v1.16 neither can a person who holds the log afterwards. Every record is hash-chained; with `--sign-key`, run start, a checkpoint every 64 records (and at least once a second) and run end are signed with Ed25519; with `--anchor`, each checkpoint is appended to storage the log's holder cannot rewrite. `tools/varek_audit.py --pubkey --anchor` catches any edit, insertion, removal or reordering before the last signature, and a stream cut short, by anyone without the key, and any rewrite of anchored history even by someone with it. It verifies signatures with its own pure-Python RFC 8032 verifier. The Warden refuses to start if the policy would let the agent open the key, the anchor, the verdict stream or a raw disk.
 
-An anchor on the Warden's own host does not protect against that host's root, who also holds the key. From v1.16.2 `tools/varek_anchor_forward.py` sends each checkpoint off the host, normally within a second, spooling through outages, to an append-only receiver set up by `tools/varek_anchor_receiver.sh` — an SSH account restricted to one forced command that appends well-formed anchor lines to a `chattr +a` file. `tools/varek_preflight.sh` (v1.16.1) checks a deployment before it runs, including every location the Warden refuses at startup, and with `--run` performs an audited trial run.
+An anchor on the Warden's own host does not protect against that host's root, who also holds the key. From v1.16.2 `tools/varek_anchor_forward.py` sends each checkpoint off the host, normally within a second, spooling through outages, to an append-only receiver set up by `tools/varek_anchor_receiver.sh` — an SSH account restricted to one forced command that appends well-formed anchor lines to a `chattr +a` file. `tools/varek_preflight.sh` (v1.16.1) checks a deployment ahead of its first run, including every location the Warden refuses at startup, and with `--run` performs an audited trial run.
 
 **Evidence export.** The verdict stream exports as a Bill of Materials in the CycloneDX 1.6 format: the runtime as a tool component, the supervised run as the subject, each authorized object and connected destination as a component, and an Authorization-Before-Execution attestation. From v1.18.0 the attestation is derived from the stream, the exporter checks the policy file against the recorded SHA-256, the BOM can be signed (JSON Signature Format, Ed25519), and output is tested against the published CycloneDX 1.6 schema. The exporter refuses a stream that does not verify, so a corrupted log cannot be laundered into an attestation. (CycloneDX is a trademark of the OWASP Foundation; VAREK is not affiliated with or endorsed by the OWASP Foundation or the CycloneDX project, and uses the name only to describe interoperability with the openly published CycloneDX format, standardized as ECMA-424.)
 
@@ -437,7 +437,7 @@ A narrated demo walks through the stack end to end: authorization on a compliant
 ## 7. Documentation
 
 - `README.md` — what VAREK is, the verdict model, and a summary of every release.
-- `RELEASE-v1.28.1.md`, `RELEASE-v1.28.0.md`, `RELEASE-v1.27.1.md`, `RELEASE-v1.27.0.md`, `RELEASE-v1.26.1.md`, `RELEASE-v1.26.0.md`, `RELEASE-v1.25.0.md`, `RELEASE-v1.24.0.md`, `RELEASE-v1.23.1.md`, `RELEASE-v1.23.0.md`, `RELEASE-v1.22.0.md`, `RELEASE-v1.21.1.md`, `RELEASE-v1.21.0.md`, and the release notes for each earlier version — what changed, how it was tested, what an independent review found, compatibility, and known limits.
+- `RELEASE-v1.29.0.md`, `RELEASE-v1.28.1.md`, `RELEASE-v1.28.0.md`, `RELEASE-v1.27.1.md`, `RELEASE-v1.27.0.md`, `RELEASE-v1.26.1.md`, `RELEASE-v1.26.0.md`, `RELEASE-v1.25.0.md`, `RELEASE-v1.24.0.md`, `RELEASE-v1.23.1.md`, `RELEASE-v1.23.0.md`, `RELEASE-v1.22.0.md`, `RELEASE-v1.21.1.md`, `RELEASE-v1.21.0.md`, and the release notes for each earlier version — what changed, how it was tested, what an independent review found, compatibility, and known limits.
 - `CHANGELOG.md` — the full change record, with dated corrections.
 - `docs/aws-deployment-guide.md` — deploying and operating VAREK Enterprise on AWS: architecture, IAM, keys, network, costs, sizing, health checks, backup and recovery, key rotation, upgrades and support, with an index to the AWS Foundational Technical Review requirements.
 - `docs/security/threat-model.md` and `docs/security/threat-model-dataflow.md` — adversary models, in-scope guarantees, and out-of-scope non-goals.
@@ -451,6 +451,7 @@ A narrated demo walks through the stack end to end: authorization on a compliant
 - `docs/security/v1.27.1-writable-noexec.md` — the design for mounting writable directories `noexec`, with implementation notes, the review's findings and the regression count.
 - `docs/security/v1.28-credential-release.md` — the design for credential release and revocation, with implementation notes, the review's findings and the regression count.
 - `docs/security/v1.28.1-delegation-chain.md` — the design for the on-behalf-of chain (verifying the user and the agent, sub-agents by control group, expiry), with implementation notes, the review's findings and the regression count.
+- `docs/security/v1.29-varek-run.md` — the design for `varek run` with nothing set up first (the baseline and profiles, opening as the agent, the dry run, `varek policy suggest`), with implementation notes and the regression count.
 - `docs/security/v1.10-architecture-roadmap.md` — the model- and TCB-changing track.
 - `docs/verification/` — the bitvector, bounded-string and bounded-sequence fragments, the verdict-distribution harness and its corpus schema.
 - `docs/security/v1.9.2-baseline-allowlist.md` — the default-deny allowlist rationale and class-to-syscall map.
@@ -470,7 +471,7 @@ The v1.10/v1.11 verification program has one goal: move cases out of UNKNOWN int
 
 Next, stated as direction and not claimed as shipped:
 
-- **The releases after v1.28.1** (`docs/roadmap/v1.28-v1.31.md`): v1.29.0, `varek run` with a built-in baseline policy and a non-enforcing dry run; v1.30.0, macOS through a Linux VM; v1.31.0, OCSF export and MCP.
+- **The releases after v1.29.0** (`docs/roadmap/v1.28-v1.31.md`): v1.30.0, macOS through a Linux VM; v1.31.0, OCSF export and MCP.
 - **Bounded sequence fragment (v1.11, candidate).** Element-level reasoning for the cross-action data-flow subsystem, composed on top of the string and bitvector fragments so its soundness inherits theirs.
 - **A customer baseline** for the verdict-distribution harness, on a design partner's workload and policy.
 - **The v1.10 architecture track:** race-free filesystem enforcement and trusted-base reduction via a kernel-native sandbox (Landlock, used for launches from v1.27.0; `noexec` mounts for written files from v1.27.1); acquisition-time mediation tiering with a latency gate; an optional post-grant re-mediation mode; an escalation ladder for UNKNOWN at the kernel edge; and a trusted base reduced to a minimal supervisor, a small proof checker and the kernel.
@@ -494,7 +495,7 @@ VAREK is released under the **MIT license**. Three provisional patent applicatio
 | v1.1 | Security release: pluggable isolation backend; subprocess-boundary fix. |
 | v1.4 | The Warden: a seccomp user-notify supervisor in C (kernel-boundary enforcement). |
 | v1.5 | Fast-path matcher and SMT feasibility study for the decision layer. |
-| v1.6 | Pre-execution verification of agent action-graphs; compositional three-state decision. |
+| v1.6 | Plan-time verification of agent action-graphs; compositional three-state decision. |
 | v1.7 | Kernel-boundary integration; vertical stack from system boundary to formal decision. |
 | v1.8 | Cross-action data-flow verification; audited declassification (v1.8.0); bounded-refusal breaker (v1.8.2). |
 | v1.9 | Progress-safety verification. Load-time liveness proof; certified human-out-of-the-loop. |
@@ -529,15 +530,16 @@ VAREK is released under the **MIT license**. Three provisional patent applicatio
 | v1.27.0 | Decided program launches (`require warden 1.27`): `allow exec` rules expanded to a launch set held by Landlock, each launch decided on its name and certified, the identity check, launch records and their audit; what a compile needs. |
 | v1.27.1 | Nothing written during the run is mapped executable: under `require warden 1.27` the policy's writable directories mounted `noexec` where the Warden opens files, a descriptor not coming through such a mount refused, each directory recorded and audited against its rule; `--writable-exec` to turn it off for a run. |
 | v1.28.0 | Credential release: the agent holds only placeholders; `warden-secrets` fetches from a file, Vault or AWS Secrets Manager and hands the values to the proxy, which writes one into a request only in the header an allowing rule names; `varek revoke`; each credential recorded and every request that carried one audited against its rule. |
-| **v1.28.1** | **The on-behalf-of chain in every decision record: the user's token verified against a trusted identity provider's keys, the agent's X.509-SVID against its trust domain's bundle, each sub-agent attributed by a control group of its own from its launch; the token's expiry revokes the run; the chain recorded and audited, not enforced.** |
-| v1.29.0 to v1.31.0 (planned) | `varek run` with a baseline policy and a dry run; macOS through a Linux VM; OCSF and MCP. |
+| v1.28.1 | The on-behalf-of chain in every decision record: the user's token verified against a trusted identity provider's keys, the agent's X.509-SVID against its trust domain's bundle, each sub-agent attributed by a control group of its own from its launch; the token's expiry revokes the run; the chain recorded and audited, not enforced. |
+| **v1.29.0** | **`varek run` with nothing set up first: a baseline policy and agent profiles; files opened and changed by name as the agent's own user; a dry run that records what a policy refuses and enforces only a fixed set; `varek policy suggest`.** |
+| v1.30.0 and v1.31.0 (planned) | macOS through a Linux VM; OCSF and MCP. |
 | v1.11 (candidate) | Bounded sequence fragment for cross-action data flow. |
 
 ---
 
 ## Appendix B — Corrections to earlier editions
 
-Earlier editions of this paper (v1.9.1 through v1.28.0) made statements a later review of the code did not bear out. They are corrected in the text above; this list records what changed.
+Earlier editions of this paper (v1.9.1 through v1.28.1) made statements a later review of the code did not bear out. They are corrected in the text above; this list records what changed.
 
 1. **UNKNOWN diagnostics and resource bounds.** Specified for v1.9.1 but not implemented then. §3.2 describes what exists, from v1.13.0. (Corrected in v1.18.0.)
 2. **TOCTOU figure.** "510 leaks in 20,000 attempts" has no recorded run. The v1.18.0 re-run gave 1,848 to 1,889 leaks for approve-then-continue and 0 for resolve-and-inject. (Corrected in v1.18.0.)
