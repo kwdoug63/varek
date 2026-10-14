@@ -579,6 +579,9 @@ sys.exit(1)' "$OUT/$1.out" "$2"; }
     g4 ft_opq2 "$(printf '%s' "$FT" | sed "s|audience=$U|audience=$U opaque|")"
     check "... and with opaque: fetched, listed as opaque, no expiry" \
         sh -c "$(declare -f ok4 rs4); OUT='$OUT'; ok4 ft_opq2 && rs4 ft_opq2 \"r['credentials'][0].get('opaque') is True and 'expires' not in r['credentials'][0]\""
+    put "$X/mt" "$(tok "$AB/as" "https://mcp.example.com/mcp" 3600)"
+    g4 ft_opq3 "$(printf '%s' "$FT" | sed "s|audience=$U|audience=$U opaque|")"
+    check "an opaque line whose value is a JWT for another server: still checked, refused (review)" no4 ft_opq3 "does not name $U"
     # the user, found through an MCP server's metadata
     MR="require warden 1.31\ntrust mcp-resource $AB/mcp\n$LIBS"
     put "$A/utok" "$(tok "$AB/as" "$AB/mcp" 3600)"
@@ -614,8 +617,19 @@ sys.exit(1)' "$OUT/$1.out" "$2"; }
         "$(tok "$AB/as" "$U" -60)" "$(cat "$A/utok")" <<'PY'
 import base64, json, sys
 b = lambda s: base64.urlsafe_b64encode(s.encode()).rstrip(b"=").decode()
+# v1.31 review: the user's token signed again (ECDSA's other s: n - s, a
+# valid signature its server's library accepts), and lenient spellings a
+# server would read as the token: padding, a tab after the scheme, DPoP
+u = sys.argv[5]
+h, p, sg = u.split(".")
+raw = base64.urlsafe_b64decode(sg + "=" * (-len(sg) % 4))
+N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+s2 = (N - int.from_bytes(raw[32:], "big")).to_bytes(32, "big")
+u2 = h + "." + p + "." + base64.urlsafe_b64encode(raw[:32] + s2).rstrip(b"=").decode()
 json.dump({"t_good": sys.argv[2], "t_other": sys.argv[3], "t_expired": sys.argv[4], "t_opaque": "opaque-abc-123",
-           "t_malformed": b('{"alg":"ES256"}') + "." + b('{"aud":"a","aud":"b"}') + ".c2ln", "t_user": sys.argv[5]},
+           "t_malformed": b('{"alg":"ES256"}') + "." + b('{"aud":"a","aud":"b"}') + ".c2ln", "t_user": u,
+           "t_user_s": u2, "t_other_pad": sys.argv[3] + "==", "t_expired_pad": sys.argv[4] + "==", "t_user_pad": u + "==",
+           "t_other_tab": "HDR:Bearer\t" + sys.argv[3], "t_other_dpop": "HDR:DPoP " + sys.argv[3]},
           open(sys.argv[1], "w"))
 PY
     chmod 644 "$X/toks.json"
@@ -632,7 +646,8 @@ PY
         /usr/bin/python3 "$X/agent.py" "$PS" tokens "$X/toks.json" > "$OUT/t4.out" 2> "$OUT/t4.log"
     cut -c1-150 "$OUT/t4.out" | sed 's/^/     /'
     for t in t_good t_opaque ph_get ph_other ph_plain; do check "allowed ($t)" said_in t4 "$t" "HTTP/1.1 200 OK"; done
-    for t in t_other t_expired t_malformed t_user; do check "refused ($t): 403" said_in t4 "$t" "HTTP/1.1 403 Forbidden"; done
+    for t in t_other t_expired t_malformed t_user t_user_s t_other_pad t_expired_pad t_user_pad t_other_tab t_other_dpop; do
+        check "refused ($t): 403" said_in t4 "$t" "HTTP/1.1 403 Forbidden"; done
     r4() { python3 -c 'import json,sys
 M = {}
 for l in open(sys.argv[1], errors="replace"):
@@ -640,9 +655,11 @@ for l in open(sys.argv[1], errors="replace"):
         r = json.loads(l); M.setdefault(r.get("rpc_id"), []).append(r)
 sys.exit(0 if eval(sys.argv[2], {"M": M}) else 1)' "$OUT/t4.log" "$1"; }
     check "the refusals' rules: another audience, expired, malformed, the user's token" \
-        r4 "sorted(r['rule'] for r in M['30'] if r['decision_final'] == 'DENY') == ['mcp_token_audience', 'mcp_token_expired', 'mcp_token_malformed', 'mcp_token_user']"
+        r4 "sorted(r['rule'] for r in M['30'] if r['decision_final'] == 'DENY') == ['mcp_token_audience'] * 3 + ['mcp_token_expired'] + ['mcp_token_malformed'] * 4 + ['mcp_token_user'] * 2"
+    check "... the user's token signed again is the user's; padding is malformed; a tab or DPoP is still the bearer token (review)" \
+        r4 "len(M['30']) == 12"
     check "each call records what kind of token it carried, never the token" \
-        r4 "sorted(r['token'] for r in M['30']) == ['jwt', 'jwt', 'jwt', 'jwt', 'malformed', 'opaque'] and all(r['token'] == 'placeholder' for r in M['31'] + M['32'])"
+        r4 "sorted(r['token'] for r in M['30']) == ['jwt'] * 7 + ['malformed'] * 4 + ['opaque'] and all(r['token'] == 'placeholder' for r in M['31'] + M['32'])"
     check "the run's MCP token reached the server once: in the call its rule names" \
         sh -c "[ \"\$(grep -c -- '$MTV' '$OUT/got.jsonl')\" = 1 ] && grep -- '$MTV' '$OUT/got.jsonl' | grep -q 'tools/call'"
     check "... not on another MCP endpoint or a plain request (they got the placeholder)" \

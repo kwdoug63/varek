@@ -191,10 +191,14 @@ static void mcp_report(struct wp_held *h, const char *fail, uint32_t code) {
         if (r < 0) {
             snprintf(why, sizeof why, "the call has two Authorization headers");
             ok = WP_MCP_HEADERS;
-        } else if (r == 1 && pvn > 7 && !strncasecmp((const char *)pv, "Bearer ", 7)) {
-            const char *t = (const char *)pv + 7;
-            size_t tn = pvn - 7;
-            while (tn && *t == ' ') { t++; tn--; }
+        } else if (r == 1 && ((pvn >= 6 && !strncasecmp((const char *)pv, "Bearer", 6) && (pvn == 6 || pv[6] == ' ' || pv[6] == '\t')) ||
+                              (pvn >= 4 && !strncasecmp((const char *)pv, "DPoP", 4) && (pvn == 4 || pv[4] == ' ' || pv[4] == '\t')))) {
+            /* v1.31 review: the scheme (Bearer, or DPoP's), any case, then any
+             * spaces and tabs (the header's own were trimmed) */
+            size_t sl = (pv[0] | 0x20) == 'b' ? 6 : 4;
+            const char *t = (const char *)pv + sl;
+            size_t tn = pvn - sl;
+            while (tn && (*t == ' ' || *t == '\t')) { t++; tn--; }
             for (unsigned k = 0; k < WS_MAX_CREDS && !m.token; k++)
                 if (g_ph[k][0] && strlen(g_ph[k]) == tn && !memcmp(g_ph[k], t, tn)) m.token = WP_TOK_PLACEHOLDER;
             if (!m.token) {
@@ -206,6 +210,8 @@ static void mcp_report(struct wp_held *h, const char *fail, uint32_t code) {
                 if (!j) snprintf(jw, sizeof jw, "the proxy is out of memory");
                 if (jr == 1) {
                     m.token = WP_TOK_JWT;
+                    unsigned sl2 = 0;          /* review: the signing input, which re-signing does not change */
+                    (void)EVP_Digest(t, j->signing_len, m.token_sin_sha256, &sl2, EVP_sha256(), NULL);
                     m.naud = j->naud;
                     m.aud_over = j->aud_over;
                     m.has_exp = j->has_exp;

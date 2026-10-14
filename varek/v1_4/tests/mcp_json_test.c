@@ -134,10 +134,20 @@ int main(int argc, char **argv) {
     jwt("a JWT, exp a fraction", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjEuNX0.c2ln", -1, 0, NULL, -1LL, 0);
     jwt("a JWT, claims not an object", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.WzFd.c2ln", -1, 0, NULL, -1LL, 0);
     jwt("a JWT, a header without alg", "eyJ0eXAiOiJKV1QifQ.e30.c2ln", -1, 0, NULL, -1LL, 0);
-    jwt("a JWT, padding in a part", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhIjoxfQ==.x", 0, 0, NULL, -1LL, 0);
+    /* v1.31 review: a token in a JWT's form must be a strict compact JWS (a
+     * lenient reader takes the padded or re-encoded one for the same token) */
+    jwt("a JWT, padding in a part (review: malformed, not opaque)", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhIjoxfQ==.x", -1, 0, NULL, -1LL, 0);
+    jwt("a JWT, padding on the signature", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJ4In0.c2ln==", -1, 0, NULL, -1LL, 0);
+    jwt("a JWT, a signature not canonically encoded (stray bits)", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJ4In0.c2l", -1, 0, NULL, -1LL, 0);
+    jwt("a JWT, a canonical short signature", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJ4In0.c2k", 1, 1, "x", -1LL, 0);
+    jwt("a JWT whose JSON starts with a space", "eyAiYWxnIjogIlJTMjU2In0.eyAiYXVkIjogIngifQ.c2ln", 1, 1, "x", -1LL, 0);
+    jwt("a JWT with a space inside", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJ4In0 .c2ln", -1, 0, NULL, -1LL, 0);
     jwt("opaque: no dots", "abcdef0123", 0, 0, NULL, -1LL, 0);
     jwt("opaque: three parts, not JSON", "abcd.efgh.ijkl", 0, 0, NULL, -1LL, 0);
-    jwt("opaque: four parts", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.e30.c2ln.x", 0, 0, NULL, -1LL, 0);
+    jwt("opaque: a b64token with + / ~ and padding", "ab+c/d~e.f==", 0, 0, NULL, -1LL, 0);
+    jwt("not a bearer token: a comma", "abc,def", -1, 0, NULL, -1LL, 0);
+    jwt("in a JWT's form, four parts (review: malformed)", "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.e30.c2ln.x", -1, 0, NULL, -1LL, 0);
+    jwt("a JWE (five parts): opaque", "eyJhbGciOiJSU0EtT0FFUCIsImVuYyI6IkEyNTZHQ00ifQ.a2V5.aXY.Y2lwaGVy.dGFn", 0, 0, NULL, -1LL, 0);
     hdr("plain", "get_issue", 1, "get_issue");
     hdr("base64", "=?base64?SGVsbG8sIOS4lueVjA==?=", 1, "Hello, \xe4\xb8\x96\xe7\x95\x8c");
     hdr("base64 of the sentinel itself", "=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?=", 1, "=?base64?literal?=");

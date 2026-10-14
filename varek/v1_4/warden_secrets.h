@@ -152,6 +152,8 @@ struct ws_identity {
     char     kid[256];                /* "" : absent */
     char     token_sha256[65];
     char     pad1[7];
+    char     token_sin_sha256[65];    /* v1.31 review: of its signing input (header.payload) */
+    char     pad4[7];
     uint32_t nact;                    /* the actors (RFC 8693 `act`), the current one first */
     uint32_t has_svid;
     struct ws_actor act[WS_MAX_ACTORS];

@@ -84,7 +84,8 @@ if len(sys.argv) > 3 and sys.argv[2] == "tokens":
     # a bearer token; then credential mt's placeholder where its rule names
     # it, on another endpoint, and on a plain request
     for tag, t in json.load(open(sys.argv[3])).items():
-        send(tag, post(call(30, "tools/list"), hdrs=V0618 + [("Authorization", "Bearer " + t)]))
+        # "HDR:value": the whole Authorization value as given (review: other spellings of the scheme)
+        send(tag, post(call(30, "tools/list"), hdrs=V0618 + [("Authorization", t[4:] if t.startswith("HDR:") else "Bearer " + t)]))
     MT = [("Authorization", "Bearer " + os.environ.get("VAREK_CRED_MT", ""))]
     send("ph_get", post(call(31, "tools/call", {"name": "get_issue"}), hdrs=V0618 + MT))
     send("ph_other", post(call(32, "tools/list"), path="/other", hdrs=V0618 + MT))

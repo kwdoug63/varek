@@ -178,11 +178,13 @@ static struct { char aud[1025]; bool opaque; } g_mcpcred[WS_MAX_CREDS];
 static const char *mcp_token_check(unsigned idx, int64_t *exp) {
     static char w[256];
     *exp = -1;
-    if (g_mcpcred[idx].opaque) return NULL;
     mj_jwt_t *j = calloc(1, sizeof *j);
     if (!j) return "out of memory";
     char jw[72] = "";
     int r = mj_jwt((const char *)g_arena + g_val[idx].off, g_val[idx].len, j, jw, sizeof jw);
+    /* an opaque line's value is not read, unless it is a readable JWT after
+     * all (v1.31 review: a store that moved to JWTs is checked as one) */
+    if (g_mcpcred[idx].opaque && r != 1) { free(j); return NULL; }
     const char *bad = NULL;
     int64_t now = (int64_t)time(NULL);
     bool named = false;
@@ -194,7 +196,7 @@ static const char *mcp_token_check(unsigned idx, int64_t *exp) {
     else if (j->exp <= now) { snprintf(w, sizeof w, "it expired %lld s ago", (long long)(now - j->exp)); bad = w; }
     else if (j->exp < now + LEEWAY_S) { snprintf(w, sizeof w, "it expires in %lld s, under 60 s", (long long)(j->exp - now)); bad = w; }
     else if (j->exp >= (int64_t)1 << 53) bad = "its expiry (exp) is past any date this Warden records";
-    else *exp = j->exp;
+    else *exp = g_mcpcred[idx].opaque ? -1 : j->exp;      /* an opaque line's: checked, not recorded as one */
     free(j);
     return bad;
 }
@@ -1316,7 +1318,11 @@ static int get_json(const char *url, char **out, size_t *ol, char *why, size_t w
         return -1;
     }
     int st = 0;
-    if (http_do(&u, g_conf.oidc_ca[0] ? g_conf.oidc_ca : NULL, false, "GET", u.path[0] ? u.path : "/",
+    /* v1.31 review: the path as written (url_parse trims a trailing '/' for
+     * the base URLs it is also used for; a well-known URL keeps it) */
+    const char *rp = strstr(url, "://");
+    rp = rp ? strchr(rp + 3, '/') : NULL;
+    if (http_do(&u, g_conf.oidc_ca[0] ? g_conf.oidc_ca : NULL, false, "GET", rp ? rp : "/",
                 "Accept: application/json\r\n", "", 0, &st, out, ol, why, wn) < 0)
         return -1;
     if (st != 200) {
@@ -1429,6 +1435,21 @@ static int jws_verify(EVP_PKEY *pk, int alg, const char *in, size_t inl, const u
 
 /* The user's token (g_user_token), as its own user. 0 with g_id filled, or
  * -1 with why (the check that failed). */
+
+/* v1.31 review: the claims' aud (one, a string or an array) holds want */
+static bool aud_holds(const char *pay, const char *pe, const char *want) {
+    char aud[256];
+    if (jcount(pay, pe, "aud") != 1) return false;
+    const char *ag = jget(pay, pe, "aud");
+    const char *av = ag ? jws(ag, pe) : NULL;
+    if (av && *av == '"') return jgets(pay, pe, "aud", aud, sizeof aud) == 1 && !strcmp(aud, want);
+    for (const char *x = jarr_first(av, pe); x; x = jarr_next(x, pe)) {
+        long n = jstr(x, pe, aud, sizeof aud - 1);
+        if (n >= 0) { aud[n] = '\0'; if ((size_t)n == strlen(want) && !strcmp(aud, want)) return true; }
+    }
+    return false;
+}
+
 static int verify_token_parts(char *why, size_t wn) {
     char sb[128], sb2[128];
     const char *tok = g_user_token;
@@ -1558,17 +1579,13 @@ static int verify_token_parts(char *why, size_t wn) {
     EVP_PKEY_free(pk);
     if (!good) { snprintf(why, wn, "its signature does not verify with the issuer's key"); return -1; }
     /* the claims (signed: the issuer's) */
-    char aud[256];
-    int c = jcount(pay, pe, "aud");
-    bool aud_ok = false;
-    if (c == 1) {
-        const char *ag = jget(pay, pe, "aud");
-        const char *av = ag ? jws(ag, pe) : NULL;
-        if (av && *av == '"') aud_ok = jgets(pay, pe, "aud", aud, sizeof aud) == 1 && !strcmp(aud, want_aud);
-        else for (const char *x = jarr_first(av, pe); x && !aud_ok; x = jarr_next(x, pe)) {
-            long n = jstr(x, pe, aud, sizeof aud - 1);
-            if (n >= 0) { aud[n] = '\0'; aud_ok = (size_t)n == strlen(want_aud) && !strcmp(aud, want_aud); }
-        }
+    bool aud_ok = aud_holds(pay, pe, want_aud);
+    /* v1.31 review: an authorization server two trusted resources share:
+     * the token is for one of them; the one its audience names */
+    for (uint32_t i = 0; !aud_ok && fx >= 0 && i < g_nfound; i++) {
+        if ((int)i == fx || strcmp(g_found[i].iss, iss)) continue;
+        const char *wa = g_mcpres[g_found[i].res].aud[0] ? g_mcpres[g_found[i].res].aud : g_mcpres[g_found[i].res].url;
+        if (aud_holds(pay, pe, wa)) { aud_ok = true; fx = (int)i; want_aud = wa; }
     }
     if (!aud_ok) { snprintf(why, wn, "its audience (aud) does not hold %s", want_aud); return -1; }
     int64_t exp = 0, nbf = -1, iat = -1, now = (int64_t)time(NULL);
@@ -1622,6 +1639,10 @@ static int verify_token_parts(char *why, size_t wn) {
     snprintf(g_id.alg, sizeof g_id.alg, "%.15s", alg);
     snprintf(g_id.kid, sizeof g_id.kid, "%s", kid);
     sha256_hex(tok, tl, g_id.token_sha256);
+    {   /* v1.31 review: the signing input, so a re-signed copy is known too */
+        const char *d1 = memchr(tok, '.', tl), *d2 = d1 ? memchr(d1 + 1, '.', tl - (size_t)(d1 + 1 - tok)) : NULL;
+        sha256_hex(tok, d2 ? (size_t)(d2 - tok) : tl, g_id.token_sin_sha256);
+    }
     return 0;
 }
 
@@ -1666,6 +1687,12 @@ static void discover_mcp(void) {
         if (rr != 1 || strcmp(res, url)) {
             if (!g_found_why[0]) snprintf(g_found_why, sizeof g_found_why, "%.120s: its metadata names another resource (%s)",
                                           url, rr == 1 ? shown(res, sb, sizeof sb) : "none");
+            free(doc);
+            continue;
+        }
+        if (jcount(doc, doc + dl, "authorization_servers") != 1) {     /* review: once, as resource is */
+            if (!g_found_why[0]) snprintf(g_found_why, sizeof g_found_why, "%.120s: its metadata has authorization_servers "
+                                          "other than once", url);
             free(doc);
             continue;
         }

@@ -153,6 +153,7 @@ struct wp_mcpreq {
     int64_t  exp;
     uint8_t  token_sha256[32];   /* of the token (WP_TOK_JWT, _OPAQUE, _MALFORMED) */
     char     token_why[72];      /* WP_TOK_MALFORMED: why */
+    uint8_t  token_sin_sha256[32]; /* v1.31 review: WP_TOK_JWT: of its signing input (header.payload) */
     char     aud[WP_AUD_MAX][512];
 };
 /* v1.31: Warden -> proxy, the decision on an MCP call. Allowed: the head

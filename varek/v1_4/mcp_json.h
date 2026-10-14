@@ -56,6 +56,7 @@ int mj_call(const uint8_t *body, size_t n, mj_call_t *out, char *why, size_t wn)
 typedef struct {
     uint32_t naud;                  /* the audiences read ("aud" a string: 1) */
     bool     aud_over;              /* more than MJ_AUD_MAX, one of MJ_AUD_LEN bytes or more, or not a string */
+    size_t   signing_len;           /* v1.31 review: the length of header.payload (the signing input) */
     bool     has_exp;
     int64_t  exp;
     char     aud[MJ_AUD_MAX][MJ_AUD_LEN];
@@ -65,8 +66,13 @@ typedef struct {
  * first decoding to a JSON object), and its header (naming "alg") and
  * claims are each one JSON object, read as strictly as a call: no
  * duplicate members, UTF-8 only, at most 64 deep; "exp", if given, a whole
- * number. 0: it is not in a JWT's form (an opaque token). -1: it is in a
- * JWT's form but cannot be read so (why). */
+ * number. 0: it is not in a JWT's form (an opaque token, an RFC 6750
+ * b64token). -1: it is in a JWT's form (its first segment decodes to '{')
+ * but is not a strict compact JWS, or cannot be read so, or it is neither
+ * (a byte a bearer token may not hold) (why). v1.31 review: padding, a
+ * byte outside base64url, or a segment not canonically encoded is -1, not
+ * opaque, so a lenient reader cannot be handed a token these checks passed
+ * over. */
 int mj_jwt(const char *tok, size_t n, mj_jwt_t *out, char *why, size_t wn);
 
 /* Decode an Mcp-Name or Mcp-Method header value as the transport says:

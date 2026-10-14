@@ -542,24 +542,67 @@ static int jwt_part(const char *s, size_t n, int cap, mj_jwt_t *out, const char 
 
 int mj_jwt(const char *tok, size_t n, mj_jwt_t *out, char *why, size_t wn) {
     memset(out, 0, sizeof *out);
+    const char *w = NULL;
     const char *d1 = memchr(tok, '.', n), *d2 = d1 ? memchr(d1 + 1, '.', n - (size_t)(d1 + 1 - tok)) : NULL;
-    if (!d1 || !d2 || d1 == tok || d2 == d1 + 1 || memchr(d2 + 1, '.', n - (size_t)(d2 + 1 - tok))) return 0;
+    /* v1.31 review: a token is in a JWT's form when its first segment (any
+     * '=' padding aside) decodes to bytes that begin, after JSON's
+     * whitespace, with '{'. A token in that form must be a compact JWS,
+     * strictly: three segments, base64url without padding, each decoding
+     * canonically (a lenient reader would take a padded or re-encoded one
+     * for the same token, and the checks below would not see it). Any other
+     * token must be an RFC 6750 b64token to be opaque. */
+    size_t hl = d1 ? (size_t)(d1 - tok) : n, hs = hl;
+    while (hs && tok[hs - 1] == '=') hs--;
+    /* its first bytes: whole groups of four characters (a cut group would
+     * fail the canonical check), or the whole segment when it is shorter */
+    uint8_t first[12];
+    size_t m = hs < 4 ? hs : (hs < 16 ? hs : 16) / 4 * 4;
+    long fl = m ? b64url(tok, m, first, sizeof first) : -1;
+    bool form = false;
+    for (long i = 0; i < fl; i++) {
+        if (first[i] == ' ' || first[i] == '\t' || first[i] == '\n' || first[i] == '\r') continue;
+        form = first[i] == '{';
+        break;
+    }
+    if (!form) {
+        size_t i = 0;
+        while (i < n && ((tok[i] >= 'A' && tok[i] <= 'Z') || (tok[i] >= 'a' && tok[i] <= 'z') ||
+                         (tok[i] >= '0' && tok[i] <= '9') || strchr("-._~+/", tok[i]))) i++;
+        while (i < n && tok[i] == '=') i++;
+        if (i == n && n) return 0;
+        w = "a bearer token with a byte RFC 6750 does not allow";
+        goto bad;
+    }
     for (size_t i = 0; i < n; i++) {
         char c = tok[i];
-        if (!(c == '.' || c == '-' || c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')))
-            return 0;
+        if (!(c == '.' || c == '-' || c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) {
+            w = "a JWT not in compact form (padding, or a byte outside base64url)";
+            goto bad;
+        }
     }
-    /* in a JWT's form: its header must decode to an object (else: opaque) */
-    uint8_t first[3];
-    size_t hl = (size_t)(d1 - tok);
-    if (b64url(tok, hl < 4 ? hl : 4, first, sizeof first) < 1 || first[0] != '{') return 0;
-    const char *w = NULL;
+    if (!d1 || !d2 || d1 == tok || d2 == d1 + 1 || memchr(d2 + 1, '.', n - (size_t)(d2 + 1 - tok))) {
+        size_t dots = 0;
+        for (size_t i = 0; i < n; i++) dots += tok[i] == '.';
+        if (dots == 4) return 0;           /* a JWE (encrypted): its claims are not readable, as an opaque token */
+        w = "a JWT without exactly three segments";
+        goto bad;
+    }
+    {
+        size_t sl = n - (size_t)(d2 + 1 - tok);
+        uint8_t *sig = malloc(sl ? sl : 1);
+        if (!sig) { w = "out of memory"; goto bad; }
+        long r = b64url(d2 + 1, sl, sig, sl ? sl : 1);
+        free(sig);
+        if (r < 0) { w = "a signature that is not canonical base64url"; goto bad; }
+    }
     if (jwt_part(tok, hl, CAP_JHDR, out, &w) < 0 ||
-        jwt_part(d1 + 1, (size_t)(d2 - d1 - 1), CAP_CLAIMS, out, &w) < 0) {
-        if (wn) { size_t l = strlen(w); if (l >= wn) l = wn - 1; memcpy(why, w, l); why[l] = '\0'; }
-        mj_jwt_t z = { 0 };
-        *out = z;
-        return -1;
-    }
+        jwt_part(d1 + 1, (size_t)(d2 - d1 - 1), CAP_CLAIMS, out, &w) < 0)
+        goto bad;
+    out->signing_len = (size_t)(d2 - tok);                 /* review: header.payload, the signing input */
     return 1;
+bad:
+    if (wn) { size_t l = strlen(w); if (l >= wn) l = wn - 1; memcpy(why, w, l); why[l] = '\0'; }
+    mj_jwt_t z = { 0 };
+    *out = z;
+    return -1;
 }

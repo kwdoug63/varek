@@ -890,7 +890,10 @@ static const char *px_token_refused(const struct px_open *o, const struct wp_mcp
     if (g_identity.has_user) {                /* a copy of the run's user token would be passthrough */
         char hx[65];
         sodium_bin2hex(hx, sizeof hx, m->token_sha256, sizeof m->token_sha256);
-        if (!strcmp(hx, g_identity.token_sha256)) {
+        char sx[65] = "";
+        if (m->token == WP_TOK_JWT)           /* review: or the same claims, signed again (ECDSA's other s) */
+            sodium_bin2hex(sx, sizeof sx, m->token_sin_sha256, sizeof m->token_sin_sha256);
+        if (!strcmp(hx, g_identity.token_sha256) || (sx[0] && !strcmp(sx, g_identity.token_sin_sha256))) {
             snprintf(why, wn, "its bearer token is the run's user token, which no call may pass on");
             return "mcp_token_user";
         }
