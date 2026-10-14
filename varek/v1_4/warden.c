@@ -183,7 +183,47 @@ struct open_how_local {
     uint64_t resolve;
 };
 
+#if defined(__x86_64__)
 #define ARCH_NR     AUDIT_ARCH_X86_64
+#define WARDEN_O_LARGEFILE 0100000      /* the kernel's bit (glibc's O_LARGEFILE is 0) */
+#elif defined(__aarch64__)
+#define ARCH_NR     AUDIT_ARCH_AARCH64
+#define WARDEN_O_LARGEFILE 0400000
+#else
+#error "VAREK Warden supports x86_64 and aarch64"
+#endif
+/* v1.30: arm64 has only the *at forms of these calls. A number no call
+ * carries stands in for each, so the comparisons below never match there. */
+#ifndef __NR_open
+#define __NR_open     (-101)
+#endif
+#ifndef __NR_stat
+#define __NR_stat     (-102)
+#endif
+#ifndef __NR_lstat
+#define __NR_lstat    (-103)
+#endif
+#ifndef __NR_access
+#define __NR_access   (-104)
+#endif
+#ifndef __NR_readlink
+#define __NR_readlink (-105)
+#endif
+#ifndef __NR_unlink
+#define __NR_unlink   (-106)
+#endif
+#ifndef __NR_rmdir
+#define __NR_rmdir    (-107)
+#endif
+#ifndef __NR_mkdir
+#define __NR_mkdir    (-108)
+#endif
+#ifndef __NR_rename
+#define __NR_rename   (-109)
+#endif
+#ifndef __NR_chmod
+#define __NR_chmod    (-110)
+#endif
 #define PATH_LIMIT  4096
 #define MAX_RULES    512
 #define MAX_CTX       64
@@ -1125,7 +1165,7 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
     int ri;
     vdp_why_t why;
     /* v1.31: by the calling subject's rules (the Warden's attribution) */
-    vdp_verdict_t v = vdp_decide_subj(&p->v, sub_policy_subject(a->subject), kind, s, (uint32_t)a->open_flags,
+    vdp_verdict_t v = vdp_decide_subj(&p->v, sub_policy_subject(a->subject), kind, s, vdp_oflags_from_native((uint32_t)a->open_flags),
                                       kind == VDP_KIND_PATH && a->flags_known,
                                       &ri, &why);
     a->why = vdp_why_name(why);
@@ -1219,7 +1259,7 @@ static bool certify(const struct policy *p, struct action *a) {
      * attribution (not the procedure's), recorded when it is not the agent */
     int subj = sub_policy_subject(a->subject);
     if (subj && (size_t)n < sizeof a->cert) snprintf(a->cert + n, sizeof a->cert - (size_t)n, ",\"cert_subject\":%d", subj);
-    if (!vdpc_check_subj(&p->c, subj, kind, s, strlen(s), (uint32_t)a->open_flags, has_flags, &cc,
+    if (!vdpc_check_subj(&p->c, subj, kind, s, strlen(s), vdp_oflags_from_native((uint32_t)a->open_flags), has_flags, &cc,
                          a->check_why, sizeof a->check_why)) {
         for (char *q = a->check_why; *q; q++)          /* recorded inside a JSON string */
             if (*q == '"' || *q == '\\' || (unsigned char)*q < 0x20) *q = '\'';
@@ -1358,9 +1398,12 @@ static const struct { const char *name; int bits; } kPlanOpenFlags[] = {
     { "O_TRUNC", O_TRUNC },       { "O_APPEND", O_APPEND },       { "O_NONBLOCK", O_NONBLOCK },
     { "O_DSYNC", O_DSYNC },       { "O_ASYNC", O_ASYNC },         { "O_DIRECT", O_DIRECT },
     /* The kernel's bit, as the policy language names it (smt_decide.c
-     * K_O_LARGEFILE): glibc defines O_LARGEFILE as 0 on x86_64, which would
-     * make a declared O_LARGEFILE mean no flag at all. */
-    { "O_LARGEFILE", 0100000 },   { "O_DIRECTORY", O_DIRECTORY }, { "O_NOFOLLOW", O_NOFOLLOW },
+     * K_O_LARGEFILE): glibc defines O_LARGEFILE as 0 on 64-bit systems, which
+     * would make a declared O_LARGEFILE mean no flag at all. v1.30: the
+     * kernel's own bit on this architecture, as every flag here (the
+     * Warden keeps an action's flags as the kernel's, and translates them
+     * where they are decided and recorded). */
+    { "O_LARGEFILE", WARDEN_O_LARGEFILE }, { "O_DIRECTORY", O_DIRECTORY }, { "O_NOFOLLOW", O_NOFOLLOW },
     { "O_NOATIME", O_NOATIME },   { "O_CLOEXEC", O_CLOEXEC },     { "O_SYNC", O_SYNC },
     { "O_PATH", O_PATH },         { "O_TMPFILE", O_TMPFILE },
 };
@@ -2401,7 +2444,8 @@ static void emit_pathology(uint64_t seq,
     clock_gettime(CLOCK_REALTIME, &ts);
     char flags_json[40] = "";
     if ((a->kind == ACT_FILE_OPEN || is_meta_kind(a->kind) || a->kind == ACT_FILE_CHANGE) && a->flags_known)
-        snprintf(flags_json, sizeof flags_json, "0x%x", (unsigned)a->open_flags);
+        snprintf(flags_json, sizeof flags_json, "0x%x",           /* v1.30: VAREK's encoding */
+                 (unsigned)vdp_oflags_from_native((uint32_t)a->open_flags));
     /* v1.17.0: what an access() asked, so an audit can tell F_OK/R_OK from
      * W_OK/X_OK. */
     if (a->kind == ACT_FILE_ACCESS && flags_json[0])

@@ -110,7 +110,11 @@ int main(int argc, char **argv) {
             }
             continue;
         } else if (!strcmp(op, "rstat") || !strcmp(op, "rlstat")) {
+#ifdef SYS_stat
             res(op, (int)syscall(op[1] == 's' ? SYS_stat : SYS_lstat, path, &st));
+#else       /* v1.30: arm64 has only newfstatat, which the legacy calls are */
+            res(op, (int)syscall(SYS_newfstatat, AT_FDCWD, path, &st, op[1] == 's' ? 0 : AT_SYMLINK_NOFOLLOW));
+#endif
             continue;
         } else if (!strcmp(op, "admits")) {
             struct rusage ru;

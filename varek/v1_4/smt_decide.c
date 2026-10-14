@@ -25,6 +25,10 @@
 /* Flag bits: x86_64 kernel uapi values (asm-generic/fcntl.h). Hard-coded     */
 /* because glibc defines some as 0 in userspace (O_LARGEFILE on 64-bit) or as */
 /* composites (O_SYNC, O_TMPFILE); checked against <fcntl.h> where possible.  */
+/* v1.30: these are VAREK's encoding of open flags on every architecture:     */
+/* rules, certificates and recorded open_flags use them. On arm64 four bits   */
+/* differ (O_DIRECTORY, O_NOFOLLOW, O_DIRECT, O_LARGEFILE), and the Warden    */
+/* translates the kernel's flags (vdp_oflags_from_native, _to_native).        */
 /* ------------------------------------------------------------------------ */
 
 #define K_O_ACCMODE    00000003u
@@ -46,9 +50,54 @@
 #define K_O_PATH      010000000u
 #define K___O_TMPFILE 020000000u
 
-#if !defined(__x86_64__)
-#error "VAREK Warden supports x86_64 only (flag bit values are x86_64 uapi)"
+#if defined(__x86_64__)
+/* the kernel's values are VAREK's */
+_Static_assert(K_O_DIRECT    == (unsigned)O_DIRECT,    "O_DIRECT");
+_Static_assert(K_O_DIRECTORY == (unsigned)O_DIRECTORY, "O_DIRECTORY");
+_Static_assert(K_O_NOFOLLOW  == (unsigned)O_NOFOLLOW,  "O_NOFOLLOW");
+_Static_assert((K___O_TMPFILE | K_O_DIRECTORY) == (unsigned)O_TMPFILE, "O_TMPFILE");
+#define N_O_DIRECT     K_O_DIRECT
+#define N_O_LARGEFILE  K_O_LARGEFILE
+#define N_O_DIRECTORY  K_O_DIRECTORY
+#define N_O_NOFOLLOW   K_O_NOFOLLOW
+#elif defined(__aarch64__)
+/* v1.30: arm64's uapi (arch/arm64/include/uapi/asm/fcntl.h) moves four bits;
+ * the rest are asm-generic's, as on x86_64 */
+#define N_O_DIRECTORY  00040000u
+#define N_O_NOFOLLOW   00100000u
+#define N_O_DIRECT     00200000u
+#define N_O_LARGEFILE  00400000u
+_Static_assert(N_O_DIRECT    == (unsigned)O_DIRECT,    "O_DIRECT (arm64)");
+_Static_assert(N_O_DIRECTORY == (unsigned)O_DIRECTORY, "O_DIRECTORY (arm64)");
+_Static_assert(N_O_NOFOLLOW  == (unsigned)O_NOFOLLOW,  "O_NOFOLLOW (arm64)");
+_Static_assert((K___O_TMPFILE | N_O_DIRECTORY) == (unsigned)O_TMPFILE, "O_TMPFILE (arm64)");
+#else
+#error "VAREK Warden supports x86_64 and aarch64 (the open flags' bit values are each one's uapi)"
 #endif
+#define N_MOVED (N_O_DIRECT | N_O_LARGEFILE | N_O_DIRECTORY | N_O_NOFOLLOW)
+#define K_MOVED (K_O_DIRECT | K_O_LARGEFILE | K_O_DIRECTORY | K_O_NOFOLLOW)
+_Static_assert(N_MOVED == K_MOVED, "the moved bits are the same four bits, permuted");
+
+/* v1.30: the kernel's open flags to VAREK's encoding, and back. On x86_64
+ * both are the identity; on arm64 the four bits above are permuted among
+ * themselves, so each is exact and the other's inverse. */
+uint32_t vdp_oflags_from_native(uint32_t f) {
+    uint32_t k = f & ~K_MOVED;
+    if (f & N_O_DIRECT)    k |= K_O_DIRECT;
+    if (f & N_O_LARGEFILE) k |= K_O_LARGEFILE;
+    if (f & N_O_DIRECTORY) k |= K_O_DIRECTORY;
+    if (f & N_O_NOFOLLOW)  k |= K_O_NOFOLLOW;
+    return k;
+}
+
+uint32_t vdp_oflags_to_native(uint32_t k) {
+    uint32_t f = k & ~K_MOVED;
+    if (k & K_O_DIRECT)    f |= N_O_DIRECT;
+    if (k & K_O_LARGEFILE) f |= N_O_LARGEFILE;
+    if (k & K_O_DIRECTORY) f |= N_O_DIRECTORY;
+    if (k & K_O_NOFOLLOW)  f |= N_O_NOFOLLOW;
+    return f;
+}
 
 _Static_assert(K_O_CREAT     == (unsigned)O_CREAT,     "O_CREAT");
 _Static_assert(K_O_EXCL      == (unsigned)O_EXCL,      "O_EXCL");
@@ -58,14 +107,10 @@ _Static_assert(K_O_APPEND    == (unsigned)O_APPEND,    "O_APPEND");
 _Static_assert(K_O_NONBLOCK  == (unsigned)O_NONBLOCK,  "O_NONBLOCK");
 _Static_assert(K_O_DSYNC     == (unsigned)O_DSYNC,     "O_DSYNC");
 _Static_assert(K_FASYNC      == (unsigned)O_ASYNC,     "O_ASYNC");
-_Static_assert(K_O_DIRECT    == (unsigned)O_DIRECT,    "O_DIRECT");
-_Static_assert(K_O_DIRECTORY == (unsigned)O_DIRECTORY, "O_DIRECTORY");
-_Static_assert(K_O_NOFOLLOW  == (unsigned)O_NOFOLLOW,  "O_NOFOLLOW");
 _Static_assert(K_O_NOATIME   == (unsigned)O_NOATIME,   "O_NOATIME");
 _Static_assert(K_O_CLOEXEC   == (unsigned)O_CLOEXEC,   "O_CLOEXEC");
 _Static_assert((K___O_SYNC | K_O_DSYNC) == (unsigned)O_SYNC, "O_SYNC");
 _Static_assert(K_O_PATH      == (unsigned)O_PATH,      "O_PATH");
-_Static_assert((K___O_TMPFILE | K_O_DIRECTORY) == (unsigned)O_TMPFILE, "O_TMPFILE");
 _Static_assert((K_O_ACCMODE | K_O_CREAT | K_O_EXCL | K_O_NOCTTY | K_O_TRUNC |
                 K_O_APPEND | K_O_NONBLOCK | K_O_DSYNC | K_FASYNC | K_O_DIRECT |
                 K_O_LARGEFILE | K_O_DIRECTORY | K_O_NOFOLLOW | K_O_NOATIME |
