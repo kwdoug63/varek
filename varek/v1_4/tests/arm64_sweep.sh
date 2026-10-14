@@ -35,7 +35,9 @@ if [ "$DEPS" = 1 ]; then
     apt-get install -y -q build-essential libseccomp-dev libsodium-dev libssl-dev openjdk-21-jdk-headless \
         musl-tools python3-cryptography python3-pip python3-venv git openssl &&
     apt-get install -y -q --no-install-recommends squid || { echo "arm64_sweep.sh: apt-get failed"; exit 1; }
-    python3 -m pip install --break-system-packages -q -r "$HERE/tools/requirements-crosscheck.txt" \
+    # --ignore-installed: beside Ubuntu's own copies (its jsonschema cannot be
+    # uninstalled by pip, and the CycloneDX validator needs a newer one)
+    python3 -m pip install --break-system-packages --ignore-installed -q -r "$HERE/tools/requirements-crosscheck.txt" \
         -r "$HERE/tools/requirements-test.txt" || { echo "arm64_sweep.sh: pip failed"; exit 1; }
 fi
 {
