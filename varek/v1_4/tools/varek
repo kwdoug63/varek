@@ -43,6 +43,7 @@ import varek_license  # noqa: E402
 import varek_bench  # noqa: E402
 import varek_baseline  # noqa: E402
 import varek_suggest  # noqa: E402
+import varek_vm  # noqa: E402
 
 CLI_VERSION = "1.3.0"
 DEFAULT_CONFIG = "/etc/varek/varek.conf"
@@ -2677,11 +2678,31 @@ def build_parser():
 
     add("license", cmd_license, "check the VAREK Enterprise subscription (AWS Marketplace)")
     add("version", cmd_version, "show the varek command and Warden versions")
+    # v1.30: on a Mac, the Linux VM VAREK runs in
+    varek_vm.add_parser(sub).set_defaults(fn=cmd_vm)
     return p
+
+
+def cmd_vm(args):
+    try:
+        return args.vm_func(args)
+    except varek_vm.VmError as e:
+        raise CliError(str(e), fix=e.fix)
 
 
 def main(argv=None):
     global SHOW_COMMANDS
+    raw = sys.argv[1:] if argv is None else list(argv)
+    # v1.30: on a Mac, `varek run` (and `varek vm run`) runs inside the VM,
+    # its arguments passed through as they are
+    if raw[:2] == ["vm", "run"] or (raw[:1] == ["run"] and platform.system() == "Darwin"):
+        try:
+            return varek_vm.cmd_run(argparse.Namespace(args=raw[2:] if raw[0] == "vm" else raw[1:]))
+        except varek_vm.VmError as e:
+            print(f"varek: {e}", file=sys.stderr)
+            if e.fix:
+                print(f"  fix: {e.fix}", file=sys.stderr)
+            return 2
     p = build_parser()
     args = p.parse_args(argv)
     SHOW_COMMANDS = args.show_commands
