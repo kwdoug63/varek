@@ -257,7 +257,9 @@ short runs that are in this release too; both are fixed here, with checks:
   could stand between two signatures, and the audit, which reads more than
   `checkpoint_every` as checkpoints removed, failed the run. The checkpoint
   now comes before a record that would pass the bound (`test_v1280`
-  section 3: requests in bursts of 32, signed, the audit passing).
+  section 3: requests in bursts of 32, signed, the audit passing). The
+  fault is in v1.26.1 to v1.27.1 too (reproduced on v1.27.1); v1.27.2
+  fixes it there.
 - **The audit refused a run in which a launch came after the run was
   revoked.** The Warden refuses it with rule `revoked`, as every call after
   a revocation, but the audit did not know that rule for a launch. It does
