@@ -2254,7 +2254,11 @@ def check_dns(meta, checker, policy, rules, problems):
             if not dry or rule not in ("no_rule", "wildcard_budget") or e.get("synthetic") or \
                     (rule == "no_rule" and (line != -1 or by_rule.get(name) is not None)) or \
                     (rule == "wildcard_budget" and line not in wild) or \
-                    (e.get("upstream") is True) != (ans == "lookup") or ans == "nxdomain":
+                    (e.get("upstream") is True and ans != "lookup") or \
+                    (ans == "lookup" and e.get("upstream") is not True and name not in pending) or \
+                    ans == "nxdomain":
+                # v1.31 (found by the OCSF tests): a second question (AAAA after A)
+                # waits on the lookup the first sent, so it is "lookup" without upstream
                 problems.append(f"{name!r}: a question let through by a dry run that is not an answer to "
                                 f"a name the policy refuses")
                 continue

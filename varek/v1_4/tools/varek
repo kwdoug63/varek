@@ -1686,7 +1686,48 @@ def cmd_audit(args):
     return run_cmd(argv, check=False).returncode
 
 
+def cmd_export_ocsf(args):
+    """v1.31: `varek export --format ocsf`: OCSF 1.9.0 events (tools/varek_ocsf.py),
+    audited first; --follow tails a live run; --verify checks events against
+    their stream."""
+    cfg = config_or_defaults()
+    log = args.follow or latest_log(cfg, args.log)
+    if args.follow and not os.path.exists(log):
+        raise CliError(f"no stream at {log}", fix="give the path the run writes its verdict stream to")
+    s = summarize(read_records(log)) if not args.follow else None
+    policy = _policy_for_log(cfg, s) if s else (args.policy or cfg.get("policy"))
+    if args.policy:
+        policy = args.policy
+    if not policy:
+        raise CliError("the policy file this run used is not on this host",
+                       fix="restore it, or give it with --policy; the events name the policy the run used")
+    argv = [sys.executable, tool("varek_ocsf.py"), "--policy", policy]
+    if args.verify:
+        argv += ["--verify", args.verify, "--log", log]
+    else:
+        argv += ["--checker", tool("vdp_cert_check")]
+        argv += ["--follow", log] if args.follow else ["--log", log]
+        out = args.output or (None if args.follow else re.sub(r"\.log$", "", log) + ".ocsf.jsonl")
+        if out:
+            argv += ["--output", out]
+        if _pubkey(cfg):
+            argv += ["--pubkey", _pubkey(cfg)]
+        if cfg["anchor"] and os.path.isfile(cfg["anchor"]):
+            argv += ["--anchor", cfg["anchor"]]
+    if args.allow_incomplete:
+        argv.append("--allow-incomplete")
+    rc = run_cmd(argv, check=False).returncode
+    if rc == 0 and not args.verify and not args.follow:
+        ok(f"OCSF 1.9.0 events written to {out}")
+        hint(f"anyone can check them against the stream with `varek export --format ocsf --verify {out} {log}`")
+    return rc
+
+
 def cmd_export(args):
+    if getattr(args, "format", "cyclonedx") == "ocsf":                  # v1.31
+        return cmd_export_ocsf(args)
+    if args.follow:
+        raise CliError("--follow is for --format ocsf")
     if args.verify:
         cfg = load_config(required=False)
         pub = args.pubkey or (_pubkey(cfg) if cfg else None)
@@ -2286,14 +2327,20 @@ def build_parser():
     sp.add_argument("--allow-incomplete", action="store_true",
                     help="audit a run that has no run_end yet")
 
-    sp = add("export", cmd_export, "write CycloneDX 1.6 authorization evidence for a run")
+    sp = add("export", cmd_export, "write CycloneDX 1.6 authorization evidence, or OCSF 1.9.0 events, for a run")
     sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")
-    sp.add_argument("-o", "--output", help="output file (default: next to the log, .cdx.json)")
+    sp.add_argument("--format", choices=("cyclonedx", "ocsf"), default="cyclonedx",
+                    help="cyclonedx (default) or ocsf: OCSF 1.9.0 events, one per line (v1.31)")
+    sp.add_argument("--follow", metavar="STREAM", help="ocsf: tail a live run's stream, writing each event "
+                    "as its record is chained (to stdout, or -o)")
+    sp.add_argument("--policy", help="ocsf: the policy file the run used (default: found from the log)")
+    sp.add_argument("-o", "--output", help="output file (default: next to the log, .cdx.json or .ocsf.jsonl)")
     sp.add_argument("--agent", default="agent", help="name of the agent, for the evidence")
     sp.add_argument("--no-sign", action="store_true", help="do not sign the evidence")
     sp.add_argument("--allow-incomplete", action="store_true",
                     help="export a run that has no run_end yet")
-    sp.add_argument("--verify", metavar="BOM", help="verify a signed evidence file instead")
+    sp.add_argument("--verify", metavar="FILE", help="verify a signed evidence file instead (ocsf: check "
+                    "events against the log they were exported from)")
     sp.add_argument("--pubkey", help="public key to verify with (default from settings)")
 
     sp = add("bench", cmd_bench, "measure what the Warden adds per call on this host (root)",

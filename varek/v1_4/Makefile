@@ -512,7 +512,7 @@ clean:
 PREFIX ?= /opt/varek
 BINDIR ?= /usr/local/bin
 INSTALL_TOOLS := tools/varek tools/vdp_check tools/vdp_cert_check tools/varek_keygen \
-	tools/varek_audit.py tools/varek_cyclonedx.py tools/varek_ed25519.py \
+	tools/varek_audit.py tools/varek_cyclonedx.py tools/varek_ocsf.py tools/varek_ed25519.py \
 	tools/varek_preflight.sh tools/varek_anchor_forward.py tools/varek_anchor_receiver.sh \
 	tools/varek_license.py tools/varek_bench.py tools/varek_bench_proxy.py tools/bench_proxy_client.py tools/varek_bench_launch.py \
 	tools/varek_baseline.py tools/varek_suggest.py \

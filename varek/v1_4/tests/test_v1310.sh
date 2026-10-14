@@ -35,6 +35,12 @@
 #      through `trust mcp-resource` (RFC 9728, RFC 8414, OpenID discovery, an
 #      issuer that is not its identifier, metadata for another resource,
 #      another audience, the line's audience); no token in any record.
+#   5. the OCSF export: each kind of record as OCSF 1.9.0, checked against
+#      the vendored schema; UNKNOWN kept; a dry run never Blocked; the user,
+#      the delegation and an MCP server named; every event's link back
+#      verified, and an edited, removed, reordered or cut event found; a
+#      stream edited or refused by the audit not exported; --follow on a
+#      live run and on one that ends early; the CLI.
 #
 #   test_v1310.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
@@ -601,6 +607,105 @@ sys.exit(0 if eval(sys.argv[2], {"M": M}) else 1)' "$OUT/t4.log" "$1"; }
     python3 "$F4" "$OUT/t4.log" "$OUT/g42.log" "g = next(r for r in recs if isinstance(r, dict) and r.get('rule') == 'mcp_token_audience'); g['token'] = 'placeholder'"
     check "the audit refuses a token refusal on a call that carried no token of that kind" \
         sh -c "! python3 '$AUD4' --policy '$POL4' --checker '$CERT' '$OUT/g42.log' > '$OUT/g42.aud' 2>&1 && grep -q 'is not one its rule' '$OUT/g42.aud'"
+fi
+
+echo "== 5. the OCSF export =="
+OX="$HERE/tools/varek_ocsf.py"; OV="$HERE/tests/ocsf_validate.py"
+if [ ! -f "$OUT/m.log" ] || [ ! -f "$HERE/schemas/ocsf-1.9.0/schema.json" ]; then
+    skip "section 5 (needs section 3's streams and the vendored schema)"
+else
+    oex() { python3 "$OX" --policy "$2" --checker "$CERT" --device testhost --log "$1" -o "$3" > "$3.err" 2>&1; }
+    # ev <events> <python on E, the events>
+    ev() { python3 -c 'import json,sys
+E = [json.loads(l) for l in open(sys.argv[1])]
+V = [e["unmapped"]["varek"] for e in E]
+sys.exit(0 if eval(sys.argv[2], {"E": E, "V": V}) else 1)' "$1" "$2"; }
+    check "a stream with files, processes, connections, requests and MCP calls exports" oex "$OUT/m.log" "$POL" "$OUT/m.ev"
+    check "every event is valid OCSF 1.9.0 (the vendored schema, no network)" python3 "$OV" "$OUT/m.ev"
+    check "each decision record is one event, a rename's second half folded into its first" \
+        python3 -c "import json,sys
+R = [json.loads(l) for l in open('$OUT/m.log') if l.startswith('{\"report_id\"')]
+E = [json.loads(l) for l in open('$OUT/m.ev')]
+ids = [e['unmapped']['varek'].get('report_id') for e in E if 'report_id' in e['unmapped']['varek']]
+want = [r['report_id'] for r in R if r['action'] != 'file.rename_to']
+sys.exit(0 if ids == want else 1)"
+    check "each event names its record's seq and chain value, and the run (correlation_uid)" \
+        ev "$OUT/m.ev" "all(v['chain'] and len(v['chain']) == 64 for v in V[:-1]) and len({e['metadata']['correlation_uid'] for e in E}) == 1"
+    check "the classes: file, process, network, HTTP, API (MCP) and lifecycle" \
+        ev "$OUT/m.ev" "{1001, 1007, 4001, 4002, 6003, 6002} <= {e['class_uid'] for e in E}"
+    check "an MCP tools/call is API Activity Other, with its tool; a tools/list is Read" \
+        ev "$OUT/m.ev" "any(e['class_uid'] == 6003 and e['activity_id'] == 99 and e['api']['operation'] == 'tools/call' and e['resources'][0]['name'] == 'get_issue' for e in E) and any(e['class_uid'] == 6003 and e['activity_id'] == 2 and e['api']['operation'] == 'tools/list' for e in E)"
+    check "an HTTP request is HTTP Activity by its method (the GET on the endpoint, the POST with a query)" \
+        ev "$OUT/m.ev" "any(e['class_uid'] == 4002 and e['activity_id'] == 3 and e['action_id'] == 1 for e in E) and any(e['class_uid'] == 4002 and e['activity_id'] == 6 and e['disposition_id'] == 2 for e in E)"
+    check "UNKNOWN is kept: refused (Denied, Blocked) and unmapped.varek.decision UNKNOWN" \
+        ev "$OUT/m.ev" "any(v.get('decision') == 'UNKNOWN' and e['action_id'] == 2 and e['disposition_id'] == 2 for e, v in zip(E, V))"
+    check "a refusal by a deny rule is UNSATISFIED, with the deciding line's text as the policy's desc" \
+        ev "$OUT/m.ev" "any(v.get('decision') == 'UNSATISFIED' and e['policy']['desc'].startswith('deny mcp') for e, v in zip(E, V))"
+    check "the last event is the audit's verdict: passed" ev "$OUT/m.ev" "V[-1]['event'] == 'audit' and V[-1]['audit']['passed'] is True"
+    [ -f "$OUT/t4.log" ] && oex "$OUT/t4.log" "$POL4" "$OUT/t4.ev"
+    [ -f "$OUT/t4.log" ] && check "a run on behalf of a user: actor.user, actor.idp and the delegation (the token's SHA-256, its issuer)" \
+        sh -c "python3 '$OV' '$OUT/t4.ev' > /dev/null && $(declare -f ev); ev '$OUT/t4.ev' \"all(e['actor']['user']['uid'] == 'alice@example.test' and e['actor']['idp']['uid'] == '$AB/as' and e['delegation']['issuer_uid'] == '$AB/as' and len(e['delegation']['uid']) == 64 for e in E if 'actor' in e)\""
+    if [ -f "$OUT/f2.log" ]; then
+        oex "$OUT/f2.log" "$POLF" "$OUT/f2.ev"
+        check "an MCP server's events name it in ai_agent (type mcp_server), the agent's the agent" \
+            sh -c "python3 '$OV' '$OUT/f2.ev' > /dev/null && $(declare -f ev); ev '$OUT/f2.ev' \"any(e.get('ai_agent', {}).get('type') == 'mcp_server' and e['ai_agent']['name'] == 'files' for e in E) and any(e.get('ai_agent', {}).get('name') == 'sagent' and e['ai_agent']['type'] == 'Other' for e in E)\""
+    fi
+    # the link back, checked
+    check "--verify: the events are the stream's" python3 "$OX" --verify "$OUT/m.ev" --log "$OUT/m.log" --policy "$POL"
+    python3 - "$OUT/m.ev" "$OUT" <<'PY'
+import json, sys
+L = open(sys.argv[1]).read().splitlines()
+d = sys.argv[2]
+e = json.loads(L[20]); e["unmapped"]["varek"]["decision"] = "SATISFIED"; e["action_id"] = 1
+open(d + "/m_edit.ev", "w").write("\n".join(L[:20] + [json.dumps(e)] + L[21:]) + "\n")
+open(d + "/m_drop.ev", "w").write("\n".join(L[:20] + L[21:]) + "\n")
+open(d + "/m_swap.ev", "w").write("\n".join(L[:20] + [L[21], L[20]] + L[22:]) + "\n")
+open(d + "/m_cut.ev", "w").write("\n".join(L[:-1]) + "\n")
+PY
+    for f in edit drop swap cut; do
+        check "--verify finds an event $f (events: ${f}ed)" sh -c "! python3 '$OX' --verify '$OUT/m_$f.ev' --log '$OUT/m.log' --policy '$POL' > '$OUT/v_$f.out' 2>&1"
+    done
+    sed '0,/"action":"net.mcp"/s/"rule":"mcp_allowed"/"rule":"mcp_allowed "/' "$OUT/m.log" > "$OUT/m_broken.log"
+    check "a stream edited after the fact: not exported, and --verify refuses it (its chain)" \
+        sh -c "! python3 '$OX' --policy '$POL' --checker '$CERT' --log '$OUT/m_broken.log' -o '$OUT/b.ev' > /dev/null 2>&1 && [ ! -s '$OUT/b.ev' ] && ! python3 '$OX' --verify '$OUT/m.ev' --log '$OUT/m_broken.log' --policy '$POL' > /dev/null 2>&1"
+    python3 "$HERE/tests/v1270_forge.py" "$OUT/m.log" "$OUT/m_forged.log" "g = next(r for r in recs if isinstance(r, dict) and r.get('action') == 'net.mcp' and r.get('rule') == 'policy_match'); g['decision_final'] = 'ALLOW'; g['rule'] = 'mcp_allowed'"
+    check "a stream the audit refuses (rechained, so its chain holds) is not exported" \
+        sh -c "! python3 '$OX' --policy '$POL' --checker '$CERT' --log '$OUT/m_forged.log' -o '$OUT/fg.ev' > '$OUT/fg.out' 2>&1 && grep -q 'the audit refuses this stream' '$OUT/fg.out' && [ ! -s '$OUT/fg.ev' ]"
+    # a dry run: would-be refusals are Detected, never Blocked
+    D5="$(mktemp -d /tmp/varek_v1310d.XXXXXX)"; chmod 755 "$D5"
+    printf 'import os\nfor p in ("/etc/hostname", "/etc/passwd"):\n    try: open(p).read()\n    except OSError: pass\nimport socket\ntry: socket.getaddrinfo("unlisted.example.org", 443)\nexcept OSError: pass\n' > "$D5/a.py"; chmod 644 "$D5/a.py"
+    printf 'require warden 1.31\nallow host mcp.example.com\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /lib64 readonly\nallow path /etc/ld.so.cache readonly\nallow path exact %s/a.py readonly\nallow path exact /etc/hostname readonly\n' "$D5" > "$D5/p.txt"
+    timeout 60 "$WARDEN" "$D5/p.txt" --dry-run --run-as nobody --dns-server "127.0.0.1:$DP" -- /usr/bin/python3 "$D5/a.py" > /dev/null 2> "$D5/d.log"
+    oex "$D5/d.log" "$D5/p.txt" "$D5/d.ev"
+    check "a dry run exports, valid" python3 "$OV" "$D5/d.ev"
+    check "a dry run's would-be refusals: Denied, Detected (15), mode dry_run; none Blocked" \
+        ev "$D5/d.ev" "any(v.get('mode') == 'dry_run' for v in V) and all(e['action_id'] == 2 and e['disposition_id'] == 15 for e, v in zip(E, V) if v.get('mode') == 'dry_run') and not any(e.get('disposition_id') == 2 and v.get('record', {}).get('enforced') is False for e, v in zip(E, V))"
+    check "a name no rule covers, asked of the stub: DNS Activity Query, its name" \
+        ev "$D5/d.ev" "any(e['class_uid'] == 4003 and e['query']['hostname'] == 'unlisted.example.org' and e['action_id'] == 2 for e in E)"
+    # --follow: each event as its record is chained, the audit at run_end
+    printf 'import time\nfor i in range(3):\n    open("/etc/hostname").read(); time.sleep(0.3)\n' > "$D5/f.py"; chmod 644 "$D5/f.py"
+    sed -i "s|exact $D5/a.py|exact $D5/f.py|" "$D5/p.txt"
+    python3 "$OX" --follow "$D5/live.log" --policy "$D5/p.txt" --checker "$CERT" --device testhost --idle 20 -o "$D5/live.ev" > "$D5/fo.out" 2>&1 &
+    FP=$!
+    sleep 0.5
+    timeout 60 "$WARDEN" "$D5/p.txt" --run-as nobody -- /usr/bin/python3 "$D5/f.py" > /dev/null 2> "$D5/live.log"
+    wait $FP; echo $? > "$D5/fo.rc"
+    oex "$D5/live.log" "$D5/p.txt" "$D5/live_b.ev"
+    check "--follow on a live run: the same events as the batch export, then the audit's verdict (passed)" \
+        python3 -c "import json,sys
+F = [json.loads(l) for l in open('$D5/live.ev')]; B = [json.loads(l) for l in open('$D5/live_b.ev')]
+sys.exit(0 if F[:-1] == B[:-1] and F[-1]['unmapped']['varek']['audit'] == {'passed': True, 'mode': 'follow', 'problems': []} and open('$D5/fo.rc').read().strip() == '0' else 1)"
+    grep -v '^{"event":"run_end"' "$D5/live.log" > "$D5/early.src"
+    : > "$D5/early.log"
+    python3 "$OX" --follow "$D5/early.log" --policy "$D5/p.txt" --checker "$CERT" --device testhost --idle 2 -o "$D5/early.ev" > /dev/null 2>&1 &
+    FP=$!
+    sleep 0.3; cat "$D5/early.src" >> "$D5/early.log"
+    wait $FP; echo $? > "$D5/early.rc"
+    check "--follow on a run that ends early (no run_end): the last event says the audit did not pass" \
+        sh -c "! grep -qx 0 '$D5/early.rc' && $(declare -f ev); ev '$D5/early.ev' \"V[-1]['audit']['passed'] is False and 'stopped growing' in V[-1]['audit']['problems'][0]\""
+    check "varek export --format ocsf (and --verify) through the CLI" \
+        sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' export --format ocsf '$D5/live.log' --policy '$D5/p.txt' -o '$D5/cli.ev' > '$D5/cli.out' 2>&1 && NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' export --format ocsf --verify '$D5/cli.ev' '$D5/live.log' --policy '$D5/p.txt' >> '$D5/cli.out' 2>&1"
+    [ -n "${KEEP:-}" ] || rm -rf "$D5"
 fi
 
 echo
