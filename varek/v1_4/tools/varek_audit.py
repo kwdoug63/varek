@@ -495,7 +495,10 @@ EXEC_REFUSALS = ("policy_match", "default_deny_unknown", "certificate_refused", 
                  "exec_not_in_ruleset", "exec_unresolved",
                  # v1.27 review: a launch by a thread another thread's launch is ending:
                  # its path cannot be read, or its image (the call is refused, nothing run)
-                 "intent_derivation_failed", "exec_identity_unreadable")
+                 "intent_derivation_failed", "exec_identity_unreadable",
+                 # the shared soak (v1.31, ported): a launch after the run was revoked
+                 # (checked against the revocation with every other call refused as revoked)
+                 "revoked")
 EXEC_RESULTS = ("launched", "failed", "gone", "killed")
 
 
