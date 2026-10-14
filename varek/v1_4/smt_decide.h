@@ -91,7 +91,7 @@
 #include <stdint.h>
 
 #define VDP_STR_MAX        4095     /* bound on s, bytes (PATH_LIMIT - 1) */
-#define VDP_MAX_RULES      256
+#define VDP_MAX_RULES      512      /* v1.31: 256 until 1.31 (room for confined subjects' own rules) */
 #define VDP_MAX_ENUM_BITS  16       /* bounded bitvector enumeration */
 #define VDP_GLOB_MAX_WILD  32       // wildcards per glob (* ** ? [...] and the /**/ unit)
 #define VDP_GLOB_MAX_TOTAL 4096     // glob tokens per policy: bounds the work per decision (v1.16: was 65536)

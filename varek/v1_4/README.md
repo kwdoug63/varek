@@ -282,7 +282,7 @@ truncates, `O_RDONLY|O_CREAT` creates); use `readonly`. A clause
 constrains the flags passed to `openat()`: `readonly` is sound, but
 `fcntl(F_SETFL)` can change `O_APPEND`, `O_NONBLOCK`, `O_ASYNC`,
 `O_DIRECT` and `O_NOATIME` afterwards (the Warden notes such clauses).
-Access mode 3 and unknown flag bits are refused. More than 256 rules,
+Access mode 3 and unknown flag bits are refused. More than 512 rules (256 before v1.31),
 an unknown or contradictory clause, a malformed glob, a matcher on a host
 rule, a control byte in a constant, or an unmet `require` is a load error.
 Start a policy that uses flag clauses with `require warden 1.13` (a v1.12

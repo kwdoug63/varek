@@ -794,6 +794,48 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
         }
         components.append(comp)
 
+    # v1.31 (docs/security/v1.31-standards.md, section 6): each MCP server the
+    # run launched (confined, by its `mcp server` line), with its file and
+    # SHA-256, and each remote MCP endpoint reached, with the methods and
+    # names its calls were allowed
+    ruleset = {e.get("path"): e for e in rs.get("exec_ruleset", []) if isinstance(e, dict)} \
+        if isinstance(rs.get("exec_ruleset"), list) else {}
+    servers = {}
+    for r in authorized:
+        if r.get("action") == "process.exec" and r.get("mcp_server") is True and isinstance(r.get("subagent"), str):
+            name = r["subagent"].split("#", 1)[0]
+            path = r.get("resolved") or r.get("target") or ""
+            sv = servers.setdefault(name, {"path": path, "launches": 0,
+                                           "sha": r.get("exec_sha256") or (ruleset.get(path) or {}).get("sha256")})
+            sv["launches"] += 1
+    for name, sv in sorted(servers.items()):
+        comp = {"type": "application", "bom-ref": bomref("mcp-server", name), "name": name,
+                "description": "An MCP server the agent launched, run confined: decided by its own rules only.",
+                "properties": ([{"name": "varek:mode", "value": "dry_run"}] if dry else []) + [
+                    {"name": "varek:mcp.server", "value": "true"},
+                    {"name": "varek:file", "value": str(sv["path"])},
+                    {"name": "varek:launches", "value": str(sv["launches"])}]}
+        if isinstance(sv["sha"], str) and re.fullmatch(r"[0-9a-f]{64}", sv["sha"]):
+            comp["hashes"] = [{"alg": "SHA-256", "content": sv["sha"]}]
+        components.append(comp)
+    endpoints = {}
+    for r in authorized:
+        if r.get("action") == "net.mcp" and isinstance(r.get("mcp_url"), str):
+            ep = endpoints.setdefault(r["mcp_url"], {"methods": set(), "names": set(), "calls": 0})
+            ep["calls"] += 1
+            if isinstance(r.get("mcp_method"), str):
+                ep["methods"].add(r["mcp_method"])
+            if isinstance(r.get("mcp_name"), str):
+                ep["names"].add(r["mcp_name"])
+    services = []
+    for url, ep in sorted(endpoints.items()):
+        services.append({"bom-ref": bomref("mcp-endpoint", url), "name": url, "endpoints": [url],
+                         "description": "A remote MCP endpoint the agent's calls reached, each decided on its "
+                                        "method and name.",
+                         "properties": [{"name": "varek:mcp.calls_allowed", "value": str(ep["calls"])}] +
+                                       [{"name": "varek:mcp.method", "value": m} for m in sorted(ep["methods"])] +
+                                       [{"name": "varek:mcp.name", "value": n} for n in sorted(ep["names"])]})
+
     attest_text, facts = attestation(records, authorized, refused, dist, policy,
                                      run_start, run_end, warden_version, complete,
                                      log_info or {}, plan_gate, policy_check)
@@ -849,6 +891,8 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
         "components": components,
         "annotations": [annotation],
     }
+    if services:                                                  # v1.31: remote MCP endpoints
+        bom["services"] = services
     return bom
 
 

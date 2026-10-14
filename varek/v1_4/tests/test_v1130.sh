@@ -10,7 +10,7 @@
 #      is created. Flag bits outside the ABI open(2) set are refused as outside
 #      the fragment, even under a permissive rule.
 #   2. Load-time analysis: the Warden reports a rule that can never fire.
-#   3. The policy parser refuses instead of dropping: more than 256 rules, a
+#   3. The policy parser refuses instead of dropping: more than 512 rules, a
 #      contradictory flag clause, a flag clause on a non-path rule.
 #   4. The shipped policies lint clean (no rule that can never fire).
 #   5. The --plan gate treats a planned file_open's flags as symbolic.
@@ -85,10 +85,10 @@ grep -q "(1 can never fire)" <<<"$o" && pass "load summary counts it" || flunk "
 "$VDP" "$OUT/dead.txt" lint >/dev/null 2>&1; [ $? -eq 1 ] && pass "vdp_check lint exits 1 on a dead rule" || flunk "vdp_check lint exits 1 on a dead rule"
 
 echo "== 3. the parser refuses instead of dropping =="
-{ for i in $(seq 1 256); do echo "allow path /tmp/r$i/"; done; echo "deny path /tmp/"; } > "$OUT/big.txt"
+{ for i in $(seq 1 512); do echo "allow path /tmp/r$i/"; done; echo "deny path /tmp/"; } > "$OUT/big.txt"
 o="$("$WARDEN" "$OUT/big.txt" -- /bin/true 2>&1 || true)"
-grep -q "more than 256 rules; refusing to drop any" <<<"$o" && ! grep -q "supervising pid=" <<<"$o" \
-  && pass "257 rules: refused, agent not started (v1.12 silently dropped rule 257)" || flunk "257 rules refused"
+grep -q "more than 512 rules; refusing to drop any" <<<"$o" && ! grep -q "supervising pid=" <<<"$o" \
+  && pass "513 rules: refused, agent not started (v1.12 silently dropped rule 257; the cap is 512 from v1.31)" || flunk "513 rules refused"
 printf 'allow path /tmp/ +O_TRUNC -O_TRUNC\n' > "$OUT/contra.txt"
 o="$("$WARDEN" "$OUT/contra.txt" -- /bin/true 2>&1 || true)"
 grep -q "contradictory flag clause" <<<"$o" && pass "contradictory flag clause refused" || flunk "contradictory flag clause refused"

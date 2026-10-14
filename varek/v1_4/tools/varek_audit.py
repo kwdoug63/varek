@@ -1107,6 +1107,65 @@ def expected_subject(obo, confined):
 
 
 SUBAGENT_TAG = re.compile(r"subagent:([a-z][a-z0-9_]{0,31})#([1-9][0-9]{0,9})")
+
+
+def check_subjects(records, confined, forl, problems):
+    """v1.31 (section 6): each decision that names a policy line names a
+    rule of the subject it was made for: a confined subject's decisions only
+    its own `for=` rules, the agent's (and an unconfined sub-agent's) only
+    rules without one. The subject is the record's chain's (the Warden's
+    attribution), the rule's the policy's, as the checker reads it."""
+    for rec in records:
+        line = rec.get("policy_line")
+        if not isinstance(line, int) or line <= 0 or "decision_final" not in rec:
+            continue
+        ks = expected_subject(rec.get("obo"), confined)
+        kr = forl.get(line, 0)
+        if ks != kr:
+            problems.append(f"seq {rec.get('seq')}: a decision for subject {ks} (its chain {rec.get('obo')!r}) "
+                            f"cites policy line {line}, a rule for subject {kr}: "
+                            f"{'a server' if ks else 'the agent'} is decided by its own rules only")
+
+
+# v1.31 (section 6): a JWT in compact form, as an MCP or user token is
+JWT_RX = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*")
+# fields that hold what the agent sent (its paths, requests, MCP calls and
+# names), where a token the agent itself chose to send is its own business
+AGENT_FIELDS = ("target", "resolved", "mcp_name", "mcp_url", "rpc_id", "traceparent", "mcp_error", "name",
+                "exe", "request_error", "tls_error", "why")
+
+
+def check_token_values(path, run, problems):
+    """v1.31 (section 6): no token value anywhere the Warden or its helpers
+    write: no JWT in any record of the run outside the fields that echo what
+    the agent sent. (The values the run holds are never written: a
+    credential is recorded by its placeholder's SHA-256, the user's token
+    by its SHA-256.)"""
+    def walk(v, key, top, where):
+        if isinstance(v, dict):
+            for k, x in v.items():
+                walk(x, k, False, where)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, key, False, where)
+        elif isinstance(v, str) and not (top and key in AGENT_FIELDS) and JWT_RX.search(v):
+            problems.append(f"{where}: a token value in the stream (field {key!r})")
+    try:
+        fh = open(path, encoding="utf-8", errors="surrogateescape", newline="\n")
+    except OSError:
+        return
+    with fh:
+        for i, raw in enumerate(fh, 1):
+            if not raw.startswith("{"):
+                continue
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict) or rec.get("run") != run:
+                continue
+            for k, x in rec.items():
+                walk(x, k, True, f"line {i}")
 JWT_ALGS = ("RS256", "PS256", "ES256", "EdDSA")
 
 
@@ -1456,6 +1515,12 @@ def check_credentials(creds, cred_rules, meta, records, complete, problems, note
                                 f"deciding rule (line {rec.get('policy_line')!r}) does not name")
                 continue
             carried += 1
+            # v1.31 (section 6): an MCP token only on an allowed MCP call to its server
+            ad = (auds or {}).get(rec.get("credential"))
+            if ad is not None and (rec.get("action") != "net.mcp" or rec.get("mcp_url") != ad[0]):
+                problems.append(f"seq {rec.get('seq')}: MCP token {rec.get('credential')} (for {ad[0]}) released "
+                                f"on {'a call to ' + str(rec.get('mcp_url')) if rec.get('action') == 'net.mcp' else 'a request'}")
+                continue
             # v1.31: an MCP token is not released past its expiry
             ex = next((e.get("expires") for e in (rs.get("credentials") or []) if isinstance(e, dict)
                        and e.get("name") == rec.get("credential") and "audience" in e), None)
@@ -3405,6 +3470,13 @@ def main(argv=None):
         problems.append(f"checker failed on the policy's identities: {e}")
         ident = ({}, {}, {}, False, {})
     per_sub = check_chain(ident, meta, records, run, problems)
+    try:                                                                                   # v1.31 (section 6)
+        confined6, forl6 = policy_confined(a.checker, a.policy)
+    except ValueError as e:
+        problems.append(f"checker failed: {e}")
+        confined6, forl6 = {}, {}
+    check_subjects(records, confined6, forl6, problems)
+    check_token_values(a.log, run, problems)
     nlaunch = nlaunch_refused = 0
     if launches_policy and prules:                                                         # v1.27
         nlaunch, nlaunch_refused = check_launches(a.checker, a.policy, prules, meta, records, complete,

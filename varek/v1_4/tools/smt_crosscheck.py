@@ -782,8 +782,8 @@ def parse_lines(raw_lines, path):
                     if not re.fullmatch(r"sha256=[0-9a-f]{64}", toks[5]):
                         raise PolicyError(f"{path}:{lineno}: bad sha256")
                     sha = toks[5][7:]
-                if len(rules) >= 256:
-                    raise PolicyError(f"{path}: more than 256 rules")
+                if len(rules) >= 512:
+                    raise PolicyError(f"{path}: more than 512 rules")
                 r = {"verb": "allow", "kind": "exec", "op": "eq", "c": fp, "rx": None, "gtoks": None,
                      "mask": 0, "value": 0, "line": lineno, "portless": False, "name": False,
                      "wild": False, "subagent": nm, "subj": 0, "mcp_server": True, "sha256": sha}
@@ -798,8 +798,8 @@ def parse_lines(raw_lines, path):
                 # v1.26.1: <verb> request METHOD URL [max_body=N]
                 if req < (1, 26) or len(toks) < 4:
                     raise PolicyError(f"{path}:{lineno}: bad request rule")
-                if len(rules) >= 256:
-                    raise PolicyError(f"{path}: more than 256 rules")
+                if len(rules) >= 512:
+                    raise PolicyError(f"{path}: more than 512 rules")
                 const, rhost, rwild, rport = request_glob(toks[2], toks[3], f"{path}:{lineno}")
                 grx, nt, gtoks = parse_glob(rx, const, f"{path}:{lineno}")
                 glob_tokens += nt
@@ -870,8 +870,8 @@ def parse_lines(raw_lines, path):
                 const = f"{cu}#{toks[3]}#{nm}"
                 if len(const) > L:
                     raise PolicyError(f"{where}: mcp object over the bound")
-                if len(rules) >= 256:
-                    raise PolicyError(f"{path}: more than 256 rules")
+                if len(rules) >= 512:
+                    raise PolicyError(f"{path}: more than 512 rules")
                 grx, nt, gtoks = parse_glob(rx, const, where)
                 glob_tokens += nt
                 if glob_tokens > GLOB_MAX_TOTAL:
@@ -936,8 +936,8 @@ def parse_lines(raw_lines, path):
                 raise PolicyError(f"{path}:{lineno}: constant length")
             if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in const):
                 raise PolicyError(f"{path}:{lineno}: control byte in constant")
-            if len(rules) >= 256:
-                raise PolicyError(f"{path}: more than 256 rules")
+            if len(rules) >= 512:
+                raise PolicyError(f"{path}: more than 512 rules")
             wild = False
             if kind == "host" and const.startswith("*.") and req >= (1, 24):
                 # v1.25: *.<suffix>[:port] -> the glob ?*.<suffix>:<port> (or :*)

@@ -90,7 +90,7 @@
 #define VDPC_GRAMMAR_MINOR 31
 
 #define VDPC_MAX_S        4095
-#define VDPC_MAX_RULES    256
+#define VDPC_MAX_RULES    512      /* v1.31: VDP_MAX_RULES */
 #define VDPC_MAX_STRETCH  32          /* a glob has at most 32 wildcards */
 #define VDPC_GLOB_MAX_TOTAL 4096      /* glob tokens per policy (v1.16; was 65536) */
 

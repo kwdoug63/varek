@@ -1352,7 +1352,7 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
                     rc = parse_credential(name, ln, tok, nt, p, err, en, req_maj, req_min);
             } else if (!strcmp(tok[0], "mcp")) {
                 /* v1.31: mcp server NAME exec PATH [sha256=HEX] */
-                if (p->n == VDPC_MAX_RULES) rc = fail(err, en, name, ln, "more than 256 rules");
+                if (p->n == VDPC_MAX_RULES) rc = fail(err, en, name, ln, "more than 512 rules");
                 else {
                     rc = parse_mcp_server(name, ln, tok, nt, req_maj, req_min, &p->rules[p->n], err, en);
                     p->n++;
@@ -1361,7 +1361,7 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
             } else if (nt < 3) {
                 rc = fail(err, en, name, ln, "bad rule");
             } else if (p->n == VDPC_MAX_RULES) {
-                rc = fail(err, en, name, ln, "more than 256 rules");
+                rc = fail(err, en, name, ln, "more than 512 rules");
             } else {
                 rc = parse_rule(name, ln, tok, nt, req_maj, req_min, &legacy_name, &glob_total,
                                 &p->rules[p->n], err, en, p);

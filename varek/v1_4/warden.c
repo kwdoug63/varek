@@ -185,7 +185,7 @@ struct open_how_local {
 
 #define ARCH_NR     AUDIT_ARCH_X86_64
 #define PATH_LIMIT  4096
-#define MAX_RULES    256
+#define MAX_RULES    512
 #define MAX_CTX       64
 
 /* ---------------- decision types ---------------- */
@@ -5226,7 +5226,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* ~1 MB (256 rules x 4 KB constants): static, not on the stack. */
+    /* ~2 MB (512 rules x 4 KB constants): static, not on the stack. */
     static struct policy p;
     if (policy_load(policy_path, &p) < 0) return 1;
     /* v1.29: a dry run (section 3), on the command line only (D3). Not with

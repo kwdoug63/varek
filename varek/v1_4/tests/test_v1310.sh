@@ -41,6 +41,12 @@
 #      verified, and an edited, removed, reordered or cut event found; a
 #      stream edited or refused by the audit not exported; --follow on a
 #      live run and on one that ends early; the CLI.
+#   6. audit and tools: forged streams the audit refuses (a server's
+#      decision on the agent's rule and the reverse, an MCP call on a
+#      passthrough connection, an MCP token released to another server, a
+#      token in the stream); policy show, refusals --for, runs, doctor's
+#      server checks, policy suggest --for and for MCP calls, the CycloneDX
+#      server and endpoint, varek run --mcp.
 #
 #   test_v1310.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
@@ -706,6 +712,116 @@ sys.exit(0 if F[:-1] == B[:-1] and F[-1]['unmapped']['varek']['audit'] == {'pass
     check "varek export --format ocsf (and --verify) through the CLI" \
         sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' export --format ocsf '$D5/live.log' --policy '$D5/p.txt' -o '$D5/cli.ev' > '$D5/cli.out' 2>&1 && NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' export --format ocsf --verify '$D5/cli.ev' '$D5/live.log' --policy '$D5/p.txt' >> '$D5/cli.out' 2>&1"
     [ -n "${KEEP:-}" ] || rm -rf "$D5"
+fi
+
+echo "== 6. audit and tools: MCP servers, their rules, calls and tokens =="
+V7="$HERE/tools/varek"; AUD7="$HERE/tools/varek_audit.py"; F7="$HERE/tests/v1270_forge.py"
+if [ ! -f "$OUT/own.out" ] || [ ! -f "$OUT/m.log" ]; then
+    skip "section 6 (needs sections 2 and 3's streams)"
+else
+    v7() { NO_COLOR=1 VAREK_CONFIG="${VC:-/nonexistent}" python3 "$V7" "$@"; }
+    refuses7() { if python3 "$AUD7" --policy "$2" --checker "$CERT" "$3" > "$OUT/f7.out" 2>&1; then flunk "the audit refuses $1"
+                 elif grep -qF -- "$4" "$OUT/f7.out"; then pass "the audit refuses $1"
+                 else flunk "the audit refuses $1 ($(grep -m1 PROBLEM "$OUT/f7.out"))"; fi; }
+    LA="$(grep -n "^allow path $B/fa readonly\$" "$B/p.txt" | cut -d: -f1)"
+    LS="$(grep -n "^allow path $B/fs readonly for=files\$" "$B/p.txt" | cut -d: -f1)"
+    python3 "$F7" "$OUT/own.out" "$OUT/h1.log" "g = next(r for r in recs if isinstance(r, dict) and r.get('cert_subject') == 1 and r.get('target') == '$B/fs'); g['policy_line'] = $LA"
+    refuses7 "a server's decision citing one of the agent's rules" "$B/p.txt" "$OUT/h1.log" "cites policy line $LA, a rule for subject 0"
+    python3 "$F7" "$OUT/own.out" "$OUT/h2.log" "g = next(r for r in recs if isinstance(r, dict) and r.get('target') == '$B/fa' and r.get('obo') == ['agent']); g['policy_line'] = $LS"
+    refuses7 "an agent's decision citing a server's rule (for=)" "$B/p.txt" "$OUT/h2.log" "cites policy line $LS, a rule for subject 1"
+    python3 "$F7" "$OUT/m.log" "$OUT/h3.log" "c = next(r for r in recs if isinstance(r, dict) and r.get('action') == 'net.mcp')['proxy_conn']; [r.update(inspected=False) for r in recs if isinstance(r, dict) and r.get('action') == 'net.proxy' and r.get('proxy_conn') == c]"
+    refuses7 "an MCP call on a connection not inspected (passthrough)" "$POL" "$OUT/h3.log" "which was not passed on to be inspected"
+    if [ -f "$OUT/t4.log" ]; then
+        python3 "$F7" "$OUT/t4.log" "$OUT/h4.log" "g = next(r for r in recs if isinstance(r, dict) and r.get('action') == 'net.mcp' and r.get('credential') == 'mt'); g['mcp_url'] = 'https://mcp.example.com:$PS/other'"
+        refuses7 "an MCP token released on a call to another server" "$POL4" "$OUT/h4.log" "(for $U) released on a call to https://mcp.example.com:$PS/other"
+    fi
+    python3 "$F7" "$OUT/own.out" "$OUT/h5.log" "next(r for r in recs if isinstance(r, dict) and r.get('event') == 'run_start')['note'] = 'eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl'"
+    refuses7 "a token value in the stream" "$B/p.txt" "$OUT/h5.log" "a token value in the stream (field 'note')"
+    check "the audit still accepts the agent's own token sent in a request it made (its own business)" \
+        python3 "$AUD7" --policy "$POL" --checker "$CERT" "$OUT/m.log"
+    # the tools
+    check "varek policy show lists the MCP server, its file and its rules" \
+        sh -c "$(declare -f v7); V7='$V7'; v7 policy show '$B/p.txt' | grep -q 'MCP server files: $B/srv (line 2), not pinned; [0-9]* rule(s) for it'"
+    v7 refusals "$OUT/notmine.out" --for files > "$OUT/r7.out" 2>&1
+    check "varek refusals --for NAME: only the server's refusals, the server named as one" \
+        sh -c "grep -q 'files#1 (MCP server)' '$OUT/r7.out' && grep -q '$B/fa' '$OUT/r7.out' && ! grep -q '$B/fs\$' '$OUT/r7.out'"
+    v7 refusals "$OUT/m.log" -n 500 > "$OUT/r7m.out" 2>&1
+    check "varek refusals: an MCP call, its method and name, and why" \
+        sh -c "grep -q 'net.mcp .*tools/call delete_repo at $U' '$OUT/r7m.out' && grep -q 'its headers disagree with its body' '$OUT/r7m.out' && grep -q 'got a JSON-RPC error in a 403' '$OUT/r7m.out'"
+    LD="$(mktemp -d /tmp/varek_v1310r.XXXXXX)"
+    cp "$OUT/own.out" "$LD/verdicts-20261014-000001.log"
+    printf '[varek]\nlog_dir = %s\npolicy = %s\n' "$LD" "$B/p.txt" > "$LD/varek.conf"
+    check "varek runs shows a run's MCP servers" sh -c "$(declare -f v7); V7='$V7'; VC='$LD/varek.conf' v7 runs | grep -q 'agent +1 MCP server'"
+    python3 - "$HERE/tools/varek" "$B" "$LD" <<'PY' > "$OUT/d7.out" 2>&1
+import hashlib, importlib.machinery, importlib.util, os, shutil, sys
+spec = importlib.util.spec_from_loader("varek_cli", importlib.machinery.SourceFileLoader("varek_cli", sys.argv[1]))
+v = importlib.util.module_from_spec(spec); spec.loader.exec_module(v)
+b, d = sys.argv[2], sys.argv[3]
+h = hashlib.sha256(open(b + "/srv", "rb").read()).hexdigest()
+cases = {"good": f"mcp server files exec {b}/srv sha256={h}\n", "badpin": f"mcp server files exec {b}/srv sha256={'0' * 64}\n"}
+shutil.copy(b + "/srv", d + "/gw"); os.chmod(d + "/gw", 0o775)
+cases["groupw"] = f"mcp server files exec {d}/gw\n"
+for k, line in cases.items():
+    open(f"{d}/{k}.txt", "w").write("require warden 1.31\n" + line)
+    print(k, v.check_server_files(f"{d}/{k}.txt"))
+PY
+    check "varek doctor: a server's file that is root's, written by no one else, with its pin, passes" grep -q "^good \[(True, 'MCP server files ($B/srv): its SHA-256 is the pin')\]" "$OUT/d7.out"
+    check "varek doctor: a server whose pin is not its file's fails" grep -q "^badpin \[(False, .*is not the pin" "$OUT/d7.out"
+    check "varek doctor: a server file others may write fails" grep -q "^groupw \[(False, .*mode 775" "$OUT/d7.out"
+    sed '/^allow path \/lib64 readonly/d' "$B/p.txt" > "$LD/pc.txt"
+    cp "$OUT/notmine.out" "$LD/nm.log"
+    python3 -c "import sys, json
+L = open('$LD/nm.log').read().replace('\"policy_sha256\":\"', '\"policy_sha256_was\":\"')
+open('$LD/nm.log', 'w').write(L)" 2>/dev/null
+    python3 - "$HERE" "$OUT/notmine.out" "$LD/pc.txt" > "$OUT/s7.out" 2>&1 <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1] + "/tools")
+import varek_suggest as vs
+recs = [json.loads(l) for l in open(sys.argv[2]) if l.startswith("{")]
+for fn in ("files", None):
+    d, a, c = vs.suggest(recs, open(sys.argv[3]).read(), sys.argv[3], "x", sys.argv[1] + "/tools/vdp_check", for_name=fn)
+    print("== for", fn); print(d)
+PY
+    check "varek policy suggest --for NAME: the server's refusals, each rule for=NAME, re-checked as the server" \
+        sh -c "sed -n '/^== for files/,/^== for None/p' '$OUT/s7.out' | grep -q '^allow path exact $B/fa readonly for=files ' && sed -n '/^== for files/,/^== for None/p' '$OUT/s7.out' | grep -q 'refusal(s) were for the agent'"
+    check "... and without --for, only the agent's" \
+        sh -c "sed -n '/^== for None/,\$p' '$OUT/s7.out' | grep -q '^allow path exact $B/fs readonly ' && ! sed -n '/^== for None/,\$p' '$OUT/s7.out' | grep -q 'readonly for=files '"
+    python3 - "$HERE" "$OUT/m.log" "$POL" > "$OUT/s7m.out" 2>&1 <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1] + "/tools")
+import varek_suggest as vs
+recs = [json.loads(l) for l in open(sys.argv[2]) if l.startswith("{")]
+print(vs.suggest(recs, open(sys.argv[3]).read(), sys.argv[3], "x", sys.argv[1] + "/tools/vdp_check")[0])
+PY
+    check "varek policy suggest: an MCP call no rule allowed gets its mcp rule; one a deny rule refuses does not" \
+        sh -c "grep -q '^allow mcp $U tools/call other_tool ' '$OUT/s7m.out' && grep -q '^# allow mcp $U tools/call delete_repo .*NOT SUGGESTED: a deny rule' '$OUT/s7m.out'"
+    # CycloneDX: each MCP server and each remote MCP endpoint
+    if [ -f "$OUT/f2.log" ]; then
+        python3 "$HERE/tools/varek_cyclonedx.py" --log "$OUT/f2.log" --agent agent --policy "$POLF" --output "$OUT/f2.cdx" > /dev/null 2>&1
+        check "CycloneDX: the MCP server as a component, with its file's SHA-256" \
+            python3 -c "import json,sys; b = json.load(open('$OUT/f2.cdx')); c = [x for x in b['components'] if x['bom-ref'].startswith('mcp-server')]; sys.exit(0 if len(c) == 1 and c[0]['name'] == 'files' and c[0]['hashes'][0]['content'] == '$(sha256sum "$X/srv" | cut -c1-64)' else 1)"
+    fi
+    python3 "$HERE/tools/varek_cyclonedx.py" --log "$OUT/m.log" --agent agent --policy "$POL" --output "$OUT/m.cdx" > /dev/null 2>&1
+    check "CycloneDX: the remote MCP endpoint as a service, with its methods and names" \
+        python3 -c "import json,sys; b = json.load(open('$OUT/m.cdx')); s = b['services']; p = {(x['name'], x['value']) for x in s[0]['properties']}; sys.exit(0 if s[0]['name'] == '$U' and ('varek:mcp.method', 'tools/call') in p and ('varek:mcp.name', 'get_issue') in p else 1)"
+    python3 "$HERE/tests/cdx_schema_check.py" "$OUT/m.cdx" > "$OUT/cdx7.out" 2>&1; rc=$?
+    if [ $rc = 2 ]; then skip "CycloneDX 1.6 schema check (cyclonedx-python-lib not installed)"
+    else check "... and the BOM is valid CycloneDX 1.6" [ $rc = 0 ]; fi
+    # varek run --mcp: the baseline with a confined server
+    PJ="$(mktemp -d /tmp/varek_v1310p.XXXXXX)"
+    (cd "$PJ" && v7 run --baseline --show-policy --mcp files="$X/srv" --run-as nobody -- /usr/bin/python3 a.py > "$OUT/bl7.txt" 2> "$OUT/bl7.err")
+    check "varek run --mcp: the baseline declares the server, pinned, before the agent's launches" \
+        python3 -c "import sys,hashlib; L = open('$OUT/bl7.txt').read().splitlines(); m = [i for i, l in enumerate(L) if l.startswith('mcp server files exec $X/srv sha256=' + hashlib.sha256(open('$X/srv','rb').read()).hexdigest())]; e = [i for i, l in enumerate(L) if l.startswith('allow exec ')]; sys.exit(0 if m and e and m[0] < e[0] and 'require warden 1.31' in L else 1)"
+    check "... with the server's own rules (for=files), the system and the working directory read-only" \
+        sh -c "grep -q '^allow path /usr/ readonly for=files' '$OUT/bl7.txt' && grep -q '^allow path $PJ/ readonly for=files' '$OUT/bl7.txt' && grep -q '^deny  path contains /.ssh/ for=files' '$OUT/bl7.txt'"
+    check "... it lints, and the Warden would start it (the 512-rule cap)" \
+        sh -c "'$VDP' '$OUT/bl7.txt' lint > '$OUT/bl7.lint' && '$WARDEN' '$OUT/bl7.txt' --check-startup > /dev/null 2>&1"
+    touch "$PJ/srv"; chmod 755 "$PJ/srv"
+    check "... a server under the working directory (which the agent may write) is refused" \
+        sh -c "cd '$PJ' && $(declare -f v7); V7='$V7'; ! v7 run --baseline --show-policy --mcp files='$PJ/srv' --run-as nobody -- /bin/true 2>&1 | grep -q '^mcp server' && cd '$PJ' && v7 run --baseline --show-policy --mcp files='$PJ/srv' --run-as nobody -- /bin/true 2>&1 | grep -q 'which the agent may write'"
+    check "... and --mcp with --dry-run is refused" \
+        sh -c "cd '$PJ' && $(declare -f v7); V7='$V7'; v7 run --baseline --dry-run --mcp files='$X/srv' -- /bin/true 2>&1 | grep -q 'mcp with --dry-run is refused'"
+    [ -n "${KEEP:-}" ] || rm -rf "$LD" "$PJ"
 fi
 
 echo

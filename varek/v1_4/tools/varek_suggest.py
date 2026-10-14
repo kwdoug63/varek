@@ -43,7 +43,31 @@ READ_ACTIONS = ("file.stat", "file.access", "file.readlink", "file.chdir")
 CHANGE_ACTIONS = ("file.unlink", "file.rmdir", "file.mkdir", "file.rename_from", "file.rename_to",
                   "file.chmod", "file.utime", "file.truncate")
 SECTIONS = (("read", "files and directories read"), ("write", "files written, made, removed or changed"),
-            ("exec", "programs launched"), ("host", "hosts connected to"), ("request", "requests sent"))
+            ("exec", "programs launched"), ("host", "hosts connected to"), ("request", "requests sent"),
+            ("mcp", "MCP calls"))                                              # v1.31
+SUBAGENT_TAG = re.compile(r"subagent:([a-z][a-z0-9_]{0,31})#([1-9][0-9]{0,9})")
+
+
+def confined_subjects(vdp, path):
+    """v1.31: {name: subject number} of the policy's confined subjects (vdp_check identity)"""
+    r = subprocess.run([vdp, path, "identity"], capture_output=True, text=True)
+    out = {}
+    for ln in r.stdout.splitlines():
+        f = ln.split(" ")
+        if len(f) == 6 and f[0] == "confined" and f[1].isdigit():
+            out[f[2]] = int(f[1])
+    return out
+
+
+def subject_of(rec, confined):
+    """v1.31: the subject a record was decided as (the innermost confined
+    sub-agent in its chain), as varek_audit.py's expected_subject"""
+    k = 0
+    for t in rec.get("obo") if isinstance(rec.get("obo"), list) else []:
+        m = SUBAGENT_TAG.fullmatch(t) if isinstance(t, str) else None
+        if m and m.group(1) in confined:
+            k = confined[m.group(1)]
+    return k
 CREDENTIAL_RX = re.compile(
     r"/\.(ssh|aws|azure|kube|gnupg|password-store)/|/\.config/gcloud/|/\.docker/config\.json$|"
     r"/\.(netrc|git-credentials|pgpass|my\.cnf|npmrc|pypirc)$|\.[pP][eE][mM]($|[.~])|\.[kK][eE][yY]($|[.~])|"
@@ -90,8 +114,9 @@ def _name_of(rec, asked):
     return r if isinstance(r, str) else ""
 
 
-def collect(records):
-    """(run_start, the run's refusals the policy made, the notes) from records"""
+def collect(records, keep=None):
+    """(run_start, the run's refusals the policy made, the notes) from records
+    (v1.31: those keep(record) accepts: one subject's)"""
     rs, run = None, None
     items, notes = {}, {}
     written = set()
@@ -119,6 +144,8 @@ def collect(records):
             if act in CHANGE_ACTIONS and isinstance(res, str):
                 written.add(res)
         if r.get("decision_final") != "DENY":
+            continue
+        if keep is not None and not keep(r):
             continue
         rule = r.get("rule")
         if rule == "syscall_not_admitted":
@@ -151,6 +178,10 @@ def collect(records):
             kind, query = "host", ("host", None)
         elif act == "net.request":
             kind, subj, query = "request", res, ("request", None)
+        elif act == "net.mcp":                                                 # v1.31: the object decided
+            if not isinstance(r.get("resolved"), str) or r["resolved"].count("#") < 2:
+                continue
+            kind, subj, query = "mcp", r["resolved"], ("mcp", None)
         else:
             continue
         key = (kind, subj)
@@ -214,9 +245,26 @@ def why_not(it, home, written):
     return None
 
 
-def rule_text(it):
-    """the rule for an item, or None when no policy line can hold it"""
+def rule_text(it, for_name=None):
+    """the rule for an item, or None when no policy line can hold it
+    (v1.31: written for=NAME for a confined subject)"""
+    t = _rule_text(it)
+    return t if t is None or not for_name else f"{t} for={for_name}"
+
+
+MCP_WORD_RX = re.compile(r"[\x21-\x7e]+")
+
+
+def _rule_text(it):
     s, kind = it["subj"], it["kind"]
+    if kind == "mcp":
+        url, method, name = s.split("#", 2)
+        # the name, as a glob: none of its metacharacters, nor a word an mcp rule reads as an option
+        if not re.fullmatch(r"[A-Za-z0-9_./-]{1,128}", method) or \
+                (name and (not MCP_WORD_RX.fullmatch(name) or any(c in name for c in "*?[]{}\\") or
+                           re.match(r"(max_body|credential|header|for)=", name))):
+            return None
+        return f"allow mcp {url} {method}" + (f" {name}" if name else "")
     if kind == "request":
         parts = s.split(" ", 1)
         if len(parts) != 2 or not re.fullmatch(r"[A-Z]{1,20}", parts[0]) or not _writable(parts[1]):
@@ -258,11 +306,13 @@ def _header(rs, policy_path, policy_sha):
     ]
 
 
-def _batch(vdp, path, queries):
-    """decide each (kind, flags, string) under the policy at path: [(verdict, line)]"""
+def _batch(vdp, path, queries, subj=0):
+    """decide each (kind, flags, string) under the policy at path, as subject
+    subj (v1.31): [(verdict, line)]"""
     lines = []
     for k, fl, s in queries:
-        lines.append(f"{k} {'-' if fl is None else hex(fl)} {s.encode('utf-8', 'surrogateescape').hex() or '='}")
+        lines.append(f"{k} {'-' if fl is None else hex(fl)} {s.encode('utf-8', 'surrogateescape').hex() or '='}" +
+                     (f" @{subj}" if subj else ""))
     r = subprocess.run([vdp, path, "batch"], input="\n".join(lines) + "\n", capture_output=True, text=True)
     out = []
     import json
@@ -277,9 +327,22 @@ def _batch(vdp, path, queries):
     return out
 
 
-def suggest(records, policy_text, policy_path, policy_sha, vdp):
-    """The draft's text, and how many rules it suggests (active, commented)."""
-    rs, items, notes, written = collect(records)
+def suggest(records, policy_text, policy_path, policy_sha, vdp, for_name=None):
+    """The draft's text, and how many rules it suggests (active, commented).
+    v1.31: for one subject: the agent's (for_name None), or the confined
+    subject for_name's, each rule written for=NAME."""
+    confined = confined_subjects(vdp, policy_path)
+    if for_name is not None and for_name not in confined:
+        raise ValueError(f"{for_name} is not an MCP server or confined sub-agent of the run's policy"
+                         + (f" (it has: {', '.join(sorted(confined))})" if confined else " (it has none)"))
+    want = confined[for_name] if for_name else 0
+    others = {}
+    for r in records:
+        if isinstance(r, dict) and r.get("decision_final") == "DENY" and "action" in r:
+            k = subject_of(r, confined)
+            if k != want:
+                others[k] = others.get(k, 0) + 1
+    rs, items, notes, written = collect(records, keep=lambda r: subject_of(r, confined) == want)
     if rs is None:
         raise ValueError("the stream has no run_start")
     home = agent_home(rs)
@@ -303,7 +366,7 @@ def suggest(records, policy_text, policy_path, policy_sha, vdp):
             continue
         out.append(f"# {title}")
         for it in its:
-            rt = rule_text(it)
+            rt = rule_text(it, for_name)
             if rt is None:
                 out.append(f"# (not written: {it['subj'][:200]!r} cannot be a policy constant) # {_comment(it)}")
                 n_commented += 1
@@ -324,7 +387,8 @@ def suggest(records, policy_text, policy_path, policy_sha, vdp):
                     by_dir.setdefault(os.path.dirname(it["subj"]), []).append(it)
             for d in sorted(by_dir):
                 if len(by_dir[d]) >= 5 and d != "/":
-                    out.append(f"# allow path {d}/{' readonly' if kind == 'read' else ''}    "
+                    out.append(f"# allow path {d}/{' readonly' if kind == 'read' else ''}"
+                               f"{' for=' + for_name if for_name else ''}    "
                                f"# ALTERNATIVE (not active): {len(by_dir[d])} objects under {d}/ were refused; "
                                f"a directory rule grants what nobody saw the agent need")
     if notes:
@@ -332,8 +396,13 @@ def suggest(records, policy_text, policy_path, policy_sha, vdp):
         for (k, n), nt in sorted(notes.items(), key=lambda x: (x[0][0], x[0][1])):
             out.append(f"# system call {n} ({nt['name']}) is outside the Warden's system-call allowlist: "
                        f"{nt['n']} time{'s' if nt['n'] != 1 else ''}; no policy rule admits it")
+    names = {k: n for n, k in confined.items()}
+    for k, n in sorted(others.items()):                                        # v1.31
+        who = f"{names.get(k, '?')}" if k else "the agent"
+        out.append(f"# ({n} refusal(s) were for {who}, not suggested here: `varek policy suggest" +
+                   (f" --for {names.get(k, '?')}`)" if k else "` without --for)"))
     if not items:
-        out.append("# (the policy refused nothing in this run)")
+        out.append("# (the policy refused nothing in this run" + (f" for {for_name})" if for_name else ")"))
     out.append("")
     # check: lint, and every refused call decided again under the draft
     with tempfile.NamedTemporaryFile("w", suffix=".policy.txt", delete=False) as fh:
@@ -346,7 +415,7 @@ def suggest(records, policy_text, policy_path, policy_sha, vdp):
                 for q in it["queries"]:
                     qs.append(q)
                     owners.append(idx)
-            got = _batch(vdp, tmp, qs)
+            got = _batch(vdp, tmp, qs, want)
             bad = set()
             for (verdict, line), idx in zip(got, owners):
                 if verdict != "SATISFIED" or line != idx + 1:
