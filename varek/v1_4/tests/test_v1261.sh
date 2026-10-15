@@ -485,7 +485,7 @@ PY
     openssl x509 -in "$W/o/run-ca.pem" -noout -text > "$OUT/ca.txt" 2>&1
     if grep -q 'NIST CURVE: P-256' "$OUT/ca.txt" && grep -A1 'Basic Constraints: critical' "$OUT/ca.txt" | grep -q 'CA:TRUE, pathlen:0' &&
        grep -A1 'Key Usage: critical' "$OUT/ca.txt" | grep -q 'Certificate Sign, CRL Sign' &&
-       grep -q 'CN = VAREK run CA '"$(grep -o '"run":"[0-9a-f]*"' "$OUT/c.log" | head -1 | cut -d'"' -f4)" "$OUT/ca.txt"
+       grep -Eq 'CN ?= ?VAREK run CA '"$(grep -o '"run":"[0-9a-f]*"' "$OUT/c.log" | head -1 | cut -d'"' -f4)" "$OUT/ca.txt"   # OpenSSL 3.5 prints CN=, 3.0 CN =
     then pass "the CA: ECDSA P-256, CA:TRUE pathlen 0, signing certificates only, named for the run"
     else flunk "the CA's form ($(head -c 400 "$OUT/ca.txt"))"; fi
     NCP=$(sed -n '/Name Constraints: critical/,/Excluded:/p' "$OUT/ca.txt")
@@ -713,7 +713,7 @@ PY
     then pass "the server got the allowed requests, and nothing of the refused ones"
     else flunk "the server got only the allowed requests ($(cat "$OUT/srv$P1.log"))"; fi
     openssl x509 -inform DER -in "$W/o/leaf-verified.der" -noout -text > "$OUT/leaf.txt" 2>&1
-    if grep -q 'Issuer: O = VAREK Warden (this run only), CN = VAREK run CA' "$OUT/leaf.txt" &&
+    if grep -Eq 'Issuer: O ?= ?VAREK Warden \(this run only\), CN ?= ?VAREK run CA' "$OUT/leaf.txt" &&
        grep -A1 'Subject Alternative Name' "$OUT/leaf.txt" | tail -1 | grep -qx ' *DNS:api.example.com' &&
        grep -A1 'Extended Key Usage' "$OUT/leaf.txt" | grep -q 'TLS Web Server Authentication' &&
        grep -A1 'Basic Constraints: critical' "$OUT/leaf.txt" | grep -q 'CA:FALSE' &&
