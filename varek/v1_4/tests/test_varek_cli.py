@@ -159,3 +159,44 @@ def test_pack_added_before_init_and_stderr_and_standalone_verify(tmp_path):
     # An auditor with no VAREK settings can verify with the public key alone.
     varek("export", "--verify", str(bom), "--pubkey", pub,
           config=str(tmp_path / "nowhere.conf"), check=0)
+
+
+def _varek_module():
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("varek_cli_mod", VAREK)
+    spec = importlib.util.spec_from_loader("varek_cli_mod", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def test_a_long_stream_is_read_as_it_goes(tmp_path):
+    """v1.31 (the shared soak): after 24 hours under the baseline a stream is
+    about 250 MB, and `varek run`'s summary held it all and was killed on a
+    2 GB host. The records are read from the file on each pass, never held."""
+    import tracemalloc
+    mod = _varek_module()
+    log = tmp_path / "verdicts.log"
+    n = 60000
+    with open(log, "w") as fh:
+        fh.write(json.dumps({"event": "run_start", "run": "r1", "warden": "1.31.0"}) + "\n")
+        fh.write("[warden] a line of the Warden's own\n")
+        for i in range(n):
+            fh.write(json.dumps({"report_id": i, "run": "r1", "action": "file.open", "target": "/w/f%d" % i,
+                                 "decision_final": "DENY" if i % 1000 == 0 else "ALLOW",
+                                 "rule": "default_deny_unknown", "pad": "x" * 200}) + "\n")
+        fh.write(json.dumps({"event": "run_end", "run": "r1"}) + "\n")
+    recs = mod.read_records(str(log))
+    assert sum(1 for _ in recs) == n + 2 and sum(1 for _ in recs) == n + 2     # read again on each pass
+    tracemalloc.start()
+    s = mod.summarize(mod.read_records(str(log)))
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert s["complete"] and s["refused"] == n // 1000
+    assert peak < 4 * 1024 * 1024, peak               # the stream is about 16 MB; holding it as objects is far more
+    # a damaged line is still refused, at the end of the pass that finds it
+    with open(log, "a") as fh:
+        fh.write('{"report_id": broken\n')
+    with pytest.raises(mod.CliError, match="cannot be read"):
+        mod.summarize(mod.read_records(str(log)))
