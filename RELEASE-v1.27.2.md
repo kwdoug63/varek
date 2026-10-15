@@ -61,9 +61,11 @@ to v1.27.
 
 ## 24 hours on a small host
 
-_(The release commit adds the figures.)_ The plan: v1.27.1's soak harness
-(`tests/soak_v1270`), signed (`--sign-key`), for 24 hours on a 1 GB droplet,
-once a droplet is free of the soaks of v1.28.0 to v1.31.0.
+v1.27.1's soak harness (`tests/soak_v1270`), signed (`--sign-key`), on the
+1 vCPU, 1 GB droplet once v1.28.0's soak had freed it. A 3-minute trial
+passed on 2026-10-15: Warden 1.27.2, the work directory mounted `noexec`,
+the tasks ok, the probe refused, the signed stream's audit passed. The
+24-hour run started the same day; the release commit adds its figures.
 
 ## Compatibility
 
