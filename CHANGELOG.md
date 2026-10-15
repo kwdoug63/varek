@@ -9,6 +9,39 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.28.0] - 2026-10-15 — The agent holds only placeholders
+
+After `require warden 1.28`, `credential NAME from STORE:REF` names a
+credential in a file, HashiCorp Vault (KV, or a leased secret it renews)
+or AWS Secrets Manager. A separate helper, `warden-secrets` (its own
+binary, recorded by hash, running as its own user), fetches each at
+startup and hands the values to the egress proxy, never to the Warden. The
+agent gets a placeholder in `VAREK_CRED_<NAME>`. In inspecting mode, on a
+request an `allow request ... credential=NAME header=HEADER[:SCHEME]` rule
+decides SATISFIED (an `https://` rule only), the proxy puts the value in
+place of the placeholder in that header, and refuses the request
+(`credential_refused`) if the header does not hold exactly the
+placeholder; a placeholder anywhere else is sent as it is. `varek revoke
+<run>` makes every later call of the run UNSATISFIED, has the proxy clear
+every value and close every connection, and revokes the run's Vault
+leases. `run_start` records each credential's store, version and
+placeholder's SHA-256, never a value; `varek_audit.py` checks every
+request that carried one against its rule, each refused swap and the
+revocation; `varek refusals`, `varek policy show`, the CycloneDX export,
+`warden --check-credentials`, `varek doctor`, the preflight and `varek
+bench --proxy` cover it. Two faults the shared soak's trial found are
+fixed: a checkpoint is written before a record that would pass
+`checkpoint_every` (a burst of proxy reports could put more between two
+signatures, failing the audit), and the audit knows a launch refused
+after a revocation. The Warden reports version 1.28.0.
+
+Reviewed by AI review agents (not a human or third-party review); a
+24-hour soak on a 1 GB host passed: 1,291 calls with a credential, each
+value only where its rule names it, 144 probes held, 2,150 lease renewals,
+the revocation honored. See `RELEASE-v1.28.0.md` for the tests, latency,
+the review's findings, compatibility and known limits, and
+`docs/security/v1.28-credential-release.md` for the design.
+
 ## [1.27.1] - 2026-10-12 — Nothing written during the run is mapped executable
 
 Under `require warden 1.27`, every directory the policy lets the agent

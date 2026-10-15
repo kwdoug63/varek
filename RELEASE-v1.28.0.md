@@ -3,9 +3,7 @@
 > The review was done by AI review agents; a human or third-party review
 > has not been done.
 
-**Draft.** Pending: the 24-hour soak of the reviewed build and the date.
-
-MIT · github.com/kwdoug63/varek
+Released 2026-10-15 · MIT · github.com/kwdoug63/varek
 
 ## Summary
 
@@ -146,7 +144,23 @@ A 6-minute trial of the build before the review passed on the 1 vCPU, 1 GB
 droplet: 99 calls before the revocation, each with the value where its rule
 names it; 11 probes held; 8 lease renewals; 10 turns after the revocation,
 all refused; the proxy holding no value, the lease revoked; the audit
-passed; memory flat. The 24-hour run of the reviewed build: (to come).
+passed; memory flat.
+
+The release build (its code as it stands: everything after the two faults
+the shared soak's trial found, fixed above, changes only tests and
+documents) ran for 24 hours on the same droplet, 2026-10-14 to 2026-10-15,
+signed, and passed:
+
+| | |
+|---|---|
+| Duration | 23.92 h, revoked 5 turns before the end |
+| Records | 20,225; `varek_audit` passed (4 credentials named, 1,363 requests carried one, 72 swaps refused, the run revoked) |
+| Calls before the revocation | 1,291 (323 each for the file, the lease and AWS Secrets Manager, 322 for Vault KV), all succeeded; the API got the value where the rule names it in all 1,291, and nowhere else |
+| Probes | 144 (36 of each kind), all held; the 72 missing-header and other-placeholder probes each refused by the proxy (`credential_refused`) |
+| The Vault lease | renewed 2,150 times (the stand-in got all 2,150), none failed |
+| The revocation | the proxy held 0 values after it, the lease revoked at the stand-in, the 5 turns after it all refused and none reached the API |
+| A call with a credential | p50 9 ms, p99 17 ms at the agent; the Warden's decision on it p50 14 us, p99 33 us |
+| Memory | the Warden 6.6 to 6.9 MB, `warden-proxy` 8.3 to 8.4 MB, `warden-secrets` 8.6 MB, flat |
 
 ## Latency
 
