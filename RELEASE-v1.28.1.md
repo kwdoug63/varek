@@ -3,10 +3,7 @@
 > The review was done by AI review agents; a human or third-party review
 > has not been done.
 
-**Draft.** Pending: the shared 24-hour soak (with v1.29.0 and v1.31.0) and
-the date.
-
-MIT · github.com/kwdoug63/varek
+Released 2026-10-15 · MIT · github.com/kwdoug63/varek
 
 ## Summary
 
@@ -143,6 +140,30 @@ token, claim, signature or private key in an output or the export, no
 helper left running or crashed, no call refused, no control group left
 behind. With no identity verified and no sub-agent launched, they hold
 trivially.
+
+## 24 hours on a small host
+
+The shared soak (`tests/soak_shared/`, on v1.31's branch) covers v1.28.1,
+v1.29.0 and v1.31.0 on one build, as decided for the three releases: the
+v1.31.0 Warden, which carries this release's code. Its run A is this
+release's: an agent acting for a user, whose token the run verified, with
+two sub-agents, one launched by the other, and the token expiring inside
+the run. It ran for 24 hours on a 2 GB droplet, 2026-10-14 to 2026-10-15,
+signed, and passed:
+
+| | |
+|---|---|
+| Duration | 24.0 h, a turn every 60 s: 1,440 turns |
+| The user | `alice@example.test`, a token from the stand-in issuer (ES256), verified at the start; `on expiry: revoke` |
+| Records | 16,456; `varek_audit` passed, every record's chain checked against the launches and the policy |
+| Calls before the expiry | 1,291 tasks, all succeeded (each kind 258 or 259), among them 258 that launched the `coder` sub-agent, which launched `tester` |
+| Attribution | every one of `tester`'s 258 opens recorded with the chain `user → agent → subagent:coder#n → subagent:tester#n`; the audit counted each sub-agent's decisions (5 for each `coder`, 4 for each `tester`) |
+| Probes | 144 (18 of each of 8 kinds), all held |
+| The expiry | the run revoked 0.00 s after the user's token expired; the 5 turns after it all refused, none working |
+| The stream's other uses | the OCSF export followed it (14,283 events, verified against the stream, valid OCSF 1.9.0) |
+
+The same soak's other runs, and the fault in `varek run`'s summary it
+found (not in this release), are in `RELEASE-v1.29.0.md`.
 
 ## Latency
 
