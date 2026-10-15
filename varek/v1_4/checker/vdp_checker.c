@@ -147,6 +147,8 @@ struct vdpc_rule {
     int      qmode;
     bool     rwild;
     unsigned rport;
+    int      cred;                    /* request (v1.28): 1 + credential index, 0: none */
+    char     hdr[65], scheme[33];     /* request (v1.28): header=NAME[:SCHEME] */
 };
 
 void vdpc_free(vdpc_policy_t *p) {
@@ -535,8 +537,101 @@ static int req_parse(const char *m, const char *u, vdpc_rule_t *r, const char **
 }
 
 /* One line: tokens (NUL-terminated copies in `line`). Returns -1 on error. */
+/* v1.28: an HTTP token character (RFC 9110 tchar) */
+static bool tchar(unsigned char c) {
+    if (c >= '0' && c <= '9') return true;
+    if ((c | 0x20) >= 'a' && (c | 0x20) <= 'z') return true;
+    switch (c) {
+    case '!': case '#': case '$': case '%': case '&': case '\'': case '*': case '+': case '-':
+    case '.': case '^': case '_': case '`': case '|': case '~': return true;
+    default: return false;
+    }
+}
+
+static bool all_tchar(const char *s, size_t n, size_t max) {
+    if (n == 0 || n > max) return false;
+    for (size_t i = 0; i < n; i++) if (!tchar((unsigned char)s[i])) return false;
+    return true;
+}
+
+/* v1.28: does a lowercase copy of h name a framing header? */
+static bool framing_header(const char *h) {
+    char low[65];
+    size_t n = strlen(h);
+    if (n >= sizeof low) return false;
+    for (size_t i = 0; i <= n; i++) low[i] = (char)((h[i] >= 'A' && h[i] <= 'Z') ? h[i] + 32 : h[i]);
+    /* v1.28 review: each name compared whole ('|' is a token character, so
+     * a search in a '|'-joined list matched "te|trailer") */
+    static const char *const kFraming[] = { "host", "content-length", "transfer-encoding", "connection",
+                                            "upgrade", "te", "trailer", "keep-alive", "proxy-connection",
+                                            "proxy-authorization" };
+    for (size_t i = 0; i < sizeof kFraming / sizeof *kFraming; i++)
+        if (!strcmp(low, kFraming[i])) return true;
+    return false;
+}
+
+/* v1.28: credential NAME from STORE:REF; 0, or -1 (the reason in err) */
+static int parse_credential(const char *name, int ln, char **tok, int nt, vdpc_policy_t *p,
+                            char *err, size_t en) {
+    if (nt != 4 || strcmp(tok[2], "from")) return fail(err, en, name, ln, "bad credential directive");
+    const char *n = tok[1];
+    size_t nl = strlen(n);
+    bool ok = nl >= 1 && nl <= 32 && n[0] >= 'a' && n[0] <= 'z';
+    for (size_t i = 1; ok && i < nl; i++)
+        ok = (n[i] >= 'a' && n[i] <= 'z') || (n[i] >= '0' && n[i] <= '9') || n[i] == '_';
+    if (!ok) return fail(err, en, name, ln, "bad credential name");
+    for (size_t k = 0; k < p->ncreds; k++)
+        if (!strcmp(p->creds[k].name, n)) return fail(err, en, name, ln, "credential named twice");
+    if (p->ncreds == VDPC_MAX_CREDS) return fail(err, en, name, ln, "more than 32 credentials");
+    const char *v = tok[3];
+    int store;
+    size_t pl;
+    if (!strncmp(v, "file:", 5))        { store = 1; pl = 5; }
+    else if (!strncmp(v, "vault:", 6))  { store = 2; pl = 6; }
+    else if (!strncmp(v, "aws-sm:", 7)) { store = 3; pl = 7; }
+    else return fail(err, en, name, ln, "bad credential store");
+    const char *r = v + pl;
+    size_t rl = strlen(r);
+    if (rl == 0 || rl > 1024) return fail(err, en, name, ln, "bad credential reference");
+    for (size_t i = 0; i < rl; i++)
+        if ((unsigned char)r[i] <= 0x20 || (unsigned char)r[i] >= 0x7f)
+            return fail(err, en, name, ln, "bad credential reference");
+    if (store == 1) {
+        /* an absolute path: segments between '/'s, none empty, "." or ".." */
+        if (r[0] != '/' || rl < 2) return fail(err, en, name, ln, "bad file credential path");
+        const char *seg = r + 1;
+        for (;;) {
+            const char *e = strchr(seg, '/');
+            size_t sl = e ? (size_t)(e - seg) : strlen(seg);
+            if (sl == 0 || (sl == 1 && seg[0] == '.') || (sl == 2 && seg[0] == '.' && seg[1] == '.'))
+                return fail(err, en, name, ln, "bad file credential path");
+            if (!e) break;
+            seg = e + 1;
+        }
+    } else if (store == 2) {
+        const char *h = strchr(r, '#');
+        if (!h || h == r || r[0] == '/' || strchr(h + 1, '#') || h[1] == '\0')
+            return fail(err, en, name, ln, "bad vault credential reference");
+        for (const char *q = h + 1; *q; q++) {
+            char c = *q;
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '_' || c == '.' || c == '-'))
+                return fail(err, en, name, ln, "bad vault credential field");
+        }
+    } else if (rl < 4 || memcmp(r, "arn:", 4) || !strstr(r, ":secretsmanager:")) {
+        return fail(err, en, name, ln, "bad aws-sm credential reference");
+    }
+    vdpc_cred_t *c = &p->creds[p->ncreds++];
+    memcpy(c->name, n, nl + 1);
+    memcpy(c->ref, r, rl + 1);
+    c->store = store;
+    c->line = ln;
+    return 0;
+}
+
 static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj, int req_min,
-                      int *legacy_name, size_t *glob_total, vdpc_rule_t *r, char *err, size_t en) {
+                      int *legacy_name, size_t *glob_total, vdpc_rule_t *r, char *err, size_t en,
+                      const vdpc_policy_t *pol) {
     memset(r, 0, sizeof *r);
     r->line = ln;
     if (!strcmp(tok[0], "allow")) r->allow = true;
@@ -568,8 +663,32 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
         }
         while (r->npre < r->ng && r->g[r->npre].type == G_LIT) r->npre++;
         while (r->nsuf < r->ng && r->g[r->ng - 1 - r->nsuf].type == G_LIT) r->nsuf++;
+        bool hdr = false;
         for (int k = 4; k < nt; k++) {
             const char *t = tok[k];
+            /* v1.28: credential=NAME, header=NAME[:SCHEME], on allow rules after 1.28 */
+            if (!strncmp(t, "credential=", 11) || !strncmp(t, "header=", 7)) {
+                if (!ver_ge(req_maj, req_min, 1, 28)) return fail(err, en, name, ln, "credential option before 1.28");
+                if (!r->allow) return fail(err, en, name, ln, "credential option on a deny rule");
+                if (t[0] == 'c') {
+                    if (r->cred) return fail(err, en, name, ln, "credential given twice");
+                    for (size_t q = 0; q < pol->ncreds && !r->cred; q++)
+                        if (!strcmp(pol->creds[q].name, t + 11)) r->cred = (int)q + 1;
+                    if (!r->cred) return fail(err, en, name, ln, "unknown credential");
+                } else {
+                    if (hdr) return fail(err, en, name, ln, "header given twice");
+                    const char *v = t + 7, *colon = strchr(v, ':');
+                    size_t hn = colon ? (size_t)(colon - v) : strlen(v);
+                    if (!all_tchar(v, hn, 64) || (colon && !all_tchar(colon + 1, strlen(colon + 1), 32)))
+                        return fail(err, en, name, ln, "bad header");
+                    memcpy(r->hdr, v, hn);
+                    r->hdr[hn] = '\0';
+                    if (colon) memcpy(r->scheme, colon + 1, strlen(colon + 1) + 1);
+                    if (framing_header(r->hdr)) return fail(err, en, name, ln, "a framing header");
+                    hdr = true;
+                }
+                continue;
+            }
             if (strncmp(t, "max_body=", 9) != 0) return fail(err, en, name, ln, "unknown request rule option");
             if (!r->allow) return fail(err, en, name, ln, "max_body on a deny rule");
             if (r->max_body) return fail(err, en, name, ln, "max_body given twice");
@@ -587,6 +706,8 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
             if (x > 1073741824ULL) return fail(err, en, name, ln, "bad max_body");
             r->max_body = (uint32_t)x;
         }
+        if ((r->cred != 0) != hdr) return fail(err, en, name, ln, "credential and header go together");
+        if (r->cred && strncmp(tok[3], "https://", 8) != 0) return fail(err, en, name, ln, "credential on http");
         return 0;
     }
 
@@ -817,13 +938,19 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
                     }
                 } else
                     rc = fail(err, en, name, ln, "bad proxy directive");
+            } else if (!strcmp(tok[0], "credential")) {
+                /* v1.28 */
+                if (!ver_ge(req_maj, req_min, 1, 28))
+                    rc = fail(err, en, name, ln, "credential before require warden 1.28");
+                else
+                    rc = parse_credential(name, ln, tok, nt, p, err, en);
             } else if (nt < 3) {
                 rc = fail(err, en, name, ln, "bad rule");
             } else if (p->n == VDPC_MAX_RULES) {
                 rc = fail(err, en, name, ln, "more than 256 rules");
             } else {
                 rc = parse_rule(name, ln, tok, nt, req_maj, req_min, &legacy_name, &glob_total,
-                                &p->rules[p->n], err, en);
+                                &p->rules[p->n], err, en, p);
                 p->n++;                       /* counted either way: freed below */
             }
         }
@@ -1011,6 +1138,9 @@ int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *o) {
     o->names = r->names;
     o->rate = r->rate;
     o->max_body = r->max_body;
+    o->cred = r->cred;
+    o->cred_hdr = r->hdr;
+    o->cred_scheme = r->scheme;
     return 0;
 }
 

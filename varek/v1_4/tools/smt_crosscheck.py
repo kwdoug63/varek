@@ -490,6 +490,37 @@ def request_glob(method, url, where):
     return glob, name, wild, port
 
 
+# v1.28: credential release (smt_decide.h)
+TOKEN_RX = r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+"
+FRAMING_HEADERS = {"host", "content-length", "transfer-encoding", "connection", "upgrade", "te",
+                   "trailer", "keep-alive", "proxy-connection", "proxy-authorization"}
+CRED_STORES = {"file": 1, "vault": 2, "aws-sm": 3}
+
+
+def credential_parse(toks, names, where):
+    """`credential NAME from STORE:REF`: (name, store, ref), or PolicyError."""
+    if len(toks) != 4 or toks[2] != "from":
+        raise PolicyError(f"{where}: bad credential directive")
+    name, spec = toks[1], toks[3]
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", name) or name in names or len(names) >= 32:
+        raise PolicyError(f"{where}: bad credential name")
+    store, sep, ref = spec.partition(":")
+    if not sep or store not in CRED_STORES or not 1 <= len(ref) <= 1024 or \
+            any(not 0x21 <= ord(ch) <= 0x7e for ch in ref):
+        raise PolicyError(f"{where}: bad credential reference")
+    if store == "file":
+        segs = ref.split("/")
+        if segs[0] != "" or len(segs) < 2 or any(sg in ("", ".", "..") for sg in segs[1:]):
+            raise PolicyError(f"{where}: bad file credential path")
+    elif store == "vault":
+        path_, h, field = ref.partition("#")
+        if not h or not path_ or path_.startswith("/") or not re.fullmatch(r"[A-Za-z0-9_.\-]+", field):
+            raise PolicyError(f"{where}: bad vault credential reference")
+    elif not ref.startswith("arn:") or ":secretsmanager:" not in ref:
+        raise PolicyError(f"{where}: bad aws-sm credential reference")
+    return (name, CRED_STORES[store], ref)
+
+
 def parse_policy(path):
     """Independent re-implementation of the policy grammar (smt_decide.h)."""
     with open(path, "rb") as fh:
@@ -505,6 +536,7 @@ def parse_lines(raw_lines, path):
     proxy, proxy_ports = False, None   # v1.26: `proxy on`, `proxy ports`
     upstream = None                    # v1.26 section 5: `proxy upstream http://HOST:PORT`
     inspect, passthrough = False, []   # v1.26.1: `proxy inspect`, `proxy passthrough host NAME`
+    creds = []                         # v1.28: (name, store, ref), in order
     if True:
         for lineno, raw in enumerate(raw_lines, 1):
             if b"\0" in raw:
@@ -526,7 +558,7 @@ def parse_lines(raw_lines, path):
                 if len(toks) != 3 or toks[1] != "warden" or not m:
                     raise PolicyError(f"{path}:{lineno}: bad directive")
                 v = (int(m.group(1)), int(m.group(2)))
-                if v > (1, 27):
+                if v > (1, 28):
                     raise PolicyError(f"{path}:{lineno}: requires newer Warden")
                 if legacy_name and v >= (1, 24):
                     raise PolicyError(f"{path}:{lineno}: require warden 1.24 after a host name")
@@ -573,6 +605,12 @@ def parse_lines(raw_lines, path):
                 raise PolicyError(f"{path}:{lineno}: bad proxy directive")
             if len(toks) < 3:
                 raise PolicyError(f"{path}:{lineno}: bad rule")
+            if toks[0] == "credential":
+                # v1.28: credential NAME from STORE:REF (smt_decide.h)
+                if req < (1, 28):
+                    raise PolicyError(f"{path}:{lineno}: credential before 1.28")
+                creds.append(credential_parse(toks, [c[0] for c in creds], f"{path}:{lineno}"))
+                continue
             verb, kind = toks[0], toks[1]
             if verb not in ("allow", "deny"):
                 raise PolicyError(f"{path}:{lineno}: verb")
@@ -588,16 +626,38 @@ def parse_lines(raw_lines, path):
                 if glob_tokens > GLOB_MAX_TOTAL:
                     raise PolicyError(f"{path}:{lineno}: glob tokens over the policy total")
                 max_body = 0
+                cred, header = None, None          # v1.28
                 for t in toks[4:]:
+                    if t.startswith(("credential=", "header=")):
+                        if req < (1, 28) or verb != "allow":
+                            raise PolicyError(f"{path}:{lineno}: credential option here")
+                        if t.startswith("credential="):
+                            names = [c[0] for c in creds]
+                            if cred is not None or t[11:] not in names:
+                                raise PolicyError(f"{path}:{lineno}: bad credential=")
+                            cred = names.index(t[11:]) + 1
+                        else:
+                            m = re.fullmatch(TOKEN_RX + r"(?::" + TOKEN_RX + r")?", t[7:])
+                            hdr, _, scheme = t[7:].partition(":")
+                            if header is not None or not m or len(hdr) > 64 or len(scheme) > 32 or \
+                                    hdr.lower() in FRAMING_HEADERS:
+                                raise PolicyError(f"{path}:{lineno}: bad header=")
+                            header = (hdr, scheme)
+                        continue
                     m = re.fullmatch(r"max_body=([1-9][0-9]{0,6})([km]?)", t)
                     if not m or verb != "allow" or max_body:
                         raise PolicyError(f"{path}:{lineno}: bad request rule option {t}")
                     max_body = int(m.group(1)) * {"": 1, "k": 1024, "m": 1 << 20}[m.group(2)]
                     if max_body > 1 << 30:
                         raise PolicyError(f"{path}:{lineno}: max_body over 1 GiB")
+                if (cred is None) != (header is None):
+                    raise PolicyError(f"{path}:{lineno}: credential= and header= go together")
+                if cred is not None and not toks[3].startswith("https://"):
+                    raise PolicyError(f"{path}:{lineno}: credential= on an http:// rule")
                 r = {"verb": verb, "kind": kind, "op": "glob", "c": const, "rx": grx, "gtoks": gtoks,
                      "mask": 0, "value": 0, "line": lineno, "portless": False, "name": False,
-                     "wild": False, "max_body": max_body, "rhost": rhost, "rwild": rwild, "rport": rport}
+                     "wild": False, "max_body": max_body, "rhost": rhost, "rwild": rwild, "rport": rport,
+                     "cred": cred or 0, "header": header or ("", "")}
                 # v1.26.1 review: a URL without a query: an allow rule holds on
                 # no string with a '?'; a deny rule holds when its glob matches
                 # the string up to its first '?'
@@ -718,6 +778,7 @@ def parse_lines(raw_lines, path):
                 raise PolicyError(f"{path}:{r['line']}: request rule for a passthrough host")
     # v1.27: launches after the first are decided only after require warden 1.27
     parse_policy.launches = req >= (1, 27)
+    parse_policy.creds = creds                     # v1.28
     return rules, rx
 
 
@@ -1232,8 +1293,29 @@ def fuzz_policy(rng, path):
         # them (allow and deny, exact and wildcard hosts, globs in the path,
         # queries), passthrough hosts, max_body, and (when the policy may be
         # invalid) each refused form
-        lines.append("require warden 1.26")
+        # v1.28: credentials, named and carried by allow request rules
+        v128 = rng.random() < 0.5
+        lines.append("require warden 1.28" if v128 else "require warden 1.26")
         lines.append("proxy inspect" if valid or rng.random() < 0.8 else rng.choice(["proxy on", ""]))
+        cred_names = []
+        if v128 or (not valid and rng.random() < 0.2):
+            good_c = ["openai from file:/etc/varek/creds/openai", "gh from vault:secret/data/gh#token",
+                      "s_3 from aws-sm:arn:aws:secretsmanager:us-east-1:1:secret:s-Ab",
+                      "k from file:/k", "v2 from vault:kv/a.b#F_1-x"]
+            bad_c = ["Openai from file:/x", "1x from file:/x", "a from file:x", "a from file:/x/",
+                     "a from file:/x//y", "a from file:/x/../y", "a from file:/x/.", "a from file:/",
+                     "a from vault:/a#b", "a from vault:a#", "a from vault:a#b#c", "a from vault:#b",
+                     "a from vault:a#b!", "a from aws-sm:arn:aws:s3:::x", "a from aws:x", "a from file",
+                     "a by file:/x", "a from file:/x extra", "a" * 33 + " from file:/x",
+                     "a from file:/x\xe9"]
+            for _ in range(rng.randint(1, 4)):
+                c = rng.choice(good_c)
+                if not valid and rng.random() < 0.2:
+                    c = rng.choice(bad_c + [c])            # a bad form, or a name given twice
+                if valid and c.split()[0] in cred_names:
+                    continue
+                lines.append("credential " + c)
+                cred_names.append(c.split()[0])
         if rng.random() < 0.3:
             lines.append("proxy ports " + rng.choice(["443", "80 443 8443", "8443"]))
         if rng.random() < 0.3:
@@ -1266,6 +1348,19 @@ def fuzz_policy(rng, path):
             opts = []
             if verb == "allow" and rng.random() < 0.3:
                 opts.append(rng.choice(["max_body=1", "max_body=256k", "max_body=1024m", "max_body=1048576"]))
+            if cred_names and (verb == "allow" or not valid) and rng.random() < 0.5:
+                # v1.28: credential= and header=, in either order
+                # (v1.28 review: '|' is a token character, and a framing name may sit beside it)
+                hdrs = ["Authorization:Bearer", "X-Api-Key", "authorization:token", "X_K:Basic", "a:B~c",
+                        "te|trailer", "Connection|Upgrade", "keep-alive|proxy-connection", "|te|", "host|"]
+                cr = ["credential=" + rng.choice(cred_names), "header=" + rng.choice(hdrs)]
+                rng.shuffle(cr)
+                opts += cr
+            if not valid and rng.random() < 0.1:
+                opts.append(rng.choice(["credential=nope", "header=Host", "header=content-length:x",
+                                        "header=A:", "header=:B", "header=A:B:C", "header=A B",
+                                        "credential=" + (cred_names[0] if cred_names else "x"),
+                                        "header=" + "H" * 65, "header=A:" + "s" * 33, "header=Proxy-Authorization"]))
             if not valid and rng.random() < 0.08:
                 opts.append(rng.choice(bad_o))
             line = " ".join([verb, "request", meth, url] + opts)
@@ -1355,8 +1450,8 @@ def fuzz_policy(rng, path):
         lines.append(rng.choice(["require warden 1.14", "require warden 1.13", "require warden 01.14",
                                  "require warden 1.15", "require warden 1.16", "require warden 1.21",
                                  "require warden 1.24", "require warden 1.24", "require warden 1.25",
-                                 "require warden 1.27"] +
-                                ([] if valid else ["require warden 1.28", "require warden x",
+                                 "require warden 1.27", "require warden 1.28"] +
+                                ([] if valid else ["require warden 1.29", "require warden x",
                                                    "require warden +1.14", "require warden 1.+14",
                                                    "require warden 1.1400000"])))
     elif rng.random() < 0.35:
@@ -1685,6 +1780,18 @@ def check_policy(vdp, policy, rng, nq, stats, verbose, checker=None):
         fails.append(f"{policy}: launches disagreement (oracle {want_l}, C {got_l})")
     if want_l == "on":
         stats["launch_policies"] += 1
+    # v1.28: the three parsers agree on the credentials and the rules that carry them
+    store_names = {1: "file", 2: "vault", 3: "aws-sm"}
+    want_c = [f"credential {n} {store_names[st]} {ref}" for n, st, ref in parse_policy.creds]
+    want_c += [f"rule {r['line']} {parse_policy.creds[r['cred'] - 1][0]} {r['header'][0]} {r['header'][1] or '-'}"
+               for r in rules if r.get("cred")]
+    got_c = [run_vdp(vdp, policy, "credentials")[1].splitlines()]
+    if checker:
+        got_c.append(subprocess.run([checker, policy, "credentials"], capture_output=True, text=True).stdout.splitlines())
+    if any(g != want_c for g in got_c):
+        fails.append(f"{policy}: credentials disagreement (oracle {want_c}, C {got_c})")
+    if want_c:
+        stats["credential_policies"] = stats.get("credential_policies", 0) + 1
     if any(r["op"] in ("suffix", "contains", "glob") for r in rules):
         stats["string_policies"] += 1
     if any(r["kind"] == "request" for r in rules):

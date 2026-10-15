@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.27.1-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.28.0-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -40,7 +40,11 @@ decided. Every launch after the agent's own is refused too, unless the policy
 opts in with `require warden 1.27` (v1.27.0): then each is decided, and the
 kernel's Landlock holds the agent to the programs the policy allows; from
 v1.27.1 the directories it may write are also mounted `noexec`, so nothing
-written during the run is launched or mapped executable. Every verdict is one of three — **SATISFIED**,
+written during the run is launched or mapped executable. From v1.28.0 the agent
+can hold only placeholders for the credentials it uses: the egress proxy puts
+the value into a request only in the header an allowing rule names, on a
+request the Warden decided SATISFIED, and `varek revoke` refuses every later
+call of a run. Every verdict is one of three — **SATISFIED**,
 **UNSATISFIED**, or **UNKNOWN** — and it fails closed: a paused call that cannot
 be proven allowed never runs. System calls the kernel filter admits without
 asking (memory, time, threads, and reads and writes on descriptors the agent
@@ -56,7 +60,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.27.1.**
+   **Current release: v1.28.0.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -123,6 +127,7 @@ The runtime line has progressed well beyond simple syscall containment:
   "Never requires a human" becomes certified rather than hoped. Since v1.18.0 the
   Warden runs it on the `--flow-policy` at startup and refuses to start if it
   fails.
+- **v1.28.0 — credential release: the agent holds only placeholders.** An agent that calls an API needed the API's key in its own memory, where anything it ran could read it and send it anywhere a rule allowed. With `credential NAME from STORE:REF` (after `require warden 1.28`), a separate helper, `warden-secrets` (its own binary, recorded by hash, running as its own user), fetches each credential at startup from a file, HashiCorp Vault (KV, or a leased secret it renews) or AWS Secrets Manager, and hands the values to the egress proxy, never to the Warden. The agent gets a placeholder in `VAREK_CRED_<NAME>`. In inspecting mode, on a request an `allow request ... credential=NAME header=HEADER[:SCHEME]` rule decides SATISFIED (an `https://` rule only), the proxy puts the value in place of the placeholder in that header, and refuses the request if the header does not hold exactly the placeholder; a placeholder anywhere else is sent as it is. `varek revoke <run>` refuses every later call of the run, has the proxy clear every value and close every connection, and revokes the run's Vault leases. `run_start` records each credential's source, version and placeholder's SHA-256 (never a value), and the audit checks every request that carried one against its rule. A server the policy allows that echoes request headers back would hand the value to the agent: the policy must not allow such an endpoint. A 24-hour soak passed, every value only where its rule names it and the revocation honored. Reviewed by AI review agents. See [`RELEASE-v1.28.0.md`](./RELEASE-v1.28.0.md).
 - **v1.27.1 — nothing written during the run is mapped executable.** v1.27.0 kept the agent from launching a file it wrote, but Landlock does not govern the executable mappings of shared libraries, so a library the agent wrote could still be loaded into an allowed program. Under the same `require warden 1.27`, the Warden now mounts every directory the policy lets the agent write `noexec` in its own private mount namespace, where it opens every file it hands the agent: a file there can be neither launched nor mapped executable (`EPERM`, `EACCES`), and a file that does not reach the agent through such a mount is refused. Anonymous executable memory (a JIT's) is unchanged, and this release does not claim to cover code written into memory. The operator can turn it off for a run with `--writable-exec`, which is recorded. `run_start` records each directory and the audit checks it against the policy. A 24-hour soak passed, every library the agent wrote refused. Reviewed by AI review agents. See [`RELEASE-v1.27.1.md`](./RELEASE-v1.27.1.md).
 - **v1.27.0 — decided program launches.** Through v1.26.1 every launch after the agent's own was refused, so an agent could not run `git`, `python3` or a compiler even where the policy named them. With `require warden 1.27`, `allow exec` rules take effect: at startup the Warden expands them to the files they admit (with each dynamic program's loader) and the agent runs in a Landlock domain that lets it launch those files and no others; each launch is decided on its name by the SMT decision procedure, with a certificate, and recorded with the file's startup hash; before the Warden answers any call of a launched process it checks the process runs a program it decided to run, and kills it otherwise. Without Landlock, launches stay refused. gcc compiles and links under the Warden; a 24-hour soak passed. Libraries are not decided (planned for v1.27.1). See [`RELEASE-v1.27.0.md`](./RELEASE-v1.27.0.md).
 - **v1.26.1 — the egress proxy's inspecting mode.** In SNI mode the Warden decides which site the agent connects to, but not what it asks there: inside TLS a request for any path, or with a `Host` for another site on the same CDN, went through. With `proxy inspect`, the proxy (now its own binary, `warden-proxy`, loaded into a sealed memfd and recorded by hash) verifies each server, terminates the agent's TLS with a CA made for the run and name-constrained to the policy's names, and reports every request; the Warden decides its method, path and query against `allow|deny request METHOD URL [max_body=N]` rules with the SMT decision procedure and certifies it before a byte of it is sent. Requests a server could read as another path are refused, bodies are bounded by `max_body` and recorded by length and SHA-256 (never stored), and hosts whose clients pin certificates can stay in SNI mode (`proxy passthrough host`). The agent's usual clients (Python, curl, Node.js, Java) trust the run's CA without changes. Every request is a chained record the audit asks of the policy again; `varek refusals`, the CycloneDX export and `varek bench --proxy` cover it. Reviewed by AI review agents. See [`RELEASE-v1.26.1.md`](./RELEASE-v1.26.1.md).
@@ -507,7 +512,8 @@ different risks at different points in the stack.
 - [x] **v1.26.1** — The egress proxy's opt-in inspecting mode (`proxy inspect`): TLS terminated with a name-constrained CA made for the run, servers verified, every request's method, path and query decided by request rules before it is sent, `max_body`, passthrough hosts for pinned clients ([design](./docs/security/v1.26.1-inspecting-mode.md))
 - [x] **v1.27.0** — Decided program launches, opt-in with `require warden 1.27`: `allow exec` rules take effect, enforced by a Landlock execute ruleset built from the policy, each launch decided and recorded by the Warden and checked against the file decided ([design](./docs/security/v1.27-program-launches.md))
 - [x] **v1.27.1** — Nothing written during the run is mapped executable: under `require warden 1.27` the policy's writable directories are mounted `noexec` where the Warden opens files, so a library the agent writes can be neither loaded nor launched ([design](./docs/security/v1.27.1-writable-noexec.md))
-- [ ] **v1.28.0** (planned) — Credential release: the agent holds only placeholder secrets, and the egress proxy swaps in the real credential (from Vault, AWS Secrets Manager or an identity provider) only for a request the Warden decided SATISFIED; the on-behalf-of chain in every verdict; `varek revoke` ([plan](./docs/roadmap/v1.28-v1.31.md))
+- [x] **v1.28.0** — Credential release: the agent holds only placeholders, and the egress proxy puts the real credential (from a file, HashiCorp Vault or AWS Secrets Manager) into a request only where a rule names it and only on a request the Warden decided SATISFIED; `varek revoke` ([design](./docs/security/v1.28-credential-release.md))
+- [ ] **v1.28.1** (planned) — The on-behalf-of chain (user → agent → sub-agent) recorded in every verdict ([plan](./docs/roadmap/v1.28-v1.31.md))
 - [ ] **v1.29.0** (planned) — `varek run -- <agent>` with nothing set up first (a built-in baseline policy), a dry run that reports what would be UNSATISFIED without blocking, and `varek policy suggest` ([plan](./docs/roadmap/v1.28-v1.31.md))
 - [ ] **v1.30.0** (planned) — macOS: the agent and the Warden in a lightweight Linux VM, with the same guarantees as on Linux ([plan](./docs/roadmap/v1.28-v1.31.md))
 - [ ] **v1.31.0** (planned) — Standards: authorization events in OCSF beside CycloneDX; enforcement on MCP server processes and MCP authorization tokens; a mapping to Agent Baseline ([plan](./docs/roadmap/v1.28-v1.31.md))
@@ -553,7 +559,8 @@ in v1.24.0, wildcard names in v1.25.0, and the egress proxy in SNI mode
 (stage 3) in v1.26.0, and its inspecting mode, with rules on each request's
 method, path and query, in v1.26.1. Decided program launches, held by a
 Landlock execute ruleset built from the policy, follow in v1.27.0, and the
-policy's writable directories mounted `noexec` in v1.27.1. The default-deny
+policy's writable directories mounted `noexec` in v1.27.1. Credential release,
+with the agent holding only placeholders, and revocation follow in v1.28.0. The default-deny
 syscall allowlist closing the alternate-ABI and variant-syscall bypass classes
 shipped in v1.9.2, and supervisor/target lifecycle coupling shipped in the live
 Warden in v1.9.3.
@@ -598,7 +605,11 @@ kernel's Landlock refuses, two threads launching at once, and forged streams
 (`make test-v1270`, 164 checks). The `noexec` mounts (v1.27.1) are tested with
 copies of host libraries the agent must fail to load, the agent's own view of
 its mounts, the host changing a writable path during the run, and forged
-streams (`make test-v1271`, 73 checks). Build and run with `make check`
+streams (`make test-v1271`, 73 checks). Credential release (v1.28.0) is tested
+against stand-ins for Vault and AWS Secrets Manager (which check each request's
+signature), a TLS server that logs what reaches it, a run revoked mid-run, a
+hard link and a bind mount of a credential file, and forged streams (`make
+test-v1280`, 168 checks). Build and run with `make check`
 in the relevant version directory. Containment verification: `python
 verify_guardrails.py` (see above).
 
@@ -635,9 +646,9 @@ platform-gating CI coverage (now macOS, Windows, Linux).
 
 ## Documentation
 
-- **Spec paper:** [`varek-spec-paper-v1.27.1.md`](./varek-spec-paper-v1.27.1.md) — language and runtime specification, design rationale, the verdict model
+- **Spec paper:** [`varek-spec-paper-v1.28.0.md`](./varek-spec-paper-v1.28.0.md) — language and runtime specification, design rationale, the verdict model
 - **VAREK Enterprise on AWS:** [`docs/aws-deployment-guide.md`](./docs/aws-deployment-guide.md) — deploying and operating the [AWS Marketplace](https://aws.amazon.com/marketplace/pp/prodview-6fdmjpuimvx64) image
-- **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`docs/security/bypass-classes.md`](./docs/security/bypass-classes.md), [`RELEASE-v1.27.1.md`](./RELEASE-v1.27.1.md), [`RELEASE-v1.27.0.md`](./RELEASE-v1.27.0.md), [`RELEASE-v1.26.1.md`](./RELEASE-v1.26.1.md), [`RELEASE-v1.26.0.md`](./RELEASE-v1.26.0.md), [`RELEASE-v1.25.0.md`](./RELEASE-v1.25.0.md), [`RELEASE-v1.24.0.md`](./RELEASE-v1.24.0.md), [`RELEASE-v1.17.0.md`](./RELEASE-v1.17.0.md), [`RELEASE-v1.12.1.md`](./RELEASE-v1.12.1.md), [`RELEASE-v1.12.0.md`](./RELEASE-v1.12.0.md), [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md), [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
+- **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`docs/security/bypass-classes.md`](./docs/security/bypass-classes.md), [`RELEASE-v1.28.0.md`](./RELEASE-v1.28.0.md), [`RELEASE-v1.27.1.md`](./RELEASE-v1.27.1.md), [`RELEASE-v1.27.0.md`](./RELEASE-v1.27.0.md), [`RELEASE-v1.26.1.md`](./RELEASE-v1.26.1.md), [`RELEASE-v1.26.0.md`](./RELEASE-v1.26.0.md), [`RELEASE-v1.25.0.md`](./RELEASE-v1.25.0.md), [`RELEASE-v1.24.0.md`](./RELEASE-v1.24.0.md), [`RELEASE-v1.17.0.md`](./RELEASE-v1.17.0.md), [`RELEASE-v1.12.1.md`](./RELEASE-v1.12.1.md), [`RELEASE-v1.12.0.md`](./RELEASE-v1.12.0.md), [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md), [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
 - **Verification notes:** [`docs/verification/`](./docs/verification/README.md) — the v1.10/v1.11 program
 - **Changelog:** [`CHANGELOG.md`](./CHANGELOG.md)
 - **Website:** [varek-lang.org](https://varek-lang.org)

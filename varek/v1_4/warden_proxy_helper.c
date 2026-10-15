@@ -7,6 +7,7 @@
 #include "warden_proxy.h"
 #include "proxy_parse.h"
 #include "proxy_ca.h"
+#include "warden_secrets.h"     /* v1.28: struct ws_value */
 
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -27,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -111,6 +113,10 @@ struct wp_held {
     bool      cut;               /* the connection is cut (max_body): no close_notify */
     bool      s_trunc;           /* review: the server's TLS ended without close_notify */
     int64_t   stop_at;           /* the gate stopped (a refusal): when */
+    /* v1.28: a credential was swapped into buf (it is wiped as it is sent,
+     * and when freed); bufcap: buf's size when it was grown for one */
+    bool      credbuf;
+    size_t    bufcap;
 };
 enum { WG_OPEN = 0, WG_HEAD, WG_LENGTH, WG_CHUNKED };
 static struct wp_ann  g_ann[WP_MAX_ANNOUNCED];
@@ -118,6 +124,14 @@ static struct wp_held g_held[WP_MAX_HELD];
 static int g_nheld = 0;
 static int g_max_held = WP_MAX_HELD;   /* v1.26 review: fewer if the descriptor limit is lower */
 static int g_ctl = -1;
+
+/* v1.28: the credentials' values (locked in main, before the drop to the
+ * proxy's user; never dumped), their lengths, and their placeholders */
+static unsigned char *g_cv;
+static size_t g_cv_len[WS_MAX_CREDS];
+static char g_ph[WS_MAX_CREDS][WP_PH_MAX];
+static bool g_cv_locked;
+static bool g_px_revoked;            /* v1.28 step 4: the run was revoked */
 
 /* Step 7: a relayed connection ends: report it (bytes each way, how long). */
 static void report_close(const struct wp_held *h, const char *why) {
@@ -158,6 +172,8 @@ static void held_drop(int k) {
     SSL_free(g_held[k].cs);
     close(g_held[k].fd);
     if (g_held[k].up >= 0) close(g_held[k].up);
+    if (g_held[k].credbuf && g_held[k].buf)
+        OPENSSL_cleanse(g_held[k].buf, g_held[k].bufcap ? g_held[k].bufcap : PP_IN_MAX);   /* v1.28 */
     free(g_held[k].buf);
     free(g_held[k].down);
     g_held[k] = g_held[--g_nheld];
@@ -545,10 +561,12 @@ static int s_write(struct wp_held *h) {
         }
     }
     if (h->off > 0 && h->off == h->fwd) {              /* sent: keep what is not yet let through */
+        size_t sent = h->off;
         memmove(h->buf, h->buf + h->off, h->len - h->off);
         h->len -= h->off;
         h->fwd -= h->off;
         h->off = 0;
+        if (h->credbuf) OPENSSL_cleanse(h->buf + h->len, sent);   /* v1.28: no stale copy of a value */
     }
     return 0;
 }
@@ -683,12 +701,92 @@ static void report_body(struct wp_held *h, int exceeded) {
     (void)send(g_ctl, &m, sizeof m, MSG_NOSIGNAL);
 }
 
+/* v1.28 (section 3): put credential v->cred into the head waiting
+ * (buf[fwd, fwd + pend_head)): the header v->hdr must occur once and hold
+ * exactly "SCHEME placeholder" (or the placeholder alone); the placeholder
+ * is replaced by the value. NULL, or why not (nothing is changed). */
+static const char *cred_swap(struct wp_held *h, const struct wp_reqverdict *v) {
+    unsigned idx = v->cred - 1;
+    if (g_px_revoked) return "the run was revoked";
+    if (idx >= WS_MAX_CREDS || !g_cv || !g_cv_len[idx] || !g_ph[idx][0]) return "the credential is not held";
+    if (!memchr(v->hdr, 0, sizeof v->hdr) || !memchr(v->scheme, 0, sizeof v->scheme) || !v->hdr[0])
+        return "a malformed verdict";
+    uint8_t *hb = h->buf + h->fwd, *end = hb + h->pend_head;
+    uint8_t *line = memmem(hb, h->pend_head, "\r\n", 2);
+    if (!line) return "a malformed head";
+    line += 2;
+    size_t hn = strlen(v->hdr);
+    uint8_t *vs = NULL, *ve = NULL;
+    int count = 0;
+    while (line < end) {
+        uint8_t *eol = memmem(line, (size_t)(end - line), "\r\n", 2);
+        if (!eol || eol == line) break;                        /* the blank line ends the head */
+        uint8_t *colon = memchr(line, ':', (size_t)(eol - line));
+        if (colon && (size_t)(colon - line) == hn && !strncasecmp((const char *)line, v->hdr, hn)) {
+            count++;
+            uint8_t *a = colon + 1, *b = eol;
+            while (a < b && (*a == ' ' || *a == '\t')) a++;
+            while (b > a && (b[-1] == ' ' || b[-1] == '\t')) b--;
+            vs = a;
+            ve = b;
+        }
+        line = eol + 2;
+    }
+    if (count == 0) return "the request has no header for its credential";
+    if (count > 1) return "the credential's header occurs more than once";
+    const char *ph = g_ph[idx];
+    size_t pl = strlen(ph), sl = strlen(v->scheme), have = (size_t)(ve - vs);
+    uint8_t *at;
+    if (sl) {
+        if (have != sl + 1 + pl || strncasecmp((const char *)vs, v->scheme, sl) || vs[sl] != ' ' ||
+            memcmp(vs + sl + 1, ph, pl))
+            return "the credential's header does not hold exactly its scheme and placeholder";
+        at = vs + sl + 1;
+    } else {
+        if (have != pl || memcmp(vs, ph, pl)) return "the credential's header does not hold exactly its placeholder";
+        at = vs;
+    }
+    size_t at_off = (size_t)(at - h->buf), vl = g_cv_len[idx];
+    size_t cap = h->bufcap ? h->bufcap : PP_IN_MAX, need = h->len - pl + vl;
+    if (need > cap) {
+        size_t ncap = PP_IN_MAX + WS_MAX_VALUE + 256;
+        uint8_t *nb = need <= ncap ? malloc(ncap) : NULL;
+        if (!nb) return "the proxy is out of memory";
+        memcpy(nb, h->buf, h->len);
+        OPENSSL_cleanse(h->buf, cap);
+        free(h->buf);
+        h->buf = nb;
+        h->bufcap = ncap;
+    }
+    memmove(h->buf + at_off + vl, h->buf + at_off + pl, h->len - at_off - pl);
+    memcpy(h->buf + at_off, g_cv + (size_t)idx * WS_MAX_VALUE, vl);
+    h->len = need;
+    h->pend_head = h->pend_head - pl + vl;
+    h->credbuf = true;
+    return NULL;
+}
+
 /* Step 6: the Warden's verdict on the request waiting. */
 static void gate_verdict(struct wp_held *h, const struct wp_reqverdict *v) {
     if (h->ig != IG_WAIT || v->seq != h->seq) return;       /* not the one waiting: ignored */
     if (!v->allow) {
         gate_stop(h, memchr(v->why, 0, sizeof v->why) && v->why[0] ? v->why : "refused by the policy");
         return;
+    }
+    if (v->cred) {                                           /* v1.28: the swap, or a refusal */
+        const char *why = cred_swap(h, v);
+        if (why) {
+            struct wp_credfail f;
+            memset(&f, 0, sizeof f);
+            f.type = WP_MSG_CREDFAIL;
+            f.cred = v->cred;
+            f.id = h->id;
+            f.seq = h->seq;
+            snprintf(f.why, sizeof f.why, "%s", why);
+            (void)send(g_ctl, &f, sizeof f, MSG_NOSIGNAL);
+            gate_stop(h, why);
+            return;
+        }
     }
     h->fwd += h->pend_head;
     h->max_body = v->max_body;
@@ -905,7 +1003,8 @@ static bool tls_step(int k, short crev, short srev) {
 static int wp_drain_ctl(int ctl) {
     for (;;) {
         union { struct wp_conn c; struct wp_verdict v; struct wp_verdict_up u; struct wp_inspect in;
-                struct wp_ca_name cn; struct wp_reqverdict rv; uint32_t type; } m;
+                struct wp_ca_name cn; struct wp_reqverdict rv; struct wp_ph ph; struct wp_creds cr;
+                uint32_t type; } m;
         union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
         struct iovec iv = { &m, sizeof m };
         struct msghdr mh = { .msg_iov = &iv, .msg_iovlen = 1, .msg_control = cb.b, .msg_controllen = sizeof cb.b };
@@ -963,7 +1062,69 @@ static int wp_drain_ctl(int ctl) {
             }
             continue;
         }
+        /* v1.28: a credential's placeholder; then its value, from warden-secrets */
+        if (n == (ssize_t)sizeof m.ph && m.type == WP_MSG_PH) {
+            if (fd >= 0) close(fd);
+            if (m.ph.index < WS_MAX_CREDS && memchr(m.ph.ph, 0, sizeof m.ph.ph) && m.ph.ph[0])
+                memcpy(g_ph[m.ph.index], m.ph.ph, sizeof m.ph.ph);
+            continue;
+        }
+        if (n == (ssize_t)sizeof m.cr && m.type == WP_MSG_CREDS) {
+            struct wp_creds ok = { .type = WP_MSG_CREDS_OK, .n = 0 };
+            uint32_t got = 0;
+            if (fd >= 0 && g_cv && g_cv_locked && m.cr.n <= WS_MAX_CREDS) {
+                static struct ws_value wv;
+                for (uint32_t i = 0; i < m.cr.n; i++) {
+                    struct pollfd pf = { .fd = fd, .events = POLLIN };
+                    if (poll(&pf, 1, 5000) != 1 || recv(fd, &wv, sizeof wv, 0) != (ssize_t)sizeof wv) break;
+                    bool good = wv.type == WS_MSG_VALUE && wv.index == i && wv.len >= 1 && wv.len <= WS_MAX_VALUE &&
+                                !memchr(wv.value, '\r', wv.len) && !memchr(wv.value, '\n', wv.len) &&
+                                !memchr(wv.value, '\0', wv.len);
+                    if (good) {
+                        memcpy(g_cv + (size_t)i * WS_MAX_VALUE, wv.value, wv.len);
+                        g_cv_len[i] = wv.len;
+                        got++;
+                    }
+                    OPENSSL_cleanse(&wv, sizeof wv);
+                    if (!good) break;
+                }
+                OPENSSL_cleanse(&wv, sizeof wv);         /* v1.28 review: a short read too */
+            }
+            if (fd >= 0) close(fd);
+            ok.n = got == m.cr.n ? got : 0;
+            if (!ok.n) {                                 /* all or none */
+                if (g_cv) OPENSSL_cleanse(g_cv, (size_t)WS_MAX_CREDS * WS_MAX_VALUE);
+                memset(g_cv_len, 0, sizeof g_cv_len);
+            }
+            (void)send(ctl, &ok, sizeof ok, MSG_NOSIGNAL);
+            continue;
+        }
         if (fd >= 0) close(fd);
+        /* v1.28 step 4: the run is revoked: clear every value and
+         * placeholder, close every connection, say how many values remain */
+        if (n == (ssize_t)sizeof(struct wp_msg) && m.type == WP_MSG_REVOKE) {
+            if (g_cv) OPENSSL_cleanse(g_cv, (size_t)WS_MAX_CREDS * WS_MAX_VALUE);
+            memset(g_cv_len, 0, sizeof g_cv_len);
+            OPENSSL_cleanse(g_ph, sizeof g_ph);
+            g_px_revoked = true;
+            while (g_nheld) {
+                struct wp_held *h = &g_held[g_nheld - 1];
+                if (h->state == WH_RELAY || h->state == WH_UPSTREAM || h->state == WH_TLS) h->why = "revoked";
+                held_drop(g_nheld - 1);
+            }
+            /* what the memory holds, not what the table says: each value's
+             * slot, any byte not zero */
+            uint32_t held = 0;
+            for (size_t i = 0; g_cv && i < WS_MAX_CREDS; i++) {
+                const unsigned char *v = g_cv + i * WS_MAX_VALUE;
+                unsigned char any = 0;
+                for (size_t k = 0; k < WS_MAX_VALUE; k++) any |= v[k];
+                held += any != 0;
+            }
+            struct wp_creds r = { .type = WP_MSG_REVOKED, .n = held };
+            (void)send(ctl, &r, sizeof r, MSG_NOSIGNAL);
+            continue;
+        }
         /* v1.26.1, step 6: the verdict on an inspected request */
         if (n == (ssize_t)sizeof m.rv && m.type == WP_MSG_REQVERDICT) {
             int k = held_find(m.rv.id);
@@ -1294,6 +1455,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "warden-proxy: the Warden starts this program (v1.26 egress proxy); "
                 "it is not run by hand\n");
         return 2;
+    }
+    /* v1.28: memory for the credentials' values, locked while still root
+     * (locked pages stay locked after the drop) and kept out of any dump */
+    g_cv = mmap(NULL, (size_t)WS_MAX_CREDS * WS_MAX_VALUE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (g_cv == MAP_FAILED) g_cv = NULL;
+    else {
+        g_cv_locked = mlock(g_cv, (size_t)WS_MAX_CREDS * WS_MAX_VALUE) == 0;
+        (void)madvise(g_cv, (size_t)WS_MAX_CREDS * WS_MAX_VALUE, MADV_DONTDUMP);
     }
     if (drop_to(u, g) < 0) {
         fprintf(stderr, "[proxy] cannot drop to %s (%s)\n", argv[1], strerror(errno));

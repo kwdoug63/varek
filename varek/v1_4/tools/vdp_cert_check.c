@@ -172,8 +172,10 @@ int main(int argc, char **argv) {
     if (argc != 3 || (strcmp(argv[2], "digest") && strcmp(argv[2], "batch") &&
                       strcmp(argv[2], "holds") && strcmp(argv[2], "openable") &&
                       strcmp(argv[2], "kinds") && strcmp(argv[2], "rules") && strcmp(argv[2], "proxy") &&
-                      strcmp(argv[2], "launches") && strcmp(argv[2], "matches"))) {
-        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds|rules|matches|proxy|launches\n", argv[0]);
+                      strcmp(argv[2], "launches") && strcmp(argv[2], "matches") &&
+                      strcmp(argv[2], "credentials"))) {
+        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds|rules|matches|proxy|launches|"
+                "credentials\n", argv[0]);
         return 2;
     }
     FILE *f = fopen(argv[1], "rb");
@@ -212,6 +214,24 @@ int main(int argc, char **argv) {
      * 1.27), else "off". varek_audit.py reads it from here. */
     if (!strcmp(argv[2], "launches")) {
         printf("%s\n", pol.launches ? "on" : "off");
+        vdpc_free(&pol);
+        return 0;
+    }
+
+    /* v1.28: the credentials and the rules that carry them (vdp_check's
+     * `credentials` prints the same lines from the decision procedure's
+     * reading) */
+    if (!strcmp(argv[2], "credentials")) {
+        static const char *const kStore[] = { "", "file", "vault", "aws-sm" };
+        for (size_t k = 0; k < pol.ncreds; k++)
+            printf("credential %s %s %s\n", pol.creds[k].name, kStore[pol.creds[k].store], pol.creds[k].ref);
+        for (size_t i = 0; i < pol.n; i++) {
+            vdpc_rule_info_t ri;
+            vdpc_rule_info(&pol, i, &ri);
+            if (ri.cred)
+                printf("rule %d %s %s %s\n", ri.line, pol.creds[ri.cred - 1].name, ri.cred_hdr,
+                       ri.cred_scheme[0] ? ri.cred_scheme : "-");
+        }
         vdpc_free(&pol);
         return 0;
     }

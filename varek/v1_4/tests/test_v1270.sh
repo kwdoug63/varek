@@ -102,8 +102,8 @@ accepted "require warden 1.27"                 'require warden 1.27\n'
 accepted "with exec rules"                     "require warden 1.27\n$X"
 accepted "with exec matchers"                  'require warden 1.27\nallow exec prefix /usr/bin/\ndeny exec glob /usr/bin/*sh\n'
 accepted "with the v1.26 proxy"                'require warden 1.27\nproxy inspect\nallow host api.example.com:443\nallow request GET https://api.example.com/x\n'
-refused  "require warden 1.28"                 'require warden 1.28\n'                 "this is 1.27"
-refused  "require warden 2.0"                  'require warden 2.0\n'                  "this is 1.27"
+refused  "require warden 1.29"                 'require warden 1.29\n'                 "this is 1.28"
+refused  "require warden 2.0"                  'require warden 2.0\n'                  "policy requires Warden 2.0"
 launches "no require"                          "$X"                                    off
 launches "require warden 1.26"                 "require warden 1.26\n$X"               off
 launches "require warden 1.27"                 "require warden 1.27\n$X"               on
@@ -164,14 +164,14 @@ if [ -n "$WARDEN" ] && [ "$(id -u)" = 0 ]; then
     printf 'require warden 1.27\nallow exec /usr/bin/python3\n%b' "$X" > "$OUT/w.txt"
     "$WARDEN" "$OUT/w.txt" --check-startup > "$OUT/w.out" 2>&1; rc=$?
     check "the Warden loads a 1.27 policy" grep -q 'startup checks passed' "$OUT/w.out"
-    check "and reports grammar 1.27" grep -q 'loaded policy default v1\.27 ' "$OUT/w.out"
+    check "and reports grammar 1.27 or later" grep -Eq 'loaded policy default v1\.(2[7-9]|[3-9][0-9]) ' "$OUT/w.out"
     check "with the interpreter note" grep -q 'note: /usr/bin/python3 is a shell or general-purpose interpreter' "$OUT/w.out"
     printf 'require warden 1.26\n%b' "$X" > "$OUT/w.txt"
     "$WARDEN" "$OUT/w.txt" --check-startup > "$OUT/w.out" 2>&1
     check "a 1.26 policy with exec rules loads, with the opt-in note" \
         sh -c "grep -q 'startup checks passed' '$OUT/w.out' && grep -q 'only with .require warden 1.27.' '$OUT/w.out'"
-    printf 'require warden 1.28\n' > "$OUT/w.txt"
-    check "the Warden refuses require warden 1.28" sh -c "! '$WARDEN' '$OUT/w.txt' --check-startup"
+    printf 'require warden 1.29\n' > "$OUT/w.txt"
+    check "the Warden refuses require warden 1.29" sh -c "! '$WARDEN' '$OUT/w.txt' --check-startup"
 else
     skip "the Warden's load (needs root and the warden binary)"
 fi
@@ -273,7 +273,7 @@ PY
     run r1 "$POLR" /usr/bin/python3 "$W/a.py"
     check "a run with require warden 1.27: the agent runs in the Landlock domain" grep -qx 'AGENT ok' "$OUT/log/r1.out"
     check "run_start records the Landlock ABI" rs "$OUT/log/r1.log" 'r["landlock"]["abi"] >= 1'
-    check "run_start names this Warden (1.27.x)" rs "$OUT/log/r1.log" '__import__("re").fullmatch(r"1\.27\.[0-9]+", r["warden"])'
+    check "run_start names this Warden (1.27.0 or later)" rs "$OUT/log/r1.log" '__import__("re").fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", r["warden"]) and tuple(map(int, r["warden"].split("."))) >= (1, 27, 0)'
     printf 'import os\nfor p in (0, -1):\n    try:\n        os.kill(p, 0); print("KILL", p, "ok")\n    except OSError as e:\n        print("KILL", p, "refused")\nos.kill(os.getpid(), 0); print("KILL self ok", flush=True)\n' > "$W/k.py"; chmod 644 "$W/k.py"
     run rk "$POLR" /usr/bin/python3 "$W/k.py"
     # v1.27 review: a #! line that ends at the end of the file (no newline) runs, as the kernel runs it

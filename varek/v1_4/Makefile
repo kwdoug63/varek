@@ -30,9 +30,9 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
              $(V1_7_DIR)/plan_policy_config.c $(V1_7_DIR)/plan_breaker.c \
              $(V1_7_DIR)/plan_progress.c
 
-BINS := warden warden-proxy target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
+BINS := warden warden-proxy warden-secrets target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 latency-v1260 latency-v1261 latency-v1270 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck harness video-v112
+.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 latency-v1260 latency-v1261 latency-v1270 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck harness video-v112
 
 all: $(BINS)
 
@@ -72,7 +72,7 @@ CHECKER := checker/vdp_checker.c checker/vdp_checker.h
 
 # v1.24: the resolution table (warden_resolve.c) runs a resolver thread and
 # uses the host's resolver library.
-RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c shared_domains.c shared_domains.h warden_proxy.c warden_proxy.h proxy_parse.h
+RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c shared_domains.c shared_domains.h warden_proxy.c warden_proxy.h proxy_parse.h warden_secrets.c warden_secrets.h warden_revoke.inc.c
 
 warden: warden.c warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c warden_exec.inc.c warden_noexec.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
@@ -80,7 +80,7 @@ warden: warden.c warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_sy
 	@# (docs/security/v1.27-program-launches.md): memfd_create stays hard-denied
 	@awk '/^static const char \*kHardDeny\[\]/,/NULL/' warden_baseline_filter.c | grep -q '"memfd_create"' || \
 	    { echo "warden: memfd_create must stay in the filter's hard-deny set (v1.27)"; exit 1; }
-	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
+	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c warden_secrets.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
 
 # v1.26.1: the egress proxy, its own program (the Warden starts it from a
 # sealed copy whose SHA-256 it records). It links neither libseccomp nor
@@ -90,12 +90,19 @@ warden-proxy: warden_proxy_helper.c warden_proxy.h proxy_parse.c proxy_parse.h p
 	@$(MAKE) -s --no-print-directory deps-check-ssl
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_proxy_helper.c proxy_parse.c proxy_ca.c -lssl -lcrypto
 
+# v1.28: warden-secrets, the helper that fetches the credentials a policy
+# names (file, HashiCorp Vault, AWS Secrets Manager). Its own program, as
+# the proxy is, so the Warden links no TLS code; it never sees a value.
+warden-secrets: warden_secrets_helper.c warden_secrets.h
+	@$(MAKE) -s --no-print-directory deps-check-ssl
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_secrets_helper.c -lssl -lcrypto
+
 # v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
 # ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that
 # the certificate checker refuses the wrong verdict. Never deploy it.
 warden_faultinject: warden.c warden_net.inc.c warden_exec.inc.c warden_noexec.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
-	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
+	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c warden_secrets.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lresolv
 
 # v1.15: command-line front end to the certificate checker (policy digest,
 # batch certificate checks). Links the checker only, never smt_decide.c.
@@ -394,6 +401,10 @@ test-v1270: warden tools/vdp_check tools/vdp_cert_check
 test-v1271: warden tools/vdp_check tools/vdp_cert_check
 	@./tests/test_v1271.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
 
+# v1.28 (docs/security/v1.28-credential-release.md): credential release
+test-v1280: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check
+	@./tests/test_v1280.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
+
 # v1.26 step 5: the proxy's parsers, under ASan and UBSan: the vectors, then
 # FUZZ_N mutated inputs (make fuzz-proxy-parse FUZZ_N=50000000 for longer).
 FUZZ_N ?= 2000000
@@ -458,10 +469,10 @@ INSTALL_TOOLS := tools/varek tools/vdp_check tools/vdp_cert_check tools/varek_ke
 	tools/varek_license.py tools/varek_bench.py tools/varek_bench_proxy.py tools/bench_proxy_client.py tools/varek_bench_launch.py \
 	tools/bench_workload
 
-install: warden warden-proxy tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
+install: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/tools $(DESTDIR)$(PREFIX)/policies $(DESTDIR)$(PREFIX)/data $(DESTDIR)$(BINDIR)
 	install -m 0644 data/public_suffix_list.dat data/varek_shared_domains.txt $(DESTDIR)$(PREFIX)/data/
-	install -m 0755 warden warden-proxy $(DESTDIR)$(PREFIX)/
+	install -m 0755 warden warden-proxy warden-secrets $(DESTDIR)$(PREFIX)/
 	install -m 0755 $(INSTALL_TOOLS) $(DESTDIR)$(PREFIX)/tools/
 	install -m 0644 policies/*.policy.txt $(DESTDIR)$(PREFIX)/policies/
 	if [ -d tools/systemd ]; then install -d -m 0755 $(DESTDIR)$(PREFIX)/tools/systemd && \

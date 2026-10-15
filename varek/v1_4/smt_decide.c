@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 /* ------------------------------------------------------------------------ */
 /* Flag bits: x86_64 kernel uapi values (asm-generic/fcntl.h). Hard-coded     */
@@ -914,6 +915,74 @@ static const char *request_parse(const char *method, const char *url, vdp_rule_t
     return NULL;
 }
 
+/* v1.28: a credential's name, [a-z][a-z0-9_]{0,31}. */
+static bool cred_name_ok(const char *n) {
+    size_t l = strlen(n);
+    if (l < 1 || l > 32 || n[0] < 'a' || n[0] > 'z') return false;
+    for (size_t i = 1; i < l; i++)
+        if (!((n[i] >= 'a' && n[i] <= 'z') || (n[i] >= '0' && n[i] <= '9') || n[i] == '_')) return false;
+    return true;
+}
+
+/* v1.28: STORE:REF (smt_decide.h); NULL and the store, or why not. */
+static const char *cred_ref_parse(const char *t, int *store, const char **ref) {
+    const char *c = strchr(t, ':');
+    if (!c) return "a credential's store is file:, vault: or aws-sm:";
+    size_t sl = (size_t)(c - t);
+    const char *r = c + 1;
+    size_t rl = strlen(r);
+    if (sl == 4 && !strncmp(t, "file", 4)) *store = VDP_CRED_FILE;
+    else if (sl == 5 && !strncmp(t, "vault", 5)) *store = VDP_CRED_VAULT;
+    else if (sl == 6 && !strncmp(t, "aws-sm", 6)) *store = VDP_CRED_AWSSM;
+    else return "a credential's store is file:, vault: or aws-sm:";
+    if (rl < 1 || rl > 1024) return "a credential's reference is 1 to 1024 bytes";
+    for (size_t i = 0; i < rl; i++)
+        if ((unsigned char)r[i] < 0x21 || (unsigned char)r[i] > 0x7e)
+            return "a credential's reference is printable ASCII";
+    if (*store == VDP_CRED_FILE) {
+        if (r[0] != '/' || rl < 2 || r[rl - 1] == '/' || strstr(r, "//") || strstr(r, "/./") ||
+            strstr(r, "/../") || !strcmp(r + rl - 2, "/.") || (rl >= 3 && !strcmp(r + rl - 3, "/..")))
+            return "file: takes an absolute path, without \".\", \"..\", \"//\" or a trailing \"/\"";
+    } else if (*store == VDP_CRED_VAULT) {
+        const char *h = strchr(r, '#');
+        if (!h || strchr(h + 1, '#') || h == r || r[0] == '/' || !h[1])
+            return "vault: takes PATH#FIELD (one '#', a path not starting with '/', a field)";
+        for (const char *q = h + 1; *q; q++)
+            if (!((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') || (*q >= '0' && *q <= '9') ||
+                  *q == '_' || *q == '.' || *q == '-'))
+                return "a vault field is letters, digits, '_', '.' and '-'";
+    } else {
+        if (strncmp(r, "arn:", 4) || !strstr(r, ":secretsmanager:"))
+            return "aws-sm: takes a Secrets Manager ARN (arn:...:secretsmanager:...)";
+    }
+    *ref = r;
+    return NULL;
+}
+
+/* v1.28: an HTTP token (RFC 9110 tchar) of 1 to max bytes. */
+static bool http_token_ok(const char *t, size_t len, size_t max) {
+    if (len < 1 || len > max) return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)t[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+              (c && strchr("!#$%&'*+-.^_`|~", c))))
+            return false;
+    }
+    return true;
+}
+
+/* v1.28: a header that frames the request or the connection, never a
+ * credential's (smt_decide.h). */
+static bool header_framing(const char *h) {
+    static const char *const kFraming[] = {
+        "host", "content-length", "transfer-encoding", "connection", "upgrade", "te",
+        "trailer", "keep-alive", "proxy-connection", "proxy-authorization",
+    };
+    for (size_t i = 0; i < sizeof kFraming / sizeof kFraming[0]; i++)
+        if (!strcasecmp(h, kFraming[i])) return true;
+    return false;
+}
+
 /* v1.26.1: max_body=N[k|m]; 0 and the value, or -1. */
 static int max_body_parse(const char *v, uint32_t *out) {
     size_t n = strlen(v);
@@ -1065,6 +1134,41 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
                       "<port>..., proxy upstream http://host:port, or proxy passthrough host <name>)");
             break;
         }
+        /* v1.28: credential NAME from STORE:REF */
+        if (!strcmp(tok[0], "credential")) {
+            if (!(req_maj > 1 || (req_maj == 1 && req_min >= 28))) {
+                rc = perr(err, errlen, path, lineno, "`credential` needs `require warden 1.28` before it");
+                break;
+            }
+            if (nt != 4 || strcmp(tok[2], "from")) {
+                rc = perr(err, errlen, path, lineno, "need: credential <name> from <store>:<reference>");
+                break;
+            }
+            if (!cred_name_ok(tok[1])) {
+                rc = perr(err, errlen, path, lineno, "'%s': a credential's name is a lowercase letter, then up "
+                          "to 31 lowercase letters, digits or '_'", tok[1]);
+                break;
+            }
+            for (size_t k = 0; rc == 0 && k < p->ncreds; k++)
+                if (!strcmp(p->creds[k].name, tok[1]))
+                    rc = perr(err, errlen, path, lineno, "credential %s named twice (line %d)", tok[1],
+                              p->creds[k].line);
+            if (rc) break;
+            if (p->ncreds >= VDP_MAX_CREDS) {
+                rc = perr(err, errlen, path, lineno, "more than %d credentials", VDP_MAX_CREDS);
+                break;
+            }
+            int store = 0;
+            const char *ref = NULL;
+            const char *why = cred_ref_parse(tok[3], &store, &ref);
+            if (why) { rc = perr(err, errlen, path, lineno, "%s", why); break; }
+            vdp_cred_t *cr = &p->creds[p->ncreds++];
+            snprintf(cr->name, sizeof cr->name, "%s", tok[1]);
+            snprintf(cr->ref, sizeof cr->ref, "%s", ref);
+            cr->store = store;
+            cr->line = lineno;
+            continue;
+        }
         if (nt < 3) { rc = perr(err, errlen, path, lineno, "bad rule (need: verb kind constant)"); break; }
         if (p->n >= VDP_MAX_RULES) {
             rc = perr(err, errlen, path, lineno,
@@ -1103,9 +1207,57 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             if (why) { rc = perr(err, errlen, path, lineno, "%s", why); break; }
             /* review: a URL without a query (smt_decide.h) */
             if (!strchr(tok[3], '?')) r->s.qmode = r->verb == VDP_ALLOW ? VDP_Q_ALLOW : VDP_Q_DENY;
+            bool has_hdr = false;
             for (int i = 4; i < nt; i++) {
+                /* v1.28: credential=NAME header=HEADER[:SCHEME] */
+                bool is_cred = !strncmp(tok[i], "credential=", 11), is_hdr = !strncmp(tok[i], "header=", 7);
+                if (is_cred || is_hdr) {
+                    if (!(req_maj > 1 || (req_maj == 1 && req_min >= 28))) {
+                        rc = perr(err, errlen, path, lineno, "%s needs `require warden 1.28` before it",
+                                  is_cred ? "credential=" : "header=");
+                        goto out;
+                    }
+                    if (r->verb != VDP_ALLOW) {
+                        rc = perr(err, errlen, path, lineno, "%s applies only to allow request rules",
+                                  is_cred ? "credential=" : "header=");
+                        goto out;
+                    }
+                }
+                if (is_cred) {
+                    const char *n = tok[i] + 11;
+                    if (r->cred) { rc = perr(err, errlen, path, lineno, "credential= given twice"); goto out; }
+                    for (size_t k = 0; !r->cred && k < p->ncreds; k++)
+                        if (!strcmp(p->creds[k].name, n)) r->cred = (int)k + 1;
+                    if (!r->cred) {
+                        rc = perr(err, errlen, path, lineno, "unknown credential '%s' (name it with `credential` "
+                                  "before the rule)", n);
+                        goto out;
+                    }
+                    continue;
+                }
+                if (is_hdr) {
+                    const char *v = tok[i] + 7, *c = strchr(v, ':');
+                    size_t hl = c ? (size_t)(c - v) : strlen(v);
+                    if (has_hdr) { rc = perr(err, errlen, path, lineno, "header= given twice"); goto out; }
+                    if (!http_token_ok(v, hl, 64) || (c && !http_token_ok(c + 1, strlen(c + 1), 32))) {
+                        rc = perr(err, errlen, path, lineno, "'%s': header=NAME or header=NAME:SCHEME, each an "
+                                  "HTTP token (a name of at most 64 bytes, a scheme of at most 32)", tok[i]);
+                        goto out;
+                    }
+                    memcpy(r->cred_hdr, v, hl);
+                    r->cred_hdr[hl] = '\0';
+                    if (c) snprintf(r->cred_scheme, sizeof r->cred_scheme, "%s", c + 1);
+                    if (header_framing(r->cred_hdr)) {
+                        rc = perr(err, errlen, path, lineno, "header=%s frames the request; a credential cannot "
+                                  "go in it", r->cred_hdr);
+                        goto out;
+                    }
+                    has_hdr = true;
+                    continue;
+                }
                 if (strncmp(tok[i], "max_body=", 9)) {
-                    rc = perr(err, errlen, path, lineno, "unknown option '%s' on a request rule (max_body=N)", tok[i]);
+                    rc = perr(err, errlen, path, lineno, "unknown option '%s' on a request rule (max_body=N, "
+                              "credential=NAME, header=HEADER[:SCHEME])", tok[i]);
                     goto out;
                 }
                 if (r->verb != VDP_ALLOW) {
@@ -1118,6 +1270,16 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
                               "N, Nk or Nm", tok[i]);
                     goto out;
                 }
+            }
+            if (!r->cred != !has_hdr) {
+                rc = perr(err, errlen, path, lineno, "credential= and header= go together");
+                break;
+            }
+            /* v1.28 step 3: a value only inside TLS */
+            if (r->cred && strncmp(tok[3], "https://", 8)) {
+                rc = perr(err, errlen, path, lineno, "credential= only on an https:// rule (a value is never "
+                          "sent in the clear)");
+                break;
             }
             char gm[160] = "out of memory";
             r->s.prog = prog_glob(r->s.c, r->s.len, gm, sizeof gm);

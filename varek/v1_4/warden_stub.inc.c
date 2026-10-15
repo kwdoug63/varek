@@ -471,6 +471,15 @@ static void stub_question(const struct policy *p, int conn_fd, const struct sock
         return;
     }
     int64_t now = g_stub_now;
+    /* v1.28 review: after `varek revoke` nothing is looked up or answered:
+     * a socket the agent connected to the stub before the revocation
+     * carries its questions with send(), which is not a mediated call */
+    if (g_revoked) {
+        size_t l = stub_build(m, qend, 5, qtype, NULL, now, out, outn);  /* REFUSED */
+        stub_send(conn_fd, from, fl, out, l);
+        stub_record("", qtype, conn_fd, "revoked", -1, NULL, false, "refused", NULL);
+        return;
+    }
     char why[8];
     if (vdp_host_name_form(name, strlen(name), why, sizeof why) != 1) {
         size_t l = stub_build(m, qend, 3, qtype, NULL, now, out, outn);  /* not a host name */

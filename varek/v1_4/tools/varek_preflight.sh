@@ -5,7 +5,8 @@
 #
 #   tools/varek_preflight.sh <policy> [--log PATH] [--sign-key KEY] [--anchor PATH]
 #                            [--spool DIR] [--flow-policy CFG [--breaker-state FILE]
-#                            [--gate-status FILE] [--session ID]] [--run] [--install-deps]
+#                            [--gate-status FILE] [--session ID]] [--secrets-conf FILE]
+#                            [--run] [--install-deps]
 #
 # Checks, in order, and prints PASS / WARN / FAIL for each:
 #   1. The Warden and its tools are built and up to date; if not, the build
@@ -64,8 +65,8 @@ set -u
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"          # varek/v1_4
 POLICY="" LOG="" KEY="" ANCHOR="" SPOOL="" RUN=0 INSTALL=0
-FLOW="" STATE="" GSTATUS="" SESSION=""
-usage() { sed -n '6,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+FLOW="" STATE="" GSTATUS="" SESSION="" SCONF=""
+usage() { sed -n '6,9p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 need() { [ $# -ge 2 ] && [ -n "$2" ] || { echo "varek_preflight: $1 needs a value" >&2; usage; }; }
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -77,6 +78,7 @@ while [ $# -gt 0 ]; do
         --breaker-state) need "$@"; STATE="$2"; shift 2 ;;
         --gate-status)  need "$@"; GSTATUS="$2"; shift 2 ;;
         --session)      need "$@"; SESSION="$2"; shift 2 ;;
+        --secrets-conf) need "$@"; SCONF="$2"; shift 2 ;;     # v1.28
         --run)          RUN=1; shift ;;
         --install-deps) INSTALL=1; shift ;;
         -h|--help)      usage ;;
@@ -303,6 +305,22 @@ if [ -n "$KEY$ANCHOR" ]; then
               [ -e /proc/kcore ] && echo /proc/kcore; } | sort -u | "$CERT" "$POLICY" openable | grep '^openable' | head -5)"
     if [ -z "$raw" ]; then pass "no raw disk or memory device is open to the agent"
     else fail "the policy lets the agent open raw storage (refused with a key or anchor): $(tr '\n' ' ' <<<"${raw//openable /}")"; fi
+fi
+
+# v1.28: each credential the policy names is fetched, as a run would fetch it
+# (warden --check-credentials: the values are not kept, and a Vault lease the
+# check makes is revoked)
+if "$CERT" "$POLICY" credentials 2>/dev/null | grep -q '^credential '; then
+    if [ "$(id -u)" -ne 0 ]; then
+        warn "the policy names credentials; run the preflight as root to fetch each (warden-secrets needs root)"; unchecked=1
+    else
+        o="$("$WARDEN" "$POLICY" ${SCONF:+--secrets-conf "$SCONF"} --check-credentials 2>&1)"; rc=$?
+        while IFS= read -r ln; do pass "${ln#\[warden\] }"; done < <(grep '^\[warden\] credential .*: fetched, ' <<<"$o")
+        if [ "$rc" -ne 0 ]; then
+            why="$(grep -m1 'refusing to start' <<<"$o")"
+            fail "credentials: ${why:-$(tail -1 <<<"$o")}"
+        fi
+    fi
 fi
 
 if [ -n "$FLOW" ]; then
