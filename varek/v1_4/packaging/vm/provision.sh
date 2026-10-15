@@ -12,7 +12,7 @@
 # rebuild of it (AlmaLinux, Rocky Linux) or CentOS Stream 9. It installs
 # what the Warden needs to build (libsodium from EPEL), builds it from a copy
 # of SRC in /opt/varek-src, installs it (make install: /opt/varek, varek in
-# /usr/local/bin), makes sure Landlock is on, and runs varek doctor.
+# /usr/bin), makes sure Landlock is on, and runs varek doctor.
 set -euo pipefail
 SRC="${1:?usage: provision.sh SRC}"
 say() { printf '[provision] %s\n' "$*"; }
@@ -55,7 +55,9 @@ tar -C "$SRC" --exclude=./.git -cf - . | tar -C /opt/varek-src.new -xf -
 rm -rf /opt/varek-src && mv /opt/varek-src.new /opt/varek-src
 make -C /opt/varek-src/varek/v1_4 clean > /dev/null 2>&1 || true
 make -C /opt/varek-src/varek/v1_4 all
-make -C /opt/varek-src/varek/v1_4 install
+# varek in /usr/bin: RHEL's sudo (secure_path) and root's shell leave
+# /usr/local/bin out, and the Mac runs `sudo varek run` inside
+make -C /opt/varek-src/varek/v1_4 install BINDIR=/usr/bin
 
 # Landlock: on by default from RHEL 9.6; if the kernel's LSM list lacks it,
 # add it (takes effect at the next boot)
@@ -67,6 +69,6 @@ if ! grep -qw landlock /sys/kernel/security/lsm 2>/dev/null; then
 fi
 
 say "varek doctor"
-varek doctor || say "varek doctor reported a problem (above)"
+/usr/bin/varek doctor || say "varek doctor reported a problem (above)"
 date -u +%Y-%m-%dT%H:%M:%SZ > /var/lib/varek-vm/provisioned
 say "done"
