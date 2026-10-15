@@ -318,28 +318,46 @@ def policy_rules(path):
     return counts, require
 
 
+class _Stream:
+    """The records of a verdict stream, read from the file on each pass and
+    never held: a day's stream under the baseline is a few hundred MB, more
+    than a small host can hold as objects (the shared soak, v1.31). Each pass
+    checks the stream to its end as read_records always did."""
+
+    def __init__(self, log):
+        self.log = log
+        with open(log, "rb"):                        # unreadable: say so now, not on first use
+            pass
+
+    def __iter__(self):
+        n, bad, other = 0, 0, 0
+        with open(self.log, encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if line.startswith("{"):
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        if raw.endswith("\n"):
+                            bad += 1             # (a last line still being written is not counted)
+                        continue
+                    n += 1
+                    yield rec
+                elif line and not line.startswith("[warden"):
+                    other += 1
+        if not n and other:
+            raise CliError(f"{self.log}: not a verdict stream (no records)")
+        if bad:
+            raise CliError(f"{self.log}: {bad} line(s) look like records but cannot be read; the stream is damaged or "
+                f"not a verdict stream (varek audit says more)")
+
+
 def read_records(log):
     """The records of a verdict stream. v1.27 review: a line that looks like a
     record but is not one is never dropped silently; a stream with any is
-    refused (a summary of part of a stream would mislead)."""
-    recs, bad, other = [], 0, 0
-    with open(log, encoding="utf-8", errors="replace") as fh:
-        for raw in fh:
-            line = raw.strip()
-            if line.startswith("{"):
-                try:
-                    recs.append(json.loads(line))
-                except ValueError:
-                    if raw.endswith("\n"):
-                        bad += 1             # (a last line still being written is not counted)
-            elif line and not line.startswith("[warden"):
-                other += 1
-    if not recs and other:
-        raise CliError(f"{log}: not a verdict stream (no records)")
-    if bad:
-        raise CliError(f"{log}: {bad} line(s) look like records but cannot be read; the stream is damaged or "
-            f"not a verdict stream (varek audit says more)")
-    return recs
+    refused (a summary of part of a stream would mislead). v1.31 (the shared
+    soak): an iterable that reads the file on each pass, not a list."""
+    return _Stream(log)
 
 
 def run_logs(cfg):
