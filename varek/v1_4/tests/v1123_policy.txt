@@ -4,6 +4,7 @@
 # loader's /lib/... opens resolve to /usr/lib/..., and libc.so.6 resolves to
 # its versioned file.
 allow path /usr/lib/
+allow path /usr/lib64/
 allow path /etc/ld.so.cache
 # The agent's own /proc, reached as /proc/self/... (mapped to the agent).
 allow path /proc/self/

@@ -223,3 +223,26 @@ def test_the_baseline_names_only_the_agents_own_terminal():
     with pytest.raises(b.BaselineError):
         b.generate("/srv/proj", pw, "/tmp/varek-x", None, ttys=["/dev/pts/../../etc/shadow"])
     assert all(x.startswith("/dev/pts/") for x in b.own_ttys())
+
+
+def test_a_user_whose_home_is_root_gets_no_home_rules():
+    """RHEL (the arm64 and RHEL sweeps): nobody's home there is /, and the
+    baseline's rules named //.gitconfig, and with a profile //.claude/,
+    which the Warden refuses to load. Such a user's rules name /nonexistent."""
+    import pwd
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
+    try:
+        import varek_baseline as b
+    finally:
+        sys.path.pop(0)
+    pw = pwd.struct_passwd(("nobody", "x", 65534, 65534, "nobody", "/", "/sbin/nologin"))
+    prof = {"name": "t", "sha256": "0" * 64, "programs": [], "about": "", "commands": [], "rules": ["allow path ${HOME}/.claude/"]}
+    t = b.generate("/srv/proj", pw, "/tmp/varek-65534", prof)
+    assert "//" not in "\n".join(l.split("#")[0] for l in t.splitlines() if not l.startswith("#"))
+    assert "#@ home /nonexistent" in t and "allow path /nonexistent/.claude/" in t
+    for name in ("claude", "codex", "gemini", "aider"):
+        p = b.load_profile(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "policies", "agents",
+                                        name + ".profile.txt"))
+        t = b.generate("/srv/proj", pw, "/tmp/varek-65534", p)
+        assert "//" not in "\n".join(l.split("#")[0] for l in t.splitlines() if not l.startswith("#")), name
+    assert b.policy_home(pwd.struct_passwd(("u", "x", 1000, 1000, "", "/home/u/", "/bin/sh"))) == "/home/u"
