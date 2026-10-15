@@ -218,6 +218,22 @@ short runs that are in this release too; both are fixed here, with checks:
   now, checked against the revocation like every other `revoked` record
   (`test_v1280` section 4: a launch after `varek revoke`).
 
+## Found by the 24-hour run
+
+The first 24-hour run of the shared soak (2026-10-14 to 2026-10-15, on a
+2 GB droplet with no swap) ran all three runs to their end: each agent
+finished, and run C's stream ends in its signed `run_end`, exit status 0.
+After them, `varek run`'s wrapper for run C was killed for memory while it
+printed its summary, and then the soak's checker was too. The wrapper read
+the whole verdict stream into memory, and under the baseline a day's
+stream is about 250 MB, about 1.2 GB as objects; runs B and C finished at
+once. **Fixed:** `varek run`, `status`, `refusals`, `export` and `policy
+suggest` read a stream as they go, holding only what they count, with the
+same check that refuses a damaged stream (`test_varek_cli.py`: a 16 MB
+stream summarized under 4 MB of peak memory, 74 MB before). The audit
+still reads a stream whole (a known limit since v1.27.1): on a small host
+give it swap.
+
 ## Known limits
 
 - **A dry run is not a sandbox.** It lets through what the policy refuses:
