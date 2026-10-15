@@ -277,6 +277,14 @@ def agent_user(run_as=None):
     return pw, "nobody", "no sudo user"
 
 
+def policy_home(pw):
+    """The home the baseline's rules name: the user's, or /nonexistent when
+    the user has none to speak of (RHEL's nobody has /: its rules would name
+    //.claude and the like, which the Warden refuses, and / itself)."""
+    h = os.path.normpath(pw.pw_dir) if pw and pw.pw_dir else ""
+    return h if h.startswith("/") and h != "/" else "/nonexistent"
+
+
 def check_cwd(cwd, home):
     real = os.path.realpath(cwd)
     if real in REFUSED_CWDS or real.rstrip("/") == os.path.realpath(home or "/nonexistent"):
@@ -373,7 +381,7 @@ def own_ttys():
 def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH, ttys=()):
     """The baseline's text for this run. ttys: the terminals the agent is
     started on (own_ttys), each allowed by its exact name."""
-    home = pw.pw_dir if pw else "/nonexistent"
+    home = policy_home(pw)
     user = pw.pw_name if pw else "nobody"
     L = []
     L.append(f"#@ varek baseline {BASELINE_FORMAT}")
