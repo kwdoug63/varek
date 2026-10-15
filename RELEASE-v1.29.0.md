@@ -1,12 +1,12 @@
 # VAREK v1.29.0 — Run an Agent With Nothing Set Up First
 
-> v1.29.0 had a correctness review: the code read, GCC's static analyzer,
-> and the suite under AddressSanitizer and UndefinedBehaviorSanitizer. The
-> adversarial review by AI review agents the ship gates call for has not
-> been done yet, and a human or third-party review has not been done.
+> v1.29.0 had a correctness review (the code read, GCC's static analyzer,
+> and the suite under AddressSanitizer and UndefinedBehaviorSanitizer) and
+> an adversarial review by AI review agents. A human or third-party review
+> has not been done.
 
-**Draft.** Pending: the adversarial review, the shared 24-hour soak (with
-v1.28.1 and v1.31.0) and the date.
+**Draft.** Pending: the date, and whether the review's fixes to the Warden
+(below) need a soak of their own after the shared one.
 
 MIT · github.com/kwdoug63/varek
 
@@ -182,8 +182,10 @@ still.
   `agent_env`, `mode`, `noexec_exec`; `run_end`: `mode`, `not_enforced`;
   records: `"enforced":false`. New rules: `change_done`, `change_failed`,
   `chdir_continued`, `mkdir_exists`, `mkdir_exists_ancestor`,
-  `syscall_not_admitted`, `rename_directory_refused`. `varek audit` exits
-  3 for a dry run.
+  `syscall_not_admitted`, `rename_directory_refused`,
+  `rename_from_refused`. `varek audit` exits 3 for a dry run.
+- A rename's old name is decided as a read and a write (0x202): a rule
+  that lets the agent write a file but not read it refuses moving it.
 
 ## Found in review
 
@@ -198,6 +200,67 @@ Running the four agents found more than profile rules (7 above): none of
 them started enforcing until the noexec places, stat(2) and the admitted
 calls were in, and the audit read a dry run's stub questions wrongly; each
 was fixed with checks (sections 5 and 7).
+
+## Found by the review agents
+
+Four AI review agents each took one part of the release (opening files as
+the agent and the baseline; the dry run; changes by name; `varek run`,
+`suggest` and the audit) and reproduced each finding below on the build.
+Each is fixed, with checks in `make test-v1290` (section 2b and 3) or
+`test_varek_cli.py`:
+
+- **High: a dry run let `openat2` through to the kernel.** A dry run sends
+  every system call outside the allowlist to the kernel, recorded, and
+  among them were calls that reach a file by a name or a handle (`openat2`,
+  `creat`, `open_by_handle_at`, `link`, `symlink`, `mknod`, the chown,
+  xattr and old time calls), which the Warden mediates nowhere: the agent
+  read the verdict stream, a protected object, through `openat2` though
+  `open` of it is refused, and the audit passed the run. Those calls, and
+  the ones that reach other processes or the whole system, now stay
+  refused in a dry run as when enforcing (EPERM, not recorded); so do the
+  changes by name and stat(2) under a policy before 1.29, which went
+  through the same way.
+- **Medium: a refused change told the agent what exists.** When the
+  Warden's walk of a change's name failed (made as root where the agent's
+  user may not search), its own error was the answer: `chmod`, `truncate`,
+  `unlink` or `chdir` of a name under a directory only root may read, or
+  under no rule, said ENOENT, ENOTDIR or EACCES, whether the file was
+  there and whether it was a file. A name that is not there is now decided
+  on where it would be, as a lookup's is (ENOENT only where the policy
+  allows the change there, EACCES elsewhere); any other failed walk is
+  EACCES.
+- **Medium: a rename moved contents out of a file the agent may not read.**
+  The old name was decided as a write only, so under `access=wo` the agent
+  renamed a file it could not read to a name where it could, and read it.
+  The old name is now decided as O_RDWR|O_TRUNC (0x202), and with
+  RENAME_EXCHANGE both names as O_RDWR|O_CREAT|O_TRUNC (0x242); the audit
+  expects those flags.
+- **Medium: the baseline let the agent open every terminal of its user's.**
+  `allow path /dev/pts/` with the agent running as the user who ran
+  `sudo` reached that user's other shells: the agent wrote into one. The
+  baseline now names the terminal `varek run` was started on, exactly,
+  beside `/dev/tty`.
+- **Medium: `suggest` drafted active rules for credential stores its list
+  missed** (`~/.config/gh/hosts.yml`, rclone's, Terraform's). The list is
+  longer now, in `suggest` and in the baseline's denies (and `.envrc`),
+  but a list is never complete: anything in a hidden directory of the
+  user's home, outside the working directory, is now written commented
+  out, for the operator to read and open by hand; and a home is another
+  user's by the accounts on the host, not only under `/home`.
+- **Low: in a dry run, a rename whose old name the policy refuses was
+  recorded on that name only**, though the call went through: the draft
+  never saw the new name. Both are decided and recorded now, and the audit
+  refuses a dry run's rename without both.
+- **Low: a baseline run recorded root as its operator.** The agent's clean
+  environment left out sudo's variables, from which the Warden records the
+  operator; `varek run` now passes them to the Warden (the agent sees
+  them too).
+
+Checked and found sound by the same agents, among others: the switches to
+the agent's user and back on every path; files the agent makes are its
+own; symbolic links planted by the agent, final components and trailing
+slashes; RENAME_EXCHANGE and RENAME_NOREPLACE together; directories never
+renamed; the policy store and TMPDIR checks; the audit's exit codes.
 
 ## Found by the shared soak's trial
 
@@ -238,6 +301,9 @@ give it swap.
 
 - **A dry run is not a sandbox.** It lets through what the policy refuses:
   the agent can do what its own user can, outside the D2 refusals.
+- **A dry run does not report** the calls outside the allowlist that reach
+  a file by a name or a handle, another process or the system: they are
+  refused, as when enforcing, by the filter, which records nothing.
 - **A draft is a draft.** `suggest` proposes; a person reviews.
 - **Programs root does not own** (Node.js under nvm) are not named by a
   profile, so launching them is refused; take a dry run and `suggest`.

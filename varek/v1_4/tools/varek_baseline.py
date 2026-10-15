@@ -76,12 +76,26 @@ CREDENTIAL_DENIES = [
     ("deny  path suffix /.my.cnf", "MySQL credentials"),
     ("deny  path suffix /.npmrc", "npm tokens"),
     ("deny  path suffix /.pypirc", "PyPI tokens"),
+    # v1.29 review: more of the stores command-line tools keep tokens in
+    ("deny  path suffix /.config/gh/hosts.yml", "the GitHub CLI's token"),
+    ("deny  path contains /.config/hub", "hub's token"),
+    ("deny  path contains /.config/rclone/", "rclone's remotes and their keys"),
+    ("deny  path suffix /.terraform.d/credentials.tfrc.json", "Terraform Cloud tokens"),
+    ("deny  path contains /.config/op/", "1Password's CLI"),
+    ("deny  path contains /.config/doctl/", "DigitalOcean's CLI"),
+    ("deny  path suffix /.vault-token", "a HashiCorp Vault token"),
+    ("deny  path suffix /.boto", "Google Cloud Storage and boto keys"),
+    ("deny  path suffix /.s3cfg", "s3cmd keys"),
+    ("deny  path suffix /.cargo/credentials", "crates.io tokens"),
+    ("deny  path suffix /.cargo/credentials.toml", ""),
+    ("deny  path suffix /.gem/credentials", "RubyGems keys"),
     ("deny  path glob /**/*.[pP][eE][mM]", "private keys and certificates (x.pem, x.PEM)"),
     ("deny  path glob /**/*.[pP][eE][mM].*", "... and copies"),
     ("deny  path glob /**/*.[kK][eE][yY]", "private keys (x.key)"),
     ("deny  path glob /**/*.[kK][eE][yY].*", "... and copies"),
     ("deny  path glob /**/.[eE][nN][vV]", "dotenv credential files, at any depth"),
     ("deny  path glob /**/.[eE][nN][vV].*", "... and their variants (.env.local)"),
+    ("deny  path glob /**/.[eE][nN][vV][rR][cC]", "direnv's exported settings (v1.29 review)"),
     ("deny  path glob /**/[iI][dD]_[rR][sS][aA]*", "SSH private keys wherever they sit"),
     ("deny  path glob /**/[iI][dD]_[eE][cC][dD][sS][aA]*", ""),
     ("deny  path glob /**/[iI][dD]_[eE][dD]25519*", ""),
@@ -117,7 +131,10 @@ SYSTEM_READS = [
     ("allow path exact /dev/null", ""), ("allow path exact /dev/zero readonly", ""),
     ("allow path exact /dev/urandom readonly", ""), ("allow path exact /dev/random readonly", ""),
     ("allow path exact /dev/tty", "an interactive agent's terminal"),
-    ("allow path /dev/pts/", ""),
+    # not /dev/pts/ (v1.29 review): the agent runs as its user, and every
+    # terminal of that user's would be the agent's to read and write, its
+    # other shells among them. The terminal `varek run` was started on is
+    # named exactly (generate's ttys).
 ]
 
 # A working directory the baseline refuses to make writable.
@@ -339,8 +356,23 @@ def agent_path(cmd, environ):
     return path
 
 
-def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH):
-    """The baseline's text for this run."""
+def own_ttys():
+    """The terminals (under /dev/pts/) this process's standard streams are
+    on: the agent's own, which its programs may open by name."""
+    out = []
+    for fd in (0, 1, 2):
+        try:
+            t = os.path.realpath(os.ttyname(fd))
+        except OSError:
+            continue
+        if t.startswith("/dev/pts/") and t[9:].isdigit() and t not in out:
+            out.append(t)
+    return out
+
+
+def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH, ttys=()):
+    """The baseline's text for this run. ttys: the terminals the agent is
+    started on (own_ttys), each allowed by its exact name."""
     home = pw.pw_dir if pw else "/nonexistent"
     user = pw.pw_name if pw else "nobody"
     L = []
@@ -372,6 +404,10 @@ def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH):
     L.append("# --- the system, read-only ---")
     for r, c in SYSTEM_READS:
         L.append(f"{r:<52} # {c}" if c else r)
+    for t in ttys:
+        if not (t.startswith("/dev/pts/") and t[9:].isdigit()):
+            raise BaselineError(f"{t}: not a terminal under /dev/pts/")
+        L.append(f"{'allow path exact ' + t:<52} # the terminal varek run was started on")
     L.append("")
     L.append("# --- the working directory and the agent's temporary directory (TMPDIR) ---")
     L.append(f"allow path exact {cwd} readonly")
