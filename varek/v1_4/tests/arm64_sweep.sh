@@ -52,7 +52,10 @@ if [ "$DEPS" = 1 ]; then
     elif command -v dnf > /dev/null; then
         # RHEL 9 or a rebuild: libsodium is EPEL's (packaging/vm/provision.sh enables it)
         dnf -y install gcc make git openssl libseccomp-devel openssl-devel libsodium-devel python3 python3-pip \
-            python3-cryptography java-21-openjdk-headless squid curl util-linux || { echo "arm64_sweep.sh: dnf failed"; exit 1; }
+            python3-cryptography java-21-openjdk-headless squid curl util-linux \
+            glibc-static libasan libubsan || { echo "arm64_sweep.sh: dnf failed"; exit 1; }
+        # glibc-static (from CRB): the suites' static probes; libasan and
+        # libubsan: test-mcp-json and the proxy's parsers under the sanitizers
         dnf -y install musl-gcc > /dev/null 2>&1 || echo "arm64_sweep.sh: note: no musl-gcc here (the musl checks skip)"
     else
         echo "arm64_sweep.sh: --deps knows apt-get and dnf only"; exit 1
