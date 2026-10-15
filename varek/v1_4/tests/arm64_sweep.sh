@@ -44,19 +44,30 @@ unset SUDO_UID SUDO_GID SUDO_USER SUDO_COMMAND
 OUT="${OUT:-/var/tmp/varek-arm64-sweep-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$OUT"
 if [ "$DEPS" = 1 ]; then
-    apt-get update -q &&
-    apt-get install -y -q build-essential libseccomp-dev libsodium-dev libssl-dev openjdk-21-jdk-headless \
-        musl-tools python3-cryptography python3-pip python3-pytest python3-yaml python3-venv git openssl &&
-    apt-get install -y -q --no-install-recommends squid || { echo "arm64_sweep.sh: apt-get failed"; exit 1; }
-    # --ignore-installed: beside Ubuntu's own copies (its jsonschema cannot be
-    # uninstalled by pip, and the CycloneDX validator needs a newer one)
-    python3 -m pip install --break-system-packages --ignore-installed -q -r "$HERE/tools/requirements-crosscheck.txt" \
-        -r "$HERE/tools/requirements-test.txt" || { echo "arm64_sweep.sh: pip failed"; exit 1; }
+    if command -v apt-get > /dev/null; then
+        apt-get update -q &&
+        apt-get install -y -q build-essential libseccomp-dev libsodium-dev libssl-dev openjdk-21-jdk-headless \
+            musl-tools python3-cryptography python3-pip python3-pytest python3-yaml python3-venv git openssl &&
+        apt-get install -y -q --no-install-recommends squid || { echo "arm64_sweep.sh: apt-get failed"; exit 1; }
+    elif command -v dnf > /dev/null; then
+        # RHEL 9 or a rebuild: libsodium is EPEL's (packaging/vm/provision.sh enables it)
+        dnf -y install gcc make git openssl libseccomp-devel openssl-devel libsodium-devel python3 python3-pip \
+            python3-cryptography java-21-openjdk-headless squid curl util-linux || { echo "arm64_sweep.sh: dnf failed"; exit 1; }
+        dnf -y install musl-gcc > /dev/null 2>&1 || echo "arm64_sweep.sh: note: no musl-gcc here (the musl checks skip)"
+    else
+        echo "arm64_sweep.sh: --deps knows apt-get and dnf only"; exit 1
+    fi
+    # --ignore-installed: beside the system's own copies (Ubuntu's jsonschema
+    # cannot be uninstalled by pip, and the CycloneDX validator needs a newer
+    # one); --break-system-packages where pip has it (not RHEL 9's)
+    BSP=""; python3 -m pip install --help 2>/dev/null | grep -q -- --break-system-packages && BSP=--break-system-packages
+    python3 -m pip install $BSP --ignore-installed -q -r "$HERE/tools/requirements-crosscheck.txt" \
+        -r "$HERE/tools/requirements-test.txt" pytest pyyaml || { echo "arm64_sweep.sh: pip failed"; exit 1; }
 fi
 {
     echo "host: $(uname -srm); $(. /etc/os-release && echo "$PRETTY_NAME")"
     echo "commit: $(git -C "$HERE" rev-parse --short HEAD 2>/dev/null) ($(git -C "$HERE" branch --show-current 2>/dev/null))"
-    echo "libseccomp $(dpkg-query -W -f '${Version}' libseccomp-dev 2>/dev/null), $(cc --version | head -1)"
+    echo "libseccomp $(dpkg-query -W -f '${Version}' libseccomp-dev 2>/dev/null || rpm -q --qf '%{VERSION}' libseccomp 2>/dev/null), $(cc --version | head -1)"
 } | tee "$OUT/host.txt"
 echo "== build"
 if ! make -C "$HERE" all tests/v1281_sub tests/v1290_open tests/v1310_peek tests/v1300_oflags > "$OUT/build.log" 2>&1; then

@@ -7,8 +7,9 @@
 #
 #   provision.sh SRC
 #
-# The guest: RHEL 9.6 or later on aarch64, registered (subscription-manager),
-# or a rebuild of it (AlmaLinux, Rocky Linux) or CentOS Stream 9. It installs
+# The guest: RHEL 9.6 or later on aarch64, registered (subscription-manager)
+# or a cloud's own RHEL image (its repositories from the cloud's RHUI), or a
+# rebuild of it (AlmaLinux, Rocky Linux) or CentOS Stream 9. It installs
 # what the Warden needs to build (libsodium from EPEL), builds it from a copy
 # of SRC in /opt/varek-src, installs it (make install: /opt/varek, varek in
 # /usr/local/bin), makes sure Landlock is on, and runs varek doctor.
@@ -24,8 +25,17 @@ MAJOR="${VERSION_ID%%.*}" MINOR="${VERSION_ID#*.}"; [ "$MINOR" = "$VERSION_ID" ]
 case "$ID" in
     rhel)
         [ "$MINOR" -ge 6 ] || die "$PRETTY_NAME: RHEL 9.6 or later is needed (Landlock)"
-        subscription-manager status > /dev/null 2>&1 || die "the guest is not registered: sudo subscription-manager register"
-        subscription-manager repos --enable "codeready-builder-for-rhel-9-$(uname -m)-rpms" ;;
+        dnf -y install dnf-plugins-core
+        if dnf -q repolist --all 2>/dev/null | grep -q rhui; then
+            # a cloud's own RHEL image (AWS's, billed by the hour): its packages
+            # come from Red Hat's update servers in that cloud, not a subscription
+            CRB="$(dnf -q repolist --all | awk '/codeready-builder/ && /rhui/ && !/debug|source/ {print $1; exit}')"
+            [ -n "$CRB" ] || die "no CodeReady Builder repository among the cloud's (dnf repolist --all)"
+            dnf config-manager --set-enabled "$CRB"
+        else
+            subscription-manager status > /dev/null 2>&1 || die "the guest is not registered: sudo subscription-manager register"
+            subscription-manager repos --enable "codeready-builder-for-rhel-9-$(uname -m)-rpms"
+        fi ;;
     almalinux|rocky|centos)
         dnf -y install dnf-plugins-core
         dnf config-manager --set-enabled crb ;;
