@@ -291,7 +291,7 @@ def policy_openas(checker, policy):
 # (warden_change.inc.c), and the rules of an allowed one
 CHANGE_FLAGS = {
     "file.unlink": ("0x201",), "file.rmdir": ("0x201",), "file.mkdir": ("0xc1",),
-    "file.rename_from": ("0x201", "0x241"), "file.rename_to": ("0x241",),
+    "file.rename_from": ("0x202", "0x242"), "file.rename_to": ("0x241", "0x242"),
     "file.chmod": ("0x1",), "file.utime": ("0x1",), "file.truncate": ("0x201",),
     "file.chdir": ("0x10000",),
 }
@@ -333,6 +333,7 @@ def check_dry(meta, records, problems):
     rv = [at(e) for _, e in meta.get("cred_events", []) if e.get("event") == "revoked"]
     rline = min(rv) if rv else None
     n = 0
+    by_seq = {r.get("seq"): r for r in records if isinstance(r, dict) and type(r.get("seq")) is int}
     for r in list(records) + list(meta.get("dns_events", [])):
         if not isinstance(r, dict) or "enforced" not in r:
             continue
@@ -352,6 +353,17 @@ def check_dry(meta, records, problems):
                             f"a dry run lets through only what the policy refused")
         if r.get("rule") in DRY_NEVER_LET:
             problems.append(f"seq {seq}: {r.get('rule')} let through: a dry run never lets it through")
+        # a rename let through: both its names decided and recorded, the old
+        # then the new (v1.29 review)
+        act = r.get("action")
+        if act in ("file.rename_from", "file.rename_to") and type(seq) is int:
+            other = by_seq.get(seq + 1 if act == "file.rename_from" else seq - 1)
+            want = "file.rename_to" if act == "file.rename_from" else "file.rename_from"
+            if not other or other.get("action") != want or other.get("enforced") is not False or \
+                    other.get("agent_pid") != r.get("agent_pid"):
+                problems.append(f"seq {seq}: a rename let through without its "
+                                f"{'new' if want == 'file.rename_to' else 'old'} name decided and recorded "
+                                f"{'next' if want == 'file.rename_to' else 'before it'}")
         if rline is not None and at(r) > rline:
             problems.append(f"seq {seq}: a call let through after the run was revoked")
     if dry and end and end[-1].get("not_enforced") != n:

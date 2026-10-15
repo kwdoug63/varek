@@ -38,7 +38,8 @@ import subprocess
 import tempfile
 
 POLICY_RULES = ("policy_match", "default_deny_unknown", "fragment_escape_flags", "fragment_escape_length",
-                "certificate_refused", "exec_not_in_ruleset", "exec_no_landlock", "max_body", "rename_to_refused")
+                "certificate_refused", "exec_not_in_ruleset", "exec_no_landlock", "max_body", "rename_to_refused",
+                "rename_from_refused")
 READ_ACTIONS = ("file.stat", "file.access", "file.readlink", "file.chdir")
 CHANGE_ACTIONS = ("file.unlink", "file.rmdir", "file.mkdir", "file.rename_from", "file.rename_to",
                   "file.chmod", "file.utime", "file.truncate")
@@ -70,8 +71,10 @@ def subject_of(rec, confined):
     return k
 CREDENTIAL_RX = re.compile(
     r"/\.(ssh|aws|azure|kube|gnupg|password-store)/|/\.config/gcloud/|/\.docker/config\.json$|"
-    r"/\.(netrc|git-credentials|pgpass|my\.cnf|npmrc|pypirc)$|\.[pP][eE][mM]($|[.~])|\.[kK][eE][yY]($|[.~])|"
-    r"/\.[eE][nN][vV]($|[.~])|/[iI][dD]_([rR][sS][aA]|[dD][sS][aA]|[eE][cC][dD][sS][aA]|[eE][dD]25519)[^/]*$")
+    r"/\.(netrc|git-credentials|pgpass|my\.cnf|npmrc|pypirc|vault-token|boto|s3cfg)$|"
+    r"/\.config/(gh/hosts\.yml$|hub($|/)|rclone/|op/|doctl/)|/\.terraform\.d/credentials\.tfrc\.json$|"
+    r"/\.cargo/credentials(\.toml)?$|/\.gem/credentials$|\.[pP][eE][mM]($|[.~])|\.[kK][eE][yY]($|[.~])|"
+    r"/\.[eE][nN][vV]([rR][cC])?($|[.~])|/[iI][dD]_([rR][sS][aA]|[dD][sS][aA]|[eE][cC][dD][sS][aA]|[eE][dD]25519)[^/]*$")
 SYSTEM_WRITE = ("/etc/", "/usr/", "/boot/", "/bin/", "/sbin/", "/lib/", "/lib64/")
 PRIVILEGED = ("sudo", "su", "doas", "pkexec")
 O_ACCMODE, O_CREAT, O_TRUNC = 3, 0x40, 0x200
@@ -223,7 +226,21 @@ def agent_home(rs):
     return None
 
 
-def why_not(it, home, written):
+def _user_homes():
+    """the homes of root and of the people with accounts (uid 1000 and up)"""
+    try:
+        import pwd
+        return {p.pw_dir.rstrip("/") for p in pwd.getpwall()
+                if (p.pw_uid == 0 or 1000 <= p.pw_uid < 65534) and p.pw_dir.rstrip("/") not in ("", "/")}
+    except ImportError:
+        return set()
+
+
+def _under(s, d):
+    return bool(d) and (s == d or s.startswith(d + "/"))
+
+
+def why_not(it, home, written, cwd=None):
     """None, or why this suggestion is written commented out"""
     s, kind = it["subj"], it["kind"]
     if it["deny_line"]:
@@ -234,6 +251,14 @@ def why_not(it, home, written):
         m = re.match(r"^(/home/[^/]+|/root)(/|$)", s)
         if m and m.group(1) != home:
             return "in another user's home"
+        if any(_under(s, h) and h != home for h in _user_homes()):
+            return "in another user's home"
+        # v1.29 review: a list of credential stores is never complete, and
+        # the baseline closes the user's home; what the agent read in a
+        # hidden directory there is for the operator to open, by hand
+        if home and _under(s, home) and not _under(s, cwd) and s[len(home) + 1:].startswith("."):
+            return ("in a hidden directory of the user's home, where tools keep their settings and "
+                    "tokens: read it, and remove the # if it holds none")
     if kind == "write" and any(s.startswith(p) or s == p.rstrip("/") for p in SYSTEM_WRITE):
         return "a write under a system directory"
     if kind == "exec":
@@ -346,6 +371,8 @@ def suggest(records, policy_text, policy_path, policy_sha, vdp, for_name=None):
     if rs is None:
         raise ValueError("the stream has no run_start")
     home = agent_home(rs)
+    b = rs.get("baseline") if isinstance(rs, dict) else None
+    cwd = b["cwd"].rstrip("/") if isinstance(b, dict) and isinstance(b.get("cwd"), str) else None
     head = _header(rs, policy_path, policy_sha)
     body = []
     for line in policy_text.splitlines():
@@ -371,7 +398,7 @@ def suggest(records, policy_text, policy_path, policy_sha, vdp, for_name=None):
                 out.append(f"# (not written: {it['subj'][:200]!r} cannot be a policy constant) # {_comment(it)}")
                 n_commented += 1
                 continue
-            why = why_not(it, home, written)
+            why = why_not(it, home, written, cwd)
             if why:
                 out.append(f"# {rt}    # NOT SUGGESTED: {why}; {_comment(it)}")
                 n_commented += 1
@@ -383,7 +410,7 @@ def suggest(records, policy_text, policy_path, policy_sha, vdp, for_name=None):
         if kind in ("read", "write"):
             by_dir = {}
             for it in its:
-                if why_not(it, home, written) is None and _writable(it["subj"]):
+                if why_not(it, home, written, cwd) is None and _writable(it["subj"]):
                     by_dir.setdefault(os.path.dirname(it["subj"]), []).append(it)
             for d in sorted(by_dir):
                 if len(by_dir[d]) >= 5 and d != "/":

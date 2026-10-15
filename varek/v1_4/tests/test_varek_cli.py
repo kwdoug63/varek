@@ -200,3 +200,26 @@ def test_a_long_stream_is_read_as_it_goes(tmp_path):
         fh.write('{"report_id": broken\n')
     with pytest.raises(mod.CliError, match="cannot be read"):
         mod.summarize(mod.read_records(str(log)))
+
+
+def test_the_baseline_names_only_the_agents_own_terminal():
+    """v1.29 review: `allow path /dev/pts/` let an agent running as its user
+    open every terminal of that user's, its other shells among them. The
+    baseline names the terminal `varek run` was started on, exactly."""
+    import pwd
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
+    try:
+        import varek_baseline as b
+    finally:
+        sys.path.pop(0)
+    pw = pwd.getpwuid(os.getuid())
+    t = b.generate("/srv/proj", pw, "/tmp/varek-x", None)
+    rules = [l.split("#")[0].strip() for l in t.splitlines()]
+    assert "allow path /dev/pts/" not in rules and not any(r.startswith("allow path /dev/pts") for r in rules)
+    assert "allow path exact /dev/tty" in rules
+    t = b.generate("/srv/proj", pw, "/tmp/varek-x", None, ttys=["/dev/pts/7"])
+    rules = [l.split("#")[0].strip() for l in t.splitlines()]
+    assert [r for r in rules if "/dev/pts" in r] == ["allow path exact /dev/pts/7"]
+    with pytest.raises(b.BaselineError):
+        b.generate("/srv/proj", pw, "/tmp/varek-x", None, ttys=["/dev/pts/../../etc/shadow"])
+    assert all(x.startswith("/dev/pts/") for x in b.own_ttys())

@@ -12,9 +12,14 @@
  *   file.unlink, file.rmdir   the name, as O_WRONLY|O_TRUNC (a rule that
  *                             refuses truncation refuses removal)
  *   file.mkdir                the new name, as O_WRONLY|O_CREAT|O_EXCL
- *   file.rename_from          the old name, as O_WRONLY|O_TRUNC (with
- *                             RENAME_EXCHANGE, as the new name below)
+ *   file.rename_from          the old name, as O_RDWR|O_TRUNC: its contents
+ *                             are read under the new name (v1.29 review), so
+ *                             a rule that lets the agent write it but not
+ *                             read it refuses moving it (with
+ *                             RENAME_EXCHANGE, O_RDWR|O_CREAT|O_TRUNC)
  *   file.rename_to            the new name, as O_WRONLY|O_CREAT|O_TRUNC
+ *                             (with RENAME_EXCHANGE, O_RDWR|O_CREAT|O_TRUNC:
+ *                             its contents move to the old name)
  *   file.chmod, file.utime    the object, as O_WRONLY
  *   file.truncate             the object, as O_WRONLY|O_TRUNC
  *   file.chdir                the directory, as a read (O_RDONLY|O_DIRECTORY)
@@ -38,6 +43,14 @@
  *
  * The calls on a descriptor (ftruncate, fchmod, utimensat on a descriptor)
  * are decided on the descriptor's object, reached through /proc/<pid>/fd.
+ *
+ * A name that is not there (v1.29 review) is decided on where it would be,
+ * as a lookup's is: ENOENT only where the policy allows the change there,
+ * EACCES elsewhere. Any other failed walk (a file where a directory is
+ * named, a loop) is answered EACCES. The walk's own error is never passed
+ * on: it is made as root where the agent's user may not search, and would
+ * tell the agent what exists where neither the policy nor the kernel lets it
+ * look.
  */
 
 #ifndef SYSFS_MAGIC
@@ -57,6 +70,8 @@
 #endif
 
 #define CHG_W_TRUNC   (O_WRONLY | O_TRUNC)
+#define CHG_RW_TRUNC  (O_RDWR | O_TRUNC)
+#define CHG_RW_SWAP   (O_RDWR | O_CREAT | O_TRUNC)
 #define CHG_W_CREATE  (O_WRONLY | O_CREAT | O_EXCL)
 #define CHG_W_REPLACE (O_WRONLY | O_CREAT | O_TRUNC)
 
@@ -78,7 +93,8 @@ static const char *change_op_name(int op) {
 /* the flags each kind of change is decided as */
 static int change_flags(int op) {
     switch (op) {
-        case CHG_UNLINK: case CHG_RMDIR: case CHG_RENAME_FROM: case CHG_TRUNCATE: return CHG_W_TRUNC;
+        case CHG_UNLINK: case CHG_RMDIR: case CHG_TRUNCATE: return CHG_W_TRUNC;
+        case CHG_RENAME_FROM: return CHG_RW_TRUNC;
         case CHG_MKDIR:     return CHG_W_CREATE;
         case CHG_RENAME_TO: return CHG_W_REPLACE;
         case CHG_CHMOD: case CHG_UTIME: return O_WRONLY;
@@ -141,7 +157,7 @@ static int change_derive(const struct seccomp_notif *req, struct action *out) {
     out->kind = ACT_FILE_CHANGE;
     out->chg_op = op;
     out->open_flags = change_flags(op);
-    if (op == CHG_RENAME_FROM && out->chg_flags & RENAME_EXCHANGE) out->open_flags = CHG_W_REPLACE;
+    if (op == CHG_RENAME_FROM && out->chg_flags & RENAME_EXCHANGE) out->open_flags = CHG_RW_SWAP;
     out->flags_known = true;
     out->open_dirfd = out->chg_dirfd;
     if (pa >= 0 && xproc_read_str(req->pid, g[pa], out->target, sizeof out->target) < 0) return -1;
@@ -188,9 +204,40 @@ struct chg_pin {
     int  agent_err;       /* the walk as the agent failed with this */
 };
 
+/* change_resolve's answer for a name that is not there (the pin's fd -1, res
+ * the name where it would be): decided by the policy, ENOENT where allowed */
+static const char CHG_MISSING[] = "change_missing";
+
+static bool path_has_dotdot(const char *p) {
+    for (const char *c = p; (c = strstr(c, "..")); c += 2)
+        if ((c == p || c[-1] == '/') && (c[2] == '\0' || c[2] == '/')) return true;
+    return false;
+}
+
+/* The name where a missing one would be: under the directory q (pinned, the
+ * deepest that is there), nm, then the rest of the walk and the last
+ * component of a named change. NULL, or the rule refusing it. */
+static const char *change_missing(pid_t pid, int q, const char *nm, const char *tail, const char *last,
+                                  char *res, size_t resn) {
+    pid_t tgid = -1;
+    char parent[PATH_LIMIT];
+    if (fd_canonical_path(q, parent, sizeof parent) < 0 ||
+        check_proc_object(q, pid, &tgid, parent, sizeof parent) < 0) return "resolution_failed";
+    if (change_fs_ok(q) < 0) return "change_on_kernel_fs";
+    int pd = in_protected_dir(NULL, q);
+    if (pd < 0) return "resolution_failed";
+    if (pd > 0) return "protected_object";
+    int n = snprintf(res, resn, "%s%s%s%s%s%s%s", parent, strcmp(parent, "/") ? "/" : "", nm,
+                     tail[0] ? "/" : "", tail, last ? "/" : "", last ? last : "");
+    if (n < 0 || (size_t)n >= resn) { res[0] = '\0'; return "resolution_failed"; }
+    if ((g_any_name || g_inspect_on) && view_by_canonical(res) >= 0) return "view_write_refused";
+    return CHG_MISSING;
+}
+
 /* Resolve one path of a change. named: pin the parent and keep the last
  * component (not followed). Sets a->resolved (or res) to the canonical name.
- * Returns NULL, or the record's rule for refusing it (with *err its errno). */
+ * Returns NULL, CHG_MISSING (a name not there, res where it would be), or
+ * the record's rule for refusing it (with *err its errno). */
 static const char *change_resolve(pid_t pid, const struct action *a, int dirfd, const char *path, bool named,
                                   bool want_dir, struct chg_pin *pin, char *res, size_t resn, int *err) {
     memset(pin, 0, sizeof *pin);
@@ -205,6 +252,7 @@ static const char *change_resolve(pid_t pid, const struct action *a, int dirfd, 
     bool ts = false;
     if (path_is_proc_self(path, &ts)) { close(base); return "change_on_kernel_fs"; }
     snprintf(work, sizeof work, "%s", path);
+    char dir[PATH_LIMIT];
     if (named) {
         size_t l = strlen(work);
         while (l > 1 && work[l - 1] == '/') { work[--l] = '\0'; pin->trailing_slash = true; }
@@ -216,7 +264,6 @@ static const char *change_resolve(pid_t pid, const struct action *a, int dirfd, 
             return "change_invalid";
         }
         snprintf(pin->name, sizeof pin->name, "%s", nm);
-        char dir[PATH_LIMIT];
         if (!sl) snprintf(dir, sizeof dir, ".");
         else if (sl == work) snprintf(dir, sizeof dir, "/");
         else snprintf(dir, sizeof dir, "%.*s", (int)(sl - work), work);
@@ -225,8 +272,23 @@ static const char *change_resolve(pid_t pid, const struct action *a, int dirfd, 
         pin->fd = resolve_openat2(base, work, want_dir ? (uint64_t)O_DIRECTORY : 0, &pin->agent_err);
     }
     int e = errno;
+    if (pin->fd < 0) {
+        /* v1.29 review: never the walk's own errno (see the top of this file) */
+        const char *walked = named ? dir : work;
+        int q = -1;
+        char mnm[256], tail[PATH_LIMIT];
+        const char *w = "resolution_failed";
+        if (e == ENOENT && !path_has_dotdot(walked) &&
+            meta_first_missing(base, walked, &q, mnm, sizeof mnm, tail, sizeof tail) == 0) {
+            w = change_missing(pid, q, mnm, tail, named ? pin->name : NULL, res, resn);
+            close(q);
+        }
+        close(base);
+        pin->fd = -1;
+        *err = w == CHG_MISSING ? ENOENT : EACCES;
+        return w;
+    }
     close(base);
-    if (pin->fd < 0) { *err = e == ENOENT || e == ENOTDIR || e == ELOOP ? e : EACCES; return "resolution_failed"; }
     char canon[PATH_LIMIT];
     if (fd_canonical_path(pin->fd, canon, sizeof canon) < 0 ||
         check_proc_object(pin->fd, pid, &tgid, canon, sizeof canon) < 0) return "resolution_failed";
@@ -397,6 +459,8 @@ static void change_handle(int notify_fd, const struct seccomp_notif *req, struct
         why = change_resolve(pid, a, a->chg_dirfd, a->target, named, a->chg_op == CHG_CHDIR, &x,
                              a->resolved, sizeof a->resolved, &err);
     }
+    bool missing = why == CHG_MISSING, missing2 = false;
+    if (missing) why = NULL;
     if (why) {
         emit_pathology(g_report_seq++, pid, a, strcmp(why, "resolution_failed") ? DEC_DENY : DEC_UNKNOWN,
                        DEC_DENY, why, change_lat(t0), err);
@@ -411,7 +475,7 @@ static void change_handle(int notify_fd, const struct seccomp_notif *req, struct
      * home directory, Python's from the working directory), and refused
      * there with EACCES it stops. Nothing changes; the record says it was
      * decided as a lookup (flags 0x0). */
-    if (a->chg_op == CHG_MKDIR && !x.agent_err) {
+    if (a->chg_op == CHG_MKDIR && !x.agent_err && !missing) {
         struct stat es;
         if (fstatat(x.fd, x.name, &es, AT_SYMLINK_NOFOLLOW) == 0) {
             int saved = a->open_flags;
@@ -439,13 +503,15 @@ static void change_handle(int notify_fd, const struct seccomp_notif *req, struct
     if (a->chg_op == CHG_RENAME_FROM) {
         memcpy(&b, a, sizeof b);
         b.chg_op = CHG_RENAME_TO;
-        b.open_flags = CHG_W_REPLACE;
+        b.open_flags = a->chg_flags & RENAME_EXCHANGE ? CHG_RW_SWAP : CHG_W_REPLACE;
         snprintf(b.target, sizeof b.target, "%s", a->target2);
         const char *why2 = change_resolve(pid, &b, a->chg_dirfd2, a->target2, true, false, &y,
                                           b.resolved, sizeof b.resolved, &err);
+        missing2 = why2 == CHG_MISSING;
+        if (missing2) why2 = NULL;
         struct stat ss, ds;
-        bool src_dir = fstatat(x.fd, x.name, &ss, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(ss.st_mode);
-        bool dst_dir = !why2 && a->chg_flags & RENAME_EXCHANGE &&
+        bool src_dir = !missing && fstatat(x.fd, x.name, &ss, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(ss.st_mode);
+        bool dst_dir = !why2 && !missing2 && a->chg_flags & RENAME_EXCHANGE &&
                        fstatat(y.fd, y.name, &ds, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(ds.st_mode);
         if (!why2 && (src_dir || dst_dir)) why2 = "rename_directory_refused", err = EXDEV;
         if (why2) {
@@ -462,6 +528,15 @@ static void change_handle(int notify_fd, const struct seccomp_notif *req, struct
         change_close(&x);
         change_close(&y);
         emit_pathology(g_report_seq++, pid, a, raw, DEC_DENY, why, change_lat(t0), 0);
+        /* a rename's new name is decided and recorded too (v1.29 review):
+         * the call goes through, and the draft must see both names */
+        if (a->chg_op == CHG_RENAME_FROM) {
+            decision_t rb = DEC_ALLOW;
+            const char *wb = change_decide(p, &b, &rb);
+            if (!wb || !dry_let(&b, wb)) b.dry = true;
+            emit_pathology(g_report_seq++, pid, &b, rb, DEC_DENY, wb ? wb : "rename_from_refused",
+                           change_lat(t0), 0);
+        }
         send_simple(notify_fd, req->id, DEC_ALLOW);
         return;
     }
@@ -492,6 +567,18 @@ static void change_handle(int notify_fd, const struct seccomp_notif *req, struct
             change_close(&y);
             return;
         }
+    }
+    /* a name that is not there, where the policy allows the change: the
+     * kernel's ENOENT, recorded (a change of directory goes to the kernel
+     * as any allowed one, below, which answers it) */
+    if ((missing || missing2) && a->chg_op != CHG_CHDIR) {
+        change_close(&x);
+        change_close(&y);
+        emit_pathology(g_report_seq++, pid, a, raw, DEC_ALLOW, "change_failed", change_lat(t0), ENOENT);
+        if (a->chg_op == CHG_RENAME_FROM)
+            emit_pathology(g_report_seq++, pid, &b, raw2, DEC_ALLOW, "change_failed", change_lat(t0), ENOENT);
+        send_errno(notify_fd, req->id, ENOENT);
+        return;
     }
     /* a change of directory: the kernel does it, as the agent */
     if (a->chg_op == CHG_CHDIR) {
