@@ -429,10 +429,11 @@ else
     check "truncate and ftruncate, decided as O_WRONLY|O_TRUNC (0x201)"   sh -c "grep -qx 'truncate ok' '$C/a.out' && grep -qx 'ftruncate ok' '$C/a.out'"
     check "... recorded so"                                               recc file.truncate "$W/f" ALLOW change_done 0x201
     check "a rename: both names decided and recorded"                     sh -c "grep -qx 'rename ok' '$C/a.out' && [ -e '$W/y' ] && [ ! -e '$W/x' ]"
-    check "... file.rename_from (0x201)"                                  recc file.rename_from "$W/x" ALLOW change_done 0x201
+    check "... file.rename_from (0x202: its contents are read under the new name)" recc file.rename_from "$W/x" ALLOW change_done 0x202
     check "... file.rename_to (0x241)"                                    recc file.rename_to "$W/y" ALLOW change_done 0x241
-    check "RENAME_EXCHANGE: both names decided as replaced (0x241)"      sh -c "grep -qx 'exchange ok' '$C/a.out'" 
-    check "... recorded so"                                               recc file.rename_from "$W/y" ALLOW change_done 0x241
+    check "RENAME_EXCHANGE: both names decided as read and replaced (0x242)" sh -c "grep -qx 'exchange ok' '$C/a.out'"
+    check "... the old name"                                              recc file.rename_from "$W/y" ALLOW change_done 0x242
+    check "... the new name"                                              recc file.rename_to "$W/z" ALLOW change_done 0x242
     check "a rename into a read-only tree is refused, the file stays"     sh -c "[ \"\$(sed -n '/^rename/p' '$C/a.out' | sed -n 2p)\" = 'rename Permission denied' ] && [ -e '$W/y' ] && [ ! -e '$W/ro/y' ]"
     check "... recorded: the new name refused"                            recc file.rename_to "$W/ro/y" DENY policy_match
     check "a rename of a file a deny rule names (.env) is refused"        sh -c "[ -e '$W/keep/.env' ] && [ ! -e '$W/e2' ]"
@@ -493,6 +494,46 @@ else
     (cd "$C/rn" && "$WARDEN" "$C/prn.txt" --run-as nobody --sign-key "$C/rk" -- "$C/bin/v1290_open" "${RA[@]}" > "$C/rn.out" 2> "$C/rn.log")
     check "a signed run of 300 renames: each one made, and no checkpoint seals more than checkpoint_every (the audit passes)" \
         sh -c "[ \"\$(grep -cx 'rename ok' '$C/rn.out')\" = 300 ] && python3 '$HERE/tools/varek_audit.py' --policy '$C/prn.txt' --checker '$CERT' --pubkey '$C/rk.pub' '$C/rn.log' > '$C/rn.aud' && grep -q 'integrity: signed' '$C/rn.aud'"
+    # v1.29 review: a refused change tells nothing of what exists where the
+    # policy does not reach, though the Warden's walk is made as root
+    mkdir -p "$C/out/secret/sub"; echo k > "$C/out/secret/key"; echo h > "$C/out/hidden"; chmod 644 "$C/out/hidden"
+    LK=(); for n in secret/key secret/nokey; do LK+=(chmod "$C/out/$n" truncate "$C/out/$n" chdir "$C/out/$n" unlink "$C/out/$n/x" mkdir "$C/out/$n/x"); done
+    LK+=(truncate "$C/out/hidden" truncate "$C/out/nohidden" chmod "$C/out/hidden" chmod "$C/out/nohidden" unlink "$C/out/secret/sub/x")
+    (cd "$W" && "$WARDEN" "$C/p129.txt" --run-as nobody -- "$C/bin/v1290_open" "${LK[@]}" > "$C/lk.out" 2> "$C/lk.log")
+    check "a refused change says EACCES whether its name is there or not, a file or a directory (15 calls)" \
+        sh -c "[ \"\$(grep -c ' Permission denied\$' '$C/lk.out')\" = 15 ] && [ \"\$(wc -l < '$C/lk.out')\" = 15 ]"
+    check "... none recorded with the walk's own errno" sh -c "! grep -q '\"errno\":\(2\|20\|40\),' '$C/lk.log'"
+    MS=(chmod "$W/nosuch2" truncate "$W/nodir/f" mkdir "$W/nodir/f" chdir "$W/nodir" utime "$W/nodir/f" rename "$W/nodir/a:$W/b")
+    (cd "$W" && "$WARDEN" "$C/p129.txt" --run-as nobody -- "$C/bin/v1290_open" "${MS[@]}" > "$C/ms.out" 2> "$C/ms.log")
+    check "a missing name where the policy allows the change: ENOENT, as the kernel says (6 calls)" \
+        sh -c "[ \"\$(grep -c ' No such file or directory\$' '$C/ms.out')\" = 6 ]"
+    check "... recorded where it would be, allowed, change_failed, errno 2" \
+        rec "$C/ms.log" "r.get('action') == 'file.mkdir' and r.get('resolved') == '$W/nodir/f' and r['decision_final'] == 'ALLOW' and r['rule'] == 'change_failed' and r['errno'] == 2"
+    check "... and the audit passes the run" python3 "$HERE/tools/varek_audit.py" --policy "$C/p129.txt" --checker "$CERT" "$C/ms.log"
+    # v1.29 review: a rename moves a file's contents to a name where they
+    # are read, so a rule that lets the agent write a file but not read it
+    # refuses moving it
+    mkdir -p "$C/wo/drop"; chmod 1777 "$C/wo"; chmod 777 "$C/wo/drop"
+    echo secret > "$C/wo/drop/other.txt"; chmod 666 "$C/wo/drop/other.txt"
+    printf 'require warden 1.29\nallow path /usr/ readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/wo/drop/ access=wo\ndeny path %s/wo/drop/\nallow path exact %s/wo readonly\nallow path %s/wo/\n' "$C" "$C" "$C" "$C" > "$C/pwo.txt"
+    (cd "$C/wo" && "$WARDEN" "$C/pwo.txt" --run-as nobody -- "$C/bin/v1290_open" read "$C/wo/drop/other.txt" \
+        rename "$C/wo/drop/other.txt:$C/wo/got.txt" read "$C/wo/got.txt" > "$C/wo.out" 2> "$C/wo.log")
+    check "a file the agent may write but not read is not renamed to where it may read it" \
+        sh -c "[ \"\$(sed -n 2p '$C/wo.out')\" = 'rename Permission denied' ] && [ -e '$C/wo/drop/other.txt' ] && [ ! -e '$C/wo/got.txt' ]"
+    check "... recorded on its old name, decided as 0x202" rec "$C/wo.log" "r.get('action') == 'file.rename_from' and r.get('resolved') == '$C/wo/drop/other.txt' and r['decision_final'] == 'DENY' and r['rule'] == 'policy_match' and r.get('open_flags') == '0x202'"
+    # v1.29 review: a dry run lets a rename through whichever name is
+    # refused, so both are decided and recorded
+    mkdir -p "$C/dr/ro" "$C/dr/ro2"; chmod 1777 "$C/dr"; chmod 777 "$C/dr/ro" "$C/dr/ro2"; echo f > "$C/dr/ro/f"; chmod 666 "$C/dr/ro/f"
+    printf 'require warden 1.29\nallow path /usr/ readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/dr/ro/ readonly\ndeny path %s/dr/ro/\nallow path %s/dr/ro2/ readonly\ndeny path %s/dr/ro2/\nallow path exact %s/dr readonly\nallow path %s/dr/\n' "$C" "$C" "$C" "$C" "$C" "$C" > "$C/pdr.txt"
+    (cd "$C/dr" && "$WARDEN" "$C/pdr.txt" --dry-run --run-as nobody -- "$C/bin/v1290_open" rename "$C/dr/ro/f:$C/dr/ro2/g" > "$C/dr.out" 2> "$C/dr.log")
+    check "a dry run: a rename whose old name is refused goes through" sh -c "grep -qx 'rename ok' '$C/dr.out' && [ -e '$C/dr/ro2/g' ]"
+    check "... its old name recorded, refused, not enforced" rec "$C/dr.log" "r.get('action') == 'file.rename_from' and r.get('resolved') == '$C/dr/ro/f' and r['rule'] == 'policy_match' and r.get('enforced') is False"
+    check "... and its new name too" rec "$C/dr.log" "r.get('action') == 'file.rename_to' and r.get('resolved') == '$C/dr/ro2/g' and r['rule'] == 'policy_match' and r.get('enforced') is False"
+    python3 "$HERE/tools/varek_audit.py" --policy "$C/pdr.txt" --checker "$CERT" "$C/dr.log" > "$C/dr.aud" 2>&1; drc=$?
+    check "... the audit says a dry run (exit 3)" sh -c "[ $drc = 3 ] && grep -q 'VERIFIED: DRY RUN' '$C/dr.aud'"
+    python3 "$F" "$C/dr.log" "$C/drf.log" "i = [k for k, r in enumerate(recs) if isinstance(r, dict) and r.get('action') == 'file.rename_to'][0]; recs.pop(i); [r.__setitem__('seq', r['seq'] - 1) for r in recs[i:] if isinstance(r, dict) and 'seq' in r]; [r.__setitem__('records', r['records'] - 1) for r in recs if isinstance(r, dict) and r.get('event') == 'run_end']; [r.__setitem__('not_enforced', r['not_enforced'] - 1) for r in recs if isinstance(r, dict) and r.get('event') == 'run_end']" >/dev/null 2>&1
+    python3 "$HERE/tools/varek_audit.py" --policy "$C/pdr.txt" --checker "$CERT" "$C/drf.log" > "$C/drf.aud" 2>&1; drc=$?
+    check "... a dry run's rename with its new name dropped: the audit refuses it" sh -c "[ $drc != 0 ] && [ $drc != 3 ] && grep -q 'without its new name decided and recorded next' '$C/drf.aud'"
     # tools an agent uses, through varek run with the baseline (the section-2 user)
     if [ -n "${MADE_BU:-}" ] && id varek1290r >/dev/null 2>&1; then
         cat > "$BH/proj/tools.sh" <<'SHT'
@@ -547,6 +588,13 @@ t("stat-outside", lambda: os.stat("$Y/o/f").st_size)
 t("own", lambda: open("$Y/o/mine", "w").write("m") and None)
 t("link", lambda: os.link("$Y/o/mine", "$Y/w/hl"))
 t("unlink-outside", lambda: os.unlink("$Y/o/mine"))
+t("priority", lambda: os.getpriority(os.PRIO_PROCESS, 0) and None)
+def oa2():   # openat2 of the verdict stream, a protected object (v1.29 review)
+    libc = ctypes.CDLL(None, use_errno=True)
+    how = (ctypes.c_uint64 * 3)(0, 0, 0)
+    r = libc.syscall(437, -100, sys.argv[1].encode(), ctypes.byref(how), 24)
+    return "fd" if r >= 0 else "errno %d" % ctypes.get_errno()
+t("openat2-stream", oa2)
 def conn():
     s = socket.create_connection(("127.0.0.1", $YP), timeout=5); s.sendall(b"GET / HTTP/1.0\r\n\r\n"); return s.recv(12).decode()
 t("connect", conn)
@@ -579,10 +627,10 @@ sys.exit(any(json.loads(l).get('enforced') is False and json.loads(l).get('decis
     check "a write the policy refuses is let through, as the agent's user" sh -c "grep -qx 'write-outside ok' '$Y/d.out' && [ \"\$(stat -c %U '$Y/o/new')\" = nobody ]"
     check "a root-only file stays unreadable: the kernel decides as the agent, never as root" yo "read-root-only PermissionError 13"
     check "a lookup the policy refuses is let through"                    yo "stat-outside 3"
-    check "a call outside the allowlist (link) goes to the kernel"        sh -c "grep -qx 'link ok' '$Y/d.out' && [ -e '$Y/w/hl' ]"
-    # link(2): x86_64's 86; arm64 has only linkat(2), 37 (v1.30)
-    YL=86; [ "$(uname -m)" = aarch64 ] && YL=37
-    check "... recorded syscall_not_admitted, enforced:false"             recd other "syscall:$YL" syscall_not_admitted
+    check "a call outside the allowlist (getpriority) goes to the kernel"  sh -c "grep -q '^priority ' '$Y/d.out' && ! grep -q '^priority PermissionError' '$Y/d.out'"
+    check "... recorded syscall_not_admitted, enforced:false"             recd other syscall:$(python3 -c 'import platform; print(140 if platform.machine() == "x86_64" else 141)') syscall_not_admitted
+    check "one that reaches a file by a name (link) stays refused, as when enforcing" sh -c "grep -qx 'link PermissionError 1' '$Y/d.out' && [ ! -e '$Y/w/hl' ]"
+    check "... so does openat2, which would read the verdict stream past the Warden" yo "openat2-stream errno 1"
     check "a change by name the policy refuses is let through"            sh -c "grep -qx 'unlink-outside ok' '$Y/d.out' && [ ! -e '$Y/o/mine' ]"
     check "a connect the policy refuses is dialed by the Warden"          yo "connect HTTP/1.0 200"
     check "... recorded DENY, enforced:false (dialed: at once or in progress)" \
@@ -918,10 +966,8 @@ else
     # a dry run of an earlier policy: what enforcing refuses in the filter is
     # recorded as a call outside the allowlist, not decided
     (cd "$G/w" && "$WARDEN" "$G/p128.txt" --dry-run --run-as nobody -- "$G/bin/v1290_open" rstat "$G/o/secret" mkdir "$G/w/n2" > /dev/null 2> "$G/d.log")
-    # x86_64: stat(2) 4, mkdir(2) 83 or mkdirat(2) 258; arm64: no stat(2), mkdirat(2) 34 (v1.30)
-    if [ "$(uname -m)" = aarch64 ]; then GS="set()" GM="{'syscall:34'}"; else GS="{'syscall:4'}" GM="{'syscall:83','syscall:258'}"; fi
-    check "a dry run under 1.28: stat(2) and mkdir are syscall_not_admitted, not decided" sh -c "
-        python3 -c \"import json,sys; R=[json.loads(l) for l in open('$G/d.log') if l.startswith('{')]; t={r.get('target') for r in R if r.get('rule') == 'syscall_not_admitted'}; sys.exit(0 if $GS <= t and t & $GM and not any(r.get('action') == 'file.mkdir' for r in R) else 1)\""
+    check "a dry run under 1.28: stat(2) and mkdir stay refused, as when enforcing (the Warden decides them only from 1.29)" sh -c "
+        [ ! -e '$G/w/n2' ] && python3 -c \"import json,sys; R=[json.loads(l) for l in open('$G/d.log') if l.startswith('{')]; sys.exit(0 if not any(r.get('rule') == 'syscall_not_admitted' or r.get('action') == 'file.mkdir' for r in R) else 1)\""
     # noexec: a place inside a writable directory that keeps exec
     H7="$G/h"
     mkdir -p "$H7/inst/bin"; chmod 1777 "$H7"; chmod 755 "$H7/inst" "$H7/inst/bin"

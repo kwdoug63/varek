@@ -380,7 +380,7 @@ static bool dry_policy_rule(const char *rule) {
     static const char *const kLet[] = {
         "policy_match", "default_deny_unknown", "fragment_escape_flags", "fragment_escape_length",
         "certificate_refused", "exec_not_in_ruleset", "exec_no_landlock", "syscall_not_admitted",
-        "rename_to_refused", "max_body", NULL };
+        "rename_to_refused", "rename_from_refused", "max_body", NULL };
     for (int i = 0; rule && kLet[i]; i++) if (!strcmp(rule, kLet[i])) return true;
     return false;
 }

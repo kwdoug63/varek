@@ -1252,7 +1252,8 @@ def baseline_for_run(args, cmd, make):
         tmp = varek_baseline.tmp_dir(pw, make=make)
         path = varek_baseline.agent_path(cmd, os.environ)
         servers = varek_baseline.mcp_servers(getattr(args, "mcp", None) or [], cwd, tmp)       # v1.31
-        text = varek_baseline.generate(cwd, pw, tmp, prof, path=path, servers=servers)
+        text = varek_baseline.generate(cwd, pw, tmp, prof, path=path, servers=servers,
+                                       ttys=varek_baseline.own_ttys())
     except varek_baseline.BaselineError as e:
         raise CliError(str(e))
     notes = [f"the agent runs as {pw.pw_name} ({why_user})",
@@ -1298,6 +1299,11 @@ def cmd_run(args):
         try:
             policy = varek_baseline.store(text)
             env = varek_baseline.agent_env(pw, tmp, args.env or [], os.environ, path)
+            # v1.29 review: the Warden records the operator from sudo's
+            # variables, which the agent's clean environment leaves out
+            for k in ("SUDO_UID", "SUDO_GID", "SUDO_USER"):
+                if k in os.environ and k not in env:
+                    env[k] = os.environ[k]
         except (varek_baseline.BaselineError, OSError) as e:
             raise CliError(str(e))
         label = f"the baseline policy for {os.getcwd()}" + (f", profile {prof}" if prof else "")

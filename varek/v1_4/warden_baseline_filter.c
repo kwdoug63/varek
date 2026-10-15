@@ -288,6 +288,34 @@ static const char *kAdmit[];
 // with argument rules (ioctl's commands, kill of a group, clone's namespace
 // bits, setsockopt's routing options, sendto, unshare, clone3,
 // io_uring_setup) keeps them: what they refuse stays refused.
+//
+// v1.29 review: never the calls that reach a file by a name or a handle
+// (the Warden's checks of the protected objects and kernel filesystems are
+// made on opens and changes it mediates; openat2 or creat would read or
+// write the verdict stream past them), other processes, or the system. Those
+// stay refused (EPERM), as when enforcing, and are not recorded; so are the
+// changes by name and stat/lstat under a policy before 1.29, which the
+// Warden mediates only from 1.29.
+static const char *const kDryNever[] = {
+    "creat", "openat2", "open_by_handle_at", "name_to_handle_at", "uselib",
+    "link", "linkat", "symlink", "symlinkat", "mknod", "mknodat",
+    "chown", "fchown", "fchownat", "lchown", "utime", "utimes", "futimesat",
+    "setxattr", "lsetxattr", "fsetxattr", "removexattr", "lremovexattr", "fremovexattr",
+    "getxattr", "lgetxattr", "fgetxattr", "listxattr", "llistxattr", "flistxattr",
+    "setxattrat", "getxattrat", "listxattrat", "removexattrat", "file_getattr", "file_setattr",
+    "inotify_add_watch", "fanotify_init", "fanotify_mark", "statfs", "ustat", "sysfs",
+    "statmount", "listmount", "mount_setattr", "fspick", "lookup_dcookie", "nfsservctl",
+    "acct", "chroot", "pivot_root", "swapon", "swapoff", "quotactl", "quotactl_fd",
+    "kcmp", "migrate_pages", "move_pages", "process_madvise", "process_mrelease",
+    "pidfd_send_signal", "tkill", "rt_sigqueueinfo", "rt_tgsigqueueinfo",
+    "reboot", "sethostname", "setdomainname", "settimeofday", "clock_settime", "clock_adjtime",
+    "adjtimex", "syslog", "iopl", "ioperm", "vhangup", "_sysctl",
+    "mq_open", "mq_unlink", "mq_timedsend", "mq_timedreceive", "mq_notify", "mq_getsetattr",
+    "msgget", "msgsnd", "msgrcv", "msgctl", "semget", "semop", "semtimedop", "semctl",
+    "shmget", "shmat", "shmdt", "shmctl",
+    NULL
+};
+
 static int add_dry_rest(scmp_filter_ctx ctx, int file_changes) {
     static const char *const kConditional[] = { "clone", "clone3", "ioctl", "kill", "sendto", "setsockopt",
                                                 "unshare", "io_uring_setup", NULL };
@@ -295,9 +323,9 @@ static int add_dry_rest(scmp_filter_ctx ctx, int file_changes) {
         char *n = seccomp_syscall_resolve_num_arch(SCMP_ARCH_NATIVE, nr);
         if (!n) continue;
         bool named = in_list(kHardDeny, n) || in_list(kMediate, n) || in_list(kAdmit, n) ||
-                     in_list((const char **)kConditional, n) ||
-                     (file_changes && (in_list(kChange, n) || in_list(kChangeAdmit, n) ||
-                                       in_list(kMediate129, n) || in_list(kAdmit129, n) ||
+                     in_list((const char **)kConditional, n) || in_list((const char **)kDryNever, n) ||
+                     in_list(kChange, n) || in_list(kMediate129, n) ||
+                     (file_changes && (in_list(kChangeAdmit, n) || in_list(kAdmit129, n) ||
                                        !strcmp(n, "prctl")));
         free(n);
         if (named) continue;
