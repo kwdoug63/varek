@@ -659,7 +659,7 @@ static int proxy_dial(int s, int dom, const struct sockaddr_storage *to, socklen
     if (wp_announce(&g_proxy, g_proxy_conns, from, tid, a->dialed) < 0) return -(errno ? errno : EIO);
     {                                            /* v1.26 review: the port it may be reported on */
         const char *c = strrchr(a->dialed, ':');
-        px_handed_off(g_proxy_conns, c ? (unsigned)strtoul(c + 1, NULL, 10) : 0);
+        px_handed_off(g_proxy_conns, c ? (unsigned)strtoul(c + 1, NULL, 10) : 0, a->subject);
     }
     return connect(s, (const struct sockaddr *)to, tl) < 0 ? -errno : 0;
 }

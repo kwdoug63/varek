@@ -114,7 +114,7 @@ check "lint is silent on a credential a rule carries" sh -c "! '$VDP' '$OUT/l.tx
 if [ -z "$WARDEN" ]; then
     skip "the Warden's checks (no warden binary given)"
 else
-    check "the Warden reports 1.28.0" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | grep -q 'VAREK Warden  1.28.0'"
+    check "the Warden reports 1.28 (1.28.0 or a later patch)" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | grep -Eq 'VAREK Warden  1\.28\.[0-9]+'"
     printf '%b' "$(Q 'credential=k header=Authorization:Bearer')" > "$OUT/w.txt"
     "$WARDEN" "$OUT/w.txt" --check-startup > "$OUT/w.out" 2>&1; echo $? > "$OUT/w.rc"
     check "--check-startup accepts a policy that names a credential, and lists it" \

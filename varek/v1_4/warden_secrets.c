@@ -74,7 +74,64 @@ static bool send_all(int fd, const void *m, size_t n) {
 int ws_fetch(ws_t *w, const char *conf, size_t n, const int *store, const char *const *ref,
              ws_meta_t *meta, char (*files)[4096], size_t *nfiles, int timeout_ms,
              char *why, size_t wn) {
+    return ws_fetch_id(w, conf, n, store, ref, meta, files, nfiles, NULL, timeout_ms, why, wn);
+}
+
+/* v1.28.1: a string from the helper that is recorded: NUL-terminated within
+ * its field, printable ASCII */
+static bool printable_field(const char *s, size_t cap, bool nonempty) {
+    const char *z = memchr(s, '\0', cap);
+    if (!z || (nonempty && z == s)) return false;
+    for (; s < z; s++) if (*s < 0x20 || *s > 0x7e) return false;
+    return true;
+}
+
+static bool hex64(const char *s) {
+    return strlen(s) == 64 && strspn(s, "0123456789abcdef") == 64;
+}
+
+/* v1.28.1: the helper's identity message, checked as the Warden records it */
+static bool identity_ok(const struct ws_identity *m, const ws_idreq_t *idr) {
+    if (!printable_field(m->why, sizeof m->why, false)) return false;
+    if (!m->ok) return true;
+    if (m->has_user != (idr->token != NULL) || m->has_svid != (idr->svid != NULL)) return false;
+    if (m->has_user) {
+        /* v1.28.1 review: the algorithm one of the four, the times NumericDates
+         * the helper can produce (under 2^53) */
+        if (m->issuer >= idr->nissuers || !printable_field(m->sub, sizeof m->sub, true) ||
+            !printable_field(m->jti, sizeof m->jti, false) || !printable_field(m->alg, sizeof m->alg, true) ||
+            !printable_field(m->kid, sizeof m->kid, false) || !hex64(m->token_sha256) || m->nact > WS_MAX_ACTORS ||
+            m->exp <= 0 || m->exp >= (int64_t)1 << 53 || m->iat < -1 || m->iat >= (int64_t)1 << 53 ||
+            m->nbf < -1 || m->nbf >= (int64_t)1 << 53 ||
+            (strcmp(m->alg, "RS256") && strcmp(m->alg, "PS256") && strcmp(m->alg, "ES256") && strcmp(m->alg, "EdDSA")))
+            return false;
+        for (uint32_t i = 0; i < m->nact; i++)
+            if (!printable_field(m->act[i].sub, sizeof m->act[i].sub, true) ||
+                !printable_field(m->act[i].iss, sizeof m->act[i].iss, false))
+                return false;
+    }
+    if (m->has_svid) {
+        if (m->spiffe >= idr->nspiffe || !printable_field(m->spiffe_id, sizeof m->spiffe_id, true) ||
+            !hex64(m->svid_sha256))
+            return false;
+        /* spiffe://DOMAIN/... with the policy's domain */
+        const char *d = idr->spiffe[m->spiffe].domain;
+        size_t dl = strlen(d);
+        if (strncmp(m->spiffe_id, "spiffe://", 9) || strncmp(m->spiffe_id + 9, d, dl) || m->spiffe_id[9 + dl] != '/')
+            return false;
+    }
+    return true;
+}
+
+int ws_fetch_id(ws_t *w, const char *conf, size_t n, const int *store, const char *const *ref,
+                ws_meta_t *meta, char (*files)[4096], size_t *nfiles, const ws_idreq_t *idr,
+                int timeout_ms, char *why, size_t wn) {
     *nfiles = 0;
+    bool want_id = idr && (idr->token || idr->svid), got_id = false;
+    if (idr && (idr->nissuers > WS_MAX_ISSUERS || idr->nspiffe > WS_MAX_SPIFFE)) {
+        snprintf(why, wn, "too many trusted issuers or trust domains");
+        return -1;
+    }
     if (w->ctl < 0 || n > WS_MAX_CREDS) { snprintf(why, wn, "the helper is not running"); return -1; }
     struct ws_setup su;
     memset(&su, 0, sizeof su);
@@ -82,7 +139,29 @@ int ws_fetch(ws_t *w, const char *conf, size_t n, const int *store, const char *
     su.ncreds = (uint32_t)n;
     if (strlen(conf) >= sizeof su.conf) { snprintf(why, wn, "the configuration path is too long"); return -1; }
     memcpy(su.conf, conf, strlen(conf) + 1);
+    if (want_id) {
+        if ((idr->token && strlen(idr->token) >= sizeof su.token) || (idr->svid && strlen(idr->svid) >= sizeof su.svid)) {
+            snprintf(why, wn, "the token's or the SVID's path is too long");
+            return -1;
+        }
+        if (idr->token) memcpy(su.token, idr->token, strlen(idr->token) + 1);
+        if (idr->svid) memcpy(su.svid, idr->svid, strlen(idr->svid) + 1);
+        su.nissuers = (uint32_t)idr->nissuers;
+        su.nspiffe = (uint32_t)idr->nspiffe;
+    }
     if (!send_all(w->ctl, &su, sizeof su)) { snprintf(why, wn, "the helper did not take its setup"); return -1; }
+    for (size_t i = 0; want_id && i < idr->nissuers; i++) {
+        struct ws_issuer m = idr->issuers[i];
+        m.type = WS_MSG_ISSUER;
+        m.index = (uint32_t)i;
+        if (!send_all(w->ctl, &m, sizeof m)) { snprintf(why, wn, "the helper did not take issuer %zu", i); return -1; }
+    }
+    for (size_t i = 0; want_id && i < idr->nspiffe; i++) {
+        struct ws_spiffe m = idr->spiffe[i];
+        m.type = WS_MSG_SPIFFE;
+        m.index = (uint32_t)i;
+        if (!send_all(w->ctl, &m, sizeof m)) { snprintf(why, wn, "the helper did not take trust domain %zu", i); return -1; }
+    }
     for (size_t i = 0; i < n; i++) {
         struct ws_cred c;
         memset(&c, 0, sizeof c);
@@ -102,7 +181,7 @@ int ws_fetch(ws_t *w, const char *conf, size_t n, const int *store, const char *
         int pr = poll(&pf, 1, (int)left);
         if (pr < 0 && errno == EINTR) continue;
         if (pr <= 0) continue;
-        union { struct ws_file f; struct ws_result r; struct ws_ready y; uint32_t type; } m;
+        static union { struct ws_file f; struct ws_result r; struct ws_ready y; struct ws_identity i; uint32_t type; } m;
         union { char b[CMSG_SPACE(sizeof(struct ucred))]; struct cmsghdr al; } cb;
         struct iovec v = { &m, sizeof m };
         struct msghdr mh = { .msg_iov = &v, .msg_iovlen = 1, .msg_control = cb.b, .msg_controllen = sizeof cb.b };
@@ -111,8 +190,21 @@ int ws_fetch(ws_t *w, const char *conf, size_t n, const int *store, const char *
         if (k <= 0) { snprintf(why, wn, "the helper ended before it was ready"); return -1; }
         if ((size_t)k < sizeof m.type) goto bad;
         if (m.type == WS_MSG_FILE && k == (ssize_t)sizeof m.f) {
-            if (*nfiles >= WS_MAX_FILES || !memchr(m.f.path, '\0', sizeof m.f.path) || m.f.path[0] != '/') goto bad;
+            if (*nfiles >= WS_MAX_FILES || !memchr(m.f.path, '\0', sizeof m.f.path) || m.f.path[0] != '/' ||
+                m.f.kind > WS_FILE_TRUSTED)
+                goto bad;
+            if (idr && idr->kinds) idr->kinds[*nfiles] = m.f.kind;
+            else if (m.f.kind != WS_FILE_SECRET) goto bad;
             memcpy(files[(*nfiles)++], m.f.path, strlen(m.f.path) + 1);
+        } else if (m.type == WS_MSG_IDENTITY && k == (ssize_t)sizeof m.i) {
+            /* v1.28.1: once, before the ready message, and only when asked */
+            if (!want_id || got_id || !identity_ok(&m.i, idr)) goto bad;
+            if (!m.i.ok) {
+                snprintf(why, wn, "%s", m.i.why);
+                return -1;
+            }
+            *idr->id = m.i;
+            got_id = true;
         } else if (m.type == WS_MSG_RESULT && k == (ssize_t)sizeof m.r) {
             if (m.r.index >= n || got[m.r.index] || !memchr(m.r.version, '\0', sizeof m.r.version) ||
                 !memchr(m.r.why, '\0', sizeof m.r.why))
@@ -144,7 +236,7 @@ int ws_fetch(ws_t *w, const char *conf, size_t n, const int *store, const char *
                 snprintf(why, wn, "the helper did not drop to its user (%u:%u)", (unsigned)w->uid, (unsigned)w->gid);
                 return -1;
             }
-            if (ngot != n || m.y.n != n) goto bad;
+            if (ngot != n || m.y.n != n || want_id != got_id) goto bad;
             w->pid = cr.pid;
             return 0;
         } else {

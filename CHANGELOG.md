@@ -9,6 +9,40 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.28.1] - 2026-10-15 — Who each decision was for
+
+After `require warden 1.28`, `trust issuer URL audience AUD [jwks URL]`
+names an identity provider and `--on-behalf-of FILE` gives the run the
+user's token (a JWT, possibly from an OAuth 2.0 token exchange):
+`warden-secrets` verifies its signature against the issuer's keys fetched
+over verified HTTPS (RS256, PS256, ES256 or EdDSA; `none` and HMAC
+refused), its issuer, audience and times, and its `act` chain, and only the
+verified claims reach the Warden. `trust spiffe DOMAIN bundle PATH` and
+`--agent-svid FILE` verify the agent's X.509-SVID; `require on-behalf-of`
+refuses a run with no verified user. `subagent=NAME` on an `allow exec`
+rule makes the program it launches a sub-agent: the Warden gives it a
+control group (cgroup v2) of its own at its launch and attributes every
+call by its process's group, so a sub-agent's calls, and those of
+everything it starts, count as its own whatever it says about itself.
+Every decision record carries `obo` and `run_start` the verified chain and
+the operator; when the user's token expires the run is revoked (or, with
+`--on-behalf-of-expiry record`, recorded). `varek_audit.py` checks every
+record's chain against the launches and the policy; `varek runs`, `varek
+refusals --subagent/--user`, `varek policy show`, `varek doctor`, the
+preflight, the CycloneDX export and `varek bench --subagents` cover it. The
+chain is recorded, not enforced: no rule depends on it. `vault_ca` and
+`aws_ca` must be root-owned and not writable by others. The two faults the
+shared soak's trial found are fixed here too. The Warden reports version
+1.28.1; the grammar stays 1.28.
+
+Reviewed by AI review agents (not a human or third-party review); the
+shared 24-hour soak (with v1.29.0 and v1.31.0) passed on a 2 GB host: an
+agent acting for a verified user, 1,291 tasks, each nested sub-agent's
+calls attributed to it, 144 probes held, the run revoked when the token
+expired. See `RELEASE-v1.28.1.md` for the tests, latency, the review's
+findings, compatibility and known limits, and
+`docs/security/v1.28.1-delegation-chain.md` for the design.
+
 ## [1.28.0] - 2026-10-15 — The agent holds only placeholders
 
 After `require warden 1.28`, `credential NAME from STORE:REF` names a

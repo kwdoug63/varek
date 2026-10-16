@@ -35,6 +35,12 @@
 //                         aws_session_token, `key = value` (else the instance's role,
 //                         through the metadata service, IMDSv2)
 //   aws_imds              the metadata service's base URL (default http://169.254.169.254)
+//   oidc_ca               v1.28.1: a PEM CA bundle to verify token issuers with (else the
+//                         host's); with no credentials and no such file, the host's
+//
+// v1.28.1 (docs/security/v1.28.1-delegation-chain.md, section 2): it also
+// verifies the user's token and the agent's X.509-SVID; see "identities"
+// below.
 
 #include "warden_secrets.h"
 
@@ -59,8 +65,13 @@
 #include <unistd.h>
 #include <grp.h>
 
+#include <openssl/core_names.h>
+#include <openssl/ec.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/param_build.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
@@ -82,14 +93,24 @@ static unsigned char *g_arena;
 static size_t g_arena_len;
 static struct { size_t off, len; } g_val[WS_MAX_CREDS];
 static char *g_vault_token;           /* the arena's last page */
+static char *g_user_token;            /* v1.28.1: the user's token, after it (WS_MAX_TOKEN + 1) */
+/* v1.28.1 review: and its decoded parts, while it is checked */
+#define HDR_MAX 4096
+#define SIG_MAX 1024
+static char *g_hdr, *g_pay;
+static unsigned char *g_sig;
 
 static int arena_init(void) {
-    g_arena_len = VALUES_LEN + TOKEN_MAX;
+    g_arena_len = VALUES_LEN + TOKEN_MAX + WS_MAX_TOKEN + 1 + HDR_MAX + WS_MAX_TOKEN + SIG_MAX;
     g_arena = mmap(NULL, g_arena_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (g_arena == MAP_FAILED) { g_arena = NULL; return -1; }
     if (mlock(g_arena, g_arena_len) < 0) return -1;
     (void)madvise(g_arena, g_arena_len, MADV_DONTDUMP);
     g_vault_token = (char *)g_arena + VALUES_LEN;
+    g_user_token = g_vault_token + TOKEN_MAX;
+    g_hdr = g_user_token + WS_MAX_TOKEN + 1;
+    g_pay = g_hdr + HDR_MAX;
+    g_sig = (unsigned char *)g_pay + WS_MAX_TOKEN;
     return 0;
 }
 
@@ -99,6 +120,10 @@ static void arena_clear(void) {
 
 static void token_clear(void) {
     if (g_vault_token) OPENSSL_cleanse(g_vault_token, TOKEN_MAX);
+}
+
+static void user_token_clear(void) {
+    if (g_user_token) OPENSSL_cleanse(g_user_token, WS_MAX_TOKEN + 1);
 }
 
 /* Step 4: the run's Vault leases (a credential's index is its slot) */
@@ -130,10 +155,11 @@ static bool ctl_send(const void *m, size_t n) {
     return r == (ssize_t)n;
 }
 
-static void report_file(const char *path) {
+static void report_file(const char *path, uint32_t kind) {
     struct ws_file f;
     memset(&f, 0, sizeof f);
     f.type = WS_MSG_FILE;
+    f.kind = kind;
     snprintf(f.path, sizeof f.path, "%s", path);
     ctl_send(&f, sizeof f);
 }
@@ -158,10 +184,11 @@ static void report(unsigned idx, bool ok, const char *version, size_t len, const
 
 /* Read a file that must be regular, owned by root and readable by no group
  * or other user, into buf (at most cap bytes). The path is reported to the
- * Warden. 0, or -1 with why. */
-static int read_private(const char *path, unsigned char *buf, size_t cap, size_t *len, struct stat *out,
-                        char *why, size_t wn) {
-    report_file(path);
+ * Warden. 0, or -1 with why. v1.28.1: kind WS_FILE_TRUSTED (a trust bundle)
+ * is a file writable by no group or other user instead; anyone may read it. */
+static int read_file(const char *path, uint32_t kind, unsigned char *buf, size_t cap, size_t *len, struct stat *out,
+                     char *why, size_t wn) {
+    report_file(path, kind);
     /* v1.28 review: every directory above it root's, and writable by no other
      * user unless sticky (as /tmp): no one else can put another file at the
      * name between the policy's checks and this read */
@@ -171,6 +198,15 @@ static int read_private(const char *path, unsigned char *buf, size_t cap, size_t
     char *sl = strrchr(dir, '/');
     if (sl == dir) sl[1] = '\0'; else *sl = '\0';
     if (!realpath(dir, real)) { snprintf(why, wn, "cannot open %.300s: %s", path, strerror(errno)); return -1; }
+    /* v1.28.1 review: the file is opened in the directory that was checked
+     * (its resolved path), not through the name given, which a symlink
+     * above it could point elsewhere after the check */
+    char checked[PATH_MAX + 2];
+    const char *base = strrchr(path, '/') + 1;
+    if (!*base || (size_t)snprintf(checked, sizeof checked, "%s/%s", strcmp(real, "/") ? real : "", base) >= sizeof checked) {
+        snprintf(why, wn, "%.300s is not a file's path", path);
+        return -1;
+    }
     for (char *c = real + strlen(real); ; ) {
         struct stat ds;
         if (stat(real[0] ? real : "/", &ds) < 0 || ds.st_uid != 0 ||
@@ -183,7 +219,8 @@ static int read_private(const char *path, unsigned char *buf, size_t cap, size_t
         while (c > real && *c != '/') c--;
         *c = '\0';                                       /* up one ("" is /) */
     }
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY);
+    /* review: O_NONBLOCK, so a FIFO put at the name cannot hold the helper */
+    int fd = open(checked, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) { snprintf(why, wn, "cannot open %s: %s", path, strerror(errno)); return -1; }
     struct stat st;
     if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
@@ -191,9 +228,10 @@ static int read_private(const char *path, unsigned char *buf, size_t cap, size_t
         close(fd);
         return -1;
     }
-    if (st.st_uid != 0 || (st.st_mode & 077)) {
-        snprintf(why, wn, "%s must be owned by root and readable by no group or other user (it is %u, mode %03o)",
-                 path, (unsigned)st.st_uid, (unsigned)(st.st_mode & 0777));
+    if (st.st_uid != 0 || (st.st_mode & (kind == WS_FILE_TRUSTED ? 022 : 077))) {
+        snprintf(why, wn, "%s must be owned by root and %s by no group or other user (it is %u, mode %03o)",
+                 path, kind == WS_FILE_TRUSTED ? "writable" : "readable",
+                 (unsigned)st.st_uid, (unsigned)(st.st_mode & 0777));
         close(fd);
         return -1;
     }
@@ -221,6 +259,11 @@ static int read_private(const char *path, unsigned char *buf, size_t cap, size_t
     return 0;
 }
 
+static int read_private(const char *path, unsigned char *buf, size_t cap, size_t *len, struct stat *out,
+                        char *why, size_t wn) {
+    return read_file(path, WS_FILE_SECRET, buf, cap, len, out, why, wn);
+}
+
 /* One trailing newline (LF or CR LF) is not part of a value kept in a file. */
 static size_t chomp(const unsigned char *b, size_t n) {
     if (n && b[n - 1] == '\n') n--;
@@ -233,6 +276,7 @@ static size_t chomp(const unsigned char *b, size_t n) {
 static struct {
     char vault_addr[512], vault_token_file[4096], vault_ca[4096];
     char aws_region[64], aws_endpoint[512], aws_ca[4096], aws_credentials_file[4096], aws_imds[512];
+    char oidc_ca[4096];               /* v1.28.1: a PEM CA bundle to verify issuers with (else the host's) */
 } g_conf;
 
 static struct { char id[256], secret[256], token[4096]; bool have; } g_aws;
@@ -277,7 +321,7 @@ static int conf_key(const char *k, const char *v, char *why, size_t wn) {
     static const struct { const char *key; size_t off, cap; } kKeys[] = {
 #define K(f) { #f, offsetof(__typeof__(g_conf), f), sizeof g_conf.f }
         K(vault_addr), K(vault_token_file), K(vault_ca), K(aws_region), K(aws_endpoint), K(aws_ca),
-        K(aws_credentials_file), K(aws_imds),
+        K(aws_credentials_file), K(aws_imds), K(oidc_ca),
 #undef K
     };
     for (size_t i = 0; i < sizeof kKeys / sizeof kKeys[0]; i++) {
@@ -351,6 +395,16 @@ static long long mono_ms(void) {
     return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
+/* v1.28.1 review: the start's network work ends by one deadline, inside the
+ * Warden's 30 s wait, so a slow server is named (0: none, after the start) */
+static long long g_deadline;
+
+static int io_ms(void) {
+    if (!g_deadline) return IO_TIMEOUT_MS;
+    long long left = g_deadline - mono_ms();
+    return left <= 0 ? 0 : left < IO_TIMEOUT_MS ? (int)left : IO_TIMEOUT_MS;
+}
+
 static int tcp_connect(const struct url *u, char *why, size_t wn) {
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM }, *res = NULL;
     int e = getaddrinfo(u->host, u->port, &hints, &res);
@@ -364,7 +418,8 @@ static int tcp_connect(const struct url *u, char *why, size_t wn) {
             struct pollfd pf = { .fd = fd, .events = POLLOUT };
             int soerr = 0;
             socklen_t sl = sizeof soerr;
-            if (poll(&pf, 1, IO_TIMEOUT_MS) == 1 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0 && soerr == 0)
+            if (io_ms() > 0 && poll(&pf, 1, io_ms()) == 1 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0 &&
+                soerr == 0)
                 break;
         }
         close(fd);
@@ -374,7 +429,8 @@ static int tcp_connect(const struct url *u, char *why, size_t wn) {
     if (fd < 0) { snprintf(why, wn, "cannot connect to %.100s:%s", u->host, u->port); return -1; }
     int fl = fcntl(fd, F_GETFL);
     fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
-    struct timeval tv = { .tv_sec = IO_TIMEOUT_MS / 1000 };
+    int ms = io_ms() > 0 ? io_ms() : 1;
+    struct timeval tv = { .tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     return fd;
@@ -383,6 +439,53 @@ static int tcp_connect(const struct url *u, char *why, size_t wn) {
 /* One request; the response's status and body (chunked or not), at most
  * RESP_MAX. ca: a PEM bundle, or NULL for the host's trust store. allow_plain:
  * plain HTTP to this host is allowed. 0, or -1 with why. */
+/* v1.28.1 review: each CA file the configuration names, read as root as a
+ * trusted file (root-owned, writable by no other user, reported to the
+ * Warden, which refuses a policy that lets the agent write it) and kept
+ * here; a connection is verified against the one its key names */
+static struct { char path[4096]; X509_STORE *store; } g_ca[3];
+
+static X509_STORE *ca_store(const char *path) {
+    for (size_t i = 0; i < sizeof g_ca / sizeof g_ca[0]; i++)
+        if (g_ca[i].store && !strcmp(g_ca[i].path, path)) return g_ca[i].store;
+    return NULL;
+}
+
+static int no_passphrase(char *buf, int size, int rw, void *u);
+
+/* Read a CA bundle (as root): 0, or -1 with why */
+static int ca_load(const char *path, char *why, size_t wn) {
+    if (ca_store(path)) return 0;
+    size_t slot = 0;
+    while (slot < sizeof g_ca / sizeof g_ca[0] && g_ca[slot].store) slot++;
+    if (slot == sizeof g_ca / sizeof g_ca[0] || strlen(path) >= sizeof g_ca[0].path) {
+        snprintf(why, wn, "too many CA files, or a path too long");
+        return -1;
+    }
+    static unsigned char buf[1 << 20];
+    size_t bl = 0;
+    char rw[512];
+    if (read_file(path, WS_FILE_TRUSTED, buf, sizeof buf, &bl, NULL, rw, sizeof rw) < 0) {
+        snprintf(why, wn, "its CA file: %.400s", rw);
+        return -1;
+    }
+    X509_STORE *st = X509_STORE_new();
+    BIO *b = BIO_new_mem_buf(buf, (int)bl);
+    int n = 0;
+    for (X509 *x; st && b && (x = PEM_read_bio_X509(b, NULL, no_passphrase, NULL)); X509_free(x))
+        n += X509_STORE_add_cert(st, x) == 1;
+    BIO_free(b);
+    ERR_clear_error();
+    if (!n) {
+        X509_STORE_free(st);
+        snprintf(why, wn, "the CA %.300s holds no certificate", path);
+        return -1;
+    }
+    memcpy(g_ca[slot].path, path, strlen(path) + 1);
+    g_ca[slot].store = st;
+    return 0;
+}
+
 static int http_do(const struct url *u, const char *ca, bool allow_plain, const char *method, const char *path,
                    const char *headers, const char *body, size_t blen, int *status, char **out, size_t *olen,
                    char *why, size_t wn) {
@@ -402,7 +505,8 @@ static int http_do(const struct url *u, const char *ca, bool allow_plain, const 
     if (u->tls) {
         ctx = SSL_CTX_new(TLS_client_method());
         if (!ctx || !SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION)) { snprintf(why, wn, "TLS setup failed"); goto done; }
-        if (ca ? SSL_CTX_load_verify_locations(ctx, ca, NULL) != 1 : SSL_CTX_set_default_verify_paths(ctx) != 1) {
+        if (ca && ca_store(ca)) SSL_CTX_set1_cert_store(ctx, ca_store(ca));
+        if (ca ? !ca_store(ca) : SSL_CTX_set_default_verify_paths(ctx) != 1) {
             snprintf(why, wn, "cannot load the CA %s", ca ? ca : "(the host's trust store)");
             goto done;
         }
@@ -441,7 +545,7 @@ static int http_do(const struct url *u, const char *ca, bool allow_plain, const 
     buf = malloc(RESP_MAX + 1);
     if (!buf) { snprintf(why, wn, "out of memory"); goto done; }
     size_t got = 0;
-    long long end = mono_ms() + IO_TIMEOUT_MS;
+    long long end = mono_ms() + (io_ms() > 0 ? io_ms() : 1);
     for (;;) {
         if (got == RESP_MAX) { snprintf(why, wn, "the response from %.100s is over 1 MiB", u->host); goto done; }
         int r = u->tls ? SSL_read(ssl, buf + got, (int)(RESP_MAX - got)) : (int)recv(fd, buf + got, RESP_MAX - got, 0);
@@ -993,6 +1097,635 @@ static int leases_wait(void) {
     return next - now > 3600000 ? 3600000 : (int)(next - now);
 }
 
+/* ---- v1.28.1: identities (docs/security/v1.28.1-delegation-chain.md, section 2) ----
+ *
+ * The user's token: one JWT (compact form) in a file held as a file store.
+ * Its header names the algorithm: RS256, PS256 (salt the hash's length),
+ * ES256 or EdDSA (Ed25519); `none` and every HMAC algorithm are refused, as
+ * is any other, and a `crit` header. Keys a token carries or points to (jwk,
+ * jku, x5c, x5u) are never used: the keys are the issuer's, fetched over
+ * verified HTTPS from the `jwks` URL the policy names or the issuer's
+ * discovery document (whose `issuer` must be the policy's, and whose
+ * `jwks_uri` must be https). The key is the one whose `kid` the token names,
+ * or, when it names none, the issuer's only key for its algorithm. Then:
+ * `iss` one the policy trusts, `aud` (a string or an array) holding that
+ * issuer's audience, `exp` at least 60 s ahead, `nbf` and `iat` not more
+ * than 60 s ahead, `sub` given; an `act` claim a chain of actors (RFC 8693),
+ * each with its `sub` (and its `iss` if given), at most 8 deep. Every claim
+ * recorded is printable ASCII, and a claim the checks read may appear once.
+ *
+ * The agent's X.509-SVID: a PEM file with the leaf certificate first, any
+ * intermediates, and its private key (a file store: it holds the key). The
+ * leaf has exactly one URI SAN, a SPIFFE ID in a trust domain the policy
+ * trusts, is not a CA, may not sign certificates, chains (now) to that
+ * domain's bundle, and matches the key. Checked as root, before the drop:
+ * no network is needed. */
+
+static struct ws_issuer g_iss[WS_MAX_ISSUERS];
+static struct ws_spiffe g_spf[WS_MAX_SPIFFE];
+static uint32_t g_niss, g_nspf;
+static struct ws_identity g_id;
+
+#define LEEWAY_S 60
+
+/* base64url, unpadded, strict; the decoded length, or -1 */
+static long b64url(const char *s, size_t n, unsigned char *out, size_t cap) {
+    static signed char t[256];
+    if (!t['B']) {
+        memset(t, -1, sizeof t);
+        const char *a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        for (int i = 0; i < 64; i++) t[(unsigned char)a[i]] = (signed char)i;
+    }
+    if (n % 4 == 1) return -1;
+    size_t o = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (size_t i = 0; i < n; i++) {
+        int v = t[(unsigned char)s[i]];
+        if (v < 0) return -1;
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (o >= cap) return -1;
+            out[o++] = (unsigned char)(acc >> bits);
+        }
+    }
+    /* v1.28.1 review: the bits left over are zero (one encoding for each
+     * value, so a token's hash names it) */
+    if (bits && (acc & ((1u << bits) - 1))) return -1;
+    return (long)o;
+}
+
+/* how many times key appears in the object at p (-1: not an object) */
+static int jcount(const char *p, const char *e, const char *key) {
+    p = jws(p, e);
+    if (p >= e || *p != '{') return -1;
+    p = jws(p + 1, e);
+    if (p < e && *p == '}') return 0;
+    int n = 0;
+    for (;;) {
+        char k[256];
+        long kl = jstr(p, e, k, sizeof k - 1);
+        const char *ke = jskip(p, e, 0);
+        if (!ke || kl < 0) return -1;            /* review: a key jget could not read: unreadable */
+        k[kl] = '\0';
+        if ((size_t)kl == strlen(key) && !strcmp(k, key)) n++;
+        p = jws(ke, e);
+        if (p >= e || *p != ':') return -1;
+        p = jskip(p + 1, e, 0);
+        if (!p) return -1;
+        p = jws(p, e);
+        if (p < e && *p == ',') { p = jws(p + 1, e); continue; }
+        return n;
+    }
+}
+
+/* key's string value: 1, 0 when absent, -1 when not a string or too long
+ * (cap includes the NUL); a key given twice is -1 */
+static int jgets(const char *o, const char *e, const char *key, char *out, size_t cap) {
+    int c = jcount(o, e, key);
+    if (c == 0) return 0;
+    if (c != 1) return -1;
+    const char *v = jget(o, e, key);
+    long n = v ? jstr(v, e, out, cap - 1) : -1;
+    if (n < 0) return -1;
+    out[n] = '\0';
+    if (memchr(out, '\0', (size_t)n)) return -1;
+    return 1;
+}
+
+/* a NumericDate (seconds; a fraction is dropped): 1, 0 when absent, -1 when
+ * not a non-negative number below 2^53, or given twice */
+static int jgetn(const char *o, const char *e, const char *key, int64_t *out) {
+    int c = jcount(o, e, key);
+    if (c == 0) return 0;
+    if (c != 1) return -1;
+    const char *g = jget(o, e, key);
+    const char *v = g ? jws(g, e) : NULL;
+    if (!v || v >= e || !isdigit((unsigned char)*v)) return -1;
+    int64_t n = 0;
+    const char *q = v;
+    for (; q < e && isdigit((unsigned char)*q); q++) {
+        if (q - v >= 16) return -1;
+        n = n * 10 + (*q - '0');
+    }
+    if (q < e && *q == '.') for (q++; q < e && isdigit((unsigned char)*q); q++) { }
+    if (q < e && (*q == 'e' || *q == 'E')) return -1;
+    q = jws(q, e);                              /* review: nothing more in the number */
+    if (q < e && *q != ',' && *q != '}') return -1;
+    if (n >= (int64_t)1 << 53) return -1;
+    *out = n;
+    return 1;
+}
+
+/* the first element of the array at p, NULL when empty or not an array */
+static const char *jarr_first(const char *p, const char *e) {
+    p = jws(p, e);
+    if (p >= e || *p != '[') return NULL;
+    p = jws(p + 1, e);
+    return p < e && *p != ']' ? p : NULL;
+}
+
+static const char *jarr_next(const char *p, const char *e) {
+    p = jskip(p, e, 0);
+    if (!p) return NULL;
+    p = jws(p, e);
+    return p < e && *p == ',' ? jws(p + 1, e) : NULL;
+}
+
+static bool printable(const char *s) {
+    for (; *s; s++) if (*s < 0x20 || *s > 0x7e) return false;
+    return true;
+}
+
+/* text from outside, fit to print: printable ASCII, at most 100 bytes */
+static const char *shown(const char *s, char *buf, size_t cap) {
+    size_t i = 0;
+    for (; s[i] && i < 100 && i + 4 < cap; i++) buf[i] = s[i] >= 0x20 && s[i] <= 0x7e ? s[i] : '?';
+    if (s[i]) { buf[i++] = '.'; buf[i++] = '.'; buf[i++] = '.'; }
+    buf[i] = '\0';
+    return buf;
+}
+
+/* GET an https URL's JSON (200); 0, or -1 with why */
+static int get_json(const char *url, char **out, size_t *ol, char *why, size_t wn) {
+    struct url u;
+    char sb[128];
+    bool odd = false;
+    for (const char *c = url; *c; c++) odd |= *c <= 0x20 || *c >= 0x7f;     /* review: no space, CR or LF */
+    if (odd || strlen(url) >= 1024 || url_parse(url, &u) < 0 || !u.tls) {
+        snprintf(why, wn, "%s is not an https URL", shown(url, sb, sizeof sb));
+        return -1;
+    }
+    int st = 0;
+    if (http_do(&u, g_conf.oidc_ca[0] ? g_conf.oidc_ca : NULL, false, "GET", u.path[0] ? u.path : "/",
+                "Accept: application/json\r\n", "", 0, &st, out, ol, why, wn) < 0)
+        return -1;
+    if (st != 200) {
+        snprintf(why, wn, "%s answered %d", shown(url, sb, sizeof sb), st);
+        free(*out);
+        *out = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+enum { ALG_RS256 = 1, ALG_PS256, ALG_ES256, ALG_EDDSA };
+
+/* the key a JWK describes, for alg; NULL with why */
+static EVP_PKEY *jwk_key(const char *k, const char *e, int alg, char *why, size_t wn) {
+    char kty[16], crv[16], a[4096], b[4096];
+    unsigned char ab[1024], bb[1024];
+    EVP_PKEY *pk = NULL;
+    if (jgets(k, e, "kty", kty, sizeof kty) != 1) { snprintf(why, wn, "the issuer's key has no kty"); return NULL; }
+    if (alg == ALG_RS256 || alg == ALG_PS256) {
+        if (strcmp(kty, "RSA")) { snprintf(why, wn, "the issuer's key for the token is not an RSA key"); return NULL; }
+        long nl = jgets(k, e, "n", a, sizeof a) == 1 ? b64url(a, strlen(a), ab, sizeof ab) : -1;
+        long el = jgets(k, e, "e", b, sizeof b) == 1 ? b64url(b, strlen(b), bb, sizeof bb) : -1;
+        if (nl <= 0 || el <= 0 || el > 8) { snprintf(why, wn, "the issuer's RSA key is malformed"); return NULL; }
+        BIGNUM *n = BN_bin2bn(ab, (int)nl, NULL), *x = BN_bin2bn(bb, (int)el, NULL);
+        OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+        OSSL_PARAM *ps = NULL;
+        EVP_PKEY_CTX *c = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
+        if (n && x && bld && c && OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_N, n) &&
+            OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_E, x) && (ps = OSSL_PARAM_BLD_to_param(bld)) &&
+            EVP_PKEY_fromdata_init(c) == 1)
+            (void)EVP_PKEY_fromdata(c, &pk, EVP_PKEY_PUBLIC_KEY, ps);
+        OSSL_PARAM_free(ps);
+        OSSL_PARAM_BLD_free(bld);
+        EVP_PKEY_CTX_free(c);
+        BN_free(n);
+        BN_free(x);
+        if (pk && EVP_PKEY_get_bits(pk) < 2048) {
+            snprintf(why, wn, "the issuer's RSA key is shorter than 2048 bits");
+            EVP_PKEY_free(pk);
+            return NULL;
+        }
+    } else if (alg == ALG_ES256) {
+        if (strcmp(kty, "EC") || jgets(k, e, "crv", crv, sizeof crv) != 1 || strcmp(crv, "P-256")) {
+            snprintf(why, wn, "the issuer's key for the token is not a P-256 key");
+            return NULL;
+        }
+        unsigned char pub[65] = { 4 };
+        long xl = jgets(k, e, "x", a, sizeof a) == 1 ? b64url(a, strlen(a), pub + 1, 32) : -1;
+        long yl = jgets(k, e, "y", b, sizeof b) == 1 ? b64url(b, strlen(b), pub + 33, 32) : -1;
+        if (xl != 32 || yl != 32) { snprintf(why, wn, "the issuer's P-256 key is malformed"); return NULL; }
+        OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
+        OSSL_PARAM *ps = NULL;
+        EVP_PKEY_CTX *c = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
+        if (bld && c && OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME, "prime256v1", 0) &&
+            OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY, pub, sizeof pub) &&
+            (ps = OSSL_PARAM_BLD_to_param(bld)) && EVP_PKEY_fromdata_init(c) == 1)
+            (void)EVP_PKEY_fromdata(c, &pk, EVP_PKEY_PUBLIC_KEY, ps);
+        OSSL_PARAM_free(ps);
+        OSSL_PARAM_BLD_free(bld);
+        EVP_PKEY_CTX_free(c);
+        if (pk) {                                         /* on the curve */
+            EVP_PKEY_CTX *pc = EVP_PKEY_CTX_new_from_pkey(NULL, pk, NULL);
+            int ok = pc && EVP_PKEY_public_check(pc) == 1;
+            EVP_PKEY_CTX_free(pc);
+            if (!ok) { EVP_PKEY_free(pk); pk = NULL; }
+        }
+    } else {
+        if (strcmp(kty, "OKP") || jgets(k, e, "crv", crv, sizeof crv) != 1 || strcmp(crv, "Ed25519")) {
+            snprintf(why, wn, "the issuer's key for the token is not an Ed25519 key");
+            return NULL;
+        }
+        long xl = jgets(k, e, "x", a, sizeof a) == 1 ? b64url(a, strlen(a), ab, sizeof ab) : -1;
+        if (xl == 32) pk = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, ab, 32);
+    }
+    if (!pk) snprintf(why, wn, "the issuer's key could not be read");
+    ERR_clear_error();
+    return pk;
+}
+
+/* the signature over the signing input, by alg; 1 good, 0 not */
+static int jws_verify(EVP_PKEY *pk, int alg, const char *in, size_t inl, const unsigned char *sig, size_t sl) {
+    unsigned char der[80];
+    if (alg == ALG_ES256) {                               /* JOSE's r || s, as DER */
+        if (sl != 64) return 0;
+        BIGNUM *r = BN_bin2bn(sig, 32, NULL), *s = BN_bin2bn(sig + 32, 32, NULL);
+        ECDSA_SIG *es = ECDSA_SIG_new();
+        if (!r || !s || !es || ECDSA_SIG_set0(es, r, s) != 1) { BN_free(r); BN_free(s); ECDSA_SIG_free(es); return 0; }
+        unsigned char *q = der;
+        int dl = i2d_ECDSA_SIG(es, NULL);
+        if (dl <= 0 || dl > (int)sizeof der) { ECDSA_SIG_free(es); return 0; }
+        dl = i2d_ECDSA_SIG(es, &q);
+        ECDSA_SIG_free(es);
+        sig = der;
+        sl = (size_t)dl;
+    }
+    EVP_MD_CTX *mc = EVP_MD_CTX_new();
+    EVP_PKEY_CTX *pc = NULL;
+    int ok = mc && EVP_DigestVerifyInit(mc, &pc, alg == ALG_EDDSA ? NULL : EVP_sha256(), NULL, pk) == 1;
+    if (ok && alg == ALG_RS256) ok = EVP_PKEY_CTX_set_rsa_padding(pc, RSA_PKCS1_PADDING) == 1;
+    if (ok && alg == ALG_PS256)
+        ok = EVP_PKEY_CTX_set_rsa_padding(pc, RSA_PKCS1_PSS_PADDING) == 1 &&
+             EVP_PKEY_CTX_set_rsa_pss_saltlen(pc, RSA_PSS_SALTLEN_DIGEST) == 1 &&
+             EVP_PKEY_CTX_set_rsa_mgf1_md(pc, EVP_sha256()) == 1;
+    if (ok) ok = EVP_DigestVerify(mc, sig, sl, (const unsigned char *)in, inl) == 1;
+    EVP_MD_CTX_free(mc);
+    ERR_clear_error();
+    return ok;
+}
+
+/* The user's token (g_user_token), as its own user. 0 with g_id filled, or
+ * -1 with why (the check that failed). */
+static int verify_token_parts(char *why, size_t wn) {
+    char sb[128], sb2[128];
+    const char *tok = g_user_token;
+    size_t tl = strlen(tok);
+    const char *d1 = memchr(tok, '.', tl), *d2 = d1 ? memchr(d1 + 1, '.', tl - (size_t)(d1 + 1 - tok)) : NULL;
+    if (!d1 || !d2 || memchr(d2 + 1, '.', tl - (size_t)(d2 + 1 - tok))) {
+        snprintf(why, wn, "it is not a JWT in compact form (three parts)");
+        return -1;
+    }
+    char *hdr = g_hdr, *pay = g_pay;
+    unsigned char *sig = g_sig;
+    long hl = b64url(tok, (size_t)(d1 - tok), (unsigned char *)hdr, HDR_MAX - 1);
+    long pl = b64url(d1 + 1, (size_t)(d2 - d1 - 1), (unsigned char *)pay, WS_MAX_TOKEN - 1);
+    long sl = b64url(d2 + 1, tl - (size_t)(d2 + 1 - tok), sig, SIG_MAX);
+    if (hl <= 0 || pl <= 0 || sl < 0) { snprintf(why, wn, "a part is not base64url"); return -1; }
+    hdr[hl] = pay[pl] = '\0';
+    const char *he = hdr + hl, *pe = pay + pl;
+    const char *hx = jskip(hdr, he, 0), *px = jskip(pay, pe, 0);
+    if (memchr(hdr, '\0', (size_t)hl) || memchr(pay, '\0', (size_t)pl) || !hx || !px ||
+        *jws(hdr, he) != '{' || jws(hx, he) != he || *jws(pay, pe) != '{' || jws(px, pe) != pe) {
+        snprintf(why, wn, "its header or claims are not one JSON object");
+        return -1;
+    }
+    /* v1.28.1 review: every member name readable (at most 255 bytes, its
+     * escapes valid), so a claim is found the same way it is counted */
+    if (jcount(hdr, he, "") < 0 || jcount(pay, pe, "") < 0) {
+        snprintf(why, wn, "its header or claims hold a member name over 255 bytes, or one that cannot be read");
+        return -1;
+    }
+    /* the algorithm, before any key */
+    char alg[32], kid[256] = "";
+    int a = jgets(hdr, he, "alg", alg, sizeof alg);
+    if (a != 1) { snprintf(why, wn, "its header names no algorithm"); return -1; }
+    if (!strcmp(alg, "none")) { snprintf(why, wn, "algorithm none is refused (an unsigned token)"); return -1; }
+    if (!strncmp(alg, "HS", 2)) { snprintf(why, wn, "algorithm %s is refused (HMAC: the key would be shared)", shown(alg, sb, sizeof sb)); return -1; }
+    int ai = !strcmp(alg, "RS256") ? ALG_RS256 : !strcmp(alg, "PS256") ? ALG_PS256 : !strcmp(alg, "ES256") ? ALG_ES256 :
+             !strcmp(alg, "EdDSA") ? ALG_EDDSA : 0;
+    if (!ai) { snprintf(why, wn, "algorithm %s is not one of RS256, PS256, ES256, EdDSA", shown(alg, sb, sizeof sb)); return -1; }
+    if (jcount(hdr, he, "crit") != 0) { snprintf(why, wn, "its header has crit (an extension this Warden does not know)"); return -1; }
+    int kr = jgets(hdr, he, "kid", kid, sizeof kid);
+    if (kr < 0 || (kr == 1 && (!kid[0] || !printable(kid)))) { snprintf(why, wn, "its key id (kid) is malformed"); return -1; }
+    /* the issuer, before its keys */
+    char iss[256];
+    if (jgets(pay, pe, "iss", iss, sizeof iss) != 1) { snprintf(why, wn, "it has no issuer (iss)"); return -1; }
+    uint32_t ix = g_niss;
+    for (uint32_t i = 0; i < g_niss; i++) if (!strcmp(g_iss[i].iss, iss)) { ix = i; break; }
+    if (ix == g_niss) {
+        snprintf(why, wn, "its issuer %s is not one the policy trusts", shown(iss, sb, sizeof sb));
+        return -1;
+    }
+    /* its keys: the policy's jwks URL, or the discovery document's */
+    char *doc = NULL, *ks = NULL;
+    size_t dl = 0, kl = 0;
+    char jwks[1100];
+    snprintf(jwks, sizeof jwks, "%s", g_iss[ix].jwks);
+    if (!jwks[0]) {
+        char disc[400], ub[1100];
+        size_t il = strlen(iss);
+        while (il && iss[il - 1] == '/') il--;
+        snprintf(disc, sizeof disc, "%.*s/.well-known/openid-configuration", (int)il, iss);
+        if (get_json(disc, &doc, &dl, ub, sizeof ub) < 0) {
+            snprintf(why, wn, "the issuer's discovery document: %.400s", ub);
+            return -1;
+        }
+        char diss[256];
+        int r1 = jgets(doc, doc + dl, "issuer", diss, sizeof diss);
+        int r2 = jgets(doc, doc + dl, "jwks_uri", jwks, sizeof jwks);
+        free(doc);
+        if (r1 != 1 || strcmp(diss, iss)) {
+            snprintf(why, wn, "the issuer's discovery document names another issuer (%s)", r1 == 1 ? shown(diss, sb2, sizeof sb2) : "none");
+            return -1;
+        }
+        if (r2 != 1) { snprintf(why, wn, "the issuer's discovery document has no jwks_uri"); return -1; }
+    }
+    {
+        char ub[1100];
+        if (get_json(jwks, &ks, &kl, ub, sizeof ub) < 0) { snprintf(why, wn, "the issuer's keys: %.400s", ub); return -1; }
+    }
+    const char *ke = ks + kl, *keys = jget(ks, ke, "keys");
+    const char *pick = NULL;
+    int ncompat = 0;
+    static const char *const kKty[] = { "", "RSA", "RSA", "EC", "OKP" };
+    for (const char *k = keys ? jarr_first(keys, ke) : NULL; k; k = jarr_next(k, ke)) {
+        char kk[256], kty[16], use[16], kalg[32];
+        if (*jws(k, ke) != '{') continue;
+        int r = jgets(k, ke, "kid", kk, sizeof kk);
+        /* review: a key named by kid but of another type is passed over (one
+         * kid may name keys of several types); none of the right type: refused below */
+        if (jgets(k, ke, "kty", kty, sizeof kty) != 1 || strcmp(kty, kKty[ai])) continue;
+        /* review: use and alg, when given, must be readable and match */
+        int ru = jgets(k, ke, "use", use, sizeof use), ra = jgets(k, ke, "alg", kalg, sizeof kalg);
+        if (ru < 0 || (ru == 1 && strcmp(use, "sig")) || ra < 0 || (ra == 1 && strcmp(kalg, alg))) continue;
+        if (kid[0]) {
+            if (r == 1 && !strcmp(kk, kid)) { pick = k; break; }
+        } else {
+            ncompat++;
+            pick = k;
+        }
+    }
+    if (!kid[0] && ncompat > 1) {
+        snprintf(why, wn, "it names no key (kid) and the issuer has %d keys for %s", ncompat, alg);
+        free(ks);
+        return -1;
+    }
+    if (!pick) {
+        if (kid[0]) snprintf(why, wn, "its key %s is not among the issuer's keys", shown(kid, sb, sizeof sb));
+        else snprintf(why, wn, "the issuer has no key for %s", alg);
+        free(ks);
+        return -1;
+    }
+    char kw[256];
+    EVP_PKEY *pk = jwk_key(pick, ke, ai, kw, sizeof kw);
+    free(ks);
+    if (!pk) { snprintf(why, wn, "%s", kw); return -1; }
+    int good = jws_verify(pk, ai, tok, (size_t)(d2 - tok), sig, (size_t)sl);
+    EVP_PKEY_free(pk);
+    if (!good) { snprintf(why, wn, "its signature does not verify with the issuer's key"); return -1; }
+    /* the claims (signed: the issuer's) */
+    char aud[256];
+    int c = jcount(pay, pe, "aud");
+    bool aud_ok = false;
+    if (c == 1) {
+        const char *ag = jget(pay, pe, "aud");
+        const char *av = ag ? jws(ag, pe) : NULL;
+        if (av && *av == '"') aud_ok = jgets(pay, pe, "aud", aud, sizeof aud) == 1 && !strcmp(aud, g_iss[ix].aud);
+        else for (const char *x = jarr_first(av, pe); x && !aud_ok; x = jarr_next(x, pe)) {
+            long n = jstr(x, pe, aud, sizeof aud - 1);
+            if (n >= 0) { aud[n] = '\0'; aud_ok = (size_t)n == strlen(g_iss[ix].aud) && !strcmp(aud, g_iss[ix].aud); }
+        }
+    }
+    if (!aud_ok) { snprintf(why, wn, "its audience (aud) does not hold %s", g_iss[ix].aud); return -1; }
+    int64_t exp = 0, nbf = -1, iat = -1, now = (int64_t)time(NULL);
+    if (jgetn(pay, pe, "exp", &exp) != 1) { snprintf(why, wn, "it has no expiry (exp)"); return -1; }
+    if (exp <= now) { snprintf(why, wn, "it expired %lld s ago", (long long)(now - exp)); return -1; }
+    if (exp < now + LEEWAY_S) { snprintf(why, wn, "it expires in %lld s, under 60 s", (long long)(exp - now)); return -1; }
+    int r = jgetn(pay, pe, "nbf", &nbf);
+    if (r < 0) { snprintf(why, wn, "its nbf is malformed"); return -1; }
+    if (r == 1 && nbf > now + LEEWAY_S) { snprintf(why, wn, "it is not valid for %lld s yet (nbf)", (long long)(nbf - now)); return -1; }
+    r = jgetn(pay, pe, "iat", &iat);
+    if (r < 0) { snprintf(why, wn, "its iat is malformed"); return -1; }
+    if (r == 1 && iat > now + LEEWAY_S) { snprintf(why, wn, "it was issued %lld s in the future (iat)", (long long)(iat - now)); return -1; }
+    if (jgets(pay, pe, "sub", g_id.sub, sizeof g_id.sub) != 1 || !g_id.sub[0]) {
+        snprintf(why, wn, "it has no subject (sub), or one longer than 255 bytes");
+        return -1;
+    }
+    if (!printable(g_id.sub)) { snprintf(why, wn, "its subject (sub) is not printable ASCII"); return -1; }
+    r = jgets(pay, pe, "jti", g_id.jti, sizeof g_id.jti);
+    if (r < 0 || !printable(g_id.jti)) { snprintf(why, wn, "its jti is malformed, or not printable ASCII"); return -1; }
+    /* act: the current actor, then the one it acted for, ... */
+    const char *o = pay;
+    for (uint32_t depth = 0;; depth++) {
+        int n = jcount(o, pe, "act");
+        if (n == 0) break;
+        if (n != 1) { snprintf(why, wn, "an act claim is given twice"); return -1; }
+        if (depth == WS_MAX_ACTORS) { snprintf(why, wn, "its act chain is nested deeper than %d", WS_MAX_ACTORS); return -1; }
+        const char *ag = jget(o, pe, "act");
+        o = ag ? jws(ag, pe) : NULL;
+        if (!o || o >= pe || *o != '{') { snprintf(why, wn, "an act claim is not an object"); return -1; }
+        struct ws_actor *ac = &g_id.act[depth];
+        if (jgets(o, pe, "sub", ac->sub, sizeof ac->sub) != 1 || !ac->sub[0] || !printable(ac->sub)) {
+            snprintf(why, wn, "actor %u of its act chain has no printable subject (sub)", depth + 1);
+            return -1;
+        }
+        if (jgets(o, pe, "iss", ac->iss, sizeof ac->iss) < 0 || !printable(ac->iss)) {
+            snprintf(why, wn, "actor %u of its act chain has a malformed iss", depth + 1);
+            return -1;
+        }
+        g_id.nact = depth + 1;
+    }
+    g_id.has_user = 1;
+    g_id.issuer = ix;
+    g_id.exp = exp;
+    g_id.iat = iat;
+    g_id.nbf = nbf;
+    snprintf(g_id.alg, sizeof g_id.alg, "%.15s", alg);
+    snprintf(g_id.kid, sizeof g_id.kid, "%s", kid);
+    sha256_hex(tok, tl, g_id.token_sha256);
+    return 0;
+}
+
+/* ... and nothing of it stays, whatever came of the checks */
+static int verify_token(char *why, size_t wn) {
+    int rc = verify_token_parts(why, wn);
+    OPENSSL_cleanse(g_hdr, HDR_MAX);
+    OPENSSL_cleanse(g_pay, WS_MAX_TOKEN);
+    OPENSSL_cleanse(g_sig, SIG_MAX);
+    return rc;
+}
+
+static int no_passphrase(char *buf, int size, int rw, void *u) { (void)buf; (void)size; (void)rw; (void)u; return -1; }
+
+/* A SPIFFE ID: spiffe://DOMAIN/PATH, the domain [a-z0-9.-_], each path
+ * segment [A-Za-z0-9.-_], none empty, `.` or `..`; at most 2048 bytes */
+static bool spiffe_id_ok(const char *s, size_t n, size_t *dlen) {
+    if (n > 2048 || n < 11 || strncmp(s, "spiffe://", 9)) return false;
+    const char *d = s + 9, *sl = memchr(d, '/', n - 9);
+    if (!sl || sl == d) return false;
+    for (const char *c = d; c < sl; c++)
+        if (!(islower((unsigned char)*c) || isdigit((unsigned char)*c) || *c == '.' || *c == '-' || *c == '_')) return false;
+    *dlen = (size_t)(sl - d);
+    const char *end = s + n, *seg = sl + 1;
+    if (seg >= end) return false;
+    for (const char *c = seg;; c++) {
+        if (c == end || *c == '/') {
+            size_t l = (size_t)(c - seg);
+            if (l == 0 || (l == 1 && seg[0] == '.') || (l == 2 && seg[0] == '.' && seg[1] == '.')) return false;
+            if (c == end) return true;
+            seg = c + 1;
+            continue;
+        }
+        if (!(isalnum((unsigned char)*c) || *c == '.' || *c == '-' || *c == '_')) return false;
+    }
+}
+
+/* The agent's SVID (as root). 0 with g_id's SVID part filled, or -1 with why. */
+static int verify_svid(const char *path, char *why, size_t wn) {
+    static unsigned char buf[65536];
+    size_t bl = 0;
+    char rw[512];
+    if (read_private(path, buf, sizeof buf, &bl, NULL, rw, sizeof rw) < 0) { snprintf(why, wn, "%.400s", rw); return -1; }
+    int rc = -1;
+    X509 *leaf = NULL;
+    STACK_OF(X509) *chain = sk_X509_new_null();
+    EVP_PKEY *key = NULL;
+    X509_STORE *store = NULL;
+    X509_STORE_CTX *ctx = NULL;
+    GENERAL_NAMES *san = NULL;
+    BIO *bio = BIO_new_mem_buf(buf, (int)bl);
+    for (X509 *x; bio && chain && (x = PEM_read_bio_X509(bio, NULL, no_passphrase, NULL)); ) {
+        if (!leaf) leaf = x;
+        else if (!sk_X509_push(chain, x)) X509_free(x);
+    }
+    BIO_free(bio);
+    bio = BIO_new_mem_buf(buf, (int)bl);
+    if (bio) key = PEM_read_bio_PrivateKey(bio, NULL, no_passphrase, NULL);
+    EVP_PKEY *key2 = key && bio ? PEM_read_bio_PrivateKey(bio, NULL, no_passphrase, NULL) : NULL;
+    BIO_free(bio);
+    /* review: one private key block, counted by its header (a second one that
+     * cannot be read is still a second key) */
+    int nkeys = 0;
+    for (size_t i = 0; i + 11 <= bl; i++)
+        if (!memcmp(buf + i, "-----BEGIN ", 11)) {
+            const unsigned char *eol = memchr(buf + i, '\n', bl - i);
+            size_t ll = eol ? (size_t)(eol - (buf + i)) : bl - i;
+            if (memmem(buf + i, ll, "PRIVATE KEY-----", 16)) nkeys++;
+        }
+    OPENSSL_cleanse(buf, sizeof buf);
+    ERR_clear_error();
+    if (!leaf) { snprintf(why, wn, "%.300s holds no certificate", path); goto out; }
+    if (!key || key2 || nkeys != 1) { snprintf(why, wn, "%.300s must hold exactly one private key (unencrypted)", path); goto out; }
+    /* its SPIFFE ID: the one URI SAN */
+    san = X509_get_ext_d2i(leaf, NID_subject_alt_name, NULL, NULL);
+    const char *id = NULL;
+    int idl = 0, nuri = 0;
+    for (int i = 0; san && i < sk_GENERAL_NAME_num(san); i++) {
+        GENERAL_NAME *g = sk_GENERAL_NAME_value(san, i);
+        if (g->type != GEN_URI) continue;
+        nuri++;
+        id = (const char *)ASN1_STRING_get0_data(g->d.uniformResourceIdentifier);
+        idl = ASN1_STRING_length(g->d.uniformResourceIdentifier);
+    }
+    size_t dlen = 0;
+    if (nuri != 1) { snprintf(why, wn, "its certificate has %d URI names; an SVID has exactly one", nuri); goto out; }
+    if (!spiffe_id_ok(id, (size_t)idl, &dlen) || memchr(id, '\0', (size_t)idl)) {
+        snprintf(why, wn, "its URI name is not a SPIFFE ID (spiffe://DOMAIN/PATH)");
+        goto out;
+    }
+    uint32_t sx = g_nspf;
+    for (uint32_t i = 0; i < g_nspf; i++)
+        if (strlen(g_spf[i].domain) == dlen && !strncmp(g_spf[i].domain, id + 9, dlen)) { sx = i; break; }
+    char sb[128], idc[2049];
+    memcpy(idc, id, (size_t)idl);
+    idc[idl] = '\0';
+    if (sx == g_nspf) { snprintf(why, wn, "its trust domain (%s) is not one the policy trusts", shown(idc, sb, sizeof sb)); goto out; }
+    if (X509_check_ca(leaf) != 0) { snprintf(why, wn, "its certificate is a CA's"); goto out; }
+    /* review: an X.509-SVID's leaf has basicConstraints (CA false) and a key
+     * usage with digitalSignature (the SPIFFE X.509-SVID standard) */
+    if (!(X509_get_extension_flags(leaf) & EXFLAG_BCONS)) {
+        snprintf(why, wn, "its certificate has no basicConstraints (an SVID's says CA:false)");
+        goto out;
+    }
+    uint32_t ku = X509_get_key_usage(leaf);
+    if (ku == UINT32_MAX || (ku & (KU_KEY_CERT_SIGN | KU_CRL_SIGN)) || !(ku & KU_DIGITAL_SIGNATURE)) {
+        snprintf(why, wn, "its certificate's key usage is not an SVID's (digitalSignature, no certificate or CRL signing)");
+        goto out;
+    }
+    if (X509_check_private_key(leaf, key) != 1) { snprintf(why, wn, "its key does not match its certificate"); goto out; }
+    /* the bundle for its trust domain */
+    {
+        static unsigned char bb[262144];
+        size_t bbl = 0;
+        if (read_file(g_spf[sx].bundle, WS_FILE_TRUSTED, bb, sizeof bb, &bbl, NULL, rw, sizeof rw) < 0) {
+            snprintf(why, wn, "the bundle for %.100s: %.300s", g_spf[sx].domain, rw);
+            goto out;
+        }
+        store = X509_STORE_new();
+        BIO *b = BIO_new_mem_buf(bb, (int)bbl);
+        int nroots = 0;
+        for (X509 *x; store && b && (x = PEM_read_bio_X509(b, NULL, no_passphrase, NULL)); X509_free(x))
+            nroots += X509_STORE_add_cert(store, x) == 1;
+        BIO_free(b);
+        ERR_clear_error();
+        if (!nroots) { snprintf(why, wn, "the bundle for %s holds no certificate", g_spf[sx].domain); goto out; }
+    }
+    /* every certificate of the bundle is an anchor (a SPIFFE bundle is the
+     * domain's signing authorities, not only self-signed roots) */
+    X509_STORE_set_flags(store, X509_V_FLAG_PARTIAL_CHAIN | X509_V_FLAG_X509_STRICT);
+    ctx = X509_STORE_CTX_new();
+    if (!ctx || X509_STORE_CTX_init(ctx, store, leaf, chain) != 1) { snprintf(why, wn, "out of memory"); goto out; }
+    if (X509_verify_cert(ctx) != 1) {
+        snprintf(why, wn, "it does not chain to the bundle for %s: %s", g_spf[sx].domain,
+                 X509_verify_cert_error_string(X509_STORE_CTX_get_error(ctx)));
+        goto out;
+    }
+    struct tm tm;
+    unsigned char *der = NULL;
+    int derl = i2d_X509(leaf, &der);
+    if (derl <= 0 || ASN1_TIME_to_tm(X509_get0_notAfter(leaf), &tm) != 1) { OPENSSL_free(der); snprintf(why, wn, "its certificate is malformed"); goto out; }
+    sha256_hex(der, (size_t)derl, g_id.svid_sha256);
+    OPENSSL_free(der);
+    g_id.svid_not_after = (int64_t)timegm(&tm);
+    memcpy(g_id.spiffe_id, idc, (size_t)idl + 1);
+    g_id.spiffe = sx;
+    g_id.has_svid = 1;
+    rc = 0;
+out:
+    ERR_clear_error();
+    GENERAL_NAMES_free(san);
+    X509_STORE_CTX_free(ctx);
+    X509_STORE_free(store);
+    EVP_PKEY_free(key);
+    EVP_PKEY_free(key2);
+    X509_free(leaf);
+    sk_X509_pop_free(chain, X509_free);
+    return rc;
+}
+
+/* WS_MSG_IDENTITY: what was verified, or why not (printable, for the Warden) */
+static void send_identity(bool ok, const char *why) {
+    g_id.type = WS_MSG_IDENTITY;
+    g_id.ok = ok;
+    memset(g_id.why, 0, sizeof g_id.why);
+    if (why) snprintf(g_id.why, sizeof g_id.why, "%s", why);
+    for (char *c = g_id.why; *c; c++) if (*c < 0x20 || *c > 0x7e) *c = '?';
+    if (!ok) {                                            /* nothing half-verified goes */
+        char w[sizeof g_id.why];
+        memcpy(w, g_id.why, sizeof w);
+        memset(&g_id, 0, sizeof g_id);
+        g_id.type = WS_MSG_IDENTITY;
+        memcpy(g_id.why, w, sizeof w);
+    }
+    ctl_send(&g_id, sizeof g_id);
+}
+
 static ssize_t ctl_recv(void *m, size_t n) {
     ssize_t r;
     while ((r = recv(g_ctl, m, n, 0)) < 0 && errno == EINTR) { }
@@ -1013,10 +1746,25 @@ int main(int argc, char **argv) {
     (void)signal(SIGPIPE, SIG_IGN);
     if (arena_init() < 0) return 2;
     /* the setup and the credentials */
-    struct ws_setup su;
+    static struct ws_setup su;
     if (ctl_recv(&su, sizeof su) != (ssize_t)sizeof su || su.type != WS_MSG_SETUP || su.ncreds > WS_MAX_CREDS ||
-        !memchr(su.conf, '\0', sizeof su.conf))
+        !memchr(su.conf, '\0', sizeof su.conf) || !memchr(su.token, '\0', sizeof su.token) ||
+        !memchr(su.svid, '\0', sizeof su.svid) || su.nissuers > WS_MAX_ISSUERS || su.nspiffe > WS_MAX_SPIFFE)
         return 2;
+    /* v1.28.1: the trusted issuers and trust domains */
+    g_niss = su.nissuers;
+    g_nspf = su.nspiffe;
+    for (uint32_t i = 0; i < g_niss; i++)
+        if (ctl_recv(&g_iss[i], sizeof g_iss[i]) != (ssize_t)sizeof g_iss[i] || g_iss[i].type != WS_MSG_ISSUER ||
+            g_iss[i].index != i || !memchr(g_iss[i].iss, '\0', sizeof g_iss[i].iss) ||
+            !memchr(g_iss[i].aud, '\0', sizeof g_iss[i].aud) || !memchr(g_iss[i].jwks, '\0', sizeof g_iss[i].jwks))
+            return 2;
+    for (uint32_t i = 0; i < g_nspf; i++)
+        if (ctl_recv(&g_spf[i], sizeof g_spf[i]) != (ssize_t)sizeof g_spf[i] || g_spf[i].type != WS_MSG_SPIFFE ||
+            g_spf[i].index != i || !memchr(g_spf[i].domain, '\0', sizeof g_spf[i].domain) ||
+            !memchr(g_spf[i].bundle, '\0', sizeof g_spf[i].bundle))
+            return 2;
+    bool want_id = su.token[0] || su.svid[0];
     static struct ws_cred cr[WS_MAX_CREDS];
     bool need_vault = false, need_aws = false;
     for (uint32_t i = 0; i < su.ncreds; i++) {
@@ -1031,12 +1779,33 @@ int main(int argc, char **argv) {
     bool failed = false;
     static unsigned char fbuf[65536];
     size_t fl;
-    if (su.conf[0] && (need_vault || need_aws)) {
+    /* v1.28.1: an issuer's CA may be named in it; with no credential that
+     * needs it, a configuration that is not there is not needed */
+    bool conf_failed = false;
+    char idwhy_ca[512] = "";
+    if (su.conf[0] && (need_vault || need_aws || (su.token[0] && access(su.conf, F_OK) == 0))) {
         if (read_private(su.conf, fbuf, sizeof fbuf - 1, &fl, NULL, why, sizeof why) < 0 ||
             (fbuf[fl] = '\0', kv_parse((char *)fbuf, su.conf, conf_key, why, sizeof why) < 0)) {
             for (uint32_t i = 0; i < su.ncreds; i++)
                 if (cr[i].store != STORE_FILE) report(i, false, NULL, 0, why);
             failed = true;
+            conf_failed = true;
+        }
+    }
+    /* v1.28.1 review: the CA files, as root, as trusted files */
+    if (!failed) {
+        const char *cas[3] = { need_vault ? g_conf.vault_ca : "", need_aws ? g_conf.aws_ca : "",
+                               su.token[0] ? g_conf.oidc_ca : "" };
+        for (int k = 0; k < 3; k++) {
+            if (!cas[k][0] || ca_load(cas[k], why, sizeof why) == 0) continue;
+            if (k == 2) {
+                if (!conf_failed) { conf_failed = true; }
+                if (want_id) snprintf(idwhy_ca, sizeof idwhy_ca, "the user's token: %.450s", why);
+            } else {
+                for (uint32_t i = 0; i < su.ncreds; i++)
+                    if (cr[i].store == (k == 0 ? STORE_VAULT : STORE_AWSSM)) report(i, false, NULL, 0, why);
+                failed = true;
+            }
         }
     }
     if (!failed && need_vault && g_conf.vault_token_file[0]) {
@@ -1063,6 +1832,36 @@ int main(int argc, char **argv) {
         } else g_aws.have = true;
         OPENSSL_cleanse(fbuf, sizeof fbuf);
     }
+    /* v1.28.1: the user's token and the agent's SVID, as root (each a file
+     * store); the SVID is checked here, the token once the keys are in */
+    char idwhy[512] = "";
+    bool id_failed = false;
+    if (conf_failed && want_id) {                /* v1.28.1: say so, though no credential needed it */
+        if (idwhy_ca[0]) snprintf(idwhy, sizeof idwhy, "%s", idwhy_ca);
+        else snprintf(idwhy, sizeof idwhy, "%s: %.450s", su.token[0] ? "the user's token" : "the agent's SVID", why);
+        id_failed = true;
+    }
+    if (!failed && su.token[0]) {
+        size_t tl = 0;
+        if (read_private(su.token, (unsigned char *)g_user_token, WS_MAX_TOKEN, &tl, NULL, why, sizeof why) < 0) {
+            snprintf(idwhy, sizeof idwhy, "%s: %.450s", su.token[0] ? "the user's token" : "the agent's SVID", why);
+            id_failed = true;
+        } else {
+            tl = chomp((unsigned char *)g_user_token, tl);
+            g_user_token[tl] = '\0';
+            if (!tl || strspn(g_user_token, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.") != tl) {
+                snprintf(idwhy, sizeof idwhy, "the user's token: %.300s is not one JWT (base64url parts, one line)", su.token);
+                id_failed = true;
+            }
+        }
+    }
+    if (!failed && !id_failed && su.svid[0]) {
+        char w[480];
+        if (verify_svid(su.svid, w, sizeof w) < 0) {
+            snprintf(idwhy, sizeof idwhy, "the agent's SVID: %s", w);
+            id_failed = true;
+        }
+    }
     for (uint32_t i = 0; !failed && i < su.ncreds; i++) {
         if (cr[i].store != STORE_FILE) continue;
         struct stat st;
@@ -1078,8 +1877,23 @@ int main(int argc, char **argv) {
         snprintf(version, sizeof version, "inode:%lu mtime:%lld", (unsigned long)st.st_ino, (long long)st.st_mtime);
         report(i, true, version, g_val[i].len, NULL);
     }
-    /* its own user, then the network */
+    /* its own user, then the network: the identity first, so no store is
+     * asked anything (no lease made) for a run that will not start */
     if (drop_to(u, g) < 0) return 2;
+    g_deadline = mono_ms() + 25000;           /* v1.28.1 review: inside the Warden's 30 s */
+    if (want_id && (!failed || id_failed)) {
+        if (!id_failed && su.token[0]) {
+            char w[480];
+            if (verify_token(w, sizeof w) < 0) {
+                snprintf(idwhy, sizeof idwhy, "the user's token: %s", w);
+                id_failed = true;
+            }
+        }
+        user_token_clear();
+        send_identity(!id_failed, id_failed ? idwhy : NULL);
+        failed |= id_failed;
+    }
+    user_token_clear();
     for (uint32_t i = 0; !failed && i < su.ncreds; i++) {
         if (cr[i].store == STORE_VAULT) vault_fetch(i, cr[i].ref);
         else if (cr[i].store == STORE_AWSSM) aws_fetch(i, cr[i].ref);
@@ -1098,6 +1912,7 @@ int main(int argc, char **argv) {
             ctl_send(&y, sizeof y);
         }
     }
+    g_deadline = 0;                           /* renewals and revocations: each its own timeout */
     /* step 3: hand the values to warden-proxy, over the socket the Warden
      * gives, then clear them here; step 4: renew leases when due, revoke
      * them when asked; until the control socket closes */

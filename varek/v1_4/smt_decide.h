@@ -169,6 +169,10 @@ typedef struct {
     int            cred;
     char           cred_hdr[65];
     char           cred_scheme[33];
+    /* v1.28.1 (docs/security/v1.28.1-delegation-chain.md): an allow exec
+     * rule's `subagent=NAME` ("" : none); the program it admits is a
+     * sub-agent. Not part of any decision. */
+    char           subagent[33];
 } vdp_rule_t;
 
 #define VDP_PROXY_MAX_PORTS 16
@@ -194,6 +198,33 @@ typedef struct {
     char ref[1025];             /* after "STORE:" */
     int  line;
 } vdp_cred_t;
+
+/* v1.28.1: the identities a run accepts, after `require warden 1.28`.
+ *   trust issuer URL audience AUD [jwks URL]
+ *       URL and the jwks URL begin "https://" and have a host; URL is at
+ *       most 255 bytes, AUD 1 to 255, the jwks URL at most 1024, each of
+ *       0x21 to 0x7e. Each issuer once, at most VDP_MAX_ISSUERS.
+ *   trust spiffe DOMAIN bundle PATH
+ *       DOMAIN is 1 to 255 bytes of [a-z0-9._-], starting with a letter or
+ *       digit; PATH is an absolute path as a file credential's. Each
+ *       domain once, at most VDP_MAX_SPIFFE.
+ *   require on-behalf-of
+ *       a run without a verified user token refuses to start (once).
+ * The certificate checker and the cross-check oracle read them the same
+ * way. None is part of any decision. */
+#define VDP_MAX_ISSUERS 8
+#define VDP_MAX_SPIFFE  8
+typedef struct {
+    char iss[256];
+    char aud[256];
+    char jwks[1025];            /* "" : the issuer's discovery document */
+    int  line;
+} vdp_issuer_t;
+typedef struct {
+    char domain[256];
+    char bundle[1025];
+    int  line;
+} vdp_spiffe_t;
 
 typedef struct {
     vdp_rule_t rules[VDP_MAX_RULES];
@@ -221,6 +252,13 @@ typedef struct {
     /* v1.28: the credentials the policy names, in order */
     vdp_cred_t creds[VDP_MAX_CREDS];
     size_t     ncreds;
+    /* v1.28.1: the trusted issuers and SPIFFE trust domains, in order, and
+     * `require on-behalf-of` */
+    vdp_issuer_t issuers[VDP_MAX_ISSUERS];
+    size_t       nissuers;
+    vdp_spiffe_t spiffe[VDP_MAX_SPIFFE];
+    size_t       nspiffe;
+    bool         require_obo;
 } vdp_policy_t;
 
 /* Why a verdict was reached (for records). */
@@ -487,7 +525,7 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * refuses both, so the policy fails closed there. */
 #define VDP_WARDEN_MAJOR 1
 #define VDP_WARDEN_MINOR 28
-#define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's */
+#define VDP_WARDEN_PATCH 1      /* v1.27.1: the Warden's version beyond the grammar's (v1.28.1) */
 
 /* v1.27: a note on exec rule i, for lint and the Warden's load-time notes,
  * in buf (empty: none); returns its length. An allow exec rule naming a shell

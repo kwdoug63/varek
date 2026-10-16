@@ -959,6 +959,27 @@ static const char *cred_ref_parse(const char *t, int *store, const char **ref) {
     return NULL;
 }
 
+/* v1.28.1: an https:// URL of at most max bytes, printable, with a host. */
+static bool https_url_ok(const char *u, size_t max) {
+    size_t l = strlen(u);
+    if (l < 9 || l > max || strncmp(u, "https://", 8) || u[8] == '/' || u[8] == '?' || u[8] == '#') return false;
+    for (size_t i = 0; i < l; i++)
+        if ((unsigned char)u[i] < 0x21 || (unsigned char)u[i] > 0x7e) return false;
+    return true;
+}
+
+/* v1.28.1: a SPIFFE trust domain, [a-z0-9._-]{1,255}, starting with a
+ * letter or a digit. */
+static bool spiffe_domain_ok(const char *d) {
+    size_t l = strlen(d);
+    if (l < 1 || l > 255 || !((d[0] >= 'a' && d[0] <= 'z') || (d[0] >= '0' && d[0] <= '9'))) return false;
+    for (size_t i = 0; i < l; i++)
+        if (!((d[i] >= 'a' && d[i] <= 'z') || (d[i] >= '0' && d[i] <= '9') || d[i] == '.' || d[i] == '_' ||
+              d[i] == '-'))
+            return false;
+    return true;
+}
+
 /* v1.28: an HTTP token (RFC 9110 tchar) of 1 to max bytes. */
 static bool http_token_ok(const char *t, size_t len, size_t max) {
     if (len < 1 || len > max) return false;
@@ -1029,6 +1050,17 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             tok[nt++] = t;
         }
         if (nt == 0) continue;
+        /* v1.28.1: require on-behalf-of */
+        if (!strcmp(tok[0], "require") && nt >= 2 && !strcmp(tok[1], "on-behalf-of")) {
+            if (nt != 2) { rc = perr(err, errlen, path, lineno, "need: require on-behalf-of"); break; }
+            if (!(req_maj > 1 || (req_maj == 1 && req_min >= 28))) {
+                rc = perr(err, errlen, path, lineno, "`require on-behalf-of` needs `require warden 1.28` before it");
+                break;
+            }
+            if (p->require_obo) { rc = perr(err, errlen, path, lineno, "`require on-behalf-of` given twice"); break; }
+            p->require_obo = true;
+            continue;
+        }
         if (!strcmp(tok[0], "require")) {
             int maj = -1, mn = -1;
             if (nt != 3 || strcmp(tok[1], "warden") || parse_version(tok[2], &maj, &mn) < 0) {
@@ -1132,6 +1164,80 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             }
             rc = perr(err, errlen, path, lineno, "bad directive (need: proxy on, proxy inspect, proxy ports "
                       "<port>..., proxy upstream http://host:port, or proxy passthrough host <name>)");
+            break;
+        }
+        /* v1.28.1: trust issuer URL audience AUD [jwks URL]; trust spiffe DOMAIN bundle PATH */
+        if (!strcmp(tok[0], "trust")) {
+            if (!(req_maj > 1 || (req_maj == 1 && req_min >= 28))) {
+                rc = perr(err, errlen, path, lineno, "`trust` needs `require warden 1.28` before it");
+                break;
+            }
+            if (nt >= 2 && !strcmp(tok[1], "issuer")) {
+                if (!((nt == 5 || nt == 7) && !strcmp(tok[3], "audience") && (nt == 5 || !strcmp(tok[5], "jwks")))) {
+                    rc = perr(err, errlen, path, lineno, "need: trust issuer <https URL> audience <audience> "
+                              "[jwks <https URL>]");
+                    break;
+                }
+                size_t al = strlen(tok[4]);
+                bool aok = al >= 1 && al <= 255;
+                for (size_t i = 0; aok && i < al; i++)
+                    aok = (unsigned char)tok[4][i] >= 0x21 && (unsigned char)tok[4][i] <= 0x7e;
+                if (!https_url_ok(tok[2], 255) || !aok || (nt == 7 && !https_url_ok(tok[6], 1024))) {
+                    rc = perr(err, errlen, path, lineno, "an issuer and its keys are https:// URLs with a host "
+                              "(at most 255 and 1024 bytes), an audience 1 to 255 printable bytes");
+                    break;
+                }
+                for (size_t k = 0; rc == 0 && k < p->nissuers; k++)
+                    if (!strcmp(p->issuers[k].iss, tok[2]))
+                        rc = perr(err, errlen, path, lineno, "issuer %s trusted twice (line %d)", tok[2],
+                                  p->issuers[k].line);
+                if (rc) break;
+                if (p->nissuers >= VDP_MAX_ISSUERS) {
+                    rc = perr(err, errlen, path, lineno, "more than %d trusted issuers", VDP_MAX_ISSUERS);
+                    break;
+                }
+                vdp_issuer_t *is = &p->issuers[p->nissuers++];
+                snprintf(is->iss, sizeof is->iss, "%s", tok[2]);
+                snprintf(is->aud, sizeof is->aud, "%s", tok[4]);
+                snprintf(is->jwks, sizeof is->jwks, "%s", nt == 7 ? tok[6] : "");
+                is->line = lineno;
+                continue;
+            }
+            if (nt >= 2 && !strcmp(tok[1], "spiffe")) {
+                if (nt != 5 || strcmp(tok[3], "bundle")) {
+                    rc = perr(err, errlen, path, lineno, "need: trust spiffe <trust domain> bundle <path>");
+                    break;
+                }
+                int st = 0;
+                const char *ref = NULL;
+                char fb[1100];
+                snprintf(fb, sizeof fb, "file:%s", tok[4]);
+                if (!spiffe_domain_ok(tok[2])) {
+                    rc = perr(err, errlen, path, lineno, "'%s': a trust domain is 1 to 255 of a-z, 0-9, '.', '_' "
+                              "and '-', starting with a letter or digit", tok[2]);
+                    break;
+                }
+                if (strlen(tok[4]) > 1024 || cred_ref_parse(fb, &st, &ref)) {
+                    rc = perr(err, errlen, path, lineno, "a bundle is an absolute path, without \".\", \"..\", "
+                              "\"//\" or a trailing \"/\"");
+                    break;
+                }
+                for (size_t k = 0; rc == 0 && k < p->nspiffe; k++)
+                    if (!strcmp(p->spiffe[k].domain, tok[2]))
+                        rc = perr(err, errlen, path, lineno, "trust domain %s trusted twice (line %d)", tok[2],
+                                  p->spiffe[k].line);
+                if (rc) break;
+                if (p->nspiffe >= VDP_MAX_SPIFFE) {
+                    rc = perr(err, errlen, path, lineno, "more than %d trust domains", VDP_MAX_SPIFFE);
+                    break;
+                }
+                vdp_spiffe_t *sp = &p->spiffe[p->nspiffe++];
+                snprintf(sp->domain, sizeof sp->domain, "%s", tok[2]);
+                snprintf(sp->bundle, sizeof sp->bundle, "%s", tok[4]);
+                sp->line = lineno;
+                continue;
+            }
+            rc = perr(err, errlen, path, lineno, "bad directive (need: trust issuer ... or trust spiffe ...)");
             break;
         }
         /* v1.28: credential NAME from STORE:REF */
@@ -1433,6 +1539,25 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
                     goto out;
                 }
                 if (is_names) r->names = val; else r->rate = val;
+                continue;
+            }
+            /* v1.28.1: subagent=NAME on an allow exec rule */
+            if (!strncmp(t, "subagent=", 9)) {
+                if (!(req_maj > 1 || (req_maj == 1 && req_min >= 28))) {
+                    rc = perr(err, errlen, path, lineno, "subagent= needs `require warden 1.28` before it");
+                    goto out;
+                }
+                if (r->kind != VDP_KIND_EXEC || r->verb != VDP_ALLOW) {
+                    rc = perr(err, errlen, path, lineno, "subagent= applies only to allow exec rules");
+                    goto out;
+                }
+                if (r->subagent[0]) { rc = perr(err, errlen, path, lineno, "subagent= given twice"); goto out; }
+                if (!cred_name_ok(t + 9)) {
+                    rc = perr(err, errlen, path, lineno, "'%s': a sub-agent's name is a lowercase letter, then up "
+                              "to 31 lowercase letters, digits or '_'", t);
+                    goto out;
+                }
+                snprintf(r->subagent, sizeof r->subagent, "%s", t + 9);
                 continue;
             }
             if (r->kind != VDP_KIND_PATH) {

@@ -142,9 +142,14 @@ int wp_load(const char *path, char sha256_hex[65], char *why, size_t wn) {
         close(fd);
         return -1;
     }
-    int m = (int)syscall(SYS_memfd_create, "warden-proxy", MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_EXEC);
+    /* v1.28.1 review: named after the binary (warden-proxy, warden-secrets), so
+     * the kernel's log names the helper that ran */
+    const char *nm = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+    char mname[64];
+    snprintf(mname, sizeof mname, "%s", *nm ? nm : "warden-helper");
+    int m = (int)syscall(SYS_memfd_create, mname, MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_EXEC);
     if (m < 0 && errno == EINVAL)          /* a kernel before 6.3 */
-        m = (int)syscall(SYS_memfd_create, "warden-proxy", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        m = (int)syscall(SYS_memfd_create, mname, MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (m < 0) { snprintf(why, wn, "memfd_create: %s", strerror(errno)); close(fd); return -1; }
     crypto_hash_sha256_state h;
     crypto_hash_sha256_init(&h);
