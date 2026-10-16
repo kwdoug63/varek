@@ -76,7 +76,13 @@ PY
     check "with O_DIRECTORY it is refused, alone and with O_NOFOLLOW" sh -c "grep -qx 'dir_directory 13' '$OUT/r.out' && grep -qx 'dir_both 13' '$OUT/r.out'"
     if [ "$(uname -m)" = x86_64 ]; then
         check "pipe(2) is admitted, as pipe2 is (glibc 2.34's pipe(), RHEL 9: a shell's command substitution)" said "pipe ok"
-    else skip "pipe(2) (x86_64 only: arm64 has pipe2 alone)"; fi
+        # getpgrp(2) under a policy before 1.29: bash (RHEL's /bin/sh) calls it at its start
+        printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /lib64 readonly\nallow path exact /etc/ld.so.cache readonly\n' > "$D/p127.txt"
+        env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$D/p127.txt" -- /usr/bin/python3 -c \
+            "import ctypes; l = ctypes.CDLL(None, use_errno=True); print('getpgrp', 'ok' if l.syscall(111) > 0 else ctypes.get_errno())" \
+            > "$OUT/pg.out" 2> "$OUT/pg.log"
+        check "getpgrp(2) is admitted under a policy before 1.29 (bash, RHEL's /bin/sh, exits without it)" grep -qx 'getpgrp ok' "$OUT/pg.out"
+    else skip "pipe(2) and getpgrp(2) (x86_64 only: arm64 has neither)"; fi
     flags() { python3 - "$OUT/r.log" "$1" <<'PY'
 import json, sys
 for l in open(sys.argv[1], errors="replace"):
