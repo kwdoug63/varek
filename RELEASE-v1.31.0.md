@@ -324,6 +324,15 @@ give it swap.
   attestation; the stream is the evidence (D1).
 - **The Agent Baseline mapping is against a draft** whose identifiers may
   change until its v1.0.
+- **Calls glibc and bash make that the Warden refuses** (fixed in v1.31.1,
+  in every release before it): on x86_64, `epoll_wait(2)` and
+  `epoll_create(2)`, which glibc calls for `epoll_wait()` and
+  `epoll_create()`, so Python's `select.epoll` and asyncio's default event
+  loop fail with EPERM under every policy (an agent can run asyncio on
+  `asyncio.SelectorEventLoop(selectors.PollSelector())`; arm64 is not
+  affected); on RHEL 9 (glibc 2.34), `pipe(2)`, which its `pipe()` calls,
+  so a shell's command substitution fails, and under a policy before 1.29
+  `getpgrp(2)`, without which bash, RHEL's `/bin/sh`, does not start.
 - From v1.29.0: a dry run is not a sandbox. From v1.28.1: the chain is
   recorded, not enforced. From v1.28.0: a server that echoes a credential
   back. From v1.27.1: code written into memory is not covered; Linux only.
