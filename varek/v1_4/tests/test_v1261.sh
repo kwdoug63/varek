@@ -1129,6 +1129,7 @@ def cut_eof(e):   # Python 3.9 with OpenSSL 3 (RHEL 9) names an unexpected EOF S
 def note(t):
     with open(log, "a") as f: f.write(t + "\n")
 def serve(c):
+    path, buf = "-", b""
     try:
         s = ctx.wrap_socket(c, server_side=True)
         buf = b""
@@ -1156,8 +1157,8 @@ def serve(c):
                 return
             note(f"GOT {path}")
             s.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-    except (OSError, ssl.SSLError):
-        pass
+    except (OSError, ssl.SSLError) as e:   # what ended it, for a check that fails
+        note(f"ERR {path} {len(buf)} {type(e).__name__} {getattr(e, 'reason', '') or e}")
 l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); l.bind((ip, port)); l.listen(16)
 while True:
     c, _ = l.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
@@ -1244,7 +1245,7 @@ PY
     if grep -q "^RAW /raw 100 $CUTSHA$" "$OUT/rv.log" &&
        rvrec '"event":"request_body"' "\"body_len\":100,\"body_sha256\":\"$CUTSHA\",\"exceeded_max_body\":true"
     then pass "a chunked body cut at max_body: the server gets what was let through, the bytes and SHA-256 recorded"
-    else flunk "a chunked body cut at max_body ($(grep RAW "$OUT/rv.log"))"; fi
+    else flunk "a chunked body cut at max_body ($(grep -E '^(RAW|ERR) ' "$OUT/rv.log" | tr '\n' ' '))"; fi
     if vhave "HALF HTTP/1.1 200 OK"
     then pass "an agent that half-closes after its request still gets the answer"
     else flunk "a half-closing agent's answer ($(grep HALF "$OUT/rv.out"))"; fi
