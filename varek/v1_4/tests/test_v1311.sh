@@ -47,7 +47,7 @@ try:
 except OSError as e:
     print("asyncio", e.errno, flush=True)
 if platform.machine() == "x86_64":
-    ep = libc.epoll_create(4)
+    ep = libc.syscall(213, 4)                  # epoll_create(2)
     print("epoll_create", "ok" if ep >= 0 else ctypes.get_errno(), flush=True)
     ev = ctypes.create_string_buffer(12)
     print("epoll_wait", "ok" if ep >= 0 and libc.syscall(232, ep, ev, 1, 0) == 0 else ctypes.get_errno(), flush=True)
