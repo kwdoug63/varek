@@ -1409,7 +1409,28 @@ def check_chain(ident, meta, records, run, problems):
     for tag, (line, _) in settled.items():
         if tag not in started or started[tag][0] > line:
             problems.append(f"sub-agent {tag} settled, but no launch started it before")
+    # a launched sub-agent with no decision of its own counts too (0)
+    for tag in started:
+        if tag not in settled or settled[tag][1] != "failed":
+            count.setdefault(tag, 0)
     return count
+
+
+def chain_summary(per_sub):
+    """v1.30: the sub-agents by name, as the chain line shows them: how many
+    were launched and how many decisions they had, with the range per launch
+    when it varies (a 24-hour run launches hundreds of each)."""
+    by = {}
+    for tag, n in per_sub.items():
+        by.setdefault(tag.rsplit("#", 1)[0], []).append(n)
+    out = []
+    for name in sorted(by):
+        ns = by[name]
+        each = f"{ns[0]} each" if min(ns) == max(ns) else f"{min(ns)} to {max(ns)} each"
+        out.append(f"{name} {len(ns)} launch{'es' if len(ns) != 1 else ''}, "
+                   f"{sum(ns)} decision{'s' if sum(ns) != 1 else ''}"
+                   f"{f' ({each})' if len(ns) > 1 else ''}")
+    return "; ".join(out) if out else "none"
 
 
 def check_credentials(creds, cred_rules, meta, records, complete, problems, notes, auds=None):
@@ -3594,8 +3615,7 @@ def main(argv=None):
         ob_ = meta.get("run_start", {}).get("on_behalf_of")
         u = ob_.get("user") if isinstance(ob_, dict) else None
         who = f"on behalf of {u.get('subject')} ({u.get('issuer')})" if isinstance(u, dict) else "no user"
-        subs = ", ".join(f"{t} {n}" for t, n in sorted(per_sub.items())) if per_sub else "none"
-        print(f"varek_audit: chain: {who}; sub-agents (decisions): {subs}")
+        print(f"varek_audit: chain: {who}; sub-agents: {chain_summary(per_sub)}")
     for n_ in cnotes:
         print(f"varek_audit: note: {n_}")
     print(f"varek_audit: integrity: {integrity}")
