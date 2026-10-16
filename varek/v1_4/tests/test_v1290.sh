@@ -963,8 +963,9 @@ else
     check "prctl with any other option stays refused (PR_SET_DUMPABLE)"              go "prctl_set_dumpable Operation not permitted"
     check "under 1.28 they are refused, as before (getrusage, pidfd_open, setsid)"  sh -c "grep -qx 'getrusage Operation not permitted' '$G/b.out' && grep -qx 'pidfd_open Operation not permitted' '$G/b.out' && grep -qx 'setsid refused' '$G/b.out'"
     check "the audit passes the run" python3 "$HERE/tools/varek_audit.py" --policy "$G/p129.txt" --checker "$CERT" "$G/a.log"
-    # a dry run of an earlier policy: what enforcing refuses in the filter is
-    # recorded as a call outside the allowlist, not decided
+    # a dry run of an earlier policy: what the filter refuses when enforcing
+    # (stat(2) and mkdir under 1.28) it refuses in the dry run too, unrecorded:
+    # the dry run passes through only the calls it could decide
     (cd "$G/w" && "$WARDEN" "$G/p128.txt" --dry-run --run-as nobody -- "$G/bin/v1290_open" rstat "$G/o/secret" mkdir "$G/w/n2" > /dev/null 2> "$G/d.log")
     check "a dry run under 1.28: stat(2) and mkdir stay refused, as when enforcing (the Warden decides them only from 1.29)" sh -c "
         [ ! -e '$G/w/n2' ] && python3 -c \"import json,sys; R=[json.loads(l) for l in open('$G/d.log') if l.startswith('{')]; sys.exit(0 if not any(r.get('rule') == 'syscall_not_admitted' or r.get('action') == 'file.mkdir' for r in R) else 1)\""
