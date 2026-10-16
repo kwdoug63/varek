@@ -57,6 +57,20 @@ if platform.machine() == "x86_64":   # pipe(2), which glibc 2.34 (RHEL 9) calls 
     libc = ctypes.CDLL(None, use_errno=True)
     fds = (ctypes.c_int * 2)()
     print("pipe", "ok" if libc.syscall(22, fds) == 0 else ctypes.get_errno(), flush=True)
+    # epoll_wait(2) and epoll_create(2), which glibc on x86_64 calls for
+    # epoll_wait() and epoll_create(): asyncio's default event loop
+    ep = libc.epoll_create(4)
+    print("epoll_create", "ok" if ep >= 0 else ctypes.get_errno(), flush=True)
+    ev = ctypes.create_string_buffer(12)
+    print("epoll_wait", "ok" if ep >= 0 and libc.syscall(232, ep, ev, 1, 0) == 0 else ctypes.get_errno(), flush=True)
+    import asyncio
+    async def nap():
+        await asyncio.sleep(0.01)
+        return "ok"
+    try:
+        print("asyncio", asyncio.run(nap()), flush=True)
+    except OSError as e:
+        print("asyncio", e.errno, flush=True)
 PY
     chmod 644 "$D/agent.py"
     # the agent's own files decided by clauses on the bits arm64 moves
@@ -76,13 +90,16 @@ PY
     check "with O_DIRECTORY it is refused, alone and with O_NOFOLLOW" sh -c "grep -qx 'dir_directory 13' '$OUT/r.out' && grep -qx 'dir_both 13' '$OUT/r.out'"
     if [ "$(uname -m)" = x86_64 ]; then
         check "pipe(2) is admitted, as pipe2 is (glibc 2.34's pipe(), RHEL 9: a shell's command substitution)" said "pipe ok"
+        check "epoll_create(2) and epoll_wait(2) are admitted, as epoll_create1 and epoll_pwait are (glibc's on x86_64)" \
+            sh -c "grep -qx 'epoll_create ok' '$OUT/r.out' && grep -qx 'epoll_wait ok' '$OUT/r.out'"
+        check "asyncio's default event loop runs" said "asyncio ok"
         # getpgrp(2) under a policy before 1.29: bash (RHEL's /bin/sh) calls it at its start
         printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /lib64 readonly\nallow path exact /etc/ld.so.cache readonly\n' > "$D/p127.txt"
         env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$D/p127.txt" -- /usr/bin/python3 -c \
             "import ctypes; l = ctypes.CDLL(None, use_errno=True); print('getpgrp', 'ok' if l.syscall(111) > 0 else ctypes.get_errno())" \
             > "$OUT/pg.out" 2> "$OUT/pg.log"
         check "getpgrp(2) is admitted under a policy before 1.29 (bash, RHEL's /bin/sh, exits without it)" grep -qx 'getpgrp ok' "$OUT/pg.out"
-    else skip "pipe(2) and getpgrp(2) (x86_64 only: arm64 has neither)"; fi
+    else skip "pipe(2), getpgrp(2), epoll_wait(2) and epoll_create(2) (x86_64 only: arm64 has none of them)"; fi
     flags() { python3 - "$OUT/r.log" "$1" <<'PY'
 import json, sys
 for l in open(sys.argv[1], errors="replace"):

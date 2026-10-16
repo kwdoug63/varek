@@ -115,6 +115,12 @@ static const char *kAdmit[] = {
     // no namespace bit. kill is admitted below for a pid above 0 only.
     "vfork",
     "epoll_create1", "epoll_ctl", "epoll_pwait", "epoll_pwait2",
+    // v1.30: epoll_wait and epoll_create, which glibc on x86_64 calls for
+    // epoll_wait() and epoll_create() (arm64 has neither and uses the two
+    // above). Without them Python's select.epoll, and so asyncio's default
+    // event loop, failed with EPERM under every policy. They do what
+    // epoll_pwait with no signal mask and epoll_create1 with no flags do.
+    "epoll_wait", "epoll_create",
     // time / sched / ids
     "clock_gettime", "clock_nanosleep", "nanosleep", "gettimeofday", "time",
     "getpid", "gettid", "getppid", "sched_yield", "sched_getaffinity",
