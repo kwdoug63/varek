@@ -622,7 +622,14 @@ while True:
 PY
     SRV="$SRV $!"
     mkdir -p "$OUT/www"; echo "http-ok" > "$OUT/www/x.txt"
-    python3 -m http.server "$HP" --bind "$HOSTIP" --directory "$OUT/www" --protocol HTTP/1.1 > "$OUT/http6.log" 2>&1 &
+    # http.server's --protocol is Python 3.11's; RHEL 9 has 3.9: the same server, HTTP/1.1 set here
+    python3 - "$HP" "$HOSTIP" "$OUT/www" > "$OUT/http6.log" 2>&1 <<'PY' &
+import functools, http.server, sys
+class H(http.server.SimpleHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+http.server.ThreadingHTTPServer((sys.argv[2], int(sys.argv[1])),
+                                functools.partial(H, directory=sys.argv[3])).serve_forever()
+PY
     SRV="$SRV $!"
     PORT=$((20000 + RANDOM % 20000))
     printf '{"api.example.com": {"ttl": 30, "a": ["%s"]}, "a.svc.example.com": {"ttl": 30, "a": ["%s"]}, "b.svc.example.com": {"ttl": 30, "a": ["%s"]}, "lo.example.com": {"ttl": 30, "a": ["127.0.0.1"]}, "den.example.com": {"ttl": 30, "a": ["192.0.2.77"]}, "m6.example.com": {"ttl": 30, "aaaa": ["::ffff:127.0.0.1"]}, "d6.example.com": {"ttl": 30, "aaaa": ["::ffff:192.0.2.77"]}}\n' \
