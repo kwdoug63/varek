@@ -793,11 +793,19 @@ static int parse_mcp_rule(const char *name, int ln, char **tok, int nt, int req_
         nm = tok[4];
         k = 5;
     }
-    size_t gl = strlen(cu) + 1 + strlen(tok[3]) + 1 + strlen(nm);
+    size_t lu = strlen(cu), lm = strlen(tok[3]), ln2 = strlen(nm);
+    size_t gl = lu + 1 + lm + 1 + ln2;
     if (gl > VDPC_MAX_S) return fail(err, en, name, ln, "mcp object over the bound");
     r->c = malloc(gl + 1);
     if (!r->c) return fail(err, en, name, ln, "out of memory");
-    snprintf(r->c, gl + 1, "%s#%s#%s", cu, tok[3], nm);
+    /* URL#METHOD#NAME, exactly gl bytes (copies, not snprintf: GCC 11 could
+     * not see that cu's length is bounded here, and warned) */
+    memcpy(r->c, cu, lu);
+    r->c[lu] = '#';
+    memcpy(r->c + lu + 1, tok[3], lm);
+    r->c[lu + 1 + lm] = '#';
+    memcpy(r->c + lu + 2 + lm, nm, ln2);
+    r->c[gl] = '\0';
     r->clen = gl;
     r->match = M_GLOB;
     const char *ge = parse_glob(r->c, r->clen, &r->g, &r->ng);
