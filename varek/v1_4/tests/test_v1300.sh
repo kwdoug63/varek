@@ -52,6 +52,11 @@ t("nofollow", D + "/a", os.O_RDONLY | os.O_NOFOLLOW)
 t("dir_plain", D + "/dir", os.O_RDONLY)
 t("dir_directory", D + "/dir", os.O_RDONLY | os.O_DIRECTORY)
 t("dir_both", D + "/dir", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+import ctypes, platform
+if platform.machine() == "x86_64":   # pipe(2), which glibc 2.34 (RHEL 9) calls for pipe()
+    libc = ctypes.CDLL(None, use_errno=True)
+    fds = (ctypes.c_int * 2)()
+    print("pipe", "ok" if libc.syscall(22, fds) == 0 else ctypes.get_errno(), flush=True)
 PY
     chmod 644 "$D/agent.py"
     # the agent's own files decided by clauses on the bits arm64 moves
@@ -69,6 +74,9 @@ PY
     check "an open with O_NOFOLLOW is refused: the clause excludes it (EACCES)" said "nofollow 13"
     check "a directory opened without O_DIRECTORY is allowed (-O_DIRECTORY)" said "dir_plain ok"
     check "with O_DIRECTORY it is refused, alone and with O_NOFOLLOW" sh -c "grep -qx 'dir_directory 13' '$OUT/r.out' && grep -qx 'dir_both 13' '$OUT/r.out'"
+    if [ "$(uname -m)" = x86_64 ]; then
+        check "pipe(2) is admitted, as pipe2 is (glibc 2.34's pipe(), RHEL 9: a shell's command substitution)" said "pipe ok"
+    else skip "pipe(2) (x86_64 only: arm64 has pipe2 alone)"; fi
     flags() { python3 - "$OUT/r.log" "$1" <<'PY'
 import json, sys
 for l in open(sys.argv[1], errors="replace"):

@@ -1166,6 +1166,9 @@ import hashlib, os, socket, ssl, sys, time
 XP, CP = int(sys.argv[1]), int(sys.argv[2])
 H = "api.example.com"
 ctx = ssl.create_default_context()
+# RHEL's Python sets OP_IGNORE_UNEXPECTED_EOF by default, so a cut TLS reads
+# as a clean close whatever the proxy sends: this agent wants to see a cut
+ctx.options &= ~getattr(ssl, "OP_IGNORE_UNEXPECTED_EOF", 0)
 def conn(port=None):
     return ctx.wrap_socket(socket.create_connection((H, port or XP), 10), server_hostname=H,
                            suppress_ragged_eofs=False)

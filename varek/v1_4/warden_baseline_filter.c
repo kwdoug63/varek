@@ -88,6 +88,9 @@ static const char *kAdmit[] = {
     // v1.27: dup2, which glibc calls for dup2() on x86_64 and every launcher
     // uses to give a child its stdin/stdout/stderr; it does what dup3 does
     "dup2",
+    // v1.30 (the RHEL 9 sweep): pipe, which glibc before 2.37 calls for pipe()
+    // on x86_64 (later ones call pipe2 with no flags); it does what pipe2 does
+    "pipe",
     "getdents64", "getcwd",
     // v1.17.0: newfstatat, statx, readlink, readlinkat, access, faccessat and
     // faccessat2 are NO LONGER admitted. They reveal whether any file exists,
