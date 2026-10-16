@@ -1124,6 +1124,8 @@ PY
 import hashlib, socket, ssl, sys, threading
 ip, port, cert, key, log = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+def cut_eof(e):   # Python 3.9 with OpenSSL 3 (RHEL 9) names an unexpected EOF SSLError, later ones SSLEOFError
+    return isinstance(e, ssl.SSLEOFError) or getattr(e, "reason", "") == "UNEXPECTED_EOF_WHILE_READING"
 def note(t):
     with open(log, "a") as f: f.write(t + "\n")
 def serve(c):
@@ -1143,7 +1145,11 @@ def serve(c):
                 return
             if path in ("/raw", "/part"):   # what follows the head, to the connection's end
                 while True:
-                    d = s.recv(65536)
+                    try:
+                        d = s.recv(65536)
+                    except ssl.SSLError as e:
+                        if not cut_eof(e): raise
+                        d = b""
                     if not d: break
                     buf += d
                 note(f"RAW {path} {len(buf)} {hashlib.sha256(buf).hexdigest()}")
@@ -1181,7 +1187,8 @@ def reads(s):
             if not d: return out, "clean"
             out += d
     except (OSError, ssl.SSLError) as e:
-        return out, type(e).__name__
+        cut = isinstance(e, ssl.SSLError) and getattr(e, "reason", "") == "UNEXPECTED_EOF_WHILE_READING"
+        return out, "SSLEOFError" if cut else type(e).__name__   # Python 3.9 + OpenSSL 3: SSLError
 # a server that drops its connection without close_notify: the agent must see it
 s = conn(); s.sendall(b"GET /trunc HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % H.encode())
 out, how = reads(s); print("TRUNC", how, out.split(b"\r\n\r\n")[-1].decode(), flush=True)
