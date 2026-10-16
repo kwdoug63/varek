@@ -272,8 +272,12 @@ if [ "$CDN_OK" = 1 ]; then
     # The system CA store, as curl uses: a host whose egress re-terminates TLS
     # (as this test's may) adds its CA there; Node reads it via
     # NODE_EXTRA_CA_CERTS.
+    # Debian and Ubuntu name the bundle ca-certificates.crt; RHEL and Fedora,
+    # ca-bundle.crt.
+    CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+    [ -f "$CA_BUNDLE" ] || CA_BUNDLE=/etc/ssl/certs/ca-bundle.crt
     client "python TLS to pypi.org (CDN, verified)" 'HTTP/1.1 200' \
-        /usr/bin/python3 "$PYC" raw-tls "$IP1" 443 pypi.org /pypi/requests/json /etc/ssl/certs/ca-certificates.crt
+        /usr/bin/python3 "$PYC" raw-tls "$IP1" 443 pypi.org /pypi/requests/json "$CA_BUNDLE"
     RUN_ENV=(NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt)
     [ -x "$NODE" ] && client "node TLS to pypi.org (CDN, verified)" 'HTTP/1.1 200 OK authorized=true' \
         "$NODE" "$JSC" tls "$IP1" 443 pypi.org /pypi/requests/json
