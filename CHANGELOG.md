@@ -9,6 +9,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.27.2] - 2026-10-16 — Checkpoints within their bound
+
+A patch release of v1.27.1 with one fix, to the signed verdict stream.
+The Warden wrote checkpoints only between notifications, but one pass over
+the egress proxy's reports (a burst of requests) can write several
+records, so a signed stream could hold more than `checkpoint_every`
+decision records between two signatures and fail its own audit
+("checkpoints were removed"). A checkpoint is now written before any
+decision record that would pass the bound. Signed runs with the
+inspecting proxy, v1.26.1 to v1.27.1, were affected; decisions and their
+enforcement never were. `make test-v1272` checks it (a signed run of 640
+requests in bursts of 32); a 24-hour signed soak on a 1 GB host passed.
+The Warden reports 1.27.2; the grammar stays 1.27. See
+`RELEASE-v1.27.2.md`.
+
 ## [1.27.1] - 2026-10-12 — Nothing written during the run is mapped executable
 
 Under `require warden 1.27`, every directory the policy lets the agent

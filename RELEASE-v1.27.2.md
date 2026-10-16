@@ -1,9 +1,6 @@
 # VAREK v1.27.2 — Checkpoints Within Their Bound
 
-> **Draft.** Not yet released: the release date, the 24-hour soak's figures
-> and the CHANGELOG entry come with the release commit, after the soak.
-
-MIT · github.com/kwdoug63/varek
+Released 2026-10-16 · MIT · github.com/kwdoug63/varek
 
 ## Summary
 
@@ -51,8 +48,8 @@ to v1.27.
   71 tests (1 skipped). The 3 checks that did not pass are the container's:
   its Python `requests` is installed under `/root/.local`, which the
   agent cannot read (test-v1210's `requests` clients); and test-v1162
-  skipped (no OpenSSH server there). The release commit's build is run
-  again on the droplet.
+  skipped (no OpenSSH server there). On the droplet, the release
+  candidate's build ran the 24-hour soak below.
 - Test changes, none in what they check: `test_v1271.sh` accepts the
   Warden's version as 1.27.1 or later (in `varek version` and
   `run_start`); `test_v1210.sh`'s lint check looks at the sample policy's
@@ -64,8 +61,28 @@ to v1.27.
 v1.27.1's soak harness (`tests/soak_v1270`), signed (`--sign-key`), on the
 1 vCPU, 1 GB droplet once v1.28.0's soak had freed it. A 3-minute trial
 passed on 2026-10-15: Warden 1.27.2, the work directory mounted `noexec`,
-the tasks ok, the probe refused, the signed stream's audit passed. The
-24-hour run started the same day; the release commit adds its figures.
+the tasks ok, the probe refused, the signed stream's audit passed.
+
+The release candidate (bbe8180) then ran for 24 hours on the same droplet
+(Landlock ABI 4), 2026-10-15 to 2026-10-16, signed: a task a minute in
+turn (`git`, `python3`, a compile with gcc), every tenth a probe that must
+be refused (a program no rule allows, one a deny rule refuses, a program
+written during the run, a library written during the run). It passed:
+
+| | |
+|---|---|
+| Duration | 24.00 h; Warden 1.27.2 |
+| `noexec` | 2 directories mounted, the work directory among them |
+| Tasks | 1,296, all ok (432 each; p50 10 ms git, 57 ms python3, 100 ms compile; p99 15, 75, 126 ms) |
+| Probes | 144 (36 of each kind), each refused and recorded |
+| Launches | 3,564 decided, 3,456 allowed, each with its `exec_result` `launched`; no task's launch refused |
+| Records | 289,185, signed; `varek_audit` passed |
+| The Warden's decision, an allowed launch | 111 to 203 us p50 by program (p99 159 to 464) |
+
+The figures match v1.27.1's soak (1,296 tasks, 3,564 launches decided,
+p50 106 to 199 us), so the earlier checkpoint costs nothing measurable
+here. This harness makes no requests in bursts, so the fault itself is
+checked by `test-v1272`, not by the soak.
 
 ## Compatibility
 
