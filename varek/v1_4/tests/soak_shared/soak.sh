@@ -76,6 +76,7 @@ PIDS=""
 trap 'kill $PIDS 2>/dev/null' EXIT
 
 # --- run A's stand-ins: the user's issuer, the remote MCP server, DNS --------
+rm -f "$OUT/as/port"                         # a reused --out holds the last run's
 python3 "$V14/tests/v1310_as.py" serve "$OUT/as" > "$OUT/as/serve.out" 2>&1 &
 PIDS="$PIDS $!"
 for _ in $(seq 100); do [ -s "$OUT/as/port" ] && break; sleep 0.1; done
