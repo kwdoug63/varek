@@ -1151,6 +1151,9 @@ def serve(c):
                     except ssl.SSLError as e:
                         if not cut_eof(e): raise
                         d = b""
+                    except ConnectionResetError:   # a cut may still end in a reset
+                        note(f"RESET {path} {len(buf)}")
+                        d = b""
                     if not d: break
                     buf += d
                 note(f"RAW {path} {len(buf)} {hashlib.sha256(buf).hexdigest()}")
