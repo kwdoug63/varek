@@ -87,7 +87,7 @@ refused "uppercase"                        "${R}allow host *.Example.com acknowl
 refused "a U-label"                        "${R}allow host *.b\xc3\xbccher.example\n" "A-labels"
 refused "a trailing dot"                   "${R}allow host *.example.com. acknowledge=dns-channel\n"       "trailing dot"
 refused "a bad port"                       "${R}allow host *.example.com:0443 acknowledge=dns-channel\n"   "port"
-refused "require 1.29"                     "require warden 1.29\n"                 "this is 1.28"
+refused "require 1.99"                     "require warden 1.99\n"                 "requires Warden 1.99"
 # Section 4: budgets on a wildcard allow rule
 accepted "names= and rate= on a wildcard"  "${R}allow host *.example.com:443 names=64 rate=10 acknowledge=dns-channel\n"
 accepted "the largest budgets"             "${R}allow host *.example.com names=100000 rate=10000 acknowledge=dns-channel\n"

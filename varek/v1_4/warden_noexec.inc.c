@@ -19,6 +19,23 @@ struct noexec_dir {
 };
 static struct noexec_dir g_nx[NOEXEC_MAX];
 static size_t g_nx_n;
+
+/* v1.29 (step 6): under `require warden 1.29`, a directory (or file) inside
+ * a listed one that no rule letting the agent write reaches keeps exec when
+ * the agent's own program, or a file of the launch set, is in it. A profile
+ * that lets the agent write one file in the home directory (Claude Code's
+ * ~/.claude.json) made the whole home noexec, and with it the agent's own
+ * install under ~/.local. Nothing in such a place can be written, renamed
+ * onto, linked or changed by the agent (each is a write on the name, and no
+ * writable rule matches it), so nothing the agent wrote can be mapped
+ * executable from it, which is what the mounts are for. */
+struct noexec_island {
+    char *path;            /* canonical; a directory, or a file */
+    char *in;              /* the listed directory it is inside */
+    bool  file;
+};
+static struct noexec_island g_nxi[NOEXEC_MAX];
+static size_t g_nxi_n;
 static bool   g_writable_exec;      /* --writable-exec: the operator turned the mounts off (D2) */
 
 /* Does path rule r allow some open that writes (an access mode of write or
@@ -118,6 +135,77 @@ static int noexec_canon_missing(const char *t, char *out, size_t on) {
     return 0;
 }
 
+/* v1.29: may writable rule r match s, or (a directory) a path inside it?
+ * Each rule is bounded by the constant before its first wildcard: every
+ * path it matches starts with it. So it reaches s when that constant is a
+ * prefix of s, or (a directory) lies inside s. An exact rule matches only
+ * its constant. A rule no directory bounds reaches everything. */
+static bool noexec_rule_reaches(const vdp_rule_t *r, const char *s, bool file) {
+    const char *c = r->s.c;
+    char stem[PATH_MAX], sd[PATH_MAX];
+    size_t sl = strlen(s);
+    snprintf(sd, sizeof sd, "%s/", s);
+    switch (r->s.op) {
+    case VDP_STR_EQ:
+        if (c[0] != '/') return false;
+        return file ? !strcmp(c, s) : noexec_under(c, s);
+    case VDP_STR_PREFIX:
+        if (c[0] != '/') return false;
+        snprintf(stem, sizeof stem, "%s", c);
+        break;
+    case VDP_STR_GLOB: {
+        size_t k = 0;
+        for (; c[k] && c[k] != '*' && c[k] != '?' && c[k] != '[' && c[k] != '\\' && k < sizeof stem - 1; k++)
+            stem[k] = c[k];
+        stem[k] = '\0';
+        if (k == 0) return true;
+        if (stem[0] != '/') return false;
+        break;
+    }
+    default:
+        return true;
+    }
+    size_t n = strlen(stem);
+    if (!strncmp(stem, s, n <= sl ? n : sl) && n <= sl) return true;        /* every name in s starts with it */
+    return !file && !strncmp(stem, sd, sl + 1);                            /* it lies inside s */
+}
+
+static bool noexec_reached(const struct policy *p, const char *s, bool file) {
+    for (size_t i = 0; i < p->v.n; i++)
+        if (noexec_rule_writable(&p->v.rules[i]) && noexec_rule_reaches(&p->v.rules[i], s, file))
+            return true;
+    return false;
+}
+
+static bool noexec_in_island(const char *path) {
+    for (size_t k = 0; k < g_nxi_n; k++)
+        if (g_nxi[k].file ? !strcmp(path, g_nxi[k].path) : noexec_under(path, g_nxi[k].path)) return true;
+    return false;
+}
+
+/* v1.29: find, or add, the place that keeps exec for file f (canonical)
+ * inside listed directory d. true when f is in one. */
+static bool noexec_island_for(const struct policy *p, const char *f, const char *d) {
+    if (noexec_in_island(f)) return true;
+    size_t dl = strlen(d);
+    char cand[PATH_MAX];
+    struct statvfs sv;
+    for (const char *q = f + (dl == 1 ? 1 : dl + 1); (q = strchr(q, '/')) != NULL; q++) {
+        snprintf(cand, sizeof cand, "%.*s", (int)(q - f), f);
+        if (noexec_reached(p, cand, false)) continue;
+        if (statvfs(cand, &sv) < 0 || (sv.f_flag & ST_NOEXEC)) return false;   /* noexec on the host too */
+        g_nxi[g_nxi_n].path = strdup(cand);
+        g_nxi[g_nxi_n].in = strdup(d);
+        g_nxi[g_nxi_n].file = false;
+        return g_nxi[g_nxi_n].path && g_nxi[g_nxi_n++].in;
+    }
+    if (noexec_reached(p, f, true) || statvfs(f, &sv) < 0 || (sv.f_flag & ST_NOEXEC)) return false;
+    g_nxi[g_nxi_n].path = strdup(f);
+    g_nxi[g_nxi_n].in = strdup(d);
+    g_nxi[g_nxi_n].file = true;
+    return g_nxi[g_nxi_n].path && g_nxi[g_nxi_n++].in;
+}
+
 /* Build the list (launches on, the mounts not turned off). 0, or -1 with
  * the reason printed (the Warden does not start). */
 static int noexec_build(const struct policy *p, const char *boot_path) {
@@ -194,9 +282,21 @@ static int noexec_build(const struct policy *p, const char *boot_path) {
     size_t w = 0;
     for (size_t k = 0; k < g_nx_n; k++) if (g_nx[k].path) g_nx[w++] = g_nx[k];
     g_nx_n = w;
-    /* the operator's own program must be launchable */
+    /* v1.29: the places that keep exec (under `require warden 1.29`) */
+    g_nxi_n = 0;
     char breal[PATH_MAX];
-    if (boot_path && realpath(boot_path, breal))
+    if (p->v.open_as_agent) {
+        for (size_t k = 0; k < g_nx_n; k++) {
+            if (boot_path && realpath(boot_path, breal) && noexec_under(breal, g_nx[k].path) &&
+                g_nxi_n < NOEXEC_MAX)
+                (void)noexec_island_for(p, breal, g_nx[k].path);
+            for (size_t e = 0; e < g_exec_n && g_nxi_n < NOEXEC_MAX; e++)
+                if (noexec_under(g_exec_rs[e].path, g_nx[k].path))
+                    (void)noexec_island_for(p, g_exec_rs[e].path, g_nx[k].path);
+        }
+    }
+    /* the operator's own program must be launchable */
+    if (boot_path && realpath(boot_path, breal) && !noexec_in_island(breal))
         for (size_t k = 0; k < g_nx_n; k++)
             if (noexec_under(breal, g_nx[k].path)) {
                 fprintf(stderr, "[warden] noexec: the agent's own program %s is under %s, which policy "
@@ -208,7 +308,7 @@ static int noexec_build(const struct policy *p, const char *boot_path) {
      * (D4). v1.27.1 review: the program's own interpreter, or a loader, under
      * one would stop the program itself, so as for the program: refused. */
     for (size_t e = 0; e < g_exec_n; e++)
-        for (size_t k = 0; k < g_nx_n; k++)
+        for (size_t k = 0; k < g_nx_n && !noexec_in_island(g_exec_rs[e].path); k++)
             if (noexec_under(g_exec_rs[e].path, g_nx[k].path) &&
                 (!strcmp(g_exec_rs[e].why, "interpreter") || !strcmp(g_exec_rs[e].why, "loader"))) {
                 fprintf(stderr, "[warden] noexec: %s, the %s a launch needs, is under %s, which policy "
@@ -323,6 +423,19 @@ static int noexec_mount(void) {
             return -1;
         }
     }
+    /* v1.29: the places that keep exec, bound again over the noexec mount
+     * (their own mount only: one beneath stays as it now is) */
+    for (size_t k = 0; k < g_nxi_n; k++) {
+        const char *s = g_nxi[k].path;
+        struct statvfs sv;
+        if (mount(s, s, NULL, MS_BIND | MS_REC, NULL) < 0 ||
+            mount(NULL, s, NULL, MS_BIND | MS_REMOUNT | noexec_keep_flags(s), NULL) < 0 ||
+            statvfs(s, &sv) < 0 || (sv.f_flag & ST_NOEXEC)) {
+            fprintf(stderr, "[warden] noexec: cannot keep %s executable (%s); refusing to start\n", s,
+                    strerror(errno ? errno : EPERM));
+            return -1;
+        }
+    }
     /* v1.27.1 review: the working directory (which the agent inherits) was
      * taken before the mounts, so it still points into the mount beneath a
      * new one, and a relative lookup from it would stay there. Enter it again
@@ -376,7 +489,7 @@ static bool noexec_breach(const char *resolved, int fd) {
     if (g_writable_exec || !g_nx_n || !resolved || resolved[0] != '/') return false;
     bool under = false;
     for (size_t k = 0; k < g_nx_n && !under; k++) under = noexec_under(resolved, g_nx[k].path);
-    if (!under) return false;
+    if (!under || noexec_in_island(resolved)) return false;          /* v1.29: kept executable */
     struct statvfs sv;
     return fstatvfs(fd, &sv) < 0 || !(sv.f_flag & ST_NOEXEC);
 }
@@ -400,4 +513,15 @@ static void noexec_record(FILE *f) {
                 g_nx[k].missing ? ",\"missing\":true" : "");
     }
     fputs("],", f);
+    if (g_changes_on) {                                  /* v1.29: what keeps exec inside them */
+        fputs("\"noexec_exec\":[", f);
+        for (size_t k = 0; k < g_nxi_n; k++) {
+            fprintf(f, "%s{\"path\":\"", k ? "," : "");
+            json_escape(f, g_nxi[k].path);
+            fputs("\",\"in\":\"", f);
+            json_escape(f, g_nxi[k].in);
+            fprintf(f, "\"%s}", g_nxi[k].file ? ",\"file\":true" : "");
+        }
+        fputs("],", f);
+    }
 }

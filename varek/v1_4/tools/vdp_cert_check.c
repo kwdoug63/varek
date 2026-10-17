@@ -173,9 +173,10 @@ int main(int argc, char **argv) {
                       strcmp(argv[2], "holds") && strcmp(argv[2], "openable") &&
                       strcmp(argv[2], "kinds") && strcmp(argv[2], "rules") && strcmp(argv[2], "proxy") &&
                       strcmp(argv[2], "launches") && strcmp(argv[2], "matches") &&
+                      strcmp(argv[2], "openas") &&
                       strcmp(argv[2], "credentials") && strcmp(argv[2], "identity"))) {
         fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds|rules|matches|proxy|launches|"
-                "credentials|identity\n", argv[0]);
+                "openas|credentials|identity\n", argv[0]);
         return 2;
     }
     FILE *f = fopen(argv[1], "rb");
@@ -214,6 +215,13 @@ int main(int argc, char **argv) {
      * 1.27), else "off". varek_audit.py reads it from here. */
     if (!strcmp(argv[2], "launches")) {
         printf("%s\n", pol.launches ? "on" : "off");
+        vdpc_free(&pol);
+        return 0;
+    }
+    /* v1.29: "on" when files are opened with the agent's credentials
+     * (require warden 1.29), else "off" */
+    if (!strcmp(argv[2], "openas")) {
+        printf("%s\n", pol.open_as_agent ? "on" : "off");
         vdpc_free(&pol);
         return 0;
     }

@@ -249,6 +249,11 @@ typedef struct {
      * exec rules. Without it every later launch is refused, as in v1.26,
      * whatever the exec rules say. Not part of any decision. */
     bool       launches;
+    /* v1.29 (docs/security/v1.29-varek-run.md, section 1): `require warden
+     * 1.29` (or later) was given, so the Warden opens each file it hands the
+     * agent with the agent's own user, group and supplementary groups. Not
+     * part of any decision. */
+    bool       open_as_agent;
     /* v1.28: the credentials the policy names, in order */
     vdp_cred_t creds[VDP_MAX_CREDS];
     size_t     ncreds;
@@ -522,10 +527,12 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * so a policy that relies on launches fails closed there.
  * v1.28: credential release, `credential NAME from STORE:REF` and an allow
  * request rule's `credential=NAME header=HEADER[:SCHEME]`; a v1.27 Warden
- * refuses both, so the policy fails closed there. */
+ * refuses both, so the policy fails closed there.
+ * v1.29: `require warden 1.29` has the Warden open files as the agent; a
+ * v1.28 Warden refuses the directive, so the policy fails closed there. */
 #define VDP_WARDEN_MAJOR 1
-#define VDP_WARDEN_MINOR 28
-#define VDP_WARDEN_PATCH 1      /* v1.27.1: the Warden's version beyond the grammar's (v1.28.1) */
+#define VDP_WARDEN_MINOR 29
+#define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's (v1.29.0) */
 
 /* v1.27: a note on exec rule i, for lint and the Warden's load-time notes,
  * in buf (empty: none); returns its length. An allow exec rule naming a shell

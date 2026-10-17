@@ -83,7 +83,7 @@
 #include <stdint.h>
 
 #define VDPC_GRAMMAR_MAJOR 1
-#define VDPC_GRAMMAR_MINOR 28
+#define VDPC_GRAMMAR_MINOR 29
 
 #define VDPC_MAX_S        4095
 #define VDPC_MAX_RULES    256
@@ -128,6 +128,7 @@ typedef struct {
     char          proxy_pass[64][254];/* v1.26.1: `proxy passthrough host NAME`, in order */
     size_t        proxy_npass;
     int           launches;           /* v1.27: `require warden 1.27` (launches decided) */
+    int           open_as_agent;      /* v1.29: `require warden 1.29` (files opened as the agent) */
     vdpc_cred_t   creds[VDPC_MAX_CREDS]; /* v1.28: the credentials, in order */
     size_t        ncreds;
     vdpc_issuer_t issuers[VDPC_MAX_ISSUERS]; /* v1.28.1 */

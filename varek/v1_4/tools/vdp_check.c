@@ -115,7 +115,7 @@ static const char *reach_name(vdp_reach_t r) {
 
 int main(int argc, char **argv) {
     if (argc != 3 && !(argc == 4 && !strcmp(argv[2], "analyze") && !strcmp(argv[3], "automaton"))) {
-        fprintf(stderr, "usage: %s <policy> lint|analyze [automaton]|batch|launches|credentials|identity\n", argv[0]);
+        fprintf(stderr, "usage: %s <policy> lint|analyze [automaton]|batch|launches|openas|credentials|identity\n", argv[0]);
         return 2;
     }
     if (argc == 4) vdp_reach_force_automaton = true;
@@ -130,6 +130,11 @@ int main(int argc, char **argv) {
     /* v1.27: are launches after the first decided (require warden 1.27)? */
     if (!strcmp(argv[2], "launches")) {
         printf("%s\n", g_pol.launches ? "on" : "off");
+        return 0;
+    }
+    /* v1.29: are files opened with the agent's credentials (require warden 1.29)? */
+    if (!strcmp(argv[2], "openas")) {
+        printf("%s\n", g_pol.open_as_agent ? "on" : "off");
         return 0;
     }
     /* v1.28: the credentials and the rules that carry them, as this parser

@@ -277,6 +277,189 @@ def policy_launches(checker, policy):
     return f == ["on"]
 
 
+def policy_openas(checker, policy):
+    """v1.29: whether files are opened, and changed by name, as the agent
+    (require warden 1.29), as the checker reads the policy."""
+    rq = subprocess.run([checker, policy, "openas"], capture_output=True, text=True)
+    f = rq.stdout.split()
+    if rq.returncode != 0 or f not in (["on"], ["off"]):
+        raise ValueError("the checker failed on the policy's openas")
+    return f == ["on"]
+
+
+# v1.29 (D12): the changes by name, each decided as a path with these flags
+# (warden_change.inc.c), and the rules of an allowed one
+CHANGE_FLAGS = {
+    "file.unlink": ("0x201",), "file.rmdir": ("0x201",), "file.mkdir": ("0xc1",),
+    "file.rename_from": ("0x202", "0x242"), "file.rename_to": ("0x241", "0x242"),
+    "file.chmod": ("0x1",), "file.utime": ("0x1",), "file.truncate": ("0x201",),
+    "file.chdir": ("0x10000",),
+}
+CHANGE_RULES = ("change_done", "change_failed", "chdir_continued")
+# v1.29 (step 6): a mkdir of a name that is there, answered EEXIST as the
+# kernel would, decided as a lookup (flags 0x0): one the policy allows
+# reading (certified), or a directory the policy leads to
+MKDIR_EXISTS_RULES = ("mkdir_exists", "mkdir_exists_ancestor")
+
+
+# v1.29 (section 3, D2): refusals a dry run never lets through; a record of
+# one marked "enforced":false is not the Warden's
+DRY_NEVER_LET = ("protected_object", "raw_device", "view_write_refused", "change_on_kernel_fs",
+                 "resolution_failed", "revoked", "subagent_unattributed", "subagent_threaded",
+                 "subagent_same_image", "subagent_limit", "subagent_depth", "subagent_failed",
+                 "intent_derivation_failed", "rename_directory_refused", "bad_descriptor",
+                 "bad_address", "family_refused", "unspec_refused", "dns_refused")
+
+
+def check_dry(meta, records, problems):
+    """v1.29 (section 5, D10): a dry run's stream. True if it is one.
+
+    Every record with "enforced":false is in a stream whose run_start says
+    mode dry_run, refuses (DENY: the policy's verdict, which the dry run let
+    through), and is not of a kind a dry run never lets through; none comes
+    after a revocation; run_end says the same mode and counts them. In a
+    stream that is not a dry run, no record says enforced:false."""
+    rs = meta.get("run_start", {})
+    dry = rs.get("mode") == "dry_run"
+    if rs.get("mode") not in (None, "dry_run"):
+        problems.append(f"run_start's mode {rs.get('mode')!r} is not one the Warden writes")
+    end = [meta["run_end"]] if isinstance(meta.get("run_end"), dict) else []
+    if end and end[-1].get("mode") != rs.get("mode"):
+        problems.append(f"run_end's mode {end[-1].get('mode')!r} is not run_start's {rs.get('mode')!r}")
+    # the revocation is one of the credential events; order by stream line
+    lines = meta.get("lineno", {})
+    at = lambda r: lines.get(id(r), 0)
+    rv = [at(e) for _, e in meta.get("cred_events", []) if e.get("event") == "revoked"]
+    rline = min(rv) if rv else None
+    n = 0
+    by_seq = {r.get("seq"): r for r in records if isinstance(r, dict) and type(r.get("seq")) is int}
+    for r in list(records) + list(meta.get("dns_events", [])):
+        if not isinstance(r, dict) or "enforced" not in r:
+            continue
+        seq = r.get("seq", r.get("name"))
+        if r.get("enforced") is not False:
+            problems.append(f"seq {seq}: \"enforced\" is {r.get('enforced')!r}; the Warden writes only false")
+            continue
+        n += 1
+        if not dry:
+            problems.append(f"seq {seq}: a record not enforced, in a run that is not a dry run")
+            continue
+        if r.get("event") == "dns_question":
+            if r.get("rule") not in ("no_rule", "wildcard_budget"):
+                problems.append(f"seq {seq}: a stub question not enforced with rule {r.get('rule')!r}")
+        elif r.get("decision_final") != "DENY":
+            problems.append(f"seq {seq}: a record not enforced whose verdict is {r.get('decision_final')!r}: "
+                            f"a dry run lets through only what the policy refused")
+        if r.get("rule") in DRY_NEVER_LET:
+            problems.append(f"seq {seq}: {r.get('rule')} let through: a dry run never lets it through")
+        # a rename let through: both its names decided and recorded, the old
+        # then the new (v1.29 review)
+        act = r.get("action")
+        if act in ("file.rename_from", "file.rename_to") and type(seq) is int:
+            other = by_seq.get(seq + 1 if act == "file.rename_from" else seq - 1)
+            want = "file.rename_to" if act == "file.rename_from" else "file.rename_from"
+            if not other or other.get("action") != want or other.get("enforced") is not False or \
+                    other.get("agent_pid") != r.get("agent_pid"):
+                problems.append(f"seq {seq}: a rename let through without its "
+                                f"{'new' if want == 'file.rename_to' else 'old'} name decided and recorded "
+                                f"{'next' if want == 'file.rename_to' else 'before it'}")
+        if rline is not None and at(r) > rline:
+            problems.append(f"seq {seq}: a call let through after the run was revoked")
+    if dry and end and end[-1].get("not_enforced") != n:
+        problems.append(f"run_end counts {end[-1].get('not_enforced')!r} calls not enforced; the stream holds {n}")
+    if not dry and end and "not_enforced" in end[-1]:
+        problems.append("run_end counts calls not enforced in a run that is not a dry run")
+    return dry
+
+
+def check_open_as(meta, openas_policy, problems):
+    """v1.29 (section 1): run_start's open_as against the policy and the run"""
+    rs = meta.get("run_start", {})
+    oa = rs.get("open_as")
+    if not openas_policy:
+        if oa is not None:
+            problems.append("run_start says files were opened as the agent, but the policy does not say "
+                            "require warden 1.29")
+        return
+    if not isinstance(oa, dict):
+        problems.append("the policy says require warden 1.29, but run_start does not say whom files were "
+                        "opened as")
+    elif oa.get("agent") is True:
+        if not (type(oa.get("uid")) is int and type(oa.get("gid")) is int and oa["uid"] > 0 and oa["gid"] > 0
+                and isinstance(oa.get("groups"), list) and all(type(g) is int and g > 0 for g in oa["groups"])):
+            problems.append(f"run_start's open_as {oa!r} is malformed (or names root)")
+    elif oa != {"agent": False, "why": "run_as_root"}:
+        problems.append(f"run_start's open_as {oa!r} is malformed")
+
+
+def check_baseline(meta, policy, problems):
+    """v1.29 (section 2): a baseline's #@ header and run_start's baseline agree"""
+    rs = meta.get("run_start", {})
+    b = rs.get("baseline")
+    try:
+        with open(policy, encoding="utf-8", errors="replace") as fh:
+            head = [ln.rstrip("\n") for ln in fh.readlines()[:8]]
+    except OSError:
+        head = []
+    hdr = {}
+    if head and head[0] == "#@ varek baseline 1":
+        for ln in head[1:]:
+            if not ln.startswith("#@ "):
+                break
+            k, _, v = ln[3:].partition(" ")
+            hdr[k] = v
+    if not hdr and b is None:
+        return
+    if not hdr:
+        problems.append("run_start names a baseline, but the policy file is not one")
+        return
+    if not isinstance(b, dict):
+        problems.append("the policy is a baseline, but run_start does not say so")
+        return
+    prof = hdr.get("profile", "").split(" ")
+    want = {"format": 1, "profile": prof[0] if prof else "", "cwd": hdr.get("cwd"), "home": hdr.get("home"),
+            "user": hdr.get("user"), "tmp": hdr.get("tmp"),
+            "profile_sha256": prof[1] if len(prof) > 1 and prof[1] != "-" else ""}
+    if b != want:
+        problems.append(f"run_start's baseline {b!r} is not the policy file's header {want!r}")
+
+
+def check_changes(records, openas_policy, problems):
+    """v1.29: every change by name is in a run whose policy says require
+    warden 1.29; an allowed one carries the flags its kind is decided as; a
+    rename's old and new names are recorded together (seq n and n+1, the same
+    process and outcome), never one without the other."""
+    allowed = [r for r in records if r.get("action") in CHANGE_FLAGS and r.get("decision_final") == "ALLOW"]
+    if not openas_policy:
+        for r in records:
+            if r.get("action") in CHANGE_FLAGS:
+                problems.append(f"seq {r.get('seq')}: a change by name ({r.get('action')}) in a run whose "
+                                f"policy does not say require warden 1.29")
+        return
+    by_seq = {r.get("seq"): r for r in records if type(r.get("seq")) is int}
+    for r in allowed:
+        act, seq = r["action"], r.get("seq")
+        if r.get("rule") in MKDIR_EXISTS_RULES:                       # step 6
+            if act != "file.mkdir" or r.get("open_flags") != "0x0" or r.get("errno") != 17:
+                problems.append(f"seq {seq}: {act} recorded {r.get('rule')}, which the Warden writes only for "
+                                f"a mkdir decided as a lookup (0x0) and answered EEXIST")
+            continue
+        if r.get("open_flags") not in CHANGE_FLAGS[act]:
+            problems.append(f"seq {seq}: {act} allowed as open flags {r.get('open_flags')!r}, not as its "
+                            f"kind is decided ({'/'.join(CHANGE_FLAGS[act])})")
+        if (act == "file.chdir") != (r.get("rule") == "chdir_continued"):
+            problems.append(f"seq {seq}: {act} allowed with rule {r.get('rule')!r}")
+        if act == "file.rename_from":
+            nx = by_seq.get(seq + 1) if type(seq) is int else None
+            if not nx or nx.get("action") != "file.rename_to" or nx.get("decision_final") != "ALLOW" or \
+                    nx.get("agent_pid") != r.get("agent_pid") or nx.get("rule") != r.get("rule"):
+                problems.append(f"seq {seq}: a rename allowed without its new name decided and recorded next")
+        if act == "file.rename_to":
+            pv = by_seq.get(seq - 1) if type(seq) is int else None
+            if not pv or pv.get("action") != "file.rename_from" or pv.get("decision_final") != "ALLOW":
+                problems.append(f"seq {seq}: a rename's new name allowed without its old name before it")
+
+
 V127_RULES = ("exec_allowed", "exec_not_in_ruleset", "exec_no_landlock", "exec_identity_mismatch",
               "exec_identity_unreadable", "open_not_found")
 
@@ -382,6 +565,65 @@ def noexec_target(r):
             return (out[:1] if sl == 0 else out[:sl]), False
         return (out[:-1] if len(out) > 1 and out.endswith("/") else out), True
     return "", False
+
+
+def noexec_rule_reaches(r, s, file):
+    """v1.29 (step 6): may writable rule r match s, or (a directory) a path
+    inside it? As warden_noexec.inc.c's noexec_rule_reaches: every path a
+    rule matches starts with its constant before the first wildcard."""
+    c, m = r["c"], r.get("match")
+    if m == "exact":
+        return c.startswith("/") and (c == s if file else _nx_under(c, s))
+    if m == "prefix":
+        if not c.startswith("/"):
+            return False
+        stem = c
+    elif m == "glob":
+        k = 0
+        while k < len(c) and c[k] not in "*?[\\":
+            k += 1
+        if k == 0:
+            return True
+        stem = c[:k]
+        if not stem.startswith("/"):
+            return False
+    else:
+        return True
+    return s.startswith(stem) or (not file and stem.startswith(s + "/"))
+
+
+def check_noexec_exec(meta, rules, openas, problems):
+    """v1.29 (step 6): under `require warden 1.29`, run_start's noexec_exec:
+    each place inside a directory mounted noexec that keeps exec (for the
+    agent's own program or a file of the launch set). Each must be inside
+    one listed directory, spelled canonically, and reached by no rule that
+    lets the agent write; none of them is recorded under an earlier policy."""
+    rs = meta.get("run_start", {})
+    nx, ne = rs.get("noexec"), rs.get("noexec_exec")
+    if not openas or not isinstance(nx, list):
+        if ne is not None:
+            problems.append("run_start records places kept executable inside the noexec mounts, but the "
+                            "policy does not say require warden 1.29 (or nothing is mounted noexec)")
+        return
+    if not isinstance(ne, list) or not all(
+            isinstance(e, dict) and set(e) <= {"path", "in", "file"} and isinstance(e.get("path"), str)
+            and isinstance(e.get("in"), str) and e.get("file", True) is True for e in ne):
+        problems.append("run_start's noexec_exec is missing or malformed")
+        return
+    listed = {e["path"] for e in nx if not e.get("missing")}
+    writable = [r for r in rules if path_rule_writable(r)]
+    for e in ne:
+        p, d = e["path"], e["in"]
+        if os.path.normpath(p) != p or p.startswith("//") or not p.startswith("/"):
+            problems.append(f"run_start's noexec_exec names {p!r}, which is not spelled as a canonical path")
+        elif d not in listed or p == d or not _nx_under(p, d):
+            problems.append(f"run_start's noexec_exec keeps {p!r} executable inside {d!r}, which is not a "
+                            f"directory run_start's noexec mounts, or does not hold it")
+        else:
+            hit = [r["line"] for r in writable if noexec_rule_reaches(r, p, bool(e.get("file")))]
+            if hit:
+                problems.append(f"run_start's noexec_exec keeps {p!r} executable, but policy line {hit[0]} "
+                                f"lets the agent write there")
 
 
 def _open_writes(flags):
@@ -1772,7 +2014,7 @@ def check_dns(meta, checker, policy, rules, problems):
     # allow rule (v1.26: or the proxy on and a host name rule), and is always
     # at the same address
     stub = wild or (pports is not None and any(r["kind"] == "h" and r["name"] and not r["wild"]
-                                               for r in rules))
+                                               for r in rules)) or rs.get("mode") == "dry_run"   # v1.29
     if rs.get("dns_stub") != (STUB if stub else None):
         problems.append(f"run_start's dns_stub {rs.get('dns_stub')!r} is not the policy's "
                         f"({STUB if stub else 'none'})")
@@ -1791,6 +2033,8 @@ def check_dns(meta, checker, policy, rules, problems):
         problems.append("synthetic addresses given, but the policy does not turn the proxy on")
     syn_given, syn_taken = {}, set()
     charged, used, window, pending, latest = {}, {}, {}, {}, {}
+    dry = rs.get("mode") == "dry_run"                           # v1.29
+    dry_sent = set()        # names a dry run looked up that the policy refuses (charged to nothing)
     last_mono = None
     nq = nb = 0
     for e in events:
@@ -1814,7 +2058,7 @@ def check_dns(meta, checker, policy, rules, problems):
             if e.get("dynamic") is True:
                 if name not in pending:
                     problems.append(f"{name}: looked up on demand with no question sending it upstream")
-                if name not in charged:
+                if name not in charged and name not in dry_sent:
                     problems.append(f"{name}: looked up on demand but never charged to a rule")
                 pending.pop(name, None)
             elif name not in exact_names:
@@ -1836,6 +2080,26 @@ def check_dns(meta, checker, policy, rules, problems):
         if rule == "revoked":                    # v1.28 review: after `varek revoke`, refused, nothing looked up
             if ans != "refused" or e.get("new") or e.get("upstream") or e.get("synthetic"):
                 problems.append(f"{name!r}: a question after the revocation was answered {ans}")
+            continue
+        if e.get("enforced") is False:
+            # v1.29: a dry run answers a name the policy refuses (no rule, or
+            # past a wildcard's budget) as it would an allowed one: looked up
+            # (sent upstream, charged to no rule) or from what was looked up
+            # (check_dry checks the run is a dry run)
+            if not dry or rule not in ("no_rule", "wildcard_budget") or e.get("synthetic") or \
+                    (rule == "no_rule" and (line != -1 or by_rule.get(name) is not None)) or \
+                    (rule == "wildcard_budget" and line not in wild) or \
+                    (e.get("upstream") is True) != (ans == "lookup") or ans == "nxdomain":
+                problems.append(f"{name!r}: a question let through by a dry run that is not an answer to "
+                                f"a name the policy refuses")
+                continue
+            if rule == "wildcard_budget":
+                nb += 1
+            if e.get("upstream") is True:
+                if name in pending:
+                    problems.append(f"{name}: sent upstream again while its lookup was outstanding")
+                pending[name] = ts if type(ts) is int else 0
+            dry_sent.add(name)
             continue
         if rule in ("no_rule", "not_a_host_name", "malformed"):
             if ans not in ("nxdomain", "formerr") or e.get("new") or e.get("upstream"):
@@ -2543,12 +2807,23 @@ def main(argv=None):
         launches_policy = False
     check_exec_set(meta, launches_policy, problems, records)
     try:
+        openas_policy = policy_openas(a.checker, a.policy)          # v1.29
+    except (OSError, ValueError) as e:
+        problems.append(f"checker failed on the policy's openas: {e}")
+        openas_policy = False
+    check_changes(records, openas_policy, problems)
+    check_open_as(meta, openas_policy, problems)                     # v1.29
+    check_baseline(meta, a.policy, problems)
+    dry_run = check_dry(meta, records, problems)
+    try:
         check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, problems, records)   # v1.27.1
+        check_noexec_exec(meta, policy_rules(a.checker, a.policy), openas_policy, problems)          # v1.29
     except (OSError, ValueError) as e:
         problems.append(f"checker failed on the policy's rules: {e}")
     exec_ok = 0
     stub_policy = wild_policy or (proxy_ports is not None and any(
-        r["kind"] == "h" and r["name"] and not r["wild"] for r in prules))
+        r["kind"] == "h" and r["name"] and not r["wild"] for r in prules)) or \
+        meta.get("run_start", {}).get("mode") == "dry_run"          # v1.29: the stub runs in a dry run
     if wild_policy:
         check_shared_lists(meta, a, problems)
     # v1.25 review: from 1.25 the Warden records the end of every grace
@@ -2579,7 +2854,9 @@ def main(argv=None):
             if launches > 1:
                 problems.append(f"seq {rec.get('seq')}: a second launch exec")
             continue
-        if rec.get("action") in META_ACTIONS and rec.get("rule") == "metadata_ancestor":
+        if rec.get("action") in META_ACTIONS + ("file.mkdir",) and \
+                rec.get("rule") == ("mkdir_exists_ancestor" if rec.get("action") == "file.mkdir"
+                                    else "metadata_ancestor"):
             if ancestors is None:
                 ancestors = policy_ancestors(a.policy)
             if rec.get("resolved") not in ancestors:
@@ -2665,7 +2942,7 @@ def main(argv=None):
             elif trust and rec.get("resolved") not in TRUST_VIEW_RULES[rec["rule"]]:
                 problems.append(f"seq {rec.get('seq')}: a {rec['rule']} answered an open of "
                                 f"{rec.get('resolved')!r}")
-            elif not trust and not names_policy:
+            elif not trust and not names_policy and not dry_run:    # v1.29: a dry run's views
                 problems.append(f"seq {rec.get('seq')}: a view answered, but run_start says the "
                                 f"policy has no host name rules")
             elif not trust and rec.get("resolved") != VIEW_RULES[rec["rule"]]:
@@ -2729,13 +3006,18 @@ def main(argv=None):
                 fl = int(str(rec.get("open_flags")), 16)
             except ValueError:
                 fl = os.O_CREAT
-            if not launches_policy or fl & os.O_CREAT or rec.get("errno") != 2 \
+            # v1.29: under require warden 1.29 a create whose directory is missing too
+            if not launches_policy or (fl & os.O_CREAT and not openas_policy) or rec.get("errno") != 2 \
                     or rec.get("kernel_verdict") == "ALLOW":
                 problems.append(f"seq {rec.get('seq')}: an open recorded as not found, which the Warden "
                                 f"writes only with launches on, for an open that does not create, "
                                 f"answered ENOENT")
                 continue
-        is_meta = rec.get("action") in META_ACTIONS and rec.get("rule") in META_RULES
+        is_meta = (rec.get("action") in META_ACTIONS and rec.get("rule") in META_RULES) or \
+                  (rec.get("action") == "file.mkdir" and rec.get("rule") == "mkdir_exists")   # v1.29
+        # v1.29: a change by name, decided as a path with its flags (check_changes)
+        is_change = rec.get("action") in CHANGE_FLAGS and rec.get("rule") in CHANGE_RULES
+        is_meta = is_meta or is_change
         is_conn = rec.get("action") == "net.connect" and rec.get("rule") in CONNECT_RULES
         # v1.26 (step 6): a name:port the proxy read, allowed: certified as a connect is
         is_proxy = rec.get("action") == "net.proxy" and rec.get("rule") in PROXY_ALLOW_RULES
@@ -2974,6 +3256,14 @@ def main(argv=None):
               f"(policy {meta['run_start'].get('policy_path')!r})")
     for pr in problems[:50]:
         print(f"  PROBLEM {pr}")
+    # v1.29 (D10): a dry run that passes is verified and NOT ENFORCED, with
+    # an exit code of its own, so a script that reads 0 as "enforced" cannot
+    # mistake it
+    if dry_run and not problems:
+        nd = sum(1 for r in list(records) + list(meta.get("dns_events", []))
+                 if isinstance(r, dict) and r.get("enforced") is False)
+        print(f"varek_audit: VERIFIED: DRY RUN, NOT ENFORCED ({nd} call(s) the policy refuses were let through)")
+        return 3
     print(f"varek_audit: {'PASS' if not problems else 'FAIL'}")
     return 0 if not problems else 1
 

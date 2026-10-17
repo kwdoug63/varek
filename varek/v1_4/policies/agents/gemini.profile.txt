@@ -1,0 +1,12 @@
+#@ profile gemini
+#@ about Gemini CLI (Google)
+#@ commands gemini gemini-cli
+#@ programs node rg
+# Built in v1.29 step 6 from dry runs of the Gemini CLI 0.63.0 (the npm
+# package) and `varek policy suggest`, then the same runs enforcing.
+allow path exact ${HOME}/.gemini                    # made on first use
+allow path ${HOME}/.gemini/                         # configuration, history, sessions
+# the npm package (npm install -g), under a user prefix (the system's is under
+# /usr/); its scope, since it looks for files beside the package (locales/)
+allow path ${HOME}/.npm-global/lib/node_modules/@google/ readonly
+allow host generativelanguage.googleapis.com:443    # the model API (an API key)

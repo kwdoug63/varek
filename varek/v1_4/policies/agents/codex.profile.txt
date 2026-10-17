@@ -1,0 +1,19 @@
+#@ profile codex
+#@ about OpenAI Codex CLI
+#@ commands codex
+#@ programs node rg
+# Built in v1.29 step 6 from dry runs of the Codex CLI 0.162.1 (the npm
+# package) and `varek policy suggest`, then the same runs enforcing.
+allow path exact ${HOME}/.codex                     # made on first use
+allow path ${HOME}/.codex/                          # configuration, sign-in, sessions, its databases
+allow path ${HOME}/.agents/ readonly                # skills shared between agents
+# Under VAREK, run it with `--sandbox danger-full-access`: its own sandbox
+# (bubblewrap) needs user namespaces, which the Warden refuses.
+# the npm package (npm install -g), under a user prefix or the system's; its
+# native program is under vendor/
+allow path ${HOME}/.npm-global/lib/node_modules/@openai/codex/ readonly
+allow exec prefix ${HOME}/.npm-global/lib/node_modules/@openai/codex/
+allow exec prefix /usr/lib/node_modules/@openai/codex/
+allow exec prefix /usr/local/lib/node_modules/@openai/codex/
+allow host api.openai.com:443                       # the model API (an API key)
+allow host chatgpt.com:443                          # the model API (signed in with ChatGPT)

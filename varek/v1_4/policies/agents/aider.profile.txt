@@ -1,0 +1,17 @@
+#@ profile aider
+#@ about Aider
+#@ commands aider aider-chat
+#@ programs python3
+# Built in v1.29 step 6 from dry runs of Aider 0.86.2 (installed as a uv tool,
+# as aider-install does) and `varek policy suggest`, then the same runs
+# enforcing. Its .aider* files are in the working directory.
+allow path exact ${HOME}/.aider                     # made on first use
+allow path ${HOME}/.aider/                          # caches, analytics settings
+# its virtual environment: uv tool (aider-install), or pipx; its scripts launch from bin/
+allow path ${HOME}/.local/share/uv/tools/aider-chat/ readonly
+allow exec prefix ${HOME}/.local/share/uv/tools/aider-chat/bin/
+allow path ${HOME}/.local/share/pipx/venvs/aider-chat/ readonly
+allow exec prefix ${HOME}/.local/share/pipx/venvs/aider-chat/bin/
+allow path ${HOME}/.local/lib/ readonly             # or pip install --user
+allow host api.openai.com:443
+allow host api.anthropic.com:443

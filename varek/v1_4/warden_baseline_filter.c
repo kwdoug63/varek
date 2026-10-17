@@ -37,6 +37,9 @@
 #define _GNU_SOURCE
 #endif
 #include "warden_baseline_filter.h"
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include <seccomp.h>
 #include <sched.h>
@@ -163,6 +166,56 @@ static const char *kMediate[] = {
     "access", "faccessat", "faccessat2", NULL
 };
 
+// v1.29 (docs/security/v1.29-varek-run.md, D12): under `require warden 1.29`
+// the changes by name go to the supervisor, which decides each as a write on
+// every path it names and carries it out as the agent (warden_change.inc.c).
+// Without it they fall to the default refusal, as before. link, linkat,
+// symlink and symlinkat are in neither list: a second name for a file is how
+// a deny rule would be escaped.
+static const char *kChange[] = {
+    "unlink", "unlinkat", "rmdir", "mkdir", "mkdirat", "rename", "renameat", "renameat2",
+    "chmod", "fchmod", "fchmodat", "fchmodat2", "utimensat", "truncate", "ftruncate", "chdir",
+    NULL
+};
+// fchdir: the agent's working directory becomes a directory it already holds
+// (an open the Warden decided); its later relative names are each decided.
+static const char *kChangeAdmit[] = { "fchdir", NULL };
+
+// v1.29 (step 6: dry runs of the coding agents' CLIs, then the same runs
+// enforcing): what they need that the lists above lack, under `require
+// warden 1.29` only (before it, refused as before).
+// stat and lstat, which musl calls (a statically linked agent, the Codex
+// CLI, looked nothing up), decided as newfstatat (warden.c).
+static const char *kMediate129[] = { "stat", "lstat", NULL };
+// Each acts on the caller, its own descriptors, or processes of its own PID
+// namespace (the agent runs as its init): its resource use (getrusage), a
+// system call the kernel restarts after a signal (restart_syscall), its
+// capabilities, read (capget), process groups and sessions (setpgid,
+// getpgid, getpgrp, getsid, setsid: shells and job control), a read-ahead
+// hint and an advisory lock on a descriptor it holds (fadvise64, flock), the
+// filesystem of a descriptor it holds (fstatfs), its timers (getitimer,
+// setitimer, alarm), its file creation mask (umask: the Warden reads it from
+// /proc when it creates a file for the agent), its own memory's NUMA policy
+// (mbind), and a descriptor for one of its processes (pidfd_open: the
+// descriptor can be waited on; pidfd_getfd is hard-denied and
+// pidfd_send_signal is not admitted).
+static const char *kAdmit129[] = {
+    "getrusage", "restart_syscall", "capget", "setpgid", "getpgid", "getpgrp", "getsid", "setsid",
+    "fadvise64", "flock", "fstatfs", "getitimer", "setitimer", "alarm", "umask", "mbind", "pidfd_open",
+    NULL
+};
+// prctl, for these options only (compared on the full 64-bit argument, as
+// ioctl's are): a thread's name, the signal at its parent's death, reading
+// whether it is dumpable, whether no_new_privs is set, its bounding set and
+// its securebits, and naming an anonymous mapping. Every other option (the
+// seccomp, dumpable, ptracer, capability and memory-map setters among them)
+// stays refused. PR_CAP_AMBIENT is admitted for PR_CAP_AMBIENT_IS_SET only.
+static const unsigned long kPrctlAdmit[] = {
+    PR_SET_NAME, PR_GET_NAME, PR_SET_PDEATHSIG, PR_GET_PDEATHSIG, PR_GET_DUMPABLE,
+    PR_GET_NO_NEW_PRIVS, PR_CAPBSET_READ, PR_GET_SECUREBITS,
+    0x53564d41UL,                 // PR_SET_VMA (Linux 5.17; anon_vma_name)
+};
+
 // HARD-DENY: never admissible (classes 3-6). KILL in strict mode, even in
 // observe mode.
 static const char *kHardDeny[] = {
@@ -211,6 +264,72 @@ static int add_list(scmp_filter_ctx ctx, const char **names, uint32_t action) {
         int nr = seccomp_syscall_resolve_name(names[i]);
         if (nr == __NR_SCMP_ERROR) continue;   // unknown here -> left to default
         int rc = seccomp_rule_add(ctx, action, nr, 0);
+        if (rc < 0 && rc != -EEXIST) return rc;
+    }
+    return 0;
+}
+
+static bool in_list(const char **names, const char *n) {
+    for (size_t i = 0; names[i]; ++i) if (!strcmp(names[i], n)) return true;
+    return false;
+}
+
+static const char *kChange[];
+static const char *kChangeAdmit[];
+static const char *kMediate129[];
+static const char *kAdmit129[];
+static const char *kMediate[];
+static const char *kHardDeny[];
+static const char *kAdmit[];
+
+// v1.29: a dry run sends every native system call the filter names nowhere
+// to the supervisor (which records it and lets the kernel carry it out),
+// instead of the default refusal. (The kernel takes no NOTIFY default.) A call
+// with argument rules (ioctl's commands, kill of a group, clone's namespace
+// bits, setsockopt's routing options, sendto, unshare, clone3,
+// io_uring_setup) keeps them: what they refuse stays refused.
+//
+// v1.29 review: never the calls that reach a file by a name or a handle
+// (the Warden's checks of the protected objects and kernel filesystems are
+// made on opens and changes it mediates; openat2 or creat would read or
+// write the verdict stream past them), other processes, or the system. Those
+// stay refused (EPERM), as when enforcing, and are not recorded; so are the
+// changes by name and stat/lstat under a policy before 1.29, which the
+// Warden mediates only from 1.29.
+static const char *const kDryNever[] = {
+    "creat", "openat2", "open_by_handle_at", "name_to_handle_at", "uselib",
+    "link", "linkat", "symlink", "symlinkat", "mknod", "mknodat",
+    "chown", "fchown", "fchownat", "lchown", "utime", "utimes", "futimesat",
+    "setxattr", "lsetxattr", "fsetxattr", "removexattr", "lremovexattr", "fremovexattr",
+    "getxattr", "lgetxattr", "fgetxattr", "listxattr", "llistxattr", "flistxattr",
+    "setxattrat", "getxattrat", "listxattrat", "removexattrat", "file_getattr", "file_setattr",
+    "inotify_add_watch", "fanotify_init", "fanotify_mark", "statfs", "ustat", "sysfs",
+    "statmount", "listmount", "mount_setattr", "fspick", "lookup_dcookie", "nfsservctl",
+    "acct", "chroot", "pivot_root", "swapon", "swapoff", "quotactl", "quotactl_fd",
+    "kcmp", "migrate_pages", "move_pages", "process_madvise", "process_mrelease",
+    "pidfd_send_signal", "tkill", "rt_sigqueueinfo", "rt_tgsigqueueinfo",
+    "reboot", "sethostname", "setdomainname", "settimeofday", "clock_settime", "clock_adjtime",
+    "adjtimex", "syslog", "iopl", "ioperm", "vhangup", "_sysctl",
+    "mq_open", "mq_unlink", "mq_timedsend", "mq_timedreceive", "mq_notify", "mq_getsetattr",
+    "msgget", "msgsnd", "msgrcv", "msgctl", "semget", "semop", "semtimedop", "semctl",
+    "shmget", "shmat", "shmdt", "shmctl",
+    NULL
+};
+
+static int add_dry_rest(scmp_filter_ctx ctx, int file_changes) {
+    static const char *const kConditional[] = { "clone", "clone3", "ioctl", "kill", "sendto", "setsockopt",
+                                                "unshare", "io_uring_setup", NULL };
+    for (int nr = 0; nr < 1024; nr++) {
+        char *n = seccomp_syscall_resolve_num_arch(SCMP_ARCH_NATIVE, nr);
+        if (!n) continue;
+        bool named = in_list(kHardDeny, n) || in_list(kMediate, n) || in_list(kAdmit, n) ||
+                     in_list((const char **)kConditional, n) || in_list((const char **)kDryNever, n) ||
+                     in_list(kChange, n) || in_list(kMediate129, n) ||
+                     (file_changes && (in_list(kChangeAdmit, n) || in_list(kAdmit129, n) ||
+                                       !strcmp(n, "prctl")));
+        free(n);
+        if (named) continue;
+        int rc = seccomp_rule_add(ctx, SCMP_ACT_NOTIFY, nr, 0);
         if (rc < 0 && rc != -EEXIST) return rc;
     }
     return 0;
@@ -384,7 +503,8 @@ static int add_io_uring_setup(scmp_filter_ctx ctx) {
 }
 
 // Build the filter. default_action is EPERM (enforce) or LOG (observe).
-static int build(scmp_filter_ctx *out_ctx, int observe) {
+static int build(scmp_filter_ctx *out_ctx, int observe, int flags) {
+    int file_changes = flags & WD_FILTER_CHANGES;
     uint32_t def = observe ? SCMP_ACT_LOG : SCMP_ACT_ERRNO(EPERM);
     scmp_filter_ctx ctx = seccomp_init(def);
     if (!ctx) return -ENOMEM;
@@ -410,6 +530,22 @@ static int build(scmp_filter_ctx *out_ctx, int observe) {
         if (rc < 0) goto fail;
     }
     if ((rc = add_list(ctx, kMediate, SCMP_ACT_NOTIFY)) < 0) goto fail;
+    if ((flags & WD_FILTER_DRY) && (rc = add_dry_rest(ctx, file_changes)) < 0) goto fail;   // v1.29
+    if (file_changes) {                                       // v1.29
+        if ((rc = add_list(ctx, kChange, SCMP_ACT_NOTIFY)) < 0) goto fail;
+        if ((rc = add_list(ctx, kChangeAdmit, SCMP_ACT_ALLOW)) < 0) goto fail;
+        if ((rc = add_list(ctx, kMediate129, SCMP_ACT_NOTIFY)) < 0) goto fail;   // step 6
+        if ((rc = add_list(ctx, kAdmit129, SCMP_ACT_ALLOW)) < 0) goto fail;
+        for (size_t i = 0; i < sizeof kPrctlAdmit / sizeof kPrctlAdmit[0]; ++i) {
+            rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(prctl), 1,
+                                  SCMP_A0(SCMP_CMP_EQ, (scmp_datum_t)kPrctlAdmit[i]));
+            if (rc < 0) goto fail;
+        }
+        rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(prctl), 2,
+                              SCMP_A0(SCMP_CMP_EQ, (scmp_datum_t)PR_CAP_AMBIENT),
+                              SCMP_A1(SCMP_CMP_EQ, (scmp_datum_t)PR_CAP_AMBIENT_IS_SET));
+        if (rc < 0) goto fail;
+    }
     if ((rc = add_sends(ctx)) < 0) goto fail;                 // v1.21
     if ((rc = add_setsockopt(ctx)) < 0) goto fail;            // v1.21
     // v1.27: kill, which subprocess uses to stop a child on a timeout, for a
@@ -447,10 +583,14 @@ fail:
 }
 
 int install_baseline_user_notif_filter(int observe) {
+    return install_baseline_user_notif_filter_ex(observe, 0);
+}
+
+int install_baseline_user_notif_filter_ex(int observe, int flags) {
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) return -1;
 
     scmp_filter_ctx ctx;
-    if (build(&ctx, observe) < 0) return -1;
+    if (build(&ctx, observe, flags) < 0) return -1;
 
     if (seccomp_load(ctx) < 0) { seccomp_release(ctx); return -1; }
 

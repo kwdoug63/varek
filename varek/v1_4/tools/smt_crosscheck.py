@@ -609,7 +609,7 @@ def parse_lines(raw_lines, path):
                 if len(toks) != 3 or toks[1] != "warden" or not m:
                     raise PolicyError(f"{path}:{lineno}: bad directive")
                 v = (int(m.group(1)), int(m.group(2)))
-                if v > (1, 28):
+                if v > (1, 29):
                     raise PolicyError(f"{path}:{lineno}: requires newer Warden")
                 if legacy_name and v >= (1, 24):
                     raise PolicyError(f"{path}:{lineno}: require warden 1.24 after a host name")
@@ -837,6 +837,8 @@ def parse_lines(raw_lines, path):
                 raise PolicyError(f"{path}:{r['line']}: request rule for a passthrough host")
     # v1.27: launches after the first are decided only after require warden 1.27
     parse_policy.launches = req >= (1, 27)
+    # v1.29: files are opened with the agent's credentials after require warden 1.29
+    parse_policy.open_as_agent = req >= (1, 29)
     parse_policy.creds = creds                     # v1.28
     parse_policy.identity = (issuers, spiffe, require_obo)   # v1.28.1
     return rules, rx
@@ -1547,8 +1549,8 @@ def fuzz_policy(rng, path):
         lines.append(rng.choice(["require warden 1.14", "require warden 1.13", "require warden 01.14",
                                  "require warden 1.15", "require warden 1.16", "require warden 1.21",
                                  "require warden 1.24", "require warden 1.24", "require warden 1.25",
-                                 "require warden 1.27", "require warden 1.28"] +
-                                ([] if valid else ["require warden 1.29", "require warden x",
+                                 "require warden 1.27", "require warden 1.28", "require warden 1.29"] +
+                                ([] if valid else ["require warden 1.30", "require warden x",
                                                    "require warden +1.14", "require warden 1.+14",
                                                    "require warden 1.1400000"])))
     elif rng.random() < 0.35:
@@ -1877,6 +1879,15 @@ def check_policy(vdp, policy, rng, nq, stats, verbose, checker=None):
         fails.append(f"{policy}: launches disagreement (oracle {want_l}, C {got_l})")
     if want_l == "on":
         stats["launch_policies"] += 1
+    # v1.29: and on whether files are opened as the agent
+    want_o = "on" if parse_policy.open_as_agent else "off"
+    got_o = [run_vdp(vdp, policy, "openas")[1].strip()]
+    if checker:
+        got_o.append(subprocess.run([checker, policy, "openas"], capture_output=True, text=True).stdout.strip())
+    if any(g != want_o for g in got_o):
+        fails.append(f"{policy}: openas disagreement (oracle {want_o}, C {got_o})")
+    if want_o == "on":
+        stats["open_as_agent_policies"] += 1
     # v1.28: the three parsers agree on the credentials and the rules that carry them
     store_names = {1: "file", 2: "vault", 3: "aws-sm"}
     want_c = [f"credential {n} {store_names[st]} {ref}" for n, st, ref in parse_policy.creds]
@@ -2003,7 +2014,7 @@ def main():
     a = ap.parse_args()
 
     rng = random.Random(a.seed)
-    stats = {k: 0 for k in ("policies", "rejected_policies", "string_policies", "request_policies", "launch_policies", "reach",
+    stats = {k: 0 for k in ("policies", "rejected_policies", "string_policies", "request_policies", "launch_policies", "open_as_agent_policies", "reach",
                             "reach_regex", "reach_solver_inconclusive", "reach_forced_checked",
                             "reach_unknown", "witnesses", "ground", "symbolic",
                             "bound_unknown", "bound_seen", "certs_emitted", "certs_forged",
@@ -2024,7 +2035,7 @@ def main():
                 break
     total = stats["reach"] + stats["reach_forced_checked"] + stats["ground"] + stats["symbolic"]
     print(f"smt_crosscheck: {stats['policies']} policies ({stats['string_policies']} with "
-          f"suffix/contains/glob rules, {stats['request_policies']} with request rules, {stats['launch_policies']} with launches; "
+          f"suffix/contains/glob rules, {stats['request_policies']} with request rules, {stats['launch_policies']} with launches, {stats['open_as_agent_policies']} opening as the agent; "
           f"{stats['rejected_policies']} rejected by both parsers), "
           f"{total} checks: {stats['reach']} reachability (+{stats['reach_forced_checked']} "
           f"automaton-search re-checks), {stats['ground']} ground, {stats['symbolic']} "

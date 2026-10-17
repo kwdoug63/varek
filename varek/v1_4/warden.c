@@ -107,6 +107,8 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/file.h>
+#include <openssl/crypto.h>   /* v1.29: SHA-256 of the launch set (warden_exec.inc.c) */
+#include <openssl/evp.h>
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -216,8 +218,13 @@ typedef enum {
     ACT_FILE_READLINK,   /* v1.17.0: readlink, readlinkat */
     ACT_NET_PROXY,       /* v1.26: a name:port the egress proxy read from a client */
     ACT_NET_REQUEST,     /* v1.26.1: a request of an inspected connection (its object) */
+    ACT_FILE_CHANGE,     /* v1.29: a change by name (warden_change.inc.c): chg_op says which */
     ACT_OTHER,
 } action_kind_t;
+
+/* v1.29 (warden_change.inc.c): the changes by name */
+enum { CHG_UNLINK = 1, CHG_RMDIR, CHG_MKDIR, CHG_RENAME_FROM, CHG_RENAME_TO, CHG_CHMOD,
+       CHG_UTIME, CHG_TRUNCATE, CHG_CHDIR };
 
 /* v1.17.0: the metadata and link lookups, mediated like opens. */
 static bool is_meta_kind(action_kind_t k) {
@@ -269,6 +276,17 @@ struct action {
     bool          proxy_handoff;        /* v1.26: a connect handed to the egress proxy */
     int           subject;              /* v1.28.1: who the call is for (warden_subagent.inc.c): 0 the
                                            agent, a sub-agent, or -1 (in no group of the run) */
+    /* v1.29: a change by name (warden_change.inc.c) */
+    int           chg_op;               /* CHG_* */
+    char          target2[PATH_LIMIT];  /* a rename's new name */
+    int           chg_dirfd, chg_dirfd2;
+    unsigned      chg_flags;            /* unlinkat's, renameat2's, utimensat's */
+    unsigned      chg_mode;
+    int64_t       chg_len;
+    int           chg_fd;               /* the descriptor of ftruncate, fchmod, futimens */
+    struct timespec chg_times[2];
+    bool          chg_times_null;
+    bool          dry;                  /* v1.29: a refusal a dry run let through (not enforced) */
     char          extra[4608];          /* extra record fields, trusted text, each ending in ',' */
 };
 
@@ -290,9 +308,44 @@ static const char *action_kind_name(action_kind_t k) {
         case ACT_FILE_READLINK: return "file.readlink";
         case ACT_NET_PROXY:     return "net.proxy";
         case ACT_NET_REQUEST:   return "net.request";
+        case ACT_FILE_CHANGE:   return "file.change";
         case ACT_OTHER:        return "other";
     }
     return "invalid";
+}
+
+/* ---------------- v1.29: the dry run (docs/security/v1.29-varek-run.md, section 3) ----------------
+ *
+ * `--dry-run`, given per run on the command line only (D3): every call is
+ * decided, certified and recorded as when enforcing; a call the POLICY
+ * refuses is then let through (D1) and its record says "enforced":false:
+ * a file open, lookup, change or launch goes to the kernel as the agent's own
+ * user (CONTINUE), a connect is dialed by the Warden as an allowed one is, the
+ * stub answers a name no rule reaches, the proxy relays a request no rule
+ * allows (with no credential), and a system call outside the allowlist,
+ * which the filter then sends here, goes to the kernel. Refused all the same
+ * (D2), recorded as enforced: the hard-denied system calls (the filter), the
+ * protected objects, raw devices, the views, kernel filesystems, anything the
+ * Warden could not resolve, the sub-agents' attribution, and every call after
+ * `varek revoke` or the user token's expiry. */
+static bool     g_dry = false;
+static uint64_t g_dry_unenforced = 0;
+
+/* the record rules of a refusal the policy made (a dry run lets those through) */
+static bool dry_policy_rule(const char *rule) {
+    static const char *const kLet[] = {
+        "policy_match", "default_deny_unknown", "fragment_escape_flags", "fragment_escape_length",
+        "certificate_refused", "exec_not_in_ruleset", "exec_no_landlock", "syscall_not_admitted",
+        "rename_to_refused", "rename_from_refused", "max_body", NULL };
+    for (int i = 0; rule && kLet[i]; i++) if (!strcmp(rule, kLet[i])) return true;
+    return false;
+}
+
+/* In a dry run, a refusal by rule is let through: mark a, true. */
+static bool dry_let(struct action *a, const char *rule) {
+    if (!g_dry || !dry_policy_rule(rule)) return false;
+    a->dry = true;
+    return true;
 }
 
 /* ---------------- Policy ---------------- */
@@ -302,13 +355,89 @@ static const char *action_kind_name(action_kind_t k) {
  * path/host/exec constant, a 32-bit bitvector for open flags), the verdict
  * semantics, and the soundness obligations. v1.14 adds the bounded string
  * fragment: exact, prefix, suffix, contains and glob matchers. */
+/* v1.29 (docs/security/v1.29-varek-run.md, section 2): a baseline `varek
+ * run` wrote says, in its first lines, what it was made for:
+ *   #@ varek baseline 1
+ *   #@ profile NAME SHA256        (or: #@ profile none -)
+ *   #@ cwd PATH   #@ home PATH   #@ user NAME   #@ tmp PATH
+ * Comments to the parsers; the Warden reads them from the same bytes it
+ * hashes and copies them into run_start's `baseline`. */
+struct baseline_hdr {
+    bool on;
+    char profile[33], profile_sha[65];
+    char cwd[PATH_MAX], home[PATH_MAX], user[64], tmp[PATH_MAX];
+};
+
 struct policy {
     char          name[64];
     char          version[16];
     vdp_policy_t  v;
     vdpc_policy_t c;                    /* v1.15: the checker's own parse */
     char          sha256[65];           /* v1.15: of the policy bytes both parsed */
+    struct baseline_hdr base;           /* v1.29 */
 };
+
+/* v1.29: 0 (b->on says whether the policy is a baseline), or -1 with why */
+static int baseline_parse(const char *buf, size_t len, struct baseline_hdr *b, char *why, size_t wn) {
+    static const char kHead[] = "#@ varek baseline ";
+    memset(b, 0, sizeof *b);
+    if (len < sizeof kHead - 1 || memcmp(buf, kHead, sizeof kHead - 1)) return 0;
+    size_t pos = 0;
+    int line = 0;
+    bool seen[5] = { false };
+    while (pos < len && len - pos >= 3 && !memcmp(buf + pos, "#@ ", 3)) {
+        const char *nl = memchr(buf + pos, '\n', len - pos);
+        size_t ll = nl ? (size_t)(nl - (buf + pos)) : len - pos;
+        char l[PATH_MAX + 32];
+        if (ll >= sizeof l) { snprintf(why, wn, "baseline header line %d is too long", line + 1); return -1; }
+        memcpy(l, buf + pos, ll);
+        l[ll] = '\0';
+        pos += ll + (nl ? 1 : 0);
+        line++;
+        for (size_t i = 3; i < ll; i++)
+            if ((unsigned char)l[i] < 0x20 || (unsigned char)l[i] > 0x7e) {
+                snprintf(why, wn, "baseline header line %d holds a byte outside printable ASCII", line);
+                return -1;
+            }
+        if (line == 1) {
+            if (strcmp(l, "#@ varek baseline 1")) {
+                snprintf(why, wn, "a baseline of a format this Warden does not know (%.40s)", l + 3);
+                return -1;
+            }
+            continue;
+        }
+        char *key = l + 3, *val = strchr(key, ' ');
+        if (!val || !val[1]) { snprintf(why, wn, "baseline header line %d has no value", line); return -1; }
+        *val++ = '\0';
+        static const char *const kKeys[] = { "profile", "cwd", "home", "user", "tmp" };
+        int k = -1;
+        for (int i = 0; i < 5; i++) if (!strcmp(key, kKeys[i])) k = i;
+        if (k < 0) { snprintf(why, wn, "baseline header line %d: unknown key %.32s", line, key); return -1; }
+        if (seen[k]) { snprintf(why, wn, "baseline header: %.16s given twice", key); return -1; }
+        seen[k] = true;
+        if (k == 0) {
+            char nm[64], sh[80];
+            if (sscanf(val, "%63s %79s", nm, sh) != 2 || strlen(nm) > 32 || strlen(sh) > 64 ||
+                (strcmp(nm, "none") && strlen(sh) != 64) || (!strcmp(nm, "none") && strcmp(sh, "-"))) {
+                snprintf(why, wn, "baseline header: need `#@ profile NAME SHA256` or `#@ profile none -`");
+                return -1;
+            }
+            snprintf(b->profile, sizeof b->profile, "%s", nm);
+            snprintf(b->profile_sha, sizeof b->profile_sha, "%s", strcmp(nm, "none") ? sh : "");
+        } else if (k == 3) {
+            if (strlen(val) >= sizeof b->user) { snprintf(why, wn, "baseline header: user too long"); return -1; }
+            snprintf(b->user, sizeof b->user, "%s", val);
+        } else {
+            if (val[0] != '/') { snprintf(why, wn, "baseline header: %.16s is not an absolute path", key); return -1; }
+            char *dst = k == 1 ? b->cwd : k == 2 ? b->home : b->tmp;
+            snprintf(dst, PATH_MAX, "%s", val);
+        }
+    }
+    for (int i = 0; i < 5; i++)
+        if (!seen[i]) { snprintf(why, wn, "baseline header: a line is missing (profile, cwd, home, user, tmp)"); return -1; }
+    b->on = true;
+    return 0;
+}
 
 #define POLICY_MAX_BYTES (16u << 20)
 
@@ -334,6 +463,11 @@ static int policy_load(const char *path, struct policy *p) {
     if (rd_err || len > POLICY_MAX_BYTES) {
         fprintf(stderr, "[warden] policy %s: %s\n", path,
                 rd_err ? "read error" : "larger than 16 MiB");
+        free(buf);
+        return -1;
+    }
+    if (baseline_parse(buf, len, &p->base, err, sizeof err) < 0) {     /* v1.29 */
+        fprintf(stderr, "[warden] policy %s: %s; refusing to start\n", path, err);
         free(buf);
         return -1;
     }
@@ -407,6 +541,13 @@ static int policy_load(const char *path, struct policy *p) {
         fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
                 "require warden differently (launches %s and %s); refusing to start\n", path,
                 p->v.launches ? "on" : "off", p->c.launches ? "on" : "off");
+        return -1;
+    }
+    /* v1.29: and whether files are opened as the agent */
+    if (p->v.open_as_agent != (p->c.open_as_agent != 0)) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
+                "require warden differently (opening as the agent %s and %s); refusing to start\n", path,
+                p->v.open_as_agent ? "on" : "off", p->c.open_as_agent ? "on" : "off");
         return -1;
     }
     /* v1.28: and the credentials (name, store, reference), in order */
@@ -588,12 +729,22 @@ static int read_all(int fd, void *buf, size_t len) {
 
 /* ---------------- Semantic Derivation ---------------- */
 
+static int change_derive(const struct seccomp_notif *req, struct action *out);   /* v1.29 */
+/* v1.29: the policy says `require warden 1.29`, so the filter sends the
+ * changes by name and stat/lstat here. Otherwise (a dry run of an earlier
+ * policy sends every unlisted call) they are derived as other calls, recorded
+ * syscall_not_admitted, as enforcing refuses them. */
+static bool g_changes_on;
+static const char *change_op_name(int op);
 static int derive_intent(const struct seccomp_notif *req,
                          struct action *out)
 {
     memset(out, 0, sizeof(*out));
     out->policy_line = -1;
     int nr = (int)req->data.nr;
+    /* v1.29: the changes by name (warden_change.inc.c) */
+    int cr = g_changes_on ? change_derive(req, out) : 0;
+    if (cr) return cr < 0 ? -1 : 0;
 
     if (nr == __NR_openat) {
         out->kind = ACT_FILE_OPEN;
@@ -785,6 +936,27 @@ static int derive_intent(const struct seccomp_notif *req,
      * existed, its size and owner, and read where any link (including the
      * Warden's own /proc/<pid>/fd entries) pointed, with no record. They are
      * now decided like a read-only open of the same object. */
+    /* v1.29 (step 6): under `require warden 1.29` the legacy stat(2) and
+     * lstat(2) come here too (the filter sends them only then): musl calls
+     * them, and with them a statically linked agent (the Codex CLI) looked
+     * nothing up. Each is newfstatat(AT_FDCWD, path, buf, 0 or
+     * AT_SYMLINK_NOFOLLOW), answered with the same struct stat. */
+    if (g_changes_on && (nr == __NR_stat || nr == __NR_lstat)) {
+        out->kind = ACT_FILE_STAT;
+        out->meta_nr = __NR_newfstatat;
+        out->open_dirfd = VAREK_AT_FDCWD;
+        out->out_addr = req->data.args[1];
+        out->at_flags = nr == __NR_lstat ? AT_SYMLINK_NOFOLLOW : 0;
+        if (req->data.args[0] == 0) {
+            out->path_null = true;
+            out->target[0] = '\0';
+        } else if (xproc_read_str(req->pid, req->data.args[0], out->target, sizeof(out->target)) < 0) {
+            return -1;
+        }
+        out->open_flags = O_RDONLY;
+        out->flags_known = true;
+        return 0;
+    }
     if (nr == __NR_newfstatat || nr == __NR_statx || nr == __NR_access ||
         nr == __NR_faccessat || nr == __NR_faccessat2 ||
         nr == __NR_readlink || nr == __NR_readlinkat) {
@@ -868,6 +1040,7 @@ static int derive_intent(const struct seccomp_notif *req,
         return 0;
     }
     out->kind = ACT_OTHER;
+    snprintf(out->target, sizeof out->target, "syscall:%d", nr);   /* v1.29: named in the record */
     return 0;
 }
 
@@ -895,6 +1068,7 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
         case ACT_FILE_STAT:
         case ACT_FILE_ACCESS:
         case ACT_FILE_READLINK:
+        case ACT_FILE_CHANGE:            /* v1.29: as a write (or chdir: a read) */
             kind = VDP_KIND_PATH;
             s = a->resolved;
             if (s[0] == '\0') { a->why = "no_resolved_path"; return DEC_UNKNOWN; }
@@ -967,7 +1141,8 @@ static bool certify(const struct policy *p, struct action *a) {
         case ACT_FILE_OPEN:
         case ACT_FILE_STAT:
         case ACT_FILE_ACCESS:
-        case ACT_FILE_READLINK: kind = VDPC_PATH; s = a->resolved; break;
+        case ACT_FILE_READLINK:
+        case ACT_FILE_CHANGE:  kind = VDPC_PATH; s = a->resolved; break;   /* v1.29 */
         case ACT_NET_CONNECT:  kind = VDPC_HOST; s = a->resolved; break;   /* v1.21 */
         case ACT_NET_PROXY:    kind = VDPC_HOST; s = a->resolved; break;   /* v1.26 */
         case ACT_NET_REQUEST:  kind = VDPC_REQUEST; s = a->resolved; break; /* v1.26.1 */
@@ -1381,6 +1556,7 @@ static char     g_run_id[33];
 static wr_table_t g_names;           /* v1.24: the resolution table (see names_setup) */
 static bool       g_names_on = false;
 static bool       g_any_name = false;  /* v1.24: the policy has a host name rule (allow or deny) */
+static bool       g_policy_any_name = false;  /* v1.29: so, before a dry run's views */
 static bool       g_any_wild = false;  /* v1.25: the policy has a wildcard allow rule (warden_stub.inc.c) */
 static void       stub_resolved(size_t i);
 static void       px_resolved(size_t i);  /* v1.26: proxied requests waiting on a lookup */
@@ -1419,7 +1595,7 @@ static bool       g_syn_on = false;    /* v1.26: `proxy on`: synthetic addresses
 static const struct policy *g_syn_p;   /* v1.26: the policy, for the hosts view */
 /* v1.26: the stub runs with a wildcard allow rule (v1.25), or with the proxy
  * on and any host name rule (synthetic addresses) */
-#define STUB_WANTED() (g_any_wild || (g_syn_on && g_names_on))
+#define STUB_WANTED() (g_any_wild || (g_syn_on && g_names_on) || g_dry)   /* v1.29: a dry run */
 static uint64_t   g_proxy_conns = 0;   /* v1.26: connections handed to the proxy (proxy_conn ids) */
 static int        g_up_entry = -1;     /* v1.26 section 5: the upstream proxy's name in g_names, or -1 */
 static wr_ip_t    g_up_ip;             /* v1.26 section 5: the upstream given as an address */
@@ -1734,6 +1910,7 @@ static void emit_on_behalf_of(FILE *f, const struct policy *p) {
     fprintf(f, "\"source\":\"%s\",\"verified\":false},", src);
 }
 
+static void as_agent_record(FILE *f);   /* v1.29: warden_asagent.inc.c */
 static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -1760,7 +1937,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
         fprintf(f, "\"checkpoint_every\":%" PRIu64 ",", g_ckpt_every);
     if (g_anchor_fd >= 0) fputs("\"anchored\":true,", f);
     /* v1.24: the names the Warden resolves (each gets a resolution record). */
-    if (g_any_name) fputs("\"host_name_rules\":true,", f);
+    if (g_policy_any_name) fputs("\"host_name_rules\":true,", f);
     /* v1.25: the lists the policy's wildcards were checked against */
     if (g_psl_sha[0]) fprintf(f, "\"psl_sha256\":\"%s\",\"shared_domains_sha256\":\"%s\","
                               "\"shared_lists_pinned\":%s,",
@@ -1800,6 +1977,40 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     }
     /* v1.27: Landlock and the launch set (require warden 1.27) */
     if (p->v.launches) { exec_ruleset_record(f); noexec_record(f); }   /* v1.27, v1.27.1 */
+    as_agent_record(f);                  /* v1.29: who files are opened as */
+    if (g_dry) fputs("\"mode\":\"dry_run\",", f);   /* v1.29: not enforcing (section 3) */
+    /* v1.29: the baseline this policy is (section 2), and the names (never
+     * the values) of the agent's environment, under require warden 1.29 */
+    if (p->base.on) {
+        fputs("\"baseline\":{\"format\":1,\"profile\":\"", f);
+        json_escape(f, p->base.profile);
+        fprintf(f, "\",\"profile_sha256\":\"%s\",\"cwd\":\"", p->base.profile_sha);
+        json_escape(f, p->base.cwd);
+        fputs("\",\"home\":\"", f);
+        json_escape(f, p->base.home);
+        fputs("\",\"user\":\"", f);
+        json_escape(f, p->base.user);
+        fputs("\",\"tmp\":\"", f);
+        json_escape(f, p->base.tmp);
+        fputs("\"},", f);
+    }
+    if (p->v.open_as_agent) {
+        extern char **environ;
+        fputs("\"agent_env\":[", f);
+        bool first = true;
+        for (char **e = environ; e && *e; e++) {
+            const char *eq = strchr(*e, '=');
+            if (!eq || eq == *e || (size_t)(eq - *e) > 255) continue;
+            char nm[256];
+            memcpy(nm, *e, (size_t)(eq - *e));
+            nm[eq - *e] = '\0';
+            fputs(first ? "\"" : ",\"", f);
+            json_escape(f, nm);
+            fputs("\"", f);
+            first = false;
+        }
+        fputs("],", f);
+    }
     /* v1.28.1: who the run acts for (docs/security/v1.28.1-delegation-chain.md,
      * section 4): the user a trusted issuer vouched for, the actors of a
      * delegation, the agent; with no token, the agent alone. Then the
@@ -1895,6 +2106,10 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
     }
     /* v1.25: a wildcard adds names when the agent asks (the stub) */
     g_names_on = g_names.n > 0 || g_any_wild;
+    g_policy_any_name = g_any_name;
+    /* v1.29: a dry run serves the agent the name views and the stub, which
+     * answers every name (warden_stub.inc.c), whatever the policy names */
+    if (g_dry) { g_any_name = true; g_names_on = true; }
     g_syn_on = p->v.proxy;               /* v1.26 */
     g_syn_p = p;
     return 0;
@@ -2069,15 +2284,23 @@ static void emit_run_end(int exit_status) {
     emit_unanswered();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
+    char dry_count[48] = "";
+    if (g_dry) snprintf(dry_count, sizeof dry_count, "\"not_enforced\":%" PRIu64 ",", g_dry_unenforced);
     FILE *f = rec_begin();
     fprintf(f, "{\"event\":\"run_end\",\"run\":\"%s\",\"records\":%" PRIu64 ","
-               "\"exit_status\":%d,%s%s%s\"timestamp_ns\":%lld}\n",
-            g_run_id, g_records, exit_status,
+               "\"exit_status\":%d,%s%s%s%s%s\"timestamp_ns\":%lld}\n",
+            g_run_id, g_records, exit_status, dry_count,
+            g_dry ? "\"mode\":\"dry_run\"," : "",
             g_anchor_errors ? "\"anchor_errors_seen\":true," : "",
             g_px_failed ? "\"proxy_failed\":true," : "",
             g_exec_mismatch ? "\"exec_identity_mismatch\":true," : "",
             (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
     rec_end("run_end");
+    if (g_dry) {                                                           /* v1.29 */
+        log_line_start();
+        fprintf(g_log, "[warden] DRY RUN: NOT ENFORCING: %" PRIu64 " call(s) the policy refuses were let "
+                "through (\"enforced\":false)\n", g_dry_unenforced);
+    }
 }
 
 /* v1.18.0: the name of an errno the Warden answers a refused call with, for
@@ -2120,10 +2343,11 @@ static void emit_pathology(uint64_t seq,
      * rename's two names); when this record would pass the bound, the
      * checkpoint comes first, here. */
     if (checkpoints_on() && g_since_ckpt >= g_ckpt_every) emit_checkpoint();
+    if (a->dry) d_final = DEC_DENY;      /* v1.29: a call a dry run let through was refused by the policy */
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     char flags_json[40] = "";
-    if ((a->kind == ACT_FILE_OPEN || is_meta_kind(a->kind)) && a->flags_known)
+    if ((a->kind == ACT_FILE_OPEN || is_meta_kind(a->kind) || a->kind == ACT_FILE_CHANGE) && a->flags_known)
         snprintf(flags_json, sizeof flags_json, "0x%x", (unsigned)a->open_flags);
     /* v1.17.0: what an access() asked, so an audit can tell F_OK/R_OK from
      * W_OK/X_OK. */
@@ -2150,7 +2374,9 @@ static void emit_pathology(uint64_t seq,
         (int)pid);
     /* v1.28.1: who it was for */
     sub_obo(f, a->subject);
-    fprintf(f, "\"action\":\"%s\",\"target\":\"", action_kind_name(a->kind));
+    if (a->dry) { fputs("\"enforced\":false,", f); g_dry_unenforced++; }   /* v1.29 */
+    fprintf(f, "\"action\":\"%s\",\"target\":\"",
+            a->kind == ACT_FILE_CHANGE ? change_op_name(a->chg_op) : action_kind_name(a->kind));
     json_escape(f, a->target);
     fputs("\",\"resolved\":\"", f);
     json_escape(f, a->resolved[0] ? a->resolved : "");
@@ -2409,6 +2635,8 @@ struct resolved_target {
     int  path_fd;          /* O_PATH fd on the object, or -1 when creating */
     int  parent_fd;        /* O_PATH fd on the parent directory when creating */
     char name[256];        /* final component when creating */
+    int  agent_err;        /* v1.29: the walk as the agent failed with this errno (the
+                            * object was then pinned as root, for the decision only) */
 };
 
 static void resolved_target_close(struct resolved_target *r) {
@@ -2521,6 +2749,26 @@ static int check_proc_object(int fd, pid_t tid, pid_t *tgid_cache,
     return 0;
 }
 
+#include "warden_asagent.inc.c"      /* v1.29 step 1 */
+static int agent_fd(pid_t tid, int fd);   /* v1.21: the agent's descriptor, or -errno */
+
+/* v1.29: a step of the resolution's walk, as the agent when opening as the
+ * agent. A walk the agent's user may not make (EACCES, EPERM: a directory it
+ * cannot search) is made again as root, so the decision is still made on the
+ * object, and the agent's error is kept for the open (materialize_target
+ * returns it): an allowed open the agent's user could not make fails as the
+ * kernel would have failed it. */
+static int resolve_openat2(int dirfd, const char *path, uint64_t extra, int *agent_err) {
+    if (!g_as.on) return openat2_path(dirfd, path, extra);
+    int fd = openat2_path_agent(dirfd, path, extra);
+    if (fd < 0 && (errno == EACCES || errno == EPERM)) {
+        int e = errno;
+        fd = openat2_path(dirfd, path, extra);   /* root's errno when it fails too */
+        if (fd >= 0) *agent_err = e;
+    }
+    return fd;
+}
+
 /* Returns 0 with r filled and a->resolved set, or -1 (fail closed). Nothing
  * on the filesystem is opened, created or modified. */
 static int resolve_target(pid_t target_pid, struct action *a,
@@ -2529,9 +2777,13 @@ static int resolve_target(pid_t target_pid, struct action *a,
     a->resolved[0] = '\0';
     r->path_fd = r->parent_fd = -1;
     r->name[0] = '\0';
+    r->agent_err = 0;
 
-    if (a->open_dirfd != VAREK_AT_FDCWD && a->target[0] != '/')
-        return -1;   /* relative open against a dirfd we do not track */
+    /* a relative open against a directory descriptor: from v1.29 (require
+     * warden 1.29), resolved from the agent's own descriptor (agent_fd, the
+     * caller's table), as lookups are; before, refused */
+    if (a->open_dirfd != VAREK_AT_FDCWD && a->target[0] != '/' && !g_as.policy)
+        return -1;
 
     /* tgid is needed only for a /proc/self path (before resolution) or a procfs
      * object (after). Compute it lazily so an ordinary open never reads
@@ -2550,14 +2802,12 @@ static int resolve_target(pid_t target_pid, struct action *a,
             return -1;
     }
 
-    char proc_cwd[64];
-    snprintf(proc_cwd, sizeof(proc_cwd), "/proc/%d/cwd", target_pid);
-    int cwd_fd = open(proc_cwd, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    int cwd_fd = agent_fd(target_pid, path[0] == '/' ? VAREK_AT_FDCWD : a->open_dirfd);
     if (cwd_fd < 0) return -1;
 
-    int fd = openat2_path(cwd_fd, path,
-                          (uint64_t)a->open_flags &
-                          ((uint64_t)O_DIRECTORY | (uint64_t)O_NOFOLLOW));
+    int fd = resolve_openat2(cwd_fd, path,
+                             (uint64_t)a->open_flags &
+                             ((uint64_t)O_DIRECTORY | (uint64_t)O_NOFOLLOW), &r->agent_err);
     if (fd >= 0) {
         close(cwd_fd);
         struct stat st;
@@ -2593,7 +2843,8 @@ static int resolve_target(pid_t target_pid, struct action *a,
     else if (slash == t) snprintf(dir, sizeof(dir), "/");
     else                 snprintf(dir, sizeof(dir), "%.*s", (int)(slash - t), t);
 
-    int pfd = openat2_path(cwd_fd, dir, (uint64_t)O_DIRECTORY);
+    r->agent_err = 0;
+    int pfd = resolve_openat2(cwd_fd, dir, (uint64_t)O_DIRECTORY, &r->agent_err);
     close(cwd_fd);
     if (pfd < 0) return -1;
 
@@ -2647,6 +2898,9 @@ static int materialize_target(pid_t target_pid, const struct action *a,
     int want = a->open_flags;
     int fd;
 
+    /* v1.29: the agent's user could not walk to it: its error, as the
+     * kernel would have given it */
+    if (r->agent_err) return -r->agent_err;
     if (r->path_fd >= 0) {
         if (want & O_PATH) {
             fd = fcntl(r->path_fd, F_DUPFD_CLOEXEC, 0);
@@ -2663,18 +2917,24 @@ static int materialize_target(pid_t target_pid, const struct action *a,
             /* O_TMPFILE creates an unnamed file in the pinned directory:
              * apply the agent's mode and umask, as for O_CREAT. */
             mode_t old = umask(target_umask(target_pid));
+            if (as_agent_enter() < 0) { umask(old); return -EACCES; }
             fd = open(self, flags, (mode_t)(a->open_mode & 07777));
+            as_agent_leave();
             int saved = errno;
             umask(old);
             errno = saved;
         } else {
+            if (as_agent_enter() < 0) return -EACCES;    /* v1.29: as the agent */
             fd = open(self, flags, 0);
+            as_agent_leave();
         }
     } else if (r->parent_fd >= 0) {
         if (want & O_PATH) return -ENOENT;
         int flags = want | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
         mode_t old = umask(target_umask(target_pid));
+        if (as_agent_enter() < 0) { umask(old); return -EACCES; }
         fd = openat(r->parent_fd, r->name, flags, (mode_t)(a->open_mode & 07777));
+        as_agent_leave();
         int saved = errno;
         umask(old);
         errno = saved;
@@ -2941,7 +3201,12 @@ static int meta_on_held_fd(pid_t tid, int notify_fd, uint64_t id, const struct a
  * to the first name that does not exist: that is where the kernel's lookup
  * stops with ENOENT. 0 with *pfd (its directory) and name, or -1. */
 static const struct policy *g_exec_policy;   /* set with launches decided (warden_exec.inc.c) */
-static int meta_first_missing(int base, const char *path, int *pfd, char *name, size_t nn) {
+/* v1.29 (step 6): rest, when given, gets the names after the missing one,
+ * joined by single slashes, or stays empty if one of them is "." or "..",
+ * where the name the kernel would reach is not the path written. */
+static int meta_first_missing(int base, const char *path, int *pfd, char *name, size_t nn,
+                              char *rest, size_t rn) {
+    if (rest && rn) rest[0] = '\0';
     int cur = path[0] == '/' ? open("/", O_PATH | O_DIRECTORY | O_CLOEXEC) : dup(base);
     if (cur < 0) return -1;
     char buf[PATH_LIMIT];
@@ -2956,6 +3221,17 @@ static int meta_first_missing(int base, const char *path, int *pfd, char *name, 
                 fstatat(cur, c, &st, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT) {
                 snprintf(name, nn, "%s", c);
                 *pfd = cur;
+                if (rest && rn) {
+                    size_t k = 0;
+                    bool ok = true;
+                    for (char *d = strtok_r(NULL, "/", &save); d && ok; d = strtok_r(NULL, "/", &save)) {
+                        if (!strcmp(d, ".") || !strcmp(d, "..")) { ok = false; break; }
+                        int w = snprintf(rest + k, rn - k, "%s%s", k ? "/" : "", d);
+                        if (w < 0 || (size_t)w >= rn - k) { ok = false; break; }
+                        k += (size_t)w;
+                    }
+                    if (!ok) rest[0] = '\0';
+                }
                 return 0;
             }
             break;                         /* a dangling link, a refusal: fail closed */
@@ -3027,10 +3303,17 @@ static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *mi
     /* the parent is missing too: fail closed, as before 1.27; with launches
      * decided (a coding agent's compiler looks up include directories under
      * missing ones), decide on where the kernel's lookup stops */
+    char tail[PATH_LIMIT] = "";
     if (pfd < 0 && errno == ENOENT && g_exec_policy && g_exec_policy->v.launches) {
         static char nm[256];
         int q = -1;
-        if (meta_first_missing(base, path, &q, nm, sizeof nm) == 0) { pfd = q; name = nm; }
+        /* v1.29 (step 6): under `require warden 1.29`, decided on the whole
+         * name asked for (~/.config/git/config, ~/.config missing), not on
+         * the first missing directory: the answer is ENOENT either way,
+         * and where the policy allows that name nothing outside it is told */
+        if (meta_first_missing(base, path, &q, nm, sizeof nm, g_changes_on ? tail : NULL, sizeof tail) == 0) {
+            pfd = q; name = nm;
+        }
     }
     close(base);
     if (pfd < 0) return -1;
@@ -3048,8 +3331,8 @@ static int resolve_meta(pid_t tid, struct action *a, int held, int *ofd, int *mi
     int rc = -1;
     if (fd_canonical_path(pfd, parent, sizeof(parent)) == 0 &&
         check_proc_object(pfd, tid, &tgid, parent, sizeof(parent)) == 0) {
-        int n = snprintf(a->resolved, sizeof(a->resolved), "%s%s%s",
-                         parent, strcmp(parent, "/") ? "/" : "", name);
+        int n = snprintf(a->resolved, sizeof(a->resolved), "%s%s%s%s%s",
+                         parent, strcmp(parent, "/") ? "/" : "", name, tail[0] ? "/" : "", tail);
         if (n > 0 && (size_t)n < sizeof(a->resolved)) { *missing = e; rc = 0; }
         else a->resolved[0] = '\0';
     }
@@ -3073,6 +3356,7 @@ static void syn_hosts_view(const struct policy *p, FILE *f);
 #include "warden_subagent.inc.c"     /* v1.28.1: sub-agents' control groups and attribution */
 #include "warden_exec.inc.c"         /* v1.27: the launch set and its Landlock ruleset */
 #include "warden_noexec.inc.c"       /* v1.27.1: writable directories mounted noexec */
+#include "warden_change.inc.c"       /* v1.29: changes by name */
 
 /* ---------------- receive loop ---------------- */
 
@@ -3294,6 +3578,12 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * decision, like read() on it. A name that does not exist is decided
          * on where it would be: ENOENT inside the policy, EACCES outside, so
          * the lookup no longer tells the agent what exists elsewhere. */
+        /* v1.29: a change by name (unlink, rename, mkdir, chmod, ...): decided
+         * as a write on each path, carried out as the agent */
+        if (act.kind == ACT_FILE_CHANGE) {
+            change_handle(notify_fd, &req, &act, p, &t0);
+            continue;
+        }
         if (is_meta_kind(act.kind)) {
             if (act.bad_flags) { send_errno(notify_fd, req.id, EINVAL); continue; }
             /* v1.26.1: a trust view's metadata, from the view */
@@ -3358,10 +3648,10 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                 if (mfd >= 0) close(mfd);
                 uint64_t lat_m = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                                + (t1.tv_nsec - t0.tv_nsec);
-                emit_pathology(g_report_seq++, req.pid, &act, m_raw, m_final,
-                               m_cert_refused ? "certificate_refused" : decision_rule_id(&act, m_raw),
-                               lat_m, EACCES);
-                send_simple(notify_fd, req.id, DEC_DENY);
+                const char *mrule = m_cert_refused ? "certificate_refused" : decision_rule_id(&act, m_raw);
+                bool mlet = dry_let(&act, mrule);                   /* v1.29: to the kernel */
+                emit_pathology(g_report_seq++, req.pid, &act, m_raw, m_final, mrule, lat_m, mlet ? 0 : EACCES);
+                send_simple(notify_fd, req.id, mlet ? DEC_ALLOW : DEC_DENY);
                 continue;
             }
             int64_t r;
@@ -3437,18 +3727,21 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                  * as a lookup is (v1.17): ENOENT where the policy allows the
                  * read, EACCES elsewhere. Before 1.27, refused as before. */
                 int mofd = -1, miss = 0;
-                if (g_exec_policy && g_exec_policy->v.launches && !(act.open_flags & O_CREAT) &&
+                if (g_exec_policy && g_exec_policy->v.launches &&
+                    (!(act.open_flags & O_CREAT) || p->v.open_as_agent) &&   /* v1.29: creates too */
                     resolve_meta(req.pid, &act, -1, &mofd, &miss) == 0 && mofd < 0 && miss == ENOENT &&
                     in_protected_dir(act.resolved, -1) == 0) {
                     decision_t nr = policy_decide(p, &act);
                     bool nok = nr == DEC_ALLOW && certify(p, &act);
                     clock_gettime(CLOCK_MONOTONIC, &t1);
-                    emit_pathology(g_report_seq++, req.pid, &act, nr, nok ? DEC_ALLOW : DEC_DENY,
-                                   nok ? "open_not_found" : nr == DEC_ALLOW ? "certificate_refused"
-                                                                         : decision_rule_id(&act, nr),
+                    const char *nrule = nok ? "open_not_found" : nr == DEC_ALLOW ? "certificate_refused"
+                                                                                : decision_rule_id(&act, nr);
+                    bool nlet = !nok && dry_let(&act, nrule);          /* v1.29: to the kernel */
+                    emit_pathology(g_report_seq++, req.pid, &act, nr, nok ? DEC_ALLOW : DEC_DENY, nrule,
                                    (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec),
-                                   nok ? ENOENT : EACCES);
-                    send_errno(notify_fd, req.id, nok ? ENOENT : EACCES);
+                                   nok ? ENOENT : nlet ? 0 : EACCES);
+                    if (nlet) send_simple(notify_fd, req.id, DEC_ALLOW);
+                    else send_errno(notify_fd, req.id, nok ? ENOENT : EACCES);
                     continue;
                 }
                 if (mofd >= 0) close(mofd);
@@ -3535,10 +3828,10 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat_d = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                            + (t1.tv_nsec - t0.tv_nsec);
-            emit_pathology(g_report_seq++, req.pid, &act, d_raw, d_final,
-                           cert_refused ? "certificate_refused" : decision_rule_id(&act, d_raw),
-                           lat_d, EACCES);
-            send_simple(notify_fd, req.id, d_final);
+            const char *orule = cert_refused ? "certificate_refused" : decision_rule_id(&act, d_raw);
+            bool olet = dry_let(&act, orule);       /* v1.29: to the kernel, as the agent */
+            emit_pathology(g_report_seq++, req.pid, &act, d_raw, d_final, orule, lat_d, olet ? 0 : EACCES);
+            send_simple(notify_fd, req.id, olet ? DEC_ALLOW : d_final);
             continue;
         }
 
@@ -3557,6 +3850,17 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             continue;
         }
 
+        /* v1.29: in a dry run the filter sends a system call outside its
+         * allowlist here (when enforcing it is refused there, EPERM): the
+         * kernel carries it out, recorded as not enforced */
+        if (act.kind == ACT_OTHER && g_dry) {
+            act.dry = true;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            emit_pathology(g_report_seq++, req.pid, &act, DEC_UNKNOWN, DEC_DENY, "syscall_not_admitted",
+                           (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec), 0);
+            send_simple(notify_fd, req.id, DEC_ALLOW);
+            continue;
+        }
         send_simple(notify_fd, req.id, d_final);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         uint64_t lat = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
@@ -4763,6 +5067,8 @@ int main(int argc, char **argv) {
             key_path = argv[++i];
         } else if (strcmp(argv[i], "--anchor") == 0 && !anchor_path) {
             anchor_path = argv[++i];
+        } else if (strcmp(argv[i], "--dry-run") == 0) {                  /* v1.29 */
+            g_dry = true;
         } else if (strcmp(argv[i], "--writable-exec") == 0) {            /* v1.27.1 */
             g_writable_exec = true;
         } else if (strcmp(argv[i], "--run-as") == 0 && !run_as_arg) {
@@ -4872,8 +5178,33 @@ int main(int argc, char **argv) {
     /* ~1 MB (256 rules x 4 KB constants): static, not on the stack. */
     static struct policy p;
     if (policy_load(policy_path, &p) < 0) return 1;
+    /* v1.29: a dry run (section 3), on the command line only (D3). Not with
+     * a plan (the plan gate refuses before the agent starts; checking a plan
+     * is `varek policy check`'s job), with credentials (it would hand the
+     * proxy real values for an agent whose policy is not settled: D2), or
+     * with sub-agents (their attribution rests on launches being held). */
+    if (g_dry) {
+        bool subs = false;
+        for (size_t i = 0; i < p.v.n; i++) if (p.v.rules[i].subagent[0]) subs = true;
+        const char *no = plan_path ? "--plan" : p.v.ncreds ? "a policy that names credentials"
+                       : subs ? "a policy that names sub-agents (subagent=)" : NULL;
+        if (no) {
+            fprintf(stderr, "[warden] --dry-run with %s is refused\n", no);
+            return 2;
+        }
+        fprintf(stderr, "[warden] DRY RUN: NOT ENFORCING. Every call is decided and recorded; a call the "
+                "policy refuses is let through (\"enforced\":false). The protected objects, the hard-denied "
+                "system calls and revocation still refuse.\n");
+        g_writable_exec = true;          /* no noexec mounts: launches are not held */
+    }
 
     /* v1.16: log integrity. */
+    /* v1.29 (step 9): libcrypto only hashes the launch set; it reads no
+     * configuration file, so no module or provider one names is loaded */
+    if (OPENSSL_init_crypto(OPENSSL_INIT_NO_LOAD_CONFIG, NULL) != 1) {
+        fprintf(stderr, "[warden] libcrypto failed to initialize\n");
+        return 1;
+    }
     if (sodium_init() < 0) {
         fprintf(stderr, "[warden] libsodium failed to initialize\n");
         return 1;
@@ -5210,6 +5541,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         fprintf(stderr, "[warden] launch set: %zu files, %s\n", g_exec_n,
+                g_dry ? "not held (dry run)" :
                 g_ll_abi >= 1 ? "held by Landlock" : "no Landlock: later launches refused");
         if (g_check_only)
             for (size_t k = 0; k < g_exec_n; k++) {
@@ -5247,6 +5579,10 @@ int main(int argc, char **argv) {
                             : g_nx[k].file ? " (a file)" : "", g_nx[k].line);
         }
     }
+    /* v1.29 step 1: files opened as the agent (require warden 1.29) */
+    g_changes_on = p.v.open_as_agent;                                /* v1.29 */
+    if (as_agent_setup(p.v.open_as_agent, ra.drop, ra.uid, ra.gid, run_as_arg ? run_as_arg : "nobody") < 0)
+        return 1;
     /* v1.28.1 step 3: sub-agents need cgroup v2 (a check makes no group) */
     if (g_check_only && sub_setup(&p, true, !ra.drop) < 0) return 1;
     if (g_check_only) {
@@ -5445,13 +5781,15 @@ int main(int argc, char **argv) {
         /* v1.27: the agent enters the launch set's Landlock domain before
          * its filter is installed (the filter does not admit the call) and
          * before its own launch, which the set holds */
-        if (exec_ruleset_apply() < 0) {
+        if (!g_dry && exec_ruleset_apply() < 0) {      /* v1.29: a dry run holds no launch */
             fprintf(stderr, "[warden-target] cannot enter the Landlock domain (%s); refusing to run\n",
                     strerror(errno));
             _exit(1);
         }
         int notify_fd =
-            install_baseline_user_notif_filter(getenv("VAREK_WARDEN_OBSERVE") != NULL);
+            install_baseline_user_notif_filter_ex(getenv("VAREK_WARDEN_OBSERVE") != NULL,
+                                                  (p.v.open_as_agent ? WD_FILTER_CHANGES : 0) |
+                                                  (g_dry ? WD_FILTER_DRY : 0));   /* v1.29 */
         if (notify_fd < 0) { perror("seccomp"); _exit(1); }
         /* v1.12: hand the fd NUMBER to the supervisor and wait for it to pull
          * the fd via pidfd_getfd(). write()/read() are admitted; no sendmsg. */

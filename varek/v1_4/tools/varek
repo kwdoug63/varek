@@ -41,8 +41,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import varek_license  # noqa: E402
 import varek_bench  # noqa: E402
+import varek_baseline  # noqa: E402
+import varek_suggest  # noqa: E402
 
-CLI_VERSION = "1.2.0"
+CLI_VERSION = "1.3.0"
 DEFAULT_CONFIG = "/etc/varek/varek.conf"
 DEFAULT_ETC = "/etc/varek"
 DEFAULT_LOG_DIR = "/var/log/varek"
@@ -139,7 +141,25 @@ def load_config(required=True):
         "spool": c.get("spool", "").strip(),
         "run_as": c.get("run_as", "nobody").strip() or "nobody",
         "packs_dir": c.get("packs_dir", os.path.join(etc, "packs")),
+        "implicit": False,
     }
+
+
+def default_config():
+    """v1.29: the settings `varek run` uses with no configuration (nothing
+    set up first): the default log directory (VAREK_LOG_DIR), the signing
+    key next to where varek.conf would be, no anchor."""
+    etc = os.path.dirname(os.path.abspath(config_path()))
+    key = os.path.join(etc, "log.key")
+    return {"path": None, "etc": etc, "policy": "",
+            "log_dir": os.environ.get("VAREK_LOG_DIR", DEFAULT_LOG_DIR),
+            "sign_key": key if os.path.exists(key) else "", "anchor": "", "spool": "",
+            "run_as": "", "packs_dir": os.path.join(etc, "packs"), "implicit": True}
+
+
+def config_or_defaults():
+    """The settings, or (v1.29) the defaults when there are none"""
+    return load_config(required=False) or default_config()
 
 
 def write_config(path, cfg):
@@ -268,6 +288,8 @@ def pack_summary(path):
         with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 s = line.strip()
+                if s.startswith("#@"):           # v1.29: a baseline's header
+                    continue
                 if s.startswith("#") and len(s) > 2 and not set(s[1:].strip()) <= set("-=_ "):
                     return s.lstrip("# ").strip()
     except OSError:
@@ -296,28 +318,46 @@ def policy_rules(path):
     return counts, require
 
 
+class _Stream:
+    """The records of a verdict stream, read from the file on each pass and
+    never held: a day's stream under the baseline is a few hundred MB, more
+    than a small host can hold as objects (the shared soak, v1.31). Each pass
+    checks the stream to its end as read_records always did."""
+
+    def __init__(self, log):
+        self.log = log
+        with open(log, "rb"):                        # unreadable: say so now, not on first use
+            pass
+
+    def __iter__(self):
+        n, bad, other = 0, 0, 0
+        with open(self.log, encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if line.startswith("{"):
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        if raw.endswith("\n"):
+                            bad += 1             # (a last line still being written is not counted)
+                        continue
+                    n += 1
+                    yield rec
+                elif line and not line.startswith("[warden"):
+                    other += 1
+        if not n and other:
+            raise CliError(f"{self.log}: not a verdict stream (no records)")
+        if bad:
+            raise CliError(f"{self.log}: {bad} line(s) look like records but cannot be read; the stream is damaged or "
+                f"not a verdict stream (varek audit says more)")
+
+
 def read_records(log):
     """The records of a verdict stream. v1.27 review: a line that looks like a
     record but is not one is never dropped silently; a stream with any is
-    refused (a summary of part of a stream would mislead)."""
-    recs, bad, other = [], 0, 0
-    with open(log, encoding="utf-8", errors="replace") as fh:
-        for raw in fh:
-            line = raw.strip()
-            if line.startswith("{"):
-                try:
-                    recs.append(json.loads(line))
-                except ValueError:
-                    if raw.endswith("\n"):
-                        bad += 1             # (a last line still being written is not counted)
-            elif line and not line.startswith("[warden"):
-                other += 1
-    if not recs and other:
-        raise CliError(f"{log}: not a verdict stream (no records)")
-    if bad:
-        raise CliError(f"{log}: {bad} line(s) look like records but cannot be read; the stream is damaged or "
-            f"not a verdict stream (varek audit says more)")
-    return recs
+    refused (a summary of part of a stream would mislead). v1.31 (the shared
+    soak): an iterable that reads the file on each pass, not a list."""
+    return _Stream(log)
 
 
 def run_logs(cfg):
@@ -347,9 +387,12 @@ def summarize(recs):
          "allowed": 0, "refused": 0, "unknown": 0, "refusals": [],
          "proxy_targets": {}, "proxy_denied": set(), "proxy_ends": [],
          "cred_refused": [], "revoked": None, "credentials": [],
-         "user": None, "spiffe_id": None, "subagents": {}, "expired": None}
+         "user": None, "spiffe_id": None, "subagents": {}, "expired": None,
+         "dry": False, "not_enforced": 0}
     for r in recs:
         ev = r.get("event")
+        if r.get("enforced") is False and (s["run"] is None or r.get("run") == s["run"]):
+            s["not_enforced"] += 1                                   # v1.29: a dry run let it through
         # v1.28 review: only this run's records (a stream can hold lines of
         # another run, which the audit ignores too)
         if s["run"] is not None and ev != "run_start" and "run" in r and r.get("run") != s["run"]:
@@ -365,6 +408,7 @@ def summarize(recs):
             s["warden"] = r.get("warden")
             s["policy"] = r.get("policy_path")
             s["policy_sha"] = r.get("policy_sha256")
+            s["dry"] = r.get("mode") == "dry_run"                    # v1.29
             ts = r.get("timestamp_ns")
             if ts:
                 s["start"] = _dt.datetime.fromtimestamp(ts / 1e9).strftime("%Y-%m-%d %H:%M:%S")
@@ -393,8 +437,10 @@ def summarize(recs):
             if r.get("why") in ("refused_request", "server_tls", "client_tls", "tls_timeout", "max_body") \
                     and type(r.get("proxy_conn")) is int:
                 s["proxy_ends"].append(r)
-        elif ev == "dns_question" and r.get("rule") == "wildcard_budget":
-            # v1.25: a name a wildcard rule's budget refused (NXDOMAIN)
+        elif ev == "dns_question" and (r.get("rule") == "wildcard_budget" or
+                                       (r.get("rule") == "no_rule" and r.get("enforced") is False)):
+            # v1.25: a name a wildcard rule's budget refused (NXDOMAIN);
+            # v1.29: or, in a dry run, a name looked up that would be refused
             s["refused"] += 1
             s["refusals"].append(r)
         elif "decision_final" in r:
@@ -434,7 +480,8 @@ def _policy_for_log(cfg, s):
     want = s.get("policy_sha")
     cands = [s.get("policy"), cfg["policy"]]
     cands += list(installed_packs(cfg).values()) + list(builtin_packs().values())
-    cands += sorted(glob.glob(cfg["policy"] + ".bak-*"), reverse=True)
+    if cfg["policy"]:
+        cands += sorted(glob.glob(cfg["policy"] + ".bak-*"), reverse=True)
     seen = set()
     for c in cands:
         if not c or c in seen or not os.path.isfile(c):
@@ -592,6 +639,24 @@ def cmd_doctor(args):
         warn("The Warden cannot make a mount namespace here: a `require warden 1.27` run refuses to "
              "start unless given --writable-exec")
         hint("run the Warden as root (it needs CAP_SYS_ADMIN), outside a container that forbids unshare")
+
+    # v1.29: a dry run lets a refused call through with CONTINUE (5.5, within
+    # the 5.14 above); the baseline runs the agent as the user who ran sudo
+    if m and (int(m.group(1)), int(m.group(2))) >= (5, 14):
+        ok("dry runs available (`varek run --dry-run` records what the policy would refuse, enforcing nothing)")
+    pw, ra, why_user = varek_baseline.agent_user(None)
+    if pw is None:
+        warn(f"the agent's user ({ra}, {why_user}) has no passwd entry: `varek run` with no settings will "
+             f"not start")
+    elif pw.pw_uid == 0:
+        fail("the agent's user would be root")
+        bad += 1
+    elif not os.path.isdir(pw.pw_dir) and ra != "nobody":
+        warn(f"the agent's user {ra} ({why_user}) has no home directory {pw.pw_dir}: the baseline "
+             f"gives it none")
+    else:
+        ok(f"the baseline runs the agent as {ra} ({why_user})" +
+           ("; run `sudo varek run` from your own account to run it as you" if ra == "nobody" else ""))
 
     cg2 = cgroup2_mount()                                                         # v1.28.1
     if cg2:
@@ -852,6 +917,13 @@ def cmd_policy_show(args):
     info(f"About    {pack_summary(path)}")
     info(f"SHA-256  {digest}   (recorded in every run's run_start)")
     info(f"Needs    Warden {require or 'any version'}")
+    hdr = baseline_header(path)                                                     # v1.29
+    if hdr:
+        prof = hdr.get("profile", "none -").split()
+        info(f"Baseline written by `varek run` (format {hdr.get('varek baseline', '?')}) for user "
+             f"{hdr.get('user', '?')}, working directory {hdr.get('cwd', '?')}, home {hdr.get('home', '?')}, "
+             f"temporary directory {hdr.get('tmp', '?')}; profile " +
+             (f"{prof[0]} (sha256 {prof[1][:16]}...)" if prof and prof[0] != "none" and len(prof) > 1 else "none"))
     show_rc = 0
     for verb in ("allow", "deny"):
         parts = ", ".join(f"{v} {k}" for k, v in sorted(counts[verb].items())) or "none"
@@ -982,6 +1054,57 @@ def cmd_policy_show(args):
     return show_rc
 
 
+def baseline_header(path):
+    """v1.29: a baseline's `#@ key value` lines (a dict), else {}"""
+    h = {}
+    try:
+        with open(path, errors="replace") as f:
+            for ln in f:
+                if not ln.startswith("#@ "):
+                    break
+                body = ln[3:].rstrip("\n")
+                if body.startswith("varek baseline "):
+                    h["varek baseline"] = body[len("varek baseline "):]
+                else:
+                    k, _, v = body.partition(" ")
+                    h[k] = v
+    except OSError:
+        return {}
+    return h if "varek baseline" in h else {}
+
+
+def cmd_policy_suggest(args):
+    """v1.29: a draft policy from a run's refusals (varek_suggest.py)"""
+    cfg = config_or_defaults()
+    log = latest_log(cfg, args.log)
+    recs = read_records(log)
+    s = summarize(recs)
+    pol = _policy_for_log(cfg, s)
+    if not pol:
+        raise CliError(f"the policy {log}'s run used (sha256 {s.get('policy_sha') or '?'}) was not found",
+                       fix="the run's policy file must still be where it was, or among the packs")
+    with open(pol, encoding="utf-8", errors="surrogateescape") as fh:
+        text = fh.read()
+    try:
+        draft, active, commented = varek_suggest.suggest(recs, text, pol, s.get("policy_sha") or "?",
+                                                         tool("vdp_check"))
+    except (ValueError, RuntimeError) as e:
+        raise CliError(str(e))
+    if args.output:
+        if os.path.exists(args.output) and not args.force:
+            raise CliError(f"{args.output} exists", fix="choose another file, or pass --force")
+        with open(args.output, "w", encoding="utf-8", errors="surrogateescape") as fh:
+            fh.write(draft)
+        ok(f"draft written to {args.output}")
+    else:
+        sys.stdout.write(draft)
+    print(_paint("2", f"[varek] a DRAFT from run {s['run'] or '?'}"
+                      f"{' (a dry run)' if s.get('dry') else ''}: {active} rule(s) suggested, {commented} "
+                      f"written commented out with the reason; read each before `varek policy use`"),
+          file=sys.stderr)
+    return 0
+
+
 def cmd_policy_check(args):
     cfg = load_config(required=not args.file)
     path = resolve_pack(args.file, cfg) if args.file else cfg["policy"]
@@ -1062,18 +1185,96 @@ def cmd_preflight(args):
     return run_cmd(argv, check=False).returncode
 
 
+def first_use(cfg):
+    """v1.29: with no configuration, make what a run needs, each step said:
+    the log directory and (unless it exists) a signing key. No varek.conf."""
+    d = cfg["log_dir"]
+    if not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+        os.chmod(d, 0o750)
+        print(_paint("2", f"[varek] log directory {d} (750), made on first use"), file=sys.stderr)
+    key = os.path.join(cfg["etc"], "log.key")
+    if not os.path.exists(key):
+        os.makedirs(cfg["etc"], exist_ok=True)
+        os.chmod(cfg["etc"], 0o755)
+        run_cmd([tool("varek_keygen"), key], capture=True)
+        print(_paint("2", f"[varek] signing key {key} (600) and {key}.pub, made on first use"), file=sys.stderr)
+    cfg["sign_key"] = key
+
+
+def baseline_for_run(args, cmd, make):
+    """v1.29: the baseline for this run: (policy text, passwd entry, --run-as
+    value, the temporary directory, the profile's name, notes)"""
+    try:
+        pw, ra, why_user = varek_baseline.agent_user(args.run_as)
+        if pw is None:
+            raise CliError(f"--run-as {ra}: no such user (the baseline needs a passwd entry for its home)")
+        if pw.pw_uid == 0:
+            raise CliError("the agent would run as root",
+                           fix="run it with sudo as yourself, or pass --run-as USER")
+        profiles = varek_baseline.all_profiles(varek_home())
+        prof, why_prof = varek_baseline.choose_profile(cmd, profiles, args.profile)
+        cwd = varek_baseline.check_cwd(os.getcwd(), pw.pw_dir)
+        tmp = varek_baseline.tmp_dir(pw, make=make)
+        path = varek_baseline.agent_path(cmd, os.environ)
+        text = varek_baseline.generate(cwd, pw, tmp, prof, path=path, ttys=varek_baseline.own_ttys())
+    except varek_baseline.BaselineError as e:
+        raise CliError(str(e))
+    notes = [f"the agent runs as {pw.pw_name} ({why_user})",
+             f"profile {prof['name']} ({why_prof})" if prof else f"no profile ({why_prof}): the baseline alone"]
+    return text, pw, ra, tmp, (prof["name"] if prof else None), notes, path
+
+
 def cmd_run(args):
-    need_root("run")
-    cfg = load_config()
     cmd = args.command
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd:
         raise CliError("no agent command given",
                        fix="put it after --, e.g. `sudo varek run -- python3 agent.py`")
-    policy = resolve_pack(args.policy, cfg) if args.policy else cfg["policy"]
-    if args.policy:
-        require_entitlement(policy)
+    cfg = load_config(required=False)
+    baseline = args.baseline or (cfg is None and not args.policy)
+    if args.policy and args.baseline:
+        raise CliError("--policy and --baseline together", fix="choose one")
+    if (args.profile or args.env) and not baseline:
+        raise CliError("--profile and --env go with the baseline policy",
+                       fix="run with no configuration, or pass --baseline")
+    if args.show_policy:
+        if not baseline:
+            raise CliError("--show-policy prints the baseline policy", fix="pass --baseline")
+        text, _, _, _, _, notes, _ = baseline_for_run(args, cmd, make=False)
+        sys.stdout.write(text)
+        for n in notes:
+            print(_paint("2", f"[varek] {n}"), file=sys.stderr)
+        return 0
+    need_root("run")
+    if cfg is None:
+        cfg = default_config()
+        first_use(cfg)
+    env = None
+    if baseline:
+        text, pw, run_as, tmp, prof, notes, path = baseline_for_run(args, cmd, make=True)
+        try:
+            policy = varek_baseline.store(text)
+            env = varek_baseline.agent_env(pw, tmp, args.env or [], os.environ, path)
+            # v1.29 review: the Warden records the operator from sudo's
+            # variables, which the agent's clean environment leaves out
+            for k in ("SUDO_UID", "SUDO_GID", "SUDO_USER"):
+                if k in os.environ and k not in env:
+                    env[k] = os.environ[k]
+        except (varek_baseline.BaselineError, OSError) as e:
+            raise CliError(str(e))
+        label = f"the baseline policy for {os.getcwd()}" + (f", profile {prof}" if prof else "")
+        for n in notes:
+            print(_paint("2", f"[varek] {n}"), file=sys.stderr)
+        print(_paint("2", f"[varek] policy {policy} (`varek run --baseline --show-policy -- ...` prints it)"),
+              file=sys.stderr)
+    else:
+        policy = resolve_pack(args.policy, cfg) if args.policy else cfg["policy"]
+        if args.policy:
+            require_entitlement(policy)
+        run_as = args.run_as or cfg["run_as"] or "nobody"
+        label = pack_summary(policy) or os.path.basename(policy)
     os.makedirs(cfg["log_dir"], exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     log = args.log or os.path.join(cfg["log_dir"], f"verdicts-{stamp}.log")
@@ -1089,14 +1290,23 @@ def cmd_run(args):
         argv += ["--sign-key", cfg["sign_key"]]
     if cfg["anchor"]:
         argv += ["--anchor", cfg["anchor"]]
-    argv += ["--run-as", args.run_as or cfg["run_as"], "--"] + cmd
+    if args.writable_exec:
+        argv += ["--writable-exec"]
+    if args.dry_run:                                                  # v1.29
+        if args.plan:
+            raise CliError("--dry-run with --plan is refused",
+                           fix="check a plan with `varek policy check`; dry-run the agent without --plan")
+        argv += ["--dry-run"]
+    argv += ["--run-as", run_as, "--"] + cmd
 
     fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
-    label = pack_summary(policy) or os.path.basename(policy)
+    if args.dry_run:
+        print(_paint("1;33", "[varek] DRY RUN: NOT ENFORCING. Every call is decided and recorded; what the "
+                             "policy refuses is let through."), file=sys.stderr)
     print(_paint("2", f"[varek] supervising `{' '.join(cmd)}` under {label}; "
                       f"verdicts -> {log}"), file=sys.stderr)
     with os.fdopen(fd, "w") as err:
-        r = run_cmd(argv, check=False, stderr=err)
+        r = run_cmd(argv, check=False, stderr=err, env=env)
 
     agent_err = []
     with open(log, encoding="utf-8", errors="replace") as fh:
@@ -1110,7 +1320,11 @@ def cmd_run(args):
     print(_paint("2", f"[varek] run {s['run'] or '?'} ended (exit {r.returncode}): "
                       f"{s['allowed']} allowed, {s['refused']} refused "
                       f"({s['unknown']} UNKNOWN)"), file=sys.stderr)
-    if s["refused"]:
+    if s["dry"] or args.dry_run:
+        print(_paint("1;33", f"[varek] DRY RUN: NOT ENFORCING: {s['not_enforced']} call(s) the policy refuses "
+                             f"were let through; `varek refusals` lists them, and `varek policy suggest` "
+                             f"drafts rules for them"), file=sys.stderr)
+    elif s["refused"]:
         print(_paint("2", "[varek] see why with `varek refusals`"), file=sys.stderr)
     if s["run"] is None:
         with open(log, encoding="utf-8", errors="replace") as fh:
@@ -1122,9 +1336,14 @@ def cmd_run(args):
 
 
 def cmd_status(args):
-    cfg = load_config()
-    info(f"Settings   {cfg['path']}")
-    if os.path.isfile(cfg["policy"]):
+    cfg = config_or_defaults()
+    if cfg["implicit"]:
+        info(f"Settings   none ({config_path()} does not exist): `varek run` uses the baseline policy")
+    else:
+        info(f"Settings   {cfg['path']}")
+    if cfg["implicit"]:
+        pass
+    elif os.path.isfile(cfg["policy"]):
         counts, _ = policy_rules(cfg["policy"])
         n = sum(sum(v.values()) for v in counts.values())
         info(f"Policy     {cfg['policy']} ({n} rules) - {pack_summary(cfg['policy'])}")
@@ -1132,13 +1351,15 @@ def cmd_status(args):
         info(f"Policy     {cfg['policy']} (MISSING)")
     info(f"Signing    {cfg['sign_key'] or 'off (chained, unsigned)'}")
     info(f"Anchor     {cfg['anchor'] or 'none'}")
-    info(f"Agent user {cfg['run_as']}")
+    info(f"Agent user {cfg['run_as'] or 'the user who ran sudo (the baseline)'}")
     info(f"Logs       {cfg['log_dir']}")
     logs = run_logs(cfg)
     if logs:
         s = summarize(read_records(logs[0]))
         info(f"Last run   {s['start'] or '?'}  {s['allowed']} allowed, {s['refused']} refused"
              f"{'' if s['complete'] else '  (no run_end: still running or cut short)'}")
+        if s["dry"]:                                                               # v1.29
+            info(f"           a DRY RUN, NOT ENFORCED: {s['not_enforced']} call(s) the policy refuses were let through")
         info(f"           {logs[0]}")
     else:
         info("Last run   none yet")
@@ -1165,16 +1386,16 @@ def obo_text(r):
 
 
 def cmd_runs(args):
-    cfg = load_config()
+    cfg = config_or_defaults()
     logs = run_logs(cfg)[: args.n]
     if not logs:
         info(f"No runs in {cfg['log_dir']}.")
         return 0
-    info(f"{'STARTED':19}  {'ALLOWED':>7}  {'REFUSED':>7}  {'DONE':4}  {'FOR':33}  LOG")
+    info(f"{'STARTED':19}  {'MODE':7}  {'ALLOWED':>7}  {'REFUSED':>7}  {'DONE':4}  {'FOR':33}  LOG")
     for log in logs:
         s = summarize(read_records(log))
-        info(f"{(s['start'] or '?'):19}  {s['allowed']:>7}  {s['refused']:>7}  "
-             f"{'yes' if s['complete'] else 'no':4}  {run_for(s):33}  {log}")
+        info(f"{(s['start'] or '?'):19}  {'dry run' if s['dry'] else 'enforce':7}  {s['allowed']:>7}  "
+             f"{s['refused']:>7}  {'yes' if s['complete'] else 'no':4}  {run_for(s):33}  {log}")
     return 0
 
 
@@ -1284,7 +1505,7 @@ EXEC_WORDS = {
 
 
 def cmd_refusals(args):
-    cfg = load_config()
+    cfg = config_or_defaults()
     log = latest_log(cfg, args.log)
     s = summarize(read_records(log))
     policy = _policy_for_log(cfg, s)
@@ -1322,12 +1543,26 @@ def cmd_refusals(args):
         how = ("the user's token expired" if rv.get("by") == "on_behalf_of_expiry"        # v1.28.1
                else f"varek revoke, by uid {rv.get('by_uid', '?')}")
         info(f"The run was revoked at {when} ({how}): every call after it was refused.\n")
+    if s["dry"]:                                                                    # v1.29
+        info(_paint("1;33", f"DRY RUN, NOT ENFORCING: {s['not_enforced']} call(s) the policy refuses were let "
+                            "through (listed as WOULD_REFUSE); calls refused all the same are listed as "
+                            "refused.") + "\n")
+    if args.enforced or args.not_enforced:                                          # v1.29: filters
+        keep = (lambda r: r.get("enforced") is not False) if args.enforced else (lambda r: r.get("enforced") is False)
+        s["refusals"] = [r for r in s["refusals"] if keep(r)]
+        s["refused"] = len(s["refusals"])
+        if args.not_enforced:
+            ends, s["cred_refused"] = [], []                   # always enforced: not shown
     if not s["refusals"] and not ends and not s["cred_refused"]:
-        info(f"No refusals in {log}" + (f" for sub-agent {args.subagent}" if args.subagent else "") + ".")
+        info(f"No {'refusals' if not args.not_enforced else 'calls let through'} in {log}" +
+             (f" for sub-agent {args.subagent}" if args.subagent else "") + ".")
         return 0
-    info(f"{s['refused']} refused action(s) in {log}:\n")
+    info(f"{s['refused']} refused action(s) in {log}" +
+         (f" ({sum(1 for r in s['refusals'] if r.get('enforced') is False)} not enforced)" if s["dry"] else "") +
+         ":\n")
     for r in s["refusals"][: args.n]:
         line = r.get("policy_line", -1)
+        dry = r.get("enforced") is False                                            # v1.29
         if r.get("action") == "net.request":
             # v1.26.1: a request on an inspected connection; the agent got a
             # 403 and the connection ended after it
@@ -1346,8 +1581,9 @@ def cmd_refusals(args):
                 word, where = verdict_word(r), "no request rule allows it"
             else:
                 word, where = verdict_word(r), RULE_WORDS.get(rl, rl or "no rule matched")
-            info(f"  {word:11}  {'net.request':13}  {r.get('target', '')}")
-            hint(f"{where}; the agent got 403 Forbidden and the connection ended")
+            info(f"  {'WOULD_REFUSE' if dry else word:11}  {'net.request':13}  {r.get('target', '')}")
+            hint(f"{where}; " + ("let through (dry run: not enforced)" if dry else
+                                 "the agent got 403 Forbidden and the connection ended"))
             continue
         rl = r.get("rule")
         if rl == "exec_identity_mismatch":
@@ -1359,8 +1595,13 @@ def cmd_refusals(args):
         if r.get("action") == "process.exec" and rl in EXEC_WORDS:
             word, what = EXEC_WORDS[rl]
             text = policy_line_text(policy, line) if policy and isinstance(line, int) and line >= 0 else None
-            info(f"  {word:11}  {'process.exec':13}  {r.get('resolved') or r.get('target', '')}")
-            hint(f"policy line {line}" + (f": {text}" if text else "") + f" {what}; the agent got EACCES")
+            info(f"  {'WOULD_REFUSE' if dry else word:11}  {'process.exec':13}  {r.get('resolved') or r.get('target', '')}")
+            hint(f"policy line {line}" + (f": {text}" if text else "") + f" {what}; " +
+                 ("let through (dry run: not enforced)" if dry else "the agent got EACCES"))
+            continue
+        if r.get("event") == "dns_question" and r.get("rule") == "no_rule":         # v1.29: a dry run
+            info(f"  {'WOULD_REFUSE':11}  {'dns.question':13}  {r.get('name', '')}")
+            hint("no rule names it; looked up all the same (dry run: not enforced)")
             continue
         if r.get("event") == "dns_question":
             text = policy_line_text(policy, line) if policy and isinstance(line, int) else None
@@ -1369,8 +1610,9 @@ def cmd_refusals(args):
                     "rate": "its rate= budget (lookups upstream per minute) is spent",
                     "label": "the part before the suffix is longer than 63 bytes"}.get(
                         b if isinstance(b, str) else "", "a budget")   # v1.25 review: no crash on a list
-            info(f"  {'BUDGET':11}  {'dns.question':13}  {r.get('name', '')}")
-            hint(f"policy line {line}" + (f": {text}" if text else "") + f"; {what}; the agent got NXDOMAIN")
+            info(f"  {'WOULD_REFUSE' if dry else 'BUDGET':11}  {'dns.question':13}  {r.get('name', '')}")
+            hint(f"policy line {line}" + (f": {text}" if text else "") + f"; {what}; " +
+                 ("looked up all the same (dry run: not enforced)" if dry else "the agent got NXDOMAIN"))
             continue
         if rl == "revoked":                                                         # v1.28
             info(f"  {'REVOKED':11}  {str(r.get('action', '?')):13}  {r.get('resolved') or r.get('target', '')}")
@@ -1385,9 +1627,10 @@ def cmd_refusals(args):
         else:
             where = r.get("rule", "no rule matched")
         target = r.get("resolved") or r.get("target", "")
-        info(f"  {verdict_word(r):11}  {r.get('action', '?'):13}  {target}")
+        info(f"  {'WOULD_REFUSE' if dry else verdict_word(r):11}  {r.get('action', '?'):13}  {target}")
         ch = obo_text(r)                                                           # v1.28.1
-        hint(f"{where}; {'sub-agent ' + ch if ch else 'the agent'} got {r.get('kernel_verdict', '?')}")
+        hint(f"{where}; " + ("let through (dry run: not enforced)" if dry else
+                             f"{'sub-agent ' + ch if ch else 'the agent'} got {r.get('kernel_verdict', '?')}"))
     if s["refused"] > args.n:
         info(f"\n  ... and {s['refused'] - args.n} more (use -n to see them)")
     if ends:
@@ -1423,6 +1666,9 @@ def cmd_refusals(args):
         if len(cf) > args.n:
             info(f"\n  ... and {len(cf) - args.n} more (use -n to see them)")
     info("\nUNSATISFIED: a deny rule matched.  UNKNOWN: no rule allowed it (refused by default).")
+    if any(r.get("enforced") is False for r in s["refusals"][: args.n]):
+        info("WOULD_REFUSE: the policy refuses it, but this was a dry run (varek run --dry-run): it was let "
+             "through. `varek policy suggest` writes the rules that would allow it.")
     if cf:
         info("CREDENTIAL: the header the rule names must hold the credential's placeholder (VAREK_CRED_<NAME>), "
              "once, alone or after the rule's scheme.")
@@ -1442,7 +1688,7 @@ def cmd_refusals(args):
 
 
 def cmd_audit(args):
-    cfg = load_config()
+    cfg = config_or_defaults()
     log = latest_log(cfg, args.log)
     s = summarize(read_records(log))
     policy = _policy_for_log(cfg, s)
@@ -1472,7 +1718,7 @@ def cmd_export(args):
                            fix="pass --pubkey /etc/varek/log.key.pub")
         return run_cmd([sys.executable, tool("varek_cyclonedx.py"),
                         "--verify", args.verify, "--pubkey", pub], check=False).returncode
-    cfg = load_config()
+    cfg = config_or_defaults()
     log = latest_log(cfg, args.log)
     s = summarize(read_records(log))
     out = args.output or re.sub(r"\.log$", "", log) + ".cdx.json"
@@ -1683,6 +1929,156 @@ def cmd_bench_subagents(args, cfg):
     return 0 if res["ok"] else 1
 
 
+def _bench_bases(args, cfg, bases, what):
+    """v1.29: the bench's own calls (opens and connects) under each of
+    several base policies (label -> text, the bench's rules after each),
+    alternated round by round, so the differences are what each base costs.
+    The medians of the rounds' p50s, per kind and base."""
+    import statistics
+    import tempfile
+    if args.policy or args.bare:
+        raise CliError(f"--{what} measures with the bench's own policies; --policy and --bare do not apply")
+    n = 2000 if args.n is None else args.n
+    warmup = 200 if args.warmup is None else args.warmup
+    rounds = 3 if args.rounds is None else args.rounds
+    if n < 100 or rounds < 1 or warmup < 0:
+        raise CliError("use -n of at least 100, --rounds of at least 1 and --warmup of 0 or more")
+    run_as = args.run_as or (cfg["run_as"] if cfg else "nobody")
+    sign_key = cfg["sign_key"] if cfg and cfg["sign_key"] and not args.no_sign else None
+    if args.output and not os.access(os.path.dirname(os.path.abspath(args.output)), os.W_OK):
+        raise CliError(f"cannot write {args.output}", fix="give -o a path in a writable directory")
+    progress = (lambda m: None) if args.json else (
+        lambda m: print(_paint("2", f"[varek] bench --{what} {m}"), file=sys.stderr))
+    d = tempfile.mkdtemp(prefix=f"varek-bench-{what}-")
+    os.chmod(d, 0o755)
+    paths, per = {}, {m: [] for m in bases}
+    for i, (m, text) in enumerate(bases.items()):
+        paths[m] = os.path.join(d, f"base-{i}.policy.txt")
+        with open(paths[m], "w") as fh:
+            fh.write(text)
+        os.chmod(paths[m], 0o644)
+    labels = list(bases)
+    try:
+        for rnd in range(rounds):
+            for m in (labels if rnd % 2 == 0 else labels[::-1]):
+                progress(f"round {rnd + 1}/{rounds}: {m}")
+                try:
+                    per[m].append(varek_bench.run(warden_bin(), tool("bench_workload"), base_policy=paths[m],
+                                                  base_label=m, n=n, warmup=warmup, rounds=1,
+                                                  run_as=run_as, sign_key=sign_key, keep=False))
+                except varek_bench.BenchError as e:
+                    raise CliError(f"{m}: {e}", fix=e.fix)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    med = lambda xs: round(statistics.median(xs), 1) if xs else None
+    kinds = {}
+    for k, label in varek_bench.KINDS:
+        row = {"label": label}
+        for m in bases:
+            row[m] = {"call_p50_us": med([r["kinds"][k]["warden"]["p50"] for r in per[m]]),
+                      "decision_p50_us": med([r["kinds"][k]["warden_decision_us"]["p50"] for r in per[m]]),
+                      "native_p50_us": med([r["kinds"][k]["native"]["p50"] for r in per[m]])}
+        kinds[k] = row
+    first = per[labels[0]][0]
+    res = {f"varek_bench_{what.replace('-', '_')}": 1, "varek_command": CLI_VERSION,
+           "date": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "host": first["host"], "warden": first["warden"],
+           "settings": {"calls_per_kind_per_run": n, "warmup": warmup, "rounds": rounds, "run_as": run_as,
+                        "signing": bool(sign_key)},
+           "bases": {m: {"rules": varek_bench.count_rules(text)} for m, text in bases.items()},
+           "kinds": kinds, "ok": all(r["ok"] for m in per for r in per[m])}
+    if args.output:
+        try:
+            with open(args.output, "w") as fh:
+                json.dump(res, fh, indent=2)
+                fh.write("\n")
+        except OSError as e:
+            warn(f"could not write {args.output}: {e}")
+    return res
+
+
+def _bench_head(what, res):
+    h, s = res["host"], res["settings"]
+    print(f"varek bench --{what} ({CLI_VERSION}), Warden {res['warden'].get('version')}, {res['date']}")
+    print(f"host: {h.get('cpu_model') or '?'}, {h.get('cpus', '?')} CPU(s), {h.get('memory') or '?'}, "
+          f"kernel {h.get('kernel', '?')}")
+    print(f"{s['calls_per_kind_per_run']} calls of each kind a run, {s['warmup']} warm-up, {s['rounds']} round(s) "
+          f"of each, alternated; medians of the rounds' p50s, in microseconds")
+    print()
+
+
+def cmd_bench_open_as(args, cfg):
+    """v1.29: `varek bench --open-as`: what opening files as the agent costs.
+    The bench's calls under `require warden 1.28` (opened as root, as before)
+    and `require warden 1.29` (each open walked and made as the agent, by a
+    thread that takes on the agent's ids), alternated."""
+    res = _bench_bases(args, cfg, {"off": "require warden 1.28\n", "on": "require warden 1.29\n"}, "open-as")
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return 0 if res["ok"] else 1
+    _bench_head("open-as", res)
+    print(f"{'call':34} {'native':>7} {'call off':>9} {'call on':>8} {'decide off':>11} {'decide on':>10} {'added':>7}")
+    for k, row in res["kinds"].items():
+        added = row["on"]["decision_p50_us"] - row["off"]["decision_p50_us"]
+        print(f"{row['label']:34} {_fmt_us(row['off']['native_p50_us']):>7} {_fmt_us(row['off']['call_p50_us']):>9} "
+              f"{_fmt_us(row['on']['call_p50_us']):>8} {_fmt_us(row['off']['decision_p50_us']):>11} "
+              f"{_fmt_us(row['on']['decision_p50_us']):>10} {added:>+7.1f}")
+    print()
+    print("off: require warden 1.28 (files opened as root). on: require warden 1.29 (opened as the agent). "
+          "added: decide on minus decide off (the Warden's own time per decision, from the verdict records).")
+    print("checks: " + ("every run's outcomes as expected" if res["ok"] else "SOME CHECKS FAILED (run with --json)"))
+    return 0 if res["ok"] else 1
+
+
+def cmd_bench_baseline(args, cfg):
+    """v1.29: `varek bench --baseline`: what the baseline and each profile
+    cost a decision, against a sector pack. Each is the policy `varek run`
+    writes (for the bench's user, in a working directory of its own), all
+    under `require warden 1.29`, the bench's rules last: every bench call is
+    decided after every rule of the base."""
+    import pwd
+    import tempfile
+    try:
+        pw = pwd.getpwnam(args.run_as or (cfg["run_as"] if cfg else "nobody"))
+    except KeyError:
+        raise CliError("--run-as: no such user")
+    packs = builtin_packs()
+    pack = args.pack or "healthcare"
+    if pack not in packs:
+        raise CliError(f"no built-in pack {pack!r}", fix="`varek policy list` shows them")
+    with open(packs[pack], encoding="utf-8") as fh:
+        ptext = fh.read()
+    ptext = re.sub(r"(?m)^require warden \S+\s*$", "", ptext)
+    bases = {f"pack {pack}": "require warden 1.29\n" + ptext}
+    proj = tempfile.mkdtemp(prefix="varek-bench-proj-")
+    os.chmod(proj, 0o755)
+    try:
+        tmp = f"/tmp/varek-{pw.pw_uid}"
+        bases["baseline"] = varek_baseline.generate(proj, pw, tmp, None)
+        for name, prof in sorted(varek_baseline.all_profiles(varek_home()).items()):
+            bases[f"baseline + {name}"] = varek_baseline.generate(proj, pw, tmp, prof)
+        res = _bench_bases(args, cfg, bases, "baseline")
+    finally:
+        shutil.rmtree(proj, ignore_errors=True)
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return 0 if res["ok"] else 1
+    _bench_head("baseline", res)
+    cols = [k for k, _ in varek_bench.KINDS]
+    short = {"open_allowed": "open ok", "open_denied": "open deny", "open_unknown": "open none",
+             "connect_allowed": "conn ok", "connect_denied": "conn deny", "request": "request"}
+    print("the Warden's own time per decision (p50, us), by base policy:")
+    print(f"{'base':22} {'rules':>5} " + " ".join(f"{short.get(k, k[:9]):>9}" for k in cols))
+    for m, b in res["bases"].items():
+        print(f"{m:22} {b['rules']:>5} " +
+              " ".join(f"{_fmt_us(res['kinds'][k][m]['decision_p50_us']):>9}" for k in cols))
+    print()
+    print("each base: require warden 1.29 (opened as the agent), then the bench's own rules. The pack's own "
+          "require line is replaced. rules: the base's allow and deny lines.")
+    print("checks: " + ("every run's outcomes as expected" if res["ok"] else "SOME CHECKS FAILED (run with --json)"))
+    return 0 if res["ok"] else 1
+
+
 def _fmt_us(v):
     return "-" if v is None else (f"{v:.0f}" if v >= 10 else f"{v:.1f}")
 
@@ -1692,6 +2088,10 @@ def cmd_bench(args):
     cfg = load_config(required=False)
     if getattr(args, "subagents", False):                                          # v1.28.1
         return cmd_bench_subagents(args, cfg)
+    if getattr(args, "open_as", False):                                            # v1.29
+        return cmd_bench_open_as(args, cfg)
+    if getattr(args, "baseline", False):
+        return cmd_bench_baseline(args, cfg)
     if args.proxy:
         return cmd_bench_proxy(args, cfg)
     if args.launches:
@@ -1836,6 +2236,12 @@ def build_parser():
     x.add_argument("--explain", action="store_true",
                    help="also show, for each rule, an example it decides")
     x.set_defaults(fn=cmd_policy_check)
+    x = psub.add_parser("suggest", help="v1.29: draft a policy from a run's refusals (a dry run's, or an "
+                                         "enforcing run's); installs nothing")
+    x.add_argument("log", nargs="?", help="a verdict log (default: the last run)")
+    x.add_argument("-o", "--output", help="write the draft here instead of to stdout")
+    x.add_argument("--force", action="store_true", help="overwrite --output if it exists")
+    x.set_defaults(fn=cmd_policy_suggest)
     x = psub.add_parser("use", help="make a pack or file the active policy (root)")
     x.add_argument("pack")
     x.set_defaults(fn=cmd_policy_use)
@@ -1850,8 +2256,25 @@ def build_parser():
     sp = add("run", cmd_run, "run an agent under the Warden (root)",
              usage="varek run [options] -- <agent command> [args...]")
     sp.add_argument("--policy", help="use this pack or file instead of the active policy")
+    sp.add_argument("--baseline", action="store_true",
+                    help="v1.29: use the baseline policy for this directory even with settings "
+                         "(the default when there are none)")
+    sp.add_argument("--profile", metavar="NAME|FILE|none",
+                    help="v1.29: the agent profile the baseline adds (default: chosen by the command's name)")
+    sp.add_argument("--env", action="append", metavar="NAME",
+                    help="v1.29: pass this variable to the agent (repeatable; recorded by name only). "
+                         "With the baseline the agent gets a clean environment otherwise")
+    sp.add_argument("--show-policy", action="store_true",
+                    help="v1.29: print the baseline policy this run would use, and stop")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="v1.29: NOT ENFORCING: decide and record every call, and let through what the policy "
+                         "refuses (the Warden's own files, the hard-denied calls and revocation still refuse)")
+    sp.add_argument("--writable-exec", action="store_true",
+                    help="let the agent launch files in the directories it may write (the Warden's "
+                         "--writable-exec; recorded)")
     sp.add_argument("--plan", help="check this action-graph plan before the agent starts")
-    sp.add_argument("--run-as", help="unprivileged user for the agent (default from settings)")
+    sp.add_argument("--run-as", help="unprivileged user for the agent (default from settings; with the "
+                                     "baseline, the user who ran sudo)")
     sp.add_argument("--log", help="write the verdict stream here instead of a new file")
     sp.add_argument("--stderr-lines", type=int, default=20, metavar="N",
                     help="after the run, show the last N lines the agent wrote to stderr "
@@ -1876,6 +2299,10 @@ def build_parser():
     sp.add_argument("-n", type=int, default=25, help="how many to show (default 25)")
     sp.add_argument("--subagent", metavar="NAME", help="only the calls made for this sub-agent (v1.28.1)")
     sp.add_argument("--user", metavar="SUB", help="only if the run was on behalf of this user (v1.28.1)")
+    g = sp.add_mutually_exclusive_group()
+    g.add_argument("--enforced", action="store_true", help="only the calls refused (in a dry run, v1.29)")
+    g.add_argument("--not-enforced", action="store_true",
+                   help="only the calls a dry run let through that the policy refuses (v1.29)")
 
     sp = add("audit", cmd_audit, "re-check a run's certificates, chain and signatures")
     sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")
@@ -1904,6 +2331,11 @@ def build_parser():
                          "in inspecting mode (defaults -n 200 --warmup 20 --rounds 3)")
     sp.add_argument("--subagents", action="store_true",
                     help="v1.28.1: what attributing each call to its control group costs (sub-agents named or not)")
+    sp.add_argument("--open-as", action="store_true",
+                    help="v1.29: what opening files as the agent costs (require warden 1.28 and 1.29)")
+    sp.add_argument("--baseline", action="store_true",
+                    help="v1.29: the decision time under the baseline and each profile, against a pack")
+    sp.add_argument("--pack", metavar="NAME", help="with --baseline: the pack to compare with (default healthcare)")
     sp.add_argument("--launches", action="store_true",
                     help="measure decided program launches instead (v1.27): launches and an open "
                          "natively, with launches off and on (defaults -n 200 --warmup 20 --rounds 3)")

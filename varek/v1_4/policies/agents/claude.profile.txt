@@ -1,0 +1,23 @@
+#@ profile claude
+#@ about Claude Code (Anthropic)
+#@ commands claude claude-code
+#@ programs node rg
+# Built in v1.29 step 6 from dry runs of Claude Code 2.1.296 (the native
+# install and the npm package) and `varek policy suggest`, then the same runs
+# enforcing. ${HOME} is the agent user's home directory.
+allow path exact ${HOME}/.claude                    # made on first use
+allow path ${HOME}/.claude/                         # settings, sessions, projects, its sign-in
+allow path glob ${HOME}/.claude.json*               # ~/.claude.json, written through a temporary file beside it
+allow path exact ${HOME}/.local/state               # made if missing
+allow path exact ${HOME}/.local/state/claude
+allow path ${HOME}/.local/state/claude/             # its locks
+allow path ${HOME}/.config/anthropic/ readonly      # which sign-in to use
+# the native install (~/.local/bin/claude, a link into versions/)
+allow path ${HOME}/.local/share/claude/ readonly
+allow exec prefix ${HOME}/.local/share/claude/versions/
+# the npm package (npm install -g), under a user prefix or the system's
+allow path ${HOME}/.npm-global/lib/node_modules/@anthropic-ai/claude-code/ readonly
+allow exec prefix ${HOME}/.npm-global/lib/node_modules/@anthropic-ai/claude-code/
+allow exec prefix /usr/lib/node_modules/@anthropic-ai/claude-code/
+allow exec prefix /usr/local/lib/node_modules/@anthropic-ai/claude-code/
+allow host api.anthropic.com:443                    # the model API

@@ -102,7 +102,7 @@ accepted "require warden 1.27"                 'require warden 1.27\n'
 accepted "with exec rules"                     "require warden 1.27\n$X"
 accepted "with exec matchers"                  'require warden 1.27\nallow exec prefix /usr/bin/\ndeny exec glob /usr/bin/*sh\n'
 accepted "with the v1.26 proxy"                'require warden 1.27\nproxy inspect\nallow host api.example.com:443\nallow request GET https://api.example.com/x\n'
-refused  "require warden 1.29"                 'require warden 1.29\n'                 "this is 1.28"
+refused  "require warden 1.99"                 'require warden 1.99\n'                 "requires Warden 1.99"
 refused  "require warden 2.0"                  'require warden 2.0\n'                  "policy requires Warden 2.0"
 launches "no require"                          "$X"                                    off
 launches "require warden 1.26"                 "require warden 1.26\n$X"               off
@@ -170,8 +170,8 @@ if [ -n "$WARDEN" ] && [ "$(id -u)" = 0 ]; then
     "$WARDEN" "$OUT/w.txt" --check-startup > "$OUT/w.out" 2>&1
     check "a 1.26 policy with exec rules loads, with the opt-in note" \
         sh -c "grep -q 'startup checks passed' '$OUT/w.out' && grep -q 'only with .require warden 1.27.' '$OUT/w.out'"
-    printf 'require warden 1.29\n' > "$OUT/w.txt"
-    check "the Warden refuses require warden 1.29" sh -c "! '$WARDEN' '$OUT/w.txt' --check-startup"
+    printf 'require warden 1.99\n' > "$OUT/w.txt"
+    check "the Warden refuses require warden 1.99" sh -c "! '$WARDEN' '$OUT/w.txt' --check-startup"
 else
     skip "the Warden's load (needs root and the warden binary)"
 fi

@@ -428,8 +428,13 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
     snprintf(a->target, sizeof a->target, "%s:%u", q->name, q->port);
     snprintf(a->resolved, sizeof a->resolved, "%s:%u", q->name, q->port);
     decision_t d_raw = policy_decide(p, a);
-    if (d_raw != DEC_ALLOW) { px_refuse(q, d_raw, decision_rule_id(a, d_raw), EACCES); return; }
-    if (!certify(p, a)) {
+    /* v1.29: a dry run relays a name the policy refuses, as not enforced:
+     * resolved like a wildcard's, charged to no budget */
+    if (d_raw != DEC_ALLOW && !dry_let(a, decision_rule_id(a, d_raw))) {
+        px_refuse(q, d_raw, decision_rule_id(a, d_raw), EACCES);
+        return;
+    }
+    if (!a->dry && !certify(p, a)) {
         log_line_start();
         fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n", g_records, a->check_why);
         px_refuse(q, d_raw, "certificate_refused", EACCES);
@@ -460,6 +465,7 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
                 struct stub_budget *bud = ri >= 0 && p->v.rules[ri].s.wild ? stub_budget_of(ri) : NULL;
                 const char *over = ri >= 0 && p->v.rules[ri].s.wild && g_up_nnames < STUB_MAX_DYN
                                    ? stub_charge(bud, q->name, g_stub_now, true) : "names";
+                if (over && g_dry) over = NULL;          /* v1.29: counted, not acting */
                 if (over) {
                     stub_record(q->name, 1, -2, "wildcard_budget", line, over, 0, "nxdomain", NULL);
                     px_refuse(q, d_raw, "wildcard_budget", EACCES);
@@ -508,10 +514,12 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
     int ri = stub_name_rule(p, q->name);
     int line = ri >= 0 ? p->v.rules[ri].line : -1;
     struct stub_budget *bud = ri >= 0 && p->v.rules[ri].s.wild ? stub_budget_of(ri) : NULL;
-    if (ri < 0 || !p->v.rules[ri].s.wild) { px_refuse(q, d_raw, "resolution_failed", EACCES); return; }
+    if ((ri < 0 || !p->v.rules[ri].s.wild) && !a->dry) { px_refuse(q, d_raw, "resolution_failed", EACCES); return; }
+    if (a->dry) bud = NULL;                              /* v1.29: no budget */
     bool isnew = i < 0;
     if (isnew) {
-        const char *over = stub_charge(bud, q->name, g_stub_now, true);
+        const char *over = bud ? stub_charge(bud, q->name, g_stub_now, true) : NULL;
+        if (over && g_dry) over = NULL;            /* nothing was charged */
         if (over) {
             stub_record(q->name, 1, -2, "wildcard_budget", line, over, 0, "nxdomain", NULL);
             px_refuse(q, d_raw, "wildcard_budget", EACCES);
@@ -528,8 +536,9 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
     const wr_entry_t *e = &g_names.e[i];
     if (!isnew && wr_entry_fresh(e, g_stub_now)) { px_resolve(p, q); return; }
     bool send_up = !e->pending;
-    if (send_up && !isnew) {
+    if (send_up && !isnew && bud) {
         const char *over = stub_charge(bud, q->name, g_stub_now, false);
+        if (over && g_dry) over = NULL;
         if (over) {
             stub_record(q->name, 1, -2, "wildcard_budget", line, over, 0, "nxdomain", NULL);
             px_refuse(q, d_raw, "wildcard_budget", EACCES);
@@ -675,7 +684,10 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
             rule = "max_body";
         }
     }
-    if (d_final == DEC_ALLOW) snprintf(why, sizeof why, "allowed");
+    /* v1.29: a dry run relays a request the policy refuses, with no
+     * credential and no body limit, as not enforced */
+    bool dry_allow = d_final != DEC_ALLOW && dry_let(a, rule);
+    if (d_final == DEC_ALLOW || dry_allow) snprintf(why, sizeof why, "%s", dry_allow ? "dry run" : "allowed");
     else if (!strcmp(rule, "max_body"))
         snprintf(why, sizeof why, "its body is over max_body=%llu (policy line %d)", (unsigned long long)maxb,
                  a->policy_line);
@@ -708,7 +720,7 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     struct wp_reqverdict v;
     memset(&v, 0, sizeof v);
     v.type = WP_MSG_REQVERDICT;
-    v.allow = d_final == DEC_ALLOW;
+    v.allow = d_final == DEC_ALLOW || dry_allow;
     v.id = m->id;
     v.seq = m->seq;
     v.max_body = d_final == DEC_ALLOW ? maxb : 0;
@@ -720,7 +732,7 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
         o->cred_seq = m->seq;
         o->cred = v.cred;
     }
-    if (d_final == DEC_ALLOW) {
+    if (d_final == DEC_ALLOW || dry_allow) {
         o->allowed = true;
         if (m->body != WP_BODY_NONE) {
             o->body_seq = m->seq;

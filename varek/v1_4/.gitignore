@@ -17,3 +17,5 @@ tests/test_v1240_resolve
 tests/test_v1250_shared
 warden-secrets
 tests/v1281_sub
+tests/v1290_open
+tests/v1290_lat

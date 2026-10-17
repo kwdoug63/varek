@@ -343,7 +343,8 @@ def test_bench_runs_a_dynamic_workload_under_a_policy_without_loader_rules():
     tmp_path = pathlib.Path(tempfile.mkdtemp(prefix="varek-bench-dyn-"))
     home = tmp_path / "home"
     (home / "tools").mkdir(parents=True)
-    for f in ("varek", "varek_bench.py", "varek_license.py", "vdp_check", "vdp_cert_check"):
+    for f in ("varek", "varek_bench.py", "varek_license.py", "varek_baseline.py", "varek_suggest.py",
+              "vdp_check", "vdp_cert_check"):
         shutil.copy2(os.path.join(HERE, "tools", f), home / "tools" / f)
     shutil.copy2(os.path.join(HERE, "warden"), home / "warden")
     subprocess.run(["cc", "-O2", "-o", str(home / "tools" / "bench_workload"),
@@ -360,3 +361,47 @@ def test_bench_runs_a_dynamic_workload_under_a_policy_without_loader_rules():
     shutil.rmtree(tmp_path, ignore_errors=True)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "dynamically linked" in r.stdout and "checks passed" in r.stdout
+
+
+# ------------------------------------------------------ v1.29 (step 8) --
+
+@needs_runtime
+def test_bench_open_as_end_to_end():
+    """--open-as: the bench's calls under require warden 1.28 and 1.29."""
+    r = varek("bench", "--open-as", "-n", "100", "--warmup", "10", "--rounds", "1", "--json")
+    assert r.returncode == 0, r.stderr
+    res = json.loads(r.stdout)
+    assert res["ok"] is True and res["varek_bench_open_as"] == 1
+    assert set(res["kinds"]) == set(KINDS)
+    for k in KINDS:
+        for m in ("off", "on"):
+            assert res["kinds"][k][m]["decision_p50_us"] > 0
+    assert set(res["bases"]) == {"off", "on"}
+
+
+@needs_runtime
+def test_bench_baseline_end_to_end():
+    """--baseline: a pack, the baseline, and the baseline with each shipped
+    profile, each as varek run writes it."""
+    r = varek("bench", "--baseline", "-n", "100", "--warmup", "10", "--rounds", "1", "--json")
+    assert r.returncode == 0, r.stderr
+    res = json.loads(r.stdout)
+    assert res["ok"] is True
+    profiles = sorted(f[:-len(".profile.txt")] for f in os.listdir(os.path.join(HERE, "policies", "agents")))
+    assert list(res["bases"]) == ["pack healthcare", "baseline"] + [f"baseline + {p}" for p in profiles]
+    assert res["bases"]["baseline"]["rules"] > res["bases"]["pack healthcare"]["rules"]
+    for k in KINDS:
+        assert all(res["kinds"][k][m]["decision_p50_us"] > 0 for m in res["bases"])
+
+
+@needs_runtime
+def test_bench_open_as_and_baseline_take_no_policy():
+    for mode in ("--open-as", "--baseline"):
+        r = varek("bench", mode, "--bare")
+        assert r.returncode == 2 and "--policy and --bare do not apply" in r.stderr
+
+
+@needs_runtime
+def test_bench_baseline_needs_a_known_pack():
+    r = varek("bench", "--baseline", "--pack", "no-such-pack")
+    assert r.returncode == 2 and "no built-in pack" in r.stderr
