@@ -1,0 +1,31 @@
+; SPDX-License-Identifier: MIT
+;
+; varek_container: the SELinux type for VAREK's container (v1.32, D5 in
+; docs/security/v1.32-containers.md), for Podman (or Docker) on RHEL, Fedora
+; and others with SELinux enforcing. It is udica's base container type, as a
+; container's own (container_t) is, with what the Warden needs beyond it:
+; with sub-agents or confined MCP servers (v1.28.1, v1.31), a control group
+; for the run and one for each sub-agent's launch, in the container's own
+; cgroup subtree (--cgroupns=private), and the container's cgroup
+; filesystem remounted read-write where the runtime mounted it read-only.
+; Other containers keep container_t: this is not the host-wide
+; container_manage_cgroup boolean.
+;
+; On the host, as root (udica, from the distribution, carries the base type):
+;
+;   dnf -y install udica
+;   semodule -i varek_container.cil /usr/share/udica/templates/base_container.cil
+;
+; and run the container with --security-opt label=type:varek_container.process,
+; with the settings in packaging/container/README.md.
+
+(block varek_container
+    (blockinherit container)
+    ; the run's control group and each sub-agent's: made, moved into,
+    ; frozen, killed, removed
+    (allow process cgroup_t (dir (getattr search open read write add_name remove_name create rmdir)))
+    (allow process cgroup_t (file (getattr open read write append)))
+    ; the container's cgroup filesystem remounted read-write (its own groups
+    ; only: the cgroup namespace's)
+    (allow process cgroup_t (filesystem (getattr remount)))
+)

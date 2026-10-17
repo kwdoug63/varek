@@ -3,8 +3,9 @@
 # varek-container: the AppArmor profile for VAREK's container (v1.32, D5 in
 # docs/security/v1.32-containers.md). It is Docker's own docker-default (as
 # of Docker 29) with one change: where docker-default denies every mount,
-# this allows the three the Warden makes for the noexec mounts (v1.27.1,
-# warden_noexec.inc.c), in a mount namespace of its own, and no other.
+# this allows the mounts the Warden makes: the noexec mounts (v1.27.1,
+# warden_noexec.inc.c) and the remount of the container's cgroup filesystem
+# (v1.32), in a mount namespace of its own, and no other.
 #
 # On the host (Ubuntu, Debian, SUSE: any with AppArmor), as root:
 #
@@ -53,6 +54,10 @@ profile varek-container flags=(attach_disconnected,mediate_deleted) {
   # 3. each mount at or under it remounted noexec, its own flags kept; and
   #    the places that keep exec (v1.29) remounted without noexec
   mount options=(remount, bind) options in (noexec, ro, nosuid, nodev, noatime, nodiratime, relatime, nosymfollow) -> /**,
+  # 4. with sub-agents or confined MCP servers, the container's cgroup
+  #    filesystem (its own groups only, --cgroupns=private), mounted
+  #    read-only by the runtime, remounted read-write (v1.32)
+  mount options=(remount) options in (nosuid, nodev, noexec, noatime, nodiratime, relatime) -> /sys/fs/cgroup/,
 
   deny /sys/[^f]*/** wklx,
   deny /sys/f[^s]*/** wklx,

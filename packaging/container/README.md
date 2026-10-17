@@ -65,9 +65,33 @@ apparmor_parser -r -W /etc/apparmor.d/varek-container
 ```
 
 and add `--security-opt apparmor=varek-container` to the run. It is
-`docker-default` with the Warden's three mounts allowed (its own mount
-namespace made private, a directory bound onto itself, that mount
-remounted noexec) and no other; never `apparmor=unconfined`.
+`docker-default` with the Warden's mounts allowed (its own mount namespace
+made private, a directory bound onto itself, that mount remounted noexec,
+and the container's cgroup filesystem remounted read-write) and no other;
+never `apparmor=unconfined`.
+
+### On a host with SELinux (RHEL, Fedora)
+
+The container's own type, `container_t`, may not make control groups, which
+a policy with sub-agents or confined MCP servers needs. Load VAREK's module,
+`selinux/varek_container.cil`, once, as root:
+
+```
+dnf -y install udica
+semodule -i packaging/container/selinux/varek_container.cil /usr/share/udica/templates/base_container.cil
+```
+
+and add `--security-opt label=type:varek_container.process` to the run. It
+is udica's base container type with the cgroup access added; other
+containers keep `container_t`. Never `label=disable`.
+
+### Sub-agents and confined MCP servers
+
+They need a control group for the run and one for each sub-agent's launch.
+Docker and Podman mount the container's cgroup filesystem read-only; with
+`--cgroupns=private` (in the command above) the container sees only its own
+groups, and the Warden remounts that view read-write in a mount namespace of
+its own. Without `--cgroupns=private` it refuses to start and says so.
 
 ## Your agent in the image
 
@@ -94,4 +118,4 @@ docker run ... -v ./policy.txt:/etc/varek/policy.txt:ro \
 `varek/v1_4/tests/container_sweep.sh` runs the suites inside the image's
 `test` stage under these settings, and with `--drop-each` once more per
 capability with that one left out, to show each is needed; with
-`--apparmor`, under the profile above.
+`--apparmor` or `--selinux`, under the profile or module above.

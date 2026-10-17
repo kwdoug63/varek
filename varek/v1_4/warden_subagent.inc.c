@@ -60,6 +60,8 @@
 #define __NR_pidfd_send_signal 424
 #endif
 static void noexec_unescape(char *s);        /* warden_noexec.inc.c */
+static unsigned long noexec_keep_flags(const char *mp);
+static bool g_own_mntns;                     /* v1.32: the Warden has a mount namespace of its own */
 
 /* Linux 6.13: a pidfd tells its process's cgroup id (the group directory's
  * inode number), without /proc's text */
@@ -274,6 +276,49 @@ refuse:
     return -1;
 }
 
+/* v1.32: in a container. Docker and Podman mount the cgroup filesystem
+ * read-only; with a cgroup namespace of the container's own
+ * (--cgroupns=private) this process is at its root ("/"), and what the
+ * filesystem shows is the container's own groups only. Then the Warden
+ * remounts it read-write in a mount namespace of its own (made here unless
+ * the noexec mounts made it), as a host's is: the container's mount stays
+ * read-only, and the agent, which runs as its own user with no
+ * capabilities, cannot write the groups, which root owns, any more than on
+ * a host. Anywhere else nothing is done. 0; 1 in a check, where the run
+ * would remount it; or -1 printed. */
+static int sub_container_cgroup(const char *mnt, const char *self, bool check_only) {
+    struct statvfs sv;
+    if (statvfs(mnt, &sv) < 0 || !(sv.f_flag & ST_RDONLY)) return 0;
+    if (strcmp(self, "/")) {
+        fprintf(stderr, "[warden] the policy names a sub-agent: the cgroup filesystem at %s is read-only and "
+                "this process's group (%s) is not its root; in a container, run it with --cgroupns=private "
+                "(packaging/container/README.md); refusing to start\n", mnt, self);
+        return -1;
+    }
+    if (check_only) {
+        fprintf(stderr, "[warden] sub-agents: the cgroup filesystem at %s is read-only (a container's, its own "
+                "groups only): a run remounts it read-write in the Warden's own mount namespace\n", mnt);
+        return 1;
+    }
+    if (!g_own_mntns) {
+        if (unshare(CLONE_NEWNS) < 0 || mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
+            fprintf(stderr, "[warden] the policy names a sub-agent: cannot make a mount namespace for the cgroup "
+                    "filesystem (%s); refusing to start\n", strerror(errno));
+            return -1;
+        }
+        g_own_mntns = true;
+    }
+    if (mount(NULL, mnt, NULL, MS_REMOUNT | (noexec_keep_flags(mnt) & ~(unsigned long)MS_RDONLY), NULL) < 0) {
+        fprintf(stderr, "[warden] the policy names a sub-agent: cannot remount the container's cgroup filesystem "
+                "%s read-write (%s); under AppArmor or SELinux, run with VAREK's profile "
+                "(packaging/container/README.md); refusing to start\n", mnt, strerror(errno));
+        return -1;
+    }
+    fprintf(stderr, "[warden] sub-agents: the container's cgroup filesystem %s remounted read-write in the "
+            "Warden's own mount namespace\n", mnt);
+    return 0;
+}
+
 /* Startup: the run's group, made (not in a check). 0, or -1 printed. */
 static int sub_setup(const struct policy *p, bool check_only, bool agent_root) {
     for (size_t i = 0; i < p->v.n; i++) if (p->v.rules[i].subagent[0]) g_sub_on = true;
@@ -303,6 +348,8 @@ static int sub_setup(const struct policy *p, bool check_only, bool agent_root) {
         return -1;
     }
     if (sub_refuse_writable(p, mnt) < 0) return -1;
+    int ro = sub_container_cgroup(mnt, self, check_only);
+    if (ro < 0) return -1;
     g_sub = calloc(SUB_MAX + 1, sizeof *g_sub);
     if (!g_sub) { fprintf(stderr, "[warden] out of memory\n"); return -1; }
     g_sub[0] = (struct subject){ .parent = -1, .state = SUB_AGENT };
@@ -310,7 +357,7 @@ static int sub_setup(const struct policy *p, bool check_only, bool agent_root) {
     if (check_only) {
         char parent[PATH_MAX];
         snprintf(parent, sizeof parent, "%s%s", mnt, under);
-        if (access(parent, W_OK) < 0) {
+        if (!ro && access(parent, W_OK) < 0) {
             fprintf(stderr, "[warden] the policy names a sub-agent: cannot make groups in %s (%s); refusing to "
                     "start\n", parent, strerror(errno));
             return -1;

@@ -28,6 +28,17 @@ set -u
 # the operator is the user sudo names when there is one: run as root itself
 # (a root shell reached by sudo -i would otherwise name its user)
 unset SUDO_UID SUDO_GID SUDO_USER SUDO_COMMAND
+# v1.32: in a container the cgroup filesystem is read-only (the Warden
+# remounts it for itself: section 3's last checks). Section 3 makes groups of
+# its own to set up its cases, so the suite runs in a mount namespace of its
+# own with it read-write.
+if [ -z "${VAREK_V1281_NS:-}" ] && [ "$(id -u)" = 0 ]; then
+    cg="$(awk '$3 == "cgroup2" { print $2; exit }' /proc/self/mounts)"
+    if [ -n "$cg" ] && awk -v m="$cg" '$2 == m && $3 == "cgroup2" { split($4, o, ","); f = o[1] == "ro" } END { exit !f }' /proc/self/mounts; then
+        exec env VAREK_V1281_NS=1 unshare -m sh -c 'mount --make-rprivate / && mount -o remount,rw "$1" && shift && exec "$@"' \
+            sh "$cg" bash "$0" "$@"
+    fi
+fi
 
 VDP="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 CERT="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
@@ -376,7 +387,7 @@ if [ "$(id -u)" != 0 ] || [ -z "$WARDEN" ] || [ ! -x "$SUBP" ] || [ -z "$CGM" ];
     skip "section 3 (needs root, the warden, tests/v1281_sub and a cgroup2 mount)"
 else
     B="$(mktemp -d /tmp/varek_v1281s.XXXXXX)"; chmod 755 "$B"
-    trap 'kill ${IDP:-} 2>/dev/null; rmdir "$CGM/v1281-other" 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $OUT ${T:-} $B" || rm -rf "$OUT" ${T:+"$T"} "$B"' EXIT
+    trap 'kill ${IDP:-} 2>/dev/null; rmdir "$CGM/v1281-other" "$CGM/v1281-in" "$CGM/v1281-ro" 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $OUT ${T:-} $B" || rm -rf "$OUT" ${T:+"$T"} "$B"' EXIT
     for n in agent a b; do cp "$SUBP" "$B/$n"; chmod 755 "$B/$n"; done
     ln -s "$B/a" "$B/plain"; echo hi > "$B/f"; chmod 644 "$B/f"
     SL='allow path /usr/ readonly\nallow path /lib readonly\nallow path /lib64 readonly\nallow path /etc/ld.so.cache readonly\n'
@@ -477,6 +488,30 @@ sys.exit(0 if rs and all(isinstance(r.get("obo"), list) and r["obo"][:1] == ["ag
     "$WARDEN" "$B/p.txt" --check-startup > "$OUT/cs3.out" 2>&1
     check "--check-startup: where the groups would go, and none made" \
         sh -c "grep -q 'sub-agents: a run.s control groups go under $CGM' '$OUT/cs3.out' && ! ls '$CGM' | grep -q '^varek-'"
+    # v1.32: a container's cgroup filesystem, read-only, with a cgroup
+    # namespace of its own (--cgroupns=private): made so here
+    if unshare -m -C true 2>/dev/null; then
+        rocg() { unshare -m -C sh -c 'mount --make-rprivate / && mount -o remount,bind,ro "$1" && shift && exec "$@"' sh "$CGM" "$@"; }
+        rocg sh -c "timeout 60 '$WARDEN' '$B/p.txt' --check-startup > '$OUT/rocs.out' 2>&1; \
+            timeout 60 '$WARDEN' '$B/p.txt' -- '$B/agent' exec '$B/a' open '$B/f' > /dev/null 2> '$OUT/ro.out'; \
+            mkdir '$CGM/v1281-ro' 2> '$OUT/ro.mkdir'"
+        rmdir "$CGM/v1281-ro" 2>/dev/null
+        check "a container's read-only cgroup filesystem: --check-startup says the run would remount it" \
+            sh -c "grep -q 'is read-only (a container.s, its own groups only): a run remounts it' '$OUT/rocs.out' && grep -q 'sub-agents: a run.s control groups go under $CGM' '$OUT/rocs.out'"
+        check "... a run remounts it read-write in the Warden's own mount namespace; the sub-agent is attributed" \
+            sh -c "grep -q 'remounted read-write in the Warden.s own mount namespace' '$OUT/ro.out' && grep -q '\"subagent\":\"alpha#1\"' '$OUT/ro.out'"
+        check "... and outside the Warden it stays read-only" grep -q 'Read-only file system' "$OUT/ro.mkdir"
+        # the namespace's root is the group it was made in; moved below it,
+        # then the filesystem made read-only
+        mkdir -p "$CGM/v1281-in"
+        unshare -m -C sh -c 'mount --make-rprivate / && echo $$ > "$1/v1281-in/cgroup.procs" && mount -o remount,bind,ro "$1" && shift && exec "$@"' \
+            sh "$CGM" sh -c "timeout 60 '$WARDEN' '$B/p.txt' -- '$B/agent' open '$B/f' > /dev/null 2> '$OUT/rono.out'; echo \$? > '$OUT/rono.rc'"
+        rmdir "$CGM/v1281-in" 2>/dev/null
+        check "refused: read-only and not at its namespace's root (--cgroupns=host)" \
+            sh -c "! grep -qx 0 '$OUT/rono.rc' && grep -q 'run it with --cgroupns=private' '$OUT/rono.out'"
+    else
+        skip "a read-only cgroup filesystem in a cgroup namespace (cannot make one here)"
+    fi
     printf 'require warden 1.28\nallow path /usr/ readonly\n%b' "$SL" > "$B/none.txt"
     POL="$B/none.txt" sgo none open "$B/f"
     check "no sub-agent named: no control group, obo the agent" sh -c "! grep -q 'control group' '$OUT/none.out' && grep -q '\"obo\":\\[\"agent\"\\]' '$OUT/none.out'"

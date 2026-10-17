@@ -149,7 +149,12 @@ PY
     check "nothing is created in a directory the agent cannot search" sh -c "sed -n 5p '$OUT/a1.log.out' | grep -qx 'create Permission denied' && [ ! -e '$OUT/w/closed/g' ]"
     check "... recorded ALLOW on the name it would have had, errno 13" \
         rec "$OUT/a1.log" "r.get('resolved') == '$OUT/w/closed/g' and r['decision_final'] == 'ALLOW' and r['errno'] == 13"
-    check "an unnamed file (O_TMPFILE) the agent makes is the agent's" grep -qx "tmpfile ok $NB $NB" "$OUT/a1.log.out"
+    # (v1.32: overlayfs before Linux 6.6, a container's /tmp, has no O_TMPFILE)
+    if python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_TMPFILE | os.O_WRONLY, 0o600))' "$OUT/w" 2>/dev/null; then
+        check "an unnamed file (O_TMPFILE) the agent makes is the agent's" grep -qx "tmpfile ok $NB $NB" "$OUT/a1.log.out"
+    else
+        skip "an unnamed file (O_TMPFILE): this filesystem ($(stat -f -c %T "$OUT/w")) has none"
+    fi
     if [ -n "$RAW" ]; then
         check "a raw device ($RAW) is still refused by identity, though the policy allows /dev/" \
             rec "$OUT/a1.log" "r.get('resolved') == '$RAW' and r['decision_final'] == 'DENY' and r['rule'] == 'raw_device'"

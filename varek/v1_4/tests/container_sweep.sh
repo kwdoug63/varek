@@ -7,7 +7,7 @@
 #
 #   sudo varek/v1_4/tests/container_sweep.sh [--runtime docker|podman]
 #        [--build] [--out DIR] [--caps "SYS_ADMIN SYS_PTRACE ..."]
-#        [--drop-each] [--apparmor] [--security-opt OPT] [SUITE...]
+#        [--drop-each] [--apparmor] [--selinux] [--security-opt OPT] [SUITE...]
 #
 # --build        build the test image first (packaging/container/Containerfile,
 #                --target test) from this checkout
@@ -15,6 +15,9 @@
 #                and run the containers under it rather than the runtime's
 #                default; with the mounts the suites make to set up their
 #                cases added, as MKNOD is (a copy, varek-container-test)
+# --selinux      load VAREK's SELinux module (packaging/container/selinux;
+#                udica's base type) and run the containers as its type,
+#                varek_container.process, rather than container_t
 # --security-opt OPT  passed to each container (diagnosis only: what the
 #                image documents is what the sweep shows)
 # --caps LIST    the capabilities added after --cap-drop ALL (default: the
@@ -33,7 +36,7 @@
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-RT="" BUILD=0 OUT="" DROP=0 APPARMOR=0 SUITES=() SECOPTS=()
+RT="" BUILD=0 OUT="" DROP=0 APPARMOR=0 SELINUX=0 SUITES=() SECOPTS=()
 CAPS="SYS_ADMIN SYS_PTRACE SETPCAP SETUID SETGID DAC_OVERRIDE KILL NET_ADMIN NET_BIND_SERVICE CHOWN"
 # what the suites themselves need to set up their cases, not VAREK: mknod
 # (a block device and a /dev/mem twin in the allowed tree)
@@ -52,8 +55,9 @@ while [ $# -gt 0 ]; do
         --drop-each) DROP=1; shift ;;
         --image) IMAGE="$2"; shift 2 ;;
         --apparmor) APPARMOR=1; shift ;;
+        --selinux) SELINUX=1; shift ;;
         --security-opt) SECOPTS+=(--security-opt "$2"); shift 2 ;;
-        -h|--help) sed -n '3,32p' "$0"; exit 0 ;;
+        -h|--help) sed -n '3,35p' "$0"; exit 0 ;;
         -*) echo "container_sweep.sh: unknown option $1" >&2; exit 2 ;;
         *) SUITES+=("$1"); shift ;;
     esac
@@ -78,6 +82,12 @@ if [ "$APPARMOR" = 1 ]; then
     } > "$OUT/varek-container-test"
     apparmor_parser -r -W "$AA" "$OUT/varek-container-test" || { echo "container_sweep.sh: --apparmor: the profiles did not load" >&2; exit 1; }
     SECOPTS+=(--security-opt apparmor=varek-container-test)
+fi
+if [ "$SELINUX" = 1 ]; then
+    UT=/usr/share/udica/templates/base_container.cil
+    [ -f "$UT" ] || { echo "container_sweep.sh: --selinux: udica's templates are not installed (dnf -y install udica)" >&2; exit 2; }
+    semodule -i "$ROOT/packaging/container/selinux/varek_container.cil" "$UT" || { echo "container_sweep.sh: --selinux: the module did not load" >&2; exit 1; }
+    SECOPTS+=(--security-opt label=type:varek_container.process)
 fi
 {
     echo "host: $(uname -srm); $(. /etc/os-release && echo "$PRETTY_NAME")"

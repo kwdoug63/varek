@@ -418,6 +418,7 @@ static int noexec_mount(void) {
                 "start\n", strerror(errno));
         return -1;
     }
+    g_own_mntns = true;                      /* v1.32: sub_container_cgroup uses it too */
     for (size_t k = 0; k < g_nx_n; k++) {
         const char *d = g_nx[k].path;
         if (g_nx[k].missing) continue;
