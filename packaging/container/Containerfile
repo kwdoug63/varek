@@ -49,8 +49,14 @@ ENTRYPOINT ["varek", "run", "--"]
 FROM ${TEST_BASE} AS test
 COPY packaging/container/deps.sh /usr/local/sbin/varek-deps
 RUN varek-deps build && varek-deps test
-COPY varek/v1_4 /src/varek/v1_4
-COPY v1_6 /src/v1_6
-COPY v1_7 /src/v1_7
+# the Python packages the suites check with (the cross-check's reference
+# solver, the CycloneDX validator)
+# (--build-arg TEST_PIP=0 leaves them out where PyPI cannot be reached; the
+# checks that need them then fail and say so)
+ARG TEST_PIP=1
+COPY varek/v1_4/tools/requirements-crosscheck.txt varek/v1_4/tools/requirements-test.txt /tmp/
+RUN if [ "$TEST_PIP" = 1 ]; then python3 -m pip install -q --break-system-packages \
+        -r /tmp/requirements-crosscheck.txt -r /tmp/requirements-test.txt; fi
+COPY . /src
 RUN make -C /src/varek/v1_4 all tests/v1281_sub tests/v1290_open tests/v1310_peek
 WORKDIR /src/varek/v1_4

@@ -29,6 +29,7 @@ docker run --rm \
   --cap-drop ALL \
   --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add SETPCAP \
   --cap-add SETUID --cap-add SETGID --cap-add DAC_OVERRIDE --cap-add KILL \
+  --cap-add NET_ADMIN --cap-add NET_BIND_SERVICE \
   --cgroupns=private \
   -v "$PWD":/work -v varek-log:/var/log/varek \
   varek python3 agent.py
@@ -42,6 +43,8 @@ docker run --rm \
 | SETUID, SETGID | dropping the agent and the helpers to their own users; opening files as the agent |
 | DAC_OVERRIDE | opening, as root, the files the policy lets the agent reach |
 | KILL | ending the agent's processes, which run as another user |
+| NET_ADMIN | bringing the loopback up in the agent's network namespace, for the DNS stub |
+| NET_BIND_SERVICE | binding the stub on port 53 there |
 
 The agent itself holds none of them: the Warden empties its bounding set
 and drops it to its own user before its filter is installed. The

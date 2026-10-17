@@ -150,8 +150,10 @@ PY
     check "... recorded ALLOW on the name it would have had, errno 13" \
         rec "$OUT/a1.log" "r.get('resolved') == '$OUT/w/closed/g' and r['decision_final'] == 'ALLOW' and r['errno'] == 13"
     check "an unnamed file (O_TMPFILE) the agent makes is the agent's" grep -qx "tmpfile ok $NB $NB" "$OUT/a1.log.out"
-    check "a raw device ($RAW) is still refused by identity, though the policy allows /dev/" \
-        rec "$OUT/a1.log" "r.get('resolved') == '$RAW' and r['decision_final'] == 'DENY' and r['rule'] == 'raw_device'"
+    if [ -n "$RAW" ]; then
+        check "a raw device ($RAW) is still refused by identity, though the policy allows /dev/" \
+            rec "$OUT/a1.log" "r.get('resolved') == '$RAW' and r['decision_final'] == 'DENY' and r['rule'] == 'raw_device'"
+    else skip "a raw device refused by identity (this host's /dev has none: a container's)"; fi
     check "the stream stays root's, written to the end after the agent's opens" \
         sh -c "[ \"\$(stat -c %u '$OUT/a1.log')\" = 0 ] && tail -n 3 '$OUT/a1.log' | grep -q '\"event\":\"run_end\"'"
 

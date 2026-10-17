@@ -1,14 +1,7 @@
-# The container build (packaging/container/Containerfile) needs only the
-# Warden's sources and its two layers, and the licence files.
-*
-!varek/v1_4
-!v1_6
-!v1_7
-!LICENSE
-!NOTICE
-!packaging/container
+# The build and runtime stages copy only the Warden's sources and the
+# licences (packaging/container/Containerfile); the test stage takes the
+# repository, as the suites read its root (test-v1180's Python suites).
+.git
 **/__pycache__
 **/*.o
-varek/v1_4/warden
-varek/v1_4/warden-proxy
-varek/v1_4/warden-secrets
+varek-v1.0.zip

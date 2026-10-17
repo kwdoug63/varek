@@ -28,7 +28,10 @@ set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 RT="" BUILD=0 OUT="" DROP=0 SUITES=()
-CAPS="SYS_ADMIN SYS_PTRACE SETPCAP SETUID SETGID DAC_OVERRIDE KILL"
+CAPS="SYS_ADMIN SYS_PTRACE SETPCAP SETUID SETGID DAC_OVERRIDE KILL NET_ADMIN NET_BIND_SERVICE"
+# what the suites themselves need to set up their cases, not the Warden:
+# chown (files another user owns), mknod (a block device, a /dev/mem twin)
+TEST_CAPS="CHOWN MKNOD"
 LIMIT=1200                                   # seconds a suite may take
 IMAGE=varek-test
 while [ $# -gt 0 ]; do
@@ -81,8 +84,8 @@ fi
 run_set() {
     local label="$1"; shift
     local args=(--rm --cap-drop ALL --cgroupns=private)
-    for c in "$@"; do args+=(--cap-add "$c"); done
-    printf '\n== %s: --cap-drop ALL%s\n' "$label" "$(printf ' --cap-add %s' "$@")" | tee -a "$OUT/summary.txt"
+    for c in "$@" $TEST_CAPS; do args+=(--cap-add "$c"); done
+    printf '\n== %s: --cap-drop ALL%s (and, for the tests, %s)\n' "$label" "$(printf ' --cap-add %s' "$@")" "$TEST_CAPS" | tee -a "$OUT/summary.txt"
     printf '%-22s %-6s %6s %6s %6s %8s\n' SUITE RESULT PASS FAIL SKIP SECONDS | tee -a "$OUT/summary.txt"
     for s in "${SUITES[@]}"; do
         local t0 log="$OUT/$label.$s.log" rc p f k name="varek-sweep-$$-$s"

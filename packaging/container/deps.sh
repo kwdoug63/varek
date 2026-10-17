@@ -11,7 +11,7 @@ if command -v apt-get >/dev/null 2>&1; then
     build)   pkgs="build-essential libseccomp-dev libsodium-dev libssl-dev python3 ca-certificates" ;;
     # what CI installs for the suites (.github/workflows/warden-build.yml)
     test)    pkgs="openjdk-21-jdk-headless musl-tools squid python3-cryptography python3-pytest python3-yaml
-                   curl openssl git iproute2 procps sudo" ;;
+                   python3-pip curl openssl git iproute2 procps sudo" ;;
     runtime) pkgs="libseccomp2 libsodium23 libssl3t64 python3 ca-certificates" ;;
     esac
     # shellcheck disable=SC2086
