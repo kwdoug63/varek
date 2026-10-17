@@ -13,9 +13,9 @@
 #                --target test) from this checkout
 # --caps LIST    the capabilities added after --cap-drop ALL (default: the
 #                list measured so far, below)
-# --drop-each    after the run with every capability, run the suites again
-#                once per capability with that one left out, so each is
-#                shown needed (a suite that fails without it) or not
+# --drop-each    after the run with every capability, run a short set of
+#                suites (DROP_SUITES) once per capability with that one left
+#                out, so each is shown needed (a suite fails without it)
 #
 # The container gets --cap-drop ALL and the capabilities, the runtime's own
 # default seccomp profile and its default AppArmor or SELinux confinement:
@@ -28,10 +28,13 @@ set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 RT="" BUILD=0 OUT="" DROP=0 SUITES=()
-CAPS="SYS_ADMIN SYS_PTRACE SETPCAP SETUID SETGID DAC_OVERRIDE KILL NET_ADMIN NET_BIND_SERVICE"
-# what the suites themselves need to set up their cases, not the Warden:
-# chown (files another user owns), mknod (a block device, a /dev/mem twin)
-TEST_CAPS="CHOWN MKNOD"
+CAPS="SYS_ADMIN SYS_PTRACE SETPCAP SETUID SETGID DAC_OVERRIDE KILL NET_ADMIN NET_BIND_SERVICE CHOWN"
+# what the suites themselves need to set up their cases, not VAREK: mknod
+# (a block device and a /dev/mem twin in the allowed tree)
+TEST_CAPS="MKNOD"
+# --drop-each runs these, which between them use every capability above,
+# rather than every suite once per capability
+DROP_SUITES="test-lifecycle test-v1124 test-v1250 test-v1271 test-v1281 test-v1290 test-v1311"
 LIMIT=1200                                   # seconds a suite may take
 IMAGE=varek-test
 while [ $# -gt 0 ]; do
@@ -105,6 +108,8 @@ cat "$OUT/host.txt" >> "$OUT/summary.txt"
 # shellcheck disable=SC2086
 run_set all $CAPS
 if [ "$DROP" = 1 ]; then
+    # shellcheck disable=SC2206
+    SUITES=($DROP_SUITES)
     for c in $CAPS; do
         rest=$(echo " $CAPS " | sed "s/ $c / /")
         # shellcheck disable=SC2086

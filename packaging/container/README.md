@@ -29,7 +29,7 @@ docker run --rm \
   --cap-drop ALL \
   --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add SETPCAP \
   --cap-add SETUID --cap-add SETGID --cap-add DAC_OVERRIDE --cap-add KILL \
-  --cap-add NET_ADMIN --cap-add NET_BIND_SERVICE \
+  --cap-add NET_ADMIN --cap-add NET_BIND_SERVICE --cap-add CHOWN \
   --cgroupns=private \
   -v "$PWD":/work -v varek-log:/var/log/varek \
   varek python3 agent.py
@@ -45,6 +45,7 @@ docker run --rm \
 | KILL | ending the agent's processes, which run as another user |
 | NET_ADMIN | bringing the loopback up in the agent's network namespace, for the DNS stub |
 | NET_BIND_SERVICE | binding the stub on port 53 there |
+| CHOWN | `varek run` giving the agent its temporary directory |
 
 The agent itself holds none of them: the Warden empties its bounding set
 and drops it to its own user before its filter is installed. The
