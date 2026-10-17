@@ -9,6 +9,32 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.29.0] - 2026-10-17 — Run an agent with nothing set up first
+
+`sudo varek run -- <agent>` runs an agent under the Warden with nothing set
+up first: it writes a baseline policy for the working directory with a
+profile for the agent (Claude Code, the Codex CLI, the Gemini CLI, Aider,
+Python or Node.js, each built from a dry run of the real agent), and under
+`require warden 1.29` the Warden opens and changes files as the agent's own
+user, so the kernel's permissions hold as well as the policy, and decides
+unlink, rmdir, mkdir, rename, chmod, utimes, truncate and chdir by name.
+`--dry-run` decides and records every call and lets through what the
+policy refuses, recorded `"enforced":false`; the hard-denied calls, the
+protected objects, Unix-socket connects and a revocation still refuse.
+`varek refusals --not-enforced` lists what the policy would have refused. `varek policy suggest` drafts a policy from a run's
+refusals: exact rules, each re-decided, with anything risky commented out
+for a person to review. `varek_audit.py` checks the baseline, the
+profiles and a dry run's records, and reports a dry run as `VERIFIED: DRY
+RUN, NOT ENFORCED`. The launch set is hashed with OpenSSL's libcrypto.
+`varek run`, `status`, `refusals`, `export` and `policy suggest` read a
+stream as they go. Reviewed for correctness (GCC's analyzer, ASan and
+UBSan) and by AI review agents (not a human or third-party review); the
+shared 24-hour soak with v1.28.1 and v1.31.0 passed on the reviewed build.
+Known limit: on x86_64 the Warden refuses `epoll_wait(2)` and
+`epoll_create(2)`, so asyncio's default event loop fails (fixed in
+v1.31.1). The Warden reports 1.29.0. See `RELEASE-v1.29.0.md` and
+`docs/security/v1.29-varek-run.md`.
+
 ## [1.28.1] - 2026-10-15 — Who each decision was for
 
 After `require warden 1.28`, `trust issuer URL audience AUD [jwks URL]`
