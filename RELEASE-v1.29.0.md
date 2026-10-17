@@ -5,7 +5,7 @@
 > an adversarial review by AI review agents. A human or third-party review
 > has not been done.
 
-Released 2026-10-17 · MIT · github.com/kwdoug63/varek
+Released 2026-10-16 · MIT · github.com/kwdoug63/varek
 
 ## Summary
 
@@ -152,7 +152,7 @@ policy, then `varek policy suggest` and a short dry run under its draft.
 The first 24-hour run (2026-10-14 to 2026-10-15) found the fault in `varek
 run`'s summary below. The review's fixes to the Warden came after it, so
 the shared soak ran again on the reviewed build, for 24 hours on a 2 GB
-droplet, 2026-10-16 to 2026-10-17. It passed:
+droplet, 2026-10-15 to 2026-10-16. It passed:
 
 | | Run B (enforcing) | Run C (dry run) |
 |---|---|---|

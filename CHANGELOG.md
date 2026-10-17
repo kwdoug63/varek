@@ -9,7 +9,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [1.31.0] - 2026-10-17 — MCP servers confined, MCP calls decided, and an OCSF export
+## [1.31.0] - 2026-10-16 — MCP servers confined, MCP calls decided, and an OCSF export
 
 Under `require warden 1.31`: `mcp server NAME exec PATH [sha256=HEX]`
 declares an MCP server; when the agent launches it, it runs as a confined
@@ -34,7 +34,7 @@ on x86_64 the Warden refuses `epoll_wait(2)` and `epoll_create(2)`, so
 asyncio's default event loop fails (fixed in v1.31.1). The Warden reports
 1.31.0. See `RELEASE-v1.31.0.md` and `docs/security/v1.31-standards.md`.
 
-## [1.29.0] - 2026-10-17 — Run an agent with nothing set up first
+## [1.29.0] - 2026-10-16 — Run an agent with nothing set up first
 
 `sudo varek run -- <agent>` runs an agent under the Warden with nothing set
 up first: it writes a baseline policy for the working directory with a
