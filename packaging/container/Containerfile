@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: MIT
+#
+# VAREK's container image (v1.32, docs/security/v1.32-containers.md): the
+# Warden as the container's entrypoint, the agent its child in namespaces
+# the Warden makes, exactly as on a host. Build from the repository's root:
+#
+#   docker build -f packaging/container/Containerfile -t varek .
+#   podman build -f packaging/container/Containerfile -t varek .
+#
+# and run with the settings in packaging/container/README.md (never
+# --privileged).
+#
+# Stages:
+#   build    AlmaLinux 9, binary-compatible with RHEL 9, with the build
+#            dependencies (CodeReady Builder and EPEL); nothing of it ships
+#   runtime  Red Hat's Universal Base Image 9 (minimal), the image (D6)
+#   test     Ubuntu 24.04 with what CI installs, to run the suites inside a
+#            container (tests/container_sweep.sh): --target test
+ARG BUILD_BASE=docker.io/library/almalinux:9
+ARG RUNTIME_BASE=registry.access.redhat.com/ubi9/ubi-minimal:latest
+ARG TEST_BASE=docker.io/library/ubuntu:24.04
+
+FROM ${BUILD_BASE} AS build
+COPY packaging/container/deps.sh /usr/local/sbin/varek-deps
+RUN varek-deps build
+COPY varek/v1_4 /src/varek/v1_4
+COPY v1_6 /src/v1_6
+COPY v1_7 /src/v1_7
+RUN make -C /src/varek/v1_4 all \
+ && make -C /src/varek/v1_4 install DESTDIR=/out PREFIX=/opt/varek BINDIR=/usr/bin
+
+FROM ${RUNTIME_BASE} AS runtime
+COPY packaging/container/deps.sh /usr/local/sbin/varek-deps
+RUN varek-deps runtime && rm -f /usr/local/sbin/varek-deps
+COPY --from=build /out/ /
+COPY LICENSE NOTICE /opt/varek/
+LABEL org.opencontainers.image.title="VAREK" \
+      org.opencontainers.image.description="The Warden: kernel-enforced, proof-checked authorization for what an AI agent's process does" \
+      org.opencontainers.image.source="https://github.com/kwdoug63/varek" \
+      org.opencontainers.image.licenses="MIT"
+# The project is mounted here; the verdict stream goes to /var/log/varek (a
+# volume), a signing key, if any, comes from a mounted secret.
+WORKDIR /work
+VOLUME ["/var/log/varek"]
+# `docker run ... varek <agent command>` runs the agent under the baseline
+# policy with the profile its command names (v1.29)
+ENTRYPOINT ["varek", "run", "--"]
+
+FROM ${TEST_BASE} AS test
+COPY packaging/container/deps.sh /usr/local/sbin/varek-deps
+RUN varek-deps build && varek-deps test
+COPY varek/v1_4 /src/varek/v1_4
+COPY v1_6 /src/v1_6
+COPY v1_7 /src/v1_7
+RUN make -C /src/varek/v1_4 all tests/v1281_sub tests/v1290_open tests/v1310_peek
+WORKDIR /src/varek/v1_4
