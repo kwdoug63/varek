@@ -43,6 +43,7 @@ import varek_license  # noqa: E402
 import varek_bench  # noqa: E402
 import varek_baseline  # noqa: E402
 import varek_suggest  # noqa: E402
+import varek_container  # noqa: E402  (v1.32)
 
 CLI_VERSION = "1.3.0"
 DEFAULT_CONFIG = "/etc/varek/varek.conf"
@@ -643,6 +644,16 @@ def cmd_doctor(args):
         warn("The Warden cannot make a mount namespace here: a `require warden 1.27` run refuses to "
              "start unless given --writable-exec")
         hint("run the Warden as root (it needs CAP_SYS_ADMIN), outside a container that forbids unshare")
+    # v1.32 (D11): in a container, each setting the Warden needs of it
+    cn = varek_container.in_container()
+    if cn:
+        info(f"\n  In a container ({cn}): the settings in packaging/container/README.md")
+        for level, text, fix in varek_container.check():
+            {"ok": ok, "warn": warn, "fail": fail}[level](text)
+            if fix and level != "ok":
+                hint(fix)
+            bad += level == "fail"
+        info("")
 
     # v1.29: a dry run lets a refused call through with CONTINUE (5.5, within
     # the 5.14 above); the baseline runs the agent as the user who ran sudo

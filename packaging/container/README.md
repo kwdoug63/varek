@@ -96,6 +96,18 @@ Docker and Podman mount the container's cgroup filesystem read-only; with
 groups, and the Warden remounts that view read-write in a mount namespace of
 its own. Without `--cgroupns=private` it refuses to start and says so.
 
+## Checking a container's settings
+
+`varek doctor` in the container checks each setting above: the
+capabilities, the seccomp profile, the AppArmor profile or SELinux type,
+the cgroup namespace, and a test of the Warden's own mounts. It names the
+flag that supplies any that is missing (`--cap-add SYS_PTRACE`,
+`--cgroupns=private`, ...):
+
+```
+docker run --rm <the settings above> --entrypoint varek varek doctor
+```
+
 ## Your agent in the image
 
 Build on the image and name your agent's command:

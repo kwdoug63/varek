@@ -343,7 +343,7 @@ def test_bench_runs_a_dynamic_workload_under_a_policy_without_loader_rules():
     tmp_path = pathlib.Path(tempfile.mkdtemp(prefix="varek-bench-dyn-"))
     home = tmp_path / "home"
     (home / "tools").mkdir(parents=True)
-    for f in ("varek", "varek_bench.py", "varek_license.py", "varek_baseline.py", "varek_suggest.py",
+    for f in ("varek", "varek_bench.py", "varek_license.py", "varek_baseline.py", "varek_suggest.py", "varek_container.py",
               "vdp_check", "vdp_cert_check"):
         shutil.copy2(os.path.join(HERE, "tools", f), home / "tools" / f)
     shutil.copy2(os.path.join(HERE, "warden"), home / "warden")
