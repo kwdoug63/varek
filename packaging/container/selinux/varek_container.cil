@@ -10,7 +10,10 @@
 ; managed, as sub-agents and confined MCP servers need (v1.28.1, v1.31).
 ; The runtime mounts the container's cgroup filesystem read-only, and the
 ; Warden remounts it read-write (its own groups only: --cgroupns=private);
-; container_init_t may not remount it, which is the rule below. Other
+; container_init_t may not remount it, which is the first rule below; nor
+; mount on a character device (the noexec mount of /dev/null, which a policy
+; letting the agent write it has the Warden bind onto itself: v1.27.1), the
+; second. Both measured on RHEL 9.8. Other
 ; containers keep container_t; this is not the host-wide
 ; container_manage_cgroup boolean.
 ;
@@ -22,3 +25,4 @@
 ; with the settings in packaging/container/README.md.
 
 (allow container_init_t cgroup_t (filesystem (remount)))
+(allow container_init_t container_file_t (chr_file (mounton)))

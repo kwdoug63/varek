@@ -75,9 +75,9 @@ never `apparmor=unconfined`.
 The container's own type, `container_t`, may not make control groups, which
 a policy with sub-agents or confined MCP servers needs. Run it as
 `container_init_t`, the distribution's type for containers that manage
-their control groups, and load VAREK's one-rule module,
-`selinux/varek_container.cil` (that type may also remount the cgroup
-filesystem), once, as root:
+their control groups, and load VAREK's module, `selinux/varek_container.cil`
+(two rules: that type may also remount the cgroup filesystem, and mount on
+`/dev/null` for the noexec mounts), once, as root:
 
 ```
 semodule -i packaging/container/selinux/varek_container.cil
