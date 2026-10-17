@@ -9,7 +9,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [1.29.0] - 2026-10-17 — Run an agent with nothing set up first
+## [1.29.0] - 2026-10-16 — Run an agent with nothing set up first
 
 `sudo varek run -- <agent>` runs an agent under the Warden with nothing set
 up first: it writes a baseline policy for the working directory with a
