@@ -5,10 +5,12 @@ child, in PID, network and mount namespaces the Warden makes inside the
 container, exactly as on a host. The design and its decisions are in
 `docs/security/v1.32-containers.md`.
 
-> **In progress.** The settings below are those measured so far (Docker
-> 29.6, Ubuntu 24.04 image, no AppArmor, cgroup v1). Step 1 of the plan
-> settles the final list on real hosts: Docker on Ubuntu (AppArmor,
-> cgroup v2) and Podman on RHEL 9 (SELinux, rootful and rootless).
+> **In progress.** The settings below are measured on real hosts: every
+> suite passes under them with Docker on Ubuntu 24.04 (AppArmor, cgroup
+> v2) and rootful Podman on RHEL 9.8 (SELinux enforcing, cgroup v2).
+> Rootless Podman is still to be measured. In a container the kernel may
+> give no process events (RHEL 9, Ubuntu 24.04): a sub-agent of the image
+> its launcher runs is then refused, as on such a host.
 
 ## Build
 
