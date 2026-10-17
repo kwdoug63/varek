@@ -2,7 +2,7 @@
 
 # VAREK — Technical Specification
 
-**Version 1.31.0** (October 2026; draft). Supersedes the v1.29.0 edition. Corrections made to earlier editions are folded into the text and listed in Appendix B.
+**Version 1.31.0** (October 2026). Supersedes the v1.29.0 edition. Corrections made to earlier editions are folded into the text and listed in Appendix B.
 
 *Deterministic runtime verification of autonomous AI agents using formal methods.*
 
@@ -368,7 +368,7 @@ An MCP server is a program the agent starts and talks to (over stdio), or a serv
 
 None of this changes a decision outside what the new lines decide: confinement and the token checks only refuse, and an OCSF event reports a decision, it decides nothing. No extension may move a genuinely unsafe action to SATISFIED.
 
-**Measured.** `make test-v1310` (317 checks; 263 of 271 fail against v1.29.0, the 8 that pass holding trivially there). A confined server's decision costs no more than the agent's (103 µs against 126 µs p50 for an allowed open after the baseline); an MCP rule adds nothing to a small call and about 9.6 ms per MiB to a large one, since the body is held whole before it is sent; the decision itself stays under 30 µs. A run starts in about 170 ms under the baseline, 250 ms with one MCP server and 420 ms with four. The rule cap is 512 (256 before); a decision's work stays bounded by the 4,096 glob tokens of §2.
+**Measured.** `make test-v1310` (317 checks; 263 of 271 fail against v1.29.0, the 8 that pass holding trivially there). A confined server's decision costs no more than the agent's (103 µs against 126 µs p50 for an allowed open after the baseline); an MCP rule adds nothing to a small call and about 9.6 ms per MiB to a large one, since the body is held whole before it is sent; the decision itself stays under 30 µs. A run starts in about 170 ms under the baseline, 250 ms with one MCP server and 420 ms with four. The rule cap is 512 (256 before); a decision's work stays bounded by the 4,096 glob tokens of §2. A 24-hour run on a 2 GB host passed: two confined MCP servers kept for the run, 1,291 tasks before the user's token expired, all succeeding, 144 probes held, the MCP token reaching the remote server in exactly the 258 calls a `for=gh` rule allowed, the run revoked at the expiry, and 11,719 OCSF events followed live and verified against the 13,891-record stream.
 
 **Scope.** The agent's calls to a local MCP server are bytes on a pipe and are not decided; a confined server bounds what any call to it can do. A call's arguments and a server's responses are not decided. A server that reads code or settings from a file another subject may write runs what was written there, under its own rules; the environment check is a list of variables that name code, not an allowlist. The review by six AI review agents found three high findings, all fixed before this edition (§5).
 

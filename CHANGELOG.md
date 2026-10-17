@@ -9,6 +9,31 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.31.0] - 2026-10-17 — MCP servers confined, MCP calls decided, and an OCSF export
+
+Under `require warden 1.31`: `mcp server NAME exec PATH [sha256=HEX]`
+declares an MCP server; when the agent launches it, it runs as a confined
+sub-agent, and every call it and its children make is decided against the
+rules written `for=NAME` and no others, each certificate naming its
+subject. Under `proxy inspect`, `allow|deny mcp URL METHOD [NAME]` decides
+each JSON-RPC call to a remote MCP server by method and tool, resource or
+prompt name, after a strict parse of the whole body, before anything is
+sent, and records it (`net.mcp`). A credential with `audience=URL` is an
+MCP token, checked at fetch and released only into calls to its own
+server; the bearer token the agent sends itself is checked on every MCP
+call; `trust mcp-resource` finds a user's issuer through a server's
+protected resource metadata. `varek export --format ocsf` writes every
+record as an OCSF 1.9.0 event, `--follow` live and `--verify` against the
+stream. The audit and the tools cover servers, MCP calls and tokens
+(`varek refusals --for`, `varek policy suggest --for`, `varek run --mcp`).
+The rule cap is 512. The Agent Baseline mapping
+(`docs/standards/agent-baseline.md`) is published with it. Reviewed by six
+AI review agents (not a human or third-party review); the shared 24-hour
+soak with v1.28.1 and v1.29.0 passed on the reviewed build. Known limit:
+on x86_64 the Warden refuses `epoll_wait(2)` and `epoll_create(2)`, so
+asyncio's default event loop fails (fixed in v1.31.1). The Warden reports
+1.31.0. See `RELEASE-v1.31.0.md` and `docs/security/v1.31-standards.md`.
+
 ## [1.29.0] - 2026-10-17 — Run an agent with nothing set up first
 
 `sudo varek run -- <agent>` runs an agent under the Warden with nothing set
