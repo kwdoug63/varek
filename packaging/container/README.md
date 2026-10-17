@@ -28,7 +28,7 @@ Never `--privileged`. Drop every capability, then add only these:
 docker run --rm \
   --cap-drop ALL \
   --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add SETPCAP \
-  --cap-add SETUID --cap-add SETGID --cap-add DAC_OVERRIDE \
+  --cap-add SETUID --cap-add SETGID --cap-add DAC_OVERRIDE --cap-add KILL \
   --cgroupns=private \
   -v "$PWD":/work -v varek-log:/var/log/varek \
   varek python3 agent.py
@@ -41,6 +41,7 @@ docker run --rm \
 | SETPCAP | emptying the agent's capability bounding set before it runs |
 | SETUID, SETGID | dropping the agent and the helpers to their own users; opening files as the agent |
 | DAC_OVERRIDE | opening, as root, the files the policy lets the agent reach |
+| KILL | ending the agent's processes, which run as another user |
 
 The agent itself holds none of them: the Warden empties its bounding set
 and drops it to its own user before its filter is installed. The

@@ -28,7 +28,8 @@ set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 RT="" BUILD=0 OUT="" DROP=0 SUITES=()
-CAPS="SYS_ADMIN SYS_PTRACE SETPCAP SETUID SETGID DAC_OVERRIDE"
+CAPS="SYS_ADMIN SYS_PTRACE SETPCAP SETUID SETGID DAC_OVERRIDE KILL"
+LIMIT=1200                                   # seconds a suite may take
 IMAGE=varek-test
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -84,9 +85,12 @@ run_set() {
     printf '\n== %s: --cap-drop ALL%s\n' "$label" "$(printf ' --cap-add %s' "$@")" | tee -a "$OUT/summary.txt"
     printf '%-22s %-6s %6s %6s %6s %8s\n' SUITE RESULT PASS FAIL SKIP SECONDS | tee -a "$OUT/summary.txt"
     for s in "${SUITES[@]}"; do
-        local t0 log="$OUT/$label.$s.log" rc p f k
+        local t0 log="$OUT/$label.$s.log" rc p f k name="varek-sweep-$$-$s"
         t0=$(date +%s)
-        timeout 3600 "$RT" run "${args[@]}" "$IMAGE" make "$s" > "$log" 2>&1; rc=$?
+        # a suite past its time is stopped by removing its container (a
+        # timeout on the client alone leaves the container running)
+        timeout "$LIMIT" "$RT" run --name "$name" "${args[@]}" "$IMAGE" make "$s" > "$log" 2>&1; rc=$?
+        [ "$rc" = 124 ] && { echo "container_sweep.sh: $s ran past ${LIMIT} s; stopped" >> "$log"; "$RT" rm -f "$name" > /dev/null 2>&1; }
         p=$(grep -c '  PASS' "$log"); f=$(grep -c '  FAIL' "$log"); k=$(grep -c '  SKIP' "$log")
         printf '%-22s %-6s %6s %6s %6s %8s\n' "$s" "$([ $rc = 0 ] && echo ok || echo FAILED)" "$p" "$f" "$k" "$(( $(date +%s) - t0 ))" \
             | tee -a "$OUT/summary.txt"
