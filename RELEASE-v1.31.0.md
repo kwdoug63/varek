@@ -6,7 +6,7 @@
 > against the code); its findings are fixed (below). A human or
 > third-party review has not been done.
 
-Released 2026-10-17 · MIT · github.com/kwdoug63/varek
+Released 2026-10-16 · MIT · github.com/kwdoug63/varek
 
 ## Summary
 
@@ -150,7 +150,7 @@ the user's token expiring near the end; the OCSF export following the
 stream throughout. The first 24-hour run (2026-10-14 to 2026-10-15) found
 the fault in `varek run`'s summary below; the review's fixes came after
 it, so the soak ran again on the reviewed build, for 24 hours on a 2 GB
-droplet, 2026-10-16 to 2026-10-17. It passed:
+droplet, 2026-10-15 to 2026-10-16. It passed:
 
 | | |
 |---|---|
