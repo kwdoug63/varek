@@ -2,7 +2,7 @@
 
 # VAREK — Technical Specification
 
-**Version 1.29.0** (October 2026; draft). Supersedes the v1.28.1 edition. Corrections made to earlier editions are folded into the text and listed in Appendix B.
+**Version 1.29.0** (October 2026). Supersedes the v1.28.1 edition. Corrections made to earlier editions are folded into the text and listed in Appendix B.
 
 *Deterministic runtime verification of autonomous AI agents using formal methods.*
 
@@ -352,7 +352,7 @@ Every guarantee above starts from a policy, and through v1.28.1 someone had to w
 
 None of this changes a decision: the baseline, the profiles and the drafts are policies decided by the same procedure and certified by the same checker, and a dry run's records keep the verdict the policy gave. No extension may move a genuinely unsafe action to SATISFIED.
 
-**Measured.** `make test-v1290` (316 checks; 290 of the 313 of the tests-and-regression step fail against v1.28.1). Opening as the agent adds 11 to 19 µs to the p50 decision time of an allowed open and 5 to 7 µs to a refused one; the baseline and profiles (205 to 221 rules) cost no measurable time against a 34-rule pack, since the procedure compiles the rules before the run; in a dry run a system call outside the allowlist takes 51 µs against 0.4 µs refused. The launch set is hashed with OpenSSL's libcrypto, which reads no configuration: a run under the baseline starts in about 170 ms, and with a Node.js agent's profile in 540 to 650 ms on a CPU without SHA extensions (230 and 920 ms with libsodium's SHA-256).
+**Measured.** `make test-v1290` (316 checks; 290 of the 313 of the tests-and-regression step fail against v1.28.1). Opening as the agent adds 11 to 19 µs to the p50 decision time of an allowed open and 5 to 7 µs to a refused one; the baseline and profiles (205 to 221 rules) cost no measurable time against a 34-rule pack, since the procedure compiles the rules before the run; in a dry run a system call outside the allowlist takes 51 µs against 0.4 µs refused. The launch set is hashed with OpenSSL's libcrypto, which reads no configuration: a run under the baseline starts in about 170 ms, and with a Node.js agent's profile in 540 to 650 ms on a CPU without SHA extensions (230 and 920 ms with libsodium's SHA-256). A 24-hour run on a 2 GB host passed: `varek run` with nothing set up, the baseline and the `python` profile enforcing, 1,296 turns of an agent's work done and 144 probes refused (436,366 records, signed, the audit passing); the same work as a dry run of a narrower policy, 4,325 refusals let through and recorded, and a draft from `varek policy suggest` under which the work let nothing through.
 
 **Scope.** A dry run is not a sandbox: in one, the agent can do what its own user can, outside the fixed refusals. A program root does not own (Node.js under nvm) is not named by a profile. inotify, statfs(2) on a path, link, symlink and listening sockets stay refused under the baseline. The adversarial review by AI review agents has not been done for this edition (§5).
 
