@@ -1,0 +1,93 @@
+name: Container release
+
+# v1.32 (step 6 of docs/security/v1.32-containers.md, D7 and D8): on a release
+# tag (v*), VAREK's runtime image is built, checked as CI checks it
+# (container.yml), and published to the GitHub Container Registry as
+# ghcr.io/kwdoug63/varek:<version>, :<major.minor> and, for a release that is
+# not a pre-release, :latest. It is signed with cosign, keyless (the
+# workflow's own GitHub identity, recorded in Sigstore's transparency log),
+# and its software bill of materials (CycloneDX, by syft) is attached as a
+# signed attestation. Both are verified before the workflow ends. No key or
+# password is kept anywhere: the registry login is the workflow's own token.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write      # push to ghcr.io
+  id-token: write      # cosign keyless: the workflow's OIDC identity
+
+jobs:
+  publish:
+    name: Build, check, publish and sign the image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/varek
+      SETTINGS: >-
+        --cap-drop ALL --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add SETPCAP
+        --cap-add SETUID --cap-add SETGID --cap-add DAC_OVERRIDE --cap-add KILL
+        --cap-add NET_ADMIN --cap-add NET_BIND_SERVICE --cap-add CHOWN
+        --cgroupns=private --security-opt apparmor=varek-container
+    steps:
+      - uses: actions/checkout@v4
+      - name: The version, from the tag
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          case "$v" in [0-9]*.[0-9]*.[0-9]*) ;; *) echo "not a release tag: $GITHUB_REF_NAME"; exit 1 ;; esac
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+          echo "MINOR=$(echo "$v" | cut -d. -f1,2)" >> "$GITHUB_ENV"
+          case "$v" in *-*) echo "PRERELEASE=1" >> "$GITHUB_ENV" ;; esac
+      - name: Load VAREK's AppArmor profile
+        run: |
+          sudo install -m 644 packaging/container/apparmor/varek-container /etc/apparmor.d/varek-container
+          sudo apparmor_parser -r -W /etc/apparmor.d/varek-container
+      - name: Build the runtime image
+        run: |
+          docker build -f packaging/container/Containerfile --target runtime \
+            --label org.opencontainers.image.version="$VERSION" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            -t "$IMAGE:$VERSION" .
+      - name: Check it before publishing (varek doctor; an agent's run)
+        run: |
+          docker run --rm $SETTINGS --entrypoint varek "$IMAGE:$VERSION" doctor | tee doctor.txt || true
+          sed -n '/In a container/,/^$/p' doctor.txt > container.txt
+          grep -q 'In a container' container.txt && ! grep -q 'FAIL' container.txt
+          mkdir -p proj && chmod 755 proj
+          out="$(docker run --rm $SETTINGS -v "$PWD/proj:/work" "$IMAGE:$VERSION" /bin/echo ran-under-the-warden)"
+          grep -qx ran-under-the-warden <<<"$out"
+          docker run --rm --entrypoint varek "$IMAGE:$VERSION" version | grep -qF "Warden  $VERSION"
+      - name: Log in to the GitHub Container Registry (the workflow's own token)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Publish
+        run: |
+          tags=("$VERSION" "$MINOR")
+          [ -n "${PRERELEASE:-}" ] || tags+=(latest)
+          for t in "${tags[@]}"; do
+            docker tag "$IMAGE:$VERSION" "$IMAGE:$t"
+            docker push "$IMAGE:$t"
+          done
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$VERSION")"
+          echo "DIGEST=$digest" >> "$GITHUB_ENV"
+          echo "published $digest as ${tags[*]}"
+      - uses: sigstore/cosign-installer@v3
+      - uses: anchore/sbom-action/download-syft@v0
+      - name: Sign the image (cosign, keyless)
+        run: cosign sign --yes "$DIGEST"
+      - name: The software bill of materials (CycloneDX), attached as a signed attestation
+        run: |
+          syft "$DIGEST" -o cyclonedx-json=sbom.cdx.json
+          cosign attest --yes --type cyclonedx --predicate sbom.cdx.json "$DIGEST"
+      - name: Verify the signature and the attestation, as a user would
+        run: |
+          id="https://github.com/${{ github.repository }}/.github/workflows/container-release.yml@${{ github.ref }}"
+          iss=https://token.actions.githubusercontent.com
+          cosign verify --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$DIGEST" > /dev/null
+          cosign verify-attestation --type cyclonedx --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$DIGEST" > /dev/null
+          echo "verified: $DIGEST"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ env.VERSION }}
+          path: sbom.cdx.json

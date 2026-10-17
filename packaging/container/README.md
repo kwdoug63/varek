@@ -12,9 +12,32 @@ container, exactly as on a host. The design and its decisions are in
 > give no process events (RHEL 9, Ubuntu 24.04): a sub-agent of the image
 > its launcher runs is then refused, as on such a host.
 
+## Get the image
+
+From v1.32.0, each release is published to the GitHub Container Registry,
+signed with cosign (keyless: the release workflow's own GitHub identity,
+recorded in Sigstore's public log) and with a CycloneDX software bill of
+materials attached as a signed attestation
+(`.github/workflows/container-release.yml`):
+
+```
+docker pull ghcr.io/kwdoug63/varek:1.32
+```
+
+Check that it is the one the release workflow built:
+
+```
+cosign verify ghcr.io/kwdoug63/varek:1.32 \
+  --certificate-identity-regexp '^https://github.com/kwdoug63/varek/.github/workflows/container-release.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+and its bill of materials, with `cosign verify-attestation --type cyclonedx`
+and the same two options.
+
 ## Build
 
-From the repository's root:
+Or build it yourself, from the repository's root:
 
 ```
 docker build -f packaging/container/Containerfile -t varek .
@@ -113,7 +136,7 @@ docker run --rm <the settings above> --entrypoint varek varek doctor
 Build on the image and name your agent's command:
 
 ```
-FROM varek
+FROM ghcr.io/kwdoug63/varek:1.32
 RUN microdnf -y install python3-pip && pip3 install --no-cache-dir requests
 COPY agent.py /work/agent.py
 CMD ["python3", "/work/agent.py"]
