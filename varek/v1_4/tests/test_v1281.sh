@@ -426,8 +426,17 @@ for l in open(sys.argv[1]):
     sgo two spawn "$B/f" "$B/a" open "$B/f"
     [ "$(opens two | awk '{print $2}' | tr '\n' ' ')" = "agent+subagent:alpha#1 agent " ] \
         && pass "the agent's own calls stay the agent's, after a sub-agent's" || flunk "the agent's own calls ($(opens two | tr '\n' ';'))"
+    # v1.32: the kernel's process events reach a listener in the initial
+    # network namespace only on some kernels (RHEL 9's 5.14 has none in a
+    # container's own); without them the Warden knows a launch by the image
+    # a process runs and refuses a sub-agent of the image its launcher runs,
+    # so the checks that need them are skipped there, and say so
+    if grep -q "known from the kernel's process events" "$OUT/fork.out"; then PE=1; else PE=; fi
+    nope() { skip "$1 (the Warden has no process events here)"; }
     sgo again spawn "$B/f" "$B/a" spawn "$B/f" "$B/a" open "$B/f"
-    check "two launches of one program: alpha#1, then alpha#2 (nested)" grep -q '"subagent":"alpha#2"' "$OUT/again.out"
+    if [ -n "$PE" ]; then
+        check "two launches of one program: alpha#1, then alpha#2 (nested)" grep -q '"subagent":"alpha#2"' "$OUT/again.out"
+    else nope "two launches of one program, nested"; fi
     sgo plain spawn "$B/f" "$B/plain" open "$B/f"
     [ "$(obos plain)" = "agent" ] && pass "the same program launched by a rule without subagent=: the agent's" || flunk "plain ($(obos plain))"
     sgo thr threaded "$B/a" open "$B/f"
@@ -441,15 +450,18 @@ for l in open(sys.argv[1]):
     check "... and no call is refused for it" sh -c "! grep -q 'intent_derivation_failed' '$OUT/e2big.out'"
     # v1.28.1 review: a launch of the image the launcher already runs
     printf '%b' "require warden 1.28\nallow exec $B/agent subagent=self\nallow path $B/f readonly\n$SL" > "$B/ps.txt"
-    POL="$B/ps.txt" sgo same e2big "$B/f" "$B/agent"
-    [ "$(obos same)" = "agent" ] && grep -q '"event":"subagent_settled".*"subagent":"self#1","result":"failed","how":"process_events"' "$OUT/same.out" \
-        && pass "a failed launch of the image the launcher runs: settled failed by the kernel's process events, the agent's (review)" \
-        || flunk "a failed same-image launch ($(obos same))"
-    POL="$B/ps.txt" sgo same2 exec "$B/agent" open "$B/f"
-    [ "$(obos same2)" = "agent+subagent:self#1" ] && pass "... and one that happened: the sub-agent's" || flunk "a same-image launch ($(obos same2))"
+    if [ -n "$PE" ]; then
+        POL="$B/ps.txt" sgo same e2big "$B/f" "$B/agent"
+        [ "$(obos same)" = "agent" ] && grep -q '"event":"subagent_settled".*"subagent":"self#1","result":"failed","how":"process_events"' "$OUT/same.out" \
+            && pass "a failed launch of the image the launcher runs: settled failed by the kernel's process events, the agent's (review)" \
+            || flunk "a failed same-image launch ($(obos same))"
+        POL="$B/ps.txt" sgo same2 exec "$B/agent" open "$B/f"
+        [ "$(obos same2)" = "agent+subagent:self#1" ] && pass "... and one that happened: the sub-agent's" || flunk "a same-image launch ($(obos same2))"
+    else nope "launches of the image the launcher runs, failed and done"; fi
     VAREK_WARDEN_TEST_NO_PROC_CONNECTOR=1 POL="$B/ps.txt" sgo samefb exec "$B/agent" open "$B/f"
     check "... without process events, refused (subagent_same_image)" sh -c "grep -q '\"rule\":\"subagent_same_image\"' '$OUT/samefb.out' && grep -q 'no process events here' '$OUT/samefb.out'"
-    check "each sub-agent's launch is settled once, before its decisions (subagent_settled)" python3 -c 'import json,sys
+    [ -n "$PE" ] || nope "each sub-agent's launch settled by process events"
+    [ -z "$PE" ] || check "each sub-agent's launch is settled once, before its decisions (subagent_settled)" python3 -c 'import json,sys
 for f in sys.argv[1:]:
     L = [json.loads(l) for l in open(f) if l.startswith("{")]
     st = [i for i, r in enumerate(L) if r.get("event") == "subagent_settled"]
@@ -477,7 +489,10 @@ sys.exit(0 if rs and all(isinstance(r.get("obo"), list) and r["obo"][:1] == ["ag
     check "the agent cannot write another control group's cgroup.procs, whatever the policy allows" \
         sh -c "grep -q 'write open: Permission denied' '$OUT/esc.so' && grep -q 'is on a control group filesystem; opening it to write is refused' '$OUT/esc.out'"
     printf '%b' "${SP}allow path /sys/\n$SL" > "$B/pw2.txt"
-    POL="$B/pw2.txt" sgo wpol open "$B/f"
+    # (--writable-exec: the policy lets the agent write /sys, which is not
+    # mounted noexec in a container under SELinux; the refusal tested is the
+    # control groups')
+    SOPT=(--writable-exec); POL="$B/pw2.txt" sgo wpol open "$B/f"; SOPT=()
     check "refused: a policy that lets the agent write the control groups" \
         sh -c "! grep -qx 0 '$OUT/wpol.rc' && grep -q 'the control groups must be out of the agent.s reach' '$OUT/wpol.out'"
     VAREK_WARDEN_TEST_NO_CGROUP2=1 timeout 30 "$WARDEN" "$B/p.txt" -- "$B/agent" open "$B/f" > /dev/null 2> "$OUT/nocg.out"; echo $? > "$OUT/nocg.rc"
