@@ -1327,6 +1327,19 @@ def cmd_run(args):
             require_entitlement(policy)
         run_as = args.run_as or cfg["run_as"] or "nobody"
         label = pack_summary(policy) or os.path.basename(policy)
+    # v1.32: in a container, refused here, before the agent starts, if the
+    # container cannot carry this run, with the flag that grants what it lacks
+    if varek_container.in_container():
+        iq = run_cmd([tool("vdp_cert_check"), policy, "identity"], capture=True)
+        cgroups = iq.returncode == 0 and any(ln.startswith(("subagent ", "confined "))
+                                             for ln in iq.stdout.splitlines())
+        lq = run_cmd([tool("vdp_check"), policy, "launches"], capture=True)
+        mounts = lq.returncode == 0 and lq.stdout.strip() == "on" and not args.writable_exec
+        lacks = varek_container.for_run(cgroups, mounts)
+        if lacks:
+            raise CliError("this container cannot carry the run: " + "; ".join(t for t, _ in lacks),
+                           fix="; ".join(dict.fromkeys(f for _, f in lacks if f)) +
+                               " (`varek doctor` checks each setting; packaging/container/README.md)")
     os.makedirs(cfg["log_dir"], exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     log = args.log or os.path.join(cfg["log_dir"], f"verdicts-{stamp}.log")

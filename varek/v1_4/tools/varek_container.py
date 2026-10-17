@@ -17,11 +17,14 @@ checked, the missing one named with the flag that grants it:
     cgroup filesystem remounted read-write where the run would.
 
 settings() reads the container's state from text (the pure part, tested by
-tests/test_varek_container.py); probe_mounts() makes the mounts.
+tests/test_varek_container.py); probe_mounts() makes the mounts. for_run() is
+the preflight's share, which `varek run` refuses on before the agent starts;
+run as a program it prints the findings for tools/varek_preflight.sh.
 """
 import ctypes
 import errno
 import os
+import sys
 import tempfile
 
 # the capabilities the Warden needs (packaging/container/README.md), by number
@@ -82,10 +85,12 @@ def _cgroup2(mounts):
     return None, False
 
 
-def settings(status, label, mounts, cgroup, uid_map=""):
+def settings(status, label, mounts, cgroup, uid_map="", cgroups=True):
     """The container's settings, from /proc/self/status, the LSM label
     (/proc/self/attr/current), /proc/self/mounts, /proc/self/cgroup and
-    /proc/self/uid_map: [(level, text, fix)], level "ok", "warn" or "fail"."""
+    /proc/self/uid_map: [(level, text, fix)], level "ok", "warn" or "fail".
+    cgroups: control groups are needed (a policy with sub-agents or MCP
+    servers, or not known); without, their absence is a warning."""
     out = []
     bnd = _field(status, "CapBnd")
     have = int(bnd, 16) if bnd else 0
@@ -141,7 +146,7 @@ def settings(status, label, mounts, cgroup, uid_map=""):
         out.append(("warn", "no cgroup v2 here: a policy that names a sub-agent or an MCP server will not start",
                     "a host with cgroup v2 (the unified hierarchy)"))
     elif ro and self_cg != "/":
-        out.append(("fail", f"the cgroup filesystem {cg} is read-only and this container shares the host's cgroup "
+        out.append(("fail" if cgroups else "warn", f"the cgroup filesystem {cg} is read-only and this container shares the host's cgroup "
                     "namespace: sub-agents and confined MCP servers cannot have control groups", "--cgroupns=private"))
     elif ro:
         out.append(("ok", f"cgroup v2 at {cg}, read-only, the container's own namespace: a run remounts it "
@@ -226,11 +231,7 @@ def probe_mounts(cgroup_mount=None):
     return [("fail", f"a test of the Warden's mounts: {text} ({err})", fix)]
 
 
-def check():
-    """Everything: [(level, text, fix)], or [] outside a container."""
-    if not in_container():
-        return []
-
+def _state():
     def read(p):
         try:
             with open(p) as f:
@@ -238,10 +239,46 @@ def check():
         except OSError:
             return ""
     label = read("/proc/self/attr/apparmor/current") or read("/proc/self/attr/current")
-    mounts = read("/proc/self/mounts")
-    cgroup = read("/proc/self/cgroup")
-    out = settings(read("/proc/self/status"), label, mounts, cgroup, read("/proc/self/uid_map"))
+    return read("/proc/self/status"), label, read("/proc/self/mounts"), read("/proc/self/cgroup"), \
+        read("/proc/self/uid_map")
+
+
+def check(cgroups=True):
+    """Everything: [(level, text, fix)], or [] outside a container."""
+    if not in_container():
+        return []
+
+    status, label, mounts, cgroup, uid_map = _state()
+    out = settings(status, label, mounts, cgroup, uid_map, cgroups)
     cg, ro = _cgroup2(mounts)
     self_cg = next((ln[3:] for ln in cgroup.splitlines() if ln.startswith("0::")), None)
-    out += probe_mounts(cg if cg and ro and self_cg == "/" else None)
+    out += probe_mounts(cg if cgroups and cg and ro and self_cg == "/" else None)
     return out
+
+
+def for_run(cgroups, mounts):
+    """The preflight's share: what this run needs of its container that the
+    container lacks, [(text, fix)]; [] outside a container or when it has
+    all. cgroups: the policy names a sub-agent or an MCP server; mounts: the
+    Warden mounts the writable directories noexec (launches decided, no
+    --writable-exec). Capabilities always; the mount test when the run
+    mounts or makes control groups."""
+    if not in_container():
+        return []
+    status, label, mnts, cgroup, uid_map = _state()
+    out = [(t, f) for lv, t, f in settings(status, label, mnts, cgroup, uid_map, cgroups) if lv == "fail"]
+    if mounts or cgroups:
+        cg, ro = _cgroup2(mnts)
+        self_cg = next((ln[3:] for ln in cgroup.splitlines() if ln.startswith("0::")), None)
+        out += [(t, f) for lv, t, f in probe_mounts(cg if cgroups and cg and ro and self_cg == "/" else None)
+                if lv == "fail"]
+    return out
+
+
+if __name__ == "__main__":
+    # tools/varek_preflight.sh: --in-container (exit 0 when in one), or
+    # --preflight [--cgroups]: each finding as LEVEL<tab>TEXT<tab>FIX
+    if "--in-container" in sys.argv:
+        sys.exit(0 if in_container() else 1)
+    for lv, t, f in check(cgroups="--cgroups" in sys.argv):
+        print(f"{lv}\t{t}\t{f or ''}")

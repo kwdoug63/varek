@@ -94,3 +94,21 @@ def test_in_container():
     assert vc.in_container({"container": "podman"}, exists=lambda p: False) == "podman"
     assert vc.in_container({}, exists=lambda p: False) is None
     assert vc.in_container({"VAREK_DOCTOR_CONTAINER": "test"}, exists=lambda p: False) == "test"
+
+
+def test_for_run_counts_what_the_run_needs(monkeypatch):
+    """the preflight's share: capabilities always; control groups only for a
+    policy with sub-agents or MCP servers; the mount test when the run mounts"""
+    probed = []
+    monkeypatch.setattr(vc, "in_container", lambda: "docker")
+    monkeypatch.setattr(vc, "probe_mounts", lambda cg=None: probed.append(cg) or [("ok", "mounts", None)])
+    shared = (status(), "varek-container (enforce)", CG_RO, "0::/system.slice/x\n", ROOTFUL)
+    monkeypatch.setattr(vc, "_state", lambda: shared)
+    assert vc.for_run(cgroups=False, mounts=True) == [] and probed == [None]
+    lacks = vc.for_run(cgroups=True, mounts=True)
+    assert [f for _, f in lacks] == ["--cgroupns=private"]
+    monkeypatch.setattr(vc, "_state", lambda: (status(TEN & ~(1 << 19)), *shared[1:]))
+    lacks = vc.for_run(cgroups=False, mounts=False)
+    assert [f for _, f in lacks] == ["--cap-add SYS_PTRACE"] and len(probed) == 2
+    monkeypatch.setattr(vc, "in_container", lambda: None)
+    assert vc.for_run(cgroups=True, mounts=True) == []

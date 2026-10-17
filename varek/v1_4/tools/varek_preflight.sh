@@ -38,6 +38,10 @@
 #        /dev/nvme* or /dev/bsg/*.
 #      These checks cannot see everything the Warden sees (whether a FIFO has
 #      a reader, for one); --run is the definitive test.
+#   2b. v1.32, in a container: each setting the Warden needs of it (the ten
+#      capabilities, seccomp, the AppArmor profile or SELinux type, the cgroup
+#      namespace, a test of the Warden's mounts), as `varek doctor` checks
+#      them (tools/varek_container.py), each missing one named with its flag.
 #   3b. v1.21, with --flow-policy: the plan gate's configuration, checked by the
 #      Warden itself (`warden <policy> --check-startup --flow-policy ...`, as
 #      root, via sudo if needed): the flow policy loads, is progress-safe and
@@ -175,6 +179,21 @@ sys.exit(os.waitpid(pid, 0)[1] != 0)' 2>/dev/null; then
             warn "the Warden cannot make a mount namespace here: a run of this policy refuses to start unless given --writable-exec"
         fi
     fi
+fi
+
+# v1.32: in a container, each setting the Warden needs of it
+# (packaging/container/README.md); control groups counted when the policy
+# names a sub-agent or an MCP server
+if python3 "$HERE/tools/varek_container.py" --in-container 2>/dev/null; then
+    echo "== 2b. the container"
+    cgf=; "$CERT" "$POLICY" identity 2>/dev/null | grep -q -E '^(subagent|confined) ' && cgf=--cgroups
+    while IFS=$'\t' read -r lv text fix; do
+        case "$lv" in
+            ok)   pass "$text" ;;
+            warn) warn "$text${fix:+ ($fix)}" ;;
+            fail) fail "$text${fix:+ ($fix)}" ;;
+        esac
+    done < <(python3 "$HERE/tools/varek_container.py" --preflight $cgf 2>/dev/null)
 fi
 
 echo "== 3. what the Warden refuses at startup"
