@@ -34,6 +34,8 @@
 #
 # Writes the logs and summary.txt (suite, result, pass, fail, skip, seconds,
 # per capability set) to DIR (default /var/tmp/varek-container-sweep-<time>).
+# Exit status 1 when a suite failed with every capability (CI:
+# .github/workflows/container.yml).
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -58,7 +60,7 @@ while [ $# -gt 0 ]; do
         --apparmor) APPARMOR=1; shift ;;
         --selinux) SELINUX=1; shift ;;
         --security-opt) SECOPTS+=(--security-opt "$2"); shift 2 ;;
-        -h|--help) sed -n '3,36p' "$0"; exit 0 ;;
+        -h|--help) sed -n '3,38p' "$0"; exit 0 ;;
         -*) echo "container_sweep.sh: unknown option $1" >&2; exit 2 ;;
         *) SUITES+=("$1"); shift ;;
     esac
@@ -147,9 +149,11 @@ run_set() {
         p=$(grep -c '  PASS' "$log"); f=$(grep -c '  FAIL' "$log"); k=$(grep -c '  SKIP' "$log")
         printf '%-22s %-6s %6s %6s %6s %8s\n' "$s" "$([ $rc = 0 ] && echo ok || echo FAILED)" "$p" "$f" "$k" "$(( $(date +%s) - t0 ))" \
             | tee -a "$OUT/summary.txt"
+        [ "$rc" = 0 ] || [ "$label" != all ] || ALLFAILED=$((ALLFAILED + 1))
     done
 }
 
+ALLFAILED=0                                  # suites failed with every capability
 : > "$OUT/summary.txt"
 cat "$OUT/host.txt" >> "$OUT/summary.txt"
 # shellcheck disable=SC2086
@@ -164,3 +168,6 @@ if [ "$DROP" = 1 ]; then
     done
 fi
 echo "container_sweep.sh: logs and summary.txt in $OUT"
+# exit 1 when a suite failed with every capability (the runs with one left
+# out are meant to fail)
+[ "$ALLFAILED" = 0 ] || { echo "container_sweep.sh: $ALLFAILED suite(s) failed with every capability"; exit 1; }

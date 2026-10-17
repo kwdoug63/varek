@@ -1,0 +1,83 @@
+name: Container image
+
+# v1.32 (step 5 of docs/security/v1.32-containers.md): VAREK's container
+# image built on every change, and the suites run inside it under the
+# documented settings (packaging/container/README.md): --cap-drop ALL and the
+# ten capabilities, --cgroupns=private, Docker's default seccomp profile, and
+# VAREK's AppArmor profile (the runner is Ubuntu, with AppArmor). The runtime
+# image is checked with `varek doctor` and a run of an agent; the test image
+# runs every suite (tests/container_sweep.sh), its logs kept as an artifact.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "varek/**"
+      - "v1_6/**"
+      - "v1_7/**"
+      - "packaging/container/**"
+      - ".github/workflows/container.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "varek/**"
+      - "v1_6/**"
+      - "v1_7/**"
+      - "packaging/container/**"
+      - ".github/workflows/container.yml"
+
+jobs:
+  image:
+    name: Build the image and run the suites in it
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SETTINGS: >-
+        --cap-drop ALL --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add SETPCAP
+        --cap-add SETUID --cap-add SETGID --cap-add DAC_OVERRIDE --cap-add KILL
+        --cap-add NET_ADMIN --cap-add NET_BIND_SERVICE --cap-add CHOWN
+        --cgroupns=private --security-opt apparmor=varek-container
+    steps:
+      - uses: actions/checkout@v4
+      - name: The host
+        run: |
+          uname -srm; docker --version
+          echo "cgroup: $(stat -fc %T /sys/fs/cgroup)  AppArmor: $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo absent)"
+      - name: Load VAREK's AppArmor profile
+        run: |
+          sudo install -m 644 packaging/container/apparmor/varek-container /etc/apparmor.d/varek-container
+          sudo apparmor_parser -r -W /etc/apparmor.d/varek-container
+      - name: Build the runtime image
+        run: docker build -f packaging/container/Containerfile --target runtime -t varek .
+      - name: The runtime image - varek doctor finds every setting
+        run: |
+          docker run --rm $SETTINGS --entrypoint varek varek doctor | tee doctor.txt || true
+          sed -n '/In a container/,/^$/p' doctor.txt > container.txt
+          grep -q 'In a container' container.txt
+          if grep -q 'FAIL' container.txt; then echo "varek doctor found a setting missing"; exit 1; fi
+      - name: The runtime image - an agent runs under the baseline
+        run: |
+          mkdir -p proj && chmod 755 proj
+          out="$(docker run --rm $SETTINGS -v "$PWD/proj:/work" varek /bin/echo ran-under-the-warden)"
+          echo "$out"
+          grep -qx ran-under-the-warden <<<"$out"
+      - name: The runtime image - Docker's defaults are refused before the agent starts
+        run: |
+          if docker run --rm -v "$PWD/proj:/work" varek /bin/true 2> refused.txt; then
+            echo "the run started under Docker's defaults"; exit 1
+          fi
+          cat refused.txt
+          grep -q 'this container cannot carry the run' refused.txt
+      - name: Build the test image
+        run: docker build -f packaging/container/Containerfile --target test -t varek-test .
+      - name: Run every suite in the test image
+        run: sudo varek/v1_4/tests/container_sweep.sh --runtime docker --image varek-test --apparmor --out "$RUNNER_TEMP/sweep"
+      - name: Keep the sweep's logs
+        if: always()
+        run: sudo chmod -R a+rX "$RUNNER_TEMP/sweep" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: container-sweep
+          path: ${{ runner.temp }}/sweep
+          if-no-files-found: ignore
