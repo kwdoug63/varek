@@ -9,6 +9,20 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.31.1] - 2026-10-17 — Calls glibc and bash make
+
+A patch release of v1.31.0. The Warden admits, under every policy, four
+system calls glibc and bash make that it refused: `epoll_wait(2)` and
+`epoll_create(2)` (x86_64), without which Python's `select.epoll` and
+asyncio's default event loop failed with EPERM; `pipe(2)`, which glibc
+before 2.37 (RHEL 9) calls for `pipe()`, without which a shell's command
+substitution failed; and `getpgrp(2)` under a policy before 1.29, without
+which bash did not start. Each does what an admitted call does or reports
+the caller's own process group. `make test-v1311` checks them (9 of its
+11 checks fail on v1.31.0); the shared 24-hour soak passed on this build.
+The Warden reports 1.31.1; the grammar stays 1.31. See
+`RELEASE-v1.31.1.md`.
+
 ## [1.31.0] - 2026-10-16 — MCP servers confined, MCP calls decided, and an OCSF export
 
 Under `require warden 1.31`: `mcp server NAME exec PATH [sha256=HEX]`

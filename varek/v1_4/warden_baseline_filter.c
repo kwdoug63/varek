@@ -88,6 +88,16 @@ static const char *kAdmit[] = {
     // v1.27: dup2, which glibc calls for dup2() on x86_64 and every launcher
     // uses to give a child its stdin/stdout/stderr; it does what dup3 does
     "dup2",
+    // v1.31.1 (found by the RHEL 9 sweep): pipe, which glibc before 2.37
+    // calls for pipe() on x86_64 (later ones call pipe2 with no flags); it
+    // does what pipe2 does
+    "pipe",
+    // v1.31.1 (the RHEL 9 sweep): getpgrp, the caller's own process group,
+    // under every policy (from 1.29 it was admitted with the rest of
+    // kAdmit129): bash, RHEL's /bin/sh, exits at its start when it fails
+    // ("getpgrp failed"), so a shell agent under an earlier pack could not
+    // start
+    "getpgrp",
     "getdents64", "getcwd",
     // v1.17.0: newfstatat, statx, readlink, readlinkat, access, faccessat and
     // faccessat2 are NO LONGER admitted. They reveal whether any file exists,
@@ -107,6 +117,12 @@ static const char *kAdmit[] = {
     // no namespace bit. kill is admitted below for a pid above 0 only.
     "vfork",
     "epoll_create1", "epoll_ctl", "epoll_pwait", "epoll_pwait2",
+    // v1.31.1: epoll_wait and epoll_create, which glibc on x86_64 calls for
+    // epoll_wait() and epoll_create() (arm64 has neither and uses the two
+    // above). Without them Python's select.epoll, and so asyncio's default
+    // event loop, failed with EPERM under every policy. They do what
+    // epoll_pwait with no signal mask and epoll_create1 with no flags do.
+    "epoll_wait", "epoll_create",
     // time / sched / ids
     "clock_gettime", "clock_nanosleep", "nanosleep", "gettimeofday", "time",
     "getpid", "gettid", "getppid", "sched_yield", "sched_getaffinity",
@@ -200,7 +216,7 @@ static const char *kMediate129[] = { "stat", "lstat", NULL };
 // descriptor can be waited on; pidfd_getfd is hard-denied and
 // pidfd_send_signal is not admitted).
 static const char *kAdmit129[] = {
-    "getrusage", "restart_syscall", "capget", "setpgid", "getpgid", "getpgrp", "getsid", "setsid",
+    "getrusage", "restart_syscall", "capget", "setpgid", "getpgid", "getsid", "setsid",
     "fadvise64", "flock", "fstatfs", "getitimer", "setitimer", "alarm", "umask", "mbind", "pidfd_open",
     NULL
 };
