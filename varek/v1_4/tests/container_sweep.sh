@@ -6,6 +6,7 @@
 # the image documents, and find which settings each needs.
 #
 #   sudo varek/v1_4/tests/container_sweep.sh [--runtime docker|podman]
+#   varek/v1_4/tests/container_sweep.sh --runtime podman ...  (rootless)
 #        [--build] [--out DIR] [--caps "SYS_ADMIN SYS_PTRACE ..."]
 #        [--drop-each] [--apparmor] [--selinux] [--security-opt OPT] [SUITE...]
 #
@@ -57,16 +58,22 @@ while [ $# -gt 0 ]; do
         --apparmor) APPARMOR=1; shift ;;
         --selinux) SELINUX=1; shift ;;
         --security-opt) SECOPTS+=(--security-opt "$2"); shift 2 ;;
-        -h|--help) sed -n '3,35p' "$0"; exit 0 ;;
+        -h|--help) sed -n '3,36p' "$0"; exit 0 ;;
         -*) echo "container_sweep.sh: unknown option $1" >&2; exit 2 ;;
         *) SUITES+=("$1"); shift ;;
     esac
 done
-[ "$(id -u)" = 0 ] || { echo "container_sweep.sh: run as root (the runtime starts the containers)" >&2; exit 2; }
 if [ -z "$RT" ]; then
     if command -v docker >/dev/null 2>&1; then RT=docker
     elif command -v podman >/dev/null 2>&1; then RT=podman
     else echo "container_sweep.sh: neither docker nor podman is installed" >&2; exit 2; fi
+fi
+# as root, or (D10) as a user with rootless Podman: the containers are then
+# that user's, in a user namespace of their own
+ROOTLESS=
+if [ "$(id -u)" != 0 ]; then
+    [ "$RT" = podman ] || { echo "container_sweep.sh: run as root, or with rootless Podman (--runtime podman)" >&2; exit 2; }
+    ROOTLESS=1
 fi
 OUT="${OUT:-/var/tmp/varek-container-sweep-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$OUT"
@@ -84,7 +91,12 @@ if [ "$APPARMOR" = 1 ]; then
     SECOPTS+=(--security-opt apparmor=varek-container-test)
 fi
 if [ "$SELINUX" = 1 ]; then
-    semodule -i "$ROOT/packaging/container/selinux/varek_container.cil" || { echo "container_sweep.sh: --selinux: the module did not load" >&2; exit 1; }
+    if [ -n "$ROOTLESS" ]; then
+        # root loads it (sudo semodule -i ...); a user cannot
+        echo "container_sweep.sh: --selinux, rootless: the module is not loaded here; root must have loaded it (packaging/container/README.md)"
+    else
+        semodule -i "$ROOT/packaging/container/selinux/varek_container.cil" || { echo "container_sweep.sh: --selinux: the module did not load" >&2; exit 1; }
+    fi
     SECOPTS+=(--security-opt label=type:container_init_t)
 fi
 {
@@ -95,6 +107,7 @@ fi
     echo "AppArmor: $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo absent)  SELinux: $(getenforce 2>/dev/null || echo absent)"
     echo "security options: $($RT info --format '{{.SecurityOptions}}' 2>/dev/null || $RT info 2>/dev/null | grep -A4 -i 'security' | tr '\n' ' ')"
     echo "capabilities: $CAPS"
+    [ -z "$ROOTLESS" ] || echo "rootless: as $(id -un) (uid $(id -u)); $(grep "^$(id -un):" /etc/subuid 2>/dev/null | head -1 || echo 'no /etc/subuid entry')"
     [ ${#SECOPTS[@]} = 0 ] || echo "options: ${SECOPTS[*]}"
 } | tee "$OUT/host.txt"
 
