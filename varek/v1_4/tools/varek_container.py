@@ -140,6 +140,7 @@ def settings(status, label, mounts, cgroup, uid_map="", cgroups=True):
         else:
             out.append(("warn", f"AppArmor profile {name}: not one the settings were measured with", APPARMOR_FIX))
 
+    rootless = _rootless(uid_map)
     cg, ro = _cgroup2(mounts)
     self_cg = next((ln[3:] for ln in cgroup.splitlines() if ln.startswith("0::")), None)
     if cg is None:
@@ -148,16 +149,19 @@ def settings(status, label, mounts, cgroup, uid_map="", cgroups=True):
     elif ro and self_cg != "/":
         out.append(("fail" if cgroups else "warn", f"the cgroup filesystem {cg} is read-only and this container shares the host's cgroup "
                     "namespace: sub-agents and confined MCP servers cannot have control groups", "--cgroupns=private"))
+    elif ro and rootless:
+        # a user namespace locks the mount read-only (D10, measured)
+        out.append(("fail" if cgroups else "warn", f"the cgroup filesystem {cg} is read-only and the container "
+                    "is rootless, where it cannot be remounted: sub-agents and confined MCP servers cannot have "
+                    "control groups", "--systemd=always (Podman then mounts the container's own groups read-write)"))
     elif ro:
         out.append(("ok", f"cgroup v2 at {cg}, read-only, the container's own namespace: a run remounts it "
                     "read-write for itself", None))
     else:
         out.append(("ok", f"cgroup v2 at {cg}", None))
 
-    first = uid_map.strip().splitlines()[0].split() if uid_map.strip() else []
-    if first and first != ["0", "0", "4294967295"]:
-        out.append(("warn", "rootless (a user namespace): root in the container is a user on the host",
-                    "rootless Podman is measured separately (docs/security/v1.32-containers.md)"))
+    if rootless:
+        out.append(("ok", "rootless (a user namespace): root in the container is a user on the host", None))
     return out
 
 
@@ -231,6 +235,11 @@ def probe_mounts(cgroup_mount=None):
     return [("fail", f"a test of the Warden's mounts: {text} ({err})", fix)]
 
 
+def _rootless(uid_map):
+    first = uid_map.strip().splitlines()[0].split() if uid_map.strip() else []
+    return bool(first) and first != ["0", "0", "4294967295"]
+
+
 def _state():
     def read(p):
         try:
@@ -252,7 +261,7 @@ def check(cgroups=True):
     out = settings(status, label, mounts, cgroup, uid_map, cgroups)
     cg, ro = _cgroup2(mounts)
     self_cg = next((ln[3:] for ln in cgroup.splitlines() if ln.startswith("0::")), None)
-    out += probe_mounts(cg if cgroups and cg and ro and self_cg == "/" else None)
+    out += probe_mounts(cg if cgroups and cg and ro and self_cg == "/" and not _rootless(uid_map) else None)
     return out
 
 
@@ -270,8 +279,8 @@ def for_run(cgroups, mounts):
     if mounts or cgroups:
         cg, ro = _cgroup2(mnts)
         self_cg = next((ln[3:] for ln in cgroup.splitlines() if ln.startswith("0::")), None)
-        out += [(t, f) for lv, t, f in probe_mounts(cg if cgroups and cg and ro and self_cg == "/" else None)
-                if lv == "fail"]
+        rm = cg if cgroups and cg and ro and self_cg == "/" and not _rootless(uid_map) else None
+        out += [(t, f) for lv, t, f in probe_mounts(rm) if lv == "fail"]
     return out
 
 

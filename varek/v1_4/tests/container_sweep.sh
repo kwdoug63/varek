@@ -132,6 +132,9 @@ fi
 run_set() {
     local label="$1"; shift
     local args=(--rm --cap-drop ALL --cgroupns=private "${SECOPTS[@]}")
+    # rootless (D10): a user namespace locks the cgroup mount read-only;
+    # Podman's systemd mode mounts the container's own groups read-write
+    [ -z "$ROOTLESS" ] || args+=(--systemd=always)
     for c in "$@" $TEST_CAPS; do args+=(--cap-add "$c"); done
     printf '\n== %s: --cap-drop ALL%s (and, for the tests, %s)\n' "$label" "$(printf ' --cap-add %s' "$@")" "$TEST_CAPS" | tee -a "$OUT/summary.txt"
     printf '%-22s %-6s %6s %6s %6s %8s\n' SUITE RESULT PASS FAIL SKIP SECONDS | tee -a "$OUT/summary.txt"

@@ -83,9 +83,20 @@ def test_cgroup_cases():
     assert find(run(mounts=""), "no cgroup v2")[0][0] == "warn"
 
 
+ROOTLESS = "0 1000 1\n1 100000 65536\n"
+
+
 def test_rootless_is_said():
-    assert find(run(uid_map="0 1000 1\n1 100000 65536\n"), "rootless")[0][0] == "warn"
+    assert find(run(uid_map=ROOTLESS, mounts=CG_RW), "rootless (a user namespace)")[0][0] == "ok"
     assert not find(run(), "rootless")
+
+
+def test_rootless_read_only_cgroups_need_systemd_always():
+    """D10, measured: a user namespace locks the cgroup mount read-only"""
+    lv, _, fix = find(run(uid_map=ROOTLESS), "cannot be remounted")[0]
+    assert lv == "fail" and fix.startswith("--systemd=always")
+    assert find(vc.settings(status(), "x", CG_RO, "0::/\n", ROOTLESS, cgroups=False), "cannot be remounted")[0][0] == "warn"
+    assert not find(run(uid_map=ROOTLESS, mounts=CG_RW), "cannot be remounted")
 
 
 def test_in_container():

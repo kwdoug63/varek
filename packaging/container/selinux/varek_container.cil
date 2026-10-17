@@ -1,6 +1,6 @@
 ; SPDX-License-Identifier: MIT
 ;
-; varek_container: the one SELinux rule VAREK's container needs (v1.32, D5
+; varek_container: the SELinux rules VAREK's container needs (v1.32, D5
 ; in docs/security/v1.32-containers.md), for Podman (or Docker) on RHEL,
 ; Fedora and others with SELinux enforcing.
 ;
@@ -13,7 +13,8 @@
 ; container_init_t may not remount it, which is the first rule below; nor
 ; mount on a character device (the noexec mount of /dev/null, which a policy
 ; letting the agent write it has the Warden bind onto itself: v1.27.1), the
-; second. Both measured on RHEL 9.8. Other
+; second; rootless (D10), where Podman binds the host's own device nodes onto
+; /dev/null and /dev/tty, the third and fourth. Each measured on RHEL 9.8. Other
 ; containers keep container_t; this is not the host-wide
 ; container_manage_cgroup boolean.
 ;
@@ -26,3 +27,5 @@
 
 (allow container_init_t cgroup_t (filesystem (remount)))
 (allow container_init_t container_file_t (chr_file (mounton)))
+(allow container_init_t null_device_t (chr_file (mounton)))
+(allow container_init_t devtty_t (chr_file (mounton)))

@@ -111,6 +111,24 @@ semodule -i packaging/container/selinux/varek_container.cil
 and add `--security-opt label=type:container_init_t` to the run. Other
 containers keep `container_t`. Never `label=disable`.
 
+### Rootless Podman
+
+As a user, with the same settings, the SELinux type above, and
+`--systemd=always`:
+
+```
+podman run --rm <the settings above> --security-opt label=type:container_init_t \
+  --systemd=always -v "$PWD":/work varek python3 agent.py
+```
+
+In the user namespace a rootless container runs in, the kernel keeps the
+cgroup filesystem read-only, so the Warden cannot remount it; Podman's
+systemd mode mounts the container's own groups read-write instead, which
+sub-agents and confined MCP servers need (without them, `--systemd=always`
+may be left out). Root loads the SELinux module once, as above; its last
+two rules are for rootless, where Podman binds the host's `/dev/null` and
+`/dev/tty` into the container.
+
 ### Sub-agents and confined MCP servers
 
 They need a control group for the run and one for each sub-agent's launch.

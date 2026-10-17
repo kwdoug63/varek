@@ -1879,7 +1879,7 @@ static int relay_agent_stderr(int fd, bool drain_all) {
 
 #define WARDEN_VSTR_(x) #x
 #define WARDEN_VSTR(x) WARDEN_VSTR_(x)
-#define WARDEN_VERSION WARDEN_VSTR(VDP_WARDEN_MAJOR) "." WARDEN_VSTR(VDP_WARDEN_MINOR) "." \
+#define WARDEN_VERSION WARDEN_VSTR(VDP_WARDEN_MAJOR) "." WARDEN_VSTR(VDP_WARDEN_REL_MINOR) "." \
                        WARDEN_VSTR(VDP_WARDEN_PATCH)
 
 /* v1.28.1: run_start's on_behalf_of and operator */
