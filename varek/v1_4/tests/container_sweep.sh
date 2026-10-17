@@ -7,10 +7,16 @@
 #
 #   sudo varek/v1_4/tests/container_sweep.sh [--runtime docker|podman]
 #        [--build] [--out DIR] [--caps "SYS_ADMIN SYS_PTRACE ..."]
-#        [--drop-each] [SUITE...]
+#        [--drop-each] [--apparmor] [--security-opt OPT] [SUITE...]
 #
 # --build        build the test image first (packaging/container/Containerfile,
 #                --target test) from this checkout
+# --apparmor     load VAREK's AppArmor profile (packaging/container/apparmor)
+#                and run the containers under it rather than the runtime's
+#                default; with the mounts the suites make to set up their
+#                cases added, as MKNOD is (a copy, varek-container-test)
+# --security-opt OPT  passed to each container (diagnosis only: what the
+#                image documents is what the sweep shows)
 # --caps LIST    the capabilities added after --cap-drop ALL (default: the
 #                list measured so far, below)
 # --drop-each    after the run with every capability, run a short set of
@@ -27,7 +33,7 @@
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-RT="" BUILD=0 OUT="" DROP=0 SUITES=()
+RT="" BUILD=0 OUT="" DROP=0 APPARMOR=0 SUITES=() SECOPTS=()
 CAPS="SYS_ADMIN SYS_PTRACE SETPCAP SETUID SETGID DAC_OVERRIDE KILL NET_ADMIN NET_BIND_SERVICE CHOWN"
 # what the suites themselves need to set up their cases, not VAREK: mknod
 # (a block device and a /dev/mem twin in the allowed tree)
@@ -45,7 +51,9 @@ while [ $# -gt 0 ]; do
         --caps) CAPS="$2"; shift 2 ;;
         --drop-each) DROP=1; shift ;;
         --image) IMAGE="$2"; shift 2 ;;
-        -h|--help) sed -n '3,30p' "$0"; exit 0 ;;
+        --apparmor) APPARMOR=1; shift ;;
+        --security-opt) SECOPTS+=(--security-opt "$2"); shift 2 ;;
+        -h|--help) sed -n '3,32p' "$0"; exit 0 ;;
         -*) echo "container_sweep.sh: unknown option $1" >&2; exit 2 ;;
         *) SUITES+=("$1"); shift ;;
     esac
@@ -58,6 +66,19 @@ if [ -z "$RT" ]; then
 fi
 OUT="${OUT:-/var/tmp/varek-container-sweep-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$OUT"
+if [ "$APPARMOR" = 1 ]; then
+    # the profile as shipped, and a copy for the suites (their tmpfs mounts
+    # and plain bind mounts, which VAREK does not make); the profile's last
+    # line is its closing brace
+    AA="$ROOT/packaging/container/apparmor/varek-container"
+    command -v apparmor_parser > /dev/null 2>&1 || { echo "container_sweep.sh: --apparmor: apparmor_parser is not installed" >&2; exit 2; }
+    { sed -e '$d' -e 's/^profile varek-container /profile varek-container-test /' \
+          -e 's/peer=varek-container,/peer=varek-container-test,/' "$AA"
+      printf '  # the suites'"'"' own setup, not VAREK'"'"'s\n  mount fstype=tmpfs,\n  mount options=(bind) /** -> /**,\n}\n'
+    } > "$OUT/varek-container-test"
+    apparmor_parser -r -W "$AA" "$OUT/varek-container-test" || { echo "container_sweep.sh: --apparmor: the profiles did not load" >&2; exit 1; }
+    SECOPTS+=(--security-opt apparmor=varek-container-test)
+fi
 {
     echo "host: $(uname -srm); $(. /etc/os-release && echo "$PRETTY_NAME")"
     echo "commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null) ($(git -C "$ROOT" branch --show-current 2>/dev/null))"
@@ -66,6 +87,7 @@ mkdir -p "$OUT"
     echo "AppArmor: $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo absent)  SELinux: $(getenforce 2>/dev/null || echo absent)"
     echo "security options: $($RT info --format '{{.SecurityOptions}}' 2>/dev/null || $RT info 2>/dev/null | grep -A4 -i 'security' | tr '\n' ' ')"
     echo "capabilities: $CAPS"
+    [ ${#SECOPTS[@]} = 0 ] || echo "options: ${SECOPTS[*]}"
 } | tee "$OUT/host.txt"
 
 if [ "$BUILD" = 1 ]; then
@@ -86,7 +108,7 @@ fi
 # these capabilities; a row per suite in summary.txt
 run_set() {
     local label="$1"; shift
-    local args=(--rm --cap-drop ALL --cgroupns=private)
+    local args=(--rm --cap-drop ALL --cgroupns=private "${SECOPTS[@]}")
     for c in "$@" $TEST_CAPS; do args+=(--cap-add "$c"); done
     printf '\n== %s: --cap-drop ALL%s (and, for the tests, %s)\n' "$label" "$(printf ' --cap-add %s' "$@")" "$TEST_CAPS" | tee -a "$OUT/summary.txt"
     printf '%-22s %-6s %6s %6s %6s %8s\n' SUITE RESULT PASS FAIL SKIP SECONDS | tee -a "$OUT/summary.txt"

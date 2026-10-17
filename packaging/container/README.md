@@ -51,6 +51,24 @@ The agent itself holds none of them: the Warden empties its bounding set
 and drops it to its own user before its filter is installed. The
 runtime's default seccomp profile stays on.
 
+### On a host with AppArmor (Ubuntu, Debian, SUSE)
+
+Docker's `docker-default` profile denies every mount, and the Warden
+mounts the agent's writable directories noexec (policies from 1.27), so
+under it the Warden refuses to start ("cannot make the mount namespace
+private (Permission denied)"). Load VAREK's profile, `apparmor/varek-container`,
+once, as root:
+
+```
+install -m 644 packaging/container/apparmor/varek-container /etc/apparmor.d/varek-container
+apparmor_parser -r -W /etc/apparmor.d/varek-container
+```
+
+and add `--security-opt apparmor=varek-container` to the run. It is
+`docker-default` with the Warden's three mounts allowed (its own mount
+namespace made private, a directory bound onto itself, that mount
+remounted noexec) and no other; never `apparmor=unconfined`.
+
 ## Your agent in the image
 
 Build on the image and name your agent's command:
@@ -75,4 +93,5 @@ docker run ... -v ./policy.txt:/etc/varek/policy.txt:ro \
 
 `varek/v1_4/tests/container_sweep.sh` runs the suites inside the image's
 `test` stage under these settings, and with `--drop-each` once more per
-capability with that one left out, to show each is needed.
+capability with that one left out, to show each is needed; with
+`--apparmor`, under the profile above.
