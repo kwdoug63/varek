@@ -73,16 +73,17 @@ never `apparmor=unconfined`.
 ### On a host with SELinux (RHEL, Fedora)
 
 The container's own type, `container_t`, may not make control groups, which
-a policy with sub-agents or confined MCP servers needs. Load VAREK's module,
-`selinux/varek_container.cil`, once, as root:
+a policy with sub-agents or confined MCP servers needs. Run it as
+`container_init_t`, the distribution's type for containers that manage
+their control groups, and load VAREK's one-rule module,
+`selinux/varek_container.cil` (that type may also remount the cgroup
+filesystem), once, as root:
 
 ```
-dnf -y install udica
-semodule -i packaging/container/selinux/varek_container.cil /usr/share/udica/templates/base_container.cil
+semodule -i packaging/container/selinux/varek_container.cil
 ```
 
-and add `--security-opt label=type:varek_container.process` to the run. It
-is udica's base container type with the cgroup access added; other
+and add `--security-opt label=type:container_init_t` to the run. Other
 containers keep `container_t`. Never `label=disable`.
 
 ### Sub-agents and confined MCP servers

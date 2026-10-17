@@ -57,7 +57,7 @@ profile varek-container flags=(attach_disconnected,mediate_deleted) {
   # 4. with sub-agents or confined MCP servers, the container's cgroup
   #    filesystem (its own groups only, --cgroupns=private), mounted
   #    read-only by the runtime, remounted read-write (v1.32)
-  mount options=(remount) options in (nosuid, nodev, noexec, noatime, nodiratime, relatime) -> /sys/fs/cgroup/,
+  mount options=(remount) options in (nosuid, nodev, noexec, noatime, nodiratime, relatime, nosymfollow) -> /sys/fs/cgroup/,
 
   deny /sys/[^f]*/** wklx,
   deny /sys/f[^s]*/** wklx,

@@ -1,31 +1,24 @@
 ; SPDX-License-Identifier: MIT
 ;
-; varek_container: the SELinux type for VAREK's container (v1.32, D5 in
-; docs/security/v1.32-containers.md), for Podman (or Docker) on RHEL, Fedora
-; and others with SELinux enforcing. It is udica's base container type, as a
-; container's own (container_t) is, with what the Warden needs beyond it:
-; with sub-agents or confined MCP servers (v1.28.1, v1.31), a control group
-; for the run and one for each sub-agent's launch, in the container's own
-; cgroup subtree (--cgroupns=private), and the container's cgroup
-; filesystem remounted read-write where the runtime mounted it read-only.
-; Other containers keep container_t: this is not the host-wide
+; varek_container: the one SELinux rule VAREK's container needs (v1.32, D5
+; in docs/security/v1.32-containers.md), for Podman (or Docker) on RHEL,
+; Fedora and others with SELinux enforcing.
+;
+; The container runs as container_init_t, the distribution's own type for
+; containers that manage their control groups (Podman uses it for systemd
+; in a container): container_t, with cgroup_t directories and files
+; managed, as sub-agents and confined MCP servers need (v1.28.1, v1.31).
+; The runtime mounts the container's cgroup filesystem read-only, and the
+; Warden remounts it read-write (its own groups only: --cgroupns=private);
+; container_init_t may not remount it, which is the rule below. Other
+; containers keep container_t; this is not the host-wide
 ; container_manage_cgroup boolean.
 ;
-; On the host, as root (udica, from the distribution, carries the base type):
+; On the host, as root:
 ;
-;   dnf -y install udica
-;   semodule -i varek_container.cil /usr/share/udica/templates/base_container.cil
+;   semodule -i varek_container.cil
 ;
-; and run the container with --security-opt label=type:varek_container.process,
+; and run the container with --security-opt label=type:container_init_t,
 ; with the settings in packaging/container/README.md.
 
-(block varek_container
-    (blockinherit container)
-    ; the run's control group and each sub-agent's: made, moved into,
-    ; frozen, killed, removed
-    (allow process cgroup_t (dir (getattr search open read write add_name remove_name create rmdir)))
-    (allow process cgroup_t (file (getattr open read write append)))
-    ; the container's cgroup filesystem remounted read-write (its own groups
-    ; only: the cgroup namespace's)
-    (allow process cgroup_t (filesystem (getattr remount)))
-)
+(allow container_init_t cgroup_t (filesystem (remount)))

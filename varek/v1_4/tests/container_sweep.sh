@@ -15,9 +15,9 @@
 #                and run the containers under it rather than the runtime's
 #                default; with the mounts the suites make to set up their
 #                cases added, as MKNOD is (a copy, varek-container-test)
-# --selinux      load VAREK's SELinux module (packaging/container/selinux;
-#                udica's base type) and run the containers as its type,
-#                varek_container.process, rather than container_t
+# --selinux      load VAREK's SELinux module (packaging/container/selinux)
+#                and run the containers as container_init_t, rather than
+#                container_t
 # --security-opt OPT  passed to each container (diagnosis only: what the
 #                image documents is what the sweep shows)
 # --caps LIST    the capabilities added after --cap-drop ALL (default: the
@@ -84,10 +84,8 @@ if [ "$APPARMOR" = 1 ]; then
     SECOPTS+=(--security-opt apparmor=varek-container-test)
 fi
 if [ "$SELINUX" = 1 ]; then
-    UT=/usr/share/udica/templates/base_container.cil
-    [ -f "$UT" ] || { echo "container_sweep.sh: --selinux: udica's templates are not installed (dnf -y install udica)" >&2; exit 2; }
-    semodule -i "$ROOT/packaging/container/selinux/varek_container.cil" "$UT" || { echo "container_sweep.sh: --selinux: the module did not load" >&2; exit 1; }
-    SECOPTS+=(--security-opt label=type:varek_container.process)
+    semodule -i "$ROOT/packaging/container/selinux/varek_container.cil" || { echo "container_sweep.sh: --selinux: the module did not load" >&2; exit 1; }
+    SECOPTS+=(--security-opt label=type:container_init_t)
 fi
 {
     echo "host: $(uname -srm); $(. /etc/os-release && echo "$PRETTY_NAME")"
