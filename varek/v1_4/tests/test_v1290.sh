@@ -236,7 +236,9 @@ open('$OUT/gen/$prof.txt', 'w').write(b.generate('$OUT/gproj', pw, '/tmp/varek-6
 done
 # the cross-check on the largest one (the profiles add a few rules each; its
 # reachability queries over the baseline's globs take minutes, so 2 queries)
-if python3 "$HERE/tools/smt_crosscheck.py" --vdp "$VDP" --cert "$CERT" --queries 2 "$OUT/gen/claude.txt" > "$OUT/cc.out" 2>&1; then
+if ! python3 -c 'import z3' 2>/dev/null; then
+    skip "the cross-check on the claude baseline (pip install -r tools/requirements-crosscheck.txt)"
+elif python3 "$HERE/tools/smt_crosscheck.py" --vdp "$VDP" --cert "$CERT" --queries 2 "$OUT/gen/claude.txt" > "$OUT/cc.out" 2>&1; then
     pass "the cross-check: the three parsers agree on the claude baseline"
 else flunk "the cross-check: the three parsers agree on the claude baseline ($(tail -1 "$OUT/cc.out"))"; fi
 # v1.29 step 6: but for the certificate authorities' bundles (read-only), which a key pattern (*.pem) would refuse
