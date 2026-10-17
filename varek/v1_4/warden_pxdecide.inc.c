@@ -109,6 +109,12 @@ struct px_open {
     bool     cut;                        /* a body passed max_body */
     uint64_t cred_seq;                   /* v1.28: the last allowed request that carries a credential */
     uint32_t cred;                       /* its credential (1 + index) */
+    /* v1.31: a POST to an MCP endpoint whose call (WP_MSG_MCPREQ) is
+     * awaited (0: none), the endpoint's URL, and the most of its body the
+     * proxy reads */
+    uint64_t mcp_seq;
+    char     mcp_url[VDP_STR_MAX + 1];
+    uint64_t mcp_limit;
 };
 static struct px_open *g_px_open;
 static size_t g_px_nopen, g_px_capopen;
@@ -168,6 +174,9 @@ static void px_close_record(uint64_t id, const char *why, const struct wp_close 
     rec_end(NULL);
 }
 
+struct policy;
+static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m);
+
 /* A close report: 0, or -1 (not a connection passed to the proxy and still
  * open, or a malformed report: the proxy is not behaving). */
 static int px_closed(const struct wp_close *m) {
@@ -196,6 +205,18 @@ static int px_closed(const struct wp_close *m) {
                 /* review: and every allowed body was reported before it */
                 g_px_open[k].body_seq)
                 return -1;
+            if (g_px_open[k].mcp_seq && g_syn_p) {
+                /* v1.31: an MCP call the connection ended (or timed out)
+                 * before the proxy could report: recorded, refused */
+                static struct wp_mcpreq r;
+                memset(&r, 0, sizeof r);
+                r.type = WP_MSG_MCPREQ;
+                r.ok = WP_MCP_UNREADABLE;
+                r.id = m->id;
+                r.seq = g_px_open[k].mcp_seq;
+                snprintf(r.why, sizeof r.why, "the connection ended before the call was read");
+                (void)px_mcpreq(g_syn_p, &r);
+            }
             g_px_open[k] = g_px_open[--g_px_nopen];
             px_close_record(m->id, m->why, m);
             return 0;
@@ -639,10 +660,49 @@ static bool px_target_ok(const char *t) {
     }
 }
 
+/* v1.31 (docs/security/v1.31-standards.md, section 3): a URL any mcp rule
+ * names (whatever its subject) is an MCP endpoint, and every POST to it is
+ * decided by mcp rules only. The most of its body the proxy reads: the
+ * largest max_body of those rules (MCP_BODY_DEFAULT for a rule without one).
+ * An mcp rule's glob is <canonical URL>#<METHOD>#<NAME>, and the URL holds no
+ * '#' or '*'. */
+#define MCP_BODY_DEFAULT (1u << 20)
+static bool px_mcp_endpoint(const struct policy *p, const char *url, uint64_t *limit) {
+    size_t ul = strlen(url);
+    bool any = false;
+    *limit = 0;
+    for (size_t k = 0; k < p->v.n; k++) {
+        const vdp_rule_t *r = &p->v.rules[k];
+        if (r->kind != VDP_KIND_MCP || strncmp(r->s.c, url, ul) || r->s.c[ul] != '#') continue;
+        uint64_t l = r->max_body ? r->max_body : MCP_BODY_DEFAULT;
+        if (l > *limit) *limit = l;
+        any = true;
+    }
+    return any;
+}
+
+/* review: a URL that is an MCP endpoint's but for ASCII case or a trailing
+ * '/' (a server's router may take it for the endpoint): a POST to it is
+ * refused (mcp_endpoint_variant), not decided as an ordinary request */
+static bool px_mcp_variant(const struct policy *p, const char *url) {
+    size_t ul = strlen(url);
+    if (ul && url[ul - 1] == '/') ul--;
+    for (size_t k = 0; k < p->v.n; k++) {
+        const vdp_rule_t *r = &p->v.rules[k];
+        if (r->kind != VDP_KIND_MCP) continue;
+        const char *hash = strchr(r->s.c, '#');
+        size_t el = hash ? (size_t)(hash - r->s.c) : strlen(r->s.c);
+        if (el && r->s.c[el - 1] == '/') el--;
+        if (el == ul && !strncasecmp(r->s.c, url, ul)) return true;
+    }
+    return false;
+}
+
 static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     struct px_open *o = NULL;
     for (size_t k = 0; k < g_px_nopen; k++) if (g_px_open[k].id == m->id) o = &g_px_open[k];
-    if (!o || !o->inspect || o->refused || o->cut || o->body_seq || m->seq != o->next_seq || m->body > WP_BODY_CHUNKED ||
+    if (!o || !o->inspect || o->refused || o->cut || o->body_seq || o->mcp_seq || m->seq != o->next_seq ||
+        m->body > WP_BODY_CHUNKED ||
         !memchr(m->object, 0, sizeof m->object))
         return -1;
     /* the object: METHOD scheme://name:port/..., the method 1 to 20 letters,
@@ -657,6 +717,34 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     for (size_t i = ml + 1; i < ol; i++) if ((unsigned char)ob[i] < 0x21 || (unsigned char)ob[i] > 0x7e) return -1;
     if (!px_target_ok(ob + ml + pl - 1)) return -1;      /* review: a form the proxy must refuse */
     o->next_seq++;
+    /* v1.31: a POST to an MCP endpoint: its body is read first, and the call
+     * it makes decided (px_mcpreq); one with a query is refused (an endpoint
+     * is a URL without one, and a server could act on it) */
+    uint64_t mcp_limit = 0;
+    bool mcp_ep = false, mcp_var = false;
+    if (ml == 4 && !memcmp(ob, "POST", 4)) {
+        char url[VDP_STR_MAX + 1];
+        snprintf(url, sizeof url, "%s", ob + 5);
+        char *qm = strchr(url, '?');
+        if (qm) *qm = '\0';
+        mcp_ep = px_mcp_endpoint(p, url, &mcp_limit);
+        mcp_var = !mcp_ep && px_mcp_variant(p, url);
+        if (mcp_ep && !qm) {
+            struct wp_reqverdict v;
+            memset(&v, 0, sizeof v);
+            v.type = WP_MSG_REQVERDICT;
+            v.allow = 1;
+            v.mcp = 1;
+            v.id = m->id;
+            v.seq = m->seq;
+            v.max_body = mcp_limit;
+            o->mcp_seq = m->seq;
+            o->mcp_limit = mcp_limit;
+            snprintf(o->mcp_url, sizeof o->mcp_url, "%s", url);
+            (void)send(g_proxy.ctl, &v, sizeof v, MSG_DONTWAIT | MSG_NOSIGNAL);
+            return 0;
+        }
+    }
     struct action *a = calloc(1, sizeof *a);
     if (!a) return -1;
     struct timespec t0, t1;
@@ -666,9 +754,10 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     a->subject = px_subject(m->id);
     memcpy(a->target, ob, ol + 1);
     memcpy(a->resolved, ob, ol + 1);
-    decision_t d_raw = policy_decide(p, a);
+    decision_t d_raw = mcp_ep || mcp_var ? DEC_DENY : policy_decide(p, a);
     decision_t d_final = d_raw == DEC_ALLOW ? DEC_ALLOW : DEC_DENY;
-    const char *rule = d_raw == DEC_ALLOW ? "request_allowed" : decision_rule_id(a, d_raw);
+    const char *rule = mcp_ep ? "mcp_query" : mcp_var ? "mcp_endpoint_variant"
+                     : d_raw == DEC_ALLOW ? "request_allowed" : decision_rule_id(a, d_raw);
     uint64_t maxb = 0;
     char why[96];
     if (d_final == DEC_ALLOW && !certify(p, a)) {
@@ -692,6 +781,8 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
         snprintf(why, sizeof why, "its body is over max_body=%llu (policy line %d)", (unsigned long long)maxb,
                  a->policy_line);
     else if (!strcmp(rule, "revoked")) snprintf(why, sizeof why, "the run was revoked (varek revoke)");
+    else if (mcp_ep) snprintf(why, sizeof why, "an MCP endpoint takes no query");
+    else if (mcp_var) snprintf(why, sizeof why, "another spelling of an MCP endpoint (its case or a trailing /)");
     else if (d_raw == DEC_DENY) snprintf(why, sizeof why, "the policy denies it (line %d)", a->policy_line);
     else snprintf(why, sizeof why, "no request rule allows it");
     static const char *const kBody[] = { "none", "length", "chunked" };
@@ -741,6 +832,250 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
             o->body_declared = m->body_len;
         }
     } else o->refused = true;
+    (void)send(g_proxy.ctl, &v, sizeof v, MSG_DONTWAIT | MSG_NOSIGNAL);
+    return 0;
+}
+
+/* v1.31: s (UTF-8, as mcp_json.c read it) as the inside of a JSON string,
+ * ASCII only (each other character a \uXXXX escape, a surrogate pair past
+ * U+FFFF), at most cap - 1 bytes: a character whose escape would not fit
+ * ends it, and *cut is set. A malformed sequence is written as U+FFFD. The
+ * result is in a static buffer, good until the next call. */
+static const char *px_json_str(const char *s, size_t cap, bool *cut) {
+    static char out[1024];
+    if (cap > sizeof out) cap = sizeof out;
+    size_t w = 0;
+    const unsigned char *u = (const unsigned char *)s;
+    while (*u) {
+        char e[16];
+        unsigned cp = *u;
+        size_t used = 1;
+        if (cp >= 0x80) {
+            size_t need = cp >= 0xf0 && cp < 0xf5 ? 4 : cp >= 0xe0 && cp < 0xf0 ? 3 : cp >= 0xc2 && cp < 0xe0 ? 2 : 0;
+            cp = need == 4 ? cp & 7 : need == 3 ? cp & 15 : cp & 31;
+            for (size_t k = 1; k < need; k++) {
+                if ((u[k] & 0xc0) != 0x80) { need = 0; break; }
+                cp = cp << 6 | (u[k] & 0x3f);
+            }
+            if (!need || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) cp = 0xfffd;
+            else used = need;
+        }
+        int el;
+        if (cp == '"' || cp == '\\') el = snprintf(e, sizeof e, "\\%c", (char)cp);
+        else if (cp >= 0x20 && cp < 0x7f) el = snprintf(e, sizeof e, "%c", (char)cp);
+        else if (cp < 0x10000) el = snprintf(e, sizeof e, "\\u%04x", cp);
+        else el = snprintf(e, sizeof e, "\\u%04x\\u%04x", 0xd800 + ((cp - 0x10000) >> 10), 0xdc00 + ((cp - 0x10000) & 0x3ff));
+        if (w + (size_t)el >= cap) { *cut = true; break; }
+        memcpy(out + w, e, (size_t)el);
+        w += (size_t)el;
+        u += used;
+    }
+    out[w] = '\0';
+    return out;
+}
+
+/* v1.31 (docs/security/v1.31-standards.md, section 3): the MCP call a POST
+ * to an MCP endpoint makes, read by the proxy from its body. Decided on its
+ * object (vdp_mcp_object) by the calling subject's mcp rules, certified,
+ * recorded (net.mcp), and answered. A call the proxy could not read, whose
+ * headers disagree with its body, or whose body is over the limit is
+ * refused. 0, or -1 (a report the proxy should not have sent: the run
+ * stops). */
+/* v1.31 step 5 (D6): the bearer token the agent sends on an MCP call, as
+ * the proxy read it (its claims unverified: they can only refuse). The
+ * rule that refuses it, or NULL (a placeholder is the swap's; an opaque
+ * token is decided by the rules alone). */
+static const char *px_token_refused(const struct px_open *o, const struct wp_mcpreq *m, char *why, size_t wn) {
+    if (m->token == WP_TOK_NONE || m->token == WP_TOK_PLACEHOLDER) return NULL;
+    if (g_identity.has_user) {                /* a copy of the run's user token would be passthrough */
+        char hx[65];
+        sodium_bin2hex(hx, sizeof hx, m->token_sha256, sizeof m->token_sha256);
+        char sx[65] = "";
+        if (m->token == WP_TOK_JWT)           /* review: or the same claims, signed again (ECDSA's other s) */
+            sodium_bin2hex(sx, sizeof sx, m->token_sin_sha256, sizeof m->token_sin_sha256);
+        if (!strcmp(hx, g_identity.token_sha256) || (sx[0] && !strcmp(sx, g_identity.token_sin_sha256))) {
+            snprintf(why, wn, "its bearer token is the run's user token, which no call may pass on");
+            return "mcp_token_user";
+        }
+    }
+    if (m->token == WP_TOK_MALFORMED) {
+        snprintf(why, wn, "its bearer token is not a readable JWT: %.50s", m->token_why);
+        return "mcp_token_malformed";
+    }
+    if (m->token != WP_TOK_JWT) return NULL;
+    bool named = false;
+    for (uint32_t k = 0; k < m->naud && !named; k++) named = mcp_aud_names(o->mcp_url, m->aud[k]);
+    if (!named) {
+        snprintf(why, wn, "its bearer token is not for this server (its audience does not name it)");
+        return "mcp_token_audience";
+    }
+    if (m->has_exp && m->exp <= (int64_t)time(NULL)) {
+        snprintf(why, wn, "its bearer token has expired");
+        return "mcp_token_expired";
+    }
+    return NULL;
+}
+
+static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
+    struct px_open *o = NULL;
+    for (size_t k = 0; k < g_px_nopen; k++) if (g_px_open[k].id == m->id) o = &g_px_open[k];
+    if (!o || !o->mcp_seq || m->seq != o->mcp_seq || m->ok > WP_MCP_OVER || m->has_name > 1 || m->notification > 1 ||
+        !memchr(m->why, 0, sizeof m->why) || !memchr(m->method, 0, sizeof m->method) ||
+        !memchr(m->name, 0, sizeof m->name) || !memchr(m->rpc_id, 0, sizeof m->rpc_id) ||
+        !memchr(m->traceparent, 0, sizeof m->traceparent) || !memchr(m->proto, 0, sizeof m->proto) ||
+        (m->ok == WP_MCP_OK && m->body_len > o->mcp_limit) ||
+        /* step 5: the token's report */
+        m->token > WP_TOK_MALFORMED || m->naud > WP_AUD_MAX || m->aud_over > 1 || m->has_exp > 1 ||
+        !memchr(m->token_why, 0, sizeof m->token_why) || (m->token != WP_TOK_JWT && (m->naud || m->has_exp)))
+        return -1;
+    for (uint32_t k = 0; k < WP_AUD_MAX; k++) if (!memchr(m->aud[k], 0, sizeof m->aud[k])) return -1;
+    o->mcp_seq = 0;
+    struct action *a = calloc(1, sizeof *a);
+    if (!a) return -1;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    a->kind = ACT_NET_MCP;
+    a->policy_line = -1;
+    a->subject = px_subject(m->id);
+    /* the target: what was asked for (a name that is not printable ASCII,
+     * or does not fit, is cut short); resolved: the object decided, or ""
+     * (outside the fragment: UNKNOWN, refused) */
+    const char *tp[5] = { o->mcp_url, "#", m->ok == WP_MCP_OK ? m->method : "", "#", m->ok == WP_MCP_OK ? m->name : "" };
+    size_t tw = 0;
+    for (int k = 0; k < 5; k++)
+        for (const char *c = tp[k]; *c && tw + 1 < sizeof a->target; c++) a->target[tw++] = *c;
+    a->target[tw] = '\0';
+    for (char *c = a->target; *c; c++) if ((unsigned char)*c < 0x20 || (unsigned char)*c > 0x7e) *c = '?';
+    if (m->ok != WP_MCP_OK || vdp_mcp_object(o->mcp_url, m->method, m->name, a->resolved, sizeof a->resolved) < 0)
+        a->resolved[0] = '\0';
+    decision_t d_raw, d_final;
+    const char *rule;
+    char why[96];
+    uint64_t maxb = 0;
+    for (char *c = m->why; *c; c++) if (*c < ' ' || *c > '~' || *c == '"' || *c == '\\') *c = '?';
+    const char *tok_rule = m->ok == WP_MCP_OK ? px_token_refused(o, m, why, sizeof why) : NULL;
+    if (m->ok != WP_MCP_OK) {
+        d_raw = d_final = DEC_DENY;
+        rule = m->ok == WP_MCP_HEADERS ? "mcp_header_mismatch" : m->ok == WP_MCP_OVER ? "max_body" : "mcp_unreadable";
+        snprintf(why, sizeof why, "%s", m->why[0] ? m->why : "the call could not be read");
+    } else if (tok_rule) {
+        d_raw = d_final = DEC_DENY;
+        rule = tok_rule;
+    } else {
+        d_raw = policy_decide(p, a);
+        d_final = d_raw == DEC_ALLOW ? DEC_ALLOW : DEC_DENY;
+        rule = d_raw == DEC_ALLOW ? "mcp_allowed" : decision_rule_id(a, d_raw);
+        if (d_final == DEC_ALLOW && !certify(p, a)) {
+            d_final = DEC_DENY;
+            rule = "certificate_refused";
+            log_line_start();
+            fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n", g_records, a->check_why);
+        }
+        if (d_final == DEC_ALLOW) {
+            maxb = p->v.rules[a->rule_index].max_body ? p->v.rules[a->rule_index].max_body : MCP_BODY_DEFAULT;
+            if (m->body_len > maxb) {
+                d_final = DEC_DENY;
+                rule = "max_body";
+            }
+        }
+        /* v1.31 step 5: an MCP token past its expiry is not released (the
+         * store is to hold a current one; VAREK does not refresh it, D8) */
+        int ce = d_final == DEC_ALLOW ? p->v.rules[a->rule_index].cred : 0;
+        if (ce > 0 && p->v.creds[ce - 1].audience[0] && g_cred_meta[ce - 1].exp > 0 &&
+            g_cred_meta[ce - 1].exp <= (int64_t)time(NULL)) {
+            d_final = DEC_DENY;
+            rule = "credential_expired";
+        }
+        if (d_final == DEC_ALLOW) snprintf(why, sizeof why, "allowed");
+        else if (!strcmp(rule, "max_body"))
+            snprintf(why, sizeof why, "its body is over max_body=%llu (policy line %d)", (unsigned long long)maxb,
+                     a->policy_line);
+        else if (!strcmp(rule, "revoked")) snprintf(why, sizeof why, "the run was revoked (varek revoke)");
+        else if (!strcmp(rule, "certificate_refused")) snprintf(why, sizeof why, "its certificate was refused");
+        else if (!strcmp(rule, "credential_expired"))
+            snprintf(why, sizeof why, "the MCP token its rule (line %d) names has expired", a->policy_line);
+        else if (d_raw == DEC_DENY) snprintf(why, sizeof why, "the policy denies it (line %d)", a->policy_line);
+        else snprintf(why, sizeof why, "no mcp rule allows it");
+    }
+    /* v1.29: a dry run relays a call the policy refuses (not one that could
+     * not be read), with no credential, as not enforced */
+    bool dry_allow = m->ok == WP_MCP_OK && d_final != DEC_ALLOW && dry_let(a, rule);
+    if (dry_allow) snprintf(why, sizeof why, "dry run");
+    char hx[65];
+    sodium_bin2hex(hx, sizeof hx, m->sha256, sizeof m->sha256);
+    size_t el;
+    bool cut = false;
+    snprintf(a->extra, sizeof a->extra, "\"proxy_conn\":%llu,\"request_seq\":%llu,\"mcp_url\":\"%s\",",
+             (unsigned long long)m->id, (unsigned long long)m->seq, px_json_str(o->mcp_url, 1024, &cut));
+    if (m->ok == WP_MCP_OK) {
+        el = strlen(a->extra);
+        snprintf(a->extra + el, sizeof a->extra - el, "\"mcp_method\":\"%s\",", px_json_str(m->method, 512, &cut));
+        if (m->has_name) {
+            el = strlen(a->extra);
+            snprintf(a->extra + el, sizeof a->extra - el, "\"mcp_name\":\"%s\",", px_json_str(m->name, 1024, &cut));
+        }
+        el = strlen(a->extra);
+        if (m->notification) snprintf(a->extra + el, sizeof a->extra - el, "\"notification\":true,");
+        else snprintf(a->extra + el, sizeof a->extra - el, "\"rpc_id\":\"%s\",", px_json_str(m->rpc_id, 512, &cut));
+        if (m->traceparent[0]) {
+            el = strlen(a->extra);
+            snprintf(a->extra + el, sizeof a->extra - el, "\"traceparent\":\"%s\",", px_json_str(m->traceparent, 128, &cut));
+        }
+    } else {
+        el = strlen(a->extra);
+        snprintf(a->extra + el, sizeof a->extra - el, "\"mcp_error\":\"%s\",", m->why);
+    }
+    if (m->token) {                                      /* step 5: what kind of token, never the token */
+        static const char *const kTok[] = { "", "placeholder", "jwt", "opaque", "malformed" };
+        el = strlen(a->extra);
+        snprintf(a->extra + el, sizeof a->extra - el, "\"token\":\"%s\",", kTok[m->token]);
+        if (m->has_exp) {
+            el = strlen(a->extra);
+            snprintf(a->extra + el, sizeof a->extra - el, "\"token_expires\":%lld,", (long long)m->exp);
+        }
+    }
+    if (m->proto[0]) {
+        el = strlen(a->extra);
+        snprintf(a->extra + el, sizeof a->extra - el, "\"protocol_version\":\"%s\",", px_json_str(m->proto, 128, &cut));
+    }
+    if (cut) {                                           /* a field was cut short (the object holds it whole) */
+        el = strlen(a->extra);
+        snprintf(a->extra + el, sizeof a->extra - el, "\"mcp_fields_cut\":true,");
+    }
+    el = strlen(a->extra);
+    snprintf(a->extra + el, sizeof a->extra - el, "\"body_len\":%llu,\"body_sha256\":\"%s\",",
+             (unsigned long long)m->body_len, hx);
+    if (d_final == DEC_ALLOW) {
+        el = strlen(a->extra);
+        snprintf(a->extra + el, sizeof a->extra - el, "\"max_body\":%llu,", (unsigned long long)maxb);
+    }
+    /* v1.28: the credential the allowing rule lets the call carry, and where */
+    const vdp_rule_t *cr = d_final == DEC_ALLOW && a->rule_index >= 0 ? &p->v.rules[a->rule_index] : NULL;
+    if (cr && !cr->cred) cr = NULL;
+    if (cr) {
+        el = strlen(a->extra);
+        snprintf(a->extra + el, sizeof a->extra - el, "\"credential\":\"%s\",\"credential_header\":\"%s\",",
+                 p->v.creds[cr->cred - 1].name, cr->cred_hdr);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    emit_pathology(g_report_seq++, 0, a, d_raw, d_final, rule, ns_between(&t0, &t1), d_final == DEC_ALLOW ? 0 : EACCES);
+    free(a);
+    struct wp_mcpverdict v;
+    memset(&v, 0, sizeof v);
+    v.type = WP_MSG_MCPVERDICT;
+    v.allow = d_final == DEC_ALLOW || dry_allow;
+    v.id = m->id;
+    v.seq = m->seq;
+    snprintf(v.why, sizeof v.why, "%s", why);
+    if (cr) {
+        v.cred = (uint32_t)cr->cred;
+        snprintf(v.hdr, sizeof v.hdr, "%s", cr->cred_hdr);
+        snprintf(v.scheme, sizeof v.scheme, "%s", cr->cred_scheme);
+        o->cred_seq = m->seq;
+        o->cred = v.cred;
+    }
+    if (v.allow) o->allowed = true;
+    else o->refused = true;
     (void)send(g_proxy.ctl, &v, sizeof v, MSG_DONTWAIT | MSG_NOSIGNAL);
     return 0;
 }
@@ -801,7 +1136,8 @@ static int px_credfail(const struct policy *p, struct wp_credfail *m) {
 static int proxy_service(const struct policy *p) {
     for (;;) {
         static union { struct wp_req r; struct wp_close c; struct wp_msg f; struct wp_httpreq hr;
-                       struct wp_httpbody hb; struct wp_credfail cf; struct wp_creds cr; uint32_t type; } u;
+                       struct wp_httpbody hb; struct wp_credfail cf; struct wp_creds cr;
+                       struct wp_mcpreq mr; uint32_t type; } u;
         ssize_t n = recv(g_proxy.ctl, &u, sizeof u, MSG_DONTWAIT);
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
         if (n <= 0) return -1;                                  /* the proxy is gone */
@@ -812,6 +1148,10 @@ static int proxy_service(const struct policy *p) {
         }
         if (n == (ssize_t)sizeof u.hb && u.type == WP_MSG_HTTPBODY) {
             if (px_httpbody(&u.hb) < 0) return -1;
+            continue;
+        }
+        if (n == (ssize_t)sizeof u.mr && u.type == WP_MSG_MCPREQ) {            /* v1.31 */
+            if (px_mcpreq(p, &u.mr) < 0) return -1;
             continue;
         }
         if (n == (ssize_t)sizeof u.cf && u.type == WP_MSG_CREDFAIL) {          /* v1.28 */

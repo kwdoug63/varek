@@ -150,6 +150,11 @@ struct vdpc_rule {
     int      cred;                    /* request (v1.28): 1 + credential index, 0: none */
     char     hdr[65], scheme[33];     /* request (v1.28): header=NAME[:SCHEME] */
     char     subagent[33];            /* exec (v1.28.1): subagent=NAME ("" : none) */
+    int      subj;                    /* v1.31: for=NAME: 1 + the subject's index; 0: the agent */
+    int      csubj;                   /* v1.31: the confined subject this rule launches, 0: none */
+    bool     confined;                /* v1.31: `confined` was given (registered by vdpc_load) */
+    bool     mcp_server;              /* v1.31: an `mcp server` line */
+    char     sha256[65];              /* v1.31: its sha256= */
 };
 
 void vdpc_free(vdpc_policy_t *p) {
@@ -608,8 +613,278 @@ static bool https_with_host(const char *u, size_t hi) {
     return printable(u, 9, hi) && !strncmp(u, "https://", 8) && u[8] != '/' && u[8] != '?' && u[8] != '#';
 }
 
+/* v1.31: an MCP server's URL in canonical form, "scheme://host:port/path"
+ * (vdp_checker.h; smt_decide.h's vdp_mcp_url has the same form, written
+ * separately). 0, or -1. host (254 bytes) and *port are set when given. */
+static int mcp_canon(const char *u, int https_only, char *out, size_t outn, char *host, unsigned *port) {
+    size_t skip;
+    unsigned pt;
+    const char *sch;
+    if (!strncmp(u, "https://", 8)) { skip = 8; pt = 443; sch = "https"; }
+    else if (!https_only && !strncmp(u, "http://", 7)) { skip = 7; pt = 80; sch = "http"; }
+    else return -1;
+    const char *a = u + skip;
+    size_t al = 0;
+    while (a[al] && a[al] != '/') al++;
+    size_t hl = 0;
+    while (hl < al && a[hl] != ':') hl++;
+    if (hl < al) {
+        size_t dl = al - hl - 1;
+        unsigned long x = 0;
+        if (dl < 1 || dl > 5 || a[hl + 1] == '0') return -1;
+        for (size_t i = hl + 1; i < al; i++) {
+            if (a[i] < '0' || a[i] > '9') return -1;
+            x = x * 10 + (unsigned long)(a[i] - '0');
+        }
+        if (x < 1 || x > 65535) return -1;
+        pt = (unsigned)x;
+    }
+    if (hl < 1 || hl > 253) return -1;
+    for (size_t i = 0; i < hl; i++) if (a[i] == '@' || a[i] == '*') return -1;
+    const char *why = "";
+    if (host_name_form(a, hl, &why) != 1) return -1;
+    const char *path = a[al] ? a + al : "/";
+    size_t pl = strlen(path);
+    /* segments: none empty but the last, none "." or ".." */
+    size_t st = 1;
+    for (size_t i = 1; i <= pl; i++) {
+        if (i < pl && path[i] != '/') continue;
+        size_t n = i - st;
+        if (n == 0 && i < pl) return -1;
+        if ((n == 1 && path[st] == '.') || (n == 2 && path[st] == '.' && path[st + 1] == '.')) return -1;
+        st = i + 1;
+    }
+    for (size_t i = 0; i < pl; i++) {
+        unsigned char b = (unsigned char)path[i];
+        if (b <= 0x20 || b >= 0x7f) return -1;
+        if (b == '\\' || b == ';' || b == '#' || b == '?' || b == '*' || b == '[' || b == ']') return -1;
+        if (b == '%') {
+            if (i + 2 >= pl) return -1;
+            int d1 = hexd(path[i + 1]), d2 = hexd(path[i + 2]);
+            if (d1 < 0 || d2 < 0) return -1;
+            unsigned v = (unsigned)(d1 * 16 + d2);
+            if (v == '/' || v == '\\' || (v >= '0' && v <= '9') || (v >= 'A' && v <= 'Z') || (v >= 'a' && v <= 'z') ||
+                v == '-' || v == '.' || v == '_' || v == '~')
+                return -1;
+        }
+    }
+    int n = snprintf(out, outn, "%s://%.*s:%u%s", sch, (int)hl, a, pt, path);
+    if (n < 0 || (size_t)n >= outn) return -1;
+    if (host) { memcpy(host, a, hl); host[hl] = '\0'; }
+    if (port) *port = pt;
+    return 0;
+}
+
+/* v1.31: an MCP method (with '*' when glob) */
+static bool mcp_method(const char *m, bool glob) {
+    size_t ml = strlen(m);
+    if (ml < 1 || ml > 128) return false;
+    for (size_t i = 0; i < ml; i++) {
+        char c = m[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '_' || c == '.' || c == '/' || c == '-' || (glob && c == '*');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/* v1.31: a shell, an interpreter, the loader or a launcher, by basename (the
+ * list smt_decide.c keeps, written here again) */
+static bool runs_others(const char *path) {
+    static const char *const kAny[] = {
+        "sh", "bash", "dash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "ash", "busybox",
+        "python", "python2", "python3", "pypy", "pypy3", "perl", "ruby", "node", "nodejs",
+        "deno", "bun", "php", "lua", "luajit", "tclsh", "wish", "pwsh", "Rscript", "R",
+        "julia", "guile", "awk", "gawk", "mawk", "nawk", "java", "jshell", "osascript",
+        "rbash", "toybox", "ipython", "ipython3", "gdb", "expect", NULL
+    };
+    static const char *const kLaunchers[] = {
+        "npx", "npm", "pnpm", "pnpx", "yarn", "bunx", "corepack", "uvx", "uv", "pipx", "pip", "pip3",
+        "docker", "podman", "nerdctl", "ctr", "env", "sudo", "doas", "su", "nix", "nix-shell",
+        "flatpak", "snap", "xargs", "nohup", "setsid", "timeout", "stdbuf", "nice", "ionice",
+        "chroot", "unshare", "nsenter", "systemd-run", "runuser", "sg",
+        /* v1.31 review */
+        "time", "taskset", "setpriv", "strace", "ltrace", "flock", "bwrap", "firejail", "chrt", "prlimit",
+        "script", "watch", "xvfb-run", "start-stop-daemon", "tsx", "ts-node", "valgrind", "numactl",
+        "torsocks", "proxychains", "proxychains4", NULL
+    };
+    const char *b = strrchr(path, '/');
+    b = b ? b + 1 : path;
+    for (size_t i = 0; kLaunchers[i]; i++) if (!strcmp(b, kLaunchers[i])) return true;
+    if (!strncmp(b, "ld-linux", 8) || !strncmp(b, "ld-musl", 7) || !strcmp(b, "ld.so")) return true;
+    if (!strncmp(b, "ld-", 3) && b[3] >= '0' && b[3] <= '9' && strstr(b, ".so")) return true;
+    for (size_t i = 0; kAny[i]; i++) {
+        size_t k = strlen(kAny[i]);
+        if (strncmp(b, kAny[i], k)) continue;
+        const char *t = b + k;
+        while (*t && ((*t >= '0' && *t <= '9') || *t == '.')) t++;
+        if (!*t) return true;
+    }
+    return false;
+}
+
+/* v1.31: 1 + the index of the confined subject named n, or 0 */
+static int subj_named(const vdpc_policy_t *p, const char *n) {
+    for (size_t k = 0; k < p->nsubjects; k++)
+        if (!strcmp(p->subjects[k].name, n)) return (int)k + 1;
+    return 0;
+}
+
+/* v1.31: register rule i's sub-agent as a confined subject */
+static int subj_register(vdpc_policy_t *p, size_t i, bool mcp, char *err, size_t en, const char *name, int ln) {
+    vdpc_rule_t *r = &p->rules[i];
+    if (subj_named(p, r->subagent)) return fail(err, en, name, ln, "a confined subject declared twice");
+    for (size_t j = 0; j < i; j++)
+        if (p->rules[j].subagent[0] && !p->rules[j].csubj && !strcmp(p->rules[j].subagent, r->subagent))
+            return fail(err, en, name, ln, "a confined name already used by an unconfined sub-agent");
+    if (p->nsubjects == 32) return fail(err, en, name, ln, "more than 32 confined subjects");
+    vdpc_subject_t *sj = &p->subjects[p->nsubjects++];
+    memcpy(sj->name, r->subagent, strlen(r->subagent) + 1);
+    sj->rule = (int)i;
+    sj->mcp = mcp;
+    sj->line = ln;
+    r->csubj = (int)p->nsubjects;
+    return 0;
+}
+
+/* v1.31: mcp server NAME exec PATH [sha256=HEX], held as an allow exec rule */
+static int parse_mcp_server(const char *name, int ln, char **tok, int nt, int req_maj, int req_min,
+                            vdpc_rule_t *r, char *err, size_t en) {
+    memset(r, 0, sizeof *r);
+    r->line = ln;
+    if (!ver_ge(req_maj, req_min, 1, 31)) return fail(err, en, name, ln, "mcp server before 1.31");
+    if (!((nt == 5 || nt == 6) && !strcmp(tok[1], "server") && !strcmp(tok[3], "exec")))
+        return fail(err, en, name, ln, "bad mcp server directive");
+    if (!short_name(tok[2])) return fail(err, en, name, ln, "bad server name");
+    if (!printable(tok[4], 2, 1024) || !clean_abs_path(tok[4])) return fail(err, en, name, ln, "bad server path");
+    if (runs_others(tok[4])) return fail(err, en, name, ln, "a server's file is an interpreter or a launcher");
+    if (nt == 6) {
+        if (strncmp(tok[5], "sha256=", 7) || strlen(tok[5]) != 71) return fail(err, en, name, ln, "bad sha256");
+        for (const char *q = tok[5] + 7; *q; q++)
+            if (!((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f'))) return fail(err, en, name, ln, "bad sha256");
+        memcpy(r->sha256, tok[5] + 7, 65);
+    }
+    size_t cl = strlen(tok[4]);
+    r->c = malloc(cl + 1);
+    if (!r->c) return fail(err, en, name, ln, "out of memory");
+    memcpy(r->c, tok[4], cl + 1);
+    r->clen = cl;
+    r->allow = true;
+    r->kind = VDPC_EXEC;
+    r->match = M_EXACT;
+    memcpy(r->subagent, tok[2], strlen(tok[2]) + 1);
+    r->mcp_server = true;
+    return 0;
+}
+
+/* v1.31: <verb> mcp URL METHOD [NAME] [max_body=N] [credential=C [header=H[:S]]] [for=NAME] */
+static int parse_mcp_rule(const char *name, int ln, char **tok, int nt, int req_maj, int req_min,
+                          size_t *glob_total, vdpc_rule_t *r, char *err, size_t en, const vdpc_policy_t *pol) {
+    if (!ver_ge(req_maj, req_min, 1, 31)) return fail(err, en, name, ln, "mcp rule before 1.31");
+    if (nt < 4) return fail(err, en, name, ln, "bad mcp rule");
+    char cu[4200];
+    if (mcp_canon(tok[2], 0, cu, sizeof cu, r->rhost, &r->rport) < 0) return fail(err, en, name, ln, "bad MCP URL");
+    if (!mcp_method(tok[3], true)) return fail(err, en, name, ln, "bad MCP method");
+    int k = 4;
+    const char *nm = "**";
+    if (nt > 4 && strncmp(tok[4], "max_body=", 9) && strncmp(tok[4], "credential=", 11) &&
+        strncmp(tok[4], "header=", 7) && strncmp(tok[4], "for=", 4)) {
+        if (!printable(tok[4], 1, 4095) || strchr(tok[4], '#')) return fail(err, en, name, ln, "bad MCP name");
+        nm = tok[4];
+        k = 5;
+    }
+    size_t gl = strlen(cu) + 1 + strlen(tok[3]) + 1 + strlen(nm);
+    if (gl > VDPC_MAX_S) return fail(err, en, name, ln, "mcp object over the bound");
+    r->c = malloc(gl + 1);
+    if (!r->c) return fail(err, en, name, ln, "out of memory");
+    snprintf(r->c, gl + 1, "%s#%s#%s", cu, tok[3], nm);
+    r->clen = gl;
+    r->match = M_GLOB;
+    const char *ge = parse_glob(r->c, r->clen, &r->g, &r->ng);
+    if (ge) return fail(err, en, name, ln, "%s", ge);
+    *glob_total += r->ng;
+    if (*glob_total > VDPC_GLOB_MAX_TOTAL) return fail(err, en, name, ln, "glob tokens over the policy total");
+    r->fixed = true;
+    for (size_t q = 0; q < r->ng; q++) {
+        if (r->g[q].type == G_LIT || r->g[q].type == G_SET) r->minlen++;
+        else r->fixed = false;
+    }
+    while (r->npre < r->ng && r->g[r->npre].type == G_LIT) r->npre++;
+    while (r->nsuf < r->ng && r->g[r->ng - 1 - r->nsuf].type == G_LIT) r->nsuf++;
+    bool hdr = false;
+    for (; k < nt; k++) {
+        const char *t = tok[k];
+        if (!strncmp(t, "for=", 4)) {
+            if (r->subj) return fail(err, en, name, ln, "for= given twice");
+            if (!(r->subj = subj_named(pol, t + 4))) return fail(err, en, name, ln, "for= names no confined subject");
+            continue;
+        }
+        if (!r->allow) return fail(err, en, name, ln, "an option on a deny mcp rule");
+        if (!strncmp(t, "credential=", 11)) {
+            if (r->cred) return fail(err, en, name, ln, "credential given twice");
+            for (size_t q = 0; q < pol->ncreds && !r->cred; q++)
+                if (!strcmp(pol->creds[q].name, t + 11)) r->cred = (int)q + 1;
+            if (!r->cred) return fail(err, en, name, ln, "unknown credential");
+        } else if (!strncmp(t, "header=", 7)) {
+            if (hdr) return fail(err, en, name, ln, "header given twice");
+            const char *v = t + 7, *colon = strchr(v, ':');
+            size_t hn = colon ? (size_t)(colon - v) : strlen(v);
+            if (!all_tchar(v, hn, 64) || (colon && !all_tchar(colon + 1, strlen(colon + 1), 32)))
+                return fail(err, en, name, ln, "bad header");
+            memcpy(r->hdr, v, hn);
+            r->hdr[hn] = '\0';
+            if (colon) memcpy(r->scheme, colon + 1, strlen(colon + 1) + 1);
+            if (framing_header(r->hdr)) return fail(err, en, name, ln, "a framing header");
+            hdr = true;
+        } else if (!strncmp(t, "max_body=", 9)) {
+            if (r->max_body) return fail(err, en, name, ln, "max_body given twice");
+            const char *d = t + 9;
+            size_t dl = strlen(d);
+            unsigned long long mul = 1, x = 0;
+            if (dl > 0 && d[dl - 1] == 'k') { mul = 1024; dl--; }
+            else if (dl > 0 && d[dl - 1] == 'm') { mul = 1024 * 1024; dl--; }
+            if (dl < 1 || dl > 7 || d[0] == '0') return fail(err, en, name, ln, "bad max_body");
+            for (size_t q = 0; q < dl; q++) {
+                if (d[q] < '0' || d[q] > '9') return fail(err, en, name, ln, "bad max_body");
+                x = x * 10 + (unsigned long long)(d[q] - '0');
+            }
+            x *= mul;
+            if (x > 1073741824ULL) return fail(err, en, name, ln, "bad max_body");
+            r->max_body = (uint32_t)x;
+        } else return fail(err, en, name, ln, "unknown mcp rule option");
+    }
+    if (hdr && !r->cred) return fail(err, en, name, ln, "header without credential");
+    if (r->cred) {
+        const vdpc_cred_t *cr = &pol->creds[r->cred - 1];
+        if (strncmp(cu, "https://", 8)) return fail(err, en, name, ln, "credential on http");
+        if (!hdr) { memcpy(r->hdr, "Authorization", 14); memcpy(r->scheme, "Bearer", 7); }
+        if (cr->audience[0] && strcmp(cr->audience, cu)) return fail(err, en, name, ln, "a token for another server");
+        if (cr->audience[0] && (strcasecmp(r->hdr, "authorization") || strcasecmp(r->scheme, "bearer")))
+            return fail(err, en, name, ln, "an MCP access token outside Authorization: Bearer");
+    }
+    return 0;
+}
+
 /* v1.28.1: trust issuer URL audience AUD [jwks URL] | trust spiffe DOMAIN bundle PATH */
-static int parse_trust(const char *name, int ln, char **tok, int nt, vdpc_policy_t *p, char *err, size_t en) {
+static int parse_trust(const char *name, int ln, char **tok, int nt, vdpc_policy_t *p, char *err, size_t en,
+                       int req_maj, int req_min) {
+    if (nt >= 2 && !strcmp(tok[1], "mcp-resource")) {        /* v1.31 */
+        if (!ver_ge(req_maj, req_min, 1, 31)) return fail(err, en, name, ln, "mcp-resource before 1.31");
+        if (!(nt == 3 || (nt == 5 && !strcmp(tok[3], "audience"))))
+            return fail(err, en, name, ln, "bad trust mcp-resource directive");
+        char cu[4200];
+        if (strlen(tok[2]) > 255 || mcp_canon(tok[2], 1, cu, sizeof cu, NULL, NULL) < 0)
+            return fail(err, en, name, ln, "bad MCP resource URL");
+        if (nt == 5 && !printable(tok[4], 1, 255)) return fail(err, en, name, ln, "bad audience");
+        for (size_t k = 0; k < p->nmcpres; k++)
+            if (!strcmp(p->mcpres[k].url, tok[2])) return fail(err, en, name, ln, "MCP resource trusted twice");
+        if (p->nmcpres == 8) return fail(err, en, name, ln, "more than 8 MCP resources");
+        vdpc_mcpres_t *m = &p->mcpres[p->nmcpres++];
+        memcpy(m->url, tok[2], strlen(tok[2]) + 1);
+        if (nt == 5) memcpy(m->aud, tok[4], strlen(tok[4]) + 1);
+        m->line = ln;
+        return 0;
+    }
     if (nt >= 2 && !strcmp(tok[1], "issuer")) {
         if (!((nt == 5 || nt == 7) && !strcmp(tok[3], "audience") && (nt == 5 || !strcmp(tok[5], "jwks"))))
             return fail(err, en, name, ln, "bad trust issuer directive");
@@ -649,8 +924,19 @@ static int parse_trust(const char *name, int ln, char **tok, int nt, vdpc_policy
 
 /* v1.28: credential NAME from STORE:REF; 0, or -1 (the reason in err) */
 static int parse_credential(const char *name, int ln, char **tok, int nt, vdpc_policy_t *p,
-                            char *err, size_t en) {
-    if (nt != 4 || strcmp(tok[2], "from")) return fail(err, en, name, ln, "bad credential directive");
+                            char *err, size_t en, int req_maj, int req_min) {
+    if (nt < 4 || nt > 6 || strcmp(tok[2], "from")) return fail(err, en, name, ln, "bad credential directive");
+    /* v1.31: audience=URL [opaque] */
+    char aud[4200] = "";
+    if (nt >= 5) {
+        if (!ver_ge(req_maj, req_min, 1, 31)) return fail(err, en, name, ln, "audience before 1.31");
+        if (strncmp(tok[4], "audience=", 9) || (nt == 6 && strcmp(tok[5], "opaque")))
+            return fail(err, en, name, ln, "bad credential directive");
+        if (mcp_canon(tok[4] + 9, 1, aud, sizeof aud, NULL, NULL) < 0)
+            return fail(err, en, name, ln, "bad audience URL");
+        if (strlen(aud) >= sizeof p->creds[0].audience)      /* v1.31 review: as the decision procedure */
+            return fail(err, en, name, ln, "an MCP server's URL is too long");
+    }
     const char *n = tok[1];
     size_t nl = strlen(n);
     bool ok = nl >= 1 && nl <= 32 && n[0] >= 'a' && n[0] <= 'z';
@@ -703,6 +989,8 @@ static int parse_credential(const char *name, int ln, char **tok, int nt, vdpc_p
     memcpy(c->ref, r, rl + 1);
     c->store = store;
     c->line = ln;
+    memcpy(c->audience, aud, strlen(aud) + 1);
+    c->opaque = nt == 6;
     return 0;
 }
 
@@ -717,7 +1005,11 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
     else if (!strcmp(tok[1], "host")) { r->kind = VDPC_HOST; r->match = M_HOST; }
     else if (!strcmp(tok[1], "exec")) { r->kind = VDPC_EXEC; r->match = M_EXACT; }
     else if (!strcmp(tok[1], "request")) r->kind = VDPC_REQUEST;      /* v1.26.1 */
+    else if (!strcmp(tok[1], "mcp")) r->kind = VDPC_MCP;              /* v1.31 */
     else return fail(err, en, name, ln, "unknown kind");
+
+    if (r->kind == VDPC_MCP)
+        return parse_mcp_rule(name, ln, tok, nt, req_maj, req_min, glob_total, r, err, en, pol);
 
     if (r->kind == VDPC_REQUEST) {
         /* v1.26.1: <verb> request METHOD URL [max_body=N] */
@@ -743,6 +1035,12 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
         bool hdr = false;
         for (int k = 4; k < nt; k++) {
             const char *t = tok[k];
+            if (!strncmp(t, "for=", 4)) {                         /* v1.31 */
+                if (!ver_ge(req_maj, req_min, 1, 31)) return fail(err, en, name, ln, "for= before 1.31");
+                if (r->subj) return fail(err, en, name, ln, "for= given twice");
+                if (!(r->subj = subj_named(pol, t + 4))) return fail(err, en, name, ln, "for= names no confined subject");
+                continue;
+            }
             /* v1.28: credential=NAME, header=NAME[:SCHEME], on allow rules after 1.28 */
             if (!strncmp(t, "credential=", 11) || !strncmp(t, "header=", 7)) {
                 if (!ver_ge(req_maj, req_min, 1, 28)) return fail(err, en, name, ln, "credential option before 1.28");
@@ -784,6 +1082,8 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
             r->max_body = (uint32_t)x;
         }
         if ((r->cred != 0) != hdr) return fail(err, en, name, ln, "credential and header go together");
+        if (r->cred && pol->creds[r->cred - 1].audience[0])
+            return fail(err, en, name, ln, "an MCP access token on a request rule");     /* v1.31 */
         if (r->cred && strncmp(tok[3], "https://", 8) != 0) return fail(err, en, name, ln, "credential on http");
         return 0;
     }
@@ -903,6 +1203,19 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
             *slot = (uint32_t)x;
             continue;
         }
+        /* v1.31: for=NAME and confined */
+        if (!strncmp(t, "for=", 4)) {
+            if (!ver_ge(req_maj, req_min, 1, 31)) return fail(err, en, name, ln, "for= before 1.31");
+            if (r->subj) return fail(err, en, name, ln, "for= given twice");
+            if (!(r->subj = subj_named(pol, t + 4))) return fail(err, en, name, ln, "for= names no confined subject");
+            continue;
+        }
+        if (!strcmp(t, "confined")) {
+            if (!ver_ge(req_maj, req_min, 1, 31)) return fail(err, en, name, ln, "confined before 1.31");
+            if (r->confined) return fail(err, en, name, ln, "confined given twice");
+            r->confined = true;
+            continue;
+        }
         /* v1.28.1: subagent=NAME on an allow exec rule */
         if (!strncmp(t, "subagent=", 9)) {
             if (!ver_ge(req_maj, req_min, 1, 28)) return fail(err, en, name, ln, "subagent before 1.28");
@@ -929,6 +1242,7 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
     }
     if (r->kind == VDPC_HOST && r->wild && r->allow && !ack)
         return fail(err, en, name, ln, "a wildcard allow without acknowledge=dns-channel");
+    if (r->confined && !r->subagent[0]) return fail(err, en, name, ln, "confined without subagent=");
     return 0;
 }
 
@@ -1035,21 +1349,34 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
                 if (!ver_ge(req_maj, req_min, 1, 28))
                     rc = fail(err, en, name, ln, "trust before require warden 1.28");
                 else
-                    rc = parse_trust(name, ln, tok, nt, p, err, en);
+                    rc = parse_trust(name, ln, tok, nt, p, err, en, req_maj, req_min);
             } else if (!strcmp(tok[0], "credential")) {
                 /* v1.28 */
                 if (!ver_ge(req_maj, req_min, 1, 28))
                     rc = fail(err, en, name, ln, "credential before require warden 1.28");
                 else
-                    rc = parse_credential(name, ln, tok, nt, p, err, en);
+                    rc = parse_credential(name, ln, tok, nt, p, err, en, req_maj, req_min);
+            } else if (!strcmp(tok[0], "mcp")) {
+                /* v1.31: mcp server NAME exec PATH [sha256=HEX] */
+                if (p->n == VDPC_MAX_RULES) rc = fail(err, en, name, ln, "more than 512 rules");
+                else {
+                    rc = parse_mcp_server(name, ln, tok, nt, req_maj, req_min, &p->rules[p->n], err, en);
+                    p->n++;
+                    if (rc == 0) rc = subj_register(p, p->n - 1, true, err, en, name, ln);
+                }
             } else if (nt < 3) {
                 rc = fail(err, en, name, ln, "bad rule");
             } else if (p->n == VDPC_MAX_RULES) {
-                rc = fail(err, en, name, ln, "more than 256 rules");
+                rc = fail(err, en, name, ln, "more than 512 rules");
             } else {
                 rc = parse_rule(name, ln, tok, nt, req_maj, req_min, &legacy_name, &glob_total,
                                 &p->rules[p->n], err, en, p);
                 p->n++;                       /* counted either way: freed below */
+                /* v1.31: a confined sub-agent is registered; an unconfined one may not share a confined name */
+                if (rc == 0 && p->rules[p->n - 1].confined)
+                    rc = subj_register(p, p->n - 1, false, err, en, name, ln);
+                else if (rc == 0 && p->rules[p->n - 1].subagent[0] && subj_named(p, p->rules[p->n - 1].subagent))
+                    rc = fail(err, en, name, ln, "a confined name used by an unconfined sub-agent");
             }
         }
         free(heap);
@@ -1071,7 +1398,7 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
     }
     for (size_t i = 0; i < p->n; i++) {
         const vdpc_rule_t *r = &p->rules[i];
-        if (r->kind != VDPC_REQUEST) continue;
+        if (r->kind != VDPC_REQUEST && r->kind != VDPC_MCP) continue;      /* v1.31: mcp rules too */
         int bad = !p->proxy_inspect;
         bool on = false;
         if (p->proxy_nports == 0) on = r->rport == 80 || r->rport == 443;
@@ -1242,6 +1569,10 @@ int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *o) {
     o->cred_hdr = r->hdr;
     o->cred_scheme = r->scheme;
     o->subagent = r->subagent;
+    o->subj = r->subj;
+    o->confined_subj = r->csubj;
+    o->mcp_server = r->mcp_server;
+    o->sha256 = r->sha256;
     return 0;
 }
 
@@ -1306,9 +1637,15 @@ static int reject(char *why, size_t n, const char *msg) {
 
 int vdpc_check(const vdpc_policy_t *p, int kind, const char *s, size_t sl,
                uint32_t f, bool has_flags, const vdpc_cert_t *c, char *why, size_t wn) {
+    return vdpc_check_subj(p, 0, kind, s, sl, f, has_flags, c, why, wn);
+}
+
+int vdpc_check_subj(const vdpc_policy_t *p, int subj, int kind, const char *s, size_t sl,
+                    uint32_t f, bool has_flags, const vdpc_cert_t *c, char *why, size_t wn) {
     if (why && wn) why[0] = '\0';
-    if (kind != VDPC_PATH && kind != VDPC_HOST && kind != VDPC_EXEC && kind != VDPC_REQUEST)
+    if (kind != VDPC_PATH && kind != VDPC_HOST && kind != VDPC_EXEC && kind != VDPC_REQUEST && kind != VDPC_MCP)
         return reject(why, wn, "bad kind");
+    if (subj < 0 || (size_t)subj > p->nsubjects) return reject(why, wn, "no such subject");
     if (sl > VDPC_MAX_S) return reject(why, wn, "string over the length bound");
     if (memchr(s, '\0', sl)) return reject(why, wn, "NUL byte in the string");
     if (kind != VDPC_PATH) { f = 0; has_flags = true; }
@@ -1321,13 +1658,14 @@ int vdpc_check(const vdpc_policy_t *p, int kind, const char *s, size_t sl,
         if (c->r < 0 || (size_t)c->r >= p->n) return reject(why, wn, "no such rule");
         const vdpc_rule_t *r = &p->rules[c->r];
         if (r->kind != kind) return reject(why, wn, "deciding rule is of another kind");
+        if (r->subj != subj) return reject(why, wn, "deciding rule is another subject's");
         if (!r->allow) return reject(why, wn, "deciding rule is not an allow rule");
         if (!flag_holds(r, f)) return reject(why, wn, "deciding rule's flag clause does not hold");
         const char *w = NULL;
         if (!witness_holds(r, s, sl, c, &w)) return reject(why, wn, w);
         for (int j = 0; j < c->r; j++) {
             const vdpc_rule_t *e = &p->rules[j];
-            if (e->kind == kind && flag_holds(e, f) && str_holds(e, s, sl))
+            if (e->kind == kind && e->subj == subj && flag_holds(e, f) && str_holds(e, s, sl))
                 return reject(why, wn, "an earlier rule holds");
         }
         return 1;
@@ -1337,7 +1675,7 @@ int vdpc_check(const vdpc_policy_t *p, int kind, const char *s, size_t sl,
      * certificate naming one deciding rule carries that rule's witness. */
     if (c->r < 0 && c->wkind != 0) return reject(why, wn, "unexpected witness");
     if (c->r >= 0) {
-        if ((size_t)c->r >= p->n || p->rules[c->r].kind != VDPC_PATH)
+        if ((size_t)c->r >= p->n || p->rules[c->r].kind != VDPC_PATH || p->rules[c->r].subj != subj)
             return reject(why, wn, "no such path rule");
         const char *w = NULL;
         if (!witness_holds(&p->rules[c->r], s, sl, c, &w)) return reject(why, wn, w);
@@ -1346,7 +1684,7 @@ int vdpc_check(const vdpc_policy_t *p, int kind, const char *s, size_t sl,
     uint32_t bits = 0;
     for (size_t j = 0; j < p->n; j++) {
         const vdpc_rule_t *e = &p->rules[j];
-        if (e->kind != VDPC_PATH || !str_holds(e, s, sl)) continue;
+        if (e->kind != VDPC_PATH || e->subj != subj || !str_holds(e, s, sl)) continue;
         hold[nh++] = j;
         bits |= e->mask;
         if (e->mask == 0) break;              /* it holds for every f: no later rule decides */
@@ -1387,13 +1725,22 @@ int vdpc_path_writable(const vdpc_policy_t *p, const char *s, size_t sl) {
     return path_openable_if(p, s, sl, true);
 }
 
+static int path_openable_subj(const vdpc_policy_t *p, int subj, const char *s, size_t sl, bool writing);
+
+/* v1.31: openable (or writable) by any subject: the agent, or a confined one */
 static int path_openable_if(const vdpc_policy_t *p, const char *s, size_t sl, bool writing) {
+    for (size_t k = 0; k <= p->nsubjects; k++)
+        if (path_openable_subj(p, (int)k, s, sl, writing)) return 1;
+    return 0;
+}
+
+static int path_openable_subj(const vdpc_policy_t *p, int subj, const char *s, size_t sl, bool writing) {
     if (sl > VDPC_MAX_S || memchr(s, '\0', sl)) return 0;   /* outside the fragment: refused */
     size_t hold[VDPC_MAX_RULES], nh = 0;
     uint32_t bits = 0;
     for (size_t j = 0; j < p->n; j++) {
         const vdpc_rule_t *e = &p->rules[j];
-        if (e->kind != VDPC_PATH || !str_holds(e, s, sl)) continue;
+        if (e->kind != VDPC_PATH || e->subj != subj || !str_holds(e, s, sl)) continue;
         hold[nh++] = j;
         bits |= e->mask;
         if (e->mask == 0) break;

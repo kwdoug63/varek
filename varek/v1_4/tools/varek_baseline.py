@@ -378,8 +378,40 @@ def own_ttys():
     return out
 
 
-def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH, ttys=()):
-    """The baseline's text for this run. ttys: the terminals the agent is
+MCP_NAME_RX = re.compile(r"[a-z][a-z0-9_]{0,31}")
+
+
+def mcp_servers(specs, cwd, tmp):
+    """v1.31: `varek run --mcp NAME=PATH`: [(name, path, sha256)]. PATH is the
+    server's program, absolute, a regular file outside the directories the
+    agent may write (the working and temporary directories: a server the
+    agent could replace would be the agent's), pinned to its SHA-256 now.
+    The Warden checks it again at the start (owner, writability, pin)."""
+    out, seen = [], set()
+    for sp in specs:
+        name, eq, path = sp.partition("=")
+        if not eq or not MCP_NAME_RX.fullmatch(name):
+            raise BaselineError(f"--mcp {sp}: give NAME=PATH, NAME 1 to 32 of a-z, 0-9, _ (starting with a letter)")
+        if name in seen:
+            raise BaselineError(f"--mcp {name} given twice")
+        seen.add(name)
+        if not path.startswith("/"):
+            raise BaselineError(f"--mcp {sp}: give the server's program as an absolute path")
+        real = os.path.realpath(path)
+        if not os.path.isfile(real):
+            raise BaselineError(f"--mcp {sp}: {real} is not a file")
+        for d in (cwd, tmp):
+            if real == d or real.startswith(d.rstrip("/") + "/"):
+                raise BaselineError(f"--mcp {sp}: {real} is under {d}, which the agent may write: the agent "
+                                    f"could replace the server")
+        with open(real, "rb") as fh:
+            out.append((name, real, hashlib.sha256(fh.read()).hexdigest()))
+    return out
+
+
+def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH, servers=(), ttys=()):
+    """The baseline's text for this run (v1.31: with each --mcp server
+    confined, under rules of its own). ttys: the terminals the agent is
     started on (own_ttys), each allowed by its exact name."""
     home = policy_home(pw)
     user = pw.pw_name if pw else "nobody"
@@ -395,7 +427,7 @@ def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH, ttys=()):
     L.append("# audit runs against it. Rules match the resolved path; the first match wins;")
     L.append("# anything no rule allows is refused. To change it, copy it, edit it and run")
     L.append("# with `varek run --policy FILE` (a dry run first: `--dry-run`).")
-    L.append("require warden 1.29")
+    L.append("require warden 1.31" if servers else "require warden 1.29")
     L.append("")
     L.append("# --- the certificate authorities (public), read-only, before the key patterns ---")
     for r, c in TRUST_READS:
@@ -428,6 +460,14 @@ def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH, ttys=()):
     L.append(f"allow path exact {home}/.gitconfig readonly")
     L.append(f"allow path {home}/.config/git/ readonly")
     L.append("")
+    # v1.31: each --mcp server's launch, before the agent's own exec rules (the
+    # first rule that matches decides: a server named by an exec rule above
+    # its line would be launched unconfined)
+    for name, real, sha in servers:
+        L.append(f"# --- MCP server {name} (varek run --mcp): when the agent launches it, it runs confined,")
+        L.append(f"# decided by its own rules (for={name}, at the end) and no others ---")
+        L.append(f"mcp server {name} exec {real} sha256={sha}")
+        L.append("")
     L.append("# --- programs the agent may launch (each file named; lint notes the shells and")
     L.append("# interpreters: with one, the agent can run any code it can read) ---")
     progs = []
@@ -436,6 +476,8 @@ def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH, ttys=()):
             if r not in progs:
                 progs.append(r)
     for r in progs:
+        if r in {real for _, real, _ in servers}:
+            continue                           # v1.31: launched as its MCP server (above), confined
         L.append(f"allow exec {r}")
     # v1.29 step 6: git runs its helpers (git-remote-https for a clone or
     # fetch over HTTPS) from its own directory
@@ -459,8 +501,27 @@ def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH, ttys=()):
         L.append(f"# --- profile {profile['name']}: {profile['about']} ---")
         for line in profile["rules"]:
             L.append(line.replace("${HOME}", home))
+    for name, real, sha in servers:                                   # v1.31
+        L.append("")
+        L.append(f"# --- MCP server {name}'s own rules: the system read-only, the working directory")
+        L.append(f"# read-only; the agent's rules above do not apply to it ---")
+        L += server_rules(name, cwd)
     L.append("")
     return "\n".join(L)
+
+
+def server_rules(name, cwd):
+    """v1.31: an MCP server's own copy of the baseline's trust, credential,
+    system-deny and system-read rules (for=NAME), and the working directory
+    read-only (also `varek bench --for`)."""
+    L = []
+    for group in (TRUST_READS, CREDENTIAL_DENIES, SYSTEM_DENIES, SYSTEM_READS):
+        for r, c in group:
+            rr = f"{r} for={name}"
+            L.append(f"{rr:<52} # {c}" if c else rr)
+    L.append(f"allow path exact {cwd} readonly for={name}")
+    L.append(f"allow path {cwd}/ readonly for={name}")
+    return L
 
 
 def store(text):

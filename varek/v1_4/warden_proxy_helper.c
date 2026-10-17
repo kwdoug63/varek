@@ -55,7 +55,8 @@ enum { WH_READING = 0, WH_WAITING = 1, WH_RELAY = 2, WH_UPSTREAM = 3, WH_TLS = 4
 enum { TS_SERVER = 0, TS_CLIENT = 1, TS_RELAY = 2, TS_FINAL = 3 };
 /* step 6: the request gate of an inspected connection: read a request's
  * head, wait for the Warden's verdict, pass its body as framed */
-enum { IG_HEAD = 0, IG_WAIT = 1, IG_LENGTH = 2, IG_CHUNKED = 3, IG_STOP = 4 };
+enum { IG_HEAD = 0, IG_WAIT = 1, IG_LENGTH = 2, IG_CHUNKED = 3, IG_STOP = 4,
+       IG_MCPBODY = 5, IG_MCPWAIT = 6 };       /* v1.31: an MCP call's body being read; its verdict awaited */
 #define WP_COUT_BUF 65536        /* TLS bytes to the client, waiting for the socket */
 #define WP_RELAY_BUF   32768     /* each direction */
 #define WP_RELAY_IDLE  3600000   /* a relayed connection idle this long is closed */
@@ -117,6 +118,13 @@ struct wp_held {
      * and when freed); bufcap: buf's size when it was grown for one */
     bool      credbuf;
     size_t    bufcap;
+    /* v1.31: an MCP call's body as framed (held until the call is decided),
+     * its limit, the call's JSON-RPC id (for the error a refusal gets) */
+    uint8_t  *mbody;
+    size_t    mlen, mcap;
+    uint64_t  mlimit;
+    char      mcp_id[160];
+    bool      mcp_refused;
 };
 enum { WG_OPEN = 0, WG_HEAD, WG_LENGTH, WG_CHUNKED };
 static struct wp_ann  g_ann[WP_MAX_ANNOUNCED];
@@ -155,11 +163,15 @@ static void report_close(const struct wp_held *h, const char *why) {
 }
 
 static void report_body(struct wp_held *h, int exceeded);
+static void mcp_report_gone(struct wp_held *h);      /* v1.31: warden_proxy_mcp.inc.c */
 
 static void held_drop(int k) {
     /* review: an allowed body still being sent when the connection ends: what
      * was sent of it, reported before the close (the Warden requires it) */
     if (g_held[k].bh) report_body(&g_held[k], 2);
+    /* v1.31: an MCP call whose body did not all arrive: reported (refused) */
+    if (g_held[k].ig == IG_MCPBODY && g_held[k].state == WH_TLS) mcp_report_gone(&g_held[k]);
+    free(g_held[k].mbody);
     if (g_held[k].state == WH_UPSTREAM)            /* the run ended while asking the upstream */
         report_close(&g_held[k], g_held[k].why ? g_held[k].why : "upstream_refused");
     else if (g_held[k].state == WH_RELAY) report_close(&g_held[k], g_held[k].why ? g_held[k].why : "closed");
@@ -766,6 +778,8 @@ static const char *cred_swap(struct wp_held *h, const struct wp_reqverdict *v) {
     return NULL;
 }
 
+#include "warden_proxy_mcp.inc.c"     /* v1.31 */
+
 /* Step 6: the Warden's verdict on the request waiting. */
 static void gate_verdict(struct wp_held *h, const struct wp_reqverdict *v) {
     if (h->ig != IG_WAIT || v->seq != h->seq) return;       /* not the one waiting: ignored */
@@ -773,6 +787,7 @@ static void gate_verdict(struct wp_held *h, const struct wp_reqverdict *v) {
         gate_stop(h, memchr(v->why, 0, sizeof v->why) && v->why[0] ? v->why : "refused by the policy");
         return;
     }
+    if (v->mcp) { mcp_begin(h, v); return; }                 /* v1.31: an MCP call: its body first */
     if (v->cred) {                                           /* v1.28: the swap, or a refusal */
         const char *why = cred_swap(h, v);
         if (why) {
@@ -816,7 +831,13 @@ static bool body_take(struct wp_held *h, size_t take) {
 /* Let through what the gate allows of buf[fwd, len). */
 static void gate_run(struct wp_held *h) {
     while (h->fwd < h->len && h->ig != IG_STOP && !h->cut) {
-        if (h->ig == IG_WAIT) break;
+        if (h->ig == IG_WAIT || h->ig == IG_MCPWAIT) break;
+        if (h->ig == IG_MCPBODY) {                       /* v1.31 */
+            size_t before = h->len;
+            mcp_collect(h);
+            if (h->ig == IG_MCPBODY && h->len == before) break;     /* more is to come */
+            continue;
+        }
         if (h->ig == IG_HEAD) {
             pp_req_t q;
             pp_status_t st = pp_request(h->buf + h->fwd, h->len - h->fwd, h->cs || h->ss ? "https" : "http",
@@ -970,7 +991,22 @@ static bool tls_step(int k, short crev, short srev) {
         if (c_done) s_shut(h);
         bool stop_wait = h->ig == IG_STOP && mono_ms() - h->stop_at > WP_READ_MS;   /* the server lingers */
         if ((h->eof_s || stop_wait) && h->dlen == h->doff) {
-            if (h->ig == IG_STOP && !strcmp(h->why, "refused_request")) {
+            if (h->ig == IG_STOP && !strcmp(h->why, "refused_request") && h->mcp_refused) {
+                /* v1.31: an MCP call gets a JSON-RPC error, code -32000 */
+                char body[400], esc[200];
+                size_t e = 0;
+                for (const char *c = h->tls_why; *c && e + 2 < sizeof esc; c++) {
+                    if (*c == '"' || *c == '\\') esc[e++] = '\\';
+                    esc[e++] = (*c >= 0x20 && *c <= 0x7e) ? *c : '?';
+                }
+                esc[e] = '\0';
+                int bl = snprintf(body, sizeof body, "{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":-32000,"
+                                  "\"message\":\"VAREK: this call was refused: %s\"}}", h->mcp_id[0] ? h->mcp_id : "null", esc);
+                snprintf(kRefused, sizeof kRefused, "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n"
+                         "Content-Length: %d\r\nConnection: close\r\n\r\n%s", bl, body);
+                if (h->cs) (void)SSL_write(h->cs, kRefused, (int)strlen(kRefused));
+                else (void)send(h->fd, kRefused, strlen(kRefused), MSG_DONTWAIT | MSG_NOSIGNAL);
+            } else if (h->ig == IG_STOP && !strcmp(h->why, "refused_request")) {
                 char body[200];
                 int bl = snprintf(body, sizeof body, "VAREK: this request was refused: %s.\n", h->tls_why);
                 snprintf(kRefused, sizeof kRefused, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n"
@@ -985,8 +1021,13 @@ static bool tls_step(int k, short crev, short srev) {
             else if (h->cs) (void)SSL_shutdown(h->cs);
             else (void)shutdown(h->fd, SHUT_WR);
             h->tstage = TS_FINAL;
-        } else if (h->ig == IG_WAIT && mono_ms() - h->since > WP_VERDICT_MS) {
+        } else if ((h->ig == IG_WAIT || h->ig == IG_MCPWAIT) && mono_ms() - h->since > WP_VERDICT_MS) {
+            if (h->ig == IG_MCPWAIT) h->mcp_refused = true;
             gate_stop(h, "no verdict from the Warden");
+        } else if (h->ig == IG_MCPBODY && (h->eof_c || mono_ms() - h->since > WP_VERDICT_MS)) {
+            /* v1.31: the body did not all arrive: reported, and refused when the Warden answers */
+            mcp_report(h, h->eof_c ? "the connection ended before the body did" : "the body did not arrive in time",
+                       WP_MCP_UNREADABLE);
         } else {
             if (mono_ms() - h->since > WP_RELAY_IDLE) { h->why = "idle"; return false; }
             return true;
@@ -1004,7 +1045,7 @@ static int wp_drain_ctl(int ctl) {
     for (;;) {
         union { struct wp_conn c; struct wp_verdict v; struct wp_verdict_up u; struct wp_inspect in;
                 struct wp_ca_name cn; struct wp_reqverdict rv; struct wp_ph ph; struct wp_creds cr;
-                uint32_t type; } m;
+                struct wp_mcpverdict mv; uint32_t type; } m;
         union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
         struct iovec iv = { &m, sizeof m };
         struct msghdr mh = { .msg_iov = &iv, .msg_iovlen = 1, .msg_control = cb.b, .msg_controllen = sizeof cb.b };
@@ -1130,6 +1171,15 @@ static int wp_drain_ctl(int ctl) {
             int k = held_find(m.rv.id);
             if (k >= 0 && g_held[k].state == WH_TLS && g_held[k].tstage == TS_RELAY) {
                 gate_verdict(&g_held[k], &m.rv);
+                g_moved = true;
+            }
+            continue;
+        }
+        /* v1.31: the verdict on an MCP call */
+        if (n == (ssize_t)sizeof m.mv && m.type == WP_MSG_MCPVERDICT) {
+            int k = held_find(m.mv.id);
+            if (k >= 0 && g_held[k].state == WH_TLS && g_held[k].tstage == TS_RELAY) {
+                mcp_verdict(&g_held[k], &m.mv);
                 g_moved = true;
             }
             continue;

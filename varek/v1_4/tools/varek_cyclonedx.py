@@ -231,6 +231,10 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             if meta is not None:
                 meta["run_start"] = rec      # v1.15: policy_sha256, for the audit
             continue
+        if "decision_final" in rec and event is not None:
+            # v1.31 review: a decision record carries no event (the exporters
+            # would read it as the event it names)
+            fail(lineno, f"a decision record that also says it is a {event!r} event.")
         if "decision_final" not in rec and event != "run_end":
             # e.g. a pre-launch plan record; carries no authorization. v1.18.0:
             # this run's plan_gate record (chained above) goes to the attestation.
@@ -541,7 +545,8 @@ def _launch_text(records, pm):
     allowed = [r for r in launches if r.get("rule") == "exec_allowed"]
     results = [e for _, e in pm.get("exec_results", [])]
     ran = sum(1 for e in results if e.get("result") == "launched")
-    killed = [r for r in records if r.get("rule") == "exec_identity_mismatch"]
+    killed = [r for r in records if r.get("rule") == "exec_identity_mismatch" or
+              (r.get("rule") == "subagent_env" and r.get("action") != "process.exec")]
     facts = [("varek:launches.landlock_abi", abi),
              ("varek:launches.set.files", str(len(ex))),
              ("varek:launches.set.sha256", digest),
@@ -726,9 +731,10 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
         "publisher": "Sober Agentic Infrastructure, Inc.",
         "name": "VAREK Warden",
         "version": warden_version,
-        "description": "Pre-execution authorization runtime for autonomous AI agents "
-                       "(Authorization-Before-Execution; kernel-enforced via seccomp-BPF "
-                       "and seccomp user-notify).",
+        "description": "Kernel-enforced, proof-checked authorization for what an AI "
+                       "agent's process actually does: each file open, lookup, connect, "
+                       "program launch and datagram send is decided at the kernel "
+                       "(seccomp-BPF and seccomp user-notify).",
         "licenses": [{"license": {"id": "MIT"}}],
         "properties": [{"name": n, "value": v} for n, v in PATENTS] + [
             {"name": "varek:status", "value": "patent-pending"},
@@ -740,7 +746,8 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
         "bom-ref": "agent-run",
         "name": agent,
         "version": run_start,
-        "description": "Autonomous agent run supervised under VAREK Authorization-Before-Execution.",
+        "description": "Autonomous agent run whose process's actions the VAREK Warden "
+                       "decided at the kernel.",
         "properties": [
             {"name": "varek:mode", "value": "dry_run" if dry else "enforcing"},     # v1.29
             {"name": "varek:policy", "value": policy},
@@ -793,6 +800,48 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
             ] if r.get("action") == "process.exec" and isinstance(r.get("exec_sha256"), str) else []),
         }
         components.append(comp)
+
+    # v1.31 (docs/security/v1.31-standards.md, section 6): each MCP server the
+    # run launched (confined, by its `mcp server` line), with its file and
+    # SHA-256, and each remote MCP endpoint reached, with the methods and
+    # names its calls were allowed
+    ruleset = {e.get("path"): e for e in rs.get("exec_ruleset", []) if isinstance(e, dict)} \
+        if isinstance(rs.get("exec_ruleset"), list) else {}
+    servers = {}
+    for r in authorized:
+        if r.get("action") == "process.exec" and r.get("mcp_server") is True and isinstance(r.get("subagent"), str):
+            name = r["subagent"].split("#", 1)[0]
+            path = r.get("resolved") or r.get("target") or ""
+            sv = servers.setdefault(name, {"path": path, "launches": 0,
+                                           "sha": r.get("exec_sha256") or (ruleset.get(path) or {}).get("sha256")})
+            sv["launches"] += 1
+    for name, sv in sorted(servers.items()):
+        comp = {"type": "application", "bom-ref": bomref("mcp-server", name), "name": name,
+                "description": "An MCP server the agent launched, run confined: decided by its own rules only.",
+                "properties": ([{"name": "varek:mode", "value": "dry_run"}] if dry else []) + [
+                    {"name": "varek:mcp.server", "value": "true"},
+                    {"name": "varek:file", "value": str(sv["path"])},
+                    {"name": "varek:launches", "value": str(sv["launches"])}]}
+        if isinstance(sv["sha"], str) and re.fullmatch(r"[0-9a-f]{64}", sv["sha"]):
+            comp["hashes"] = [{"alg": "SHA-256", "content": sv["sha"]}]
+        components.append(comp)
+    endpoints = {}
+    for r in authorized:
+        if r.get("action") == "net.mcp" and isinstance(r.get("mcp_url"), str):
+            ep = endpoints.setdefault(r["mcp_url"], {"methods": set(), "names": set(), "calls": 0})
+            ep["calls"] += 1
+            if isinstance(r.get("mcp_method"), str):
+                ep["methods"].add(r["mcp_method"])
+            if isinstance(r.get("mcp_name"), str):
+                ep["names"].add(r["mcp_name"])
+    services = []
+    for url, ep in sorted(endpoints.items()):
+        services.append({"bom-ref": bomref("mcp-endpoint", url), "name": url, "endpoints": [url],
+                         "description": "A remote MCP endpoint the agent's calls reached, each decided on its "
+                                        "method and name.",
+                         "properties": [{"name": "varek:mcp.calls_allowed", "value": str(ep["calls"])}] +
+                                       [{"name": "varek:mcp.method", "value": m} for m in sorted(ep["methods"])] +
+                                       [{"name": "varek:mcp.name", "value": n} for n in sorted(ep["names"])]})
 
     attest_text, facts = attestation(records, authorized, refused, dist, policy,
                                      run_start, run_end, warden_version, complete,
@@ -849,6 +898,8 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
         "components": components,
         "annotations": [annotation],
     }
+    if services:                                                  # v1.31: remote MCP endpoints
+        bom["services"] = services
     return bom
 
 

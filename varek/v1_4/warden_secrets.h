@@ -41,9 +41,24 @@
 //                      before any network store is fetched
 //   helper -> Warden   WS_MSG_IDENTITY the verified claims (never the token,
 //                                     never the key), or why not
+//
+// v1.31 step 5 (docs/security/v1.31-standards.md, section 4): a credential
+// may be an MCP access token (WS_MSG_CRED's audience, opaque): the helper
+// checks it is a JWT whose aud names that URL and whose exp is at least
+// 60 s away (an opaque one: neither), and reports the exp (WS_MSG_RESULT).
+// The user's issuer may be found through an MCP server's metadata:
+//
+//   Warden -> helper   WS_MSG_MCPRES  one per `trust mcp-resource` line
+//                                     (with the token, as the issuers)
+//   helper             fetches the resource's metadata (RFC 9728), each of
+//                      its authorization servers' (RFC 8414, or OpenID
+//                      discovery; the issuer identical to the identifier),
+//                      and their keys; a token from one of them is checked
+//                      with the line's audience (or its URL as written)
 #ifndef VAREK_WARDEN_SECRETS_H
 #define VAREK_WARDEN_SECRETS_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <sys/types.h>
 
@@ -63,6 +78,7 @@ enum {
     WS_MSG_ISSUER,                    /* Warden -> helper (struct ws_issuer) */
     WS_MSG_SPIFFE,                    /* Warden -> helper (struct ws_spiffe) */
     WS_MSG_IDENTITY,                  /* helper -> Warden (struct ws_identity) */
+    WS_MSG_MCPRES,                    /* v1.31: Warden -> helper (struct ws_mcpres) */
 };
 
 /* struct ws_file's kind: a file whose contents are secret (the agent may not
@@ -71,6 +87,7 @@ enum { WS_FILE_SECRET = 0, WS_FILE_TRUSTED = 1 };
 
 #define WS_MAX_ISSUERS 8              /* VDP_MAX_ISSUERS */
 #define WS_MAX_SPIFFE  8              /* VDP_MAX_SPIFFE */
+#define WS_MAX_MCPRES  8              /* VDP_MAX_MCPRES */
 #define WS_MAX_ACTORS  8              /* an `act` chain nested at most 8 deep */
 #define WS_MAX_TOKEN   16384          /* the user's token file, at most */
 
@@ -87,6 +104,17 @@ struct ws_setup {
     uint32_t nspiffe;
     char     token[4096];             /* --on-behalf-of: the user's token ("" : none) */
     char     svid[4096];              /* --agent-svid: the agent's X.509-SVID and key ("" : none) */
+    uint32_t nmcpres;                 /* v1.31 */
+    uint32_t pad;
+};
+
+/* v1.31: an MCP server whose authorization servers the policy trusts as the
+ * user's issuers */
+struct ws_mcpres {
+    uint32_t type;                    /* WS_MSG_MCPRES */
+    uint32_t index;
+    char     url[256];                /* as written */
+    char     aud[256];                /* "" : the URL */
 };
 
 /* v1.28.1: an issuer the policy trusts */
@@ -124,6 +152,8 @@ struct ws_identity {
     char     kid[256];                /* "" : absent */
     char     token_sha256[65];
     char     pad1[7];
+    char     token_sin_sha256[65];    /* v1.31 review: of its signing input (header.payload) */
+    char     pad4[7];
     uint32_t nact;                    /* the actors (RFC 8693 `act`), the current one first */
     uint32_t has_svid;
     struct ws_actor act[WS_MAX_ACTORS];
@@ -133,14 +163,22 @@ struct ws_identity {
     char     spiffe_id[2049];
     char     svid_sha256[65];         /* of the leaf certificate (DER) */
     char     why[512];
+    /* v1.31: 0, the token's issuer is the policy's issuers[issuer]; k > 0,
+     * it was found through `trust mcp-resource` k - 1: its identifier and
+     * the audience the token was checked against */
+    uint32_t mcp_resource;
+    uint32_t pad3;
+    char     found_iss[256];
+    char     found_aud[256];
 };
 
 struct ws_cred {
     uint32_t type;                    /* WS_MSG_CRED */
     uint32_t index;
     uint32_t store;                   /* VDP_CRED_FILE, _VAULT, _AWSSM (smt_decide.h) */
-    uint32_t pad;
+    uint32_t opaque;                  /* v1.31: an MCP token that is not a JWT */
     char     ref[1025];
+    char     audience[1025];          /* v1.31: an MCP token for this server (canonical URL; "" : none) */
 };
 
 struct ws_file {
@@ -157,6 +195,7 @@ struct ws_result {
     char     version[160];            /* the store's version of it: "kv2:N", a lease id, an AWS
                                          version id, or a file's "inode:N mtime:S" */
     char     why[256];                /* not ok: why */
+    int64_t  exp;                     /* v1.31: an MCP token's expiry (a JWT's exp; -1: none, or opaque) */
 };
 
 struct ws_ready {
@@ -202,6 +241,7 @@ typedef struct {
 typedef struct {
     char     version[160];
     uint32_t len;
+    int64_t  exp;                     /* v1.31: an MCP token's expiry (-1: none) */
 } ws_meta_t;
 
 /* Start the helper from exe_fd (wp_load's sealed copy) as uid:gid. 0, or -1
@@ -228,6 +268,12 @@ typedef struct {
     size_t nspiffe;
     struct ws_identity *id;
     uint32_t *kinds;
+    /* v1.31: each credential's audience= ("" : none) and opaque, and the
+     * MCP resources trusted for the user's token */
+    const char *const *audience;
+    const bool *opaque;
+    const struct ws_mcpres *mcpres;
+    size_t nmcpres;
 } ws_idreq_t;
 
 /* ws_fetch, and the identities: a token or an SVID that fails a check makes

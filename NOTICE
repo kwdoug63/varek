@@ -14,9 +14,21 @@ describe interoperability with the openly published CycloneDX format
 be implemented by anyone. All other product names, logos, and marks are the
 property of their respective owners.
 
+OCSF (the Open Cybersecurity Schema Framework) is a series of LF Projects, LLC.
+VAREK and Sober Agentic Infrastructure, Inc. are not affiliated with, endorsed
+by, or certified by the OCSF project. VAREK uses the OCSF name only to describe
+interoperability with the openly published OCSF schema, which is Apache-2.0
+licensed (`varek export --format ocsf`, v1.31).
+
 Third-party data
 ----------------
 varek/v1_4/data/public_suffix_list.dat is the Public Suffix List
 (https://publicsuffix.org/), distributed under the Mozilla Public License,
 v. 2.0 (https://mozilla.org/MPL/2.0/); its license header is kept in the file.
 VAREK reads it to refuse wildcard host rules over shared domains.
+
+varek/v1_4/schemas/ocsf-1.9.0/schema.json is part of the OCSF 1.9.0 schema
+(https://github.com/ocsf/ocsf-schema, tag 1.9.0), compiled by the OCSF project's
+compiler and cut down to the classes VAREK exports; it is licensed under the
+Apache License 2.0, whose text and the project's NOTICE are kept beside it.
+The tests check VAREK's OCSF events against it.

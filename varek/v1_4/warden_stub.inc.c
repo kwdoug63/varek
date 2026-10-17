@@ -227,9 +227,14 @@ static int stub_name_rule(const struct policy *p, const char *name) {
         snprintf(s, sizeof s, "%s:%u", name, ports[k]);
         int ri;
         vdp_why_t why;
-        if (vdp_decide(&p->v, VDP_KIND_HOST, s, 0, false, &ri, &why) != VDP_SATISFIED || ri < 0) continue;
-        if (!p->v.rules[ri].s.wild) return ri;
-        if (best < 0 || ri < best) best = ri;
+        /* v1.31: a name any subject may reach is resolved; each connect is
+         * still decided by its caller's rules */
+        for (size_t sj = 0; sj <= p->v.nsubjects; sj++) {
+            if (vdp_decide_subj(&p->v, (int)sj, VDP_KIND_HOST, s, 0, false, &ri, &why) != VDP_SATISFIED || ri < 0)
+                continue;
+            if (!p->v.rules[ri].s.wild) return ri;
+            if (best < 0 || ri < best) best = ri;
+        }
     }
     return best;
 }

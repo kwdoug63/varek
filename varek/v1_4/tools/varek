@@ -388,7 +388,7 @@ def summarize(recs):
          "proxy_targets": {}, "proxy_denied": set(), "proxy_ends": [],
          "cred_refused": [], "revoked": None, "credentials": [],
          "user": None, "spiffe_id": None, "subagents": {}, "expired": None,
-         "dry": False, "not_enforced": 0}
+         "dry": False, "not_enforced": 0, "mcp_servers": set(), "mcp_calls": 0}
     for r in recs:
         ev = r.get("event")
         if r.get("enforced") is False and (s["run"] is None or r.get("run") == s["run"]):
@@ -449,10 +449,14 @@ def summarize(recs):
             if isinstance(ob, list) and ob and isinstance(ob[-1], str) and ob[-1].startswith("subagent:"):
                 t = ob[-1][len("subagent:"):]
                 s["subagents"][t] = s["subagents"].get(t, 0) + 1
+            if r.get("action") == "process.exec" and r.get("mcp_server") is True and r.get("subagent"):
+                s["mcp_servers"].add(str(r["subagent"]))                 # v1.31
+            if r.get("action") == "net.mcp":
+                s["mcp_calls"] += 1
             if r.get("action") == "net.proxy" and isinstance(r.get("proxy_conn"), int):
                 s["proxy_targets"].setdefault(r["proxy_conn"], r.get("target", ""))
-            if r.get("action") == "net.request" and d != "ALLOW" and type(r.get("proxy_conn")) is int:
-                s["proxy_denied"].add(r["proxy_conn"])
+            if r.get("action") in ("net.request", "net.mcp") and d != "ALLOW" and type(r.get("proxy_conn")) is int:
+                s["proxy_denied"].add(r["proxy_conn"])                  # v1.31: an MCP call's refusal too
             if d == "ALLOW":
                 s["allowed"] += 1
             else:
@@ -709,6 +713,14 @@ def cmd_doctor(args):
                             hint("a run with --on-behalf-of fetches these keys at its start; oidc_ca in "
                                  "/etc/varek/secrets.conf names a CA for the issuer")
                             bad += 1
+                # v1.31: each MCP server's (confined sub-agent's) file
+                for good, text in check_server_files(cfg["policy"]):
+                    if good:
+                        ok(text)
+                    else:
+                        fail(text)
+                        hint("a confined subject's file must be root's, written by no one else, and its pin current")
+                        bad += 1
                 # v1.28: each credential the policy names can be fetched
                 names = policy_credential_names(cfg["policy"])
                 if names and os.geteuid() != 0:
@@ -1007,26 +1019,31 @@ def cmd_policy_show(args):
                   "the agent's lookups under it leave the host (acknowledge=dns-channel)"))
     # v1.28: credential release, as the certificate checker reads the policy
     cq = run_cmd([tool("vdp_cert_check"), path, "credentials"], capture=True)
-    creds, crules = [], []
+    creds, crules, cauds = [], [], {}
     for ln in cq.stdout.splitlines() if cq.returncode == 0 else []:
         f = ln.split(" ")
         if len(f) == 4 and f[0] == "credential":
             creds.append(f[1:])
         elif len(f) == 5 and f[0] == "rule":
             crules.append(f[1:])
+        elif len(f) == 4 and f[0] == "audience":                     # v1.31: an MCP token
+            cauds[f[1]] = (f[2], f[3] == "opaque")
     if creds:
         info(f"Credentials ({len(creds)}): fetched at startup by warden-secrets; the agent gets a placeholder in "
              f"VAREK_CRED_<NAME>, and the proxy puts the value in only where a rule below names it")
         for name, store, ref in creds:
             used = [r for r in crules if r[1] == name]
-            info(f"  {name} from {store}:{ref}")
+            info(f"  {name} from {store}:{ref}" +
+                 (f": an MCP token for {cauds[name][0]}" + (" (opaque)" if cauds[name][1] else
+                                                            ", checked for that audience and expiry when fetched")
+                  if name in cauds else ""))
             for line, _, hdr, scheme in used:
                 info(f"    line {line}: in {hdr}" + (f" after {scheme}" if scheme != "-" else ""))
             if not used:
                 info("    no rule carries it (fetched, never sent)")
     # v1.28.1: whom a run acts for, as the certificate checker reads the policy
     iq = run_cmd([tool("vdp_cert_check"), path, "identity"], capture=True)
-    issuers, domains, subs, req = [], [], [], False
+    issuers, domains, subs, req, mres = [], [], [], False, []
     for ln in iq.stdout.splitlines() if iq.returncode == 0 else []:
         f = ln.split(" ")
         if len(f) == 4 and f[0] == "issuer":
@@ -1037,6 +1054,11 @@ def cmd_policy_show(args):
             subs.append(f[1:])
         elif ln == "require on-behalf-of":
             req = True
+        elif len(f) == 3 and f[0] == "mcp-resource":                  # v1.31
+            mres.append(f[1:])
+    for url, aud in mres:
+        info(f"MCP resource {url}: a user's token from an authorization server its metadata names "
+             f"(RFC 9728) is verified for {aud if aud != '-' else url}")
     for iss, aud, jwks in issuers:
         info(f"Issuer   {iss}: a user's token it issued for {aud} is verified at the start (keys from "
              f"{jwks if jwks != '-' else 'its discovery document'}; --on-behalf-of)")
@@ -1050,6 +1072,17 @@ def cmd_policy_show(args):
         for line, name in subs:
             text = policy_line_text(path, int(line)) if line.isdigit() else None
             info(f"  {name}: line {line}" + (f": {text}" if text else ""))
+    servers, forl = policy_servers(path)                                          # v1.31
+    if servers:
+        info(f"Confined ({len(servers)}): each is decided by its own rules (for=NAME) and no one else's; the "
+             f"agent's rules do not apply to it, nor its rules to the agent")
+        for sv in servers:
+            n = sum(1 for k in forl.values() if k == sv["k"])
+            info(f"  {'MCP server' if sv['mcp'] else 'sub-agent'} {sv['name']}: {sv['file']} (line {sv['line']}), " +
+                 (f"pinned to sha256 {sv['sha'][:16]}..." if sv["sha"] else "not pinned") + f"; {n} rule(s) for it")
+            for line, name, hdr, scheme in crules:
+                if line.isdigit() and forl.get(int(line)) == sv["k"]:
+                    info(f"    credential {name}: line {line}, in {hdr}" + (f" after {scheme}" if scheme != "-" else ""))
     info("Anything not allowed is UNKNOWN and refused.")
     return show_rc
 
@@ -1087,7 +1120,7 @@ def cmd_policy_suggest(args):
         text = fh.read()
     try:
         draft, active, commented = varek_suggest.suggest(recs, text, pol, s.get("policy_sha") or "?",
-                                                         tool("vdp_check"))
+                                                         tool("vdp_check"), for_name=args.for_)
     except (ValueError, RuntimeError) as e:
         raise CliError(str(e))
     if args.output:
@@ -1217,7 +1250,9 @@ def baseline_for_run(args, cmd, make):
         cwd = varek_baseline.check_cwd(os.getcwd(), pw.pw_dir)
         tmp = varek_baseline.tmp_dir(pw, make=make)
         path = varek_baseline.agent_path(cmd, os.environ)
-        text = varek_baseline.generate(cwd, pw, tmp, prof, path=path, ttys=varek_baseline.own_ttys())
+        servers = varek_baseline.mcp_servers(getattr(args, "mcp", None) or [], cwd, tmp)       # v1.31
+        text = varek_baseline.generate(cwd, pw, tmp, prof, path=path, servers=servers,
+                                       ttys=varek_baseline.own_ttys())
     except varek_baseline.BaselineError as e:
         raise CliError(str(e))
     notes = [f"the agent runs as {pw.pw_name} ({why_user})",
@@ -1236,6 +1271,12 @@ def cmd_run(args):
     baseline = args.baseline or (cfg is None and not args.policy)
     if args.policy and args.baseline:
         raise CliError("--policy and --baseline together", fix="choose one")
+    if args.mcp and not baseline:                                                  # v1.31
+        raise CliError("--mcp goes with the baseline policy (write `mcp server` lines in your own policy)",
+                       fix="run with no configuration, or pass --baseline")
+    if args.mcp and args.dry_run:
+        raise CliError("--mcp with --dry-run is refused: a dry run does not run sub-agents",
+                       fix="dry-run the agent without --mcp, then run with it")
     if (args.profile or args.env) and not baseline:
         raise CliError("--profile and --env go with the baseline policy",
                        fix="run with no configuration, or pass --baseline")
@@ -1370,9 +1411,11 @@ def run_for(s):
     """v1.28.1: whom a run acted for, short: the user (else the agent), and
     how many sub-agents ran"""
     who = str(s["user"].get("subject", "?")) if s["user"] else "agent"
-    n = len(s["subagents"])
+    srv = len(s.get("mcp_servers", ()))                                            # v1.31
+    n = len(s["subagents"]) - srv
     who = who if len(who) <= 20 else who[:19] + "~"
-    return who + (f" +{n} sub-agent{'s' if n > 1 else ''}" if n else "")
+    return who + (f" +{n} sub-agent{'s' if n > 1 else ''}" if n > 0 else "") + \
+        (f" +{srv} MCP server{'s' if srv > 1 else ''}" if srv else "")
 
 
 def obo_text(r):
@@ -1476,6 +1519,76 @@ def policy_line_text(path, n):
     return None
 
 
+def policy_servers(path):
+    """v1.31: the confined subjects the policy declares (MCP servers, and
+    sub-agents marked confined), as the certificate checker reads them:
+    [{k, name, mcp, line, sha, file}], and {policy line: k} for the rules
+    written `for=` one."""
+    q = run_cmd([tool("vdp_cert_check"), path, "identity"], capture=True)
+    subs, forl = [], {}
+    for ln in q.stdout.splitlines() if q.returncode == 0 else []:
+        f = ln.split(" ")
+        if len(f) == 6 and f[0] == "confined" and f[1].isdigit() and f[4].isdigit():
+            t = (policy_line_text(path, int(f[4])) or "").split()
+            fp = t[4] if t[:2] == ["mcp", "server"] and len(t) > 4 else t[2] if len(t) > 2 and t[1] == "exec" else "?"
+            subs.append({"k": int(f[1]), "name": f[2], "mcp": f[3] == "mcp", "line": int(f[4]),
+                         "sha": None if f[5] == "-" else f[5], "file": fp})
+        elif len(f) == 3 and f[0] == "for" and f[1].isdigit() and f[2].isdigit():
+            forl[int(f[1])] = int(f[2])
+    return subs, forl
+
+
+def check_server_files(path):
+    """v1.31 (doctor): each confined subject's file: a regular file owned by
+    root, writable by no group or other user, in directories no group or
+    other user may write (unless sticky), and its sha256= pin. [(ok, text)]"""
+    out = []
+    for sv in policy_servers(path)[0]:
+        f, what = sv["file"], f"{'MCP server' if sv['mcp'] else 'confined sub-agent'} {sv['name']} ({sv['file']})"
+        try:
+            st = os.stat(f)
+        except OSError as e:
+            out.append((False, f"{what}: {e.strerror}"))
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            out.append((False, f"{what}: not a regular file"))
+            continue
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            out.append((False, f"{what}: owned by uid {st.st_uid}, mode {stat.S_IMODE(st.st_mode):o}: anyone but "
+                               f"root who can write it can replace the server"))
+            continue
+        # v1.31 review: the directories of the path as written (a symlink's own
+        # directory) and of the file it reaches, each as it is (lstat)
+        dirs, weak = [], None
+        for start in (os.path.dirname(os.path.abspath(f)), os.path.dirname(os.path.realpath(f))):
+            d = start
+            while d and d not in dirs:
+                dirs.append(d)
+                d = "" if d == "/" else os.path.dirname(d)
+        for d in dirs:
+            try:
+                ds = os.lstat(d)
+            except OSError:
+                weak = d
+                break
+            if stat.S_ISLNK(ds.st_mode):
+                ds = os.stat(d)            # a link to a directory: the directory it names (its own is above)
+            if ds.st_mode & 0o022 and not ds.st_mode & stat.S_ISVTX or ds.st_uid not in (0,):
+                weak = d
+                break
+        if weak:
+            out.append((False, f"{what}: {weak} is writable by others or not root's: the file can be replaced"))
+            continue
+        if sv["sha"]:
+            with open(f, "rb") as fh:
+                h = hashlib.sha256(fh.read()).hexdigest()
+            out.append((h == sv["sha"], f"{what}: " + ("its SHA-256 is the pin" if h == sv["sha"] else
+                                                      f"its SHA-256 {h} is not the pin {sv['sha']}: the run will not start")))
+        else:
+            out.append((True, f"{what}: owned by root, mode {stat.S_IMODE(st.st_mode):o} (not pinned: add sha256=)"))
+    return out
+
+
 RULE_WORDS = {
     "default_deny_unknown": "no rule allows it",
     "resolution_failed": "the path could not be resolved (missing, or outside what the agent can reach)",
@@ -1518,17 +1631,30 @@ def cmd_refusals(args):
         info(("On behalf of " + f"{u.get('subject')} (token from {u.get('issuer')}, "
               f"{'verified' if u.get('verified') is True else 'NOT marked verified'})" if u else
               "On behalf of no user (no token was given)") +
-             (f"; sub-agents: {', '.join(f'{t} ({n} decisions)' for t, n in sorted(s['subagents'].items()))}"
+             (f"; sub-agents: {', '.join(f'{t}' + (' (MCP server)' if t in s['mcp_servers'] else '') + f' ({n} decisions)' for t, n in sorted(s['subagents'].items()))}"
               if s["subagents"] else "") + ".")
         if s["expired"]:
             info(f"The user's token expired during the run ({'the run was revoked' if s['expired'].get('action') == 'revoke' else 'recorded; the run went on'}).")
         info("")
+    if getattr(args, "for_", None):                                                # v1.31: --for NAME
+        args.subagent = args.for_
     if args.user is not None or args.subagent is not None:                         # v1.28.1: filters
         if args.user is not None and (not s["user"] or s["user"].get("subject") != args.user):
             info(f"This run was not on behalf of {args.user}" +
                  (f" (it was on behalf of {s['user'].get('subject')})." if s["user"] else " (no user)."))
             return 0
-        if args.subagent is not None:
+        if args.subagent is not None and getattr(args, "for_", None) and policy:
+            # v1.31 review: --for NAME: the refusals decided as that confined
+            # subject (the innermost one in each chain), as suggest --for
+            conf = varek_suggest.confined_subjects(tool("vdp_check"), policy)
+            want = conf.get(args.for_)
+            if want is None:
+                raise CliError(f"{args.for_} is not a confined subject of the policy this run used",
+                               fix="`varek policy show` lists its MCP servers and confined sub-agents")
+            s["refusals"] = [r for r in s["refusals"] if varek_suggest.subject_of(r, conf) == want]
+            s["refused"] = len(s["refusals"])
+            ends, s["cred_refused"] = [], []
+        elif args.subagent is not None:
             s["refusals"] = [r for r in s["refusals"] if isinstance(r.get("obo"), list) and
                              any(isinstance(x, str) and x.startswith(f"subagent:{args.subagent}#") for x in r["obo"])]
             s["refused"] = len(s["refusals"])
@@ -1585,7 +1711,38 @@ def cmd_refusals(args):
             hint(f"{where}; " + ("let through (dry run: not enforced)" if dry else
                                  "the agent got 403 Forbidden and the connection ended"))
             continue
+        if r.get("action") == "net.mcp":                                            # v1.31: an MCP call
+            rl = r.get("rule")
+            text = policy_line_text(policy, line) if policy and isinstance(line, int) and line > 0 else None
+            what = {"mcp_unreadable": f"the call could not be read: {r.get('mcp_error', '?')}",
+                    "mcp_header_mismatch": f"its headers disagree with its body: {r.get('mcp_error', '?')}",
+                    "mcp_token_user": "its bearer token is the run's user token",
+                    "mcp_token_audience": "its bearer token is for another server",
+                    "mcp_token_expired": "its bearer token has expired",
+                    "mcp_token_malformed": "its bearer token is a JWT that cannot be read",
+                    "credential_expired": "the MCP token its rule names has expired",
+                    "max_body": "its body is over its rule's max_body",
+                    "revoked": RULE_WORDS["revoked"]}.get(rl) or \
+                (f"policy line {line}" + (f": {text}" if text else "") if isinstance(line, int) and line > 0
+                 else "no mcp rule allows it")
+            call = f"{r.get('mcp_method') or '?'} {r.get('mcp_name') or ''}".rstrip()
+            info(f"  {'WOULD_REFUSE' if dry else verdict_word(r):11}  {'net.mcp':13}  {call} at {r.get('mcp_url', '?')}")
+            ch = obo_text(r)
+            hint(f"{what}; " + ("let through (dry run: not enforced)" if dry else
+                                f"{'sub-agent ' + ch if ch else 'the agent'} got a JSON-RPC error in a 403"))
+            continue
         rl = r.get("rule")
+        if rl == "subagent_env":
+            # v1.31 review: a confined subject launched with a variable that names code
+            if r.get("action") == "process.exec":
+                info(f"  {verdict_word(r):11}  {'process.exec':13}  {r.get('resolved') or r.get('target', '?')}")
+                hint(f"a confined subject's launch with {r.get('env', '?')} set, which names code its launcher "
+                     f"chose (it would run under the subject's rules); launch it without that variable")
+            else:
+                info(f"  {'KILLED':11}  {r.get('action', '?'):13}  pid {r.get('agent_pid')} ({r.get('exe', '?')})")
+                hint(f"launched as a confined subject with {r.get('env', '?')} set after its launch was decided; "
+                     f"the process was killed before this call was answered")
+            continue
         if rl == "exec_identity_mismatch":
             # v1.27: a process found running a program the Warden did not decide to run
             info(f"  {'KILLED':11}  {r.get('action', '?'):13}  pid {r.get('agent_pid')} ran {r.get('exe', '?')}")
@@ -1709,7 +1866,52 @@ def cmd_audit(args):
     return run_cmd(argv, check=False).returncode
 
 
+def cmd_export_ocsf(args):
+    """v1.31: `varek export --format ocsf`: OCSF 1.9.0 events (tools/varek_ocsf.py),
+    audited first; --follow tails a live run; --verify checks events against
+    their stream."""
+    cfg = config_or_defaults()
+    log = args.follow or latest_log(cfg, args.log)
+    if args.follow and not os.path.exists(log):
+        raise CliError(f"no stream at {log}", fix="give the path the run writes its verdict stream to")
+    s = summarize(read_records(log)) if not args.follow else None
+    policy = _policy_for_log(cfg, s) if s else (args.policy or cfg.get("policy"))
+    if args.policy:
+        policy = args.policy
+    if not policy:
+        raise CliError("the policy file this run used is not on this host",
+                       fix="restore it, or give it with --policy; the events name the policy the run used")
+    argv = [sys.executable, tool("varek_ocsf.py"), "--policy", policy, "--checker", tool("vdp_cert_check")]
+    # review: the key given, else the configured one; the stream is audited
+    # with it for --verify too
+    pub = args.pubkey or _pubkey(cfg)
+    if pub:
+        argv += ["--pubkey", pub]
+    if cfg["anchor"] and os.path.isfile(cfg["anchor"]):
+        argv += ["--anchor", cfg["anchor"]]
+    if args.verify:
+        argv += ["--verify", args.verify, "--log", log]
+    else:
+        argv += ["--follow", log] if args.follow else ["--log", log]
+        out = args.output or (None if args.follow else re.sub(r"\.log$", "", log) + ".ocsf.jsonl")
+        if out:
+            argv += ["--output", out]
+        if args.follow and args.idle:
+            argv += ["--idle", str(args.idle)]
+    if args.allow_incomplete:
+        argv.append("--allow-incomplete")
+    rc = run_cmd(argv, check=False).returncode
+    if rc == 0 and not args.verify and not args.follow:
+        ok(f"OCSF 1.9.0 events written to {out}")
+        hint(f"anyone can check them against the stream with `varek export --format ocsf --verify {out} {log}`")
+    return rc
+
+
 def cmd_export(args):
+    if getattr(args, "format", "cyclonedx") == "ocsf":                  # v1.31
+        return cmd_export_ocsf(args)
+    if args.follow:
+        raise CliError("--follow is for --format ocsf")
     if args.verify:
         cfg = load_config(required=False)
         pub = args.pubkey or (_pubkey(cfg) if cfg else None)
@@ -1837,6 +2039,60 @@ def cmd_bench_proxy(args, cfg):
     return 0 if res["ok"] and not budget_fail else 1
 
 
+def cmd_bench_mcp(args, cfg):
+    """v1.31: `varek bench --mcp`."""
+    import varek_bench_mcp          # only here: the rest of the command does not need it
+    if args.policy or args.bare:
+        raise CliError("--mcp measures with the bench's own policies; --policy and --bare do not apply")
+    args.n = 100 if args.n is None else args.n
+    args.warmup = 10 if args.warmup is None else args.warmup
+    args.rounds = 3 if args.rounds is None else args.rounds
+    if args.n < 10 or args.rounds < 1 or args.warmup < 0:
+        raise CliError("use -n of at least 10, --rounds of at least 1 and --warmup of 0 or more")
+    run_as = args.run_as or (cfg["run_as"] if cfg else "nobody")
+    sign_key = cfg["sign_key"] if cfg and cfg["sign_key"] and not args.no_sign else None
+    if args.output and not os.access(os.path.dirname(os.path.abspath(args.output)), os.W_OK):
+        raise CliError(f"cannot write {args.output}", fix="give -o a path in a writable directory")
+    if SHOW_COMMANDS:
+        print(_paint("2", f"$ {warden_bin()} <bench policy> --dns-server <bench> --run-as {run_as} -- "
+                          f"python3 bench_mcp_client.py ...  (a request rule and an MCP rule, and natively)"),
+              file=sys.stderr)
+    progress = (lambda m: None) if args.json else (
+        lambda m: print(_paint("2", f"[varek] bench --mcp {m}"), file=sys.stderr))
+    try:
+        res = varek_bench_mcp.run(warden_bin(), tool("vdp_cert_check"), n=args.n, warmup=args.warmup,
+                                  rounds=args.rounds, run_as=run_as, sign_key=sign_key,
+                                  progress=progress, keep=args.keep)
+    except varek_bench.BenchError as e:
+        raise CliError(str(e), fix=e.fix)
+    res["varek_command"] = CLI_VERSION
+    budget_fail = []
+    if args.max_added_p50 is not None:
+        budget_fail = [f"{r['label']} ({m})" for r in res["sizes"].values()
+                       for m, v in r["added_p50_us"].items() if v > args.max_added_p50]
+        res["budget"] = {"max_added_p50_us": args.max_added_p50, "over": budget_fail}
+    if args.output:
+        try:
+            with open(args.output, "w") as fh:
+                json.dump(res, fh, indent=2)
+                fh.write("\n")
+        except OSError as e:
+            warn(f"could not write {args.output}: {e}")
+            args.output = None
+    if args.json:
+        print(json.dumps(res, indent=2))
+    else:
+        sys.stdout.write(varek_bench_mcp.format_report(res, CLI_VERSION))
+        if budget_fail:
+            fail(f"added p50 over {args.max_added_p50} us: " + ", ".join(budget_fail))
+        if args.output:
+            ok(f"results written to {args.output}")
+        if res.get("kept"):
+            info(f"  kept: the bench's files in {res['kept'][0]}; its policies and verdict "
+                 f"streams in {res['kept'][1]}")
+    return 0 if res["ok"] and not budget_fail else 1
+
+
 def cmd_bench_subagents(args, cfg):
     """v1.28.1: `varek bench --subagents`: what attributing every call to its
     process's control group costs. The bench's own calls (opens and connects)
@@ -1929,11 +2185,12 @@ def cmd_bench_subagents(args, cfg):
     return 0 if res["ok"] else 1
 
 
-def _bench_bases(args, cfg, bases, what):
+def _bench_bases(args, cfg, bases, what, subjects=None):
     """v1.29: the bench's own calls (opens and connects) under each of
     several base policies (label -> text, the bench's rules after each),
     alternated round by round, so the differences are what each base costs.
-    The medians of the rounds' p50s, per kind and base."""
+    The medians of the rounds' p50s, per kind and base. v1.31: subjects
+    (label -> "agent" or "server"), who makes the calls (varek_bench)."""
     import statistics
     import tempfile
     if args.policy or args.bare:
@@ -1965,7 +2222,8 @@ def _bench_bases(args, cfg, bases, what):
                 try:
                     per[m].append(varek_bench.run(warden_bin(), tool("bench_workload"), base_policy=paths[m],
                                                   base_label=m, n=n, warmup=warmup, rounds=1,
-                                                  run_as=run_as, sign_key=sign_key, keep=False))
+                                                  run_as=run_as, sign_key=sign_key, keep=False,
+                                                  subject=(subjects or {}).get(m)))
                 except varek_bench.BenchError as e:
                     raise CliError(f"{m}: {e}", fix=e.fix)
     finally:
@@ -2079,6 +2337,66 @@ def cmd_bench_baseline(args, cfg):
     return 0 if res["ok"] else 1
 
 
+def cmd_bench_for(args, cfg):
+    """v1.31: `varek bench --for`: what deciding a call as a confined subject
+    (an MCP server, D3) costs, against deciding it as the agent. The bench's
+    calls are made by a copy of the workload the agent launches: as the
+    agent, after the baseline's rules; as a server declared by an `mcp
+    server` line, whose rules are the bench's only (the baseline is the
+    agent's); and as a server with its own copy of the baseline (as `varek
+    run --mcp` writes it). All under `require warden 1.31`."""
+    import pwd
+    import tempfile
+    try:
+        pw = pwd.getpwnam(args.run_as or (cfg["run_as"] if cfg else "nobody"))
+    except KeyError:
+        raise CliError("--run-as: no such user")
+    proj = tempfile.mkdtemp(prefix="varek-bench-proj-")
+    os.chmod(proj, 0o755)
+    try:
+        base = re.sub(r"(?m)^require warden \S+\s*$", "require warden 1.31",
+                      varek_baseline.generate(proj, pw, f"/tmp/varek-{pw.pw_uid}", None), count=1)
+        own = base + "\n" + "\n".join(varek_baseline.server_rules(varek_bench.SERVER_NAME, proj)) + "\n"
+        bases = {"agent": base, "server": base, "server + own": own}
+        res = _bench_bases(args, cfg, bases, "for",
+                           subjects={"agent": "agent", "server": "server", "server + own": "server"})
+    finally:
+        shutil.rmtree(proj, ignore_errors=True)
+    sname = varek_bench.SERVER_NAME
+    for m, text in bases.items():
+        mine = [ln for ln in text.splitlines() if re.match(r"\s*(allow|deny)\b", ln)]
+        srv = sum(1 for ln in mine if re.search(rf"\sfor={sname}\b", ln.split("#", 1)[0]))
+        bench = len(varek_bench.bench_rules("/x", {"allowed": 1, "denied": 2, "request": 3}))
+        res["bases"][m]["decided_against"] = (srv if m != "agent" else len(mine) - srv) + bench
+    if args.output:
+        try:
+            with open(args.output, "w") as fh:
+                json.dump(res, fh, indent=2)
+                fh.write("\n")
+        except OSError as e:
+            warn(f"could not write {args.output}: {e}")
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return 0 if res["ok"] else 1
+    _bench_head("for", res)
+    cols = [k for k, _ in varek_bench.KINDS]
+    short = {"open_allowed": "open ok", "open_denied": "open deny", "open_unknown": "open none",
+             "connect_allowed": "conn ok", "connect_denied": "conn deny", "request": "request"}
+    print("the Warden's own time per decision (p50, us), by who makes the calls:")
+    print(f"{'calls made by':22} {'rules':>5} " + " ".join(f"{short.get(k, k[:9]):>9}" for k in cols))
+    for m, b in res["bases"].items():
+        print(f"{m:22} {b['decided_against']:>5} " +
+              " ".join(f"{_fmt_us(res['kinds'][k][m]['decision_p50_us']):>9}" for k in cols))
+    print()
+    print(f"agent: the calls are the agent's, after the baseline's rules. server: the agent launches an MCP "
+          f"server (mcp server {sname}), which makes them; its rules are the bench's only (for={sname}). "
+          f"server + own: it also has its own copy of the baseline, as varek run --mcp writes it. rules: "
+          f"the rules each call is decided against (the subject's own, the bench's included).")
+    print("checks: " + ("every run's outcomes as expected, each call decided as its subject"
+                        if res["ok"] else "SOME CHECKS FAILED (run with --json)"))
+    return 0 if res["ok"] else 1
+
+
 def _fmt_us(v):
     return "-" if v is None else (f"{v:.0f}" if v >= 10 else f"{v:.1f}")
 
@@ -2092,6 +2410,10 @@ def cmd_bench(args):
         return cmd_bench_open_as(args, cfg)
     if getattr(args, "baseline", False):
         return cmd_bench_baseline(args, cfg)
+    if getattr(args, "for_", False):                                               # v1.31
+        return cmd_bench_for(args, cfg)
+    if getattr(args, "mcp", False):
+        return cmd_bench_mcp(args, cfg)
     if args.proxy:
         return cmd_bench_proxy(args, cfg)
     if args.launches:
@@ -2241,6 +2563,8 @@ def build_parser():
     x.add_argument("log", nargs="?", help="a verdict log (default: the last run)")
     x.add_argument("-o", "--output", help="write the draft here instead of to stdout")
     x.add_argument("--force", action="store_true", help="overwrite --output if it exists")
+    x.add_argument("--for", dest="for_", metavar="NAME", help="v1.31: rules for this MCP server (or confined "
+                   "sub-agent), from its refusals, each written for=NAME")
     x.set_defaults(fn=cmd_policy_suggest)
     x = psub.add_parser("use", help="make a pack or file the active policy (root)")
     x.add_argument("pack")
@@ -2272,6 +2596,10 @@ def build_parser():
     sp.add_argument("--writable-exec", action="store_true",
                     help="let the agent launch files in the directories it may write (the Warden's "
                          "--writable-exec; recorded)")
+    sp.add_argument("--mcp", action="append", metavar="NAME=PATH", default=[],
+                    help="v1.31, with the baseline: run the MCP server at PATH (when the agent launches it) "
+                         "confined as NAME, decided by rules of its own: the system read-only and the working "
+                         "directory read-only; pinned to the file's SHA-256 (repeat for more servers)")
     sp.add_argument("--plan", help="check this action-graph plan before the agent starts")
     sp.add_argument("--run-as", help="unprivileged user for the agent (default from settings; with the "
                                      "baseline, the user who ran sudo)")
@@ -2298,6 +2626,8 @@ def build_parser():
     sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")
     sp.add_argument("-n", type=int, default=25, help="how many to show (default 25)")
     sp.add_argument("--subagent", metavar="NAME", help="only the calls made for this sub-agent (v1.28.1)")
+    sp.add_argument("--for", dest="for_", metavar="NAME", help="only the calls made for this MCP server or "
+                    "confined sub-agent (v1.31; the same as --subagent)")
     sp.add_argument("--user", metavar="SUB", help="only if the run was on behalf of this user (v1.28.1)")
     g = sp.add_mutually_exclusive_group()
     g.add_argument("--enforced", action="store_true", help="only the calls refused (in a dry run, v1.29)")
@@ -2309,14 +2639,23 @@ def build_parser():
     sp.add_argument("--allow-incomplete", action="store_true",
                     help="audit a run that has no run_end yet")
 
-    sp = add("export", cmd_export, "write CycloneDX 1.6 authorization evidence for a run")
+    sp = add("export", cmd_export, "write CycloneDX 1.6 authorization evidence, or OCSF 1.9.0 events, for a run")
     sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")
-    sp.add_argument("-o", "--output", help="output file (default: next to the log, .cdx.json)")
+    sp.add_argument("--format", choices=("cyclonedx", "ocsf"), default="cyclonedx",
+                    help="cyclonedx (default) or ocsf: OCSF 1.9.0 events, one per line (v1.31)")
+    sp.add_argument("--follow", metavar="STREAM", help="ocsf: tail a live run's stream, writing each event "
+                    "as its record is chained (to stdout, or -o)")
+    sp.add_argument("--policy", help="ocsf: the policy file the run used (default: found from the log)")
+    sp.add_argument("--idle", type=float, default=0, metavar="SECONDS",
+                    help="ocsf --follow: end, with a failed verdict, after this long with no new record "
+                         "(default: wait for the run's end)")
+    sp.add_argument("-o", "--output", help="output file (default: next to the log, .cdx.json or .ocsf.jsonl)")
     sp.add_argument("--agent", default="agent", help="name of the agent, for the evidence")
     sp.add_argument("--no-sign", action="store_true", help="do not sign the evidence")
     sp.add_argument("--allow-incomplete", action="store_true",
                     help="export a run that has no run_end yet")
-    sp.add_argument("--verify", metavar="BOM", help="verify a signed evidence file instead")
+    sp.add_argument("--verify", metavar="FILE", help="verify a signed evidence file instead (ocsf: check "
+                    "events against the log they were exported from)")
     sp.add_argument("--pubkey", help="public key to verify with (default from settings)")
 
     sp = add("bench", cmd_bench, "measure what the Warden adds per call on this host (root)",
@@ -2336,6 +2675,11 @@ def build_parser():
     sp.add_argument("--baseline", action="store_true",
                     help="v1.29: the decision time under the baseline and each profile, against a pack")
     sp.add_argument("--pack", metavar="NAME", help="with --baseline: the pack to compare with (default healthcare)")
+    sp.add_argument("--for", dest="for_", action="store_true",
+                    help="v1.31: the decision time of a confined MCP server's calls against the agent's")
+    sp.add_argument("--mcp", action="store_true",
+                    help="v1.31: MCP calls over HTTPS of 1 KiB to 1 MiB, natively, under a request rule and "
+                         "decided as MCP calls (defaults -n 100 --warmup 10 --rounds 3)")
     sp.add_argument("--launches", action="store_true",
                     help="measure decided program launches instead (v1.27): launches and an open "
                          "natively, with launches off and on (defaults -n 200 --warmup 20 --rounds 3)")

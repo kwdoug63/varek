@@ -78,7 +78,7 @@ openas "require warden 1.27: as root"                                    'requir
 openas "no require: as root"                                             'allow path /tmp/\n'                      off
 openas "1.29 after 1.28: the highest counts"                             'require warden 1.28\nrequire warden 1.29\n' on
 printf 'require warden 1.99\n' > "$OUT/p.txt"
-check "require warden 1.99: refused by the procedure" sh -c "'$VDP' '$OUT/p.txt' analyze 2>&1 | grep -q 'requires Warden 1.99; this is 1.29'"
+check "require warden 1.99: refused by the procedure" sh -c "'$VDP' '$OUT/p.txt' analyze 2>&1 | grep -Eq 'requires Warden 1.99; this is 1\.(29|[3-9][0-9])'"
 check "require warden 1.99: refused by the checker" sh -c "! '$CERT' '$OUT/p.txt' digest"
 printf 'require warden 1.29\nallow path /usr/ readonly\n' > "$OUT/p.txt"
 
@@ -88,7 +88,7 @@ elif [ "$(id -u)" != 0 ]; then
     skip "the Warden's checks (they run as root: the agent runs as another user)"
 else
     check "the Warden reports 1.29.0 or later" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | python3 -c 'import re,sys; m=re.search(r\"VAREK Warden  (\\d+)\\.(\\d+)\\.(\\d+)\", sys.stdin.read()); sys.exit(0 if m and tuple(map(int, m.groups())) >= (1, 29, 0) else 1)'"
-    check "the Warden starts a 1.29 policy, read as version 1.29" sh -c "'$WARDEN' '$OUT/p.txt' --check-startup 2>&1 | grep -q 'loaded policy .* v1.29 '"
+    check "the Warden starts a 1.29 policy, read as version 1.29 or later" sh -c "'$WARDEN' '$OUT/p.txt' --check-startup 2>&1 | grep -Eq 'loaded policy .* v1\.(29|[3-9][0-9]) '"
 
     # the agent's files: W writable by anyone; a root-owned 0644 file and a
     # 0600 file in it; a directory the agent cannot search, with a file

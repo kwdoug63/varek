@@ -32,7 +32,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden warden-proxy warden-secrets target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
+.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
 
 all: $(BINS)
 
@@ -86,16 +86,16 @@ warden: warden.c warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_sy
 # sealed copy whose SHA-256 it records). It links neither libseccomp nor
 # libsodium, and never holds the signing key; v1.26.1 inspecting mode links
 # OpenSSL here, and only here.
-warden-proxy: warden_proxy_helper.c warden_proxy.h proxy_parse.c proxy_parse.h proxy_ca.c proxy_ca.h
+warden-proxy: warden_proxy_helper.c warden_proxy_mcp.inc.c warden_proxy.h proxy_parse.c proxy_parse.h proxy_ca.c proxy_ca.h mcp_json.c mcp_json.h
 	@$(MAKE) -s --no-print-directory deps-check-ssl
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_proxy_helper.c proxy_parse.c proxy_ca.c -lssl -lcrypto
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_proxy_helper.c proxy_parse.c proxy_ca.c mcp_json.c -lssl -lcrypto
 
 # v1.28: warden-secrets, the helper that fetches the credentials a policy
 # names (file, HashiCorp Vault, AWS Secrets Manager). Its own program, as
 # the proxy is, so the Warden links no TLS code; it never sees a value.
-warden-secrets: warden_secrets_helper.c warden_secrets.h
+warden-secrets: warden_secrets_helper.c warden_secrets.h mcp_json.c mcp_json.h mcp_aud.h
 	@$(MAKE) -s --no-print-directory deps-check-ssl
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_secrets_helper.c -lssl -lcrypto
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_secrets_helper.c mcp_json.c -lssl -lcrypto
 
 # v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
 # ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that
@@ -418,6 +418,10 @@ tests/v1290_lat: tests/v1290_lat.c
 latency-v1290: warden tools/vdp_check tools/vdp_cert_check tools/bench_workload tests/v1290_lat
 	@./tests/latency_v1290.sh
 
+# v1.31 step 9: bench --for, bench --mcp and startup with MCP servers
+latency-v1310: warden warden-proxy tools/vdp_check tools/vdp_cert_check tools/bench_workload
+	@./tests/latency_v1310.sh
+
 # v1.28.1 step 3: the sub-agent test program
 tests/v1281_sub: tests/v1281_sub.c
 	$(CC) -O2 -Wall -Wextra -pthread -o $@ $<
@@ -431,6 +435,22 @@ tests/v1290_open: tests/v1290_open.c
 
 test-v1290: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check tests/v1290_open
 	@./tests/test_v1290.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
+
+# v1.31 (docs/security/v1.31-standards.md)
+tests/v1310_peek: tests/v1310_peek.c
+	$(CC) -O2 -Wall -Wextra -o $@ $<
+
+test-v1310: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check tests/v1281_sub tests/v1310_peek
+	@./tests/test_v1310.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
+
+# v1.31: the strict JSON parser for MCP calls (mcp_json.c), under ASan and
+# UBSan: its vectors, then MJ_N mutated inputs
+MJ_N ?= 1000000
+tests/mcp_json_test: tests/mcp_json_test.c mcp_json.c mcp_json.h
+	$(CC) -O1 -g -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=all -o $@ tests/mcp_json_test.c mcp_json.c
+
+test-mcp-json: tests/mcp_json_test
+	@./tests/mcp_json_test $(MJ_N)
 
 # v1.26 step 5: the proxy's parsers, under ASan and UBSan: the vectors, then
 # FUZZ_N mutated inputs (make fuzz-proxy-parse FUZZ_N=50000000 for longer).
@@ -496,7 +516,7 @@ clean:
 PREFIX ?= /opt/varek
 BINDIR ?= /usr/local/bin
 INSTALL_TOOLS := tools/varek tools/vdp_check tools/vdp_cert_check tools/varek_keygen \
-	tools/varek_audit.py tools/varek_cyclonedx.py tools/varek_ed25519.py \
+	tools/varek_audit.py tools/varek_cyclonedx.py tools/varek_ocsf.py tools/varek_ed25519.py \
 	tools/varek_preflight.sh tools/varek_anchor_forward.py tools/varek_anchor_receiver.sh \
 	tools/varek_license.py tools/varek_bench.py tools/varek_bench_proxy.py tools/bench_proxy_client.py tools/varek_bench_launch.py \
 	tools/varek_baseline.py tools/varek_suggest.py \
@@ -521,4 +541,4 @@ uninstall:
 	@echo "removed $(PREFIX); settings in /etc/varek and logs in /var/log/varek were kept"
 
 test-cli: warden warden-proxy tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
-	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_license.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py
+	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_license.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py tests/test_varek_bench_mcp.py

@@ -72,7 +72,11 @@
 // v1.26.1: a request is (request, s) with s the request object
 // "METHOD scheme://host:port/path?query"; request rules are globs over it.
 //
-// The checker implements the policy grammar of VAREK 1.27 (smt_decide.h). A
+// v1.31: an MCP call is (mcp, s) with s "<canonical URL>#<method>#<name>";
+// mcp rules are globs over it. Each rule decides for one subject (for=), and
+// a certificate is checked against the calling subject's rules only.
+//
+// The checker implements the policy grammar of VAREK 1.31 (smt_decide.h). A
 // policy it cannot parse is refused, so the Warden does not start.
 
 #ifndef VAREK_VDP_CHECKER_H
@@ -83,14 +87,14 @@
 #include <stdint.h>
 
 #define VDPC_GRAMMAR_MAJOR 1
-#define VDPC_GRAMMAR_MINOR 29
+#define VDPC_GRAMMAR_MINOR 31
 
 #define VDPC_MAX_S        4095
-#define VDPC_MAX_RULES    256
+#define VDPC_MAX_RULES    512      /* v1.31: VDP_MAX_RULES */
 #define VDPC_MAX_STRETCH  32          /* a glob has at most 32 wildcards */
 #define VDPC_GLOB_MAX_TOTAL 4096      /* glob tokens per policy (v1.16; was 65536) */
 
-enum { VDPC_PATH = 0, VDPC_HOST = 1, VDPC_EXEC = 2, VDPC_REQUEST = 3 /* v1.26.1 */ };
+enum { VDPC_PATH = 0, VDPC_HOST = 1, VDPC_EXEC = 2, VDPC_REQUEST = 3 /* v1.26.1 */, VDPC_MCP = 4 /* v1.31 */ };
 
 typedef struct vdpc_rule vdpc_rule_t;
 
@@ -101,6 +105,8 @@ typedef struct {
     int  store;                       /* 1 file, 2 vault, 3 aws-sm */
     char ref[1025];
     int  line;
+    char audience[4096];              /* v1.31: audience=URL, canonical; "" : none */
+    int  opaque;                      /* v1.31: opaque */
 } vdpc_cred_t;
 
 /* v1.28.1: `trust issuer`, `trust spiffe` (smt_decide.h has the forms) */
@@ -114,6 +120,16 @@ typedef struct {
     char domain[256], bundle[1025];
     int  line;
 } vdpc_spiffe_t;
+/* v1.31: `trust mcp-resource URL [audience AUD]`, and the confined subjects
+ * (`mcp server NAME ...`, `subagent=NAME confined`) */
+typedef struct {
+    char url[256], aud[256];
+    int  line;
+} vdpc_mcpres_t;
+typedef struct {
+    char name[33];
+    int  rule, mcp, line;
+} vdpc_subject_t;
 
 typedef struct {
     vdpc_rule_t  *rules;
@@ -136,6 +152,10 @@ typedef struct {
     vdpc_spiffe_t spiffe[VDPC_MAX_SPIFFE];
     size_t        nspiffe;
     int           require_obo;        /* v1.28.1: `require on-behalf-of` */
+    vdpc_subject_t subjects[32];      /* v1.31: subject k is subjects[k - 1] */
+    size_t        nsubjects;
+    vdpc_mcpres_t mcpres[8];          /* v1.31 */
+    size_t        nmcpres;
 } vdpc_policy_t;
 
 typedef struct {
@@ -159,6 +179,15 @@ int vdpc_check(const vdpc_policy_t *p, int kind, const char *s, size_t sl,
                uint32_t flags, bool has_flags, const vdpc_cert_t *c,
                char *why, size_t whylen);
 
+/* v1.31: as vdpc_check, for a call of subject subj (0: the agent and every
+ * unconfined sub-agent; k > 0: the confined subject subjects[k - 1]), which
+ * the Warden gives from its own attribution: the deciding rule must be that
+ * subject's, and only that subject's earlier rules are checked.
+ * vdpc_check is vdpc_check_subj with subj 0. */
+int vdpc_check_subj(const vdpc_policy_t *p, int subj, int kind, const char *s, size_t sl,
+                    uint32_t flags, bool has_flags, const vdpc_cert_t *c,
+                    char *why, size_t whylen);
+
 /* A parsed rule, for comparison with another parser (the Warden compares the
  * decision procedure's parse with this one at load). */
 enum { VDPC_M_PREFIX, VDPC_M_EXACT, VDPC_M_SUFFIX, VDPC_M_CONTAINS, VDPC_M_GLOB, VDPC_M_HOST };
@@ -177,6 +206,10 @@ typedef struct {
     const char *cred_hdr;             /* request (v1.28): header=NAME ("" : none) */
     const char *cred_scheme;          /* request (v1.28): header=NAME:SCHEME ("" : none) */
     const char *subagent;             /* exec (v1.28.1): subagent=NAME ("" : none) */
+    int         subj;                 /* v1.31: the subject the rule decides for (for=), 0: the agent */
+    int         confined_subj;        /* v1.31: the confined subject it launches, 0: none */
+    bool        mcp_server;           /* v1.31: an `mcp server` line */
+    const char *sha256;               /* v1.31: its sha256= ("" : none) */
 } vdpc_rule_info_t;
 int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *out);
 

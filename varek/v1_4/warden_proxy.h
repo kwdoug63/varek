@@ -46,7 +46,10 @@ enum { WP_MSG_READY = 1, WP_MSG_CONN = 2, WP_MSG_REQUEST = 3, WP_MSG_UNREADABLE 
         * holds and closes every connection (each reported, why "revoked"),
         * then answers WP_MSG_REVOKED (a struct wp_creds; n: values it still
         * holds, 0) */
-       WP_MSG_REVOKE = 22, WP_MSG_REVOKED = 23 };
+       WP_MSG_REVOKE = 22, WP_MSG_REVOKED = 23,
+       /* v1.31 (docs/security/v1.31-standards.md, section 3): an MCP call,
+        * struct wp_mcpreq and struct wp_mcpverdict below */
+       WP_MSG_MCPREQ = 24, WP_MSG_MCPVERDICT = 25 };
 
 /* v1.28 (docs/security/v1.28-credential-release.md, section 3). Before the
  * agent starts, Warden -> proxy: WP_MSG_PH, each credential's placeholder
@@ -102,6 +105,67 @@ struct wp_reqverdict {
     char     why[96];            /* a refusal: why, for the client's 403 (NUL-terminated) */
     /* v1.28: the credential the allowing rule names (1 + its index; 0: none),
      * the header it goes in, and the scheme before it ("" : the whole value) */
+    uint32_t cred;
+    char     hdr[65];
+    char     scheme[33];
+    /* v1.31: 1, the request is a POST to an MCP endpoint (a URL an mcp rule
+     * names): not decided yet. The proxy reads its whole body (at most
+     * max_body bytes) before sending anything, parses it (mcp_json.h),
+     * checks the Mcp-Method and Mcp-Name headers against it, and reports
+     * WP_MSG_MCPREQ; the Warden decides the call and answers
+     * WP_MSG_MCPVERDICT, whose credential (not this one) the head gets */
+    uint32_t mcp;
+};
+
+/* v1.31: proxy -> Warden, the MCP call a request makes. ok WP_MCP_OK: the
+ * call read; otherwise why says what is wrong, and the Warden refuses it:
+ * WP_MCP_UNREADABLE, not one JSON-RPC call (or the body did not arrive);
+ * WP_MCP_HEADERS, an Mcp-Method or Mcp-Name header disagrees with the body;
+ * WP_MCP_OVER, the body is over the limit the Warden gave. The body
+ * (as sent: a chunked one with its framing) is reported by length and
+ * SHA-256. Every string is NUL-terminated. */
+enum { WP_MCP_UNREADABLE = 0, WP_MCP_OK = 1, WP_MCP_HEADERS = 2, WP_MCP_OVER = 3 };
+/* v1.31 step 5: the bearer token in the call's Authorization header: none
+ * (or another scheme), a credential's placeholder (the swap's), a JWT (its
+ * claims read, its signature not checked: they can only refuse), an opaque
+ * token, or one in a JWT's form whose parts cannot be read */
+enum { WP_TOK_NONE = 0, WP_TOK_PLACEHOLDER = 1, WP_TOK_JWT = 2, WP_TOK_OPAQUE = 3, WP_TOK_MALFORMED = 4 };
+#define WP_AUD_MAX 8
+struct wp_mcpreq {
+    uint32_t type;               /* WP_MSG_MCPREQ */
+    uint32_t ok;
+    uint64_t id;
+    uint64_t seq;                /* the request's (as in WP_MSG_HTTPREQ) */
+    uint64_t body_len;
+    uint8_t  sha256[32];
+    uint32_t has_name, notification;
+    char     why[96];
+    char     method[256];
+    char     name[4096];         /* params.name or params.uri, decoded UTF-8 */
+    char     rpc_id[160];        /* the JSON-RPC id as written ("" : a notification) */
+    char     traceparent[64];
+    char     proto[64];          /* the MCP-Protocol-Version header ("" : none) */
+    /* v1.31 step 5: the bearer token (never the token itself) */
+    uint32_t token;              /* WP_TOK_* */
+    uint32_t naud;               /* a JWT's audiences read */
+    uint32_t aud_over;           /* more than WP_AUD_MAX, one too long, or one not a string */
+    uint32_t has_exp;
+    int64_t  exp;
+    uint8_t  token_sha256[32];   /* of the token (WP_TOK_JWT, _OPAQUE, _MALFORMED) */
+    char     token_why[72];      /* WP_TOK_MALFORMED: why */
+    uint8_t  token_sin_sha256[32]; /* v1.31 review: WP_TOK_JWT: of its signing input (header.payload) */
+    char     aud[WP_AUD_MAX][512];
+};
+/* v1.31: Warden -> proxy, the decision on an MCP call. Allowed: the head
+ * (with the credential, as for WP_MSG_REQVERDICT) and the body are sent;
+ * refused: the client gets a JSON-RPC error (code -32000, why) in an HTTP
+ * 403, and the connection takes no more requests. */
+struct wp_mcpverdict {
+    uint32_t type;               /* WP_MSG_MCPVERDICT */
+    uint32_t allow;
+    uint64_t id;
+    uint64_t seq;
+    char     why[96];
     uint32_t cred;
     char     hdr[65];
     char     scheme[33];

@@ -328,7 +328,7 @@ else
     then pass "the audit accepts the run"
     else flunk "the audit accepts the run ($(tail -3 "$OUT/au.out"))"; fi
     if grep -Eq '"event":"run_start",[^}]*"warden":"1\.(26\.[1-9][0-9]*|2[7-9]\.[0-9]+|[3-9][0-9]\.[0-9]+)"' "$RUN" &&
-       NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 "$HERE/tools/varek" version 2>&1 | grep -q '1\.26\.1\|1\.2[7-9]\.'
+       NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 "$HERE/tools/varek" version 2>&1 | grep -q '1\.26\.1\|1\.2[7-9]\.\|1\.[3-9][0-9]\.'
     then pass "run_start and varek version report the Warden as 1.26.1 (or later)"
     else flunk "the Warden's version ($(grep -o '"warden":"[^"]*"' "$RUN" | head -1))"; fi
     forge() {   # forge <in> <out> <from> <to>: rewrite the first record holding <from>, rechain

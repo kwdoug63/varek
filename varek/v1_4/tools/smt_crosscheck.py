@@ -527,6 +527,70 @@ def https_with_host(u, hi):
         all(0x21 <= ord(ch) <= 0x7e for ch in u)
 
 
+# v1.31 (docs/security/v1.31-standards.md; smt_decide.h): MCP servers, confined
+# subjects, mcp rules. Written from the grammar, independently of both C parsers.
+RUNS_OTHERS_INTERP = ["sh", "bash", "dash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "ash", "busybox",
+                      "python", "python2", "python3", "pypy", "pypy3", "perl", "ruby", "node", "nodejs",
+                      "deno", "bun", "php", "lua", "luajit", "tclsh", "wish", "pwsh", "Rscript", "R",
+                      "julia", "guile", "awk", "gawk", "mawk", "nawk", "java", "jshell", "osascript",
+                      "rbash", "toybox", "ipython", "ipython3", "gdb", "expect"]
+RUNS_OTHERS_LAUNCH = {"npx", "npm", "pnpm", "pnpx", "yarn", "bunx", "corepack", "uvx", "uv", "pipx", "pip", "pip3",
+                      "docker", "podman", "nerdctl", "ctr", "env", "sudo", "doas", "su", "nix", "nix-shell",
+                      "flatpak", "snap", "xargs", "nohup", "setsid", "timeout", "stdbuf", "nice", "ionice",
+                      "chroot", "unshare", "nsenter", "systemd-run", "runuser", "sg",
+                      # v1.31 review
+                      "time", "taskset", "setpriv", "strace", "ltrace", "flock", "bwrap", "firejail", "chrt",
+                      "prlimit", "script", "watch", "xvfb-run", "start-stop-daemon", "tsx", "ts-node", "valgrind",
+                      "numactl", "torsocks", "proxychains", "proxychains4"}
+
+
+def runs_others(path):
+    """A shell, an interpreter, the loader or a launcher, by basename."""
+    b = path.rsplit("/", 1)[-1]
+    if b in RUNS_OTHERS_LAUNCH or b.startswith(("ld-linux", "ld-musl")) or b == "ld.so":
+        return True
+    if b.startswith("ld-") and b[3:4].isdigit() and ".so" in b:
+        return True
+    return any(b.startswith(n) and all(ch in "0123456789." for ch in b[len(n):]) for n in RUNS_OTHERS_INTERP)
+
+
+def mcp_canon(u, https_only, where):
+    """An MCP server's URL in canonical form, with its host and port."""
+    m = re.fullmatch(r"(https?)://([^/]*)(/.*)?", u, re.S)
+    if not m or (https_only and m.group(1) == "http"):
+        raise PolicyError(f"{where}: bad MCP URL")
+    scheme, auth, path = m.group(1), m.group(2), m.group(3) or "/"
+    host, sep, port = auth.partition(":")
+    if sep:
+        if not re.fullmatch(r"[1-9][0-9]{0,4}", port) or int(port) > 65535:
+            raise PolicyError(f"{where}: bad MCP port")
+        port = int(port)
+    else:
+        port = 443 if scheme == "https" else 80
+    if not 1 <= len(host) <= 253 or "@" in host or "*" in host or host_name_form(host) != 1:
+        raise PolicyError(f"{where}: bad MCP host")
+    segs = path.split("/")[1:]
+    for k, sg in enumerate(segs):
+        if sg in (".", "..") or (sg == "" and k < len(segs) - 1):
+            raise PolicyError(f"{where}: bad MCP path segment")
+    for ch in path:
+        if not 0x21 <= ord(ch) <= 0x7e or ch in "\\;#?*[]":
+            raise PolicyError(f"{where}: byte in MCP path")
+    for mm in re.finditer(r"%(.{0,2})", path, re.S):
+        h = mm.group(1)
+        if not re.fullmatch(r"[0-9A-Fa-f]{2}", h) or int(h, 16) in (0x2F, 0x5C) or int(h, 16) in UNRESERVED:
+            raise PolicyError(f"{where}: bad MCP escape")
+    return f"{scheme}://{host}:{port}{path}", host, port
+
+
+def mcp_object(url, method, name):
+    """The object an MCP call is decided on (the Warden's vdp_mcp_object), or None."""
+    if not re.fullmatch(r"[A-Za-z0-9_./\-]{1,128}", method) or any(not 0x20 <= ord(c) <= 0x7e or c == "#" for c in name):
+        return None
+    o = f"{url}#{method}#{name}"
+    return o if len(o) <= L else None
+
+
 def trust_parse(toks, issuers, spiffe, where):
     """v1.28.1: `trust issuer URL audience AUD [jwks URL]` or `trust spiffe
     DOMAIN bundle PATH`, appended to issuers or spiffe; or PolicyError."""
@@ -575,6 +639,31 @@ def parse_lines(raw_lines, path):
     upstream = None                    # v1.26 section 5: `proxy upstream http://HOST:PORT`
     inspect, passthrough = False, []   # v1.26.1: `proxy inspect`, `proxy passthrough host NAME`
     creds = []                         # v1.28: (name, store, ref), in order
+    cred_aud = []                      # v1.31: (audience, opaque) of each credential
+    subjects = []                      # v1.31: (name, rule index, mcp, line); subject k is subjects[k - 1]
+    mcpres = []                        # v1.31: (url, aud, line)
+
+    def subj_named(n):
+        for k, sj in enumerate(subjects):
+            if sj[0] == n:
+                return k + 1
+        return 0
+
+    def subj_register(i, mcp, where):
+        n = rules[i]["subagent"]
+        if subj_named(n) or len(subjects) >= 32 or \
+                any(r.get("subagent") == n and not r.get("csubj") for r in rules[:i]):
+            raise PolicyError(f"{where}: bad confined subject {n}")
+        subjects.append((n, i, mcp, rules[i]["line"]))
+        rules[i]["csubj"] = len(subjects)
+
+    def for_opt(t, where):
+        if req < (1, 31):
+            raise PolicyError(f"{where}: for= before 1.31")
+        k = subj_named(t[4:])
+        if not k:
+            raise PolicyError(f"{where}: for= names no confined subject")
+        return k
     issuers, spiffe, require_obo = [], [], False   # v1.28.1
     if True:
         for lineno, raw in enumerate(raw_lines, 1):
@@ -602,6 +691,16 @@ def parse_lines(raw_lines, path):
                 # v1.28.1
                 if req < (1, 28):
                     raise PolicyError(f"{path}:{lineno}: trust before 1.28")
+                if len(toks) >= 2 and toks[1] == "mcp-resource":
+                    # v1.31: trust mcp-resource URL [audience AUD]
+                    if req < (1, 31) or not (len(toks) == 3 or (len(toks) == 5 and toks[3] == "audience")) or \
+                            len(toks[2]) > 255 or any(m_[0] == toks[2] for m_ in mcpres) or len(mcpres) >= 8 or \
+                            (len(toks) == 5 and (not 1 <= len(toks[4]) <= 255 or
+                                                 any(not 0x21 <= ord(ch) <= 0x7e for ch in toks[4]))):
+                        raise PolicyError(f"{path}:{lineno}: bad trust mcp-resource")
+                    mcp_canon(toks[2], True, f"{path}:{lineno}")
+                    mcpres.append((toks[2], toks[4] if len(toks) == 5 else "", lineno))
+                    continue
                 trust_parse(toks, issuers, spiffe, f"{path}:{lineno}")
                 continue
             if toks[0] == "require":
@@ -609,7 +708,7 @@ def parse_lines(raw_lines, path):
                 if len(toks) != 3 or toks[1] != "warden" or not m:
                     raise PolicyError(f"{path}:{lineno}: bad directive")
                 v = (int(m.group(1)), int(m.group(2)))
-                if v > (1, 29):
+                if v > (1, 31):
                     raise PolicyError(f"{path}:{lineno}: requires newer Warden")
                 if legacy_name and v >= (1, 24):
                     raise PolicyError(f"{path}:{lineno}: require warden 1.24 after a host name")
@@ -660,7 +759,43 @@ def parse_lines(raw_lines, path):
                 # v1.28: credential NAME from STORE:REF (smt_decide.h)
                 if req < (1, 28):
                     raise PolicyError(f"{path}:{lineno}: credential before 1.28")
+                # v1.31: [audience=URL [opaque]]
+                aud, opq = "", False
+                if len(toks) in (5, 6):
+                    if req < (1, 31) or not toks[4].startswith("audience=") or \
+                            (len(toks) == 6 and toks[5] != "opaque"):
+                        raise PolicyError(f"{path}:{lineno}: bad credential audience")
+                    aud = mcp_canon(toks[4][9:], True, f"{path}:{lineno}")[0]
+                    if len(aud) > L:                          # v1.31 review: as the decision procedure
+                        raise PolicyError(f"{path}:{lineno}: an MCP server's URL is too long")
+                    opq = len(toks) == 6
+                    toks = toks[:4]
                 creds.append(credential_parse(toks, [c[0] for c in creds], f"{path}:{lineno}"))
+                cred_aud.append((aud, opq))
+                continue
+            if toks[0] == "mcp":
+                # v1.31: mcp server NAME exec PATH [sha256=HEX]
+                if req < (1, 31) or len(toks) not in (5, 6) or toks[1] != "server" or toks[3] != "exec":
+                    raise PolicyError(f"{path}:{lineno}: bad mcp server")
+                nm, fp = toks[2], toks[4]
+                segs = fp.split("/")
+                if not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", nm) or len(fp) > 1024 or \
+                        any(not 0x21 <= ord(ch) <= 0x7e for ch in fp) or segs[0] != "" or len(segs) < 2 or \
+                        any(sg in ("", ".", "..") for sg in segs[1:]) or runs_others(fp):
+                    raise PolicyError(f"{path}:{lineno}: bad mcp server")
+                sha = ""
+                if len(toks) == 6:
+                    if not re.fullmatch(r"sha256=[0-9a-f]{64}", toks[5]):
+                        raise PolicyError(f"{path}:{lineno}: bad sha256")
+                    sha = toks[5][7:]
+                if len(rules) >= 512:
+                    raise PolicyError(f"{path}: more than 512 rules")
+                r = {"verb": "allow", "kind": "exec", "op": "eq", "c": fp, "rx": None, "gtoks": None,
+                     "mask": 0, "value": 0, "line": lineno, "portless": False, "name": False,
+                     "wild": False, "subagent": nm, "subj": 0, "mcp_server": True, "sha256": sha}
+                r["lang"] = atom_rx(rx, r)
+                rules.append(r)
+                subj_register(len(rules) - 1, True, f"{path}:{lineno}")
                 continue
             verb, kind = toks[0], toks[1]
             if verb not in ("allow", "deny"):
@@ -669,8 +804,8 @@ def parse_lines(raw_lines, path):
                 # v1.26.1: <verb> request METHOD URL [max_body=N]
                 if req < (1, 26) or len(toks) < 4:
                     raise PolicyError(f"{path}:{lineno}: bad request rule")
-                if len(rules) >= 256:
-                    raise PolicyError(f"{path}: more than 256 rules")
+                if len(rules) >= 512:
+                    raise PolicyError(f"{path}: more than 512 rules")
                 const, rhost, rwild, rport = request_glob(toks[2], toks[3], f"{path}:{lineno}")
                 grx, nt, gtoks = parse_glob(rx, const, f"{path}:{lineno}")
                 glob_tokens += nt
@@ -678,7 +813,13 @@ def parse_lines(raw_lines, path):
                     raise PolicyError(f"{path}:{lineno}: glob tokens over the policy total")
                 max_body = 0
                 cred, header = None, None          # v1.28
+                rsubj = 0                          # v1.31
                 for t in toks[4:]:
+                    if t.startswith("for="):
+                        if rsubj:
+                            raise PolicyError(f"{path}:{lineno}: for= twice")
+                        rsubj = for_opt(t, f"{path}:{lineno}")
+                        continue
                     if t.startswith(("credential=", "header=")):
                         if req < (1, 28) or verb != "allow":
                             raise PolicyError(f"{path}:{lineno}: credential option here")
@@ -703,16 +844,86 @@ def parse_lines(raw_lines, path):
                         raise PolicyError(f"{path}:{lineno}: max_body over 1 GiB")
                 if (cred is None) != (header is None):
                     raise PolicyError(f"{path}:{lineno}: credential= and header= go together")
+                if cred is not None and cred_aud[cred - 1][0]:
+                    raise PolicyError(f"{path}:{lineno}: an MCP access token on a request rule")
                 if cred is not None and not toks[3].startswith("https://"):
                     raise PolicyError(f"{path}:{lineno}: credential= on an http:// rule")
                 r = {"verb": verb, "kind": kind, "op": "glob", "c": const, "rx": grx, "gtoks": gtoks,
                      "mask": 0, "value": 0, "line": lineno, "portless": False, "name": False,
                      "wild": False, "max_body": max_body, "rhost": rhost, "rwild": rwild, "rport": rport,
-                     "cred": cred or 0, "header": header or ("", "")}
+                     "cred": cred or 0, "header": header or ("", ""), "subj": rsubj}
                 # v1.26.1 review: a URL without a query: an allow rule holds on
                 # no string with a '?'; a deny rule holds when its glob matches
                 # the string up to its first '?'
                 r["qmode"] = 0 if "?" in toks[3] else (1 if verb == "allow" else 2)
+                r["lang"] = atom_rx(rx, r)
+                rules.append(r)
+                continue
+            if kind == "mcp":
+                # v1.31: <verb> mcp URL METHOD [NAME] [max_body=N] [credential=C [header=H[:S]]] [for=NAME]
+                where = f"{path}:{lineno}"
+                if req < (1, 31) or len(toks) < 4:
+                    raise PolicyError(f"{where}: bad mcp rule")
+                cu, rhost, rport = mcp_canon(toks[2], False, where)
+                if not re.fullmatch(r"[A-Za-z0-9_./*\-]{1,128}", toks[3]):
+                    raise PolicyError(f"{where}: bad MCP method")
+                rest, nm = toks[4:], "**"
+                if rest and not rest[0].startswith(("max_body=", "credential=", "header=", "for=")):
+                    nm = rest[0]
+                    if any(not 0x21 <= ord(ch) <= 0x7e for ch in nm) or "#" in nm:     # v1.31 review: no '#'
+                        raise PolicyError(f"{where}: bad MCP name")
+                    rest = rest[1:]
+                const = f"{cu}#{toks[3]}#{nm}"
+                if len(const) > L:
+                    raise PolicyError(f"{where}: mcp object over the bound")
+                if len(rules) >= 512:
+                    raise PolicyError(f"{path}: more than 512 rules")
+                grx, nt, gtoks = parse_glob(rx, const, where)
+                glob_tokens += nt
+                if glob_tokens > GLOB_MAX_TOTAL:
+                    raise PolicyError(f"{where}: glob tokens over the policy total")
+                max_body, cred, header, rsubj = 0, None, None, 0
+                for t in rest:
+                    if t.startswith("for="):
+                        if rsubj:
+                            raise PolicyError(f"{where}: for= twice")
+                        rsubj = for_opt(t, where)
+                        continue
+                    if verb != "allow":
+                        raise PolicyError(f"{where}: option on a deny mcp rule")
+                    if t.startswith("credential="):
+                        names = [c[0] for c in creds]
+                        if cred is not None or t[11:] not in names:
+                            raise PolicyError(f"{where}: bad credential=")
+                        cred = names.index(t[11:]) + 1
+                    elif t.startswith("header="):
+                        m = re.fullmatch(TOKEN_RX + r"(?::" + TOKEN_RX + r")?", t[7:])
+                        hdr, _, scheme = t[7:].partition(":")
+                        if header is not None or not m or len(hdr) > 64 or len(scheme) > 32 or \
+                                hdr.lower() in FRAMING_HEADERS:
+                            raise PolicyError(f"{where}: bad header=")
+                        header = (hdr, scheme)
+                    else:
+                        m = re.fullmatch(r"max_body=([1-9][0-9]{0,6})([km]?)", t)
+                        if not m or max_body:
+                            raise PolicyError(f"{where}: bad mcp rule option {t}")
+                        max_body = int(m.group(1)) * {"": 1, "k": 1024, "m": 1 << 20}[m.group(2)]
+                        if max_body > 1 << 30:
+                            raise PolicyError(f"{where}: max_body over 1 GiB")
+                if header is not None and cred is None:
+                    raise PolicyError(f"{where}: header= without credential=")
+                if cred is not None:
+                    if not cu.startswith("https://"):
+                        raise PolicyError(f"{where}: credential= on an http:// rule")
+                    if header is None:
+                        header = ("Authorization", "Bearer")
+                    aud = cred_aud[cred - 1][0]
+                    if aud and (aud != cu or header[0].lower() != "authorization" or header[1].lower() != "bearer"):
+                        raise PolicyError(f"{where}: an MCP access token for another server, or another header")
+                r = {"verb": verb, "kind": kind, "op": "glob", "c": const, "rx": grx, "gtoks": gtoks,
+                     "mask": 0, "value": 0, "line": lineno, "portless": False, "name": False,
+                     "wild": False, "max_body": max_body, "rhost": rhost, "rwild": False, "rport": rport,
+                     "cred": cred or 0, "header": header or ("", ""), "subj": rsubj, "qmode": 0}
                 r["lang"] = atom_rx(rx, r)
                 rules.append(r)
                 continue
@@ -731,8 +942,8 @@ def parse_lines(raw_lines, path):
                 raise PolicyError(f"{path}:{lineno}: constant length")
             if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in const):
                 raise PolicyError(f"{path}:{lineno}: control byte in constant")
-            if len(rules) >= 256:
-                raise PolicyError(f"{path}: more than 256 rules")
+            if len(rules) >= 512:
+                raise PolicyError(f"{path}: more than 512 rules")
             wild = False
             if kind == "host" and const.startswith("*.") and req >= (1, 24):
                 # v1.25: *.<suffix>[:port] -> the glob ?*.<suffix>:<port> (or :*)
@@ -755,8 +966,19 @@ def parse_lines(raw_lines, path):
             budgets = {}
             ack = False
             subagent = ""                  # v1.28.1
+            rsubj, confined = 0, False     # v1.31
             for t in toks[ci + 1:]:
                 bk, _, bv = t.partition("=")
+                if t.startswith("for="):
+                    if rsubj:
+                        raise PolicyError(f"{path}:{lineno}: for= twice")
+                    rsubj = for_opt(t, f"{path}:{lineno}")
+                    continue
+                if t == "confined":
+                    if req < (1, 31) or confined:
+                        raise PolicyError(f"{path}:{lineno}: bad confined")
+                    confined = True
+                    continue
                 if bk == "subagent" and _:
                     # v1.28.1: subagent=NAME on an allow exec rule
                     if req < (1, 28) or kind != "exec" or verb != "allow" or subagent or \
@@ -802,6 +1024,8 @@ def parse_lines(raw_lines, path):
                 value |= v & m
             if kind == "host" and wild and verb == "allow" and not ack:
                 raise PolicyError(f"{path}:{lineno}: wildcard allow without acknowledge=dns-channel")
+            if confined and not subagent:
+                raise PolicyError(f"{path}:{lineno}: confined without subagent=")
             portless = name = False
             if wild:
                 name = True
@@ -816,9 +1040,13 @@ def parse_lines(raw_lines, path):
                     portless = host_portless(const)
             r = {"verb": verb, "kind": kind, "op": op, "c": const, "rx": grx, "gtoks": gtoks,
                  "mask": mask, "value": value, "line": lineno, "portless": portless, "name": name,
-                 "wild": wild, "subagent": subagent}
+                 "wild": wild, "subagent": subagent, "subj": rsubj}
             r["lang"] = atom_rx(rx, r)
             rules.append(r)
+            if confined:
+                subj_register(len(rules) - 1, False, f"{path}:{lineno}")
+            elif subagent and subj_named(subagent):
+                raise PolicyError(f"{path}:{lineno}: a confined name on an unconfined sub-agent")
     if proxy_ports is not None and not proxy:
         raise PolicyError(f"{path}: proxy ports without proxy on")
     if upstream is not None and not proxy:
@@ -828,7 +1056,7 @@ def parse_lines(raw_lines, path):
         raise PolicyError(f"{path}: passthrough without proxy inspect")
     ports = proxy_ports or [80, 443]
     for r in rules:
-        if r["kind"] != "request":
+        if r["kind"] not in ("request", "mcp"):        # v1.31: mcp rules too
             continue
         if not inspect or r["rport"] not in ports:
             raise PolicyError(f"{path}:{r['line']}: request rule without proxy inspect, or on an unproxied port")
@@ -841,6 +1069,16 @@ def parse_lines(raw_lines, path):
     parse_policy.open_as_agent = req >= (1, 29)
     parse_policy.creds = creds                     # v1.28
     parse_policy.identity = (issuers, spiffe, require_obo)   # v1.28.1
+    parse_policy.cred_aud = cred_aud                         # v1.31
+    parse_policy.subjects = subjects
+    parse_policy.mcpres = mcpres
+    # v1.31: a rule decides for its subject only. Within the oracle a rule's
+    # "kind" is its partition: the kind, and "@k" for confined subject k; its
+    # "base" is the kind as written.
+    for r in rules:
+        r["base"] = r["kind"]
+        if r.get("subj"):
+            r["kind"] = f"{r['kind']}@{r['subj']}"
     return rules, rx
 
 
@@ -974,11 +1212,22 @@ def sat(*fs):
     return r == smt.sat
 
 
+def kbase(kind):
+    """v1.31: the kind of a partition key ("path@2" -> "path")."""
+    return kind.split("@")[0]
+
+
+def kline(kind):
+    """v1.31: a partition key as the C tools' query: "path" or "path ... @2"."""
+    b, _, k = kind.partition("@")
+    return b, (f" @{k}" if k else "")
+
+
 def oracle_first(rx, rules, kind, sval, fval):
     """Index of the first rule that holds on the concrete action, None if no
     rule holds, or 'OUT' if the action is outside the fragment."""
     s, f = smt.String("s", ctx=CTX), smt.BitVec("f", 32, ctx=CTX)
-    fv = fval if (kind == "path" and fval is not None) else 0
+    fv = fval if (kbase(kind) == "path" and fval is not None) else 0
     pin = [s == zstr(sval), f == smt.BitVecVal(fv, 32, ctx=CTX)]
     if not sat(domain(s, f), *pin):
         return "OUT"
@@ -997,13 +1246,14 @@ def oracle_ground(rx, rules, kind, sval, fval):
     return "SATISFIED" if rules[i]["verb"] == "allow" else "UNSATISFIED"
 
 
-def oracle_symbolic(rx, rules, sval):
-    """path, concrete s, symbolic f. SATISFIED iff every admissible f is."""
+def oracle_symbolic(rx, rules, sval, kind="path"):
+    """path, concrete s, symbolic f. SATISFIED iff every admissible f is.
+    v1.31: kind is the partition ("path", or "path@k" for subject k)."""
     s, f = smt.String("s", ctx=CTX), smt.BitVec("f", 32, ctx=CTX)
     pin = s == zstr(sval)
     if not sat(domain(s, f), pin):
         return "UNKNOWN"
-    idx = [i for i, r in enumerate(rules) if r["kind"] == "path"]
+    idx = [i for i, r in enumerate(rules) if r["kind"] == kind]
     allow_first = smt.Or([fires_first(rx, rules, i, s, f) for i in idx
                          if rules[i]["verb"] == "allow"] or [smt.BoolVal(False, ctx=CTX)])
     deny_first = smt.Or([fires_first(rx, rules, i, s, f) for i in idx
@@ -1192,11 +1442,12 @@ def sample(rx, a, rng, depth=0):
 def gen_queries(rules, rx, rng, n):
     by_kind = {"path": [], "host": [], "exec": [], "request": []}
     for r in rules:
-        by_kind[r["kind"]].append(r)
+        by_kind.setdefault(r["kind"], []).append(r)
+    extra = [k for k in by_kind if k not in ("path", "host", "exec")]     # request, mcp, and subjects' partitions
     out = []
-    alphabet = "/ab:.x"
+    alphabet = "/ab:.x#"
     for _ in range(n):
-        kind = rng.choice(["path", "path", "path", "host", "exec"] + (["request"] * 3 if by_kind["request"] else []))
+        kind = rng.choice(["path", "path", "path", "host", "exec"] + [k for k in extra if by_kind[k]] * 3)
         base = sample(rx, rng.choice(by_kind[kind])["lang"], rng) \
             if by_kind[kind] and rng.random() < 0.85 else ""
         choice = rng.random()
@@ -1224,7 +1475,13 @@ def gen_queries(rules, rx, rng, n):
         elif kind == "host" and base and (host_portless(base) or (host_name_form(base) == 1 and ":" not in base)) \
                 and rng.random() < 0.4:
             sval = base + ":" + str(rng.choice([80, 443, 8080]))
-        if kind == "path":
+        if kbase(kind) == "mcp" and rng.random() < 0.3:
+            # v1.31: the objects the Warden builds (vdp_mcp_object)
+            r0 = rng.choice(by_kind[kind])
+            o = mcp_object(r0["c"].split("#")[0], rng.choice(["tools/call", "tools/list", "resources/read", "x"]),
+                           rng.choice(["", "get_issue", "delete_repo", "file:///projects/app/a", "a b"]))
+            sval = o if o is not None else sval
+        if kind == "path" or (kbase(kind) == "path" and rng.random() < 0.8):
             r = rng.random()
             if r < 0.2:
                 fval = None                                   # symbolic
@@ -1343,6 +1600,115 @@ def fuzz_line(rng, prior, strings, wide):
     return line, kind, c
 
 
+def fuzz_v131(rng, lines, valid, cred_names):
+    """v1.31: MCP access tokens, trusted MCP resources, MCP servers, confined
+    sub-agents, rules for each subject (for=) and mcp rules, valid and (when
+    the policy may be invalid) each refused form."""
+    bad = lambda: not valid and rng.random() < 0.15
+    mcp_url = ["https://mcp.example.com/mcp", "https://mcp.example.com", "https://api.example.com/mcp/",
+               "http://plain.example.com/mcp", "https://mcp.example.com:443/mcp", "https://api.example.com:8443/m"]
+    bad_url = ["https://mcp.example.com/mcp?x=1", "https://mcp.example.com/m#f", "https://1.2.3.4/mcp",
+               "https://MCP.example.com/mcp", "https://*.example.com/mcp", "https://u@mcp.example.com/mcp",
+               "ftp://mcp.example.com/x", "https://mcp.example.com/a//b", "https://mcp.example.com/a/../b",
+               "https://mcp.example.com/%41", "https://mcp.example.com/a*", "https://mcp.example.com:0/x",
+               "https://mcp.example.com/a\\b", "https://mcp.example.com/a;b", "https://mcp.example.com/[x]", "mcp.example.com"]
+    tok_names, tok_aud = [], {}
+    for _ in range(rng.randint(0, 2)):
+        n = rng.choice(["mc", "mo", "tok_1"])
+        if n in cred_names + tok_names:
+            continue
+        aud = rng.choice(mcp_url[:3] + mcp_url[4:5])
+        tok_aud[n] = mcp_canon(aud, True, "x")[0]
+        line = f"credential {n} from file:/etc/varek/creds/{n} audience={aud}" + (" opaque" if rng.random() < 0.3 else "")
+        if bad():
+            line = rng.choice([f"credential {n} from file:/x audience=" + rng.choice(bad_url + ["http://mcp.example.com/mcp"]),
+                               f"credential {n} from file:/x opaque", f"credential {n} from file:/x audience=https://mcp.example.com/mcp opaque x",
+                               f"credential {n} from file:/x audience=https://mcp.example.com/mcp Opaque",
+                               f"credential {n} from file:/x audiences=https://mcp.example.com/mcp"])
+        lines.append(line)
+        tok_names.append(n)
+    seen_res = set()
+    for _ in range(rng.randint(0, 2)):
+        t = rng.choice(["trust mcp-resource https://mcp.example.com/mcp", "trust mcp-resource https://api.example.com audience api://x",
+                        "trust mcp-resource https://mcp.example.com:8443/a/b audience a|b"])
+        if valid and t.split()[2] in seen_res:
+            continue
+        seen_res.add(t.split()[2])
+        if bad():
+            t = rng.choice(["trust mcp-resource http://mcp.example.com/mcp", "trust mcp-resource https://mcp.example.com/mcp audience",
+                            "trust mcp-resource https://mcp.example.com/mcp aud x", "trust mcp-resource " + rng.choice(bad_url),
+                            "trust mcp-resource https://mcp.example.com/" + "x" * 250, "trust mcp-resource"])
+        lines.append(t)
+    subjects = []
+    for _ in range(rng.randint(1, 3)):
+        n = rng.choice(["files", "gh", "helper", "s_2"])
+        if valid and n in subjects:
+            continue
+        if rng.random() < 0.6:
+            line = f"mcp server {n} exec " + rng.choice(["/opt/mcp/bin/fs", "/opt/mcp/bin/github-mcp-server", "/usr/local/bin/m-1"]) + \
+                (" sha256=" + "%064x" % rng.getrandbits(256) if rng.random() < 0.4 else "")
+        else:
+            line = "allow exec " + rng.choice(["/opt/tools/helper", "prefix /opt/tools/", "glob /opt/*/run"]) + \
+                f" subagent={n} confined" + (" for=" + subjects[0] if subjects and rng.random() < 0.2 else "")
+        if bad():
+            line = rng.choice([f"mcp server {n} exec /usr/bin/node", f"mcp server {n} exec /usr/bin/npx",
+                               f"mcp server {n} exec /usr/bin/python3.12", f"mcp server {n} exec /usr/bin/env",
+                               f"mcp server {n} exec opt/x", f"mcp server {n} exec /opt/x/", f"mcp server N exec /opt/x",
+                               f"mcp server {n} exec /opt/x sha256=ABC", f"mcp server {n} run /opt/x", f"mcp server {n}",
+                               f"mcp server {n} exec /opt/x sha256=" + "0" * 63, f"allow path /tmp/ subagent={n} confined",
+                               f"deny exec /x subagent={n} confined", f"allow exec /x subagent={n} confined confined",
+                               f"allow exec /x confined", f"allow exec /x subagent={n}", f"allow exec /x subagent={n} confined"])
+        lines.append(line)
+        if n not in subjects:
+            subjects.append(n)
+    if subjects and rng.random() < 0.3:
+        lines.append(f"allow exec /opt/other subagent={subjects[0]}" if not valid else "allow exec /opt/other subagent=plain")
+    names = ["get_*", "get_issue", "file:///projects/app/**", "*", "a?c", "[gs]et_x", "\\for=x", "**"]
+    meths = ["tools/call", "tools/list", "tools/*", "resources/read", "*", "server/discover", "notifications/x-y.z"]
+    for _ in range(rng.randint(1, 6)):
+        verb = rng.choice(["allow", "deny"])
+        url = rng.choice(mcp_url)
+        toks = [verb, "mcp", url, rng.choice(meths)]
+        if rng.random() < 0.7:
+            toks.append(rng.choice(names))
+        if verb == "allow" and rng.random() < 0.25:
+            toks.append(rng.choice(["max_body=1m", "max_body=4k"]))
+        cu = mcp_canon(url, False, "x")[0]
+        usable = [t for t in tok_names if tok_aud.get(t) == cu] + (cred_names if cu.startswith("https://") else [])
+        if verb == "allow" and (usable or not valid and tok_names) and rng.random() < 0.35:
+            toks.append("credential=" + rng.choice(usable if valid or not tok_names else tok_names + cred_names))
+            if rng.random() < 0.3:
+                toks.append("header=" + rng.choice(["Authorization:Bearer", "authorization:bearer"] +
+                                                   ([] if valid else ["X-Api-Key"])))
+        if subjects and rng.random() < 0.5:
+            toks.append("for=" + rng.choice(subjects))
+        if bad():
+            toks = rng.choice([[verb, "mcp", rng.choice(bad_url), "tools/call"], [verb, "mcp", mcp_url[0], "tools#call"],
+                               [verb, "mcp", mcp_url[0], "tools call"], [verb, "mcp", mcp_url[0], "m" * 129],
+                               [verb, "mcp", mcp_url[0]], ["deny", "mcp", mcp_url[0], "x", "max_body=1k"],
+                               ["deny", "mcp", mcp_url[0], "x", "credential=" + (tok_names + ["x"])[0]],
+                               ["allow", "mcp", mcp_url[0], "x", "header=Authorization:Bearer"],
+                               ["allow", "mcp", mcp_url[0], "x", "for=nobody"], ["allow", "mcp", mcp_url[0], "x", "a\xe9"],
+                               ["allow", "mcp", mcp_url[0], "x", "y", "z"], ["allow", "mcp", mcp_url[0], "x", "for=a", "for=a"],
+                               ["allow", "mcp", mcp_url[3], "x", "credential=" + (tok_names + cred_names + ["x"])[0]],
+                               ["allow", "mcp", mcp_url[1], "x", "credential=" + (tok_names + ["x"])[0], "header=X-K"],
+                               ["allow", "mcp", mcp_url[0], "x", "[a"]])
+        lines.append(" ".join(toks))
+    for _ in range(rng.randint(0, 4)):
+        if not subjects:
+            break
+        sj = rng.choice(subjects)
+        line = rng.choice([f"allow path /home/u/proj/ for={sj}", f"deny path glob /home/u/**/.env for={sj}",
+                           f"allow path /usr/lib/ readonly for={sj}", f"allow host api.github.com:443 for={sj}",
+                           f"allow host mcp.example.com:443 for={sj}", f"allow exec /usr/bin/git for={sj}",
+                           f"allow request GET https://api.example.com/v1/** for={sj}",
+                           f"allow exec /opt/n2 subagent=nested for={sj}"])
+        if bad():
+            line = rng.choice([f"allow path /x for=nobody", f"allow path /x for={sj} for={sj}", f"allow path /x for=",
+                               f"allow host a.example.com:443 for=" + sj.upper()])
+        lines.append(line)
+
+
 def fuzz_policy(rng, path):
     """A random policy. Seven in ten are kept valid (each line is regenerated
     until this file's parser accepts it; the C parser must agree, which the
@@ -1350,14 +1716,15 @@ def fuzz_policy(rng, path):
     the rest may carry any number of malformed lines, for the parsers."""
     valid = rng.random() < 0.7
     lines = []
-    if rng.random() < 0.2:
+    if rng.random() < 0.3:
         # v1.26.1: an inspecting-mode policy: host rules, request rules over
         # them (allow and deny, exact and wildcard hosts, globs in the path,
         # queries), passthrough hosts, max_body, and (when the policy may be
         # invalid) each refused form
         # v1.28: credentials, named and carried by allow request rules
-        v128 = rng.random() < 0.5
-        lines.append("require warden 1.28" if v128 else "require warden 1.26")
+        v128 = rng.random() < 0.6
+        v131 = v128 and rng.random() < 0.7           # v1.31: MCP servers, confined subjects, mcp rules
+        lines.append("require warden 1.31" if v131 else "require warden 1.28" if v128 else "require warden 1.26")
         lines.append("proxy inspect" if valid or rng.random() < 0.8 else rng.choice(["proxy on", ""]))
         cred_names = []
         if v128 or (not valid and rng.random() < 0.2):
@@ -1469,15 +1836,19 @@ def fuzz_policy(rng, path):
                 except PolicyError:
                     continue
             lines.append(line)
-        # a valid policy: drop the request rules the end-of-file checks refuse
-        # (an unproxied port, a passthrough host), so most of these load
-        for _ in range(12 if valid else 0):
+        if v131 or (not valid and rng.random() < 0.15):
+            fuzz_v131(rng, lines, valid, cred_names)
+        # a valid policy: drop the request (and v1.31) lines the parser refuses
+        # (an unproxied port, a passthrough host, a token for another server, a
+        # subject a dropped line declared), so most of these load
+        for _ in range(40 if valid else 0):
             try:
                 parse_lines([x.encode("latin-1") for x in lines], "p")
                 break
             except PolicyError as e:
                 m = re.match(r"p:(\d+):", str(e))
-                if not m or " request " not in lines[int(m.group(1)) - 1]:
+                if not m or not any(k in lines[int(m.group(1)) - 1] for k in
+                                    (" request ", " mcp ", "for=", "confined", "audience=", "mcp-resource", "mcp server")):
                     break
                 del lines[int(m.group(1)) - 1]
         with open(path, "w", encoding="latin-1", newline="") as fh:
@@ -1674,14 +2045,15 @@ def cert_checks(checker, policy, rules, rx, qs, res, wants, rng, stats, fails):
     def add(kind, sval, fval, r, w, want, label):
         fl = "-" if fval is None else hex(fval)
         hx = sval.encode("latin-1").hex() or "="
-        lines.append(f"{kind} {fl} {hx} {r} {w}")
+        b, sj = kline(kind)
+        lines.append(f"{b} {fl} {hx} {r} {w}{sj}")
         expect.append(want)
         labels.append(label)
 
     for (kind, sval, fval), r, want in zip(qs, res, wants):
         allow_idx = [i for i, x in enumerate(rules) if x["kind"] == kind and x["verb"] == "allow"]
-        sym = kind == "path" and fval is None
-        if r["verdict"] != want:
+        sym = kbase(kind) == "path" and fval is None
+        if r.get("verdict") != want:
             continue       # the procedure's conservative UNKNOWN (enumeration bound)
         if r["verdict"] == "SATISFIED":
             w = r.get("w", "!")
@@ -1753,7 +2125,7 @@ def cert_checks(checker, policy, rules, rx, qs, res, wants, rng, stats, fails):
             for relax in ("star", "segs"):
                 sp = find_spans(rr["gtoks"], sval, relax)
                 if sp is not None:
-                    fv = 0 if rr["kind"] != "path" else rr["value"]
+                    fv = 0 if rr["base"] != "path" else rr["value"]
                     add(rr["kind"], sval, fv, fr, wit_str(sp), "reject", f"witness wrong ({relax})")
                     stats["certs_forged"] += 1
     # Deny claims, kind confusion, and witnesses wrong in one specific way.
@@ -1807,12 +2179,12 @@ def cert_checks(checker, policy, rules, rx, qs, res, wants, rng, stats, fails):
         # that holds (so only the earlier-rule check can refuse the claim)
         extra = [(k, x, rng.choice([0, 0x1, 0x2, 0x241])) for x in probes for k in ("path", "exec")]
         for (kind, sval, fval), r, want in list(zip(qs, res, wants)) + [(e, None, None) for e in extra]:
-            if (kind == "path" and fval is None) or len(sval) > L:
+            if (kbase(kind) == "path" and fval is None) or len(sval) > L:
                 continue
-            fv = fval if kind == "path" else 0
+            fv = fval if kbase(kind) == "path" else 0
             hold = [i for i, rr in enumerate(rules) if rr["kind"] == kind
                     and (fv & rr["mask"]) == rr["value"] and rx.matches(rr["lang"], sval)]
-            if len(hold) < 2 or (kind == "path" and ((fv & ~KNOWN) or (fv & ACC) == ACC)):
+            if len(hold) < 2 or (kbase(kind) == "path" and ((fv & ~KNOWN) or (fv & ACC) == ACC)):
                 continue
             for fr in hold[1:]:
                 rr = rules[fr]
@@ -1893,6 +2265,8 @@ def check_policy(vdp, policy, rng, nq, stats, verbose, checker=None):
     want_c = [f"credential {n} {store_names[st]} {ref}" for n, st, ref in parse_policy.creds]
     want_c += [f"rule {r['line']} {parse_policy.creds[r['cred'] - 1][0]} {r['header'][0]} {r['header'][1] or '-'}"
                for r in rules if r.get("cred")]
+    want_c += [f"audience {c[0]} {a} {'opaque' if o else '-'}"                       # v1.31
+               for c, (a, o) in zip(parse_policy.creds, parse_policy.cred_aud) if a]
     got_c = [run_vdp(vdp, policy, "credentials")[1].splitlines()]
     if checker:
         got_c.append(subprocess.run([checker, policy, "credentials"], capture_output=True, text=True).stdout.splitlines())
@@ -1905,6 +2279,11 @@ def check_policy(vdp, policy, rng, nq, stats, verbose, checker=None):
     want_i = [f"issuer {a} {b} {c or '-'}" for a, b, c in iss] + [f"spiffe {d} {b}" for d, b in spf]
     want_i += [f"subagent {r['line']} {r['subagent']}" for r in rules if r.get("subagent")]
     want_i += ["require on-behalf-of"] if robo else []
+    # v1.31: the confined subjects, the rules for each, the MCP resources
+    want_i += [f"confined {k + 1} {n} {'mcp' if m else 'subagent'} {ln} {rules[ri].get('sha256') or '-'}"
+               for k, (n, ri, m, ln) in enumerate(parse_policy.subjects)]
+    want_i += [f"for {r['line']} {r['subj']}" for r in rules if r.get("subj")]
+    want_i += [f"mcp-resource {u} {a or '-'}" for u, a, _ in parse_policy.mcpres]
     got_i = [run_vdp(vdp, policy, "identity")[1].splitlines()]
     if checker:
         got_i.append(subprocess.run([checker, policy, "identity"], capture_output=True, text=True).stdout.splitlines())
@@ -1914,8 +2293,12 @@ def check_policy(vdp, policy, rng, nq, stats, verbose, checker=None):
         stats["identity_policies"] = stats.get("identity_policies", 0) + 1
     if any(r["op"] in ("suffix", "contains", "glob") for r in rules):
         stats["string_policies"] += 1
-    if any(r["kind"] == "request" for r in rules):
+    if any(r["base"] == "request" for r in rules):
         stats["request_policies"] += 1      # v1.26.1
+    if any(r["base"] == "mcp" for r in rules):
+        stats["mcp_policies"] = stats.get("mcp_policies", 0) + 1         # v1.31
+    if parse_policy.subjects:
+        stats["subject_policies"] = stats.get("subject_policies", 0) + 1
 
     # Reachability of every rule, and the witness of every REACHABLE answer.
     reach = [json.loads(l) for l in out.splitlines() if l.strip()]
@@ -1930,7 +2313,7 @@ def check_policy(vdp, policy, rng, nq, stats, verbose, checker=None):
         want = None
         stats["reach"] += 1
         for label, res in (("", rr), (" [automaton]", forced[i] if i < len(forced) else {})):
-            if label and rules[i]["kind"] == "host":
+            if label and rules[i]["base"] == "host":
                 continue
             if label:
                 stats["reach_forced_checked"] += 1
@@ -1971,7 +2354,8 @@ def check_policy(vdp, policy, rng, nq, stats, verbose, checker=None):
     lines = []
     for kind, sval, fval in qs:
         fl = "-" if fval is None else hex(fval)
-        lines.append(f"{kind} {fl} {sval.encode('latin-1').hex()}")
+        b, sj = kline(kind)
+        lines.append(f"{b} {fl} {sval.encode('latin-1').hex() or '='}{sj}")
     rc, out, err = run_vdp(vdp, policy, "batch", stdin="\n".join(lines) + "\n")
     res = [json.loads(l) for l in out.splitlines() if l.strip()]
     if len(res) != len(qs):
@@ -1979,13 +2363,13 @@ def check_policy(vdp, policy, rng, nq, stats, verbose, checker=None):
         return fails
     wants = []
     for (kind, sval, fval), r in zip(qs, res):
-        if kind == "path" and fval is None:
-            want = oracle_symbolic(rx, rules, sval)
+        if kbase(kind) == "path" and fval is None:
+            want = oracle_symbolic(rx, rules, sval, kind)
             stats["symbolic"] += 1
         else:
             want = oracle_ground(rx, rules, kind, sval, fval)
             stats["ground"] += 1
-        got = r["verdict"]
+        got = r.get("verdict", f"error {r.get('error')}")
         wants.append(want)
         if r.get("why") == "enumeration_bound":
             stats["bound_seen"] += 1
@@ -2036,6 +2420,7 @@ def main():
     total = stats["reach"] + stats["reach_forced_checked"] + stats["ground"] + stats["symbolic"]
     print(f"smt_crosscheck: {stats['policies']} policies ({stats['string_policies']} with "
           f"suffix/contains/glob rules, {stats['request_policies']} with request rules, {stats['launch_policies']} with launches, {stats['open_as_agent_policies']} opening as the agent; "
+          f"{stats.get('mcp_policies', 0)} with mcp rules, {stats.get('subject_policies', 0)} with confined subjects; "
           f"{stats['rejected_policies']} rejected by both parsers), "
           f"{total} checks: {stats['reach']} reachability (+{stats['reach_forced_checked']} "
           f"automaton-search re-checks), {stats['ground']} ground, {stats['symbolic']} "
