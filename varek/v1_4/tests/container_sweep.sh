@@ -93,10 +93,14 @@ run_set() {
     for s in "${SUITES[@]}"; do
         local t0 log="$OUT/$label.$s.log" rc p f k name="varek-sweep-$$-$s"
         t0=$(date +%s)
-        # a suite past its time is stopped by removing its container (a
-        # timeout on the client alone leaves the container running)
-        timeout "$LIMIT" "$RT" run --name "$name" "${args[@]}" "$IMAGE" make "$s" > "$log" 2>&1; rc=$?
-        [ "$rc" = 124 ] && { echo "container_sweep.sh: $s ran past ${LIMIT} s; stopped" >> "$log"; "$RT" rm -f "$name" > /dev/null 2>&1; }
+        # a suite past its time is stopped by removing its container. The
+        # client passes timeout's SIGTERM on to make, the container's PID 1,
+        # which ignores it, and waits on; -k kills the client 10 s later
+        timeout -k 10 "$LIMIT" "$RT" run --name "$name" "${args[@]}" "$IMAGE" make "$s" > "$log" 2>&1; rc=$?
+        if [ $(( $(date +%s) - t0 )) -ge "$LIMIT" ]; then
+            echo "container_sweep.sh: $s ran past ${LIMIT} s; stopped" >> "$log"
+            "$RT" rm -f "$name" > /dev/null 2>&1
+        fi
         p=$(grep -c '  PASS' "$log"); f=$(grep -c '  FAIL' "$log"); k=$(grep -c '  SKIP' "$log")
         printf '%-22s %-6s %6s %6s %6s %8s\n' "$s" "$([ $rc = 0 ] && echo ok || echo FAILED)" "$p" "$f" "$k" "$(( $(date +%s) - t0 ))" \
             | tee -a "$OUT/summary.txt"
