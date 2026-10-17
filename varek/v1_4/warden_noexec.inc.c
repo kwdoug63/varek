@@ -385,6 +385,11 @@ static int noexec_remount_tree(const char *root, bool check) {
             if (statvfs(tok, &sv) < 0) rc = -1;
             else if (!(sv.f_flag & ST_NOEXEC)) { errno = EPERM; rc = -1; }
             else done++;
+        } else if (statvfs(tok, &sv) == 0 && (sv.f_flag & ST_NOEXEC)) {
+            /* v1.32: noexec already (a container's /dev/mqueue, /dev/shm):
+             * not remounted, which SELinux refuses a container for some
+             * (mqueue); the check pass confirms it */
+            done++;
         } else if (mount(NULL, tok, NULL, MS_BIND | MS_REMOUNT | MS_NOEXEC | noexec_keep_flags(tok), NULL) < 0)
             rc = -1;
         else done++;
