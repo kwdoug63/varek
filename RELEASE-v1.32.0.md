@@ -166,7 +166,7 @@ fixed (commit `b8d7a71`).
   and the workflow hardened: every action pinned by its commit (the job
   holds the token that publishes and the identity that signs), cosign and
   syft by version and installed before the registry login, permissions
-  per job, a `release` environment, only a tag on main, Docker's defaults
+  per job, only a tag on main, Docker's defaults
   checked refused, the version compared exactly, a pre-release published
   under its own tag only, `:1.32` and `:latest` moved only after signing
   and verifying and only to the highest release, and no expression
