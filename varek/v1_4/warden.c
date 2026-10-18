@@ -5237,8 +5237,8 @@ int main(int argc, char **argv) {
     static struct policy p;
     if (policy_load(policy_path, &p) < 0) return 1;
     /* v1.29: a dry run (section 3), on the command line only (D3). Not with
-     * a plan (the plan gate refuses before the agent starts; checking a plan
-     * is `varek policy check`'s job), with credentials (it would hand the
+     * a plan (the plan gate refuses before the agent starts; no command
+     * checks a plan without starting the agent: v1.35), with credentials (it would hand the
      * proxy real values for an agent whose policy is not settled: D2), or
      * with sub-agents (their attribution rests on launches being held). */
     if (g_dry) {

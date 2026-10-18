@@ -333,6 +333,16 @@ against the code, most by running it, before it was fixed.
 - **The image is x86_64 only** in this release, and is published to the
   GitHub Container Registry only (Red Hat's registry with its
   certification later).
+- **The plan gate** (`varek run --plan`) is found
+  short of what its notes said (the v1.35 design note, 2026-10-18): a
+  `process_exec` step is refused whatever the policy says, though v1.27's
+  note says it is decided by the policy; a refused plan is not shown by
+  `varek refusals`, so `varek run` reports "0 refused" after one; `varek
+  policy check`, which two messages named for checking a plan, takes none
+  (the messages are corrected); and the agent is not held to its plan once
+  it starts, though the threat model said the plan is re-verified as the
+  agent revises it (corrected). All are on the safe side or in what is
+  shown, not in what is decided; v1.35.0 plans the fixes.
 - From v1.31.0: the agent's calls to a stdio MCP server are not decided.
   From v1.29.0: a dry run is not a sandbox. From v1.28.1: the chain is
   recorded, not enforced. From v1.28.0: a server that echoes a credential

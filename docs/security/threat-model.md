@@ -177,8 +177,11 @@ Model-B techniques below, with the residual limits stated honestly.
   SATISFIED verdict under the active policy. UNKNOWN and UNSATISFIED both fail
   closed.
 - **Compositional plan safety (action-graph).** A planned directed acyclic graph
-  of actions is verified before its first action runs, and re-verified as the
-  agent revises it.
+  of actions is verified before the agent starts, once per launch. The agent is
+  not held to it once it starts: each call is decided by the policy, as
+  without a plan. *(Correction, v1.32.0: through v1.31 this said the plan is
+  re-verified as the agent revises it; nothing does that. Holding a run to its
+  plan is planned for v1.35.0.)*
 - **Cross-action data-flow bounds.** A source labeled secret cannot reach a sink
   forbidden by policy, across actions, with declassification only where audited.
 - **Progress-safety / liveness (v1.9).** At policy load the verifier certifies

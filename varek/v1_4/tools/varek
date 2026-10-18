@@ -1360,7 +1360,7 @@ def cmd_run(args):
     if args.dry_run:                                                  # v1.29
         if args.plan:
             raise CliError("--dry-run with --plan is refused",
-                           fix="check a plan with `varek policy check`; dry-run the agent without --plan")
+                           fix="a plan is checked as the run starts (`varek run --plan`); dry-run the agent without --plan")
         argv += ["--dry-run"]
     argv += ["--run-as", run_as, "--"] + cmd
 
