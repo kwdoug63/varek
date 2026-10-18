@@ -7,10 +7,11 @@ container, exactly as on a host. The design and its decisions are in
 
 > **In progress.** The settings below are measured on real hosts: every
 > suite passes under them with Docker on Ubuntu 24.04 (AppArmor, cgroup
-> v2) and rootful Podman on RHEL 9.8 (SELinux enforcing, cgroup v2).
-> Rootless Podman is still to be measured. In a container the kernel may
-> give no process events (RHEL 9, Ubuntu 24.04): a sub-agent of the image
-> its launcher runs is then refused, as on such a host.
+> v2) and rootful Podman on RHEL 9.8 (SELinux enforcing, cgroup v2), and
+> all but one with rootless Podman there (its rerun pending). In a
+> container the kernel may give no process events (RHEL 9, Ubuntu 24.04):
+> a sub-agent of the image its launcher runs is then refused, as on such a
+> host.
 
 ## Get the image
 
@@ -21,19 +22,25 @@ materials attached as a signed attestation
 (`.github/workflows/container-release.yml`):
 
 ```
-docker pull ghcr.io/kwdoug63/varek:1.32
+docker pull ghcr.io/kwdoug63/varek:1.32.0
 ```
 
-Check that it is the one the release workflow built:
+(Until the first release's package is made public, a pull needs a GitHub
+login.) Check that it is the one the release workflow built for that
+version's tag, by its exact identity:
 
 ```
-cosign verify ghcr.io/kwdoug63/varek:1.32 \
-  --certificate-identity-regexp '^https://github.com/kwdoug63/varek/.github/workflows/container-release.yml@refs/tags/v' \
+cosign verify ghcr.io/kwdoug63/varek:1.32.0 \
+  --certificate-identity https://github.com/kwdoug63/varek/.github/workflows/container-release.yml@refs/tags/v1.32.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
 and its bill of materials, with `cosign verify-attestation --type cyclonedx`
-and the same two options.
+and the same two options. `cosign verify` prints the digest it checked
+(`"docker-manifest-digest"`); run that digest
+(`ghcr.io/kwdoug63/varek@sha256:...`), not the tag, which can be moved.
+`:1.32` and `:latest` follow the newest release; verify the version they
+point to as above.
 
 ## Build
 
@@ -64,7 +71,7 @@ docker run --rm \
 |---|---|
 | SYS_ADMIN | the agent's PID, network and mount namespaces; the writable directories mounted noexec |
 | SYS_PTRACE | taking the agent's listener and sockets (`pidfd_getfd`) and reading paths from its memory |
-| SETPCAP | emptying the agent's capability bounding set before it runs |
+| SETPCAP | emptying the agent's capability bounding set at its launch |
 | SETUID, SETGID | dropping the agent and the helpers to their own users; opening files as the agent |
 | DAC_OVERRIDE | opening, as root, the files the policy lets the agent reach |
 | KILL | ending the agent's processes, which run as another user |
@@ -73,8 +80,9 @@ docker run --rm \
 | CHOWN | `varek run` giving the agent its temporary directory |
 
 The agent itself holds none of them: the Warden empties its bounding set
-and drops it to its own user before its filter is installed. The
-runtime's default seccomp profile stays on.
+and drops it to its own user before its filter is installed (unless run
+`--run-as root`, which the Warden warns of). The runtime's default
+seccomp profile stays on.
 
 ### On a host with AppArmor (Ubuntu, Debian, SUSE)
 
@@ -89,20 +97,28 @@ install -m 644 packaging/container/apparmor/varek-container /etc/apparmor.d/vare
 apparmor_parser -r -W /etc/apparmor.d/varek-container
 ```
 
-and add `--security-opt apparmor=varek-container` to the run. It is
+and add `--security-opt apparmor=varek-container` to the run (AppArmor 3.0
+or later: Ubuntu 22.04, Debian 12). It is Docker's current
 `docker-default` with the Warden's mounts allowed (its own mount namespace
-made private, a directory bound onto itself, that mount remounted noexec,
-and the container's cgroup filesystem remounted read-write) and no other;
-never `apparmor=unconfined`.
+made private, a directory bound, a bind mount's flags changed: noexec, and
+the container's cgroup filesystem read-write) and no other; never
+`apparmor=unconfined`. AppArmor cannot tie a bind's target to its source,
+so a process holding CAP_SYS_ADMIN in the container (the Warden, or a root
+shell `docker exec` starts with the same capabilities) may bind any path
+and make a bind mount read-write, a read-only volume's included; the agent
+holds no capability and cannot.
 
 ### On a host with SELinux (RHEL, Fedora)
 
 The container's own type, `container_t`, may not make control groups, which
 a policy with sub-agents or confined MCP servers needs. Run it as
 `container_init_t`, the distribution's type for containers that manage
-their control groups, and load VAREK's module, `selinux/varek_container.cil`
-(two rules: that type may also remount the cgroup filesystem, and mount on
-`/dev/null` for the noexec mounts), once, as root:
+their control groups (systemd in a container: beyond `container_t`, it may
+manage, mount on and unmount the cgroup filesystem, mount on sysfs and
+`/proc`, and its network is unconfined), and load VAREK's module,
+`selinux/varek_container.cil` (four rules: that type may also remount the
+cgroup filesystem, and mount on the container's character devices for the
+noexec mount of `/dev/null`; two more for rootless, below), once, as root:
 
 ```
 semodule -i packaging/container/selinux/varek_container.cil
@@ -151,10 +167,11 @@ docker run --rm <the settings above> --entrypoint varek varek doctor
 
 ## Your agent in the image
 
-Build on the image and name your agent's command:
+Build on the image and name your agent's command (not yet built and run in
+the release's tests):
 
 ```
-FROM ghcr.io/kwdoug63/varek:1.32
+FROM ghcr.io/kwdoug63/varek:1.32.0
 RUN microdnf -y install python3-pip && pip3 install --no-cache-dir requests
 COPY agent.py /work/agent.py
 CMD ["python3", "/work/agent.py"]
