@@ -88,6 +88,8 @@ expect "an ordinary allowed file still opens"          "$A" ordinary_file      "
 if [ -n "$RAWOK" ]; then
     [ "$(rules raw_device "$D/secret/run.log")" -ge 2 ] && pass "raw_device recorded for both" \
         || flunk "raw_device records ($(rules raw_device "$D/secret/run.log"))"
+else
+    skip "raw_device recorded for both (no raw devices made here)"
 fi
 if python3 "$AUDIT" --policy "$POL" --checker "$CERT" --pubkey "$(cat "$D/secret/log.key.hex")" \
         --anchor "$D/secret/anchor.log" "$D/secret/run.log" > "$OUT/a1" 2>&1 \

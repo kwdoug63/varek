@@ -432,7 +432,14 @@ for l in open(sys.argv[1]):
     # a process runs and refuses a sub-agent of the image its launcher runs,
     # so the checks that need them are skipped there, and say so
     if grep -q "known from the kernel's process events" "$OUT/fork.out"; then PE=1; else PE=; fi
-    nope() { skip "$1 (the Warden has no process events here)"; }
+    # only a container may lack them (RHEL 9's and Ubuntu 24.04's kernels give
+    # none in a container's network namespace; v1.32); on a host their lack
+    # is the Warden's, a failure (v1.32 review)
+    if [ -f /.dockerenv ] || [ -f /run/.containerenv ] || [ -n "${container:-}" ]; then
+        nope() { skip "$1 (the Warden has no process events here, in a container)"; }
+    else
+        nope() { flunk "$1: the Warden has no process events, on a host"; }
+    fi
     sgo again spawn "$B/f" "$B/a" spawn "$B/f" "$B/a" open "$B/f"
     if [ -n "$PE" ]; then
         check "two launches of one program: alpha#1, then alpha#2 (nested)" grep -q '"subagent":"alpha#2"' "$OUT/again.out"
@@ -511,9 +518,10 @@ sys.exit(0 if rs and all(isinstance(r.get("obo"), list) and r["obo"][:1] == ["ag
             timeout 60 '$WARDEN' '$B/p.txt' -- '$B/agent' exec '$B/a' open '$B/f' > /dev/null 2> '$OUT/ro.out'; \
             mkdir '$CGM/v1281-ro' 2> '$OUT/ro.mkdir'"
         rmdir "$CGM/v1281-ro" 2>/dev/null
-        if awk 'NR == 1 { exit !($1 == 0 && $2 == 0 && $3 == 4294967295) }' /proc/self/uid_map; then
-            check "a container's read-only cgroup filesystem: --check-startup says the run would remount it" \
-                sh -c "grep -q 'is read-only (a container.s, its own groups only): a run remounts it' '$OUT/rocs.out' && grep -q 'sub-agents: a run.s control groups go under $CGM' '$OUT/rocs.out'"
+        # the initial user namespace's inode (PROC_USER_INIT_INO), as the Warden tells
+        if [ "$(stat -Lc %i /proc/self/ns/user)" = 4026531837 ]; then
+            check "a container's read-only cgroup filesystem: --check-startup tries the remount and says the run makes it" \
+                sh -c "grep -q 'is read-only (a container.s, its own groups only): a run remounts it read-write in the Warden.s own mount namespace (tried)' '$OUT/rocs.out' && grep -q 'sub-agents: a run.s control groups go under $CGM' '$OUT/rocs.out'"
             check "... a run remounts it read-write in the Warden's own mount namespace; the sub-agent is attributed" \
                 sh -c "grep -q 'remounted read-write in the Warden.s own mount namespace' '$OUT/ro.out' && grep -q '\"subagent\":\"alpha#1\"' '$OUT/ro.out'"
         else

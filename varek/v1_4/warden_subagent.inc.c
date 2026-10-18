@@ -286,15 +286,26 @@ refuse:
  * capabilities, cannot write the groups, which root owns, any more than on
  * a host. Anywhere else nothing is done. 0; 1 in a check, where the run
  * would remount it; or -1 printed. */
-/* v1.32 (D10): in a user namespace (rootless Podman): the identity map is
- * the initial namespace's only */
+/* v1.32 (D10): in a user namespace (rootless Podman)? The initial user
+ * namespace's inode is fixed (PROC_USER_INIT_INO); a child namespace with an
+ * identity map is still a child (v1.32 review). Unreadable: taken as one. */
 static bool sub_in_userns(void) {
-    FILE *f = fopen("/proc/self/uid_map", "re");
-    if (!f) return false;
-    unsigned long a = 0, b = 0, n = 0;
-    int k = fscanf(f, "%lu %lu %lu", &a, &b, &n);
-    fclose(f);
-    return k == 3 && !(a == 0 && b == 0 && n == 4294967295UL);
+    struct stat st;
+    if (stat("/proc/self/ns/user", &st) < 0) return true;
+    return st.st_ino != 0xEFFFFFFDU;
+}
+
+/* The container's cgroup filesystem remounted read-write in this mount
+ * namespace: a bind remount, which changes this mount's flags only, never
+ * the filesystem's, which every cgroup2 mount on the machine shares (v1.32
+ * review); noexec and the mount's other flags kept. 0, or -1 with errno. */
+static int sub_cg_remount(const char *mnt) {
+    unsigned long f = (noexec_keep_flags(mnt) & ~(unsigned long)MS_RDONLY) | MS_NOEXEC;
+    if (mount(NULL, mnt, NULL, MS_BIND | MS_REMOUNT | f, NULL) < 0) return -1;
+    struct statvfs sv;
+    if (statvfs(mnt, &sv) < 0) return -1;
+    if (sv.f_flag & ST_RDONLY) { errno = EROFS; return -1; }
+    return 0;
 }
 
 static int sub_container_cgroup(const char *mnt, const char *self, bool check_only) {
@@ -315,9 +326,27 @@ static int sub_container_cgroup(const char *mnt, const char *self, bool check_on
                 "(packaging/container/README.md); refusing to start\n", mnt, self);
         return -1;
     }
+    const char *refused = "[warden] the policy names a sub-agent: cannot remount the container's cgroup "
+                          "filesystem %s read-write (%s); under AppArmor or SELinux, run with VAREK's profile "
+                          "(packaging/container/README.md); refusing to start\n";
     if (check_only) {
+        /* tried, in a child's mount namespace, so the check says what a run
+         * would find (v1.32 review) */
+        pid_t c = fork();
+        if (c < 0) { fprintf(stderr, refused, mnt, strerror(errno)); return -1; }
+        if (c == 0) {
+            if (unshare(CLONE_NEWNS) < 0 || mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0 ||
+                sub_cg_remount(mnt) < 0) _exit(errno > 0 && errno < 126 ? errno : 1);
+            _exit(0);
+        }
+        int st = 0;
+        while (waitpid(c, &st, 0) < 0 && errno == EINTR) ;
+        if (!WIFEXITED(st) || WEXITSTATUS(st)) {
+            fprintf(stderr, refused, mnt, WIFEXITED(st) ? strerror(WEXITSTATUS(st)) : "the test was killed");
+            return -1;
+        }
         fprintf(stderr, "[warden] sub-agents: the cgroup filesystem at %s is read-only (a container's, its own "
-                "groups only): a run remounts it read-write in the Warden's own mount namespace\n", mnt);
+                "groups only): a run remounts it read-write in the Warden's own mount namespace (tried)\n", mnt);
         return 1;
     }
     if (!g_own_mntns) {
@@ -328,10 +357,8 @@ static int sub_container_cgroup(const char *mnt, const char *self, bool check_on
         }
         g_own_mntns = true;
     }
-    if (mount(NULL, mnt, NULL, MS_REMOUNT | (noexec_keep_flags(mnt) & ~(unsigned long)MS_RDONLY), NULL) < 0) {
-        fprintf(stderr, "[warden] the policy names a sub-agent: cannot remount the container's cgroup filesystem "
-                "%s read-write (%s); under AppArmor or SELinux, run with VAREK's profile "
-                "(packaging/container/README.md); refusing to start\n", mnt, strerror(errno));
+    if (sub_cg_remount(mnt) < 0) {
+        fprintf(stderr, refused, mnt, strerror(errno));
         return -1;
     }
     fprintf(stderr, "[warden] sub-agents: the container's cgroup filesystem %s remounted read-write in the "

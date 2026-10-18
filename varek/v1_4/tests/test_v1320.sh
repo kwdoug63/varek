@@ -51,7 +51,11 @@ fi
 echo "== 2. varek doctor in a container (D11) =="
 VAREK_CONFIG=/nonexistent VAREK_DOCTOR_CONTAINER=test NO_COLOR=1 python3 "$VAREK" doctor > "$OUT/doc.out" 2>&1
 check "doctor has a container section when it runs in one" grep -q 'In a container (test): the settings in packaging/container/README.md' "$OUT/doc.out"
-check "... with the capabilities checked" grep -qE '(OK|FAIL)  +(the 10 capabilities|capability )' "$OUT/doc.out"
+if [ "$(id -u)" = 0 ] && [ "$(awk '/^CapEff:/ {print $2}' /proc/self/status)" = 000001ffffffffff ]; then
+    check "... with the capabilities checked: all ten, as root with every capability" grep -qE 'OK +the 10 capabilities' "$OUT/doc.out"
+else
+    check "... with the capabilities checked" grep -qE '(OK|FAIL)  +(the 10 capabilities|capability )' "$OUT/doc.out"
+fi
 if [ "$(id -u)" = 0 ]; then
     check "... and the Warden's mounts made in a child" grep -q 'OK    a test of the Warden.s mounts: a mount namespace of its own, a directory mounted noexec' "$OUT/doc.out"
 else
@@ -90,11 +94,24 @@ if command -v apparmor_parser > /dev/null; then
 else
     skip "the AppArmor profile compiles (no apparmor_parser here)"
 fi
-check "... allows the Warden's mounts and no other: no 'deny mount', four mount rules" \
-    sh -c "! grep -q '^ *deny mount' '$AA' && [ \"\$(grep -c '^ *mount ' '$AA')\" = 4 ] && grep -q 'mount options=(rprivate) -> /,' '$AA'"
-check "... and keeps docker-default's denials (/proc, /sys)" sh -c "grep -q 'deny @{PROC}/sysrq-trigger rwklx' '$AA' && grep -q 'deny /sys/firmware/\*\* rwklx' '$AA'"
-check "the SELinux module: container_init_t's four rules (the cgroup remount; mounton the container's and the host's /dev/null and /dev/tty)" \
-    sh -c "[ \"\$(grep -c '^(allow container_init_t ' '$PK/selinux/varek_container.cil')\" = 4 ]"
+# the profile's rules that name mounts, exactly the Warden's three (v1.32 review)
+cat > "$OUT/aa.want" <<'EOF2'
+mount options=(rprivate) -> /,
+mount options=(rbind) /** -> /**,
+mount options=(remount, bind) options in (noexec, ro, nosuid, nodev, noatime, nodiratime, relatime, nosymfollow) -> /**,
+EOF2
+grep -E '^\s*(audit\s+|allow\s+|deny\s+)*(mount|remount|umount|pivot_root)\b' "$AA" | sed 's/^ *//' > "$OUT/aa.have"
+check "... allows the Warden's mounts and no other: exactly its three mount rules, and umount" \
+    sh -c "grep -vx 'umount,' '$OUT/aa.have' | diff -q '$OUT/aa.want' - && grep -qx 'umount,' '$OUT/aa.have'"
+check "... and keeps docker-default's denials (/proc, /sys, AF_ALG, AF_VSOCK)" sh -c "grep -q 'deny @{PROC}/sysrq-trigger rwklx' '$AA' && grep -q 'deny /sys/firmware/\*\* rwklx' '$AA' && grep -qx '  deny network alg,' '$AA' && grep -qx '  deny network vsock,' '$AA'"
+cat > "$OUT/se.want" <<'EOF2'
+(allow container_init_t cgroup_t (filesystem (remount)))
+(allow container_init_t container_file_t (chr_file (mounton)))
+(allow container_init_t null_device_t (chr_file (mounton)))
+(allow container_init_t devtty_t (chr_file (mounton)))
+EOF2
+check "the SELinux module: exactly container_init_t's four rules (the cgroup remount; mounton the container's and the host's /dev/null and /dev/tty)" \
+    sh -c "grep -v '^ *;' '$PK/selinux/varek_container.cil' | grep -v '^ *\$' | diff -q '$OUT/se.want' -"
 CF="$PK/Containerfile"
 check "the Containerfile: build, runtime and test stages; the entrypoint varek run" \
     sh -c "grep -q ' AS build\$' '$CF' && grep -q ' AS runtime\$' '$CF' && grep -q ' AS test\$' '$CF' && grep -qF 'ENTRYPOINT [\"varek\", \"run\", \"--\"]' '$CF'"
@@ -108,10 +125,15 @@ run = ' '.join(x.get('run', '') for x in s)
 sys.exit(0 if '--target runtime' in run and '--target test' in run and 'container_sweep.sh' in run and '--apparmor' in run else 1)"
     check "the release publishes, signs, attests and verifies" python3 -c "
 import yaml, sys
+import re
 d = yaml.safe_load(open('$WF/container-release.yml'))
-run = ' '.join(x.get('run', '') for x in d['jobs']['publish']['steps'])
-ok = d['permissions'].get('id-token') == 'write' and d['permissions'].get('packages') == 'write'
+j = d['jobs']['publish']
+run = ' '.join(x.get('run', '') for x in j['steps'])
+ok = d['permissions'] == {} and j['permissions'].get('id-token') == 'write' and j['permissions'].get('packages') == 'write'
 ok = ok and all(w in run for w in ('docker push', 'cosign sign', 'cosign attest', 'cosign verify ', 'cosign verify-attestation'))
+# every action pinned by its commit; no expression in a script (v1.32 review)
+ok = ok and all(re.fullmatch(r'[\w.-]+/[\w./-]+@[0-9a-f]{40}', x['uses']) for x in j['steps'] if 'uses' in x)
+ok = ok and '\${{' not in run and 'merge-base --is-ancestor' in run
 sys.exit(0 if ok else 1)"
 else
     skip "the workflows (no python3-yaml here)"

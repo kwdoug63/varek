@@ -16,8 +16,9 @@ CG_RW = "cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime 0 0\n"
 CG_RO = "cgroup2 /sys/fs/cgroup cgroup2 ro,nosuid,nodev,noexec,relatime 0 0\n"
 
 
-def status(caps=TEN, seccomp=2):
-    return f"Name:\tpython3\nCapBnd:\t{caps:016x}\nSeccomp:\t{seccomp}\n"
+def status(caps=TEN, seccomp=2, eff=None):
+    e = f"CapEff:\t{eff:016x}\n" if eff is not None else ""
+    return f"Name:\tpython3\n{e}CapBnd:\t{caps:016x}\nSeccomp:\t{seccomp}\n"
 
 
 def run(caps=TEN, seccomp=2, label="varek-container (enforce)", mounts=CG_RO, cgroup="0::/\n", uid_map=ROOTFUL):
@@ -44,6 +45,17 @@ def test_each_missing_capability_names_its_flag():
         assert f and f[0][0] == "fail" and f[0][2] == f"--cap-add {name}", (name, out)
 
 
+def test_root_counts_the_effective_set(monkeypatch):
+    """v1.32 review: as root the Warden holds the effective set, which an
+    entrypoint may have dropped below the bounding set"""
+    monkeypatch.setattr(vc.os, "geteuid", lambda: 0)
+    out = vc.settings(status(eff=TEN & ~(1 << 19)), "varek-container (enforce)", CG_RO, "0::/\n", ROOTFUL)
+    assert find(out, "capability SYS_PTRACE is missing")[0][0] == "fail"
+    monkeypatch.setattr(vc.os, "geteuid", lambda: 1000)
+    out = vc.settings(status(eff=0), "varek-container (enforce)", CG_RO, "0::/\n", ROOTFUL)
+    assert not find(out, "is missing")
+
+
 def test_extra_capabilities_and_privileged_warn():
     out = run(caps=TEN | 1 << 27)                                   # MKNOD
     assert find(out, "beyond the Warden's ten: MKNOD")[0][0] == "warn"
@@ -58,6 +70,9 @@ def test_seccomp_unconfined_warns():
 def test_apparmor_docker_default_fails_with_the_profile_as_fix():
     lv, text, fix = find(run(label="docker-default (enforce)"), "AppArmor profile docker-default")[0]
     assert lv == "fail" and "denies every mount" in text and "apparmor=varek-container" in fix
+    # v1.32 review: a run that mounts nothing is only warned
+    quiet = vc.settings(status(), "docker-default (enforce)", CG_RO, "0::/\n", ROOTFUL, cgroups=False, noexec=False)
+    assert find(quiet, "AppArmor profile docker-default")[0][0] == "warn"
     assert find(run(label="containers-default-0.50.1 (enforce)"), "containers-default")[0][0] == "fail"
     assert find(run(label="unconfined"), "apparmor=unconfined")[0][0] == "warn"
 
@@ -115,11 +130,30 @@ def test_for_run_counts_what_the_run_needs(monkeypatch):
     monkeypatch.setattr(vc, "probe_mounts", lambda cg=None: probed.append(cg) or [("ok", "mounts", None)])
     shared = (status(), "varek-container (enforce)", CG_RO, "0::/system.slice/x\n", ROOTFUL)
     monkeypatch.setattr(vc, "_state", lambda: shared)
+    monkeypatch.setattr(vc, "_userns", lambda: False)
     assert vc.for_run(cgroups=False, mounts=True) == [] and probed == [None]
     lacks = vc.for_run(cgroups=True, mounts=True)
     assert [f for _, f in lacks] == ["--cgroupns=private"]
     monkeypatch.setattr(vc, "_state", lambda: (status(TEN & ~(1 << 19)), *shared[1:]))
     lacks = vc.for_run(cgroups=False, mounts=False)
     assert [f for _, f in lacks] == ["--cap-add SYS_PTRACE"] and len(probed) == 2
+    # v1.32 review: docker-default refuses only a run that mounts
+    monkeypatch.setattr(vc, "_state", lambda: (status(), "docker-default (enforce)", *shared[2:]))
+    assert vc.for_run(cgroups=False, mounts=False) == [] and len(probed) == 2
+    assert "AppArmor profile docker-default" in vc.for_run(cgroups=False, mounts=True)[0][0]
     monkeypatch.setattr(vc, "in_container", lambda: None)
     assert vc.for_run(cgroups=True, mounts=True) == []
+
+
+def test_the_probe_never_returns_in_the_child(monkeypatch):
+    """v1.32 review: whatever the child raises, it exits there; the parent
+    removes its own directory only"""
+    monkeypatch.setattr(vc.os, "geteuid", lambda: 0)
+    import tempfile
+    other = tempfile.mkdtemp(prefix="varek-doctor.")
+    try:
+        out = vc.probe_mounts()
+        assert out and out[0][0] in ("ok", "fail")
+        assert os.path.isdir(other)
+    finally:
+        os.rmdir(other)

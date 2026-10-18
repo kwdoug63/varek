@@ -6,17 +6,24 @@
 ;
 ; The container runs as container_init_t, the distribution's own type for
 ; containers that manage their control groups (Podman uses it for systemd
-; in a container): container_t, with cgroup_t directories and files
-; managed, as sub-agents and confined MCP servers need (v1.28.1, v1.31).
-; The runtime mounts the container's cgroup filesystem read-only, and the
-; Warden remounts it read-write (its own groups only: --cgroupns=private);
-; container_init_t may not remount it, which is the first rule below; nor
-; mount on a character device (the noexec mount of /dev/null, which a policy
-; letting the agent write it has the Warden bind onto itself: v1.27.1), the
-; second; rootless (D10), where Podman binds the host's own device nodes onto
-; /dev/null and /dev/tty, the third and fourth. Each measured on RHEL 9.8. Other
-; containers keep container_t; this is not the host-wide
-; container_manage_cgroup boolean.
+; in a container). container-selinux (container.te) gives it what
+; container_t has and more: cgroup_t directories and files managed, as
+; sub-agents and confined MCP servers need (v1.28.1, v1.31); mounting on and
+; unmounting the cgroup filesystem, sysfs and /proc, and remounting /proc and
+; device_t filesystems, as systemd does; unmounting tmpfs; and the network
+; unconfined (corenet_unconfined). Other containers keep container_t; this
+; is not the host-wide container_manage_cgroup boolean.
+;
+; The four rules below, each measured refused without it on RHEL 9.8:
+;   1. the cgroup filesystem remounted: the runtime mounts the container's
+;      read-only, and the Warden bind-remounts it read-write in its own mount
+;      namespace (its own groups only: --cgroupns=private); SELinux asks for
+;      the filesystem's remount permission for any remount;
+;   2. a mount on any of the container's own character devices
+;      (container_file_t): the noexec mount of /dev/null, which a policy
+;      letting the agent write it has the Warden bind onto itself (v1.27.1);
+;   3. and 4. rootless (D10), where Podman binds the host's own device nodes
+;      onto /dev/null (null_device_t) and /dev/tty (devtty_t): the same mount.
 ;
 ; On the host, as root:
 ;

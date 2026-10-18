@@ -1,29 +1,37 @@
 name: Container release
 
 # v1.32 (step 6 of docs/security/v1.32-containers.md, D7 and D8): on a release
-# tag (v*), VAREK's runtime image is built, checked as CI checks it
+# tag (v*) on main, VAREK's runtime image is built, checked as CI checks it
 # (container.yml), and published to the GitHub Container Registry as
-# ghcr.io/kwdoug63/varek:<version>, :<major.minor> and, for a release that is
-# not a pre-release, :latest. It is signed with cosign, keyless (the
+# ghcr.io/kwdoug63/varek:<version>. It is signed with cosign, keyless (the
 # workflow's own GitHub identity, recorded in Sigstore's transparency log),
 # and its software bill of materials (CycloneDX, by syft) is attached as a
-# signed attestation. Both are verified before the workflow ends. No key or
-# password is kept anywhere: the registry login is the workflow's own token.
+# signed attestation; both are verified. Only then, for a release that is not
+# a pre-release, are :<major.minor> and :latest moved to it, each only when
+# it is the highest release of its kind. No key or password is kept
+# anywhere: the registry login is the workflow's own token.
+#
+# Every action is pinned by its commit, and cosign and syft by version: the
+# job holds the token that publishes and the identity that signs.
 
 on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: read
-  packages: write      # push to ghcr.io
-  id-token: write      # cosign keyless: the workflow's OIDC identity
+permissions: {}
 
 jobs:
   publish:
     name: Build, check, publish and sign the image
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # the repository's "release" environment: its protection rules (required
+    # reviewers, the tags it admits) are set in the repository's settings
+    environment: release
+    permissions:
+      contents: read
+      packages: write      # push to ghcr.io
+      id-token: write      # cosign keyless: the workflow's OIDC identity
     env:
       IMAGE: ghcr.io/${{ github.repository_owner }}/varek
       SETTINGS: >-
@@ -32,48 +40,73 @@ jobs:
         --cap-add NET_ADMIN --cap-add NET_BIND_SERVICE --cap-add CHOWN
         --cgroupns=private --security-opt apparmor=varek-container
     steps:
-      - uses: actions/checkout@v4
-      - name: The version, from the tag
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: The version, from the tag (a release tag, on main)
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          v="${GITHUB_REF_NAME#v}"
-          case "$v" in [0-9]*.[0-9]*.[0-9]*) ;; *) echo "not a release tag: $GITHUB_REF_NAME"; exit 1 ;; esac
+          v="${REF_NAME#v}"
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "not a release tag: $REF_NAME"; exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "the tag's commit is not on main: $GITHUB_SHA"; exit 1
+          fi
           echo "VERSION=$v" >> "$GITHUB_ENV"
+          echo "RELEASE=${v%%-*}" >> "$GITHUB_ENV"
           echo "MINOR=$(echo "$v" | cut -d. -f1,2)" >> "$GITHUB_ENV"
           case "$v" in *-*) echo "PRERELEASE=1" >> "$GITHUB_ENV" ;; esac
       - name: Load VAREK's AppArmor profile
         run: |
           sudo install -m 644 packaging/container/apparmor/varek-container /etc/apparmor.d/varek-container
           sudo apparmor_parser -r -W /etc/apparmor.d/varek-container
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5  # v3.10.1
+        with:
+          cosign-release: v2.6.1
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c  # v0.24.3
+        with:
+          syft-version: v1.54.1
       - name: Build the runtime image
         run: |
           docker build -f packaging/container/Containerfile --target runtime \
             --label org.opencontainers.image.version="$VERSION" \
             --label org.opencontainers.image.revision="$GITHUB_SHA" \
             -t "$IMAGE:$VERSION" .
-      - name: Check it before publishing (varek doctor; an agent's run)
+      - name: Check it before publishing - varek doctor finds every setting
         run: |
           docker run --rm $SETTINGS --entrypoint varek "$IMAGE:$VERSION" doctor | tee doctor.txt || true
           sed -n '/In a container/,/^$/p' doctor.txt > container.txt
-          grep -q 'In a container' container.txt && ! grep -q 'FAIL' container.txt
+          grep -q 'In a container' container.txt
+          if grep -q 'FAIL' container.txt; then echo "varek doctor found a setting missing"; exit 1; fi
+      - name: Check it before publishing - an agent runs under the baseline
+        run: |
           mkdir -p proj && chmod 755 proj
           out="$(docker run --rm $SETTINGS -v "$PWD/proj:/work" "$IMAGE:$VERSION" /bin/echo ran-under-the-warden)"
           grep -qx ran-under-the-warden <<<"$out"
-          docker run --rm --entrypoint varek "$IMAGE:$VERSION" version | grep -qF "Warden  $VERSION"
-      - name: Log in to the GitHub Container Registry (the workflow's own token)
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: Publish
+      - name: Check it before publishing - Docker's defaults are refused before the agent starts
         run: |
-          tags=("$VERSION" "$MINOR")
-          [ -n "${PRERELEASE:-}" ] || tags+=(latest)
-          for t in "${tags[@]}"; do
-            docker tag "$IMAGE:$VERSION" "$IMAGE:$t"
-            docker push "$IMAGE:$t"
-          done
+          if docker run --rm -v "$PWD/proj:/work" "$IMAGE:$VERSION" /bin/true 2> refused.txt; then
+            echo "the run started under Docker's defaults"; exit 1
+          fi
+          grep -q 'this container cannot carry the run' refused.txt
+      - name: Check it before publishing - the Warden is the tag's version
+        run: |
+          docker run --rm --entrypoint varek "$IMAGE:$VERSION" version > version.txt
+          cat version.txt
+          grep -qE "^VAREK Warden  ${RELEASE//./\\.}  " version.txt
+      - name: Log in to the GitHub Container Registry (the workflow's own token)
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - name: Publish the version
+        run: |
+          docker push "$IMAGE:$VERSION"
           digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$VERSION")"
           echo "DIGEST=$digest" >> "$GITHUB_ENV"
-          echo "published $digest as ${tags[*]}"
-      - uses: sigstore/cosign-installer@v3
-      - uses: anchore/sbom-action/download-syft@v0
+          echo "published $digest as $VERSION"
       - name: Sign the image (cosign, keyless)
         run: cosign sign --yes "$DIGEST"
       - name: The software bill of materials (CycloneDX), attached as a signed attestation
@@ -81,13 +114,28 @@ jobs:
           syft "$DIGEST" -o cyclonedx-json=sbom.cdx.json
           cosign attest --yes --type cyclonedx --predicate sbom.cdx.json "$DIGEST"
       - name: Verify the signature and the attestation, as a user would
+        env:
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
         run: |
-          id="https://github.com/${{ github.repository }}/.github/workflows/container-release.yml@${{ github.ref }}"
+          id="https://github.com/$REPO/.github/workflows/container-release.yml@$REF"
           iss=https://token.actions.githubusercontent.com
           cosign verify --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$DIGEST" > /dev/null
           cosign verify-attestation --type cyclonedx --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$DIGEST" > /dev/null
           echo "verified: $DIGEST"
-      - uses: actions/upload-artifact@v4
+      - name: Move the major.minor tag and latest, once signed (not for a pre-release)
+        if: env.PRERELEASE == ''
+        run: |
+          rels="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)"
+          tags=()
+          [ "$(grep -F "v$MINOR." <<<"$rels" | tail -1)" = "v$VERSION" ] && tags+=("$MINOR")
+          [ "$(tail -1 <<<"$rels")" = "v$VERSION" ] && tags+=(latest)
+          for t in "${tags[@]}"; do
+            docker tag "$IMAGE:$VERSION" "$IMAGE:$t"
+            docker push "$IMAGE:$t"
+          done
+          echo "moved: ${tags[*]:-none} (a newer release holds the rest)"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: sbom-${{ env.VERSION }}
           path: sbom.cdx.json

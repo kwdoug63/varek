@@ -517,7 +517,7 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared tests/proxy_parse_test tests/proxy_parse_fuzzer tests/v1281_sub tests/v1290_open tests/v1290_lat
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared tests/proxy_parse_test tests/proxy_parse_fuzzer tests/v1281_sub tests/v1290_open tests/v1290_lat tests/v1310_peek
 
 # v1.22: install the runtime and the `varek` command.
 #   sudo make install                  -> /opt/varek, plus /usr/local/bin/varek

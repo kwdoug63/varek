@@ -85,15 +85,23 @@ def _cgroup2(mounts):
     return None, False
 
 
-def settings(status, label, mounts, cgroup, uid_map="", cgroups=True):
+def settings(status, label, mounts, cgroup, uid_map="", cgroups=True, noexec=True, userns=None):
     """The container's settings, from /proc/self/status, the LSM label
     (/proc/self/attr/current), /proc/self/mounts, /proc/self/cgroup and
     /proc/self/uid_map: [(level, text, fix)], level "ok", "warn" or "fail".
     cgroups: control groups are needed (a policy with sub-agents or MCP
-    servers, or not known); without, their absence is a warning."""
+    servers, or not known); without, their absence is a warning. noexec: the
+    Warden mounts the writable directories noexec (launches decided, or not
+    known); a profile that denies mounts fails only when the run mounts
+    (noexec or cgroups), and warns otherwise. userns: a user namespace (from
+    /proc/self/ns/user), or None to tell from uid_map. The capabilities are
+    the effective set as root, which is what the Warden holds, and the
+    bounding set otherwise."""
     out = []
-    bnd = _field(status, "CapBnd")
+    bnd, eff = _field(status, "CapBnd"), _field(status, "CapEff")
     have = int(bnd, 16) if bnd else 0
+    if eff is not None and os.geteuid() == 0:
+        have &= int(eff, 16)
     missing = [n for n in sorted(NEEDED) if not have >> n & 1]
     for n in missing:
         name, why = NEEDED[n]
@@ -133,14 +141,15 @@ def settings(status, label, mounts, cgroup, uid_map="", cgroups=True):
         if name.startswith("varek-container"):
             out.append(("ok", f"AppArmor profile {name}", None))
         elif name == "docker-default" or name.startswith("containers-default"):
-            out.append(("fail", f"AppArmor profile {name}: it denies every mount, so the Warden cannot mount the "
-                        "agent's writable directories noexec", APPARMOR_FIX))
+            out.append(("fail" if noexec or cgroups else "warn", f"AppArmor profile {name}: it denies every mount, "
+                        "so the Warden cannot mount the agent's writable directories noexec nor remount the cgroup "
+                        "filesystem", APPARMOR_FIX))
         elif name == "unconfined":
             out.append(("warn", "no AppArmor profile on the container (apparmor=unconfined)", APPARMOR_FIX))
         else:
             out.append(("warn", f"AppArmor profile {name}: not one the settings were measured with", APPARMOR_FIX))
 
-    rootless = _rootless(uid_map)
+    rootless = _rootless(uid_map) if userns is None else userns
     cg, ro = _cgroup2(mounts)
     self_cg = next((ln[3:] for ln in cgroup.splitlines() if ln.startswith("0::")), None)
     if cg is None:
@@ -180,44 +189,59 @@ def _keep(path):
 
 def probe_mounts(cgroup_mount=None):
     """The Warden's mounts, made in a child (so this process keeps its own
-    namespace) as root: [(level, text, fix)]; [] when not root."""
+    namespace) as root: [(level, text, fix)]; [] when not root. The cgroup
+    filesystem is bind-remounted, as the Warden does (sub_cg_remount)."""
     if os.geteuid() != 0:
         return []
-    r, w = os.pipe()
-    pid = os.fork()
+    try:
+        d = tempfile.mkdtemp(prefix="varek-doctor.")
+    except OSError as e:
+        return [("fail", f"a test of the Warden's mounts: cannot make a directory in {tempfile.gettempdir()} "
+                 f"({errno.errorcode.get(e.errno, e.errno)})", "a writable /tmp (--tmpfs /tmp)")]
+    try:
+        r, w = os.pipe()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        pid = os.fork()
+    except OSError as e:
+        os.rmdir(d)
+        return [("fail", f"a test of the Warden's mounts: cannot start it ({errno.errorcode.get(e.errno, e.errno)})",
+                 None)]
     if pid == 0:
-        os.close(r)
-        libc = ctypes.CDLL(None, use_errno=True)
-        libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_void_p]
-
-        def step(name, rc):
-            if rc != 0:
-                os.write(w, f"{name} {ctypes.get_errno()}".encode())
-                os._exit(1)
+        code = 2
         try:
+            os.close(r)
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong,
+                                   ctypes.c_void_p]
+
+            def step(name, rc):
+                if rc != 0:
+                    os.write(w, f"{name} {ctypes.get_errno()}".encode())
+                    os._exit(1)
             step("unshare", libc.unshare(0x20000))                         # CLONE_NEWNS
             step("private", libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None))
-            d = tempfile.mkdtemp(prefix="varek-doctor.")
             b = d.encode()
             step("bind", libc.mount(b, b, None, MS_BIND | MS_REC, None))
             step("noexec", libc.mount(None, b, None, MS_BIND | MS_REMOUNT | MS_NOEXEC | _keep(d), None))
             if cgroup_mount:
                 c = cgroup_mount.encode()
-                step("cgroup", libc.mount(None, c, None, MS_REMOUNT | (_keep(cgroup_mount) & ~MS_RDONLY), None))
+                step("cgroup", libc.mount(None, c, None, MS_BIND | MS_REMOUNT | MS_NOEXEC |
+                                          (_keep(cgroup_mount) & ~MS_RDONLY), None))
             os.write(w, b"ok 0")
-            os._exit(0)
-        except Exception:                                                   # noqa: BLE001
-            os._exit(2)
+            code = 0
+        finally:                                                            # never back into the caller
+            os._exit(code)
     os.close(w)
-    msg = os.read(r, 64).decode() or "error 0"
-    os.close(r)
-    os.waitpid(pid, 0)
-    for d in os.listdir(tempfile.gettempdir()):                             # the child's directory
-        if d.startswith("varek-doctor."):
-            try:
-                os.rmdir(os.path.join(tempfile.gettempdir(), d))
-            except OSError:
-                pass
+    try:
+        msg = os.read(r, 64).decode() or "error 0"
+    finally:
+        os.close(r)
+        os.waitpid(pid, 0)
+        try:
+            os.rmdir(d)                                                     # this probe's own directory
+        except OSError:
+            pass
     what, _, e = msg.partition(" ")
     err = errno.errorcode.get(int(e or 0), e)
     if what == "ok":
@@ -252,16 +276,30 @@ def _state():
         read("/proc/self/uid_map")
 
 
-def check(cgroups=True):
-    """Everything: [(level, text, fix)], or [] outside a container."""
+def _userns():
+    """in a user namespace: the initial one's inode is fixed
+    (PROC_USER_INIT_INO), as the Warden tells (sub_in_userns)"""
+    try:
+        return os.stat("/proc/self/ns/user").st_ino != 0xEFFFFFFD
+    except OSError:
+        return None
+
+
+def check(cgroups=True, noexec=True):
+    """Everything, as the run would need it: [(level, text, fix)], or []
+    outside a container. `varek doctor` asks for all (the policy is not
+    known); the preflight, for its policy's (--cgroups, --noexec). The mount
+    test when the run mounts or makes control groups."""
     if not in_container():
         return []
-
     status, label, mounts, cgroup, uid_map = _state()
-    out = settings(status, label, mounts, cgroup, uid_map, cgroups)
-    cg, ro = _cgroup2(mounts)
-    self_cg = next((ln[3:] for ln in cgroup.splitlines() if ln.startswith("0::")), None)
-    out += probe_mounts(cg if cgroups and cg and ro and self_cg == "/" and not _rootless(uid_map) else None)
+    userns = _userns()
+    rootless = _rootless(uid_map) if userns is None else userns
+    out = settings(status, label, mounts, cgroup, uid_map, cgroups, noexec, rootless)
+    if noexec or cgroups:
+        cg, ro = _cgroup2(mounts)
+        self_cg = next((ln[3:] for ln in cgroup.splitlines() if ln.startswith("0::")), None)
+        out += probe_mounts(cg if cgroups and cg and ro and self_cg == "/" and not rootless else None)
     return out
 
 
@@ -270,24 +308,15 @@ def for_run(cgroups, mounts):
     container lacks, [(text, fix)]; [] outside a container or when it has
     all. cgroups: the policy names a sub-agent or an MCP server; mounts: the
     Warden mounts the writable directories noexec (launches decided, no
-    --writable-exec). Capabilities always; the mount test when the run
-    mounts or makes control groups."""
-    if not in_container():
-        return []
-    status, label, mnts, cgroup, uid_map = _state()
-    out = [(t, f) for lv, t, f in settings(status, label, mnts, cgroup, uid_map, cgroups) if lv == "fail"]
-    if mounts or cgroups:
-        cg, ro = _cgroup2(mnts)
-        self_cg = next((ln[3:] for ln in cgroup.splitlines() if ln.startswith("0::")), None)
-        rm = cg if cgroups and cg and ro and self_cg == "/" and not _rootless(uid_map) else None
-        out += [(t, f) for lv, t, f in probe_mounts(rm) if lv == "fail"]
-    return out
+    --writable-exec). Capabilities always; the profile and the mount test
+    when the run mounts or makes control groups."""
+    return [(t, f) for lv, t, f in check(cgroups, mounts) if lv == "fail"]
 
 
 if __name__ == "__main__":
     # tools/varek_preflight.sh: --in-container (exit 0 when in one), or
-    # --preflight [--cgroups]: each finding as LEVEL<tab>TEXT<tab>FIX
+    # --preflight [--cgroups] [--noexec]: each finding as LEVEL<tab>TEXT<tab>FIX
     if "--in-container" in sys.argv:
         sys.exit(0 if in_container() else 1)
-    for lv, t, f in check(cgroups="--cgroups" in sys.argv):
+    for lv, t, f in check(cgroups="--cgroups" in sys.argv, noexec="--noexec" in sys.argv):
         print(f"{lv}\t{t}\t{f or ''}")

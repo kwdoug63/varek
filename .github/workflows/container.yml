@@ -16,7 +16,11 @@ on:
       - "v1_6/**"
       - "v1_7/**"
       - "packaging/container/**"
+      - ".dockerignore"
+      - "LICENSE"
+      - "NOTICE"
       - ".github/workflows/container.yml"
+      - ".github/workflows/container-release.yml"
   pull_request:
     branches: [main]
     paths:
@@ -24,7 +28,14 @@ on:
       - "v1_6/**"
       - "v1_7/**"
       - "packaging/container/**"
+      - ".dockerignore"
+      - "LICENSE"
+      - "NOTICE"
       - ".github/workflows/container.yml"
+      - ".github/workflows/container-release.yml"
+
+permissions:
+  contents: read
 
 jobs:
   image:

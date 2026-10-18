@@ -29,9 +29,21 @@ elif command -v dnf >/dev/null 2>&1; then
     dnf clean all >/dev/null
 elif command -v microdnf >/dev/null 2>&1; then
     [ "$stage" = runtime ] || { echo "deps.sh: microdnf images are for the runtime stage only" >&2; exit 2; }
-    # libsodium is not in UBI's repositories; it comes from EPEL 9, as on RHEL
-    rpm -q epel-release >/dev/null 2>&1 ||
-        rpm -i https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+    # libsodium is not in UBI's repositories; it comes from EPEL 9, as on RHEL.
+    # EPEL's key is the one kept with this file (packaging/container/
+    # RPM-GPG-KEY-EPEL-9, fingerprint FF8A D134 4597 106E CE81 3B91 8A38 72BF
+    # 3228 467C), imported first, so epel-release is installed only signed by
+    # it, and every EPEL package microdnf installs after it is checked by it
+    if ! rpm -q epel-release >/dev/null 2>&1; then
+        key="${VAREK_EPEL_KEY:-/tmp/RPM-GPG-KEY-EPEL-9}"
+        rpm --import "$key"
+        rpm -q gpg-pubkey-3228467c >/dev/null || { echo "deps.sh: EPEL 9's key did not import" >&2; exit 1; }
+        curl -fsSL -o /tmp/epel-release.rpm https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+        rpm -K /tmp/epel-release.rpm | grep -q 'digests signatures OK$' ||
+            { echo "deps.sh: epel-release is not signed by EPEL 9's key" >&2; exit 1; }
+        rpm -i /tmp/epel-release.rpm
+        rm -f /tmp/epel-release.rpm "$key"
+    fi
     microdnf -y install libseccomp libsodium openssl-libs python3 >/dev/null
     microdnf clean all >/dev/null
 else

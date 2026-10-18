@@ -182,18 +182,25 @@ sys.exit(os.waitpid(pid, 0)[1] != 0)' 2>/dev/null; then
 fi
 
 # v1.32: in a container, each setting the Warden needs of it
-# (packaging/container/README.md); control groups counted when the policy
-# names a sub-agent or an MCP server
+# (packaging/container/README.md), as this policy needs it, as `varek run`
+# counts it: control groups when the policy names a sub-agent or an MCP
+# server, the mounts when it decides launches
 if python3 "$HERE/tools/varek_container.py" --in-container 2>/dev/null; then
     echo "== 2b. the container"
-    cgf=; "$CERT" "$POLICY" identity 2>/dev/null | grep -q -E '^(subagent|confined) ' && cgf=--cgroups
-    while IFS=$'\t' read -r lv text fix; do
-        case "$lv" in
-            ok)   pass "$text" ;;
-            warn) warn "$text${fix:+ ($fix)}" ;;
-            fail) fail "$text${fix:+ ($fix)}" ;;
-        esac
-    done < <(python3 "$HERE/tools/varek_container.py" --preflight $cgf 2>/dev/null)
+    cflags=()
+    "$CERT" "$POLICY" identity 2>/dev/null | grep -q -E '^(subagent|confined) ' && cflags+=(--cgroups)
+    [ "$("$VDP" "$POLICY" launches 2>/dev/null)" = on ] && cflags+=(--noexec)
+    if cout="$(python3 "$HERE/tools/varek_container.py" --preflight "${cflags[@]}" 2>&1)"; then
+        while IFS=$'\t' read -r lv text fix; do
+            case "$lv" in
+                ok)   pass "$text" ;;
+                warn) warn "$text${fix:+ ($fix)}" ;;
+                fail) fail "$text${fix:+ ($fix)}" ;;
+            esac
+        done <<< "$cout"
+    else
+        fail "the container's checks did not run (tools/varek_container.py): $(printf '%s' "$cout" | tail -1)"
+    fi
 fi
 
 echo "== 3. what the Warden refuses at startup"
