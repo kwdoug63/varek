@@ -147,7 +147,11 @@ remount among them; `/bin/echo` run as the agent under the baseline, as
 
 ## 24 hours in a container
 
-Pending.
+Running: started 2026-10-18 02:29 CDT on a 2 GB droplet (Ubuntu 24.04,
+kernel 6.8, Docker 29.1.3), the shared soak in the test image under the
+documented settings and the AppArmor profile as shipped
+(`tests/soak_shared/container.sh`, commit `54584a4`). Its 6-minute trial
+passed, run A's two Python servers settled by their layout.
 
 ## Compatibility
 
