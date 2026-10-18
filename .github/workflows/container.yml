@@ -62,6 +62,7 @@ jobs:
         run: docker build -f packaging/container/Containerfile --target runtime -t varek .
       - name: The runtime image - varek doctor finds every setting
         run: |
+          # shellcheck disable=SC2086  # $SETTINGS: the docker flags, split into words
           docker run --rm $SETTINGS --entrypoint varek varek doctor | tee doctor.txt || true
           sed -n '/In a container/,/^$/p' doctor.txt > container.txt
           grep -q 'In a container' container.txt
@@ -69,6 +70,7 @@ jobs:
       - name: The runtime image - an agent runs under the baseline
         run: |
           mkdir -p proj && chmod 755 proj
+          # shellcheck disable=SC2086  # $SETTINGS: the docker flags, split into words
           out="$(docker run --rm $SETTINGS -v "$PWD/proj:/work" varek /bin/echo ran-under-the-warden)"
           echo "$out"
           grep -qx ran-under-the-warden <<<"$out"

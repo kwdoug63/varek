@@ -51,10 +51,12 @@ jobs:
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
             echo "the tag's commit is not on main: $GITHUB_SHA"; exit 1
           fi
-          echo "VERSION=$v" >> "$GITHUB_ENV"
-          echo "RELEASE=${v%%-*}" >> "$GITHUB_ENV"
-          echo "MINOR=$(echo "$v" | cut -d. -f1,2)" >> "$GITHUB_ENV"
-          case "$v" in *-*) echo "PRERELEASE=1" >> "$GITHUB_ENV" ;; esac
+          {
+            echo "VERSION=$v"
+            echo "RELEASE=${v%%-*}"
+            echo "MINOR=$(echo "$v" | cut -d. -f1,2)"
+            case "$v" in *-*) echo "PRERELEASE=1" ;; esac
+          } >> "$GITHUB_ENV"
       - name: Load VAREK's AppArmor profile
         run: |
           sudo install -m 644 packaging/container/apparmor/varek-container /etc/apparmor.d/varek-container
@@ -73,6 +75,7 @@ jobs:
             -t "$IMAGE:$VERSION" .
       - name: Check it before publishing - varek doctor finds every setting
         run: |
+          # shellcheck disable=SC2086  # $SETTINGS: the docker flags, split into words
           docker run --rm $SETTINGS --entrypoint varek "$IMAGE:$VERSION" doctor | tee doctor.txt || true
           sed -n '/In a container/,/^$/p' doctor.txt > container.txt
           grep -q 'In a container' container.txt
@@ -80,6 +83,7 @@ jobs:
       - name: Check it before publishing - an agent runs under the baseline
         run: |
           mkdir -p proj && chmod 755 proj
+          # shellcheck disable=SC2086  # $SETTINGS: the docker flags, split into words
           out="$(docker run --rm $SETTINGS -v "$PWD/proj:/work" "$IMAGE:$VERSION" /bin/echo ran-under-the-warden)"
           grep -qx ran-under-the-warden <<<"$out"
       - name: Check it before publishing - Docker's defaults are refused before the agent starts
