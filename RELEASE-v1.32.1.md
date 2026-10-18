@@ -55,7 +55,11 @@ runs rootless without `--systemd=always` (`--systemd` adds it).
 capabilities, `--cgroupns=private`, **without `--systemd=always`**): every
 suite passes, 32 of 32 (`test-v1321`'s section 2, which makes a user
 namespace of its own, skips inside a container, where it cannot; it runs
-on the host). v1.32.0's rootless sweep was run with `--systemd=always`.
+on the host). In the container's user namespace, `test-v1281` found the
+cgroup filesystem read-only, `--check-startup` tried the remount and said
+a run makes it, and a run made it and attributed its sub-agent: the two
+checks v1.32.0 refused there. v1.32.0's rootless sweep was run with
+`--systemd=always`.
 
 ## Upgrading
 
