@@ -124,7 +124,7 @@ static const char *reach_name(vdp_reach_t r) {
 
 int main(int argc, char **argv) {
     if (argc != 3 && !(argc == 4 && !strcmp(argv[2], "analyze") && !strcmp(argv[3], "automaton"))) {
-        fprintf(stderr, "usage: %s <policy> lint|analyze [automaton]|batch|launches|openas|credentials|identity\n", argv[0]);
+        fprintf(stderr, "usage: %s <policy> lint|analyze [automaton]|batch|launches|mounts|openas|credentials|identity\n", argv[0]);
         return 2;
     }
     if (argc == 4) vdp_reach_force_automaton = true;
@@ -139,6 +139,14 @@ int main(int argc, char **argv) {
     /* v1.27: are launches after the first decided (require warden 1.27)? */
     if (!strcmp(argv[2], "launches")) {
         printf("%s\n", g_pol.launches ? "on" : "off");
+        return 0;
+    }
+    /* v1.32: will the Warden mount anything (launches decided and a path
+     * rule that writes: the noexec mounts)? varek run's container check */
+    if (!strcmp(argv[2], "mounts")) {
+        bool w = false;
+        for (size_t i = 0; g_pol.launches && i < g_pol.n; i++) w = w || vdp_rule_may_write(&g_pol.rules[i]);
+        printf("%s\n", w ? "on" : "off");
         return 0;
     }
     /* v1.29: are files opened with the agent's credentials (require warden 1.29)? */

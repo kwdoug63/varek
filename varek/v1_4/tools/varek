@@ -1333,7 +1333,9 @@ def cmd_run(args):
         iq = run_cmd([tool("vdp_cert_check"), policy, "identity"], capture=True, check=False)
         cgroups = iq.returncode == 0 and any(ln.startswith(("subagent ", "confined "))
                                              for ln in iq.stdout.splitlines())
-        lq = run_cmd([tool("vdp_check"), policy, "launches"], capture=True, check=False)
+        # the noexec mounts: launches decided and a rule that writes (v1.32
+        # second review: launches alone counted a run that mounts nothing)
+        lq = run_cmd([tool("vdp_check"), policy, "mounts"], capture=True, check=False)
         mounts = lq.returncode == 0 and lq.stdout.strip() == "on" and not args.writable_exec
         lacks = varek_container.for_run(cgroups, mounts)
         if lacks:

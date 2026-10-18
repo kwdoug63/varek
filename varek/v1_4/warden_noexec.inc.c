@@ -38,23 +38,10 @@ static struct noexec_island g_nxi[NOEXEC_MAX];
 static size_t g_nxi_n;
 static bool   g_writable_exec;      /* --writable-exec: the operator turned the mounts off (D2) */
 
-/* Does path rule r allow some open that writes (an access mode of write or
- * read-write, O_TRUNC, or O_CREAT)? The flags a rule requires are its value;
- * the rest are free. Over-approximating is the safe direction: one more
- * directory not mapped executable. */
-static bool noexec_rule_writable(const vdp_rule_t *r) {
-    if (r->kind != VDP_KIND_PATH || r->verb != VDP_ALLOW) return false;
-    static const uint32_t cand[] = {
-        1u, 2u, (uint32_t)O_TRUNC, (uint32_t)O_CREAT, 1u | (uint32_t)O_TRUNC, 2u | (uint32_t)O_TRUNC, 1u | (uint32_t)O_CREAT, 2u | (uint32_t)O_CREAT,
-        (uint32_t)O_CREAT | (uint32_t)O_TRUNC, 1u | (uint32_t)O_CREAT | (uint32_t)O_TRUNC, 2u | (uint32_t)O_CREAT | (uint32_t)O_TRUNC,
-    };
-    for (size_t k = 0; k < sizeof cand / sizeof cand[0]; k++) {
-        uint32_t f = (cand[k] & ~r->b.mask) | r->b.value;
-        if ((f & (uint32_t)O_ACCMODE) == 1u || (f & (uint32_t)O_ACCMODE) == 2u || (f & ((uint32_t)O_TRUNC | (uint32_t)O_CREAT)))
-            return true;
-    }
-    return false;
-}
+/* Does path rule r allow some open that writes? vdp_rule_may_write
+ * (smt_decide.c, v1.32: shared with vdp_check's `mounts`, which varek run
+ * asks whether the Warden will mount anything). */
+static bool noexec_rule_writable(const vdp_rule_t *r) { return vdp_rule_may_write(r); }
 
 /* Is p inside d (or d itself)? Both canonical. */
 static bool noexec_under(const char *p, const char *d) {

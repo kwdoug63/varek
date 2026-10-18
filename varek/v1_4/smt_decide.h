@@ -538,6 +538,11 @@ typedef struct {
  * then refuses: the action is not authorized). */
 int vdp_certificate(const vdp_policy_t *p, int rule_index, const char *s, vdp_cert_t *c);
 
+/* v1.32: does path rule r allow some open that writes (an access mode of
+ * write or read-write, O_TRUNC, or O_CREAT)? The Warden mounts the
+ * directories of such rules noexec when launches are decided. */
+bool vdp_rule_may_write(const vdp_rule_t *r);
+
 /* Release what vdp_policy_load allocated (compiled globs). */
 void vdp_policy_free(vdp_policy_t *p);
 

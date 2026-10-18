@@ -99,10 +99,11 @@ stays 1.31 (`require warden 1.32` is refused).
 
 ## Tested
 
-`make test-v1320` runs 22 checks; CI runs it as root:
+`make test-v1320` runs 24 checks; CI runs it as root:
 
 - **The version** (section 1): the Warden reports 1.32.0 and `run_start`
-  names it; `require warden 1.32` refused, `require warden 1.31` loads.
+  names it; `require warden 1.32` refused, `require warden 1.31` loads;
+  `vdp_check mounts` says whether the Warden will mount anything.
 - **`varek doctor` in a container** (2): its container section, the
   capabilities, and the Warden's mounts made in a child; no section on a
   host.
@@ -282,7 +283,13 @@ against the code, most by running it, before it was fixed.
   mounts none noexec (a read-only `/tmp` refused it), and did not check
   the cgroup filesystem read-write after its remount, as the Warden does;
   no cgroup v2 only warned a run that needs control groups. Fixed; the
-  preflight's empty option list on bash before 4.4.
+  preflight's empty option list on bash before 4.4. **`varek run` and the
+  preflight counted a run that decides launches as one that mounts**,
+  though with no rule that writes the Warden mounts nothing; under
+  `docker-default` such a run was refused. They now ask `vdp_check POLICY
+  mounts`, which applies the Warden's own test of a rule
+  (`vdp_rule_may_write`, moved to `smt_decide.c` from the Warden's
+  `warden_noexec.inc.c`).
 - **The container soak's wrapper** removed a stopped container of its
   name, which holds the only copy of that soak's tokens, so a cut-short
   soak could not be judged again. It never removes one now, and
@@ -319,10 +326,6 @@ against the code, most by running it, before it was fixed.
   MCP servers: in a user namespace the Warden does not remount a
   read-only cgroup filesystem. A bind remount may work there; it is not
   yet measured under rootless Podman.
-- **`varek run`'s container check counts a run that decides launches as
-  one that mounts**, though with no writable directory the Warden mounts
-  nothing: under `docker-default` such a run is refused before the
-  Warden would start it. VAREK's profile carries it.
 - **The AppArmor profile bounds what is mounted, not where.** The Warden,
   or a root shell started in the container with the same capabilities,
   may bind any path and make a bind mount read-write. The agent holds no

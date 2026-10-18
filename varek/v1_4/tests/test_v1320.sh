@@ -41,6 +41,15 @@ printf 'require warden 1.32\nallow path /usr/ readonly\n' > "$OUT/p132.txt"
 printf 'require warden 1.31\nallow path /usr/ readonly\n' > "$OUT/p131.txt"
 check "the grammar stays 1.31: require warden 1.32 is refused" sh -c "! '$VDP' '$OUT/p132.txt' lint && '$VDP' '$OUT/p132.txt' lint 2>&1 | grep -q 'policy requires Warden 1.32; this is 1.31'"
 check "... and require warden 1.31 loads" "$VDP" "$OUT/p131.txt" lint
+# v1.32 second review: varek run's container check asks whether the Warden
+# will mount anything (vdp_check mounts), not only whether launches are decided
+printf 'require warden 1.27\nallow path /usr/ readonly\nallow exec /usr/bin/true\n' > "$OUT/mro.txt"
+printf 'require warden 1.27\nallow path /usr/ readonly\nallow path /tmp/varek-v1320-w/\n' > "$OUT/mrw.txt"
+printf 'require warden 1.26\nallow path /tmp/varek-v1320-w/\n' > "$OUT/m126.txt"
+check "the noexec mounts: none for a policy that decides launches but writes nothing" \
+    sh -c "[ \"\$('$VDP' '$OUT/mro.txt' launches)\" = on ] && [ \"\$('$VDP' '$OUT/mro.txt' mounts)\" = off ]"
+check "... made for one that writes, and none where launches are not decided" \
+    sh -c "[ \"\$('$VDP' '$OUT/mrw.txt' mounts)\" = on ] && [ \"\$('$VDP' '$OUT/m126.txt' mounts)\" = off ]"
 if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
     skip "run_start's version (needs root and the warden binary)"
 else

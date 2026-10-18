@@ -3281,3 +3281,22 @@ size_t vdp_exec_advisory(const vdp_policy_t *p, size_t i, char *buf, size_t n) {
 #undef EADD
     return w;
 }
+
+/* Does path rule r allow some open that writes (an access mode of write or
+ * read-write, O_TRUNC, or O_CREAT)? The flags a rule requires are its value;
+ * the rest are free. Over-approximating is the safe direction: one more
+ * directory not mapped executable. (v1.32: moved here from the Warden's
+ * warden_noexec.inc.c, so vdp_check asks the same.) */
+bool vdp_rule_may_write(const vdp_rule_t *r) {
+    if (r->kind != VDP_KIND_PATH || r->verb != VDP_ALLOW) return false;
+    static const uint32_t cand[] = {
+        1u, 2u, K_O_TRUNC, K_O_CREAT, 1u | K_O_TRUNC, 2u | K_O_TRUNC, 1u | K_O_CREAT, 2u | K_O_CREAT,
+        K_O_CREAT | K_O_TRUNC, 1u | K_O_CREAT | K_O_TRUNC, 2u | K_O_CREAT | K_O_TRUNC,
+    };
+    for (size_t k = 0; k < sizeof cand / sizeof cand[0]; k++) {
+        uint32_t f = (cand[k] & ~r->b.mask) | r->b.value;
+        if ((f & K_O_ACCMODE) == 1u || (f & K_O_ACCMODE) == 2u || (f & (K_O_TRUNC | K_O_CREAT)))
+            return true;
+    }
+    return false;
+}

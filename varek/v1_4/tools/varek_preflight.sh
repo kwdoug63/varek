@@ -184,12 +184,12 @@ fi
 # v1.32: in a container, each setting the Warden needs of it
 # (packaging/container/README.md), as this policy needs it, as `varek run`
 # counts it: control groups when the policy names a sub-agent or an MCP
-# server, the mounts when it decides launches
+# server, the mounts when it mounts writable directories noexec (vdp_check mounts)
 if python3 "$HERE/tools/varek_container.py" --in-container 2>/dev/null; then
     echo "== 2b. the container"
     cflags=()
     "$CERT" "$POLICY" identity 2>/dev/null | grep -q -E '^(subagent|confined) ' && cflags+=(--cgroups)
-    [ "$("$VDP" "$POLICY" launches 2>/dev/null)" = on ] && cflags+=(--noexec)
+    [ "$("$VDP" "$POLICY" mounts 2>/dev/null)" = on ] && cflags+=(--noexec)
     if cout="$(python3 "$HERE/tools/varek_container.py" --preflight ${cflags[@]+"${cflags[@]}"} 2>&1)"; then
         while IFS=$'\t' read -r lv text fix; do
             case "$lv" in
