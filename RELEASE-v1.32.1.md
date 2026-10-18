@@ -1,7 +1,6 @@
 # VAREK v1.32.1 — Rootless Podman Without `--systemd=always`
 
-**Draft.** Pending: v1.32.0's release, the rootless sweep on this build,
-review, and the date.
+**Draft.** Pending: v1.32.0's release, review, and the date.
 
 MIT · github.com/kwdoug63/varek
 
@@ -50,8 +49,13 @@ read-only cgroup filesystem is no longer a failure, and that a refused
 remount there names `--systemd=always` first. `tests/container_sweep.sh`
 runs rootless without `--systemd=always` (`--systemd` adds it).
 
-To do before release: the rootless sweep on this build (31 suites,
-without `--systemd=always`), as v1.32.0's was run with it.
+**The rootless sweep** (October 18, 2026, 10:38 CDT; `5b59920`; RHEL
+9.8, kernel 5.14.0-687, Podman 5.8.2 as ec2-user, subordinate IDs
+`100000:65536`, SELinux enforcing, `container_init_t`, the ten
+capabilities, `--cgroupns=private`, **without `--systemd=always`**): every
+suite passes, 32 of 32 (`test-v1321`'s section 2, which makes a user
+namespace of its own, skips inside a container, where it cannot; it runs
+on the host). v1.32.0's rootless sweep was run with `--systemd=always`.
 
 ## Upgrading
 
