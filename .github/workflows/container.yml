@@ -81,6 +81,13 @@ jobs:
           fi
           cat refused.txt
           grep -q 'this container cannot carry the run' refused.txt
+      - name: The runtime image - an agent's image built on it (packaging/container/example)
+        run: |
+          docker build --build-arg VAREK_IMAGE=varek -t varek-example packaging/container/example
+          # shellcheck disable=SC2086  # $SETTINGS: the docker flags, split into words
+          out="$(docker run --rm $SETTINGS varek-example)"
+          echo "$out"
+          python3 -c 'import json,sys; r = json.loads(sys.argv[1].splitlines()[-1]); ok = r["read_own_file"] == "ok" and r["import_requests"] == "ok" and r["read_shadow"] != "ok" and r["write_etc"] != "ok" and r["user"] != 0; sys.exit(0 if ok else 1)' "$out"
       - name: Build the test image
         run: docker build -f packaging/container/Containerfile --target test -t varek-test .
       - name: Run every suite in the test image

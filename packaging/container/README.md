@@ -168,8 +168,9 @@ docker run --rm <the settings above> --entrypoint varek varek doctor
 
 ## Your agent in the image
 
-Build on the image and name your agent's command (not yet built and run in
-the release's tests):
+Build on the image and name your agent's command (`example/` holds this
+Dockerfile with a small agent; CI builds it on each change and runs it
+under the settings above):
 
 ```
 FROM ghcr.io/kwdoug63/varek:1.32.0
