@@ -286,9 +286,29 @@ refuse:
  * capabilities, cannot write the groups, which root owns, any more than on
  * a host. Anywhere else nothing is done. 0; 1 in a check, where the run
  * would remount it; or -1 printed. */
+/* v1.32 (D10): in a user namespace (rootless Podman): the identity map is
+ * the initial namespace's only */
+static bool sub_in_userns(void) {
+    FILE *f = fopen("/proc/self/uid_map", "re");
+    if (!f) return false;
+    unsigned long a = 0, b = 0, n = 0;
+    int k = fscanf(f, "%lu %lu %lu", &a, &b, &n);
+    fclose(f);
+    return k == 3 && !(a == 0 && b == 0 && n == 4294967295UL);
+}
+
 static int sub_container_cgroup(const char *mnt, const char *self, bool check_only) {
     struct statvfs sv;
     if (statvfs(mnt, &sv) < 0 || !(sv.f_flag & ST_RDONLY)) return 0;
+    /* D10, measured: in a user namespace the kernel refuses the remount;
+     * rootless Podman's systemd mode mounts the container's own groups
+     * read-write instead */
+    if (sub_in_userns()) {
+        fprintf(stderr, "[warden] the policy names a sub-agent: the cgroup filesystem at %s is read-only and this "
+                "is a user namespace (rootless), where it cannot be remounted; run the container with "
+                "--systemd=always (packaging/container/README.md); refusing to start\n", mnt);
+        return -1;
+    }
     if (strcmp(self, "/")) {
         fprintf(stderr, "[warden] the policy names a sub-agent: the cgroup filesystem at %s is read-only and "
                 "this process's group (%s) is not its root; in a container, run it with --cgroupns=private "
