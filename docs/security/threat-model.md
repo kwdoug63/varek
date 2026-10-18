@@ -651,8 +651,11 @@ Model-B techniques below, with the residual limits stated honestly.
   - *Refused, not run with less.* `varek run` in a container refuses a
     run the container cannot carry (a missing capability; for a run that
     mounts or makes control groups, the profile, the mount test, the
-    cgroup namespace), naming the flag; rootless Podman without
-    `--systemd=always` is refused for sub-agents at the start.
+    cgroup namespace), naming the flag. Rootless Podman without
+    `--systemd=always` was refused for sub-agents at the start through
+    v1.32.0; from v1.32.1 the Warden bind-remounts the cgroup filesystem
+    in the user namespace too, and refuses, naming that flag, only where
+    the kernel refuses the remount.
   - *The image's provenance.* Each tag's image is built from main, checked
     (`varek doctor`, an agent's run, Docker's defaults refused), signed
     with cosign keyless and given a signed CycloneDX SBOM attestation,

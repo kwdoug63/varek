@@ -36,7 +36,7 @@ unset SUDO_UID SUDO_GID SUDO_USER SUDO_COMMAND
 VAREK="$HERE/tools/varek"
 
 echo "== 1. the version =="
-check "the Warden reports 1.32.0" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$VAREK' version | grep -q 'VAREK Warden  1.32.0'"
+check "the Warden reports 1.32.0 or later" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$VAREK' version | grep -qE 'VAREK Warden  1\.32\.[0-9]+'"
 printf 'require warden 1.32\nallow path /usr/ readonly\n' > "$OUT/p132.txt"
 printf 'require warden 1.31\nallow path /usr/ readonly\n' > "$OUT/p131.txt"
 check "the grammar stays 1.31: require warden 1.32 is refused" sh -c "! '$VDP' '$OUT/p132.txt' lint && '$VDP' '$OUT/p132.txt' lint 2>&1 | grep -q 'policy requires Warden 1.32; this is 1.31'"
@@ -57,7 +57,7 @@ if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
     skip "run_start's version (needs root and the warden binary)"
 else
     (cd /tmp && timeout 60 "$WARDEN" "$OUT/p131.txt" -- /usr/bin/true > /dev/null 2> "$OUT/rs.log")
-    check "run_start names the Warden 1.32.0" grep -q '"event":"run_start".*"warden":"1.32.0"' "$OUT/rs.log"
+    check "run_start names the Warden 1.32.0 or later" grep -qE '"event":"run_start".*"warden":"1\.32\.[0-9]+"' "$OUT/rs.log"
 fi
 
 echo "== 2. varek doctor in a container (D11) =="

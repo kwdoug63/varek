@@ -663,7 +663,7 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
 /* v1.32 (D12): the Warden's own version, ahead of the grammar's when a
  * release adds no policy lines (v1.32.0: containers; the grammar stays 1.31) */
 #define VDP_WARDEN_REL_MINOR 32
-#define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's */
+#define VDP_WARDEN_PATCH 1      /* v1.27.1: the Warden's version beyond the grammar's */
 
 /* v1.27: a note on exec rule i, for lint and the Warden's load-time notes,
  * in buf (empty: none); returns its length. An allow exec rule naming a shell

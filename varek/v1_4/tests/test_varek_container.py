@@ -107,12 +107,32 @@ def test_rootless_is_said():
     assert not find(run(), "rootless")
 
 
-def test_rootless_read_only_cgroups_need_systemd_always():
-    """D10: in a user namespace the Warden does not remount the cgroup mount"""
-    lv, _, fix = find(run(uid_map=ROOTLESS), "does not remount it")[0]
+def test_rootless_read_only_cgroups_are_remounted():
+    """v1.32.1 (D10 measured): in a user namespace the Warden bind-remounts
+    the cgroup mount as elsewhere; --systemd=always is no longer needed"""
+    assert find(run(uid_map=ROOTLESS), "a run remounts it read-write")[0][0] == "ok"
+    assert not find(run(uid_map=ROOTLESS), "does not remount it")
+    assert not [t for lv, t, _ in run(uid_map=ROOTLESS) if lv == "fail"]
+
+
+def test_rootless_remount_refused_names_systemd_always(monkeypatch):
+    """where the remount is refused in a user namespace, the fix names
+    --systemd=always first"""
+    monkeypatch.setattr(vc.os, "geteuid", lambda: 0)
+
+    real_pipe = os.pipe
+
+    def failed_pipe():                       # the child's report: the cgroup step, EPERM
+        r, w = real_pipe()
+        os.write(w, b"cgroup 1")
+        return r, w
+    monkeypatch.setattr(vc.os, "pipe", failed_pipe)
+    monkeypatch.setattr(vc.os, "fork", lambda: 1 << 22)
+    monkeypatch.setattr(vc.os, "waitpid", lambda pid, f: (pid, 0))
+    lv, _, fix = vc.probe_mounts("/sys/fs/cgroup", noexec=False, rootless=True)[0]
     assert lv == "fail" and fix.startswith("--systemd=always")
-    assert find(vc.settings(status(), "x", CG_RO, "0::/\n", ROOTLESS, cgroups=False), "does not remount it")[0][0] == "warn"
-    assert not find(run(uid_map=ROOTLESS, mounts=CG_RW), "does not remount it")
+    lv, _, fix = vc.probe_mounts("/sys/fs/cgroup", noexec=False, rootless=False)[0]
+    assert lv == "fail" and not fix.startswith("--systemd=always")
 
 
 def test_in_container():
@@ -128,7 +148,7 @@ def test_for_run_counts_what_the_run_needs(monkeypatch):
     policy with sub-agents or MCP servers; the mount test when the run mounts"""
     probed = []
     monkeypatch.setattr(vc, "in_container", lambda: "docker")
-    monkeypatch.setattr(vc, "probe_mounts", lambda cg=None, noexec=True: probed.append(cg) or [("ok", "mounts", None)])
+    monkeypatch.setattr(vc, "probe_mounts", lambda cg=None, noexec=True, rootless=False: probed.append(cg) or [("ok", "mounts", None)])
     shared = (status(), "varek-container (enforce)", CG_RO, "0::/system.slice/x\n", ROOTFUL)
     monkeypatch.setattr(vc, "_state", lambda: shared)
     monkeypatch.setattr(vc, "_userns", lambda: False)
@@ -157,7 +177,8 @@ def test_the_probe_mounts_only_what_the_run_does(monkeypatch):
 
 def test_userns_on_a_kernel_without_them(monkeypatch):
     """v1.32 second review: no /proc/self/ns/user is no user namespace, as
-    the Warden takes it (sub_in_userns)"""
+    the Warden takes it (sub_in_userns, which names --systemd=always where
+    the remount is refused in one)"""
     def gone(p):
         raise FileNotFoundError(2, "no", p)
     monkeypatch.setattr(vc.os, "stat", gone)

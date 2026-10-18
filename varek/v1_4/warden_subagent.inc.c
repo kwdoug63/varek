@@ -326,12 +326,13 @@ static int sub_cg_remount(const char *mnt) {
 static int sub_container_cgroup(const char *mnt, const char *self, bool check_only) {
     struct statvfs sv;
     if (statvfs(mnt, &sv) < 0 || !(sv.f_flag & ST_RDONLY)) return 0;
-    /* D10: in a user namespace it is not remounted. Measured with a plain
-     * remount, which the kernel refuses there; a bind remount, the one made
-     * now, was measured to work under rootless Podman after the second
-     * review (2026-10-18, a group made and used), but v1.32.0 keeps the
-     * refusal it was soaked with: lifting it is for a later release. Rootless Podman's systemd mode mounts the
-     * container's own groups read-write instead */
+    /* D10: through v1.32.0 a user namespace was refused here. The plain
+     * remount D10 measured is refused there; the bind remount made since
+     * the v1.32 review was measured to work under rootless Podman
+     * (2026-10-18, a group made and used), so from v1.32.1 it is tried in
+     * a user namespace too. Where it is refused (a mount locked read-only
+     * by a more privileged namespace), the refusal names --systemd=always,
+     * whose mount of the container's own groups is read-write already */
     /* a cgroup namespace of its own first: the setting any container needs
      * (v1.32, as varek doctor orders them) */
     if (strcmp(self, "/")) {
@@ -340,15 +341,13 @@ static int sub_container_cgroup(const char *mnt, const char *self, bool check_on
                 "(packaging/container/README.md); refusing to start\n", mnt, self);
         return -1;
     }
-    if (sub_in_userns()) {
-        fprintf(stderr, "[warden] the policy names a sub-agent: the cgroup filesystem at %s is read-only and this "
-                "is a user namespace (rootless), where the Warden does not remount it; run the container with "
-                "--systemd=always (packaging/container/README.md); refusing to start\n", mnt);
-        return -1;
-    }
-    const char *refused = "[warden] the policy names a sub-agent: cannot remount the container's cgroup "
-                          "filesystem %s read-write (%s); under AppArmor or SELinux, run with VAREK's profile "
-                          "(packaging/container/README.md); refusing to start\n";
+    const char *refused = sub_in_userns()
+        ? "[warden] the policy names a sub-agent: cannot remount the container's cgroup filesystem %s "
+          "read-write (%s) in this user namespace (rootless); run the container with --systemd=always, or "
+          "under SELinux with VAREK's module (packaging/container/README.md); refusing to start\n"
+        : "[warden] the policy names a sub-agent: cannot remount the container's cgroup "
+          "filesystem %s read-write (%s); under AppArmor or SELinux, run with VAREK's profile "
+          "(packaging/container/README.md); refusing to start\n";
     if (check_only) {
         /* tried, in a child's mount namespace, so the check says what a run
          * would find (v1.32 review) */

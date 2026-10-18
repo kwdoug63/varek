@@ -159,11 +159,6 @@ def settings(status, label, mounts, cgroup, uid_map="", cgroups=True, noexec=Tru
     elif ro and self_cg != "/":
         out.append(("fail" if cgroups else "warn", f"the cgroup filesystem {cg} is read-only and this container shares the host's cgroup "
                     "namespace: sub-agents and confined MCP servers cannot have control groups", "--cgroupns=private"))
-    elif ro and rootless:
-        # in a user namespace the Warden does not remount it (D10; sub_container_cgroup)
-        out.append(("fail" if cgroups else "warn", f"the cgroup filesystem {cg} is read-only and the container "
-                    "is rootless, where the Warden does not remount it: sub-agents and confined MCP servers cannot "
-                    "have control groups", "--systemd=always (Podman then mounts the container's own groups read-write)"))
     elif ro:
         out.append(("ok", f"cgroup v2 at {cg}, read-only, the container's own namespace: a run remounts it "
                     "read-write for itself", None))
@@ -188,7 +183,7 @@ def _keep(path):
     return sum(ms for st, ms in ST_FLAGS if f & st)
 
 
-def probe_mounts(cgroup_mount=None, noexec=True):
+def probe_mounts(cgroup_mount=None, noexec=True, rootless=False):
     """The Warden's mounts, made in a child (so this process keeps its own
     namespace) as root: [(level, text, fix)]; [] when not root. A directory
     mounted noexec when the run mounts them (noexec); the cgroup filesystem
@@ -265,7 +260,8 @@ def probe_mounts(cgroup_mount=None, noexec=True):
         "bind": ("cannot bind a directory onto itself", APPARMOR_FIX),
         "noexec": ("cannot remount a directory noexec", APPARMOR_FIX),
         "cgroup": ("cannot remount the cgroup filesystem read-write (sub-agents and confined MCP servers)",
-                   SELINUX_FIX + " (under AppArmor: " + APPARMOR_FIX + ")"),
+                   ("--systemd=always (Podman then mounts the container's own groups read-write), or " if rootless
+                    else "") + SELINUX_FIX + " (under AppArmor: " + APPARMOR_FIX + ")"),
     }
     text, fix = fixes.get(what, ("the mount test failed", None))
     return [("fail", f"a test of the Warden's mounts: {text} ({err})", fix)]
@@ -313,7 +309,8 @@ def check(cgroups=True, noexec=True):
     if noexec or cgroups:
         cg, ro = _cgroup2(mounts)
         self_cg = next((ln[3:] for ln in cgroup.splitlines() if ln.startswith("0::")), None)
-        out += probe_mounts(cg if cgroups and cg and ro and self_cg == "/" and not rootless else None, noexec)
+        # v1.32.1: rootless too (the Warden bind-remounts it in a user namespace)
+        out += probe_mounts(cg if cgroups and cg and ro and self_cg == "/" else None, noexec, rootless)
     return out
 
 
