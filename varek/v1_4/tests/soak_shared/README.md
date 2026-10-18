@@ -147,7 +147,14 @@ then the 24 hours (the image is built already):
 varek/v1_4/tests/soak_shared/container.sh --runtime docker --apparmor --out /var/tmp/varek-soak-24h
 ```
 
-The memory note below holds for the host.
+The memory note above holds for the host. If the steps after the runs were
+cut short, `container.sh --check-only` does them again; the soak's tokens
+and agents' files are in its stopped container only, which `container.sh`
+therefore never removes (remove it once the soak is judged):
+
+```
+varek/v1_4/tests/soak_shared/container.sh --runtime docker --apparmor --out /var/tmp/varek-soak-24h --check-only
+```
 
 While it runs, run nothing else under the Warden on the droplet: the test
 suites included (`test_v1280.sh` runs `varek revoke --all`, which revokes

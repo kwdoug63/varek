@@ -13,10 +13,16 @@ name: Container release
 #
 # Every action is pinned by its commit, and cosign and syft by version: the
 # job holds the token that publishes and the identity that signs.
+#
+# The version is pushed before it is signed (cosign signs a digest in the
+# registry). If signing, the attestation or the verification fails, the
+# version's tag is there unsigned, which `cosign verify` refuses, and
+# :<major.minor> and :latest have not moved; re-running the job builds,
+# signs and verifies a new digest, and the tag moves to it.
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
 
 permissions: {}
 

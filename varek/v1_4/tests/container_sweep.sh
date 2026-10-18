@@ -181,15 +181,17 @@ ALLFAILED=0                                  # suites failed with every capabili
 NOTSHOWN=()                                  # capabilities no suite failed without
 : > "$OUT/summary.txt"
 cat "$OUT/host.txt" >> "$OUT/summary.txt"
+SETFAILED=0
 # shellcheck disable=SC2086
-SETFAILED=0; run_set all $CAPS
+run_set all $CAPS
 if [ "$DROP" = 1 ]; then
     # shellcheck disable=SC2206
     SUITES=($DROP_SUITES)
     for c in $CAPS; do
         rest=$(echo " $CAPS " | sed "s/ $c / /")
+        SETFAILED=0
         # shellcheck disable=SC2086
-        SETFAILED=0; run_set "without-$c" $rest
+        run_set "without-$c" $rest
         if [ "$SETFAILED" = 0 ]; then
             echo "no suite failed without $c: not shown needed" | tee -a "$OUT/summary.txt"
             NOTSHOWN+=("$c")

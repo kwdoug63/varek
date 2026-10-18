@@ -174,7 +174,7 @@ under the settings above):
 
 ```
 FROM ghcr.io/kwdoug63/varek:1.32.0
-RUN microdnf -y install python3-pip && pip3 install --no-cache-dir requests
+RUN microdnf -y install python3-pip && pip3 install --no-cache-dir requests && microdnf clean all
 COPY agent.py /work/agent.py
 CMD ["python3", "/work/agent.py"]
 ```

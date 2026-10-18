@@ -4,8 +4,10 @@
 > Warden's changes, the image and its AppArmor and SELinux confinement, the
 > CI and release workflows, the container checks in `varek doctor` and
 > `varek run`, the tests and the container sweep, and the documentation
-> against the code); its findings are fixed (below). A human or
-> third-party review has not been done.
+> against the code); its findings are fixed (below). Three more reviewed
+> the changes made after it (the memory-layout settling; the review's
+> fixes to the Warden and the tools; the soak harness, the example and the
+> workflows). A human or third-party review has not been done.
 
 **Draft.** Pending: the 24-hour soak inside a container, and the date.
 
@@ -249,6 +251,51 @@ neither `/.dockerenv` nor `/run/.containerenv` (Kubernetes' containerd):
 `varek doctor` and `varek run` treat it as a host, and the Warden refuses
 by itself what it cannot do.
 
+## Found in the second review
+
+Three AI review agents reviewed the changes made after the first review
+(2026-10-18); none found a way past the Warden. Each finding was checked
+against the code, most by running it, before it was fixed.
+
+- **The memory layout's reason was misstated.** The code and the notes
+  said a process cannot rewrite its layout because `prctl(PR_SET_MM)`
+  needs CAP_SYS_RESOURCE; `PR_SET_MM_MAP` asks no capability for it. The
+  reason is that the agent's filter refuses `prctl(PR_SET_MM)`, every
+  form, under every policy (checked by simulating the Warden's filters:
+  `PR_SET_MM_MAP`, `PR_SET_MM_START_CODE` and
+  `personality(ADDR_NO_RANDOMIZE)` are refused; only a dry run, which
+  refuses sub-agents, would pass them to the Warden). The build now fails
+  if `PR_SET_MM` is admitted, or if a `prctl` rule is added unreviewed.
+- **A kernel without user namespaces was taken for rootless.** There
+  `/proc/self/ns/user` does not exist, and the Warden refused a
+  read-only cgroup filesystem naming `--systemd=always`, while the tools
+  passed it. Both now take it as no user namespace.
+- **`--check-startup` blamed the profile for every failure** of its
+  remount test; it now names the step (no mount namespace: `--cap-add
+  SYS_ADMIN`) and its error. `test-v1281` checks it without
+  CAP_SYS_ADMIN.
+- **The rootless refusal's reason** dated from the plain remount, which
+  the kernel refuses in a user namespace. The bind remount made now is
+  not measured under rootless Podman, so the refusal stays, worded as it
+  is (known limits).
+- **`varek doctor`'s mount test** made a test directory for a run that
+  mounts none noexec (a read-only `/tmp` refused it), and did not check
+  the cgroup filesystem read-write after its remount, as the Warden does;
+  no cgroup v2 only warned a run that needs control groups. Fixed; the
+  preflight's empty option list on bash before 4.4.
+- **The container soak's wrapper** removed a stopped container of its
+  name, which holds the only copy of that soak's tokens, so a cut-short
+  soak could not be judged again. It never removes one now, and
+  `container.sh --check-only` redoes the steps after the runs in a copy
+  of it. A relative `--out` became a volume name, not the directory; a
+  soak that stopped at once was reported running; `--out` given to
+  `soak.sh` wrote inside the container. Fixed.
+- **Smaller**: the release workflow starts on release tags only (`vX.Y.Z`),
+  and says why the version is pushed before it is signed (cosign signs a
+  digest in the registry; an unsigned one fails `cosign verify`, and
+  `:1.32` and `:latest` have not moved); the sweep's shellcheck
+  directives; the README's Dockerfile is the example's.
+
 ## Known limits
 
 - **The Warden needs CAP_SYS_ADMIN in the agent's container** (D3): it
@@ -269,7 +316,13 @@ by itself what it cannot do.
   noexec and refuses to start, naming it. A tmpfs the runtime mounts
   (`--tmpfs`) is mounted noexec.
 - **Rootless Podman needs `--systemd=always`** for sub-agents and confined
-  MCP servers.
+  MCP servers: in a user namespace the Warden does not remount a
+  read-only cgroup filesystem. A bind remount may work there; it is not
+  yet measured under rootless Podman.
+- **`varek run`'s container check counts a run that decides launches as
+  one that mounts**, though with no writable directory the Warden mounts
+  nothing: under `docker-default` such a run is refused before the
+  Warden would start it. VAREK's profile carries it.
 - **The AppArmor profile bounds what is mounted, not where.** The Warden,
   or a root shell started in the container with the same capabilities,
   may bind any path and make a bind mount read-write. The agent holds no
