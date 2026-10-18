@@ -153,16 +153,17 @@ def settings(status, label, mounts, cgroup, uid_map="", cgroups=True, noexec=Tru
     cg, ro = _cgroup2(mounts)
     self_cg = next((ln[3:] for ln in cgroup.splitlines() if ln.startswith("0::")), None)
     if cg is None:
-        out.append(("warn", "no cgroup v2 here: a policy that names a sub-agent or an MCP server will not start",
+        out.append(("fail" if cgroups else "warn", "no cgroup v2 here: a policy that names a sub-agent or an "
+                    "MCP server will not start",
                     "a host with cgroup v2 (the unified hierarchy)"))
     elif ro and self_cg != "/":
         out.append(("fail" if cgroups else "warn", f"the cgroup filesystem {cg} is read-only and this container shares the host's cgroup "
                     "namespace: sub-agents and confined MCP servers cannot have control groups", "--cgroupns=private"))
     elif ro and rootless:
-        # a user namespace locks the mount read-only (D10, measured)
+        # in a user namespace the Warden does not remount it (D10; sub_container_cgroup)
         out.append(("fail" if cgroups else "warn", f"the cgroup filesystem {cg} is read-only and the container "
-                    "is rootless, where it cannot be remounted: sub-agents and confined MCP servers cannot have "
-                    "control groups", "--systemd=always (Podman then mounts the container's own groups read-write)"))
+                    "is rootless, where the Warden does not remount it: sub-agents and confined MCP servers cannot "
+                    "have control groups", "--systemd=always (Podman then mounts the container's own groups read-write)"))
     elif ro:
         out.append(("ok", f"cgroup v2 at {cg}, read-only, the container's own namespace: a run remounts it "
                     "read-write for itself", None))
@@ -187,24 +188,29 @@ def _keep(path):
     return sum(ms for st, ms in ST_FLAGS if f & st)
 
 
-def probe_mounts(cgroup_mount=None):
+def probe_mounts(cgroup_mount=None, noexec=True):
     """The Warden's mounts, made in a child (so this process keeps its own
-    namespace) as root: [(level, text, fix)]; [] when not root. The cgroup
-    filesystem is bind-remounted, as the Warden does (sub_cg_remount)."""
-    if os.geteuid() != 0:
+    namespace) as root: [(level, text, fix)]; [] when not root. A directory
+    mounted noexec when the run mounts them (noexec); the cgroup filesystem
+    bind-remounted and then found read-write, as the Warden does
+    (sub_cg_remount)."""
+    if os.geteuid() != 0 or not (noexec or cgroup_mount):
         return []
-    try:
-        d = tempfile.mkdtemp(prefix="varek-doctor.")
-    except OSError as e:
-        return [("fail", f"a test of the Warden's mounts: cannot make a directory in {tempfile.gettempdir()} "
-                 f"({errno.errorcode.get(e.errno, e.errno)})", "a writable /tmp (--tmpfs /tmp)")]
+    d = None
+    if noexec:
+        try:
+            d = tempfile.mkdtemp(prefix="varek-doctor.")
+        except OSError as e:
+            return [("fail", f"a test of the Warden's mounts: cannot make a directory in {tempfile.gettempdir()} "
+                     f"({errno.errorcode.get(e.errno, e.errno)})", "a writable /tmp (--tmpfs /tmp)")]
     try:
         r, w = os.pipe()
         sys.stdout.flush()
         sys.stderr.flush()
         pid = os.fork()
     except OSError as e:
-        os.rmdir(d)
+        if d:
+            os.rmdir(d)
         return [("fail", f"a test of the Warden's mounts: cannot start it ({errno.errorcode.get(e.errno, e.errno)})",
                  None)]
     if pid == 0:
@@ -221,13 +227,17 @@ def probe_mounts(cgroup_mount=None):
                     os._exit(1)
             step("unshare", libc.unshare(0x20000))                         # CLONE_NEWNS
             step("private", libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None))
-            b = d.encode()
-            step("bind", libc.mount(b, b, None, MS_BIND | MS_REC, None))
-            step("noexec", libc.mount(None, b, None, MS_BIND | MS_REMOUNT | MS_NOEXEC | _keep(d), None))
+            if d:
+                b = d.encode()
+                step("bind", libc.mount(b, b, None, MS_BIND | MS_REC, None))
+                step("noexec", libc.mount(None, b, None, MS_BIND | MS_REMOUNT | MS_NOEXEC | _keep(d), None))
             if cgroup_mount:
                 c = cgroup_mount.encode()
                 step("cgroup", libc.mount(None, c, None, MS_BIND | MS_REMOUNT | MS_NOEXEC |
                                           (_keep(cgroup_mount) & ~MS_RDONLY), None))
+                if os.statvfs(cgroup_mount).f_flag & 1:                    # ST_RDONLY: still, as the Warden checks
+                    os.write(w, f"cgroup {errno.EROFS}".encode())
+                    os._exit(1)
             os.write(w, b"ok 0")
             code = 0
         finally:                                                            # never back into the caller
@@ -239,13 +249,15 @@ def probe_mounts(cgroup_mount=None):
         os.close(r)
         os.waitpid(pid, 0)
         try:
-            os.rmdir(d)                                                     # this probe's own directory
+            if d:
+                os.rmdir(d)                                                 # this probe's own directory
         except OSError:
             pass
     what, _, e = msg.partition(" ")
     err = errno.errorcode.get(int(e or 0), e)
     if what == "ok":
-        return [("ok", "a test of the Warden's mounts: a mount namespace of its own, a directory mounted noexec" +
+        return [("ok", "a test of the Warden's mounts: a mount namespace of its own" +
+                 (", a directory mounted noexec" if d else "") +
                  (", the cgroup filesystem remounted read-write" if cgroup_mount else ""), None)]
     fixes = {
         "unshare": ("cannot make a mount namespace", "--cap-add SYS_ADMIN"),
@@ -281,6 +293,8 @@ def _userns():
     (PROC_USER_INIT_INO), as the Warden tells (sub_in_userns)"""
     try:
         return os.stat("/proc/self/ns/user").st_ino != 0xEFFFFFFD
+    except FileNotFoundError:
+        return False                    # a kernel without user namespaces, as the Warden takes it
     except OSError:
         return None
 
@@ -299,7 +313,7 @@ def check(cgroups=True, noexec=True):
     if noexec or cgroups:
         cg, ro = _cgroup2(mounts)
         self_cg = next((ln[3:] for ln in cgroup.splitlines() if ln.startswith("0::")), None)
-        out += probe_mounts(cg if cgroups and cg and ro and self_cg == "/" and not rootless else None)
+        out += probe_mounts(cg if cgroups and cg and ro and self_cg == "/" and not rootless else None, noexec)
     return out
 
 

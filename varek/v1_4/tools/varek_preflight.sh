@@ -190,7 +190,7 @@ if python3 "$HERE/tools/varek_container.py" --in-container 2>/dev/null; then
     cflags=()
     "$CERT" "$POLICY" identity 2>/dev/null | grep -q -E '^(subagent|confined) ' && cflags+=(--cgroups)
     [ "$("$VDP" "$POLICY" launches 2>/dev/null)" = on ] && cflags+=(--noexec)
-    if cout="$(python3 "$HERE/tools/varek_container.py" --preflight "${cflags[@]}" 2>&1)"; then
+    if cout="$(python3 "$HERE/tools/varek_container.py" --preflight ${cflags[@]+"${cflags[@]}"} 2>&1)"; then
         while IFS=$'\t' read -r lv text fix; do
             case "$lv" in
                 ok)   pass "$text" ;;

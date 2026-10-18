@@ -95,7 +95,8 @@ def test_cgroup_cases():
     assert lv == "fail" and fix == "--cgroupns=private"
     assert find(run(), "a run remounts it read-write")[0][0] == "ok"
     assert find(run(mounts=CG_RW, cgroup="0::/x\n"), "cgroup v2 at /sys/fs/cgroup")[0][0] == "ok"
-    assert find(run(mounts=""), "no cgroup v2")[0][0] == "warn"
+    assert find(run(mounts=""), "no cgroup v2")[0][0] == "fail"
+    assert find(vc.settings(status(), "x", "", "0::/\n", "", cgroups=False), "no cgroup v2")[0][0] == "warn"
 
 
 ROOTLESS = "0 1000 1\n1 100000 65536\n"
@@ -107,11 +108,11 @@ def test_rootless_is_said():
 
 
 def test_rootless_read_only_cgroups_need_systemd_always():
-    """D10, measured: a user namespace locks the cgroup mount read-only"""
-    lv, _, fix = find(run(uid_map=ROOTLESS), "cannot be remounted")[0]
+    """D10: in a user namespace the Warden does not remount the cgroup mount"""
+    lv, _, fix = find(run(uid_map=ROOTLESS), "does not remount it")[0]
     assert lv == "fail" and fix.startswith("--systemd=always")
-    assert find(vc.settings(status(), "x", CG_RO, "0::/\n", ROOTLESS, cgroups=False), "cannot be remounted")[0][0] == "warn"
-    assert not find(run(uid_map=ROOTLESS, mounts=CG_RW), "cannot be remounted")
+    assert find(vc.settings(status(), "x", CG_RO, "0::/\n", ROOTLESS, cgroups=False), "does not remount it")[0][0] == "warn"
+    assert not find(run(uid_map=ROOTLESS, mounts=CG_RW), "does not remount it")
 
 
 def test_in_container():
@@ -127,7 +128,7 @@ def test_for_run_counts_what_the_run_needs(monkeypatch):
     policy with sub-agents or MCP servers; the mount test when the run mounts"""
     probed = []
     monkeypatch.setattr(vc, "in_container", lambda: "docker")
-    monkeypatch.setattr(vc, "probe_mounts", lambda cg=None: probed.append(cg) or [("ok", "mounts", None)])
+    monkeypatch.setattr(vc, "probe_mounts", lambda cg=None, noexec=True: probed.append(cg) or [("ok", "mounts", None)])
     shared = (status(), "varek-container (enforce)", CG_RO, "0::/system.slice/x\n", ROOTFUL)
     monkeypatch.setattr(vc, "_state", lambda: shared)
     monkeypatch.setattr(vc, "_userns", lambda: False)
@@ -143,6 +144,24 @@ def test_for_run_counts_what_the_run_needs(monkeypatch):
     assert "AppArmor profile docker-default" in vc.for_run(cgroups=False, mounts=True)[0][0]
     monkeypatch.setattr(vc, "in_container", lambda: None)
     assert vc.for_run(cgroups=True, mounts=True) == []
+
+
+def test_the_probe_mounts_only_what_the_run_does(monkeypatch):
+    """v1.32 second review: a run that mounts nothing noexec makes no test
+    directory (a read-only /tmp is no reason to refuse it)"""
+    monkeypatch.setattr(vc.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(vc.tempfile, "mkdtemp", lambda **k: (_ for _ in ()).throw(OSError(30, "ro")))
+    assert vc.probe_mounts(None, noexec=False) == []
+    assert "cannot make a directory" in vc.probe_mounts(None, noexec=True)[0][1]
+
+
+def test_userns_on_a_kernel_without_them(monkeypatch):
+    """v1.32 second review: no /proc/self/ns/user is no user namespace, as
+    the Warden takes it (sub_in_userns)"""
+    def gone(p):
+        raise FileNotFoundError(2, "no", p)
+    monkeypatch.setattr(vc.os, "stat", gone)
+    assert vc._userns() is False
 
 
 def test_the_probe_never_returns_in_the_child(monkeypatch):

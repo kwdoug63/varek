@@ -302,10 +302,11 @@ refuse:
  * would remount it; or -1 printed. */
 /* v1.32 (D10): in a user namespace (rootless Podman)? The initial user
  * namespace's inode is fixed (PROC_USER_INIT_INO); a child namespace with an
- * identity map is still a child (v1.32 review). Unreadable: taken as one. */
+ * identity map is still a child (v1.32 review). Missing (a kernel without
+ * user namespaces): not one; otherwise unreadable: taken as one. */
 static bool sub_in_userns(void) {
     struct stat st;
-    if (stat("/proc/self/ns/user", &st) < 0) return true;
+    if (stat("/proc/self/ns/user", &st) < 0) return errno != ENOENT;
     return st.st_ino != 0xEFFFFFFDU;
 }
 
@@ -325,9 +326,11 @@ static int sub_cg_remount(const char *mnt) {
 static int sub_container_cgroup(const char *mnt, const char *self, bool check_only) {
     struct statvfs sv;
     if (statvfs(mnt, &sv) < 0 || !(sv.f_flag & ST_RDONLY)) return 0;
-    /* D10, measured: in a user namespace the kernel refuses the remount;
-     * rootless Podman's systemd mode mounts the container's own groups
-     * read-write instead */
+    /* D10: in a user namespace it is not remounted. Measured with a plain
+     * remount, which the kernel refuses there; a bind remount, the one made
+     * now, is not yet measured under rootless Podman (v1.32 second review),
+     * so it is still refused. Rootless Podman's systemd mode mounts the
+     * container's own groups read-write instead */
     /* a cgroup namespace of its own first: the setting any container needs
      * (v1.32, as varek doctor orders them) */
     if (strcmp(self, "/")) {
@@ -338,7 +341,7 @@ static int sub_container_cgroup(const char *mnt, const char *self, bool check_on
     }
     if (sub_in_userns()) {
         fprintf(stderr, "[warden] the policy names a sub-agent: the cgroup filesystem at %s is read-only and this "
-                "is a user namespace (rootless), where it cannot be remounted; run the container with "
+                "is a user namespace (rootless), where the Warden does not remount it; run the container with "
                 "--systemd=always (packaging/container/README.md); refusing to start\n", mnt);
         return -1;
     }
@@ -348,17 +351,36 @@ static int sub_container_cgroup(const char *mnt, const char *self, bool check_on
     if (check_only) {
         /* tried, in a child's mount namespace, so the check says what a run
          * would find (v1.32 review) */
+        /* the step that failed and its errno come back through a pipe
+         * (v1.32 second review) */
+        int pp[2];
+        if (pipe2(pp, O_CLOEXEC) < 0) { fprintf(stderr, refused, mnt, strerror(errno)); return -1; }
         pid_t c = fork();
-        if (c < 0) { fprintf(stderr, refused, mnt, strerror(errno)); return -1; }
+        if (c < 0) { fprintf(stderr, refused, mnt, strerror(errno)); close(pp[0]); close(pp[1]); return -1; }
         if (c == 0) {
-            if (unshare(CLONE_NEWNS) < 0 || mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0 ||
-                sub_cg_remount(mnt) < 0) _exit(errno > 0 && errno < 126 ? errno : 1);
-            _exit(0);
+            int r[2] = { 0, 0 };
+            close(pp[0]);
+            if (unshare(CLONE_NEWNS) < 0) r[0] = 1;
+            else if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) r[0] = 2;
+            else if (sub_cg_remount(mnt) < 0) r[0] = 3;
+            r[1] = r[0] ? errno : 0;
+            if (write(pp[1], r, sizeof r) != (ssize_t)sizeof r) _exit(1);
+            _exit(r[0] ? 1 : 0);
         }
-        int st = 0;
+        close(pp[1]);
+        int r[2] = { 0, 0 }, st = 0;
+        ssize_t got;
+        while ((got = read(pp[0], r, sizeof r)) < 0 && errno == EINTR) ;
+        close(pp[0]);
         while (waitpid(c, &st, 0) < 0 && errno == EINTR) ;
-        if (!WIFEXITED(st) || WEXITSTATUS(st)) {
-            fprintf(stderr, refused, mnt, WIFEXITED(st) ? strerror(WEXITSTATUS(st)) : "the test was killed");
+        if (got != (ssize_t)sizeof r || !WIFEXITED(st) || WEXITSTATUS(st) || r[0]) {
+            const char *why = got != (ssize_t)sizeof r || !WIFEXITED(st) ? "the test did not finish" : strerror(r[1]);
+            if (r[0] == 1)
+                fprintf(stderr, "[warden] the policy names a sub-agent: cannot make a mount namespace for the "
+                        "cgroup filesystem (%s); in a container, add --cap-add SYS_ADMIN "
+                        "(packaging/container/README.md); refusing to start\n", why);
+            else
+                fprintf(stderr, refused, mnt, why);
             return -1;
         }
         fprintf(stderr, "[warden] sub-agents: the cgroup filesystem at %s is read-only (a container's, its own "
