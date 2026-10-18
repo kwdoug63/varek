@@ -33,11 +33,18 @@
  *     whose launcher launched is launched, else its launch failed (the
  *     launching process is back from it, running what it ran). Where the
  *     connector cannot be used (checked at the start with a launch of its
- *     own), the image a process runs is compared with the one the launch
- *     was decided for, and a launch of the image the launcher already runs
- *     (which could not be told from a failed one) is refused
- *     (subagent_same_image). Each sub-agent's settling is recorded
- *     (subagent_settled);
+ *     own: in a container, whose network namespace the kernel sends none),
+ *     the image a process runs is compared with the one the launch was
+ *     decided for. A launch of the image the launcher already runs is told
+ *     from a failed one by the process's memory layout (v1.32): where its
+ *     code, stack, heap, arguments and environment begin and end
+ *     (/proc/<pid>/stat), which every new program gets anew, randomized,
+ *     and which the process cannot change but by a launch (PR_SET_MM needs
+ *     CAP_SYS_RESOURCE, which the agent never holds); the same layout is a
+ *     failed launch. Where the layout cannot be read, or is not
+ *     randomized, such a launch is refused (subagent_same_image). Each
+ *     sub-agent's settling is recorded (subagent_settled, "how": the
+ *     process events, the image, or the layout);
  *   - a failed sub-agent's group is frozen (cgroup.freeze), every process in
  *     it moved back to the launcher's group, and the group removed; a
  *     process that cannot be moved is still attributed to the launcher.
@@ -62,6 +69,7 @@
 static void noexec_unescape(char *s);        /* warden_noexec.inc.c */
 static unsigned long noexec_keep_flags(const char *mp);
 static bool g_own_mntns;                     /* v1.32: the Warden has a mount namespace of its own */
+static bool sub_aslr(void);                  /* v1.32, below */
 
 /* Linux 6.13: a pidfd tells its process's cgroup id (the group directory's
  * inode number), without /proc's text */
@@ -82,6 +90,7 @@ struct sub_pidfd_info {
 #define SUB_REL_MAX   512            /* a group's path under the run's: 8 x "/NAME-n" */
 
 enum { SUB_AGENT = 0, SUB_PENDING, SUB_LAUNCHED, SUB_FAILED };
+#define SUB_LAYOUT_N 10              /* /proc/<pid>/stat's layout fields, below */
 
 struct subject {
     char     name[33];               /* "" : the agent */
@@ -97,6 +106,10 @@ struct subject {
     uint64_t cgid;                   /* its group's id (the directory's inode number); 0 once removed */
     pid_t    tgid;                   /* the launching process */
     bool     exec_seen;              /* the kernel reported its launch (proc connector) */
+    /* v1.32: a launch of the image its launcher runs, without the connector:
+     * the launcher's memory layout when it launched */
+    bool     by_layout;
+    unsigned long long layout[SUB_LAYOUT_N];
     /* v1.31: the policy subject its calls are decided as (smt_decide.h): the
      * confined subject its launch rule declares, else its launcher's (0: the
      * agent's rules); and whether an `mcp server` line launched it */
@@ -432,8 +445,10 @@ static int sub_setup(const struct policy *p, bool check_only, bool agent_root) {
                   !getenv("VAREK_WARDEN_TEST_NO_PIDFD_INFO");
     fprintf(stderr, "[warden] sub-agents: the run's control group %s (each call's group read %s; launches "
             "known %s)\n", g_cg_dir, g_sub_pidfd ? "through a pidfd" : "from /proc",
-            cn ? "from the kernel's process events" : "by the image a process runs (no process events here: a "
-            "sub-agent of the image its launcher runs is refused)");
+            cn ? "from the kernel's process events" : sub_aslr() ? "by the image a process runs and, for a "
+            "sub-agent of the image its launcher runs, its memory layout (no process events here)" :
+            "by the image a process runs (no process events here, and layouts are not randomized: a sub-agent "
+            "of the image its launcher runs is refused)");
     return 0;
 }
 
@@ -472,6 +487,39 @@ static int sub_effective(int s) {
     return s;
 }
 
+/* v1.32: a process's memory layout, from /proc/<pid>/stat: startcode,
+ * endcode, startstack (fields 26-28), start_data, end_data, start_brk,
+ * arg_start, arg_end, env_start, env_end (45-51). Each is set by a launch
+ * (randomized, with ASLR) and changed otherwise only by prctl(PR_SET_MM),
+ * which needs CAP_SYS_RESOURCE. 0, or -1 (unreadable, or shown as zeros:
+ * the reader may not trace it). */
+static int sub_layout(pid_t pid, unsigned long long out[SUB_LAYOUT_N]) {
+    static const int field[SUB_LAYOUT_N] = { 26, 27, 28, 45, 46, 47, 48, 49, 50, 51 };
+    char p[64], buf[2048];
+    snprintf(p, sizeof p, "/proc/%d/stat", (int)pid);
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+    char *c = strrchr(buf, ')');                 /* the name may hold spaces and parentheses */
+    if (!c) return -1;
+    int f = 2, k = 0;                            /* field 2 is the name; c is its end */
+    unsigned long long any = 0;
+    for (char *t = c + 1; *t && k < SUB_LAYOUT_N; ) {
+        while (*t == ' ') t++;
+        if (!*t) break;
+        f++;
+        char *e;
+        unsigned long long v = strtoull(t, &e, 10);
+        if (f == field[k]) { out[k++] = v; any |= v; }
+        t = e;
+        while (*t && *t != ' ') t++;
+    }
+    return k == SUB_LAYOUT_N && any ? 0 : -1;
+}
+
 /* subagent_settled: how a sub-agent's launch came out (once) */
 static void sub_settled_record(int s, const char *result) {
     struct timespec ts;
@@ -479,7 +527,8 @@ static void sub_settled_record(int s, const char *result) {
     FILE *f = rec_begin();
     fprintf(f, "{\"event\":\"subagent_settled\",\"run\":\"%s\",\"subagent\":\"%s#%u\",\"result\":\"%s\","
             "\"how\":\"%s\",\"timestamp_ns\":%lld}\n", g_run_id, g_sub[s].name, g_sub[s].n, result,
-            g_cn >= 0 && !g_cn_lost ? "process_events" : "image", (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+            g_cn >= 0 && !g_cn_lost ? "process_events" : g_sub[s].by_layout ? "layout" : "image",
+            (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
     rec_end(NULL);
 }
 
@@ -543,7 +592,14 @@ static int sub_settle(int s, pid_t tid) {
     char p[64];
     struct stat st;
     snprintf(p, sizeof p, "/proc/%d/exe", (int)tid);
-    if (stat(p, &st) == 0 && st.st_dev == g_sub[s].edev && st.st_ino == g_sub[s].eino) {
+    bool launched = stat(p, &st) == 0 && st.st_dev == g_sub[s].edev && st.st_ino == g_sub[s].eino;
+    if (launched && g_sub[s].by_layout) {
+        /* v1.32: the launcher's own image: launched only if its layout is
+         * new (a process it forked after has the same layout as it) */
+        unsigned long long now[SUB_LAYOUT_N];
+        launched = sub_layout(tid, now) == 0 && memcmp(now, g_sub[s].layout, sizeof now) != 0;
+    }
+    if (launched) {
         g_sub[s].state = SUB_LAUNCHED;
         sub_settled_record(s, "launched");
     } else sub_fail(s);
@@ -596,6 +652,17 @@ found:
     return sub_effective(s);
 }
 
+/* v1.32: the kernel randomizes a new program's layout (kernel.randomize_va_space
+ * 2: the stack, the program, the heap). Without it a new program of the same
+ * image could keep the launcher's layout. */
+static bool sub_aslr(void) {
+    if (getenv("VAREK_WARDEN_TEST_NO_ASLR")) return false;    /* make test-v1281 */
+    int fd = open("/proc/sys/kernel/randomize_va_space", O_RDONLY | O_CLOEXEC);
+    char c = 0;
+    if (fd >= 0) { if (read(fd, &c, 1) != 1) c = 0; close(fd); }
+    return c == '2';
+}
+
 /* A launch the policy allows by a rule with subagent=name, from a process of
  * subject from: the sub-agent made, its group made and the process moved.
  * The subject, or -1 with the rule that refuses it. */
@@ -615,12 +682,19 @@ static int sub_launch(pid_t tid, int from, const char *name, int csubj, bool mcp
     while (sf && fgets(line, sizeof line, sf)) if (sscanf(line, "Threads: %d", &threads) == 1) break;
     if (sf) fclose(sf);
     if (threads != 1) { *rule = "subagent_threaded"; return -1; }
-    /* without process events a launch of the image the launcher runs could
-     * not be told from a failed one (v1.28.1 review) */
+    /* without process events a launch of the image the launcher runs is told
+     * from a failed one by the layout (v1.32); if it cannot be, refused
+     * (v1.28.1 review) */
+    bool by_layout = false;
+    unsigned long long layout[SUB_LAYOUT_N] = { 0 };
     if (g_cn < 0) {
         struct stat xs;
         snprintf(sp, sizeof sp, "/proc/%d/exe", (int)tgid);
-        if (stat(sp, &xs) < 0 || (xs.st_dev == edev && xs.st_ino == eino)) { *rule = "subagent_same_image"; return -1; }
+        if (stat(sp, &xs) < 0) { *rule = "subagent_same_image"; return -1; }
+        if (xs.st_dev == edev && xs.st_ino == eino) {
+            if (!sub_aslr() || sub_layout(tgid, layout) < 0) { *rule = "subagent_same_image"; return -1; }
+            by_layout = true;
+        }
     }
     sub_cn_drain();                      /* events from before this launch are not its */
     size_t c = 0;
@@ -641,6 +715,8 @@ static int sub_launch(pid_t tid, int from, const char *name, int csubj, bool mcp
     s->edev = edev;
     s->eino = eino;
     s->tgid = tgid;
+    s->by_layout = by_layout;
+    memcpy(s->layout, layout, sizeof s->layout);
     s->psubj = csubj > 0 ? csubj : g_sub[from].psubj;      /* v1.31 */
     s->mcp = mcp;
     s->confined = csubj > 0;

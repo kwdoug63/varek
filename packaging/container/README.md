@@ -9,9 +9,10 @@ container, exactly as on a host. The design and its decisions are in
 > suite passes under them with Docker on Ubuntu 24.04 (AppArmor, cgroup
 > v2) and rootful Podman on RHEL 9.8 (SELinux enforcing, cgroup v2), and
 > all but one with rootless Podman there (its rerun pending). In a
-> container the kernel may give no process events (RHEL 9, Ubuntu 24.04):
-> a sub-agent of the image its launcher runs is then refused, as on such a
-> host.
+> container the kernel gives no process events (RHEL 9, Ubuntu 24.04): the
+> Warden then tells a sub-agent's launch by the image it runs and, for one
+> of the image its launcher runs (a Python agent launching a Python MCP
+> server), by its memory layout.
 
 ## Get the image
 

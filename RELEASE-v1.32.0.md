@@ -78,8 +78,21 @@ From v1.32.0:
    `:latest` moved to it. Only a tag on main is released; every action the
    workflow runs is pinned by its commit. No key or password is kept.
 
-It changes no decision, rule, record or policy line: the Warden inside a
-container is the Warden on a host. The Warden reports 1.32.0; the grammar
+8. **A sub-agent of the image its launcher runs, without process events.**
+   In a container the kernel's process events do not reach the Warden
+   (RHEL 9, Ubuntu 24.04), and through v1.31 the Warden then refused a
+   sub-agent of the image its launcher runs (`subagent_same_image`): a
+   Python agent could not launch a Python MCP server confined. The Warden
+   now tells such a launch from a failed one by the process's memory
+   layout (`/proc/<pid>/stat`: where its code, stack, heap, arguments and
+   environment begin and end), which every new program gets anew,
+   randomized, and which the process cannot change but by a launch. The
+   settling is recorded `"how":"layout"`. On a host without process events
+   the same holds.
+
+It changes no policy line: the Warden inside a container is the Warden on
+a host. The one decision that changes is the last above: a launch the
+Warden refused without process events is now made where it can be told. The Warden reports 1.32.0; the grammar
 stays 1.31 (`require warden 1.32` is refused).
 
 ## Tested
@@ -102,8 +115,11 @@ stays 1.31 (`require warden 1.32` is refused).
   the CI and release workflows (the release's pins and gates).
 
 `tests/test_varek_container.py` (14 tests, in `make test-cli`) checks each
-of doctor's rules from a container's state as text, and the mount probe. Every earlier suite
-passes on the test host, except `test-v1210`'s three Python `requests`
+of doctor's rules from a container's state as text, and the mount probe.
+`make test-v1281` gains three checks, on any host with the process events
+turned off for them: a sub-agent of the image its launcher runs, launched
+and told by its layout; a failed one (E2BIG), the agent's; and the refusal
+where layouts are not randomized. Every earlier suite passes on the test host, except `test-v1210`'s three Python `requests`
 checks, which fail the same way on v1.31.1 there (the host reaches no
 network they need): no regression.
 
@@ -133,7 +149,11 @@ Pending.
 
 ## Compatibility
 
-- Every v1.31 policy loads unchanged and decides the same. The grammar is
+- Every v1.31 policy loads unchanged and decides the same, but for one
+  launch: without the kernel's process events (in a container, or a host
+  without them), a sub-agent of the image its launcher runs, refused
+  through v1.31 (`subagent_same_image`), is now made where layouts are
+  randomized, its settling recorded `"how":"layout"`. The grammar is
   1.31's; a policy naming `require warden 1.32` is refused.
 - The Warden, on a host or in a container: a read-only cgroup filesystem
   at its cgroup namespace's root is remounted read-write in the Warden's
@@ -220,9 +240,10 @@ by itself what it cannot do.
 - **Process events**: on RHEL 9's kernel 5.14 and Ubuntu 24.04's 6.8 the
   kernel's process events do not reach a listener in a container's own
   network namespace. The Warden says so and falls back, as on a host
-  without them: a launch is known by the image a process runs, and a
-  sub-agent of the image its launcher runs is refused
-  (`subagent_same_image`).
+  without them: a launch is known by the image a process runs, and one of
+  the image its launcher runs by the process's memory layout (above).
+  Where layouts are not randomized (`kernel.randomize_va_space` not 2),
+  such a launch is refused (`subagent_same_image`).
 - **`O_TMPFILE`**: the container's overlayfs `/tmp` has none on either
   host; an agent that needs it should be given a `--tmpfs` or a volume.
 - **A tmpfs the container mounts itself** is `tmpfs_t` under SELinux,

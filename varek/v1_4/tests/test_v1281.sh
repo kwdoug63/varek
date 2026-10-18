@@ -465,8 +465,21 @@ for l in open(sys.argv[1]):
         POL="$B/ps.txt" sgo same2 exec "$B/agent" open "$B/f"
         [ "$(obos same2)" = "agent+subagent:self#1" ] && pass "... and one that happened: the sub-agent's" || flunk "a same-image launch ($(obos same2))"
     else nope "launches of the image the launcher runs, failed and done"; fi
+    # v1.32: without process events (a container's), told by the memory
+    # layout, which only a launch makes new
     VAREK_WARDEN_TEST_NO_PROC_CONNECTOR=1 POL="$B/ps.txt" sgo samefb exec "$B/agent" open "$B/f"
-    check "... without process events, refused (subagent_same_image)" sh -c "grep -q '\"rule\":\"subagent_same_image\"' '$OUT/samefb.out' && grep -q 'no process events here' '$OUT/samefb.out'"
+    [ "$(obos samefb)" = "agent+subagent:self#1" ] && grep -q 'its memory layout (no process events here)' "$OUT/samefb.out" \
+        && grep -q '"event":"subagent_settled".*"subagent":"self#1","result":"launched","how":"layout"' "$OUT/samefb.out" \
+        && pass "... without process events, one that happened: the sub-agent's, told by the memory layout (v1.32)" \
+        || flunk "a same-image launch without process events ($(obos samefb))"
+    VAREK_WARDEN_TEST_NO_PROC_CONNECTOR=1 POL="$B/ps.txt" sgo samefbx e2big "$B/f" "$B/agent"
+    [ "$(obos samefbx)" = "agent" ] && grep -q 'Argument list too long' "$OUT/samefbx.so" \
+        && grep -q '"event":"subagent_settled".*"subagent":"self#1","result":"failed","how":"layout"' "$OUT/samefbx.out" \
+        && pass "... and a failed one (E2BIG): the agent's, the layout unchanged" \
+        || flunk "a failed same-image launch without process events ($(obos samefbx))"
+    VAREK_WARDEN_TEST_NO_PROC_CONNECTOR=1 VAREK_WARDEN_TEST_NO_ASLR=1 POL="$B/ps.txt" sgo samefb0 exec "$B/agent" open "$B/f"
+    check "... and where layouts are not randomized, refused (subagent_same_image)" \
+        sh -c "grep -q '\"rule\":\"subagent_same_image\"' '$OUT/samefb0.out' && grep -q 'layouts are not randomized' '$OUT/samefb0.out'"
     [ -n "$PE" ] || nope "each sub-agent's launch settled by process events"
     [ -z "$PE" ] || check "each sub-agent's launch is settled once, before its decisions (subagent_settled)" python3 -c 'import json,sys
 for f in sys.argv[1:]:
