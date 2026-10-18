@@ -87,13 +87,16 @@ int main(int argc, char **argv) {
     fclose(f);
 
     // the OCI profile, from what the builder did
-    unsigned eno;
+    // (each action named into its own errno: one shared between the default's
+    // and the bad-architecture action's lookups, in one call's arguments,
+    // printed the default's as 0, found by runc building the profile)
+    unsigned eno, deno, beno;
     snprintf(p, sizeof p, "%s/oci.json", argv[2]);
     f = fopen(p, "w");
-    const char *dn = act_name(rec_default, &eno);
+    const char *dn = act_name(rec_default, &deno);
+    const char *bn = rec_badarch_set ? act_name(rec_badarch, &beno) : "(libseccomp's default)";
     fprintf(f, "{\"defaultAction\":\"%s\",\"defaultErrnoRet\":%u,\"architectures\":[\"SCMP_ARCH_NATIVE\"],"
-               "\"warden_badarch\":\"%s\",\"syscalls\":[\n", dn, eno,
-            rec_badarch_set ? act_name(rec_badarch, &eno) : "(libseccomp's default)");
+               "\"warden_badarch\":\"%s\",\"syscalls\":[\n", dn, deno, bn);
     for (size_t i = 0; i < nrec; i++) {
         char *name = seccomp_syscall_resolve_num_arch(SCMP_ARCH_NATIVE, rec[i].nr);
         const char *an = act_name(rec[i].action, &eno);
