@@ -44,8 +44,19 @@ esac
 
 say "packages"
 dnf -y install gcc make git tar python3 libseccomp-devel openssl-devel
-# libsodium (the Warden's Ed25519 signatures) is in EPEL, not RHEL
-rpm -q epel-release > /dev/null 2>&1 || dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+# libsodium (the Warden's Ed25519 signatures) is in EPEL, not RHEL. EPEL's
+# key is the one kept with this file (RPM-GPG-KEY-EPEL-9, fingerprint FF8A
+# D134 4597 106E CE81 3B91 8A38 72BF 3228 467C), imported first, so
+# epel-release is installed only signed by it (dnf does not check a package
+# given by its URL), and every EPEL package after it is checked by it
+if ! rpm -q epel-release > /dev/null 2>&1; then
+    rpm --import "$SRC/varek/v1_4/packaging/vm/RPM-GPG-KEY-EPEL-9"
+    rpm -q gpg-pubkey-3228467c > /dev/null || die "EPEL 9's key did not import"
+    curl -fsSL -o /tmp/epel-release.rpm https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+    rpm -K /tmp/epel-release.rpm | grep -q 'digests signatures OK$' || die "epel-release is not signed by EPEL 9's key"
+    dnf -y install /tmp/epel-release.rpm
+    rm -f /tmp/epel-release.rpm
+fi
 dnf -y install libsodium-devel
 
 say "the Warden, from $SRC"
