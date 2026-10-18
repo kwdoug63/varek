@@ -327,16 +327,18 @@ static int sub_container_cgroup(const char *mnt, const char *self, bool check_on
     /* D10, measured: in a user namespace the kernel refuses the remount;
      * rootless Podman's systemd mode mounts the container's own groups
      * read-write instead */
-    if (sub_in_userns()) {
-        fprintf(stderr, "[warden] the policy names a sub-agent: the cgroup filesystem at %s is read-only and this "
-                "is a user namespace (rootless), where it cannot be remounted; run the container with "
-                "--systemd=always (packaging/container/README.md); refusing to start\n", mnt);
-        return -1;
-    }
+    /* a cgroup namespace of its own first: the setting any container needs
+     * (v1.32, as varek doctor orders them) */
     if (strcmp(self, "/")) {
         fprintf(stderr, "[warden] the policy names a sub-agent: the cgroup filesystem at %s is read-only and "
                 "this process's group (%s) is not its root; in a container, run it with --cgroupns=private "
                 "(packaging/container/README.md); refusing to start\n", mnt, self);
+        return -1;
+    }
+    if (sub_in_userns()) {
+        fprintf(stderr, "[warden] the policy names a sub-agent: the cgroup filesystem at %s is read-only and this "
+                "is a user namespace (rootless), where it cannot be remounted; run the container with "
+                "--systemd=always (packaging/container/README.md); refusing to start\n", mnt);
         return -1;
     }
     const char *refused = "[warden] the policy names a sub-agent: cannot remount the container's cgroup "

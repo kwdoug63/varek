@@ -35,7 +35,7 @@ unset SUDO_UID SUDO_GID SUDO_USER SUDO_COMMAND
 if [ -z "${VAREK_V1281_NS:-}" ] && [ "$(id -u)" = 0 ]; then
     cg="$(awk '$3 == "cgroup2" { print $2; exit }' /proc/self/mounts)"
     if [ -n "$cg" ] && awk -v m="$cg" '$2 == m && $3 == "cgroup2" { split($4, o, ","); f = o[1] == "ro" } END { exit !f }' /proc/self/mounts; then
-        exec env VAREK_V1281_NS=1 unshare -m sh -c 'mount --make-rprivate / && mount -o remount,rw "$1" && shift && exec "$@"' \
+        exec env VAREK_V1281_NS=1 unshare -m sh -c 'mount --make-rprivate / && mount -o remount,bind,rw "$1" && shift && exec "$@"' \
             sh "$cg" bash "$0" "$@"
     fi
 fi
