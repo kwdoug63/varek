@@ -165,6 +165,7 @@ else
     say "  the node agent received the descriptor: NO ($(wc -l < "$OUT/listener.log" 2>/dev/null || echo 0) log lines)"
 fi
 
+say "== 2. the launcher's Landlock in the pod: the pod's landlock lines in section 1"
 say "== 3. D6: a group under the container's own, from the node"
 pid="$(docker exec $N sh -c "crictl inspect \$(crictl ps -q --name agent | head -1) 2>/dev/null" | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["pid"])' 2>/dev/null)"
 if [ -n "$pid" ]; then
