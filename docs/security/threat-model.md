@@ -641,7 +641,8 @@ Model-B techniques below, with the residual limits stated honestly.
     filesystem's options are untouched, and the agent writes none of it.
     Without the kernel's process events (a container's), a sub-agent of
     the image its launcher runs is told launched by its memory layout,
-    which the process cannot change but by a launch; the same layout is a
+    which the process cannot change but by a launch (its filter refuses
+    `prctl(PR_SET_MM)`); the same layout is a
     failed launch, and where layouts are not randomized such a launch is
     refused.
   - *Refused, not run with less.* `varek run` in a container refuses a

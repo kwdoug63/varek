@@ -80,6 +80,13 @@ warden: warden.c warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_sy
 	@# (docs/security/v1.27-program-launches.md): memfd_create stays hard-denied
 	@awk '/^static const char \*kHardDeny\[\]/,/NULL/' warden_baseline_filter.c | grep -q '"memfd_create"' || \
 	    { echo "warden: memfd_create must stay in the filter's hard-deny set (v1.27)"; exit 1; }
+	@# v1.32: a sub-agent launch is told by its memory layout, which only a
+	@# launch or prctl(PR_SET_MM) changes, so PR_SET_MM (35) is never admitted,
+	@# and a new prctl rule is a change to look at here
+	@! awk '/^static const unsigned long kPrctlAdmit\[\]/,/^};/' warden_baseline_filter.c | grep -qE 'PR_SET_MM|\<35\>|0x23\>' || \
+	    { echo "warden: prctl(PR_SET_MM) must stay refused (v1.32, the layout settling)"; exit 1; }
+	@[ "$$(grep -c 'SCMP_ACT_ALLOW, SCMP_SYS(prctl)' warden_baseline_filter.c)" = 2 ] || \
+	    { echo "warden: a prctl rule changed: check it admits no PR_SET_MM (v1.32), then this count"; exit 1; }
 	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c warden_secrets.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lcrypto -lresolv
 
 # v1.26.1: the egress proxy, its own program (the Warden starts it from a

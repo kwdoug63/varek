@@ -39,8 +39,9 @@
  *     from a failed one by the process's memory layout (v1.32): where its
  *     code, stack, heap, arguments and environment begin and end
  *     (/proc/<pid>/stat), which every new program gets anew, randomized,
- *     and which the process cannot change but by a launch (PR_SET_MM needs
- *     CAP_SYS_RESOURCE, which the agent never holds); the same layout is a
+ *     and which the process cannot change but by a launch (the agent's
+ *     filter refuses prctl(PR_SET_MM), every form, under every policy; the
+ *     Makefile fails the build if it is admitted); the same layout is a
  *     failed launch. Where the layout cannot be read, or is not
  *     randomized, such a launch is refused (subagent_same_image). Each
  *     sub-agent's settling is recorded (subagent_settled, "how": the
@@ -493,7 +494,8 @@ static int sub_effective(int s) {
  * endcode, startstack (fields 26-28), start_data, end_data, start_brk,
  * arg_start, arg_end, env_start, env_end (45-51). Each is set by a launch
  * (randomized, with ASLR) and changed otherwise only by prctl(PR_SET_MM),
- * which needs CAP_SYS_RESOURCE. 0, or -1 (unreadable, or shown as zeros:
+ * which the agent's filter refuses (a capability would not do:
+ * PR_SET_MM_MAP asks none for the layout). 0, or -1 (unreadable, or shown as zeros:
  * the reader may not trace it). */
 static int sub_layout(pid_t pid, unsigned long long out[SUB_LAYOUT_N]) {
     static const int field[SUB_LAYOUT_N] = { 26, 27, 28, 45, 46, 47, 48, 49, 50, 51 };

@@ -85,7 +85,8 @@ From v1.32.0:
    now tells such a launch from a failed one by the process's memory
    layout (`/proc/<pid>/stat`: where its code, stack, heap, arguments and
    environment begin and end), which every new program gets anew,
-   randomized, and which the process cannot change but by a launch. The
+   randomized, and which the process cannot change but by a launch (the
+   agent's filter refuses `prctl(PR_SET_MM)`, under every policy). The
    settling is recorded `"how":"layout"`. On a host without process events
    the same holds.
 
