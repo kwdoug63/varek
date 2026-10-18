@@ -7,7 +7,7 @@
 > against the code); its findings are fixed (below). Three more reviewed
 > the changes made after it (the memory-layout settling; the review's
 > fixes to the Warden and the tools; the soak harness, the example and the
-> workflows). A human or third-party review has not been done.
+> workflows), and one more the four commits after those. A human or third-party review has not been done.
 
 **Draft.** Pending: the 24-hour soak inside a container, and the date.
 
@@ -99,7 +99,7 @@ stays 1.31 (`require warden 1.32` is refused).
 
 ## Tested
 
-`make test-v1320` runs 24 checks; CI runs it as root:
+`make test-v1320` runs 25 checks; CI runs it as root:
 
 - **The version** (section 1): the Warden reports 1.32.0 and `run_start`
   names it; `require warden 1.32` refused, `require warden 1.31` loads;
@@ -297,6 +297,15 @@ against the code, most by running it, before it was fixed.
   of it. A relative `--out` became a volume name, not the directory; a
   soak that stopped at once was reported running; `--out` given to
   `soak.sh` wrote inside the container. Fixed.
+- **A review of the four commits after** (2026-10-18) found no way past
+  the Warden either. `vdp_check POLICY mounts` said a rule that writes no
+  absolute path (a relative one) mounts, where the Warden lists none; it
+  now applies the Warden's own target test as well (`vdp_rule_noexec_target`,
+  moved to `smt_decide.c`). `container.sh --check-only` now refuses a
+  container that did not write the soak named, and takes the soak's own
+  options from its record; its option list, empty, on bash before 4.4.
+  The preflight's mount-namespace warning only for a policy that mounts;
+  the run's mount-namespace refusal names `--cap-add SYS_ADMIN`.
 - **Smaller**: the release workflow starts on release tags only (`vX.Y.Z`),
   and says why the version is pushed before it is signed (cosign signs a
   digest in the registry; an unsigned one fails `cosign verify`, and

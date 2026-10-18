@@ -20,7 +20,8 @@
 # --out       the soak's directory on the host (default
 #             /var/tmp/varek-soak-container-<time>), mounted at /soak
 # --check-only  the steps after the runs again (soak.sh --check-only), on the
-#             stopped container NAME's soak in DIR, when they were cut short:
+#             stopped container NAME's soak in DIR (the one it wrote), with
+#             the soak's options as recorded, when they were cut short:
 #             its tokens and agents' files are in that container only, so it
 #             is committed to an image and the steps run in a container of it
 #
@@ -51,7 +52,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ "$(id -u)" = 0 ] || { echo "container.sh: run as root" >&2; exit 2; }
-for a in "${SOAK[@]}"; do
+for a in ${SOAK[@]+"${SOAK[@]}"}; do                     # (bash before 4.4: an empty array under set -u)
     case "$a" in --out|--out=*|--check-only)
         echo "container.sh: give $a to container.sh, not to soak.sh (the soak's directory is /soak/run, on the host)" >&2; exit 2 ;;
     esac
@@ -69,6 +70,19 @@ state="$("$RT" inspect --format '{{.State.Running}}' "$NAME" 2>/dev/null)"
 if [ "$CHECK_ONLY" = 1 ]; then
     if [ "$state" != false ] || [ ! -d "$OUT/run" ]; then
         echo "container.sh: --check-only needs the stopped container $NAME and its soak in $OUT/run" >&2; exit 2
+    fi
+    # the container that wrote this soak (its tokens are the ones its runs
+    # used), with the soak's own options, as container.txt records them
+    src="$("$RT" inspect --format '{{range .Mounts}}{{if eq .Destination "/soak"}}{{.Source}}{{end}}{{end}}' "$NAME" 2>/dev/null)"
+    if [ "$(realpath -m "$src")" != "$OUT" ]; then
+        echo "container.sh: $NAME ran the soak in ${src:-(none)}, not $OUT: give the --name and --out of one soak" >&2; exit 2
+    fi
+    rec="$(sed -n 's/^soak: //p' "$OUT/container.txt" 2>/dev/null)"
+    [ "$rec" = "(24 hours)" ] && rec=""
+    if [ ${#SOAK[@]} = 0 ]; then
+        read -r -a SOAK <<< "$rec"
+    elif [ "${SOAK[*]}" != "$rec" ]; then
+        echo "container.sh: the soak ran with '${rec:-(24 hours)}', not '${SOAK[*]}': give its options, or none" >&2; exit 2
     fi
 # a soak of its own: never one on top of another's files, in place of a
 # running one, nor removing a stopped one (its tokens are in it)
@@ -103,7 +117,7 @@ if [ "$CHECK_ONLY" = 1 ]; then
     img="varek-soak-check:$NAME"
     echo "== $NAME committed to $img; the steps after the runs, again"
     "$RT" commit "$NAME" "$img" > /dev/null || { echo "container.sh: cannot commit $NAME" >&2; exit 1; }
-    "$RT" run --rm "${args[@]}" "$img" tests/soak_shared/soak.sh --out /soak/run --check-only "${SOAK[@]}"
+    "$RT" run --rm "${args[@]}" "$img" tests/soak_shared/soak.sh --out /soak/run --check-only ${SOAK[@]+"${SOAK[@]}"}
     rc=$?
     echo "container.sh: done (exit $rc; the result in $OUT/run/report.txt); remove $img and $NAME once judged"
     exit "$rc"
@@ -118,12 +132,13 @@ fi
     echo "soak: ${SOAK[*]:-(24 hours)}"
     echo "started: $(TZ=America/Chicago date '+%Y-%m-%d %H:%M %Z')"
 } | tee "$OUT/container.txt"
-"$RT" run -d --name "$NAME" "${args[@]}" "$IMAGE" tests/soak_shared/soak.sh --out /soak/run "${SOAK[@]}" > /dev/null ||
+"$RT" run -d --name "$NAME" "${args[@]}" "$IMAGE" tests/soak_shared/soak.sh --out /soak/run ${SOAK[@]+"${SOAK[@]}"} > /dev/null ||
     { echo "container.sh: the container did not start" >&2; exit 1; }
 # soak.sh refuses bad options at once: running after a few seconds, or said
+# (a later stop shows in its log and report)
 sleep 5
 if [ "$("$RT" inspect --format '{{.State.Running}}' "$NAME" 2>/dev/null)" != true ]; then
     "$RT" logs "$NAME" 2>&1 | tail -20
-    echo "container.sh: $NAME stopped at once (above); remove it ($RT rm $NAME) and start again" >&2; exit 1
+    echo "container.sh: $NAME stopped at once (above); remove it ($RT rm $NAME) and start again with a new --out" >&2; exit 1
 fi
 echo "container.sh: running as $NAME; follow it with: $RT logs -f $NAME (the result in $OUT/run/report.txt)"

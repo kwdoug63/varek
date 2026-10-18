@@ -542,6 +542,12 @@ int vdp_certificate(const vdp_policy_t *p, int rule_index, const char *s, vdp_ce
  * write or read-write, O_TRUNC, or O_CREAT)? The Warden mounts the
  * directories of such rules noexec when launches are decided. */
 bool vdp_rule_may_write(const vdp_rule_t *r);
+/* v1.32: the directory (or file) writable rule r asks the Warden to mount
+ * noexec, into out; "" when the rule matches no absolute path; -1 when no
+ * directory bounds it (the Warden then refuses to start). *exact: the rule
+ * names one path. vdp_path_parent: s cut to its parent directory. */
+int vdp_rule_noexec_target(const vdp_rule_t *r, char *out, size_t on, bool *exact);
+void vdp_path_parent(char *s);
 
 /* Release what vdp_policy_load allocated (compiled globs). */
 void vdp_policy_free(vdp_policy_t *p);

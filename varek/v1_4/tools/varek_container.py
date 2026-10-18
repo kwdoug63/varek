@@ -91,8 +91,8 @@ def settings(status, label, mounts, cgroup, uid_map="", cgroups=True, noexec=Tru
     /proc/self/uid_map: [(level, text, fix)], level "ok", "warn" or "fail".
     cgroups: control groups are needed (a policy with sub-agents or MCP
     servers, or not known); without, their absence is a warning. noexec: the
-    Warden mounts the writable directories noexec (launches decided, or not
-    known); a profile that denies mounts fails only when the run mounts
+    Warden mounts the writable directories noexec (`vdp_check POLICY mounts`,
+    or not known); a profile that denies mounts fails only when the run mounts
     (noexec or cgroups), and warns otherwise. userns: a user namespace (from
     /proc/self/ns/user), or None to tell from uid_map. The capabilities are
     the effective set as root, which is what the Warden holds, and the
@@ -321,8 +321,8 @@ def for_run(cgroups, mounts):
     """The preflight's share: what this run needs of its container that the
     container lacks, [(text, fix)]; [] outside a container or when it has
     all. cgroups: the policy names a sub-agent or an MCP server; mounts: the
-    Warden mounts the writable directories noexec (launches decided, no
-    --writable-exec). Capabilities always; the profile and the mount test
+    Warden mounts the writable directories noexec (`vdp_check POLICY
+    mounts`, and no --writable-exec). Capabilities always; the profile and the mount test
     when the run mounts or makes control groups."""
     return [(t, f) for lv, t, f in check(cgroups, mounts) if lv == "fail"]
 

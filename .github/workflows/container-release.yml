@@ -1,7 +1,7 @@
 name: Container release
 
 # v1.32 (step 6 of docs/security/v1.32-containers.md, D7 and D8): on a release
-# tag (v*) on main, VAREK's runtime image is built, checked as CI checks it
+# tag (vX.Y.Z) on main, VAREK's runtime image is built, checked as CI checks it
 # (container.yml), and published to the GitHub Container Registry as
 # ghcr.io/kwdoug63/varek:<version>. It is signed with cosign, keyless (the
 # workflow's own GitHub identity, recorded in Sigstore's transparency log),

@@ -3300,3 +3300,59 @@ bool vdp_rule_may_write(const vdp_rule_t *r) {
     }
     return false;
 }
+
+void vdp_path_parent(char *s) {
+    char *sl = strrchr(s, '/');
+    if (sl == s) s[1] = '\0';
+    else if (sl) *sl = '\0';
+}
+
+/* (v1.32: moved here from the Warden's warden_noexec.inc.c.) The directory
+ * (or file) one writable rule asks to mount, into out, or
+ * an empty string to skip the rule (a constant that matches no absolute
+ * path). -1: a rule that cannot be bounded (suffix, contains, a glob that
+ * starts with a wildcard). *exact: the rule names one path (an exact rule,
+ * or a glob with no wildcard), so a file may be the target, or, if it is not
+ * there yet, its directory (D3). */
+int vdp_rule_noexec_target(const vdp_rule_t *r, char *out, size_t on, bool *exact) {
+    const char *c = r->s.c;
+    out[0] = '\0';
+    *exact = false;
+    switch (r->s.op) {
+    case VDP_STR_SUFFIX:
+    case VDP_STR_CONTAINS:
+        return -1;
+    case VDP_STR_EQ:
+        if (c[0] != '/') return 0;
+        snprintf(out, on, "%s", c);
+        *exact = true;
+        return 0;
+    case VDP_STR_PREFIX: {
+        if (c[0] != '/') return 0;
+        snprintf(out, on, "%s", c);
+        size_t n = strlen(out);
+        if (n > 1 && out[n - 1] == '/') out[n - 1] = '\0';   /* a directory: itself */
+        else vdp_path_parent(out);                             /* /work/out admits /work/out2 */
+        return 0;
+    }
+    case VDP_STR_GLOB: {
+        size_t k = 0;
+        for (; c[k] && c[k] != '*' && c[k] != '?' && c[k] != '[' && c[k] != '\\' && k < on - 1; k++)
+            out[k] = c[k];
+        out[k] = '\0';
+        if (k == 0) return -1;                              /* a glob from a wildcard: anywhere */
+        if (out[0] != '/') { out[0] = '\0'; return 0; }      /* relative: matches no absolute path */
+        if (c[k]) {                                          /* to the directory before the wildcard */
+            char *sl = strrchr(out, '/');
+            if (sl == out) out[1] = '\0'; else *sl = '\0';
+        } else {
+            size_t n = strlen(out);                          /* a glob with no wildcard: an exact path */
+            if (n > 1 && out[n - 1] == '/') out[n - 1] = '\0';
+            *exact = true;                                   /* v1.27.1 review: as an exact rule */
+        }
+        return 0;
+    }
+    default:
+        return 0;
+    }
+}

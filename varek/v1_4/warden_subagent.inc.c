@@ -390,7 +390,8 @@ static int sub_container_cgroup(const char *mnt, const char *self, bool check_on
     if (!g_own_mntns) {
         if (unshare(CLONE_NEWNS) < 0 || mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
             fprintf(stderr, "[warden] the policy names a sub-agent: cannot make a mount namespace for the cgroup "
-                    "filesystem (%s); refusing to start\n", strerror(errno));
+                    "filesystem (%s); in a container, add --cap-add SYS_ADMIN (packaging/container/README.md); "
+                    "refusing to start\n", strerror(errno));
             return -1;
         }
         g_own_mntns = true;

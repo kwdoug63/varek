@@ -46,10 +46,13 @@ check "... and require warden 1.31 loads" "$VDP" "$OUT/p131.txt" lint
 printf 'require warden 1.27\nallow path /usr/ readonly\nallow exec /usr/bin/true\n' > "$OUT/mro.txt"
 printf 'require warden 1.27\nallow path /usr/ readonly\nallow path /tmp/varek-v1320-w/\n' > "$OUT/mrw.txt"
 printf 'require warden 1.26\nallow path /tmp/varek-v1320-w/\n' > "$OUT/m126.txt"
+printf 'require warden 1.27\nallow exec /usr/bin/true\nallow path relative/x\n' > "$OUT/mrel.txt"
 check "the noexec mounts: none for a policy that decides launches but writes nothing" \
     sh -c "[ \"\$('$VDP' '$OUT/mro.txt' launches)\" = on ] && [ \"\$('$VDP' '$OUT/mro.txt' mounts)\" = off ]"
 check "... made for one that writes, and none where launches are not decided" \
     sh -c "[ \"\$('$VDP' '$OUT/mrw.txt' mounts)\" = on ] && [ \"\$('$VDP' '$OUT/m126.txt' mounts)\" = off ]"
+check "... and none for a rule that writes no absolute path, as the Warden lists them" \
+    sh -c "[ \"\$('$VDP' '$OUT/mrel.txt' mounts)\" = off ]"
 if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
     skip "run_start's version (needs root and the warden binary)"
 else

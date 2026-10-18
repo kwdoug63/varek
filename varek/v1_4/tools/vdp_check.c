@@ -142,10 +142,17 @@ int main(int argc, char **argv) {
         return 0;
     }
     /* v1.32: will the Warden mount anything (launches decided and a path
-     * rule that writes: the noexec mounts)? varek run's container check */
+     * rule that writes somewhere absolute: the noexec mounts, as
+     * noexec_build lists them; a rule no directory bounds makes the Warden
+     * refuse, counted as mounting)? varek run's container check */
     if (!strcmp(argv[2], "mounts")) {
         bool w = false;
-        for (size_t i = 0; g_pol.launches && i < g_pol.n; i++) w = w || vdp_rule_may_write(&g_pol.rules[i]);
+        for (size_t i = 0; g_pol.launches && i < g_pol.n; i++) {
+            char t[4096];
+            bool exact;
+            if (vdp_rule_may_write(&g_pol.rules[i]) &&
+                (vdp_rule_noexec_target(&g_pol.rules[i], t, sizeof t, &exact) < 0 || t[0])) w = true;
+        }
         printf("%s\n", w ? "on" : "off");
         return 0;
     }
