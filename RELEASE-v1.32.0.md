@@ -7,8 +7,7 @@
 > against the code); its findings are fixed (below). A human or
 > third-party review has not been done.
 
-**Draft.** Pending: both hosts' sweeps rerun with the review's fixes,
-rootless Podman's rerun, the 24-hour soak inside a container, and the date.
+**Draft.** Pending: the 24-hour soak inside a container, and the date.
 
 MIT · github.com/kwdoug63/varek
 
@@ -128,11 +127,14 @@ stage, every suite under the documented settings):
 
 | Host | Confinement | Result |
 |---|---|---|
-| Ubuntu 24.04, kernel 6.8, Docker 29.1.3, cgroup v2 | AppArmor, `varek-container` | 30 of 30 |
-| RHEL 9.8, kernel 5.14, Podman 5.8.2 rootful, cgroup v2 | SELinux enforcing, `container_init_t` and `varek_container.cil` | 30 of 30 |
-| RHEL 9.8, Podman 5.8.2 rootless, `--systemd=always` | SELinux enforcing, as above | 30 of 31; rerun pending |
+| Ubuntu 24.04, kernel 6.8, Docker 29.1.3, cgroup v2 | AppArmor, `varek-container` | 31 of 31 |
+| RHEL 9.8, kernel 5.14, Podman 5.8.2 rootful, cgroup v2 | SELinux enforcing, `container_init_t` and `varek_container.cil` | 31 of 31 |
+| RHEL 9.8, Podman 5.8.2 rootless (as a user, subordinate IDs), `--systemd=always` | SELinux enforcing, as above | 31 of 31 |
 
-These are before the review's fixes; both hosts are run again with them.
+With the review's fixes and the memory layout (2026-10-17 and 18,
+Central): every suite on commit `f37d9ae`, and `test-v1281` again on
+`fc6f4c4` (Docker) and `63a9511` (rootless), after its own setup and the
+order of two refusals were fixed (below).
 
 With `--drop-each`, each of the ten capabilities is needed by at least one
 suite. The skips are those a container explains (Known limits, below), and
@@ -165,6 +167,17 @@ Pending.
   run`'s container refusal, the preflight's section 2b, `make test-v1320`,
   `tests/container_sweep.sh`, and the workflows `container.yml` and
   `container-release.yml`.
+
+## Found by the sweeps after the review
+
+- **test-v1281 stopped at its own setup under the AppArmor profile.**
+  Where the cgroup filesystem is read-only, the suite re-runs itself with
+  it remounted read-write, by a plain remount, which the profile no longer
+  allows; it now bind-remounts it, as the Warden does.
+- **Rootless, the refusal named the wrong setting first.** A read-only
+  cgroup filesystem not at its cgroup namespace's root was refused for
+  the user namespace; the Warden now names `--cgroupns=private` first,
+  the setting every container needs, as `varek doctor` orders them.
 
 ## Found in review
 
