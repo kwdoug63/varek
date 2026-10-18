@@ -278,7 +278,8 @@ against the code, most by running it, before it was fixed.
 - **The rootless refusal's reason** dated from the plain remount, which
   the kernel refuses in a user namespace. The bind remount made now is
   not measured under rootless Podman, so the refusal stays, worded as it
-  is (known limits).
+  is (known limits). Measured since (2026-10-18): it works there; lifting
+  the refusal is for a later release.
 - **`varek doctor`'s mount test** made a test directory for a run that
   mounts none noexec (a read-only `/tmp` refused it), and did not check
   the cgroup filesystem read-write after its remount, as the Warden does;
@@ -333,8 +334,9 @@ against the code, most by running it, before it was fixed.
   (`--tmpfs`) is mounted noexec.
 - **Rootless Podman needs `--systemd=always`** for sub-agents and confined
   MCP servers: in a user namespace the Warden does not remount a
-  read-only cgroup filesystem. A bind remount may work there; it is not
-  yet measured under rootless Podman.
+  read-only cgroup filesystem. The bind remount was measured to work
+  there after the second review (2026-10-18; a group made and used), so a
+  later release can lift the refusal, once built and tested.
 - **The AppArmor profile bounds what is mounted, not where.** The Warden,
   or a root shell started in the container with the same capabilities,
   may bind any path and make a bind mount read-write. The agent holds no

@@ -328,8 +328,9 @@ static int sub_container_cgroup(const char *mnt, const char *self, bool check_on
     if (statvfs(mnt, &sv) < 0 || !(sv.f_flag & ST_RDONLY)) return 0;
     /* D10: in a user namespace it is not remounted. Measured with a plain
      * remount, which the kernel refuses there; a bind remount, the one made
-     * now, is not yet measured under rootless Podman (v1.32 second review),
-     * so it is still refused. Rootless Podman's systemd mode mounts the
+     * now, was measured to work under rootless Podman after the second
+     * review (2026-10-18, a group made and used), but v1.32.0 keeps the
+     * refusal it was soaked with: lifting it is for a later release. Rootless Podman's systemd mode mounts the
      * container's own groups read-write instead */
     /* a cgroup namespace of its own first: the setting any container needs
      * (v1.32, as varek doctor orders them) */
