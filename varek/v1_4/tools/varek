@@ -1364,7 +1364,14 @@ def cmd_run(args):
         argv += ["--dry-run"]
     argv += ["--run-as", run_as, "--"] + cmd
 
-    fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+    try:
+        fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+    except FileExistsError:
+        raise CliError(f"the verdict stream {log} exists already",
+                       fix="give the run a file of its own (--log); a stream is never written over")
+    except OSError as e:
+        raise CliError(f"cannot make the verdict stream {log}: {e.strerror}",
+                       fix="--log in a directory root may write")
     if args.dry_run:
         print(_paint("1;33", "[varek] DRY RUN: NOT ENFORCING. Every call is decided and recorded; what the "
                              "policy refuses is let through."), file=sys.stderr)

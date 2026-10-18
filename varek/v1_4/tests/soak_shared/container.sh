@@ -49,6 +49,14 @@ if [ -z "$RT" ]; then
 fi
 IMAGE="${IMAGE:-varek-test:$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo local)}"
 OUT="${OUT:-/var/tmp/varek-soak-container-$(date -u +%Y%m%dT%H%M%SZ)}"
+# a soak of its own: never one on top of another's files, nor in place of a
+# running one
+if [ -e "$OUT/run" ]; then
+    echo "container.sh: $OUT/run exists: give this soak a directory of its own (--out)" >&2; exit 2
+fi
+if [ "$("$RT" inspect --format '{{.State.Running}}' "$NAME" 2>/dev/null)" = true ]; then
+    echo "container.sh: a container $NAME is running (a soak?); stop it first ($RT rm -f $NAME) or give --name" >&2; exit 2
+fi
 mkdir -p "$OUT"
 args=(-d --name "$NAME" --cap-drop ALL --cgroupns=private)
 for c in $CAPS; do args+=(--cap-add "$c"); done
@@ -70,7 +78,7 @@ if [ "$BUILD" = 1 ]; then
         { tail -20 "$OUT/build.log"; echo "container.sh: the build failed ($OUT/build.log)" >&2; exit 1; }
 fi
 "$RT" image inspect "$IMAGE" > /dev/null 2>&1 || { echo "container.sh: no image $IMAGE (--build makes it)" >&2; exit 2; }
-"$RT" rm -f "$NAME" > /dev/null 2>&1
+"$RT" rm "$NAME" > /dev/null 2>&1                 # a stopped one of that name
 {
     echo "host: $(uname -srm); $(. /etc/os-release && echo "$PRETTY_NAME")"
     echo "commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
