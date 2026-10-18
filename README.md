@@ -531,9 +531,13 @@ different risks at different points in the stack.
 - [x] **v1.28.0** — Credential release: the agent holds only placeholders, and the egress proxy puts the real credential (from a file, HashiCorp Vault or AWS Secrets Manager) into a request only where a rule names it and only on a request the Warden decided SATISFIED; `varek revoke` ([design](./docs/security/v1.28-credential-release.md))
 - [x] **v1.28.1** — The on-behalf-of chain (user → agent → sub-agent) in every verdict: the user's token and the agent's SPIFFE ID verified at the start, each sub-agent attributed by a control group of its own ([design](./docs/security/v1.28.1-delegation-chain.md))
 - [x] **v1.29.0** — `varek run -- <agent>` with nothing set up first (a baseline policy and agent profiles), files opened and changed as the agent's own user, a dry run that records what a policy would refuse without enforcing it, and `varek policy suggest` ([design](./docs/security/v1.29-varek-run.md))
-- [ ] **v1.30.0** (planned) — macOS: the agent and the Warden in a lightweight Linux VM, with the same guarantees as on Linux ([plan](./docs/roadmap/v1.28-v1.31.md))
 - [x] **v1.31.0** — Standards: authorization events in OCSF beside CycloneDX; MCP servers confined to their own rules, MCP calls decided by method and tool, MCP tokens bound to their server; a mapping to Agent Baseline ([design](./docs/security/v1.31-standards.md))
 - [x] **v1.31.1** — A patch release of v1.31.0: `epoll_wait`, `epoll_create`, `pipe` and `getpgrp` admitted under every policy, so asyncio, a shell's command substitution and bash work under the Warden ([release notes](./RELEASE-v1.31.1.md)).
+- [ ] **v1.32.0** (in progress) — Containers: an official image (`ghcr.io/kwdoug63/varek`, signed, with an SBOM), Docker and Podman, rootless included, under a published minimal set of settings, never `--privileged` ([design](./docs/security/v1.32-containers.md))
+- [ ] **v1.33.0** (in progress; planned as v1.30.0) — macOS: the agent and the Warden in a lightweight Linux VM, with the same guarantees as on Linux ([plan](./docs/roadmap/v1.28-v1.31.md))
+- [ ] **v1.34.0** (planned) — Kubernetes: a node agent, a Helm chart, OpenShift, an Amazon EKS add-on ([plan](./docs/roadmap/v1.32-v1.35.md))
+- [ ] **v1.35.0** (planned) — Agent frameworks: plans generated from the framework, Amazon Bedrock AgentCore first ([plan](./docs/roadmap/v1.32-v1.35.md))
+- [ ] **v1.36.0** (planned) — Security operations: Splunk, Microsoft Sentinel, OpenTelemetry ([plan](./docs/roadmap/v1.32-v1.35.md))
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
 

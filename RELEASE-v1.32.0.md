@@ -253,7 +253,7 @@ by itself what it cannot do.
 - **The Warden needs CAP_SYS_ADMIN in the agent's container** (D3): it
   makes the agent's PID, network and mount namespaces and the noexec
   mounts. The agent never holds it. Running the Warden outside the agent's
-  container is v1.33's node agent.
+  container is v1.34's node agent.
 - **Process events**: on RHEL 9's kernel 5.14 and Ubuntu 24.04's 6.8 the
   kernel's process events do not reach a listener in a container's own
   network namespace. The Warden says so and falls back, as on a host
