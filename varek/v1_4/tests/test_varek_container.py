@@ -135,6 +135,23 @@ def test_rootless_remount_refused_names_systemd_always(monkeypatch):
     assert lv == "fail" and not fix.startswith("--systemd=always")
 
 
+def test_rootless_groups_not_delegated(monkeypatch):
+    """v1.32.1 review: remounted, but no groups can be made (not delegated):
+    said as such, naming the delegation"""
+    monkeypatch.setattr(vc.os, "geteuid", lambda: 0)
+    real_pipe = os.pipe
+
+    def groups_pipe():
+        r, w = real_pipe()
+        os.write(w, b"groups 13")
+        return r, w
+    monkeypatch.setattr(vc.os, "pipe", groups_pipe)
+    monkeypatch.setattr(vc.os, "fork", lambda: 1 << 22)
+    monkeypatch.setattr(vc.os, "waitpid", lambda pid, f: (pid, 0))
+    lv, text, fix = vc.probe_mounts("/sys/fs/cgroup", noexec=False, rootless=True)[0]
+    assert lv == "fail" and "not delegated" in text and "systemd cgroup manager" in fix and "EACCES" in text
+
+
 def test_in_container():
     assert vc.in_container({}, exists=lambda p: p == "/.dockerenv") == "docker"
     assert vc.in_container({}, exists=lambda p: p == "/run/.containerenv") == "podman"

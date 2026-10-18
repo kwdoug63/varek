@@ -323,6 +323,15 @@ static int sub_cg_remount(const char *mnt) {
     return 0;
 }
 
+/* v1.32.1 review: the cgroup filesystem is writable as a mount, but this
+ * process may not make groups in it (in a user namespace: the container's
+ * group not delegated to its user, so its root is not their owner) */
+static const char *sub_nogroups = "[warden] the policy names a sub-agent: cannot make groups in %s (%s)%s; "
+                                  "refusing to start\n";
+static const char *sub_nodelegation = ": in a user namespace (rootless) the container's control group must be "
+                                      "delegated to its user (rootless Podman with the systemd cgroup manager "
+                                      "in the user's systemd session)";
+
 static int sub_container_cgroup(const char *mnt, const char *self, bool check_only) {
     struct statvfs sv;
     if (statvfs(mnt, &sv) < 0 || !(sv.f_flag & ST_RDONLY)) return 0;
@@ -344,7 +353,7 @@ static int sub_container_cgroup(const char *mnt, const char *self, bool check_on
     const char *refused = sub_in_userns()
         ? "[warden] the policy names a sub-agent: cannot remount the container's cgroup filesystem %s "
           "read-write (%s) in this user namespace (rootless); run the container with --systemd=always, or "
-          "under SELinux with VAREK's module (packaging/container/README.md); refusing to start\n"
+          "with VAREK's SELinux module or AppArmor profile (packaging/container/README.md); refusing to start\n"
         : "[warden] the policy names a sub-agent: cannot remount the container's cgroup "
           "filesystem %s read-write (%s); under AppArmor or SELinux, run with VAREK's profile "
           "(packaging/container/README.md); refusing to start\n";
@@ -363,6 +372,10 @@ static int sub_container_cgroup(const char *mnt, const char *self, bool check_on
             if (unshare(CLONE_NEWNS) < 0) r[0] = 1;
             else if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) r[0] = 2;
             else if (sub_cg_remount(mnt) < 0) r[0] = 3;
+            /* v1.32.1 review: and groups can then be made there, as the run
+             * makes one (in a user namespace, only where the container's
+             * group is delegated to its user) */
+            else if (access(mnt, W_OK) < 0) r[0] = 4;
             r[1] = r[0] ? errno : 0;
             if (write(pp[1], r, sizeof r) != (ssize_t)sizeof r) _exit(1);
             _exit(r[0] ? 1 : 0);
@@ -379,6 +392,8 @@ static int sub_container_cgroup(const char *mnt, const char *self, bool check_on
                 fprintf(stderr, "[warden] the policy names a sub-agent: cannot make a mount namespace for the "
                         "cgroup filesystem (%s); in a container, add --cap-add SYS_ADMIN "
                         "(packaging/container/README.md); refusing to start\n", why);
+            else if (r[0] == 4)
+                fprintf(stderr, sub_nogroups, mnt, why, sub_in_userns() ? sub_nodelegation : "");
             else
                 fprintf(stderr, refused, mnt, why);
             return -1;
@@ -452,8 +467,10 @@ static int sub_setup(const struct policy *p, bool check_only, bool agent_root) {
         return 0;
     }
     if (mkdir(g_cg_dir, 0755) < 0) {
-        fprintf(stderr, "[warden] the policy names a sub-agent: cannot make the run's control group %s (%s); "
-                "refusing to start\n", g_cg_dir, strerror(errno));
+        int e = errno;
+        fprintf(stderr, "[warden] the policy names a sub-agent: cannot make the run's control group %s (%s)%s; "
+                "refusing to start\n", g_cg_dir, strerror(e),
+                (e == EACCES || e == EPERM) && sub_in_userns() ? sub_nodelegation : "");
         return -1;
     }
     char fz[PATH_MAX + 32];

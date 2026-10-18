@@ -233,6 +233,9 @@ def probe_mounts(cgroup_mount=None, noexec=True, rootless=False):
                 if os.statvfs(cgroup_mount).f_flag & 1:                    # ST_RDONLY: still, as the Warden checks
                     os.write(w, f"cgroup {errno.EROFS}".encode())
                     os._exit(1)
+                if not os.access(cgroup_mount, os.W_OK):                  # groups can be made, as a run makes one
+                    os.write(w, f"groups {errno.EACCES}".encode())
+                    os._exit(1)
             os.write(w, b"ok 0")
             code = 0
         finally:                                                            # never back into the caller
@@ -263,6 +266,13 @@ def probe_mounts(cgroup_mount=None, noexec=True, rootless=False):
                    ("--systemd=always (Podman then mounts the container's own groups read-write), or " if rootless
                     else "") + SELINUX_FIX + " (under AppArmor: " + APPARMOR_FIX + ")"),
     }
+    if rootless:
+        fixes["groups"] = ("the cgroup filesystem is writable, but groups cannot be made in it: the container's "
+                           "control group is not delegated to its user (sub-agents and confined MCP servers)",
+                           "rootless Podman with the systemd cgroup manager, in the user's systemd session")
+    else:
+        fixes["groups"] = ("the cgroup filesystem is writable, but groups cannot be made in it (sub-agents and "
+                           "confined MCP servers)", None)
     text, fix = fixes.get(what, ("the mount test failed", None))
     return [("fail", f"a test of the Warden's mounts: {text} ({err})", fix)]
 

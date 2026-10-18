@@ -156,8 +156,9 @@ trap 'exit 130' INT TERM
 run_set() {
     local label="$1"; shift
     local args=(--rm --cap-drop ALL --cgroupns=private "${SECOPTS[@]}")
-    # rootless (D10): a user namespace locks the cgroup mount read-only;
-    # Podman's systemd mode mounts the container's own groups read-write
+    # rootless (D10): Podman mounts the cgroup filesystem read-only, which
+    # the Warden bind-remounts from v1.32.1; --systemd (v1.32.0's way) has
+    # Podman's systemd mode mount the container's own groups read-write
     [ -z "$ROOTLESS" ] || [ "$SYSTEMD" = 0 ] || args+=(--systemd=always)
     for c in "$@" $TEST_CAPS; do args+=(--cap-add "$c"); done
     printf '\n== %s: --cap-drop ALL%s (and, for the tests, %s)\n' "$label" "$([ $# = 0 ] || printf ' --cap-add %s' "$@")" "$TEST_CAPS" | tee -a "$OUT/summary.txt"
