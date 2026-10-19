@@ -24,7 +24,7 @@ read-only; their mount test also checks that groups can be made.
 (`--systemd` adds it).
 `RELEASE-v1.32.1.md`.
 
-## [1.32.0] - (date at release; a draft until its 24-hour soak) — Containers: an official image, Docker and Podman
+## [1.32.0] - 2026-10-19 — Containers: an official image, Docker and Podman
 
 VAREK's image, `ghcr.io/kwdoug63/varek`: the Warden, its helpers and the
 `varek` command on Red Hat's UBI 9 minimal, the entrypoint `varek run --`, so
@@ -43,8 +43,9 @@ checks each setting and names the flag that grants a missing one; `varek run`
 refuses a container that cannot carry the run. Each release tag builds,
 checks, signs (cosign, keyless) and attests (a CycloneDX SBOM) the image.
 Every suite passes inside the container on Docker with AppArmor and rootful
-and rootless Podman with SELinux. The Warden reports 1.32.0; the grammar
-stays 1.31. Reviewed by AI review agents. See `RELEASE-v1.32.0.md`.
+and rootless Podman with SELinux; the shared 24-hour soak passed inside a
+container under the documented settings. The Warden reports 1.32.0; the
+grammar stays 1.31. Reviewed by AI review agents. See `RELEASE-v1.32.0.md`.
 
 ## [1.31.1] - 2026-10-17 — Calls glibc and bash make
 

@@ -524,9 +524,13 @@ sys.exit(0 if rs and all(isinstance(r.get("obo"), list) and r["obo"][:1] == ["ag
     check "--check-startup: where the groups would go, and none made" \
         sh -c "grep -q 'sub-agents: a run.s control groups go under $CGM' '$OUT/cs3.out' && ! ls '$CGM' | grep -q '^varek-'"
     # v1.32: a container's cgroup filesystem, read-only, with a cgroup
-    # namespace of its own (--cgroupns=private): made so here
+    # namespace of its own (--cgroupns=private): made so here. The namespace
+    # is made from the hierarchy's root group, so that its root is the
+    # mount's, as a container's is (a suite started in another group, a CI
+    # runner's service, moves there first; in a container it is there)
+    TOROOT='[ "$(sed -n "s/^0:://p" /proc/self/cgroup)" = / ] || echo $$ > "$1/cgroup.procs"'
     if unshare -m -C true 2>/dev/null; then
-        rocg() { unshare -m -C sh -c 'mount --make-rprivate / && mount -o remount,bind,ro "$1" && shift && exec "$@"' sh "$CGM" "$@"; }
+        rocg() { unshare -m sh -c "$TOROOT"' && exec unshare -C sh -c '"'"'mount --make-rprivate / && mount -o remount,bind,ro "$1" && shift && exec "$@"'"'"' sh "$@"' sh "$CGM" "$@"; }
         rocg sh -c "timeout 60 '$WARDEN' '$B/p.txt' --check-startup > '$OUT/rocs.out' 2>&1; \
             timeout 60 '$WARDEN' '$B/p.txt' -- '$B/agent' exec '$B/a' open '$B/f' > /dev/null 2> '$OUT/ro.out'; \
             mkdir '$CGM/v1281-ro' 2> '$OUT/ro.mkdir'"
@@ -548,7 +552,7 @@ sys.exit(0 if rs and all(isinstance(r.get("obo"), list) and r["obo"][:1] == ["ag
         # the namespace's root is the group it was made in; moved below it,
         # then the filesystem made read-only
         mkdir -p "$CGM/v1281-in"
-        unshare -m -C sh -c 'mount --make-rprivate / && echo $$ > "$1/v1281-in/cgroup.procs" && mount -o remount,bind,ro "$1" && shift && exec "$@"' \
+        unshare -m sh -c "$TOROOT"' && exec unshare -C sh -c '"'"'mount --make-rprivate / && echo $$ > "$1/v1281-in/cgroup.procs" && mount -o remount,bind,ro "$1" && shift && exec "$@"'"'"' sh "$@"' \
             sh "$CGM" sh -c "timeout 60 '$WARDEN' '$B/p.txt' -- '$B/agent' open '$B/f' > /dev/null 2> '$OUT/rono.out'; echo \$? > '$OUT/rono.rc'"
         rmdir "$CGM/v1281-in" 2>/dev/null
         check "refused: read-only and not at its namespace's root (--cgroupns=host)" \

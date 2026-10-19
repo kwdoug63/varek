@@ -2,7 +2,7 @@
 
 # VAREK — Technical Specification
 
-**Version 1.32.0** (October 2026; a draft until its 24-hour soak). Supersedes the v1.31.0 edition. Corrections made to earlier editions are folded into the text and listed in Appendix B.
+**Version 1.32.0** (October 2026). Supersedes the v1.31.0 edition. Corrections made to earlier editions are folded into the text and listed in Appendix B.
 
 *Deterministic runtime verification of autonomous AI agents using formal methods.*
 
@@ -385,7 +385,7 @@ Most production agents run in containers, where through v1.31.1 the Warden could
 
 None of this changes a decision procedure, a rule or a record: the Warden in a container decides as on a host, and the one launch decided differently (a sub-agent of its launcher's image, without process events) is now made where it can be told and refused where it cannot. No extension may move a genuinely unsafe action to SATISFIED.
 
-**Measured.** Every suite passes inside the container, 31 of 31, on Docker 29.1.3 on Ubuntu 24.04 (kernel 6.8, AppArmor) and on rootful and rootless Podman 5.8.2 on RHEL 9.8 (kernel 5.14, SELinux enforcing). `make test-v1320` adds 22 checks (the version, `varek doctor` and the run's refusal in a container, the packaging and the release workflow's pins and gates). The shared 24-hour soak runs inside a container under the documented settings and nothing more.
+**Measured.** Every suite passes inside the container, 31 of 31, on Docker 29.1.3 on Ubuntu 24.04 (kernel 6.8, AppArmor) and on rootful and rootless Podman 5.8.2 on RHEL 9.8 (kernel 5.14, SELinux enforcing). `make test-v1320` adds 25 checks (the version, `varek doctor` and the run's refusal in a container, the packaging and the release workflow's pins and gates). The shared 24-hour soak passed inside a container under the documented settings and nothing more: 1,440 turns in each run, every task done, every probe held, the user's token expiry revoking the run 0.02 s after, and memory flat.
 
 **Scope.** The container holds CAP_SYS_ADMIN, the agent never does; running the Warden outside the agent's container is v1.34's node agent. The AppArmor profile bounds what is mounted, not where: a process with CAP_SYS_ADMIN in the container may bind any path and make a bind mount read-write. Container detection knows Docker and Podman. The review by six AI review agents found five high findings (the release workflow's check that could not fail and its actions on movable tags, an image build that could take binaries built on the host, `varek run` refusing every run under `docker-default`, and a test's skip decided by the Warden under test) and a cgroup remount that reconfigured the filesystem every cgroup2 mount shares, all fixed before this edition (§5).
 

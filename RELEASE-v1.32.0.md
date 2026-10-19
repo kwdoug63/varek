@@ -9,7 +9,7 @@
 > fixes to the Warden and the tools; the soak harness, the example and the
 > workflows), and one more the four commits after those. A human or third-party review has not been done.
 
-**Draft.** Pending: the 24-hour soak inside a container, and the date.
+Released 2026-10-19.
 
 MIT · github.com/kwdoug63/varek
 
@@ -151,11 +151,31 @@ remount among them; `/bin/echo` run as the agent under the baseline, as
 
 ## 24 hours in a container
 
-Running: started 2026-10-18 02:29 CDT on a 2 GB droplet (Ubuntu 24.04,
-kernel 6.8, Docker 29.1.3), the shared soak in the test image under the
-documented settings and the AppArmor profile as shipped
-(`tests/soak_shared/container.sh`, commit `54584a4`). Its 6-minute trial
-passed, run A's two Python servers settled by their layout.
+The shared soak (`tests/soak_shared/`: v1.28.1's, v1.29.0's and v1.31.0's
+runs) inside the test image, under the documented settings and nothing
+more: `--cap-drop ALL` and the ten capabilities, `--cgroupns=private`,
+Docker's default seccomp profile and VAREK's AppArmor profile as shipped
+(`tests/soak_shared/container.sh`, commit `54584a4`). On a 2 GB droplet
+(Ubuntu 24.04, kernel 6.8, Docker 29.1.3, 4 GB of swap), 2026-10-18 02:29
+to 2026-10-19 02:29 CDT. In the container the kernel gives the Warden no
+process events, so run A's two Python servers, launched by the Python
+agent, are told launched by their memory layout. It passed (`soak_check:
+PASS`):
+
+| | |
+|---|---|
+| Duration | 24.0 h, a turn every 60 s: 1,440 turns in each run; Warden 1.32.0 |
+| Run A: tasks before the expiry | 1,291, all succeeded: the agent's `tools/list` 259 and `tools/call` 258, `fs` reads 258, `gh`'s calls to the remote server 258, sub-agent launches 258 |
+| Run A: probes | 144 (18 of each of 8 kinds), all held |
+| Run A: confined servers | `fs` and `gh`, each confined, each call certified under its own subject |
+| Run A: the remote MCP server | 775 requests, the MCP token in 258 (`gh`'s allowed calls) and in none other, 0 errors |
+| Run A: the expiry | the run revoked 0.02 s after the user's token expired; the 5 turns after it all refused |
+| Run A: records | 13,830; `varek_audit` passed (the credential carried by 258 requests, none refused, the run revoked; the chain intact) |
+| Run A: OCSF | 11,658 events followed live and verified against the stream (`--verify`: the stream's 13,830 records, chain intact); valid OCSF 1.9.0 |
+| Run A: time | an MCP call at the agent p50 52 to 53 ms (p99 73 to 84 ms), through the proxy and back; a sub-agent launch p50 13 ms (p99 28); the Warden's decision on the agent's MCP calls p50 31 us (p99 101), on `gh`'s p50 34 us (p99 99), on the agent's opens p50 92 us (p99 2.4 ms), on `fs`'s p50 560 us (p99 3.7 ms) |
+| Run B (v1.29.0, enforcing) | 1,296 of 1,296 tasks done; probes 144 (`/etc/shadow`, outside the project, the agent's own program, 48 each), all held; 288 git commits; 396,222 records, signed, `varek_audit` passed |
+| Run C (v1.29.0, a dry run) | 1,440 of 1,440 tasks done; 4,325 calls the narrower policy refuses let through and recorded; `varek_audit`: VERIFIED, DRY RUN, NOT ENFORCED; `varek policy suggest` drafted 40 exact rules, under which the work ran with nothing let through |
+| Memory | the Warden 11.1 to 12.1 MB in each run, `warden-proxy` 8.8 MB, `warden-secrets` 8.9 MB, `fs` 10.8 MB, `gh` 19.8 to 20.7 MB, flat |
 
 ## Compatibility
 
