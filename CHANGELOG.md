@@ -9,7 +9,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [1.32.1] - (date at release; after v1.32.0's) — Rootless Podman without `--systemd=always`
+## [1.32.1] - 2026-10-19 — Rootless Podman without `--systemd=always`
 
 A patch release of 1.32.0. In a user namespace (rootless Podman) the Warden
 bind-remounts the container's read-only cgroup filesystem read-write in its

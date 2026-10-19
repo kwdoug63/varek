@@ -1,8 +1,6 @@
 # VAREK v1.32.1 — Rootless Podman Without `--systemd=always`
 
-**Draft.** Pending: v1.32.0's release, and the date.
-
-MIT · github.com/kwdoug63/varek
+Released 2026-10-19 · MIT · github.com/kwdoug63/varek
 
 ## Summary
 
