@@ -123,6 +123,39 @@ options:
 cd ~/varek131 && varek/v1_4/tests/soak_shared/soak.sh --hours 24 --sign-key KEY --out /var/tmp/varek-soak-shared-24h --check-only
 ```
 
+## In a container (v1.32)
+
+`container.sh` runs the same soak inside VAREK's test image, under the
+settings the image documents and nothing more (the ten capabilities,
+`--cgroupns=private`, the runtime's default seccomp profile, and the
+AppArmor profile as shipped), detached, its directory on the host. There
+the kernel gives the Warden no process events, so run A's two Python
+servers, launched by the Python agent, are told launched by their memory
+layout. On the Docker droplet, as root, from the checkout:
+
+```
+varek/v1_4/tests/soak_shared/container.sh --runtime docker --build --apparmor --out /var/tmp/varek-soak-trial -- --hours 0.1 --interval 3
+```
+
+```
+docker logs -f varek-soak
+```
+
+then the 24 hours (the image is built already):
+
+```
+varek/v1_4/tests/soak_shared/container.sh --runtime docker --apparmor --out /var/tmp/varek-soak-24h
+```
+
+The memory note above holds for the host. If the steps after the runs were
+cut short, `container.sh --check-only` does them again; the soak's tokens
+and agents' files are in its stopped container only, which `container.sh`
+therefore never removes (remove it once the soak is judged):
+
+```
+varek/v1_4/tests/soak_shared/container.sh --runtime docker --apparmor --out /var/tmp/varek-soak-24h --check-only
+```
+
 While it runs, run nothing else under the Warden on the droplet: the test
 suites included (`test_v1280.sh` runs `varek revoke --all`, which revokes
 every run on the host, the soak's three with it).

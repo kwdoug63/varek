@@ -308,8 +308,11 @@ def tmp_dir(pw, make=True):
         if not make:
             return d
         os.mkdir(d, 0o700)
-        os.chown(d, pw.pw_uid, pw.pw_gid)
+        # the mode while root's, then the owner: changing the mode of
+        # another user's directory needs CAP_FOWNER, which a container
+        # need not grant (v1.32)
         os.chmod(d, 0o700)
+        os.chown(d, pw.pw_uid, pw.pw_gid)
         st = os.lstat(d)
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != pw.pw_uid or stat.S_IMODE(st.st_mode) != 0o700:
         raise BaselineError(f"{d} exists but is not a directory of {pw.pw_name}'s with mode 0700; "

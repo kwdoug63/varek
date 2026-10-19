@@ -538,6 +538,17 @@ typedef struct {
  * then refuses: the action is not authorized). */
 int vdp_certificate(const vdp_policy_t *p, int rule_index, const char *s, vdp_cert_t *c);
 
+/* v1.32: does path rule r allow some open that writes (an access mode of
+ * write or read-write, O_TRUNC, or O_CREAT)? The Warden mounts the
+ * directories of such rules noexec when launches are decided. */
+bool vdp_rule_may_write(const vdp_rule_t *r);
+/* v1.32: the directory (or file) writable rule r asks the Warden to mount
+ * noexec, into out; "" when the rule matches no absolute path; -1 when no
+ * directory bounds it (the Warden then refuses to start). *exact: the rule
+ * names one path. vdp_path_parent: s cut to its parent directory. */
+int vdp_rule_noexec_target(const vdp_rule_t *r, char *out, size_t on, bool *exact);
+void vdp_path_parent(char *s);
+
 /* Release what vdp_policy_load allocated (compiled globs). */
 void vdp_policy_free(vdp_policy_t *p);
 
@@ -648,8 +659,11 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * `require warden 1.31`; a v1.29 Warden refuses each, so the policy fails
  * closed there. (v1.30 adds no lines.) */
 #define VDP_WARDEN_MAJOR 1
-#define VDP_WARDEN_MINOR 31
-#define VDP_WARDEN_PATCH 1      /* v1.27.1: the Warden's version beyond the grammar's (v1.31.1; the grammar stays 1.31) */
+#define VDP_WARDEN_MINOR 31     /* the grammar: the highest `require warden` a policy may name */
+/* v1.32 (D12): the Warden's own version, ahead of the grammar's when a
+ * release adds no policy lines (v1.32.0: containers; the grammar stays 1.31) */
+#define VDP_WARDEN_REL_MINOR 32
+#define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's */
 
 /* v1.27: a note on exec rule i, for lint and the Warden's load-time notes,
  * in buf (empty: none); returns its length. An allow exec rule naming a shell

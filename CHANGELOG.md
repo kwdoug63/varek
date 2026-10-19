@@ -9,6 +9,29 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.32.0] - 2026-10-19 — Containers: an official image, Docker and Podman
+
+VAREK's image, `ghcr.io/kwdoug63/varek`: the Warden, its helpers and the
+`varek` command on Red Hat's UBI 9 minimal, the entrypoint `varek run --`, so
+the agent is the Warden's child in namespaces it makes inside the container,
+as on a host. A published, minimal set of settings, never `--privileged`:
+`--cap-drop ALL` and ten capabilities, each with its reason and shown needed,
+`--cgroupns=private`, the runtime's default seccomp profile; an AppArmor
+profile (`docker-default` with the Warden's three kinds of mount) and an
+SELinux module (`container_init_t` and four rules); rootless Podman with
+`--systemd=always`. The Warden bind-remounts a container's read-only cgroup
+filesystem read-write in its own mount namespace, so sub-agents and confined
+MCP servers run in a container, and, without the kernel's process events (in
+a container), tells a sub-agent of its launcher's image by its memory layout,
+so a Python agent can launch a Python MCP server confined. `varek doctor`
+checks each setting and names the flag that grants a missing one; `varek run`
+refuses a container that cannot carry the run. Each release tag builds,
+checks, signs (cosign, keyless) and attests (a CycloneDX SBOM) the image.
+Every suite passes inside the container on Docker with AppArmor and rootful
+and rootless Podman with SELinux; the shared 24-hour soak passed inside a
+container under the documented settings. The Warden reports 1.32.0; the
+grammar stays 1.31. Reviewed by AI review agents. See `RELEASE-v1.32.0.md`.
+
 ## [1.31.1] - 2026-10-17 — Calls glibc and bash make
 
 A patch release of v1.31.0. The Warden admits, under every policy, four

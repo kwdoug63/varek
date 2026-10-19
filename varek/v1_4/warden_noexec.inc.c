@@ -38,23 +38,10 @@ static struct noexec_island g_nxi[NOEXEC_MAX];
 static size_t g_nxi_n;
 static bool   g_writable_exec;      /* --writable-exec: the operator turned the mounts off (D2) */
 
-/* Does path rule r allow some open that writes (an access mode of write or
- * read-write, O_TRUNC, or O_CREAT)? The flags a rule requires are its value;
- * the rest are free. Over-approximating is the safe direction: one more
- * directory not mapped executable. */
-static bool noexec_rule_writable(const vdp_rule_t *r) {
-    if (r->kind != VDP_KIND_PATH || r->verb != VDP_ALLOW) return false;
-    static const uint32_t cand[] = {
-        1u, 2u, (uint32_t)O_TRUNC, (uint32_t)O_CREAT, 1u | (uint32_t)O_TRUNC, 2u | (uint32_t)O_TRUNC, 1u | (uint32_t)O_CREAT, 2u | (uint32_t)O_CREAT,
-        (uint32_t)O_CREAT | (uint32_t)O_TRUNC, 1u | (uint32_t)O_CREAT | (uint32_t)O_TRUNC, 2u | (uint32_t)O_CREAT | (uint32_t)O_TRUNC,
-    };
-    for (size_t k = 0; k < sizeof cand / sizeof cand[0]; k++) {
-        uint32_t f = (cand[k] & ~r->b.mask) | r->b.value;
-        if ((f & (uint32_t)O_ACCMODE) == 1u || (f & (uint32_t)O_ACCMODE) == 2u || (f & ((uint32_t)O_TRUNC | (uint32_t)O_CREAT)))
-            return true;
-    }
-    return false;
-}
+/* Does path rule r allow some open that writes? vdp_rule_may_write
+ * (smt_decide.c, v1.32: shared with vdp_check's `mounts`, which varek run
+ * asks whether the Warden will mount anything). */
+static bool noexec_rule_writable(const vdp_rule_t *r) { return vdp_rule_may_write(r); }
 
 /* Is p inside d (or d itself)? Both canonical. */
 static bool noexec_under(const char *p, const char *d) {
@@ -63,59 +50,11 @@ static bool noexec_under(const char *p, const char *d) {
     return !strncmp(p, d, n) && (p[n] == '\0' || p[n] == '/');
 }
 
-static void noexec_parent(char *s) {
-    char *sl = strrchr(s, '/');
-    if (sl == s) s[1] = '\0';
-    else if (sl) *sl = '\0';
-}
-
-/* The directory (or file) one writable rule asks to mount, into out, or
- * an empty string to skip the rule (a constant that matches no absolute
- * path). -1: a rule that cannot be bounded (suffix, contains, a glob that
- * starts with a wildcard). *exact: the rule names one path (an exact rule,
- * or a glob with no wildcard), so a file may be the target, or, if it is not
- * there yet, its directory (D3). */
+/* v1.32: moved to smt_decide.c (vdp_path_parent, vdp_rule_noexec_target),
+ * so vdp_check's `mounts` asks what the Warden mounts (second review). */
+static void noexec_parent(char *s) { vdp_path_parent(s); }
 static int noexec_target(const vdp_rule_t *r, char *out, size_t on, bool *exact) {
-    const char *c = r->s.c;
-    out[0] = '\0';
-    *exact = false;
-    switch (r->s.op) {
-    case VDP_STR_SUFFIX:
-    case VDP_STR_CONTAINS:
-        return -1;
-    case VDP_STR_EQ:
-        if (c[0] != '/') return 0;
-        snprintf(out, on, "%s", c);
-        *exact = true;
-        return 0;
-    case VDP_STR_PREFIX: {
-        if (c[0] != '/') return 0;
-        snprintf(out, on, "%s", c);
-        size_t n = strlen(out);
-        if (n > 1 && out[n - 1] == '/') out[n - 1] = '\0';   /* a directory: itself */
-        else noexec_parent(out);                             /* /work/out admits /work/out2 */
-        return 0;
-    }
-    case VDP_STR_GLOB: {
-        size_t k = 0;
-        for (; c[k] && c[k] != '*' && c[k] != '?' && c[k] != '[' && c[k] != '\\' && k < on - 1; k++)
-            out[k] = c[k];
-        out[k] = '\0';
-        if (k == 0) return -1;                              /* a glob from a wildcard: anywhere */
-        if (out[0] != '/') { out[0] = '\0'; return 0; }      /* relative: matches no absolute path */
-        if (c[k]) {                                          /* to the directory before the wildcard */
-            char *sl = strrchr(out, '/');
-            if (sl == out) out[1] = '\0'; else *sl = '\0';
-        } else {
-            size_t n = strlen(out);                          /* a glob with no wildcard: an exact path */
-            if (n > 1 && out[n - 1] == '/') out[n - 1] = '\0';
-            *exact = true;                                   /* v1.27.1 review: as an exact rule */
-        }
-        return 0;
-    }
-    default:
-        return 0;
-    }
+    return vdp_rule_noexec_target(r, out, on, exact);
 }
 
 /* A path that is not there: its nearest existing ancestor, canonical, and
@@ -385,6 +324,11 @@ static int noexec_remount_tree(const char *root, bool check) {
             if (statvfs(tok, &sv) < 0) rc = -1;
             else if (!(sv.f_flag & ST_NOEXEC)) { errno = EPERM; rc = -1; }
             else done++;
+        } else if (statvfs(tok, &sv) == 0 && (sv.f_flag & ST_NOEXEC)) {
+            /* v1.32: noexec already (a container's /dev/mqueue, /dev/shm):
+             * not remounted, which SELinux refuses a container for some
+             * (mqueue); the check pass confirms it */
+            done++;
         } else if (mount(NULL, tok, NULL, MS_BIND | MS_REMOUNT | MS_NOEXEC | noexec_keep_flags(tok), NULL) < 0)
             rc = -1;
         else done++;
@@ -413,6 +357,7 @@ static int noexec_mount(void) {
                 "start\n", strerror(errno));
         return -1;
     }
+    g_own_mntns = true;                      /* v1.32: sub_container_cgroup uses it too */
     for (size_t k = 0; k < g_nx_n; k++) {
         const char *d = g_nx[k].path;
         if (g_nx[k].missing) continue;
