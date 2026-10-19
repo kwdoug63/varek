@@ -157,9 +157,7 @@ static int view_open(int v) {
         if (g_view_fd[v] < 0) return -1;
         if (v == VIEW_HOSTS) g_view_gen = g_names.generation;
     }
-    char p[64];
-    snprintf(p, sizeof p, "/proc/self/fd/%d", g_view_fd[v]);
-    return open(p, O_RDONLY | O_CLOEXEC);
+    return proc_openf(O_RDONLY, 0, "self/fd/%d", g_view_fd[v]);
 }
 
 /* Answer a read-only open of view v. The policy is asked about the view's

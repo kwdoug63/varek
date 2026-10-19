@@ -690,12 +690,76 @@ static struct exec_ctx *ctx_get(pid_t pid) {
     return free_slot;
 }
 
+/* ---------------- v1.34: the node's /proc ----------------
+ * Every read of a process's state, the agent's or the Warden's own
+ * (/proc/<pid>/mem, /proc/self/fd/N, ...), goes through a descriptor on the
+ * /proc the Warden started with. Under the node agent the supervisor enters
+ * the container's mount namespace, where /proc is the container's: another
+ * PID namespace, in which the supervisor has no entry (docs/security/
+ * v1.34-kubernetes.md, step 2). Names the agent asks for (its own
+ * /proc/self) are still resolved in its view. proc_dir() is first called
+ * before any namespace is entered. */
+static int g_procfd = -1;
+static int proc_dir(void) {
+    if (g_procfd < 0) g_procfd = open("/proc", O_PATH | O_DIRECTORY | O_CLOEXEC);
+    return g_procfd;
+}
+
+/* The name below that /proc ("<pid>/..." or "self/..."), or -1 */
+static int proc_rel(char *rel, size_t n, const char *fmt, va_list ap) {
+    int k = vsnprintf(rel, n, fmt, ap);
+    if (k < 0 || (size_t)k >= n || proc_dir() < 0) { errno = ENAMETOOLONG; return -1; }
+    return 0;
+}
+
+__attribute__((format(printf, 3, 4)))
+static int proc_openf(int flags, mode_t mode, const char *fmt, ...) {
+    char rel[128];
+    va_list ap;
+    va_start(ap, fmt);
+    int r = proc_rel(rel, sizeof rel, fmt, ap);
+    va_end(ap);
+    return r < 0 ? -1 : openat(g_procfd, rel, flags | O_CLOEXEC, mode);
+}
+
+__attribute__((format(printf, 1, 2)))
+static FILE *proc_fopenf(const char *fmt, ...) {
+    char rel[128];
+    va_list ap;
+    va_start(ap, fmt);
+    int r = proc_rel(rel, sizeof rel, fmt, ap);
+    va_end(ap);
+    int fd = r < 0 ? -1 : openat(g_procfd, rel, O_RDONLY | O_CLOEXEC);
+    FILE *f = fd < 0 ? NULL : fdopen(fd, "re");
+    if (fd >= 0 && !f) close(fd);
+    return f;
+}
+
+/* as readlink(2): the length, not terminated */
+__attribute__((format(printf, 3, 4)))
+static ssize_t proc_readlinkf(char *out, size_t n, const char *fmt, ...) {
+    char rel[128];
+    va_list ap;
+    va_start(ap, fmt);
+    int r = proc_rel(rel, sizeof rel, fmt, ap);
+    va_end(ap);
+    return r < 0 ? -1 : readlinkat(g_procfd, rel, out, n);
+}
+
+__attribute__((format(printf, 2, 3)))
+static int proc_statf(struct stat *st, const char *fmt, ...) {
+    char rel[128];
+    va_list ap;
+    va_start(ap, fmt);
+    int r = proc_rel(rel, sizeof rel, fmt, ap);
+    va_end(ap);
+    return r < 0 ? -1 : fstatat(g_procfd, rel, st, 0);
+}
+
 /* ---------------- cross-process memory ---------------- */
 
 static int xproc_read_str(pid_t pid, uint64_t addr, char *out, size_t outlen) {
-    char p[64];
-    snprintf(p, sizeof(p), "/proc/%d/mem", pid);
-    int fd = open(p, O_RDONLY);
+    int fd = proc_openf(O_RDONLY, 0, "%d/mem", pid);
     if (fd < 0) return -1;
     if (lseek(fd, (off_t)addr, SEEK_SET) < 0) { close(fd); return -1; }
     ssize_t n = read(fd, out, outlen - 1);
@@ -711,9 +775,7 @@ static int xproc_read_str(pid_t pid, uint64_t addr, char *out, size_t outlen) {
 }
 
 static int xproc_read_bytes(pid_t pid, uint64_t addr, void *out, size_t len) {
-    char p[64];
-    snprintf(p, sizeof(p), "/proc/%d/mem", pid);
-    int fd = open(p, O_RDONLY);
+    int fd = proc_openf(O_RDONLY, 0, "%d/mem", pid);
     if (fd < 0) return -1;
     if (lseek(fd, (off_t)addr, SEEK_SET) < 0) { close(fd); return -1; }
     ssize_t n = read(fd, out, len);
@@ -2701,9 +2763,7 @@ static void resolved_target_close(struct resolved_target *r) {
 /* Canonical path of a descriptor the supervisor holds. Fails closed on a
  * deleted or anonymous inode (readlink does not start with '/'). */
 static int fd_canonical_path(int fd, char *out, size_t outlen) {
-    char linkpath[64];
-    snprintf(linkpath, sizeof(linkpath), "/proc/self/fd/%d", fd);
-    ssize_t rl = readlink(linkpath, out, outlen - 1);
+    ssize_t rl = proc_readlinkf(out, outlen - 1, "self/fd/%d", fd);
     if (rl < 0 || (size_t)rl >= outlen - 1) { out[0] = '\0'; return -1; }
     out[rl] = '\0';
     if (out[0] != '/') { out[0] = '\0'; return -1; }
@@ -2721,9 +2781,8 @@ static int openat2_path(int dirfd, const char *path, uint64_t extra_flags) {
 
 /* v1.12.3: thread-group id of a requesting task (req.pid is a thread id). */
 static pid_t task_tgid(pid_t tid) {
-    char path[64], line[128];
-    snprintf(path, sizeof(path), "/proc/%d/status", tid);
-    FILE *f = fopen(path, "re");
+    char line[128];
+    FILE *f = proc_fopenf("%d/status", tid);
     if (!f) return -1;
     pid_t tgid = -1;
     while (fgets(line, sizeof(line), f)) {
@@ -2749,6 +2808,31 @@ static bool path_is_proc_self(const char *in, bool *thread_self) {
     return false;
 }
 
+/* v1.34: the supervisor resolves names in a container's view (its mount
+ * namespace, and so its /proc, of the container's PID namespace), set once it
+ * has entered it under the node agent; the pids the kernel gives the Warden
+ * are the node's. */
+static bool g_view_container = false;
+
+/* A process's pid as the /proc of the Warden's view numbers it: the node's
+ * own, or in a container's view the last of its NSpid (the innermost
+ * namespace's). -1 if unknown. */
+static pid_t view_pid(pid_t pid) {
+    if (!g_view_container) return pid;
+    char line[256];
+    FILE *f = proc_fopenf("%d/status", pid);
+    if (!f) return -1;
+    pid_t v = -1;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "NSpid:", 6)) continue;
+        char *s = line + 6, *e;
+        for (long x; (x = strtol(s, &e, 10)), e != s; s = e) v = (pid_t)x;
+        break;
+    }
+    fclose(f);
+    return v > 0 ? v : -1;
+}
+
 /* Rewrite a leading /proc/self or /proc/thread-self (already matched) to the
  * agent's own /proc/<tgid>[/task/<tid>], so the supervisor does not resolve it
  * to itself. Returns 0 (out filled), or -1 if it does not fit. */
@@ -2756,6 +2840,9 @@ static int rewrite_proc_self(const char *in, bool thread_self,
                              pid_t tgid, pid_t tid, char *out, size_t outlen) {
     static const char kSelf[] = "/proc/self", kThread[] = "/proc/thread-self";
     int n;
+    tgid = view_pid(tgid);                      /* v1.34 */
+    if (thread_self) tid = view_pid(tid);
+    if (tgid < 0 || tid < 0) return -1;
     if (thread_self) {
         const char *rest = in + sizeof(kThread) - 1;
         n = snprintf(out, outlen, "/proc/%d/task/%d%s", tgid, tid, rest);
@@ -2794,7 +2881,7 @@ static int check_proc_object(int fd, pid_t tid, pid_t *tgid_cache,
         *tgid_cache = task_tgid(tid);
         if (*tgid_cache < 0) return -1;
     }
-    if (n != (long)*tgid_cache) return -1;   /* the supervisor's, or another process's */
+    if (n != (long)view_pid(*tgid_cache)) return -1;   /* the supervisor's, or another process's */
     char tmp[PATH_LIMIT];
     int w = snprintf(tmp, sizeof(tmp), "/proc/self%s", end);
     if (w < 0 || (size_t)w >= sizeof(tmp) || (size_t)w >= canonlen) return -1;
@@ -2922,9 +3009,8 @@ static int resolve_target(pid_t target_pid, struct action *a,
 /* The agent's umask, so a file the supervisor creates on its behalf gets the
  * permissions the agent's own open would have produced. Falls back to 022. */
 static mode_t target_umask(pid_t pid) {
-    char path[64], line[128];
-    snprintf(path, sizeof(path), "/proc/%d/status", pid);
-    FILE *f = fopen(path, "re");
+    char line[128];
+    FILE *f = proc_fopenf("%d/status", pid);
     mode_t m = 022;
     if (!f) return m;
     while (fgets(line, sizeof(line), f)) {
@@ -2959,8 +3045,6 @@ static int materialize_target(pid_t target_pid, const struct action *a,
             fd = fcntl(r->path_fd, F_DUPFD_CLOEXEC, 0);
             return fd < 0 ? -errno : fd;
         }
-        char self[64];
-        snprintf(self, sizeof(self), "/proc/self/fd/%d", r->path_fd);
         /* Through the pinned descriptor: same inode that was decided on.
          * O_NOFOLLOW is dropped here only because /proc/self/fd/N is itself a
          * link; the agent's O_NOFOLLOW was already honoured at resolution
@@ -2971,14 +3055,14 @@ static int materialize_target(pid_t target_pid, const struct action *a,
              * apply the agent's mode and umask, as for O_CREAT. */
             mode_t old = umask(target_umask(target_pid));
             if (as_agent_enter() < 0) { umask(old); return -EACCES; }
-            fd = open(self, flags, (mode_t)(a->open_mode & 07777));
+            fd = proc_openf(flags, (mode_t)(a->open_mode & 07777), "self/fd/%d", r->path_fd);
             as_agent_leave();
             int saved = errno;
             umask(old);
             errno = saved;
         } else {
             if (as_agent_enter() < 0) return -EACCES;    /* v1.29: as the agent */
-            fd = open(self, flags, 0);
+            fd = proc_openf(flags, 0, "self/fd/%d", r->path_fd);
             as_agent_leave();
         }
     } else if (r->parent_fd >= 0) {
@@ -3115,9 +3199,7 @@ static void send_value(int notify_fd, uint64_t id, int64_t val) {
 static int xproc_write(pid_t pid, int notify_fd, uint64_t id,
                        uint64_t addr, const void *buf, size_t len) {
     if (addr == 0) return -EFAULT;
-    char p[64];
-    snprintf(p, sizeof(p), "/proc/%d/mem", pid);
-    int fd = open(p, O_WRONLY | O_CLOEXEC);
+    int fd = proc_openf(O_WRONLY, 0, "%d/mem", pid);
     if (fd < 0) return -EFAULT;
     if (!notif_id_valid(notify_fd, id)) { close(fd); return -ESRCH; }
     ssize_t n = pwrite(fd, buf, len, (off_t)addr);
@@ -3130,9 +3212,7 @@ static int xproc_write(pid_t pid, int notify_fd, uint64_t id,
  * AT_FDCWD is the agent's working directory. Returns a descriptor or -errno. */
 static int agent_fd(pid_t tid, int fd) {
     if (fd == VAREK_AT_FDCWD) {
-        char p[64];
-        snprintf(p, sizeof(p), "/proc/%d/cwd", tid);
-        int r = open(p, O_PATH | O_DIRECTORY | O_CLOEXEC);
+        int r = proc_openf(O_PATH | O_DIRECTORY, 0, "%d/cwd", tid);
         return r < 0 ? -EBADF : r;
     }
     if (fd < 0) return -EBADF;
@@ -3957,9 +4037,7 @@ static int have_cap_sys_admin(void) {
 /* The canonical path of an open descriptor, as the kernel resolved it (no
  * second lookup that could race with a rename). */
 static int fd_path(int fd, char *out, size_t n) {
-    char link[64];
-    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
-    ssize_t k = readlink(link, out, n - 1);
+    ssize_t k = proc_readlinkf(out, n - 1, "self/fd/%d", fd);
     if (k <= 0 || (size_t)k >= n - 1 || out[0] != '/') return -1;
     out[k] = '\0';
     return 0;
@@ -4027,7 +4105,7 @@ static int refuse_secret_reachable(const struct policy *p, const char *path, boo
     if (rc == 0 && (fstat(fd, &st) < 0 || fd_path(fd, rp, sizeof rp) < 0)) rc = -1;
     close(fd);
     if (rc < 0) return -1;
-    FILE *mi = fopen("/proc/self/mountinfo", "re");
+    FILE *mi = proc_fopenf("self/mountinfo");
     if (!mi) {
         fprintf(stderr, "[warden] credentials: cannot read the mounts (%s); refusing to start\n", strerror(errno));
         return -1;
@@ -4242,9 +4320,7 @@ static int open_anchor(const char *path, const struct policy *p) {
          * forwarder restarts mid-run, records written meanwhile wait in the
          * pipe (64 KiB) instead of failing with EPIPE. The Warden never reads
          * from it. */
-        char self[64];
-        snprintf(self, sizeof self, "/proc/self/fd/%d", fd);
-        int rw = open(self, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+        int rw = proc_openf(O_RDWR | O_NONBLOCK, 0, "self/fd/%d", fd);
         if (rw < 0) {
             fprintf(stderr, "[warden] anchor %s: cannot hold the FIFO open (%s)\n", path, strerror(errno));
             close(fd);
@@ -5312,7 +5388,7 @@ int main(int argc, char **argv) {
         char pb[PATH_MAX], why[PATH_MAX + 128];
         if (proxy_bin_arg) snprintf(pb, sizeof pb, "%s", proxy_bin_arg);
         else {
-            ssize_t n = readlink("/proc/self/exe", pb, sizeof pb - 16);
+            ssize_t n = proc_readlinkf(pb, sizeof pb - 16, "self/exe");
             if (n <= 0) { fprintf(stderr, "[warden] cannot find this binary's directory\n"); return 1; }
             pb[n] = '\0';
             char *sl = strrchr(pb, '/');
@@ -5422,7 +5498,7 @@ int main(int argc, char **argv) {
             char sb[PATH_MAX], why[PATH_MAX + 256];
             if (secrets_bin_arg) snprintf(sb, sizeof sb, "%s", secrets_bin_arg);
             else {
-                ssize_t n = readlink("/proc/self/exe", sb, sizeof sb - 16);
+                ssize_t n = proc_readlinkf(sb, sizeof sb - 16, "self/exe");
                 if (n <= 0) { fprintf(stderr, "[warden] cannot find this binary's directory\n"); return 1; }
                 sb[n] = '\0';
                 char *sl = strrchr(sb, '/');

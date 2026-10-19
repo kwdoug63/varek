@@ -149,9 +149,8 @@ static int sock_kind_of(int fd, struct sock_kind *k) {
 
 /* The agent's descriptor's close-on-exec flag: 1, 0, or -1 (unknown). */
 static int agent_fd_cloexec(pid_t tid, int fd) {
-    char p[64], buf[512];
-    snprintf(p, sizeof p, "/proc/%d/fdinfo/%d", tid, fd);
-    int f = open(p, O_RDONLY | O_CLOEXEC);
+    char buf[512];
+    int f = proc_openf(O_RDONLY, 0, "%d/fdinfo/%d", tid, fd);
     if (f < 0) return -1;
     ssize_t n = read(f, buf, sizeof buf - 1);
     close(f);
@@ -165,9 +164,8 @@ static int agent_fd_cloexec(pid_t tid, int fd) {
 
 /* The agent's effective uid and gid (for a Unix connect made on its behalf). */
 static int agent_creds(pid_t tid, uid_t *uid, gid_t *gid) {
-    char p[64], line[256];
-    snprintf(p, sizeof p, "/proc/%d/status", tid);
-    FILE *f = fopen(p, "re");
+    char line[256];
+    FILE *f = proc_fopenf("%d/status", tid);
     if (!f) return -1;
     int got = 0;
     while (fgets(line, sizeof line, f)) {
@@ -911,9 +909,21 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
         }
         memset(&un, 0, sizeof un);
         un.sun_family = AF_UNIX;
-        snprintf(un.sun_path, sizeof un.sun_path, "/proc/self/fd/%d", pin);
+        /* through the pin, by its name below the node's /proc, from there
+         * (v1.34: under the node agent /proc in the Warden's view is the
+         * container's, where the Warden has no entry) */
+        snprintf(un.sun_path, sizeof un.sun_path, "self/fd/%d", pin);
         un_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(un.sun_path) + 1);
-        rc = connect_as_agent(s, (struct sockaddr *)&un, un_len, uid, gid);
+        int here = open(".", O_PATH | O_DIRECTORY | O_CLOEXEC);
+        if (here < 0 || proc_dir() < 0 || fchdir(g_procfd) < 0) rc = -EACCES;
+        else {
+            rc = connect_as_agent(s, (struct sockaddr *)&un, un_len, uid, gid);
+            if (fchdir(here) < 0) {
+                fprintf(stderr, "[warden] internal error: cannot return to the Warden's directory; stopping\n");
+                abort();
+            }
+        }
+        if (here >= 0) close(here);
     } else if (a->proxy_handoff) {
         rc = proxy_dial(s, k.dom, &dial, dial_len, tid, a);
     } else {
@@ -1027,9 +1037,7 @@ static ssize_t gather_iov(pid_t tid, const struct msghdr_user *m, bool dgram, vo
     }
     char *buf = malloc(total ? total : 1);
     if (!buf) return -ENOBUFS;
-    char p[64];
-    snprintf(p, sizeof p, "/proc/%d/mem", tid);
-    int mf = open(p, O_RDONLY | O_CLOEXEC);
+    int mf = proc_openf(O_RDONLY, 0, "%d/mem", tid);
     if (mf < 0) { free(buf); return -EFAULT; }
     uint64_t off = 0;
     for (uint64_t i = 0; i < m->iovlen && off < total; i++) {
