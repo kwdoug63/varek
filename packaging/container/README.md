@@ -130,21 +130,22 @@ containers keep `container_t`. Never `label=disable`.
 
 ### Rootless Podman
 
-As a user, with the same settings, the SELinux type above, and
-`--systemd=always`:
+As a user, with the same settings and the SELinux type above:
 
 ```
 podman run --rm <the settings above> --security-opt label=type:container_init_t \
-  --systemd=always -v "$PWD":/work varek python3 agent.py
+  -v "$PWD":/work varek python3 agent.py
 ```
 
-In the user namespace a rootless container runs in, the kernel keeps the
-cgroup filesystem read-only, so the Warden cannot remount it; Podman's
-systemd mode mounts the container's own groups read-write instead, which
-sub-agents and confined MCP servers need (without them, `--systemd=always`
-may be left out). Root loads the SELinux module once, as above; its last
-two rules are for rootless, where Podman binds the host's `/dev/null` and
-`/dev/tty` into the container.
+Podman mounts a rootless container's cgroup filesystem read-only; for
+sub-agents and confined MCP servers the Warden bind-remounts it read-write
+in its own mount namespace, in the user namespace too (from v1.32.1;
+v1.32.0 needed `--systemd=always`, which mounts the container's own groups
+read-write and still works). Where the kernel refuses that remount (a mount
+locked read-only by a more privileged namespace), the Warden refuses to
+start and names `--systemd=always`. Root loads the SELinux module once, as
+above; its last two rules are for rootless, where Podman binds the host's
+`/dev/null` and `/dev/tty` into the container.
 
 ### Sub-agents and confined MCP servers
 

@@ -9,7 +9,7 @@
 #   varek/v1_4/tests/container_sweep.sh --runtime podman ...  (rootless)
 #        [--build] [--out DIR] [--caps "SYS_ADMIN SYS_PTRACE ..."]
 #        [--drop-each] [--apparmor] [--selinux] [--security-opt OPT]
-#        [--image NAME] [SUITE...]
+#        [--image NAME] [--systemd] [SUITE...]
 #
 # --build        build the test image first (packaging/container/Containerfile,
 #                --target test) from this checkout
@@ -24,6 +24,9 @@
 #                container_t
 # --security-opt OPT  passed to each container (diagnosis only: what the
 #                image documents is what the sweep shows)
+# --systemd      rootless: run the containers with --systemd=always, which
+#                v1.32.0 needed (from v1.32.1 the Warden remounts the
+#                container's read-only cgroup filesystem in a user namespace)
 # --caps LIST    the capabilities added after --cap-drop ALL (default: the
 #                list measured so far, below)
 # --drop-each    after the run with every capability, run a short set of
@@ -43,7 +46,7 @@
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-RT="" BUILD=0 OUT="" DROP=0 APPARMOR=0 SELINUX=0 SUITES=() SECOPTS=()
+RT="" BUILD=0 OUT="" DROP=0 APPARMOR=0 SELINUX=0 SUITES=() SECOPTS=() SYSTEMD=0
 CAPS="SYS_ADMIN SYS_PTRACE SETPCAP SETUID SETGID DAC_OVERRIDE KILL NET_ADMIN NET_BIND_SERVICE CHOWN"
 # what the suites themselves need to set up their cases, not VAREK: mknod
 # (a block device and a /dev/mem twin in the allowed tree)
@@ -63,6 +66,7 @@ while [ $# -gt 0 ]; do
         --image) IMAGE="$2"; shift 2 ;;
         --apparmor) APPARMOR=1; shift ;;
         --selinux) SELINUX=1; shift ;;
+        --systemd) SYSTEMD=1; shift ;;
         --security-opt) SECOPTS+=(--security-opt "$2"); shift 2 ;;
         -h|--help) sed -n '3,/^set -u$/{/^#/p}' "$0"; exit 0 ;;
         -*) echo "container_sweep.sh: unknown option $1" >&2; exit 2 ;;
@@ -116,7 +120,7 @@ fi
     echo "AppArmor: $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo absent)  SELinux: $(getenforce 2>/dev/null || echo absent)"
     echo "security options: $($RT info --format '{{.SecurityOptions}}' 2>/dev/null || $RT info 2>/dev/null | grep -A4 -i 'security' | tr '\n' ' ')"
     echo "capabilities: $CAPS"
-    [ -z "$ROOTLESS" ] || echo "rootless: as $(id -un) (uid $(id -u)); $(grep "^$(id -un):" /etc/subuid 2>/dev/null | head -1 || echo 'no /etc/subuid entry')"
+    [ -z "$ROOTLESS" ] || echo "rootless: as $(id -un) (uid $(id -u)); $(grep "^$(id -un):" /etc/subuid 2>/dev/null | head -1 || echo 'no /etc/subuid entry')$([ "$SYSTEMD" = 1 ] && echo "; --systemd=always")"
     [ ${#SECOPTS[@]} = 0 ] || echo "options: ${SECOPTS[*]}"
     if [ "$SELINUX" = 1 ]; then
         if [ -n "$ROOTLESS" ]; then echo "SELinux module: not checked (root's; semodule -l lists it)"
@@ -152,9 +156,10 @@ trap 'exit 130' INT TERM
 run_set() {
     local label="$1"; shift
     local args=(--rm --cap-drop ALL --cgroupns=private "${SECOPTS[@]}")
-    # rootless (D10): a user namespace locks the cgroup mount read-only;
-    # Podman's systemd mode mounts the container's own groups read-write
-    [ -z "$ROOTLESS" ] || args+=(--systemd=always)
+    # rootless (D10): Podman mounts the cgroup filesystem read-only, which
+    # the Warden bind-remounts from v1.32.1; --systemd (v1.32.0's way) has
+    # Podman's systemd mode mount the container's own groups read-write
+    [ -z "$ROOTLESS" ] || [ "$SYSTEMD" = 0 ] || args+=(--systemd=always)
     for c in "$@" $TEST_CAPS; do args+=(--cap-add "$c"); done
     printf '\n== %s: --cap-drop ALL%s (and, for the tests, %s)\n' "$label" "$([ $# = 0 ] || printf ' --cap-add %s' "$@")" "$TEST_CAPS" | tee -a "$OUT/summary.txt"
     printf '%-22s %-6s %6s %6s %6s %8s\n' SUITE RESULT PASS FAIL SKIP SECONDS | tee -a "$OUT/summary.txt"

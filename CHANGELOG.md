@@ -9,6 +9,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.32.1] - 2026-10-19 — Rootless Podman without `--systemd=always`
+
+A patch release of 1.32.0. In a user namespace (rootless Podman) the Warden
+bind-remounts the container's read-only cgroup filesystem read-write in its
+own mount namespace, as it does elsewhere, where 1.32.0 refused to start and
+named `--systemd=always`; measured on rootless Podman 5.8.2 after 1.32's
+second review. Refused, naming that flag, only where the kernel refuses the
+remount, or, where the container's group is not delegated to its user, at
+`--check-startup` as at a run, naming the delegation. `varek doctor` and
+`varek run` no longer fail a rootless container whose cgroup filesystem is
+read-only; their mount test also checks that groups can be made.
+`make test-v1321`; the rootless sweep, 32 of 32 without `--systemd=always`
+(`--systemd` adds it).
+`RELEASE-v1.32.1.md`.
+
 ## [1.32.0] - 2026-10-19 — Containers: an official image, Docker and Podman
 
 VAREK's image, `ghcr.io/kwdoug63/varek`: the Warden, its helpers and the
