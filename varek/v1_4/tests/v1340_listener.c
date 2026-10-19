@@ -16,6 +16,8 @@
 //   - an openat2 of that path with RESOLVE_IN_ROOT below /proc/PID/root, as
 //     the process's own user (setfsuid/setfsgid), the way the Warden opens a
 //     file as the agent (v1.29).
+// And, when the descriptor arrives, the container's mounts (D4): whether its
+// root is read-only, and each writable mount without noexec.
 // Each result is one line of LOG.
 #define _GNU_SOURCE
 #include <errno.h>
@@ -126,6 +128,29 @@ static void measure(const struct seccomp_notif *n) {
     }
 }
 
+// v1.34 step 1, D4: what the node agent can see of the container's mounts
+// when the descriptor arrives, before it answers a call: the root's options,
+// and each writable mount without noexec (from the state's pid)
+static void mounts_at_receipt(const char *state) {
+    const char *p = strstr(state, "\"pid\":");
+    if (!p) { L("mounts at receipt: no pid in the state"); return; }
+    char path[64], line[4096], writable[2048] = "";
+    snprintf(path, sizeof path, "/proc/%ld/mountinfo", strtol(p + 6, NULL, 10));
+    FILE *f = fopen(path, "r");
+    if (!f) { L("mounts at receipt: %s: %s", path, strerror(errno)); return; }
+    size_t o = 0;
+    while (fgets(line, sizeof line, f)) {
+        char mp[1024], opts[512];
+        if (sscanf(line, "%*s %*s %*s %*s %1023s %511s", mp, opts) != 2) continue;
+        int ro = !strncmp(opts, "ro", 2) && (opts[2] == ',' || !opts[2]);
+        if (!strcmp(mp, "/")) L("mounts at receipt: the root is %s (%s)", ro ? "read-only" : "WRITABLE", opts);
+        else if (!ro && !strstr(opts, "noexec") && o < sizeof writable - 64)
+            o += (size_t)snprintf(writable + o, sizeof writable - o, " %s", mp);
+    }
+    fclose(f);
+    L("mounts at receipt: writable without noexec:%s", o ? writable : " none");
+}
+
 static void serve(int sfd, int max) {
     struct seccomp_notif_sizes sz;
     if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0, &sz) < 0) { L("notif sizes: %s", strerror(errno)); return; }
@@ -186,6 +211,7 @@ int main(int argc, char **argv) {
                 memcpy(fds, CMSG_DATA(h), sizeof(int) * (size_t)nfd);
             }
         L("descriptors received: %d", nfd);
+        mounts_at_receipt(buf);
         for (int i = 0; i < nfd; i++) {
             char lp[64], t[256] = "";
             snprintf(lp, sizeof lp, "/proc/self/fd/%d", fds[i]);
