@@ -571,6 +571,13 @@ static int build(scmp_filter_ctx *out_ctx, int observe, int flags) {
     // kill(-pgid) fall to the default refusal all the same, for a run with
     // VAREK_WARDEN_NO_PIDNS=1, where -1 would reach every process of its user.
     if ((rc = allow_int_range(ctx, SCMP_SYS(kill), 0, 1, 0x7fffffffull, NULL)) < 0) goto fail;
+    // v1.33 (arm64's first CI run): getpgid(0), the caller's own process
+    // group, under every policy, as getpgrp is from v1.31.1: arm64 has no
+    // getpgrp, and glibc's getpgrp() calls getpgid(0) there, so bash could
+    // not start under a policy before 1.29. From 1.29 getpgid is admitted for
+    // any pid (kAdmit129).
+    if (!file_changes &&
+        (rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(getpgid), 1, SCMP_A0(SCMP_CMP_EQ, 0))) < 0) goto fail;
     if ((rc = add_list(ctx, kAdmit, SCMP_ACT_ALLOW)) < 0) goto fail;
     if ((rc = deny_ns_bits(ctx, SCMP_SYS(clone))) < 0) goto fail;
     if ((rc = deny_ns_bits(ctx, SCMP_SYS(unshare))) < 0) goto fail;
