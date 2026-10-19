@@ -1,0 +1,199 @@
+# SPDX-License-Identifier: MIT
+#
+# varek-mac-watch.yaml — v1.33's EC2 Mac run (docs/security/v1.33-mac-runbook.md):
+# allocate one Mac host as soon as one is free, while no one is watching.
+#
+# Every 10 minutes a function tries, in order, the (region, Mac type) pairs in
+# Candidates, each zone that offers it. A region whose Mac host limit is not
+# approved yet just fails (HostLimitExceeded) and is tried again next time. On
+# the first host allocated it launches the newest macOS 15 (Sequoia) arm64 AMI
+# on it, with the key pair (imported in each region beforehand) and an
+# ssh-only security group, emails the address given, and turns itself off. It
+# never allocates a second host: any Mac host in a candidate region ends the
+# search (one it made is launched on). It also turns itself off after Hours.
+#
+# Made from AWS CloudShell, in us-east-1 (docs/security/v1.33-mac-runbook.md):
+#   aws cloudformation deploy --region us-east-1 --stack-name varek-mac-watch \
+#     --template-file varek-mac-watch.yaml --capabilities CAPABILITY_IAM \
+#     --parameter-overrides SshCidr=203.0.113.7/32 Email=you@example.com
+# Removed (the host and the Mac are not touched):
+#   aws cloudformation delete-stack --region us-east-1 --stack-name varek-mac-watch
+AWSTemplateFormatVersion: "2010-09-09"
+Description: VAREK v1.33 - allocate one EC2 Mac host when one is free, launch macOS on it, then stop
+Parameters:
+  SshCidr:
+    Type: String
+    Description: Where ssh may come from (your laptop's address, /32), for a security group this makes
+    AllowedPattern: "^[0-9]{1,3}(\\.[0-9]{1,3}){3}/(3[0-2]|[12][0-9]|[0-9])$"
+  Email:
+    Type: String
+    Description: Where to say the Mac is up (confirm AWS's subscription email first)
+  Candidates:
+    Type: String
+    Default: "us-east-1:mac2.metal,us-east-1:mac2-m2.metal,us-east-2:mac2.metal,us-west-2:mac2.metal"
+    Description: region:instance-type pairs, in the order tried
+  KeyName:
+    Type: String
+    Default: varek-sweep-key
+    Description: The key pair, imported in each candidate region beforehand
+  SecurityGroupName:
+    Type: String
+    Default: launch-wizard-3
+    Description: Used where it exists; elsewhere varek-mac-ssh is made (ssh from SshCidr only)
+  Hours:
+    Type: Number
+    Default: 36
+    Description: Stop searching after this many hours
+Resources:
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref Email
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: mac-watch
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeHosts
+                  - ec2:AllocateHosts
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeInstanceTypeOfferings
+                  - ec2:DescribeSecurityGroups
+                  - ec2:CreateSecurityGroup
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeImages
+                  - ec2:DescribeInstances
+                  - ec2:RunInstances
+                  - ec2:CreateTags
+                Resource: "*"
+              - Effect: Allow
+                Action: events:DisableRule
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/varek-mac-watch"
+              - Effect: Allow
+                Action: lambda:GetFunctionConfiguration
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:varek-mac-watch"
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref Topic
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: varek-mac-watch
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt Role.Arn
+      Environment:
+        Variables:
+          CANDIDATES: !Ref Candidates
+          SSH_CIDR: !Ref SshCidr
+          KEY_NAME: !Ref KeyName
+          SG_NAME: !Ref SecurityGroupName
+          TOPIC: !Ref Topic
+          RULE: varek-mac-watch
+          DEADLINE: !Ref Hours
+      Code:
+        ZipFile: |
+          import boto3, calendar, os, time
+          from botocore.exceptions import ClientError
+          E = os.environ
+          TAG = "varek-mac-watch"
+          def F(n, *v):
+              return {"Name": n, "Values": list(v)}
+          def say(m):
+              print(m)
+              boto3.client("sns").publish(TopicArn=E["TOPIC"], Subject="VAREK Mac", Message=m)
+          def stop():
+              boto3.client("events").disable_rule(Name=E["RULE"])
+          def macs(ec2):
+              hs = [h for h in ec2.describe_hosts()["Hosts"] if h["State"] in ("available", "pending", "under-assessment")
+                    and h.get("HostProperties", {}).get("InstanceType", "").startswith("mac")]
+              return sorted(hs, key=lambda h: {"Key": "Name", "Value": TAG} not in h.get("Tags", []))
+          def group(ec2, vpc):
+              for n in (E["SG_NAME"], "varek-mac-ssh"):
+                  g = ec2.describe_security_groups(Filters=[F("group-name", n), F("vpc-id", vpc)])["SecurityGroups"]
+                  if g:
+                      return g[0]["GroupId"]
+              g = ec2.create_security_group(GroupName="varek-mac-ssh", Description="ssh to the VAREK Mac", VpcId=vpc)["GroupId"]
+              ec2.authorize_security_group_ingress(GroupId=g, IpPermissions=[{"IpProtocol": "tcp", "FromPort": 22,
+                  "ToPort": 22, "IpRanges": [{"CidrIp": E["SSH_CIDR"]}]}])
+              return g
+          def launch(ec2, region, h):
+              live = F("instance-state-name", "pending", "running", "stopping", "stopped")
+              if [i for r in ec2.describe_instances(Filters=[F("tag:Name", "varek-mac"), live])["Reservations"] for i in r["Instances"]]:
+                  return
+              az, it = h["AvailabilityZone"], h["HostProperties"]["InstanceType"]
+              sn = ec2.describe_subnets(Filters=[F("availability-zone", az), F("default-for-az", "true")])["Subnets"][0]
+              im = ec2.describe_images(Owners=["amazon"], Filters=[F("name", "amzn-ec2-macos-15.*"),
+                  F("architecture", "arm64_mac"), F("state", "available")])["Images"]
+              im = max(im, key=lambda i: i["CreationDate"])
+              r = ec2.run_instances(ImageId=im["ImageId"], InstanceType=it, KeyName=E["KEY_NAME"], MinCount=1, MaxCount=1,
+                  ClientToken=h["HostId"], Placement={"Tenancy": "host", "HostId": h["HostId"]},
+                  NetworkInterfaces=[{"DeviceIndex": 0, "SubnetId": sn["SubnetId"], "Groups": [group(ec2, sn["VpcId"])],
+                                      "AssociatePublicIpAddress": True}],
+                  MetadataOptions={"HttpTokens": "required"},
+                  TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": "varek-mac"}]}])
+              say(f"Host {h['HostId']} ({it}, {az}): instance {r['Instances'][0]['InstanceId']} ({im['Name']}) "
+                  f"launched. EC2 console, {region}: wait for 2/2 checks; note its public IPv4.")
+          def handler(event, context):
+              cands = [c.split(":") for c in E["CANDIDATES"].split(",")]
+              for region, _ in cands:
+                  ec2 = boto3.client("ec2", region_name=region)
+                  hs = macs(ec2)
+                  if hs:
+                      if {"Key": "Name", "Value": TAG} in hs[0].get("Tags", []):
+                          launch(ec2, region, hs[0])
+                      else:
+                          say(f"A Mac host is in {region} already ({hs[0]['HostId']}): none allocated.")
+                      return stop()
+              lm = boto3.client("lambda").get_function_configuration(FunctionName=context.function_name)["LastModified"]
+              if time.time() > calendar.timegm(time.strptime(lm[:19], "%Y-%m-%dT%H:%M:%S")) + float(E["DEADLINE"]) * 3600:
+                  say("No Mac host was free; the search has stopped.")
+                  return stop()
+              for region, it in cands:
+                  ec2 = boto3.client("ec2", region_name=region)
+                  offers = ec2.describe_instance_type_offerings(LocationType="availability-zone", Filters=[F("instance-type", it)])
+                  for az in sorted(o["Location"] for o in offers["InstanceTypeOfferings"]):
+                      try:
+                          hid = ec2.allocate_hosts(AvailabilityZone=az, InstanceType=it, Quantity=1, TagSpecifications=[
+                              {"ResourceType": "dedicated-host", "Tags": [{"Key": "Name", "Value": TAG}]}])["HostIds"][0]
+                      except ClientError as e:
+                          print(region, it, az, e.response["Error"]["Code"])
+                          continue
+                      launch(ec2, region, ec2.describe_hosts(HostIds=[hid])["Hosts"][0])
+                      return stop()
+  Schedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: varek-mac-watch
+      ScheduleExpression: rate(10 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt Function.Arn
+          Id: mac-watch
+  Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt Schedule.Arn
+Outputs:
+  Function:
+    Value: !Ref Function
