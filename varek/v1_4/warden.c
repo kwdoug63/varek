@@ -756,6 +756,27 @@ static int proc_statf(struct stat *st, const char *fmt, ...) {
     return r < 0 ? -1 : fstatat(g_procfd, rel, st, 0);
 }
 
+/* v1.34 step 2: the container a node agent's supervisor supervises
+ * (warden_node.inc.c); off in a run the Warden starts itself */
+struct node_run {
+    bool   on;                  /* this process supervises a container a runtime started */
+    int    notify_fd;
+    pid_t  pid;                 /* the container's init, as the node numbers it */
+    int    pidfd;               /* that process itself, opened as the state arrived */
+    char   id[128];             /* the container's id */
+    char   bundle[PATH_MAX];
+    char   meta[256];           /* the profile's listenerMetadata */
+    char   pod_ns[256], pod_name[256], pod_uid[128], ctr[256];
+    char   argv0[PATH_MAX];     /* the container's command: its first launch */
+    uid_t  uid;                 /* the agent's, read from its process */
+    gid_t  gid;
+    gid_t  groups[256];         /* its supplementary groups, from its process too */
+    int    ngroups;
+    long   before_exec;         /* the runtime's own calls before that launch, let through */
+};
+static struct node_run g_nr = { .notify_fd = -1, .pidfd = -1 };
+static void node_run_start(FILE *f);
+
 /* ---------------- cross-process memory ---------------- */
 
 static int xproc_read_str(pid_t pid, uint64_t addr, char *out, size_t outlen) {
@@ -2044,6 +2065,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
         fprintf(f, "\"checkpoint_every\":%" PRIu64 ",", g_ckpt_every);
     if (g_anchor_fd >= 0) fputs("\"anchored\":true,", f);
     /* v1.24: the names the Warden resolves (each gets a resolution record). */
+    node_run_start(f);                                                   /* v1.34 step 2 */
     if (g_policy_any_name) fputs("\"host_name_rules\":true,", f);
     /* v1.25: the lists the policy's wildcards were checked against */
     if (g_psl_sha[0]) fprintf(f, "\"psl_sha256\":\"%s\",\"shared_domains_sha256\":\"%s\","
@@ -2399,8 +2421,10 @@ static void emit_run_end(int exit_status) {
     emit_unanswered();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    char dry_count[48] = "";
+    char dry_count[96] = "";
     if (g_dry) snprintf(dry_count, sizeof dry_count, "\"not_enforced\":%" PRIu64 ",", g_dry_unenforced);
+    else if (g_nr.on)                     /* v1.34 step 2: the runtime's own, let through */
+        snprintf(dry_count, sizeof dry_count, "\"runtime_calls_before_exec\":%ld,", g_nr.before_exec);
     FILE *f = rec_begin();
     fprintf(f, "{\"event\":\"run_end\",\"run\":\"%s\",\"records\":%" PRIu64 ","
                "\"exit_status\":%d,%s%s%s%s%s\"timestamp_ns\":%lld}\n",
@@ -2813,6 +2837,7 @@ static bool path_is_proc_self(const char *in, bool *thread_self) {
  * has entered it under the node agent; the pids the kernel gives the Warden
  * are the node's. */
 static bool g_view_container = false;
+
 
 /* A process's pid as the /proc of the Warden's view numbers it: the node's
  * own, or in a container's view the last of its NSpid (the innermost
@@ -3612,6 +3637,18 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
 
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        /* v1.34 step 2: under the node agent, until the container's first
+         * launch, the calls of the container's init are the runtime's own
+         * (its checks of /proc before it executes the command), made before
+         * any of the container's code runs: let through and counted, as the
+         * calls of the Warden's own child before its exec are on a host */
+        if (g_nr.on && !bootstrap_done && req.data.nr != __NR_execve && req.data.nr != __NR_execveat &&
+            task_tgid((pid_t)req.pid) == bootstrap_pid && notif_id_valid(notify_fd, req.id)) {
+            g_nr.before_exec++;
+            send_simple(notify_fd, req.id, DEC_ALLOW);
+            continue;
+        }
 
         struct exec_ctx *ctx = ctx_get(req.pid);
         if (ctx) ctx->seq++;
@@ -5143,6 +5180,8 @@ static void usage(const char *argv0) {
         stderr);
 }
 
+#include "warden_node.inc.c"         /* v1.34 step 2: the node agent */
+
 int main(int argc, char **argv) {
     /* v1.24: the resolver helper is this program re-executed (a clean address
      * space, without the signing key); see warden_resolve.h. */
@@ -5182,6 +5221,7 @@ int main(int argc, char **argv) {
     const char *psl_arg = NULL, *shared_arg = NULL;   /* v1.25 */
     wr_config_default(&dns_cfg);
     int sep_idx = -1;
+    const char *node_sock = NULL, *node_streams = NULL;                     /* v1.34 step 2 */
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) { sep_idx = i; break; }
@@ -5203,6 +5243,10 @@ int main(int argc, char **argv) {
             anchor_path = argv[++i];
         } else if (strcmp(argv[i], "--dry-run") == 0) {                  /* v1.29 */
             g_dry = true;
+        } else if (strcmp(argv[i], "--node-agent") == 0 && !node_sock && i + 1 < argc) {   /* v1.34 step 2 */
+            node_sock = argv[++i];
+        } else if (strcmp(argv[i], "--node-streams") == 0 && !node_streams && i + 1 < argc) {
+            node_streams = argv[++i];
         } else if (strcmp(argv[i], "--writable-exec") == 0) {            /* v1.27.1 */
             g_writable_exec = true;
         } else if (strcmp(argv[i], "--run-as") == 0 && !run_as_arg) {
@@ -5265,7 +5309,13 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!g_check_only && (sep_idx < 0 || sep_idx + 1 >= argc)) { usage(argv[0]); return 2; }
+    if (node_sock && (sep_idx >= 0 || g_check_only || !node_streams)) {   /* v1.34 step 2 */
+        fprintf(stderr, "[warden] --node-agent takes --node-streams DIR, and no agent (\"--\") or check\n");
+        return 2;
+    }
+    if (node_sock && node_listen(node_sock, node_streams) < 0) return 1;
+    /* from here, under the node agent, the supervisor of one container */
+    if (!g_check_only && !g_nr.on && (sep_idx < 0 || sep_idx + 1 >= argc)) { usage(argv[0]); return 2; }
     if (flow_path && !plan_path && !g_check_only) {
         fprintf(stderr, "[warden] --flow-policy checks a plan; give --plan too\n");
         return 2;
@@ -5289,10 +5339,17 @@ int main(int argc, char **argv) {
                 run_as_arg ? run_as_arg : "nobody");
         return 2;
     }
+    if (g_nr.on) {                                                       /* v1.34 step 2 */
+        ra.uid = g_nr.uid;
+        ra.gid = g_nr.gid;
+        ra.drop = g_nr.uid != 0;
+        if (ra.drop && ra.gid == 0) node_fail("an unprivileged user in group 0 (root)");
+    }
     if (!ra.drop)
         fprintf(stderr, "[warden] WARNING: --run-as root: the agent runs as root with every "
                 "capability (the pre-v1.17 behaviour); only the seccomp filter holds it back\n");
     static char boot_path[PATH_MAX];
+    if (g_nr.on) snprintf(boot_path, sizeof boot_path, "%s", g_nr.argv0);   /* v1.34: in the container's view */
     if (target_argv && find_program(target_argv[0], boot_path, sizeof boot_path) < 0) {
         fprintf(stderr, "[warden] %s: program not found (or not a regular file)\n", target_argv[0]);
         return 127;
@@ -5352,6 +5409,14 @@ int main(int argc, char **argv) {
     if (flow_path && flow_setup(&p, flow_path, state_arg, session_arg, gstatus_arg) < 0)
         return 1;                                                           /* v1.18.0 */
     if (names_setup(&p, &dns_cfg) < 0) return 1;                            /* v1.24 */
+    if (g_nr.on) {                                                         /* v1.34 step 2 */
+        const char *no = node_unsupported(&p, g_dry, plan_path, flow_path, obo_arg, svid_arg, g_trust_bundle_arg);
+        if (no) {
+            char why[256];
+            snprintf(why, sizeof why, "%s is not carried under the node agent yet", no);
+            node_fail(why);
+        }
+    }
     if (wildcards_check(policy_path, &p, psl_arg, shared_arg) < 0) return 1;            /* v1.25 */
     g_inspect_on = p.v.proxy_inspect;                                      /* v1.26.1 */
     if (g_any_name || g_inspect_on) views_setup();
@@ -5728,8 +5793,10 @@ int main(int argc, char **argv) {
     }
     /* v1.29 step 1: files opened as the agent (require warden 1.29) */
     g_changes_on = p.v.open_as_agent;                                /* v1.29 */
-    if (as_agent_setup(p.v.open_as_agent, ra.drop, ra.uid, ra.gid, run_as_arg ? run_as_arg : "nobody") < 0)
+    if (as_agent_setup(p.v.open_as_agent, ra.drop, ra.uid, ra.gid,
+                       g_nr.on ? NULL : run_as_arg ? run_as_arg : "nobody") < 0)
         return 1;
+    if (g_nr.on) node_as_agent_groups();                                  /* v1.34 step 2 */
     /* v1.28.1 step 3: sub-agents need cgroup v2 (a check makes no group) */
     if (g_check_only && sub_setup(&p, true, !ra.drop) < 0) return 1;
     if (g_check_only) {
@@ -5752,7 +5819,7 @@ int main(int argc, char **argv) {
         if (g_sk) sodium_free(g_sk);
         return 0;
     }
-    if (!target_argv) { usage(argv[0]); return 2; }
+    if (!target_argv && !g_nr.on) { usage(argv[0]); return 2; }
     /* A FIFO anchor whose reader went away must fail the write (EPIPE, then
      * an anchor_error record), not kill the Warden. The agent gets the
      * default disposition back before it runs (see the child below). */
@@ -5826,6 +5893,8 @@ int main(int argc, char **argv) {
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGCHLD, &sa, NULL);
+
+    if (g_nr.on) return node_supervise(&p, boot_path);                      /* v1.34 step 2 */
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
