@@ -781,6 +781,7 @@ struct node_run {
 };
 static struct node_run g_nr = { .notify_fd = -1, .pidfd = -1 };
 static void node_run_start(FILE *f);
+static void node_fail(const char *why) __attribute__((noreturn));
 
 /* ---------------- cross-process memory ---------------- */
 
@@ -1773,6 +1774,7 @@ static unsigned char *g_sk;                /* sodium_malloc: guarded, locked, no
 static int           g_anchor_fd = -1;
 static bool          g_anchor_fifo = false;  /* v1.16.2: held read-write; drained at exit */
 static char          g_anchor_lock[PATH_MAX + 8];  /* v1.16.2: the forwarder's liveness lock */
+static int           g_anchor_lock_dir = -1;        /* v1.34 review: its directory, held (the node's) */
 static uint64_t      g_ckpt_every = 64;
 static uint64_t      g_since_ckpt = 0;      /* decision records since the last signed record */
 static struct timespec g_last_ckpt;         /* CLOCK_MONOTONIC */
@@ -3679,6 +3681,15 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             send_simple(notify_fd, req.id, DEC_ALLOW);
             continue;
         }
+        /* review: before the container's first launch only its init calls
+         * (the runtime's init, before it executes the command; the runtime's
+         * hooks run outside the filter): a call from another process then
+         * is not the runtime's, and the container is ended */
+        if (g_nr.on && !bootstrap_done) {
+            pid_t tg = task_tgid((pid_t)req.pid);
+            if (tg > 0 && tg != bootstrap_pid)
+                node_fail("a process other than the container's init made a call before the container's command ran");
+        }
 
         struct exec_ctx *ctx = ctx_get(req.pid);
         if (ctx) ctx->seq++;
@@ -4351,6 +4362,16 @@ static int forwarder_alive(const char *fifo) {
     int fd = open(lp, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return -1;
     snprintf(g_anchor_lock, sizeof g_anchor_lock, "%s", lp);
+    if (g_anchor_lock_dir < 0) {
+        /* the lock is opened again at the end through its directory, held
+         * from here: under the node agent the Warden is in the container's
+         * mount namespace by then, where the name is the container's */
+        char d[PATH_MAX + 8];
+        snprintf(d, sizeof d, "%s", lp);
+        char *sl = strrchr(d, '/');
+        if (sl == d) d[1] = '\0'; else if (sl) *sl = '\0'; else snprintf(d, sizeof d, ".");
+        g_anchor_lock_dir = open(d, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    }
     /* A shared probe: it conflicts only with the forwarder's exclusive lock,
      * never with another probe. */
     int r = flock(fd, LOCK_SH | LOCK_NB) == 0 ? 0 : (errno == EWOULDBLOCK ? 1 : -1);
@@ -4426,7 +4447,10 @@ static void anchor_drain(void) {
         /* A live forwarder holds the pipe itself: what is left is safe with
          * it (it may just be busy sending). */
         if (g_anchor_lock[0]) {
-            int fd = open(g_anchor_lock, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            const char *base = strrchr(g_anchor_lock, '/');
+            int fd = g_anchor_lock_dir >= 0 ? openat(g_anchor_lock_dir, base ? base + 1 : g_anchor_lock,
+                                                     O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+                                            : open(g_anchor_lock, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
             if (fd >= 0) {
                 int busy = flock(fd, LOCK_SH | LOCK_NB) != 0 && errno == EWOULDBLOCK;
                 close(fd);
@@ -5828,7 +5852,7 @@ int main(int argc, char **argv) {
     if (as_agent_setup(p.v.open_as_agent, ra.drop, ra.uid, ra.gid,
                        g_nr.on ? NULL : run_as_arg ? run_as_arg : "nobody") < 0)
         return 1;
-    if (g_nr.on) node_as_agent_groups();                                  /* v1.34 step 2 */
+    if (g_nr.on) node_as_agent();                                         /* v1.34 step 2 (review) */
     /* v1.28.1 step 3: sub-agents need cgroup v2 (a check makes no group) */
     if (g_check_only && sub_setup(&p, true, !ra.drop) < 0) return 1;
     if (g_check_only) {

@@ -8,7 +8,8 @@
 #   1. the node agent's options: --node-streams required, no agent, no check;
 #   2. a container, its command a static probe (tests/v1340_probe.c), as user
 #      65534 with no new privileges and a read-only root: a read the policy
-#      allows, one it does not name and a write it does not allow, its own
+#      allows, one it does not name, one it allows of a file only root may
+#      read (opened as the container's user), a write it does not allow, its own
 #      /proc/self (in the container's /proc), a connect and a second launch,
 #      each decided in the container's view; its stream (DIR/<container>...):
 #      run_start names the container, its command and user; the command is
@@ -16,7 +17,13 @@
 #   3. a second container under the same node agent, its own stream;
 #   4. refused at the start, the container ended: a policy with what this
 #      step does not carry (a host-name rule), a command named without an
-#      absolute path, a container with new privileges allowed.
+#      absolute path, a container with new privileges allowed, a container
+#      running as root;
+#   5. the listener (review): a supervisor killed ends its container; a
+#      socket in a directory others can reach is
+#      refused; a state sent by a process that is not the runtime, with a
+#      descriptor that is not a seccomp listener, naming a process, is
+#      refused and that process is not killed.
 #
 #   test_v1340.sh VDP_CHECK VDP_CERT_CHECK WARDEN
 set -u
@@ -54,24 +61,26 @@ if [ "$(id -u)" != 0 ] || [ -z "$WARDEN" ] || [ -z "$RUNC" ] || [ -z "$ARCH" ] |
 fi
 B="$(mktemp -d /tmp/varek_v1340.XXXXXX)"; chmod 755 "$B"
 mkdir -p "$B/streams" "$B/state" "$B/f" "$B/rootfs/data" "$B/rootfs/proc" "$B/rootfs/dev" "$B/rootfs/tmp"
+mkdir -m 700 "$B/s"                          # the sockets' directory: root's alone
 mv /tmp/varek_v1340_probe.$$ "$B/rootfs/probe"; mv /tmp/varek_v1340_ocif.$$ "$B/ocif"
 chmod 755 "$B/rootfs/probe"
 echo "allowed content" > "$B/rootfs/data/allowed"; echo "secret" > "$B/rootfs/data/denied"; chmod 644 "$B/rootfs/data/"*
+echo "root's" > "$B/rootfs/data/rootonly"; chmod 600 "$B/rootfs/data/rootonly"
 "$B/ocif" 1 "$B/f" > /dev/null || { flunk "the filter's OCI form"; exit 1; }
-printf 'allow path /data/allowed readonly\nallow path /proc/self/status readonly\n' > "$B/p.txt"
+printf 'allow path /data/allowed readonly\nallow path /data/rootonly readonly\nallow path /proc/self/status readonly\n' > "$B/p.txt"
 printf 'require warden 1.24\nallow path /data/allowed readonly\nallow host example.com:443\n' > "$B/p_names.txt"
 
-# a bundle: NAME POLICY-SOCKET ARGV0 NNP
+# a bundle: NAME POLICY-SOCKET ARGV0 NNP [UID]
 bundle() {
     mkdir -p "$B/b-$1" && (cd "$B/b-$1" && "$RUNC" spec >/dev/null)
-    python3 - "$B/b-$1/config.json" "$B/f/oci.json" "$2" "$3" "$4" "$ARCH" "$B/rootfs" <<'PY'
+    python3 - "$B/b-$1/config.json" "$B/f/oci.json" "$2" "$3" "$4" "$ARCH" "$B/rootfs" "${5:-65534}" <<'PY'
 import json, sys
-cfg, flt, sock, argv0, nnp, arch, root = sys.argv[1:]
+cfg, flt, sock, argv0, nnp, arch, root, uid = sys.argv[1:]
 c = json.load(open(cfg)); f = json.load(open(flt))
 f.pop("warden_badarch", None); f["architectures"] = [arch]
 for s in f["syscalls"]: s.pop("nr", None)
 f["listenerPath"] = sock; f["listenerMetadata"] = "varek-test/" + cfg.split("/")[-2]
-c["process"].update(terminal=False, args=[argv0], env=["PATH=/"], user={"uid": 65534, "gid": 65534},
+c["process"].update(terminal=False, args=argv0.split(), env=["PATH=/"], user={"uid": int(uid), "gid": int(uid)},
                     noNewPrivileges=nnp == "1", cwd="/")
 c["root"] = {"path": root, "readonly": True}
 c["linux"]["seccomp"] = f
@@ -81,9 +90,9 @@ PY
 # an agent: NAME POLICY
 agent() {
     mkdir -p "$B/streams-$1"
-    "$WARDEN" "$2" --node-agent "$B/$1.sock" --node-streams "$B/streams-$1" > "$B/$1.log" 2>&1 &
+    "$WARDEN" "$2" --node-agent "$B/s/$1.sock" --node-streams "$B/streams-$1" > "$B/$1.log" 2>&1 &
     AGENTS="$AGENTS $!"
-    for _ in $(seq 50); do [ -S "$B/$1.sock" ] && return 0; sleep 0.1; done
+    for _ in $(seq 50); do [ -S "$B/s/$1.sock" ] && return 0; sleep 0.1; done
     return 1
 }
 run() { (cd "$B/b-$1" && timeout 60 "$RUNC" --root "$B/state" run "v1340-$1" > "$B/$1.out" 2>&1); echo $? > "$B/$1.rc"; sleep 0.5; }
@@ -99,45 +108,79 @@ PY
 
 echo "== 2. a container under the node agent =="
 check "the node agent listens" agent a "$B/p.txt"
-bundle one "$B/a.sock" /probe 1
+bundle one "$B/s/a.sock" /probe 1
 run one
 sed 's/^/     /' "$B/one.out"
 check "the container's command ran (the first launch)" grep -q '^read_allowed:' "$B/one.out"
 check "a read the policy allows" said one "read_allowed: ok allowed content"
 check "a read it does not name is refused" said one "read_denied: EACCES"
 check "a write it does not allow is refused" said one "write_allowed: EACCES"
+check "a file it allows that only root may read: refused (opened as the container's user)" said one "read_rootonly: EACCES"
 check "its own /proc/self, in the container's /proc" sh -c "grep -q '^proc_self: ok Name:' '$B/one.out'"
 check "a connect with no rule is refused" said one "connect: EACCES"
 check "a second launch is refused (launches not decided)" said one "exec_again: EACCES"
 S1="$(stream a one)"
 check "its stream, named by the container" test -s "$S1"
-check "run_start names the container, its command and its user" rec a one \
-    'S and S[0]["node"]["container"] == "v1340-one" and S[0]["node"]["command"] == "/probe" and S[0]["node"]["uid"] == 65534 and S[0]["node"]["metadata"] == "varek-test/b-one"'
+check "run_start names the container, its command, its user, and that files are opened as it" rec a one \
+    'S and S[0]["node"]["container"] == "v1340-one" and S[0]["node"]["command"] == "/probe" and S[0]["node"]["uid"] == 65534 and S[0]["node"]["metadata"] == "varek-test/b-one" and S[0]["node"]["opens_as_agent"] is True'
 check "the command is the first launch" rec a one 'any(r.get("rule") == "bootstrap_exec_allow" and r.get("target") == "/probe" for r in R)'
 check "the refused read is decided by name in the container's view" rec a one \
     'any(r.get("target") == "/data/denied" and r.get("resolved") == "/data/denied" and r.get("decision_final") == "DENY" for r in R)'
 check "run_end counts the runtime's own calls before the command" rec a one 'E and E[0]["runtime_calls_before_exec"] > 0 and E[0]["exit_status"] == -1'
 
 echo "== 3. a second container under the same node agent =="
-bundle two "$B/a.sock" /probe 1
+bundle two "$B/s/a.sock" /probe 1
 run two
 check "it ran, decided the same" said two "read_denied: EACCES"
 check "its own stream" sh -c "[ -s '$(stream a two)' ] && [ '$(stream a two)' != '$S1' ]"
 
 echo "== 4. refused at the start, the container ended =="
 check "a second node agent, with a host-name rule in its policy" agent n "$B/p_names.txt"
-bundle names "$B/n.sock" /probe 1
+bundle names "$B/s/n.sock" /probe 1
 run names
 check "a policy with what this step does not carry: refused, the container ended" sh -c \
     "! grep -q '^read_allowed' '$B/names.out' && grep -q 'refused: host-name rules (with step 4, the pod.s network) is not carried' '$(stream n names)'"
-bundle rel "$B/a.sock" probe 1
+bundle rel "$B/s/a.sock" probe 1
 run rel
 check "a command named without an absolute path: refused" sh -c \
     "! grep -q '^read_allowed' '$B/rel.out' && grep -q 'must be named by an absolute path' '$(stream a rel)'"
-bundle nnp "$B/a.sock" /probe 0
+bundle nnp "$B/s/a.sock" /probe 0
 run nnp
 check "a container with new privileges allowed: refused" sh -c \
     "! grep -q '^read_allowed' '$B/nnp.out' && grep -q 'without no_new_privs' '$(stream a nnp)'"
+bundle root "$B/s/a.sock" /probe 1 0
+run root
+check "a container running as root: refused" sh -c \
+    "! grep -q '^read_allowed' '$B/root.out' && grep -q 'runs as root' '$(stream a root)'"
+
+echo "== 5. the listener =="
+bundle wait "$B/s/a.sock" "/probe wait" 1
+( run wait ) &
+for _ in $(seq 100); do grep -q '^waiting' "$B/wait.out" 2>/dev/null && break; sleep 0.1; done
+SUP="$(stream a wait | sed 's/.*\.\([0-9]*\)\.jsonl$/\1/')"
+[ -n "$SUP" ] && kill -9 "$SUP"
+for _ in $(seq 100); do [ -s "$B/wait.rc" ] && break; sleep 0.1; done
+check "a supervisor killed: its container ended (the listener holds the container)" sh -c \
+    "grep -q '^waiting' '$B/wait.out' && [ -s '$B/wait.rc' ] && grep -q 'supervisor $SUP ended (signal 9): its container ended' '$B/a.log'"
+mkdir -m 755 "$B/open"
+"$WARDEN" "$B/p.txt" --node-agent "$B/open/x.sock" --node-streams "$B/streams" > "$B/open.log" 2>&1; orc=$?
+check "a socket in a directory others can reach: refused at the start" sh -c \
+    "[ $orc != 0 ] && grep -q 'must be root.s, with no access for others' '$B/open.log' && [ ! -S '$B/open/x.sock' ]"
+sleep 300 & VICTIM=$!
+python3 - "$B/s/a.sock" "$VICTIM" > "$B/forge.out" 2>&1 <<'PY'
+import json, os, socket, sys
+r, w = os.pipe()
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+st = {"ociVersion": "1.2.1", "fds": ["seccompFd"], "pid": int(sys.argv[2]), "metadata": "",
+      "state": {"ociVersion": "1.2.1", "id": "forged", "status": "creating", "pid": int(sys.argv[2]), "bundle": "/nonexistent"}}
+socket.send_fds(s, [json.dumps(st).encode()], [r])
+s.close()
+PY
+sleep 1
+check "a state from a process that is not the runtime: refused" grep -q 'a connection refused: the descriptor sent is not a seccomp listener' "$B/a.log"
+check "... and the process it names is not killed" kill -0 "$VICTIM"
+kill "$VICTIM" 2>/dev/null
 check "the node agent is still listening" sh -c "kill -0 ${AGENTS%% *} 2>/dev/null || kill -0 \$(echo $AGENTS | cut -d' ' -f1)"
 
 echo

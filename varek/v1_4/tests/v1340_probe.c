@@ -4,10 +4,13 @@
 // "NAME: <errno name>":
 //   read_allowed   /data/allowed, which the policy allows to read
 //   read_denied    /data/denied, which it does not name
+//   read_rootonly  /data/rootonly, which it allows, root's alone (0600):
+//                  opened as the container's user, refused
 //   write_allowed  /data/allowed for writing (a read-only rule)
 //   proc_self      /proc/self/status (resolved in the container's /proc)
 //   connect        127.0.0.1:9 (no connect rule)
 //   exec_again     itself (a launch after the first, launches not decided)
+// With the argument "wait" it prints "waiting" and waits.
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -42,10 +45,12 @@ static void readf(const char *name, const char *path) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "wait")) { printf("waiting\n"); fflush(stdout); for (;;) sleep(1); }
     if (argc > 1) { printf("exec_again: ran\n"); return 0; }
     setvbuf(stdout, NULL, _IONBF, 0);
     readf("read_allowed", "/data/allowed");
     readf("read_denied", "/data/denied");
+    readf("read_rootonly", "/data/rootonly");
     int w = open("/data/allowed", O_WRONLY);
     printf("write_allowed: %s\n", w >= 0 ? "ok" : en(errno));
     if (w >= 0) close(w);
