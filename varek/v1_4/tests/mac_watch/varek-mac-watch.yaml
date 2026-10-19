@@ -5,12 +5,14 @@
 #
 # Every 10 minutes a function tries, in order, the (region, Mac type) pairs in
 # Candidates, each zone that offers it. A region whose Mac host limit is not
-# approved yet just fails (HostLimitExceeded) and is tried again next time. On
-# the first host allocated it launches the newest macOS 15 (Sequoia) arm64 AMI
-# on it, with the key pair (imported in each region beforehand) and an
-# ssh-only security group, emails the address given, and turns itself off. It
-# never allocates a second host: any Mac host in a candidate region ends the
-# search (one it made is launched on). It also turns itself off after Hours.
+# approved yet just fails (HostLimitExceeded) and is tried again next time.
+# Once the host it allocated is available (a later run: a launch on a host not
+# yet ready is ended by AWS, as on October 19), it launches the newest macOS
+# 15 (Sequoia) arm64 AMI on it, with the key pair (imported in each region
+# beforehand) and an ssh-only security group, emails the address given, and
+# turns itself off. It never allocates a second host: any Mac host in a
+# candidate region ends the search (one it made is launched on). It also
+# turns itself off after Hours.
 #
 # Made from AWS CloudShell, in us-east-1 (docs/security/v1.33-mac-runbook.md):
 #   aws cloudformation deploy --region us-east-1 --stack-name varek-mac-watch \
@@ -149,8 +151,8 @@ Resources:
                                       "AssociatePublicIpAddress": True}],
                   MetadataOptions={"HttpTokens": "required"},
                   TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": "varek-mac"}]}])
-              say(f"Host {h['HostId']} ({it}, {az}): instance {r['Instances'][0]['InstanceId']} ({im['Name']}) "
-                  f"launched. EC2 console, {region}: wait for 2/2 checks; note its public IPv4.")
+              say(f"Host {h['HostId']} ({it}, {az}): {r['Instances'][0]['InstanceId']} ({im['Name']}) launched "
+                  f"in {region}: wait for 2/2 checks, note its IPv4.")
           def handler(event, context):
               cands = [c.split(":") for c in E["CANDIDATES"].split(",")]
               for region, _ in cands:
@@ -158,13 +160,15 @@ Resources:
                   hs = macs(ec2)
                   if hs:
                       if {"Key": "Name", "Value": TAG} in hs[0].get("Tags", []):
+                          if hs[0]["State"] != "available":
+                              return print(hs[0]["HostId"], hs[0]["State"])
                           launch(ec2, region, hs[0])
                       else:
-                          say(f"A Mac host is in {region} already ({hs[0]['HostId']}): none allocated.")
+                          say(f"Mac host in {region} already: {hs[0]['HostId']}")
                       return stop()
               lm = boto3.client("lambda").get_function_configuration(FunctionName=context.function_name)["LastModified"]
               if time.time() > calendar.timegm(time.strptime(lm[:19], "%Y-%m-%dT%H:%M:%S")) + float(E["DEADLINE"]) * 3600:
-                  say("No Mac host was free; the search has stopped.")
+                  say("No Mac host free; stopped.")
                   return stop()
               for region, it in cands:
                   ec2 = boto3.client("ec2", region_name=region)
@@ -176,8 +180,7 @@ Resources:
                       except ClientError as e:
                           print(region, it, az, e.response["Error"]["Code"])
                           continue
-                      launch(ec2, region, ec2.describe_hosts(HostIds=[hid])["Hosts"][0])
-                      return stop()
+                      return print(az, hid, "allocated")
   Schedule:
     Type: AWS::Events::Rule
     Properties:
