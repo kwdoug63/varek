@@ -36,8 +36,10 @@ grep -q cgroup2 /proc/filesystems && [ -e /sys/fs/cgroup/cgroup.controllers ] ||
 KIND_V=v0.33.0 KUBE_V=v1.37.0 NODE_IMG=kindest/node:v1.37.0
 CRIO_V=v1.37.2 CRIO_SHA=b8824b49ac082fe0a445bab498e6b5c8daff90c680092c7f9f098c968c7f5370
 POD_IMG=mirror.gcr.io/library/busybox:1.36
-# the launch set: the image's busybox (every command of it) and its loader
-LAUNCH=/bin/busybox,/lib64/ld-linux-x86-64.so.2
+# the launch set: the image's /bin (busybox under each of its commands' names)
+# and its loader. Not /bin/busybox alone: through overlayfs, as a container's
+# root is, a Landlock rule on one name of a file does not cover its hardlinks
+LAUNCH=/bin,/lib64/ld-linux-x86-64.so.2
 S=/opt/varek-nri
 mkdir -p "$OUT" "$S"
 SUM="$OUT/summary.txt"
@@ -83,7 +85,7 @@ awk "\$5 == \"/\" || \$5 == \"/work\" || \$5 == \"/dev/shm\" || \$5 == \"/varek/
 if cp /bin/busybox /tmp/true 2> /dev/null; then /tmp/true 2> /dev/null; echo "write a copy to the root (/tmp): allowed; run it: exit $?"; else echo "write a copy to the root (/tmp): refused"; fi
 cp /bin/busybox /work/true && /work/true 2> /dev/null; echo "run a copy written to /work: exit $?"
 /bin/true; echo "run /bin/true (in the launch set): exit $?"
-if [ -e /varek/init ]; then /varek/init /bin/busybox -- /bin/true 2> /dev/null; echo "run /varek/init (not in the launch set): exit $?"; fi
+if [ -e /varek/init ]; then /varek/init /bin -- /bin/true 2> /dev/null; echo "run /varek/init (not in the launch set): exit $?"; fi
 sleep 3'
 
 # the summary lines for a run: the pod's own, then the plugin's and the node agent's
