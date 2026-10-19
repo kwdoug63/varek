@@ -10,7 +10,7 @@
 # bind remount the Warden makes works there, so from v1.32.1 it is made in a
 # user namespace too, and refused, naming --systemd=always, only where the
 # kernel refuses it (a mount locked read-only by a more privileged one):
-#   1. the Warden reports 1.32.1;
+#   1. the Warden reports 1.32.1 or later;
 #   2. in a user namespace (rootless) whose group is delegated to its user,
 #      a read-only cgroup filesystem: --check-startup tries the remount and
 #      says a run makes it; a run makes it, its sub-agent attributed;
@@ -33,7 +33,7 @@ check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else flu
 trap '[ -n "${KEEP:-}" ] && echo "kept $OUT ${B:-}" || rm -rf "$OUT" "${B:-}"' EXIT
 
 echo "== 1. the version =="
-check "the Warden reports 1.32.1" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | grep -q 'VAREK Warden  1.32.1'"
+check "the Warden reports 1.32.1 or later" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | python3 -c 'import re,sys; m=re.search(r\"VAREK Warden  (\\d+)\\.(\\d+)\\.(\\d+)\", sys.stdin.read()); sys.exit(0 if m and tuple(map(int, m.groups())) >= (1, 32, 1) else 1)'"
 
 echo "== 2. to 4. a read-only cgroup filesystem in a user namespace =="
 # As rootless Podman makes it: each case in a group of its own, the host's
