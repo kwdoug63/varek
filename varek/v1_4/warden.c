@@ -3705,7 +3705,10 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * that interrupts the caller's call, which the kernel restarts (and
          * notifies again); this one is void, and not a decision */
         if (g_sub_froze && !notif_id_valid(notify_fd, req.id)) continue;
-        if (dr < 0 || !notif_id_valid(notify_fd, req.id)) {
+        /* a call interrupted while it waited is restarted by the kernel and
+         * notified again: this one is void, not a decision */
+        if (!notif_id_valid(notify_fd, req.id)) continue;
+        if (dr < 0) {
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                          + (t1.tv_nsec - t0.tv_nsec);
@@ -3765,6 +3768,13 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             (boot_by_fd || strcmp(act.target, bootstrap_path) == 0)) {
             if (boot_by_fd)
                 snprintf(act.target, sizeof act.target, "%s", bootstrap_path);
+            /* v1.34 review: the allowance is spent only once the kernel takes
+             * the answer. A signal can interrupt the exec while it waits (the
+             * Go runtime's preemption signals, in a container's runc init):
+             * the answer then reaches no one, the kernel restarts the call,
+             * and the restarted exec is the same launch, still the first */
+            struct seccomp_notif_resp br = { .id = req.id, .flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE };
+            if (ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &br) < 0) continue;
             bootstrap_done = true;
             g_exec_checking = p->v.launches;   /* v1.27 step 4: from here on */
             if (ctx) ctx->launched = true;
@@ -3773,7 +3783,6 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                            + (t1.tv_nsec - t0.tv_nsec);
             emit_pathology(g_report_seq++, req.pid, &act, DEC_ALLOW, DEC_ALLOW,
                            "bootstrap_exec_allow", lat_b, 0);
-            send_simple(notify_fd, req.id, DEC_ALLOW);
             continue;
         }
 
