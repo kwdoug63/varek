@@ -733,7 +733,7 @@ import json, sys
 L = open(sys.argv[1]).read().splitlines()
 d = sys.argv[2]
 # an event's decision changed, whatever it was (which event is 20th depends on
-# the architecture: what the agent does at startup differs)
+# what the agent does at startup, which differs by host)
 e = json.loads(L[20]); v = e["unmapped"]["varek"]
 v["decision"] = "UNSATISFIED" if v.get("decision") == "SATISFIED" else "SATISFIED"
 e["action_id"] = 2 if e.get("action_id") == 1 else 1

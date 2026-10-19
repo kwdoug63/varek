@@ -38,6 +38,10 @@
 #        /dev/nvme* or /dev/bsg/*.
 #      These checks cannot see everything the Warden sees (whether a FIFO has
 #      a reader, for one); --run is the definitive test.
+#   2b. v1.32, in a container: each setting the Warden needs of it (the ten
+#      capabilities, seccomp, the AppArmor profile or SELinux type, the cgroup
+#      namespace, a test of the Warden's mounts), as `varek doctor` checks
+#      them (tools/varek_container.py), each missing one named with its flag.
 #   3b. v1.21, with --flow-policy: the plan gate's configuration, checked by the
 #      Warden itself (`warden <policy> --check-startup --flow-policy ...`, as
 #      root, via sudo if needed): the flow policy loads, is progress-safe and
@@ -166,7 +170,8 @@ if [ "$("$VDP" "$POLICY" launches 2>/dev/null)" = on ]; then
         *)      warn "the policy decides launches (require warden 1.27), but Landlock is not available here (${ll:-no python3 to probe it}): every launch after the agent's own will be refused" ;;
     esac
     # v1.27.1: the Warden mounts the policy's writable directories noexec in a mount namespace of its own
-    if [ "$(id -u)" = 0 ]; then
+    # (v1.32 second review: when it has any, vdp_check's mounts)
+    if [ "$(id -u)" = 0 ] && [ "$("$VDP" "$POLICY" mounts 2>/dev/null)" = on ]; then
         if python3 -c 'import ctypes,os,sys; pid=os.fork()
 if pid == 0: os._exit(0 if ctypes.CDLL(None).unshare(0x20000) == 0 else 1)
 sys.exit(os.waitpid(pid, 0)[1] != 0)' 2>/dev/null; then
@@ -174,6 +179,28 @@ sys.exit(os.waitpid(pid, 0)[1] != 0)' 2>/dev/null; then
         else
             warn "the Warden cannot make a mount namespace here: a run of this policy refuses to start unless given --writable-exec"
         fi
+    fi
+fi
+
+# v1.32: in a container, each setting the Warden needs of it
+# (packaging/container/README.md), as this policy needs it, as `varek run`
+# counts it: control groups when the policy names a sub-agent or an MCP
+# server, the mounts when it mounts writable directories noexec (vdp_check mounts)
+if python3 "$HERE/tools/varek_container.py" --in-container 2>/dev/null; then
+    echo "== 2b. the container"
+    cflags=()
+    "$CERT" "$POLICY" identity 2>/dev/null | grep -q -E '^(subagent|confined) ' && cflags+=(--cgroups)
+    [ "$("$VDP" "$POLICY" mounts 2>/dev/null)" = on ] && cflags+=(--noexec)
+    if cout="$(python3 "$HERE/tools/varek_container.py" --preflight ${cflags[@]+"${cflags[@]}"} 2>&1)"; then
+        while IFS=$'\t' read -r lv text fix; do
+            case "$lv" in
+                ok)   pass "$text" ;;
+                warn) warn "$text${fix:+ ($fix)}" ;;
+                fail) fail "$text${fix:+ ($fix)}" ;;
+            esac
+        done <<< "$cout"
+    else
+        fail "the container's checks did not run (tools/varek_container.py): $(printf '%s' "$cout" | tail -1)"
     fi
 fi
 

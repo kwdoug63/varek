@@ -5,10 +5,7 @@
 > an adversarial review by AI review agents. A human or third-party review
 > has not been done.
 
-**Draft.** Pending: the date, and whether the review's fixes to the Warden
-(below) need a soak of their own after the shared one.
-
-MIT · github.com/kwdoug63/varek
+Released 2026-10-16 · MIT · github.com/kwdoug63/varek
 
 ## Summary
 
@@ -141,6 +138,32 @@ fail, 23 pass. Of the 23, 2 check a refusal v1.28.1 shares, 9 that a
 `require warden 1.28` policy behaves as before, 9 that something does not
 happen (which holds when nothing runs), and 3 pass by coincidence (the
 design note lists them).
+
+## 24 hours on a small host
+
+The shared soak (`tests/soak_shared/`, on v1.31's branch) covers v1.28.1,
+v1.29.0 and v1.31.0 on one build: the v1.31.0 Warden, which carries this
+release's code. Its runs B and C are this release's: B is `varek run` with
+nothing set up (the baseline policy and the `python` profile), an agent's
+work in its project each turn (writing files, running `python3`, every
+fifth turn `git commit`); C is the same work as a dry run of a narrower
+policy, then `varek policy suggest` and a short dry run under its draft.
+
+The first 24-hour run (2026-10-14 to 2026-10-15) found the fault in `varek
+run`'s summary below. The review's fixes to the Warden came after it, so
+the shared soak ran again on the reviewed build, for 24 hours on a 2 GB
+droplet, 2026-10-15 to 2026-10-16. It passed:
+
+| | Run B (enforcing) | Run C (dry run) |
+|---|---|---|
+| Turns | 1,440 | 1,440 |
+| Work | 1,296 of 1,296 turns done; 288 `git` commits | 1,440 of 1,440 turns done |
+| Probes | 144 (`/etc/shadow`, a write outside the project, a program the agent wrote; 48 each), each refused and recorded | — |
+| Records | 436,366, signed; `varek_audit` passed | 463,827, signed; `varek_audit`: `VERIFIED: DRY RUN, NOT ENFORCED` (exit 3), 4,325 calls the narrower policy refuses let through, each recorded `"enforced": false` |
+| `varek policy suggest` | | a draft of 40 exact rules; under it, 12 of 12 turns done and nothing let through |
+| The Warden's memory | 12.0 to 12.3 MB | 12.1 to 12.4 MB |
+
+Run A (v1.28.1 and v1.31.0) passed in the same soak.
 
 ## Latency
 
@@ -281,7 +304,7 @@ short runs that are in this release too; both are fixed here, with checks:
   now, checked against the revocation like every other `revoked` record
   (`test_v1280` section 4: a launch after `varek revoke`).
 
-## Found by the 24-hour run
+## Found by the first 24-hour run
 
 The first 24-hour run of the shared soak (2026-10-14 to 2026-10-15, on a
 2 GB droplet with no swap) ran all three runs to their end: each agent
@@ -314,6 +337,15 @@ give it swap.
   `--sandbox danger-full-access` under VAREK.
 - **The certificate authorities' bundles** are read ahead of the key
   patterns: a key placed among them is readable.
+- **Calls glibc and bash make that the Warden refuses** (fixed in v1.31.1,
+  in every release before it): on x86_64, `epoll_wait(2)` and
+  `epoll_create(2)`, which glibc calls for `epoll_wait()` and
+  `epoll_create()`, so Python's `select.epoll` and asyncio's default event
+  loop fail with EPERM under every policy (an agent can run asyncio on
+  `asyncio.SelectorEventLoop(selectors.PollSelector())`; arm64 is not
+  affected); on RHEL 9 (glibc 2.34), `pipe(2)`, which its `pipe()` calls,
+  so a shell's command substitution fails, and under a policy before 1.29
+  `getpgrp(2)`, without which bash, RHEL's `/bin/sh`, does not start.
 - From v1.28.1, still: the chain is recorded, not enforced. From v1.28.0:
   a server that echoes a credential back. From v1.27.1: code written into
   memory is not covered; Linux only.

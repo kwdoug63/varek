@@ -33,11 +33,19 @@
  *     whose launcher launched is launched, else its launch failed (the
  *     launching process is back from it, running what it ran). Where the
  *     connector cannot be used (checked at the start with a launch of its
- *     own), the image a process runs is compared with the one the launch
- *     was decided for, and a launch of the image the launcher already runs
- *     (which could not be told from a failed one) is refused
- *     (subagent_same_image). Each sub-agent's settling is recorded
- *     (subagent_settled);
+ *     own: in a container, whose network namespace the kernel sends none),
+ *     the image a process runs is compared with the one the launch was
+ *     decided for. A launch of the image the launcher already runs is told
+ *     from a failed one by the process's memory layout (v1.32): where its
+ *     code, stack, heap, arguments and environment begin and end
+ *     (/proc/<pid>/stat), which every new program gets anew, randomized,
+ *     and which the process cannot change but by a launch (the agent's
+ *     filter refuses prctl(PR_SET_MM), every form, under every policy; the
+ *     Makefile fails the build if it is admitted); the same layout is a
+ *     failed launch. Where the layout cannot be read, or is not
+ *     randomized, such a launch is refused (subagent_same_image). Each
+ *     sub-agent's settling is recorded (subagent_settled, "how": the
+ *     process events, the image, or the layout);
  *   - a failed sub-agent's group is frozen (cgroup.freeze), every process in
  *     it moved back to the launcher's group, and the group removed; a
  *     process that cannot be moved is still attributed to the launcher.
@@ -60,6 +68,9 @@
 #define __NR_pidfd_send_signal 424
 #endif
 static void noexec_unescape(char *s);        /* warden_noexec.inc.c */
+static unsigned long noexec_keep_flags(const char *mp);
+static bool g_own_mntns;                     /* v1.32: the Warden has a mount namespace of its own */
+static bool sub_aslr(void);                  /* v1.32, below */
 
 /* Linux 6.13: a pidfd tells its process's cgroup id (the group directory's
  * inode number), without /proc's text */
@@ -80,6 +91,7 @@ struct sub_pidfd_info {
 #define SUB_REL_MAX   512            /* a group's path under the run's: 8 x "/NAME-n" */
 
 enum { SUB_AGENT = 0, SUB_PENDING, SUB_LAUNCHED, SUB_FAILED };
+#define SUB_LAYOUT_N 10              /* /proc/<pid>/stat's layout fields, below */
 
 struct subject {
     char     name[33];               /* "" : the agent */
@@ -95,6 +107,10 @@ struct subject {
     uint64_t cgid;                   /* its group's id (the directory's inode number); 0 once removed */
     pid_t    tgid;                   /* the launching process */
     bool     exec_seen;              /* the kernel reported its launch (proc connector) */
+    /* v1.32: a launch of the image its launcher runs, without the connector:
+     * the launcher's memory layout when it launched */
+    bool     by_layout;
+    unsigned long long layout[SUB_LAYOUT_N];
     /* v1.31: the policy subject its calls are decided as (smt_decide.h): the
      * confined subject its launch rule declares, else its launcher's (0: the
      * agent's rules); and whether an `mcp server` line launched it */
@@ -274,6 +290,122 @@ refuse:
     return -1;
 }
 
+/* v1.32: in a container. Docker and Podman mount the cgroup filesystem
+ * read-only; with a cgroup namespace of the container's own
+ * (--cgroupns=private) this process is at its root ("/"), and what the
+ * filesystem shows is the container's own groups only. Then the Warden
+ * remounts it read-write in a mount namespace of its own (made here unless
+ * the noexec mounts made it), as a host's is: the container's mount stays
+ * read-only, and the agent, which runs as its own user with no
+ * capabilities, cannot write the groups, which root owns, any more than on
+ * a host. Anywhere else nothing is done. 0; 1 in a check, where the run
+ * would remount it; or -1 printed. */
+/* v1.32 (D10): in a user namespace (rootless Podman)? The initial user
+ * namespace's inode is fixed (PROC_USER_INIT_INO); a child namespace with an
+ * identity map is still a child (v1.32 review). Missing (a kernel without
+ * user namespaces): not one; otherwise unreadable: taken as one. */
+static bool sub_in_userns(void) {
+    struct stat st;
+    if (stat("/proc/self/ns/user", &st) < 0) return errno != ENOENT;
+    return st.st_ino != 0xEFFFFFFDU;
+}
+
+/* The container's cgroup filesystem remounted read-write in this mount
+ * namespace: a bind remount, which changes this mount's flags only, never
+ * the filesystem's, which every cgroup2 mount on the machine shares (v1.32
+ * review); noexec and the mount's other flags kept. 0, or -1 with errno. */
+static int sub_cg_remount(const char *mnt) {
+    unsigned long f = (noexec_keep_flags(mnt) & ~(unsigned long)MS_RDONLY) | MS_NOEXEC;
+    if (mount(NULL, mnt, NULL, MS_BIND | MS_REMOUNT | f, NULL) < 0) return -1;
+    struct statvfs sv;
+    if (statvfs(mnt, &sv) < 0) return -1;
+    if (sv.f_flag & ST_RDONLY) { errno = EROFS; return -1; }
+    return 0;
+}
+
+static int sub_container_cgroup(const char *mnt, const char *self, bool check_only) {
+    struct statvfs sv;
+    if (statvfs(mnt, &sv) < 0 || !(sv.f_flag & ST_RDONLY)) return 0;
+    /* D10: in a user namespace it is not remounted. Measured with a plain
+     * remount, which the kernel refuses there; a bind remount, the one made
+     * now, was measured to work under rootless Podman after the second
+     * review (2026-10-18, a group made and used), but v1.32.0 keeps the
+     * refusal it was soaked with: lifting it is for a later release. Rootless Podman's systemd mode mounts the
+     * container's own groups read-write instead */
+    /* a cgroup namespace of its own first: the setting any container needs
+     * (v1.32, as varek doctor orders them) */
+    if (strcmp(self, "/")) {
+        fprintf(stderr, "[warden] the policy names a sub-agent: the cgroup filesystem at %s is read-only and "
+                "this process's group (%s) is not its root; in a container, run it with --cgroupns=private "
+                "(packaging/container/README.md); refusing to start\n", mnt, self);
+        return -1;
+    }
+    if (sub_in_userns()) {
+        fprintf(stderr, "[warden] the policy names a sub-agent: the cgroup filesystem at %s is read-only and this "
+                "is a user namespace (rootless), where the Warden does not remount it; run the container with "
+                "--systemd=always (packaging/container/README.md); refusing to start\n", mnt);
+        return -1;
+    }
+    const char *refused = "[warden] the policy names a sub-agent: cannot remount the container's cgroup "
+                          "filesystem %s read-write (%s); under AppArmor or SELinux, run with VAREK's profile "
+                          "(packaging/container/README.md); refusing to start\n";
+    if (check_only) {
+        /* tried, in a child's mount namespace, so the check says what a run
+         * would find (v1.32 review) */
+        /* the step that failed and its errno come back through a pipe
+         * (v1.32 second review) */
+        int pp[2];
+        if (pipe2(pp, O_CLOEXEC) < 0) { fprintf(stderr, refused, mnt, strerror(errno)); return -1; }
+        pid_t c = fork();
+        if (c < 0) { fprintf(stderr, refused, mnt, strerror(errno)); close(pp[0]); close(pp[1]); return -1; }
+        if (c == 0) {
+            int r[2] = { 0, 0 };
+            close(pp[0]);
+            if (unshare(CLONE_NEWNS) < 0) r[0] = 1;
+            else if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) r[0] = 2;
+            else if (sub_cg_remount(mnt) < 0) r[0] = 3;
+            r[1] = r[0] ? errno : 0;
+            if (write(pp[1], r, sizeof r) != (ssize_t)sizeof r) _exit(1);
+            _exit(r[0] ? 1 : 0);
+        }
+        close(pp[1]);
+        int r[2] = { 0, 0 }, st = 0;
+        ssize_t got;
+        while ((got = read(pp[0], r, sizeof r)) < 0 && errno == EINTR) ;
+        close(pp[0]);
+        while (waitpid(c, &st, 0) < 0 && errno == EINTR) ;
+        if (got != (ssize_t)sizeof r || !WIFEXITED(st) || WEXITSTATUS(st) || r[0]) {
+            const char *why = got != (ssize_t)sizeof r || !WIFEXITED(st) ? "the test did not finish" : strerror(r[1]);
+            if (r[0] == 1)
+                fprintf(stderr, "[warden] the policy names a sub-agent: cannot make a mount namespace for the "
+                        "cgroup filesystem (%s); in a container, add --cap-add SYS_ADMIN "
+                        "(packaging/container/README.md); refusing to start\n", why);
+            else
+                fprintf(stderr, refused, mnt, why);
+            return -1;
+        }
+        fprintf(stderr, "[warden] sub-agents: the cgroup filesystem at %s is read-only (a container's, its own "
+                "groups only): a run remounts it read-write in the Warden's own mount namespace (tried)\n", mnt);
+        return 1;
+    }
+    if (!g_own_mntns) {
+        if (unshare(CLONE_NEWNS) < 0 || mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
+            fprintf(stderr, "[warden] the policy names a sub-agent: cannot make a mount namespace for the cgroup "
+                    "filesystem (%s); in a container, add --cap-add SYS_ADMIN (packaging/container/README.md); "
+                    "refusing to start\n", strerror(errno));
+            return -1;
+        }
+        g_own_mntns = true;
+    }
+    if (sub_cg_remount(mnt) < 0) {
+        fprintf(stderr, refused, mnt, strerror(errno));
+        return -1;
+    }
+    fprintf(stderr, "[warden] sub-agents: the container's cgroup filesystem %s remounted read-write in the "
+            "Warden's own mount namespace\n", mnt);
+    return 0;
+}
+
 /* Startup: the run's group, made (not in a check). 0, or -1 printed. */
 static int sub_setup(const struct policy *p, bool check_only, bool agent_root) {
     for (size_t i = 0; i < p->v.n; i++) if (p->v.rules[i].subagent[0]) g_sub_on = true;
@@ -303,6 +435,8 @@ static int sub_setup(const struct policy *p, bool check_only, bool agent_root) {
         return -1;
     }
     if (sub_refuse_writable(p, mnt) < 0) return -1;
+    int ro = sub_container_cgroup(mnt, self, check_only);
+    if (ro < 0) return -1;
     g_sub = calloc(SUB_MAX + 1, sizeof *g_sub);
     if (!g_sub) { fprintf(stderr, "[warden] out of memory\n"); return -1; }
     g_sub[0] = (struct subject){ .parent = -1, .state = SUB_AGENT };
@@ -310,7 +444,7 @@ static int sub_setup(const struct policy *p, bool check_only, bool agent_root) {
     if (check_only) {
         char parent[PATH_MAX];
         snprintf(parent, sizeof parent, "%s%s", mnt, under);
-        if (access(parent, W_OK) < 0) {
+        if (!ro && access(parent, W_OK) < 0) {
             fprintf(stderr, "[warden] the policy names a sub-agent: cannot make groups in %s (%s); refusing to "
                     "start\n", parent, strerror(errno));
             return -1;
@@ -338,8 +472,10 @@ static int sub_setup(const struct policy *p, bool check_only, bool agent_root) {
                   !getenv("VAREK_WARDEN_TEST_NO_PIDFD_INFO");
     fprintf(stderr, "[warden] sub-agents: the run's control group %s (each call's group read %s; launches "
             "known %s)\n", g_cg_dir, g_sub_pidfd ? "through a pidfd" : "from /proc",
-            cn ? "from the kernel's process events" : "by the image a process runs (no process events here: a "
-            "sub-agent of the image its launcher runs is refused)");
+            cn ? "from the kernel's process events" : sub_aslr() ? "by the image a process runs and, for a "
+            "sub-agent of the image its launcher runs, its memory layout (no process events here)" :
+            "by the image a process runs (no process events here, and layouts are not randomized: a sub-agent "
+            "of the image its launcher runs is refused)");
     return 0;
 }
 
@@ -378,6 +514,40 @@ static int sub_effective(int s) {
     return s;
 }
 
+/* v1.32: a process's memory layout, from /proc/<pid>/stat: startcode,
+ * endcode, startstack (fields 26-28), start_data, end_data, start_brk,
+ * arg_start, arg_end, env_start, env_end (45-51). Each is set by a launch
+ * (randomized, with ASLR) and changed otherwise only by prctl(PR_SET_MM),
+ * which the agent's filter refuses (a capability would not do:
+ * PR_SET_MM_MAP asks none for the layout). 0, or -1 (unreadable, or shown as zeros:
+ * the reader may not trace it). */
+static int sub_layout(pid_t pid, unsigned long long out[SUB_LAYOUT_N]) {
+    static const int field[SUB_LAYOUT_N] = { 26, 27, 28, 45, 46, 47, 48, 49, 50, 51 };
+    char p[64], buf[2048];
+    snprintf(p, sizeof p, "/proc/%d/stat", (int)pid);
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+    char *c = strrchr(buf, ')');                 /* the name may hold spaces and parentheses */
+    if (!c) return -1;
+    int f = 2, k = 0;                            /* field 2 is the name; c is its end */
+    unsigned long long any = 0;
+    for (char *t = c + 1; *t && k < SUB_LAYOUT_N; ) {
+        while (*t == ' ') t++;
+        if (!*t) break;
+        f++;
+        char *e;
+        unsigned long long v = strtoull(t, &e, 10);
+        if (f == field[k]) { out[k++] = v; any |= v; }
+        t = e;
+        while (*t && *t != ' ') t++;
+    }
+    return k == SUB_LAYOUT_N && any ? 0 : -1;
+}
+
 /* subagent_settled: how a sub-agent's launch came out (once) */
 static void sub_settled_record(int s, const char *result) {
     struct timespec ts;
@@ -385,7 +555,8 @@ static void sub_settled_record(int s, const char *result) {
     FILE *f = rec_begin();
     fprintf(f, "{\"event\":\"subagent_settled\",\"run\":\"%s\",\"subagent\":\"%s#%u\",\"result\":\"%s\","
             "\"how\":\"%s\",\"timestamp_ns\":%lld}\n", g_run_id, g_sub[s].name, g_sub[s].n, result,
-            g_cn >= 0 && !g_cn_lost ? "process_events" : "image", (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+            g_cn >= 0 && !g_cn_lost ? "process_events" : g_sub[s].by_layout ? "layout" : "image",
+            (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
     rec_end(NULL);
 }
 
@@ -449,7 +620,14 @@ static int sub_settle(int s, pid_t tid) {
     char p[64];
     struct stat st;
     snprintf(p, sizeof p, "/proc/%d/exe", (int)tid);
-    if (stat(p, &st) == 0 && st.st_dev == g_sub[s].edev && st.st_ino == g_sub[s].eino) {
+    bool launched = stat(p, &st) == 0 && st.st_dev == g_sub[s].edev && st.st_ino == g_sub[s].eino;
+    if (launched && g_sub[s].by_layout) {
+        /* v1.32: the launcher's own image: launched only if its layout is
+         * new (a process it forked after has the same layout as it) */
+        unsigned long long now[SUB_LAYOUT_N];
+        launched = sub_layout(tid, now) == 0 && memcmp(now, g_sub[s].layout, sizeof now) != 0;
+    }
+    if (launched) {
         g_sub[s].state = SUB_LAUNCHED;
         sub_settled_record(s, "launched");
     } else sub_fail(s);
@@ -502,6 +680,17 @@ found:
     return sub_effective(s);
 }
 
+/* v1.32: the kernel randomizes a new program's layout (kernel.randomize_va_space
+ * 2: the stack, the program, the heap). Without it a new program of the same
+ * image could keep the launcher's layout. */
+static bool sub_aslr(void) {
+    if (getenv("VAREK_WARDEN_TEST_NO_ASLR")) return false;    /* make test-v1281 */
+    int fd = open("/proc/sys/kernel/randomize_va_space", O_RDONLY | O_CLOEXEC);
+    char c = 0;
+    if (fd >= 0) { if (read(fd, &c, 1) != 1) c = 0; close(fd); }
+    return c == '2';
+}
+
 /* A launch the policy allows by a rule with subagent=name, from a process of
  * subject from: the sub-agent made, its group made and the process moved.
  * The subject, or -1 with the rule that refuses it. */
@@ -521,12 +710,19 @@ static int sub_launch(pid_t tid, int from, const char *name, int csubj, bool mcp
     while (sf && fgets(line, sizeof line, sf)) if (sscanf(line, "Threads: %d", &threads) == 1) break;
     if (sf) fclose(sf);
     if (threads != 1) { *rule = "subagent_threaded"; return -1; }
-    /* without process events a launch of the image the launcher runs could
-     * not be told from a failed one (v1.28.1 review) */
+    /* without process events a launch of the image the launcher runs is told
+     * from a failed one by the layout (v1.32); if it cannot be, refused
+     * (v1.28.1 review) */
+    bool by_layout = false;
+    unsigned long long layout[SUB_LAYOUT_N] = { 0 };
     if (g_cn < 0) {
         struct stat xs;
         snprintf(sp, sizeof sp, "/proc/%d/exe", (int)tgid);
-        if (stat(sp, &xs) < 0 || (xs.st_dev == edev && xs.st_ino == eino)) { *rule = "subagent_same_image"; return -1; }
+        if (stat(sp, &xs) < 0) { *rule = "subagent_same_image"; return -1; }
+        if (xs.st_dev == edev && xs.st_ino == eino) {
+            if (!sub_aslr() || sub_layout(tgid, layout) < 0) { *rule = "subagent_same_image"; return -1; }
+            by_layout = true;
+        }
     }
     sub_cn_drain();                      /* events from before this launch are not its */
     size_t c = 0;
@@ -547,6 +743,8 @@ static int sub_launch(pid_t tid, int from, const char *name, int csubj, bool mcp
     s->edev = edev;
     s->eino = eino;
     s->tgid = tgid;
+    s->by_layout = by_layout;
+    memcpy(s->layout, layout, sizeof s->layout);
     s->psubj = csubj > 0 ? csubj : g_sub[from].psubj;      /* v1.31 */
     s->mcp = mcp;
     s->confined = csubj > 0;

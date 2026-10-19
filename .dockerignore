@@ -1,0 +1,52 @@
+# The build and runtime stages copy only the Warden's sources and the
+# licences (packaging/container/Containerfile); the test stage takes the
+# repository, as the suites read its root (test-v1180's Python suites).
+# Nothing built on the host goes in: each stage builds from source (and runs
+# `make clean` first, should anything slip through), and nothing private.
+.git
+.claude
+.env
+.env.*
+*.local
+.venv
+venv
+.pytest_cache
+**/.pytest_cache
+**/__pycache__
+**/*.o
+**/*.a
+**/*.so
+**/*.log
+**/*.ipynb
+**/*-intercept.py
+**/*_intercept.py
+darpa-i2o
+wandb
+varek-v1.0
+varek-v1.0.zip
+varek-v1_6-release-staging
+varek-v1_6-release-staging.tar.gz
+varek/v1_4/warden
+varek/v1_4/warden-proxy
+varek/v1_4/warden-secrets
+varek/v1_4/warden_faultinject
+varek/v1_4/target_demo
+varek/v1_4/target_conformance
+varek/v1_4/bench_target
+varek/v1_4/tools/vdp_check
+varek/v1_4/tools/vdp_cert_check
+varek/v1_4/tools/varek_keygen
+varek/v1_4/tools/bench_workload
+varek/v1_4/tests/*_probe
+varek/v1_4/tests/lifecycle_target
+varek/v1_4/tests/test_v193_lifecycle
+varek/v1_4/tests/v1210_bench
+varek/v1_4/tests/test_v14_filter
+varek/v1_4/tests/test_v1240_resolve
+varek/v1_4/tests/test_v1250_shared
+varek/v1_4/tests/proxy_parse_test
+varek/v1_4/tests/proxy_parse_fuzzer
+varek/v1_4/tests/v1281_sub
+varek/v1_4/tests/v1290_open
+varek/v1_4/tests/v1290_lat
+varek/v1_4/tests/v1310_peek

@@ -90,6 +90,10 @@ jobs:
         run: sudo make -C varek/v1_4 test-v1310
       - name: v1.30 the Warden on this architecture (open flags in VAREK's encoding, flag clauses in a run, run_start's arch)
         run: make -C varek/v1_4 test-v1300
+      - name: v1.31.1 calls glibc and bash make, admitted under every policy (asyncio's event loop, pipe, bash)
+        run: sudo make -C varek/v1_4 test-v1311
+      - name: v1.32 containers (the version, varek doctor and the run's refusal in a container, the packaging)
+        run: sudo make -C varek/v1_4 test-v1320
       - name: Build and test the plan_verify CLI (v1_6, v1.16.3)
         run: make -C v1_6 plan_verify check check-plan-verify
       - name: Test the v1.7 layer (v1.18.0)

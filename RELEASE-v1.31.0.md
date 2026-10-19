@@ -6,11 +6,7 @@
 > against the code); its findings are fixed (below). A human or
 > third-party review has not been done.
 
-**Draft.** Pending: the shared 24-hour soak (with v1.28.1 and v1.29.0), the
-date, and the CHANGELOG entry and README's current release (written in the
-release commit, after v1.28.0, v1.28.1 and v1.29.0's, as for each release).
-
-MIT · github.com/kwdoug63/varek
+Released 2026-10-16 · MIT · github.com/kwdoug63/varek
 
 ## Summary
 
@@ -140,6 +136,36 @@ helpers copied in): 263 fail, 8 pass. Of the 8, one checks a refusal v1.29.0
 shares, two that no value reached a stream (nothing ran), and five that
 edited streams are refused (v1.29.0 has no OCSF exporter, so they hold
 trivially).
+
+## 24 hours on a small host
+
+The shared soak (`tests/soak_shared/`, on this branch) covers v1.28.1,
+v1.29.0 and v1.31.0 on this release's Warden. Its run A is this
+release's: an agent acting for a verified user, the egress proxy
+inspecting, two confined MCP servers launched once and kept the whole run
+(`fs` reading project files under its own rules, `gh` calling a remote MCP
+server with the run's MCP token, which the proxy puts in only where a rule
+written `for=gh` names it), the agent's own MCP calls, two sub-agents, and
+the user's token expiring near the end; the OCSF export following the
+stream throughout. The first 24-hour run (2026-10-14 to 2026-10-15) found
+the fault in `varek run`'s summary below; the review's fixes came after
+it, so the soak ran again on the reviewed build, for 24 hours on a 2 GB
+droplet, 2026-10-15 to 2026-10-16. It passed:
+
+| | |
+|---|---|
+| Duration | 24.0 h, a turn every 60 s: 1,440 turns; Warden 1.31.0 |
+| Tasks before the expiry | 1,291, all succeeded: the agent's `tools/list` 259 and `tools/call search_code` 258, `fs` reads 258, `gh`'s `get_issue` on the remote server 258, sub-agent launches 258 |
+| Probes | 144 (18 of each of 8 kinds), all held: the agent's `delete_repo`, an unlisted tool and `get_issue` itself refused (403); `fs` reading the agent's file and the token's store refused; `gh`'s `delete_repo` refused; the agent opening `fs`'s file refused; a second `fs` launched with `PYTHONPATH` refused at the launch |
+| Confined servers | `fs` and `gh`, each confined, each call decided for its own subject and certified under it |
+| The remote MCP server | 775 requests, the MCP token in exactly `gh`'s 258 allowed calls and in none other, 0 errors |
+| The expiry | the run revoked 0.00 s after the user's token expired; the 5 turns after it all refused |
+| Records | 13,891; `varek_audit` passed (the token released on 258 requests, none refused, the run revoked) |
+| OCSF | 11,719 events followed live, verified against the stream (`--verify`), valid OCSF 1.9.0 |
+| Time | an MCP call at the agent p50 71 to 73 ms (p99 85 ms), through the proxy and back; the Warden's decision on it p50 26 us (p99 73), on `gh`'s p50 30 us (p99 59) |
+| Memory | the Warden 12.5 to 13.2 MB, `warden-proxy` 8.7 MB, `warden-secrets` 9.1 MB, `fs` 11.4 MB, `gh` 20.3 to 21.3 MB, flat |
+
+Runs B and C (v1.29.0) passed in the same soak (`RELEASE-v1.29.0.md`).
 
 ## Latency
 
@@ -285,6 +311,22 @@ user's token expired, the token only in `gh`'s allowed calls, nothing
 after the revocation, the audit, and the OCSF events verified and valid;
 B's work and probes, and its audit; C's dry run, draft and second dry run.
 
+## Found by the first 24-hour run
+
+The first 24-hour run of the shared soak (2026-10-14 to 2026-10-15, on a
+2 GB droplet with no swap) ran all three runs to their end: each agent
+finished, and run C's stream ends in its signed `run_end`, exit status 0.
+After them, `varek run`'s wrapper for run C was killed for memory while it
+printed its summary, and then the soak's checker was too. The wrapper read
+the whole verdict stream into memory, and under the baseline a day's
+stream is about 250 MB, about 1.2 GB as objects; runs B and C finished at
+once. **Fixed:** `varek run`, `status`, `refusals`, `export` and `policy
+suggest` read a stream as they go, holding only what they count, with the
+same check that refuses a damaged stream (`test_varek_cli.py`: a 16 MB
+stream summarized under 4 MB of peak memory, 74 MB before). The audit
+still reads a stream whole (a known limit since v1.27.1): on a small host
+give it swap.
+
 ## Known limits
 
 - **The agent's calls to a stdio MCP server are not decided** (D4): they
@@ -308,6 +350,15 @@ B's work and probes, and its audit; C's dry run, draft and second dry run.
   attestation; the stream is the evidence (D1).
 - **The Agent Baseline mapping is against a draft** whose identifiers may
   change until its v1.0.
+- **Calls glibc and bash make that the Warden refuses** (fixed in v1.31.1,
+  in every release before it): on x86_64, `epoll_wait(2)` and
+  `epoll_create(2)`, which glibc calls for `epoll_wait()` and
+  `epoll_create()`, so Python's `select.epoll` and asyncio's default event
+  loop fail with EPERM under every policy (an agent can run asyncio on
+  `asyncio.SelectorEventLoop(selectors.PollSelector())`; arm64 is not
+  affected); on RHEL 9 (glibc 2.34), `pipe(2)`, which its `pipe()` calls,
+  so a shell's command substitution fails, and under a policy before 1.29
+  `getpgrp(2)`, without which bash, RHEL's `/bin/sh`, does not start.
 - From v1.29.0: a dry run is not a sandbox. From v1.28.1: the chain is
   recorded, not enforced. From v1.28.0: a server that echoes a credential
   back. From v1.27.1: code written into memory is not covered; Linux only.

@@ -9,6 +9,176 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.32.0] - 2026-10-19 — Containers: an official image, Docker and Podman
+
+VAREK's image, `ghcr.io/kwdoug63/varek`: the Warden, its helpers and the
+`varek` command on Red Hat's UBI 9 minimal, the entrypoint `varek run --`, so
+the agent is the Warden's child in namespaces it makes inside the container,
+as on a host. A published, minimal set of settings, never `--privileged`:
+`--cap-drop ALL` and ten capabilities, each with its reason and shown needed,
+`--cgroupns=private`, the runtime's default seccomp profile; an AppArmor
+profile (`docker-default` with the Warden's three kinds of mount) and an
+SELinux module (`container_init_t` and four rules); rootless Podman with
+`--systemd=always`. The Warden bind-remounts a container's read-only cgroup
+filesystem read-write in its own mount namespace, so sub-agents and confined
+MCP servers run in a container, and, without the kernel's process events (in
+a container), tells a sub-agent of its launcher's image by its memory layout,
+so a Python agent can launch a Python MCP server confined. `varek doctor`
+checks each setting and names the flag that grants a missing one; `varek run`
+refuses a container that cannot carry the run. Each release tag builds,
+checks, signs (cosign, keyless) and attests (a CycloneDX SBOM) the image.
+Every suite passes inside the container on Docker with AppArmor and rootful
+and rootless Podman with SELinux; the shared 24-hour soak passed inside a
+container under the documented settings. The Warden reports 1.32.0; the
+grammar stays 1.31. Reviewed by AI review agents. See `RELEASE-v1.32.0.md`.
+
+## [1.31.1] - 2026-10-17 — Calls glibc and bash make
+
+A patch release of v1.31.0. The Warden admits, under every policy, four
+system calls glibc and bash make that it refused: `epoll_wait(2)` and
+`epoll_create(2)` (x86_64), without which Python's `select.epoll` and
+asyncio's default event loop failed with EPERM; `pipe(2)`, which glibc
+before 2.37 (RHEL 9) calls for `pipe()`, without which a shell's command
+substitution failed; and `getpgrp(2)` under a policy before 1.29, without
+which bash did not start. Each does what an admitted call does or reports
+the caller's own process group. `make test-v1311` checks them (9 of its
+11 checks fail on v1.31.0); the shared 24-hour soak passed on this build.
+The Warden reports 1.31.1; the grammar stays 1.31. See
+`RELEASE-v1.31.1.md`.
+
+## [1.31.0] - 2026-10-16 — MCP servers confined, MCP calls decided, and an OCSF export
+
+Under `require warden 1.31`: `mcp server NAME exec PATH [sha256=HEX]`
+declares an MCP server; when the agent launches it, it runs as a confined
+sub-agent, and every call it and its children make is decided against the
+rules written `for=NAME` and no others, each certificate naming its
+subject. Under `proxy inspect`, `allow|deny mcp URL METHOD [NAME]` decides
+each JSON-RPC call to a remote MCP server by method and tool, resource or
+prompt name, after a strict parse of the whole body, before anything is
+sent, and records it (`net.mcp`). A credential with `audience=URL` is an
+MCP token, checked at fetch and released only into calls to its own
+server; the bearer token the agent sends itself is checked on every MCP
+call; `trust mcp-resource` finds a user's issuer through a server's
+protected resource metadata. `varek export --format ocsf` writes every
+record as an OCSF 1.9.0 event, `--follow` live and `--verify` against the
+stream. The audit and the tools cover servers, MCP calls and tokens
+(`varek refusals --for`, `varek policy suggest --for`, `varek run --mcp`).
+The rule cap is 512. The Agent Baseline mapping
+(`docs/standards/agent-baseline.md`) is published with it. Reviewed by six
+AI review agents (not a human or third-party review); the shared 24-hour
+soak with v1.28.1 and v1.29.0 passed on the reviewed build. Known limit:
+on x86_64 the Warden refuses `epoll_wait(2)` and `epoll_create(2)`, so
+asyncio's default event loop fails (fixed in v1.31.1). The Warden reports
+1.31.0. See `RELEASE-v1.31.0.md` and `docs/security/v1.31-standards.md`.
+
+## [1.29.0] - 2026-10-16 — Run an agent with nothing set up first
+
+`sudo varek run -- <agent>` runs an agent under the Warden with nothing set
+up first: it writes a baseline policy for the working directory with a
+profile for the agent (Claude Code, the Codex CLI, the Gemini CLI, Aider,
+Python or Node.js, each built from a dry run of the real agent), and under
+`require warden 1.29` the Warden opens and changes files as the agent's own
+user, so the kernel's permissions hold as well as the policy, and decides
+unlink, rmdir, mkdir, rename, chmod, utimes, truncate and chdir by name.
+`--dry-run` decides and records every call and lets through what the
+policy refuses, recorded `"enforced":false`; the hard-denied calls, the
+protected objects, Unix-socket connects and a revocation still refuse.
+`varek refusals --not-enforced` lists what the policy would have refused. `varek policy suggest` drafts a policy from a run's
+refusals: exact rules, each re-decided, with anything risky commented out
+for a person to review. `varek_audit.py` checks the baseline, the
+profiles and a dry run's records, and reports a dry run as `VERIFIED: DRY
+RUN, NOT ENFORCED`. The launch set is hashed with OpenSSL's libcrypto.
+`varek run`, `status`, `refusals`, `export` and `policy suggest` read a
+stream as they go. Reviewed for correctness (GCC's analyzer, ASan and
+UBSan) and by AI review agents (not a human or third-party review); the
+shared 24-hour soak with v1.28.1 and v1.31.0 passed on the reviewed build.
+Known limit: on x86_64 the Warden refuses `epoll_wait(2)` and
+`epoll_create(2)`, so asyncio's default event loop fails (fixed in
+v1.31.1). The Warden reports 1.29.0. See `RELEASE-v1.29.0.md` and
+`docs/security/v1.29-varek-run.md`.
+
+## [1.28.1] - 2026-10-15 — Who each decision was for
+
+After `require warden 1.28`, `trust issuer URL audience AUD [jwks URL]`
+names an identity provider and `--on-behalf-of FILE` gives the run the
+user's token (a JWT, possibly from an OAuth 2.0 token exchange):
+`warden-secrets` verifies its signature against the issuer's keys fetched
+over verified HTTPS (RS256, PS256, ES256 or EdDSA; `none` and HMAC
+refused), its issuer, audience and times, and its `act` chain, and only the
+verified claims reach the Warden. `trust spiffe DOMAIN bundle PATH` and
+`--agent-svid FILE` verify the agent's X.509-SVID; `require on-behalf-of`
+refuses a run with no verified user. `subagent=NAME` on an `allow exec`
+rule makes the program it launches a sub-agent: the Warden gives it a
+control group (cgroup v2) of its own at its launch and attributes every
+call by its process's group, so a sub-agent's calls, and those of
+everything it starts, count as its own whatever it says about itself.
+Every decision record carries `obo` and `run_start` the verified chain and
+the operator; when the user's token expires the run is revoked (or, with
+`--on-behalf-of-expiry record`, recorded). `varek_audit.py` checks every
+record's chain against the launches and the policy; `varek runs`, `varek
+refusals --subagent/--user`, `varek policy show`, `varek doctor`, the
+preflight, the CycloneDX export and `varek bench --subagents` cover it. The
+chain is recorded, not enforced: no rule depends on it. `vault_ca` and
+`aws_ca` must be root-owned and not writable by others. The two faults the
+shared soak's trial found are fixed here too. The Warden reports version
+1.28.1; the grammar stays 1.28.
+
+Reviewed by AI review agents (not a human or third-party review); the
+shared 24-hour soak (with v1.29.0 and v1.31.0) passed on a 2 GB host: an
+agent acting for a verified user, 1,291 tasks, each nested sub-agent's
+calls attributed to it, 144 probes held, the run revoked when the token
+expired. See `RELEASE-v1.28.1.md` for the tests, latency, the review's
+findings, compatibility and known limits, and
+`docs/security/v1.28.1-delegation-chain.md` for the design.
+
+## [1.28.0] - 2026-10-15 — The agent holds only placeholders
+
+After `require warden 1.28`, `credential NAME from STORE:REF` names a
+credential in a file, HashiCorp Vault (KV, or a leased secret it renews)
+or AWS Secrets Manager. A separate helper, `warden-secrets` (its own
+binary, recorded by hash, running as its own user), fetches each at
+startup and hands the values to the egress proxy, never to the Warden. The
+agent gets a placeholder in `VAREK_CRED_<NAME>`. In inspecting mode, on a
+request an `allow request ... credential=NAME header=HEADER[:SCHEME]` rule
+decides SATISFIED (an `https://` rule only), the proxy puts the value in
+place of the placeholder in that header, and refuses the request
+(`credential_refused`) if the header does not hold exactly the
+placeholder; a placeholder anywhere else is sent as it is. `varek revoke
+<run>` makes every later call of the run UNSATISFIED, has the proxy clear
+every value and close every connection, and revokes the run's Vault
+leases. `run_start` records each credential's store, version and
+placeholder's SHA-256, never a value; `varek_audit.py` checks every
+request that carried one against its rule, each refused swap and the
+revocation; `varek refusals`, `varek policy show`, the CycloneDX export,
+`warden --check-credentials`, `varek doctor`, the preflight and `varek
+bench --proxy` cover it. Two faults the shared soak's trial found are
+fixed: a checkpoint is written before a record that would pass
+`checkpoint_every` (a burst of proxy reports could put more between two
+signatures, failing the audit), and the audit knows a launch refused
+after a revocation. The Warden reports version 1.28.0.
+
+Reviewed by AI review agents (not a human or third-party review); a
+24-hour soak on a 1 GB host passed: 1,291 calls with a credential, each
+value only where its rule names it, 144 probes held, 2,150 lease renewals,
+the revocation honored. See `RELEASE-v1.28.0.md` for the tests, latency,
+the review's findings, compatibility and known limits, and
+`docs/security/v1.28-credential-release.md` for the design.
+
+## [1.27.2] - 2026-10-16 — Checkpoints within their bound
+
+A patch release of v1.27.1 with one fix, to the signed verdict stream.
+The Warden wrote checkpoints only between notifications, but one pass over
+the egress proxy's reports (a burst of requests) can write several
+records, so a signed stream could hold more than `checkpoint_every`
+decision records between two signatures and fail its own audit
+("checkpoints were removed"). A checkpoint is now written before any
+decision record that would pass the bound. Signed runs with the
+inspecting proxy, v1.26.1 to v1.27.1, were affected; decisions and their
+enforcement never were. `make test-v1272` checks it (a signed run of 640
+requests in bursts of 32); a 24-hour signed soak on a 1 GB host passed.
+The Warden reports 1.27.2; the grammar stays 1.27. See
+`RELEASE-v1.27.2.md`.
+
 ## [1.27.1] - 2026-10-12 — Nothing written during the run is mapped executable
 
 Under `require warden 1.27`, every directory the policy lets the agent

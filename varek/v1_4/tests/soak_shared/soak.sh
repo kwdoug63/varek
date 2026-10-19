@@ -23,7 +23,10 @@
 # program built (make -C varek/v1_4 all tests/v1281_sub), with
 # python3-cryptography, openssl and git installed:
 #
-#   sudo varek/v1_4/tests/soak_shared/soak.sh [--hours 24] [--interval 60] [--out DIR] [--sign-key KEY]
+#   sudo varek/v1_4/tests/soak_shared/soak.sh [--hours 24] [--interval 60] [--out DIR] [--sign-key KEY] [--check-only]
+#
+# --check-only redoes the steps after the runs (C's draft, then soak_check.py)
+# on a finished soak's DIR.
 #
 # It writes DIR/{a,b,c}/ and, at the end, DIR/report.txt. It holds the
 # terminal for the whole run: start it with setsid nohup (see README.md).
@@ -31,13 +34,14 @@ set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 V14="$(cd "$HERE/../.." && pwd)"
-HOURS=24 INTERVAL=60 OUT="" KEY=""
+HOURS=24 INTERVAL=60 OUT="" KEY="" CHECK_ONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --hours) HOURS="$2"; shift 2 ;;
         --interval) INTERVAL="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         --sign-key) KEY="$2"; shift 2 ;;
+        --check-only) CHECK_ONLY=1; shift ;;
         *) echo "unknown option $1"; exit 2 ;;
     esac
 done
@@ -58,12 +62,47 @@ LEAD=$(python3 -c "print(int(min(max(5 * float('$INTERVAL'), 30), $SECS / 2)))")
 python3 -c "import sys; sys.exit(0 if 0.36 * $SECS / float('$INTERVAL') + 2 < 1000 else 1)" ||
     { echo "soak.sh: --interval too short for $HOURS h (run A would launch more than the 1024 sub-agents a run may)"; exit 2; }
 OUT="${OUT:-/var/tmp/varek-soak-shared-$(date -u +%Y%m%dT%H%M%SZ)}"
+AG=/opt/varek-soak-shared                    # the agents' files, read-only to them
+S=/etc/varek-soak-shared                     # the tokens: root's alone
+venv() { local d="$1"; shift
+         env -i PATH=/usr/bin:/bin NO_COLOR=1 VAREK_CONFIG="$OUT/$d/etc/varek.conf" VAREK_LIB_DIR="$OUT/$d/lib" \
+             VAREK_LOG_DIR="$OUT/$d/log" "$@"; }
+finish() {
+    # --- C's draft: varek policy suggest, then a short dry run under it ------------
+    ( cd "$OUT/c/work" && venv c python3 "$V14/tools/varek" policy suggest "$OUT/c/verdicts.log" -o "$OUT/c/draft.txt" ) \
+        > "$OUT/c/suggest.out" 2> "$OUT/c/suggest.err"
+    if [ -s "$OUT/c/draft.txt" ]; then
+        chmod 644 "$OUT/c/draft.txt"
+        ( cd "$OUT/c/work" && venv c python3 "$V14/tools/varek" run --dry-run --policy "$OUT/c/draft.txt" --run-as nobody \
+              --log "$OUT/c/draft.log" -- python3 "$AG/build_agent.py" --interval 1 --seconds 12 --outside "$OUT/c/work" ) \
+            > "$OUT/c/draft.jsonl" 2> "$OUT/c/draft.err"
+    fi
+
+    PK=()
+    [ -n "$KEY" ] && [ -e "$KEY.pub" ] && PK=(--pubkey "$KEY.pub")
+    python3 "$HERE/soak_check.py" --dir "$OUT" --checker "$V14/tools/vdp_cert_check" --vdp "$V14/tools/vdp_check" \
+        --values "$S/values.json" --hours "$HOURS" --interval "$INTERVAL" --lead "$LEAD" --dir-ag "$AG" "${PK[@]}"
+}
+# --check-only: the steps after the runs, again, on a finished soak's DIR (when
+# they were cut short, as by a host out of memory), with the same --hours,
+# --interval and --sign-key
+if [ "$CHECK_ONLY" = 1 ]; then
+    [ -n "$OUT" ] && [ -s "$OUT/a/verdicts.log" ] && [ -s "$OUT/b/verdicts.log" ] && [ -s "$OUT/c/verdicts.log" ] ||
+        { echo "soak.sh: --check-only needs --out DIR of a soak whose runs finished"; exit 2; }
+    echo "soak.sh: the steps after the runs again, on $OUT (--check-only)"
+    rm -f "$OUT/c/draft.txt" "$OUT/c/draft.log" "$OUT/c/draft.jsonl" "$OUT/c/draft.err"
+    finish
+    exit $?
+fi
+# a directory of its own: an earlier soak's files there would be judged with
+# this one's (v1.32, the container trial)
+if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
+    echo "soak.sh: $OUT is not empty: give the soak a directory of its own (--out)"; exit 2
+fi
 mkdir -p "$OUT/a" "$OUT/b/work" "$OUT/b/outside" "$OUT/c/work" "$OUT/as"
 chmod 755 "$OUT" "$OUT/a" "$OUT/b" "$OUT/c" "$OUT/as"
 chmod 1777 "$OUT/b/outside"                  # its owner's rights would let the agent write: only the policy refuses
 chown nobody "$OUT/b/work" "$OUT/c/work"
-AG=/opt/varek-soak-shared                    # the agents' files, read-only to them
-S=/etc/varek-soak-shared                     # the tokens: root's alone
 mkdir -p "$AG/bin" "$AG/srv" "$AG/proj" "$S"; chmod 755 "$AG" "$AG/bin" "$AG/srv" "$AG/proj"; chmod 700 "$S"
 cp "$HERE/agent_a.py" "$HERE/build_agent.py" "$AG/"; chmod 644 "$AG/agent_a.py" "$AG/build_agent.py"
 cp "$HERE/fs_server.py" "$HERE/gh_server.py" "$AG/srv/"; chmod 755 "$AG/srv/fs_server.py" "$AG/srv/gh_server.py"
@@ -170,9 +209,6 @@ WOPTS=(--secrets-conf "$S/secrets.conf" --dns-server "127.0.0.1:$DP" --trust-bun
     { cat "$OUT/a/check.out"; echo "soak.sh: run A's Warden would not start"; exit 1; }
 
 # --- runs B and C: varek run, kept apart from the host's own VAREK files ------
-venv() { local d="$1"; shift
-         env -i PATH=/usr/bin:/bin NO_COLOR=1 VAREK_CONFIG="$OUT/$d/etc/varek.conf" VAREK_LIB_DIR="$OUT/$d/lib" \
-             VAREK_LOG_DIR="$OUT/$d/log" "$@"; }
 BOPTS=(--interval "$INTERVAL" --seconds "$SECS")
 # C's policy: the baseline varek run would write for C's directory, the
 # project read-only but for build/ and .git/
@@ -237,17 +273,4 @@ echo "soak.sh: the runs finished (A exit $RA, B exit $RB, C exit $RC)"
 for _ in $(seq 60); do kill -0 "$WO" 2>/dev/null || break; sleep 1; done
 kill "$WO" 2>/dev/null
 
-# --- C's draft: varek policy suggest, then a short dry run under it ------------
-( cd "$OUT/c/work" && venv c python3 "$V14/tools/varek" policy suggest "$OUT/c/verdicts.log" -o "$OUT/c/draft.txt" ) \
-    > "$OUT/c/suggest.out" 2> "$OUT/c/suggest.err"
-if [ -s "$OUT/c/draft.txt" ]; then
-    chmod 644 "$OUT/c/draft.txt"
-    ( cd "$OUT/c/work" && venv c python3 "$V14/tools/varek" run --dry-run --policy "$OUT/c/draft.txt" --run-as nobody \
-          --log "$OUT/c/draft.log" -- python3 "$AG/build_agent.py" --interval 1 --seconds 12 --outside "$OUT/c/work" ) \
-        > "$OUT/c/draft.jsonl" 2> "$OUT/c/draft.err"
-fi
-
-PK=()
-[ -n "$KEY" ] && [ -e "$KEY.pub" ] && PK=(--pubkey "$KEY.pub")
-python3 "$HERE/soak_check.py" --dir "$OUT" --checker "$V14/tools/vdp_cert_check" --vdp "$V14/tools/vdp_check" \
-    --values "$S/values.json" --hours "$HOURS" --interval "$INTERVAL" --lead "$LEAD" --dir-ag "$AG" "${PK[@]}"
+finish

@@ -236,6 +236,11 @@ static int probe(void) {
         { "loader_written",          "the loader given a written file (set: program + loader)",   0, 1 },
     };
     int bad = 0;
+    /* v1.32: overlayfs before Linux 6.6 (a container's /tmp) has no
+     * O_TMPFILE; those rows cannot be set up there, and say so */
+    int tf = open(scratch, O_TMPFILE | O_RDWR, 0600);
+    int have_tmpfile = tf >= 0;
+    if (tf >= 0) close(tf);
     printf("%-28s\t%-62s\t%-16s\t%-16s\t%s\n", "id", "launch", "control", "in the domain", "verdict");
     for (size_t i = 0; i < sizeof rows / sizeof *rows; i++) {
         char c[64], d[64];
@@ -243,7 +248,8 @@ static int probe(void) {
         run_child(rows[i].id, 1, rows[i].with_loader, d, sizeof d);
         const char *v;
         int refused = !strncmp(d, "refused", 7);
-        if (rows[i].must_refuse < 0) { v = !strcmp(d, "runs") ? "ok (runs)" : "FAIL (the set's program must run)"; bad |= strcmp(d, "runs") != 0; }
+        if (!have_tmpfile && !strncmp(rows[i].id, "tmpfile", 7)) v = "skip (no O_TMPFILE on this filesystem)";
+        else if (rows[i].must_refuse < 0) { v = !strcmp(d, "runs") ? "ok (runs)" : "FAIL (the set's program must run)"; bad |= strcmp(d, "runs") != 0; }
         else if (rows[i].must_refuse) {
             if (!refused) { v = "FAIL (must be refused)"; bad = 1; }
             else v = !strcmp(c, "runs") ? "ok (refused by Landlock)" : "ok (refused; refused without Landlock too)";
