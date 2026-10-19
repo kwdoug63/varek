@@ -81,6 +81,8 @@ jobs:
         run: sudo make -C varek/v1_4 test-v1311
       - name: v1.32 containers (the version, varek doctor and the run's refusal in a container, the packaging)
         run: sudo make -C varek/v1_4 test-v1320
+      - name: v1.32.1 rootless Podman without --systemd=always (the cgroup remount in a user namespace, delegated or not)
+        run: sudo make -C varek/v1_4 test-v1321
       - name: Build and test the plan_verify CLI (v1_6, v1.16.3)
         run: make -C v1_6 plan_verify check check-plan-verify
       - name: Test the v1.7 layer (v1.18.0)

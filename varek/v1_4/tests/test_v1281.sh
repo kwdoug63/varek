@@ -535,24 +535,18 @@ sys.exit(0 if rs and all(isinstance(r.get("obo"), list) and r["obo"][:1] == ["ag
             timeout 60 '$WARDEN' '$B/p.txt' -- '$B/agent' exec '$B/a' open '$B/f' > /dev/null 2> '$OUT/ro.out'; \
             mkdir '$CGM/v1281-ro' 2> '$OUT/ro.mkdir'"
         rmdir "$CGM/v1281-ro" 2>/dev/null
-        # the initial user namespace's inode (PROC_USER_INIT_INO), as the Warden tells
-        if [ "$(stat -Lc %i /proc/self/ns/user)" = 4026531837 ]; then
-            check "a container's read-only cgroup filesystem: --check-startup tries the remount and says the run makes it" \
-                sh -c "grep -q 'is read-only (a container.s, its own groups only): a run remounts it read-write in the Warden.s own mount namespace (tried)' '$OUT/rocs.out' && grep -q 'sub-agents: a run.s control groups go under $CGM' '$OUT/rocs.out'"
-            check "... a run remounts it read-write in the Warden's own mount namespace; the sub-agent is attributed" \
-                sh -c "grep -q 'remounted read-write in the Warden.s own mount namespace' '$OUT/ro.out' && grep -q '\"subagent\":\"alpha#1\"' '$OUT/ro.out'"
-            # v1.32 second review: the check says which step failed (here, the
-            # mount namespace: no CAP_SYS_ADMIN), not only the profile
-            if command -v setpriv > /dev/null 2>&1; then
-                rocg setpriv --bounding-set=-sys_admin --inh-caps=-sys_admin -- \
-                    timeout 60 "$WARDEN" "$B/p.txt" --check-startup > "$OUT/rocsna.out" 2>&1
-                check "... without CAP_SYS_ADMIN, --check-startup names it, not the profile" \
-                    sh -c "grep -q 'cannot make a mount namespace for the cgroup filesystem (Operation not permitted); in a container, add --cap-add SYS_ADMIN' '$OUT/rocsna.out' && ! grep -q 'run with VAREK.s profile' '$OUT/rocsna.out'"
-            fi
-        else
-            # v1.32 (D10): a user namespace (rootless) cannot remount it
-            check "rootless: a read-only cgroup filesystem refused at --check-startup and at a run, naming --systemd=always" \
-                sh -c "grep -q 'where the Warden does not remount it; run the container with --systemd=always' '$OUT/rocs.out' && grep -q 'where the Warden does not remount it; run the container with --systemd=always' '$OUT/ro.out'"
+        # v1.32.1: the same in a user namespace (rootless), where v1.32.0 refused
+        check "a container's read-only cgroup filesystem: --check-startup tries the remount and says the run makes it" \
+            sh -c "grep -q 'is read-only (a container.s, its own groups only): a run remounts it read-write in the Warden.s own mount namespace (tried)' '$OUT/rocs.out' && grep -q 'sub-agents: a run.s control groups go under $CGM' '$OUT/rocs.out'"
+        check "... a run remounts it read-write in the Warden's own mount namespace; the sub-agent is attributed" \
+            sh -c "grep -q 'remounted read-write in the Warden.s own mount namespace' '$OUT/ro.out' && grep -q '\"subagent\":\"alpha#1\"' '$OUT/ro.out'"
+        # v1.32 second review: the check says which step failed (here, the
+        # mount namespace: no CAP_SYS_ADMIN), not only the profile
+        if command -v setpriv > /dev/null 2>&1; then
+            rocg setpriv --bounding-set=-sys_admin --inh-caps=-sys_admin -- \
+                timeout 60 "$WARDEN" "$B/p.txt" --check-startup > "$OUT/rocsna.out" 2>&1
+            check "... without CAP_SYS_ADMIN, --check-startup names it, not the profile" \
+                sh -c "grep -q 'cannot make a mount namespace for the cgroup filesystem (Operation not permitted); in a container, add --cap-add SYS_ADMIN' '$OUT/rocsna.out' && ! grep -q 'run with VAREK.s profile' '$OUT/rocsna.out'"
         fi
         check "... and outside the Warden it stays read-only" grep -q 'Read-only file system' "$OUT/ro.mkdir"
         # the namespace's root is the group it was made in; moved below it,
