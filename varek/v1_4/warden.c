@@ -55,7 +55,7 @@
  * Build:    make
  * Run:      sudo ./warden policy.txt -- ./target_program [args...]
  *
- * Requires: Linux kernel >= 5.14, x86_64 (BPF arch check).
+ * Requires: Linux kernel >= 5.14, x86_64 or aarch64 (BPF arch check).
  */
 
 #ifndef _GNU_SOURCE
@@ -811,6 +811,10 @@ static int derive_intent(const struct seccomp_notif *req,
     memset(out, 0, sizeof(*out));
     out->policy_line = -1;
     int nr = (int)req->data.nr;
+    /* v1.33: a negative number is no system call (the legacy calls arm64
+     * lacks are given such numbers here, and the filter notifies none):
+     * never derived as one */
+    if (nr < 0) { out->kind = ACT_OTHER; snprintf(out->target, sizeof out->target, "syscall:%d", nr); return 0; }
     /* v1.29: the changes by name (warden_change.inc.c) */
     int cr = g_changes_on ? change_derive(req, out) : 0;
     if (cr) return cr < 0 ? -1 : 0;

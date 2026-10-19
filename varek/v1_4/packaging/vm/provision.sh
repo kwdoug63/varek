@@ -3,7 +3,7 @@
 #
 # provision.sh — v1.30 (docs/security/v1.30-macos.md, step 4): set up the
 # guest VAREK runs in on a Mac. Run as root inside the VM by `varek vm init`,
-# with the VAREK checkout shared read from SRC:
+# with a copy of the VAREK checkout in SRC (sent over ssh):
 #
 #   provision.sh SRC
 #
@@ -50,12 +50,18 @@ dnf -y install gcc make git tar python3 libseccomp-devel openssl-devel
 # epel-release is installed only signed by it (dnf does not check a package
 # given by its URL), and every EPEL package after it is checked by it
 if ! rpm -q epel-release > /dev/null 2>&1; then
-    rpm --import "$SRC/varek/v1_4/packaging/vm/RPM-GPG-KEY-EPEL-9"
+    KEY="$SRC/varek/v1_4/packaging/vm/RPM-GPG-KEY-EPEL-9"
+    FPR="$(gpg --show-keys --with-colons "$KEY" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }')"
+    [ "$FPR" = FF8AD1344597106ECE813B918A3872BF3228467C ] || die "the EPEL key kept with this file is not EPEL 9's ($FPR)"
+    rpm --import "$KEY"
     rpm -q gpg-pubkey-3228467c > /dev/null || die "EPEL 9's key did not import"
-    curl -fsSL -o /tmp/epel-release.rpm https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
-    rpm -K /tmp/epel-release.rpm | grep -q 'digests signatures OK$' || die "epel-release is not signed by EPEL 9's key"
-    dnf -y install /tmp/epel-release.rpm
-    rm -f /tmp/epel-release.rpm
+    T="$(mktemp -d)"
+    curl -fsSL -o "$T/epel-release.rpm" https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+    # signed, and by that key (rpm -K alone accepts any key imported)
+    rpm -Kv "$T/epel-release.rpm" | grep -Eqi 'signature.*key id 3228467c: ok' || die "epel-release is not signed by EPEL 9's key"
+    rpm -K "$T/epel-release.rpm" | grep -q 'digests signatures OK$' || die "epel-release's digests or signatures do not check"
+    dnf -y install "$T/epel-release.rpm"
+    rm -rf "$T"
 fi
 dnf -y install libsodium-devel
 

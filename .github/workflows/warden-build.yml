@@ -10,7 +10,8 @@ name: Warden build
 # host matching), the Python suites, and the exporter's output against the
 # CycloneDX 1.6 schema.
 # v1.24.0: the host-name grammar and the resolution table (make test-v1240).
-# v1.30.0: the same job on arm64 (a matrix), and make test-v1300.
+# v1.33.0: the same job on arm64 (a matrix, both runners pinned to Ubuntu
+# 24.04), and make test-v1300.
 
 on:
   push:
@@ -28,7 +29,7 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: aarch64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
@@ -50,7 +51,7 @@ jobs:
         run: make -C varek/v1_4 all
       - name: Check the deployment scripts parse
         run: |
-          python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py varek/v1_4/tools/varek_bench.py
+          python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py varek/v1_4/tools/varek_bench.py varek/v1_4/tools/varek_vm.py varek/v1_4/tools/varek_suggest.py
           bash -n varek/v1_4/tools/varek_preflight.sh
           bash -n varek/v1_4/tools/varek_anchor_receiver.sh
       - name: Lint the shipped policies

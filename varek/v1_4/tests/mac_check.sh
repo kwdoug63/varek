@@ -6,12 +6,14 @@
 # EC2 Mac). Run as the Mac's user (not root), from a checkout of the v1.30
 # branch, after `brew install vfkit qemu python`:
 #
-#   varek/v1_4/tests/mac_check.sh [--image FILE] [--out DIR] [--sweep] [--soak-trial]
+#   varek/v1_4/tests/mac_check.sh [--image FILE --sha256 HEX] [--out DIR] [--sweep] [--soak-trial]
 #
 # --image FILE   the RHEL 9 aarch64 KVM guest image (9.6 or later), for the
-#                first run: `varek vm init` makes the VM from it. A RHEL guest
-#                stops there to be registered with your own login; then run
-#                this again without --image (it carries on with --resume).
+#                first run: `varek vm init` makes the VM from it, checked
+#                against --sha256 (as Red Hat's download page shows it). A
+#                RHEL guest stops there to be registered with your own login;
+#                then run this again without --image (it carries on with
+#                --resume).
 # --sweep        also run every suite inside the VM (tests/arm64_sweep.sh; an
 #                hour or more)
 # --soak-trial   also the shared soak's 6-minute trial inside the VM
@@ -21,20 +23,25 @@
 #   1. the Mac: macOS on Apple silicon, vfkit, qemu-img, ssh;
 #   2. the VM made and set up (varek vm init), once;
 #   3. its start time, cold, with a project shared; varek doctor inside;
-#   4. what the VM sees of the Mac: the project share only (no /Users, no
-#      home directory, one virtio-fs mount besides the setup's);
+#   4. what the VM sees of the Mac: the project share only (one virtio-fs
+#      mount; of the Mac's /Users only the path to the project), even to
+#      root in the VM (a link or .. out of the share);
 #   5. an agent under the Warden in the VM (varek vm run): it reads and
 #      writes the project, and the Mac sees its file; it cannot read a file
 #      in the Mac's home directory (not in the VM at all), nor write outside
-#      the project in the VM; its verdict stream copied to the project;
+#      the project in the VM, nor connect to the Mac (the VM's gateway) or
+#      to the instance metadata service; its verdict stream copied to the
+#      project and audited; what root in the VM reaches of the Mac's network
+#      is reported (a known limit, docs/security/v1.30-macos.md);
 #   6. (--sweep) every suite inside the VM; (--soak-trial) the soak's trial.
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 VAREK="$HERE/tools/varek"
-IMAGE="" OUT="$HOME/varek-mac-check" SWEEP=0 SOAK=0
+IMAGE="" SHA="" OUT="$HOME/varek-mac-check" SWEEP=0 SOAK=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --image) IMAGE="$2"; shift 2 ;;
+        --sha256) SHA="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         --sweep) SWEEP=1; shift ;;
         --soak-trial) SOAK=1; shift ;;
@@ -69,7 +76,8 @@ echo "== 2. the VM" | tee -a "$SUM"
 VMJ="${VAREK_VM_DIR:-$HOME/.varek/vm}/default/vm.json"
 if [ -n "$IMAGE" ] && [ ! -e "$VMJ" ]; then
     t0=$(date +%s)
-    vk vm init --image "$IMAGE" 2>&1 | tee "$OUT/init.log"; rc=${PIPESTATUS[0]}
+    [ -n "$SHA" ] || { echo "mac_check.sh: --image needs --sha256 HEX (Red Hat's download page shows it)"; exit 2; }
+    vk vm init --image "$IMAGE" --sha256 "$SHA" 2>&1 | tee "$OUT/init.log"; rc=${PIPESTATUS[0]}
     if [ "$rc" = 3 ]; then
         echo "mac_check.sh: register the guest as the lines above say, then run this again without --image"
         exit 3
@@ -99,15 +107,21 @@ else
 fi
 vssh "sudo varek doctor" > "$OUT/doctor.txt" 2>&1
 check "varek doctor in the VM: Landlock, seccomp user-notify, cgroup v2" \
-    sh -c "grep -qi 'landlock' '$OUT/doctor.txt' && ! grep -E '^ *FAIL' '$OUT/doctor.txt' | grep -qiv 'varek.conf'"
+    sh -c "grep -Eq 'OK.*Landlock ABI' '$OUT/doctor.txt' && ! grep -E '^ *FAIL' '$OUT/doctor.txt' | grep -qiv 'varek.conf'"
 vssh "uname -srm; . /etc/os-release; echo \$PRETTY_NAME; cat /sys/kernel/security/lsm" > "$OUT/guest.txt" 2>&1
 echo "  guest: $(tr '\n' ' ' < "$OUT/guest.txt")" | tee -a "$SUM"
 
 echo "== 4. what the VM sees of the Mac" | tee -a "$SUM"
 vssh "findmnt -rn -t virtiofs -o TARGET,SOURCE" > "$OUT/mounts.txt" 2>&1
 check "one virtio-fs share, the project, at the Mac's path" sh -c "[ \"\$(wc -l < '$OUT/mounts.txt')\" = 1 ] && grep -q '^$PROJ project' '$OUT/mounts.txt'"
-check "no /Users and no home directory of the Mac's in the VM" vssh "[ ! -e /Users ] && [ ! -e '$HOME' ] || [ '$HOME' = '$PROJ' ]"
-check "the Mac's file outside the project is not in the VM" vssh "[ ! -e '$SECRET' ]"
+# the project's path is made in the VM to mount it at: nothing else of /Users
+check "of the Mac's /Users, only the path to the project" vssh \
+    "[ -z \"\$(sudo find /Users -path '$PROJ' -prune -o -print | grep -vx -e /Users -e '$HOME' -e '$(dirname "$PROJ")')\" ]"
+check "the Mac's file outside the project is not in the VM" vssh "! sudo test -e '$SECRET'"
+check "root in the VM: a link out of the share does not reach it" vssh \
+    "sudo ln -sfn '$SECRET' '$PROJ/link-out' && ! sudo cat '$PROJ/link-out'; sudo rm -f '$PROJ/link-out'"
+check "root in the VM: .. from the share does not reach it" vssh "! sudo cat '$PROJ/../$(basename "$SECRET")'"
+GW="$(vssh "ip route show default | awk '{print \$3; exit}'" 2>/dev/null)"
 
 echo "== 5. an agent under the Warden in the VM" | tee -a "$SUM"
 cat > "$PROJ/probe.py" <<EOF
@@ -121,6 +135,11 @@ t("write_project", lambda: open("from-the-vm.txt", "w").write("written by the ag
 t("read_mac_secret", lambda: open("$SECRET").read())
 t("write_outside", lambda: open("/var/tmp/varek-mac-check-outside", "w").write("x"))
 t("read_shadow", lambda: open("/etc/shadow").read())
+import socket
+def conn(host, port):
+    s = socket.create_connection((host, port), timeout=5); s.close()
+t("connect_mac", lambda: conn("${GW:-192.168.64.1}", 22))
+t("connect_imds", lambda: conn("169.254.169.254", 80))
 print(json.dumps(r))
 EOF
 (cd "$PROJ" && vk vm run --profile python -- python3 probe.py) > "$OUT/probe.out" 2> "$OUT/probe.err"
@@ -130,14 +149,30 @@ check "... and the Mac sees what it wrote" grep -q 'written by the agent in the 
 [ "$(r read_mac_secret)" != ok ] && pass "it cannot read the Mac's file outside the project ($(r read_mac_secret))" || flunk "it read the Mac's file outside the project"
 [ "$(r write_outside)" != ok ] && pass "it cannot write outside the project in the VM ($(r write_outside))" || flunk "it wrote outside the project"
 [ "$(r read_shadow)" != ok ] && pass "it cannot read the VM's /etc/shadow ($(r read_shadow))" || flunk "it read /etc/shadow"
-check "its verdict stream copied to the project (.varek/)" sh -c "ls '$PROJ'/.varek/verdicts-*.log"
-check "... and the stream audits" sh -c "python3 '$HERE/tools/varek' audit \"\$(ls -t '$PROJ'/.varek/verdicts-*.log | head -1)\" > '$OUT/audit.txt' 2>&1 || grep -q 'PASS\\|VERIFIED' '$OUT/audit.txt'"
+[ "$(r connect_mac)" != ok ] && pass "it cannot connect to the Mac, the VM's gateway ${GW:-192.168.64.1}:22 ($(r connect_mac))" || flunk "it connected to the Mac"
+[ "$(r connect_imds)" != ok ] && pass "it cannot connect to the instance metadata service ($(r connect_imds))" || flunk "it connected to 169.254.169.254"
+# the stream by the name varek vm run gave it, not the newest file in a directory the agent writes
+STREAM="$(sed -n 's/^\[varek\] the run.s verdict stream: //p' "$OUT/probe.err" | tail -1)"
+check "its verdict stream copied to the project (.varek/)" test -s "$STREAM"
+python3 "$HERE/tools/varek" audit "$STREAM" > "$OUT/audit.txt" 2>&1; arc=$?
+[ "$arc" = 0 ] && pass "... and the stream audits (exit 0)" || flunk "the stream's audit: exit $arc ($OUT/audit.txt)"
+# root in the VM, unlike the agent, is not under the Warden: what it reaches of the Mac's network
+for t in "${GW:-192.168.64.1} 22" "${GW:-192.168.64.1} 5000" "169.254.169.254 80"; do
+    set -- $t
+    if vssh "timeout 5 bash -c '</dev/tcp/$1/$2'" > /dev/null 2>&1; then w="reaches"; else w="does not reach"; fi
+    echo "  INFO  root in the VM $w $1:$2" | tee -a "$SUM"
+done
 
 if [ "$SWEEP" = 1 ]; then
     echo "== 6a. every suite inside the VM" | tee -a "$SUM"
     vssh "sudo /opt/varek-src/varek/v1_4/tests/arm64_sweep.sh --deps --out /var/tmp/varek-vm-sweep" > "$OUT/sweep.log" 2>&1
     vssh "cat /var/tmp/varek-vm-sweep/summary.txt 2>/dev/null || ls /var/tmp/varek-vm-sweep" > "$OUT/sweep-summary.txt" 2>&1
     tail -45 "$OUT/sweep-summary.txt" | tee -a "$SUM"
+    if grep -q ' FAILED ' "$OUT/sweep-summary.txt" || ! grep -Eq '^test-[a-z0-9-]+ +ok ' "$OUT/sweep-summary.txt"; then
+        flunk "every suite inside the VM ($OUT/sweep-summary.txt)"
+    else
+        pass "every suite inside the VM"
+    fi
 fi
 if [ "$SOAK" = 1 ]; then
     echo "== 6b. the shared soak's 6-minute trial inside the VM" | tee -a "$SUM"

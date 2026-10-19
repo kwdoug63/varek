@@ -950,9 +950,12 @@ else
     check "... a file the policy does not name: EACCES"                             go "rstat Permission denied"
     check "... a missing file where the policy allows it: ENOENT"                    go "rstat No such file or directory"
     check "lstat(2) answers the link itself"                                        rec "$G/a.log" "r.get('action') == 'file.stat' and r.get('resolved') == '$G/o/link' and r['rule'] == 'metadata_answered'"
-    # v1.30: arm64 has no stat(2); its newfstatat(2) is decided under 1.28 as before
+    # v1.33.0: arm64 has no stat(2); its newfstatat(2) is decided under 1.28 as
+    # before (from v1.17.0): the allowed file answered, the other refused
     if [ "$(uname -m)" = aarch64 ]; then
-        skip "under require warden 1.28, stat(2) is refused by the filter (arm64 has no stat(2))"
+        check "under require warden 1.28, newfstatat(2) is decided as before (arm64 has no stat(2))" sh -c \
+            "grep -qx 'rstat ok' '$G/b.out' && grep -qx 'rstat Permission denied' '$G/b.out'"
+        check "... recorded as a lookup (file.stat), metadata_answered"             rec "$G/b.log" "r.get('action') == 'file.stat' and r.get('resolved') == '$G/o/r' and r['rule'] == 'metadata_answered'"
     else
         check "under require warden 1.28, stat(2) is refused by the filter (EPERM), as before" bo "rstat Operation not permitted"
     fi

@@ -80,25 +80,76 @@ PRIVILEGED = ("sudo", "su", "doas", "pkexec")
 O_ACCMODE, O_CREAT, O_TRUNC = 3, 0x40, 0x200
 
 
-def _syscall_names(arch="x86_64"):
-    """the system calls' names by number, for the architecture the run was
-    recorded on (run_start's arch, v1.30; x86_64 before it)"""
-    if arch == "aarch64":
-        # arm64's are the generic table: numbers, and names defined by another
-        # (__NR_fstat __NR3264_fstat), the 64-bit one first
+# what arm64's uapi <asm/unistd.h> defines before it includes the generic
+# table: the calls the table gives only to architectures that want them
+ARM64_WANTS = frozenset({"__ARCH_WANT_RENAMEAT", "__ARCH_WANT_NEW_STAT", "__ARCH_WANT_SET_GET_RLIMIT",
+                         "__ARCH_WANT_TIME32_SYSCALLS", "__ARCH_WANT_SYS_CLONE3", "__ARCH_WANT_MEMFD_SECRET"})
+
+
+def _generic_syscall_names(text, wants, bits=64):
+    """{number: name} from <asm-generic/unistd.h>'s text, for an architecture
+    defining the macros in wants: its conditional blocks followed (an
+    architecture that does not want sync_file_range2 has sync_file_range at
+    84), names defined by another (__NR_fstat __NR3264_fstat) resolved, and
+    markers that name no call (__NR_arch_specific_syscall, __NR_syscalls)
+    left out"""
+    def cond(expr):
+        e = re.sub(r"defined\s*\(\s*(\w+)\s*\)|defined\s+(\w+)",
+                   lambda m: str((m.group(1) or m.group(2)) in wants), expr)
+        e = e.replace("__BITS_PER_LONG", str(bits)).replace("&&", " and ").replace("||", " or ")
+        e = re.sub(r"!(?!=)", " not ", e)
         try:
-            with open("/usr/include/asm-generic/unistd.h") as fh:
-                t = fh.read()
-        except OSError:
-            return {}
-        n3264 = {m.group(1): int(m.group(2)) for m in re.finditer(r"#define __NR3264_(\w+)\s+(\d+)", t)}
-        names = {}
-        for m in re.finditer(r"#define __NR_(\w+)\s+(\d+|__NR3264_\w+)\b", t):
+            return bool(eval(e, {"__builtins__": {}}, {"True": True, "False": False}))
+        except Exception:
+            return True
+    n3264, names, stack = {}, {}, []      # stack: (this branch taken, a branch taken so far)
+    for line in text.splitlines():
+        d = line.strip()
+        if d.startswith("#ifdef") or d.startswith("#ifndef"):
+            on = (d.split()[1] in wants) if len(d.split()) > 1 else True
+            on = on if d.startswith("#ifdef") else not on
+            stack.append((on, on))
+            continue
+        if d.startswith("#if"):
+            on = cond(d[3:])
+            stack.append((on, on))
+            continue
+        if d.startswith("#elif") and stack:
+            _, any_ = stack[-1]
+            on = not any_ and cond(d[5:])
+            stack[-1] = (on, any_ or on)
+            continue
+        if d.startswith("#else") and stack:
+            _, any_ = stack[-1]
+            stack[-1] = (not any_, True)
+            continue
+        if d.startswith("#endif") and stack:
+            stack.pop()
+            continue
+        if not all(on for on, _ in stack):
+            continue
+        m = re.match(r"#define __NR3264_(\w+)\s+(\d+)", d)
+        if m:
+            n3264[m.group(1)] = int(m.group(2))
+            continue
+        m = re.match(r"#define __NR_(\w+)\s+(\d+|__NR3264_\w+)\b", d)
+        if m and m.group(1) not in ("syscalls", "arch_specific_syscall"):
             v = m.group(2)
             n = int(v) if v.isdigit() else n3264.get(v[len("__NR3264_"):])
-            if n is not None and m.group(1) != "syscalls":
+            if n is not None:
                 names.setdefault(n, m.group(1))
-        return names
+    return names
+
+
+def _syscall_names(arch="x86_64"):
+    """the system calls' names by number, for the architecture the run was
+    recorded on (run_start's arch, v1.33.0; x86_64 before it)"""
+    if arch == "aarch64":
+        try:
+            with open("/usr/include/asm-generic/unistd.h") as fh:
+                return _generic_syscall_names(fh.read(), ARM64_WANTS)
+        except OSError:
+            return {}
     for p in ("/usr/include/x86_64-linux-gnu/asm/unistd_64.h", "/usr/include/asm/unistd_64.h"):
         try:
             with open(p) as fh:

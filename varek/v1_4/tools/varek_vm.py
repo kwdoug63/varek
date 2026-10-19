@@ -9,7 +9,8 @@ it under the Warden as on Linux. The Mac shares one directory with the VM,
 the project, mounted at the same path inside; never the home directory or a
 directory holding it.
 
-  varek vm init --image FILE   make the VM from a RHEL 9 aarch64 KVM guest
+  varek vm init --image FILE --sha256 HEX
+                               make the VM from a RHEL 9 aarch64 KVM guest
                                image (qcow2 or raw), and set it up: the
                                Warden built and installed inside
   varek vm start [DIR]         start it with DIR (default: the working
@@ -51,18 +52,74 @@ class VmError(Exception):
 
 # ------------------------------------------------------------------ pure --
 
-def check_share(path, home=None):
-    """the directory to share with the VM, resolved; refused: the root, the
-    home directory or any directory holding it, /Users, a non-directory"""
+def check_share(path, home=None, refuse=()):
+    """the directory to share with the VM, resolved; refused: a non-directory,
+    the home directory or any directory holding it, a directory in a hidden
+    one of the home directory's (~/.ssh, ~/.varek...) or in its Library
+    (keychains, mail, browsers' profiles), a volume's root, the
+    system's directories, and each directory in refuse (the VMs' own, the
+    VAREK checkout) or one holding it. Compared by the file, not its name:
+    the Mac's file system folds case, and firmlinks (/System/Volumes/Data)
+    give the same directory a second name."""
     home = os.path.realpath(home or os.path.expanduser("~"))
     p = os.path.realpath(path)
     if not os.path.isdir(p):
         raise VmError(f"{path} is not a directory", fix="share the project directory")
-    if p == "/" or p in ("/Users", "/Volumes", "/private", "/System") or \
-            home == p or home.startswith(p.rstrip("/") + "/"):
-        raise VmError(f"{p} would share the home directory or more with the VM",
-                      fix="share the project directory itself, e.g. ~/src/project")
+    fix = "share the project directory itself, e.g. ~/src/project"
+    st = os.stat(p)
+
+    def holds(d):
+        """p is d or a directory holding d"""
+        d = os.path.realpath(d)
+        while True:
+            try:
+                if os.path.samestat(os.stat(d), st):
+                    return True
+            except OSError:
+                pass
+            up = os.path.dirname(d)
+            if up == d:
+                return False
+            d = up
+    if p == "/" or os.path.ismount(p) or holds(home):
+        raise VmError(f"{p} would share the home directory or more with the VM", fix=fix)
+    low = p.lower().rstrip("/") + "/"
+    if low.startswith(("/system/", "/library/", "/private/", "/users/shared/", "/applications/", "/usr/",
+                       "/bin/", "/sbin/", "/etc/", "/opt/homebrew/")) or low in ("/users/", "/volumes/"):
+        raise VmError(f"{p} is a system directory", fix=fix)
+    for r in refuse:
+        if r and os.path.exists(r) and (holds(r) or _under(p, r)):
+            raise VmError(f"{p} would share {r} with the VM", fix=fix)
+    # a directory in one of the home directory's hidden directories
+    d = p
+    while True:
+        up = os.path.dirname(d)
+        if up == d:
+            break
+        try:
+            b = os.path.basename(d)
+            if os.path.samestat(os.stat(up), os.stat(home)) and (b.startswith(".") or b.lower() == "library"):
+                raise VmError(f"{p} is in a hidden directory of the home directory's, or its Library ({d})", fix=fix)
+        except OSError:
+            pass
+        d = up
     return p
+
+
+def _under(p, r):
+    """p is r or under it, by the file"""
+    rs = os.stat(r)
+    d = p
+    while True:
+        try:
+            if os.path.samestat(os.stat(d), rs):
+                return True
+        except OSError:
+            pass
+        up = os.path.dirname(d)
+        if up == d:
+            return False
+        d = up
 
 
 def new_mac(rand=secrets.token_bytes):
@@ -134,7 +191,7 @@ def vfkit_argv(vfkit, vmdir, cfg, shares=(), cloud_init=None):
     a = [vfkit, "--cpus", str(cfg["cpus"]), "--memory", str(cfg["memory_mib"]),
          "--bootloader", f"efi,variable-store={efi}" + ("" if os.path.exists(efi) else ",create"),
          "--device", f"virtio-blk,path={os.path.join(vmdir, 'disk.raw')}",
-         "--device", f"virtio-net,nat,mac={cfg['mac']}",
+         "--device", f"virtio-net,nat,mac={_mac(cfg)}",
          "--device", "virtio-rng",
          "--device", f"virtio-serial,logFilePath={os.path.join(vmdir, 'serial.log')}"]
     for path, tag in shares:
@@ -148,10 +205,25 @@ def vfkit_argv(vfkit, vmdir, cfg, shares=(), cloud_init=None):
     return a
 
 
+def _mac(cfg):
+    m = norm_mac(str(cfg.get("mac", "")))
+    if not m:
+        raise VmError("the VM's MAC address in vm.json is not one", fix="remove the VM's directory and make it again")
+    return m
+
+
 def ssh_argv(vmdir, ip, cmd=None, tty=False):
-    a = ["ssh", "-i", os.path.join(vmdir, "id_ed25519"),
-         "-o", f"UserKnownHostsFile={os.path.join(vmdir, 'known_hosts')}",
-         "-o", "StrictHostKeyChecking=accept-new", "-o", "IdentitiesOnly=yes",
+    """ssh to the VM, with none of the user's own ssh configuration (no
+    agent, X11 or port forwarding, no local command, no shared connection):
+    the VM is not trusted with the Mac's keys. Its host key is trusted on
+    first use, kept under one name whatever its address, then pinned."""
+    kh = os.path.join(vmdir, "known_hosts")
+    a = ["ssh", "-F", "/dev/null", "-a", "-x", "-i", os.path.join(vmdir, "id_ed25519"),
+         "-o", f"UserKnownHostsFile={kh}", "-o", "GlobalKnownHostsFile=/dev/null",
+         "-o", "HostKeyAlias=varek-vm",
+         "-o", "StrictHostKeyChecking=" + ("yes" if os.path.exists(kh) and os.path.getsize(kh) else "accept-new"),
+         "-o", "IdentitiesOnly=yes", "-o", "ForwardAgent=no", "-o", "ForwardX11=no",
+         "-o", "ClearAllForwardings=yes", "-o", "PermitLocalCommand=no", "-o", "ControlPath=none",
          "-o", "ConnectTimeout=5", "-o", "LogLevel=ERROR"]
     if tty:
         a.append("-t")
@@ -187,10 +259,13 @@ def save_cfg(vmdir, cfg):
 
 
 def running_pid(vmdir):
+    """vfkit's pid, if the VM's vfkit is running: the pid file's process,
+    if it is vfkit (a pid left from before a crash may be another's now)"""
     try:
         pid = int(open(os.path.join(vmdir, "vfkit.pid")).read())
         os.kill(pid, 0)
-        return pid
+        comm = subprocess.run(["ps", "-p", str(pid), "-o", "comm="], capture_output=True, text=True).stdout.strip()
+        return pid if os.path.basename(comm) == "vfkit" else None
     except (OSError, ValueError):
         return None
 
@@ -249,12 +324,23 @@ def halt(vmdir, cfg):
     ip = guest_ip(cfg)
     if ip:
         ssh(vmdir, ip, "sudo systemctl poweroff", check=False, capture_output=True)
-    for _ in range(60):
-        if not running_pid(vmdir):
-            break
-        time.sleep(1)
-    else:
-        os.kill(pid, signal.SIGTERM)
+    # the guest may not power off: vfkit is ended, then killed, and the
+    # share is not recorded gone until it has
+    for sig in (None, signal.SIGTERM, signal.SIGKILL):
+        if sig:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        for _ in range(60 if sig is None else 15):
+            if not running_pid(vmdir):
+                break
+            time.sleep(1)
+        else:
+            continue
+        break
+    if running_pid(vmdir):
+        raise VmError(f"the VM's vfkit (pid {pid}) does not stop", fix=f"kill -9 {pid}")
     cfg["project"] = None
     save_cfg(vmdir, cfg)
     return True
@@ -262,30 +348,99 @@ def halt(vmdir, cfg):
 
 # -------------------------------------------------------------- commands --
 
+def image_format(fd):
+    """qcow2 by its magic, else raw"""
+    head = os.pread(fd, 4, 0)
+    return "qcow2" if head == b"QFI\xfb" else "raw"
+
+
+def make_disk(a, vmdir):
+    """the VM's disk from the image: checked against the SHA-256 the user
+    gives (Red Hat's download page shows it), its format named (by its
+    magic), and a qcow2 image refused if it names any other file (a backing
+    or data file would copy a Mac file into the guest)"""
+    want = (a.sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", want):
+        raise VmError("--sha256 is required: the image's SHA-256, as Red Hat's download page shows it",
+                      fix="varek vm init --image rhel-9.6-aarch64-kvm.qcow2 --sha256 HEX")
+    fd = os.open(a.image, os.O_RDONLY)
+    try:
+        h = hashlib.sha256()
+        off = 0
+        while True:
+            chunk = os.pread(fd, 1 << 20, off)
+            if not chunk:
+                break
+            h.update(chunk)
+            off += len(chunk)
+        if h.hexdigest() != want:
+            raise VmError(f"the image's SHA-256 is {h.hexdigest()}, not the one given",
+                          fix="download the image again, and give the SHA-256 Red Hat's page shows for it")
+        print(f"[varek] the image: {a.image} (sha256 {want}, as given)")
+        fmt = image_format(fd)
+        src = a.image
+        if fmt == "qcow2":
+            info = json.loads(subprocess.run(["qemu-img", "info", "-f", "qcow2", "--output=json", src],
+                                             check=True, capture_output=True, text=True).stdout)
+            data = (info.get("format-specific") or {}).get("data") or {}
+            if info.get("backing-filename") or info.get("full-backing-filename") or data.get("data-file"):
+                raise VmError("the image names another file (a backing or data file): refused",
+                              fix="use Red Hat's KVM guest image as downloaded")
+        disk = os.path.join(vmdir, "disk.raw")
+        subprocess.run(["qemu-img", "convert", "-f", fmt, "-O", "raw", src, disk], check=True)
+        subprocess.run(["qemu-img", "resize", "-f", "raw", disk, f"{a.disk_gib}G"], check=True)
+        return want
+    finally:
+        os.close(fd)
+
+
+def send_source(vmdir, ip, dest):
+    """the VAREK checkout copied into the VM over ssh (not shared with it:
+    the checkout holds the tools the Mac's user runs)"""
+    env = dict(os.environ, COPYFILE_DISABLE="1")
+    argv = ["tar"] + (["--no-mac-metadata"] if platform.system() == "Darwin" else []) + \
+        ["--exclude", ".git", "-C", SRC_ROOT, "-cf", "-", "."]
+    t = subprocess.Popen(argv, stdout=subprocess.PIPE, env=env)
+    r = subprocess.run(ssh_argv(vmdir, ip, f"sudo rm -rf {dest} && sudo mkdir -p {dest} && "
+                                           f"sudo tar --no-same-owner -C {dest} -xf -"), stdin=t.stdout)
+    t.stdout.close()
+    if t.wait() != 0 or r.returncode != 0:
+        raise VmError("the VAREK checkout could not be copied into the VM")
+
+
+def register(vmdir, ip, a):
+    """the guest registered with the user's activation key, given on stdin
+    (not on a command line: sudo would log it)"""
+    key = open(a.rh_activation_key_file).read().strip()
+    ssh(vmdir, ip, "sudo sh -c 'IFS= read -r k; exec subscription-manager register --org \"$1\" "
+                   f"--activationkey \"$k\"' _ {sh_quote(a.rh_org)}",
+        input=key + "\n", text=True, capture_output=True)
+
+
 def cmd_init(a):
     if not a.resume and not a.image:
-        raise VmError("--image is required", fix="varek vm init --image rhel-9.6-aarch64-kvm.qcow2 (or --resume)")
+        raise VmError("--image is required", fix="varek vm init --image rhel-9.6-aarch64-kvm.qcow2 --sha256 HEX (or --resume)")
     need_mac_host()
+    if not os.path.isfile(os.path.join(SRC_ROOT, "varek", "v1_4", "packaging", "vm", "provision.sh")):
+        raise VmError(f"no VAREK checkout at {SRC_ROOT} (the VM is set up from it)",
+                      fix="run varek vm init from a VAREK checkout's tools/varek")
     vmdir = vm_dir()
     if os.path.exists(os.path.join(vmdir, "vm.json")) and not a.resume:
         raise VmError(f"a VM already exists in {vmdir}",
                       fix="use it (varek vm start), or remove that directory to make a new one")
     if a.resume:
         cfg = load_cfg(vmdir)
+        if cfg.get("provisioned"):
+            raise VmError("the VM is set up already",
+                          fix=f"varek vm start; to make it again, remove {vmdir} and run varek vm init --image")
     else:
         os.makedirs(vmdir, mode=0o700, exist_ok=True)
-        h = hashlib.sha256()
-        with open(a.image, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
-                h.update(chunk)
-        print(f"[varek] the image: {a.image} (sha256 {h.hexdigest()})")
-        disk = os.path.join(vmdir, "disk.raw")
-        subprocess.run(["qemu-img", "convert", "-O", "raw", a.image, disk], check=True)
-        subprocess.run(["qemu-img", "resize", "-f", "raw", disk, f"{a.disk_gib}G"], check=True)
+        os.chmod(vmdir, 0o700)
+        sha = make_disk(a, vmdir)
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "varek-vm",
                         "-f", os.path.join(vmdir, "id_ed25519")], check=True)
         cfg = {"name": "default", "mac": new_mac(), "cpus": a.cpus, "memory_mib": a.memory_mib,
-               "disk_gib": a.disk_gib, "image": os.path.abspath(a.image), "image_sha256": h.hexdigest(),
+               "disk_gib": a.disk_gib, "image": os.path.abspath(a.image), "image_sha256": sha,
                "provisioned": None, "project": None}
         save_cfg(vmdir, cfg)
     ci = os.path.join(vmdir, "cloud-init")
@@ -294,24 +449,28 @@ def cmd_init(a):
     for f, text in (("user-data", user_data(pub, "varek-vm")), ("meta-data", meta_data("varek-vm-1", "varek-vm"))):
         with open(os.path.join(ci, f), "w") as fh:
             fh.write(text)
-    ip = boot(vmdir, cfg, [(SRC_ROOT, "varek-src")],
-              [os.path.join(ci, "user-data"), os.path.join(ci, "meta-data")])
+    # a resume finds the VM still up (it stays up for the user to register it)
+    ip = guest_ip(cfg) if running_pid(vmdir) else None
+    if not ip:
+        ip = boot(vmdir, cfg, [], [os.path.join(ci, "user-data"), os.path.join(ci, "meta-data")])
     print(f"[varek] the VM is up at {ip}")
-    rhel = ssh(vmdir, ip, ". /etc/os-release; echo $ID", capture_output=True, text=True).stdout.strip() == "rhel"
-    if rhel and ssh(vmdir, ip, "sudo subscription-manager status", check=False, capture_output=True).returncode != 0:
-        if a.rh_org and a.rh_activation_key_file:
-            key = open(a.rh_activation_key_file).read().strip()
-            ssh(vmdir, ip, f"sudo subscription-manager register --org {sh_quote(a.rh_org)} "
-                           f"--activationkey {sh_quote(key)}", capture_output=True)
-        else:
-            print("[varek] RHEL needs your subscription before it can install packages. In another terminal:\n"
-                  "          varek vm ssh\n"
-                  "          sudo subscription-manager register      (your own Red Hat login)\n"
-                  "        then: varek vm init --resume   (the VM stays up)")
-            return 3
-    ssh(vmdir, ip, "sudo mkdir -p /mnt/varek-src && (mountpoint -q /mnt/varek-src || "
-                   "sudo mount -t virtiofs varek-src /mnt/varek-src) && "
-                   "sudo bash /mnt/varek-src/varek/v1_4/packaging/vm/provision.sh /mnt/varek-src", tty=True)
+    try:
+        rhel = ssh(vmdir, ip, ". /etc/os-release; echo $ID", capture_output=True, text=True).stdout.strip() == "rhel"
+        if rhel and ssh(vmdir, ip, "sudo subscription-manager status", check=False, capture_output=True).returncode != 0:
+            if a.rh_org and a.rh_activation_key_file:
+                register(vmdir, ip, a)
+            else:
+                print("[varek] RHEL needs your subscription before it can install packages. In another terminal:\n"
+                      "          varek vm ssh\n"
+                      "          sudo subscription-manager register      (your own Red Hat login)\n"
+                      "        then: varek vm init --resume   (the VM stays up)")
+                return 3
+        src = "/var/tmp/varek-src-in"
+        send_source(vmdir, ip, src)
+        ssh(vmdir, ip, f"sudo bash {src}/varek/v1_4/packaging/vm/provision.sh {src} && sudo rm -rf {src}", tty=True)
+    except BaseException:
+        halt(vmdir, cfg)
+        raise
     cfg["provisioned"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     save_cfg(vmdir, cfg)
     halt(vmdir, cfg)
@@ -325,7 +484,7 @@ def start(project):
     cfg = load_cfg(vmdir)
     if not cfg.get("provisioned"):
         raise VmError("the VM is not set up yet", fix="varek vm init --resume")
-    p = check_share(project)
+    p = check_share(project, refuse=(VM_ROOT, SRC_ROOT))
     if running_pid(vmdir):
         ip = guest_ip(cfg)
         if cfg.get("project") == p and ip:
@@ -345,15 +504,51 @@ def cmd_start(a):
     return 0
 
 
+STREAMS = "sudo sh -c 'ls -t /var/log/varek/verdicts-*.log 2>/dev/null'"
+
+
 def cmd_run(a):
     vmdir, cfg, ip, p = start(os.getcwd())
+    before = set(ssh(vmdir, ip, STREAMS, check=False, capture_output=True, text=True).stdout.split())
     args = " ".join(sh_quote(x) for x in a.args)
     r = ssh(vmdir, ip, f"cd {sh_quote(p)} && sudo varek run {args}", check=False, tty=True)
-    # the run's verdict stream, kept in the VM, copied to the project
-    ssh(vmdir, ip, "sudo sh -c 'f=$(ls -t /var/log/varek/verdicts-*.log 2>/dev/null | head -1); "
-                   f"[ -n \"$f\" ] && mkdir -p {sh_quote(p + '/.varek')} && cp \"$f\" {sh_quote(p + '/.varek/')}'",
-        check=False)
+    copy_stream(vmdir, ip, p, before)
     return r.returncode
+
+
+def copy_stream(vmdir, ip, p, before):
+    """the run's verdict stream (the one it made, in the VM's /var/log/varek,
+    root's), copied to the project's .varek/ by the Mac's user: a new file,
+    never through a link the agent made there"""
+    new = [x for x in ssh(vmdir, ip, STREAMS, check=False, capture_output=True, text=True).stdout.split()
+           if x not in before and re.fullmatch(r"/var/log/varek/verdicts-[\w.:-]+\.log", x)]
+    if not new:
+        print("[varek] the run made no verdict stream", file=sys.stderr)
+        return None
+    d = os.path.join(p, ".varek")
+    try:
+        os.mkdir(d, 0o755)
+    except FileExistsError:
+        pass
+    try:
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        print(f"[varek] the stream is not copied: {d} is not a directory ({e.strerror})", file=sys.stderr)
+        return None
+    name = os.path.basename(new[0])
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+    except OSError as e:
+        print(f"[varek] the stream is not copied: {d}/{name} ({e.strerror})", file=sys.stderr)
+        return None
+    finally:
+        os.close(dfd)
+    try:
+        ssh(vmdir, ip, f"sudo cat {sh_quote(new[0])}", check=False, stdout=fd)
+    finally:
+        os.close(fd)
+    print(f"[varek] the run's verdict stream: {d}/{name}", file=sys.stderr)
+    return os.path.join(d, name)
 
 
 def cmd_ssh(a):
@@ -389,6 +584,7 @@ def add_parser(sub):
     vs = vm.add_subparsers(dest="vm_cmd", required=True)
     x = vs.add_parser("init", help="make the VM from a RHEL 9 aarch64 KVM guest image, and set it up")
     x.add_argument("--image", help="the guest image (qcow2 or raw)")
+    x.add_argument("--sha256", help="the image's SHA-256, as Red Hat's download page shows it")
     x.add_argument("--resume", action="store_true", help="carry on after registering the guest")
     x.add_argument("--cpus", type=int, default=4)
     x.add_argument("--memory-mib", type=int, default=4096)

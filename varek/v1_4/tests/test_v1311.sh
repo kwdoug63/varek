@@ -89,6 +89,14 @@ PY
             > "$OUT/b$v.out" 2> "$OUT/b$v.log"
         check "bash starts and runs a command substitution ($what)" grep -qx "bash sub" "$OUT/b$v.out"
     done
+    case "$(uname -m)" in x86_64) NR=121 ;; aarch64) NR=155 ;; *) NR="" ;; esac
+    if [ -n "$NR" ]; then
+        echo "== 4. a dry run of a policy with no require line: getpgid(0) =="
+        env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$W/p127.txt" --dry-run -- /usr/bin/python3 "$W/agent.py" \
+            > "$OUT/d127.out" 2> "$OUT/d127.log"
+        check "getpgid(0) is admitted in a dry run, as when enforcing" grep -qx "getpgid0 ok" "$OUT/d127.out"
+        check "... and not recorded as a call the policy refuses" sh -c "! grep -q '\"syscall:$NR\"' '$OUT/d127.log'"
+    fi
     [ "$(uname -m)" = x86_64 ] || skip "epoll_create(2), epoll_wait(2), pipe(2) and getpgrp(2) by number (x86_64 only: arm64 has none of them)"
 fi
 

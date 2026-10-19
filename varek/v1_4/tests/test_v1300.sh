@@ -11,7 +11,8 @@
 #      records carry VAREK's encoding, the certificates check, and the audit
 #      passes;
 #   3. run_start names the architecture, the audit reports it, and refuses
-#      one the Warden does not write.
+#      one the Warden does not write, a 1.33 stream without one and one from
+#      an earlier Warden with one.
 #
 #   test_v1300.sh VDP_CERT_CHECK [WARDEN]
 set -u
@@ -63,14 +64,16 @@ if platform.machine() == "x86_64":   # pipe(2), which glibc 2.34 (RHEL 9) calls 
     print("epoll_create", "ok" if ep >= 0 else ctypes.get_errno(), flush=True)
     ev = ctypes.create_string_buffer(12)
     print("epoll_wait", "ok" if ep >= 0 and libc.syscall(232, ep, ev, 1, 0) == 0 else ctypes.get_errno(), flush=True)
-    import asyncio
-    async def nap():
-        await asyncio.sleep(0.01)
-        return "ok"
-    try:
-        print("asyncio", asyncio.run(nap()), flush=True)
-    except OSError as e:
-        print("asyncio", e.errno, flush=True)
+# asyncio's default event loop: epoll_create(2) and epoll_wait(2) on x86_64,
+# epoll_create1 and epoll_pwait on arm64
+import asyncio
+async def nap():
+    await asyncio.sleep(0.01)
+    return "ok"
+try:
+    print("asyncio", asyncio.run(nap()), flush=True)
+except OSError as e:
+    print("asyncio", e.errno, flush=True)
 PY
     chmod 644 "$D/agent.py"
     # the agent's own files decided by clauses on the bits arm64 moves
@@ -92,7 +95,6 @@ PY
         check "pipe(2) is admitted, as pipe2 is (glibc 2.34's pipe(), RHEL 9: a shell's command substitution)" said "pipe ok"
         check "epoll_create(2) and epoll_wait(2) are admitted, as epoll_create1 and epoll_pwait are (glibc's on x86_64)" \
             sh -c "grep -qx 'epoll_create ok' '$OUT/r.out' && grep -qx 'epoll_wait ok' '$OUT/r.out'"
-        check "asyncio's default event loop runs" said "asyncio ok"
         # getpgrp(2) under a policy before 1.29: bash (RHEL's /bin/sh) calls it at its start
         printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /lib64 readonly\nallow path exact /etc/ld.so.cache readonly\n' > "$D/p127.txt"
         env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$D/p127.txt" -- /usr/bin/python3 -c \
@@ -100,6 +102,7 @@ PY
             > "$OUT/pg.out" 2> "$OUT/pg.log"
         check "getpgrp(2) is admitted under a policy before 1.29 (bash, RHEL's /bin/sh, exits without it)" grep -qx 'getpgrp ok' "$OUT/pg.out"
     else skip "pipe(2), getpgrp(2), epoll_wait(2) and epoll_create(2) (x86_64 only: arm64 has none of them)"; fi
+    check "asyncio's default event loop runs" said "asyncio ok"
     flags() { python3 - "$OUT/r.log" "$1" <<'PY'
 import json, sys
 for l in open(sys.argv[1], errors="replace"):
@@ -142,6 +145,15 @@ sys.exit(0 if rs.get('arch') == '$A' else 1)"
     elif grep -q "run_start's arch 'riscv64' is not one the Warden writes" "$OUT/g1.out"; then
         pass "the audit refuses an architecture the Warden does not write"
     else flunk "the audit refuses an architecture the Warden does not write ($(grep -m1 PROBLEM "$OUT/g1.out"))"; fi
+    # the architecture tied to the Warden's version: 1.33.0 writes it, earlier ones do not
+    python3 "$HERE/tests/v1270_forge.py" "$OUT/r.log" "$OUT/g2.log" \
+        "rs = next(r for r in recs if isinstance(r, dict) and r.get('event') == 'run_start'); del rs['arch']"
+    python3 "$HERE/tools/varek_audit.py" --policy "$D/p.txt" --checker "$CERT" "$OUT/g2.log" > "$OUT/g2.out" 2>&1
+    check "the audit refuses a 1.33 stream with no architecture" grep -q "which records its architecture, but has none" "$OUT/g2.out"
+    python3 "$HERE/tests/v1270_forge.py" "$OUT/r.log" "$OUT/g3.log" \
+        "rs = next(r for r in recs if isinstance(r, dict) and r.get('event') == 'run_start'); rs['warden'] = '1.29.0'"
+    python3 "$HERE/tools/varek_audit.py" --policy "$D/p.txt" --checker "$CERT" "$OUT/g3.log" > "$OUT/g3.out" 2>&1
+    check "... and an architecture in a stream from an earlier Warden" grep -q "records an architecture, but names the Warden '1.29.0'" "$OUT/g3.out"
 fi
 
 echo

@@ -333,8 +333,10 @@ static const char *const kDryNever[] = {
 };
 
 static int add_dry_rest(scmp_filter_ctx ctx, int file_changes) {
+    /* getpgid: admitted for 0 only (glibc's getpgrp() on arm64), refused
+     * otherwise, in a dry run as when enforcing */
     static const char *const kConditional[] = { "clone", "clone3", "ioctl", "kill", "sendto", "setsockopt",
-                                                "unshare", "io_uring_setup", NULL };
+                                                "unshare", "io_uring_setup", "getpgid", NULL };
     for (int nr = 0; nr < 1024; nr++) {
         char *n = seccomp_syscall_resolve_num_arch(SCMP_ARCH_NATIVE, nr);
         if (!n) continue;
@@ -383,7 +385,7 @@ static int deny_ns_bits(scmp_filter_ctx ctx, int sysnr) {
 // No other rule names clone3, and this one is the same in enforce, observe and
 // non-strict builds.
 #ifndef __NR_clone3
-#define __NR_clone3 435   // x86_64; the Warden supports x86_64 only
+#define __NR_clone3 435   // the same on x86_64 and aarch64
 #endif
 static int add_clone3(scmp_filter_ctx ctx) {
     int nr = seccomp_syscall_resolve_name("clone3");
