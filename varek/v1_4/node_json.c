@@ -15,6 +15,7 @@ typedef struct {
     int depth;
     char *why;
     size_t wn;
+    bool skip;          /* a checked document: values skipped, names not compared again */
 } cur_t;
 
 static int fail(cur_t *c, const char *what) {
@@ -166,41 +167,104 @@ static int number(cur_t *c) {
 
 static int value(cur_t *c);
 
-/* The decoded name of the member whose key starts at raw (a checked string) */
-static int key_at(const char *s, size_t n, size_t at, char *out, size_t outn) {
-    cur_t k = { s, n, at, 0, NULL, 0 };
-    return string(&k, out, outn, NULL);
+/* A member name as Go's encoding/json matches it to a field: ASCII letters
+ * in either case, and the two letters outside ASCII that Go folds onto ASCII
+ * (U+017F to s, U+212A to k). Two names the same folded are the same field to
+ * the runtime's reader, which takes the last. */
+static size_t fold(const char *in, size_t n, char *out) {
+    size_t o = 0;
+    for (size_t k = 0; k < n;) {
+        unsigned char b = (unsigned char)in[k];
+        if (b >= 'A' && b <= 'Z') { out[o++] = (char)(b - 'A' + 'a'); k++; }
+        else if (k + 1 < n && b == 0xC5 && (unsigned char)in[k + 1] == 0xBF) { out[o++] = 's'; k += 2; }
+        else if (k + 2 < n && b == 0xE2 && (unsigned char)in[k + 1] == 0x84 && (unsigned char)in[k + 2] == 0xAA) { out[o++] = 'k'; k += 3; }
+        else out[o++] = in[k++];
+    }
+    return o;
+}
+
+#define NJ_MEMBERS 512
+#define NJ_SLOTS 1024                         /* a power of two, twice NJ_MEMBERS */
+
+/* An object's names, each folded once, in a hash set: a name given twice is
+ * found without comparing it to every name before it. */
+typedef struct {
+    char *buf;
+    size_t len, cap;
+    struct { uint64_t h; size_t off, n; bool used; } slot[NJ_SLOTS];
+} names_t;
+
+static int names_add(names_t *t, const char *name, size_t n) {
+    uint64_t h = 1469598103934665603ULL;      /* FNV-1a */
+    for (size_t k = 0; k < n; k++) { h ^= (unsigned char)name[k]; h *= 1099511628211ULL; }
+    size_t at = (size_t)h & (NJ_SLOTS - 1);
+    while (t->slot[at].used) {
+        if (t->slot[at].h == h && t->slot[at].n == n && !memcmp(t->buf + t->slot[at].off, name, n)) return 1;
+        at = (at + 1) & (NJ_SLOTS - 1);
+    }
+    if (t->len + n > t->cap) {
+        size_t cap = t->cap ? t->cap : 4096;
+        while (cap < t->len + n) cap *= 2;
+        char *b = realloc(t->buf, cap);
+        if (!b) return -1;
+        t->buf = b;
+        t->cap = cap;
+    }
+    memcpy(t->buf + t->len, name, n);
+    t->slot[at].h = h;
+    t->slot[at].off = t->len;
+    t->slot[at].n = n;
+    t->slot[at].used = true;
+    t->len += n;
+    return 0;
+}
+
+static int members(cur_t *c, names_t *t) {
+    size_t nk = 0;
+    char *a = malloc(4096), *f = malloc(4096);
+    int rc = -1;
+    if (!a || !f) { rc = fail(c, "out of memory"); goto out; }
+    for (;;) {
+        ws(c);
+        size_t an = 0;
+        int r = string(c, t ? a : NULL, t ? 4096 : 0, &an);
+        if (r == -2) { rc = fail(c, "a member name too long, or holding a NUL"); goto out; }
+        if (r < 0) goto out;
+        if (t) {
+            if (nk == NJ_MEMBERS) { rc = fail(c, "too many members"); goto out; }
+            int d = names_add(t, f, fold(a, an, f));
+            if (d < 0) { rc = fail(c, "out of memory"); goto out; }
+            if (d) { rc = fail(c, "a member name given twice (compared as the runtime's reader does)"); goto out; }
+            nk++;
+        }
+        ws(c);
+        if (c->i >= c->n || c->s[c->i] != ':') { rc = fail(c, "':' expected"); goto out; }
+        c->i++;
+        if (value(c) < 0) goto out;
+        ws(c);
+        if (c->i < c->n && c->s[c->i] == ',') { c->i++; continue; }
+        if (c->i < c->n && c->s[c->i] == '}') { c->i++; rc = 0; goto out; }
+        rc = fail(c, "',' or '}' expected");
+        goto out;
+    }
+out:
+    free(a);
+    free(f);
+    return rc;
 }
 
 static int object(cur_t *c) {
     if (++c->depth > NJ_MAX_DEPTH) return fail(c, "nesting too deep");
     c->i++;                                   /* { */
     ws(c);
-    size_t keys[512];
-    size_t nk = 0;
     if (c->i < c->n && c->s[c->i] == '}') { c->i++; c->depth--; return 0; }
-    for (;;) {
-        ws(c);
-        size_t at = c->i;
-        if (string(c, NULL, 0, NULL) < 0) return -1;
-        /* the same name twice, compared decoded */
-        static char a[4096], b[4096];
-        if (key_at(c->s, c->n, at, a, sizeof a) < 0) return fail(c, "a member name too long");
-        for (size_t k = 0; k < nk; k++) {
-            if (key_at(c->s, c->n, keys[k], b, sizeof b) == 0 && !strcmp(a, b))
-                return fail(c, "a member name given twice");
-        }
-        if (nk == sizeof keys / sizeof keys[0]) return fail(c, "too many members");
-        keys[nk++] = at;
-        ws(c);
-        if (c->i >= c->n || c->s[c->i] != ':') return fail(c, "':' expected");
-        c->i++;
-        if (value(c) < 0) return -1;
-        ws(c);
-        if (c->i < c->n && c->s[c->i] == ',') { c->i++; continue; }
-        if (c->i < c->n && c->s[c->i] == '}') { c->i++; c->depth--; return 0; }
-        return fail(c, "',' or '}' expected");
-    }
+    names_t *t = NULL;
+    if (!c->skip && !(t = calloc(1, sizeof *t))) return fail(c, "out of memory");
+    int rc = members(c, t);
+    if (t) free(t->buf);
+    free(t);
+    if (rc == 0) c->depth--;
+    return rc;
 }
 
 static int array(cur_t *c) {
@@ -238,7 +302,7 @@ static int value(cur_t *c) {
 }
 
 int nj_check(const char *doc, size_t n, char *why, size_t wn) {
-    cur_t c = { doc, n, 0, 0, why, wn };
+    cur_t c = { doc, n, 0, 0, why, wn, false };
     if (n >= 3 && (unsigned char)doc[0] == 0xEF && (unsigned char)doc[1] == 0xBB && (unsigned char)doc[2] == 0xBF)
         return fail(&c, "a byte-order mark");
     if (value(&c) < 0) return -1;
@@ -249,7 +313,7 @@ int nj_check(const char *doc, size_t n, char *why, size_t wn) {
 
 int nj_find(const char *doc, size_t n, const char *const *path, size_t depth,
             const char **v, size_t *vn) {
-    cur_t c = { doc, n, 0, 0, NULL, 0 };
+    cur_t c = { doc, n, 0, 0, NULL, 0, true };
     ws(&c);
     for (size_t d = 0; d < depth; d++) {
         ws(&c);
@@ -258,6 +322,7 @@ int nj_find(const char *doc, size_t n, const char *const *path, size_t depth,
         bool found = false;
         if (want[0] == '#') {
             if (c.s[c.i] != '[') return -1;
+            if (!want[1] || strspn(want + 1, "0123456789") != strlen(want + 1)) return -1;
             char *e;
             long idx = strtol(want + 1, &e, 10);
             if (*e || idx < 0) return -1;
@@ -303,7 +368,7 @@ int nj_find(const char *doc, size_t n, const char *const *path, size_t depth,
 }
 
 int nj_string(const char *v, size_t vn, char *out, size_t outn) {
-    cur_t c = { v, vn, 0, 0, NULL, 0 };
+    cur_t c = { v, vn, 0, 0, NULL, 0, false };
     if (!outn || string(&c, out, outn, NULL) != 0 || c.i != vn) return -1;
     return 0;
 }

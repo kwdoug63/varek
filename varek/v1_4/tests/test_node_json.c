@@ -46,6 +46,39 @@ int main(void) {
     CHECK("a name twice deep is refused", !ok("{\"process\":{\"user\":{\"uid\":0,\"gid\":1,\"uid\":65534}}}"));
     CHECK("a name twice through an escape is refused", !ok("{\"uid\":0,\"\\u0075id\":1}"));
     CHECK("the same name in two objects is fine", ok("{\"a\":{\"x\":1},\"b\":{\"x\":2}}"));
+    /* Go's encoding/json matches a member to a field in either case, and folds
+     * U+017F onto s and U+212A onto k: the same field to the runtime's reader */
+    CHECK("a name twice in two cases is refused", !ok("{\"process\":{\"args\":[\"/ok\"],\"Args\":[\"/evil\"]}}"));
+    CHECK("... at the top", !ok("{\"process\":{\"args\":[\"/ok\"]},\"PROCESS\":{\"args\":[\"/evil\"]}}"));
+    CHECK("... with U+017F for s, raw", !ok("{\"args\":[\"/ok\"],\"ARG\xC5\xBF\":[\"/evil\"]}"));
+    CHECK("... with U+017F for s, escaped", !ok("{\"args\":[\"/ok\"],\"arg\\u017f\":[\"/evil\"]}"));
+    CHECK("... with U+212A for k", !ok("{\"kind\":\"a\",\"\xE2\x84\xAAind\":\"b\"}"));
+    CHECK("... an integer", !ok("{\"pid\":4242,\"Pid\":7}"));
+    CHECK("names that differ by more than case are fine", ok("{\"args\":1,\"argv\":2,\"\xC4\xB1" "d\":3,\"id\":4}"));
+    {
+        const char *lone = "{\"process\":{\"Args\":[\"/evil\"]}}", *p[] = { "process", "args" }, *v; size_t vn;
+        CHECK("a lone name in another case is not found (refused)", ok(lone) && nj_find(lone, strlen(lone), p, 2, &v, &vn) < 0);
+    }
+    {
+        /* members: 512 taken, 513 refused; a name of 4095 bytes taken, 4096 refused */
+        static char big[1 << 16]; size_t o = 0;
+        big[o++] = '{';
+        for (int k = 0; k < 513; k++) o += (size_t)sprintf(big + o, "%s\"m%d\":0", k ? "," : "", k);
+        big[o++] = '}'; big[o] = 0;
+        CHECK("513 members are refused", !ok(big));
+        char *cut = strstr(big, ",\"m512\""); memcpy(cut, "}", 2);
+        CHECK("512 members are fine", ok(big));
+        static char nm[8300]; o = 0; nm[o++] = '{'; nm[o++] = '"';
+        memset(nm + o, 'a', 4095); o += 4095; o += (size_t)sprintf(nm + o, "\":0}");
+        CHECK("a name of 4095 bytes is fine", ok(nm));
+        o = 2; memset(nm + o, 'a', 4096); o += 4096; sprintf(nm + o, "\":0}");
+        CHECK("a name of 4096 bytes is refused", !ok(nm));
+        CHECK("a name holding a NUL is refused", !ok("{\"a\\u0000\":1}"));
+    }
+    {
+        const char *a = "[1,2,3]", *p[] = { "#" }, *q[] = { "#+1" }, *v; size_t vn;
+        CHECK("an array index must be digits", nj_find(a, strlen(a), p, 1, &v, &vn) < 0 && nj_find(a, strlen(a), q, 1, &v, &vn) < 0);
+    }
     /* strictness */
     CHECK("trailing data is refused", !ok("{} x"));
     CHECK("a byte-order mark is refused", !ok("\xEF\xBB\xBF{}"));

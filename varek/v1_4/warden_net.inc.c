@@ -509,6 +509,28 @@ static int connect_as_agent(int s, const struct sockaddr *sa, socklen_t sl, uid_
     return rc;
 }
 
+/* A Unix connect through the pin (the socket's file, opened as the agent).
+ * Under the node agent the pin is named below the node's /proc, relative,
+ * from there: the Warden's /proc is the container's, where it has no entry.
+ * The first connect and every retry go through here, so a relative name is
+ * never resolved from the Warden's own directory. On the host the name is
+ * absolute (/proc/self/fd/N), and no change of directory is made. */
+static int connect_pinned_as_agent(int s, const struct sockaddr_un *un, socklen_t ul, uid_t uid, gid_t gid) {
+    if (un->sun_path[0] == '/') return connect_as_agent(s, (const struct sockaddr *)un, ul, uid, gid);
+    int here = open(".", O_PATH | O_DIRECTORY | O_CLOEXEC);
+    int rc;
+    if (here < 0 || proc_dir() < 0 || fchdir(g_procfd) < 0) rc = -EACCES;
+    else {
+        rc = connect_as_agent(s, (const struct sockaddr *)un, ul, uid, gid);
+        if (fchdir(here) < 0) {
+            fprintf(stderr, "[warden] internal error: cannot return to the Warden's directory; stopping\n");
+            abort();
+        }
+    }
+    if (here >= 0) close(here);
+    return rc;
+}
+
 /* ---- connects and sends that finish later ---- */
 
 enum { PEND_CONNECT = 1, PEND_UNIX_RETRY, PEND_SEND, PEND_STUB };
@@ -909,21 +931,11 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
         }
         memset(&un, 0, sizeof un);
         un.sun_family = AF_UNIX;
-        /* through the pin, by its name below the node's /proc, from there
-         * (v1.34: under the node agent /proc in the Warden's view is the
-         * container's, where the Warden has no entry) */
-        snprintf(un.sun_path, sizeof un.sun_path, "self/fd/%d", pin);
+        /* through the pin (v1.34: under the node agent, by its name below
+         * the node's /proc; connect_pinned_as_agent) */
+        snprintf(un.sun_path, sizeof un.sun_path, g_view_container ? "self/fd/%d" : "/proc/self/fd/%d", pin);
         un_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(un.sun_path) + 1);
-        int here = open(".", O_PATH | O_DIRECTORY | O_CLOEXEC);
-        if (here < 0 || proc_dir() < 0 || fchdir(g_procfd) < 0) rc = -EACCES;
-        else {
-            rc = connect_as_agent(s, (struct sockaddr *)&un, un_len, uid, gid);
-            if (fchdir(here) < 0) {
-                fprintf(stderr, "[warden] internal error: cannot return to the Warden's directory; stopping\n");
-                abort();
-            }
-        }
-        if (here >= 0) close(here);
+        rc = connect_pinned_as_agent(s, &un, un_len, uid, gid);
     } else if (a->proxy_handoff) {
         rc = proxy_dial(s, k.dom, &dial, dial_len, tid, a);
     } else {
@@ -1264,8 +1276,7 @@ static void pend_service(int notify_fd, const short *rev, int n) {
                 net_record(op->tid, op->act, op->d_raw, DEC_ALLOW, "dial_failed", &op->t0, EAGAIN);
                 pend_free(i);
             } else if (ts_ge(&now, &op->next_try)) {
-                int rc = connect_as_agent(op->sock, (struct sockaddr *)&op->dial_un,
-                                          op->dial_un_len, op->uid, op->gid);
+                int rc = connect_pinned_as_agent(op->sock, &op->dial_un, op->dial_un_len, op->uid, op->gid);
                 if (rc == -EAGAIN) {
                     op->next_try = now;
                     ts_add_ns(&op->next_try, UNIX_RETRY_NS);

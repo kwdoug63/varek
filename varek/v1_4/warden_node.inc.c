@@ -63,11 +63,22 @@ static void node_str(const char *doc, size_t n, const char *const *path, size_t 
 }
 
 /* The pod's namespace, name and uid and the container's name: containerd's
- * annotations, else CRI-O's */
-static void node_annotation(const char *doc, size_t n, const char *cd, const char *co, char *out, size_t on) {
-    const char *p1[] = { "state", "annotations", cd }, *p2[] = { "state", "annotations", co };
-    node_str(doc, n, p1, 3, out, on);
-    if (!out[0]) node_str(doc, n, p2, 3, out, on);
+ * annotations or CRI-O's. A pod's own annotations can be passed through to
+ * the container's, so each family can be claimed: one present but unusable
+ * (not a string, too long), or both present and different, is refused. 0, or
+ * -1. */
+static int node_annotation(const char *doc, size_t n, const char *cd, const char *co, char *out, size_t on) {
+    const char *p1[] = { "state", "annotations", cd }, *p2[] = { "state", "annotations", co }, *v;
+    size_t vn;
+    char other[256];
+    bool h1 = nj_find(doc, n, p1, 3, &v, &vn) == 0, h2;
+    if (h1 && nj_string(v, vn, out, on) < 0) return -1;
+    if (!h1) out[0] = '\0';
+    if (!(h2 = nj_find(doc, n, p2, 3, &v, &vn) == 0)) return 0;
+    if (nj_string(v, vn, other, sizeof other) < 0 || strlen(other) >= on) return -1;
+    if (h1 && strcmp(out, other)) return -1;
+    if (!h1) snprintf(out, on, "%s", other);
+    return 0;
 }
 
 /* The container's state, as the runtime sent it. 0, or -1 with why. */
@@ -99,10 +110,13 @@ static int node_state(const char *doc, size_t n, char *why, size_t wn) {
         return -1;
     }
     if (g_nr.bundle[0] != '/') { snprintf(why, wn, "the container's state names no bundle"); return -1; }
-    node_annotation(doc, n, "io.kubernetes.cri.sandbox-namespace", "io.kubernetes.pod.namespace", g_nr.pod_ns, sizeof g_nr.pod_ns);
-    node_annotation(doc, n, "io.kubernetes.cri.sandbox-name", "io.kubernetes.pod.name", g_nr.pod_name, sizeof g_nr.pod_name);
-    node_annotation(doc, n, "io.kubernetes.cri.sandbox-uid", "io.kubernetes.pod.uid", g_nr.pod_uid, sizeof g_nr.pod_uid);
-    node_annotation(doc, n, "io.kubernetes.cri.container-name", "io.kubernetes.container.name", g_nr.ctr, sizeof g_nr.ctr);
+    if (node_annotation(doc, n, "io.kubernetes.cri.sandbox-namespace", "io.kubernetes.pod.namespace", g_nr.pod_ns, sizeof g_nr.pod_ns) < 0 ||
+        node_annotation(doc, n, "io.kubernetes.cri.sandbox-name", "io.kubernetes.pod.name", g_nr.pod_name, sizeof g_nr.pod_name) < 0 ||
+        node_annotation(doc, n, "io.kubernetes.cri.sandbox-uid", "io.kubernetes.pod.uid", g_nr.pod_uid, sizeof g_nr.pod_uid) < 0 ||
+        node_annotation(doc, n, "io.kubernetes.cri.container-name", "io.kubernetes.container.name", g_nr.ctr, sizeof g_nr.ctr) < 0) {
+        snprintf(why, wn, "the container's state names its pod twice, differently, or unusably (containerd's and CRI-O's annotations)");
+        return -1;
+    }
     return 0;
 }
 
@@ -326,6 +340,8 @@ static int node_supervise(const struct policy *p, const char *boot_path) {
         snprintf(why, sizeof why, "cannot enter the container's mount namespace (%s)", strerror(errno));
         node_fail(why);
     }
+    /* the container's /proc is its PID namespace's: its init's */
+    if ((g_view_depth = pidns_depth(g_nr.pid)) < 0) node_fail("cannot read the container's PID namespace (NSpid)");
     g_view_container = true;
     /* the pod's network namespace is the Warden's own now: both held, the
      * same, so a socket made "in the agent's" and the stub resolver's are the

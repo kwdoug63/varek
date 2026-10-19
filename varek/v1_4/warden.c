@@ -701,14 +701,19 @@ static struct exec_ctx *ctx_get(pid_t pid) {
  * before any namespace is entered. */
 static int g_procfd = -1;
 static int proc_dir(void) {
-    if (g_procfd < 0) g_procfd = open("/proc", O_PATH | O_DIRECTORY | O_CLOEXEC);
+    /* opened once, at the start (main), never again: a later open could be
+     * the container's /proc, once in its mount namespace */
+    static bool tried = false;
+    if (!tried) { tried = true; g_procfd = open("/proc", O_PATH | O_DIRECTORY | O_CLOEXEC); }
+    if (g_procfd < 0) errno = ENOENT;
     return g_procfd;
 }
 
 /* The name below that /proc ("<pid>/..." or "self/..."), or -1 */
 static int proc_rel(char *rel, size_t n, const char *fmt, va_list ap) {
     int k = vsnprintf(rel, n, fmt, ap);
-    if (k < 0 || (size_t)k >= n || proc_dir() < 0) { errno = ENAMETOOLONG; return -1; }
+    if (k < 0 || (size_t)k >= n) { errno = ENAMETOOLONG; return -1; }
+    if (proc_dir() < 0) return -1;
     return 0;
 }
 
@@ -2837,11 +2842,16 @@ static bool path_is_proc_self(const char *in, bool *thread_self) {
  * has entered it under the node agent; the pids the kernel gives the Warden
  * are the node's. */
 static bool g_view_container = false;
+/* the container's PID namespace's place in a process's NSpid (0, the node's,
+ * first): its /proc numbers processes by that entry, the agent's included,
+ * however deep the agent's own namespace is */
+static int g_view_depth = 0;
 
 
 /* A process's pid as the /proc of the Warden's view numbers it: the node's
- * own, or in a container's view the last of its NSpid (the innermost
- * namespace's). -1 if unknown. */
+ * own, or in a container's view its NSpid entry for the container's PID
+ * namespace (g_view_depth). -1 if unknown, or if the process is not in that
+ * namespace. */
 static pid_t view_pid(pid_t pid) {
     if (!g_view_container) return pid;
     char line[256];
@@ -2851,11 +2861,31 @@ static pid_t view_pid(pid_t pid) {
     while (fgets(line, sizeof line, f)) {
         if (strncmp(line, "NSpid:", 6)) continue;
         char *s = line + 6, *e;
-        for (long x; (x = strtol(s, &e, 10)), e != s; s = e) v = (pid_t)x;
+        int k = 0;
+        for (long x; (x = strtol(s, &e, 10)), e != s; s = e, k++)
+            if (k == g_view_depth) { v = (pid_t)x; break; }
         break;
     }
     fclose(f);
     return v > 0 ? v : -1;
+}
+
+/* How deep a process's PID namespace is below the node's: its NSpid's
+ * entries less one. -1 if unknown. */
+static int pidns_depth(pid_t pid) {
+    char line[256];
+    FILE *f = proc_fopenf("%d/status", pid);
+    if (!f) return -1;
+    int n = -1;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "NSpid:", 6)) continue;
+        char *s = line + 6, *e;
+        n = 0;
+        for (; strtol(s, &e, 10), e != s; s = e) n++;
+        break;
+    }
+    fclose(f);
+    return n > 0 ? n - 1 : -1;
 }
 
 /* Rewrite a leading /proc/self or /proc/thread-self (already matched) to the
@@ -5186,6 +5216,8 @@ int main(int argc, char **argv) {
     /* v1.24: the resolver helper is this program re-executed (a clean address
      * space, without the signing key); see warden_resolve.h. */
     if (argc >= 2 && !strcmp(argv[1], "--resolver-helper")) return wr_helper_exec_main(argc, argv);
+    /* v1.34: the node's /proc, held from the start (proc_dir) */
+    if (proc_dir() < 0) { fprintf(stderr, "[warden] cannot open /proc: %s\n", strerror(errno)); return 2; }
     /* v1.26.1: the egress proxy is its own program, warden-proxy (see
      * proxy_bin below); this binary no longer has a --proxy-helper mode. */
     /* Positional parse with optional --plan between policy_path and --.

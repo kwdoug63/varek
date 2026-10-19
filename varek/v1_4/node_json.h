@@ -8,7 +8,10 @@
 // only, no trailing data, nesting at most NJ_MAX_DEPTH), and an object that
 // holds the same member name twice, at any depth, is refused: the runtime's
 // own reader takes the last of two, so the Warden must never read another
-// value than the one the runtime acts on.
+// value than the one the runtime acts on. Names are compared as Go's
+// encoding/json matches them to fields (ASCII case folded, U+017F as s and
+// U+212A as k), so "args" and "Args" are the same name; nj_find matches
+// exactly, so a lone name in another case is not found.
 #ifndef VAREK_NODE_JSON_H
 #define VAREK_NODE_JSON_H
 #include <stdbool.h>
