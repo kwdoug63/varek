@@ -94,7 +94,7 @@ report() {   # report LABEL PODLOG
 }
 agent_lines() {   # agent_lines LOG FROM: the node agent's lines after line FROM
     tail -n +"$2" "$1" 2>/dev/null | grep -E 'descriptors received|mounts at receipt|"metadata"|notifications answered' |
-        sed -E 's/state \([0-9]+ bytes\): .*"metadata":"([^"]*)".*/state received, metadata \1/; s/^/  node agent: /' | tee -a "$SUM"
+        sed -E 's/state \([0-9]+ bytes\): .*"metadata": ?"([^"]*)".*/state received, metadata \1/; s/^ *"metadata": ?"([^"]*)".*/state received, metadata \1/; s/^/  node agent: /' | tee -a "$SUM"
 }
 
 if [ "$ONLY" != crio ]; then
@@ -185,7 +185,7 @@ LPID=$!
 PPID_NRI=$!
 for _ in $(seq 50); do grep -q '^configure:' "$S/nri-crio.log" && break; sleep 0.2; done
 say "  plugin: $(grep -m1 '^configure:' "$S/nri-crio.log" || echo 'NOT registered')"
-mkdir -p "$OUT/crio-logs"
+rm -rf "$OUT/crio-logs"; mkdir -p "$OUT/crio-logs"   # a rerun's logs, not appended to the last's
 for rt in crun runc; do
     for pod in a:test:true b::true c:test:false; do
         IFS=: read -r name pol ro <<< "$pod"
