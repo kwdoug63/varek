@@ -60,7 +60,10 @@ start)
     vssh "sudo dnf -y -q install python3-cryptography openssl git > /dev/null && cd /opt/varek-src && sudo make -s -C varek/v1_4 all tests/v1281_sub" ||
         { echo "mac_soak.sh: the VM's setup for the soak failed (above)"; exit 1; }
     echo "== the soak, $HOURS h, in the background in the VM"
-    vssh "cd /opt/varek-src && sudo setsid nohup varek/v1_4/tests/soak_shared/soak.sh --hours $HOURS --out $VMOUT > /var/tmp/varek-vm-soak-24h.out 2>&1 < /dev/null &"
+    # only the soak itself in the background, its descriptors none of ssh's
+    # (a list put in the background, `cd && ...&`, would hold the session
+    # open, and this would wait the soak's whole length)
+    vssh "cd /opt/varek-src || exit 1; sudo setsid nohup varek/v1_4/tests/soak_shared/soak.sh --hours $HOURS --out $VMOUT > /var/tmp/varek-vm-soak-24h.out 2>&1 < /dev/null &"
     sleep 20
     vssh "pgrep -f '[s]oak_shared/soak.sh' > /dev/null" || {
         echo "mac_soak.sh: the soak stopped at once:"; vssh "tail -20 /var/tmp/varek-vm-soak-24h.out"; exit 1; }
