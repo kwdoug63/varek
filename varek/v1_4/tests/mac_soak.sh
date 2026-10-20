@@ -61,7 +61,9 @@ start)
         echo "mac_soak.sh: the soak stopped at once:"; vssh "tail -20 /var/tmp/varek-vm-soak-24h.out"; exit 1; }
     # the Mac awake for the soak and an hour more
     secs=$(python3 -c "print(int(float('$HOURS') * 3600) + 3600)")
-    nohup caffeinate -i -s -t "$secs" > /dev/null 2>&1 < /dev/null &
+    # (macOS's nohup refuses to run without a console, as under Session
+    # Manager: the hangup is ignored by hand)
+    /bin/sh -c 'trap "" HUP; exec caffeinate -i -s -t "$0"' "$secs" > /dev/null 2>&1 < /dev/null &
     {
         echo "mac_soak.sh start: $(date '+%Y-%m-%d %H:%M %Z') ($(TZ=America/Chicago date '+%Y-%m-%d %H:%M %Z'))"
         echo "  host: $(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null), $(sysctl -n hw.model 2>/dev/null)"
