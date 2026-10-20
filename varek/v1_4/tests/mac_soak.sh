@@ -37,6 +37,10 @@ done
 [ "$(id -u)" != 0 ] || { echo "mac_soak.sh: run as the Mac's user, not root (the VM is the user's)" >&2; exit 2; }
 vk() { python3 "$VAREK" "$@"; }
 vssh() { python3 "$VAREK" vm ssh "$@"; }
+# the VM's copy of the source (/opt/varek-src, made when the VM was set up)
+# refreshed from this checkout, so what runs in the VM is this commit
+sync_src() { (cd "$HERE/../.." && COPYFILE_DISABLE=1 tar --no-mac-metadata --exclude .git -cf - .) |
+             vssh "sudo tar --no-same-owner -C /opt/varek-src -xf -"; }
 mkdir -p "$OUT"
 
 case "$cmd" in
@@ -52,6 +56,7 @@ start)
     fi
     vssh "[ ! -e $VMOUT ]" || { echo "mac_soak.sh: $VMOUT is already in the VM: move it aside first (vm ssh)"; exit 1; }
     echo "== what the soak needs, in the VM"
+    sync_src || { echo "mac_soak.sh: the VM's copy of the source could not be refreshed"; exit 1; }
     vssh "sudo dnf -y -q install python3-cryptography openssl git > /dev/null && cd /opt/varek-src && sudo make -s -C varek/v1_4 all tests/v1281_sub" ||
         { echo "mac_soak.sh: the VM's setup for the soak failed (above)"; exit 1; }
     echo "== the soak, $HOURS h, in the background in the VM"

@@ -58,6 +58,10 @@ flunk() { printf '  FAIL  %s\n' "$1" | tee -a "$SUM"; fails=$((fails + 1)); }
 check() { local d="$1"; shift; if "$@" >> "$OUT/checks.log" 2>&1; then pass "$d"; else flunk "$d"; fi; }
 vk() { python3 "$VAREK" "$@"; }
 vssh() { python3 "$VAREK" vm ssh "$@"; }
+# the VM's copy of the source (/opt/varek-src, made when the VM was set up)
+# refreshed from this checkout, so what runs in the VM is this commit
+sync_src() { (cd "$HERE/../.." && COPYFILE_DISABLE=1 tar --no-mac-metadata --exclude .git -cf - .) |
+             vssh "sudo tar --no-same-owner -C /opt/varek-src -xf -"; }
 {
     echo "mac_check.sh $(date '+%Y-%m-%d %H:%M %Z')"
     echo "host: $(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null), $(uname -m), $(sysctl -n hw.model 2>/dev/null)"
@@ -105,6 +109,7 @@ if vk vm start "$PROJ" > "$OUT/start.log" 2>&1; then
 else
     flunk "varek vm start ($OUT/start.log)"; exit 1
 fi
+check "the VM's copy of the source refreshed from this checkout" sync_src
 vssh "sudo varek doctor" > "$OUT/doctor.txt" 2>&1
 check "varek doctor in the VM: Landlock, seccomp user-notify, cgroup v2" \
     sh -c "grep -Eq 'OK.*Landlock ABI' '$OUT/doctor.txt' && ! grep -E '^ *FAIL' '$OUT/doctor.txt' | grep -qiv 'varek.conf'"

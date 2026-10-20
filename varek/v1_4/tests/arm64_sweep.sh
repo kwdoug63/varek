@@ -64,8 +64,14 @@ if [ "$DEPS" = 1 ]; then
     # cannot be uninstalled by pip, and the CycloneDX validator needs a newer
     # one); --break-system-packages where pip has it (not RHEL 9's)
     BSP=""; python3 -m pip install --help 2>/dev/null | grep -q -- --break-system-packages && BSP=--break-system-packages
-    python3 -m pip install $BSP --ignore-installed -q -r "$HERE/tools/requirements-crosscheck.txt" \
-        -r "$HERE/tools/requirements-test.txt" pytest pyyaml || { echo "arm64_sweep.sh: pip failed"; exit 1; }
+    # --prefer-binary: the newest release with a wheel for this Python and
+    # machine, not the newest's source (on October 20 z3-solver's newest had
+    # no wheel for RHEL 9's Python 3.9 on aarch64, and its build failed)
+    python3 -m pip install $BSP --ignore-installed --prefer-binary -q -r "$HERE/tools/requirements-test.txt" \
+        pytest pyyaml || { echo "arm64_sweep.sh: pip failed"; exit 1; }
+    # the cross-check oracle's solver is optional: without it that check skips
+    python3 -m pip install $BSP --ignore-installed --prefer-binary -q -r "$HERE/tools/requirements-crosscheck.txt" ||
+        echo "arm64_sweep.sh: note: z3-solver did not install; the cross-check oracle skips"
 fi
 {
     echo "host: $(uname -srm); $(. /etc/os-release && echo "$PRETTY_NAME")"
