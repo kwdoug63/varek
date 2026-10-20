@@ -113,7 +113,8 @@ echo "  guest: $(tr '\n' ' ' < "$OUT/guest.txt")" | tee -a "$SUM"
 
 echo "== 4. what the VM sees of the Mac" | tee -a "$SUM"
 vssh "findmnt -rn -t virtiofs -o TARGET,SOURCE" > "$OUT/mounts.txt" 2>&1
-check "one virtio-fs share, the project, at the Mac's path" sh -c "[ \"\$(wc -l < '$OUT/mounts.txt')\" = 1 ] && grep -q '^$PROJ project' '$OUT/mounts.txt'"
+# (macOS's wc pads its count with spaces)
+check "one virtio-fs share, the project, at the Mac's path" sh -c "[ \"\$(wc -l < '$OUT/mounts.txt' | tr -d ' ')\" = 1 ] && grep -q '^$PROJ project' '$OUT/mounts.txt'"
 # the project's path is made in the VM to mount it at: nothing else of /Users
 check "of the Mac's /Users, only the path to the project" vssh \
     "[ -z \"\$(sudo find /Users -path '$PROJ' -prune -o -print | grep -vx -e /Users -e '$HOME' -e '$(dirname "$PROJ")')\" ]"
@@ -154,8 +155,13 @@ check "... and the Mac sees what it wrote" grep -q 'written by the agent in the 
 # the stream by the name varek vm run gave it, not the newest file in a directory the agent writes
 STREAM="$(sed -n 's/^\[varek\] the run.s verdict stream: //p' "$OUT/probe.err" | tail -1)"
 check "its verdict stream copied to the project (.varek/)" test -s "$STREAM"
-python3 "$HERE/tools/varek" audit "$STREAM" > "$OUT/audit.txt" 2>&1; arc=$?
-[ "$arc" = 0 ] && pass "... and the stream audits (exit 0)" || flunk "the stream's audit: exit $arc ($OUT/audit.txt)"
+# audited in the VM, where the run's policy and the certificate checker are
+# (the copy on the Mac is the same file: compared by its hash)
+SNAME="$(basename "$STREAM")"
+vssh "sudo varek audit /var/log/varek/$SNAME" > "$OUT/audit.txt" 2>&1; arc=$?
+[ "$arc" = 0 ] && pass "... and the stream audits in the VM (exit 0)" || flunk "the stream's audit in the VM: exit $arc ($OUT/audit.txt)"
+check "... and the copy on the Mac is the VM's stream" sh -c \
+    "[ \"\$(shasum -a 256 < '$STREAM' | cut -d' ' -f1)\" = \"\$(python3 '$VAREK' vm ssh 'sudo sha256sum /var/log/varek/$SNAME' | cut -d' ' -f1)\" ]"
 # root in the VM, unlike the agent, is not under the Warden: what it reaches of the Mac's network
 for t in "${GW:-192.168.64.1} 22" "${GW:-192.168.64.1} 5000" "169.254.169.254 80"; do
     set -- $t
