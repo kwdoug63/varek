@@ -120,9 +120,11 @@ echo "== 4. what the VM sees of the Mac" | tee -a "$SUM"
 vssh "findmnt -rn -t virtiofs -o TARGET,SOURCE" > "$OUT/mounts.txt" 2>&1
 # (macOS's wc pads its count with spaces)
 check "one virtio-fs share, the project, at the Mac's path" sh -c "[ \"\$(wc -l < '$OUT/mounts.txt' | tr -d ' ')\" = 1 ] && grep -q '^$PROJ project' '$OUT/mounts.txt'"
-# the project's path is made in the VM to mount it at: nothing else of /Users
-check "of the Mac's /Users, only the path to the project" vssh \
-    "[ -z \"\$(sudo find /Users -path '$PROJ' -prune -o -print | grep -vx -e /Users -e '$HOME' -e '$(dirname "$PROJ")')\" ]"
+# the project's path is made in the VM to mount it at, and an earlier
+# project's stays (the VM's disk is kept): of /Users only such directories,
+# empty, and no file
+check "of the Mac's /Users, no file and no directory with anything in it but the project's path" vssh \
+    "[ -z \"\$(sudo find /Users -path '$PROJ' -prune -o ! -type d -print -o -type d ! -empty -print | grep -vx -e /Users -e '$HOME' -e '$(dirname "$PROJ")')\" ]"
 check "the Mac's file outside the project is not in the VM" vssh "! sudo test -e '$SECRET'"
 check "root in the VM: a link out of the share does not reach it" vssh \
     "sudo ln -sfn '$SECRET' '$PROJ/link-out' && ! sudo cat '$PROJ/link-out'; sudo rm -f '$PROJ/link-out'"
