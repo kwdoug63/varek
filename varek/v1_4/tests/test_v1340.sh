@@ -235,6 +235,39 @@ PY
 for _ in $(seq 100); do grep -q 'a connection refused: the descriptor' "$B/a.log" && break; sleep 0.1; done
 check "a state from a process that is not the runtime: refused" grep -q 'a connection refused: the descriptor sent is not a seccomp listener' "$B/a.log"
 check "... and the process it names is not killed" kill -0 "$VICTIM"
+# the peer's mount namespace, by any of its threads: runc's main thread can
+# be left in a container's, it seems, by a goroutine locked to it (kind, in CI)
+peer() {   # MODE: thread (the main thread in a mount namespace of its own, another thread not) | all
+    python3 - "$B/s/a.sock" "$VICTIM" "$1" > "$B/peer-$1.out" 2>&1 <<'PY'
+import ctypes, json, os, socket, sys, threading, time
+libc = ctypes.CDLL(None, use_errno=True)
+if sys.argv[3] == "thread":
+    threading.Thread(target=time.sleep, args=(30,), daemon=True).start()
+if libc.unshare(0x00020000) != 0:    # CLONE_NEWNS, this thread's alone where there are others
+    sys.exit("unshare: " + os.strerror(ctypes.get_errno()))
+r, w = os.pipe()
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+st = {"ociVersion": "1.2.1", "fds": ["seccompFd"], "pid": int(sys.argv[2]), "metadata": "",
+      "state": {"ociVersion": "1.2.1", "id": "peer", "status": "creating", "pid": int(sys.argv[2]), "bundle": "/nonexistent"}}
+socket.send_fds(s, [json.dumps(st).encode()], [r])
+s.shutdown(socket.SHUT_WR)    # the state whole, as the runtime's (it reads to the end)
+s.settimeout(10)
+try:
+    s.recv(1)    # alive until the node agent has read the peer and closed
+except OSError:
+    pass
+PY
+}
+n0=$(grep -c 'a connection refused: the descriptor sent is not a seccomp listener' "$B/a.log")
+peer thread
+for _ in $(seq 100); do [ "$(grep -c 'a connection refused: the descriptor sent' "$B/a.log")" -gt "$n0" ] && break; sleep 0.1; done
+check "a peer whose main thread is in another mount namespace, another thread in the node's: past that check" sh -c \
+    "[ \$(grep -c 'a connection refused: the descriptor sent is not a seccomp listener' '$B/a.log') -gt $n0 ] && ! grep -q 'in any of its threads' '$B/a.log'"
+peer all
+for _ in $(seq 100); do grep -q 'in any of its threads' "$B/a.log" && break; sleep 0.1; done
+check "a peer in another mount namespace, every thread: refused" \
+    grep -q "a connection refused: the peer (pid [0-9]*, python3) is not in the node's mount namespace nor the node agent's, in any of its threads" "$B/a.log"
 kill "$VICTIM" 2>/dev/null
 check "the node agent is still listening" sh -c "kill -0 ${AGENTS%% *} 2>/dev/null || kill -0 \$(echo $AGENTS | cut -d' ' -f1)"
 

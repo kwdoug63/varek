@@ -337,6 +337,39 @@ static bool node_same_ns(pid_t pid, const char *ns, const char *of) {
            a.st_dev == b.st_dev && a.st_ino == b.st_ino;
 }
 
+/* Whether any thread of a process is in the namespace of that kind of `of`.
+ * /proc/<pid>/ns/ is the main thread's. On kind, in CI, runc was at times
+ * refused by its mount namespace; likely (not yet confirmed) because it is
+ * a Go program, and a goroutine that joins a container's mount namespace is
+ * locked to its thread, at times the main one. A process that
+ * can have one thread in the node's mount namespace can have them all, so
+ * this asks no less of the peer. */
+static bool node_any_thread_ns(pid_t pid, const char *ns, const char *of) {
+    struct stat b;
+    if (proc_statf(&b, "%s/ns/%s", of, ns) < 0) return false;
+    int d = proc_openf(O_RDONLY | O_DIRECTORY, 0, "%d/task", pid);
+    DIR *dir = d < 0 ? NULL : fdopendir(d);
+    if (!dir) {
+        if (d >= 0) close(d);
+        return false;
+    }
+    bool any = false;
+    struct dirent *e;
+    while (!any && (e = readdir(dir)) != NULL) {
+        struct stat a;
+        if (e->d_name[0] >= '1' && e->d_name[0] <= '9')
+            any = proc_statf(&a, "%d/task/%s/ns/%s", pid, e->d_name, ns) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+    }
+    closedir(dir);
+    return any;
+}
+
+/* a namespace's inode, for a refusal's wording (0: not read) */
+static unsigned long long node_ns_ino(const char *of, const char *ns) {
+    struct stat st;
+    return proc_statf(&st, "%s/ns/%s", of, ns) == 0 ? (unsigned long long)st.st_ino : 0;
+}
+
 /* A connection the listener takes, checked before a supervisor is forked
  * for it (review: through step 2 any root peer could name any process, to
  * have it killed, or supervised in its place): the peer is root, in the
@@ -366,10 +399,20 @@ static int node_admit(int c, const char *doc, size_t n, int fd, pid_t *pid, int 
      * (with the node's PID and user namespaces), the runtime in the node's;
      * on a host the two are one (and where the node's init cannot be read,
      * as in some sandboxes, the node agent's own is the node's). In the pod
-     * no other process shares the node agent's own: each container has one. */
-    if (!node_same_ns(cr.pid, "mnt", "self") && !node_same_ns(cr.pid, "mnt", "1")) {
-        snprintf(why, wn, "the peer (pid %d) is not in the node's mount namespace nor the node agent's (not the node's runtime)",
-                 (int)cr.pid);
+     * no other process shares the node agent's own: each container has one.
+     * Any of the peer's threads (node_any_thread_ns). */
+    if (!node_any_thread_ns(cr.pid, "mnt", "self") && !node_any_thread_ns(cr.pid, "mnt", "1")) {
+        char pn[16], comm[32] = "?";
+        snprintf(pn, sizeof pn, "%d", (int)cr.pid);
+        FILE *f = proc_fopenf("%d/comm", (int)cr.pid);
+        if (f) {
+            if (fgets(comm, sizeof comm, f)) comm[strcspn(comm, "\n")] = '\0';
+            fclose(f);
+        }
+        snprintf(why, wn, "the peer (pid %d, %s) is not in the node's mount namespace nor the node agent's, in any of "
+                 "its threads (not the node's runtime; its main thread's mnt:[%llu], the node's mnt:[%llu], the node "
+                 "agent's mnt:[%llu])", (int)cr.pid, comm, node_ns_ino(pn, "mnt"), node_ns_ino("1", "mnt"),
+                 node_ns_ino("self", "mnt"));
         return -1;
     }
     char ln[64];
