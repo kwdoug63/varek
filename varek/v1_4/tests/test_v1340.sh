@@ -49,6 +49,16 @@
 #      next address; the audit accepts both streams; with the proxy on, the
 #      name's synthetic address reaches the server through the proxy, and a
 #      name no rule allows gets no address.
+# Step 5 (D7, D8):
+#   6 (more). the policies of the pod's namespace (POLICY_DIR/<namespace>/),
+#      the policy copied beside the stream (read-only) and run from there; a
+#      container without the plugin's SHA-256 of its policy, or with another
+#      one, refused;
+#   8. evidence: a node agent signing with the node's key and anchoring; two
+#      containers: the audit verifies each stream with the node's public key
+#      and the anchor, which holds both runs' checkpoints; the streams root's
+#      (0600), the policies read-only; the node exporter
+#      (tools/varek_node_export.py) gives both runs as OCSF.
 #
 #   test_v1340.sh VDP_CHECK VDP_CERT_CHECK WARDEN [VAREK_INIT]
 set -u
@@ -227,12 +237,14 @@ else
     cp "$LAUNCHER" "$B/varek-init"; cp "$LAUNCHER" "$B/other-init"; chmod 755 "$B/varek-init" "$B/other-init"
     mkdir -p "$B/rootfs/varek" "$B/rootfs/work" "$B/rootfs/work2"; touch "$B/rootfs/varek/init"
     mkdir -m 777 "$B/work"
-    mkdir -m 755 "$B/pol"
-    cp "$B/p.txt" "$B/pol/plain.policy"
-    printf 'require warden 1.29\nallow path /data/allowed readonly\nallow path /ok readonly\nallow path /work/\nallow exec /ok\nallow exec /ok2\n' > "$B/pol/launch.policy"
-    chmod 644 "$B/pol/"*.policy
-    "$WARDEN" "$B/pol/launch.policy" --oci-filter > "$B/f/launch.json" 2>/dev/null
-    "$WARDEN" "$B/pol/plain.policy" --oci-filter > "$B/f/plain.json" 2>/dev/null
+    # step 5: the policies of the pod's namespace (team-a), as the plugin writes them
+    mkdir -m 755 "$B/pol" "$B/pol/team-a"
+    P="$B/pol/team-a"
+    cp "$B/p.txt" "$P/plain.policy"
+    printf 'require warden 1.29\nallow path /data/allowed readonly\nallow path /ok readonly\nallow path /work/\nallow exec /ok\nallow exec /ok2\n' > "$P/launch.policy"
+    chmod 644 "$P/"*.policy
+    "$WARDEN" "$P/launch.policy" --oci-filter > "$B/f/launch.json" 2>/dev/null
+    "$WARDEN" "$P/plain.policy" --oci-filter > "$B/f/plain.json" 2>/dev/null
     check "--oci-filter: the filter step 1 measured, rule for rule; then Landlock, and every call it names no rule for notified" \
         python3 - "$B/f/oci.json" "$B/f/launch.json" <<'PY'
 import json, sys
@@ -257,7 +269,8 @@ PY
     fi
     # a bundle with the launcher: NAME SOCKET FILTER POLICY-NAME|- ARGS [OPTION...]
     #   rw-root, work-exec (/work without noexec), twice (/work2: /work's directory again, read-only),
-    #   other-init (another copy of the launcher at /varek/init)
+    #   other-init (another copy of the launcher at /varek/init); step 5: the annotations the
+    #   plugin adds (the pod's namespace team-a, the policy's SHA-256), or no-sha, bad-sha
     lbundle() {
         local name="$1" sock="$2" filt="$3" ann="$4" args="$5"
         shift 5
@@ -272,7 +285,12 @@ c["process"].update(terminal=False, args=args.split(), env=["PATH=/"], user={"ui
                     noNewPrivileges=True, cwd="/")
 c["root"] = {"path": B + "/rootfs", "readonly": "rw-root" not in opts}
 c["linux"]["seccomp"] = f
-if ann != "-": c["annotations"] = {"varek.dev/policy": ann}
+if ann != "-":
+    import hashlib, os
+    pf = B + "/pol/team-a/" + ann + ".policy"
+    sha = hashlib.sha256(open(pf, "rb").read()).hexdigest() if os.path.isfile(pf) else "0" * 64
+    c["annotations"] = {"varek.dev/policy": ann, "varek.dev/pod-namespace": "team-a"}
+    if "no-sha" not in opts: c["annotations"]["varek.dev/policy-sha256"] = "f" * 64 if "bad-sha" in opts else sha
 for m in c["mounts"]:
     if m["destination"] == "/dev": m["options"].append("noexec")      # as the NRI plugin makes it
 c["mounts"].append({"destination": "/varek/init", "type": "bind", "source": B + ("/other-init" if "other-init" in opts else "/varek-init"),
@@ -314,6 +332,13 @@ PY
     check "a policy that decides no launch, with the launcher: the command ran, a second launch refused" sh -c \
         "grep -qx 'read_allowed: ok allowed content' '$B/plain.out' && grep -qx 'exec_again: EACCES' '$B/plain.out'"
     check "... its launch set the command alone" rec l plain '[e["why"] for e in S[0]["exec_ruleset"]] == ["bootstrap"] and S[0]["node"]["policy"] == "plain"'
+    PC="$(stream l plain | sed 's/\.jsonl$/.policy/')"
+    check "the policy, from the pod's namespace, copied beside the stream (read-only) and run from there (step 5)" sh -c \
+        "cmp -s '$PC' '$P/plain.policy' && [ \"\$(stat -c %a '$PC')\" = 400 ] && grep -q '\"policy_path\":\"$PC\"' '$(stream l plain)'"
+    lbundle nosha "$B/s/l.sock" "$B/f/plain.json" plain "/varek/init -- /probe" no-sha; run nosha
+    check "a container without the plugin's SHA-256 of its policy: refused" refused l nosha 'not given its filter by VAREK.s NRI plugin'
+    lbundle badsha "$B/s/l.sock" "$B/f/plain.json" plain "/varek/init -- /probe" bad-sha; run badsha
+    check "... with another one (the policy changed after the plugin wrote the filter): refused" refused l badsha 'is not the one the NRI plugin wrote'
     check "... the runtime's calls its filter names no rule for let through before the command, refused after (counted)" rec l plain \
         'E and E[0]["runtime_calls_before_exec"] > 0 and E[0]["calls_not_admitted"] >= 0'
     lbundle noname "$B/s/l.sock" "$B/f/plain.json" - "/varek/init -- /probe"; run noname
@@ -332,7 +357,7 @@ PY
     check "D4: a volume mounted twice, once writable: refused" refused l twice 'mount /work2 allows execution and shows files its writable mount /work'
     lbundle nol "$B/s/a.sock" "$B/f/plain.json" plain "/varek/init -- /probe"; run nol
     check "the launcher's command under a node agent with no launcher: refused" refused a nol 'this node agent has none'
-    check "a node agent with one policy that decides launches" agent d "$B/pol/launch.policy" --node-launcher "$B/varek-init"
+    check "a node agent with one policy that decides launches" agent d "$P/launch.policy" --node-launcher "$B/varek-init"
     bundle direct "$B/s/d.sock" "/probe launch" 1; run direct
     check "decided launches without the launcher: refused" refused d direct 'decided launches without the launcher'
     check "the launcher with no node agent serving its view refuses to run the command" sh -c \
@@ -417,6 +442,38 @@ PY
     else
         skip "the proxy in the pod's network (needs warden-proxy: make warden-proxy)"
     fi
+fi
+
+echo "== 8. evidence (step 5, D8) =="
+if [ ! -x "$HERE/tools/varek_keygen" ] || [ -z "$CERT" ]; then
+    skip "evidence (needs tools/varek_keygen and the certificate checker)"
+else
+    "$HERE/tools/varek_keygen" "$B/nodekey" > /dev/null 2>&1
+    : > "$B/anchor"; chmod 600 "$B/anchor"
+    check "a node agent signing with the node's key, anchored" agent e "$B/p.txt" --sign-key "$B/nodekey" \
+        --anchor "$B/anchor" --checkpoint-every 4
+    bundle ev1 "$B/s/e.sock" /probe 1; run ev1
+    bundle ev2 "$B/s/e.sock" /probe 1; run ev2
+    E1="$(stream e ev1)" E2="$(stream e ev2)"
+    check "each container's stream signed with the node's key and anchored: the audit verifies both" sh -c \
+        "python3 '$HERE/tools/varek_audit.py' --policy '${E1%.jsonl}.policy' --checker '$CERT' --pubkey '$B/nodekey.pub' --anchor '$B/anchor' '$E1' &&
+         python3 '$HERE/tools/varek_audit.py' --policy '${E2%.jsonl}.policy' --checker '$CERT' --pubkey '$B/nodekey.pub' --anchor '$B/anchor' '$E2'"
+    R1="$(python3 -c 'import json,sys; print([json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")][0]["run"])' "$E1")"
+    R2="$(python3 -c 'import json,sys; print([json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")][0]["run"])' "$E2")"
+    check "the anchor holds both runs' checkpoints" sh -c "grep -q '$R1' '$B/anchor' && grep -q '$R2' '$B/anchor' && [ '$R1' != '$R2' ]"
+    check "the streams root's and 0600, the policies beside them read-only" sh -c \
+        "[ \"\$(stat -c '%u %a' '$E1')\" = '0 600' ] && [ \"\$(stat -c '%u %a' '${E1%.jsonl}.policy')\" = '0 400' ]"
+    python3 "$HERE/tools/varek_node_export.py" --streams "$B/streams-e" --once --checker "$CERT" \
+        --pubkey "$B/nodekey.pub" --anchor "$B/anchor" --device node-1 -o "$B/ocsf.jsonl" > "$B/export.out" 2>&1
+    check "the node exporter gives both runs as OCSF, each event an object, each run's audited" python3 - "$B/ocsf.jsonl" "$R1" "$R2" <<'PY'
+import json, sys
+ev = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+txt = [json.dumps(e) for e in ev]
+ok = all(isinstance(e, dict) and "class_uid" in e for e in ev) and \
+     all(any(r in t for t in txt) for r in sys.argv[2:]) and \
+     sum(1 for t in txt if '"audit"' in t or "audit" in t.lower()) >= 2
+sys.exit(0 if ok else 1)
+PY
 fi
 
 echo

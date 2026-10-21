@@ -961,7 +961,7 @@ are claimed as solved.
     in.
   - *Review.* v1.32.0 was reviewed by AI review agents, not by a human or
     third party. Its findings are listed in its release notes.
-- Kubernetes (v1.34.0, in progress: steps 1 to 4 built,
+- Kubernetes (v1.34.0, in progress: steps 1 to 5 built,
   `v1.34-kubernetes.md`):
   - *The pod's network, not an empty one* (D5). On a host the agent's
     network namespace is empty and the Warden dials every connect from its
@@ -986,7 +986,13 @@ are claimed as solved.
     such a pod (steps 5 and 6). The node agent cannot read which filter the
     runtime installed, so it cannot check that the filter is the Warden's
     for that policy.
-  - *Review.* Steps 1 to 4 have not yet been reviewed.
+  - *Policies come from the cluster* (D7). Whoever may create or change a
+    namespace's `VarekPolicy` resources decides what its agents may do, as
+    whoever may edit the policy file does on a host: that right is to be
+    granted as the cluster's RBAC grants any other. The admission webhook
+    refuses a policy the Warden does not load; it does not judge one that
+    loads.
+  - *Review.* Steps 1 to 5 have not yet been reviewed.
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).
 - An agent may probe for SATISFIED-but-harmful actions near a policy boundary;

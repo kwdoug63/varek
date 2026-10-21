@@ -29,18 +29,22 @@
 // before v0.10: containerd before 2.2, CRI-O before 1.35) the plugin refuses
 // to start, naming the version.
 //
-//	varek-nri -warden FILE -policies DIR -listener SOCKET -launcher FILE [-socket NRI_SOCKET]
+//	varek-nri -warden FILE -policies DIR -listener SOCKET -launcher FILE [-socket NRI_SOCKET] [-sync]
+//
+// v1.34 step 5: a pod's policy is POLICY_DIR/<namespace>/<name>.policy, and
+// -sync writes there the cluster's VarekPolicy resources (sync.go).
 package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,6 +52,8 @@ import (
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/containerd/nri/pkg/stub"
+
+	"varek.dev/varek-k8s/internal/kube"
 )
 
 const (
@@ -55,7 +61,7 @@ const (
 	launcherAt = "/varek/init"
 )
 
-var policyName = regexp.MustCompile(`^[a-z0-9-]{1,63}$`)
+var policyName = kube.Name
 
 type ociArg struct {
 	Index    uint32 `json:"index"`
@@ -78,16 +84,10 @@ type ociProfile struct {
 	Syscalls        []ociSyscall `json:"syscalls"`
 }
 
-type cached struct {
-	mod  time.Time
-	size int64
-	p    *ociProfile
-}
-
 type plugin struct {
 	warden, policies, listener, launcher string
 	mu                                   sync.Mutex
-	filters                              map[string]cached // by policy name, while its file is unchanged
+	filters                              map[string]*ociProfile // by the SHA-256 of the policy written for
 }
 
 // The runtimes whose NRI sets a seccomp policy and the command (v0.10)
@@ -127,36 +127,59 @@ func (p *plugin) Configure(_ context.Context, _, runtime, ver string) (api.Event
 	return api.MustParseEventMask("CreateContainer"), nil
 }
 
-// The Warden's filter for the policy, in OCI's form
-func (p *plugin) filter(name string) (*ociProfile, error) {
-	path := filepath.Join(p.policies, name+".policy")
+// The Warden's filter, in OCI's form, for the policy of the pod's namespace
+// (v1.34 step 5: POLICY_DIR/<namespace>/<name>.policy, as the policy sync
+// writes each VarekPolicy resource), and the SHA-256 of the bytes it was
+// written for: the node agent loads the policy again, and refuses it if it
+// is not those bytes (it changed in between). The filter is written from a
+// private copy of those bytes, and kept by their hash.
+func (p *plugin) filter(ns, name string) (*ociProfile, string, error) {
+	path := filepath.Join(p.policies, ns, name+".policy")
 	st, err := os.Lstat(path)
 	if err != nil || !st.Mode().IsRegular() {
-		return nil, fmt.Errorf("no policy named %s (%s)", name, path)
+		return nil, "", fmt.Errorf("no policy named %s in namespace %s (%s)", name, ns, path)
 	}
+	b, err := os.ReadFile(path)
+	if err != nil || len(b) > 8<<20 {
+		return nil, "", fmt.Errorf("cannot read the policy %s (%v; at most 8 MiB)", path, err)
+	}
+	sum := sha256.Sum256(b)
+	sha := hex.EncodeToString(sum[:])
 	p.mu.Lock()
-	c, ok := p.filters[name]
+	f, ok := p.filters[sha]
 	p.mu.Unlock()
-	if ok && c.mod.Equal(st.ModTime()) && c.size == st.Size() {
-		return c.p, nil
+	if ok {
+		return f, sha, nil
+	}
+	dir, err := os.MkdirTemp("", "varek-nri-")
+	if err != nil {
+		return nil, "", err
+	}
+	defer os.RemoveAll(dir)
+	copyPath := filepath.Join(dir, name+".policy")
+	if err := os.WriteFile(copyPath, b, 0o600); err != nil {
+		return nil, "", err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, p.warden, path, "--oci-filter")
+	cmd := exec.CommandContext(ctx, p.warden, copyPath, "--oci-filter")
 	var errb strings.Builder
 	cmd.Stderr = &errb
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("the Warden does not write the filter for policy %s: %v: %s", name, err, lastLine(errb.String()))
+		return nil, "", fmt.Errorf("the Warden does not write the filter for policy %s: %v: %s", name, err, lastLine(errb.String()))
 	}
-	f := &ociProfile{}
+	f = &ociProfile{}
 	if err := json.Unmarshal(out, f); err != nil || len(f.Syscalls) == 0 {
-		return nil, fmt.Errorf("the Warden's filter for policy %s does not read: %v", name, err)
+		return nil, "", fmt.Errorf("the Warden's filter for policy %s does not read: %v", name, err)
 	}
 	p.mu.Lock()
-	p.filters[name] = cached{st.ModTime(), st.Size(), f}
+	if len(p.filters) >= 256 {
+		p.filters = map[string]*ociProfile{}
+	}
+	p.filters[sha] = f
 	p.mu.Unlock()
-	return f, nil
+	return f, sha, nil
 }
 
 func lastLine(s string) string {
@@ -231,7 +254,10 @@ func (p *plugin) adjust(pod *api.PodSandbox, ctr *api.Container) (*api.Container
 	if args[0] == launcherAt {
 		return nil, refuse("the command is already %s", launcherAt)
 	}
-	f, err := p.filter(name)
+	if !policyName.MatchString(pod.GetNamespace()) {
+		return nil, refuse("the pod's namespace %q is not a name a policy can be under", pod.GetNamespace())
+	}
+	f, sha, err := p.filter(pod.GetNamespace(), name)
 	if err != nil {
 		return nil, refuse("%v", err)
 	}
@@ -253,6 +279,7 @@ func (p *plugin) adjust(pod *api.PodSandbox, ctr *api.Container) (*api.Container
 	}
 	adj.SetArgs(append([]string{launcherAt, "--"}, args...))
 	adj.AddAnnotation(annotation, name)
+	adj.AddAnnotation("varek.dev/policy-sha256", sha)
 	// the pod's names, for the node agent's record (CRI-O puts the
 	// kubelet's in one JSON string; a runtime's own, where it has them,
 	// must agree)
@@ -277,12 +304,17 @@ func (p *plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr *ap
 }
 
 func main() {
-	p := &plugin{filters: map[string]cached{}}
+	p := &plugin{filters: map[string]*ociProfile{}}
 	flag.StringVar(&p.warden, "warden", "", "the warden binary (it writes each policy's filter)")
 	flag.StringVar(&p.policies, "policies", "", "the policies' directory (NAME.policy), the node agent's")
 	flag.StringVar(&p.listener, "listener", "", "the node agent's socket")
 	flag.StringVar(&p.launcher, "launcher", "", "the launcher (varek-init) on the node")
 	socket := flag.String("socket", "", "the runtime's NRI socket (default: NRI's)")
+	// v1.34 step 5 (D7): the cluster's VarekPolicy resources into -policies
+	syncAPI := flag.Bool("sync", false, "write the cluster's VarekPolicy resources to -policies (in a cluster)")
+	api := flag.String("api", "", "-sync: the API server (default: the cluster's, from the service account)")
+	apiToken := flag.String("api-token", "", "-sync: the service account's token file")
+	apiCA := flag.String("api-ca", "", "-sync: the cluster's CA")
 	flag.Parse()
 	for _, v := range []struct{ name, val string }{{"-warden", p.warden}, {"-policies", p.policies},
 		{"-listener", p.listener}, {"-launcher", p.launcher}} {
@@ -290,6 +322,15 @@ func main() {
 			fmt.Fprintf(os.Stderr, "varek-nri: %s takes an absolute path\n", v.name)
 			os.Exit(2)
 		}
+	}
+	if *syncAPI {
+		c, err := kube.InCluster(*api, *apiToken, *apiCA)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "varek-nri: -sync:", err)
+			os.Exit(2)
+		}
+		s := &syncer{c: c, dir: p.policies, logf: func(f string, a ...interface{}) { fmt.Fprintf(os.Stderr, f+"\n", a...) }}
+		go s.run(context.Background())
 	}
 	opts := []stub.Option{stub.WithPluginName("varek"), stub.WithPluginIdx("10")}
 	if *socket != "" {

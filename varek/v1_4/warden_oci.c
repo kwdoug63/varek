@@ -5,7 +5,7 @@
 //
 //   warden POLICY --oci-filter
 //
-// writes it to standard output; the NRI plugin (nri/) gives it to the
+// writes it to standard output; the NRI plugin (k8s/cmd/varek-nri) gives it to the
 // runtime as the container's seccomp policy, with the node agent's socket as
 // its listenerPath. The Warden's own builder (warden_baseline_filter.c,
 // included here) is run with every libseccomp call recorded, and the rules

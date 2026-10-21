@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: MIT
+#
+# v1.34 step 5 (docs/security/v1.34-kubernetes.md, D7): VAREK's policies as
+# a namespaced resource. Its text is the policy as written for the Warden; a
+# pod names one of its namespace's by the annotation varek.dev/policy: NAME.
+# VAREK's NRI plugin (varek-nri -sync) writes each to its node's policy
+# directory, as POLICY_DIR/<namespace>/<name>.policy; the admission webhook
+# (varek-admission) refuses one the Warden does not load or the node agent
+# does not carry. Step 6's Helm chart installs this file.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: varekpolicies.varek.dev
+spec:
+  group: varek.dev
+  scope: Namespaced
+  names:
+    plural: varekpolicies
+    singular: varekpolicy
+    kind: VarekPolicy
+    shortNames: [vp]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          # the node agent takes a name of 1 to 63 of a-z, 0-9 and - only
+          x-kubernetes-validations:
+            - rule: "self.metadata.name.matches('^[a-z0-9-]{1,63}$')"
+              message: "a VarekPolicy's name is 1 to 63 of a-z, 0-9 and -"
+          properties:
+            spec:
+              type: object
+              required: [policy]
+              properties:
+                policy:
+                  description: The policy, as written for the Warden (varek/v1_4/policy.txt is one).
+                  type: string
+                  minLength: 1
+                  maxLength: 1048576

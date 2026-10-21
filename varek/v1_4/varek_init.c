@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
 // varek_init.c — v1.34 step 3 (docs/security/v1.34-kubernetes.md, D3): the
-// launcher, varek-init, built static. The NRI plugin (nri/) binds it
+// launcher, varek-init, built static. The NRI plugin (k8s/cmd/varek-nri) binds it
 // read-only at /varek/init in each container of a pod VAREK supervises and
 // puts it first in the container's command:
 //

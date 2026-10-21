@@ -1,4 +1,4 @@
-module varek.dev/varek-nri
+module varek.dev/varek-k8s
 
 go 1.24.0
 

@@ -32,7 +32,7 @@
  * the namespace the pod's containers share, and the proxy runs there, taking
  * only the connections the Warden announces.
  *
- * Step 3 (the NRI plugin, nri/, and the launcher, varek_init.c):
+ * Step 3 (the NRI plugin, k8s/cmd/varek-nri, and the launcher, varek_init.c):
  *
  *   warden POLICY_DIR --node-agent SOCKET --node-streams DIR --node-launcher FILE
  *
@@ -168,21 +168,34 @@ static int node_state(const char *doc, size_t n, char *why, size_t wn) {
     return 0;
 }
 
+/* a name of 1 to 63 of a-z, 0-9 and - (a policy's, a namespace's) */
+static bool node_label(const char *s) {
+    size_t k = 0;
+    for (; s[k]; k++)
+        if (!((s[k] >= 'a' && s[k] <= 'z') || (s[k] >= '0' && s[k] <= '9') || s[k] == '-')) return false;
+    return k > 0 && k <= 63;
+}
+
 /* v1.34 step 3: the container's policy, by the name its pod gives
- * (varek.dev/policy, copied by the NRI plugin to the container's annotations),
- * as POLICY_DIR/<name>.policy; with a single policy file, every container's
- * (the name, if any, recorded). A name is [a-z0-9-], 1 to 63 characters. 0,
- * or -1 with why. */
+ * (varek.dev/policy, copied by the NRI plugin to the container's annotations);
+ * step 5: as POLICY_DIR/<pod's namespace>/<name>.policy, where the plugin
+ * writes each namespace's VarekPolicy resources (D7). With a single policy
+ * file, every container's (the name, if any, recorded). Also the plugin's
+ * SHA-256 of the policy it wrote the filter for (varek.dev/policy-sha256),
+ * required with a directory. 0, or -1 with why. */
 static int node_policy(const char *doc, size_t n, const char **policy_path, char *why, size_t wn) {
     const char *pp[] = { "state", "annotations", "varek.dev/policy" }, *v;
+    const char *ph[] = { "state", "annotations", "varek.dev/policy-sha256" };
     size_t vn;
     bool has = nj_find(doc, n, pp, 3, &v, &vn) == 0;
     if (has && nj_string(v, vn, g_nr.policy, sizeof g_nr.policy) < 0) g_nr.policy[0] = '\0';
-    size_t k = 0;
-    for (; g_nr.policy[k]; k++)
-        if (!((g_nr.policy[k] >= 'a' && g_nr.policy[k] <= 'z') || (g_nr.policy[k] >= '0' && g_nr.policy[k] <= '9') ||
-              g_nr.policy[k] == '-')) break;
-    bool named = has && k > 0 && !g_nr.policy[k];
+    bool named = has && node_label(g_nr.policy);
+    g_nr.policy_sha[0] = '\0';
+    if (nj_find(doc, n, ph, 3, &v, &vn) == 0) {
+        bool hex = nj_string(v, vn, g_nr.policy_sha, sizeof g_nr.policy_sha) == 0 && strlen(g_nr.policy_sha) == 64;
+        for (size_t k = 0; hex && k < 64; k++) hex = strchr("0123456789abcdef", g_nr.policy_sha[k]) != NULL;
+        if (!hex) { snprintf(why, wn, "the container's varek.dev/policy-sha256 is not a SHA-256 (64 hex digits)"); return -1; }
+    }
     if (!g_node_policies) {
         if (!named) g_nr.policy[0] = '\0';
         return 0;
@@ -196,15 +209,72 @@ static int node_policy(const char *doc, size_t n, const char **policy_path, char
         snprintf(why, wn, "the container's policy name (varek.dev/policy) is not 1 to 63 of a-z, 0-9 and -");
         return -1;
     }
+    if (!node_label(g_nr.pod_ns)) {
+        snprintf(why, wn, "the container's pod names no namespace its policy could be in");
+        return -1;
+    }
+    if (!g_nr.policy_sha[0]) {
+        snprintf(why, wn, "the container was not given its filter by VAREK's NRI plugin (no varek.dev/policy-sha256)");
+        return -1;
+    }
     static char path[PATH_MAX];
     struct stat st;
-    snprintf(path, sizeof path, "%s/%s.policy", g_node_policies, g_nr.policy);
+    snprintf(path, sizeof path, "%s/%s/%s.policy", g_node_policies, g_nr.pod_ns, g_nr.policy);
     int e = lstat(path, &st) < 0 ? errno : 0;
     if (e || !S_ISREG(st.st_mode)) {
         snprintf(why, wn, "no policy named %s (%.300s: %s)", g_nr.policy, path, e ? strerror(e) : "not a file");
         return -1;
     }
     *policy_path = path;
+    return 0;
+}
+
+/* v1.34 step 5 (D8): the policy the container runs under, copied beside its
+ * stream (DIR/<container>.<supervisor>.policy, root's, read-only) and loaded
+ * from there, so the run's evidence holds the policy as it was, whatever the
+ * cluster's resource becomes; its SHA-256 must be the one the plugin wrote
+ * the filter for. *policy_path becomes the copy. 0, or -1 with why. */
+static int node_policy_copy(int sd, const char *streams, const char *base, const char **policy_path,
+                            char *why, size_t wn) {
+    int src = open(*policy_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    struct stat st;
+    if (src < 0 || fstat(src, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size > (8 << 20)) {
+        snprintf(why, wn, "cannot read the policy %.300s (%s)", *policy_path,
+                 src < 0 ? strerror(errno) : "not a file of at most 8 MiB");
+        if (src >= 0) close(src);
+        return -1;
+    }
+    char *b = malloc((size_t)st.st_size + 1);
+    size_t n = 0;
+    ssize_t r = 0;
+    while (b && n < (size_t)st.st_size + 1 && (r = read(src, b + n, (size_t)st.st_size + 1 - n)) > 0) n += (size_t)r;
+    close(src);
+    if (!b || r < 0 || n > (size_t)st.st_size) {
+        free(b);
+        snprintf(why, wn, "cannot read the policy %.300s whole", *policy_path);
+        return -1;
+    }
+    unsigned char h[crypto_hash_sha256_BYTES];
+    char hex[65];
+    crypto_hash_sha256(h, (const unsigned char *)b, n);
+    sodium_bin2hex(hex, sizeof hex, h, sizeof h);
+    if (g_nr.policy_sha[0] && strcmp(hex, g_nr.policy_sha)) {
+        free(b);
+        snprintf(why, wn, "the policy %.300s is not the one the NRI plugin wrote the container's filter for "
+                 "(SHA-256 %.16s..., the plugin's %.16s...): it changed between them; the container is to be "
+                 "created again", *policy_path, hex, g_nr.policy_sha);
+        return -1;
+    }
+    char cname[300];
+    snprintf(cname, sizeof cname, "%s.policy", base);
+    int dst = openat(sd, cname, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0400);
+    bool ok = dst >= 0 && write_all(dst, b, n) == 0 && fsync(dst) == 0;
+    if (dst >= 0) close(dst);
+    free(b);
+    if (!ok) { snprintf(why, wn, "cannot copy the policy beside the stream (%s)", strerror(errno)); return -1; }
+    static char copy[PATH_MAX];
+    snprintf(copy, sizeof copy, "%s/%s", streams, cname);
+    *policy_path = copy;
     return 0;
 }
 
@@ -435,18 +505,26 @@ static int node_enter(int type) {
 }
 
 /* The policy's needs this step does not carry: why, or NULL */
+/* v1.34 step 5: what of the policy itself the node agent does not carry
+ * yet: why, or NULL (warden POLICY --oci-filter refuses it, so the plugin
+ * and the admission check refuse it before the container starts) */
+static const char *node_policy_why(const struct policy *p) {
+    if (p->v.ncreds) return "credentials";
+    if (p->v.require_obo) return "the on-behalf-of chain (require on-behalf-of)";
+    for (size_t i = 0; i < p->v.n; i++)
+        if (p->v.rules[i].subagent[0]) return "sub-agents";
+    return NULL;
+}
+
 static const char *node_unsupported(const struct policy *p, bool dry, const char *plan, const char *flow,
                                     const char *obo, const char *svid, const char *trust) {
     if (dry) return "a dry run";
     if (plan || flow) return "a plan";
     if (obo || svid) return "the on-behalf-of chain";
     if (trust) return "a trust bundle";
-    if (p->v.ncreds) return "credentials";
     if (p->v.launches && !g_nr.launcher)
         return "decided launches without the launcher (" NODE_LAUNCHER " first in the command: the NRI plugin)";
-    for (size_t i = 0; i < p->v.n; i++)
-        if (p->v.rules[i].subagent[0]) return "sub-agents";
-    return NULL;
+    return node_policy_why(p);
 }
 
 /* run_start's container fields */
@@ -694,13 +772,15 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
         int oom = proc_openf(O_WRONLY, 0, "self/oom_score_adj");
         if (oom >= 0) { (void)!write(oom, "-1000", 5); close(oom); }
         int ok = node_state(buf, (size_t)r, why, sizeof why);
-        char sname[256];
-        snprintf(sname, sizeof sname, "%s.%d.jsonl", ok == 0 ? g_nr.id : "unknown", (int)getpid());
+        char sbase[200], sname[256];
+        snprintf(sbase, sizeof sbase, "%s.%d", ok == 0 ? g_nr.id : "unknown", (int)getpid());
+        snprintf(sname, sizeof sname, "%s.jsonl", sbase);
         int so = openat(sd, sname, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (so < 0 || dup2(so, STDERR_FILENO) < 0) node_fail("cannot open its stream");
         close(so);
-        close(sd);
         if (ok == 0) ok = node_policy(buf, (size_t)r, policy_path, why, sizeof why);
+        if (ok == 0) ok = node_policy_copy(sd, streams, sbase, policy_path, why, sizeof why);   /* step 5 */
+        close(sd);
         if (ok == 0) ok = node_config(why, sizeof why);
         if (ok == 0) ok = node_process(why, sizeof why);
         if (ok == 0 && node_alive(g_nr.pidfd)) node_dns();

@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: MIT
+#
+# v1.34 step 5 (D7): where the API server sends what VAREK's admission
+# webhook (varek-admission) checks. Step 6's Helm chart installs this with
+# its Service, Deployment and certificate (the caBundle below is the CA that
+# signs the webhook's certificate); the names here are the chart's.
+#   - every VarekPolicy created or changed;
+#   - every pod created: one annotated varek.dev/policy is checked;
+#   - in a namespace labelled varek.dev/policy-required=true, a pod with no
+#     policy is refused.
+# failurePolicy Fail: if the webhook is down, these are refused, not let in.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: varek
+webhooks:
+  - name: varekpolicy.varek.dev
+    rules:
+      - apiGroups: ["varek.dev"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["varekpolicies"]
+    clientConfig:
+      service: { name: varek-admission, namespace: varek-system, path: /varekpolicy, port: 443 }
+      caBundle: ""
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    timeoutSeconds: 15
+  - name: pod.varek.dev
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+    namespaceSelector:
+      matchExpressions:
+        - { key: varek.dev/policy-required, operator: NotIn, values: ["true"] }
+        - { key: kubernetes.io/metadata.name, operator: NotIn, values: ["varek-system", "kube-system"] }
+    clientConfig:
+      service: { name: varek-admission, namespace: varek-system, path: /pod, port: 443 }
+      caBundle: ""
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    timeoutSeconds: 15
+  - name: pod-required.varek.dev
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+    namespaceSelector:
+      matchLabels: { varek.dev/policy-required: "true" }
+    clientConfig:
+      service: { name: varek-admission, namespace: varek-system, path: /pod-required, port: 443 }
+      caBundle: ""
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    timeoutSeconds: 15

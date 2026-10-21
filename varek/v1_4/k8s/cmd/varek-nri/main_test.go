@@ -2,6 +2,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,12 +27,12 @@ func setup(t *testing.T) *plugin {
 		t.Fatal(err)
 	}
 	pol := filepath.Join(d, "policies")
-	os.Mkdir(pol, 0o755)
+	os.MkdirAll(filepath.Join(pol, "ns"), 0o755)
 	for _, n := range []string{"agent", "bad"} {
-		os.WriteFile(filepath.Join(pol, n+".policy"), []byte("allow path /tmp/\n"), 0o644)
+		os.WriteFile(filepath.Join(pol, "ns", n+".policy"), []byte("allow path /tmp/\n"), 0o644)
 	}
 	return &plugin{warden: w, policies: pol, listener: "/run/varek/node.sock", launcher: "/opt/varek/varek-init",
-		filters: map[string]cached{}}
+		filters: map[string]*ociProfile{}}
 }
 
 func pod(ann map[string]string) *api.PodSandbox {
@@ -87,6 +89,9 @@ func TestAdjustment(t *testing.T) {
 		a["varek.dev/pod-uid"] != "u-1" || a["varek.dev/container"] != "c" {
 		t.Errorf("the pod's names in the container's annotations: %v", a)
 	}
+	if want := sha256.Sum256([]byte("allow path /tmp/\n")); adj.GetAnnotations()["varek.dev/policy-sha256"] != hex.EncodeToString(want[:]) {
+		t.Errorf("the policy's SHA-256: %v", adj.GetAnnotations())
+	}
 	if adj.GetAnnotations()[annotation] != "agent" {
 		t.Errorf("the policy's name in the container's annotations: %v", adj.GetAnnotations())
 	}
@@ -115,17 +120,20 @@ func TestRefused(t *testing.T) {
 	}
 }
 
-func TestFilterCachedWhileUnchanged(t *testing.T) {
+func TestFilterKeptByHash(t *testing.T) {
 	p := setup(t)
-	a, err := p.filter("agent")
-	b, err2 := p.filter("agent")
-	if err != nil || err2 != nil || a != b {
-		t.Fatalf("cached: %v %v", err, err2)
+	a, s1, err := p.filter("ns", "agent")
+	b, s2, err2 := p.filter("ns", "agent")
+	if err != nil || err2 != nil || a != b || s1 != s2 || len(s1) != 64 {
+		t.Fatalf("kept: %v %v", err, err2)
 	}
-	os.WriteFile(filepath.Join(p.policies, "agent.policy"), []byte("allow path /tmp/\nallow path /var/\n"), 0o644)
-	c, err := p.filter("agent")
-	if err != nil || c == a {
-		t.Fatalf("a changed policy is written again: %v", err)
+	os.WriteFile(filepath.Join(p.policies, "ns", "agent.policy"), []byte("allow path /tmp/\nallow path /var/\n"), 0o644)
+	c, s3, err := p.filter("ns", "agent")
+	if err != nil || c == a || s3 == s1 {
+		t.Fatalf("a changed policy is written again, with its own hash: %v", err)
+	}
+	if _, _, err := p.filter("other", "agent"); err == nil || !strings.Contains(err.Error(), "in namespace other") {
+		t.Fatalf("another namespace's policy: %v", err)
 	}
 }
 

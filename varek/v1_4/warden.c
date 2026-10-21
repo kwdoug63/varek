@@ -786,6 +786,7 @@ struct node_run {
     long   launcher_calls;      /* the launcher's own calls before the command, let through */
     int    set_view;            /* the launch set the launcher reads, a sealed memfd */
     char  *set_text;            /* its text, one path a line */
+    char   policy_sha[65];      /* v1.34 step 5: the plugin's SHA-256 of the policy it wrote the filter for, or "" */
     char   dns[80];             /* v1.34 step 4: the pod's DNS server, "a.b.c.d:53" (its resolv.conf), or "" */
     struct sock_filter *bpf;    /* the Warden's own filter for the policy, compiled */
     unsigned nbpf;
@@ -5436,6 +5437,13 @@ int main(int argc, char **argv) {
         }
         static struct policy op;
         if (policy_load(policy_path, &op) < 0) return 1;
+        /* v1.34 step 5: written only for a policy the node agent carries
+         * (the plugin's, and the admission check's, test) */
+        const char *no = node_policy_why(&op);
+        if (no) {
+            fprintf(stderr, "[warden] --oci-filter: the node agent does not carry %s yet\n", no);
+            return 1;
+        }
         char why[200];
         if (wd_oci_filter_write(stdout, op.v.open_as_agent ? WD_FILTER_CHANGES : 0, why, sizeof why) < 0 ||
             fflush(stdout) != 0) {

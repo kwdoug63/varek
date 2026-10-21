@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 #
 # v1340_crio.sh — v1.34 step 3 (docs/security/v1.34-kubernetes.md): the NRI
-# plugin (nri/, varek-nri), the node agent and the launcher (varek-init)
+# plugin (k8s/cmd/varek-nri), the node agent and the launcher (varek-init)
 # together under CRI-O, as step 1's sixth measurement ran their stand-ins.
 # On a host with CRI-O 1.35 or later (NRI on), crictl and Go, as root, from a
 # checkout of this branch. The node agent takes each pod's policy by name
@@ -45,15 +45,16 @@ say "v1340_crio.sh $(TZ=America/Chicago date '+%Y-%m-%d %H:%M %Z'); $(uname -sr)
 
 echo "== building the Warden, the launcher and the plugin"
 make -s -C "$HERE" warden varek-init > "$OUT/build.log" 2>&1 &&
-    (cd "$HERE/nri" && go build -o "$OUT/varek-nri" .) >> "$OUT/build.log" 2>&1 ||
+    (cd "$HERE/k8s" && go build -o "$OUT/varek-nri" ./cmd/varek-nri) >> "$OUT/build.log" 2>&1 ||
     { tail -20 "$OUT/build.log"; echo "v1340_crio.sh: the build failed" >&2; exit 1; }
 install -m 755 "$HERE/warden" "$OUT/warden"; install -m 755 "$HERE/varek-init" "$OUT/varek-init"
-mkdir -m 755 "$OUT/policies" "$OUT/streams"; mkdir -m 700 "$OUT/sock"
+# step 5: the policies of the pods' namespace (varek), as the plugin's -sync writes them
+mkdir -m 755 "$OUT/policies" "$OUT/policies/varek" "$OUT/streams"; mkdir -m 700 "$OUT/sock"
 # busybox's commands are hardlinks of one file, and its shell runs some
 # without a launch: each name is its own rule (through overlayfs a Landlock
 # rule on one name does not cover another, so the launcher is given each),
 # and each check below launches its program (exec in a subshell)
-cat > "$OUT/policies/busybox.policy" <<'EOF'
+cat > "$OUT/policies/varek/busybox.policy" <<'EOF'
 require warden 1.29
 allow path /bin/ readonly
 allow path /lib/ readonly
@@ -69,7 +70,7 @@ allow exec /bin/cp
 allow exec /bin/true
 allow exec /bin/sleep
 EOF
-chmod 644 "$OUT/policies/busybox.policy"
+chmod 644 "$OUT/policies/varek/busybox.policy"
 
 if [ ! -S /var/run/crio/crio.sock ]; then
     crio > "$OUT/crio.log" 2>&1 &
