@@ -98,15 +98,16 @@ fi
 case "$(uname -m)" in x86_64) ARCH=SCMP_ARCH_X86_64 ;; aarch64) ARCH=SCMP_ARCH_AARCH64 ;; *) ARCH="" ;; esac
 if [ "$(id -u)" != 0 ] || [ -z "$WARDEN" ] || [ -z "$RUNC" ] || [ -z "$ARCH" ] || ! command -v python3 >/dev/null ||
    ! gcc -static -O2 -o /tmp/varek_v1340_probe.$$ "$HERE/tests/v1340_probe.c" -lpthread 2>/dev/null ||
-   ! gcc -O2 -I"$HERE" -o /tmp/varek_v1340_ocif.$$ "$HERE/tests/v1340_oci_filter.c" -lseccomp 2>/dev/null; then
-    rm -f /tmp/varek_v1340_probe.$$ /tmp/varek_v1340_ocif.$$
+   ! gcc -O2 -I"$HERE" -o /tmp/varek_v1340_ocif.$$ "$HERE/tests/v1340_oci_filter.c" -lseccomp 2>/dev/null ||
+   ! gcc -O2 -o /tmp/varek_v1340_rt.$$ "$HERE/tests/v1340_runtime.c" 2>/dev/null; then
+    rm -f /tmp/varek_v1340_probe.$$ /tmp/varek_v1340_ocif.$$ /tmp/varek_v1340_rt.$$
     skip "containers under the node agent (need root, the warden, runc, python3, a static gcc and libseccomp)"
     echo; [ "$fail" = 0 ] && echo "test_v1340: PASS ($skips skipped)" || echo "test_v1340: FAIL"; [ "$fail" = 0 ]; exit
 fi
 B="$(mktemp -d /tmp/varek_v1340.XXXXXX)"; chmod 755 "$B"
 mkdir -p "$B/streams" "$B/state" "$B/f" "$B/rootfs/data" "$B/rootfs/proc" "$B/rootfs/dev" "$B/rootfs/tmp"
 mkdir -m 700 "$B/s"                          # the sockets' directory: root's alone
-mv /tmp/varek_v1340_probe.$$ "$B/rootfs/probe"; mv /tmp/varek_v1340_ocif.$$ "$B/ocif"
+mv /tmp/varek_v1340_probe.$$ "$B/rootfs/probe"; mv /tmp/varek_v1340_ocif.$$ "$B/ocif"; mv /tmp/varek_v1340_rt.$$ "$B/rt"
 chmod 755 "$B/rootfs/probe"
 echo "allowed content" > "$B/rootfs/data/allowed"; echo "secret" > "$B/rootfs/data/denied"; chmod 644 "$B/rootfs/data/"*
 echo "root's" > "$B/rootfs/data/rootonly"; chmod 600 "$B/rootfs/data/rootonly"
@@ -235,15 +236,21 @@ PY
 for _ in $(seq 100); do grep -q 'a connection refused: the descriptor' "$B/a.log" && break; sleep 0.1; done
 check "a state from a process that is not the runtime: refused" grep -q 'a connection refused: the descriptor sent is not a seccomp listener' "$B/a.log"
 check "... and the process it names is not killed" kill -0 "$VICTIM"
-# the peer's mount namespace, by any of its threads: runc's main thread can
-# be left in a container's, it seems, by a goroutine locked to it (kind, in CI)
-peer() {   # MODE: thread (the main thread in a mount namespace of its own, another thread not) | all
-    python3 - "$B/s/a.sock" "$VICTIM" "$1" > "$B/peer-$1.out" 2>&1 <<'PY'
-import ctypes, json, os, socket, sys, threading, time
+# the peer read as the connection is taken: under containerd runc create
+# sends the state and ends, reaped by its shim, its child then the shim's
+# (kind, in CI); tests/v1340_runtime.c stands in for both, the node agent
+# held on another connection until the runtime is gone
+"$B/rt" "$B/s/a.sock" gone > "$B/rt.out" 2>&1; rrc=$?
+# (taken, its supervisor goes on to the bundle, which the stand-in has not,
+# and says so in the run's stream)
+for _ in $(seq 100); do cat "$B"/streams-a/gone.*.jsonl 2>/dev/null | grep -q 'container gone refused' && break; sleep 0.1; done
+check "a runtime that ended once it sent the state: its child, now its shim's, taken" sh -c \
+    "[ $rrc = 0 ] && cat '$B'/streams-a/gone.*.jsonl | grep -q 'container gone refused: cannot read the bundle'"
+# a peer in another mount namespace, from its start
+python3 - "$B/s/a.sock" "$VICTIM" > "$B/peer.out" 2>&1 <<'PY'
+import ctypes, json, os, socket, sys
 libc = ctypes.CDLL(None, use_errno=True)
-if sys.argv[3] == "thread":
-    threading.Thread(target=time.sleep, args=(30,), daemon=True).start()
-if libc.unshare(0x00020000) != 0:    # CLONE_NEWNS, this thread's alone where there are others
+if libc.unshare(0x00020000) != 0:    # CLONE_NEWNS
     sys.exit("unshare: " + os.strerror(ctypes.get_errno()))
 r, w = os.pipe()
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -258,16 +265,9 @@ try:
 except OSError:
     pass
 PY
-}
-n0=$(grep -c 'a connection refused: the descriptor sent is not a seccomp listener' "$B/a.log")
-peer thread
-for _ in $(seq 100); do [ "$(grep -c 'a connection refused: the descriptor sent' "$B/a.log")" -gt "$n0" ] && break; sleep 0.1; done
-check "a peer whose main thread is in another mount namespace, another thread in the node's: past that check" sh -c \
-    "[ \$(grep -c 'a connection refused: the descriptor sent is not a seccomp listener' '$B/a.log') -gt $n0 ] && ! grep -q 'in any of its threads' '$B/a.log'"
-peer all
-for _ in $(seq 100); do grep -q 'in any of its threads' "$B/a.log" && break; sleep 0.1; done
-check "a peer in another mount namespace, every thread: refused" \
-    grep -q "a connection refused: the peer (pid [0-9]*, python3) is not in the node's mount namespace nor the node agent's, in any of its threads" "$B/a.log"
+for _ in $(seq 100); do grep -q "is not in the node's mount namespace nor the node agent's" "$B/a.log" && break; sleep 0.1; done
+check "a peer in another mount namespace: refused" \
+    grep -q "a connection refused: the peer (pid [0-9]*, python3) is not in the node's mount namespace nor the node agent's (not the node's runtime" "$B/a.log"
 kill "$VICTIM" 2>/dev/null
 check "the node agent is still listening" sh -c "kill -0 ${AGENTS%% *} 2>/dev/null || kill -0 \$(echo $AGENTS | cut -d' ' -f1)"
 

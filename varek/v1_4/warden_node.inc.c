@@ -337,82 +337,93 @@ static bool node_same_ns(pid_t pid, const char *ns, const char *of) {
            a.st_dev == b.st_dev && a.st_ino == b.st_ino;
 }
 
-/* Whether any thread of a process is in the namespace of that kind of `of`.
- * /proc/<pid>/ns/ is the main thread's. On kind, in CI, runc was at times
- * refused by its mount namespace; likely (not yet confirmed) because it is
- * a Go program, and a goroutine that joins a container's mount namespace is
- * locked to its thread, at times the main one. A process that
- * can have one thread in the node's mount namespace can have them all, so
- * this asks no less of the peer. */
-static bool node_any_thread_ns(pid_t pid, const char *ns, const char *of) {
-    struct stat b;
-    if (proc_statf(&b, "%s/ns/%s", of, ns) < 0) return false;
-    int d = proc_openf(O_RDONLY | O_DIRECTORY, 0, "%d/task", pid);
-    DIR *dir = d < 0 ? NULL : fdopendir(d);
-    if (!dir) {
-        if (d >= 0) close(d);
-        return false;
-    }
-    bool any = false;
-    struct dirent *e;
-    while (!any && (e = readdir(dir)) != NULL) {
-        struct stat a;
-        if (e->d_name[0] >= '1' && e->d_name[0] <= '9')
-            any = proc_statf(&a, "%d/task/%s/ns/%s", pid, e->d_name, ns) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
-    }
-    closedir(dir);
-    return any;
-}
-
 /* a namespace's inode, for a refusal's wording (0: not read) */
 static unsigned long long node_ns_ino(const char *of, const char *ns) {
     struct stat st;
     return proc_statf(&st, "%s/ns/%s", of, ns) == 0 ? (unsigned long long)st.st_ino : 0;
 }
 
-/* A connection the listener takes, checked before a supervisor is forked
- * for it (review: through step 2 any root peer could name any process, to
- * have it killed, or supervised in its place): the peer is root, in the
- * node agent's own user and PID namespaces and in its mount namespace or
- * the node's (the runtime, on the node); the state is well formed and names a process whose parent is the
- * peer (runc's init is its runtime's child; crun's is not yet tested); the
- * descriptor is a seccomp listener, and that process is under a filter.
- * 0 with the process's pid and pidfd, or -1 with why. */
-static int node_admit(int c, const char *doc, size_t n, int fd, pid_t *pid, int *pidfd, char *why, size_t wn) {
-    struct ucred cr;
-    socklen_t cl = sizeof cr;
-    *pidfd = -1;
-    if (getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &cl) < 0 || cr.pid <= 0) {
-        snprintf(why, wn, "the peer's credentials cannot be read");
-        return -1;
-    }
-    if (cr.uid != 0) { snprintf(why, wn, "the peer (pid %d) is not root (uid %u)", (int)cr.pid, (unsigned)cr.uid); return -1; }
+/* Whether a process runs where the node's runtime does: in the node agent's
+ * own user and PID namespaces, and in its mount namespace or the node's (its
+ * init's). v1.34 step 6: in the chart's DaemonSet the node agent runs in a
+ * pod's mount namespace (with the node's PID and user namespaces), the
+ * runtime in the node's; on a host the two are one (and where the node's
+ * init cannot be read, as in some sandboxes, the node agent's own is the
+ * node's). In the pod no other process shares the node agent's own: each
+ * container has one. 0, or -1 with why (WHO names the process). */
+static int node_runtime_ns(pid_t pid, const char *who, char *why, size_t wn) {
     static const char *const kNs[] = { "user", "pid" };
     for (size_t i = 0; i < sizeof kNs / sizeof kNs[0]; i++)
-        if (!node_same_ns(cr.pid, kNs[i], "self")) {
-            snprintf(why, wn, "the peer (pid %d) is not in the node agent's %s namespace (not the node's runtime)",
-                     (int)cr.pid, kNs[i]);
+        if (!node_same_ns(pid, kNs[i], "self")) {
+            snprintf(why, wn, "%s (pid %d) is not in the node agent's %s namespace (not the node's runtime)",
+                     who, (int)pid, kNs[i]);
             return -1;
         }
-    /* v1.34 step 6: the mount namespace the node agent's own, or the node's
-     * (its init's): in the chart's DaemonSet the node agent runs in a pod's
-     * (with the node's PID and user namespaces), the runtime in the node's;
-     * on a host the two are one (and where the node's init cannot be read,
-     * as in some sandboxes, the node agent's own is the node's). In the pod
-     * no other process shares the node agent's own: each container has one.
-     * Any of the peer's threads (node_any_thread_ns). */
-    if (!node_any_thread_ns(cr.pid, "mnt", "self") && !node_any_thread_ns(cr.pid, "mnt", "1")) {
+    if (!node_same_ns(pid, "mnt", "self") && !node_same_ns(pid, "mnt", "1")) {
         char pn[16], comm[32] = "?";
-        snprintf(pn, sizeof pn, "%d", (int)cr.pid);
-        FILE *f = proc_fopenf("%d/comm", (int)cr.pid);
+        snprintf(pn, sizeof pn, "%d", (int)pid);
+        FILE *f = proc_fopenf("%d/comm", (int)pid);
         if (f) {
             if (fgets(comm, sizeof comm, f)) comm[strcspn(comm, "\n")] = '\0';
             fclose(f);
         }
-        snprintf(why, wn, "the peer (pid %d, %s) is not in the node's mount namespace nor the node agent's, in any of "
-                 "its threads (not the node's runtime; its main thread's mnt:[%llu], the node's mnt:[%llu], the node "
-                 "agent's mnt:[%llu])", (int)cr.pid, comm, node_ns_ino(pn, "mnt"), node_ns_ino("1", "mnt"),
-                 node_ns_ino("self", "mnt"));
+        snprintf(why, wn, "%s (pid %d, %s) is not in the node's mount namespace nor the node agent's (not the node's "
+                 "runtime; its mnt:[%llu], the node's mnt:[%llu], the node agent's mnt:[%llu])", who, (int)pid, comm,
+                 node_ns_ino(pn, "mnt"), node_ns_ino("1", "mnt"), node_ns_ino("self", "mnt"));
+        return -1;
+    }
+    return 0;
+}
+
+/* The peer, as the node agent finds it when it takes the connection, before
+ * it reads the state. The runtime need not wait for the node agent: under
+ * containerd, runc create sends the state and ends, its shim (a subreaper)
+ * reaps it, and the container's process becomes the shim's child (kind, in
+ * CI: refused, the peer then a zombie, whose mount namespace is gone, or
+ * reaped, or its child the shim's). */
+struct node_peer {
+    pid_t pid;          /* SO_PEERCRED's, as the kernel took it at connect */
+    uid_t uid;
+    int state;          /* 1: read, where the runtime runs; 0: read, not (why); -1: ended before it could be read */
+    long ppid;          /* its parent, where read (a zombie's too), or -1 */
+    char why[400];
+};
+
+static void node_peer_read(int c, struct node_peer *p) {
+    struct ucred cr;
+    socklen_t cl = sizeof cr;
+    memset(p, 0, sizeof *p);
+    p->ppid = -1;
+    if (getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &cl) < 0 || cr.pid <= 0) {
+        snprintf(p->why, sizeof p->why, "the peer's credentials cannot be read");
+        return;
+    }
+    p->pid = cr.pid;
+    p->uid = cr.uid;
+    p->ppid = node_status_field(cr.pid, "PPid:");
+    struct stat st;
+    if (proc_statf(&st, "%d/ns/mnt", (int)cr.pid) < 0) { p->state = -1; return; }   /* ended: a zombie has none */
+    p->state = node_runtime_ns(cr.pid, "the peer", p->why, sizeof p->why) == 0 ? 1 : 0;
+}
+
+/* A connection the listener takes, checked before a supervisor is forked
+ * for it (review: through step 2 any root peer could name any process, to
+ * have it killed, or supervised in its place): the peer is root and runs
+ * where the runtime does (node_runtime_ns, read as the connection is taken,
+ * node_peer_read); the state is well formed and names a process whose
+ * parent is the peer (runc's init is its runtime's child; crun's is not yet
+ * tested) or the peer's parent (the runtime ended, its child reparented to
+ * the shim); the descriptor is a seccomp listener, and that process is under
+ * a filter. A peer that ended before it could be read: the process's parent
+ * (the shim) is root and runs where the runtime does, and is the peer's
+ * parent where that was read. 0 with the process's pid and pidfd, or -1
+ * with why. */
+static int node_admit(const struct node_peer *peer, const char *doc, size_t n, int fd, pid_t *pid, int *pidfd,
+                      char *why, size_t wn) {
+    *pidfd = -1;
+    if (peer->pid <= 0 || peer->state == 0) { snprintf(why, wn, "%s", peer->why); return -1; }
+    if (peer->uid != 0) {
+        snprintf(why, wn, "the peer (pid %d) is not root (uid %u)", (int)peer->pid, (unsigned)peer->uid);
         return -1;
     }
     char ln[64];
@@ -423,15 +434,36 @@ static int node_admit(int c, const char *doc, size_t n, int fd, pid_t *pid, int 
     }
     if (node_state_pid(doc, n, pid, why, wn) < 0) return -1;
     if ((*pidfd = (int)syscall(__NR_pidfd_open, *pid, 0)) < 0) {
-        snprintf(why, wn, "the container's process %d is gone", (int)*pid);
+        snprintf(why, wn, "the container's process %d is gone (%s)", (int)*pid, strerror(errno));
         return -1;
     }
     long pp = node_status_field(*pid, "PPid:"), sc = node_status_field(*pid, "Seccomp:");
-    if (!node_alive(*pidfd)) { snprintf(why, wn, "the container's process %d is gone", (int)*pid); goto fail; }
-    if (pp != (long)cr.pid) {
-        snprintf(why, wn, "the process the state names (%d) is not the peer's child (its parent is %ld, the peer %d)",
-                 (int)*pid, pp, (int)cr.pid);
+    if (!node_alive(*pidfd)) {
+        snprintf(why, wn, "the container's process %d is gone (%s)", (int)*pid, strerror(errno));
         goto fail;
+    }
+    if (peer->state == 1) {
+        if (pp != (long)peer->pid && !(peer->ppid > 0 && pp == peer->ppid)) {
+            snprintf(why, wn, "the process the state names (%d) is not the peer's child nor its parent's (its parent "
+                     "is %ld, the peer %d, the peer's parent %ld)", (int)*pid, pp, (int)peer->pid, peer->ppid);
+            goto fail;
+        }
+    } else {
+        if (peer->ppid > 0 && pp != peer->ppid) {
+            snprintf(why, wn, "the peer (pid %d) ended before it could be read, and the process the state names (%d) "
+                     "is not its parent's child (its parent is %ld, the peer's %ld)", (int)peer->pid, (int)*pid, pp,
+                     peer->ppid);
+            goto fail;
+        }
+        long pu = pp > 0 ? node_status_field((pid_t)pp, "Uid:") : -1;
+        if (pp <= 0 || pu != 0) {
+            snprintf(why, wn, "the peer (pid %d) ended before it could be read, and the parent of the process the "
+                     "state names (%ld) is not root (uid %ld)", (int)peer->pid, pp, pu);
+            goto fail;
+        }
+        if (node_runtime_ns((pid_t)pp, "the parent of the process the state names (the peer ended before it could "
+                            "be read)", why, wn) < 0)
+            goto fail;
     }
     if (sc != 2) { snprintf(why, wn, "the process the state names (%d) is not under a seccomp filter", (int)*pid); goto fail; }
     return 0;
@@ -782,6 +814,8 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
         if (g_node_chld) node_reap();
         int c = accept4(ls, NULL, NULL, SOCK_CLOEXEC);
         if (c < 0) { if (errno == EINTR || errno == ECONNABORTED) continue; perror("[warden] accept"); continue; }
+        struct node_peer peer;
+        node_peer_read(c, &peer);   /* first: the runtime may end once it has sent the state */
         int fds[8], nfd = 0;
         ssize_t r = node_receive(c, buf, NODE_STATE_MAX, fds, &nfd);
         if (r < 0 || nfd != 1) {
@@ -793,7 +827,7 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
         char why[512];
         pid_t pid;
         int pidfd;
-        int adm = node_admit(c, buf, (size_t)r, fds[0], &pid, &pidfd, why, sizeof why);
+        int adm = node_admit(&peer, buf, (size_t)r, fds[0], &pid, &pidfd, why, sizeof why);
         close(c);
         if (adm < 0) {
             /* not the runtime's, or not a container's: nothing is killed (the
