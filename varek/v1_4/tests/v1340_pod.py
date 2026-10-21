@@ -186,8 +186,12 @@ def main():
     if fl.returncode != 0:
         # the plugin refuses the container, which is not created
         # (the Warden's reason, naming the policy as the suite gave it, and its status)
-        sys.stderr.write(fl.stderr.decode(errors="replace").replace(pf, policy))
+        why = fl.stderr.decode(errors="replace").replace(pf, policy)
+        sys.stderr.write(why)
         sys.stderr.write("v1340_pod: the plugin refuses the container: the Warden writes no filter for this policy\n")
+        # the sweep's comparison reads it here (the suite keeps the stand-in's
+        # standard error to itself): the evidence of a reason listed whole
+        log("refused", why.strip()[-2000:] or "no filter", sys.argv[1:])
         shutil.rmtree(inv, ignore_errors=True)
         sys.exit(fl.returncode)
     filt = json.loads(fl.stdout)
