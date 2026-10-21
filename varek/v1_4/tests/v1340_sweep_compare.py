@@ -92,6 +92,11 @@ def main():
                     c["unlisted"] += 1
                     bad += 1
                     notes.append("  %-16s DIFFERS, no reason listed (%s): %s" % (s, nv, k[0][:110]))
+                    # a check missing from the node run is often there with
+                    # more words (a failure's reason after its text): say it
+                    for nk, nvv in n.items():
+                        if nv == "MISSING" and nk[0] != k[0] and nk[0].startswith(k[0]):
+                            notes.append("%-20s node: %s %s" % ("", nvv, nk[0][:300]))
             elif hv == "FAIL":
                 c["both fail" if nv != "PASS" else "node only"] += 1
             elif hv == "SKIP":

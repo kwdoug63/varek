@@ -283,8 +283,13 @@ def main():
     # written, as the Warden's do (a suite reads them during the run): the
     # records as they are (chained), the text lines named
     sent = {}
+    drain_lock = threading.Lock()    # the tail thread's and finish's: a line copied once
 
     def drain():
+        with drain_lock:
+            drain_locked()
+
+    def drain_locked():
         files = [("agent", agent_log.name)] + [(p, os.path.join(streams, p)) for p in sorted(os.listdir(streams))
                                                if p.endswith(".jsonl")] if os.path.isdir(streams) else []
         for key, path in files:
@@ -308,6 +313,8 @@ def main():
         while not stop_tail.wait(0.05):
             drain()
 
+    tailer = threading.Thread(target=tail, daemon=True)
+
     def finish(rc):
         subprocess.run([RUNC, "--root", state, "delete", "-f", cid], capture_output=True)
         # the stream is whole once its supervisor has ended: after run_end it
@@ -326,6 +333,8 @@ def main():
         except subprocess.TimeoutExpired:
             agent.kill()
         stop_tail.set()
+        if tailer.is_alive():
+            tailer.join(5)
         drain()
         if mounted:
             subprocess.run(["umount", "-l", root])
@@ -367,7 +376,7 @@ def main():
     if not mounted or agent.poll() is not None:
         sys.stderr.write("v1340_pod: %s\n" % ("the overlay root did not mount" if not mounted else "the node agent did not start"))
         finish(125)
-    threading.Thread(target=tail, daemon=True).start()
+    tailer.start()
     proc = subprocess.Popen([RUNC, "--root", state, "run", "-b", bundle, cid])
     rc = proc.wait()
     finish(128 + got[0] if got else rc if rc >= 0 else 128 - rc)
