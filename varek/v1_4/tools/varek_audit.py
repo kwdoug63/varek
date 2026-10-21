@@ -126,6 +126,16 @@ DEFAULT_NAMES, DEFAULT_RATE, DEFAULT_LABEL = 256, 30, 63    # the Warden's, v1.2
 STUB = "127.53.53.53:53"          # the Warden's stub resolver (warden_stub.inc.c)
 
 
+def stub_of(rs):
+    """v1.34 step 4: the stub's address in this run. Under the node agent the
+    namespace is the pod's, which its containers share, so the stub takes
+    the first address free from 127.53.53.53 to 127.53.53.254 (run_start
+    says which); a run the Warden starts itself has its own, at STUB."""
+    s = rs.get("dns_stub")
+    m = re.fullmatch(r"127\.53\.53\.(\d{2,3}):53", s) if isinstance(rs.get("node"), dict) and isinstance(s, str) else None
+    return s if m and 53 <= int(m.group(1)) <= 254 else STUB
+
+
 def policy_rules(checker, policy):
     """The policy's rules as the certificate checker parses the file (its
     "rules" mode), one dict each: kind (p|h|e, r: a v1.26.1 request rule),
@@ -2321,9 +2331,9 @@ def check_dns(meta, checker, policy, rules, problems):
     # at the same address
     stub = wild or (pports is not None and any(r["kind"] == "h" and r["name"] and not r["wild"]
                                                for r in rules)) or rs.get("mode") == "dry_run"   # v1.29
-    if rs.get("dns_stub") != (STUB if stub else None):
+    if rs.get("dns_stub") != (stub_of(rs) if stub else None):
         problems.append(f"run_start's dns_stub {rs.get('dns_stub')!r} is not the policy's "
-                        f"({STUB if stub else 'none'})")
+                        f"({stub_of(rs) if stub else 'none'})")
     per = {ln: {"names": n, "rate": r, "label": DEFAULT_LABEL} for ln, (_s, n, r) in wild.items()}
     asked_names = {e.get("name") for e in events if e.get("event") == "dns_question"
                    and isinstance(e.get("name"), str) and e.get("name")}
@@ -3136,6 +3146,7 @@ def main(argv=None):
     stub_policy = wild_policy or (proxy_ports is not None and any(
         r["kind"] == "h" and r["name"] and not r["wild"] for r in prules)) or \
         meta.get("run_start", {}).get("mode") == "dry_run"          # v1.29: the stub runs in a dry run
+    stub_addr = stub_of(meta.get("run_start", {}))                     # v1.34 step 4
     if wild_policy:
         check_shared_lists(meta, a, problems)
     # v1.25 review: from 1.25 the Warden records the end of every grace
@@ -3190,10 +3201,10 @@ def main(argv=None):
             if not stub_policy:
                 problems.append(f"seq {rec.get('seq')}: a stub connect, but the policy has no "
                                 f"wildcard allow rule and no proxy (no stub resolver)")
-            elif rec.get("resolved") != STUB or ct is None or \
-                    f"{_ip(str(ct[0]))}:{ct[1]}" != STUB:
+            elif rec.get("resolved") != stub_addr or ct is None or \
+                    f"{_ip(str(ct[0]))}:{ct[1]}" != stub_addr:
                 problems.append(f"seq {rec.get('seq')}: a dns_stub record to "
-                                f"{rec.get('target')!r} / {rec.get('resolved')!r}, not the stub at {STUB}")
+                                f"{rec.get('target')!r} / {rec.get('resolved')!r}, not the stub at {stub_addr}")
             stubs += 1
             continue
         if rec.get("proxy_handoff") is True or rec.get("rule") in HANDOFF_RULES:

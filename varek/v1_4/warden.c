@@ -786,6 +786,7 @@ struct node_run {
     long   launcher_calls;      /* the launcher's own calls before the command, let through */
     int    set_view;            /* the launch set the launcher reads, a sealed memfd */
     char  *set_text;            /* its text, one path a line */
+    char   dns[80];             /* v1.34 step 4: the pod's DNS server, "a.b.c.d:53" (its resolv.conf), or "" */
     struct sock_filter *bpf;    /* the Warden's own filter for the policy, compiled */
     unsigned nbpf;
     long   not_admitted;        /* calls it refuses, which the pod's filter notifies */
@@ -1705,6 +1706,10 @@ static void       px_resolved(size_t i);  /* v1.26: proxied requests waiting on 
 static bool       px_up_charged(const char *name);  /* v1.26 review: sent to the upstream, charged */
 static void       px_handed_off(uint64_t id, unsigned port, int subject);  /* v1.26 review: a hand-off announced */
 static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden_stub.inc.c) */
+/* v1.25: the stub's address; v1.34 step 4: under the node agent, the first of
+ * 127.53.53.53 to 127.53.53.254 free in the pod's network namespace (which
+ * the pod's containers share) */
+static char       g_stub_text[16] = "127.53.53.53";
 /* v1.25 (section 4): a wildcard allow rule's budgets when it sets none */
 #define STUB_DEFAULT_NAMES 256           /* distinct new names per run */
 #define STUB_DEFAULT_RATE  30            /* distinct new names per minute */
@@ -2095,7 +2100,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     if (g_names_on) fprintf(f, "\"host_names\":%zu,\"resolver\":\"%s\",", g_names.n, g_names.resolver);
     /* v1.25: where the agent's questions go (connects and sends to it are
      * records with rule dns_stub) */
-    if (STUB_WANTED()) fputs("\"dns_stub\":\"127.53.53.53:53\",", f);
+    if (STUB_WANTED()) fprintf(f, "\"dns_stub\":\"%s:53\",", g_stub_text);
     /* v1.26: the egress proxy: its listener, its user, the proxied ports */
     if (g_proxy.ctl >= 0) {
         fprintf(f, "\"proxy\":{\"mode\":\"%s\",\"listen\":\"127.0.0.1:%u\",\"uid\":%u,\"gid\":%u,\"pid\":%d,\"ports\":[",
@@ -5540,7 +5545,15 @@ int main(int argc, char **argv) {
     if ((key_path || anchor_path) && refuse_raw_devices(&p) < 0) return 1;
     if (flow_path && flow_setup(&p, flow_path, state_arg, session_arg, gstatus_arg) < 0)
         return 1;                                                           /* v1.18.0 */
+    /* v1.34 step 4: in a pod, names are resolved from the pod's network
+     * through the pod's DNS server (the kubelet's resolv.conf: the cluster's
+     * DNS), unless --dns-server names one; the node's own may be on its
+     * loopback, which the pod's network does not reach */
+    if (g_nr.on && !dns_cfg.server && g_nr.dns[0]) dns_cfg.server = g_nr.dns;
     if (names_setup(&p, &dns_cfg) < 0) return 1;                            /* v1.24 */
+    if (g_nr.on && g_names_on && !dns_cfg.server)
+        node_fail("the policy names hosts, and the pod's /etc/resolv.conf names no IPv4 nameserver to resolve "
+                  "them through (give the node agent --dns-server)");
     if (g_nr.on) {                                                         /* v1.34 step 2 */
         const char *no = node_unsupported(&p, g_dry, plan_path, flow_path, obo_arg, svid_arg, g_trust_bundle_arg);
         if (no) {
@@ -5995,13 +6008,16 @@ int main(int argc, char **argv) {
      * to start it stops the run. */
     if (g_names_on) {
         if (wr_async_start(&g_names, "/proc/self/exe") < 0) {
+            if (g_nr.on) node_fail("cannot start the resolver helper");
             fprintf(stderr, "[warden] cannot start the resolver helper (%s); refusing to start\n",
                     strerror(errno));
             emit_run_end(1);
             if (g_sk) sodium_free(g_sk);
             return 1;
         }
-        names_resolve_all(true);
+        /* v1.34 step 4: under the node agent, after run_start (node_supervise);
+         * the helper is started here, where this binary is the node's */
+        if (!g_nr.on) names_resolve_all(true);
     }
 
     /* v1.6 pre-execution plan verification. Fires before fork; on

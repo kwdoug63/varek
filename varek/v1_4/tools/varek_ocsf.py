@@ -349,7 +349,8 @@ class Exporter:
             out_ev = self._base(DNS, 1, rec, rec.get("timestamp_ns"), f"{rec.get('run')}/dns/{self.n}")
             t = rec.get("type")
             out_ev["query"] = {"hostname": str(rec.get("name") or ""), "type": DNS_TYPES.get(t, str(t))}
-            out_ev["dst_endpoint"] = _endpoint("127.53.53.53:53")
+            # v1.34 step 4: under the node agent the stub may be at a later address
+            out_ev["dst_endpoint"] = _endpoint(str((getattr(self, "rs", None) or {}).get("dns_stub") or "127.53.53.53:53"))
             out_ev["src_endpoint"] = {"name": self.device["name"]}
             ok = rec.get("rule") in ("policy_match", "exact_name")     # review: an exact rule's name answered
             dry = rec.get("enforced") is False

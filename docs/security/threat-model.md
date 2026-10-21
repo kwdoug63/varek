@@ -961,6 +961,32 @@ are claimed as solved.
     in.
   - *Review.* v1.32.0 was reviewed by AI review agents, not by a human or
     third party. Its findings are listed in its release notes.
+- Kubernetes (v1.34.0, in progress: steps 1 to 4 built,
+  `v1.34-kubernetes.md`):
+  - *The pod's network, not an empty one* (D5). On a host the agent's
+    network namespace is empty and the Warden dials every connect from its
+    own. In a pod the agent has the pod's interfaces and the cluster's
+    network, and the node agent dials from the pod's namespace. Every
+    connect and send is still decided, as on a host. What changes is what
+    an allowed connect reaches: the cluster's services as the pod sees
+    them, and the pod's loopback, which its other containers share. A
+    name is still never allowed to lead to a loopback or link-local
+    address. Names are resolved through the pod's DNS server (the
+    cluster's), so whoever answers for the cluster's DNS answers for the
+    policy's names, as the host's resolver does on a host.
+  - *The pod's other containers share its network namespace.* A sidecar
+    can listen where the agent's allowed connects go, or hold the stub
+    resolver's usual address; the stub then takes the next free one
+    (127.53.53.54 and on), which `run_start` names. The egress proxy
+    listens on the pod's loopback, but takes only the connections the
+    Warden announces.
+  - *A pod is supervised only through VAREK's NRI plugin.* If the plugin is
+    not running, an annotated pod runs as its spec says, unsupervised, until
+    NRI's validator requires the plugin and the admission check refuses
+    such a pod (steps 5 and 6). The node agent cannot read which filter the
+    runtime installed, so it cannot check that the filter is the Warden's
+    for that policy.
+  - *Review.* Steps 1 to 4 have not yet been reviewed.
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).
 - An agent may probe for SATISFIED-but-harmful actions near a policy boundary;

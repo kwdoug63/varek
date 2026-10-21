@@ -20,6 +20,13 @@
 //   arch32         (x86_64) an i386 call from a second thread of a child:
 //                  "process killed" (the launcher's filter) or "thread only"
 // and with "arch", arch32 alone.
+// Step 4, with "net ALLOWED WILD [hold]" (the pod's network):
+//   hosts          ALLOWED's address in /etc/hosts (the Warden's view)
+//   get_allowed    an HTTP GET to ALLOWED:80 by that address
+//   numeric        a connect to 10.77.0.2:80 (no rule, and no allowed name has it)
+//   stub           the nameserver /etc/resolv.conf names (the stub's view)
+//   get_wild       WILD asked of that nameserver (A), then an HTTP GET to it
+// and with "hold", waiting 4 s after.
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -31,6 +38,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static const char *en(int e) {
@@ -109,7 +117,95 @@ static void arch32(void) {
 #endif
 }
 
+/* the first address /etc/hosts gives name, or "" */
+static void hosts_lookup(const char *name, char *out, size_t on) {
+    out[0] = '\0';
+    FILE *f = fopen("/etc/hosts", "r");
+    if (!f) return;
+    char line[512], a[64], n[256];
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "%63s %255s", a, n) == 2 && !strcmp(n, name) && strchr(a, '.')) { snprintf(out, on, "%s", a); break; }
+    fclose(f);
+}
+
+/* an HTTP GET to addr:80 for host: its status line, or an errno's name */
+static void http_get(const char *what, const char *addr, const char *host) {
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(80) };
+    if (inet_pton(AF_INET, addr, &a.sin_addr) != 1) { printf("%s: no address\n", what); return; }
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0 || connect(s, (struct sockaddr *)&a, sizeof a) < 0) {
+        printf("%s: %s\n", what, en(errno));
+        if (s >= 0) close(s);
+        return;
+    }
+    char req[512], b[512] = "";
+    int n = snprintf(req, sizeof req, "GET / HTTP/1.0\r\nHost: %s\r\n\r\n", host);
+    ssize_t r = write(s, req, (size_t)n) == n ? read(s, b, sizeof b - 1) : -1;
+    close(s);
+    if (r <= 0) { printf("%s: no answer\n", what); return; }
+    b[r] = '\0';
+    char *nl = strpbrk(b, "\r\n");
+    if (nl) *nl = '\0';
+    printf("%s: %s\n", what, b);
+}
+
+/* name's first A record, asked of server:53 over UDP */
+static int dns_a(const char *server, const char *name, char *out, size_t on) {
+    unsigned char q[512] = { 0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0 }, r[512];
+    size_t k = 12;
+    for (const char *p = name; *p; ) {
+        const char *d = strchr(p, '.');
+        size_t l = d ? (size_t)(d - p) : strlen(p);
+        q[k++] = (unsigned char)l;
+        memcpy(q + k, p, l);
+        k += l;
+        p += l + (d ? 1 : 0);
+    }
+    q[k++] = 0; q[k++] = 0; q[k++] = 1; q[k++] = 0; q[k++] = 1;
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(53) };
+    if (inet_pton(AF_INET, server, &a.sin_addr) != 1) return -1;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    struct timeval tv = { 5, 0 };
+    if (s < 0) return -1;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    ssize_t n = sendto(s, q, k, 0, (struct sockaddr *)&a, sizeof a) == (ssize_t)k ? recv(s, r, sizeof r, 0) : -1;
+    close(s);
+    if (n < 12 || (r[3] & 0x0f) || !(r[6] | r[7])) return -1;
+    size_t o = 12;
+    while (o < (size_t)n && r[o]) o += (size_t)r[o] + 1;      /* the question's name */
+    o += 5;
+    for (int an = 0; an < (r[6] << 8 | r[7]) && o + 12 <= (size_t)n; an++) {
+        if ((r[o] & 0xc0) == 0xc0) o += 2; else { while (o < (size_t)n && r[o]) o += (size_t)r[o] + 1; o++; }
+        unsigned type = (unsigned)(r[o] << 8 | r[o + 1]), len = (unsigned)(r[o + 8] << 8 | r[o + 9]);
+        o += 10;
+        if (type == 1 && len == 4 && o + 4 <= (size_t)n) { snprintf(out, on, "%u.%u.%u.%u", r[o], r[o + 1], r[o + 2], r[o + 3]); return 0; }
+        o += len;
+    }
+    return -1;
+}
+
+static void net(const char *allowed, const char *wild) {
+    char a[64], ns[64] = "", line[256];
+    hosts_lookup(allowed, a, sizeof a);
+    printf("hosts: %s %s\n", a[0] ? a : "none", allowed);
+    http_get("get_allowed", a, allowed);
+    http_get("numeric", "10.77.0.2", allowed);
+    FILE *f = fopen("/etc/resolv.conf", "r");
+    while (f && fgets(line, sizeof line, f)) if (sscanf(line, "nameserver %63s", ns) == 1) break;
+    if (f) fclose(f);
+    printf("stub: %s\n", ns[0] ? ns : "none");
+    char w[64] = "";
+    if (ns[0] && dns_a(ns, wild, w, sizeof w) == 0) http_get("get_wild", w, wild);
+    else printf("get_wild: no address\n");
+}
+
 int main(int argc, char **argv) {
+    if (argc > 3 && !strcmp(argv[1], "net")) {
+        setvbuf(stdout, NULL, _IONBF, 0);
+        net(argv[2], argv[3]);
+        if (argc > 4) { struct timespec t = { 4, 0 }; nanosleep(&t, NULL); }
+        return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "wait")) { printf("waiting\n"); fflush(stdout); for (;;) sleep(1); }
     if (argc > 1 && !strcmp(argv[1], "launch")) {
         setvbuf(stdout, NULL, _IONBF, 0);

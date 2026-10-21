@@ -53,7 +53,6 @@
 
 #include <linux/sockios.h>
 
-#define STUB_ADDR_TEXT "127.53.53.53"   /* v1.25: STUB_ADDR in warden_stub.inc.c */
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 
@@ -762,7 +761,7 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
         rule = NULL;
         /* v1.25: the stub resolver's port 53 is the one that is reached */
         if (stub_is_dest(&dial) && (!strcmp(k.name, "udp") || !strcmp(k.name, "tcp"))) {
-            snprintf(a->resolved, sizeof a->resolved, "%s:53", STUB_ADDR_TEXT);
+            snprintf(a->resolved, sizeof a->resolved, "%s:53", g_stub_text);
             stub_connect(notify_fd, req, a, ag, &k, t0);
             return;
         }

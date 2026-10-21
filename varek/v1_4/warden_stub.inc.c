@@ -44,7 +44,7 @@
 
 #include <net/if.h>
 
-#define STUB_ADDR       STUB_ADDR_TEXT
+#define STUB_ADDR       g_stub_text       /* v1.34 step 4: a variable (warden.c) */
 #define STUB_MAX_Q      128              /* questions waiting on the resolver helper */
 #define STUB_MAX_CONN   16               /* TCP connections to the stub */
 #define STUB_MAX_DYN    4096             /* dynamic names per run, all rules (a backstop) */
@@ -138,7 +138,6 @@ static void stub_setup(void) {
                 g_syn_on ? ", and names are not given synthetic addresses by the stub" : "");
         return;
     }
-    inet_pton(AF_INET, STUB_ADDR, &g_stub_in);
     if (setns(g_agent_netns, CLONE_NEWNET) < 0) {
         fprintf(stderr, "[warden] cannot enter the agent's network namespace (%s): no stub "
                 "resolver\n", strerror(errno));
@@ -155,18 +154,34 @@ static void stub_setup(void) {
         if (ioctl(s, SIOCSIFFLAGS, &ifr) < 0) step = "bring the loopback up";
     }
     if (s >= 0) close(s);
-    struct sockaddr_storage ss;
-    socklen_t sl = stub_sockaddr(AF_INET, &ss);
     int one = 1;
-    if (!step) {
-        g_stub_udp = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        if (g_stub_udp < 0 || bind(g_stub_udp, (struct sockaddr *)&ss, sl) < 0) step = "bind the UDP stub";
-    }
-    if (!step) {
-        g_stub_tcp = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        if (g_stub_tcp < 0 || setsockopt(g_stub_tcp, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) < 0 ||
-            bind(g_stub_tcp, (struct sockaddr *)&ss, sl) < 0 || listen(g_stub_tcp, 64) < 0)
-            step = "bind the TCP stub";
+    /* v1.34 step 4: under the node agent the namespace is the pod's, which
+     * its other containers share (another supervised one has a stub too, a
+     * sidecar may hold the address): the first address free from
+     * 127.53.53.53 to 127.53.53.254. On a host, 127.53.53.53 alone. */
+    const char *first_step = step;
+    for (int last = 53; last <= (g_nr.on ? 254 : 53); last++) {
+        step = first_step;
+        snprintf(g_stub_text, sizeof g_stub_text, "127.53.53.%d", last);
+        inet_pton(AF_INET, STUB_ADDR, &g_stub_in);
+        struct sockaddr_storage ss;
+        socklen_t sl = stub_sockaddr(AF_INET, &ss);
+        if (!step) {
+            g_stub_udp = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+            if (g_stub_udp < 0 || bind(g_stub_udp, (struct sockaddr *)&ss, sl) < 0) step = "bind the UDP stub";
+        }
+        if (!step) {
+            g_stub_tcp = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+            if (g_stub_tcp < 0 || setsockopt(g_stub_tcp, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) < 0 ||
+                bind(g_stub_tcp, (struct sockaddr *)&ss, sl) < 0 || listen(g_stub_tcp, 64) < 0)
+                step = "bind the TCP stub";
+        }
+        if (!step || errno != EADDRINUSE) break;
+        int e2 = errno;
+        if (g_stub_udp >= 0) close(g_stub_udp);
+        if (g_stub_tcp >= 0) close(g_stub_tcp);
+        g_stub_udp = g_stub_tcp = -1;
+        errno = e2;
     }
     int e = errno;
     if (setns(g_host_netns, CLONE_NEWNET) < 0) {

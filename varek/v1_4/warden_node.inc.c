@@ -22,9 +22,15 @@
  * Step 2 carries what needs nothing of the Warden's own start of the agent:
  * files, opened as the agent's user (read from its process), the container's
  * command, connects to addresses. Refused at the start, until the steps that
- * bring them: host-name rules and the proxy (step 4, the pod's network),
- * credentials, the on-behalf-of chain and sub-agents (step 5), plans and the
+ * bring them: credentials, the on-behalf-of chain and sub-agents (step 5), plans and the
  * dry run.
+ *
+ * Step 4 (D5): the pod's network. Host-name rules and the egress proxy are
+ * carried: the names are resolved from the pod's network namespace through
+ * the pod's DNS server (node_dns), the views are served in the container's
+ * view, the stub resolver binds the first address free from 127.53.53.53 in
+ * the namespace the pod's containers share, and the proxy runs there, taking
+ * only the connections the Warden announces.
  *
  * Step 3 (the NRI plugin, nri/, and the launcher, varek_init.c):
  *
@@ -200,6 +206,37 @@ static int node_policy(const char *doc, size_t n, const char **policy_path, char
     }
     *policy_path = path;
     return 0;
+}
+
+/* v1.34 step 4: the pod's DNS server, the first IPv4 nameserver of the
+ * container's /etc/resolv.conf (the kubelet's: the cluster's DNS), read
+ * within the container's root (RESOLVE_IN_ROOT: a link in the image leads
+ * nowhere outside it) before any of its code runs. None found: "". */
+#ifndef RESOLVE_IN_ROOT
+#define RESOLVE_IN_ROOT 0x10
+#endif
+static void node_dns(void) {
+    g_nr.dns[0] = '\0';
+    int root = proc_openf(O_PATH | O_DIRECTORY, 0, "%d/root", g_nr.pid);
+    if (root < 0) return;
+    struct open_how_local how = { .flags = O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK,
+                                  .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS };
+    int fd = (int)syscall(__NR_openat2, root, "etc/resolv.conf", &how, sizeof how);
+    close(root);
+    struct stat st;
+    if (fd < 0) return;
+    FILE *f = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) ? fdopen(fd, "r") : NULL;
+    if (!f) { close(fd); return; }
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        char ns[64];
+        struct in_addr a;
+        if (sscanf(line, " nameserver %63s", ns) == 1 && inet_pton(AF_INET, ns, &a) == 1) {
+            snprintf(g_nr.dns, sizeof g_nr.dns, "%s:53", ns);
+            break;
+        }
+    }
+    fclose(f);
 }
 
 /* A number from a process's status ("PPid:", "Seccomp:"), through the
@@ -404,8 +441,6 @@ static const char *node_unsupported(const struct policy *p, bool dry, const char
     if (plan || flow) return "a plan";
     if (obo || svid) return "the on-behalf-of chain";
     if (trust) return "a trust bundle";
-    if (p->v.proxy) return "the egress proxy (with step 4, the pod's network)";
-    if (g_policy_any_name) return "host-name rules (with step 4, the pod's network)";
     if (p->v.ncreds) return "credentials";
     if (p->v.launches && !g_nr.launcher)
         return "decided launches without the launcher (" NODE_LAUNCHER " first in the command: the NRI plugin)";
@@ -434,7 +469,7 @@ static void node_run_start(FILE *f) {
     fprintf(f, "\",\"uid\":%u,\"gid\":%u,\"opens_as_agent\":%s,\"policy\":\"", (unsigned)g_nr.uid, (unsigned)g_nr.gid,
             g_as.on ? "true" : "false");
     json_escape(f, g_nr.policy);
-    fprintf(f, "\",\"launcher\":%s", g_nr.launcher ? "true" : "false");
+    fprintf(f, "\",\"launcher\":%s,\"pod_dns\":\"%s\"", g_nr.launcher ? "true" : "false", g_nr.dns);
     if (g_nr.set_text) {                         /* the paths Landlock is given, each name */
         fputs(",\"launch_paths\":[", f);
         const char *s = g_nr.set_text;
@@ -668,6 +703,7 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
         if (ok == 0) ok = node_policy(buf, (size_t)r, policy_path, why, sizeof why);
         if (ok == 0) ok = node_config(why, sizeof why);
         if (ok == 0) ok = node_process(why, sizeof why);
+        if (ok == 0 && node_alive(g_nr.pidfd)) node_dns();
         if (ok == 0 && node_enter(CLONE_NEWNET) < 0) {
             snprintf(why, sizeof why, "cannot enter the container's network namespace (%s)", strerror(errno));
             ok = -1;
@@ -916,6 +952,9 @@ static int node_supervise(const struct policy *p, const char *boot_path, const c
     if ((g_view_depth = pidns_depth(g_nr.pid)) < 0 || !node_alive(g_nr.pidfd))
         node_fail("cannot read the container's PID namespace (NSpid)");
     g_view_container = true;
+    /* v1.34 step 4: the views are the container's names: what each resolves
+     * to in its view (views_setup ran in the node's) */
+    if (g_any_name || g_inspect_on) views_setup();
     /* v1.34 step 3: the launcher, D4 and the launch set, in the container's
      * view, before any of its code runs; the Warden's own filter for the
      * policy, by which the calls the pod's filter notifies for the runtime
@@ -940,7 +979,6 @@ static int node_supervise(const struct policy *p, const char *boot_path, const c
         if (node_set_view(why, sizeof why) < 0) node_fail(why);
         fprintf(stderr, "[warden] launch set: %zu files, held by the launcher's Landlock (ABI %d)\n", g_exec_n, g_ll_abi);
     }
-    emit_run_start(policy_path, p);
     /* the pod's network namespace is the Warden's own now: both held, the
      * same, so a socket made "in the agent's" and the stub resolver's are the
      * pod's (warden_net.inc.c, warden_stub.inc.c) */
@@ -949,7 +987,11 @@ static int node_supervise(const struct policy *p, const char *boot_path, const c
     if (g_host_netns < 0 || g_agent_netns < 0) node_fail("cannot hold the pod's network namespace");
     g_netns_separate = true;
     sockref_warm();
-    stub_setup();
+    stub_setup();                     /* v1.34 step 4: before run_start, which names its address */
+    emit_run_start(policy_path, p);
+    /* v1.34 step 4: the names resolved, from the pod's network, the first
+     * records after run_start as on a host (the helper started in main) */
+    if (g_names_on) names_resolve_all(true);
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
         rl.rlim_cur = rl.rlim_max < 65536 ? rl.rlim_max : 65536;

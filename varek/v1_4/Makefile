@@ -483,7 +483,7 @@ test-varek-nri:
 # v1.34 step 2: the node agent, a container runc starts under the Warden's
 # filter handed to it (docs/security/v1.34-kubernetes.md); needs root and runc.
 # Step 3: with the launcher, policies by name and D4.
-test-v1340: warden varek-init tools/vdp_check tools/vdp_cert_check test-node-json
+test-v1340: warden warden-proxy varek-init tools/vdp_check tools/vdp_cert_check test-node-json
 	@./tests/test_v1340.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden ./varek-init
 
 # v1.31: the strict JSON parser for MCP calls (mcp_json.c), under ASan and

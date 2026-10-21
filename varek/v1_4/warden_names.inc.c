@@ -125,7 +125,7 @@ static int view_memfd(int v) {
     if (v == VIEW_HOSTS && g_syn_on) syn_hosts_view(g_syn_p, f);      /* v1.26 */
     else if (v == VIEW_HOSTS) wr_hosts_view(&g_names, f);
     /* v1.25: with the stub resolver up, the agent's questions go to it */
-    else if (v == VIEW_RESOLV && g_stub_on) fputs("nameserver 127.53.53.53\noptions attempts:2 timeout:5\n", f);
+    else if (v == VIEW_RESOLV && g_stub_on) fprintf(f, "nameserver %s\noptions attempts:2 timeout:5\n", g_stub_text);
     else if (v == VIEW_RESOLV) fputs("nameserver 192.0.2.1\noptions attempts:1 timeout:0\n", f);
     else if (v == VIEW_NSSWITCH) fputs(g_stub_on ? "passwd: files\ngroup: files\nhosts: files dns\n"
                                                  : "passwd: files\ngroup: files\nhosts: files\n", f);

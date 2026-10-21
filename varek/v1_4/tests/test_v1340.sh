@@ -37,9 +37,23 @@
 #      launcher, a writable root, a writable mount without noexec, a volume
 #      mounted twice, the launcher under a node agent that has none, decided
 #      launches without the launcher; the launcher with no view refuses.
+# Step 4 (D5, the pod's network):
+#   7. a network namespace standing in for a pod's (10.77.0.1 on its
+#      loopback, a DNS server and an HTTP server in it), the container's
+#      resolv.conf naming that DNS server: under a policy naming a host and a
+#      wildcard, the hosts view gives the name's address (resolved through
+#      the pod's DNS server, from the pod's network), a GET to it is dialed
+#      from there, a connect to an address no name has is refused, the stub is
+#      named by the resolv.conf view and answers a wildcard name, which is
+#      then reached; a second container in the same pod gets the stub at the
+#      next address; the audit accepts both streams; with the proxy on, the
+#      name's synthetic address reaches the server through the proxy, and a
+#      name no rule allows gets no address.
 #
 #   test_v1340.sh VDP_CHECK VDP_CERT_CHECK WARDEN [VAREK_INIT]
 set -u
+CERT="${2:-}"
+[ -n "$CERT" ] && CERT="$(cd "$(dirname "$CERT")" && pwd)/$(basename "$CERT")"
 WARDEN="${3:-}"
 [ -n "$WARDEN" ] && WARDEN="$(cd "$(dirname "$WARDEN")" && pwd)/$(basename "$WARDEN")"
 LAUNCHER="${4:-}"
@@ -52,9 +66,10 @@ skip()  { printf '  SKIP   %s\n' "$1"; skips=$((skips + 1)); }
 check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else flunk "$d"; fi; }
 RUNC="${RUNC:-$(command -v runc || true)}"
 [ -z "$RUNC" ] && [ -x /usr/libexec/crio/runc ] && RUNC=/usr/libexec/crio/runc
-B="" AGENTS=""
+B="" AGENTS="" SERVERS=""
 cleanup() {
-    for a in $AGENTS; do kill "$a" 2>/dev/null; done
+    for a in $AGENTS $SERVERS; do kill "$a" 2>/dev/null; done
+    [ -n "$B" ] && [ -e "$B/netns" ] && umount "$B/netns" 2>/dev/null
     if [ -n "$B" ]; then for c in "$B"/state/*; do [ -e "$c" ] && "$RUNC" --root "$B/state" delete -f "${c##*/}" >/dev/null 2>&1; done; fi
     [ -n "${KEEP:-}" ] && echo "kept $B" || { [ -n "$B" ] && rm -rf "$B"; }
 }
@@ -159,8 +174,8 @@ echo "== 4. refused at the start, the container ended =="
 check "a second node agent, with a host-name rule in its policy" agent n "$B/p_names.txt"
 bundle names "$B/s/n.sock" /probe 1
 run names
-check "a policy with what this step does not carry: refused, the container ended" sh -c \
-    "! grep -q '^read_allowed' '$B/names.out' && grep -q 'refused: host-name rules (with step 4, the pod.s network) is not carried' '$(stream n names)'"
+check "a policy naming hosts, in a container whose resolv.conf names no nameserver: refused, the container ended" sh -c \
+    "! grep -q '^read_allowed' '$B/names.out' && grep -q 'names no IPv4 nameserver' '$(stream n names)'"
 bundle rel "$B/s/a.sock" probe 1
 run rel
 check "a command named without an absolute path: refused" sh -c \
@@ -322,6 +337,86 @@ PY
     check "decided launches without the launcher: refused" refused d direct 'decided launches without the launcher'
     check "the launcher with no node agent serving its view refuses to run the command" sh -c \
         "'$B/varek-init' -- /bin/true 2>/dev/null; [ \$? = 126 ]"
+fi
+
+echo "== 7. the pod's network (step 4) =="
+if ! command -v unshare > /dev/null || ! command -v nsenter > /dev/null || ! touch "$B/netns" ||
+   ! unshare --net="$B/netns" true 2>/dev/null; then
+    skip "the pod's network (needs unshare and nsenter)"
+else
+    # the pod's network: its loopback up, 10.77.0.1 on it (netlink: no ip here)
+    nsenter --net="$B/netns" python3 - <<'PY'
+import fcntl, socket, struct
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+fl = struct.unpack("16sH", fcntl.ioctl(s, 0x8913, struct.pack("16sH14s", b"lo", 0, bytes(14)))[:18])[1]
+fcntl.ioctl(s, 0x8914, struct.pack("16sH14s", b"lo", fl | 0x1 | 0x40, bytes(14)))          # IFF_UP, IFF_RUNNING
+nl = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0)
+for ip in ("10.77.0.1", "10.77.0.2"):       # the server's, and one no name resolves to
+    a = socket.inet_aton(ip)
+    body = struct.pack("BBBBI", socket.AF_INET, 32, 0, 0, socket.if_nametoindex("lo")) + \
+        struct.pack("HH4s", 8, 2, a) + struct.pack("HH4s", 8, 1, a)                     # IFA_LOCAL, IFA_ADDRESS
+    nl.send(struct.pack("IHHII", 16 + len(body), 20, 0x1 | 0x4 | 0x200 | 0x400, 1, 0) + body)   # RTM_NEWADDR
+    assert struct.unpack("i", nl.recv(4096)[16:20])[0] == 0
+PY
+    mkdir -p "$B/www" "$B/rootfs/etc"; echo hello > "$B/www/index.html"
+    echo "nameserver 127.0.0.1" > "$B/rootfs/etc/resolv.conf"; chmod 644 "$B/rootfs/etc/resolv.conf"
+    printf '{"svc.test": {"ttl": 30, "a": ["10.77.0.1"]}, "a.wild.test": {"ttl": 30, "a": ["10.77.0.1"]}, "b.wild.test": {"ttl": 30, "a": ["10.77.0.1"]}}\n' > "$B/zone.json"
+    nsenter --net="$B/netns" python3 "$HERE/tests/dns_test_server.py" --port 53 --zone "$B/zone.json" --log "$B/dns.log" \
+        --ready "$B/dns.ready" > "$B/dns.out" 2>&1 &
+    SERVERS="$SERVERS $!"
+    nsenter --net="$B/netns" python3 -m http.server 80 --bind 0.0.0.0 --directory "$B/www" > "$B/http.out" 2>&1 &
+    SERVERS="$SERVERS $!"
+    for _ in $(seq 50); do [ -e "$B/dns.ready" ] && grep -q 'Serving HTTP' "$B/http.out" 2>/dev/null && break; sleep 0.1; done
+    in_pod() {   # the bundle NAME joins the pod's network namespace
+        python3 - "$B/b-$1/config.json" "$B/netns" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c["linux"]["namespaces"] = [n for n in c["linux"]["namespaces"] if n["type"] != "network"] + [{"type": "network", "path": sys.argv[2]}]
+json.dump(c, open(sys.argv[1], "w"))
+PY
+    }
+    printf 'require warden 1.25\nallow host svc.test:80\nallow host *.wild.test:80 acknowledge=dns-channel\n' > "$B/p_net.txt"
+    printf 'require warden 1.26\nproxy on\nproxy ports 80\nallow host svc.test:80\n' > "$B/p_px.txt"
+    check "a node agent with a policy naming a host and a wildcard" agent net "$B/p_net.txt"
+    bundle neta "$B/s/net.sock" "/probe net svc.test a.wild.test hold" 1; in_pod neta
+    bundle netb "$B/s/net.sock" "/probe net svc.test b.wild.test" 1; in_pod netb
+    ( run neta ) &
+    RA=$!
+    for _ in $(seq 100); do grep -q '^get_wild' "$B/neta.out" 2>/dev/null && break; sleep 0.1; done
+    run netb
+    wait "$RA"
+    sed 's/^/     /' "$B/neta.out"
+    check "the name the policy allows, in the hosts view, resolved through the pod's DNS server" sh -c \
+        "grep -qx 'hosts: 10.77.0.1 svc.test' '$B/neta.out' && grep -q 'svc.test' '$B/dns.log'"
+    check "... a GET to it, dialed from the pod's network" said neta "get_allowed: HTTP/1.0 200 OK"
+    check "a connect to an address no rule or allowed name has: refused" said neta "numeric: EACCES"
+    check "the stub, named by the resolv.conf view" said neta "stub: 127.53.53.53"
+    check "a wildcard name asked of the stub, then reached" said neta "get_wild: HTTP/1.0 200 OK"
+    check "run_start: the pod's DNS server, from its resolv.conf; the stub" rec net neta \
+        'S[0]["node"]["pod_dns"] == "127.0.0.1:53" and S[0]["dns_stub"] == "127.53.53.53:53"'
+    check "a second container in the pod: the stub at the next address, its names answered" sh -c \
+        "grep -qx 'stub: 127.53.53.54' '$B/netb.out' && grep -qx 'get_wild: HTTP/1.0 200 OK' '$B/netb.out'"
+    check "... in its run_start" rec net netb 'S[0]["dns_stub"] == "127.53.53.54:53"'
+    if [ -n "$CERT" ]; then
+        check "the audit accepts both streams (the stub at either address)" sh -c \
+            "python3 '$HERE/tools/varek_audit.py' --policy '$B/p_net.txt' --checker '$CERT' '$(stream net neta)' &&
+             python3 '$HERE/tools/varek_audit.py' --policy '$B/p_net.txt' --checker '$CERT' '$(stream net netb)'"
+    fi
+    if [ -x "$HERE/warden-proxy" ]; then
+        check "a node agent with the proxy on" agent px "$B/p_px.txt"
+        # (a connect by number on a proxied port goes to the proxy, which decides by the request's name: v1.26)
+        bundle pxa "$B/s/px.sock" "/probe net svc.test a.wild.test" 1; in_pod pxa
+        run pxa
+        sed 's/^/     /' "$B/pxa.out"
+        check "with the proxy: the name's synthetic address, reached through the proxy" sh -c \
+            "grep -q '^hosts: ' '$B/pxa.out' && ! grep -qx 'hosts: 10.77.0.1 svc.test' '$B/pxa.out' && ! grep -qx 'hosts: none svc.test' '$B/pxa.out' &&
+             grep -qx 'get_allowed: HTTP/1.0 200 OK' '$B/pxa.out'"
+        check "... handed to the proxy, which dialed the server from the pod's network" rec px pxa \
+            'any(r.get("rule") == "proxy_handoff" and r.get("target", "").startswith("198.18.") for r in R) and any(r.get("action") == "net.proxy" and r.get("rule") == "proxy_dialed" and r.get("dialed") == "10.77.0.1:80" for r in R)'
+        check "... a name no rule allows: no address" said pxa "get_wild: no address"
+    else
+        skip "the proxy in the pod's network (needs warden-proxy: make warden-proxy)"
+    fi
 fi
 
 echo
