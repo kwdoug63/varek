@@ -140,8 +140,9 @@ echo "image: $IMAGE $iid" | tee -a "$OUT/host.txt"
 
 if [ ${#SUITES[@]} = 0 ]; then
     # every suite the Makefile names but the ones that need no privilege or
-    # take most of an hour (the cross-check); test-cli last
-    mapfile -t SUITES < <(sed -n 's/^\.PHONY:\(.*\)$/\1/p' "$HERE/Makefile" | tr ' ' '\n' | grep -E '^test-v1|^test-lifecycle$' )
+    # take most of an hour (the cross-check), and v1.34's that need a cluster
+    # (test-v1340-kind, test-v1340-apiserver); test-cli last
+    mapfile -t SUITES < <(sed -n 's/^\.PHONY:\(.*\)$/\1/p' "$HERE/Makefile" | tr ' ' '\n' | grep -E '^test-v1[0-9]+$|^test-lifecycle$' )
     [ ${#SUITES[@]} -ge 25 ] || { echo "container_sweep.sh: only ${#SUITES[@]} suites found in the Makefile" >&2; exit 2; }
     SUITES+=(test-cli)
 fi
