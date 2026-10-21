@@ -403,7 +403,10 @@ static void node_peer_read(int c, struct node_peer *p) {
     p->ppid = node_status_field(cr.pid, "PPid:");
     struct stat st;
     if (proc_statf(&st, "%d/ns/mnt", (int)cr.pid) < 0) { p->state = -1; return; }   /* ended: a zombie has none */
-    p->state = node_runtime_ns(cr.pid, "the peer", p->why, sizeof p->why) == 0 ? 1 : 0;
+    if (node_runtime_ns(cr.pid, "the peer", p->why, sizeof p->why) == 0) { p->state = 1; return; }
+    /* not where the runtime runs, or ended while it was read (kind, in CI:
+     * its mount namespace read, then gone when compared) */
+    p->state = proc_statf(&st, "%d/ns/mnt", (int)cr.pid) < 0 ? -1 : 0;
 }
 
 /* A connection the listener takes, checked before a supervisor is forked
