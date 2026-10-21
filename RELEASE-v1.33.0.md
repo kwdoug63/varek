@@ -50,8 +50,20 @@ changes meaning.
   VM reading and writing the project, refused the Mac's files, writes
   outside the project, `/etc/shadow`, the Mac (the VM's gateway) and the
   instance metadata service; its stream copied to the Mac, audited in the
-  VM, the same file by its SHA-256). The full sweep inside the VM: *to be
-  filled in.*
+  VM, the same file by its SHA-256). The full sweep inside the VM
+  (October 21): every suite passes but these. test-v1130, test-v1140,
+  test-v1150 and `make crosscheck`: the solver cross-check's reference,
+  z3, was 4.15.4, the newest with a wheel for RHEL 9 on aarch64, and
+  under every 4.x release (4.13 to 4.16, measured on x86-64) its regex
+  queries time out, each counted a disagreement (87 s under z3 5.1.0,
+  past 15 minutes under 4.x); the cross-check now needs z3 5.0 or later
+  and says so, and the sweep builds it from source on RHEL 9 (its aarch64
+  wheels need glibc 2.38). test-v1240: 6 of 106 checks, each an agent's
+  connect to the VM's own address after a name the Warden resolved
+  (`python: and connects`, `curl: fetches from an allowed name`, three
+  reached-address checks); the name checks before them pass. Not yet
+  explained (they pass on arm64 RHEL 9.8 on a Graviton instance); the
+  logs went with the instance. A known limit until it is: below.
 - **24 hours inside the VM on the Mac** (`tests/mac_soak.sh`, the shared
   soak), October 20 to 21, 2026, 9:47 pm to 9:47 pm CDT: `soak_check:
   PASS`.
@@ -89,3 +101,6 @@ From the review (`docs/security/v1.30-macos.md`, Review):
 - The audit holds a run's whole stream in memory: about 1.9 GB for 24
   hours of a dry run's records (476,082). A long run's audit needs that
   much memory, or swap.
+- test-v1240's connects to the machine's own address, after a name the
+  Warden resolved, failed in the VM on the Mac (6 checks, above): not yet
+  explained.

@@ -53,9 +53,11 @@ if [ "$DEPS" = 1 ]; then
         # RHEL 9 or a rebuild: libsodium is EPEL's (packaging/vm/provision.sh enables it)
         dnf -y install gcc make git openssl libseccomp-devel openssl-devel libsodium-devel python3 python3-pip \
             python3-cryptography java-21-openjdk-headless squid curl util-linux \
-            glibc-static libasan libubsan || { echo "arm64_sweep.sh: dnf failed"; exit 1; }
+            glibc-static libasan libubsan gcc-c++ cmake || { echo "arm64_sweep.sh: dnf failed"; exit 1; }
         # glibc-static (from CRB): the suites' static probes; libasan and
-        # libubsan: test-mcp-json and the proxy's parsers under the sanitizers
+        # libubsan: test-mcp-json and the proxy's parsers under the sanitizers;
+        # gcc-c++ and cmake: z3 5 built from source (its aarch64 wheels need
+        # glibc 2.38; RHEL 9 has 2.34), for the cross-check
         dnf -y install musl-gcc > /dev/null 2>&1 || echo "arm64_sweep.sh: note: no musl-gcc here (the musl checks skip)"
     else
         echo "arm64_sweep.sh: --deps knows apt-get and dnf only"; exit 1
@@ -64,9 +66,10 @@ if [ "$DEPS" = 1 ]; then
     # cannot be uninstalled by pip, and the CycloneDX validator needs a newer
     # one); --break-system-packages where pip has it (not RHEL 9's)
     BSP=""; python3 -m pip install --help 2>/dev/null | grep -q -- --break-system-packages && BSP=--break-system-packages
-    # --prefer-binary: the newest release with a wheel for this Python and
-    # machine, not the newest's source (on October 20 z3-solver's newest had
-    # no wheel for RHEL 9's Python 3.9 on aarch64, and its build failed)
+    # --prefer-binary: a release with a wheel for this Python and machine where
+    # one meets the requirement; z3 5 has none for aarch64 before glibc 2.38,
+    # so on RHEL 9 it is built from source (gcc-c++ and cmake, above; about
+    # half an hour)
     python3 -m pip install $BSP --ignore-installed --prefer-binary -q -r "$HERE/tools/requirements-test.txt" \
         pytest pyyaml || { echo "arm64_sweep.sh: pip failed"; exit 1; }
     # the cross-check oracle's solver is optional: without it that check skips
