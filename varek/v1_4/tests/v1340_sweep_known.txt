@@ -1,7 +1,10 @@
 # v1340_sweep_known.txt — the checks of the suites that differ when each
 # agent runs as a pod's container under the node agent (tests/v1340_sweep.sh),
 # each with its reason. One a line, tab-separated: the suite, a regular
-# expression on the check's text (its figures masked as #), the reason. A
+# expression on the check's text (its figures masked as #), the reason, and
+# optionally a regular expression the node run's log (or its calls' reasons)
+# must hold for the line to apply (step 8 review: a suite listed whole holds
+# only while its runs are refused for what is not carried yet). A
 # difference not listed here fails the sweep; a line no difference matches is
 # said, so the list stays true. Found October 21, 2026 (Central), each cause
 # read in the node run's own logs and streams (VAREK_SWEEP_KEEP=1).
@@ -106,7 +109,7 @@ test-v1271	^a file an exact rule names, replaced by the host during the run	AS-U
 test-v1271	^standard input open on a file in a writable directory refuses the start$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
 test-v1280	^refused: (a|an) (empty )?file store	NOT-YET: credentials: --oci-filter refuses the policy ('the node agent does not carry credentials yet'), in place of the store's own reason; no warden-secrets runs
 test-v1280	^warden-secrets runs as its own user	NOT-YET: credentials: --oci-filter refuses the policy ('the node agent does not carry credentials yet'), in place of the store's own reason; no warden-secrets runs
-test-v1281	.	NOT-YET: sub-agents: every policy of the suite's runs names subagent=, which --oci-filter refuses ('the node agent does not carry sub-agents yet'); what follows from those runs (forged streams, varek runs) has no records
+test-v1281	.	NOT-YET: sub-agents: every policy of the suite's runs names subagent=, which --oci-filter refuses ('the node agent does not carry sub-agents yet'); what follows from those runs (forged streams, varek runs) has no records	does not carry sub-agents yet
 test-v1290	^require warden #\.#: (a created file is root's|the root-owned file is written|the closed directory is reached), as before$	AS-USER: the node agent opens as the container's user even under require warden 1.28 (its point: a pod's files are its user's)
 test-v1290	^(--run-as root under #\.#: run_start says the agent is root|\.\.\. and the file is root's)$	RUNTIME: the node agent refuses a root container (not carried)
 test-v1290	^a raw device \(/dev/[^)]+\) is still refused by identity	RUNTIME: the container's /dev is the runtime's, without the host's raw device (/dev/mem on GitHub's runner, /dev/zram0 where there is none) (ENOENT): nothing to refuse
@@ -116,7 +119,7 @@ test-v1290	^a rule that could write there \(glob in\*\): refused to start, as be
 test-v1290	^under #\.#: refused to start, as before$	D4: the program is moved into the image (/varek-sweep/NAME), so it is not under the writable directory and nothing is kept executable there; run_start names it by its image path
 test-v1290	^forged: a place kept executable outside the noexec directories	D4: the program is moved into the image (/varek-sweep/NAME), so it is not under the writable directory and nothing is kept executable there; run_start names it by its image path
 test-v1290	^\.\.\. and each file's is the file's$	D4: the program is moved into the image (/varek-sweep/NAME), so it is not under the writable directory and nothing is kept executable there; run_start names it by its image path
-test-v1310	.	NOT-YET: confined MCP servers (mcp server ... exec, built on sub-agents): --oci-filter refuses the policy; what follows from those runs (the audit's forgeries, varek refusals, runs, suggest) has no records
+test-v1310	.	NOT-YET: confined MCP servers (mcp server ... exec, built on sub-agents): --oci-filter refuses the policy; what follows from those runs (the audit's forgeries, varek refusals, runs, suggest) has no records	does not carry (sub-agents|confined MCP servers)[^\n]* yet
 test-cli	^pytest tests/test_varek_bench_mcp\.py::test_bench_for_end_to_end$	NOT-YET: varek bench --for confines an MCP server (sub-agents)
 test-cli	^pytest tests/test_varek_bench_launch\.py::test_bench_launches_end_to_end$	D4: the bench's allowed launches are of programs under /tmp (the noexec volume): decided and certified, then refused by the kernel
 test-v1123	^no bypass reported by probe$	OWN-PID: the probe counts its own /proc/1/mem (the container's PID 1 is the agent) as another process's

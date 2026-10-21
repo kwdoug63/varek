@@ -11,12 +11,17 @@ Each check is:
   held       passed on both;
   differs    passed on the host, not in the node run: listed in KNOWN with
              its reason (a tab-separated line: SUITE, a regular expression on
-             the check's text, the reason), or a failure;
+             the check's text, the reason, and optionally EVIDENCE, a regular
+             expression the node run's log or its calls' reasons must hold
+             for the line to apply), or a failure;
   both fail  failed on the host too (the host run's own failure);
   node only  passed in the node run alone (said, not a failure).
 The calls each suite made of the Warden (OUT/calls.jsonl) are counted:
 carried to the node agent, or passed through to the Warden and why. A KNOWN
 line that matches no difference is said, so the list stays true.
+Step 8 review: a pytest suite's ERROR lines are its failures too, and a
+suite whose node run ended in error with no check that differs is a
+difference (its checks may not have run).
 Exit status 1 for an unlisted difference or a suite failed on the host."""
 import collections
 import json
@@ -25,7 +30,7 @@ import re
 import sys
 
 CHECK = re.compile(r"^\s*(?:note\s+)?(PASS|FAIL|SKIP)\b[\s:]*(.*?)\s*$")
-PYTEST_FAILED = re.compile(r"^FAILED (\S+)")      # a pytest suite's failures (test-cli)
+PYTEST_FAILED = re.compile(r"^(?:FAILED|ERROR) (\S+)")      # a pytest suite's failures and errors (test-cli)
 
 
 def checks(path):
@@ -60,8 +65,8 @@ def main():
     if os.path.exists(known_file):
         for line in open(known_file):
             if line.strip() and not line.startswith("#"):
-                s, rx, why = (line.rstrip("\n").split("\t") + ["", ""])[:3]
-                known.append([s, re.compile(rx), why, 0])
+                s, rx, why, ev = (line.rstrip("\n").split("\t") + ["", "", ""])[:4]
+                known.append([s, re.compile(rx), why, 0, re.compile(ev) if ev else None])
     calls = collections.defaultdict(lambda: collections.Counter())
     if os.path.exists(os.path.join(out, "calls.jsonl")):
         for line in open(os.path.join(out, "calls.jsonl")):
@@ -78,12 +83,21 @@ def main():
         n = dict(checks(os.path.join(out, "node", s + ".log")))
         hrc, nrc = rc(os.path.join(out, "host", s + ".rc")), rc(os.path.join(out, "node", s + ".rc"))
         c = collections.Counter()
+        try:
+            evidence = open(os.path.join(out, "node", s + ".log"), errors="replace").read()
+        except OSError:
+            evidence = ""
+        evidence += "\n".join(w for (_, w) in calls[s])
+
+        def listed(text):
+            return next((kn for kn in known if kn[0] == s and kn[1].search(text) and
+                         (kn[4] is None or kn[4].search(evidence))), None)
         for k, hv in h.items():
             nv = n.get(k, "MISSING")
             if hv == "PASS" and nv == "PASS":
                 c["held"] += 1
             elif hv == "PASS":
-                why = next((kn for kn in known if kn[0] == s and kn[1].search(k[0])), None)
+                why = listed(k[0])
                 if why:
                     why[3] += 1
                     c["known"] += 1
@@ -106,7 +120,7 @@ def main():
                 c["node only"] += 1
             elif k not in h and k[0].startswith("pytest ") and hrc == 0:
                 # a pytest test failed in the node run alone (the host's passed)
-                why = next((kn for kn in known if kn[0] == s and kn[1].search(k[0])), None)
+                why = listed(k[0])
                 if why:
                     why[3] += 1
                     c["known"] += 1
@@ -115,6 +129,12 @@ def main():
                     c["unlisted"] += 1
                     bad += 1
                     notes.append("  %-16s DIFFERS, no reason listed (FAIL): %s" % (s, k[0][:110]))
+        if hrc == 0 and nrc not in (0, None) and not c["known"] and not c["unlisted"]:
+            # S2: the node run failed, and no check says why
+            c["unlisted"] += 1
+            bad += 1
+            notes.append("  %-16s DIFFERS: the node run ended rc=%s with no check that differs (see node/%s.log)"
+                         % (s, nrc, s))
         carried = sum(v for (kind, _), v in calls[s].items() if kind == "carried")
         passed = sum(v for (kind, _), v in calls[s].items() if kind == "passed")
         if hrc not in (0, None):

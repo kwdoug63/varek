@@ -544,16 +544,28 @@ else
     check "the streams root's and 0600, the policies beside them read-only" sh -c \
         "[ \"\$(stat -c '%u %a' '$E1')\" = '0 600' ] && [ \"\$(stat -c '%u %a' '${E1%.jsonl}.policy')\" = '0 400' ]"
     python3 "$HERE/tools/varek_node_export.py" --streams "$B/streams-e" --once --checker "$CERT" \
-        --pubkey "$B/nodekey.pub" --anchor "$B/anchor" --device node-1 -o "$B/ocsf.jsonl" > "$B/export.out" 2>&1
-    check "the node exporter gives both runs as OCSF, each event an object, each run's audited" python3 - "$B/ocsf.jsonl" "$R1" "$R2" <<'PY'
+        --pubkey "$B/nodekey.pub" --anchor "$B/anchor" --device node-1 -o "$B/ocsf.jsonl" \
+        --state "$B/export.state" --max-followers 1 > "$B/export.out" 2>&1; xrc=$?
+    # step 8 review (S3): each run's last event the audit's, and it passed
+    check "the node exporter gives both runs as OCSF, each event an object, each run's audit passed" python3 - "$B/ocsf.jsonl" "$xrc" "$R1" "$R2" <<'PY'
 import json, sys
 ev = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+audits = {}
+for e in ev:
+    v = e.get("unmapped", {}).get("varek", {}) if isinstance(e, dict) else {}
+    if v.get("event") == "audit":
+        audits[e.get("metadata", {}).get("correlation_uid") or json.dumps(e)] = v["audit"].get("passed")
 txt = [json.dumps(e) for e in ev]
-ok = all(isinstance(e, dict) and "class_uid" in e for e in ev) and \
-     all(any(r in t for t in txt) for r in sys.argv[2:]) and \
-     sum(1 for t in txt if '"audit"' in t or "audit" in t.lower()) >= 2
+ok = sys.argv[2] == "0" and all(isinstance(e, dict) and "class_uid" in e for e in ev) and \
+     all(any(r in t for t in txt) for r in sys.argv[3:]) and len(audits) == 2 and all(p is True for p in audits.values())
 sys.exit(0 if ok else 1)
 PY
+    # T1: the streams done written down, and not exported again
+    python3 "$HERE/tools/varek_node_export.py" --streams "$B/streams-e" --once --checker "$CERT" \
+        --pubkey "$B/nodekey.pub" --anchor "$B/anchor" --device node-1 -o "$B/ocsf2.jsonl" \
+        --state "$B/export.state" > "$B/export2.out" 2>&1
+    check "... the streams done in its state, not exported again when it starts again" sh -c \
+        "[ \"\$(wc -l < '$B/export.state')\" = 2 ] && [ ! -s '$B/ocsf2.jsonl' ]"
 fi
 
 echo

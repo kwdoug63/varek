@@ -19,7 +19,7 @@ func item(ns, name, rv, text string) string {
 	return fmt.Sprintf(`{"metadata":{"namespace":%q,"name":%q,"resourceVersion":%q},"spec":{"policy":%q}}`, ns, name, rv, text)
 }
 
-// a stand-in API server: one list, then a watch with three events, then one
+// a stand-in API server: one list in two pages, then a watch with three events, then one
 // that ends 410 (a list again), then a watch that waits
 func fakeAPI(t *testing.T) (*httptest.Server, *int) {
 	var mu sync.Mutex
@@ -32,11 +32,17 @@ func fakeAPI(t *testing.T) (*httptest.Server, *int) {
 		mu.Lock()
 		defer mu.Unlock()
 		if r.URL.Query().Get("watch") == "" {
+			if r.URL.Query().Get("limit") != fmt.Sprint(kube.PageSize) {
+				t.Errorf("a list without a page size: %s", r.URL.RawQuery)
+			}
+			if r.URL.Query().Get("continue") == "page-2" {
+				fmt.Fprintf(w, `{"metadata":{"resourceVersion":"5"},"items":[%s]}`, item("Team_B", "agent", "4", "allow path /x/\n"))
+				return
+			}
 			lists++
 			if lists == 1 {
-				fmt.Fprintf(w, `{"metadata":{"resourceVersion":"5"},"items":[%s,%s,%s]}`,
-					item("team-a", "agent", "3", "allow path /tmp/\n"), item("team-a", "old", "4", "allow path /old/\n"),
-					item("Team_B", "agent", "4", "allow path /x/\n"))
+				fmt.Fprintf(w, `{"metadata":{"resourceVersion":"5","continue":"page-2"},"items":[%s,%s]}`,
+					item("team-a", "agent", "3", "allow path /tmp/\n"), item("team-a", "old", "4", "allow path /old/\n"))
 			} else {
 				fmt.Fprintf(w, `{"metadata":{"resourceVersion":"9"},"items":[%s]}`, item("team-a", "agent", "6", "allow path /tmp/\nallow path /var/\n"))
 			}

@@ -344,17 +344,21 @@ def main():
         if not ENV.get("VAREK_SWEEP_KEEP"):
             for x in ("bundle", "state", "pol", "s"):
                 shutil.rmtree(os.path.join(inv, x), ignore_errors=True)
+        os.write(watch_w, b"k")              # the watchdog stands down: an end of our own
         os._exit(rc)
 
     # the stand-in killed (SIGKILL, which it cannot catch) is the Warden
     # killed: a watchdog then kills the container's supervisor (its pid is in
     # the stream's name, CONTAINER.PID.jsonl); the node agent, seeing it end,
-    # ends the container (test_v1340.sh section 5), and is then stopped
-    me = os.getpid()
+    # ends the container (test_v1340.sh section 5), and is then stopped.
+    # Step 8 review (S5): only then: after an end of the stand-in's own
+    # (finish), the supervisors have ended and their pids may be another's
+    watch_r, watch_w = os.pipe()
     if os.fork() == 0:
         os.setsid()
-        while os.getppid() == me:
-            time.sleep(0.05)
+        os.close(watch_w)
+        if os.read(watch_r, 1) == b"k":      # finish() said so; EOF: the stand-in was killed
+            os._exit(0)
         for p in os.listdir(streams) if os.path.isdir(streams) else []:
             if p.endswith(".jsonl"):
                 try:
@@ -371,6 +375,7 @@ def main():
         except OSError:
             pass
         os._exit(0)
+    os.close(watch_r)
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     if not mounted or agent.poll() is not None:

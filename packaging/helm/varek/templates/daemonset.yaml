@@ -4,6 +4,7 @@
   privileged on the node and in its PID namespace, as the runtime it listens
   to is; the plugin and the exporter hold no capability. */}}
 {{- $state := include "varek.state" . -}}
+{{- $dns := include "varek.dnsServer" . -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -43,7 +44,10 @@ spec:
         # socket's reachable by no one else, the policies' written by no one
         # else), and the launcher put where the runtime binds it from: written
         # whole, then renamed, so a container starting meanwhile binds one or
-        # the other
+        # the other. And VAREK's unsupervised seccomp profile (step 8 review):
+        # every call refused, which each container of a supervised pod names
+        # and the plugin replaces with the Warden's filter, so that one the
+        # plugin does not adjust does not run
         - name: prepare
           image: {{ include "varek.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -51,12 +55,16 @@ spec:
             - /bin/sh
             - -ec
             - |
-              install -d -o 0 -g 0 -m 0700 /host/socket /host/streams /host/control
+              install -d -o 0 -g 0 -m 0700 /host/socket /host/streams /host/control /host/export
               install -d -o 0 -g 0 -m 0755 /host/policies /host/bin
-              chmod 0700 /host/socket /host/streams /host/control
+              chmod 0700 /host/socket /host/streams /host/control /host/export
               chmod 0755 /host/policies /host/bin
               install -o 0 -g 0 -m 0755 /opt/varek/varek-init /host/bin/.varek-init.new
               mv -f /host/bin/.varek-init.new /host/bin/varek-init
+              install -d -o 0 -g 0 -m 0755 /host/seccomp/varek
+              printf '%s\n' '{"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRet":1,"syscalls":[]}' > /host/seccomp/varek/.unsupervised.json.new
+              chmod 0644 /host/seccomp/varek/.unsupervised.json.new
+              mv -f /host/seccomp/varek/.unsupervised.json.new /host/seccomp/varek/unsupervised.json
           securityContext:
             runAsUser: 0
             allowPrivilegeEscalation: false
@@ -65,8 +73,10 @@ spec:
             - { name: socket, mountPath: /host/socket }
             - { name: streams, mountPath: /host/streams }
             - { name: control, mountPath: /host/control }
+            - { name: export, mountPath: /host/export }
             - { name: policies, mountPath: /host/policies }
             - { name: bin, mountPath: /host/bin }
+            - { name: seccomp, mountPath: /host/seccomp }
       containers:
         - name: node-agent
           image: {{ include "varek.image" . }}
@@ -80,6 +90,12 @@ spec:
             - {{ .Values.node.streams }}
             - --node-launcher
             - {{ .Values.node.bin }}/varek-init
+            {{- if $dns }}
+            # the policy's names resolved through the cluster's DNS, not a
+            # server the pod's resolv.conf names
+            - --dns-server
+            - {{ $dns | quote }}
+            {{- end }}
             {{- if .Values.signing.secretName }}
             - --sign-key
             - /etc/varek/node.key
@@ -124,6 +140,8 @@ spec:
             - {{ .Values.node.bin }}/varek-init
             - -socket
             - {{ .Values.nri.socket }}
+            - -runtime-handlers
+            - {{ join "," .Values.nri.runtimeHandlers | quote }}
             - -sync
           # root, to write the node's policies (root's) and reach the runtime's
           # NRI socket (root's), with no capability
@@ -132,6 +150,7 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: { drop: [ALL] }
+            seccompProfile: { type: RuntimeDefault }
           resources: {{- toYaml .Values.plugin.resources | nindent 12 }}
           volumeMounts:
             - { name: policies, mountPath: {{ .Values.node.policies }} }
@@ -150,6 +169,12 @@ spec:
             - /opt/varek/tools/vdp_cert_check
             - --device
             - $(NODE_NAME)
+            # the streams exported, kept on the node: not exported again when
+            # the exporter starts again
+            - --state
+            - {{ .Values.node.exportState }}/done
+            - --max-followers
+            - {{ .Values.exporter.maxFollowers | quote }}
             {{- if .Values.signing.secretName }}
             - --pubkey
             - /etc/varek/node.key.pub
@@ -167,9 +192,11 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: { drop: [ALL] }
+            seccompProfile: { type: RuntimeDefault }
           resources: {{- toYaml .Values.exporter.resources | nindent 12 }}
           volumeMounts:
             - { name: streams, mountPath: {{ .Values.node.streams }}, readOnly: true }
+            - { name: export, mountPath: {{ .Values.node.exportState }} }
             - { name: tmp, mountPath: /tmp }
             {{- if .Values.signing.secretName }}
             - { name: key, mountPath: /etc/varek/node.key.pub, subPath: key.pub, readOnly: true }
@@ -179,8 +206,10 @@ spec:
         - { name: socket, hostPath: { path: {{ .Values.node.socket }}, type: DirectoryOrCreate } }
         - { name: streams, hostPath: { path: {{ .Values.node.streams }}, type: DirectoryOrCreate } }
         - { name: control, hostPath: { path: {{ .Values.node.control }}, type: DirectoryOrCreate } }
+        - { name: export, hostPath: { path: {{ .Values.node.exportState }}, type: DirectoryOrCreate } }
         - { name: policies, hostPath: { path: {{ .Values.node.policies }}, type: DirectoryOrCreate } }
         - { name: bin, hostPath: { path: {{ .Values.node.bin }}, type: DirectoryOrCreate } }
+        - { name: seccomp, hostPath: { path: {{ .Values.node.seccompRoot }}, type: DirectoryOrCreate } }
         - { name: state, hostPath: { path: {{ $state }}, type: Directory } }
         - { name: nri, hostPath: { path: {{ dir .Values.nri.socket }}, type: Directory } }
         - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 64Mi } }

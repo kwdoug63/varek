@@ -31,6 +31,9 @@ runtime: containerd        # containerd or cri-o
 nri:
   # the runtime's NRI socket (both runtimes' default)
   socket: /var/run/nri/nri.sock
+  # the runtime handlers whose containers run the Warden's filter (its
+  # seccomp listener); a supervised pod of another (Kata, gVisor) is refused
+  runtimeHandlers: [runc, crun]
 
 # Where things are on each node (hostPath). The node agent refuses a
 # policies' directory others can write and a socket directory others can
@@ -41,6 +44,18 @@ node:
   socket: /run/varek-node               # the node agent's listener (the filters' listenerPath)
   bin: /opt/varek/bin                   # the launcher the plugin binds at /varek/init
   control: /run/varek                   # each run's control socket (varek revoke, on the node)
+  exportState: /var/lib/varek/export    # the exporter's record of the streams it has exported
+  # the kubelet's seccomp root: VAREK's unsupervised profile is put at
+  # varek/unsupervised.json under it, which each container of a supervised
+  # pod names (seccompProfile: {type: Localhost, localhostProfile:
+  # varek/unsupervised.json}); every call refused until the plugin replaces it
+  seccompRoot: /var/lib/kubelet/seccomp
+  # the DNS server (a.b.c.d[:port]) the node agent resolves the policies'
+  # host names through: "" the cluster's DNS service (kube-system/kube-dns,
+  # or OpenShift's openshift-dns/dns-default), looked up at install; "none"
+  # the one the pod's resolv.conf names (the webhook keeps a pod to the
+  # cluster's DNS)
+  dnsServer: ""
   # the runtime's state, where each container's bundle is (read-only)
   state:
     containerd: /run/containerd
@@ -63,6 +78,8 @@ anchor:
 # cluster's log collector takes (tools/varek_node_export.py)
 exporter:
   enabled: true
+  # streams followed at once (each a process); the others wait their turn
+  maxFollowers: 64
   resources:
     requests: { cpu: 20m, memory: 64Mi }
     limits: { memory: 512Mi }
@@ -79,10 +96,14 @@ plugin:
     requests: { cpu: 10m, memory: 32Mi }
     limits: { memory: 256Mi }
 
+# the release builds the node image for amd64 only: a supervised pod placed
+# on another node does not run (no plugin there to replace its unsupervised
+# profile)
 nodeSelector:
   kubernetes.io/os: linux
-# every node runs it, tainted ones too: a pod placed on a node without the
-# node agent is not supervised
+  kubernetes.io/arch: amd64
+# every node runs it, tainted ones too: a supervised pod placed on a node
+# without it does not run
 tolerations:
   - operator: Exists
 priorityClassName: system-node-critical
@@ -96,6 +117,9 @@ admission:
   timeoutSeconds: 15
   # namespaces whose pods are not checked (the chart's own is always one)
   excludeNamespaces: [kube-system]
+  # RuntimeClass names a supervised pod may give: ones whose handler is in
+  # nri.runtimeHandlers (a pod giving none is taken)
+  runtimeClasses: []
   # the webhook's certificate: the chart makes a CA and a certificate and
   # keeps them across upgrades; or name a kubernetes.io/tls Secret with
   # ca.crt, or use cert-manager (an Issuer or ClusterIssuer of yours)

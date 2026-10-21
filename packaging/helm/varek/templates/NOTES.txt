@@ -13,11 +13,15 @@ A pod is supervised when it names a VarekPolicy of its namespace:
       allow path /work/
 
   and in the pod: metadata.annotations: { varek.dev/policy: agent }
+  and its seccomp profile VAREK's unsupervised one:
+    securityContext: { seccompProfile: { type: Localhost, localhostProfile: varek/unsupervised.json } }
+  (every call refused, until the plugin puts the Warden's filter in its
+  place: a container it does not adjust does not run)
 
 Its containers must not allow privilege escalation, must drop every
-capability (capabilities: drop: [ALL]), must not run as root,
-and, under a policy that decides launches, must have a read-only root; the
-webhook says so at deploy. Label a namespace varek.dev/policy-required=true
+capability (capabilities: drop: [ALL]), must not run as root or in group 0,
+must use the cluster's DNS, and, under a policy that decides launches, must
+have a read-only root; the webhook says so at deploy. Label a namespace varek.dev/policy-required=true
 to refuse its pods that name no policy.
 
 The evidence is on each node in {{ .Values.node.streams }} (a stream and its policy for

@@ -6,6 +6,7 @@ checked in what it renders. Run with `make test-varek-chart` (HELM names helm;
 KUBECONFORM, if set, also checks each render against Kubernetes' schemas).
 The chart installed on a cluster is step 7's (kind in CI)."""
 import base64
+import json
 import os
 import re
 import shutil
@@ -94,8 +95,8 @@ def test_lint_strict():
 def test_the_default_render():
     docs = render()
     assert kinds(docs) == ["ClusterRole", "ClusterRole", "ClusterRoleBinding", "ClusterRoleBinding",
-                           "CustomResourceDefinition", "DaemonSet", "Deployment", "Secret", "Service",
-                           "ServiceAccount", "ServiceAccount", "ValidatingWebhookConfiguration"]
+                           "CustomResourceDefinition", "DaemonSet", "Deployment", "PodDisruptionBudget", "Secret",
+                           "Service", "ServiceAccount", "ServiceAccount", "ValidatingWebhookConfiguration"]
     for d in docs:
         if d["kind"] not in ("CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
                              "ValidatingWebhookConfiguration"):
@@ -126,6 +127,48 @@ def test_each_path_is_the_nodes_own():
     assert "/host/bin/varek-init" in script and host_path(spec, init, "/host/bin") == "/opt/varek/bin"
 
 
+def test_the_unsupervised_profile():
+    """step 8 review (G-1): VAREK's unsupervised profile, every call refused,
+    put whole under the kubelet's seccomp root, where each container of a
+    supervised pod names it (the webhook requires it) and the plugin
+    replaces it"""
+    spec = pod(render(), "DaemonSet")
+    init = ctr(spec, "prepare", init=True)
+    script = init["command"][-1]
+    assert host_path(spec, init, "/host/seccomp/varek/unsupervised.json") == "/var/lib/kubelet/seccomp/varek/unsupervised.json"
+    m = re.search(r"printf '%s\\n' '(\{.*\})' > /host/seccomp/varek/\.unsupervised\.json\.new", script)
+    assert m, script
+    assert json.loads(m.group(1)) == {"defaultAction": "SCMP_ACT_ERRNO", "defaultErrnoRet": 1, "syscalls": []}
+    assert "mv -f /host/seccomp/varek/.unsupervised.json.new /host/seccomp/varek/unsupervised.json" in script
+    spec = pod(render("node.seccompRoot=/var/lib/k/seccomp"), "DaemonSet")
+    assert volumes(spec)["seccomp"]["hostPath"]["path"] == "/var/lib/k/seccomp"
+    # a node the release's image does not run on gets no node agent
+    assert spec["nodeSelector"] == {"kubernetes.io/os": "linux", "kubernetes.io/arch": "amd64"}
+
+
+def test_the_exporters_state():
+    spec = pod(render(), "DaemonSet")
+    ex = ctr(spec, "exporter")
+    assert host_path(spec, ex, arg(ex, "--state")) == "/var/lib/varek/export/done"
+    assert arg(ex, "--max-followers") == "64"
+    assert "-m 0700 /host/socket /host/streams /host/control /host/export" in ctr(spec, "prepare", init=True)["command"][-1]
+
+
+def test_runtime_handlers_and_dns():
+    spec = pod(render(), "DaemonSet")
+    assert arg(ctr(spec, "plugin"), "-runtime-handlers") == "runc,crun"
+    # helm template sees no cluster: no DNS service looked up, none given
+    assert "--dns-server" not in ctr(spec, "node-agent")["command"]
+    spec = pod(render("node.dnsServer=10.96.0.10:53"), "DaemonSet")
+    assert arg(ctr(spec, "node-agent"), "--dns-server") == "10.96.0.10:53"
+    spec = pod(render("node.dnsServer=none"), "DaemonSet")
+    assert "--dns-server" not in ctr(spec, "node-agent")["command"]
+    c = ctr(pod(render(), "Deployment"), "admission")
+    assert "-runtime-classes" not in c["command"]
+    c = ctr(pod(render("admission.runtimeClasses={runc,fast}"), "Deployment"), "admission")
+    assert arg(c, "-runtime-classes") == "runc,fast"
+
+
 def test_who_may_write_what():
     spec = pod(render(), "DaemonSet")
     assert spec["hostPID"] is True and not spec.get("hostNetwork")
@@ -142,6 +185,8 @@ def test_who_may_write_what():
         sc = c["securityContext"]
         assert sc["capabilities"] == {"drop": ["ALL"]} and sc["allowPrivilegeEscalation"] is False
         assert sc["readOnlyRootFilesystem"] is True
+        # the pod shares the node's PID namespace (the node agent's): theirs filtered still
+        assert sc["seccompProfile"] == {"type": "RuntimeDefault"}
     init = ctr(spec, "prepare", init=True)
     assert set(init["securityContext"]["capabilities"]["add"]) == {"CHOWN", "DAC_OVERRIDE", "FOWNER"}
     script = init["command"][-1]
@@ -209,6 +254,9 @@ def test_the_webhook():
         assert h["failurePolicy"] == "Fail" and h["sideEffects"] == "None"
     assert hooks["varekpolicy.varek.dev"]["rules"][0]["resources"] == ["varekpolicies"]
     assert hooks["varekpolicy.varek.dev"]["rules"][0]["operations"] == ["CREATE", "UPDATE"]
+    for name in ("pod.varek.dev", "pod-required.varek.dev"):
+        # G-3: an update is sent too (the annotation is not changed)
+        assert hooks[name]["rules"][0]["operations"] == ["CREATE", "UPDATE"]
     for name, op in (("pod.varek.dev", "NotIn"), ("pod-required.varek.dev", "In")):
         ex = hooks[name]["namespaceSelector"]["matchExpressions"]
         assert {"key": "varek.dev/policy-required", "operator": op, "values": ["true"]} in ex
@@ -237,7 +285,14 @@ def _padding(cert):
 
 
 def test_the_webhooks_pod():
-    spec = pod(render(), "Deployment")
+    docs = render()
+    pdb = one(docs, "PodDisruptionBudget")
+    assert pdb["spec"]["minAvailable"] == 1
+    assert "PodDisruptionBudget" not in kinds(render("admission.replicas=1"))
+    spec = pod(docs, "Deployment")
+    anti = spec["affinity"]["podAntiAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"][0]["podAffinityTerm"]
+    assert anti["topologyKey"] == "kubernetes.io/hostname"
+    assert anti["labelSelector"]["matchLabels"] == pdb["spec"]["selector"]["matchLabels"]
     c = ctr(spec, "admission")
     assert spec["securityContext"]["runAsNonRoot"] is True and spec["securityContext"]["runAsUser"] == 65532
     assert c["securityContext"]["capabilities"] == {"drop": ["ALL"]}

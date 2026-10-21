@@ -54,13 +54,18 @@ type Policy struct {
 	} `json:"spec"`
 }
 
-// List is a list of them
+// List is a page of them
 type List struct {
 	Metadata struct {
 		ResourceVersion string `json:"resourceVersion"`
+		Continue        string `json:"continue"`
 	} `json:"metadata"`
 	Items []Policy `json:"items"`
 }
+
+// PageSize is how many policies a page of a list holds (review, G-2: a
+// cluster's every policy is not held at once on every node)
+const PageSize = 16
 
 // Event is one of a watch's
 type Event struct {
@@ -166,10 +171,28 @@ func collection(ns string) string {
 	return fmt.Sprintf("/apis/%s/%s/namespaces/%s/%s", Group, Version, url.PathEscape(ns), Resource)
 }
 
-// ListPolicies lists every namespace's policies
-func (c *Client) ListPolicies(ctx context.Context) (*List, error) {
-	l := &List{}
-	return l, c.get(ctx, collection(""), l)
+// ListPolicies calls each for every namespace's policies, a page at a time,
+// and returns the list's version (a watch's start); a list whose
+// continuation expired (410) fails Gone, and is listed again
+func (c *Client) ListPolicies(ctx context.Context, each func(*Policy)) (string, error) {
+	cont := ""
+	for {
+		q := "?limit=" + fmt.Sprint(PageSize)
+		if cont != "" {
+			q += "&continue=" + url.QueryEscape(cont)
+		}
+		l := &List{}
+		if err := c.get(ctx, collection("")+q, l); err != nil {
+			return "", err
+		}
+		for i := range l.Items {
+			each(&l.Items[i])
+		}
+		if l.Metadata.Continue == "" {
+			return l.Metadata.ResourceVersion, nil
+		}
+		cont = l.Metadata.Continue
+	}
 }
 
 // GetPolicy is a namespace's policy by its name; nil, nil when there is none

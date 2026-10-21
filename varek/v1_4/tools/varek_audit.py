@@ -132,7 +132,8 @@ def stub_of(rs):
     the first address free from 127.53.53.53 to 127.53.53.254 (run_start
     says which); a run the Warden starts itself has its own, at STUB."""
     s = rs.get("dns_stub")
-    m = re.fullmatch(r"127\.53\.53\.(\d{2,3}):53", s) if isinstance(rs.get("node"), dict) and isinstance(s, str) else None
+    # review (T5): written as the Warden writes it (%d: no leading zero)
+    m = re.fullmatch(r"127\.53\.53\.([1-9]\d{1,2}):53", s) if isinstance(rs.get("node"), dict) and isinstance(s, str) else None
     return s if m and 53 <= int(m.group(1)) <= 254 else STUB
 
 
@@ -501,12 +502,27 @@ def check_exec_set(meta, launches, problems, records=()):
             # its launch set the container's command alone (and what starts
             # it), whatever the policy says of launches
             ll, ex = rs.get("landlock"), rs.get("exec_ruleset")
+            if not _version_at_least(w, (1, 34)):
+                problems.append(f"run_start names the launcher, but the Warden {w!r}: only 1.34 or later runs "
+                                f"under the node agent")
             if not (isinstance(ll, dict) and type(ll.get("abi")) is int and ll["abi"] >= 1):
                 problems.append(f"run_start names the launcher, but its landlock {ll!r} is not an ABI")
+            # step 8 review (T4): the command alone, and what starts it: one
+            # bootstrap entry, the launch the run's first record names, at
+            # most one interpreter, each entry whole
+            whys = [e.get("why") for e in ex] if isinstance(ex, list) else []
+            boot = next((r for r in records if r.get("rule") == "bootstrap_exec_allow"), None)
             if not isinstance(ex, list) or not ex or not all(
-                    isinstance(e, dict) and e.get("why") in ("bootstrap", "loader", "interpreter") for e in ex):
+                    isinstance(e, dict) and isinstance(e.get("name"), str) and e["name"].startswith("/") and
+                    isinstance(e.get("path"), str) and type(e.get("dev")) is int and type(e.get("ino")) is int and
+                    isinstance(e.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", e["sha256"]) and
+                    e.get("why") in ("bootstrap", "loader", "interpreter") for e in ex) or \
+                    whys.count("bootstrap") != 1 or whys.count("interpreter") > 1:
                 problems.append("run_start names the launcher, and the policy does not turn launches on, but its "
                                 "launch set is not the command alone (and what starts it)")
+            elif boot is not None and ex[whys.index("bootstrap")].get("name") != boot.get("target"):
+                problems.append(f"run_start's launch set names the bootstrap {ex[whys.index('bootstrap')].get('name')!r}, "
+                                f"but the agent's own launch was {boot.get('target')!r}")
         elif has:
             problems.append("run_start records a launch set or Landlock, but the policy does not turn "
                             "launches on (require warden 1.27)")

@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+struct names;
+
 typedef struct {
     const char *s;
     size_t n, i;
@@ -16,6 +18,11 @@ typedef struct {
     char *why;
     size_t wn;
     bool skip;          /* a checked document: values skipped, names not compared again */
+    /* step 8 review: an object's names table kept for each depth, and the
+     * member name's buffers, made once a check and used again (an object
+     * each made and freed cost the check most of its time) */
+    struct names *tab[NJ_MAX_DEPTH + 1];
+    char *a, *f;
 } cur_t;
 
 static int fail(cur_t *c, const char *what) {
@@ -188,18 +195,33 @@ static size_t fold(const char *in, size_t n, char *out) {
 
 /* An object's names, each folded once, in a hash set: a name given twice is
  * found without comparing it to every name before it. */
-typedef struct {
+typedef struct names {
     char *buf;
     size_t len, cap;
     struct { uint64_t h; size_t off, n; bool used; } slot[NJ_SLOTS];
+    uint16_t used_at[NJ_MEMBERS];             /* the slots used, to clear them for the next object */
+    size_t nused;
 } names_t;
+
+static void names_reset(names_t *t) {
+    for (size_t k = 0; k < t->nused; k++) t->slot[t->used_at[k]].used = false;
+    t->nused = 0;
+    t->len = 0;
+}
+
+static void cur_free(cur_t *c) {
+    for (int d = 0; d <= NJ_MAX_DEPTH; d++)
+        if (c->tab[d]) { free(c->tab[d]->buf); free(c->tab[d]); }
+    free(c->a);
+    free(c->f);
+}
 
 static int names_add(names_t *t, const char *name, size_t n) {
     uint64_t h = 1469598103934665603ULL;      /* FNV-1a */
     for (size_t k = 0; k < n; k++) { h ^= (unsigned char)name[k]; h *= 1099511628211ULL; }
     size_t at = (size_t)h & (NJ_SLOTS - 1);
     while (t->slot[at].used) {
-        if (t->slot[at].h == h && t->slot[at].n == n && !memcmp(t->buf + t->slot[at].off, name, n)) return 1;
+        if (t->slot[at].h == h && t->slot[at].n == n && (!n || !memcmp(t->buf + t->slot[at].off, name, n))) return 1;
         at = (at + 1) & (NJ_SLOTS - 1);
     }
     if (t->len + n > t->cap) {
@@ -210,20 +232,20 @@ static int names_add(names_t *t, const char *name, size_t n) {
         t->buf = b;
         t->cap = cap;
     }
-    memcpy(t->buf + t->len, name, n);
+    if (n) memcpy(t->buf + t->len, name, n);
     t->slot[at].h = h;
     t->slot[at].off = t->len;
     t->slot[at].n = n;
     t->slot[at].used = true;
+    t->used_at[t->nused++] = (uint16_t)at;
     t->len += n;
     return 0;
 }
 
 static int members(cur_t *c, names_t *t) {
     size_t nk = 0;
-    char *a = malloc(4096), *f = malloc(4096);
+    char *a = c->a, *f = c->f;                /* a name is done with before its value is read */
     int rc = -1;
-    if (!a || !f) { rc = fail(c, "out of memory"); goto out; }
     for (;;) {
         ws(c);
         size_t an = 0;
@@ -248,8 +270,6 @@ static int members(cur_t *c, names_t *t) {
         goto out;
     }
 out:
-    free(a);
-    free(f);
     return rc;
 }
 
@@ -259,10 +279,14 @@ static int object(cur_t *c) {
     ws(c);
     if (c->i < c->n && c->s[c->i] == '}') { c->i++; c->depth--; return 0; }
     names_t *t = NULL;
-    if (!c->skip && !(t = calloc(1, sizeof *t))) return fail(c, "out of memory");
+    if (!c->skip) {
+        if (!c->a && (!(c->a = malloc(4096)) || !(c->f = malloc(4096)))) return fail(c, "out of memory");
+        if (!c->tab[c->depth] && !(c->tab[c->depth] = calloc(1, sizeof *c->tab[c->depth])))
+            return fail(c, "out of memory");
+        t = c->tab[c->depth];
+        names_reset(t);
+    }
     int rc = members(c, t);
-    if (t) free(t->buf);
-    free(t);
     if (rc == 0) c->depth--;
     return rc;
 }
@@ -302,18 +326,21 @@ static int value(cur_t *c) {
 }
 
 int nj_check(const char *doc, size_t n, char *why, size_t wn) {
-    cur_t c = { doc, n, 0, 0, why, wn, false };
+    cur_t c = { .s = doc, .n = n, .why = why, .wn = wn };
     if (n >= 3 && (unsigned char)doc[0] == 0xEF && (unsigned char)doc[1] == 0xBB && (unsigned char)doc[2] == 0xBF)
         return fail(&c, "a byte-order mark");
-    if (value(&c) < 0) return -1;
-    ws(&c);
-    if (c.i != n) return fail(&c, "data after the document");
-    return 0;
+    int rc = value(&c);
+    if (rc == 0) {
+        ws(&c);
+        if (c.i != n) rc = fail(&c, "data after the document");
+    }
+    cur_free(&c);
+    return rc;
 }
 
 int nj_find(const char *doc, size_t n, const char *const *path, size_t depth,
             const char **v, size_t *vn) {
-    cur_t c = { doc, n, 0, 0, NULL, 0, true };
+    cur_t c = { .s = doc, .n = n, .skip = true };
     ws(&c);
     for (size_t d = 0; d < depth; d++) {
         ws(&c);
@@ -368,7 +395,7 @@ int nj_find(const char *doc, size_t n, const char *const *path, size_t depth,
 }
 
 int nj_string(const char *v, size_t vn, char *out, size_t outn) {
-    cur_t c = { v, vn, 0, 0, NULL, 0, false };
+    cur_t c = { .s = v, .n = vn };
     if (!outn || string(&c, out, outn, NULL) != 0 || c.i != vn) return -1;
     return 0;
 }

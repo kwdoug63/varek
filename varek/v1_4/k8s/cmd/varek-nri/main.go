@@ -20,16 +20,27 @@
 //
 // A container that cannot be carried (no command, a command not named by an
 // absolute path, a policy name that is not one, no such policy, a filter the
-// Warden does not write) is refused: the runtime does not create it, and the
+// Warden does not write in the time the runtime gives, a runtime handler
+// that does not run the filter's listener, one of the node's namespaces
+// shared, a seccomp profile other than VAREK's unsupervised one) is refused: the runtime does not create it, and the
 // reason is in the pod's events. Other pods are left as they are. The node
 // agent checks what it receives again (the launcher's identity, the
 // container's mounts, the root read-only) and refuses what does not hold.
+//
+// v1.34 step 8 (review, G-1): every container of an annotated pod names, as
+// its seccomp profile, VAREK's unsupervised one (Localhost
+// varek/unsupervised.json: every call refused, its exec first), which the
+// chart installs on each node and the admission webhook requires. The filter
+// set here replaces it; a container this plugin does not adjust (the plugin
+// not running, not answering in time, a node without it) keeps it, and does
+// not run.
 //
 // On a runtime whose NRI cannot set a seccomp policy or the command (NRI
 // before v0.10: containerd before 2.2, CRI-O before 1.35) the plugin refuses
 // to start, naming the version.
 //
 //	varek-nri -warden FILE -policies DIR -listener SOCKET -launcher FILE [-socket NRI_SOCKET] [-sync]
+//	          [-runtime-handlers runc,crun]
 //
 // v1.34 step 5: a pod's policy is POLICY_DIR/<namespace>/<name>.policy, and
 // -sync writes there the cluster's VarekPolicy resources (sync.go).
@@ -59,6 +70,9 @@ import (
 const (
 	annotation = "varek.dev/policy"
 	launcherAt = "/varek/init"
+	// the profile every container of an annotated pod names (G-1), under
+	// the kubelet's seccomp root
+	unsupervised = "varek/unsupervised.json"
 )
 
 var policyName = kube.Name
@@ -86,6 +100,7 @@ type ociProfile struct {
 
 type plugin struct {
 	warden, policies, listener, launcher string
+	handlers                             map[string]bool // runtime handlers that run the filter's listener (G-4)
 	mu                                   sync.Mutex
 	filters                              map[string]*ociProfile // by the SHA-256 of the policy written for
 }
@@ -133,7 +148,7 @@ func (p *plugin) Configure(_ context.Context, _, runtime, ver string) (api.Event
 // written for: the node agent loads the policy again, and refuses it if it
 // is not those bytes (it changed in between). The filter is written from a
 // private copy of those bytes, and kept by their hash.
-func (p *plugin) filter(ns, name string) (*ociProfile, string, error) {
+func (p *plugin) filter(ctx context.Context, ns, name string) (*ociProfile, string, error) {
 	path := filepath.Join(p.policies, ns, name+".policy")
 	st, err := os.Lstat(path)
 	if err != nil || !st.Mode().IsRegular() {
@@ -160,12 +175,13 @@ func (p *plugin) filter(ns, name string) (*ociProfile, string, error) {
 	if err := os.WriteFile(copyPath, b, 0o600); err != nil {
 		return nil, "", err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
 	cmd := exec.CommandContext(ctx, p.warden, copyPath, "--oci-filter")
 	var errb strings.Builder
 	cmd.Stderr = &errb
 	out, err := cmd.Output()
+	if ctx.Err() != nil {
+		return nil, "", fmt.Errorf("the Warden did not write the filter for policy %s in the time the runtime gives (%v)", name, ctx.Err())
+	}
 	if err != nil {
 		return nil, "", fmt.Errorf("the Warden does not write the filter for policy %s: %v: %s", name, err, lastLine(errb.String()))
 	}
@@ -229,10 +245,35 @@ func has(opts []string, o string) bool {
 // check makes the same exception)
 var kernelKinds = map[string]bool{"proc": true, "sysfs": true, "cgroup": true, "cgroup2": true, "mqueue": true, "devpts": true}
 
+// the namespaces a container of a pod VAREK supervises has of its own, not
+// the node's (D5; the webhook refuses hostNetwork, hostPID and hostIPC first)
+var ownNamespaces = []string{"network", "pid", "ipc", "mount"}
+
+// Whether the seccomp profile the runtime is to give the container is VAREK's
+// unsupervised one: by the profile's name where the runtime says it, or by
+// the policy itself (every call refused) where it says only that. A runtime
+// that says neither is let through: the webhook required the profile.
+func unsupervisedProfile(l *api.LinuxContainer) (bool, string) {
+	if sp := l.GetSeccompProfile(); sp != nil {
+		ref := sp.GetLocalhostRef()
+		if sp.GetProfileType() == api.SecurityProfile_LOCALHOST && (ref == unsupervised || strings.HasSuffix(ref, "/"+unsupervised)) {
+			return true, ""
+		}
+		return false, fmt.Sprintf("%s %s", sp.GetProfileType(), ref)
+	}
+	if sc := l.GetSeccompPolicy(); sc != nil {
+		if (sc.DefaultAction == "SCMP_ACT_ERRNO" || strings.HasPrefix(sc.DefaultAction, "SCMP_ACT_KILL")) && len(sc.Syscalls) == 0 {
+			return true, ""
+		}
+		return false, fmt.Sprintf("a policy whose default is %s, with %d rules", sc.DefaultAction, len(sc.Syscalls))
+	}
+	return true, "unsaid"
+}
+
 // adjust is CreateContainer's work, apart from NRI: the adjustment for a
 // container of a pod VAREK supervises, nil for another pod's, or why it is
 // refused.
-func (p *plugin) adjust(pod *api.PodSandbox, ctr *api.Container) (*api.ContainerAdjustment, error) {
+func (p *plugin) adjust(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) (*api.ContainerAdjustment, error) {
 	name, ok := pod.GetAnnotations()[annotation]
 	if !ok {
 		return nil, nil
@@ -257,7 +298,28 @@ func (p *plugin) adjust(pod *api.PodSandbox, ctr *api.Container) (*api.Container
 	if !policyName.MatchString(pod.GetNamespace()) {
 		return nil, refuse("the pod's namespace %q is not a name a policy can be under", pod.GetNamespace())
 	}
-	f, sha, err := p.filter(pod.GetNamespace(), name)
+	// G-4: a sandboxed runtime (Kata, gVisor) runs no seccomp listener
+	if h := pod.GetRuntimeHandler(); h != "" && !p.handlers[h] {
+		return nil, refuse("its runtime handler %q is not one that runs the Warden's filter (-runtime-handlers)", h)
+	}
+	// G-5: D5 held here too, not by admission alone
+	have := map[string]bool{}
+	for _, n := range ctr.GetLinux().GetNamespaces() {
+		have[n.GetType()] = true
+	}
+	for _, t := range ownNamespaces {
+		if !have[t] {
+			return nil, refuse("it shares the node's %s namespace (the node agent takes a container in its own)", t)
+		}
+	}
+	if ok, what := unsupervisedProfile(ctr.GetLinux()); !ok {
+		return nil, refuse("its seccomp profile is %s, not Localhost %s (VAREK's unsupervised profile, which keeps a "+
+			"container this plugin does not adjust from running)", what, unsupervised)
+	} else if what == "unsaid" {
+		fmt.Fprintf(os.Stderr, "varek-nri: %s/%s/%s: the runtime does not say the container's seccomp profile (the webhook "+
+			"required VAREK's unsupervised one)\n", pod.GetNamespace(), pod.GetName(), ctr.GetName())
+	}
+	f, sha, err := p.filter(ctx, pod.GetNamespace(), name)
 	if err != nil {
 		return nil, refuse("%v", err)
 	}
@@ -290,8 +352,22 @@ func (p *plugin) adjust(pod *api.PodSandbox, ctr *api.Container) (*api.Container
 	return adj, nil
 }
 
-func (p *plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	adj, err := p.adjust(pod, ctr)
+// the time the plugin keeps of the runtime's for answering: past its
+// deadline NRI drops the plugin, and the container keeps its unsupervised
+// profile (it does not run); an answer before it says why
+const answerMargin = 250 * time.Millisecond
+
+func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
+	if d, ok := ctx.Deadline(); ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, d.Add(-answerMargin))
+		defer cancel()
+	} else {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+	}
+	adj, err := p.adjust(ctx, pod, ctr)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "varek-nri: refused:", err)
 		return nil, nil, err
@@ -310,12 +386,20 @@ func main() {
 	flag.StringVar(&p.listener, "listener", "", "the node agent's socket")
 	flag.StringVar(&p.launcher, "launcher", "", "the launcher (varek-init) on the node")
 	socket := flag.String("socket", "", "the runtime's NRI socket (default: NRI's)")
+	handlers := flag.String("runtime-handlers", "runc,crun", "the runtime handlers (RuntimeClass) whose containers run the Warden's filter; "+
+		"a pod of another is refused (the default handler, unnamed, is taken)")
 	// v1.34 step 5 (D7): the cluster's VarekPolicy resources into -policies
 	syncAPI := flag.Bool("sync", false, "write the cluster's VarekPolicy resources to -policies (in a cluster)")
 	api := flag.String("api", "", "-sync: the API server (default: the cluster's, from the service account)")
 	apiToken := flag.String("api-token", "", "-sync: the service account's token file")
 	apiCA := flag.String("api-ca", "", "-sync: the cluster's CA")
 	flag.Parse()
+	p.handlers = map[string]bool{}
+	for _, h := range strings.Split(*handlers, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			p.handlers[h] = true
+		}
+	}
 	for _, v := range []struct{ name, val string }{{"-warden", p.warden}, {"-policies", p.policies},
 		{"-listener", p.listener}, {"-launcher", p.launcher}} {
 		if !strings.HasPrefix(v.val, "/") {

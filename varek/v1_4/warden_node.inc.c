@@ -543,13 +543,17 @@ out:
 
 /* The container's init as the descriptor arrives: no new privileges (the
  * runtime then loads the filter after it takes the container's user and
- * capabilities), that user, the agent's, and no capability. 0, or -1. */
+ * capabilities), that user, the agent's, and no capability; PID 1 of a PID
+ * namespace of its own (step 8 review: in a namespace the pod's containers
+ * share, shareProcessNamespace, the agent's kill reaches its siblings, and its
+ * descendants outlive the run, reparented to the pod's first process). 0, or
+ * -1. */
 static int node_process(char *why, size_t wn) {
     FILE *f = proc_fopenf("%d/status", g_nr.pid);
     if (!f) { snprintf(why, wn, "the container's process %d is gone", g_nr.pid); return -1; }
     char line[256];
     int nnp = -1;
-    long uid = -1, gid = -1;
+    long uid = -1, gid = -1, nspid = -1;
     bool groups_ok = false;
     /* v1.34 step 7 (found by the sweep): the capabilities it holds; the
      * Warden's agent holds none (caps=none), and a pod's is to hold none
@@ -571,6 +575,9 @@ static int node_process(char *why, size_t wn) {
                 if (g_nr.ngroups == (int)(sizeof g_nr.groups / sizeof g_nr.groups[0]) || x < 0) { groups_ok = false; break; }
                 g_nr.groups[g_nr.ngroups++] = (gid_t)x;
             }
+        } else if (!strncmp(line, "NSpid:", 6)) {
+            char *s = line + 6, *e2;            /* its last: its own namespace's */
+            for (long x; (x = strtol(s, &e2, 10)), e2 != s; s = e2) nspid = x;
         } else (void)sscanf(line, "NoNewPrivs: %d", &nnp);
     }
     fclose(f);
@@ -588,6 +595,18 @@ static int node_process(char *why, size_t wn) {
         return -1;
     }
     if (gid == 0) { snprintf(why, wn, "the container's user is in group 0 (root)"); return -1; }
+    /* review (G-7): files are opened as the agent with its groups too */
+    for (int i = 0; i < g_nr.ngroups; i++)
+        if (g_nr.groups[i] == 0) {
+            snprintf(why, wn, "the container's user is in group 0 (root) as a supplementary group "
+                     "(supplementalGroups, fsGroup)");
+            return -1;
+        }
+    if (nspid != 1) {
+        snprintf(why, wn, "the container's process is %ld of its PID namespace, not 1: a PID namespace the pod's "
+                 "containers share (shareProcessNamespace) is not carried", nspid);
+        return -1;
+    }
     if (cap_eff || cap_prm || cap_amb) {
         snprintf(why, wn, "the container holds capabilities (effective %llx, permitted %llx, ambient %llx): the "
                  "agent holds none (securityContext.capabilities: drop: [ALL], and none added)", cap_eff, cap_prm, cap_amb);

@@ -12,8 +12,11 @@
 #      a policy the Warden does not load and one with credentials refused
 #      with the Warden's reason; one that loads admitted; pods refused for a
 #      policy not in their namespace, root, a relative command, a writable
-#      root under a policy that decides launches, a capability added; a pod naming no policy, in
-#      a namespace that requires one, refused; the chart's own namespace not
+#      root under a policy that decides launches, a capability added, a
+#      seccomp profile other than VAREK's unsupervised one, a PID namespace
+#      shared, DNS servers of its own; a pod naming no policy, in a
+#      namespace that requires one, refused; a pod's policy annotation
+#      changed after it is created, refused; the chart's own namespace not
 #      checked;
 #   3. the sync (varek-nri -sync) through the API server: each policy
 #      written to POLICY_DIR/<namespace>/<name>.policy, changed, and removed.
@@ -134,7 +137,15 @@ if edit == "writable":
     sc["readOnlyRootFilesystem"] = False
 if edit == "caps":
     sc["capabilities"]["add"] = ["NET_RAW"]
-print(json.dumps({"apiVersion": "v1", "kind": "Pod", "metadata": meta, "spec": {"containers": [c]}}))
+spec = {"containers": [c], "securityContext": {"seccompProfile": {"type": "Localhost", "localhostProfile": "varek/unsupervised.json"}}}
+if edit == "runtimedefault":
+    spec["securityContext"]["seccompProfile"] = {"type": "RuntimeDefault"}
+if edit == "sharepid":
+    spec["shareProcessNamespace"] = True
+if edit == "dns":
+    spec["dnsPolicy"] = "None"
+    spec["dnsConfig"] = {"nameservers": ["203.0.113.5"]}
+print(json.dumps({"apiVersion": "v1", "kind": "Pod", "metadata": meta, "spec": spec}))
 EOF
 }
 pod p1 team-a nosuch - > "$OUT/p1.json"; refused "a pod naming a policy not in its namespace: refused" "$OUT/p1.json" "no VarekPolicy nosuch in namespace team-a"
@@ -142,7 +153,15 @@ pod p2 team-a agent root > "$OUT/p2.json"; refused "a pod running as root: refus
 pod p3 team-a agent relative > "$OUT/p3.json"; refused "a command by a relative path: refused" "$OUT/p3.json" "absolute path"
 pod p4 team-a agent writable > "$OUT/p4.json"; refused "a writable root under a policy that decides launches: refused" "$OUT/p4.json" "must be read-only"
 pod p8 team-a agent caps > "$OUT/p8.json"; refused "a capability added back: refused" "$OUT/p8.json" "adds capabilities"
+pod p9 team-a agent runtimedefault > "$OUT/p9.json"; refused "a seccomp profile other than VAREK's unsupervised one: refused" "$OUT/p9.json" "seccompProfile must be"
+pod p10 team-a agent sharepid > "$OUT/p10.json"; refused "a PID namespace shared between its containers: refused" "$OUT/p10.json" "shareProcessNamespace"
+pod p11 team-a agent dns > "$OUT/p11.json"; refused "DNS servers of its own: refused" "$OUT/p11.json" "names DNS servers of its own"
 pod p5 team-a agent - > "$OUT/p5.json"; check "a pod as the node agent requires: admitted" K apply -f "$OUT/p5.json"
+if K -n team-a annotate pod p5 --overwrite varek.dev/policy=other > "$OUT/p5-annotate.out" 2>&1; then
+    flunk "... its policy annotation changed after: refused (changed)"
+elif grep -q "not added, changed or removed" "$OUT/p5-annotate.out"; then pass "... its policy annotation changed after: refused"
+else flunk "... its policy annotation changed after: refused ($(tail -1 "$OUT/p5-annotate.out"))"; fi
+check "... a label added: admitted" K -n team-a label pod p5 x=y
 pod p6 team-req - - > "$OUT/p6.json"; refused "a pod naming no policy where one is required: refused" "$OUT/p6.json" "requires every pod to name its policy"
 pod p7 varek-system nosuch root > "$OUT/p7.json"; check "the chart's own namespace not checked" K apply -f "$OUT/p7.json"
 

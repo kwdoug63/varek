@@ -13,10 +13,12 @@
 #      that loads accepted, and written to the node by the plugin's -sync;
 #      pods refused for a policy not in their namespace, a command by a
 #      relative path, a writable root under a policy that decides launches,
-#      and, in a namespace that requires it, for naming no policy;
+#      a seccomp profile other than VAREK's unsupervised one, and, in a
+#      namespace that requires it, for naming no policy;
 #   3. a pod naming the policy, in a namespace enforcing Pod Security's
-#      "restricted" level (its filter RuntimeDefault, as the level requires):
-#      the plugin's filter in its place, the launcher first; a read the
+#      "restricted" level (its seccomp profile VAREK's unsupervised one, a
+#      Localhost profile, as the level allows): the plugin's filter in its
+#      place, the launcher first; a read the
 #      policy allows and one it does not, a program it allows to launch and
 #      one it does not, a copy written to its volume (noexec) and launched;
 #      a pod naming no policy left as it is;
@@ -25,7 +27,9 @@
 #      in its log;
 #   5. the policy changed: written to the node again, and a new pod run
 #      under the new one; the policy deleted: removed from the node;
-#   6. the node agent's pod restarted by the DaemonSet: a new pod supervised.
+#   6. the node agent's pods taken off the node: a pod naming the policy
+#      does not run (its unsupervised profile kept); they come back, and a
+#      new pod is supervised.
 #
 #   varek/v1_4/tests/v1340_kind.sh --image IMAGE [--out DIR] [--keep]
 #                                  [--node-image kindest/node:TAG]
@@ -128,7 +132,8 @@ CHECK='while read -r k v; do case "$k" in Seccomp:|NoNewPrivs:) echo "$k $v" ;; 
 (exec /bin/cat /etc/passwd) > /dev/null 2>&1; echo "read_denied: $?"
 (exec /bin/true); echo "launch_allowed: $?"
 (exec /bin/ls /) > /dev/null 2>&1; echo "launch_denied: $?"
-(exec /bin/cp /bin/true /work/copy) 2>/dev/null; (exec /work/copy) 2>/dev/null; echo "launch_written: $?"'
+(exec /bin/cp /bin/true /work/copy) 2>/dev/null; echo "copy_written: $?"
+(exec /work/copy) 2>/dev/null; echo "launch_written: $?"'
 pod() {   # NAME NAMESPACE POLICY|- [EDIT]: a pod as "restricted" requires, running CHECK
     python3 - "$1" "$2" "$3" "${4:-}" "$POD_IMG" "$CHECK" <<'EOF'
 import json, sys
@@ -144,10 +149,15 @@ if edit == "relative":
     c["command"] = ["sh", "-c", check]
 if edit == "writable":
     c["securityContext"]["readOnlyRootFilesystem"] = False
+# VAREK's unsupervised profile, which the plugin replaces (a pod naming no
+# policy keeps the runtime's)
+profile = {"type": "RuntimeDefault"}
+if pol != "-" and edit != "runtimedefault":
+    profile = {"type": "Localhost", "localhostProfile": "varek/unsupervised.json"}
 print(json.dumps({"apiVersion": "v1", "kind": "Pod", "metadata": meta, "spec": {
     "restartPolicy": "Never",
     "securityContext": {"runAsNonRoot": True, "runAsUser": 65534, "runAsGroup": 65534,
-                        "seccompProfile": {"type": "RuntimeDefault"}},
+                        "seccompProfile": profile},
     "containers": [c], "volumes": [{"name": "work", "emptyDir": {}}]}}))
 EOF
 }
@@ -194,6 +204,10 @@ pod p-relative team-a busybox relative > "$OUT/p-relative.json"
 refused "a pod whose command is named by a relative path: refused" "$OUT/p-relative.json" "absolute path"
 pod p-writable team-a busybox writable > "$OUT/p-writable.json"
 refused "a writable root under a policy that decides launches (D4): refused" "$OUT/p-writable.json" "must be read-only"
+pod p-default team-a busybox runtimedefault > "$OUT/p-default.json"
+refused "a seccomp profile other than VAREK's unsupervised one: refused" "$OUT/p-default.json" "seccompProfile must be"
+check "VAREK's unsupervised profile on the node (every call refused)" sh -c \
+    "docker exec $N cat /var/lib/kubelet/seccomp/varek/unsupervised.json | grep -q '\"defaultAction\":\"SCMP_ACT_ERRNO\"'"
 kubectl create namespace team-req > /dev/null
 kubectl label namespace team-req varek.dev/policy-required=true pod-security.kubernetes.io/enforce=restricted > /dev/null
 pod p-none team-req - > "$OUT/p-none.json"
@@ -203,7 +217,7 @@ echo "== 3. a supervised pod, and one left as it is"
 pod pod-a team-a busybox > "$OUT/pod-a.json"
 kubectl apply -f "$OUT/pod-a.json" > /dev/null 2>&1
 check "the pod naming the policy ran to its end" ran pod-a
-check "the plugin's filter in place of RuntimeDefault (Seccomp 2), no new privileges" sh -c \
+check "the plugin's filter in place of the unsupervised profile (Seccomp 2), no new privileges" sh -c \
     "grep -q '^Seccomp: 2' '$OUT/pod-a.log' && grep -q '^NoNewPrivs: 1' '$OUT/pod-a.log'"
 check "the launcher first: the launch set applied, then the pod's command" \
     said pod-a '^varek-init: Landlock ABI [0-9]*, a launch set of [0-9]* file(s) applied; running /bin/sh'
@@ -211,7 +225,8 @@ check "a read the policy allows, and one it does not (refused)" sh -c \
     "grep -qx 'read_allowed: 0' '$OUT/pod-a.log' && grep -q '^read_denied: [1-9]' '$OUT/pod-a.log'"
 check "a program the policy allows to launch ran; one it does not, refused" sh -c \
     "grep -qx 'launch_allowed: 0' '$OUT/pod-a.log' && grep -q '^launch_denied: [1-9]' '$OUT/pod-a.log'"
-check "a copy written to its volume (noexec) and launched: refused" said pod-a '^launch_written: [1-9]'
+check "a copy written to its volume (noexec) and launched: refused" sh -c \
+    "grep -qx 'copy_written: 0' '$OUT/pod-a.log' && grep -q '^launch_written: [1-9]' '$OUT/pod-a.log'"
 pod pod-b team-a - > "$OUT/pod-b.json"
 kubectl apply -f "$OUT/pod-b.json" > /dev/null 2>&1
 ran pod-b
@@ -242,11 +257,14 @@ RUN="$(python3 -c 'import json,sys; print([json.loads(l) for l in open(sys.argv[
 check "the anchor holds the run's checkpoints" grep -q "$RUN" "$OUT/streams/anchor"
 for _ in $(seq 30); do kubectl -n "$NS" logs ds/varek-node -c exporter 2>/dev/null | grep -q "$RUN" && break; sleep 2; done
 kubectl -n "$NS" logs ds/varek-node -c exporter > "$OUT/exporter.log" 2>&1
-check "the exporter's log: the run as OCSF events (each an object, with its class)" python3 - "$OUT/exporter.log" "$RUN" <<'EOF'
+check "the exporter's log: the run as OCSF events (each an object, with its class), its audit passed" python3 - "$OUT/exporter.log" "$RUN" <<'EOF'
 import json, sys
 ev = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
 mine = [e for e in ev if sys.argv[2] in json.dumps(e)]
-sys.exit(0 if mine and all(isinstance(e, dict) and "class_uid" in e for e in mine) else 1)
+audit = [e["unmapped"]["varek"]["audit"] for e in mine
+         if isinstance(e, dict) and e.get("unmapped", {}).get("varek", {}).get("event") == "audit"]
+sys.exit(0 if mine and all(isinstance(e, dict) and "class_uid" in e for e in mine) and
+         len(audit) == 1 and audit[0].get("passed") is True else 1)
 EOF
 
 echo "== 5. the policy changed, then deleted"
@@ -262,11 +280,31 @@ kubectl -n team-a delete varekpolicy busybox > /dev/null 2>&1
 check "the policy deleted: removed from the node" sh -c \
     "for i in \$(seq 30); do docker exec $N test -e /var/lib/varek/policies/team-a/busybox.policy || exit 0; sleep 1; done; exit 1"
 
-echo "== 6. the node agent's pod restarted"
+echo "== 6. the node agent's pods taken off the node, then back"
 node_logs "-before-restart"   # the restart below ends these
 kubectl apply -f "$OUT/vp-busybox.json" > /dev/null 2>&1
 synced 'allow exec /bin/sleep' > /dev/null
-kubectl -n "$NS" delete pod -l app.kubernetes.io/component=node --wait=true > /dev/null 2>&1
+# step 8 review (G-1): a pod the plugin does not adjust keeps its
+# unsupervised profile, and does not run
+kubectl -n "$NS" patch ds varek-node --type merge \
+    -p '{"spec":{"template":{"spec":{"nodeSelector":{"varek.dev/no-node":"x"}}}}}' > /dev/null
+for _ in $(seq 90); do [ -z "$(kubectl -n "$NS" get pod -l app.kubernetes.io/component=node -o name 2>/dev/null)" ] && break; sleep 2; done
+check "the node agent's pods off the node" sh -c "[ -z \"\$(kubectl -n '$NS' get pod -l app.kubernetes.io/component=node -o name)\" ]"
+pod pod-u team-a busybox > "$OUT/pod-u.json"
+kubectl apply -f "$OUT/pod-u.json" > /dev/null 2>&1
+for _ in $(seq 60); do
+    [ "$(kubectl -n team-a get pod pod-u -o jsonpath='{.status.containerStatuses[0].state.terminated.reason}{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null)" != "" ] &&
+        [ "$(kubectl -n team-a get pod pod-u -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null)" != ContainerCreating ] && break
+    sleep 2
+done
+kubectl -n team-a logs pod-u > "$OUT/pod-u.log" 2>&1
+kubectl -n team-a describe pod pod-u > "$OUT/pod-u.describe" 2>&1
+grep -E '^ *(State|Reason|Message|Exit Code):' "$OUT/pod-u.describe" | sed 's/^ */     pod-u: /' | tee -a "$SUM"
+check "a pod naming the policy, with no plugin on its node: its command did not run" sh -c \
+    "[ \"\$(kubectl -n team-a get pod pod-u -o jsonpath='{.status.phase}')\" != Succeeded ] && ! grep -q 'read_allowed' '$OUT/pod-u.log'"
+kubectl -n team-a delete pod pod-u --wait=false > /dev/null 2>&1
+kubectl -n "$NS" patch ds varek-node --type json \
+    -p '[{"op":"remove","path":"/spec/template/spec/nodeSelector/varek.dev~1no-node"}]' > /dev/null
 check "the DaemonSet's new pod ready" kubectl -n "$NS" rollout status ds/varek-node --timeout=180s
 for _ in $(seq 60); do kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null | grep -q '^varek-nri: runtime' && break; sleep 2; done
 pod pod-a3 team-a busybox > "$OUT/pod-a3.json"

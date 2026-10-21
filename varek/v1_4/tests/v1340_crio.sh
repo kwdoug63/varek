@@ -6,18 +6,28 @@
 # together under CRI-O, as step 1's sixth measurement ran their stand-ins.
 # On a host with CRI-O 1.35 or later (NRI on), crictl and Go, as root, from a
 # checkout of this branch. The node agent takes each pod's policy by name
-# from a directory; four pods of the busybox image, each as user 65534 with
-# every capability dropped, no new privileges and the RuntimeDefault profile
-# (as Pod Security's "restricted" level requires):
+# from a directory; five pods of the busybox image, each in network and PID
+# namespaces of its own, as user 65534 with every capability dropped and no
+# new privileges, an annotated one with VAREK's unsupervised profile
+# (Localhost: every call refused) and one not with RuntimeDefault:
 #   A  annotated varek.dev/policy: busybox, its root read-only: the plugin's
-#      filter replaces RuntimeDefault, the launcher runs first and applies the
-#      launch set; inside, a read the policy allows and one it does not, a
+#      filter replaces the unsupervised profile, the launcher runs first and
+#      applies the launch set; inside, a read the policy allows and one it does not, a
 #      program it allows to launch and one it does not, a copy written to
 #      /work (noexec) and launched; its stream in the node agent's directory;
 #   B  not annotated: left as it is;
 #   C  annotated, its root writable: refused by the node agent (D4);
 #   D  annotated with a policy that does not exist: refused by the plugin
-#      (the container is not created).
+#      (the container is not created);
+#   E  annotated, with RuntimeDefault: refused by the plugin (step 8 review:
+#      a container it did not adjust would run unsupervised), where the
+#      runtime tells the plugin the container's profile (CRI-O 1.37 does
+#      not: then the webhook's check is the one);
+#   F  not annotated, with the unsupervised profile, which the plugin then
+#      leaves: its command never runs (a container of a supervised pod the
+#      plugin does not adjust does not run).
+# Where CRI-O has no network configured, a bridge one is put in
+# /etc/cni/net.d for the run, and taken out after.
 # Under each runtime CRI-O has of crun and runc (--runtimes). The summary is
 # DIR/summary.txt (default /var/tmp/varek-crio).
 #
@@ -71,6 +81,20 @@ allow exec /bin/true
 allow exec /bin/sleep
 EOF
 chmod 644 "$OUT/policies/varek/busybox.policy"
+# VAREK's unsupervised profile, as the chart puts it under the kubelet's seccomp root
+mkdir -p "$OUT/seccomp/varek"
+echo '{"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRet":1,"syscalls":[]}' > "$OUT/seccomp/varek/unsupervised.json"
+CNI=""
+if [ -z "$(ls /etc/cni/net.d 2>/dev/null)" ]; then
+    CNI=/etc/cni/net.d/10-varek-test.conflist
+    mkdir -p /etc/cni/net.d
+    cat > "$CNI" <<'EOF'
+{"cniVersion": "1.0.0", "name": "varek-test", "plugins": [
+  {"type": "bridge", "bridge": "varek-test0", "isGateway": true, "ipMasq": false,
+   "ipam": {"type": "host-local", "ranges": [[{"subnet": "10.89.0.0/24"}]]}},
+  {"type": "loopback"}]}
+EOF
+fi
 
 if [ ! -S /var/run/crio/crio.sock ]; then
     crio > "$OUT/crio.log" 2>&1 &
@@ -83,7 +107,7 @@ AGENT=$!
 "$OUT/varek-nri" -warden "$OUT/warden" -policies "$OUT/policies" -listener "$OUT/sock/node.sock" \
     -launcher "$OUT/varek-init" > "$OUT/varek-nri.log" 2>&1 &
 PLUGIN=$!
-trap 'kill $PLUGIN $AGENT 2>/dev/null' EXIT
+trap 'kill $PLUGIN $AGENT 2>/dev/null; [ -n "$CNI" ] && rm -f "$CNI"' EXIT
 for _ in $(seq 50); do grep -q '^varek-nri: runtime' "$OUT/varek-nri.log" && break; sleep 0.2; done
 say "  plugin: $(grep -m1 '^varek-nri: runtime' "$OUT/varek-nri.log" || echo "NOT registered: $(tail -1 "$OUT/varek-nri.log")")"
 
@@ -94,27 +118,32 @@ CHECK='while read -r k v; do case "$k" in Seccomp:|NoNewPrivs:) echo "$k $v" ;; 
 (exec /bin/cat /etc/passwd) > /dev/null 2>&1; echo "read_denied: $?"
 (exec /bin/true); echo "launch_allowed: $?"
 (exec /bin/ls /) > /dev/null 2>&1; echo "launch_denied: $?"
-(exec /bin/cp /bin/true /work/copy) 2>/dev/null; (exec /work/copy) 2>/dev/null; echo "launch_written: $?"
+(exec /bin/cp /bin/true /work/copy) 2>/dev/null; echo "copy_written: $?"
+(exec /work/copy) 2>/dev/null; echo "launch_written: $?"
 (exec /bin/sleep 1)'
 
 for rt in $RUNTIMES; do
     say "== $rt"
-    for pod in a:busybox:true b::true c:busybox:false d:nosuch:true; do
+    for pod in a:busybox:true b::true c:busybox:false d:nosuch:true e:busybox:true f::true; do
         IFS=: read -r name pol ro <<< "$pod"
         W="$OUT/work-$rt-$name"; mkdir -p "$W"; chmod 1777 "$W"
         python3 - "$rt" "$name" "$pol" "$ro" "$POD_IMG" "$CHECK" "$W" "$OUT" <<'EOF'
 import json, sys, uuid
 rt, name, pol, ro, img, check, work, out = sys.argv[1:]
 pod = {"metadata": {"name": f"varek-{name}-{rt}", "namespace": "varek", "uid": str(uuid.uuid4()), "attempt": 0},
-       "log_directory": out, "linux": {"security_context": {"namespace_options": {"network": 2, "pid": 1}}}}
+       "log_directory": out, "linux": {"security_context": {"namespace_options": {"network": 0, "pid": 1}}}}
 if pol:
     pod["annotations"] = {"varek.dev/policy": pol}
+# CRI's profile types: 0 RuntimeDefault, 2 Localhost
+seccomp = {"profile_type": 0}
+if (pol and name != "e") or name == "f":
+    seccomp = {"profile_type": 2, "localhost_ref": f"{out}/seccomp/varek/unsupervised.json"}
 ctr = {"metadata": {"name": "agent"}, "image": {"image": img}, "command": ["/bin/sh", "-c", check],
        "log_path": f"agent-{rt}-{name}.log", "mounts": [{"container_path": "/work", "host_path": work}],
-       "linux": {"security_context": {"namespace_options": {"network": 2, "pid": 1},
+       "linux": {"security_context": {"namespace_options": {"network": 0, "pid": 1},
                                       "run_as_user": {"value": 65534}, "readonly_rootfs": ro == "true",
                                       "no_new_privs": True, "capabilities": {"drop_capabilities": ["ALL"]},
-                                      "seccomp": {"profile_type": 0}}}}
+                                      "seccomp": seccomp}}}
 json.dump(pod, open(f"{out}/pod-{rt}-{name}.json", "w"))
 json.dump(ctr, open(f"{out}/ctr-{rt}-{name}.json", "w"))
 EOF
@@ -143,7 +172,8 @@ EOF
         "grep -qx 'read_allowed: 0' '$OUT/$rt-a.log' && grep -q '^read_denied: [1-9]' '$OUT/$rt-a.log'"
     check "A: a program the policy allows to launch ran; one it does not, refused" sh -c \
         "grep -qx 'launch_allowed: 0' '$OUT/$rt-a.log' && grep -q '^launch_denied: [1-9]' '$OUT/$rt-a.log'"
-    check "A: a copy written to /work (noexec) and launched: refused" grep -q '^launch_written: [1-9]' "$OUT/$rt-a.log"
+    check "A: a copy written to /work (noexec) and launched: refused" sh -c \
+        "grep -qx 'copy_written: 0' '$OUT/$rt-a.log' && grep -q '^launch_written: [1-9]' '$OUT/$rt-a.log'"
     check "A: its stream, named by the container: the pod, the policy by its name, each name of busybox given to Landlock" python3 -c '
 import json, sys
 recs = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
@@ -156,6 +186,14 @@ sys.exit(0 if s["policy"] == "busybox" and s["launcher"] is True and s["pod"]["n
         "! grep -q '^read_allowed' '$OUT/$rt-c.log' && grep -q 'root file system is writable' '$(stream c)'"
     check "D (no such policy): refused by the plugin, the container not created" sh -c \
         "[ ! -s '$OUT/$rt-d.id' ] && grep -q 'no policy named nosuch' '$OUT/$rt-d.create'"
+    if grep -q "varek-e-$rt/agent: the runtime does not say the container's seccomp profile" "$OUT/varek-nri.log"; then
+        say "  SKIP   E (RuntimeDefault): the runtime does not tell the plugin the container's profile (the webhook checks it)"
+    else
+        check "E (RuntimeDefault, not the unsupervised profile): refused by the plugin" sh -c \
+            "[ ! -s '$OUT/$rt-e.id' ] && grep -q 'not Localhost varek/unsupervised.json' '$OUT/$rt-e.create'"
+    fi
+    check "F (the unsupervised profile, the container not adjusted): its command never ran" sh -c \
+        "! grep -q '^read_allowed' '$OUT/$rt-f.log' && ! grep -q 'varek-f-$rt' '$OUT/varek-nri.log'"
 done
 echo
 [ "$fail" = 0 ] && say "v1340_crio: PASS" || say "v1340_crio: FAIL"

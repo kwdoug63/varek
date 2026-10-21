@@ -4,8 +4,9 @@ name: varek
 description: >-
   VAREK on Kubernetes: the Warden's node agent, NRI plugin and launcher on
   each node (a DaemonSet), the VarekPolicy resource and its admission webhook.
-  Every call of the containers of a pod that names a policy (the annotation
-  varek.dev/policy) is decided by the Warden under that policy.
+  Each container of a pod that names a policy (the annotation
+  varek.dev/policy) runs with the Warden deciding its calls under that policy,
+  or does not run.
 type: application
 version: 1.34.0
 appVersion: "1.34.0"

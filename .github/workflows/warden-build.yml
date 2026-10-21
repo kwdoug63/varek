@@ -17,6 +17,10 @@ on:
   pull_request:
     branches: [main]
 
+# v1.34 review: the token reads only
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build the Warden with libseccomp + libsodium

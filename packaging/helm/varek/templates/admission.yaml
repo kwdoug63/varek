@@ -1,7 +1,8 @@
 {{/* SPDX-License-Identifier: MIT
   The admission webhook (D7): the API server sends it every VarekPolicy
-  created or changed and every pod created, and it refuses what the Warden
-  does not load or the node agent would refuse at the container's start. */}}
+  created or changed and every pod created or changed, and it refuses what
+  the Warden does not load or the node agent would refuse at the container's
+  start (and, on a pod's update, a change to its policy's annotation). */}}
 {{- $name := include "varek.admissionName" . -}}
 {{- $svc := printf "%s.%s.svc" $name .Release.Namespace -}}
 {{- $secret := .Values.admission.tls.secretName | default (printf "%s-tls" $name) -}}
@@ -77,6 +78,17 @@ spec:
         app.kubernetes.io/component: admission
     spec:
       serviceAccountName: {{ $name }}
+      # the two apart, so that one node's loss does not stop pod creation
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/instance: {{ .Release.Name }}
+                    app.kubernetes.io/component: admission
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -102,6 +114,10 @@ spec:
             - /tls/tls.key
             - -listen
             - :8443
+            {{- with .Values.admission.runtimeClasses }}
+            - -runtime-classes
+            - {{ join "," . | quote }}
+            {{- end }}
           ports:
             - { name: https, containerPort: 8443 }
           readinessProbe:
@@ -119,6 +135,21 @@ spec:
           secret: { secretName: {{ $secret }} }
         - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 64Mi } }
 ---
+{{- if gt (int .Values.admission.replicas) 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "varek.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: admission
+---
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -155,7 +186,7 @@ webhooks:
     rules:
       - apiGroups: [""]
         apiVersions: ["v1"]
-        operations: ["CREATE"]
+        operations: ["CREATE", "UPDATE"]
         resources: ["pods"]
     namespaceSelector:
       matchExpressions:

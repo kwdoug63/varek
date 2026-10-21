@@ -30,3 +30,20 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 
 {{- define "varek.admissionName" -}}{{ .Release.Name }}-admission{{- end -}}
 {{- define "varek.nodeName" -}}{{ .Release.Name }}-node{{- end -}}
+
+{{/* The DNS server the node agent resolves policies' names through: the
+  value given, or the cluster's DNS service's address where the chart can
+  look it up (helm install; helm template sees no cluster), or none ("none":
+  the pod's, which the webhook keeps to the cluster's) */}}
+{{- define "varek.dnsServer" -}}
+{{- $v := .Values.node.dnsServer -}}
+{{- if eq $v "none" -}}
+{{- else if $v -}}{{ $v }}
+{{- else -}}
+{{- $svc := lookup "v1" "Service" "kube-system" "kube-dns" -}}
+{{- if not $svc }}{{ $svc = lookup "v1" "Service" "openshift-dns" "dns-default" }}{{ end -}}
+{{- if and $svc $svc.spec $svc.spec.clusterIP (ne $svc.spec.clusterIP "None") (regexMatch "^[0-9.]+$" $svc.spec.clusterIP) -}}
+{{ $svc.spec.clusterIP }}:53
+{{- end -}}
+{{- end -}}
+{{- end -}}

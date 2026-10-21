@@ -14,11 +14,18 @@ if given); the events of all of them go to one output, a JSON object a line
 collector already takes).
 
 A stream whose supervisor has gone without its run_end (a container refused
-at its start, or a supervisor killed) is left once it stops growing.
+at its start, or a supervisor killed) is left once it stops growing and its
+follower has had GRACE seconds to finish (its last audit) on its own.
+
+Step 8 review: at most --max-followers streams are followed at once, the
+others waiting their turn; a stream is taken once its policy copy is beside
+it; with --state FILE, the streams done are written there, and not exported
+again when the exporter starts again (a pod restarted, its node's streams
+still there).
 
   varek_node_export.py --streams DIR [--output FILE] [--checker VDP_CERT_CHECK]
                        [--pubkey KEY.pub] [--anchor ANCHOR] [--device NODE]
-                       [--once]
+                       [--state FILE] [--max-followers N] [--once]
 
 --once exports the streams present and returns when each is done (for a test,
 or a node's last pass)."""
@@ -32,7 +39,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STREAM = re.compile(r"^(?P<base>[^/]+\.(?P<pid>\d+))\.jsonl$")
-QUIET_S = 5.0                     # a stream not growing this long, its supervisor gone: left
+QUIET_S = 5.0                     # a stream not growing this long, its supervisor gone: left ...
+GRACE_S = 120.0                   # ... after its follower has had this long to end on its own
 
 
 def alive(pid):
@@ -50,9 +58,38 @@ class Exporter:
         self.args = args
         self.lock = threading.Lock()
         self.out = open(args.output, "a", encoding="utf-8") if args.output else sys.stdout
-        self.seen = set()
-        self.running = {}            # path -> (process, thread)
+        self.seen = set()            # taken: following, waiting, or done
+        self.waiting = []            # names, in the order seen
+        self.running = {}            # path -> (process, thread, supervisor's pid)
+        self.gone_at = {}            # path -> when its supervisor was found gone, the stream quiet
         self.failed = 0
+        self.state = None
+        if args.state:
+            self.load_state()
+
+    def load_state(self):
+        """the streams done before, those still in the directory kept"""
+        try:
+            done = [l.strip() for l in open(self.args.state, encoding="utf-8") if l.strip()]
+        except FileNotFoundError:
+            done = []
+        try:
+            present = set(os.listdir(self.args.streams))
+        except OSError:
+            present = set()
+        keep = [n for n in done if n in present]
+        self.seen.update(keep)
+        tmp = self.args.state + ".new"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(n + "\n" for n in keep)
+        os.replace(tmp, self.args.state)
+        self.state = open(self.args.state, "a", encoding="utf-8")
+
+    def done(self, path):
+        if self.state:
+            with self.lock:
+                self.state.write(os.path.basename(path) + "\n")
+                self.state.flush()
 
     def emit(self, line):
         with self.lock:
@@ -64,9 +101,6 @@ class Exporter:
         m = STREAM.match(name)
         path = os.path.join(a.streams, name)
         policy = os.path.join(a.streams, m.group("base") + ".policy")
-        if not os.path.isfile(policy):
-            print(f"varek_node_export: {name}: no policy beside it ({policy}); not exported", file=sys.stderr)
-            return
         cmd = [sys.executable, os.path.join(HERE, "varek_ocsf.py"), "--follow", path, "--policy", policy]
         for flag, val in (("--checker", a.checker), ("--pubkey", a.pubkey), ("--anchor", a.anchor),
                           ("--device", a.device)):
@@ -93,10 +127,20 @@ class Exporter:
         except OSError as e:
             print(f"varek_node_export: {self.args.streams}: {e}", file=sys.stderr)
             return
+        present = set(names)
         for name in names:
-            if STREAM.match(name) and name not in self.seen:
+            m = STREAM.match(name)
+            # review (T3): taken once its policy is beside it (the node
+            # agent copies it there as the stream starts)
+            if m and name not in self.seen and m.group("base") + ".policy" in present:
                 self.seen.add(name)
-                self.start(name)
+                self.waiting.append(name)
+        while self.waiting and len(self.running) < self.args.max_followers:
+            self.start(self.waiting.pop(0))
+
+    def scan_waiting(self):
+        while self.waiting and len(self.running) < self.args.max_followers:
+            self.start(self.waiting.pop(0))
 
     def reap(self):
         now = time.time()
@@ -104,16 +148,26 @@ class Exporter:
             if p.poll() is not None:
                 t.join()
                 del self.running[path]
+                self.gone_at.pop(path, None)
+                self.done(path)
                 continue
             try:
                 quiet = now - os.stat(path).st_mtime
             except OSError:
                 quiet = QUIET_S
-            if not alive(pid) and quiet >= QUIET_S:
+            if alive(pid) or quiet < QUIET_S:
+                self.gone_at.pop(path, None)
+                continue
+            # review (T2): its follower may be in its last audit (run_end
+            # read): it is given time to end on its own first
+            since = self.gone_at.setdefault(path, now)
+            if now - since >= self.args.grace:
                 p.terminate()                # no run_end will come: its supervisor is gone
                 p.wait()
                 t.join()
                 del self.running[path]
+                del self.gone_at[path]
+                self.done(path)
                 print(f"varek_node_export: {os.path.basename(path)}: its supervisor ended without run_end; left",
                       file=sys.stderr)
 
@@ -126,14 +180,21 @@ def main(argv=None):
     ap.add_argument("--pubkey", help="the node's public key (the streams are signed)")
     ap.add_argument("--anchor", help="the node's anchor")
     ap.add_argument("--device", help="the node's name in each event's device")
+    ap.add_argument("--state", help="the streams done are written here, and not exported again")
+    ap.add_argument("--max-followers", type=int, default=64, help="streams followed at once (the others wait)")
+    ap.add_argument("--grace", type=float, default=GRACE_S, help=argparse.SUPPRESS)
     ap.add_argument("--once", action="store_true", help="the streams present only, then return")
     args = ap.parse_args(argv)
+    if args.max_followers < 1:
+        ap.error("--max-followers takes 1 or more")
     ex = Exporter(args)
     ex.scan()
     while True:
         ex.reap()
-        if args.once and not ex.running:
-            break
+        if args.once:
+            ex.scan_waiting()
+            if not ex.running and not ex.waiting:
+                break
         time.sleep(1)
         if not args.once:
             ex.scan()

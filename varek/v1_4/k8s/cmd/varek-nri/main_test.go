@@ -2,20 +2,23 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/containerd/nri/pkg/api"
 )
 
 // a stand-in for the Warden: it writes a small filter for any policy, or
-// fails for one named "bad"
+// fails for one named "bad", or takes 5 s for one named "slow"
 const fakeWarden = `#!/bin/sh
 case "$1" in */bad.policy) echo "[warden] policy: line 1: no" >&2; exit 1 ;; esac
+case "$1" in */slow.policy) exec sleep 5 ;; esac
 [ "$2" = --oci-filter ] || exit 2
 echo '{"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRet":1,"architectures":["SCMP_ARCH_X86_64"],"syscalls":[{"names":["openat"],"action":"SCMP_ACT_NOTIFY","args":[]},{"names":["ioctl"],"action":"SCMP_ACT_ALLOW","args":[{"index":1,"value":21505,"valueTwo":0,"op":"SCMP_CMP_EQ"}]}]}'
 `
@@ -28,19 +31,26 @@ func setup(t *testing.T) *plugin {
 	}
 	pol := filepath.Join(d, "policies")
 	os.MkdirAll(filepath.Join(pol, "ns"), 0o755)
-	for _, n := range []string{"agent", "bad"} {
+	for _, n := range []string{"agent", "bad", "slow"} {
 		os.WriteFile(filepath.Join(pol, "ns", n+".policy"), []byte("allow path /tmp/\n"), 0o644)
 	}
 	return &plugin{warden: w, policies: pol, listener: "/run/varek/node.sock", launcher: "/opt/varek/varek-init",
-		filters: map[string]*ociProfile{}}
+		handlers: map[string]bool{"runc": true, "crun": true}, filters: map[string]*ociProfile{}}
 }
 
 func pod(ann map[string]string) *api.PodSandbox {
 	return &api.PodSandbox{Name: "p", Namespace: "ns", Uid: "u-1", Annotations: ann}
 }
 
+// a container as the runtime describes it: its own namespaces, VAREK's
+// unsupervised profile
 func ctr(args ...string) *api.Container {
-	return &api.Container{Name: "c", Args: args, Mounts: []*api.Mount{
+	l := &api.LinuxContainer{SeccompProfile: &api.SecurityProfile{ProfileType: api.SecurityProfile_LOCALHOST,
+		LocalhostRef: "/var/lib/kubelet/seccomp/varek/unsupervised.json"}}
+	for _, t := range []string{"pid", "network", "ipc", "uts", "mount"} {
+		l.Namespaces = append(l.Namespaces, &api.LinuxNamespace{Type: t, Path: "/proc/1/ns/" + t})
+	}
+	return &api.Container{Name: "c", Args: args, Linux: l, Mounts: []*api.Mount{
 		{Destination: "/work", Type: "bind", Source: "/var/lib/x", Options: []string{"rbind", "rw"}},
 		{Destination: "/etc/config", Type: "bind", Source: "/var/lib/y", Options: []string{"rbind", "ro"}},
 		{Destination: "/dev/shm", Type: "bind", Source: "/run/shm", Options: []string{"rbind", "noexec"}},
@@ -50,7 +60,7 @@ func ctr(args ...string) *api.Container {
 
 func TestOtherPodsLeftAlone(t *testing.T) {
 	p := setup(t)
-	adj, err := p.adjust(pod(map[string]string{"other": "x"}), ctr("/bin/agent"))
+	adj, err := p.adjust(context.Background(), pod(map[string]string{"other": "x"}), ctr("/bin/agent"))
 	if adj != nil || err != nil {
 		t.Fatalf("a pod without %s: %v %v", annotation, adj, err)
 	}
@@ -58,7 +68,7 @@ func TestOtherPodsLeftAlone(t *testing.T) {
 
 func TestAdjustment(t *testing.T) {
 	p := setup(t)
-	adj, err := p.adjust(pod(map[string]string{annotation: "agent"}), ctr("/bin/agent", "--flag"))
+	adj, err := p.adjust(context.Background(), pod(map[string]string{annotation: "agent"}), ctr("/bin/agent", "--flag"))
 	if err != nil || adj == nil {
 		t.Fatalf("adjust: %v", err)
 	}
@@ -113,26 +123,81 @@ func TestRefused(t *testing.T) {
 		{"no such policy", "nosuch", []string{"/bin/x"}, "no policy named nosuch"},
 		{"a policy the Warden refuses", "bad", []string{"/bin/x"}, "does not write the filter for policy bad"},
 	} {
-		adj, err := p.adjust(pod(map[string]string{annotation: c.ann}), ctr(c.args...))
+		adj, err := p.adjust(context.Background(), pod(map[string]string{annotation: c.ann}), ctr(c.args...))
 		if adj != nil || err == nil || !strings.Contains(err.Error(), c.why) {
 			t.Errorf("%s: %v %v", c.name, adj, err)
 		}
+	}
+	// review (G-1, G-4, G-5): what the runtime describes
+	for _, c := range []struct {
+		name   string
+		change func(*api.PodSandbox, *api.Container)
+		why    string
+	}{
+		{"a sandboxed runtime", func(p *api.PodSandbox, _ *api.Container) { p.RuntimeHandler = "kata" }, `runtime handler "kata"`},
+		{"the node's network", func(_ *api.PodSandbox, c *api.Container) { c.Linux.Namespaces = c.Linux.Namespaces[:1] }, "node's network namespace"},
+		{"the node's PID namespace", func(_ *api.PodSandbox, c *api.Container) { c.Linux.Namespaces = c.Linux.Namespaces[1:] }, "node's pid namespace"},
+		{"the runtime's default profile", func(_ *api.PodSandbox, c *api.Container) {
+			c.Linux.SeccompProfile = &api.SecurityProfile{ProfileType: api.SecurityProfile_RUNTIME_DEFAULT}
+		}, "its seccomp profile is RUNTIME_DEFAULT"},
+		{"another Localhost profile", func(_ *api.PodSandbox, c *api.Container) {
+			c.Linux.SeccompProfile.LocalhostRef = "/var/lib/kubelet/seccomp/other/unsupervised.json.x"
+		}, "not Localhost varek/unsupervised.json"},
+		{"a policy that allows", func(_ *api.PodSandbox, c *api.Container) {
+			c.Linux.SeccompProfile = nil
+			c.Linux.SeccompPolicy = &api.LinuxSeccomp{DefaultAction: "SCMP_ACT_ALLOW"}
+		}, "default is SCMP_ACT_ALLOW"},
+	} {
+		pd, k := pod(map[string]string{annotation: "agent"}), ctr("/bin/x")
+		c.change(pd, k)
+		adj, err := p.adjust(context.Background(), pd, k)
+		if adj != nil || err == nil || !strings.Contains(err.Error(), c.why) {
+			t.Errorf("%s: %v %v", c.name, adj, err)
+		}
+	}
+	for _, h := range []string{"", "runc"} {
+		pd := pod(map[string]string{annotation: "agent"})
+		pd.RuntimeHandler = h
+		if _, err := p.adjust(context.Background(), pd, ctr("/bin/x")); err != nil {
+			t.Errorf("runtime handler %q: %v", h, err)
+		}
+	}
+	k := ctr("/bin/x")
+	k.Linux.SeccompProfile = nil
+	k.Linux.SeccompPolicy = &api.LinuxSeccomp{DefaultAction: "SCMP_ACT_ERRNO"}
+	if _, err := p.adjust(context.Background(), pod(map[string]string{annotation: "agent"}), k); err != nil {
+		t.Errorf("the unsupervised profile known by its policy: %v", err)
+	}
+}
+
+// G-1: the answer comes before the runtime's deadline, saying why
+func TestDeadline(t *testing.T) {
+	p := setup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	t0 := time.Now()
+	_, _, err := p.CreateContainer(ctx, pod(map[string]string{annotation: "slow"}), ctr("/bin/x"))
+	if err == nil || !strings.Contains(err.Error(), "in the time the runtime gives") {
+		t.Fatalf("a filter not written in time: %v", err)
+	}
+	if d := time.Since(t0); d > time.Second-answerMargin/2 {
+		t.Errorf("answered %v after a 1 s deadline", d)
 	}
 }
 
 func TestFilterKeptByHash(t *testing.T) {
 	p := setup(t)
-	a, s1, err := p.filter("ns", "agent")
-	b, s2, err2 := p.filter("ns", "agent")
+	a, s1, err := p.filter(context.Background(), "ns", "agent")
+	b, s2, err2 := p.filter(context.Background(), "ns", "agent")
 	if err != nil || err2 != nil || a != b || s1 != s2 || len(s1) != 64 {
 		t.Fatalf("kept: %v %v", err, err2)
 	}
 	os.WriteFile(filepath.Join(p.policies, "ns", "agent.policy"), []byte("allow path /tmp/\nallow path /var/\n"), 0o644)
-	c, s3, err := p.filter("ns", "agent")
+	c, s3, err := p.filter(context.Background(), "ns", "agent")
 	if err != nil || c == a || s3 == s1 {
 		t.Fatalf("a changed policy is written again, with its own hash: %v", err)
 	}
-	if _, _, err := p.filter("other", "agent"); err == nil || !strings.Contains(err.Error(), "in namespace other") {
+	if _, _, err := p.filter(context.Background(), "other", "agent"); err == nil || !strings.Contains(err.Error(), "in namespace other") {
 		t.Fatalf("another namespace's policy: %v", err)
 	}
 }

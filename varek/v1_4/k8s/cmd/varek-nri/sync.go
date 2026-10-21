@@ -3,8 +3,8 @@
 // v1.34 step 5 (D7): the cluster's VarekPolicy resources, written to the
 // node's policy directory as POLICY_DIR/<namespace>/<name>.policy, where the
 // node agent and this plugin take a pod's policy by the name its pod gives.
-// Listed, then watched; listed again when the watch ends with its version
-// too old. A file is written whole and renamed into place, root's, readable
+// Listed a page at a time, then watched; listed again when the watch ends
+// with its version too old. A file is written whole and renamed into place, root's, readable
 // by all (the node agent refuses a directory others can write); one whose
 // resource is gone is removed. A resource whose namespace or name the node
 // agent would not take (1 to 63 of a-z, 0-9 and -), or whose text is larger
@@ -106,17 +106,16 @@ func (s *syncer) prune(have map[string]bool) {
 }
 
 func (s *syncer) list(ctx context.Context) (string, error) {
-	l, err := s.c.ListPolicies(ctx)
+	have := map[string]bool{}
+	rv, err := s.c.ListPolicies(ctx, func(p *kube.Policy) {
+		have[p.Metadata.Namespace+"/"+p.Metadata.Name] = true
+		s.write(p)
+	})
 	if err != nil {
 		return "", err
 	}
-	have := map[string]bool{}
-	for i := range l.Items {
-		have[l.Items[i].Metadata.Namespace+"/"+l.Items[i].Metadata.Name] = true
-		s.write(&l.Items[i])
-	}
 	s.prune(have)
-	return l.Metadata.ResourceVersion, nil
+	return rv, nil
 }
 
 func (s *syncer) event(ev kube.Event) error {
