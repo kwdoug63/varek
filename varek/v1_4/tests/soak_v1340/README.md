@@ -64,7 +64,7 @@ anything.
 |---|---|
 | EKS: the control plane ($0.10/h), 2 m6i.large ($0.096/h each), a NAT gateway ($0.045/h), 2 × 40 GB gp3, the images pulled | about $10 |
 | ROSA HCP: the cluster ($0.25/h), 2 m5.xlarge workers ($0.192/h each, and $0.171/h each to Red Hat) | about $25 |
-| Single-node OpenShift: one m6i.2xlarge ($0.384/h), 120 GB gp3 (a 60-day evaluation subscription) | about $11 |
+| Single-node OpenShift (the choice, D11): one m6i.2xlarge ($0.384/h), 120 GB gp3, the installer's load balancers and a NAT gateway in one zone (a 60-day evaluation subscription) | about $15 |
 
 ## 1. The images
 
@@ -124,16 +124,28 @@ eksctl delete cluster -f varek/v1_4/tests/soak_v1340/eks-cluster.yaml
 aws ecr delete-repository --repository-name varek-node --region us-east-1 --force
 ```
 
-## 3. OpenShift
+## 3. OpenShift (single-node, on AWS)
 
-The cluster (ROSA HCP with 2 workers, or single-node OpenShift), version
-4.22 or later; then, logged in with `oc` as a cluster administrator:
+Decided October 21, 2026 (D11): a single-node OpenShift on one EC2
+instance, made by `openshift-install` 4.22 or later (CRI-O 1.35) in the
+account's Route 53 domain (`soberagents-lab.com`). Its one node is
+schedulable, so the run has one long agent.
 
 ```sh
+mkdir ~/varek-sno && cp varek/v1_4/tests/soak_v1340/openshift-sno-install-config.yaml ~/varek-sno/install-config.yaml
+# put the pull secret and an SSH public key into ~/varek-sno/install-config.yaml
+openshift-install version                                  # 4.22 or later
+openshift-install create manifests --dir ~/varek-sno
+cp varek/v1_4/tests/soak_v1340/openshift-nri-master.yaml ~/varek-sno/openshift/   # NRI on from the first boot
+openshift-install create cluster --dir ~/varek-sno         # about 45 minutes
+export KUBECONFIG=~/varek-sno/auth/kubeconfig
 oc get nodes -o wide                                       # cri-o://1.35 or later
-oc apply -f varek/v1_4/tests/soak_v1340/openshift-nri-worker.yaml   # single-node: openshift-nri-master.yaml
-oc get mcp -w                                              # until the pool is UPDATED (its nodes reboot)
+oc debug node/NODE -- chroot /host cat /etc/crio/crio.conf.d/99-varek-nri.conf   # enable_nri = true
 ```
+
+On a cluster made without it, `oc apply -f openshift-nri-master.yaml` (or
+`-worker.yaml` on one with workers) and `oc get mcp -w` until the pool is
+UPDATED: its nodes reboot.
 
 The node image must be pullable by the cluster (ECR with a pull secret, or
 OpenShift's own registry). `soak.sh --openshift` installs the chart with
@@ -150,7 +162,8 @@ varek/v1_4/tests/soak_v1340/soak.sh --openshift --image REGISTRY/varek-node:soak
 ```
 
 Then the 24 hours as for EKS, with `--openshift`, and the cluster removed
-after (`rosa delete cluster`, or the single node's instance terminated).
+after: `openshift-install destroy cluster --dir ~/varek-sno` (its instance,
+load balancers, NAT gateway, volumes and DNS records).
 
 What is not yet measured on OpenShift, and the trial shows first: the
 SELinux labels (the launcher bound into each container, the plugin's and
@@ -169,3 +182,4 @@ container that does not start, not one that runs unsupervised.
 | `crio_trial.sh` | The agent and its policy on one CRI-O host, under the plugin and the node agent. |
 | `eks-cluster.yaml` | The EKS cluster (eksctl). |
 | `openshift-nri-worker.yaml`, `openshift-nri-master.yaml` | CRI-O's NRI turned on (a MachineConfig). |
+| `openshift-sno-install-config.yaml` | The single-node OpenShift (openshift-install), without its pull secret and SSH key. |
