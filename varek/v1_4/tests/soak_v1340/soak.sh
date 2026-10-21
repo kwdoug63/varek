@@ -299,7 +299,30 @@ for _ in $(seq 120); do
     left="$(K -n "$AG" get pods -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}' | grep -c -E 'Running|Pending')"
     [ "$left" = 0 ] && break; sleep 10
 done
-sleep 30                                # the exporter's last audits
+# the exporter audits each stream whole at its end: minutes for a day's
+# (README.md); wait until each agent pod's run has its audit's event
+for _ in $(seq 120); do
+    sample > /dev/null 2>&1
+    python3 - "$OUT" <<'EOF' && break
+import glob, json, sys
+out = sys.argv[1]
+done = set()
+for f in glob.glob(f"{out}/exporter/*.jsonl"):
+    for l in open(f, errors="replace"):
+        if '"event": "audit"' in l or '"event":"audit"' in l:
+            try:
+                e = json.loads(l)
+            except ValueError:
+                continue
+            done.add((e.get("metadata") or {}).get("correlation_uid"))
+# every run: the short Jobs' pods kept as they ended, and a long agent a node
+short = [f for f in glob.glob(f"{out}/logs/*.pod.json")
+         if json.load(open(f))["metadata"].get("labels", {}).get("soak") == "short"]
+want = len(short) + len(json.load(open(f"{out}/meta.json"))["nodes"])
+sys.exit(0 if len(done) >= want else 1)
+EOF
+    sleep 10
+done
 sample
 for p in $(K -n "$AG" get pods -o name); do      # every pod's log, those not yet kept
     n="${p#pod/}"; [ -s "$OUT/logs/$n.jsonl" ] || K -n "$AG" logs "$n" > "$OUT/logs/$n.jsonl" 2>/dev/null
