@@ -961,7 +961,7 @@ are claimed as solved.
     in.
   - *Review.* v1.32.0 was reviewed by AI review agents, not by a human or
     third party. Its findings are listed in its release notes.
-- Kubernetes (v1.34.0, in progress: steps 1 to 7 built,
+- Kubernetes (v1.34.0, in progress: steps 1 to 8 built,
   `v1.34-kubernetes.md`):
   - *The pod's network, not an empty one* (D5). On a host the agent's
     network namespace is empty and the Warden dials every connect from its
@@ -971,21 +971,46 @@ are claimed as solved.
     an allowed connect reaches: the cluster's services as the pod sees
     them, and the pod's loopback, which its other containers share. A
     name is still never allowed to lead to a loopback or link-local
-    address. Names are resolved through the pod's DNS server (the
-    cluster's), so whoever answers for the cluster's DNS answers for the
-    policy's names, as the host's resolver does on a host.
+    address. Names are resolved through the cluster's DNS server (the
+    chart gives the node agent its service's address; without it, the
+    pod's, which the webhook keeps to the cluster's: no `dnsPolicy: None`,
+    no `dnsConfig.nameservers`), so whoever answers for the cluster's DNS
+    answers for the policy's names, as the host's resolver does on a host.
   - *The pod's other containers share its network namespace.* A sidecar
     can listen where the agent's allowed connects go, or hold the stub
     resolver's usual address; the stub then takes the next free one
     (127.53.53.54 and on), which `run_start` names. The egress proxy
     listens on the pod's loopback, but takes only the connections the
-    Warden announces.
-  - *A pod is supervised only through VAREK's NRI plugin.* If the plugin is
-    not running, an annotated pod runs as its spec says, unsupervised, until
-    NRI's validator requires the plugin and the admission check refuses
-    such a pod (steps 5 and 6). The node agent cannot read which filter the
-    runtime installed, so it cannot check that the filter is the Warden's
-    for that policy.
+    Warden announces. The stub resolver answers any of the pod's
+    containers: one can spend the agent's name budget and put questions in
+    its stream.
+  - *A pod is supervised only through VAREK's NRI plugin, or does not run*
+    (step 8). Each container of an annotated pod names VAREK's
+    unsupervised seccomp profile, which refuses every call, and the
+    webhook refuses one that does not; the plugin replaces it with the
+    Warden's filter. A container the plugin does not adjust (no plugin on
+    its node, a plugin that does not answer the runtime in time) does not
+    start. This rests on the webhook (with `failurePolicy: Fail`) for pods
+    in the namespaces it checks: an annotated pod in an excluded namespace
+    (`kube-system` by default, the chart's own always) is not checked, and
+    could name another profile. The plugin checks the profile again where
+    the runtime tells it (CRI-O 1.37 does not). A sandboxed runtime (Kata,
+    gVisor), which would ignore the listener, is refused by both. The node
+    agent cannot read which filter the runtime installed, so it cannot
+    check that the filter is the Warden's for that policy: a filter naming
+    its socket comes from the runtime's spec, which only the node's root
+    writes.
+  - *Who may connect to the node agent* (step 7, decided October 21,
+    2026). The node agent takes a connection from root in its own user and
+    PID namespaces and the node's or its own mount namespace. When the
+    runtime has ended before it can be read (containerd's runc does not
+    wait), its namespaces are not known: the connection is then tied to
+    the process the state names by the runtime's parent, read before it
+    ended, which must be root and run where the runtime does. A runtime
+    already reaped before it is read is refused (step 8). The socket's
+    directory being root's alone on the node is what keeps other processes
+    out; a root container given that directory by a hostPath could
+    connect.
   - *Policies come from the cluster* (D7). Whoever may create or change a
     namespace's `VarekPolicy` resources decides what its agents may do, as
     whoever may edit the policy file does on a host: that right is to be
@@ -1006,15 +1031,23 @@ are claimed as solved.
     capability: the node agent refuses a container whose effective,
     permitted or ambient set is not empty, and the webhook a pod that does
     not drop them all. It runs as a user other than root, with no new
-    privileges, and its files are opened as that user whatever the policy's
-    version.
+    privileges, in no group 0, and its files are opened as that user and
+    its groups whatever the policy's version. It is PID 1 of a PID
+    namespace of its own (a namespace the pod's containers share is
+    refused), so its `kill` reaches its own processes only, and ending it
+    ends them all.
   - *The suites against a pod* (step 7). Every suite ran with each agent as
     a pod's container under the node agent (`tests/v1340_sweep.sh`); each
     check that differs from the host run has its reason listed
     (`tests/v1340_sweep_known.txt`). The sweep's container is runc's with
     the plugin's adjustments, not a kubelet's: the chart on a cluster is
     `kind`'s, in CI.
-  - *Review.* Steps 1 to 7 have not yet been reviewed.
+  - *The node's signing key* is one Secret given to every node: a stream
+    names its node, but any node's key signs as any other's.
+  - *Review.* Step 2 and then steps 1 to 7 as a whole (step 8) were
+    reviewed by AI review agents; their findings and fixes are listed in
+    `v1.34-kubernetes.md` (step 8) and the release notes. No human or
+    third-party review has been made.
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).
 - An agent may probe for SATISFIED-but-harmful actions near a policy boundary;

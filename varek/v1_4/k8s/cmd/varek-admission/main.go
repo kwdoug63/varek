@@ -12,7 +12,8 @@
 //	/pod           a pod annotated varek.dev/policy: NAME names a VarekPolicy
 //	               of its namespace that the Warden loads, and each of its
 //	               containers runs as the node agent requires: no privilege
-//	               escalation, not as root (runAsNonRoot or a runAsUser above
+//	               escalation, not privileged, every capability dropped and
+//	               none added, not as root (runAsNonRoot or a runAsUser above
 //	               0, and no group 0), a command named by an absolute path
 //	               where the pod gives one, a read-only root when the policy
 //	               decides launches (D4), none of the node's namespaces

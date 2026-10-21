@@ -21,9 +21,9 @@
  *
  * Step 2 carries what needs nothing of the Warden's own start of the agent:
  * files, opened as the agent's user (read from its process), the container's
- * command, connects to addresses. Refused at the start, until the steps that
- * bring them: credentials, the on-behalf-of chain and sub-agents (step 5), plans and the
- * dry run.
+ * command, connects to addresses. Refused at the start (step 5 names them,
+ * and the webhook refuses them at deploy), not carried in v1.34.0:
+ * credentials, the on-behalf-of chain and sub-agents, plans and the dry run.
  *
  * Step 4 (D5): the pod's network. Host-name rules and the egress proxy are
  * carried: the names are resolved from the pod's network namespace through
@@ -39,8 +39,9 @@
  * takes each container's policy by the name its pod gives
  * (varek.dev/policy, which the plugin copies to the container's own
  * annotations: the state carries the container's, not the pod's), as
- * POLICY_DIR/<name>.policy; a single policy file stays one policy for every
- * container. The plugin puts the launcher first in the command
+ * POLICY_DIR/<namespace>/<name>.policy (step 5), held to the SHA-256 the
+ * plugin wrote the filter for; a single policy file stays one policy for
+ * every container. The plugin puts the launcher first in the command
  * (/varek/init -- COMMAND ...), bound read-only from FILE on the node. The
  * supervisor checks /varek/init is that file, builds the launch set in the
  * container's view, and serves it to the launcher (NODE_SET_VIEW), which

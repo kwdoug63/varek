@@ -6,11 +6,11 @@
 // agent (warden POLICY_DIR --node-agent ...). For each container of a pod
 // annotated varek.dev/policy: NAME it asks the runtime for:
 //   - the Warden's filter for that policy in OCI's form (written by the
-//     Warden itself, warden POLICY_DIR/NAME.policy --oci-filter, so the
-//     plugin carries no copy that could drift) as the container's seccomp
-//     policy, its listenerPath the node agent's socket: the pod's own
-//     profile (RuntimeDefault, as Pod Security's "restricted" requires) is
-//     replaced;
+//     Warden itself, warden NAME.policy --oci-filter on a private copy of
+//     POLICY_DIR/<namespace>/NAME.policy, so the plugin carries no copy
+//     that could drift) as the container's seccomp policy, its listenerPath
+//     the node agent's socket: the pod's own profile (VAREK's unsupervised
+//     one, step 8) is replaced;
 //   - the launcher (varek-init) bound read-only, nosuid, nodev at
 //     /varek/init and put first in the command: /varek/init -- COMMAND ...;
 //   - every writable mount noexec (D4);
@@ -382,7 +382,7 @@ func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, ctr *
 func main() {
 	p := &plugin{filters: map[string]*ociProfile{}}
 	flag.StringVar(&p.warden, "warden", "", "the warden binary (it writes each policy's filter)")
-	flag.StringVar(&p.policies, "policies", "", "the policies' directory (NAME.policy), the node agent's")
+	flag.StringVar(&p.policies, "policies", "", "the policies' directory (<namespace>/NAME.policy), the node agent's")
 	flag.StringVar(&p.listener, "listener", "", "the node agent's socket")
 	flag.StringVar(&p.launcher, "launcher", "", "the launcher (varek-init) on the node")
 	socket := flag.String("socket", "", "the runtime's NRI socket (default: NRI's)")
