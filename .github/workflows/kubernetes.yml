@@ -11,7 +11,10 @@ name: Kubernetes
 #   sweep  the suites run under the Warden and again with each agent run as
 #          a pod's container under the node agent, each check compared
 #          (varek/v1_4/tests/v1340_sweep.sh); every difference has its
-#          reason listed, or the job fails.
+#          reason listed, or the job fails;
+#   soak   the ship gate's harness (varek/v1_4/tests/soak_v1340/soak.sh, step
+#          9), six minutes of it on a one-node kind cluster, judged as the
+#          24-hour runs on EKS and OpenShift are (soak_check.py).
 # kind is built from source at a pinned version (its modules checked against
 # Go's checksum database); kubectl and helm are the runner's.
 
@@ -94,3 +97,35 @@ jobs:
         with:
           name: sweep
           path: ${{ runner.temp }}/sweep
+
+  soak:
+    name: The 24-hour runs' harness, for six minutes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
+      - name: Build the tools the check uses (the key, the certificate checker)
+        run: make -C varek/v1_4 tools/varek_keygen tools/vdp_cert_check
+      - name: kind, pinned
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install sigs.k8s.io/kind@v0.33.0
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Build the node image
+        run: docker build -f packaging/container/Containerfile --target node -t varek-node:ci .
+      - name: The cluster
+        run: |
+          kind create cluster --name varek-soak --image kindest/node:v1.37.0 --wait 300s
+          kind load docker-image varek-node:ci --name varek-soak
+      - name: The harness, six minutes
+        run: |
+          varek/v1_4/tests/soak_v1340/soak.sh --image varek-node:ci --hours 0.1 --interval 3 \
+            --short-every 2 --sample 30 --out "$RUNNER_TEMP/soak"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak
+          path: ${{ runner.temp }}/soak

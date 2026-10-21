@@ -60,6 +60,10 @@ spec:
               chmod 0700 /host/socket /host/streams /host/control /host/export
               chmod 0755 /host/policies /host/bin
               install -o 0 -g 0 -m 0755 /opt/varek/varek-init /host/bin/.varek-init.new
+              {{- if .Values.openshift.enabled }}
+              # SELinux: a file containers may read and run (it is bound into each)
+              chcon -t container_ro_file_t /host/bin/.varek-init.new
+              {{- end }}
               mv -f /host/bin/.varek-init.new /host/bin/varek-init
               install -d -o 0 -g 0 -m 0755 /host/seccomp/varek
               printf '%s\n' '{"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRet":1,"syscalls":[]}' > /host/seccomp/varek/.unsupervised.json.new
@@ -69,6 +73,10 @@ spec:
             runAsUser: 0
             allowPrivilegeEscalation: false
             capabilities: { drop: [ALL], add: [CHOWN, DAC_OVERRIDE, FOWNER] }
+            {{- if .Values.openshift.enabled }}
+            # SELinux: the node's paths (container_t may not write them)
+            seLinuxOptions: { type: spc_t }
+            {{- end }}
           volumeMounts:
             - { name: socket, mountPath: /host/socket }
             - { name: streams, mountPath: /host/streams }
@@ -151,6 +159,10 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: { drop: [ALL] }
             seccompProfile: { type: RuntimeDefault }
+            {{- if .Values.openshift.enabled }}
+            # SELinux: the node's paths and the runtime's NRI socket
+            seLinuxOptions: { type: spc_t }
+            {{- end }}
           resources: {{- toYaml .Values.plugin.resources | nindent 12 }}
           volumeMounts:
             - { name: policies, mountPath: {{ .Values.node.policies }} }
@@ -193,6 +205,10 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: { drop: [ALL] }
             seccompProfile: { type: RuntimeDefault }
+            {{- if .Values.openshift.enabled }}
+            # SELinux: the node's paths and the runtime's NRI socket
+            seLinuxOptions: { type: spc_t }
+            {{- end }}
           resources: {{- toYaml .Values.exporter.resources | nindent 12 }}
           volumeMounts:
             - { name: streams, mountPath: {{ .Values.node.streams }}, readOnly: true }

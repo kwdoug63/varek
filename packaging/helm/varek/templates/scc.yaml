@@ -31,3 +31,49 @@ volumes: [hostPath, secret, emptyDir, projected, configMap, downwardAPI]
 users:
   - system:serviceaccount:{{ .Release.Namespace }}:{{ include "varek.nodeName" . }}
 {{- end }}
+{{- if .Values.openshift.enabled }}
+{{- $sup := printf "%s-supervised" .Release.Name }}
+---
+{{/* v1.34 step 9: supervised pods. restricted-v2 admits only the runtime's
+  default seccomp profile, and each container of a supervised pod names
+  VAREK's unsupervised one (a Localhost profile): this is restricted-v2 with
+  that profile admitted too, and nothing else. A namespace's service
+  accounts are given it by binding the ClusterRole below (a RoleBinding in
+  the namespace). Its containers are also to give runAsGroup (not 0): the
+  node agent refuses group 0, which OpenShift gives a container otherwise. */}}
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: {{ $sup }}
+  labels: {{- include "varek.labels" . | nindent 4 }}
+allowPrivilegedContainer: false
+allowPrivilegeEscalation: false
+allowHostPID: false
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPorts: false
+allowHostDirVolumePlugin: false
+allowedCapabilities: []
+defaultAddCapabilities: []
+requiredDropCapabilities: [ALL]
+readOnlyRootFilesystem: false
+runAsUser: { type: MustRunAsRange }
+seLinuxContext: { type: MustRunAs }
+fsGroup: { type: MustRunAs }
+supplementalGroups: { type: RunAsAny }
+seccompProfiles: ["runtime/default", "localhost/varek/unsupervised.json"]
+volumes: [configMap, csi, downwardAPI, emptyDir, ephemeral, persistentVolumeClaim, projected, secret]
+users: []
+groups: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $sup }}-scc
+  labels: {{- include "varek.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [security.openshift.io]
+    resources: [securitycontextconstraints]
+    resourceNames: [{{ $sup }}]
+    verbs: [use]
+{{- end }}

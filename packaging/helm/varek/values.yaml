@@ -137,6 +137,11 @@ admission:
     limits: { memory: 256Mi }
 
 # OpenShift: a SecurityContextConstraints for the node agent's service
-# account (privileged, the node's PID namespace, host paths)
+# account (privileged, the node's PID namespace, host paths; the plugin,
+# the exporter and the init container as spc_t, the launcher labelled for
+# containers), and one for supervised pods (RELEASE-supervised:
+# restricted-v2 with VAREK's unsupervised profile admitted), given to a
+# namespace's service accounts by binding the ClusterRole
+# RELEASE-supervised-scc
 openshift:
   enabled: false

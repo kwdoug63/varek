@@ -334,7 +334,7 @@ def test_rbac_reads_only():
 
 def test_openshift():
     docs = render("openshift.enabled=true", "runtime=cri-o")
-    scc = one(docs, "SecurityContextConstraints")
+    scc = one(docs, "SecurityContextConstraints", "t-node")
     assert scc["users"] == [f"system:serviceaccount:{NS}:t-node"]
     assert scc["allowPrivilegedContainer"] and scc["allowHostPID"] and scc["allowHostDirVolumePlugin"]
     assert not scc["allowHostNetwork"]
@@ -347,6 +347,22 @@ def test_openshift():
     sc = pod(docs, "Deployment")["securityContext"]
     assert sc["runAsNonRoot"] is True and "runAsUser" not in sc and "runAsGroup" not in sc
     assert "SecurityContextConstraints" not in kinds(render())
+    # step 9: the node's own as spc_t (SELinux: the node's paths, the NRI
+    # socket), the launcher labelled for containers
+    for c in (ctr(spec, "prepare", init=True), ctr(spec, "plugin"), ctr(spec, "exporter")):
+        assert c["securityContext"]["seLinuxOptions"] == {"type": "spc_t"}, c["name"]
+    assert "chcon -t container_ro_file_t /host/bin/.varek-init.new" in ctr(spec, "prepare", init=True)["command"][-1]
+    assert "seLinuxOptions" not in ctr(pod(render(), "DaemonSet"), "plugin")["securityContext"]
+    # supervised pods: restricted-v2 with the unsupervised profile admitted,
+    # used through a ClusterRole a namespace binds
+    sup = one(docs, "SecurityContextConstraints", "t-supervised")
+    assert sup["seccompProfiles"] == ["runtime/default", "localhost/varek/unsupervised.json"]
+    assert sup["requiredDropCapabilities"] == ["ALL"] and not sup["allowPrivilegeEscalation"]
+    assert sup["runAsUser"] == {"type": "MustRunAsRange"} and not sup["allowHostDirVolumePlugin"]
+    assert sup["users"] == [] and sup["groups"] == []
+    role = one(docs, "ClusterRole", "t-supervised-scc")
+    assert role["rules"] == [{"apiGroups": ["security.openshift.io"], "resources": ["securitycontextconstraints"],
+                              "resourceNames": ["t-supervised"], "verbs": ["use"]}]
 
 
 def test_the_crd_names_what_the_node_agent_takes():

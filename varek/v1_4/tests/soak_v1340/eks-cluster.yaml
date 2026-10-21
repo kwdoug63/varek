@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT
+# v1.34 step 9: the EKS cluster for the 24-hour run (README.md). Two amd64
+# nodes on Amazon Linux 2023, whose containerd is 2.2 or later (the plugin
+# needs NRI v0.10); one long agent runs on each.
+#
+#   eksctl create cluster -f eks-cluster.yaml      (about 20 minutes)
+#   eksctl delete cluster -f eks-cluster.yaml      (after the run)
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: varek-soak
+  region: us-east-1
+  version: "1.35"
+  tags: { purpose: varek-v1.34-soak }
+managedNodeGroups:
+  - name: agents
+    amiFamily: AmazonLinux2023
+    instanceType: m6i.large
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 2
+    volumeSize: 40
+    # the node role's default policies include reading ECR, where the node
+    # image is pushed (README.md, step 2)
