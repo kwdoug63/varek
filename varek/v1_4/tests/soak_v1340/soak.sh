@@ -230,6 +230,10 @@ EOF
 say "the agents started: ${#NODES[@]} long (one a node), a short Job every $SHORT_EVERY min; until $(TZ=America/Chicago date -d @$END '+%Y-%m-%d %H:%M %Z')"
 
 # --- 5. the samples
+TARPY='import sys, tarfile
+t = tarfile.open(fileobj=sys.stdout.buffer, mode="w|")
+t.add("/var/log/varek", arcname=".")
+t.close()'
 MEMPY='import json, os, sys, time
 out = []
 for p in os.listdir("/proc"):
@@ -333,7 +337,8 @@ K -n "$NS" get pods -o json > "$OUT/varek-pods.json"
 for p in $(K -n "$NS" get pod -l app.kubernetes.io/component=node -o name); do
     node="$(K -n "$NS" get "$p" -o jsonpath='{.spec.nodeName}')"
     mkdir -p "$OUT/streams/$node"
-    K -n "$NS" exec "$p" -c node-agent -- tar -C /var/log/varek -cf - . 2>/dev/null | tar -C "$OUT/streams/$node" -xf - ||
+    # the node image has no tar (UBI minimal): its python3 writes the archive
+    K -n "$NS" exec "$p" -c node-agent -- python3 -c "$TARPY" 2>"$OUT/streams/$node.copy.err" | tar -C "$OUT/streams/$node" -xf - ||
         say "soak.sh: the streams of $node were not all copied"
     K -n "$NS" logs "$p" -c node-agent > "$OUT/streams/$node.node-agent.log" 2>/dev/null
     K -n "$NS" logs "$p" -c plugin > "$OUT/streams/$node.plugin.log" 2>/dev/null

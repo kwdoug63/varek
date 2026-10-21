@@ -124,8 +124,8 @@ def main():
     for n, p in sorted(short.items()):
         L = agent_log(jl(f"{d}/logs/{n}.jsonl"))
         s_probes += len(L["probes"])
-        good = p.get("status", {}).get("phase") == "Succeeded" and L["start"] and L["end"] and not L["bad"] \
-            and not L["leaks"] and L["work"]
+        good = bool(p.get("status", {}).get("phase") == "Succeeded" and L["start"] and L["end"] and not L["bad"]
+                    and not L["leaks"] and L["work"])
         s_ok += good
         if not good:
             s_bad += 1
