@@ -206,6 +206,16 @@ def main():
         os.makedirs(x)
     os.makedirs(os.path.join(up, "varek"))
     open(os.path.join(up, "varek", "init"), "w").close()
+    # the pod's /etc/resolv.conf, a file, as the kubelet gives each container:
+    # the host's, read through its links (where it is a link into /run, as on
+    # Ubuntu with systemd-resolved, the bind of / does not carry /run's mount,
+    # and the node agent would find no nameserver for the policy's hosts)
+    os.makedirs(os.path.join(up, "etc"))
+    try:
+        shutil.copyfile("/etc/resolv.conf", os.path.join(up, "etc", "resolv.conf"))
+        os.chmod(os.path.join(up, "etc", "resolv.conf"), 0o644)
+    except OSError as e:
+        log("resolv.conf", "the host's /etc/resolv.conf does not read (%s): the container keeps the image's" % e, argv)
     # a program the suite made under /tmp, which is the container's writable
     # volume (noexec, D4), is put in the image, as a pod's program is
     if prog[0].startswith("/tmp/") and os.path.isfile(prog[0]):
