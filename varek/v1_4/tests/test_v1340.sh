@@ -246,6 +246,8 @@ check "... and the process it names is not killed" kill -0 "$VICTIM"
 for _ in $(seq 100); do cat "$B"/streams-a/gone.*.jsonl 2>/dev/null | grep -q 'container gone refused' && break; sleep 0.1; done
 check "a runtime that ended once it sent the state: its child, now its shim's, taken" sh -c \
     "[ $rrc = 0 ] && cat '$B'/streams-a/gone.*.jsonl | grep -q 'container gone refused: cannot read the bundle'"
+check "... and the node agent's log says it was taken by the runtime's parent" \
+    grep -q "the runtime (pid [0-9]*) ended before it could be read; its container's process $(head -1 "$B/rt.out" 2>/dev/null) taken by" "$B/a.log"
 # a peer in another mount namespace, from its start
 python3 - "$B/s/a.sock" "$VICTIM" > "$B/peer.out" 2>&1 <<'PY'
 import ctypes, json, os, socket, sys

@@ -476,6 +476,12 @@ static int node_admit(const struct node_peer *peer, const char *doc, size_t n, i
             goto fail;
     }
     if (sc != 2) { snprintf(why, wn, "the process the state names (%d) is not under a seccomp filter", (int)*pid); goto fail; }
+    /* taken by the runtime's parent alone: said, so the node's log shows each
+     * container taken so (decided October 21, 2026: kept, design note step 7) */
+    if (peer->state != 1)
+        fprintf(stderr, "[warden] node agent: the runtime (pid %d) ended before it could be read; its container's "
+                "process %d taken by the runtime's process it leaves (%ld: root, where the runtime runs)\n",
+                (int)peer->pid, (int)*pid, peer->ppid > 0 ? peer->ppid : pp);
     return 0;
 fail:
     close(*pidfd);
