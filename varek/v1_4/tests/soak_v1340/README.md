@@ -41,8 +41,8 @@ on one CRI-O host (`sudo varek/v1_4/tests/soak_v1340/crio_trial.sh`).
 **Sizes.** A long agent writes about 338 records a turn (its python3 and
 git), some 440,000 in a day, about 245 MB on its node; the exporter audits
 each stream whole at its end, about 3.7 KB of memory a record (1.6 GB and
-some 4 minutes for a day's, within its 2 GiB). `soak.sh` waits for those
-last audits before it collects.
+some 4 minutes for a day's, within its 2 GiB; a follower in that audit is
+given an hour). `soak.sh` waits for those last audits before it collects.
 
 ## What it needs
 

@@ -15,7 +15,9 @@ collector already takes).
 
 A stream whose supervisor has gone without its run_end (a container refused
 at its start, or a supervisor killed) is left once it stops growing and its
-follower has had GRACE seconds to finish (its last audit) on its own.
+follower has had GRACE seconds to finish on its own. A stream that ends with
+its run_end has its follower in the whole-stream audit, minutes for a day's
+(step 9): it is given AUDIT_GRACE seconds.
 
 Step 8 review: at most --max-followers streams are followed at once, the
 others waiting their turn; a stream is taken once its policy copy is beside
@@ -41,6 +43,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STREAM = re.compile(r"^(?P<base>[^/]+\.(?P<pid>\d+))\.jsonl$")
 QUIET_S = 5.0                     # a stream not growing this long, its supervisor gone: left ...
 GRACE_S = 120.0                   # ... after its follower has had this long to end on its own
+AUDIT_GRACE_S = 3600.0            # ... or this long, its run_end written: its follower is in the audit
 
 
 def alive(pid):
@@ -51,6 +54,19 @@ def alive(pid):
         return False
     except PermissionError:
         return True
+
+
+def ends_with_run_end(path):
+    """True when the stream's last record is its run_end"""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 65536))
+            tail = f.read()
+    except OSError:
+        return False
+    lines = tail.rstrip(b"\n").rsplit(b"\n", 1)
+    return b'"event":"run_end"' in lines[-1]
 
 
 class Exporter:
@@ -161,15 +177,18 @@ class Exporter:
             # review (T2): its follower may be in its last audit (run_end
             # read): it is given time to end on its own first
             since = self.gone_at.setdefault(path, now)
-            if now - since >= self.args.grace:
-                p.terminate()                # no run_end will come: its supervisor is gone
+            # step 9: a day's stream takes minutes to audit, past GRACE_S
+            ended = ends_with_run_end(path)
+            grace = self.args.audit_grace if ended else self.args.grace
+            if now - since >= grace:
+                p.terminate()                # no run_end will come, or its audit has not ended
                 p.wait()
                 t.join()
                 del self.running[path]
                 del self.gone_at[path]
                 self.done(path)
-                print(f"varek_node_export: {os.path.basename(path)}: its supervisor ended without run_end; left",
-                      file=sys.stderr)
+                why = f"its audit did not end in {grace:g} s" if ended else "its supervisor ended without run_end"
+                print(f"varek_node_export: {os.path.basename(path)}: {why}; left (not verified)", file=sys.stderr)
 
 
 def main(argv=None):
@@ -183,6 +202,7 @@ def main(argv=None):
     ap.add_argument("--state", help="the streams done are written here, and not exported again")
     ap.add_argument("--max-followers", type=int, default=64, help="streams followed at once (the others wait)")
     ap.add_argument("--grace", type=float, default=GRACE_S, help=argparse.SUPPRESS)
+    ap.add_argument("--audit-grace", type=float, default=AUDIT_GRACE_S, help=argparse.SUPPRESS)
     ap.add_argument("--once", action="store_true", help="the streams present only, then return")
     args = ap.parse_args(argv)
     if args.max_followers < 1:

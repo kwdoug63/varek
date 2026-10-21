@@ -179,7 +179,8 @@ code before it was fixed (commits `9a05660`, `c956810`).
   not checked.
 - **The exporter audits each stream whole** when its run ends, about 3.7 KB
   of memory a record (measured: 202,857 records, 748 MB, 110 s). Its limit
-  is 2 GiB, about 550,000 records: a day of a busy agent's work. A run whose
+  is 2 GiB, about 550,000 records: a day of a busy agent's work, some 4
+  minutes (the exporter gives an audit an hour). A run whose
   audit does not fit is reported not verified, never verified. The streams
   are not rotated on the node (that agent's day: some 250 MB).
 - **The node's signing key** is one Secret given to every node.

@@ -485,7 +485,7 @@ test-varek-k8s: warden
 # its settings, by helm on PATH or HELM; KUBECONFORM, if set, also checks
 # each render against Kubernetes' schemas
 test-varek-chart:
-	python3 -m pytest -q tests/test_varek_chart.py
+	python3 -m pytest -q tests/test_varek_chart.py tests/test_varek_node_export.py
 
 # v1.34 step 7 (docs/security/v1.34-kubernetes.md, section 4):
 #   sweep-v1340          the suites, each again with every agent it starts run
