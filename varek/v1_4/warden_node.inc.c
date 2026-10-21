@@ -417,11 +417,11 @@ static void node_peer_read(int c, struct node_peer *p) {
  * parent is the peer (runc's init is its runtime's child; crun's is not yet
  * tested) or the peer's parent (the runtime ended, its child reparented to
  * the shim); the descriptor is a seccomp listener, and that process is under
- * a filter. A peer that ended before it could be read, or while it was: the
+ * a filter. A peer that ended before it could be read, or while it was: its
+ * parent must have been read (a zombie's is; a reaped peer is refused), the
  * process's parent is the peer (still ending) or the peer's parent, and the
- * peer's parent where read (else the process's), the shim, is root and runs
- * where the runtime does. 0 with the process's pid and pidfd, or -1 with
- * why. */
+ * peer's parent, the shim, is root and runs where the runtime does. 0 with
+ * the process's pid and pidfd, or -1 with why. */
 static int node_admit(const struct node_peer *peer, const char *doc, size_t n, int fd, pid_t *pid, int *pidfd,
                       char *why, size_t wn) {
     *pidfd = -1;
@@ -455,10 +455,17 @@ static int node_admit(const struct node_peer *peer, const char *doc, size_t n, i
     } else {
         /* the peer ended before it could be read, or while it was: the
          * process's parent is the peer, still ending (its children not yet
-         * reparented), or the peer's parent (the shim, the process now its);
-         * the peer's parent, where read, else the process's, checked as the
-         * runtime */
-        long rt = peer->ppid > 0 ? peer->ppid : pp;
+         * reparented), or the peer's parent (the shim, the process now its),
+         * which is checked as the runtime. A peer already reaped, its parent
+         * not read, is refused: nothing then ties it to the process it names
+         * (review: a root peer anywhere could name another pod's process,
+         * end at once, and have it supervised or killed) */
+        long rt = peer->ppid;
+        if (rt <= 0) {
+            snprintf(why, wn, "the peer (pid %d) ended and was reaped before it could be read: nothing ties it to "
+                     "the process the state names (%d), refused", (int)peer->pid, (int)*pid);
+            goto fail;
+        }
         if (pp != (long)peer->pid && pp != rt) {
             snprintf(why, wn, "the peer (pid %d) ended before it could be read, and the process the state names (%d) "
                      "is not its child nor its parent's (its parent is %ld, the peer's %ld)", (int)peer->pid, (int)*pid,
@@ -480,8 +487,8 @@ static int node_admit(const struct node_peer *peer, const char *doc, size_t n, i
      * container taken so (decided October 21, 2026: kept, design note step 7) */
     if (peer->state != 1)
         fprintf(stderr, "[warden] node agent: the runtime (pid %d) ended before it could be read; its container's "
-                "process %d taken by the runtime's process it leaves (%ld: root, where the runtime runs)\n",
-                (int)peer->pid, (int)*pid, peer->ppid > 0 ? peer->ppid : pp);
+                "process %d taken by the runtime's parent (%ld: root, where the runtime runs)\n",
+                (int)peer->pid, (int)*pid, peer->ppid);
     return 0;
 fail:
     close(*pidfd);
@@ -727,18 +734,47 @@ static void node_reap(void) {
 
 /* The state and the descriptor a runtime sends: the descriptor with the
  * first part, then the rest until the runtime closes the connection (a
- * large state can come in parts), at most 1 MiB, within 5 s. The length,
+ * large state can come in parts), at most 1 MiB, all within 5 s. The length,
  * or -1 (and *nfd the descriptors received, to close). */
 #define NODE_STATE_MAX (1 << 20)
+/* the time left of a connection's 5 s, for poll(2): 0 when it is spent */
+static int node_left_ms(const struct timespec *end) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long long ms = (long long)(end->tv_sec - now.tv_sec) * 1000 + (end->tv_nsec - now.tv_nsec) / 1000000;
+    return ms <= 0 ? 0 : (int)ms;
+}
+
+/* readable within the connection's time left (review: a per-read timeout let
+ * a peer sending a byte at a time hold the listener, and so every container
+ * after it, for as long as it liked) */
+static bool node_wait(int c, const struct timespec *end) {
+    for (;;) {
+        int ms = node_left_ms(end);
+        if (ms == 0) return false;
+        struct pollfd p = { .fd = c, .events = POLLIN };
+        int r = poll(&p, 1, ms);
+        if (r < 0 && errno == EINTR) continue;
+        return r > 0;
+    }
+}
+
 static ssize_t node_receive(int c, char *buf, size_t cap, int *fds, int *nfd) {
-    struct timeval tv = { 5, 0 };
-    (void)setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    end.tv_sec += 5;
+    *nfd = 0;
+    if (!node_wait(c, &end)) return -1;
     char cbuf[CMSG_SPACE(sizeof(int) * 8)];
     struct iovec iov = { buf, cap };
     struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = cbuf, .msg_controllen = sizeof cbuf };
     ssize_t r;
-    while ((r = recvmsg(c, &m, MSG_CMSG_CLOEXEC)) < 0 && errno == EINTR) {}
-    *nfd = 0;
+    for (;;) {
+        r = recvmsg(c, &m, MSG_CMSG_CLOEXEC | MSG_DONTWAIT);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0 && errno == EAGAIN && node_wait(c, &end)) continue;
+        break;
+    }
     for (struct cmsghdr *h = CMSG_FIRSTHDR(&m); r >= 0 && h; h = CMSG_NXTHDR(&m, h))
         if (h->cmsg_level == SOL_SOCKET && h->cmsg_type == SCM_RIGHTS) {
             int k = (int)((h->cmsg_len - CMSG_LEN(0)) / sizeof(int));
@@ -751,9 +787,10 @@ static ssize_t node_receive(int c, char *buf, size_t cap, int *fds, int *nfd) {
     if (r <= 0 || (m.msg_flags & MSG_CTRUNC)) return -1;
     size_t n = (size_t)r;
     while (n < cap) {
-        ssize_t q = read(c, buf + n, cap - n);
-        if (q < 0 && errno == EINTR) continue;
-        if (q < 0) return -1;                 /* the timeout too */
+        if (!node_wait(c, &end)) return -1;   /* the 5 s spent */
+        ssize_t q = recv(c, buf + n, cap - n, MSG_DONTWAIT);
+        if (q < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (q < 0) return -1;
         if (q == 0) return (ssize_t)n;
         n += (size_t)q;
     }

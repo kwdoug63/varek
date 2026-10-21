@@ -5,20 +5,22 @@
 // under containerd: its shim, a subreaper, has it reaped, and the container's
 // process is then the shim's child. As root:
 //
-//   v1340_runtime SOCKET ID
+//   v1340_runtime SOCKET ID zombie|reaped
 //
 // Run as the shim: holds the node agent with a connection that sends
 // nothing (it reads one connection at a time, for at most 5 s); forks the
 // runtime, which forks the container's process (no-new-privileges, a filter
 // with a listener, then waiting), sends the node agent its state (pid, id
-// ID, bundle /nonexistent) with the listener, and ends; reaps the runtime;
-// then lets the node agent go on, so it reads the runtime's connection with
-// the runtime gone. Prints the container process's pid, waits 3 s for the
+// ID, bundle /nonexistent) with the listener, and ends; waits for the
+// runtime's end, leaving it a zombie (zombie) or reaping it (reaped); then
+// lets the node agent go on, so it reads the runtime's connection with the
+// runtime ended. Prints the container process's pid, waits 3 s for the
 // node agent and ends it. 0, or 1 (said why) if it could not.
 #define _GNU_SOURCE
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,7 +82,11 @@ static void container(int sp) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3) { fprintf(stderr, "usage: v1340_runtime SOCKET ID\n"); return 2; }
+    if (argc != 4 || (strcmp(argv[3], "zombie") && strcmp(argv[3], "reaped"))) {
+        fprintf(stderr, "usage: v1340_runtime SOCKET ID zombie|reaped\n");
+        return 2;
+    }
+    bool zombie = strcmp(argv[3], "zombie") == 0;
     if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) < 0) { perror("v1340_runtime: subreaper"); return 1; }
     int hold = dial(argv[1]);
     if (hold < 0) { perror("v1340_runtime: the node agent's socket"); return 1; }
@@ -110,8 +116,10 @@ int main(int argc, char **argv) {
     }
     close(pp[1]);
     pid_t c = 0;
-    int ws;
-    if (read(pp[0], &c, sizeof c) != (ssize_t)sizeof c || waitpid(rt, &ws, 0) != rt || !WIFEXITED(ws) || WEXITSTATUS(ws)) {
+    siginfo_t si = { 0 };
+    // its end waited for; a zombie left as one (WNOWAIT), else reaped
+    if (read(pp[0], &c, sizeof c) != (ssize_t)sizeof c ||
+        waitid(P_PID, (id_t)rt, &si, WEXITED | (zombie ? WNOWAIT : 0)) < 0 || si.si_code != CLD_EXITED || si.si_status) {
         fprintf(stderr, "v1340_runtime: the runtime did not send the listener\n");
         return 1;
     }

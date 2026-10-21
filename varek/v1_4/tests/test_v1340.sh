@@ -237,17 +237,46 @@ for _ in $(seq 100); do grep -q 'a connection refused: the descriptor' "$B/a.log
 check "a state from a process that is not the runtime: refused" grep -q 'a connection refused: the descriptor sent is not a seccomp listener' "$B/a.log"
 check "... and the process it names is not killed" kill -0 "$VICTIM"
 # the peer read as the connection is taken: under containerd runc create
-# sends the state and ends, reaped by its shim, its child then the shim's
+# sends the state and ends, its shim reaps it, and its child is the shim's
 # (kind, in CI); tests/v1340_runtime.c stands in for both, the node agent
-# held on another connection until the runtime is gone
-"$B/rt" "$B/s/a.sock" gone > "$B/rt.out" 2>&1; rrc=$?
-# (taken, its supervisor goes on to the bundle, which the stand-in has not,
-# and says so in the run's stream)
+# held on another connection until the runtime has ended. Ended but not yet
+# reaped (a zombie, its parent read): taken, its supervisor going on to the
+# bundle the stand-in lacks, and said in the node agent's log. Reaped
+# before it could be read (nothing then ties it to the process it names,
+# review): refused
+"$B/rt" "$B/s/a.sock" gone zombie > "$B/rt.out" 2>&1; rrc=$?
 for _ in $(seq 100); do cat "$B"/streams-a/gone.*.jsonl 2>/dev/null | grep -q 'container gone refused' && break; sleep 0.1; done
-check "a runtime that ended once it sent the state: its child, now its shim's, taken" sh -c \
+check "a runtime that ended once it sent the state, not yet reaped: its child taken" sh -c \
     "[ $rrc = 0 ] && cat '$B'/streams-a/gone.*.jsonl | grep -q 'container gone refused: cannot read the bundle'"
 check "... and the node agent's log says it was taken by the runtime's parent" \
-    grep -q "the runtime (pid [0-9]*) ended before it could be read; its container's process $(head -1 "$B/rt.out" 2>/dev/null) taken by" "$B/a.log"
+    grep -q "the runtime (pid [0-9]*) ended before it could be read; its container's process $(head -1 "$B/rt.out" 2>/dev/null) taken by the runtime's parent" "$B/a.log"
+"$B/rt" "$B/s/a.sock" reaped reaped > "$B/rt2.out" 2>&1; rrc2=$?
+for _ in $(seq 100); do grep -q 'was reaped before it could be read' "$B/a.log" && break; sleep 0.1; done
+check "a runtime reaped before it could be read: refused, and its child not taken" sh -c \
+    "[ $rrc2 = 0 ] && grep -q \"ended and was reaped before it could be read: nothing ties it to the process the state names ($(head -1 "$B/rt2.out" 2>/dev/null))\" '$B/a.log' && ! ls '$B'/streams-a/reaped.* > /dev/null 2>&1"
+# ended, its parent not where the runtime runs (another mount namespace):
+# what another root process's zombie would show; refused
+unshare -m "$B/rt" "$B/s/a.sock" elsewhere zombie > "$B/rt3.out" 2>&1; rrc3=$?
+for _ in $(seq 100); do grep -q "the runtime's process the peer leaves" "$B/a.log" && break; sleep 0.1; done
+check "a runtime that ended, its parent in another mount namespace: refused" sh -c \
+    "[ $rrc3 = 0 ] && grep -q \"the runtime's process the peer leaves (it ended before it could be read) (pid [0-9]*, rt) is not in the node's mount namespace\" '$B/a.log' && ! ls '$B'/streams-a/elsewhere.* > /dev/null 2>&1"
+# a peer sending a byte a second: let go at 5 s for the whole state (review:
+# 5 s a read let it hold the listener), and the next connection served
+python3 - "$B/s/a.sock" > "$B/slow.out" 2>&1 <<'PY'
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+t0 = time.monotonic()
+try:
+    for _ in range(12):
+        s.send(b"{")
+        time.sleep(1)
+except OSError:
+    pass
+print("held %.1f" % (time.monotonic() - t0))
+PY
+check "a peer sending a byte a second: let go within 5 s of the whole state" sh -c \
+    "awk '/^held/ { exit !(\$2 < 8) }' '$B/slow.out'"
 # a peer in another mount namespace, from its start
 python3 - "$B/s/a.sock" "$VICTIM" > "$B/peer.out" 2>&1 <<'PY'
 import ctypes, json, os, socket, sys
