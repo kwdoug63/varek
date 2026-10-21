@@ -109,3 +109,9 @@ jobs:
             --pubkey /tmp/ci_key/log.key.pub --sign-key /tmp/ci_key/log.key --output /tmp/ci_signed.json
           python3 varek/v1_4/tools/varek_cyclonedx.py --verify /tmp/ci_signed.json --pubkey /tmp/ci_key/log.key.pub
           python3 varek/v1_4/tests/cdx_schema_check.py /tmp/ci_bom.json /tmp/ci_signed.json
+      - name: v1.34 step 6 the Helm chart (lint, and each setting's render checked and against Kubernetes' schemas)
+        run: |
+          # the runner's helm (ubuntu-latest has one); kubeconform built pinned
+          helm version --short
+          GOBIN=/tmp/ci_bin go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7
+          KUBECONFORM=/tmp/ci_bin/kubeconform make -C varek/v1_4 test-varek-chart

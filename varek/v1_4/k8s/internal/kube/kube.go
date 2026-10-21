@@ -25,7 +25,7 @@ import (
 	"time"
 )
 
-// Group, version and resource of VAREK's policies (packaging/kubernetes/varekpolicy-crd.yaml)
+// Group, version and resource of VAREK's policies (packaging/helm/varek/crds/varekpolicy.yaml)
 const (
 	Group    = "varek.dev"
 	Version  = "v1alpha1"

@@ -1,0 +1,118 @@
+# SPDX-License-Identifier: MIT
+#
+# VAREK's chart (v1.34, docs/security/v1.34-kubernetes.md, section 3). Install
+# it into a namespace of its own that admits privileged pods (the node agent
+# is privileged on the node, as Falco or Tetragon are):
+#
+#   kubectl create namespace varek-system
+#   kubectl label namespace varek-system pod-security.kubernetes.io/enforce=privileged
+#   helm install varek oci://ghcr.io/kwdoug63/charts/varek -n varek-system
+#
+# A pod is then supervised when it names a VarekPolicy of its namespace with
+# the annotation varek.dev/policy: NAME.
+
+image:
+  repository: ghcr.io/kwdoug63/varek-node
+  # default: the chart's appVersion
+  tag: ""
+  # a digest (sha256:...) pins the image whatever its tag points at, and is
+  # what to give in production
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# The node's container runtime, which must let an NRI plugin set a
+# container's seccomp policy and command (NRI v0.10): containerd 2.2 or later
+# (EKS, kind), or CRI-O 1.35 or later (OpenShift). An earlier one is refused
+# by the plugin, which says so in its log.
+runtime: containerd        # containerd or cri-o
+
+nri:
+  # the runtime's NRI socket (both runtimes' default)
+  socket: /var/run/nri/nri.sock
+
+# Where things are on each node (hostPath). The node agent refuses a
+# policies' directory others can write and a socket directory others can
+# reach; the chart's init container makes them so.
+node:
+  policies: /var/lib/varek/policies     # POLICY_DIR/<namespace>/<name>.policy (the plugin's -sync)
+  streams: /var/log/varek               # the evidence: one stream a container, with its policy
+  socket: /run/varek-node               # the node agent's listener (the filters' listenerPath)
+  bin: /opt/varek/bin                   # the launcher the plugin binds at /varek/init
+  control: /run/varek                   # each run's control socket (varek revoke, on the node)
+  # the runtime's state, where each container's bundle is (read-only)
+  state:
+    containerd: /run/containerd
+    cri-o: /run/containers
+
+# D8: each container's stream signed with the node's key, a Secret holding
+# `key` (tools/varek_keygen's private key) and `key.pub`; "" signs nothing
+signing:
+  secretName: ""
+  # a checkpoint every this many records (the Warden's --checkpoint-every)
+  checkpointEvery: 256
+
+# D8: each run's checkpoints appended to the node's anchor, a file in the
+# streams' directory (forward it with tools/varek_anchor_forward.py)
+anchor:
+  enabled: false
+  file: anchor
+
+# D8: the streams exported as OCSF to the DaemonSet's log, which the
+# cluster's log collector takes (tools/varek_node_export.py)
+exporter:
+  enabled: true
+  resources:
+    requests: { cpu: 20m, memory: 64Mi }
+    limits: { memory: 512Mi }
+
+nodeAgent:
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 1Gi }
+  # extra arguments to the node agent (the Warden's options: --dns-server ...)
+  extraArgs: []
+
+plugin:
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { memory: 256Mi }
+
+nodeSelector:
+  kubernetes.io/os: linux
+# every node runs it, tainted ones too: a pod placed on a node without the
+# node agent is not supervised
+tolerations:
+  - operator: Exists
+priorityClassName: system-node-critical
+
+# D7: the admission webhook
+admission:
+  replicas: 2
+  # failurePolicy Fail: while the webhook is down, the pods and policies it
+  # checks are refused, not let in
+  failurePolicy: Fail
+  timeoutSeconds: 15
+  # namespaces whose pods are not checked (the chart's own is always one)
+  excludeNamespaces: [kube-system]
+  # the webhook's certificate: the chart makes a CA and a certificate and
+  # keeps them across upgrades; or name a kubernetes.io/tls Secret with
+  # ca.crt, or use cert-manager (an Issuer or ClusterIssuer of yours)
+  tls:
+    secretName: ""
+    # with secretName: the CA that signed its certificate (base64 PEM), when
+    # the Secret holds no ca.crt
+    caBundle: ""
+    certManager:
+      enabled: false
+      issuerKind: Issuer
+      issuerName: ""
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { memory: 256Mi }
+
+# OpenShift: a SecurityContextConstraints for the node agent's service
+# account (privileged, the node's PID namespace, host paths)
+openshift:
+  enabled: false

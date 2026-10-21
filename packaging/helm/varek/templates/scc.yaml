@@ -1,0 +1,33 @@
+{{/* SPDX-License-Identifier: MIT
+  OpenShift: the node agent's pod is privileged, in the node's PID namespace,
+  with host paths; this lets the chart's node service account (and no other)
+  run it. The webhook runs under restricted-v2, as the namespace's user (the
+  chart then sets no user for it). */}}
+{{- if .Values.openshift.enabled }}
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: {{ include "varek.nodeName" . }}
+  labels: {{- include "varek.labels" . | nindent 4 }}
+allowPrivilegedContainer: true
+allowPrivilegeEscalation: true
+allowHostPID: true
+allowHostDirVolumePlugin: true
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPorts: false
+# the init container's, to make the node's directories root's
+allowedCapabilities: [CHOWN, DAC_OVERRIDE, FOWNER]
+defaultAddCapabilities: []
+requiredDropCapabilities: []
+readOnlyRootFilesystem: false
+runAsUser: { type: RunAsAny }
+seLinuxContext: { type: RunAsAny }
+fsGroup: { type: RunAsAny }
+supplementalGroups: { type: RunAsAny }
+seccompProfiles: ["*"]
+# projected: the service account's token
+volumes: [hostPath, secret, emptyDir, projected, configMap, downwardAPI]
+users:
+  - system:serviceaccount:{{ .Release.Namespace }}:{{ include "varek.nodeName" . }}
+{{- end }}

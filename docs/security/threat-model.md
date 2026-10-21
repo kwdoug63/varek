@@ -961,7 +961,7 @@ are claimed as solved.
     in.
   - *Review.* v1.32.0 was reviewed by AI review agents, not by a human or
     third party. Its findings are listed in its release notes.
-- Kubernetes (v1.34.0, in progress: steps 1 to 5 built,
+- Kubernetes (v1.34.0, in progress: steps 1 to 6 built,
   `v1.34-kubernetes.md`):
   - *The pod's network, not an empty one* (D5). On a host the agent's
     network namespace is empty and the Warden dials every connect from its
@@ -992,7 +992,17 @@ are claimed as solved.
     granted as the cluster's RBAC grants any other. The admission webhook
     refuses a policy the Warden does not load; it does not judge one that
     loads.
-  - *Review.* Steps 1 to 5 have not yet been reviewed.
+  - *The chart's namespace is the node's* (step 6). The node agent is
+    privileged, in the node's PID namespace, with host paths, so whoever
+    may create pods in the chart's namespace, change its DaemonSet, or use
+    its OpenShift security context constraint is root on every node.
+    Whoever may write the node's policy directory, or the Secret holding
+    the node's signing key, decides policies or signs streams. The webhook
+    never checks the chart's own namespace (its pods must start while it
+    is down). With `failurePolicy: Fail`, while the webhook is down the
+    pods and policies it checks are refused, not let in. The chart pins
+    its image by the digest the release signed.
+  - *Review.* Steps 1 to 6 have not yet been reviewed.
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).
 - An agent may probe for SATISFIED-but-harmful actions near a policy boundary;

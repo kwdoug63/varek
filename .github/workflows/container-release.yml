@@ -19,6 +19,14 @@ name: Container release
 # version's tag is there unsigned, which `cosign verify` refuses, and
 # :<major.minor> and :latest have not moved; re-running the job builds,
 # signs and verifies a new digest, and the tag moves to it.
+#
+# v1.34 (step 6 of docs/security/v1.34-kubernetes.md): the node image (the
+# Containerfile's node target, what the Helm chart runs) is built, checked
+# (packaging/container/node_check.sh), published as
+# ghcr.io/kwdoug63/varek-node:<version>, signed and attested the same way;
+# then the chart (packaging/helm/varek), its image pinned by the digest just
+# signed, is packaged and published as oci://ghcr.io/kwdoug63/charts/varek,
+# version <version>, and signed. The chart's version must be the tag's.
 
 on:
   push:
@@ -37,6 +45,8 @@ jobs:
       id-token: write      # cosign keyless: the workflow's OIDC identity
     env:
       IMAGE: ghcr.io/${{ github.repository_owner }}/varek
+      NODE: ghcr.io/${{ github.repository_owner }}/varek-node
+      CHARTS: ghcr.io/${{ github.repository_owner }}/charts
       SETTINGS: >-
         --cap-drop ALL --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add SETPCAP
         --cap-add SETUID --cap-add SETGID --cap-add DAC_OVERRIDE --cap-add KILL
@@ -130,6 +140,66 @@ jobs:
           cosign verify --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$DIGEST" > /dev/null
           cosign verify-attestation --type cyclonedx --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$DIGEST" > /dev/null
           echo "verified: $DIGEST"
+      - name: Build the node image (v1.34, the Helm chart's)
+        run: |
+          docker build -f packaging/container/Containerfile --target node \
+            --label org.opencontainers.image.version="$VERSION" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            -t "$NODE:$VERSION" .
+      - name: Check it before publishing - each command the chart names runs, the launcher static, the Warden the tag's version
+        run: |
+          packaging/container/node_check.sh "$NODE:$VERSION"
+          docker run --rm "$NODE:$VERSION" varek version > node-version.txt
+          grep -qE "^VAREK Warden  ${RELEASE//./\\.}  " node-version.txt
+      - name: Publish the node image, sign it and attach its software bill of materials
+        run: |
+          docker push "$NODE:$VERSION"
+          node="$(docker inspect --format '{{index .RepoDigests 0}}' "$NODE:$VERSION")"
+          echo "NODE_DIGEST=$node" >> "$GITHUB_ENV"
+          echo "published $node as $VERSION"
+          cosign sign --yes "$node"
+          syft "$node" -o cyclonedx-json=sbom-node.cdx.json
+          cosign attest --yes --type cyclonedx --predicate sbom-node.cdx.json "$node"
+      - name: Install helm (pinned, built from source; its modules checked against Go's checksum database)
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install helm.sh/helm/v3/cmd/helm@v3.18.6
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Package the chart, its image pinned by the digest just signed
+        run: |
+          for f in version appVersion; do
+            v="$(helm show chart packaging/helm/varek | sed -n "s/^$f: //p" | tr -d '"')"
+            [ "$v" = "$VERSION" ] || { echo "the chart's $f is $v, the tag's version $VERSION"; exit 1; }
+          done
+          cp -r packaging/helm/varek "$RUNNER_TEMP/varek"
+          d="${NODE_DIGEST#*@}"
+          sed -i "s|^  digest: \"\"\$|  digest: \"$d\"|" "$RUNNER_TEMP/varek/values.yaml"
+          grep -qx "  digest: \"$d\"" "$RUNNER_TEMP/varek/values.yaml"
+          helm lint --strict "$RUNNER_TEMP/varek"
+          helm template t "$RUNNER_TEMP/varek" --kube-version 1.31.0 > chart-render.yaml
+          grep -q "image: $NODE@$d" chart-render.yaml
+          helm package "$RUNNER_TEMP/varek" -d "$RUNNER_TEMP/chart"
+      - name: Publish the chart and sign it
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          printf '%s' "$TOKEN" | helm registry login ghcr.io -u "$ACTOR" --password-stdin
+          helm push "$RUNNER_TEMP/chart/varek-$VERSION.tgz" "oci://$CHARTS" 2>&1 | tee chart-push.txt
+          d="$(sed -n 's/^Digest: //p' chart-push.txt)"
+          [ -n "$d" ] || { echo "helm push gave no digest"; exit 1; }
+          echo "CHART_DIGEST=$CHARTS/varek@$d" >> "$GITHUB_ENV"
+          cosign sign --yes "$CHARTS/varek@$d"
+      - name: Verify the node image, its attestation and the chart, as a user would
+        env:
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+        run: |
+          id="https://github.com/$REPO/.github/workflows/container-release.yml@$REF"
+          iss=https://token.actions.githubusercontent.com
+          cosign verify --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$NODE_DIGEST" > /dev/null
+          cosign verify-attestation --type cyclonedx --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$NODE_DIGEST" > /dev/null
+          cosign verify --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$CHART_DIGEST" > /dev/null
+          echo "verified: $NODE_DIGEST $CHART_DIGEST"
       - name: Move the major.minor tag and latest, once signed (not for a pre-release)
         if: env.PRERELEASE == ''
         run: |
@@ -138,11 +208,15 @@ jobs:
           [ "$(grep -F "v$MINOR." <<<"$rels" | tail -1)" = "v$VERSION" ] && tags+=("$MINOR")
           [ "$(tail -1 <<<"$rels")" = "v$VERSION" ] && tags+=(latest)
           for t in "${tags[@]}"; do
-            docker tag "$IMAGE:$VERSION" "$IMAGE:$t"
-            docker push "$IMAGE:$t"
+            for i in "$IMAGE" "$NODE"; do
+              docker tag "$i:$VERSION" "$i:$t"
+              docker push "$i:$t"
+            done
           done
           echo "moved: ${tags[*]:-none} (a newer release holds the rest)"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: sbom-${{ env.VERSION }}
-          path: sbom.cdx.json
+          path: |
+            sbom.cdx.json
+            sbom-node.cdx.json

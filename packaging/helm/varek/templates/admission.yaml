@@ -1,0 +1,178 @@
+{{/* SPDX-License-Identifier: MIT
+  The admission webhook (D7): the API server sends it every VarekPolicy
+  created or changed and every pod created, and it refuses what the Warden
+  does not load or the node agent would refuse at the container's start. */}}
+{{- $name := include "varek.admissionName" . -}}
+{{- $svc := printf "%s.%s.svc" $name .Release.Namespace -}}
+{{- $secret := .Values.admission.tls.secretName | default (printf "%s-tls" $name) -}}
+{{- $ca := "" -}}
+{{- if and (not .Values.admission.tls.secretName) (not .Values.admission.tls.certManager.enabled) }}
+{{- /* the chart's own CA and certificate, kept across upgrades */ -}}
+{{- $old := lookup "v1" "Secret" .Release.Namespace $secret -}}
+{{- $crt := "" -}}{{- $key := "" -}}
+{{- if and $old (index $old.data "ca.crt") }}
+{{- $ca = index $old.data "ca.crt" -}}
+{{- $crt = index $old.data "tls.crt" -}}
+{{- $key = index $old.data "tls.key" -}}
+{{- else }}
+{{- $caObj := genCA "varek-admission-ca" 3650 -}}
+{{- $cert := genSignedCert $svc nil (list $name (printf "%s.%s" $name .Release.Namespace) $svc) 3650 $caObj -}}
+{{- $ca = $caObj.Cert | b64enc -}}
+{{- $crt = $cert.Cert | b64enc -}}
+{{- $key = $cert.Key | b64enc -}}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secret }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "varek.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  ca.crt: {{ $ca }}
+  tls.crt: {{ $crt }}
+  tls.key: {{ $key }}
+---
+{{- else if .Values.admission.tls.certManager.enabled }}
+{{- if not .Values.admission.tls.certManager.issuerName }}{{ fail "admission.tls.certManager.issuerName: name the cert-manager Issuer" }}{{ end }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "varek.labels" . | nindent 4 }}
+spec:
+  secretName: {{ $secret }}
+  dnsNames: [{{ $name }}, {{ printf "%s.%s" $name .Release.Namespace }}, {{ $svc }}]
+  issuerRef:
+    kind: {{ .Values.admission.tls.certManager.issuerKind }}
+    name: {{ .Values.admission.tls.certManager.issuerName }}
+---
+{{- else }}
+{{- /* a Secret of the operator's: its ca.crt, or the CA given as a value */ -}}
+{{- $given := lookup "v1" "Secret" .Release.Namespace $secret -}}
+{{- if and $given (index $given.data "ca.crt") }}{{ $ca = index $given.data "ca.crt" }}
+{{- else if .Values.admission.tls.caBundle }}{{ $ca = .Values.admission.tls.caBundle }}
+{{- else }}{{ fail (printf "admission.tls.secretName %s: it holds no ca.crt (or does not exist yet): give admission.tls.caBundle, the CA that signed its certificate (base64 PEM)" $secret) }}
+{{- end -}}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "varek.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admission
+spec:
+  replicas: {{ .Values.admission.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: admission
+  template:
+    metadata:
+      labels:
+        {{- include "varek.labels" . | nindent 8 }}
+        app.kubernetes.io/component: admission
+    spec:
+      serviceAccountName: {{ $name }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        {{- if not .Values.openshift.enabled }}
+        # on OpenShift, restricted-v2 gives the namespace's user
+        runAsUser: 65532
+        runAsGroup: 65532
+        {{- end }}
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: admission
+          image: {{ include "varek.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /opt/varek/varek-admission
+            - -warden
+            - /opt/varek/warden
+            - -tls-cert
+            - /tls/tls.crt
+            - -tls-key
+            - /tls/tls.key
+            - -listen
+            - :8443
+          ports:
+            - { name: https, containerPort: 8443 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: https, scheme: HTTPS }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources: {{- toYaml .Values.admission.resources | nindent 12 }}
+          volumeMounts:
+            - { name: tls, mountPath: /tls, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tls
+          secret: { secretName: {{ $secret }} }
+        - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 64Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "varek.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: admission
+  ports:
+    - { name: https, port: 443, targetPort: https }
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: {{ $name }}
+  labels: {{- include "varek.labels" . | nindent 4 }}
+  {{- if .Values.admission.tls.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/{{ $name }}
+  {{- end }}
+webhooks:
+  {{- $excluded := concat (list .Release.Namespace) .Values.admission.excludeNamespaces | uniq }}
+  {{- range $hook := list (dict "name" "varekpolicy" "path" "/varekpolicy") (dict "name" "pod" "path" "/pod") (dict "name" "pod-required" "path" "/pod-required") }}
+  - name: {{ $hook.name }}.varek.dev
+    {{- if eq $hook.name "varekpolicy" }}
+    rules:
+      - apiGroups: ["varek.dev"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["varekpolicies"]
+    {{- else }}
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+    namespaceSelector:
+      matchExpressions:
+        - key: varek.dev/policy-required
+          operator: {{ if eq $hook.name "pod" }}NotIn{{ else }}In{{ end }}
+          values: ["true"]
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: {{ toJson $excluded }}
+    {{- end }}
+    clientConfig:
+      service: { name: {{ $name }}, namespace: {{ $.Release.Namespace }}, path: {{ $hook.path }}, port: 443 }
+      {{- if not $.Values.admission.tls.certManager.enabled }}
+      caBundle: {{ $ca }}
+      {{- end }}
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: {{ $.Values.admission.failurePolicy }}
+    timeoutSeconds: {{ $.Values.admission.timeoutSeconds }}
+  {{- end }}

@@ -22,7 +22,8 @@ elif command -v dnf >/dev/null 2>&1; then
     build)
         dnf -y -q install epel-release dnf-plugins-core
         dnf config-manager --set-enabled crb
-        dnf -y -q install gcc make libseccomp-devel libsodium-devel openssl-devel python3 ;;
+        # glibc-static (CodeReady Builder): the launcher, varek-init, is static (v1.34)
+        dnf -y -q install gcc make libseccomp-devel libsodium-devel openssl-devel python3 glibc-static ;;
     test) echo "deps.sh: the test stage is Ubuntu's (see the Containerfile)" >&2; exit 2 ;;
     runtime) dnf -y -q install libseccomp libsodium openssl-libs python3 ;;
     esac

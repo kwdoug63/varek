@@ -329,18 +329,19 @@ static bool node_alive(int pidfd) {
     return syscall(__NR_pidfd_send_signal, pidfd, 0, NULL, 0) == 0;
 }
 
-/* Whether a process shares the node agent's namespace of that kind */
-static bool node_same_ns(pid_t pid, const char *ns) {
+/* Whether a process is in the namespace of that kind of `of` ("self", or
+ * "1": the node's init) */
+static bool node_same_ns(pid_t pid, const char *ns, const char *of) {
     struct stat a, b;
-    return proc_statf(&a, "%d/ns/%s", pid, ns) == 0 && proc_statf(&b, "self/ns/%s", ns) == 0 &&
+    return proc_statf(&a, "%d/ns/%s", pid, ns) == 0 && proc_statf(&b, "%s/ns/%s", of, ns) == 0 &&
            a.st_dev == b.st_dev && a.st_ino == b.st_ino;
 }
 
 /* A connection the listener takes, checked before a supervisor is forked
  * for it (review: through step 2 any root peer could name any process, to
  * have it killed, or supervised in its place): the peer is root, in the
- * node agent's own user, PID and mount namespaces (the runtime, on the
- * node); the state is well formed and names a process whose parent is the
+ * node agent's own user and PID namespaces and in its mount namespace or
+ * the node's (the runtime, on the node); the state is well formed and names a process whose parent is the
  * peer (runc's init is its runtime's child; crun's is not yet tested); the
  * descriptor is a seccomp listener, and that process is under a filter.
  * 0 with the process's pid and pidfd, or -1 with why. */
@@ -353,13 +354,24 @@ static int node_admit(int c, const char *doc, size_t n, int fd, pid_t *pid, int 
         return -1;
     }
     if (cr.uid != 0) { snprintf(why, wn, "the peer (pid %d) is not root (uid %u)", (int)cr.pid, (unsigned)cr.uid); return -1; }
-    static const char *const kNs[] = { "user", "pid", "mnt" };
+    static const char *const kNs[] = { "user", "pid" };
     for (size_t i = 0; i < sizeof kNs / sizeof kNs[0]; i++)
-        if (!node_same_ns(cr.pid, kNs[i])) {
+        if (!node_same_ns(cr.pid, kNs[i], "self")) {
             snprintf(why, wn, "the peer (pid %d) is not in the node agent's %s namespace (not the node's runtime)",
                      (int)cr.pid, kNs[i]);
             return -1;
         }
+    /* v1.34 step 6: the mount namespace the node agent's own, or the node's
+     * (its init's): in the chart's DaemonSet the node agent runs in a pod's
+     * (with the node's PID and user namespaces), the runtime in the node's;
+     * on a host the two are one (and where the node's init cannot be read,
+     * as in some sandboxes, the node agent's own is the node's). In the pod
+     * no other process shares the node agent's own: each container has one. */
+    if (!node_same_ns(cr.pid, "mnt", "self") && !node_same_ns(cr.pid, "mnt", "1")) {
+        snprintf(why, wn, "the peer (pid %d) is not in the node's mount namespace nor the node agent's (not the node's runtime)",
+                 (int)cr.pid);
+        return -1;
+    }
     char ln[64];
     ssize_t k = proc_readlinkf(ln, sizeof ln - 1, "self/fd/%d", fd);
     if (k < 0 || (ln[k] = '\0', strcmp(ln, "anon_inode:seccomp notify"))) {
