@@ -45,6 +45,12 @@ import tempfile
 
 import z3 as smt  # the reference SMT solver; see tools/requirements-crosscheck.txt
 
+# z3 4.x times out on the regex queries (each a disagreement): refused, by name
+if smt.get_version()[0] < 5:
+    sys.exit(f"smt_crosscheck: z3 {smt.get_version_string()} is too old: the cross-check needs z3 5.0 or "
+             "later (tools/requirements-crosscheck.txt; on aarch64 with glibc before 2.38, as RHEL 9, "
+             "pip builds it from source: it needs gcc-c++ and cmake)")
+
 L = 4095
 KNOWN = 0x007FFFC3
 ACC = 0o3

@@ -14,7 +14,8 @@
 #   1. the Warden reports 1.31.1;
 #   2. asyncio's default event loop runs; on x86_64, epoll_create(2),
 #      epoll_wait(2) and pipe(2) are admitted;
-#   3. bash starts and runs a command substitution; getpgrp(2) is admitted.
+#   3. bash starts and runs a command substitution; getpgrp(2) is admitted,
+#      and getpgid(0), which glibc calls for getpgrp() on arm64 (v1.33).
 #
 #   test_v1311.sh VDP_CHECK VDP_CERT_CHECK WARDEN
 set -u
@@ -55,6 +56,10 @@ if platform.machine() == "x86_64":
     fds = (ctypes.c_int * 2)()
     print("pipe", "ok" if libc.syscall(22, fds) == 0 else ctypes.get_errno(), flush=True)
     print("getpgrp", "ok" if libc.syscall(111) > 0 else ctypes.get_errno(), flush=True)
+# v1.33: getpgid(0), which glibc's getpgrp() calls on arm64 (no getpgrp there)
+nr = {"x86_64": 121, "aarch64": 155}.get(platform.machine())
+if nr:
+    print("getpgid0", "ok" if libc.syscall(nr, 0) > 0 else ctypes.get_errno(), flush=True)
 PY
     chmod 644 "$W/agent.py"
     BASE='allow path /usr/ readonly\nallow path /lib readonly\nallow path /lib64 readonly\nallow path exact /etc/ld.so.cache readonly\n'
@@ -75,12 +80,23 @@ PY
             check "pipe(2) is admitted, as pipe2 is ($what)" said "pipe ok"
             check "getpgrp(2) is admitted ($what)" said "getpgrp ok"
         fi
+        case "$(uname -m)" in x86_64|aarch64)
+            check "getpgid(0), glibc's getpgrp() on arm64, is admitted ($what)" said "getpgid0 ok" ;;
+        esac
         echo "== 3. under $what: bash =="
         # shellcheck disable=SC2016,SC2086
         env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$W/p$v.txt" $as -- /bin/bash -c 'x=$(echo sub); echo "bash $x"' \
             > "$OUT/b$v.out" 2> "$OUT/b$v.log"
         check "bash starts and runs a command substitution ($what)" grep -qx "bash sub" "$OUT/b$v.out"
     done
+    case "$(uname -m)" in x86_64) NR=121 ;; aarch64) NR=155 ;; *) NR="" ;; esac
+    if [ -n "$NR" ]; then
+        echo "== 4. a dry run of a policy with no require line: getpgid(0) =="
+        env -i PATH=/usr/bin:/bin timeout 60 "$WARDEN" "$W/p127.txt" --dry-run -- /usr/bin/python3 "$W/agent.py" \
+            > "$OUT/d127.out" 2> "$OUT/d127.log"
+        check "getpgid(0) is admitted in a dry run, as when enforcing" grep -qx "getpgid0 ok" "$OUT/d127.out"
+        check "... and not recorded as a call the policy refuses" sh -c "! grep -q '\"syscall:$NR\"' '$OUT/d127.log'"
+    fi
     [ "$(uname -m)" = x86_64 ] || skip "epoll_create(2), epoll_wait(2), pipe(2) and getpgrp(2) by number (x86_64 only: arm64 has none of them)"
 fi
 

@@ -632,7 +632,7 @@ else
                 elif grep -qF -- "$4" "$OUT/f.out"; then pass "the audit refuses $1"
                 else flunk "the audit refuses $1 ($(grep -m1 PROBLEM "$OUT/f.out"))"; fi; }
     check "the audit reports whom the run was for, and each sub-agent's decisions" sh -c \
-        "python3 '$AUD' --policy '$B/pu.txt' --checker '$CERT' '$OUT/user.out' | grep -q 'chain: on behalf of alice@example.test ($ISS); sub-agents (decisions): alpha#1 [0-9]'"
+        "python3 '$AUD' --policy '$B/pu.txt' --checker '$CERT' '$OUT/user.out' | grep -q 'chain: on behalf of alice@example.test ($ISS); sub-agents: alpha 1 launch, [0-9][0-9]* decision'"
     python3 "$F" "$OUT/user.out" "$OUT/g1.log" "$RS; rs['on_behalf_of']['user']['issuer'] = 'https://idp.elsewhere.test'"
     refuses "a user vouched for by an issuer the policy does not trust" "$B/pu.txt" "$OUT/g1.log" "an issuer the policy does not trust"
     python3 "$F" "$OUT/user.out" "$OUT/g2.log" "$RS; rs['on_behalf_of']['user']['verified'] = False"

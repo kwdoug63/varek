@@ -246,3 +246,45 @@ def test_a_user_whose_home_is_root_gets_no_home_rules():
         t = b.generate("/srv/proj", pw, "/tmp/varek-65534", p)
         assert "//" not in "\n".join(l.split("#")[0] for l in t.splitlines() if not l.startswith("#")), name
     assert b.policy_home(pwd.struct_passwd(("u", "x", 1000, 1000, "", "/home/u/", "/bin/sh"))) == "/home/u"
+
+
+def test_suggest_names_arm64s_system_calls_from_the_generic_table():
+    """v1.33.0 review: arm64's names came from <asm-generic/unistd.h> with
+    its conditional blocks ignored, so 84 read as sync_file_range2 (for
+    architectures that want it) and 244 as arch_specific_syscall (a marker,
+    no call). The blocks are followed for what arm64 defines."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
+    try:
+        import varek_suggest as s
+    finally:
+        sys.path.pop(0)
+    t = "\n".join([
+        "#define __NR3264_fstat 80",
+        "#ifdef __ARCH_WANT_SYNC_FILE_RANGE2",
+        "#define __NR_sync_file_range2 84",
+        "#else",
+        "#define __NR_sync_file_range 84",
+        "#endif",
+        "#ifdef __ARCH_WANT_RENAMEAT",
+        "#define __NR_renameat 38",
+        "#endif",
+        "#ifndef __ARCH_WANT_NEW_STAT",
+        "#define __NR_oldstat 999",
+        "#endif",
+        "#define __NR_arch_specific_syscall 244",
+        "#if defined(__ARCH_WANT_TIME32_SYSCALLS) || __BITS_PER_LONG != 32",
+        "#define __NR_wait4 260",
+        "#endif",
+        "#if __BITS_PER_LONG == 64 && !defined(__SYSCALL_COMPAT)",
+        "#define __NR_fstat __NR3264_fstat",
+        "#else",
+        "#define __NR_fstat64 __NR3264_fstat",
+        "#endif",
+        "#undef __NR_syscalls",
+        "#define __NR_syscalls 462",
+    ])
+    n = s._generic_syscall_names(t, s.ARM64_WANTS)
+    assert n == {84: "sync_file_range", 38: "renameat", 260: "wait4", 80: "fstat"}
+    if os.path.exists("/usr/include/asm-generic/unistd.h"):
+        real = s._syscall_names("aarch64")
+        assert real[84] == "sync_file_range" and 244 not in real and real[79] == "newfstatat" and real[80] == "fstat"

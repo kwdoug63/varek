@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
+# provision.sh — v1.30 (docs/security/v1.30-macos.md, step 4): set up the
+# guest VAREK runs in on a Mac. Run as root inside the VM by `varek vm init`,
+# with a copy of the VAREK checkout in SRC (sent over ssh):
+#
+#   provision.sh SRC
+#
+# The guest: RHEL 9.6 or later on aarch64, registered (subscription-manager)
+# or a cloud's own RHEL image (its repositories from the cloud's RHUI), or a
+# rebuild of it (AlmaLinux, Rocky Linux) or CentOS Stream 9. It installs
+# what the Warden needs to build (libsodium from EPEL), builds it from a copy
+# of SRC in /opt/varek-src, installs it (make install: /opt/varek, varek in
+# /usr/bin), makes sure Landlock is on, and runs varek doctor.
+set -euo pipefail
+SRC="${1:?usage: provision.sh SRC}"
+say() { printf '[provision] %s\n' "$*"; }
+die() { printf '[provision] %s\n' "$*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || die "run as root"
+. /etc/os-release
+MAJOR="${VERSION_ID%%.*}" MINOR="${VERSION_ID#*.}"; [ "$MINOR" = "$VERSION_ID" ] && MINOR=0
+[ "$MAJOR" = 9 ] || die "$PRETTY_NAME: the guest must be RHEL 9 or a rebuild of it"
+[ "$(uname -m)" = aarch64 ] || say "note: this guest is $(uname -m), not aarch64"
+case "$ID" in
+    rhel)
+        [ "$MINOR" -ge 6 ] || die "$PRETTY_NAME: RHEL 9.6 or later is needed (Landlock)"
+        dnf -y install dnf-plugins-core
+        if dnf -q repolist --all 2>/dev/null | grep -q rhui; then
+            # a cloud's own RHEL image (AWS's, billed by the hour): its packages
+            # come from Red Hat's update servers in that cloud, not a subscription
+            CRB="$(dnf -q repolist --all | awk '/codeready-builder/ && /rhui/ && !/debug|source/ {print $1; exit}')"
+            [ -n "$CRB" ] || die "no CodeReady Builder repository among the cloud's (dnf repolist --all)"
+            dnf config-manager --set-enabled "$CRB"
+        else
+            subscription-manager status > /dev/null 2>&1 || die "the guest is not registered: sudo subscription-manager register"
+            subscription-manager repos --enable "codeready-builder-for-rhel-9-$(uname -m)-rpms"
+        fi ;;
+    almalinux|rocky|centos)
+        dnf -y install dnf-plugins-core
+        dnf config-manager --set-enabled crb ;;
+    *) die "$PRETTY_NAME is not RHEL 9 or a rebuild of it" ;;
+esac
+
+say "packages"
+dnf -y install gcc make git tar python3 libseccomp-devel openssl-devel
+# libsodium (the Warden's Ed25519 signatures) is in EPEL, not RHEL. EPEL's
+# key is the one kept with this file (RPM-GPG-KEY-EPEL-9, fingerprint FF8A
+# D134 4597 106E CE81 3B91 8A38 72BF 3228 467C), imported first, so
+# epel-release is installed only signed by it (dnf does not check a package
+# given by its URL), and every EPEL package after it is checked by it
+if ! rpm -q epel-release > /dev/null 2>&1; then
+    KEY="$SRC/varek/v1_4/packaging/vm/RPM-GPG-KEY-EPEL-9"
+    FPR="$(gpg --show-keys --with-colons "$KEY" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }')"
+    [ "$FPR" = FF8AD1344597106ECE813B918A3872BF3228467C ] || die "the EPEL key kept with this file is not EPEL 9's ($FPR)"
+    rpm --import "$KEY"
+    rpm -q gpg-pubkey-3228467c > /dev/null || die "EPEL 9's key did not import"
+    T="$(mktemp -d)"
+    curl -fsSL -o "$T/epel-release.rpm" https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+    # signed, and by that key (rpm -K alone accepts any key imported)
+    rpm -Kv "$T/epel-release.rpm" | grep -Eqi 'signature.*key id 3228467c: ok' || die "epel-release is not signed by EPEL 9's key"
+    rpm -K "$T/epel-release.rpm" | grep -q 'digests signatures OK$' || die "epel-release's digests or signatures do not check"
+    dnf -y install "$T/epel-release.rpm"
+    rm -rf "$T"
+fi
+dnf -y install libsodium-devel
+
+say "the Warden, from $SRC"
+rm -rf /opt/varek-src.new
+mkdir -p /opt/varek-src.new
+tar -C "$SRC" --exclude=./.git -cf - . | tar -C /opt/varek-src.new -xf -
+rm -rf /opt/varek-src && mv /opt/varek-src.new /opt/varek-src
+make -C /opt/varek-src/varek/v1_4 clean > /dev/null 2>&1 || true
+make -C /opt/varek-src/varek/v1_4 all
+# varek in /usr/bin: RHEL's sudo (secure_path) and root's shell leave
+# /usr/local/bin out, and the Mac runs `sudo varek run` inside
+make -C /opt/varek-src/varek/v1_4 install BINDIR=/usr/bin
+
+# Landlock: on by default from RHEL 9.6; if the kernel's LSM list lacks it,
+# add it (takes effect at the next boot)
+mkdir -p /var/lib/varek-vm
+if ! grep -qw landlock /sys/kernel/security/lsm 2>/dev/null; then
+    say "Landlock is not in the kernel's LSM list: adding it (at the next boot)"
+    grubby --update-kernel=ALL --args="lsm=$(cat /sys/kernel/security/lsm),landlock"
+    touch /var/lib/varek-vm/reboot-needed
+fi
+
+say "varek doctor"
+/usr/bin/varek doctor || say "varek doctor reported a problem (above)"
+date -u +%Y-%m-%dT%H:%M:%SZ > /var/lib/varek-vm/provisioned
+say "done"

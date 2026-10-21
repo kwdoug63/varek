@@ -23,6 +23,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <time.h>
+#include <stddef.h>
 #include <unistd.h>
 
 static int cmp(const void *a, const void *b) {

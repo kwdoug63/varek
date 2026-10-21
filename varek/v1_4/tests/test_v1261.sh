@@ -1124,9 +1124,12 @@ PY
 import hashlib, socket, ssl, sys, threading
 ip, port, cert, key, log = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+def cut_eof(e):   # Python 3.9 with OpenSSL 3 (RHEL 9) names an unexpected EOF SSLError, later ones SSLEOFError
+    return isinstance(e, ssl.SSLEOFError) or getattr(e, "reason", "") == "UNEXPECTED_EOF_WHILE_READING"
 def note(t):
     with open(log, "a") as f: f.write(t + "\n")
 def serve(c):
+    path, buf = "-", b""
     try:
         s = ctx.wrap_socket(c, server_side=True)
         buf = b""
@@ -1143,15 +1146,22 @@ def serve(c):
                 return
             if path in ("/raw", "/part"):   # what follows the head, to the connection's end
                 while True:
-                    d = s.recv(65536)
+                    try:
+                        d = s.recv(65536)
+                    except ssl.SSLError as e:
+                        if not cut_eof(e): raise
+                        d = b""
+                    except ConnectionResetError:   # a cut may still end in a reset
+                        note(f"RESET {path} {len(buf)}")
+                        d = b""
                     if not d: break
                     buf += d
                 note(f"RAW {path} {len(buf)} {hashlib.sha256(buf).hexdigest()}")
                 return
             note(f"GOT {path}")
             s.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-    except (OSError, ssl.SSLError):
-        pass
+    except (OSError, ssl.SSLError) as e:   # what ended it, for a check that fails
+        note(f"ERR {path} {len(buf)} {type(e).__name__} {getattr(e, 'reason', '') or e}")
 l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); l.bind((ip, port)); l.listen(16)
 while True:
     c, _ = l.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
@@ -1166,6 +1176,9 @@ import hashlib, os, socket, ssl, sys, time
 XP, CP = int(sys.argv[1]), int(sys.argv[2])
 H = "api.example.com"
 ctx = ssl.create_default_context()
+# RHEL's Python sets OP_IGNORE_UNEXPECTED_EOF by default, so a cut TLS reads
+# as a clean close whatever the proxy sends: this agent wants to see a cut
+ctx.options &= ~getattr(ssl, "OP_IGNORE_UNEXPECTED_EOF", 0)
 def conn(port=None):
     return ctx.wrap_socket(socket.create_connection((H, port or XP), 10), server_hostname=H,
                            suppress_ragged_eofs=False)
@@ -1178,7 +1191,8 @@ def reads(s):
             if not d: return out, "clean"
             out += d
     except (OSError, ssl.SSLError) as e:
-        return out, type(e).__name__
+        cut = isinstance(e, ssl.SSLError) and getattr(e, "reason", "") == "UNEXPECTED_EOF_WHILE_READING"
+        return out, "SSLEOFError" if cut else type(e).__name__   # Python 3.9 + OpenSSL 3: SSLError
 # a server that drops its connection without close_notify: the agent must see it
 s = conn(); s.sendall(b"GET /trunc HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % H.encode())
 out, how = reads(s); print("TRUNC", how, out.split(b"\r\n\r\n")[-1].decode(), flush=True)
@@ -1234,7 +1248,7 @@ PY
     if grep -q "^RAW /raw 100 $CUTSHA$" "$OUT/rv.log" &&
        rvrec '"event":"request_body"' "\"body_len\":100,\"body_sha256\":\"$CUTSHA\",\"exceeded_max_body\":true"
     then pass "a chunked body cut at max_body: the server gets what was let through, the bytes and SHA-256 recorded"
-    else flunk "a chunked body cut at max_body ($(grep RAW "$OUT/rv.log"))"; fi
+    else flunk "a chunked body cut at max_body ($(grep -E '^(RAW|ERR) ' "$OUT/rv.log" | tr '\n' ' '))"; fi
     if vhave "HALF HTTP/1.1 200 OK"
     then pass "an agent that half-closes after its request still gets the answer"
     else flunk "a half-closing agent's answer ($(grep HALF "$OUT/rv.out"))"; fi

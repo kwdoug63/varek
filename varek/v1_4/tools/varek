@@ -43,6 +43,8 @@ import varek_license  # noqa: E402
 import varek_bench  # noqa: E402
 import varek_baseline  # noqa: E402
 import varek_suggest  # noqa: E402
+import varek_vm  # noqa: E402
+
 import varek_container  # noqa: E402  (v1.32)
 
 CLI_VERSION = "1.3.0"
@@ -519,8 +521,8 @@ def mount_ns_ok():
 def landlock_abi():
     """v1.27: (the Landlock ABI, "") or (0, why), probed as the Warden does
     (landlock_create_ruleset with LANDLOCK_CREATE_RULESET_VERSION)."""
-    if platform.system() != "Linux" or platform.machine() != "x86_64":
-        return 0, "not Linux on x86_64"
+    if platform.system() != "Linux" or platform.machine() not in ("x86_64", "aarch64"):
+        return 0, "not Linux on x86_64 or arm64"
     import ctypes
     libc = ctypes.CDLL(None, use_errno=True)
     libc.syscall.restype = ctypes.c_long
@@ -612,10 +614,10 @@ def cmd_doctor(args):
     info("VAREK doctor: is this host ready to run the Warden?\n")
     bad = 0
 
-    if platform.system() == "Linux" and platform.machine() == "x86_64":
-        ok(f"Linux x86_64 ({platform.release()})")
+    if platform.system() == "Linux" and platform.machine() in ("x86_64", "aarch64"):
+        ok(f"Linux {platform.machine()} ({platform.release()})")
     else:
-        fail(f"{platform.system()} {platform.machine()}: the Warden needs Linux on x86_64")
+        fail(f"{platform.system()} {platform.machine()}: the Warden needs Linux on x86_64 or arm64 (aarch64)")
         bad += 1
 
     m = re.match(r"(\d+)\.(\d+)", platform.release())
@@ -2734,11 +2736,31 @@ def build_parser():
 
     add("license", cmd_license, "check the VAREK Enterprise subscription (AWS Marketplace)")
     add("version", cmd_version, "show the varek command and Warden versions")
+    # v1.30: on a Mac, the Linux VM VAREK runs in
+    varek_vm.add_parser(sub).set_defaults(fn=cmd_vm)
     return p
+
+
+def cmd_vm(args):
+    try:
+        return args.vm_func(args)
+    except varek_vm.VmError as e:
+        raise CliError(str(e), fix=e.fix)
 
 
 def main(argv=None):
     global SHOW_COMMANDS
+    raw = sys.argv[1:] if argv is None else list(argv)
+    # v1.30: on a Mac, `varek run` (and `varek vm run`) runs inside the VM,
+    # its arguments passed through as they are
+    if raw[:2] == ["vm", "run"] or (raw[:1] == ["run"] and platform.system() == "Darwin"):
+        try:
+            return varek_vm.cmd_run(argparse.Namespace(args=raw[2:] if raw[0] == "vm" else raw[1:]))
+        except varek_vm.VmError as e:
+            print(f"varek: {e}", file=sys.stderr)
+            if e.fix:
+                print(f"  fix: {e.fix}", file=sys.stderr)
+            return 2
     p = build_parser()
     args = p.parse_args(argv)
     SHOW_COMMANDS = args.show_commands

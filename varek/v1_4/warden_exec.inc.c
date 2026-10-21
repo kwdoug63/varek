@@ -488,7 +488,7 @@ static int exec_ruleset_build(const struct policy *p, const char *boot_path) {
         bool wr = false;
         for (size_t w = 0; w < sizeof kW / sizeof kW[0] && !wr; w++)
             for (size_t sj = 0; sj <= p->v.nsubjects && !wr; sj++)
-                wr = vdp_decide_subj(&p->v, (int)sj, VDP_KIND_PATH, f->path, kW[w], true, NULL, NULL) == VDP_SATISFIED;
+                wr = vdp_decide_subj(&p->v, (int)sj, VDP_KIND_PATH, f->path, vdp_oflags_from_native(kW[w]), true, NULL, NULL) == VDP_SATISFIED;
         if (wr)
             fprintf(stderr, "[warden] note: launch set: %s (%s) may be both launched and written by "
                     "the agent: a launch runs the file as it is then, not as hashed now\n",
