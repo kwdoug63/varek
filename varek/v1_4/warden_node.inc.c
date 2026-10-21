@@ -417,10 +417,11 @@ static void node_peer_read(int c, struct node_peer *p) {
  * parent is the peer (runc's init is its runtime's child; crun's is not yet
  * tested) or the peer's parent (the runtime ended, its child reparented to
  * the shim); the descriptor is a seccomp listener, and that process is under
- * a filter. A peer that ended before it could be read: the process's parent
- * (the shim) is root and runs where the runtime does, and is the peer's
- * parent where that was read. 0 with the process's pid and pidfd, or -1
- * with why. */
+ * a filter. A peer that ended before it could be read, or while it was: the
+ * process's parent is the peer (still ending) or the peer's parent, and the
+ * peer's parent where read (else the process's), the shim, is root and runs
+ * where the runtime does. 0 with the process's pid and pidfd, or -1 with
+ * why. */
 static int node_admit(const struct node_peer *peer, const char *doc, size_t n, int fd, pid_t *pid, int *pidfd,
                       char *why, size_t wn) {
     *pidfd = -1;
@@ -452,20 +453,26 @@ static int node_admit(const struct node_peer *peer, const char *doc, size_t n, i
             goto fail;
         }
     } else {
-        if (peer->ppid > 0 && pp != peer->ppid) {
+        /* the peer ended before it could be read, or while it was: the
+         * process's parent is the peer, still ending (its children not yet
+         * reparented), or the peer's parent (the shim, the process now its);
+         * the peer's parent, where read, else the process's, checked as the
+         * runtime */
+        long rt = peer->ppid > 0 ? peer->ppid : pp;
+        if (pp != (long)peer->pid && pp != rt) {
             snprintf(why, wn, "the peer (pid %d) ended before it could be read, and the process the state names (%d) "
-                     "is not its parent's child (its parent is %ld, the peer's %ld)", (int)peer->pid, (int)*pid, pp,
-                     peer->ppid);
+                     "is not its child nor its parent's (its parent is %ld, the peer's %ld)", (int)peer->pid, (int)*pid,
+                     pp, peer->ppid);
             goto fail;
         }
-        long pu = pp > 0 ? node_status_field((pid_t)pp, "Uid:") : -1;
-        if (pp <= 0 || pu != 0) {
-            snprintf(why, wn, "the peer (pid %d) ended before it could be read, and the parent of the process the "
-                     "state names (%ld) is not root (uid %ld)", (int)peer->pid, pp, pu);
+        long ru = rt > 0 ? node_status_field((pid_t)rt, "Uid:") : -1;
+        if (rt <= 0 || ru != 0) {
+            snprintf(why, wn, "the peer (pid %d) ended before it could be read, and the runtime's process it leaves "
+                     "(%ld) is not root (uid %ld)", (int)peer->pid, rt, ru);
             goto fail;
         }
-        if (node_runtime_ns((pid_t)pp, "the parent of the process the state names (the peer ended before it could "
-                            "be read)", why, wn) < 0)
+        if (node_runtime_ns((pid_t)rt, "the runtime's process the peer leaves (it ended before it could be read)",
+                            why, wn) < 0)
             goto fail;
     }
     if (sc != 2) { snprintf(why, wn, "the process the state names (%d) is not under a seccomp filter", (int)*pid); goto fail; }
