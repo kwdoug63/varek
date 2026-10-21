@@ -14,7 +14,8 @@ A pod is supervised when it names a VarekPolicy of its namespace:
 
   and in the pod: metadata.annotations: { varek.dev/policy: agent }
 
-Its containers must not allow privilege escalation, must not run as root,
+Its containers must not allow privilege escalation, must drop every
+capability (capabilities: drop: [ALL]), must not run as root,
 and, under a policy that decides launches, must have a read-only root; the
 webhook says so at deploy. Label a namespace varek.dev/policy-required=true
 to refuse its pods that name no policy.

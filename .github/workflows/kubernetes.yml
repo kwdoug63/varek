@@ -1,0 +1,96 @@
+name: Kubernetes
+
+# v1.34 (step 7 of docs/security/v1.34-kubernetes.md, section 4), on every
+# change:
+#   kind   the node image built, the Helm chart installed on a one-node kind
+#          cluster (containerd 2.2 or later, NRI on), and checked as a
+#          cluster runs it (varek/v1_4/tests/v1340_kind.sh): the webhook's
+#          refusals, the policies' sync, a pod supervised and one left as it
+#          is, its stream audited, a policy changed and deleted, the node
+#          agent restarted;
+#   sweep  the suites run under the Warden and again with each agent run as
+#          a pod's container under the node agent, each check compared
+#          (varek/v1_4/tests/v1340_sweep.sh); every difference has its
+#          reason listed, or the job fails.
+# kind is built from source at a pinned version (its modules checked against
+# Go's checksum database); kubectl and helm are the runner's.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "varek/**"
+      - "packaging/**"
+      - ".github/workflows/kubernetes.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "varek/**"
+      - "packaging/**"
+      - ".github/workflows/kubernetes.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  kind:
+    name: The chart on kind
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
+      - name: Build the tools the test uses (the key and the certificate checker)
+        run: make -C varek/v1_4 tools/varek_keygen tools/vdp_cert_check
+      - name: kind, pinned
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install sigs.k8s.io/kind@v0.33.0
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: The host
+        run: |
+          uname -srm; stat -fc 'cgroup: %T' /sys/fs/cgroup; cat /sys/kernel/security/lsm; echo
+          kind version; kubectl version --client; helm version --short
+      - name: Build the node image
+        run: docker build -f packaging/container/Containerfile --target node -t varek-node:ci .
+      - name: The chart on kind
+        run: varek/v1_4/tests/v1340_kind.sh --image varek-node:ci --out "$RUNNER_TEMP/kind"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kind
+          path: ${{ runner.temp }}/kind
+
+  sweep:
+    name: The suites under the node agent
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies (as warden-build.yml)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
+          sudo apt-get install -y openjdk-21-jdk-headless musl-tools
+          sudo apt-get install -y --no-install-recommends squid python3-cryptography
+          python3 -m pip install --break-system-packages -r varek/v1_4/tools/requirements-test.txt pytest pyyaml
+      - name: The host
+        run: uname -srm; runc --version | head -1
+      - name: The sweep
+        run: sudo varek/v1_4/tests/v1340_sweep.sh --out "$RUNNER_TEMP/sweep" $SUITES
+        env:
+          # the suites warden-build.yml runs on the host
+          SUITES: >-
+            test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280
+            test-v1281 test-v1290 test-v1310 test-v1311 test-v1340
+      - name: Keep the sweep's logs
+        if: always()
+        run: sudo chmod -R a+rX "$RUNNER_TEMP/sweep" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sweep
+          path: ${{ runner.temp }}/sweep

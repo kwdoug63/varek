@@ -961,7 +961,7 @@ are claimed as solved.
     in.
   - *Review.* v1.32.0 was reviewed by AI review agents, not by a human or
     third party. Its findings are listed in its release notes.
-- Kubernetes (v1.34.0, in progress: steps 1 to 6 built,
+- Kubernetes (v1.34.0, in progress: steps 1 to 7 built,
   `v1.34-kubernetes.md`):
   - *The pod's network, not an empty one* (D5). On a host the agent's
     network namespace is empty and the Warden dials every connect from its
@@ -1002,7 +1002,19 @@ are claimed as solved.
     is down). With `failurePolicy: Fail`, while the webhook is down the
     pods and policies it checks are refused, not let in. The chart pins
     its image by the digest the release signed.
-  - *Review.* Steps 1 to 6 have not yet been reviewed.
+  - *What a pod's agent holds* (step 7). As on a host, the agent holds no
+    capability: the node agent refuses a container whose effective,
+    permitted or ambient set is not empty, and the webhook a pod that does
+    not drop them all. It runs as a user other than root, with no new
+    privileges, and its files are opened as that user whatever the policy's
+    version.
+  - *The suites against a pod* (step 7). Every suite ran with each agent as
+    a pod's container under the node agent (`tests/v1340_sweep.sh`); each
+    check that differs from the host run has its reason listed
+    (`tests/v1340_sweep_known.txt`). The sweep's container is runc's with
+    the plugin's adjustments, not a kubelet's: the chart on a cluster is
+    `kind`'s, in CI.
+  - *Review.* Steps 1 to 7 have not yet been reviewed.
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).
 - An agent may probe for SATISFIED-but-harmful actions near a policy boundary;

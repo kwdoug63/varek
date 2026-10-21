@@ -77,6 +77,7 @@ spec:
         runAsNonRoot: true
         runAsUser: 1000
         readOnlyRootFilesystem: true
+        capabilities: { drop: [ALL] }
       volumeMounts: [{ name: work, mountPath: /work }]
   volumes: [{ name: work, emptyDir: {} }]
 ```
@@ -85,6 +86,7 @@ The webhook refuses an annotated pod whose containers would be refused at
 their start, and says why. A container must:
 
 - turn privilege escalation off;
+- drop every capability, and add none;
 - not run as root;
 - name its command by an absolute path;
 - not use the node's network, PID or IPC namespace;

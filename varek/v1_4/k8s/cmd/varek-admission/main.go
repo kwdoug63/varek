@@ -82,6 +82,12 @@ type secCtx struct {
 	AllowPrivilegeEscalation *bool  `json:"allowPrivilegeEscalation"`
 	ReadOnlyRootFilesystem   *bool  `json:"readOnlyRootFilesystem"`
 	Privileged               *bool  `json:"privileged"`
+	Capabilities             *caps  `json:"capabilities"`
+}
+
+type caps struct {
+	Add  []string `json:"add"`
+	Drop []string `json:"drop"`
 }
 
 type container struct {
@@ -262,6 +268,14 @@ func (s *server) pod(ctx context.Context, req *request) string {
 		if cc != nil && cc.Privileged != nil && *cc.Privileged {
 			w("it is privileged")
 		}
+		// v1.34 step 7: the node agent refuses a container holding a
+		// capability (the Warden's agent holds none), which the runtime gives
+		// a user other than root unless they are dropped
+		if cc == nil || cc.Capabilities == nil || !dropsAll(cc.Capabilities.Drop) {
+			w("capabilities must drop ALL (capabilities: drop: [ALL]; the agent holds none)")
+		} else if len(cc.Capabilities.Add) > 0 {
+			w("it adds capabilities %v (the agent holds none)", cc.Capabilities.Add)
+		}
 		if user != nil && *user == 0 {
 			w("it runs as root (runAsUser 0)")
 		} else if user == nil && (nonRoot == nil || !*nonRoot) {
@@ -278,6 +292,15 @@ func (s *server) pod(ctx context.Context, req *request) string {
 		}
 	}
 	return strings.Join(whys, "; ")
+}
+
+func dropsAll(d []string) bool {
+	for _, x := range d {
+		if strings.EqualFold(x, "ALL") {
+			return true
+		}
+	}
+	return false
 }
 
 func pick(c, p *secCtx, f func(*secCtx) *int64) *int64 {

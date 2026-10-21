@@ -32,7 +32,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden warden-proxy warden-secrets target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-v1311 test-v1320 test-v1321 test-v1340 test-varek-k8s test-varek-chart varek-nri varek-admission test-node-json test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
+.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-v1311 test-v1320 test-v1321 test-v1340 test-varek-k8s test-varek-chart sweep-v1340 test-v1340-kind test-v1340-apiserver varek-nri varek-admission test-node-json test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
 
 all: $(BINS)
 
@@ -486,6 +486,24 @@ test-varek-k8s: warden
 # each render against Kubernetes' schemas
 test-varek-chart:
 	python3 -m pytest -q tests/test_varek_chart.py
+
+# v1.34 step 7 (docs/security/v1.34-kubernetes.md, section 4):
+#   sweep-v1340          the suites, each again with every agent it starts run
+#                        as a pod's container under the node agent, each check
+#                        compared (root, runc; SUITES= to name some)
+#   test-v1340-kind      the chart on a kind cluster, with the node image
+#                        IMAGE= (packaging/container/Containerfile --target node)
+#   test-v1340-apiserver the chart's resource and webhook and the plugin's sync
+#                        against a real API server, without a cluster (root,
+#                        CRI-O; ENVTEST= the directory setup-envtest gives)
+sweep-v1340:
+	sudo tests/v1340_sweep.sh $(SUITES)
+
+test-v1340-kind: tools/varek_keygen tools/vdp_cert_check
+	tests/v1340_kind.sh --image $(IMAGE)
+
+test-v1340-apiserver:
+	sudo tests/v1340_apiserver.sh $(ENVTEST)
 
 # v1.34 step 3: the plugin, the node agent and the launcher together under
 # CRI-O (needs root, CRI-O with NRI, crictl and Go): tests/v1340_crio.sh

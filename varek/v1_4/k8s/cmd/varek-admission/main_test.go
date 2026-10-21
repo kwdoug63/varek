@@ -97,7 +97,8 @@ func agentPod(policy string, edit func(*pod)) pod {
 		p.Metadata.Annotations = map[string]string{annotation: policy}
 	}
 	p.Spec.Containers = []container{{Name: "agent", Command: []string{"/usr/bin/agent"},
-		SecurityContext: &secCtx{AllowPrivilegeEscalation: f(false), RunAsNonRoot: f(true), ReadOnlyRootFilesystem: f(true)}}}
+		SecurityContext: &secCtx{AllowPrivilegeEscalation: f(false), RunAsNonRoot: f(true), ReadOnlyRootFilesystem: f(true),
+			Capabilities: &caps{Drop: []string{"ALL"}}}}}
 	if edit != nil {
 		edit(&p)
 	}
@@ -131,8 +132,11 @@ func TestPod(t *testing.T) {
 		{"a command by a relative path", "/pod", "agent", func(p *pod) { p.Spec.Containers[0].Command = []string{"python"} }, "absolute path"},
 		{"decided launches with a writable root", "/pod", "launch", func(p *pod) { sc(p).ReadOnlyRootFilesystem = f(false) }, "must be read-only"},
 		{"the node's network", "/pod", "agent", func(p *pod) { p.Spec.HostNetwork = true }, "hostNetwork"},
+		{"capabilities not dropped", "/pod", "agent", func(p *pod) { sc(p).Capabilities = nil }, "capabilities must drop ALL"},
+		{"one added back", "/pod", "agent", func(p *pod) { sc(p).Capabilities.Add = []string{"NET_RAW"} }, "adds capabilities [NET_RAW]"},
 		{"an init container checked too", "/pod", "agent", func(p *pod) {
-			p.Spec.InitContainers = []container{{Name: "init", SecurityContext: &secCtx{RunAsNonRoot: f(true)}}}
+			p.Spec.InitContainers = []container{{Name: "init", SecurityContext: &secCtx{RunAsNonRoot: f(true),
+				Capabilities: &caps{Drop: []string{"ALL"}}}}}
 		}, "container init: allowPrivilegeEscalation"},
 	} {
 		ok, msg := post(t, s, c.path, "team-a", agentPod(c.policy, c.edit))

@@ -18,7 +18,7 @@
 #   4. refused at the start, the container ended: a policy with what this
 #      step does not carry (a host-name rule), a command named without an
 #      absolute path, a container with new privileges allowed, a container
-#      running as root;
+#      holding capabilities (step 7), a container running as root;
 #   5. the listener (review): a supervisor killed ends its container; a
 #      socket in a directory others can reach is
 #      refused; a state sent by a process that is not the runtime, with a
@@ -117,9 +117,9 @@ printf 'require warden 1.24\nallow path /data/allowed readonly\nallow host examp
 # a bundle: NAME POLICY-SOCKET ARGV0 NNP [UID]
 bundle() {
     mkdir -p "$B/b-$1" && (cd "$B/b-$1" && "$RUNC" spec >/dev/null)
-    python3 - "$B/b-$1/config.json" "$B/f/oci.json" "$2" "$3" "$4" "$ARCH" "$B/rootfs" "${5:-65534}" <<'PY'
+    python3 - "$B/b-$1/config.json" "$B/f/oci.json" "$2" "$3" "$4" "$ARCH" "$B/rootfs" "${5:-65534}" "${6:-}" <<'PY'
 import json, sys
-cfg, flt, sock, argv0, nnp, arch, root, uid = sys.argv[1:]
+cfg, flt, sock, argv0, nnp, arch, root, uid, caps = sys.argv[1:]
 c = json.load(open(cfg)); f = json.load(open(flt))
 f.pop("warden_badarch", None); f["architectures"] = [arch]
 for s in f["syscalls"]: s.pop("nr", None)
@@ -128,6 +128,8 @@ c["process"].update(terminal=False, args=argv0.split(), env=["PATH=/"], user={"u
                     noNewPrivileges=nnp == "1", cwd="/")
 c["root"] = {"path": root, "readonly": True}
 c["linux"]["seccomp"] = f
+if caps != "caps":   # as a pod's securityContext drops them (runc's own spec keeps three)
+    c["process"]["capabilities"] = {k: [] for k in ("bounding", "effective", "permitted", "inheritable", "ambient")}
 json.dump(c, open(cfg, "w"))
 PY
 }
@@ -194,6 +196,12 @@ bundle nnp "$B/s/a.sock" /probe 0
 run nnp
 check "a container with new privileges allowed: refused" sh -c \
     "! grep -q '^read_allowed' '$B/nnp.out' && grep -q 'without no_new_privs' '$(stream a nnp)'"
+# step 7 (found by the sweep): capabilities, which runc's own spec gives a
+# user other than root (a pod's are dropped, capabilities: drop: [ALL])
+bundle caps "$B/s/a.sock" /probe 1 65534 caps
+run caps
+check "a container holding capabilities: refused, naming them" sh -c \
+    "! grep -q '^read_allowed' '$B/caps.out' && grep -q 'the container holds capabilities (effective' '$(stream a caps)'"
 bundle root "$B/s/a.sock" /probe 1 0
 run root
 check "a container running as root: refused" sh -c \
@@ -223,7 +231,8 @@ st = {"ociVersion": "1.2.1", "fds": ["seccompFd"], "pid": int(sys.argv[2]), "met
 socket.send_fds(s, [json.dumps(st).encode()], [r])
 s.close()
 PY
-sleep 1
+# (the node agent's line, waited for: a loaded host takes more than a second)
+for _ in $(seq 100); do grep -q 'a connection refused: the descriptor' "$B/a.log" && break; sleep 0.1; done
 check "a state from a process that is not the runtime: refused" grep -q 'a connection refused: the descriptor sent is not a seccomp listener' "$B/a.log"
 check "... and the process it names is not killed" kill -0 "$VICTIM"
 kill "$VICTIM" 2>/dev/null
@@ -285,6 +294,7 @@ c["process"].update(terminal=False, args=args.split(), env=["PATH=/"], user={"ui
                     noNewPrivileges=True, cwd="/")
 c["root"] = {"path": B + "/rootfs", "readonly": "rw-root" not in opts}
 c["linux"]["seccomp"] = f
+c["process"]["capabilities"] = {k: [] for k in ("bounding", "effective", "permitted", "inheritable", "ambient")}
 if ann != "-":
     import hashlib, os
     pf = B + "/pol/team-a/" + ann + ".policy"
@@ -335,6 +345,12 @@ PY
     PC="$(stream l plain | sed 's/\.jsonl$/.policy/')"
     check "the policy, from the pod's namespace, copied beside the stream (read-only) and run from there (step 5)" sh -c \
         "cmp -s '$PC' '$P/plain.policy' && [ \"\$(stat -c %a '$PC')\" = 400 ] && grep -q '\"policy_path\":\"$PC\"' '$(stream l plain)'"
+    # step 7 (found by the sweep): the audit takes the launcher's launch set
+    # (the command alone) and Landlock under a policy that decides no launch
+    if [ -n "$CERT" ]; then
+        check "... and the audit accepts its stream (the launcher's launch set, under a policy without launches)" \
+            python3 "$HERE/tools/varek_audit.py" --policy "$PC" --checker "$CERT" "$(stream l plain)"
+    fi
     lbundle nosha "$B/s/l.sock" "$B/f/plain.json" plain "/varek/init -- /probe" no-sha; run nosha
     check "a container without the plugin's SHA-256 of its policy: refused" refused l nosha 'not given its filter by VAREK.s NRI plugin'
     lbundle badsha "$B/s/l.sock" "$B/f/plain.json" plain "/varek/init -- /probe" bad-sha; run badsha

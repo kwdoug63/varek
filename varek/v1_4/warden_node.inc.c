@@ -444,8 +444,8 @@ out:
 }
 
 /* The container's init as the descriptor arrives: no new privileges (the
- * runtime then loads the filter after it takes the container's user), and
- * that user, the agent's. 0, or -1. */
+ * runtime then loads the filter after it takes the container's user and
+ * capabilities), that user, the agent's, and no capability. 0, or -1. */
 static int node_process(char *why, size_t wn) {
     FILE *f = proc_fopenf("%d/status", g_nr.pid);
     if (!f) { snprintf(why, wn, "the container's process %d is gone", g_nr.pid); return -1; }
@@ -453,8 +453,14 @@ static int node_process(char *why, size_t wn) {
     int nnp = -1;
     long uid = -1, gid = -1;
     bool groups_ok = false;
+    /* v1.34 step 7 (found by the sweep): the capabilities it holds; the
+     * Warden's agent holds none (caps=none), and a pod's is to hold none
+     * either (capabilities: drop: [ALL]) */
+    unsigned long long cap_eff = ~0ULL, cap_prm = ~0ULL, cap_amb = ~0ULL;
     while (fgets(line, sizeof line, f)) {
         long r, e;
+        if (sscanf(line, "CapEff: %llx", &cap_eff) == 1 || sscanf(line, "CapPrm: %llx", &cap_prm) == 1 ||
+            sscanf(line, "CapAmb: %llx", &cap_amb) == 1) continue;
         if (sscanf(line, "Uid: %ld %ld", &r, &e) == 2) uid = e;
         else if (sscanf(line, "Gid: %ld %ld", &r, &e) == 2) gid = e;
         else if (!strncmp(line, "Groups:", 7)) {
@@ -484,6 +490,11 @@ static int node_process(char *why, size_t wn) {
         return -1;
     }
     if (gid == 0) { snprintf(why, wn, "the container's user is in group 0 (root)"); return -1; }
+    if (cap_eff || cap_prm || cap_amb) {
+        snprintf(why, wn, "the container holds capabilities (effective %llx, permitted %llx, ambient %llx): the "
+                 "agent holds none (securityContext.capabilities: drop: [ALL], and none added)", cap_eff, cap_prm, cap_amb);
+        return -1;
+    }
     g_nr.uid = (uid_t)uid;
     g_nr.gid = (gid_t)gid;
     return 0;

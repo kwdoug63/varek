@@ -471,6 +471,13 @@ def check_changes(records, openas_policy, problems):
                 problems.append(f"seq {seq}: a rename's new name allowed without its old name before it")
 
 
+def _node_launcher(rs):
+    """v1.34: does run_start say a node agent's container ran the launcher
+    (varek-init) first?"""
+    node = rs.get("node")
+    return isinstance(node, dict) and node.get("launcher") is True
+
+
 V127_RULES = ("exec_allowed", "exec_not_in_ruleset", "exec_no_landlock", "exec_identity_mismatch",
               "exec_identity_unreadable", "open_not_found", "subagent_env")
 
@@ -488,7 +495,19 @@ def check_exec_set(meta, launches, problems, records=()):
     elif (launches or has) and not _version_at_least(w, (1, 27)):
         problems.append(f"run_start names the Warden {w!r}, but only 1.27 or later decides launches")
     if not launches:
-        if has:
+        if has and _node_launcher(rs):
+            # v1.34 step 7 (found by the sweep): under the node agent the
+            # launcher runs first in every container and applies Landlock,
+            # its launch set the container's command alone (and what starts
+            # it), whatever the policy says of launches
+            ll, ex = rs.get("landlock"), rs.get("exec_ruleset")
+            if not (isinstance(ll, dict) and type(ll.get("abi")) is int and ll["abi"] >= 1):
+                problems.append(f"run_start names the launcher, but its landlock {ll!r} is not an ABI")
+            if not isinstance(ex, list) or not ex or not all(
+                    isinstance(e, dict) and e.get("why") in ("bootstrap", "loader", "interpreter") for e in ex):
+                problems.append("run_start names the launcher, and the policy does not turn launches on, but its "
+                                "launch set is not the command alone (and what starts it)")
+        elif has:
             problems.append("run_start records a launch set or Landlock, but the policy does not turn "
                             "launches on (require warden 1.27)")
         bad = [r for r in records if r.get("rule") in V127_RULES]
@@ -658,7 +677,9 @@ def check_noexec(meta, rules, launches, problems, records=()):
     rs = meta.get("run_start", {})
     has = "noexec" in rs
     if not launches:
-        if has:
+        # v1.34: under the node agent's launcher, an empty list (the pod's own
+        # mounts are the node agent's D4 check, not the Warden's)
+        if has and not (_node_launcher(rs) and rs["noexec"] == []):
             problems.append("run_start records noexec mounts, but the policy does not turn launches on")
         return
     if not has:
