@@ -63,10 +63,19 @@ pass() { say "  PASS   $1"; }
 flunk() { say "  FAIL   $1"; fail=1; }
 check() { local d="$1"; shift; if "$@" > /dev/null 2>&1; then pass "$d"; else flunk "$d"; fi; }
 on_node() { docker exec "$N" "$@"; }
+node_logs() {   # SUFFIX: the node agent's and the plugin's logs, as OUT/{node-agent,plugin}SUFFIX.log
+    kubectl -n "$NS" logs ds/varek-node -c node-agent > "$OUT/node-agent$1.log" 2>&1
+    kubectl -n "$NS" logs ds/varek-node -c plugin > "$OUT/plugin$1.log" 2>&1
+}
 cleanup() {
-    kubectl -n "$NS" logs ds/varek-node -c node-agent > "$OUT/node-agent.log" 2>&1
-    kubectl -n "$NS" logs ds/varek-node -c plugin > "$OUT/plugin.log" 2>&1
+    node_logs ""
     kubectl -n "$NS" logs deploy/varek-admission > "$OUT/admission.log" 2>&1
+    # a failure's logs in the job's log too (the artifact holds them whole)
+    if [ "$fail" != 0 ]; then
+        for l in "$OUT"/node-agent*.log "$OUT"/plugin*.log; do
+            [ -s "$l" ] && { echo "== ${l##*/}, its end"; tail -40 "$l"; }
+        done
+    fi
     [ "$KEEP" = 1 ] || kind delete cluster --name "$CL" > /dev/null 2>&1
 }
 trap cleanup EXIT
@@ -156,7 +165,9 @@ ran() {   # POD [NAMESPACE]: wait for the pod to end; its log in OUT/POD.log
     done
     kubectl -n "${2:-team-a}" logs "$1" > "$OUT/$1.log" 2>&1
     kubectl -n "${2:-team-a}" describe pod "$1" > "$OUT/$1.describe" 2>&1
-    sed "s/^/     $1: /" "$OUT/$1.log" | tee -a "$SUM" > /dev/null
+    # in the job's log too: what a failed check saw
+    sed "s/^/     $1: /" "$OUT/$1.log" | tee -a "$SUM"
+    [ "$ph" = Succeeded ] || { echo "     $1: phase ${ph:-none}"; grep -E '^ *(Reason|Message|Exit Code):' "$OUT/$1.describe" | sed "s/^ */     $1: /"; }
     [ "$ph" = Succeeded ]
 }
 said() { grep -q "$2" "$OUT/$1.log"; }
@@ -252,6 +263,7 @@ check "the policy deleted: removed from the node" sh -c \
     "for i in \$(seq 30); do docker exec $N test -e /var/lib/varek/policies/team-a/busybox.policy || exit 0; sleep 1; done; exit 1"
 
 echo "== 6. the node agent's pod restarted"
+node_logs "-before-restart"   # the restart below ends these
 kubectl apply -f "$OUT/vp-busybox.json" > /dev/null 2>&1
 synced 'allow exec /bin/sleep' > /dev/null
 kubectl -n "$NS" delete pod -l app.kubernetes.io/component=node --wait=true > /dev/null 2>&1
