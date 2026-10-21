@@ -132,6 +132,7 @@
 #include "plan_breaker.h"
 #include "plan_progress.h"
 #include "warden_baseline_filter.h"
+#include "warden_oci.h"                 /* v1.34 step 3 */
 #include "smt_decide.h"            /* v1.13 SMT decision procedure */
 #include "checker/vdp_checker.h"   /* v1.15 independent certificate checker */
 #include "warden_lifecycle.h"   /* v1.9.3 supervisor/target lifecycle coupling */
@@ -778,10 +779,23 @@ struct node_run {
     gid_t  groups[256];         /* its supplementary groups, from its process too */
     int    ngroups;
     long   before_exec;         /* the runtime's own calls before that launch, let through */
+    /* v1.34 step 3 */
+    char   policy[64];          /* the pod's policy, by name (varek.dev/policy), or "" */
+    bool   launcher;            /* the command is /varek/init -- COMMAND (the NRI plugin's) */
+    bool   in_launcher;         /* the runtime has launched /varek/init; the launcher runs */
+    long   launcher_calls;      /* the launcher's own calls before the command, let through */
+    int    set_view;            /* the launch set the launcher reads, a sealed memfd */
+    char  *set_text;            /* its text, one path a line */
+    struct sock_filter *bpf;    /* the Warden's own filter for the policy, compiled */
+    unsigned nbpf;
+    long   not_admitted;        /* calls it refuses, which the pod's filter notifies */
 };
-static struct node_run g_nr = { .notify_fd = -1, .pidfd = -1 };
+static struct node_run g_nr = { .notify_fd = -1, .pidfd = -1, .set_view = -1 };
 static void node_run_start(FILE *f);
 static void node_fail(const char *why) __attribute__((noreturn));
+static bool node_launcher_open(int notify_fd, const struct seccomp_notif *req);
+static int node_launcher_exec(int notify_fd, const struct seccomp_notif *req, const struct action *a,
+                              const char *bootstrap_path, bool by_fd);
 
 /* ---------------- cross-process memory ---------------- */
 
@@ -2112,7 +2126,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
         }
     }
     /* v1.27: Landlock and the launch set (require warden 1.27) */
-    if (p->v.launches) { exec_ruleset_record(f); noexec_record(f); }   /* v1.27, v1.27.1 */
+    if (p->v.launches || g_nr.launcher) { exec_ruleset_record(f); noexec_record(f); }   /* v1.27, v1.27.1; v1.34 */
     as_agent_record(f);                  /* v1.29: who files are opened as */
     if (g_dry) fputs("\"mode\":\"dry_run\",", f);   /* v1.29: not enforcing (section 3) */
     /* v1.29: the baseline this policy is (section 2), and the names (never
@@ -2428,10 +2442,11 @@ static void emit_run_end(int exit_status) {
     emit_unanswered();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    char dry_count[96] = "";
+    char dry_count[160] = "";
     if (g_dry) snprintf(dry_count, sizeof dry_count, "\"not_enforced\":%" PRIu64 ",", g_dry_unenforced);
     else if (g_nr.on)                     /* v1.34 step 2: the runtime's own, let through */
-        snprintf(dry_count, sizeof dry_count, "\"runtime_calls_before_exec\":%ld,", g_nr.before_exec);
+        snprintf(dry_count, sizeof dry_count, "\"runtime_calls_before_exec\":%ld,\"launcher_calls_before_exec\":%ld,"
+                 "\"calls_not_admitted\":%ld,", g_nr.before_exec, g_nr.launcher_calls, g_nr.not_admitted);
     FILE *f = rec_begin();
     fprintf(f, "{\"event\":\"run_end\",\"run\":\"%s\",\"records\":%" PRIu64 ","
                "\"exit_status\":%d,%s%s%s%s%s\"timestamp_ns\":%lld}\n",
@@ -3675,9 +3690,15 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * (its checks of /proc before it executes the command), made before
          * any of the container's code runs: let through and counted, as the
          * calls of the Warden's own child before its exec are on a host */
+        /* v1.34 step 3: then the launcher's (the NRI plugin's /varek/init),
+         * once the runtime has launched it: the launch set it reads is a view
+         * the Warden serves, and its other calls (Landlock, its own filter)
+         * are let through, until it launches the container's command */
         if (g_nr.on && !bootstrap_done && req.data.nr != __NR_execve && req.data.nr != __NR_execveat &&
             task_tgid((pid_t)req.pid) == bootstrap_pid && notif_id_valid(notify_fd, req.id)) {
-            g_nr.before_exec++;
+            if (g_nr.in_launcher && node_launcher_open(notify_fd, &req)) continue;
+            if (g_nr.in_launcher) g_nr.launcher_calls++;
+            else g_nr.before_exec++;
             send_simple(notify_fd, req.id, DEC_ALLOW);
             continue;
         }
@@ -3689,6 +3710,19 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             pid_t tg = task_tgid((pid_t)req.pid);
             if (tg > 0 && tg != bootstrap_pid)
                 node_fail("a process other than the container's init made a call before the container's command ran");
+        }
+        /* v1.34 step 3: from the command's launch, a call the Warden's own
+         * filter for this policy refuses (the pod's filter notifies each call
+         * that filter names no rule for, for the runtime's last steps) is
+         * answered as that filter answers it, without a record, as on a host */
+        if (g_nr.on && bootstrap_done && g_nr.bpf) {
+            uint32_t fa = wd_bpf_run(g_nr.bpf, g_nr.nbpf, &req.data);
+            if ((fa & SECCOMP_RET_ACTION_FULL) != SECCOMP_RET_USER_NOTIF) {
+                g_nr.not_admitted++;
+                send_errno(notify_fd, req.id, (fa & SECCOMP_RET_ACTION_FULL) == SECCOMP_RET_ERRNO && (fa & SECCOMP_RET_DATA)
+                                              ? (int)(fa & SECCOMP_RET_DATA) : EPERM);
+                continue;
+            }
         }
 
         struct exec_ctx *ctx = ctx_get(req.pid);
@@ -3763,6 +3797,12 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * the exec, so CONTINUE stays as sound as before. */
         bool boot_by_fd = act.kind == ACT_PROCESS_EXEC && req.data.nr == __NR_execveat &&
                           act.target[0] == '\0' && (req.data.args[4] & AT_EMPTY_PATH);
+        /* v1.34 step 3: under the node agent with the launcher, the runtime
+         * launches /varek/init first, and the launcher the container's
+         * command, which is then the bootstrap below */
+        if (g_nr.on && g_nr.launcher && !bootstrap_done && act.kind == ACT_PROCESS_EXEC &&
+            node_launcher_exec(notify_fd, &req, &act, bootstrap_path, boot_by_fd))
+            continue;
         if (act.kind == ACT_PROCESS_EXEC && !bootstrap_done &&
             (pid_t)req.pid == bootstrap_pid && bootstrap_path &&
             (boot_by_fd || strcmp(act.target, bootstrap_path) == 0)) {
@@ -5127,7 +5167,10 @@ static void usage(const char *argv0) {
         "              [--writable-exec]\n"
         "              -- <target> [args...]\n"
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
-        , argv0, argv0);
+        "       %s <policies dir | policy.txt> --node-agent <socket> --node-streams <dir>\n"
+        "              [--node-launcher <varek-init>]   (v1.34: the node agent, one supervisor a container)\n"
+        "       %s <policy.txt> --oci-filter   (v1.34: the policy's filter in OCI's form, for the NRI plugin)\n"
+        , argv0, argv0, argv0, argv0);
     fprintf(stderr,
         "\n"
         "  Privileged seccomp-unotify supervisor (VAREK Warden v1.4).\n"
@@ -5264,10 +5307,12 @@ int main(int argc, char **argv) {
      * state directory, lock and table, and --gate-status), then exits: 0 if
      * the Warden would start, 1 with the reason otherwise. No agent runs and
      * no verdict stream is written. tools/varek_preflight.sh uses it. */
+    bool oci_only = false;
     for (int i = 2; i < argc && strcmp(argv[i], "--"); i++)
         if (!strcmp(argv[i], "--check-startup")) g_check_only = true;
         else if (!strcmp(argv[i], "--check-credentials")) g_check_only = g_check_creds = true;   /* v1.28 */
-    if (argc < (g_check_only ? 3 : 4)) { usage(argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--oci-filter")) oci_only = true;                             /* v1.34 step 3 */
+    if (argc < (g_check_only || oci_only ? 3 : 4)) { usage(argv[0]); return 2; }
 
     const char *policy_path = argv[1];
     const char *plan_path   = NULL;
@@ -5287,10 +5332,12 @@ int main(int argc, char **argv) {
     wr_config_default(&dns_cfg);
     int sep_idx = -1;
     const char *node_sock = NULL, *node_streams = NULL;                     /* v1.34 step 2 */
+    const char *node_launcher = NULL;                                       /* v1.34 step 3 */
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) { sep_idx = i; break; }
-        if (strcmp(argv[i], "--check-startup") == 0 || strcmp(argv[i], "--check-credentials") == 0) continue;
+        if (strcmp(argv[i], "--check-startup") == 0 || strcmp(argv[i], "--check-credentials") == 0 ||
+            strcmp(argv[i], "--oci-filter") == 0) continue;
         if (i + 1 >= argc) { usage(argv[0]); return 2; }
         if (strcmp(argv[i], "--plan") == 0 && !plan_path) {
             plan_path = argv[++i];
@@ -5312,6 +5359,8 @@ int main(int argc, char **argv) {
             node_sock = argv[++i];
         } else if (strcmp(argv[i], "--node-streams") == 0 && !node_streams && i + 1 < argc) {
             node_streams = argv[++i];
+        } else if (strcmp(argv[i], "--node-launcher") == 0 && !node_launcher && i + 1 < argc) {   /* v1.34 step 3 */
+            node_launcher = argv[++i];
         } else if (strcmp(argv[i], "--writable-exec") == 0) {            /* v1.27.1 */
             g_writable_exec = true;
         } else if (strcmp(argv[i], "--run-as") == 0 && !run_as_arg) {
@@ -5374,11 +5423,29 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (node_sock && (sep_idx >= 0 || g_check_only || !node_streams)) {   /* v1.34 step 2 */
-        fprintf(stderr, "[warden] --node-agent takes --node-streams DIR, and no agent (\"--\") or check\n");
+    /* v1.34 step 3: the filter in OCI's form, for the NRI plugin */
+    if (oci_only) {
+        if (sep_idx >= 0 || g_check_only || node_sock || g_dry || plan_path) {
+            fprintf(stderr, "[warden] --oci-filter takes the policy alone\n");
+            return 2;
+        }
+        static struct policy op;
+        if (policy_load(policy_path, &op) < 0) return 1;
+        char why[200];
+        if (wd_oci_filter_write(stdout, op.v.open_as_agent ? WD_FILTER_CHANGES : 0, why, sizeof why) < 0 ||
+            fflush(stdout) != 0) {
+            fprintf(stderr, "[warden] --oci-filter: %s\n", why);
+            return 1;
+        }
+        return 0;
+    }
+    if ((node_sock && (sep_idx >= 0 || g_check_only || !node_streams || g_writable_exec)) ||
+        (node_launcher && !node_sock)) {                                    /* v1.34 step 2 */
+        fprintf(stderr, "[warden] --node-agent takes --node-streams DIR, and no agent (\"--\"), check or "
+                "--writable-exec (a pod's mounts are checked, D4); --node-launcher goes with --node-agent\n");
         return 2;
     }
-    if (node_sock && node_listen(node_sock, node_streams) < 0) return 1;
+    if (node_sock && node_listen(node_sock, node_streams, node_launcher, &policy_path) < 0) return 1;
     /* from here, under the node agent, the supervisor of one container */
     if (!g_check_only && !g_nr.on && (sep_idx < 0 || sep_idx + 1 >= argc)) { usage(argv[0]); return 2; }
     if (flow_path && !plan_path && !g_check_only) {
@@ -5810,8 +5877,9 @@ int main(int argc, char **argv) {
         }
     }
     /* v1.27: with `require warden 1.27`, the files the agent may launch and
-     * the Landlock ruleset that holds it to them (warden_exec.inc.c) */
-    if (p.v.launches) {
+     * the Landlock ruleset that holds it to them (warden_exec.inc.c). v1.34
+     * step 3: under the node agent, in the container's view (node_supervise) */
+    if (p.v.launches && !g_nr.on) {
         if (exec_ruleset_build(&p, target_argv ? boot_path : NULL) < 0 ||
             exec_confined_checks(&p) < 0) {              /* v1.31 */
             if (g_sk) sodium_free(g_sk);
@@ -5918,7 +5986,7 @@ int main(int argc, char **argv) {
         if (g_sk) sodium_free(g_sk);
         return 1;
     }
-    emit_run_start(policy_path, &p);
+    if (!g_nr.on) emit_run_start(policy_path, &p);     /* v1.34 step 3: node_supervise's, after the launch set */
     ctl_open();                                                            /* v1.28 step 4 */
     /* v1.24: every allowed host name is resolved before the agent runs.
      * Refreshes then run in a resolver helper process (warden_resolve.c),
@@ -5959,7 +6027,7 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGCHLD, &sa, NULL);
 
-    if (g_nr.on) return node_supervise(&p, boot_path);                      /* v1.34 step 2 */
+    if (g_nr.on) return node_supervise(&p, boot_path, policy_path);         /* v1.34 step 2 */
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {

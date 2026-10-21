@@ -83,10 +83,14 @@ jobs:
         run: sudo make -C varek/v1_4 test-v1320
       - name: v1.32.1 rootless Podman without --systemd=always (the cgroup remount in a user namespace, delegated or not)
         run: sudo make -C varek/v1_4 test-v1321
-      - name: v1.34 step 2 the node agent (a container runc starts under the Warden's filter, handed to it)
+      - name: v1.34 steps 2 and 3 the node agent (a container runc starts under the Warden's filter, handed to it; the launcher, policies by name, D4)
         run: |
           runc --version | head -1   # the runner's, with its Docker; the suite skips without one
           sudo make -C varek/v1_4 test-v1340
+      - name: v1.34 step 3 the NRI plugin (gofmt, go vet, its unit tests)
+        run: |
+          go version
+          make -C varek/v1_4 test-varek-nri
       - name: Build and test the plan_verify CLI (v1_6, v1.16.3)
         run: make -C v1_6 plan_verify check check-plan-verify
       - name: Test the v1.7 layer (v1.18.0)

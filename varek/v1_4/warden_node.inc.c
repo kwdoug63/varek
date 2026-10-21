@@ -23,9 +23,38 @@
  * files, opened as the agent's user (read from its process), the container's
  * command, connects to addresses. Refused at the start, until the steps that
  * bring them: host-name rules and the proxy (step 4, the pod's network),
- * decided launches and noexec mounts (step 3, the launcher), credentials,
- * the on-behalf-of chain and sub-agents (step 5), plans and the dry run. */
+ * credentials, the on-behalf-of chain and sub-agents (step 5), plans and the
+ * dry run.
+ *
+ * Step 3 (the NRI plugin, nri/, and the launcher, varek_init.c):
+ *
+ *   warden POLICY_DIR --node-agent SOCKET --node-streams DIR --node-launcher FILE
+ *
+ * takes each container's policy by the name its pod gives
+ * (varek.dev/policy, which the plugin copies to the container's own
+ * annotations: the state carries the container's, not the pod's), as
+ * POLICY_DIR/<name>.policy; a single policy file stays one policy for every
+ * container. The plugin puts the launcher first in the command
+ * (/varek/init -- COMMAND ...), bound read-only from FILE on the node. The
+ * supervisor checks /varek/init is that file, builds the launch set in the
+ * container's view, and serves it to the launcher (NODE_SET_VIEW), which
+ * applies it with Landlock and launches the command: the runtime's launch
+ * of /varek/init is let through, then the launcher's calls, and the
+ * command's launch is the bootstrap. With the launcher, a policy that
+ * decides launches (require warden 1.27) is carried, under D4: the
+ * container's root read-only, every writable mount noexec, and no mount
+ * that allows execution showing what a writable one can change (checked
+ * from the container's mounts as the descriptor arrives, before any of its
+ * code runs). */
 #include "node_json.h"
+
+#define NODE_LAUNCHER "/varek/init"              /* where the plugin binds the launcher */
+#define NODE_SET_VIEW "/etc/varek/launch-set"    /* the view the launcher reads */
+
+static const char *g_node_policies;               /* the policies' directory, or NULL: one policy */
+static bool  g_node_have_launcher;
+static dev_t g_node_launcher_dev;                 /* --node-launcher, on the node */
+static ino_t g_node_launcher_ino;
 
 static void node_fail(const char *why) __attribute__((noreturn));
 
@@ -62,22 +91,25 @@ static void node_str(const char *doc, size_t n, const char *const *path, size_t 
     if (nj_find(doc, n, path, depth, &v, &vn) < 0 || nj_string(v, vn, out, on) < 0) out[0] = '\0';
 }
 
-/* The pod's namespace, name and uid and the container's name: containerd's
- * annotations or CRI-O's. A pod's own annotations can be passed through to
- * the container's, so each family can be claimed: one present but unusable
- * (not a string, too long), or both present and different, is refused. 0, or
- * -1. */
-static int node_annotation(const char *doc, size_t n, const char *cd, const char *co, char *out, size_t on) {
-    const char *p1[] = { "state", "annotations", cd }, *p2[] = { "state", "annotations", co }, *v;
-    size_t vn;
-    char other[256];
-    bool h1 = nj_find(doc, n, p1, 3, &v, &vn) == 0, h2;
-    if (h1 && nj_string(v, vn, out, on) < 0) return -1;
-    if (!h1) out[0] = '\0';
-    if (!(h2 = nj_find(doc, n, p2, 3, &v, &vn) == 0)) return 0;
-    if (nj_string(v, vn, other, sizeof other) < 0 || strlen(other) >= on) return -1;
-    if (h1 && strcmp(out, other)) return -1;
-    if (!h1) snprintf(out, on, "%s", other);
+/* The pod's namespace, name and uid and the container's name: the NRI
+ * plugin's annotations (v1.34 step 3: CRI-O puts the kubelet's in one JSON
+ * string, and crictl none), containerd's, or CRI-O's. A pod's own
+ * annotations can be passed through to the container's, so each family can
+ * be claimed: one present but unusable (not a string, too long), or two
+ * present and different, is refused. 0, or -1. */
+static int node_annotation(const char *doc, size_t n, const char *const keys[3], char *out, size_t on) {
+    bool have = false;
+    out[0] = '\0';
+    for (int k = 0; k < 3; k++) {
+        const char *pk[] = { "state", "annotations", keys[k] }, *v;
+        size_t vn;
+        char val[256];
+        if (nj_find(doc, n, pk, 3, &v, &vn) < 0) continue;
+        if (nj_string(v, vn, val, sizeof val) < 0 || strlen(val) >= on) return -1;
+        if (have && strcmp(out, val)) return -1;
+        if (!have) snprintf(out, on, "%s", val);
+        have = true;
+    }
     return 0;
 }
 
@@ -113,13 +145,60 @@ static int node_state(const char *doc, size_t n, char *why, size_t wn) {
         return -1;
     }
     if (g_nr.bundle[0] != '/') { snprintf(why, wn, "the container's state names no bundle"); return -1; }
-    if (node_annotation(doc, n, "io.kubernetes.cri.sandbox-namespace", "io.kubernetes.pod.namespace", g_nr.pod_ns, sizeof g_nr.pod_ns) < 0 ||
-        node_annotation(doc, n, "io.kubernetes.cri.sandbox-name", "io.kubernetes.pod.name", g_nr.pod_name, sizeof g_nr.pod_name) < 0 ||
-        node_annotation(doc, n, "io.kubernetes.cri.sandbox-uid", "io.kubernetes.pod.uid", g_nr.pod_uid, sizeof g_nr.pod_uid) < 0 ||
-        node_annotation(doc, n, "io.kubernetes.cri.container-name", "io.kubernetes.container.name", g_nr.ctr, sizeof g_nr.ctr) < 0) {
-        snprintf(why, wn, "the container's state names its pod twice, differently, or unusably (containerd's and CRI-O's annotations)");
+    static const char *const kNs[3] = { "varek.dev/pod-namespace", "io.kubernetes.cri.sandbox-namespace",
+                                        "io.kubernetes.pod.namespace" };
+    static const char *const kName[3] = { "varek.dev/pod-name", "io.kubernetes.cri.sandbox-name", "io.kubernetes.pod.name" };
+    static const char *const kUid[3] = { "varek.dev/pod-uid", "io.kubernetes.cri.sandbox-uid", "io.kubernetes.pod.uid" };
+    static const char *const kCtr[3] = { "varek.dev/container", "io.kubernetes.cri.container-name",
+                                         "io.kubernetes.container.name" };
+    if (node_annotation(doc, n, kNs, g_nr.pod_ns, sizeof g_nr.pod_ns) < 0 ||
+        node_annotation(doc, n, kName, g_nr.pod_name, sizeof g_nr.pod_name) < 0 ||
+        node_annotation(doc, n, kUid, g_nr.pod_uid, sizeof g_nr.pod_uid) < 0 ||
+        node_annotation(doc, n, kCtr, g_nr.ctr, sizeof g_nr.ctr) < 0) {
+        snprintf(why, wn, "the container's state names its pod twice, differently, or unusably (the NRI plugin's, "
+                 "containerd's and CRI-O's annotations)");
         return -1;
     }
+    return 0;
+}
+
+/* v1.34 step 3: the container's policy, by the name its pod gives
+ * (varek.dev/policy, copied by the NRI plugin to the container's annotations),
+ * as POLICY_DIR/<name>.policy; with a single policy file, every container's
+ * (the name, if any, recorded). A name is [a-z0-9-], 1 to 63 characters. 0,
+ * or -1 with why. */
+static int node_policy(const char *doc, size_t n, const char **policy_path, char *why, size_t wn) {
+    const char *pp[] = { "state", "annotations", "varek.dev/policy" }, *v;
+    size_t vn;
+    bool has = nj_find(doc, n, pp, 3, &v, &vn) == 0;
+    if (has && nj_string(v, vn, g_nr.policy, sizeof g_nr.policy) < 0) g_nr.policy[0] = '\0';
+    size_t k = 0;
+    for (; g_nr.policy[k]; k++)
+        if (!((g_nr.policy[k] >= 'a' && g_nr.policy[k] <= 'z') || (g_nr.policy[k] >= '0' && g_nr.policy[k] <= '9') ||
+              g_nr.policy[k] == '-')) break;
+    bool named = has && k > 0 && !g_nr.policy[k];
+    if (!g_node_policies) {
+        if (!named) g_nr.policy[0] = '\0';
+        return 0;
+    }
+    if (!has) {
+        snprintf(why, wn, "the container names no policy (its pod's varek.dev/policy annotation, which the NRI "
+                 "plugin copies to the container's)");
+        return -1;
+    }
+    if (!named) {
+        snprintf(why, wn, "the container's policy name (varek.dev/policy) is not 1 to 63 of a-z, 0-9 and -");
+        return -1;
+    }
+    static char path[PATH_MAX];
+    struct stat st;
+    snprintf(path, sizeof path, "%s/%s.policy", g_node_policies, g_nr.policy);
+    int e = lstat(path, &st) < 0 ? errno : 0;
+    if (e || !S_ISREG(st.st_mode)) {
+        snprintf(why, wn, "no policy named %s (%.300s: %s)", g_nr.policy, path, e ? strerror(e) : "not a file");
+        return -1;
+    }
+    *policy_path = path;
     return 0;
 }
 
@@ -217,10 +296,30 @@ static int node_config(char *why, size_t wn) {
     else {
         const char *ap[] = { "process", "args", "#0" };
         node_str(doc, n, ap, 3, g_nr.argv0, sizeof g_nr.argv0);
+        /* v1.34 step 3: the launcher first (the NRI plugin's), then "--" and
+         * the container's own command, its first launch */
+        if (!strcmp(g_nr.argv0, NODE_LAUNCHER)) {
+            const char *p1[] = { "process", "args", "#1" }, *p2[] = { "process", "args", "#2" };
+            char dd[4];
+            node_str(doc, n, p1, 3, dd, sizeof dd);
+            node_str(doc, n, p2, 3, g_nr.argv0, sizeof g_nr.argv0);
+            g_nr.launcher = true;
+            if (strcmp(dd, "--")) {
+                snprintf(why, wn, "the container's command is the launcher (" NODE_LAUNCHER "), not followed by "
+                         "\"-- COMMAND\"");
+                goto out;
+            }
+            if (!g_node_have_launcher) {
+                snprintf(why, wn, "the container's command is the launcher (" NODE_LAUNCHER "), and this node agent "
+                         "has none (--node-launcher)");
+                goto out;
+            }
+        }
         if (g_nr.argv0[0] != '/')
             snprintf(why, wn, "the container's command must be named by an absolute path (it is \"%.200s\")", g_nr.argv0);
         else rc = 0;
     }
+out:
     free(doc);
     return rc;
 }
@@ -308,7 +407,8 @@ static const char *node_unsupported(const struct policy *p, bool dry, const char
     if (p->v.proxy) return "the egress proxy (with step 4, the pod's network)";
     if (g_policy_any_name) return "host-name rules (with step 4, the pod's network)";
     if (p->v.ncreds) return "credentials";
-    if (p->v.launches) return "decided launches (with step 3, the launcher)";
+    if (p->v.launches && !g_nr.launcher)
+        return "decided launches without the launcher (" NODE_LAUNCHER " first in the command: the NRI plugin)";
     for (size_t i = 0; i < p->v.n; i++)
         if (p->v.rules[i].subagent[0]) return "sub-agents";
     return NULL;
@@ -331,8 +431,25 @@ static void node_run_start(FILE *f) {
     json_escape(f, g_nr.ctr);
     fprintf(f, "\"},\"command\":\"");
     json_escape(f, g_nr.argv0);
-    fprintf(f, "\",\"uid\":%u,\"gid\":%u,\"opens_as_agent\":%s},", (unsigned)g_nr.uid, (unsigned)g_nr.gid,
+    fprintf(f, "\",\"uid\":%u,\"gid\":%u,\"opens_as_agent\":%s,\"policy\":\"", (unsigned)g_nr.uid, (unsigned)g_nr.gid,
             g_as.on ? "true" : "false");
+    json_escape(f, g_nr.policy);
+    fprintf(f, "\",\"launcher\":%s", g_nr.launcher ? "true" : "false");
+    if (g_nr.set_text) {                         /* the paths Landlock is given, each name */
+        fputs(",\"launch_paths\":[", f);
+        const char *s = g_nr.set_text;
+        for (bool first = true; *s; first = false) {
+            const char *e = strchr(s, '\n');
+            char one[PATH_MAX];
+            snprintf(one, sizeof one, "%.*s", (int)(e - s), s);
+            fputs(first ? "\"" : ",\"", f);
+            json_escape(f, one);
+            fputc('"', f);
+            s = e + 1;
+        }
+        fputc(']', f);
+    }
+    fputs("},", f);
 }
 
 /* A container the supervisor cannot carry: said in its stream, then the
@@ -419,9 +536,37 @@ static ssize_t node_receive(int c, char *buf, size_t cap, int *fds, int *nfd) {
 /* Listen for the runtime. Returns 0 in each supervisor (one per container,
  * set up to continue the Warden's start as for a run) and -1 if the listener
  * cannot be made; the node agent itself never returns otherwise. */
-static int node_listen(const char *sock_path, const char *streams) {
+static int node_listen(const char *sock_path, const char *streams, const char *launcher, const char **policy_path) {
     int sd = open(streams, O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (sd < 0) { fprintf(stderr, "[warden] --node-streams %s: %s\n", streams, strerror(errno)); return -1; }
+    /* v1.34 step 3: a directory of policies, chosen by name per container,
+     * or one policy file for every container; root's, written by no one else */
+    struct stat ps;
+    if (stat(*policy_path, &ps) < 0) { fprintf(stderr, "[warden] %s: %s\n", *policy_path, strerror(errno)); return -1; }
+    if (S_ISDIR(ps.st_mode)) {
+        if (ps.st_uid != 0 || (ps.st_mode & 022)) {
+            fprintf(stderr, "[warden] the policies' directory %s must be root's, written by no one else\n", *policy_path);
+            return -1;
+        }
+        g_node_policies = *policy_path;
+    }
+    /* the launcher the plugin binds at /varek/init: root's, written by no
+     * one else, known by its device and inode */
+    if (launcher) {
+        int lf = open(launcher, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+        struct stat ls;
+        if (lf < 0 || fstat(lf, &ls) < 0 || !S_ISREG(ls.st_mode) || ls.st_uid != 0 || (ls.st_mode & 022) ||
+            !(ls.st_mode & 0111)) {
+            fprintf(stderr, "[warden] --node-launcher %s: must be an executable file, root's, written by no one else%s%s\n",
+                    launcher, lf < 0 ? ": " : "", lf < 0 ? strerror(errno) : "");
+            if (lf >= 0) close(lf);
+            return -1;
+        }
+        close(lf);
+        g_node_have_launcher = true;
+        g_node_launcher_dev = ls.st_dev;
+        g_node_launcher_ino = ls.st_ino;
+    }
     struct sockaddr_un a = { .sun_family = AF_UNIX };
     if (strlen(sock_path) >= sizeof a.sun_path) { fprintf(stderr, "[warden] --node-agent: the path is too long\n"); return -1; }
     snprintf(a.sun_path, sizeof a.sun_path, "%s", sock_path);
@@ -451,7 +596,8 @@ static int node_listen(const char *sock_path, const char *streams) {
     struct sigaction sc = { .sa_handler = node_on_chld };   /* no SA_RESTART: accept returns to reap */
     sigemptyset(&sc.sa_mask);
     sigaction(SIGCHLD, &sc, NULL);
-    fprintf(stderr, "[warden] node agent: listening on %s; streams in %s\n", sock_path, streams);
+    fprintf(stderr, "[warden] node agent: listening on %s; streams in %s; %s %s; launcher %s\n", sock_path, streams,
+            g_node_policies ? "policies by name from" : "one policy,", *policy_path, launcher ? launcher : "none");
     static char buf[NODE_STATE_MAX + 1];
     for (;;) {
         if (g_node_chld) node_reap();
@@ -519,6 +665,7 @@ static int node_listen(const char *sock_path, const char *streams) {
         if (so < 0 || dup2(so, STDERR_FILENO) < 0) node_fail("cannot open its stream");
         close(so);
         close(sd);
+        if (ok == 0) ok = node_policy(buf, (size_t)r, policy_path, why, sizeof why);
         if (ok == 0) ok = node_config(why, sizeof why);
         if (ok == 0) ok = node_process(why, sizeof why);
         if (ok == 0 && node_enter(CLONE_NEWNET) < 0) {
@@ -531,10 +678,235 @@ static int node_listen(const char *sock_path, const char *streams) {
     }
 }
 
+
+/* ---- v1.34 step 3: the launcher and D4 ---- */
+
+/* /varek/init in the container's view is the node's launcher, mounted
+ * read-only (the plugin's bind of --node-launcher). 0, or -1 with why. */
+static int node_launcher_check(char *why, size_t wn) {
+    struct stat st;
+    struct statvfs sv;
+    if (lstat(NODE_LAUNCHER, &st) < 0 || !S_ISREG(st.st_mode) || st.st_dev != g_node_launcher_dev ||
+        st.st_ino != g_node_launcher_ino) {
+        snprintf(why, wn, NODE_LAUNCHER " in the container is not the node's launcher (--node-launcher)");
+        return -1;
+    }
+    if (statvfs(NODE_LAUNCHER, &sv) < 0 || !(sv.f_flag & ST_RDONLY)) {
+        snprintf(why, wn, NODE_LAUNCHER " is not mounted read-only in the container");
+        return -1;
+    }
+    return 0;
+}
+
+/* Whether the process runs the node's launcher (its executable, through the
+ * node's /proc) */
+static bool node_runs_launcher(pid_t pid) {
+    struct stat st;
+    return proc_statf(&st, "%d/exe", pid) == 0 && st.st_dev == g_node_launcher_dev && st.st_ino == g_node_launcher_ino;
+}
+
+/* One of the container's mounts, from its mountinfo */
+struct node_mnt {
+    unsigned maj, min;
+    char    *root, *mp;
+    bool     ro, noexec, kernel, mask;
+};
+
+static bool node_opt(const char *opts, const char *o) {
+    size_t ol = strlen(o);
+    for (const char *s = opts; s && *s; ) {
+        const char *c = strchr(s, ',');
+        size_t l = c ? (size_t)(c - s) : strlen(s);
+        if (l == ol && !strncmp(s, o, ol)) return true;
+        s = c ? c + 1 : NULL;
+    }
+    return false;
+}
+
+/* a and b name one directory, or one is beneath the other */
+static bool node_overlap(const char *a, const char *b) {
+    size_t al = strlen(a), bl = strlen(b), l = al < bl ? al : bl;
+    if (strncmp(a, b, l)) return false;
+    if (al == bl) return true;
+    const char *lg = al > bl ? a : b;
+    return l == 1 || lg[l] == '/';               /* "/" holds everything */
+}
+
+/* D4, as the descriptor arrives (in the container's mount namespace, before
+ * any of its code runs): the root read-only; every writable mount noexec,
+ * except a kernel file system nothing can be written to as a program (proc,
+ * sysfs, cgroup, mqueue, devpts) and a runtime's mask (a character device
+ * bound over a /proc or /sys entry); and no mount that allows execution
+ * showing files a writable mount can change (the same file system, one root
+ * at or beneath the other: a volume mounted twice). 0, or -1 with why. */
+#define NODE_MOUNTS_MAX 1024
+static int node_d4(char *why, size_t wn) {
+    FILE *mi = proc_fopenf("%d/mountinfo", g_nr.pid);
+    if (!mi) { snprintf(why, wn, "cannot read the container's mounts"); return -1; }
+    static struct node_mnt m[NODE_MOUNTS_MAX];
+    size_t nm = 0;
+    char *line = NULL;
+    size_t cap = 0;
+    int rc = 0;
+    static const char *const kKernel[] = { "proc", "sysfs", "cgroup", "cgroup2", "mqueue", "devpts", NULL };
+    while (rc == 0 && getline(&line, &cap, mi) > 0) {
+        /* id parent maj:min root mountpoint opts [optional...] - fstype source superopts */
+        char *f[64];
+        int nf = 0;
+        char *save = NULL;
+        for (char *t = strtok_r(line, " \n", &save); t && nf < 64; t = strtok_r(NULL, " \n", &save)) f[nf++] = t;
+        int dash = -1;
+        for (int k = 6; k < nf; k++) if (!strcmp(f[k], "-")) { dash = k; break; }
+        if (nm == NODE_MOUNTS_MAX) { snprintf(why, wn, "the container has more than %d mounts", NODE_MOUNTS_MAX); rc = -1; break; }
+        struct node_mnt *x = &m[nm];
+        if (dash < 0 || dash + 3 >= nf || sscanf(f[2], "%u:%u", &x->maj, &x->min) != 2) {
+            snprintf(why, wn, "the container's mounts cannot be read (a line of its mountinfo)");
+            rc = -1;
+            break;
+        }
+        noexec_unescape(f[3]);
+        noexec_unescape(f[4]);
+        x->root = strdup(f[3]);
+        x->mp = strdup(f[4]);
+        if (!x->root || !x->mp) { snprintf(why, wn, "out of memory"); rc = -1; break; }
+        nm++;
+        x->ro = node_opt(f[5], "ro") || node_opt(f[dash + 3], "ro");
+        x->noexec = node_opt(f[5], "noexec");
+        x->kernel = false;
+        for (int k = 0; kKernel[k]; k++) if (!strcmp(f[dash + 1], kKernel[k])) x->kernel = true;
+        struct stat st;
+        x->mask = (!strncmp(x->mp, "/proc/", 6) || !strncmp(x->mp, "/sys/", 5)) &&
+                  lstat(x->mp, &st) == 0 && S_ISCHR(st.st_mode);
+    }
+    free(line);
+    fclose(mi);
+    bool root_seen = false;
+    for (size_t i = 0; rc == 0 && i < nm; i++) {
+        const struct node_mnt *x = &m[i];
+        if (!strcmp(x->mp, "/")) {
+            root_seen = true;
+            if (!x->ro) {
+                snprintf(why, wn, "the container's root file system is writable (D4: readOnlyRootFilesystem: true)");
+                rc = -1;
+            }
+            continue;
+        }
+        if (x->kernel || x->mask || x->ro || x->noexec) continue;
+        snprintf(why, wn, "the container's writable mount %.300s is not noexec (D4; the NRI plugin makes it so)", x->mp);
+        rc = -1;
+    }
+    if (rc == 0 && !root_seen) { snprintf(why, wn, "the container's mounts show no root"); rc = -1; }
+    for (size_t i = 0; rc == 0 && i < nm; i++) {
+        const struct node_mnt *x = &m[i];
+        if (x->kernel || x->mask || x->noexec) continue;               /* nothing written there runs */
+        for (size_t j = 0; rc == 0 && j < nm; j++) {
+            const struct node_mnt *w = &m[j];
+            if (w->ro || w->kernel || w->mask || w->maj != x->maj || w->min != x->min ||
+                !node_overlap(w->root, x->root)) continue;
+            snprintf(why, wn, "the container's mount %.200s allows execution and shows files its writable mount "
+                     "%.200s can change (one volume mounted twice; D4)", x->mp, w->mp);
+            rc = -1;
+        }
+    }
+    for (size_t i = 0; i < nm; i++) { free(m[i].root); free(m[i].mp); }
+    return rc;
+}
+
+/* The launch set the launcher reads: each file's path in the container's
+ * view, one a line, in a sealed memfd. Landlock is applied to each path, so
+ * a file's other names (hardlinks: on the overlay file system a container's
+ * root is, a rule on one name of a file does not cover another) are not in
+ * it. 0, or -1 with why. */
+static int node_set_view(char *why, size_t wn) {
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *f = open_memstream(&buf, &len);
+    if (!f) { snprintf(why, wn, "out of memory"); return -1; }
+    for (size_t k = 0; k < g_exec_n + g_exec_nalias; k++) {
+        const char *pk = k < g_exec_n ? g_exec_rs[k].path : g_exec_alias[k - g_exec_n];
+        bool dup = false;
+        for (size_t j = 0; j < k && !dup; j++) dup = !strcmp(j < g_exec_n ? g_exec_rs[j].path : g_exec_alias[j - g_exec_n], pk);
+        if (dup) continue;
+        if (pk[0] != '/' || strchr(pk, '\n')) {
+            fclose(f);
+            free(buf);
+            snprintf(why, wn, "the launch set holds a path the launcher cannot read (a newline in it)");
+            return -1;
+        }
+        fprintf(f, "%s\n", pk);
+    }
+    if (fclose(f) != 0) { free(buf); snprintf(why, wn, "out of memory"); return -1; }
+    int fd = memfd_create("launch_set_view", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    bool ok = fd >= 0 && fchmod(fd, 0444) == 0 && write_all(fd, buf, len) == 0 &&
+              fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) == 0;
+    g_nr.set_text = buf;                         /* run_start's "launch_paths" */
+    if (!ok) {
+        if (fd >= 0) close(fd);
+        snprintf(why, wn, "cannot make the launch set's view (%s)", strerror(errno));
+        return -1;
+    }
+    g_nr.set_view = fd;
+    return 0;
+}
+
+/* The launcher's open of its launch set, answered from the view: true when
+ * the call was answered. Any other call of the launcher is let through. */
+static bool node_launcher_open(int notify_fd, const struct seccomp_notif *req) {
+    if (req->data.nr != __NR_openat && req->data.nr != __NR_openat2
+#ifdef __NR_open
+        && req->data.nr != __NR_open
+#endif
+        ) return false;
+    static struct action a;
+    if (derive_intent(req, &a) < 0 || a.kind != ACT_FILE_OPEN || strcmp(a.target, NODE_SET_VIEW) ||
+        !node_runs_launcher((pid_t)req->pid)) return false;
+    int fd = proc_openf(O_RDONLY, 0, "self/fd/%d", g_nr.set_view);         /* its own offset */
+    if (fd < 0 || !notif_id_valid(notify_fd, req->id) || inject_fd(notify_fd, req->id, fd) != 0)
+        send_errno(notify_fd, req->id, EACCES);
+    if (fd >= 0) close(fd);
+    g_nr.launcher_calls++;
+    return true;
+}
+
+/* A launch before the container's command (the bootstrap): the runtime's of
+ * /varek/init, let through; then the launcher's of the command, which is the
+ * bootstrap (false: the caller goes on to it). Anything else ends the
+ * container. true when the call was answered. */
+static int node_launcher_exec(int notify_fd, const struct seccomp_notif *req, const struct action *a,
+                              const char *bootstrap_path, bool by_fd) {
+    char why[PATH_MAX + 160];
+    if ((pid_t)req->pid != g_nr.pid) node_fail("a launch before the container's command, not by its init");
+    if (!g_nr.in_launcher) {
+        if (by_fd || strcmp(a->target, NODE_LAUNCHER)) {
+            snprintf(why, sizeof why, "before the launcher, the container's init launched \"%.*s\", not " NODE_LAUNCHER,
+                     PATH_MAX, by_fd ? "(a descriptor)" : a->target);
+            node_fail(why);
+        }
+        /* the runtime's own launch, of the file checked to be the node's
+         * launcher (node_launcher_check), on a read-only mount */
+        struct seccomp_notif_resp r = { .id = req->id, .flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE };
+        if (ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &r) == 0) g_nr.in_launcher = true;
+        return 1;                       /* (not taken: interrupted, the kernel restarts it) */
+    }
+    if (by_fd || strcmp(a->target, bootstrap_path)) {
+        snprintf(why, sizeof why, "the launcher launched \"%.*s\", not the container's command", PATH_MAX,
+                 by_fd ? "(a descriptor)" : a->target);
+        node_fail(why);
+    }
+    /* the launcher's launch is answered with CONTINUE, as the Warden's own
+     * child's is on a host: sound while nothing else can change the path it
+     * names, so the caller runs the launcher, single-threaded */
+    if (!node_runs_launcher((pid_t)req->pid))
+        node_fail("the container's command was launched by a process that does not run the launcher");
+    if (node_status_field((pid_t)req->pid, "Threads:") != 1)
+        node_fail("the launcher is not single-threaded at the container's command");
+    return 0;
+}
+
 /* The container's supervision, where a run forks its agent (main): into the
  * container's mount namespace, now that the node's files are open, then the
  * descriptor supervised as a run's. Returns the Warden's exit status. */
-static int node_supervise(const struct policy *p, const char *boot_path) {
+static int node_supervise(const struct policy *p, const char *boot_path, const char *policy_path) {
     if (node_enter(CLONE_NEWNS) < 0) {
         char why[160];
         snprintf(why, sizeof why, "cannot enter the container's mount namespace (%s)", strerror(errno));
@@ -544,6 +916,31 @@ static int node_supervise(const struct policy *p, const char *boot_path) {
     if ((g_view_depth = pidns_depth(g_nr.pid)) < 0 || !node_alive(g_nr.pidfd))
         node_fail("cannot read the container's PID namespace (NSpid)");
     g_view_container = true;
+    /* v1.34 step 3: the launcher, D4 and the launch set, in the container's
+     * view, before any of its code runs; the Warden's own filter for the
+     * policy, by which the calls the pod's filter notifies for the runtime
+     * are answered once the command runs */
+    char why[600];
+    if (wd_filter_bpf(p->v.open_as_agent ? WD_FILTER_CHANGES : 0, &g_nr.bpf, &g_nr.nbpf) < 0)
+        node_fail("cannot compile the Warden's filter for the policy");
+    if (g_nr.launcher && node_launcher_check(why, sizeof why) < 0) node_fail(why);
+    if (p->v.launches && node_d4(why, sizeof why) < 0) node_fail(why);
+    if (g_nr.launcher) {
+        g_exec_rules_off = !p->v.launches;      /* the command alone, when the policy decides no launch */
+        if (exec_ruleset_build(p, boot_path) < 0 || (p->v.launches && exec_confined_checks(p) < 0))
+            node_fail("the launch set cannot be built (above)");
+        if (g_ll_abi < 1)
+            node_fail("the node has no Landlock: the launcher could not hold the container to its launch set");
+        if (p->v.launches) {
+            if (noexec_build(p, boot_path) < 0) node_fail("the directories the agent may write (above)");
+            if (g_nxi_n)
+                node_fail("a program the policy allows to launch is under a directory it may write: kept executable "
+                          "on a host, it cannot be in a pod (D4: every writable mount noexec)");
+        }
+        if (node_set_view(why, sizeof why) < 0) node_fail(why);
+        fprintf(stderr, "[warden] launch set: %zu files, held by the launcher's Landlock (ABI %d)\n", g_exec_n, g_ll_abi);
+    }
+    emit_run_start(policy_path, p);
     /* the pod's network namespace is the Warden's own now: both held, the
      * same, so a socket made "in the agent's" and the stub resolver's are the
      * pod's (warden_net.inc.c, warden_stub.inc.c) */

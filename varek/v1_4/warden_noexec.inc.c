@@ -437,7 +437,13 @@ static bool noexec_breach(const char *resolved, int fd) {
     for (size_t k = 0; k < g_nx_n && !under; k++) under = noexec_under(resolved, g_nx[k].path);
     if (!under || noexec_in_island(resolved)) return false;          /* v1.29: kept executable */
     struct statvfs sv;
-    return fstatvfs(fd, &sv) < 0 || !(sv.f_flag & ST_NOEXEC);
+    if (fstatvfs(fd, &sv) < 0) return true;
+    /* v1.34 step 3: in a pod the Warden mounts nothing; D4 (the node agent,
+     * at the start) has every writable mount noexec, and no mount that allows
+     * execution showing what one of them can change, so a file on a
+     * read-only mount was not written by the agent */
+    if (g_nr.on && (sv.f_flag & ST_RDONLY)) return false;
+    return !(sv.f_flag & ST_NOEXEC);
 }
 
 /* ---- step 4: the record ---- */
