@@ -152,6 +152,10 @@ def main():
             pod = (rs.get("node") or {}).get("pod", {})
             if pod.get("namespace") != "varek-soak":
                 continue
+            # a stream of an earlier run on the same cluster (the node keeps
+            # them) is not this run's
+            if isinstance(rs.get("timestamp_ns"), int) and rs["timestamp_ns"] < meta["start"] * 10**9:
+                continue
             streams[s] = {"node": node, "run": rs.get("run"), "pod": pod.get("name"), "records": len(recs),
                           "end": any(r.get("event") == "run_end" for r in recs),
                           "deny": sum(1 for r in recs if r.get("decision_final") == "DENY"),

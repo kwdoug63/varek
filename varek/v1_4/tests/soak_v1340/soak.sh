@@ -120,6 +120,12 @@ SETS=(--set image.repository="$REPO" --set image.tag="$TAG" --set signing.secret
 say "installing the chart (${SETS[*]})"
 helm upgrade --install varek "$ROOT/packaging/helm/varek" -n "$NS" --wait --timeout 10m "${SETS[@]}" > "$OUT/helm.log" 2>&1 ||
     { tail -20 "$OUT/helm.log" | tee -a "$LOG"; die "the chart did not install"; }
+# the node agent reads the node's key at its start, and an upgrade that changes
+# only the Secret starts nothing again: on a run after another, its pods would
+# go on signing with the last run's key. They are started again with this one.
+DS="$(K -n "$NS" get ds -l app.kubernetes.io/component=node -o name)"
+K -n "$NS" rollout restart "$DS" > /dev/null &&
+    K -n "$NS" rollout status "$DS" --timeout 10m >> "$LOG" 2>&1 || die "the node agent's pods did not start again"
 K -n "$NS" get pods -o wide >> "$LOG"
 for _ in $(seq 60); do
     n=$(for p in $(K -n "$NS" get pod -l app.kubernetes.io/component=node -o name); do
