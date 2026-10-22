@@ -15,8 +15,9 @@
 #   - the services they call (servers.py), unsupervised, in a namespace of
 #     their own: one the policy names, one it does not.
 # Every --sample seconds it records the pods, the finished pods' logs, each
-# node's VAREK processes' memory (read in the node agent's container) and
-# the exporter's log. At the end it collects each node's streams and anchor
+# node's VAREK processes' memory (read in the node agent's container); each
+# node's exporter log is followed throughout for its audit events and its
+# errors. At the end it collects each node's streams and anchor
 # and runs soak_check.py, which judges the run and writes report.txt.
 #
 #   varek/v1_4/tests/soak_v1340/soak.sh --image REPO:TAG [--digest sha256:...]
@@ -178,6 +179,26 @@ sleep 10                                # the plugin's -sync writes it to each n
 
 # --- 4. the agents
 START=$(date +%s)
+# the exporter's audit events and its errors, each node's followed across the
+# kubelet's rotations of its log (10 MiB: a minute or two of a busy node's
+# events), of which kubectl logs alone reads only the last; a pod replaced
+# is found again, and what a reconnection reads twice is taken once
+START_ISO="$(date -u -d @"$START" +%Y-%m-%dT%H:%M:%SZ)"
+follow_exporter() {
+    local node="$1" p
+    while [ ! -e "$OUT/.done" ]; do
+        p="$(K -n "$NS" get pod -l app.kubernetes.io/component=node --field-selector spec.nodeName="$node" \
+             -o name 2>/dev/null | head -1)"
+        # kubectl itself, not K: a child of this loop, ended with it
+        [ -n "$p" ] && kubectl -n "$NS" logs -f "$p" -c exporter --since-time="$START_ISO" 2>/dev/null |
+            grep --line-buffered -E '"event":"audit"|^[^{]' >> "$OUT/exporter/$node.jsonl"
+        sleep 5
+    done
+}
+FOLLOWERS=()
+for n in "${NODES[@]}"; do follow_exporter "$n" & FOLLOWERS+=($!); done
+stop_followers() { touch "$OUT/.done"; for f in "${FOLLOWERS[@]}"; do pkill -P "$f" 2>/dev/null; kill "$f" 2>/dev/null; done; }
+trap stop_followers EXIT
 END=$((START + $(python3 -c "print(int(float('$HOURS') * 3600))")))
 python3 - "$OUT" "$AGENT_IMG" "$AG" "$SVC" "$DENIED_IP" "$HOURS" "$INTERVAL" "$SHORT_EVERY" "$OPENSHIFT" "${NODES[@]}" <<'EOF'
 import json, sys
@@ -253,7 +274,6 @@ for p in os.listdir("/proc"):
         out.append({"pid": int(p), "ppid": int(st["PPid"]), "name": name, "arg": arg[:120],
                     "rss_kb": int(st.get("VmRSS", "0 kB").split()[0])})
 print(json.dumps({"t": time.time(), "procs": out}))'
-declare -A SINCE
 sample() {
     K -n "$AG" get pods -o json > "$OUT/samples/pods.json.tmp" 2>/dev/null && mv "$OUT/samples/pods.json.tmp" "$OUT/samples/pods.json"
     python3 - "$OUT" <<'EOF'
@@ -282,14 +302,6 @@ EOF
         K -n "$NS" exec "$p" -c node-agent -- python3 -c "$MEMPY" 2>/dev/null |
             python3 -c 'import json,sys; r=json.loads(sys.stdin.read()); r["node"]=sys.argv[1]; print(json.dumps(r))' "$node" \
             >> "$OUT/samples/mem.jsonl" 2>/dev/null
-        local since="${SINCE[$node]:-}" now
-        now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        if [ -n "$since" ]; then
-            K -n "$NS" logs "$p" -c exporter --since-time="$since" >> "$OUT/exporter/$node.jsonl" 2>/dev/null
-        else
-            K -n "$NS" logs "$p" -c exporter >> "$OUT/exporter/$node.jsonl" 2>/dev/null
-        fi
-        SINCE[$node]="$now"
     done
 }
 while [ "$(date +%s)" -lt "$END" ]; do

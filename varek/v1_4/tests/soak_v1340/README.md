@@ -25,9 +25,10 @@ profile. Its probes, in turn, each to be refused or not to reach its server:
 (a copy of `true`); the denied service by name, and by its address; the
 instance metadata service (169.254.169.254).
 
-Every 5 minutes it records the pods, the finished pods' logs, each node's
-VAREK processes' memory and the exporter's log. At the end it collects each
-node's streams and anchor, and `soak_check.py` judges the run: every turn
+Every 5 minutes it records the pods, the finished pods' logs and each
+node's VAREK processes' memory; each node's exporter log is followed
+throughout, across the kubelet's rotations of it, for its audit events and
+errors. At the end it collects each node's streams and anchor, and `soak_check.py` judges the run: every turn
 done and every probe held, the denied service reached by nothing, one
 stream per agent container, each audited (signed with the node's key,
 anchored), each run's audit passed in the exporter's log, VAREK's own pods
