@@ -38,15 +38,21 @@ PROBES = {"shadow", "outside", "own_program", "denied_host", "denied_ip", "metad
 
 
 def jl(path):
-    out = []
+    """the JSON objects of a log, a line each; objects run together on one
+    line (two writers at once, as servers.py's threads before its lock) are
+    each read"""
+    out, dec = [], json.JSONDecoder()
     try:
         for line in open(path, errors="replace"):
-            line = line.strip()
-            if line.startswith("{"):
+            line, pos = line.strip(), 0
+            while pos < len(line) and line[pos] == "{":
                 try:
-                    out.append(json.loads(line))
+                    obj, pos = dec.raw_decode(line, pos)
                 except ValueError:
-                    pass
+                    break
+                out.append(obj)
+                while pos < len(line) and line[pos].isspace():
+                    pos += 1
     except OSError:
         pass
     return out

@@ -14,6 +14,7 @@ Standard library only. Runs unsupervised, in the soak's services' namespace.
 import argparse
 import json
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -23,11 +24,19 @@ def main():
     ap.add_argument("--name", required=True)
     ap.add_argument("--port", type=int, default=8080)
     a = ap.parse_args()
+    lock = threading.Lock()
+
+    def log(rec):
+        # one write a line, one thread at a time: two requests at once (the
+        # server is threaded) printed as one line were each lost to the count
+        line = json.dumps(rec) + "\n"
+        with lock:
+            sys.stdout.write(line)
+            sys.stdout.flush()
 
     class H(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802 - the library's name
-            print(json.dumps({"t": round(time.time(), 3), "server": a.name, "client": self.client_address[0],
-                              "path": self.path}), flush=True)
+            log({"t": round(time.time(), 3), "server": a.name, "client": self.client_address[0], "path": self.path})
             body = (a.name + "\n").encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -38,7 +47,7 @@ def main():
         def log_message(self, *args):
             pass
 
-    print(json.dumps({"t": round(time.time(), 3), "server": a.name, "listening": a.port}), flush=True)
+    log({"t": round(time.time(), 3), "server": a.name, "listening": a.port})
     ThreadingHTTPServer(("", a.port), H).serve_forever()
 
 
