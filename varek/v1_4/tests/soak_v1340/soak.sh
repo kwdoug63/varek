@@ -59,6 +59,9 @@ if [ -n "$CHECK_ONLY" ]; then
     exec python3 "$SOAK/soak_check.py" "$CHECK_ONLY" --tools "$HERE/tools"
 fi
 [ -n "$IMAGE" ] || { echo "usage: soak.sh --image REPO:TAG [options] (--help)" >&2; exit 2; }
+# the chart pins the image by it: a digest no registry has is pods that never pull
+[ -z "$DIGEST" ] || [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+    { echo "soak.sh: --digest takes sha256: and 64 hex digits (the one docker push printed), not '$DIGEST'" >&2; exit 2; }
 for t in kubectl helm python3; do command -v "$t" > /dev/null || { echo "soak.sh: $t is needed" >&2; exit 2; }; done
 [ -x "$HERE/tools/varek_keygen" ] && [ -x "$HERE/tools/vdp_cert_check" ] ||
     { echo "soak.sh: build the tools first (make -C varek/v1_4 all)" >&2; exit 2; }
