@@ -176,6 +176,14 @@ oc adm release extract --credentials-requests --included --install-config ~/vare
   --output-dir ~/ocp/ccoctl-out --create-private-s3-bucket
 ```
 
+The cluster takes one Elastic IP (its NAT gateway's) of the region's 5 (the
+default quota; EKS's NAT gateway holds another): the template gives both
+pools the one zone. The first run, its worker pool's zones not given, laid
+out all five of the region's, ran out of addresses (AddressLimitExceeded)
+and stopped at "infrastructure was not ready within 15m0s";
+`openshift-install destroy cluster` removed what it had made. Check first:
+`aws ec2 describe-addresses --region us-east-1 --query 'length(Addresses)'`.
+
 The manifests, with the roles' and NRI's, and the cluster (about 45
 minutes, detached):
 
