@@ -22,14 +22,18 @@
 #
 #   varek/v1_4/tests/soak_v1340/soak.sh --image REPO:TAG [--digest sha256:...]
 #        [--hours 24] [--interval 60] [--short-every 15] [--sample 300]
-#        [--openshift] [--out DIR] [--check-only DIR]
+#        [--openshift] [--ecr-pull-secret] [--out DIR] [--check-only DIR]
 #
 # Against the cluster kubectl's current context names, with helm and python3
 # where this runs, and this checkout's tools/varek_keygen and
 # tools/vdp_cert_check built (make -C varek/v1_4 all). --image is the node
 # image (packaging/container/Containerfile --target node) the nodes can
 # pull; --digest pins it. --openshift: CRI-O, the chart's SCCs, the agents'
-# user given by the namespace (README.md). The run's directory is DIR
+# user given by the namespace (README.md). --ecr-pull-secret: the image is in
+# ECR and the nodes have no ECR access of their own (OpenShift): a pull
+# secret for it is made in varek-system from this host's AWS access (aws ecr
+# get-login-password; a token of 12 hours, enough for the pods' one pull) and
+# given to the chart. The run's directory is DIR
 # (default /var/tmp/varek-soak-k8s-<time>); DIR/report.txt holds the verdict.
 # --check-only DIR runs soak_check.py again on a run already collected.
 #
@@ -40,7 +44,7 @@ set -u
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 SOAK="$HERE/tests/soak_v1340"
-IMAGE="" DIGEST="" HOURS=24 INTERVAL=60 SHORT_EVERY=15 SAMPLE=300 OPENSHIFT=0 OUT="" CHECK_ONLY=""
+IMAGE="" DIGEST="" HOURS=24 INTERVAL=60 SHORT_EVERY=15 SAMPLE=300 OPENSHIFT=0 ECR_PULL=0 OUT="" CHECK_ONLY=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --image) IMAGE="$2"; shift 2 ;;
@@ -50,6 +54,7 @@ while [ $# -gt 0 ]; do
         --short-every) SHORT_EVERY="$2"; shift 2 ;;
         --sample) SAMPLE="$2"; shift 2 ;;
         --openshift) OPENSHIFT=1; shift ;;
+        --ecr-pull-secret) ECR_PULL=1; shift ;;
         --out) OUT="$2"; shift 2 ;;
         --check-only) CHECK_ONLY="$2"; shift 2 ;;
         -h|--help) sed -n '3,/^set -u$/{/^#/p}' "$0"; exit 0 ;;
@@ -117,6 +122,17 @@ SETS=(--set image.repository="$REPO" --set image.tag="$TAG" --set signing.secret
       --set anchor.enabled=true)
 [ -n "$DIGEST" ] && SETS+=(--set image.digest="$DIGEST")
 [ "$OPENSHIFT" = 1 ] && SETS+=(--set runtime=cri-o --set openshift.enabled=true)
+if [ "$ECR_PULL" = 1 ]; then
+    REG="${IMAGE%%/*}"
+    [[ "$REG" =~ ^[0-9]+\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com$ ]] || die "--ecr-pull-secret: $REG is not an ECR registry"
+    command -v aws > /dev/null || die "--ecr-pull-secret needs aws"
+    K -n "$NS" delete secret varek-image-pull > /dev/null 2>&1
+    # the token goes from aws to kubectl, never to the log
+    K -n "$NS" create secret docker-registry varek-image-pull --docker-server="$REG" --docker-username=AWS \
+        --docker-password="$(aws ecr get-login-password --region "${BASH_REMATCH[1]}")" > /dev/null ||
+        die "the image's pull secret (aws ecr get-login-password)"
+    SETS+=(--set "imagePullSecrets[0].name=varek-image-pull")
+fi
 say "installing the chart (${SETS[*]})"
 helm upgrade --install varek "$ROOT/packaging/helm/varek" -n "$NS" --wait --timeout 10m "${SETS[@]}" > "$OUT/helm.log" 2>&1 ||
     { tail -20 "$OUT/helm.log" | tee -a "$LOG"; die "the chart did not install"; }

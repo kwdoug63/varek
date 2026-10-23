@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # v1.34 step 9 (README.md, section 3): single-node OpenShift on AWS for the
 # 24-hour run (D11), made by openshift-install 4.22 or later (CRI-O 1.35).
-# Copy it into an empty directory as install-config.yaml and put in your
-# pull secret and SSH public key there, on your own machine; the installer
-# consumes the file. Nothing here is a secret.
+# openshift_sno_config.py writes it, with the pull secret and an SSH public
+# key put in, as DIR/install-config.yaml (0600) where openshift-install runs;
+# the installer consumes the file. Nothing here is a secret.
 apiVersion: v1
 baseDomain: soberagents-lab.com
 metadata:

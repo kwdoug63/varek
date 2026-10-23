@@ -130,46 +130,90 @@ aws ecr delete-repository --repository-name varek-node --region us-east-1 --forc
 Decided October 21, 2026 (D11): a single-node OpenShift on one EC2
 instance, made by `openshift-install` 4.22 or later (CRI-O 1.35) in the
 account's Route 53 domain (`soberagents-lab.com`). Its one node is
-schedulable, so the run has one long agent.
+schedulable, so the run has one long agent. It can run beside the EKS run,
+from the same host, in a shell of its own (its own `KUBECONFIG`).
+
+As root on the host, where the EKS image was built and pushed. The tools
+(the mirror's `stable-4.22` channel; `openshift-install version` must say
+4.22 or later):
 
 ```sh
-mkdir ~/varek-sno && cp varek/v1_4/tests/soak_v1340/openshift-sno-install-config.yaml ~/varek-sno/install-config.yaml
-# put the pull secret and an SSH public key into ~/varek-sno/install-config.yaml
-openshift-install version                                  # 4.22 or later
+mkdir -p ~/ocp && cd ~/ocp
+for t in openshift-install openshift-client; do
+  curl -fLO https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable-4.22/$t-linux.tar.gz
+done
+tar xzf openshift-install-linux.tar.gz -C /usr/local/bin openshift-install
+tar xzf openshift-client-linux.tar.gz -C /usr/local/bin oc
+openshift-install version
+```
+
+The pull secret, put on the host by its owner (pasted into the file, then
+Ctrl-D; it is not shown again), an SSH key made for the cluster, and the
+install config (`openshift_sno_config.py`: the template with both put in,
+mode 0600):
+
+```sh
+umask 077; cat > ~/ocp/pull-secret.json
+ssh-keygen -q -t ed25519 -N '' -f ~/ocp/varek-sno-ssh
+cd /root/varek && python3 varek/v1_4/tests/soak_v1340/openshift_sno_config.py \
+  --pull-secret ~/ocp/pull-secret.json --ssh-key ~/ocp/varek-sno-ssh.pub --dir ~/varek-sno
+```
+
+The manifests, NRI on from the first boot, and the cluster (about 45
+minutes, detached; `openshift-install` checks the host's AWS permissions
+first and stops there if any is missing):
+
+```sh
 openshift-install create manifests --dir ~/varek-sno
-cp varek/v1_4/tests/soak_v1340/openshift-nri-master.yaml ~/varek-sno/openshift/   # NRI on from the first boot
-openshift-install create cluster --dir ~/varek-sno         # about 45 minutes
+cp varek/v1_4/tests/soak_v1340/openshift-nri-master.yaml ~/varek-sno/openshift/99-master-varek-nri.yaml
+setsid nohup openshift-install create cluster --dir ~/varek-sno --log-level info \
+  > ~/varek-sno/create.out 2>&1 < /dev/null &
+tail -3 ~/varek-sno/.openshift_install.log     # until "Install complete!"
+```
+
+Then, in that shell only:
+
+```sh
 export KUBECONFIG=~/varek-sno/auth/kubeconfig
 oc get nodes -o wide                                       # cri-o://1.35 or later
-oc debug node/NODE -- chroot /host cat /etc/crio/crio.conf.d/99-varek-nri.conf   # enable_nri = true
+oc debug node/$(oc get nodes -o name | cut -d/ -f2) -- chroot /host cat /etc/crio/crio.conf.d/99-varek-nri.conf
 ```
 
-On a cluster made without it, `oc apply -f openshift-nri-master.yaml` (or
-`-worker.yaml` on one with workers) and `oc get mcp -w` until the pool is
-UPDATED: its nodes reboot.
+On a cluster made without the MachineConfig, `oc apply -f
+openshift-nri-master.yaml` and `oc get mcp master -w` until it is UPDATED
+(the node reboots).
 
-The node image must be pullable by the cluster (ECR with a pull secret, or
-OpenShift's own registry). `soak.sh --openshift` installs the chart with
-`runtime=cri-o` and `openshift.enabled=true`: the node agent's SCC, the
-plugin, the exporter and the init container as `spc_t`, the launcher
-labelled for containers, and the supervised pods' SCC (`varek-supervised`:
-restricted-v2 with VAREK's unsupervised profile admitted), which it gives
-the agents' service account. On OpenShift the agents run as the namespace's
-user, and give `runAsGroup` (the node agent refuses group 0).
+The node image is the EKS run's, in ECR. OpenShift's node has no ECR
+access of its own: `--ecr-pull-secret` makes a pull secret for it from the
+host's AWS access (its token lasts 12 hours; the node pulls once).
+`--openshift` installs the chart with `runtime=cri-o` and
+`openshift.enabled=true`: the node agent's SCC, the plugin, the exporter and
+the init container as `spc_t`, the launcher labelled for containers, and the
+supervised pods' SCC (`varek-supervised`: restricted-v2 with VAREK's
+unsupervised profile admitted), which it gives the agents' service account.
+On OpenShift the agents run as the namespace's user, and give `runAsGroup`
+(the node agent refuses group 0). The trial, then the 24 hours if it
+passes:
 
 ```sh
-varek/v1_4/tests/soak_v1340/soak.sh --openshift --image REGISTRY/varek-node:soak --digest sha256:... \
-  --hours 0.1 --interval 3 --short-every 2 --sample 30 --out /var/tmp/varek-soak-ocp-trial
+R=ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/varek-node; D=sha256:...
+S=varek/v1_4/tests/soak_v1340/soak.sh
+setsid nohup bash -c "$S --openshift --ecr-pull-secret --image $R:soak --digest $D --hours 0.1 --interval 3 \
+    --short-every 2 --sample 30 --out /var/tmp/varek-soak-ocp-trial \
+  && kubectl delete namespace varek-soak varek-soak-svc --wait \
+  && $S --openshift --ecr-pull-secret --image $R:soak --digest $D --hours 24 --out /var/tmp/varek-soak-ocp-24h" \
+  > /var/tmp/varek-soak-ocp.out 2>&1 < /dev/null &
 ```
-
-Then the 24 hours as for EKS, with `--openshift`, and the cluster removed
-after: `openshift-install destroy cluster --dir ~/varek-sno` (its instance,
-load balancers, NAT gateway, volumes and DNS records).
 
 What is not yet measured on OpenShift, and the trial shows first: the
 SELinux labels (the launcher bound into each container, the plugin's and
 the exporter's host paths), and the supervised SCC. A failure there is a
 container that does not start, not one that runs unsupervised.
+
+Then remove everything: `openshift-install destroy cluster --dir
+~/varek-sno` (its instance, load balancers, NAT gateway, volumes and DNS
+records), then `~/ocp/pull-secret.json` and
+`~/varek-sno-install-config.yaml.keep` (both hold the pull secret).
 
 ## Files
 
@@ -184,3 +228,4 @@ container that does not start, not one that runs unsupervised.
 | `eks-cluster.yaml` | The EKS cluster (eksctl). |
 | `openshift-nri-worker.yaml`, `openshift-nri-master.yaml` | CRI-O's NRI turned on (a MachineConfig). |
 | `openshift-sno-install-config.yaml` | The single-node OpenShift (openshift-install), without its pull secret and SSH key. |
+| `openshift_sno_config.py` | The install config with the pull secret and SSH key put in (0600; the secret never printed). |
