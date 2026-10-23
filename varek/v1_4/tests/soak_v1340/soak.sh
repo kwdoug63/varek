@@ -109,6 +109,14 @@ sys.exit(1 if bad or not nodes else 0)
 EOF
 sed 's/^/  node: /' "$OUT/nodes.txt" | tee -a "$LOG"
 NODES=($(cut -f1 "$OUT/nodes.txt"))
+# before anything is changed: --openshift on OpenShift only, and a run without
+# it not on OpenShift (a shell's KUBECONFIG lost, a run aimed at the other
+# cluster, deleted a 24-hour run's agents on EKS: README.md)
+if K api-resources --api-group=security.openshift.io -o name 2>/dev/null | grep -q '^securitycontextconstraints'; then
+    [ "$OPENSHIFT" = 1 ] || die "$(K config current-context) is OpenShift: give --openshift, or the cluster meant"
+else
+    [ "$OPENSHIFT" = 0 ] || die "--openshift, but $(K config current-context) is not OpenShift (KUBECONFIG?)"
+fi
 
 # --- 2. the chart
 "$HERE/tools/varek_keygen" "$OUT/node.key" > /dev/null

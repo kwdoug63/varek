@@ -107,9 +107,19 @@ Then the 24 hours, detached (a second release of the same chart on the same
 cluster is the trial's, upgraded in place; its namespaces' pods are
 replaced):
 
+Each command names its cluster (`KUBECONFIG`), not the shell: a Session
+Manager shell that times out comes back without what was exported in it,
+and a run on the same host against the other cluster (section 3) then
+lands on this one. (It did once: the OpenShift trial's namespaces deleted,
+on EKS, the 24-hour run's agents, 12.6 hours in. `soak.sh` now refuses
+`--openshift` on a cluster that is not OpenShift, and the converse, before
+it changes anything.)
+
 ```sh
+export KUBECONFIG=~/.kube/config                   # eksctl's
 kubectl delete namespace varek-soak varek-soak-svc --wait
-setsid nohup varek/v1_4/tests/soak_v1340/soak.sh --image ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/varek-node:soak \
+setsid nohup env KUBECONFIG=$KUBECONFIG varek/v1_4/tests/soak_v1340/soak.sh \
+  --image ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/varek-node:soak \
   --digest sha256:... --hours 24 --out /var/tmp/varek-soak-eks-24h > /var/tmp/varek-soak-eks.out 2>&1 < /dev/null &
 tail -f /var/tmp/varek-soak-eks-24h/soak.log      # a line every 5 minutes
 ```
@@ -223,7 +233,8 @@ passes:
 ```sh
 R=ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/varek-node; D=sha256:...
 S=varek/v1_4/tests/soak_v1340/soak.sh
-setsid nohup bash -c "$S --openshift --ecr-pull-secret --image $R:soak --digest $D --hours 0.1 --interval 3 \
+setsid nohup bash -c "export KUBECONFIG=$HOME/varek-sno/auth/kubeconfig; \
+  $S --openshift --ecr-pull-secret --image $R:soak --digest $D --hours 0.1 --interval 3 \
     --short-every 2 --sample 30 --out /var/tmp/varek-soak-ocp-trial \
   && kubectl delete namespace varek-soak varek-soak-svc --wait \
   && $S --openshift --ecr-pull-secret --image $R:soak --digest $D --hours 24 --out /var/tmp/varek-soak-ocp-24h" \
