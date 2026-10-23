@@ -612,6 +612,49 @@ static void pend_free(int i) {
     g_pend[i] = g_pend[--g_npend];
 }
 
+/* v1.34 step 9: under SELinux (OpenShift's nodes) a socket takes the
+ * context of the process that made it, and the kernel does not hand the
+ * agent (container_t) a socket the node agent (spc_t) made: ADDFD failed for
+ * every connect, with no denial logged. Under the node agent the socket it
+ * dials is made with the agent's own context: the thread's sockcreate, set
+ * for that one socket() (the Warden is single-threaded). Nothing is set where
+ * the agent has no SELinux context (AppArmor's labels have no ':'); a context
+ * that cannot be set leaves the socket the node agent's, and the handover
+ * refuses it, as before. Failing to clear it stops the Warden, as failing to
+ * leave the agent's network namespace does: every socket it made afterwards
+ * would carry the agent's context. */
+static bool sockcreate_as_agent(pid_t tid) {
+    char ctx[256];
+    int fd = proc_openf(O_RDONLY, 0, "%d/attr/current", tid);
+    if (fd < 0) return false;
+    ssize_t n = read(fd, ctx, sizeof ctx - 1);
+    close(fd);
+    if (n <= 0) return false;
+    ctx[n] = 0;
+    ctx[strcspn(ctx, "\n")] = 0;
+    int colons = 0;
+    for (const char *c = ctx; *c; c++) {
+        if (*c == ' ') return false;
+        colons += *c == ':';
+    }
+    if (colons < 3) return false;                 /* user:role:type:level */
+    if ((fd = open("/proc/thread-self/attr/sockcreate", O_WRONLY | O_CLOEXEC)) < 0) return false;
+    size_t l = strlen(ctx);
+    bool ok = write(fd, ctx, l) == (ssize_t)l;
+    close(fd);
+    return ok;
+}
+
+static void sockcreate_clear(void) {
+    int fd = open("/proc/thread-self/attr/sockcreate", O_WRONLY | O_CLOEXEC);
+    if (fd < 0 || write(fd, NULL, 0) < 0) {
+        fprintf(stderr, "[warden] internal error: cannot clear the context for new sockets (%s); stopping\n",
+                strerror(errno));
+        abort();
+    }
+    close(fd);
+}
+
 /* Hand the Warden's socket to the agent in place of its descriptor, and
  * answer its connect with reply_err (0 or EINPROGRESS). Returns the rule for
  * the record. */
@@ -647,6 +690,8 @@ static const char *handover(int notify_fd, uint64_t id, pid_t tid, int s, int af
     if (ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd) < 0) {
         int e = errno;
         if (e == ENOENT) { *kerr = 0; return "requester_gone"; }
+        log_line_start();
+        fprintf(g_log, "[warden] connect: the dialed socket could not be handed to the agent (%s)\n", strerror(e));
         send_errno(notify_fd, id, EACCES);
         *kerr = EACCES;
         return "injection_failed";
@@ -882,9 +927,11 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
     }
 
     /* Dial. */
+    bool as_agent = g_view_container && sockcreate_as_agent(tid);
     int s = socket(k.dom, k.type | SOCK_NONBLOCK | SOCK_CLOEXEC, k.proto);
+    err = errno;
+    if (as_agent) sockcreate_clear();
     if (s < 0) {
-        err = errno;
         close(ag);
         if (pin >= 0) close(pin);
         net_record(tid, a, d_raw, d_final, "dial_failed", t0, err);
