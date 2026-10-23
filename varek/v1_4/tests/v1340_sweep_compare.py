@@ -52,6 +52,21 @@ def checks(path):
     return out
 
 
+def host_failures(path, most=12):
+    """A failed run's FAIL lines as the suite printed them, each with the two
+    lines after it (a failure's reason), or its last lines if it has none."""
+    try:
+        lines = [l.rstrip("\n")[:300] for l in open(path, errors="replace")]
+    except OSError:
+        return ["(no log)"]
+    out = []
+    for i, l in enumerate(lines):
+        m = CHECK.match(l)
+        if (m and m.group(1) == "FAIL") or PYTEST_FAILED.match(l):
+            out.extend(lines[i:i + 3])
+    return (out or ["(no FAIL line; its last lines:)"] + lines[-8:])[:most * 3]
+
+
 def rc(path):
     try:
         return int(open(path).read().strip())
@@ -140,6 +155,9 @@ def main():
         if hrc not in (0, None):
             bad += 1
             notes.append("  %-16s FAILED ON THE HOST (rc=%s): the host run's own failure, see host/%s.log" % (s, hrc, s))
+            # step 9: the host's failures in the job's log too (the
+            # artifact is not where every reader can fetch it)
+            notes.extend("%-20s host: %s" % ("", l) for l in host_failures(os.path.join(out, "host", s + ".log")))
         rows.append((s, hrc, nrc, c, carried, passed))
         tot.update(c)
         tot["carried"] += carried
