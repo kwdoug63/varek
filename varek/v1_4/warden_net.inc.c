@@ -620,9 +620,12 @@ static void pend_free(int i) {
  * for that one socket() (the Warden is single-threaded). Nothing is set where
  * the agent has no SELinux context (AppArmor's labels have no ':'); a context
  * that cannot be set leaves the socket the node agent's, and the handover
- * refuses it, as before. Failing to clear it stops the Warden, as failing to
- * leave the agent's network namespace does: every socket it made afterwards
- * would carry the agent's context. */
+ * refuses it, as before, and the reason is logged. Failing to clear it stops
+ * the Warden, as failing to leave the agent's network namespace does: every
+ * socket it made afterwards would carry the agent's context. The Warden's own
+ * thread-self is named below the node's /proc (g_procfd): the supervisor is
+ * in the container's mount namespace, whose /proc has no entry for it (the
+ * first OpenShift trial with this: nothing was set, and nothing said). */
 static bool sockcreate_as_agent(pid_t tid) {
     char ctx[256];
     int fd = proc_openf(O_RDONLY, 0, "%d/attr/current", tid);
@@ -638,15 +641,20 @@ static bool sockcreate_as_agent(pid_t tid) {
         colons += *c == ':';
     }
     if (colons < 3) return false;                 /* user:role:type:level */
-    if ((fd = open("/proc/thread-self/attr/sockcreate", O_WRONLY | O_CLOEXEC)) < 0) return false;
     size_t l = strlen(ctx);
-    bool ok = write(fd, ctx, l) == (ssize_t)l;
-    close(fd);
+    bool ok = (fd = proc_openf(O_WRONLY, 0, "thread-self/attr/sockcreate")) >= 0 && write(fd, ctx, l) == (ssize_t)l;
+    if (!ok) {
+        int e = errno;
+        log_line_start();
+        fprintf(g_log, "[warden] connect: cannot make the dialed socket with the agent's context %s (%s)\n",
+                ctx, strerror(e));
+    }
+    if (fd >= 0) close(fd);
     return ok;
 }
 
 static void sockcreate_clear(void) {
-    int fd = open("/proc/thread-self/attr/sockcreate", O_WRONLY | O_CLOEXEC);
+    int fd = proc_openf(O_WRONLY, 0, "thread-self/attr/sockcreate");
     if (fd < 0 || write(fd, NULL, 0) < 0) {
         fprintf(stderr, "[warden] internal error: cannot clear the context for new sockets (%s); stopping\n",
                 strerror(errno));
