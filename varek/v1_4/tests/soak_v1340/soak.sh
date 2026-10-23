@@ -164,10 +164,12 @@ if [ "$OPENSHIFT" = 1 ]; then
     K -n "$AG" create rolebinding varek-supervised --clusterrole=varek-supervised-scc --serviceaccount="$AG:default" \
         --dry-run=client -o json | K apply -f - > /dev/null
 fi
-python3 - "$OUT/manifests" "$AGENT_IMG" "$SVC" <<'EOF'
+python3 - "$OUT/manifests" "$AGENT_IMG" "$SVC" "$OPENSHIFT" <<'EOF'
 import json, sys
-out, img, ns = sys.argv[1:]
+out, img, ns, openshift = sys.argv[1:]
 items = []
+# on OpenShift the namespace's user (restricted-v2 admits only its range)
+user = {} if openshift == "1" else {"runAsUser": 65534}
 for name in ("allowed", "denied"):
     lab = {"app": name}
     items += [{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": name, "namespace": ns},
@@ -176,7 +178,7 @@ for name in ("allowed", "denied"):
                    "containers": [{"name": name, "image": img,
                                    "command": ["python3", "-u", "/code/servers.py", "--name", name, "--port", "8080"],
                                    "ports": [{"containerPort": 8080}],
-                                   "securityContext": {"allowPrivilegeEscalation": False, "runAsUser": 65534,
+                                   "securityContext": {"allowPrivilegeEscalation": False, **user,
                                                        "capabilities": {"drop": ["ALL"]}},
                                    "readinessProbe": {"tcpSocket": {"port": 8080}},
                                    "volumeMounts": [{"name": "code", "mountPath": "/code"}]}],
