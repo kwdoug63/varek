@@ -148,23 +148,40 @@ openshift-install version
 ```
 
 The pull secret, put on the host by its owner (pasted into the file, then
-Ctrl-D; it is not shown again), an SSH key made for the cluster, and the
-install config (`openshift_sno_config.py`: the template with both put in,
-mode 0600):
+Ctrl-D; it is not shown again), and an SSH key made for the cluster:
 
 ```sh
 umask 077; cat > ~/ocp/pull-secret.json
 ssh-keygen -q -t ed25519 -N '' -f ~/ocp/varek-sno-ssh
-cd /root/varek && python3 varek/v1_4/tests/soak_v1340/openshift_sno_config.py \
-  --pull-secret ~/ocp/pull-secret.json --ssh-key ~/ocp/varek-sno-ssh.pub --dir ~/varek-sno
 ```
 
-The manifests, NRI on from the first boot, and the cluster (about 45
-minutes, detached; `openshift-install` checks the host's AWS permissions
-first and stops there if any is missing):
+The host's AWS access is an instance role, whose temporary credentials the
+installer's default mode refuses ("not valid for default credentials
+mode"): the cluster runs in manual mode with STS, each component given an
+IAM role of its own by the release's `ccoctl`, and no long-lived key
+anywhere. The install config (`openshift_sno_config.py --manual`: the
+template with the pull secret and key put in, mode 0600), the credential
+requests, and the roles (`--create-private-s3-bucket`: the OIDC documents
+behind CloudFront, for an account that blocks public buckets):
+
+```sh
+cd /root/varek-ocp
+REL=$(openshift-install version | awk '/^release image/ {print $3}')
+oc adm release extract --command=ccoctl --registry-config ~/ocp/pull-secret.json --to ~/ocp "$REL"
+python3 varek/v1_4/tests/soak_v1340/openshift_sno_config.py --manual \
+  --pull-secret ~/ocp/pull-secret.json --ssh-key ~/ocp/varek-sno-ssh.pub --dir ~/varek-sno
+oc adm release extract --credentials-requests --included --install-config ~/varek-sno/install-config.yaml \
+  --registry-config ~/ocp/pull-secret.json --to ~/ocp/credreqs "$REL"
+~/ocp/ccoctl aws create-all --name varek-sno --region us-east-1 --credentials-requests-dir ~/ocp/credreqs \
+  --output-dir ~/ocp/ccoctl-out --create-private-s3-bucket
+```
+
+The manifests, with the roles' and NRI's, and the cluster (about 45
+minutes, detached):
 
 ```sh
 openshift-install create manifests --dir ~/varek-sno
+cp ~/ocp/ccoctl-out/manifests/* ~/varek-sno/manifests/ && cp -a ~/ocp/ccoctl-out/tls ~/varek-sno/
 cp varek/v1_4/tests/soak_v1340/openshift-nri-master.yaml ~/varek-sno/openshift/99-master-varek-nri.yaml
 setsid nohup openshift-install create cluster --dir ~/varek-sno --log-level info \
   > ~/varek-sno/create.out 2>&1 < /dev/null &
@@ -212,7 +229,8 @@ container that does not start, not one that runs unsupervised.
 
 Then remove everything: `openshift-install destroy cluster --dir
 ~/varek-sno` (its instance, load balancers, NAT gateway, volumes and DNS
-records), then `~/ocp/pull-secret.json` and
+records), `~/ocp/ccoctl aws delete --name varek-sno --region us-east-1` (the
+roles, the OIDC provider, its bucket and CloudFront), then `~/ocp/pull-secret.json` and
 `~/varek-sno-install-config.yaml.keep` (both hold the pull secret).
 
 ## Files

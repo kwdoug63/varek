@@ -4,7 +4,12 @@
 single-node OpenShift's install-config.yaml, from openshift-sno-install-
 config.yaml with the operator's pull secret and an SSH public key put in.
 
-  openshift_sno_config.py --pull-secret FILE --ssh-key FILE.pub --dir DIR
+  openshift_sno_config.py --pull-secret FILE --ssh-key FILE.pub --dir DIR [--manual]
+
+--manual sets credentialsMode: Manual, for a host whose AWS access is an
+instance role (temporary credentials, which the default mode refuses): the
+cluster's components get IAM roles of their own, made with ccoctl (STS;
+README.md, section 3).
 
 Writes DIR/install-config.yaml (0600) and, beside DIR, a copy
 DIR-install-config.yaml.keep (openshift-install consumes the first; nothing
@@ -27,6 +32,7 @@ def main():
     ap.add_argument("--pull-secret", required=True)
     ap.add_argument("--ssh-key", required=True, help="a public key (.pub)")
     ap.add_argument("--dir", required=True)
+    ap.add_argument("--manual", action="store_true", help="credentialsMode: Manual (ccoctl, STS)")
     a = ap.parse_args()
     try:
         secret = json.load(open(a.pull_secret))
@@ -45,6 +51,10 @@ def main():
     if "'" in one or "'" in key:
         sys.exit("openshift_sno_config: a quote in the pull secret or the key")
     text = text.replace(PULL, f"pullSecret: '{one}'").replace(SSH, f"sshKey: '{key}'")
+    if a.manual:
+        if "\napiVersion: v1\n" not in text:
+            sys.exit("openshift_sno_config: the template's apiVersion line is not where it was")
+        text = text.replace("\napiVersion: v1\n", "\napiVersion: v1\ncredentialsMode: Manual\n", 1)
     os.makedirs(a.dir, mode=0o700, exist_ok=True)
     for path in (os.path.join(a.dir, "install-config.yaml"), a.dir.rstrip("/") + "-install-config.yaml.keep"):
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
