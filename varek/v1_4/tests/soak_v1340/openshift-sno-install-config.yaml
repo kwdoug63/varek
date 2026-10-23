@@ -19,6 +19,12 @@ controlPlane:
 compute:
   - name: worker
     replicas: 0
+    # none, but the pool's zones are where the installer lays out subnets
+    # and a NAT gateway each: without this, every zone of the region (five
+    # in us-east-1, the first run)
+    platform:
+      aws:
+        zones: [us-east-1a]
 networking:
   networkType: OVNKubernetes
   machineNetwork: [{ cidr: 10.0.0.0/16 }]

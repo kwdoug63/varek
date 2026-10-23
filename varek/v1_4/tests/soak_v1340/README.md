@@ -65,7 +65,7 @@ anything.
 |---|---|
 | EKS: the control plane ($0.10/h), 2 m6i.large ($0.096/h each), a NAT gateway ($0.045/h), 2 × 40 GB gp3, the images pulled | about $10 |
 | ROSA HCP: the cluster ($0.25/h), 2 m5.xlarge workers ($0.192/h each, and $0.171/h each to Red Hat) | about $25 |
-| Single-node OpenShift (the choice, D11): one m6i.2xlarge ($0.384/h), 120 GB gp3, the installer's load balancers and a NAT gateway in one zone (a 60-day evaluation subscription) | about $15 |
+| Single-node OpenShift (the choice, D11): one m6i.2xlarge ($0.384/h), 120 GB gp3, the installer's load balancers and a NAT gateway in one zone (the worker pool's zones given too: the first run, without, had one in each of the region's five), the cluster's IAM roles and OIDC bucket behind CloudFront (a 60-day evaluation subscription) | about $15 (the first run about $25) |
 
 ## 1. The images
 
