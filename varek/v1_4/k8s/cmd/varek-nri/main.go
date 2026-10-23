@@ -37,7 +37,16 @@
 //
 // On a runtime whose NRI cannot set a seccomp policy or the command (NRI
 // before v0.10: containerd before 2.2, CRI-O before 1.35) the plugin refuses
-// to start, naming the version.
+// to start, naming the version. On one whose NRI carries no errno on a rule
+// of the policy (before NRI v0.12: containerd before 2.3, CRI-O before 1.37,
+// so OpenShift 4.22's CRI-O 1.35; step 9) no rule is given one: NRI's
+// conversion there writes it through a nil pointer, and the runtime panics
+// as it creates the container. A rule whose errno is EPERM names none (EPERM
+// is runc's and crun's when a rule names none); one with another (ENOSYS for
+// clone3 and io_uring_setup, EACCES for the setsockopt options refused) is
+// notified instead, and from the command's launch the node agent answers it
+// with that errno, from the Warden's own filter, as it answers each call
+// that filter refuses and the pod's notifies (warden_oci.c).
 //
 //	varek-nri -warden FILE -policies DIR -listener SOCKET -launcher FILE [-socket NRI_SOCKET] [-sync]
 //	          [-runtime-handlers runc,crun]
@@ -59,6 +68,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
@@ -101,6 +111,7 @@ type ociProfile struct {
 type plugin struct {
 	warden, policies, listener, launcher string
 	handlers                             map[string]bool // runtime handlers that run the filter's listener (G-4)
+	noRuleErrno                          bool            // the runtime's NRI carries no errno on a rule (before v0.12)
 	mu                                   sync.Mutex
 	filters                              map[string]*ociProfile // by the SHA-256 of the policy written for
 }
@@ -133,12 +144,28 @@ func runtimeOK(runtime, ver string) error {
 	return nil
 }
 
+// The runtimes whose NRI carries a rule's own errno (v0.12). Before it,
+// ToOCILinuxSyscalls writes the errno through a nil pointer: CRI-O 1.35.9
+// (NRI v0.11.0) panicked creating each supervised container (step 9).
+var errnoRuntime = map[string][2]int{"containerd": {2, 3}, "cri-o": {1, 37}}
+
+func ruleErrnoOK(runtime, ver string) bool {
+	min, known := errnoRuntime[strings.ToLower(runtime)]
+	a, b, ok := version(ver)
+	return known && ok && (a > min[0] || (a == min[0] && b >= min[1]))
+}
+
 func (p *plugin) Configure(_ context.Context, _, runtime, ver string) (api.EventMask, error) {
 	if err := runtimeOK(runtime, ver); err != nil {
 		return 0, err
 	}
+	p.noRuleErrno = !ruleErrnoOK(runtime, ver)
 	fmt.Fprintf(os.Stderr, "varek-nri: runtime %s %s; policies in %s; node agent %s; launcher %s\n",
 		runtime, ver, p.policies, p.listener, p.launcher)
+	if p.noRuleErrno {
+		fmt.Fprintf(os.Stderr, "varek-nri: runtime %s %s: its NRI carries no errno on a rule (before NRI v0.12): "+
+			"rules refusing with EPERM name none, the others are notified and the node agent answers them\n", runtime, ver)
+	}
 	return api.MustParseEventMask("CreateContainer"), nil
 }
 
@@ -224,6 +251,14 @@ func (p *plugin) policy(f *ociProfile, meta string) *api.LinuxSeccomp {
 	}
 	for _, c := range f.Syscalls {
 		r := &api.LinuxSyscall{Names: c.Names, Action: c.Action, ErrnoRet: optional(c.ErrnoRet)}
+		if p.noRuleErrno && c.ErrnoRet != nil {
+			// NRI before v0.12 (Configure): EPERM is the runtime's own for a
+			// rule that names none; another errno is the node agent's to give
+			r.ErrnoRet = nil
+			if *c.ErrnoRet != uint32(syscall.EPERM) {
+				r.Action = "SCMP_ACT_NOTIFY"
+			}
+		}
 		for _, a := range c.Args {
 			r.Args = append(r.Args, &api.LinuxSeccompArg{Index: a.Index, Value: a.Value, ValueTwo: a.ValueTwo, Op: a.Op})
 		}

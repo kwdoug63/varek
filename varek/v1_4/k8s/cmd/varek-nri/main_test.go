@@ -216,3 +216,46 @@ func TestRuntimes(t *testing.T) {
 		}
 	}
 }
+
+// step 9: NRI before v0.12 writes a rule's errno through a nil pointer (CRI-O
+// 1.35.9 panicked), so there no rule carries one
+func TestRuleErrno(t *testing.T) {
+	for _, c := range []struct {
+		rt, v string
+		ok    bool
+	}{
+		{"containerd", "v2.2.1", false}, {"containerd", "v2.3.0", true}, {"containerd", "2.3.5", true},
+		{"cri-o", "1.35.9-12.rhaos4.22.git4c168db.el9", false}, {"cri-o", "1.36.3", false},
+		{"cri-o", "1.37.0", true}, {"CRI-O", "2.0.0", true}, {"containerd", "garbage", false},
+	} {
+		if ruleErrnoOK(c.rt, c.v) != c.ok {
+			t.Errorf("%s %s: %v", c.rt, c.v, !c.ok)
+		}
+	}
+	u := func(v uint32) *uint32 { return &v }
+	f := &ociProfile{DefaultAction: "SCMP_ACT_ERRNO", DefaultErrnoRet: u(1), Architectures: []string{"SCMP_ARCH_X86_64"},
+		Syscalls: []ociSyscall{
+			{Names: []string{"ptrace"}, Action: "SCMP_ACT_ERRNO", ErrnoRet: u(1)},
+			{Names: []string{"clone3"}, Action: "SCMP_ACT_ERRNO", ErrnoRet: u(38)},
+			{Names: []string{"setsockopt"}, Action: "SCMP_ACT_ERRNO", ErrnoRet: u(13),
+				Args: []ociArg{{Index: 1, Value: 0, ValueTwo: 0xffffffff, Op: "SCMP_CMP_MASKED_EQ"}}},
+			{Names: []string{"read"}, Action: "SCMP_ACT_ALLOW"},
+			{Names: []string{"openat"}, Action: "SCMP_ACT_NOTIFY"},
+		}}
+	p := setup(t)
+	s := p.policy(f, "ns/p/c")
+	if s.Syscalls[1].ErrnoRet.GetValue() != 38 || s.Syscalls[1].Action != "SCMP_ACT_ERRNO" {
+		t.Errorf("a runtime with NRI v0.12: the rule's errno kept: %+v", s.Syscalls[1])
+	}
+	p.noRuleErrno = true
+	s = p.policy(f, "ns/p/c")
+	want := []string{"SCMP_ACT_ERRNO", "SCMP_ACT_NOTIFY", "SCMP_ACT_NOTIFY", "SCMP_ACT_ALLOW", "SCMP_ACT_NOTIFY"}
+	for i, r := range s.Syscalls {
+		if r.ErrnoRet != nil || r.Action != want[i] || strings.Join(r.Names, ",") != strings.Join(f.Syscalls[i].Names, ",") {
+			t.Errorf("rule %d: %+v, want %s and no errno", i, r, want[i])
+		}
+	}
+	if len(s.Syscalls[2].Args) != 1 || s.Syscalls[2].Args[0].ValueTwo != 0xffffffff {
+		t.Errorf("a notified rule keeps its arguments: %+v", s.Syscalls[2])
+	}
+}

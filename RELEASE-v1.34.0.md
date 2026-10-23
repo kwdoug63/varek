@@ -42,6 +42,13 @@ from outside them, and the agent's pod passes "restricted":
    puts the launcher first in the command, and makes every writable mount
    noexec. A container it cannot carry is refused, the reason in the pod's
    events.
+   On a runtime whose NRI is older than v0.12 (containerd before 2.3,
+   CRI-O before 1.37, so OpenShift 4.22), that NRI cannot carry a rule's
+   errno: the runtime crashed creating the container (found on OpenShift,
+   step 9). There the rules that refuse with EPERM name no errno, and the
+   kernel answers them EPERM as before. The rules that refuse with another
+   errno (`clone3`, `io_uring_setup`, a few `setsockopt` options) are
+   notified, and the node agent answers them with the Warden's errno.
 3. **The launch set in a pod** (D3). Landlock cannot be added to a running
    process from outside, so a small static launcher, `varek-init`, bound
    read-only at `/varek/init`, applies the launch set and runs the
