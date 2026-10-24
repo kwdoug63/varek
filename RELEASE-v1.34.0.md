@@ -237,7 +237,11 @@ every 15 minutes, all under one policy.
 
 `soak_check: PASS`. Every probe held: `/etc/shadow`, a volume the policy
 does not name, a program the agent wrote, a service it does not name (by
-name and by address) and the instance metadata. An earlier run of the
+name and by address) and the instance metadata. The release's own image
+(ff512a7, `sha256:058e20a8…`) then ran a 6-minute trial on the same nodes
+(October 24, 03:03 CDT): 216 turns of work, 48 git commits, 33 probes all
+held, 243 requests to the allowed service (p50 3 ms, p99 29 ms) and none to
+the denied one, 5 streams of 85,997 records all audited; `soak_check: PASS`. An earlier run of the
 day was cut 12.6 hours in: the first OpenShift trial was started in a
 shell whose KUBECONFIG was EKS's, and its setup deleted the EKS run's
 namespaces. `soak.sh` now refuses a cluster of the other kind before it
