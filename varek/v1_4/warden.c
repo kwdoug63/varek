@@ -1527,6 +1527,8 @@ static int net_plan_canon(const char *in, char *out, size_t n, char *why, size_t
  * for use by warden_adapter_verify(). The plan_spec_action_t's
  * (kind, target) pair is sufficient because policy_decide() only
  * inspects those two fields. */
+static plan_decision_t plan_exec_decide(const struct policy *p, struct action *a, const char **why);  /* warden_exec.inc.c */
+
 static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
                                            void *ud)
 {
@@ -1572,17 +1574,25 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
     /* v1.18.0: the runtime refuses every launch after the first, whatever
      * the policy says, so a process_exec step is UNSATISFIED (a plan lists
      * what the agent does after it starts, so every such step is a later
-     * launch). v1.21: connects are decided at runtime, so a net_connect step
-     * is decided by the policy on the destination the runtime would decide
-     * on (net_plan_canon); through v1.20.0 it was always UNSATISFIED. */
+     * launch). v1.35 step 2 (D9): unless the policy decides launches
+     * (require warden 1.27): then the step is decided as the launch would be
+     * (plan_exec_decide). v1.21: connects are decided at runtime, so a
+     * net_connect step is decided by the policy on the destination the
+     * runtime would decide on (net_plan_canon); through v1.20.0 it was always
+     * UNSATISFIED. */
     if (act.kind == ACT_PROCESS_EXEC) {
-        log_line_start();
-        fprintf(g_log, "[warden] plan: %s step \"", a->kind);
-        json_escape(g_log, act.target);
-        fprintf(g_log, "\" is UNSATISFIED: the Warden refuses every launch after the first "
-                "at runtime, whatever the policy says\n");
-        fflush(g_log);
-        return PLAN_DEC_UNSATISFIED;
+        const char *why = "the Warden refuses every launch after the first at runtime, "
+                          "as the policy does not decide launches (require warden 1.27)";
+        plan_decision_t pd = PLAN_DEC_UNSATISFIED;
+        if (u->policy->v.launches) pd = plan_exec_decide(u->policy, &act, &why);
+        if (pd != PLAN_DEC_SATISFIED) {
+            log_line_start();
+            fprintf(g_log, "[warden] plan: %s step \"", a->kind);
+            json_escape(g_log, act.target);
+            fprintf(g_log, "\" is %s: %s\n", plan_decision_name(pd), why);
+            fflush(g_log);
+        }
+        return pd;
     }
     if (act.kind == ACT_NET_CONNECT) {
         char why[200];

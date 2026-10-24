@@ -820,6 +820,31 @@ static int exec_env_image(pid_t pid, char *name, size_t nn) {
 /* A launch after the first, with `require warden 1.27`: decided on its name
  * (certified), then CONTINUE only if Landlock holds the agent and the file
  * is one of the set (by device and inode). Recorded before it is answered. */
+/* v1.35 step 2 (D9): a plan's process_exec step, decided as exec_launch
+ * decides the launch: the program opened as the launch would open it
+ * (following symlinks, no magic links), the policy on its canonical path,
+ * the checker, Landlock, and the launch set, which is built before the plan
+ * is checked. Through v1.34 such a step was always UNSATISFIED, true only
+ * while every launch after the first was refused. Why it is not SATISFIED,
+ * or NULL. */
+static plan_decision_t plan_exec_decide(const struct policy *p, struct action *a, const char **why) {
+    struct stat st;
+    *why = NULL;
+    if (a->target[0] != '/') { *why = "a launch is named by its absolute path"; return PLAN_DEC_UNKNOWN; }
+    int fd = openat2_path(AT_FDCWD, a->target, 0);
+    bool ok = fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+              fd_canonical_path(fd, a->resolved, sizeof a->resolved) == 0;
+    if (fd >= 0) close(fd);
+    if (!ok) { a->resolved[0] = '\0'; *why = "the program is not a file here"; return PLAN_DEC_UNKNOWN; }
+    decision_t d = policy_decide(p, a);
+    if (d == DEC_DENY) { *why = "the policy refuses it"; return PLAN_DEC_UNSATISFIED; }
+    if (d != DEC_ALLOW) { *why = "no rule of the policy allows it"; return PLAN_DEC_UNKNOWN; }
+    if (!p->c.launches || !certify(p, a)) { *why = "its certificate is refused"; return PLAN_DEC_UNKNOWN; }
+    if (g_ll_abi < 1) { *why = "this host has no Landlock, so every later launch is refused"; return PLAN_DEC_UNSATISFIED; }
+    if (!exec_rs_find(st.st_dev, st.st_ino)) { *why = "it is not in the launch set"; return PLAN_DEC_UNSATISFIED; }
+    return PLAN_DEC_SATISFIED;
+}
+
 static void exec_launch(int notify_fd, const struct seccomp_notif *req, struct action *a,
                         const struct policy *p, const struct timespec *t0) {
     struct stat st;
