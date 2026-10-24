@@ -33,8 +33,13 @@ the account's own VPC, x86_64 or arm64) is a second measurement, at the end.
 
 Open CloudShell from the console's top bar, in **us-east-1**. These commands
 run there, with the console's own sign-in; nothing below asks for a key.
+`AWS_PAGER=""` keeps the AWS CLI from opening long output in `less`, which
+would read the rest of a pasted block as its own keystrokes. CloudShell
+forgets both variables when it reconnects ("Preparing your terminal..."),
+so each block below sets them again.
 
 ```bash
+export AWS_PAGER=""
 export AWS_REGION=us-east-1
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 
@@ -67,6 +72,7 @@ In CloudShell, start a Graviton instance with that profile (Amazon Linux
 2023, arm64; the default VPC's subnet; no key pair):
 
 ```bash
+export AWS_PAGER="" AWS_REGION=us-east-1
 AMI=$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 \
       --query Parameter.Value --output text)
 aws ec2 run-instances --image-id "$AMI" --instance-type t4g.large \
@@ -108,7 +114,7 @@ from the instance's role, through the pipe; it is never shown or typed.
 Back in CloudShell:
 
 ```bash
-export AWS_REGION=us-east-1
+export AWS_PAGER="" AWS_REGION=us-east-1
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 aws bedrock-agentcore-control create-agent-runtime --agent-runtime-name varek_probe \
   --agent-runtime-artifact "containerConfiguration={containerUri=$ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/varek-agentcore-probe:1}" \
@@ -154,7 +160,7 @@ v1.32's image and v1.34's cluster already run). The commands come then.
 ## 5. Teardown (CloudShell)
 
 ```bash
-export AWS_REGION=us-east-1
+export AWS_PAGER="" AWS_REGION=us-east-1
 aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id $(cut -d/ -f2 runtime.arn)
 aws ecr delete-repository --repository-name varek-agentcore-probe --force
 IID=$(aws ec2 describe-instances --filters Name=tag:Name,Values=varek-probe-builder \
