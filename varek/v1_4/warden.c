@@ -1431,6 +1431,17 @@ struct warden_plan_ud {
      * field (NULL: no fields). */
     const plan_parsed_t *parsed;
     const plan_spec_t   *spec;
+    /* v1.35 step 2 (D9): the plan file, for the plan_step records (NULL:
+     * none written). */
+    const char          *plan_path;
+};
+
+/* v1.35 step 2 (D9): why a step was not SATISFIED, for its plan_step record.
+ * Filled by plan_step_decide; the deciding rule's line when a rule decided. */
+struct plan_step_note {
+    char why[320];
+    int  policy_line;
+    char resolved[PATH_MAX];
 };
 
 /* v1.21.1: how a file_open step says it will open its file.
@@ -1529,18 +1540,19 @@ static int net_plan_canon(const char *in, char *out, size_t n, char *why, size_t
  * inspects those two fields. */
 static plan_decision_t plan_exec_decide(const struct policy *p, struct action *a, const char **why);  /* warden_exec.inc.c */
 
-static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
-                                           void *ud)
+static plan_decision_t plan_step_decide(const struct warden_plan_ud *u, const plan_spec_action_t *a,
+                                        struct plan_step_note *nt)
 {
-    const struct warden_plan_ud *u = (const struct warden_plan_ud *)ud;
-    if (!u || !u->policy || !a) return PLAN_DEC_UNKNOWN;
-
     struct action act;
     memset(&act, 0, sizeof(act));
+    act.policy_line = -1;
     act.kind = kind_from_string(a->kind);
     /* v1.20.0: a target that does not fit is UNKNOWN, never cut short and
      * decided as the shorter path it would become. */
-    if (a->target && strlen(a->target) >= sizeof(act.target)) return PLAN_DEC_UNKNOWN;
+    if (a->target && strlen(a->target) >= sizeof(act.target)) {
+        snprintf(nt->why, sizeof nt->why, "the target is too long");
+        return PLAN_DEC_UNKNOWN;
+    }
     if (a->target) {
         snprintf(act.target, sizeof(act.target), "%s", a->target);
     }
@@ -1567,6 +1579,7 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
             json_escape(g_log, act.target);
             fprintf(g_log, "\" is UNKNOWN: %s\n", why);
             fflush(g_log);
+            snprintf(nt->why, sizeof nt->why, "%s", why);
             return PLAN_DEC_UNKNOWN;
         }
         if (r > 0) { act.open_flags = of; act.flags_known = true; }
@@ -1591,6 +1604,9 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
             json_escape(g_log, act.target);
             fprintf(g_log, "\" is %s: %s\n", plan_decision_name(pd), why);
             fflush(g_log);
+            snprintf(nt->why, sizeof nt->why, "%s", why);
+            nt->policy_line = act.policy_line;
+            snprintf(nt->resolved, sizeof nt->resolved, "%s", act.resolved);
         }
         return pd;
     }
@@ -1602,10 +1618,13 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
             json_escape(g_log, act.target);
             fprintf(g_log, "\" is UNKNOWN: %s\n", why);
             fflush(g_log);
+            snprintf(nt->why, sizeof nt->why, "%s", why);
             return PLAN_DEC_UNKNOWN;
         }
     }
     decision_t d = policy_decide(u->policy, &act);
+    nt->policy_line = act.policy_line;
+    snprintf(nt->resolved, sizeof nt->resolved, "%s", act.resolved);
     if (d == DEC_ALLOW && !certify(u->policy, &act)) {
         /* v1.15: the plan gate authorizes only what the checker confirms. */
         log_line_start();
@@ -1613,41 +1632,71 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
         json_escape(g_log, act.target);
         fprintf(g_log, "\": %s\n", act.check_why);
         fflush(g_log);
+        snprintf(nt->why, sizeof nt->why, "its certificate is refused: %s", act.check_why);
         return PLAN_DEC_UNKNOWN;
     }
     switch (d) {
         case DEC_ALLOW:   return PLAN_DEC_SATISFIED;
-        case DEC_DENY:    return PLAN_DEC_UNSATISFIED;
-        case DEC_UNKNOWN: return PLAN_DEC_UNKNOWN;
+        case DEC_DENY:
+            snprintf(nt->why, sizeof nt->why, "the policy refuses it");
+            return PLAN_DEC_UNSATISFIED;
+        case DEC_UNKNOWN: break;
     }
+    if (act.kind == ACT_OTHER)
+        snprintf(nt->why, sizeof nt->why, "the Warden decides no step of this kind");
+    else
+        snprintf(nt->why, sizeof nt->why, "no rule of the policy allows it");
     return PLAN_DEC_UNKNOWN;
+}
+
+/* v1.35 step 2 (D9): the plan gate's chained records (defined after the
+ * record writer). */
+static void emit_plan_step(const char *plan_path, const plan_spec_action_t *a,
+                           plan_decision_t pd, const struct plan_step_note *nt);
+static void emit_plan_gate_basic(const char *plan_path, size_t n_actions, size_t n_edges,
+                                 plan_decision_t pd, const char *error);
+
+static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
+                                           void *ud)
+{
+    const struct warden_plan_ud *u = (const struct warden_plan_ud *)ud;
+    if (!u || !u->policy || !a) return PLAN_DEC_UNKNOWN;
+    struct plan_step_note nt = { .policy_line = -1 };
+    plan_decision_t pd = plan_step_decide(u, a, &nt);
+    if (pd != PLAN_DEC_SATISFIED && u->plan_path) emit_plan_step(u->plan_path, a, pd, &nt);
+    return pd;
 }
 
 /* Verify an agent's declared plan against the current policy, ahead
  * of any execution. Returns 0 if the plan is authorized, non-zero
- * otherwise. Emits a plan-level pathology record to stderr. */
+ * otherwise. Emits a plan-level pathology record to stderr. v1.35 step 2
+ * (D9): and chained plan_step and plan_gate records, unless `records` is
+ * false (--check-startup, which opens no stream). */
 static int warden_verify_plan(const char *plan_path,
-                              const struct policy *policy)
+                              const struct policy *policy, bool records)
 {
     char err[256] = {0};
     plan_parsed_t *parsed = plan_parser_load(plan_path, err, sizeof(err));
     if (!parsed) {
         fprintf(stderr, "[warden] plan load failed: %s\n", err);
+        if (records) emit_plan_gate_basic(plan_path, 0, 0, PLAN_DEC_UNKNOWN, err);
         return 1;
     }
 
     const plan_spec_t *spec = plan_parser_spec(parsed);
     pathology_sink_t *sink = pathology_sink_new(stderr);
-    struct warden_plan_ud ud = { .policy = policy, .parsed = parsed, .spec = spec };
+    struct warden_plan_ud ud = { .policy = policy, .parsed = parsed, .spec = spec,
+                                 .plan_path = records ? plan_path : NULL };
 
     plan_decision_t pd = warden_adapter_verify(spec, warden_plan_decider,
                                                &ud, sink);
 
     /* v1.21.1: read the count before the plan is freed (spec points into it;
      * through v1.21.0 it was read after plan_parser_free). */
-    size_t n_actions = spec->n_actions;
+    size_t n_actions = spec->n_actions, n_edges = spec->n_edges;
     pathology_sink_free(sink);
     plan_parser_free(parsed);
+    if (records) emit_plan_gate_basic(plan_path, n_actions, n_edges, pd, NULL);
 
     if (pd != PLAN_DEC_SATISFIED) {
         fprintf(stderr,
@@ -4667,6 +4716,55 @@ static int find_program(const char *name, char *out, size_t n) {
  * malformed) is an error and the plan is refused. The lock file and the
  * table are protected from the agent by identity, like the signing key. */
 
+/* v1.35 step 2 (D9): each step the plan gate does not find SATISFIED is a
+ * chained plan_step record, so `varek refusals` and the audit read why a plan
+ * was refused from the stream itself (through v1.34 the basic gate's reasons
+ * were lines on standard error only). The plan's own text (label, kind,
+ * target) is escaped, as a path is. */
+static void emit_plan_step(const char *plan_path, const plan_spec_action_t *a,
+                           plan_decision_t pd, const struct plan_step_note *nt) {
+    FILE *f = rec_begin();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(f, "{\"event\":\"plan_step\",\"run\":\"%s\",\"plan\":\"", g_run_id);
+    json_escape(f, plan_path);
+    fputs("\",\"label\":\"", f);
+    json_escape(f, a->label ? a->label : "");
+    fputs("\",\"kind\":\"", f);
+    json_escape(f, a->kind ? a->kind : "");
+    fputs("\",\"target\":\"", f);
+    json_escape(f, a->target ? a->target : "");
+    fputs("\",\"resolved\":\"", f);
+    json_escape(f, nt->resolved);
+    fprintf(f, "\",\"decision\":\"%s\",\"policy_line\":%d,\"why\":\"", plan_decision_name(pd),
+            nt->policy_line);
+    json_escape(f, nt->why);
+    fprintf(f, "\",\"timestamp_ns\":%lld}\n", (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+    rec_end(NULL);
+}
+
+/* v1.35 step 2 (D9): the basic gate's outcome as a chained plan_gate record
+ * (the flow gate writes its own, with the breaker's fields): the plan, its
+ * size, the verdict, and why it could not be read when it could not. Through
+ * v1.34 the outcome was a line on standard error only. */
+static void emit_plan_gate_basic(const char *plan_path, size_t n_actions, size_t n_edges,
+                                 plan_decision_t pd, const char *error) {
+    FILE *f = rec_begin();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(f, "{\"event\":\"plan_gate\",\"run\":\"%s\",\"gate\":\"plan\",\"plan\":\"", g_run_id);
+    json_escape(f, plan_path);
+    fprintf(f, "\",\"actions\":%zu,\"edges\":%zu,\"verdict\":\"%s\"", n_actions, n_edges,
+            plan_decision_name(pd));
+    if (error) {
+        fputs(",\"error\":\"", f);
+        json_escape(f, error);
+        fputc('"', f);
+    }
+    fprintf(f, ",\"timestamp_ns\":%lld}\n", (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+    rec_end(NULL);
+}
+
 #define BREAKER_DEFAULT_DIR  "/var/lib/varek"
 #define BREAKER_DEFAULT_NAME "breaker.state"
 
@@ -4989,7 +5087,8 @@ static int warden_gate_plan_flow(const char *plan_path, const struct policy *pol
     canon = calloc(n, sizeof *canon);
     if (!plan || !acts || !args || !canon) goto out;
 
-    struct warden_plan_ud ud = { .policy = policy, .parsed = parsed, .spec = spec };
+    struct warden_plan_ud ud = { .policy = policy, .parsed = parsed, .spec = spec,
+                                 .plan_path = plan_path };
     for (size_t i = 0; i < n; i++) {
         const plan_spec_action_t *sa = &spec->actions[i];
         plan_decision_t d = warden_plan_decider(sa, &ud);
@@ -5088,7 +5187,7 @@ static int warden_gate_plan_flow(const char *plan_path, const struct policy *pol
     FILE *f = rec_begin();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    fprintf(f, "{\"event\":\"plan_gate\",\"run\":\"%s\",\"plan\":\"", g_run_id);
+    fprintf(f, "{\"event\":\"plan_gate\",\"run\":\"%s\",\"gate\":\"flow\",\"plan\":\"", g_run_id);
     json_escape(f, plan_path);
     fprintf(f, "\",\"actions\":%zu,\"edges\":%zu,\"node_axis\":\"%s\",\"flow_axis\":\"%s\","
                "\"verdict\":\"%s\",\"session\":\"", n, spec->n_edges,
@@ -5974,9 +6073,24 @@ int main(int argc, char **argv) {
             names_resolve_all(false);
             wr_async_stop(&g_names);
         }
-        fprintf(stderr, "[warden] startup checks passed: the policy%s%s%s%s would be accepted%s\n",
+        /* v1.35 step 2 (D9): a plan is decided as the run would decide it
+         * (after the launch set is built), with each step's reason, and no
+         * record written: `varek policy check --plan`. The flow policy and
+         * the breaker are not stepped by a check. */
+        if (plan_path) {
+            if (!g_log) g_log = stderr;             /* the decider's reasons, with no stream */
+            if (flow_path)
+                fprintf(stderr, "[warden] the plan's steps are decided (the node check); a check does not "
+                        "step the flow policy or the breaker\n");
+            if (warden_verify_plan(plan_path, &p, false) != 0) {
+                if (g_sk) sodium_free(g_sk);
+                return 1;
+            }
+        }
+        fprintf(stderr, "[warden] startup checks passed: the policy%s%s%s%s%s would be accepted%s\n",
                 key_path ? ", the signing key" : "", anchor_path ? ", the anchor" : "",
                 flow_path ? ", the flow policy, the breaker state" : "",
+                plan_path ? ", the plan" : "",
                 gstatus_arg ? ", --gate-status" : "",
                 pidns && !have_cap_sys_admin() ? " (but this user lacks CAP_SYS_ADMIN, which "
                 "a run needs)" : "");
@@ -6048,7 +6162,7 @@ int main(int argc, char **argv) {
             if (g_sk) sodium_free(g_sk);
             return gate;
         }
-    } else if (plan_path && warden_verify_plan(plan_path, &p) != 0) {
+    } else if (plan_path && warden_verify_plan(plan_path, &p, true) != 0) {
         emit_run_end(1);                    /* v1.16: a closed (and signed) stream */
         if (g_sk) sodium_free(g_sk);
         return 1;

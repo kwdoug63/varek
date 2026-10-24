@@ -389,7 +389,8 @@ def summarize(recs):
          "proxy_targets": {}, "proxy_denied": set(), "proxy_ends": [],
          "cred_refused": [], "revoked": None, "credentials": [],
          "user": None, "spiffe_id": None, "subagents": {}, "expired": None,
-         "dry": False, "not_enforced": 0, "mcp_servers": set(), "mcp_calls": 0}
+         "dry": False, "not_enforced": 0, "mcp_servers": set(), "mcp_calls": 0,
+         "plan_gate": None, "plan_steps": []}
     for r in recs:
         ev = r.get("event")
         if r.get("enforced") is False and (s["run"] is None or r.get("run") == s["run"]):
@@ -429,6 +430,10 @@ def summarize(recs):
             s["cred_refused"].append(r)
         elif ev == "revoked" and s["revoked"] is None:
             s["revoked"] = r
+        elif ev == "plan_gate" and s["plan_gate"] is None:              # v1.35: the plan gate's outcome
+            s["plan_gate"] = r
+        elif ev == "plan_step":                                         # v1.35: a step it did not find SATISFIED
+            s["plan_steps"].append(r)
         elif ev == "on_behalf_of_expired" and s["expired"] is None:    # v1.28.1
             s["expired"] = r
         elif ev == "proxy_close":
@@ -466,6 +471,41 @@ def summarize(recs):
                 s["refused"] += 1
                 s["refusals"].append(r)
     return s
+
+
+def plan_refused(s):
+    """v1.35: the plan gate refused the run's plan (so the agent never ran):
+    a verdict other than SATISFIED, or the flow gate's breaker refusing it."""
+    g = s.get("plan_gate")
+    return isinstance(g, dict) and (g.get("verdict") != "SATISFIED" or
+                                    g.get("breaker") not in (None, "PASS"))
+
+
+def plan_refusal_lines(s, policy, n):
+    """v1.35: `varek refusals` on a refused plan: the plan, then each step the
+    gate did not find SATISFIED, with the reason the Warden recorded."""
+    g = s["plan_gate"]
+    how = str(g.get("verdict", "?"))
+    if g.get("breaker") not in (None, "PASS"):
+        how += f"; breaker {g.get('breaker')}"
+    info(f"The plan {g.get('plan', '?')} was refused ({how}): the agent did not start.")
+    if g.get("error"):
+        hint(f"the plan could not be read: {g['error']}")
+    if g.get("breaker") == "STATE_ERROR":
+        hint("the breaker state could not be used (a fault of the state, not a verdict on the plan)")
+    steps = s["plan_steps"]
+    if steps:
+        info(f"\n{len(steps)} step(s) not SATISFIED:\n")
+    for r in steps[:n]:
+        line, why = r.get("policy_line"), r.get("why") or "no reason recorded"
+        text = policy_line_text(policy, line) if policy and isinstance(line, int) and line > 0 else None
+        where = (f"policy line {line}" + (f": {text}" if text else "") + f" ({why})"
+                 if isinstance(line, int) and line > 0 else why)
+        info(f"  {str(r.get('decision', '?')):11}  {str(r.get('kind', '?')):13}  {r.get('target', '')}")
+        hint(f"step {r.get('label', '?')}: {where}")
+    if len(steps) > n:
+        info(f"\n  ... and {len(steps) - n} more (use -n to see them)")
+    info("")
 
 
 def verdict_word(r):
@@ -1158,11 +1198,46 @@ def cmd_policy_check(args):
         r = run_cmd([tool("vdp_check"), path, "analyze"], check=False, capture=True)
         print((r.stdout + r.stderr).rstrip())
     print()
-    if rc == 0:
-        info(f"{path}: OK")
-    else:
+    if rc != 0:
         info(f"{path}: fix the lines above before using this policy")
-    return 0 if rc == 0 else 1
+        return 1
+    if args.plan:
+        return policy_check_plan(path, args.plan)
+    info(f"{path}: OK")
+    return 0
+
+
+def policy_check_plan(path, plan):
+    """v1.35 (D9): decide a plan under the policy as `varek run --plan` would
+    as the run starts (the Warden's own check, on this host: its launch set,
+    its Landlock), with each step's reason; no agent runs, no record is
+    written."""
+    if not os.path.isfile(plan):
+        raise CliError(f"no plan at {plan}")
+    w = warden_bin()
+    if not os.access(w, os.X_OK):
+        raise CliError(f"no Warden at {w}", fix="install VAREK (make install), or set VAREK_HOME")
+    r = subprocess.run([w, path, "--check-startup", "--plan", plan], capture_output=True, text=True)
+    lines = r.stderr.splitlines()
+    steps = [ln[len("[warden] plan: "):] for ln in lines if ln.startswith("[warden] plan: ")]
+    verdict = next((ln for ln in lines if ln.startswith(("[warden] plan authorized", "[warden] plan rejected",
+                                                          "[warden] plan load failed"))), None)
+    if verdict is None:
+        # the Warden stopped before the plan (the policy would not start here)
+        why = next((ln for ln in reversed(lines) if ln.startswith("[warden] ")), f"exit {r.returncode}")
+        raise CliError(f"the Warden would not start with {path} here: {why[len('[warden] '):]}",
+                       fix="`varek preflight` says what it needs")
+    for ln in steps:
+        info(f"  {ln}")
+    if r.returncode == 0:
+        ok(f"{plan}: authorized under {path} ({verdict.split('(', 1)[1].split(')', 1)[0]})")
+        return 0
+    if verdict.startswith("[warden] plan load failed"):
+        info(f"{plan}: the plan could not be read: {verdict.split(': ', 1)[1]}")
+    else:
+        info(f"{plan}: refused under {path} ({verdict.split('(', 1)[1].split(')', 1)[0]}): "
+             f"`varek run --plan` would not start the agent")
+    return 1
 
 
 def cmd_policy_use(args):
@@ -1398,7 +1473,11 @@ def cmd_run(args):
         print(_paint("1;33", f"[varek] DRY RUN: NOT ENFORCING: {s['not_enforced']} call(s) the policy refuses "
                              f"were let through; `varek refusals` lists them, and `varek policy suggest` "
                              f"drafts rules for them"), file=sys.stderr)
-    elif s["refused"]:
+    if plan_refused(s):                                                             # v1.35
+        print(_paint("1;31", f"[varek] the plan was refused ({s['plan_gate'].get('verdict', '?')}, "
+                             f"{len(s['plan_steps'])} step(s) not SATISFIED): the agent did not start; "
+                             f"see why with `varek refusals`"), file=sys.stderr)
+    elif s["refused"] and not (s["dry"] or args.dry_run):
         print(_paint("2", "[varek] see why with `varek refusals`"), file=sys.stderr)
     if s["run"] is None:
         with open(log, encoding="utf-8", errors="replace") as fh:
@@ -1706,6 +1785,11 @@ def cmd_refusals(args):
         info(_paint("1;33", f"DRY RUN, NOT ENFORCING: {s['not_enforced']} call(s) the policy refuses were let "
                             "through (listed as WOULD_REFUSE); calls refused all the same are listed as "
                             "refused.") + "\n")
+    if plan_refused(s) and not args.not_enforced:                                    # v1.35
+        plan_refusal_lines(s, policy, args.n)
+        if not s["refusals"] and not ends and not s["cred_refused"]:
+            info("UNSATISFIED: a deny rule matched.  UNKNOWN: no rule allowed it (refused by default).")
+            return 0
     if args.enforced or args.not_enforced:                                          # v1.29: filters
         keep = (lambda r: r.get("enforced") is not False) if args.enforced else (lambda r: r.get("enforced") is False)
         s["refusals"] = [r for r in s["refusals"] if keep(r)]
@@ -2590,6 +2674,9 @@ def build_parser():
     x.add_argument("file", nargs="?")
     x.add_argument("--explain", action="store_true",
                    help="also show, for each rule, an example it decides")
+    x.add_argument("--plan", metavar="PLAN",
+                   help="v1.35: also decide this plan under the policy, as `varek run --plan` would, "
+                        "with each step's reason (no agent runs)")
     x.set_defaults(fn=cmd_policy_check)
     x = psub.add_parser("suggest", help="v1.29: draft a policy from a run's refusals (a dry run's, or an "
                                          "enforcing run's); installs nothing")
