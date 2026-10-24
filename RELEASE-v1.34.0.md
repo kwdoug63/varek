@@ -1,10 +1,5 @@
 # VAREK v1.34.0 — Kubernetes: a Node Agent and a Helm Chart
 
-> **Not released yet.** The ship gate, the 24-hour runs with a real agent
-> on Amazon EKS and on OpenShift (step 9 of
-> `docs/security/v1.34-kubernetes.md`), passed on October 24, 2026; its
-> figures are below. The release date is set when it is tagged.
->
 > v1.34.0 had a review by AI review agents: seven, each on one part (the
 > node agent, in two parts; the strict JSON reader, the OCI filter and the
 > launcher; the Go plugin, policy sync and webhook; the chart, images and
@@ -12,9 +7,7 @@
 > findings are fixed or stated as limits (below). A human or third-party
 > review has not been done.
 
-Not yet released.
-
-MIT · github.com/kwdoug63/varek
+Released 2026-10-24 · MIT · github.com/kwdoug63/varek
 
 ## Summary
 
