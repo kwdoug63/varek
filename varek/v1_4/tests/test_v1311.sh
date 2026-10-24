@@ -30,7 +30,8 @@ check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else flu
 trap '[ -n "${KEEP:-}" ] && echo "kept $OUT ${W:-}" || rm -rf "$OUT" "${W:-}"' EXIT
 
 echo "== 1. the version =="
-check "the Warden reports 1.31.1" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | grep -q 'VAREK Warden  1.31.1'"
+# (v1.32: 1.31.1 or a later release)
+check "the Warden reports 1.31.1 or later" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$HERE/tools/varek' version | python3 -c 'import re,sys; m=re.search(r\"VAREK Warden  (\\d+)\\.(\\d+)\\.(\\d+)\", sys.stdin.read()); sys.exit(0 if m and tuple(map(int, m.groups())) >= (1, 31, 1) else 1)'"
 
 if [ -z "$WARDEN" ] || [ "$(id -u)" != 0 ]; then
     skip "the calls under the Warden (needs root and the warden binary)"

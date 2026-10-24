@@ -34,6 +34,8 @@ AUDIT="$HERE/tools/varek_audit.py"
 fail=0
 pass() { printf '  %-6s %s\n' PASS "$1"; }
 flunk() { printf '  %-6s %s\n' FAIL "$1"; fail=1; }
+skips=0
+skip() { printf '  %-6s %s\n' SKIP "$1"; skips=$((skips + 1)); }
 
 D=/tmp/varek_v1170
 OUT="$(mktemp -d)"
@@ -54,6 +56,8 @@ mkdir -p "$D/hidden/bob/work"
 "$KEYGEN" "$D/secret/log.key" > "$D/secret/log.key.hex"
 mknod "$D/allowed/blk" b 7 0
 mknod "$D/allowed/mem" c 1 1
+# v1.32: a user namespace (rootless Podman) may not make device nodes
+RAWOK=; [ -b "$D/allowed/blk" ] && [ -c "$D/allowed/mem" ] && RAWOK=1
 # The secret directory, reachable a second time under the allowed tree.
 mount --bind "$D/secret" "$D/allowed/keys"
 mount --bind "$D/secret" "$D/allowed/logs"
@@ -72,13 +76,21 @@ expect "signing key through a bind mount: refused"     "$A" key_via_alias      "
 expect "signing key lookup through the mount: refused" "$A" key_stat_via_alias "ERR Permission denied"
 expect "verdict stream through the mount: refused"     "$A" stream_via_alias   "ERR Permission denied"
 expect "anchor through the mount: refused"             "$A" anchor_via_alias   "ERR Permission denied"
-expect "block device in the allowed tree: refused"     "$A" block_device       "ERR Permission denied"
-expect "/dev/mem twin in the allowed tree: refused"    "$A" dev_mem            "ERR Permission denied"
+if [ -n "$RAWOK" ]; then
+    expect "block device in the allowed tree: refused"     "$A" block_device       "ERR Permission denied"
+    expect "/dev/mem twin in the allowed tree: refused"    "$A" dev_mem            "ERR Permission denied"
+else
+    skip "a block device and a /dev/mem twin in the allowed tree (no device nodes can be made here)"
+fi
 expect "an ordinary allowed file still opens"          "$A" ordinary_file      "READ 3"
 [ "$(rules protected_object "$D/secret/run.log")" -ge 4 ] && pass "protected_object recorded for each" \
     || flunk "protected_object records ($(rules protected_object "$D/secret/run.log"))"
-[ "$(rules raw_device "$D/secret/run.log")" -ge 2 ] && pass "raw_device recorded for both" \
-    || flunk "raw_device records ($(rules raw_device "$D/secret/run.log"))"
+if [ -n "$RAWOK" ]; then
+    [ "$(rules raw_device "$D/secret/run.log")" -ge 2 ] && pass "raw_device recorded for both" \
+        || flunk "raw_device records ($(rules raw_device "$D/secret/run.log"))"
+else
+    skip "raw_device recorded for both (no raw devices made here)"
+fi
 if python3 "$AUDIT" --policy "$POL" --checker "$CERT" --pubkey "$(cat "$D/secret/log.key.hex")" \
         --anchor "$D/secret/anchor.log" "$D/secret/run.log" > "$OUT/a1" 2>&1 \
    && grep -q "integrity: signed, anchored" "$OUT/a1"; then
@@ -155,5 +167,5 @@ cp "$PROBE" "$D/secret/private_probe"; chmod 700 "$D/secret/private_probe"
     && pass "a program nobody may execute: a clear refusal (exit 127)" || flunk "non-executable program (exit $rc)"
 
 echo
-if [ "$fail" -eq 0 ]; then echo "test_v1170: PASS"; else echo "test_v1170: FAIL"; fi
+if [ "$fail" -eq 0 ]; then echo "test_v1170: PASS ($skips skipped)"; else echo "test_v1170: FAIL"; fi
 exit "$fail"

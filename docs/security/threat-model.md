@@ -1,6 +1,6 @@
 # VAREK — Threat Model
 
-Version: current as of v1.29.0 (release candidate) · MIT · github.com/kwdoug63/varek
+Version: current as of v1.32.0 (release candidate; v1.31.0 added with it) · MIT · github.com/kwdoug63/varek
 
 This document states what VAREK defends, against whom, and what it explicitly
 does not defend. It is deliberately conservative: where a guarantee is
@@ -127,6 +127,32 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
   home, the working directory, PATH, the programs root owns, the shipped
   profiles); a profile is trusted to name only what its agent needs.
 
+- **Trust boundary 15 (v1.31.0):** an MCP server the policy declares, and
+  the rules written for it. A confined server (`mcp server NAME exec PATH`,
+  `subagent=NAME confined`) is decided by its own rules (`for=NAME`) and
+  none of the agent's, and the agent by none of its: each subject is
+  trusted with what its rules allow, no more. The server's file is pinned
+  (`sha256=`) or trusted as a file no subject may write; a server that
+  reads code or settings from a file the agent may write runs what the
+  agent wrote there, under the server's rules. A remote MCP server is
+  trusted to act on the body the Warden decided (the proxy sends that body
+  and no other) and with the token released to it; what it does with a
+  call, and what it returns, is outside VAREK.
+- **Trust boundary 16 (v1.32.0):** the container the Warden runs in, and
+  the host's container runtime. In a container the Warden holds the ten
+  capabilities the documented settings add (the agent none: its bounding
+  set is emptied and it runs as its own user, unless run `--run-as root`),
+  under the runtime's default seccomp profile and VAREK's AppArmor profile
+  or SELinux type, with a cgroup namespace of its own. The runtime, its
+  kernel and its host are trusted as a host's kernel is: whoever controls
+  the runtime controls the container, the Warden in it included. A root
+  process started in the container with the same capabilities (a `docker
+  exec` shell) has the Warden's power there. The published image is
+  trusted as far as its signature: cosign keyless, the release workflow's
+  GitHub identity for that version's tag, and its SBOM attestation; the
+  base images are taken by tag at each build, and the SBOM records what
+  went in.
+
 ## 3. Adversary models
 
 VAREK is specified against two adversaries. The default deployment posture is
@@ -151,8 +177,11 @@ Model-B techniques below, with the residual limits stated honestly.
   SATISFIED verdict under the active policy. UNKNOWN and UNSATISFIED both fail
   closed.
 - **Compositional plan safety (action-graph).** A planned directed acyclic graph
-  of actions is verified before its first action runs, and re-verified as the
-  agent revises it.
+  of actions is verified before the agent starts, once per launch. The agent is
+  not held to it once it starts: each call is decided by the policy, as
+  without a plan. *(Correction, v1.32.0: through v1.31 this said the plan is
+  re-verified as the agent revises it; nothing does that. Holding a run to its
+  plan is planned for v1.35.0.)*
 - **Cross-action data-flow bounds.** A source labeled secret cannot reach a sink
   forbidden by policy, across actions, with declassification only where audited.
 - **Progress-safety / liveness (v1.9).** At policy load the verifier certifies
@@ -572,6 +601,67 @@ Model-B techniques below, with the residual limits stated honestly.
     the same SMT decision procedure and checked by the same certificate
     checker.
 
+- **MCP servers confined, MCP calls decided, MCP tokens bound, and an OCSF
+  export (v1.31.0).** After `require warden 1.31`:
+  - *A confined server's calls are its rules'.* Every call of a declared
+    MCP server, and of every process it starts, is decided against the
+    rules written `for=NAME` only; the agent's rules do not apply to it,
+    nor its to the agent. The hard-denied calls, the Warden's own files,
+    revocation and the token's expiry hold for it as for the agent; each
+    allowed decision's certificate names its subject, and the checker
+    replays it as that subject only.
+  - *The start is refused* for a server file any subject may write (or a
+    directory above it), one whose SHA-256 is not its pin, one that is or
+    reaches an interpreter or a launcher, and a confined launch whose
+    environment names code (`subagent_env`).
+  - *A remote MCP call is decided before any of it is sent,* on its method
+    and the tool, resource or prompt it names, read by a strict parser
+    from the whole body the server will act on; a call that cannot be
+    read, a batch, a duplicate key or a header that disagrees with the
+    body is refused.
+  - *An MCP token reaches only its server.* A credential with
+    `audience=URL` is checked at fetch and released only into calls to
+    that server; a token the agent sends itself that is the user's, for
+    another audience, expired or unreadable is refused.
+  - *The OCSF export is the stream's.* Every event carries its record's
+    report id, sequence number and chain hash; `--verify` finds an event
+    edited, dropped, reordered or cut; a stream the audit refuses is not
+    exported.
+- **Containers: an official image, Docker and Podman (v1.32.0).** The
+  Warden in a container is the Warden on a host: the same filter,
+  decisions, records and refusals, the agent its child in namespaces the
+  Warden makes inside the container.
+  - *Settings, never `--privileged`.* The documented run drops every
+    capability and adds ten, each shown needed by a suite that fails
+    without it; the runtime's default seccomp profile stays on; VAREK's
+    AppArmor profile is Docker's `docker-default` with the Warden's three
+    kinds of mount allowed and no filesystem mounted or reconfigured, its
+    SELinux module four rules for `container_init_t`.
+  - *Sub-agents and confined MCP servers in a container.* The container's
+    read-only cgroup filesystem is bind-remounted read-write in the
+    Warden's own mount namespace only, for its own groups only
+    (`--cgroupns=private`, else refused); the container's mount and the
+    filesystem's options are untouched, and the agent writes none of it.
+    Without the kernel's process events (a container's), a sub-agent of
+    the image its launcher runs is told launched by its memory layout,
+    which the process cannot change but by a launch (its filter refuses
+    `prctl(PR_SET_MM)`); the same layout is a
+    failed launch, and where layouts are not randomized such a launch is
+    refused.
+  - *Refused, not run with less.* `varek run` in a container refuses a
+    run the container cannot carry (a missing capability; for a run that
+    mounts or makes control groups, the profile, the mount test, the
+    cgroup namespace), naming the flag. Rootless Podman without
+    `--systemd=always` was refused for sub-agents at the start through
+    v1.32.0; from v1.32.1 the Warden bind-remounts the cgroup filesystem
+    in the user namespace too, and refuses, naming that flag, only where
+    the kernel refuses the remount.
+  - *The image's provenance.* Each tag's image is built from main, checked
+    (`varek doctor`, an agent's run, Docker's defaults refused), signed
+    with cosign keyless and given a signed CycloneDX SBOM attestation,
+    both verified before `:1.32` and `:latest` move to it; every action
+    the release runs is pinned by commit.
+
 The per-class status of every known bypass class is maintained in
 `docs/security/bypass-classes.md`.
 
@@ -787,8 +877,9 @@ are claimed as solved.
     `obo`.
   - *Sub-agents.* A threaded process cannot launch one. Where the kernel's
     process events cannot be used (some containers), a launch of the image
-    the launcher already runs is refused, since its outcome could not be
-    told.
+    the launcher already runs was refused through v1.31, since its outcome
+    could not be told; from v1.32.0 it is told by the process's memory
+    layout, and refused only where layouts are not randomized.
   - *The operator* is recorded as the host reports it, not verified.
   - *SPIFFE.* An X.509-SVID from a file only; JWT-SVIDs and the Workload
     API are not supported.
@@ -821,6 +912,55 @@ are claimed as solved.
     call for (a dry run used to reach what the agent's user could not; a
     dry run's stream passed off as enforcing; `suggest` led to an active
     rule for a credential store) has not been done yet.
+- MCP servers and tokens, and the OCSF export (v1.31.0,
+  `v1.31-standards.md`):
+  - *The agent's calls to a stdio MCP server are not decided* (D4): they
+    are bytes on a pipe between two supervised processes. A confined
+    server bounds what any call to it can do; its tools remain the
+    agent's to call.
+  - *A call's arguments and a server's responses are not decided* (a tool
+    list that changes, a result carrying an injected instruction).
+  - *Tokens come from stores.* VAREK runs no OAuth flow and refreshes no
+    token; token introspection (RFC 7662) is not used.
+  - *A confined server shares what both subjects' rules reach:* one that
+    reads code or settings from a file the agent may write runs what the
+    agent wrote. Its launch environment is checked against variables that
+    name code; a program taking code from another variable is the
+    operator's to know.
+  - *A large MCP call is held whole,* up to `max_body=`, before it is sent.
+  - *The OCSF export is 1.9.0 only,* with no `record_integrity`
+    attestation; the stream is the evidence.
+  - *Review.* v1.31.0 was reviewed by AI review agents, not by a human or
+    third party. Its findings are listed in its release notes.
+- Containers (v1.32.0, `v1.32-containers.md`):
+  - *The Warden needs CAP_SYS_ADMIN in the agent's container* (D3): the
+    container holds it, the agent never does. Running the Warden outside
+    the agent's container is v1.34's node agent.
+  - *The AppArmor profile bounds what is mounted, not where.* AppArmor
+    cannot tie a bind's target to its source nor require a remount to
+    keep a flag: a process with CAP_SYS_ADMIN in the container (the
+    Warden, or a root shell started there with the same capabilities) may
+    bind any path and make a bind mount read-write, a read-only volume's
+    included. The SELinux type `container_init_t` has more than
+    `container_t` beyond the control groups (mounts on `/proc`, sysfs and
+    the cgroup filesystem, an unconfined network): the distribution's
+    type for systemd in a container, used as is.
+  - *Process events* do not reach the Warden in a container's network
+    namespace (RHEL 9, Ubuntu 24.04). A process may turn off its next
+    program's randomization (`personality(ADDR_NO_RANDOMIZE)`): its launch
+    then most likely settles failed, its process the launcher's subject,
+    never the other way.
+  - *A tmpfs the container mounts itself* cannot be remounted noexec under
+    SELinux; the Warden refuses to start, naming it.
+  - *Container detection* knows Docker and Podman (`/.dockerenv`,
+    `/run/.containerenv`); under another runtime `varek doctor` and `varek
+    run`'s container checks do not run, and the Warden refuses by itself
+    what it cannot do.
+  - *The base images are taken by tag,* so a build takes their current
+    fixes and is not reproducible bit for bit; the SBOM records what went
+    in.
+  - *Review.* v1.32.0 was reviewed by AI review agents, not by a human or
+    third party. Its findings are listed in its release notes.
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).
 - An agent may probe for SATISFIED-but-harmful actions near a policy boundary;

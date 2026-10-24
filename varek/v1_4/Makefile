@@ -32,7 +32,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden warden-proxy warden-secrets target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-v1311 test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
+.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-v1311 test-v1320 test-v1321 test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
 
 all: $(BINS)
 
@@ -80,6 +80,13 @@ warden: warden.c warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_sy
 	@# (docs/security/v1.27-program-launches.md): memfd_create stays hard-denied
 	@awk '/^static const char \*kHardDeny\[\]/,/NULL/' warden_baseline_filter.c | grep -q '"memfd_create"' || \
 	    { echo "warden: memfd_create must stay in the filter's hard-deny set (v1.27)"; exit 1; }
+	@# v1.32: a sub-agent launch is told by its memory layout, which only a
+	@# launch or prctl(PR_SET_MM) changes, so PR_SET_MM (35) is never admitted,
+	@# and a new prctl rule is a change to look at here
+	@! awk '/^static const unsigned long kPrctlAdmit\[\]/,/^};/' warden_baseline_filter.c | grep -qE 'PR_SET_MM|\<35\>|0x23\>' || \
+	    { echo "warden: prctl(PR_SET_MM) must stay refused (v1.32, the layout settling)"; exit 1; }
+	@[ "$$(grep -c 'SCMP_ACT_ALLOW, SCMP_SYS(prctl)' warden_baseline_filter.c)" = 2 ] || \
+	    { echo "warden: a prctl rule changed: check it admits no PR_SET_MM (v1.32), then this count"; exit 1; }
 	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c warden_secrets.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lcrypto -lresolv
 
 # v1.26.1: the egress proxy, its own program (the Warden starts it from a
@@ -447,6 +454,16 @@ test-v1310: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_ch
 test-v1311: warden tools/vdp_check tools/vdp_cert_check
 	@./tests/test_v1311.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
 
+# v1.32: containers (docs/security/v1.32-containers.md); the suites inside a
+# container: tests/container_sweep.sh
+test-v1320: warden tools/vdp_check tools/vdp_cert_check
+	@./tests/test_v1320.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
+
+# v1.32.1: rootless Podman without --systemd=always (the bind remount in a
+# user namespace)
+test-v1321: warden tools/vdp_check tools/vdp_cert_check tests/v1281_sub
+	@./tests/test_v1321.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
+
 # v1.31: the strict JSON parser for MCP calls (mcp_json.c), under ASan and
 # UBSan: its vectors, then MJ_N mutated inputs
 MJ_N ?= 1000000
@@ -512,7 +529,7 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared tests/proxy_parse_test tests/proxy_parse_fuzzer tests/v1281_sub tests/v1290_open tests/v1290_lat
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared tests/proxy_parse_test tests/proxy_parse_fuzzer tests/v1281_sub tests/v1290_open tests/v1290_lat tests/v1310_peek
 
 # v1.22: install the runtime and the `varek` command.
 #   sudo make install                  -> /opt/varek, plus /usr/local/bin/varek
@@ -523,7 +540,7 @@ INSTALL_TOOLS := tools/varek tools/vdp_check tools/vdp_cert_check tools/varek_ke
 	tools/varek_audit.py tools/varek_cyclonedx.py tools/varek_ocsf.py tools/varek_ed25519.py \
 	tools/varek_preflight.sh tools/varek_anchor_forward.py tools/varek_anchor_receiver.sh \
 	tools/varek_license.py tools/varek_bench.py tools/varek_bench_proxy.py tools/bench_proxy_client.py tools/varek_bench_launch.py \
-	tools/varek_baseline.py tools/varek_suggest.py \
+	tools/varek_baseline.py tools/varek_suggest.py tools/varek_container.py \
 	tools/bench_workload
 
 install: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
@@ -545,4 +562,4 @@ uninstall:
 	@echo "removed $(PREFIX); settings in /etc/varek and logs in /var/log/varek were kept"
 
 test-cli: warden warden-proxy tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
-	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_license.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py tests/test_varek_bench_mcp.py
+	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_container.py tests/test_varek_license.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py tests/test_varek_bench_mcp.py

@@ -117,8 +117,27 @@ if [ "$(id -u)" != 0 ] || [ -z "$WARDEN" ]; then
 else
     M="$(mktemp -d /tmp/varek_v1271m.XXXXXX)"; chmod 755 "$M"
     mkdir -p "$M/w" "$M/s" "$M/ns" "$M/e"; : > "$M/e/f"; chmod -R 755 "$M"
-    mount -t tmpfs -o size=1m tmpfs "$M/s" && mkdir -p "$M/s/in" && mount -t tmpfs -o size=1m tmpfs "$M/s/in"
-    mount -t tmpfs -o size=1m,nosuid tmpfs "$M/ns"
+    # v1.32: under SELinux in a container, a tmpfs the container mounts
+    # itself (tmpfs_t) may not be remounted, which the noexec mount is; the
+    # runtime's own (--tmpfs, /dev/shm) may. There the cases are directories
+    # bound onto themselves, with the same flags (VAREK_V1271_BIND=1 too)
+    tmpok=1
+    P="$(mktemp -d /tmp/varek_v1271p.XXXXXX)"
+    if [ -n "${VAREK_V1271_BIND:-}" ]; then tmpok=
+    elif mount -t tmpfs -o size=64k tmpfs "$P" 2>/dev/null; then
+        unshare -m sh -c "mount --make-rprivate / && mount --bind '$P' '$P' && mount -o remount,bind,noexec '$P'" 2>/dev/null || tmpok=
+        umount "$P"
+    else tmpok=; fi
+    rmdir "$P"
+    [ -n "$tmpok" ] || echo "  (the mounts beneath are bind mounts: a tmpfs made here cannot be remounted)"
+    # tmount OPTS DIR: a tmpfs, or DIR bound onto itself with OPTS' flags
+    tmount() {
+        if [ -n "$tmpok" ]; then mount -t tmpfs -o "$1" tmpfs "$2"; return; fi
+        local f; f="$(printf '%s' "$1" | tr , '\n' | grep -v -E '^(size|mode)=' | paste -sd, -)"
+        mount --bind "$2" "$2" && mount -o "remount,bind${f:+,$f}" "$2"
+    }
+    tmount size=1m "$M/s" && mkdir -p "$M/s/in" && tmount size=1m "$M/s/in"
+    tmount size=1m,nosuid "$M/ns"
     chmod 755 "$M/s" "$M/s/in" "$M/ns"
     trap 'umount "$M/s/in" "$M/s" "$M/ns" 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $OUT" || rm -rf "$OUT" "${W:-}" "$M"' EXIT
     # mi <policy body> [warden options]: the agent's /proc/self/mountinfo in $OUT/mi.out
@@ -139,7 +158,7 @@ else
     check "the host's mounts are unchanged by the run" sh -c "cmp -s '$OUT/host.before' '$OUT/host.after' && ! grep -q ' $M/w ' /proc/self/mountinfo"
     # v1.27.1 review: nosymfollow kept; a mount beneath whose mountinfo line is long
     mkdir -p "$M/y/nsf" "$M/l/sub"; chmod -R 755 "$M/y" "$M/l"
-    mount -t tmpfs -o size=1m,nosymfollow tmpfs "$M/y/nsf" && chmod 755 "$M/y/nsf"
+    tmount size=1m,nosymfollow "$M/y/nsf" && chmod 755 "$M/y/nsf"
     LONG="$M/deep"; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do LONG="$LONG/$(printf '%200s' '')"; done
     mkdir -p "$LONG" && chmod -R 755 "$M/deep" && mount --bind "$LONG" "$M/l/sub"
     trap 'umount "$M/s/in" "$M/s" "$M/ns" "$M/y/nsf" "$M/l/sub" 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $OUT" || rm -rf "$OUT" "${W:-}" "$M"' EXIT

@@ -94,6 +94,11 @@ if [ "$CHECK_ONLY" = 1 ]; then
     finish
     exit $?
 fi
+# a directory of its own: an earlier soak's files there would be judged with
+# this one's (v1.32, the container trial)
+if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
+    echo "soak.sh: $OUT is not empty: give the soak a directory of its own (--out)"; exit 2
+fi
 mkdir -p "$OUT/a" "$OUT/b/work" "$OUT/b/outside" "$OUT/c/work" "$OUT/as"
 chmod 755 "$OUT" "$OUT/a" "$OUT/b" "$OUT/c" "$OUT/as"
 chmod 1777 "$OUT/b/outside"                  # its owner's rights would let the agent write: only the policy refuses
