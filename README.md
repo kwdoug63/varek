@@ -538,7 +538,7 @@ different risks at different points in the stack.
 - [x] **v1.31.1** — A patch release of v1.31.0: `epoll_wait`, `epoll_create`, `pipe` and `getpgrp` admitted under every policy, so asyncio, a shell's command substitution and bash work under the Warden ([release notes](./RELEASE-v1.31.1.md)).
 - [x] **v1.32.1** — A patch release of v1.32.0: rootless Podman without `--systemd=always`
 - [x] **v1.32.0** — Containers: an official image (`ghcr.io/kwdoug63/varek`, signed, with an SBOM), Docker and Podman, rootless included, under a published minimal set of settings, never `--privileged` ([design](./docs/security/v1.32-containers.md))
-- [ ] **v1.33.0** (in progress; planned as v1.30.0) — macOS: the agent and the Warden in a lightweight Linux VM, with the same guarantees as on Linux ([plan](./docs/roadmap/v1.28-v1.31.md))
+- [ ] **macOS** (in progress; planned as v1.30.0, then v1.33.0; v1.34.0 shipped first, so it takes the next number when it is released) — macOS: the agent and the Warden in a lightweight Linux VM, with the same guarantees as on Linux ([plan](./docs/roadmap/v1.28-v1.31.md))
 - [x] **v1.34.0** — Kubernetes: a node agent, a Helm chart, OpenShift and Amazon EKS ([design](./docs/security/v1.34-kubernetes.md))
 - [ ] **v1.35.0** (planned) — Agent frameworks: plans generated from the framework, Amazon Bedrock AgentCore first ([plan](./docs/roadmap/v1.32-v1.35.md))
 - [ ] **v1.36.0** (planned) — Security operations: Splunk, Microsoft Sentinel, OpenTelemetry ([plan](./docs/roadmap/v1.32-v1.35.md))
