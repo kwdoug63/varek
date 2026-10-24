@@ -212,7 +212,62 @@ code before it was fixed (commits `9a05660`, `c956810`).
 
 ## The 24-hour runs
 
-*To be run (step 9): EKS and OpenShift, a real agent, 24 hours each.*
+### Amazon EKS: passed
+
+October 23 to 24, 2026, from about 01:25 CDT; `soak.sh` at 243bb21. Two
+m6i.large nodes on Amazon Linux 2023: Kubernetes 1.35.8, containerd 2.3.5
+(NRI v0.12, on by default). The image was built for the EKS trials, before
+the three OpenShift fixes (below). Those fixes change nothing on these
+nodes: the plugin's rules differ only for NRI before v0.12, and the
+dialed socket's context only where the agent has an SELinux context.
+Agent run B of the shared soak (files, `python3`, git) in pods, one long
+agent on each node for the whole day, a turn a minute, and a short Job
+every 15 minutes, all under one policy.
+
+| | |
+|---|---|
+| Long agents | 2,592 turns of work done, 576 git commits; 288 probes, all held |
+| Short Jobs | 97 of 95 due ran to their end; 291 probes, all held |
+| The allowed service | 3,465 requests; at the agent p50 3 ms, p99 18 ms |
+| The denied service | 0 requests |
+| Streams | 99, 1,246,748 records (1,052 refused); audited: 99 pass |
+| The exporter | 99 runs' audits passed in its log |
+| VAREK's containers | not restarted (8: node agent, plugin, exporter, webhook) |
+| Memory, each node | exporter 11.0 to 13.4 MB; listener 4.3 to 4.4 MB; plugin 11.4 to 12.2 MB; a long agent's supervisor 10.3 to 10.7 MB; the node agent's flat (574 samples) |
+
+`soak_check: PASS`. Every probe held: `/etc/shadow`, a volume the policy
+does not name, a program the agent wrote, a service it does not name (by
+name and by address) and the instance metadata. An earlier run of the
+day was cut 12.6 hours in: the first OpenShift trial was started in a
+shell whose KUBECONFIG was EKS's, and its setup deleted the EKS run's
+namespaces. `soak.sh` now refuses a cluster of the other kind before it
+changes anything (243bb21), and the run was started again.
+
+### OpenShift
+
+Under way: single-node OpenShift 4.22.18 (CRI-O 1.35.9, crun 1.27, SELinux
+enforcing), from 03:20 CDT on October 23, at ff512a7. Its trials found
+three faults, each fixed before the run:
+
+- **CRI-O 1.35 crashed creating every supervised container.** Its NRI
+  (v0.11) writes a seccomp rule's errno through a pointer it never
+  allocated. Every NRI before v0.12 has it: containerd before 2.3 and
+  CRI-O before 1.37. On such a runtime the plugin now gives no rule an
+  errno. A rule refusing with EPERM names none, which is the runtime's own
+  EPERM, so the kernel's filter is the same. Any other errno (ENOSYS for
+  `clone3` and `io_uring_setup`, EACCES for the refused `setsockopt`
+  options) is notified instead, and the node agent answers it with that
+  errno.
+- **Under SELinux no connection reached the agent.** A socket takes its
+  maker's context, and the kernel does not hand a socket the node agent
+  (`spc_t`) made to the agent (`container_t`). The node agent now makes the
+  socket it dials with the agent's context.
+- **That first fix set nothing**: it named `/proc` by path inside the
+  container's mount namespace, where `/proc` is the container's. It now
+  goes through the node's `/proc`, and a context it cannot set is logged.
+
+The sixth trial then passed: 135 of 135 turns' requests reached the
+allowed service, and all four streams were audited.
 
 ## Upgrading
 
