@@ -1074,7 +1074,7 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
 /* ---- sendmsg / sendmmsg on a connected socket ---- */
 
 #define RELAY_MAX (256 * 1024)
-struct msghdr_user {                      /* struct msghdr as the x86_64 kernel reads it */
+struct msghdr_user {                      /* struct msghdr as the kernel reads it (x86_64, aarch64) */
     uint64_t name;
     uint32_t namelen, pad0;
     uint64_t iov;

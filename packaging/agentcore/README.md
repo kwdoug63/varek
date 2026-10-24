@@ -14,7 +14,7 @@ from inside a session, by this probe:
   read its memory (`process_vm_readv`);
 - the cgroup file system, and whether it can make a group;
 - whether its root is writable; Landlock's ABI; the LSMs; the architecture;
-- with VAREK's own image as its base (once the Warden builds for arm64), also
+- with VAREK's own image as its base (built for arm64, as below), also
   `varek doctor` and a real run: `varek run -- /bin/cat /etc/os-release`
   under the baseline policy, with `varek refusals` on its stream.
 
@@ -111,9 +111,14 @@ sudo docker push -q $REPO:1
 ```
 
 The build takes a minute: the probe stands alone (Python's standard library),
-as the Warden does not build for arm64 on this branch yet (its arm64 build is
-on the macOS branch, v1.33), so the report has no `varek doctor` or run
-under the Warden; every fact D8 needs is measured without it. `docker login`
+and every fact D8 needs is measured without the Warden. For a run under the
+Warden too, build VAREK's image for arm64 first and give it as the base
+(about ten minutes):
+
+    sudo docker build -q -f packaging/container/Containerfile -t varek:arm64 .
+    sudo docker build -q --build-arg BASE=varek:arm64 -f packaging/agentcore/Containerfile -t $REPO:2 .
+
+and in section 3 name `:2` in the runtime's `containerUri`. `docker login`
 takes ECR's token from the instance's role, through the pipe; it is never
 shown or typed.
 

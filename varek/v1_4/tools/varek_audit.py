@@ -335,6 +335,16 @@ def check_dry(meta, records, problems):
     dry = rs.get("mode") == "dry_run"
     if rs.get("mode") not in (None, "dry_run"):
         problems.append(f"run_start's mode {rs.get('mode')!r} is not one the Warden writes")
+    # v1.33.0: the architecture the Warden ran on (written from v1.33.0; open
+    # flags are recorded in VAREK's encoding, x86_64's, on both)
+    if "arch" in rs and rs.get("arch") not in ("x86_64", "aarch64"):
+        problems.append(f"run_start's arch {rs.get('arch')!r} is not one the Warden writes")
+    elif "arch" not in rs and _version_at_least(rs.get("warden"), (1, 33)):
+        problems.append(f"run_start names the Warden {rs.get('warden')!r}, which records its architecture, "
+                        f"but has none")
+    elif "arch" in rs and not _version_at_least(rs.get("warden"), (1, 33)):
+        problems.append(f"run_start records an architecture, but names the Warden {rs.get('warden')!r}, "
+                        f"which records none")
     end = [meta["run_end"]] if isinstance(meta.get("run_end"), dict) else []
     if end and end[-1].get("mode") != rs.get("mode"):
         problems.append(f"run_end's mode {end[-1].get('mode')!r} is not run_start's {rs.get('mode')!r}")
@@ -1452,7 +1462,28 @@ def check_chain(ident, meta, records, run, problems):
     for tag, (line, _) in settled.items():
         if tag not in started or started[tag][0] > line:
             problems.append(f"sub-agent {tag} settled, but no launch started it before")
+    # a launched sub-agent with no decision of its own counts too (0)
+    for tag in started:
+        if tag not in settled or settled[tag][1] != "failed":
+            count.setdefault(tag, 0)
     return count
+
+
+def chain_summary(per_sub):
+    """v1.30: the sub-agents by name, as the chain line shows them: how many
+    were launched and how many decisions they had, with the range per launch
+    when it varies (a 24-hour run launches hundreds of each)."""
+    by = {}
+    for tag, n in per_sub.items():
+        by.setdefault(tag.rsplit("#", 1)[0], []).append(n)
+    out = []
+    for name in sorted(by):
+        ns = by[name]
+        each = f"{ns[0]} each" if min(ns) == max(ns) else f"{min(ns)} to {max(ns)} each"
+        out.append(f"{name} {len(ns)} launch{'es' if len(ns) != 1 else ''}, "
+                   f"{sum(ns)} decision{'s' if sum(ns) != 1 else ''}"
+                   f"{f' ({each})' if len(ns) > 1 else ''}")
+    return "; ".join(out) if out else "none"
 
 
 def check_credentials(creds, cred_rules, meta, records, complete, problems, notes, auds=None):
@@ -3638,11 +3669,12 @@ def main(argv=None):
         ob_ = meta.get("run_start", {}).get("on_behalf_of")
         u = ob_.get("user") if isinstance(ob_, dict) else None
         who = f"on behalf of {u.get('subject')} ({u.get('issuer')})" if isinstance(u, dict) else "no user"
-        subs = ", ".join(f"{t} {n}" for t, n in sorted(per_sub.items())) if per_sub else "none"
-        print(f"varek_audit: chain: {who}; sub-agents (decisions): {subs}")
+        print(f"varek_audit: chain: {who}; sub-agents: {chain_summary(per_sub)}")
     for n_ in cnotes:
         print(f"varek_audit: note: {n_}")
     print(f"varek_audit: integrity: {integrity}")
+    if isinstance(meta.get("run_start", {}).get("arch"), str):                          # v1.33.0
+        print(f"varek_audit: architecture: {meta['run_start']['arch']}")
     t0 = meta.get("run_start", {}).get("timestamp_ns")
     if isinstance(t0, int):
         import datetime

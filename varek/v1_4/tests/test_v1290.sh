@@ -950,7 +950,15 @@ else
     check "... a file the policy does not name: EACCES"                             go "rstat Permission denied"
     check "... a missing file where the policy allows it: ENOENT"                    go "rstat No such file or directory"
     check "lstat(2) answers the link itself"                                        rec "$G/a.log" "r.get('action') == 'file.stat' and r.get('resolved') == '$G/o/link' and r['rule'] == 'metadata_answered'"
-    check "under require warden 1.28, stat(2) is refused by the filter (EPERM), as before" bo "rstat Operation not permitted"
+    # v1.33.0: arm64 has no stat(2); its newfstatat(2) is decided under 1.28 as
+    # before (from v1.17.0): the allowed file answered, the other refused
+    if [ "$(uname -m)" = aarch64 ]; then
+        check "under require warden 1.28, newfstatat(2) is decided as before (arm64 has no stat(2))" sh -c \
+            "grep -qx 'rstat ok' '$G/b.out' && grep -qx 'rstat Permission denied' '$G/b.out'"
+        check "... recorded as a lookup (file.stat), metadata_answered"             rec "$G/b.log" "r.get('action') == 'file.stat' and r.get('resolved') == '$G/o/r' and r['rule'] == 'metadata_answered'"
+    else
+        check "under require warden 1.28, stat(2) is refused by the filter (EPERM), as before" bo "rstat Operation not permitted"
+    fi
     check "a lookup under a missing directory, of a name the policy allows: ENOENT" sh -c "grep -q 'rstat No such file or directory' '$G/a.out' && [ \"\$(grep -c '^rstat No such file or directory' '$G/a.out')\" = 2 ]"
     check "... decided on the whole name asked for"                                 rec "$G/a.log" "r.get('action') == 'file.stat' and r.get('resolved') == '$G/mi/x/y' and r['rule'] == 'metadata_not_found'"
     check "... a name it does not allow: EACCES, on the first missing directory"    rec "$G/a.log" "r.get('action') == 'file.stat' and r.get('target') == '$G/mi/z/y' and r.get('resolved') == '$G/mi/z/y' and r['decision_final'] == 'DENY'"

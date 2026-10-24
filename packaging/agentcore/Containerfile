@@ -5,14 +5,14 @@
 # answered with what the container holds. See packaging/agentcore/README.md.
 #
 # By default the probe stands alone (Python's standard library and libc):
-# the facts D8 needs are measured without the Warden, whose arm64 build is
-# not on this branch yet (it is on the macOS branch, v1.33). AgentCore
-# Runtime's default compute takes arm64. From the repository's root:
+# the facts D8 needs are measured without the Warden. AgentCore Runtime's
+# default compute takes arm64. From the repository's root:
 #
 #   docker build --platform linux/arm64 -f packaging/agentcore/Containerfile -t varek-agentcore-probe:1 .
 #
-# With VAREK's own image as BASE (built for arm64, once the Warden builds
-# there), the report also has `varek doctor` and a run under the Warden:
+# With VAREK's own image as BASE (built for arm64; the Warden builds there
+# from v1.35, its port taken from the macOS branch), the report also has
+# `varek doctor` and a run under the Warden:
 #
 #   docker build --platform linux/arm64 -f packaging/container/Containerfile -t varek:arm64 .
 #   docker build --platform linux/arm64 --build-arg BASE=varek:arm64 \

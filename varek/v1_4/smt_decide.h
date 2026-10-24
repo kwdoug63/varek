@@ -582,6 +582,12 @@ const char *vdp_reach_unknown_text(void);
 /* Name <-> bit for flag clauses; returns 0 if unknown. */
 uint32_t vdp_flag_bit(const char *name);
 
+/* v1.30: open flags between the kernel's encoding on this architecture and
+ * VAREK's (x86_64's uapi values, which rules, certificates and records use
+ * on every architecture). The identity on x86_64; exact both ways. */
+uint32_t vdp_oflags_from_native(uint32_t f);
+uint32_t vdp_oflags_to_native(uint32_t k);
+
 /* Advisory text for a rule (flag clauses that constrain only the open() call,
  * non-ASCII bytes in the constant). Writes a NUL-terminated message and returns
  * its length, or 0 if there is nothing to report. */
