@@ -540,9 +540,10 @@ different risks at different points in the stack.
 - [ ] **v1.33.0** (in progress; planned as v1.30.0) — macOS: the agent and the Warden in a lightweight Linux VM, with the same guarantees as on Linux ([plan](./docs/roadmap/v1.28-v1.31.md))
 - [ ] **v1.34.0** (planned) — Kubernetes: a node agent, a Helm chart, OpenShift, an Amazon EKS add-on ([plan](./docs/roadmap/v1.32-v1.35.md))
 - [ ] **v1.35.0** (planned) — Agent frameworks: plans generated from the framework, Amazon Bedrock AgentCore first ([plan](./docs/roadmap/v1.32-v1.35.md))
-- [ ] **v1.36.0** (planned) — Security operations: Splunk, Microsoft Sentinel, OpenTelemetry ([plan](./docs/roadmap/v1.32-v1.35.md))
+- [ ] **v1.36.0** (planned) — Kubernetes at parity with a host (credentials, sub-agents, confined MCP servers, plans and the dry run in pods; arm64; an audit in bounded memory; a key for each node), and the supported platforms tested in CI ([plan](./docs/roadmap/v1.36-v1.37.md))
+- [ ] **v1.37.0** (planned; was v1.36.0) — Security operations: Splunk, Microsoft Sentinel, OpenTelemetry ([plan](./docs/roadmap/v1.32-v1.35.md))
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
-- [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
+- [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow; revisited after v1.35, once generated plans show how many steps it would clear ([plan](./docs/roadmap/v1.36-v1.37.md))
 
 ### Language
 
