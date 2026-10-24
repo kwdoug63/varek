@@ -1,8 +1,9 @@
 # VAREK v1.34.0 — Kubernetes: a Node Agent and a Helm Chart
 
-> **DRAFT.** Not released. These notes are a draft until the ship gate, the
-> 24-hour runs with a real agent on Amazon EKS and on OpenShift (step 9 of
-> `docs/security/v1.34-kubernetes.md`), has run and its figures are here.
+> **Not released yet.** The ship gate, the 24-hour runs with a real agent
+> on Amazon EKS and on OpenShift (step 9 of
+> `docs/security/v1.34-kubernetes.md`), passed on October 24, 2026; its
+> figures are below. The release date is set when it is tagged.
 >
 > v1.34.0 had a review by AI review agents: seven, each on one part (the
 > node agent, in two parts; the strict JSON reader, the OCI filter and the
@@ -247,11 +248,27 @@ shell whose KUBECONFIG was EKS's, and its setup deleted the EKS run's
 namespaces. `soak.sh` now refuses a cluster of the other kind before it
 changes anything (243bb21), and the run was started again.
 
-### OpenShift
+### OpenShift: passed
 
-Under way: single-node OpenShift 4.22.18 (CRI-O 1.35.9, crun 1.27, SELinux
-enforcing), from 03:20 CDT on October 23, at ff512a7. Its trials found
-three faults, each fixed before the run:
+October 23 to 24, 2026, from 03:20 CDT, at ff512a7 (the release's code
+and image, `sha256:058e20a8…`). Single-node OpenShift 4.22.18 on one EC2
+instance: CRI-O 1.35.9 (NRI v0.11), crun 1.27, RHCOS 9.8, SELinux
+enforcing, NRI turned on by a MachineConfig. The same agent and policy as
+on EKS, with one long agent (one node).
+
+| | |
+|---|---|
+| Long agent | 1,296 turns of work done, 288 git commits; 144 probes, all held |
+| Short Jobs | 96 of 95 due ran to their end; 288 probes, all held |
+| The allowed service | 2,160 requests; at the agent p50 4 ms, p99 8 ms |
+| The denied service | 0 requests |
+| Streams | 97, 807,885 records (906 refused); audited: 97 pass |
+| The exporter | 97 runs' audits passed in its log |
+| VAREK's containers | not restarted (5) |
+| Memory | exporter 10.8 to 13.4 MB; listener 3.9 to 4.2 MB; plugin 13.5 to 24.2 MB; the node agent's flat (290 samples) |
+
+`soak_check: PASS`. OpenShift's trials found three faults, each fixed
+before the run:
 
 - **CRI-O 1.35 crashed creating every supervised container.** Its NRI
   (v0.11) writes a seccomp rule's errno through a pointer it never
@@ -271,7 +288,8 @@ three faults, each fixed before the run:
   goes through the node's `/proc`, and a context it cannot set is logged.
 
 The sixth trial then passed: 135 of 135 turns' requests reached the
-allowed service, and all four streams were audited.
+allowed service, and all four streams were audited. The 24-hour run
+followed it.
 
 ## Upgrading
 
