@@ -16,9 +16,15 @@
 #   runtime  Red Hat's Universal Base Image 9 (minimal), the image (D6)
 #   test     Ubuntu 24.04 with what CI installs, to run the suites inside a
 #            container (tests/container_sweep.sh): --target test
+#   node     v1.34 (docs/security/v1.34-kubernetes.md): the runtime image
+#            with what a Kubernetes node runs (the Helm chart's DaemonSet and
+#            admission webhook, packaging/helm/varek): the launcher
+#            (varek-init, static), the NRI plugin (varek-nri) and the
+#            admission webhook (varek-admission), built in build-go
 ARG BUILD_BASE=docker.io/library/almalinux:9
 ARG RUNTIME_BASE=registry.access.redhat.com/ubi9/ubi-minimal:latest
 ARG TEST_BASE=docker.io/library/ubuntu:24.04
+ARG GO_BASE=docker.io/library/golang:1.24
 
 FROM ${BUILD_BASE} AS build
 COPY packaging/container/deps.sh /usr/local/sbin/varek-deps
@@ -26,8 +32,15 @@ RUN varek-deps build
 COPY varek/v1_4 /src/varek/v1_4
 COPY v1_6 /src/v1_6
 COPY v1_7 /src/v1_7
-RUN make -C /src/varek/v1_4 clean all \
- && make -C /src/varek/v1_4 install DESTDIR=/out PREFIX=/opt/varek BINDIR=/usr/bin
+RUN make -C /src/varek/v1_4 clean all varek-init \
+ && make -C /src/varek/v1_4 install DESTDIR=/out PREFIX=/opt/varek BINDIR=/usr/bin \
+ && install -D -m 0755 /src/varek/v1_4/varek-init /node/opt/varek/varek-init
+
+# v1.34: the NRI plugin and the admission webhook, Go, linked statically
+FROM ${GO_BASE} AS build-go
+COPY varek/v1_4/k8s /src/k8s
+RUN cd /src/k8s && CGO_ENABLED=0 go build -trimpath -o /node/opt/varek/varek-nri ./cmd/varek-nri \
+ && CGO_ENABLED=0 go build -trimpath -o /node/opt/varek/varek-admission ./cmd/varek-admission
 
 FROM ${RUNTIME_BASE} AS runtime
 COPY packaging/container/deps.sh /usr/local/sbin/varek-deps
@@ -61,3 +74,17 @@ RUN if [ "$TEST_PIP" = 1 ]; then python3 -m pip install -q --break-system-packag
 COPY . /src
 RUN make -C /src/varek/v1_4 clean all tests/v1281_sub tests/v1290_open tests/v1310_peek
 WORKDIR /src/varek/v1_4
+
+# v1.34: a Kubernetes node's image (the chart names each container's command)
+FROM runtime AS node
+COPY --from=build /node/ /
+COPY --from=build-go /node/ /
+LABEL org.opencontainers.image.title="VAREK node" \
+      org.opencontainers.image.description="The Warden's node agent, NRI plugin, launcher and admission webhook, for Kubernetes"
+WORKDIR /
+ENTRYPOINT []
+CMD ["/opt/varek/warden"]
+
+# A build without --target: the runtime image, as packaging/container/README.md
+# builds it (the last stage is the default; before v1.34 it was test)
+FROM runtime

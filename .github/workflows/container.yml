@@ -88,6 +88,10 @@ jobs:
           out="$(docker run --rm $SETTINGS varek-example)"
           echo "$out"
           python3 -c 'import json,sys; r = json.loads(sys.argv[1].splitlines()[-1]); ok = r["read_own_file"] == "ok" and r["import_requests"] == "ok" and r["read_shadow"] != "ok" and r["write_etc"] != "ok" and r["user"] != 0; sys.exit(0 if ok else 1)' "$out"
+      - name: Build the node image (v1.34, the Helm chart's)
+        run: docker build -f packaging/container/Containerfile --target node -t varek-node .
+      - name: The node image - each command the chart names runs, the launcher static
+        run: packaging/container/node_check.sh varek-node
       - name: Build the test image
         run: docker build -f packaging/container/Containerfile --target test -t varek-test .
       - name: Run every suite in the test image

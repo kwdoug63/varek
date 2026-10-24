@@ -228,7 +228,7 @@ static int sub_find_cgroup2(char *mnt, size_t mn, char *root, size_t rn, char *s
                             char *why, size_t wn) {
     /* make test-v1281: act as if there were none */
     if (getenv("VAREK_WARDEN_TEST_NO_CGROUP2")) { snprintf(why, wn, "VAREK_WARDEN_TEST_NO_CGROUP2 is set"); return -1; }
-    FILE *mi = fopen("/proc/self/mountinfo", "re");
+    FILE *mi = proc_fopenf("self/mountinfo");
     if (!mi) { snprintf(why, wn, "cannot read the mounts (%s)", strerror(errno)); return -1; }
     char *line = NULL;
     size_t lc = 0;
@@ -249,7 +249,7 @@ static int sub_find_cgroup2(char *mnt, size_t mn, char *root, size_t rn, char *s
     free(line);
     fclose(mi);
     if (!found) { snprintf(why, wn, "no cgroup2 filesystem is mounted"); return -1; }
-    FILE *cg = fopen("/proc/self/cgroup", "re");
+    FILE *cg = proc_fopenf("self/cgroup");
     if (!cg) { snprintf(why, wn, "cannot read /proc/self/cgroup (%s)", strerror(errno)); return -1; }
     char buf[PATH_MAX + 8];
     found = false;
@@ -306,7 +306,7 @@ refuse:
  * user namespaces): not one; otherwise unreadable: taken as one. */
 static bool sub_in_userns(void) {
     struct stat st;
-    if (stat("/proc/self/ns/user", &st) < 0) return errno != ENOENT;
+    if (proc_statf(&st, "self/ns/user") < 0) return errno != ENOENT;
     return st.st_ino != 0xEFFFFFFDU;
 }
 
@@ -539,9 +539,8 @@ static int sub_effective(int s) {
  * the reader may not trace it). */
 static int sub_layout(pid_t pid, unsigned long long out[SUB_LAYOUT_N]) {
     static const int field[SUB_LAYOUT_N] = { 26, 27, 28, 45, 46, 47, 48, 49, 50, 51 };
-    char p[64], buf[2048];
-    snprintf(p, sizeof p, "/proc/%d/stat", (int)pid);
-    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    char buf[2048];
+    int fd = proc_openf(O_RDONLY, 0, "%d/stat", (int)pid);
     if (fd < 0) return -1;
     ssize_t n = read(fd, buf, sizeof buf - 1);
     close(fd);
@@ -633,10 +632,8 @@ static int sub_settle(int s, pid_t tid) {
         return g_sub[s].state;
     }
     if (!tid) return SUB_PENDING;
-    char p[64];
     struct stat st;
-    snprintf(p, sizeof p, "/proc/%d/exe", (int)tid);
-    bool launched = stat(p, &st) == 0 && st.st_dev == g_sub[s].edev && st.st_ino == g_sub[s].eino;
+    bool launched = proc_statf(&st, "%d/exe", (int)tid) == 0 && st.st_dev == g_sub[s].edev && st.st_ino == g_sub[s].eino;
     if (launched && g_sub[s].by_layout) {
         /* v1.32: the launcher's own image: launched only if its layout is
          * new (a process it forked after has the same layout as it) */
@@ -665,7 +662,7 @@ static const char *sub_pend_end(int s, pid_t tid, const char *result) {
  * group could not be read: the thread has gone) */
 static int sub_attribute(pid_t tid) {
     if (!g_sub_on) return 0;
-    char p[64], buf[PATH_MAX + 64];
+    char buf[PATH_MAX + 64];
     int s = -1;
     if (g_sub_pidfd) {
         uint64_t id = sub_cgid_of(tid);
@@ -675,9 +672,8 @@ static int sub_attribute(pid_t tid) {
         if (s < 0) return -1;
         goto found;
     }
-    snprintf(p, sizeof p, "/proc/%d/cgroup", (int)tid);
     /* review: line by line (a hybrid host's v1 lines come first, and may be long) */
-    FILE *cf = fopen(p, "re");
+    FILE *cf = proc_fopenf("%d/cgroup", (int)tid);
     if (!cf) return -2;
     char *l = NULL;
     bool got = false;
@@ -719,9 +715,8 @@ static int sub_launch(pid_t tid, int from, const char *name, int csubj, bool mcp
     pid_t tgid = task_tgid(tid);
     if (tgid <= 0) return -1;
     /* single-threaded only (see above) */
-    char sp[64], line[128];
-    snprintf(sp, sizeof sp, "/proc/%d/status", (int)tgid);
-    FILE *sf = fopen(sp, "re");
+    char line[128];
+    FILE *sf = proc_fopenf("%d/status", (int)tgid);
     int threads = -1;
     while (sf && fgets(line, sizeof line, sf)) if (sscanf(line, "Threads: %d", &threads) == 1) break;
     if (sf) fclose(sf);
@@ -733,8 +728,7 @@ static int sub_launch(pid_t tid, int from, const char *name, int csubj, bool mcp
     unsigned long long layout[SUB_LAYOUT_N] = { 0 };
     if (g_cn < 0) {
         struct stat xs;
-        snprintf(sp, sizeof sp, "/proc/%d/exe", (int)tgid);
-        if (stat(sp, &xs) < 0) { *rule = "subagent_same_image"; return -1; }
+        if (proc_statf(&xs, "%d/exe", (int)tgid) < 0) { *rule = "subagent_same_image"; return -1; }
         if (xs.st_dev == edev && xs.st_ino == eino) {
             if (!sub_aslr() || sub_layout(tgid, layout) < 0) { *rule = "subagent_same_image"; return -1; }
             by_layout = true;

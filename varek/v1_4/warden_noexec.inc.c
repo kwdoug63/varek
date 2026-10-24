@@ -307,7 +307,7 @@ static void noexec_unescape(char *s) {
  * (getline), and the second pass, so no mount beneath is left exec-allowed
  * however its line reads. */
 static int noexec_remount_tree(const char *root, bool check) {
-    FILE *mi = fopen("/proc/self/mountinfo", "re");
+    FILE *mi = proc_fopenf("self/mountinfo");
     if (!mi) return -1;
     char *line = NULL;
     size_t cap = 0;
@@ -395,7 +395,9 @@ static int noexec_mount(void) {
      * input, or one the operator's shell left open) was opened before the
      * mounts too. One open for reading on a file under a listed directory
      * could be mapped executable: refused. */
-    DIR *fds = opendir("/proc/self/fd");
+    int fdsd = proc_openf(O_RDONLY | O_DIRECTORY, 0, "self/fd");
+    DIR *fds = fdsd < 0 ? NULL : fdopendir(fdsd);
+    if (fdsd >= 0 && !fds) close(fdsd);
     if (!fds) {
         fprintf(stderr, "[warden] noexec: cannot list the open descriptors (%s); refusing to start\n",
                 strerror(errno));
@@ -409,9 +411,8 @@ static int noexec_mount(void) {
         struct stat st;
         if (fd == self || fl < 0 || fdf < 0 || (fdf & FD_CLOEXEC) || (fl & O_PATH) ||
             (fl & O_ACCMODE) == O_WRONLY || fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) continue;
-        char link[64], path[PATH_MAX];
-        snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
-        ssize_t n = readlink(link, path, sizeof path - 1);
+        char path[PATH_MAX];
+        ssize_t n = proc_readlinkf(path, sizeof path - 1, "self/fd/%d", fd);
         if (n <= 0) continue;
         path[n] = '\0';
         if (noexec_breach(path, fd)) { bad = fd; snprintf(badpath, sizeof badpath, "%s", path); }
@@ -436,7 +437,13 @@ static bool noexec_breach(const char *resolved, int fd) {
     for (size_t k = 0; k < g_nx_n && !under; k++) under = noexec_under(resolved, g_nx[k].path);
     if (!under || noexec_in_island(resolved)) return false;          /* v1.29: kept executable */
     struct statvfs sv;
-    return fstatvfs(fd, &sv) < 0 || !(sv.f_flag & ST_NOEXEC);
+    if (fstatvfs(fd, &sv) < 0) return true;
+    /* v1.34 step 3: in a pod the Warden mounts nothing; D4 (the node agent,
+     * at the start) has every writable mount noexec, and no mount that allows
+     * execution showing what one of them can change, so a file on a
+     * read-only mount was not written by the agent */
+    if (g_nr.on && (sv.f_flag & ST_RDONLY)) return false;
+    return !(sv.f_flag & ST_NOEXEC);
 }
 
 /* ---- step 4: the record ---- */

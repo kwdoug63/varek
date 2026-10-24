@@ -1,0 +1,296 @@
+# VAREK v1.34.0 — Kubernetes: a Node Agent and a Helm Chart
+
+> v1.34.0 had a review by AI review agents: seven, each on one part (the
+> node agent, in two parts; the strict JSON reader, the OCI filter and the
+> launcher; the Go plugin, policy sync and webhook; the chart, images and
+> workflows; the tools and tests; the documentation against the code). Its
+> findings are fixed or stated as limits (below). A human or third-party
+> review has not been done.
+
+Released 2026-10-24 · MIT · github.com/kwdoug63/varek
+
+## Summary
+
+v1.32 runs the Warden inside the agent's container, which needs ten
+capabilities, a confinement profile of VAREK's and a private cgroup
+namespace in the pod: a cluster's admission policy (Pod Security's
+"restricted" and "baseline" levels, OpenShift's default constraints)
+refuses that pod. From v1.34.0 the Warden can supervise a pod's containers
+from outside them, and the agent's pod passes "restricted":
+
+1. **A node agent.** One Warden on each node (a DaemonSet), privileged on
+   the node as Falco or Tetragon are, listening on a socket the runtime
+   dials. The container's seccomp filter is the Warden's own for its
+   policy, in the OCI form, with `SCMP_ACT_NOTIFY` and
+   `linux.seccomp.listenerPath`; the runtime hands the filter's
+   notification descriptor and the container's state to the node agent as
+   it creates the container, and from then on its calls are decided as
+   the Warden decides an agent's on a host. Each container has its own
+   supervisor, policy and stream. The node agent takes a connection only
+   from root running where the runtime runs, and the descriptor only for a
+   process the runtime started.
+2. **An NRI plugin** (`varek-nri`, containerd 2.2 or later, CRI-O 1.35 or
+   later). For each container of a pod annotated `varek.dev/policy: NAME`
+   it sets the Warden's filter (written by the Warden, from the policy's
+   bytes, which the node agent loads again and holds to their SHA-256),
+   puts the launcher first in the command, and makes every writable mount
+   noexec. A container it cannot carry is refused, the reason in the pod's
+   events.
+   On a runtime whose NRI is older than v0.12 (containerd before 2.3,
+   CRI-O before 1.37, so OpenShift 4.22), that NRI cannot carry a rule's
+   errno: the runtime crashed creating the container (found on OpenShift,
+   step 9). There the rules that refuse with EPERM name no errno, and the
+   kernel answers them EPERM as before. The rules that refuse with another
+   errno (`clone3`, `io_uring_setup`, a few `setsockopt` options) are
+   notified, and the node agent answers them with the Warden's errno.
+3. **The launch set in a pod** (D3). Landlock cannot be added to a running
+   process from outside, so a small static launcher, `varek-init`, bound
+   read-only at `/varek/init`, applies the launch set and runs the
+   container's command; the node agent checks it is that file. A policy
+   that decides launches needs a read-only root (D4).
+4. **A container that is not adjusted does not run.** Each container of a
+   supervised pod names VAREK's unsupervised seccomp profile, which
+   refuses every call and which only the plugin replaces. With no plugin
+   on the node, an old runtime, or a plugin that does not answer in time,
+   the container keeps it and does not start (found in review, below).
+5. **The pod's network** (D5). The agent has the pod's network namespace;
+   every connect and send is decided as on a host, and the stub resolver
+   and the egress proxy run inside the pod's namespace, entered by the
+   node agent.
+6. **Policies as cluster resources** (D7). `VarekPolicy`
+   (`varek.dev/v1alpha1`), namespaced, its text the policy as written for
+   the Warden. The plugin writes each to the node
+   (`POLICY_DIR/<namespace>/<name>.policy`); a pod names a policy of its
+   own namespace. An admission webhook refuses a policy the Warden does not
+   load, with the Warden's reason, and most of what the node agent would
+   refuse at a container's start; a namespace labelled
+   `varek.dev/policy-required=true` refuses pods that name none.
+7. **Evidence on the node** (D8). One stream per container on the node,
+   outside every pod, signed with the node's key and anchored, the policy
+   copied beside it; an exporter gives each as OCSF in the DaemonSet's log,
+   for the cluster's collector.
+8. **A Helm chart**, signed and published with the node image
+   (`oci://ghcr.io/kwdoug63/charts/varek`), pinning the image by the
+   digest the release signed; OpenShift's security context constraint for
+   the node agent.
+
+It changes no policy line. The Warden reports 1.34.0; the grammar stays
+1.31 (`require warden 1.34` is refused). On a host nothing changes.
+
+## Tested
+
+- **`make test-v1340`** (as root, under runc): the node agent, the
+  plugin's adjustments and the launcher end to end with a stand-in
+  runtime, in eight sections: the node agent's options; a container
+  under it, and a second; what is refused at the start, the container
+  ended; the listener (who may connect, the runtime's exit race, a slow
+  peer); the launcher, policies by name and decided launches; the pod's
+  network; the evidence and the exporter. It passes, 0 skipped.
+- **`kind` in CI** (`.github/workflows/kubernetes.yml`): the chart
+  installed on a one-node cluster (containerd 2.2 or later); the webhook's
+  refusals from a real API server; a pod in a "restricted" namespace
+  supervised (the plugin's filter in place of the unsupervised profile,
+  the launcher first, reads and launches decided, a copy written to its
+  volume refused); its stream audited and exported; the policy changed and
+  deleted; the node agent's pods taken off the node (a supervised pod does
+  not run) and back (a new pod supervised).
+- **CRI-O** (`tests/v1340_crio.sh`, CRI-O 1.37.2 and runc): the same pods
+  under CRI-O, and a container with the unsupervised profile that the
+  plugin leaves: it never starts.
+- **A real API server** (`tests/v1340_apiserver.sh`, Kubernetes 1.37.0's
+  `kube-apiserver` and `etcd`): the CRD, every refusal of the webhook, and
+  the plugin's sync, 25 checks.
+- **The sweep** (`tests/v1340_sweep.sh`): every suite run twice, once under
+  the Warden and once with each agent a pod's container under the node
+  agent; every check that differs has its reason listed
+  (`tests/v1340_sweep_known.txt`).
+- **The chart** (`make test-varek-chart`, 19 tests) and the Go tests.
+
+## Compatibility
+
+- Every v1.31 policy loads unchanged. Under the node agent, a policy with
+  credentials, sub-agents (and the MCP servers confined by them) or
+  `require on-behalf-of` is refused at deploy and at the container's start.
+- Under the node agent every file is opened as the container's user and
+  groups, whatever the policy's version (on a host, a policy before 1.29
+  has the Warden open allowed files as root).
+- New: `varek-nri`, `varek-admission`, `varek-init`, the node image
+  (`packaging/container/Containerfile --target node`), the chart
+  (`packaging/helm/varek`), `tools/varek_node_export.py`, the Warden's
+  `--node-agent`, `--node-streams`, `--node-launcher` and `--oci-filter`.
+
+## Found in review
+
+Seven AI review agents each reviewed one part; each finding was read in the
+code before it was fixed (commits `9a05660`, `c956810`).
+
+- **A supervised pod could run unsupervised.** Where the plugin did not
+  adjust a container (no plugin on its node, an old runtime, an arm64
+  node, or a plugin that did not answer NRI within its 2 s, after which
+  NRI creates the container as it was), the pod ran under its own profile.
+  NRI's validator does not close this (it counts a plugin that timed out
+  as present). Now every container of a supervised pod names VAREK's
+  unsupervised profile, required by the webhook and replaced only by the
+  plugin; the plugin answers before NRI's deadline, saying why.
+- **A runtime reaped before it was read was taken on its parent's word.**
+  The node agent's step 7 change, for containerd's runc, which exits
+  without waiting, tied the container to the named process's parent
+  alone: a root process that could reach the socket could name another
+  pod's process and have it supervised or ended. Such a peer is refused.
+- **The pod chose the resolver for its policy's host names.** The node
+  agent resolved through the container's `resolv.conf`, which `dnsPolicy:
+  None` lets the pod's author write. The webhook refuses that, and the
+  chart gives the node agent the cluster's DNS service.
+- **The webhook read its certificate once,** so a rotation stopped pod
+  creation; it reads it again when it changes, and bounds its requests,
+  its checks at once and what it keeps.
+- **The policy sync listed every policy at once** in the plugin's process
+  on every node; it lists them in pages.
+- **The exporter started a process per stream without a bound,** and again
+  for every stream on a restart; it follows at most 64 at once and records
+  what it has exported on the node.
+- **A slow peer held the node agent's listener**: one deadline now covers
+  a connection's whole state.
+- **A PID namespace shared by the pod's containers** let the agent's
+  `kill` reach its siblings and its processes outlive the run; such a
+  container is refused.
+- **A sandboxed runtime** (Kata, gVisor) runs no seccomp listener; the
+  plugin refuses its handler, the webhook its runtime class.
+- **A pod's policy annotation** could be changed after it was created; the
+  webhook refuses that.
+- **The audit took any launch set under the launcher**; it now checks the
+  set is the command alone and what starts it.
+- **The sweep could hide a regression** in a suite listed whole, or a
+  pytest error; each listed suite now needs its reason's evidence.
+- Smaller: supplementary group 0 refused; the plugin checks the
+  container's own namespaces too; `require warden` read on the Warden's
+  white space; the webhook's replicas spread, with a disruption budget;
+  the plugin and exporter under `RuntimeDefault`; two workflows' tokens
+  read only; a nested 16 MiB state read in 0.09 s, not 75 s; two
+  zero-length copies from a null buffer; checks that could pass when
+  nothing ran.
+
+## Known limits
+
+- **The webhook is part of the guarantee.** Each supervised container must
+  name the unsupervised profile; the webhook (`failurePolicy: Fail`)
+  requires it in the namespaces it checks. The plugin checks it again
+  where the runtime tells it the container's profile; CRI-O 1.37 does not.
+  An annotated pod in an excluded namespace (`kube-system` by default) is
+  not checked.
+- **The exporter audits each stream whole** when its run ends, about 3.7 KB
+  of memory a record (measured: 202,857 records, 748 MB, 110 s). Its limit
+  is 2 GiB, about 550,000 records: a day of a busy agent's work, some 4
+  minutes (the exporter gives an audit an hour). A run whose
+  audit does not fit is reported not verified, never verified. The streams
+  are not rotated on the node (that agent's day: some 250 MB).
+- **The node's signing key** is one Secret given to every node.
+- **The pod's other containers share its network namespace**: they can
+  reach the agent's stub resolver and the addresses its connects go to.
+- **The node agent does not read the kernel's filter back**: that the
+  filter is the Warden's rests on the runtime's spec, which only the
+  node's root writes.
+- **Not carried yet**: credentials, sub-agents and confined MCP servers,
+  `require on-behalf-of`, plans and the dry run.
+- **containerd before 2.2 and CRI-O before 1.35** cannot set a container's
+  seccomp policy and command through NRI; the plugin refuses to start
+  there, and supervised pods on those nodes do not run.
+- **amd64 only**: the node image is built for amd64 and the DaemonSet is
+  placed on amd64 nodes.
+- A volume with mounts beneath it keeps those submounts executable, and the
+  node agent refuses the container (D4).
+- Base images, and `kind`'s node image in CI, are taken by tag.
+- From v1.32: the image in the pod remains the fallback where the node
+  agent cannot run. From v1.31.0: the agent's calls to a stdio MCP server
+  are not decided.
+
+## The 24-hour runs
+
+### Amazon EKS: passed
+
+October 23 to 24, 2026, from about 01:25 CDT; `soak.sh` at 243bb21. Two
+m6i.large nodes on Amazon Linux 2023: Kubernetes 1.35.8, containerd 2.3.5
+(NRI v0.12, on by default). The image was built for the EKS trials, before
+the three OpenShift fixes (below). Those fixes change nothing on these
+nodes: the plugin's rules differ only for NRI before v0.12, and the
+dialed socket's context only where the agent has an SELinux context.
+Agent run B of the shared soak (files, `python3`, git) in pods, one long
+agent on each node for the whole day, a turn a minute, and a short Job
+every 15 minutes, all under one policy.
+
+| | |
+|---|---|
+| Long agents | 2,592 turns of work done, 576 git commits; 288 probes, all held |
+| Short Jobs | 97 of 95 due ran to their end; 291 probes, all held |
+| The allowed service | 3,465 requests; at the agent p50 3 ms, p99 18 ms |
+| The denied service | 0 requests |
+| Streams | 99, 1,246,748 records (1,052 refused); audited: 99 pass |
+| The exporter | 99 runs' audits passed in its log |
+| VAREK's containers | not restarted (8: node agent, plugin, exporter, webhook) |
+| Memory, each node | exporter 11.0 to 13.4 MB; listener 4.3 to 4.4 MB; plugin 11.4 to 12.2 MB; a long agent's supervisor 10.3 to 10.7 MB; the node agent's flat (574 samples) |
+
+`soak_check: PASS`. Every probe held: `/etc/shadow`, a volume the policy
+does not name, a program the agent wrote, a service it does not name (by
+name and by address) and the instance metadata. The release's own image
+(ff512a7, `sha256:058e20a8…`) then ran a 6-minute trial on the same nodes
+(October 24, 03:03 CDT): 216 turns of work, 48 git commits, 33 probes all
+held, 243 requests to the allowed service (p50 3 ms, p99 29 ms) and none to
+the denied one, 5 streams of 85,997 records all audited; `soak_check: PASS`. An earlier run of the
+day was cut 12.6 hours in: the first OpenShift trial was started in a
+shell whose KUBECONFIG was EKS's, and its setup deleted the EKS run's
+namespaces. `soak.sh` now refuses a cluster of the other kind before it
+changes anything (243bb21), and the run was started again.
+
+### OpenShift: passed
+
+October 23 to 24, 2026, from 03:20 CDT, at ff512a7 (the release's code
+and image, `sha256:058e20a8…`). Single-node OpenShift 4.22.18 on one EC2
+instance: CRI-O 1.35.9 (NRI v0.11), crun 1.27, RHCOS 9.8, SELinux
+enforcing, NRI turned on by a MachineConfig. The same agent and policy as
+on EKS, with one long agent (one node).
+
+| | |
+|---|---|
+| Long agent | 1,296 turns of work done, 288 git commits; 144 probes, all held |
+| Short Jobs | 96 of 95 due ran to their end; 288 probes, all held |
+| The allowed service | 2,160 requests; at the agent p50 4 ms, p99 8 ms |
+| The denied service | 0 requests |
+| Streams | 97, 807,885 records (906 refused); audited: 97 pass |
+| The exporter | 97 runs' audits passed in its log |
+| VAREK's containers | not restarted (5) |
+| Memory | exporter 10.8 to 13.4 MB; listener 3.9 to 4.2 MB; plugin 13.5 to 24.2 MB (median 21.9); the long agent's supervisor 10.8 to 11.0 MB; the node agent's flat (290 samples) |
+
+`soak_check: PASS`. OpenShift's trials found three faults, each fixed
+before the run:
+
+- **CRI-O 1.35 crashed creating every supervised container.** Its NRI
+  (v0.11) writes a seccomp rule's errno through a pointer it never
+  allocated. Every NRI before v0.12 has it: containerd before 2.3 and
+  CRI-O before 1.37. On such a runtime the plugin now gives no rule an
+  errno. A rule refusing with EPERM names none, which is the runtime's own
+  EPERM, so the kernel's filter is the same. Any other errno (ENOSYS for
+  `clone3` and `io_uring_setup`, EACCES for the refused `setsockopt`
+  options) is notified instead, and the node agent answers it with that
+  errno.
+- **Under SELinux no connection reached the agent.** A socket takes its
+  maker's context, and the kernel does not hand a socket the node agent
+  (`spc_t`) made to the agent (`container_t`). The node agent now makes the
+  socket it dials with the agent's context.
+- **That first fix set nothing**: it named `/proc` by path inside the
+  container's mount namespace, where `/proc` is the container's. It now
+  goes through the node's `/proc`, and a context it cannot set is logged.
+
+The sixth trial then passed: 135 of 135 turns' requests reached the
+allowed service, and all four streams were audited. The 24-hour run
+followed it.
+
+## Upgrading
+
+1. On a host, nothing changes: rebuild (`make all`) and reinstall.
+2. On a cluster: install the chart into a namespace of its own that admits
+   privileged pods (`packaging/helm/varek/README.md`), check its
+   signatures first with `cosign verify`.
+3. Create a `VarekPolicy` in the agent's namespace, annotate the pod
+   `varek.dev/policy: NAME`, and give each container
+   `seccompProfile: {type: Localhost, localhostProfile:
+   varek/unsupervised.json}`; the webhook says what else is missing.

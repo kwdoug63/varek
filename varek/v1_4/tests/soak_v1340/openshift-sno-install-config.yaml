@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: MIT
+# v1.34 step 9 (README.md, section 3): single-node OpenShift on AWS for the
+# 24-hour run (D11), made by openshift-install 4.22 or later (CRI-O 1.35).
+# openshift_sno_config.py writes it, with the pull secret and an SSH public
+# key put in, as DIR/install-config.yaml (0600) where openshift-install runs;
+# the installer consumes the file. Nothing here is a secret.
+apiVersion: v1
+baseDomain: soberagents-lab.com
+metadata:
+  name: varek-sno
+controlPlane:
+  name: master
+  replicas: 1
+  platform:
+    aws:
+      type: m6i.2xlarge            # 8 vCPU, 32 GiB: single-node's minimum
+      zones: [us-east-1a]          # one zone: one NAT gateway
+      rootVolume: { size: 120, type: gp3 }
+compute:
+  - name: worker
+    replicas: 0
+    # none, but the pool's zones are where the installer lays out subnets
+    # and a NAT gateway each: without this, every zone of the region (five
+    # in us-east-1, the first run)
+    platform:
+      aws:
+        zones: [us-east-1a]
+networking:
+  networkType: OVNKubernetes
+  machineNetwork: [{ cidr: 10.0.0.0/16 }]
+platform:
+  aws:
+    region: us-east-1
+pullSecret: 'PASTE THE PULL SECRET HERE (console.redhat.com, OpenShift, Downloads)'
+sshKey: 'PASTE YOUR SSH PUBLIC KEY HERE'

@@ -1,0 +1,132 @@
+# v1340_sweep_known.txt — the checks of the suites that differ when each
+# agent runs as a pod's container under the node agent (tests/v1340_sweep.sh),
+# each with its reason. One a line, tab-separated: the suite, a regular
+# expression on the check's text (its figures masked as #), the reason, and
+# optionally a regular expression the node run's log (or its calls' reasons)
+# must hold for the line to apply (step 8 review: a suite listed whole holds
+# only while its runs are refused for what is not carried yet). A
+# difference not listed here fails the sweep; a line no difference matches is
+# said, so the list stays true. Found October 21, 2026 (Central), each cause
+# read in the node run's own logs and streams (VAREK_SWEEP_KEEP=1).
+#
+# The kinds (the reason says which, by its first word):
+#  AS-USER   under the node agent every file is opened as the container's
+#            user, whatever the policy's version (step 2's review, "Files
+#            opened as the node's root"); on a host a policy before 1.29 has
+#            the Warden open allowed files as root. The suites' directories
+#            and files are root's, so the agent (65534) cannot create or
+#            write there, and what follows from a file it could not make
+#            differs too.
+#  OWN-PID   in the container's PID namespace the agent is PID 1: /proc/1 is
+#            its own, decided as /proc/self/... (another process's
+#            /proc/<pid> is refused under both; measured).
+#  STREAM    in a pod the node agent's stream is a file on the node, outside
+#            every pod, and the container's standard error is the kubelet's
+#            log; the stand-in writes both on its standard error, so a
+#            suite's "verdict stream" file is only that copy (not protected,
+#            not the stream the node agent writes, no [agent] prefix).
+#  RUNTIME   the runtime, not the node agent, starts the container and is
+#            its parent: no exit status in run_end, no "agent killed by
+#            signal", no network namespace of the Warden's (netns=on), the
+#            runtime's own session (setsid), its own /dev.
+#  LINE      the node agent's status lines differ in wording from the
+#            Warden's ("supervising container ... pid=N ... uid=N", "held by
+#            the launcher's Landlock"), which a check greps for.
+#  D4        a pod's writable volumes are noexec as a whole (the plugin) and
+#            the node agent refuses a container that could run a file it can
+#            write; the Warden's per-directory noexec mounts (v1.27.1) are not
+#            the node agent's. The suites' programs and scripts under /tmp
+#            (the container's volume) cannot run; the stand-in moves the
+#            program it is given into the image (/varek-sweep/NAME), so its
+#            path differs.
+#  LAUNCHER  the launcher runs first in every container and applies Landlock,
+#            whatever the policy says of launches, and refuses to run without
+#            Landlock; its refusals are its own (exit 126, its message).
+#  NOT-YET   not carried in pods yet, refused at deploy (the webhook) and at
+#            the start (--oci-filter names it): credentials (warden-secrets),
+#            sub-agents (and the confined MCP servers built on them),
+#            require on-behalf-of.
+#  STAND-IN  how the stand-in differs from a pod in a way that does not bear
+#            on the node agent (named in the reason).
+test-v1121	^O_CREAT in the allowed directory succeeds$	AS-USER: the policy has no require warden 1.29; the directory and trunc_me.txt are root's (probe: creat_allowed, trunc_allowed DENIED)
+test-v1121	^created file holds what the agent wrote$	AS-USER: the policy has no require warden 1.29; the directory and trunc_me.txt are root's (probe: creat_allowed, trunc_allowed DENIED)
+test-v1121	^created file honours the agent's umask	AS-USER: the policy has no require warden 1.29; the directory and trunc_me.txt are root's (probe: creat_allowed, trunc_allowed DENIED)
+test-v1121	^O_TRUNC on an allowed file succeeds$	AS-USER: the policy has no require warden 1.29; the directory and trunc_me.txt are root's (probe: creat_allowed, trunc_allowed DENIED)
+test-v1121	^allowed O_TRUNC truncated the file$	AS-USER: the policy has no require warden 1.29; the directory and trunc_me.txt are root's (probe: creat_allowed, trunc_allowed DENIED)
+test-v1121	^FIFO with no reader gives ENXIO, not a hang$	AS-USER: the FIFO is root's 0644, so 65534's O_WRONLY is EACCES before ENXIO
+test-v1121	^no agent-written line starts a record$	STREAM: the probe's forged line is on the stand-in's standard error beside the stream; in a pod it is in the kubelet's log, never in the stream
+test-v1121	^agent stderr relayed with the \[agent\] prefix$	STREAM: the node agent does not relay the container's standard error (the kubelet's log)
+test-v1121	^exporter accepts the Warden's own stream$	STREAM: the container's output comes first in the stand-in's copy, so varek_cyclonedx refuses it (record before run_start); with no file created (AS-USER) the BOM has none
+test-v1121	^forged /etc/shadow absent from the BOM$	STREAM: the container's output comes first in the stand-in's copy, so varek_cyclonedx refuses it (record before run_start); with no file created (AS-USER) the BOM has none
+test-v1121	^BOM lists the file the agent was allowed to create$	STREAM: the container's output comes first in the stand-in's copy, so varek_cyclonedx refuses it (record before run_start); with no file created (AS-USER) the BOM has none
+test-v1121	^exporter refuses a stream holding a forged record$	STREAM: the container's output comes first in the stand-in's copy, so varek_cyclonedx refuses it (record before run_start); with no file created (AS-USER) the BOM has none
+test-v1121	^Warden reports its own network namespace$	RUNTIME: the runtime makes the network namespace (the pod's); the node agent's line has no netns=
+test-v1122	^Warden reports the agent was killed by SIGSYS$	RUNTIME: the runtime is the container's parent; the node agent does not print 'agent killed by signal 31' (the kubelet reports the container's end)
+test-v1150	^prefix rule admits a write$	AS-USER: the policy is 1.15's, work/ is root's (probe: prefix_write DENIED)
+test-v1160	^an unwritable verdict stream stops supervision and the agent	STREAM: the suite's 2>/dev/full is the stand-in's standard error, not the node agent's stream, which it writes on the node
+test-v1160	^a policy that denies the key's directory first is accepted$	LINE: the check greps the Warden's 'supervising pid='; the run started (the launcher's line, and the node agent's 'supervising container ... pid=')
+test-v1160	^--checkpoint-every # is accepted$	LINE: as above, 'supervising pid=' (the node agent's line names the container first)
+test-v1160	^a policy that lets the agent open the verdict stream file is refused$	STREAM: the suite's stream file is the stand-in's copy; the node agent's stream is on the node, which no policy in a pod reaches
+test-v1161	^tool and Warden agree on # policy/location pairs$	STREAM: the 6 that differ are the stream placed inside a policy's allowed /tmp space: the stand-in's copy, not the node agent's stream, so the node agent does not refuse it
+test-v1161	^\.\.\. and the Warden refuses it too$	STREAM: the dangling-symlink log is the stand-in's standard error, not the node agent's stream
+test-v1170	^verdict stream through the mount: refused$	STREAM: the file read is the stand-in's copy (the launcher's line), not the node agent's stream; the key and the anchor are refused by identity (held)
+test-v1170	^protected_object recorded for each$	STREAM: 3 records (the key, its stat, the anchor); the 4th would be the stream, which this file is not
+test-v1170	^readlink of the host's /proc/#: refused$	OWN-PID: /proc/1/cwd in the container is the agent's own, decided as /proc/self/cwd, which allow path /proc/self/ admits
+test-v1170	^status line: uid=# caps=none$	LINE: the node agent's line ends uid=N; the container's capabilities are the runtime's, and the node agent refuses a container that holds any (step 7)
+test-v1170	^--run-as root: uid #, with a warning$	RUNTIME: the node agent refuses a container running as root (not carried), so there is no root run
+test-v1170	^a missing program: a clear refusal \(exit #\)$	LAUNCHER: the launcher refuses the missing command (exit 126, its message), not the Warden's 127
+test-v1170	^a program nobody may execute: a clear refusal \(exit #\)$	LAUNCHER: exit 127 from the launcher's execv (EACCES, its message), not the Warden's 'cannot execute'
+test-v1250	^a list in data/ that is not the release's stops the Warden$	STAND-IN: the suite copies ./warden (the stand-in) beside an altered data/; --check-startup passes through to the real Warden, which reads the release's data/ beside itself
+test-v1270	^a script whose #! line has no newline: launched, not killed$	D4: the scripts are under /tmp, the container's noexec volume, so the kernel refuses them
+test-v1270	^a script whose interpreter is allowed runs$	D4: the scripts are under /tmp, the container's noexec volume, so the kernel refuses them
+test-v1270	^a relative path is decided on its absolute name$	D4: the scripts are under /tmp, the container's noexec volume, so the kernel refuses them
+test-v1270	^the program the operator names, though no rule allows it, runs$	D4: the program is moved into the image (/varek-sweep/NAME), so the set names it there, not at its /tmp path; RUNTIME: run_end's exit_status is -1
+test-v1270	^in the set as bootstrap$	D4: the program is moved into the image (/varek-sweep/NAME), so the set names it there, not at its /tmp path; RUNTIME: run_end's exit_status is -1
+test-v1270	^a script the operator names runs, with its interpreter in the set$	D4: the program is moved into the image (/varek-sweep/NAME), so the set names it there, not at its /tmp path; RUNTIME: run_end's exit_status is -1
+test-v1270	^recorded as bootstrap and its interpreter's file$	D4: the program is moved into the image (/varek-sweep/NAME), so the set names it there, not at its /tmp path; RUNTIME: run_end's exit_status is -1
+test-v1270	^without the opt-in: no Landlock, no set in run_start, the agent runs$	LAUNCHER: run_start always records Landlock and the launch set (the launcher's), whatever the policy says of launches
+test-v1270	^without Landlock: the agent runs, run_start says landlock null	LAUNCHER: with Landlock turned off (VAREK_WARDEN_TEST_NO_LANDLOCK) the node agent refuses the container (the launcher needs it), before run_start
+test-v1270	^the audit accepts run r#$	LAUNCHER: with Landlock turned off (VAREK_WARDEN_TEST_NO_LANDLOCK) the node agent refuses the container (the launcher needs it), before run_start
+test-v1270	^without Landlock an allowed launch is refused \(exec_no_landlock\)$	LAUNCHER: with Landlock turned off (VAREK_WARDEN_TEST_NO_LANDLOCK) the node agent refuses the container (the launcher needs it), before run_start
+test-v1270	^the audit accepts that run$	LAUNCHER: with Landlock turned off (VAREK_WARDEN_TEST_NO_LANDLOCK) the node agent refuses the container (the launcher needs it), before run_start
+test-v1270	^run_end says so, and the Warden exits #$	RUNTIME: the stand-in exits with the container's status; the node agent's is not the run's (run_end still says exec_identity_mismatch)
+test-v1270	^the kernel refuses every launch outside the set the table names	LINE: landlock_table.sh greps 'held by Landlock'; the node agent says 'held by the launcher's Landlock (ABI N)'
+test-v1271	^the agent sees each writable directory mounted noexec$	D4: the node agent makes no per-directory noexec mounts; the container's /tmp volume is noexec as a whole
+test-v1271	^an exact path that is a file: the file itself, noexec$	D4: the node agent makes no per-directory noexec mounts; the container's /tmp volume is noexec as a whole
+test-v1271	^the Warden says what it mounted$	D4: the node agent makes no per-directory noexec mounts; the container's /tmp volume is noexec as a whole
+test-v1271	^a system library at its own path loads$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
+test-v1271	^a copy of it in a writable directory cannot be loaded$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
+test-v1271	^a copy of a Python extension module cannot be imported$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
+test-v1271	^a pure-Python module written there imports$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
+test-v1271	^mmap with PROT_EXEC of a file there: EPERM$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
+test-v1271	^mprotect adding PROT_EXEC to a mapping of it: EACCES$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
+test-v1271	^anonymous memory may still be made executable$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
+test-v1271	^a ctypes callback \(libffi\) works$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
+test-v1271	^the agent goes on, and the Warden exits #$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
+test-v1271	^from a working directory inside it, a copy by a relative name cannot be loaded or mapped either$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
+test-v1271	^a writable directory missing at start: listed	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
+test-v1271	^a file an exact rule names, replaced by the host during the run	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
+test-v1271	^standard input open on a file in a writable directory refuses the start$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
+test-v1280	^refused: (a|an) (empty )?file store	NOT-YET: credentials: --oci-filter refuses the policy ('the node agent does not carry credentials yet'), in place of the store's own reason; no warden-secrets runs
+test-v1280	^warden-secrets runs as its own user	NOT-YET: credentials: --oci-filter refuses the policy ('the node agent does not carry credentials yet'), in place of the store's own reason; no warden-secrets runs
+test-v1281	.	NOT-YET: sub-agents: every policy of the suite's runs names subagent=, which --oci-filter refuses ('the node agent does not carry sub-agents yet'); what follows from those runs (forged streams, varek runs) has no records	does not carry sub-agents yet
+test-v1290	^require warden #\.#: (a created file is root's|the root-owned file is written|the closed directory is reached), as before$	AS-USER: the node agent opens as the container's user even under require warden 1.28 (its point: a pod's files are its user's)
+test-v1290	^(--run-as root under #\.#: run_start says the agent is root|\.\.\. and the file is root's)$	RUNTIME: the node agent refuses a root container (not carried)
+test-v1290	^a raw device \(/dev/[^)]+\) is still refused by identity	RUNTIME: the container's /dev is the runtime's, without the host's raw device (/dev/mem on GitHub's runner, /dev/zram0 where there is none) (ENOENT): nothing to refuse
+test-v1290	^admitted under #\.#: setpgid$	RUNTIME: runc makes the container's process a session leader, and setpgid(0,0) from a session leader is EPERM by the kernel; the other admitted calls hold
+test-v1290	^\.\.\. run_start lists the directory noexec and the place kept executable$	D4: the program is moved into the image (/varek-sweep/NAME), so it is not under the writable directory and nothing is kept executable there; run_start names it by its image path
+test-v1290	^a rule that could write there \(glob in\*\): refused to start, as before$	D4: the program is moved into the image (/varek-sweep/NAME), so it is not under the writable directory and nothing is kept executable there; run_start names it by its image path
+test-v1290	^under #\.#: refused to start, as before$	D4: the program is moved into the image (/varek-sweep/NAME), so it is not under the writable directory and nothing is kept executable there; run_start names it by its image path
+test-v1290	^forged: a place kept executable outside the noexec directories	D4: the program is moved into the image (/varek-sweep/NAME), so it is not under the writable directory and nothing is kept executable there; run_start names it by its image path
+test-v1290	^\.\.\. and each file's is the file's$	D4: the program is moved into the image (/varek-sweep/NAME), so it is not under the writable directory and nothing is kept executable there; run_start names it by its image path
+test-v1310	.	NOT-YET: confined MCP servers (mcp server ... exec, built on sub-agents): --oci-filter refuses the policy; what follows from those runs (the audit's forgeries, varek refusals, runs, suggest) has no records	does not carry (sub-agents|confined MCP servers)[^\n]* yet
+test-cli	^pytest tests/test_varek_bench_mcp\.py::test_bench_for_end_to_end$	NOT-YET: varek bench --for confines an MCP server (sub-agents)
+test-cli	^pytest tests/test_varek_bench_launch\.py::test_bench_launches_end_to_end$	D4: the bench's allowed launches are of programs under /tmp (the noexec volume): decided and certified, then refused by the kernel
+test-v1123	^no bypass reported by probe$	OWN-PID: the probe counts its own /proc/1/mem (the container's PID 1 is the agent) as another process's
+test-v1123	numeric /proc/#/mem is refused	OWN-PID: the container's /proc/1 is the agent's own, decided as /proc/self/mem (allowed); another process's is refused
+test-v1123	^another process's /proc/#/mem opened directly is refused	OWN-PID: the container's /proc/1 is the agent's own, decided as /proc/self/mem (allowed); another process's is refused
+test-v1123	^no foreign /proc object was allowed$	OWN-PID: the one counted is the agent's own /proc/1 (above)
+test-v1130	^a rule without flag clauses admits writes$	AS-USER: the policy is 1.13's, the directory root's
+test-v1130	^\.\.\. and appends$	AS-USER: the file the write would have made is not there
+test-v1130	^all three recorded as fragment_escape_flags	AS-USER: with no file, the opens fail resolution before their flags are decided (recorded resolution_failed, still refused)
+test-v1140	^prefix rule still admits the workspace	AS-USER: the policy is 1.14's, the directory root's

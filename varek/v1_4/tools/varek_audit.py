@@ -126,6 +126,17 @@ DEFAULT_NAMES, DEFAULT_RATE, DEFAULT_LABEL = 256, 30, 63    # the Warden's, v1.2
 STUB = "127.53.53.53:53"          # the Warden's stub resolver (warden_stub.inc.c)
 
 
+def stub_of(rs):
+    """v1.34 step 4: the stub's address in this run. Under the node agent the
+    namespace is the pod's, which its containers share, so the stub takes
+    the first address free from 127.53.53.53 to 127.53.53.254 (run_start
+    says which); a run the Warden starts itself has its own, at STUB."""
+    s = rs.get("dns_stub")
+    # review (T5): written as the Warden writes it (%d: no leading zero)
+    m = re.fullmatch(r"127\.53\.53\.([1-9]\d{1,2}):53", s) if isinstance(rs.get("node"), dict) and isinstance(s, str) else None
+    return s if m and 53 <= int(m.group(1)) <= 254 else STUB
+
+
 def policy_rules(checker, policy):
     """The policy's rules as the certificate checker parses the file (its
     "rules" mode), one dict each: kind (p|h|e, r: a v1.26.1 request rule),
@@ -461,6 +472,13 @@ def check_changes(records, openas_policy, problems):
                 problems.append(f"seq {seq}: a rename's new name allowed without its old name before it")
 
 
+def _node_launcher(rs):
+    """v1.34: does run_start say a node agent's container ran the launcher
+    (varek-init) first?"""
+    node = rs.get("node")
+    return isinstance(node, dict) and node.get("launcher") is True
+
+
 V127_RULES = ("exec_allowed", "exec_not_in_ruleset", "exec_no_landlock", "exec_identity_mismatch",
               "exec_identity_unreadable", "open_not_found", "subagent_env")
 
@@ -478,7 +496,34 @@ def check_exec_set(meta, launches, problems, records=()):
     elif (launches or has) and not _version_at_least(w, (1, 27)):
         problems.append(f"run_start names the Warden {w!r}, but only 1.27 or later decides launches")
     if not launches:
-        if has:
+        if has and _node_launcher(rs):
+            # v1.34 step 7 (found by the sweep): under the node agent the
+            # launcher runs first in every container and applies Landlock,
+            # its launch set the container's command alone (and what starts
+            # it), whatever the policy says of launches
+            ll, ex = rs.get("landlock"), rs.get("exec_ruleset")
+            if not _version_at_least(w, (1, 34)):
+                problems.append(f"run_start names the launcher, but the Warden {w!r}: only 1.34 or later runs "
+                                f"under the node agent")
+            if not (isinstance(ll, dict) and type(ll.get("abi")) is int and ll["abi"] >= 1):
+                problems.append(f"run_start names the launcher, but its landlock {ll!r} is not an ABI")
+            # step 8 review (T4): the command alone, and what starts it: one
+            # bootstrap entry, the launch the run's first record names, at
+            # most one interpreter, each entry whole
+            whys = [e.get("why") for e in ex] if isinstance(ex, list) else []
+            boot = next((r for r in records if r.get("rule") == "bootstrap_exec_allow"), None)
+            if not isinstance(ex, list) or not ex or not all(
+                    isinstance(e, dict) and isinstance(e.get("name"), str) and e["name"].startswith("/") and
+                    isinstance(e.get("path"), str) and type(e.get("dev")) is int and type(e.get("ino")) is int and
+                    isinstance(e.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", e["sha256"]) and
+                    e.get("why") in ("bootstrap", "loader", "interpreter") for e in ex) or \
+                    whys.count("bootstrap") != 1 or whys.count("interpreter") > 1:
+                problems.append("run_start names the launcher, and the policy does not turn launches on, but its "
+                                "launch set is not the command alone (and what starts it)")
+            elif boot is not None and ex[whys.index("bootstrap")].get("name") != boot.get("target"):
+                problems.append(f"run_start's launch set names the bootstrap {ex[whys.index('bootstrap')].get('name')!r}, "
+                                f"but the agent's own launch was {boot.get('target')!r}")
+        elif has:
             problems.append("run_start records a launch set or Landlock, but the policy does not turn "
                             "launches on (require warden 1.27)")
         bad = [r for r in records if r.get("rule") in V127_RULES]
@@ -648,7 +693,9 @@ def check_noexec(meta, rules, launches, problems, records=()):
     rs = meta.get("run_start", {})
     has = "noexec" in rs
     if not launches:
-        if has:
+        # v1.34: under the node agent's launcher, an empty list (the pod's own
+        # mounts are the node agent's D4 check, not the Warden's)
+        if has and not (_node_launcher(rs) and rs["noexec"] == []):
             problems.append("run_start records noexec mounts, but the policy does not turn launches on")
         return
     if not has:
@@ -2321,9 +2368,9 @@ def check_dns(meta, checker, policy, rules, problems):
     # at the same address
     stub = wild or (pports is not None and any(r["kind"] == "h" and r["name"] and not r["wild"]
                                                for r in rules)) or rs.get("mode") == "dry_run"   # v1.29
-    if rs.get("dns_stub") != (STUB if stub else None):
+    if rs.get("dns_stub") != (stub_of(rs) if stub else None):
         problems.append(f"run_start's dns_stub {rs.get('dns_stub')!r} is not the policy's "
-                        f"({STUB if stub else 'none'})")
+                        f"({stub_of(rs) if stub else 'none'})")
     per = {ln: {"names": n, "rate": r, "label": DEFAULT_LABEL} for ln, (_s, n, r) in wild.items()}
     asked_names = {e.get("name") for e in events if e.get("event") == "dns_question"
                    and isinstance(e.get("name"), str) and e.get("name")}
@@ -3136,6 +3183,7 @@ def main(argv=None):
     stub_policy = wild_policy or (proxy_ports is not None and any(
         r["kind"] == "h" and r["name"] and not r["wild"] for r in prules)) or \
         meta.get("run_start", {}).get("mode") == "dry_run"          # v1.29: the stub runs in a dry run
+    stub_addr = stub_of(meta.get("run_start", {}))                     # v1.34 step 4
     if wild_policy:
         check_shared_lists(meta, a, problems)
     # v1.25 review: from 1.25 the Warden records the end of every grace
@@ -3190,10 +3238,10 @@ def main(argv=None):
             if not stub_policy:
                 problems.append(f"seq {rec.get('seq')}: a stub connect, but the policy has no "
                                 f"wildcard allow rule and no proxy (no stub resolver)")
-            elif rec.get("resolved") != STUB or ct is None or \
-                    f"{_ip(str(ct[0]))}:{ct[1]}" != STUB:
+            elif rec.get("resolved") != stub_addr or ct is None or \
+                    f"{_ip(str(ct[0]))}:{ct[1]}" != stub_addr:
                 problems.append(f"seq {rec.get('seq')}: a dns_stub record to "
-                                f"{rec.get('target')!r} / {rec.get('resolved')!r}, not the stub at {STUB}")
+                                f"{rec.get('target')!r} / {rec.get('resolved')!r}, not the stub at {stub_addr}")
             stubs += 1
             continue
         if rec.get("proxy_handoff") is True or rec.get("rule") in HANDOFF_RULES:

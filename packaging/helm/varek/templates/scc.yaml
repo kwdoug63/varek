@@ -1,0 +1,79 @@
+{{/* SPDX-License-Identifier: MIT
+  OpenShift: the node agent's pod is privileged, in the node's PID namespace,
+  with host paths; this lets the chart's node service account (and no other)
+  run it. The webhook runs under restricted-v2, as the namespace's user (the
+  chart then sets no user for it). */}}
+{{- if .Values.openshift.enabled }}
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: {{ include "varek.nodeName" . }}
+  labels: {{- include "varek.labels" . | nindent 4 }}
+allowPrivilegedContainer: true
+allowPrivilegeEscalation: true
+allowHostPID: true
+allowHostDirVolumePlugin: true
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPorts: false
+# the init container's, to make the node's directories root's
+allowedCapabilities: [CHOWN, DAC_OVERRIDE, FOWNER]
+defaultAddCapabilities: []
+requiredDropCapabilities: []
+readOnlyRootFilesystem: false
+runAsUser: { type: RunAsAny }
+seLinuxContext: { type: RunAsAny }
+fsGroup: { type: RunAsAny }
+supplementalGroups: { type: RunAsAny }
+seccompProfiles: ["*"]
+# projected: the service account's token
+volumes: [hostPath, secret, emptyDir, projected, configMap, downwardAPI]
+users:
+  - system:serviceaccount:{{ .Release.Namespace }}:{{ include "varek.nodeName" . }}
+{{- end }}
+{{- if .Values.openshift.enabled }}
+{{- $sup := printf "%s-supervised" .Release.Name }}
+---
+{{/* v1.34 step 9: supervised pods. restricted-v2 admits only the runtime's
+  default seccomp profile, and each container of a supervised pod names
+  VAREK's unsupervised one (a Localhost profile): this is restricted-v2 with
+  that profile admitted too, and nothing else. A namespace's service
+  accounts are given it by binding the ClusterRole below (a RoleBinding in
+  the namespace). Its containers are also to give runAsGroup (not 0): the
+  node agent refuses group 0, which OpenShift gives a container otherwise. */}}
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: {{ $sup }}
+  labels: {{- include "varek.labels" . | nindent 4 }}
+allowPrivilegedContainer: false
+allowPrivilegeEscalation: false
+allowHostPID: false
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPorts: false
+allowHostDirVolumePlugin: false
+allowedCapabilities: []
+defaultAddCapabilities: []
+requiredDropCapabilities: [ALL]
+readOnlyRootFilesystem: false
+runAsUser: { type: MustRunAsRange }
+seLinuxContext: { type: MustRunAs }
+fsGroup: { type: MustRunAs }
+supplementalGroups: { type: RunAsAny }
+seccompProfiles: ["runtime/default", "localhost/varek/unsupervised.json"]
+volumes: [configMap, csi, downwardAPI, emptyDir, ephemeral, persistentVolumeClaim, projected, secret]
+users: []
+groups: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $sup }}-scc
+  labels: {{- include "varek.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [security.openshift.io]
+    resources: [securitycontextconstraints]
+    resourceNames: [{{ $sup }}]
+    verbs: [use]
+{{- end }}

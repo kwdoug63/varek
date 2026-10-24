@@ -69,6 +69,12 @@ static int g_ll_abi = -1;         /* Landlock ABI; -1 when it is not available *
 static int g_ll_fd = -1;          /* the ruleset, applied in the agent */
 static char g_ll_why[160];        /* why Landlock is not available */
 static size_t g_exec_walked;
+static bool g_exec_rules_off;     /* v1.34 step 3: the command alone (a pod's policy that decides no launch) */
+/* v1.34 step 3: the other names a rule admits a file of the set by (its
+ * hardlinks): a pod's launcher applies Landlock by name, and through
+ * overlayfs a rule on one name of a file does not cover another */
+static char **g_exec_alias;
+static size_t g_exec_nalias;
 
 /* The Landlock ABI, or -1 with the reason. VAREK_WARDEN_TEST_NO_LANDLOCK=1
  * acts as if it were missing (make test-v1270). */
@@ -201,10 +207,20 @@ static int exec_rs_add(const char *name, const char *why, int line, char *err, s
     if (pfd < 0) return 0;
     struct stat st;
     if (fstat(pfd, &st) < 0 || !S_ISREG(st.st_mode) || !(st.st_mode & 0111)) { close(pfd); return 0; }
-    if (exec_rs_find(st.st_dev, st.st_ino)) { close(pfd); return 2; }
-    char pp[64];
-    snprintf(pp, sizeof pp, "/proc/self/fd/%d", pfd);
-    int fd = open(pp, O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);   /* the same file */
+    if (exec_rs_find(st.st_dev, st.st_ino)) {
+        char canon[PATH_MAX];
+        ssize_t cl = g_nr.on ? proc_readlinkf(canon, sizeof canon - 1, "self/fd/%d", pfd) : -1;
+        close(pfd);
+        if (cl > 0) {
+            canon[cl] = '\0';
+            char **na = realloc(g_exec_alias, (g_exec_nalias + 1) * sizeof *na);
+            if (!na || !(na[g_exec_nalias] = strdup(canon))) { snprintf(err, en, "out of memory"); return -1; }
+            g_exec_alias = na;
+            g_exec_nalias++;
+        }
+        return 2;
+    }
+    int fd = proc_openf(O_RDONLY | O_NONBLOCK | O_NOCTTY, 0, "self/fd/%d", pfd);   /* the same file */
     close(pfd);
     struct stat st2;
     if (fd < 0 || fstat(fd, &st2) < 0 || st2.st_dev != st.st_dev || st2.st_ino != st.st_ino) {
@@ -218,9 +234,7 @@ static int exec_rs_add(const char *name, const char *why, int line, char *err, s
     }
     struct exec_file *f = &g_exec_rs[g_exec_n];
     char canon[PATH_MAX];
-    char fdp[64];
-    snprintf(fdp, sizeof fdp, "/proc/self/fd/%d", fd);
-    ssize_t cl = readlink(fdp, canon, sizeof canon - 1);
+    ssize_t cl = proc_readlinkf(canon, sizeof canon - 1, "self/fd/%d", fd);
     if (cl <= 0) { close(fd); snprintf(err, en, "%s: cannot name the file", name); return -1; }
     canon[cl] = '\0';
     if (exec_hash_fd(fd, f->sha) < 0) { close(fd); snprintf(err, en, "%s: cannot read it", name); return -1; }
@@ -386,7 +400,7 @@ static int exec_ruleset_build(const struct policy *p, const char *boot_path) {
     size_t *admitted = calloc(p->v.n ? p->v.n : 1, sizeof *admitted);
     if (!g_exec_rs || !admitted) { fprintf(stderr, "[warden] out of memory\n"); return -1; }
     int rc = 0;
-    for (size_t i = 0; rc == 0 && i < p->v.n; i++) {
+    for (size_t i = 0; rc == 0 && !g_exec_rules_off && i < p->v.n; i++) {
         const vdp_rule_t *r = &p->v.rules[i];
         if (r->kind != VDP_KIND_EXEC || r->verb != VDP_ALLOW) continue;
         g_exec_subj = r->subj;               /* v1.31 */
@@ -509,6 +523,9 @@ static int exec_ruleset_build(const struct policy *p, const char *boot_path) {
                 "refused (exec_no_landlock)\n", g_ll_why);
         return 0;
     }
+    /* v1.34 step 3: in a pod the launcher applies the set (varek_init.c),
+     * from the view the supervisor serves it */
+    if (g_nr.on) return 0;
     struct landlock_ruleset_attr ra = { .handled_access_fs = LANDLOCK_ACCESS_FS_EXECUTE };
     g_ll_fd = (int)syscall(__NR_landlock_create_ruleset, &ra, sizeof ra, 0);
     if (g_ll_fd < 0) {
@@ -585,14 +602,15 @@ static int exec_name(const struct seccomp_notif *req, struct action *a, struct s
     int dirfd = at ? (int)(int32_t)req->data.args[0] : AT_FDCWD;
     uint64_t flags = at ? req->data.args[4] : 0;
     if (flags & ~(uint64_t)(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW)) return -1;
-    char bp[64];
+    char bp[64];     /* below the node's /proc (v1.34) */
     int base;
-    if (dirfd == AT_FDCWD) snprintf(bp, sizeof bp, "/proc/%d/cwd", tid);
-    else if (dirfd >= 0) snprintf(bp, sizeof bp, "/proc/%d/fd/%d", tid, dirfd);
+    if (dirfd == AT_FDCWD) snprintf(bp, sizeof bp, "%d/cwd", tid);
+    else if (dirfd >= 0) snprintf(bp, sizeof bp, "%d/fd/%d", tid, dirfd);
     else return -1;
+    if (proc_dir() < 0) return -1;
     if ((flags & AT_EMPTY_PATH) && a->target[0] == '\0') {
         /* by descriptor: the file it refers to */
-        int fd = open(bp, O_PATH | O_CLOEXEC);
+        int fd = openat(g_procfd, bp, O_PATH | O_CLOEXEC);
         if (fd < 0) return -1;
         int ok = fstat(fd, st) == 0 && S_ISREG(st->st_mode) &&
                  fd_canonical_path(fd, a->resolved, sizeof a->resolved) == 0;
@@ -601,7 +619,7 @@ static int exec_name(const struct seccomp_notif *req, struct action *a, struct s
         return 0;
     }
     if (a->target[0] == '\0') return -1;
-    base = open(bp, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    base = openat(g_procfd, bp, O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (base < 0) return -1;
     /* the file */
     int fd = openat2_path(base, a->target, (flags & AT_SYMLINK_NOFOLLOW) ? (uint64_t)O_NOFOLLOW : 0);
@@ -749,9 +767,7 @@ static const char *exec_env_code(const char *kv, size_t n, bool whole, char *nam
 static int exec_env_launch(const struct seccomp_notif *req, char *name, size_t nn) {
     uint64_t envp = req->data.nr == __NR_execveat ? req->data.args[3] : req->data.args[2];
     if (!envp) return 0;
-    char p[64];
-    snprintf(p, sizeof p, "/proc/%d/mem", (int)req->pid);
-    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    int fd = proc_openf(O_RDONLY, 0, "%d/mem", (int)req->pid);
     if (fd < 0) return -1;
     int r = 0;
     for (size_t k = 0; k < 65536 && !r; k++) {
@@ -771,9 +787,7 @@ static int exec_env_launch(const struct seccomp_notif *req, char *name, size_t n
 /* In the new image's own copy (/proc/PID/environ). 1 with the first variable
  * that names code, 0 none, -1 unreadable. */
 static int exec_env_image(pid_t pid, char *name, size_t nn) {
-    char p[64];
-    snprintf(p, sizeof p, "/proc/%d/environ", (int)pid);
-    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    int fd = proc_openf(O_RDONLY, 0, "%d/environ", (int)pid);
     if (fd < 0) return -1;
     size_t cap = 1 << 16, len = 0;
     char *b = malloc(cap);
@@ -988,11 +1002,9 @@ static void exec_pend_last_sub(int s) {
 /* Register a continued launch, before it is answered. 0, or -1 (refuse it). */
 static int exec_pend_add(pid_t tid, dev_t edev, ino_t eino, uint64_t seq) {
     if (g_nxp == EXEC_PEND_MAX) return -1;
-    char ep[64];
     struct stat ost;
-    snprintf(ep, sizeof ep, "/proc/%d/exe", tid);
     pid_t tgid = task_tgid(tid);
-    if (tgid < 0 || stat(ep, &ost) < 0) return -1;
+    if (tgid < 0 || proc_statf(&ost, "%d/exe", tid) < 0) return -1;
     int pidfd = (int)syscall(__NR_pidfd_open, tgid, 0);
     if (pidfd < 0) return -1;
     g_xp[g_nxp++] = (struct exec_pend){ .tid = tid, .tgid = tgid, .edev = edev, .eino = eino,
@@ -1015,12 +1027,10 @@ static bool exec_identity(int notify_fd, const struct seccomp_notif *req, struct
         if (syscall(__NR_pidfd_send_signal, g_xp[k].pidfd, 0, NULL, 0) < 0 && errno == ESRCH)
             exec_pend_drop(k, "gone");
         else k++;
-    char ep[64];
     struct stat st;
-    snprintf(ep, sizeof ep, "/proc/%d/exe", tid);
     const char *why = NULL;
     char envn[64] = "";
-    if (stat(ep, &st) < 0) why = "exec_identity_unreadable";
+    if (proc_statf(&st, "%d/exe", tid) < 0) why = "exec_identity_unreadable";
     /* The process's pending launches (one per thread that asked). If it now
      * runs the file one of them decided, that launch happened, and the others
      * cannot have (a launch ends every other thread): launched, and failed.
@@ -1054,9 +1064,9 @@ static bool exec_identity(int notify_fd, const struct seccomp_notif *req, struct
             continue;
         }
         if (st.st_dev == x->odev && st.st_ino == x->oino) {
-            char tp[64];
-            snprintf(tp, sizeof tp, "/proc/%d/task/%d", (int)x->tgid, (int)x->tid);
-            if (tid == x->tid || access(tp, F_OK) != 0) { exec_pend_drop(k, "failed"); continue; }
+            char tp[64];     /* below the node's /proc (v1.34) */
+            snprintf(tp, sizeof tp, "%d/task/%d", (int)x->tgid, (int)x->tid);
+            if (tid == x->tid || proc_dir() < 0 || faccessat(g_procfd, tp, F_OK, 0) != 0) { exec_pend_drop(k, "failed"); continue; }
             k++;                              /* its thread is still in its launch */
             continue;
         }
@@ -1082,7 +1092,7 @@ static bool exec_identity(int notify_fd, const struct seccomp_notif *req, struct
     }
     /* what it runs, read before the kill (v1.27 review: after, it may be gone) */
     char canon[PATH_MAX] = "";
-    ssize_t n = readlink(ep, canon, sizeof canon - 1);
+    ssize_t n = proc_readlinkf(canon, sizeof canon - 1, "%d/exe", tid);
     if (n > 0) canon[n] = '\0';
     /* kill the process (it is blocked in this call, so its pid is its own) */
     pid_t tgid = task_tgid(tid);

@@ -1,0 +1,237 @@
+{{/* SPDX-License-Identifier: MIT
+  The node agent, the NRI plugin and the exporter on every node
+  (docs/security/v1.34-kubernetes.md, section 2). The node agent is
+  privileged on the node and in its PID namespace, as the runtime it listens
+  to is; the plugin and the exporter hold no capability. */}}
+{{- $state := include "varek.state" . -}}
+{{- $dns := include "varek.dnsServer" . -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "varek.nodeName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "varek.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: node
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 1 }
+  template:
+    metadata:
+      labels:
+        {{- include "varek.labels" . | nindent 8 }}
+        app.kubernetes.io/component: node
+    spec:
+      serviceAccountName: {{ include "varek.nodeName" . }}
+      hostPID: true
+      priorityClassName: {{ .Values.priorityClassName }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        # the node's directories as the node agent requires them (root's: the
+        # socket's reachable by no one else, the policies' written by no one
+        # else), and the launcher put where the runtime binds it from: written
+        # whole, then renamed, so a container starting meanwhile binds one or
+        # the other. And VAREK's unsupervised seccomp profile (step 8 review):
+        # every call refused, which each container of a supervised pod names
+        # and the plugin replaces with the Warden's filter, so that one the
+        # plugin does not adjust does not run
+        - name: prepare
+          image: {{ include "varek.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              install -d -o 0 -g 0 -m 0700 /host/socket /host/streams /host/control /host/export
+              install -d -o 0 -g 0 -m 0755 /host/policies /host/bin
+              chmod 0700 /host/socket /host/streams /host/control /host/export
+              chmod 0755 /host/policies /host/bin
+              install -o 0 -g 0 -m 0755 /opt/varek/varek-init /host/bin/.varek-init.new
+              {{- if .Values.openshift.enabled }}
+              # SELinux: a file containers may read and run (it is bound into each)
+              chcon -t container_ro_file_t /host/bin/.varek-init.new
+              {{- end }}
+              mv -f /host/bin/.varek-init.new /host/bin/varek-init
+              install -d -o 0 -g 0 -m 0755 /host/seccomp/varek
+              printf '%s\n' '{"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRet":1,"syscalls":[]}' > /host/seccomp/varek/.unsupervised.json.new
+              chmod 0644 /host/seccomp/varek/.unsupervised.json.new
+              mv -f /host/seccomp/varek/.unsupervised.json.new /host/seccomp/varek/unsupervised.json
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL], add: [CHOWN, DAC_OVERRIDE, FOWNER] }
+            {{- if .Values.openshift.enabled }}
+            # SELinux: the node's paths (container_t may not write them)
+            seLinuxOptions: { type: spc_t }
+            {{- end }}
+          volumeMounts:
+            - { name: socket, mountPath: /host/socket }
+            - { name: streams, mountPath: /host/streams }
+            - { name: control, mountPath: /host/control }
+            - { name: export, mountPath: /host/export }
+            - { name: policies, mountPath: /host/policies }
+            - { name: bin, mountPath: /host/bin }
+            - { name: seccomp, mountPath: /host/seccomp }
+      containers:
+        - name: node-agent
+          image: {{ include "varek.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /opt/varek/warden
+            - {{ .Values.node.policies }}
+            - --node-agent
+            - {{ .Values.node.socket }}/node.sock
+            - --node-streams
+            - {{ .Values.node.streams }}
+            - --node-launcher
+            - {{ .Values.node.bin }}/varek-init
+            {{- if $dns }}
+            # the policy's names resolved through the cluster's DNS, not a
+            # server the pod's resolv.conf names
+            - --dns-server
+            - {{ $dns | quote }}
+            {{- end }}
+            {{- if .Values.signing.secretName }}
+            - --sign-key
+            - /etc/varek/node.key
+            - --checkpoint-every
+            - {{ .Values.signing.checkpointEvery | quote }}
+            {{- end }}
+            {{- if .Values.anchor.enabled }}
+            - --anchor
+            - {{ .Values.node.streams }}/{{ .Values.anchor.file }}
+            {{- end }}
+            {{- range .Values.nodeAgent.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          resources: {{- toYaml .Values.nodeAgent.resources | nindent 12 }}
+          volumeMounts:
+            # each at the node's own path: the runtime names them so
+            - { name: socket, mountPath: {{ .Values.node.socket }} }
+            - { name: streams, mountPath: {{ .Values.node.streams }} }
+            - { name: control, mountPath: {{ .Values.node.control }} }
+            - { name: policies, mountPath: {{ .Values.node.policies }}, readOnly: true }
+            - { name: bin, mountPath: {{ .Values.node.bin }}, readOnly: true }
+            - { name: state, mountPath: {{ $state }}, readOnly: true, mountPropagation: HostToContainer }
+            {{- if .Values.signing.secretName }}
+            # a file, not the Secret volume's link (the Warden opens its key O_NOFOLLOW)
+            - { name: key, mountPath: /etc/varek/node.key, subPath: key, readOnly: true }
+            {{- end }}
+        - name: plugin
+          image: {{ include "varek.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /opt/varek/varek-nri
+            - -warden
+            - /opt/varek/warden
+            - -policies
+            - {{ .Values.node.policies }}
+            - -listener
+            - {{ .Values.node.socket }}/node.sock
+            - -launcher
+            - {{ .Values.node.bin }}/varek-init
+            - -socket
+            - {{ .Values.nri.socket }}
+            - -runtime-handlers
+            - {{ join "," .Values.nri.runtimeHandlers | quote }}
+            - -sync
+          # root, to write the node's policies (root's) and reach the runtime's
+          # NRI socket (root's), with no capability
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+            seccompProfile: { type: RuntimeDefault }
+            {{- if .Values.openshift.enabled }}
+            # SELinux: the node's paths and the runtime's NRI socket
+            seLinuxOptions: { type: spc_t }
+            {{- end }}
+          resources: {{- toYaml .Values.plugin.resources | nindent 12 }}
+          volumeMounts:
+            - { name: policies, mountPath: {{ .Values.node.policies }} }
+            - { name: nri, mountPath: {{ dir .Values.nri.socket }} }
+            - { name: tmp, mountPath: /tmp }
+        {{- if .Values.exporter.enabled }}
+        - name: exporter
+          image: {{ include "varek.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - python3
+            - /opt/varek/tools/varek_node_export.py
+            - --streams
+            - {{ .Values.node.streams }}
+            - --checker
+            - /opt/varek/tools/vdp_cert_check
+            - --device
+            - $(NODE_NAME)
+            # the streams exported, kept on the node: not exported again when
+            # the exporter starts again
+            - --state
+            - {{ .Values.node.exportState }}/done
+            - --max-followers
+            - {{ .Values.exporter.maxFollowers | quote }}
+            {{- if .Values.signing.secretName }}
+            - --pubkey
+            - /etc/varek/node.key.pub
+            {{- end }}
+            {{- if .Values.anchor.enabled }}
+            - --anchor
+            - {{ .Values.node.streams }}/{{ .Values.anchor.file }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          # root, to read the streams (root's, 0600), with no capability
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+            seccompProfile: { type: RuntimeDefault }
+            {{- if .Values.openshift.enabled }}
+            # SELinux: the node's paths and the runtime's NRI socket
+            seLinuxOptions: { type: spc_t }
+            {{- end }}
+          resources: {{- toYaml .Values.exporter.resources | nindent 12 }}
+          volumeMounts:
+            - { name: streams, mountPath: {{ .Values.node.streams }}, readOnly: true }
+            - { name: export, mountPath: {{ .Values.node.exportState }} }
+            - { name: tmp, mountPath: /tmp }
+            {{- if .Values.signing.secretName }}
+            - { name: key, mountPath: /etc/varek/node.key.pub, subPath: key.pub, readOnly: true }
+            {{- end }}
+        {{- end }}
+      volumes:
+        - { name: socket, hostPath: { path: {{ .Values.node.socket }}, type: DirectoryOrCreate } }
+        - { name: streams, hostPath: { path: {{ .Values.node.streams }}, type: DirectoryOrCreate } }
+        - { name: control, hostPath: { path: {{ .Values.node.control }}, type: DirectoryOrCreate } }
+        - { name: export, hostPath: { path: {{ .Values.node.exportState }}, type: DirectoryOrCreate } }
+        - { name: policies, hostPath: { path: {{ .Values.node.policies }}, type: DirectoryOrCreate } }
+        - { name: bin, hostPath: { path: {{ .Values.node.bin }}, type: DirectoryOrCreate } }
+        - { name: seccomp, hostPath: { path: {{ .Values.node.seccompRoot }}, type: DirectoryOrCreate } }
+        - { name: state, hostPath: { path: {{ $state }}, type: Directory } }
+        - { name: nri, hostPath: { path: {{ dir .Values.nri.socket }}, type: Directory } }
+        - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 64Mi } }
+        {{- if .Values.signing.secretName }}
+        - name: key
+          secret:
+            secretName: {{ .Values.signing.secretName }}
+            defaultMode: 0400
+        {{- end }}
