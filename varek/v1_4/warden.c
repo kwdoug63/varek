@@ -132,6 +132,7 @@
 #include "plan_breaker.h"
 #include "plan_progress.h"
 #include "warden_baseline_filter.h"
+#include "warden_oci.h"                 /* v1.34 step 3 */
 #include "smt_decide.h"            /* v1.13 SMT decision procedure */
 #include "checker/vdp_checker.h"   /* v1.15 independent certificate checker */
 #include "warden_lifecycle.h"   /* v1.9.3 supervisor/target lifecycle coupling */
@@ -690,12 +691,118 @@ static struct exec_ctx *ctx_get(pid_t pid) {
     return free_slot;
 }
 
+/* ---------------- v1.34: the node's /proc ----------------
+ * Every read of a process's state, the agent's or the Warden's own
+ * (/proc/<pid>/mem, /proc/self/fd/N, ...), goes through a descriptor on the
+ * /proc the Warden started with. Under the node agent the supervisor enters
+ * the container's mount namespace, where /proc is the container's: another
+ * PID namespace, in which the supervisor has no entry (docs/security/
+ * v1.34-kubernetes.md, step 2). Names the agent asks for (its own
+ * /proc/self) are still resolved in its view. proc_dir() is first called
+ * before any namespace is entered. */
+static int g_procfd = -1;
+static int proc_dir(void) {
+    /* opened once, at the start (main), never again: a later open could be
+     * the container's /proc, once in its mount namespace */
+    static bool tried = false;
+    if (!tried) { tried = true; g_procfd = open("/proc", O_PATH | O_DIRECTORY | O_CLOEXEC); }
+    if (g_procfd < 0) errno = ENOENT;
+    return g_procfd;
+}
+
+/* The name below that /proc ("<pid>/..." or "self/..."), or -1 */
+static int proc_rel(char *rel, size_t n, const char *fmt, va_list ap) {
+    int k = vsnprintf(rel, n, fmt, ap);
+    if (k < 0 || (size_t)k >= n) { errno = ENAMETOOLONG; return -1; }
+    if (proc_dir() < 0) return -1;
+    return 0;
+}
+
+__attribute__((format(printf, 3, 4)))
+static int proc_openf(int flags, mode_t mode, const char *fmt, ...) {
+    char rel[128];
+    va_list ap;
+    va_start(ap, fmt);
+    int r = proc_rel(rel, sizeof rel, fmt, ap);
+    va_end(ap);
+    return r < 0 ? -1 : openat(g_procfd, rel, flags | O_CLOEXEC, mode);
+}
+
+__attribute__((format(printf, 1, 2)))
+static FILE *proc_fopenf(const char *fmt, ...) {
+    char rel[128];
+    va_list ap;
+    va_start(ap, fmt);
+    int r = proc_rel(rel, sizeof rel, fmt, ap);
+    va_end(ap);
+    int fd = r < 0 ? -1 : openat(g_procfd, rel, O_RDONLY | O_CLOEXEC);
+    FILE *f = fd < 0 ? NULL : fdopen(fd, "re");
+    if (fd >= 0 && !f) close(fd);
+    return f;
+}
+
+/* as readlink(2): the length, not terminated */
+__attribute__((format(printf, 3, 4)))
+static ssize_t proc_readlinkf(char *out, size_t n, const char *fmt, ...) {
+    char rel[128];
+    va_list ap;
+    va_start(ap, fmt);
+    int r = proc_rel(rel, sizeof rel, fmt, ap);
+    va_end(ap);
+    return r < 0 ? -1 : readlinkat(g_procfd, rel, out, n);
+}
+
+__attribute__((format(printf, 2, 3)))
+static int proc_statf(struct stat *st, const char *fmt, ...) {
+    char rel[128];
+    va_list ap;
+    va_start(ap, fmt);
+    int r = proc_rel(rel, sizeof rel, fmt, ap);
+    va_end(ap);
+    return r < 0 ? -1 : fstatat(g_procfd, rel, st, 0);
+}
+
+/* v1.34 step 2: the container a node agent's supervisor supervises
+ * (warden_node.inc.c); off in a run the Warden starts itself */
+struct node_run {
+    bool   on;                  /* this process supervises a container a runtime started */
+    int    notify_fd;
+    pid_t  pid;                 /* the container's init, as the node numbers it */
+    int    pidfd;               /* that process itself, opened as the state arrived */
+    char   id[128];             /* the container's id */
+    char   bundle[PATH_MAX];
+    char   meta[256];           /* the profile's listenerMetadata */
+    char   pod_ns[256], pod_name[256], pod_uid[128], ctr[256];
+    char   argv0[PATH_MAX];     /* the container's command: its first launch */
+    uid_t  uid;                 /* the agent's, read from its process */
+    gid_t  gid;
+    gid_t  groups[256];         /* its supplementary groups, from its process too */
+    int    ngroups;
+    long   before_exec;         /* the runtime's own calls before that launch, let through */
+    /* v1.34 step 3 */
+    char   policy[64];          /* the pod's policy, by name (varek.dev/policy), or "" */
+    bool   launcher;            /* the command is /varek/init -- COMMAND (the NRI plugin's) */
+    bool   in_launcher;         /* the runtime has launched /varek/init; the launcher runs */
+    long   launcher_calls;      /* the launcher's own calls before the command, let through */
+    int    set_view;            /* the launch set the launcher reads, a sealed memfd */
+    char  *set_text;            /* its text, one path a line */
+    char   policy_sha[65];      /* v1.34 step 5: the plugin's SHA-256 of the policy it wrote the filter for, or "" */
+    char   dns[80];             /* v1.34 step 4: the pod's DNS server, "a.b.c.d:53" (its resolv.conf), or "" */
+    struct sock_filter *bpf;    /* the Warden's own filter for the policy, compiled */
+    unsigned nbpf;
+    long   not_admitted;        /* calls it refuses, which the pod's filter notifies */
+};
+static struct node_run g_nr = { .notify_fd = -1, .pidfd = -1, .set_view = -1 };
+static void node_run_start(FILE *f);
+static void node_fail(const char *why) __attribute__((noreturn));
+static bool node_launcher_open(int notify_fd, const struct seccomp_notif *req);
+static int node_launcher_exec(int notify_fd, const struct seccomp_notif *req, const struct action *a,
+                              const char *bootstrap_path, bool by_fd);
+
 /* ---------------- cross-process memory ---------------- */
 
 static int xproc_read_str(pid_t pid, uint64_t addr, char *out, size_t outlen) {
-    char p[64];
-    snprintf(p, sizeof(p), "/proc/%d/mem", pid);
-    int fd = open(p, O_RDONLY);
+    int fd = proc_openf(O_RDONLY, 0, "%d/mem", pid);
     if (fd < 0) return -1;
     if (lseek(fd, (off_t)addr, SEEK_SET) < 0) { close(fd); return -1; }
     ssize_t n = read(fd, out, outlen - 1);
@@ -711,9 +818,7 @@ static int xproc_read_str(pid_t pid, uint64_t addr, char *out, size_t outlen) {
 }
 
 static int xproc_read_bytes(pid_t pid, uint64_t addr, void *out, size_t len) {
-    char p[64];
-    snprintf(p, sizeof(p), "/proc/%d/mem", pid);
-    int fd = open(p, O_RDONLY);
+    int fd = proc_openf(O_RDONLY, 0, "%d/mem", pid);
     if (fd < 0) return -1;
     if (lseek(fd, (off_t)addr, SEEK_SET) < 0) { close(fd); return -1; }
     ssize_t n = read(fd, out, len);
@@ -1602,6 +1707,10 @@ static void       px_resolved(size_t i);  /* v1.26: proxied requests waiting on 
 static bool       px_up_charged(const char *name);  /* v1.26 review: sent to the upstream, charged */
 static void       px_handed_off(uint64_t id, unsigned port, int subject);  /* v1.26 review: a hand-off announced */
 static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden_stub.inc.c) */
+/* v1.25: the stub's address; v1.34 step 4: under the node agent, the first of
+ * 127.53.53.53 to 127.53.53.254 free in the pod's network namespace (which
+ * the pod's containers share) */
+static char       g_stub_text[16] = "127.53.53.53";
 /* v1.25 (section 4): a wildcard allow rule's budgets when it sets none */
 #define STUB_DEFAULT_NAMES 256           /* distinct new names per run */
 #define STUB_DEFAULT_RATE  30            /* distinct new names per minute */
@@ -1685,6 +1794,7 @@ static unsigned char *g_sk;                /* sodium_malloc: guarded, locked, no
 static int           g_anchor_fd = -1;
 static bool          g_anchor_fifo = false;  /* v1.16.2: held read-write; drained at exit */
 static char          g_anchor_lock[PATH_MAX + 8];  /* v1.16.2: the forwarder's liveness lock */
+static int           g_anchor_lock_dir = -1;        /* v1.34 review: its directory, held (the node's) */
 static uint64_t      g_ckpt_every = 64;
 static uint64_t      g_since_ckpt = 0;      /* decision records since the last signed record */
 static struct timespec g_last_ckpt;         /* CLOCK_MONOTONIC */
@@ -1982,6 +2092,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
         fprintf(f, "\"checkpoint_every\":%" PRIu64 ",", g_ckpt_every);
     if (g_anchor_fd >= 0) fputs("\"anchored\":true,", f);
     /* v1.24: the names the Warden resolves (each gets a resolution record). */
+    node_run_start(f);                                                   /* v1.34 step 2 */
     if (g_policy_any_name) fputs("\"host_name_rules\":true,", f);
     /* v1.25: the lists the policy's wildcards were checked against */
     if (g_psl_sha[0]) fprintf(f, "\"psl_sha256\":\"%s\",\"shared_domains_sha256\":\"%s\","
@@ -1990,7 +2101,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     if (g_names_on) fprintf(f, "\"host_names\":%zu,\"resolver\":\"%s\",", g_names.n, g_names.resolver);
     /* v1.25: where the agent's questions go (connects and sends to it are
      * records with rule dns_stub) */
-    if (STUB_WANTED()) fputs("\"dns_stub\":\"127.53.53.53:53\",", f);
+    if (STUB_WANTED()) fprintf(f, "\"dns_stub\":\"%s:53\",", g_stub_text);
     /* v1.26: the egress proxy: its listener, its user, the proxied ports */
     if (g_proxy.ctl >= 0) {
         fprintf(f, "\"proxy\":{\"mode\":\"%s\",\"listen\":\"127.0.0.1:%u\",\"uid\":%u,\"gid\":%u,\"pid\":%d,\"ports\":[",
@@ -2021,7 +2132,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
         }
     }
     /* v1.27: Landlock and the launch set (require warden 1.27) */
-    if (p->v.launches) { exec_ruleset_record(f); noexec_record(f); }   /* v1.27, v1.27.1 */
+    if (p->v.launches || g_nr.launcher) { exec_ruleset_record(f); noexec_record(f); }   /* v1.27, v1.27.1; v1.34 */
     as_agent_record(f);                  /* v1.29: who files are opened as */
     if (g_dry) fputs("\"mode\":\"dry_run\",", f);   /* v1.29: not enforcing (section 3) */
     /* v1.29: the baseline this policy is (section 2), and the names (never
@@ -2337,8 +2448,11 @@ static void emit_run_end(int exit_status) {
     emit_unanswered();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    char dry_count[48] = "";
+    char dry_count[160] = "";
     if (g_dry) snprintf(dry_count, sizeof dry_count, "\"not_enforced\":%" PRIu64 ",", g_dry_unenforced);
+    else if (g_nr.on)                     /* v1.34 step 2: the runtime's own, let through */
+        snprintf(dry_count, sizeof dry_count, "\"runtime_calls_before_exec\":%ld,\"launcher_calls_before_exec\":%ld,"
+                 "\"calls_not_admitted\":%ld,", g_nr.before_exec, g_nr.launcher_calls, g_nr.not_admitted);
     FILE *f = rec_begin();
     fprintf(f, "{\"event\":\"run_end\",\"run\":\"%s\",\"records\":%" PRIu64 ","
                "\"exit_status\":%d,%s%s%s%s%s\"timestamp_ns\":%lld}\n",
@@ -2701,9 +2815,7 @@ static void resolved_target_close(struct resolved_target *r) {
 /* Canonical path of a descriptor the supervisor holds. Fails closed on a
  * deleted or anonymous inode (readlink does not start with '/'). */
 static int fd_canonical_path(int fd, char *out, size_t outlen) {
-    char linkpath[64];
-    snprintf(linkpath, sizeof(linkpath), "/proc/self/fd/%d", fd);
-    ssize_t rl = readlink(linkpath, out, outlen - 1);
+    ssize_t rl = proc_readlinkf(out, outlen - 1, "self/fd/%d", fd);
     if (rl < 0 || (size_t)rl >= outlen - 1) { out[0] = '\0'; return -1; }
     out[rl] = '\0';
     if (out[0] != '/') { out[0] = '\0'; return -1; }
@@ -2721,9 +2833,8 @@ static int openat2_path(int dirfd, const char *path, uint64_t extra_flags) {
 
 /* v1.12.3: thread-group id of a requesting task (req.pid is a thread id). */
 static pid_t task_tgid(pid_t tid) {
-    char path[64], line[128];
-    snprintf(path, sizeof(path), "/proc/%d/status", tid);
-    FILE *f = fopen(path, "re");
+    char line[128];
+    FILE *f = proc_fopenf("%d/status", tid);
     if (!f) return -1;
     pid_t tgid = -1;
     while (fgets(line, sizeof(line), f)) {
@@ -2749,6 +2860,57 @@ static bool path_is_proc_self(const char *in, bool *thread_self) {
     return false;
 }
 
+/* v1.34: the supervisor resolves names in a container's view (its mount
+ * namespace, and so its /proc, of the container's PID namespace), set once it
+ * has entered it under the node agent; the pids the kernel gives the Warden
+ * are the node's. */
+static bool g_view_container = false;
+/* the container's PID namespace's place in a process's NSpid (0, the node's,
+ * first): its /proc numbers processes by that entry, the agent's included,
+ * however deep the agent's own namespace is */
+static int g_view_depth = 0;
+
+
+/* A process's pid as the /proc of the Warden's view numbers it: the node's
+ * own, or in a container's view its NSpid entry for the container's PID
+ * namespace (g_view_depth). -1 if unknown, or if the process is not in that
+ * namespace. */
+static pid_t view_pid(pid_t pid) {
+    if (!g_view_container) return pid;
+    char line[256];
+    FILE *f = proc_fopenf("%d/status", pid);
+    if (!f) return -1;
+    pid_t v = -1;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "NSpid:", 6)) continue;
+        char *s = line + 6, *e;
+        int k = 0;
+        for (long x; (x = strtol(s, &e, 10)), e != s; s = e, k++)
+            if (k == g_view_depth) { v = (pid_t)x; break; }
+        break;
+    }
+    fclose(f);
+    return v > 0 ? v : -1;
+}
+
+/* How deep a process's PID namespace is below the node's: its NSpid's
+ * entries less one. -1 if unknown. */
+static int pidns_depth(pid_t pid) {
+    char line[256];
+    FILE *f = proc_fopenf("%d/status", pid);
+    if (!f) return -1;
+    int n = -1;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "NSpid:", 6)) continue;
+        char *s = line + 6, *e;
+        n = 0;
+        for (; strtol(s, &e, 10), e != s; s = e) n++;
+        break;
+    }
+    fclose(f);
+    return n > 0 ? n - 1 : -1;
+}
+
 /* Rewrite a leading /proc/self or /proc/thread-self (already matched) to the
  * agent's own /proc/<tgid>[/task/<tid>], so the supervisor does not resolve it
  * to itself. Returns 0 (out filled), or -1 if it does not fit. */
@@ -2756,6 +2918,9 @@ static int rewrite_proc_self(const char *in, bool thread_self,
                              pid_t tgid, pid_t tid, char *out, size_t outlen) {
     static const char kSelf[] = "/proc/self", kThread[] = "/proc/thread-self";
     int n;
+    tgid = view_pid(tgid);                      /* v1.34 */
+    if (thread_self) tid = view_pid(tid);
+    if (tgid < 0 || tid < 0) return -1;
     if (thread_self) {
         const char *rest = in + sizeof(kThread) - 1;
         n = snprintf(out, outlen, "/proc/%d/task/%d%s", tgid, tid, rest);
@@ -2794,7 +2959,7 @@ static int check_proc_object(int fd, pid_t tid, pid_t *tgid_cache,
         *tgid_cache = task_tgid(tid);
         if (*tgid_cache < 0) return -1;
     }
-    if (n != (long)*tgid_cache) return -1;   /* the supervisor's, or another process's */
+    if (n != (long)view_pid(*tgid_cache)) return -1;   /* the supervisor's, or another process's */
     char tmp[PATH_LIMIT];
     int w = snprintf(tmp, sizeof(tmp), "/proc/self%s", end);
     if (w < 0 || (size_t)w >= sizeof(tmp) || (size_t)w >= canonlen) return -1;
@@ -2922,9 +3087,8 @@ static int resolve_target(pid_t target_pid, struct action *a,
 /* The agent's umask, so a file the supervisor creates on its behalf gets the
  * permissions the agent's own open would have produced. Falls back to 022. */
 static mode_t target_umask(pid_t pid) {
-    char path[64], line[128];
-    snprintf(path, sizeof(path), "/proc/%d/status", pid);
-    FILE *f = fopen(path, "re");
+    char line[128];
+    FILE *f = proc_fopenf("%d/status", pid);
     mode_t m = 022;
     if (!f) return m;
     while (fgets(line, sizeof(line), f)) {
@@ -2959,8 +3123,6 @@ static int materialize_target(pid_t target_pid, const struct action *a,
             fd = fcntl(r->path_fd, F_DUPFD_CLOEXEC, 0);
             return fd < 0 ? -errno : fd;
         }
-        char self[64];
-        snprintf(self, sizeof(self), "/proc/self/fd/%d", r->path_fd);
         /* Through the pinned descriptor: same inode that was decided on.
          * O_NOFOLLOW is dropped here only because /proc/self/fd/N is itself a
          * link; the agent's O_NOFOLLOW was already honoured at resolution
@@ -2971,14 +3133,14 @@ static int materialize_target(pid_t target_pid, const struct action *a,
              * apply the agent's mode and umask, as for O_CREAT. */
             mode_t old = umask(target_umask(target_pid));
             if (as_agent_enter() < 0) { umask(old); return -EACCES; }
-            fd = open(self, flags, (mode_t)(a->open_mode & 07777));
+            fd = proc_openf(flags, (mode_t)(a->open_mode & 07777), "self/fd/%d", r->path_fd);
             as_agent_leave();
             int saved = errno;
             umask(old);
             errno = saved;
         } else {
             if (as_agent_enter() < 0) return -EACCES;    /* v1.29: as the agent */
-            fd = open(self, flags, 0);
+            fd = proc_openf(flags, 0, "self/fd/%d", r->path_fd);
             as_agent_leave();
         }
     } else if (r->parent_fd >= 0) {
@@ -3115,9 +3277,7 @@ static void send_value(int notify_fd, uint64_t id, int64_t val) {
 static int xproc_write(pid_t pid, int notify_fd, uint64_t id,
                        uint64_t addr, const void *buf, size_t len) {
     if (addr == 0) return -EFAULT;
-    char p[64];
-    snprintf(p, sizeof(p), "/proc/%d/mem", pid);
-    int fd = open(p, O_WRONLY | O_CLOEXEC);
+    int fd = proc_openf(O_WRONLY, 0, "%d/mem", pid);
     if (fd < 0) return -EFAULT;
     if (!notif_id_valid(notify_fd, id)) { close(fd); return -ESRCH; }
     ssize_t n = pwrite(fd, buf, len, (off_t)addr);
@@ -3130,9 +3290,7 @@ static int xproc_write(pid_t pid, int notify_fd, uint64_t id,
  * AT_FDCWD is the agent's working directory. Returns a descriptor or -errno. */
 static int agent_fd(pid_t tid, int fd) {
     if (fd == VAREK_AT_FDCWD) {
-        char p[64];
-        snprintf(p, sizeof(p), "/proc/%d/cwd", tid);
-        int r = open(p, O_PATH | O_DIRECTORY | O_CLOEXEC);
+        int r = proc_openf(O_PATH | O_DIRECTORY, 0, "%d/cwd", tid);
         return r < 0 ? -EBADF : r;
     }
     if (fd < 0) return -EBADF;
@@ -3533,6 +3691,46 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
+        /* v1.34 step 2: under the node agent, until the container's first
+         * launch, the calls of the container's init are the runtime's own
+         * (its checks of /proc before it executes the command), made before
+         * any of the container's code runs: let through and counted, as the
+         * calls of the Warden's own child before its exec are on a host */
+        /* v1.34 step 3: then the launcher's (the NRI plugin's /varek/init),
+         * once the runtime has launched it: the launch set it reads is a view
+         * the Warden serves, and its other calls (Landlock, its own filter)
+         * are let through, until it launches the container's command */
+        if (g_nr.on && !bootstrap_done && req.data.nr != __NR_execve && req.data.nr != __NR_execveat &&
+            task_tgid((pid_t)req.pid) == bootstrap_pid && notif_id_valid(notify_fd, req.id)) {
+            if (g_nr.in_launcher && node_launcher_open(notify_fd, &req)) continue;
+            if (g_nr.in_launcher) g_nr.launcher_calls++;
+            else g_nr.before_exec++;
+            send_simple(notify_fd, req.id, DEC_ALLOW);
+            continue;
+        }
+        /* review: before the container's first launch only its init calls
+         * (the runtime's init, before it executes the command; the runtime's
+         * hooks run outside the filter): a call from another process then
+         * is not the runtime's, and the container is ended */
+        if (g_nr.on && !bootstrap_done) {
+            pid_t tg = task_tgid((pid_t)req.pid);
+            if (tg > 0 && tg != bootstrap_pid)
+                node_fail("a process other than the container's init made a call before the container's command ran");
+        }
+        /* v1.34 step 3: from the command's launch, a call the Warden's own
+         * filter for this policy refuses (the pod's filter notifies each call
+         * that filter names no rule for, for the runtime's last steps) is
+         * answered as that filter answers it, without a record, as on a host */
+        if (g_nr.on && bootstrap_done && g_nr.bpf) {
+            uint32_t fa = wd_bpf_run(g_nr.bpf, g_nr.nbpf, &req.data);
+            if ((fa & SECCOMP_RET_ACTION_FULL) != SECCOMP_RET_USER_NOTIF) {
+                g_nr.not_admitted++;
+                send_errno(notify_fd, req.id, (fa & SECCOMP_RET_ACTION_FULL) == SECCOMP_RET_ERRNO && (fa & SECCOMP_RET_DATA)
+                                              ? (int)(fa & SECCOMP_RET_DATA) : EPERM);
+                continue;
+            }
+        }
+
         struct exec_ctx *ctx = ctx_get(req.pid);
         if (ctx) ctx->seq++;
 
@@ -3547,7 +3745,10 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * that interrupts the caller's call, which the kernel restarts (and
          * notifies again); this one is void, and not a decision */
         if (g_sub_froze && !notif_id_valid(notify_fd, req.id)) continue;
-        if (dr < 0 || !notif_id_valid(notify_fd, req.id)) {
+        /* a call interrupted while it waited is restarted by the kernel and
+         * notified again: this one is void, not a decision */
+        if (!notif_id_valid(notify_fd, req.id)) continue;
+        if (dr < 0) {
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                          + (t1.tv_nsec - t0.tv_nsec);
@@ -3602,11 +3803,24 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * the exec, so CONTINUE stays as sound as before. */
         bool boot_by_fd = act.kind == ACT_PROCESS_EXEC && req.data.nr == __NR_execveat &&
                           act.target[0] == '\0' && (req.data.args[4] & AT_EMPTY_PATH);
+        /* v1.34 step 3: under the node agent with the launcher, the runtime
+         * launches /varek/init first, and the launcher the container's
+         * command, which is then the bootstrap below */
+        if (g_nr.on && g_nr.launcher && !bootstrap_done && act.kind == ACT_PROCESS_EXEC &&
+            node_launcher_exec(notify_fd, &req, &act, bootstrap_path, boot_by_fd))
+            continue;
         if (act.kind == ACT_PROCESS_EXEC && !bootstrap_done &&
             (pid_t)req.pid == bootstrap_pid && bootstrap_path &&
             (boot_by_fd || strcmp(act.target, bootstrap_path) == 0)) {
             if (boot_by_fd)
                 snprintf(act.target, sizeof act.target, "%s", bootstrap_path);
+            /* v1.34 review: the allowance is spent only once the kernel takes
+             * the answer. A signal can interrupt the exec while it waits (the
+             * Go runtime's preemption signals, in a container's runc init):
+             * the answer then reaches no one, the kernel restarts the call,
+             * and the restarted exec is the same launch, still the first */
+            struct seccomp_notif_resp br = { .id = req.id, .flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE };
+            if (ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &br) < 0) continue;
             bootstrap_done = true;
             g_exec_checking = p->v.launches;   /* v1.27 step 4: from here on */
             if (ctx) ctx->launched = true;
@@ -3615,7 +3829,6 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                            + (t1.tv_nsec - t0.tv_nsec);
             emit_pathology(g_report_seq++, req.pid, &act, DEC_ALLOW, DEC_ALLOW,
                            "bootstrap_exec_allow", lat_b, 0);
-            send_simple(notify_fd, req.id, DEC_ALLOW);
             continue;
         }
 
@@ -3957,9 +4170,7 @@ static int have_cap_sys_admin(void) {
 /* The canonical path of an open descriptor, as the kernel resolved it (no
  * second lookup that could race with a rename). */
 static int fd_path(int fd, char *out, size_t n) {
-    char link[64];
-    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
-    ssize_t k = readlink(link, out, n - 1);
+    ssize_t k = proc_readlinkf(out, n - 1, "self/fd/%d", fd);
     if (k <= 0 || (size_t)k >= n - 1 || out[0] != '/') return -1;
     out[k] = '\0';
     return 0;
@@ -4027,7 +4238,7 @@ static int refuse_secret_reachable(const struct policy *p, const char *path, boo
     if (rc == 0 && (fstat(fd, &st) < 0 || fd_path(fd, rp, sizeof rp) < 0)) rc = -1;
     close(fd);
     if (rc < 0) return -1;
-    FILE *mi = fopen("/proc/self/mountinfo", "re");
+    FILE *mi = proc_fopenf("self/mountinfo");
     if (!mi) {
         fprintf(stderr, "[warden] credentials: cannot read the mounts (%s); refusing to start\n", strerror(errno));
         return -1;
@@ -4206,6 +4417,16 @@ static int forwarder_alive(const char *fifo) {
     int fd = open(lp, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return -1;
     snprintf(g_anchor_lock, sizeof g_anchor_lock, "%s", lp);
+    if (g_anchor_lock_dir < 0) {
+        /* the lock is opened again at the end through its directory, held
+         * from here: under the node agent the Warden is in the container's
+         * mount namespace by then, where the name is the container's */
+        char d[PATH_MAX + 8];
+        snprintf(d, sizeof d, "%s", lp);
+        char *sl = strrchr(d, '/');
+        if (sl == d) d[1] = '\0'; else if (sl) *sl = '\0'; else snprintf(d, sizeof d, ".");
+        g_anchor_lock_dir = open(d, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    }
     /* A shared probe: it conflicts only with the forwarder's exclusive lock,
      * never with another probe. */
     int r = flock(fd, LOCK_SH | LOCK_NB) == 0 ? 0 : (errno == EWOULDBLOCK ? 1 : -1);
@@ -4242,9 +4463,7 @@ static int open_anchor(const char *path, const struct policy *p) {
          * forwarder restarts mid-run, records written meanwhile wait in the
          * pipe (64 KiB) instead of failing with EPIPE. The Warden never reads
          * from it. */
-        char self[64];
-        snprintf(self, sizeof self, "/proc/self/fd/%d", fd);
-        int rw = open(self, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+        int rw = proc_openf(O_RDWR | O_NONBLOCK, 0, "self/fd/%d", fd);
         if (rw < 0) {
             fprintf(stderr, "[warden] anchor %s: cannot hold the FIFO open (%s)\n", path, strerror(errno));
             close(fd);
@@ -4283,7 +4502,10 @@ static void anchor_drain(void) {
         /* A live forwarder holds the pipe itself: what is left is safe with
          * it (it may just be busy sending). */
         if (g_anchor_lock[0]) {
-            int fd = open(g_anchor_lock, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            const char *base = strrchr(g_anchor_lock, '/');
+            int fd = g_anchor_lock_dir >= 0 ? openat(g_anchor_lock_dir, base ? base + 1 : g_anchor_lock,
+                                                     O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+                                            : open(g_anchor_lock, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
             if (fd >= 0) {
                 int busy = flock(fd, LOCK_SH | LOCK_NB) != 0 && errno == EWOULDBLOCK;
                 close(fd);
@@ -4951,7 +5173,10 @@ static void usage(const char *argv0) {
         "              [--writable-exec]\n"
         "              -- <target> [args...]\n"
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
-        , argv0, argv0);
+        "       %s <policies dir | policy.txt> --node-agent <socket> --node-streams <dir>\n"
+        "              [--node-launcher <varek-init>]   (v1.34: the node agent, one supervisor a container)\n"
+        "       %s <policy.txt> --oci-filter   (v1.34: the policy's filter in OCI's form, for the NRI plugin)\n"
+        , argv0, argv0, argv0, argv0);
     fprintf(stderr,
         "\n"
         "  Privileged seccomp-unotify supervisor (VAREK Warden v1.4).\n"
@@ -5067,10 +5292,14 @@ static void usage(const char *argv0) {
         stderr);
 }
 
+#include "warden_node.inc.c"         /* v1.34 step 2: the node agent */
+
 int main(int argc, char **argv) {
     /* v1.24: the resolver helper is this program re-executed (a clean address
      * space, without the signing key); see warden_resolve.h. */
     if (argc >= 2 && !strcmp(argv[1], "--resolver-helper")) return wr_helper_exec_main(argc, argv);
+    /* v1.34: the node's /proc, held from the start (proc_dir) */
+    if (proc_dir() < 0) { fprintf(stderr, "[warden] cannot open /proc: %s\n", strerror(errno)); return 2; }
     /* v1.26.1: the egress proxy is its own program, warden-proxy (see
      * proxy_bin below); this binary no longer has a --proxy-helper mode. */
     /* Positional parse with optional --plan between policy_path and --.
@@ -5084,10 +5313,12 @@ int main(int argc, char **argv) {
      * state directory, lock and table, and --gate-status), then exits: 0 if
      * the Warden would start, 1 with the reason otherwise. No agent runs and
      * no verdict stream is written. tools/varek_preflight.sh uses it. */
+    bool oci_only = false;
     for (int i = 2; i < argc && strcmp(argv[i], "--"); i++)
         if (!strcmp(argv[i], "--check-startup")) g_check_only = true;
         else if (!strcmp(argv[i], "--check-credentials")) g_check_only = g_check_creds = true;   /* v1.28 */
-    if (argc < (g_check_only ? 3 : 4)) { usage(argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--oci-filter")) oci_only = true;                             /* v1.34 step 3 */
+    if (argc < (g_check_only || oci_only ? 3 : 4)) { usage(argv[0]); return 2; }
 
     const char *policy_path = argv[1];
     const char *plan_path   = NULL;
@@ -5106,10 +5337,13 @@ int main(int argc, char **argv) {
     const char *psl_arg = NULL, *shared_arg = NULL;   /* v1.25 */
     wr_config_default(&dns_cfg);
     int sep_idx = -1;
+    const char *node_sock = NULL, *node_streams = NULL;                     /* v1.34 step 2 */
+    const char *node_launcher = NULL;                                       /* v1.34 step 3 */
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) { sep_idx = i; break; }
-        if (strcmp(argv[i], "--check-startup") == 0 || strcmp(argv[i], "--check-credentials") == 0) continue;
+        if (strcmp(argv[i], "--check-startup") == 0 || strcmp(argv[i], "--check-credentials") == 0 ||
+            strcmp(argv[i], "--oci-filter") == 0) continue;
         if (i + 1 >= argc) { usage(argv[0]); return 2; }
         if (strcmp(argv[i], "--plan") == 0 && !plan_path) {
             plan_path = argv[++i];
@@ -5127,6 +5361,12 @@ int main(int argc, char **argv) {
             anchor_path = argv[++i];
         } else if (strcmp(argv[i], "--dry-run") == 0) {                  /* v1.29 */
             g_dry = true;
+        } else if (strcmp(argv[i], "--node-agent") == 0 && !node_sock && i + 1 < argc) {   /* v1.34 step 2 */
+            node_sock = argv[++i];
+        } else if (strcmp(argv[i], "--node-streams") == 0 && !node_streams && i + 1 < argc) {
+            node_streams = argv[++i];
+        } else if (strcmp(argv[i], "--node-launcher") == 0 && !node_launcher && i + 1 < argc) {   /* v1.34 step 3 */
+            node_launcher = argv[++i];
         } else if (strcmp(argv[i], "--writable-exec") == 0) {            /* v1.27.1 */
             g_writable_exec = true;
         } else if (strcmp(argv[i], "--run-as") == 0 && !run_as_arg) {
@@ -5189,7 +5429,38 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!g_check_only && (sep_idx < 0 || sep_idx + 1 >= argc)) { usage(argv[0]); return 2; }
+    /* v1.34 step 3: the filter in OCI's form, for the NRI plugin */
+    if (oci_only) {
+        if (sep_idx >= 0 || g_check_only || node_sock || g_dry || plan_path) {
+            fprintf(stderr, "[warden] --oci-filter takes the policy alone\n");
+            return 2;
+        }
+        static struct policy op;
+        if (policy_load(policy_path, &op) < 0) return 1;
+        /* v1.34 step 5: written only for a policy the node agent carries
+         * (the plugin's, and the admission check's, test) */
+        const char *no = node_policy_why(&op);
+        if (no) {
+            fprintf(stderr, "[warden] --oci-filter: the node agent does not carry %s yet\n", no);
+            return 1;
+        }
+        char why[200];
+        if (wd_oci_filter_write(stdout, op.v.open_as_agent ? WD_FILTER_CHANGES : 0, why, sizeof why) < 0 ||
+            fflush(stdout) != 0) {
+            fprintf(stderr, "[warden] --oci-filter: %s\n", why);
+            return 1;
+        }
+        return 0;
+    }
+    if ((node_sock && (sep_idx >= 0 || g_check_only || !node_streams || g_writable_exec)) ||
+        (node_launcher && !node_sock)) {                                    /* v1.34 step 2 */
+        fprintf(stderr, "[warden] --node-agent takes --node-streams DIR, and no agent (\"--\"), check or "
+                "--writable-exec (a pod's mounts are checked, D4); --node-launcher goes with --node-agent\n");
+        return 2;
+    }
+    if (node_sock && node_listen(node_sock, node_streams, node_launcher, &policy_path) < 0) return 1;
+    /* from here, under the node agent, the supervisor of one container */
+    if (!g_check_only && !g_nr.on && (sep_idx < 0 || sep_idx + 1 >= argc)) { usage(argv[0]); return 2; }
     if (flow_path && !plan_path && !g_check_only) {
         fprintf(stderr, "[warden] --flow-policy checks a plan; give --plan too\n");
         return 2;
@@ -5213,10 +5484,17 @@ int main(int argc, char **argv) {
                 run_as_arg ? run_as_arg : "nobody");
         return 2;
     }
+    if (g_nr.on) {                                                       /* v1.34 step 2 */
+        ra.uid = g_nr.uid;
+        ra.gid = g_nr.gid;
+        ra.drop = g_nr.uid != 0;
+        if (ra.drop && ra.gid == 0) node_fail("an unprivileged user in group 0 (root)");
+    }
     if (!ra.drop)
         fprintf(stderr, "[warden] WARNING: --run-as root: the agent runs as root with every "
                 "capability (the pre-v1.17 behaviour); only the seccomp filter holds it back\n");
     static char boot_path[PATH_MAX];
+    if (g_nr.on) snprintf(boot_path, sizeof boot_path, "%s", g_nr.argv0);   /* v1.34: in the container's view */
     if (target_argv && find_program(target_argv[0], boot_path, sizeof boot_path) < 0) {
         fprintf(stderr, "[warden] %s: program not found (or not a regular file)\n", target_argv[0]);
         return 127;
@@ -5275,7 +5553,23 @@ int main(int argc, char **argv) {
     if ((key_path || anchor_path) && refuse_raw_devices(&p) < 0) return 1;
     if (flow_path && flow_setup(&p, flow_path, state_arg, session_arg, gstatus_arg) < 0)
         return 1;                                                           /* v1.18.0 */
+    /* v1.34 step 4: in a pod, names are resolved from the pod's network
+     * through the pod's DNS server (the kubelet's resolv.conf: the cluster's
+     * DNS), unless --dns-server names one; the node's own may be on its
+     * loopback, which the pod's network does not reach */
+    if (g_nr.on && !dns_cfg.server && g_nr.dns[0]) dns_cfg.server = g_nr.dns;
     if (names_setup(&p, &dns_cfg) < 0) return 1;                            /* v1.24 */
+    if (g_nr.on && g_names_on && !dns_cfg.server)
+        node_fail("the policy names hosts, and the pod's /etc/resolv.conf names no IPv4 nameserver to resolve "
+                  "them through (give the node agent --dns-server)");
+    if (g_nr.on) {                                                         /* v1.34 step 2 */
+        const char *no = node_unsupported(&p, g_dry, plan_path, flow_path, obo_arg, svid_arg, g_trust_bundle_arg);
+        if (no) {
+            char why[256];
+            snprintf(why, sizeof why, "%s is not carried under the node agent yet", no);
+            node_fail(why);
+        }
+    }
     if (wildcards_check(policy_path, &p, psl_arg, shared_arg) < 0) return 1;            /* v1.25 */
     g_inspect_on = p.v.proxy_inspect;                                      /* v1.26.1 */
     if (g_any_name || g_inspect_on) views_setup();
@@ -5312,7 +5606,7 @@ int main(int argc, char **argv) {
         char pb[PATH_MAX], why[PATH_MAX + 128];
         if (proxy_bin_arg) snprintf(pb, sizeof pb, "%s", proxy_bin_arg);
         else {
-            ssize_t n = readlink("/proc/self/exe", pb, sizeof pb - 16);
+            ssize_t n = proc_readlinkf(pb, sizeof pb - 16, "self/exe");
             if (n <= 0) { fprintf(stderr, "[warden] cannot find this binary's directory\n"); return 1; }
             pb[n] = '\0';
             char *sl = strrchr(pb, '/');
@@ -5422,7 +5716,7 @@ int main(int argc, char **argv) {
             char sb[PATH_MAX], why[PATH_MAX + 256];
             if (secrets_bin_arg) snprintf(sb, sizeof sb, "%s", secrets_bin_arg);
             else {
-                ssize_t n = readlink("/proc/self/exe", sb, sizeof sb - 16);
+                ssize_t n = proc_readlinkf(sb, sizeof sb - 16, "self/exe");
                 if (n <= 0) { fprintf(stderr, "[warden] cannot find this binary's directory\n"); return 1; }
                 sb[n] = '\0';
                 char *sl = strrchr(sb, '/');
@@ -5604,8 +5898,9 @@ int main(int argc, char **argv) {
         }
     }
     /* v1.27: with `require warden 1.27`, the files the agent may launch and
-     * the Landlock ruleset that holds it to them (warden_exec.inc.c) */
-    if (p.v.launches) {
+     * the Landlock ruleset that holds it to them (warden_exec.inc.c). v1.34
+     * step 3: under the node agent, in the container's view (node_supervise) */
+    if (p.v.launches && !g_nr.on) {
         if (exec_ruleset_build(&p, target_argv ? boot_path : NULL) < 0 ||
             exec_confined_checks(&p) < 0) {              /* v1.31 */
             if (g_sk) sodium_free(g_sk);
@@ -5652,8 +5947,10 @@ int main(int argc, char **argv) {
     }
     /* v1.29 step 1: files opened as the agent (require warden 1.29) */
     g_changes_on = p.v.open_as_agent;                                /* v1.29 */
-    if (as_agent_setup(p.v.open_as_agent, ra.drop, ra.uid, ra.gid, run_as_arg ? run_as_arg : "nobody") < 0)
+    if (as_agent_setup(p.v.open_as_agent, ra.drop, ra.uid, ra.gid,
+                       g_nr.on ? NULL : run_as_arg ? run_as_arg : "nobody") < 0)
         return 1;
+    if (g_nr.on) node_as_agent();                                         /* v1.34 step 2 (review) */
     /* v1.28.1 step 3: sub-agents need cgroup v2 (a check makes no group) */
     if (g_check_only && sub_setup(&p, true, !ra.drop) < 0) return 1;
     if (g_check_only) {
@@ -5676,7 +5973,7 @@ int main(int argc, char **argv) {
         if (g_sk) sodium_free(g_sk);
         return 0;
     }
-    if (!target_argv) { usage(argv[0]); return 2; }
+    if (!target_argv && !g_nr.on) { usage(argv[0]); return 2; }
     /* A FIFO anchor whose reader went away must fail the write (EPIPE, then
      * an anchor_error record), not kill the Warden. The agent gets the
      * default disposition back before it runs (see the child below). */
@@ -5710,7 +6007,7 @@ int main(int argc, char **argv) {
         if (g_sk) sodium_free(g_sk);
         return 1;
     }
-    emit_run_start(policy_path, &p);
+    if (!g_nr.on) emit_run_start(policy_path, &p);     /* v1.34 step 3: node_supervise's, after the launch set */
     ctl_open();                                                            /* v1.28 step 4 */
     /* v1.24: every allowed host name is resolved before the agent runs.
      * Refreshes then run in a resolver helper process (warden_resolve.c),
@@ -5719,13 +6016,16 @@ int main(int argc, char **argv) {
      * to start it stops the run. */
     if (g_names_on) {
         if (wr_async_start(&g_names, "/proc/self/exe") < 0) {
+            if (g_nr.on) node_fail("cannot start the resolver helper");
             fprintf(stderr, "[warden] cannot start the resolver helper (%s); refusing to start\n",
                     strerror(errno));
             emit_run_end(1);
             if (g_sk) sodium_free(g_sk);
             return 1;
         }
-        names_resolve_all(true);
+        /* v1.34 step 4: under the node agent, after run_start (node_supervise);
+         * the helper is started here, where this binary is the node's */
+        if (!g_nr.on) names_resolve_all(true);
     }
 
     /* v1.6 pre-execution plan verification. Fires before fork; on
@@ -5750,6 +6050,8 @@ int main(int argc, char **argv) {
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGCHLD, &sa, NULL);
+
+    if (g_nr.on) return node_supervise(&p, boot_path, policy_path);         /* v1.34 step 2 */
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {

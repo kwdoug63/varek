@@ -1,0 +1,36 @@
+{{/* SPDX-License-Identifier: MIT
+  The node's plugin lists and watches every namespace's VarekPolicy (-sync);
+  the webhook reads a pod's. Neither may change one. */}}
+{{- range $who := list (dict "name" (include "varek.nodeName" .) "verbs" (list "get" "list" "watch")) (dict "name" (include "varek.admissionName" .) "verbs" (list "get")) }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $who.name }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {{- include "varek.labels" $ | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $who.name }}
+  labels: {{- include "varek.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: ["varek.dev"]
+    resources: ["varekpolicies"]
+    verbs: {{ toJson $who.verbs }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $who.name }}
+  labels: {{- include "varek.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $who.name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $who.name }}
+    namespace: {{ $.Release.Namespace }}
+---
+{{- end }}

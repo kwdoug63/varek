@@ -53,7 +53,6 @@
 
 #include <linux/sockios.h>
 
-#define STUB_ADDR_TEXT "127.53.53.53"   /* v1.25: STUB_ADDR in warden_stub.inc.c */
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 
@@ -149,9 +148,8 @@ static int sock_kind_of(int fd, struct sock_kind *k) {
 
 /* The agent's descriptor's close-on-exec flag: 1, 0, or -1 (unknown). */
 static int agent_fd_cloexec(pid_t tid, int fd) {
-    char p[64], buf[512];
-    snprintf(p, sizeof p, "/proc/%d/fdinfo/%d", tid, fd);
-    int f = open(p, O_RDONLY | O_CLOEXEC);
+    char buf[512];
+    int f = proc_openf(O_RDONLY, 0, "%d/fdinfo/%d", tid, fd);
     if (f < 0) return -1;
     ssize_t n = read(f, buf, sizeof buf - 1);
     close(f);
@@ -165,9 +163,8 @@ static int agent_fd_cloexec(pid_t tid, int fd) {
 
 /* The agent's effective uid and gid (for a Unix connect made on its behalf). */
 static int agent_creds(pid_t tid, uid_t *uid, gid_t *gid) {
-    char p[64], line[256];
-    snprintf(p, sizeof p, "/proc/%d/status", tid);
-    FILE *f = fopen(p, "re");
+    char line[256];
+    FILE *f = proc_fopenf("%d/status", tid);
     if (!f) return -1;
     int got = 0;
     while (fgets(line, sizeof line, f)) {
@@ -511,6 +508,28 @@ static int connect_as_agent(int s, const struct sockaddr *sa, socklen_t sl, uid_
     return rc;
 }
 
+/* A Unix connect through the pin (the socket's file, opened as the agent).
+ * Under the node agent the pin is named below the node's /proc, relative,
+ * from there: the Warden's /proc is the container's, where it has no entry.
+ * The first connect and every retry go through here, so a relative name is
+ * never resolved from the Warden's own directory. On the host the name is
+ * absolute (/proc/self/fd/N), and no change of directory is made. */
+static int connect_pinned_as_agent(int s, const struct sockaddr_un *un, socklen_t ul, uid_t uid, gid_t gid) {
+    if (un->sun_path[0] == '/') return connect_as_agent(s, (const struct sockaddr *)un, ul, uid, gid);
+    int here = open(".", O_PATH | O_DIRECTORY | O_CLOEXEC);
+    int rc;
+    if (here < 0 || proc_dir() < 0 || fchdir(g_procfd) < 0) rc = -EACCES;
+    else {
+        rc = connect_as_agent(s, (const struct sockaddr *)un, ul, uid, gid);
+        if (fchdir(here) < 0) {
+            fprintf(stderr, "[warden] internal error: cannot return to the Warden's directory; stopping\n");
+            abort();
+        }
+    }
+    if (here >= 0) close(here);
+    return rc;
+}
+
 /* ---- connects and sends that finish later ---- */
 
 enum { PEND_CONNECT = 1, PEND_UNIX_RETRY, PEND_SEND, PEND_STUB };
@@ -593,6 +612,57 @@ static void pend_free(int i) {
     g_pend[i] = g_pend[--g_npend];
 }
 
+/* v1.34 step 9: under SELinux (OpenShift's nodes) a socket takes the
+ * context of the process that made it, and the kernel does not hand the
+ * agent (container_t) a socket the node agent (spc_t) made: ADDFD failed for
+ * every connect, with no denial logged. Under the node agent the socket it
+ * dials is made with the agent's own context: the thread's sockcreate, set
+ * for that one socket() (the Warden is single-threaded). Nothing is set where
+ * the agent has no SELinux context (AppArmor's labels have no ':'); a context
+ * that cannot be set leaves the socket the node agent's, and the handover
+ * refuses it, as before, and the reason is logged. Failing to clear it stops
+ * the Warden, as failing to leave the agent's network namespace does: every
+ * socket it made afterwards would carry the agent's context. The Warden's own
+ * thread-self is named below the node's /proc (g_procfd): the supervisor is
+ * in the container's mount namespace, whose /proc has no entry for it (the
+ * first OpenShift trial with this: nothing was set, and nothing said). */
+static bool sockcreate_as_agent(pid_t tid) {
+    char ctx[256];
+    int fd = proc_openf(O_RDONLY, 0, "%d/attr/current", tid);
+    if (fd < 0) return false;
+    ssize_t n = read(fd, ctx, sizeof ctx - 1);
+    close(fd);
+    if (n <= 0) return false;
+    ctx[n] = 0;
+    ctx[strcspn(ctx, "\n")] = 0;
+    int colons = 0;
+    for (const char *c = ctx; *c; c++) {
+        if (*c == ' ') return false;
+        colons += *c == ':';
+    }
+    if (colons < 3) return false;                 /* user:role:type:level */
+    size_t l = strlen(ctx);
+    bool ok = (fd = proc_openf(O_WRONLY, 0, "thread-self/attr/sockcreate")) >= 0 && write(fd, ctx, l) == (ssize_t)l;
+    if (!ok) {
+        int e = errno;
+        log_line_start();
+        fprintf(g_log, "[warden] connect: cannot make the dialed socket with the agent's context %s (%s)\n",
+                ctx, strerror(e));
+    }
+    if (fd >= 0) close(fd);
+    return ok;
+}
+
+static void sockcreate_clear(void) {
+    int fd = proc_openf(O_WRONLY, 0, "thread-self/attr/sockcreate");
+    if (fd < 0 || write(fd, NULL, 0) < 0) {
+        fprintf(stderr, "[warden] internal error: cannot clear the context for new sockets (%s); stopping\n",
+                strerror(errno));
+        abort();
+    }
+    close(fd);
+}
+
 /* Hand the Warden's socket to the agent in place of its descriptor, and
  * answer its connect with reply_err (0 or EINPROGRESS). Returns the rule for
  * the record. */
@@ -628,6 +698,8 @@ static const char *handover(int notify_fd, uint64_t id, pid_t tid, int s, int af
     if (ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd) < 0) {
         int e = errno;
         if (e == ENOENT) { *kerr = 0; return "requester_gone"; }
+        log_line_start();
+        fprintf(g_log, "[warden] connect: the dialed socket could not be handed to the agent (%s)\n", strerror(e));
         send_errno(notify_fd, id, EACCES);
         *kerr = EACCES;
         return "injection_failed";
@@ -742,7 +814,7 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
         rule = NULL;
         /* v1.25: the stub resolver's port 53 is the one that is reached */
         if (stub_is_dest(&dial) && (!strcmp(k.name, "udp") || !strcmp(k.name, "tcp"))) {
-            snprintf(a->resolved, sizeof a->resolved, "%s:53", STUB_ADDR_TEXT);
+            snprintf(a->resolved, sizeof a->resolved, "%s:53", g_stub_text);
             stub_connect(notify_fd, req, a, ag, &k, t0);
             return;
         }
@@ -863,9 +935,11 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
     }
 
     /* Dial. */
+    bool as_agent = g_view_container && sockcreate_as_agent(tid);
     int s = socket(k.dom, k.type | SOCK_NONBLOCK | SOCK_CLOEXEC, k.proto);
+    err = errno;
+    if (as_agent) sockcreate_clear();
     if (s < 0) {
-        err = errno;
         close(ag);
         if (pin >= 0) close(pin);
         net_record(tid, a, d_raw, d_final, "dial_failed", t0, err);
@@ -911,9 +985,11 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
         }
         memset(&un, 0, sizeof un);
         un.sun_family = AF_UNIX;
-        snprintf(un.sun_path, sizeof un.sun_path, "/proc/self/fd/%d", pin);
+        /* through the pin (v1.34: under the node agent, by its name below
+         * the node's /proc; connect_pinned_as_agent) */
+        snprintf(un.sun_path, sizeof un.sun_path, g_view_container ? "self/fd/%d" : "/proc/self/fd/%d", pin);
         un_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(un.sun_path) + 1);
-        rc = connect_as_agent(s, (struct sockaddr *)&un, un_len, uid, gid);
+        rc = connect_pinned_as_agent(s, &un, un_len, uid, gid);
     } else if (a->proxy_handoff) {
         rc = proxy_dial(s, k.dom, &dial, dial_len, tid, a);
     } else {
@@ -1027,9 +1103,7 @@ static ssize_t gather_iov(pid_t tid, const struct msghdr_user *m, bool dgram, vo
     }
     char *buf = malloc(total ? total : 1);
     if (!buf) return -ENOBUFS;
-    char p[64];
-    snprintf(p, sizeof p, "/proc/%d/mem", tid);
-    int mf = open(p, O_RDONLY | O_CLOEXEC);
+    int mf = proc_openf(O_RDONLY, 0, "%d/mem", tid);
     if (mf < 0) { free(buf); return -EFAULT; }
     uint64_t off = 0;
     for (uint64_t i = 0; i < m->iovlen && off < total; i++) {
@@ -1256,8 +1330,7 @@ static void pend_service(int notify_fd, const short *rev, int n) {
                 net_record(op->tid, op->act, op->d_raw, DEC_ALLOW, "dial_failed", &op->t0, EAGAIN);
                 pend_free(i);
             } else if (ts_ge(&now, &op->next_try)) {
-                int rc = connect_as_agent(op->sock, (struct sockaddr *)&op->dial_un,
-                                          op->dial_un_len, op->uid, op->gid);
+                int rc = connect_pinned_as_agent(op->sock, &op->dial_un, op->dial_un_len, op->uid, op->gid);
                 if (rc == -EAGAIN) {
                     op->next_try = now;
                     ts_add_ns(&op->next_try, UNIX_RETRY_NS);

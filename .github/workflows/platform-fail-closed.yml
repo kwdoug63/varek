@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# v1.34 review: the token reads only
+permissions:
+  contents: read
+
 jobs:
   non-linux-fails-closed:
     name: Verify non-Linux raises IsolationError

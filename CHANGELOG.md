@@ -9,6 +9,31 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.34.0] - 2026-10-24 — Kubernetes: a node agent and a Helm chart
+
+The Warden supervises a pod's containers from outside them, so the agent's
+pod passes Pod Security's "restricted" level. A node agent on each node
+(`warden POLICY_DIR --node-agent`, a DaemonSet) receives each supervised
+container's seccomp notifications through `linux.seccomp.listenerPath`
+and decides its calls as on a host, one supervisor, policy and signed,
+anchored stream per container. An NRI plugin (`varek-nri`; containerd 2.2
+or later, CRI-O 1.35 or later) sets the Warden's filter, written by the
+Warden itself (`--oci-filter`), puts the launcher `varek-init` first in the
+command to apply the launch set with Landlock, and makes writable mounts
+noexec; a container it cannot carry is refused, and one it does not adjust
+keeps VAREK's unsupervised profile and does not start. The pod's network,
+stub resolver and egress proxy work in the pod's namespace. `VarekPolicy`
+resources, an admission webhook, an exporter of each stream as OCSF, and a
+signed Helm chart (`oci://ghcr.io/kwdoug63/charts/varek`) with an SCC for
+OpenShift. On a runtime whose NRI is before v0.12 no seccomp rule carries
+an errno (NRI v0.11 crashed CRI-O 1.35); under SELinux the dialed socket
+has the agent's context. Not carried in pods yet: credentials, sub-agents,
+confined MCP servers, `require on-behalf-of`, plans and the dry run. No
+policy line changes; the grammar stays 1.31. 24 hours each on Amazon EKS
+(containerd 2.3.5) and single-node OpenShift 4.22 (CRI-O 1.35.9, SELinux
+enforcing): every probe held, every stream audited.
+`RELEASE-v1.34.0.md`.
+
 ## [1.32.1] - 2026-10-19 — Rootless Podman without `--systemd=always`
 
 A patch release of 1.32.0. In a user namespace (rootless Podman) the Warden

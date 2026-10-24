@@ -69,6 +69,14 @@ OUT="$(mktemp -d)"
 fail=0 skips=0
 pass()  { printf '  PASS   %s\n' "$1"; }
 flunk() { printf '  FAIL   %s\n' "$1"; fail=1; }
+# The test's servers listen on HOSTIP, the host's own address, which carries
+# the host's connections, each from a port of the ephemeral range (32768 to
+# 60999 by default). Their ports are taken below it, each kind in a band of
+# its own, so no connection holds one: a server that could not bind failed
+# a later check as if the Warden had (CI, October 24, 2026: section 5's
+# plain-HTTP echo server, its port in use, and "plain HTTP" failed). And
+# each wait for them says so when one did not start.
+listening() { python3 -c 'import socket, sys; [socket.create_connection((sys.argv[1], int(p)), 0.5).close() for p in sys.argv[2:]]' "$HOSTIP" "$@" 2>/dev/null; }
 skip()  { printf '  SKIP   %s\n' "$1"; skips=$((skips + 1)); }
 trap '[ -n "${KEEP:-}" ] && echo "kept $OUT" || rm -rf "$OUT"' EXIT
 hex() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
@@ -370,7 +378,7 @@ else
     W=/tmp/varek_v1261c.$$
     rm -rf "$W"; mkdir -p "$W/o"; chmod 755 "$W"; chmod 777 "$W/o"
     HOSTIP=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("10.255.255.255", 1)); print(s.getsockname()[0])')
-    TP=$((45000 + RANDOM % 5000))
+    TP=$((22000 + RANDOM % 2000))
     openssl req -x509 -newkey rsa:2048 -nodes -keyout "$OUT/key.pem" -out "$OUT/cert.pem" -days 1 \
         -subj /CN=pinned.example.net > /dev/null 2>&1
     python3 - "$HOSTIP" "$TP" "$OUT/cert.pem" "$OUT/key.pem" <<'PY' > "$OUT/tlssrv.out" 2>&1 &
@@ -394,7 +402,7 @@ while True:
     c, _ = l.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
 PY
     SRV="$!"
-    DPORT=$((20000 + RANDOM % 20000))
+    DPORT=$((20000 + RANDOM % 2000))
     printf '{"api.example.com": {"ttl": 30, "a": ["%s"]}, "pinned.example.net": {"ttl": 30, "a": ["%s"]}}\n' \
         "$HOSTIP" "$HOSTIP" > "$OUT/zone.json"
     rm -f "$OUT/ready"
@@ -405,6 +413,7 @@ PY
         [ -e "$OUT/ready" ] && python3 -c "import socket; socket.create_connection(('$HOSTIP', $TP), 0.2)" 2>/dev/null && break
         sleep 0.1
     done
+    listening "$TP" || flunk "the test's TLS server did not start on port $TP (a port in use?)"
     cat > "$W/agent.py" <<'PY'
 import os, socket, ssl, sys, time
 TP, O = int(sys.argv[1]), sys.argv[2]
@@ -563,7 +572,7 @@ else
     W=/tmp/varek_v1261t.$$
     rm -rf "$W"; mkdir -p "$W/o"; chmod 755 "$W"; chmod 777 "$W/o"
     HOSTIP=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("10.255.255.255", 1)); print(s.getsockname()[0])')
-    P1=$((42000 + RANDOM % 5000)); P2=$((P1 + 1)); P3=$((P1 + 2)); P4=$((P1 + 3))   # good, wrong name, self-signed, passthrough
+    P1=$((24000 + RANDOM % 5000)); P2=$((P1 + 1)); P3=$((P1 + 2)); P4=$((P1 + 3))   # good, wrong name, self-signed, passthrough
     # a test root, servers' certificates under it, and the trust bundle given the Warden
     ( cd "$W" &&
       openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout tca.key -out tca.pem -days 2 \
@@ -603,7 +612,7 @@ PY
         python3 "$OUT/srv.py" "$HOSTIP" "$1" "$W/$2.pem" "$W/$2.key" > "$OUT/srv$1.log" 2>&1 &
         SRV="$SRV $!"
     done
-    DPORT=$((20000 + RANDOM % 20000))
+    DPORT=$((20000 + RANDOM % 2000))
     printf '{"api.example.com": {"ttl": 30, "a": ["%s"]}, "pinned.example.net": {"ttl": 30, "a": ["%s"]}}\n' \
         "$HOSTIP" "$HOSTIP" > "$OUT/zone4.json"
     rm -f "$OUT/ready4"
@@ -614,6 +623,7 @@ PY
         [ -e "$OUT/ready4" ] && python3 -c "import socket; [socket.create_connection(('$HOSTIP', p), 0.2) for p in ($P1, $P4)]" 2>/dev/null && break
         sleep 0.1
     done
+    listening "$P1" "$P2" "$P3" "$P4" || flunk "the test's TLS servers did not start on ports $P1 to $P4 (a port in use?)"
     cat > "$W/agent.py" <<'PY'
 import os, socket, ssl, sys
 P1, P2, P3, P4, O = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
@@ -836,7 +846,7 @@ JAVA
         SQUID=$(command -v squid || echo /usr/sbin/squid)
         SQ=/tmp/varek_v1261sq.$$
         rm -rf "$SQ"; mkdir -p "$SQ"; chmod 777 "$SQ"
-        SP=$((47500 + RANDOM % 2000))
+        SP=$((29500 + RANDOM % 1500))
         printf '%s api.example.com\n' "$HOSTIP" > "$SQ/hosts"
         { printf 'http_port %s:%s\nhttp_access allow all\n' "$HOSTIP" "$SP"
           printf 'hosts_file %s/hosts\naccess_log %s/access.log\ncache_log %s/cache.log\npid_filename %s/squid.pid\n' "$SQ" "$SQ" "$SQ" "$SQ"
@@ -845,6 +855,7 @@ JAVA
         chmod 644 "$SQ"/*
         ( cd "$SQ" && "$SQUID" -N -f "$SQ/squid.conf" > "$SQ/out.log" 2>&1 & )
         for _ in $(seq 100); do python3 -c "import socket; socket.create_connection(('$HOSTIP', $SP), 0.2)" 2>/dev/null && break; sleep 0.1; done
+        listening "$SP" || flunk "squid did not start on port $SP (a port in use?)"
         { printf 'require warden 1.26\nproxy inspect\nproxy ports %s\nproxy upstream http://%s:%s\nallow host api.example.com:%s\n' "$P1" "$HOSTIP" "$SP" "$P1"
           printf 'allow request GET https://api.example.com:%s/\n' "$P1"
           printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path %s/\n' "$W"
@@ -882,6 +893,7 @@ PY
     python3 "$HERE/tests/v1261_echo_server.py" "$HOSTIP" "$HP" "$OUT/echo.log" > /dev/null 2>&1 &
     SRV="$SRV $!"
     for _ in $(seq 50); do python3 -c "import socket; [socket.create_connection(('$HOSTIP', p), 0.2) for p in ($TP, $HP)]" 2>/dev/null && break; sleep 0.1; done
+    listening "$TP" "$HP" || flunk "the test's echo servers did not start on ports $TP and $HP (a port in use?)"
     cat > "$W/req.py" <<'PY'
 import hashlib, socket, ssl, sys, time
 TP, HP = int(sys.argv[1]), int(sys.argv[2])
@@ -1161,6 +1173,7 @@ PY
     python3 "$OUT/rvsrv.py" "$HOSTIP" "$CP" "$W/cn.pem" "$W/cn.key" "$OUT/rv.log" > /dev/null 2>&1 &
     SRV="$SRV $!"
     for _ in $(seq 50); do python3 -c "import socket; [socket.create_connection(('$HOSTIP', p), 0.2) for p in ($XP, $CP)]" 2>/dev/null && break; sleep 0.1; done
+    listening "$XP" "$CP" || flunk "the test's servers did not start on ports $XP and $CP (a port in use?)"
     cat > "$W/rv.py" <<'PY'
 import hashlib, os, socket, ssl, sys, time
 XP, CP = int(sys.argv[1]), int(sys.argv[2])
