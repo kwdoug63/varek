@@ -62,6 +62,10 @@ aws iam put-role-policy --role-name varek-probe-runtime --policy-name pull-and-l
     {\"Effect\":\"Allow\",\"Action\":[\"ecr:BatchGetImage\",\"ecr:GetDownloadUrlForLayer\"],\"Resource\":\"arn:aws:ecr:us-east-1:$ACCOUNT:repository/varek-agentcore-probe\"},
     {\"Effect\":\"Allow\",\"Action\":\"ecr:GetAuthorizationToken\",\"Resource\":\"*\"},
     {\"Effect\":\"Allow\",\"Action\":[\"logs:CreateLogGroup\",\"logs:CreateLogStream\",\"logs:PutLogEvents\",\"logs:DescribeLogStreams\"],\"Resource\":\"arn:aws:logs:us-east-1:$ACCOUNT:log-group:/aws/bedrock-agentcore/runtimes/*\"}]}"
+# AWS's documented execution role also lets the runtime look up log groups;
+# without it the container can start and its logs never reach CloudWatch
+aws iam put-role-policy --role-name varek-probe-runtime --policy-name describe-log-groups \
+  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"logs:DescribeLogGroups\",\"Resource\":\"arn:aws:logs:us-east-1:$ACCOUNT:log-group:*\"}]}"
 
 aws ecr create-repository --repository-name varek-agentcore-probe
 ```
@@ -172,6 +176,7 @@ aws iam detach-role-policy --role-name varek-probe-builder --policy-arn arn:aws:
 aws iam detach-role-policy --role-name varek-probe-builder --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 aws iam delete-role --role-name varek-probe-builder
 aws iam delete-role-policy --role-name varek-probe-runtime --policy-name pull-and-log
+aws iam delete-role-policy --role-name varek-probe-runtime --policy-name describe-log-groups
 aws iam delete-role --role-name varek-probe-runtime
 ```
 
