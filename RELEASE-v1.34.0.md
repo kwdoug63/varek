@@ -265,7 +265,7 @@ on EKS, with one long agent (one node).
 | Streams | 97, 807,885 records (906 refused); audited: 97 pass |
 | The exporter | 97 runs' audits passed in its log |
 | VAREK's containers | not restarted (5) |
-| Memory | exporter 10.8 to 13.4 MB; listener 3.9 to 4.2 MB; plugin 13.5 to 24.2 MB; the node agent's flat (290 samples) |
+| Memory | exporter 10.8 to 13.4 MB; listener 3.9 to 4.2 MB; plugin 13.5 to 24.2 MB (median 21.9); the long agent's supervisor 10.8 to 11.0 MB; the node agent's flat (290 samples) |
 
 `soak_check: PASS`. OpenShift's trials found three faults, each fixed
 before the run:
