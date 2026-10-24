@@ -14,7 +14,8 @@ from inside a session, by this probe:
   read its memory (`process_vm_readv`);
 - the cgroup file system, and whether it can make a group;
 - whether its root is writable; Landlock's ABI; the LSMs; the architecture;
-- then `varek doctor`, and a real run: `varek run -- /bin/cat /etc/os-release`
+- with VAREK's own image as its base (once the Warden builds for arm64), also
+  `varek doctor` and a real run: `varek run -- /bin/cat /etc/os-release`
   under the baseline policy, with `varek refusals` on its stream.
 
 The probe answers AgentCore Runtime's container contract: HTTP on port 8080,
@@ -99,8 +100,7 @@ export AWS_REGION=us-east-1
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 REPO=$ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/varek-agentcore-probe
 
-sudo docker build -q -f packaging/container/Containerfile -t varek:arm64 .
-sudo docker build -q --build-arg BASE=varek:arm64 -f packaging/agentcore/Containerfile -t $REPO:1 .
+sudo docker build -q -f packaging/agentcore/Containerfile -t $REPO:1 .
 
 # a smoke test: the probe answers here, in Docker's default settings
 sudo docker run --rm --entrypoint python3 $REPO:1 /opt/varek/agentcore_probe.py --once \
@@ -110,8 +110,12 @@ aws ecr get-login-password | sudo docker login -u AWS --password-stdin $ACCOUNT.
 sudo docker push -q $REPO:1
 ```
 
-The first build takes about ten minutes. `docker login` takes ECR's token
-from the instance's role, through the pipe; it is never shown or typed.
+The build takes a minute: the probe stands alone (Python's standard library),
+as the Warden does not build for arm64 on this branch yet (its arm64 build is
+on the macOS branch, v1.33), so the report has no `varek doctor` or run
+under the Warden; every fact D8 needs is measured without it. `docker login`
+takes ECR's token from the instance's role, through the pipe; it is never
+shown or typed.
 
 ## 3. The runtime (CloudShell)
 

@@ -1,17 +1,23 @@
 # SPDX-License-Identifier: MIT
 #
-# The AgentCore Runtime probe (v1.35 step 1, D8): VAREK's image with an HTTP
-# server on port 8080 that answers AgentCore Runtime's /ping and
-# /invocations, each invocation answered with what the container holds and
-# a run of an agent under the Warden. See packaging/agentcore/README.md.
+# The AgentCore Runtime probe (v1.35 step 1, D8): an HTTP server on port 8080
+# that answers AgentCore Runtime's /ping and /invocations, each invocation
+# answered with what the container holds. See packaging/agentcore/README.md.
 #
-# BASE is VAREK's own image built for the same architecture, from the
-# repository's root (AgentCore Runtime's default compute takes arm64):
+# By default the probe stands alone (Python's standard library and libc):
+# the facts D8 needs are measured without the Warden, whose arm64 build is
+# not on this branch yet (it is on the macOS branch, v1.33). AgentCore
+# Runtime's default compute takes arm64. From the repository's root:
+#
+#   docker build --platform linux/arm64 -f packaging/agentcore/Containerfile -t varek-agentcore-probe:1 .
+#
+# With VAREK's own image as BASE (built for arm64, once the Warden builds
+# there), the report also has `varek doctor` and a run under the Warden:
 #
 #   docker build --platform linux/arm64 -f packaging/container/Containerfile -t varek:arm64 .
 #   docker build --platform linux/arm64 --build-arg BASE=varek:arm64 \
-#       -f packaging/agentcore/Containerfile -t varek-agentcore-probe:arm64 .
-ARG BASE=varek:arm64
+#       -f packaging/agentcore/Containerfile -t varek-agentcore-probe:2 .
+ARG BASE=public.ecr.aws/docker/library/python:3.12-slim
 FROM ${BASE}
 COPY packaging/agentcore/probe_server.py /opt/varek/agentcore_probe.py
 EXPOSE 8080
