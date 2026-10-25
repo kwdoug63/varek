@@ -1,0 +1,26 @@
+# The sample's policy (VAREK v1.35): the deployer may read its manifests and
+# look at deployments, and change none. Its plan is refused under it: its
+# settings allow every tool of the deploy server (mcp__deploy), so the plan's
+# step for its tools names none, which no rule here allows.
+require warden 1.35
+proxy inspect
+allow path /usr/ readonly
+allow path /lib/ readonly
+allow path /lib64/ readonly
+deny  path /etc/shadow
+allow path /etc/ readonly
+allow path /proc/self/ readonly
+allow path exact /dev/null
+allow path exact /dev/urandom readonly
+allow path /tmp/
+allow path /srv/deployer/ readonly
+allow path /home/agent/.claude/
+allow path exact /home/agent/.claude.json
+allow exec /opt/claude/bin/claude
+allow host api.anthropic.com:443
+allow host deploy.example.com:443
+allow mcp https://deploy.example.com/mcp initialize
+allow mcp https://deploy.example.com/mcp notifications/initialized
+allow mcp https://deploy.example.com/mcp tools/list
+allow mcp https://deploy.example.com/mcp tools/call get_*
+allow mcp https://deploy.example.com/mcp tools/call list_*

@@ -618,7 +618,7 @@ install: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/policies/agents
 	install -m 0644 policies/agents/*.profile.txt $(DESTDIR)$(PREFIX)/policies/agents/
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/adapters        # v1.35 step 5: varek plan generate's adapters
-	install -m 0644 adapters/*.py $(DESTDIR)$(PREFIX)/adapters/
+	install -m 0644 adapters/*.py adapters/requirements-frameworks.txt $(DESTDIR)$(PREFIX)/adapters/
 	if [ -d tools/systemd ]; then install -d -m 0755 $(DESTDIR)$(PREFIX)/tools/systemd && \
 	    install -m 0644 tools/systemd/* $(DESTDIR)$(PREFIX)/tools/systemd/; fi
 	ln -sf $(PREFIX)/tools/varek $(DESTDIR)$(BINDIR)/varek

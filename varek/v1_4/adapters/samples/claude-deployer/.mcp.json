@@ -1,0 +1,1 @@
+{ "mcpServers": { "deploy": { "type": "http", "url": "https://deploy.example.com/mcp" } } }

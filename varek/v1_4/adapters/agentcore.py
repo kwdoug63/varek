@@ -49,101 +49,31 @@ generate`, under the Warden, with the project read-only and no network.
 """
 
 import argparse
-import hashlib
-import json
 import os
 import re
 import sys
 
+import importlib.util as _ilu
+_vp_spec = _ilu.spec_from_file_location("varek_plan", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                    "varek_plan.py"))
+vp = _ilu.module_from_spec(_vp_spec)
+_vp_spec.loader.exec_module(vp)   # by its path: the adapter's directory is not put on sys.path, where an
+                                  # adapter's name could hide the framework's package
+
 ADAPTER = "agentcore"
-ADAPTER_VERSION = "1.35.0"
-LABEL = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
+ADAPTER_VERSION = vp.VERSION
 REGION = re.compile(r"[a-z]{2}(-gov)?-[a-z]+-[0-9]")
-HOSTPORT = re.compile(r"[A-Za-z0-9.-]{1,253}:[0-9]{1,5}")
+HOSTPORT = vp.HOSTPORT
 SEARCH_TOOL = "x_amz_bedrock_agentcore_search"      # the gateway's own tool, with semantic search on
 LIVE_KINDS = {"mcpServer": "an MCP server", "smithyModel": "a Smithy model", "apiGateway": "an API Gateway stage",
               "connector": "a connector", "passthrough": "a passthrough endpoint", "httpRuntime": "a runtime"}
 
 
-class AdapterError(Exception):
-    pass
+AdapterError, Plan, field, read_json = vp.AdapterError, vp.Plan, vp.field, vp.read_json
 
 
 def warn(msg):
-    print(f"agentcore: {msg}", file=sys.stderr)
-
-
-def read_json(path, what, required=True):
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except FileNotFoundError:
-        if required:
-            raise AdapterError(f"no {what} at {path}")
-        return None, None
-    except OSError as e:
-        raise AdapterError(f"cannot read {what} {path}: {e.strerror}")
-    try:
-        return json.loads(data.decode("utf-8")), hashlib.sha256(data).hexdigest()
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
-        raise AdapterError(f"{what} {path} is not JSON: {e}")
-
-
-class Plan:
-    def __init__(self):
-        self.lines, self.labels, self.n = [], set(), 0
-
-    def label(self, *parts):
-        base = re.sub(r"[^A-Za-z0-9_-]", "_", "_".join(p for p in parts if p)).strip("-") or "step"
-        if not re.match(r"[A-Za-z_]", base):
-            base = "s_" + base
-        base = base[:56]
-        lab, k = base, 2
-        while lab in self.labels:
-            lab, k = f"{base}_{k}", k + 1
-        assert LABEL.fullmatch(lab), lab
-        self.labels.add(lab)
-        return lab
-
-    def comment(self, text=""):
-        self.lines.append(("# " + text).rstrip())
-
-    def step(self, kind, target, *labelparts, **fields):
-        if not target or re.search(r"\s", target) or len(target) > 4095:
-            raise AdapterError(f"a {kind} step's target {target!r} is not one token of at most 4095 bytes")
-        if self.n == 256:
-            raise AdapterError("the plan would have more than 256 steps (the plan format's limit)")
-        out = f"action {self.label(*labelparts)} {kind} {target}"
-        for k, v in fields.items():
-            out += f" {k}={field(v)}"
-        self.lines.append(out)
-        self.n += 1
-
-    def text(self):
-        return "\n".join(self.lines) + "\n"
-
-
-def field(v):
-    """a field's value, bare where it can be, else quoted (plan_parser.h)"""
-    v = str(v)
-    if v and re.fullmatch(r'[^\s"\\\x00-\x1f\x7f]+', v):
-        return v
-    out = '"'
-    for ch in v:
-        o = ord(ch)
-        if ch in '"\\':
-            out += "\\" + ch
-        elif ch == "\n":
-            out += "\\n"
-        elif ch == "\t":
-            out += "\\t"
-        elif o < 0x20 or o == 0x7f:
-            if o == 0:
-                raise AdapterError("a field holds a NUL byte")
-            out += f"\\x{o:02x}"
-        else:
-            out += ch
-    return out + '"'
+    vp.warn(ADAPTER, msg)
 
 
 def find_project(root):
@@ -263,7 +193,7 @@ def generate(a):
     P.comment("allows that no step covers. Not here, as agentcore.json does not say them: the agent's")
     P.comment("own tools and its model provider, which are its framework's (--model-host names the")
     P.comment("model's host).")
-    P.lines.append("plan 1.35")
+    P.start()
 
     if not a.no_runtime:
         P.comment()

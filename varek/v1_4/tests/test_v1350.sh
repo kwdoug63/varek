@@ -29,6 +29,14 @@
 #   8. `varek plan generate --from agentcore` (step 5, D5): the adapter on
 #      the two samples (adapters/samples/), what it refuses, the command,
 #      the adapter under the Warden, each sample's plan under its policy
+#   9. the other adapters (step 6): watsonx and claude on their samples,
+#      read as data, each sample's plan under its policy (one authorized, one
+#      refused, the step and its reason given), the same plan under the
+#      Warden; `varek plan merge`; and, where VAREK_FW_PYTHON names a Python
+#      that has the frameworks (adapters/requirements-frameworks.txt) and
+#      nobody can read, the code adapters (langgraph, openai-agents) under the
+#      Warden in that Python: nothing refused, the agent's prints kept out of
+#      the plan, each sample's plan under its policy
 #
 # Usage: test_v1350.sh <warden> (tools/varek, tools/vdp_cert_check beside it)
 set -u
@@ -395,7 +403,7 @@ check "varek plan generate --no-confine -o: the plan written, its steps counted"
 python3 "$VAREK" plan generate --no-confine -o "$OUT/w.plan" --from agentcore "$OUT/agentcore-weather" > "$OUT/cli.out" 2>&1
 check "... an existing file not written over without --force" sh -c "[ \$? != 0 ] || grep -q 'exists' '$OUT/cli.out'"
 check "... a framework with no adapter: refused, the adapters named" sh -c \
-    "! python3 '$VAREK' plan generate --no-confine --from langgraph '$OUT/agentcore-weather' > '$OUT/cli.out' 2>&1 && grep -q 'no adapter for' '$OUT/cli.out'"
+    "! python3 '$VAREK' plan generate --no-confine --from crewai '$OUT/agentcore-weather' > '$OUT/cli.out' 2>&1 && grep -q 'no adapter for' '$OUT/cli.out'"
 # under the Warden (D5): the adapter as an agent, the project read-only, no network
 mkdir -m 755 "$OUT/home"; cp -r "$HERE/adapters" "$OUT/home/"; chmod -R a+rX "$OUT/home/adapters"
 ln -s "$WARDEN" "$OUT/home/warden"; ln -s "$HERE/tools" "$OUT/home/tools"
@@ -421,6 +429,106 @@ if getent hosts xray.us-east-1.amazonaws.com > /dev/null 2>&1; then
         "[ $trc = 1 ] && grep -q 'the plan: refused under' '$OUT/cli.out' && grep -q 'tools/call#\\\" is UNKNOWN: no rule of the policy allows it' '$OUT/cli.out' &&
          ! grep -q 'refused under' '$OUT/gen.plan'"
 else pass "the samples under their policies: not tried (the AWS host names do not resolve here)"; fi
+
+echo "== 9. the other adapters (step 6): watsonx, claude, langgraph, openai-agents; plan merge =="
+for d in watsonx-banking claude-reviewer claude-deployer langgraph-research openai-support; do cp -r "$SM/$d" "$OUT/"; done
+chmod -R a+rX "$OUT"/watsonx-banking "$OUT"/claude-* "$OUT"/langgraph-research "$OUT"/openai-support
+pgen() { python3 "$VAREK" plan generate "$@" > "$OUT/gen.plan" 2> "$OUT/cli.out"; }
+pgen --no-confine --from watsonx "$OUT/watsonx-banking"
+check "watsonx: three agents, none named: no plan, said why" sh -c \
+    "[ ! -s '$OUT/gen.plan' ] && grep -q 'the project has 3 agents' '$OUT/cli.out'"
+pgen --no-confine --from watsonx "$OUT/watsonx-banking" --agent banking_agent
+check "watsonx: the banking agent's toolkit, each tool it allows, its model at watsonx.ai in its region" sh -c \
+    "grep -q 'mcp_call https://banking.example.com/mcp method=tools/call name=get_balance\$' '$OUT/gen.plan' &&
+     grep -q 'action model net_connect us-south.ml.cloud.ibm.com:443\$' '$OUT/gen.plan'"
+check "... its collaborator's toolkit too (fx), said so" sh -c \
+    "grep -q 'mcp_call https://fx.example.com/mcp method=tools/call name=convert\$' '$OUT/gen.plan' &&
+     grep -q '^# collaborator fx_agent (of banking_agent)' '$OUT/gen.plan'"
+pgen --no-confine --from watsonx "$OUT/watsonx-banking" --agent banking_agent --watsonx-region eu-de --no-runtime
+check "... --watsonx-region gives the model's host; --no-runtime leaves the runtime's reads out" sh -c \
+    "grep -q 'net_connect eu-de.ml.cloud.ibm.com:443\$' '$OUT/gen.plan' && ! grep -q sys_usr '$OUT/gen.plan'"
+pgen --no-confine --policy "$OUT/watsonx-banking/banking.policy" --from watsonx "$OUT/watsonx-banking" --agent banking_agent; rc=$?
+check "watsonx: the banking agent's plan under the sample's policy: authorized" sh -c \
+    "[ $rc = 0 ] && grep -q 'the plan: authorized under' '$OUT/cli.out'"
+pgen --no-confine --policy "$OUT/watsonx-banking/banking.policy" --from watsonx "$OUT/watsonx-banking" --agent payments_agent; rc=$?
+check "... the payments agent's (tools: [\"*\"]): refused, its step naming no tool" sh -c \
+    "[ $rc = 1 ] && grep -q 'payments.example.com:443/mcp#tools/call#\" is UNKNOWN: no rule of the policy allows it' '$OUT/cli.out'"
+VAREK_HOME="$OUT/home" python3 "$VAREK" plan generate --log "$OUT/wx.log" -o "$OUT/wxc.plan" --from watsonx \
+    "$OUT/watsonx-banking" --agent banking_agent > "$OUT/cli.out" 2>&1
+python3 "$VAREK" plan generate --no-confine -o "$OUT/wx.plan" --from watsonx "$OUT/watsonx-banking" --agent banking_agent > /dev/null 2>&1
+check "watsonx under the Warden (the system's PyYAML, -I without -S): the same plan, nothing refused" sh -c \
+    "cmp -s '$OUT/wx.plan' '$OUT/wxc.plan' && ! grep -q '\"decision_final\":\"DENY\"' '$OUT/wx.log'"
+# claude: the CLI the SDK runs is a stub here (in the project, which the adapter may read under the
+# Warden, as it may /usr/ where the CLI is installed), the sample's policies naming it
+CLI="$OUT/claude-reviewer/.bin/claude"
+mkdir -m 755 "$OUT/claude-reviewer/.bin"; printf '#!/bin/sh\n' > "$CLI"; chmod 755 "$CLI"
+for s in reviewer deployer; do
+    sed "s|^allow exec /opt/claude/bin/claude\$|allow exec $CLI|" "$OUT/claude-$s/$s.policy" > "$OUT/$s.policy"
+done
+CL="--home /home/agent --cli $CLI"
+pgen --no-confine --from claude "$OUT/claude-reviewer" --app-dir /srv/reviewer $CL
+check "claude: Read/Grep a directory read, Write written, where the agent runs (--app-dir)" sh -c \
+    "grep -q 'file_open /srv/reviewer/src/ open=read\$' '$OUT/gen.plan' && grep -q 'file_open /srv/reviewer/reviews/\$' '$OUT/gen.plan'"
+check "... Bash(git diff:*) the program's launch, the CLI's, WebFetch's host, Anthropic's API, the CLI's state" sh -c \
+    "grep -q 'process_exec /usr/bin/git\$' '$OUT/gen.plan' && grep -q 'action claude_cli process_exec $CLI\$' '$OUT/gen.plan' &&
+     grep -q 'net_connect docs.python.org:443\$' '$OUT/gen.plan' && grep -q 'net_connect api.anthropic.com:443\$' '$OUT/gen.plan' &&
+     grep -q 'file_open /home/agent/.claude/\$' '$OUT/gen.plan'"
+check "... each mcp__SERVER__TOOL a step; the CLI's telemetry left out where its env turns it off" sh -c \
+    "grep -q 'mcp_call https://issues.example.com/mcp method=tools/call name=get_issue\$' '$OUT/gen.plan' &&
+     grep -q 'name=add_comment\$' '$OUT/gen.plan' && ! grep -q statsig '$OUT/gen.plan'"
+pgen --no-confine --from claude "$OUT/claude-reviewer" $CL --allow 'Bash(curl:*)' --app-dir /srv/reviewer
+check "... --allow adds the agent's own options' rules" grep -q 'process_exec /usr/bin/curl$' "$OUT/gen.plan"
+pgen --no-confine --policy "$OUT/reviewer.policy" --from claude "$OUT/claude-reviewer" --app-dir /srv/reviewer $CL; rc=$?
+check "claude: the reviewer's plan under its policy: authorized" sh -c "[ $rc = 0 ] && grep -q 'the plan: authorized under' '$OUT/cli.out'"
+pgen --no-confine --policy "$OUT/deployer.policy" --from claude "$OUT/claude-deployer" --app-dir /srv/deployer $CL; rc=$?
+check "... the deployer's (mcp__deploy, the server whole): refused, its step naming no tool" sh -c \
+    "[ $rc = 1 ] && grep -q 'deploy.example.com:443/mcp#tools/call#\" is UNKNOWN: no rule of the policy allows it' '$OUT/cli.out' &&
+     grep -q 'an allow rule grants it whole (mcp__deploy)' '$OUT/gen.plan'"
+VAREK_HOME="$OUT/home" python3 "$VAREK" plan generate --log "$OUT/cl.log" -o "$OUT/clc.plan" --from claude \
+    "$OUT/claude-reviewer" $CL > "$OUT/cli.out" 2>&1
+python3 "$VAREK" plan generate --no-confine -o "$OUT/cl.plan" --from claude "$OUT/claude-reviewer" $CL > /dev/null 2>&1
+check "claude under the Warden: the same plan, nothing refused" sh -c \
+    "cmp -s '$OUT/cl.plan' '$OUT/clc.plan' && ! grep -q '\"decision_final\":\"DENY\"' '$OUT/cl.log'"
+check "a code adapter (langgraph) is not run unconfined" sh -c \
+    "! python3 '$VAREK' plan generate --no-confine --from langgraph '$OUT/langgraph-research' > '$OUT/cli.out' 2>&1 &&
+     grep -q 'so it runs confined' '$OUT/cli.out'"
+# plan merge: a step in both written once, a label taken twice renamed
+python3 "$VAREK" plan merge -o "$OUT/m.plan" "$OUT/wx.plan" "$OUT/cl.plan" > "$OUT/cli.out" 2>&1
+nwx=$(grep -c '^action' "$OUT/wx.plan"); ncl=$(grep -c '^action' "$OUT/cl.plan"); nm=$(grep -c '^action' "$OUT/m.plan")
+check "plan merge: every step of each, the runtime's reads written once" sh -c \
+    "[ $nm = \$(( $nwx + $ncl - 8 )) ] && [ \$(grep -c 'action sys_usr file_open /usr/ open=read\$' '$OUT/m.plan') = 1 ]"
+check "... a label taken twice renamed (model), and the merged plan read as a plan" sh -c \
+    "grep -q '^action model net_connect us-south.ml.cloud.ibm.com:443\$' '$OUT/m.plan' &&
+     grep -q '^action model_2 net_connect api.anthropic.com:443\$' '$OUT/m.plan' &&
+     python3 '$VAREK' policy check --plan '$OUT/m.plan' '$OUT/reviewer.policy' > /dev/null 2>&1; [ \$? != 2 ]"
+# the code adapters, in the agent's own Python (VAREK_FW_PYTHON)
+FWPY=${VAREK_FW_PYTHON:-}
+if [ -n "$FWPY" ] && runuser -u nobody -- "$FWPY" -I -c 'import langgraph, langchain_anthropic, langchain_openai, langchain_mcp_adapters, agents' > /dev/null 2>&1; then
+    cgen() { VAREK_HOME="$OUT/home" python3 "$VAREK" plan generate --python "$FWPY" --log "$OUT/c.log" "$@" > "$OUT/gen.plan" 2> "$OUT/cli.out"; }
+    cgen --from langgraph "$OUT/langgraph-research" --graph researcher --app-dir /srv/research
+    check "langgraph under the Warden in the agent's Python: the graph's model, its MCP client's server, nothing refused" sh -c \
+        "grep -q 'action model net_connect api.anthropic.com:443\$' '$OUT/gen.plan' &&
+         grep -q 'mcp_call https://docs.example.com/mcp method=tools/call\$' '$OUT/gen.plan' &&
+         ! grep -q '\"decision_final\":\"DENY\"' '$OUT/c.log'"
+    check "... the graph's print as it is imported kept out of the plan (on standard error)" sh -c \
+        "! grep -q 'researcher built' '$OUT/gen.plan' && grep -q 'researcher built' '$OUT/cli.out'"
+    cgen --policy "$OUT/langgraph-research/research.policy" --from langgraph "$OUT/langgraph-research" --graph researcher --app-dir /srv/research; rc=$?
+    check "... the researcher's plan under the sample's policy: authorized" sh -c "[ $rc = 0 ] && grep -q 'the plan: authorized under' '$OUT/cli.out'"
+    cgen --policy "$OUT/langgraph-research/research.policy" --from langgraph "$OUT/langgraph-research" --graph publisher --app-dir /srv/research; rc=$?
+    check "... the publisher's (a factory; a stdio MCP server it launches): refused, the sub-agent named" sh -c \
+        "[ $rc = 1 ] && grep -q 'subagent step \"files\" is UNKNOWN: no rule of the policy launches a sub-agent by that name' '$OUT/cli.out' &&
+         ! grep -q '\"decision_final\":\"DENY\"' '$OUT/c.log'"
+    cgen --from openai-agents "$OUT/openai-support" --entry support.py:triage --app-dir /srv/support
+    check "openai-agents under the Warden: the handoff's agent too, the static filter's tools, the traces' host" sh -c \
+        "grep -q 'name=search_articles\$' '$OUT/gen.plan' && grep -q 'name=get_article\$' '$OUT/gen.plan' &&
+         grep -q \"agent billing's tool invoice_total\" '$OUT/gen.plan' && grep -q \"^#   api.openai.com:443: the SDK's traces\" '$OUT/gen.plan' &&
+         ! grep -q '\"decision_final\":\"DENY\"' '$OUT/c.log'"
+    cgen --policy "$OUT/openai-support/support.policy" --from openai-agents "$OUT/openai-support" --entry support.py:triage --app-dir /srv/support; rc=$?
+    check "... the triage agent's plan under the sample's policy: authorized" sh -c "[ $rc = 0 ] && grep -q 'the plan: authorized under' '$OUT/cli.out'"
+    cgen --policy "$OUT/openai-support/support.policy" --from openai-agents "$OUT/openai-support" --entry support.py:ops --app-dir /srv/support; rc=$?
+    check "... the ops agent's (no tool filter): refused, its step naming no tool" sh -c \
+        "[ $rc = 1 ] && grep -q 'ops.example.com:443/mcp#tools/call#\" is UNKNOWN: no rule of the policy allows it' '$OUT/cli.out'"
+else pass "the code adapters under the Warden: not tried (VAREK_FW_PYTHON names no Python with the frameworks that nobody can read)"; fi
 
 echo
 if [ "$fail" = 0 ]; then echo "test_v1350: PASS"; else echo "test_v1350: FAIL"; fi

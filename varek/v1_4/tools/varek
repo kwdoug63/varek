@@ -1255,9 +1255,19 @@ def policy_check_plan(path, plan, shown=None):
 # Warden: the system and the project read-only, no network, no launch.
 
 PLAN_ADAPTERS = {
-    # name: (what it reads, whether it reads data only: then --no-confine is offered)
+    # name: (what it reads, whether it reads data only: then --no-confine is offered, whether it uses the
+    # system's packages (PyYAML): then it runs without -S, still -I; its file in adapters/, named so it
+    # hides no framework's package)
     "agentcore": ("Amazon Bedrock AgentCore: an AgentCore CLI project's agentcore/ (agentcore.json, "
-                  "aws-targets.json, .cli/deployed-state.json), read as data", True),
+                  "aws-targets.json, .cli/deployed-state.json), read as data", True, False, "agentcore.py"),
+    "watsonx": ("IBM watsonx Orchestrate: an Agent Development Kit project's agent and toolkit specs "
+                "(YAML or JSON), read as data", True, True, "watsonx.py"),
+    "langgraph": ("LangGraph: the compiled graph langgraph.json names, imported in the agent's Python "
+                  "(--python), confined", False, False, "langgraph_plan.py"),
+    "openai-agents": ("the OpenAI Agents SDK: the Agent --entry FILE.py:ATTR names, imported in the agent's "
+                      "Python (--python), confined", False, False, "openai_agents.py"),
+    "claude": ("the Claude Agent SDK and Claude Code: a project's .claude/settings.json allow rules, .mcp.json "
+               "and .claude/agents/, read as data", True, False, "claude_agent.py"),
 }
 PLAN_KINDS = {"file_open", "net_connect", "process_exec", "mcp_call", "subagent", "credential"}
 PLAN_LABEL = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
@@ -1296,20 +1306,28 @@ def plan_text_problems(text):
     return n, problems
 
 
-def plan_confinement(project, adapter_dir, python):
+def plan_confinement(project, adapter_dir, python, env_dirs=()):
     """v1.35 step 5 (D5): the policy an adapter runs under: the system and the
     project read-only, the credential stores refused, no host, no launch
-    after its own"""
+    after its own; step 6: and the agent's Python environment read-only
+    (env_dirs), for an adapter that imports the agent's code"""
     L = ["# varek plan generate: the adapter's confinement (v1.35 step 5, D5): the system and the",
          "# project read-only, no network (no host rule), no launch after the adapter's own.",
          "require warden 1.29"]
-    for r, _ in varek_baseline.CREDENTIAL_DENIES + varek_baseline.SYSTEM_DENIES:
+    # step 6: the certificate authorities first, as the baseline has them (an agent's HTTP client reads
+    # its bundle as it loads: certifi's cacert.pem), then the key patterns, which refuse every other *.pem
+    for r, _ in varek_baseline.TRUST_READS + varek_baseline.CREDENTIAL_DENIES + varek_baseline.SYSTEM_DENIES:
         L.append(r)
     for d in ("/usr/", "/lib/", "/lib64/", "/etc/", "/proc/self/"):
         L.append(f"allow path {d} readonly")
     L += ["allow path exact /dev/null", "allow path exact /dev/urandom readonly",
-          "allow path exact /proc/sys/crypto/fips_enabled readonly"]     # OpenSSL's FIPS check (hashlib)
-    for d in (project, adapter_dir):
+          "allow path exact /proc/sys/crypto/fips_enabled readonly",     # OpenSSL's FIPS check (hashlib)
+          # step 6: what an agent's packages read of the machine as they load (the CPU count and the
+          # control group's limits), as the baseline allows
+          "allow path exact /proc/stat readonly", "allow path exact /proc/cpuinfo readonly",
+          "allow path exact /proc/meminfo readonly", "allow path /sys/devices/system/cpu/ readonly",
+          "allow path /sys/fs/cgroup/ readonly"]
+    for d in (project, adapter_dir) + tuple(env_dirs):
         L += [f"allow path exact {d} readonly", f"allow path {d}/ readonly"]
     L.append(f"allow exec {python}")
     return "\n".join(L) + "\n"
@@ -1320,8 +1338,8 @@ def cmd_plan_generate(args):
     if name not in PLAN_ADAPTERS:
         raise CliError(f"no adapter for {name!r}",
                        fix="the adapters: " + "; ".join(f"{k} ({v[0]})" for k, v in PLAN_ADAPTERS.items()))
-    about, data_only = PLAN_ADAPTERS[name]
-    adapter = os.path.join(varek_home(), "adapters", f"{name}.py")
+    about, data_only, system_site, script = PLAN_ADAPTERS[name]
+    adapter = os.path.join(varek_home(), "adapters", script)
     if not os.path.isfile(adapter):
         raise CliError(f"no adapter at {adapter}", fix="install VAREK (make install), or set VAREK_HOME")
     project = os.path.realpath(args.project)
@@ -1334,15 +1352,38 @@ def cmd_plan_generate(args):
     extra = list(args.adapter_args or [])
     if extra[:1] == ["--"]:
         extra = extra[1:]
-    python = os.path.realpath(sys.executable)
-    cmd = [python, "-I", "-S", adapter, project] + extra
+    # step 6: an adapter that imports the agent's code runs in the agent's
+    # own Python (--python: its virtual environment), whose packages it
+    # reads; one that reads data only runs without site packages (-S)
+    env_dirs = []
+    if data_only:
+        if args.python:
+            raise CliError(f"the {name} adapter reads data only: it takes no --python")
+        python = os.path.realpath(sys.executable)
+        cmd = [python, "-I", "-B"] + ([] if system_site else ["-S"]) + [adapter, project] + extra
+    else:
+        python = shutil.which(args.python) if args.python else os.path.realpath(sys.executable)
+        if not python:
+            raise CliError(f"--python {args.python}: no such interpreter")
+        q = run_cmd([python, "-I", "-c", "import sys; print(sys.prefix); print(sys.base_prefix)"], check=False,
+                    capture=True)
+        if q.returncode != 0:
+            raise CliError(f"{python} does not run as Python ({q.stderr.strip()[-200:]})")
+        env_dirs = sorted({os.path.realpath(d) for d in q.stdout.split()} - {"/usr", "/"})
+        if any(re.search(r"\s", d) for d in env_dirs):
+            raise CliError("the agent's Python environment's path has white space, which a policy rule cannot name")
+        cmd = [python, "-I", "-B", adapter, project] + extra      # -B: no bytecode written (-I ignores PYTHON*)
+    # the adapter's environment: nothing of the operator's (no key, token or
+    # path), so the agent's code it imports finds none
+    clean_env = {"PATH": varek_baseline.SYSTEM_PATH, "LANG": "C.UTF-8", "HOME": "/nonexistent",
+                 "PYTHONDONTWRITEBYTECODE": "1", "VAREK_PLAN_GENERATE": "1"}
     if args.no_confine:
         if not data_only:
             raise CliError(f"the {name} adapter imports the agent's code, so it runs confined",
                            fix="run as root (sudo), without --no-confine")
         print(_paint("2", f"[varek] running the {name} adapter unconfined (--no-confine): it reads the "
                           f"project as data"), file=sys.stderr)
-        r = run_cmd(cmd, check=False, capture=True)
+        r = run_cmd(cmd, check=False, capture=True, env=clean_env)
         out, err_lines, log = r.stdout, r.stderr.splitlines(), None
     else:
         need_root("plan generate (the adapter runs under the Warden; --no-confine for a data adapter)")
@@ -1354,13 +1395,13 @@ def cmd_plan_generate(args):
         try:
             pol = os.path.join(tmpd, f"{name}-adapter.policy")
             with open(pol, "w") as f:
-                f.write(plan_confinement(project, os.path.dirname(os.path.realpath(adapter)), python))
+                f.write(plan_confinement(project, os.path.dirname(os.path.realpath(adapter)), python, env_dirs))
             log = args.log or os.path.join(tmpd, f"{name}-adapter.log")
             print(_paint("2", f"[varek] running the {name} adapter under the Warden as {run_as}: the project "
                               f"read-only, no network"), file=sys.stderr)
             with open(log, "w") as errf:
                 r = run_cmd([w, pol, "--run-as", run_as, "--"] + cmd, check=False, capture=False,
-                            stdout=subprocess.PIPE, stderr=errf, text=True)
+                            stdout=subprocess.PIPE, stderr=errf, text=True, env=clean_env)
             out = r.stdout or ""
             with open(log, encoding="utf-8", errors="replace") as fh:
                 stream = fh.read().splitlines()
@@ -1400,6 +1441,70 @@ def cmd_plan_generate(args):
         finally:
             sys.stdout = saved
             os.unlink(f.name)
+    return 0
+
+
+def plan_steps(path):
+    """v1.35 step 6: a plan file's steps and edges, as varek plan merge reads
+    them: ([(label, kind, target, rest)], [(from, to)], comments)"""
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError as e:
+        raise CliError(f"cannot read the plan {path}: {e.strerror}")
+    n, problems = plan_text_problems(text)
+    if problems:
+        raise CliError(f"{path} is not a plan the Warden reads: " + "; ".join(problems[:3]))
+    steps, edges, notes = [], [], []
+    for line in text.splitlines():
+        t = line.strip()
+        if t.startswith("action "):
+            f = t.split(None, 4)
+            steps.append((f[1], f[2], f[3], f[4] if len(f) > 4 else ""))
+        elif t.startswith("edge "):
+            f = t.split()
+            edges.append((f[1], f[2]))
+        elif t.startswith("# from ") or t.startswith("# Written by"):
+            notes.append(t[2:])
+    return steps, edges, notes
+
+
+def cmd_plan_merge(args):
+    """v1.35 step 6: one plan from several (an AgentCore runtime's and its
+    framework's): every step of each, a step the same in two (kind, target
+    and fields) written once, a label taken twice renamed"""
+    out = ["# Written by `varek plan merge` (VAREK v1.35) from:"]
+    body, seen, labels, n = [], {}, set(), 0
+    for path in args.plans:
+        steps, edges, notes = plan_steps(path)
+        out.append(f"#   {path}" + (f": {notes[0]}" if notes else ""))
+        rename = {}
+        for lab, kind, target, rest in steps:
+            key = (kind, target, rest)
+            if key in seen:
+                rename[lab] = seen[key]          # its edges go to the step written already
+                continue
+            new, k = lab, 2
+            while new in labels:
+                new, k = f"{lab[:56]}_{k}", k + 1
+            labels.add(new)
+            seen[key] = rename[lab] = new
+            body.append(f"action {new} {kind} {target}" + (f" {rest}" if rest else ""))
+            n += 1
+        for a, b in edges:
+            if a in rename and b in rename and f"edge {rename[a]} {rename[b]}" not in body:
+                body.append(f"edge {rename[a]} {rename[b]}")
+    if n > 256:
+        raise CliError(f"the merged plan would have {n} steps: a plan has at most 256")
+    text = "\n".join(out + ["plan 1.35"] + body) + "\n"
+    if args.output:
+        if os.path.exists(args.output) and not args.force:
+            raise CliError(f"{args.output} exists", fix="--force to write over it")
+        with open(args.output + ".tmp", "w") as f:
+            f.write(text)
+        os.replace(args.output + ".tmp", args.output)
+        ok(f"{args.output}: a plan of {n} steps, from {len(args.plans)} plans")
+    else:
+        sys.stdout.write(text)
     return 0
 
 
@@ -2882,11 +2987,15 @@ def build_parser():
                          description="Run the framework's adapter (adapters/FRAMEWORK.py) on the agent's project, "
                                      "under the Warden (the project read-only, no network), and write the plan it "
                                      "writes. Options after PROJECT go to the adapter (agentcore: --runtime, "
-                                     "--target, --region, --gateway-url NAME=URL, --model-host HOST:PORT, --app-dir, "
-                                     "--no-runtime).")
+                                     "--target, --region, --gateway-url NAME=URL, --model-host HOST:PORT; watsonx: "
+                                     "--agent, --watsonx-region, --model-host; langgraph: --graph, --entry, --region, "
+                                     "--host, --file; openai-agents: --entry, --host, --file, --no-traces; claude: "
+                                     "--allow RULE, --cli, --home; each: --app-dir, --no-runtime). adapters/README.md "
+                                     "says what each reads.")
     x.add_argument("--from", dest="from_", required=True, metavar="FRAMEWORK",
                    help="the framework: " + ", ".join(PLAN_ADAPTERS))
-    x.add_argument("project", help="the agent's project (agentcore: the directory holding agentcore/)")
+    x.add_argument("project", help="the agent's project (agentcore: the directory holding agentcore/; "
+                                       "langgraph: the one holding langgraph.json; claude: the one holding .claude/)")
     x.add_argument("-o", "--output", help="write the plan here (default: standard output)")
     x.add_argument("--force", action="store_true", help="write over --output")
     x.add_argument("--policy", help="also decide the plan under this policy (pack or file), as `varek run "
@@ -2895,8 +3004,15 @@ def build_parser():
                    help="run an adapter that reads data only without the Warden (no root needed)")
     x.add_argument("--run-as", help="the adapter's user under the Warden (default: the user who ran sudo)")
     x.add_argument("--log", help="keep the adapter's run under the Warden (its verdict stream) here")
+    x.add_argument("--python", metavar="PATH", help="step 6: the agent's own Python (its virtual environment's "
+                   "python3), for an adapter that imports the agent's code (default: this one)")
     x.add_argument("adapter_args", nargs=argparse.REMAINDER)
     x.set_defaults(fn=cmd_plan_generate)
+    x = plsub.add_parser("merge", help="one plan from several (an AgentCore runtime's and its framework's)")
+    x.add_argument("plans", nargs="+", metavar="PLAN")
+    x.add_argument("-o", "--output", help="write the plan here (default: standard output)")
+    x.add_argument("--force", action="store_true", help="write over --output")
+    x.set_defaults(fn=cmd_plan_merge)
 
     sp = add("preflight", cmd_preflight, "check the deployment before running agents")
     sp.add_argument("--run", action="store_true", help="also do a real trial run and audit it (root)")

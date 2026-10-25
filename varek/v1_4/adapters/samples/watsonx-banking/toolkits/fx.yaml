@@ -1,0 +1,8 @@
+spec_version: v1
+kind: mcp
+name: fx
+description: Exchange rates
+transport: streamable_http
+url: https://fx.example.com/mcp
+tools:
+  - convert

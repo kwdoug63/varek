@@ -1,0 +1,23 @@
+# The framework versions the step-6 adapters were written against and tested
+# with (VAREK v1.35, docs/security/v1.35-frameworks.md). The code adapters
+# (langgraph, openai-agents) import the agent in the agent's own Python: these
+# are what its virtual environment held for test_v1350 section 9
+# (VAREK_FW_PYTHON). The data adapters read files and need none of these;
+# watsonx reads YAML with the system's PyYAML (python3-yaml).
+#
+#   python3 -m venv /var/tmp/varek-fw && /var/tmp/varek-fw/bin/pip install -r adapters/requirements-frameworks.txt
+langgraph==1.2.17
+langgraph-prebuilt==1.1.1
+langchain-core==1.7.0
+langchain-anthropic==1.7.6
+langchain-openai==1.7.2
+langchain-aws==1.9.0
+langchain-mcp-adapters==0.3.2
+openai-agents==0.24.0
+openai==3.37.0
+anthropic==1.17.0
+mcp==1.30.0
+# read as data by the adapters, not imported; installed to check the specs
+# and settings the samples hold against what the framework's own tools write
+ibm-watsonx-orchestrate==2.19.1
+claude-agent-sdk==0.2.174
