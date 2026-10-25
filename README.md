@@ -686,7 +686,7 @@ platform-gating CI coverage (now macOS, Windows, Linux).
 
 ## Documentation
 
-- **Spec paper:** [`varek-spec-paper-v1.32.0.md`](./varek-spec-paper-v1.32.0.md) — language and runtime specification, design rationale, the verdict model
+- **Spec paper:** [`varek-spec-paper-v1.34.0.md`](./varek-spec-paper-v1.34.0.md) — language and runtime specification, design rationale, the verdict model
 - **VAREK Enterprise on AWS:** [`docs/aws-deployment-guide.md`](./docs/aws-deployment-guide.md) — deploying and operating the [AWS Marketplace](https://aws.amazon.com/marketplace/pp/prodview-6fdmjpuimvx64) image
 - **Security:** [`docs/security/threat-model.md`](./docs/security/threat-model.md), [`docs/security/TRUSTED-COMPUTING-BASE.md`](./docs/security/TRUSTED-COMPUTING-BASE.md), [`docs/security/bypass-classes.md`](./docs/security/bypass-classes.md), [`RELEASE-v1.31.0.md`](./RELEASE-v1.31.0.md), [`RELEASE-v1.29.0.md`](./RELEASE-v1.29.0.md), [`RELEASE-v1.28.1.md`](./RELEASE-v1.28.1.md), [`RELEASE-v1.28.0.md`](./RELEASE-v1.28.0.md), [`RELEASE-v1.27.1.md`](./RELEASE-v1.27.1.md), [`RELEASE-v1.27.0.md`](./RELEASE-v1.27.0.md), [`RELEASE-v1.26.1.md`](./RELEASE-v1.26.1.md), [`RELEASE-v1.26.0.md`](./RELEASE-v1.26.0.md), [`RELEASE-v1.25.0.md`](./RELEASE-v1.25.0.md), [`RELEASE-v1.24.0.md`](./RELEASE-v1.24.0.md), [`RELEASE-v1.17.0.md`](./RELEASE-v1.17.0.md), [`RELEASE-v1.12.1.md`](./RELEASE-v1.12.1.md), [`RELEASE-v1.12.0.md`](./RELEASE-v1.12.0.md), [`RELEASE-v1.9.3.md`](./RELEASE-v1.9.3.md), [`RELEASE-v1.9.2.md`](./RELEASE-v1.9.2.md), [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md)
 - **Standards:** [`docs/standards/agent-baseline.md`](./docs/standards/agent-baseline.md) — the Agent Baseline's controls, what in VAREK addresses each and how far
