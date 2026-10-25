@@ -1181,6 +1181,8 @@ def policy_identity(checker, policy):
             sub[int(f[1])] = f[2]
         elif line == "require on-behalf-of":
             req = True
+        elif line == "require plan":
+            pass                                   # v1.35 step 4b: policy_requires_plan reads it
         elif f[0] == "mcp-resource" and len(f) == 3:                  # v1.31
             mres[f[1]] = None if f[2] == "-" else f[2]
         elif f[0] in ("confined", "for") and len(f) in (3, 6):
@@ -1188,6 +1190,15 @@ def policy_identity(checker, policy):
         elif line.strip():
             raise ValueError(f"an unexpected line from the checker: {line!r}")
     return iss, dom, sub, req, mres
+
+
+def policy_requires_plan(checker, policy):
+    """v1.35 step 4b (D7): whether the policy says `require plan`, as the
+    checker reads it (`identity`)"""
+    q = subprocess.run([checker, policy, "identity"], capture_output=True, text=True)
+    if q.returncode != 0:
+        raise ValueError(q.stderr.strip() or "the checker has no identity mode")
+    return "require plan" in q.stdout.splitlines()
 
 
 def policy_confined(checker, policy):
@@ -3661,6 +3672,11 @@ def main(argv=None):
         problems.append(f"checker failed on the policy's identities: {e}")
         ident = ({}, {}, {}, False, {})
     per_sub = check_chain(ident, meta, records, run, problems)
+    try:                                                                                   # v1.35 step 4b
+        if policy_requires_plan(a.checker, a.policy) and not isinstance(meta.get("run_start", {}).get("hold"), dict):
+            problems.append("the policy says `require plan`, and run_start holds the run to no plan")
+    except (OSError, ValueError) as e:
+        problems.append(f"checker failed on the policy's identities: {e}")
     try:                                                                                   # v1.31 (section 6)
         confined6, forl6 = policy_confined(a.checker, a.policy)
     except ValueError as e:

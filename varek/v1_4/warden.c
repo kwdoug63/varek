@@ -831,6 +831,8 @@ struct node_run {
     int    set_view;            /* the launch set the launcher reads, a sealed memfd */
     char  *set_text;            /* its text, one path a line */
     char   policy_sha[65];      /* v1.34 step 5: the plugin's SHA-256 of the policy it wrote the filter for, or "" */
+    char   plan[64];            /* v1.35 step 4c (D11): the pod's plan, by name (varek.dev/plan), or "" */
+    char   plan_sha[65];        /* the plugin's SHA-256 of the plan it checked the policy with, or "" */
     char   dns[80];             /* v1.34 step 4: the pod's DNS server, "a.b.c.d:53" (its resolv.conf), or "" */
     struct sock_filter *bpf;    /* the Warden's own filter for the policy, compiled */
     unsigned nbpf;
@@ -1778,6 +1780,8 @@ static plan_decision_t plan_step_decide(const struct warden_plan_ud *u, const pl
         if (as && ver < 135) why = "an as= field needs `plan 1.35` as the plan's first line";
         else if (as && !(act.plan_psubj = plan_subject(u->policy, as, &why))) { }
         else if (newkind && ver < 135) why = "this kind of step needs `plan 1.35` as the plan's first line";
+        else if (newkind && g_nr.on)                                    /* v1.35 step 4c (D11) */
+            why = "the node agent does not carry this kind of step yet (v1.36)";
         else if (newkind && !strcmp(a->kind, "credential")) pd = plan_cred_decide(u->policy, a, &act, &why);
         else if (newkind && !strcmp(a->kind, "subagent")) pd = plan_subagent_decide(u, a, &act, &why);
         else if (newkind) {                                             /* mcp_call */
@@ -1942,11 +1946,12 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
  * otherwise. Emits a plan-level pathology record to stderr. v1.35 step 2
  * (D9): and chained plan_step and plan_gate records, unless `records` is
  * false (--check-startup, which opens no stream). */
-static int warden_verify_plan(const char *plan_path,
-                              const struct policy *policy, bool records)
+/* v1.35 step 4c: a plan read already (parsed, or NULL with err): under the
+ * node agent it is read in the node's view and decided in the container's
+ * (node_supervise); it is freed here */
+static int warden_verify_plan_parsed(plan_parsed_t *parsed, const char *err, const char *plan_path,
+                                     const struct policy *policy, bool records)
 {
-    char err[256] = {0};
-    plan_parsed_t *parsed = plan_parser_load(plan_path, err, sizeof(err));
     if (!parsed) {
         fprintf(stderr, "[warden] plan load failed: %s\n", err);
         if (records) emit_plan_gate_basic(plan_path, 0, 0, PLAN_DEC_UNKNOWN, err);
@@ -1978,6 +1983,14 @@ static int warden_verify_plan(const char *plan_path,
             "[warden] plan authorized (%zu actions); proceeding to supervise\n",
             n_actions);
     return 0;
+}
+
+static int warden_verify_plan(const char *plan_path,
+                              const struct policy *policy, bool records)
+{
+    char err[256] = {0};
+    plan_parsed_t *parsed = plan_parser_load(plan_path, err, sizeof(err));
+    return warden_verify_plan_parsed(parsed, err, plan_path, policy, records);
 }
 
 /* ---------------- Pathology Report ---------------- */
@@ -5572,7 +5585,8 @@ static void usage(const char *argv0) {
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
         "       %s <policies dir | policy.txt> --node-agent <socket> --node-streams <dir>\n"
         "              [--node-launcher <varek-init>]   (v1.34: the node agent, one supervisor a container)\n"
-        "       %s <policy.txt> --oci-filter   (v1.34: the policy's filter in OCI's form, for the NRI plugin)\n"
+        "       %s <policy.txt> --oci-filter [--plan PLAN | --no-plan]   (v1.34: the policy's filter in OCI's form, for the\n"
+        "              NRI plugin; v1.35: with the pod's plan, or for a pod that names none)\n"
         , argv0, argv0, argv0, argv0);
     fprintf(stderr,
         "\n"
@@ -5710,11 +5724,12 @@ int main(int argc, char **argv) {
      * state directory, lock and table, and --gate-status), then exits: 0 if
      * the Warden would start, 1 with the reason otherwise. No agent runs and
      * no verdict stream is written. tools/varek_preflight.sh uses it. */
-    bool oci_only = false;
+    bool oci_only = false, oci_no_plan = false;
     for (int i = 2; i < argc && strcmp(argv[i], "--"); i++)
         if (!strcmp(argv[i], "--check-startup")) g_check_only = true;
         else if (!strcmp(argv[i], "--check-credentials")) g_check_only = g_check_creds = true;   /* v1.28 */
         else if (!strcmp(argv[i], "--oci-filter")) oci_only = true;                             /* v1.34 step 3 */
+        else if (!strcmp(argv[i], "--no-plan")) oci_no_plan = true;                             /* v1.35 step 4c */
     if (argc < (g_check_only || oci_only ? 3 : 4)) { usage(argv[0]); return 2; }
 
     const char *policy_path = argv[1];
@@ -5740,7 +5755,7 @@ int main(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) { sep_idx = i; break; }
         if (strcmp(argv[i], "--check-startup") == 0 || strcmp(argv[i], "--check-credentials") == 0 ||
-            strcmp(argv[i], "--oci-filter") == 0) continue;
+            strcmp(argv[i], "--oci-filter") == 0 || strcmp(argv[i], "--no-plan") == 0) continue;
         if (i + 1 >= argc) { usage(argv[0]); return 2; }
         if (strcmp(argv[i], "--plan") == 0 && !plan_path) {
             plan_path = argv[++i];
@@ -5830,8 +5845,10 @@ int main(int argc, char **argv) {
 
     /* v1.34 step 3: the filter in OCI's form, for the NRI plugin */
     if (oci_only) {
-        if (sep_idx >= 0 || g_check_only || node_sock || g_dry || plan_path) {
-            fprintf(stderr, "[warden] --oci-filter takes the policy alone\n");
+        if (sep_idx >= 0 || g_check_only || node_sock || g_dry || flow_path || g_hold_req ||
+            (plan_path && oci_no_plan)) {
+            fprintf(stderr, "[warden] --oci-filter takes the policy, and the pod's plan (--plan PLAN) or "
+                    "--no-plan\n");
             return 2;
         }
         static struct policy op;
@@ -5843,7 +5860,19 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[warden] --oci-filter: the node agent does not carry %s yet\n", no);
             return 1;
         }
+        /* v1.35 step 4c (D11): with the pod's plan (--plan), or for a pod
+         * that names none (--no-plan), which a policy that says `require
+         * plan` refuses; the policy alone (a VarekPolicy) is checked as before */
         char why[200];
+        if (oci_no_plan && op.v.require_plan) {
+            fprintf(stderr, "[warden] --oci-filter: the policy says `require plan`: a pod under it names its plan "
+                    "(varek.dev/plan)\n");
+            return 1;
+        }
+        if (plan_path && node_plan_carried(plan_path, why, sizeof why) < 0) {
+            fprintf(stderr, "[warden] --oci-filter: the plan %s: %s\n", plan_path, why);
+            return 1;
+        }
         if (wd_oci_filter_write(stdout, op.v.open_as_agent ? WD_FILTER_CHANGES : 0, why, sizeof why) < 0 ||
             fflush(stdout) != 0) {
             fprintf(stderr, "[warden] --oci-filter: %s\n", why);
@@ -5851,13 +5880,15 @@ int main(int argc, char **argv) {
         }
         return 0;
     }
-    if ((node_sock && (sep_idx >= 0 || g_check_only || !node_streams || g_writable_exec)) ||
-        (node_launcher && !node_sock)) {                                    /* v1.34 step 2 */
-        fprintf(stderr, "[warden] --node-agent takes --node-streams DIR, and no agent (\"--\"), check or "
-                "--writable-exec (a pod's mounts are checked, D4); --node-launcher goes with --node-agent\n");
+    if ((node_sock && (sep_idx >= 0 || g_check_only || !node_streams || g_writable_exec || plan_path ||
+                       flow_path || g_hold_req)) ||
+        (node_launcher && !node_sock) || (oci_no_plan && !oci_only)) {     /* v1.34 step 2 */
+        fprintf(stderr, "[warden] --node-agent takes --node-streams DIR, and no agent (\"--\"), check, plan (each "
+                "pod names its own, v1.35) or --writable-exec (a pod's mounts are checked, D4); --node-launcher "
+                "goes with --node-agent, --no-plan with --oci-filter\n");
         return 2;
     }
-    if (node_sock && node_listen(node_sock, node_streams, node_launcher, &policy_path) < 0) return 1;
+    if (node_sock && node_listen(node_sock, node_streams, node_launcher, &policy_path, &plan_path) < 0) return 1;
     /* from here, under the node agent, the supervisor of one container */
     if (!g_check_only && !g_nr.on && (sep_idx < 0 || sep_idx + 1 >= argc)) { usage(argv[0]); return 2; }
     /* v1.35 step 4: the hold needs a plan to hold to; its path and hash are
@@ -5991,6 +6022,8 @@ int main(int argc, char **argv) {
     }
     /* v1.35 step 4 (D7): a policy that says `require plan` runs an agent only
      * with a plan it is held to */
+    if (p.v.require_plan && g_nr.on && !plan_path)                       /* v1.35 step 4c (D11) */
+        node_fail("its policy says `require plan`, and its pod names no plan (varek.dev/plan)");
     if (p.v.require_plan && !g_nr.on && (!plan_path || !g_hold_req)) {
         if (g_check_only) {
             fprintf(stderr, "[warden] note: the policy says `require plan`: a run needs a plan it is held to "
@@ -6476,8 +6509,11 @@ int main(int argc, char **argv) {
 
     /* v1.6 pre-execution plan verification. Fires before fork; on
      * any non-SATISFIED result the target is not started. */
-    g_hold_collect = g_hold_req;                  /* v1.35 step 4: each step that passes */
-    if (plan_path && g_flow_cfg) {
+    g_hold_collect = g_hold_req && !g_nr.on;      /* v1.35 step 4: each step that passes */
+    if (g_nr.on) {
+        /* v1.35 step 4c: the pod's plan is decided in node_supervise, in the
+         * container's view, after run_start */
+    } else if (plan_path && g_flow_cfg) {
         /* v1.18.0: node + flow check, refusal breaker (exit 3, 4 or 5). */
         int gate = warden_gate_plan_flow(plan_path, &p);
         if (gate != GATE_PASS) {
@@ -6490,7 +6526,7 @@ int main(int argc, char **argv) {
         if (g_sk) sodium_free(g_sk);
         return 1;
     }
-    if (g_hold_req) {                                                      /* v1.35 step 4 */
+    if (g_hold_req && !g_nr.on) {                                          /* v1.35 step 4 */
         g_hold_collect = false;
         g_hold_on = true;
         fprintf(stderr, "[warden] the run is held to its plan: %zu entries; a call the policy allows "
@@ -6504,7 +6540,13 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGCHLD, &sa, NULL);
 
-    if (g_nr.on) return node_supervise(&p, boot_path, policy_path);         /* v1.34 step 2 */
+    if (g_nr.on) {                                                         /* v1.34 step 2 */
+        /* v1.35 step 4c: the pod's plan read here, in the node's view (its
+         * copy beside the stream), decided in the container's */
+        static char perr[256];
+        plan_parsed_t *pp = plan_path ? plan_parser_load(plan_path, perr, sizeof perr) : NULL;
+        return node_supervise(&p, boot_path, policy_path, plan_path, pp, perr);
+    }
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {

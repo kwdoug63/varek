@@ -1095,6 +1095,7 @@ def cmd_policy_show(args):
     # v1.28.1: whom a run acts for, as the certificate checker reads the policy
     iq = run_cmd([tool("vdp_cert_check"), path, "identity"], capture=True)
     issuers, domains, subs, req, mres = [], [], [], False, []
+    req_plan = False
     for ln in iq.stdout.splitlines() if iq.returncode == 0 else []:
         f = ln.split(" ")
         if len(f) == 4 and f[0] == "issuer":
@@ -1105,6 +1106,8 @@ def cmd_policy_show(args):
             subs.append(f[1:])
         elif ln == "require on-behalf-of":
             req = True
+        elif ln == "require plan":                                    # v1.35 step 4b
+            req_plan = True
         elif len(f) == 3 and f[0] == "mcp-resource":                  # v1.31
             mres.append(f[1:])
     for url, aud in mres:
@@ -1117,6 +1120,9 @@ def cmd_policy_show(args):
         info(f"SPIFFE   {dom}: the agent's SVID is verified against {bundle} (--agent-svid)")
     if req:
         info("Requires a verified user: a run without --on-behalf-of refuses to start")
+    if req_plan:
+        info("Requires a plan: a run without one it is held to refuses to start (--plan PLAN --hold-to-plan; "
+             "under the node agent, the pod's varek.dev/plan)")
     if subs:
         info(f"Sub-agents ({len(subs)} rule(s)): each launch runs in its own control group, and every call it "
              f"makes is recorded as for it")

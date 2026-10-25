@@ -59,6 +59,15 @@
 #      and the anchor, which holds both runs' checkpoints; the streams root's
 #      (0600), the policies read-only; the node exporter
 #      (tools/varek_node_export.py) gives both runs as OCSF.
+# v1.35 step 4c (D11):
+#   9. plans under the node agent: --oci-filter with the pod's plan
+#      (--plan) or none (--no-plan, refused under `require plan`), a plan
+#      with a step the node agent does not carry refused; a pod's plan
+#      (varek.dev/plan) decided in the container's view and the run held to
+#      it (a read no step covers refused, outside_plan), the plan copied
+#      beside the stream, run_start naming it, the audit; refused: no plan
+#      under `require plan`, a plan the policy does not allow, an mcp_call
+#      step, another SHA-256 or none, no such plan, one policy file.
 #
 #   test_v1340.sh VDP_CHECK VDP_CERT_CHECK WARDEN [VAREK_INIT]
 set -u
@@ -365,6 +374,13 @@ if ann != "-":
     sha = hashlib.sha256(open(pf, "rb").read()).hexdigest() if os.path.isfile(pf) else "0" * 64
     c["annotations"] = {"varek.dev/policy": ann, "varek.dev/pod-namespace": "team-a"}
     if "no-sha" not in opts: c["annotations"]["varek.dev/policy-sha256"] = "f" * 64 if "bad-sha" in opts else sha
+    # v1.35 step 4c: the pod's plan (plan=NAME), as the plugin adds it, or plan-no-sha, plan-bad-sha
+    for o in opts:
+        if o.startswith("plan="):
+            pl = B + "/pol/team-a/" + o[5:] + ".plan"
+            c["annotations"]["varek.dev/plan"] = o[5:]
+            psha = hashlib.sha256(open(pl, "rb").read()).hexdigest() if os.path.isfile(pl) else "0" * 64
+            if "plan-no-sha" not in opts: c["annotations"]["varek.dev/plan-sha256"] = "e" * 64 if "plan-bad-sha" in opts else psha
 for m in c["mounts"]:
     if m["destination"] == "/dev": m["options"].append("noexec")      # as the NRI plugin makes it
 c["mounts"].append({"destination": "/varek/init", "type": "bind", "source": B + ("/other-init" if "other-init" in opts else "/varek-init"),
@@ -566,6 +582,61 @@ PY
         --state "$B/export.state" > "$B/export2.out" 2>&1
     check "... the streams done in its state, not exported again when it starts again" sh -c \
         "[ \"\$(wc -l < '$B/export.state')\" = 2 ] && [ ! -s '$B/ocsf2.jsonl' ]"
+fi
+
+echo "== 9. plans under the node agent (v1.35 step 4c, D11) =="
+if [ -z "$WARDEN" ] || ! declare -f lbundle > /dev/null; then
+    skip "plans under the node agent (need the launcher, as section 6)"
+else
+    check "--node-agent with --plan is refused (each pod names its own)" sh -c \
+        "'$WARDEN' '$B/pol' --node-agent '$B/s/x.sock' --node-streams '$B/streams' --plan /dev/null; [ \$? = 2 ]"
+    printf 'require warden 1.35\nrequire plan\nallow path /data/allowed readonly\nallow path /data/denied readonly\nallow path /ok readonly\nallow path /work/\nallow exec /ok\n' > "$P/held.policy"
+    printf 'plan 1.35\naction a file_open /data/allowed open=read\n' > "$P/held.plan"
+    printf 'plan 1.35\naction a file_open /data/rootonly open=read\n' > "$P/over.plan"
+    printf 'plan 1.35\naction a file_open /data/allowed open=read\naction m mcp_call http://10.0.0.1:8080/mcp method=tools/call name=x\n' > "$P/mcp.plan"
+    chmod 644 "$P/"*.policy "$P/"*.plan
+    "$WARDEN" "$P/held.policy" --oci-filter --plan "$P/held.plan" > "$B/f/held.json" 2> "$B/f/held.err"; hrc=$?
+    "$WARDEN" "$P/held.policy" --oci-filter > "$B/f/held0.json" 2>/dev/null
+    check "--oci-filter --plan: the pod's plan read; the filter the policy's own" sh -c "[ $hrc = 0 ] && cmp -s '$B/f/held.json' '$B/f/held0.json'"
+    "$WARDEN" "$P/held.policy" --oci-filter --no-plan > /dev/null 2> "$B/f/np.err"; nrc=$?
+    check "--oci-filter --no-plan under \`require plan\`: refused, said why" sh -c \
+        "[ $nrc = 1 ] && grep -q 'a pod under it names its plan (varek.dev/plan)' '$B/f/np.err'"
+    check "... under a policy without it: written" sh -c "'$WARDEN' '$P/plain.policy' --oci-filter --no-plan > /dev/null 2>&1"
+    "$WARDEN" "$P/held.policy" --oci-filter --plan "$P/mcp.plan" > /dev/null 2> "$B/f/mcp.err"; mrc=$?
+    check "--oci-filter --plan with an mcp_call step: refused (the node agent does not carry it yet)" sh -c \
+        "[ $mrc = 1 ] && grep -q 'does not carry mcp_call steps yet (step m)' '$B/f/mcp.err'"
+    check "--oci-filter with --plan and --no-plan: refused" sh -c \
+        "'$WARDEN' '$P/held.policy' --oci-filter --plan '$P/held.plan' --no-plan > /dev/null 2>&1; [ \$? = 2 ]"
+    lbundle held "$B/s/l.sock" "$B/f/held.json" held "/varek/init -- /probe" plan=held; run held
+    sed 's/^/     /' "$B/held.out"
+    check "a pod's plan: the command ran, a read a step covers answered" said held "read_allowed: ok allowed content"
+    check "... a read the policy allows and no step covers: refused, outside_plan" sh -c \
+        "grep -qx 'read_denied: EACCES' '$B/held.out' && grep -F '\"resolved\":\"/data/denied\"' '$(stream l held)' | grep -q '\"decision_raw\":\"ALLOW\",\"decision_final\":\"DENY\",\"rule\":\"outside_plan\"'"
+    HC="$(stream l held | sed 's/\.jsonl$/.plan/')"
+    check "the plan, from the pod's namespace, copied beside the stream (read-only); run_start names it and holds the run to the copy" sh -c \
+        "cmp -s '$HC' '$P/held.plan' && [ \"\$(stat -c %a '$HC')\" = 400 ]" 
+    check "... run_start: the plan by its name, the hold on its copy" rec l held \
+        'S and S[0]["node"]["plan"] == "held" and S[0]["hold"]["plan"].endswith(".plan") and S[0]["hold"]["plan"] == "'"$HC"'"'
+    if [ -n "$CERT" ]; then
+        check "... and the audit accepts its stream (a held run under the node agent)" \
+            python3 "$HERE/tools/varek_audit.py" --policy "$(stream l held | sed 's/\.jsonl$/.policy/')" --checker "$CERT" "$(stream l held)"
+    fi
+    lbundle noplan "$B/s/l.sock" "$B/f/held.json" held "/varek/init -- /probe"; run noplan
+    check "\`require plan\`, a pod naming no plan: refused" refused l noplan 'its pod names no plan'
+    lbundle over "$B/s/l.sock" "$B/f/held.json" held "/varek/init -- /probe" plan=over; run over
+    check "a plan with a step the policy does not allow: refused, its records in the stream" sh -c \
+        "! grep -q '^read_allowed' '$B/over.out' && grep -q 'its plan is refused' '$(stream l over)' && grep -q '\"event\":\"plan_gate\"' '$(stream l over)'"
+    lbundle mcp "$B/s/l.sock" "$B/f/held.json" held "/varek/init -- /probe" plan=mcp; run mcp
+    check "a plan with an mcp_call step: the step UNKNOWN under the node agent, the plan refused" sh -c \
+        "! grep -q '^read_allowed' '$B/mcp.out' && grep -q 'the node agent does not carry this kind of step yet' '$(stream l mcp)'"
+    lbundle pbad "$B/s/l.sock" "$B/f/held.json" held "/varek/init -- /probe" plan=held plan-bad-sha; run pbad
+    check "a plan not the one the plugin checked (another SHA-256): refused" refused l pbad 'the plan .* is not the one the NRI plugin'
+    lbundle pnosha "$B/s/l.sock" "$B/f/held.json" held "/varek/init -- /probe" plan=held plan-no-sha; run pnosha
+    check "a plan without the plugin's SHA-256 of it: refused" refused l pnosha 'with it (no varek.dev/plan-sha256'
+    lbundle pnone "$B/s/l.sock" "$B/f/held.json" held "/varek/init -- /probe" plan=nosuch; run pnone
+    check "a plan name with no file: refused" refused l pnone 'no plan named nosuch'
+    lbundle p1 "$B/s/a.sock" "$B/f/plain.json" plain "/varek/init -- /probe" plan=held; run p1
+    check "a plan under a node agent with one policy file: refused" refused a p1 'this node agent has one policy'
 fi
 
 echo
