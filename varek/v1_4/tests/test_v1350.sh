@@ -26,6 +26,9 @@
 #   7. `require plan` (step 4b, D7): a run without a held plan refused; the
 #      audit and `varek policy show`; the grammar (1.35, once), both parsers
 #      alike; the node agent carries it, a pod naming no plan refused (4c)
+#   8. `varek plan generate --from agentcore` (step 5, D5): the adapter on
+#      the two samples (adapters/samples/), what it refuses, the command,
+#      the adapter under the Warden, each sample's plan under its policy
 #
 # Usage: test_v1350.sh <warden> (tools/varek, tools/vdp_cert_check beside it)
 set -u
@@ -328,6 +331,96 @@ grep -qx 'require plan' "$OUT/id1" && cmp -s "$OUT/id1" "$OUT/id2" \
 "$WARDEN" "$RP" --oci-filter --no-plan > /dev/null 2> "$OUT/rp.err"
 [ $? = 1 ] && grep -q 'a pod under it names its plan' "$OUT/rp.err" \
     && pass "require plan: a pod naming no plan refused (--oci-filter --no-plan)" || flunk "require plan: --no-plan"
+
+echo "== 8. varek plan generate --from agentcore (step 5, D5) =="
+AD="$HERE/adapters/agentcore.py"
+SM="$HERE/adapters/samples"
+cp -r "$SM/agentcore-weather" "$SM/agentcore-travel" "$OUT/"
+chmod -R a+rX "$OUT/agentcore-weather" "$OUT/agentcore-travel"
+gen() { python3 -I "$AD" "$@" > "$OUT/gen.plan" 2> "$OUT/gen.err"; }
+WGW=https://weather-tools-q1w2e3r4t5.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp
+gen "$OUT/agentcore-weather"
+check "the adapter: a plan 1.35 from the weather sample's agentcore.json" sh -c "[ \$(grep -cx 'plan 1.35' '$OUT/gen.plan') = 1 ]"
+check "... its gateway's MCP calls, each tool as the gateway names it (TARGET___TOOL)" sh -c \
+    "grep -qx 'action gw_weather-tools_initialize mcp_call $WGW method=initialize' '$OUT/gen.plan' &&
+     grep -q 'mcp_call $WGW method=tools/list\$' '$OUT/gen.plan' &&
+     grep -q 'mcp_call $WGW method=tools/call name=forecast___get_forecast\$' '$OUT/gen.plan' &&
+     grep -q 'mcp_call $WGW method=tools/call name=forecast___get_alerts\$' '$OUT/gen.plan'"
+check "... the AWS hosts its features reach, in its region (Identity and Memory, X-Ray, CloudWatch Logs)" sh -c \
+    "grep -q 'net_connect bedrock-agentcore.us-east-1.amazonaws.com:443\$' '$OUT/gen.plan' &&
+     grep -q 'net_connect xray.us-east-1.amazonaws.com:443\$' '$OUT/gen.plan' &&
+     grep -q 'net_connect logs.us-east-1.amazonaws.com:443\$' '$OUT/gen.plan'"
+check "... its session storage (read and written), its code at the Dockerfile's WORKDIR, the runtime's reads" sh -c \
+    "grep -q 'file_open /mnt/session/\$' '$OUT/gen.plan' && grep -q 'file_open /app/ open=read\$' '$OUT/gen.plan' &&
+     grep -q 'action sys_usr file_open /usr/ open=read' '$OUT/gen.plan'"
+check "... no model host unless named (the framework's, not agentcore.json's); its credential a comment, not a step" sh -c \
+    "! grep -q bedrock-runtime '$OUT/gen.plan' && grep -q '^#   forecast-api-key (ApiKeyCredentialProvider)' '$OUT/gen.plan' &&
+     ! grep -q '^action [^ ]* credential ' '$OUT/gen.plan'"
+gen "$OUT/agentcore-weather" --model-host bedrock-runtime.us-east-1.amazonaws.com:443 --no-runtime
+check "--model-host names the model's host; --no-runtime leaves out the runtime's own reads" sh -c \
+    "grep -q 'action model net_connect bedrock-runtime.us-east-1.amazonaws.com:443' '$OUT/gen.plan' && ! grep -q sys_usr '$OUT/gen.plan'"
+gen "$OUT/agentcore-travel"
+TGW=https://travel-tools-z9x8c7v6b5.gateway.bedrock-agentcore.us-west-2.amazonaws.com/mcp
+check "the travel sample: CodeZip's code at /var/task; a target whose tools the gateway lists live: one step naming no tool, said so" sh -c \
+    "grep -q 'file_open /var/task/ open=read' '$OUT/gen.plan' && grep -q 'mcp_call $TGW method=tools/call\$' '$OUT/gen.plan' &&
+     ! grep -q 'name=flights___' '$OUT/gen.plan' && grep -q 'target hotels: its tools are an MCP server' '$OUT/gen.plan' &&
+     ! grep -q bedrock-agentcore.us-west-2.amazonaws.com:443 '$OUT/gen.plan'"
+# what the adapter refuses
+cp -r "$OUT/agentcore-weather" "$OUT/w2"
+python3 - "$OUT/w2/agentcore/agentcore.json" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+r = dict(d["runtimes"][0]); r["name"] = "second_agent"; d["runtimes"].append(r)
+d["agentCoreGateways"][0]["enableSemanticSearch"] = True
+json.dump(d, open(p, "w"))
+PY
+gen "$OUT/w2"
+check "two runtimes, none named: no plan, said why" sh -c "[ ! -s '$OUT/gen.plan' ] && grep -q 'name one with --runtime' '$OUT/gen.err'"
+gen "$OUT/w2" --runtime second_agent
+check "... --runtime names one; semantic search on: the gateway's own search tool a step" sh -c \
+    "grep -q 'runtime second_agent' '$OUT/gen.plan' && grep -q 'name=x_amz_bedrock_agentcore_search\$' '$OUT/gen.plan'"
+rm "$OUT/w2/agentcore/.cli/deployed-state.json"
+gen "$OUT/w2" --runtime weather_agent
+check "a gateway not deployed (no URL): no plan, said why" sh -c "[ ! -s '$OUT/gen.plan' ] && grep -q 'gateway weather-tools has no URL' '$OUT/gen.err'"
+gen "$OUT/w2" --runtime weather_agent --gateway-url weather-tools=https://gw.example.com/mcp
+check "... --gateway-url gives it" grep -q 'mcp_call https://gw.example.com/mcp method=tools/list' "$OUT/gen.plan"
+echo '{"runtimes": [' > "$OUT/w2/agentcore/agentcore.json"
+gen "$OUT/w2"
+check "a project file that is not JSON: no plan, said why" sh -c "[ ! -s '$OUT/gen.plan' ] && grep -q 'is not JSON' '$OUT/gen.err'"
+# the command
+python3 "$VAREK" plan generate --no-confine -o "$OUT/w.plan" --from agentcore "$OUT/agentcore-weather" > "$OUT/cli.out" 2>&1
+python3 -I "$AD" "$OUT/agentcore-weather" > "$OUT/direct.plan"
+check "varek plan generate --no-confine -o: the plan written, its steps counted" sh -c \
+    "grep -q 'a plan of 18 steps, from' '$OUT/cli.out' && cmp -s '$OUT/w.plan' '$OUT/direct.plan'"
+python3 "$VAREK" plan generate --no-confine -o "$OUT/w.plan" --from agentcore "$OUT/agentcore-weather" > "$OUT/cli.out" 2>&1
+check "... an existing file not written over without --force" sh -c "[ \$? != 0 ] || grep -q 'exists' '$OUT/cli.out'"
+check "... a framework with no adapter: refused, the adapters named" sh -c \
+    "! python3 '$VAREK' plan generate --no-confine --from langgraph '$OUT/agentcore-weather' > '$OUT/cli.out' 2>&1 && grep -q 'no adapter for' '$OUT/cli.out'"
+# under the Warden (D5): the adapter as an agent, the project read-only, no network
+mkdir -m 755 "$OUT/home"; cp -r "$HERE/adapters" "$OUT/home/"; chmod -R a+rX "$OUT/home/adapters"
+ln -s "$WARDEN" "$OUT/home/warden"; ln -s "$HERE/tools" "$OUT/home/tools"
+VAREK_HOME="$OUT/home" python3 "$VAREK" plan generate --log "$OUT/gen.log" -o "$OUT/wc.plan" --from agentcore \
+    "$OUT/agentcore-weather" > "$OUT/cli.out" 2>&1
+check "under the Warden: the same plan, the adapter's run a verdict stream with nothing refused" sh -c \
+    "cmp -s '$OUT/w.plan' '$OUT/wc.plan' && grep -q '\"event\":\"run_start\"' '$OUT/gen.log' &&
+     ! grep -q '\"decision_final\":\"DENY\"' '$OUT/gen.log' && ! grep -q 'refused the adapter' '$OUT/cli.out'"
+check "... its confinement: the project read-only, no host rule, no launch after its own" sh -c \
+    "grep -q 'allow path $OUT/agentcore-weather/ readonly' '$OUT/gen.log' || python3 - '$OUT/gen.log' <<'PY'
+import json, sys
+rs = [json.loads(l) for l in open(sys.argv[1]) if l.startswith('{\"event\":\"run_start\"')]
+sys.exit(0 if rs and not rs[0].get('hosts') else 1)
+PY"
+# decided under each sample's policy, as the run would (needs the AWS names to resolve)
+if getent hosts xray.us-east-1.amazonaws.com > /dev/null 2>&1; then
+    python3 "$VAREK" plan generate --no-confine --policy "$OUT/agentcore-weather/weather.policy" --from agentcore \
+        "$OUT/agentcore-weather" --model-host bedrock-runtime.us-east-1.amazonaws.com:443 > "$OUT/cli.out" 2>&1; wrc=$?
+    check "the weather sample's plan under its policy: authorized" sh -c "[ $wrc = 0 ] && grep -q 'the plan: authorized under' '$OUT/cli.out'"
+    python3 "$VAREK" plan generate --no-confine --policy "$OUT/agentcore-travel/travel.policy" --from agentcore \
+        "$OUT/agentcore-travel" > "$OUT/gen.plan" 2> "$OUT/cli.out"; trc=$?
+    check "the travel sample's under its: refused, the step and its reason given" sh -c \
+        "[ $trc = 1 ] && grep -q 'the plan: refused under' '$OUT/cli.out' && grep -q 'tools/call#\\\" is UNKNOWN: no rule of the policy allows it' '$OUT/cli.out' &&
+         ! grep -q 'refused under' '$OUT/gen.plan'"
+else pass "the samples under their policies: not tried (the AWS host names do not resolve here)"; fi
 
 echo
 if [ "$fail" = 0 ]; then echo "test_v1350: PASS"; else echo "test_v1350: FAIL"; fi

@@ -37,6 +37,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import varek_license  # noqa: E402
@@ -1213,7 +1214,7 @@ def cmd_policy_check(args):
     return 0
 
 
-def policy_check_plan(path, plan):
+def policy_check_plan(path, plan, shown=None):
     """v1.35 (D9): decide a plan under the policy as `varek run --plan` would
     as the run starts (the Warden's own check, on this host: its launch set,
     its Landlock), with each step's reason; no agent runs, no record is
@@ -1233,17 +1234,173 @@ def policy_check_plan(path, plan):
         why = next((ln for ln in reversed(lines) if ln.startswith("[warden] ")), f"exit {r.returncode}")
         raise CliError(f"the Warden would not start with {path} here: {why[len('[warden] '):]}",
                        fix="`varek preflight` says what it needs")
+    shown = shown or plan
     for ln in steps:
         info(f"  {ln}")
     if r.returncode == 0:
-        ok(f"{plan}: authorized under {path} ({verdict.split('(', 1)[1].split(')', 1)[0]})")
+        ok(f"{shown}: authorized under {path} ({verdict.split('(', 1)[1].split(')', 1)[0]})")
         return 0
     if verdict.startswith("[warden] plan load failed"):
-        info(f"{plan}: the plan could not be read: {verdict.split(': ', 1)[1]}")
+        info(f"{shown}: the plan could not be read: {verdict.split(': ', 1)[1]}")
     else:
-        info(f"{plan}: refused under {path} ({verdict.split('(', 1)[1].split(')', 1)[0]}): "
+        info(f"{shown}: refused under {path} ({verdict.split('(', 1)[1].split(')', 1)[0]}): "
              f"`varek run --plan` would not start the agent")
     return 1
+
+
+# ------------------------------------------------------------ plan generate --
+# v1.35 step 5 (docs/security/v1.35-frameworks.md, D5): a plan written from
+# what a framework says of the agent, by the framework's adapter
+# (adapters/NAME.py), run as a step of its own before the run, under the
+# Warden: the system and the project read-only, no network, no launch.
+
+PLAN_ADAPTERS = {
+    # name: (what it reads, whether it reads data only: then --no-confine is offered)
+    "agentcore": ("Amazon Bedrock AgentCore: an AgentCore CLI project's agentcore/ (agentcore.json, "
+                  "aws-targets.json, .cli/deployed-state.json), read as data", True),
+}
+PLAN_KINDS = {"file_open", "net_connect", "process_exec", "mcp_call", "subagent", "credential"}
+PLAN_LABEL = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
+
+
+def plan_text_problems(text):
+    """v1.35 step 5: what in an adapter's plan the plan format refuses (the
+    Warden's parser reads it again when the run starts): (steps, problems)"""
+    problems, labels, n, seen = [], set(), 0, False
+    for i, line in enumerate(text.splitlines(), 1):
+        t = line.strip()
+        if not t or t.startswith("#"):
+            continue
+        f = t.split()
+        if not seen:
+            seen = True
+            if f != ["plan", "1.35"]:
+                problems.append(f"line {i}: the plan's first line is not `plan 1.35`")
+            continue
+        if f[0] == "action":
+            if len(f) < 4 or not PLAN_LABEL.fullmatch(f[1]) or f[1] in labels:
+                problems.append(f"line {i}: not a step with a label of its own: {t[:120]}")
+            elif f[2] not in PLAN_KINDS:
+                problems.append(f"line {i}: a step of a kind the Warden does not decide: {f[2]}")
+            labels.add(f[1] if len(f) > 1 else "")
+            n += 1
+        elif f[0] == "edge":
+            if len(f) != 3 or f[1] not in labels or f[2] not in labels:
+                problems.append(f"line {i}: an edge between steps not declared above it: {t[:120]}")
+        else:
+            problems.append(f"line {i}: not a plan line: {t[:120]}")
+    if not seen:
+        problems.append("the plan is empty")
+    if n > 256:
+        problems.append(f"{n} steps: a plan has at most 256")
+    return n, problems
+
+
+def plan_confinement(project, adapter_dir, python):
+    """v1.35 step 5 (D5): the policy an adapter runs under: the system and the
+    project read-only, the credential stores refused, no host, no launch
+    after its own"""
+    L = ["# varek plan generate: the adapter's confinement (v1.35 step 5, D5): the system and the",
+         "# project read-only, no network (no host rule), no launch after the adapter's own.",
+         "require warden 1.29"]
+    for r, _ in varek_baseline.CREDENTIAL_DENIES + varek_baseline.SYSTEM_DENIES:
+        L.append(r)
+    for d in ("/usr/", "/lib/", "/lib64/", "/etc/", "/proc/self/"):
+        L.append(f"allow path {d} readonly")
+    L += ["allow path exact /dev/null", "allow path exact /dev/urandom readonly",
+          "allow path exact /proc/sys/crypto/fips_enabled readonly"]     # OpenSSL's FIPS check (hashlib)
+    for d in (project, adapter_dir):
+        L += [f"allow path exact {d} readonly", f"allow path {d}/ readonly"]
+    L.append(f"allow exec {python}")
+    return "\n".join(L) + "\n"
+
+
+def cmd_plan_generate(args):
+    name = args.from_
+    if name not in PLAN_ADAPTERS:
+        raise CliError(f"no adapter for {name!r}",
+                       fix="the adapters: " + "; ".join(f"{k} ({v[0]})" for k, v in PLAN_ADAPTERS.items()))
+    about, data_only = PLAN_ADAPTERS[name]
+    adapter = os.path.join(varek_home(), "adapters", f"{name}.py")
+    if not os.path.isfile(adapter):
+        raise CliError(f"no adapter at {adapter}", fix="install VAREK (make install), or set VAREK_HOME")
+    project = os.path.realpath(args.project)
+    if not os.path.isdir(project):
+        raise CliError(f"no project directory at {args.project}")
+    if re.search(r"\s", project):
+        raise CliError(f"the project's path {project} has white space, which a policy rule cannot name")
+    if args.output and os.path.exists(args.output) and not args.force:
+        raise CliError(f"{args.output} exists", fix="--force to write over it")
+    extra = list(args.adapter_args or [])
+    if extra[:1] == ["--"]:
+        extra = extra[1:]
+    python = os.path.realpath(sys.executable)
+    cmd = [python, "-I", "-S", adapter, project] + extra
+    if args.no_confine:
+        if not data_only:
+            raise CliError(f"the {name} adapter imports the agent's code, so it runs confined",
+                           fix="run as root (sudo), without --no-confine")
+        print(_paint("2", f"[varek] running the {name} adapter unconfined (--no-confine): it reads the "
+                          f"project as data"), file=sys.stderr)
+        r = run_cmd(cmd, check=False, capture=True)
+        out, err_lines, log = r.stdout, r.stderr.splitlines(), None
+    else:
+        need_root("plan generate (the adapter runs under the Warden; --no-confine for a data adapter)")
+        w = warden_bin()
+        if not os.access(w, os.X_OK):
+            raise CliError(f"no Warden at {w}", fix="install VAREK (make install), or set VAREK_HOME")
+        _pw, run_as, _why = varek_baseline.agent_user(args.run_as)
+        tmpd = tempfile.mkdtemp(prefix="varek-plan-")
+        try:
+            pol = os.path.join(tmpd, f"{name}-adapter.policy")
+            with open(pol, "w") as f:
+                f.write(plan_confinement(project, os.path.dirname(os.path.realpath(adapter)), python))
+            log = args.log or os.path.join(tmpd, f"{name}-adapter.log")
+            print(_paint("2", f"[varek] running the {name} adapter under the Warden as {run_as}: the project "
+                              f"read-only, no network"), file=sys.stderr)
+            with open(log, "w") as errf:
+                r = run_cmd([w, pol, "--run-as", run_as, "--"] + cmd, check=False, capture=False,
+                            stdout=subprocess.PIPE, stderr=errf, text=True)
+            out = r.stdout or ""
+            with open(log, encoding="utf-8", errors="replace") as fh:
+                stream = fh.read().splitlines()
+            err_lines = [ln[len("[agent] "):] for ln in stream if ln.startswith("[agent] ")]
+            refused = summarize(read_records(log))["refused"]
+            if refused:
+                warn(f"the Warden refused the adapter {refused} call(s): `varek refusals {log}` lists them")
+        finally:
+            if not args.log:
+                shutil.rmtree(tmpd, ignore_errors=True)
+                log = None
+    for ln in err_lines:
+        print(f"  {ln}", file=sys.stderr)
+    if r.returncode != 0 or not out.strip():
+        raise CliError(f"the {name} adapter wrote no plan (exit {r.returncode})",
+                       fix="what it said is above" + (f"; its run under the Warden: {log}" if log else ""))
+    n, problems = plan_text_problems(out)
+    if problems:
+        raise CliError(f"the {name} adapter's plan is not one the Warden reads: " + "; ".join(problems[:5]))
+    if args.output:
+        tmp = args.output + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(out)
+        os.replace(tmp, args.output)
+        ok(f"{args.output}: a plan of {n} steps, from {project} ({name})")
+    else:
+        sys.stdout.write(out)
+    if args.policy:                                       # decided as the run would, no agent run
+        policy = resolve_pack(args.policy, load_config(required=False) or default_config())
+        if args.output:
+            return policy_check_plan(policy, args.output)
+        with tempfile.NamedTemporaryFile("w", suffix=".plan", delete=False) as f:
+            f.write(out)
+        saved, sys.stdout = sys.stdout, sys.stderr      # the plan is standard output: the check goes beside it
+        try:
+            return policy_check_plan(policy, f.name, shown="the plan")
+        finally:
+            sys.stdout = saved
+            os.unlink(f.name)
+    return 0
 
 
 def cmd_policy_use(args):
@@ -2645,6 +2802,8 @@ Getting started:
   sudo varek init --pack healthcare       settings, signing key, log directory
   sudo varek preflight --run              a real trial run, then its audit
   sudo varek run -- python3 agent.py      supervise an agent
+  sudo varek plan generate --from agentcore . -o agent.plan
+                                          a plan from the agent's framework (v1.35)
   varek refusals                          what was refused in the last run, and why
   varek audit                             re-check the last run's verdicts and signatures
   sudo varek export                       signed CycloneDX 1.6 evidence for auditors
@@ -2712,6 +2871,32 @@ def build_parser():
     x.add_argument("file")
     x.add_argument("--name", help="name to install it under")
     x.set_defaults(fn=cmd_policy_add)
+
+    pl = sub.add_parser("plan", help="v1.35: write a plan from what an agent framework says of the agent",
+                        description="v1.35: plans from the framework (docs/security/v1.35-frameworks.md).")
+    plsub = pl.add_subparsers(dest="plcmd", metavar="<action>")
+    pl.set_defaults(fn=lambda a: (pl.print_help(), 0)[1])
+    x = plsub.add_parser("generate", help="write the plan of an agent from its framework's description of it",
+                         usage="varek plan generate [-o PLAN] [--policy POLICY] [--no-confine] --from FRAMEWORK "
+                               "PROJECT [ADAPTER OPTIONS]",
+                         description="Run the framework's adapter (adapters/FRAMEWORK.py) on the agent's project, "
+                                     "under the Warden (the project read-only, no network), and write the plan it "
+                                     "writes. Options after PROJECT go to the adapter (agentcore: --runtime, "
+                                     "--target, --region, --gateway-url NAME=URL, --model-host HOST:PORT, --app-dir, "
+                                     "--no-runtime).")
+    x.add_argument("--from", dest="from_", required=True, metavar="FRAMEWORK",
+                   help="the framework: " + ", ".join(PLAN_ADAPTERS))
+    x.add_argument("project", help="the agent's project (agentcore: the directory holding agentcore/)")
+    x.add_argument("-o", "--output", help="write the plan here (default: standard output)")
+    x.add_argument("--force", action="store_true", help="write over --output")
+    x.add_argument("--policy", help="also decide the plan under this policy (pack or file), as `varek run "
+                                    "--plan` would, with each step's reason")
+    x.add_argument("--no-confine", action="store_true",
+                   help="run an adapter that reads data only without the Warden (no root needed)")
+    x.add_argument("--run-as", help="the adapter's user under the Warden (default: the user who ran sudo)")
+    x.add_argument("--log", help="keep the adapter's run under the Warden (its verdict stream) here")
+    x.add_argument("adapter_args", nargs=argparse.REMAINDER)
+    x.set_defaults(fn=cmd_plan_generate)
 
     sp = add("preflight", cmd_preflight, "check the deployment before running agents")
     sp.add_argument("--run", action="store_true", help="also do a real trial run and audit it (root)")

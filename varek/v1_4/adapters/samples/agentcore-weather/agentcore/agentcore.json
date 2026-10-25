@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.agentcore.aws.dev/v1/agentcore.json",
+  "name": "WeatherDesk",
+  "version": 1,
+  "managedBy": "CDK",
+  "runtimes": [
+    {
+      "name": "weather_agent",
+      "description": "Answers weather questions with the forecast tools",
+      "build": "Container",
+      "entrypoint": "main.py",
+      "codeLocation": "app",
+      "runtimeVersion": "PYTHON_3_12",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP",
+      "instrumentation": { "enableOtel": true },
+      "filesystemConfigurations": [ { "sessionStorage": { "mountPath": "/mnt/session" } } ],
+      "connections": [ { "to": { "type": "memory", "arn": "arn:aws:bedrock-agentcore:us-east-1:111122223333:memory/WeatherMemory-abc123" } } ]
+    }
+  ],
+  "memories": [ { "name": "WeatherMemory", "eventExpiryDuration": 30, "strategies": [ { "type": "SEMANTIC" } ] } ],
+  "knowledgeBases": [],
+  "credentials": [ { "authorizerType": "ApiKeyCredentialProvider", "name": "forecast-api-key" } ],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": [
+    {
+      "name": "weather-tools",
+      "protocolType": "MCP",
+      "authorizerType": "AWS_IAM",
+      "enableSemanticSearch": false,
+      "exceptionLevel": "NONE",
+      "targets": [
+        {
+          "name": "forecast",
+          "targetType": "lambdaFunctionArn",
+          "lambdaFunctionArn": {
+            "lambdaArn": "arn:aws:lambda:us-east-1:111122223333:function:forecast",
+            "toolSchemaFile": "tools/forecast-tools.json"
+          }
+        }
+      ]
+    }
+  ],
+  "policyEngines": [],
+  "configBundles": [],
+  "abTests": [],
+  "harnesses": []
+}

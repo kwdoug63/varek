@@ -1,0 +1,52 @@
+{
+  "$schema": "https://schema.agentcore.aws.dev/v1/agentcore.json",
+  "name": "TravelDesk",
+  "version": 1,
+  "managedBy": "CDK",
+  "runtimes": [
+    {
+      "name": "travel_agent",
+      "description": "Books trips with the flights and hotels tools",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app",
+      "runtimeVersion": "PYTHON_3_12",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP"
+    }
+  ],
+  "memories": [],
+  "knowledgeBases": [],
+  "credentials": [],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": [
+    {
+      "name": "travel-tools",
+      "protocolType": "MCP",
+      "authorizerType": "AWS_IAM",
+      "enableSemanticSearch": false,
+      "exceptionLevel": "NONE",
+      "targets": [
+        {
+          "name": "flights",
+          "targetType": "lambda",
+          "toolDefinitions": [
+            { "name": "search_flights", "description": "Flights between two airports on a day", "inputSchema": { "type": "object" } },
+            { "name": "book_flight", "description": "Books a flight", "inputSchema": { "type": "object" } }
+          ]
+        },
+        {
+          "name": "hotels",
+          "targetType": "mcpServer",
+          "endpoint": "https://hotels.example.com/mcp",
+          "outboundAuth": { "type": "OAUTH", "credentialName": "hotels-oauth" }
+        }
+      ]
+    }
+  ],
+  "policyEngines": [],
+  "configBundles": [],
+  "abTests": [],
+  "harnesses": []
+}
