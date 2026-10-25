@@ -320,6 +320,8 @@ struct action {
     bool          proxy_handoff;        /* v1.26: a connect handed to the egress proxy */
     int           subject;              /* v1.28.1: who the call is for (warden_subagent.inc.c): 0 the
                                            agent, a sub-agent, or -1 (in no group of the run) */
+    int           plan_psubj;           /* v1.35 (D6): a plan step's policy subject, plus 1 (0: none,
+                                           the subject is the call's attribution, as at run time) */
     /* v1.29: a change by name (warden_change.inc.c) */
     int           chg_op;               /* CHG_* */
     char          target2[PATH_LIMIT];  /* a rename's new name */
@@ -1226,6 +1228,11 @@ static int derive_intent(const struct seccomp_notif *req,
 
 static bool g_revoked;               /* v1.28 step 4: warden_revoke.inc.c */
 static int sub_policy_subject(int s);  /* v1.31: warden_subagent.inc.c */
+/* v1.35 (D6): the policy subject an action is decided as: a plan step's own
+ * (as=NAME), else the calling process's attribution */
+static int act_policy_subject(const struct action *a) {
+    return a->plan_psubj > 0 ? a->plan_psubj - 1 : sub_policy_subject(a->subject);
+}
 static decision_t policy_decide(const struct policy *p, struct action *a)
 {
     /* v1.13: every decision is made by the SMT decision procedure
@@ -1276,7 +1283,7 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
     int ri;
     vdp_why_t why;
     /* v1.31: by the calling subject's rules (the Warden's attribution) */
-    vdp_verdict_t v = vdp_decide_subj(&p->v, sub_policy_subject(a->subject), kind, s, vdp_oflags_from_native((uint32_t)a->open_flags),
+    vdp_verdict_t v = vdp_decide_subj(&p->v, act_policy_subject(a), kind, s, vdp_oflags_from_native((uint32_t)a->open_flags),
                                       kind == VDP_KIND_PATH && a->flags_known,
                                       &ri, &why);
     a->why = vdp_why_name(why);
@@ -1368,7 +1375,7 @@ static bool certify(const struct policy *p, struct action *a) {
     if ((size_t)n < sizeof a->cert) n += snprintf(a->cert + n, sizeof a->cert - (size_t)n, "\"");
     /* v1.31: the subject the certificate is checked as, from the Warden's own
      * attribution (not the procedure's), recorded when it is not the agent */
-    int subj = sub_policy_subject(a->subject);
+    int subj = act_policy_subject(a);
     if (subj && (size_t)n < sizeof a->cert) snprintf(a->cert + n, sizeof a->cert - (size_t)n, ",\"cert_subject\":%d", subj);
     if (!vdpc_check_subj(&p->c, subj, kind, s, strlen(s), vdp_oflags_from_native((uint32_t)a->open_flags), has_flags, &cc,
                          a->check_why, sizeof a->check_why)) {
@@ -1589,6 +1596,158 @@ static int net_plan_canon(const char *in, char *out, size_t n, char *why, size_t
  * inspects those two fields. */
 static plan_decision_t plan_exec_decide(const struct policy *p, struct action *a, const char **why);  /* warden_exec.inc.c */
 
+/* v1.35 (D3, D4, D6; docs/security/v1.35-frameworks.md): the steps a plan
+ * in format 1.35 (`plan 1.35` its first line) may name besides file_open,
+ * net_connect and process_exec, and the subject a step is decided as.
+ *
+ *   mcp_call URL [method=METHOD] [name=NAME]
+ *       an MCP call over HTTP, decided as v1.31 decides one: on the object
+ *       <canonical URL>#<METHOD>#<NAME> (vdp_mcp_object), by the mcp rules,
+ *       and certified. METHOD defaults to tools/call. Without name= the step
+ *       is the server (its tools found when it is connected): decided on the
+ *       empty name, so SATISFIED only where a rule allows any name. A server
+ *       that is not an http:// or https:// URL (a stdio server) is UNKNOWN:
+ *       its calls are not decided (its launch is a subagent step).
+ *   subagent NAME [exec=PATH]
+ *       a sub-agent, or a confined MCP server, decided as its launch: by the
+ *       exec rules, as a process_exec step is, and SATISFIED only when the
+ *       rule that allows the program is one with subagent=NAME. Without
+ *       exec= the program is the one exact rule with subagent=NAME names.
+ *   credential NAME
+ *       a credential the policy names (`credential NAME from ...`) and an
+ *       allow request or mcp rule of the step's subject releases
+ *       (credential=NAME); the requests that carry it are decided when made.
+ *   as=NAME   on any step: decided under the rules of NAME, a confined
+ *       subject (`mcp server NAME`, `subagent=NAME confined`), as its calls
+ *       are; for an unconfined sub-agent, the rules of the subject that
+ *       launches it, as its calls are. A name the policy does not give is
+ *       UNKNOWN.
+ *
+ * A plan without `plan 1.35` is read as through v1.34: these kinds, and an
+ * as= field, are UNKNOWN there. */
+static const char *plan_field(const struct warden_plan_ud *u, const plan_spec_action_t *a, const char *key) {
+    if (!u->parsed || !u->spec || a < u->spec->actions || a >= u->spec->actions + u->spec->n_actions)
+        return NULL;
+    size_t nf = 0;
+    const plan_spec_field_t *fl = plan_parser_fields(u->parsed, (size_t)(a - u->spec->actions), &nf);
+    for (size_t k = 0; k < nf; k++)
+        if (fl[k].key && !strcmp(fl[k].key, key)) return fl[k].value ? fl[k].value : "";
+    return NULL;
+}
+
+/* as=NAME: 1 + the policy subject its calls are decided as (1: the agent's
+ * rules), or 0 with why */
+static int plan_subject(const struct policy *p, const char *name, const char **why) {
+    for (size_t k = 0; k < p->v.nsubjects; k++)
+        if (!strcmp(p->v.subjects[k].name, name)) return (int)k + 2;
+    int subj = -1;
+    for (size_t i = 0; i < p->v.n; i++) {
+        const vdp_rule_t *r = &p->v.rules[i];
+        if (r->kind != VDP_KIND_EXEC || r->verb != VDP_ALLOW || strcmp(r->subagent, name)) continue;
+        if (subj >= 0 && subj != r->subj) { *why = "the sub-agent is launched by rules of two subjects"; return 0; }
+        subj = r->subj;
+    }
+    if (subj < 0) { *why = "the policy names no sub-agent or MCP server by that name"; return 0; }
+    return subj + 1;
+}
+
+/* a subagent step: its launch, as a process_exec step's (plan_exec_decide),
+ * then the deciding rule's subagent= */
+static plan_decision_t plan_subagent_decide(const struct warden_plan_ud *u, const plan_spec_action_t *a,
+                                            struct action *act, const char **why) {
+    const struct policy *p = u->policy;
+    const char *name = a->target ? a->target : "";
+    int subj = act->plan_psubj > 0 ? act->plan_psubj - 1 : 0;
+    const vdp_rule_t *only = NULL;
+    size_t n = 0;
+    for (size_t i = 0; i < p->v.n; i++) {
+        const vdp_rule_t *r = &p->v.rules[i];
+        if (r->kind == VDP_KIND_EXEC && r->verb == VDP_ALLOW && r->subj == subj && !strcmp(r->subagent, name)) {
+            only = r;
+            n++;
+        }
+    }
+    if (!n) { *why = "no rule of the policy launches a sub-agent by that name"; return PLAN_DEC_UNKNOWN; }
+    const char *path = plan_field(u, a, "exec");
+    if (!path) {
+        if (n != 1 || only->s.op != VDP_STR_EQ) {
+            *why = "name the sub-agent's program with exec=PATH (no one exact rule names it)";
+            return PLAN_DEC_UNKNOWN;
+        }
+        path = only->s.c;
+    }
+    if (strlen(path) >= sizeof act->target) { *why = "the program's path is too long"; return PLAN_DEC_UNKNOWN; }
+    snprintf(act->target, sizeof act->target, "%s", path);
+    act->kind = ACT_PROCESS_EXEC;
+    if (!p->v.launches) {
+        *why = "the Warden refuses every launch after the first at runtime, as the policy does not decide "
+               "launches (require warden 1.27)";
+        return PLAN_DEC_UNSATISFIED;
+    }
+    plan_decision_t pd = plan_exec_decide(p, act, why);
+    if (pd == PLAN_DEC_SATISFIED &&
+        (act->rule_index < 0 || strcmp(p->v.rules[act->rule_index].subagent, name))) {
+        *why = "the program is allowed, but by a rule that does not launch it as this sub-agent";
+        return PLAN_DEC_UNKNOWN;
+    }
+    return pd;
+}
+
+/* a credential step: named, and released by an allow rule of the subject */
+static plan_decision_t plan_cred_decide(const struct policy *p, const plan_spec_action_t *a,
+                                        struct action *act, const char **why) {
+    const char *name = a->target ? a->target : "";
+    int subj = act->plan_psubj > 0 ? act->plan_psubj - 1 : 0;
+    size_t c = 0;
+    while (c < p->v.ncreds && strcmp(p->v.creds[c].name, name)) c++;
+    if (c == p->v.ncreds) { *why = "the policy names no credential by that name"; return PLAN_DEC_UNKNOWN; }
+    for (size_t i = 0; i < p->v.n; i++) {
+        const vdp_rule_t *r = &p->v.rules[i];
+        if (r->verb == VDP_ALLOW && (r->kind == VDP_KIND_REQUEST || r->kind == VDP_KIND_MCP) &&
+            r->cred == (int)c + 1 && r->subj == subj) {
+            act->policy_line = r->line;
+            return PLAN_DEC_SATISFIED;
+        }
+    }
+    *why = "no rule of the policy releases it (credential=) to this subject";
+    return PLAN_DEC_UNKNOWN;
+}
+
+/* an mcp_call step's server: its host and port decided (and certified) as the
+ * connection the proxy reads is (ACT_NET_PROXY), before the call. At run time
+ * the call is decided only on a connection the host rules allow, so a step
+ * whose host they do not is not SATISFIED either. url is canonical
+ * (vdp_mcp_url): scheme://host:port/path. */
+static plan_decision_t plan_mcp_host(const struct policy *p, const struct action *call, const char *url,
+                                     const char **why) {
+    struct action h;
+    memset(&h, 0, sizeof h);
+    h.kind = ACT_NET_PROXY;
+    h.policy_line = -1;
+    h.plan_psubj = call->plan_psubj;
+    const char *b = strstr(url, "://");
+    const char *e = b ? strchr(b + 3, '/') : NULL;
+    if (!b || !e || (size_t)(e - b - 3) >= sizeof h.resolved) { *why = "the server's URL has no host"; return PLAN_DEC_UNKNOWN; }
+    memcpy(h.resolved, b + 3, (size_t)(e - b - 3));
+    snprintf(h.target, sizeof h.target, "%s", h.resolved);
+    decision_t d = policy_decide(p, &h);
+    if (d == DEC_ALLOW && certify(p, &h)) return PLAN_DEC_SATISFIED;
+    *why = d == DEC_DENY ? "the connection to its server's host and port is refused by a host rule"
+         : d == DEC_ALLOW ? "the connection to its server's host and port: certificate refused"
+                          : "no host rule allows the connection to its server's host and port";
+    return d == DEC_DENY ? PLAN_DEC_UNSATISFIED : PLAN_DEC_UNKNOWN;
+}
+
+static void plan_step_log(const plan_spec_action_t *a, const char *target, plan_decision_t pd, const char *why) {
+    log_line_start();
+    fputs("[warden] plan: ", g_log);
+    json_escape(g_log, a->kind ? a->kind : "");
+    fputs(" step \"", g_log);
+    json_escape(g_log, target);
+    fprintf(g_log, "\" is %s: %s\n", plan_decision_name(pd), why);
+    fflush(g_log);
+}
+
 static plan_decision_t plan_step_decide(const struct warden_plan_ud *u, const plan_spec_action_t *a,
                                         struct plan_step_note *nt)
 {
@@ -1604,6 +1763,45 @@ static plan_decision_t plan_step_decide(const struct warden_plan_ud *u, const pl
     }
     if (a->target) {
         snprintf(act.target, sizeof(act.target), "%s", a->target);
+    }
+    /* v1.35 (D3, D4, D6): the subject, then the kinds of plan 1.35 */
+    {
+        int ver = plan_parser_version(u->parsed);
+        const char *why = NULL;
+        plan_decision_t pd = PLAN_DEC_UNKNOWN;
+        bool newkind = a->kind && (!strcmp(a->kind, "mcp_call") || !strcmp(a->kind, "subagent") ||
+                                   !strcmp(a->kind, "credential"));
+        const char *as = plan_field(u, a, "as");
+        if (as && ver < 135) why = "an as= field needs `plan 1.35` as the plan's first line";
+        else if (as && !(act.plan_psubj = plan_subject(u->policy, as, &why))) { }
+        else if (newkind && ver < 135) why = "this kind of step needs `plan 1.35` as the plan's first line";
+        else if (newkind && !strcmp(a->kind, "credential")) pd = plan_cred_decide(u->policy, a, &act, &why);
+        else if (newkind && !strcmp(a->kind, "subagent")) pd = plan_subagent_decide(u, a, &act, &why);
+        else if (newkind) {                                             /* mcp_call */
+            char url[VDP_STR_MAX + 1];
+            const char *method = plan_field(u, a, "method"), *name = plan_field(u, a, "name");
+            const char *bad = strstr(act.target, "://") ? vdp_mcp_url(act.target, false, url, sizeof url)
+                                                        : "not an http:// or https:// URL";
+            if (bad && !strstr(act.target, "://"))
+                why = "a stdio MCP server's calls are not decided (the Warden decides MCP calls over HTTP); "
+                      "its launch is a subagent step";
+            else if (bad) why = bad;
+            else if (vdp_mcp_object(url, method ? method : "tools/call", name ? name : "", act.resolved,
+                                    sizeof act.resolved) < 0)
+                why = "the method or name is outside what the Warden decides";
+            else if ((pd = plan_mcp_host(u->policy, &act, url, &why)) == PLAN_DEC_SATISFIED) {
+                pd = PLAN_DEC_UNKNOWN;
+                act.kind = ACT_NET_MCP;                                 /* decided below, as a call */
+            }
+        }
+        if (why || pd != PLAN_DEC_UNKNOWN) {
+            if (!why) return pd;                                        /* a credential step SATISFIED */
+            plan_step_log(a, act.target, pd, why);
+            snprintf(nt->why, sizeof nt->why, "%s", why);
+            nt->policy_line = act.policy_line;
+            snprintf(nt->resolved, sizeof nt->resolved, "%s", act.resolved[0] ? act.resolved : act.target);
+            return pd;
+        }
     }
     /* v1.12.4: policy_decide() decides a file open on the RESOLVED canonical
      * path (v1.12.0+), not the raw target. At plan time there is no live agent
@@ -1684,18 +1882,23 @@ static plan_decision_t plan_step_decide(const struct warden_plan_ud *u, const pl
         snprintf(nt->why, sizeof nt->why, "its certificate is refused: %s", act.check_why);
         return PLAN_DEC_UNKNOWN;
     }
+    /* v1.35 step 3: a step the policy decides is logged with its reason too,
+     * as every other is (through step 2 only its record said why, and
+     * `varek policy check --plan`, which writes no record, showed nothing) */
+    plan_decision_t pd = PLAN_DEC_UNKNOWN;
     switch (d) {
         case DEC_ALLOW:   return PLAN_DEC_SATISFIED;
         case DEC_DENY:
             snprintf(nt->why, sizeof nt->why, "the policy refuses it");
-            return PLAN_DEC_UNSATISFIED;
-        case DEC_UNKNOWN: break;
+            pd = PLAN_DEC_UNSATISFIED;
+            break;
+        case DEC_UNKNOWN:
+            snprintf(nt->why, sizeof nt->why, "%s", act.kind == ACT_OTHER ? "the Warden decides no step of this kind"
+                                                                      : "no rule of the policy allows it");
+            break;
     }
-    if (act.kind == ACT_OTHER)
-        snprintf(nt->why, sizeof nt->why, "the Warden decides no step of this kind");
-    else
-        snprintf(nt->why, sizeof nt->why, "no rule of the policy allows it");
-    return PLAN_DEC_UNKNOWN;
+    plan_step_log(a, act.kind == ACT_NET_MCP && act.resolved[0] ? act.resolved : act.target, pd, nt->why);
+    return pd;
 }
 
 /* v1.35 step 2 (D9): the plan gate's chained records (defined after the

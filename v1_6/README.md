@@ -166,9 +166,17 @@ Line-oriented text. See `sample_plan.txt` for a worked example.
 
 ```
 # Comments begin with #.
+plan   1.35                        (v1.35: optional; the first line if given)
 action <label> <kind> <target> [<key>=<value> ...]
 edge   <from_label> <to_label>
 ```
+
+- v1.35: `plan 1.35`, before any action or edge and once, says the plan
+  is in format 1.35; `plan_parser_version()` returns 135 (0 without it).
+  Another version refuses the file. In format 1.35 the Warden also
+  decides `mcp_call`, `subagent` and `credential` steps and an `as=` field
+  on any step (`docs/security/v1.35-frameworks.md`, step 3). A plan
+  without the line is read as before.
 
 - `<label>` matches `[A-Za-z_][A-Za-z0-9_-]*`, up to 63 chars,
   unique within the file.
@@ -178,7 +186,8 @@ edge   <from_label> <to_label>
   suppressed under symmetric-suppression semantics. Since v1.18.0
   the Warden's gate decides every `process_exec` step UNSATISFIED,
   because the runtime refuses later launches whatever the policy
-  says. A `net_connect` step is decided like the connect it names
+  says; from v1.35, under a policy that decides launches (`require
+  warden 1.27`), it decides the step as the launch. A `net_connect` step is decided like the connect it names
   (v1.21.0; from v1.18.0 to v1.20.0 it was UNSATISFIED too), and a
   `file_open` step with the flags its `open` field declares
   (v1.21.1).

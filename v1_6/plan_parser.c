@@ -24,6 +24,7 @@
 #include "plan_parser.h"
 
 #include <ctype.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +53,11 @@ struct plan_parsed {
 
     plan_spec_edge_t   edges[PLAN_PARSE_MAX_EDGES];
     size_t             n_edges;
+
+    /* v1.35 (D3): the plan's format, from a first line `plan 1.35`; 0 when
+     * the plan has none (read as through v1.34). */
+    int                version;
+    bool               seen_directive;     /* an action or edge has been read */
 
     plan_spec_t        spec;
 };
@@ -268,6 +274,29 @@ static int parse_line(plan_parsed_t *h, const char *path, size_t lineno,
     char *directive = strtok_r(trimmed, " \t", &saveptr);
     if (!directive) return 0;
 
+    /* v1.35 (D3): `plan 1.35`, before any action or edge, once. A version
+     * this parser does not know refuses the file rather than reading its
+     * steps as an older format's. */
+    if (strcmp(directive, "plan") == 0) {
+        char *ver = next_token(&saveptr);
+        char *extra = next_token(&saveptr);
+        if (h->seen_directive || h->version) {
+            set_err(err, err_len, path, lineno, "`plan VERSION` must be the plan's first line, once");
+            return -1;
+        }
+        if (!ver || extra) {
+            set_err(err, err_len, path, lineno, "plan requires: plan <version>");
+            return -1;
+        }
+        if (strcmp(ver, "1.35") != 0) {
+            set_err(err, err_len, path, lineno, "unknown plan version (this Warden reads plan 1.35)");
+            return -1;
+        }
+        h->version = 135;
+        return 0;
+    }
+    h->seen_directive = true;
+
     if (strcmp(directive, "action") == 0) {
         if (h->n_actions >= PLAN_PARSE_MAX_ACTIONS) {
             set_err(err, err_len, path, lineno, "too many actions");
@@ -371,7 +400,7 @@ static int parse_line(plan_parsed_t *h, const char *path, size_t lineno,
     }
 
     set_err(err, err_len, path, lineno,
-            "unknown directive (expected 'action' or 'edge')");
+            "unknown directive (expected 'plan', 'action' or 'edge')");
     return -1;
 }
 
@@ -466,4 +495,9 @@ void plan_parser_free(plan_parsed_t *parsed)
     if (!parsed) return;
     for (size_t i = 0; i < parsed->n_owned; i++) free(parsed->owned[i]);
     free(parsed);
+}
+
+/* v1.35 (D3) */
+int plan_parser_version(const plan_parsed_t *parsed) {
+    return parsed ? parsed->version : 0;
 }

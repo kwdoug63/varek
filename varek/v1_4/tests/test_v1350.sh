@@ -16,6 +16,9 @@
 #   3. `varek refusals` and `varek run`'s summary on a refused plan
 #   4. `varek policy check --plan`: the plan decided as the run would, no
 #      agent run
+#   5. plan 1.35 (step 3: D3, D4, D6): mcp_call, subagent and credential
+#      steps, a step decided as a confined subject (as=), and the same plan
+#      without `plan 1.35`, read as through v1.34
 #
 # Usage: test_v1350.sh <warden> (tools/varek, tools/vdp_cert_check beside it)
 set -u
@@ -136,6 +139,70 @@ else flunk "an allowed plan: exit $RC ($(tail -1 "$OUT/pc"))"; fi
 python3 "$VAREK" policy check "$LP" --plan "$OUT/bad.txt" > "$OUT/pc" 2>&1
 [ $? = 1 ] && grep -q 'could not be read' "$OUT/pc" && pass "an unreadable plan: exit 1, said so" || flunk "an unreadable plan ($(tail -1 "$OUT/pc"))"
 [ "$(ls "$OUT/logs" | wc -l)" = "$NLOGS" ] && pass "a check runs no agent and writes no stream" || flunk "a check wrote a stream"
+
+echo "== 5. plan 1.35: mcp_call, subagent, credential, as= =="
+U=https://mcp.example.com/mcp
+MP="$OUT/mcp.policy"
+printf 'require warden 1.31\nproxy inspect\nallow host mcp.example.com:443\nmcp server files exec /usr/bin/true\nallow exec /usr/bin/false subagent=helper\ncredential gh from file:/etc/varek/creds/gh\nallow mcp %s tools/call search credential=gh\nallow mcp %s tools/list\ndeny mcp %s tools/call delete_*\nallow path /srv/data/ readonly for=files\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow mcp https://nohost.example.com/mcp tools/list\ndeny host blocked.example.com:443\nallow mcp https://blocked.example.com/mcp tools/list\n' "$U" "$U" "$U" > "$MP"
+steps() {   # steps <header?>: the plan, with or without `plan 1.35`
+    [ "$1" = 1 ] && echo 'plan 1.35'
+    cat <<EOF
+action m1 mcp_call $U name=search
+action m2 mcp_call $U method=tools/list
+action m3 mcp_call $U name=delete_all
+action m4 mcp_call $U name=other
+action m5 mcp_call $U
+action m6 mcp_call stdio:files
+action m7 mcp_call https://nohost.example.com/mcp method=tools/list
+action m8 mcp_call https://blocked.example.com/mcp method=tools/list
+action s1 subagent helper
+action s2 subagent files
+action s3 subagent nobody
+action s4 subagent helper exec=/usr/bin/true
+action c1 credential gh
+action c2 credential nope
+action f1 file_open /srv/data/x.csv open=read as=files
+action f2 file_open /srv/data/x.csv open=read
+action f3 file_open /usr/lib/os-release open=read as=files
+action f4 file_open /srv/data/x.csv as=ghost
+EOF
+}
+steps 1 > "$OUT/p135.txt"
+"$WARDEN" "$MP" --check-startup --plan "$OUT/p135.txt" > /dev/null 2> "$OUT/p135.err"
+says() { grep -qF "plan: $1 step \"$2\" is $3" "$OUT/p135.err"; }
+quiet() { ! grep -qF "plan: $1 step \"$2\" is " "$OUT/p135.err"; }
+check "mcp_call: a tool a rule allows (certified): SATISFIED" quiet mcp_call "https://mcp.example.com:443/mcp#tools/call#search"
+check "mcp_call: method= (tools/list): SATISFIED" quiet mcp_call "https://mcp.example.com:443/mcp#tools/list#"
+check "mcp_call: a tool a deny rule matches: UNSATISFIED" says mcp_call "https://mcp.example.com:443/mcp#tools/call#delete_all" UNSATISFIED
+check "mcp_call: a tool no rule allows: UNKNOWN" says mcp_call "https://mcp.example.com:443/mcp#tools/call#other" UNKNOWN
+check "mcp_call: the server, no tool named, where no rule allows any: UNKNOWN" says mcp_call "https://mcp.example.com:443/mcp#tools/call#" UNKNOWN
+check "mcp_call: a stdio server: UNKNOWN, said why" says mcp_call stdio:files "UNKNOWN: a stdio MCP server"
+check "mcp_call: a call its rule allows, on a server no host rule allows: UNKNOWN (the connection is decided first, as at run time)" \
+    says mcp_call https://nohost.example.com/mcp "UNKNOWN: no host rule allows the connection to its server's host and port"
+check "mcp_call: on a server a host rule refuses: UNSATISFIED" \
+    says mcp_call https://blocked.example.com/mcp "UNSATISFIED: the connection to its server's host and port is refused by a host rule"
+if grep -q 'no Landlock' "$OUT/p135.err"; then
+    pass "subagent: launches refused on this host (no Landlock), as a run's would be"
+else
+    check "subagent: an unconfined sub-agent's launch, allowed by its subagent= rule: SATISFIED" quiet subagent helper
+    check "subagent: a confined MCP server (mcp server NAME exec PATH): SATISFIED" quiet subagent files
+    check "subagent: a program allowed, but not by a subagent= rule for that name: UNKNOWN" \
+        says subagent /usr/bin/true "UNKNOWN: the program is allowed, but by a rule that does not launch it as this sub-agent"
+fi
+check "subagent: a name no rule launches: UNKNOWN" says subagent nobody UNKNOWN
+check "credential: named and released by a rule: SATISFIED" quiet credential gh
+check "credential: a name the policy does not give: UNKNOWN" says credential nope UNKNOWN
+[ "$(grep -cF 'file_open step "/srv/data/x.csv" is UNKNOWN: no rule of the policy allows it' "$OUT/p135.err")" = 1 ] \
+    && pass "as=: a confined subject's own rule allows it: SATISFIED (and the same file as the agent, which no rule of its allows: UNKNOWN)" \
+    || flunk "as=: /srv/data/x.csv decided as files and as the agent"
+check "as=: the subject's rules alone decide (not the agent's): UNKNOWN" says file_open /usr/lib/os-release "UNKNOWN: no rule"
+check "as=: a name the policy does not give: UNKNOWN" grep -qF 'is UNKNOWN: the policy names no sub-agent or MCP server by that name' "$OUT/p135.err"
+steps 0 > "$OUT/p134.txt"
+"$WARDEN" "$MP" --check-startup --plan "$OUT/p134.txt" > /dev/null 2> "$OUT/p134.err"
+[ "$(grep -cF 'is UNKNOWN: this kind of step needs `plan 1.35`' "$OUT/p134.err")" = 14 ] \
+    && pass "without plan 1.35: each mcp_call, subagent and credential step UNKNOWN, said why" \
+    || flunk "without plan 1.35: the new kinds ($(grep -cF 'needs `plan 1.35`' "$OUT/p134.err") said why)"
+check "without plan 1.35: an as= field UNKNOWN, said why" grep -qF 'is UNKNOWN: an as= field needs `plan 1.35`' "$OUT/p134.err"
 
 echo
 if [ "$fail" = 0 ]; then echo "test_v1350: PASS"; else echo "test_v1350: FAIL"; fi
