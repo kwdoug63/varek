@@ -1,6 +1,13 @@
 # VAREK Enterprise on AWS: Deployment Guide
 
-Version 1.1, for VAREK Enterprise 1.23.1 on AWS Marketplace.
+Version 1.2 (October 25, 2026), for VAREK Enterprise 1.23.1 on AWS Marketplace.
+
+> **Which version the AMI runs.** The AWS Marketplace listing offers
+> VAREK Enterprise 1.23.1, listed October 4, 2026, when 1.23.0 was withdrawn
+> for new subscribers. Releases since (v1.24.0 to v1.34.0) are published on
+> GitHub and, from v1.32.0, as the container image `ghcr.io/kwdoug63/varek`;
+> they are not in the AMI yet. This guide describes 1.23.1. On an instance,
+> `varek version` prints the version it runs.
 Published by Sober Agentic Infrastructure, Inc. (SAI).
 
 This guide covers deploying, operating, backing up, upgrading and getting
@@ -54,7 +61,7 @@ exported as CycloneDX 1.6 authorization evidence.
   reading credentials or calling an unapproved host is refused before the
   read or connection happens, not detected afterwards.
 - **Evaluating agent behaviour.** Run an agent under a strict policy and
-  read `varek refusals` to see everything it tried that the policy does not
+  read `sudo varek refusals` to see everything it tried that the policy does not
   allow.
 
 ### What a typical deployment contains
@@ -197,8 +204,10 @@ knowledge of what your agent is supposed to touch.
 The agent itself never runs as root. The Warden drops to the user in
 `run_as` (default `nobody`), removes every capability from the bounding,
 ambient, permitted, effective and inheritable sets, and verifies the drop
-before starting the agent. `varek refusals`, `varek status`, `varek runs`,
-`varek policy list/show/check` and `varek license` run without root.
+before starting the agent. `varek policy list/show/check` and `varek license`
+run without root. `varek refusals`, `varek status` and `varek runs` read the
+verdict streams in `/var/log/varek`, which only root can read (the directory
+is mode 750), so run them with `sudo`.
 
 Setting `VAREK_WARDEN_NO_PIDNS=1` lets the Warden start without
 `CAP_SYS_ADMIN`, but then processes the agent spawns are not guaranteed to
@@ -481,7 +490,7 @@ instance:
    sudo varek run -- python3 /path/to/your_agent.py
    ```
 
-4. Review: `varek refusals` shows each refused action and the policy line or
+4. Review: `sudo varek refusals` shows each refused action and the policy line or
    reason that decided it. Adjust the policy and repeat until only the
    actions you intend to refuse are refused.
 
@@ -559,10 +568,10 @@ On the instance:
 
    ```bash
    sudo varek run -- /usr/bin/python3 -c 'exec("try: open(\"/etc/hostname\")\nexcept OSError: print(\"refused as expected\")")'
-   varek refusals        # shows the open of /etc/hostname as refused
+   sudo varek refusals   # shows the open of /etc/hostname as refused
    sudo varek audit      # checks certificates, the hash chain and signatures
    sudo varek export     # writes signed CycloneDX evidence
-   varek export --verify /var/log/varek/<run>.cdx.json
+   sudo varek export --verify /var/log/varek/<run>.cdx.json
    ```
 
 5. `sudo varek bench` runs a workload natively and under the Warden, checks
@@ -587,7 +596,7 @@ it runs.
 | `The specified image is not eligible for Free Tier` at launch | The AWS account is on the Free plan, which cannot launch AWS Marketplace AMIs | Upgrade the account to the paid plan (Billing and Cost Management, or `aws freetier upgrade-account-plan --account-plan-type PAID`); remaining credits carry over |
 | `The instance configuration for this AWS Marketplace product is not supported` | The instance type is not one the listing offers | Choose one from the listing's **Pricing** tab ([section 6](#6-sizing)) |
 | `policy ... does not lint` | Syntax error or unknown rule | `varek policy check --explain` |
-| The agent fails with "Permission denied" | The policy refused an action | `varek refusals` names the action and the deciding line; allow it in the policy if it is intended |
+| The agent fails with "Permission denied" | The policy refused an action | `sudo varek refusals` names the action and the deciding line; allow it in the policy if it is intended |
 | `[varek] the Warden did not start the agent` | Startup check failed (policy, key permissions, anchor, a path the agent may not reach) | The lines printed after it give the reason; `sudo varek doctor` and `sudo varek preflight --run` |
 | `signing key ... is readable by group or others` | Key permissions changed | `sudo chmod 600 /etc/varek/log.key` |
 | Anchor errors at start | Forwarder not running | `sudo systemctl status varek-anchor-forward` and its journal |
@@ -602,8 +611,8 @@ On the instance:
 | Command | What it tells you |
 |---|---|
 | `sudo varek doctor` | Host readiness: architecture and kernel, runtime built, settings, policy lints, signing-key permissions, log directory, anchor, license. Exits 0 when ready, 1 if there is a problem |
-| `varek status` | Active policy and rule count, signing, anchor, agent user, last run and its allowed/refused counts |
-| `varek runs` | Recent runs; `DONE: no` marks a run that is still going or was cut short |
+| `sudo varek status` | Active policy and rule count, signing, anchor, agent user, last run and its allowed/refused counts |
+| `sudo varek runs` | Recent runs; `DONE: no` marks a run that is still going or was cut short |
 | `varek license` | Subscription status (exit 0 when licensed) |
 | `sudo varek audit` | Verifies the last run: certificates, hash chain, signatures, anchor; its `integrity:` line says how far the stream is protected |
 | `systemctl status varek-anchor-forward` | The anchor forwarder, if used |
@@ -613,7 +622,7 @@ To monitor continuously:
 - Run `sudo varek doctor` from cron or a systemd timer and alert on a
   non-zero exit, for example by sending it to Amazon CloudWatch with the
   CloudWatch agent or a CloudWatch custom metric.
-- Watch `varek runs` for runs without `run_end` and unexpected spikes in
+- Watch `sudo varek runs` for runs without `run_end` and unexpected spikes in
   refusals.
 - In your AWS account, add a CloudWatch alarm on the instance's
   `StatusCheckFailed` metric.
@@ -703,9 +712,10 @@ EC2 key pairs and agent secrets under your own policies.
 - **Operating system.** On the instance:
   `sudo dnf upgrade --releasever=latest`, then reboot if the kernel or core
   libraries changed. Run `sudo varek doctor` afterwards.
-- **VAREK.** Each VAREK release is published as a new version of the AWS
-  Marketplace listing, built on current Amazon Linux 2023 patches. SAI
-  announces releases and security advisories to subscribers. To upgrade:
+- **VAREK.** A new AMI is published as a new version of the AWS
+  Marketplace listing, built on current Amazon Linux 2023 patches; not every
+  GitHub release becomes an AMI (the listing currently offers 1.23.1). SAI
+  announces new versions and security advisories to subscribers. To upgrade:
   1. Launch a new instance from the new version, as in [7.2](#72-launch-the-instance).
   2. Copy `/etc/varek` from the old instance (and `/var/lib/varek` if used).
   3. `sudo varek doctor`, `varek policy check`, `sudo varek preflight --run`.
@@ -748,10 +758,10 @@ account.
 
 | Fault | What VAREK does | What to do (on the instance) |
 |---|---|---|
-| The Warden crashes or is killed | The agent and everything it spawned are killed with it (PID namespace); nothing keeps running unsupervised. The verdict stream ends without `run_end` | `varek runs` shows `DONE: no`; audit what was recorded with `sudo varek audit --allow-incomplete`; restart the agent with `sudo varek run` (a systemd unit with `Restart=on-failure` does this) |
+| The Warden crashes or is killed | The agent and everything it spawned are killed with it (PID namespace); nothing keeps running unsupervised. The verdict stream ends without `run_end` | `sudo varek runs` shows `DONE: no`; audit what was recorded with `sudo varek audit --allow-incomplete`; restart the agent with `sudo varek run` (a systemd unit with `Restart=on-failure` does this) |
 | The Warden refuses to start | The agent never starts; the reason is in the verdict log and printed by `varek run` | Fix the reason shown; `sudo varek doctor`, `sudo varek preflight --run` |
 | The license check fails | Enterprise packs cannot be selected; an active policy and the Warden keep working | Check the role, network and subscription (section 8) |
-| Legitimate actions are refused | The agent gets permission errors | `varek refusals`; correct the policy; `varek policy check` |
+| Legitimate actions are refused | The agent gets permission errors | `sudo varek refusals`; correct the policy; `varek policy check` |
 | The anchor host is unreachable | The forwarder spools checkpoints and resends when it returns | Restore the anchor host; check `systemctl status varek-anchor-forward` |
 | The disk fills | New verdict streams cannot be written, so new runs fail | Archive and remove old streams from `/var/log/varek`, or enlarge the EBS volume |
 | The instance fails | Its agents stop | Recover as in [section 10](#10-backup-and-recovery) |
@@ -785,8 +795,8 @@ If the VAREK files on an instance are damaged or changed:
 - **Security vulnerabilities:** GitHub private vulnerability reporting on
   this repository, or email as described in [SECURITY.md](../SECURITY.md).
   Reports are acknowledged within 48 hours.
-- Send with each request: the output of `varek doctor` and `varek version`,
-  the relevant `varek refusals` output or verdict stream, and the policy.
+- Send with each request: the output of `sudo varek doctor` and `varek version`,
+  the relevant `sudo varek refusals` output or verdict stream, and the policy.
   Replace any paths or addresses that identify people, and do not send
   protected health information or other regulated data.
 
