@@ -1,10 +1,10 @@
 # VAREK v1.35.0 — Agent Frameworks: Plans from the Framework
 
-> **Draft** until the 24-hour soak (`varek/v1_4/tests/soak_v1350/`) has
-> passed. The release takes its number when it is tagged
-> (`docs/roadmap/v1.32-v1.35.md`). v1.35.0 had a review by AI review
-> agents, six, each on one part (below). A human or third-party review has
-> not been done.
+> v1.35.0 had a review by AI review agents, six, each on one part (the
+> Warden's plan gate and hold; `varek plan generate` and the adapters; the
+> audit and the exports; the node agent and the cluster; the corpus and
+> the soak's harness; the docs). Its findings are fixed or stated as limits
+> (below). A human or third-party review has not been done.
 
 MIT · github.com/kwdoug63/varek
 
@@ -102,7 +102,36 @@ whose program is on the agent's PATH, not the system's.
   decided on that target, which no policy names, while the file's open was
   answered by the name view. A metadata call on a name view's host target
   is now decided as the view's own path (a deny rule over it still
-  refuses). The 24-hour run: _to be filled in_.
+  refuses). The 24-hour run passed (below).
+
+## The 24-hour run: passed
+
+October 25 to 26, 2026, from about 07:16 CDT; the Warden at 88dcd6f (the
+commits after it add a test section and documents). A DigitalOcean droplet,
+Ubuntu, systemd-resolved. Run D of `tests/soak_v1350/`: an OpenAI Agents
+SDK agent run by the SDK's own loop, its model scripted, with its MCP client
+(Streamable HTTP, a static tool filter) and a function tool, held to the
+plan `varek plan generate` wrote for it, under a policy that says `require
+plan`. A turn a minute; every tenth turn three probes: a file, a host and an
+MCP tool past the client's filter, each allowed by the policy and named by
+no step of the plan.
+
+| | |
+|---|---|
+| The Warden | exited 0 at the run's end |
+| The plan gate | SATISFIED, 23 steps; the run held to it |
+| Turns | 1,439 (about 1,440 due), none not done; 143 with probes |
+| Refused outside the plan | 429: 143 files, 143 hosts, 143 MCP calls (every probe) |
+| Refused as every run is | 168 (nscd, the MCP transport's GET and DELETE) |
+| Refused otherwise | 0 |
+| The docs server | 2,878 `tools/call` (`get_doc` 1,439, `search_docs` 1,439); 0 reconnects |
+| The audit | `varek audit`: PASS; the chain whole; the plan by its SHA-256 (`dd19e8e9…`), held, 429 calls refused outside it |
+| OCSF | 31,711 events, 0 invalid (OCSF 1.9.0); the plan gate's event: 1 |
+| Memory (start, at most, end; 287 samples) | the Warden 12,388, 12,400, 12,400 kB; the proxy 8,756, 9,260, 9,260 kB; the agent 96,408, 101,052, 101,052 kB |
+
+`soak_check: PASS`. The last quarter's median memory against the second's:
+the Warden 12,400 against 12,396 kB, the proxy 9,256 against 9,244 kB, the
+agent 100,980 against 100,208 kB.
 
 ## Compatibility
 

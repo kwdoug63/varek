@@ -8,8 +8,8 @@ description: >-
   varek.dev/policy) runs with the Warden deciding its calls under that policy,
   or does not run.
 type: application
-version: 1.34.0
-appVersion: "1.34.0"
+version: 1.35.0
+appVersion: "1.35.0"
 kubeVersion: ">=1.30.0-0"
 home: https://github.com/kwdoug63/varek
 sources:
