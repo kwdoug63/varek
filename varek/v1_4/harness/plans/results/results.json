@@ -1,0 +1,2348 @@
+{
+ "manifest": "harness/plans/manifest.json",
+ "results": [
+  {
+   "id": "agentcore/episodic-memory-claims-agent",
+   "framework": "agentcore",
+   "source": "https://github.com/awslabs/amazon-bedrock-agentcore-samples@0672a4e9c2f8b194007ee479fc7f15f03dc335f4:02-use-cases/01-conversational-agents/episodic-memory-claims-agent/agent",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 15,
+    "net_connect": 2
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "agentcore/private-idp-ping-agent",
+   "framework": "agentcore",
+   "source": "https://github.com/awslabs/amazon-bedrock-agentcore-samples@0672a4e9c2f8b194007ee479fc7f15f03dc335f4:01-features/05-authenticate-and-authorize/01-inbound-auth/04-inbound-auth-pingfederate/agent/private-idp-ping-agent",
+   "shim": null,
+   "generated": true,
+   "steps": 18,
+   "kinds": {
+    "file_open": 15,
+    "net_connect": 3
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "agentcore/receipts-intelligent-document-processing-agent",
+   "framework": "agentcore",
+   "source": "https://github.com/awslabs/amazon-bedrock-agentcore-samples@0672a4e9c2f8b194007ee479fc7f15f03dc335f4:02-use-cases/02-workflow-automation-agents/receipts-intelligent-document-processing-agent",
+   "shim": null,
+   "generated": true,
+   "steps": 26,
+   "kinds": {
+    "file_open": 15,
+    "net_connect": 2,
+    "mcp_call": 9
+   },
+   "names_a_server": true,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "agentcore/event-driven-claims-agent",
+   "framework": "agentcore",
+   "source": "https://github.com/awslabs/amazon-bedrock-agentcore-samples@0672a4e9c2f8b194007ee479fc7f15f03dc335f4:02-use-cases/02-workflow-automation-agents/event-driven-claims-agent",
+   "shim": null,
+   "generated": true,
+   "steps": 28,
+   "kinds": {
+    "file_open": 15,
+    "net_connect": 3,
+    "mcp_call": 10
+   },
+   "names_a_server": true,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "agentcore/it-incident-response-agent",
+   "framework": "agentcore",
+   "source": "https://github.com/awslabs/amazon-bedrock-agentcore-samples@0672a4e9c2f8b194007ee479fc7f15f03dc335f4:02-use-cases/02-workflow-automation-agents/it-incident-response-agent",
+   "shim": null,
+   "generated": true,
+   "steps": 26,
+   "kinds": {
+    "file_open": 15,
+    "net_connect": 3,
+    "mcp_call": 8
+   },
+   "names_a_server": true,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/agent-skills",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/agent-skills",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/agent_builder",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/agent_builder",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/agent_builder/box_knowledge",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/agent_builder/box_knowledge",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/agent_builder/catalog_onboarding",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/agent_builder/catalog_onboarding",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/agent_builder/healthcare_provider",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/agent_builder/healthcare_provider",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/agent_builder/ibm_knowledge",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/agent_builder/ibm_knowledge",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/agent_builder/personal_banking",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/agent_builder/personal_banking",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/agent_builder/voice_enabled_azure",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/agent_builder/voice_enabled_azure",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/agent_builder/voice_enabled_deepgram",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/agent_builder/voice_enabled_deepgram",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/agent_builder/voice_enabled_elevenlabs",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/agent_builder/voice_enabled_elevenlabs",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/agent_builder/voice_enabled_google",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/agent_builder/voice_enabled_google",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/agent_builder/voice_enabled_watson",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/agent_builder/voice_enabled_watson",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/channel-integrations/SIP_phone_channel",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/channel-integrations/SIP_phone_channel",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/channel-integrations/facebook_messenger_channel",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/channel-integrations/facebook_messenger_channel",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/channel-integrations/genesys_audio_connector_phone_channel",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/channel-integrations/genesys_audio_connector_phone_channel",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/channel-integrations/genesys_bot_connector_channel",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/channel-integrations/genesys_bot_connector_channel",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/channel-integrations/slack_channel",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/channel-integrations/slack_channel",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/channel-integrations/teams_channel",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/channel-integrations/teams_channel",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/channel-integrations/twilio_sms_channel",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/channel-integrations/twilio_sms_channel",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/channel-integrations/twilio_whatsapp_channel",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/channel-integrations/twilio_whatsapp_channel",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/compaction",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/compaction",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/experimental/agent_builder/customer_care_style",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/experimental/agent_builder/customer_care_style",
+   "shim": null,
+   "generated": true,
+   "steps": 18,
+   "kinds": {
+    "file_open": 14,
+    "mcp_call": 4
+   },
+   "names_a_server": true,
+   "authorized": false,
+   "refused_steps": [
+    {
+     "kind": "mcp_call",
+     "object": "http://host.docker.internal:3004/mcp#tools/call#",
+     "decision": "UNKNOWN",
+     "why": "no rule of the policy allows it",
+     "stratum": "collection",
+     "v111_clears": false
+    }
+   ],
+   "refused_only_collection": true,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/Document_Review",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/Document_Review",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/Employee_information",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/Employee_information",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/Event_manager",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/Event_manager",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/Grievance_Processing_Agent",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/Grievance_Processing_Agent",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/HR_agent",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/HR_agent",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/IT_agent",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/IT_agent",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/Payment_agent",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/Payment_agent",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/Random_Failure",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/Random_Failure",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/Time_off_Agent",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/Time_off_Agent",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/agent_scheduler",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/agent_scheduler",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/book_a_flight",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/book_a_flight",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/car_price_calculator",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/car_price_calculator",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/collaborator_agents",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/collaborator_agents",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/count_tracker_flow",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/count_tracker_flow",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/document_classifier",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/document_classifier",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/document_extractor",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/document_extractor",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/document_extractor_structured",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/document_extractor_structured",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/document_processing",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/document_processing",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/dynamic_forms",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/dynamic_forms",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/extract_support_request",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/extract_support_request",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/extract_support_request_llm_params",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/extract_support_request_llm_params",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/flow_callback",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/flow_callback",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/flow_callback_no_db",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/flow_callback_no_db",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/foreach_email",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/foreach_email",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/get_facts_numbers",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/get_facts_numbers",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/get_insurance_rate",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/get_insurance_rate",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/get_pet_facts_error_branching",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/get_pet_facts_error_branching",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/get_pet_facts_if_else",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/get_pet_facts_if_else",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/get_tuition_reimbursed",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/get_tuition_reimbursed",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/hello_message_flow",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/hello_message_flow",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/hello_message_flow_datamap",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/hello_message_flow_datamap",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/hello_message_script_flow",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/hello_message_script_flow",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/ibm_knowledge_to_emails",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/ibm_knowledge_to_emails",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/live_agent_transfer_flow",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/live_agent_transfer_flow",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/masking_test_flow",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/masking_test_flow",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/parallel_flow",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/parallel_flow",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/recent_transactions",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/recent_transactions",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/schedule_helpdesk_alert",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/schedule_helpdesk_alert",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/text_extraction",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/text_extraction",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/triage_workflow_agent_swarm",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/triage_workflow_agent_swarm",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/user_activity",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/user_activity",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/user_activity_no_files",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/user_activity_no_files",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/user_activity_user_assignment",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/user_activity_user_assignment",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/flow_builder/user_activity_with_forms",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/flow_builder/user_activity_with_forms",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/langflow/travel_advice",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/langflow/travel_advice",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/langflow/travel_visa_enquiry",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/langflow/travel_visa_enquiry",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "watsonx/plugins",
+   "framework": "watsonx",
+   "source": "https://github.com/IBM/ibm-watsonx-orchestrate-adk@724d6af901cc77548917bd9c83488abc47cc367a:examples/plugins",
+   "shim": null,
+   "generated": true,
+   "steps": 15,
+   "kinds": {
+    "file_open": 14,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "langgraph/react-agent/agent",
+   "framework": "langgraph",
+   "source": "https://github.com/langchain-ai/react-agent@87aac0fdcb811d05457314a42418f3fbe139933a:.",
+   "shim": null,
+   "generated": true,
+   "steps": 16,
+   "kinds": {
+    "file_open": 16
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "langgraph/memory-agent/agent",
+   "framework": "langgraph",
+   "source": "https://github.com/langchain-ai/memory-agent@6593de01380d8435f758295531a5023f530f831c:.",
+   "shim": null,
+   "generated": true,
+   "steps": 16,
+   "kinds": {
+    "file_open": 16
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "langgraph/retrieval-agent-template/retrieval_graph",
+   "framework": "langgraph",
+   "source": "https://github.com/langchain-ai/retrieval-agent-template@8950705b90101226321265378f57c4cecce078fb:.",
+   "shim": null,
+   "generated": true,
+   "steps": 16,
+   "kinds": {
+    "file_open": 16
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "langgraph/retrieval-agent-template/indexer",
+   "framework": "langgraph",
+   "source": "https://github.com/langchain-ai/retrieval-agent-template@8950705b90101226321265378f57c4cecce078fb:.",
+   "shim": null,
+   "generated": true,
+   "steps": 16,
+   "kinds": {
+    "file_open": 16
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "langgraph/data-enrichment/agent",
+   "framework": "langgraph",
+   "source": "https://github.com/langchain-ai/data-enrichment@847337a940630e17aaeae644b194b02a08ef12db:.",
+   "shim": null,
+   "generated": true,
+   "steps": 16,
+   "kinds": {
+    "file_open": 16
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "langgraph/new-langgraph-project/agent",
+   "framework": "langgraph",
+   "source": "https://github.com/langchain-ai/new-langgraph-project@36b4403a6709a9c3afdbf303849dfd37e81a32bd:.",
+   "shim": null,
+   "generated": true,
+   "steps": 16,
+   "kinds": {
+    "file_open": 16
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/agents_as_tools/orchestrator_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/agents_as_tools/synthesizer_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/agents_as_tools_conditional/orchestrator",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/agents_as_tools_structured/orchestrator",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/deterministic/story_outline_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/deterministic/outline_checker_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/deterministic/story_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/human_in_the_loop/agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/input_guardrails/guardrail_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/llm_as_a_judge/story_outline_generator",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/output_guardrails/agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/parallelization/spanish_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/parallelization/translation_picker",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/routing/triage_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/streaming_guardrails/agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/agent_patterns/streaming_guardrails/guardrail_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/basic/agent_lifecycle_example/start_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/basic/dynamic_system_prompt/agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/basic/lifecycle_example/start_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/basic/tool_guardrails/agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/basic/tools/agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/financial_research_agent/agents/financials_agent/financials_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/financial_research_agent/agents/planner_agent/planner_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/financial_research_agent/agents/risk_agent/risk_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/financial_research_agent/agents/search_agent/search_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/financial_research_agent/agents/verifier_agent/verifier_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/financial_research_agent/agents/writer_agent/writer_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/handoffs/message_filter/first_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/handoffs/message_filter/second_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/handoffs/message_filter_streaming/first_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/handoffs/message_filter_streaming/second_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/research_bot/agents/planner_agent/planner_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/research_bot/agents/search_agent/search_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/research_bot/agents/writer_agent/writer_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/tools/tool_search/namespaced_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/tools/tool_search/top_level_agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/voice/static/main/agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": false,
+   "why": [
+    "  openai-agents: importing /var/tmp/corpus-src/openai-agents-python/examples/voice/static/main.py failed: ModuleNotFoundError: No module named 'sounddevice'",
+    "varek: the openai-agents adapter wrote no plan (exit 1)",
+    "  fix: what it said is above"
+   ]
+  },
+  {
+   "id": "openai-agents/voice/streamed/my_workflow/agent",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:.",
+   "shim": null,
+   "generated": true,
+   "steps": 17,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/mcp/filesystem_example",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:examples/mcp/filesystem_example",
+   "shim": "shims/openai/filesystem_example.py",
+   "generated": true,
+   "steps": 18,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1,
+    "subagent": 1
+   },
+   "names_a_server": true,
+   "authorized": false,
+   "refused_steps": [
+    {
+     "kind": "subagent",
+     "object": "filesystem_server__via_npx",
+     "decision": "UNKNOWN",
+     "why": "no rule of the policy launches a sub-agent by that name",
+     "stratum": "launch",
+     "v111_clears": false
+    }
+   ],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/mcp/git_example",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:examples/mcp/git_example",
+   "shim": "shims/openai/git_example.py",
+   "generated": true,
+   "steps": 18,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1,
+    "subagent": 1
+   },
+   "names_a_server": true,
+   "authorized": false,
+   "refused_steps": [
+    {
+     "kind": "subagent",
+     "object": "stdio__uvx",
+     "decision": "UNKNOWN",
+     "why": "no rule of the policy launches a sub-agent by that name",
+     "stratum": "launch",
+     "v111_clears": false
+    }
+   ],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/mcp/sse_example",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:examples/mcp/sse_example",
+   "shim": "shims/openai/sse_example.py",
+   "generated": true,
+   "steps": 21,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1,
+    "mcp_call": 4
+   },
+   "names_a_server": true,
+   "authorized": false,
+   "refused_steps": [
+    {
+     "kind": "mcp_call",
+     "object": "http://127.0.0.1:8000/sse",
+     "decision": "UNKNOWN",
+     "why": "an MCP server's host is a host name, not an address",
+     "stratum": "string-host",
+     "v111_clears": false
+    },
+    {
+     "kind": "mcp_call",
+     "object": "http://127.0.0.1:8000/sse",
+     "decision": "UNKNOWN",
+     "why": "an MCP server's host is a host name, not an address",
+     "stratum": "string-host",
+     "v111_clears": false
+    },
+    {
+     "kind": "mcp_call",
+     "object": "http://127.0.0.1:8000/sse",
+     "decision": "UNKNOWN",
+     "why": "an MCP server's host is a host name, not an address",
+     "stratum": "string-host",
+     "v111_clears": false
+    },
+    {
+     "kind": "mcp_call",
+     "object": "http://127.0.0.1:8000/sse",
+     "decision": "UNKNOWN",
+     "why": "an MCP server's host is a host name, not an address",
+     "stratum": "string-host",
+     "v111_clears": false
+    }
+   ],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/mcp/streamable_http_remote_example",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:examples/mcp/streamable_http_remote_example",
+   "shim": "shims/openai/streamable_http_remote_example.py",
+   "generated": true,
+   "steps": 21,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1,
+    "mcp_call": 4
+   },
+   "names_a_server": true,
+   "authorized": false,
+   "refused_steps": [
+    {
+     "kind": "mcp_call",
+     "object": "https://mcp.deepwiki.com:443/mcp#tools/call#",
+     "decision": "UNKNOWN",
+     "why": "no rule of the policy allows it",
+     "stratum": "collection",
+     "v111_clears": false
+    }
+   ],
+   "refused_only_collection": true,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/mcp/streamablehttp_example",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:examples/mcp/streamablehttp_example",
+   "shim": "shims/openai/streamablehttp_example.py",
+   "generated": true,
+   "steps": 21,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1,
+    "mcp_call": 4
+   },
+   "names_a_server": true,
+   "authorized": false,
+   "refused_steps": [
+    {
+     "kind": "mcp_call",
+     "object": "http://127.0.0.1:8000/mcp",
+     "decision": "UNKNOWN",
+     "why": "an MCP server's host is a host name, not an address",
+     "stratum": "string-host",
+     "v111_clears": false
+    },
+    {
+     "kind": "mcp_call",
+     "object": "http://127.0.0.1:8000/mcp",
+     "decision": "UNKNOWN",
+     "why": "an MCP server's host is a host name, not an address",
+     "stratum": "string-host",
+     "v111_clears": false
+    },
+    {
+     "kind": "mcp_call",
+     "object": "http://127.0.0.1:8000/mcp",
+     "decision": "UNKNOWN",
+     "why": "an MCP server's host is a host name, not an address",
+     "stratum": "string-host",
+     "v111_clears": false
+    },
+    {
+     "kind": "mcp_call",
+     "object": "http://127.0.0.1:8000/mcp",
+     "decision": "UNKNOWN",
+     "why": "an MCP server's host is a host name, not an address",
+     "stratum": "string-host",
+     "v111_clears": false
+    }
+   ],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "openai-agents/mcp/tool_filter_example",
+   "framework": "openai-agents",
+   "source": "https://github.com/openai/openai-agents-python@0dc4cf152bff1f50bdc0e41f28808563406545b2:examples/mcp/tool_filter_example",
+   "shim": "shims/openai/tool_filter_example.py",
+   "generated": true,
+   "steps": 18,
+   "kinds": {
+    "file_open": 16,
+    "net_connect": 1,
+    "subagent": 1
+   },
+   "names_a_server": true,
+   "authorized": false,
+   "refused_steps": [
+    {
+     "kind": "subagent",
+     "object": "filesystem_server_with_filter",
+     "decision": "UNKNOWN",
+     "why": "no rule of the policy launches a sub-agent by that name",
+     "stratum": "launch",
+     "v111_clears": false
+    }
+   ],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "claude/sdk-repo-settings",
+   "framework": "claude",
+   "source": "https://github.com/anthropics/claude-agent-sdk-python@0e89b298e771259378a6cd3734e00d323dff5703:.",
+   "shim": null,
+   "generated": true,
+   "steps": 21,
+   "kinds": {
+    "file_open": 17,
+    "net_connect": 2,
+    "process_exec": 2
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "claude/examples/quick_start",
+   "framework": "claude",
+   "source": "https://github.com/anthropics/claude-agent-sdk-python@0e89b298e771259378a6cd3734e00d323dff5703:examples",
+   "shim": null,
+   "generated": true,
+   "steps": 20,
+   "kinds": {
+    "file_open": 17,
+    "net_connect": 2,
+    "process_exec": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "claude/examples/streaming_mode",
+   "framework": "claude",
+   "source": "https://github.com/anthropics/claude-agent-sdk-python@0e89b298e771259378a6cd3734e00d323dff5703:examples",
+   "shim": null,
+   "generated": true,
+   "steps": 20,
+   "kinds": {
+    "file_open": 17,
+    "net_connect": 2,
+    "process_exec": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "claude/examples/tools_option",
+   "framework": "claude",
+   "source": "https://github.com/anthropics/claude-agent-sdk-python@0e89b298e771259378a6cd3734e00d323dff5703:examples",
+   "shim": null,
+   "generated": true,
+   "steps": 20,
+   "kinds": {
+    "file_open": 17,
+    "net_connect": 2,
+    "process_exec": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "claude/examples/hooks",
+   "framework": "claude",
+   "source": "https://github.com/anthropics/claude-agent-sdk-python@0e89b298e771259378a6cd3734e00d323dff5703:examples",
+   "shim": null,
+   "generated": true,
+   "steps": 20,
+   "kinds": {
+    "file_open": 17,
+    "net_connect": 2,
+    "process_exec": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "claude/examples/mcp_calculator",
+   "framework": "claude",
+   "source": "https://github.com/anthropics/claude-agent-sdk-python@0e89b298e771259378a6cd3734e00d323dff5703:examples",
+   "shim": null,
+   "generated": true,
+   "steps": 20,
+   "kinds": {
+    "file_open": 17,
+    "net_connect": 2,
+    "process_exec": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  },
+  {
+   "id": "claude/examples/agents",
+   "framework": "claude",
+   "source": "https://github.com/anthropics/claude-agent-sdk-python@0e89b298e771259378a6cd3734e00d323dff5703:examples",
+   "shim": null,
+   "generated": true,
+   "steps": 20,
+   "kinds": {
+    "file_open": 17,
+    "net_connect": 2,
+    "process_exec": 1
+   },
+   "names_a_server": false,
+   "authorized": true,
+   "refused_steps": [],
+   "refused_only_collection": false,
+   "v111_could_start": false
+  }
+ ]
+}

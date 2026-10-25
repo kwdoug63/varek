@@ -142,19 +142,44 @@ def header(P, adapter, source, what, notes=()):
     P.start()
 
 
-def runtime_steps(P, app_dir=None, home=None, extra=()):
+def python_env_dirs():
+    """step 10: the directories of this Python's environment outside the
+    system's (a virtual environment, a Python of its own): a code adapter
+    runs in the agent's own Python (varek plan generate --python), so these
+    are where the agent's packages are read from"""
+    out = []
+    for d in (sys.prefix, sys.base_prefix, os.path.realpath(sys.prefix), os.path.realpath(sys.base_prefix)):
+        d = os.path.normpath(d)
+        if d in ("/", "/usr") or d.startswith(("/usr/", "/lib", "/etc/")):
+            continue
+        if d not in out:
+            out.append(d)
+    return out
+
+
+def runtime_steps(P, app_dir=None, home=None, extra=(), python_env=False):
     """the language runtime's own reads (the system read-only, /proc/self/,
     /dev/null and /dev/urandom, /tmp/), its code read-only, and the files and
-    directories it is configured with (extra: (path, read_only))"""
+    directories it is configured with (extra: (path, read_only)); with
+    python_env, the agent's Python environment read-only (python_env_dirs)"""
     P.comment()
     P.comment("the language runtime's own reads, and the agent's code")
     for lab, path, f in (("sys_usr", "/usr/", "read"), ("sys_lib", "/lib/", "read"), ("sys_lib64", "/lib64/", "read"),
                          ("sys_etc", "/etc/", "read"), ("proc_self", "/proc/self/", "read"),
                          ("dev_null", "/dev/null", None), ("dev_urandom", "/dev/urandom", "read"),
-                         ("tmp", "/tmp/", None)):
+                         ("tmp", "/tmp/", None),
+                         # step 10: what a runtime reads of the machine as it loads (the CPU count, the
+                         # control group's limits, OpenSSL's FIPS switch): a held run is refused the rest
+                         ("proc_stat", "/proc/stat", "read"), ("proc_cpuinfo", "/proc/cpuinfo", "read"),
+                         ("proc_meminfo", "/proc/meminfo", "read"),
+                         ("fips", "/proc/sys/crypto/fips_enabled", "read"),
+                         ("sys_cpu", "/sys/devices/system/cpu/", "read"), ("cgroup", "/sys/fs/cgroup/", "read")):
         P.step("file_open", path, lab, **({"open": f} if f else {}))
     if app_dir:
         P.step("file_open", app_dir.rstrip("/") + "/", "app", open="read")
+    if python_env:
+        for d in python_env_dirs():
+            P.step("file_open", d + "/", "python_env", open="read")
     for path, ro in extra:
         P.step("file_open", path, "file", os.path.basename(path.rstrip("/")), **({"open": "read"} if ro else {}))
 
@@ -358,10 +383,26 @@ def import_attr(root, entry, what):
     for d in (os.path.dirname(file), root):
         if d not in sys.path:
             sys.path.insert(0, d)
-    spec = importlib.util.spec_from_file_location("varek_plan_agent_" + os.path.basename(file)[:-3], file)
-    mod = importlib.util.module_from_spec(spec)
+    # step 8: a file in a package is imported as its package's module (its
+    # relative imports work, as `langgraph dev` loads it); any other is
+    # registered in sys.modules before it runs (a dataclass looks its module
+    # up there as it is defined)
+    parts, d = [os.path.basename(file)[:-3]], os.path.dirname(file)
+    while os.path.isfile(os.path.join(d, "__init__.py")) and d != os.path.dirname(d):
+        parts.insert(0, os.path.basename(d))
+        d = os.path.dirname(d)
     try:
-        spec.loader.exec_module(mod)
+        if len(parts) > 1:
+            if d not in sys.path:
+                sys.path.insert(0, d)
+            import importlib
+            mod = importlib.import_module(".".join(parts))
+        else:
+            name = "varek_plan_agent_" + parts[0]
+            spec = importlib.util.spec_from_file_location(name, file)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[name] = mod
+            spec.loader.exec_module(mod)
     except Exception as e:
         raise AdapterError(f"importing {file} failed: {type(e).__name__}: {e}")
     if not hasattr(mod, attr):

@@ -196,17 +196,9 @@ def generate(a):
     P.start()
 
     if not a.no_runtime:
-        P.comment()
-        P.comment("the language runtime's own reads, and its code")
-        for lab, path, f in (("sys_usr", "/usr/", "read"), ("sys_lib", "/lib/", "read"), ("sys_lib64", "/lib64/", "read"),
-                             ("sys_etc", "/etc/", "read"), ("proc_self", "/proc/self/", "read"),
-                             ("dev_null", "/dev/null", None), ("dev_urandom", "/dev/urandom", "read"),
-                             ("tmp", "/tmp/", None)):
-            P.step("file_open", path, lab, **({"open": f} if f else {}))
         app = a.app_dir or workdir(rt, root)
-        if app:
-            P.step("file_open", app.rstrip("/") + "/", "app", open="read")
-        else:
+        vp.runtime_steps(P, app)                 # step 10: the shared runtime reads, the machine's too
+        if not app:
             warn(f"runtime {rname}: its code directory in the container is not known (no WORKDIR): give --app-dir")
 
     said = False

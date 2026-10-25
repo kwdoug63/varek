@@ -1,0 +1,35 @@
+# Written by `varek plan generate --from openai-agents` (VAREK 1.35.0, adapters/openai_agents.py)
+# from varek_shim.py:agent
+# agent Assistant: 1 agent(s) with its handoffs
+# Each step names something the agent is given. Held to this plan (varek run --hold-to-plan,
+# or a policy's `require plan`), the run is refused a call the policy allows that no step
+# covers.
+plan 1.35
+#
+# the language runtime's own reads, and the agent's code
+action sys_usr file_open /usr/ open=read
+action sys_lib file_open /lib/ open=read
+action sys_lib64 file_open /lib64/ open=read
+action sys_etc file_open /etc/ open=read
+action proc_self file_open /proc/self/ open=read
+action dev_null file_open /dev/null
+action dev_urandom file_open /dev/urandom open=read
+action tmp file_open /tmp/
+action proc_stat file_open /proc/stat open=read
+action proc_cpuinfo file_open /proc/cpuinfo open=read
+action proc_meminfo file_open /proc/meminfo open=read
+action fips file_open /proc/sys/crypto/fips_enabled open=read
+action sys_cpu file_open /sys/devices/system/cpu/ open=read
+action cgroup file_open /sys/fs/cgroup/ open=read
+action app file_open /var/tmp/varek-plan-corpus/work/openai-agents__mcp__git_example/ open=read
+action python_env file_open /var/tmp/lg/venv/ open=read
+#
+# the hosts the agent reaches
+#   api.openai.com:443: agent Assistant's model: OpenAI's API (the SDK's default model)
+action model net_connect api.openai.com:443
+#   api.openai.com:443: the SDK's traces (off with --no-traces where the agent turns them off)
+#
+# MCP server stdio: uvx (MCPServerStdio)
+#   stdio: uvx: a server the agent launches (uvx); its calls over stdio are not decided,
+#   its launch is, as the sub-agent the policy names it (`mcp server` or subagent=)
+action subagent_stdio__uvx subagent stdio__uvx

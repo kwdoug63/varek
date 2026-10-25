@@ -1,0 +1,4 @@
+/var/tmp/varek-plan-corpus/policies/watsonx__flow_builder__dynamic_forms.policy: glob tokens 0 of 4096
+/var/tmp/varek-plan-corpus/policies/watsonx__flow_builder__dynamic_forms.policy: 15 rules, 0 can never fire
+
+  OK    /var/tmp/varek-plan-corpus/plans/watsonx__flow_builder__dynamic_forms.plan: authorized under /var/tmp/varek-plan-corpus/policies/watsonx__flow_builder__dynamic_forms.policy (15 actions)

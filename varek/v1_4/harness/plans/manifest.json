@@ -1,0 +1,1429 @@
+{
+ "about": "v1.35 step 8: the plan corpus (harness/plans/README.md), public example agents of each framework at pinned commits",
+ "repos": {
+  "amazon-bedrock-agentcore-samples": {
+   "url": "https://github.com/awslabs/amazon-bedrock-agentcore-samples",
+   "commit": "0672a4e9c2f8b194007ee479fc7f15f03dc335f4"
+  },
+  "ibm-watsonx-orchestrate-adk": {
+   "url": "https://github.com/IBM/ibm-watsonx-orchestrate-adk",
+   "commit": "724d6af901cc77548917bd9c83488abc47cc367a"
+  },
+  "react-agent": {
+   "url": "https://github.com/langchain-ai/react-agent",
+   "commit": "87aac0fdcb811d05457314a42418f3fbe139933a"
+  },
+  "memory-agent": {
+   "url": "https://github.com/langchain-ai/memory-agent",
+   "commit": "6593de01380d8435f758295531a5023f530f831c"
+  },
+  "retrieval-agent-template": {
+   "url": "https://github.com/langchain-ai/retrieval-agent-template",
+   "commit": "8950705b90101226321265378f57c4cecce078fb"
+  },
+  "data-enrichment": {
+   "url": "https://github.com/langchain-ai/data-enrichment",
+   "commit": "847337a940630e17aaeae644b194b02a08ef12db"
+  },
+  "new-langgraph-project": {
+   "url": "https://github.com/langchain-ai/new-langgraph-project",
+   "commit": "36b4403a6709a9c3afdbf303849dfd37e81a32bd"
+  },
+  "openai-agents-python": {
+   "url": "https://github.com/openai/openai-agents-python",
+   "commit": "0dc4cf152bff1f50bdc0e41f28808563406545b2"
+  },
+  "claude-agent-sdk-python": {
+   "url": "https://github.com/anthropics/claude-agent-sdk-python",
+   "commit": "0e89b298e771259378a6cd3734e00d323dff5703"
+  }
+ },
+ "agents": [
+  {
+   "id": "agentcore/episodic-memory-claims-agent",
+   "framework": "agentcore",
+   "repo": "amazon-bedrock-agentcore-samples",
+   "path": "02-use-cases/01-conversational-agents/episodic-memory-claims-agent/agent",
+   "args": [
+    "--region",
+    "us-east-1"
+   ]
+  },
+  {
+   "id": "agentcore/private-idp-ping-agent",
+   "framework": "agentcore",
+   "repo": "amazon-bedrock-agentcore-samples",
+   "path": "01-features/05-authenticate-and-authorize/01-inbound-auth/04-inbound-auth-pingfederate/agent/private-idp-ping-agent",
+   "args": [
+    "--region",
+    "us-east-1"
+   ]
+  },
+  {
+   "id": "agentcore/receipts-intelligent-document-processing-agent",
+   "framework": "agentcore",
+   "repo": "amazon-bedrock-agentcore-samples",
+   "path": "02-use-cases/02-workflow-automation-agents/receipts-intelligent-document-processing-agent",
+   "args": [
+    "--region",
+    "us-east-1",
+    "--gateway-url",
+    "ReceiptsGateway=https://receiptsgateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+   ],
+   "note": "its gateway is not deployed: --gateway-url gives a stand-in URL; its tools are read from the project's tool schemas"
+  },
+  {
+   "id": "agentcore/event-driven-claims-agent",
+   "framework": "agentcore",
+   "repo": "amazon-bedrock-agentcore-samples",
+   "path": "02-use-cases/02-workflow-automation-agents/event-driven-claims-agent",
+   "args": [
+    "--region",
+    "us-east-1",
+    "--gateway-url",
+    "ClaimsGateway=https://claimsgateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+   ],
+   "note": "its gateway is not deployed: --gateway-url gives a stand-in URL; its tools are read from the project's tool schemas"
+  },
+  {
+   "id": "agentcore/it-incident-response-agent",
+   "framework": "agentcore",
+   "repo": "amazon-bedrock-agentcore-samples",
+   "path": "02-use-cases/02-workflow-automation-agents/it-incident-response-agent",
+   "args": [
+    "--region",
+    "us-east-1",
+    "--gateway-url",
+    "ITIncidentGateway=https://itincidentgateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+   ],
+   "note": "its gateway is not deployed: --gateway-url gives a stand-in URL; its tools are read from the project's tool schemas"
+  },
+  {
+   "id": "watsonx/agent-skills",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/agent-skills",
+   "args": [
+    "--agent",
+    "hello_skill_agent"
+   ]
+  },
+  {
+   "id": "watsonx/agent_builder",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/agent_builder",
+   "args": [
+    "--agent",
+    "st_marys_hospitals_agent"
+   ]
+  },
+  {
+   "id": "watsonx/agent_builder/box_knowledge",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/agent_builder/box_knowledge",
+   "args": [
+    "--agent",
+    "hr_benefits_agent"
+   ]
+  },
+  {
+   "id": "watsonx/agent_builder/catalog_onboarding",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/agent_builder/catalog_onboarding",
+   "args": [
+    "--agent",
+    "catalog_example_agent"
+   ]
+  },
+  {
+   "id": "watsonx/agent_builder/healthcare_provider",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/agent_builder/healthcare_provider",
+   "args": [
+    "--agent",
+    "healthcare_agent"
+   ]
+  },
+  {
+   "id": "watsonx/agent_builder/ibm_knowledge",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/agent_builder/ibm_knowledge",
+   "args": [
+    "--agent",
+    "ibm_agent"
+   ]
+  },
+  {
+   "id": "watsonx/agent_builder/personal_banking",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/agent_builder/personal_banking",
+   "args": [
+    "--agent",
+    "personal_banking_agent"
+   ]
+  },
+  {
+   "id": "watsonx/agent_builder/voice_enabled_azure",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/agent_builder/voice_enabled_azure",
+   "args": [
+    "--agent",
+    "sample_agent"
+   ]
+  },
+  {
+   "id": "watsonx/agent_builder/voice_enabled_deepgram",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/agent_builder/voice_enabled_deepgram",
+   "args": [
+    "--agent",
+    "sample_agent"
+   ]
+  },
+  {
+   "id": "watsonx/agent_builder/voice_enabled_elevenlabs",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/agent_builder/voice_enabled_elevenlabs",
+   "args": [
+    "--agent",
+    "sample_agent"
+   ]
+  },
+  {
+   "id": "watsonx/agent_builder/voice_enabled_google",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/agent_builder/voice_enabled_google",
+   "args": [
+    "--agent",
+    "sample_agent"
+   ]
+  },
+  {
+   "id": "watsonx/agent_builder/voice_enabled_watson",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/agent_builder/voice_enabled_watson",
+   "args": [
+    "--agent",
+    "sample_agent"
+   ]
+  },
+  {
+   "id": "watsonx/channel-integrations/SIP_phone_channel",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/channel-integrations/SIP_phone_channel",
+   "args": [
+    "--agent",
+    "channel_agent"
+   ]
+  },
+  {
+   "id": "watsonx/channel-integrations/facebook_messenger_channel",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/channel-integrations/facebook_messenger_channel",
+   "args": [
+    "--agent",
+    "channel_agent"
+   ]
+  },
+  {
+   "id": "watsonx/channel-integrations/genesys_audio_connector_phone_channel",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/channel-integrations/genesys_audio_connector_phone_channel",
+   "args": [
+    "--agent",
+    "channel_agent"
+   ]
+  },
+  {
+   "id": "watsonx/channel-integrations/genesys_bot_connector_channel",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/channel-integrations/genesys_bot_connector_channel",
+   "args": [
+    "--agent",
+    "channel_agent"
+   ]
+  },
+  {
+   "id": "watsonx/channel-integrations/slack_channel",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/channel-integrations/slack_channel",
+   "args": [
+    "--agent",
+    "channel_agent"
+   ]
+  },
+  {
+   "id": "watsonx/channel-integrations/teams_channel",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/channel-integrations/teams_channel",
+   "args": [
+    "--agent",
+    "channel_agent"
+   ]
+  },
+  {
+   "id": "watsonx/channel-integrations/twilio_sms_channel",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/channel-integrations/twilio_sms_channel",
+   "args": [
+    "--agent",
+    "channel_agent"
+   ]
+  },
+  {
+   "id": "watsonx/channel-integrations/twilio_whatsapp_channel",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/channel-integrations/twilio_whatsapp_channel",
+   "args": [
+    "--agent",
+    "channel_agent"
+   ]
+  },
+  {
+   "id": "watsonx/compaction",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/compaction",
+   "args": [
+    "--agent",
+    "research_assistant"
+   ]
+  },
+  {
+   "id": "watsonx/experimental/agent_builder/customer_care_style",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/experimental/agent_builder/customer_care_style",
+   "args": [
+    "--agent",
+    "banking_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/Document_Review",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/Document_Review",
+   "args": [
+    "--agent",
+    "Document_review_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/Employee_information",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/Employee_information",
+   "args": [
+    "--agent",
+    "employee_information_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/Event_manager",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/Event_manager",
+   "args": [
+    "--agent",
+    "Event_manager"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/Grievance_Processing_Agent",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/Grievance_Processing_Agent",
+   "args": [
+    "--agent",
+    "Doc_Processing_Agent_6873w7"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/HR_agent",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/HR_agent",
+   "args": [
+    "--agent",
+    "HR_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/IT_agent",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/IT_agent",
+   "args": [
+    "--agent",
+    "IT_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/Payment_agent",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/Payment_agent",
+   "args": [
+    "--agent",
+    "Payment_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/Random_Failure",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/Random_Failure",
+   "args": [
+    "--agent",
+    "testAgent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/Time_off_Agent",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/Time_off_Agent",
+   "args": [
+    "--agent",
+    "HR_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/agent_scheduler",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/agent_scheduler",
+   "args": [
+    "--agent",
+    "agent_scheduler"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/book_a_flight",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/book_a_flight",
+   "args": [
+    "--agent",
+    "Book_a_flight_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/car_price_calculator",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/car_price_calculator",
+   "args": [
+    "--agent",
+    "car_price_calculator"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/collaborator_agents",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/collaborator_agents",
+   "args": [
+    "--agent",
+    "aggregate_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/count_tracker_flow",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/count_tracker_flow",
+   "args": [
+    "--agent",
+    "count_tracker_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/document_classifier",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/document_classifier",
+   "args": [
+    "--agent",
+    "document_classifier_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/document_extractor",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/document_extractor",
+   "args": [
+    "--agent",
+    "document_extractor_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/document_extractor_structured",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/document_extractor_structured",
+   "args": [
+    "--agent",
+    "structured_document_extractor_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/document_processing",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/document_processing",
+   "args": [
+    "--agent",
+    "document_processing_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/dynamic_forms",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/dynamic_forms",
+   "args": [
+    "--agent",
+    "user_activity_dynamic_forms_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/extract_support_request",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/extract_support_request",
+   "args": [
+    "--agent",
+    "ticket_processing_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/extract_support_request_llm_params",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/extract_support_request_llm_params",
+   "args": [
+    "--agent",
+    "ticket_processing_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/flow_callback",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/flow_callback",
+   "args": [
+    "--agent",
+    "flow_callback_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/flow_callback_no_db",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/flow_callback_no_db",
+   "args": [
+    "--agent",
+    "flow_callback_agent_no_db"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/foreach_email",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/foreach_email",
+   "args": [
+    "--agent",
+    "customer_email_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/get_facts_numbers",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/get_facts_numbers",
+   "args": [
+    "--agent",
+    "get_number_fact_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/get_insurance_rate",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/get_insurance_rate",
+   "args": [
+    "--agent",
+    "insurance_assessment_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/get_pet_facts_error_branching",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/get_pet_facts_error_branching",
+   "args": [
+    "--agent",
+    "pet_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/get_pet_facts_if_else",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/get_pet_facts_if_else",
+   "args": [
+    "--agent",
+    "pet_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/get_tuition_reimbursed",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/get_tuition_reimbursed",
+   "args": [
+    "--agent",
+    "get_tuition_reimbursed_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/hello_message_flow",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/hello_message_flow",
+   "args": [
+    "--agent",
+    "hello_message_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/hello_message_flow_datamap",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/hello_message_flow_datamap",
+   "args": [
+    "--agent",
+    "hello_message_datamap_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/hello_message_script_flow",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/hello_message_script_flow",
+   "args": [
+    "--agent",
+    "hello_message_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/ibm_knowledge_to_emails",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/ibm_knowledge_to_emails",
+   "args": [
+    "--agent",
+    "ibm_email_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/live_agent_transfer_flow",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/live_agent_transfer_flow",
+   "args": [
+    "--agent",
+    "book_hotel_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/masking_test_flow",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/masking_test_flow",
+   "args": [
+    "--agent",
+    "masking_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/parallel_flow",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/parallel_flow",
+   "args": [
+    "--agent",
+    "feature_delivery_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/recent_transactions",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/recent_transactions",
+   "args": [
+    "--agent",
+    "recent_transactions"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/schedule_helpdesk_alert",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/schedule_helpdesk_alert",
+   "args": [
+    "--agent",
+    "schedule_alert_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/text_extraction",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/text_extraction",
+   "args": [
+    "--agent",
+    "text_extraction_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/triage_workflow_agent_swarm",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/triage_workflow_agent_swarm",
+   "args": [
+    "--agent",
+    "billing_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/user_activity",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/user_activity",
+   "args": [
+    "--agent",
+    "user_flow_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/user_activity_no_files",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/user_activity_no_files",
+   "args": [
+    "--agent",
+    "user_flow_agent_no_files"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/user_activity_user_assignment",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/user_activity_user_assignment",
+   "args": [
+    "--agent",
+    "multi_user_flow_agent"
+   ]
+  },
+  {
+   "id": "watsonx/flow_builder/user_activity_with_forms",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/flow_builder/user_activity_with_forms",
+   "args": [
+    "--agent",
+    "user_flow_forms_agent"
+   ]
+  },
+  {
+   "id": "watsonx/langflow/travel_advice",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/langflow/travel_advice",
+   "args": [
+    "--agent",
+    "travel_advice_agent"
+   ]
+  },
+  {
+   "id": "watsonx/langflow/travel_visa_enquiry",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/langflow/travel_visa_enquiry",
+   "args": [
+    "--agent",
+    "travel_visa_agent"
+   ]
+  },
+  {
+   "id": "watsonx/plugins",
+   "framework": "watsonx",
+   "repo": "ibm-watsonx-orchestrate-adk",
+   "path": "examples/plugins",
+   "args": [
+    "--agent",
+    "email_agent"
+   ]
+  },
+  {
+   "id": "langgraph/react-agent/agent",
+   "framework": "langgraph",
+   "repo": "react-agent",
+   "path": ".",
+   "args": [
+    "--graph",
+    "agent"
+   ]
+  },
+  {
+   "id": "langgraph/memory-agent/agent",
+   "framework": "langgraph",
+   "repo": "memory-agent",
+   "path": ".",
+   "args": [
+    "--graph",
+    "agent"
+   ]
+  },
+  {
+   "id": "langgraph/retrieval-agent-template/retrieval_graph",
+   "framework": "langgraph",
+   "repo": "retrieval-agent-template",
+   "path": ".",
+   "args": [
+    "--graph",
+    "retrieval_graph"
+   ]
+  },
+  {
+   "id": "langgraph/retrieval-agent-template/indexer",
+   "framework": "langgraph",
+   "repo": "retrieval-agent-template",
+   "path": ".",
+   "args": [
+    "--graph",
+    "indexer"
+   ]
+  },
+  {
+   "id": "langgraph/data-enrichment/agent",
+   "framework": "langgraph",
+   "repo": "data-enrichment",
+   "path": ".",
+   "args": [
+    "--graph",
+    "agent"
+   ]
+  },
+  {
+   "id": "langgraph/new-langgraph-project/agent",
+   "framework": "langgraph",
+   "repo": "new-langgraph-project",
+   "path": ".",
+   "args": [
+    "--graph",
+    "agent"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/agents_as_tools/orchestrator_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/agents_as_tools.py:orchestrator_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/agents_as_tools/synthesizer_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/agents_as_tools.py:synthesizer_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/agents_as_tools_conditional/orchestrator",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/agents_as_tools_conditional.py:orchestrator"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/agents_as_tools_structured/orchestrator",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/agents_as_tools_structured.py:orchestrator"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/deterministic/story_outline_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/deterministic.py:story_outline_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/deterministic/outline_checker_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/deterministic.py:outline_checker_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/deterministic/story_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/deterministic.py:story_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/human_in_the_loop/agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/human_in_the_loop.py:agent"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/input_guardrails/guardrail_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/input_guardrails.py:guardrail_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/llm_as_a_judge/story_outline_generator",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/llm_as_a_judge.py:story_outline_generator"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/output_guardrails/agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/output_guardrails.py:agent"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/parallelization/spanish_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/parallelization.py:spanish_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/parallelization/translation_picker",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/parallelization.py:translation_picker"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/routing/triage_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/routing.py:triage_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/streaming_guardrails/agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/streaming_guardrails.py:agent"
+   ]
+  },
+  {
+   "id": "openai-agents/agent_patterns/streaming_guardrails/guardrail_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/agent_patterns/streaming_guardrails.py:guardrail_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/basic/agent_lifecycle_example/start_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/basic/agent_lifecycle_example.py:start_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/basic/dynamic_system_prompt/agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/basic/dynamic_system_prompt.py:agent"
+   ]
+  },
+  {
+   "id": "openai-agents/basic/lifecycle_example/start_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/basic/lifecycle_example.py:start_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/basic/tool_guardrails/agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/basic/tool_guardrails.py:agent"
+   ]
+  },
+  {
+   "id": "openai-agents/basic/tools/agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/basic/tools.py:agent"
+   ]
+  },
+  {
+   "id": "openai-agents/financial_research_agent/agents/financials_agent/financials_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/financial_research_agent/agents/financials_agent.py:financials_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/financial_research_agent/agents/planner_agent/planner_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/financial_research_agent/agents/planner_agent.py:planner_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/financial_research_agent/agents/risk_agent/risk_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/financial_research_agent/agents/risk_agent.py:risk_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/financial_research_agent/agents/search_agent/search_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/financial_research_agent/agents/search_agent.py:search_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/financial_research_agent/agents/verifier_agent/verifier_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/financial_research_agent/agents/verifier_agent.py:verifier_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/financial_research_agent/agents/writer_agent/writer_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/financial_research_agent/agents/writer_agent.py:writer_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/handoffs/message_filter/first_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/handoffs/message_filter.py:first_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/handoffs/message_filter/second_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/handoffs/message_filter.py:second_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/handoffs/message_filter_streaming/first_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/handoffs/message_filter_streaming.py:first_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/handoffs/message_filter_streaming/second_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/handoffs/message_filter_streaming.py:second_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/research_bot/agents/planner_agent/planner_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/research_bot/agents/planner_agent.py:planner_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/research_bot/agents/search_agent/search_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/research_bot/agents/search_agent.py:search_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/research_bot/agents/writer_agent/writer_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/research_bot/agents/writer_agent.py:writer_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/tools/tool_search/namespaced_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/tools/tool_search.py:namespaced_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/tools/tool_search/top_level_agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/tools/tool_search.py:top_level_agent"
+   ]
+  },
+  {
+   "id": "openai-agents/voice/static/main/agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/voice/static/main.py:agent"
+   ]
+  },
+  {
+   "id": "openai-agents/voice/streamed/my_workflow/agent",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": ".",
+   "args": [
+    "--entry",
+    "examples/voice/streamed/my_workflow.py:agent"
+   ]
+  },
+  {
+   "id": "openai-agents/mcp/filesystem_example",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": "examples/mcp/filesystem_example",
+   "shim": "shims/openai/filesystem_example.py",
+   "args": [
+    "--entry",
+    "varek_shim.py:agent"
+   ]
+  },
+  {
+   "id": "openai-agents/mcp/git_example",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": "examples/mcp/git_example",
+   "shim": "shims/openai/git_example.py",
+   "args": [
+    "--entry",
+    "varek_shim.py:agent"
+   ]
+  },
+  {
+   "id": "openai-agents/mcp/sse_example",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": "examples/mcp/sse_example",
+   "shim": "shims/openai/sse_example.py",
+   "args": [
+    "--entry",
+    "varek_shim.py:agent"
+   ]
+  },
+  {
+   "id": "openai-agents/mcp/streamable_http_remote_example",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": "examples/mcp/streamable_http_remote_example",
+   "shim": "shims/openai/streamable_http_remote_example.py",
+   "args": [
+    "--entry",
+    "varek_shim.py:agent"
+   ]
+  },
+  {
+   "id": "openai-agents/mcp/streamablehttp_example",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": "examples/mcp/streamablehttp_example",
+   "shim": "shims/openai/streamablehttp_example.py",
+   "args": [
+    "--entry",
+    "varek_shim.py:agent"
+   ]
+  },
+  {
+   "id": "openai-agents/mcp/tool_filter_example",
+   "framework": "openai-agents",
+   "repo": "openai-agents-python",
+   "path": "examples/mcp/tool_filter_example",
+   "shim": "shims/openai/tool_filter_example.py",
+   "args": [
+    "--entry",
+    "varek_shim.py:agent"
+   ]
+  },
+  {
+   "id": "claude/sdk-repo-settings",
+   "framework": "claude",
+   "repo": "claude-agent-sdk-python",
+   "path": ".",
+   "args": [
+    "--home",
+    "/home/agent",
+    "--cli",
+    "/var/tmp/lg/venv/lib/python3.11/site-packages/claude_agent_sdk/_bundled/claude"
+   ],
+   "note": "the repository's own .claude/settings.json and .claude/agents (filesystem_agents.py, setting_sources=[\"project\"])"
+  },
+  {
+   "id": "claude/examples/quick_start",
+   "framework": "claude",
+   "repo": "claude-agent-sdk-python",
+   "path": "examples",
+   "args": [
+    "--home",
+    "/home/agent",
+    "--cli",
+    "/var/tmp/lg/venv/lib/python3.11/site-packages/claude_agent_sdk/_bundled/claude",
+    "--allow",
+    "Read",
+    "--allow",
+    "Write"
+   ],
+   "note": "its options in code (allowed_tools, the agents' tools), given with --allow"
+  },
+  {
+   "id": "claude/examples/streaming_mode",
+   "framework": "claude",
+   "repo": "claude-agent-sdk-python",
+   "path": "examples",
+   "args": [
+    "--home",
+    "/home/agent",
+    "--cli",
+    "/var/tmp/lg/venv/lib/python3.11/site-packages/claude_agent_sdk/_bundled/claude",
+    "--allow",
+    "Read",
+    "--allow",
+    "Write"
+   ],
+   "note": "its options in code (allowed_tools, the agents' tools), given with --allow"
+  },
+  {
+   "id": "claude/examples/tools_option",
+   "framework": "claude",
+   "repo": "claude-agent-sdk-python",
+   "path": "examples",
+   "args": [
+    "--home",
+    "/home/agent",
+    "--cli",
+    "/var/tmp/lg/venv/lib/python3.11/site-packages/claude_agent_sdk/_bundled/claude",
+    "--allow",
+    "Read",
+    "--allow",
+    "Glob",
+    "--allow",
+    "Grep"
+   ],
+   "note": "its options in code (allowed_tools, the agents' tools), given with --allow"
+  },
+  {
+   "id": "claude/examples/hooks",
+   "framework": "claude",
+   "repo": "claude-agent-sdk-python",
+   "path": "examples",
+   "args": [
+    "--home",
+    "/home/agent",
+    "--cli",
+    "/var/tmp/lg/venv/lib/python3.11/site-packages/claude_agent_sdk/_bundled/claude",
+    "--allow",
+    "Write",
+    "--allow",
+    "Bash"
+   ],
+   "note": "its options in code (allowed_tools, the agents' tools), given with --allow"
+  },
+  {
+   "id": "claude/examples/mcp_calculator",
+   "framework": "claude",
+   "repo": "claude-agent-sdk-python",
+   "path": "examples",
+   "args": [
+    "--home",
+    "/home/agent",
+    "--cli",
+    "/var/tmp/lg/venv/lib/python3.11/site-packages/claude_agent_sdk/_bundled/claude",
+    "--allow",
+    "mcp__calc__add",
+    "--allow",
+    "mcp__calc__subtract",
+    "--allow",
+    "mcp__calc__multiply",
+    "--allow",
+    "mcp__calc__divide",
+    "--allow",
+    "mcp__calc__sqrt",
+    "--allow",
+    "mcp__calc__power"
+   ],
+   "note": "its options in code (allowed_tools, the agents' tools), given with --allow"
+  },
+  {
+   "id": "claude/examples/agents",
+   "framework": "claude",
+   "repo": "claude-agent-sdk-python",
+   "path": "examples",
+   "args": [
+    "--home",
+    "/home/agent",
+    "--cli",
+    "/var/tmp/lg/venv/lib/python3.11/site-packages/claude_agent_sdk/_bundled/claude",
+    "--allow",
+    "Read",
+    "--allow",
+    "Write",
+    "--allow",
+    "Edit",
+    "--allow",
+    "Grep",
+    "--allow",
+    "Glob"
+   ],
+   "note": "its options in code (allowed_tools, the agents' tools), given with --allow"
+  }
+ ]
+}

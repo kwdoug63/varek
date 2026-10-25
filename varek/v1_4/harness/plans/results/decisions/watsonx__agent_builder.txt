@@ -1,0 +1,4 @@
+/var/tmp/varek-plan-corpus/policies/watsonx__agent_builder.policy: glob tokens 0 of 4096
+/var/tmp/varek-plan-corpus/policies/watsonx__agent_builder.policy: 15 rules, 0 can never fire
+
+  OK    /var/tmp/varek-plan-corpus/plans/watsonx__agent_builder.plan: authorized under /var/tmp/varek-plan-corpus/policies/watsonx__agent_builder.policy (15 actions)

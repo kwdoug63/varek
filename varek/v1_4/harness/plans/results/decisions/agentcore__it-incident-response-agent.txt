@@ -1,0 +1,4 @@
+/var/tmp/varek-plan-corpus/policies/agentcore__it-incident-response-agent.policy: glob tokens 932 of 4096
+/var/tmp/varek-plan-corpus/policies/agentcore__it-incident-response-agent.policy: 27 rules, 0 can never fire
+
+  OK    /var/tmp/varek-plan-corpus/plans/agentcore__it-incident-response-agent.plan: authorized under /var/tmp/varek-plan-corpus/policies/agentcore__it-incident-response-agent.policy (26 actions)

@@ -1,0 +1,4 @@
+/var/tmp/varek-plan-corpus/policies/openai-agents__agent_patterns__human_in_the_loop__agent.policy: glob tokens 0 of 4096
+/var/tmp/varek-plan-corpus/policies/openai-agents__agent_patterns__human_in_the_loop__agent.policy: 17 rules, 0 can never fire
+
+  OK    /var/tmp/varek-plan-corpus/plans/openai-agents__agent_patterns__human_in_the_loop__agent.plan: authorized under /var/tmp/varek-plan-corpus/policies/openai-agents__agent_patterns__human_in_the_loop__agent.policy (17 actions)

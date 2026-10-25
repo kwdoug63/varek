@@ -1,0 +1,25 @@
+# Written by `varek plan generate --from langgraph` (VAREK 1.35.0, adapters/langgraph_plan.py)
+# from ./src/agent/graph.py:graph (graph agent)
+# graph agent: 1 graph(s), 0 model(s), 0 tool(s), 0 MCP client(s)
+# Each step names something the agent is given. Held to this plan (varek run --hold-to-plan,
+# or a policy's `require plan`), the run is refused a call the policy allows that no step
+# covers.
+plan 1.35
+#
+# the language runtime's own reads, and the agent's code
+action sys_usr file_open /usr/ open=read
+action sys_lib file_open /lib/ open=read
+action sys_lib64 file_open /lib64/ open=read
+action sys_etc file_open /etc/ open=read
+action proc_self file_open /proc/self/ open=read
+action dev_null file_open /dev/null
+action dev_urandom file_open /dev/urandom open=read
+action tmp file_open /tmp/
+action proc_stat file_open /proc/stat open=read
+action proc_cpuinfo file_open /proc/cpuinfo open=read
+action proc_meminfo file_open /proc/meminfo open=read
+action fips file_open /proc/sys/crypto/fips_enabled open=read
+action sys_cpu file_open /sys/devices/system/cpu/ open=read
+action cgroup file_open /sys/fs/cgroup/ open=read
+action app file_open /var/tmp/corpus-src/new-langgraph-project/ open=read
+action python_env file_open /var/tmp/lg/venv/ open=read

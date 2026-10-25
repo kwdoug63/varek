@@ -1,0 +1,4 @@
+/var/tmp/varek-plan-corpus/policies/langgraph__retrieval-agent-template__retrieval_graph.policy: glob tokens 0 of 4096
+/var/tmp/varek-plan-corpus/policies/langgraph__retrieval-agent-template__retrieval_graph.policy: 16 rules, 0 can never fire
+
+  OK    /var/tmp/varek-plan-corpus/plans/langgraph__retrieval-agent-template__retrieval_graph.plan: authorized under /var/tmp/varek-plan-corpus/policies/langgraph__retrieval-agent-template__retrieval_graph.policy (16 actions)

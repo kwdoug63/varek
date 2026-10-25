@@ -52,6 +52,14 @@ framework's package), MIT-licensed, with what they share in
   adapters, with the agent's virtual environment read-only). An adapter that reads data only may be run
   without the Warden (`--no-confine`, no root needed); one that imports the
   agent's code may not.
+- **The runtime's reads.** Every adapter writes the steps a language
+  runtime needs as it starts (the system read-only, `/proc/self/`, the
+  machine's CPU and control-group files, `/tmp/`, the agent's code), unless
+  `--no-runtime`; a code adapter also names the agent's own Python
+  environment (its virtual environment, read-only), since it runs in it. A
+  policy that holds the run to the plan must allow those too: the samples'
+  policies do for the system, and `tests/test_v1350.sh` adds the
+  environment's directory to a copy of each, as an operator would.
 - **What it writes is a description, not a grant.** A plan can only narrow
   what the policy allows: each step is decided by the policy when the run
   starts, and a held run is refused what no step covers.
@@ -72,7 +80,7 @@ gateway target names. For one runtime (`--runtime`, if there are several):
 | credentials, memory, a browser, a code interpreter, another runtime | `net_connect` AgentCore's data plane in the region (Identity's credentials are released to the agent by AWS from there, not by the Warden: they are comments, not `credential` steps) |
 | OpenTelemetry (on by default) | `net_connect` X-Ray and CloudWatch Logs in the region |
 | session storage, EFS, S3 Files, a capacity provider's volume | `file_open` the mount, read and written |
-| its language runtime | `file_open` the system read-only, `/proc/self/`, `/dev/null`, `/dev/urandom`, `/tmp/`, and its code (the Dockerfile's `WORKDIR`, or `/var/task` for CodeZip; `--app-dir`), unless `--no-runtime` |
+| its language runtime | `file_open` the system read-only, `/proc/self/`, `/dev/null`, `/dev/urandom`, `/tmp/`, what a runtime reads of the machine as it loads (`/proc/stat`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/sys/crypto/fips_enabled`, `/sys/devices/system/cpu/`, `/sys/fs/cgroup/`), and its code (the Dockerfile's `WORKDIR`, or `/var/task` for CodeZip; `--app-dir`), unless `--no-runtime` |
 
 Not in the project's files, so not in the plan: the agent's own tools and
 its model provider, which are its framework's (Strands, LangGraph, the
@@ -178,3 +186,9 @@ The framework versions the adapters were tested with are pinned in
 `requirements-frameworks.txt`; `tests/test_v1350.sh` runs the code adapters
 where `VAREK_FW_PYTHON` names a Python that has them, which the user
 `nobody` can read.
+
+`harness/plans/` is the plan corpus of v1.35 step 8: the adapters run on
+the frameworks' own published examples (131 agents, five frameworks, at
+pinned commits), each plan decided under a policy that names everything
+the plan names (`tools/plan_corpus.py`); its README says how, and
+`results/` what came of it.

@@ -1,0 +1,29 @@
+# Written by `varek plan generate --from watsonx` (VAREK 1.35.0, adapters/watsonx.py)
+# from agents/hr_benefits_agent.yaml (agent hr_benefits_agent)
+# agent hr_benefits_agent, model groq/openai/gpt-oss-120b
+# Each step names something the agent is given. Held to this plan (varek run --hold-to-plan,
+# or a policy's `require plan`), the run is refused a call the policy allows that no step
+# covers.
+# A native agent runs on watsonx Orchestrate: its plan can be checked against a policy
+# anywhere; a run is held to it only where the agent runs beside the Warden.
+plan 1.35
+#
+# the language runtime's own reads, and the agent's code
+action sys_usr file_open /usr/ open=read
+action sys_lib file_open /lib/ open=read
+action sys_lib64 file_open /lib64/ open=read
+action sys_etc file_open /etc/ open=read
+action proc_self file_open /proc/self/ open=read
+action dev_null file_open /dev/null
+action dev_urandom file_open /dev/urandom open=read
+action tmp file_open /tmp/
+action proc_stat file_open /proc/stat open=read
+action proc_cpuinfo file_open /proc/cpuinfo open=read
+action proc_meminfo file_open /proc/meminfo open=read
+action fips file_open /proc/sys/crypto/fips_enabled open=read
+action sys_cpu file_open /sys/devices/system/cpu/ open=read
+action cgroup file_open /sys/fs/cgroup/ open=read
+#
+# the hosts the agent reaches
+#   api.groq.com:443: the model provider (groq/openai/gpt-oss-120b)
+action model net_connect api.groq.com:443

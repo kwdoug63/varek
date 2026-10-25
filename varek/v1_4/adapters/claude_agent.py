@@ -220,6 +220,10 @@ def generate(a):
                 vp.mcp_server_steps(P, srv.get("url", ""), name, sorted(tools))
         elif srv.get("command"):
             vp.stdio_server_step(P, name, srv["command"], SYSTEM_PATH)
+    for name in sorted(set(mcp_tools) - set(servers)):
+        notes.append(f"allow rules name MCP server {name}, which .mcp.json does not: an SDK server in the agent's "
+                     f"process (create_sdk_mcp_server) or one its options give; its tools run in the agent's process "
+                     f"or reach what the plan does not name")
     for sa in subagents:
         notes.append(f"sub-agent {sa.get('name', sa['file'])} (.claude/agents/{sa['file']}) runs in the agent's "
                      f"process, with tools {sa.get('tools', 'its own')}: the plan's steps are its too")

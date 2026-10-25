@@ -184,7 +184,7 @@ def generate(a):
             tool_notes.append(f"tool {name} runs in the agent's process: what it opens and dials is decided by the "
                               f"policy, and is not in the plan (--host, --file name it)")
     if not a.no_runtime:
-        vp.runtime_steps(P, a.app_dir or root, extra=extra)
+        vp.runtime_steps(P, a.app_dir or root, extra=extra, python_env=True)
     elif extra:
         for path, ro in extra:
             P.step("file_open", path, "file", os.path.basename(path.rstrip("/")), **({"open": "read"} if ro else {}))

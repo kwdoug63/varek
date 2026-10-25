@@ -257,10 +257,14 @@ else
     python3 -m http.server "$HP" --bind 0.0.0.0 > /dev/null 2>&1 &
     SERVERS="$SERVERS $!"
     trap 'kill $SERVERS 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$OUT"; rm -rf "$W"' EXIT
-    for _ in $(seq 50); do
-        [ -e "$OUT/ready" ] && python3 -c "import socket; socket.create_connection(('$HOSTIP', $HP), 0.2)" 2>/dev/null && break
+    # v1.35 step 8: up to 30 s (under a loaded sweep the HTTP server took more than the 5 s this
+    # waited, and every connect after was refused), and said when it never answered
+    up=0
+    for _ in $(seq 300); do
+        [ -e "$OUT/ready" ] && python3 -c "import socket; socket.create_connection(('$HOSTIP', $HP), 0.2)" 2>/dev/null && { up=1; break; }
         sleep 0.1
     done
+    [ "$up" = 1 ] || echo "  NOTE   the DNS or HTTP test server did not answer within 30 s: the connects below will fail"
     NODE=$(readlink -f "$(command -v node 2>/dev/null)" 2>/dev/null)
     JAVA=$(ls /usr/lib/jvm/java-21-openjdk-*/bin/java 2>/dev/null | head -1)
     [ -n "$JAVA" ] || JAVA=$(readlink -f "$(command -v java 2>/dev/null)" 2>/dev/null)

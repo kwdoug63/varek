@@ -1104,7 +1104,8 @@ HANDOFF_OTHER_RULES = ("already_connected", "socket_option_failed", "too_many_pe
 # v1.26 review: the rules of a proxied decision the Warden refused
 PROXY_REFUSE_RULES = ("policy_match", "default_deny_unknown", "fragment_escape_flags",
                       "fragment_escape_length", "certificate_refused", "wildcard_budget",
-                      "resolution_failed", "address_refused", "run_ended", "revoked")   # v1.28: revoked
+                      "resolution_failed", "address_refused", "run_ended", "revoked",   # v1.28: revoked
+                      "outside_plan")       # v1.35 step 8: a held run's connection the plan names not (check_hold)
 # v1.26 (step 6): the Warden's decision on what the proxy read, when it allowed
 PROXY_ALLOW_RULES = ("proxy_dialed", "proxy_dial_failed")
 PROXY_KINDS = ("tls", "http", "connect")
@@ -1871,7 +1872,8 @@ def check_dialed_denies(checker, policy, rules, dialed, problems):
 REQUEST_REFUSE_RULES = ("policy_match", "default_deny_unknown", "certificate_refused", "max_body",
                         "fragment_escape_length", "revoked",       # v1.28: revoked
                         "mcp_query",                               # v1.31: a POST to an MCP endpoint with a query
-                        "mcp_endpoint_variant")                    # review: to another spelling of one
+                        "mcp_endpoint_variant",                    # review: to another spelling of one
+                        "outside_plan")                            # v1.35 step 8: a held run (check_hold)
 
 # v1.31 (section 3): an MCP call's refusals (net.mcp): by the policy, or a
 # call the proxy could not read (mcp_unreadable), whose Mcp-Method or
@@ -1881,7 +1883,8 @@ MCP_REFUSE_RULES = ("policy_match", "default_deny_unknown", "certificate_refused
                     "fragment_escape_length", "revoked", "mcp_unreadable", "mcp_header_mismatch",
                     # step 5: the agent's own bearer token (D6), a credential past its expiry
                     "mcp_token_user", "mcp_token_audience", "mcp_token_expired", "mcp_token_malformed",
-                    "credential_expired")
+                    "credential_expired",
+                    "outside_plan")         # v1.35 step 8: a held run's call no step names (check_hold)
 MCP_TOKEN_KINDS = ("placeholder", "jwt", "opaque", "malformed")
 MCP_BODY_DEFAULT = 1 << 20                 # an mcp rule without max_body=
 
@@ -2351,7 +2354,8 @@ def check_proxied(records, resolutions, handoff_all, problems, upstream=None, di
         if passthrough is not None:
             should = name not in passthrough
             if insp != (should and rule not in ("policy_match", "default_deny_unknown", "certificate_refused",
-                                                "fragment_escape_flags", "fragment_escape_length")):
+                                                "fragment_escape_flags", "fragment_escape_length",
+                                                "outside_plan")):     # v1.35 step 8: refused, not inspected
                 problems.append(f"seq {seq}: in inspecting mode, {name} was {'' if insp else 'not '}inspected, "
                                 f"which {'only a host that is not passthrough is' if insp else 'it must be'}")
                 continue

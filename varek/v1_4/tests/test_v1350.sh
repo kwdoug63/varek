@@ -405,7 +405,7 @@ check "a project file that is not JSON: no plan, said why" sh -c "[ ! -s '$OUT/g
 python3 "$VAREK" plan generate --no-confine -o "$OUT/w.plan" --from agentcore "$OUT/agentcore-weather" > "$OUT/cli.out" 2>&1
 python3 -I "$AD" "$OUT/agentcore-weather" > "$OUT/direct.plan"
 check "varek plan generate --no-confine -o: the plan written, its steps counted" sh -c \
-    "grep -q 'a plan of 18 steps, from' '$OUT/cli.out' && cmp -s '$OUT/w.plan' '$OUT/direct.plan'"
+    "grep -q 'a plan of 24 steps, from' '$OUT/cli.out' && cmp -s '$OUT/w.plan' '$OUT/direct.plan'"
 python3 "$VAREK" plan generate --no-confine -o "$OUT/w.plan" --from agentcore "$OUT/agentcore-weather" > "$OUT/cli.out" 2>&1
 check "... an existing file not written over without --force" sh -c "[ \$? != 0 ] || grep -q 'exists' '$OUT/cli.out'"
 check "... a framework with no adapter: refused, the adapters named" sh -c \
@@ -502,7 +502,7 @@ check "a code adapter (langgraph) is not run unconfined" sh -c \
 python3 "$VAREK" plan merge -o "$OUT/m.plan" "$OUT/wx.plan" "$OUT/cl.plan" > "$OUT/cli.out" 2>&1
 nwx=$(grep -c '^action' "$OUT/wx.plan"); ncl=$(grep -c '^action' "$OUT/cl.plan"); nm=$(grep -c '^action' "$OUT/m.plan")
 check "plan merge: every step of each, the runtime's reads written once" sh -c \
-    "[ $nm = \$(( $nwx + $ncl - 8 )) ] && [ \$(grep -c 'action sys_usr file_open /usr/ open=read\$' '$OUT/m.plan') = 1 ]"
+    "[ $nm = \$(( $nwx + $ncl - 14 )) ] && [ \$(grep -c 'action sys_usr file_open /usr/ open=read\$' '$OUT/m.plan') = 1 ]"
 check "... a label taken twice renamed (model), and the merged plan read as a plan" sh -c \
     "grep -q '^action model net_connect us-south.ml.cloud.ibm.com:443\$' '$OUT/m.plan' &&
      grep -q '^action model_2 net_connect api.anthropic.com:443\$' '$OUT/m.plan' &&
@@ -511,16 +511,23 @@ check "... a label taken twice renamed (model), and the merged plan read as a pl
 FWPY=${VAREK_FW_PYTHON:-}
 if [ -n "$FWPY" ] && runuser -u nobody -- "$FWPY" -I -c 'import langgraph, langchain_anthropic, langchain_openai, langchain_mcp_adapters, agents' > /dev/null 2>&1; then
     cgen() { VAREK_HOME="$OUT/home" python3 "$VAREK" plan generate --python "$FWPY" --log "$OUT/c.log" "$@" > "$OUT/gen.plan" 2> "$OUT/cli.out"; }
+    # the agent's Python environment, which the plan names and each sample's policy must allow (step 10)
+    "$FWPY" -I -c 'import os, sys
+for d in dict.fromkeys(os.path.normpath(x) for x in (sys.prefix, sys.base_prefix, os.path.realpath(sys.prefix), os.path.realpath(sys.base_prefix))):
+    if not (d in ("/", "/usr") or d.startswith(("/usr/", "/lib", "/etc/"))): print(f"allow path {d}/ readonly")' > "$OUT/venv.rules"
+    for p in langgraph-research/research openai-support/support; do cat "$OUT/$p.policy" "$OUT/venv.rules" > "$OUT/$p.venv.policy"; done
     cgen --from langgraph "$OUT/langgraph-research" --graph researcher --app-dir /srv/research
     check "langgraph under the Warden in the agent's Python: the graph's model, its MCP client's server, nothing refused" sh -c \
         "grep -q 'action model net_connect api.anthropic.com:443\$' '$OUT/gen.plan' &&
          grep -q 'mcp_call https://docs.example.com/mcp method=tools/call\$' '$OUT/gen.plan' &&
          ! grep -q '\"decision_final\":\"DENY\"' '$OUT/c.log'"
+    check "... the agent's Python environment named, read-only (the plan's python_env steps)" sh -c \
+        "[ -s '$OUT/venv.rules' ] && grep -q '^action python_env[^ ]* file_open /[^ ]*/ open=read\$' '$OUT/gen.plan'"
     check "... the graph's print as it is imported kept out of the plan (on standard error)" sh -c \
         "! grep -q 'researcher built' '$OUT/gen.plan' && grep -q 'researcher built' '$OUT/cli.out'"
-    cgen --policy "$OUT/langgraph-research/research.policy" --from langgraph "$OUT/langgraph-research" --graph researcher --app-dir /srv/research; rc=$?
+    cgen --policy "$OUT/langgraph-research/research.venv.policy" --from langgraph "$OUT/langgraph-research" --graph researcher --app-dir /srv/research; rc=$?
     check "... the researcher's plan under the sample's policy: authorized" sh -c "[ $rc = 0 ] && grep -q 'the plan: authorized under' '$OUT/cli.out'"
-    cgen --policy "$OUT/langgraph-research/research.policy" --from langgraph "$OUT/langgraph-research" --graph publisher --app-dir /srv/research; rc=$?
+    cgen --policy "$OUT/langgraph-research/research.venv.policy" --from langgraph "$OUT/langgraph-research" --graph publisher --app-dir /srv/research; rc=$?
     check "... the publisher's (a factory; a stdio MCP server it launches): refused, the sub-agent named" sh -c \
         "[ $rc = 1 ] && grep -q 'subagent step \"files\" is UNKNOWN: no rule of the policy launches a sub-agent by that name' '$OUT/cli.out' &&
          ! grep -q '\"decision_final\":\"DENY\"' '$OUT/c.log'"
@@ -529,9 +536,9 @@ if [ -n "$FWPY" ] && runuser -u nobody -- "$FWPY" -I -c 'import langgraph, langc
         "grep -q 'name=search_articles\$' '$OUT/gen.plan' && grep -q 'name=get_article\$' '$OUT/gen.plan' &&
          grep -q \"agent billing's tool invoice_total\" '$OUT/gen.plan' && grep -q \"^#   api.openai.com:443: the SDK's traces\" '$OUT/gen.plan' &&
          ! grep -q '\"decision_final\":\"DENY\"' '$OUT/c.log'"
-    cgen --policy "$OUT/openai-support/support.policy" --from openai-agents "$OUT/openai-support" --entry support.py:triage --app-dir /srv/support; rc=$?
+    cgen --policy "$OUT/openai-support/support.venv.policy" --from openai-agents "$OUT/openai-support" --entry support.py:triage --app-dir /srv/support; rc=$?
     check "... the triage agent's plan under the sample's policy: authorized" sh -c "[ $rc = 0 ] && grep -q 'the plan: authorized under' '$OUT/cli.out'"
-    cgen --policy "$OUT/openai-support/support.policy" --from openai-agents "$OUT/openai-support" --entry support.py:ops --app-dir /srv/support; rc=$?
+    cgen --policy "$OUT/openai-support/support.venv.policy" --from openai-agents "$OUT/openai-support" --entry support.py:ops --app-dir /srv/support; rc=$?
     check "... the ops agent's (no tool filter): refused, its step naming no tool" sh -c \
         "[ $rc = 1 ] && grep -q 'ops.example.com:443/mcp#tools/call#\" is UNKNOWN: no rule of the policy allows it' '$OUT/cli.out'"
 else pass "the code adapters under the Warden: not tried (VAREK_FW_PYTHON names no Python with the frameworks that nobody can read)"; fi
@@ -549,7 +556,7 @@ python3 "$AUD" --policy "$HP" --checker "$CHECKER" --plan "$OUT/h1.plan" "$OUT/h
 check "... a held run: the gate's plan the one held to, the calls refused outside it counted" sh -c \
     "[ $rc = 0 ] && grep -q 'varek_audit: plan: .*h1.plan (4 steps, SHA-256 $SHA_H1): SATISFIED; held to it, [1-9][0-9]* call(s) refused outside it' '$OUT/audit'"
 python3 "$AUD" --policy "$HP" --checker "$CHECKER" --plan "$OUT/h2.plan" "$OUT/h1.log" > "$OUT/audit" 2>&1; rc=$?
-check "... --plan another file: FAIL, the two SHA-256s given" sh -c \
+check "... --plan another file: refused, the two SHA-256s given" sh -c \
     "[ $rc = 1 ] && grep -q 'PROBLEM the plan .*h2.plan hashes to [0-9a-f]\{64\}, the run.s plan to $SHA_H1' '$OUT/audit'"
 VAREK_HOME="$HERE" VAREK_CONFIG="$OUT/hold.conf" python3 "$VAREK" audit --plan "$OUT/h2.plan" "$OUT/h1.log" > "$OUT/audit" 2>&1
 check "varek audit --plan: passed to the audit" grep -q 'h2.plan hashes to' "$OUT/audit"

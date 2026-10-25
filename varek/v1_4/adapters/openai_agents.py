@@ -140,7 +140,7 @@ def generate(a):
             raise vp.AdapterError(f"--file {f!r}: an absolute path")
         extra.append((path, ro == "ro"))
     if not a.no_runtime:
-        vp.runtime_steps(P, a.app_dir or root, extra=extra)
+        vp.runtime_steps(P, a.app_dir or root, extra=extra, python_env=True)
     else:
         for path, ro in extra:
             P.step("file_open", path, "file", os.path.basename(path.rstrip("/")), **({"open": "read"} if ro else {}))
