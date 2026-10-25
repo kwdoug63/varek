@@ -62,15 +62,16 @@ sudo varek doctor                          # is this host ready?
 sudo varek init --pack healthcare          # settings, signing key, log directory
 sudo varek preflight --run                 # a real trial run, then its audit
 sudo varek run -- python3 agent.py         # supervise an agent
-varek refusals                             # what the last run refused, and why
+sudo varek refusals                        # what the last run refused, and why
 sudo varek audit                           # re-check certificates, chain, signatures
 sudo varek export                          # signed CycloneDX 1.6 evidence
 varek export --verify <file>.cdx.json      # anyone can check that evidence
 sudo varek bench                           # what mediation costs per call on this host
 ```
 
-`varek policy list|show|check|use|add` manages policies, `varek runs` and
-`varek status` show history, and `--show-commands` prints the underlying tool
+`varek policy list|show|check|use|add` manages policies, `sudo varek runs` and
+`sudo varek status` show history (the verdict streams are root-only, so
+`runs`, `status` and `refusals` need `sudo`), and `--show-commands` prints the underlying tool
 calls. `make test-cli` runs its tests (root, Linux).
 
 ### Measuring the cost: `varek bench`
@@ -125,7 +126,8 @@ Results for v1.21.1: [`bench_results_v1_21_1.txt`](bench_results_v1_21_1.txt).
   target's PID namespace (see below). It also covers reading
   `/proc/<pid>/mem`.
 - libseccomp and, from v1.16, libsodium development headers, and from
-  v1.26.1 OpenSSL's (for `warden-proxy` only; the Warden does not link it):
+  v1.26.1 OpenSSL's (`warden-proxy` and `warden-secrets` link libssl and
+  libcrypto; from v1.29 the Warden links libcrypto too, to hash the launch set):
   `sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev`
   (Debian/Ubuntu) or `sudo dnf install -y gcc make libseccomp-devel
   libsodium-devel openssl-devel` (Fedora/RHEL). `make deps` runs the right one; `make`
