@@ -43,6 +43,10 @@
 #      and --plan the plan file; the OCSF export (the gate an event, its
 #      refused steps folded in, valid OCSF 1.9.0, --verify); the CycloneDX
 #      evidence; varek audit --plan; varek doctor's adapters
+#  11. the credential hold (step 10): a held run through the inspecting
+#      proxy, two credentials the policy releases and the plan naming one:
+#      the one swapped and sent, the other's request refused outside the
+#      plan, its value never sent; the audit accepts the run
 #
 # Usage: test_v1350.sh <warden> (tools/varek, tools/vdp_cert_check beside it)
 set -u
@@ -656,6 +660,99 @@ check "... the held run: held, and the calls refused outside its plan" sh -c \
 VAREK_HOME="$HERE" VAREK_CONFIG="$OUT/none.conf" python3 "$VAREK" doctor > "$OUT/doc" 2>&1
 check "varek doctor names the plan adapters installed" \
     grep -q 'plan adapters: agentcore, watsonx, langgraph, openai-agents, claude' "$OUT/doc"
+
+echo "== 11. the credential hold (step 10: untested until the review said so) =="
+# a held run through the inspecting proxy: two credentials the policy releases, the plan naming one.
+# A request carrying the one is swapped and reaches the server; one carrying the other is refused
+# outside the plan, and its value never leaves the Warden.
+if [ ! -x "$HERE/warden-proxy" ] || [ ! -x "$HERE/warden-secrets" ] || ! command -v openssl > /dev/null; then
+    pass "the credential hold: not tried (needs warden-proxy, warden-secrets and openssl)"
+else
+    C="$OUT/cr"; mkdir -m 755 "$C"
+    HOSTIP=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("10.255.255.255", 1)); print(s.getsockname()[0])')
+    PS=$((43000 + RANDOM % 5000)); DP=$((20000 + RANDOM % 20000))
+    ( cd "$C" &&
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key -out ca.pem -days 2 \
+          -subj "/CN=VAREK v1.35 test root" -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign" &&
+      openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout s.key -out s.csr -subj "/CN=api.example.com" &&
+      printf 'subjectAltName=DNS:api.example.com\nextendedKeyUsage=serverAuth\n' > s.ext &&
+      openssl x509 -req -in s.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out s.pem -days 1 -extfile s.ext ) > "$C/certs.log" 2>&1
+    cat "$(python3 -c 'import ssl; print(ssl.get_default_verify_paths().openssl_cafile)')" "$C/ca.pem" > "$C/bundle.pem"
+    chmod 644 "$C"/*.pem
+    cat > "$C/srv.py" <<'PY'
+import json, socket, ssl, sys, threading
+ip, port, cert, key, log = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); l.bind((ip, port)); l.listen(16)
+def serve(c):
+    try:
+        s = ctx.wrap_socket(c, server_side=True); d = b""
+        while b"\r\n\r\n" not in d:
+            x = s.recv(65536)
+            if not x: return
+            d += x
+        with open(log, "a") as f:
+            f.write(json.dumps({"head": d.split(b"\r\n\r\n", 1)[0].decode("latin-1")}) + "\n")
+        s.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"); s.close()
+    except Exception:
+        pass
+while True:
+    c, _ = l.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
+PY
+    python3 "$C/srv.py" "$HOSTIP" "$PS" "$C/s.pem" "$C/s.key" "$C/got.jsonl" > /dev/null 2>&1 &
+    CSRV=$!
+    printf '{"api.example.com": {"ttl": 30, "a": ["%s"]}}\n' "$HOSTIP" > "$C/zone.json"
+    python3 "$HERE/tests/dns_test_server.py" --port "$DP" --zone "$C/zone.json" --log "$C/dns.log" --ready "$C/dns.ready" > /dev/null 2>&1 &
+    CSRV="$CSRV $!"
+    for _ in $(seq 100); do
+        [ -e "$C/dns.ready" ] && python3 -c "import socket; socket.create_connection(('$HOSTIP', $PS), 0.2)" 2>/dev/null && break
+        sleep 0.1
+    done
+    printf 'value-of-c1\n' > "$C/v1"; printf 'value-of-c2\n' > "$C/v2"; chmod 600 "$C/v1" "$C/v2"
+    cat > "$C/agent.py" <<'PY'
+import os, socket, ssl, sys
+P = int(sys.argv[1])
+def req(tag, path, header, ph):
+    try:
+        s = ssl.create_default_context().wrap_socket(socket.create_connection(("api.example.com", P), 10),
+                                                     server_hostname="api.example.com")
+        s.sendall(b"GET %s HTTP/1.1\r\nHost: api.example.com:%d\r\n%s: %s\r\n\r\n" % (path, P, header, ph.encode()))
+        out = b""
+        while True:
+            d = s.recv(4096)
+            if not d: break
+            out += d
+        print("REQ", tag, out.split(b"\r\n")[0].decode(), flush=True)
+    except (OSError, ssl.SSLError) as e:
+        print("REQ", tag, "ERR", type(e).__name__, flush=True)
+req("c1", b"/v1/a", b"X-Key-A", os.environ.get("VAREK_CRED_C1", ""))
+req("c2", b"/v1/b", b"X-Key-B", os.environ.get("VAREK_CRED_C2", ""))
+PY
+    chmod 644 "$C/agent.py"
+    CP="$C/cred.policy"
+    { printf 'require warden 1.35\nproxy inspect\nproxy ports %s\n' "$PS"
+      printf 'credential c1 from file:%s/v1\ncredential c2 from file:%s/v2\n' "$C" "$C"
+      printf 'allow host api.example.com:%s\n' "$PS"
+      printf 'allow request GET https://api.example.com:%s/v1/a credential=c1 header=X-Key-A\n' "$PS"
+      printf 'allow request GET https://api.example.com:%s/v1/b credential=c2 header=X-Key-B\n' "$PS"
+      printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path exact %s/agent.py readonly\n' "$C"
+    } > "$CP"
+    { printf 'plan 1.35\naction r1 file_open /usr/ open=read\naction r2 file_open /lib/ open=read\n'
+      printf 'action r3 file_open /etc/ld.so.cache open=read\naction ag file_open %s/agent.py open=read\n' "$C"
+      printf 'action api net_connect api.example.com:%s\naction key credential c1\n' "$PS"
+    } > "$C/cred.plan"
+    env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$CP" --plan "$C/cred.plan" --hold-to-plan --dns-server "127.0.0.1:$DP" \
+        --trust-bundle "$C/bundle.pem" -- /usr/bin/python3 "$C/agent.py" "$PS" > "$C/a.out" 2> "$C/a.log"
+    kill $CSRV 2>/dev/null
+    check "held: a request carrying the credential a step names: swapped, and the server got its value" \
+        sh -c "grep -q 'REQ c1 HTTP/1.1 200' '$C/a.out' && grep -q 'X-Key-A: value-of-c1' '$C/got.jsonl'"
+    check "held: a request carrying a credential the policy releases and no step names: refused, outside_plan" \
+        sh -c "grep -q 'REQ c2 HTTP/1.1 403' '$C/a.out' && grep -F '\"target\":\"GET https://api.example.com:$PS/v1/b\"' '$C/a.log' |
+               grep -F '\"decision_raw\":\"ALLOW\"' | grep -q '\"rule\":\"outside_plan\"'"
+    check "... its value never reached the server" sh -c "! grep -q 'value-of-c2' '$C/got.jsonl'"
+    python3 "$HERE/tools/varek_audit.py" --policy "$CP" --checker "$CHECKER" "$C/a.log" > "$C/audit" 2>&1
+    check "varek_audit accepts the held run with its credential refused outside the plan" grep -q 'varek_audit: PASS' "$C/audit"
+fi
 
 echo
 if [ "$fail" = 0 ]; then echo "test_v1350: PASS"; else echo "test_v1350: FAIL"; fi

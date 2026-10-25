@@ -80,8 +80,10 @@ whose program is on the agent's PATH, not the system's.
   checks, plan 1.35's kinds, the hold, `require plan`, `varek plan
   generate` for each framework on its samples (one plan authorized and one
   refused under each sample's policy), merge, and the audit and exports of
-  the plan's records (eleven forgeries of the gate's records each refused).
-  133 checks pass with the frameworks installed (`VAREK_FW_PYTHON`); the
+  the plan's records (eleven forgeries of the gate's records each refused),
+  and the credential hold through the inspecting proxy (a request carrying
+  a credential no step names refused, its value never sent).
+  137 checks pass with the frameworks installed (`VAREK_FW_PYTHON`); the
   code adapters' checks are not tried without them.
 - **`make test-v1340`**: plans under the node agent (section 9); **the
   cluster** (`tests/v1340_apiserver.sh`, `tests/v1340_crio.sh` pod G under
@@ -243,9 +245,6 @@ they found, and what was done (step 9):
   its SHA-256).
 - **A host-name step is matched as written**: a run whose names are spelt
   otherwise (another case) is refused its connection, never allowed one.
-- **The credential hold** (a request carrying a credential no step names)
-  is built as the others are and not yet tested; the MCP call hold is
-  exercised by the soak.
 - **The plan's records are chained, not sealed**: without a signing key
   (`--sign-key`), anyone who can rewrite and re-chain the stream can make a
   refused plan read as authorized, and `varek audit --plan` checks only the
