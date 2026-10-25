@@ -37,6 +37,12 @@
 #      nobody can read, the code adapters (langgraph, openai-agents) under the
 #      Warden in that Python: nothing refused, the agent's prints kept out of
 #      the plan, each sample's plan under its policy
+#  10. audit and tools for the plan's records (step 7): the plan gate's
+#      record names the plan by its SHA-256; the audit checks the gate's
+#      records with each other, the run and its hold (each forgery refused),
+#      and --plan the plan file; the OCSF export (the gate an event, its
+#      refused steps folded in, valid OCSF 1.9.0, --verify); the CycloneDX
+#      evidence; varek audit --plan; varek doctor's adapters
 #
 # Usage: test_v1350.sh <warden> (tools/varek, tools/vdp_cert_check beside it)
 set -u
@@ -529,6 +535,110 @@ if [ -n "$FWPY" ] && runuser -u nobody -- "$FWPY" -I -c 'import langgraph, langc
     check "... the ops agent's (no tool filter): refused, its step naming no tool" sh -c \
         "[ $rc = 1 ] && grep -q 'ops.example.com:443/mcp#tools/call#\" is UNKNOWN: no rule of the policy allows it' '$OUT/cli.out'"
 else pass "the code adapters under the Warden: not tried (VAREK_FW_PYTHON names no Python with the frameworks that nobody can read)"; fi
+
+echo "== 10. audit and tools for the plan's records (step 7) =="
+AUD="$HERE/tools/varek_audit.py"
+SHA_MIXED=$(sha256sum "$OUT/mixed.txt" | cut -d' ' -f1); SHA_H1=$(sha256sum "$OUT/h1.plan" | cut -d' ' -f1)
+check "the plan gate's record names the plan by its SHA-256 (refused, and held)" sh -c \
+    "grep -q '^{\"event\":\"plan_gate\",.*\"plan_sha256\":\"$SHA_MIXED\"' '$OUT/mixed.log' &&
+     grep -q '^{\"event\":\"plan_gate\",.*\"verdict\":\"SATISFIED\",\"plan_sha256\":\"$SHA_H1\"' '$OUT/h1.log'"
+python3 "$AUD" --policy "$LP" --checker "$CHECKER" --plan "$OUT/mixed.txt" "$OUT/mixed.log" > "$OUT/audit" 2>&1; rc=$?
+check "the audit: a refused plan, its steps and SHA-256 (--plan the same file): PASS" sh -c \
+    "[ $rc = 0 ] && grep -q 'varek_audit: plan: .*mixed.txt (3 steps, SHA-256 $SHA_MIXED): UNSATISFIED, 3 step(s) not SATISFIED; not held to it' '$OUT/audit'"
+python3 "$AUD" --policy "$HP" --checker "$CHECKER" --plan "$OUT/h1.plan" "$OUT/h1.log" > "$OUT/audit" 2>&1; rc=$?
+check "... a held run: the gate's plan the one held to, the calls refused outside it counted" sh -c \
+    "[ $rc = 0 ] && grep -q 'varek_audit: plan: .*h1.plan (4 steps, SHA-256 $SHA_H1): SATISFIED; held to it, [1-9][0-9]* call(s) refused outside it' '$OUT/audit'"
+python3 "$AUD" --policy "$HP" --checker "$CHECKER" --plan "$OUT/h2.plan" "$OUT/h1.log" > "$OUT/audit" 2>&1; rc=$?
+check "... --plan another file: FAIL, the two SHA-256s given" sh -c \
+    "[ $rc = 1 ] && grep -q 'PROBLEM the plan .*h2.plan hashes to [0-9a-f]\{64\}, the run.s plan to $SHA_H1' '$OUT/audit'"
+VAREK_HOME="$HERE" VAREK_CONFIG="$OUT/hold.conf" python3 "$VAREK" audit --plan "$OUT/h2.plan" "$OUT/h1.log" > "$OUT/audit" 2>&1
+check "varek audit --plan: passed to the audit" grep -q 'h2.plan hashes to' "$OUT/audit"
+# what the audit refuses, the chain aside (a holder of the signing key could re-chain): each check by itself
+python3 - "$HERE/tools" > "$OUT/forge.out" 2>&1 <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import varek_audit as va
+S = "a" * 64
+def gate(v, **k):
+    return dict({"event": "plan_gate", "gate": "plan", "plan": "/p", "actions": 2, "edges": 0, "verdict": v,
+                 "plan_sha256": S}, **k)
+step = {"event": "plan_step", "plan": "/p", "label": "a", "kind": "file_open", "target": "/x",
+        "decision": "UNKNOWN", "policy_line": -1, "why": "no rule of the policy allows it"}
+dec = [{"seq": 0, "action": "file.open", "decision_final": "ALLOW"}]
+rs = {"warden": "1.35.0"}
+nosha = {k: v for k, v in gate("SATISFIED").items() if k != "plan_sha256"}
+cases = {
+    "a refused plan, and the agent's calls": ({"run_start": rs, "plan_events": [(0, step), (0, gate("UNSATISFIED"))]}, dec),
+    "an authorized plan, and a step not SATISFIED": ({"run_start": rs, "plan_events": [(0, step), (0, gate("SATISFIED"))]}, []),
+    "a refused plan, no step its reason": ({"run_start": rs, "plan_events": [(0, gate("UNKNOWN"))]}, []),
+    "a step recorded SATISFIED": ({"run_start": rs, "plan_events": [(0, dict(step, decision="SATISFIED")),
+                                                                    (0, gate("UNSATISFIED"))]}, []),
+    "a step after the gate": ({"run_start": rs, "plan_events": [(0, gate("UNSATISFIED")), (0, step)]}, []),
+    "the gate after the agent's calls": ({"run_start": rs, "plan_events": [(1, gate("SATISFIED"))]}, dec),
+    "a second plan gate": ({"run_start": rs, "plan_events": [(0, gate("SATISFIED")), (0, gate("SATISFIED"))]}, []),
+    "a 1.35 gate without the plan's SHA-256": ({"run_start": rs, "plan_events": [(0, nosha)]}, []),
+    "a held run no gate decided": ({"run_start": dict(rs, hold={"plan": "/p", "plan_sha256": S})}, []),
+    "a held run, the gate on another plan": ({"run_start": dict(rs, hold={"plan": "/q", "plan_sha256": S}),
+                                              "plan_events": [(0, gate("SATISFIED"))]}, []),
+    "a held run, the plan changed between gate and hold": (
+        {"run_start": dict(rs, hold={"plan": "/p", "plan_sha256": "b" * 64}), "plan_events": [(0, gate("SATISFIED"))]}, []),
+}
+for what, (meta, recs) in cases.items():
+    problems = []
+    va.check_plan_gate(meta, recs, problems)
+    print(("REFUSED " if problems else "MISSED  ") + what + (": " + problems[0] if problems else ""))
+problems = []
+va.check_plan_gate({"run_start": rs, "plan_events": [(0, step), (0, gate("UNSATISFIED"))]}, [], problems)
+print("CLEAN" if not problems else "NOT CLEAN " + problems[0])
+PY
+check "the audit refuses each of 11 forgeries of the gate's records, and passes the true one" sh -c \
+    "[ \$(grep -c '^REFUSED ' '$OUT/forge.out') = 11 ] && grep -qx CLEAN '$OUT/forge.out'"
+# the OCSF export
+OC="$HERE/tools/varek_ocsf.py"; OV="$HERE/tests/ocsf_validate.py"
+python3 "$OC" --log "$OUT/mixed.log" --policy "$LP" --checker "$CHECKER" --output "$OUT/m.ocsf" > /dev/null 2>&1
+python3 - "$OUT/m.ocsf" > "$OUT/oc.out" 2>&1 <<'PY'
+import json, sys
+ev = [json.loads(l) for l in open(sys.argv[1])]
+g = [e for e in ev if e["unmapped"]["varek"].get("event") == "plan_gate"]
+assert len(g) == 1, len(g)
+g = g[0]; v = g["unmapped"]["varek"]
+assert g["class_uid"] == 6002 and g["activity_id"] == 99, (g["class_uid"], g["activity_id"])
+assert g["action"] == "Denied" and g["disposition"] == "Blocked" and g["status"] == "Failure"
+assert v["decision"] == "UNSATISFIED" and v["plan"]["actions"] == 3 and len(v["plan"]["plan_sha256"]) == 64
+st = {s["label"]: s for s in v["plan_steps"]}
+assert set(st) == {"a", "b", "c"}, st
+assert st["a"]["decision"] == "UNSATISFIED" and st["a"]["policy_text"] == "deny exec /usr/bin/false", st["a"]
+assert st["b"]["why"] == "no rule of the policy allows it"
+assert not any(e["unmapped"]["varek"].get("event") == "plan_step" for e in ev)
+print("ok")
+PY
+check "OCSF: the refused plan an Application Lifecycle event, Denied and Blocked, its steps folded in with each reason" \
+    grep -qx ok "$OUT/oc.out"
+python3 "$OC" --log "$OUT/h1.log" --policy "$HP" --checker "$CHECKER" --output "$OUT/h.ocsf" > /dev/null 2>&1
+check "... a held run's gate Allowed; a call refused outside the plan names the plan it is held to" python3 -c "
+import json
+ev = [json.loads(l) for l in open('$OUT/h.ocsf')]
+g = [e for e in ev if e['unmapped']['varek'].get('event') == 'plan_gate'][0]
+o = [e for e in ev if e['unmapped']['varek'].get('rule') == 'outside_plan']
+assert g['action'] == 'Allowed' and g['unmapped']['varek']['plan_steps'] == []
+assert o and all(e['unmapped']['varek']['plan'] == {'plan': '$OUT/h1.plan', 'plan_sha256': '$SHA_H1', 'held': True} for e in o)
+assert all(e['disposition'] == 'Blocked' for e in o)"
+check "... both valid OCSF 1.9.0, and --verify finds them the stream's" sh -c \
+    "python3 '$OV' '$OUT/m.ocsf' && python3 '$OV' '$OUT/h.ocsf' &&
+     python3 '$OC' --verify '$OUT/h.ocsf' --log '$OUT/h1.log' --policy '$HP' --checker '$CHECKER'"
+# the CycloneDX evidence
+CX="$HERE/tools/varek_cyclonedx.py"
+python3 "$CX" --log "$OUT/mixed.log" --policy "$LP" --agent t > "$OUT/m.cdx" 2> /dev/null
+python3 "$CX" --log "$OUT/h1.log" --policy "$HP" --agent t > "$OUT/h.cdx" 2> /dev/null
+check "CycloneDX: the refused plan by its SHA-256, the agent not started, the steps counted" sh -c \
+    "grep -q 'was decided UNSATISFIED under the policy (3 step(s) not SATISFIED, each recorded with its reason), so the agent was not started' '$OUT/m.cdx' &&
+     grep -q '\"varek:plan.sha256\"' '$OUT/m.cdx' && grep -q '$SHA_MIXED' '$OUT/m.cdx'"
+check "... the held run: held, and the calls refused outside its plan" sh -c \
+    "grep -q 'The run was held to its plan: [1-9][0-9]* call(s) the policy allowed were refused as outside it' '$OUT/h.cdx' &&
+     grep -q '\"varek:plan.held\"' '$OUT/h.cdx'"
+VAREK_HOME="$HERE" VAREK_CONFIG="$OUT/none.conf" python3 "$VAREK" doctor > "$OUT/doc" 2>&1
+check "varek doctor names the plan adapters installed" \
+    grep -q 'plan adapters: agentcore, watsonx, langgraph, openai-agents, claude' "$OUT/doc"
 
 echo
 if [ "$fail" = 0 ]; then echo "test_v1350: PASS"; else echo "test_v1350: FAIL"; fi

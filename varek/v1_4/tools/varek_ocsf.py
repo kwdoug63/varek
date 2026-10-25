@@ -30,7 +30,13 @@ ai_operation and host, and carries:
 
 Records with no OCSF counterpart are folded into the event they belong to
 (an exec_result into its launch, a request_body into its request, a
-rename's second half into its first) or not exported.
+rename's second half into its first, v1.35: each plan_step into its plan
+gate's event) or not exported. v1.35 step 7: the plan gate's verdict is an
+Application Lifecycle event of its own (activity Other, unmapped.varek.event
+"plan_gate"): Allowed when the plan is authorized, Denied and Blocked when it
+is refused (the agent not started), with the plan's path, SHA-256 and size,
+and each step not SATISFIED with its reason and the policy line's text; a
+call refused as outside a held run's plan names the plan it is held to.
 
 Usage:
     varek_ocsf.py --log STREAM --policy POLICY --checker vdp_cert_check
@@ -151,6 +157,7 @@ class Exporter:
         self.rs = None
         self.agent = None
         self.subagents = {}            # "NAME#n" -> True if an MCP server
+        self.plan_steps = []           # v1.35 step 7: plan_step records, folded into their gate's event
         self.queue = []                # [event, waiting-for key or None, records left to wait]
         self.n = 0                     # chained records seen
         self.last_ts = 0
@@ -225,13 +232,8 @@ class Exporter:
         """security_control and the link back, for a decision record"""
         self._outcome(ev, rec)
         dry = rec.get("enforced") is False
-        pol = {"name": os.path.basename(str((self.rs or {}).get("policy_path") or self.policy_path)),
-               "uid": self.policy_sha, "is_applied": True,
-               "version": _policy_grammar(self.policy_lines, (self.rs or {}).get("warden"))}
         line = rec.get("policy_line")
-        if isinstance(line, int) and 1 <= line <= len(self.policy_lines):
-            pol["desc"] = self.policy_lines[line - 1].strip()
-        ev["policy"] = pol
+        ev["policy"] = self._policy_obj(line)
         v = ev["unmapped"]["varek"]
         v.update({"report_id": rec.get("report_id"), "seq": rec.get("seq"),
                   "decision": VERDICT.get(rec.get("decision_raw"), "UNKNOWN"),
@@ -242,6 +244,9 @@ class Exporter:
                                 "check": rec.get("check"), "subject": rec.get("cert_subject", 0)}
         if dry:
             v["mode"] = "dry_run"
+        hold = (self.rs or {}).get("hold")
+        if rec.get("rule") == "outside_plan" and isinstance(hold, dict):      # v1.35 step 7
+            v["plan"] = {"plan": hold.get("plan"), "plan_sha256": hold.get("plan_sha256"), "held": True}
         ev["metadata"]["sequence"] = rec.get("seq") if isinstance(rec.get("seq"), int) else 0
 
     # ---- each kind ----
@@ -317,6 +322,41 @@ class Exporter:
         ev["unmapped"]["varek"]["event"] = what
         return ev
 
+    def _policy_obj(self, line):
+        pol = {"name": os.path.basename(str((self.rs or {}).get("policy_path") or self.policy_path)),
+               "uid": self.policy_sha, "is_applied": True,
+               "version": _policy_grammar(self.policy_lines, (self.rs or {}).get("warden"))}
+        if isinstance(line, int) and 1 <= line <= len(self.policy_lines):
+            pol["desc"] = self.policy_lines[line - 1].strip()
+        return pol
+
+    def _plan_step(self, rec):
+        st = {k: rec.get(k) for k in ("label", "kind", "target", "resolved", "decision", "policy_line", "why")}
+        line = rec.get("policy_line")
+        if isinstance(line, int) and 1 <= line <= len(self.policy_lines):
+            st["policy_text"] = self.policy_lines[line - 1].strip()
+        st["chain"] = rec.get("chain")
+        return st
+
+    def _plan_gate_event(self, rec):
+        """v1.35 step 7: the plan gate's verdict, its refused steps folded in"""
+        ev = self._life(99, rec, "plan_gate")
+        ok = rec.get("verdict") == "SATISFIED"
+        ev["action_id"], ev["action"] = (1, "Allowed") if ok else (2, "Denied")
+        ev["disposition_id"], ev["disposition"] = (1, "Allowed") if ok else (2, "Blocked")
+        ev["status_id"], ev["status"] = (1, "Success") if ok else (2, "Failure")
+        if not ok:
+            ev["status_detail"] = str(rec.get("error") or "the plan was refused: the agent did not start")
+        ev["severity_id"], ev["severity"] = (1, "Informational") if ok else (3, "Medium")
+        ev["policy"] = self._policy_obj(None)
+        v = ev["unmapped"]["varek"]
+        v["plan"] = {k: rec.get(k) for k in ("gate", "plan", "plan_sha256", "actions", "edges") if k in rec}
+        v["decision"] = rec.get("verdict") if rec.get("verdict") in VERDICT.values() else "UNKNOWN"
+        steps = [x for x in self.plan_steps if x.get("plan") == rec.get("plan")]
+        v["plan_steps"] = [self._plan_step(x) for x in steps]
+        self.plan_steps = [x for x in self.plan_steps if x.get("plan") != rec.get("plan")]
+        return ev
+
     # ---- feeding ----
 
     def feed(self, rec):
@@ -361,6 +401,10 @@ class Exporter:
                                                 "answer": rec.get("answer")})
             if dry:
                 out_ev["unmapped"]["varek"]["mode"] = "dry_run"
+        elif ev_name == "plan_step":                                       # v1.35 step 7
+            self.plan_steps.append(rec)
+        elif ev_name == "plan_gate":
+            out_ev = self._plan_gate_event(rec)
         elif ev_name == "exec_result":
             self._fold(("exec", rec.get("decision_seq")), "exec_result", rec)
         elif ev_name == "request_body":
@@ -419,6 +463,11 @@ class Exporter:
     def finish(self):
         out = [item[0] for item in self.queue]
         self.queue = []
+        for rec in self.plan_steps:        # v1.35 step 7: a step whose gate's record never came
+            ev = self._life(99, rec, "plan_step")
+            ev["unmapped"]["varek"]["plan_steps"] = [self._plan_step(rec)]
+            out.append(ev)
+        self.plan_steps = []
         return out
 
 

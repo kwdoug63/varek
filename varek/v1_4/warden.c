@@ -1491,6 +1491,15 @@ struct warden_plan_ud {
     const char          *plan_path;
 };
 
+/* v1.35 step 7: the plan file's SHA-256, read where the plan is read (in the
+ * node's view under the node agent), for its plan_gate record: the evidence
+ * names the plan by its bytes, not its path alone ("" when unread) */
+static char g_gate_plan_sha[65];
+static int sha256_file_hex(const char *path, char out[65]);
+static void gate_plan_hash(const char *plan_path) {
+    if (!plan_path || sha256_file_hex(plan_path, g_gate_plan_sha) < 0) g_gate_plan_sha[0] = 0;
+}
+
 /* v1.35 step 2 (D9): why a step was not SATISFIED, for its plan_step record.
  * Filled by plan_step_decide; the deciding rule's line when a rule decided. */
 struct plan_step_note {
@@ -1990,6 +1999,7 @@ static int warden_verify_plan(const char *plan_path,
 {
     char err[256] = {0};
     plan_parsed_t *parsed = plan_parser_load(plan_path, err, sizeof(err));
+    gate_plan_hash(parsed ? plan_path : NULL);
     return warden_verify_plan_parsed(parsed, err, plan_path, policy, records);
 }
 
@@ -5057,6 +5067,7 @@ static void emit_plan_gate_basic(const char *plan_path, size_t n_actions, size_t
     json_escape(f, plan_path);
     fprintf(f, "\",\"actions\":%zu,\"edges\":%zu,\"verdict\":\"%s\"", n_actions, n_edges,
             plan_decision_name(pd));
+    if (g_gate_plan_sha[0]) fprintf(f, ",\"plan_sha256\":\"%s\"", g_gate_plan_sha);    /* v1.35 step 7 */
     if (error) {
         fputs(",\"error\":\"", f);
         json_escape(f, error);
@@ -5363,6 +5374,7 @@ static int cmp_arg_key(const void *x, const void *y) {
 static int warden_gate_plan_flow(const char *plan_path, const struct policy *policy) {
     char err[256] = {0};
     plan_parsed_t *parsed = plan_parser_load(plan_path, err, sizeof(err));
+    gate_plan_hash(parsed ? plan_path : NULL);
     if (!parsed) {
         fprintf(stderr, "[warden] plan load failed: %s\n", err);
         return GATE_ERROR;
@@ -5491,9 +5503,11 @@ static int warden_gate_plan_flow(const char *plan_path, const struct policy *pol
     fprintf(f, "{\"event\":\"plan_gate\",\"run\":\"%s\",\"gate\":\"flow\",\"plan\":\"", g_run_id);
     json_escape(f, plan_path);
     fprintf(f, "\",\"actions\":%zu,\"edges\":%zu,\"node_axis\":\"%s\",\"flow_axis\":\"%s\","
-               "\"verdict\":\"%s\",\"session\":\"", n, spec->n_edges,
+               "\"verdict\":\"%s\",", n, spec->n_edges,
             plan_decision_name(resp.node_axis), plan_decision_name(resp.flow_axis),
             plan_decision_name(resp.verdict));
+    if (g_gate_plan_sha[0]) fprintf(f, "\"plan_sha256\":\"%s\",", g_gate_plan_sha);     /* v1.35 step 7 */
+    fputs("\"session\":\"", f);
     json_escape(f, g_session);
     fprintf(f, "\",\"signature\":\"%016" PRIx64 "\",\"breaker\":\"%s\",\"refusals\":%u,"
                "\"budget\":%u,\"session_refusals\":%u,\"session_budget\":%u,"
@@ -6545,6 +6559,7 @@ int main(int argc, char **argv) {
          * copy beside the stream), decided in the container's */
         static char perr[256];
         plan_parsed_t *pp = plan_path ? plan_parser_load(plan_path, perr, sizeof perr) : NULL;
+        gate_plan_hash(pp ? plan_path : NULL);
         return node_supervise(&p, boot_path, policy_path, plan_path, pp, perr);
     }
 

@@ -350,6 +350,102 @@ def check_hold(meta, records, problems):
     return hold is not None
 
 
+PLAN_VERDICTS = ("SATISFIED", "UNSATISFIED", "UNKNOWN")
+
+
+def check_plan_gate(meta, records, problems, plan_file=None):
+    """v1.35 step 7: the plan gate's records (step 2, D9), with each other,
+    with the run and with its hold. A plan_step is a step not SATISFIED
+    (UNSATISFIED or UNKNOWN, with its reason), of the gate's plan, written
+    before the gate's record; a plan_gate (gate plan or flow) says the
+    verdict, once per gate, before any decision record. A refused plan
+    starts no agent (no decision record follows), and is refused for a step
+    it records (or a plan that could not be read); an authorized one records
+    no step. A held run passed the plan gate, on the plan it is held to, the
+    same file by its SHA-256. With plan_file, the plan's SHA-256 is that
+    file's. Returns the plan gate's record (or None)."""
+    rs = meta.get("run_start", {})
+    events = meta.get("plan_events", [])
+    gates, steps = {}, []
+    for before, r in events:
+        where = f"the {r.get('event')} record of plan {r.get('plan')!r}"
+        if before:
+            problems.append(f"{where} follows {before} decision record(s): the gate decides a plan before the "
+                            f"agent starts")
+        if not isinstance(r.get("plan"), str) or not r.get("plan"):
+            problems.append(f"{where} names no plan")
+        if r.get("event") == "plan_step":
+            if r.get("decision") not in ("UNSATISFIED", "UNKNOWN"):
+                problems.append(f"{where}: step {r.get('label')!r} recorded as {r.get('decision')!r} (a "
+                                f"plan_step is a step not SATISFIED)")
+            if not (isinstance(r.get("label"), str) and isinstance(r.get("kind"), str) and
+                    isinstance(r.get("why"), str) and isinstance(r.get("policy_line"), int)):
+                problems.append(f"{where}: a plan_step without its label, kind, deciding line and reason")
+            if "plan" in gates:
+                problems.append(f"{where}: step {r.get('label')!r} after the gate's verdict")
+            steps.append(r)
+            continue
+        g = r.get("gate")
+        if g not in ("plan", "flow"):
+            problems.append(f"{where}: gate {g!r} is not one the Warden has")
+            continue
+        if g in gates:
+            problems.append(f"{where}: a second {g} gate in one run")
+        if r.get("verdict") not in PLAN_VERDICTS:
+            problems.append(f"{where}: verdict {r.get('verdict')!r}")
+        sha = r.get("plan_sha256")
+        if sha is not None and not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
+            problems.append(f"{where}: plan_sha256 {sha!r} is not a SHA-256")
+        elif sha is None and "error" not in r and _version_at_least(rs.get("warden"), (1, 35)):
+            problems.append(f"{where}: no plan_sha256 (the Warden records the plan's SHA-256 from 1.35)")
+        gates[g] = r
+    gate = gates.get("plan")
+    if steps and gate is None:
+        problems.append(f"{len(steps)} plan_step record(s) and no plan gate's verdict")
+    if gate is not None:
+        own = [s for s in steps if s.get("plan") == gate.get("plan")]
+        if len(own) != len(steps):
+            problems.append("a plan_step record names a plan other than the gate's")
+        if isinstance(gate.get("actions"), int) and len(steps) > gate["actions"]:
+            problems.append(f"{len(steps)} plan_step records for a plan of {gate['actions']} step(s)")
+        if gate.get("verdict") == "SATISFIED" and steps:
+            problems.append(f"the plan was authorized, and {len(steps)} of its steps are recorded as not "
+                            f"SATISFIED")
+        if gate.get("verdict") in ("UNSATISFIED", "UNKNOWN"):
+            if not steps and "error" not in gate:
+                problems.append("the plan was refused, and no step of it is recorded as the reason")
+    for g, r in gates.items():
+        if r.get("verdict") != "SATISFIED" and records:
+            problems.append(f"the {g} gate refused the plan ({r.get('verdict')}), and the stream holds "
+                            f"{len(records)} decision record(s): a refused plan starts no agent")
+    hold = rs.get("hold") if isinstance(rs.get("hold"), dict) else None
+    if hold is not None:
+        if gate is None:
+            problems.append("the run is held to a plan, and no plan gate decided it")
+        else:
+            if gate.get("plan") != hold.get("plan"):
+                problems.append(f"the run is held to {hold.get('plan')!r}, the gate decided {gate.get('plan')!r}")
+            if gate.get("plan_sha256") and gate.get("plan_sha256") != hold.get("plan_sha256"):
+                problems.append(f"the plan held to (SHA-256 {hold.get('plan_sha256')}) is not the plan the gate "
+                                f"decided ({gate.get('plan_sha256')}): it changed between the two")
+    if plan_file is not None:
+        try:
+            with open(plan_file, "rb") as fh:
+                want = hashlib.sha256(fh.read()).hexdigest()
+        except OSError as e:
+            problems.append(f"cannot read the plan {plan_file}: {e.strerror}")
+            want = None
+        got = (gate or {}).get("plan_sha256") or (hold or {}).get("plan_sha256")
+        if want is not None:
+            if gate is None and hold is None:
+                problems.append(f"--plan {plan_file}: the run decided no plan")
+            elif got is None:
+                problems.append(f"--plan {plan_file}: the stream records no SHA-256 of its plan to compare")
+            elif got != want:
+                problems.append(f"the plan {plan_file} hashes to {want}, the run's plan to {got}")
+    return gate
+
+
 def check_dry(meta, records, problems):
     """v1.29 (section 5, D10): a dry run's stream. True if it is one.
 
@@ -3150,6 +3246,8 @@ def main(argv=None):
     ap.add_argument("--anchor", help="the Warden's --anchor file: the stream's signed records "
                     "must match it")
     ap.add_argument("--run", help="the run id the stream must carry (run_start's \"run\")")
+    ap.add_argument("--plan", help="v1.35: the plan file the run was given: its SHA-256 must be the "
+                    "one the plan gate (or the hold) recorded")
     def seconds(v):
         try:
             x = float(v)
@@ -3244,6 +3342,7 @@ def main(argv=None):
     check_baseline(meta, a.policy, problems)
     dry_run = check_dry(meta, records, problems)
     check_hold(meta, records, problems)                                   # v1.35 step 4
+    plan_gate = check_plan_gate(meta, records, problems, a.plan)          # v1.35 step 7
     try:
         check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, problems, records)   # v1.27.1
         check_noexec_exec(meta, policy_rules(a.checker, a.policy), openas_policy, problems)          # v1.29
@@ -3714,6 +3813,15 @@ def main(argv=None):
         u = ob_.get("user") if isinstance(ob_, dict) else None
         who = f"on behalf of {u.get('subject')} ({u.get('issuer')})" if isinstance(u, dict) else "no user"
         print(f"varek_audit: chain: {who}; sub-agents: {chain_summary(per_sub)}")
+    if plan_gate is not None:                                                             # v1.35 step 7
+        hold_ = meta.get("run_start", {}).get("hold")
+        nout = sum(1 for r in records if r.get("rule") == "outside_plan")
+        nsteps = sum(1 for _, e in meta.get("plan_events", []) if e.get("event") == "plan_step")
+        print(f"varek_audit: plan: {plan_gate.get('plan')} ({plan_gate.get('actions')} steps"
+              f"{', SHA-256 ' + plan_gate['plan_sha256'] if plan_gate.get('plan_sha256') else ''}): "
+              f"{plan_gate.get('verdict')}"
+              f"{f', {nsteps} step(s) not SATISFIED' if nsteps else ''}; "
+              f"{f'held to it, {nout} call(s) refused outside it' if isinstance(hold_, dict) else 'not held to it'}")
     for n_ in cnotes:
         print(f"varek_audit: note: {n_}")
     print(f"varek_audit: integrity: {integrity}")

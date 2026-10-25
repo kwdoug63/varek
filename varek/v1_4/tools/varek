@@ -842,6 +842,15 @@ def cmd_doctor(args):
             warn(f"VAREK Enterprise license not checked: {r.detail}")
             hint("`varek license` shows the IAM permission the instance needs")
 
+    # v1.35 step 7: the plan adapters `varek plan generate` runs (not needed to run an agent)
+    adir = os.path.join(varek_home(), "adapters")
+    have = [k for k, v in PLAN_ADAPTERS.items() if os.path.isfile(os.path.join(adir, v[3]))]
+    if len(have) == len(PLAN_ADAPTERS):
+        ok(f"plan adapters: {', '.join(have)} ({adir})")
+    else:
+        warn(f"plan adapters: {', '.join(have) or 'none'} of {len(PLAN_ADAPTERS)} installed in {adir}: "
+             f"`varek plan generate` runs only those")
+
     print()
     if bad:
         info(f"{bad} problem(s) to fix before running agents.")
@@ -2260,6 +2269,8 @@ def cmd_audit(args):
         argv += ["--anchor", cfg["anchor"]]
     if args.allow_incomplete:
         argv.append("--allow-incomplete")
+    if getattr(args, "plan", None):
+        argv += ["--plan", args.plan]                                    # v1.35 step 7
     argv.append(log)
     return run_cmd(argv, check=False).returncode
 
@@ -3081,6 +3092,8 @@ def build_parser():
     sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")
     sp.add_argument("--allow-incomplete", action="store_true",
                     help="audit a run that has no run_end yet")
+    sp.add_argument("--plan", help="v1.35: the plan the run was given: its SHA-256 must be the one the run "
+                    "recorded")
 
     sp = add("export", cmd_export, "write CycloneDX 1.6 authorization evidence, or OCSF 1.9.0 events, for a run")
     sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")

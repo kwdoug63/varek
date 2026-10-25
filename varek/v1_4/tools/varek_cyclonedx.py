@@ -241,6 +241,11 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
             if event == "plan_gate" and run is not None and rec.get("run") == run \
                     and meta is not None:
                 meta["plan_gate"] = rec
+            # v1.35 step 7: the plan gate's records, each with the number of
+            # decision records before it (varek_audit.py checks them together)
+            if event in ("plan_step", "plan_gate") and run is not None and rec.get("run") == run \
+                    and meta is not None:
+                meta.setdefault("plan_events", []).append((len(records), rec))
             # v1.24: this run's resolution records, each with the number of
             # decision records before it (varek_audit.py checks a connect
             # decided on a name against the resolutions it relied on).
@@ -386,7 +391,7 @@ def _scope(warden_version):
 
 
 def attestation(records, authorized, refused, dist, policy, run_start, run_end,
-                warden_version, complete, log_info, plan_gate, policy_check):
+                warden_version, complete, log_info, plan_gate, policy_check, meta=None):
     """v1.18.0: the attestation text and its facts, each derived from the
     stream. Raises StreamError when the records break an invariant the text
     would otherwise assert."""
@@ -431,10 +436,25 @@ def attestation(records, authorized, refused, dist, policy, run_start, run_end,
     if cert_refused:
         parts.append(f"The checker refused {len(cert_refused)} certificate(s); those "
                      f"actions were refused.")
-    if plan_gate:
-        parts.append(f"Before launch, the plan gate decided {plan_gate.get('verdict')} "
+    meta = meta or {}
+    hold = (meta.get("run_start") or {}).get("hold")
+    hold = hold if isinstance(hold, dict) else None
+    nsteps = sum(1 for _, e in meta.get("plan_events", []) if e.get("event") == "plan_step")
+    outside = [r for r in records if r.get("rule") == "outside_plan"]
+    if plan_gate and plan_gate.get("gate") == "flow":
+        parts.append(f"As the agent was started, the plan gate decided {plan_gate.get('verdict')} "
                      f"(node {plan_gate.get('node_axis')}, flow {plan_gate.get('flow_axis')}; "
                      f"breaker {plan_gate.get('breaker')}).")
+    elif plan_gate:                                    # v1.35 step 7: the plan gate (gate plan)
+        sha = plan_gate.get("plan_sha256")
+        parts.append(f"The plan {plan_gate.get('plan')} ({plan_gate.get('actions')} step(s)"
+                     + (f", SHA-256 {sha}" if sha else "") + f") was decided {plan_gate.get('verdict')} "
+                     + ("under the policy, so the agent was started" if plan_gate.get("verdict") == "SATISFIED"
+                        else f"under the policy ({nsteps} step(s) not SATISFIED, each recorded with its "
+                             f"reason), so the agent was not started") + ".")
+    if hold:
+        parts.append(f"The run was held to its plan: {len(outside)} call(s) the policy allowed were "
+                     f"refused as outside it (outside_plan).")
     chain = log_info.get("chain", "none")
     if chain != "none":
         nsig, nsigned = log_info.get("sigs", 0), log_info.get("signable", 0)
@@ -465,8 +485,18 @@ def attestation(records, authorized, refused, dist, policy, run_start, run_end,
         ("varek:policy.sha256.check", policy_check),
     ]
     if plan_gate:
-        facts += [("varek:plan_gate.verdict", str(plan_gate.get("verdict", ""))),
-                  ("varek:plan_gate.breaker", str(plan_gate.get("breaker", "")))]
+        facts += [("varek:plan_gate.verdict", str(plan_gate.get("verdict", "")))]
+        if plan_gate.get("gate") == "flow":
+            facts.append(("varek:plan_gate.breaker", str(plan_gate.get("breaker", ""))))
+        else:                                          # v1.35 step 7
+            facts += [("varek:plan.path", str(plan_gate.get("plan", ""))),
+                      ("varek:plan.steps", str(plan_gate.get("actions", ""))),
+                      ("varek:plan.steps_not_satisfied", str(nsteps))]
+            if plan_gate.get("plan_sha256"):
+                facts.append(("varek:plan.sha256", str(plan_gate["plan_sha256"])))
+    if hold:
+        facts += [("varek:plan.held", "true"), ("varek:plan.held.sha256", str(hold.get("plan_sha256", ""))),
+                  ("varek:plan.outside_plan", str(len(outside)))]
     return " ".join(parts), facts
 
 
@@ -845,7 +875,7 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
 
     attest_text, facts = attestation(records, authorized, refused, dist, policy,
                                      run_start, run_end, warden_version, complete,
-                                     log_info or {}, plan_gate, policy_check)
+                                     log_info or {}, plan_gate, policy_check, proxy_meta)
     if views:
         attest_text += (f" {len(views)} open(s) of the resolver files (and, in inspecting mode, the "
                         f"trust files) were answered with the Warden's views ({', '.join(sorted({r['rule'] for r in views}))}); no "
