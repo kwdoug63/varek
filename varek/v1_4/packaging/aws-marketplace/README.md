@@ -99,13 +99,13 @@ A test image first (no Marketplace product needed):
 
 ```bash
 cd varek/varek/v1_4/packaging/aws-marketplace
-./build.sh --version 1.23.1 --packs ~/varek-packs --test
+./build.sh --version 1.34.0 --packs ~/varek-packs --test
 ```
 
 Then the image for the listing, with the product's ID for License Manager:
 
 ```bash
-./build.sh --version 1.23.1 --packs ~/varek-packs --product-id prod-ceonv23mvlzw4
+./build.sh --version 1.34.0 --packs ~/varek-packs --product-id prod-ceonv23mvlzw4
 ```
 
 AWS's License Manager guide calls this the "Product ID with a Globally Unique
@@ -124,7 +124,7 @@ Marketplace one. Build with your account's issuer instead of Marketplace's:
 
 ```bash
 ACCT=$(aws sts get-caller-identity --query Account --output text)
-./build.sh --version 1.23.1-lmtest --packs ~/varek-packs --product-id <product ID> \
+./build.sh --version 1.34.0-lmtest --packs ~/varek-packs --product-id <product ID> \
   --issuer-fingerprint "aws:$ACCT:Self:issuer-fingerprint"
 ```
 
