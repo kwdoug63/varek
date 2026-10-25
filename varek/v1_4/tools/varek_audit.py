@@ -323,6 +323,33 @@ DRY_NEVER_LET = ("protected_object", "raw_device", "view_write_refused", "change
                  "subagent_env")                                        # v1.31 review
 
 
+def check_hold(meta, records, problems):
+    """v1.35 step 4 (D2): a run held to its plan (--hold-to-plan). run_start
+    names the plan and its SHA-256; a call refused as outside it (rule
+    outside_plan) is one the policy allowed (decision_raw ALLOW, refused
+    after), names the same plan, and appears only in a held run. True if the
+    run is held."""
+    rs = meta.get("run_start", {})
+    hold = rs.get("hold")
+    if hold is not None and not (isinstance(hold, dict) and isinstance(hold.get("plan"), str) and
+                                 isinstance(hold.get("plan_sha256"), str) and
+                                 re.fullmatch(r"[0-9a-f]{64}", hold.get("plan_sha256", ""))):
+        problems.append(f"run_start's hold {hold!r} is not one the Warden writes")
+        hold = None
+    for r in records:
+        if r.get("rule") != "outside_plan":
+            continue
+        if hold is None:
+            problems.append(f"seq {r.get('seq')}: an outside_plan refusal in a run not held to a plan")
+        elif r.get("decision_raw") != "ALLOW" or r.get("decision_final") != "DENY":
+            problems.append(f"seq {r.get('seq')}: an outside_plan record is not a refusal of a call the policy "
+                            f"allowed ({r.get('decision_raw')}/{r.get('decision_final')})")
+        elif r.get("plan") != hold.get("plan"):
+            problems.append(f"seq {r.get('seq')}: an outside_plan record names the plan {r.get('plan')!r}, "
+                            f"not the run's {hold.get('plan')!r}")
+    return hold is not None
+
+
 def check_dry(meta, records, problems):
     """v1.29 (section 5, D10): a dry run's stream. True if it is one.
 
@@ -3205,6 +3232,7 @@ def main(argv=None):
     check_open_as(meta, openas_policy, problems)                     # v1.29
     check_baseline(meta, a.policy, problems)
     dry_run = check_dry(meta, records, problems)
+    check_hold(meta, records, problems)                                   # v1.35 step 4
     try:
         check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, problems, records)   # v1.27.1
         check_noexec_exec(meta, policy_rules(a.checker, a.policy), openas_policy, problems)          # v1.29

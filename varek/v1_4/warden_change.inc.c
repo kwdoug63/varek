@@ -360,6 +360,7 @@ static const char *change_decide(const struct policy *p, struct action *a, decis
         fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n", g_records, a->check_why);
         return "certificate_refused";
     }
+    if (hold_refuses(a)) return "outside_plan";          /* v1.35 step 4: outside the run's plan */
     return NULL;
 }
 

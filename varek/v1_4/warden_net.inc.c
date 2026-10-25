@@ -890,14 +890,18 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
         fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n",
                 g_records, a->check_why);
     }
+    /* v1.35 step 4: outside the run's plan (a connection handed to the proxy
+     * is held where the proxy reads its destination, warden_pxdecide.inc.c) */
+    bool held = false;
+    if (d_final == DEC_ALLOW && !a->proxy_handoff && hold_refuses(a)) { d_final = DEC_DENY; held = true; }
     /* v1.29: a dry run dials a connect the policy refuses as it dials an
      * allowed one (the agent has no network of its own), recorded as not
      * enforced; never a Unix socket, which the Warden would reach as root */
     if (d_final != DEC_ALLOW &&
-        (fam == AF_UNIX || !dry_let(a, cert_refused ? "certificate_refused" : decision_rule_id(a, d_raw)))) {
+        (fam == AF_UNIX || held || !dry_let(a, cert_refused ? "certificate_refused" : decision_rule_id(a, d_raw)))) {
         close(ag);
         if (pin >= 0) close(pin);
-        net_record(tid, a, d_raw, d_final,
+        net_record(tid, a, d_raw, d_final, held ? "outside_plan" :
                    cert_refused ? "certificate_refused" : decision_rule_id(a, d_raw), t0, EACCES);
         send_simple(notify_fd, req->id, DEC_DENY);
         return;

@@ -865,6 +865,11 @@ static void exec_launch(int notify_fd, const struct seccomp_notif *req, struct a
             d_final = DEC_DENY;
             rule = "exec_not_in_ruleset";
         }
+        /* v1.35 step 4: allowed, but no step of the run's plan names the program */
+        else if (d_final == DEC_ALLOW && hold_refuses_exec(a, ef->path)) {
+            d_final = DEC_DENY;
+            rule = "outside_plan";
+        }
         if (!rule) rule = d_final == DEC_ALLOW ? "exec_allowed" : decision_rule_id(a, d_raw);
     }
     if (ef) {

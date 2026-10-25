@@ -461,6 +461,10 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
         px_refuse(q, d_raw, "certificate_refused", EACCES);
         return;
     }
+    if (!a->dry && hold_refuses(a)) {                     /* v1.35 step 4: outside the run's plan */
+        px_refuse(q, d_raw, "outside_plan", EACCES);
+        return;
+    }
     /* v1.26.1: in inspecting mode a host that is not a passthrough host is
      * inspected: the proxy terminates its TLS (TLS, and TLS inside an
      * answered CONNECT), or reads its plain HTTP, and each request is decided
@@ -773,6 +777,11 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
             rule = "max_body";
         }
     }
+    /* v1.35 step 4: a credential no step of the run's plan names */
+    if (d_final == DEC_ALLOW && hold_refuses_cred(p, a, p->v.rules[a->rule_index].cred)) {
+        d_final = DEC_DENY;
+        rule = "outside_plan";
+    }
     /* v1.29: a dry run relays a request the policy refuses, with no
      * credential and no body limit, as not enforced */
     bool dry_allow = d_final != DEC_ALLOW && dry_let(a, rule);
@@ -781,6 +790,7 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
         snprintf(why, sizeof why, "its body is over max_body=%llu (policy line %d)", (unsigned long long)maxb,
                  a->policy_line);
     else if (!strcmp(rule, "revoked")) snprintf(why, sizeof why, "the run was revoked (varek revoke)");
+    else if (!strcmp(rule, "outside_plan")) snprintf(why, sizeof why, "it carries a credential no step of the run's plan names");
     else if (mcp_ep) snprintf(why, sizeof why, "an MCP endpoint takes no query");
     else if (mcp_var) snprintf(why, sizeof why, "another spelling of an MCP endpoint (its case or a trailing /)");
     else if (d_raw == DEC_DENY) snprintf(why, sizeof why, "the policy denies it (line %d)", a->policy_line);
@@ -986,6 +996,16 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
             d_final = DEC_DENY;
             rule = "credential_expired";
         }
+        /* v1.35 step 4: a call, or a credential it carries, no step of the run's plan names */
+        if (d_final == DEC_ALLOW && hold_refuses(a)) {
+            d_final = DEC_DENY;
+            rule = "outside_plan";
+            snprintf(why, sizeof why, "no step of the run's plan names this call");
+        } else if (d_final == DEC_ALLOW && hold_refuses_cred(p, a, p->v.rules[a->rule_index].cred)) {
+            d_final = DEC_DENY;
+            rule = "outside_plan";
+            snprintf(why, sizeof why, "it carries a credential no step of the run's plan names");
+        }
         if (d_final == DEC_ALLOW) snprintf(why, sizeof why, "allowed");
         else if (!strcmp(rule, "max_body"))
             snprintf(why, sizeof why, "its body is over max_body=%llu (policy line %d)", (unsigned long long)maxb,
@@ -994,6 +1014,7 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
         else if (!strcmp(rule, "certificate_refused")) snprintf(why, sizeof why, "its certificate was refused");
         else if (!strcmp(rule, "credential_expired"))
             snprintf(why, sizeof why, "the MCP token its rule (line %d) names has expired", a->policy_line);
+        else if (!strcmp(rule, "outside_plan")) { }          /* v1.35 step 4: said above */
         else if (d_raw == DEC_DENY) snprintf(why, sizeof why, "the policy denies it (line %d)", a->policy_line);
         else snprintf(why, sizeof why, "no mcp rule allows it");
     }

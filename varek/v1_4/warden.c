@@ -1495,7 +1495,10 @@ struct plan_step_note {
     char why[320];
     int  policy_line;
     char resolved[PATH_MAX];
+    char mcp_host[PATH_MAX];    /* v1.35 step 4: an mcp_call step's server, host:port */
 };
+
+#include "warden_hold.inc.c"         /* v1.35 step 4: a run held to its plan */
 
 /* v1.21.1: how a file_open step says it will open its file.
  *
@@ -1719,7 +1722,7 @@ static plan_decision_t plan_cred_decide(const struct policy *p, const plan_spec_
  * whose host they do not is not SATISFIED either. url is canonical
  * (vdp_mcp_url): scheme://host:port/path. */
 static plan_decision_t plan_mcp_host(const struct policy *p, const struct action *call, const char *url,
-                                     const char **why) {
+                                     char *host, size_t hn, const char **why) {
     struct action h;
     memset(&h, 0, sizeof h);
     h.kind = ACT_NET_PROXY;
@@ -1731,7 +1734,7 @@ static plan_decision_t plan_mcp_host(const struct policy *p, const struct action
     memcpy(h.resolved, b + 3, (size_t)(e - b - 3));
     snprintf(h.target, sizeof h.target, "%s", h.resolved);
     decision_t d = policy_decide(p, &h);
-    if (d == DEC_ALLOW && certify(p, &h)) return PLAN_DEC_SATISFIED;
+    if (d == DEC_ALLOW && certify(p, &h)) { snprintf(host, hn, "%s", h.resolved); return PLAN_DEC_SATISFIED; }
     *why = d == DEC_DENY ? "the connection to its server's host and port is refused by a host rule"
          : d == DEC_ALLOW ? "the connection to its server's host and port: certificate refused"
                           : "no host rule allows the connection to its server's host and port";
@@ -1789,13 +1792,17 @@ static plan_decision_t plan_step_decide(const struct warden_plan_ud *u, const pl
             else if (vdp_mcp_object(url, method ? method : "tools/call", name ? name : "", act.resolved,
                                     sizeof act.resolved) < 0)
                 why = "the method or name is outside what the Warden decides";
-            else if ((pd = plan_mcp_host(u->policy, &act, url, &why)) == PLAN_DEC_SATISFIED) {
+            else if ((pd = plan_mcp_host(u->policy, &act, url, nt->mcp_host, sizeof nt->mcp_host, &why)) ==
+                     PLAN_DEC_SATISFIED) {
                 pd = PLAN_DEC_UNKNOWN;
                 act.kind = ACT_NET_MCP;                                 /* decided below, as a call */
             }
         }
         if (why || pd != PLAN_DEC_UNKNOWN) {
-            if (!why) return pd;                                        /* a credential step SATISFIED */
+            if (!why) {                                                 /* a credential or subagent step SATISFIED */
+                if (g_hold_collect) hold_from_step(a, &act, nt);
+                return pd;
+            }
             plan_step_log(a, act.target, pd, why);
             snprintf(nt->why, sizeof nt->why, "%s", why);
             nt->policy_line = act.policy_line;
@@ -1812,6 +1819,15 @@ static plan_decision_t plan_step_decide(const struct warden_plan_ud *u, const pl
      * unparseable path leaves resolved empty and stays UNKNOWN. */
     if (act.kind == ACT_FILE_OPEN) {
         (void)plan_lexical_canon(act.target, act.resolved, sizeof(act.resolved));
+        /* v1.35 step 4: a directory step (its target ending in '/') is decided
+         * on the directory's name with its '/', as a prefix rule names it;
+         * each call beneath it is decided by the policy when it is made */
+        size_t tl = strlen(act.target), rl = strlen(act.resolved);
+        if (tl > 1 && act.target[tl - 1] == '/' && rl > 1 && act.resolved[rl - 1] != '/' &&
+            rl + 1 < sizeof act.resolved) {
+            act.resolved[rl] = '/';
+            act.resolved[rl + 1] = '\0';
+        }
     }
     /* v1.21.1: the flags the step declares it will open with (see
      * plan_open_field). */
@@ -1854,7 +1870,7 @@ static plan_decision_t plan_step_decide(const struct warden_plan_ud *u, const pl
             snprintf(nt->why, sizeof nt->why, "%s", why);
             nt->policy_line = act.policy_line;
             snprintf(nt->resolved, sizeof nt->resolved, "%s", act.resolved);
-        }
+        } else if (g_hold_collect) hold_from_step(a, &act, nt);
         return pd;
     }
     if (act.kind == ACT_NET_CONNECT) {
@@ -1887,7 +1903,9 @@ static plan_decision_t plan_step_decide(const struct warden_plan_ud *u, const pl
      * `varek policy check --plan`, which writes no record, showed nothing) */
     plan_decision_t pd = PLAN_DEC_UNKNOWN;
     switch (d) {
-        case DEC_ALLOW:   return PLAN_DEC_SATISFIED;
+        case DEC_ALLOW:
+            if (g_hold_collect) hold_from_step(a, &act, nt);
+            return PLAN_DEC_SATISFIED;
         case DEC_DENY:
             snprintf(nt->why, sizeof nt->why, "the policy refuses it");
             pd = PLAN_DEC_UNSATISFIED;
@@ -2395,6 +2413,8 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
             );
     /* v1.16: how this stream is protected (see the log integrity notes). */
     fputs("\"log\":\"chain-1\",", f);
+    /* v1.35 step 4: the run is held to this plan (if it passes the gate) */
+    if (g_hold_req) fprintf(f, "\"hold\":{\"plan\":\"%s\",\"plan_sha256\":\"%s\"},", g_hold_plan_json, g_hold_plan_sha);
     if (g_signing) {
         char pk_hex[2 * crypto_sign_PUBLICKEYBYTES + 1];
         sodium_bin2hex(pk_hex, sizeof pk_hex, g_pk, sizeof g_pk);
@@ -2814,6 +2834,7 @@ static void emit_pathology(uint64_t seq,
                            uint64_t latency_ns,
                            int kernel_errno)
 {
+    bool held = rule_id && !strcmp(rule_id, "outside_plan");   /* v1.35 step 4 */
     if (!g_log) return;
     /* v1.31 (the shared soak): a checkpoint seals at most checkpoint_every
      * decision records. It is written between notifications
@@ -2867,7 +2888,7 @@ static void emit_pathology(uint64_t seq,
         "\"policy_line\":%d,"
         "%s%s%s"
         "%s%s%s%s%s%s"
-        "%s%s"
+        "%s%s%s%s%s"
         "\"kernel_verdict\":\"%s\","
         "\"errno\":%d,"
         "\"latency_us\":%" PRIu64 ","
@@ -2884,6 +2905,8 @@ static void emit_pathology(uint64_t seq,
         a->cert[0] && !a->certified ? a->check_why : "",
         a->cert[0] && !a->certified ? "\"," : "",
         net_json, a->extra,
+        /* v1.35 step 4: an outside_plan refusal names the plan the run is held to */
+        held ? "\"plan\":\"" : "", held ? g_hold_plan_json : "", held ? "\"," : "",
         /* v1.12.1: an ALLOW whose open then failed (EEXIST, ENXIO, ...)
          * delivered nothing; say so rather than reporting ALLOW.
          * v1.18.0: a refusal names the errno the agent actually received
@@ -4204,7 +4227,8 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                 struct stat ast;
                 if (fstat(mfd, &ast) == 0 && S_ISDIR(ast.st_mode) &&
                     is_ancestor(act.resolved, sub_policy_subject(act.subject)) &&
-                    !ancestor_denied(p, act.resolved, sub_policy_subject(act.subject))) {
+                    !ancestor_denied(p, act.resolved, sub_policy_subject(act.subject)) &&
+                    (!g_hold_on || hold_covers(&act))) {                    /* v1.35 step 4 */
                     int64_t r = meta_answer(req.pid, notify_fd, req.id, &act, mfd, true);
                     close(mfd);
                     if (r < 0) send_errno(notify_fd, req.id, (int)-r);
@@ -4219,7 +4243,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             }
             decision_t m_raw   = policy_decide(p, &act);
             decision_t m_final = (m_raw == DEC_ALLOW) ? DEC_ALLOW : DEC_DENY;
-            bool m_cert_refused = false;
+            bool m_cert_refused = false, m_held = false;
             if (m_final == DEC_ALLOW && !certify(p, &act)) {
                 m_final = DEC_DENY;
                 m_cert_refused = true;
@@ -4227,12 +4251,14 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                 fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n",
                         g_records, act.check_why);
             }
+            if (m_final == DEC_ALLOW && hold_refuses(&act)) { m_final = DEC_DENY; m_held = true; }   /* v1.35 */
             clock_gettime(CLOCK_MONOTONIC, &t1);
             if (m_final != DEC_ALLOW) {
                 if (mfd >= 0) close(mfd);
                 uint64_t lat_m = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                                + (t1.tv_nsec - t0.tv_nsec);
-                const char *mrule = m_cert_refused ? "certificate_refused" : decision_rule_id(&act, m_raw);
+                const char *mrule = m_held ? "outside_plan" : m_cert_refused ? "certificate_refused"
+                                                                             : decision_rule_id(&act, m_raw);
                 bool mlet = dry_let(&act, mrule);                   /* v1.29: to the kernel */
                 emit_pathology(g_report_seq++, req.pid, &act, m_raw, m_final, mrule, lat_m, mlet ? 0 : EACCES);
                 send_simple(notify_fd, req.id, mlet ? DEC_ALLOW : DEC_DENY);
@@ -4317,9 +4343,11 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                     in_protected_dir(act.resolved, -1) == 0) {
                     decision_t nr = policy_decide(p, &act);
                     bool nok = nr == DEC_ALLOW && certify(p, &act);
+                    bool nheld = nok && hold_refuses(&act);                 /* v1.35 step 4 */
+                    if (nheld) nok = false;
                     clock_gettime(CLOCK_MONOTONIC, &t1);
-                    const char *nrule = nok ? "open_not_found" : nr == DEC_ALLOW ? "certificate_refused"
-                                                                                : decision_rule_id(&act, nr);
+                    const char *nrule = nok ? "open_not_found" : nheld ? "outside_plan"
+                                      : nr == DEC_ALLOW ? "certificate_refused" : decision_rule_id(&act, nr);
                     bool nlet = !nok && dry_let(&act, nrule);          /* v1.29: to the kernel */
                     emit_pathology(g_report_seq++, req.pid, &act, nr, nok ? DEC_ALLOW : DEC_DENY, nrule,
                                    (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec),
@@ -4373,7 +4401,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         decision_t d_final = (d_raw == DEC_ALLOW) ? DEC_ALLOW : DEC_DENY;
         /* v1.15: a file open is authorized only if the independent checker
          * accepts the verdict's certificate. */
-        bool cert_refused = false;
+        bool cert_refused = false, held = false;
         if (d_final == DEC_ALLOW && act.kind == ACT_FILE_OPEN && !certify(p, &act)) {
             d_final = DEC_DENY;
             cert_refused = true;
@@ -4381,6 +4409,11 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             log_line_start();
             fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n",
                     g_records, act.check_why);
+        }
+        /* v1.35 step 4: allowed and certified, but outside the run's plan */
+        if (d_final == DEC_ALLOW && act.kind == ACT_FILE_OPEN && hold_refuses(&act)) {
+            d_final = DEC_DENY;
+            held = true;
         }
 
         if (act.kind == ACT_FILE_OPEN) {
@@ -4412,7 +4445,8 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat_d = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                            + (t1.tv_nsec - t0.tv_nsec);
-            const char *orule = cert_refused ? "certificate_refused" : decision_rule_id(&act, d_raw);
+            const char *orule = held ? "outside_plan" : cert_refused ? "certificate_refused"
+                                                                     : decision_rule_id(&act, d_raw);
             bool olet = dry_let(&act, orule);       /* v1.29: to the kernel, as the agent */
             emit_pathology(g_report_seq++, req.pid, &act, d_raw, d_final, orule, lat_d, olet ? 0 : EACCES);
             send_simple(notify_fd, req.id, olet ? DEC_ALLOW : d_final);
@@ -5524,7 +5558,7 @@ out:
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s <policy.txt> [--plan <plan.txt> [--flow-policy <cfg>\n"
+        "usage: %s <policy.txt> [--plan <plan.txt> [--hold-to-plan] [--flow-policy <cfg>\n"
         "              [--session <id>] [--breaker-state <file>] [--gate-status <file>]]]\n"
         "              [--sign-key <key>]\n"
         "              [--anchor <path>] [--checkpoint-every <n>] [--run-as <user>]\n"
@@ -5724,6 +5758,8 @@ int main(int argc, char **argv) {
             anchor_path = argv[++i];
         } else if (strcmp(argv[i], "--dry-run") == 0) {                  /* v1.29 */
             g_dry = true;
+        } else if (strcmp(argv[i], "--hold-to-plan") == 0) {             /* v1.35 step 4 */
+            g_hold_req = true;
         } else if (strcmp(argv[i], "--node-agent") == 0 && !node_sock && i + 1 < argc) {   /* v1.34 step 2 */
             node_sock = argv[++i];
         } else if (strcmp(argv[i], "--node-streams") == 0 && !node_streams && i + 1 < argc) {
@@ -5824,6 +5860,26 @@ int main(int argc, char **argv) {
     if (node_sock && node_listen(node_sock, node_streams, node_launcher, &policy_path) < 0) return 1;
     /* from here, under the node agent, the supervisor of one container */
     if (!g_check_only && !g_nr.on && (sep_idx < 0 || sep_idx + 1 >= argc)) { usage(argv[0]); return 2; }
+    /* v1.35 step 4: the hold needs a plan to hold to; its path and hash are
+     * read now, for run_start and every outside_plan record */
+    if (g_hold_req) {
+        if (!plan_path) {
+            fprintf(stderr, "[warden] --hold-to-plan holds a run to its plan; give --plan too\n");
+            return 2;
+        }
+        if (sha256_file_hex(plan_path, g_hold_plan_sha) < 0) {
+            fprintf(stderr, "[warden] cannot read the plan %s (%s)\n", plan_path, strerror(errno));
+            return 1;
+        }
+        char *jb = NULL;
+        size_t jn = 0;
+        FILE *jf = open_memstream(&jb, &jn);
+        if (!jf) return 1;
+        json_escape(jf, plan_path);
+        fclose(jf);
+        snprintf(g_hold_plan_json, sizeof g_hold_plan_json, "%s", jb ? jb : "");
+        free(jb);
+    }
     if (flow_path && !plan_path && !g_check_only) {
         fprintf(stderr, "[warden] --flow-policy checks a plan; give --plan too\n");
         return 2;
@@ -6408,6 +6464,7 @@ int main(int argc, char **argv) {
 
     /* v1.6 pre-execution plan verification. Fires before fork; on
      * any non-SATISFIED result the target is not started. */
+    g_hold_collect = g_hold_req;                  /* v1.35 step 4: each step that passes */
     if (plan_path && g_flow_cfg) {
         /* v1.18.0: node + flow check, refusal breaker (exit 3, 4 or 5). */
         int gate = warden_gate_plan_flow(plan_path, &p);
@@ -6420,6 +6477,12 @@ int main(int argc, char **argv) {
         emit_run_end(1);                    /* v1.16: a closed (and signed) stream */
         if (g_sk) sodium_free(g_sk);
         return 1;
+    }
+    if (g_hold_req) {                                                      /* v1.35 step 4 */
+        g_hold_collect = false;
+        g_hold_on = true;
+        fprintf(stderr, "[warden] the run is held to its plan: %zu entries; a call the policy allows "
+                "outside them is refused (outside_plan)\n", g_nhold);
     }
 
     struct sigaction sa = { .sa_handler = on_term };

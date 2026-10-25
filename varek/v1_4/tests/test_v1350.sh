@@ -19,6 +19,10 @@
 #   5. plan 1.35 (step 3: D3, D4, D6): mcp_call, subagent and credential
 #      steps, a step decided as a confined subject (as=), and the same plan
 #      without `plan 1.35`, read as through v1.34
+#   6. a run held to its plan (step 4, D2): a call the policy allows but no
+#      step covers refused (outside_plan) as the agent makes it: a file, a
+#      write under a read-only step, a launch, a connection; what the plan
+#      covers let through; run_start, the audit, varek refusals, varek run
 #
 # Usage: test_v1350.sh <warden> (tools/varek, tools/vdp_cert_check beside it)
 set -u
@@ -203,6 +207,76 @@ steps 0 > "$OUT/p134.txt"
     && pass "without plan 1.35: each mcp_call, subagent and credential step UNKNOWN, said why" \
     || flunk "without plan 1.35: the new kinds ($(grep -cF 'needs `plan 1.35`' "$OUT/p134.err") said why)"
 check "without plan 1.35: an as= field UNKNOWN, said why" grep -qF 'is UNKNOWN: an as= field needs `plan 1.35`' "$OUT/p134.err"
+
+echo "== 6. a run held to its plan (--hold-to-plan) =="
+mkdir -p "$OUT/w"
+chmod 777 "$OUT/w"
+HP="$OUT/hold.policy"
+printf 'require warden 1.27\nallow exec /usr/bin/cat\nallow exec /usr/bin/tee\nallow exec /usr/bin/stat\nallow exec /usr/bin/sh\nallow exec /usr/bin/true\nallow exec /usr/bin/false\nallow exec /usr/bin/python3\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path /etc/hostname readonly\nallow path /etc/passwd readonly\nallow path %s/w/\nallow host 127.0.0.1:%s\nallow host 127.0.0.1:%s\n' "$OUT" 20801 20802 > "$HP"
+base() { printf 'plan 1.35\naction r1 file_open /usr/ open=read\naction r2 file_open /lib/ open=read\naction r3 file_open /etc/ld.so.cache open=read\n'; }
+held() {   # held <plan> <agent...>: run held, stderr in held.err
+    local pl="$1"; shift
+    "$WARDEN" "$HP" --plan "$pl" --hold-to-plan -- "$@" > "$OUT/held.out" 2> "$OUT/held.err"
+}
+rec_of() { grep '^{"event"\|^{"seq"\|"decision_final"' "$OUT/held.err" | grep -F "\"resolved\":\"$1\"" | head -1; }
+{ base; printf 'action h file_open /etc/hostname open=read\n'; } > "$OUT/h1.plan"
+held "$OUT/h1.plan" /usr/bin/cat /etc/hostname /etc/passwd
+grep -q "$(cat /etc/hostname)" "$OUT/held.out" && pass "held: a file a step covers is read" || flunk "held: a file a step covers is read"
+R=$(rec_of /etc/passwd)
+grep -q '"decision_raw":"ALLOW","decision_final":"DENY","rule":"outside_plan"' <<<"$R" && grep -q "\"plan\":\"$OUT/h1.plan\"" <<<"$R" \
+    && pass "held: a file the policy allows but no step covers: refused, outside_plan, the policy's verdict kept, the plan named" \
+    || flunk "held: the outside file ($R)"
+check "held: the agent got EACCES for it" grep -q 'cat: /etc/passwd: Permission denied' "$OUT/held.err"
+check "run_start names the plan and its SHA-256" grep -q "\"hold\":{\"plan\":\"$OUT/h1.plan\",\"plan_sha256\":\"$(sha256sum "$OUT/h1.plan" | cut -c1-64)\"}" "$OUT/held.err"
+python3 "$HERE/tools/varek_audit.py" --policy "$HP" --checker "$CHECKER" "$OUT/held.err" > "$OUT/audit" 2>&1 \
+    && grep -q 'varek_audit: PASS' "$OUT/audit" && pass "varek_audit accepts the held run" || flunk "varek_audit on the held run ($(tail -2 "$OUT/audit"))"
+cp "$OUT/held.err" "$OUT/h1.log"
+python3 "$VAREK" refusals "$OUT/h1.log" > "$OUT/ref" 2>&1
+check "varek refusals: OUTSIDE_PLAN, the plan named" grep -q "OUTSIDE_PLAN  file.open      /etc/passwd" "$OUT/ref"
+{ base; printf 'action w file_open %s/w/ open=read\n' "$OUT"; } > "$OUT/h2.plan"
+held "$OUT/h2.plan" /usr/bin/tee "$OUT/w/f" < /dev/null
+check "held: a write under a step with open=read: outside_plan" sh -c "grep -F '\"resolved\":\"$OUT/w/f\"' '$OUT/held.err' | grep -q '\"rule\":\"outside_plan\"'"
+{ base; printf 'action w file_open %s/w/\n' "$OUT"; } > "$OUT/h3.plan"
+held "$OUT/h3.plan" /usr/bin/tee "$OUT/w/f" < /dev/null
+[ -e "$OUT/w/f" ] && pass "held: a write under a directory step without open=: allowed" || flunk "held: a write under a directory step"
+held "$OUT/h3.plan" /usr/bin/stat -c %n "$OUT"
+check "held: a stat of a directory above a covered path: answered" grep -qx "$OUT" "$OUT/held.out"
+if grep -q '"landlock":{"abi":[1-9]' "$OUT/held.err"; then
+    { base; printf 'action t process_exec /usr/bin/true\n'; } > "$OUT/h4.plan"
+    held "$OUT/h4.plan" /usr/bin/sh -c '/usr/bin/true && echo true-ran; /usr/bin/false; echo "false: $?"'
+    check "held: a launch a process_exec step names: run" grep -q true-ran "$OUT/held.out"
+    check "held: a launch the policy allows but no step names: outside_plan" \
+        sh -c "grep -F '\"action\":\"process.exec\"' '$OUT/held.err' | grep -F '/usr/bin/false' | grep -q '\"rule\":\"outside_plan\"'"
+else pass "held launches: not tried (no Landlock here)"; fi
+python3 - "$OUT" <<'PY' &
+import socket, sys, time
+ss = []
+for port in (20801, 20802):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", port)); s.listen(4); ss.append(s)
+time.sleep(30)
+PY
+SRV=$!
+sleep 1
+{ base; printf 'action c net_connect 127.0.0.1:20801\n'; } > "$OUT/h5.plan"
+held "$OUT/h5.plan" /usr/bin/python3 -c '
+import socket
+for p in (20801, 20802):
+    s = socket.socket()
+    try:
+        s.connect(("127.0.0.1", p)); print(p, "connected")
+    except OSError as e:
+        print(p, "refused", e.errno)
+'
+kill $SRV 2>/dev/null
+check "held: a connection a net_connect step names: made" grep -q '20801 connected' "$OUT/held.out"
+check "held: a connection the policy allows but no step names: refused (outside_plan)" \
+    sh -c "grep -q '20802 refused 13' '$OUT/held.out' && grep -F '127.0.0.1:20802' '$OUT/held.err' | grep -q '\"rule\":\"outside_plan\"'"
+"$WARDEN" "$HP" --hold-to-plan -- /usr/bin/true > /dev/null 2> "$OUT/held.err"
+[ $? = 2 ] && grep -q 'give --plan too' "$OUT/held.err" && pass "--hold-to-plan without --plan: refused, said why" || flunk "--hold-to-plan without --plan"
+printf '[varek]\npolicy = %s\nlog_dir = %s/hlogs\nsign_key =\nanchor =\n' "$HP" "$OUT" > "$OUT/hold.conf"
+mkdir -p "$OUT/hlogs"
+VAREK_CONFIG="$OUT/hold.conf" python3 "$VAREK" run --plan "$OUT/h1.plan" --hold-to-plan -- /usr/bin/cat /etc/passwd > /dev/null 2> "$OUT/vrun.err"
+check "varek run --hold-to-plan: the run held (the outside file refused)" sh -c "grep -h '\"rule\":\"outside_plan\"' '$OUT'/hlogs/*.log | grep -q /etc/passwd"
 
 echo
 if [ "$fail" = 0 ]; then echo "test_v1350: PASS"; else echo "test_v1350: FAIL"; fi

@@ -1428,6 +1428,10 @@ def cmd_run(args):
     argv = [warden_bin(), policy]
     if args.plan:
         argv += ["--plan", args.plan]
+    if getattr(args, "hold_to_plan", False):                          # v1.35 step 4
+        if not args.plan:
+            raise CliError("--hold-to-plan holds the run to a plan", fix="give the plan with --plan PLAN")
+        argv += ["--hold-to-plan"]
     if cfg["sign_key"]:
         argv += ["--sign-key", cfg["sign_key"]]
     if cfg["anchor"]:
@@ -1849,6 +1853,12 @@ def cmd_refusals(args):
                                 f"{'sub-agent ' + ch if ch else 'the agent'} got a JSON-RPC error in a 403"))
             continue
         rl = r.get("rule")
+        if rl == "outside_plan":                                                   # v1.35 step 4
+            info(f"  {'OUTSIDE_PLAN':11}  {str(r.get('action', '?')):13}  {r.get('resolved') or r.get('target', '')}")
+            ch = obo_text(r)
+            hint(f"the policy allows it, but no step of the plan {r.get('plan', '?')} covers it; "
+                 f"{'sub-agent ' + ch if ch else 'the agent'} got {r.get('kernel_verdict', '?')}")
+            continue
         if rl == "subagent_env":
             # v1.31 review: a confined subject launched with a variable that names code
             if r.get("action") == "process.exec":
@@ -1954,6 +1964,9 @@ def cmd_refusals(args):
         info("NOT_IN_SET: the policy allows the program's name, but only files present at startup can be launched.")
     if any(r.get("rule") == "exec_no_landlock" for r in s["refusals"][: args.n]):
         info("NO_LANDLOCK: launches need Landlock (Linux 5.13 or later, enabled); varek doctor says why it is missing.")
+    if any(r.get("rule") == "outside_plan" for r in s["refusals"][: args.n]):
+        info("OUTSIDE_PLAN: the run was held to its plan (--hold-to-plan); a step for it would let it through, "
+             "if the policy still allows it.")
     if any(r.get("rule") == "exec_identity_mismatch" for r in s["refusals"][: args.n]):
         info("KILLED: a process ran a program the Warden did not decide to run; the audit fails such a run.")
     if any(r.get("rule") == "max_body" for r in s["refusals"][: args.n]):
@@ -2721,6 +2734,9 @@ def build_parser():
                          "confined as NAME, decided by rules of its own: the system read-only and the working "
                          "directory read-only; pinned to the file's SHA-256 (repeat for more servers)")
     sp.add_argument("--plan", help="check this action-graph plan before the agent starts")
+    sp.add_argument("--hold-to-plan", action="store_true",
+                    help="v1.35: also hold the run to the plan: a call the policy allows but no step of the plan "
+                         "covers is refused (outside_plan)")
     sp.add_argument("--run-as", help="unprivileged user for the agent (default from settings; with the "
                                      "baseline, the user who ran sudo)")
     sp.add_argument("--log", help="write the verdict stream here instead of a new file")
