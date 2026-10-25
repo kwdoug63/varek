@@ -22,7 +22,8 @@
  *     egress proxy reads): a net_connect step for that destination, or an
  *     mcp_call step for a server there;
  *   - a launch after the agent's own: a process_exec or subagent step for
- *     the program (its canonical path);
+ *     the program (its canonical name, as the launch and the step are each
+ *     decided: a link followed, a hardlink by its own name);
  *   - an MCP call over HTTP: an mcp_call step for its object, or for its
  *     server and method when the step names no tool;
  *   - a request carrying a credential (credential=): a credential step for
@@ -154,8 +155,11 @@ static bool hold_refuses_cred(const struct policy *p, struct action *a, int c) {
     return g_hold_on && !hold_covers_cred(p, a, c);
 }
 
-/* a launch: matched on the launch set's file (its canonical path), not the
- * name the agent gave, which may be a link to it */
+/* a launch: matched on the canonical name it is decided on (the name the
+ * agent gave with its links followed), as the step was; not on the launch
+ * set's entry, whose one name stands for every hardlink of its file (v1.35
+ * step 4c: busybox's /bin/cat was refused as /bin/sh's, and a step naming
+ * /bin/sh would have covered every busybox command) */
 static bool hold_refuses_exec(struct action *a, const char *canon) {
     if (!g_hold_on) return false;
     int subj = act_policy_subject(a);

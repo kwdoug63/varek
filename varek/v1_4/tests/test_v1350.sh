@@ -250,6 +250,16 @@ if grep -q '"landlock":{"abi":[1-9]' "$OUT/held.err"; then
     check "held: a launch a process_exec step names: run" grep -q true-ran "$OUT/held.out"
     check "held: a launch the policy allows but no step names: outside_plan" \
         sh -c "grep -F '\"action\":\"process.exec\"' '$OUT/held.err' | grep -F '/usr/bin/false' | grep -q '\"rule\":\"outside_plan\"'"
+    # step 4c (found under CRI-O, busybox): a hardlink is held by its own
+    # name, not by the launch set entry's, which its other names share
+    mkdir -m 755 "$OUT/hl"; cp /usr/bin/true "$OUT/hl/a"; ln "$OUT/hl/a" "$OUT/hl/b"
+    { cat "$HP"; printf 'allow path %s/hl/ readonly\nallow exec %s/hl/a\nallow exec %s/hl/b\n' "$OUT" "$OUT" "$OUT"; } > "$OUT/hl.policy"
+    { base; printf 'action a process_exec %s/hl/a\n' "$OUT"; } > "$OUT/h6.plan"
+    "$WARDEN" "$OUT/hl.policy" --plan "$OUT/h6.plan" --hold-to-plan -- /usr/bin/sh -c "$OUT/hl/a && echo a-ran; $OUT/hl/b; echo \"b: \$?\"" \
+        > "$OUT/held.out" 2> "$OUT/held.err"
+    check "held: a hardlink a step names: run" grep -qx a-ran "$OUT/held.out"
+    check "held: another name of the same file, which no step names: outside_plan" \
+        sh -c "grep -F '\"action\":\"process.exec\"' '$OUT/held.err' | grep -F '\"resolved\":\"$OUT/hl/b\"' | grep -q '\"rule\":\"outside_plan\"'"
 else pass "held launches: not tried (no Landlock here)"; fi
 python3 - "$OUT" <<'PY' &
 import socket, sys, time

@@ -14,6 +14,8 @@ the container does not start. The chart installs:
   the unsupervised profile, under the kubelet's seccomp root;
 - **the `VarekPolicy` resource** (`varek.dev/v1alpha1`), a policy as written
   for the Warden, kept in the pod's namespace;
+- **the `VarekPlan` resource** (from 1.35), a plan as written for the Warden,
+  kept in the pod's namespace beside its policy;
 - **the admission webhook** (`varek-admission`), which refuses a policy the
   Warden does not load, and most of what the node agent would refuse at a
   container's start (the rest fails at the start).
@@ -116,6 +118,40 @@ it is created.
 
 Label a namespace `varek.dev/policy-required=true` to also refuse its pods
 that name no policy.
+
+## A plan (from 1.35)
+
+A pod can name a plan as it names its policy: a `VarekPlan` of its
+namespace, by the annotation `varek.dev/plan: NAME`. The node agent decides
+the plan with the pod's policy as each container starts, in the container's
+view (each step SATISFIED, or the container does not run), and holds the run
+to it: a call the policy allows and no step of the plan covers is refused
+(`outside_plan`). A policy that says `require plan` admits no pod that names
+no plan.
+
+```yaml
+apiVersion: varek.dev/v1alpha1
+kind: VarekPlan
+metadata: { name: summarize, namespace: team-a }
+spec:
+  plan: |
+    plan 1.35
+    action read file_open /work/ open=read
+    action api net_connect api.example.com:443
+```
+
+and on the pod, beside `varek.dev/policy: agent`, `varek.dev/plan: summarize`.
+What the agent's own runtime reads as it starts is held too, so it is a
+step as well (`file_open /usr/ open=read` and the like).
+The webhook refuses a plan the Warden does not read, a step of a kind the node
+agent does not carry yet (`mcp_call`, `subagent`, `credential`: planned for
+1.36), and a pod naming a plan not in its namespace. Like the policy's, a
+pod's `varek.dev/plan` annotation is not added, changed or removed after it
+is created.
+
+Helm installs a chart's CRDs only when it first installs the chart, so on an
+upgrade from 1.34 apply the new one by hand:
+`kubectl apply -f https://raw.githubusercontent.com/kwdoug63/varek/v1.35.0/packaging/helm/varek/crds/varekplan.yaml`.
 
 ## Values
 

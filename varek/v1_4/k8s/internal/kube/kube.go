@@ -4,7 +4,8 @@
 // and admission webhook use (v1.34 step 5, docs/security/v1.34-kubernetes.md,
 // D7): the VarekPolicy resource, read and watched through the API server with
 // the pod's service account, over HTTPS checked against the cluster's CA. No
-// client library: a list, a get and a watch are a few requests.
+// client library: a list, a get and a watch are a few requests. v1.35 step
+// 4c (D11): and the VarekPlan resource, a pod's plan, the same way.
 package kube
 
 import (
@@ -25,11 +26,13 @@ import (
 	"time"
 )
 
-// Group, version and resource of VAREK's policies (packaging/helm/varek/crds/varekpolicy.yaml)
+// Group, version and resource of VAREK's policies (packaging/helm/varek/crds/varekpolicy.yaml),
+// and of its plans (crds/varekplan.yaml, v1.35)
 const (
 	Group    = "varek.dev"
 	Version  = "v1alpha1"
 	Resource = "varekpolicies"
+	Plans    = "varekplans"
 )
 
 // A policy's name, and a namespace's as the node agent takes it: 1 to 63 of
@@ -46,12 +49,22 @@ type Meta struct {
 	ResourceVersion string `json:"resourceVersion"`
 }
 
-// Policy is a VarekPolicy: its text is the policy as written for the Warden
+// Policy is a VarekPolicy: its text is the policy as written for the Warden;
+// or a VarekPlan (v1.35): its text is the plan, as written for the Warden
 type Policy struct {
 	Metadata Meta `json:"metadata"`
 	Spec     struct {
 		Policy string `json:"policy"`
+		Plan   string `json:"plan"`
 	} `json:"spec"`
+}
+
+// Text is a VarekPolicy's policy, or a VarekPlan's plan
+func (p *Policy) Text(resource string) string {
+	if resource == Plans {
+		return p.Spec.Plan
+	}
+	return p.Spec.Policy
 }
 
 // List is a page of them
@@ -164,17 +177,22 @@ func (c *Client) get(ctx context.Context, path string, out interface{}) error {
 	return json.NewDecoder(io.LimitReader(resp.Body, 256<<20)).Decode(out)
 }
 
-func collection(ns string) string {
+func collection(resource, ns string) string {
 	if ns == "" {
-		return fmt.Sprintf("/apis/%s/%s/%s", Group, Version, Resource)
+		return fmt.Sprintf("/apis/%s/%s/%s", Group, Version, resource)
 	}
-	return fmt.Sprintf("/apis/%s/%s/namespaces/%s/%s", Group, Version, url.PathEscape(ns), Resource)
+	return fmt.Sprintf("/apis/%s/%s/namespaces/%s/%s", Group, Version, url.PathEscape(ns), resource)
 }
 
 // ListPolicies calls each for every namespace's policies, a page at a time,
 // and returns the list's version (a watch's start); a list whose
 // continuation expired (410) fails Gone, and is listed again
 func (c *Client) ListPolicies(ctx context.Context, each func(*Policy)) (string, error) {
+	return c.List(ctx, Resource, each)
+}
+
+// List is ListPolicies for either resource (Resource, Plans)
+func (c *Client) List(ctx context.Context, resource string, each func(*Policy)) (string, error) {
 	cont := ""
 	for {
 		q := "?limit=" + fmt.Sprint(PageSize)
@@ -182,7 +200,7 @@ func (c *Client) ListPolicies(ctx context.Context, each func(*Policy)) (string, 
 			q += "&continue=" + url.QueryEscape(cont)
 		}
 		l := &List{}
-		if err := c.get(ctx, collection("")+q, l); err != nil {
+		if err := c.get(ctx, collection(resource, "")+q, l); err != nil {
 			return "", err
 		}
 		for i := range l.Items {
@@ -197,8 +215,18 @@ func (c *Client) ListPolicies(ctx context.Context, each func(*Policy)) (string, 
 
 // GetPolicy is a namespace's policy by its name; nil, nil when there is none
 func (c *Client) GetPolicy(ctx context.Context, ns, name string) (*Policy, error) {
+	return c.Get(ctx, Resource, ns, name)
+}
+
+// GetPlan is a namespace's plan by its name (v1.35); nil, nil when there is none
+func (c *Client) GetPlan(ctx context.Context, ns, name string) (*Policy, error) {
+	return c.Get(ctx, Plans, ns, name)
+}
+
+// Get is GetPolicy for either resource
+func (c *Client) Get(ctx context.Context, resource, ns, name string) (*Policy, error) {
 	p := &Policy{}
-	err := c.get(ctx, collection(ns)+"/"+url.PathEscape(name), p)
+	err := c.get(ctx, collection(resource, ns)+"/"+url.PathEscape(name), p)
 	var se *StatusError
 	if errors.As(err, &se) && se.Code == http.StatusNotFound {
 		return nil, nil
@@ -213,7 +241,12 @@ func (c *Client) GetPolicy(ctx context.Context, ns, name string) (*Policy, error
 // the watch ends (nil: watch again from the last version seen, which it
 // returns) or fails (Gone: list again)
 func (c *Client) WatchPolicies(ctx context.Context, rv string, each func(Event) error) (string, error) {
-	resp, err := c.request(ctx, collection("")+"?watch=1&allowWatchBookmarks=true&resourceVersion="+url.QueryEscape(rv))
+	return c.Watch(ctx, Resource, rv, each)
+}
+
+// Watch is WatchPolicies for either resource
+func (c *Client) Watch(ctx context.Context, resource, rv string, each func(Event) error) (string, error) {
+	resp, err := c.request(ctx, collection(resource, "")+"?watch=1&allowWatchBookmarks=true&resourceVersion="+url.QueryEscape(rv))
 	if err != nil {
 		return rv, err
 	}

@@ -53,6 +53,15 @@
 //
 // v1.34 step 5: a pod's policy is POLICY_DIR/<namespace>/<name>.policy, and
 // -sync writes there the cluster's VarekPolicy resources (sync.go).
+//
+// v1.35 step 4c (D11): a pod's plan, by the name it gives (varek.dev/plan),
+// is POLICY_DIR/<namespace>/<name>.plan (-sync writes the VarekPlan
+// resources there too). The Warden checks it with the policy (warden
+// NAME.policy --oci-filter --plan NAME.plan: it reads, and names no step of a
+// kind the node agent does not carry yet); a pod naming none is checked
+// with --no-plan, which a policy that says `require plan` refuses. The
+// plan's name and the SHA-256 of the bytes checked go in the container's
+// annotations, where the node agent takes them.
 package main
 
 import (
@@ -78,8 +87,9 @@ import (
 )
 
 const (
-	annotation = "varek.dev/policy"
-	launcherAt = "/varek/init"
+	annotation     = "varek.dev/policy"
+	planAnnotation = "varek.dev/plan" // v1.35 step 4c
+	launcherAt     = "/varek/init"
 	// the profile every container of an annotated pod names (G-1), under
 	// the kubelet's seccomp root
 	unsupervised = "varek/unsupervised.json"
@@ -113,7 +123,7 @@ type plugin struct {
 	handlers                             map[string]bool // runtime handlers that run the filter's listener (G-4)
 	noRuleErrno                          bool            // the runtime's NRI carries no errno on a rule (before v0.12)
 	mu                                   sync.Mutex
-	filters                              map[string]*ociProfile // by the SHA-256 of the policy written for
+	filters                              map[string]*ociProfile // by the SHA-256s of the policy written for and the plan checked
 }
 
 // The runtimes whose NRI sets a seccomp policy and the command (v0.10)
@@ -174,55 +184,81 @@ func (p *plugin) Configure(_ context.Context, _, runtime, ver string) (api.Event
 // writes each VarekPolicy resource), and the SHA-256 of the bytes it was
 // written for: the node agent loads the policy again, and refuses it if it
 // is not those bytes (it changed in between). The filter is written from a
-// private copy of those bytes, and kept by their hash.
-func (p *plugin) filter(ctx context.Context, ns, name string) (*ociProfile, string, error) {
-	path := filepath.Join(p.policies, ns, name+".policy")
+// private copy of those bytes, and kept by their hash. v1.35 step 4c: with
+// the pod's plan (plan, or "" for none), checked the same way from a copy of
+// its bytes, whose SHA-256 is returned too ("" for none).
+func (p *plugin) read(ns, name, ext, what string) ([]byte, string, error) {
+	path := filepath.Join(p.policies, ns, name+ext)
 	st, err := os.Lstat(path)
 	if err != nil || !st.Mode().IsRegular() {
-		return nil, "", fmt.Errorf("no policy named %s in namespace %s (%s)", name, ns, path)
+		return nil, "", fmt.Errorf("no %s named %s in namespace %s (%s)", what, name, ns, path)
 	}
 	b, err := os.ReadFile(path)
 	if err != nil || len(b) > 8<<20 {
-		return nil, "", fmt.Errorf("cannot read the policy %s (%v; at most 8 MiB)", path, err)
+		return nil, "", fmt.Errorf("cannot read the %s %s (%v; at most 8 MiB)", what, path, err)
 	}
 	sum := sha256.Sum256(b)
-	sha := hex.EncodeToString(sum[:])
+	return b, hex.EncodeToString(sum[:]), nil
+}
+
+func (p *plugin) filter(ctx context.Context, ns, name, plan string) (*ociProfile, string, string, error) {
+	b, sha, err := p.read(ns, name, ".policy", "policy")
+	if err != nil {
+		return nil, "", "", err
+	}
+	var pb []byte
+	psha := ""
+	if plan != "" {
+		if pb, psha, err = p.read(ns, plan, ".plan", "plan"); err != nil {
+			return nil, "", "", err
+		}
+	}
+	key := sha + "/" + psha
 	p.mu.Lock()
-	f, ok := p.filters[sha]
+	f, ok := p.filters[key]
 	p.mu.Unlock()
 	if ok {
-		return f, sha, nil
+		return f, sha, psha, nil
 	}
 	dir, err := os.MkdirTemp("", "varek-nri-")
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	defer os.RemoveAll(dir)
 	copyPath := filepath.Join(dir, name+".policy")
 	if err := os.WriteFile(copyPath, b, 0o600); err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
-	cmd := exec.CommandContext(ctx, p.warden, copyPath, "--oci-filter")
+	args := []string{copyPath, "--oci-filter", "--no-plan"}
+	if plan != "" {
+		planPath := filepath.Join(dir, plan+".plan")
+		if err := os.WriteFile(planPath, pb, 0o600); err != nil {
+			return nil, "", "", err
+		}
+		args = []string{copyPath, "--oci-filter", "--plan", planPath}
+	}
+	cmd := exec.CommandContext(ctx, p.warden, args...)
 	var errb strings.Builder
 	cmd.Stderr = &errb
 	out, err := cmd.Output()
 	if ctx.Err() != nil {
-		return nil, "", fmt.Errorf("the Warden did not write the filter for policy %s in the time the runtime gives (%v)", name, ctx.Err())
+		return nil, "", "", fmt.Errorf("the Warden did not write the filter for policy %s in the time the runtime gives (%v)", name, ctx.Err())
 	}
 	if err != nil {
-		return nil, "", fmt.Errorf("the Warden does not write the filter for policy %s: %v: %s", name, err, lastLine(errb.String()))
+		return nil, "", "", fmt.Errorf("the Warden does not write the filter for policy %s: %v: %s", name, err,
+			strings.ReplaceAll(lastLine(errb.String()), dir+"/", ""))
 	}
 	f = &ociProfile{}
 	if err := json.Unmarshal(out, f); err != nil || len(f.Syscalls) == 0 {
-		return nil, "", fmt.Errorf("the Warden's filter for policy %s does not read: %v", name, err)
+		return nil, "", "", fmt.Errorf("the Warden's filter for policy %s does not read: %v", name, err)
 	}
 	p.mu.Lock()
 	if len(p.filters) >= 256 {
 		p.filters = map[string]*ociProfile{}
 	}
-	p.filters[sha] = f
+	p.filters[key] = f
 	p.mu.Unlock()
-	return f, sha, nil
+	return f, sha, psha, nil
 }
 
 func lastLine(s string) string {
@@ -320,6 +356,10 @@ func (p *plugin) adjust(ctx context.Context, pod *api.PodSandbox, ctr *api.Conta
 	if !policyName.MatchString(name) {
 		return nil, refuse("the policy name %q (%s) is not 1 to 63 of a-z, 0-9 and -", name, annotation)
 	}
+	plan, named := pod.GetAnnotations()[planAnnotation]
+	if named && !policyName.MatchString(plan) {
+		return nil, refuse("the plan name %q (%s) is not 1 to 63 of a-z, 0-9 and -", plan, planAnnotation)
+	}
 	args := ctr.GetArgs()
 	if len(args) == 0 {
 		return nil, refuse("no command for the launcher to run")
@@ -354,7 +394,7 @@ func (p *plugin) adjust(ctx context.Context, pod *api.PodSandbox, ctr *api.Conta
 		fmt.Fprintf(os.Stderr, "varek-nri: %s/%s/%s: the runtime does not say the container's seccomp profile (the webhook "+
 			"required VAREK's unsupervised one)\n", pod.GetNamespace(), pod.GetName(), ctr.GetName())
 	}
-	f, sha, err := p.filter(ctx, pod.GetNamespace(), name)
+	f, sha, psha, err := p.filter(ctx, pod.GetNamespace(), name, plan)
 	if err != nil {
 		return nil, refuse("%v", err)
 	}
@@ -377,6 +417,10 @@ func (p *plugin) adjust(ctx context.Context, pod *api.PodSandbox, ctr *api.Conta
 	adj.SetArgs(append([]string{launcherAt, "--"}, args...))
 	adj.AddAnnotation(annotation, name)
 	adj.AddAnnotation("varek.dev/policy-sha256", sha)
+	if plan != "" { // v1.35 step 4c: the plan checked, for the node agent to hold the run to
+		adj.AddAnnotation(planAnnotation, plan)
+		adj.AddAnnotation("varek.dev/plan-sha256", psha)
+	}
 	// the pod's names, for the node agent's record (CRI-O puts the
 	// kubelet's in one JSON string; a runtime's own, where it has them,
 	// must agree)
@@ -408,8 +452,12 @@ func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, ctr *
 		return nil, nil, err
 	}
 	if adj != nil {
-		fmt.Fprintf(os.Stderr, "varek-nri: %s/%s/%s: policy %s, under the node agent\n", pod.GetNamespace(), pod.GetName(),
-			ctr.GetName(), pod.GetAnnotations()[annotation])
+		plan := ""
+		if n, ok := pod.GetAnnotations()[planAnnotation]; ok {
+			plan = ", plan " + n
+		}
+		fmt.Fprintf(os.Stderr, "varek-nri: %s/%s/%s: policy %s%s, under the node agent\n", pod.GetNamespace(), pod.GetName(),
+			ctr.GetName(), pod.GetAnnotations()[annotation], plan)
 	}
 	return adj, nil, nil
 }
@@ -424,7 +472,8 @@ func main() {
 	handlers := flag.String("runtime-handlers", "runc,crun", "the runtime handlers (RuntimeClass) whose containers run the Warden's filter; "+
 		"a pod of another is refused (the default handler, unnamed, is taken)")
 	// v1.34 step 5 (D7): the cluster's VarekPolicy resources into -policies
-	syncAPI := flag.Bool("sync", false, "write the cluster's VarekPolicy resources to -policies (in a cluster)")
+	// (v1.35 step 4c: and its VarekPlan resources)
+	syncAPI := flag.Bool("sync", false, "write the cluster's VarekPolicy and VarekPlan resources to -policies (in a cluster)")
 	api := flag.String("api", "", "-sync: the API server (default: the cluster's, from the service account)")
 	apiToken := flag.String("api-token", "", "-sync: the service account's token file")
 	apiCA := flag.String("api-ca", "", "-sync: the cluster's CA")
@@ -448,8 +497,9 @@ func main() {
 			fmt.Fprintln(os.Stderr, "varek-nri: -sync:", err)
 			os.Exit(2)
 		}
-		s := &syncer{c: c, dir: p.policies, logf: func(f string, a ...interface{}) { fmt.Fprintf(os.Stderr, f+"\n", a...) }}
-		go s.run(context.Background())
+		logf := func(f string, a ...interface{}) { fmt.Fprintf(os.Stderr, f+"\n", a...) }
+		go (&syncer{c: c, dir: p.policies, logf: logf}).run(context.Background())
+		go (&syncer{c: c, dir: p.policies, logf: logf, resource: kube.Plans}).run(context.Background())
 	}
 	opts := []stub.Option{stub.WithPluginName("varek"), stub.WithPluginIdx("10")}
 	if *socket != "" {

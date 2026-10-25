@@ -95,7 +95,7 @@ def test_lint_strict():
 def test_the_default_render():
     docs = render()
     assert kinds(docs) == ["ClusterRole", "ClusterRole", "ClusterRoleBinding", "ClusterRoleBinding",
-                           "CustomResourceDefinition", "DaemonSet", "Deployment", "PodDisruptionBudget", "Secret",
+                           "CustomResourceDefinition", "CustomResourceDefinition", "DaemonSet", "Deployment", "PodDisruptionBudget", "Secret",
                            "Service", "ServiceAccount", "ServiceAccount", "ValidatingWebhookConfiguration"]
     for d in docs:
         if d["kind"] not in ("CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
@@ -242,7 +242,7 @@ def test_the_webhook():
     docs = render("admission.excludeNamespaces={kube-system,monitoring}")
     vwc = one(docs, "ValidatingWebhookConfiguration")
     hooks = {h["name"]: h for h in vwc["webhooks"]}
-    assert set(hooks) == {"varekpolicy.varek.dev", "pod.varek.dev", "pod-required.varek.dev"}
+    assert set(hooks) == {"varekpolicy.varek.dev", "varekplan.varek.dev", "pod.varek.dev", "pod-required.varek.dev"}
     secret = one(docs, "Secret")
     assert secret["type"] == "kubernetes.io/tls"
     svc = one(docs, "Service")
@@ -254,6 +254,10 @@ def test_the_webhook():
         assert h["failurePolicy"] == "Fail" and h["sideEffects"] == "None"
     assert hooks["varekpolicy.varek.dev"]["rules"][0]["resources"] == ["varekpolicies"]
     assert hooks["varekpolicy.varek.dev"]["rules"][0]["operations"] == ["CREATE", "UPDATE"]
+    # v1.35 step 4c (D11): the plans
+    assert hooks["varekplan.varek.dev"]["rules"] == [{"apiGroups": ["varek.dev"], "apiVersions": ["v1alpha1"],
+                                                       "operations": ["CREATE", "UPDATE"], "resources": ["varekplans"]}]
+    assert "namespaceSelector" not in hooks["varekplan.varek.dev"]
     for name in ("pod.varek.dev", "pod-required.varek.dev"):
         # G-3: an update is sent too (the annotation is not changed)
         assert hooks[name]["rules"][0]["operations"] == ["CREATE", "UPDATE"]
@@ -324,8 +328,9 @@ def test_the_webhooks_certificate_three_ways():
 def test_rbac_reads_only():
     docs = render()
     rules = {d["metadata"]["name"]: d["rules"] for d in docs if d["kind"] == "ClusterRole"}
-    assert rules == {"t-node": [{"apiGroups": ["varek.dev"], "resources": ["varekpolicies"], "verbs": ["get", "list", "watch"]}],
-                     "t-admission": [{"apiGroups": ["varek.dev"], "resources": ["varekpolicies"], "verbs": ["get"]}]}
+    res = ["varekpolicies", "varekplans"]                    # v1.35 step 4c: the plans too
+    assert rules == {"t-node": [{"apiGroups": ["varek.dev"], "resources": res, "verbs": ["get", "list", "watch"]}],
+                     "t-admission": [{"apiGroups": ["varek.dev"], "resources": res, "verbs": ["get"]}]}
     for b in (d for d in docs if d["kind"] == "ClusterRoleBinding"):
         assert b["subjects"] == [{"kind": "ServiceAccount", "name": b["roleRef"]["name"], "namespace": NS}]
     assert pod(docs, "DaemonSet")["serviceAccountName"] == "t-node"
@@ -366,14 +371,19 @@ def test_openshift():
 
 
 def test_the_crd_names_what_the_node_agent_takes():
-    crd = one(render(), "CustomResourceDefinition")
-    assert crd["metadata"]["name"] == "varekpolicies.varek.dev" and crd["spec"]["scope"] == "Namespaced"
-    v = crd["spec"]["versions"][0]
-    assert v["name"] == "v1alpha1" and v["served"] and v["storage"]
-    rule = v["schema"]["openAPIV3Schema"]["x-kubernetes-validations"][0]["rule"]
+    docs = render()
     kube = open(os.path.join(ROOT, "varek", "v1_4", "k8s", "internal", "kube", "kube.go")).read()
     go = re.search(r"var Name = regexp\.MustCompile\(`([^`]*)`\)", kube).group(1)
-    assert f"matches('{go}')" in rule, (rule, go)
+    # v1.35 step 4c (D11): VarekPlan beside VarekPolicy, its text spec.plan
+    for name, kind, field in (("varekpolicies.varek.dev", "VarekPolicy", "policy"), ("varekplans.varek.dev", "VarekPlan", "plan")):
+        crd = one(docs, "CustomResourceDefinition", name)
+        assert crd["spec"]["scope"] == "Namespaced" and crd["spec"]["names"]["kind"] == kind
+        v = crd["spec"]["versions"][0]
+        assert v["name"] == "v1alpha1" and v["served"] and v["storage"]
+        rule = v["schema"]["openAPIV3Schema"]["x-kubernetes-validations"][0]["rule"]
+        assert f"matches('{go}')" in rule, (rule, go)
+        spec = v["schema"]["openAPIV3Schema"]["properties"]["spec"]
+        assert spec["required"] == [field] and spec["properties"][field]["type"] == "string"
 
 
 def test_the_chart_version_is_the_wardens():

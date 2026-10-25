@@ -111,3 +111,37 @@ func TestSync(t *testing.T) {
 		t.Errorf("only the policy is left in its namespace's directory (no temporary file): %v", e)
 	}
 }
+
+// v1.35 step 4c (D11): the VarekPlan resources, as <namespace>/<name>.plan,
+// beside the policies and apart from them
+func TestSyncPlans(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/apis/varek.dev/v1alpha1/varekplans" {
+			http.Error(w, "no", http.StatusNotFound)
+			return
+		}
+		if r.URL.Query().Get("watch") == "" {
+			fmt.Fprint(w, `{"metadata":{"resourceVersion":"3"},"items":[{"metadata":{"namespace":"team-a","name":"p1","resourceVersion":"2"},"spec":{"plan":"plan 1.35\naction a file_open /tmp/x\n"}}]}`)
+			return
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	pol := t.TempDir()
+	os.MkdirAll(filepath.Join(pol, "team-a"), 0o755)
+	os.WriteFile(filepath.Join(pol, "team-a", "agent.policy"), []byte("allow path /tmp/\n"), 0o644)
+	os.WriteFile(filepath.Join(pol, "team-a", "gone.plan"), []byte("plan 1.35\n"), 0o644)
+	s := &syncer{c: &kube.Client{Base: srv.URL, HTTP: srv.Client()}, dir: pol, logf: t.Logf, resource: kube.Plans}
+	if _, err := s.list(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(pol, "team-a", "p1.plan")); string(b) != "plan 1.35\naction a file_open /tmp/x\n" {
+		t.Errorf("the plan written: %q", b)
+	}
+	if _, err := os.Stat(filepath.Join(pol, "team-a", "gone.plan")); !os.IsNotExist(err) {
+		t.Errorf("a plan gone from the list is removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(pol, "team-a", "agent.policy")); err != nil {
+		t.Errorf("the plans' prune leaves the policies: %v", err)
+	}
+}

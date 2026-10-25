@@ -174,14 +174,14 @@ metadata:
   {{- end }}
 webhooks:
   {{- $excluded := concat (list .Release.Namespace) .Values.admission.excludeNamespaces | uniq }}
-  {{- range $hook := list (dict "name" "varekpolicy" "path" "/varekpolicy") (dict "name" "pod" "path" "/pod") (dict "name" "pod-required" "path" "/pod-required") }}
+  {{- range $hook := list (dict "name" "varekpolicy" "path" "/varekpolicy" "resource" "varekpolicies") (dict "name" "varekplan" "path" "/varekplan" "resource" "varekplans") (dict "name" "pod" "path" "/pod") (dict "name" "pod-required" "path" "/pod-required") }}
   - name: {{ $hook.name }}.varek.dev
-    {{- if eq $hook.name "varekpolicy" }}
+    {{- if $hook.resource }}
     rules:
       - apiGroups: ["varek.dev"]
         apiVersions: ["v1alpha1"]
         operations: ["CREATE", "UPDATE"]
-        resources: ["varekpolicies"]
+        resources: [{{ $hook.resource | quote }}]
     {{- else }}
     rules:
       - apiGroups: [""]

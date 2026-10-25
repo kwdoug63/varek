@@ -865,8 +865,10 @@ static void exec_launch(int notify_fd, const struct seccomp_notif *req, struct a
             d_final = DEC_DENY;
             rule = "exec_not_in_ruleset";
         }
-        /* v1.35 step 4: allowed, but no step of the run's plan names the program */
-        else if (d_final == DEC_ALLOW && hold_refuses_exec(a, ef->path)) {
+        /* v1.35 step 4: allowed, but no step of the run's plan names the program
+         * (by the canonical name the launch is decided on: a hardlink's own,
+         * not the launch set entry's first name, which its other names share) */
+        else if (d_final == DEC_ALLOW && hold_refuses_exec(a, a->resolved)) {
             d_final = DEC_DENY;
             rule = "outside_plan";
         }
