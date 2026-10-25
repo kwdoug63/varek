@@ -1,8 +1,8 @@
-/var/tmp/varek-plan-corpus/policies/openai-agents__mcp__sse_example.policy: glob tokens 0 of 4096
-/var/tmp/varek-plan-corpus/policies/openai-agents__mcp__sse_example.policy: 18 rules, 0 can never fire
+/var/tmp/varek-plan-corpus3/policies/openai-agents__mcp__sse_example.policy: glob tokens 0 of 4096
+/var/tmp/varek-plan-corpus3/policies/openai-agents__mcp__sse_example.policy: 18 rules, 0 can never fire
 
   mcp_call step "http://127.0.0.1:8000/sse" is UNKNOWN: an MCP server's host is a host name, not an address
   mcp_call step "http://127.0.0.1:8000/sse" is UNKNOWN: an MCP server's host is a host name, not an address
   mcp_call step "http://127.0.0.1:8000/sse" is UNKNOWN: an MCP server's host is a host name, not an address
   mcp_call step "http://127.0.0.1:8000/sse" is UNKNOWN: an MCP server's host is a host name, not an address
-/var/tmp/varek-plan-corpus/plans/openai-agents__mcp__sse_example.plan: refused under /var/tmp/varek-plan-corpus/policies/openai-agents__mcp__sse_example.policy (UNKNOWN): `varek run --plan` would not start the agent
+/var/tmp/varek-plan-corpus3/plans/openai-agents__mcp__sse_example.plan: refused under /var/tmp/varek-plan-corpus3/policies/openai-agents__mcp__sse_example.policy (UNKNOWN): `varek run --plan` would not start the agent

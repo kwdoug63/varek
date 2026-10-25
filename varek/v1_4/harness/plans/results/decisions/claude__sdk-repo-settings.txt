@@ -1,5 +1,5 @@
-/var/tmp/varek-plan-corpus/policies/claude__sdk-repo-settings.policy:24: note: /usr/bin/python3.11 is a shell or general-purpose interpreter: the agent can run any code it can read with it (the file and network rules still hold)
-/var/tmp/varek-plan-corpus/policies/claude__sdk-repo-settings.policy: glob tokens 0 of 4096
-/var/tmp/varek-plan-corpus/policies/claude__sdk-repo-settings.policy: 21 rules, 0 can never fire
+/var/tmp/varek-plan-corpus3/policies/claude__sdk-repo-settings.policy:24: note: /usr/bin/python3.11 is a shell or general-purpose interpreter: the agent can run any code it can read with it (the file and network rules still hold)
+/var/tmp/varek-plan-corpus3/policies/claude__sdk-repo-settings.policy: glob tokens 0 of 4096
+/var/tmp/varek-plan-corpus3/policies/claude__sdk-repo-settings.policy: 21 rules, 0 can never fire
 
-  OK    /var/tmp/varek-plan-corpus/plans/claude__sdk-repo-settings.plan: authorized under /var/tmp/varek-plan-corpus/policies/claude__sdk-repo-settings.policy (21 actions)
+  OK    /var/tmp/varek-plan-corpus3/plans/claude__sdk-repo-settings.plan: authorized under /var/tmp/varek-plan-corpus3/policies/claude__sdk-repo-settings.policy (21 actions)

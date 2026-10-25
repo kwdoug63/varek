@@ -69,6 +69,7 @@ func testServer(t *testing.T, warden string) *server {
 		"team-a/broken": "allow path /tmp/\nbad\n",
 		// v1.35 step 4c
 		"team-a/needs":     "require warden 1.35\nrequire plan\nallow path /tmp/\n",
+		"team-a/held":      "require warden 1.35\nallow path /tmp/\n", // step 9: a plan needs a 1.35 policy
 		"plan:team-a/p1":   "plan 1.35\naction a file_open /tmp/x\n",
 		"plan:team-a/pmcp": "plan 1.35\naction m mcp_call http://10.0.0.1/mcp\n",
 	}, "runc, crun")
@@ -336,12 +337,14 @@ func TestPodPlan(t *testing.T) {
 		p    pod
 		why  string
 	}{
-		{"a pod with its plan", withPlan("agent", "p1"), ""},
+		{"a pod with its plan", withPlan("held", "p1"), ""},
+		{"a plan under a policy before 1.35 (a node before 1.35 would not hold it)", withPlan("agent", "p1"),
+			"does not say `require warden 1.35`"},
 		{"`require plan`, the pod's plan named", withPlan("needs", "p1"), ""},
 		{"`require plan`, no plan named", agentPod("needs", nil), "refuses its policy needs: --oci-filter: the policy says require plan"},
-		{"no such plan in the namespace", withPlan("agent", "nosuch"), "no VarekPlan nosuch in namespace team-a"},
-		{"a plan name that is not one", withPlan("agent", "P_1"), "its plan name \"P_1\""},
-		{"a plan the Warden refuses with the policy", withPlan("agent", "pmcp"), "refuses its policy agent with its plan pmcp"},
+		{"no such plan in the namespace", withPlan("held", "nosuch"), "no VarekPlan nosuch in namespace team-a"},
+		{"a plan name that is not one", withPlan("held", "P_1"), "its plan name \"P_1\""},
+		{"a plan the Warden refuses with the policy", withPlan("held", "pmcp"), "refuses its policy held with its plan pmcp"},
 		{"a plan and no policy", withPlan("", "p1"), "names a plan (varek.dev/plan) and no policy"},
 	} {
 		ok, msg := post(t, s, "/pod", "team-a", c.p)

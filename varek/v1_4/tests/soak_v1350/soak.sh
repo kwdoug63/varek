@@ -19,7 +19,7 @@
 # all), with openssl, and a Python that has the OpenAI Agents SDK
 # (adapters/requirements-frameworks.txt) and that nobody can read:
 #
-#   sudo varek/v1_4/tests/soak_v1350/soak.sh --python /opt/varek-fw/bin/python3 \
+#   sudo bash varek/v1_4/tests/soak_v1350/soak.sh --python /var/tmp/varek-fw/bin/python3 \
 #       [--hours 24] [--interval 60] [--out DIR] [--sign-key KEY]
 #
 # It writes DIR/d/ and, at the end, DIR/report.txt. It holds the terminal
@@ -133,16 +133,22 @@ WOPTS=(--plan "$D/agent.plan" --hold-to-plan --dns-server "127.0.0.1:$DP" --trus
 
 # --- the run --------------------------------------------------------------------
 echo "soak.sh: run D for $HOURS h, a turn each ${INTERVAL}s, in $OUT (started $(TZ=America/Chicago date '+%Y-%m-%d %H:%M %Z'))"
+env -i PATH=/usr/bin:/bin HOME=/nonexistent "$V14/warden" "$POL" "${WOPTS[@]}" -- \
+    "$PY" "$AG/agent_d.py" --hours "$HOURS" --interval "$INTERVAL" > "$D/agent.jsonl" 2> "$D/verdicts.log" &
+WPID=$!
+PIDS="$PIDS $WPID"
+# each process's memory every 5 minutes: the Warden by its PID, the agent as its child, the proxy (which
+# the Warden starts through an intermediate, so it is not its child) in the Warden's session (step 9,
+# review: not by a command-line pattern another run on the host could match; setsid gives each soak its own)
+SID=$(ps -o sid= -p "$WPID" | tr -d ' ')
 ( printf 't\twarden\tproxy\tagent\n'
+  rss() { [ -n "$1" ] && awk '/^VmRSS/ {print $2}' "/proc/$1/status" 2>/dev/null || echo -; }
   while sleep 300; do
-      w=$(pgrep -fx "$V14/warden $POL.*" | head -1); px=$(pgrep -fx 'warden-proxy [0-9]+:[0-9]+' | head -1)
-      ag=$(pgrep -f "agent_d.py --hours" | tail -1)
-      rss() { [ -n "$1" ] && awk '/^VmRSS/ {print $2}' "/proc/$1/status" 2>/dev/null || echo -; }
-      printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$(rss "$w")" "$(rss "$px")" "$(rss "$ag")"
+      px=$(pgrep -s "$SID" -f '^warden-proxy [0-9]+:[0-9]+$' | head -1); ag=$(pgrep -P "$WPID" -f 'agent_d\.py --hours' | head -1)
+      printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$(rss "$WPID")" "$(rss "$px")" "$(rss "$ag")"
   done ) > "$D/rss.tsv" &
 PIDS="$PIDS $!"
-env -i PATH=/usr/bin:/bin HOME=/nonexistent "$V14/warden" "$POL" "${WOPTS[@]}" -- \
-    "$PY" "$AG/agent_d.py" --hours "$HOURS" --interval "$INTERVAL" > "$D/agent.jsonl" 2> "$D/verdicts.log"
+wait "$WPID"
 echo "$?" > "$D/exit"
 
 # --- the judgement ------------------------------------------------------------------

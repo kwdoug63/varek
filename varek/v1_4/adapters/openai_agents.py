@@ -27,7 +27,7 @@ process: what it opens and dials is decided by the policy as any call, and
 is not in the plan unless named (--host, --file).
 
   openai_agents.py PROJECT --entry FILE.py:ATTR [--host HOST:PORT ...]
-                   [--file PATH[:ro] ...] [--app-dir DIR] [--no-runtime]
+                   [--file PATH[:ro] ...] [--app-dir DIR] [--no-runtime] [--no-traces]
 
 The plan goes to standard output; exit 0 with a plan, 1 without.
 """

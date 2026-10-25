@@ -21,7 +21,7 @@ action proc_meminfo file_open /proc/meminfo open=read
 action fips file_open /proc/sys/crypto/fips_enabled open=read
 action sys_cpu file_open /sys/devices/system/cpu/ open=read
 action cgroup file_open /sys/fs/cgroup/ open=read
-action app file_open /var/tmp/varek-plan-corpus/work/openai-agents__mcp__filesystem_example/ open=read
+action app file_open /var/tmp/varek-plan-corpus3/work/openai-agents__mcp__filesystem_example/ open=read
 action python_env file_open /var/tmp/lg/venv/ open=read
 #
 # the hosts the agent reaches

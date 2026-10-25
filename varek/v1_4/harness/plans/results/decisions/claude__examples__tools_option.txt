@@ -1,4 +1,4 @@
-/var/tmp/varek-plan-corpus/policies/claude__examples__tools_option.policy: glob tokens 0 of 4096
-/var/tmp/varek-plan-corpus/policies/claude__examples__tools_option.policy: 20 rules, 0 can never fire
+/var/tmp/varek-plan-corpus3/policies/claude__examples__tools_option.policy: glob tokens 0 of 4096
+/var/tmp/varek-plan-corpus3/policies/claude__examples__tools_option.policy: 20 rules, 0 can never fire
 
-  OK    /var/tmp/varek-plan-corpus/plans/claude__examples__tools_option.plan: authorized under /var/tmp/varek-plan-corpus/policies/claude__examples__tools_option.policy (20 actions)
+  OK    /var/tmp/varek-plan-corpus3/plans/claude__examples__tools_option.plan: authorized under /var/tmp/varek-plan-corpus3/policies/claude__examples__tools_option.policy (20 actions)

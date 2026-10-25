@@ -1495,9 +1495,60 @@ struct warden_plan_ud {
  * node's view under the node agent), for its plan_gate record: the evidence
  * names the plan by its bytes, not its path alone ("" when unread) */
 static char g_gate_plan_sha[65];
-static int sha256_file_hex(const char *path, char out[65]);
-static void gate_plan_hash(const char *plan_path) {
-    if (!plan_path || sha256_file_hex(plan_path, g_gate_plan_sha) < 0) g_gate_plan_sha[0] = 0;
+
+/* v1.35 step 9 (review): the plan is read once, into memory, and that copy
+ * is both hashed and parsed, for the hold and the gate alike (through step 8
+ * the file was read three times: a plan rewritten between them was decided
+ * on one content and named by another's SHA-256) */
+#define PLAN_SNAPSHOT_MAX (64u << 20)
+static char  *g_plan_snap;
+static size_t g_plan_snap_len;
+static char   g_plan_snap_path[PATH_MAX];
+static char   g_plan_snap_sha[65];
+
+static int plan_snapshot(const char *path) {
+    if (g_plan_snap && !strcmp(path, g_plan_snap_path)) return 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    size_t cap = 65536, n = 0;
+    char *b = malloc(cap);
+    for (;;) {
+        if (!b) { close(fd); errno = ENOMEM; return -1; }
+        if (n == cap) {
+            if (cap >= PLAN_SNAPSHOT_MAX) { free(b); close(fd); errno = EFBIG; return -1; }
+            char *nb = realloc(b, cap * 2);
+            if (!nb) { free(b); close(fd); errno = ENOMEM; return -1; }
+            b = nb, cap *= 2;
+        }
+        ssize_t r = read(fd, b + n, cap - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) { int e = errno; free(b); close(fd); errno = e; return -1; }
+        if (r == 0) break;
+        n += (size_t)r;
+    }
+    close(fd);
+    unsigned char h[32];
+    crypto_hash_sha256(h, (const unsigned char *)b, n);
+    sodium_bin2hex(g_plan_snap_sha, sizeof g_plan_snap_sha, h, sizeof h);
+    free(g_plan_snap);
+    g_plan_snap = b, g_plan_snap_len = n;
+    snprintf(g_plan_snap_path, sizeof g_plan_snap_path, "%s", path);
+    return 0;
+}
+
+/* the plan parsed from its snapshot, its SHA-256 the gate's (v1.35 step 7:
+ * the evidence names the plan by its bytes, not its path alone) */
+static plan_parsed_t *plan_load_snapshot(const char *path, char *err, size_t errlen) {
+    g_gate_plan_sha[0] = 0;
+    if (!path || plan_snapshot(path) < 0) {
+        snprintf(err, errlen, "%s: cannot open", path ? path : "?");
+        return NULL;
+    }
+    /* an empty file is read as one empty line (fmemopen takes no empty buffer) */
+    FILE *fp = g_plan_snap_len ? fmemopen(g_plan_snap, g_plan_snap_len, "r") : fmemopen((void *)"\n", 1, "r");
+    plan_parsed_t *pp = plan_parser_load_stream(fp, path, err, errlen);
+    if (pp) memcpy(g_gate_plan_sha, g_plan_snap_sha, sizeof g_gate_plan_sha);
+    return pp;
 }
 
 /* v1.35 step 2 (D9): why a step was not SATISFIED, for its plan_step record.
@@ -1762,6 +1813,32 @@ static void plan_step_log(const plan_spec_action_t *a, const char *target, plan_
     fflush(g_log);
 }
 
+/* v1.35 step 9 (review): in plan 1.35, a field the Warden does not read for
+ * the step's kind is refused, not passed over: a misspelled open= (opne=read)
+ * or name= would leave the step wider than written. The bad field's key, or
+ * NULL. */
+static const char *plan_bad_field(const struct warden_plan_ud *u, const plan_spec_action_t *a) {
+    static const struct { const char *kind, *keys; } ok[] = {
+        { "file_open", " open as " }, { "net_connect", " as " }, { "process_exec", " as " },
+        { "subagent", " exec as " }, { "mcp_call", " method name as " }, { "credential", " as " },
+    };
+    if (!u->parsed || !u->spec || a < u->spec->actions || a >= u->spec->actions + u->spec->n_actions || !a->kind)
+        return NULL;
+    const char *keys = NULL;
+    for (size_t i = 0; i < sizeof ok / sizeof ok[0]; i++)
+        if (!strcmp(a->kind, ok[i].kind)) keys = ok[i].keys;
+    if (!keys) return NULL;                         /* a kind not decided: UNKNOWN already */
+    size_t nf = 0;
+    const plan_spec_field_t *fl = plan_parser_fields(u->parsed, (size_t)(a - u->spec->actions), &nf);
+    for (size_t k = 0; k < nf; k++) {
+        char pat[48];
+        if (!fl[k].key || strlen(fl[k].key) > 40) return fl[k].key ? fl[k].key : "?";
+        snprintf(pat, sizeof pat, " %s ", fl[k].key);
+        if (!strstr(keys, pat)) return fl[k].key;
+    }
+    return NULL;
+}
+
 static plan_decision_t plan_step_decide(const struct warden_plan_ud *u, const plan_spec_action_t *a,
                                         struct plan_step_note *nt)
 {
@@ -1786,7 +1863,14 @@ static plan_decision_t plan_step_decide(const struct warden_plan_ud *u, const pl
         bool newkind = a->kind && (!strcmp(a->kind, "mcp_call") || !strcmp(a->kind, "subagent") ||
                                    !strcmp(a->kind, "credential"));
         const char *as = plan_field(u, a, "as");
-        if (as && ver < 135) why = "an as= field needs `plan 1.35` as the plan's first line";
+        const char *badf = ver >= 135 ? plan_bad_field(u, a) : NULL;
+        static char badwhy[160];
+        if (badf) {
+            snprintf(badwhy, sizeof badwhy, "a %.20s step takes no %.40s= field (the Warden would not read it)",
+                     a->kind, badf);
+            why = badwhy;
+        }
+        else if (as && ver < 135) why = "an as= field needs `plan 1.35` as the plan's first line";
         else if (as && !(act.plan_psubj = plan_subject(u->policy, as, &why))) { }
         else if (newkind && ver < 135) why = "this kind of step needs `plan 1.35` as the plan's first line";
         else if (newkind && g_nr.on)                                    /* v1.35 step 4c (D11) */
@@ -1937,7 +2021,7 @@ static plan_decision_t plan_step_decide(const struct warden_plan_ud *u, const pl
 static void emit_plan_step(const char *plan_path, const plan_spec_action_t *a,
                            plan_decision_t pd, const struct plan_step_note *nt);
 static void emit_plan_gate_basic(const char *plan_path, size_t n_actions, size_t n_edges,
-                                 plan_decision_t pd, const char *error);
+                                 plan_decision_t pd, const char *error, const char *why);
 
 static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
                                            void *ud)
@@ -1963,12 +2047,20 @@ static int warden_verify_plan_parsed(plan_parsed_t *parsed, const char *err, con
 {
     if (!parsed) {
         fprintf(stderr, "[warden] plan load failed: %s\n", err);
-        if (records) emit_plan_gate_basic(plan_path, 0, 0, PLAN_DEC_UNKNOWN, err);
+        if (records) emit_plan_gate_basic(plan_path, 0, 0, PLAN_DEC_UNKNOWN, err, NULL);
         return 1;
     }
 
     const plan_spec_t *spec = plan_parser_spec(parsed);
-    pathology_sink_t *sink = pathology_sink_new(stderr);
+    /* v1.35 step 9 (review): the pathology report to memory, then to standard
+     * error prefixed as the flow gate's is (through step 8 an unprefixed JSON
+     * line with no run id went into the stream, which a follower took for
+     * another run's record); and its suppression_reason, the plan's refusal
+     * when no step is (a cycle, an empty plan), on the plan_gate record */
+    char *pbuf = NULL;
+    size_t plen = 0;
+    FILE *pmem = open_memstream(&pbuf, &plen);
+    pathology_sink_t *sink = pathology_sink_new(pmem ? pmem : stderr);
     struct warden_plan_ud ud = { .policy = policy, .parsed = parsed, .spec = spec,
                                  .plan_path = records ? plan_path : NULL };
 
@@ -1980,7 +2072,27 @@ static int warden_verify_plan_parsed(plan_parsed_t *parsed, const char *err, con
     size_t n_actions = spec->n_actions, n_edges = spec->n_edges;
     pathology_sink_free(sink);
     plan_parser_free(parsed);
-    if (records) emit_plan_gate_basic(plan_path, n_actions, n_edges, pd, NULL);
+    char why[32] = "";
+    if (pmem) {
+        fclose(pmem);
+        if (pbuf && plen) {
+            fputs("[warden] plan pathology: ", stderr);
+            fwrite(pbuf, 1, plen, stderr);
+            if (pbuf[plen - 1] != '\n') fputc('\n', stderr);
+            const char *r = strstr(pbuf, "\"suppression_reason\":\"");
+            if (r) {
+                r += strlen("\"suppression_reason\":\"");
+                size_t k = 0;
+                while (r[k] && r[k] != '"' && k + 1 < sizeof(why) &&
+                       ((r[k] >= 'a' && r[k] <= 'z') || r[k] == '_')) { why[k] = r[k]; k++; }
+                why[r[k] == '"' ? k : 0] = '\0';
+            }
+        }
+        free(pbuf);
+    }
+    if (records) emit_plan_gate_basic(plan_path, n_actions, n_edges, pd, NULL,
+                                      /* a step's refusal is its plan_step record's */
+                                      pd != PLAN_DEC_SATISFIED && why[0] && strcmp(why, "node") ? why : NULL);
 
     if (pd != PLAN_DEC_SATISFIED) {
         fprintf(stderr,
@@ -1998,8 +2110,7 @@ static int warden_verify_plan(const char *plan_path,
                               const struct policy *policy, bool records)
 {
     char err[256] = {0};
-    plan_parsed_t *parsed = plan_parser_load(plan_path, err, sizeof(err));
-    gate_plan_hash(parsed ? plan_path : NULL);
+    plan_parsed_t *parsed = plan_load_snapshot(plan_path, err, sizeof(err));
     return warden_verify_plan_parsed(parsed, err, plan_path, policy, records);
 }
 
@@ -4248,10 +4359,23 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             if (mfd >= 0 &&
                 !(act.kind == ACT_FILE_ACCESS && (act.access_mode & (W_OK | X_OK)))) {
                 struct stat ast;
-                if (fstat(mfd, &ast) == 0 && S_ISDIR(ast.st_mode) &&
-                    is_ancestor(act.resolved, sub_policy_subject(act.subject)) &&
-                    !ancestor_denied(p, act.resolved, sub_policy_subject(act.subject)) &&
-                    (!g_hold_on || hold_covers(&act))) {                    /* v1.35 step 4 */
+                bool anc = fstat(mfd, &ast) == 0 && S_ISDIR(ast.st_mode) &&
+                           is_ancestor(act.resolved, sub_policy_subject(act.subject)) &&
+                           !ancestor_denied(p, act.resolved, sub_policy_subject(act.subject));
+                if (anc && g_hold_on && !hold_covers(&act)) {
+                    /* v1.35 step 9 (review): the policy leads to it, the plan does
+                     * not: the hold's refusal, recorded as one (through step 8 it
+                     * fell to the policy's decision and was recorded as that) */
+                    close(mfd);
+                    clock_gettime(CLOCK_MONOTONIC, &t1);
+                    uint64_t lat_h = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
+                                   + (t1.tv_nsec - t0.tv_nsec);
+                    emit_pathology(g_report_seq++, req.pid, &act, DEC_ALLOW, DEC_DENY,
+                                   "outside_plan", lat_h, EACCES);
+                    send_simple(notify_fd, req.id, DEC_DENY);
+                    continue;
+                }
+                if (anc) {                                                  /* v1.35 step 4 */
                     int64_t r = meta_answer(req.pid, notify_fd, req.id, &act, mfd, true);
                     close(mfd);
                     if (r < 0) send_errno(notify_fd, req.id, (int)-r);
@@ -5059,7 +5183,7 @@ static void emit_plan_step(const char *plan_path, const plan_spec_action_t *a,
  * size, the verdict, and why it could not be read when it could not. Through
  * v1.34 the outcome was a line on standard error only. */
 static void emit_plan_gate_basic(const char *plan_path, size_t n_actions, size_t n_edges,
-                                 plan_decision_t pd, const char *error) {
+                                 plan_decision_t pd, const char *error, const char *why) {
     FILE *f = rec_begin();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -5068,6 +5192,7 @@ static void emit_plan_gate_basic(const char *plan_path, size_t n_actions, size_t
     fprintf(f, "\",\"actions\":%zu,\"edges\":%zu,\"verdict\":\"%s\"", n_actions, n_edges,
             plan_decision_name(pd));
     if (g_gate_plan_sha[0]) fprintf(f, ",\"plan_sha256\":\"%s\"", g_gate_plan_sha);    /* v1.35 step 7 */
+    if (why) fprintf(f, ",\"why\":\"%s\"", why);    /* step 9 (review): node, cycle, empty, ...: [a-z_] only */
     if (error) {
         fputs(",\"error\":\"", f);
         json_escape(f, error);
@@ -5373,8 +5498,7 @@ static int cmp_arg_key(const void *x, const void *y) {
 
 static int warden_gate_plan_flow(const char *plan_path, const struct policy *policy) {
     char err[256] = {0};
-    plan_parsed_t *parsed = plan_parser_load(plan_path, err, sizeof(err));
-    gate_plan_hash(parsed ? plan_path : NULL);
+    plan_parsed_t *parsed = plan_load_snapshot(plan_path, err, sizeof(err));
     if (!parsed) {
         fprintf(stderr, "[warden] plan load failed: %s\n", err);
         return GATE_ERROR;
@@ -5912,17 +6036,23 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[warden] --hold-to-plan holds a run to its plan; give --plan too\n");
             return 2;
         }
-        if (sha256_file_hex(plan_path, g_hold_plan_sha) < 0) {
+        if (plan_snapshot(plan_path) < 0) {          /* step 9 (review): the gate parses these bytes */
             fprintf(stderr, "[warden] cannot read the plan %s (%s)\n", plan_path, strerror(errno));
             return 1;
         }
+        memcpy(g_hold_plan_sha, g_plan_snap_sha, sizeof g_hold_plan_sha);
         char *jb = NULL;
         size_t jn = 0;
         FILE *jf = open_memstream(&jb, &jn);
         if (!jf) return 1;
         json_escape(jf, plan_path);
         fclose(jf);
-        snprintf(g_hold_plan_json, sizeof g_hold_plan_json, "%s", jb ? jb : "");
+        if (!jb || strlen(jb) >= sizeof g_hold_plan_json) {   /* step 9 (review): never cut inside an escape */
+            fprintf(stderr, "[warden] the plan's path is too long to record in each refusal; give a shorter one\n");
+            free(jb);
+            return 2;
+        }
+        snprintf(g_hold_plan_json, sizeof g_hold_plan_json, "%s", jb);
         free(jb);
     }
     if (flow_path && !plan_path && !g_check_only) {
@@ -6558,8 +6688,7 @@ int main(int argc, char **argv) {
         /* v1.35 step 4c: the pod's plan read here, in the node's view (its
          * copy beside the stream), decided in the container's */
         static char perr[256];
-        plan_parsed_t *pp = plan_path ? plan_parser_load(plan_path, perr, sizeof perr) : NULL;
-        gate_plan_hash(pp ? plan_path : NULL);
+        plan_parsed_t *pp = plan_path ? plan_load_snapshot(plan_path, perr, sizeof perr) : NULL;
         return node_supervise(&p, boot_path, policy_path, plan_path, pp, perr);
     }
 

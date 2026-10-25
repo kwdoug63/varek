@@ -145,9 +145,17 @@ What the agent's own runtime reads as it starts is held too, so it is a
 step as well (`file_open /usr/ open=read` and the like).
 The webhook refuses a plan the Warden does not read, a step of a kind the node
 agent does not carry yet (`mcp_call`, `subagent`, `credential`: planned for
-1.36), and a pod naming a plan not in its namespace. Like the policy's, a
-pod's `varek.dev/plan` annotation is not added, changed or removed after it
-is created.
+1.36), a pod naming a plan not in its namespace, and a pod naming a plan
+whose policy does not say `require warden 1.35` (a node still on 1.34 during
+an upgrade would run it under its policy alone, not held; with that line it
+refuses the container). Like the policy's, a pod's `varek.dev/plan`
+annotation is not added, changed or removed after it is created.
+
+A plan is bound by its name, as a policy is: each container start (a restart
+too) takes the `VarekPlan` of that name as it is then, so whoever may update
+`varekplans` in the namespace decides what its pods are held to. The run's
+first record names the plan it was held to by its SHA-256
+(`run_start.hold.plan_sha256`).
 
 Helm installs a chart's CRDs only when it first installs the chart, so on an
 upgrade from 1.34 apply the new one by hand:

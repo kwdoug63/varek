@@ -353,7 +353,19 @@ def check_hold(meta, records, problems):
 PLAN_VERDICTS = ("SATISFIED", "UNSATISFIED", "UNKNOWN")
 
 
-def check_plan_gate(meta, records, problems, plan_file=None):
+# step 9 (review): the reasons the basic gate gives on plan_gate (why) for a plan refused with no step
+# refused (pathology.c's suppression reasons)
+GATE_WHYS = ("cycle", "empty", "capacity", "edge_index")
+
+
+def gate_passed(r):
+    """the gate's record lets the agent start: SATISFIED, and under the flow
+    gate its breaker PASS"""
+    return isinstance(r, dict) and r.get("verdict") == "SATISFIED" and \
+        (r.get("gate") != "flow" or r.get("breaker") == "PASS")
+
+
+def check_plan_gate(meta, records, problems, plan_file=None, complete=True):
     """v1.35 step 7: the plan gate's records (step 2, D9), with each other,
     with the run and with its hold. A plan_step is a step not SATISFIED
     (UNSATISFIED or UNKNOWN, with its reason), of the gate's plan, written
@@ -398,9 +410,14 @@ def check_plan_gate(meta, records, problems, plan_file=None):
             problems.append(f"{where}: plan_sha256 {sha!r} is not a SHA-256")
         elif sha is None and "error" not in r and _version_at_least(rs.get("warden"), (1, 35)):
             problems.append(f"{where}: no plan_sha256 (the Warden records the plan's SHA-256 from 1.35)")
+        if r.get("why") is not None and r.get("why") not in GATE_WHYS:
+            problems.append(f"{where}: why {r.get('why')!r} is not a reason the gate gives")
         gates[g] = r
-    gate = gates.get("plan")
-    if steps and gate is None:
+    # step 9 (review): the flow gate (--flow-policy) writes plan_step records too, and its own plan_gate
+    gate = gates.get("plan") or gates.get("flow")
+    # step 9 (review): a stream cut before the gate's record (--allow-incomplete), no decision after it
+    cut = not complete and gate is None and not records
+    if steps and gate is None and not cut:
         problems.append(f"{len(steps)} plan_step record(s) and no plan gate's verdict")
     if gate is not None:
         own = [s for s in steps if s.get("plan") == gate.get("plan")]
@@ -412,16 +429,21 @@ def check_plan_gate(meta, records, problems, plan_file=None):
             problems.append(f"the plan was authorized, and {len(steps)} of its steps are recorded as not "
                             f"SATISFIED")
         if gate.get("verdict") in ("UNSATISFIED", "UNKNOWN"):
-            if not steps and "error" not in gate:
+            # the reason: a step, the parser's error, the plan's structure (step 9: why, a cycle), or
+            # under the flow gate its flow axis (its steps all SATISFIED)
+            if not steps and "error" not in gate and gate.get("why") not in GATE_WHYS and \
+                    not (gate.get("gate") == "flow" and gate.get("node_axis") == "SATISFIED"):
                 problems.append("the plan was refused, and no step of it is recorded as the reason")
     for g, r in gates.items():
-        if r.get("verdict") != "SATISFIED" and records:
-            problems.append(f"the {g} gate refused the plan ({r.get('verdict')}), and the stream holds "
-                            f"{len(records)} decision record(s): a refused plan starts no agent")
+        if not gate_passed(r) and records:
+            problems.append(f"the {g} gate refused the plan ({r.get('verdict')}"
+                            f"{', breaker ' + str(r.get('breaker')) if g == 'flow' else ''}), and the stream "
+                            f"holds {len(records)} decision record(s): a refused plan starts no agent")
     hold = rs.get("hold") if isinstance(rs.get("hold"), dict) else None
     if hold is not None:
         if gate is None:
-            problems.append("the run is held to a plan, and no plan gate decided it")
+            if not cut:
+                problems.append("the run is held to a plan, and no plan gate decided it")
         else:
             if gate.get("plan") != hold.get("plan"):
                 problems.append(f"the run is held to {hold.get('plan')!r}, the gate decided {gate.get('plan')!r}")
@@ -925,7 +947,9 @@ EXEC_REFUSALS = ("policy_match", "default_deny_unknown", "certificate_refused", 
                  "subagent_env",
                  # v1.31 (the shared soak): a launch after the run was revoked (checked
                  # against the revocation with every other call refused as revoked)
-                 "revoked")
+                 "revoked",
+                 # v1.35 step 9 (review): a launch the policy allows and the run's plan does not name
+                 "outside_plan")
 SUBAGENT_REFUSALS = ("subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed", "subagent_env")
 EXEC_RESULTS = ("launched", "failed", "gone", "killed")
 
@@ -1027,6 +1051,9 @@ def check_launches(checker, policy, rules, meta, records, complete, problems):
                             f"{r.get('decision_raw')!r}")
         elif rule == "exec_identity_mismatch":
             pass
+        elif rule == "outside_plan" and r.get("decision_raw") != "ALLOW":    # v1.35 step 9 (review)
+            problems.append(f"seq {seq}: a launch refused as outside the plan, which follows only a decision "
+                            f"to allow it, but the decision was {r.get('decision_raw')!r}")
         elif rule not in EXEC_REFUSALS:
             problems.append(f"seq {seq}: a launch refused with rule {rule!r}, not one the Warden writes")
     allowed = [r for r in launches if r.get("rule") == "exec_allowed"]
@@ -3346,7 +3373,7 @@ def main(argv=None):
     check_baseline(meta, a.policy, problems)
     dry_run = check_dry(meta, records, problems)
     check_hold(meta, records, problems)                                   # v1.35 step 4
-    plan_gate = check_plan_gate(meta, records, problems, a.plan)          # v1.35 step 7
+    plan_gate = check_plan_gate(meta, records, problems, a.plan, complete)    # v1.35 step 7
     try:
         check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, problems, records)   # v1.27.1
         check_noexec_exec(meta, policy_rules(a.checker, a.policy), openas_policy, problems)          # v1.29
@@ -3822,10 +3849,10 @@ def main(argv=None):
         nout = sum(1 for r in records if r.get("rule") == "outside_plan")
         nsteps = sum(1 for _, e in meta.get("plan_events", []) if e.get("event") == "plan_step")
         print(f"varek_audit: plan: {plan_gate.get('plan')} ({plan_gate.get('actions')} steps"
-              f"{', SHA-256 ' + plan_gate['plan_sha256'] if plan_gate.get('plan_sha256') else ''}): "
+              f"{', SHA-256 ' + plan_gate['plan_sha256'] if isinstance(plan_gate.get('plan_sha256'), str) else ''}): "
               f"{plan_gate.get('verdict')}"
               f"{f', {nsteps} step(s) not SATISFIED' if nsteps else ''}; "
-              f"{f'held to it, {nout} call(s) refused outside it' if isinstance(hold_, dict) else 'not held to it'}")
+              f"{f'held to it, {nout} call(s) refused outside it' if isinstance(hold_, dict) and gate_passed(plan_gate) else 'to be held to it, but refused' if isinstance(hold_, dict) else 'not held to it'}")
     for n_ in cnotes:
         print(f"varek_audit: note: {n_}")
     print(f"varek_audit: integrity: {integrity}")

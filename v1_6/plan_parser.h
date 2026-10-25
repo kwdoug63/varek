@@ -47,6 +47,7 @@
 #include "plan_spec.h"
 
 #include <stddef.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -70,6 +71,13 @@ typedef struct plan_parsed plan_parsed_t;
 plan_parsed_t *plan_parser_load(const char *path,
                                 char       *err_buf,
                                 size_t      err_buf_len);
+
+/* v1.35 step 9: the same, from an open stream, which it closes; path names
+ * the plan in messages. */
+plan_parsed_t *plan_parser_load_stream(FILE       *fp,
+                                       const char *path,
+                                       char       *err_buf,
+                                       size_t      err_buf_len);
 
 /* Borrow the parsed spec. Pointer is valid until plan_parser_free()
  * is called on the parent handle. Returns NULL on a NULL handle. */

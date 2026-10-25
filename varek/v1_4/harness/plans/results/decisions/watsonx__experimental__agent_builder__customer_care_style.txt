@@ -1,5 +1,5 @@
-/var/tmp/varek-plan-corpus/policies/watsonx__experimental__agent_builder__customer_care_style.policy: glob tokens 162 of 4096
-/var/tmp/varek-plan-corpus/policies/watsonx__experimental__agent_builder__customer_care_style.policy: 18 rules, 0 can never fire
+/var/tmp/varek-plan-corpus3/policies/watsonx__experimental__agent_builder__customer_care_style.policy: glob tokens 162 of 4096
+/var/tmp/varek-plan-corpus3/policies/watsonx__experimental__agent_builder__customer_care_style.policy: 18 rules, 0 can never fire
 
   mcp_call step "http://host.docker.internal:3004/mcp#tools/call#" is UNKNOWN: no rule of the policy allows it
-/var/tmp/varek-plan-corpus/plans/watsonx__experimental__agent_builder__customer_care_style.plan: refused under /var/tmp/varek-plan-corpus/policies/watsonx__experimental__agent_builder__customer_care_style.policy (UNKNOWN): `varek run --plan` would not start the agent
+/var/tmp/varek-plan-corpus3/plans/watsonx__experimental__agent_builder__customer_care_style.plan: refused under /var/tmp/varek-plan-corpus3/policies/watsonx__experimental__agent_builder__customer_care_style.policy (UNKNOWN): `varek run --plan` would not start the agent

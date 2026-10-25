@@ -62,7 +62,7 @@ def read_json(path, what, required=True):
 def field(v):
     """a field's value, bare where it can be, else quoted (plan_parser.h)"""
     v = str(v)
-    if v and re.fullmatch(r'[^\s"\\\x00-\x1f\x7f]+', v):
+    if v and re.fullmatch(r'[^\s"\\\x00-\x1f\x7f\x85\u2028\u2029]+', v):
         return v
     out = '"'
     for ch in v:
@@ -77,6 +77,8 @@ def field(v):
             if o == 0:
                 raise AdapterError("a field holds a NUL byte")
             out += f"\\x{o:02x}"
+        elif o in (0x85, 0x2028, 0x2029):    # a line break to some readers: its UTF-8 bytes, escaped
+            out += "".join(f"\\x{b:02x}" for b in ch.encode())
         else:
             out += ch
     return out + '"'
@@ -100,6 +102,10 @@ class Plan:
         return lab
 
     def comment(self, text=""):
+        """a comment line: what a framework's file or object gave (a name, a description) can hold a
+        newline or a control character, which would end the comment and start a line of the plan's
+        own; each is written as '?'"""
+        text = re.sub(r"[\x00-\x1f\x7f\x85\u2028\u2029]", "?", str(text))
         self.lines.append(("# " + text).rstrip())
 
     def start(self):
@@ -112,6 +118,8 @@ class Plan:
         self.start()
         if not target or re.search(r"\s", target) or len(target) > 4095:
             raise AdapterError(f"a {kind} step's target {target!r} is not one token of at most 4095 bytes")
+        if kind in ("file_open", "process_exec") and not target.startswith("/"):
+            raise AdapterError(f"a {kind} step's target {target!r} is not an absolute path")
         key = (kind, target, tuple(sorted(fields.items())))
         if key in self.seen:
             return
@@ -176,7 +184,10 @@ def runtime_steps(P, app_dir=None, home=None, extra=(), python_env=False):
                          ("sys_cpu", "/sys/devices/system/cpu/", "read"), ("cgroup", "/sys/fs/cgroup/", "read")):
         P.step("file_open", path, lab, **({"open": f} if f else {}))
     if app_dir:
-        P.step("file_open", app_dir.rstrip("/") + "/", "app", open="read")
+        if not str(app_dir).startswith("/"):     # step 9 (review): where the agent runs, not relative to here
+            raise AdapterError(f"--app-dir {app_dir!r}: an absolute path (the agent's code directory where it runs)")
+        app_dir = os.path.normpath(app_dir)
+        P.step("file_open", "/" if app_dir == "/" else app_dir + "/", "app", open="read")
     if python_env:
         for d in python_env_dirs():
             P.step("file_open", d + "/", "python_env", open="read")
@@ -204,8 +215,20 @@ def mcp_server_steps(P, url, label, tools=None, why_any=None):
         P.comment("  tools names none: it covers every tool of the server")
         P.step("mcp_call", url, "mcp", label, "tools", method="tools/call")
     else:
-        for t in tools:
+        names = tool_names(tools)
+        if len(names) < len(list(tools)):      # step 9 (review): never a step naming "" (or no tool)
+            P.comment(f"  {label}: a tool with no name, or a name that is not text, is left out")
+        if not names:
+            P.comment(f"  {label}: no tool named, so no tools/call step")
+        for t in names:
             P.step("mcp_call", url, "mcp", label, t, method="tools/call", name=t)
+
+
+def tool_names(xs):
+    """the tool names a framework's list gives that a step can name: text, not
+    empty, at most 4096 bytes (the plan format's field), in order, once each"""
+    return list(dict.fromkeys(x for x in xs or () if isinstance(x, str) and x.strip() and
+                              len(x.encode("utf-8", "surrogateescape")) <= 4096))
 
 
 def find_program(prog, path_env=None):
@@ -229,6 +252,8 @@ def stdio_server_step(P, name, command, path_env=None):
     """an MCP server the agent launches (stdio): a sub-agent step (D4), its
     program resolved as the launch would be; its calls are not decided
     (v1.31 decides MCP calls over HTTP)"""
+    if not isinstance(command, str) or not command.strip():      # step 9 (review)
+        raise AdapterError(f"MCP server {name}'s command {command!r} is not a program's name")
     prog = find_program(command, path_env)
     P.comment(f"  {name}: a server the agent launches ({command}); its calls over stdio are not decided,")
     P.comment("  its launch is, as the sub-agent the policy names it (`mcp server` or subagent=)")
@@ -246,17 +271,23 @@ def host_steps(P, hosts):
     P.comment()
     P.comment("the hosts the agent reaches")
     for lab, hp, why in hosts:
-        if not HOSTPORT.fullmatch(hp):
+        if not isinstance(hp, str) or not HOSTPORT.fullmatch(hp):
             raise AdapterError(f"the host {hp!r} is not HOST:PORT")
         P.comment(f"  {hp}: {why}")
         P.step("net_connect", hp, lab)
 
 
 def hostport_of_url(url, default_port=443):
-    u = urlsplit(url)
+    """HOST:PORT of a URL, or None (step 9, review: None too for a URL that
+    is not text or whose port is not a port)"""
+    try:
+        u = urlsplit(url)
+        port = u.port
+    except (TypeError, ValueError, AttributeError):
+        return None
     if not u.hostname:
         return None
-    return f"{u.hostname}:{u.port or (443 if u.scheme == 'https' else 80 if u.scheme == 'http' else default_port)}"
+    return f"{u.hostname}:{port or (443 if u.scheme == 'https' else 80 if u.scheme == 'http' else default_port)}"
 
 
 # The model providers' hosts, by the name a framework gives the provider or
@@ -312,9 +343,19 @@ def _cell_ok(c):
         return False
 
 
+def code_names(code, depth=0):
+    """the global names a code object and the functions defined in it use"""
+    names = set(code.co_names)
+    if depth < 8:
+        for c in code.co_consts:
+            if isinstance(c, types.CodeType):
+                names |= code_names(c, depth + 1)
+    return names
+
+
 def children(obj):
-    """what an object holds: containers' items, functions' closures and
-    defaults, partials' arguments, instances' attributes"""
+    """what an object holds: containers' items, functions' closures, defaults
+    and the globals they use, partials' arguments, instances' attributes"""
     if isinstance(obj, dict):
         return list(obj.values())
     if isinstance(obj, (list, tuple, set, frozenset)):
@@ -322,6 +363,11 @@ def children(obj):
     if isinstance(obj, types.FunctionType):
         out = [c.cell_contents for c in (obj.__closure__ or ()) if _cell_ok(c)]
         out += list(obj.__defaults__ or ()) + list((obj.__kwdefaults__ or {}).values())
+        # step 9 (review): and the module's names its code uses (a node calling a module-level model),
+        # not the whole module: what the agent reaches, not what its file happens to define
+        g = getattr(obj, "__globals__", None)
+        if isinstance(g, dict):
+            out += [g[n] for n in code_names(obj.__code__) if n in g]
         if hasattr(obj, "__wrapped__"):
             out.append(obj.__wrapped__)
         return out
@@ -385,7 +431,7 @@ def import_attr(root, entry, what):
             sys.path.insert(0, d)
     # step 8: a file in a package is imported as its package's module (its
     # relative imports work, as `langgraph dev` loads it); any other is
-    # registered in sys.modules before it runs (a dataclass looks its module
+    # registered in sys.modules before its code is executed (a dataclass looks its module
     # up there as it is defined)
     parts, d = [os.path.basename(file)[:-3]], os.path.dirname(file)
     while os.path.isfile(os.path.join(d, "__init__.py")) and d != os.path.dirname(d):

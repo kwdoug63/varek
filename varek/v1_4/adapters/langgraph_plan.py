@@ -11,7 +11,8 @@ the Warden: the project and its packages read-only, no network. Before it
 imports anything it sets each model provider's key to a placeholder: the
 agent's clients are made, and never with a real key.
 
-From the compiled graph (and the module that builds it) it writes:
+From the compiled graph (its nodes, and the module-level objects their
+code uses), and the MCP clients its module defines, it writes:
   - each chat model's provider host (its base URL where set: ChatOpenAI,
     AzureChatOpenAI, ChatAnthropic, ChatBedrock(Converse), ChatGoogle*,
     ChatVertexAI, ChatOllama, ...);
@@ -156,7 +157,14 @@ def generate(a):
         if isinstance(entry, dict):
             entry = entry.get("path", "")
     mod, graph = import_entry(root, entry)
-    found = walk([graph, vars(mod)])
+    # step 9 (review): what the graph reaches (its nodes, and the module's names their code uses), not
+    # everything the module defines: a model the file builds and no node uses is not the agent's. The
+    # one exception, said in the plan: the module's own MCP clients (MultiServerMCPClient), whose tools
+    # the agent gets when it runs (await client.get_tools()), so no graph built before then holds them
+    found = walk([graph])
+    module_mcp = [v for v in vars(mod).values()
+                  if "MultiServerMCPClient" in mro_names(v) and all(v is not c for c in found["mcp"])]
+    found["mcp"] += module_mcp
     P = vp.Plan()
     vp.header(P, ADAPTER, f"{entry} (graph {gname})", f"graph {gname}: {len(found['graphs'])} graph(s), "
               f"{len(found['models'])} model(s), {len(found['tools'])} tool(s), {len(found['mcp'])} MCP client(s)")
@@ -175,7 +183,10 @@ def generate(a):
         elif cls in FILE_TOOLS_READ | FILE_TOOLS_WRITE:
             rd = getattr(t, "root_dir", None)
             if rd:
-                extra.append((os.path.abspath(rd).rstrip("/") + "/", cls in FILE_TOOLS_READ))
+                # step 9 (review): a relative root_dir is the agent's working directory's, where it runs
+                # (--app-dir, else the project), not this adapter's
+                rd = os.path.normpath(os.path.join(a.app_dir or root, str(rd)))
+                extra.append((rd.rstrip("/") + "/", cls in FILE_TOOLS_READ))
             else:
                 tool_notes.append(f"tool {name} ({cls}): no root_dir, so any file; name its files with --file")
         elif "MCP" in cls or getattr(t, "metadata", None) and "mcp" in str(getattr(t, "metadata", "")).lower():
@@ -197,6 +208,10 @@ def generate(a):
     for h in a.host:
         hosts.append(("host", h, "--host"))
     vp.host_steps(P, hosts)
+    if module_mcp:
+        P.comment()
+        P.comment(f"{len(module_mcp)} MCP client(s) the module defines and the graph does not hold: the agent gets")
+        P.comment("their tools when it runs, so their servers are in the plan")
     for c in found["mcp"]:
         conns = getattr(c, "connections", None) or {}
         for sname, conn in conns.items() if isinstance(conns, dict) else []:

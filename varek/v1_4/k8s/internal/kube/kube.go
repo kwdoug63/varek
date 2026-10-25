@@ -269,15 +269,18 @@ func (c *Client) Watch(ctx context.Context, resource, rv string, each func(Event
 		var m struct {
 			Metadata Meta `json:"metadata"`
 		}
+		next := rv
 		if json.Unmarshal(ev.Object, &m) == nil && m.Metadata.ResourceVersion != "" {
-			rv = m.Metadata.ResourceVersion
+			next = m.Metadata.ResourceVersion
 		}
-		if ev.Type == "BOOKMARK" {
-			continue
+		// v1.35 step 9 (review): past an event only once it is applied, so a
+		// failed one is not skipped when the watch resumes
+		if ev.Type != "BOOKMARK" {
+			if err := each(ev); err != nil {
+				return rv, err
+			}
 		}
-		if err := each(ev); err != nil {
-			return rv, err
-		}
+		rv = next
 	}
 	return rv, sc.Err()
 }

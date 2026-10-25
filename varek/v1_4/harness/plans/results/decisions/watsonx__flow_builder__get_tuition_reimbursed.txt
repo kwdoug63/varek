@@ -1,4 +1,4 @@
-/var/tmp/varek-plan-corpus/policies/watsonx__flow_builder__get_tuition_reimbursed.policy: glob tokens 0 of 4096
-/var/tmp/varek-plan-corpus/policies/watsonx__flow_builder__get_tuition_reimbursed.policy: 15 rules, 0 can never fire
+/var/tmp/varek-plan-corpus3/policies/watsonx__flow_builder__get_tuition_reimbursed.policy: glob tokens 0 of 4096
+/var/tmp/varek-plan-corpus3/policies/watsonx__flow_builder__get_tuition_reimbursed.policy: 15 rules, 0 can never fire
 
-  OK    /var/tmp/varek-plan-corpus/plans/watsonx__flow_builder__get_tuition_reimbursed.plan: authorized under /var/tmp/varek-plan-corpus/policies/watsonx__flow_builder__get_tuition_reimbursed.policy (15 actions)
+  OK    /var/tmp/varek-plan-corpus3/plans/watsonx__flow_builder__get_tuition_reimbursed.plan: authorized under /var/tmp/varek-plan-corpus3/policies/watsonx__flow_builder__get_tuition_reimbursed.policy (15 actions)

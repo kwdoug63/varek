@@ -1282,15 +1282,41 @@ PLAN_KINDS = {"file_open", "net_connect", "process_exec", "mcp_call", "subagent"
 PLAN_LABEL = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
 
 
+def write_replacing(path, text):
+    """step 9 (review): written beside PATH under a name of its own (O_EXCL,
+    not a fixed PATH.tmp a link could redirect), then renamed over it"""
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".varek-plan-", dir=d)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def plan_text_problems(text):
     """v1.35 step 5: what in an adapter's plan the plan format refuses (the
     Warden's parser reads it again when the run starts): (steps, problems)"""
     problems, labels, n, seen = [], set(), 0, False
-    for i, line in enumerate(text.splitlines(), 1):
-        t = line.strip()
+    # step 9 (review): lines as the Warden's parser splits them (on "\n" only), and none with a control
+    # character or another line break (a comment holding one would be a step to a reader that splits on it)
+    for i, line in enumerate(text.split("\n"), 1):
+        if re.search(r"[\x00-\x08\x0a-\x1f\x7f\x85\u2028\u2029]", line):
+            problems.append(f"line {i}: a control character or line break inside the line")
+            continue
+        if len(line.encode("utf-8", "surrogateescape")) > 16383:
+            problems.append(f"line {i}: longer than the plan format's 16383 bytes")
+            continue
+        t = line.strip(" \t")
         if not t or t.startswith("#"):
             continue
-        f = t.split()
+        f = [x for x in re.split(r"[ \t]+", t) if x]
         if not seen:
             seen = True
             if f != ["plan", "1.35"]:
@@ -1313,6 +1339,53 @@ def plan_text_problems(text):
     if n > 256:
         problems.append(f"{n} steps: a plan has at most 256")
     return n, problems
+
+
+# step 9 (review): directories a Python environment may not be, as it is allowed whole (read-only)
+PLAN_ENV_TOO_WIDE = {"/home", "/root", "/var", "/opt", "/srv", "/usr/local", "/tmp", "/etc", "/mnt", "/media",
+                     "/run", "/boot", "/var/lib", "/var/tmp", "/proc", "/sys", "/dev"}
+
+
+# without site (-S) sys.prefix is not the virtual environment's: found here as site.venv() finds it
+# (pyvenv.cfg beside the interpreter, or one directory up)
+PLAN_ENV_PROBE = """import os, sys
+d = os.path.dirname(sys.executable)
+v = next((x for x in (d, os.path.dirname(d)) if os.path.isfile(os.path.join(x, "pyvenv.cfg"))), None)
+print(v or sys.prefix)
+print(sys.base_prefix)"""
+
+
+def python_env_of(python, run_as):
+    """step 6: the agent's Python environment's directories (sys.prefix and
+    sys.base_prefix, but /usr), for the confinement. Step 9 (review): asked
+    of that Python as the adapter's user, with -I -S (no site, so no .pth
+    file of the environment runs: its pyvenv.cfg is found as site would)
+    and nothing of the operator's environment;
+    its answer read as exactly two absolute, normal paths, none of them a
+    directory as wide as /home or /opt"""
+    pw, _run_as, _why = varek_baseline.agent_user(run_as)
+    kw = {"user": pw.pw_uid, "group": pw.pw_gid, "extra_groups": []} if pw and os.geteuid() == 0 else {}
+    try:
+        q = subprocess.run([python, "-I", "-S", "-c", PLAN_ENV_PROBE],
+                           capture_output=True, text=True, timeout=30, cwd="/",
+                           env={"PATH": varek_baseline.SYSTEM_PATH, "LANG": "C.UTF-8", "HOME": "/nonexistent"}, **kw)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise CliError(f"{python} does not run as Python ({e})")
+    lines = q.stdout.split("\n")
+    if q.returncode != 0 or len(lines) != 3 or lines[2] != "":
+        raise CliError(f"{python} does not run as Python ({(q.stderr or q.stdout).strip()[-200:]})")
+    out = set()
+    for d in lines[:2]:
+        if not d.startswith("/") or os.path.normpath(d) != d or re.search(r"[\s\x00-\x1f\x7f]", d):
+            raise CliError(f"{python}'s environment is not a path a policy rule can name: {d!r}")
+        for x in (d, os.path.realpath(d)):
+            if x in ("/usr", "/"):
+                continue
+            if x in PLAN_ENV_TOO_WIDE or x.count("/") < 2:
+                raise CliError(f"{python}'s environment is {x}, too wide a directory to allow whole",
+                               fix="give the agent a virtual environment of its own (python3 -m venv)")
+            out.add(x)
+    return sorted(out)
 
 
 def plan_confinement(project, adapter_dir, python, env_dirs=()):
@@ -1374,13 +1447,7 @@ def cmd_plan_generate(args):
         python = shutil.which(args.python) if args.python else os.path.realpath(sys.executable)
         if not python:
             raise CliError(f"--python {args.python}: no such interpreter")
-        q = run_cmd([python, "-I", "-c", "import sys; print(sys.prefix); print(sys.base_prefix)"], check=False,
-                    capture=True)
-        if q.returncode != 0:
-            raise CliError(f"{python} does not run as Python ({q.stderr.strip()[-200:]})")
-        env_dirs = sorted({os.path.realpath(d) for d in q.stdout.split()} - {"/usr", "/"})
-        if any(re.search(r"\s", d) for d in env_dirs):
-            raise CliError("the agent's Python environment's path has white space, which a policy rule cannot name")
+        env_dirs = python_env_of(python, args.run_as)
         cmd = [python, "-I", "-B", adapter, project] + extra      # -B: no bytecode written (-I ignores PYTHON*)
     # the adapter's environment: nothing of the operator's (no key, token or
     # path), so the agent's code it imports finds none
@@ -1419,24 +1486,28 @@ def cmd_plan_generate(args):
             if refused:
                 warn(f"the Warden refused the adapter {refused} call(s): `varek refusals {log}` lists them")
         finally:
+            shutil.rmtree(tmpd, ignore_errors=True)      # step 9 (review): with --log too (the log is elsewhere)
             if not args.log:
-                shutil.rmtree(tmpd, ignore_errors=True)
                 log = None
-    for ln in err_lines:
-        print(f"  {ln}", file=sys.stderr)
+    for ln in err_lines:                         # step 9 (review): the agent's code may write any bytes there
+        print("  " + re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "?", ln), file=sys.stderr)
     if r.returncode != 0 or not out.strip():
         raise CliError(f"the {name} adapter wrote no plan (exit {r.returncode})",
                        fix="what it said is above" + (f"; its run under the Warden: {log}" if log else ""))
     n, problems = plan_text_problems(out)
     if problems:
         raise CliError(f"the {name} adapter's plan is not one the Warden reads: " + "; ".join(problems[:5]))
+    kinds = {}                                       # step 9 (review): what the plan names, by kind
+    for ln in out.split("\n"):
+        f = ln.split()
+        if len(f) >= 3 and f[0] == "action":
+            kinds[f[2]] = kinds.get(f[2], 0) + 1
+    by_kind = ", ".join(f"{v} {k}" for k, v in sorted(kinds.items()))
     if args.output:
-        tmp = args.output + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(out)
-        os.replace(tmp, args.output)
-        ok(f"{args.output}: a plan of {n} steps, from {project} ({name})")
+        write_replacing(args.output, out)
+        ok(f"{args.output}: a plan of {n} steps ({by_kind}), from {project} ({name})")
     else:
+        print(_paint("2", f"[varek] a plan of {n} steps ({by_kind}), from {project} ({name})"), file=sys.stderr)
         sys.stdout.write(out)
     if args.policy:                                       # decided as the run would, no agent run
         policy = resolve_pack(args.policy, load_config(required=False) or default_config())
@@ -1463,18 +1534,21 @@ def plan_steps(path):
     n, problems = plan_text_problems(text)
     if problems:
         raise CliError(f"{path} is not a plan the Warden reads: " + "; ".join(problems[:3]))
-    steps, edges, notes = [], [], []
-    for line in text.splitlines():
-        t = line.strip()
-        if t.startswith("action "):
-            f = t.split(None, 4)
+    steps, edges, notes, lines = [], [], [], []
+    for line in text.split("\n"):              # step 9 (review): as the Warden's parser splits and tokenizes
+        t = line.strip(" \t")
+        if t.startswith("action"):
+            f = re.split(r"[ \t]+", t, maxsplit=4)
             steps.append((f[1], f[2], f[3], f[4] if len(f) > 4 else ""))
-        elif t.startswith("edge "):
-            f = t.split()
+            lines.append(("step", steps[-1]))
+        elif t.startswith("edge"):
+            f = re.split(r"[ \t]+", t)
             edges.append((f[1], f[2]))
-        elif t.startswith("# from ") or t.startswith("# Written by"):
-            notes.append(t[2:])
-    return steps, edges, notes
+        elif t.startswith("#"):
+            if t.startswith("# from ") or t.startswith("# Written by"):
+                notes.append(t[2:])
+            lines.append(("comment", t))
+    return steps, edges, notes, lines
 
 
 def cmd_plan_merge(args):
@@ -1482,12 +1556,17 @@ def cmd_plan_merge(args):
     framework's): every step of each, a step the same in two (kind, target
     and fields) written once, a label taken twice renamed"""
     out = ["# Written by `varek plan merge` (VAREK v1.35) from:"]
-    body, seen, labels, n = [], {}, set(), 0
+    body, seen, labels, n, alledges = [], {}, set(), 0, []
     for path in args.plans:
-        steps, edges, notes = plan_steps(path)
+        steps, edges, notes, lines = plan_steps(path)
         out.append(f"#   {path}" + (f": {notes[0]}" if notes else ""))
+        body += ["#", f"# from {path}:"]
         rename = {}
-        for lab, kind, target, rest in steps:
+        for what, x in lines:                    # step 9 (review): each plan's comments kept, with its steps
+            if what == "comment":
+                body.append(x)
+                continue
+            lab, kind, target, rest = x
             key = (kind, target, rest)
             if key in seen:
                 rename[lab] = seen[key]          # its edges go to the step written already
@@ -1500,17 +1579,32 @@ def cmd_plan_merge(args):
             body.append(f"action {new} {kind} {target}" + (f" {rest}" if rest else ""))
             n += 1
         for a, b in edges:
-            if a in rename and b in rename and f"edge {rename[a]} {rename[b]}" not in body:
-                body.append(f"edge {rename[a]} {rename[b]}")
+            e = (rename.get(a), rename.get(b))
+            if None not in e and e[0] != e[1] and e not in alledges:     # two steps written as one: no self-edge
+                alledges.append(e)
+                body.append(f"edge {e[0]} {e[1]}")
     if n > 256:
         raise CliError(f"the merged plan would have {n} steps: a plan has at most 256")
+    # step 9 (review): steps written once can join two plans' edges into a cycle, which the Warden refuses
+    succ = {}
+    for a, b in alledges:
+        succ.setdefault(a, []).append(b)
+    state = {}
+    def cyclic(v):
+        state[v] = 1
+        for w in succ.get(v, ()):
+            if state.get(w) == 1 or (w not in state and cyclic(w)):
+                return True
+        state[v] = 2
+        return False
+    if any(v not in state and cyclic(v) for v in list(succ)):
+        raise CliError("the plans' edges make a cycle once their shared steps are written once",
+                       fix="merge plans whose orders agree, or drop the edges from one")
     text = "\n".join(out + ["plan 1.35"] + body) + "\n"
     if args.output:
         if os.path.exists(args.output) and not args.force:
             raise CliError(f"{args.output} exists", fix="--force to write over it")
-        with open(args.output + ".tmp", "w") as f:
-            f.write(text)
-        os.replace(args.output + ".tmp", args.output)
+        write_replacing(args.output, text)
         ok(f"{args.output}: a plan of {n} steps, from {len(args.plans)} plans")
     else:
         sys.stdout.write(text)
@@ -2995,7 +3089,8 @@ def build_parser():
     x = plsub.add_parser("generate", help="write the plan of an agent from its framework's description of it",
                          usage="varek plan generate [-o PLAN] [--policy POLICY] [--no-confine] --from FRAMEWORK "
                                "PROJECT [ADAPTER OPTIONS]",
-                         description="Run the framework's adapter (adapters/FRAMEWORK.py) on the agent's project, "
+                         description="Run the framework's adapter (in adapters/: agentcore.py, watsonx.py, "
+                                     "langgraph_plan.py, openai_agents.py, claude_agent.py) on the agent's project, "
                                      "under the Warden (the project read-only, no network), and write the plan it "
                                      "writes. Options after PROJECT go to the adapter (agentcore: --runtime, "
                                      "--target, --region, --gateway-url NAME=URL, --model-host HOST:PORT; watsonx: "

@@ -101,7 +101,9 @@ def generate(a):
         raise vp.AdapterError(f"--app-dir {a.app_dir!r}: an absolute path")
     base = os.path.normpath(a.app_dir) if a.app_dir else root    # a rule's relative path is the project's, there
     home = a.home
-    if not home:
+    if not home and os.getuid() == 0:            # step 9 (review): root's home is not the agent's
+        home = None
+    elif not home:
         try:
             home = pwd.getpwuid(os.getuid()).pw_dir
         except KeyError:
@@ -113,11 +115,16 @@ def generate(a):
         d, _ = vp.read_json(os.path.join(root, ".claude", name), f".claude/{name}", required=False)
         if isinstance(d, dict):
             sources.append(f".claude/{name}")
-            allow += [r for r in (d.get("permissions") or {}).get("allow") or [] if isinstance(r, str)]
-            env.update({k: str(v) for k, v in (d.get("env") or {}).items()})
+            # step 9 (review): a value of another type is read as none, not a traceback
+            perms = d.get("permissions") if isinstance(d.get("permissions"), dict) else {}
+            rules = perms.get("allow") if isinstance(perms.get("allow"), list) else []
+            allow += [r for r in rules if isinstance(r, str)]
+            denv = d.get("env") if isinstance(d.get("env"), dict) else {}
+            env.update({str(k): str(v) for k, v in denv.items()})
             settings = d if name == "settings.json" else settings
     mcp, _ = vp.read_json(os.path.join(root, ".mcp.json"), ".mcp.json", required=False)
-    servers = (mcp or {}).get("mcpServers") or {}
+    servers = mcp.get("mcpServers") if isinstance(mcp, dict) else None
+    servers = servers if isinstance(servers, dict) else {}
     if mcp is not None:
         sources.append(".mcp.json")
     enabled = settings.get("enabledMcpjsonServers")
@@ -143,6 +150,10 @@ def generate(a):
         tool, spec = m.group(1), m.group(2)
         if tool.startswith("mcp__"):
             parts = tool.split("__", 2)
+            # step 9 (review): mcp__SERVER is every tool of SERVER; an empty server or tool name is not
+            if not parts[1] or (len(parts) > 2 and not parts[2]):
+                notes.append(f"allow rule {rule!r}: an empty server or tool name: left out")
+                continue
             mcp_tools.setdefault(parts[1], set()).add(parts[2] if len(parts) > 2 else "*")
         elif tool in ("Read", "Glob", "Grep", "LS", "NotebookRead") and spec:
             p = path_prefix(spec, base, home)
@@ -182,7 +193,10 @@ def generate(a):
         r = env.get("CLOUD_ML_REGION", "us-east5")
         hosts.append(("model", f"{r}-aiplatform.googleapis.com:443", "Vertex AI (CLAUDE_CODE_USE_VERTEX)"))
     elif env.get("ANTHROPIC_BASE_URL"):
-        hosts.append(("model", vp.hostport_of_url(env["ANTHROPIC_BASE_URL"]), "ANTHROPIC_BASE_URL"))
+        h = vp.hostport_of_url(env["ANTHROPIC_BASE_URL"])
+        if not h:
+            raise vp.AdapterError(f"ANTHROPIC_BASE_URL {str(env['ANTHROPIC_BASE_URL'])[:200]!r} is not a URL with a host")
+        hosts.append(("model", h, "ANTHROPIC_BASE_URL"))
     else:
         hosts.append(("model", vp.MODEL_HOSTS["anthropic"], "Anthropic's API"))
     quiet = env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC") in ("1", "true") or \

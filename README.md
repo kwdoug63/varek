@@ -310,6 +310,13 @@ SKIPs to PASSes, run on a Linux host meeting the production requirements.
 
 ### Quick start
 
+> **Legacy (v1.1).** `varek_guardrails` and the integration demos below run
+> in the agent's own process and use none of the Warden. They are kept so
+> existing copies keep working (v1.35, D10). For an agent built on a
+> framework, `varek plan generate` writes its plan from the framework
+> ([`varek/v1_4/adapters/README.md`](./varek/v1_4/adapters/README.md)) and
+> `varek run --plan PLAN --hold-to-plan` runs it under the Warden held to it.
+
 ```python
 import sys
 from varek_guardrails import (
@@ -356,8 +363,9 @@ except IsolationError as e:
 
 ### Integration demos
 
-Numbered demos apply Warden to popular agent frameworks. Each follows the same
-`Target / Vector / Defense` pattern and runs end-to-end.
+Numbered demos (legacy, v1.1: in-process, without the Warden; see the note
+above) apply the v1.1 containment layer to popular agent frameworks. Each
+follows the same `Target / Vector / Defense` pattern and runs end-to-end.
 
 | File | Surface |
 |------|---------|

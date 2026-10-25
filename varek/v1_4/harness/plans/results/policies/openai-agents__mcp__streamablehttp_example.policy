@@ -16,7 +16,7 @@ allow path exact /proc/meminfo readonly
 allow path exact /proc/sys/crypto/fips_enabled readonly
 allow path /sys/devices/system/cpu/ readonly
 allow path /sys/fs/cgroup/ readonly
-allow path /var/tmp/varek-plan-corpus/work/openai-agents__mcp__streamablehttp_example/ readonly
+allow path /var/tmp/varek-plan-corpus3/work/openai-agents__mcp__streamablehttp_example/ readonly
 allow path /var/tmp/lg/venv/ readonly
 allow host api.openai.com:443
 allow host 127.0.0.1:8000

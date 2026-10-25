@@ -34,19 +34,24 @@ schema.md) by what it names:
   file_open                       string-path
   net_connect                     string-host
   mcp_call with name=, or another method than tools/call   string-host
-  mcp_call tools/call, no name    collection: the server's tools, an
-                                  element each, listed by the live server
+  mcp_call tools/call, no name    unlisted-tools: every tool of the server,
+                                  which the plan does not list
   process_exec, subagent          launch
   credential                      credential
+  (a step refused for its certificate)   certificate
 
-and asked whether v1.11's fragment could clear it: it decides predicates
-over the elements of a payload given at decision time, at most N long
-(docs/verification/bounded-sequence-fragment.md, 2). A collection step
-clears only if the plan gives its elements; a plan 1.35 step gives none (it
-names one object, or a server whose tools the plan does not list).
+classified from the plan's own step (its kind, method= and name=), not the
+decision's object, which for a server at an address is its URL alone (step
+9, review). No step of plan 1.35 is on the collection stratum
+(docs/verification/corpus-v1-schema.md: an element of a payload crossing a
+boundary): a step names one object, or a server's tools as a set the plan
+does not list, which a policy granting the server, or an adapter listing
+its tools, allows without v1.11. So with plan 1.35 the plan gate cannot
+meet v1.11's condition at all, whatever the corpus: the column is kept,
+and is 0 by construction (v111_clears), not by measurement.
 
   plan_corpus.py fetch  --manifest M --src DIR
-  plan_corpus.py run    --manifest M --src DIR --out DIR [--python PY]
+  plan_corpus.py run    --manifest M --src DIR --out DIR [--python PY] [--varek-home DIR]
   plan_corpus.py report --out DIR
 
 run writes OUT/plans/, OUT/policies/, OUT/decisions/, OUT/results.json and
@@ -66,6 +71,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 VAREK = os.path.join(HERE, "varek")
 DATA_ADAPTERS = ("agentcore", "watsonx", "claude")
 STEP = re.compile(r'^\s*(\w+) step "(.*)" is (SATISFIED|UNSATISFIED|UNKNOWN): (.*)$')
+CERT = re.compile(r'^\s*(?:\[warden\] plan: )?certificate refused for "(.*)": (.*)$')   # step 9 (review)
 
 
 class CorpusError(Exception):
@@ -114,8 +120,12 @@ def plan_steps(path):
 
 
 def hostport(url):
+    """HOST:PORT of a server's URL, an IPv6 address bracketed (step 9, review)"""
     u = urlsplit(url)
-    return f"{u.hostname}:{u.port or (443 if u.scheme == 'https' else 80)}"
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise CorpusError(f"{url!r} is not an http:// or https:// URL")
+    h = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
+    return f"{h}:{u.port or (443 if u.scheme == 'https' else 80)}"
 
 
 def named_policy(steps):
@@ -146,26 +156,61 @@ def named_policy(steps):
     return "\n".join(dict.fromkeys(L)) + "\n"
 
 
-def stratum(kind, obj):
-    """a step not SATISFIED, by what it names (the decision's object)"""
+def stratum(kind, step):
+    """a step not SATISFIED, by what the plan's own step names"""
     if kind == "file_open":
         return "string-path"
     if kind == "net_connect":
         return "string-host"
     if kind == "mcp_call":
-        parts = obj.split("#")
-        if len(parts) == 3 and parts[1] == "tools/call" and parts[2] == "":
-            return "collection"
+        if step and step.get("method", "tools/call") == "tools/call" and not step.get("name"):
+            return "unlisted-tools"
         return "string-host"
     if kind in ("process_exec", "subagent"):
         return "launch"
     return kind
 
 
+def match_steps(steps, refused):
+    """each refused line's step of the plan: the Warden decides the steps in
+    the plan's order and says each refused one in that order, so the next
+    step of the same kind whose target the object names"""
+    def norm(url):                       # the canonical URL names the default port; the plan may not
+        try:
+            u = urlsplit(url)
+            return (u.scheme, u.hostname, u.port or (443 if u.scheme == "https" else 80), u.path.rstrip("/"))
+        except ValueError:
+            return url
+
+    def same(kind, obj, s):
+        if s["kind"] != kind:
+            return False
+        if kind != "mcp_call":
+            return True
+        parts = obj.split("#")
+        if norm(parts[0]) != norm(s["target"]):
+            return False
+        # an object URL#METHOD#NAME is the step's method and name; the URL alone (a server at an
+        # address, refused before its object is made) is any step of that server, in order
+        return len(parts) != 3 or (parts[1] == s.get("method", "tools/call") and parts[2] == s.get("name", ""))
+    i, out = 0, []
+    for kind, obj in refused:
+        j = i
+        while j < len(steps) and not same(kind, obj, steps[j]):
+            j += 1
+        if j < len(steps):
+            out.append(steps[j])
+            i = j + 1
+        else:
+            out.append(None)
+    return out
+
+
 def v111_clears(kind, obj):
     """whether v1.11's fragment could clear the step: it decides over the
-    elements of a payload given at decision time; a plan 1.35 step gives
-    none (the server's tools are listed by the live server)"""
+    elements of a payload given at decision time
+    (docs/verification/bounded-sequence-fragment.md, 2); a plan 1.35 step
+    gives it none, so this is False by construction, not a measurement"""
     return False
 
 
@@ -177,7 +222,10 @@ def generate(a, ent, m, project, plan):
     env = dict(os.environ)
     if a.varek_home:
         env["VAREK_HOME"] = a.varek_home
-    r = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=600)
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=600)
+    except subprocess.TimeoutExpired:                    # step 9 (review): that agent's, not the run's end
+        return False, ["varek plan generate took more than 600 s"]
     why = [x for x in (r.stderr + r.stdout).splitlines() if not x.startswith("{")]
     return r.returncode == 0 and os.path.isfile(plan), why
 
@@ -187,6 +235,10 @@ def cmd_run(a):
     for sub in ("plans", "policies", "decisions", "work"):
         os.makedirs(os.path.join(a.out, sub), exist_ok=True)
     results = []
+
+    def save():                          # step 9 (review): after each agent, so a run cut short keeps them
+        with open(os.path.join(a.out, "results.json"), "w") as fh:
+            json.dump({"manifest": a.manifest, "results": results}, fh, indent=1)
     for ent in m["agents"]:
         safe = ent["id"].replace("/", "__")
         repo = m["repos"][ent["repo"]]
@@ -208,32 +260,59 @@ def cmd_run(a):
         if not ok:
             res.update({"generated": False, "why": why[-3:]})
             results.append(res)
+            save()
             print(f"{ent['id']}: no plan ({(why or ['?'])[-1][:120]})")
             continue
         steps = plan_steps(plan)
         pol = os.path.join(a.out, "policies", safe + ".policy")
+        try:
+            text = named_policy(steps)
+        except CorpusError as e:
+            res.update({"generated": True, "policy_error": [str(e)]})
+            results.append(res)
+            save()
+            print(f"{ent['id']}: no named policy ({e})")
+            continue
         with open(pol, "w") as fh:
-            fh.write(named_policy(steps))
-        d = subprocess.run([sys.executable, VAREK, "policy", "check", pol, "--plan", plan],
-                           capture_output=True, text=True, timeout=300)
+            fh.write(text)
+        try:
+            d = subprocess.run([sys.executable, VAREK, "policy", "check", pol, "--plan", plan],
+                               capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            res.update({"generated": True, "policy_error": ["varek policy check took more than 300 s"]})
+            results.append(res)
+            save()
+            continue
         with open(os.path.join(a.out, "decisions", safe + ".txt"), "w") as fh:
             fh.write(d.stdout + d.stderr)
         out = d.stdout + d.stderr
-        if "policy error:" in out:
-            res.update({"generated": True, "policy_error": [x for x in out.splitlines() if "policy error" in x][:2]})
+        if "policy error:" in out or "plan load failed" in out:
+            res.update({"generated": True, "policy_error": [x for x in out.splitlines()
+                                                            if "policy error" in x or "plan load failed" in x][:2]})
             results.append(res)
-            print(f"{ent['id']}: the named policy does not load ({res['policy_error'][0][:120]})")
+            save()
+            print(f"{ent['id']}: the named policy or the plan does not load ({res['policy_error'][0][:120]})")
             continue
-        refused = []
+        lines, certs = [], []
         for line in out.splitlines():
-            mm = STEP.match(line)
+            mm, mc = STEP.match(line), CERT.match(line)
             if mm and mm.group(3) != "SATISFIED":
-                k, obj = mm.group(1), mm.group(2)
-                refused.append({"kind": k, "object": obj, "decision": mm.group(3), "why": mm.group(4),
-                                "stratum": stratum(k, obj), "v111_clears": v111_clears(k, obj)})
+                lines.append((mm.group(1), mm.group(2), mm.group(3), mm.group(4)))
+            elif mc:
+                certs.append({"kind": "?", "object": mc.group(1), "decision": "UNKNOWN", "why": mc.group(2),
+                              "stratum": "certificate", "v111_clears": False})
+        refused = []
+        for (k, obj, dec, why_), st in zip(lines, match_steps(steps, [(x[0], x[1]) for x in lines])):
+            refused.append({"kind": k, "object": obj, "decision": dec, "why": why_,
+                            "step": st and st["label"], "stratum": stratum(k, st), "v111_clears": v111_clears(k, obj)})
+        refused += certs
         authorized = bool(re.search(r": authorized under \S+ \(\d+ actions\)", out))
         if not authorized and not refused:
-            raise CorpusError(f"{ent['id']}: the plan was refused and no step's reason was read:\n{out[-800:]}")
+            res.update({"generated": True, "policy_error": ["refused, and no step's reason was read: " + out[-300:]]})
+            results.append(res)
+            save()
+            print(f"{ent['id']}: refused, no step's reason read")
+            continue
         kinds = {}
         for s in steps:
             kinds[s["kind"]] = kinds.get(s["kind"], 0) + 1
@@ -241,11 +320,12 @@ def cmd_run(a):
                     "names_a_server": any(s["kind"] in ("mcp_call", "subagent") for s in steps),
                     "authorized": authorized, "refused_steps": refused,
                     "refused_only_collection": bool(refused) and all(r["stratum"] == "collection" for r in refused),
+                    "refused_only_unlisted": bool(refused) and all(r["stratum"] == "unlisted-tools" for r in refused),
                     "v111_could_start": bool(refused) and all(r["v111_clears"] for r in refused)})
         results.append(res)
+        save()
         print(f"{ent['id']}: {len(steps)} steps, {'authorized' if authorized else 'refused (' + ', '.join(sorted({r['stratum'] for r in refused})) + ')'}")
-    with open(os.path.join(a.out, "results.json"), "w") as fh:
-        json.dump({"manifest": a.manifest, "results": results}, fh, indent=1)
+    save()
     text = summary(results)
     with open(os.path.join(a.out, "summary.md"), "w") as fh:
         fh.write(text)
@@ -260,12 +340,14 @@ def pct(n, d):
 def summary(results):
     gen = [r for r in results if r.get("generated") and "policy_error" not in r]
     fws = sorted({r["framework"] for r in results})
-    rows = ["| framework | agents | plans | authorized | refused | refused only for collection steps | v1.11 could let start |",
-            "| --- | --- | --- | --- | --- | --- | --- |"]
+    rows = ["| framework | agents | plans | authorized | refused | refused only for unlisted tools | "
+            "refused only for collection steps | v1.11 could let start (0 by construction) |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |"]
 
     def row(name, rs, g):
         ref = [r for r in g if not r["authorized"]]
         return (f"| {name} | {len(rs)} | {len(g)} | {sum(r['authorized'] for r in g)} | {len(ref)} | "
+                f"{pct(sum(r.get('refused_only_unlisted', False) for r in g), len(g))} | "
                 f"{pct(sum(r['refused_only_collection'] for r in g), len(g))} | "
                 f"{pct(sum(r['v111_could_start'] for r in g), len(g))} |")
     for fw in fws:
@@ -278,7 +360,7 @@ def summary(results):
     for r in gen:
         for s in r["refused_steps"]:
             strata[s["stratum"]] = strata.get(s["stratum"], 0) + 1
-    share = [sum(r["refused_only_collection"] for r in gen if r["framework"] == fw) /
+    share = [sum(r.get("refused_only_unlisted", False) for r in gen if r["framework"] == fw) /
              max(1, len([r for r in gen if r["framework"] == fw])) for fw in fws]
     lines = ["# v1.35 step 8: the plan corpus, v1.11's condition", "",
              f"{len(results)} agents, {len(fws)} frameworks ({', '.join(fws)}); {len(gen)} plans generated.", ""]
@@ -286,13 +368,20 @@ def summary(results):
     lines += ["", "Steps not SATISFIED, by stratum: " +
               (", ".join(f"{k} {v}" for k, v in sorted(strata.items())) or "none") + ".", "",
               f"Per framework (each framework's share, averaged): {100.0 * sum(share) / max(1, len(share)):.1f}% "
-              f"refused only for collection steps.", ""]
+              f"refused only for unlisted tools.", "",
+              "No step of plan 1.35 is on the collection stratum, so the collection column and v1.11's are 0 by "
+              "construction: with plan 1.35 the plan gate cannot meet v1.11's condition. The agents are the "
+              "frameworks' published examples, not deployed agents.", ""]
     nogen = [r for r in results if not r.get("generated")]
     if nogen:
         def reason(r):                           # the adapter's own line, else the last
             w = r.get("why") or ["?"]
             return next((x.strip() for x in w if "failed" in x or "refused" in x), w[-1].strip())[:220]
         lines.append(f"No plan for {len(nogen)}: " + "; ".join(f"{r['id']} ({reason(r)})" for r in nogen) + ".")
+    perr = [r for r in results if "policy_error" in r]          # step 9 (review): left out of the plans, said
+    if perr:
+        lines.append(f"Left out, the named policy or the plan not loading: {len(perr)}: " +
+                     "; ".join(f"{r['id']} ({r['policy_error'][0][:160]})" for r in perr) + ".")
     return "\n".join(lines) + "\n"
 
 

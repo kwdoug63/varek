@@ -17,7 +17,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,25 +51,27 @@ func (s *syncer) path(ns, name string) (string, bool) {
 	return filepath.Join(s.dir, ns, name+ext), true
 }
 
-func (s *syncer) write(p *kube.Policy) {
+// write a resource's file; an error when it could not be written (v1.35 step 9,
+// review: a failure is retried, not only logged), none for a resource the node
+// agent would not take (not written, said)
+func (s *syncer) write(p *kube.Policy) error {
 	what, ext := s.kind()
 	text := p.Text(s.resource)
 	path, ok := s.path(p.Metadata.Namespace, p.Metadata.Name)
 	if !ok {
 		s.logf("varek-nri: %s %s/%s: not a name the node agent takes; not written", what, p.Metadata.Namespace, p.Metadata.Name)
-		return
+		return nil
 	}
 	if len(text) > kube.MaxPolicy {
 		s.logf("varek-nri: %s %s/%s: larger than %d bytes; not written", what, p.Metadata.Namespace, p.Metadata.Name, kube.MaxPolicy)
-		return
+		return s.remove(p.Metadata.Namespace, p.Metadata.Name) // step 9: an older version is not kept
 	}
 	if old, err := os.ReadFile(path); err == nil && string(old) == text {
-		return
+		return nil
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		s.logf("varek-nri: %s %s/%s: %v", what, p.Metadata.Namespace, p.Metadata.Name, err)
-		return
+		return fmt.Errorf("%s %s/%s: %v", what, p.Metadata.Namespace, p.Metadata.Name, err)
 	}
 	f, err := os.CreateTemp(dir, "."+p.Metadata.Name+ext+".tmp-")
 	if err == nil {
@@ -89,49 +93,78 @@ func (s *syncer) write(p *kube.Policy) {
 		}
 	}
 	if err != nil {
-		s.logf("varek-nri: %s %s/%s: %v", what, p.Metadata.Namespace, p.Metadata.Name, err)
-		return
+		return fmt.Errorf("%s %s/%s: %v", what, p.Metadata.Namespace, p.Metadata.Name, err)
 	}
 	s.logf("varek-nri: %s %s/%s written (version %s)", what, p.Metadata.Namespace, p.Metadata.Name, p.Metadata.ResourceVersion)
+	return nil
 }
 
-func (s *syncer) remove(ns, name string) {
+// remove a resource's file; an error when it is there and could not be removed
+func (s *syncer) remove(ns, name string) error {
 	what, _ := s.kind()
-	if path, ok := s.path(ns, name); ok {
-		if err := os.Remove(path); err == nil {
-			s.logf("varek-nri: %s %s/%s removed", what, ns, name)
-		}
+	path, ok := s.path(ns, name)
+	if !ok {
+		return nil
 	}
+	err := os.Remove(path)
+	if err == nil {
+		s.logf("varek-nri: %s %s/%s removed", what, ns, name)
+		return nil
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	return fmt.Errorf("%s %s/%s: not removed: %v", what, ns, name, err)
 }
 
-// After a list: the files of resources not in it removed
-func (s *syncer) prune(have map[string]bool) {
-	nss, _ := os.ReadDir(s.dir)
+// After a list: the files of resources not in it removed (step 9, review: a
+// directory that cannot be read, or a file that cannot be removed, fails the
+// list, which is tried again)
+func (s *syncer) prune(have map[string]bool) error {
+	nss, err := os.ReadDir(s.dir)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	var first error
 	for _, n := range nss {
 		if !n.IsDir() || !kube.Name.MatchString(n.Name()) {
 			continue
 		}
-		fs, _ := os.ReadDir(filepath.Join(s.dir, n.Name()))
+		files, err := os.ReadDir(filepath.Join(s.dir, n.Name()))
+		if err != nil {
+			return err
+		}
 		_, ext := s.kind()
-		for _, f := range fs {
+		for _, f := range files {
 			name := strings.TrimSuffix(f.Name(), ext)
 			if f.Type().IsRegular() && name != f.Name() && kube.Name.MatchString(name) && !have[n.Name()+"/"+name] {
-				s.remove(n.Name(), name)
+				if err := s.remove(n.Name(), name); err != nil && first == nil {
+					first = err
+				}
 			}
 		}
 	}
+	return first
 }
 
 func (s *syncer) list(ctx context.Context) (string, error) {
 	have := map[string]bool{}
+	var werr error
 	rv, err := s.c.List(ctx, s.res(), func(p *kube.Policy) {
 		have[p.Metadata.Namespace+"/"+p.Metadata.Name] = true
-		s.write(p)
+		if err := s.write(p); err != nil && werr == nil {
+			werr = err
+		}
 	})
 	if err != nil {
 		return "", err
 	}
-	s.prune(have)
+	if err := s.prune(have); err != nil && werr == nil {
+		werr = err
+	}
+	if werr != nil {
+		return "", werr
+	}
 	return rv, nil
 }
 
@@ -143,9 +176,9 @@ func (s *syncer) event(ev kube.Event) error {
 	}
 	switch ev.Type {
 	case "ADDED", "MODIFIED":
-		s.write(&p)
+		return s.write(&p)
 	case "DELETED":
-		s.remove(p.Metadata.Namespace, p.Metadata.Name)
+		return s.remove(p.Metadata.Namespace, p.Metadata.Name)
 	}
 	return nil
 }
@@ -177,6 +210,7 @@ func (s *syncer) run(ctx context.Context) {
 			}
 			if err != nil && ctx.Err() == nil {
 				s.logf("varek-nri: watching the %s: %v", s.res(), err)
+				rv = "" // step 9 (review): listed again, so what failed is written again
 			}
 		}
 		select {

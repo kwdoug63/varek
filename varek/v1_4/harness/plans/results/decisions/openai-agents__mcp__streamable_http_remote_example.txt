@@ -1,5 +1,5 @@
-/var/tmp/varek-plan-corpus/policies/openai-agents__mcp__streamable_http_remote_example.policy: glob tokens 150 of 4096
-/var/tmp/varek-plan-corpus/policies/openai-agents__mcp__streamable_http_remote_example.policy: 21 rules, 0 can never fire
+/var/tmp/varek-plan-corpus3/policies/openai-agents__mcp__streamable_http_remote_example.policy: glob tokens 150 of 4096
+/var/tmp/varek-plan-corpus3/policies/openai-agents__mcp__streamable_http_remote_example.policy: 21 rules, 0 can never fire
 
   mcp_call step "https://mcp.deepwiki.com:443/mcp#tools/call#" is UNKNOWN: no rule of the policy allows it
-/var/tmp/varek-plan-corpus/plans/openai-agents__mcp__streamable_http_remote_example.plan: refused under /var/tmp/varek-plan-corpus/policies/openai-agents__mcp__streamable_http_remote_example.policy (UNKNOWN): `varek run --plan` would not start the agent
+/var/tmp/varek-plan-corpus3/plans/openai-agents__mcp__streamable_http_remote_example.plan: refused under /var/tmp/varek-plan-corpus3/policies/openai-agents__mcp__streamable_http_remote_example.policy (UNKNOWN): `varek run --plan` would not start the agent

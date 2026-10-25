@@ -71,7 +71,7 @@ static void hold_from_step(const plan_spec_action_t *a, const struct action *act
     switch (act->kind) {
     case ACT_FILE_OPEN: {
         size_t tl = a->target ? strlen(a->target) : 0;
-        bool dir = tl > 1 && a->target[tl - 1] == '/';
+        bool dir = tl >= 1 && a->target[tl - 1] == '/';      /* step 9 (review): `file_open /` too */
         int acc = act->open_flags & O_ACCMODE;
         bool ro = act->flags_known && acc == O_RDONLY && !(act->open_flags & (O_CREAT | O_TRUNC | O_APPEND));
         hold_add(HOLD_FILE, subj, act->resolved, dir, ro, false);
@@ -97,8 +97,18 @@ static bool hold_path_in(const char *path, const struct hold_entry *e) {
 
 /* is the call covered by a step of the plan? */
 static bool hold_covers(const struct action *a) {
+    switch (a->kind) {                      /* step 9 (review): the kinds the hold narrows; any other is */
+    case ACT_FILE_OPEN: case ACT_FILE_STAT: case ACT_FILE_ACCESS: case ACT_FILE_READLINK:
+    case ACT_FILE_CHANGE: case ACT_NET_CONNECT: case ACT_NET_SEND: case ACT_NET_PROXY:
+    case ACT_PROCESS_EXEC: case ACT_NET_MCP:
+        break;
+    default:
+        return true;                        /* covered, whatever entries the subject has (none too) */
+    }
     int subj = act_policy_subject(a);
-    bool meta = a->kind == ACT_FILE_STAT || a->kind == ACT_FILE_ACCESS || a->kind == ACT_FILE_READLINK;
+    /* step 9 (review): a chdir is a lookup too (a directory above a step's path) */
+    bool meta = a->kind == ACT_FILE_STAT || a->kind == ACT_FILE_ACCESS || a->kind == ACT_FILE_READLINK ||
+                (a->kind == ACT_FILE_CHANGE && a->chg_op == CHG_CHDIR);
     bool write = a->kind == ACT_FILE_CHANGE && a->chg_op != CHG_CHDIR;
     if (a->kind == ACT_FILE_OPEN)
         write = (a->open_flags & O_ACCMODE) != O_RDONLY || (a->open_flags & (O_CREAT | O_TRUNC | O_APPEND));
@@ -128,7 +138,7 @@ static bool hold_covers(const struct action *a) {
                 (e->prefix ? !strncmp(s, e->obj, strlen(e->obj)) : !strcmp(s, e->obj))) return true;
             break;
         default:
-            return true;                    /* not a kind the hold narrows */
+            break;
         }
     }
     return false;
@@ -155,11 +165,15 @@ static bool hold_refuses_cred(const struct policy *p, struct action *a, int c) {
     return g_hold_on && !hold_covers_cred(p, a, c);
 }
 
-/* a launch: matched on the canonical name it is decided on (the name the
- * agent gave with its links followed), as the step was; not on the launch
- * set's entry, whose one name stands for every hardlink of its file (v1.35
- * step 4c: busybox's /bin/cat was refused as /bin/sh's, and a step naming
- * /bin/sh would have covered every busybox command) */
+/* a launch: matched on the name it is decided on (exec_name: the name the
+ * agent gave, made absolute, a final symlink's own), as the step was (step 9);
+ * not on the launch set's entry, whose one name stands for every hardlink of
+ * its file (v1.35 step 4c: busybox's /bin/cat was refused as /bin/sh's).
+ * What is held is the file launched by that name, not what it does: a
+ * multi-call binary (busybox) picks its applet from argv[0], which the agent
+ * chooses, so a step naming /bin/cat on a busybox image launches a shell as
+ * readily (step 9, review). A plan for such an image names the programs as
+ * the policy does, for the file each is. */
 static bool hold_refuses_exec(struct action *a, const char *canon) {
     if (!g_hold_on) return false;
     int subj = act_policy_subject(a);

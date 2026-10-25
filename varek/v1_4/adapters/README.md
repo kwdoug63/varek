@@ -168,6 +168,10 @@ varek plan generate --no-confine --policy samples/agentcore-travel/travel.policy
     --from agentcore samples/agentcore-travel > /dev/null
 ```
 
+(run from `adapters/`; deciding the plan resolves the AWS host names the
+policy names, so the host needs DNS, as `make test-v1350` does for these
+checks.)
+
 The others, one authorized and one refused under each sample's policy:
 
 | Sample | Authorized | Refused, and why |

@@ -3,8 +3,9 @@
 AgentCore Runtime's API gives a container nothing but its image
 (`containerConfiguration` has `containerUri` only), and no page AWS
 publishes says what the container may do. D8 in
-`docs/security/v1.35-frameworks.md` waits on these facts. They are measured
-from inside a session, by this probe:
+`docs/security/v1.35-frameworks.md` waited on these facts, and was settled at
+(a) on them (October 24, 2026, Central). They are measured from inside a
+session, by this probe:
 
 - the container's user, capabilities, `NoNewPrivs` and seccomp state;
 - whether it can load a filter that hands calls to a supervisor (the

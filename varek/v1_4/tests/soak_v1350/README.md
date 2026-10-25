@@ -19,21 +19,26 @@ Step 10 of `docs/security/v1.35-frameworks.md`. One run, D, for 24 hours:
   agent's tool filter, as a compromised agent would. Each must be refused as
   outside the plan, and `get_secret` must never reach the server.
 
-`soak_check.py` judges the run when it ends: the turns, the probes, the
-stream's refusals, the server's log, the audit with `--plan`, the OCSF
-export, and each process's memory. `DIR/report.txt` holds the verdict.
+`soak_check.py` judges the run when it ends: the turns (each done when the
+model's answer came and `word_count`'s note names the turn), the probes
+(each refused by its exact target, once per probe turn, during that turn's
+probes), the stream's refusals (none other but the MCP client's GET and
+DELETE and glibc's nscd, refused in every run), reconnects to the docs
+server (a few at most), the server's log, the audit with `--plan`, the OCSF
+export, and each process's memory (the last quarter's median at most 16 MB,
+or a fifth, above the second quarter's). `DIR/report.txt` holds the verdict.
 
 ## Running it
 
-On a Linux host as root (the droplet), from a checkout of this branch with
-the Warden built, a Python that has the OpenAI Agents SDK and that `nobody`
-can read, then the soak in the background. Each line runs on the host, as
-root:
+On a Linux host as root (the droplet), from the top of a checkout of this
+branch that `nobody` can read, with the Warden built, a Python that has the
+OpenAI Agents SDK and that `nobody` can read, then the soak in the
+background. Each line runs on the host, as root, from the checkout's top:
 
 ```sh
 make -C varek/v1_4 all # end
-python3 -m venv /opt/varek-fw && /opt/varek-fw/bin/python3 -m pip install -r varek/v1_4/adapters/requirements-frameworks.txt && chmod -R a+rX /opt/varek-fw # end
-setsid nohup varek/v1_4/tests/soak_v1350/soak.sh --python /opt/varek-fw/bin/python3 --out /var/tmp/varek-soak-v1350 > /var/tmp/varek-soak-v1350.out 2>&1 < /dev/null & # end
+python3 -m venv /var/tmp/varek-fw && /var/tmp/varek-fw/bin/python3 -m pip install -r varek/v1_4/adapters/requirements-frameworks.txt && chmod -R a+rX /var/tmp/varek-fw # end
+setsid nohup bash varek/v1_4/tests/soak_v1350/soak.sh --python /var/tmp/varek-fw/bin/python3 --out /var/tmp/varek-soak-v1350 > /var/tmp/varek-soak-v1350.out 2>&1 < /dev/null & # end
 ```
 
 Progress: `tail -3 /var/tmp/varek-soak-v1350/d/agent.jsonl` (a turn a

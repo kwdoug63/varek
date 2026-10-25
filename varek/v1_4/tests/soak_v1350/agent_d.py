@@ -14,7 +14,9 @@ when the module is imported, from soak.json beside it:
    "docs": DIR, "notes": DIR, "outside": FILE}
 
 Run (python3 agent_d.py --hours H --interval S), each turn is a JSON line
-on standard output. Every tenth turn three probes, each a call the policy
+on standard output; a turn is done when the model's answer came and
+word_count's note names the turn. A turn that fails reconnects to the docs
+server (reconnected), which the soak's check bounds. Every tenth turn three probes, each a call the policy
 allows and the plan does not name, which a run held to its plan refuses:
 reading FILE (outside), connecting to status_url, and calling the docs
 server's get_secret (past the agent's tool filter, as a compromised agent
@@ -131,6 +133,26 @@ async def probes():
     return out
 
 
+def noted(n):
+    """word_count ran this turn: its note names the turn (step 9, review: the
+    scripted model ends a turn on any tool output, an error's too)"""
+    try:
+        with open(os.path.join(CONF["notes"], "last.txt")) as fh:
+            return fh.read().startswith(f"turn {n}: ")
+    except OSError:
+        return False
+
+
+async def reconnect():
+    """a new session with the docs server, after one is lost (step 9, review:
+    one lost session would fail every later turn of 24 hours)"""
+    try:
+        await docs.cleanup()
+    except BaseException:
+        pass
+    await docs.connect()
+
+
 async def main(a):
     set_tracing_disabled(True)
     await docs.connect()
@@ -142,13 +164,23 @@ async def main(a):
             rec = {"turn": TURN["n"], "t": t0}
             try:
                 r = await Runner.run(agent, f"turn {TURN['n']}")
-                rec["ok"] = r.final_output == f"turn {TURN['n']} done"
+                rec["ok"] = r.final_output == f"turn {TURN['n']} done" and noted(TURN["n"])
                 rec["output"] = str(r.final_output)
             except Exception as e:
                 rec["ok"] = False
                 rec["error"] = f"{type(e).__name__}: {e}"[:300]
+                try:
+                    await reconnect()
+                    rec["reconnected"] = True
+                except Exception as e2:
+                    rec["reconnect_error"] = f"{type(e2).__name__}: {e2}"[:300]
             if TURN["n"] % 10 == 0:
-                rec["probes"] = {k: {"refused": v[0], "detail": v[1]} for k, v in (await probes()).items()}
+                rec["probe_t"] = time.time()
+                try:
+                    rec["probes"] = {k: {"refused": v[0], "detail": v[1]} for k, v in (await probes()).items()}
+                except Exception as e:           # step 9 (review): recorded, not the agent's end
+                    rec["probes"] = {"error": {"refused": False, "detail": f"{type(e).__name__}: {e}"[:300]}}
+                rec["probe_end"] = time.time()
             rec["seconds"] = round(time.time() - t0, 3)
             print(json.dumps(rec), flush=True)
             await asyncio.sleep(max(0.0, a.interval - (time.time() - t0)))

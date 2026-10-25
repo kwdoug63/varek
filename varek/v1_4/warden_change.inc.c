@@ -482,8 +482,17 @@ static void change_handle(int notify_fd, const struct seccomp_notif *req, struct
             const char *erule = NULL;
             decision_t eraw = DEC_UNKNOWN;
             a->open_flags = O_RDONLY;
+            /* v1.35 step 9 (review): held, the answer is the hold's too: a lookup,
+             * asked as a metadata call is (a directory above a step's path) */
+            bool hold_ok = true;
+            if (g_hold_on) {
+                int k = a->kind;
+                a->kind = ACT_FILE_STAT;
+                hold_ok = hold_covers(a);
+                a->kind = k;
+            }
             if (S_ISDIR(es.st_mode) && is_ancestor(a->resolved, sub_policy_subject(a->subject)) &&
-                !ancestor_denied(p, a->resolved, sub_policy_subject(a->subject))) {
+                !ancestor_denied(p, a->resolved, sub_policy_subject(a->subject)) && hold_ok) {
                 erule = "mkdir_exists_ancestor";
                 eraw = DEC_ALLOW;
             } else if (!change_decide(p, a, &eraw)) {

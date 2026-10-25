@@ -1,5 +1,5 @@
-/var/tmp/varek-plan-corpus/policies/openai-agents__mcp__tool_filter_example.policy: glob tokens 0 of 4096
-/var/tmp/varek-plan-corpus/policies/openai-agents__mcp__tool_filter_example.policy: 17 rules, 0 can never fire
+/var/tmp/varek-plan-corpus3/policies/openai-agents__mcp__tool_filter_example.policy: glob tokens 0 of 4096
+/var/tmp/varek-plan-corpus3/policies/openai-agents__mcp__tool_filter_example.policy: 17 rules, 0 can never fire
 
   subagent step "filesystem_server_with_filter" is UNKNOWN: no rule of the policy launches a sub-agent by that name
-/var/tmp/varek-plan-corpus/plans/openai-agents__mcp__tool_filter_example.plan: refused under /var/tmp/varek-plan-corpus/policies/openai-agents__mcp__tool_filter_example.policy (UNKNOWN): `varek run --plan` would not start the agent
+/var/tmp/varek-plan-corpus3/plans/openai-agents__mcp__tool_filter_example.plan: refused under /var/tmp/varek-plan-corpus3/policies/openai-agents__mcp__tool_filter_example.policy (UNKNOWN): `varek run --plan` would not start the agent

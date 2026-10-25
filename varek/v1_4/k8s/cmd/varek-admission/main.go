@@ -196,11 +196,14 @@ type server struct {
 // Warden splits a line on the same white space (review, G-6)
 var requireLine = regexp.MustCompile(`(?m)^[ \t\r\v\f]*require[ \t\r\v\f]+warden[ \t\r\v\f]+(\d+)\.(\d+)`)
 
-func decidesLaunches(text string) bool {
+func decidesLaunches(text string) bool { return requiresWarden(text, 1, 27) }
+
+// requiresWarden: the policy says `require warden X.Y` of at least major.minor
+func requiresWarden(text string, major, minor int) bool {
 	for _, m := range requireLine.FindAllStringSubmatch(text, -1) {
 		a, _ := strconv.Atoi(m[1])
 		b, _ := strconv.Atoi(m[2])
-		if a > 1 || (a == 1 && b >= 27) {
+		if a > major || (a == major && b >= minor) {
 			return true
 		}
 	}
@@ -411,6 +414,14 @@ func (s *server) pod(ctx context.Context, req *request) string {
 	if planned { // v1.35 step 4c (D11)
 		if !kube.Name.MatchString(plan) {
 			return fmt.Sprintf("its plan name %q (%s) is not 1 to 63 of a-z, 0-9 and -", plan, planAnnotation)
+		}
+		// v1.35 step 9 (review): a node whose plugin and Warden are older than
+		// 1.35 never reads the plan and would run the pod under its policy
+		// alone, not held (a rollout's window); a 1.35 grammar line makes such
+		// a node refuse the container instead
+		if !requiresWarden(vp.Spec.Policy, 1, 35) {
+			return fmt.Sprintf("it names a plan (%s), and its policy %s does not say `require warden 1.35`: a node "+
+				"older than 1.35 would run it not held to the plan", planAnnotation, name)
 		}
 		pl, err := s.api.GetPlan(ctx, ns, plan)
 		if err != nil {

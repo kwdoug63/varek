@@ -9,13 +9,15 @@ DIR/d/:
   - the plan: decided SATISFIED at the gate, by the SHA-256 of the plan
     `varek plan generate` wrote, and the run held to it (run_start's hold);
   - the probes, every tenth turn: each refused, as the agent saw it, and
-    in the stream as outside the plan (rule outside_plan), each of the three
-    the same number of times as the probes ran; no other call refused;
+    in the stream as outside the plan (rule outside_plan) by its exact
+    target, during a probe turn's probes, each of the three once per probe
+    turn; no other call refused; reconnects to the docs server few;
   - the docs server: tools/call of search_docs and get_doc about once a turn,
     never get_secret (the probe's call must not reach it);
   - the audit (varek_audit.py --plan) PASS; the OCSF export valid OCSF 1.9.0,
     and the plan gate's event in it;
-  - each process's memory over the run (rss.tsv): a note above 16 MB of growth.
+  - each process's memory over the run (rss.tsv): the last quarter's median
+    at most 16 MB (or a fifth) above the second quarter's.
 
   soak_check.py --dir DIR --v14 DIR [--hours 24] [--interval 60] [--pubkey K.pub]
 """
@@ -25,6 +27,7 @@ import json
 import os
 import subprocess
 import sys
+from urllib.parse import urlsplit
 
 
 def load(path):
@@ -82,6 +85,13 @@ def main():
         problems.append(f"turn {t}: the {k} probe was let through ({d})")
     if not probed:
         problems.append("no probe ran")
+    # step 9 (review): a lost session is reconnected; more than a few means the run did not hold up
+    recon = [r for r in turns if r.get("reconnected") or r.get("reconnect_error")]
+    say(f"  reconnects to the docs server: {len(recon)}")
+    if len(recon) > max(3, len(turns) // 500):
+        problems.append(f"{len(recon)} reconnects to the docs server in {len(turns)} turns")
+    for r in [r for r in turns if r.get("reconnect_error")][:3]:
+        problems.append(f"turn {r.get('turn')}: the reconnect failed: {r['reconnect_error']}")
 
     # the stream: the gate, the hold, every refusal
     recs = load(os.path.join(D, "verdicts.log"))
@@ -109,22 +119,32 @@ def main():
             (r.get("action") == "net.request" and t in ("GET " + conf["mcp_url"], "DELETE " + conf["mcp_url"]))
     known = [r for r in denied if r.get("rule") != "outside_plan" and expected(r)]
     other = [r for r in denied if r.get("rule") != "outside_plan" and not expected(r)]
+    # step 9 (review): each probe's call by its exact target, and within a probe turn's probes (2 s either side)
+    su = urlsplit(conf["status_url"])
+    status_hp = f"{su.hostname}:{su.port or 443}"
+    windows = [(r["probe_t"] - 2, r["probe_end"] + 2) for r in probed if "probe_t" in r and "probe_end" in r]
     by = {"file": 0, "host": 0, "mcp": 0}
     for r in outside:
         t = str(r.get("resolved") or r.get("target") or "")
         if r.get("action") == "net.mcp" and r.get("mcp_name") == "get_secret":
-            by["mcp"] += 1
-        elif t == conf["outside"]:
-            by["file"] += 1
-        elif "status.example.com" in t or r.get("action") in ("net.connect", "net.proxy"):
-            by["host"] += 1
+            k = "mcp"
+        elif r.get("action") == "file.open" and t == conf["outside"]:
+            k = "file"
+        elif r.get("action") in ("net.connect", "net.proxy") and str(r.get("target") or "") == status_hp:
+            k = "host"
         else:
             problems.append(f"seq {r.get('seq')}: refused outside the plan, and not a probe's: {r.get('action')} {t}")
+            continue
+        by[k] += 1
+        ts = r.get("timestamp_ns")
+        if windows and isinstance(ts, int) and not any(a <= ts / 1e9 <= b for a, b in windows):
+            problems.append(f"seq {r.get('seq')}: the {k} probe's refusal, at no probe turn's probes")
     say(f"  refused outside the plan: {len(outside)} (file {by['file']}, host {by['host']}, mcp {by['mcp']}); "
         f"refused as every run is (nscd, the MCP transport's GET and DELETE): {len(known)}; refused otherwise: {len(other)}")
     for k, n in by.items():
-        if n < len(probed):
-            problems.append(f"the {k} probe ran {len(probed)} times, and {n} of its calls are refused outside the plan")
+        if n != len(probed):
+            problems.append(f"the {k} probe ran {len(probed)} times, and {n} of its calls are refused outside the plan "
+                            f"(one each)")
     for r in other[:5]:
         problems.append(f"seq {r.get('seq')}: refused ({r.get('rule')}), a call no probe makes: {r.get('action')} "
                         f"{r.get('resolved') or r.get('target')}")
@@ -177,8 +197,16 @@ def main():
             if xs:
                 say(f"  memory, {name}: {xs[0]} kB at the start, {max(xs)} kB at most, {xs[-1]} kB at the end "
                     f"({len(xs)} samples)")
-                if xs[-1] > xs[0] + 16384:
-                    say(f"    note: {name} grew by {xs[-1] - xs[0]} kB over the run")
+                # step 9 (review): a judgement, not a note: the last quarter's median against the second's
+                # (the first quarter is the run settling), over an hour's samples or more
+                if len(xs) >= 12:
+                    q = len(xs) // 4
+                    early, late = sorted(xs[q:2 * q])[q // 2], sorted(xs[-q:])[q // 2]
+                    grew = late - early
+                    say(f"    the last quarter's median {late} kB, the second's {early} kB")
+                    if grew > max(16384, early // 5):
+                        problems.append(f"{name}'s memory grew by {grew} kB over the run (median of the last "
+                                        f"quarter's samples against the second's)")
     except (OSError, IndexError):
         say("  memory: no rss.tsv")
     say("")

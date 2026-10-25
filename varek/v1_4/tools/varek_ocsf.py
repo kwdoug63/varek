@@ -158,6 +158,7 @@ class Exporter:
         self.agent = None
         self.subagents = {}            # "NAME#n" -> True if an MCP server
         self.plan_steps = []           # v1.35 step 7: plan_step records, folded into their gate's event
+        self.plan_step_n = {}
         self.queue = []                # [event, waiting-for key or None, records left to wait]
         self.n = 0                     # chained records seen
         self.last_ts = 0
@@ -341,16 +342,21 @@ class Exporter:
     def _plan_gate_event(self, rec):
         """v1.35 step 7: the plan gate's verdict, its refused steps folded in"""
         ev = self._life(99, rec, "plan_gate")
-        ok = rec.get("verdict") == "SATISFIED"
+        # step 9 (review): under the flow gate the agent starts only with the breaker's PASS too
+        ok = rec.get("verdict") == "SATISFIED" and (rec.get("gate") != "flow" or rec.get("breaker") == "PASS")
         ev["action_id"], ev["action"] = (1, "Allowed") if ok else (2, "Denied")
         ev["disposition_id"], ev["disposition"] = (1, "Allowed") if ok else (2, "Blocked")
         ev["status_id"], ev["status"] = (1, "Success") if ok else (2, "Failure")
         if not ok:
-            ev["status_detail"] = str(rec.get("error") or "the plan was refused: the agent did not start")
+            ev["status_detail"] = str(rec.get("error") or (
+                f"the breaker refused ({rec.get('breaker')}): the agent did not start"
+                if rec.get("verdict") == "SATISFIED" else
+                f"the plan was refused{' (' + str(rec['why']) + ')' if rec.get('why') else ''}: the agent did not start"))
         ev["severity_id"], ev["severity"] = (1, "Informational") if ok else (3, "Medium")
         ev["policy"] = self._policy_obj(None)
         v = ev["unmapped"]["varek"]
-        v["plan"] = {k: rec.get(k) for k in ("gate", "plan", "plan_sha256", "actions", "edges") if k in rec}
+        v["plan"] = {k: rec.get(k) for k in ("gate", "plan", "plan_sha256", "actions", "edges", "why", "breaker",
+                                             "node_axis", "flow_axis") if k in rec}
         v["decision"] = rec.get("verdict") if rec.get("verdict") in VERDICT.values() else "UNKNOWN"
         steps = [x for x in self.plan_steps if x.get("plan") == rec.get("plan")]
         v["plan_steps"] = [self._plan_step(x) for x in steps]
@@ -403,6 +409,7 @@ class Exporter:
                 out_ev["unmapped"]["varek"]["mode"] = "dry_run"
         elif ev_name == "plan_step":                                       # v1.35 step 7
             self.plan_steps.append(rec)
+            self.plan_step_n[id(rec)] = self.n                 # step 9 (review): its own place, for finish()
         elif ev_name == "plan_gate":
             out_ev = self._plan_gate_event(rec)
         elif ev_name == "exec_result":
@@ -463,10 +470,13 @@ class Exporter:
     def finish(self):
         out = [item[0] for item in self.queue]
         self.queue = []
+        n = self.n
         for rec in self.plan_steps:        # v1.35 step 7: a step whose gate's record never came
+            self.n = self.plan_step_n.get(id(rec), n)    # step 9 (review): each at its place, not the last
             ev = self._life(99, rec, "plan_step")
             ev["unmapped"]["varek"]["plan_steps"] = [self._plan_step(rec)]
             out.append(ev)
+        self.n = n
         self.plan_steps = []
         return out
 
@@ -508,13 +518,18 @@ def run_records(path, allow_incomplete):
     meta = {}
     with open(path, encoding="utf-8", errors="surrogateescape", newline="\n") as fh:
         run, _, complete, _ = cdx._parse_log(fh, allow_incomplete, meta)
-    out = []
+    out, started = [], False
     with open(path, encoding="utf-8", errors="surrogateescape", newline="\n") as fh:
         for raw in fh:
             if not raw.startswith("{"):
                 continue
             rec = json.loads(raw)
-            if isinstance(rec, dict) and (rec.get("run") == run):
+            if not isinstance(rec, dict) or rec.get("run") != run:
+                continue
+            # v1.35 step 9 (review): from run_start on, the records the parser chained (it refuses the
+            # run's records before run_start; this keeps the two to the same records)
+            started = started or rec.get("event") == "run_start"
+            if started:
                 out.append(rec)
     return out, complete
 
@@ -618,6 +633,9 @@ def cmd_follow(args):
                     continue
                 run = rec.get("run")
                 ex = Exporter(args.policy, args.device)
+            if "run" not in rec and rec.get("event") != "run_start":
+                continue                # step 9 (review): as batch mode does (a Warden before 1.35's
+                                        # basic gate wrote its pathology report unprefixed)
             if rec.get("run") != run:
                 fail(lineno, "a record of another run")
             cdx._chain_step(chained, raw, rec, lineno, ndec, fail)   # each record checked as it is chained

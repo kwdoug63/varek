@@ -420,7 +420,22 @@ plan_parsed_t *plan_parser_load(const char *path,
         }
         return NULL;
     }
+    return plan_parser_load_stream(fp, path, err_buf, err_buf_len);
+}
 
+/* v1.35 step 9 (review): the same, from an open stream (closed here); path
+ * names it in messages. The Warden parses the bytes it read and hashed once
+ * (fmemopen), not a second read of the file. */
+plan_parsed_t *plan_parser_load_stream(FILE       *fp,
+                                       const char *path,
+                                       char       *err_buf,
+                                       size_t      err_buf_len)
+{
+    if (!fp) {
+        if (err_buf && err_buf_len) snprintf(err_buf, err_buf_len, "%s: cannot open", path ? path : "?");
+        return NULL;
+    }
+    if (!path) path = "?";
     plan_parsed_t *h = calloc(1, sizeof(*h));
     if (!h) {
         fclose(fp);

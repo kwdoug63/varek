@@ -183,7 +183,13 @@ Model-B techniques below, with the residual limits stated honestly.
   (`--hold-to-plan`): a call the policy allows but no step of the plan covers
   is refused as the agent makes it (`outside_plan`). The hold only narrows
   the policy, never widens it, and the plan is still verified once, not
-  re-verified as the agent revises it. *(Correction, v1.32.0: through v1.31
+  re-verified as the agent revises it. Not held: the agent's own launch,
+  binds, the stub resolver's answers, and a stdio MCP server's calls
+  (which are not decided; its launch is). A launch is held by the file
+  launched by that name, not by what it does (a multi-call binary picks
+  its applet from `argv[0]`). Under the node agent a pod naming a plan is
+  always held to it, the plan bound by its name (each container start
+  takes the `VarekPlan` of that name as it then is). *(Correction, v1.32.0: through v1.31
   this said the plan is re-verified as the agent revises it; nothing does
   that.)*
 - **Cross-action data-flow bounds.** A source labeled secret cannot reach a sink

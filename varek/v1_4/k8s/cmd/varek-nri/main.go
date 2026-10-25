@@ -420,6 +420,9 @@ func (p *plugin) adjust(ctx context.Context, pod *api.PodSandbox, ctr *api.Conta
 	if plan != "" { // v1.35 step 4c: the plan checked, for the node agent to hold the run to
 		adj.AddAnnotation(planAnnotation, plan)
 		adj.AddAnnotation("varek.dev/plan-sha256", psha)
+	} else { // step 9 (review): and none the container came with, for a pod naming no plan
+		adj.RemoveAnnotation(planAnnotation)
+		adj.RemoveAnnotation("varek.dev/plan-sha256")
 	}
 	// the pod's names, for the node agent's record (CRI-O puts the
 	// kubelet's in one JSON string; a runtime's own, where it has them,

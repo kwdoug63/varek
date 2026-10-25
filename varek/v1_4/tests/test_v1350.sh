@@ -83,7 +83,17 @@ check "a launch no rule allows: UNKNOWN, the reason said" \
     grep -q 'is UNKNOWN: no rule of the policy allows it' "$OUT/gate.err"
 plan link.txt "action a process_exec $OUT/true-link"
 gate "$LP" link.txt
-check "a symlink to an allowed program: decided on the file it names" \
+# step 9 (review): as the launch is, on the link's own name (through step 8 on the file it names,
+# so the gate authorized a step the launch would then refuse)
+check "a symlink to an allowed program: decided on its own name, as the launch is (no rule names it)" \
+    grep -q 'is UNKNOWN: no rule of the policy allows it' "$OUT/gate.err"
+LLP="$OUT/link.policy"
+{ cat "$LP"; echo "allow exec $OUT/true-link"; } > "$LLP"
+gate "$LLP" link.txt
+check "... and a policy naming the link allows it" grep -Eq 'plan authorized|no Landlock' "$OUT/gate.err"
+plan dots.txt 'action a process_exec /usr/bin/../bin/true'
+gate "$LP" dots.txt
+check "a path through '..': decided on the directory it resolves to (/usr/bin/true)" \
     grep -Eq 'plan authorized|no Landlock' "$OUT/gate.err"
 plan rel.txt 'action a process_exec usr/bin/true'
 gate "$LP" rel.txt
@@ -404,8 +414,8 @@ check "a project file that is not JSON: no plan, said why" sh -c "[ ! -s '$OUT/g
 # the command
 python3 "$VAREK" plan generate --no-confine -o "$OUT/w.plan" --from agentcore "$OUT/agentcore-weather" > "$OUT/cli.out" 2>&1
 python3 -I "$AD" "$OUT/agentcore-weather" > "$OUT/direct.plan"
-check "varek plan generate --no-confine -o: the plan written, its steps counted" sh -c \
-    "grep -q 'a plan of 24 steps, from' '$OUT/cli.out' && cmp -s '$OUT/w.plan' '$OUT/direct.plan'"
+check "varek plan generate --no-confine -o: the plan written, its steps counted, by kind" sh -c \
+    "grep -Eq 'a plan of 24 steps \\([0-9]+ file_open, [0-9]+ mcp_call, [0-9]+ net_connect\\), from' '$OUT/cli.out' && cmp -s '$OUT/w.plan' '$OUT/direct.plan'"
 python3 "$VAREK" plan generate --no-confine -o "$OUT/w.plan" --from agentcore "$OUT/agentcore-weather" > "$OUT/cli.out" 2>&1
 check "... an existing file not written over without --force" sh -c "[ \$? != 0 ] || grep -q 'exists' '$OUT/cli.out'"
 check "... a framework with no adapter: refused, the adapters named" sh -c \

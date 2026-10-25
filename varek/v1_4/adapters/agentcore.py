@@ -45,7 +45,8 @@ adapter (v1.35 step 6) writes the rest.
 The plan goes to standard output; what the adapter could not read, or did
 not write, to standard error. Exit 0 with a plan, 1 without one, 2 on usage.
 It needs only Python's standard library, and is run by `varek plan
-generate`, under the Warden, with the project read-only and no network.
+generate`, under the Warden, with the project read-only and no network (or,
+as it reads the project as data only, without it: --no-confine).
 """
 
 import argparse
@@ -267,7 +268,10 @@ def generate(a):
                 P.comment("  tool of this gateway")
             P.step("mcp_call", url, "gw", name, "tools", method="tools/call")
         else:
-            for tool in tools:
+            names = vp.tool_names(tools)       # step 9 (review): never a step naming "" (or no tool)
+            if len(names) < len(tools):
+                P.comment(f"  gateway {name}: a tool with no name, or a name that is not text, is left out")
+            for tool in names:
                 P.step("mcp_call", url, "gw", name, tool, method="tools/call", name=tool)
 
     mcp_rt = (res.get("mcp") or {}).get("runtimes") or {}
@@ -283,7 +287,15 @@ def generate(a):
         P.comment(f"MCP server {tool.get('name')} on AgentCore Runtime, bound to this runtime")
         for m in ("initialize", "notifications/initialized", "tools/list"):
             P.step("mcp_call", ep, "mcprt", tool.get("name"), m.split("/")[-1], method=m)
-        P.step("mcp_call", ep, "mcprt", tool.get("name"), tn, method="tools/call", **({"name": tn} if tn else {}))
+        if tn is None:                         # no tool definition: the server lists its tools
+            P.comment(f"  {tool.get('name')}: no toolDefinition name, so the step for its tools names none: it")
+            P.comment("  covers every tool of the server")
+            P.step("mcp_call", ep, "mcprt", tool.get("name"), "tools", method="tools/call")
+        elif vp.tool_names([tn]):
+            P.step("mcp_call", ep, "mcprt", tool.get("name"), tn, method="tools/call", name=tn)
+        else:                                  # step 9 (review): an empty name is not every tool
+            P.comment(f"  {tool.get('name')}: its toolDefinition name {str(tn)[:60]!r} is not a tool name, so no "
+                      f"tools/call step")
 
     creds = [c for c in spec.get("credentials") or [] if isinstance(c, dict)]
     if creds:
