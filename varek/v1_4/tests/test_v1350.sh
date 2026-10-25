@@ -23,6 +23,8 @@
 #      step covers refused (outside_plan) as the agent makes it: a file, a
 #      write under a read-only step, a launch, a connection; what the plan
 #      covers let through; run_start, the audit, varek refusals, varek run
+#   7. `require plan` (step 4b, D7): a run without a held plan refused; the
+#      grammar (1.35, once), both parsers alike, the node agent's refusal
 #
 # Usage: test_v1350.sh <warden> (tools/varek, tools/vdp_cert_check beside it)
 set -u
@@ -277,6 +279,37 @@ printf '[varek]\npolicy = %s\nlog_dir = %s/hlogs\nsign_key =\nanchor =\n' "$HP" 
 mkdir -p "$OUT/hlogs"
 VAREK_CONFIG="$OUT/hold.conf" python3 "$VAREK" run --plan "$OUT/h1.plan" --hold-to-plan -- /usr/bin/cat /etc/passwd > /dev/null 2> "$OUT/vrun.err"
 check "varek run --hold-to-plan: the run held (the outside file refused)" sh -c "grep -h '\"rule\":\"outside_plan\"' '$OUT'/hlogs/*.log | grep -q /etc/passwd"
+
+echo "== 7. require plan (step 4b, D7) =="
+RP="$OUT/rp.policy"
+sed 's/^require warden 1.27$/require warden 1.35/' "$HP" > "$RP"; printf 'require plan\n' >> "$RP"
+"$WARDEN" "$RP" -- /usr/bin/true > /dev/null 2> "$OUT/rp.err"
+[ $? = 1 ] && grep -q 'the policy says `require plan`: a run needs a plan it is held to' "$OUT/rp.err" \
+    && pass "require plan: a run without a plan refused, said why" || flunk "require plan: no plan ($(tail -1 "$OUT/rp.err"))"
+"$WARDEN" "$RP" --plan "$OUT/h1.plan" -- /usr/bin/true > /dev/null 2> "$OUT/rp.err"
+[ $? = 1 ] && grep -q 'refusing to start' "$OUT/rp.err" \
+    && pass "require plan: a plan not held (no --hold-to-plan) refused" || flunk "require plan: --plan alone"
+"$WARDEN" "$RP" --plan "$OUT/h1.plan" --hold-to-plan -- /usr/bin/cat /etc/hostname /etc/passwd > "$OUT/rp.out" 2> "$OUT/rp.err"
+grep -q "$(cat /etc/hostname)" "$OUT/rp.out" && grep -q '"rule":"outside_plan"' "$OUT/rp.err" \
+    && pass "require plan: a held run runs, held" || flunk "require plan: held run"
+"$WARDEN" "$RP" --check-startup > /dev/null 2> "$OUT/rp.err"
+grep -q 'note: the policy says `require plan`' "$OUT/rp.err" \
+    && pass "require plan: --check-startup notes it" || flunk "require plan: --check-startup"
+printf 'require warden 1.34\nrequire plan\n' > "$OUT/rp134.policy"
+"$WARDEN" "$OUT/rp134.policy" --check-startup > /dev/null 2> "$OUT/rp.err"
+[ $? != 0 ] && grep -q '`require plan` needs `require warden 1.35` before it' "$OUT/rp.err" \
+    && pass "require plan under require warden 1.34: refused" || flunk "require plan before 1.35 ($(tail -1 "$OUT/rp.err"))"
+printf 'require warden 1.35\nrequire plan\nrequire plan\n' > "$OUT/rp2.policy"
+"$WARDEN" "$OUT/rp2.policy" --check-startup > /dev/null 2> "$OUT/rp.err"
+[ $? != 0 ] && grep -q '`require plan` given twice' "$OUT/rp.err" \
+    && pass "require plan given twice: refused" || flunk "require plan twice"
+"$HERE/tools/vdp_check" "$RP" identity > "$OUT/id1" 2>&1
+"$CHECKER" "$RP" identity > "$OUT/id2" 2>&1
+grep -qx 'require plan' "$OUT/id1" && cmp -s "$OUT/id1" "$OUT/id2" \
+    && pass "require plan: vdp_check and the checker read it alike (identity)" || flunk "require plan: identity ($(diff "$OUT/id1" "$OUT/id2" | head -3))"
+"$WARDEN" "$RP" --oci-filter > /dev/null 2> "$OUT/rp.err"
+[ $? = 1 ] && grep -q 'the node agent does not carry plans (require plan) yet' "$OUT/rp.err" \
+    && pass "require plan: the node agent refuses it (until step 4c)" || flunk "require plan: --oci-filter"
 
 echo
 if [ "$fail" = 0 ]; then echo "test_v1350: PASS"; else echo "test_v1350: FAIL"; fi

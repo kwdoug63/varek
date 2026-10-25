@@ -527,7 +527,7 @@ test-v1340: warden warden-proxy varek-init tools/vdp_check tools/vdp_cert_check 
 
 # v1.35 step 2: the present mismatches between a plan's decision and the
 # runtime's (docs/security/v1.35-frameworks.md, D9); needs root.
-test-v1350: warden tools/vdp_cert_check
+test-v1350: warden tools/vdp_cert_check tools/vdp_check
 	@./tests/test_v1350.sh ./warden
 
 # v1.31: the strict JSON parser for MCP calls (mcp_json.c), under ASan and

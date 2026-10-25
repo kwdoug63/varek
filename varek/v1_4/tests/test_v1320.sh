@@ -6,7 +6,7 @@
 # What v1.32 adds, checked on any host; the suites run inside the container
 # itself by tests/container_sweep.sh (and CI's .github/workflows/container.yml):
 #   1. the version: the Warden reports 1.32.0, its run_start names it, and the
-#      grammar stays 1.31 (`require warden 1.32` refused, 1.31 loads) (D12);
+#      grammar is the latest a release added (1.35: `require warden 1.36` refused, 1.31 loads) (D12);
 #   2. `varek doctor` in a container (D11), here as one (VAREK_DOCTOR_CONTAINER):
 #      its container section, and the Warden's mounts made in a child;
 #   3. the preflight's share: `varek run` refused before the agent starts when
@@ -37,9 +37,11 @@ VAREK="$HERE/tools/varek"
 
 echo "== 1. the version =="
 check "the Warden reports 1.32.0 or later" sh -c "NO_COLOR=1 VAREK_CONFIG=/nonexistent python3 '$VAREK' version | python3 -c 'import re,sys; m=re.search(r\"VAREK Warden  (\\d+)\\.(\\d+)\\.(\\d+)\", sys.stdin.read()); sys.exit(0 if m and tuple(map(int, m.groups())) >= (1, 32, 0) else 1)'"
-printf 'require warden 1.32\nallow path /usr/ readonly\n' > "$OUT/p132.txt"
+# v1.35: the grammar is 1.35 (require plan); a release with no new policy
+# line keeps it, so the next is refused and an older one loads
+printf 'require warden 1.36\nallow path /usr/ readonly\n' > "$OUT/p136.txt"
 printf 'require warden 1.31\nallow path /usr/ readonly\n' > "$OUT/p131.txt"
-check "the grammar stays 1.31: require warden 1.32 is refused" sh -c "! '$VDP' '$OUT/p132.txt' lint && '$VDP' '$OUT/p132.txt' lint 2>&1 | grep -q 'policy requires Warden 1.32; this is 1.31'"
+check "the grammar is 1.35: require warden 1.36 is refused" sh -c "! '$VDP' '$OUT/p136.txt' lint && '$VDP' '$OUT/p136.txt' lint 2>&1 | grep -q 'policy requires Warden 1.36; this is 1.35'"
 check "... and require warden 1.31 loads" "$VDP" "$OUT/p131.txt" lint
 # v1.32 second review: varek run's container check asks whether the Warden
 # will mount anything (vdp_check mounts), not only whether launches are decided

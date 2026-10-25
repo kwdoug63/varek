@@ -652,6 +652,7 @@ static int node_enter(int type) {
 static const char *node_policy_why(const struct policy *p) {
     if (p->v.ncreds) return "credentials";
     if (p->v.require_obo) return "the on-behalf-of chain (require on-behalf-of)";
+    if (p->v.require_plan) return "plans (require plan)";                /* v1.35 step 4c carries them */
     for (size_t i = 0; i < p->v.n; i++)
         if (p->v.rules[i].subagent[0]) return "sub-agents";
     return NULL;

@@ -5989,6 +5989,18 @@ int main(int argc, char **argv) {
             node_fail(why);
         }
     }
+    /* v1.35 step 4 (D7): a policy that says `require plan` runs an agent only
+     * with a plan it is held to */
+    if (p.v.require_plan && !g_nr.on && (!plan_path || !g_hold_req)) {
+        if (g_check_only) {
+            fprintf(stderr, "[warden] note: the policy says `require plan`: a run needs a plan it is held to "
+                    "(--plan PLAN --hold-to-plan)\n");
+        } else {
+            fprintf(stderr, "[warden] the policy says `require plan`: a run needs a plan it is held to "
+                    "(--plan PLAN --hold-to-plan); refusing to start\n");
+            return 1;
+        }
+    }
     if (wildcards_check(policy_path, &p, psl_arg, shared_arg) < 0) return 1;            /* v1.25 */
     g_inspect_on = p.v.proxy_inspect;                                      /* v1.26.1 */
     if (g_any_name || g_inspect_on) views_setup();
