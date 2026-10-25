@@ -94,7 +94,13 @@ whose program is on the agent's PATH, not the system's.
 - **The soak's harness** (`tests/soak_v1350/`): a 6-minute trial passed
   on the harness as revised in review (36 turns, the 9 probes each refused
   outside the plan, nothing else refused but what every run refuses). The
-  24-hour run: _to be filled in_.
+  first trial on the soak's host (Ubuntu, systemd-resolved) found the
+  Warden refusing glibc's `stat` of `/etc/resolv.conf` on every lookup:
+  there it is a symlink into `/run/systemd/resolve/`, and the stat was
+  decided on that target, which no policy names, while the file's open was
+  answered by the name view. A metadata call on a name view's host target
+  is now decided as the view's own path (a deny rule over it still
+  refuses). The 24-hour run: _to be filled in_.
 
 ## Compatibility
 

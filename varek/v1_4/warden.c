@@ -4354,6 +4354,17 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                 send_simple(notify_fd, req.id, DEC_DENY);
                 continue;
             }
+            /* v1.35 step 10: a name view's file reached by its host target
+             * (/etc/resolv.conf a symlink to /run/systemd/resolve/stub-resolv.conf,
+             * as systemd-resolved makes it) is decided as the view's own path,
+             * as its open is (view_serve): glibc's resolver stats the file
+             * before each lookup to see whether to read it again, and that
+             * stat, refused for a directory the policy never names, was a
+             * refusal on every lookup on such a host. A deny rule over the
+             * view's path still refuses it. */
+            if ((g_any_name || g_inspect_on) && mfd >= 0 && view_by_canonical(act.resolved) >= 0 &&
+                !(act.kind == ACT_FILE_ACCESS && (act.access_mode & (W_OK | X_OK))))
+                snprintf(act.resolved, sizeof act.resolved, "%s", kViewPath[view_by_canonical(act.resolved)]);
             /* A directory the policy's allow rules lead to: a read-type
              * lookup is answered without a decision (see load_ancestors). */
             if (mfd >= 0 &&
