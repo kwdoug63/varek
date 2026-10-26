@@ -39,8 +39,13 @@ global:
   spire:
     trustDomain: $TD
     clusterName: measure
+spiffe-oidc-discovery-provider:
+  enabled: false
 spire-server:
+  persistence:
+    type: emptyDir
   controllerManager:
+    watchClassless: true
     identities:
       clusterSPIFFEIDs:
         default:
@@ -56,12 +61,38 @@ spire-agent:
     unix:
       enabled: true
 EOF
+# The sixth run: the server's claim stayed unbound (a kubeadm cluster has no
+# storage class), so the server never ran and nothing else came up. The
+# server's data goes in an emptyDir above; in case the chart still asks for
+# a claim, a volume on the node with no class binds it.
+"$KUBECTL" create namespace spire-mgmt >> "$LOG" 2>&1 || true
+install -d -m 0700 /var/lib/measure-spire
+"$KUBECTL" apply -f - >> "$LOG" 2>&1 <<EOF
+apiVersion: v1
+kind: PersistentVolume
+metadata: {name: measure-spire-data}
+spec:
+  capacity: {storage: 5Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: ""
+  hostPath: {path: /var/lib/measure-spire, type: Directory}
+EOF
 helm repo add spiffe https://spiffe.github.io/helm-charts-hardened/ >> "$LOG" 2>&1
 helm repo update >> "$LOG" 2>&1
 helm upgrade --install spire-crds spiffe/spire-crds -n spire-mgmt --create-namespace --wait >> "$LOG" 2>&1 ||
     { measure setup "spire-crds did not install"; exit 1; }
 helm upgrade --install spire spiffe/spire -n spire-mgmt -f "$OUT/spire-values.yaml" --wait --timeout 10m >> "$LOG" 2>&1 ||
-    { measure setup "spire did not install ($(tail -1 "$LOG"))"; "$KUBECTL" get pods -A >> "$LOG" 2>&1; exit 1; }
+    { measure setup "spire did not install ($(tail -1 "$LOG"))"
+      # into the job's log itself: its artifacts are not always reachable
+      "$KUBECTL" get pods -A -o wide 2>&1
+      "$KUBECTL" get events -A --sort-by=.lastTimestamp 2>&1 | tail -40
+      for p in $("$KUBECTL" get pods -n spire-mgmt -o name 2>/dev/null); do
+          "$KUBECTL" get -n spire-mgmt "$p" -o jsonpath='{.status.phase}' | grep -qx Running && continue
+          "$KUBECTL" describe -n spire-mgmt "$p" 2>&1 | tail -25
+          "$KUBECTL" logs -n spire-mgmt "$p" --all-containers --tail=20 2>&1
+      done
+      exit 1; }
 measure chart "$(helm list -n spire-mgmt -o json | python3 -c 'import json,sys; print(", ".join(r["chart"] + " (app " + r["app_version"] + ")" for r in json.load(sys.stdin)))')"
 
 server="$("$KUBECTL" get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' | grep -m1 '/spire-server-')"
@@ -75,6 +106,7 @@ apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterSPIFFEID
 metadata: {name: varek-m3}
 spec:
+  className: spire-mgmt-spire
   spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}/m3"
   podSelector: {matchLabels: {varek-m3: registered}}
 ---
@@ -82,6 +114,7 @@ apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterStaticEntry
 metadata: {name: varek-delegate}
 spec:
+  className: spire-mgmt-spire
   spiffeID: $DELEGATE
   parentID: ${agent_id:-spiffe://$TD/unknown}
   selectors: ["unix:uid:0"]
@@ -100,9 +133,22 @@ spec:
 EOF
 "$KUBECTL" apply -f "$OUT/m3.yaml" >> "$LOG" 2>&1 || measure entries "not applied ($(tail -1 "$LOG"))"
 "$KUBECTL" wait --for=condition=Ready pod/m3-registered pod/m3-unregistered --timeout=300s >> "$LOG" 2>&1
-sleep 20                                 # the controller manager writes the entries
-measure entries "$(srv entry show 2>> "$LOG" | grep -c 'Entry ID') on the server"
+# The controller manager writes the entries. Run 7 found none after 20 s:
+# the chart's controller manager reconciles only resources of its own class
+# (spire-mgmt-spire), and these had none. If there are still none, what it
+# said, into the job's log
+n=0
+for _ in $(seq 1 18); do
+    n="$(srv entry show 2>> "$LOG" | grep -c 'Entry ID')"
+    [ "$n" -ge 2 ] && break
+    sleep 5
+done
+measure entries "$n on the server"
 srv entry show >> "$LOG" 2>&1
+if [ "$n" -lt 2 ]; then
+    "$KUBECTL" get clusterspiffeids,clusterstaticentries -o yaml 2>&1 | tail -60
+    "$KUBECTL" -n "${server%%/*}" logs "${server##*/}" -c spire-controller-manager --tail=40 2>&1
+fi
 
 # --- the agent's admin socket, as the node sees it
 apid="$(pgrep -f 'spire-agent run' | head -1)"

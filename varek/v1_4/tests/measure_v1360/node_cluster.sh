@@ -51,7 +51,44 @@ measure() {
     return 0
 }
 run() { echo "+ $*" >> "$LOG"; "$@" >> "$LOG" 2>&1; }
-fail() { measure "cluster.failed_at" "$1"; tail -30 "$LOG"; exit 1; }
+# On a failure, what the runtime and the kubelet said, and the containers
+# the runtime made (the first run's crun cells failed with neither kept)
+# The log's own tail is printed first: the fourth run's install failures
+# were hidden under the journal, which fail() appended before printing.
+fail() {
+    measure "cluster.failed_at" "$1"
+    echo "--- the log's last 40 lines"; tail -40 "$LOG"
+    echo "--- apt's errors"; grep -E '^(E|W): ' "$LOG" | tail -20
+    { echo "--- crictl ps -a"; crictl ps -a 2>&1
+      echo "--- journal"; journalctl -u crio -u containerd -u kubelet --no-pager 2>&1 | tail -200; } >> "$LOG"
+    tail -60 "$LOG"; exit 1
+}
+# Kubernetes at the cell's minor, then crictl. The third run's CRI-O 1.35
+# cell got kubeadm 1.37.1 unpinned; the fourth run's single install with
+# cri-tools failed in every cell. crictl comes from apt if a repository has
+# it, else from the cri-tools project's release for that minor (or its newest).
+# The runner's image has a newer kubectl from apt, so pinning below it is a
+# downgrade, which apt refuses under -y unless allowed (the fifth run).
+k8s_install() {
+    run apt-cache policy kubeadm kubelet kubectl cri-tools "$@"
+    run apt-get install -y --allow-downgrades "$@" "kubelet=$K8S.*" "kubeadm=$K8S.*" "kubectl=$K8S.*" ||
+        fail "installing ${*:+$* and }Kubernetes $K8S"
+    command -v crictl > /dev/null && return 0
+    run apt-get install -y cri-tools && command -v crictl > /dev/null && return 0
+    measure "crictl.note" "no cri-tools package; the cri-tools release"
+    local v
+    v="$(curl -fsSL "https://api.github.com/repos/kubernetes-sigs/cri-tools/releases?per_page=100" |
+        python3 -c "import json,sys,re
+a=[r['tag_name'][1:] for r in json.load(sys.stdin) if re.fullmatch(r'v\d+\.\d+\.\d+', r['tag_name'])]
+v=[t for t in a if t.startswith('$K8S.')] or a
+v.sort(key=lambda s: [int(x) for x in s.split('.')]); print(v[-1] if v else '')")"
+    [ -n "$v" ] || fail "no cri-tools release found"
+    curl -fsSL -o "$OUT/crictl.tgz" "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$v/crictl-v$v-linux-amd64.tar.gz" || fail "downloading crictl $v"
+    curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$v/crictl-v$v-linux-amd64.tar.gz.sha256" |
+        awk '{print $1}' > "$OUT/crictl.sha" || fail "crictl's checksum"
+    [ "$(sha256sum "$OUT/crictl.tgz" | awk '{print $1}')" = "$(cat "$OUT/crictl.sha")" ] || fail "crictl's checksum does not match"
+    run tar -C /usr/local/bin -xzf "$OUT/crictl.tgz" crictl || fail "unpacking crictl"
+}
 START=$(date +%s)
 CELL="$RUNTIME-$VERSION-$OCI"
 measure "cell" "$CELL, Kubernetes $K8S, $(uname -sr), cgroup $(stat -fc %T /sys/fs/cgroup)"
@@ -73,11 +110,18 @@ if [ "$RUNTIME" = crio ]; then
     key "$CRIO_REPO" /etc/apt/keyrings/cri-o.gpg || fail "the CRI-O package key ($CRIO_REPO)"
     echo "deb [signed-by=/etc/apt/keyrings/cri-o.gpg] $CRIO_REPO /" > /etc/apt/sources.list.d/cri-o.list
     run apt-get update || fail "apt-get update"
-    run apt-get install -y cri-o kubelet kubeadm kubectl || fail "installing cri-o and kubeadm"
-    # CRI-O's packages bring crun (and runc in newer ones); the OS's if not.
-    # To be confirmed on the first run: where each package puts them.
-    ociPath="$(command -v "$OCI" || ls "/usr/libexec/crio/$OCI" 2>/dev/null || true)"
-    if [ -z "$ociPath" ]; then run apt-get install -y "$OCI"; ociPath="$(command -v "$OCI" || true)"; fi
+    # Kubernetes pinned to the cell's minor: the first fixed run's CRI-O 1.35
+    # cell got kubeadm 1.37.1 from an unpinned install
+    k8s_install cri-o
+    # CRI-O's own build of the runtime first: the runner's image has an older
+    # crun (1.14.1, podman's) on the PATH, under which the first run's
+    # control plane never started. The OS's only if CRI-O brings none.
+    ociPath="$(ls "/usr/libexec/crio/$OCI" 2>/dev/null || true)"
+    if [ -z "$ociPath" ]; then
+        measure "runtime.note" "CRI-O's packages bring no $OCI; the OS's"
+        ociPath="$(command -v "$OCI" || true)"
+        if [ -z "$ociPath" ]; then run apt-get install -y "$OCI"; ociPath="$(command -v "$OCI" || true)"; fi
+    fi
     [ -n "$ociPath" ] || fail "no $OCI binary"
     install -d /etc/crio/crio.conf.d
     cat > /etc/crio/crio.conf.d/90-measure.conf <<EOF
@@ -90,10 +134,10 @@ runtime_path = "$ociPath"
 EOF
     run systemctl enable --now crio || fail "starting crio"
     SOCK=unix:///var/run/crio/crio.sock
-    measure "runtime" "$(crio --version 2>/dev/null | awk '/^Version/ {print $2}'), $OCI $("$ociPath" --version 2>/dev/null | head -1)"
+    measure "runtime" "CRI-O $(crio --version 2>/dev/null | grep -Eom1 '[0-9]+\.[0-9]+\.[0-9]+'), $OCI $("$ociPath" --version 2>/dev/null | head -1) ($ociPath)"
 else
     run apt-get update || fail "apt-get update"
-    run apt-get install -y kubelet kubeadm kubectl || fail "installing kubeadm"
+    k8s_install
     # The newest release of that minor, from the project's releases
     full="$(curl -fsSL "https://api.github.com/repos/containerd/containerd/releases?per_page=100" |
         python3 -c "import json,sys,re
@@ -141,8 +185,10 @@ apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
 cgroupDriver: systemd
 EOF
-run kubeadm init --config "$OUT/kubeadm.yaml" || fail "kubeadm init"
-measure "kubeadm" "$(kubeadm version -o short)"
+# apt's kubeadm by its path: the runner's image may have another on the PATH
+KUBEADM=/usr/bin/kubeadm
+run "$KUBEADM" init --config "$OUT/kubeadm.yaml" || fail "kubeadm init"
+measure "kubeadm" "$("$KUBEADM" version -o short) (on the PATH: $(command -v kubeadm))"
 run "$KUBECTL" taint nodes --all node-role.kubernetes.io/control-plane- || true
 run "$KUBECTL" apply -f "$FLANNEL" || fail "flannel"
 if run "$KUBECTL" wait --for=condition=Ready node --all --timeout=300s; then
@@ -152,7 +198,10 @@ else
 fi
 measure "node_runtime" "$("$KUBECTL" get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}')"
 
-# --- a plain pod
+# --- a plain pod, once the namespace's default service account exists: the
+# controller manager makes it after the node is Ready (the first run started
+# the pod before it, and was refused)
+for _ in $(seq 60); do "$KUBECTL" get serviceaccount default > /dev/null 2>&1 && break; sleep 2; done
 t0=$(date +%s)
 run "$KUBECTL" run m4-plain --image="$POD_IMAGE" --restart=Never -- sleep 3600
 if run "$KUBECTL" wait --for=condition=Ready pod/m4-plain --timeout=300s; then

@@ -86,4 +86,49 @@ measure hidden_from_container "$([ "$seen" = 0 ] && echo "yes (not in its mounts
 for _ in $(seq 60); do [ -e "$V" ] || break; sleep 1; done
 measure removed_with_pod "$([ -e "$V" ] && echo "no, $V remains" || echo yes)"
 "$KUBECTL" delete secret obo-token >> "$LOG" 2>&1
+
+# 5. M2b: the same Secret mounted by an init container that ends before the
+# pod's container starts (the first run found the kubelet does not mount a
+# volume no container names). Is it on the node while the pod runs, and
+# still out of the pod's container's sight?
+value="m2b-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+"$KUBECTL" create secret generic obo-token --from-literal=token="$value" >> "$LOG" 2>&1
+cat > "$OUT/m2b-pod.yaml" <<EOF2
+apiVersion: v1
+kind: Pod
+metadata: {name: m2b}
+spec:
+  terminationGracePeriodSeconds: 5
+  initContainers:
+  - name: i
+    image: $IMG
+    command: ["true"]
+    volumeMounts: [{name: obo-token, mountPath: /obo, readOnly: true}]
+  containers:
+  - name: c
+    image: $IMG
+    command: [sleep, "16180340"]
+  volumes:
+  - name: obo-token
+    secret: {secretName: obo-token}
+EOF2
+"$KUBECTL" apply -f "$OUT/m2b-pod.yaml" >> "$LOG" 2>&1
+if "$KUBECTL" wait --for=condition=Ready pod/m2b --timeout=300s >> "$LOG" 2>&1; then
+    uid="$("$KUBECTL" get pod m2b -o jsonpath='{.metadata.uid}')"
+    V="/var/lib/kubelet/pods/$uid/volumes/kubernetes.io~secret/obo-token"
+    if [ -f "$V/token" ]; then
+        measure init_volume_on_node "yes, while the pod's container runs ($(findmnt -no FSTYPE "$V" 2> /dev/null || echo "not a mount point"))"
+        measure init_token_matches "$([ "$(cat "$V/token")" = "$value" ] && echo yes || echo no)"
+    else
+        measure init_volume_on_node "no ($(ls "/var/lib/kubelet/pods/$uid/volumes/" 2>&1 | tr '\n' ' '))"
+    fi
+    seen="$("$KUBECTL" exec m2b -c c -- grep -c obo-token /proc/self/mountinfo 2>> "$LOG")"
+    measure init_hidden_from_container "$([ "$seen" = 0 ] && echo "yes (not in its mounts)" || echo "no: ${seen:-the exec failed} of its mounts name it")"
+    "$KUBECTL" delete pod m2b --grace-period=5 --wait=true --timeout=120s >> "$LOG" 2>&1
+    for _ in $(seq 60); do [ -e "$V" ] || break; sleep 1; done
+    measure init_removed_with_pod "$([ -e "$V" ] && echo "no, $V remains" || echo yes)"
+else
+    "$KUBECTL" describe pod m2b 2>&1 | tail -25; measure init_pod "did not start"
+fi
+"$KUBECTL" delete secret obo-token >> "$LOG" 2>&1
 exit 0

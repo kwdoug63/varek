@@ -89,7 +89,11 @@ EOF
 
 # 1. The container's group
 pid="$(cpid m1)"
+# Every check below acts on this process's group: without it they would act
+# on the node's root group (the first run, crictl missing, did)
+case "$pid" in ''|*[!0-9]*|0) measure setup "the container's process was not found (crictl: $(command -v crictl || echo missing))"; exit 1 ;; esac
 cg="$(cg_of "$pid")"
+[ -n "$cg" ] && [ "$cg" != / ] || { measure setup "the container's group was not found (pid $pid)"; exit 1; }
 G="/sys/fs/cgroup$cg"
 measure container_cgroup "$cg"
 measure systemd_scope "$([[ "$cg" == *.scope ]] && echo yes || echo no)"
@@ -121,8 +125,7 @@ systemctl daemon-reload
 sleep 3
 measure after_daemon_reload "$([ -d "$S" ] && [ "$(cg_of "$pid")" = "$cg/varek-sub-1" ] && echo "kept" || echo "changed: $(cg_of "$pid"), sub exists: $([ -d "$S" ] && echo yes || echo no)")"
 
-# 6. The pod's limits over a process moved below: the kubelet's figure, and
-# the memory limit enforced
+# 6. The pod's limits over a process moved below: the kubelet's figure
 node="$("$KUBECTL" get node -o jsonpath='{.items[0].metadata.name}')"
 ws() {
     "$KUBECTL" get --raw "/api/v1/nodes/$node/proxy/stats/summary" | python3 -c '
@@ -132,6 +135,7 @@ for p in json.load(sys.stdin).get("pods", []):
         print(sum(c.get("memory", {}).get("workingSetBytes", 0) for c in p.get("containers", [])))'
 }
 before="$(ws)"
+for _ in 1 2 3 4 5 6; do [ -n "$before" ] && break; sleep 5; before="$(ws)"; done
 "$KUBECTL" exec m1 -- sh -c 'sleep 3; x=$(head -c 60000000 /dev/zero | tr "\0" a); sleep 90' >> "$LOG" 2>&1 &
 sleep 1
 hold="$(in_ctr 'sleep 3; x=')"
@@ -139,25 +143,41 @@ if [ -n "$hold" ]; then
     echo "$hold" > "$S/cgroup.procs" 2>> "$LOG"
     sleep 40
     measure kubelet_counts_below "working set before $before, with 60 MB held below $(ws) (the kubelet's summary)"
-    measure memory_current "container group $(cat "$G/memory.current"), varek-sub-1 $(cat "$S/memory.current")"
+    measure memory_current "container group $(cat "$G/memory.current"), varek-sub-1 $(cat "$S/memory.current" 2>/dev/null || echo "none (memory is not enabled below)")"
 else
     measure kubelet_counts_below "not measured (no exec)"
 fi
-ooms0="$(awk '/^oom_kill / {print $2}' "$G/memory.events")"
-"$KUBECTL" exec m1 -- sh -c 'sleep 3; head -c 300000000 /dev/zero | tail > /dev/null' >> "$LOG" 2>&1 &
-sleep 1
-big="$(in_ctr 'sleep 3; head -c 300000000')"
-if [ -n "$big" ]; then
-    echo "$big" > "$S/cgroup.procs" 2>> "$LOG"
-    sleep 20
-    measure limit_enforced_below "oom_kill $ooms0 -> $(awk '/^oom_kill / {print $2}' "$G/memory.events") (limit $(cat "$G/memory.max"))"
-else
-    measure limit_enforced_below "not measured (no exec)"
-fi
-
 # 5. The pod deleted: every process below ended, the scope and its groups gone
 "$KUBECTL" delete pod m1 --grace-period=5 --wait=true --timeout=120s >> "$LOG" 2>&1
 sleep 5
 measure process_ended "$(kill -0 "$pid" 2> /dev/null && echo "no, $pid still runs" || echo yes)"
 measure groups_removed "$([ -d "$G" ] && echo "no: $(find "$G" -type d | wc -l) groups left" || echo yes)"
+
+# 6b. The memory limit over a process moved below, in a pod of its own. The
+# sixth run did this in m1: the container's group was gone after it (the
+# kubelet sets memory.oom.group, so the kill takes the whole container and
+# it restarts in a new group), and that left step 5 measuring the old one.
+sed 's/name: m1}/name: m1lim}/' "$OUT/m1-pod.yaml" > "$OUT/m1lim-pod.yaml"
+"$KUBECTL" apply -f "$OUT/m1lim-pod.yaml" >> "$LOG" 2>&1
+if "$KUBECTL" wait --for=condition=Ready pod/m1lim --timeout=300s >> "$LOG" 2>&1; then
+    lpid="$(cpid m1lim)"; cg="$(cg_of "$lpid")"; LG="/sys/fs/cgroup$cg"; LS="$LG/varek-sub-1"
+    mkdir "$LS" 2>> "$LOG"
+    echo "$lpid" > "$LS/cgroup.procs" 2>> "$LOG"
+    measure limit_settings "memory.max $(cat "$LG/memory.max"), memory.oom.group $(cat "$LG/memory.oom.group" 2>/dev/null || echo none)"
+    "$KUBECTL" exec m1lim -- sh -c 'sleep 3; head -c 300000000 /dev/zero | tail > /dev/null' >> "$LOG" 2>&1 &
+    sleep 1
+    big="$(in_ctr 'sleep 3; head -c 300000000')"
+    if [ -n "$big" ]; then
+        echo "$big" > "$LS/cgroup.procs" 2>> "$LOG"
+        moved="$([ "$(cg_of "$big")" = "$cg/varek-sub-1" ] && echo yes || echo "no, $(cg_of "$big")")"
+        sleep 20
+        st="$("$KUBECTL" get pod m1lim -o jsonpath='{.status.containerStatuses[0].restartCount} {.status.containerStatuses[0].lastState.terminated.reason}')"
+        measure limit_enforced_below "moved below: $moved; after: restarts and reason '$st', the first process $(kill -0 "$lpid" 2> /dev/null && echo "still runs" || echo ended), the old group $([ -d "$LG" ] && echo "still there" || echo gone)"
+    else
+        measure limit_enforced_below "not measured (no exec)"
+    fi
+    "$KUBECTL" delete pod m1lim --grace-period=5 --wait=true --timeout=120s >> "$LOG" 2>&1
+else
+    measure limit_enforced_below "not measured (m1lim did not start)"
+fi
 exit 0
