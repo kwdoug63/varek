@@ -33,27 +33,42 @@
 #
 #   varek/v1_4/tests/v1340_kind.sh --image IMAGE [--out DIR] [--keep]
 #                                  [--node-image kindest/node:TAG]
+#   varek/v1_4/tests/v1340_kind.sh --host --image IMAGE --archive FILE [--out DIR]
 #
 # IMAGE is the node image (packaging/container/Containerfile --target node),
 # built where this runs. Needs docker, kind, kubectl, helm, python3 and this
 # checkout's tools/varek_keygen and tools/vdp_cert_check (make all). The
 # summary is DIR/summary.txt (default /var/tmp/varek-kind); everything else
 # is beside it. CI: .github/workflows/kubernetes.yml.
+#
+# --host (v1.36 step 2, the matrix): the same checks on a one-node cluster
+# already running on this host (tests/node_cluster.sh, kubeadm under CRI-O
+# or containerd), its kubeconfig in KUBECONFIG or ~/.kube/config. IMAGE is
+# loaded into the node's runtime from FILE (`docker save IMAGE`, made before
+# the cluster: node_cluster.sh stops the runner's Docker), fully named
+# (docker.io/library/... when it has no registry), and the node's files are
+# read with sudo. Needs no kind or docker; skopeo or podman for CRI-O, ctr
+# for containerd. CI: .github/workflows/matrix.yml.
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-OUT=/var/tmp/varek-kind KEEP=0 IMAGE="" NODE_IMG=kindest/node:v1.37.0
+OUT=/var/tmp/varek-kind KEEP=0 IMAGE="" NODE_IMG=kindest/node:v1.37.0 HOST=0 ARCHIVE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --image) IMAGE="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         --keep) KEEP=1; shift ;;
         --node-image) NODE_IMG="$2"; shift 2 ;;
+        --host) HOST=1; shift ;;
+        --archive) ARCHIVE="$2"; shift 2 ;;
         *) echo "v1340_kind.sh: unknown option $1" >&2; exit 2 ;;
     esac
 done
-[ -n "$IMAGE" ] || { echo "usage: v1340_kind.sh --image IMAGE [--out DIR] [--keep] [--node-image IMG]" >&2; exit 2; }
-for t in docker kind kubectl helm python3; do
+[ -n "$IMAGE" ] || { echo "usage: v1340_kind.sh [--host] --image IMAGE [--out DIR] [--keep] [--node-image IMG]" >&2; exit 2; }
+TOOLS="docker kind kubectl helm python3"
+[ "$HOST" = 1 ] && TOOLS="kubectl helm python3 sudo crictl"
+[ "$HOST" = 0 ] || [ -s "$ARCHIVE" ] || { echo "v1340_kind.sh: --host needs --archive FILE (docker save IMAGE)" >&2; exit 2; }
+for t in $TOOLS; do
     command -v "$t" > /dev/null || { echo "v1340_kind.sh: $t is needed" >&2; exit 2; }
 done
 [ -x "$HERE/tools/varek_keygen" ] && [ -x "$HERE/tools/vdp_cert_check" ] ||
@@ -66,7 +81,9 @@ say() { echo "$*" | tee -a "$SUM"; }
 pass() { say "  PASS   $1"; }
 flunk() { say "  FAIL   $1"; fail=1; }
 check() { local d="$1"; shift; if "$@" > /dev/null 2>&1; then pass "$d"; else flunk "$d"; fi; }
-on_node() { docker exec "$N" "$@"; }
+# A command on the node: in kind's node container, or on this host as root
+if [ "$HOST" = 1 ]; then NODE_EXEC="sudo"; else NODE_EXEC="docker exec $N"; fi
+on_node() { $NODE_EXEC "$@"; }
 node_logs() {   # SUFFIX: the node agent's and the plugin's logs, as OUT/{node-agent,plugin}SUFFIX.log
     kubectl -n "$NS" logs ds/varek-node -c node-agent > "$OUT/node-agent$1.log" 2>&1
     kubectl -n "$NS" logs ds/varek-node -c plugin > "$OUT/plugin$1.log" 2>&1
@@ -79,30 +96,89 @@ cleanup() {
         for l in "$OUT"/node-agent*.log "$OUT"/plugin*.log; do
             [ -s "$l" ] && { echo "== ${l##*/}, its end"; tail -40 "$l"; }
         done
+        # the first supervised pod, its streams and what the node saw (the
+        # matrix's first CRI-O cells: every supervised pod killed at its start)
+        for l in "$OUT/pod-a.log" "$OUT/pod-a.describe"; do
+            [ -s "$l" ] && { echo "== ${l##*/}, its end"; tail -30 "$l"; }
+        done
+        rm -rf "$OUT/streams-end"; mkdir -p "$OUT/streams-end"
+        if [ "$HOST" = 1 ]; then
+            sudo sh -c 'cp -a /var/log/varek/. "$1"/' sh "$OUT/streams-end" 2>/dev/null
+            sudo chown -R "$(id -u):$(id -g)" "$OUT/streams-end" 2>/dev/null
+        else
+            docker cp "$N:/var/log/varek/." "$OUT/streams-end" > /dev/null 2>&1
+        fi
+        for l in "$OUT"/streams-end/*.jsonl; do
+            [ -s "$l" ] && { echo "== stream ${l##*/}, its end"; tail -12 "$l" | cut -c1-400; }
+        done
+        echo "== the node's kernel: seccomp and kills"
+        on_node dmesg 2>/dev/null | grep -iE 'seccomp|type=1326|killed|segfault' | tail -20
+        if [ "$HOST" = 1 ]; then
+            echo "== the runtime's journal: errors and warnings"
+            sudo journalctl -u crio -u containerd --since "-15 min" --no-pager 2>/dev/null |
+                grep -iE 'level=(error|warn)|seccomp|notif|nri' | tail -40 | cut -c1-400
+        fi
     fi
-    [ "$KEEP" = 1 ] || kind delete cluster --name "$CL" > /dev/null 2>&1
+    [ "$KEEP" = 1 ] || [ "$HOST" = 1 ] || kind delete cluster --name "$CL" > /dev/null 2>&1
 }
 trap cleanup EXIT
-say "v1340_kind.sh $(TZ=America/Chicago date '+%Y-%m-%d %H:%M %Z'); $(uname -sr); kind $(kind version | cut -d' ' -f2); $NODE_IMG; image $IMAGE; commit $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
-
 echo "== 1. the cluster and the chart"
-kind delete cluster --name "$CL" > /dev/null 2>&1
-kind create cluster --name "$CL" --image "$NODE_IMG" --wait 300s > "$OUT/kind.log" 2>&1 ||
-    { tail -20 "$OUT/kind.log"; echo "v1340_kind.sh: the cluster did not start" >&2; exit 1; }
-say "  node: $(on_node sh -c 'containerd --version | cut -d" " -f3; runc --version | head -1' | tr '\n' ' ')$(on_node uname -r)"
-kind load docker-image "$IMAGE" --name "$CL" > "$OUT/load.log" 2>&1 || { cat "$OUT/load.log"; exit 1; }
+if [ "$HOST" = 1 ]; then
+    say "v1340_kind.sh --host $(TZ=America/Chicago date '+%Y-%m-%d %H:%M %Z'); $(uname -srm); image $IMAGE; commit $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
+    # the API server can still be settling just after the cluster's own checks
+    for _ in $(seq 15); do kubectl get node > "$OUT/kubectl.log" 2>&1 && break; sleep 2; done
+    kubectl get node > "$OUT/kubectl.log" 2>&1 || { cat "$OUT/kubectl.log"; ls -l "${KUBECONFIG:-$HOME/.kube/config}";
+        echo "v1340_kind.sh: no cluster here (KUBECONFIG=${KUBECONFIG:-unset})" >&2; exit 1; }
+    RT="$(kubectl get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}')"
+    say "  node: $RT, kubelet $(kubectl get node -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}'), $(uname -r)"
+    # The image, fully named: CRI-O does not resolve a short name in its own
+    # storage unless it is told a registry to search
+    first="${IMAGE%%/*}"
+    case "$IMAGE" in
+        */*) case "$first" in *.*|*:*|localhost) QUAL="$IMAGE" ;; *) QUAL="docker.io/$IMAGE" ;; esac ;;
+        *) QUAL="docker.io/library/$IMAGE" ;;
+    esac
+    # (the log is this user's file: only the command runs as root)
+    # shellcheck disable=SC2024
+    case "$RT" in
+        cri-o://*)
+            if command -v skopeo > /dev/null; then
+                sudo skopeo copy "docker-archive:$ARCHIVE" "containers-storage:$QUAL" > "$OUT/load.log" 2>&1
+            else
+                sudo podman load -i "$ARCHIVE" > "$OUT/load.log" 2>&1 && sudo podman tag "$IMAGE" "$QUAL" >> "$OUT/load.log" 2>&1
+            fi ;;
+        containerd://*)
+            sudo ctr -n k8s.io images import "$ARCHIVE" > "$OUT/load.log" 2>&1 ;;
+        *) echo "v1340_kind.sh: the runtime $RT" >&2; exit 1 ;;
+    esac || { cat "$OUT/load.log"; echo "v1340_kind.sh: the image did not load into $RT" >&2; exit 1; }
+    sudo crictl inspecti "$QUAL" > /dev/null 2>&1 || { cat "$OUT/load.log"; echo "v1340_kind.sh: $QUAL is not in the node's runtime" >&2; exit 1; }
+    IMAGE="$QUAL"
+else
+    say "v1340_kind.sh $(TZ=America/Chicago date '+%Y-%m-%d %H:%M %Z'); $(uname -sr); kind $(kind version | cut -d' ' -f2); $NODE_IMG; image $IMAGE; commit $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
+    kind delete cluster --name "$CL" > /dev/null 2>&1
+    kind create cluster --name "$CL" --image "$NODE_IMG" --wait 300s > "$OUT/kind.log" 2>&1 ||
+        { tail -20 "$OUT/kind.log"; echo "v1340_kind.sh: the cluster did not start" >&2; exit 1; }
+    say "  node: $(on_node sh -c 'containerd --version | cut -d" " -f3; runc --version | head -1' | tr '\n' ' ')$(on_node uname -r)"
+    kind load docker-image "$IMAGE" --name "$CL" > "$OUT/load.log" 2>&1 || { cat "$OUT/load.log"; exit 1; }
+fi
 "$HERE/tools/varek_keygen" "$OUT/node.key" > /dev/null
 kubectl create namespace "$NS" > /dev/null
 kubectl label namespace "$NS" pod-security.kubernetes.io/enforce=privileged > /dev/null
 kubectl -n "$NS" create secret generic varek-node-key --from-file=key="$OUT/node.key" \
     --from-file=key.pub="$OUT/node.key.pub" > /dev/null
+# the chart's runtime (its default containerd): the node agent reads each
+# container's bundle from the runtime's state, mounted from the node (the
+# matrix's first CRI-O cells installed the default, mounted /run/containerd,
+# and every supervised container was refused: no config.json in its bundle)
+CHART_RT=containerd
+[ "$HOST" = 1 ] && case "$RT" in cri-o://*) CHART_RT=cri-o ;; esac
 REPO="${IMAGE%:*}" TAG="${IMAGE##*:}"
 [ "$REPO" = "$IMAGE" ] && TAG=latest
 check "the chart installs, its pods ready (the node agent, the plugin, the exporter, the webhook)" \
     helm install varek "$ROOT/packaging/helm/varek" -n "$NS" --wait --timeout 6m \
     --set image.repository="$REPO" --set image.tag="$TAG" --set image.pullPolicy=Never \
     --set signing.secretName=varek-node-key --set signing.checkpointEvery=8 --set anchor.enabled=true \
-    --set admission.replicas=1
+    --set admission.replicas=1 --set runtime="$CHART_RT"
 for _ in $(seq 60); do grep -q '^varek-nri: runtime' <(kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null) && break; sleep 2; done
 say "  plugin: $(kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null | grep -m1 '^varek-nri: runtime' || echo 'NOT registered')"
 check "the plugin registered with the node's runtime (NRI)" sh -c "kubectl -n '$NS' logs ds/varek-node -c plugin | grep -q '^varek-nri: runtime'"
@@ -197,7 +273,7 @@ check "a VarekPolicy the Warden loads: admitted" kubectl apply -f "$OUT/vp-busyb
 synced() { for _ in $(seq 30); do on_node cat /var/lib/varek/policies/team-a/busybox.policy 2> /dev/null | grep -qx "$1" && return 0; sleep 1; done; return 1; }
 check "... written to the node by the plugin's -sync (POLICY_DIR/team-a/busybox.policy)" synced 'allow exec /bin/sleep'
 check "... root's, 0644, in a directory others cannot write" sh -c \
-    "[ \"\$(docker exec $N stat -c '%u %a' /var/lib/varek/policies/team-a/busybox.policy)\" = '0 644' ] && [ \"\$(docker exec $N stat -c '%u %a' /var/lib/varek/policies)\" = '0 755' ]"
+    "[ \"\$($NODE_EXEC stat -c '%u %a' /var/lib/varek/policies/team-a/busybox.policy)\" = '0 644' ] && [ \"\$($NODE_EXEC stat -c '%u %a' /var/lib/varek/policies)\" = '0 755' ]"
 pod p-nosuch team-a nosuch > "$OUT/p-nosuch.json"
 refused "a pod naming a policy not in its namespace: refused" "$OUT/p-nosuch.json" "no VarekPolicy nosuch in namespace team-a"
 pod p-relative team-a busybox relative > "$OUT/p-relative.json"
@@ -207,7 +283,7 @@ refused "a writable root under a policy that decides launches (D4): refused" "$O
 pod p-default team-a busybox runtimedefault > "$OUT/p-default.json"
 refused "a seccomp profile other than VAREK's unsupervised one: refused" "$OUT/p-default.json" "seccompProfile must be"
 check "VAREK's unsupervised profile on the node (every call refused)" sh -c \
-    "docker exec $N cat /var/lib/kubelet/seccomp/varek/unsupervised.json | grep -q '\"defaultAction\":\"SCMP_ACT_ERRNO\"'"
+    "$NODE_EXEC cat /var/lib/kubelet/seccomp/varek/unsupervised.json | grep -q '\"defaultAction\":\"SCMP_ACT_ERRNO\"'"
 kubectl create namespace team-req > /dev/null
 kubectl label namespace team-req varek.dev/policy-required=true pod-security.kubernetes.io/enforce=restricted > /dev/null
 pod p-none team-req - > "$OUT/p-none.json"
@@ -235,7 +311,12 @@ check "a pod naming no policy: left as it is, its command ran" sh -c \
 
 echo "== 4. the evidence"
 sleep 3
-rm -rf "$OUT/streams"; docker cp "$N:/var/log/varek" "$OUT/streams" > /dev/null 2>&1
+rm -rf "$OUT/streams"
+if [ "$HOST" = 1 ]; then
+    sudo cp -a /var/log/varek "$OUT/streams" && sudo chown -R "$(id -u):$(id -g)" "$OUT/streams"
+else
+    docker cp "$N:/var/log/varek" "$OUT/streams" > /dev/null 2>&1
+fi
 SA="$(python3 - "$OUT/streams" <<'EOF'
 import glob, json, sys
 for p in sorted(glob.glob(sys.argv[1] + "/*.jsonl")):
@@ -249,7 +330,7 @@ EOF
 )"
 check "the pod's stream on the node: run_start names the pod, its namespace and the policy" sh -c "[ -n '$SA' ] && [ -s '$SA' ]"
 check "... the policy copied beside it (root's, 0400), the stream root's (0600)" sh -c \
-    "on() { docker exec $N stat -c '%u %a' \"/var/log/varek/\$(basename \"\$1\")\"; }; [ \"\$(on '$SA')\" = '0 600' ] && [ \"\$(on '${SA%.jsonl}.policy')\" = '0 400' ]"
+    "on() { $NODE_EXEC stat -c '%u %a' \"/var/log/varek/\$(basename \"\$1\")\"; }; [ \"\$(on '$SA')\" = '0 600' ] && [ \"\$(on '${SA%.jsonl}.policy')\" = '0 400' ]"
 check "the audit verifies it: signed with the node's key, anchored, each decision under its policy" \
     python3 "$HERE/tools/varek_audit.py" --policy "${SA%.jsonl}.policy" --checker "$HERE/tools/vdp_cert_check" \
     --pubkey "$OUT/node.key.pub" --anchor "$OUT/streams/anchor" "$SA"
@@ -271,14 +352,14 @@ echo "== 5. the policy changed, then deleted"
 vp busybox "$POLICY
 allow path /etc/passwd readonly" > "$OUT/vp-busybox2.json"
 check "the changed policy admitted, and written to the node again" sh -c \
-    "kubectl apply -f '$OUT/vp-busybox2.json' && for i in \$(seq 30); do docker exec $N grep -qx 'allow path /etc/passwd readonly' /var/lib/varek/policies/team-a/busybox.policy && exit 0; sleep 1; done; exit 1"
+    "kubectl apply -f '$OUT/vp-busybox2.json' && for i in \$(seq 30); do $NODE_EXEC grep -qx 'allow path /etc/passwd readonly' /var/lib/varek/policies/team-a/busybox.policy && exit 0; sleep 1; done; exit 1"
 pod pod-a2 team-a busybox > "$OUT/pod-a2.json"
 kubectl apply -f "$OUT/pod-a2.json" > /dev/null 2>&1
 ran pod-a2
 check "a new pod runs under the new policy (the read it now allows)" grep -qx 'read_denied: 0' "$OUT/pod-a2.log"
 kubectl -n team-a delete varekpolicy busybox > /dev/null 2>&1
 check "the policy deleted: removed from the node" sh -c \
-    "for i in \$(seq 30); do docker exec $N test -e /var/lib/varek/policies/team-a/busybox.policy || exit 0; sleep 1; done; exit 1"
+    "for i in \$(seq 30); do $NODE_EXEC test -e /var/lib/varek/policies/team-a/busybox.policy || exit 0; sleep 1; done; exit 1"
 
 echo "== 6. the node agent's pods taken off the node, then back"
 node_logs "-before-restart"   # the restart below ends these
