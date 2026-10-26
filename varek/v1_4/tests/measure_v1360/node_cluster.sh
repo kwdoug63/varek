@@ -51,7 +51,14 @@ measure() {
     return 0
 }
 run() { echo "+ $*" >> "$LOG"; "$@" >> "$LOG" 2>&1; }
-fail() { measure "cluster.failed_at" "$1"; tail -30 "$LOG"; exit 1; }
+# On a failure, what the runtime and the kubelet said, and the containers
+# the runtime made (the first run's crun cells failed with neither kept)
+fail() {
+    measure "cluster.failed_at" "$1"
+    { echo "--- crictl ps -a"; crictl ps -a 2>&1
+      echo "--- journal"; journalctl -u crio -u containerd -u kubelet --no-pager 2>&1 | tail -200; } >> "$LOG"
+    tail -60 "$LOG"; exit 1
+}
 START=$(date +%s)
 CELL="$RUNTIME-$VERSION-$OCI"
 measure "cell" "$CELL, Kubernetes $K8S, $(uname -sr), cgroup $(stat -fc %T /sys/fs/cgroup)"
@@ -74,10 +81,15 @@ if [ "$RUNTIME" = crio ]; then
     echo "deb [signed-by=/etc/apt/keyrings/cri-o.gpg] $CRIO_REPO /" > /etc/apt/sources.list.d/cri-o.list
     run apt-get update || fail "apt-get update"
     run apt-get install -y cri-o kubelet kubeadm kubectl || fail "installing cri-o and kubeadm"
-    # CRI-O's packages bring crun (and runc in newer ones); the OS's if not.
-    # To be confirmed on the first run: where each package puts them.
-    ociPath="$(command -v "$OCI" || ls "/usr/libexec/crio/$OCI" 2>/dev/null || true)"
-    if [ -z "$ociPath" ]; then run apt-get install -y "$OCI"; ociPath="$(command -v "$OCI" || true)"; fi
+    # CRI-O's own build of the runtime first: the runner's image has an older
+    # crun (1.14.1, podman's) on the PATH, under which the first run's
+    # control plane never started. The OS's only if CRI-O brings none.
+    ociPath="$(ls "/usr/libexec/crio/$OCI" 2>/dev/null || true)"
+    if [ -z "$ociPath" ]; then
+        measure "runtime.note" "CRI-O's packages bring no $OCI; the OS's"
+        ociPath="$(command -v "$OCI" || true)"
+        if [ -z "$ociPath" ]; then run apt-get install -y "$OCI"; ociPath="$(command -v "$OCI" || true)"; fi
+    fi
     [ -n "$ociPath" ] || fail "no $OCI binary"
     install -d /etc/crio/crio.conf.d
     cat > /etc/crio/crio.conf.d/90-measure.conf <<EOF
@@ -90,7 +102,7 @@ runtime_path = "$ociPath"
 EOF
     run systemctl enable --now crio || fail "starting crio"
     SOCK=unix:///var/run/crio/crio.sock
-    measure "runtime" "$(crio --version 2>/dev/null | awk '/^Version/ {print $2}'), $OCI $("$ociPath" --version 2>/dev/null | head -1)"
+    measure "runtime" "CRI-O $(crio --version 2>/dev/null | grep -Eom1 '[0-9]+\.[0-9]+\.[0-9]+'), $OCI $("$ociPath" --version 2>/dev/null | head -1) ($ociPath)"
 else
     run apt-get update || fail "apt-get update"
     run apt-get install -y kubelet kubeadm kubectl || fail "installing kubeadm"
@@ -152,7 +164,10 @@ else
 fi
 measure "node_runtime" "$("$KUBECTL" get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}')"
 
-# --- a plain pod
+# --- a plain pod, once the namespace's default service account exists: the
+# controller manager makes it after the node is Ready (the first run started
+# the pod before it, and was refused)
+for _ in $(seq 60); do "$KUBECTL" get serviceaccount default > /dev/null 2>&1 && break; sleep 2; done
 t0=$(date +%s)
 run "$KUBECTL" run m4-plain --image="$POD_IMAGE" --restart=Never -- sleep 3600
 if run "$KUBECTL" wait --for=condition=Ready pod/m4-plain --timeout=300s; then

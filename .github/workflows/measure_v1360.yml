@@ -63,7 +63,7 @@ jobs:
       - name: Keep the logs
         if: always()
         run: |
-          sudo journalctl -u crio -u kubelet --no-pager > "$OUT/journal.log" 2>&1 || true
+          sudo mkdir -p "$OUT"; sudo journalctl -u crio -u kubelet --no-pager 2>&1 | sudo tee "$OUT/journal.log" > /dev/null || true
           sudo chmod -R a+rX "$OUT" 2>/dev/null || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: always()
@@ -105,7 +105,7 @@ jobs:
       - name: Keep the logs
         if: always()
         run: |
-          sudo journalctl -u containerd -u kubelet --no-pager > "$OUT/journal.log" 2>&1 || true
+          sudo mkdir -p "$OUT"; sudo journalctl -u containerd -u kubelet --no-pager 2>&1 | sudo tee "$OUT/journal.log" > /dev/null || true
           sudo chmod -R a+rX "$OUT" 2>/dev/null || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: always()
