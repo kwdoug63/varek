@@ -38,8 +38,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The node image, built once and handed to every cell (each cell built its
+  # own at first: three of eight then sat in the build for over ten minutes
+  # while the same build took one in the others)
+  image:
+    name: The node image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the node image, and save it
+        timeout-minutes: 20
+        run: |
+          docker build -f packaging/container/Containerfile --target node -t varek-node:ci .
+          docker save -o "$RUNNER_TEMP/varek-node.tar" varek-node:ci
+          ls -l "$RUNNER_TEMP/varek-node.tar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-image
+          path: ${{ runner.temp }}/varek-node.tar
+          retention-days: 1
+
   cell:
     name: ${{ matrix.name }}
+    needs: image
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -64,11 +86,12 @@ jobs:
           sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
       - name: Build the tools the test uses (the key and the certificate checker)
         run: make -C varek/v1_4 tools/varek_keygen tools/vdp_cert_check
-      - name: Build the node image, and save it (the cluster stops the runner's Docker)
-        run: |
-          docker build -f packaging/container/Containerfile --target node -t varek-node:ci .
-          mkdir -p "$OUT"
-          docker save -o "$RUNNER_TEMP/varek-node.tar" varek-node:ci
+      # the image as a saved archive: the cluster stops the runner's Docker,
+      # and v1340_kind.sh --host loads it into the node's runtime
+      - uses: actions/download-artifact@v4
+        with:
+          name: node-image
+          path: ${{ runner.temp }}
       - name: The host
         run: |
           uname -srm; stat -fc 'cgroup: %T' /sys/fs/cgroup; cat /sys/kernel/security/lsm; echo
