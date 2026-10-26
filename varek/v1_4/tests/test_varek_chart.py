@@ -103,7 +103,9 @@ def test_the_default_render():
             assert d["metadata"]["namespace"] == NS, d["metadata"]
     images = {c["image"] for k in ("DaemonSet", "Deployment") for key in ("containers", "initContainers")
               for c in pod(docs, k).get(key, [])}
-    assert images == {"ghcr.io/kwdoug63/varek-node:1.34.0"}
+    # the image's tag is the chart's appVersion, which a release sets to its tag
+    app = yaml.safe_load(open(os.path.join(CHART, "Chart.yaml")))["appVersion"]
+    assert images == {f"ghcr.io/kwdoug63/varek-node:{app}"}
 
 
 def test_each_path_is_the_nodes_own():

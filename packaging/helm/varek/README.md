@@ -43,18 +43,18 @@ pins its image by the digest that was signed.
 ```sh
 kubectl create namespace varek-system
 kubectl label namespace varek-system pod-security.kubernetes.io/enforce=privileged
-helm install varek oci://ghcr.io/kwdoug63/charts/varek --version 1.34.0 -n varek-system
+helm install varek oci://ghcr.io/kwdoug63/charts/varek --version 1.35.0 -n varek-system
 ```
 
 To check the signatures first:
 
 ```sh
-cosign verify ghcr.io/kwdoug63/charts/varek:1.34.0 \
-  --certificate-identity https://github.com/kwdoug63/varek/.github/workflows/container-release.yml@refs/tags/v1.34.0 \
+cosign verify ghcr.io/kwdoug63/charts/varek:1.35.0 \
+  --certificate-identity https://github.com/kwdoug63/varek/.github/workflows/container-release.yml@refs/tags/v1.35.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-and the same for `ghcr.io/kwdoug63/varek-node:1.34.0`.
+and the same for `ghcr.io/kwdoug63/varek-node:1.35.0`.
 
 On OpenShift (CRI-O), add `--set runtime=cri-o --set openshift.enabled=true`.
 This creates a SecurityContextConstraints that only the node agent's service
