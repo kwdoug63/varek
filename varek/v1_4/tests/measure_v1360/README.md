@@ -112,6 +112,13 @@ the node:
 
 Measured: each check, yes or no.
 
+**M2b**, added after the first runs (October 26, 2026): on CRI-O and on
+containerd the kubelet did not mount the volume at all, only the pod's
+service-account token. So the same Secret is mounted by an init container
+(`true`) that ends before the pod's container starts. The checks: is the
+volume on the node while the pod's container runs, does its token match,
+is it out of that container's mounts, and is it removed with the pod.
+
 ### M3: SPIRE (D5)
 
 SPIRE's server and agent are installed from SPIRE's Helm chart, with the

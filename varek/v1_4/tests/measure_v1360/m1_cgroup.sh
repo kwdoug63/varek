@@ -89,7 +89,11 @@ EOF
 
 # 1. The container's group
 pid="$(cpid m1)"
+# Every check below acts on this process's group: without it they would act
+# on the node's root group (the first run, crictl missing, did)
+case "$pid" in ''|*[!0-9]*|0) measure setup "the container's process was not found (crictl: $(command -v crictl || echo missing))"; exit 1 ;; esac
 cg="$(cg_of "$pid")"
+[ -n "$cg" ] && [ "$cg" != / ] || { measure setup "the container's group was not found (pid $pid)"; exit 1; }
 G="/sys/fs/cgroup$cg"
 measure container_cgroup "$cg"
 measure systemd_scope "$([[ "$cg" == *.scope ]] && echo yes || echo no)"

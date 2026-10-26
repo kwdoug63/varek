@@ -61,7 +61,16 @@ helm repo update >> "$LOG" 2>&1
 helm upgrade --install spire-crds spiffe/spire-crds -n spire-mgmt --create-namespace --wait >> "$LOG" 2>&1 ||
     { measure setup "spire-crds did not install"; exit 1; }
 helm upgrade --install spire spiffe/spire -n spire-mgmt -f "$OUT/spire-values.yaml" --wait --timeout 10m >> "$LOG" 2>&1 ||
-    { measure setup "spire did not install ($(tail -1 "$LOG"))"; "$KUBECTL" get pods -A >> "$LOG" 2>&1; exit 1; }
+    { measure setup "spire did not install ($(tail -1 "$LOG"))"
+      # into the job's log itself: its artifacts are not always reachable
+      "$KUBECTL" get pods -A -o wide 2>&1
+      "$KUBECTL" get events -A --sort-by=.lastTimestamp 2>&1 | tail -40
+      for p in $("$KUBECTL" get pods -n spire-mgmt -o name 2>/dev/null); do
+          "$KUBECTL" get -n spire-mgmt "$p" -o jsonpath='{.status.phase}' | grep -qx Running && continue
+          "$KUBECTL" describe -n spire-mgmt "$p" 2>&1 | tail -25
+          "$KUBECTL" logs -n spire-mgmt "$p" --all-containers --tail=20 2>&1
+      done
+      exit 1; }
 measure chart "$(helm list -n spire-mgmt -o json | python3 -c 'import json,sys; print(", ".join(r["chart"] + " (app " + r["app_version"] + ")" for r in json.load(sys.stdin)))')"
 
 server="$("$KUBECTL" get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' | grep -m1 '/spire-server-')"

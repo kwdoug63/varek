@@ -80,7 +80,11 @@ if [ "$RUNTIME" = crio ]; then
     key "$CRIO_REPO" /etc/apt/keyrings/cri-o.gpg || fail "the CRI-O package key ($CRIO_REPO)"
     echo "deb [signed-by=/etc/apt/keyrings/cri-o.gpg] $CRIO_REPO /" > /etc/apt/sources.list.d/cri-o.list
     run apt-get update || fail "apt-get update"
-    run apt-get install -y cri-o kubelet kubeadm kubectl || fail "installing cri-o and kubeadm"
+    # Kubernetes pinned to the cell's minor: the first fixed run's CRI-O 1.35
+    # cell got kubeadm 1.37.1 from an unpinned install
+    run apt-cache policy kubeadm cri-o
+    run apt-get install -y cri-o cri-tools "kubelet=$K8S.*" "kubeadm=$K8S.*" "kubectl=$K8S.*" ||
+        fail "installing cri-o and Kubernetes $K8S"
     # CRI-O's own build of the runtime first: the runner's image has an older
     # crun (1.14.1, podman's) on the PATH, under which the first run's
     # control plane never started. The OS's only if CRI-O brings none.
@@ -105,7 +109,8 @@ EOF
     measure "runtime" "CRI-O $(crio --version 2>/dev/null | grep -Eom1 '[0-9]+\.[0-9]+\.[0-9]+'), $OCI $("$ociPath" --version 2>/dev/null | head -1) ($ociPath)"
 else
     run apt-get update || fail "apt-get update"
-    run apt-get install -y kubelet kubeadm kubectl || fail "installing kubeadm"
+    run apt-cache policy kubeadm
+    run apt-get install -y cri-tools "kubelet=$K8S.*" "kubeadm=$K8S.*" "kubectl=$K8S.*" || fail "installing Kubernetes $K8S"
     # The newest release of that minor, from the project's releases
     full="$(curl -fsSL "https://api.github.com/repos/containerd/containerd/releases?per_page=100" |
         python3 -c "import json,sys,re
@@ -153,8 +158,10 @@ apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
 cgroupDriver: systemd
 EOF
-run kubeadm init --config "$OUT/kubeadm.yaml" || fail "kubeadm init"
-measure "kubeadm" "$(kubeadm version -o short)"
+# apt's kubeadm by its path: the runner's image may have another on the PATH
+KUBEADM=/usr/bin/kubeadm
+run "$KUBEADM" init --config "$OUT/kubeadm.yaml" || fail "kubeadm init"
+measure "kubeadm" "$("$KUBEADM" version -o short) (on the PATH: $(command -v kubeadm))"
 run "$KUBECTL" taint nodes --all node-role.kubernetes.io/control-plane- || true
 run "$KUBECTL" apply -f "$FLANNEL" || fail "flannel"
 if run "$KUBECTL" wait --for=condition=Ready node --all --timeout=300s; then
