@@ -1,0 +1,136 @@
+name: v1.36 step 1 measurements
+
+# v1.36 step 1 (docs/security/v1.36-kubernetes-parity.md; the runbook is
+# varek/v1_4/tests/measure_v1360/README.md), M1 to M4, started by hand:
+#   crio        a one-node kubeadm cluster under CRI-O 1.35, 1.36 and 1.37,
+#               each under runc and under crun, the systemd cgroup driver
+#               (M4a); on 1.35 under runc, M1 (a sub-agent's group, D3), M2
+#               (a Secret volume no container mounts, D5) and M3 (a pod's
+#               SVID through SPIRE's Delegated Identity API, D5);
+#   containerd  the same under containerd 2.2 and 2.3 with SystemdCgroup
+#               (M4b); on 2.2, M1 to M3;
+#   kvm         KVM on the runner, and a Fedora Cloud VM's SELinux (M4c).
+# Each cell builds its cluster from nothing on the runner (a VM with systemd
+# and cgroup v2; kind's nodes are containers and could not answer M1). Every
+# MEASURE line is in the job's summary and its uploaded logs. A cell that
+# fails does not stop the others.
+
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Which jobs to run"
+        type: choice
+        options: [all, crio, containerd, kvm]
+        default: all
+
+permissions:
+  contents: read
+
+jobs:
+  crio:
+    name: CRI-O ${{ matrix.version }} under ${{ matrix.oci }}
+    if: inputs.only == 'all' || inputs.only == 'crio'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["1.35", "1.36", "1.37"]
+        oci: [runc, crun]
+    env:
+      OUT: ${{ github.workspace }}/measure
+      M: varek/v1_4/tests/measure_v1360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: The host
+        run: |
+          uname -srm; stat -fc 'cgroup: %T' /sys/fs/cgroup; systemctl --version | head -1
+      - name: The cluster (M4a)
+        run: sudo -E env "PATH=$PATH" bash "$M/node_cluster.sh" --runtime crio --version "${{ matrix.version }}" --oci "${{ matrix.oci }}" --out "$OUT"
+      - name: M1, a sub-agent's group
+        if: matrix.version == '1.35' && matrix.oci == 'runc'
+        continue-on-error: true
+        run: sudo -E env "PATH=$PATH" bash "$M/m1_cgroup.sh" --out "$OUT"
+      - name: M2, a Secret volume no container mounts
+        if: matrix.version == '1.35' && matrix.oci == 'runc'
+        continue-on-error: true
+        run: sudo -E env "PATH=$PATH" bash "$M/m2_volume.sh" --out "$OUT"
+      - name: M3, a pod's SVID from SPIRE
+        if: matrix.version == '1.35' && matrix.oci == 'runc'
+        continue-on-error: true
+        run: sudo -E env "PATH=$PATH" bash "$M/m3_spire.sh" --out "$OUT"
+      - name: Keep the logs
+        if: always()
+        run: |
+          sudo journalctl -u crio -u kubelet --no-pager > "$OUT/journal.log" 2>&1 || true
+          sudo chmod -R a+rX "$OUT" 2>/dev/null || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: measure-crio-${{ matrix.version }}-${{ matrix.oci }}
+          path: ${{ github.workspace }}/measure
+
+  containerd:
+    name: containerd ${{ matrix.version }} (SystemdCgroup)
+    if: inputs.only == 'all' || inputs.only == 'containerd'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["2.2", "2.3"]
+    env:
+      OUT: ${{ github.workspace }}/measure
+      M: varek/v1_4/tests/measure_v1360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: The host
+        run: |
+          uname -srm; stat -fc 'cgroup: %T' /sys/fs/cgroup; systemctl --version | head -1
+      - name: The cluster (M4b)
+        run: sudo -E env "PATH=$PATH" bash "$M/node_cluster.sh" --runtime containerd --version "${{ matrix.version }}" --out "$OUT"
+      - name: M1, a sub-agent's group
+        if: matrix.version == '2.2'
+        continue-on-error: true
+        run: sudo -E env "PATH=$PATH" bash "$M/m1_cgroup.sh" --out "$OUT"
+      - name: M2, a Secret volume no container mounts
+        if: matrix.version == '2.2'
+        continue-on-error: true
+        run: sudo -E env "PATH=$PATH" bash "$M/m2_volume.sh" --out "$OUT"
+      - name: M3, a pod's SVID from SPIRE
+        if: matrix.version == '2.2'
+        continue-on-error: true
+        run: sudo -E env "PATH=$PATH" bash "$M/m3_spire.sh" --out "$OUT"
+      - name: Keep the logs
+        if: always()
+        run: |
+          sudo journalctl -u containerd -u kubelet --no-pager > "$OUT/journal.log" 2>&1 || true
+          sudo chmod -R a+rX "$OUT" 2>/dev/null || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: measure-containerd-${{ matrix.version }}
+          path: ${{ github.workspace }}/measure
+
+  kvm:
+    name: KVM and a Fedora VM's SELinux
+    if: inputs.only == 'all' || inputs.only == 'kvm'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      OUT: ${{ github.workspace }}/measure
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - name: M4c, KVM
+        run: sudo -E env "PATH=$PATH" bash varek/v1_4/tests/measure_v1360/m4_kvm.sh --out "$OUT"
+      - name: Keep the logs
+        if: always()
+        run: |
+          sudo rm -f "$OUT"/kvm/*.qcow2 "$OUT"/kvm/seed.iso
+          sudo chmod -R a+rX "$OUT" 2>/dev/null || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: measure-kvm
+          path: ${{ github.workspace }}/measure
