@@ -53,11 +53,39 @@ measure() {
 run() { echo "+ $*" >> "$LOG"; "$@" >> "$LOG" 2>&1; }
 # On a failure, what the runtime and the kubelet said, and the containers
 # the runtime made (the first run's crun cells failed with neither kept)
+# The log's own tail is printed first: the fourth run's install failures
+# were hidden under the journal, which fail() appended before printing.
 fail() {
     measure "cluster.failed_at" "$1"
+    echo "--- the log's last 40 lines"; tail -40 "$LOG"
+    echo "--- apt's errors"; grep -E '^(E|W): ' "$LOG" | tail -20
     { echo "--- crictl ps -a"; crictl ps -a 2>&1
       echo "--- journal"; journalctl -u crio -u containerd -u kubelet --no-pager 2>&1 | tail -200; } >> "$LOG"
     tail -60 "$LOG"; exit 1
+}
+# Kubernetes at the cell's minor, then crictl. The third run's CRI-O 1.35
+# cell got kubeadm 1.37.1 unpinned; the fourth run's single install with
+# cri-tools failed in every cell. crictl comes from apt if a repository has
+# it, else from the cri-tools project's release for that minor (or its newest).
+k8s_install() {
+    run apt-cache policy kubeadm kubelet kubectl cri-tools "$@"
+    run apt-get install -y "$@" "kubelet=$K8S.*" "kubeadm=$K8S.*" "kubectl=$K8S.*" ||
+        fail "installing ${*:+$* and }Kubernetes $K8S"
+    command -v crictl > /dev/null && return 0
+    run apt-get install -y cri-tools && command -v crictl > /dev/null && return 0
+    measure "crictl.note" "no cri-tools package; the cri-tools release"
+    local v
+    v="$(curl -fsSL "https://api.github.com/repos/kubernetes-sigs/cri-tools/releases?per_page=100" |
+        python3 -c "import json,sys,re
+a=[r['tag_name'][1:] for r in json.load(sys.stdin) if re.fullmatch(r'v\d+\.\d+\.\d+', r['tag_name'])]
+v=[t for t in a if t.startswith('$K8S.')] or a
+v.sort(key=lambda s: [int(x) for x in s.split('.')]); print(v[-1] if v else '')")"
+    [ -n "$v" ] || fail "no cri-tools release found"
+    curl -fsSL -o "$OUT/crictl.tgz" "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$v/crictl-v$v-linux-amd64.tar.gz" || fail "downloading crictl $v"
+    curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$v/crictl-v$v-linux-amd64.tar.gz.sha256" |
+        awk '{print $1}' > "$OUT/crictl.sha" || fail "crictl's checksum"
+    [ "$(sha256sum "$OUT/crictl.tgz" | awk '{print $1}')" = "$(cat "$OUT/crictl.sha")" ] || fail "crictl's checksum does not match"
+    run tar -C /usr/local/bin -xzf "$OUT/crictl.tgz" crictl || fail "unpacking crictl"
 }
 START=$(date +%s)
 CELL="$RUNTIME-$VERSION-$OCI"
@@ -82,9 +110,7 @@ if [ "$RUNTIME" = crio ]; then
     run apt-get update || fail "apt-get update"
     # Kubernetes pinned to the cell's minor: the first fixed run's CRI-O 1.35
     # cell got kubeadm 1.37.1 from an unpinned install
-    run apt-cache policy kubeadm cri-o
-    run apt-get install -y cri-o cri-tools "kubelet=$K8S.*" "kubeadm=$K8S.*" "kubectl=$K8S.*" ||
-        fail "installing cri-o and Kubernetes $K8S"
+    k8s_install cri-o
     # CRI-O's own build of the runtime first: the runner's image has an older
     # crun (1.14.1, podman's) on the PATH, under which the first run's
     # control plane never started. The OS's only if CRI-O brings none.
@@ -109,8 +135,7 @@ EOF
     measure "runtime" "CRI-O $(crio --version 2>/dev/null | grep -Eom1 '[0-9]+\.[0-9]+\.[0-9]+'), $OCI $("$ociPath" --version 2>/dev/null | head -1) ($ociPath)"
 else
     run apt-get update || fail "apt-get update"
-    run apt-cache policy kubeadm
-    run apt-get install -y cri-tools "kubelet=$K8S.*" "kubeadm=$K8S.*" "kubectl=$K8S.*" || fail "installing Kubernetes $K8S"
+    k8s_install
     # The newest release of that minor, from the project's releases
     full="$(curl -fsSL "https://api.github.com/repos/containerd/containerd/releases?per_page=100" |
         python3 -c "import json,sys,re
