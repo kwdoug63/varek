@@ -7,7 +7,11 @@
 # of docs/security/v1.36-kubernetes-parity.md). For GitHub's hosted runners
 # (Ubuntu 24.04, systemd, cgroup v2, amd64 or arm64): it stops the runner's
 # own Docker and containerd, turns swap off and installs packages, so it is
-# not for a machine anyone uses.
+# not for a machine anyone uses. Since step 2's second part it also makes a
+# CRI-O cell on a dnf host (Rocky Linux 9 in a VM on the runner,
+# tests/vm_cell.sh): with SELinux enforcing, CRI-O labels each container,
+# the control plane runs as spc_t (kubeadm's patches), and pods use a bridge
+# on the node instead of flannel.
 #
 #   sudo -E varek/v1_4/tests/node_cluster.sh --runtime crio --version 1.35 --oci runc [--out DIR]
 #   sudo -E varek/v1_4/tests/node_cluster.sh --runtime containerd --version 2.2 [--k8s 1.35] [--out DIR]
@@ -38,9 +42,17 @@ case "$OCI" in runc|crun) ;; *) echo "node_cluster.sh: --oci runc|crun" >&2; exi
 # The CRI-O project's package repository for one minor (its install guide,
 # github.com/cri-o/packaging). To be confirmed on the first run.
 # the release downloads' architecture (amd64, arm64)
-ARCH="$(dpkg --print-architecture)"
-CRIO_REPO="https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v$VERSION/deb/"
-K8S_REPO="https://pkgs.k8s.io/core:/stable:/v$K8S/deb/"
+ARCH="$(dpkg --print-architecture 2>/dev/null || { case "$(uname -m)" in aarch64) echo arm64 ;; *) echo amd64 ;; esac; })"
+# the host's packages: apt (Ubuntu, the runner) or dnf (RHEL 9 and its
+# rebuilds), each project's repository in that format
+if command -v apt-get > /dev/null; then PM=apt; elif command -v dnf > /dev/null; then PM=dnf; else
+    echo "node_cluster.sh: no apt-get or dnf here" >&2; exit 2; fi
+[ "$PM" = dnf ] && [ "$RUNTIME" != crio ] && { echo "node_cluster.sh: a dnf host's cell is CRI-O's only" >&2; exit 2; }
+FMT=deb; [ "$PM" = dnf ] && FMT=rpm
+CRIO_REPO="https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v$VERSION/$FMT/"
+K8S_REPO="https://pkgs.k8s.io/core:/stable:/v$K8S/$FMT/"
+# SELinux as the host has it (none on the runner)
+SELINUX="$(getenforce 2>/dev/null || echo none)"
 FLANNEL="https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
 # A test image the Kubernetes project keeps, with a shell and sleep
 export POD_IMAGE="${POD_IMAGE:-registry.k8s.io/e2e-test-images/busybox:1.36.1-1}"
@@ -77,7 +89,7 @@ get() { curl -fsSL --retry 3 --retry-delay 5 "$@"; }
 fail() {
     measure "cluster.failed_at" "$1"
     echo "--- the log's last 40 lines"; tail -40 "$LOG"
-    echo "--- apt's errors"; grep -E '^(E|W): ' "$LOG" | tail -20
+    echo "--- the package manager's errors"; grep -E '^(E|W): |^Error|^Problem|^ - ' "$LOG" | tail -20
     { echo "--- crictl ps -a"; crictl ps -a 2>&1
       echo "--- journal"; journalctl -u crio -u containerd -u kubelet --no-pager 2>&1 | tail -200; } >> "$LOG"
     tail -60 "$LOG"; exit 1
@@ -88,12 +100,21 @@ fail() {
 # it, else from the cri-tools project's release for that minor (or its newest).
 # The runner's image has a newer kubectl from apt, so pinning below it is a
 # downgrade, which apt refuses under -y unless allowed (the fifth run).
+# On a dnf host cri-tools comes with Kubernetes, from its repository, and
+# the kubelet is enabled here (apt's package enables it itself).
 k8s_install() {
-    run apt-cache policy kubeadm kubelet kubectl cri-tools "$@"
-    run apt-get install -y --allow-downgrades "$@" "kubelet=$K8S.*" "kubeadm=$K8S.*" "kubectl=$K8S.*" ||
-        fail "installing ${*:+$* and }Kubernetes $K8S"
+    if [ "$PM" = dnf ]; then
+        # --allowerasing: the cloud images' curl-minimal gives way if asked
+        run dnf -y --allowerasing install "$@" "kubelet-$K8S.*" "kubeadm-$K8S.*" "kubectl-$K8S.*" cri-tools ||
+            fail "installing ${*:+$* and }Kubernetes $K8S"
+        run systemctl enable kubelet
+    else
+        run apt-cache policy kubeadm kubelet kubectl cri-tools "$@"
+        run apt-get install -y --allow-downgrades "$@" "kubelet=$K8S.*" "kubeadm=$K8S.*" "kubectl=$K8S.*" ||
+            fail "installing ${*:+$* and }Kubernetes $K8S"
+    fi
     command -v crictl > /dev/null && return 0
-    run apt-get install -y cri-tools && command -v crictl > /dev/null && return 0
+    [ "$PM" = apt ] && run apt-get install -y cri-tools && command -v crictl > /dev/null && return 0
     measure "crictl.note" "no cri-tools package; the cri-tools release"
     local v
     v="$(latest kubernetes-sigs/cri-tools "v${K8S//./\\.}\\.[0-9]*" || latest kubernetes-sigs/cri-tools 'v1\.[0-9]*\.[0-9]*')"
@@ -106,7 +127,7 @@ k8s_install() {
 }
 START=$(date +%s)
 CELL="$RUNTIME-$VERSION-$OCI"
-measure "cell" "$CELL, Kubernetes $K8S, $(uname -sr), cgroup $(stat -fc %T /sys/fs/cgroup)"
+measure "cell" "$CELL, Kubernetes $K8S, $(uname -sr), cgroup $(stat -fc %T /sys/fs/cgroup), $(. /etc/os-release && echo "$PRETTY_NAME"), SELinux $SELINUX"
 
 # --- the host
 run swapoff -a
@@ -115,19 +136,36 @@ run modprobe overlay
 run modprobe br_netfilter
 printf 'net.ipv4.ip_forward = 1\nnet.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\n' > /etc/sysctl.d/90-measure.conf
 run sysctl --system
-install -d -m 0755 /etc/apt/keyrings
-key() { get "$1Release.key" | gpg --dearmor --yes -o "$2"; }
-key "$K8S_REPO" /etc/apt/keyrings/kubernetes.gpg || fail "the Kubernetes package key"
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] $K8S_REPO /" > /etc/apt/sources.list.d/kubernetes.list
+# a dnf repository, its packages checked with the key it publishes
+repo() {   # NAME URL
+    printf '[%s]\nname=%s\nbaseurl=%s\nenabled=1\ngpgcheck=1\ngpgkey=%srepodata/repomd.xml.key\n' \
+        "$1" "$1" "$2" "$2" > "/etc/yum.repos.d/$1.repo"
+}
+if [ "$PM" = apt ]; then
+    install -d -m 0755 /etc/apt/keyrings
+    key() { get "$1Release.key" | gpg --dearmor --yes -o "$2"; }
+    key "$K8S_REPO" /etc/apt/keyrings/kubernetes.gpg || fail "the Kubernetes package key"
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] $K8S_REPO /" > /etc/apt/sources.list.d/kubernetes.list
+else
+    repo kubernetes "$K8S_REPO"
+    # the API server's and the kubelet's ports, and the pods' traffic
+    systemctl is-active -q firewalld && run systemctl disable --now firewalld
+fi
 
 # --- the runtime
-if [ "$RUNTIME" = crio ]; then
+if [ "$RUNTIME" = crio ] && [ "$PM" = dnf ]; then
+    repo cri-o "$CRIO_REPO"
+    # container-selinux: the types CRI-O labels containers with
+    k8s_install cri-o container-selinux
+elif [ "$RUNTIME" = crio ]; then
     key "$CRIO_REPO" /etc/apt/keyrings/cri-o.gpg || fail "the CRI-O package key ($CRIO_REPO)"
     echo "deb [signed-by=/etc/apt/keyrings/cri-o.gpg] $CRIO_REPO /" > /etc/apt/sources.list.d/cri-o.list
     run apt-get update || fail "apt-get update"
     # Kubernetes pinned to the cell's minor: the first fixed run's CRI-O 1.35
     # cell got kubeadm 1.37.1 from an unpinned install
     k8s_install cri-o
+fi
+if [ "$RUNTIME" = crio ]; then
     # CRI-O's own build of the runtime first: the runner's image has an older
     # crun (1.14.1, podman's) on the PATH, under which the first run's
     # control plane never started. The OS's only if CRI-O brings none.
@@ -135,14 +173,21 @@ if [ "$RUNTIME" = crio ]; then
     if [ -z "$ociPath" ]; then
         measure "runtime.note" "CRI-O's packages bring no $OCI; the OS's"
         ociPath="$(command -v "$OCI" || true)"
-        if [ -z "$ociPath" ]; then run apt-get install -y "$OCI"; ociPath="$(command -v "$OCI" || true)"; fi
+        if [ -z "$ociPath" ]; then
+            if [ "$PM" = apt ]; then run apt-get install -y "$OCI"; else run dnf -y install "$OCI"; fi
+            ociPath="$(command -v "$OCI" || true)"
+        fi
     fi
     [ -n "$ociPath" ] || fail "no $OCI binary"
     install -d /etc/crio/crio.conf.d
+    # SELinux enforcing: CRI-O labels each container (container_t, a
+    # category pair of its own), as OpenShift's nodes do; its default is off
+    SEL=false; [ "$SELINUX" = Enforcing ] && SEL=true
     cat > /etc/crio/crio.conf.d/90-measure.conf <<EOF
 [crio.runtime]
 cgroup_manager = "systemd"
 default_runtime = "$OCI"
+selinux = $SEL
 
 [crio.runtime.runtimes.$OCI]
 runtime_path = "$ociPath"
@@ -153,7 +198,7 @@ enable_nri = true
 EOF
     run systemctl enable --now crio || fail "starting crio"
     SOCK=unix:///var/run/crio/crio.sock
-    measure "runtime" "CRI-O $(crio --version 2>/dev/null | grep -Eom1 '[0-9]+\.[0-9]+\.[0-9]+'), $OCI $("$ociPath" --version 2>/dev/null | head -1) ($ociPath)"
+    measure "runtime" "CRI-O $(crio --version 2>/dev/null | grep -Eom1 '[0-9]+\.[0-9]+\.[0-9]+'), $OCI $("$ociPath" --version 2>/dev/null | head -1) ($ociPath), selinux = $SEL"
 else
     run apt-get update || fail "apt-get update"
     k8s_install
@@ -204,11 +249,26 @@ else
 fi
 
 # --- the cluster
+# Under SELinux enforcing, kubeadm's static pods (etcd, the API server, the
+# controller manager, the scheduler) read and write the node's own files
+# (/var/lib/etcd, /etc/kubernetes/pki), which container_t may not: they run
+# as spc_t, as OpenShift runs its control plane, through kubeadm's patches.
+# VAREK's own pods keep the types the chart gives them.
+PATCHES=""
+if [ "$SELINUX" = Enforcing ]; then
+    install -d "$OUT/patches"
+    for c in etcd kube-apiserver kube-controller-manager kube-scheduler; do
+        printf 'spec:\n  securityContext:\n    seLinuxOptions:\n      type: spc_t\n' > "$OUT/patches/$c+strategic.yaml"
+    done
+    PATCHES="patches:
+  directory: $OUT/patches"
+fi
 cat > "$OUT/kubeadm.yaml" <<EOF
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
 nodeRegistration:
   criSocket: $SOCK
+$PATCHES
 ---
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
@@ -224,7 +284,21 @@ KUBEADM=/usr/bin/kubeadm
 run "$KUBEADM" init --config "$OUT/kubeadm.yaml" || fail "kubeadm init"
 measure "kubeadm" "$("$KUBEADM" version -o short) (on the PATH: $(command -v kubeadm))"
 run "$KUBECTL" taint nodes --all node-role.kubernetes.io/control-plane- || true
-run "$KUBECTL" apply -f "$FLANNEL" || fail "flannel"
+# The pods' network: flannel, or under SELinux enforcing a bridge on the
+# node (one node needs no overlay; the CNI plugins run on the node, not in
+# a container), in the pod subnet kubeadm was given
+if [ "$SELINUX" = Enforcing ]; then
+    install -d /etc/cni/net.d
+    cat > /etc/cni/net.d/10-varek-bridge.conflist <<'EOF'
+{"cniVersion": "1.0.0", "name": "varek-bridge", "plugins": [
+  {"type": "bridge", "bridge": "cni0", "isGateway": true, "ipMasq": true, "hairpinMode": true,
+   "ipam": {"type": "host-local", "ranges": [[{"subnet": "10.244.0.0/16"}]], "routes": [{"dst": "0.0.0.0/0"}]}},
+  {"type": "portmap", "capabilities": {"portMappings": true}}]}
+EOF
+    measure "pod_network" "a bridge on the node (10-varek-bridge.conflist)"
+else
+    run "$KUBECTL" apply -f "$FLANNEL" || fail "flannel"
+fi
 if run "$KUBECTL" wait --for=condition=Ready node --all --timeout=300s; then
     measure "node_ready" "yes, $(( $(date +%s) - START )) s from the start"
 else

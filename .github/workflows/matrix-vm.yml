@@ -1,0 +1,107 @@
+name: Matrix in VMs
+
+# v1.36 step 2, its second part (docs/security/v1.36-kubernetes-parity.md,
+# D11): the matrix's cells that need a host other than the runner's Ubuntu,
+# each a cloud image booted under KVM on a hosted runner and reached by ssh
+# (varek/v1_4/tests/vm_cell.sh):
+#   SELinux enforcing: a one-node CRI-O 1.35 cluster on Rocky Linux 9 (RHEL
+#     9's rebuild; OpenShift's nodes are RHEL 9 with CRI-O), VAREK's chart
+#     checked on it as matrix.yml checks it (v1340_kind.sh --host), and
+#     SELinux's denials counted;
+#   the hosts: every host suite on Rocky Linux 9 and on Amazon Linux 2023
+#     (the OS of EKS's nodes). Ubuntu 24.04 is the runner's own, in
+#     warden-build.yml.
+# For each release (its tag), and for each pull request that touches the
+# Warden, the node agent, the chart, the node image or these cells. Each
+# image is its project's newest, checked by its SHA-256 and cached by it.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  pull_request:
+    branches: [main]
+    paths:
+      - "varek/v1_4/*.c"
+      - "varek/v1_4/*.h"
+      - "varek/v1_4/Makefile"
+      - "varek/v1_4/k8s/**"
+      - "packaging/helm/**"
+      - "packaging/container/**"
+      - "varek/v1_4/tests/vm_cell.sh"
+      - "varek/v1_4/tests/node_cluster.sh"
+      - "varek/v1_4/tests/arm64_sweep.sh"
+      - "varek/v1_4/tests/v1340_kind.sh"
+      - ".github/workflows/matrix-vm.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: matrix-vm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: The node image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the node image, and save it
+        timeout-minutes: 20
+        run: |
+          docker build -f packaging/container/Containerfile --target node -t varek-node:ci .
+          docker save -o "$RUNNER_TEMP/varek-node.tar" varek-node:ci
+          ls -l "$RUNNER_TEMP/varek-node.tar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-image-vm
+          path: ${{ runner.temp }}/varek-node.tar
+          retention-days: 1
+
+  vm:
+    name: ${{ matrix.name }}
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: "SELinux enforcing: CRI-O 1.35 on Rocky Linux 9", os: rocky9, cell: chart}
+          - {name: "Rocky Linux 9 host: every suite", os: rocky9, cell: sweep}
+          - {name: "Amazon Linux 2023 host: every suite", os: al2023, cell: sweep}
+    env:
+      OUT: ${{ github.workspace }}/vm-cell
+      CACHE: ${{ github.workspace }}/vm-cache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        if: matrix.cell == 'chart'
+        with:
+          name: node-image-vm
+          path: ${{ runner.temp }}
+      - name: The image (its project's newest, and its SHA-256)
+        id: img
+        run: bash varek/v1_4/tests/vm_cell.sh resolve --os "${{ matrix.os }}" | tee -a "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.CACHE }}/${{ steps.img.outputs.file }}
+          key: vm-${{ steps.img.outputs.file }}-${{ steps.img.outputs.sha }}
+      - name: The cell
+        run: |
+          mkdir -p "$OUT" "$CACHE"
+          sudo -E env "PATH=$PATH" bash varek/v1_4/tests/vm_cell.sh run --os "${{ matrix.os }}" --cell "${{ matrix.cell }}" \
+            --cache "$CACHE" --out "$OUT" --archive "$RUNNER_TEMP/varek-node.tar" \
+            --file "${{ steps.img.outputs.file }}" --sha "${{ steps.img.outputs.sha }}" --base "${{ steps.img.outputs.base }}"
+      - name: Keep the logs (not the VM's key or disks)
+        if: always()
+        run: |
+          sudo rm -f "$OUT"/vm/key "$OUT"/vm/key.pub "$OUT"/vm/*.qcow2 "$OUT"/vm/seed.iso
+          sudo chmod -R a+rX "$OUT" "$CACHE" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vm-${{ matrix.os }}-${{ matrix.cell }}
+          path: ${{ github.workspace }}/vm-cell
