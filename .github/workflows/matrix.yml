@@ -77,9 +77,11 @@ jobs:
         run: |
           sudo -E env "PATH=$PATH" bash varek/v1_4/tests/node_cluster.sh --runtime "${{ matrix.runtime }}" \
             --version "${{ matrix.version }}" --oci "${{ matrix.oci }}" --out "$OUT/cluster"
-          mkdir -p "$HOME/.kube"
+          # the cluster's kubectl ran as root with this HOME (sudo -E), and made
+          # ~/.kube (its cache) root's: the folder is given back with the config
+          sudo mkdir -p "$HOME/.kube"
           sudo cp /etc/kubernetes/admin.conf "$HOME/.kube/config"
-          sudo chown "$(id -u):$(id -g)" "$HOME/.kube/config"
+          sudo chown -R "$(id -u):$(id -g)" "$HOME/.kube"
       - name: The chart on the cluster
         # the cluster's own kubectl (the cell's minor) ahead of the runner's,
         # and the cluster's kubeconfig named
