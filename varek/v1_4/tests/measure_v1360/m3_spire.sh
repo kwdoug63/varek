@@ -45,6 +45,7 @@ spire-server:
   persistence:
     type: emptyDir
   controllerManager:
+    watchClassless: true
     identities:
       clusterSPIFFEIDs:
         default:
@@ -105,6 +106,7 @@ apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterSPIFFEID
 metadata: {name: varek-m3}
 spec:
+  className: spire-mgmt-spire
   spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}/m3"
   podSelector: {matchLabels: {varek-m3: registered}}
 ---
@@ -112,6 +114,7 @@ apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterStaticEntry
 metadata: {name: varek-delegate}
 spec:
+  className: spire-mgmt-spire
   spiffeID: $DELEGATE
   parentID: ${agent_id:-spiffe://$TD/unknown}
   selectors: ["unix:uid:0"]
@@ -130,9 +133,22 @@ spec:
 EOF
 "$KUBECTL" apply -f "$OUT/m3.yaml" >> "$LOG" 2>&1 || measure entries "not applied ($(tail -1 "$LOG"))"
 "$KUBECTL" wait --for=condition=Ready pod/m3-registered pod/m3-unregistered --timeout=300s >> "$LOG" 2>&1
-sleep 20                                 # the controller manager writes the entries
-measure entries "$(srv entry show 2>> "$LOG" | grep -c 'Entry ID') on the server"
+# The controller manager writes the entries. Run 7 found none after 20 s:
+# the chart's controller manager reconciles only resources of its own class
+# (spire-mgmt-spire), and these had none. If there are still none, what it
+# said, into the job's log
+n=0
+for _ in $(seq 1 18); do
+    n="$(srv entry show 2>> "$LOG" | grep -c 'Entry ID')"
+    [ "$n" -ge 2 ] && break
+    sleep 5
+done
+measure entries "$n on the server"
 srv entry show >> "$LOG" 2>&1
+if [ "$n" -lt 2 ]; then
+    "$KUBECTL" get clusterspiffeids,clusterstaticentries -o yaml 2>&1 | tail -60
+    "$KUBECTL" -n "${server%%/*}" logs "${server##*/}" -c spire-controller-manager --tail=40 2>&1
+fi
 
 # --- the agent's admin socket, as the node sees it
 apid="$(pgrep -f 'spire-agent run' | head -1)"
