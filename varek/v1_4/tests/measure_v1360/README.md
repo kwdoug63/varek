@@ -170,7 +170,7 @@ matrix.
 ## Files (to be written)
 
 - `.github/workflows/measure_v1360.yml`: M1 to M4, started by hand.
-- `varek/v1_4/tests/measure_v1360/node_cluster.sh`: the one-node kubeadm
+- `varek/v1_4/tests/node_cluster.sh` (moved there in step 2, as the matrix uses it too): the one-node kubeadm
   cluster (CRI-O or containerd, runc or crun).
 - `varek/v1_4/tests/measure_v1360/m1_cgroup.sh`, `m2_volume.sh`,
   `m3_spire.sh`, `m4_kvm.sh`: one measurement each, printing `MEASURE`

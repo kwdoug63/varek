@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# node_cluster.sh — v1.36 step 1 (tests/measure_v1360/README.md, M4a and
-# M4b): a one-node kubeadm cluster on this host, the systemd cgroup driver,
-# under CRI-O or containerd, then a plain pod run on it. Made for GitHub's
-# hosted runners (Ubuntu 24.04, systemd, cgroup v2): it stops the runner's
+# node_cluster.sh — a one-node kubeadm cluster on this host, the systemd
+# cgroup driver, under CRI-O or containerd, NRI on, then a plain pod run on
+# it. Made for v1.36 step 1 (tests/measure_v1360/README.md, M4a and M4b),
+# and the matrix's cluster since step 2 (.github/workflows/matrix.yml, D11
+# of docs/security/v1.36-kubernetes-parity.md). For GitHub's hosted runners
+# (Ubuntu 24.04, systemd, cgroup v2, amd64 or arm64): it stops the runner's
 # own Docker and containerd, turns swap off and installs packages, so it is
 # not for a machine anyone uses.
 #
-#   sudo -E varek/v1_4/tests/measure_v1360/node_cluster.sh --runtime crio --version 1.35 --oci runc [--out DIR]
-#   sudo -E varek/v1_4/tests/measure_v1360/node_cluster.sh --runtime containerd --version 2.2 [--k8s 1.35] [--out DIR]
+#   sudo -E varek/v1_4/tests/node_cluster.sh --runtime crio --version 1.35 --oci runc [--out DIR]
+#   sudo -E varek/v1_4/tests/node_cluster.sh --runtime containerd --version 2.2 [--k8s 1.35] [--out DIR]
 #
 # Prints MEASURE lines (and adds them to $GITHUB_STEP_SUMMARY). Exits 1 if
 # the cluster or the pod did not come up: for M4 that is the finding.
@@ -35,6 +37,8 @@ case "$OCI" in runc|crun) ;; *) echo "node_cluster.sh: --oci runc|crun" >&2; exi
 
 # The CRI-O project's package repository for one minor (its install guide,
 # github.com/cri-o/packaging). To be confirmed on the first run.
+# the release downloads' architecture (amd64, arm64)
+ARCH="$(dpkg --print-architecture)"
 CRIO_REPO="https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v$VERSION/deb/"
 K8S_REPO="https://pkgs.k8s.io/core:/stable:/v$K8S/deb/"
 FLANNEL="https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
@@ -83,8 +87,8 @@ a=[r['tag_name'][1:] for r in json.load(sys.stdin) if re.fullmatch(r'v\d+\.\d+\.
 v=[t for t in a if t.startswith('$K8S.')] or a
 v.sort(key=lambda s: [int(x) for x in s.split('.')]); print(v[-1] if v else '')")"
     [ -n "$v" ] || fail "no cri-tools release found"
-    curl -fsSL -o "$OUT/crictl.tgz" "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$v/crictl-v$v-linux-amd64.tar.gz" || fail "downloading crictl $v"
-    curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$v/crictl-v$v-linux-amd64.tar.gz.sha256" |
+    curl -fsSL -o "$OUT/crictl.tgz" "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$v/crictl-v$v-linux-$ARCH.tar.gz" || fail "downloading crictl $v"
+    curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$v/crictl-v$v-linux-$ARCH.tar.gz.sha256" |
         awk '{print $1}' > "$OUT/crictl.sha" || fail "crictl's checksum"
     [ "$(sha256sum "$OUT/crictl.tgz" | awk '{print $1}')" = "$(cat "$OUT/crictl.sha")" ] || fail "crictl's checksum does not match"
     run tar -C /usr/local/bin -xzf "$OUT/crictl.tgz" crictl || fail "unpacking crictl"
@@ -131,6 +135,10 @@ default_runtime = "$OCI"
 
 [crio.runtime.runtimes.$OCI]
 runtime_path = "$ociPath"
+
+# VAREK's plugin adjusts each container through NRI
+[crio.nri]
+enable_nri = true
 EOF
     run systemctl enable --now crio || fail "starting crio"
     SOCK=unix:///var/run/crio/crio.sock
@@ -144,8 +152,8 @@ else
 v=[r['tag_name'][1:] for r in json.load(sys.stdin) if re.fullmatch(r'v$VERSION\.\d+', r['tag_name'])]
 v.sort(key=lambda s: [int(x) for x in s.split('.')]); print(v[-1] if v else '')")"
     [ -n "$full" ] || fail "no containerd $VERSION release found"
-    curl -fsSL -o "$OUT/containerd.tgz" "https://github.com/containerd/containerd/releases/download/v$full/containerd-$full-linux-amd64.tar.gz" || fail "downloading containerd $full"
-    curl -fsSL "https://github.com/containerd/containerd/releases/download/v$full/containerd-$full-linux-amd64.tar.gz.sha256sum" |
+    curl -fsSL -o "$OUT/containerd.tgz" "https://github.com/containerd/containerd/releases/download/v$full/containerd-$full-linux-$ARCH.tar.gz" || fail "downloading containerd $full"
+    curl -fsSL "https://github.com/containerd/containerd/releases/download/v$full/containerd-$full-linux-$ARCH.tar.gz.sha256sum" |
         awk '{print $1}' > "$OUT/containerd.sha" || fail "containerd's checksum"
     [ "$(sha256sum "$OUT/containerd.tgz" | awk '{print $1}')" = "$(cat "$OUT/containerd.sha")" ] || fail "containerd's checksum does not match"
     run tar -C /usr/local -xzf "$OUT/containerd.tgz" || fail "unpacking containerd"
@@ -159,6 +167,18 @@ v.sort(key=lambda s: [int(x) for x in s.split('.')]); print(v[-1] if v else '')"
     grep -q 'SystemdCgroup = true' /etc/containerd/config.toml ||
         sed -i "/^ *\[plugins\.'io\.containerd\.cri\.v1\.runtime'\.containerd\.runtimes\.runc\.options\]/a\\            SystemdCgroup = true" /etc/containerd/config.toml
     grep -q 'SystemdCgroup = true' /etc/containerd/config.toml || fail "SystemdCgroup could not be set in containerd's config"
+    # NRI, through which VAREK's plugin adjusts each container: on in 2.x's
+    # default config, and kept on
+    python3 - /etc/containerd/config.toml <<'PY' || fail "NRI could not be turned on in containerd's config"
+import re, sys
+p = sys.argv[1]; s = open(p).read()
+m = re.search(r"^[ \t]*\[plugins\.'io\.containerd\.nri\.v1\.nri'\]\n((?:[ \t]*[^\s\[].*\n|[ \t]*\n)*)", s, re.M)
+if not m:
+    sys.exit(1)
+body = re.sub(r"^([ \t]+)disable = true", r"\1disable = false", m.group(1), flags=re.M)
+s = s[:m.start(1)] + body + s[m.end(1):]
+open(p, "w").write(s)
+PY
     run systemctl daemon-reload
     run systemctl enable --now containerd || fail "starting containerd"
     SOCK=unix:///run/containerd/containerd.sock
@@ -167,7 +187,7 @@ fi
 # CNI plugins (bridge, portmap, loopback) for flannel, from the project's releases
 cni="$(curl -fsSL https://api.github.com/repos/containernetworking/plugins/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
 install -d /opt/cni/bin
-curl -fsSL "https://github.com/containernetworking/plugins/releases/download/$cni/cni-plugins-linux-amd64-$cni.tgz" | tar -C /opt/cni/bin -xz || fail "the CNI plugins"
+curl -fsSL "https://github.com/containernetworking/plugins/releases/download/$cni/cni-plugins-linux-$ARCH-$cni.tgz" | tar -C /opt/cni/bin -xz || fail "the CNI plugins"
 
 # --- the cluster
 cat > "$OUT/kubeadm.yaml" <<EOF

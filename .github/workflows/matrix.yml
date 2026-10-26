@@ -1,0 +1,98 @@
+name: Matrix
+
+# v1.36 step 2 (docs/security/v1.36-kubernetes-parity.md, D11): the
+# platforms VAREK supports under Kubernetes, each a one-node cluster made by
+# kubeadm on a hosted runner itself (varek/v1_4/tests/node_cluster.sh: the
+# systemd cgroup driver, NRI on), with the node image built from this commit
+# and VAREK's Helm chart checked on it as kubernetes.yml checks it on kind
+# (varek/v1_4/tests/v1340_kind.sh --host):
+#   CRI-O 1.35, 1.36 and 1.37, each under runc and under crun, Kubernetes at
+#     CRI-O's own minor;
+#   containerd 2.2 and 2.3 with runc, `SystemdCgroup = true` (Amazon Linux
+#     2023's setting on EKS), Kubernetes 1.35.
+# kind, whose node images carry one containerd for each kind release, stays
+# in kubernetes.yml. The cells that need a host other than Ubuntu, or
+# SELinux enforcing, run for each release, in virtual machines on the
+# runner (step 2's second part).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "varek/**"
+      - "packaging/**"
+      - ".github/workflows/matrix.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "varek/**"
+      - "packaging/**"
+      - ".github/workflows/matrix.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cell:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: "CRI-O 1.35, runc", runtime: crio, version: "1.35", oci: runc}
+          - {name: "CRI-O 1.35, crun", runtime: crio, version: "1.35", oci: crun}
+          - {name: "CRI-O 1.36, runc", runtime: crio, version: "1.36", oci: runc}
+          - {name: "CRI-O 1.36, crun", runtime: crio, version: "1.36", oci: crun}
+          - {name: "CRI-O 1.37, runc", runtime: crio, version: "1.37", oci: runc}
+          - {name: "CRI-O 1.37, crun", runtime: crio, version: "1.37", oci: crun}
+          - {name: "containerd 2.2, runc", runtime: containerd, version: "2.2", oci: runc}
+          - {name: "containerd 2.3, runc", runtime: containerd, version: "2.3", oci: runc}
+    env:
+      OUT: ${{ github.workspace }}/cell
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
+      - name: Build the tools the test uses (the key and the certificate checker)
+        run: make -C varek/v1_4 tools/varek_keygen tools/vdp_cert_check
+      - name: Build the node image, and save it (the cluster stops the runner's Docker)
+        run: |
+          docker build -f packaging/container/Containerfile --target node -t varek-node:ci .
+          mkdir -p "$OUT"
+          docker save -o "$RUNNER_TEMP/varek-node.tar" varek-node:ci
+      - name: The host
+        run: |
+          uname -srm; stat -fc 'cgroup: %T' /sys/fs/cgroup; cat /sys/kernel/security/lsm; echo
+          systemctl --version | head -1
+      - name: The cluster
+        run: |
+          sudo -E env "PATH=$PATH" bash varek/v1_4/tests/node_cluster.sh --runtime "${{ matrix.runtime }}" \
+            --version "${{ matrix.version }}" --oci "${{ matrix.oci }}" --out "$OUT/cluster"
+          mkdir -p "$HOME/.kube"
+          sudo cp /etc/kubernetes/admin.conf "$HOME/.kube/config"
+          sudo chown "$(id -u):$(id -g)" "$HOME/.kube/config"
+      - name: The chart on the cluster
+        # the cluster's own kubectl (the cell's minor) ahead of the runner's
+        run: |
+          PATH="/usr/bin:$PATH" varek/v1_4/tests/v1340_kind.sh --host --image varek-node:ci \
+            --archive "$RUNNER_TEMP/varek-node.tar" --out "$OUT/chart"
+      - name: Keep the logs
+        if: always()
+        run: |
+          sudo mkdir -p "$OUT"
+          sudo journalctl -u crio -u containerd -u kubelet --no-pager 2>&1 | sudo tee "$OUT/journal.log" > /dev/null || true
+          sudo chmod -R a+rX "$OUT" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cell-${{ matrix.runtime }}-${{ matrix.version }}-${{ matrix.oci }}
+          path: ${{ github.workspace }}/cell

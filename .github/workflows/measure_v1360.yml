@@ -47,7 +47,7 @@ jobs:
         run: |
           uname -srm; stat -fc 'cgroup: %T' /sys/fs/cgroup; systemctl --version | head -1
       - name: The cluster (M4a)
-        run: sudo -E env "PATH=$PATH" bash "$M/node_cluster.sh" --runtime crio --version "${{ matrix.version }}" --oci "${{ matrix.oci }}" --out "$OUT"
+        run: sudo -E env "PATH=$PATH" bash varek/v1_4/tests/node_cluster.sh --runtime crio --version "${{ matrix.version }}" --oci "${{ matrix.oci }}" --out "$OUT"
       - name: M1, a sub-agent's group
         if: matrix.version == '1.35' && matrix.oci == 'runc'
         continue-on-error: true
@@ -89,7 +89,7 @@ jobs:
         run: |
           uname -srm; stat -fc 'cgroup: %T' /sys/fs/cgroup; systemctl --version | head -1
       - name: The cluster (M4b)
-        run: sudo -E env "PATH=$PATH" bash "$M/node_cluster.sh" --runtime containerd --version "${{ matrix.version }}" --out "$OUT"
+        run: sudo -E env "PATH=$PATH" bash varek/v1_4/tests/node_cluster.sh --runtime containerd --version "${{ matrix.version }}" --out "$OUT"
       - name: M1, a sub-agent's group
         if: matrix.version == '2.2'
         continue-on-error: true
