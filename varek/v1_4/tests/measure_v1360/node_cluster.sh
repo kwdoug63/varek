@@ -67,9 +67,11 @@ fail() {
 # cell got kubeadm 1.37.1 unpinned; the fourth run's single install with
 # cri-tools failed in every cell. crictl comes from apt if a repository has
 # it, else from the cri-tools project's release for that minor (or its newest).
+# The runner's image has a newer kubectl from apt, so pinning below it is a
+# downgrade, which apt refuses under -y unless allowed (the fifth run).
 k8s_install() {
     run apt-cache policy kubeadm kubelet kubectl cri-tools "$@"
-    run apt-get install -y "$@" "kubelet=$K8S.*" "kubeadm=$K8S.*" "kubectl=$K8S.*" ||
+    run apt-get install -y --allow-downgrades "$@" "kubelet=$K8S.*" "kubeadm=$K8S.*" "kubectl=$K8S.*" ||
         fail "installing ${*:+$* and }Kubernetes $K8S"
     command -v crictl > /dev/null && return 0
     run apt-get install -y cri-tools && command -v crictl > /dev/null && return 0
