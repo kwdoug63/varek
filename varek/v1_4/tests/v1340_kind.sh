@@ -103,7 +103,10 @@ trap cleanup EXIT
 echo "== 1. the cluster and the chart"
 if [ "$HOST" = 1 ]; then
     say "v1340_kind.sh --host $(TZ=America/Chicago date '+%Y-%m-%d %H:%M %Z'); $(uname -srm); image $IMAGE; commit $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
-    kubectl get node > /dev/null 2>&1 || { echo "v1340_kind.sh: no cluster here (KUBECONFIG?)" >&2; exit 1; }
+    # the API server can still be settling just after the cluster's own checks
+    for _ in $(seq 15); do kubectl get node > "$OUT/kubectl.log" 2>&1 && break; sleep 2; done
+    kubectl get node > "$OUT/kubectl.log" 2>&1 || { cat "$OUT/kubectl.log"; ls -l "${KUBECONFIG:-$HOME/.kube/config}";
+        echo "v1340_kind.sh: no cluster here (KUBECONFIG=${KUBECONFIG:-unset})" >&2; exit 1; }
     RT="$(kubectl get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}')"
     say "  node: $RT, kubelet $(kubectl get node -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}'), $(uname -r)"
     # The image, fully named: CRI-O does not resolve a short name in its own

@@ -81,8 +81,11 @@ jobs:
           sudo cp /etc/kubernetes/admin.conf "$HOME/.kube/config"
           sudo chown "$(id -u):$(id -g)" "$HOME/.kube/config"
       - name: The chart on the cluster
-        # the cluster's own kubectl (the cell's minor) ahead of the runner's
+        # the cluster's own kubectl (the cell's minor) ahead of the runner's,
+        # and the cluster's kubeconfig named
         run: |
+          export KUBECONFIG="$HOME/.kube/config"
+          ls -l "$KUBECONFIG"; /usr/bin/kubectl version --client 2>&1 | head -1
           PATH="/usr/bin:$PATH" varek/v1_4/tests/v1340_kind.sh --host --image varek-node:ci \
             --archive "$RUNNER_TEMP/varek-node.tar" --out "$OUT/chart"
       - name: Keep the logs
