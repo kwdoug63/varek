@@ -166,13 +166,19 @@ kubectl create namespace "$NS" > /dev/null
 kubectl label namespace "$NS" pod-security.kubernetes.io/enforce=privileged > /dev/null
 kubectl -n "$NS" create secret generic varek-node-key --from-file=key="$OUT/node.key" \
     --from-file=key.pub="$OUT/node.key.pub" > /dev/null
+# the chart's runtime (its default containerd): the node agent reads each
+# container's bundle from the runtime's state, mounted from the node (the
+# matrix's first CRI-O cells installed the default, mounted /run/containerd,
+# and every supervised container was refused: no config.json in its bundle)
+CHART_RT=containerd
+[ "$HOST" = 1 ] && case "$RT" in cri-o://*) CHART_RT=cri-o ;; esac
 REPO="${IMAGE%:*}" TAG="${IMAGE##*:}"
 [ "$REPO" = "$IMAGE" ] && TAG=latest
 check "the chart installs, its pods ready (the node agent, the plugin, the exporter, the webhook)" \
     helm install varek "$ROOT/packaging/helm/varek" -n "$NS" --wait --timeout 6m \
     --set image.repository="$REPO" --set image.tag="$TAG" --set image.pullPolicy=Never \
     --set signing.secretName=varek-node-key --set signing.checkpointEvery=8 --set anchor.enabled=true \
-    --set admission.replicas=1
+    --set admission.replicas=1 --set runtime="$CHART_RT"
 for _ in $(seq 60); do grep -q '^varek-nri: runtime' <(kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null) && break; sleep 2; done
 say "  plugin: $(kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null | grep -m1 '^varek-nri: runtime' || echo 'NOT registered')"
 check "the plugin registered with the node's runtime (NRI)" sh -c "kubectl -n '$NS' logs ds/varek-node -c plugin | grep -q '^varek-nri: runtime'"
