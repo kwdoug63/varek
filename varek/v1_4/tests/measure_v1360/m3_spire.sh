@@ -39,7 +39,11 @@ global:
   spire:
     trustDomain: $TD
     clusterName: measure
+spiffe-oidc-discovery-provider:
+  enabled: false
 spire-server:
+  persistence:
+    type: emptyDir
   controllerManager:
     identities:
       clusterSPIFFEIDs:
@@ -55,6 +59,23 @@ spire-agent:
   workloadAttestors:
     unix:
       enabled: true
+EOF
+# The sixth run: the server's claim stayed unbound (a kubeadm cluster has no
+# storage class), so the server never ran and nothing else came up. The
+# server's data goes in an emptyDir above; in case the chart still asks for
+# a claim, a volume on the node with no class binds it.
+"$KUBECTL" create namespace spire-mgmt >> "$LOG" 2>&1 || true
+install -d -m 0700 /var/lib/measure-spire
+"$KUBECTL" apply -f - >> "$LOG" 2>&1 <<EOF
+apiVersion: v1
+kind: PersistentVolume
+metadata: {name: measure-spire-data}
+spec:
+  capacity: {storage: 5Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: ""
+  hostPath: {path: /var/lib/measure-spire, type: Directory}
 EOF
 helm repo add spiffe https://spiffe.github.io/helm-charts-hardened/ >> "$LOG" 2>&1
 helm repo update >> "$LOG" 2>&1
