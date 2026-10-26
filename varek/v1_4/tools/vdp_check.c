@@ -192,6 +192,7 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < g_pol.n; i++)
             if (g_pol.rules[i].subagent[0]) printf("subagent %d %s\n", g_pol.rules[i].line, g_pol.rules[i].subagent);
         if (g_pol.require_obo) printf("require on-behalf-of\n");
+        if (g_pol.require_plan) printf("require plan\n");                 /* v1.35 step 4 */
         /* v1.31: the confined subjects, the rules for each, the MCP resources */
         for (size_t k = 0; k < g_pol.nsubjects; k++) {
             const vdp_rule_t *r = &g_pol.rules[g_pol.subjects[k].rule];

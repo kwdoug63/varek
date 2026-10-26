@@ -323,6 +323,151 @@ DRY_NEVER_LET = ("protected_object", "raw_device", "view_write_refused", "change
                  "subagent_env")                                        # v1.31 review
 
 
+def check_hold(meta, records, problems):
+    """v1.35 step 4 (D2): a run held to its plan (--hold-to-plan). run_start
+    names the plan and its SHA-256; a call refused as outside it (rule
+    outside_plan) is one the policy allowed (decision_raw ALLOW, refused
+    after), names the same plan, and appears only in a held run. True if the
+    run is held."""
+    rs = meta.get("run_start", {})
+    hold = rs.get("hold")
+    if hold is not None and not (isinstance(hold, dict) and isinstance(hold.get("plan"), str) and
+                                 isinstance(hold.get("plan_sha256"), str) and
+                                 re.fullmatch(r"[0-9a-f]{64}", hold.get("plan_sha256", ""))):
+        problems.append(f"run_start's hold {hold!r} is not one the Warden writes")
+        hold = None
+    for r in records:
+        if r.get("rule") != "outside_plan":
+            continue
+        if hold is None:
+            problems.append(f"seq {r.get('seq')}: an outside_plan refusal in a run not held to a plan")
+        elif r.get("decision_raw") != "ALLOW" or r.get("decision_final") != "DENY":
+            problems.append(f"seq {r.get('seq')}: an outside_plan record is not a refusal of a call the policy "
+                            f"allowed ({r.get('decision_raw')}/{r.get('decision_final')})")
+        elif r.get("plan") != hold.get("plan"):
+            problems.append(f"seq {r.get('seq')}: an outside_plan record names the plan {r.get('plan')!r}, "
+                            f"not the run's {hold.get('plan')!r}")
+    return hold is not None
+
+
+PLAN_VERDICTS = ("SATISFIED", "UNSATISFIED", "UNKNOWN")
+
+
+# step 9 (review): the reasons the basic gate gives on plan_gate (why) for a plan refused with no step
+# refused (pathology.c's suppression reasons)
+GATE_WHYS = ("cycle", "empty", "capacity", "edge_index")
+
+
+def gate_passed(r):
+    """the gate's record lets the agent start: SATISFIED, and under the flow
+    gate its breaker PASS"""
+    return isinstance(r, dict) and r.get("verdict") == "SATISFIED" and \
+        (r.get("gate") != "flow" or r.get("breaker") == "PASS")
+
+
+def check_plan_gate(meta, records, problems, plan_file=None, complete=True):
+    """v1.35 step 7: the plan gate's records (step 2, D9), with each other,
+    with the run and with its hold. A plan_step is a step not SATISFIED
+    (UNSATISFIED or UNKNOWN, with its reason), of the gate's plan, written
+    before the gate's record; a plan_gate (gate plan or flow) says the
+    verdict, once per gate, before any decision record. A refused plan
+    starts no agent (no decision record follows), and is refused for a step
+    it records (or a plan that could not be read); an authorized one records
+    no step. A held run passed the plan gate, on the plan it is held to, the
+    same file by its SHA-256. With plan_file, the plan's SHA-256 is that
+    file's. Returns the plan gate's record (or None)."""
+    rs = meta.get("run_start", {})
+    events = meta.get("plan_events", [])
+    gates, steps = {}, []
+    for before, r in events:
+        where = f"the {r.get('event')} record of plan {r.get('plan')!r}"
+        if before:
+            problems.append(f"{where} follows {before} decision record(s): the gate decides a plan before the "
+                            f"agent starts")
+        if not isinstance(r.get("plan"), str) or not r.get("plan"):
+            problems.append(f"{where} names no plan")
+        if r.get("event") == "plan_step":
+            if r.get("decision") not in ("UNSATISFIED", "UNKNOWN"):
+                problems.append(f"{where}: step {r.get('label')!r} recorded as {r.get('decision')!r} (a "
+                                f"plan_step is a step not SATISFIED)")
+            if not (isinstance(r.get("label"), str) and isinstance(r.get("kind"), str) and
+                    isinstance(r.get("why"), str) and isinstance(r.get("policy_line"), int)):
+                problems.append(f"{where}: a plan_step without its label, kind, deciding line and reason")
+            if "plan" in gates:
+                problems.append(f"{where}: step {r.get('label')!r} after the gate's verdict")
+            steps.append(r)
+            continue
+        g = r.get("gate")
+        if g not in ("plan", "flow"):
+            problems.append(f"{where}: gate {g!r} is not one the Warden has")
+            continue
+        if g in gates:
+            problems.append(f"{where}: a second {g} gate in one run")
+        if r.get("verdict") not in PLAN_VERDICTS:
+            problems.append(f"{where}: verdict {r.get('verdict')!r}")
+        sha = r.get("plan_sha256")
+        if sha is not None and not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
+            problems.append(f"{where}: plan_sha256 {sha!r} is not a SHA-256")
+        elif sha is None and "error" not in r and _version_at_least(rs.get("warden"), (1, 35)):
+            problems.append(f"{where}: no plan_sha256 (the Warden records the plan's SHA-256 from 1.35)")
+        if r.get("why") is not None and r.get("why") not in GATE_WHYS:
+            problems.append(f"{where}: why {r.get('why')!r} is not a reason the gate gives")
+        gates[g] = r
+    # step 9 (review): the flow gate (--flow-policy) writes plan_step records too, and its own plan_gate
+    gate = gates.get("plan") or gates.get("flow")
+    # step 9 (review): a stream cut before the gate's record (--allow-incomplete), no decision after it
+    cut = not complete and gate is None and not records
+    if steps and gate is None and not cut:
+        problems.append(f"{len(steps)} plan_step record(s) and no plan gate's verdict")
+    if gate is not None:
+        own = [s for s in steps if s.get("plan") == gate.get("plan")]
+        if len(own) != len(steps):
+            problems.append("a plan_step record names a plan other than the gate's")
+        if isinstance(gate.get("actions"), int) and len(steps) > gate["actions"]:
+            problems.append(f"{len(steps)} plan_step records for a plan of {gate['actions']} step(s)")
+        if gate.get("verdict") == "SATISFIED" and steps:
+            problems.append(f"the plan was authorized, and {len(steps)} of its steps are recorded as not "
+                            f"SATISFIED")
+        if gate.get("verdict") in ("UNSATISFIED", "UNKNOWN"):
+            # the reason: a step, the parser's error, the plan's structure (step 9: why, a cycle), or
+            # under the flow gate its flow axis (its steps all SATISFIED)
+            if not steps and "error" not in gate and gate.get("why") not in GATE_WHYS and \
+                    not (gate.get("gate") == "flow" and gate.get("node_axis") == "SATISFIED"):
+                problems.append("the plan was refused, and no step of it is recorded as the reason")
+    for g, r in gates.items():
+        if not gate_passed(r) and records:
+            problems.append(f"the {g} gate refused the plan ({r.get('verdict')}"
+                            f"{', breaker ' + str(r.get('breaker')) if g == 'flow' else ''}), and the stream "
+                            f"holds {len(records)} decision record(s): a refused plan starts no agent")
+    hold = rs.get("hold") if isinstance(rs.get("hold"), dict) else None
+    if hold is not None:
+        if gate is None:
+            if not cut:
+                problems.append("the run is held to a plan, and no plan gate decided it")
+        else:
+            if gate.get("plan") != hold.get("plan"):
+                problems.append(f"the run is held to {hold.get('plan')!r}, the gate decided {gate.get('plan')!r}")
+            if gate.get("plan_sha256") and gate.get("plan_sha256") != hold.get("plan_sha256"):
+                problems.append(f"the plan held to (SHA-256 {hold.get('plan_sha256')}) is not the plan the gate "
+                                f"decided ({gate.get('plan_sha256')}): it changed between the two")
+    if plan_file is not None:
+        try:
+            with open(plan_file, "rb") as fh:
+                want = hashlib.sha256(fh.read()).hexdigest()
+        except OSError as e:
+            problems.append(f"cannot read the plan {plan_file}: {e.strerror}")
+            want = None
+        got = (gate or {}).get("plan_sha256") or (hold or {}).get("plan_sha256")
+        if want is not None:
+            if gate is None and hold is None:
+                problems.append(f"--plan {plan_file}: the run decided no plan")
+            elif got is None:
+                problems.append(f"--plan {plan_file}: the stream records no SHA-256 of its plan to compare")
+            elif got != want:
+                problems.append(f"the plan {plan_file} hashes to {want}, the run's plan to {got}")
+    return gate
+
+
 def check_dry(meta, records, problems):
     """v1.29 (section 5, D10): a dry run's stream. True if it is one.
 
@@ -335,6 +480,16 @@ def check_dry(meta, records, problems):
     dry = rs.get("mode") == "dry_run"
     if rs.get("mode") not in (None, "dry_run"):
         problems.append(f"run_start's mode {rs.get('mode')!r} is not one the Warden writes")
+    # v1.33.0: the architecture the Warden ran on (written from v1.33.0; open
+    # flags are recorded in VAREK's encoding, x86_64's, on both)
+    if "arch" in rs and rs.get("arch") not in ("x86_64", "aarch64"):
+        problems.append(f"run_start's arch {rs.get('arch')!r} is not one the Warden writes")
+    elif "arch" not in rs and _version_at_least(rs.get("warden"), (1, 33)):
+        problems.append(f"run_start names the Warden {rs.get('warden')!r}, which records its architecture, "
+                        f"but has none")
+    elif "arch" in rs and not _version_at_least(rs.get("warden"), (1, 33)):
+        problems.append(f"run_start records an architecture, but names the Warden {rs.get('warden')!r}, "
+                        f"which records none")
     end = [meta["run_end"]] if isinstance(meta.get("run_end"), dict) else []
     if end and end[-1].get("mode") != rs.get("mode"):
         problems.append(f"run_end's mode {end[-1].get('mode')!r} is not run_start's {rs.get('mode')!r}")
@@ -792,7 +947,9 @@ EXEC_REFUSALS = ("policy_match", "default_deny_unknown", "certificate_refused", 
                  "subagent_env",
                  # v1.31 (the shared soak): a launch after the run was revoked (checked
                  # against the revocation with every other call refused as revoked)
-                 "revoked")
+                 "revoked",
+                 # v1.35 step 9 (review): a launch the policy allows and the run's plan does not name
+                 "outside_plan")
 SUBAGENT_REFUSALS = ("subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed", "subagent_env")
 EXEC_RESULTS = ("launched", "failed", "gone", "killed")
 
@@ -894,6 +1051,9 @@ def check_launches(checker, policy, rules, meta, records, complete, problems):
                             f"{r.get('decision_raw')!r}")
         elif rule == "exec_identity_mismatch":
             pass
+        elif rule == "outside_plan" and r.get("decision_raw") != "ALLOW":    # v1.35 step 9 (review)
+            problems.append(f"seq {seq}: a launch refused as outside the plan, which follows only a decision "
+                            f"to allow it, but the decision was {r.get('decision_raw')!r}")
         elif rule not in EXEC_REFUSALS:
             problems.append(f"seq {seq}: a launch refused with rule {rule!r}, not one the Warden writes")
     allowed = [r for r in launches if r.get("rule") == "exec_allowed"]
@@ -971,7 +1131,8 @@ HANDOFF_OTHER_RULES = ("already_connected", "socket_option_failed", "too_many_pe
 # v1.26 review: the rules of a proxied decision the Warden refused
 PROXY_REFUSE_RULES = ("policy_match", "default_deny_unknown", "fragment_escape_flags",
                       "fragment_escape_length", "certificate_refused", "wildcard_budget",
-                      "resolution_failed", "address_refused", "run_ended", "revoked")   # v1.28: revoked
+                      "resolution_failed", "address_refused", "run_ended", "revoked",   # v1.28: revoked
+                      "outside_plan")       # v1.35 step 8: a held run's connection the plan names not (check_hold)
 # v1.26 (step 6): the Warden's decision on what the proxy read, when it allowed
 PROXY_ALLOW_RULES = ("proxy_dialed", "proxy_dial_failed")
 PROXY_KINDS = ("tls", "http", "connect")
@@ -1144,6 +1305,8 @@ def policy_identity(checker, policy):
             sub[int(f[1])] = f[2]
         elif line == "require on-behalf-of":
             req = True
+        elif line == "require plan":
+            pass                                   # v1.35 step 4b: policy_requires_plan reads it
         elif f[0] == "mcp-resource" and len(f) == 3:                  # v1.31
             mres[f[1]] = None if f[2] == "-" else f[2]
         elif f[0] in ("confined", "for") and len(f) in (3, 6):
@@ -1151,6 +1314,15 @@ def policy_identity(checker, policy):
         elif line.strip():
             raise ValueError(f"an unexpected line from the checker: {line!r}")
     return iss, dom, sub, req, mres
+
+
+def policy_requires_plan(checker, policy):
+    """v1.35 step 4b (D7): whether the policy says `require plan`, as the
+    checker reads it (`identity`)"""
+    q = subprocess.run([checker, policy, "identity"], capture_output=True, text=True)
+    if q.returncode != 0:
+        raise ValueError(q.stderr.strip() or "the checker has no identity mode")
+    return "require plan" in q.stdout.splitlines()
 
 
 def policy_confined(checker, policy):
@@ -1452,7 +1624,28 @@ def check_chain(ident, meta, records, run, problems):
     for tag, (line, _) in settled.items():
         if tag not in started or started[tag][0] > line:
             problems.append(f"sub-agent {tag} settled, but no launch started it before")
+    # a launched sub-agent with no decision of its own counts too (0)
+    for tag in started:
+        if tag not in settled or settled[tag][1] != "failed":
+            count.setdefault(tag, 0)
     return count
+
+
+def chain_summary(per_sub):
+    """v1.30: the sub-agents by name, as the chain line shows them: how many
+    were launched and how many decisions they had, with the range per launch
+    when it varies (a 24-hour run launches hundreds of each)."""
+    by = {}
+    for tag, n in per_sub.items():
+        by.setdefault(tag.rsplit("#", 1)[0], []).append(n)
+    out = []
+    for name in sorted(by):
+        ns = by[name]
+        each = f"{ns[0]} each" if min(ns) == max(ns) else f"{min(ns)} to {max(ns)} each"
+        out.append(f"{name} {len(ns)} launch{'es' if len(ns) != 1 else ''}, "
+                   f"{sum(ns)} decision{'s' if sum(ns) != 1 else ''}"
+                   f"{f' ({each})' if len(ns) > 1 else ''}")
+    return "; ".join(out) if out else "none"
 
 
 def check_credentials(creds, cred_rules, meta, records, complete, problems, notes, auds=None):
@@ -1706,7 +1899,8 @@ def check_dialed_denies(checker, policy, rules, dialed, problems):
 REQUEST_REFUSE_RULES = ("policy_match", "default_deny_unknown", "certificate_refused", "max_body",
                         "fragment_escape_length", "revoked",       # v1.28: revoked
                         "mcp_query",                               # v1.31: a POST to an MCP endpoint with a query
-                        "mcp_endpoint_variant")                    # review: to another spelling of one
+                        "mcp_endpoint_variant",                    # review: to another spelling of one
+                        "outside_plan")                            # v1.35 step 8: a held run (check_hold)
 
 # v1.31 (section 3): an MCP call's refusals (net.mcp): by the policy, or a
 # call the proxy could not read (mcp_unreadable), whose Mcp-Method or
@@ -1716,7 +1910,8 @@ MCP_REFUSE_RULES = ("policy_match", "default_deny_unknown", "certificate_refused
                     "fragment_escape_length", "revoked", "mcp_unreadable", "mcp_header_mismatch",
                     # step 5: the agent's own bearer token (D6), a credential past its expiry
                     "mcp_token_user", "mcp_token_audience", "mcp_token_expired", "mcp_token_malformed",
-                    "credential_expired")
+                    "credential_expired",
+                    "outside_plan")         # v1.35 step 8: a held run's call no step names (check_hold)
 MCP_TOKEN_KINDS = ("placeholder", "jwt", "opaque", "malformed")
 MCP_BODY_DEFAULT = 1 << 20                 # an mcp rule without max_body=
 
@@ -2186,7 +2381,8 @@ def check_proxied(records, resolutions, handoff_all, problems, upstream=None, di
         if passthrough is not None:
             should = name not in passthrough
             if insp != (should and rule not in ("policy_match", "default_deny_unknown", "certificate_refused",
-                                                "fragment_escape_flags", "fragment_escape_length")):
+                                                "fragment_escape_flags", "fragment_escape_length",
+                                                "outside_plan")):     # v1.35 step 8: refused, not inspected
                 problems.append(f"seq {seq}: in inspecting mode, {name} was {'' if insp else 'not '}inspected, "
                                 f"which {'only a host that is not passthrough is' if insp else 'it must be'}")
                 continue
@@ -3081,6 +3277,8 @@ def main(argv=None):
     ap.add_argument("--anchor", help="the Warden's --anchor file: the stream's signed records "
                     "must match it")
     ap.add_argument("--run", help="the run id the stream must carry (run_start's \"run\")")
+    ap.add_argument("--plan", help="v1.35: the plan file the run was given: its SHA-256 must be the "
+                    "one the plan gate (or the hold) recorded")
     def seconds(v):
         try:
             x = float(v)
@@ -3174,6 +3372,8 @@ def main(argv=None):
     check_open_as(meta, openas_policy, problems)                     # v1.29
     check_baseline(meta, a.policy, problems)
     dry_run = check_dry(meta, records, problems)
+    check_hold(meta, records, problems)                                   # v1.35 step 4
+    plan_gate = check_plan_gate(meta, records, problems, a.plan, complete)    # v1.35 step 7
     try:
         check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, problems, records)   # v1.27.1
         check_noexec_exec(meta, policy_rules(a.checker, a.policy), openas_policy, problems)          # v1.29
@@ -3602,6 +3802,11 @@ def main(argv=None):
         problems.append(f"checker failed on the policy's identities: {e}")
         ident = ({}, {}, {}, False, {})
     per_sub = check_chain(ident, meta, records, run, problems)
+    try:                                                                                   # v1.35 step 4b
+        if policy_requires_plan(a.checker, a.policy) and not isinstance(meta.get("run_start", {}).get("hold"), dict):
+            problems.append("the policy says `require plan`, and run_start holds the run to no plan")
+    except (OSError, ValueError) as e:
+        problems.append(f"checker failed on the policy's identities: {e}")
     try:                                                                                   # v1.31 (section 6)
         confined6, forl6 = policy_confined(a.checker, a.policy)
     except ValueError as e:
@@ -3638,11 +3843,21 @@ def main(argv=None):
         ob_ = meta.get("run_start", {}).get("on_behalf_of")
         u = ob_.get("user") if isinstance(ob_, dict) else None
         who = f"on behalf of {u.get('subject')} ({u.get('issuer')})" if isinstance(u, dict) else "no user"
-        subs = ", ".join(f"{t} {n}" for t, n in sorted(per_sub.items())) if per_sub else "none"
-        print(f"varek_audit: chain: {who}; sub-agents (decisions): {subs}")
+        print(f"varek_audit: chain: {who}; sub-agents: {chain_summary(per_sub)}")
+    if plan_gate is not None:                                                             # v1.35 step 7
+        hold_ = meta.get("run_start", {}).get("hold")
+        nout = sum(1 for r in records if r.get("rule") == "outside_plan")
+        nsteps = sum(1 for _, e in meta.get("plan_events", []) if e.get("event") == "plan_step")
+        print(f"varek_audit: plan: {plan_gate.get('plan')} ({plan_gate.get('actions')} steps"
+              f"{', SHA-256 ' + plan_gate['plan_sha256'] if isinstance(plan_gate.get('plan_sha256'), str) else ''}): "
+              f"{plan_gate.get('verdict')}"
+              f"{f', {nsteps} step(s) not SATISFIED' if nsteps else ''}; "
+              f"{f'held to it, {nout} call(s) refused outside it' if isinstance(hold_, dict) and gate_passed(plan_gate) else 'to be held to it, but refused' if isinstance(hold_, dict) else 'not held to it'}")
     for n_ in cnotes:
         print(f"varek_audit: note: {n_}")
     print(f"varek_audit: integrity: {integrity}")
+    if isinstance(meta.get("run_start", {}).get("arch"), str):                          # v1.33.0
+        print(f"varek_audit: architecture: {meta['run_start']['arch']}")
     t0 = meta.get("run_start", {}).get("timestamp_ns")
     if isinstance(t0, int):
         import datetime

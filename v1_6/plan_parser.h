@@ -8,6 +8,7 @@
  *
  * File format (line-oriented, # comments, blank lines ignored):
  *
+ *   plan   1.35                                  (v1.35, optional, first)
  *   action <label> <kind> <target> [<key>=<value> ...]
  *   edge   <from_label> <to_label>
  *
@@ -46,6 +47,7 @@
 #include "plan_spec.h"
 
 #include <stddef.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -70,6 +72,13 @@ plan_parsed_t *plan_parser_load(const char *path,
                                 char       *err_buf,
                                 size_t      err_buf_len);
 
+/* v1.35 step 9: the same, from an open stream, which it closes; path names
+ * the plan in messages. */
+plan_parsed_t *plan_parser_load_stream(FILE       *fp,
+                                       const char *path,
+                                       char       *err_buf,
+                                       size_t      err_buf_len);
+
 /* Borrow the parsed spec. Pointer is valid until plan_parser_free()
  * is called on the parent handle. Returns NULL on a NULL handle. */
 const plan_spec_t *plan_parser_spec(const plan_parsed_t *parsed);
@@ -83,6 +92,11 @@ size_t plan_parser_edge_count  (const plan_parsed_t *parsed);
  * of range. Valid until plan_parser_free(). */
 const plan_spec_field_t *plan_parser_fields(const plan_parsed_t *parsed, size_t action_idx,
                                             size_t *n_out);
+
+/* v1.35 (D3): the plan's format: 135 for a plan whose first line is
+ * `plan 1.35`, 0 for one without (read as through v1.34). The parser
+ * refuses another version, and `plan` anywhere but first. */
+int plan_parser_version(const plan_parsed_t *parsed);
 
 /* Release all storage owned by the handle. NULL-safe. */
 void plan_parser_free(plan_parsed_t *parsed);

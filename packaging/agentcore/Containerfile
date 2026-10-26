@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+#
+# The AgentCore Runtime probe (v1.35 step 1, D8): an HTTP server on port 8080
+# that answers AgentCore Runtime's /ping and /invocations, each invocation
+# answered with what the container holds. See packaging/agentcore/README.md.
+#
+# By default the probe stands alone (Python's standard library and libc):
+# the facts D8 needs are measured without the Warden. AgentCore Runtime's
+# default compute takes arm64. From the repository's root:
+#
+#   docker build --platform linux/arm64 -f packaging/agentcore/Containerfile -t varek-agentcore-probe:1 .
+#
+# With VAREK's own image as BASE (built for arm64; the Warden builds there
+# from v1.35, its port taken from the macOS branch), the report also has
+# `varek doctor` and a run under the Warden:
+#
+#   docker build --platform linux/arm64 -f packaging/container/Containerfile -t varek:arm64 .
+#   docker build --platform linux/arm64 --build-arg BASE=varek:arm64 \
+#       -f packaging/agentcore/Containerfile -t varek-agentcore-probe:2 .
+ARG BASE=public.ecr.aws/docker/library/python:3.12-slim
+FROM ${BASE}
+COPY packaging/agentcore/probe_server.py /opt/varek/agentcore_probe.py
+EXPOSE 8080
+WORKDIR /tmp
+ENTRYPOINT ["python3", "/opt/varek/agentcore_probe.py"]

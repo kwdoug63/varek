@@ -16,23 +16,44 @@ import (
 	"varek.dev/varek-k8s/internal/kube"
 )
 
-// a stand-in for the Warden: it refuses a policy holding "bad"
+// a stand-in for the Warden: it refuses a policy holding "bad"; v1.35: a
+// plan holding "mcp_call" (--plan), and --no-plan for a policy holding
+// "require plan"
 const fakeWarden = `#!/bin/sh
 grep -q bad "$1" && { echo "[warden] policy $1:2: a bad line" >&2; exit 1; }
 [ "$2" = --oci-filter ] || exit 2
+case "$3" in
+  --plan) grep -q mcp_call "$4" && { echo "[warden] --oci-filter: the plan $4: the node agent does not carry mcp_call steps yet (step m)" >&2; exit 1; } ;;
+  --no-plan) grep -q 'require plan' "$1" && { echo "[warden] --oci-filter: the policy says require plan: a pod under it names its plan (varek.dev/plan)" >&2; exit 1; } ;;
+  "") ;;
+  *) exit 2 ;;
+esac
 echo '{}'
 `
 
-type fakeAPI map[string]string // "ns/name" -> policy text
+type fakeAPI map[string]string // "ns/name" -> policy text; "plan:ns/name" -> plan text (v1.35)
 
-func (f fakeAPI) GetPolicy(_ context.Context, ns, name string) (*kube.Policy, error) {
-	t, ok := f[ns+"/"+name]
+func (f fakeAPI) get(key, ns, name string, plan bool) (*kube.Policy, error) {
+	t, ok := f[key]
 	if !ok {
 		return nil, nil
 	}
 	p := &kube.Policy{}
-	p.Metadata.Namespace, p.Metadata.Name, p.Spec.Policy = ns, name, t
+	p.Metadata.Namespace, p.Metadata.Name = ns, name
+	if plan {
+		p.Spec.Plan = t
+	} else {
+		p.Spec.Policy = t
+	}
 	return p, nil
+}
+
+func (f fakeAPI) GetPolicy(_ context.Context, ns, name string) (*kube.Policy, error) {
+	return f.get(ns+"/"+name, ns, name, false)
+}
+
+func (f fakeAPI) GetPlan(_ context.Context, ns, name string) (*kube.Policy, error) {
+	return f.get("plan:"+ns+"/"+name, ns, name, true)
 }
 
 func testServer(t *testing.T, warden string) *server {
@@ -46,6 +67,11 @@ func testServer(t *testing.T, warden string) *server {
 		"team-a/agent":  "allow path /tmp/\n",
 		"team-a/launch": "require warden 1.29\nallow path /tmp/\nallow exec /bin/true\n",
 		"team-a/broken": "allow path /tmp/\nbad\n",
+		// v1.35 step 4c
+		"team-a/needs":     "require warden 1.35\nrequire plan\nallow path /tmp/\n",
+		"team-a/held":      "require warden 1.35\nallow path /tmp/\n", // step 9: a plan needs a 1.35 policy
+		"plan:team-a/p1":   "plan 1.35\naction a file_open /tmp/x\n",
+		"plan:team-a/pmcp": "plan 1.35\naction m mcp_call http://10.0.0.1/mcp\n",
 	}, "runc, crun")
 }
 
@@ -249,6 +275,93 @@ func TestRealWarden(t *testing.T) {
 		{"credentials, which the node agent does not carry yet", "require warden 1.28\nproxy on\ncredential k from file:/etc/varek/creds/k\nallow host api.example.com:443\n", "does not carry credentials"},
 	} {
 		ok, msg := post(t, s, "/varekpolicy", "team-a", vp("agent", c.text))
+		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
+			t.Errorf("%s: allowed %v, %q", c.what, ok, msg)
+		}
+	}
+	// v1.35 step 4c: plans, as the Warden reads them
+	for _, c := range []struct {
+		what, text, why string
+	}{
+		{"a plan it reads", "plan 1.35\naction a file_open /tmp/x open=read\n", ""},
+		{"one it does not", "plan 1.36\n", "refuses this plan"},
+		{"an mcp_call step, which the node agent does not carry yet", "plan 1.35\naction m mcp_call http://10.0.0.1:8080/mcp\n",
+			"does not carry mcp_call steps yet (step m)"},
+	} {
+		ok, msg := post(t, s, "/varekplan", "team-a", vplan("p1", c.text))
+		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
+			t.Errorf("%s: allowed %v, %q", c.what, ok, msg)
+		}
+	}
+	if ok, msg := post(t, s, "/pod", "team-a", agentPod("needs", nil)); ok || !strings.Contains(msg, "names its plan (varek.dev/plan)") {
+		t.Errorf("`require plan`, a pod naming no plan: allowed %v, %q", ok, msg)
+	}
+}
+
+// v1.35 step 4c (D11): a VarekPlan, and a pod's plan with its policy
+func vplan(name, text string) map[string]interface{} {
+	return map[string]interface{}{"metadata": map[string]string{"name": name, "namespace": "team-a"},
+		"spec": map[string]string{"plan": text}}
+}
+
+func TestVarekPlan(t *testing.T) {
+	s := testServer(t, "")
+	for _, c := range []struct {
+		what, name, text, why string
+	}{
+		{"a plan the Warden reads", "p1", "plan 1.35\naction a file_open /tmp/x\n", ""},
+		{"a name the node agent does not take", "P_1", "plan 1.35\n", "is not 1 to 63"},
+		{"an empty plan", "p1", " \n", "the plan is empty"},
+		{"a step the node agent does not carry", "p1", "plan 1.35\naction m mcp_call http://10.0.0.1/mcp\n",
+			"refuses this plan: --oci-filter: the plan: the node agent does not carry mcp_call steps yet"},
+	} {
+		ok, msg := post(t, s, "/varekplan", "team-a", vplan(c.name, c.text))
+		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
+			t.Errorf("%s: allowed %v, %q", c.what, ok, msg)
+		}
+	}
+}
+
+func TestPodPlan(t *testing.T) {
+	s := testServer(t, "")
+	withPlan := func(policy, plan string) pod {
+		p := agentPod(policy, nil)
+		if p.Metadata.Annotations == nil {
+			p.Metadata.Annotations = map[string]string{}
+		}
+		p.Metadata.Annotations[planAnnotation] = plan
+		return p
+	}
+	for _, c := range []struct {
+		what string
+		p    pod
+		why  string
+	}{
+		{"a pod with its plan", withPlan("held", "p1"), ""},
+		{"a plan under a policy before 1.35 (a node before 1.35 would not hold it)", withPlan("agent", "p1"),
+			"does not say `require warden 1.35`"},
+		{"`require plan`, the pod's plan named", withPlan("needs", "p1"), ""},
+		{"`require plan`, no plan named", agentPod("needs", nil), "refuses its policy needs: --oci-filter: the policy says require plan"},
+		{"no such plan in the namespace", withPlan("held", "nosuch"), "no VarekPlan nosuch in namespace team-a"},
+		{"a plan name that is not one", withPlan("held", "P_1"), "its plan name \"P_1\""},
+		{"a plan the Warden refuses with the policy", withPlan("held", "pmcp"), "refuses its policy held with its plan pmcp"},
+		{"a plan and no policy", withPlan("", "p1"), "names a plan (varek.dev/plan) and no policy"},
+	} {
+		ok, msg := post(t, s, "/pod", "team-a", c.p)
+		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
+			t.Errorf("%s: allowed %v, %q", c.what, ok, msg)
+		}
+	}
+	for _, c := range []struct {
+		what     string
+		old, new pod
+		why      string
+	}{
+		{"the plan unchanged", withPlan("agent", "p1"), withPlan("agent", "p1"), ""},
+		{"the plan changed", withPlan("agent", "p1"), withPlan("agent", "p2"), "varek.dev/plan annotation is set when the pod is created"},
+		{"the plan added", agentPod("agent", nil), withPlan("agent", "p1"), "varek.dev/plan annotation is set when the pod is created"},
+	} {
+		ok, msg := postOp(t, s, "/pod", "team-a", "UPDATE", c.new, c.old)
 		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
 			t.Errorf("%s: allowed %v, %q", c.what, ok, msg)
 		}

@@ -24,6 +24,13 @@
  * command, connects to addresses. Refused at the start (step 5 names them,
  * and the webhook refuses them at deploy), not carried in v1.34.0:
  * credentials, the on-behalf-of chain and sub-agents, plans and the dry run.
+ * v1.35 step 4c (D11) carries plans: a pod's plan by the name it gives
+ * (varek.dev/plan), as POLICY_DIR/<namespace>/<name>.plan, held to the
+ * plugin's SHA-256 of it and copied beside the stream as the policy is; it
+ * is decided in the container's view once run_start is written (a step of a
+ * kind the node agent does not carry, mcp_call, subagent or credential, is
+ * UNKNOWN, so its plan is refused), and the run is held to it (D2). A
+ * policy that says `require plan` runs no container whose pod names none.
  *
  * Step 4 (D5): the pod's network. Host-name rules and the egress proxy are
  * carried: the names are resolved from the pod's network namespace through
@@ -230,17 +237,62 @@ static int node_policy(const char *doc, size_t n, const char **policy_path, char
     return 0;
 }
 
+/* v1.35 step 4c (D11): the pod's plan, by the name its pod gives
+ * (varek.dev/plan, copied by the NRI plugin to the container's annotations),
+ * as POLICY_DIR/<pod's namespace>/<name>.plan, where the plugin writes each
+ * namespace's VarekPlan resources; held to the SHA-256 of the plan the
+ * plugin checked the policy with (varek.dev/plan-sha256). A pod naming no
+ * plan: *plan_path stays NULL. 0, or -1 with why. */
+static int node_plan(const char *doc, size_t n, const char **plan_path, char *why, size_t wn) {
+    const char *pp[] = { "state", "annotations", "varek.dev/plan" }, *v;
+    const char *ph[] = { "state", "annotations", "varek.dev/plan-sha256" };
+    size_t vn;
+    g_nr.plan[0] = g_nr.plan_sha[0] = '\0';
+    if (nj_find(doc, n, pp, 3, &v, &vn) < 0) return 0;
+    if (nj_string(v, vn, g_nr.plan, sizeof g_nr.plan) < 0 || !node_label(g_nr.plan)) {
+        g_nr.plan[0] = '\0';
+        snprintf(why, wn, "the container's plan name (varek.dev/plan) is not 1 to 63 of a-z, 0-9 and -");
+        return -1;
+    }
+    if (!g_node_policies) {
+        snprintf(why, wn, "the container names a plan, and this node agent has one policy, not a directory of "
+                 "policies and plans");
+        return -1;
+    }
+    bool hex = nj_find(doc, n, ph, 3, &v, &vn) == 0 && nj_string(v, vn, g_nr.plan_sha, sizeof g_nr.plan_sha) == 0 &&
+               strlen(g_nr.plan_sha) == 64;
+    for (size_t k = 0; hex && k < 64; k++) hex = strchr("0123456789abcdef", g_nr.plan_sha[k]) != NULL;
+    if (!hex) {
+        g_nr.plan_sha[0] = '\0';
+        snprintf(why, wn, "the container names a plan, and was not given its filter by VAREK's NRI plugin with it "
+                 "(no varek.dev/plan-sha256 of 64 hex digits)");
+        return -1;
+    }
+    static char path[PATH_MAX];
+    struct stat st;
+    snprintf(path, sizeof path, "%s/%s/%s.plan", g_node_policies, g_nr.pod_ns, g_nr.plan);
+    int e = lstat(path, &st) < 0 ? errno : 0;
+    if (e || !S_ISREG(st.st_mode)) {
+        snprintf(why, wn, "no plan named %s (%.300s: %s)", g_nr.plan, path, e ? strerror(e) : "not a file");
+        return -1;
+    }
+    *plan_path = path;
+    return 0;
+}
+
 /* v1.34 step 5 (D8): the policy the container runs under, copied beside its
  * stream (DIR/<container>.<supervisor>.policy, root's, read-only) and loaded
  * from there, so the run's evidence holds the policy as it was, whatever the
  * cluster's resource becomes; its SHA-256 must be the one the plugin wrote
- * the filter for. *policy_path becomes the copy. 0, or -1 with why. */
-static int node_policy_copy(int sd, const char *streams, const char *base, const char **policy_path,
-                            char *why, size_t wn) {
+ * the filter for. *policy_path becomes the copy. 0, or -1 with why.
+ * v1.35 step 4c (D11): the pod's plan the same (what "plan", ext ".plan",
+ * want the plugin's SHA-256 of the plan). */
+static int node_copy(int sd, const char *streams, const char *base, const char *what, const char *ext,
+                     const char *want, const char **policy_path, char *why, size_t wn) {
     int src = open(*policy_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     struct stat st;
     if (src < 0 || fstat(src, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size > (8 << 20)) {
-        snprintf(why, wn, "cannot read the policy %.300s (%s)", *policy_path,
+        snprintf(why, wn, "cannot read the %s %.300s (%s)", what, *policy_path,
                  src < 0 ? strerror(errno) : "not a file of at most 8 MiB");
         if (src >= 0) close(src);
         return -1;
@@ -252,29 +304,30 @@ static int node_policy_copy(int sd, const char *streams, const char *base, const
     close(src);
     if (!b || r < 0 || n > (size_t)st.st_size) {
         free(b);
-        snprintf(why, wn, "cannot read the policy %.300s whole", *policy_path);
+        snprintf(why, wn, "cannot read the %s %.300s whole", what, *policy_path);
         return -1;
     }
     unsigned char h[crypto_hash_sha256_BYTES];
     char hex[65];
     crypto_hash_sha256(h, (const unsigned char *)b, n);
     sodium_bin2hex(hex, sizeof hex, h, sizeof h);
-    if (g_nr.policy_sha[0] && strcmp(hex, g_nr.policy_sha)) {
+    if (want[0] && strcmp(hex, want)) {
         free(b);
-        snprintf(why, wn, "the policy %.300s is not the one the NRI plugin wrote the container's filter for "
+        snprintf(why, wn, "the %s %.300s is not the one the NRI plugin wrote the container's filter for "
                  "(SHA-256 %.16s..., the plugin's %.16s...): it changed between them; the container is to be "
-                 "created again", *policy_path, hex, g_nr.policy_sha);
+                 "created again", what, *policy_path, hex, want);
         return -1;
     }
     char cname[300];
-    snprintf(cname, sizeof cname, "%s.policy", base);
+    snprintf(cname, sizeof cname, "%s%s", base, ext);
     int dst = openat(sd, cname, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0400);
     bool ok = dst >= 0 && write_all(dst, b, n) == 0 && fsync(dst) == 0;
     if (dst >= 0) close(dst);
     free(b);
-    if (!ok) { snprintf(why, wn, "cannot copy the policy beside the stream (%s)", strerror(errno)); return -1; }
-    static char copy[PATH_MAX];
-    snprintf(copy, sizeof copy, "%s/%s", streams, cname);
+    if (!ok) { snprintf(why, wn, "cannot copy the %s beside the stream (%s)", what, strerror(errno)); return -1; }
+    static char copies[2][PATH_MAX];                  /* the policy's, the plan's: each its own */
+    char *copy = copies[strcmp(what, "plan") == 0];
+    snprintf(copy, PATH_MAX, "%s/%s", streams, cname);
     *policy_path = copy;
     return 0;
 }
@@ -660,12 +713,37 @@ static const char *node_policy_why(const struct policy *p) {
 static const char *node_unsupported(const struct policy *p, bool dry, const char *plan, const char *flow,
                                     const char *obo, const char *svid, const char *trust) {
     if (dry) return "a dry run";
-    if (plan || flow) return "a plan";
+    (void)plan;                                  /* v1.35 step 4c (D11): the pod's plan is carried */
+    if (flow) return "a flow policy";
     if (obo || svid) return "the on-behalf-of chain";
     if (trust) return "a trust bundle";
     if (p->v.launches && !g_nr.launcher)
         return "decided launches without the launcher (" NODE_LAUNCHER " first in the command: the NRI plugin)";
     return node_policy_why(p);
+}
+
+/* v1.35 step 4c (D11): a pod's plan, as the plugin and the admission check
+ * take it (warden POLICY --oci-filter --plan PLAN): it reads, and names no
+ * step of a kind the node agent does not carry yet (mcp_call, subagent,
+ * credential: v1.36), which it would decide UNKNOWN and refuse. Its steps
+ * are decided by the node agent, in the container's view. 0, or -1 with
+ * why. */
+static int node_plan_carried(const char *plan_path, char *why, size_t wn) {
+    char err[256] = {0};
+    plan_parsed_t *parsed = plan_parser_load(plan_path, err, sizeof err);
+    if (!parsed) { snprintf(why, wn, "the plan does not read: %s", err); return -1; }
+    const plan_spec_t *spec = plan_parser_spec(parsed);
+    int rc = 0;
+    for (size_t i = 0; i < spec->n_actions && rc == 0; i++) {
+        const char *k = spec->actions[i].kind ? spec->actions[i].kind : "";
+        if (!strcmp(k, "mcp_call") || !strcmp(k, "subagent") || !strcmp(k, "credential")) {
+            snprintf(why, wn, "the node agent does not carry %s steps yet (step %.64s)", k,
+                     spec->actions[i].label ? spec->actions[i].label : "?");
+            rc = -1;
+        }
+    }
+    plan_parser_free(parsed);
+    return rc;
 }
 
 /* run_start's container fields */
@@ -688,6 +766,8 @@ static void node_run_start(FILE *f) {
     fprintf(f, "\",\"uid\":%u,\"gid\":%u,\"opens_as_agent\":%s,\"policy\":\"", (unsigned)g_nr.uid, (unsigned)g_nr.gid,
             g_as.on ? "true" : "false");
     json_escape(f, g_nr.policy);
+    fputs("\",\"plan\":\"", f);                     /* v1.35 step 4c: the pod's plan by name, or "" */
+    json_escape(f, g_nr.plan);
     fprintf(f, "\",\"launcher\":%s,\"pod_dns\":\"%s\"", g_nr.launcher ? "true" : "false", g_nr.dns);
     if (g_nr.set_text) {                         /* the paths Landlock is given, each name */
         fputs(",\"launch_paths\":[", f);
@@ -820,7 +900,8 @@ static ssize_t node_receive(int c, char *buf, size_t cap, int *fds, int *nfd) {
 /* Listen for the runtime. Returns 0 in each supervisor (one per container,
  * set up to continue the Warden's start as for a run) and -1 if the listener
  * cannot be made; the node agent itself never returns otherwise. */
-static int node_listen(const char *sock_path, const char *streams, const char *launcher, const char **policy_path) {
+static int node_listen(const char *sock_path, const char *streams, const char *launcher, const char **policy_path,
+                       const char **plan_path) {
     int sd = open(streams, O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (sd < 0) { fprintf(stderr, "[warden] --node-streams %s: %s\n", streams, strerror(errno)); return -1; }
     /* v1.34 step 3: a directory of policies, chosen by name per container,
@@ -952,7 +1033,13 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
         if (so < 0 || dup2(so, STDERR_FILENO) < 0) node_fail("cannot open its stream");
         close(so);
         if (ok == 0) ok = node_policy(buf, (size_t)r, policy_path, why, sizeof why);
-        if (ok == 0) ok = node_policy_copy(sd, streams, sbase, policy_path, why, sizeof why);   /* step 5 */
+        if (ok == 0) ok = node_copy(sd, streams, sbase, "policy", ".policy", g_nr.policy_sha, policy_path,
+                                    why, sizeof why);                                        /* step 5 */
+        if (ok == 0) ok = node_plan(buf, (size_t)r, plan_path, why, sizeof why);            /* v1.35 step 4c */
+        if (ok == 0 && *plan_path) {
+            ok = node_copy(sd, streams, sbase, "plan", ".plan", g_nr.plan_sha, plan_path, why, sizeof why);
+            g_hold_req = true;                  /* D11: a pod's plan holds its run (D2) */
+        }
         close(sd);
         if (ok == 0) ok = node_config(why, sizeof why);
         if (ok == 0) ok = node_process(why, sizeof why);
@@ -1195,7 +1282,8 @@ static int node_launcher_exec(int notify_fd, const struct seccomp_notif *req, co
 /* The container's supervision, where a run forks its agent (main): into the
  * container's mount namespace, now that the node's files are open, then the
  * descriptor supervised as a run's. Returns the Warden's exit status. */
-static int node_supervise(const struct policy *p, const char *boot_path, const char *policy_path) {
+static int node_supervise(const struct policy *p, const char *boot_path, const char *policy_path,
+                          const char *plan_path, plan_parsed_t *plan, const char *plan_err) {
     if (node_enter(CLONE_NEWNS) < 0) {
         char why[160];
         snprintf(why, sizeof why, "cannot enter the container's mount namespace (%s)", strerror(errno));
@@ -1245,6 +1333,20 @@ static int node_supervise(const struct policy *p, const char *boot_path, const c
     /* v1.34 step 4: the names resolved, from the pod's network, the first
      * records after run_start as on a host (the helper started in main) */
     if (g_names_on) names_resolve_all(true);
+    /* v1.35 step 4c (D11): the pod's plan, decided as on a host (its
+     * records after run_start), in the container's view and with its launch
+     * set; refused, the container ends; passed, the run is held to it (D2) */
+    if (plan_path) {
+        g_hold_collect = true;
+        if (warden_verify_plan_parsed(plan, plan_err, plan_path, p, true) != 0) {
+            emit_run_end(1);
+            node_fail("its plan is refused (the plan_step and plan_gate records above)");
+        }
+        g_hold_collect = false;
+        g_hold_on = true;
+        fprintf(stderr, "[warden] the run is held to its plan %s: %zu entries; a call the policy allows outside "
+                "them is refused (outside_plan)\n", g_nr.plan, g_nhold);
+    }
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
         rl.rlim_cur = rl.rlim_max < 65536 ? rl.rlim_max : 65536;
@@ -1254,8 +1356,9 @@ static int node_supervise(const struct policy *p, const char *boot_path, const c
      * (review: not one opened again by its number) */
     int target_pidfd = fcntl(g_nr.pidfd, F_DUPFD_CLOEXEC, 0);
     if (target_pidfd < 0) node_fail("cannot watch the container's process");
-    fprintf(stderr, "[warden] supervising container %s (pod %s/%s) pid=%d policy=%s (%zu rules) uid=%u\n",
-            g_nr.id, g_nr.pod_ns, g_nr.pod_name, (int)g_nr.pid, p->name, p->v.n, (unsigned)g_nr.uid);
+    fprintf(stderr, "[warden] supervising container %s (pod %s/%s) pid=%d policy=%s (%zu rules)%s%s uid=%u\n",
+            g_nr.id, g_nr.pod_ns, g_nr.pod_name, (int)g_nr.pid, p->name, p->v.n, g_nr.plan[0] ? " plan=" : "",
+            g_nr.plan, (unsigned)g_nr.uid);
     bool ended = supervise(g_nr.notify_fd, target_pidfd, -1, p, boot_path, g_nr.pid);
     if (!ended || g_revoked)
         /* the Warden stopped supervising, or the run was revoked: the

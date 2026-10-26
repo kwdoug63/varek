@@ -502,7 +502,7 @@ static int exec_ruleset_build(const struct policy *p, const char *boot_path) {
         bool wr = false;
         for (size_t w = 0; w < sizeof kW / sizeof kW[0] && !wr; w++)
             for (size_t sj = 0; sj <= p->v.nsubjects && !wr; sj++)
-                wr = vdp_decide_subj(&p->v, (int)sj, VDP_KIND_PATH, f->path, kW[w], true, NULL, NULL) == VDP_SATISFIED;
+                wr = vdp_decide_subj(&p->v, (int)sj, VDP_KIND_PATH, f->path, vdp_oflags_from_native(kW[w]), true, NULL, NULL) == VDP_SATISFIED;
         if (wr)
             fprintf(stderr, "[warden] note: launch set: %s (%s) may be both launched and written by "
                     "the agent: a launch runs the file as it is then, not as hashed now\n",
@@ -586,6 +586,47 @@ static void exec_ruleset_record(FILE *f) {
 
 /* ---- v1.27 step 3: deciding a launch (design section 3) ---- */
 
+/* The name of an absolute path as a launch is decided on it (exec_name):
+ * the part through a last ".." segment replaced by the directory it resolves
+ * to (opened from base), "." and empty segments dropped, no other symlink
+ * followed. v1.35 step 9 (review): shared with a plan's process_exec step,
+ * which through step 8 was decided on the path with every link followed. 0,
+ * or -1. */
+static int exec_name_from(int base, const char *joined, char *out, size_t outn) {
+    out[0] = '\0';
+    const char *rest = joined;
+    char head[PATH_LIMIT] = "";
+    for (const char *q = joined; (q = strstr(q, "/..")); q++)
+        if (q[3] == '/' || q[3] == '\0') rest = q + 3;
+    if (rest != joined) {
+        char pre[PATH_LIMIT * 2];
+        snprintf(pre, sizeof pre, "%.*s", (int)(rest - joined), joined);
+        int dfd = openat2_path(base, pre, (uint64_t)O_DIRECTORY);
+        if (dfd < 0 || fd_canonical_path(dfd, head, sizeof head) < 0) {
+            if (dfd >= 0) close(dfd);
+            return -1;
+        }
+        close(dfd);
+        if (!strcmp(head, "/")) head[0] = '\0';
+    }
+    size_t n = strlen(head);
+    char seg[PATH_LIMIT * 2];
+    snprintf(seg, sizeof seg, "%s", rest);
+    char *save = NULL;
+    for (char *t = strtok_r(seg, "/", &save); t; t = strtok_r(NULL, "/", &save)) {
+        if (!strcmp(t, ".")) continue;
+        size_t tl = strlen(t);
+        if (n + 1 + tl >= outn || n + 1 + tl >= sizeof head) { out[0] = '\0'; return -1; }
+        head[n++] = '/';
+        memcpy(head + n, t, tl);
+        n += tl;
+        head[n] = '\0';
+    }
+    if (n == 0) return -1;
+    memcpy(out, head, n + 1);
+    return 0;
+}
+
 /* The name a launch is decided on, and the file it reaches. The name is the
  * path as the agent wrote it, made absolute: a relative path joined to the
  * canonical path of the directory it is relative to (the agent's cwd, or
@@ -637,41 +678,9 @@ static int exec_name(const struct seccomp_notif *req, struct action *a, struct s
         if (fd_canonical_path(base, dir, sizeof dir) < 0) { close(base); return -1; }
         snprintf(joined, sizeof joined, "%s/%s", dir, a->target);
     }
-    /* through the last ".." segment: the directory it resolves to */
-    const char *rest = joined;
-    char head[PATH_LIMIT] = "";
-    for (const char *q = joined; (q = strstr(q, "/..")); q++)
-        if (q[3] == '/' || q[3] == '\0') rest = q + 3;
-    if (rest != joined) {
-        char pre[PATH_LIMIT * 2];
-        snprintf(pre, sizeof pre, "%.*s", (int)(rest - joined), joined);
-        int dfd = openat2_path(base, pre, (uint64_t)O_DIRECTORY);
-        if (dfd < 0 || fd_canonical_path(dfd, head, sizeof head) < 0) {
-            if (dfd >= 0) close(dfd);
-            close(base);
-            return -1;
-        }
-        close(dfd);
-        if (!strcmp(head, "/")) head[0] = '\0';
-    }
+    int r = exec_name_from(base, joined, a->resolved, sizeof a->resolved);
     close(base);
-    /* drop "." and empty segments */
-    size_t n = strlen(head);
-    char seg[PATH_LIMIT * 2];
-    snprintf(seg, sizeof seg, "%s", rest);
-    char *save = NULL;
-    for (char *t = strtok_r(seg, "/", &save); t; t = strtok_r(NULL, "/", &save)) {
-        if (!strcmp(t, ".")) continue;
-        size_t tl = strlen(t);
-        if (n + 1 + tl >= sizeof a->resolved) { a->resolved[0] = '\0'; return -1; }
-        head[n++] = '/';
-        memcpy(head + n, t, tl);
-        n += tl;
-        head[n] = '\0';
-    }
-    if (n == 0) return -1;
-    memcpy(a->resolved, head, n + 1);
-    return 0;
+    return r;
 }
 
 /* ---- v1.31 review: the environment a confined subject is launched with ----
@@ -820,6 +829,35 @@ static int exec_env_image(pid_t pid, char *name, size_t nn) {
 /* A launch after the first, with `require warden 1.27`: decided on its name
  * (certified), then CONTINUE only if Landlock holds the agent and the file
  * is one of the set (by device and inode). Recorded before it is answered. */
+/* v1.35 step 2 (D9): a plan's process_exec step, decided as exec_launch
+ * decides the launch: the program opened as the launch would open it
+ * (following symlinks, no magic links), the policy on the name the launch
+ * is decided on (exec_name_from; step 9: through step 8 its canonical path),
+ * the checker, Landlock, and the launch set, which is built before the plan
+ * is checked. Through v1.34 such a step was always UNSATISFIED, true only
+ * while every launch after the first was refused. Why it is not SATISFIED,
+ * or NULL. */
+static plan_decision_t plan_exec_decide(const struct policy *p, struct action *a, const char **why) {
+    struct stat st;
+    *why = NULL;
+    if (a->target[0] != '/') { *why = "a launch is named by its absolute path"; return PLAN_DEC_UNKNOWN; }
+    int fd = openat2_path(AT_FDCWD, a->target, 0);
+    /* step 9 (review): the file as the launch opens it (its device and inode,
+     * for the launch set), the name as the launch names it (a final symlink's
+     * own: /bin/sh, not /usr/bin/dash) */
+    bool ok = fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+              exec_name_from(AT_FDCWD, a->target, a->resolved, sizeof a->resolved) == 0;
+    if (fd >= 0) close(fd);
+    if (!ok) { a->resolved[0] = '\0'; *why = "the program is not a file here"; return PLAN_DEC_UNKNOWN; }
+    decision_t d = policy_decide(p, a);
+    if (d == DEC_DENY) { *why = "the policy refuses it"; return PLAN_DEC_UNSATISFIED; }
+    if (d != DEC_ALLOW) { *why = "no rule of the policy allows it"; return PLAN_DEC_UNKNOWN; }
+    if (!p->c.launches || !certify(p, a)) { *why = "its certificate is refused"; return PLAN_DEC_UNKNOWN; }
+    if (g_ll_abi < 1) { *why = "this host has no Landlock, so every later launch is refused"; return PLAN_DEC_UNSATISFIED; }
+    if (!exec_rs_find(st.st_dev, st.st_ino)) { *why = "it is not in the launch set"; return PLAN_DEC_UNSATISFIED; }
+    return PLAN_DEC_SATISFIED;
+}
+
 static void exec_launch(int notify_fd, const struct seccomp_notif *req, struct action *a,
                         const struct policy *p, const struct timespec *t0) {
     struct stat st;
@@ -839,6 +877,13 @@ static void exec_launch(int notify_fd, const struct seccomp_notif *req, struct a
         else if (d_final == DEC_ALLOW && !(ef = exec_rs_find(st.st_dev, st.st_ino))) {
             d_final = DEC_DENY;
             rule = "exec_not_in_ruleset";
+        }
+        /* v1.35 step 4: allowed, but no step of the run's plan names the program
+         * (by the canonical name the launch is decided on: a hardlink's own,
+         * not the launch set entry's first name, which its other names share) */
+        else if (d_final == DEC_ALLOW && hold_refuses_exec(a, a->resolved)) {
+            d_final = DEC_DENY;
+            rule = "outside_plan";
         }
         if (!rule) rule = d_final == DEC_ALLOW ? "exec_allowed" : decision_rule_id(a, d_raw);
     }

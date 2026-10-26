@@ -1,0 +1,4 @@
+[
+  { "name": "get_forecast", "description": "The forecast for a city", "inputSchema": { "type": "object", "properties": { "city": { "type": "string" } }, "required": ["city"] } },
+  { "name": "get_alerts", "description": "Weather alerts for a US state", "inputSchema": { "type": "object", "properties": { "state": { "type": "string" } }, "required": ["state"] } }
+]

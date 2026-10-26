@@ -183,6 +183,16 @@ static void held_drop(int k) {
     SSL_free(g_held[k].ss);                          /* (the client's SSL frees its BIOs) */
     SSL_free(g_held[k].cs);
     close(g_held[k].fd);
+    /* v1.30 (the RHEL 9 sweep): a cut connection (max_body) ends at the
+     * server with a FIN after what was let through, not a reset. What the
+     * server sent that the proxy never read (a TLS 1.3 server's session
+     * tickets) is discarded first: closing a socket with unread data sends
+     * a reset, which can make the server drop what it has not yet read. */
+    if (g_held[k].up >= 0 && g_held[k].cut) {
+        char drain[4096];
+        (void)shutdown(g_held[k].up, SHUT_WR);
+        for (int i = 0; i < 64 && recv(g_held[k].up, drain, sizeof drain, MSG_DONTWAIT) > 0; i++) { }
+    }
     if (g_held[k].up >= 0) close(g_held[k].up);
     if (g_held[k].credbuf && g_held[k].buf)
         OPENSSL_cleanse(g_held[k].buf, g_held[k].bufcap ? g_held[k].bufcap : PP_IN_MAX);   /* v1.28 */

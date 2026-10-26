@@ -1,0 +1,5 @@
+/var/tmp/varek-plan-corpus3/policies/openai-agents__mcp__git_example.policy: glob tokens 0 of 4096
+/var/tmp/varek-plan-corpus3/policies/openai-agents__mcp__git_example.policy: 17 rules, 0 can never fire
+
+  subagent step "stdio__uvx" is UNKNOWN: no rule of the policy launches a sub-agent by that name
+/var/tmp/varek-plan-corpus3/plans/openai-agents__mcp__git_example.plan: refused under /var/tmp/varek-plan-corpus3/policies/openai-agents__mcp__git_example.policy (UNKNOWN): `varek run --plan` would not start the agent

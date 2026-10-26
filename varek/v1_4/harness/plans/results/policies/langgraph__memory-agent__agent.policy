@@ -1,0 +1,19 @@
+# plan_corpus.py: the "named" policy, from the plan's own steps
+require warden 1.35
+proxy inspect
+allow path /usr/ readonly
+allow path /lib/ readonly
+allow path /lib64/ readonly
+allow path /etc/ readonly
+allow path /proc/self/ readonly
+allow path exact /dev/null
+allow path exact /dev/urandom readonly
+allow path /tmp/
+allow path exact /proc/stat readonly
+allow path exact /proc/cpuinfo readonly
+allow path exact /proc/meminfo readonly
+allow path exact /proc/sys/crypto/fips_enabled readonly
+allow path /sys/devices/system/cpu/ readonly
+allow path /sys/fs/cgroup/ readonly
+allow path /var/tmp/corpus-src/memory-agent/ readonly
+allow path /var/tmp/lg/venv/ readonly

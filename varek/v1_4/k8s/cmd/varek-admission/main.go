@@ -31,6 +31,20 @@
 //	               configuration sends here the pods of the namespaces that
 //	               require a policy (a namespaceSelector).
 //
+// v1.35 step 4c (D11): plans.
+//
+//	/varekplan     a VarekPlan created or changed: its name is one the node
+//	               agent takes, and the Warden reads it and carries it in a
+//	               pod (warden --oci-filter --plan: no step of a kind the node
+//	               agent does not carry yet, mcp_call, subagent, credential);
+//	/pod           and a pod annotated varek.dev/plan: NAME names a VarekPlan
+//	               of its namespace, which the Warden checks with the pod's
+//	               policy (--oci-filter --plan); a pod naming none is checked
+//	               with --no-plan, which a policy saying `require plan`
+//	               refuses. The plan's steps are decided by the node agent, in
+//	               the container's view, as the container starts. On an
+//	               update, the plan's annotation is fixed as the policy's is.
+//
 // Each answer that refuses says why; the API server shows it to whoever
 // applied the object.
 //
@@ -65,7 +79,8 @@ import (
 )
 
 const (
-	annotation = "varek.dev/policy"
+	annotation     = "varek.dev/policy"
+	planAnnotation = "varek.dev/plan" // v1.35 step 4c
 	// the seccomp profile every container of an annotated pod names (G-1)
 	unsupervised = "varek/unsupervised.json"
 	// the largest AdmissionReview read: an object and its old one, each at
@@ -162,14 +177,18 @@ type checked struct {
 	launches bool
 }
 
+// the API server's part the webhook reads: a namespace's policy and plan
+type reader interface {
+	GetPolicy(ctx context.Context, ns, name string) (*kube.Policy, error)
+	GetPlan(ctx context.Context, ns, name string) (*kube.Policy, error)
+}
+
 type server struct {
-	warden string
-	api    interface {
-		GetPolicy(ctx context.Context, ns, name string) (*kube.Policy, error)
-	}
+	warden  string
+	api     reader
 	classes map[string]bool // runtime classes whose handler runs the Warden's filter (G-4)
 	mu      sync.Mutex
-	cache   map[[32]byte]checked // by the policy's SHA-256 (W2)
+	cache   map[[32]byte]checked // by the SHA-256 of what was checked (W2): the policy, and the pod's plan
 	slots   chan struct{}        // the Warden's checks at once (W2)
 }
 
@@ -177,22 +196,45 @@ type server struct {
 // Warden splits a line on the same white space (review, G-6)
 var requireLine = regexp.MustCompile(`(?m)^[ \t\r\v\f]*require[ \t\r\v\f]+warden[ \t\r\v\f]+(\d+)\.(\d+)`)
 
-func decidesLaunches(text string) bool {
+func decidesLaunches(text string) bool { return requiresWarden(text, 1, 27) }
+
+// requiresWarden: the policy says `require warden X.Y` of at least major.minor
+func requiresWarden(text string, major, minor int) bool {
 	for _, m := range requireLine.FindAllStringSubmatch(text, -1) {
 		a, _ := strconv.Atoi(m[1])
 		b, _ := strconv.Atoi(m[2])
-		if a > 1 || (a == 1 && b >= 27) {
+		if a > major || (a == major && b >= minor) {
 			return true
 		}
 	}
 	return false
 }
 
+// What a check is of (v1.35 step 4c): a policy alone (a VarekPolicy), or a
+// pod's policy with its plan, or with none
+type checkOf int
+
+const (
+	policyAlone checkOf = iota
+	podWithPlan
+	podNoPlan
+)
+
+// planCarrier is the policy a VarekPlan is checked with on its own: the
+// plan's text and kinds are what is checked, its steps are decided with the
+// pod's policy, in the pod
+const planCarrier = "require warden 1.35\n"
+
 // Whether the Warden loads text and carries it in a pod: why not, or "".
 // Its verdict is kept; a check that did not finish (the request's time, a
-// failure of the webhook's own) is not.
+// failure of the webhook's own) is not. v1.35 step 4c: with a pod's plan
+// (of podWithPlan), or for a pod naming none (podNoPlan).
 func (s *server) check(ctx context.Context, text string) checked {
-	sum := sha256.Sum256([]byte(text))
+	return s.checkPlan(ctx, text, policyAlone, "")
+}
+
+func (s *server) checkPlan(ctx context.Context, text string, of checkOf, plan string) checked {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d\x00%d\x00%s\x00%s", of, len(text), text, plan)))
 	s.mu.Lock()
 	c, ok := s.cache[sum]
 	s.mu.Unlock()
@@ -215,9 +257,20 @@ func (s *server) check(ctx context.Context, text string) checked {
 	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
 		return checked{why: err.Error()}
 	}
+	args := []string{path, "--oci-filter"}
+	planPath := filepath.Join(dir, "plan")
+	switch of {
+	case podWithPlan:
+		if err := os.WriteFile(planPath, []byte(plan), 0o600); err != nil {
+			return checked{why: err.Error()}
+		}
+		args = append(args, "--plan", planPath)
+	case podNoPlan:
+		args = append(args, "--no-plan")
+	}
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, s.warden, path, "--oci-filter")
+	cmd := exec.CommandContext(ctx, s.warden, args...)
 	var errb strings.Builder
 	cmd.Stdout = io.Discard
 	cmd.Stderr = &errb
@@ -226,7 +279,7 @@ func (s *server) check(ctx context.Context, text string) checked {
 		if ctx.Err() != nil || !errors.As(err, &ee) || !ee.Exited() {
 			return checked{why: fmt.Sprintf("the Warden did not finish checking it (%v)", err)}
 		}
-		c.why = warden(errb.String(), path)
+		c.why = strings.ReplaceAll(warden(errb.String(), path), " "+planPath, "")
 		if c.why == "" {
 			c.why = err.Error()
 		}
@@ -279,12 +332,44 @@ func (s *server) varekPolicy(ctx context.Context, req *request) string {
 	return ""
 }
 
+// v1.35 step 4c (D11): a VarekPlan
+func (s *server) varekPlan(ctx context.Context, req *request) string {
+	if req.Operation == "DELETE" {
+		return ""
+	}
+	var p kube.Policy
+	if err := json.Unmarshal(req.Object, &p); err != nil {
+		return "the VarekPlan does not read: " + err.Error()
+	}
+	if !kube.Name.MatchString(p.Metadata.Name) {
+		return fmt.Sprintf("the VarekPlan's name %q is not 1 to 63 of a-z, 0-9 and - (the node agent takes no other)", p.Metadata.Name)
+	}
+	ns := p.Metadata.Namespace
+	if ns == "" {
+		ns = req.Namespace
+	}
+	if !kube.Name.MatchString(ns) {
+		return fmt.Sprintf("the namespace %q is not 1 to 63 of a-z, 0-9 and - (the node agent takes no other)", ns)
+	}
+	if len(p.Spec.Plan) > kube.MaxPolicy {
+		return fmt.Sprintf("the plan is larger than %d bytes", kube.MaxPolicy)
+	}
+	if strings.TrimSpace(p.Spec.Plan) == "" {
+		return "the plan is empty"
+	}
+	if c := s.checkPlan(ctx, planCarrier, podWithPlan, p.Spec.Plan); c.why != "" {
+		return "the Warden refuses this plan: " + c.why
+	}
+	return ""
+}
+
 func (s *server) pod(ctx context.Context, req *request) string {
 	var p pod
 	if err := json.Unmarshal(req.Object, &p); err != nil {
 		return "the pod does not read: " + err.Error()
 	}
 	name, ok := p.Metadata.Annotations[annotation]
+	plan, planned := p.Metadata.Annotations[planAnnotation]
 	// G-3: what a pod was admitted as it stays; its spec is otherwise
 	// fixed, and an update is not checked again (a policy deleted since
 	// does not keep its pod from being changed and deleted)
@@ -297,9 +382,15 @@ func (s *server) pod(ctx context.Context, req *request) string {
 		if was != name || wasOK != ok {
 			return fmt.Sprintf("its %s annotation is set when the pod is created, and not added, changed or removed after", annotation)
 		}
+		if wasPlan, wasPlanned := old.Metadata.Annotations[planAnnotation]; wasPlan != plan || wasPlanned != planned {
+			return fmt.Sprintf("its %s annotation is set when the pod is created, and not added, changed or removed after", planAnnotation)
+		}
 		return ""
 	}
 	if !ok {
+		if planned {
+			return fmt.Sprintf("it names a plan (%s) and no policy (%s): a plan is held under a policy", planAnnotation, annotation)
+		}
 		return ""
 	}
 	ns := p.Metadata.Namespace
@@ -319,8 +410,30 @@ func (s *server) pod(ctx context.Context, req *request) string {
 	if vp == nil {
 		return fmt.Sprintf("there is no VarekPolicy %s in namespace %s", name, ns)
 	}
-	c := s.check(ctx, vp.Spec.Policy)
-	if c.why != "" {
+	var c checked
+	if planned { // v1.35 step 4c (D11)
+		if !kube.Name.MatchString(plan) {
+			return fmt.Sprintf("its plan name %q (%s) is not 1 to 63 of a-z, 0-9 and -", plan, planAnnotation)
+		}
+		// v1.35 step 9 (review): a node whose plugin and Warden are older than
+		// 1.35 never reads the plan and would run the pod under its policy
+		// alone, not held (a rollout's window); a 1.35 grammar line makes such
+		// a node refuse the container instead
+		if !requiresWarden(vp.Spec.Policy, 1, 35) {
+			return fmt.Sprintf("it names a plan (%s), and its policy %s does not say `require warden 1.35`: a node "+
+				"older than 1.35 would run it not held to the plan", planAnnotation, name)
+		}
+		pl, err := s.api.GetPlan(ctx, ns, plan)
+		if err != nil {
+			return "its plan cannot be read from the API server: " + err.Error()
+		}
+		if pl == nil {
+			return fmt.Sprintf("there is no VarekPlan %s in namespace %s", plan, ns)
+		}
+		if c = s.checkPlan(ctx, vp.Spec.Policy, podWithPlan, pl.Spec.Plan); c.why != "" {
+			return fmt.Sprintf("the Warden refuses its policy %s with its plan %s: %s", name, plan, c.why)
+		}
+	} else if c = s.checkPlan(ctx, vp.Spec.Policy, podNoPlan, ""); c.why != "" {
 		return fmt.Sprintf("the Warden refuses its policy %s: %s", name, c.why)
 	}
 	var whys []string
@@ -401,9 +514,7 @@ func (s *server) pod(ctx context.Context, req *request) string {
 	return strings.Join(whys, "; ")
 }
 
-func newServer(warden string, api interface {
-	GetPolicy(ctx context.Context, ns, name string) (*kube.Policy, error)
-}, classes string) *server {
+func newServer(warden string, api reader, classes string) *server {
 	s := &server{warden: warden, api: api, classes: map[string]bool{}, cache: map[[32]byte]checked{},
 		slots: make(chan struct{}, maxChecks)}
 	for _, c := range strings.Split(classes, ",") {
@@ -464,6 +575,7 @@ func (s *server) handle(decide func(context.Context, *request) string) http.Hand
 func (s *server) mux() *http.ServeMux {
 	m := http.NewServeMux()
 	m.HandleFunc("/varekpolicy", s.handle(s.varekPolicy))
+	m.HandleFunc("/varekplan", s.handle(s.varekPlan)) // v1.35 step 4c
 	m.HandleFunc("/pod", s.handle(s.pod))
 	m.HandleFunc("/pod-required", s.handle(func(ctx context.Context, r *request) string {
 		var p pod

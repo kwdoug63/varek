@@ -263,6 +263,7 @@ int main(int argc, char **argv) {
             if (ri.subagent && ri.subagent[0]) printf("subagent %d %s\n", ri.line, ri.subagent);
         }
         if (pol.require_obo) printf("require on-behalf-of\n");
+        if (pol.require_plan) printf("require plan\n");                   /* v1.35 step 4 */
         /* v1.31: the confined subjects, the rules for each, the MCP resources */
         for (size_t k = 0; k < pol.nsubjects; k++) {
             vdpc_rule_info_t ri;

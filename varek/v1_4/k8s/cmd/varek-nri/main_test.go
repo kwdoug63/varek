@@ -15,11 +15,18 @@ import (
 )
 
 // a stand-in for the Warden: it writes a small filter for any policy, or
-// fails for one named "bad", or takes 5 s for one named "slow"
+// fails for one named "bad", or takes 5 s for one named "slow"; v1.35: it
+// is given the pod's plan (--plan FILE) or --no-plan, refuses --no-plan for
+// a policy named "needsplan" and a plan named "badplan", and writes what it
+// was given to calls beside itself
 const fakeWarden = `#!/bin/sh
+echo "$*" >> "$(dirname "$0")/calls"
 case "$1" in */bad.policy) echo "[warden] policy: line 1: no" >&2; exit 1 ;; esac
 case "$1" in */slow.policy) exec sleep 5 ;; esac
 [ "$2" = --oci-filter ] || exit 2
+case "$3" in --plan) [ -f "$4" ] || exit 2; case "$4" in */badplan.plan) echo "[warden] --oci-filter: the plan $4: the node agent does not carry mcp_call steps yet (step m)" >&2; exit 1 ;; esac ;;
+  --no-plan) case "$1" in */needsplan.policy) echo "[warden] --oci-filter: the policy says ` + "`require plan`" + `: a pod under it names its plan (varek.dev/plan)" >&2; exit 1 ;; esac ;;
+  *) exit 2 ;; esac
 echo '{"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRet":1,"architectures":["SCMP_ARCH_X86_64"],"syscalls":[{"names":["openat"],"action":"SCMP_ACT_NOTIFY","args":[]},{"names":["ioctl"],"action":"SCMP_ACT_ALLOW","args":[{"index":1,"value":21505,"valueTwo":0,"op":"SCMP_CMP_EQ"}]}]}'
 `
 
@@ -31,8 +38,13 @@ func setup(t *testing.T) *plugin {
 	}
 	pol := filepath.Join(d, "policies")
 	os.MkdirAll(filepath.Join(pol, "ns"), 0o755)
-	for _, n := range []string{"agent", "bad", "slow"} {
+	for _, n := range []string{"agent", "bad", "slow", "needsplan"} {
 		os.WriteFile(filepath.Join(pol, "ns", n+".policy"), []byte("allow path /tmp/\n"), 0o644)
+	}
+	// the filter is kept by the bytes' hash: the Warden's verdict is theirs
+	os.WriteFile(filepath.Join(pol, "ns", "needsplan.policy"), []byte("require warden 1.35\nrequire plan\nallow path /tmp/\n"), 0o644)
+	for _, n := range []string{"p1", "p2", "badplan"} { // v1.35 step 4c
+		os.WriteFile(filepath.Join(pol, "ns", n+".plan"), []byte("plan 1.35\naction a file_open /tmp/"+n+"\n"), 0o644)
 	}
 	return &plugin{warden: w, policies: pol, listener: "/run/varek/node.sock", launcher: "/opt/varek/varek-init",
 		handlers: map[string]bool{"runc": true, "crun": true}, filters: map[string]*ociProfile{}}
@@ -187,18 +199,64 @@ func TestDeadline(t *testing.T) {
 
 func TestFilterKeptByHash(t *testing.T) {
 	p := setup(t)
-	a, s1, err := p.filter(context.Background(), "ns", "agent")
-	b, s2, err2 := p.filter(context.Background(), "ns", "agent")
+	a, s1, _, err := p.filter(context.Background(), "ns", "agent", "")
+	b, s2, _, err2 := p.filter(context.Background(), "ns", "agent", "")
 	if err != nil || err2 != nil || a != b || s1 != s2 || len(s1) != 64 {
 		t.Fatalf("kept: %v %v", err, err2)
 	}
 	os.WriteFile(filepath.Join(p.policies, "ns", "agent.policy"), []byte("allow path /tmp/\nallow path /var/\n"), 0o644)
-	c, s3, err := p.filter(context.Background(), "ns", "agent")
+	c, s3, _, err := p.filter(context.Background(), "ns", "agent", "")
 	if err != nil || c == a || s3 == s1 {
 		t.Fatalf("a changed policy is written again, with its own hash: %v", err)
 	}
-	if _, _, err := p.filter(context.Background(), "other", "agent"); err == nil || !strings.Contains(err.Error(), "in namespace other") {
+	if _, _, _, err := p.filter(context.Background(), "other", "agent", ""); err == nil || !strings.Contains(err.Error(), "in namespace other") {
 		t.Fatalf("another namespace's policy: %v", err)
+	}
+	// v1.35 step 4c: kept by the policy's and the plan's hashes together
+	d, _, ps1, err := p.filter(context.Background(), "ns", "agent", "p1")
+	e, _, ps2, err2 := p.filter(context.Background(), "ns", "agent", "p2")
+	if err != nil || err2 != nil || d == c || e == d || ps1 == ps2 || len(ps1) != 64 {
+		t.Fatalf("a plan checked apart from the policy alone, and from another plan: %v %v", err, err2)
+	}
+}
+
+// v1.35 step 4c (D11): a pod's plan, checked by the Warden with its policy,
+// its name and SHA-256 in the container's annotations
+func TestPlan(t *testing.T) {
+	p := setup(t)
+	adj, err := p.adjust(context.Background(), pod(map[string]string{annotation: "agent", planAnnotation: "p1"}), ctr("/bin/agent"))
+	if err != nil || adj == nil {
+		t.Fatalf("adjust: %v", err)
+	}
+	want := sha256.Sum256([]byte("plan 1.35\naction a file_open /tmp/p1\n"))
+	if a := adj.GetAnnotations(); a[planAnnotation] != "p1" || a["varek.dev/plan-sha256"] != hex.EncodeToString(want[:]) {
+		t.Errorf("the plan's name and SHA-256 in the container's annotations: %v", a)
+	}
+	calls, _ := os.ReadFile(filepath.Join(filepath.Dir(p.warden), "calls"))
+	if !strings.Contains(string(calls), "--oci-filter --plan ") || !strings.Contains(string(calls), "/p1.plan") {
+		t.Errorf("the Warden given the plan: %q", calls)
+	}
+	adj, err = p.adjust(context.Background(), pod(map[string]string{annotation: "agent"}), ctr("/bin/agent"))
+	if err != nil || adj.GetAnnotations()[planAnnotation] != "" || adj.GetAnnotations()["varek.dev/plan-sha256"] != "" {
+		t.Errorf("a pod naming no plan: %v %v", err, adj.GetAnnotations())
+	}
+	if calls, _ = os.ReadFile(filepath.Join(filepath.Dir(p.warden), "calls")); !strings.Contains(string(calls), "--oci-filter --no-plan") {
+		t.Errorf("the Warden told the pod names no plan: %q", calls)
+	}
+	for _, c := range []struct {
+		what string
+		ann  map[string]string
+		why  string
+	}{
+		{"a plan name that is not one", map[string]string{annotation: "agent", planAnnotation: "Plan_1"}, "the plan name \"Plan_1\""},
+		{"no such plan", map[string]string{annotation: "agent", planAnnotation: "nosuch"}, "no plan named nosuch in namespace ns"},
+		{"a plan the Warden refuses", map[string]string{annotation: "agent", planAnnotation: "badplan"}, "the plan badplan.plan: the node agent does not carry mcp_call steps"},
+		{"`require plan`, no plan named", map[string]string{annotation: "needsplan"}, "a pod under it names its plan"},
+	} {
+		adj, err := p.adjust(context.Background(), pod(c.ann), ctr("/bin/x"))
+		if adj != nil || err == nil || !strings.Contains(err.Error(), c.why) {
+			t.Errorf("%s: %v %v", c.what, adj, err)
+		}
 	}
 }
 

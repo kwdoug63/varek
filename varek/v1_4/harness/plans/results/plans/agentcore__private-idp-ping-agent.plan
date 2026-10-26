@@ -1,0 +1,38 @@
+# Written by `varek plan generate --from agentcore` (VAREK 1.35.0, adapters/agentcore.py)
+# from agentcore/agentcore.json (SHA-256 430be13bddf49e47144f8899edd471ce6be7eb4453638eeb16ddcb0e9e6a6890)
+# project PrivateIdpPingAgent, runtime PrivateIdpPingAgent, target - (account -, region us-east-1)
+# Each step names something the project gives the agent. Held to this plan (varek run
+# --hold-to-plan, or a policy's `require plan`), the run is refused a call the policy
+# allows that no step covers. Not here, as agentcore.json does not say them: the agent's
+# own tools and its model provider, which are its framework's (--model-host names the
+# model's host).
+plan 1.35
+#
+# the language runtime's own reads, and the agent's code
+action sys_usr file_open /usr/ open=read
+action sys_lib file_open /lib/ open=read
+action sys_lib64 file_open /lib64/ open=read
+action sys_etc file_open /etc/ open=read
+action proc_self file_open /proc/self/ open=read
+action dev_null file_open /dev/null
+action dev_urandom file_open /dev/urandom open=read
+action tmp file_open /tmp/
+action proc_stat file_open /proc/stat open=read
+action proc_cpuinfo file_open /proc/cpuinfo open=read
+action proc_meminfo file_open /proc/meminfo open=read
+action fips file_open /proc/sys/crypto/fips_enabled open=read
+action sys_cpu file_open /sys/devices/system/cpu/ open=read
+action cgroup file_open /sys/fs/cgroup/ open=read
+action app file_open /var/task/ open=read
+#
+# the hosts the runtime's features reach
+#   bedrock-agentcore.us-east-1.amazonaws.com:443: Identity's credentials
+action agentcore_data net_connect bedrock-agentcore.us-east-1.amazonaws.com:443
+#   xray.us-east-1.amazonaws.com:443: OpenTelemetry's traces (X-Ray)
+action otel_traces net_connect xray.us-east-1.amazonaws.com:443
+#   logs.us-east-1.amazonaws.com:443: OpenTelemetry's logs (CloudWatch)
+action otel_logs net_connect logs.us-east-1.amazonaws.com:443
+#
+# credentials (AgentCore Identity): AWS releases them to the agent from AgentCore's data
+# plane (its host above), not the Warden, so they are not credential steps:
+#   ping-private-idp (OAuthCredentialProvider)

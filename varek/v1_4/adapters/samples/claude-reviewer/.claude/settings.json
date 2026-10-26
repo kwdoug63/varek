@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(./src/**)",
+      "Grep(./src/**)",
+      "Write(./reviews/**)",
+      "Bash(git diff:*)",
+      "WebFetch(domain:docs.python.org)",
+      "mcp__issues__get_issue",
+      "mcp__issues__add_comment"
+    ],
+    "deny": ["Read(./.env)"]
+  },
+  "env": { "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1" }
+}

@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: MIT
+#
+# v1.35 step 4c (docs/security/v1.35-frameworks.md, D11): VAREK's plans as a
+# namespaced resource. Its text is the plan as written for the Warden (plan
+# 1.35); a pod names one of its namespace's by the annotation
+# varek.dev/plan: NAME, beside its varek.dev/policy. VAREK's NRI plugin
+# (varek-nri -sync) writes each to its node's policy directory, as
+# POLICY_DIR/<namespace>/<name>.plan; the node agent decides it in the
+# container's view as the container starts, and holds the run to it. The
+# admission webhook (varek-admission) refuses one the Warden does not read,
+# or one with a step of a kind the node agent does not carry yet. Helm
+# installs it with the chart, and does not change or remove it on an upgrade
+# or an uninstall (Helm's rule for crds/): it is applied by hand on an
+# upgrade from a chart before 1.35 (kubectl apply -f).
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: varekplans.varek.dev
+spec:
+  group: varek.dev
+  scope: Namespaced
+  names:
+    plural: varekplans
+    singular: varekplan
+    kind: VarekPlan
+    shortNames: [vpl]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          # the node agent takes a name of 1 to 63 of a-z, 0-9 and - only
+          x-kubernetes-validations:
+            - rule: "self.metadata.name.matches('^[a-z0-9-]{1,63}$')"
+              message: "a VarekPlan's name is 1 to 63 of a-z, 0-9 and -"
+          properties:
+            spec:
+              type: object
+              required: [plan]
+              properties:
+                plan:
+                  description: The plan, as written for the Warden (plan 1.35; docs/security/v1.35-frameworks.md).
+                  type: string
+                  minLength: 1
+                  maxLength: 1048576

@@ -31,6 +31,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <stddef.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>

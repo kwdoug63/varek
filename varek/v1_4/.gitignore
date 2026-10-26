@@ -25,3 +25,4 @@ tests/v1310_peek
 tests/mcp_json_test
 tests/v1290_open
 tests/v1290_lat
+tests/v1300_oflags

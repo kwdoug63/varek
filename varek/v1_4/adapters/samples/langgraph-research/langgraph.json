@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "researcher": "./src/researcher.py:graph",
+    "publisher": "./src/publisher.py:make_graph"
+  }
+}

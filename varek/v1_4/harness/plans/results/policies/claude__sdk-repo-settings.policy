@@ -1,0 +1,24 @@
+# plan_corpus.py: the "named" policy, from the plan's own steps
+require warden 1.35
+proxy inspect
+allow path /usr/ readonly
+allow path /lib/ readonly
+allow path /lib64/ readonly
+allow path /etc/ readonly
+allow path /proc/self/ readonly
+allow path exact /dev/null
+allow path exact /dev/urandom readonly
+allow path /tmp/
+allow path exact /proc/stat readonly
+allow path exact /proc/cpuinfo readonly
+allow path exact /proc/meminfo readonly
+allow path exact /proc/sys/crypto/fips_enabled readonly
+allow path /sys/devices/system/cpu/ readonly
+allow path /sys/fs/cgroup/ readonly
+allow path /var/tmp/corpus-src/claude-agent-sdk-python/ readonly
+allow path /home/agent/.claude/
+allow path exact /home/agent/.claude.json
+allow host api.anthropic.com:443
+allow host statsig.anthropic.com:443
+allow exec /var/tmp/lg/venv/lib/python3.11/site-packages/claude_agent_sdk/_bundled/claude
+allow exec /usr/bin/python3.11

@@ -9,6 +9,31 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.35.0] - 2026-10-26 — Agent frameworks: plans from the framework
+
+A plan (the steps an agent says it will take) now comes from the agent's
+framework, and a run can be held to it. `varek plan generate --from
+FRAMEWORK PROJECT` writes the plan from what Amazon Bedrock AgentCore, IBM
+watsonx Orchestrate, LangGraph, the OpenAI Agents SDK, or the Claude Agent
+SDK and Claude Code already say of the agent; the adapter runs under the
+Warden, the project read-only, no network, and the code adapters import
+the agent in its own Python with each provider's key a placeholder. Plan
+1.35 names MCP calls, sub-agents and credentials, and any step may be
+decided under a confined subject (`as=`). `varek run --plan PLAN
+--hold-to-plan` refuses a call the policy allows and no step covers
+(`outside_plan`), for files, connections, launches, MCP calls and
+credentials alike; the hold can only refuse. A policy line `require plan`
+refuses a run not held to a plan. Under the node agent a pod names its plan
+by annotation or a `VarekPlan`, checked at admission and held in the
+container. The plan gate's records are chained and name the plan by its
+SHA-256; `varek audit --plan`, the OCSF event and the CycloneDX evidence
+carry it. A plan's `process_exec` step is decided as the launch is, and the
+Warden builds for arm64. v1.11's condition was measured on 130 plans from
+the frameworks' published examples: with plan 1.35 the plan gate cannot
+meet it, and v1.11 stays a candidate. Not carried under the node agent yet:
+`mcp_call`, `subagent` and `credential` steps (v1.36). 24 hours on a host (a DigitalOcean droplet, Ubuntu) with an OpenAI Agents SDK agent held to its generated plan under `require plan`: 1,439 turns, every one done; each of the 429 probes refused outside the plan, and nothing else refused but what every run refuses; the stream audited and its 31,711 OCSF events valid; memory flat. See
+[`RELEASE-v1.35.0.md`](./RELEASE-v1.35.0.md).
+
 ## [1.34.0] - 2026-10-24 — Kubernetes: a node agent and a Helm chart
 
 The Warden supervises a pod's containers from outside them, so the agent's
