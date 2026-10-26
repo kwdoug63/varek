@@ -98,6 +98,10 @@ jobs:
           systemctl --version | head -1
       - name: The cluster
         run: |
+          # the cell's folder the runner's: node_cluster.sh, as root, makes
+          # only its own part of it (an 18d1b60 cell's test could not write
+          # its log in a folder root had made)
+          mkdir -p "$OUT"
           sudo -E env "PATH=$PATH" bash varek/v1_4/tests/node_cluster.sh --runtime "${{ matrix.runtime }}" \
             --version "${{ matrix.version }}" --oci "${{ matrix.oci }}" --out "$OUT/cluster"
           # the cluster's kubectl ran as root with this HOME (sudo -E), and made
