@@ -55,6 +55,21 @@ measure() {
     return 0
 }
 run() { echo "+ $*" >> "$LOG"; "$@" >> "$LOG" 2>&1; }
+# The newest release tag of a GitHub project matching PATTERN (a sed
+# regex: vX.Y.Z), without the leading v, read with git's own protocol: the
+# matrix's first run asked GitHub's API, unauthenticated, from eight
+# runners at once, and was answered 504. Tried three times.
+latest() {   # OWNER/REPO PATTERN
+    local t i
+    for i in 1 2 3; do
+        t="$(git ls-remote --tags --refs "https://github.com/$1" 2>> "$LOG" |
+            sed -n "s|.*refs/tags/\($2\)$|\1|p" | sed 's/^v//' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
+        [ -n "$t" ] && { echo "$t"; return 0; }
+        sleep $((i * 5))
+    done
+    return 1
+}
+get() { curl -fsSL --retry 3 --retry-delay 5 "$@"; }
 # On a failure, what the runtime and the kubelet said, and the containers
 # the runtime made (the first run's crun cells failed with neither kept)
 # The log's own tail is printed first: the fourth run's install failures
@@ -81,14 +96,10 @@ k8s_install() {
     run apt-get install -y cri-tools && command -v crictl > /dev/null && return 0
     measure "crictl.note" "no cri-tools package; the cri-tools release"
     local v
-    v="$(curl -fsSL "https://api.github.com/repos/kubernetes-sigs/cri-tools/releases?per_page=100" |
-        python3 -c "import json,sys,re
-a=[r['tag_name'][1:] for r in json.load(sys.stdin) if re.fullmatch(r'v\d+\.\d+\.\d+', r['tag_name'])]
-v=[t for t in a if t.startswith('$K8S.')] or a
-v.sort(key=lambda s: [int(x) for x in s.split('.')]); print(v[-1] if v else '')")"
+    v="$(latest kubernetes-sigs/cri-tools "v${K8S//./\\.}\\.[0-9]*" || latest kubernetes-sigs/cri-tools 'v1\.[0-9]*\.[0-9]*')"
     [ -n "$v" ] || fail "no cri-tools release found"
-    curl -fsSL -o "$OUT/crictl.tgz" "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$v/crictl-v$v-linux-$ARCH.tar.gz" || fail "downloading crictl $v"
-    curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$v/crictl-v$v-linux-$ARCH.tar.gz.sha256" |
+    get -o "$OUT/crictl.tgz" "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$v/crictl-v$v-linux-$ARCH.tar.gz" || fail "downloading crictl $v"
+    get "https://github.com/kubernetes-sigs/cri-tools/releases/download/v$v/crictl-v$v-linux-$ARCH.tar.gz.sha256" |
         awk '{print $1}' > "$OUT/crictl.sha" || fail "crictl's checksum"
     [ "$(sha256sum "$OUT/crictl.tgz" | awk '{print $1}')" = "$(cat "$OUT/crictl.sha")" ] || fail "crictl's checksum does not match"
     run tar -C /usr/local/bin -xzf "$OUT/crictl.tgz" crictl || fail "unpacking crictl"
@@ -105,7 +116,7 @@ run modprobe br_netfilter
 printf 'net.ipv4.ip_forward = 1\nnet.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\n' > /etc/sysctl.d/90-measure.conf
 run sysctl --system
 install -d -m 0755 /etc/apt/keyrings
-key() { curl -fsSL "$1Release.key" | gpg --dearmor --yes -o "$2"; }
+key() { get "$1Release.key" | gpg --dearmor --yes -o "$2"; }
 key "$K8S_REPO" /etc/apt/keyrings/kubernetes.gpg || fail "the Kubernetes package key"
 echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] $K8S_REPO /" > /etc/apt/sources.list.d/kubernetes.list
 
@@ -147,18 +158,15 @@ else
     run apt-get update || fail "apt-get update"
     k8s_install
     # The newest release of that minor, from the project's releases
-    full="$(curl -fsSL "https://api.github.com/repos/containerd/containerd/releases?per_page=100" |
-        python3 -c "import json,sys,re
-v=[r['tag_name'][1:] for r in json.load(sys.stdin) if re.fullmatch(r'v$VERSION\.\d+', r['tag_name'])]
-v.sort(key=lambda s: [int(x) for x in s.split('.')]); print(v[-1] if v else '')")"
+    full="$(latest containerd/containerd "v${VERSION//./\\.}\\.[0-9]*")"
     [ -n "$full" ] || fail "no containerd $VERSION release found"
-    curl -fsSL -o "$OUT/containerd.tgz" "https://github.com/containerd/containerd/releases/download/v$full/containerd-$full-linux-$ARCH.tar.gz" || fail "downloading containerd $full"
-    curl -fsSL "https://github.com/containerd/containerd/releases/download/v$full/containerd-$full-linux-$ARCH.tar.gz.sha256sum" |
+    get -o "$OUT/containerd.tgz" "https://github.com/containerd/containerd/releases/download/v$full/containerd-$full-linux-$ARCH.tar.gz" || fail "downloading containerd $full"
+    get "https://github.com/containerd/containerd/releases/download/v$full/containerd-$full-linux-$ARCH.tar.gz.sha256sum" |
         awk '{print $1}' > "$OUT/containerd.sha" || fail "containerd's checksum"
     [ "$(sha256sum "$OUT/containerd.tgz" | awk '{print $1}')" = "$(cat "$OUT/containerd.sha")" ] || fail "containerd's checksum does not match"
     run tar -C /usr/local -xzf "$OUT/containerd.tgz" || fail "unpacking containerd"
     command -v runc > /dev/null || run apt-get install -y runc
-    curl -fsSL -o /etc/systemd/system/containerd.service "https://raw.githubusercontent.com/containerd/containerd/v$full/containerd.service" || fail "containerd's unit"
+    get -o /etc/systemd/system/containerd.service "https://raw.githubusercontent.com/containerd/containerd/v$full/containerd.service" || fail "containerd's unit"
     install -d /etc/containerd
     /usr/local/bin/containerd config default > /etc/containerd/config.toml
     sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
@@ -185,9 +193,15 @@ PY
     measure "runtime" "containerd $full, $(runc --version | head -1)"
 fi
 # CNI plugins (bridge, portmap, loopback) for flannel, from the project's releases
-cni="$(curl -fsSL https://api.github.com/repos/containernetworking/plugins/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
-install -d /opt/cni/bin
-curl -fsSL "https://github.com/containernetworking/plugins/releases/download/$cni/cni-plugins-linux-$ARCH-$cni.tgz" | tar -C /opt/cni/bin -xz || fail "the CNI plugins"
+# (kubelet's kubernetes-cni package brings them; the project's release if not)
+if [ -x /opt/cni/bin/bridge ] && [ -x /opt/cni/bin/portmap ] && [ -x /opt/cni/bin/loopback ]; then
+    measure "cni" "the kubernetes-cni package's plugins"
+else
+    cni="v$(latest containernetworking/plugins 'v1\.[0-9]*\.[0-9]*')" || fail "no CNI plugins release found"
+    install -d /opt/cni/bin
+    get "https://github.com/containernetworking/plugins/releases/download/$cni/cni-plugins-linux-$ARCH-$cni.tgz" | tar -C /opt/cni/bin -xz || fail "the CNI plugins"
+    measure "cni" "the CNI plugins $cni"
+fi
 
 # --- the cluster
 cat > "$OUT/kubeadm.yaml" <<EOF
