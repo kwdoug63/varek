@@ -240,7 +240,7 @@ rc=$?
 
 # --- the cell's logs back, and the VM's journal
 mkdir -p "$OUT/cell"
-"${SSH[@]}" 'sudo journalctl -b --no-pager > /var/tmp/vm-cell/journal.log 2>&1; sudo tar -C /var/tmp/vm-cell -cf - .' |
+"${SSH[@]}" "sudo sh -c 'journalctl -b --no-pager > /var/tmp/vm-cell/journal.log 2>&1'; sudo tar -C /var/tmp/vm-cell -cf - ." |
     tar -C "$OUT/cell" -xf - 2>> "$LOG"
 cat "$OUT/cell/measure.txt" >> "$OUT/measure.txt" 2>/dev/null
 [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -s "$OUT/cell/summary.txt" ] &&

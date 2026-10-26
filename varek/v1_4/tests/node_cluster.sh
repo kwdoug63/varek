@@ -183,6 +183,12 @@ if [ "$RUNTIME" = crio ]; then
     # SELinux enforcing: CRI-O labels each container (container_t, a
     # category pair of its own), as OpenShift's nodes do; its default is off
     SEL=false; [ "$SELINUX" = Enforcing ] && SEL=true
+    # conmon, CRI-O's monitor of each container: the runtime's table above
+    # replaces the package's, which named CRI-O's own; on the runner one is
+    # on the PATH (podman's), on Rocky Linux 9 none is (the VM cell's first
+    # run: "conmon: executable file not found in $PATH")
+    MON=""
+    command -v conmon > /dev/null || { [ -x /usr/libexec/crio/conmon ] && MON='monitor_path = "/usr/libexec/crio/conmon"'; }
     cat > /etc/crio/crio.conf.d/90-measure.conf <<EOF
 [crio.runtime]
 cgroup_manager = "systemd"
@@ -191,6 +197,7 @@ selinux = $SEL
 
 [crio.runtime.runtimes.$OCI]
 runtime_path = "$ociPath"
+$MON
 
 # VAREK's plugin adjusts each container through NRI
 [crio.nri]
