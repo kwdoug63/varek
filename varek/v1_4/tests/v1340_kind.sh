@@ -96,6 +96,28 @@ cleanup() {
         for l in "$OUT"/node-agent*.log "$OUT"/plugin*.log; do
             [ -s "$l" ] && { echo "== ${l##*/}, its end"; tail -40 "$l"; }
         done
+        # the first supervised pod, its streams and what the node saw (the
+        # matrix's first CRI-O cells: every supervised pod killed at its start)
+        for l in "$OUT/pod-a.log" "$OUT/pod-a.describe"; do
+            [ -s "$l" ] && { echo "== ${l##*/}, its end"; tail -30 "$l"; }
+        done
+        rm -rf "$OUT/streams-end"; mkdir -p "$OUT/streams-end"
+        if [ "$HOST" = 1 ]; then
+            sudo sh -c 'cp -a /var/log/varek/. "$1"/' sh "$OUT/streams-end" 2>/dev/null
+            sudo chown -R "$(id -u):$(id -g)" "$OUT/streams-end" 2>/dev/null
+        else
+            docker cp "$N:/var/log/varek/." "$OUT/streams-end" > /dev/null 2>&1
+        fi
+        for l in "$OUT"/streams-end/*.jsonl; do
+            [ -s "$l" ] && { echo "== stream ${l##*/}, its end"; tail -12 "$l" | cut -c1-400; }
+        done
+        echo "== the node's kernel: seccomp and kills"
+        on_node dmesg 2>/dev/null | grep -iE 'seccomp|type=1326|killed|segfault' | tail -20
+        if [ "$HOST" = 1 ]; then
+            echo "== the runtime's journal: errors and warnings"
+            sudo journalctl -u crio -u containerd --since "-15 min" --no-pager 2>/dev/null |
+                grep -iE 'level=(error|warn)|seccomp|notif|nri' | tail -40 | cut -c1-400
+        fi
     fi
     [ "$KEEP" = 1 ] || [ "$HOST" = 1 ] || kind delete cluster --name "$CL" > /dev/null 2>&1
 }
