@@ -72,9 +72,8 @@ jobs:
           - {name: "SELinux enforcing: CRI-O 1.35 on Rocky Linux 9", os: rocky9, cell: chart}
           - {name: "Rocky Linux 9 host: every suite", os: rocky9, cell: sweep}
           - {name: "Amazon Linux 2023 host: every suite", os: al2023, cell: sweep}
-    env:
-      OUT: ${{ github.workspace }}/vm-cell
-      CACHE: ${{ github.workspace }}/vm-cache
+    # the cell's files and the image cache in the runner's own space, not in
+    # the checkout the cell copies into the VM
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -85,23 +84,33 @@ jobs:
       - name: The image (its project's newest, and its SHA-256)
         id: img
         run: bash varek/v1_4/tests/vm_cell.sh resolve --os "${{ matrix.os }}" | tee -a "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      # restored here, saved after the cell even if it fails (a download
+      # is kept for the next run whatever the cell found)
+      - uses: actions/cache/restore@v4
+        id: cache
         with:
-          path: ${{ env.CACHE }}/${{ steps.img.outputs.file }}
+          path: ${{ runner.temp }}/vm-cache/${{ steps.img.outputs.file }}
           key: vm-${{ steps.img.outputs.file }}-${{ steps.img.outputs.sha }}
       - name: The cell
         run: |
+          OUT="$RUNNER_TEMP/vm-cell" CACHE="$RUNNER_TEMP/vm-cache"
           mkdir -p "$OUT" "$CACHE"
           sudo -E env "PATH=$PATH" bash varek/v1_4/tests/vm_cell.sh run --os "${{ matrix.os }}" --cell "${{ matrix.cell }}" \
             --cache "$CACHE" --out "$OUT" --archive "$RUNNER_TEMP/varek-node.tar" \
             --file "${{ steps.img.outputs.file }}" --sha "${{ steps.img.outputs.sha }}" --base "${{ steps.img.outputs.base }}"
+      - uses: actions/cache/save@v4
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/vm-cache/${{ steps.img.outputs.file }}
+          key: vm-${{ steps.img.outputs.file }}-${{ steps.img.outputs.sha }}
       - name: Keep the logs (not the VM's key or disks)
         if: always()
         run: |
+          OUT="$RUNNER_TEMP/vm-cell" CACHE="$RUNNER_TEMP/vm-cache"
           sudo rm -f "$OUT"/vm/key "$OUT"/vm/key.pub "$OUT"/vm/*.qcow2 "$OUT"/vm/seed.iso
           sudo chmod -R a+rX "$OUT" "$CACHE" 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: vm-${{ matrix.os }}-${{ matrix.cell }}
-          path: ${{ github.workspace }}/vm-cell
+          path: ${{ runner.temp }}/vm-cell

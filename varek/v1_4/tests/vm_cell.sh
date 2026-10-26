@@ -164,6 +164,7 @@ START=$(date +%s)
 # --- the runner: qemu, and /dev/kvm opened to its user (GitHub's udev rule)
 apt-get update -q >> "$LOG" 2>&1
 apt-get install -y -q qemu-system-x86 qemu-utils cloud-image-utils >> "$LOG" 2>&1 || { tail -20 "$LOG"; echo "vm_cell.sh: qemu did not install"; exit 1; }
+measure "runner.qemu" "$(qemu-system-x86_64 --version | head -1), installed in $(( $(date +%s) - START )) s"
 echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' > /etc/udev/rules.d/99-kvm4all.rules
 udevadm control --reload-rules >> "$LOG" 2>&1; udevadm trigger --name-match=kvm >> "$LOG" 2>&1
 [ -w /dev/kvm ] || { echo "vm_cell.sh: no /dev/kvm on this runner"; exit 1; }
@@ -223,7 +224,11 @@ measure "vm.up" "$(( $(date +%s) - START )) s from the start; $MEM MB, $CPUS CPU
 
 # --- the checkout (and the node image) into the VM, where the user nobody
 # can read it (the suites run tools as nobody), then the cell
-tar -C "$ROOT" -cf - . | "${SSH[@]}" 'sudo rm -rf /opt/varek && sudo mkdir -p /opt/varek && sudo tar -C /opt/varek -xf - --no-same-owner' ||
+# (the run's own files and the image cache left out, if they are in it: the
+# first run copied the VM's disk as the VM wrote it, and failed)
+ex=()
+for d in "$OUT" "$CACHE"; do case "$(realpath -m "$d")" in "$ROOT"/*) ex+=("--exclude=./$(realpath -m --relative-to="$ROOT" "$d")") ;; esac; done
+tar -C "$ROOT" "${ex[@]}" -cf - . | "${SSH[@]}" 'sudo rm -rf /opt/varek && sudo mkdir -p /opt/varek && sudo tar -C /opt/varek -xf - --no-same-owner' ||
     { echo "vm_cell.sh: the checkout did not copy"; exit 1; }
 args=(--cell "$CELL" --crio "$CRIO" --oci "$OCI" --out /var/tmp/vm-cell)
 if [ "$CELL" = chart ]; then
