@@ -115,11 +115,13 @@ if [ "$CMD" = inside ]; then
         "$HERE/tests/arm64_sweep.sh" --deps --out "$OUT/sweep" "${SUITES[@]}"
         rc=$?
         cp "$OUT/sweep/summary.txt" "$OUT/summary.txt" 2>/dev/null
-        # each failed suite's failing checks, with the lines before them, in
-        # the job's log (the artifact holds the whole logs)
+        # each failed suite's whole log in the job's log (its first 1500
+        # lines): the artifact holds it too, but where it cannot be read the
+        # failing checks' excerpts alone did not say why (run 5's network
+        # checks)
         for s in $(awk '$2 == "FAILED" {print $1}' "$OUT/sweep/summary.txt" 2>/dev/null); do
-            echo "== $s: its failures"
-            grep -B6 -A4 '  FAIL' "$OUT/sweep/$s.log" | cut -c1-300 | head -120
+            echo "== $s: its log"
+            cut -c1-300 "$OUT/sweep/$s.log" | head -1500
         done
         exit $rc ;;
     chart)

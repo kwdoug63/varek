@@ -260,7 +260,8 @@ R=$(rec_of /etc/passwd)
 grep -q '"decision_raw":"ALLOW","decision_final":"DENY","rule":"outside_plan"' <<<"$R" && grep -q "\"plan\":\"$OUT/h1.plan\"" <<<"$R" \
     && pass "held: a file the policy allows but no step covers: refused, outside_plan, the policy's verdict kept, the plan named" \
     || flunk "held: the outside file ($R)"
-check "held: the agent got EACCES for it" grep -q 'cat: /etc/passwd: Permission denied' "$OUT/held.err"
+grep -q 'cat: /etc/passwd: Permission denied' "$OUT/held.err" && pass "held: the agent got EACCES for it" ||
+    flunk "held: the agent got EACCES for it (cat said: $(grep -v '^{' "$OUT/held.err" | grep -m2 'passwd' | tr '\n' ' '))"
 check "run_start names the plan and its SHA-256" grep -q "\"hold\":{\"plan\":\"$OUT/h1.plan\",\"plan_sha256\":\"$(sha256sum "$OUT/h1.plan" | cut -c1-64)\"}" "$OUT/held.err"
 python3 "$HERE/tools/varek_audit.py" --policy "$HP" --checker "$CHECKER" "$OUT/held.err" > "$OUT/audit" 2>&1 \
     && grep -q 'varek_audit: PASS' "$OUT/audit" && pass "varek_audit accepts the held run" || flunk "varek_audit on the held run ($(tail -2 "$OUT/audit"))"
