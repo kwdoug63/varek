@@ -28,7 +28,7 @@ for a in "$@"; do [ "$prev" = --credential-list ] && cp "$a" "$(dirname "$0")/li
 case "$1" in */bad.policy) echo "[warden] policy: line 1: no" >&2; exit 1 ;; esac
 case "$1" in */slow.policy) exec sleep 5 ;; esac
 [ "$2" = --oci-filter ] || exit 2
-case "$3" in --plan) [ -f "$4" ] || exit 2; case "$4" in */badplan.plan) echo "[warden] --oci-filter: the plan $4: the node agent does not carry mcp_call steps yet (step m)" >&2; exit 1 ;; esac ;;
+case "$3" in --plan) [ -f "$4" ] || exit 2; case "$4" in */badplan.plan) echo "[warden] --oci-filter: the plan $4: the plan does not read: line 2: an unknown kind of step" >&2; exit 1 ;; esac ;;
   --no-plan) case "$1" in */needsplan.policy) echo "[warden] --oci-filter: the policy says ` + "`require plan`" + `: a pod under it names its plan (varek.dev/plan)" >&2; exit 1 ;; esac ;;
   *) exit 2 ;; esac
 creds=; case "$1" in */creds.policy) creds=',"varekCredentials":["gh"]' ;; */credsbad.policy) creds=',"varekCredentials":["GH-x"]' ;; esac
@@ -258,7 +258,7 @@ func TestPlan(t *testing.T) {
 	}{
 		{"a plan name that is not one", map[string]string{annotation: "agent", planAnnotation: "Plan_1"}, "the plan name \"Plan_1\""},
 		{"no such plan", map[string]string{annotation: "agent", planAnnotation: "nosuch"}, "no plan named nosuch in namespace ns"},
-		{"a plan the Warden refuses", map[string]string{annotation: "agent", planAnnotation: "badplan"}, "the plan badplan.plan: the node agent does not carry mcp_call steps"},
+		{"a plan the Warden refuses", map[string]string{annotation: "agent", planAnnotation: "badplan"}, "the plan badplan.plan: the plan does not read"},
 		{"`require plan`, no plan named", map[string]string{annotation: "needsplan"}, "a pod under it names its plan"},
 	} {
 		adj, err := p.adjust(context.Background(), pod(c.ann), ctr("/bin/x"))

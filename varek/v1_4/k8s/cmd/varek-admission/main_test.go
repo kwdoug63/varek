@@ -17,7 +17,8 @@ import (
 )
 
 // a stand-in for the Warden: it refuses a policy holding "bad"; v1.35: a
-// plan holding "mcp_call" (--plan), and --no-plan for a policy holding
+// plan holding "nosuchkind" (--plan; v1.36 step 5: a plan that does not
+// read, as every kind of step is carried), and --no-plan for a policy holding
 // "require plan"; v1.36: a policy's first credential (credential NAME from
 // SRC) not given to --pod-namespace from SRC by --credential-list
 const fakeWarden = `#!/bin/sh
@@ -34,7 +35,7 @@ while [ $# -gt 0 ]; do
     *) exit 2 ;;
   esac
 done
-[ -n "$plan" ] && grep -q mcp_call "$plan" && { echo "[warden] --oci-filter: the plan $plan: the node agent does not carry mcp_call steps yet (step m)" >&2; exit 1; }
+[ -n "$plan" ] && grep -q nosuchkind "$plan" && { echo "[warden] --oci-filter: the plan $plan: the plan does not read: line 2: an unknown kind of step" >&2; exit 1; }
 [ -n "$noplan" ] && grep -q 'require plan' "$pol" && { echo "[warden] --oci-filter: the policy says require plan: a pod under it names its plan (varek.dev/plan)" >&2; exit 1; }
 c=$(sed -n 's/^credential \([a-z_]*\) from \(.*\)$/\1 \2/p' "$pol" | head -1)
 if [ -n "$c" ]; then
@@ -103,7 +104,7 @@ func testServer(t *testing.T, warden string) *server {
 		"team-a/needs":     "require warden 1.35\nrequire plan\nallow path /tmp/\n",
 		"team-a/held":      "require warden 1.35\nallow path /tmp/\n", // step 9: a plan needs a 1.35 policy
 		"plan:team-a/p1":   "plan 1.35\naction a file_open /tmp/x\n",
-		"plan:team-a/pmcp": "plan 1.35\naction m mcp_call http://10.0.0.1/mcp\n",
+		"plan:team-a/pbad": "plan 1.35\naction m nosuchkind /x\n",
 		// v1.36 step 4 (D2)
 		"team-a/creds":  "require warden 1.28\nproxy on\ncredential gh from file:/var/lib/varek/credentials/gh/token\nallow host api.github.com:443\n",
 		"team-b/creds":  "require warden 1.28\nproxy on\ncredential gh from file:/var/lib/varek/credentials/gh/token\nallow host api.github.com:443\n",
@@ -324,8 +325,8 @@ func TestRealWarden(t *testing.T) {
 	}{
 		{"a plan it reads", "plan 1.35\naction a file_open /tmp/x open=read\n", ""},
 		{"one it does not", "plan 1.36\n", "refuses this plan"},
-		{"an mcp_call step, which the node agent does not carry yet", "plan 1.35\naction m mcp_call http://10.0.0.1:8080/mcp\n",
-			"does not carry mcp_call steps yet (step m)"},
+		// v1.36 step 5 (D4): carried, decided as on a host when the pod starts
+		{"an mcp_call step", "plan 1.35\naction m mcp_call http://10.0.0.1:8080/mcp\n", ""},
 	} {
 		ok, msg := post(t, s, "/varekplan", "team-a", vplan("p1", c.text))
 		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
@@ -351,8 +352,8 @@ func TestVarekPlan(t *testing.T) {
 		{"a plan the Warden reads", "p1", "plan 1.35\naction a file_open /tmp/x\n", ""},
 		{"a name the node agent does not take", "P_1", "plan 1.35\n", "is not 1 to 63"},
 		{"an empty plan", "p1", " \n", "the plan is empty"},
-		{"a step the node agent does not carry", "p1", "plan 1.35\naction m mcp_call http://10.0.0.1/mcp\n",
-			"refuses this plan: --oci-filter: the plan: the node agent does not carry mcp_call steps yet"},
+		{"a plan the Warden does not read", "p1", "plan 1.35\naction m nosuchkind /x\n",
+			"refuses this plan: --oci-filter: the plan: the plan does not read"},
 	} {
 		ok, msg := post(t, s, "/varekplan", "team-a", vplan(c.name, c.text))
 		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
@@ -383,7 +384,7 @@ func TestPodPlan(t *testing.T) {
 		{"`require plan`, no plan named", agentPod("needs", nil), "refuses its policy needs: --oci-filter: the policy says require plan"},
 		{"no such plan in the namespace", withPlan("held", "nosuch"), "no VarekPlan nosuch in namespace team-a"},
 		{"a plan name that is not one", withPlan("held", "P_1"), "its plan name \"P_1\""},
-		{"a plan the Warden refuses with the policy", withPlan("held", "pmcp"), "refuses its policy held with its plan pmcp"},
+		{"a plan the Warden refuses with the policy", withPlan("held", "pbad"), "refuses its policy held with its plan pbad"},
 		{"a plan and no policy", withPlan("", "p1"), "names a plan (varek.dev/plan) and no policy"},
 	} {
 		ok, msg := post(t, s, "/pod", "team-a", c.p)

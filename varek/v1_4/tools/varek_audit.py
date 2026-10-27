@@ -320,7 +320,8 @@ DRY_NEVER_LET = ("protected_object", "raw_device", "view_write_refused", "change
                  "subagent_same_image", "subagent_limit", "subagent_depth", "subagent_failed",
                  "intent_derivation_failed", "rename_directory_refused", "bad_descriptor",
                  "bad_address", "family_refused", "unspec_refused", "dns_refused",
-                 "subagent_env")                                        # v1.31 review
+                 "subagent_env",                                        # v1.31 review
+                 "subagent_first_process")                              # v1.36 step 5
 
 
 def check_hold(meta, records, problems):
@@ -943,6 +944,10 @@ EXEC_REFUSALS = ("policy_match", "default_deny_unknown", "certificate_refused", 
                  "intent_derivation_failed", "exec_identity_unreadable",
                  # v1.28.1 step 3: a sub-agent's launch the Warden could not make one
                  "subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed",
+                 "subagent_same_image",
+                 # v1.36 step 5: under the node agent, a sub-agent launched by the container's
+                 # first process itself (it stays in the container's group)
+                 "subagent_first_process",
                  # v1.31 review: a confined subject launched with a variable that names code
                  "subagent_env",
                  # v1.31 (the shared soak): a launch after the run was revoked (checked
@@ -950,7 +955,8 @@ EXEC_REFUSALS = ("policy_match", "default_deny_unknown", "certificate_refused", 
                  "revoked",
                  # v1.35 step 9 (review): a launch the policy allows and the run's plan does not name
                  "outside_plan")
-SUBAGENT_REFUSALS = ("subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed", "subagent_env")
+SUBAGENT_REFUSALS = ("subagent_threaded", "subagent_limit", "subagent_depth", "subagent_failed", "subagent_env",
+                     "subagent_same_image", "subagent_first_process")
 EXEC_RESULTS = ("launched", "failed", "gone", "killed")
 
 
