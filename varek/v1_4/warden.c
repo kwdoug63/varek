@@ -6296,7 +6296,7 @@ int main(int argc, char **argv) {
     if (p.v.proxy && geteuid() == 0) {
         if (wp_start(&g_proxy, proxy_fd, pxa.uid, pxa.gid) < 0) {
             fprintf(stderr, "[warden] cannot start the egress proxy (%s); refusing to start\n",
-                    strerror(errno));
+                    g_proxy.why[0] ? g_proxy.why : strerror(errno));
             if (g_sk) sodium_free(g_sk);
             return 1;
         }

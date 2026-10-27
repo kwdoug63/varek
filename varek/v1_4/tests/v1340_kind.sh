@@ -118,8 +118,13 @@ cleanup() {
         for l in "$OUT"/streams-end/*.jsonl; do
             [ -s "$l" ] && { echo "== stream ${l##*/}, its end"; tail -12 "$l" | cut -c1-400; }
         done
-        echo "== the node's kernel: seccomp and kills"
-        on_node dmesg 2>/dev/null | grep -iE 'seccomp|type=1326|killed|segfault' | tail -20
+        # v1.36 step 4: what the runtime confines the node agent with (its
+        # LSM label, its seccomp mode), as each runtime gives a privileged pod
+        echo "== the node agent's confinement"
+        kubectl -n "$NS" exec ds/varek-node -c node-agent -- sh -c \
+            'echo "label: $(cat /proc/self/attr/current 2>&1)"; grep -E "^(Seccomp|NoNewPrivs|CapEff):" /proc/self/status' 2>&1 | head -6
+        echo "== the node's kernel: seccomp, AppArmor and kills"
+        on_node dmesg 2>/dev/null | grep -iE 'seccomp|type=1326|killed|segfault|apparmor=.DENIED' | tail -20
         if [ "$HOST" = 1 ]; then
             echo "== the runtime's journal: errors and warnings"
             sudo journalctl -u crio -u containerd --since "-15 min" --no-pager 2>/dev/null |
