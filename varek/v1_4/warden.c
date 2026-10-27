@@ -846,6 +846,9 @@ struct node_run {
     char   cred_env[64][160];
     int    ncred_env;
     bool   cred_env_over;       /* more VAREK_CRED_ entries than are kept, or one too long */
+    /* v1.36 step 6 (D5): the Secret the user's token is in (varek.dev/on-behalf-of,
+     * which the NRI plugin copies from the pod), or "" */
+    char   obo[254];
 };
 static struct node_run g_nr = { .notify_fd = -1, .pidfd = -1, .set_view = -1, .node_netns = -1 };
 static void node_run_start(FILE *f);
@@ -5746,6 +5749,8 @@ static void usage(const char *argv0) {
         "       %s <policies dir | policy.txt> --node-agent <socket> --node-streams <dir>\n"
         "              [--node-launcher <varek-init>]   (v1.34: the node agent, one supervisor a container)\n"
         "              [--node-credentials <dir>]   (v1.36: where a file: credential is)\n"
+        "              [--node-kubelet <dir>] [--node-spire-socket <admin socket> [--node-spire-self <SPIFFE ID>]\n"
+        "               [--node-svid-helper <varek-svid>]]   (v1.36: the pod's user's token and SVID)\n"
         "       %s <policy.txt> --oci-filter [--plan PLAN | --no-plan]   (v1.34: the policy's filter in OCI's form, for the\n"
         "              NRI plugin; v1.35: with the pod's plan, or for a pod that names none)\n"
         "              [--credential-list FILE --pod-namespace NS]   (v1.36: the cluster's VarekCredential resources)\n"
@@ -5903,6 +5908,7 @@ int main(int argc, char **argv) {
     const char *proxy_bin_arg = NULL;   /* v1.26.1: the warden-proxy binary */
     const char *secrets_bin_arg = NULL, *secrets_as_arg = NULL, *secrets_conf_arg = NULL;   /* v1.28 */
     const char *obo_arg = NULL, *svid_arg = NULL, *obo_exp_arg = NULL;                  /* v1.28.1 */
+    const char *node_kubelet_arg = NULL;                                                 /* v1.36 step 6 */
     const char *flow_path   = NULL;     /* v1.18.0 */
     const char *session_arg = NULL;     /* v1.18.0 */
     const char *state_arg   = NULL;     /* v1.18.0 */
@@ -5949,6 +5955,14 @@ int main(int argc, char **argv) {
             node_launcher = argv[++i];
         } else if (strcmp(argv[i], "--node-credentials") == 0 && !g_node_creds_dir) {   /* v1.36 step 4 */
             g_node_creds_dir = argv[++i];
+        } else if (strcmp(argv[i], "--node-kubelet") == 0 && !node_kubelet_arg && i + 1 < argc) {   /* v1.36 step 6 */
+            node_kubelet_arg = g_node_kubelet = argv[++i];
+        } else if (strcmp(argv[i], "--node-spire-socket") == 0 && !g_node_spire && i + 1 < argc) {
+            g_node_spire = argv[++i];
+        } else if (strcmp(argv[i], "--node-spire-self") == 0 && !g_node_spire_self && i + 1 < argc) {
+            g_node_spire_self = argv[++i];
+        } else if (strcmp(argv[i], "--node-svid-helper") == 0 && !g_node_svid_bin && i + 1 < argc) {
+            g_node_svid_bin = argv[++i];
         } else if (strcmp(argv[i], "--credential-list") == 0 && !cred_list_arg) {
             cred_list_arg = argv[++i];
         } else if (strcmp(argv[i], "--pod-namespace") == 0 && !pod_ns_arg) {
@@ -6085,11 +6099,17 @@ int main(int argc, char **argv) {
     if ((node_sock && (sep_idx >= 0 || g_check_only || !node_streams || g_writable_exec || plan_path ||
                        flow_path || g_hold_req)) ||
         (node_launcher && !node_sock) || (oci_no_plan && !oci_only) ||    /* v1.34 step 2 */
-        (g_node_creds_dir && !node_sock) || ((cred_list_arg || pod_ns_arg) && !oci_only)) {   /* v1.36 step 4 */
+        (g_node_creds_dir && !node_sock) || ((cred_list_arg || pod_ns_arg) && !oci_only) ||   /* v1.36 step 4 */
+        ((node_kubelet_arg || g_node_spire || g_node_spire_self || g_node_svid_bin) && !node_sock) ||  /* step 6 */
+        ((g_node_spire_self || g_node_svid_bin) && !g_node_spire) ||
+        (node_sock && (obo_arg || svid_arg || obo_exp_arg))) {     /* step 6: each pod names its own */
         fprintf(stderr, "[warden] --node-agent takes --node-streams DIR, and no agent (\"--\"), check, plan (each "
                 "pod names its own, v1.35) or --writable-exec (a pod's mounts are checked, D4); --node-launcher "
                 "goes with --node-agent, --no-plan with --oci-filter; v1.36: --node-credentials goes with --node-agent, "
-                "--credential-list and --pod-namespace with --oci-filter\n");
+                "--credential-list and --pod-namespace with --oci-filter; --node-kubelet and --node-spire-socket with "
+                "--node-agent, --node-spire-self and --node-svid-helper with --node-spire-socket; and not "
+                "--on-behalf-of, --agent-svid or --on-behalf-of-expiry (each pod names its user's token, "
+                "varek.dev/on-behalf-of, and its SVID is its own, from SPIRE)\n");
         return 2;
     }
     if (node_sock && node_listen(node_sock, node_streams, node_launcher, &policy_path, &plan_path) < 0) return 1;
@@ -6229,6 +6249,7 @@ int main(int argc, char **argv) {
             snprintf(why, sizeof why, "%s is not carried under the node agent yet", no);
             node_fail(why);
         }
+        node_obo(&p, &obo_arg, &svid_arg);                                 /* v1.36 step 6 (D5) */
     }
     /* v1.35 step 4 (D7): a policy that says `require plan` runs an agent only
      * with a plan it is held to */
@@ -6512,6 +6533,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "[warden]   actor %u: %s%s%s\n", k + 1, id->act[k].sub,
                             id->act[k].iss[0] ? ", issuer " : "", id->act[k].iss);
             }
+            if (g_nr.on) node_obo_forget();                                /* v1.36 step 6: read, verified */
             if (g_identity.has_svid)
                 fprintf(stderr, "[warden] agent %s: SVID verified against the bundle for %s (line %d), SHA-256 %s\n",
                         g_identity.spiffe_id, p.v.spiffe[g_identity.spiffe].domain, p.v.spiffe[g_identity.spiffe].line,
