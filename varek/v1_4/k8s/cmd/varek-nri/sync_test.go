@@ -145,3 +145,53 @@ func TestSyncPlans(t *testing.T) {
 		t.Errorf("the plans' prune leaves the policies: %v", err)
 	}
 }
+
+// v1.36 step 4 (D2): the VarekCredential resources, as one list beside the
+// policies (POLICY_DIR/.credentials), the ones the node agent does not take
+// left out, rewritten as they change
+func TestSyncCredentials(t *testing.T) {
+	cr := func(name, cred, src, ns string) string {
+		return fmt.Sprintf(`{"metadata":{"name":%q,"resourceVersion":"1"},"spec":{"credential":%q,"source":%q,"namespaces":[%s]}}`,
+			name, cred, src, ns)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/apis/varek.dev/v1alpha1/varekcredentials" {
+			http.Error(w, "no", http.StatusNotFound)
+			return
+		}
+		fmt.Fprintf(w, `{"metadata":{"resourceVersion":"3"},"items":[%s,%s,%s]}`,
+			cr("gh-token", "gh", "file:/var/lib/varek/credentials/gh/token", `"team-a","team-b"`),
+			cr("db", "db", "vault:database/creds/ro#password", `"team-a"`),
+			cr("bad", "Bad-Name", "file:/x", `"team-a"`))
+	}))
+	defer srv.Close()
+	pol := t.TempDir()
+	s := &credSyncer{c: &kube.Client{Base: srv.URL, HTTP: srv.Client()}, dir: pol, logf: t.Logf}
+	if _, err := s.list(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := "# VAREK: the cluster's VarekCredential resources (v1.36): credential, namespaces, source, resource\n" +
+		"db\tteam-a\tvault:database/creds/ro#password\tdb\n" +
+		"gh\tteam-a,team-b\tfile:/var/lib/varek/credentials/gh/token\tgh-token\n"
+	path := filepath.Join(pol, kube.CredentialListFile)
+	if b, _ := os.ReadFile(path); string(b) != want {
+		t.Errorf("the list: %q", b)
+	}
+	if st, err := os.Stat(path); err != nil || st.Mode().Perm() != 0o644 {
+		t.Errorf("the list's mode: %v %v", st, err)
+	}
+	if err := s.event(kube.Event{Type: "DELETED", Object: []byte(cr("db", "db", "vault:database/creds/ro#password", `"team-a"`))}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.event(kube.Event{Type: "MODIFIED", Object: []byte(cr("gh-token", "gh", "file:/var/lib/varek/credentials/gh/token", `"team-c"`))}); err != nil {
+		t.Fatal(err)
+	}
+	want = "# VAREK: the cluster's VarekCredential resources (v1.36): credential, namespaces, source, resource\n" +
+		"gh\tteam-c\tfile:/var/lib/varek/credentials/gh/token\tgh-token\n"
+	if b, _ := os.ReadFile(path); string(b) != want {
+		t.Errorf("the list after a deletion and a change: %q", b)
+	}
+	if e, _ := os.ReadDir(pol); len(e) != 1 {
+		t.Errorf("only the list is left (no temporary file): %v", e)
+	}
+}

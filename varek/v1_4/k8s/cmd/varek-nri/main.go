@@ -62,11 +62,23 @@
 // with --no-plan, which a policy that says `require plan` refuses. The
 // plan's name and the SHA-256 of the bytes checked go in the container's
 // annotations, where the node agent takes them.
+//
+// v1.36 step 4 (docs/security/v1.36-kubernetes-parity.md, D1 and D2): a
+// policy that names credentials. The Warden checks each against the
+// cluster's VarekCredential list (-sync writes it as POLICY_DIR/.credentials;
+// a private copy is given, with the pod's namespace: --credential-list,
+// --pod-namespace) and names them in its output (varekCredentials). For each,
+// the container's environment gets its placeholder, VAREK_CRED_<NAME> =
+// varek_ph_<name>_ and 43 random base64url characters, made for that
+// container; the node agent takes it from there and hands it to the proxy,
+// which swaps in the value. The value is never here.
 package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -116,6 +128,9 @@ type ociProfile struct {
 	DefaultErrnoRet *uint32      `json:"defaultErrnoRet"`
 	Architectures   []string     `json:"architectures"`
 	Syscalls        []ociSyscall `json:"syscalls"`
+	// v1.36 step 4: the credentials the policy names, whose placeholders the
+	// container's environment gets (the Warden's, beside the profile)
+	VarekCredentials []string `json:"varekCredentials"`
 }
 
 type plugin struct {
@@ -213,7 +228,14 @@ func (p *plugin) filter(ctx context.Context, ns, name, plan string) (*ociProfile
 			return nil, "", "", err
 		}
 	}
-	key := sha + "/" + psha
+	// v1.36 step 4 (D2): the cluster's VarekCredential list, as -sync wrote it
+	// (none: an empty one), checked with the pod's namespace
+	lb, err := os.ReadFile(filepath.Join(p.policies, kube.CredentialListFile))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, "", "", fmt.Errorf("cannot read the credential list: %v", err)
+	}
+	lsum := sha256.Sum256(lb)
+	key := sha + "/" + psha + "/" + ns + "/" + hex.EncodeToString(lsum[:])
 	p.mu.Lock()
 	f, ok := p.filters[key]
 	p.mu.Unlock()
@@ -237,6 +259,11 @@ func (p *plugin) filter(ctx context.Context, ns, name, plan string) (*ociProfile
 		}
 		args = []string{copyPath, "--oci-filter", "--plan", planPath}
 	}
+	listPath := filepath.Join(dir, "credentials")
+	if err := os.WriteFile(listPath, lb, 0o600); err != nil {
+		return nil, "", "", err
+	}
+	args = append(args, "--credential-list", listPath, "--pod-namespace", ns)
 	cmd := exec.CommandContext(ctx, p.warden, args...)
 	var errb strings.Builder
 	cmd.Stderr = &errb
@@ -251,6 +278,11 @@ func (p *plugin) filter(ctx context.Context, ns, name, plan string) (*ociProfile
 	f = &ociProfile{}
 	if err := json.Unmarshal(out, f); err != nil || len(f.Syscalls) == 0 {
 		return nil, "", "", fmt.Errorf("the Warden's filter for policy %s does not read: %v", name, err)
+	}
+	for _, c := range f.VarekCredentials {
+		if !kube.CredentialName.MatchString(c) {
+			return nil, "", "", fmt.Errorf("the Warden names a credential %q that is not a credential's name", c)
+		}
 	}
 	p.mu.Lock()
 	if len(p.filters) >= 256 {
@@ -415,6 +447,14 @@ func (p *plugin) adjust(ctx context.Context, pod *api.PodSandbox, ctr *api.Conta
 			Options: append(append([]string{}, m.Options...), "noexec")})
 	}
 	adj.SetArgs(append([]string{launcherAt, "--"}, args...))
+	// v1.36 step 4 (D1): each credential's placeholder, made for this container
+	for _, c := range f.VarekCredentials {
+		ph, err := placeholder(c)
+		if err != nil {
+			return nil, refuse("cannot make a placeholder for credential %s: %v", c, err)
+		}
+		adj.AddEnv("VAREK_CRED_"+strings.ToUpper(c), ph)
+	}
 	adj.AddAnnotation(annotation, name)
 	adj.AddAnnotation("varek.dev/policy-sha256", sha)
 	if plan != "" { // v1.35 step 4c: the plan checked, for the node agent to hold the run to
@@ -432,6 +472,16 @@ func (p *plugin) adjust(ctx context.Context, pod *api.PodSandbox, ctr *api.Conta
 	adj.AddAnnotation("varek.dev/pod-uid", pod.GetUid())
 	adj.AddAnnotation("varek.dev/container", ctr.GetName())
 	return adj, nil
+}
+
+// placeholder is a credential's placeholder, as the Warden makes one on a host
+// (varek_ph_<name>_ and 32 random bytes in base64url, unpadded: 43 characters)
+func placeholder(name string) (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return "varek_ph_" + name + "_" + base64.RawURLEncoding.EncodeToString(b[:]), nil
 }
 
 // the time the plugin keeps of the runtime's for answering: past its
@@ -476,7 +526,7 @@ func main() {
 		"a pod of another is refused (the default handler, unnamed, is taken)")
 	// v1.34 step 5 (D7): the cluster's VarekPolicy resources into -policies
 	// (v1.35 step 4c: and its VarekPlan resources)
-	syncAPI := flag.Bool("sync", false, "write the cluster's VarekPolicy and VarekPlan resources to -policies (in a cluster)")
+	syncAPI := flag.Bool("sync", false, "write the cluster's VarekPolicy, VarekPlan and VarekCredential resources to -policies (in a cluster)")
 	api := flag.String("api", "", "-sync: the API server (default: the cluster's, from the service account)")
 	apiToken := flag.String("api-token", "", "-sync: the service account's token file")
 	apiCA := flag.String("api-ca", "", "-sync: the cluster's CA")
@@ -503,6 +553,7 @@ func main() {
 		logf := func(f string, a ...interface{}) { fmt.Fprintf(os.Stderr, f+"\n", a...) }
 		go (&syncer{c: c, dir: p.policies, logf: logf}).run(context.Background())
 		go (&syncer{c: c, dir: p.policies, logf: logf, resource: kube.Plans}).run(context.Background())
+		go (&credSyncer{c: c, dir: p.policies, logf: logf}).run(context.Background()) // v1.36 step 4 (D2)
 	}
 	opts := []stub.Option{stub.WithPluginName("varek"), stub.WithPluginIdx("10")}
 	if *socket != "" {

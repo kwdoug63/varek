@@ -47,3 +47,38 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/* v1.36 step 4 (D1): warden-secrets' configuration from the credentials
+  values, key = value lines, or "" when no vault: or aws-sm: store is
+  configured (file: stores need none) */}}
+{{- define "varek.secretsConf" -}}
+{{- $c := .Values.credentials -}}
+{{- if and (or $c.vault.caSecret $c.vault.kubernetesAuth.role) (not $c.vault.addr) }}
+{{- fail "credentials.vault: caSecret and kubernetesAuth.role need vault.addr" }}
+{{- end }}
+{{- if $c.vault.addr }}
+vault_addr = {{ $c.vault.addr }}
+{{- if $c.vault.caSecret }}
+vault_ca = /etc/varek/vault-ca/ca.crt
+{{- end }}
+{{- if $c.vault.kubernetesAuth.role }}
+vault_k8s_role = {{ $c.vault.kubernetesAuth.role }}
+vault_k8s_jwt_file = /var/run/varek/tokens/vault/token
+vault_k8s_mount = {{ $c.vault.kubernetesAuth.mount }}
+{{- end }}
+{{- end }}
+{{- if $c.aws.region }}
+aws_region = {{ $c.aws.region }}
+{{- end }}
+{{- if and $c.aws.roleArn $c.aws.podIdentity }}
+{{- fail "credentials.aws: give roleArn (IRSA) or podIdentity, not both" }}
+{{- end }}
+{{- if $c.aws.roleArn }}
+aws_role_arn = {{ $c.aws.roleArn }}
+aws_web_identity_token_file = /var/run/varek/tokens/aws/token
+{{- end }}
+{{- if $c.aws.podIdentity }}
+aws_container_credentials_uri = http://169.254.170.23/v1/credentials
+aws_container_token_file = /var/run/varek/tokens/aws/token
+{{- end }}
+{{- end -}}

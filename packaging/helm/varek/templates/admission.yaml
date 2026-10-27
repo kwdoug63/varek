@@ -118,6 +118,9 @@ spec:
             - -runtime-classes
             - {{ join "," . | quote }}
             {{- end }}
+            # v1.36 step 4 (D1): a VarekCredential's file: source is under the node agent's directory
+            - -credentials-dir
+            - {{ .Values.credentials.dir }}
           ports:
             - { name: https, containerPort: 8443 }
           readinessProbe:
@@ -174,7 +177,7 @@ metadata:
   {{- end }}
 webhooks:
   {{- $excluded := concat (list .Release.Namespace) .Values.admission.excludeNamespaces | uniq }}
-  {{- range $hook := list (dict "name" "varekpolicy" "path" "/varekpolicy" "resource" "varekpolicies") (dict "name" "varekplan" "path" "/varekplan" "resource" "varekplans") (dict "name" "pod" "path" "/pod") (dict "name" "pod-required" "path" "/pod-required") }}
+  {{- range $hook := list (dict "name" "varekpolicy" "path" "/varekpolicy" "resource" "varekpolicies") (dict "name" "varekplan" "path" "/varekplan" "resource" "varekplans") (dict "name" "varekcredential" "path" "/varekcredential" "resource" "varekcredentials") (dict "name" "pod" "path" "/pod") (dict "name" "pod-required" "path" "/pod-required") }}
   - name: {{ $hook.name }}.varek.dev
     {{- if $hook.resource }}
     rules:

@@ -45,6 +45,20 @@
 //	               the container's view, as the container starts. On an
 //	               update, the plan's annotation is fixed as the policy's is.
 //
+// v1.36 step 4 (docs/security/v1.36-kubernetes-parity.md, D2): credentials.
+//
+//	/varekcredential  a VarekCredential created or changed (cluster-scoped):
+//	                  its credential's name as a policy writes it, its source
+//	                  (file:, under -credentials-dir when given; vault:;
+//	                  aws-sm:) and the namespaces given it;
+//	/varekpolicy, /pod and a policy that names credentials: the Warden checks
+//	                  each against the cluster's VarekCredential resources for
+//	                  the policy's namespace (warden --oci-filter
+//	                  --credential-list --pod-namespace): given to it, from
+//	                  the source the policy names. The node agent checks the
+//	                  same at the container's start, so a webhook that is down
+//	                  or bypassed is not enough.
+//
 // Each answer that refuses says why; the API server shows it to whoever
 // applied the object.
 //
@@ -53,7 +67,7 @@
 // by the policy's SHA-256.
 //
 //	varek-admission -warden FILE -tls-cert FILE -tls-key FILE [-listen :8443]
-//	                [-runtime-classes NAME,...]
+//	                [-runtime-classes NAME,...] [-credentials-dir DIR]
 package main
 
 import (
@@ -177,19 +191,23 @@ type checked struct {
 	launches bool
 }
 
-// the API server's part the webhook reads: a namespace's policy and plan
+// the API server's part the webhook reads: a namespace's policy and plan;
+// v1.36 step 4: the cluster's VarekCredential resources
 type reader interface {
 	GetPolicy(ctx context.Context, ns, name string) (*kube.Policy, error)
 	GetPlan(ctx context.Context, ns, name string) (*kube.Policy, error)
+	ListCredentials(ctx context.Context) ([]*kube.Policy, error)
 }
 
 type server struct {
 	warden  string
 	api     reader
 	classes map[string]bool // runtime classes whose handler runs the Warden's filter (G-4)
-	mu      sync.Mutex
-	cache   map[[32]byte]checked // by the SHA-256 of what was checked (W2): the policy, and the pod's plan
-	slots   chan struct{}        // the Warden's checks at once (W2)
+	credDir string          // v1.36 step 4: where a file: source must be (the chart's), or ""
+
+	mu    sync.Mutex
+	cache map[[32]byte]checked // by the SHA-256 of what was checked (W2): the policy, and the pod's plan
+	slots chan struct{}        // the Warden's checks at once (W2)
 }
 
 // `require warden X.Y` from 1.27 on turns decided launches on (v1.27); the
@@ -197,6 +215,10 @@ type server struct {
 var requireLine = regexp.MustCompile(`(?m)^[ \t\r\v\f]*require[ \t\r\v\f]+warden[ \t\r\v\f]+(\d+)\.(\d+)`)
 
 func decidesLaunches(text string) bool { return requiresWarden(text, 1, 27) }
+
+// v1.36 step 4: a policy naming a credential (the Warden splits a line on
+// the same white space); only then is the cluster's list read for its check
+var credentialLine = regexp.MustCompile(`(?m)^[ \t\r\v\f]*credential[ \t\r\v\f]`)
 
 // requiresWarden: the policy says `require warden X.Y` of at least major.minor
 func requiresWarden(text string, major, minor int) bool {
@@ -229,12 +251,22 @@ const planCarrier = "require warden 1.35\n"
 // Its verdict is kept; a check that did not finish (the request's time, a
 // failure of the webhook's own) is not. v1.35 step 4c: with a pod's plan
 // (of podWithPlan), or for a pod naming none (podNoPlan).
-func (s *server) check(ctx context.Context, text string) checked {
-	return s.checkPlan(ctx, text, policyAlone, "")
+func (s *server) check(ctx context.Context, text, ns string) checked {
+	return s.checkPlan(ctx, text, policyAlone, "", ns)
 }
 
-func (s *server) checkPlan(ctx context.Context, text string, of checkOf, plan string) checked {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%d\x00%d\x00%s\x00%s", of, len(text), text, plan)))
+// v1.36 step 4 (D2): of the namespace ns, whose given credentials (the
+// cluster's list, read only for a policy naming one) are checked with it
+func (s *server) checkPlan(ctx context.Context, text string, of checkOf, plan, ns string) checked {
+	list := ""
+	if credentialLine.MatchString(text) {
+		cs, err := s.api.ListCredentials(ctx)
+		if err != nil {
+			return checked{why: "the cluster's VarekCredential resources cannot be read from the API server: " + err.Error()}
+		}
+		list = kube.CredentialList(cs)
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d\x00%d\x00%s\x00%d\x00%s\x00%s\x00%s", of, len(text), text, len(plan), plan, ns, list)))
 	s.mu.Lock()
 	c, ok := s.cache[sum]
 	s.mu.Unlock()
@@ -258,6 +290,13 @@ func (s *server) checkPlan(ctx context.Context, text string, of checkOf, plan st
 		return checked{why: err.Error()}
 	}
 	args := []string{path, "--oci-filter"}
+	if list != "" {
+		lp := filepath.Join(dir, "credentials")
+		if err := os.WriteFile(lp, []byte(list), 0o600); err != nil {
+			return checked{why: err.Error()}
+		}
+		args = append(args, "--credential-list", lp, "--pod-namespace", ns)
+	}
 	planPath := filepath.Join(dir, "plan")
 	switch of {
 	case podWithPlan:
@@ -326,7 +365,7 @@ func (s *server) varekPolicy(ctx context.Context, req *request) string {
 	if strings.TrimSpace(p.Spec.Policy) == "" {
 		return "the policy is empty"
 	}
-	if c := s.check(ctx, p.Spec.Policy); c.why != "" {
+	if c := s.check(ctx, p.Spec.Policy, ns); c.why != "" {
 		return "the Warden refuses this policy: " + c.why
 	}
 	return ""
@@ -357,8 +396,29 @@ func (s *server) varekPlan(ctx context.Context, req *request) string {
 	if strings.TrimSpace(p.Spec.Plan) == "" {
 		return "the plan is empty"
 	}
-	if c := s.checkPlan(ctx, planCarrier, podWithPlan, p.Spec.Plan); c.why != "" {
+	if c := s.checkPlan(ctx, planCarrier, podWithPlan, p.Spec.Plan, ns); c.why != "" {
 		return "the Warden refuses this plan: " + c.why
+	}
+	return ""
+}
+
+// v1.36 step 4 (D2): a VarekCredential
+func (s *server) varekCredential(_ context.Context, req *request) string {
+	if req.Operation == "DELETE" {
+		return ""
+	}
+	var c kube.Policy
+	if err := json.Unmarshal(req.Object, &c); err != nil {
+		return "the VarekCredential does not read: " + err.Error()
+	}
+	if why := kube.CredentialProblem(&c); why != "" {
+		return why
+	}
+	if src, ok := strings.CutPrefix(c.Spec.Source, "file:"); ok && s.credDir != "" {
+		if clean := filepath.Clean(src); clean != src || !strings.HasPrefix(clean, strings.TrimRight(s.credDir, "/")+"/") {
+			return fmt.Sprintf("a file: source is a file under %s, the node agent's credentials directory (the chart's "+
+				"Secrets; D1), named plainly (it is %s)", s.credDir, src)
+		}
 	}
 	return ""
 }
@@ -430,10 +490,10 @@ func (s *server) pod(ctx context.Context, req *request) string {
 		if pl == nil {
 			return fmt.Sprintf("there is no VarekPlan %s in namespace %s", plan, ns)
 		}
-		if c = s.checkPlan(ctx, vp.Spec.Policy, podWithPlan, pl.Spec.Plan); c.why != "" {
+		if c = s.checkPlan(ctx, vp.Spec.Policy, podWithPlan, pl.Spec.Plan, ns); c.why != "" {
 			return fmt.Sprintf("the Warden refuses its policy %s with its plan %s: %s", name, plan, c.why)
 		}
-	} else if c = s.checkPlan(ctx, vp.Spec.Policy, podNoPlan, ""); c.why != "" {
+	} else if c = s.checkPlan(ctx, vp.Spec.Policy, podNoPlan, "", ns); c.why != "" {
 		return fmt.Sprintf("the Warden refuses its policy %s: %s", name, c.why)
 	}
 	var whys []string
@@ -575,7 +635,8 @@ func (s *server) handle(decide func(context.Context, *request) string) http.Hand
 func (s *server) mux() *http.ServeMux {
 	m := http.NewServeMux()
 	m.HandleFunc("/varekpolicy", s.handle(s.varekPolicy))
-	m.HandleFunc("/varekplan", s.handle(s.varekPlan)) // v1.35 step 4c
+	m.HandleFunc("/varekplan", s.handle(s.varekPlan))             // v1.35 step 4c
+	m.HandleFunc("/varekcredential", s.handle(s.varekCredential)) // v1.36 step 4
 	m.HandleFunc("/pod", s.handle(s.pod))
 	m.HandleFunc("/pod-required", s.handle(func(ctx context.Context, r *request) string {
 		var p pod
@@ -641,6 +702,8 @@ func main() {
 	apiCA := flag.String("api-ca", "", "the cluster's CA")
 	classes := flag.String("runtime-classes", "", "the RuntimeClass names whose handler runs the Warden's filter (runc, crun); "+
 		"a pod naming another is refused")
+	credDir := flag.String("credentials-dir", "", "v1.36: the node agent's credentials directory (the chart's Secrets): a "+
+		"VarekCredential's file: source must be under it")
 	flag.Parse()
 	if !strings.HasPrefix(*wardenPath, "/") || *cert == "" || *key == "" {
 		fmt.Fprintln(os.Stderr, "varek-admission: give -warden (an absolute path), -tls-cert and -tls-key")
@@ -652,6 +715,7 @@ func main() {
 		os.Exit(2)
 	}
 	s := newServer(*wardenPath, c, *classes)
+	s.credDir = *credDir
 	cf := &certFiles{cert: *cert, key: *key}
 	if _, err := cf.get(nil); err != nil {
 		fmt.Fprintln(os.Stderr, "varek-admission: the certificate:", err)

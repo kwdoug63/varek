@@ -19,7 +19,7 @@ no() { echo "  FAIL   $1"; fail=1; }
 run() { "$RT" run --rm --network none "$@"; }
 
 # each command the chart's DaemonSet and Deployment name (the exporter's script by python3)
-for f in /opt/varek/warden /opt/varek/varek-init /opt/varek/varek-nri /opt/varek/varek-admission \
+for f in /opt/varek/warden /opt/varek/warden-secrets /opt/varek/varek-init /opt/varek/varek-nri /opt/varek/varek-admission \
          /opt/varek/tools/vdp_cert_check /opt/varek/tools/varek_node_export.py; do
     t=-x; case "$f" in *.py) t=-r ;; esac
     if run --entrypoint /bin/sh "$IMAGE" -c "test $t $f"; then ok "$f is there"; else no "$f is missing"; fi

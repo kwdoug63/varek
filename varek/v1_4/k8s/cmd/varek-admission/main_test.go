@@ -18,20 +18,39 @@ import (
 
 // a stand-in for the Warden: it refuses a policy holding "bad"; v1.35: a
 // plan holding "mcp_call" (--plan), and --no-plan for a policy holding
-// "require plan"
+// "require plan"; v1.36: a policy's first credential (credential NAME from
+// SRC) not given to --pod-namespace from SRC by --credential-list
 const fakeWarden = `#!/bin/sh
-grep -q bad "$1" && { echo "[warden] policy $1:2: a bad line" >&2; exit 1; }
-[ "$2" = --oci-filter ] || exit 2
-case "$3" in
-  --plan) grep -q mcp_call "$4" && { echo "[warden] --oci-filter: the plan $4: the node agent does not carry mcp_call steps yet (step m)" >&2; exit 1; } ;;
-  --no-plan) grep -q 'require plan' "$1" && { echo "[warden] --oci-filter: the policy says require plan: a pod under it names its plan (varek.dev/plan)" >&2; exit 1; } ;;
-  "") ;;
-  *) exit 2 ;;
-esac
+pol="$1"; shift
+grep -q bad "$pol" && { echo "[warden] policy $pol:2: a bad line" >&2; exit 1; }
+[ "$1" = --oci-filter ] || exit 2; shift
+plan= noplan= list= ns=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --plan) plan="$2"; shift 2 ;;
+    --no-plan) noplan=1; shift ;;
+    --credential-list) list="$2"; shift 2 ;;
+    --pod-namespace) ns="$2"; shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+[ -n "$plan" ] && grep -q mcp_call "$plan" && { echo "[warden] --oci-filter: the plan $plan: the node agent does not carry mcp_call steps yet (step m)" >&2; exit 1; }
+[ -n "$noplan" ] && grep -q 'require plan' "$pol" && { echo "[warden] --oci-filter: the policy says require plan: a pod under it names its plan (varek.dev/plan)" >&2; exit 1; }
+c=$(sed -n 's/^credential \([a-z_]*\) from \(.*\)$/\1 \2/p' "$pol" | head -1)
+if [ -n "$c" ]; then
+  [ -n "$list" ] && [ -n "$ns" ] || { echo "[warden] --oci-filter: the policy names credentials: give --credential-list FILE --pod-namespace NS" >&2; exit 1; }
+  name=${c%% *} src=${c#* }
+  awk -F'\t' -v n="$name" -v s="$src" -v ns="$ns" '$1 == n && $3 == s { k = split($2, a, ","); for (i = 1; i <= k; i++) if (a[i] == ns) ok = 1 } END { exit !ok }' "$list" ||
+    { echo "[warden] --oci-filter: credential $name (line 1) is not given to namespace $ns (D2)" >&2; exit 1; }
+  echo '{"varekCredentials":["'"$name"'"]}'
+  exit 0
+fi
 echo '{}'
 `
 
-type fakeAPI map[string]string // "ns/name" -> policy text; "plan:ns/name" -> plan text (v1.35)
+// "ns/name" -> policy text; "plan:ns/name" -> plan text (v1.35); v1.36:
+// "cred:RESOURCE" -> "CREDENTIAL SOURCE NS,NS" (a VarekCredential)
+type fakeAPI map[string]string
 
 func (f fakeAPI) get(key, ns, name string, plan bool) (*kube.Policy, error) {
 	t, ok := f[key]
@@ -56,6 +75,19 @@ func (f fakeAPI) GetPlan(_ context.Context, ns, name string) (*kube.Policy, erro
 	return f.get("plan:"+ns+"/"+name, ns, name, true)
 }
 
+func (f fakeAPI) ListCredentials(context.Context) ([]*kube.Policy, error) {
+	var out []*kube.Policy
+	for k, v := range f {
+		if r, ok := strings.CutPrefix(k, "cred:"); ok {
+			x := strings.Fields(v)
+			c := &kube.Policy{}
+			c.Metadata.Name, c.Spec.Credential, c.Spec.Source, c.Spec.Namespaces = r, x[0], x[1], strings.Split(x[2], ",")
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
 func testServer(t *testing.T, warden string) *server {
 	if warden == "" {
 		warden = filepath.Join(t.TempDir(), "warden")
@@ -72,6 +104,10 @@ func testServer(t *testing.T, warden string) *server {
 		"team-a/held":      "require warden 1.35\nallow path /tmp/\n", // step 9: a plan needs a 1.35 policy
 		"plan:team-a/p1":   "plan 1.35\naction a file_open /tmp/x\n",
 		"plan:team-a/pmcp": "plan 1.35\naction m mcp_call http://10.0.0.1/mcp\n",
+		// v1.36 step 4 (D2)
+		"team-a/creds":  "require warden 1.28\nproxy on\ncredential gh from file:/var/lib/varek/credentials/gh/token\nallow host api.github.com:443\n",
+		"team-b/creds":  "require warden 1.28\nproxy on\ncredential gh from file:/var/lib/varek/credentials/gh/token\nallow host api.github.com:443\n",
+		"cred:gh-token": "gh file:/var/lib/varek/credentials/gh/token team-a,team-c",
 	}, "runc, crun")
 }
 
@@ -235,14 +271,14 @@ func TestCheckKept(t *testing.T) {
 	w := filepath.Join(d, "warden")
 	os.WriteFile(w, []byte("#!/bin/sh\necho x >> "+count+"\ngrep -q slow \"$1\" && exec sleep 5\necho '{}'\n"), 0o755)
 	s := newServer(w, fakeAPI{}, "")
-	s.check(context.Background(), "allow path /tmp/\n")
-	s.check(context.Background(), "allow path /tmp/\n")
+	s.check(context.Background(), "allow path /tmp/\n", "team-a")
+	s.check(context.Background(), "allow path /tmp/\n", "team-a")
 	if b, _ := os.ReadFile(count); strings.Count(string(b), "x") != 1 {
 		t.Errorf("a policy checked again: %q", b)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	if c := s.check(ctx, "slow\n"); !strings.Contains(c.why, "did not finish") {
+	if c := s.check(ctx, "slow\n", "team-a"); !strings.Contains(c.why, "did not finish") {
 		t.Errorf("a check past its time: %+v", c)
 	}
 	if len(s.cache) != 1 {
@@ -272,7 +308,10 @@ func TestRealWarden(t *testing.T) {
 	}{
 		{"a policy it loads", "require warden 1.29\nallow path /tmp/\n", ""},
 		{"one it does not parse", "allow pathh /tmp/\n", "refuses this policy"},
-		{"credentials, which the node agent does not carry yet", "require warden 1.28\nproxy on\ncredential k from file:/etc/varek/creds/k\nallow host api.example.com:443\n", "does not carry credentials"},
+		// v1.36 step 4 (D2): credentials, checked against the cluster's VarekCredential resources
+		{"a credential given to the namespace", "require warden 1.28\nproxy on\ncredential gh from file:/var/lib/varek/credentials/gh/token\nallow host api.github.com:443\n", ""},
+		{"one no VarekCredential gives", "require warden 1.28\nproxy on\ncredential k from file:/etc/varek/creds/k\nallow host api.example.com:443\n", "is given by no VarekCredential"},
+		{"one from another source", "require warden 1.28\nproxy on\ncredential gh from vault:secret/gh#t\nallow host api.github.com:443\n", "names another source"},
 	} {
 		ok, msg := post(t, s, "/varekpolicy", "team-a", vp("agent", c.text))
 		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
@@ -365,5 +404,61 @@ func TestPodPlan(t *testing.T) {
 		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
 			t.Errorf("%s: allowed %v, %q", c.what, ok, msg)
 		}
+	}
+}
+
+// v1.36 step 4 (D2): a VarekCredential, and the credentials a policy names
+func vcred(name, cred, source string, ns ...string) map[string]interface{} {
+	return map[string]interface{}{"metadata": map[string]string{"name": name},
+		"spec": map[string]interface{}{"credential": cred, "source": source, "namespaces": ns}}
+}
+
+func TestVarekCredential(t *testing.T) {
+	s := testServer(t, "")
+	s.credDir = "/var/lib/varek/credentials"
+	for _, c := range []struct {
+		what string
+		obj  map[string]interface{}
+		why  string
+	}{
+		{"a file under the credentials directory", vcred("gh-token", "gh", "file:/var/lib/varek/credentials/gh/token", "team-a"), ""},
+		{"a Vault secret's field", vcred("db", "db", "vault:database/creds/ro#password", "team-a", "team-b"), ""},
+		{"an AWS secret", vcred("stripe", "stripe", "aws-sm:arn:aws:secretsmanager:us-east-1:111122223333:secret:s-AbC", "team-a"), ""},
+		{"a credential's name a policy cannot write", vcred("x", "GH-token", "file:/var/lib/varek/credentials/x", "team-a"), "is not a credential's name"},
+		{"a source that is not a store", vcred("x", "x", "env:X", "team-a"), "is not file:PATH, vault:PATH#FIELD or aws-sm:ARN"},
+		{"a source with a space", vcred("x", "x", "file:/var/lib/varek/credentials/a b", "team-a"), "no space"},
+		{"a Vault source with no field", vcred("x", "x", "vault:secret/data/x", "team-a"), "names its field"},
+		{"no namespace", vcred("x", "x", "file:/var/lib/varek/credentials/x"), "names no namespace"},
+		{"a namespace that is not one", vcred("x", "x", "file:/var/lib/varek/credentials/x", "Team_A"), "is not 1 to 63"},
+		{"a file outside the credentials directory", vcred("x", "x", "file:/etc/shadow", "team-a"), "under /var/lib/varek/credentials"},
+		{"a file named through ..", vcred("x", "x", "file:/var/lib/varek/credentials/../../../etc/shadow", "team-a"), "named plainly"},
+	} {
+		ok, msg := post(t, s, "/varekcredential", "", c.obj)
+		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
+			t.Errorf("%s: allowed %v, %q", c.what, ok, msg)
+		}
+	}
+	if ok, _ := postOp(t, s, "/varekcredential", "", "DELETE", map[string]interface{}{}, nil); !ok {
+		t.Error("a VarekCredential's deletion refused")
+	}
+}
+
+func TestCredentialsGiven(t *testing.T) {
+	s := testServer(t, "")
+	pol := "require warden 1.28\nproxy on\ncredential gh from file:/var/lib/varek/credentials/gh/token\nallow host api.github.com:443\n"
+	if ok, msg := post(t, s, "/varekpolicy", "team-a", vp("creds", pol)); !ok {
+		t.Errorf("a policy naming a credential given to its namespace: refused: %q", msg)
+	}
+	b := vp("creds", pol)
+	b["metadata"] = map[string]string{"name": "creds", "namespace": "team-b"}
+	if ok, msg := post(t, s, "/varekpolicy", "team-b", b); ok || !strings.Contains(msg, "is not given to namespace team-b") {
+		t.Errorf("a policy naming a credential not given to its namespace: allowed %v, %q", ok, msg)
+	}
+	if ok, msg := post(t, s, "/pod", "team-a", agentPod("creds", nil)); !ok {
+		t.Errorf("a pod whose policy names a credential given to its namespace: refused: %q", msg)
+	}
+	bp := agentPod("creds", func(p *pod) { p.Metadata.Namespace = "team-b" })
+	if ok, msg := post(t, s, "/pod", "team-b", bp); ok || !strings.Contains(msg, "is not given to namespace team-b") {
+		t.Errorf("a pod whose policy names a credential not given to its namespace: allowed %v, %q", ok, msg)
 	}
 }

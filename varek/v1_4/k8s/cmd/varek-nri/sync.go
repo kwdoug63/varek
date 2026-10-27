@@ -12,6 +12,11 @@
 //
 // v1.35 step 4c (D11): the cluster's VarekPlan resources the same way, as
 // POLICY_DIR/<namespace>/<name>.plan, by a second syncer.
+//
+// v1.36 step 4 (D2): the cluster's VarekCredential resources (cluster-scoped)
+// as one list, POLICY_DIR/.credentials (kube.CredentialList), written whole
+// after each list and each event, by a third (credSyncer). A resource the
+// node agent would not take is left out of it, and said.
 package main
 
 import (
@@ -192,24 +197,28 @@ func (s *syncer) res() string {
 	return s.resource
 }
 
-func (s *syncer) run(ctx context.Context) {
+func (s *syncer) run(ctx context.Context) { runSync(ctx, s.c, s.res(), s.logf, s.list, s.event) }
+
+// runSync lists and watches a resource until ctx ends (each syncer's run)
+func runSync(ctx context.Context, c *kube.Client, res string, logf func(string, ...interface{}),
+	list func(context.Context) (string, error), event func(kube.Event) error) {
 	rv := ""
 	for ctx.Err() == nil {
 		var err error
 		if rv == "" {
-			if rv, err = s.list(ctx); err != nil {
-				s.logf("varek-nri: listing the %s: %v", s.res(), err)
+			if rv, err = list(ctx); err != nil {
+				logf("varek-nri: listing the %s: %v", res, err)
 				rv = ""
 			}
 		}
 		if rv != "" {
-			rv, err = s.c.Watch(ctx, s.res(), rv, s.event)
+			rv, err = c.Watch(ctx, res, rv, event)
 			if kube.Gone(err) {
 				rv = ""
 				continue
 			}
 			if err != nil && ctx.Err() == nil {
-				s.logf("varek-nri: watching the %s: %v", s.res(), err)
+				logf("varek-nri: watching the %s: %v", res, err)
 				rv = "" // step 9 (review): listed again, so what failed is written again
 			}
 		}
@@ -218,4 +227,93 @@ func (s *syncer) run(ctx context.Context) {
 		case <-time.After(2 * time.Second):
 		}
 	}
+}
+
+// v1.36 step 4 (D2): the cluster's VarekCredential resources, one list
+type credSyncer struct {
+	c    *kube.Client
+	dir  string
+	logf func(string, ...interface{})
+	have map[string]*kube.Policy // by resource name
+}
+
+// the list written whole and renamed into place, root's, readable by all (the
+// node agent refuses one others can write); unchanged, not written
+func (s *credSyncer) write() error {
+	items := make([]*kube.Policy, 0, len(s.have))
+	for _, c := range s.have {
+		items = append(items, c)
+	}
+	text := kube.CredentialList(items)
+	path := filepath.Join(s.dir, kube.CredentialListFile)
+	if old, err := os.ReadFile(path); err == nil && string(old) == text {
+		return nil
+	}
+	if err := os.MkdirAll(s.dir, 0o755); err != nil {
+		return fmt.Errorf("the credential list: %v", err)
+	}
+	f, err := os.CreateTemp(s.dir, kube.CredentialListFile+".tmp-")
+	if err == nil {
+		_, err = f.WriteString(text)
+		if err == nil {
+			err = f.Chmod(0o644)
+		}
+		if err == nil {
+			err = f.Sync()
+		}
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err == nil {
+			err = os.Rename(f.Name(), path)
+		}
+		if err != nil {
+			os.Remove(f.Name())
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("the credential list: %v", err)
+	}
+	s.logf("varek-nri: the credential list written (%d VarekCredential resources)", strings.Count(text, "\n")-1)
+	return nil
+}
+
+func (s *credSyncer) keep(p *kube.Policy) {
+	if why := kube.CredentialProblem(p); why != "" {
+		s.logf("varek-nri: VarekCredential %s: %s; not listed", p.Metadata.Name, why)
+	}
+	q := *p
+	s.have[p.Metadata.Name] = &q
+}
+
+func (s *credSyncer) list(ctx context.Context) (string, error) {
+	s.have = map[string]*kube.Policy{}
+	rv, err := s.c.List(ctx, kube.Credentials, s.keep)
+	if err != nil {
+		return "", err
+	}
+	if err := s.write(); err != nil {
+		return "", err
+	}
+	return rv, nil
+}
+
+func (s *credSyncer) event(ev kube.Event) error {
+	var p kube.Policy
+	if err := json.Unmarshal(ev.Object, &p); err != nil {
+		return fmt.Errorf("a VarekCredential does not read: %v", err)
+	}
+	switch ev.Type {
+	case "ADDED", "MODIFIED":
+		s.keep(&p)
+	case "DELETED":
+		delete(s.have, p.Metadata.Name)
+	default:
+		return nil
+	}
+	return s.write()
+}
+
+func (s *credSyncer) run(ctx context.Context) {
+	runSync(ctx, s.c, kube.Credentials, s.logf, s.list, s.event)
 }
