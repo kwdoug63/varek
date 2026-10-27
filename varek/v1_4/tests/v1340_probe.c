@@ -221,6 +221,21 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "arch")) { setvbuf(stdout, NULL, _IONBF, 0); arch32(); return 0; }
+    /* v1.36 step 5: a sub-agent and a confined MCP server, each launched by
+     * a child; then one launched by the container's first process itself */
+    if (argc > 1 && !strcmp(argv[1], "sub")) {
+        setvbuf(stdout, NULL, _IONBF, 0);
+        launch("launch_sub", "/sub");
+        launch("launch_srv", "/srv");
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "subself")) {
+        setvbuf(stdout, NULL, _IONBF, 0);
+        char *const av[] = { "/sub", NULL };
+        execv("/sub", av);
+        printf("subself: %s\n", en(errno));
+        return 0;
+    }
     if (argc > 1) { printf("exec_again: ran\n"); return 0; }
     setvbuf(stdout, NULL, _IONBF, 0);
     readf("read_allowed", "/data/allowed");

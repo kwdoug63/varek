@@ -43,10 +43,18 @@
 #            whatever the policy says of launches, and refuses to run without
 #            Landlock; its refusals are its own (exit 126, its message).
 #  NOT-YET   not carried in pods yet, refused at deploy (the webhook) and at
-#            the start (--oci-filter names it): sub-agents (and the confined
-#            MCP servers built on them), require on-behalf-of. Credentials are
-#            carried from v1.36 step 4 (the stand-in gives each to its
-#            namespace and sets the placeholders, as a cluster does).
+#            the start (--oci-filter names it): require on-behalf-of.
+#            Credentials are carried from v1.36 step 4 (the stand-in gives
+#            each to its namespace and sets the placeholders, as a cluster
+#            does), sub-agents and confined MCP servers from step 5 (the
+#            stand-in binds each program the policy names under /tmp
+#            read-only at its path, as a pod's read-only volume holds one).
+#  FIRST     v1.36 step 5 (D3, M1): the container's first process stays in
+#            the container's group, so a sub-agent it launches itself is
+#            refused (subagent_first_process); one launched by any other
+#            process of the container runs, as on a host. The suite's agent
+#            launches its sub-agents itself (exec), so each of those runs,
+#            and what is read from their streams later, differs.
 #  STAND-IN  how the stand-in differs from a pod in a way that does not bear
 #            on the node agent (named in the reason).
 test-v1121	^O_CREAT in the allowed directory succeeds$	AS-USER: the policy has no require warden 1.29; the directory and trunc_me.txt are root's (probe: creat_allowed, trunc_allowed DENIED)
@@ -78,9 +86,6 @@ test-v1170	^--run-as root: uid #, with a warning$	RUNTIME: the node agent refuse
 test-v1170	^a missing program: a clear refusal \(exit #\)$	LAUNCHER: the launcher refuses the missing command (exit 126, its message), not the Warden's 127
 test-v1170	^a program nobody may execute: a clear refusal \(exit #\)$	LAUNCHER: exit 127 from the launcher's execv (EACCES, its message), not the Warden's 'cannot execute'
 test-v1250	^a list in data/ that is not the release's stops the Warden$	STAND-IN: the suite copies ./warden (the stand-in) beside an altered data/; --check-startup passes through to the real Warden, which reads the release's data/ beside itself
-test-v1270	^a script whose #! line has no newline: launched, not killed$	D4: the scripts are under /tmp, the container's noexec volume, so the kernel refuses them
-test-v1270	^a script whose interpreter is allowed runs$	D4: the scripts are under /tmp, the container's noexec volume, so the kernel refuses them
-test-v1270	^a relative path is decided on its absolute name$	D4: the scripts are under /tmp, the container's noexec volume, so the kernel refuses them
 test-v1270	^the program the operator names, though no rule allows it, runs$	D4: the program is moved into the image (/varek-sweep/NAME), so the set names it there, not at its /tmp path; RUNTIME: run_end's exit_status is -1
 test-v1270	^in the set as bootstrap$	D4: the program is moved into the image (/varek-sweep/NAME), so the set names it there, not at its /tmp path; RUNTIME: run_end's exit_status is -1
 test-v1270	^a script the operator names runs, with its interpreter in the set$	D4: the program is moved into the image (/varek-sweep/NAME), so the set names it there, not at its /tmp path; RUNTIME: run_end's exit_status is -1
@@ -92,6 +97,7 @@ test-v1270	^without Landlock an allowed launch is refused \(exec_no_landlock\)$	
 test-v1270	^the audit accepts that run$	LAUNCHER: with Landlock turned off (VAREK_WARDEN_TEST_NO_LANDLOCK) the node agent refuses the container (the launcher needs it), before run_start
 test-v1270	^run_end says so, and the Warden exits #$	RUNTIME: the stand-in exits with the container's status; the node agent's is not the run's (run_end still says exec_identity_mismatch)
 test-v1270	^the kernel refuses every launch outside the set the table names	LINE: landlock_table.sh greps 'held by Landlock'; the node agent says 'held by the launcher's Landlock (ABI N)'
+test-v1270	^and each file: its name, canonical path, device, inode and SHA-#$	STAND-IN: a program the policy names under /tmp is a copy bound read-only at its path (v1.36 step 5, as a pod's read-only volume holds one): the set names its path, with the copy's device and inode, not the host file's
 test-v1271	^the agent sees each writable directory mounted noexec$	D4: the node agent makes no per-directory noexec mounts; the container's /tmp volume is noexec as a whole
 test-v1271	^an exact path that is a file: the file itself, noexec$	D4: the node agent makes no per-directory noexec mounts; the container's /tmp volume is noexec as a whole
 test-v1271	^the Warden says what it mounted$	D4: the node agent makes no per-directory noexec mounts; the container's /tmp volume is noexec as a whole
@@ -108,7 +114,33 @@ test-v1271	^from a working directory inside it, a copy by a relative name cannot
 test-v1271	^a writable directory missing at start: listed	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
 test-v1271	^a file an exact rule names, replaced by the host during the run	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
 test-v1271	^standard input open on a file in a writable directory refuses the start$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
-test-v1281	.	NOT-YET: sub-agents: every policy of the suite's runs names subagent=, which --oci-filter refuses ('the node agent does not carry sub-agents yet'); what follows from those runs (forged streams, varek runs) has no records	does not carry sub-agents yet
+test-v1271	^a launch-set file under a writable directory: reported, and the kernel refuses its launch \(EACCES\)$	STAND-IN: the program is a copy bound read-only at its path (v1.36 step 5, as a pod's read-only volume holds one): the agent cannot write it there, so it launches (D4: only a writable mount must be noexec); on a host it is in the writable directory, mounted noexec, and the kernel refuses it
+test-v1281	^refused: require on-behalf-of with no token$	NOT-YET: require on-behalf-of (v1.36 step 6): --oci-filter refuses the policy, so the start is refused for that, not for the missing token	does not carry the on-behalf-of chain
+test-v1281	^a sub-agent and the child it forks: two processes$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1); what follows is the agent's	subagent_first_process
+test-v1281	^\.\.\. attributed to it: agent\+subagent:alpha##$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1); what follows is the agent's	subagent_first_process
+test-v1281	^its launch record names the sub-agent and its group$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1)	subagent_first_process
+test-v1281	^the launch is recorded launched, for the sub-agent$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1)	subagent_first_process
+test-v1281	^a double fork that reparents the grandchild: still the sub-agent's$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1); what follows is the agent's	subagent_first_process
+test-v1281	^a thread of the sub-agent: the sub-agent's$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1); what follows is the agent's	subagent_first_process
+test-v1281	^a sub-agent launched by a sub-agent: the chain grows by one$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1); what follows is the agent's	subagent_first_process
+test-v1281	^\.\.\. its group under its launcher's$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1)	subagent_first_process
+test-v1281	^\.\.\. the same with each call's group read from /proc	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1); what follows is the agent's	subagent_first_process
+test-v1281	^a launch allowed and then failed by the kernel \(E#BIG\): recorded failed$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1); nothing to settle	subagent_first_process
+test-v1281	^a failed launch of the image the launcher runs: settled failed	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1); nothing to settle	subagent_first_process
+test-v1281	^\.\.\. and one that happened: the sub-agent's$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1); what follows is the agent's	subagent_first_process
+test-v1281	^\.\.\. without process events, one that happened: the sub-agent's, told by the memory layout	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1); what follows is the agent's	subagent_first_process
+test-v1281	^\.\.\. and a failed one \(E#BIG\): the agent's, the layout unchanged$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1); nothing to settle	subagent_first_process
+test-v1281	^\.\.\. and where layouts are not randomized, refused \(subagent_same_image\)$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1); and the launcher (the agent, moved into the image: D4) and the program (bound at its path) are two files, not one image	subagent_first_process
+test-v1281	^each sub-agent's launch is settled once, before its decisions \(subagent_settled\)$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1): no launch to settle	subagent_first_process
+test-v1281	^a Warden in a group whose name holds a quote: every record is still JSON$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1): no record names it; and the run's group is the container's (D3 (a)), not one below the Warden's	subagent_first_process
+test-v1281	^the audit refuses a decision for a sub-agent after its launch failed$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1) in the stream the suite forges (e2big): its forgery is refused for another reason	subagent_first_process
+test-v1281	^the audit refuses a failed launch with its sub-agent stripped from its results$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1) in the stream the suite forges: it holds no failed launch to strip	subagent_first_process
+test-v1281	^the audit refuses a sub-agent's decision before its launch settled$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1) in the stream the suite forges: it holds no settled launch to move	subagent_first_process
+test-v1281	^varek runs: whom each run was for, and its sub-agents$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1) in the runs varek runs lists: they count no sub-agent	subagent_first_process
+test-v1281	^run_start names the run's control group$	D3: the run's control group is the container's own (D3 (a)), the runtime's name for it, not varek-<run> below the Warden's (run_start names it, as the check's pattern does not)
+test-v1281	^the agent cannot write another control group's cgroup\.procs, whatever the policy allows$	RUNTIME: the container's cgroup filesystem is the runtime's mount of its own groups: the host's group the suite makes (v1281-other) is not in it, so the open is refused as one under a directory that is not there (Permission denied, without the control-group message)
+test-v1281	^\.\.\. a run remounts it read-write in the Warden's own mount namespace; the sub-agent is attributed$	STAND-IN: the suite runs its Warden in a cgroup namespace of its own with the cgroup filesystem read-only (a container's, v1.32's remount); a node agent never runs so (its supervisor uses the node's cgroup namespace and a mount of its own: D3 (a)), so no remount is made; where the node's init's namespace is out of reach (a sandbox hiding /proc/1) the start is refused, else the agent's own launch of the sub-agent is (FIRST)
+test-v1281	^refused: read-only and not at its namespace's root \(--cgroupns=host\)$	STAND-IN: as the line above: the Warden-in-a-container refusal (--cgroupns=private) is not the node agent's, whose supervisor reaches the container's group from the node
 test-v1290	^require warden #\.#: (a created file is root's|the root-owned file is written|the closed directory is reached), as before$	AS-USER: the node agent opens as the container's user even under require warden 1.28 (its point: a pod's files are its user's)
 test-v1290	^(--run-as root under #\.#: run_start says the agent is root|\.\.\. and the file is root's)$	RUNTIME: the node agent refuses a root container (not carried)
 test-v1290	^a raw device \(/dev/[^)]+\) is still refused by identity	RUNTIME: the container's /dev is the runtime's, without the host's raw device (/dev/mem on GitHub's runner, /dev/zram0 where there is none) (ENOENT): nothing to refuse
@@ -118,9 +150,7 @@ test-v1290	^a rule that could write there \(glob in\*\): refused to start, as be
 test-v1290	^under #\.#: refused to start, as before$	D4: the program is moved into the image (/varek-sweep/NAME), so it is not under the writable directory and nothing is kept executable there; run_start names it by its image path
 test-v1290	^forged: a place kept executable outside the noexec directories	D4: the program is moved into the image (/varek-sweep/NAME), so it is not under the writable directory and nothing is kept executable there; run_start names it by its image path
 test-v1290	^\.\.\. and each file's is the file's$	D4: the program is moved into the image (/varek-sweep/NAME), so it is not under the writable directory and nothing is kept executable there; run_start names it by its image path
-test-v1310	.	NOT-YET: confined MCP servers (mcp server ... exec, built on sub-agents): --oci-filter refuses the policy; what follows from those runs (the audit's forgeries, varek refusals, runs, suggest) has no records	does not carry (sub-agents|confined MCP servers)[^\n]* yet
-test-cli	^pytest tests/test_varek_bench_mcp\.py::test_bench_for_end_to_end$	NOT-YET: varek bench --for confines an MCP server (sub-agents)
-test-cli	^pytest tests/test_varek_bench_launch\.py::test_bench_launches_end_to_end$	D4: the bench's allowed launches are of programs under /tmp (the noexec volume): decided and certified, then refused by the kernel
+test-v1350	^require plan: a run without a plan refused, said why$	LINE: the node agent refuses the container in its own words ('its policy says `require plan`, and its pod names no plan'), not the Warden's ('a run needs a plan it is held to'), which the check greps
 test-v1123	^no bypass reported by probe$	OWN-PID: the probe counts its own /proc/1/mem (the container's PID 1 is the agent) as another process's
 test-v1123	numeric /proc/#/mem is refused	OWN-PID: the container's /proc/1 is the agent's own, decided as /proc/self/mem (allowed); another process's is refused
 test-v1123	^another process's /proc/#/mem opened directly is refused	OWN-PID: the container's /proc/1 is the agent's own, decided as /proc/self/mem (allowed); another process's is refused

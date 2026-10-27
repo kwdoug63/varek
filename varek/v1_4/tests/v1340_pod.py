@@ -16,7 +16,10 @@ bound at /varek/init, the policy's name and SHA-256 in its annotations, its
 writable mounts noexec. The container's root is an overlay of the host's
 root file system, read-only, as a pod's image is an overlay; /tmp is the
 host's, writable and noexec, as a pod's volume (a program the suite made
-there is put in the image, at /varek-sweep/NAME, and run from there). It runs as USER (default
+there is put in the image, at /varek-sweep/NAME, and run from there; v1.36
+step 5: each other program the policy names by its file there, a
+sub-agent's or a confined MCP server's, is copied off the volume and bound
+read-only at its own path, as a pod's read-only volume holds one). It runs as USER (default
 65534, as the Warden runs an agent), with no capability and no new
 privileges, in PID, IPC and mount namespaces of its own and the host's
 network (where the suites' servers are; a pod's own network is
@@ -286,6 +289,27 @@ def main():
                         "options": ["bind", "ro", "nosuid", "nodev"]})
     c["mounts"].append({"destination": "/tmp", "type": "bind", "source": "/tmp",
                         "options": ["rbind", "rw", "nosuid", "nodev", "noexec", "rnosuid", "rnodev", "rnoexec"]})
+    # v1.36 step 5: each other program the policy names by its file under
+    # /tmp (an exact `allow exec` rule, a sub-agent's or a confined MCP
+    # server's), bound read-only at its own path, as a pod's read-only volume
+    # holds a program: it can run, and its launch is decided by the name the
+    # suite gave it (the node agent still refuses one under a directory the
+    # policy may write: D4)
+    named = set()
+    for m in re.finditer(rb"(?m)^[ \t]*(?:allow[ \t]+exec|mcp[ \t]+server[ \t]+\S+[ \t]+exec)[ \t]+(/tmp/\S+)", text):
+        p = m.group(1).decode(errors="replace")
+        if os.path.isfile(p) and not os.path.islink(p) and not any(ch in p for ch in "*?[") and p != prog0:
+            named.add(p)
+    # a copy, off the volume: a bind of the volume's own file would show what
+    # the writable /tmp can change, which the node agent refuses (D4)
+    bound = os.path.join(D, "ovl", n, "bound")
+    for k, p in enumerate(sorted(named)):
+        os.makedirs(bound, exist_ok=True)
+        cp = os.path.join(bound, "%d-%s" % (k, os.path.basename(p)))
+        shutil.copy2(p, cp)
+        c["mounts"].append({"destination": p, "type": "bind", "source": cp, "options": ["bind", "ro", "nosuid", "nodev"]})
+    if named:
+        log("bound", "%d program(s) the policy names under /tmp, bound read-only at their paths" % len(named), argv)
     c["annotations"] = {"varek.dev/policy": "p", "varek.dev/policy-sha256": sha,
                         "varek.dev/pod-namespace": "sweep", "varek.dev/pod-name": SUITE.replace("_", "-")[:63] or "sweep",
                         "varek.dev/pod-uid": n, "varek.dev/container": "agent"}
@@ -367,6 +391,17 @@ def main():
         if tailer.is_alive():
             tailer.join(5)
         drain()
+        # v1.36 step 5: the evidence of a difference the node agent makes by
+        # its own rule (the sweep's known list reads it): a sub-agent the
+        # container's first process launched itself, which stays in the
+        # container's group (M1)
+        for p in os.listdir(streams) if os.path.isdir(streams) else []:
+            try:
+                if p.endswith(".jsonl") and b'"rule":"subagent_first_process"' in open(os.path.join(streams, p), "rb").read():
+                    log("first_process", "the container's first process launched a sub-agent itself (subagent_first_process)", argv)
+                    break
+            except OSError:
+                pass
         if mounted:
             subprocess.run(["umount", "-l", root])
         shutil.rmtree(os.path.join(D, "ovl", n), ignore_errors=True)

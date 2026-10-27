@@ -36,7 +36,12 @@
 #      written to the node by the plugin's -sync; a policy naming it refused
 #      in a namespace it is not given to; a pod naming it runs with the
 #      plugin's placeholder, never the value, which warden-secrets fetched
-#      on the node (run_start).
+#      on the node (run_start);
+#   8. sub-agents and confined MCP servers (v1.36 step 5, D3, D4): a pod whose
+#      policy names a sub-agent and a confined MCP server, each launched by
+#      its shell: each in a group the node agent made below the container's
+#      own (as each reads its /proc/self/cgroup), the server held to its own
+#      rules, each launch settled, and the audit verifies the stream.
 #
 #   varek/v1_4/tests/v1340_kind.sh --image IMAGE [--out DIR] [--keep]
 #                                  [--node-image kindest/node:TAG]
@@ -465,6 +470,61 @@ for p in sorted(glob.glob(sys.argv[1] + "/*.jsonl")):
 sys.exit(1)
 EOF
 check "... the value in no stream on the node" sh -c "! grep -rqF -- '$CRED_VAL' '$OUT/streams7'"
+
+echo "== 8. sub-agents and confined MCP servers (v1.36 step 5: D3, D4)"
+# busybox's programs are one file: each launch is of the image its shell
+# runs, settled by its memory layout (the pod's network has no process events)
+SPOL="require warden 1.31
+mcp server files exec /bin/head
+$(printf '%s\n' "${POLICY#*
+}" | sed 's|^allow exec /bin/cat$|allow exec /bin/cat subagent=reader|')
+allow path /proc/self/ readonly for=files
+allow path /etc/hostname readonly for=files
+allow path /lib/ readonly for=files
+allow path /lib64/ readonly for=files
+allow path /etc/ld.so.cache readonly for=files"
+vp subs "$SPOL" > "$OUT/vp-subs.json"
+check "a policy naming a sub-agent and a confined MCP server: admitted (carried), and written to the node" sh -c \
+    "kubectl apply -f '$OUT/vp-subs.json' && for i in \$(seq 30); do $NODE_EXEC grep -q '^mcp server files' /var/lib/varek/policies/team-a/subs.policy 2>/dev/null && exit 0; sleep 1; done; exit 1"
+CHECK='echo "reader: $(exec /bin/cat /proc/self/cgroup)"
+echo "files: $(exec /bin/head -n 1 /proc/self/cgroup)"
+(exec /bin/head -n 1 /etc/hostname) > /dev/null 2>&1; echo "files_allowed: $?"
+(exec /bin/head -n 1 /etc/passwd) > /dev/null 2>&1; echo "files_denied: $?"' pod pod-s team-a subs > "$OUT/pod-s.json"
+kubectl apply -f "$OUT/pod-s.json" > /dev/null 2>&1
+check "the pod ran to its end" ran pod-s
+check "... supervised (the launcher first)" said pod-s '^varek-init: Landlock'
+check "the sub-agent in a group below the container's own (its /proc/self/cgroup: .../reader-1)" said pod-s '^reader: 0::/\(.*/\)\{0,1\}reader-1$'
+check "the confined server in its own (.../files-1)" said pod-s '^files: 0::/\(.*/\)\{0,1\}files-1$'
+check "... held to its own rules: a file they allow read, one they do not refused" sh -c \
+    "grep -qx 'files_allowed: 0' '$OUT/pod-s.log' && grep -q '^files_denied: [1-9]' '$OUT/pod-s.log'"
+rm -rf "$OUT/streams8"
+if [ "$HOST" = 1 ]; then
+    sudo cp -a /var/log/varek "$OUT/streams8" && sudo chown -R "$(id -u):$(id -g)" "$OUT/streams8"
+else
+    docker cp "$N:/var/log/varek" "$OUT/streams8" > /dev/null 2>&1
+fi
+SS="$(python3 - "$OUT/streams8" <<'EOF'
+import glob, json, sys
+for p in sorted(glob.glob(sys.argv[1] + "/*.jsonl")):
+    for l in open(p):
+        if l.startswith("{"):
+            r = json.loads(l)
+            if r.get("event") == "run_start" and r.get("node", {}).get("pod", {}).get("name") == "pod-s":
+                print(p)
+            break
+EOF
+)"
+check "... its stream: the run's group the container's, each sub-agent's below it, each launch settled" python3 - "$SS" <<'EOF'
+import json, sys
+R = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+cg = R[0]["on_behalf_of"]["agent"]["cgroup"]
+subs = {r["subagent"]: r["cgroup"] for r in R if r.get("action") == "process.exec" and "subagent" in r}
+settled = {r["subagent"] for r in R if r.get("event") == "subagent_settled" and r.get("result") == "launched"}
+sys.exit(0 if subs.get("reader#1") == cg + "/reader-1" and subs.get("files#1") == cg + "/files-1" and
+         {"reader#1", "files#1"} <= settled else 1)
+EOF
+check "... and the audit verifies it" python3 "$HERE/tools/varek_audit.py" --policy "${SS%.jsonl}.policy" \
+    --checker "$HERE/tools/vdp_cert_check" --pubkey "$OUT/node.key.pub" "$SS"
 
 echo
 [ "$fail" = 0 ] && say "v1340_kind: PASS" || say "v1340_kind: FAIL"

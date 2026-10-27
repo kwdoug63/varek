@@ -81,6 +81,18 @@
 #      credential not given to the namespace, from another source, a file
 #      outside the directory, no placeholder, two, a malformed one, one
 #      policy file.
+# v1.36 step 5 (D3, D4):
+#  11. sub-agents and confined MCP servers under the node agent: a sub-agent
+#      and a confined server (mcp server NAME exec PATH), each launched by a
+#      child of the container's first process: each in a group the
+#      supervisor made below the container's own (as the launched process
+#      reads its /proc/self/cgroup), each call attributed to it (obo), the
+#      server held to its own rules, each launch settled; --oci-filter
+#      carries the policy, and a plan's subagent steps and an mcp_call to a
+#      stdio server (UNKNOWN, the plan refused, as on a host); refused: a
+#      sub-agent launched by the container's first process itself
+#      (subagent_first_process), a policy that could write the container's
+#      control groups.
 #
 #   test_v1340.sh VDP_CHECK VDP_CERT_CHECK WARDEN [VAREK_INIT]
 set -u
@@ -403,6 +415,9 @@ c["mounts"].append({"destination": "/varek/init", "type": "bind", "source": B + 
                     "options": ["bind", "ro", "nosuid", "nodev"]})
 c["mounts"].append({"destination": "/work", "type": "bind", "source": B + "/work",
                     "options": ["rbind", "rw", "nosuid", "nodev"] + ([] if "work-exec" in opts else ["noexec"])})
+if "cg2" in opts:     # v1.36 step 5: the cgroup filesystem as a cgroup v2 node mounts it (on a hybrid host too)
+    for m in c["mounts"]:
+        if m["destination"] == "/sys/fs/cgroup": m.update(type="cgroup2", source="cgroup2")
 if "twice" in opts:
     c["mounts"].append({"destination": "/work2", "type": "bind", "source": B + "/work", "options": ["rbind", "ro", "nosuid", "nodev"]})
 json.dump(c, open(cfg, "w"))
@@ -619,8 +634,7 @@ else
         "[ $nrc = 1 ] && grep -q 'a pod under it names its plan (varek.dev/plan)' '$B/f/np.err'"
     check "... under a policy without it: written" sh -c "'$WARDEN' '$P/plain.policy' --oci-filter --no-plan > /dev/null 2>&1"
     "$WARDEN" "$P/held.policy" --oci-filter --plan "$P/mcp.plan" > /dev/null 2> "$B/f/mcp.err"; mrc=$?
-    check "--oci-filter --plan with an mcp_call step: refused (the node agent does not carry it yet)" sh -c \
-        "[ $mrc = 1 ] && grep -q 'does not carry mcp_call steps yet (step m)' '$B/f/mcp.err'"
+    check "--oci-filter --plan with an mcp_call step: carried (v1.36 step 5), the plan read" sh -c "[ $mrc = 0 ]"
     check "--oci-filter with --plan and --no-plan: refused" sh -c \
         "'$WARDEN' '$P/held.policy' --oci-filter --plan '$P/held.plan' --no-plan > /dev/null 2>&1; [ \$? = 2 ]"
     lbundle held "$B/s/l.sock" "$B/f/held.json" held "/varek/init -- /probe" plan=held; run held
@@ -643,8 +657,8 @@ else
     check "a plan with a step the policy does not allow: refused, its records in the stream" sh -c \
         "! grep -q '^read_allowed' '$B/over.out' && grep -q 'its plan is refused' '$(stream l over)' && grep -q '\"event\":\"plan_gate\"' '$(stream l over)'"
     lbundle mcp "$B/s/l.sock" "$B/f/held.json" held "/varek/init -- /probe" plan=mcp; run mcp
-    check "a plan with an mcp_call step: the step UNKNOWN under the node agent, the plan refused" sh -c \
-        "! grep -q '^read_allowed' '$B/mcp.out' && grep -q 'the node agent does not carry this kind of step yet' '$(stream l mcp)'"
+    check "a plan with an mcp_call step: decided as on a host (UNKNOWN: the policy allows no MCP call), the plan refused" sh -c \
+        "! grep -q '^read_allowed' '$B/mcp.out' && grep -q 'plan: mcp_call step \"http://10.0.0.1:8080/mcp\" is UNKNOWN' '$(stream l mcp)' && grep -q 'its plan is refused' '$(stream l mcp)'"
     lbundle pbad "$B/s/l.sock" "$B/f/held.json" held "/varek/init -- /probe" plan=held plan-bad-sha; run pbad
     check "a plan not the one the plugin checked (another SHA-256): refused" refused l pbad 'the plan .* is not the one the NRI plugin'
     lbundle pnosha "$B/s/l.sock" "$B/f/held.json" held "/varek/init -- /probe" plan=held plan-no-sha; run pnosha
@@ -737,6 +751,70 @@ else
     lbundle c1a "$B/s/c1.sock" "$B/f/cfile.json" - "/varek/init -- /probe env VAREK_CRED_GH" "env=VAREK_CRED_GH=$PH"; in_pod c1a; run c1a
     check "refused: credentials under one policy file (no VarekCredential list beside it)" sh -c \
         "! grep -q '^env:' '$B/c1a.out' && grep -q 'this node agent has one policy' '$(stream c1 c1a)'"
+fi
+
+echo "== 11. sub-agents and confined MCP servers under the node agent (v1.36 step 5, D3 and D4) =="
+if [ -z "$WARDEN" ] || ! declare -f lbundle > /dev/null ||
+   ! printf '%s\n' '#include <errno.h>' '#include <fcntl.h>' '#include <stdio.h>' '#include <string.h>' '#include <unistd.h>' \
+       'static void r(const char *n, const char *p) { int fd = open(p, O_RDONLY); printf("%s %s: %s\n", n, p, fd >= 0 ? "ok" : errno == EACCES ? "EACCES" : strerror(errno)); if (fd >= 0) close(fd); }' \
+       'int main(int c, char **v) { setvbuf(stdout, NULL, _IONBF, 0); const char *n = strrchr(v[0], 0x2f); n = n ? n + 1 : v[0];' \
+       '  r(n, "/data/allowed"); r(n, "/data/denied"); char b[4096]; int fd = open("/proc/self/cgroup", O_RDONLY); ssize_t k = fd >= 0 ? read(fd, b, sizeof b - 1) : -1;' \
+       '  b[k > 0 ? k : 0] = 0; char *l = strstr(b, "0::"); if (l) { l[strcspn(l, "\n")] = 0; printf("%s cgroup: %s\n", n, l + 3); } else printf("%s cgroup: none\n", n); return 0; }' |
+     gcc -static -O2 -x c -o "$B/rootfs/sub" - 2>/dev/null; then
+    skip "sub-agents under the node agent (need the launcher, as section 6, and a static gcc)"
+else
+    cp "$B/rootfs/sub" "$B/rootfs/srv"; chmod 755 "$B/rootfs/sub" "$B/rootfs/srv"
+    printf 'require warden 1.31\nmcp server files exec /srv\nallow path /data/allowed readonly\nallow path /proc/self/cgroup readonly\nallow path /data/denied readonly for=files\nallow path /proc/self/cgroup readonly for=files\nallow path /work/\nallow exec /sub subagent=reader\n' > "$P/sub.policy"
+    { cat "$P/sub.policy"; printf 'allow path /sys/fs/cgroup/\n'; } > "$P/subw.policy"
+    printf 'plan 1.35\naction s1 subagent reader\naction s2 subagent files\naction r1 file_open /data/allowed open=read\naction r2 file_open /proc/self/cgroup open=read\naction r3 file_open /data/denied open=read as=files\naction r4 file_open /proc/self/cgroup open=read as=files\n' > "$P/sub.plan"
+    printf 'plan 1.35\naction s1 subagent reader\naction m mcp_call stdio:files\n' > "$P/stdio.plan"
+    chmod 644 "$P/"*.policy "$P/"*.plan
+    "$WARDEN" "$P/sub.policy" --oci-filter > "$B/f/sub.json" 2> "$B/f/sub.err"; src=$?
+    check "--oci-filter: a policy naming a sub-agent and a confined MCP server, carried (v1.36 step 5)" sh -c "[ $src = 0 ] && [ -s '$B/f/sub.json' ]"
+    check "... with a plan of subagent steps, and one with an mcp_call to a stdio server (read; decided in the container's view)" sh -c \
+        "'$WARDEN' '$P/sub.policy' --oci-filter --plan '$P/sub.plan' > /dev/null 2>&1 && '$WARDEN' '$P/sub.policy' --oci-filter --plan '$P/stdio.plan' > /dev/null 2>&1"
+    lbundle sub "$B/s/l.sock" "$B/f/sub.json" sub "/varek/init -- /probe sub"; run sub
+    sed 's/^/     /' "$B/sub.out"
+    SS="$(stream l sub)"
+    CG="$(python3 -c 'import json, sys; print(next(json.loads(l) for l in open(sys.argv[1]) if "\"event\":\"run_start\"" in l)["on_behalf_of"]["agent"]["cgroup"])' "$SS" 2>/dev/null)"
+    check "the sub-agent and the confined server ran, each launched by a child of the container's first process" sh -c \
+        "grep -qx 'launch_sub: ran' '$B/sub.out' && grep -qx 'launch_srv: ran' '$B/sub.out'"
+    check "run_start: the run's control group (on_behalf_of.agent.cgroup) is the container's own (the runtime's)" sh -c \
+        "[ -n '$CG' ] && grep -q 'sub-agents: the run.s control group $CG, the container.s' '$SS'"
+    check "each in a group made below the container's (its /proc/self/cgroup: reader-1, files-1)" sh -c \
+        "grep -Eq '^sub cgroup: (.*/)?reader-1\$' '$B/sub.out' && grep -Eq '^srv cgroup: (.*/)?files-1\$' '$B/sub.out'"
+    check "... the launch records name them, under the container's group" rec l sub \
+        '[r for r in R if r.get("subagent") == "reader#1" and r.get("cgroup") == "'"$CG"'/reader-1"] and [r for r in R if r.get("subagent") == "files#1" and r.get("mcp_server") and r.get("confined") and r.get("cgroup") == "'"$CG"'/files-1"]'
+    check "the sub-agent's calls attributed to it (obo), decided by the agent's rules" sh -c \
+        "grep -qx 'sub /data/allowed: ok' '$B/sub.out' && grep -qx 'sub /data/denied: EACCES' '$B/sub.out'" 
+    check "... in its records" rec l sub \
+        '[r for r in R if r.get("resolved") == "/data/allowed" and r.get("decision_final") == "ALLOW" and r.get("obo") == ["agent", "subagent:reader#1"]]'
+    check "the confined server held to its own rules (its records: obo files#1)" sh -c \
+        "grep -qx 'srv /data/allowed: EACCES' '$B/sub.out' && grep -qx 'srv /data/denied: ok' '$B/sub.out'"
+    check "... in its records" rec l sub \
+        '[r for r in R if r.get("resolved") == "/data/denied" and r.get("decision_final") == "ALLOW" and r.get("obo") == ["agent", "subagent:files#1"]]'
+    check "each launch settled (subagent_settled: launched)" rec l sub \
+        'sorted(r["subagent"] for r in R if r.get("event") == "subagent_settled" and r.get("result") == "launched") == ["files#1", "reader#1"]'
+    check "the supervisor removed the groups it made" sh -c "! grep -q 'could not remove the run.s control groups' '$SS'"
+    if [ -n "$CERT" ]; then
+        check "... and the audit accepts the stream" python3 "$HERE/tools/varek_audit.py" --policy "$(echo "$SS" | sed 's/\.jsonl$/.policy/')" --checker "$CERT" "$SS"
+    fi
+    lbundle self "$B/s/l.sock" "$B/f/sub.json" sub "/varek/init -- /probe subself"; run self
+    check "refused: a sub-agent launched by the container's first process itself (subagent_first_process)" sh -c \
+        "grep -qx 'subself: EACCES' '$B/self.out' && grep -F '\"target\":\"/sub\"' '$(stream l self)' | grep -q '\"rule\":\"subagent_first_process\"'"
+    if [ -n "$CERT" ]; then
+        check "... and the audit accepts the stream (a refusal the Warden writes)" \
+            python3 "$HERE/tools/varek_audit.py" --policy "$(stream l self | sed 's/\.jsonl$/.policy/')" --checker "$CERT" "$(stream l self)"
+    fi
+    lbundle splan "$B/s/l.sock" "$B/f/sub.json" sub "/varek/init -- /probe sub" plan=sub; run splan
+    check "a pod's plan of subagent steps: decided, the run held to it, the sub-agent and the server ran" sh -c \
+        "grep -qx 'sub /data/allowed: ok' '$B/splan.out' && grep -qx 'srv /data/denied: ok' '$B/splan.out' && grep -q 'the run is held to its plan' '$(stream l splan)'"
+    lbundle sstdio "$B/s/l.sock" "$B/f/sub.json" sub "/varek/init -- /probe sub" plan=stdio; run sstdio
+    check "a plan with an mcp_call to a stdio server: UNKNOWN, as on a host (D4 (b)), the plan refused" sh -c \
+        "! grep -q '^launch_sub' '$B/sstdio.out' && grep -q 'a stdio MCP server.s calls are not decided' '$(stream l sstdio)' && grep -q 'its plan is refused' '$(stream l sstdio)'"
+    "$WARDEN" "$P/subw.policy" --oci-filter > "$B/f/subw.json" 2>/dev/null
+    lbundle subw "$B/s/l.sock" "$B/f/subw.json" subw "/varek/init -- /probe sub" cg2; run subw
+    check "refused: a policy that lets the agent write the container's control groups" refused l subw 'with sub-agents named, the control groups must be out of the agent.s reach'
 fi
 
 echo

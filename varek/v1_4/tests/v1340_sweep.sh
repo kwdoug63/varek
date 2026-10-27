@@ -96,17 +96,23 @@ if [ "$ONLY" != host ]; then
     : > "$OUT/calls.jsonl"; chmod 666 "$OUT/calls.jsonl"   # a suite runs the Warden as other users too
     # the stand-in where any user (or a user namespace's root) can run it
     install -m 755 "$HERE/tests/v1340_pod.py" "$W/bin/v1340_pod.py"
+    PY="$(command -v python3)"
     # the version the Warden reports, which tools/varek reads from its binary
     VER="$(grep -ao '"warden":"[0-9.]*"' "$S/warden-sweep-real" | head -1)"
     for t in "${SUITES[@]}"; do
         # the stand-in, its settings written in (sudo, in the suites' targets, clears the environment)
+        # v1.36 step 5: in Python, not sh (a shell drops variables whose names
+        # are not its own, BASH_FUNC_f%% among them, which the agent is to
+        # get), and isolated (-I: a suite's PYTHONPATH is the agent's, not the
+        # stand-in's)
         cat > "$S/warden" <<EOF
-#!/bin/sh
+#!$PY -I
 # v1340_sweep.sh's stand-in for the Warden $VER
-export VAREK_SWEEP_DIR='$W' VAREK_SWEEP_WARDEN='$S/warden-sweep-real' VAREK_SWEEP_LAUNCHER='$S/varek-init' \
-       VAREK_SWEEP_RUNC='$RUNC' VAREK_SWEEP_LOG='$OUT/calls.jsonl' VAREK_SWEEP_SUITE='$t' \
-       VAREK_SWEEP_KEEP='${VAREK_SWEEP_KEEP:-}'
-exec python3 '$W/bin/v1340_pod.py' "\$@"
+import os, sys
+os.environ.update(VAREK_SWEEP_DIR='$W', VAREK_SWEEP_WARDEN='$S/warden-sweep-real', VAREK_SWEEP_LAUNCHER='$S/varek-init',
+                  VAREK_SWEEP_RUNC='$RUNC', VAREK_SWEEP_LOG='$OUT/calls.jsonl', VAREK_SWEEP_SUITE='$t',
+                  VAREK_SWEEP_KEEP='${VAREK_SWEEP_KEEP:-}')
+os.execv(sys.executable, [sys.executable, "-I", "$W/bin/v1340_pod.py"] + sys.argv[1:])
 EOF
         chmod 755 "$S/warden"; touch -r "$S/warden-sweep-real" "$S/warden"
         suite node "$t"
