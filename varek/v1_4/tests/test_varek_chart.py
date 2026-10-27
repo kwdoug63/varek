@@ -144,8 +144,8 @@ def test_the_unsupervised_profile():
     assert "mv -f /host/seccomp/varek/.unsupervised.json.new /host/seccomp/varek/unsupervised.json" in script
     spec = pod(render("node.seccompRoot=/var/lib/k/seccomp"), "DaemonSet")
     assert volumes(spec)["seccomp"]["hostPath"]["path"] == "/var/lib/k/seccomp"
-    # a node the release's image does not run on gets no node agent
-    assert spec["nodeSelector"] == {"kubernetes.io/os": "linux", "kubernetes.io/arch": "amd64"}
+    # v1.36 (D8): the release's image is for amd64 and arm64, so every Linux node gets the node agent
+    assert spec["nodeSelector"] == {"kubernetes.io/os": "linux"}
 
 
 def test_the_exporters_state():
@@ -400,17 +400,32 @@ def test_ci_and_the_release_build_check_and_sign_the_node_image_and_the_chart():
     assert "--target node" in ci and "node_check.sh" in ci
     ci = " ".join(s.get("run", "") for s in yaml.safe_load(open(os.path.join(wf, "warden-build.yml")))["jobs"]["build"]["steps"])
     assert "test-varek-chart" in ci and "KUBECONFORM=" in ci and re.search(r"kubeconform@v\d+\.\d+\.\d+", ci)
-    rel = yaml.safe_load(open(os.path.join(wf, "container-release.yml")))["jobs"]["publish"]["steps"]
+    jobs = yaml.safe_load(open(os.path.join(wf, "container-release.yml")))["jobs"]
+    rel = jobs["publish"]["steps"]
     run = [s.get("run", "") for s in rel]
     joined = " ".join(run)
-    for w in ("--target node", "node_check.sh", 'docker push "$NODE:$VERSION"', 'cosign sign --yes "$node"',
-              'cosign attest --yes --type cyclonedx --predicate sbom-node.cdx.json "$node"', "helm lint --strict",
+    # v1.36 (D8): arm64's node image built and checked on the arm64 runner, before publish
+    arm = jobs["node-arm64"]
+    assert arm["runs-on"] == "ubuntu-24.04-arm" and jobs["publish"]["needs"] == "node-arm64"
+    armrun = " ".join(s.get("run", "") for s in arm["steps"])
+    for w in ("--target node", 'node_check.sh "$NODE:$VERSION-arm64"', "= linux/arm64 ]",
+              'docker push "$NODE:$VERSION-arm64"', '"digest=$digest" >> "$GITHUB_OUTPUT"'):
+        assert w in armrun, w
+    assert "cosign" not in armrun and "id-token" not in arm["permissions"]
+    for w in ("--target node", 'node_check.sh "$NODE:$VERSION-amd64"', "= linux/amd64 ]", 'docker push "$NODE:$VERSION-amd64"',
+              'docker buildx imagetools create -t "$NODE:$VERSION" "$amd64" "$ARM64"',
+              "platforms.py node-index.json linux/amd64 linux/arm64", 'cosign sign --yes --recursive "$node"',
+              'cosign attest --yes --type cyclonedx --predicate "sbom-node-$a.cdx.json" "$d"', "helm lint --strict",
               "helm package", 'helm push', 'cosign sign --yes "$CHARTS/varek@$d"',
-              '"$NODE_DIGEST" > /dev/null', '"$CHART_DIGEST" > /dev/null'):
+              '"$NODE_DIGEST" > /dev/null', 'for d in "$NODE_AMD64" "$NODE_ARM64"', '"$CHART_DIGEST" > /dev/null',
+              'docker buildx imagetools create -t "$NODE:$t" "$NODE_DIGEST"'):
         assert w in joined, w
     # helm pinned; the chart's version the tag's; its image the digest just signed
     assert re.search(r"helm\.sh/helm/v3/cmd/helm@v\d+\.\d+\.\d+", joined)
     assert "for f in version appVersion" in joined and 'd="${NODE_DIGEST#*@}"' in joined
     # each in order: published, then signed, then verified, then the tags moved
     at = lambda w: next(i for i, r in enumerate(run) if w in r)
-    assert at('docker push "$NODE:$VERSION"') < at("helm package") < at("helm push") < at('"$CHART_DIGEST" > /dev/null') < at("docker push \"$i:$t\"")
+    assert at('docker push "$NODE:$VERSION-amd64"') < at("helm package") < at("helm push") < at('"$CHART_DIGEST" > /dev/null') < at('imagetools create -t "$NODE:$t"')
+    # the platforms checked before the image for both is signed
+    pub = run[at("platforms.py")]
+    assert pub.index("platforms.py") < pub.index("cosign sign")

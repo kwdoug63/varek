@@ -101,7 +101,7 @@ for n in nodes:
         print(line + "\t(tainted: no long agent)", file=sys.stderr)
         continue
     out.append(line)
-    if not (ready and ok and i["architecture"] == "amd64"):
+    if not (ready and ok and i["architecture"] in ("amd64", "arm64")):
         bad.append(line)
 open(sys.argv[2], "w").write("\n".join(out) + "\n")
 print("\n".join(out))

@@ -27,9 +27,10 @@ the container does not start. The chart installs:
   command: **containerd 2.2** or later (EKS, kind), or **CRI-O 1.35** or
   later (OpenShift). With an earlier one the plugin says so in its log and
   does not start, and the supervised pods on that node do not run.
-- amd64 nodes: the release builds the node image for amd64, and the
-  DaemonSet is placed on amd64 nodes only (`nodeSelector`). A supervised pod
-  placed on another node does not run.
+- amd64 or arm64 nodes: the release builds the node image for both, as
+  one image (v1.36), and the DaemonSet is placed on every Linux node
+  (`nodeSelector`). A supervised pod placed on a node without the node
+  agent does not run.
 - A namespace of its own that admits privileged pods. The node agent is
   privileged on the node, in the node's PID namespace, as Falco and Tetragon
   are.
@@ -54,7 +55,11 @@ cosign verify ghcr.io/kwdoug63/charts/varek:1.35.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-and the same for `ghcr.io/kwdoug63/varek-node:1.35.0`.
+and the same for `ghcr.io/kwdoug63/varek-node:1.35.0`. From v1.36 the node
+image is one image for amd64 and arm64, and each architecture's is also
+tagged `:<version>-amd64` and `:<version>-arm64`, signed the same way, with
+its bill of materials attested on it (`cosign verify-attestation --type
+cyclonedx` on that tag, with the same two options).
 
 On OpenShift (CRI-O), add `--set runtime=cri-o --set openshift.enabled=true`.
 This creates a SecurityContextConstraints that only the node agent's service

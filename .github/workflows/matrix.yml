@@ -10,8 +10,9 @@ name: Matrix
 #     CRI-O's own minor;
 #   containerd 2.2 and 2.3 with runc, `SystemdCgroup = true` (Amazon Linux
 #     2023's setting on EKS), Kubernetes 1.35.
-# kind, whose node images carry one containerd for each kind release, stays
-# in kubernetes.yml. The cells that need a host other than Ubuntu, or
+# Each cell on amd64 and, v1.36 step 3 (D8), on arm64: GitHub's arm64 runner,
+# the node image built there natively. kind, whose node images carry one
+# containerd for each kind release, stays in kubernetes.yml. The cells that need a host other than Ubuntu, or
 # SELinux enforcing, run for each release, in virtual machines on the
 # runner (step 2's second part).
 
@@ -41,33 +42,44 @@ jobs:
   # The node image, built once and handed to every cell (each cell built its
   # own at first: three of eight then sat in the build for over ten minutes
   # while the same build took one in the others)
+  # for each architecture, on its own runner (v1.36: arm64's checked as the
+  # release checks it, node_check.sh)
   image:
-    name: The node image
-    runs-on: ubuntu-24.04
+    name: ${{ matrix.arch == 'arm64' && 'The node image, arm64' || 'The node image' }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
       - name: Build the node image, and save it
         timeout-minutes: 20
         run: |
+          uname -srm
           docker build -f packaging/container/Containerfile --target node -t varek-node:ci .
+          [ "$(docker image inspect --format '{{.Architecture}}' varek-node:ci)" = "${{ matrix.arch }}" ]
           docker save -o "$RUNNER_TEMP/varek-node.tar" varek-node:ci
           ls -l "$RUNNER_TEMP/varek-node.tar"
+      - name: The node image - each command the chart names runs, the launcher static
+        run: packaging/container/node_check.sh varek-node:ci
       - uses: actions/upload-artifact@v4
         with:
-          name: node-image
+          name: ${{ matrix.arch == 'arm64' && 'node-image-arm64' || 'node-image' }}
           path: ${{ runner.temp }}/varek-node.tar
           retention-days: 1
 
   cell:
-    name: ${{ matrix.name }}
+    name: ${{ matrix.cell.name }}${{ matrix.arch == 'arm64' && ', arm64' || '' }}
     needs: image
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        include:
+        arch: [amd64, arm64]
+        cell:
           - {name: "CRI-O 1.35, runc", runtime: crio, version: "1.35", oci: runc}
           - {name: "CRI-O 1.35, crun", runtime: crio, version: "1.35", oci: crun}
           - {name: "CRI-O 1.36, runc", runtime: crio, version: "1.36", oci: runc}
@@ -90,7 +102,7 @@ jobs:
       # and v1340_kind.sh --host loads it into the node's runtime
       - uses: actions/download-artifact@v4
         with:
-          name: node-image
+          name: ${{ matrix.arch == 'arm64' && 'node-image-arm64' || 'node-image' }}
           path: ${{ runner.temp }}
       - name: The host
         run: |
@@ -102,8 +114,8 @@ jobs:
           # only its own part of it (an 18d1b60 cell's test could not write
           # its log in a folder root had made)
           mkdir -p "$OUT"
-          sudo -E env "PATH=$PATH" bash varek/v1_4/tests/node_cluster.sh --runtime "${{ matrix.runtime }}" \
-            --version "${{ matrix.version }}" --oci "${{ matrix.oci }}" --out "$OUT/cluster"
+          sudo -E env "PATH=$PATH" bash varek/v1_4/tests/node_cluster.sh --runtime "${{ matrix.cell.runtime }}" \
+            --version "${{ matrix.cell.version }}" --oci "${{ matrix.cell.oci }}" --out "$OUT/cluster"
           # the cluster's kubectl ran as root with this HOME (sudo -E), and made
           # ~/.kube (its cache) root's: the folder is given back with the config
           sudo mkdir -p "$HOME/.kube"
@@ -126,5 +138,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: cell-${{ matrix.runtime }}-${{ matrix.version }}-${{ matrix.oci }}
+          name: cell-${{ matrix.cell.runtime }}-${{ matrix.cell.version }}-${{ matrix.cell.oci }}${{ matrix.arch == 'arm64' && '-arm64' || '' }}
           path: ${{ github.workspace }}/cell

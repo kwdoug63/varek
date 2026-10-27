@@ -101,12 +101,12 @@ plugin:
     requests: { cpu: 10m, memory: 32Mi }
     limits: { memory: 256Mi }
 
-# the release builds the node image for amd64 only: a supervised pod placed
-# on another node does not run (no plugin there to replace its unsupervised
-# profile)
+# the release builds the node image for amd64 and arm64 (one image, both
+# architectures): Linux nodes of either. A supervised pod placed on a node
+# without the agent does not run (no plugin there to replace its
+# unsupervised profile)
 nodeSelector:
   kubernetes.io/os: linux
-  kubernetes.io/arch: amd64
 # every node runs it, tainted ones too: a supervised pod placed on a node
 # without it does not run
 tolerations:
