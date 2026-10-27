@@ -27,6 +27,14 @@ name: Container release
 # then the chart (packaging/helm/varek), its image pinned by the digest just
 # signed, is packaged and published as oci://ghcr.io/kwdoug63/charts/varek,
 # version <version>, and signed. The chart's version must be the tag's.
+#
+# v1.36 step 3 (docs/security/v1.36-kubernetes-parity.md, D8): the node
+# image for amd64 and arm64, each built and checked natively (arm64 on
+# GitHub's arm64 runner, node-arm64 below, before anything is published
+# here), each pushed as :<version>-<arch>, then published as one image for
+# both, :<version>. The image for both and each architecture's are signed
+# (cosign --recursive); each architecture's bill of materials is attested
+# on its own image. The chart pins the image for both.
 
 on:
   push:
@@ -35,8 +43,66 @@ on:
 permissions: {}
 
 jobs:
+  # v1.36: the node image for arm64, built and checked on the arm64 runner,
+  # pushed as :<version>-arm64; publish joins it to amd64's
+  node-arm64:
+    name: Build, check and push the node image for arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write      # push to ghcr.io
+    env:
+      NODE: ghcr.io/${{ github.repository_owner }}/varek-node
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: The version, from the tag (a release tag, on main)
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          v="${REF_NAME#v}"
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "not a release tag: $REF_NAME"; exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "the tag's commit is not on main: $GITHUB_SHA"; exit 1
+          fi
+          { echo "VERSION=$v"; echo "RELEASE=${v%%-*}"; } >> "$GITHUB_ENV"
+      - name: The host
+        run: uname -srm; docker --version
+      - name: Build the node image
+        run: |
+          docker build -f packaging/container/Containerfile --target node \
+            --label org.opencontainers.image.version="$VERSION" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            -t "$NODE:$VERSION-arm64" .
+      - name: Check it before publishing - each command the chart names runs, the launcher static, the Warden the tag's version
+        run: |
+          packaging/container/node_check.sh "$NODE:$VERSION-arm64"
+          docker run --rm "$NODE:$VERSION-arm64" varek version > node-version.txt
+          cat node-version.txt
+          grep -qE "^VAREK Warden  ${RELEASE//./\\.}  " node-version.txt
+          [ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$NODE:$VERSION-arm64")" = linux/arm64 ]
+      - name: Log in to the GitHub Container Registry (the workflow's own token)
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - name: Push it (publish signs it, with amd64's)
+        id: push
+        run: |
+          docker push "$NODE:$VERSION-arm64"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$NODE:$VERSION-arm64")"
+          echo "pushed $digest as $VERSION-arm64"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
   publish:
     name: Build, check, publish and sign the image
+    needs: node-arm64
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -140,26 +206,41 @@ jobs:
           cosign verify --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$DIGEST" > /dev/null
           cosign verify-attestation --type cyclonedx --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$DIGEST" > /dev/null
           echo "verified: $DIGEST"
-      - name: Build the node image (v1.34, the Helm chart's)
+      - name: Build the node image (v1.34, the Helm chart's), amd64
         run: |
           docker build -f packaging/container/Containerfile --target node \
             --label org.opencontainers.image.version="$VERSION" \
             --label org.opencontainers.image.revision="$GITHUB_SHA" \
-            -t "$NODE:$VERSION" .
+            -t "$NODE:$VERSION-amd64" .
       - name: Check it before publishing - each command the chart names runs, the launcher static, the Warden the tag's version
         run: |
-          packaging/container/node_check.sh "$NODE:$VERSION"
-          docker run --rm "$NODE:$VERSION" varek version > node-version.txt
+          packaging/container/node_check.sh "$NODE:$VERSION-amd64"
+          docker run --rm "$NODE:$VERSION-amd64" varek version > node-version.txt
           grep -qE "^VAREK Warden  ${RELEASE//./\\.}  " node-version.txt
-      - name: Publish the node image, sign it and attach its software bill of materials
+          [ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$NODE:$VERSION-amd64")" = linux/amd64 ]
+      - name: Publish the node image for amd64 and arm64 (v1.36), sign it and attach each one's software bill of materials
+        env:
+          ARM64: ${{ needs.node-arm64.outputs.digest }}
         run: |
-          docker push "$NODE:$VERSION"
-          node="$(docker inspect --format '{{index .RepoDigests 0}}' "$NODE:$VERSION")"
-          echo "NODE_DIGEST=$node" >> "$GITHUB_ENV"
-          echo "published $node as $VERSION"
-          cosign sign --yes "$node"
-          syft "$node" -o cyclonedx-json=sbom-node.cdx.json
-          cosign attest --yes --type cyclonedx --predicate sbom-node.cdx.json "$node"
+          docker push "$NODE:$VERSION-amd64"
+          amd64="$(docker inspect --format '{{index .RepoDigests 0}}' "$NODE:$VERSION-amd64")"
+          [[ "$ARM64" == "$NODE@sha256:"* ]] || { echo "node-arm64 gave no digest: $ARM64"; exit 1; }
+          docker buildx imagetools create -t "$NODE:$VERSION" "$amd64" "$ARM64"
+          # the image for both: exactly linux/amd64 and linux/arm64 (a build's
+          # attestations, if any, are listed as unknown/unknown)
+          docker buildx imagetools inspect --raw "$NODE:$VERSION" > node-index.json
+          python3 packaging/container/platforms.py node-index.json linux/amd64 linux/arm64
+          node="$NODE@$(docker buildx imagetools inspect "$NODE:$VERSION" | awk '$1 == "Digest:" {print $2; exit}')"
+          [[ "$node" == "$NODE@sha256:"* ]] || { echo "no digest for $NODE:$VERSION"; exit 1; }
+          { echo "NODE_DIGEST=$node"; echo "NODE_AMD64=$amd64"; echo "NODE_ARM64=$ARM64"; } >> "$GITHUB_ENV"
+          echo "published $node as $VERSION ($amd64, $ARM64)"
+          # the image for both, and each architecture's (--recursive)
+          cosign sign --yes --recursive "$node"
+          for a in amd64 arm64; do
+            d="$amd64"; [ "$a" = arm64 ] && d="$ARM64"
+            syft "$d" --platform "linux/$a" -o "cyclonedx-json=sbom-node-$a.cdx.json"
+            cosign attest --yes --type cyclonedx --predicate "sbom-node-$a.cdx.json" "$d"
+          done
       - name: Install helm (pinned, built from source; its modules checked against Go's checksum database)
         run: |
           GOBIN="$RUNNER_TEMP/bin" go install helm.sh/helm/v3/cmd/helm@v3.18.6
@@ -197,9 +278,12 @@ jobs:
           id="https://github.com/$REPO/.github/workflows/container-release.yml@$REF"
           iss=https://token.actions.githubusercontent.com
           cosign verify --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$NODE_DIGEST" > /dev/null
-          cosign verify-attestation --type cyclonedx --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$NODE_DIGEST" > /dev/null
+          for d in "$NODE_AMD64" "$NODE_ARM64"; do
+            cosign verify --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$d" > /dev/null
+            cosign verify-attestation --type cyclonedx --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$d" > /dev/null
+          done
           cosign verify --certificate-identity "$id" --certificate-oidc-issuer "$iss" "$CHART_DIGEST" > /dev/null
-          echo "verified: $NODE_DIGEST $CHART_DIGEST"
+          echo "verified: $NODE_DIGEST ($NODE_AMD64, $NODE_ARM64) $CHART_DIGEST"
       - name: Move the major.minor tag and latest, once signed (not for a pre-release)
         if: env.PRERELEASE == ''
         run: |
@@ -208,10 +292,10 @@ jobs:
           [ "$(grep -F "v$MINOR." <<<"$rels" | tail -1)" = "v$VERSION" ] && tags+=("$MINOR")
           [ "$(tail -1 <<<"$rels")" = "v$VERSION" ] && tags+=(latest)
           for t in "${tags[@]}"; do
-            for i in "$IMAGE" "$NODE"; do
-              docker tag "$i:$VERSION" "$i:$t"
-              docker push "$i:$t"
-            done
+            docker tag "$IMAGE:$VERSION" "$IMAGE:$t"
+            docker push "$IMAGE:$t"
+            # the node image for both architectures, moved in the registry
+            docker buildx imagetools create -t "$NODE:$t" "$NODE_DIGEST"
           done
           echo "moved: ${tags[*]:-none} (a newer release holds the rest)"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -219,4 +303,5 @@ jobs:
           name: sbom-${{ env.VERSION }}
           path: |
             sbom.cdx.json
-            sbom-node.cdx.json
+            sbom-node-amd64.cdx.json
+            sbom-node-arm64.cdx.json

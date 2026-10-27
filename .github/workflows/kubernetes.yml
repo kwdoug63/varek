@@ -17,6 +17,8 @@ name: Kubernetes
 #          24-hour runs on EKS and OpenShift are (soak_check.py).
 # kind is built from source at a pinned version (its modules checked against
 # Go's checksum database); kubectl and helm are the runner's.
+# Each job on amd64 and, v1.36 step 3 (D8), on arm64: GitHub's arm64 runner,
+# the node image built there natively.
 
 on:
   push:
@@ -38,9 +40,13 @@ permissions:
 
 jobs:
   kind:
-    name: The chart on kind
-    runs-on: ubuntu-24.04
+    name: ${{ matrix.arch == 'arm64' && 'The chart on kind, arm64' || 'The chart on kind' }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
       - name: Install build dependencies
@@ -64,13 +70,17 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: kind
+          name: kind${{ matrix.arch == 'arm64' && '-arm64' || '' }}
           path: ${{ runner.temp }}/kind
 
   sweep:
-    name: The suites under the node agent
-    runs-on: ubuntu-24.04
+    name: ${{ matrix.arch == 'arm64' && 'The suites under the node agent, arm64' || 'The suites under the node agent' }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
       - name: Install build dependencies (as warden-build.yml)
@@ -95,13 +105,17 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: sweep
+          name: sweep${{ matrix.arch == 'arm64' && '-arm64' || '' }}
           path: ${{ runner.temp }}/sweep
 
   soak:
-    name: The 24-hour runs' harness, for six minutes
-    runs-on: ubuntu-24.04
+    name: ${{ matrix.arch == 'arm64' && 'The 24-hour runs'' harness, for six minutes, arm64' || 'The 24-hour runs'' harness, for six minutes' }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
       - name: Install build dependencies
@@ -127,5 +141,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: soak
+          name: soak${{ matrix.arch == 'arm64' && '-arm64' || '' }}
           path: ${{ runner.temp }}/soak
