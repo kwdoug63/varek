@@ -41,7 +41,17 @@
 #      policy names a sub-agent and a confined MCP server, each launched by
 #      its shell: each in a group the node agent made below the container's
 #      own (as each reads its /proc/self/cgroup), the server held to its own
-#      rules, each launch settled, and the audit verifies the stream.
+#      rules, each launch settled, and the audit verifies the stream;
+#   9. a pod acting for a user (v1.36 step 6, D5): the user's token a
+#      service account token of the cluster's own issuer (its discovery
+#      opened to the unauthenticated, as for federation), in a Secret the
+#      pod names (varek.dev/on-behalf-of); a pod naming none under a policy
+#      that says `require on-behalf-of` refused; the webhook gives the pod
+#      its token's volume and init container, and refuses an agent mounting
+#      it; the node agent reads the kubelet's copy, warden-secrets verifies
+#      it (run_start names the user), the agent cannot read it, and the
+#      audit verifies the stream. (No SPIRE here: the SVID is test_v1340's
+#      section 12 and varek-svid's own test.)
 #
 #   varek/v1_4/tests/v1340_kind.sh --image IMAGE [--out DIR] [--keep]
 #                                  [--node-image kindest/node:TAG]
@@ -199,7 +209,8 @@ check "the chart installs, its pods ready (the node agent, the plugin, the expor
     helm install varek "$ROOT/packaging/helm/varek" -n "$NS" --wait --timeout 6m \
     --set image.repository="$REPO" --set image.tag="$TAG" --set image.pullPolicy=Never \
     --set signing.secretName=varek-node-key --set signing.checkpointEvery=8 --set anchor.enabled=true \
-    --set admission.replicas=1 --set runtime="$CHART_RT" --set 'credentials.secrets={varek-test-cred}'
+    --set admission.replicas=1 --set runtime="$CHART_RT" --set 'credentials.secrets={varek-test-cred}' \
+    --set onBehalfOf.issuerCaConfigMap=kube-root-ca.crt
 for _ in $(seq 60); do grep -q '^varek-nri: runtime' <(kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null) && break; sleep 2; done
 say "  plugin: $(kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null | grep -m1 '^varek-nri: runtime' || echo 'NOT registered')"
 check "the plugin registered with the node's runtime (NRI)" sh -c "kubectl -n '$NS' logs ds/varek-node -c plugin | grep -q '^varek-nri: runtime'"
@@ -246,6 +257,11 @@ if edit == "relative":
     c["command"] = ["sh", "-c", check]
 if edit == "writable":
     c["securityContext"]["readOnlyRootFilesystem"] = False
+# section 9: acting for a user (and the agent mounting its token's volume)
+if edit in ("obo", "obomount"):
+    meta["annotations"]["varek.dev/on-behalf-of"] = "alice-token"
+if edit == "obomount":
+    c["volumeMounts"].append({"name": "varek-obo", "mountPath": "/token", "readOnly": True})
 # VAREK's unsupervised profile, which the plugin replaces (a pod naming no
 # policy keeps the runtime's)
 profile = {"type": "RuntimeDefault"}
@@ -525,6 +541,79 @@ sys.exit(0 if subs.get("reader#1") == cg + "/reader-1" and subs.get("files#1") =
 EOF
 check "... and the audit verifies it" python3 "$HERE/tools/varek_audit.py" --policy "${SS%.jsonl}.policy" \
     --checker "$HERE/tools/vdp_cert_check" --pubkey "$OUT/node.key.pub" "$SS"
+
+echo "== 9. a pod acting for a user (v1.36 step 6: D5)"
+# the cluster's service account issuer: its discovery and keys read by
+# warden-secrets on the node, unauthenticated, verified with the cluster's CA
+kubectl create clusterrolebinding varek-ci-issuer --clusterrole=system:service-account-issuer-discovery \
+    --group=system:unauthenticated > /dev/null
+ISS="$(kubectl get --raw /.well-known/openid-configuration | python3 -c 'import json, sys; print(json.load(sys.stdin)["issuer"])')"
+say "  issuer: $ISS"
+kubectl -n team-a create serviceaccount alice > /dev/null
+TOK="$(kubectl -n team-a create token alice --audience varek-agent --duration 1h)"
+kubectl -n team-a create secret generic alice-token --from-literal=token="$TOK" > /dev/null
+# the keys by the API server's name in the cluster (its certificate's), not
+# the address its discovery document gives
+OPOL="require warden 1.29
+require on-behalf-of
+trust issuer $ISS audience varek-agent jwks https://kubernetes.default.svc.cluster.local/openid/v1/jwks
+${POLICY#*
+}"
+vp obo "$OPOL" > "$OUT/vp-obo.json"
+check "a policy that says \`require on-behalf-of\`: admitted (carried), and written to the node" sh -c \
+    "kubectl apply -f '$OUT/vp-obo.json' && for i in \$(seq 30); do $NODE_EXEC grep -q '^require on-behalf-of' /var/lib/varek/policies/team-a/obo.policy 2>/dev/null && exit 0; sleep 1; done; exit 1"
+pod p-nobody team-a obo > "$OUT/p-nobody.json"
+refused "a pod under it naming no user's token: refused at deploy" "$OUT/p-nobody.json" "says .require on-behalf-of., and it names no user's token"
+pod p-mount team-a obo obomount > "$OUT/p-mount.json"
+refused "a pod whose agent mounts its token's volume: refused" "$OUT/p-mount.json" "container agent mounts varek-obo"
+CHECK='(exec /bin/cat /var/run/varek-obo/token) > /dev/null 2>&1; echo "token_read: $?"
+(exec /bin/cat /etc/hostname) > /dev/null 2>&1; echo "read_allowed: $?"
+(exec /bin/true); echo "launch_allowed: $?"' pod pod-o team-a obo obo > "$OUT/pod-o.json"
+check "the pod acting for alice: admitted" kubectl apply -f "$OUT/pod-o.json"
+kubectl -n team-a get pod pod-o -o json > "$OUT/pod-o.spec.json" 2>&1
+check "... given its token's volume and the init container that alone mounts it (the node image, /bin/true)" \
+    python3 - "$OUT/pod-o.spec.json" "$IMAGE" <<'EOF'
+import json, sys
+s = json.load(open(sys.argv[1]))["spec"]
+init = [c for c in s.get("initContainers", []) if c["name"] == "varek-obo"]
+vol = [v for v in s["volumes"] if v["name"] == "varek-obo"]
+agent = [c for c in s["containers"] if c["name"] == "agent"][0]
+sys.exit(0 if len(init) == 1 and init[0]["image"] == sys.argv[2] and init[0]["command"] == ["/bin/true"] and
+         len(vol) == 1 and vol[0]["secret"]["secretName"] == "alice-token" and
+         not any(m["name"] == "varek-obo" for m in agent.get("volumeMounts", [])) else 1)
+EOF
+check "the pod ran to its end" ran pod-o
+check "... supervised (the launcher first), its command ran" sh -c \
+    "grep -q '^varek-init: Landlock' '$OUT/pod-o.log' && grep -qx 'read_allowed: 0' '$OUT/pod-o.log' && grep -qx 'launch_allowed: 0' '$OUT/pod-o.log'"
+check "... the agent cannot read its user's token (not mounted in its container)" grep -q '^token_read: [1-9]' "$OUT/pod-o.log"
+rm -rf "$OUT/streams9"
+if [ "$HOST" = 1 ]; then
+    sudo cp -a /var/log/varek "$OUT/streams9" && sudo chown -R "$(id -u):$(id -g)" "$OUT/streams9"
+else
+    docker cp "$N:/var/log/varek" "$OUT/streams9" > /dev/null 2>&1
+fi
+SO="$(python3 - "$OUT/streams9" <<'EOF'
+import glob, json, sys
+for p in sorted(glob.glob(sys.argv[1] + "/*.jsonl")):
+    for l in open(p):
+        if l.startswith("{"):
+            r = json.loads(l)
+            if r.get("event") == "run_start" and r.get("node", {}).get("pod", {}).get("name") == "pod-o":
+                print(p)
+            break
+EOF
+)"
+check "... run_start: the token from the kubelet's copy, verified by warden-secrets, names alice and the issuer" \
+    python3 - "$SO" "$ISS" <<'EOF'
+import json, sys
+r = next(json.loads(l) for l in open(sys.argv[1]) if l.startswith("{"))
+u = r.get("on_behalf_of", {}).get("user", {})
+sys.exit(0 if u.get("subject") == "system:serviceaccount:team-a:alice" and u.get("issuer") == sys.argv[2] else 1)
+EOF
+check "... the token in no stream on the node" sh -c "! grep -rqF -- '${TOK##*.}' '$OUT/streams9'"
+check "... no copy of it left in the node agent's socket directory" sh -c "! $NODE_EXEC ls /run/varek-node | grep -q '\.obo\$'"
+check "... and the audit verifies the stream" python3 "$HERE/tools/varek_audit.py" --policy "${SO%.jsonl}.policy" \
+    --checker "$HERE/tools/vdp_cert_check" --pubkey "$OUT/node.key.pub" "$SO"
 
 echo
 [ "$fail" = 0 ] && say "v1340_kind: PASS" || say "v1340_kind: FAIL"

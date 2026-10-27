@@ -25,7 +25,8 @@ privileges, in PID, IPC and mount namespaces of its own and the host's
 network (where the suites' servers are; a pod's own network is
 tests/test_v1340.sh section 7's).
 
-Its standard output and error are the container's; the node agent's own
+Its standard output and error are the container's (its standard input
+/dev/null, as a pod's container has); the node agent's own
 lines and then the container's stream follow on standard error, where the
 Warden writes them, and it exits with the container's status. Every other
 use of the Warden (other options, no program) runs the real Warden, and
@@ -41,6 +42,20 @@ placeholder (VAREK_CRED_<NAME>), as the plugin sets it; and the node agent
 given --node-credentials / (the suites' file stores are where they put them)
 and the suite's own --secrets-conf, --secrets-as and --secrets-bin.
 
+v1.36 step 6 (D5): the on-behalf-of chain, as a cluster carries it. The
+user's token (--on-behalf-of FILE) is put where the kubelet keeps a pod's
+varek-obo Secret volume (a directory of the stand-in's given as
+--node-kubelet: pods/<uid>/volumes/kubernetes.io~secret/varek-obo/token, a
+link into ..data, root's, 0400), and the container annotated
+varek.dev/on-behalf-of, as the NRI plugin copies it from the pod; the
+agent's SVID (--agent-svid FILE) is given by a stand-in varek-svid
+(--node-spire-socket, --node-svid-helper) that copies it, as the node's
+SPIRE agent would give the container's. A file the Warden refuses as a file
+(a link, not regular, not root's, readable by others) is passed through:
+the kubelet's copy is never so; and so is --on-behalf-of-expiry record (the
+node agent revokes, its default) and an SVID under a policy that trusts no
+SPIFFE trust domain (the node agent asks SPIRE for none).
+
 Environment (set by tests/v1340_sweep.sh): VAREK_SWEEP_DIR (its own
 directory: hostroot, a bind of / with no submounts; ovl, a tmpfs),
 VAREK_SWEEP_WARDEN, VAREK_SWEEP_LAUNCHER, VAREK_SWEEP_RUNC, VAREK_SWEEP_LOG,
@@ -53,6 +68,7 @@ import pwd
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -96,7 +112,7 @@ def parse(argv):
     head, prog = argv[:i], argv[i + 1:]
     if not prog or not head:
         return "no program or no policy"
-    policy, opts, run_as, j = head[0], [], None, 1
+    policy, opts, run_as, j, ident = head[0], [], None, 1, {}
     while j < len(head):
         o = head[j]
         if o in FORMS:
@@ -105,10 +121,25 @@ def parse(argv):
             opts += [o, head[j + 1]]
         elif o == "--run-as" and j + 1 < len(head):
             run_as = head[j + 1]
+        elif o in ("--on-behalf-of", "--agent-svid") and j + 1 < len(head):    # v1.36 step 6
+            ident[o] = head[j + 1]
+        elif o == "--on-behalf-of-expiry" and j + 1 < len(head) and head[j + 1] == "revoke":
+            pass                    # the node agent's own, and only, way
         else:
             return "the option " + o + " (not the node agent's)"
         j += 2
-    return policy, opts, run_as, prog
+    return policy, opts, run_as, prog, ident
+
+
+def private_file(path):
+    """v1.36 step 6: whether the Warden takes the file as the user's token
+    or the agent's SVID (regular, root's, readable by no one else), as the
+    kubelet's copy and SPIRE's answer always are"""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o077
 
 
 def user_of(spec):
@@ -154,7 +185,14 @@ def main():
     if os.geteuid() != 0 or not initial:
         # no node agent or runtime runs so: the Warden's own answer is the answer
         passthrough("not the node's root (a node agent runs as it)", argv)
-    policy, opts, run_as, prog = got
+    policy, opts, run_as, prog, ident = got
+    for o, f in ident.items():
+        if not private_file(f):
+            passthrough("the file of %s the Warden refuses as a file (the kubelet's copy, and SPIRE's answer, "
+                        "are root's and private)" % o, argv)
+    if "--agent-svid" in ident and os.path.isfile(policy) and \
+            not re.search(rb"(?m)^[ \t]*trust[ \t]+spiffe[ \t]", open(policy, "rb").read()):
+        passthrough("--agent-svid under a policy that trusts no SPIFFE trust domain (the node agent asks SPIRE for none)", argv)
     try:
         uid, gid = user_of(run_as)
     except (KeyError, ValueError):
@@ -224,10 +262,38 @@ def main():
     cred_env = ["VAREK_CRED_%s=varek_ph_%s_%s" % (c.upper(), c, base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("="))
                 for c in filt.pop("varekCredentials", [])]
 
+    # v1.36 step 6 (D5): the user's token where the kubelet keeps the pod's
+    # varek-obo volume (KEY -> ..data/KEY, ..data -> ..<time>/), and a
+    # stand-in varek-svid giving the agent's SVID
+    if "--on-behalf-of" in ident:
+        kube = os.path.join(inv, "kubelet")
+        vol = os.path.join(kube, "pods", n, "volumes", "kubernetes.io~secret", "varek-obo")
+        ts = os.path.join(vol, "..2026_10_28_10_00_00.1")
+        os.makedirs(ts, mode=0o755)
+        for d in (kube, os.path.join(kube, "pods"), os.path.join(kube, "pods", n), os.path.join(kube, "pods", n, "volumes"),
+                  os.path.dirname(vol), vol, ts):
+            os.chmod(d, 0o755)
+        shutil.copyfile(ident["--on-behalf-of"], os.path.join(ts, "token"))
+        os.chmod(os.path.join(ts, "token"), 0o400)
+        os.symlink("..2026_10_28_10_00_00.1", os.path.join(vol, "..data"))
+        os.symlink("..data/token", os.path.join(vol, "token"))
+        opts += ["--node-kubelet", kube]
+    if "--agent-svid" in ident:
+        helper = os.path.join(inv, "varek-svid")
+        with open(helper, "w") as f:
+            f.write('#!/bin/sh\n# the stand-in varek-svid (tests/v1340_pod.py): the SVID the suite gave\n'
+                    'while [ $# -gt 0 ]; do case "$1" in -out) out="$2" ;; esac; shift 2; done\n'
+                    'umask 077; exec cp "$0.pem" "$out"\n')
+        os.chmod(helper, 0o755)
+        shutil.copyfile(ident["--agent-svid"], helper + ".pem")
+        os.chmod(helper + ".pem", 0o600)
+        opts += ["--node-spire-socket", os.path.join(inv, "spire.sock"), "--node-svid-helper", helper]
+
     agent_log = open(os.path.join(inv, "agent.log"), "w+")
+    # v1.36 step 6: no standard input of the suite's (a node agent has none)
     agent = subprocess.Popen([WARDEN, pol_dir, "--node-agent", sock, "--node-streams", streams,
                               "--node-launcher", LAUNCHER, "--node-credentials", "/"] + opts,
-                             stdout=agent_log, stderr=agent_log)
+                             stdin=subprocess.DEVNULL, stdout=agent_log, stderr=agent_log)
     for _ in range(100):
         if os.path.exists(sock) or agent.poll() is not None:
             break
@@ -313,6 +379,8 @@ def main():
     c["annotations"] = {"varek.dev/policy": "p", "varek.dev/policy-sha256": sha,
                         "varek.dev/pod-namespace": "sweep", "varek.dev/pod-name": SUITE.replace("_", "-")[:63] or "sweep",
                         "varek.dev/pod-uid": n, "varek.dev/container": "agent"}
+    if "--on-behalf-of" in ident:
+        c["annotations"]["varek.dev/on-behalf-of"] = "sweep-token"
     json.dump(c, open(cfg_path, "w"))
 
     cid = "sweep-" + n
@@ -448,7 +516,11 @@ def main():
         sys.stderr.write("v1340_pod: %s\n" % ("the overlay root did not mount" if not mounted else "the node agent did not start"))
         finish(125)
     tailer.start()
-    proc = subprocess.Popen([RUNC, "--root", state, "run", "-b", bundle, cid])
+    # v1.36 step 6: standard input /dev/null, as a pod's container has (stdin:
+    # false): runc given the suite's reads it away when the node agent
+    # refuses the container at its start, and a suite's `while read` loop
+    # then ends at its first case
+    proc = subprocess.Popen([RUNC, "--root", state, "run", "-b", bundle, cid], stdin=subprocess.DEVNULL)
     rc = proc.wait()
     finish(128 + got[0] if got else rc if rc >= 0 else 128 - rc)
 

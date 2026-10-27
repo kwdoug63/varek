@@ -184,6 +184,9 @@ spec:
             {{- if .Values.spire.bundleConfigMap }}
             - { name: spire-bundle, mountPath: /etc/varek/spire-bundle, readOnly: true }
             {{- end }}
+            {{- if .Values.onBehalfOf.issuerCaConfigMap }}
+            - { name: issuer-ca, mountPath: /etc/varek/issuer-ca, readOnly: true }
+            {{- end }}
         - name: plugin
           image: {{ include "varek.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -290,6 +293,10 @@ spec:
         {{- if .Values.spire.bundleConfigMap }}
         - name: spire-bundle
           configMap: { name: {{ .Values.spire.bundleConfigMap }}, defaultMode: 0444 }
+        {{- end }}
+        {{- if .Values.onBehalfOf.issuerCaConfigMap }}
+        - name: issuer-ca
+          configMap: { name: {{ .Values.onBehalfOf.issuerCaConfigMap }}, defaultMode: 0444, items: [{ key: ca.crt, path: ca.crt }] }
         {{- end }}
         {{- if .Values.signing.secretName }}
         - name: key

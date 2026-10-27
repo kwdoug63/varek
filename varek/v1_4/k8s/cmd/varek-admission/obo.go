@@ -74,7 +74,8 @@ func (s *server) oboContainer() map[string]interface{} {
 	if s.oboUser > 0 { // else the platform's (OpenShift's restricted-v2 gives the namespace's)
 		sc["runAsUser"], sc["runAsGroup"] = s.oboUser, s.oboUser
 	}
-	return map[string]interface{}{"name": oboName, "image": s.oboImage, "command": []string{oboCommand},
+	// IfNotPresent: the node image is the DaemonSet's, on every node already
+	return map[string]interface{}{"name": oboName, "image": s.oboImage, "imagePullPolicy": "IfNotPresent", "command": []string{oboCommand},
 		"volumeMounts":    []interface{}{map[string]interface{}{"name": oboName, "mountPath": oboMount, "readOnly": true}},
 		"securityContext": sc,
 		"resources": map[string]interface{}{"requests": map[string]string{"cpu": "1m", "memory": "4Mi"},

@@ -422,10 +422,22 @@ func TestOnBehalfOf(t *testing.T) {
 		{"another image", ann, &api.Image{Name: "evil", Digest: "sha256:def"}, []string{"/bin/true"}},
 		{"another command", ann, nil, []string{"/bin/sh", "-c", "x"}},
 		{"a pod acting for no one", map[string]string{annotation: "agent"}, nil, []string{"/bin/true"}},
+		{"another image by name", ann, &api.Image{Name: "varek-node:evil"}, []string{"/bin/true"}},
 	} {
 		if _, err := p.adjust(context.Background(), pod(c.ann), init(c.img, c.args...)); err == nil ||
 			!strings.Contains(err.Error(), "seccomp profile is RUNTIME_DEFAULT") {
 			t.Errorf("a container named %s, %s: carried as any other (refused here for its profile): %v", oboInit, c.what, err)
+		}
+	}
+	// by name, as the runtime resolves it (the chart's image by its tag)
+	p.oboImage = "varek-node:ci"
+	if adj, err := p.adjust(context.Background(), pod(ann), init(&api.Image{Name: "docker.io/library/varek-node:ci"}, "/bin/true")); adj != nil || err != nil {
+		t.Errorf("the image by its name as the runtime resolves it: %v %v", adj, err)
+	}
+	for ref, want := range map[string]string{"busybox": "docker.io/library/busybox", "kwdoug63/x:1": "docker.io/kwdoug63/x:1",
+		"ghcr.io/kwdoug63/x:1": "ghcr.io/kwdoug63/x:1", "localhost/x": "localhost/x", "reg:5000/x": "reg:5000/x"} {
+		if fullName(ref) != want {
+			t.Errorf("fullName(%q) = %q", ref, fullName(ref))
 		}
 	}
 }

@@ -514,6 +514,14 @@ def test_on_behalf_of():
     assert mounts(agent)["/etc/varek/spire-bundle"]["readOnly"] is True
     p = render("spire.self=" + me, ok=False)
     assert p.returncode != 0 and "spire.self: give spire.adminSocket too" in p.stderr
+    # the issuers' CA: the cluster's own (kube-root-ca.crt), in warden-secrets' configuration
+    docs = render("onBehalfOf.issuerCaConfigMap=kube-root-ca.crt")
+    agent, spec = ctr(pod(docs, "DaemonSet"), "node-agent"), pod(docs, "DaemonSet")
+    assert _conf(docs)["oidc_ca"] == "/etc/varek/issuer-ca/ca.crt"
+    assert arg(agent, "--secrets-conf") == "/etc/varek/secrets/secrets.conf"
+    v = volumes(spec)[mounts(agent)["/etc/varek/issuer-ca"]["name"]]["configMap"]
+    assert v["name"] == "kube-root-ca.crt" and v["items"] == [{"key": "ca.crt", "path": "ca.crt"}]
+    assert "issuer-ca" not in volumes(pod(render(), "DaemonSet"))
     # the init container's user: the value, or on OpenShift the namespace's
     assert arg(ctr(pod(render("onBehalfOf.user=1001"), "Deployment"), "admission"), "-obo-user") == "1001"
     assert arg(ctr(pod(render("openshift.enabled=true", "runtime=cri-o"), "Deployment"), "admission"), "-obo-user") == "0"

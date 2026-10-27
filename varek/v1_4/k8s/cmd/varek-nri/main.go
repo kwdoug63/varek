@@ -520,7 +520,20 @@ func (p *plugin) oboContainer(ctr *api.Container) bool {
 	if i := strings.LastIndex(p.oboImage, "@"); i >= 0 && img.GetDigest() != "" {
 		return img.GetDigest() == p.oboImage[i+1:]
 	}
-	return img.GetName() == p.oboImage
+	return fullName(img.GetName()) == fullName(p.oboImage)
+}
+
+// fullName: an image's name as a runtime may give it (docker.io/library/
+// for one with no registry, as containerd and CRI-O resolve it)
+func fullName(ref string) string {
+	first, _, named := strings.Cut(ref, "/")
+	switch {
+	case !named:
+		return "docker.io/library/" + ref
+	case !strings.ContainsAny(first, ".:") && first != "localhost":
+		return "docker.io/" + ref
+	}
+	return ref
 }
 
 // placeholder is a credential's placeholder, as the Warden makes one on a host

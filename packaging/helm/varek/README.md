@@ -242,6 +242,57 @@ sub-agent of the program its launcher runs is told from a failed launch by
 its memory layout, and refused where the node's layouts are not randomized
 (`kernel.randomize_va_space` not 2).
 
+## A pod acting for a user (from 1.36)
+
+A policy trusts the user's token's issuer (`trust issuer URL audience AUD
+[jwks URL]`) as on a host, and may say `require on-behalf-of`. A pod acting
+for a user names the Secret holding the token (key `token`):
+
+```yaml
+metadata:
+  annotations:
+    varek.dev/policy: agent
+    varek.dev/on-behalf-of: alice-token
+```
+
+The webhook's mutating hook gives the pod a Secret volume of it,
+`varek-obo`, and an init container that alone mounts it: the node image,
+`/bin/true`, not root, with no privilege and the runtime's default seccomp
+profile. The kubelet mounts no volume that no container names, so the init
+container is what makes the kubelet keep a copy on the node. The node agent
+reads that copy by the pod's uid, under `node.kubelet`'s `pods/` (mounted
+read-only, as the kubelet mounts each volume, with HostToContainer
+propagation). warden-secrets verifies the token on the node as the Warden's
+`--on-behalf-of` does on a host. `run_start` names the user, and every
+decision is the user's. No container of the agent's can read the token: the
+webhook refuses a pod whose other containers mount `varek-obo`, an ephemeral
+container added later that mounts it, an init container of that name other
+than its own, and the annotation added, changed or removed after the pod is
+created. A pod naming no Secret under a policy that says `require
+on-behalf-of` is refused at deploy, and again by the node agent.
+
+An issuer reached over TLS with a private CA, such as the cluster's own
+service account issuer, is verified with `onBehalfOf.issuerCaConfigMap`
+(`kube-root-ca.crt` for that one). Its discovery document and keys must be
+readable by the node agent's pod without credentials. On many clusters that
+means binding `system:service-account-issuer-discovery` to
+`system:unauthenticated`, as for federation.
+
+The agent's SVID (a policy's `trust spiffe DOMAIN bundle FILE`) comes from
+the node's SPIRE agent through its Delegated Identity API. `varek-svid`
+asks by the container's process id. Set `spire.adminSocket` (the SPIRE
+agent's `admin_socket_path`) and name the node agent's SPIFFE ID among the
+SPIRE agent's `authorized_delegates`. Give that ID as `spire.self` too: an
+entry selected by the DaemonSet's uid alone also matches the pods'
+processes, and varek-svid leaves it out. The trust bundle the policy names
+can come from a ConfigMap of the release's namespace
+(`spire.bundleConfigMap`, at `/etc/varek/spire-bundle/KEY`). SPIRE's
+Kubernetes workload attestor must attest the container's process as soon
+as it starts. A configuration that waits for the container's status
+(selectors by container image or name) can miss that moment, and the start
+is refused. Selectors by namespace, service account and pod label are
+attested from the pod alone (`disable_container_selectors = true`).
+
 ## Values
 
 | Value | Default | |
@@ -265,11 +316,12 @@ its memory layout, and refused where the node's layouts are not randomized
 | `credentials.dir`, `credentials.secrets` | `/var/lib/varek/credentials`, `[]` | where a `file:` source is, and the Secrets mounted there |
 | `credentials.vault.*` | `addr: ""`, `caSecret: ""`, `kubernetesAuth: {role: "", mount: kubernetes, audience: vault}` | `vault:` sources, signed in to with the node agent's service account |
 | `credentials.aws.*` | `region: ""`, `roleArn: ""`, `podIdentity: false` | `aws-sm:` sources: IRSA, EKS Pod Identity, or the node's instance role |
+| `node.kubelet` | `/var/lib/kubelet` | the kubelet's root: a pod's user's token is read from its `pods/` |
+| `onBehalfOf.user` | `65534` | the token's init container's user and group (on OpenShift, the namespace's) |
+| `onBehalfOf.issuerCaConfigMap` | `""` | a ConfigMap whose `ca.crt` verifies the token issuers' TLS (`kube-root-ca.crt` for the cluster's own); `""` the image's trust store |
+| `spire.adminSocket`, `spire.self`, `spire.bundleConfigMap` | `""` | the SPIRE agent's admin socket on the node, the node agent's own SPIFFE ID, a ConfigMap holding the trust bundle |
 
 ## What it does not do yet
-
-A policy with `require on-behalf-of` is refused by the webhook and at the
-container's start. The node agent does not carry it yet.
 
 The node's signing key (`signing.secretName`) is one Secret, given to every
 node: a stream says which node wrote it (its `device`), but each node's key

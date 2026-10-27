@@ -43,12 +43,22 @@
 #            whatever the policy says of launches, and refuses to run without
 #            Landlock; its refusals are its own (exit 126, its message).
 #  NOT-YET   not carried in pods yet, refused at deploy (the webhook) and at
-#            the start (--oci-filter names it): require on-behalf-of.
+#            the start (--oci-filter names it); none from v1.36 step 6.
 #            Credentials are carried from v1.36 step 4 (the stand-in gives
 #            each to its namespace and sets the placeholders, as a cluster
 #            does), sub-agents and confined MCP servers from step 5 (the
 #            stand-in binds each program the policy names under /tmp
-#            read-only at its path, as a pod's read-only volume holds one).
+#            read-only at its path, as a pod's read-only volume holds one),
+#            the on-behalf-of chain from step 6 (the stand-in puts the token
+#            where the kubelet keeps the pod's varek-obo volume and gives
+#            the SVID by a stand-in varek-svid).
+#  OBO       v1.36 step 6 (D5): a pod's user's token and its agent's SVID are
+#            the node agent's, read from the kubelet's copy and SPIRE's
+#            answer outside the container and copied to its own files: its
+#            refusals name those copies, and say a pod names no token
+#            (varek.dev/on-behalf-of) where a host's say to give
+#            --on-behalf-of FILE; the file a suite gave the Warden is not
+#            the pod's token, so a policy naming it does not bear on it.
 #  FIRST     v1.36 step 5 (D3, M1): the container's first process stays in
 #            the container's group, so a sub-agent it launches itself is
 #            refused (subagent_first_process); one launched by any other
@@ -113,9 +123,17 @@ test-v1271	^the agent goes on, and the Warden exits #$	AS-USER: the policy is 1.
 test-v1271	^from a working directory inside it, a copy by a relative name cannot be loaded or mapped either$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
 test-v1271	^a writable directory missing at start: listed	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
 test-v1271	^a file an exact rule names, replaced by the host during the run	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
-test-v1271	^standard input open on a file in a writable directory refuses the start$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
+test-v1271	^standard input open on a file in a writable directory refuses the start$	RUNTIME: a pod's container has no standard input of its caller's (stdin: false; the stand-in gives /dev/null, v1.36 step 6), so there is no inherited descriptor 0 on a file in a writable directory to refuse: the container starts
 test-v1271	^a launch-set file under a writable directory: reported, and the kernel refuses its launch \(EACCES\)$	STAND-IN: the program is a copy bound read-only at its path (v1.36 step 5, as a pod's read-only volume holds one): the agent cannot write it there, so it launches (D4: only a writable mount must be noexec); on a host it is in the writable directory, mounted noexec, and the kernel refuses it
-test-v1281	^refused: require on-behalf-of with no token$	NOT-YET: require on-behalf-of (v1.36 step 6): --oci-filter refuses the policy, so the start is refused for that, not for the missing token	does not carry the on-behalf-of chain
+test-v1281	^refused: require on-behalf-of with no token$	OBO: refused at the start for that, as on a host, in the node agent's words: "its pod names no user's token (varek.dev/on-behalf-of: the Secret it is in)", not the host's "give the user's token with --on-behalf-of FILE", which the check greps for
+test-v1281	^refused: a policy that lets the agent open the token file$	OBO: the token the node agent reads is the kubelet's copy, outside the container (here the stand-in's, under its own directory), never the file the suite gave, so a policy letting the agent open that file does not refuse the start; the run starts (the suite's file is in the container's /tmp only because the stand-in's /tmp is the host's)
+test-v1281	^refused: a second key, one that cannot be read \(review\)$	OBO: refused at the start for that, as on a host, naming the node agent's copy of the SVID (its socket's directory, <id>.svid), not the suite's file, which the check greps for	\.svid must hold exactly one private key
+test-v1281	^with a verified user: user, agent, sub-agent$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1): the sub-agent never runs, so the run (its records the user's and the agent's) opens no file to read the chain from	subagent_first_process
+test-v1281	^the audit reports whom the run was for, and each sub-agent's decisions$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1): the run the audit reads has no sub-agent's decisions	subagent_first_process
+test-v1281	^the audit refuses a sub-agent the policy does not name$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1): the stream the suite forges from that run holds no sub-agent to rename	subagent_first_process
+test-v1281	^varek refusals: on behalf of whom, the sub-agents, and who got each refusal$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1): the run's refusals are the agent's, none the sub-agent's	subagent_first_process
+test-v1281	^varek refusals --subagent: that sub-agent's refusals only$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1): the sub-agent has no refusals to show	subagent_first_process
+test-v1281	^the export carries varek:on_behalf_of\.\* \(the user, the operator, each sub-agent's decisions\)$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1): the export holds no sub-agent's decisions	subagent_first_process
 test-v1281	^a sub-agent and the child it forks: two processes$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1); what follows is the agent's	subagent_first_process
 test-v1281	^\.\.\. attributed to it: agent\+subagent:alpha##$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1); what follows is the agent's	subagent_first_process
 test-v1281	^its launch record names the sub-agent and its group$	FIRST: the suite's agent (the container's first process) launches the sub-agent itself (exec): refused, subagent_first_process (M1)	subagent_first_process

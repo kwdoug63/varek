@@ -139,6 +139,10 @@ onBehalfOf:
   # the init container's user and group; on OpenShift, the namespace's
   # (restricted-v2 gives it) whatever is set here
   user: 65534
+  # a ConfigMap of this release's namespace whose ca.crt verifies the
+  # issuers' TLS (their discovery documents and keys): kube-root-ca.crt for
+  # the cluster's own service account issuer; "" the image's trust store
+  issuerCaConfigMap: ""
 
 # v1.36 step 6 (D5): the agent's SVID, from the node's SPIRE agent through
 # its Delegated Identity API (varek-svid, by the container's process id),
