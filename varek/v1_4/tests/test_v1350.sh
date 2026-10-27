@@ -248,9 +248,13 @@ chmod 777 "$OUT/w"
 HP="$OUT/hold.policy"
 printf 'require warden 1.27\nallow exec /usr/bin/cat\nallow exec /usr/bin/tee\nallow exec /usr/bin/stat\nallow exec /usr/bin/sh\nallow exec /usr/bin/true\nallow exec /usr/bin/false\nallow exec /usr/bin/python3\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path /etc/hostname readonly\nallow path /etc/passwd readonly\nallow path %s/w/\nallow host 127.0.0.1:%s\nallow host 127.0.0.1:%s\n' "$OUT" 20801 20802 > "$HP"
 base() { printf 'plan 1.35\naction r1 file_open /usr/ open=read\naction r2 file_open /lib/ open=read\naction r3 file_open /etc/ld.so.cache open=read\n'; }
+# The agent in the C locale: under another (en_US.UTF-8 on Rocky Linux 9 and
+# Amazon Linux 2023) glibc opens its message catalog to say "Permission
+# denied", that open's record starts a line of its own, and cat's message is
+# split around it (v1.36's matrix: "[agent] /usr/bin/cat: /etc/passwd")
 held() {   # held <plan> <agent...>: run held, stderr in held.err
     local pl="$1"; shift
-    "$WARDEN" "$HP" --plan "$pl" --hold-to-plan -- "$@" > "$OUT/held.out" 2> "$OUT/held.err"
+    LC_ALL=C "$WARDEN" "$HP" --plan "$pl" --hold-to-plan -- "$@" > "$OUT/held.out" 2> "$OUT/held.err"
 }
 rec_of() { grep '^{"event"\|^{"seq"\|"decision_final"' "$OUT/held.err" | grep -F "\"resolved\":\"$1\"" | head -1; }
 { base; printf 'action h file_open /etc/hostname open=read\n'; } > "$OUT/h1.plan"
@@ -260,7 +264,8 @@ R=$(rec_of /etc/passwd)
 grep -q '"decision_raw":"ALLOW","decision_final":"DENY","rule":"outside_plan"' <<<"$R" && grep -q "\"plan\":\"$OUT/h1.plan\"" <<<"$R" \
     && pass "held: a file the policy allows but no step covers: refused, outside_plan, the policy's verdict kept, the plan named" \
     || flunk "held: the outside file ($R)"
-check "held: the agent got EACCES for it" grep -q 'cat: /etc/passwd: Permission denied' "$OUT/held.err"
+grep -q 'cat: /etc/passwd: Permission denied' "$OUT/held.err" && pass "held: the agent got EACCES for it" ||
+    flunk "held: the agent got EACCES for it (cat said: $(grep -v '^{' "$OUT/held.err" | grep -m2 'passwd' | tr '\n' ' '))"
 check "run_start names the plan and its SHA-256" grep -q "\"hold\":{\"plan\":\"$OUT/h1.plan\",\"plan_sha256\":\"$(sha256sum "$OUT/h1.plan" | cut -c1-64)\"}" "$OUT/held.err"
 python3 "$HERE/tools/varek_audit.py" --policy "$HP" --checker "$CHECKER" "$OUT/held.err" > "$OUT/audit" 2>&1 \
     && grep -q 'varek_audit: PASS' "$OUT/audit" && pass "varek_audit accepts the held run" || flunk "varek_audit on the held run ($(tail -2 "$OUT/audit"))"

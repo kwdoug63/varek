@@ -254,7 +254,14 @@ else
     python3 "$T/dns_test_server.py" --port "$PORT" --zone "$OUT/zone.json" --log "$OUT/q.log" \
         --ready "$OUT/ready" > "$OUT/dns.out" 2>&1 &
     SERVERS="$!"
-    python3 -m http.server "$HP" --bind 0.0.0.0 > /dev/null 2>&1 &
+    # v1.36: the HTTP test server is socketserver's, not `python3 -m http.server`,
+    # whose HTTPServer looks up the bound address's name (getfqdn("0.0.0.0"), a
+    # reverse DNS query) between bind and listen. In the matrix's VMs, behind
+    # qemu's DNS, every connect to it was refused in some runs, as though nothing
+    # listened; a slow answer to that query is the likely cause
+    python3 -c 'import http.server, socketserver, sys
+class S(socketserver.ThreadingTCPServer): allow_reuse_address = True; daemon_threads = True
+S(("0.0.0.0", int(sys.argv[1])), http.server.SimpleHTTPRequestHandler).serve_forever()' "$HP" > /dev/null 2>&1 &
     SERVERS="$SERVERS $!"
     trap 'kill $SERVERS 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$OUT"; rm -rf "$W"' EXIT
     # v1.35 step 8: up to 30 s (under a loaded sweep the HTTP server took more than the 5 s this

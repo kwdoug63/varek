@@ -691,8 +691,13 @@ else
     "$HERE/tests/landlock_table.sh" "$WARDEN" > "$OUT/llt.out" 2>&1; lrc=$?
     if [ $lrc = 2 ]; then skip "the measured table ($(tail -1 "$OUT/llt.out"))"
     else
-        check "the kernel refuses every launch outside the set the table names (open item 1)" \
-            sh -c "[ $lrc = 0 ] && ! grep -q 'FAIL' '$OUT/llt.out'"
+        if [ $lrc = 0 ] && ! grep -q 'FAIL' "$OUT/llt.out"; then
+            pass "the kernel refuses every launch outside the set the table names (open item 1)"
+        else
+            # the table itself, where a row failed: which launch, on which kernel
+            flunk "the kernel refuses every launch outside the set the table names (open item 1)"
+            sed 's/^/      /' "$OUT/llt.out"
+        fi
         check "an agent under the Warden cannot make a memfd" grep -q 'verdict|ok' "$OUT/llt.out"
     fi
 fi

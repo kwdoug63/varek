@@ -7,12 +7,15 @@ stage="$1"
 # an install, tried again with the package manager's metadata dropped: some
 # of EPEL's mirrors at times serve a repomd.xml other than the one its
 # metalink names ("checksum doesn't match"), until the metalink is fetched
-# again and agrees (it has lasted half an hour in CI, other builds passing)
+# again and agrees (it has lasted half an hour in CI, other builds passing).
+# Each try is held to five minutes: an install that stalls, printing nothing,
+# is tried again too (v1.36's matrix: the node image's build sat in this step
+# for 20 minutes in four of its runs, the same build taking one in the rest)
 retry() {
     n=1
-    until "$@"; do
+    until timeout 300 "$@"; do
         [ "$n" -lt 6 ] || return 1
-        echo "deps.sh: $1 failed (try $n of 6); again in $((n * 15)) s, its metadata dropped" >&2
+        echo "deps.sh: $1 failed or stalled (try $n of 6); again in $((n * 15)) s, its metadata dropped" >&2
         "$1" clean all >/dev/null 2>&1 || true
         sleep $((n * 15))
         n=$((n + 1))
@@ -34,7 +37,7 @@ if command -v apt-get >/dev/null 2>&1; then
 elif command -v dnf >/dev/null 2>&1; then
     case "$stage" in
     build)
-        dnf -y -q install epel-release dnf-plugins-core
+        retry dnf -y -q install epel-release dnf-plugins-core
         dnf config-manager --set-enabled crb
         # glibc-static (CodeReady Builder): the launcher, varek-init, is static (v1.34)
         retry dnf -y -q install gcc make libseccomp-devel libsodium-devel openssl-devel python3 glibc-static ;;

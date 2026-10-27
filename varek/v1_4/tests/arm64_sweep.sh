@@ -3,7 +3,9 @@
 #
 # arm64_sweep.sh — v1.30 (docs/security/v1.30-macos.md, step 1): build the
 # Warden on an arm64 Linux host and run every suite, one after another, each
-# logged to OUT/<suite>.log, then a table of each suite's result.
+# logged to OUT/<suite>.log, then a table of each suite's result. Since
+# v1.36 also the matrix's host cells (Rocky Linux 9 and Amazon Linux 2023 in
+# VMs on x86_64 runners, tests/vm_cell.sh).
 #
 # Run as root on the arm64 host (an AWS Graviton instance, Ubuntu 24.04), from
 # a checkout of the v1.30 branch where the user nobody can read it (/opt, not
@@ -50,10 +52,22 @@ if [ "$DEPS" = 1 ]; then
             musl-tools python3-cryptography python3-pip python3-pytest python3-yaml python3-venv git openssl &&
         apt-get install -y -q --no-install-recommends squid || { echo "arm64_sweep.sh: apt-get failed"; exit 1; }
     elif command -v dnf > /dev/null; then
-        # RHEL 9 or a rebuild: libsodium is EPEL's (packaging/vm/provision.sh enables it)
-        dnf -y install gcc make git openssl libseccomp-devel openssl-devel libsodium-devel python3 python3-pip \
-            python3-cryptography java-21-openjdk-headless squid curl util-linux \
-            glibc-static libasan libubsan gcc-c++ cmake || { echo "arm64_sweep.sh: dnf failed"; exit 1; }
+        # RHEL 9 or a rebuild: libsodium is EPEL's, glibc-static CodeReady
+        # Builder's (tests/vm_cell.sh enables both). Amazon Linux 2023 (v1.36,
+        # the matrix's host cells): its own repositories, Java as Corretto.
+        # A name the host's repositories do not have is left out (strict=0)
+        # and the build's own packages are checked after; --allowerasing:
+        # the cloud images' curl-minimal gives way to curl.
+        java="java-21-openjdk-headless"
+        grep -q '^ID="*amzn' /etc/os-release && java="java-21-amazon-corretto-headless"
+        dnf -y --allowerasing --setopt=strict=0 install gcc make git openssl libseccomp-devel openssl-devel \
+            libsodium-devel python3 python3-pip python3-cryptography "$java" squid curl util-linux \
+            glibc-static libasan libubsan gcc-c++ cmake procps-ng iproute sudo || { echo "arm64_sweep.sh: dnf failed"; exit 1; }
+        missing="$(rpm -q gcc make libseccomp-devel libsodium-devel openssl-devel python3 | sed -n 's/^package \(.*\) is not installed$/\1/p' | tr '\n' ' ')"
+        [ -z "$missing" ] || { echo "arm64_sweep.sh: the build needs $missing(not in this host's repositories)"; exit 1; }
+        for p in "$java" squid glibc-static libasan libubsan; do
+            rpm -q "$p" > /dev/null 2>&1 || echo "arm64_sweep.sh: note: no $p here (the suites that need it skip or fail)"
+        done
         # glibc-static (from CRB): the suites' static probes; libasan and
         # libubsan: test-mcp-json and the proxy's parsers under the sanitizers;
         # gcc-c++ and cmake: z3 5 built from source (its aarch64 wheels need

@@ -202,7 +202,14 @@ else
     # or multicast address (only a numeric rule reaches one), so the names
     # here resolve to this machine's own address (private or public).
     HOSTIP=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("10.255.255.255", 1)); print(s.getsockname()[0])')
-    python3 -m http.server "$HP" --bind 0.0.0.0 > /dev/null 2>&1 &
+    # v1.36: the HTTP test server is socketserver's, not `python3 -m http.server`,
+    # whose HTTPServer looks up the bound address's name (getfqdn("0.0.0.0"), a
+    # reverse DNS query) between bind and listen. In the matrix's VMs, behind
+    # qemu's DNS, every connect to it was refused in some runs, as though nothing
+    # listened; a slow answer to that query is the likely cause
+    python3 -c 'import http.server, socketserver, sys
+class S(socketserver.ThreadingTCPServer): allow_reuse_address = True; daemon_threads = True
+S(("0.0.0.0", int(sys.argv[1])), http.server.SimpleHTTPRequestHandler).serve_forever()' "$HP" > /dev/null 2>&1 &
     SERVER="$SERVER $!"
     printf '{"api.example.com": {"ttl": 3, "a": ["%s"]}, "blocked.example.com": {"ttl": 30, "a": ["198.51.100.9"]}}\n' \
         "$HOSTIP" > "$OUT/zone.json"
