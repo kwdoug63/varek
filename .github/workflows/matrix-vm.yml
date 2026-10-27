@@ -37,9 +37,9 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: matrix-vm-${{ github.ref }}
-  cancel-in-progress: true
+# No concurrency group: a push does not cancel the run before it. A host
+# cell's sweep runs for an hour or more, and its result is kept, not lost
+# to the next push (matrix.yml's two-minute cells do cancel).
 
 jobs:
   image:
