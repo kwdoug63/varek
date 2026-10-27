@@ -170,14 +170,22 @@ else
     # v1.36 step 4: a Warden given inheritable capabilities (CRI-O gives a
     # privileged container some): warden-secrets, the proxy and the agent
     # each drop them too
+    # (only capabilities this process may make inheritable: a container's
+    # bounding set may lack some, and setpriv then refuses)
+    INH=""
     if command -v setpriv > /dev/null; then
-        printf '#!/bin/sh\nexec setpriv --inh-caps +net_raw,+chown %s "$@"\n' "$WARDEN" > "$T/inh-warden"; chmod 755 "$T/inh-warden"
+        for c in net_raw chown setgid setuid kill; do
+            setpriv --inh-caps "+$c" true 2> /dev/null && INH="${INH:+$INH,}+$c"
+        done
+    fi
+    if [ -n "$INH" ]; then
+        printf '#!/bin/sh\nexec setpriv --inh-caps %s %s "$@"\n' "$INH" "$WARDEN" > "$T/inh-warden"; chmod 755 "$T/inh-warden"
         WARDEN="$T/inh-warden" run inh "credential c from file:$T/k\n" --run-as 65534:65534
         check "v1.36: started with inheritable capabilities: the value fetched and held by the proxy, the agent run as its user" \
             sh -c "grep -q 'credential c from file:$T/k: fetched' '$OUT/inh.out' && grep -q 'credentials: 1 held by the proxy' '$OUT/inh.out' &&
                    ! grep -q 'cannot drop\|drop to its user failed' '$OUT/inh.out'"
     else
-        skip "v1.36: started with inheritable capabilities (needs setpriv)"
+        skip "v1.36: started with inheritable capabilities (needs setpriv, and a capability it may make inheritable)"
     fi
 
     # refusals
