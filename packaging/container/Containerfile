@@ -19,8 +19,9 @@
 #   node     v1.34 (docs/security/v1.34-kubernetes.md): the runtime image
 #            with what a Kubernetes node runs (the Helm chart's DaemonSet and
 #            admission webhook, packaging/helm/varek): the launcher
-#            (varek-init, static), the NRI plugin (varek-nri) and the
-#            admission webhook (varek-admission), built in build-go
+#            (varek-init, static), the NRI plugin (varek-nri), the
+#            admission webhook (varek-admission) and, v1.36, the pod's SVID
+#            from SPIRE (varek-svid), built in build-go
 ARG BUILD_BASE=docker.io/library/almalinux:9
 ARG RUNTIME_BASE=registry.access.redhat.com/ubi9/ubi-minimal:latest
 ARG TEST_BASE=docker.io/library/ubuntu:24.04
@@ -40,7 +41,8 @@ RUN make -C /src/varek/v1_4 clean all varek-init \
 FROM ${GO_BASE} AS build-go
 COPY varek/v1_4/k8s /src/k8s
 RUN cd /src/k8s && CGO_ENABLED=0 go build -trimpath -o /node/opt/varek/varek-nri ./cmd/varek-nri \
- && CGO_ENABLED=0 go build -trimpath -o /node/opt/varek/varek-admission ./cmd/varek-admission
+ && CGO_ENABLED=0 go build -trimpath -o /node/opt/varek/varek-admission ./cmd/varek-admission \
+ && CGO_ENABLED=0 go build -trimpath -o /node/opt/varek/varek-svid ./cmd/varek-svid
 
 FROM ${RUNTIME_BASE} AS runtime
 COPY packaging/container/deps.sh /usr/local/sbin/varek-deps

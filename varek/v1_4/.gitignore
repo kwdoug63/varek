@@ -19,6 +19,7 @@ warden-secrets
 /varek-init
 /varek-nri
 /varek-admission
+/varek-svid
 tests/v1281_sub
 tests/test_node_json
 tests/v1310_peek
