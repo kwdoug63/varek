@@ -7,8 +7,9 @@
 //	/varekpolicy   a VarekPolicy created or changed: its name is one the node
 //	               agent takes, and the Warden loads its text and carries it in
 //	               a pod (warden POLICY --oci-filter: both parsers, and nothing
-//	               the node agent does not carry yet, credentials, sub-agents,
-//	               the on-behalf-of chain);
+//	               the node agent does not carry yet: the on-behalf-of chain;
+//	               v1.36 carries credentials, step 4, and sub-agents and
+//	               confined MCP servers, step 5);
 //	/pod           a pod annotated varek.dev/policy: NAME names a VarekPolicy
 //	               of its namespace that the Warden loads, and each of its
 //	               containers runs as the node agent requires: no privilege
@@ -35,8 +36,9 @@
 //
 //	/varekplan     a VarekPlan created or changed: its name is one the node
 //	               agent takes, and the Warden reads it and carries it in a
-//	               pod (warden --oci-filter --plan: no step of a kind the node
-//	               agent does not carry yet, mcp_call, subagent, credential);
+//	               pod (warden --oci-filter --plan: it reads; v1.36 carries
+//	               each kind of step, credential from step 4, mcp_call and
+//	               subagent from step 5);
 //	/pod           and a pod annotated varek.dev/plan: NAME names a VarekPlan
 //	               of its namespace, which the Warden checks with the pod's
 //	               policy (--oci-filter --plan); a pod naming none is checked

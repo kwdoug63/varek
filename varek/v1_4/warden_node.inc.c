@@ -735,10 +735,9 @@ static int node_enter(int type) {
  * yet: why, or NULL (warden POLICY --oci-filter refuses it, so the plugin
  * and the admission check refuse it before the container starts) */
 static const char *node_policy_why(const struct policy *p) {
-    /* v1.36 step 4 (D1, D2): credentials are carried (node_creds_check) */
+    /* v1.36 step 4 (D1, D2): credentials are carried (node_creds_check);
+     * step 5 (D3, D4): sub-agents and confined MCP servers (sub_setup_node) */
     if (p->v.require_obo) return "the on-behalf-of chain (require on-behalf-of)";
-    for (size_t i = 0; i < p->v.n; i++)
-        if (p->v.rules[i].subagent[0]) return "sub-agents";
     return NULL;
 }
 
@@ -755,27 +754,17 @@ static const char *node_unsupported(const struct policy *p, bool dry, const char
 }
 
 /* v1.35 step 4c (D11): a pod's plan, as the plugin and the admission check
- * take it (warden POLICY --oci-filter --plan PLAN): it reads, and names no
- * step of a kind the node agent does not carry yet (mcp_call, subagent:
- * v1.36 step 5), which it would decide UNKNOWN and refuse; v1.36 step 4:
- * credential steps are carried. Its steps are decided by the node agent, in
- * the container's view. 0, or -1 with why. */
+ * take it (warden POLICY --oci-filter --plan PLAN): it reads. v1.36 step 4:
+ * credential steps are carried; step 5 (D4 (b)): mcp_call and subagent
+ * steps too, decided as on a host (an mcp_call to a stdio server stays
+ * UNKNOWN, and the plan is refused, as there). Its steps are decided by the
+ * node agent, in the container's view. 0, or -1 with why. */
 static int node_plan_carried(const char *plan_path, char *why, size_t wn) {
     char err[256] = {0};
     plan_parsed_t *parsed = plan_parser_load(plan_path, err, sizeof err);
     if (!parsed) { snprintf(why, wn, "the plan does not read: %s", err); return -1; }
-    const plan_spec_t *spec = plan_parser_spec(parsed);
-    int rc = 0;
-    for (size_t i = 0; i < spec->n_actions && rc == 0; i++) {
-        const char *k = spec->actions[i].kind ? spec->actions[i].kind : "";
-        if (!strcmp(k, "mcp_call") || !strcmp(k, "subagent")) {
-            snprintf(why, wn, "the node agent does not carry %s steps yet (step %.64s)", k,
-                     spec->actions[i].label ? spec->actions[i].label : "?");
-            rc = -1;
-        }
-    }
     plan_parser_free(parsed);
-    return rc;
+    return 0;
 }
 
 /* v1.36 step 4 (D2): each credential the policy names given to namespace

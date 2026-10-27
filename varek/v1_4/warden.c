@@ -1882,8 +1882,6 @@ static plan_decision_t plan_step_decide(const struct warden_plan_ud *u, const pl
         else if (as && ver < 135) why = "an as= field needs `plan 1.35` as the plan's first line";
         else if (as && !(act.plan_psubj = plan_subject(u->policy, as, &why))) { }
         else if (newkind && ver < 135) why = "this kind of step needs `plan 1.35` as the plan's first line";
-        else if (newkind && g_nr.on && strcmp(a->kind, "credential"))  /* v1.35 step 4c (D11); v1.36 step 4 */
-            why = "the node agent does not carry this kind of step yet (v1.36: sub-agents and MCP calls)";
         else if (newkind && !strcmp(a->kind, "credential")) pd = plan_cred_decide(u->policy, a, &act, &why);
         else if (newkind && !strcmp(a->kind, "subagent")) pd = plan_subagent_decide(u, a, &act, &why);
         else if (newkind) {                                             /* mcp_call */
