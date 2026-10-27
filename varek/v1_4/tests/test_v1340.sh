@@ -68,6 +68,19 @@
 #      beside the stream, run_start naming it, the audit; refused: no plan
 #      under `require plan`, a plan the policy does not allow, an mcp_call
 #      step, another SHA-256 or none, no such plan, one policy file.
+# v1.36 step 4 (docs/security/v1.36-kubernetes-parity.md, D1 and D2):
+#  10. credentials under the node agent: --oci-filter against the cluster's
+#      VarekCredential list (given, refused for another namespace or another
+#      source, the names in its output); a container whose policy names a
+#      file store in a Secret's volume (a link into ..data) under
+#      --node-credentials, and one a Vault store that listens on the node's
+#      loopback only (warden-secrets reaches it from the node's network, not
+#      the pod's): each fetched, the proxy holding it, the container's
+#      placeholder (VAREK_CRED_<NAME>, as the NRI plugin sets it) the one
+#      run_start records; a plan's credential step carried; refused: a
+#      credential not given to the namespace, from another source, a file
+#      outside the directory, no placeholder, two, a malformed one, one
+#      policy file.
 #
 #   test_v1340.sh VDP_CHECK VDP_CERT_CHECK WARDEN [VAREK_INIT]
 set -u
@@ -362,9 +375,12 @@ import json, sys
 cfg, flt, sock, arch, B, ann, args = sys.argv[1:8]
 opts = set(sys.argv[8:])
 c = json.load(open(cfg)); f = json.load(open(flt))
+f.pop("varekCredentials", None)      # v1.36 step 4: the plugin's, not the runtime's
 f["architectures"] = [arch]; f["listenerPath"] = sock; f["listenerMetadata"] = "varek-test/" + cfg.split("/")[-2]
 c["process"].update(terminal=False, args=args.split(), env=["PATH=/"], user={"uid": 65534, "gid": 65534},
                     noNewPrivileges=True, cwd="/")
+# v1.36 step 4: env=NAME=VALUE, as the NRI plugin sets a credential's placeholder
+c["process"]["env"] += [o[4:] for o in sorted(opts) if o.startswith("env=")]
 c["root"] = {"path": B + "/rootfs", "readonly": "rw-root" not in opts}
 c["linux"]["seccomp"] = f
 c["process"]["capabilities"] = {k: [] for k in ("bounding", "effective", "permitted", "inheritable", "ambient")}
@@ -637,6 +653,90 @@ else
     check "a plan name with no file: refused" refused l pnone 'no plan named nosuch'
     lbundle p1 "$B/s/a.sock" "$B/f/plain.json" plain "/varek/init -- /probe" plan=held; run p1
     check "a plan under a node agent with one policy file: refused" refused a p1 'this node agent has one policy'
+fi
+
+echo "== 10. credentials under the node agent (v1.36 step 4, D1 and D2) =="
+if [ -z "$WARDEN" ] || ! declare -f lbundle > /dev/null || ! declare -f in_pod > /dev/null || [ ! -x "$HERE/warden-secrets" ] ||
+   [ ! -x "$HERE/warden-proxy" ] || ! python3 -c 'import cryptography' 2>/dev/null; then
+    skip "credentials under the node agent (need the launcher and the pod's network, as sections 6 and 7, warden-secrets, warden-proxy and python3-cryptography)"
+else
+    # the stores (tests/v1280_stores.py), on the node's own loopback: not in the pod's network
+    SD="$B/stores"; mkdir -p "$SD"
+    python3 "$HERE/tests/v1280_stores.py" "$SD" > "$SD/server.out" 2>&1 &
+    SERVERS="$SERVERS $!"
+    for _ in $(seq 100); do [ -f "$SD/ports" ] && break; sleep 0.1; done
+    read -r HP _ < "$SD/ports"
+    cp "$SD/ca.pem" "$B/ca.pem"; chmod 644 "$B/ca.pem"
+    printf 's.test-token-v1280\n' > "$B/vt"; chmod 600 "$B/vt"
+    printf 'vault_addr = https://127.0.0.1:%s\nvault_token_file = %s/vt\nvault_ca = %s/ca.pem\n' "$HP" "$B" "$B" > "$B/secrets.conf"
+    chmod 600 "$B/secrets.conf"
+    # the chart's credentials directory, a Secret's volume in it: KEY -> ..data/KEY, ..data -> ..<time>/
+    C="$B/creds"; V="$C/gh/..2026_10_27_10_00_00.1"
+    mkdir -p "$V"; chmod 755 "$C" "$V"; chmod 1777 "$C/gh"
+    printf 'file-value-1234\n' > "$V/token"; chmod 400 "$V/token"
+    ln -s ..2026_10_27_10_00_00.1 "$C/gh/..data"; ln -s ..data/token "$C/gh/token"
+    printf 'v\n' > "$B/outside"; chmod 400 "$B/outside"
+    # cpol NAME CREDENTIAL SOURCE: a policy of team-a naming one credential
+    cpol() { printf 'require warden 1.28\nproxy inspect\ncredential %s from %s\nallow path /data/allowed readonly\nallow host svc.test:443\nallow request GET https://svc.test/x credential=%s header=X-K\n' \
+                    "$2" "$3" "$2" > "$P/$1.policy"; chmod 644 "$P/$1.policy"; }
+    cpol cfile gh "file:$C/gh/token"
+    cpol cvault vgh "vault:secret/data/agents/gh#token"
+    cpol cother og "file:$C/gh/token"
+    cpol csrc os "file:$C/gh/token"
+    cpol cout ou "file:$B/outside"
+    # the cluster's VarekCredential resources, as the plugin's sync lists them
+    printf '# VarekCredential resources\ngh\tteam-a,team-c\tfile:%s/gh/token\tgh-file\nvgh\tteam-a\tvault:secret/data/agents/gh#token\tgh-vault\nog\tteam-b\tfile:%s/gh/token\tother-team\nos\tteam-a\tvault:secret/data/os#x\tother-source\nou\tteam-a\tfile:%s/outside\toutside\n' \
+        "$C" "$C" "$B" > "$B/pol/.credentials"
+    chmod 644 "$B/pol/.credentials"
+    L="$B/pol/.credentials"
+    "$WARDEN" "$P/cfile.policy" --oci-filter --no-plan --credential-list "$L" --pod-namespace team-a > "$B/f/cfile.json" 2> "$B/f/cfile.err"; frc=$?
+    check "--oci-filter: a credential the list gives the pod's namespace; its name in the output (varekCredentials)" sh -c \
+        "[ $frc = 0 ] && python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); sys.exit(0 if d[\"varekCredentials\"] == [\"gh\"] and d[\"syscalls\"] else 1)' '$B/f/cfile.json'"
+    check "... without the list: refused" sh -c "! '$WARDEN' '$P/cfile.policy' --oci-filter --no-plan > /dev/null 2>&1"
+    # ocirefused POLICY NAMESPACE WHY: --oci-filter exits 1 and says why
+    ocirefused() { "$WARDEN" "$P/$1.policy" --oci-filter --no-plan --credential-list "$L" --pod-namespace "$2" > /dev/null 2> "$B/f/$1.$2.err"
+                   [ $? = 1 ] && grep -q "$3" "$B/f/$1.$2.err"; }
+    check "... for another namespace: refused, said why" ocirefused cfile team-b 'not given to namespace team-b'
+    check "... from another source than its VarekCredential's: refused" ocirefused csrc team-a 'names another source'
+    printf 'plan 1.35\naction c credential gh\n' > "$P/cplan.plan"; chmod 644 "$P/cplan.plan"
+    check "... a plan with a credential step: carried now" "$WARDEN" "$P/cfile.policy" --oci-filter --plan "$P/cplan.plan" --credential-list "$L" --pod-namespace team-a
+    PH="varek_ph_gh_$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("="))')"
+    PHV="varek_ph_vgh_$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("="))')"
+    check "a node agent with the cluster's credentials directory (--node-credentials) and warden-secrets' configuration" \
+        agent cr "$B/pol" --node-launcher "$B/varek-init" --node-credentials "$C" --secrets-conf "$B/secrets.conf"
+    # cbundle NAME POLICY [OPTION...]: the container in the pod's network, printing its placeholder
+    cbundle() { local n="$1" pol="$2" var="$3"; shift 3
+                lbundle "$n" "$B/s/cr.sock" "$B/f/cfile.json" "$pol" "/varek/init -- /probe env $var" "$@"; in_pod "$n"; run "$n"; }
+    crefused() { ! grep -q '^env:' "$B/$1.out" && grep -q "$2" "$(stream cr "$1")"; }
+    cbundle cf cfile VAREK_CRED_GH "env=VAREK_CRED_GH=$PH"
+    sed 's/^/     /' "$B/cf.out"
+    check "a file store in a Secret's volume: the container ran, its placeholder the plugin's" said cf "env: $PH"
+    check "... fetched by warden-secrets (the link followed), held by the proxy" sh -c \
+        "grep -q 'credential gh from file:$C/gh/token: fetched, 15 bytes' '$(stream cr cf)' && grep -q 'credentials: 1 held by the proxy' '$(stream cr cf)'"
+    check "... run_start: the credential, and its placeholder's SHA-256 the container's" rec cr cf \
+        'S and S[0]["credentials"][0]["name"] == "gh" and S[0]["credentials"][0]["length"] == 15 and S[0]["credentials"][0]["placeholder_sha256"] == "'"$(printf %s "$PH" | sha256sum | cut -c1-64)"'"'
+    check "... no value in the stream" sh -c "! grep -q 'file-value-1234' '$(stream cr cf)'"
+    : > "$SD/requests.log"
+    cbundle cv cvault VAREK_CRED_VGH "env=VAREK_CRED_VGH=$PHV"
+    check "a Vault store on the node's loopback only: fetched from the node's network (not the pod's), the container ran" sh -c \
+        "grep -qx 'env: $PHV' '$B/cv.out' && grep -q 'credential vgh from vault:secret/data/agents/gh#token: fetched, 20 bytes' '$(stream cr cv)' &&
+         grep -q 'vault GET /v1/secret/data/agents/gh token=ok' '$SD/requests.log'"
+    cbundle co cother VAREK_CRED_OG "env=VAREK_CRED_OG=varek_ph_og_${PH#varek_ph_gh_}"
+    check "refused: a credential its VarekCredential gives another namespace (D2)" crefused co 'is not given to namespace team-a'
+    cbundle cs csrc VAREK_CRED_OS "env=VAREK_CRED_OS=varek_ph_os_${PH#varek_ph_gh_}"
+    check "refused: a source other than its VarekCredential's" crefused cs 'names another source'
+    cbundle cu cout VAREK_CRED_OU "env=VAREK_CRED_OU=varek_ph_ou_${PH#varek_ph_gh_}"
+    check "refused: a file store outside the node's credentials directory (D1)" crefused cu 'is not under the node.s credentials directory'
+    cbundle cn cfile VAREK_CRED_GH
+    check "refused: no placeholder in the container's environment" crefused cn 'has no placeholder for credential gh'
+    cbundle c2 cfile VAREK_CRED_GH "env=VAREK_CRED_GH=$PH" "env=VAREK_CRED_GH=varek_ph_gh_${PHV#varek_ph_vgh_}"
+    check "refused: two placeholders for it" crefused c2 'has more than one placeholder for credential gh'
+    cbundle cb cfile VAREK_CRED_GH "env=VAREK_CRED_GH=varek_ph_gh_short"
+    check "refused: a placeholder not of the plugin's form" crefused cb 'has no placeholder for credential gh'
+    check "a node agent with one policy file, naming a credential" agent c1 "$P/cfile.policy" --node-launcher "$B/varek-init" --node-credentials "$C"
+    lbundle c1a "$B/s/c1.sock" "$B/f/cfile.json" - "/varek/init -- /probe env VAREK_CRED_GH" "env=VAREK_CRED_GH=$PH"; in_pod c1a; run c1a
+    check "refused: credentials under one policy file (no VarekCredential list beside it)" sh -c \
+        "! grep -q '^env:' '$B/c1a.out' && grep -q 'this node agent has one policy' '$(stream c1 c1a)'"
 fi
 
 echo

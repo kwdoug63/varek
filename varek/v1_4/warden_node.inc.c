@@ -59,13 +59,28 @@
  * container's root read-only, every writable mount noexec, and no mount
  * that allows execution showing what a writable one can change (checked
  * from the container's mounts as the descriptor arrives, before any of its
- * code runs). */
+ * code runs).
+ *
+ * v1.36 step 4 (docs/security/v1.36-kubernetes-parity.md, D1 and D2):
+ * credentials. warden-secrets is started in the node agent's own network
+ * namespace, before the supervisor enters the pod's, so each store is
+ * reached from the node under the DaemonSet's identity; a file: store must
+ * be under --node-credentials DIR (the chart's Secrets, in VAREK's own
+ * namespace). Each credential the policy names must be given to the pod's
+ * namespace, from that source, by a VarekCredential resource (the NRI
+ * plugin's sync writes the cluster's as POLICY_DIR/.credentials). The value
+ * goes to the proxy in the pod's network namespace, as on a host; the agent
+ * has the placeholder the NRI plugin put in its environment
+ * (VAREK_CRED_<NAME>). */
 #include "node_json.h"
 
 #define NODE_LAUNCHER "/varek/init"              /* where the plugin binds the launcher */
 #define NODE_SET_VIEW "/etc/varek/launch-set"    /* the view the launcher reads */
 
 static const char *g_node_policies;               /* the policies' directory, or NULL: one policy */
+static const char *g_node_creds_dir;              /* v1.36 step 4: --node-credentials, the file: stores' */
+#define NODE_CRED_LIST ".credentials"             /* POLICY_DIR/.credentials: the cluster's VarekCredential list */
+static const char *const kNodeStore[] = { "", "file", "vault", "aws-sm" };
 static bool  g_node_have_launcher;
 static dev_t g_node_launcher_dev;                 /* --node-launcher, on the node */
 static ino_t g_node_launcher_ino;
@@ -586,6 +601,23 @@ static int node_config(char *why, size_t wn) {
                 goto out;
             }
         }
+        /* v1.36 step 4 (D1): the placeholders in its environment */
+        g_nr.ncred_env = 0;
+        g_nr.cred_env_over = false;
+        for (int k = 0; k < 4096; k++) {
+            char idx[16], ent[sizeof g_nr.cred_env[0] + 1];
+            snprintf(idx, sizeof idx, "#%d", k);
+            const char *ep[] = { "process", "env", idx }, *v;
+            size_t vn;
+            if (nj_find(doc, n, ep, 3, &v, &vn) < 0) break;
+            if (vn < 13 || memcmp(v, "\"VAREK_CRED_", 12)) continue;
+            if (nj_string(v, vn, ent, sizeof ent) < 0 || strlen(ent) >= sizeof g_nr.cred_env[0] ||
+                g_nr.ncred_env == (int)(sizeof g_nr.cred_env / sizeof g_nr.cred_env[0])) {
+                g_nr.cred_env_over = true;
+                continue;
+            }
+            snprintf(g_nr.cred_env[g_nr.ncred_env++], sizeof g_nr.cred_env[0], "%s", ent);
+        }
         if (g_nr.argv0[0] != '/')
             snprintf(why, wn, "the container's command must be named by an absolute path (it is \"%.200s\")", g_nr.argv0);
         else rc = 0;
@@ -703,7 +735,7 @@ static int node_enter(int type) {
  * yet: why, or NULL (warden POLICY --oci-filter refuses it, so the plugin
  * and the admission check refuse it before the container starts) */
 static const char *node_policy_why(const struct policy *p) {
-    if (p->v.ncreds) return "credentials";
+    /* v1.36 step 4 (D1, D2): credentials are carried (node_creds_check) */
     if (p->v.require_obo) return "the on-behalf-of chain (require on-behalf-of)";
     for (size_t i = 0; i < p->v.n; i++)
         if (p->v.rules[i].subagent[0]) return "sub-agents";
@@ -724,10 +756,10 @@ static const char *node_unsupported(const struct policy *p, bool dry, const char
 
 /* v1.35 step 4c (D11): a pod's plan, as the plugin and the admission check
  * take it (warden POLICY --oci-filter --plan PLAN): it reads, and names no
- * step of a kind the node agent does not carry yet (mcp_call, subagent,
- * credential: v1.36), which it would decide UNKNOWN and refuse. Its steps
- * are decided by the node agent, in the container's view. 0, or -1 with
- * why. */
+ * step of a kind the node agent does not carry yet (mcp_call, subagent:
+ * v1.36 step 5), which it would decide UNKNOWN and refuse; v1.36 step 4:
+ * credential steps are carried. Its steps are decided by the node agent, in
+ * the container's view. 0, or -1 with why. */
 static int node_plan_carried(const char *plan_path, char *why, size_t wn) {
     char err[256] = {0};
     plan_parsed_t *parsed = plan_parser_load(plan_path, err, sizeof err);
@@ -736,7 +768,7 @@ static int node_plan_carried(const char *plan_path, char *why, size_t wn) {
     int rc = 0;
     for (size_t i = 0; i < spec->n_actions && rc == 0; i++) {
         const char *k = spec->actions[i].kind ? spec->actions[i].kind : "";
-        if (!strcmp(k, "mcp_call") || !strcmp(k, "subagent") || !strcmp(k, "credential")) {
+        if (!strcmp(k, "mcp_call") || !strcmp(k, "subagent")) {
             snprintf(why, wn, "the node agent does not carry %s steps yet (step %.64s)", k,
                      spec->actions[i].label ? spec->actions[i].label : "?");
             rc = -1;
@@ -744,6 +776,155 @@ static int node_plan_carried(const char *plan_path, char *why, size_t wn) {
     }
     plan_parser_free(parsed);
     return rc;
+}
+
+/* v1.36 step 4 (D2): each credential the policy names given to namespace
+ * NS, from the source the policy names, by one of the cluster's
+ * VarekCredential resources, as the NRI plugin's sync lists them (the
+ * supervisor's POLICY_DIR/.credentials; --oci-filter --credential-list FILE),
+ * one a line:
+ *   CREDENTIAL <tab> NAMESPACE[,NAMESPACE...] <tab> STORE:REFERENCE <tab> RESOURCE
+ * (# begins a comment line). A list root's, written by no one else, when
+ * strict (the node's). 0, or -1 with why. */
+static int node_creds_given(const struct policy *p, const char *list, const char *ns, bool strict, char *why,
+                            size_t wn) {
+    int fd = open(list, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size > (4 << 20)) {
+        snprintf(why, wn, "the policy names credentials, and the cluster's list of VarekCredential resources (%.300s) "
+                 "cannot be read (%s)", list, fd < 0 ? strerror(errno) : "not a file of at most 4 MiB");
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    if (strict && (st.st_uid != 0 || (st.st_mode & 022))) {
+        close(fd);
+        snprintf(why, wn, "the list of VarekCredential resources %.300s must be root's, written by no one else", list);
+        return -1;
+    }
+    char *b = malloc((size_t)st.st_size + 1);
+    size_t n = 0;
+    ssize_t r = 0;
+    while (b && n < (size_t)st.st_size && (r = read(fd, b + n, (size_t)st.st_size - n)) > 0) n += (size_t)r;
+    close(fd);
+    if (!b || r < 0) { free(b); snprintf(why, wn, "cannot read %.300s", list); return -1; }
+    b[n] = '\0';
+    int rc = 0;
+    for (size_t k = 0; k < p->v.ncreds && rc == 0; k++) {
+        const char *name = p->v.creds[k].name;
+        char src[1100];
+        snprintf(src, sizeof src, "%s:%s", kNodeStore[p->v.creds[k].store], p->v.creds[k].ref);
+        bool named = false, sourced = false, given = false;
+        char other[160] = "", to[300] = "";
+        int ln = 0;
+        char *text = strdup(b);
+        if (!text) { snprintf(why, wn, "out of memory"); rc = -1; break; }
+        for (char *save = NULL, *line = strtok_r(text, "\n", &save); line && !given; line = strtok_r(NULL, "\n", &save)) {
+            ln++;
+            if (!line[0] || line[0] == '#') continue;
+            char *f[4], *fs = NULL;
+            int nf = 0;
+            for (char *t = strtok_r(line, "\t", &fs); t && nf < 4; t = strtok_r(NULL, "\t", &fs)) f[nf++] = t;
+            if (nf != 4 || strtok_r(NULL, "\t", &fs)) {
+                snprintf(why, wn, "the list of VarekCredential resources %.300s: line %d is not four fields", list, ln);
+                rc = -1;
+                break;
+            }
+            if (strcmp(f[0], name)) continue;
+            named = true;
+            if (strcmp(f[2], src)) { snprintf(other, sizeof other, "%.150s", f[3]); continue; }
+            sourced = true;
+            snprintf(to, sizeof to, "%.120s (to %.160s)", f[3], f[1]);
+            for (char *ns_save = NULL, *x = strtok_r(f[1], ",", &ns_save); x && !given; x = strtok_r(NULL, ",", &ns_save))
+                given = !strcmp(x, ns);
+        }
+        free(text);
+        if (rc < 0 || given) continue;
+        rc = -1;
+        if (!named)
+            snprintf(why, wn, "credential %s (line %d) is given by no VarekCredential (a cluster administrator gives "
+                     "a credential to namespaces; D2)", name, p->v.creds[k].line);
+        else if (!sourced)
+            snprintf(why, wn, "credential %s (line %d): its VarekCredential (%s) names another source than the "
+                     "policy's %.300s", name, p->v.creds[k].line, other, src);
+        else
+            snprintf(why, wn, "credential %s (line %d) is not given to namespace %s (VarekCredential %s; D2)", name,
+                     p->v.creds[k].line, ns, to);
+    }
+    free(b);
+    return rc;
+}
+
+/* v1.36 step 4 (D1, D2): what the supervisor checks of a policy that names
+ * credentials, before warden-secrets starts: each given to the pod's
+ * namespace (node_creds_given, from POLICY_DIR/.credentials); each file:
+ * store under --node-credentials DIR; and each one's placeholder, as the NRI
+ * plugin put it in the container's environment (VAREK_CRED_<NAME> =
+ * varek_ph_<name>_ and 43 of base64url), into ph. 0, or -1 with why. */
+static int node_creds_check(const struct policy *p, char (*ph)[WP_PH_MAX], char *why, size_t wn) {
+    if (!g_node_policies) {
+        snprintf(why, wn, "the policy names credentials, and this node agent has one policy, not a directory of "
+                 "policies with the cluster's VarekCredential list beside them");
+        return -1;
+    }
+    if (!node_label(g_nr.pod_ns)) { snprintf(why, wn, "the container's pod names no namespace"); return -1; }
+    char list[PATH_MAX];
+    snprintf(list, sizeof list, "%s/%s", g_node_policies, NODE_CRED_LIST);
+    if (node_creds_given(p, list, g_nr.pod_ns, true, why, wn) < 0) return -1;
+    char dir[PATH_MAX] = "";
+    if (g_node_creds_dir && !realpath(g_node_creds_dir, dir)) {
+        snprintf(why, wn, "--node-credentials %.300s: %s", g_node_creds_dir, strerror(errno));
+        return -1;
+    }
+    if (g_nr.cred_env_over) {
+        snprintf(why, wn, "the container's environment has more VAREK_CRED_ entries than the node agent reads, or one "
+                 "too long to be a placeholder");
+        return -1;
+    }
+    for (size_t k = 0; k < p->v.ncreds; k++) {
+        const vdp_cred_t *c = &p->v.creds[k];
+        if (c->store == 1) {                                   /* file: under the chart's directory */
+            char real[PATH_MAX];
+            size_t dl = strlen(dir);
+            if (!dir[0]) {
+                snprintf(why, wn, "credential %s from file: needs the node agent's --node-credentials DIR (the chart's "
+                         "Secrets)", c->name);
+                return -1;
+            }
+            /* the file resolved, or (not there) its directory: where neither
+             * is, warden-secrets cannot read it and says so */
+            bool found = realpath(c->ref, real) != NULL, unread = false;
+            if (!found && errno == ENOENT) {
+                char up[PATH_MAX], rup[PATH_MAX];
+                snprintf(up, sizeof up, "%s", c->ref);
+                char *sl = strrchr(up, '/');
+                if (sl && sl != up) *sl = '\0';
+                found = sl && sl != up && realpath(up, rup) && (size_t)snprintf(real, sizeof real, "%s/%s", rup, sl + 1) < sizeof real;
+                unread = !found && errno == ENOENT;
+            }
+            if (!unread && (!found || strncmp(real, dir, dl) || (real[dl] != '/' && !(dl == 1 && dir[0] == '/')))) {
+                snprintf(why, wn, "credential %s: its file %.300s is not under the node's credentials directory %.300s "
+                         "(D1)", c->name, c->ref, dir);
+                return -1;
+            }
+        }
+        char key[64], want[48];
+        int kl = snprintf(key, sizeof key, "VAREK_CRED_%s=", c->name);
+        for (int q = 11; q < kl - 1; q++) key[q] = (char)toupper((unsigned char)key[q]);
+        snprintf(want, sizeof want, "varek_ph_%s_", c->name);
+        const char *found = NULL;
+        int seen = 0;
+        for (int e = 0; e < g_nr.ncred_env; e++)
+            if (!strncmp(g_nr.cred_env[e], key, (size_t)kl)) { found = g_nr.cred_env[e] + kl; seen++; }
+        size_t wl = strlen(want);
+        if (seen != 1 || strncmp(found, want, wl) || strlen(found + wl) != 43 ||
+            strspn(found + wl, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_") != 43) {
+            snprintf(why, wn, "the container's environment has %s placeholder for credential %s (%.*s, which VAREK's "
+                     "NRI plugin sets)", seen > 1 ? "more than one" : "no", c->name, kl - 1, key);
+            return -1;
+        }
+        snprintf(ph[k], WP_PH_MAX, "%s", found);
+    }
+    return 0;
 }
 
 /* run_start's container fields */
@@ -1044,6 +1225,12 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
         if (ok == 0) ok = node_config(why, sizeof why);
         if (ok == 0) ok = node_process(why, sizeof why);
         if (ok == 0 && node_alive(g_nr.pidfd)) node_dns();
+        /* v1.36 step 4 (D1): the node agent's own network namespace, held for
+         * warden-secrets, before the supervisor enters the pod's */
+        if (ok == 0 && (g_nr.node_netns = proc_openf(O_RDONLY | O_CLOEXEC, 0, "self/ns/net")) < 0) {
+            snprintf(why, sizeof why, "cannot hold the node's network namespace (%s)", strerror(errno));
+            ok = -1;
+        }
         if (ok == 0 && node_enter(CLONE_NEWNET) < 0) {
             snprintf(why, sizeof why, "cannot enter the container's network namespace (%s)", strerror(errno));
             ok = -1;

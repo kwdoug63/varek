@@ -29,10 +29,20 @@ use of the Warden (other options, no program) runs the real Warden, and
 each invocation is logged as carried or passed through, with why, to
 $VAREK_SWEEP_LOG.
 
+v1.36 step 4 (docs/security/v1.36-kubernetes-parity.md, D1 and D2): a
+policy that names credentials, as a cluster carries it: each given to the
+stand-in's namespace (sweep) from the source the policy names, in the
+VarekCredential list beside the policy (POLICY_DIR/.credentials, as the
+plugin's -sync writes it); the container's environment holding each one's
+placeholder (VAREK_CRED_<NAME>), as the plugin sets it; and the node agent
+given --node-credentials / (the suites' file stores are where they put them)
+and the suite's own --secrets-conf, --secrets-as and --secrets-bin.
+
 Environment (set by tests/v1340_sweep.sh): VAREK_SWEEP_DIR (its own
 directory: hostroot, a bind of / with no submounts; ovl, a tmpfs),
 VAREK_SWEEP_WARDEN, VAREK_SWEEP_LAUNCHER, VAREK_SWEEP_RUNC, VAREK_SWEEP_LOG,
 VAREK_SWEEP_SUITE."""
+import base64
 import hashlib
 import json
 import os
@@ -53,7 +63,8 @@ RUNC = ENV.get("VAREK_SWEEP_RUNC", "runc")
 LOG = ENV.get("VAREK_SWEEP_LOG", "")
 SUITE = ENV.get("VAREK_SWEEP_SUITE", "-")
 
-CARRIED = {"--sign-key", "--anchor", "--checkpoint-every"}      # the node agent's own (D8)
+CARRIED = {"--sign-key", "--anchor", "--checkpoint-every",      # the node agent's own (D8)
+           "--secrets-conf", "--secrets-as", "--secrets-bin"}   # v1.36 step 4: warden-secrets', as on a host
 FORMS = {"--check-startup", "--check-credentials", "--oci-filter", "--node-agent", "--dry-run"}
 
 
@@ -181,8 +192,19 @@ def main():
     state = os.path.join(inv, "state")
     os.mkdir(state, 0o700)
 
+    # v1.36 step 4 (D2): each credential the policy names given to this
+    # namespace, from its source, as a cluster administrator's VarekCredential
+    creds = re.findall(rb"(?m)^[ \t]*credential[ \t]+([a-z][a-z0-9_]*)[ \t]+from[ \t]+(\S+)", text)
+    lp = os.path.join(pol_dir, ".credentials")
+    with open(lp, "w") as f:
+        f.write("# the sweep's VarekCredential list (tests/v1340_pod.py)\n")
+        for name, src in creds:
+            f.write("%s\tsweep\t%s\t%s\n" % (name.decode(), src.decode(errors="replace"), name.decode()))
+    os.chmod(lp, 0o644)
+
     # the plugin's filter: the Warden's, from the policy's bytes
-    fl = subprocess.run([WARDEN, pf, "--oci-filter"], capture_output=True)
+    fl = subprocess.run([WARDEN, pf, "--oci-filter", "--credential-list", lp, "--pod-namespace", "sweep"],
+                        capture_output=True)
     if fl.returncode != 0:
         # the plugin refuses the container, which is not created
         # (the Warden's reason, naming the policy as the suite gave it, and its status)
@@ -195,10 +217,14 @@ def main():
         shutil.rmtree(inv, ignore_errors=True)
         sys.exit(fl.returncode)
     filt = json.loads(fl.stdout)
+    # v1.36 step 4 (D1): a placeholder for each credential, as the plugin makes one
+    cred_env = ["VAREK_CRED_%s=varek_ph_%s_%s" % (c.upper(), c, base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("="))
+                for c in filt.pop("varekCredentials", [])]
 
     agent_log = open(os.path.join(inv, "agent.log"), "w+")
     agent = subprocess.Popen([WARDEN, pol_dir, "--node-agent", sock, "--node-streams", streams,
-                              "--node-launcher", LAUNCHER] + opts, stdout=agent_log, stderr=agent_log)
+                              "--node-launcher", LAUNCHER, "--node-credentials", "/"] + opts,
+                             stdout=agent_log, stderr=agent_log)
     for _ in range(100):
         if os.path.exists(sock) or agent.poll() is not None:
             break
@@ -237,7 +263,8 @@ def main():
     cfg_path = os.path.join(bundle, "config.json")
     c = json.load(open(cfg_path))
     cwd = os.getcwd()
-    env = ["%s=%s" % kv for kv in ENV.items() if not kv[0].startswith("VAREK_SWEEP_")]
+    env = ["%s=%s" % kv for kv in ENV.items() if not kv[0].startswith("VAREK_SWEEP_") and not kv[0].startswith("VAREK_CRED_")]
+    env += cred_env
     c["process"].update(terminal=False, args=["/varek/init", "--"] + prog, env=env,
                         user={"uid": uid, "gid": gid, "umask": umask,
                               "additionalGids": groups_of(run_as, gid)}, noNewPrivileges=True, cwd=cwd)

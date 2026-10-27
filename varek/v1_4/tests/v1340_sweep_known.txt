@@ -43,9 +43,10 @@
 #            whatever the policy says of launches, and refuses to run without
 #            Landlock; its refusals are its own (exit 126, its message).
 #  NOT-YET   not carried in pods yet, refused at deploy (the webhook) and at
-#            the start (--oci-filter names it): credentials (warden-secrets),
-#            sub-agents (and the confined MCP servers built on them),
-#            require on-behalf-of.
+#            the start (--oci-filter names it): sub-agents (and the confined
+#            MCP servers built on them), require on-behalf-of. Credentials are
+#            carried from v1.36 step 4 (the stand-in gives each to its
+#            namespace and sets the placeholders, as a cluster does).
 #  STAND-IN  how the stand-in differs from a pod in a way that does not bear
 #            on the node agent (named in the reason).
 test-v1121	^O_CREAT in the allowed directory succeeds$	AS-USER: the policy has no require warden 1.29; the directory and trunc_me.txt are root's (probe: creat_allowed, trunc_allowed DENIED)
@@ -107,8 +108,6 @@ test-v1271	^from a working directory inside it, a copy by a relative name cannot
 test-v1271	^a writable directory missing at start: listed	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
 test-v1271	^a file an exact rule names, replaced by the host during the run	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
 test-v1271	^standard input open on a file in a writable directory refuses the start$	AS-USER: the policy is 1.27's and the writable directories are root's: the probe's first copy there fails (PermissionError, read in its output), and the rest of it with it
-test-v1280	^refused: (a|an) (empty )?file store	NOT-YET: credentials: --oci-filter refuses the policy ('the node agent does not carry credentials yet'), in place of the store's own reason; no warden-secrets runs
-test-v1280	^warden-secrets runs as its own user	NOT-YET: credentials: --oci-filter refuses the policy ('the node agent does not carry credentials yet'), in place of the store's own reason; no warden-secrets runs
 test-v1281	.	NOT-YET: sub-agents: every policy of the suite's runs names subagent=, which --oci-filter refuses ('the node agent does not carry sub-agents yet'); what follows from those runs (forged streams, varek runs) has no records	does not carry sub-agents yet
 test-v1290	^require warden #\.#: (a created file is root's|the root-owned file is written|the closed directory is reached), as before$	AS-USER: the node agent opens as the container's user even under require warden 1.28 (its point: a pod's files are its user's)
 test-v1290	^(--run-as root under #\.#: run_start says the agent is root|\.\.\. and the file is root's)$	RUNTIME: the node agent refuses a root container (not carried)
