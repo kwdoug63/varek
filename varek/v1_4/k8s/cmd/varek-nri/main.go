@@ -72,6 +72,18 @@
 // varek_ph_<name>_ and 43 random base64url characters, made for that
 // container; the node agent takes it from there and hands it to the proxy,
 // which swaps in the value. The value is never here.
+//
+// v1.36 step 6 (D5): a pod acting for a user (varek.dev/on-behalf-of: the
+// Secret its user's token is in). The name goes in each container's
+// annotations, where the node agent takes it, and the pod's token is read
+// by the node agent from the kubelet's copy of the varek-obo volume. That
+// volume is mounted by the webhook's init container alone (varek-obo,
+// /bin/true, the node image: the kubelet mounts no volume no container
+// names), which is let through as it is: it runs no agent. A container of
+// that name otherwise (another command, another image where the runtime
+// says it, a pod naming no Secret) is carried, or refused, as any other.
+//
+//	-obo-image REF: the init container's image (the node image, by digest)
 package main
 
 import (
@@ -86,6 +98,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -100,7 +113,10 @@ import (
 
 const (
 	annotation     = "varek.dev/policy"
-	planAnnotation = "varek.dev/plan" // v1.35 step 4c
+	planAnnotation = "varek.dev/plan"         // v1.35 step 4c
+	oboAnnotation  = "varek.dev/on-behalf-of" // v1.36 step 6
+	oboInit        = "varek-obo"              // the webhook's init container, and its volume
+	oboCommand     = "/bin/true"
 	launcherAt     = "/varek/init"
 	// the profile every container of an annotated pod names (G-1), under
 	// the kubelet's seccomp root
@@ -108,6 +124,9 @@ const (
 )
 
 var policyName = kube.Name
+
+// a Secret's name (a DNS subdomain), as the node agent takes it
+var secretName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$`)
 
 type ociArg struct {
 	Index    uint32 `json:"index"`
@@ -135,6 +154,7 @@ type ociProfile struct {
 
 type plugin struct {
 	warden, policies, listener, launcher string
+	oboImage                             string          // -obo-image: the webhook's init container's (step 6)
 	handlers                             map[string]bool // runtime handlers that run the filter's listener (G-4)
 	noRuleErrno                          bool            // the runtime's NRI carries no errno on a rule (before v0.12)
 	mu                                   sync.Mutex
@@ -392,6 +412,13 @@ func (p *plugin) adjust(ctx context.Context, pod *api.PodSandbox, ctr *api.Conta
 	if named && !policyName.MatchString(plan) {
 		return nil, refuse("the plan name %q (%s) is not 1 to 63 of a-z, 0-9 and -", plan, planAnnotation)
 	}
+	obo, acting := pod.GetAnnotations()[oboAnnotation]
+	if acting && !secretName.MatchString(obo) {
+		return nil, refuse("%s %q is not a Secret's name", oboAnnotation, obo)
+	}
+	if acting && p.oboContainer(ctr) {
+		return nil, nil
+	}
 	args := ctr.GetArgs()
 	if len(args) == 0 {
 		return nil, refuse("no command for the launcher to run")
@@ -464,6 +491,11 @@ func (p *plugin) adjust(ctx context.Context, pod *api.PodSandbox, ctr *api.Conta
 		adj.RemoveAnnotation(planAnnotation)
 		adj.RemoveAnnotation("varek.dev/plan-sha256")
 	}
+	if acting { // v1.36 step 6 (D5): the Secret its user's token is in
+		adj.AddAnnotation(oboAnnotation, obo)
+	} else {
+		adj.RemoveAnnotation(oboAnnotation)
+	}
 	// the pod's names, for the node agent's record (CRI-O puts the
 	// kubelet's in one JSON string; a runtime's own, where it has them,
 	// must agree)
@@ -472,6 +504,23 @@ func (p *plugin) adjust(ctx context.Context, pod *api.PodSandbox, ctr *api.Conta
 	adj.AddAnnotation("varek.dev/pod-uid", pod.GetUid())
 	adj.AddAnnotation("varek.dev/container", ctr.GetName())
 	return adj, nil
+}
+
+// oboContainer: whether the container is the webhook's init container for a
+// pod acting for a user: its name, its command alone, and its image where
+// the runtime says it (by digest, where -obo-image names one)
+func (p *plugin) oboContainer(ctr *api.Container) bool {
+	if ctr.GetName() != oboInit || len(ctr.GetArgs()) != 1 || ctr.GetArgs()[0] != oboCommand {
+		return false
+	}
+	img := ctr.GetImage()
+	if p.oboImage == "" || img == nil || (img.GetName() == "" && img.GetDigest() == "") {
+		return true
+	}
+	if i := strings.LastIndex(p.oboImage, "@"); i >= 0 && img.GetDigest() != "" {
+		return img.GetDigest() == p.oboImage[i+1:]
+	}
+	return img.GetName() == p.oboImage
 }
 
 // placeholder is a credential's placeholder, as the Warden makes one on a host
@@ -504,6 +553,12 @@ func (p *plugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, ctr *
 		fmt.Fprintln(os.Stderr, "varek-nri: refused:", err)
 		return nil, nil, err
 	}
+	if adj == nil && ctr.GetName() == oboInit {
+		if _, ok := pod.GetAnnotations()[oboAnnotation]; ok {
+			fmt.Fprintf(os.Stderr, "varek-nri: %s/%s/%s: the init container of a pod acting for a user (its token's volume), as it is\n",
+				pod.GetNamespace(), pod.GetName(), ctr.GetName())
+		}
+	}
 	if adj != nil {
 		plan := ""
 		if n, ok := pod.GetAnnotations()[planAnnotation]; ok {
@@ -522,6 +577,7 @@ func main() {
 	flag.StringVar(&p.listener, "listener", "", "the node agent's socket")
 	flag.StringVar(&p.launcher, "launcher", "", "the launcher (varek-init) on the node")
 	socket := flag.String("socket", "", "the runtime's NRI socket (default: NRI's)")
+	flag.StringVar(&p.oboImage, "obo-image", "", "the image of the webhook's init container for a pod acting for a user (the node image)")
 	handlers := flag.String("runtime-handlers", "runc,crun", "the runtime handlers (RuntimeClass) whose containers run the Warden's filter; "+
 		"a pod of another is refused (the default handler, unnamed, is taken)")
 	// v1.34 step 5 (D7): the cluster's VarekPolicy resources into -policies

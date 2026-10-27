@@ -56,6 +56,10 @@ node:
   # the one the pod's resolv.conf names (the webhook keeps a pod to the
   # cluster's DNS)
   dnsServer: ""
+  # v1.36 step 6 (D5): the kubelet's root, whose pods/ directory the node
+  # agent reads a pod's user's token from (read-only), the copy the kubelet
+  # keeps of the pod's varek-obo volume
+  kubelet: /var/lib/kubelet
   # the runtime's state, where each container's bundle is (read-only)
   state:
     containerd: /run/containerd
@@ -121,6 +125,38 @@ exporter:
   resources:
     requests: { cpu: 20m, memory: 64Mi }
     limits: { memory: 2Gi }
+
+# v1.36 step 6 (docs/security/v1.36-kubernetes-parity.md, D5): a pod acting
+# for a user names the Secret its user's token is in (key token) with the
+# annotation varek.dev/on-behalf-of: SECRET; its policy trusts the token's
+# issuer (trust issuer URL audience AUD) and may say `require
+# on-behalf-of`. The webhook gives the pod a Secret volume of it (varek-obo)
+# and an init container that alone mounts it (the node image, /bin/true);
+# the node agent reads the token from the kubelet's copy, by the pod's uid,
+# and verifies it as the Warden does on a host (--on-behalf-of). No
+# container of the agent's can read it.
+onBehalfOf:
+  # the init container's user and group; on OpenShift, the namespace's
+  # (restricted-v2 gives it) whatever is set here
+  user: 65534
+
+# v1.36 step 6 (D5): the agent's SVID, from the node's SPIRE agent through
+# its Delegated Identity API (varek-svid, by the container's process id),
+# for a policy that trusts a SPIFFE trust domain (trust spiffe DOMAIN bundle
+# FILE). The SPIRE agent's configuration names the node agent's SPIFFE ID
+# among its authorized_delegates; "" asks for no SVID.
+spire:
+  # the SPIRE agent's admin socket on the node (admin_socket_path), e.g.
+  # /run/spire/admin-sockets/admin.sock: its directory is mounted
+  adminSocket: ""
+  # the node agent's own SPIFFE ID, left out of a pod's SVIDs (an entry
+  # selected by the DaemonSet's uid alone matches the pods' processes too)
+  self: ""
+  # a ConfigMap of this release's namespace holding the trust domain's
+  # bundle (SPIRE's k8sbundle notifier can write one), mounted at
+  # /etc/varek/spire-bundle: the policy says trust spiffe DOMAIN bundle
+  # /etc/varek/spire-bundle/KEY
+  bundleConfigMap: ""
 
 nodeAgent:
   resources:

@@ -2,7 +2,10 @@
   The admission webhook (D7): the API server sends it every VarekPolicy
   created or changed and every pod created or changed, and it refuses what
   the Warden does not load or the node agent would refuse at the container's
-  start (and, on a pod's update, a change to its policy's annotation). */}}
+  start (and, on a pod's update, a change to its policy's annotation).
+  v1.36 step 6 (D5): and every pod created to its mutating hook, which gives
+  a pod acting for a user (varek.dev/on-behalf-of) its token's volume and
+  the init container that alone mounts it. */}}
 {{- $name := include "varek.admissionName" . -}}
 {{- $svc := printf "%s.%s.svc" $name .Release.Namespace -}}
 {{- $secret := .Values.admission.tls.secretName | default (printf "%s-tls" $name) -}}
@@ -121,6 +124,12 @@ spec:
             # v1.36 step 4 (D1): a VarekCredential's file: source is under the node agent's directory
             - -credentials-dir
             - {{ .Values.credentials.dir }}
+            # v1.36 step 6 (D5): the init container of a pod acting for a user
+            # (the node image), and its user (on OpenShift, the namespace's)
+            - -obo-image
+            - {{ include "varek.image" . }}
+            - -obo-user
+            - {{ if .Values.openshift.enabled }}"0"{{ else }}{{ .Values.onBehalfOf.user | int64 | quote }}{{ end }}
           ports:
             - { name: https, containerPort: 8443 }
           readinessProbe:
@@ -190,7 +199,8 @@ webhooks:
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE"]
-        resources: ["pods"]
+        # v1.36 step 6: an ephemeral container added mounts no user's token
+        resources: ["pods", "pods/ephemeralcontainers"]
     namespaceSelector:
       matchExpressions:
         - key: varek.dev/policy-required
@@ -210,3 +220,38 @@ webhooks:
     failurePolicy: {{ $.Values.admission.failurePolicy }}
     timeoutSeconds: {{ $.Values.admission.timeoutSeconds }}
   {{- end }}
+---
+{{- /* v1.36 step 6 (D5): a pod acting for a user given its token's volume and
+  init container; every other pod is answered unchanged. Never reinvoked:
+  the validating hook holds the pod to what it gave. */}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: {{ $name }}
+  labels: {{- include "varek.labels" . | nindent 4 }}
+  {{- if .Values.admission.tls.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/{{ $name }}
+  {{- end }}
+webhooks:
+  - name: pod-mutate.varek.dev
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: {{ toJson (concat (list .Release.Namespace) .Values.admission.excludeNamespaces | uniq) }}
+    clientConfig:
+      service: { name: {{ $name }}, namespace: {{ .Release.Namespace }}, path: /pod-mutate, port: 443 }
+      {{- if not .Values.admission.tls.certManager.enabled }}
+      caBundle: {{ $ca }}
+      {{- end }}
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    reinvocationPolicy: Never
+    failurePolicy: {{ .Values.admission.failurePolicy }}
+    timeoutSeconds: {{ .Values.admission.timeoutSeconds }}
