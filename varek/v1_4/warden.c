@@ -5743,8 +5743,10 @@ static void usage(const char *argv0) {
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
         "       %s <policies dir | policy.txt> --node-agent <socket> --node-streams <dir>\n"
         "              [--node-launcher <varek-init>]   (v1.34: the node agent, one supervisor a container)\n"
+        "              [--node-credentials <dir>]   (v1.36: where a file: credential is)\n"
         "       %s <policy.txt> --oci-filter [--plan PLAN | --no-plan]   (v1.34: the policy's filter in OCI's form, for the\n"
         "              NRI plugin; v1.35: with the pod's plan, or for a pod that names none)\n"
+        "              [--credential-list FILE --pod-namespace NS]   (v1.36: the cluster's VarekCredential resources)\n"
         , argv0, argv0, argv0, argv0);
     fprintf(stderr,
         "\n"
