@@ -295,6 +295,28 @@ cleanly everywhere, but `SeccompBpfBackend.is_available()` returns an explanator
 string on non-Linux hosts or environments without kernel support. No silent
 degradation.
 
+### Supported platforms
+
+Each platform below is checked in CI; the job named is the one to read.
+"Each PR" means each pull request that touches the code the workflow
+watches; the VM cells also run for each release tag (v1.36,
+[D11](./docs/security/v1.36-kubernetes-parity.md)).
+
+| Platform | What runs | CI job | When |
+|---|---|---|---|
+| Ubuntu 24.04, x86_64 and arm64 (host) | the Warden's build and its suites | [`warden-build.yml`](https://github.com/kwdoug63/varek/actions/workflows/warden-build.yml): *Build the Warden with libseccomp + libsodium* | each PR |
+| RHEL 9 (host), tested on Rocky Linux 9 | every host suite, in a VM | [`matrix-vm.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix-vm.yml): *Rocky Linux 9 host: every suite* | each PR and release |
+| Amazon Linux 2023 (host, Linux 6.1) | every host suite, in a VM | [`matrix-vm.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix-vm.yml): *Amazon Linux 2023 host: every suite* | each PR and release |
+| Kubernetes, CRI-O 1.35, 1.36 and 1.37, under runc and crun | the Helm chart, on a kubeadm node | [`matrix.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix.yml): *CRI-O 1.35, runc* (and the other five) | each PR |
+| Kubernetes, containerd 2.2 and 2.3 | the Helm chart, on a kubeadm node | [`matrix.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix.yml): *containerd 2.2, runc*, *containerd 2.3, runc* | each PR |
+| Kubernetes, SELinux enforcing (CRI-O 1.35 on Rocky Linux 9) | the Helm chart, SELinux's denials counted | [`matrix-vm.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix-vm.yml): *SELinux enforcing: CRI-O 1.35 on Rocky Linux 9* | each PR and release |
+| Kubernetes on kind | the Helm chart; the suites under the node agent | [`kubernetes.yml`](https://github.com/kwdoug63/varek/actions/workflows/kubernetes.yml): *The chart on kind*, *The suites under the node agent* | each PR |
+| Containers (the UBI 9 image) | the suites in the image | [`container.yml`](https://github.com/kwdoug63/varek/actions/workflows/container.yml): *Build the image and run the suites in it* | each PR |
+| macOS, Windows | refused (the runtime fails closed) | [`platform-fail-closed.yml`](https://github.com/kwdoug63/varek/actions/workflows/platform-fail-closed.yml) | each PR |
+
+On CRI-O, install the chart with `--set runtime=cri-o`. arm64 Kubernetes
+nodes come with v1.36's step 3.
+
 ### Verify your installation
 
 ```bash
