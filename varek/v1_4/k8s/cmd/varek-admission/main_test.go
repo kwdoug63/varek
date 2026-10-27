@@ -325,8 +325,8 @@ func TestRealWarden(t *testing.T) {
 	}{
 		{"a plan it reads", "plan 1.35\naction a file_open /tmp/x open=read\n", ""},
 		{"one it does not", "plan 1.36\n", "refuses this plan"},
-		{"a step of no kind the Warden reads", "plan 1.35\naction m nosuchkind /x\n",
-			"the plan does not read: line 2"},
+		// v1.36 step 5 (D4): carried, decided as on a host when the pod starts
+		{"an mcp_call step", "plan 1.35\naction m mcp_call http://10.0.0.1:8080/mcp\n", ""},
 	} {
 		ok, msg := post(t, s, "/varekplan", "team-a", vplan("p1", c.text))
 		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
