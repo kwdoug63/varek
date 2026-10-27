@@ -218,6 +218,75 @@ else
     "$WARDEN" "$T/cs.txt" --check-startup --secrets-conf "$T/conf" > "$OUT/cs.out" 2>&1
     check "--check-startup lists the credentials and fetches nothing" \
         sh -c "grep -q 'credential c from vault:secret/data/agents/gh#token (line 3)' '$OUT/cs.out' && [ ! -s '$SD/requests.log' ]"
+
+    # v1.36 step 4 (docs/security/v1.36-kubernetes-parity.md, D1): a store in
+    # a Kubernetes Secret's volume, and the DaemonSet's own sign-ins, each from
+    # a token the kubelet projects. A volume's file is a link into a directory
+    # the kubelet replaces whole: KEY -> ..data/KEY, ..data -> ..<time>/
+    # vol <dir> <key> <value> [mode]: a volume laid out so
+    vol() { mkdir -p "$T/$1/..2026_10_27_10_00_00.1"; chmod 1777 "$T/$1"; chmod 755 "$T/$1/..2026_10_27_10_00_00.1"
+            printf '%b' "$3" > "$T/$1/..2026_10_27_10_00_00.1/$2"; chmod "${4:-400}" "$T/$1/..2026_10_27_10_00_00.1/$2"
+            ln -sfn ..2026_10_27_10_00_00.1 "$T/$1/..data"; ln -sfn "..data/$2" "$T/$1/$2"; }
+    vol sec k 'file-value-1234\n'
+    run l1 "credential c from file:$T/sec/k\n"
+    check "v1.36: a store in a Secret's volume (a link into ..data): followed, fetched" \
+        sh -c "grep -Eq 'credential c from file:$T/sec/k: fetched, 15 bytes' '$OUT/l1.out'"
+    mkdir -p "$T/open"; chmod 777 "$T/open"; printf 'v\n' > "$T/open/k"; chmod 400 "$T/open/k"; ln -sfn "$T/open/k" "$T/lopen"
+    run l2 "credential c from file:$T/lopen\n"
+    refuse "v1.36: a link to a file in a directory others can write" l2 "the directory $T/open must be root's"
+    ln -sfn "$T/sec/k" "$T/lnot"; chown -h 65534 "$T/lnot"
+    run l3 "credential c from file:$T/lnot\n"
+    refuse "v1.36: a link that is not root's" l3 "is a link that is not root's"
+    vol sa token 'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ2YXJlay1ub2RlIn0.c2lnLWs4cy12MTM2MA\n'
+    VK="vault_addr = https://127.0.0.1:$HP\nvault_ca = $T/ca.pem\nvault_k8s_role = agents\nvault_k8s_jwt_file = $T/sa/token\n"
+    put ck8s "$VK"
+    : > "$SD/requests.log"
+    run k1 "credential c from vault:secret/data/agents/gh#token\n" --secrets-conf "$T/ck8s"
+    check "v1.36: Vault's Kubernetes auth: the service account's token (a projected one, a link) logs in, the secret fetched with the token given" \
+        sh -c "grep -q 'credential c from vault:secret/data/agents/gh#token: fetched, 20 bytes, version kv2:3' '$OUT/k1.out' &&
+               grep -q 'vault POST login mount=kubernetes role=agents jwt=ok' '$SD/requests.log' &&
+               grep -q 'vault GET /v1/secret/data/agents/gh token=ok (the Kubernetes login' '$SD/requests.log'"
+    check "v1.36: no token is in the Warden's output" sh -c "! grep -Eq 'eyJhbGci|s.k8s-login' '$OUT/k1.out'"
+    put ck8m "${VK}vault_k8s_mount = kube/prod\n"
+    : > "$SD/requests.log"
+    run k2 "credential c from vault:secret/data/agents/gh#token\n" --secrets-conf "$T/ck8m"
+    check "v1.36: Vault's Kubernetes auth at another path (vault_k8s_mount)" \
+        sh -c "grep -q 'fetched, 20 bytes' '$OUT/k2.out' && grep -q 'vault POST login mount=kube/prod role=agents jwt=ok' '$SD/requests.log'"
+    vol sab token 'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJvdGhlciJ9.c2ln\n'
+    put ck8b "vault_addr = https://127.0.0.1:$HP\nvault_ca = $T/ca.pem\nvault_k8s_role = agents\nvault_k8s_jwt_file = $T/sab/token\n"
+    run k3 "credential c from vault:secret/data/agents/gh#token\n" --secrets-conf "$T/ck8b"
+    refuse "v1.36: a service account Vault does not take" k3 "vault's Kubernetes login (role agents at auth/kubernetes) answered 403"
+    put ck8t "${VK}vault_token_file = $T/vt\n"
+    run k4 "credential c from vault:secret/data/agents/gh#token\n" --secrets-conf "$T/ck8t"
+    refuse "v1.36: a Vault token file and Kubernetes auth both" k4 "give vault_token_file or vault_k8s_role, not both"
+    put ck8r "vault_addr = https://127.0.0.1:$HP\nvault_ca = $T/ca.pem\nvault_k8s_role = agents\n"
+    run k5 "credential c from vault:secret/data/agents/gh#token\n" --secrets-conf "$T/ck8r"
+    refuse "v1.36: a Kubernetes role without the service account's token" k5 "needs vault_k8s_role and vault_k8s_jwt_file"
+    vol irsa token 'eyJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJzdHMuYW1hem9uYXdzLmNvbSJ9.c2lnLWlyc2E\n'
+    AW="aws_endpoint = https://127.0.0.1:$HP\naws_ca = $T/ca.pem\n"
+    put cirsa "${AW}aws_sts_endpoint = https://127.0.0.1:$HP\naws_role_arn = arn:aws:iam::111122223333:role/varek-node\naws_web_identity_token_file = $T/irsa/token\n"
+    : > "$SD/requests.log"
+    run i1 "credential c from aws-sm:$ARN:stripe-AbCdEf\n" --secrets-conf "$T/cirsa"
+    check "v1.36: IRSA: the web identity token assumes the role at STS, the secret signed with the role's key and token" \
+        sh -c "grep -q 'credential c from aws-sm:.*: fetched, 17 bytes' '$OUT/i1.out' &&
+               grep -q 'sts POST AssumeRoleWithWebIdentity role=arn:aws:iam::111122223333:role/varek-node token=ok' '$SD/requests.log' &&
+               grep -q 'key=ASIAIRSAV1360 signature=ok' '$SD/requests.log'"
+    vol pod token 'eyJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJwb2RzLmVrcy5hbWF6b25hd3MuY29tIn0.c2lnLXBvZA\n'
+    put cpod "${AW}aws_container_credentials_uri = http://127.0.0.1:$IP/v1/credentials\naws_container_token_file = $T/pod/token\n"
+    : > "$SD/requests.log"
+    run i2 "credential c from aws-sm:$ARN:stripe-AbCdEf\n" --secrets-conf "$T/cpod"
+    check "v1.36: EKS Pod Identity: the agent gives the role's credentials for its token, the secret signed with them" \
+        sh -c "grep -q 'credential c from aws-sm:.*: fetched, 17 bytes' '$OUT/i2.out' && grep -q 'pod-identity GET token=ok' '$SD/requests.log' &&
+               grep -q 'key=ASIAPODV1360 signature=ok' '$SD/requests.log'"
+    put cboth "${AW}aws_credentials_file = $T/aws\naws_role_arn = arn:aws:iam::111122223333:role/varek-node\naws_web_identity_token_file = $T/irsa/token\n"
+    run i3 "credential c from aws-sm:$ARN:stripe-AbCdEf\n" --secrets-conf "$T/cboth"
+    refuse "v1.36: two ways to the AWS role at once" i3 "give one of aws_credentials_file, aws_role_arn and aws_container_credentials_uri"
+    put cpodf "${AW}aws_container_credentials_uri = http://192.0.2.1/v1/credentials\naws_container_token_file = $T/pod/token\n"
+    run i4 "credential c from aws-sm:$ARN:stripe-AbCdEf\n" --secrets-conf "$T/cpodf"
+    refuse "v1.36: plain http to a Pod Identity agent that is not at its own address" i4 "plain http to 192.0.2.1"
+    put cirsan "${AW}aws_role_arn = arn:aws:iam::111122223333:role/varek-node\n"
+    run i5 "credential c from aws-sm:$ARN:stripe-AbCdEf\n" --secrets-conf "$T/cirsan"
+    refuse "v1.36: an IRSA role without its token" i5 "IRSA needs aws_role_arn and aws_web_identity_token_file, together"
 fi
 
 echo "== 3. the swap =="

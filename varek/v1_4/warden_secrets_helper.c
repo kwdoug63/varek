@@ -38,6 +38,20 @@
 //   oidc_ca               v1.28.1: a PEM CA bundle to verify token issuers with (else the
 //                         host's); with no credentials and no such file, the host's
 //
+// v1.36 step 4 (docs/security/v1.36-kubernetes-parity.md, D1): under the
+// node agent, a store is reached under the DaemonSet's own identity, each
+// from a token the kubelet projects into its pod (a file, read as root):
+//   vault_k8s_role        Vault's Kubernetes auth: the role to log in as, with
+//   vault_k8s_jwt_file    the service account's token (in place of vault_token_file)
+//   vault_k8s_mount       the auth method's path (default kubernetes)
+//   aws_role_arn          IRSA: the role assumed with the web identity token
+//   aws_web_identity_token_file   (AssumeRoleWithWebIdentity), from
+//   aws_sts_endpoint      https://... (else https://sts.REGION.amazonaws.com)
+//   aws_container_credentials_uri EKS Pod Identity: the agent's endpoint
+//   aws_container_token_file      (http://169.254.170.23/v1/credentials), and its token
+// One of aws_credentials_file, aws_role_arn and aws_container_credentials_uri,
+// or none (the instance's role).
+//
 // v1.28.1 (docs/security/v1.28.1-delegation-chain.md, section 2): it also
 // verifies the user's token and the agent's X.509-SVID; see "identities"
 // below.
@@ -97,6 +111,9 @@ static size_t g_arena_len;
 static struct { size_t off, len; } g_val[WS_MAX_CREDS];
 static char *g_vault_token;           /* the arena's last page */
 static char *g_user_token;            /* v1.28.1: the user's token, after it (WS_MAX_TOKEN + 1) */
+/* v1.36 step 4: the tokens the DaemonSet signs in with (Vault's, AWS's),
+ * each WS_MAX_TOKEN + 1, after the decoded parts below */
+static char *g_vault_jwt, *g_aws_jwt;
 /* v1.28.1 review: and its decoded parts, while it is checked */
 #define HDR_MAX 4096
 #define SIG_MAX 1024
@@ -104,7 +121,7 @@ static char *g_hdr, *g_pay;
 static unsigned char *g_sig;
 
 static int arena_init(void) {
-    g_arena_len = VALUES_LEN + TOKEN_MAX + WS_MAX_TOKEN + 1 + HDR_MAX + WS_MAX_TOKEN + SIG_MAX;
+    g_arena_len = VALUES_LEN + TOKEN_MAX + WS_MAX_TOKEN + 1 + HDR_MAX + WS_MAX_TOKEN + SIG_MAX + 2 * (WS_MAX_TOKEN + 1);
     g_arena = mmap(NULL, g_arena_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (g_arena == MAP_FAILED) { g_arena = NULL; return -1; }
     if (mlock(g_arena, g_arena_len) < 0) return -1;
@@ -114,6 +131,8 @@ static int arena_init(void) {
     g_hdr = g_user_token + WS_MAX_TOKEN + 1;
     g_pay = g_hdr + HDR_MAX;
     g_sig = (unsigned char *)g_pay + WS_MAX_TOKEN;
+    g_vault_jwt = (char *)g_sig + SIG_MAX;
+    g_aws_jwt = g_vault_jwt + WS_MAX_TOKEN + 1;
     return 0;
 }
 
@@ -127,6 +146,10 @@ static void token_clear(void) {
 
 static void user_token_clear(void) {
     if (g_user_token) OPENSSL_cleanse(g_user_token, WS_MAX_TOKEN + 1);
+}
+
+static void signin_clear(void) {
+    if (g_vault_jwt) OPENSSL_cleanse(g_vault_jwt, 2 * (WS_MAX_TOKEN + 1));
 }
 
 /* Step 4: the run's Vault leases (a credential's index is its slot) */
@@ -234,6 +257,26 @@ static void report(unsigned idx, bool ok, const char *version, size_t len, const
 
 /* ---- local files (as root) ---- */
 
+/* v1.28 review: a resolved directory and every directory above it root's,
+ * and writable by no other user unless sticky (as /tmp): no one else can put
+ * another file at a name in it between the policy's checks and the read.
+ * real is the directory's resolved path, cut up as it is checked. 0, or -1
+ * with why (path: the file named, for the reason). */
+static int dirs_root_only(const char *path, char *real, char *why, size_t wn) {
+    for (char *c = real + strlen(real); ; ) {
+        struct stat ds;
+        if (stat(real[0] ? real : "/", &ds) < 0 || ds.st_uid != 0 ||
+            ((ds.st_mode & 022) && !(ds.st_mode & S_ISVTX))) {
+            snprintf(why, wn, "%.200s: the directory %.200s must be root's and writable by no other user",
+                     path, real[0] ? real : "/");
+            return -1;
+        }
+        if (!real[0]) return 0;
+        while (c > real && *c != '/') c--;
+        *c = '\0';                                       /* up one ("" is /) */
+    }
+}
+
 /* Read a file that must be regular, owned by root and readable by no group
  * or other user, into buf (at most cap bytes). The path is reported to the
  * Warden. 0, or -1 with why. v1.28.1: kind WS_FILE_TRUSTED (a trust bundle)
@@ -241,9 +284,6 @@ static void report(unsigned idx, bool ok, const char *version, size_t len, const
 static int read_file(const char *path, uint32_t kind, unsigned char *buf, size_t cap, size_t *len, struct stat *out,
                      char *why, size_t wn) {
     report_file(path, kind);
-    /* v1.28 review: every directory above it root's, and writable by no other
-     * user unless sticky (as /tmp): no one else can put another file at the
-     * name between the policy's checks and this read */
     if (path[0] != '/') { snprintf(why, wn, "%.300s is not an absolute path", path); return -1; }
     char dir[PATH_MAX], real[PATH_MAX];
     snprintf(dir, sizeof dir, "%s", path);
@@ -259,20 +299,31 @@ static int read_file(const char *path, uint32_t kind, unsigned char *buf, size_t
         snprintf(why, wn, "%.300s is not a file's path", path);
         return -1;
     }
-    for (char *c = real + strlen(real); ; ) {
-        struct stat ds;
-        if (stat(real[0] ? real : "/", &ds) < 0 || ds.st_uid != 0 ||
-            ((ds.st_mode & 022) && !(ds.st_mode & S_ISVTX))) {
-            snprintf(why, wn, "%.200s: the directory %.200s must be root's and writable by no other user",
-                     path, real[0] ? real : "/");
+    if (dirs_root_only(path, real, why, wn) < 0) return -1;
+    /* v1.36 step 4 (D1): a Kubernetes Secret's or projected token's file is
+     * a link into a directory the kubelet replaces whole (KEY ->
+     * ..data/KEY): a link at the name is followed if it is root's, in the
+     * directories just checked (so only root put it there), and its target's
+     * directories pass the same check; the target is opened, not the link */
+    struct stat ls;
+    char target[PATH_MAX];
+    const char *at = checked;
+    if (lstat(checked, &ls) == 0 && S_ISLNK(ls.st_mode)) {
+        char tdir[PATH_MAX];
+        if (ls.st_uid != 0) {
+            snprintf(why, wn, "%.300s is a link that is not root's", path);
             return -1;
         }
-        if (!real[0]) break;
-        while (c > real && *c != '/') c--;
-        *c = '\0';                                       /* up one ("" is /) */
+        if (!realpath(checked, target)) { snprintf(why, wn, "cannot open %.300s: %s", path, strerror(errno)); return -1; }
+        snprintf(tdir, sizeof tdir, "%s", target);
+        char *ts = strrchr(tdir, '/');
+        if (!ts || !ts[1]) { snprintf(why, wn, "%.300s is not a file's path", path); return -1; }
+        if (ts == tdir) ts[1] = '\0'; else *ts = '\0';
+        if (dirs_root_only(path, tdir, why, wn) < 0) return -1;
+        at = target;
     }
     /* review: O_NONBLOCK, so a FIFO put at the name cannot hold the helper */
-    int fd = open(checked, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY | O_NONBLOCK);
+    int fd = open(at, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) { snprintf(why, wn, "cannot open %s: %s", path, strerror(errno)); return -1; }
     struct stat st;
     if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
@@ -329,6 +380,10 @@ static struct {
     char vault_addr[512], vault_token_file[4096], vault_ca[4096];
     char aws_region[64], aws_endpoint[512], aws_ca[4096], aws_credentials_file[4096], aws_imds[512];
     char oidc_ca[4096];               /* v1.28.1: a PEM CA bundle to verify issuers with (else the host's) */
+    /* v1.36 step 4 (D1): the DaemonSet's identity */
+    char vault_k8s_role[129], vault_k8s_jwt_file[4096], vault_k8s_mount[129];
+    char aws_role_arn[2049], aws_web_identity_token_file[4096], aws_sts_endpoint[512];
+    char aws_container_credentials_uri[512], aws_container_token_file[4096];
 } g_conf;
 
 static struct { char id[256], secret[256], token[4096]; bool have; } g_aws;
@@ -374,6 +429,9 @@ static int conf_key(const char *k, const char *v, char *why, size_t wn) {
 #define K(f) { #f, offsetof(__typeof__(g_conf), f), sizeof g_conf.f }
         K(vault_addr), K(vault_token_file), K(vault_ca), K(aws_region), K(aws_endpoint), K(aws_ca),
         K(aws_credentials_file), K(aws_imds), K(oidc_ca),
+        K(vault_k8s_role), K(vault_k8s_jwt_file), K(vault_k8s_mount), K(aws_role_arn),          /* v1.36 */
+        K(aws_web_identity_token_file), K(aws_sts_endpoint), K(aws_container_credentials_uri),
+        K(aws_container_token_file),
 #undef K
     };
     for (size_t i = 0; i < sizeof kKeys / sizeof kKeys[0]; i++) {
@@ -768,6 +826,98 @@ static const char *jget(const char *p, const char *e, const char *key) {
 
 /* ---- Vault ---- */
 
+/* ---- v1.36 step 4 (D1): signing in as the DaemonSet ---- */
+
+/* A token the kubelet projects (a JWT), read as root into buf (WS_MAX_TOKEN
+ * + 1): one line of base64url parts. 0, or -1 with why. */
+static int read_signin(const char *key, const char *path, char *buf, char *why, size_t wn) {
+    size_t tl = 0;
+    if (read_private(path, (unsigned char *)buf, WS_MAX_TOKEN, &tl, NULL, why, wn) < 0) return -1;
+    tl = chomp((unsigned char *)buf, tl);
+    buf[tl] = '\0';
+    if (!tl || strspn(buf, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.") != tl) {
+        OPENSSL_cleanse(buf, WS_MAX_TOKEN + 1);
+        snprintf(why, wn, "%s %.300s is not one token (base64url parts, one line)", key, path);
+        return -1;
+    }
+    return 0;
+}
+
+static bool printable(const char *s);
+static bool chars_in(const char *s, const char *set) { return *s && strspn(s, set) == strlen(s); }
+
+/* The Vault keys of Kubernetes auth, checked: NULL, or why */
+static const char *vault_k8s_bad(void) {
+    if (g_conf.vault_token_file[0]) return "give vault_token_file or vault_k8s_role, not both";
+    if (!g_conf.vault_k8s_role[0] || !g_conf.vault_k8s_jwt_file[0])
+        return "Vault's Kubernetes auth needs vault_k8s_role and vault_k8s_jwt_file";
+    if (!chars_in(g_conf.vault_k8s_role, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.@-"))
+        return "vault_k8s_role is letters, digits and _ . @ -";
+    const char *m = g_conf.vault_k8s_mount;
+    if (m[0] && (!chars_in(m, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-/") || m[0] == '/' ||
+                 m[strlen(m) - 1] == '/' || strstr(m, "//")))
+        return "vault_k8s_mount is the auth method's path: letters, digits, _ and -, in parts joined by /";
+    return NULL;
+}
+
+/* The AWS keys of a role's sign-in, checked: NULL, or why */
+static const char *aws_signin_bad(void) {
+    int n = (g_conf.aws_credentials_file[0] != 0) + (g_conf.aws_role_arn[0] != 0) +
+            (g_conf.aws_container_credentials_uri[0] != 0);
+    if (n > 1) return "give one of aws_credentials_file, aws_role_arn and aws_container_credentials_uri";
+    if (!g_conf.aws_role_arn[0] != !g_conf.aws_web_identity_token_file[0])
+        return "IRSA needs aws_role_arn and aws_web_identity_token_file, together";
+    if (!g_conf.aws_container_credentials_uri[0] != !g_conf.aws_container_token_file[0])
+        return "EKS Pod Identity needs aws_container_credentials_uri and aws_container_token_file, together";
+    const char *a = g_conf.aws_role_arn;
+    if (a[0] && (strncmp(a, "arn:", 4) || !printable(a) || strchr(a, ' ')))
+        return "aws_role_arn is an ARN (arn:..., printable, no space)";
+    return NULL;
+}
+
+/* Vault's Kubernetes auth: the role's token, given for the service
+ * account's (POST /v1/auth/MOUNT/login), into g_vault_token. 0, or -1 with why. */
+static int vault_login(char *why, size_t wn) {
+    struct url u;
+    if (!g_conf.vault_addr[0] || url_parse(g_conf.vault_addr, &u) < 0) {
+        snprintf(why, wn, "%s", g_conf.vault_addr[0] ? "vault_addr is not an http(s) URL" :
+                 "a vault credential needs vault_addr in the configuration");
+        return -1;
+    }
+    const char *mount = g_conf.vault_k8s_mount[0] ? g_conf.vault_k8s_mount : "kubernetes";
+    char path[1400];
+    snprintf(path, sizeof path, "%s/v1/auth/%s/login", u.path, mount);
+    size_t cap = strlen(g_vault_jwt) + strlen(g_conf.vault_k8s_role) + 32;
+    char *body = malloc(cap);
+    if (!body) { snprintf(why, wn, "out of memory"); return -1; }
+    /* the role and the token hold no '"' or '\\' (checked) */
+    int bl = snprintf(body, cap, "{\"role\":\"%s\",\"jwt\":\"%s\"}", g_conf.vault_k8s_role, g_vault_jwt);
+    int status = 0;
+    char *resp = NULL;
+    size_t rl = 0;
+    int r = http_do(&u, g_conf.vault_ca[0] ? g_conf.vault_ca : NULL, false, "POST", path,
+                    "Content-Type: application/json\r\nAccept: application/json\r\n", body, (size_t)bl, &status, &resp,
+                    &rl, why, wn);
+    OPENSSL_cleanse(body, cap);
+    free(body);
+    if (r < 0) return -1;
+    const char *e = resp + rl, *auth = status == 200 ? jget(resp, e, "auth") : NULL;
+    const char *ct = auth ? jget(auth, e, "client_token") : NULL;
+    long tl = ct ? jstr(ct, e, g_vault_token, TOKEN_MAX - 1) : -1;
+    int rc = 0;
+    if (status != 200) {
+        snprintf(why, wn, "vault's Kubernetes login (role %s at auth/%s) answered %d", g_conf.vault_k8s_role, mount, status);
+        rc = -1;
+    } else if (tl <= 0 || (g_vault_token[tl] = '\0', !printable(g_vault_token)) || strchr(g_vault_token, ' ')) {
+        snprintf(why, wn, "vault's Kubernetes login gave no client token one header can carry");
+        rc = -1;
+    }
+    if (rc < 0) token_clear();
+    OPENSSL_cleanse(resp, rl);
+    free(resp);
+    return rc;
+}
+
 static void vault_fetch(unsigned idx, const char *ref) {
     char why[256];
     struct url u;
@@ -776,7 +926,10 @@ static void vault_fetch(unsigned idx, const char *ref) {
                "a vault credential needs vault_addr in the configuration");
         return;
     }
-    if (!g_vault_token[0]) { report(idx, false, NULL, 0, "a vault credential needs vault_token_file"); return; }
+    if (!g_vault_token[0]) {
+        report(idx, false, NULL, 0, "a vault credential needs vault_token_file or vault_k8s_role");
+        return;
+    }
     const char *h = strchr(ref, '#');
     char path[1400], hdr[4200];
     snprintf(path, sizeof path, "%s/v1/%.*s", u.path, (int)(h - ref), ref);
@@ -916,6 +1069,108 @@ out:
     return rc;
 }
 
+/* v1.36 step 4 (D1): a value between <TAG> and </TAG> in STS's XML, into
+ * out (cap bytes with its NUL): its length, or -1 */
+static long xml_get(const char *b, size_t bl, const char *tag, char *out, size_t cap) {
+    char open[64], close[64];
+    snprintf(open, sizeof open, "<%s>", tag);
+    snprintf(close, sizeof close, "</%s>", tag);
+    const char *s = memmem(b, bl, open, strlen(open));
+    if (!s) return -1;
+    s += strlen(open);
+    const char *e = memmem(s, bl - (size_t)(s - b), close, strlen(close));
+    if (!e || (size_t)(e - s) >= cap || memchr(s, '<', (size_t)(e - s)) || memchr(s, '&', (size_t)(e - s))) return -1;
+    memcpy(out, s, (size_t)(e - s));
+    out[e - s] = '\0';
+    return (long)(e - s);
+}
+
+/* s, percent-encoded for a form (all but A-Z a-z 0-9 - . _ ~), appended at
+ * out + *n (cap in all): 0, or -1 if it does not fit */
+static int form_enc(const char *s, char *out, size_t cap, size_t *n) {
+    static const char x[] = "0123456789ABCDEF";
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        bool keep = isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~';
+        if (*n + (keep ? 1 : 3) >= cap) return -1;
+        if (keep) out[(*n)++] = (char)c;
+        else { out[(*n)++] = '%'; out[(*n)++] = x[c >> 4]; out[(*n)++] = x[c & 15]; }
+    }
+    out[*n] = '\0';
+    return 0;
+}
+
+/* IRSA: the role's credentials from STS (AssumeRoleWithWebIdentity, with
+ * the web identity token: a request STS takes unsigned). 0, or -1 with why. */
+static int sts_credentials(const char *region, char *why, size_t wn) {
+    char ep[600];
+    if (g_conf.aws_sts_endpoint[0]) snprintf(ep, sizeof ep, "%s", g_conf.aws_sts_endpoint);
+    else snprintf(ep, sizeof ep, "https://sts.%s.amazonaws.com", region);
+    struct url u;
+    if (url_parse(ep, &u) < 0) { snprintf(why, wn, "aws_sts_endpoint is not an http(s) URL"); return -1; }
+    size_t cap = 3 * (strlen(g_aws_jwt) + strlen(g_conf.aws_role_arn)) + 256, n = 0;
+    char *body = malloc(cap);
+    if (!body) { snprintf(why, wn, "out of memory"); return -1; }
+    n = (size_t)snprintf(body, cap, "Action=AssumeRoleWithWebIdentity&Version=2011-06-15&DurationSeconds=3600"
+                         "&RoleSessionName=varek-warden-secrets&RoleArn=");
+    int ok = form_enc(g_conf.aws_role_arn, body, cap, &n) == 0 && n + 18 < cap;
+    if (ok) { memcpy(body + n, "&WebIdentityToken=", 18); n += 18; ok = form_enc(g_aws_jwt, body, cap, &n) == 0; }
+    if (!ok) { OPENSSL_cleanse(body, cap); free(body); snprintf(why, wn, "the STS request is too long"); return -1; }
+    char path[1100];
+    snprintf(path, sizeof path, "%s/", u.path);
+    int status = 0;
+    char *resp = NULL;
+    size_t rl = 0;
+    int r = http_do(&u, g_conf.aws_ca[0] ? g_conf.aws_ca : NULL, false, "POST", path,
+                    "Content-Type: application/x-www-form-urlencoded; charset=utf-8\r\n", body, n, &status, &resp, &rl,
+                    why, wn);
+    OPENSSL_cleanse(body, cap);
+    free(body);
+    if (r < 0) return -1;
+    long al = status == 200 ? xml_get(resp, rl, "AccessKeyId", g_aws.id, sizeof g_aws.id) : -1;
+    long sl = status == 200 ? xml_get(resp, rl, "SecretAccessKey", g_aws.secret, sizeof g_aws.secret) : -1;
+    long xl = status == 200 ? xml_get(resp, rl, "SessionToken", g_aws.token, sizeof g_aws.token) : -1;
+    OPENSSL_cleanse(resp, rl);
+    free(resp);
+    if (status != 200) { snprintf(why, wn, "STS answered %d to AssumeRoleWithWebIdentity (%.150s)", status, g_conf.aws_role_arn); return -1; }
+    if (al <= 0 || sl <= 0 || xl <= 0) { snprintf(why, wn, "STS's answer has no credentials"); return -1; }
+    g_aws.have = true;
+    return 0;
+}
+
+/* EKS Pod Identity: the role's credentials from the node's Pod Identity
+ * agent, with the token projected for it. Plain HTTP only to the agent's
+ * own addresses (or a loopback one). 0, or -1 with why. */
+static int container_credentials(char *why, size_t wn) {
+    struct url u;
+    if (url_parse(g_conf.aws_container_credentials_uri, &u) < 0) {
+        snprintf(why, wn, "aws_container_credentials_uri is not an http(s) URL");
+        return -1;
+    }
+    bool agent = !strcmp(u.host, "169.254.170.23") || !strcmp(u.host, "fd00:ec2::23");
+    static char h[WS_MAX_TOKEN + 64];
+    snprintf(h, sizeof h, "Authorization: %s\r\nAccept: application/json\r\n", g_aws_jwt);
+    int status = 0;
+    char *resp = NULL;
+    size_t rl = 0;
+    int r = http_do(&u, g_conf.aws_ca[0] ? g_conf.aws_ca : NULL, agent, "GET", u.path[0] ? u.path : "/", h, "", 0,
+                    &status, &resp, &rl, why, wn);
+    OPENSSL_cleanse(h, sizeof h);
+    if (r < 0) return -1;
+    const char *e = resp + rl, *a = jget(resp, e, "AccessKeyId"), *s = jget(resp, e, "SecretAccessKey"),
+               *t = jget(resp, e, "Token");
+    long al = status == 200 && a ? jstr(a, e, g_aws.id, sizeof g_aws.id - 1) : -1;
+    long sl = status == 200 && s ? jstr(s, e, g_aws.secret, sizeof g_aws.secret - 1) : -1;
+    long xl = status == 200 && t ? jstr(t, e, g_aws.token, sizeof g_aws.token - 1) : -1;
+    OPENSSL_cleanse(resp, rl);
+    free(resp);
+    if (status != 200) { snprintf(why, wn, "the Pod Identity agent answered %d", status); return -1; }
+    if (al <= 0 || sl <= 0 || xl <= 0) { snprintf(why, wn, "the Pod Identity agent's answer has no credentials"); return -1; }
+    g_aws.id[al] = g_aws.secret[sl] = g_aws.token[xl] = '\0';
+    g_aws.have = true;
+    return 0;
+}
+
 /* v1.28 review: the key material goes into request headers: printable
  * ASCII only (the metadata service's JSON, or a key file, could carry an
  * escaped or inner CR/LF) */
@@ -944,7 +1199,13 @@ static void aws_fetch(unsigned idx, const char *arn) {
     else snprintf(ep, sizeof ep, "https://secretsmanager.%s.amazonaws.com", region);
     struct url u;
     if (url_parse(ep, &u) < 0) { report(idx, false, NULL, 0, "aws_endpoint is not an http(s) URL"); return; }
-    if (!g_aws.have && imds_credentials(why, sizeof why) < 0) { report(idx, false, NULL, 0, why); return; }
+    /* the role's: IRSA, EKS Pod Identity (v1.36), else the instance's */
+    if (!g_aws.have && (g_conf.aws_role_arn[0] ? sts_credentials(region, why, sizeof why) :
+                        g_conf.aws_container_credentials_uri[0] ? container_credentials(why, sizeof why) :
+                        imds_credentials(why, sizeof why)) < 0) {
+        report(idx, false, NULL, 0, why);
+        return;
+    }
     if (!aws_creds_ok()) {
         report(idx, false, NULL, 0, "the AWS key, secret or session token holds a character that is not printable");
         return;
@@ -2006,6 +2267,26 @@ int main(int argc, char **argv) {
             }
         }
     }
+    /* v1.36 step 4 (D1): the tokens the DaemonSet signs in with, as root */
+    if (!failed && need_vault && (g_conf.vault_k8s_role[0] || g_conf.vault_k8s_jwt_file[0] || g_conf.vault_k8s_mount[0])) {
+        const char *bad = vault_k8s_bad();
+        if (bad) snprintf(why, sizeof why, "%s", bad);
+        if (bad || read_signin("vault_k8s_jwt_file", g_conf.vault_k8s_jwt_file, g_vault_jwt, why, sizeof why) < 0) {
+            for (uint32_t i = 0; i < su.ncreds; i++) if (cr[i].store == STORE_VAULT) report(i, false, NULL, 0, why);
+            failed = true;
+        }
+    }
+    if (!failed && need_aws) {
+        const char *bad = aws_signin_bad();
+        const char *key = g_conf.aws_role_arn[0] ? "aws_web_identity_token_file" : "aws_container_token_file";
+        const char *tf = g_conf.aws_role_arn[0] ? g_conf.aws_web_identity_token_file :
+                         g_conf.aws_container_credentials_uri[0] ? g_conf.aws_container_token_file : NULL;
+        if (bad) snprintf(why, sizeof why, "%s", bad);
+        if (bad || (tf && read_signin(key, tf, g_aws_jwt, why, sizeof why) < 0)) {
+            for (uint32_t i = 0; i < su.ncreds; i++) if (cr[i].store == STORE_AWSSM) report(i, false, NULL, 0, why);
+            failed = true;
+        }
+    }
     if (!failed && need_vault && g_conf.vault_token_file[0]) {
         if (read_private(g_conf.vault_token_file, fbuf, TOKEN_MAX - 1, &fl, NULL, why, sizeof why) < 0) {
             for (uint32_t i = 0; i < su.ncreds; i++) if (cr[i].store == STORE_VAULT) report(i, false, NULL, 0, why);
@@ -2092,10 +2373,15 @@ int main(int argc, char **argv) {
         failed |= id_failed;
     }
     user_token_clear();
+    if (!failed && need_vault && g_vault_jwt[0] && vault_login(why, sizeof why) < 0) {          /* v1.36 */
+        for (uint32_t i = 0; i < su.ncreds; i++) if (cr[i].store == STORE_VAULT) report(i, false, NULL, 0, why);
+        failed = true;
+    }
     for (uint32_t i = 0; !failed && i < su.ncreds; i++) {
         if (cr[i].store == STORE_VAULT) vault_fetch(i, cr[i].ref);
         else if (cr[i].store == STORE_AWSSM) aws_fetch(i, cr[i].ref);
     }
+    signin_clear();
     bool leased = false;
     for (uint32_t i = 0; i < su.ncreds; i++) leased |= g_lease[i].live;
     /* v1.28 review: no run: the leases made are revoked at once */
