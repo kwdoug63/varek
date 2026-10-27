@@ -9,8 +9,8 @@
 #   1. the CRD installs; its name rule (CEL) refuses a name the node agent
 #      does not take;
 #   2. the webhook (varek-admission, the chart's hooks pointed at it):
-#      a policy the Warden does not load and one with credentials refused
-#      with the Warden's reason; one that loads admitted; pods refused for a
+#      a policy the Warden does not load and one naming a credential no
+#      VarekCredential gives refused with the Warden's reason; one that loads admitted; pods refused for a
 #      policy not in their namespace, root, a relative command, a writable
 #      root under a policy that decides launches, a capability added, a
 #      seccomp profile other than VAREK's unsupervised one, a PID namespace
@@ -25,6 +25,10 @@
 # `require plan` admitted, its pod refused naming no plan or one not in its
 # namespace, admitted naming its plan, the plan annotation fixed after; each
 # plan written to POLICY_DIR/<namespace>/<name>.plan, and removed.
+# v1.36 step 4 (D1, D2): the VarekCredential CRD; one whose file: source is
+# not under the chart's directory refused, one given to team-a admitted; a
+# policy naming it refused in team-b, admitted in team-a, and its pod; the
+# cluster's list written to POLICY_DIR/.credentials, and changed.
 #
 #   sudo varek/v1_4/tests/v1340_apiserver.sh ASSETS [--out DIR]
 #
@@ -86,18 +90,20 @@ docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
 crds = {d["metadata"]["name"]: d for d in docs if d["kind"] == "CustomResourceDefinition"}
 json.dump(crds["varekpolicies.varek.dev"], open(sys.argv[2] + "/crd.json", "w"))
 json.dump(crds["varekplans.varek.dev"], open(sys.argv[2] + "/crd-plan.json", "w"))       # v1.35 step 4c
+json.dump(crds["varekcredentials.varek.dev"], open(sys.argv[2] + "/crd-cred.json", "w"))  # v1.36 step 4
 vwc = [d for d in docs if d["kind"] == "ValidatingWebhookConfiguration"][0]
 for h in vwc["webhooks"]:
     path = h["clientConfig"]["service"]["path"]
     h["clientConfig"] = {"url": "https://127.0.0.1:18443" + path, "caBundle": sys.argv[3]}
 json.dump(vwc, open(sys.argv[2] + "/vwc.json", "w"))
 EOF
-crd() { K apply -f "$OUT/crd.json" -f "$OUT/crd-plan.json" &&
-        K wait --for condition=established crd/varekpolicies.varek.dev crd/varekplans.varek.dev --timeout=30s; }
-check "the chart's CRDs (VarekPolicy, and VarekPlan from v1.35) install and are established" crd
+crd() { K apply -f "$OUT/crd.json" -f "$OUT/crd-plan.json" -f "$OUT/crd-cred.json" &&
+        K wait --for condition=established crd/varekpolicies.varek.dev crd/varekplans.varek.dev \
+            crd/varekcredentials.varek.dev --timeout=30s; }
+check "the chart's CRDs (VarekPolicy, VarekPlan from v1.35, VarekCredential from v1.36) install and are established" crd
 vp() { python3 -c 'import json, sys; print(json.dumps({"apiVersion": "varek.dev/v1alpha1", "kind": "VarekPolicy",
     "metadata": {"name": sys.argv[1], "namespace": sys.argv[2]}, "spec": {"policy": sys.argv[3] + "\n"}}))' "$@"; }
-K create namespace team-a > /dev/null; K create namespace varek-system > /dev/null
+K create namespace team-a > /dev/null; K create namespace varek-system > /dev/null; K create namespace team-b > /dev/null
 K create namespace team-req > /dev/null; K label namespace team-req varek.dev/policy-required=true > /dev/null
 refused() {   # WHAT FILE PATTERN
     if K apply -f "$2" > "$2.out" 2>&1; then flunk "$1 (admitted)"
@@ -114,10 +120,11 @@ refused "a VarekPlan's name the node agent does not take: refused by its CRD's r
 echo "== 2. the webhook"
 echo admin-token > "$P/token"
 "$OUT/varek-admission" -warden "$HERE/warden" -tls-cert "$P/wh.crt" -tls-key "$P/wh.key" -listen 127.0.0.1:18443 \
-    -api https://127.0.0.1:6443 -api-token "$P/token" -api-ca "$P/apiserver.crt" > "$OUT/admission.log" 2>&1 &
+    -api https://127.0.0.1:6443 -api-token "$P/token" -api-ca "$P/apiserver.crt" \
+    -credentials-dir /var/lib/varek/credentials > "$OUT/admission.log" 2>&1 &
 PIDS="$PIDS $!"
 for _ in $(seq 50); do curl -sk https://127.0.0.1:18443/healthz | grep -q ok && break; sleep 0.2; done
-check "the chart's four hooks registered, pointed at the webhook" K apply -f "$OUT/vwc.json"
+check "the chart's five hooks registered, pointed at the webhook" K apply -f "$OUT/vwc.json"
 sleep 2
 vp broken team-a "allow pathh /tmp/" > "$OUT/vp-broken.json"
 refused "a policy the Warden does not load: refused, with its reason" "$OUT/vp-broken.json" "refuses this policy"
@@ -125,7 +132,30 @@ vp creds team-a 'require warden 1.28
 proxy on
 credential k from file:/etc/varek/creds/k
 allow host api.example.com:443' > "$OUT/vp-creds.json"
-refused "a policy with credentials: refused (not carried by the node agent yet)" "$OUT/vp-creds.json" "does not carry credentials"
+refused "a policy naming a credential no VarekCredential gives (D2): refused" "$OUT/vp-creds.json" "is given by no VarekCredential"
+# v1.36 step 4 (D1, D2): credentials given to namespaces
+vc() { python3 -c 'import json, sys; print(json.dumps({"apiVersion": "varek.dev/v1alpha1", "kind": "VarekCredential",
+    "metadata": {"name": sys.argv[1]}, "spec": {"credential": sys.argv[2], "source": sys.argv[3], "namespaces": sys.argv[4].split(",")}}))' "$@"; }
+CSRC=file:/var/lib/varek/credentials/gh/token
+vc outside gh file:/etc/varek/creds/k team-a > "$OUT/vc-outside.json"
+refused "a VarekCredential whose file: source is not under the chart's directory: refused" "$OUT/vc-outside.json" "the node agent's credentials directory"
+vc Bad_Name gh "$CSRC" team-a > "$OUT/vc-badname.json"
+refused "... a credential name the policies do not take: refused" "$OUT/vc-badname.json" "VarekCredential"
+vc gh gh "$CSRC" team-a > "$OUT/vc.json"
+check "a VarekCredential giving gh to team-a: admitted" K apply -f "$OUT/vc.json"
+CPOL="require warden 1.29
+proxy inspect
+credential gh from $CSRC
+allow path /work/
+allow exec /usr/bin/agent
+allow host api.example.com:443
+allow request GET https://api.example.com/x credential=gh header=X-K"
+vp cagent team-b "$CPOL" > "$OUT/vp-cagent-b.json"
+refused "a policy naming it in team-b, which it is not given to: refused" "$OUT/vp-cagent-b.json" "is not given to namespace team-b"
+vp cagent team-a "${CPOL/$CSRC/file:/var/lib/varek/credentials/other/token}" > "$OUT/vp-cagent-src.json"
+refused "a policy naming it from another source: refused" "$OUT/vp-cagent-src.json" "names another source than the policy"
+vp cagent team-a "$CPOL" > "$OUT/vp-cagent.json"
+check "a policy naming it in team-a: admitted" K apply -f "$OUT/vp-cagent.json"
 vp agent team-a 'require warden 1.29
 allow path /work/
 allow exec /usr/bin/agent' > "$OUT/vp-agent.json"
@@ -195,6 +225,7 @@ if K -n team-a annotate pod p14 --overwrite varek.dev/plan=other > "$OUT/p14-ann
     flunk "... its plan annotation changed after: refused (changed)"
 elif grep -q "varek.dev/plan annotation is set when the pod is created" "$OUT/p14-annotate.out"; then pass "... its plan annotation changed after: refused"
 else flunk "... its plan annotation changed after: refused ($(tail -1 "$OUT/p14-annotate.out"))"; fi
+pod p15 team-a cagent - > "$OUT/p15.json"; check "a pod naming the policy with the credential: admitted (v1.36)" K apply -f "$OUT/p15.json"
 pod p7 varek-system nosuch root > "$OUT/p7.json"; check "the chart's own namespace not checked" K apply -f "$OUT/p7.json"
 
 echo "== 3. the sync"
@@ -222,6 +253,14 @@ check "the files root's, 0644" sh -c "[ \"\$(stat -c '%u %a' '$OUT/pol/team-a/ag
 check "each plan written to POLICY_DIR/<namespace>/<name>.plan (v1.35)" waitfor "grep -qx 'action a file_open /work/x' '$OUT/pol/team-a/p1.plan'"
 K -n team-a delete pod p14 > /dev/null 2>&1; K -n team-a delete varekplan p1 > /dev/null
 check "... a plan's deletion, removed" waitfor "[ ! -e '$OUT/pol/team-a/p1.plan' ]"
+# v1.36 step 4 (D2): the cluster's VarekCredential resources, one list
+check "the cluster's credentials written to POLICY_DIR/.credentials (v1.36)" \
+    waitfor "grep -qx 'gh	team-a	$CSRC	gh' '$OUT/pol/.credentials'"
+vc gh gh "$CSRC" team-a,team-b > "$OUT/vc2.json"; K apply -f "$OUT/vc2.json" > /dev/null
+check "... a change, written again" waitfor "grep -qx 'gh	team-a,team-b	$CSRC	gh' '$OUT/pol/.credentials'"
+K delete varekcredential gh > /dev/null
+check "... a deletion, its line removed" waitfor "! grep -q '^gh	' '$OUT/pol/.credentials'"
+check "... root's, 0644" sh -c "[ \"\$(stat -c '%u %a' '$OUT/pol/.credentials')\" = '0 644' ]"
 sed 's/^/     nri: /' "$OUT/nri.log" | head -8
 
 echo

@@ -8,8 +8,8 @@
 #   1. the chart installs and its node agent, plugin, exporter and webhook
 #      are ready; the node's signing key and anchor given;
 #   2. the webhook (a real API server's calls): a VarekPolicy the Warden
-#      does not load, and one with what the node agent does not carry
-#      (credentials), refused at deploy with the Warden's reason; a policy
+#      does not load, and one naming a credential no VarekCredential gives,
+#      refused at deploy with the Warden's reason; a policy
 #      that loads accepted, and written to the node by the plugin's -sync;
 #      pods refused for a policy not in their namespace, a command by a
 #      relative path, a writable root under a policy that decides launches,
@@ -29,7 +29,14 @@
 #      under the new one; the policy deleted: removed from the node;
 #   6. the node agent's pods taken off the node: a pod naming the policy
 #      does not run (its unsupervised profile kept); they come back, and a
-#      new pod is supervised.
+#      new pod is supervised;
+#   7. credentials (v1.36 step 4, docs/security/v1.36-kubernetes-parity.md,
+#      D1, D2): a VarekCredential whose file: source is not under the
+#      chart's directory refused; one giving a Secret's key to team-a,
+#      written to the node by the plugin's -sync; a policy naming it refused
+#      in a namespace it is not given to; a pod naming it runs with the
+#      plugin's placeholder, never the value, which warden-secrets fetched
+#      on the node (run_start).
 #
 #   varek/v1_4/tests/v1340_kind.sh --image IMAGE [--out DIR] [--keep]
 #                                  [--node-image kindest/node:TAG]
@@ -166,6 +173,10 @@ kubectl create namespace "$NS" > /dev/null
 kubectl label namespace "$NS" pod-security.kubernetes.io/enforce=privileged > /dev/null
 kubectl -n "$NS" create secret generic varek-node-key --from-file=key="$OUT/node.key" \
     --from-file=key.pub="$OUT/node.key.pub" > /dev/null
+# section 7's credential: a value made here, in a Secret the chart mounts in
+# the node agent (credentials.secrets)
+CRED_VAL="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+kubectl -n "$NS" create secret generic varek-test-cred --from-literal=token="$CRED_VAL" > /dev/null
 # the chart's runtime (its default containerd): the node agent reads each
 # container's bundle from the runtime's state, mounted from the node (the
 # matrix's first CRI-O cells installed the default, mounted /run/containerd,
@@ -178,7 +189,7 @@ check "the chart installs, its pods ready (the node agent, the plugin, the expor
     helm install varek "$ROOT/packaging/helm/varek" -n "$NS" --wait --timeout 6m \
     --set image.repository="$REPO" --set image.tag="$TAG" --set image.pullPolicy=Never \
     --set signing.secretName=varek-node-key --set signing.checkpointEvery=8 --set anchor.enabled=true \
-    --set admission.replicas=1 --set runtime="$CHART_RT"
+    --set admission.replicas=1 --set runtime="$CHART_RT" --set 'credentials.secrets={varek-test-cred}'
 for _ in $(seq 60); do grep -q '^varek-nri: runtime' <(kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null) && break; sleep 2; done
 say "  plugin: $(kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null | grep -m1 '^varek-nri: runtime' || echo 'NOT registered')"
 check "the plugin registered with the node's runtime (NRI)" sh -c "kubectl -n '$NS' logs ds/varek-node -c plugin | grep -q '^varek-nri: runtime'"
@@ -267,7 +278,7 @@ vp creds 'require warden 1.28
 proxy on
 credential k from file:/etc/varek/creds/k
 allow host api.example.com:443' > "$OUT/vp-creds.json"
-refused "a VarekPolicy with credentials (not carried by the node agent yet): refused at deploy" "$OUT/vp-creds.json" "does not carry credentials"
+refused "a VarekPolicy naming a credential no VarekCredential gives (D2): refused at deploy" "$OUT/vp-creds.json" "is given by no VarekCredential"
 vp busybox "$POLICY" > "$OUT/vp-busybox.json"
 check "a VarekPolicy the Warden loads: admitted" kubectl apply -f "$OUT/vp-busybox.json"
 synced() { for _ in $(seq 30); do on_node cat /var/lib/varek/policies/team-a/busybox.policy 2> /dev/null | grep -qx "$1" && return 0; sleep 1; done; return 1; }
@@ -393,6 +404,62 @@ kubectl apply -f "$OUT/pod-a3.json" > /dev/null 2>&1
 ran pod-a3
 check "a new pod supervised by it, as before" sh -c \
     "grep -q '^varek-init: Landlock' '$OUT/pod-a3.log' && grep -q '^launch_denied: [1-9]' '$OUT/pod-a3.log'"
+
+echo "== 7. credentials (v1.36 step 4: D1, D2)"
+vc() {   # NAME CREDENTIAL SOURCE NAMESPACE: a VarekCredential
+    python3 -c 'import json, sys; print(json.dumps({"apiVersion": "varek.dev/v1alpha1", "kind": "VarekCredential",
+        "metadata": {"name": sys.argv[1]}, "spec": {"credential": sys.argv[2], "source": sys.argv[3], "namespaces": [sys.argv[4]]}}))' "$@"
+}
+CSRC=file:/var/lib/varek/credentials/varek-test-cred/token
+vc outside test_cred file:/etc/varek/creds/k team-a > "$OUT/vc-outside.json"
+refused "a VarekCredential whose file: source is not under the chart's directory: refused" "$OUT/vc-outside.json" "the node agent's credentials directory"
+vc varek-test-cred test_cred "$CSRC" team-a > "$OUT/vc.json"
+check "a VarekCredential giving a Secret's key to team-a: admitted" kubectl apply -f "$OUT/vc.json"
+check "... written to the node by the plugin's -sync (POLICY_DIR/.credentials)" sh -c \
+    "for i in \$(seq 30); do $NODE_EXEC cat /var/lib/varek/policies/.credentials 2>/dev/null | grep -qx 'test_cred	team-a	$CSRC	varek-test-cred' && exit 0; sleep 1; done; exit 1"
+CPOL="require warden 1.29
+proxy inspect
+credential test_cred from $CSRC
+${POLICY#*
+}
+allow host kubernetes.default.svc.cluster.local:443
+allow request GET https://kubernetes.default.svc.cluster.local/version credential=test_cred header=X-Varek-Test"
+kubectl create namespace team-b > /dev/null
+kubectl label namespace team-b pod-security.kubernetes.io/enforce=restricted > /dev/null
+vp creds "$CPOL" | sed 's/"team-a"/"team-b"/' > "$OUT/vp-creds-b.json"
+refused "a policy naming it in a namespace it is not given to (team-b): refused at deploy" "$OUT/vp-creds-b.json" "is not given to namespace team-b"
+vp creds "$CPOL" > "$OUT/vp-creds-a.json"
+check "a policy naming it in team-a: admitted, and written to the node" sh -c \
+    "kubectl apply -f '$OUT/vp-creds-a.json' && for i in \$(seq 30); do $NODE_EXEC grep -q '^credential test_cred' /var/lib/varek/policies/team-a/creds.policy 2>/dev/null && exit 0; sleep 1; done; exit 1"
+CHECK='echo "placeholder: ${VAREK_CRED_TEST_CRED:-none}"
+(exec /bin/true); echo "launch_allowed: $?"' pod pod-c team-a creds > "$OUT/pod-c.json"
+kubectl apply -f "$OUT/pod-c.json" > /dev/null 2>&1
+check "the pod naming it ran to its end" ran pod-c
+check "... supervised (the launcher first)" said pod-c '^varek-init: Landlock'
+PH="$(sed -n 's/^placeholder: //p' "$OUT/pod-c.log")"
+check "... its environment holds the plugin's placeholder (VAREK_CRED_TEST_CRED), not the value" sh -c \
+    "printf %s '$PH' | grep -Eqx 'varek_ph_test_cred_[A-Za-z0-9_-]{43}' && ! grep -qF -- '$CRED_VAL' '$OUT/pod-c.log' && grep -qx 'launch_allowed: 0' '$OUT/pod-c.log'"
+rm -rf "$OUT/streams7"
+if [ "$HOST" = 1 ]; then
+    sudo cp -a /var/log/varek "$OUT/streams7" && sudo chown -R "$(id -u):$(id -g)" "$OUT/streams7"
+else
+    docker cp "$N:/var/log/varek" "$OUT/streams7" > /dev/null 2>&1
+fi
+check "... run_start: fetched by warden-secrets on the node (its length), the placeholder's SHA-256 the pod's" \
+    python3 - "$OUT/streams7" "${#CRED_VAL}" "$(printf %s "$PH" | sha256sum | cut -c1-64)" <<'EOF'
+import glob, json, sys
+for p in sorted(glob.glob(sys.argv[1] + "/*.jsonl")):
+    for l in open(p):
+        if l.startswith("{"):
+            r = json.loads(l)
+            if r.get("event") == "run_start" and r.get("node", {}).get("pod", {}).get("name") == "pod-c":
+                c = r.get("credentials") or [{}]
+                sys.exit(0 if len(c) == 1 and c[0].get("name") == "test_cred" and c[0].get("length") == int(sys.argv[2])
+                         and c[0].get("placeholder_sha256") == sys.argv[3] else 1)
+            break
+sys.exit(1)
+EOF
+check "... the value in no stream on the node" sh -c "! grep -rqF -- '$CRED_VAL' '$OUT/streams7'"
 
 echo
 [ "$fail" = 0 ] && say "v1340_kind: PASS" || say "v1340_kind: FAIL"
