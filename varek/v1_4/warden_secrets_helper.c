@@ -1315,7 +1315,10 @@ static int drop_to(uid_t u, gid_t g) {
     if (setresgid(g, g, g) < 0 || setresuid(u, u, u) < 0) return -1;
     struct __user_cap_header_struct hdr = { .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0 };
     struct __user_cap_data_struct data[2];
+    /* v1.36 step 4: the inheritable set too, which a change of user leaves
+     * (CRI-O gives a privileged container one) */
     memset(data, 0, sizeof data);
+    if (syscall(SYS_capset, &hdr, data) != 0) return -1;
     if (syscall(SYS_capget, &hdr, data) != 0) return -1;
     for (int i = 0; i < 2; i++)
         if (data[i].effective || data[i].permitted || data[i].inheritable) { errno = EPERM; return -1; }

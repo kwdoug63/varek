@@ -167,6 +167,18 @@ else
         sh -c "grep -q 'credential c from aws-sm:.*: fetched, 17 bytes' '$OUT/imds.out' && grep -q 'key=ASIAROLEV1280 signature=ok' '$SD/requests.log'"
     run as "credential c from file:$T/k\n" --secrets-as 65530:65530
     check "with --secrets-as, the helper proves it runs as that user" has as "credential c from file:$T/k: fetched"
+    # v1.36 step 4: a Warden given inheritable capabilities (CRI-O gives a
+    # privileged container some): warden-secrets, the proxy and the agent
+    # each drop them too
+    if command -v setpriv > /dev/null; then
+        printf '#!/bin/sh\nexec setpriv --inh-caps +net_raw,+chown %s "$@"\n' "$WARDEN" > "$T/inh-warden"; chmod 755 "$T/inh-warden"
+        WARDEN="$T/inh-warden" run inh "credential c from file:$T/k\n" --run-as 65534:65534
+        check "v1.36: started with inheritable capabilities: the value fetched and held by the proxy, the agent run as its user" \
+            sh -c "grep -q 'credential c from file:$T/k: fetched' '$OUT/inh.out' && grep -q 'credentials: 1 held by the proxy' '$OUT/inh.out' &&
+                   ! grep -q 'cannot drop\|drop to its user failed' '$OUT/inh.out'"
+    else
+        skip "v1.36: started with inheritable capabilities (needs setpriv)"
+    fi
 
     # refusals
     refuse() { local d="$1" n="$2" w="$3"; if has "$n" "$w" && ! grep -qx 0 "$OUT/$n.rc"; then pass "refused: $d"; else flunk "refused: $d ($(grep -m1 'refusing\|credential' "$OUT/$n.out"))"; fi; }

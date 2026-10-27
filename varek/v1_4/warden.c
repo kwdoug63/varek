@@ -5077,7 +5077,8 @@ static int parse_run_as(const char *v, struct run_as *ra) {
 
 /* In the child, before the filter: no supplementary groups, an empty
  * capability bounding and ambient set, then the unprivileged user and group
- * (which clears the permitted and effective sets). Verified afterwards. */
+ * (which clears the permitted and effective sets), then an empty inheritable
+ * set. Verified afterwards. */
 static int drop_privileges(const struct run_as *ra) {
     if (setgroups(0, NULL) < 0) return -errno;
     for (int cap = 0; cap <= 63; cap++)
@@ -5087,7 +5088,10 @@ static int drop_privileges(const struct run_as *ra) {
     if (setresuid(ra->uid, ra->uid, ra->uid) < 0) return -errno;
     struct __user_cap_header_struct hdr = { .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0 };
     struct __user_cap_data_struct data[2];
+    /* v1.36 step 4: the inheritable set too, which a change of user leaves
+     * (CRI-O gives a privileged container one) */
     memset(data, 0, sizeof data);
+    if (syscall(SYS_capset, &hdr, data) != 0) return -errno;
     if (syscall(SYS_capget, &hdr, data) != 0) return -errno;
     for (int i = 0; i < 2; i++)
         if (data[i].effective || data[i].permitted || data[i].inheritable) return -EPERM;
