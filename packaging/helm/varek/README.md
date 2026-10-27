@@ -151,8 +151,7 @@ spec:
 and on the pod, beside `varek.dev/policy: agent`, `varek.dev/plan: summarize`.
 What the agent's own runtime reads as it starts is held too, so it is a
 step as well (`file_open /usr/ open=read` and the like).
-The webhook refuses a plan the Warden does not read, a step of a kind the node
-agent does not carry yet (`mcp_call`, `subagent`), a pod naming a plan not in its namespace, and a pod naming a plan
+The webhook refuses a plan the Warden does not read, a pod naming a plan not in its namespace, and a pod naming a plan
 whose policy does not say `require warden 1.35` (a node still on 1.34 during
 an upgrade would run it under its policy alone, not held; with that line it
 refuses the container). Like the policy's, a pod's `varek.dev/plan`
@@ -223,6 +222,26 @@ Helm installs a chart's CRDs only when it first installs the chart, so on an
 upgrade from 1.35 apply the new one by hand:
 `kubectl apply -f https://raw.githubusercontent.com/kwdoug63/varek/v1.36.0/packaging/helm/varek/crds/varekcredential.yaml`.
 
+## Sub-agents and confined MCP servers (from 1.36)
+
+A policy names sub-agents (`allow exec PATH subagent=NAME`) and confined MCP
+servers (`mcp server NAME exec PATH`) as on a host. The container's own
+control group (the runtime's) is the run's: the node agent makes each
+sub-agent's group below it from the node, and attributes each call by the
+calling process's group, so a sub-agent's calls, and those of everything it
+starts, are its own whatever it says. The pod gets no capability and nothing
+is delegated to it. A plan's `subagent` and `mcp_call` steps are decided as
+on a host (an `mcp_call` to a stdio server is UNKNOWN there too).
+
+Two refusals are the node's own: a sub-agent launched by the container's
+first process itself (`subagent_first_process`: that process stays in the
+container's group, so a process started in the container later, with
+`kubectl exec`, is not put in a sub-agent's), and a container running as
+root. A pod's network has none of the kernel's process events, so a
+sub-agent of the program its launcher runs is told from a failed launch by
+its memory layout, and refused where the node's layouts are not randomized
+(`kernel.randomize_va_space` not 2).
+
 ## Values
 
 | Value | Default | |
@@ -249,8 +268,8 @@ upgrade from 1.35 apply the new one by hand:
 
 ## What it does not do yet
 
-A policy with sub-agents or `require on-behalf-of` is refused by the webhook
-and at the container's start. The node agent does not carry them yet.
+A policy with `require on-behalf-of` is refused by the webhook and at the
+container's start. The node agent does not carry it yet.
 
 The node's signing key (`signing.secretName`) is one Secret, given to every
 node: a stream says which node wrote it (its `device`), but each node's key
