@@ -11,11 +11,23 @@ stage="$1"
 # Each try is held to five minutes: an install that stalls, printing nothing,
 # is tried again too (v1.36's matrix: the node image's build sat in this step
 # for 20 minutes in four of its runs, the same build taking one in the rest)
+# On AlmaLinux, a try that fails moves its repositories from the mirror list
+# to AlmaLinux's own server (the baseurl each repository file keeps
+# commented out), its packages still checked by AlmaLinux's key: v1.36's
+# arm64 runners were handed an aarch64 mirror that served an empty
+# repomd.xml at every try, and another that stalled.
+almalinux_primary() {
+    [ -f /etc/almalinux-release ] && [ ! -e /etc/yum.repos.d/.varek-primary ] || return 0
+    echo "deps.sh: AlmaLinux's repositories from repo.almalinux.org, not the mirror list" >&2
+    sed -i -e 's|^mirrorlist=|#mirrorlist=|' -e 's|^# *baseurl=|baseurl=|' /etc/yum.repos.d/almalinux-*.repo
+    : > /etc/yum.repos.d/.varek-primary
+}
 retry() {
     n=1
     until timeout 300 "$@"; do
         [ "$n" -lt 6 ] || return 1
         echo "deps.sh: $1 failed or stalled (try $n of 6); again in $((n * 15)) s, its metadata dropped" >&2
+        almalinux_primary
         "$1" clean all >/dev/null 2>&1 || true
         sleep $((n * 15))
         n=$((n + 1))
