@@ -1618,6 +1618,14 @@ static int node_launcher_exec(int notify_fd, const struct seccomp_notif *req, co
                               const char *bootstrap_path, bool by_fd) {
     char why[PATH_MAX + 160];
     if ((pid_t)req->pid != g_nr.pid) node_fail("a launch before the container's command, not by its init");
+    /* v1.36 step 6 (found by the sweep, once in 97 runs): the runtime's launch
+     * of /varek/init, let through, can be restarted by the kernel before it
+     * takes (a signal at its credential lock gives -ERESTARTNOINTR, and the
+     * runtime's init is Go, whose preemption signals it), and so is notified
+     * again. The process then still runs the runtime's init, not the
+     * launcher: no code of the container's, or of the launcher's, has run. It
+     * is the runtime's launch again, checked as the first was. */
+    if (g_nr.in_launcher && !node_runs_launcher((pid_t)req->pid)) g_nr.in_launcher = false;
     if (!g_nr.in_launcher) {
         if (by_fd || strcmp(a->target, NODE_LAUNCHER)) {
             snprintf(why, sizeof why, "before the launcher, the container's init launched \"%.*s\", not " NODE_LAUNCHER,
