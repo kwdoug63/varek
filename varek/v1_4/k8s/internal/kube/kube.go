@@ -5,7 +5,9 @@
 // D7): the VarekPolicy resource, read and watched through the API server with
 // the pod's service account, over HTTPS checked against the cluster's CA. No
 // client library: a list, a get and a watch are a few requests. v1.35 step
-// 4c (D11): and the VarekPlan resource, a pod's plan, the same way.
+// 4c (D11): and the VarekPlan resource, a pod's plan, the same way. v1.36
+// step 4 (D2): and the VarekCredential resource, cluster-scoped
+// (credentials.go).
 package kube
 
 import (
@@ -50,12 +52,17 @@ type Meta struct {
 }
 
 // Policy is a VarekPolicy: its text is the policy as written for the Warden;
-// or a VarekPlan (v1.35): its text is the plan, as written for the Warden
+// or a VarekPlan (v1.35): its text is the plan, as written for the Warden; or
+// a VarekCredential (v1.36): a credential's source and the namespaces given it
 type Policy struct {
 	Metadata Meta `json:"metadata"`
 	Spec     struct {
 		Policy string `json:"policy"`
 		Plan   string `json:"plan"`
+		// v1.36 step 4 (D2): a VarekCredential's
+		Credential string   `json:"credential"`
+		Source     string   `json:"source"`
+		Namespaces []string `json:"namespaces"`
 	} `json:"spec"`
 }
 

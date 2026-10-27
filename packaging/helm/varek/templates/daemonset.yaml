@@ -5,6 +5,8 @@
   to is; the plugin and the exporter hold no capability. */}}
 {{- $state := include "varek.state" . -}}
 {{- $dns := include "varek.dnsServer" . -}}
+{{- $conf := include "varek.secretsConf" . -}}
+{{- $cred := .Values.credentials -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -114,6 +116,14 @@ spec:
             - --anchor
             - {{ .Values.node.streams }}/{{ .Values.anchor.file }}
             {{- end }}
+            # v1.36 step 4 (D1): a file: source is under the chart's directory;
+            # warden-secrets' configuration for vault: and aws-sm:
+            - --node-credentials
+            - {{ $cred.dir }}
+            {{- if $conf }}
+            - --secrets-conf
+            - /etc/varek/secrets/secrets.conf
+            {{- end }}
             {{- range .Values.nodeAgent.extraArgs }}
             - {{ . | quote }}
             {{- end }}
@@ -132,6 +142,24 @@ spec:
             {{- if .Values.signing.secretName }}
             # a file, not the Secret volume's link (the Warden opens its key O_NOFOLLOW)
             - { name: key, mountPath: /etc/varek/node.key, subPath: key, readOnly: true }
+            {{- end }}
+            # v1.36 step 4 (D1): the credentials' Secrets, warden-secrets'
+            # configuration, and the tokens the DaemonSet signs in with (each
+            # a link into the volume's ..data, which warden-secrets follows)
+            {{- range $cred.secrets }}
+            - { name: {{ printf "cred-%s" . | trunc 63 | trimSuffix "-" }}, mountPath: {{ $cred.dir }}/{{ . }}, readOnly: true }
+            {{- end }}
+            {{- if $conf }}
+            - { name: secrets-conf, mountPath: /etc/varek/secrets, readOnly: true }
+            {{- end }}
+            {{- if $cred.vault.caSecret }}
+            - { name: vault-ca, mountPath: /etc/varek/vault-ca, readOnly: true }
+            {{- end }}
+            {{- if $cred.vault.kubernetesAuth.role }}
+            - { name: vault-token, mountPath: /var/run/varek/tokens/vault, readOnly: true }
+            {{- end }}
+            {{- if or $cred.aws.roleArn $cred.aws.podIdentity }}
+            - { name: aws-token, mountPath: /var/run/varek/tokens/aws, readOnly: true }
             {{- end }}
         - name: plugin
           image: {{ include "varek.image" . }}
@@ -234,4 +262,30 @@ spec:
           secret:
             secretName: {{ .Values.signing.secretName }}
             defaultMode: 0400
+        {{- end }}
+        {{- range $cred.secrets }}
+        - name: {{ printf "cred-%s" . | trunc 63 | trimSuffix "-" }}
+          secret: { secretName: {{ . }}, defaultMode: 0400 }
+        {{- end }}
+        {{- if $conf }}
+        - name: secrets-conf
+          secret: { secretName: {{ include "varek.nodeName" . }}-secrets-conf, defaultMode: 0400 }
+        {{- end }}
+        {{- if $cred.vault.caSecret }}
+        - name: vault-ca
+          secret: { secretName: {{ $cred.vault.caSecret }}, defaultMode: 0444, items: [{ key: ca.crt, path: ca.crt }] }
+        {{- end }}
+        {{- if $cred.vault.kubernetesAuth.role }}
+        - name: vault-token
+          projected:
+            defaultMode: 0400
+            sources:
+              - serviceAccountToken: { audience: {{ $cred.vault.kubernetesAuth.audience | quote }}, expirationSeconds: 3600, path: token }
+        {{- end }}
+        {{- if or $cred.aws.roleArn $cred.aws.podIdentity }}
+        - name: aws-token
+          projected:
+            defaultMode: 0400
+            sources:
+              - serviceAccountToken: { audience: {{ if $cred.aws.roleArn }}sts.amazonaws.com{{ else }}pods.eks.amazonaws.com{{ end }}, expirationSeconds: 86400, path: token }
         {{- end }}

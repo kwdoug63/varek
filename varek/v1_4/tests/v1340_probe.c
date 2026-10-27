@@ -27,6 +27,8 @@
 //   stub           the nameserver /etc/resolv.conf names (the stub's view)
 //   get_wild       WILD asked of that nameserver (A), then an HTTP GET to it
 // and with "hold", waiting 4 s after.
+// v1.36 step 4, with "env NAME": its value in the environment (env: VALUE,
+// or env: none), the placeholder the NRI plugin set.
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -206,6 +208,7 @@ int main(int argc, char **argv) {
         if (argc > 4) { struct timespec t = { 4, 0 }; nanosleep(&t, NULL); }
         return 0;
     }
+    if (argc > 2 && !strcmp(argv[1], "env")) { const char *v = getenv(argv[2]); printf("env: %s\n", v ? v : "none"); return 0; }
     if (argc > 1 && !strcmp(argv[1], "wait")) { printf("waiting\n"); fflush(stdout); for (;;) sleep(1); }
     if (argc > 1 && !strcmp(argv[1], "launch")) {
         setvbuf(stdout, NULL, _IONBF, 0);

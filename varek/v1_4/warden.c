@@ -837,8 +837,17 @@ struct node_run {
     struct sock_filter *bpf;    /* the Warden's own filter for the policy, compiled */
     unsigned nbpf;
     long   not_admitted;        /* calls it refuses, which the pod's filter notifies */
+    /* v1.36 step 4 (D1): the node agent's own network namespace, where
+     * warden-secrets is started (the stores are reached from the node, under
+     * the DaemonSet's identity); and the placeholders the NRI plugin put in
+     * the container's environment, VAREK_CRED_<NAME>=..., as the bundle's
+     * config.json gives them */
+    int    node_netns;
+    char   cred_env[64][160];
+    int    ncred_env;
+    bool   cred_env_over;       /* more VAREK_CRED_ entries than are kept, or one too long */
 };
-static struct node_run g_nr = { .notify_fd = -1, .pidfd = -1, .set_view = -1 };
+static struct node_run g_nr = { .notify_fd = -1, .pidfd = -1, .set_view = -1, .node_netns = -1 };
 static void node_run_start(FILE *f);
 static void node_fail(const char *why) __attribute__((noreturn));
 static bool node_launcher_open(int notify_fd, const struct seccomp_notif *req);
@@ -1873,8 +1882,8 @@ static plan_decision_t plan_step_decide(const struct warden_plan_ud *u, const pl
         else if (as && ver < 135) why = "an as= field needs `plan 1.35` as the plan's first line";
         else if (as && !(act.plan_psubj = plan_subject(u->policy, as, &why))) { }
         else if (newkind && ver < 135) why = "this kind of step needs `plan 1.35` as the plan's first line";
-        else if (newkind && g_nr.on)                                    /* v1.35 step 4c (D11) */
-            why = "the node agent does not carry this kind of step yet (v1.36)";
+        else if (newkind && g_nr.on && strcmp(a->kind, "credential"))  /* v1.35 step 4c (D11); v1.36 step 4 */
+            why = "the node agent does not carry this kind of step yet (v1.36: sub-agents and MCP calls)";
         else if (newkind && !strcmp(a->kind, "credential")) pd = plan_cred_decide(u->policy, a, &act, &why);
         else if (newkind && !strcmp(a->kind, "subagent")) pd = plan_subagent_decide(u, a, &act, &why);
         else if (newkind) {                                             /* mcp_call */
@@ -5068,7 +5077,8 @@ static int parse_run_as(const char *v, struct run_as *ra) {
 
 /* In the child, before the filter: no supplementary groups, an empty
  * capability bounding and ambient set, then the unprivileged user and group
- * (which clears the permitted and effective sets). Verified afterwards. */
+ * (which clears the permitted and effective sets), then an empty inheritable
+ * set. Verified afterwards. */
 static int drop_privileges(const struct run_as *ra) {
     if (setgroups(0, NULL) < 0) return -errno;
     for (int cap = 0; cap <= 63; cap++)
@@ -5078,7 +5088,10 @@ static int drop_privileges(const struct run_as *ra) {
     if (setresuid(ra->uid, ra->uid, ra->uid) < 0) return -errno;
     struct __user_cap_header_struct hdr = { .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0 };
     struct __user_cap_data_struct data[2];
+    /* v1.36 step 4: the inheritable set too, which a change of user leaves
+     * (CRI-O gives a privileged container one) */
     memset(data, 0, sizeof data);
+    if (syscall(SYS_capset, &hdr, data) != 0) return -errno;
     if (syscall(SYS_capget, &hdr, data) != 0) return -errno;
     for (int i = 0; i < 2; i++)
         if (data[i].effective || data[i].permitted || data[i].inheritable) return -EPERM;
@@ -5734,8 +5747,10 @@ static void usage(const char *argv0) {
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
         "       %s <policies dir | policy.txt> --node-agent <socket> --node-streams <dir>\n"
         "              [--node-launcher <varek-init>]   (v1.34: the node agent, one supervisor a container)\n"
+        "              [--node-credentials <dir>]   (v1.36: where a file: credential is)\n"
         "       %s <policy.txt> --oci-filter [--plan PLAN | --no-plan]   (v1.34: the policy's filter in OCI's form, for the\n"
         "              NRI plugin; v1.35: with the pod's plan, or for a pod that names none)\n"
+        "              [--credential-list FILE --pod-namespace NS]   (v1.36: the cluster's VarekCredential resources)\n"
         , argv0, argv0, argv0, argv0);
     fprintf(stderr,
         "\n"
@@ -5900,6 +5915,10 @@ int main(int argc, char **argv) {
     int sep_idx = -1;
     const char *node_sock = NULL, *node_streams = NULL;                     /* v1.34 step 2 */
     const char *node_launcher = NULL;                                       /* v1.34 step 3 */
+    /* v1.36 step 4 (D1, D2): the directory a file: store must be under (the
+     * chart's Secrets); --oci-filter's cluster list of VarekCredential
+     * resources and the pod's namespace */
+    const char *cred_list_arg = NULL, *pod_ns_arg = NULL;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) { sep_idx = i; break; }
@@ -5930,6 +5949,12 @@ int main(int argc, char **argv) {
             node_streams = argv[++i];
         } else if (strcmp(argv[i], "--node-launcher") == 0 && !node_launcher && i + 1 < argc) {   /* v1.34 step 3 */
             node_launcher = argv[++i];
+        } else if (strcmp(argv[i], "--node-credentials") == 0 && !g_node_creds_dir) {   /* v1.36 step 4 */
+            g_node_creds_dir = argv[++i];
+        } else if (strcmp(argv[i], "--credential-list") == 0 && !cred_list_arg) {
+            cred_list_arg = argv[++i];
+        } else if (strcmp(argv[i], "--pod-namespace") == 0 && !pod_ns_arg) {
+            pod_ns_arg = argv[++i];
         } else if (strcmp(argv[i], "--writable-exec") == 0) {            /* v1.27.1 */
             g_writable_exec = true;
         } else if (strcmp(argv[i], "--run-as") == 0 && !run_as_arg) {
@@ -6022,19 +6047,51 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[warden] --oci-filter: the plan %s: %s\n", plan_path, why);
             return 1;
         }
-        if (wd_oci_filter_write(stdout, op.v.open_as_agent ? WD_FILTER_CHANGES : 0, why, sizeof why) < 0 ||
-            fflush(stdout) != 0) {
-            fprintf(stderr, "[warden] --oci-filter: %s\n", why);
+        /* v1.36 step 4 (D2): a policy that names credentials, for the pod's
+         * namespace, against the cluster's VarekCredential list (the
+         * plugin's copy, or the webhook's from the API server) */
+        if (op.v.ncreds) {
+            char cw[700];
+            if (!cred_list_arg || !pod_ns_arg) {
+                fprintf(stderr, "[warden] --oci-filter: the policy names credentials: give --credential-list FILE "
+                        "--pod-namespace NS (the cluster's VarekCredential resources, the pod's namespace)\n");
+                return 1;
+            }
+            if (node_creds_given(&op, cred_list_arg, pod_ns_arg, false, cw, sizeof cw) < 0) {
+                fprintf(stderr, "[warden] --oci-filter: %s\n", cw);
+                return 1;
+            }
+        }
+        /* the filter, and v1.36: the credentials whose placeholders the plugin
+         * puts in the container's environment ("varekCredentials", beside the
+         * profile's own fields) */
+        char *fb = NULL;
+        size_t fl = 0;
+        FILE *ff = open_memstream(&fb, &fl);
+        if (!ff || wd_oci_filter_write(ff, op.v.open_as_agent ? WD_FILTER_CHANGES : 0, why, sizeof why) < 0 ||
+            fclose(ff) != 0) {
+            fprintf(stderr, "[warden] --oci-filter: %s\n", ff ? why : "out of memory");
+            free(fb);
             return 1;
         }
+        while (fl && (fb[fl - 1] == '\n' || fb[fl - 1] == ' ')) fl--;
+        if (!fl || fb[fl - 1] != '}') { fprintf(stderr, "[warden] --oci-filter: the filter is not one object\n"); free(fb); return 1; }
+        fwrite(fb, 1, fl - 1, stdout);
+        free(fb);
+        fputs(",\"varekCredentials\":[", stdout);
+        for (size_t k = 0; k < op.v.ncreds; k++) printf("%s\"%s\"", k ? "," : "", op.v.creds[k].name);
+        fputs("]}\n", stdout);
+        if (fflush(stdout) != 0) { fprintf(stderr, "[warden] --oci-filter: cannot write the filter\n"); return 1; }
         return 0;
     }
     if ((node_sock && (sep_idx >= 0 || g_check_only || !node_streams || g_writable_exec || plan_path ||
                        flow_path || g_hold_req)) ||
-        (node_launcher && !node_sock) || (oci_no_plan && !oci_only)) {     /* v1.34 step 2 */
+        (node_launcher && !node_sock) || (oci_no_plan && !oci_only) ||    /* v1.34 step 2 */
+        (g_node_creds_dir && !node_sock) || ((cred_list_arg || pod_ns_arg) && !oci_only)) {   /* v1.36 step 4 */
         fprintf(stderr, "[warden] --node-agent takes --node-streams DIR, and no agent (\"--\"), check, plan (each "
                 "pod names its own, v1.35) or --writable-exec (a pod's mounts are checked, D4); --node-launcher "
-                "goes with --node-agent, --no-plan with --oci-filter\n");
+                "goes with --node-agent, --no-plan with --oci-filter; v1.36: --node-credentials goes with --node-agent, "
+                "--credential-list and --pod-namespace with --oci-filter\n");
         return 2;
     }
     if (node_sock && node_listen(node_sock, node_streams, node_launcher, &policy_path, &plan_path) < 0) return 1;
@@ -6243,7 +6300,7 @@ int main(int argc, char **argv) {
     if (p.v.proxy && geteuid() == 0) {
         if (wp_start(&g_proxy, proxy_fd, pxa.uid, pxa.gid) < 0) {
             fprintf(stderr, "[warden] cannot start the egress proxy (%s); refusing to start\n",
-                    strerror(errno));
+                    g_proxy.why[0] ? g_proxy.why : strerror(errno));
             if (g_sk) sodium_free(g_sk);
             return 1;
         }
@@ -6292,6 +6349,13 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (access(b, F_OK) == 0 && refuse_secret_reachable(&p, b, true) < 0) return 1;
+    }
+    /* v1.36 step 4 (D1, D2): under the node agent, each credential given to
+     * the pod's namespace, a file: store under the chart's directory, and the
+     * placeholders the NRI plugin set, before warden-secrets starts */
+    if (g_nr.on && p.v.ncreds) {
+        char why[800];
+        if (node_creds_check(&p, g_cred_ph, why, sizeof why) < 0) node_fail(why);
     }
     if (p.v.ncreds || obo_arg || svid_arg) {
         static const char *const kStore[] = { "", "file", "vault", "aws-sm" };
@@ -6348,9 +6412,16 @@ int main(int argc, char **argv) {
                 return 1;
             }
             fprintf(stderr, "[warden] credentials' helper %s, SHA-256 %s\n", sb, g_secrets_sha);
-            if (ws_start(&g_secrets, sfd, sca.uid, sca.gid) < 0) {
+            /* v1.36 step 4 (D1): under the node agent, in the node agent's own
+             * network namespace (the stores reached from the node, as the
+             * DaemonSet); the supervisor then returns to the pod's */
+            if (g_nr.on && setns(g_nr.node_netns, CLONE_NEWNET) < 0) node_fail("cannot return to the node's network namespace");
+            int wsr = ws_start(&g_secrets, sfd, sca.uid, sca.gid), wse = errno;
+            if (g_nr.on && node_enter(CLONE_NEWNET) < 0) node_fail("cannot enter the container's network namespace again");
+            if (g_nr.on) { close(g_nr.node_netns); g_nr.node_netns = -1; }
+            if (wsr < 0) {
                 close(sfd);
-                fprintf(stderr, "[warden] cannot start warden-secrets (%s); refusing to start\n", strerror(errno));
+                fprintf(stderr, "[warden] cannot start warden-secrets (%s); refusing to start\n", strerror(wse));
                 return 1;
             }
             close(sfd);
@@ -6389,6 +6460,10 @@ int main(int argc, char **argv) {
             /* every local file the helper read, whatever came of it: the
              * agent must not be able to open one (v1.28.1: a trust bundle,
              * to write one) */
+            /* v1.36 step 4: under the node agent these are the node agent's
+             * own files (its pod's mounts, root's, readable by no other user),
+             * which a container (never root, no capability) does not reach;
+             * a policy that names one by its path is refused all the same */
             for (size_t k = 0; k < nfiles; k++) {
                 char real[PATH_MAX];
                 const char *f = realpath(files[k], real) ? real : files[k];
@@ -6487,6 +6562,13 @@ int main(int argc, char **argv) {
                 for (size_t k = 0; k < p.v.ncreds; k++) {
                     unsigned char rnd[32], dg[32];
                     char b64[64], env[48];
+                    if (g_nr.on) {
+                        /* v1.36 step 4: the NRI plugin's, in the container's
+                         * environment already (node_creds_check) */
+                        crypto_hash_sha256(dg, (const unsigned char *)g_cred_ph[k], strlen(g_cred_ph[k]));
+                        sodium_bin2hex(g_cred_ph_sha[k], sizeof g_cred_ph_sha[k], dg, sizeof dg);
+                        continue;
+                    }
                     randombytes_buf(rnd, sizeof rnd);
                     sodium_bin2base64(b64, sizeof b64, rnd, sizeof rnd, sodium_base64_VARIANT_URLSAFE_NO_PADDING);
                     snprintf(g_cred_ph[k], sizeof g_cred_ph[k], "varek_ph_%s_%s", p.v.creds[k].name, b64);

@@ -241,8 +241,12 @@ else
     rm -rf "$W"; mkdir -p "$W"; chmod 755 "$W"
     cp "$T/v1250_client.py" "$T/v1250_client.js" "$T/v1250_stall.py" "$W/"
     chmod 644 "$W"/*
-    PORT=$((20000 + RANDOM % 20000))
-    HP=$((40000 + RANDOM % 5000))
+    # v1.36 step 4: the stand-ins' ports below 32768, out of the kernel's
+    # ephemeral range (32768-60999 by default), where a client socket of the
+    # host's own could hold the drawn port (the matrix's VMs: "Address already
+    # in use"); the DNS server's 20000-25999, the HTTP server's 26000-31999
+    PORT=$((20000 + RANDOM % 6000))
+    HP=$((26000 + RANDOM % 6000))
     # v1.24 review: a name never leads to loopback, so the names here resolve
     # to this machine's own address (private or public)
     HOSTIP=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("10.255.255.255", 1)); print(s.getsockname()[0])')
@@ -259,19 +263,30 @@ else
     # reverse DNS query) between bind and listen. In the matrix's VMs, behind
     # qemu's DNS, every connect to it was refused in some runs, as though nothing
     # listened; a slow answer to that query is the likely cause
-    python3 -c 'import http.server, socketserver, sys
+    http_start() {
+        python3 -c 'import http.server, socketserver, sys
 class S(socketserver.ThreadingTCPServer): allow_reuse_address = True; daemon_threads = True
-S(("0.0.0.0", int(sys.argv[1])), http.server.SimpleHTTPRequestHandler).serve_forever()' "$HP" > /dev/null 2>&1 &
-    SERVERS="$SERVERS $!"
+S(("0.0.0.0", int(sys.argv[1])), http.server.SimpleHTTPRequestHandler).serve_forever()' "$HP" > /dev/null 2>> "$OUT/http.err" &
+        HTTPPID=$!
+        SERVERS="$SERVERS $HTTPPID"
+    }
+    : > "$OUT/http.err"
+    http_start
     trap 'kill $SERVERS 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$OUT"; rm -rf "$W"' EXIT
     # v1.35 step 8: up to 30 s (under a loaded sweep the HTTP server took more than the 5 s this
-    # waited, and every connect after was refused), and said when it never answered
+    # waited, and every connect after was refused), and said when it never answered.
+    # v1.36 step 4: a server that ended (its port taken) is started again on
+    # another, its error kept
     up=0
     for _ in $(seq 300); do
         [ -e "$OUT/ready" ] && python3 -c "import socket; socket.create_connection(('$HOSTIP', $HP), 0.2)" 2>/dev/null && { up=1; break; }
+        if ! kill -0 "$HTTPPID" 2>/dev/null; then HP=$((26000 + RANDOM % 6000)); http_start; fi
         sleep 0.1
     done
-    [ "$up" = 1 ] || echo "  NOTE   the DNS or HTTP test server did not answer within 30 s: the connects below will fail"
+    if [ "$up" != 1 ]; then
+        echo "  NOTE   the DNS or HTTP test server did not answer within 30 s: the connects below will fail"
+        tail -3 "$OUT/http.err" | sed 's/^/     http: /'
+    fi
     NODE=$(readlink -f "$(command -v node 2>/dev/null)" 2>/dev/null)
     JAVA=$(ls /usr/lib/jvm/java-21-openjdk-*/bin/java 2>/dev/null | head -1)
     [ -n "$JAVA" ] || JAVA=$(readlink -f "$(command -v java 2>/dev/null)" 2>/dev/null)

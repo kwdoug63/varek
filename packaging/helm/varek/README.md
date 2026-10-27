@@ -16,6 +16,9 @@ the container does not start. The chart installs:
   for the Warden, kept in the pod's namespace;
 - **the `VarekPlan` resource** (from 1.35), a plan as written for the Warden,
   kept in the pod's namespace beside its policy;
+- **the `VarekCredential` resource** (from 1.36), cluster-scoped: a credential
+  a policy names, given from one source to the namespaces whose policies may
+  name it;
 - **the admission webhook** (`varek-admission`), which refuses a policy the
   Warden does not load, and most of what the node agent would refuse at a
   container's start (the rest fails at the start).
@@ -149,8 +152,7 @@ and on the pod, beside `varek.dev/policy: agent`, `varek.dev/plan: summarize`.
 What the agent's own runtime reads as it starts is held too, so it is a
 step as well (`file_open /usr/ open=read` and the like).
 The webhook refuses a plan the Warden does not read, a step of a kind the node
-agent does not carry yet (`mcp_call`, `subagent`, `credential`: planned for
-1.36), a pod naming a plan not in its namespace, and a pod naming a plan
+agent does not carry yet (`mcp_call`, `subagent`), a pod naming a plan not in its namespace, and a pod naming a plan
 whose policy does not say `require warden 1.35` (a node still on 1.34 during
 an upgrade would run it under its policy alone, not held; with that line it
 refuses the container). Like the policy's, a pod's `varek.dev/plan`
@@ -165,6 +167,61 @@ first record names the plan it was held to by its SHA-256
 Helm installs a chart's CRDs only when it first installs the chart, so on an
 upgrade from 1.34 apply the new one by hand:
 `kubectl apply -f https://raw.githubusercontent.com/kwdoug63/varek/v1.35.0/packaging/helm/varek/crds/varekplan.yaml`.
+
+## Credentials (from 1.36)
+
+A policy names a credential as on a host (`credential gh_token from
+file:/var/lib/varek/credentials/gh-token/token`, then `credential=gh_token
+header=Authorization` on a request rule). On a node, the node agent fetches
+its value with warden-secrets, in the node agent's own network and under the
+DaemonSet's identity, and hands it to the proxy in the pod's network. The
+agent's pod never holds it: the plugin sets a placeholder
+(`VAREK_CRED_GH_TOKEN=varek_ph_gh_token_...`), new for each container, which
+the proxy replaces on the requests the policy names.
+
+A cluster administrator gives each credential to namespaces:
+
+```yaml
+apiVersion: varek.dev/v1alpha1
+kind: VarekCredential
+metadata:
+  name: gh-token
+spec:
+  credential: gh_token
+  source: file:/var/lib/varek/credentials/gh-token/token
+  namespaces: [agents]
+```
+
+A pod runs only where a `VarekCredential` gives each credential its policy
+names, from the policy's source, to the pod's namespace: the webhook refuses
+the pod otherwise, and the node agent refuses the container at its start
+(from the list the plugin writes on each node, `POLICY_DIR/.credentials`).
+The webhook also refuses a `VarekCredential` whose `file:` source is not
+under `credentials.dir`. Whoever may write `varekcredentials` decides which
+namespaces' agents may use which values; whoever may write a namespace's
+`varekpolicies` decides which requests carry them.
+
+The sources:
+
+- **`file:`**: a key of a Secret of the chart's namespace, named in
+  `credentials.secrets`, mounted in the node agent at
+  `credentials.dir/<secret>/<key>` (root's, 0400);
+- **`vault:`**: `credentials.vault.addr`, with Vault's Kubernetes auth
+  (`kubernetesAuth.role`): the node agent's service account's token, which
+  the kubelet projects with audience `kubernetesAuth.audience`, logs in as
+  that role; `caSecret` names a Secret with `ca.crt` to verify Vault with;
+- **`aws-sm:`**: IRSA (`credentials.aws.roleArn`: that role, assumed with a
+  projected token of audience `sts.amazonaws.com`), or EKS Pod Identity
+  (`credentials.aws.podIdentity`: the role associated with the node agent's
+  service account, from the node's Pod Identity agent), or neither: the
+  node's instance role (IMDSv2).
+
+The chart writes warden-secrets' configuration from these values (a Secret,
+`<release>-node-secrets-conf`). It holds no token or key.
+
+Helm installs a chart's CRDs only when it first installs the chart, so on an
+upgrade from 1.35 apply the new one by hand:
+`kubectl apply -f https://raw.githubusercontent.com/kwdoug63/varek/v1.36.0/packaging/helm/varek/crds/varekcredential.yaml`.
 
 ## Values
 
@@ -186,12 +243,14 @@ upgrade from 1.34 apply the new one by hand:
 | `admission.runtimeClasses` | `[]` | RuntimeClass names a supervised pod may give: ones whose handler is in `nri.runtimeHandlers` |
 | `admission.tls.*` | the chart's own CA | or a `kubernetes.io/tls` Secret (`secretName`, with its `ca.crt` or `caBundle`), or cert-manager (`certManager.enabled`, `issuerName`) |
 | `openshift.enabled` | `false` | the SecurityContextConstraints for the node agent |
+| `credentials.dir`, `credentials.secrets` | `/var/lib/varek/credentials`, `[]` | where a `file:` source is, and the Secrets mounted there |
+| `credentials.vault.*` | `addr: ""`, `caSecret: ""`, `kubernetesAuth: {role: "", mount: kubernetes, audience: vault}` | `vault:` sources, signed in to with the node agent's service account |
+| `credentials.aws.*` | `region: ""`, `roleArn: ""`, `podIdentity: false` | `aws-sm:` sources: IRSA, EKS Pod Identity, or the node's instance role |
 
 ## What it does not do yet
 
-A policy with credentials, sub-agents or `require on-behalf-of` is refused by
-the webhook and at the container's start. The node agent does not carry
-them yet.
+A policy with sub-agents or `require on-behalf-of` is refused by the webhook
+and at the container's start. The node agent does not carry them yet.
 
 The node's signing key (`signing.secretName`) is one Secret, given to every
 node: a stream says which node wrote it (its `device`), but each node's key

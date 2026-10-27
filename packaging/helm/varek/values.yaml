@@ -74,6 +74,39 @@ anchor:
   enabled: false
   file: anchor
 
+# v1.36 step 4 (docs/security/v1.36-kubernetes-parity.md, D1, D2): credentials.
+# A policy names a credential (credential NAME from SOURCE); a cluster
+# administrator gives it, from that source, to the namespaces whose policies
+# may name it, with a VarekCredential (cluster-scoped). The node agent fetches
+# each value with warden-secrets on the node, under the DaemonSet's identity,
+# and hands it to the proxy in the pod's network; the agent's pod holds only
+# a placeholder (VAREK_CRED_<NAME>), which the NRI plugin sets.
+credentials:
+  # where a file: source is: each Secret named below (of this release's
+  # namespace) is mounted at DIR/<secret>/<key>, root's, 0400
+  dir: /var/lib/varek/credentials
+  secrets: []
+  # vault: sources
+  vault:
+    addr: ""              # https://vault.example.com:8200
+    caSecret: ""          # a Secret of this namespace with ca.crt to verify Vault with (else the image's trust store)
+    # Vault's Kubernetes auth: the node agent's service account's token, which
+    # the kubelet projects (this audience), logs in as this role
+    kubernetesAuth:
+      role: ""
+      mount: kubernetes
+      audience: vault
+  # aws-sm: sources
+  aws:
+    region: ""            # else the secret ARN's
+    # IRSA: this role, assumed with a token the kubelet projects (audience
+    # sts.amazonaws.com) for the node agent's service account
+    roleArn: ""
+    # or EKS Pod Identity: the role associated with the node agent's service
+    # account, from the node's Pod Identity agent (audience pods.eks.amazonaws.com)
+    podIdentity: false
+    # neither: the node's instance role (IMDSv2)
+
 # D8: the streams exported as OCSF to the DaemonSet's log, which the
 # cluster's log collector takes (tools/varek_node_export.py)
 exporter:

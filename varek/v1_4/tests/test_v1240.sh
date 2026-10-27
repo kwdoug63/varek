@@ -121,7 +121,11 @@ else
 fi
 
 echo "== 2. the resolution table =="
-PORT=$((20000 + RANDOM % 20000))
+# v1.36 step 4: the stand-ins' ports below 32768, out of the kernel's
+# ephemeral range (32768-60999 by default), where a client socket of the
+# host's own could hold the drawn port (the matrix's VMs: "Address already
+# in use"); the DNS server's 20000-25999, the HTTP server's 26000-31999
+PORT=$((20000 + RANDOM % 6000))
 echo '{}' > "$OUT/zone.json"
 python3 "$T/dns_test_server.py" --port "$PORT" --zone "$OUT/zone.json" --log "$OUT/q.log" \
     --ready "$OUT/ready" > "$OUT/dns.out" 2>&1 &
@@ -197,7 +201,7 @@ else
     rm -rf "$W"; mkdir -p "$W"; chmod 755 "$W"
     cp "$T/v1240_client.py" "$T/v1240_client.js" "$W/"
     chmod 644 "$W"/*
-    HP=$((20000 + RANDOM % 20000))
+    HP=$((26000 + RANDOM % 6000))
     # v1.24 review: a name never leads to a loopback, link-local, unspecified
     # or multicast address (only a numeric rule reaches one), so the names
     # here resolve to this machine's own address (private or public).

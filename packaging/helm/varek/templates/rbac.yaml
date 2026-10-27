@@ -1,8 +1,10 @@
 {{/* SPDX-License-Identifier: MIT
   The node's plugin lists and watches every namespace's VarekPolicy and
-  VarekPlan (-sync; plans from v1.35); the webhook reads a pod's. Neither may
-  change one. */}}
-{{- range $who := list (dict "name" (include "varek.nodeName" .) "verbs" (list "get" "list" "watch")) (dict "name" (include "varek.admissionName" .) "verbs" (list "get")) }}
+  VarekPlan (-sync; plans from v1.35) and the cluster's VarekCredential
+  resources (v1.36); the webhook reads a pod's policy and plan, and lists the
+  VarekCredential resources to check a policy that names credentials. Neither
+  may change one. */}}
+{{- range $who := list (dict "name" (include "varek.nodeName" .) "verbs" (list "get" "list" "watch") "credVerbs" (list "get" "list" "watch")) (dict "name" (include "varek.admissionName" .) "verbs" (list "get") "credVerbs" (list "list")) }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -19,6 +21,9 @@ rules:
   - apiGroups: ["varek.dev"]
     resources: ["varekpolicies", "varekplans"]
     verbs: {{ toJson $who.verbs }}
+  - apiGroups: ["varek.dev"]
+    resources: ["varekcredentials"]
+    verbs: {{ toJson $who.credVerbs }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

@@ -95,7 +95,7 @@ def test_lint_strict():
 def test_the_default_render():
     docs = render()
     assert kinds(docs) == ["ClusterRole", "ClusterRole", "ClusterRoleBinding", "ClusterRoleBinding",
-                           "CustomResourceDefinition", "CustomResourceDefinition", "DaemonSet", "Deployment", "PodDisruptionBudget", "Secret",
+                           "CustomResourceDefinition", "CustomResourceDefinition", "CustomResourceDefinition", "DaemonSet", "Deployment", "PodDisruptionBudget", "Secret",
                            "Service", "ServiceAccount", "ServiceAccount", "ValidatingWebhookConfiguration"]
     for d in docs:
         if d["kind"] not in ("CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
@@ -244,7 +244,8 @@ def test_the_webhook():
     docs = render("admission.excludeNamespaces={kube-system,monitoring}")
     vwc = one(docs, "ValidatingWebhookConfiguration")
     hooks = {h["name"]: h for h in vwc["webhooks"]}
-    assert set(hooks) == {"varekpolicy.varek.dev", "varekplan.varek.dev", "pod.varek.dev", "pod-required.varek.dev"}
+    assert set(hooks) == {"varekpolicy.varek.dev", "varekplan.varek.dev", "varekcredential.varek.dev",
+                          "pod.varek.dev", "pod-required.varek.dev"}
     secret = one(docs, "Secret")
     assert secret["type"] == "kubernetes.io/tls"
     svc = one(docs, "Service")
@@ -260,6 +261,11 @@ def test_the_webhook():
     assert hooks["varekplan.varek.dev"]["rules"] == [{"apiGroups": ["varek.dev"], "apiVersions": ["v1alpha1"],
                                                        "operations": ["CREATE", "UPDATE"], "resources": ["varekplans"]}]
     assert "namespaceSelector" not in hooks["varekplan.varek.dev"]
+    # v1.36 step 4 (D2): the credentials, cluster-scoped, each checked
+    assert hooks["varekcredential.varek.dev"]["rules"] == [{"apiGroups": ["varek.dev"], "apiVersions": ["v1alpha1"],
+                                                            "operations": ["CREATE", "UPDATE"],
+                                                            "resources": ["varekcredentials"]}]
+    assert "namespaceSelector" not in hooks["varekcredential.varek.dev"]
     for name in ("pod.varek.dev", "pod-required.varek.dev"):
         # G-3: an update is sent too (the annotation is not changed)
         assert hooks[name]["rules"][0]["operations"] == ["CREATE", "UPDATE"]
@@ -331,8 +337,12 @@ def test_rbac_reads_only():
     docs = render()
     rules = {d["metadata"]["name"]: d["rules"] for d in docs if d["kind"] == "ClusterRole"}
     res = ["varekpolicies", "varekplans"]                    # v1.35 step 4c: the plans too
-    assert rules == {"t-node": [{"apiGroups": ["varek.dev"], "resources": res, "verbs": ["get", "list", "watch"]}],
-                     "t-admission": [{"apiGroups": ["varek.dev"], "resources": res, "verbs": ["get"]}]}
+    # v1.36 step 4 (D2): the node lists and watches the credentials; the webhook lists them
+    cred = ["varekcredentials"]
+    assert rules == {"t-node": [{"apiGroups": ["varek.dev"], "resources": res, "verbs": ["get", "list", "watch"]},
+                                {"apiGroups": ["varek.dev"], "resources": cred, "verbs": ["get", "list", "watch"]}],
+                     "t-admission": [{"apiGroups": ["varek.dev"], "resources": res, "verbs": ["get"]},
+                                     {"apiGroups": ["varek.dev"], "resources": cred, "verbs": ["list"]}]}
     for b in (d for d in docs if d["kind"] == "ClusterRoleBinding"):
         assert b["subjects"] == [{"kind": "ServiceAccount", "name": b["roleRef"]["name"], "namespace": NS}]
     assert pod(docs, "DaemonSet")["serviceAccountName"] == "t-node"
@@ -386,6 +396,94 @@ def test_the_crd_names_what_the_node_agent_takes():
         assert f"matches('{go}')" in rule, (rule, go)
         spec = v["schema"]["openAPIV3Schema"]["properties"]["spec"]
         assert spec["required"] == [field] and spec["properties"][field]["type"] == "string"
+
+
+def _conf(docs):
+    """warden-secrets' configuration the chart writes, as key = value"""
+    text = one(docs, "Secret", "t-node-secrets-conf")["stringData"]["secrets.conf"]
+    return dict(l.split(" = ", 1) for l in text.splitlines() if l and not l.startswith("#"))
+
+
+def test_credentials():
+    """v1.36 step 4 (D1, D2): a file: source under the node agent's directory,
+    each Secret there; warden-secrets' configuration for vault: and aws-sm:,
+    each sign-in's token the kubelet projects for the node agent"""
+    docs = render()
+    spec = pod(docs, "DaemonSet")
+    agent = ctr(spec, "node-agent")
+    assert arg(agent, "--node-credentials") == "/var/lib/varek/credentials"
+    assert "--secrets-conf" not in agent["command"]
+    assert "t-node-secrets-conf" not in {d["metadata"]["name"] for d in docs if d["kind"] == "Secret"}
+    # the webhook names a file: source by the node agent's directory
+    assert arg(ctr(pod(docs, "Deployment"), "admission"), "-credentials-dir") == "/var/lib/varek/credentials"
+
+    docs = render("credentials.secrets={gh-token,db}", "credentials.vault.addr=https://vault:8200",
+                  "credentials.vault.caSecret=vca", "credentials.vault.kubernetesAuth.role=agents",
+                  "credentials.aws.region=us-east-2", "credentials.aws.roleArn=arn:aws:iam::1:role/r")
+    spec = pod(docs, "DaemonSet")
+    agent, m, v = ctr(spec, "node-agent"), mounts(ctr(spec, "node-agent")), volumes(spec)
+    for s in ("gh-token", "db"):
+        mp = m[f"/var/lib/varek/credentials/{s}"]
+        assert mp["readOnly"] and v[mp["name"]]["secret"] == {"secretName": s, "defaultMode": 0o400}
+    conf = arg(agent, "--secrets-conf")
+    assert conf == "/etc/varek/secrets/secrets.conf"
+    assert v[m[os.path.dirname(conf)]["name"]]["secret"] == {"secretName": "t-node-secrets-conf", "defaultMode": 0o400}
+    c = _conf(docs)
+    assert c == {"vault_addr": "https://vault:8200", "vault_ca": "/etc/varek/vault-ca/ca.crt",
+                 "vault_k8s_role": "agents", "vault_k8s_jwt_file": "/var/run/varek/tokens/vault/token",
+                 "vault_k8s_mount": "kubernetes", "aws_region": "us-east-2",
+                 "aws_role_arn": "arn:aws:iam::1:role/r",
+                 "aws_web_identity_token_file": "/var/run/varek/tokens/aws/token"}
+    # each key is one warden-secrets reads
+    helper = open(os.path.join(ROOT, "varek", "v1_4", "warden_secrets_helper.c")).read()
+    assert set(c) <= set(re.findall(r"\bK\((\w+)\)", helper)), set(c) - set(re.findall(r"\bK\((\w+)\)", helper))
+    # each file it names is on a mount: the CA, and each token, projected with its audience
+    assert v[m["/etc/varek/vault-ca"]["name"]]["secret"]["secretName"] == "vca"
+    for key, aud in (("vault_k8s_jwt_file", "vault"), ("aws_web_identity_token_file", "sts.amazonaws.com")):
+        vol = v[m[os.path.dirname(c[key])]["name"]]["projected"]
+        assert vol["defaultMode"] == 0o400
+        assert vol["sources"] == [{"serviceAccountToken": {"audience": aud, "expirationSeconds": vol["sources"][0]["serviceAccountToken"]["expirationSeconds"],
+                                                           "path": os.path.basename(c[key])}}]
+    # OpenShift admits each of these volumes
+    sdocs = render("openshift.enabled=true", "runtime=cri-o", "credentials.secrets={gh-token}",
+                   "credentials.vault.addr=https://vault:8200", "credentials.vault.kubernetesAuth.role=agents")
+    used = {next(k for k in x if k != "name") for x in pod(sdocs, "DaemonSet")["volumes"]}
+    assert used <= set(one(sdocs, "SecurityContextConstraints", "t-node")["volumes"])
+
+    # EKS Pod Identity: the node's agent, with the token its audience names
+    docs = render("credentials.aws.podIdentity=true")
+    c = _conf(docs)
+    assert c == {"aws_container_credentials_uri": "http://169.254.170.23/v1/credentials",
+                 "aws_container_token_file": "/var/run/varek/tokens/aws/token"}
+    spec = pod(docs, "DaemonSet")
+    vol = volumes(spec)[mounts(ctr(spec, "node-agent"))["/var/run/varek/tokens/aws"]["name"]]
+    assert vol["projected"]["sources"][0]["serviceAccountToken"]["audience"] == "pods.eks.amazonaws.com"
+    # the node's instance role: a region alone, and no token
+    docs = render("credentials.aws.region=us-east-2")
+    assert _conf(docs) == {"aws_region": "us-east-2"}
+    assert "/var/run/varek/tokens/aws" not in mounts(ctr(pod(docs, "DaemonSet"), "node-agent"))
+
+    for sets, why in ((("credentials.aws.roleArn=arn:aws:iam::1:role/r", "credentials.aws.podIdentity=true"), "not both"),
+                      (("credentials.vault.kubernetesAuth.role=agents",), "need vault.addr"),
+                      (("credentials.vault.caSecret=vca",), "need vault.addr")):
+        p = render(*sets, ok=False)
+        assert p.returncode != 0 and why in p.stderr, (sets, p.stderr)
+
+
+def test_the_varekcredential_crd():
+    crd = one(render(), "CustomResourceDefinition", "varekcredentials.varek.dev")
+    assert crd["spec"]["scope"] == "Cluster" and crd["spec"]["names"]["kind"] == "VarekCredential"
+    v = crd["spec"]["versions"][0]
+    assert v["name"] == "v1alpha1" and v["served"] and v["storage"]
+    spec = v["schema"]["openAPIV3Schema"]["properties"]["spec"]
+    assert spec["required"] == ["credential", "source", "namespaces"]
+    # the names and sources the node agent takes (k8s/internal/kube/credentials.go)
+    go = open(os.path.join(ROOT, "varek", "v1_4", "k8s", "internal", "kube", "credentials.go")).read()
+    name = re.search(r"var CredentialName = regexp\.MustCompile\(`([^`]*)`\)", go).group(1)
+    assert spec["properties"]["credential"]["pattern"] == name
+    src = spec["properties"]["source"]
+    assert src["pattern"] == "^(file|vault|aws-sm):[!-~]+$" and src["maxLength"] == len("aws-sm:") + 1024
+    assert spec["properties"]["namespaces"]["minItems"] == 1
 
 
 def test_the_chart_version_is_the_wardens():
