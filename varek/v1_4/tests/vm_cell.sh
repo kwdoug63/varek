@@ -115,6 +115,12 @@ if [ "$CMD" = inside ]; then
         "$HERE/tests/arm64_sweep.sh" --deps --out "$OUT/sweep" "${SUITES[@]}"
         rc=$?
         cp "$OUT/sweep/summary.txt" "$OUT/summary.txt" 2>/dev/null
+        # each failed suite's failing checks, with the lines before them, in
+        # the job's log (the artifact holds the whole logs)
+        for s in $(awk '$2 == "FAILED" {print $1}' "$OUT/sweep/summary.txt" 2>/dev/null); do
+            echo "== $s: its failures"
+            grep -B6 -A4 '  FAIL' "$OUT/sweep/$s.log" | cut -c1-300 | head -120
+        done
         exit $rc ;;
     chart)
         [ "$(getenforce 2>/dev/null)" = Enforcing ] || { measure "selinux" "not enforcing: the cell's point is missing"; exit 1; }
