@@ -450,8 +450,9 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
     snprintf(a->resolved, sizeof a->resolved, "%s:%u", q->name, q->port);
     decision_t d_raw = policy_decide(p, a);
     /* v1.29: a dry run relays a name the policy refuses, as not enforced:
-     * resolved like a wildcard's, charged to no budget */
-    if (d_raw != DEC_ALLOW && !dry_let(a, decision_rule_id(a, d_raw))) {
+     * resolved like a wildcard's, charged to no budget; v1.36 step 7 (D6a):
+     * not in a pod (dry_net_let) */
+    if (d_raw != DEC_ALLOW && !dry_net_let(a, decision_rule_id(a, d_raw))) {
         px_refuse(q, d_raw, decision_rule_id(a, d_raw), EACCES);
         return;
     }

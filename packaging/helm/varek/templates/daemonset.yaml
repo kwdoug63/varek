@@ -137,6 +137,14 @@ spec:
             {{- end }}
             {{- else if .Values.spire.self }}{{ fail "spire.self: give spire.adminSocket too" }}
             {{- end }}
+            # v1.36 step 7 (D7b, D7): a flow policy's breaker table, on the
+            # node; the trust bundles a VarekPolicy names
+            - --node-flow-state
+            - {{ .Values.flowPolicy.stateDir }}
+            {{- if .Values.trustBundles.configMap }}
+            - --node-trust-bundles
+            - /etc/varek/trust-bundles
+            {{- end }}
             {{- range .Values.nodeAgent.extraArgs }}
             - {{ . | quote }}
             {{- end }}
@@ -186,6 +194,11 @@ spec:
             {{- end }}
             {{- if .Values.onBehalfOf.issuerCaConfigMap }}
             - { name: issuer-ca, mountPath: /etc/varek/issuer-ca, readOnly: true }
+            {{- end }}
+            # v1.36 step 7
+            - { name: flow-state, mountPath: {{ .Values.flowPolicy.stateDir }} }
+            {{- if .Values.trustBundles.configMap }}
+            - { name: trust-bundles, mountPath: /etc/varek/trust-bundles, readOnly: true }
             {{- end }}
         - name: plugin
           image: {{ include "varek.image" . }}
@@ -298,6 +311,11 @@ spec:
         - name: spire-bundle
           projected: { defaultMode: 0444, sources: [{ configMap: { name: {{ .Values.spire.bundleConfigMap }} } }] }
         {{- end }}
+        {{- if .Values.trustBundles.configMap }}
+        - name: trust-bundles
+          projected: { defaultMode: 0444, sources: [{ configMap: { name: {{ .Values.trustBundles.configMap }} } }] }
+        {{- end }}
+        - { name: flow-state, hostPath: { path: {{ .Values.flowPolicy.stateDir }}, type: DirectoryOrCreate } }
         {{- if .Values.onBehalfOf.issuerCaConfigMap }}
         - name: issuer-ca
           projected: { defaultMode: 0444, sources: [{ configMap: { name: {{ .Values.onBehalfOf.issuerCaConfigMap }}, items: [{ key: ca.crt, path: ca.crt }] } }] }

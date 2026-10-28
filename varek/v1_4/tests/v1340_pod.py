@@ -56,6 +56,17 @@ the kubelet's copy is never so; and so is --on-behalf-of-expiry record (the
 node agent revokes, its default) and an SVID under a policy that trusts no
 SPIFFE trust domain (the node agent asks SPIRE for none).
 
+v1.36 step 7 (D6, D7): --dry-run and --trust-bundle FILE, as a pod's
+VarekPolicy says them (dryRun, trustBundle): the container annotated
+varek.dev/dry-run, its filter the dry run's (--oci-filter --dry-run) and no
+mount made noexec, as the plugin does; the bundle a key of a stand-in
+ConfigMap's volume (KEY -> ..data/KEY), given to the node agent as
+--node-trust-bundles, and the container annotated varek.dev/trust-bundle. A
+bundle that is not a file is passed through (a ConfigMap's key always is
+one). A flow policy is not carried here: it checks a plan, and the stand-in
+gives no pod a plan (test_v1340.sh sections 9 and 13, and the kind run,
+carry them).
+
 Environment (set by tests/v1340_sweep.sh): VAREK_SWEEP_DIR (its own
 directory: hostroot, a bind of / with no submounts; ovl, a tmpfs),
 VAREK_SWEEP_WARDEN, VAREK_SWEEP_LAUNCHER, VAREK_SWEEP_RUNC, VAREK_SWEEP_LOG,
@@ -84,7 +95,7 @@ SUITE = ENV.get("VAREK_SWEEP_SUITE", "-")
 
 CARRIED = {"--sign-key", "--anchor", "--checkpoint-every",      # the node agent's own (D8)
            "--secrets-conf", "--secrets-as", "--secrets-bin"}   # v1.36 step 4: warden-secrets', as on a host
-FORMS = {"--check-startup", "--check-credentials", "--oci-filter", "--node-agent", "--dry-run"}
+FORMS = {"--check-startup", "--check-credentials", "--oci-filter", "--node-agent"}
 
 
 def log(kind, why, argv):
@@ -105,18 +116,23 @@ def passthrough(why, argv):
 
 
 def parse(argv):
-    """(policy, options for the node agent, run-as, program argv) or why not carried"""
+    """(policy, options for the node agent, run-as, program argv, the chain's
+    files, the VarekPolicy's: dry run and trust bundle) or why not carried"""
     if "--" not in argv:
         return "no program (" + " ".join(a for a in argv if a.startswith("--")) + ")"
     i = argv.index("--")
     head, prog = argv[:i], argv[i + 1:]
     if not prog or not head:
         return "no program or no policy"
-    policy, opts, run_as, j, ident = head[0], [], None, 1, {}
+    policy, opts, run_as, j, ident, vp = head[0], [], None, 1, {}, {}
     while j < len(head):
         o = head[j]
         if o in FORMS:
             return "the form " + o
+        if o == "--dry-run":                    # v1.36 step 7 (D6): the VarekPolicy's dryRun
+            vp["dry"] = True
+            j += 1
+            continue
         if o in CARRIED and j + 1 < len(head):
             opts += [o, head[j + 1]]
         elif o == "--run-as" and j + 1 < len(head):
@@ -125,10 +141,12 @@ def parse(argv):
             ident[o] = head[j + 1]
         elif o == "--on-behalf-of-expiry" and j + 1 < len(head) and head[j + 1] == "revoke":
             pass                    # the node agent's own, and only, way
+        elif o == "--trust-bundle" and j + 1 < len(head):    # v1.36 step 7 (D7): its trustBundle
+            vp["trust"] = head[j + 1]
         else:
             return "the option " + o + " (not the node agent's)"
         j += 2
-    return policy, opts, run_as, prog, ident
+    return policy, opts, run_as, prog, ident, vp
 
 
 def private_file(path):
@@ -185,7 +203,9 @@ def main():
     if os.geteuid() != 0 or not initial:
         # no node agent or runtime runs so: the Warden's own answer is the answer
         passthrough("not the node's root (a node agent runs as it)", argv)
-    policy, opts, run_as, prog, ident = got
+    policy, opts, run_as, prog, ident, vp = got
+    if "trust" in vp and not os.path.isfile(vp["trust"]):
+        passthrough("a trust bundle that is not a file (a ConfigMap's key always is one)", argv)
     for o, f in ident.items():
         if not private_file(f):
             passthrough("the file of %s the Warden refuses as a file (the kubelet's copy, and SPIRE's answer, "
@@ -244,8 +264,8 @@ def main():
     os.chmod(lp, 0o644)
 
     # the plugin's filter: the Warden's, from the policy's bytes
-    fl = subprocess.run([WARDEN, pf, "--oci-filter", "--credential-list", lp, "--pod-namespace", "sweep"],
-                        capture_output=True)
+    fl = subprocess.run([WARDEN, pf, "--oci-filter", "--credential-list", lp, "--pod-namespace", "sweep"] +
+                        (["--dry-run"] if vp.get("dry") else []), capture_output=True)
     if fl.returncode != 0:
         # the plugin refuses the container, which is not created
         # (the Warden's reason, naming the policy as the suite gave it, and its status)
@@ -288,6 +308,21 @@ def main():
         shutil.copyfile(ident["--agent-svid"], helper + ".pem")
         os.chmod(helper + ".pem", 0o600)
         opts += ["--node-spire-socket", os.path.join(inv, "spire.sock"), "--node-svid-helper", helper]
+
+    # v1.36 step 7 (D7): the trust bundle, a key of a ConfigMap's projected
+    # volume as the kubelet lays it out
+    tkey = ""
+    if "trust" in vp:
+        tkey = re.sub(r"[^-._a-zA-Z0-9]", "_", os.path.basename(vp["trust"])).strip(".") or "bundle.pem"
+        tb = os.path.join(inv, "trust")
+        ts = os.path.join(tb, "..2026_10_28_10_00_00.1")
+        os.makedirs(ts, mode=0o755)
+        os.chmod(tb, 0o755)
+        shutil.copyfile(vp["trust"], os.path.join(ts, tkey))
+        os.chmod(os.path.join(ts, tkey), 0o444)
+        os.symlink("..2026_10_28_10_00_00.1", os.path.join(tb, "..data"))
+        os.symlink("..data/" + tkey, os.path.join(tb, tkey))
+        opts += ["--node-trust-bundles", tb]
 
     agent_log = open(os.path.join(inv, "agent.log"), "w+")
     # v1.36 step 6: no standard input of the suite's (a node agent has none)
@@ -348,13 +383,15 @@ def main():
     for m in c["mounts"]:
         # as the plugin makes a pod's writable mounts (kernel file systems apart)
         opts_m = m.setdefault("options", [])
+        # (v1.36 step 7, D6: none in a dry run, which holds no launch)
         if m["type"] not in ("proc", "sysfs", "cgroup", "cgroup2", "mqueue", "devpts") and \
-                "ro" not in opts_m and "noexec" not in opts_m:
+                "ro" not in opts_m and "noexec" not in opts_m and not vp.get("dry"):
             opts_m.append("noexec")
     c["mounts"].append({"destination": "/varek/init", "type": "bind", "source": LAUNCHER,
                         "options": ["bind", "ro", "nosuid", "nodev"]})
     c["mounts"].append({"destination": "/tmp", "type": "bind", "source": "/tmp",
-                        "options": ["rbind", "rw", "nosuid", "nodev", "noexec", "rnosuid", "rnodev", "rnoexec"]})
+                        "options": ["rbind", "rw", "nosuid", "nodev", "rnosuid", "rnodev"] +
+                                   ([] if vp.get("dry") else ["noexec", "rnoexec"])})
     # v1.36 step 5: each other program the policy names by its file under
     # /tmp (an exact `allow exec` rule, a sub-agent's or a confined MCP
     # server's), bound read-only at its own path, as a pod's read-only volume
@@ -381,6 +418,10 @@ def main():
                         "varek.dev/pod-uid": n, "varek.dev/container": "agent"}
     if "--on-behalf-of" in ident:
         c["annotations"]["varek.dev/on-behalf-of"] = "sweep-token"
+    if vp.get("dry"):                           # v1.36 step 7, as the plugin adds them
+        c["annotations"]["varek.dev/dry-run"] = "true"
+    if tkey:
+        c["annotations"]["varek.dev/trust-bundle"] = tkey
     json.dump(c, open(cfg_path, "w"))
 
     cid = "sweep-" + n

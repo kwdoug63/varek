@@ -533,6 +533,20 @@ def check_dry(meta, records, problems):
                                 f"{'next' if want == 'file.rename_to' else 'before it'}")
         if rline is not None and at(r) > rline:
             problems.append(f"seq {seq}: a call let through after the run was revoked")
+    # v1.36 step 7 (D6a): in a pod a dry run refuses a connect the policy
+    # refuses (and a name the proxy would relay) all the same, saying so: only
+    # in a dry run under the node agent, a refusal of the policy's, enforced
+    for r in records:
+        if not isinstance(r, dict) or "dry_run_refused" not in r:
+            continue
+        seq = r.get("seq")
+        if r.get("dry_run_refused") is not True:
+            problems.append(f"seq {seq}: \"dry_run_refused\" is {r.get('dry_run_refused')!r}; the Warden writes only true")
+        elif not dry or not isinstance(rs.get("node"), dict):
+            problems.append(f"seq {seq}: a dry run's refusal in a pod, in a run that is not a dry run under the node agent")
+        elif r.get("action") not in ("net.connect", "net.proxy") or r.get("decision_final") != "DENY" or \
+                "enforced" in r:
+            problems.append(f"seq {seq}: a dry run's refusal in a pod that is not a refused connect or proxied name")
     if dry and end and end[-1].get("not_enforced") != n:
         problems.append(f"run_end counts {end[-1].get('not_enforced')!r} calls not enforced; the stream holds {n}")
     if not dry and end and "not_enforced" in end[-1]:

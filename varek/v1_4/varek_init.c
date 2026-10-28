@@ -16,7 +16,12 @@
 //      path a line;
 //   2. it applies Landlock to exactly those paths (each path, never another
 //      name of its file: on the overlay file system a container's root is,
-//      a rule on one name of a file does not cover its hardlinks);
+//      a rule on one name of a file does not cover its hardlinks); v1.36
+//      step 7: a directory in the set (a dry run's, which is / alone) gives
+//      execution beneath it, and moving a file between directories beneath
+//      it (LANDLOCK_ACCESS_FS_REFER, from Landlock's ABI 2: a domain refuses
+//      every such move otherwise, which a host's dry run, with no Landlock,
+//      lets through);
 //   3. it adds a filter of its own whose only effect is that a call from
 //      another architecture (i386, x32 on x86_64; 32-bit ARM on aarch64)
 //      kills the whole process, as the Warden's own filter does on a host
@@ -39,6 +44,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -104,7 +110,8 @@ int main(int argc, char **argv) {
     if (n == 0 || set[n - 1] != '\n') return refuse("the launch set is not whole", NULL);
 
     /* 2: Landlock on exactly those paths */
-    struct landlock_ruleset_attr ra = { .handled_access_fs = LANDLOCK_ACCESS_FS_EXECUTE };
+    __u64 refer = abi >= 2 ? LANDLOCK_ACCESS_FS_REFER : 0;
+    struct landlock_ruleset_attr ra = { .handled_access_fs = LANDLOCK_ACCESS_FS_EXECUTE | refer };
     int rs = (int)syscall(SYS_landlock_create_ruleset, &ra, sizeof ra, 0);
     if (rs < 0) return refuse("landlock_create_ruleset", strerror(errno));
     int count = 0;
@@ -114,7 +121,10 @@ int main(int argc, char **argv) {
         if (line[0] != '/') return refuse("the launch set holds a path that is not absolute", line);
         int fd = open(line, O_PATH | O_NOFOLLOW | O_CLOEXEC);
         if (fd < 0) return refuse(line, strerror(errno));
-        struct landlock_path_beneath_attr pb = { .allowed_access = LANDLOCK_ACCESS_FS_EXECUTE, .parent_fd = fd };
+        struct stat st;
+        if (fstat(fd, &st) < 0) return refuse(line, strerror(errno));
+        struct landlock_path_beneath_attr pb = { .allowed_access = LANDLOCK_ACCESS_FS_EXECUTE |
+                                                 (S_ISDIR(st.st_mode) ? refer : 0), .parent_fd = fd };
         if (syscall(SYS_landlock_add_rule, rs, LANDLOCK_RULE_PATH_BENEATH, &pb, 0) < 0)
             return refuse(line, strerror(errno));
         close(fd);

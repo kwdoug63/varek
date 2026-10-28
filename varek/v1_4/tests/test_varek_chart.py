@@ -340,8 +340,10 @@ def test_rbac_reads_only():
     res = ["varekpolicies", "varekplans"]                    # v1.35 step 4c: the plans too
     # v1.36 step 4 (D2): the node lists and watches the credentials; the webhook lists them
     cred = ["varekcredentials"]
+    # v1.36 step 7 (D7b): the plugin gets a pod, for its service account (a flow policy's session)
     assert rules == {"t-node": [{"apiGroups": ["varek.dev"], "resources": res, "verbs": ["get", "list", "watch"]},
-                                {"apiGroups": ["varek.dev"], "resources": cred, "verbs": ["get", "list", "watch"]}],
+                                {"apiGroups": ["varek.dev"], "resources": cred, "verbs": ["get", "list", "watch"]},
+                                {"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}],
                      "t-admission": [{"apiGroups": ["varek.dev"], "resources": res, "verbs": ["get"]},
                                      {"apiGroups": ["varek.dev"], "resources": cred, "verbs": ["list"]}]}
     for b in (d for d in docs if d["kind"] == "ClusterRoleBinding"):
@@ -528,6 +530,33 @@ def test_on_behalf_of():
     # the init container's user: the value, or on OpenShift the namespace's
     assert arg(ctr(pod(render("onBehalfOf.user=1001"), "Deployment"), "admission"), "-obo-user") == "1001"
     assert arg(ctr(pod(render("openshift.enabled=true", "runtime=cri-o"), "Deployment"), "admission"), "-obo-user") == "0"
+
+
+def test_dry_run_flow_policy_and_trust_bundles():
+    """v1.36 step 7 (D6, D7, D7b): the VarekPolicy's fields; a flow policy's
+    breaker table on the node (root's host path); the trust bundles'
+    ConfigMap, projected (in memory: a configMap volume's directory is the
+    node's, writable by all)"""
+    docs = render()
+    crd = one(docs, "CustomResourceDefinition", "varekpolicies.varek.dev")
+    props = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+    assert props["dryRun"]["type"] == "boolean" and props["flowPolicy"]["type"] == "string"
+    kube = open(os.path.join(ROOT, "varek", "v1_4", "k8s", "internal", "kube", "kube.go")).read()
+    go = re.search(r"var TrustKey = regexp\.MustCompile\(`([^`]*)`\)", kube).group(1)
+    assert props["trustBundle"]["pattern"] == go, (props["trustBundle"], go)
+    spec = pod(docs, "DaemonSet")
+    agent = ctr(spec, "node-agent")
+    assert arg(agent, "--node-flow-state") == "/var/lib/varek/flow"
+    assert host_path(spec, agent, "/var/lib/varek/flow") == "/var/lib/varek/flow"
+    assert "--node-trust-bundles" not in agent["command"] and "/etc/varek/trust-bundles" not in mounts(agent)
+    spec = pod(render("trustBundles.configMap=corp-roots", "flowPolicy.stateDir=/var/lib/varek/breaker"), "DaemonSet")
+    agent = ctr(spec, "node-agent")
+    assert arg(agent, "--node-trust-bundles") == "/etc/varek/trust-bundles"
+    assert arg(agent, "--node-flow-state") == "/var/lib/varek/breaker"
+    m = mounts(agent)["/etc/varek/trust-bundles"]
+    assert m["readOnly"] is True
+    v = volumes(spec)[m["name"]]
+    assert v["projected"]["sources"] == [{"configMap": {"name": "corp-roots"}}] and "configMap" not in v
 
 
 def test_the_varekcredential_crd():

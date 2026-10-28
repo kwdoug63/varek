@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
+
+	"varek.dev/varek-k8s/internal/kube"
 )
 
 // a stand-in for the Warden: it writes a small filter for any policy, or
@@ -207,22 +209,22 @@ func TestDeadline(t *testing.T) {
 
 func TestFilterKeptByHash(t *testing.T) {
 	p := setup(t)
-	a, s1, _, err := p.filter(context.Background(), "ns", "agent", "")
-	b, s2, _, err2 := p.filter(context.Background(), "ns", "agent", "")
+	a, s1, _, err := filter3(p, "ns", "agent", "")
+	b, s2, _, err2 := filter3(p, "ns", "agent", "")
 	if err != nil || err2 != nil || a != b || s1 != s2 || len(s1) != 64 {
 		t.Fatalf("kept: %v %v", err, err2)
 	}
 	os.WriteFile(filepath.Join(p.policies, "ns", "agent.policy"), []byte("allow path /tmp/\nallow path /var/\n"), 0o644)
-	c, s3, _, err := p.filter(context.Background(), "ns", "agent", "")
+	c, s3, _, err := filter3(p, "ns", "agent", "")
 	if err != nil || c == a || s3 == s1 {
 		t.Fatalf("a changed policy is written again, with its own hash: %v", err)
 	}
-	if _, _, _, err := p.filter(context.Background(), "other", "agent", ""); err == nil || !strings.Contains(err.Error(), "in namespace other") {
+	if _, _, _, err := filter3(p, "other", "agent", ""); err == nil || !strings.Contains(err.Error(), "in namespace other") {
 		t.Fatalf("another namespace's policy: %v", err)
 	}
 	// v1.35 step 4c: kept by the policy's and the plan's hashes together
-	d, _, ps1, err := p.filter(context.Background(), "ns", "agent", "p1")
-	e, _, ps2, err2 := p.filter(context.Background(), "ns", "agent", "p2")
+	d, _, ps1, err := filter3(p, "ns", "agent", "p1")
+	e, _, ps2, err2 := filter3(p, "ns", "agent", "p2")
 	if err != nil || err2 != nil || d == c || e == d || ps1 == ps2 || len(ps1) != 64 {
 		t.Fatalf("a plan checked apart from the policy alone, and from another plan: %v %v", err, err2)
 	}
@@ -439,5 +441,101 @@ func TestOnBehalfOf(t *testing.T) {
 		if fullName(ref) != want {
 			t.Errorf("fullName(%q) = %q", ref, fullName(ref))
 		}
+	}
+}
+
+// filter3 is filter's filter and its policy's and plan's SHA-256s
+func filter3(p *plugin, ns, name, plan string) (*ociProfile, string, string, error) {
+	fd, err := p.filter(context.Background(), ns, name, plan)
+	if err != nil {
+		return nil, "", "", err
+	}
+	return fd.f, fd.sha, fd.psha, nil
+}
+
+// a stand-in for the API server's pods (v1.36 step 7)
+type fakePods map[string]*kube.Pod
+
+func (f fakePods) GetPod(_ context.Context, ns, name string) (*kube.Pod, error) {
+	return f[ns+"/"+name], nil
+}
+
+func apiPod(uid, sa string) *kube.Pod {
+	o := &kube.Pod{}
+	o.Metadata.UID, o.Spec.ServiceAccountName = uid, sa
+	return o
+}
+
+// v1.36 step 7 (D6, D7, D7b): a VarekPolicy's dry run, trust bundle and flow
+// policy, from the files -sync writes beside it
+func TestDryRunTrustFlow(t *testing.T) {
+	p := setup(t)
+	dir := filepath.Join(p.policies, "ns")
+	os.WriteFile(filepath.Join(dir, "dry.policy"), []byte("allow path /tmp/dry\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "dry.run"), []byte(`{"dryRun":true,"trustBundle":"corp.pem"}`+"\n"), 0o644)
+	adj, err := p.adjust(context.Background(), pod(map[string]string{annotation: "dry"}), ctr("/bin/agent"))
+	if err != nil {
+		t.Fatalf("a dry run: %v", err)
+	}
+	a := adj.GetAnnotations()
+	if a[dryAnnotation] != "true" || a[trustAnnotation] != "corp.pem" {
+		t.Errorf("the dry run and trust bundle in the container's annotations: %v", a)
+	}
+	if _, ok := a[api.MarkForRemoval(flowAnnotation)]; !ok {
+		t.Errorf("a flow policy's hash the container came with is removed: %v", a)
+	}
+	for _, m := range adj.GetMounts() {
+		if m.Destination == "/work" {
+			t.Errorf("a dry run makes no mount noexec: %v", m.Options)
+		}
+	}
+	calls, _ := os.ReadFile(filepath.Join(filepath.Dir(p.warden), "calls"))
+	if !strings.Contains(string(calls), "--dry-run") {
+		t.Errorf("the Warden asked for a dry run's filter: %q", calls)
+	}
+	// the pod's own annotations are not taken
+	adj, err = p.adjust(context.Background(), pod(map[string]string{annotation: "agent", dryAnnotation: "true",
+		trustAnnotation: "x", flowAnnotation: strings.Repeat("a", 64), saAnnotation: "admin"}), ctr("/bin/agent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{dryAnnotation, trustAnnotation, flowAnnotation, saAnnotation} {
+		if _, ok := adj.GetAnnotations()[api.MarkForRemoval(k)]; !ok || adj.GetAnnotations()[k] != "" {
+			t.Errorf("%s: the plugin's alone (removed for a policy that says none): %v", k, adj.GetAnnotations())
+		}
+	}
+	// a flow policy: its hash, and the pod's service account from the API server
+	os.WriteFile(filepath.Join(dir, "flowy.policy"), []byte("allow path /tmp/flowy\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "flowy.flow"), []byte("varek_policy 1\n"), 0o644)
+	ann := map[string]string{annotation: "flowy", planAnnotation: "p1"}
+	if _, err := p.adjust(context.Background(), pod(ann), ctr("/bin/agent")); err == nil || !strings.Contains(err.Error(), "-sync") {
+		t.Errorf("a flow policy, and no API server to read the pod's service account from: %v", err)
+	}
+	p.api = fakePods{"ns/p": apiPod("u-1", "agent-sa")}
+	adj, err = p.adjust(context.Background(), pod(ann), ctr("/bin/agent"))
+	want := sha256.Sum256([]byte("varek_policy 1\n"))
+	if err != nil || adj.GetAnnotations()[flowAnnotation] != hex.EncodeToString(want[:]) || adj.GetAnnotations()[saAnnotation] != "agent-sa" {
+		t.Fatalf("a flow policy's hash and the pod's service account: %v %v", err, adj.GetAnnotations())
+	}
+	if calls, _ = os.ReadFile(filepath.Join(filepath.Dir(p.warden), "calls")); !strings.Contains(string(calls), "--flow-policy ") {
+		t.Errorf("the Warden given the flow policy: %q", calls)
+	}
+	p.api = fakePods{"ns/p": apiPod("u-2", "agent-sa")}
+	if _, err := p.adjust(context.Background(), pod(ann), ctr("/bin/agent")); err == nil || !strings.Contains(err.Error(), "of uid u-1") {
+		t.Errorf("the API server's pod of another uid (created again by the name): %v", err)
+	}
+	p.api = fakePods{"ns/p": apiPod("u-1", "")}
+	if adj, err = p.adjust(context.Background(), pod(ann), ctr("/bin/agent")); err != nil || adj.GetAnnotations()[saAnnotation] != "default" {
+		t.Errorf("a pod naming no service account runs as default: %v", err)
+	}
+	// options that do not read, or a trust bundle that is not a key
+	os.WriteFile(filepath.Join(dir, "dry.run"), []byte(`{"dryRun":true,"other":1}`), 0o644)
+	if _, err := p.adjust(context.Background(), pod(map[string]string{annotation: "dry"}), ctr("/bin/agent")); err == nil {
+		t.Errorf("options with an unknown field are refused")
+	}
+	os.WriteFile(filepath.Join(dir, "dry.run"), []byte(`{"trustBundle":"../x"}`), 0o644)
+	if _, err := p.adjust(context.Background(), pod(map[string]string{annotation: "dry"}), ctr("/bin/agent")); err == nil ||
+		!strings.Contains(err.Error(), "not a ConfigMap's key") {
+		t.Errorf("a trust bundle that is not a key: %v", err)
 	}
 }

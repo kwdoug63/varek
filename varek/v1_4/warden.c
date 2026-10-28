@@ -333,6 +333,7 @@ struct action {
     struct timespec chg_times[2];
     bool          chg_times_null;
     bool          dry;                  /* v1.29: a refusal a dry run let through (not enforced) */
+    bool          dry_kept;             /* v1.36 step 7 (D6a): a pod's connect a dry run refuses all the same */
     char          extra[4608];          /* extra record fields, trusted text, each ending in ',' */
 };
 
@@ -849,8 +850,30 @@ struct node_run {
     /* v1.36 step 6 (D5): the Secret the user's token is in (varek.dev/on-behalf-of,
      * which the NRI plugin copies from the pod), or "" */
     char   obo[254];
+    /* v1.36 step 7 (D6, D7, D7b): the plugin's, from the pod's VarekPolicy:
+     * a dry run (varek.dev/dry-run), the trust bundle's key in the node's
+     * ConfigMap (varek.dev/trust-bundle), the SHA-256 of the flow policy it
+     * checked (varek.dev/flow-sha256), and the pod's service account
+     * (varek.dev/service-account, from the API server), the breaker's session */
+    bool   dry;
+    char   trust[254];
+    char   flow_sha[65];
+    char   sa[254];
 };
 static struct node_run g_nr = { .notify_fd = -1, .pidfd = -1, .set_view = -1, .node_netns = -1 };
+
+/* v1.36 step 7 (docs/security/v1.36-kubernetes-parity.md, D6a): a dry run
+ * lets a connect the policy refuses through (dry_let) on a host, where the
+ * agent's network namespace is empty and the Warden dials it. In a pod the
+ * connect would reach the cluster's network (other pods, the API server, the
+ * instance metadata service), so a dry run refuses it there all the same,
+ * the record saying it was a dry run's refusal (dry_run_refused), which
+ * `varek policy suggest` reads as the policy's refusal it is. A name the
+ * proxy would relay is the same. */
+static bool dry_net_let(struct action *a, const char *rule) {
+    if (g_nr.on && g_dry && dry_policy_rule(rule)) { a->dry_kept = true; return false; }
+    return dry_let(a, rule);
+}
 static void node_run_start(FILE *f);
 static void node_fail(const char *why) __attribute__((noreturn));
 static bool node_launcher_open(int notify_fd, const struct seccomp_notif *req);
@@ -3020,6 +3043,7 @@ static void emit_pathology(uint64_t seq,
     /* v1.28.1: who it was for */
     sub_obo(f, a->subject);
     if (a->dry) { fputs("\"enforced\":false,", f); g_dry_unenforced++; }   /* v1.29 */
+    if (a->dry_kept) fputs("\"dry_run_refused\":true,", f);                  /* v1.36 step 7 (D6a) */
     fprintf(f, "\"action\":\"%s\",\"target\":\"",
             a->kind == ACT_FILE_CHANGE ? change_op_name(a->chg_op) : action_kind_name(a->kind));
     json_escape(f, a->target);
@@ -5252,8 +5276,10 @@ static bool own_private_file(const struct stat *st) {
 /* Load and certify the flow policy; open and check the state directory, the
  * lock file and (if it exists) the table; open --gate-status. Returns 0, or -1
  * after saying why. */
-static int flow_setup(const struct policy *pol, const char *cfg_path, const char *state_path,
-                      const char *session, const char *gate_status_path) {
+/* The flow policy loaded and certified, with the budgets the Warden requires
+ * (v1.36 step 7: also --oci-filter's check, for the plugin and the webhook).
+ * 0, or -1 after saying why. */
+static int flow_load(const char *cfg_path) {
     int line = 0;
     const char *msg = NULL;
     if (plan_label_policy_config_load(cfg_path, &g_flow_cfg, &line, &msg) != 0) {
@@ -5294,6 +5320,12 @@ static int flow_setup(const struct policy *pol, const char *cfg_path, const char
                 "session_refusal_budget 10); refusing to start\n", cfg_path);
         return -1;
     }
+    return 0;
+}
+
+static int flow_setup(const struct policy *pol, const char *cfg_path, const char *state_path,
+                      const char *session, const char *gate_status_path) {
+    if (flow_load(cfg_path) < 0) return -1;
     if (session) {
         size_t n = strlen(session);
         bool ok = n >= 1 && n <= 128;
@@ -5521,9 +5553,10 @@ static int cmp_arg_key(const void *x, const void *y) {
     return strcmp(((const plan_action_arg_t *)x)->key, ((const plan_action_arg_t *)y)->key);
 }
 
-static int warden_gate_plan_flow(const char *plan_path, const struct policy *policy) {
-    char err[256] = {0};
-    plan_parsed_t *parsed = plan_load_snapshot(plan_path, err, sizeof(err));
+/* v1.36 step 7 (D7b): the gate on a plan parsed already (the node agent's,
+ * read in the node's view and decided in the container's); it is freed */
+static int warden_gate_plan_flow_parsed(plan_parsed_t *parsed, const char *err, const char *plan_path,
+                                        const struct policy *policy) {
     if (!parsed) {
         fprintf(stderr, "[warden] plan load failed: %s\n", err);
         return GATE_ERROR;
@@ -5732,6 +5765,12 @@ out:
     return result;
 }
 
+static int warden_gate_plan_flow(const char *plan_path, const struct policy *policy) {
+    char err[256] = {0};
+    plan_parsed_t *parsed = plan_load_snapshot(plan_path, err, sizeof(err));
+    return warden_gate_plan_flow_parsed(parsed, err, plan_path, policy);
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s <policy.txt> [--plan <plan.txt> [--hold-to-plan] [--flow-policy <cfg>\n"
@@ -5751,9 +5790,12 @@ static void usage(const char *argv0) {
         "              [--node-credentials <dir>]   (v1.36: where a file: credential is)\n"
         "              [--node-kubelet <dir>] [--node-spire-socket <admin socket> [--node-spire-self <SPIFFE ID>]\n"
         "               [--node-svid-helper <varek-svid>]]   (v1.36: the pod's user's token and SVID)\n"
+        "              [--node-trust-bundles <dir>] [--node-flow-state <dir>]   (v1.36: the trust bundles' ConfigMap,\n"
+        "               the flow policies' breaker table)\n"
         "       %s <policy.txt> --oci-filter [--plan PLAN | --no-plan]   (v1.34: the policy's filter in OCI's form, for the\n"
         "              NRI plugin; v1.35: with the pod's plan, or for a pod that names none)\n"
         "              [--credential-list FILE --pod-namespace NS]   (v1.36: the cluster's VarekCredential resources)\n"
+        "              [--dry-run] [--flow-policy FILE]   (v1.36: the pod's VarekPolicy's dry run and flow policy)\n"
         , argv0, argv0, argv0, argv0);
     fprintf(stderr,
         "\n"
@@ -5872,6 +5914,21 @@ static void usage(const char *argv0) {
 
 #include "warden_node.inc.c"         /* v1.34 step 2: the node agent */
 
+/* v1.29: what a dry run is not given (section 3): a plan (the plan gate
+ * refuses before the agent starts; no command checks a plan without starting
+ * the agent: v1.35), credentials (it would hand the proxy real values for an
+ * agent whose policy is not settled: D2), or sub-agents (their attribution
+ * rests on launches being held). v1.36 step 7: also a flow policy, which
+ * checks a plan, for --oci-filter (the plugin's and the webhook's check).
+ * What it is given with, or NULL. */
+static const char *dry_refusal(const struct policy *p, bool plan, bool flow) {
+    bool subs = false;
+    for (size_t i = 0; i < p->v.n; i++) if (p->v.rules[i].subagent[0]) subs = true;
+    return plan ? "--plan" : flow ? "a flow policy (it checks a plan)" :
+           p->v.ncreds ? "a policy that names credentials" :
+           subs ? "a policy that names sub-agents (subagent=)" : NULL;
+}
+
 int main(int argc, char **argv) {
     /* v1.24: the resolver helper is this program re-executed (a clean address
      * space, without the signing key); see warden_resolve.h. */
@@ -5928,6 +5985,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--") == 0) { sep_idx = i; break; }
         if (strcmp(argv[i], "--check-startup") == 0 || strcmp(argv[i], "--check-credentials") == 0 ||
             strcmp(argv[i], "--oci-filter") == 0 || strcmp(argv[i], "--no-plan") == 0) continue;
+        /* v1.36 step 7: --oci-filter --dry-run may end the line */
+        if (strcmp(argv[i], "--dry-run") == 0) { g_dry = true; continue; }                /* v1.29 */
         if (i + 1 >= argc) { usage(argv[0]); return 2; }
         if (strcmp(argv[i], "--plan") == 0 && !plan_path) {
             plan_path = argv[++i];
@@ -5943,8 +6002,6 @@ int main(int argc, char **argv) {
             key_path = argv[++i];
         } else if (strcmp(argv[i], "--anchor") == 0 && !anchor_path) {
             anchor_path = argv[++i];
-        } else if (strcmp(argv[i], "--dry-run") == 0) {                  /* v1.29 */
-            g_dry = true;
         } else if (strcmp(argv[i], "--hold-to-plan") == 0) {             /* v1.35 step 4 */
             g_hold_req = true;
         } else if (strcmp(argv[i], "--node-agent") == 0 && !node_sock && i + 1 < argc) {   /* v1.34 step 2 */
@@ -5963,6 +6020,10 @@ int main(int argc, char **argv) {
             g_node_spire_self = argv[++i];
         } else if (strcmp(argv[i], "--node-svid-helper") == 0 && !g_node_svid_bin && i + 1 < argc) {
             g_node_svid_bin = argv[++i];
+        } else if (strcmp(argv[i], "--node-trust-bundles") == 0 && !g_node_trust_dir) {   /* v1.36 step 7 */
+            g_node_trust_dir = argv[++i];
+        } else if (strcmp(argv[i], "--node-flow-state") == 0 && !g_node_flow_state) {
+            g_node_flow_state = argv[++i];
         } else if (strcmp(argv[i], "--credential-list") == 0 && !cred_list_arg) {
             cred_list_arg = argv[++i];
         } else if (strcmp(argv[i], "--pod-namespace") == 0 && !pod_ns_arg) {
@@ -6031,10 +6092,10 @@ int main(int argc, char **argv) {
 
     /* v1.34 step 3: the filter in OCI's form, for the NRI plugin */
     if (oci_only) {
-        if (sep_idx >= 0 || g_check_only || node_sock || g_dry || flow_path || g_hold_req ||
-            (plan_path && oci_no_plan)) {
+        if (sep_idx >= 0 || g_check_only || node_sock || g_hold_req || session_arg || state_arg || gstatus_arg ||
+            g_trust_bundle_arg || (plan_path && oci_no_plan)) {
             fprintf(stderr, "[warden] --oci-filter takes the policy, and the pod's plan (--plan PLAN) or "
-                    "--no-plan\n");
+                    "--no-plan; v1.36: and its VarekPolicy's --dry-run and --flow-policy FILE\n");
             return 2;
         }
         static struct policy op;
@@ -6059,6 +6120,21 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[warden] --oci-filter: the plan %s: %s\n", plan_path, why);
             return 1;
         }
+        /* v1.36 step 7 (D6, D7b): the VarekPolicy's dry run, as a host's
+         * (dry_refusal), and its flow policy, which loads, is certified, has
+         * the budgets the Warden requires, and checks the pod's plan */
+        const char *dno = !g_dry ? NULL : op.v.require_plan ? "a policy that says `require plan` (it needs a plan)"
+                                                            : dry_refusal(&op, plan_path, flow_path);
+        if (dno) {
+            fprintf(stderr, "[warden] --oci-filter: --dry-run with %s is refused\n", dno);
+            return 1;
+        }
+        if (flow_path && flow_load(flow_path) < 0) return 1;
+        if (flow_path && oci_no_plan) {
+            fprintf(stderr, "[warden] --oci-filter: the policy has a flow policy, which checks a plan: a pod under it "
+                    "names its plan (varek.dev/plan)\n");
+            return 1;
+        }
         /* v1.36 step 4 (D2): a policy that names credentials, for the pod's
          * namespace, against the cluster's VarekCredential list (the
          * plugin's copy, or the webhook's from the API server) */
@@ -6080,7 +6156,8 @@ int main(int argc, char **argv) {
         char *fb = NULL;
         size_t fl = 0;
         FILE *ff = open_memstream(&fb, &fl);
-        if (!ff || wd_oci_filter_write(ff, op.v.open_as_agent ? WD_FILTER_CHANGES : 0, why, sizeof why) < 0 ||
+        if (!ff || wd_oci_filter_write(ff, (op.v.open_as_agent ? WD_FILTER_CHANGES : 0) | (g_dry ? WD_FILTER_DRY : 0),
+                                       why, sizeof why) < 0 ||
             fclose(ff) != 0) {
             fprintf(stderr, "[warden] --oci-filter: %s\n", ff ? why : "out of memory");
             free(fb);
@@ -6102,18 +6179,24 @@ int main(int argc, char **argv) {
         (g_node_creds_dir && !node_sock) || ((cred_list_arg || pod_ns_arg) && !oci_only) ||   /* v1.36 step 4 */
         ((node_kubelet_arg || g_node_spire || g_node_spire_self || g_node_svid_bin) && !node_sock) ||  /* step 6 */
         ((g_node_spire_self || g_node_svid_bin) && !g_node_spire) ||
-        (node_sock && (obo_arg || svid_arg || obo_exp_arg))) {     /* step 6: each pod names its own */
+        (node_sock && (obo_arg || svid_arg || obo_exp_arg)) ||     /* step 6: each pod names its own */
+        ((g_node_trust_dir || g_node_flow_state) && !node_sock) ||  /* step 7: so the dry run, trust bundle, */
+        (node_sock && (g_dry || g_trust_bundle_arg || session_arg || state_arg || gstatus_arg))) {   /* flow */
         fprintf(stderr, "[warden] --node-agent takes --node-streams DIR, and no agent (\"--\"), check, plan (each "
                 "pod names its own, v1.35) or --writable-exec (a pod's mounts are checked, D4); --node-launcher "
                 "goes with --node-agent, --no-plan with --oci-filter; v1.36: --node-credentials goes with --node-agent, "
                 "--credential-list and --pod-namespace with --oci-filter; --node-kubelet and --node-spire-socket with "
                 "--node-agent, --node-spire-self and --node-svid-helper with --node-spire-socket; and not "
                 "--on-behalf-of, --agent-svid or --on-behalf-of-expiry (each pod names its user's token, "
-                "varek.dev/on-behalf-of, and its SVID is its own, from SPIRE)\n");
+                "varek.dev/on-behalf-of, and its SVID is its own, from SPIRE); --node-trust-bundles and "
+                "--node-flow-state with --node-agent, and not --dry-run, --trust-bundle, --session, "
+                "--breaker-state or --gate-status (each pod's VarekPolicy says them)\n");
         return 2;
     }
-    if (node_sock && node_listen(node_sock, node_streams, node_launcher, &policy_path, &plan_path) < 0) return 1;
+    if (node_sock && node_listen(node_sock, node_streams, node_launcher, &policy_path, &plan_path, &flow_path) < 0)
+        return 1;
     /* from here, under the node agent, the supervisor of one container */
+    if (g_nr.on) node_inputs(flow_path, &session_arg, &state_arg);          /* v1.36 step 7 */
     if (!g_check_only && !g_nr.on && (sep_idx < 0 || sep_idx + 1 >= argc)) { usage(argv[0]); return 2; }
     /* v1.35 step 4: the hold needs a plan to hold to; its path and hash are
      * read now, for run_start and every outside_plan record */
@@ -6142,6 +6225,7 @@ int main(int argc, char **argv) {
         free(jb);
     }
     if (flow_path && !plan_path && !g_check_only) {
+        if (g_nr.on) node_fail("its policy has a flow policy, which checks a plan, and its pod names no plan (varek.dev/plan)");
         fprintf(stderr, "[warden] --flow-policy checks a plan; give --plan too\n");
         return 2;
     }
@@ -6194,17 +6278,17 @@ int main(int argc, char **argv) {
     /* ~2 MB (512 rules x 4 KB constants): static, not on the stack. */
     static struct policy p;
     if (policy_load(policy_path, &p) < 0) return 1;
-    /* v1.29: a dry run (section 3), on the command line only (D3). Not with
-     * a plan (the plan gate refuses before the agent starts; no command
-     * checks a plan without starting the agent: v1.35), with credentials (it would hand the
-     * proxy real values for an agent whose policy is not settled: D2), or
-     * with sub-agents (their attribution rests on launches being held). */
+    /* v1.29: a dry run (section 3), on the command line only (D3); not with
+     * a plan, credentials or sub-agents (dry_refusal). v1.36 step 7 (D6):
+     * under the node agent, the pod's VarekPolicy's, refused the same */
     if (g_dry) {
-        bool subs = false;
-        for (size_t i = 0; i < p.v.n; i++) if (p.v.rules[i].subagent[0]) subs = true;
-        const char *no = plan_path ? "--plan" : p.v.ncreds ? "a policy that names credentials"
-                       : subs ? "a policy that names sub-agents (subagent=)" : NULL;
+        const char *no = dry_refusal(&p, plan_path, false);
         if (no) {
+            if (g_nr.on) {
+                char why[160];
+                snprintf(why, sizeof why, "a dry run with %s is refused (as on a host)", no);
+                node_fail(why);
+            }
             fprintf(stderr, "[warden] --dry-run with %s is refused\n", no);
             return 2;
         }
@@ -6243,7 +6327,7 @@ int main(int argc, char **argv) {
         node_fail("the policy names hosts, and the pod's /etc/resolv.conf names no IPv4 nameserver to resolve "
                   "them through (give the node agent --dns-server)");
     if (g_nr.on) {                                                         /* v1.34 step 2 */
-        const char *no = node_unsupported(&p, g_dry, plan_path, flow_path, obo_arg, svid_arg, g_trust_bundle_arg);
+        const char *no = node_unsupported(&p, obo_arg, svid_arg);
         if (no) {
             char why[256];
             snprintf(why, sizeof why, "%s is not carried under the node agent yet", no);

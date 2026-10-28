@@ -13,6 +13,9 @@
 // v1.35 step 4c (D11): the cluster's VarekPlan resources the same way, as
 // POLICY_DIR/<namespace>/<name>.plan, by a second syncer.
 //
+// v1.36 step 7 (D6, D7, D7b): beside each policy, its flow policy
+// (<name>.flow) and its dry run and trust bundle (<name>.run), when it has them.
+//
 // v1.36 step 4 (D2): the cluster's VarekCredential resources (cluster-scoped)
 // as one list, POLICY_DIR/.credentials (kube.CredentialList), written whole
 // after each list and each event, by a third (credSyncer). A resource the
@@ -48,6 +51,42 @@ func (s *syncer) kind() (string, string) {
 	return "policy", ".policy"
 }
 
+// v1.36 step 7 (D6, D7, D7b): beside a VarekPolicy's policy, its flow policy
+// (NAME.flow, the --flow-policy file) and what the plugin takes for it
+// (NAME.run: its dry run and its trust bundle's name, as JSON); neither is
+// kept for a policy that says none
+type runOptions struct {
+	DryRun      bool   `json:"dryRun,omitempty"`
+	TrustBundle string `json:"trustBundle,omitempty"`
+}
+
+// a file of a resource: its extension and text ("" for one not kept)
+type rfile struct{ ext, text string }
+
+// a resource's files, its own last (the plugin reads a policy's others after
+// the policy, and a change is taken whole at the next container)
+func (s *syncer) files(p *kube.Policy) []rfile {
+	_, ext := s.kind()
+	if s.resource == kube.Plans {
+		return []rfile{{ext, p.Text(s.resource)}}
+	}
+	run := ""
+	if p.Spec.DryRun || p.Spec.TrustBundle != "" {
+		b, _ := json.Marshal(runOptions{DryRun: p.Spec.DryRun, TrustBundle: p.Spec.TrustBundle})
+		run = string(b) + "\n"
+	}
+	return []rfile{{".flow", p.Spec.FlowPolicy}, {".run", run}, {ext, p.Spec.Policy}}
+}
+
+// every extension a resource's files have
+func (s *syncer) exts() []string {
+	_, ext := s.kind()
+	if s.resource == kube.Plans {
+		return []string{ext}
+	}
+	return []string{".flow", ".run", ext}
+}
+
 func (s *syncer) path(ns, name string) (string, bool) {
 	if !kube.Name.MatchString(ns) || !kube.Name.MatchString(name) {
 		return "", false
@@ -56,70 +95,100 @@ func (s *syncer) path(ns, name string) (string, bool) {
 	return filepath.Join(s.dir, ns, name+ext), true
 }
 
-// write a resource's file; an error when it could not be written (v1.35 step 9,
-// review: a failure is retried, not only logged), none for a resource the node
-// agent would not take (not written, said)
+// write a resource's files; an error when one could not be written (v1.35
+// step 9, review: a failure is retried, not only logged), none for a
+// resource the node agent would not take (not written, said)
 func (s *syncer) write(p *kube.Policy) error {
-	what, ext := s.kind()
-	text := p.Text(s.resource)
+	what, _ := s.kind()
 	path, ok := s.path(p.Metadata.Namespace, p.Metadata.Name)
 	if !ok {
 		s.logf("varek-nri: %s %s/%s: not a name the node agent takes; not written", what, p.Metadata.Namespace, p.Metadata.Name)
 		return nil
 	}
-	if len(text) > kube.MaxPolicy {
-		s.logf("varek-nri: %s %s/%s: larger than %d bytes; not written", what, p.Metadata.Namespace, p.Metadata.Name, kube.MaxPolicy)
-		return s.remove(p.Metadata.Namespace, p.Metadata.Name) // step 9: an older version is not kept
+	rfs := s.files(p)
+	for _, f := range rfs {
+		if len(f.text) > kube.MaxPolicy {
+			s.logf("varek-nri: %s %s/%s: larger than %d bytes; not written", what, p.Metadata.Namespace, p.Metadata.Name, kube.MaxPolicy)
+			return s.remove(p.Metadata.Namespace, p.Metadata.Name) // step 9: an older version is not kept
+		}
 	}
-	if old, err := os.ReadFile(path); err == nil && string(old) == text {
-		return nil
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("%s %s/%s: %v", what, p.Metadata.Namespace, p.Metadata.Name, err)
-	}
-	f, err := os.CreateTemp(dir, "."+p.Metadata.Name+ext+".tmp-")
-	if err == nil {
-		_, err = f.WriteString(text)
-		if err == nil {
-			err = f.Chmod(0o644)
-		}
-		if err == nil {
-			err = f.Sync()
-		}
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
-		if err == nil {
-			err = os.Rename(f.Name(), path)
-		}
+	base := strings.TrimSuffix(path, filepath.Ext(path))
+	wrote := false
+	for _, f := range rfs {
+		w, err := s.writeFile(base+f.ext, f.text)
 		if err != nil {
-			os.Remove(f.Name())
+			return fmt.Errorf("%s %s/%s: %v", what, p.Metadata.Namespace, p.Metadata.Name, err)
 		}
+		wrote = wrote || w
 	}
-	if err != nil {
-		return fmt.Errorf("%s %s/%s: %v", what, p.Metadata.Namespace, p.Metadata.Name, err)
+	if wrote {
+		s.logf("varek-nri: %s %s/%s written (version %s)", what, p.Metadata.Namespace, p.Metadata.Name, p.Metadata.ResourceVersion)
 	}
-	s.logf("varek-nri: %s %s/%s written (version %s)", what, p.Metadata.Namespace, p.Metadata.Name, p.Metadata.ResourceVersion)
 	return nil
 }
 
-// remove a resource's file; an error when it is there and could not be removed
+// writeFile writes text whole and renames it into place (root's, readable by
+// all), or removes the file for "": whether it changed
+func (s *syncer) writeFile(path, text string) (bool, error) {
+	if text == "" {
+		err := os.Remove(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return err == nil, err
+	}
+	if old, err := os.ReadFile(path); err == nil && string(old) == text {
+		return false, nil
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return false, err
+	}
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return false, err
+	}
+	_, err = f.WriteString(text)
+	if err == nil {
+		err = f.Chmod(0o644)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), path)
+	}
+	if err != nil {
+		os.Remove(f.Name())
+		return false, err
+	}
+	return true, nil
+}
+
+// remove a resource's files; an error when one is there and could not be removed
 func (s *syncer) remove(ns, name string) error {
 	what, _ := s.kind()
 	path, ok := s.path(ns, name)
 	if !ok {
 		return nil
 	}
-	err := os.Remove(path)
-	if err == nil {
+	base := strings.TrimSuffix(path, filepath.Ext(path))
+	removed := false
+	for _, ext := range s.exts() {
+		err := os.Remove(base + ext)
+		if err == nil {
+			removed = true
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%s %s/%s: not removed: %v", what, ns, name, err)
+		}
+	}
+	if removed {
 		s.logf("varek-nri: %s %s/%s removed", what, ns, name)
-		return nil
 	}
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	return fmt.Errorf("%s %s/%s: not removed: %v", what, ns, name, err)
+	return nil
 }
 
 // After a list: the files of resources not in it removed (step 9, review: a
@@ -139,12 +208,13 @@ func (s *syncer) prune(have map[string]bool) error {
 		if err != nil {
 			return err
 		}
-		_, ext := s.kind()
 		for _, f := range files {
-			name := strings.TrimSuffix(f.Name(), ext)
-			if f.Type().IsRegular() && name != f.Name() && kube.Name.MatchString(name) && !have[n.Name()+"/"+name] {
-				if err := s.remove(n.Name(), name); err != nil && first == nil {
-					first = err
+			for _, ext := range s.exts() {
+				name := strings.TrimSuffix(f.Name(), ext)
+				if f.Type().IsRegular() && name != f.Name() && kube.Name.MatchString(name) && !have[n.Name()+"/"+name] {
+					if err := s.remove(n.Name(), name); err != nil && first == nil {
+						first = err
+					}
 				}
 			}
 		}

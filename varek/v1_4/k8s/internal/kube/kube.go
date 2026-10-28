@@ -63,7 +63,45 @@ type Policy struct {
 		Credential string   `json:"credential"`
 		Source     string   `json:"source"`
 		Namespaces []string `json:"namespaces"`
+		// v1.36 step 7 (D6, D7, D7b): a VarekPolicy's dry run, its trust
+		// bundle (a key of the chart's trust bundle ConfigMap) and its flow
+		// policy (the text of a --flow-policy file)
+		DryRun      bool   `json:"dryRun"`
+		TrustBundle string `json:"trustBundle"`
+		FlowPolicy  string `json:"flowPolicy"`
 	} `json:"spec"`
+}
+
+// TrustKey is a trust bundle's name: a ConfigMap's key, as the node agent
+// takes it (1 to 253 of a-z, A-Z, 0-9, -, _ and ., not . or ..)
+var TrustKey = regexp.MustCompile(`^[-._a-zA-Z0-9]{1,253}$`)
+
+// TrustKeyOK is whether k is a trust bundle's name
+func TrustKeyOK(k string) bool { return TrustKey.MatchString(k) && k != "." && k != ".." }
+
+// Pod is the part of a pod used here (v1.36 step 7, D7b: the breaker's
+// session is the pod's namespace and service account)
+type Pod struct {
+	Metadata struct {
+		UID string `json:"uid"`
+	} `json:"metadata"`
+	Spec struct {
+		ServiceAccountName string `json:"serviceAccountName"`
+	} `json:"spec"`
+}
+
+// GetPod is a pod by its namespace and name; nil, nil when there is none
+func (c *Client) GetPod(ctx context.Context, ns, name string) (*Pod, error) {
+	p := &Pod{}
+	err := c.get(ctx, "/api/v1/namespaces/"+url.PathEscape(ns)+"/pods/"+url.PathEscape(name), p)
+	var se *StatusError
+	if errors.As(err, &se) && se.Code == http.StatusNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 // Text is a VarekPolicy's policy, or a VarekPlan's plan

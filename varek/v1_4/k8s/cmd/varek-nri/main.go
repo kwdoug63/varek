@@ -115,9 +115,14 @@ const (
 	annotation     = "varek.dev/policy"
 	planAnnotation = "varek.dev/plan"         // v1.35 step 4c
 	oboAnnotation  = "varek.dev/on-behalf-of" // v1.36 step 6
-	oboInit        = "varek-obo"              // the webhook's init container, and its volume
-	oboCommand     = "/bin/true"
-	launcherAt     = "/varek/init"
+	// v1.36 step 7: the plugin's alone, from the pod's VarekPolicy and the API server
+	dryAnnotation   = "varek.dev/dry-run"
+	trustAnnotation = "varek.dev/trust-bundle"
+	flowAnnotation  = "varek.dev/flow-sha256"
+	saAnnotation    = "varek.dev/service-account"
+	oboInit         = "varek-obo" // the webhook's init container, and its volume
+	oboCommand      = "/bin/true"
+	launcherAt      = "/varek/init"
 	// the profile every container of an annotated pod names (G-1), under
 	// the kubelet's seccomp root
 	unsupervised = "varek/unsupervised.json"
@@ -157,6 +162,7 @@ type plugin struct {
 	oboImage                             string          // -obo-image: the webhook's init container's (step 6)
 	handlers                             map[string]bool // runtime handlers that run the filter's listener (G-4)
 	noRuleErrno                          bool            // the runtime's NRI carries no errno on a rule (before v0.12)
+	api                                  podReader       // v1.36 step 7: the API server (-sync), for a pod's service account
 	mu                                   sync.Mutex
 	filters                              map[string]*ociProfile // by the SHA-256s of the policy written for and the plan checked
 }
@@ -236,72 +242,126 @@ func (p *plugin) read(ns, name, ext, what string) ([]byte, string, error) {
 	return b, hex.EncodeToString(sum[:]), nil
 }
 
-func (p *plugin) filter(ctx context.Context, ns, name, plan string) (*ociProfile, string, string, error) {
+// v1.36 step 7: the pod's API object, for its service account (the breaker's session)
+type podReader interface {
+	GetPod(ctx context.Context, ns, name string) (*kube.Pod, error)
+}
+
+// what the plugin checked for a container: the filter, the SHA-256s of the
+// policy, the plan and (v1.36 step 7) the flow policy, and the policy's dry
+// run and trust bundle (POLICY.run, as -sync writes it)
+type filtered struct {
+	f               *ociProfile
+	sha, psha, fsha string
+	run             runOptions
+}
+
+// a policy's optional file beside it: its bytes and SHA-256, or none
+func (p *plugin) optional(ns, name, ext, what string) ([]byte, string, error) {
+	if _, err := os.Lstat(filepath.Join(p.policies, ns, name+ext)); os.IsNotExist(err) {
+		return nil, "", nil
+	}
+	return p.read(ns, name, ext, what)
+}
+
+func (p *plugin) filter(ctx context.Context, ns, name, plan string) (*filtered, error) {
 	b, sha, err := p.read(ns, name, ".policy", "policy")
 	if err != nil {
-		return nil, "", "", err
+		return nil, err
 	}
 	var pb []byte
 	psha := ""
 	if plan != "" {
 		if pb, psha, err = p.read(ns, plan, ".plan", "plan"); err != nil {
-			return nil, "", "", err
+			return nil, err
 		}
 	}
+	// v1.36 step 7 (D6, D7, D7b): the policy's flow policy, dry run and trust bundle
+	fb, fsha, err := p.optional(ns, name, ".flow", "flow policy")
+	if err != nil {
+		return nil, err
+	}
+	rb, _, err := p.optional(ns, name, ".run", "policy's options")
+	if err != nil {
+		return nil, err
+	}
+	var run runOptions
+	if rb != nil {
+		dec := json.NewDecoder(strings.NewReader(string(rb)))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&run); err != nil {
+			return nil, fmt.Errorf("the options of policy %s (%s.run) do not read: %v", name, name, err)
+		}
+	}
+	if run.TrustBundle != "" && !kube.TrustKeyOK(run.TrustBundle) {
+		return nil, fmt.Errorf("policy %s names a trust bundle %q that is not a ConfigMap's key", name, run.TrustBundle)
+	}
+	res := &filtered{sha: sha, psha: psha, fsha: fsha, run: run}
 	// v1.36 step 4 (D2): the cluster's VarekCredential list, as -sync wrote it
 	// (none: an empty one), checked with the pod's namespace
 	lb, err := os.ReadFile(filepath.Join(p.policies, kube.CredentialListFile))
 	if err != nil && !os.IsNotExist(err) {
-		return nil, "", "", fmt.Errorf("cannot read the credential list: %v", err)
+		return nil, fmt.Errorf("cannot read the credential list: %v", err)
 	}
 	lsum := sha256.Sum256(lb)
-	key := sha + "/" + psha + "/" + ns + "/" + hex.EncodeToString(lsum[:])
+	key := sha + "/" + psha + "/" + ns + "/" + hex.EncodeToString(lsum[:]) + "/" + fsha + "/" + strconv.FormatBool(run.DryRun)
 	p.mu.Lock()
 	f, ok := p.filters[key]
 	p.mu.Unlock()
 	if ok {
-		return f, sha, psha, nil
+		res.f = f
+		return res, nil
 	}
 	dir, err := os.MkdirTemp("", "varek-nri-")
 	if err != nil {
-		return nil, "", "", err
+		return nil, err
 	}
 	defer os.RemoveAll(dir)
 	copyPath := filepath.Join(dir, name+".policy")
 	if err := os.WriteFile(copyPath, b, 0o600); err != nil {
-		return nil, "", "", err
+		return nil, err
 	}
 	args := []string{copyPath, "--oci-filter", "--no-plan"}
 	if plan != "" {
 		planPath := filepath.Join(dir, plan+".plan")
 		if err := os.WriteFile(planPath, pb, 0o600); err != nil {
-			return nil, "", "", err
+			return nil, err
 		}
 		args = []string{copyPath, "--oci-filter", "--plan", planPath}
 	}
 	listPath := filepath.Join(dir, "credentials")
 	if err := os.WriteFile(listPath, lb, 0o600); err != nil {
-		return nil, "", "", err
+		return nil, err
 	}
 	args = append(args, "--credential-list", listPath, "--pod-namespace", ns)
+	if run.DryRun { // v1.36 step 7 (D6): every call outside the allowlist notified
+		args = append(args, "--dry-run")
+	}
+	if fb != nil { // (D7b): it loads, is certified, and checks the pod's plan
+		flowPath := filepath.Join(dir, name+".flow")
+		if err := os.WriteFile(flowPath, fb, 0o600); err != nil {
+			return nil, err
+		}
+		args = append(args, "--flow-policy", flowPath)
+	}
 	cmd := exec.CommandContext(ctx, p.warden, args...)
 	var errb strings.Builder
 	cmd.Stderr = &errb
 	out, err := cmd.Output()
 	if ctx.Err() != nil {
-		return nil, "", "", fmt.Errorf("the Warden did not write the filter for policy %s in the time the runtime gives (%v)", name, ctx.Err())
+		return nil, fmt.Errorf("the Warden did not write the filter for policy %s in the time the runtime gives (%v)", name, ctx.Err())
 	}
 	if err != nil {
-		return nil, "", "", fmt.Errorf("the Warden does not write the filter for policy %s: %v: %s", name, err,
+		return nil, fmt.Errorf("the Warden does not write the filter for policy %s: %v: %s", name, err,
 			strings.ReplaceAll(lastLine(errb.String()), dir+"/", ""))
 	}
 	f = &ociProfile{}
 	if err := json.Unmarshal(out, f); err != nil || len(f.Syscalls) == 0 {
-		return nil, "", "", fmt.Errorf("the Warden's filter for policy %s does not read: %v", name, err)
+		return nil, fmt.Errorf("the Warden's filter for policy %s does not read: %v", name, err)
 	}
 	for _, c := range f.VarekCredentials {
 		if !kube.CredentialName.MatchString(c) {
-			return nil, "", "", fmt.Errorf("the Warden names a credential %q that is not a credential's name", c)
+			return nil, fmt.Errorf("the Warden names a credential %q that is not a credential's name", c)
 		}
 	}
 	p.mu.Lock()
@@ -310,7 +370,8 @@ func (p *plugin) filter(ctx context.Context, ns, name, plan string) (*ociProfile
 	}
 	p.filters[key] = f
 	p.mu.Unlock()
-	return f, sha, psha, nil
+	res.f = f
+	return res, nil
 }
 
 func lastLine(s string) string {
@@ -453,9 +514,18 @@ func (p *plugin) adjust(ctx context.Context, pod *api.PodSandbox, ctr *api.Conta
 		fmt.Fprintf(os.Stderr, "varek-nri: %s/%s/%s: the runtime does not say the container's seccomp profile (the webhook "+
 			"required VAREK's unsupervised one)\n", pod.GetNamespace(), pod.GetName(), ctr.GetName())
 	}
-	f, sha, psha, err := p.filter(ctx, pod.GetNamespace(), name, plan)
+	fd, err := p.filter(ctx, pod.GetNamespace(), name, plan)
 	if err != nil {
 		return nil, refuse("%v", err)
+	}
+	f, sha, psha := fd.f, fd.sha, fd.psha
+	// v1.36 step 7 (D7b): the breaker's session, the pod's service account,
+	// from the API server (the pod's author does not write it)
+	sa := ""
+	if fd.fsha != "" {
+		if sa, err = p.serviceAccount(ctx, pod); err != nil {
+			return nil, refuse("its policy has a flow policy, and %v", err)
+		}
 	}
 	adj := &api.ContainerAdjustment{}
 	adj.SetLinuxSeccompPolicy(p.policy(f, pod.GetNamespace()+"/"+pod.GetName()+"/"+ctr.GetName()))
@@ -465,7 +535,9 @@ func (p *plugin) adjust(ctx context.Context, pod *api.PodSandbox, ctr *api.Conta
 		if m.Destination == launcherAt {
 			return nil, refuse("it has a mount at %s already", launcherAt)
 		}
-		if has(m.Options, "ro") || has(m.Options, "noexec") || kernelKinds[m.Type] {
+		// v1.36 step 7 (D6): a dry run holds no launch, as on a host: no
+		// mount is made noexec
+		if has(m.Options, "ro") || has(m.Options, "noexec") || kernelKinds[m.Type] || fd.run.DryRun {
 			continue
 		}
 		// the same destination again: the runtime puts it in the place of
@@ -496,6 +568,19 @@ func (p *plugin) adjust(ctx context.Context, pod *api.PodSandbox, ctr *api.Conta
 	} else {
 		adj.RemoveAnnotation(oboAnnotation)
 	}
+	// v1.36 step 7 (D6, D7, D7b): its VarekPolicy's dry run, trust bundle and
+	// flow policy, each set or removed (the pod's own are not taken)
+	own := func(key, val string, set bool) {
+		if set {
+			adj.AddAnnotation(key, val)
+		} else {
+			adj.RemoveAnnotation(key)
+		}
+	}
+	own(dryAnnotation, "true", fd.run.DryRun)
+	own(trustAnnotation, fd.run.TrustBundle, fd.run.TrustBundle != "")
+	own(flowAnnotation, fd.fsha, fd.fsha != "")
+	own(saAnnotation, sa, sa != "")
 	// the pod's names, for the node agent's record (CRI-O puts the
 	// kubelet's in one JSON string; a runtime's own, where it has them,
 	// must agree)
@@ -504,6 +589,29 @@ func (p *plugin) adjust(ctx context.Context, pod *api.PodSandbox, ctr *api.Conta
 	adj.AddAnnotation("varek.dev/pod-uid", pod.GetUid())
 	adj.AddAnnotation("varek.dev/container", ctr.GetName())
 	return adj, nil
+}
+
+// serviceAccount is the pod's, as the API server has it (its uid the
+// runtime's: the same pod, not one created again by its name)
+func (p *plugin) serviceAccount(ctx context.Context, pod *api.PodSandbox) (string, error) {
+	if p.api == nil {
+		return "", fmt.Errorf("the plugin reads no pod from the API server (-sync), for its service account (the breaker's session)")
+	}
+	o, err := p.api.GetPod(ctx, pod.GetNamespace(), pod.GetName())
+	if err != nil {
+		return "", fmt.Errorf("its pod cannot be read from the API server: %v", err)
+	}
+	if o == nil || o.Metadata.UID != pod.GetUid() {
+		return "", fmt.Errorf("the API server has no pod %s/%s of uid %s", pod.GetNamespace(), pod.GetName(), pod.GetUid())
+	}
+	sa := o.Spec.ServiceAccountName
+	if sa == "" {
+		sa = "default"
+	}
+	if !secretName.MatchString(sa) {
+		return "", fmt.Errorf("its service account's name %q is not one", sa)
+	}
+	return sa, nil
 }
 
 // oboContainer: whether the container is the webhook's init container for a
@@ -623,6 +731,7 @@ func main() {
 		go (&syncer{c: c, dir: p.policies, logf: logf}).run(context.Background())
 		go (&syncer{c: c, dir: p.policies, logf: logf, resource: kube.Plans}).run(context.Background())
 		go (&credSyncer{c: c, dir: p.policies, logf: logf}).run(context.Background()) // v1.36 step 4 (D2)
+		p.api = c                                                                     // v1.36 step 7 (D7b)
 	}
 	opts := []stub.Option{stub.WithPluginName("varek"), stub.WithPluginIdx("10")}
 	if *socket != "" {
