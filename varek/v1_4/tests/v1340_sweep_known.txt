@@ -51,7 +51,10 @@
 #            read-only at its path, as a pod's read-only volume holds one),
 #            the on-behalf-of chain from step 6 (the stand-in puts the token
 #            where the kubelet keeps the pod's varek-obo volume and gives
-#            the SVID by a stand-in varek-svid).
+#            the SVID by a stand-in varek-svid), the dry run and trust
+#            bundles from step 7 (the stand-in annotates the container as
+#            the plugin does for a VarekPolicy saying them; a flow policy
+#            checks a plan, and the stand-in gives no pod one).
 #  OBO       v1.36 step 6 (D5): a pod's user's token and its agent's SVID are
 #            the node agent's, read from the kubelet's copy and SPIRE's
 #            answer outside the container and copied to its own files: its
