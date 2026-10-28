@@ -290,13 +290,17 @@ spec:
         {{- if .Values.spire.adminSocket }}
         - { name: spire-admin, hostPath: { path: {{ dir .Values.spire.adminSocket }}, type: DirectoryOrCreate } }
         {{- end }}
+        # projected, not configMap: a ConfigMap's volume is a directory on the
+        # node's disk that the kubelet makes writable by all (0777), which
+        # warden-secrets refuses for a trust file's; a projected one is in
+        # memory, as a Secret's is (the first kind run of v1.36 step 6)
         {{- if .Values.spire.bundleConfigMap }}
         - name: spire-bundle
-          configMap: { name: {{ .Values.spire.bundleConfigMap }}, defaultMode: 0444 }
+          projected: { defaultMode: 0444, sources: [{ configMap: { name: {{ .Values.spire.bundleConfigMap }} } }] }
         {{- end }}
         {{- if .Values.onBehalfOf.issuerCaConfigMap }}
         - name: issuer-ca
-          configMap: { name: {{ .Values.onBehalfOf.issuerCaConfigMap }}, defaultMode: 0444, items: [{ key: ca.crt, path: ca.crt }] }
+          projected: { defaultMode: 0444, sources: [{ configMap: { name: {{ .Values.onBehalfOf.issuerCaConfigMap }}, items: [{ key: ca.crt, path: ca.crt }] } }] }
         {{- end }}
         {{- if .Values.signing.secretName }}
         - name: key

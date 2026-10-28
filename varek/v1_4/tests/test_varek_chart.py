@@ -510,7 +510,9 @@ def test_on_behalf_of():
     agent = ctr(spec, "node-agent")
     assert arg(agent, "--node-spire-socket") == sock and arg(agent, "--node-spire-self") == me
     assert host_path(spec, agent, sock) == sock
-    assert volumes(spec)[mounts(agent)["/etc/varek/spire-bundle"]["name"]]["configMap"]["name"] == "spire-bundle"
+    # projected (in memory): a configMap volume's directory is the node's, writable by all
+    assert volumes(spec)[mounts(agent)["/etc/varek/spire-bundle"]["name"]]["projected"]["sources"] == [
+        {"configMap": {"name": "spire-bundle"}}]
     assert mounts(agent)["/etc/varek/spire-bundle"]["readOnly"] is True
     p = render("spire.self=" + me, ok=False)
     assert p.returncode != 0 and "spire.self: give spire.adminSocket too" in p.stderr
@@ -519,8 +521,9 @@ def test_on_behalf_of():
     agent, spec = ctr(pod(docs, "DaemonSet"), "node-agent"), pod(docs, "DaemonSet")
     assert _conf(docs)["oidc_ca"] == "/etc/varek/issuer-ca/ca.crt"
     assert arg(agent, "--secrets-conf") == "/etc/varek/secrets/secrets.conf"
-    v = volumes(spec)[mounts(agent)["/etc/varek/issuer-ca"]["name"]]["configMap"]
-    assert v["name"] == "kube-root-ca.crt" and v["items"] == [{"key": "ca.crt", "path": "ca.crt"}]
+    v = volumes(spec)[mounts(agent)["/etc/varek/issuer-ca"]["name"]]["projected"]
+    assert v["sources"] == [{"configMap": {"name": "kube-root-ca.crt", "items": [{"key": "ca.crt", "path": "ca.crt"}]}}]
+    assert "configMap" not in volumes(spec)[mounts(agent)["/etc/varek/issuer-ca"]["name"]]
     assert "issuer-ca" not in volumes(pod(render(), "DaemonSet"))
     # the init container's user: the value, or on OpenShift the namespace's
     assert arg(ctr(pod(render("onBehalfOf.user=1001"), "Deployment"), "admission"), "-obo-user") == "1001"
