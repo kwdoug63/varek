@@ -333,6 +333,55 @@ spec:
   session is the pod's namespace and service account, which the plugin reads
   from the API server (the chart gives it `get` on pods).
 
+## A key for each node (from 1.36)
+
+Each node agent makes its own signing key at its first start
+(`signing.nodeKey`). The key stays on the node, root's and mode 0400, in a
+directory only the node agent mounts (`signing.nodeKey.dir`). Its public
+key is written apart (`signing.nodeKey.pubDir`), where the plugin and the
+exporter read it. The plugin publishes it as the node's `VarekNodeKey`, a
+cluster-scoped resource named for the node and the key:
+
+```sh
+kubectl get vareknodekeys
+NAME                          NODE     KEY                     ADMITTED
+node-1-3f9a0c2e71d4b856       node-1   3f9a0c2e71d4b856...     2d
+```
+
+- **Only that node publishes it.** The webhook admits a `VarekNodeKey` only
+  from the node agent's service account, and only for the node its token was
+  given on: the API server gives the node's name with the kubelet's bound
+  token. A key is never changed, and a node does not remove one; a cluster
+  administrator may. The webhook is never skipped for these
+  (`failurePolicy: Fail` whatever `admission.failurePolicy` says), since it is
+  what ties each key to its node.
+- **Each stream names its node** (`run_start`'s `node.node_name`), and is
+  signed with that node's key. A node that is taken over signs only as
+  itself.
+- **To audit a stream**, give the audit the cluster's list:
+
+  ```sh
+  kubectl get vareknodekeys -o json > node-keys.json
+  varek_audit.py --policy STREAM.policy --checker vdp_cert_check \
+      --node-keys node-keys.json --anchor ANCHOR STREAM.jsonl
+  ```
+
+  The stream's key must be the one listed for its node.
+- **A rebuilt node** (its key gone) makes a new key, published as a new
+  `VarekNodeKey`; the one before is kept for the streams it signed. The old
+  key is retired at the new one's `creationTimestamp`, a time the cluster
+  sets, and the audit trusts it only for runs that began before then. The
+  time a run began is the anchor host's when the anchor holds its
+  `run_start` with a receive time (`tools/varek_anchor_receiver.sh`);
+  otherwise it is the node's own clock, and the report says so.
+- **With the anchor on** (`anchor.enabled`), each start of the node agent
+  also announces its key there (a `node_key` line, carried by the
+  forwarder and stamped by the receiver). `varek_audit.py --list-runs
+  --anchor FILE` lists them.
+
+`signing.secretName` instead signs every node's streams with one key, a
+Secret (v1.34's way); then no node makes a key of its own.
+
 ## Values
 
 | Value | Default | |
@@ -343,7 +392,8 @@ spec:
 | `node.seccompRoot` | `/var/lib/kubelet/seccomp` | the kubelet's seccomp root, where the unsupervised profile is put |
 | `node.dnsServer` | `""` | the DNS server the node agent resolves policies' host names through: `""` the cluster's DNS service, looked up at install (`helm template` sees no cluster, and gives none); `none` the pod's own (the webhook keeps it to the cluster's) |
 | `nri.runtimeHandlers` | `[runc, crun]` | the runtime handlers whose containers run the Warden's filter; a supervised pod of another is refused by the plugin |
-| `signing.secretName` | `""` | a Secret with `key` and `key.pub` (from `tools/varek_keygen`): each stream signed with the node's key |
+| `signing.nodeKey.enabled`, `.dir`, `.pubDir` | `true`, `/var/lib/varek/key`, `/var/lib/varek/key-pub` | each node agent's own key, made at its first start, and where its public key is written (published as the node's `VarekNodeKey`) |
+| `signing.secretName` | `""` | one key for every node instead: a Secret with `key` and `key.pub` (from `tools/varek_keygen`) |
 | `signing.checkpointEvery` | `256` | a checkpoint every this many records |
 | `anchor.enabled`, `anchor.file` | `false`, `anchor` | each run's checkpoints appended to the node's anchor, in the streams' directory |
 | `exporter.enabled`, `exporter.maxFollowers` | `true`, `64` | the streams as OCSF in the exporter's log; at most this many followed at once |
@@ -366,9 +416,10 @@ spec:
 
 ## What it does not do yet
 
-The node's signing key (`signing.secretName`) is one Secret, given to every
-node: a stream says which node wrote it (its `device`), but each node's key
-is the same key. A key of each node's own is not made by this chart.
+A node's key is tied to its node by the node's name in the plugin's service
+account token, which the API server gives for a token bound to a pod. A
+cluster whose tokens do not name their node admits no `VarekNodeKey`; use
+`signing.secretName` there.
 
 The plugin checks again that a supervised container names the unsupervised
 profile where the runtime tells it the container's profile. CRI-O 1.37 does

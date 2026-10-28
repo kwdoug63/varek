@@ -117,6 +117,167 @@ static ino_t g_node_launcher_ino;
 
 static void node_fail(const char *why) __attribute__((noreturn));
 
+/* v1.36 step 9 (D10): a key for each node. --node-key FILE is the node
+ * agent's own signing key, made at its first start and kept on the node: an
+ * Ed25519 seed, 64 hex characters as tools/varek_keygen writes it, root's,
+ * mode 0400, in a directory no one else may write. FILE.pub, its public key
+ * (or --node-key-pub PATH: the chart keeps it apart, where the plugin and the
+ * exporter read it, and the key where only the node agent does), is written
+ * again from it at each start (root's, 0444); the NRI plugin
+ * publishes it as the node's VarekNodeKey, which the admission webhook
+ * admits only from the plugin on this node. Every supervisor signs with it,
+ * as with --sign-key. --node-name is the node's name, in each run_start
+ * ("node":{"node_name":...}), by which the audit finds the stream's key in
+ * the cluster's list; with --anchor, each start announces the key there
+ * too, in a node_key line, which the anchor host stamps with its own time. */
+static const char *g_node_name;                   /* --node-name */
+
+/* a node's name as Kubernetes has it: a DNS subdomain, 1 to 253 of a-z, 0-9, . and - */
+static bool node_name_ok(const char *s) {
+    size_t n = strlen(s);
+    if (n < 1 || n > 253 || !isalnum((unsigned char)s[0]) || !isalnum((unsigned char)s[n - 1])) return false;
+    for (size_t i = 0; i < n; i++)
+        if (!((s[i] >= 'a' && s[i] <= 'z') || (s[i] >= '0' && s[i] <= '9') || s[i] == '.' || s[i] == '-'))
+            return false;
+    return true;
+}
+
+/* write text to a new file beside path (path.new, made afresh), then put it
+ * in place: renamed over path, or (replace false) linked to it, failing with
+ * EEXIST if path is there. 0 or an errno. */
+static int node_key_put(const char *path, const char *text, mode_t mode, bool replace) {
+    char tmp[PATH_MAX];
+    if ((size_t)snprintf(tmp, sizeof tmp, "%s.new", path) >= sizeof tmp) return ENAMETOOLONG;
+    if (unlink(tmp) < 0 && errno != ENOENT) return errno;
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode);
+    if (fd < 0) return errno;
+    size_t len = strlen(text);
+    ssize_t w;
+    do { w = write(fd, text, len); } while (w < 0 && errno == EINTR);
+    int err = w != (ssize_t)len ? (w < 0 ? errno : EIO) : 0;
+    if (!err && (fchmod(fd, mode) < 0 || fsync(fd) < 0)) err = errno;
+    if (close(fd) < 0 && !err) err = errno;
+    if (!err && (replace ? rename(tmp, path) : link(tmp, path)) < 0) err = errno;
+    if (err || !replace) (void)unlink(tmp);
+    return err;
+}
+
+static int node_key_prepare(const char *path, const char *pub_path, const char *anchor) {
+    if (sodium_init() < 0) { fprintf(stderr, "[warden] libsodium failed to initialize\n"); return -1; }
+    /* the key's directory: root's, written by no one else (so no one else
+     * can put a key of their own there before the first start) */
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *sl = strrchr(dir, '/');
+    if (!sl) snprintf(dir, sizeof dir, ".");
+    else if (sl == dir) dir[1] = '\0';
+    else *sl = '\0';
+    struct stat ds;
+    if (lstat(dir, &ds) < 0 || !S_ISDIR(ds.st_mode) || ds.st_uid != 0 || (ds.st_mode & 022)) {
+        fprintf(stderr, "[warden] --node-key %s: its directory %s must be root's, written by no one else\n", path, dir);
+        return -1;
+    }
+    unsigned char seed[crypto_sign_SEEDBYTES];
+    char hex[2 * crypto_sign_SEEDBYTES + 2];
+    bool made = false;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0 && errno == ENOENT) {        /* the first start: make it */
+        randombytes_buf(seed, sizeof seed);
+        sodium_bin2hex(hex, sizeof hex - 1, seed, sizeof seed);
+        sodium_memzero(seed, sizeof seed);
+        strcat(hex, "\n");
+        int err = node_key_put(path, hex, 0400, false);
+        sodium_memzero(hex, sizeof hex);
+        if (err && err != EEXIST) {         /* EEXIST: made meanwhile; read that one */
+            fprintf(stderr, "[warden] --node-key %s: cannot make the node's key: %s\n", path, strerror(err));
+            return -1;
+        }
+        made = !err;
+        fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    }
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != 0 || (st.st_mode & 077)) {
+        fprintf(stderr, "[warden] --node-key %s: must be a regular file, root's, readable by no one else (0400)%s%s\n",
+                path, fd < 0 ? ": " : "", fd < 0 ? strerror(errno) : "");
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    char buf[80];
+    ssize_t n;
+    do { n = read(fd, buf, sizeof buf); } while (n < 0 && errno == EINTR);
+    close(fd);
+    size_t bl = 0;
+    bool ok = (n == 64 || (n == 65 && buf[64] == '\n')) &&
+              sodium_hex2bin(seed, sizeof seed, buf, 64, NULL, &bl, NULL) == 0 && bl == sizeof seed;
+    sodium_memzero(buf, sizeof buf);
+    unsigned char *sk = ok ? sodium_malloc(crypto_sign_SECRETKEYBYTES) : NULL;
+    unsigned char pk[crypto_sign_PUBLICKEYBYTES];
+    if (sk) {
+        crypto_sign_seed_keypair(pk, sk, seed);
+        sodium_free(sk);
+    }
+    sodium_memzero(seed, sizeof seed);
+    if (!sk) {
+        fprintf(stderr, "[warden] --node-key %s: %s\n", path, ok ? "cannot allocate protected memory"
+                : "not a VAREK signing key (64 hex characters); remove it, and the node agent makes a new one");
+        return -1;
+    }
+    char pk_hex[2 * crypto_sign_PUBLICKEYBYTES + 2];
+    sodium_bin2hex(pk_hex, sizeof pk_hex - 1, pk, sizeof pk);
+    char pub[PATH_MAX];
+    if ((size_t)snprintf(pub, sizeof pub, pub_path ? "%s" : "%s.pub", pub_path ? pub_path : path) >= sizeof pub) {
+        fprintf(stderr, "[warden] --node-key %s: the path is too long\n", path);
+        return -1;
+    }
+    if (pub_path) {                         /* its directory, as the key's */
+        char pd[PATH_MAX];
+        snprintf(pd, sizeof pd, "%s", pub);
+        char *ps = strrchr(pd, '/');
+        if (!ps) snprintf(pd, sizeof pd, ".");
+        else if (ps == pd) pd[1] = '\0';
+        else *ps = '\0';
+        struct stat pds;
+        if (lstat(pd, &pds) < 0 || !S_ISDIR(pds.st_mode) || pds.st_uid != 0 || (pds.st_mode & 022)) {
+            fprintf(stderr, "[warden] --node-key-pub %s: its directory %s must be root's, written by no one else\n",
+                    pub, pd);
+            return -1;
+        }
+    }
+    strcat(pk_hex, "\n");
+    int err = node_key_put(pub, pk_hex, 0444, true);
+    pk_hex[2 * crypto_sign_PUBLICKEYBYTES] = '\0';
+    if (err) {
+        fprintf(stderr, "[warden] --node-key %s: cannot write its public key %s: %s\n", path, pub, strerror(err));
+        return -1;
+    }
+    fprintf(stderr, "[warden] node agent: %s the node's key %s (node %s, public key %s)\n", made ? "made" : "signing with",
+            path, g_node_name, pk_hex);
+    if (anchor) {                           /* the key, announced where the stream heads go */
+        int af = open(anchor, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW, 0600);
+        struct stat as;
+        if (af < 0 || fstat(af, &as) < 0 || !(S_ISREG(as.st_mode) || S_ISFIFO(as.st_mode) || S_ISCHR(as.st_mode))) {
+            fprintf(stderr, "[warden] anchor %s: %s\n", anchor, af < 0 ? strerror(errno)
+                    : "not a regular file, FIFO or character device");
+            if (af >= 0) close(af);
+            return -1;
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        char line[512];
+        int ln = snprintf(line, sizeof line, "{\"event\":\"node_key\",\"node\":\"%s\",\"key\":\"%s\",\"timestamp_ns\":%lld}\n",
+                          g_node_name, pk_hex, (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+        ssize_t w;
+        do { w = write(af, line, (size_t)ln); } while (w < 0 && errno == EINTR);
+        int e = w < 0 ? errno : EIO;
+        close(af);
+        if (w != ln) {
+            fprintf(stderr, "[warden] anchor %s: cannot announce the node's key there: %s\n", anchor, strerror(e));
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* struct node_run and g_nr are in warden.c, before the supervision loop */
 
 static int node_read_file(int dirfd, const char *name, char **out, size_t *on, size_t max) {
@@ -1054,7 +1215,9 @@ static int node_creds_check(const struct policy *p, char (*ph)[WP_PH_MAX], char 
 /* run_start's container fields */
 static void node_run_start(FILE *f) {
     if (!g_nr.on) return;
-    fprintf(f, "\"node\":{\"container\":\"");
+    fputs("\"node\":{", f);
+    if (g_node_name) fprintf(f, "\"node_name\":\"%s\",", g_node_name);   /* v1.36 step 9 (D10) */
+    fputs("\"container\":\"", f);
     json_escape(f, g_nr.id);
     fprintf(f, "\",\"pid\":%d,\"metadata\":\"", (int)g_nr.pid);
     json_escape(f, g_nr.meta);

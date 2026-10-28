@@ -73,7 +73,16 @@ order (NAME.jsonl NAME.jsonl.2 ...), or put together in one file.
 
 Usage:
   varek_audit.py --policy POLICY --checker tools/vdp_cert_check
-                 [--pubkey KEY.pub|HEX] [--anchor ANCHOR] VERDICTS.LOG [SEGMENT ...]
+                 [--pubkey KEY.pub|HEX | --node-keys LIST] [--anchor ANCHOR] VERDICTS.LOG [SEGMENT ...]
+
+v1.36 step 9 (D10): under the node agent each node signs with its own key,
+listed in the cluster as a VarekNodeKey. --node-keys takes that list
+(kubectl get vareknodekeys -o json) in place of --pubkey: the stream's key
+must be the one listed for the node its run_start names, and not one
+retired before the run began (a key is retired when the node's next is
+admitted, at that one's creationTimestamp). The run began when the anchor
+host received its run_start, if --anchor holds that; else when run_start
+says, by the node's own clock, as the report says.
 """
 
 import argparse
@@ -3611,6 +3620,48 @@ def _cli_pubkey(arg):
     return _hex_key(arg.strip().lower())
 
 
+def _rfc3339_ns(t):
+    """A Kubernetes timestamp (2026-10-28T12:00:00Z) as nanoseconds since the epoch, or None."""
+    import datetime
+    try:
+        d = datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+    return int(d.timestamp()) * 1_000_000_000
+
+
+def _ns_text(ns):
+    import datetime
+    return datetime.datetime.fromtimestamp(ns / 1e9, datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def _node_keys(path):
+    """v1.36 step 9 (D10): --node-keys, the cluster's VarekNodeKey resources
+    as `kubectl get vareknodekeys -o json` writes them (a List, or one
+    object): {node: [(admitted ns, key, resource name)]}, each node's in the
+    order the cluster admitted them; or (None, why)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as e:
+        return None, f"--node-keys {path}: {e}"
+    items = doc.get("items") if isinstance(doc, dict) and isinstance(doc.get("items"), list) else [doc]
+    keys = {}
+    for it in items:
+        md = it.get("metadata") if isinstance(it, dict) else None
+        sp = it.get("spec") if isinstance(it, dict) else None
+        if not isinstance(md, dict) or not isinstance(sp, dict) or it.get("kind", "VarekNodeKey") != "VarekNodeKey":
+            return None, f"--node-keys {path}: an item that is not a VarekNodeKey"
+        k, t, node = _hex_key(sp.get("publicKey")), _rfc3339_ns(md.get("creationTimestamp")), sp.get("node")
+        if k is None or t is None or not isinstance(node, str) or not node:
+            return None, (f"--node-keys {path}: VarekNodeKey {md.get('name')!r} has no node, no 64-hex publicKey, "
+                          f"or no creationTimestamp")
+        keys.setdefault(node, []).append((t, k, str(md.get("name"))))
+    for v in keys.values():
+        v.sort(key=lambda e: (e[0], e[2]))
+    return keys, None
+
+
 class AnchorIndex:
     """v1.36 (D9): this run's anchor lines, by chain value, on disk (SQLite,
     in a temporary file), each with its place in the file and whether its
@@ -3686,6 +3737,8 @@ class Integrity:
         self.delays = None                   # (min, max, how many)
         self.nlate = 0                       # how many over --max-anchor-delay
         self.sealed_max = None               # anchored without a key: the last record the anchor holds
+        self.start_rx = None                 # when the anchor host received run_start (D10)
+        self.key_note = None                 # --node-keys: whose key signed the stream
 
     def start(self, rs, run):
         """run_start: the key, the pinned key, checkpoint_every, and the anchor's
@@ -3716,6 +3769,9 @@ class Integrity:
         elif a.pubkey:
             head.append("--pubkey given, but the stream is not signed (the Warden ran "
                         "without --sign-key)")
+        elif a.node_keys:
+            head.append("--node-keys given, but the stream is not signed (the node agent ran "
+                        "without --node-key)")
         if a.anchor:
             self.load_anchor()
         for kind, c in self.early:
@@ -3813,6 +3869,8 @@ class Integrity:
         self.matched_n += 1
         if hit.get("event") == "run_end" and isinstance(hit.get("received_ns"), int):
             self.end_rx = hit["received_ns"]
+        if hit.get("event") == "run_start" and isinstance(hit.get("received_ns"), int):
+            self.start_rx = hit["received_ns"]
         # How late each record reached the anchor host: its receive time (set
         # by the anchor host) against the time in the STREAM's signed record
         # (an anchor line's own timestamp is not trusted).
@@ -3825,6 +3883,50 @@ class Integrity:
         self.sealed_max = c["ndec"]
         if self.mode != "signed":
             self.sealed(c["ndec"])
+
+    def node_key(self, head):
+        """v1.36 step 9 (D10): the stream's key, if the cluster's list holds it
+        for the stream's node and it was not retired before the run began;
+        else None, with the problem. A key is retired when the node's next
+        key is admitted, at that one's creationTimestamp (the cluster's time).
+        The run began when the anchor host received its run_start, if the
+        anchor holds that; else at the time its run_start says, the node's
+        own."""
+        a, rs = self.a, self.rs or {}
+        keys, why = _node_keys(a.node_keys)
+        if keys is None:
+            head.append(why)
+            return None
+        node = (rs.get("node") or {}).get("node_name") if isinstance(rs.get("node"), dict) else None
+        if not isinstance(node, str):
+            head.append("--node-keys given, but the stream's run_start names no node (a node agent without "
+                        "--node-name, or not one)")
+            return None
+        mine = keys.get(node, [])
+        at = next((i for i, e in enumerate(mine) if e[1] == self.pk), None)
+        if at is None:
+            elsewhere = sorted(n for n, v in keys.items() if n != node and any(e[1] == self.pk for e in v))
+            head.append(f"the stream is signed by {self.pk.hex()}, which the cluster's list does not hold for node "
+                        f"{node}" + (f" (it is {', '.join(elsewhere)}'s)" if elsewhere else ""))
+            return None
+        admitted, _, name = mine[at]
+        nxt = next((e for e in mine[at + 1:] if e[0] > admitted), None)
+        if self.start_rx is not None:
+            began, clock = self.start_rx, "by the anchor host's clock"
+        elif isinstance(rs.get("timestamp_ns"), int):
+            began, clock = rs["timestamp_ns"], "by the node's own clock: the anchor holds no time it received run_start"
+        else:
+            head.append("run_start has no timestamp_ns: when the run began is not known")
+            return None
+        if nxt is not None and began >= nxt[0]:
+            head.append(f"the stream is signed by node {node}'s key {name}, retired at {_ns_text(nxt[0])} when the "
+                        f"node's next key ({nxt[2]}) was admitted; the run began at {_ns_text(began)} ({clock}), "
+                        f"after")
+            return None
+        self.key_note = (f"node {node}'s key {name}, admitted {_ns_text(admitted)}" +
+                         (f"; retired at {_ns_text(nxt[0])}, after the run began at {_ns_text(began)} ({clock})"
+                          if nxt is not None else ""))
+        return self.pk
 
     def finish(self, meta, complete):
         """the rest of log_integrity's checks, its notes printed; the level"""
@@ -3847,11 +3949,15 @@ class Integrity:
                 sec["integ_tail"].append(f"{tail} decision records after the last signature, more than "
                                          f"checkpoint_every ({self.every}): checkpoints were removed")
             meta["signed_through"] = self.prev
+            if a.node_keys:
+                self.pinned = self.node_key(sec["integ_head"])
             pinned, pk = self.pinned, self.pk
             level = "signed" if (pinned is not None and pinned == pk and not self.bad) \
                 else "signed, key not pinned (pass --pubkey to rely on the signatures)"
             if not complete:
                 level += f"; covers the first {self.prev} decision records only"
+            if self.key_note:
+                print(f"varek_audit: signed with {self.key_note}")
         if a.anchor:
             ap = sec["integ_anchor"]
             # A validly signed anchored record the stream does not hold is evidence
@@ -3960,6 +4066,16 @@ def list_runs(path):
               f"{'ended ' + fmt(end.get('timestamp_ns')) if end else 'NO run_end'}  "
               f"{evs.count('checkpoint')} checkpoint(s)  "
               f"received {fmt(es[0].get('received_ns'))} .. {fmt(es[-1].get('received_ns'))}")
+    # v1.36 step 9 (D10): the keys node agents announced there, each when first received
+    seen = {}
+    for e in lines:
+        if e.get("event") == "node_key" and isinstance(e.get("node"), str) and isinstance(e.get("key"), str):
+            seen.setdefault((e["node"], e["key"]), e)
+    if seen:
+        print(f"varek_audit: {len(seen)} node key(s) announced in {path}")
+        for (node, key), e in seen.items():
+            print(f"  node {node}  key {key}  announced {fmt(e.get('timestamp_ns'))}  "
+                  f"received {fmt(e.get('received_ns'))}")
     return 0
 
 
@@ -4309,6 +4425,9 @@ def main(argv=None):
                     help="audit a stream from the test-only fault-injected Warden (testing)")
     ap.add_argument("--pubkey", help="the Warden's signing public key (64 hex characters, "
                     "or a .pub file from tools/varek_keygen): signatures must verify under it")
+    ap.add_argument("--node-keys", metavar="LIST", help="v1.36 (D10): the cluster's VarekNodeKey resources "
+                    "(kubectl get vareknodekeys -o json): the stream must be signed by the key listed for its "
+                    "node, and not one retired before the run began")
     ap.add_argument("--anchor", help="the Warden's --anchor file: the stream's signed records "
                     "must match it")
     ap.add_argument("--run", help="the run id the stream must carry (run_start's \"run\")")
@@ -4333,6 +4452,8 @@ def main(argv=None):
     ap.add_argument("log", nargs="*", help="the verdict stream; v1.36: a stream the node agent rotated "
                     "is its segments, in order (NAME.jsonl, NAME.jsonl.2, ...)")
     a = ap.parse_args(argv)
+    if a.pubkey and a.node_keys:
+        ap.error("--pubkey and --node-keys each say which key to rely on: give one")
     if a.list_runs:
         if not a.anchor:
             ap.error("--list-runs needs --anchor")

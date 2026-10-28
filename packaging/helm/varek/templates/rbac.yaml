@@ -4,8 +4,10 @@
   resources (v1.36); the webhook reads a pod's policy and plan, and lists the
   VarekCredential resources to check a policy that names credentials. Neither
   may change one. v1.36 step 7 (D7b): the plugin gets a pod, for its service
-  account (a flow policy's session). */}}
-{{- range $who := list (dict "name" (include "varek.nodeName" .) "verbs" (list "get" "list" "watch") "credVerbs" (list "get" "list" "watch") "podVerbs" (list "get")) (dict "name" (include "varek.admissionName" .) "verbs" (list "get") "credVerbs" (list "list") "podVerbs" (list)) }}
+  account (a flow policy's session). v1.36 step 9 (D10): the plugin makes its
+  node's VarekNodeKey and reads it back; it may not change or remove one,
+  and the webhook admits one only for the plugin's own node. */}}
+{{- range $who := list (dict "name" (include "varek.nodeName" .) "verbs" (list "get" "list" "watch") "credVerbs" (list "get" "list" "watch") "podVerbs" (list "get") "keyVerbs" (list "get" "create")) (dict "name" (include "varek.admissionName" .) "verbs" (list "get") "credVerbs" (list "list") "podVerbs" (list)) }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -25,6 +27,11 @@ rules:
   - apiGroups: ["varek.dev"]
     resources: ["varekcredentials"]
     verbs: {{ toJson $who.credVerbs }}
+  {{- if $who.keyVerbs }}
+  - apiGroups: ["varek.dev"]
+    resources: ["vareknodekeys"]
+    verbs: {{ toJson $who.keyVerbs }}
+  {{- end }}
   {{- if $who.podVerbs }}
   - apiGroups: [""]
     resources: ["pods"]

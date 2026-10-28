@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: MIT
+#
+# v1.36 step 9 (docs/security/v1.36-kubernetes-parity.md, D10): a node's
+# signing key, cluster-scoped. Each node agent makes its own key at its
+# first start and keeps it on the node (signing.nodeKey); VAREK's NRI plugin
+# on that node publishes its public key as a VarekNodeKey named for the node
+# and the key (NODE-<the key's first 16 hex characters>). The admission
+# webhook admits one only from the node agent's service account, from the
+# node it names (the node's name the API server gives for the token), and
+# never a change to one. A rebuilt node's new key is a new VarekNodeKey; the
+# one before it is retired at the new one's creationTimestamp, and kept for
+# the streams it signed: the audit trusts it only for runs that began
+# before then (varek_audit.py --node-keys, given `kubectl get
+# vareknodekeys -o json`). Helm installs it with the chart, and does not
+# change or remove it on an upgrade or an uninstall (Helm's rule for
+# crds/): it is applied by hand on an upgrade from a chart before 1.36
+# (kubectl apply -f).
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: vareknodekeys.varek.dev
+spec:
+  group: varek.dev
+  scope: Cluster
+  names:
+    plural: vareknodekeys
+    singular: vareknodekey
+    kind: VarekNodeKey
+    shortNames: [vnk]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Node
+          type: string
+          jsonPath: .spec.node
+        - name: Key
+          type: string
+          jsonPath: .spec.publicKey
+        - name: Admitted
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [node, publicKey]
+              # a key is never changed: a new key is a new VarekNodeKey
+              x-kubernetes-validations:
+                - rule: self == oldSelf
+                  message: a node's key is not changed (a new key is a new VarekNodeKey)
+              properties:
+                node:
+                  description: The node's name, as Kubernetes has it.
+                  type: string
+                  pattern: '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$'
+                publicKey:
+                  description: The node agent's Ed25519 public key, 64 hex characters (its --node-key FILE.pub).
+                  type: string
+                  pattern: '^[0-9a-f]{64}$'

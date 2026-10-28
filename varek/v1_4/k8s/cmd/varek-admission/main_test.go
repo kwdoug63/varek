@@ -783,3 +783,83 @@ func (f fakeFlowAPI) GetPolicy(ctx context.Context, ns, name string) (*kube.Poli
 	p.Spec.Policy, p.Spec.FlowPolicy = "require warden 1.35\nallow path /tmp/\n", "varek_policy 1\n"
 	return p, nil
 }
+
+// v1.36 step 9 (D10): a node's key, admitted only from its node
+func TestVarekNodeKey(t *testing.T) {
+	s := testServer(t, "")
+	key := strings.Repeat("ab", 32)
+	agent := "system:serviceaccount:varek:varek-node"
+	nk := func(node, name string) *kube.NodeKey {
+		k := kube.NewNodeKey(node, key)
+		if name != "" {
+			k.Metadata.Name = name
+		}
+		return k
+	}
+	ask := func(op string, k, old *kube.NodeKey, user, node string) (bool, string) {
+		b, _ := json.Marshal(k)
+		var ob []byte
+		if old != nil {
+			ob, _ = json.Marshal(old)
+		}
+		u := userInfo{Username: user}
+		if node != "" {
+			u.Extra = map[string][]string{nodeNameExtra: {node}}
+		}
+		in, _ := json.Marshal(review{APIVersion: "admission.k8s.io/v1", Kind: "AdmissionReview",
+			Request: &request{UID: "u-1", Operation: op, Object: b, OldObject: ob, UserInfo: u}})
+		rec := httptest.NewRecorder()
+		s.mux().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/vareknodekey", bytes.NewReader(in)))
+		var out review
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || out.Response == nil {
+			t.Fatalf("the answer does not read: %s", rec.Body.String())
+		}
+		if out.Response.Status != nil {
+			return out.Response.Allowed, out.Response.Status.Message
+		}
+		return out.Response.Allowed, ""
+	}
+	if ok, msg := ask("CREATE", nk("node-1", ""), nil, agent, "node-1"); ok || !strings.Contains(msg, "-node-agent-sa") {
+		t.Errorf("a webhook not given the node agent's account admits a key: %v %q", ok, msg)
+	}
+	s.nodeAgent = agent
+	for _, c := range []struct {
+		what       string
+		k          *kube.NodeKey
+		user, node string
+		why        string
+	}{
+		{"the node agent, from the node it names", nk("node-1", ""), agent, "node-1", ""},
+		{"the node agent, for another node", nk("node-2", ""), agent, "node-1", "the token was given on node-1, the key names node-2"},
+		{"the node agent, its token naming no node", nk("node-1", ""), agent, "", "the token was given on , the key names node-1"},
+		{"another account, from the node", nk("node-1", ""), "system:serviceaccount:team-a:default", "node-1", "only by the node agent"},
+		{"an administrator", nk("node-1", ""), "kubernetes-admin", "", "only by the node agent"},
+		{"named for another key", nk("node-1", "node-1-0000000000000000"), agent, "node-1", "named for its node and key: node-1-abababababababab"},
+		{"a node's name Kubernetes would not give", nk("Node_1", ""), agent, "Node_1", "is not a node's name"},
+	} {
+		ok, msg := ask("CREATE", c.k, nil, c.user, c.node)
+		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
+			t.Errorf("%s: allowed %v, %q", c.what, ok, msg)
+		}
+	}
+	bad := nk("node-1", "")
+	bad.Spec.PublicKey = "AB" + key[2:]
+	if ok, msg := ask("CREATE", bad, nil, agent, "node-1"); ok || !strings.Contains(msg, "64 lowercase hex") {
+		t.Errorf("a key not as the Warden writes it: %v %q", ok, msg)
+	}
+	// never changed; labels and the like may be
+	other := nk("node-1", "")
+	other.Spec.PublicKey = strings.Repeat("cd", 32)
+	if ok, msg := ask("UPDATE", nk("node-1", ""), other, "kubernetes-admin", ""); ok || !strings.Contains(msg, "is not changed") {
+		t.Errorf("a key changed: %v %q", ok, msg)
+	}
+	if ok, msg := ask("UPDATE", nk("node-1", ""), nk("node-1", ""), "kubernetes-admin", ""); !ok {
+		t.Errorf("an update leaving the key as it was refused: %q", msg)
+	}
+	if ok, msg := ask("DELETE", &kube.NodeKey{}, nil, agent, "node-1"); ok || !strings.Contains(msg, "a node does not remove") {
+		t.Errorf("a node removing a key: %v %q", ok, msg)
+	}
+	if ok, _ := ask("DELETE", &kube.NodeKey{}, nil, "kubernetes-admin", ""); !ok {
+		t.Error("an administrator's removal of a key refused")
+	}
+}

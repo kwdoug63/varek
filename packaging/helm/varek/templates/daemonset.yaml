@@ -7,6 +7,9 @@
 {{- $dns := include "varek.dnsServer" . -}}
 {{- $conf := include "varek.secretsConf" . -}}
 {{- $cred := .Values.credentials -}}
+{{- /* v1.36 step 9 (D10): each node's own key, unless one Secret signs for every node */ -}}
+{{- $nk := and (not .Values.signing.secretName) .Values.signing.nodeKey.enabled -}}
+{{- $nkd := .Values.signing.nodeKey -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -59,6 +62,14 @@ spec:
             - |
               install -d -o 0 -g 0 -m 0700 /host/socket /host/streams /host/control /host/export
               install -d -o 0 -g 0 -m 0755 /host/policies /host/bin
+              {{- if $nk }}
+              # v1.36 step 9 (D10): the node's key, the node agent's alone;
+              # its public key, which the plugin and the exporter read
+              install -d -o 0 -g 0 -m 0700 /host/key
+              install -d -o 0 -g 0 -m 0755 /host/key-pub
+              chmod 0700 /host/key
+              chmod 0755 /host/key-pub
+              {{- end }}
               chmod 0700 /host/socket /host/streams /host/control /host/export
               chmod 0755 /host/policies /host/bin
               install -o 0 -g 0 -m 0755 /opt/varek/varek-init /host/bin/.varek-init.new
@@ -87,6 +98,10 @@ spec:
             - { name: policies, mountPath: /host/policies }
             - { name: bin, mountPath: /host/bin }
             - { name: seccomp, mountPath: /host/seccomp }
+            {{- if $nk }}
+            - { name: node-key, mountPath: /host/key }
+            - { name: node-key-pub, mountPath: /host/key-pub }
+            {{- end }}
       containers:
         - name: node-agent
           image: {{ include "varek.image" . }}
@@ -106,9 +121,21 @@ spec:
             - --dns-server
             - {{ $dns | quote }}
             {{- end }}
+            # v1.36 step 9 (D10): the node's name in each run_start
+            - --node-name
+            - $(NODE_NAME)
             {{- if .Values.signing.secretName }}
             - --sign-key
             - /etc/varek/node.key
+            - --checkpoint-every
+            - {{ .Values.signing.checkpointEvery | quote }}
+            {{- else if $nk }}
+            # the node's own key, made at the first start; its public key
+            # published by the plugin as the node's VarekNodeKey
+            - --node-key
+            - {{ $nkd.dir }}/node.key
+            - --node-key-pub
+            - {{ $nkd.pubDir }}/node.key.pub
             - --checkpoint-every
             - {{ .Values.signing.checkpointEvery | quote }}
             {{- end }}
@@ -153,6 +180,9 @@ spec:
             {{- range .Values.nodeAgent.extraArgs }}
             - {{ . | quote }}
             {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
           securityContext:
             privileged: true
             runAsUser: 0
@@ -168,6 +198,9 @@ spec:
             {{- if .Values.signing.secretName }}
             # a file, not the Secret volume's link (the Warden opens its key O_NOFOLLOW)
             - { name: key, mountPath: /etc/varek/node.key, subPath: key, readOnly: true }
+            {{- else if $nk }}
+            - { name: node-key, mountPath: {{ $nkd.dir }} }
+            - { name: node-key-pub, mountPath: {{ $nkd.pubDir }} }
             {{- end }}
             # v1.36 step 4 (D1): the credentials' Secrets, warden-secrets'
             # configuration, and the tokens the DaemonSet signs in with (each
@@ -226,6 +259,16 @@ spec:
             - -obo-image
             - {{ include "varek.image" . }}
             - -sync
+            {{- if $nk }}
+            # v1.36 step 9 (D10): the node's key, published as its VarekNodeKey
+            - -node-key-pub
+            - {{ $nkd.pubDir }}/node.key.pub
+            - -node
+            - $(NODE_NAME)
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            {{- end }}
           # root, to write the node's policies (root's) and reach the runtime's
           # NRI socket (root's), with no capability
           securityContext:
@@ -243,6 +286,9 @@ spec:
             - { name: policies, mountPath: {{ .Values.node.policies }} }
             - { name: nri, mountPath: {{ dir .Values.nri.socket }} }
             - { name: tmp, mountPath: /tmp }
+            {{- if $nk }}
+            - { name: node-key-pub, mountPath: {{ $nkd.pubDir }}, readOnly: true }
+            {{- end }}
         {{- if .Values.exporter.enabled }}
         - name: exporter
           image: {{ include "varek.image" . }}
@@ -265,6 +311,9 @@ spec:
             {{- if .Values.signing.secretName }}
             - --pubkey
             - /etc/varek/node.key.pub
+            {{- else if $nk }}
+            - --pubkey
+            - {{ $nkd.pubDir }}/node.key.pub
             {{- end }}
             {{- if .Values.anchor.enabled }}
             - --anchor
@@ -291,6 +340,8 @@ spec:
             - { name: tmp, mountPath: /tmp }
             {{- if .Values.signing.secretName }}
             - { name: key, mountPath: /etc/varek/node.key.pub, subPath: key.pub, readOnly: true }
+            {{- else if $nk }}
+            - { name: node-key-pub, mountPath: {{ $nkd.pubDir }}, readOnly: true }
             {{- end }}
         {{- end }}
       volumes:
@@ -324,6 +375,10 @@ spec:
         {{- if .Values.onBehalfOf.issuerCaConfigMap }}
         - name: issuer-ca
           projected: { defaultMode: 0444, sources: [{ configMap: { name: {{ .Values.onBehalfOf.issuerCaConfigMap }}, items: [{ key: ca.crt, path: ca.crt }] } }] }
+        {{- end }}
+        {{- if $nk }}
+        - { name: node-key, hostPath: { path: {{ $nkd.dir }}, type: DirectoryOrCreate } }
+        - { name: node-key-pub, hostPath: { path: {{ $nkd.pubDir }}, type: DirectoryOrCreate } }
         {{- end }}
         {{- if .Values.signing.secretName }}
         - name: key
