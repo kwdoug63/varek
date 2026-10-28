@@ -166,22 +166,28 @@ def status_kb(pid):
 
 def read_pos(pid, segs, sizes):
     """how far the audit has read a stream of segments: the bytes of the
-    segments before the one it has open, and its offset in that one"""
+    segments before the furthest one it has begun, and its offset in that
+    one (the audit opens every segment at the start and reads them in turn,
+    so each one read stays open at its end)"""
     reals = [os.path.realpath(s) for s in segs]
     try:
         fds = os.listdir(f"/proc/{pid}/fd")
     except OSError:
         return None
+    best, opened = None, False           # (segment, offset); a segment open at all
     for fd in fds:
         try:
             k = reals.index(os.readlink(f"/proc/{pid}/fd/{fd}"))
             with open(f"/proc/{pid}/fdinfo/{fd}") as f:
-                for line in f:
-                    if line.startswith("pos:"):
-                        return sum(sizes[:k]) + int(line.split()[1])
-        except (OSError, ValueError):
+                off = next(int(line.split()[1]) for line in f if line.startswith("pos:"))
+        except (OSError, ValueError, StopIteration):
             continue
-    return None
+        opened = True
+        if off > 0 and (best is None or k > best[0]):
+            best = (k, off)
+    if best is None:
+        return 0 if opened else None
+    return sum(sizes[:best[0]]) + best[1]
 
 
 def audit(cmd, segs, sample):
