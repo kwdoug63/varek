@@ -801,7 +801,7 @@ PY
     { printf 'require warden 1.26\nproxy inspect\nproxy ports %s\nallow host api.example.com\n' "$P1"
       printf 'allow request GET https://api.example.com:%s/v1/models\n' "$P1"
       for d in /usr/ /lib /proc/ /sys/ "$W/" ${NODE:+$(dirname "$(dirname "$NODE")")/} \
-               ${JAVA:+$(dirname "$(dirname "$JAVA")")/} /etc/java-21-openjdk/ /etc/java-17-openjdk/; do
+               ${JAVA:+$(dirname "$(dirname "$JAVA")")/} /etc/java-21-openjdk/ /etc/java-17-openjdk/ /etc/java/ /etc/crypto-policies/ /etc/pki/java/; do
           printf 'allow path %s readonly\n' "$d"; done
       printf 'allow path /etc/ld.so.cache readonly\nallow path /etc/ssl/openssl.cnf readonly\nallow path /tmp/hsperfdata_nobody/\n'
     } > "$POLC"

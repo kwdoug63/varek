@@ -224,7 +224,7 @@ S(("0.0.0.0", int(sys.argv[1])), http.server.SimpleHTTPRequestHandler).serve_for
     [ -n "$JAVA" ] || JAVA=$(readlink -f "$(command -v java 2>/dev/null)" 2>/dev/null)
     PREFIXES="/usr/ /lib /etc/ssl/ /proc/ /sys/ $W/"
     [ -n "$NODE" ] && PREFIXES="$PREFIXES $(dirname "$(dirname "$NODE")")/"
-    [ -n "$JAVA" ] && PREFIXES="$PREFIXES $(dirname "$(dirname "$JAVA")")/ /etc/java-21-openjdk/ /etc/java-17-openjdk/"
+    [ -n "$JAVA" ] && PREFIXES="$PREFIXES $(dirname "$(dirname "$JAVA")")/ /etc/java-21-openjdk/ /etc/java-17-openjdk/ /etc/java/ /etc/crypto-policies/ /etc/pki/java/"
     POL="$OUT/clients.policy"
     { printf 'require warden 1.24\n'
       printf 'deny  host api.example.com:%s\n' $((HP + 1))      # a name deny before a numeric allow
