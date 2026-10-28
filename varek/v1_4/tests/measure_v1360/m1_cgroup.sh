@@ -160,7 +160,14 @@ measure groups_removed "$([ -d "$G" ] && echo "no: $(find "$G" -type d | wc -l) 
 sed 's/name: m1}/name: m1lim}/' "$OUT/m1-pod.yaml" > "$OUT/m1lim-pod.yaml"
 "$KUBECTL" apply -f "$OUT/m1lim-pod.yaml" >> "$LOG" 2>&1
 if "$KUBECTL" wait --for=condition=Ready pod/m1lim --timeout=300s >> "$LOG" 2>&1; then
-    lpid="$(cpid m1lim)"; cg="$(cg_of "$lpid")"; LG="/sys/fs/cgroup$cg"; LS="$LG/varek-sub-1"
+    # v1.36 step 11 (review): as in step 1, no process or group found stops
+    # here; an empty $cg would make $LG the node's root group
+    nolim() { measure limit_setup "$1"; "$KUBECTL" delete pod m1lim --grace-period=5 --wait=true --timeout=120s >> "$LOG" 2>&1; exit 1; }
+    lpid="$(cpid m1lim)"
+    case "$lpid" in ''|*[!0-9]*|0) nolim "m1lim's process was not found" ;; esac
+    cg="$(cg_of "$lpid")"
+    [ -n "$cg" ] && [ "$cg" != / ] || nolim "m1lim's group was not found (pid $lpid)"
+    LG="/sys/fs/cgroup$cg"; LS="$LG/varek-sub-1"
     mkdir "$LS" 2>> "$LOG"
     echo "$lpid" > "$LS/cgroup.procs" 2>> "$LOG"
     measure limit_settings "memory.max $(cat "$LG/memory.max"), memory.oom.group $(cat "$LG/memory.oom.group" 2>/dev/null || echo none)"

@@ -913,7 +913,26 @@ static int node_config(char *why, size_t wn) {
             }
             snprintf(g_nr.cred_env[g_nr.ncred_env++], sizeof g_nr.cred_env[0], "%s", ent);
         }
-        if (g_nr.argv0[0] != '/')
+        /* v1.36 step 11 (review): the user's token is the node agent's to
+         * read, never the agent's: a container of the agent's that mounts the
+         * pod's varek-obo volume is refused here too, so a webhook down or
+         * bypassed is not enough */
+        bool obo_mounted = false;
+        for (int k = 0; k < 4096 && !obo_mounted; k++) {
+            char idx[16], src[PATH_MAX];
+            snprintf(idx, sizeof idx, "#%d", k);
+            const char *mp[] = { "mounts", idx }, *sp[] = { "mounts", idx, "source" }, *v;
+            size_t vn;
+            if (nj_find(doc, n, mp, 2, &v, &vn) < 0) break;
+            if (nj_find(doc, n, sp, 3, &v, &vn) < 0 || nj_string(v, vn, src, sizeof src) < 0) continue;
+            const char *t = strstr(src, "/volumes/kubernetes.io~secret/" NODE_OBO_VOLUME);
+            size_t tl = strlen("/volumes/kubernetes.io~secret/" NODE_OBO_VOLUME);
+            obo_mounted = t && (t[tl] == '\0' || t[tl] == '/');
+        }
+        if (obo_mounted)
+            snprintf(why, wn, "the container mounts its pod's " NODE_OBO_VOLUME " volume, the user's token: the node "
+                     "agent reads it, the agent never does");
+        else if (g_nr.argv0[0] != '/')
             snprintf(why, wn, "the container's command must be named by an absolute path (it is \"%.200s\")", g_nr.argv0);
         else rc = 0;
     }
@@ -1099,7 +1118,6 @@ static int node_creds_given(const struct policy *p, const char *list, const char
         char src[1100];
         snprintf(src, sizeof src, "%s:%s", kNodeStore[p->v.creds[k].store], p->v.creds[k].ref);
         bool named = false, sourced = false, given = false;
-        char other[160] = "", to[300] = "";
         int ln = 0;
         char *text = strdup(b);
         if (!text) { snprintf(why, wn, "out of memory"); rc = -1; break; }
@@ -1116,9 +1134,8 @@ static int node_creds_given(const struct policy *p, const char *list, const char
             }
             if (strcmp(f[0], name)) continue;
             named = true;
-            if (strcmp(f[2], src)) { snprintf(other, sizeof other, "%.150s", f[3]); continue; }
+            if (strcmp(f[2], src)) continue;
             sourced = true;
-            snprintf(to, sizeof to, "%.120s (to %.160s)", f[3], f[1]);
             for (char *ns_save = NULL, *x = strtok_r(f[1], ",", &ns_save); x && !given; x = strtok_r(NULL, ",", &ns_save))
                 given = !strcmp(x, ns);
         }
@@ -1128,12 +1145,16 @@ static int node_creds_given(const struct policy *p, const char *list, const char
         if (!named)
             snprintf(why, wn, "credential %s (line %d) is given by no VarekCredential (a cluster administrator gives "
                      "a credential to namespaces; D2)", name, p->v.creds[k].line);
+        /* v1.36 step 11 (review): the refusal reaches the policy's author
+         * (the webhook's answer, the pod's events): it names what they gave,
+         * not the source or the namespaces a cluster administrator gave the
+         * credential to */
         else if (!sourced)
-            snprintf(why, wn, "credential %s (line %d): its VarekCredential (%s) names another source than the "
-                     "policy's %.300s", name, p->v.creds[k].line, other, src);
+            snprintf(why, wn, "credential %s (line %d): its VarekCredential names another source than the "
+                     "policy's %.300s", name, p->v.creds[k].line, src);
         else
-            snprintf(why, wn, "credential %s (line %d) is not given to namespace %s (VarekCredential %s; D2)", name,
-                     p->v.creds[k].line, ns, to);
+            snprintf(why, wn, "credential %s (line %d) is not given to namespace %s (D2)", name,
+                     p->v.creds[k].line, ns);
     }
     free(b);
     return rc;
@@ -1616,6 +1637,15 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
         fprintf(stderr, "[warden] --node-agent %s: %s\n", dir, strerror(errno));
         return -1;
     }
+    /* v1.36 step 11 (review): a supervisor killed (SIGKILL) leaves its copies;
+     * none is in use when the node agent starts (its supervisors went with it) */
+    DIR *kd = opendir(g_node_sock_dir);
+    for (struct dirent *de; kd && (de = readdir(kd)) != NULL;) {
+        size_t l = strlen(de->d_name);
+        if ((l > 4 && !strcmp(de->d_name + l - 4, ".obo")) || (l > 5 && !strcmp(de->d_name + l - 5, ".svid")))
+            (void)unlinkat(dirfd(kd), de->d_name, 0);
+    }
+    if (kd) closedir(kd);
     int ls = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     (void)unlink(sock_path);
     mode_t old = umask(077);                  /* only root may connect: the runtime */

@@ -4723,6 +4723,22 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * allowlist here (when enforcing it is refused there, EPERM): the
          * kernel carries it out, recorded as not enforced */
         if (act.kind == ACT_OTHER && g_dry) {
+            /* v1.36 step 11 (review): in a pod, a socket listening would be
+             * reached from the cluster's network, as a connect would reach it
+             * (dry_net_let): listen and accept are refused all the same, the
+             * record saying it was a dry run's refusal */
+            if (g_nr.on && (req.data.nr == __NR_listen || req.data.nr == __NR_accept4
+#ifdef __NR_accept
+                            || req.data.nr == __NR_accept
+#endif
+                            )) {
+                act.dry_kept = true;
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                emit_pathology(g_report_seq++, req.pid, &act, DEC_UNKNOWN, DEC_DENY, "syscall_not_admitted",
+                               (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec), EACCES);
+                send_simple(notify_fd, req.id, DEC_DENY);
+                continue;
+            }
             act.dry = true;
             clock_gettime(CLOCK_MONOTONIC, &t1);
             emit_pathology(g_report_seq++, req.pid, &act, DEC_UNKNOWN, DEC_DENY, "syscall_not_admitted",
@@ -6286,6 +6302,10 @@ int main(int argc, char **argv) {
     if (g_node_name && !node_name_ok(g_node_name)) {                     /* v1.36 step 9 (D10) */
         fprintf(stderr, "[warden] --node-name takes the node's name as Kubernetes has it (1 to 253 of a-z, 0-9, . "
                 "and -, beginning and ending with a letter or digit)\n");
+        return 2;
+    }
+    if (node_key_arg && node_key_pub_arg && !strcmp(node_key_arg, node_key_pub_arg)) {   /* v1.36 step 11 (review) */
+        fprintf(stderr, "[warden] --node-key-pub names the key's own file: give the public key a file of its own\n");
         return 2;
     }
     if (node_key_arg) {                     /* made, or read, once; each supervisor signs with it */

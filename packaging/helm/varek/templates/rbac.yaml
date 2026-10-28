@@ -6,8 +6,11 @@
   may change one. v1.36 step 7 (D7b): the plugin gets a pod, for its service
   account (a flow policy's session). v1.36 step 9 (D10): the plugin makes its
   node's VarekNodeKey and reads it back; it may not change or remove one,
-  and the webhook admits one only for the plugin's own node. */}}
-{{- range $who := list (dict "name" (include "varek.nodeName" .) "verbs" (list "get" "list" "watch") "credVerbs" (list "get" "list" "watch") "podVerbs" (list "get") "keyVerbs" (list "get" "create")) (dict "name" (include "varek.admissionName" .) "verbs" (list "get") "credVerbs" (list "list") "podVerbs" (list)) }}
+  and the webhook admits one only for the plugin's own node. v1.36 step 11
+  (review): the credentials listed and watched, never got one by one; a pod
+  got in any namespace (RBAC cannot narrow it to the node's pods: the plugin
+  asks only for the pods of the containers its runtime creates). */}}
+{{- range $who := list (dict "name" (include "varek.nodeName" .) "verbs" (list "get" "list" "watch") "credVerbs" (list "list" "watch") "podVerbs" (list "get") "keyVerbs" (list "get" "create")) (dict "name" (include "varek.admissionName" .) "verbs" (list "get") "credVerbs" (list "list") "podVerbs" (list)) }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:

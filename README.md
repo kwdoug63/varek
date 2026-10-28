@@ -299,7 +299,8 @@ degradation.
 
 Each platform below is checked in CI; the job named is the one to read.
 "Each PR" means each pull request that touches the code the workflow
-watches; the VM cells also run for each release tag (v1.36,
+watches. A release runs both matrices on its tag's commit and publishes
+nothing unless every cell passes (v1.36,
 [D11](./docs/security/v1.36-kubernetes-parity.md)).
 
 | Platform | What runs | CI job | When |
@@ -307,8 +308,8 @@ watches; the VM cells also run for each release tag (v1.36,
 | Ubuntu 24.04, x86_64 and arm64 (host) | the Warden's build and its suites | [`warden-build.yml`](https://github.com/kwdoug63/varek/actions/workflows/warden-build.yml): *Build the Warden with libseccomp + libsodium* | each PR |
 | RHEL 9 (host), tested on Rocky Linux 9 | every host suite, in a VM | [`matrix-vm.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix-vm.yml): *Rocky Linux 9 host: every suite* | each PR and release |
 | Amazon Linux 2023 (host, Linux 6.1) | every host suite, in a VM | [`matrix-vm.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix-vm.yml): *Amazon Linux 2023 host: every suite* | each PR and release |
-| Kubernetes, CRI-O 1.35, 1.36 and 1.37, under runc and crun, amd64 and arm64 | the Helm chart, on a kubeadm node | [`matrix.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix.yml): *CRI-O 1.35, runc*, *CRI-O 1.35, runc, arm64* (and the other five, each on both) | each PR |
-| Kubernetes, containerd 2.2 and 2.3, amd64 and arm64 | the Helm chart, on a kubeadm node | [`matrix.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix.yml): *containerd 2.2, runc*, *containerd 2.3, runc*, each also *…, arm64* | each PR |
+| Kubernetes, CRI-O 1.35, 1.36 and 1.37, under runc and crun, amd64 and arm64 | the Helm chart, on a kubeadm node | [`matrix.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix.yml): *CRI-O 1.35, runc*, *CRI-O 1.35, runc, arm64* (and the other five, each on both) | each PR and release |
+| Kubernetes, containerd 2.2 and 2.3, amd64 and arm64 | the Helm chart, on a kubeadm node | [`matrix.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix.yml): *containerd 2.2, runc*, *containerd 2.3, runc*, each also *…, arm64* | each PR and release |
 | Kubernetes, SELinux enforcing (CRI-O 1.35 on Rocky Linux 9) | the Helm chart, SELinux's denials counted | [`matrix-vm.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix-vm.yml): *SELinux enforcing: CRI-O 1.35 on Rocky Linux 9* | each PR and release |
 | Kubernetes on kind, amd64 and arm64 | the Helm chart; the suites under the node agent | [`kubernetes.yml`](https://github.com/kwdoug63/varek/actions/workflows/kubernetes.yml): *The chart on kind*, *The suites under the node agent*, each also *…, arm64* | each PR |
 | Containers (the UBI 9 image) | the suites in the image | [`container.yml`](https://github.com/kwdoug63/varek/actions/workflows/container.yml): *Build the image and run the suites in it* | each PR |

@@ -689,6 +689,51 @@ func TestPodOnBehalfOf(t *testing.T) {
 			delete(isc(m), "runAsUser")
 			delete(isc(m), "runAsGroup")
 		}, ""},
+		// v1.36 step 11 (review)
+		{"the API server's service account mount too", "obo", func(m map[string]interface{}) {
+			initc(m)["volumeMounts"] = append(initc(m)["volumeMounts"].([]interface{}),
+				map[string]interface{}{"name": "kube-api-access-x7k2p", "mountPath": saMount, "readOnly": true})
+		}, ""},
+		{"a volume of the pod's at /bin", "obo", func(m map[string]interface{}) {
+			initc(m)["volumeMounts"] = append(initc(m)["volumeMounts"].([]interface{}),
+				map[string]interface{}{"name": "tools", "mountPath": "/bin", "readOnly": true})
+		}, "it mounts tools at /bin"},
+		{"the token's volume twice", "obo", func(m map[string]interface{}) {
+			initc(m)["volumeMounts"] = append(initc(m)["volumeMounts"].([]interface{}),
+				map[string]interface{}{"name": oboName, "mountPath": oboMount, "readOnly": true})
+		}, "once"},
+		{"an SELinux type", "obo", func(m map[string]interface{}) {
+			isc(m)["seLinuxOptions"] = map[string]interface{}{"type": "spc_t"}
+		}, "seLinuxOptions name a type"},
+		{"the platform's SELinux level", "obo", func(m map[string]interface{}) {
+			isc(m)["seLinuxOptions"] = map[string]interface{}{"level": "s0:c26,c5"}
+		}, ""},
+		{"AppArmor unconfined", "obo", func(m map[string]interface{}) {
+			isc(m)["appArmorProfile"] = map[string]interface{}{"type": "Unconfined"}
+		}, "appArmorProfile is not the runtime's default"},
+		{"an unmasked /proc", "obo", func(m map[string]interface{}) { isc(m)["procMount"] = "Unmasked" }, "procMount is not Default"},
+		{"a Windows option", "obo", func(m map[string]interface{}) { isc(m)["windowsOptions"] = map[string]interface{}{} }, "securityContext has windowsOptions"},
+		{"the token's Secret as another volume", "obo", func(m map[string]interface{}) {
+			spec(m)["volumes"] = append(spec(m)["volumes"].([]interface{}),
+				map[string]interface{}{"name": "t2", "secret": map[string]interface{}{"secretName": "alice-token"}})
+		}, "its volume t2 is the user's token's Secret alice-token too"},
+		{"the token's Secret projected", "obo", func(m map[string]interface{}) {
+			spec(m)["volumes"] = append(spec(m)["volumes"].([]interface{}), map[string]interface{}{"name": "t3",
+				"projected": map[string]interface{}{"sources": []interface{}{map[string]interface{}{"secret": map[string]interface{}{"name": "alice-token"}}}}})
+		}, "its volume t3 projects the user's token's Secret alice-token"},
+		{"the token's Secret in the agent's env", "obo", func(m map[string]interface{}) {
+			c := spec(m)["containers"].([]interface{})[0].(map[string]interface{})
+			c["env"] = []interface{}{map[string]interface{}{"name": "T", "valueFrom": map[string]interface{}{
+				"secretKeyRef": map[string]interface{}{"name": "alice-token", "key": "token"}}}}
+		}, "container agent's environment names the user's token's Secret alice-token"},
+		{"the token's Secret in the agent's envFrom", "obo", func(m map[string]interface{}) {
+			c := spec(m)["containers"].([]interface{})[0].(map[string]interface{})
+			c["envFrom"] = []interface{}{map[string]interface{}{"secretRef": map[string]interface{}{"name": "alice-token"}}}
+		}, "container agent's environment names the user's token's Secret alice-token"},
+		{"another Secret in the agent's env", "obo", func(m map[string]interface{}) {
+			c := spec(m)["containers"].([]interface{})[0].(map[string]interface{})
+			c["envFrom"] = []interface{}{map[string]interface{}{"secretRef": map[string]interface{}{"name": "app-config"}}}
+		}, ""},
 	} {
 		ok, msg := post(t, s, "/pod", "team-a", oboPod(t, s, c.policy, c.edit))
 		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
@@ -721,6 +766,12 @@ func TestPodOnBehalfOf(t *testing.T) {
 		{"an ephemeral container of its own", func(m map[string]interface{}) {
 			spec(m)["ephemeralContainers"] = []interface{}{map[string]interface{}{"name": "debug"}}
 		}, ""},
+		{"an ephemeral container naming the token's Secret", func(m map[string]interface{}) {
+			spec(m)["ephemeralContainers"] = []interface{}{map[string]interface{}{"name": "debug",
+				"envFrom": []interface{}{map[string]interface{}{"secretRef": map[string]interface{}{"name": "alice-token"}}}}}
+		}, "ephemeral container debug's environment names the user's token's Secret"},
+		{"the init container's image changed", func(m map[string]interface{}) { initc(m)["image"] = "evil:latest" },
+			"its init container varek-obo is the webhook's, and not changed after"},
 	} {
 		ok, msg := postOp(t, s, "/pod", "team-a", "UPDATE", oboPod(t, s, "obo", c.edit), old)
 		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
@@ -796,6 +847,7 @@ func TestVarekNodeKey(t *testing.T) {
 		}
 		return k
 	}
+	podBound := true
 	ask := func(op string, k, old *kube.NodeKey, user, node string) (bool, string) {
 		b, _ := json.Marshal(k)
 		var ob []byte
@@ -805,6 +857,9 @@ func TestVarekNodeKey(t *testing.T) {
 		u := userInfo{Username: user}
 		if node != "" {
 			u.Extra = map[string][]string{nodeNameExtra: {node}}
+			if podBound {
+				u.Extra[podNameExtra], u.Extra[podUIDExtra] = []string{"varek-node-x7k2p"}, []string{"u-9"}
+			}
 		}
 		in, _ := json.Marshal(review{APIVersion: "admission.k8s.io/v1", Kind: "AdmissionReview",
 			Request: &request{UID: "u-1", Operation: op, Object: b, OldObject: ob, UserInfo: u}})
@@ -855,6 +910,31 @@ func TestVarekNodeKey(t *testing.T) {
 	}
 	if ok, msg := ask("UPDATE", nk("node-1", ""), nk("node-1", ""), "kubernetes-admin", ""); !ok {
 		t.Errorf("an update leaving the key as it was refused: %q", msg)
+	}
+	// v1.36 step 11 (review): a token bound to the node alone; an owner; the node agent's own update
+	podBound = false
+	if ok, msg := ask("CREATE", nk("node-1", ""), nil, agent, "node-1"); ok || !strings.Contains(msg, "names no pod") {
+		t.Errorf("a token bound to a node, not a pod: %v %q", ok, msg)
+	}
+	podBound = true
+	owned := nk("node-1", "")
+	b, _ := json.Marshal(owned)
+	var m map[string]interface{}
+	json.Unmarshal(b, &m)
+	m["metadata"].(map[string]interface{})["ownerReferences"] = []interface{}{map[string]interface{}{"kind": "Pod", "name": "x"}}
+	b, _ = json.Marshal(m)
+	json.Unmarshal(b, owned)
+	for _, op := range []string{"CREATE", "UPDATE"} {
+		in, _ := json.Marshal(review{APIVersion: "admission.k8s.io/v1", Kind: "AdmissionReview",
+			Request: &request{UID: "u-1", Operation: op, Object: b, OldObject: b, UserInfo: userInfo{Username: "kubernetes-admin"}}})
+		rec := httptest.NewRecorder()
+		s.mux().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/vareknodekey", bytes.NewReader(in)))
+		if !strings.Contains(rec.Body.String(), "has no owner") {
+			t.Errorf("%s: a key given an owner: %s", op, rec.Body.String())
+		}
+	}
+	if ok, msg := ask("UPDATE", nk("node-1", ""), nk("node-1", ""), agent, "node-1"); ok || !strings.Contains(msg, "does not change") {
+		t.Errorf("the node agent updating its key: %v %q", ok, msg)
 	}
 	if ok, msg := ask("DELETE", &kube.NodeKey{}, nil, agent, "node-1"); ok || !strings.Contains(msg, "a node does not remove") {
 		t.Errorf("a node removing a key: %v %q", ok, msg)

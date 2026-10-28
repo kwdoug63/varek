@@ -133,3 +133,27 @@ def test_a_segment_named_out_of_turn_in_one_file_is_refused():
 def test_the_exporters_list_parser_is_unchanged():
     run, records, complete, warden = cdx._parse_log(io.StringIO("".join(stream())), False, {})
     assert run == RUN and len(records) == 6 and complete and warden == "1.36.0"
+
+
+CHECKER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools", "vdp_cert_check")
+
+
+@pytest.mark.skipif(not os.access(CHECKER, os.X_OK), reason="tools/vdp_cert_check is not built")
+def test_a_malformed_connection_id_fails_the_audit(tmp_path, capsys):
+    """v1.36 step 11 (review): a connection id that is no number gives a FAIL
+    with its problems, as v1.35.0's audit did, not a traceback"""
+    pol = tmp_path / "p.policy"
+    pol.write_text("allow path /tmp/\n")
+    recs = [{"event": "run_start", "run": RUN, "log": "chain-1", "warden": "1.36.0", "arch": "x86_64",
+             "policy_sha256": hashlib.sha256(pol.read_bytes()).hexdigest(), "timestamp_ns": 10**18,
+             "operator": {"uid": 0, "verified": False}},
+            {"run": RUN, "seq": 0, "action": "file.open", "target": "/etc/x", "decision_final": "DENY",
+             "rule": "default_deny_unknown", "policy_line": -1, "proxy_handoff": True, "proxy_conn": 1,
+             "agent_pid": [7], "timestamp_ns": 10**18 + 1},
+            {"event": "proxy_close", "run": RUN, "proxy_conn": [1], "why": "closed"},
+            {"event": "run_end", "run": RUN, "records": 1}]
+    s = tmp_path / "s.jsonl"
+    s.write_text("".join(chained(recs)))
+    rc = va.main(["--policy", str(pol), "--checker", CHECKER, str(s)])
+    out = capsys.readouterr().out
+    assert rc != 0 and "varek_audit: FAIL" in out and "malformed connection id [1]" in out

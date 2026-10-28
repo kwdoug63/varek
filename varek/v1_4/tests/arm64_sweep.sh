@@ -58,16 +58,19 @@ if [ "$DEPS" = 1 ]; then
         # A name the host's repositories do not have is left out (strict=0)
         # and the build's own packages are checked after; --allowerasing:
         # the cloud images' curl-minimal gives way to curl.
-        java="java-21-openjdk-headless"
-        grep -q '^ID="*amzn' /etc/os-release && java="java-21-amazon-corretto-headless"
+        # a JDK, not a runtime alone: the Java checks compile their probe with javac
+        java="java-21-openjdk-devel"
+        grep -q '^ID="*amzn' /etc/os-release && java="java-21-amazon-corretto-devel"
         dnf -y --allowerasing --setopt=strict=0 install gcc make git openssl libseccomp-devel openssl-devel \
             libsodium-devel python3 python3-pip python3-cryptography "$java" squid curl util-linux \
-            glibc-static libasan libubsan gcc-c++ cmake procps-ng iproute sudo || { echo "arm64_sweep.sh: dnf failed"; exit 1; }
+            glibc-static libasan libubsan gcc-c++ cmake procps-ng iproute sudo runc || { echo "arm64_sweep.sh: dnf failed"; exit 1; }
         missing="$(rpm -q gcc make libseccomp-devel libsodium-devel openssl-devel python3 | sed -n 's/^package \(.*\) is not installed$/\1/p' | tr '\n' ' ')"
         [ -z "$missing" ] || { echo "arm64_sweep.sh: the build needs $missing(not in this host's repositories)"; exit 1; }
-        for p in "$java" squid glibc-static libasan libubsan; do
+        for p in "$java" squid glibc-static libasan libubsan runc; do
             rpm -q "$p" > /dev/null 2>&1 || echo "arm64_sweep.sh: note: no $p here (the suites that need it skip or fail)"
         done
+        # runc (v1.36 step 11): test_v1340's containers under the node
+        # agent, which skip without it (vm_cell.sh fails a sweep that skips);
         # glibc-static (from CRB): the suites' static probes; libasan and
         # libubsan: test-mcp-json and the proxy's parsers under the sanitizers;
         # gcc-c++ and cmake: z3 5 built from source (its aarch64 wheels need

@@ -115,6 +115,26 @@ if [ "$CMD" = inside ]; then
         "$HERE/tests/arm64_sweep.sh" --deps --out "$OUT/sweep" "${SUITES[@]}"
         rc=$?
         cp "$OUT/sweep/summary.txt" "$OUT/summary.txt" 2>/dev/null
+        # v1.36 step 11 (review): a skipped check fails the cell, unless it is
+        # one these hosts are expected to skip (each a SKIP line's reason):
+        EXPECTED_SKIPS=(
+            'no apparmor_parser here'       # RHEL 9 and Amazon Linux 2023 have SELinux, not AppArmor
+            'node \(not installed\)|node (is )?not installed|Node\.js \(not installed\)'   # --deps brings no Node.js
+            'go \(not installed\)'          # nor Go, on a dnf host; Ubuntu's sweep (warden-build.yml) runs both
+            '^musl \('                      # no musl-gcc in Amazon Linux 2023's repositories (arm64_sweep.sh notes it)
+            'no git or no v1\.13\.0 tag'     # the checkout is shallow, without tags
+        )
+        allowed="$(IFS='|'; echo "${EXPECTED_SKIPS[*]}")"
+        for f in "$OUT"/sweep/test-*.log "$OUT"/sweep/crosscheck.log; do
+            [ -f "$f" ] || continue
+            sed -nE 's/^[[:space:]]*SKIP[[:space:]]+(.*)$/\1/p; s/^[A-Za-z0-9_]+: SKIP[[:space:]]+(.*)$/\1/p' "$f" |
+                grep -vE "$allowed" | sed "s|^|$(basename "$f" .log): |"
+        done > "$OUT/skips.txt"
+        if [ -s "$OUT/skips.txt" ]; then
+            echo "== checks skipped that this host should run (each fails the cell)"; cat "$OUT/skips.txt"
+            measure "sweep.skips" "$(wc -l < "$OUT/skips.txt") not expected (skips.txt)"
+            [ "$rc" = 0 ] && rc=1
+        fi
         # each failed suite's whole log in the job's log (its first 1500
         # lines): the artifact holds it too, but where it cannot be read the
         # failing checks' excerpts alone did not say why (run 5's network
@@ -155,6 +175,12 @@ if [ "$CMD" = inside ]; then
         measure "selinux.denials" "$n since boot; SELinux $(getenforce) at the end"
         grep -oE 'scontext=[^ ]+ tcontext=[^ ]+ tclass=[^ ]+' "$OUT/avc.log" | sed 's/:c[0-9,.c]*//g' |
             sort | uniq -c | sort -rn | head -15 | tee "$OUT/avc-summary.txt"
+        # v1.36 step 11 (review): still enforcing at the end, or the checks
+        # above may not have run under it
+        if [ "$(getenforce 2>/dev/null)" != Enforcing ]; then
+            measure "selinux.end" "not enforcing at the end ($(getenforce 2>/dev/null || echo none)): the cell fails"
+            rc=1
+        fi
         exit $rc ;;
     *) echo "vm_cell.sh: --cell chart|sweep" >&2; exit 2 ;;
     esac

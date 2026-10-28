@@ -113,6 +113,58 @@ var oboFields = map[string]bool{"name": true, "image": true, "command": true, "v
 	"securityContext": true, "resources": true, "imagePullPolicy": true, "terminationMessagePath": true,
 	"terminationMessagePolicy": true}
 
+// the API server's service account mount (its ServiceAccount admission
+// plugin adds it to each container, init containers too)
+const (
+	saVolumePrefix = "kube-api-access-"
+	saMount        = "/var/run/secrets/kubernetes.io/serviceaccount"
+)
+
+// the init container's securityContext: the webhook's keys, and no others
+// that change how it is confined (an AppArmor profile other than the
+// runtime's, an SELinux type, an unmasked /proc)
+var oboSecCtxFields = map[string]bool{"runAsUser": true, "runAsGroup": true, "runAsNonRoot": true,
+	"allowPrivilegeEscalation": true, "readOnlyRootFilesystem": true, "privileged": true, "capabilities": true,
+	"seccompProfile": true, "seLinuxOptions": true, "appArmorProfile": true, "procMount": true}
+
+func oboSecCtxKeys(raw json.RawMessage) string {
+	var m map[string]json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &m) != nil {
+		return ""
+	}
+	for k := range m {
+		if !oboSecCtxFields[k] {
+			return fmt.Sprintf("its securityContext has %s", k)
+		}
+	}
+	if v, ok := m["seLinuxOptions"]; ok {
+		var se map[string]json.RawMessage
+		if json.Unmarshal(v, &se) != nil {
+			return "its securityContext's seLinuxOptions do not read"
+		}
+		for k := range se {
+			if k != "level" { // the platform's (OpenShift gives the namespace's level)
+				return fmt.Sprintf("its securityContext's seLinuxOptions name a %s", k)
+			}
+		}
+	}
+	if v, ok := m["appArmorProfile"]; ok {
+		var ap struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(v, &ap) != nil || ap.Type != "RuntimeDefault" {
+			return "its securityContext's appArmorProfile is not the runtime's default"
+		}
+	}
+	if v, ok := m["procMount"]; ok {
+		var pm string
+		if json.Unmarshal(v, &pm) != nil || pm != "Default" {
+			return "its securityContext's procMount is not Default"
+		}
+	}
+	return ""
+}
+
 // oboContainerWhy: why the init container named varek-obo is not the webhook's, or ""
 func (s *server) oboContainerWhy(c map[string]json.RawMessage, pc *secCtx) string {
 	why := func(f string, a ...interface{}) string {
@@ -146,15 +198,28 @@ func (s *server) oboContainerWhy(c map[string]json.RawMessage, pc *secCtx) strin
 	if s.oboImage != "" && k.Image != s.oboImage {
 		return why("its image is not %s (the node image)", s.oboImage)
 	}
-	mounted := false
+	// v1.36 step 11 (review): the token's volume, and the API server's own
+	// service account mount, and nothing else: a volume of the pod's at
+	// /bin or /lib would run the pod's own program in its place, unsupervised
+	mounted := 0
 	for _, m := range k.VolumeMounts {
 		if !m.ReadOnly || m.SubPath != "" || m.SubPathExpr != "" || (m.MountPropagation != nil && *m.MountPropagation != "None") {
 			return why("its mount of %s is not read-only and plain", m.Name)
 		}
-		mounted = mounted || (m.Name == oboName && m.MountPath == oboMount)
+		switch {
+		case m.Name == oboName && m.MountPath == oboMount:
+			mounted++
+		case strings.HasPrefix(m.Name, saVolumePrefix) && m.MountPath == saMount:
+		default:
+			return why("it mounts %s at %s: it mounts the token's volume (%s at %s) and nothing else", m.Name,
+				m.MountPath, oboName, oboMount)
+		}
 	}
-	if !mounted {
-		return why("it does not mount %s at %s", oboName, oboMount)
+	if mounted != 1 {
+		return why("it does not mount %s at %s, once", oboName, oboMount)
+	}
+	if why2 := oboSecCtxKeys(c["securityContext"]); why2 != "" {
+		return why("%s", why2)
 	}
 	cc := k.SecurityContext
 	user := pick(cc, pc, func(x *secCtx) *int64 { return x.RunAsUser })
@@ -288,7 +353,71 @@ func (s *server) oboWhys(req *request, p *pod, policy string) (whys []string, sk
 			"(%s) once each as the webhook gives them (its mutating hook, %s)", oboAnnotation, oboName, "/pod-mutate"))
 	}
 	whys = append(whys, oboMounts(p, skip)...)
+	whys = append(whys, oboSecretRefs(&r, p, secret)...)
 	return whys, skip
+}
+
+// oboSecretRefs: what else reaches the user's token's Secret: a volume of it
+// under another name (a Secret's or a projected one's), or a container's
+// environment (env, envFrom), ephemeral containers too (v1.36 step 11, review)
+func oboSecretRefs(r *rawPod, p *pod, secret string) []string {
+	var whys []string
+	for _, v := range r.Spec.Volumes {
+		var n string
+		json.Unmarshal(v["name"], &n)
+		if n == oboName {
+			continue
+		}
+		var sv struct {
+			SecretName string `json:"secretName"`
+		}
+		if json.Unmarshal(v["secret"], &sv) == nil && sv.SecretName == secret {
+			whys = append(whys, fmt.Sprintf("its volume %s is the user's token's Secret %s too (the node agent's to read)", n, secret))
+		}
+		var pv struct {
+			Sources []struct {
+				Secret *struct {
+					Name string `json:"name"`
+				} `json:"secret"`
+			} `json:"sources"`
+		}
+		if json.Unmarshal(v["projected"], &pv) == nil {
+			for _, src := range pv.Sources {
+				if src.Secret != nil && src.Secret.Name == secret {
+					whys = append(whys, fmt.Sprintf("its volume %s projects the user's token's Secret %s (the node agent's to read)", n, secret))
+				}
+			}
+		}
+	}
+	whys = append(whys, oboEnvRefs(p, secret, nil)...)
+	return whys
+}
+
+// oboEnvRefs: the containers (but those named in except) whose environment
+// names the Secret
+func oboEnvRefs(p *pod, secret string, except map[string]bool) []string {
+	var whys []string
+	check := func(kind string, cs []container) {
+		for _, c := range cs {
+			if except[c.Name] {
+				continue
+			}
+			for _, e := range c.Env {
+				if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && e.ValueFrom.SecretKeyRef.Name == secret {
+					whys = append(whys, fmt.Sprintf("%scontainer %s's environment names the user's token's Secret %s", kind, c.Name, secret))
+				}
+			}
+			for _, e := range c.EnvFrom {
+				if e.SecretRef != nil && e.SecretRef.Name == secret {
+					whys = append(whys, fmt.Sprintf("%scontainer %s's environment names the user's token's Secret %s", kind, c.Name, secret))
+				}
+			}
+		}
+	}
+	check("init ", p.Spec.InitContainers)
+	check("", p.Spec.Containers)
+	check("ephemeral ", p.Spec.EphemeralContainers)
+	return whys
 }
 
 // oboMounts: the containers, but the init container at skip, that mount the
@@ -314,8 +443,11 @@ func oboMounts(p *pod, skip int) []string {
 	return whys
 }
 
-// oboUpdate: on an update, the annotation fixed, and no container added that mounts the volume
-func oboUpdate(p, old *pod) string {
+// oboUpdate: on an update, the annotation fixed; no container added that
+// mounts the volume or names the token's Secret; and the init container as it
+// was (v1.36 step 11, review: an update may change an image, and the runtime
+// does not tell the NRI plugin which it runs)
+func oboUpdate(p, old *pod, raw, oldRaw json.RawMessage) string {
 	was, wasActing := old.Metadata.Annotations[oboAnnotation]
 	if is, acting := p.Metadata.Annotations[oboAnnotation]; is != was || acting != wasActing {
 		return fmt.Sprintf("its %s annotation is set when the pod is created, and not added, changed or removed after", oboAnnotation)
@@ -341,5 +473,38 @@ func oboUpdate(p, old *pod) string {
 		}
 	}
 	check(p.Spec.EphemeralContainers, old.Spec.EphemeralContainers)
+	seen := map[string]bool{}
+	for _, c := range old.Spec.EphemeralContainers {
+		seen[c.Name] = true
+	}
+	added := &pod{}
+	for _, c := range p.Spec.EphemeralContainers {
+		if !seen[c.Name] {
+			added.Spec.EphemeralContainers = append(added.Spec.EphemeralContainers, c)
+		}
+	}
+	whys = append(whys, oboEnvRefs(added, was, nil)...)
+	var r, or rawPod
+	if json.Unmarshal(raw, &r) != nil || json.Unmarshal(oldRaw, &or) != nil {
+		return "the pod does not read"
+	}
+	if !reflect.DeepEqual(oboInit(&r), oboInit(&or)) {
+		whys = append(whys, fmt.Sprintf("its init container %s is the webhook's, and not changed after the pod is created", oboName))
+	}
 	return strings.Join(whys, "; ")
+}
+
+// oboInit: the init container named varek-obo, decoded, or nil
+func oboInit(r *rawPod) interface{} {
+	for _, c := range r.Spec.InitContainers {
+		var n string
+		json.Unmarshal(c["name"], &n)
+		if n == oboName {
+			var v interface{}
+			b, _ := json.Marshal(c)
+			json.Unmarshal(b, &v)
+			return v
+		}
+	}
+	return nil
 }

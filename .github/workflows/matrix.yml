@@ -30,6 +30,9 @@ on:
       - "packaging/**"
       - ".github/workflows/matrix.yml"
   workflow_dispatch:
+  # v1.36 step 11: a release (container-release.yml) runs the matrix on its
+  # tag's commit and publishes nothing unless every cell passes
+  workflow_call:
 
 permissions:
   contents: read
@@ -53,7 +56,9 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
       - name: Build the node image, and save it
         timeout-minutes: 20
         run: |
@@ -64,7 +69,7 @@ jobs:
           ls -l "$RUNNER_TEMP/varek-node.tar"
       - name: The node image - each command the chart names runs, the launcher static
         run: packaging/container/node_check.sh varek-node:ci
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: ${{ matrix.arch == 'arm64' && 'node-image-arm64' || 'node-image' }}
           path: ${{ runner.temp }}/varek-node.tar
@@ -91,7 +96,9 @@ jobs:
     env:
       OUT: ${{ github.workspace }}/cell
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -100,7 +107,7 @@ jobs:
         run: make -C varek/v1_4 tools/varek_keygen tools/vdp_cert_check
       # the image as a saved archive: the cluster stops the runner's Docker,
       # and v1340_kind.sh --host loads it into the node's runtime
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: ${{ matrix.arch == 'arm64' && 'node-image-arm64' || 'node-image' }}
           path: ${{ runner.temp }}
@@ -135,7 +142,7 @@ jobs:
           sudo mkdir -p "$OUT"
           sudo journalctl -u crio -u containerd -u kubelet --no-pager 2>&1 | sudo tee "$OUT/journal.log" > /dev/null || true
           sudo chmod -R a+rX "$OUT" 2>/dev/null || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: always()
         with:
           name: cell-${{ matrix.cell.runtime }}-${{ matrix.cell.version }}-${{ matrix.cell.oci }}${{ matrix.arch == 'arm64' && '-arm64' || '' }}

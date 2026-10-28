@@ -122,6 +122,7 @@ const (
 	saAnnotation    = "varek.dev/service-account"
 	oboInit         = "varek-obo" // the webhook's init container, and its volume
 	oboCommand      = "/bin/true"
+	oboMountPath    = "/var/run/varek-obo" // the token's volume, in the init container (the webhook's oboMount)
 	launcherAt      = "/varek/init"
 	// the profile every container of an annotated pod names (G-1), under
 	// the kubelet's seccomp root
@@ -477,7 +478,7 @@ func (p *plugin) adjust(ctx context.Context, pod *api.PodSandbox, ctr *api.Conta
 	if acting && !secretName.MatchString(obo) {
 		return nil, refuse("%s %q is not a Secret's name", oboAnnotation, obo)
 	}
-	if acting && p.oboContainer(ctr) {
+	if acting && p.oboContainer(ctx, pod, ctr) {
 		return nil, nil
 	}
 	args := ctr.GetArgs()
@@ -616,19 +617,60 @@ func (p *plugin) serviceAccount(ctx context.Context, pod *api.PodSandbox) (strin
 
 // oboContainer: whether the container is the webhook's init container for a
 // pod acting for a user: its name, its command alone, and its image where
-// the runtime says it (by digest, where -obo-image names one)
-func (p *plugin) oboContainer(ctr *api.Container) bool {
-	if ctr.GetName() != oboInit || len(ctr.GetArgs()) != 1 || ctr.GetArgs()[0] != oboCommand {
+// the runtime says it (by digest, where -obo-image names one). v1.36 step 11
+// (review): and the pod's init container of the name, as the API server has
+// it, is the webhook's: -obo-image, its command alone, and no mount but the
+// token's and the service account's (the runtime may not say an image, and
+// a mount of the pod's at /bin would run the pod's own program in its place)
+func (p *plugin) oboContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) bool {
+	if ctr.GetName() != oboInit || len(ctr.GetArgs()) != 1 || ctr.GetArgs()[0] != oboCommand || p.oboImage == "" {
 		return false
 	}
-	img := ctr.GetImage()
-	if p.oboImage == "" || img == nil || (img.GetName() == "" && img.GetDigest() == "") {
-		return true
+	if img := ctr.GetImage(); img != nil && (img.GetName() != "" || img.GetDigest() != "") {
+		if i := strings.LastIndex(p.oboImage, "@"); i >= 0 && img.GetDigest() != "" {
+			if img.GetDigest() != p.oboImage[i+1:] {
+				return false
+			}
+		} else if fullName(img.GetName()) != fullName(p.oboImage) {
+			return false
+		}
 	}
-	if i := strings.LastIndex(p.oboImage, "@"); i >= 0 && img.GetDigest() != "" {
-		return img.GetDigest() == p.oboImage[i+1:]
+	if p.api == nil {
+		return false
 	}
-	return fullName(img.GetName()) == fullName(p.oboImage)
+	o, err := p.api.GetPod(ctx, pod.GetNamespace(), pod.GetName())
+	if err != nil || o == nil || o.Metadata.UID != pod.GetUid() {
+		return false
+	}
+	for _, c := range o.Spec.InitContainers {
+		if c.Name == oboInit {
+			return oboSpec(&c, p.oboImage)
+		}
+	}
+	return false
+}
+
+// oboSpec: whether the pod's init container is the webhook's (as the
+// webhook makes it and checks it)
+func oboSpec(c *kube.InitContainer, image string) bool {
+	if c.Image != image || len(c.Command) != 1 || c.Command[0] != oboCommand || len(c.Args) != 0 ||
+		len(c.Env) > 0 && string(c.Env) != "null" || len(c.EnvFrom) > 0 && string(c.EnvFrom) != "null" ||
+		len(c.VolumeDevices) > 0 && string(c.VolumeDevices) != "null" {
+		return false
+	}
+	token := 0
+	for _, m := range c.VolumeMounts {
+		switch {
+		case !m.ReadOnly || m.SubPath != "" || m.SubPathExpr != "":
+			return false
+		case m.Name == oboInit && m.MountPath == oboMountPath:
+			token++
+		case strings.HasPrefix(m.Name, "kube-api-access-") && m.MountPath == "/var/run/secrets/kubernetes.io/serviceaccount":
+		default:
+			return false
+		}
+	}
+	return token == 1
 }
 
 // fullName: an image's name as a runtime may give it (docker.io/library/

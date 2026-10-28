@@ -180,7 +180,10 @@ PY
 
     # a user's supplementary groups: by name, the group's file is readable; as
     # uid:gid (no groups beyond the gid), it is not
-    if groupadd "$TGROUP" >/dev/null 2>&1 && useradd -M -N -g nogroup -G "$TGROUP" -s /usr/sbin/nologin "$TUSER" >/dev/null 2>&1; then
+    # the primary group: Debian's nogroup, RHEL's and Amazon Linux's nobody
+    # (v1.36 step 11: the dnf hosts' sweep skipped this for want of nogroup)
+    NOG=nogroup; getent group nogroup > /dev/null || NOG=nobody
+    if groupadd "$TGROUP" >/dev/null 2>&1 && useradd -M -N -g "$NOG" -G "$TGROUP" -s /usr/sbin/nologin "$TUSER" >/dev/null 2>&1; then
         MADE_USER=1
         TU="$(id -u "$TUSER")" TG="$(getent group "$TGROUP" | cut -d: -f3)" PG="$(id -g "$TUSER")"
         chgrp "$TGROUP" "$OUT/w/grp"; chmod 640 "$OUT/w/grp"
@@ -1025,9 +1028,11 @@ else
 import sys
 t = b.generate('$G/w', pwd.getpwnam('nobody'), '/tmp/varek-65534', None, path=b.SYSTEM_PATH + ':/home:$G')
 sys.exit(1 if [l for l in t.splitlines() if l in ('allow path /home/ readonly', 'allow path $G/ readonly')] else 0)"
-    if [ -d /usr/lib/git-core ] && command -v git >/dev/null; then
-        check "... git's helpers (/usr/lib/git-core/)" grep -qx "allow exec prefix /usr/lib/git-core/" "$G/base.txt"
-    else skip "git's helpers (no /usr/lib/git-core here)"; fi
+    # Debian's /usr/lib/git-core, RHEL's and Amazon Linux's /usr/libexec/git-core
+    GC=; for d in /usr/lib/git-core /usr/libexec/git-core; do [ -d "$d" ] && { GC="$d"; break; }; done
+    if [ -n "$GC" ] && command -v git >/dev/null; then
+        check "... git's helpers ($GC/)" grep -qx "allow exec prefix $GC/" "$G/base.txt"
+    else skip "git's helpers (no /usr/lib/git-core or /usr/libexec/git-core here)"; fi
     check "the baseline lints" "$VDP" "$G/base.txt" lint
     # the profiles (6c): none lets the agent write a name in the home itself
     # by a bare prefix (the whole home noexec, and agents installed there

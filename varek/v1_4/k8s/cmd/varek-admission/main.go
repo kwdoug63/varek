@@ -150,6 +150,13 @@ type userInfo struct {
 // token to the pod and its node, and the API server says the node's name here)
 const nodeNameExtra = "authentication.kubernetes.io/node-name"
 
+// v1.36 step 11 (review): a token bound to a pod names it (one bound to a
+// node, which names the node alone, is not the DaemonSet's)
+const (
+	podNameExtra = "authentication.kubernetes.io/pod-name"
+	podUIDExtra  = "authentication.kubernetes.io/pod-uid"
+)
+
 type response struct {
 	UID     string  `json:"uid"`
 	Allowed bool    `json:"allowed"`
@@ -196,6 +203,19 @@ type container struct {
 	VolumeMounts    []struct {
 		Name string `json:"name"`
 	} `json:"volumeMounts"` // v1.36 step 6
+	// v1.36 step 11 (review): a Secret reached by the environment
+	Env []struct {
+		ValueFrom *struct {
+			SecretKeyRef *struct {
+				Name string `json:"name"`
+			} `json:"secretKeyRef"`
+		} `json:"valueFrom"`
+	} `json:"env"`
+	EnvFrom []struct {
+		SecretRef *struct {
+			Name string `json:"name"`
+		} `json:"secretRef"`
+	} `json:"envFrom"`
 }
 
 type pod struct {
@@ -514,7 +534,20 @@ func (s *server) varekNodeKey(_ context.Context, req *request) string {
 	if why := kube.NodeKeyProblem(&k); why != "" {
 		return why
 	}
+	// v1.36 step 11 (review): a key is not removed by the collector for an
+	// owner's sake (the streams it signed outlive whatever owned it)
+	var meta struct {
+		Metadata struct {
+			OwnerReferences []json.RawMessage `json:"ownerReferences"`
+		} `json:"metadata"`
+	}
+	if json.Unmarshal(req.Object, &meta) == nil && len(meta.Metadata.OwnerReferences) > 0 {
+		return "a node's key has no owner: it is kept for the streams it signed until a cluster administrator removes it"
+	}
 	if req.Operation == "UPDATE" {
+		if s.nodeAgent != "" && req.UserInfo.Username == s.nodeAgent {
+			return "a node does not change a node's key, once published"
+		}
 		var old kube.NodeKey
 		if err := json.Unmarshal(req.OldObject, &old); err != nil {
 			return "the VarekNodeKey's old object does not read: " + err.Error()
@@ -533,6 +566,10 @@ func (s *server) varekNodeKey(_ context.Context, req *request) string {
 	if n := req.UserInfo.Extra[nodeNameExtra]; len(n) != 1 || n[0] != k.Spec.Node {
 		return fmt.Sprintf("a node's key is published only from that node: the token was given on %s, the key names %s "+
 			"(a cluster whose service account tokens do not name their node admits none)", strings.Join(n, ","), k.Spec.Node)
+	}
+	if pn, pu := req.UserInfo.Extra[podNameExtra], req.UserInfo.Extra[podUIDExtra]; len(pn) != 1 || pn[0] == "" ||
+		len(pu) != 1 || pu[0] == "" {
+		return "a node's key is published only with a token bound to the node agent's pod (this one names no pod)"
 	}
 	return ""
 }
@@ -559,7 +596,7 @@ func (s *server) pod(ctx context.Context, req *request) string {
 		if wasPlan, wasPlanned := old.Metadata.Annotations[planAnnotation]; wasPlan != plan || wasPlanned != planned {
 			return fmt.Sprintf("its %s annotation is set when the pod is created, and not added, changed or removed after", planAnnotation)
 		}
-		return oboUpdate(&p, &old) // v1.36 step 6
+		return oboUpdate(&p, &old, req.Object, req.OldObject) // v1.36 step 6
 	}
 	if !ok {
 		if planned {

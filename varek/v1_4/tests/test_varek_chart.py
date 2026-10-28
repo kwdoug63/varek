@@ -352,8 +352,9 @@ def test_rbac_reads_only():
     cred = ["varekcredentials"]
     # v1.36 step 7 (D7b): the plugin gets a pod, for its service account (a flow policy's session)
     # v1.36 step 9 (D10): it makes its node's key, and reads it back; changes or removes none
+    # v1.36 step 11 (review): the credentials never got one by one
     assert rules == {"t-node": [{"apiGroups": ["varek.dev"], "resources": res, "verbs": ["get", "list", "watch"]},
-                                {"apiGroups": ["varek.dev"], "resources": cred, "verbs": ["get", "list", "watch"]},
+                                {"apiGroups": ["varek.dev"], "resources": cred, "verbs": ["list", "watch"]},
                                 {"apiGroups": ["varek.dev"], "resources": ["vareknodekeys"], "verbs": ["get", "create"]},
                                 {"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}],
                      "t-admission": [{"apiGroups": ["varek.dev"], "resources": res, "verbs": ["get"]},
@@ -571,6 +572,62 @@ def test_dry_run_flow_policy_and_trust_bundles():
     assert v["projected"]["sources"] == [{"configMap": {"name": "corp-roots"}}] and "configMap" not in v
 
 
+def test_the_api_token_in_the_plugin_alone():
+    """v1.36 step 11 (review): the node's service account token is not in
+    every container of the DaemonSet (the exporter could publish a node's key
+    with it, a credential's process log in with it): the plugin's alone,
+    bound to the pod, as the kubelet would automount it"""
+    spec = pod(render("exporter.enabled=true"), "DaemonSet")
+    assert spec["automountServiceAccountToken"] is False
+    sa = "/var/run/secrets/kubernetes.io/serviceaccount"
+    for c in spec["containers"] + spec["initContainers"]:
+        assert (sa in mounts(c)) == (c["name"] == "plugin"), c["name"]
+    assert mounts(ctr(spec, "plugin"))[sa] == {"name": "api-token", "mountPath": sa, "readOnly": True}
+    src = volumes(spec)["api-token"]["projected"]["sources"]
+    assert src[0]["serviceAccountToken"]["path"] == "token" and "audience" not in src[0]["serviceAccountToken"]
+    assert src[1]["configMap"]["name"] == "kube-root-ca.crt" and src[2]["downwardAPI"]["items"][0]["path"] == "namespace"
+    p = render("credentials.vault.addr=https://vault.example", "credentials.vault.kubernetesAuth.role=r",
+               "credentials.vault.kubernetesAuth.audience=", ok=False)
+    assert p.returncode != 0 and "binds its tokens to an audience" in p.stderr
+
+
+@pytest.mark.parametrize("sets, why", [
+    (["streams.rotateBytes=1000"], "65536 or more"),
+    (["streams.rotateBytes=1.5"], "a whole number of bytes"),
+    (["signing.nodeKey.pubDir=/var/lib/varek/key"], "each a directory of its own"),
+    (["signing.nodeKey.pubDir=/var/lib/varek/key/pub"], "each a directory of its own"),
+    (["signing.nodeKey.dir=/var/log/varek/key"], "node.streams (/var/log/varek) and signing.nodeKey.dir"),
+    (["credentials.dir=/var/lib/varek/policies/c"], "credentials.dir (/var/lib/varek/policies/c) and node.policies"),
+    (["signing.nodeKey.dir=/var/lib/varek/../x"], "an absolute path, with no .."),
+    (["signing.nodeKey.dir=key"], "an absolute path"),
+])
+def test_values_refused_at_render(sets, why):
+    """v1.36 step 11 (review): what the node would refuse, or would expose,
+    refused when the chart renders"""
+    p = render(*sets, ok=False)
+    assert p.returncode != 0 and why in p.stderr, p.stderr
+
+
+def test_values_the_checks_let_through():
+    render("streams.rotateBytes=0")
+    render("streams.rotateBytes=65536")
+    # one Secret signing every node: the node key's directories are not used, so not checked
+    render("signing.secretName=k", "signing.nodeKey.dir=/var/log/varek/key")
+    # a Secret's name with dots: its volume named by its place
+    spec = pod(render("credentials.secrets={gh.token,aws}"), "DaemonSet")
+    assert volumes(spec)["cred-0"]["secret"]["secretName"] == "gh.token"
+    assert mounts(ctr(spec, "node-agent"))["/var/lib/varek/credentials/gh.token"]["name"] == "cred-0"
+    # the SPIRE agent's directory, read-only, never made here
+    spec = pod(render("spire.adminSocket=/run/spire/admin-sockets/admin.sock"), "DaemonSet")
+    assert mounts(ctr(spec, "node-agent"))["/run/spire/admin-sockets"]["readOnly"] is True
+    assert volumes(spec)["spire-admin"]["hostPath"]["type"] == "Directory"
+    # the exporter's audit keeps what it holds back on the node's disk, not in the plugin's memory volume
+    spec = pod(render(), "DaemonSet")
+    assert mounts(ctr(spec, "exporter"))["/tmp"]["name"] == "exporter-scratch"
+    assert volumes(spec)["exporter-scratch"]["emptyDir"] == {"sizeLimit": "4Gi"}
+    assert mounts(ctr(spec, "plugin"))["/tmp"]["name"] == "tmp"
+
+
 def test_stream_rotation():
     """v1.36 step 8 (D9): the node agent rotates each stream at the chart's
     size, given in bytes as a whole number (never as a float); 0, none"""
@@ -663,12 +720,23 @@ def test_ci_and_the_release_build_check_and_sign_the_node_image_and_the_chart():
     joined = " ".join(run)
     # v1.36 (D8): arm64's node image built and checked on the arm64 runner, before publish
     arm = jobs["node-arm64"]
-    assert arm["runs-on"] == "ubuntu-24.04-arm" and jobs["publish"]["needs"] == "node-arm64"
+    assert arm["runs-on"] == "ubuntu-24.04-arm" and "node-arm64" in jobs["publish"]["needs"]
+    # v1.36 step 11: nothing is pushed until both matrices pass on the tag's commit
+    assert jobs["matrix"]["uses"] == "./.github/workflows/matrix.yml"
+    assert jobs["matrix-vm"]["uses"] == "./.github/workflows/matrix-vm.yml"
+    for j in ("node-arm64", "publish"):
+        assert {"matrix", "matrix-vm"} <= set(jobs[j]["needs"]), j
+    for m in ("matrix.yml", "matrix-vm.yml"):
+        assert "workflow_call" in yaml.safe_load(open(os.path.join(wf, m)))[True], m
+    # the VM cells run once for a tag: the release's call, not their own trigger too
+    assert "push" not in yaml.safe_load(open(os.path.join(wf, "matrix-vm.yml")))[True]
     armrun = " ".join(s.get("run", "") for s in arm["steps"])
     for w in ("--target node", 'node_check.sh "$NODE:$VERSION-arm64"', "= linux/arm64 ]",
               'docker push "$NODE:$VERSION-arm64"', '"digest=$digest" >> "$GITHUB_OUTPUT"'):
         assert w in armrun, w
-    assert "cosign" not in armrun and "id-token" not in arm["permissions"]
+    # v1.36 step 11 (review): the arm64 image signed as it is pushed, not left unsigned while publish runs
+    assert 'cosign sign --yes "$digest"' in armrun and arm["permissions"]["id-token"] == "write"
+    assert armrun.index('docker push "$NODE:$VERSION-arm64"') < armrun.index('cosign sign --yes "$digest"')
     for w in ("--target node", 'node_check.sh "$NODE:$VERSION-amd64"', "= linux/amd64 ]", 'docker push "$NODE:$VERSION-amd64"',
               'docker buildx imagetools create -t "$NODE:$VERSION" "$amd64" "$ARM64"',
               "platforms.py node-index.json linux/amd64 linux/arm64", 'cosign sign --yes --recursive "$node"',
