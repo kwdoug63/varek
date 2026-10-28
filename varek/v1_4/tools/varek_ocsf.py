@@ -31,7 +31,9 @@ ai_operation and host, and carries:
 Records with no OCSF counterpart are folded into the event they belong to
 (an exec_result into its launch, a request_body into its request, a
 rename's second half into its first, v1.35: each plan_step into its plan
-gate's event) or not exported. v1.35 step 7: the plan gate's verdict is an
+gate's event) or not exported. v1.36 step 12: a connection the egress
+proxy could not read (proxy_unreadable) is a Network Activity event of its
+own, Refuse, Denied and Blocked, to where its hand-off went. v1.35 step 7: the plan gate's verdict is an
 Application Lifecycle event of its own (activity Other, unmapped.varek.event
 "plan_gate"): Allowed when the plan is authorized, Denied and Blocked when it
 is refused (the agent not started), with the plan's path, SHA-256 and size,
@@ -157,6 +159,7 @@ class Exporter:
         self.rs = None
         self.agent = None
         self.subagents = {}            # "NAME#n" -> True if an MCP server
+        self.handoffs = {}             # v1.36 step 12: proxy_conn -> the connect handed to the proxy, until decided
         self.plan_steps = []           # v1.35 step 7: plan_step records, folded into their gate's event
         self.plan_step_n = {}
         self.queue = []                # [event, waiting-for key or None, records left to wait]
@@ -416,8 +419,29 @@ class Exporter:
             self._fold(("exec", rec.get("decision_seq")), "exec_result", rec)
         elif ev_name == "request_body":
             self._fold(("body", rec.get("proxy_conn"), rec.get("request_seq")), "request_body", rec)
+        elif ev_name == "proxy_unreadable":
+            # v1.36 step 12: a connection handed to the proxy that it could
+            # not read, refused with nothing dialed: Network Activity, Refuse,
+            # to where the agent connected (its hand-off's record)
+            ho = self.handoffs.pop(rec.get("proxy_conn"), None) if type(rec.get("proxy_conn")) is int else None
+            out_ev = self._base(NET, 5, rec, rec.get("timestamp_ns"), f"{rec.get('run')}/proxy_unreadable/{self.n}")
+            out_ev["dst_endpoint"] = _endpoint((ho or {}).get("target"))
+            out_ev["src_endpoint"] = {"name": self.device["name"]}
+            if ho:
+                self._who(out_ev, ho)
+            out_ev["action_id"], out_ev["action"] = 2, "Denied"
+            out_ev["disposition_id"], out_ev["disposition"] = 2, "Blocked"
+            out_ev["status_id"], out_ev["status"], out_ev["status_detail"] = 2, "Failure", str(rec.get("why") or "")
+            out_ev["severity_id"], out_ev["severity"] = 3, "Medium"
+            out_ev["unmapped"]["varek"].update({"event": "proxy_unreadable", "proxy_conn": rec.get("proxy_conn"),
+                                                "proxy_kind": rec.get("proxy_kind"), "why": rec.get("why"),
+                                                "handoff_seq": (ho or {}).get("seq")})
         elif "decision_final" in rec and "action" in rec:
             a = rec.get("action")
+            if rec.get("proxy_handoff") is True and type(rec.get("proxy_conn")) is int:   # v1.36 step 12
+                self.handoffs[rec["proxy_conn"]] = {k: rec.get(k) for k in ("target", "seq", "agent_pid", "obo")}
+            elif a == "net.proxy" and type(rec.get("proxy_conn")) is int:
+                self.handoffs.pop(rec["proxy_conn"], None)
             if a == "file.rename_to" and self.queue and self.queue[-1][1] == ("rename", rec.get("agent_pid")):
                 head = self.queue[-1][0]
                 head["file_result"] = _file(rec.get("resolved") or rec.get("target"))

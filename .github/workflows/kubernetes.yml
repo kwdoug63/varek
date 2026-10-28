@@ -13,8 +13,10 @@ name: Kubernetes
 #          (varek/v1_4/tests/v1340_sweep.sh); every difference has its
 #          reason listed, or the job fails;
 #   soak   the ship gate's harness (varek/v1_4/tests/soak_v1340/soak.sh, step
-#          9), six minutes of it on a one-node kind cluster, judged as the
-#          24-hour runs on EKS and OpenShift are (soak_check.py).
+#          9; v1.36 step 12), six minutes of it on a one-node kind cluster,
+#          judged as the 24-hour runs on EKS and OpenShift are
+#          (soak_check.py): its volume pod faster and its streams in
+#          segments of 4 MiB, so a trial's are read across segments too.
 # kind is built from source at a pinned version (its modules checked against
 # Go's checksum database); kubectl and helm are the runner's.
 # Each job on amd64 and, v1.36 step 3 (D8), on arm64: GitHub's arm64 runner,
@@ -137,7 +139,7 @@ jobs:
       - name: The harness, six minutes
         run: |
           varek/v1_4/tests/soak_v1340/soak.sh --image varek-node:ci --hours 0.1 --interval 3 \
-            --short-every 2 --sample 30 --out "$RUNNER_TEMP/soak"
+            --short-every 2 --sample 30 --volume-rate 200 --rotate-bytes 4194304 --out "$RUNNER_TEMP/soak"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

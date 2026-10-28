@@ -14,6 +14,17 @@
 #     VarekPolicy `agent` and VAREK's unsupervised profile;
 #   - the services they call (servers.py), unsupervised, in a namespace of
 #     their own: one the policy names, one it does not.
+# v1.36 step 12 (docs/security/v1.36-kubernetes-parity.md), the ship gate's
+# runs: the policy (policy.txt) names a credential, a sub-agent, a confined
+# MCP server and a plan (`require plan`), and each pod is held to its plan
+# (plan.txt, the VarekPlan `agent`); the allowed service is reached over
+# HTTPS through the egress proxy in inspecting mode (its CA made here, the
+# chart's trust bundle), the agent's placeholder for the soak's token (made
+# here, a Secret the chart mounts in the node agent) swapped for the token;
+#   - a volume pod on each node (`volume-N`, pod_agent.py --volume): reads
+#     of a file of its project, --volume-rate a second, for the whole run,
+#     its stream the ship gate's of over 1,000,000 records in 24 hours,
+#     audited in fixed memory.
 # Every --sample seconds it records the pods, the finished pods' logs, each
 # node's VAREK processes' memory (read in the node agent's container); each
 # node's exporter log is followed throughout for its audit events and its
@@ -22,10 +33,13 @@
 #
 #   varek/v1_4/tests/soak_v1340/soak.sh --image REPO:TAG [--digest sha256:...]
 #        [--hours 24] [--interval 60] [--short-every 15] [--sample 300]
+#        [--volume-rate 15] [--rotate-bytes N]
 #        [--openshift] [--ecr-pull-secret] [--out DIR] [--check-only DIR]
 #
-# Against the cluster kubectl's current context names, with helm and python3
-# where this runs, and this checkout's
+# --rotate-bytes: the chart's streams.rotateBytes (its default, 256 MiB,
+# otherwise); a trial gives a small one, so its streams go on in segments.
+# Against the cluster kubectl's current context names, with helm, python3
+# and openssl where this runs, and this checkout's
 # tools/vdp_cert_check built (make -C varek/v1_4 all). --image is the node
 # image (packaging/container/Containerfile --target node) the nodes can
 # pull; --digest pins it. --openshift: CRI-O, the chart's SCCs, the agents'
@@ -35,16 +49,21 @@
 # get-login-password; a token of 12 hours, enough for the pods' one pull) and
 # given to the chart. The run's directory is DIR
 # (default /var/tmp/varek-soak-k8s-<time>); DIR/report.txt holds the verdict.
-# --check-only DIR runs soak_check.py again on a run already collected.
+# DIR/secret (0700) holds the soak's token and the CA's and the service's
+# keys, made for the run. --check-only DIR runs soak_check.py again on a run
+# already collected.
 #
 # It installs the chart as the release `varek` in varek-system and makes the
-# namespaces varek-soak and varek-soak-svc; it removes nothing (README.md:
-# what to remove, and the cluster).
+# namespaces varek-soak and varek-soak-svc, the VarekCredential
+# varek-soak-cred, the Secret varek-soak-cred and the ConfigMap
+# varek-soak-roots in varek-system; it removes nothing (README.md: what to
+# remove, and the cluster).
 set -u
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 SOAK="$HERE/tests/soak_v1340"
 IMAGE="" DIGEST="" HOURS=24 INTERVAL=60 SHORT_EVERY=15 SAMPLE=300 OPENSHIFT=0 ECR_PULL=0 OUT="" CHECK_ONLY=""
+VOLUME_RATE=15 ROTATE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --image) IMAGE="$2"; shift 2 ;;
@@ -53,6 +72,8 @@ while [ $# -gt 0 ]; do
         --interval) INTERVAL="$2"; shift 2 ;;
         --short-every) SHORT_EVERY="$2"; shift 2 ;;
         --sample) SAMPLE="$2"; shift 2 ;;
+        --volume-rate) VOLUME_RATE="$2"; shift 2 ;;
+        --rotate-bytes) ROTATE="$2"; shift 2 ;;
         --openshift) OPENSHIFT=1; shift ;;
         --ecr-pull-secret) ECR_PULL=1; shift ;;
         --out) OUT="$2"; shift 2 ;;
@@ -68,13 +89,17 @@ fi
 # the chart pins the image by it: a digest no registry has is pods that never pull
 [ -z "$DIGEST" ] || [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] ||
     { echo "soak.sh: --digest takes sha256: and 64 hex digits (the one docker push printed), not '$DIGEST'" >&2; exit 2; }
-for t in kubectl helm python3; do command -v "$t" > /dev/null || { echo "soak.sh: $t is needed" >&2; exit 2; }; done
+[[ "$VOLUME_RATE" =~ ^[1-9][0-9]*$ ]] || { echo "soak.sh: --volume-rate takes a whole number of reads a second" >&2; exit 2; }
+[ -z "$ROTATE" ] || [[ "$ROTATE" =~ ^[0-9]+$ ]] || { echo "soak.sh: --rotate-bytes takes a number of bytes" >&2; exit 2; }
+for t in kubectl helm python3 openssl; do command -v "$t" > /dev/null || { echo "soak.sh: $t is needed" >&2; exit 2; }; done
 [ -x "$HERE/tools/vdp_cert_check" ] ||
     { echo "soak.sh: build the tools first (make -C varek/v1_4 all)" >&2; exit 2; }
 OUT="${OUT:-/var/tmp/varek-soak-k8s-$(date +%Y%m%d-%H%M)}"
 [ -e "$OUT" ] && { echo "soak.sh: $OUT exists (give another --out)" >&2; exit 2; }
-mkdir -p "$OUT/logs" "$OUT/samples" "$OUT/exporter" "$OUT/streams" "$OUT/manifests"
+mkdir -p "$OUT/logs" "$OUT/samples" "$OUT/exporter" "$OUT/streams" "$OUT/manifests" "$OUT/tls"
+mkdir -m 700 "$OUT/secret"
 NS=varek-system AG=varek-soak SVC=varek-soak-svc
+ALLOWED_NAME="allowed.$SVC.svc.cluster.local"
 AGENT_IMG=mirror.gcr.io/library/python:3.12-bookworm
 LOG="$OUT/soak.log"
 say() { echo "[$(TZ=America/Chicago date '+%H:%M:%S %Z')] $*" | tee -a "$LOG"; }
@@ -121,9 +146,33 @@ fi
 # --- 2. the chart
 K create namespace "$NS" > /dev/null 2>&1
 K label namespace "$NS" --overwrite pod-security.kubernetes.io/enforce=privileged > /dev/null
+# v1.36 step 12: the soak's token, a Secret the chart mounts in the node agent
+# (credentials.secrets), never given to a pod; the allowed service's CA, the
+# chart's trust bundle (trustBundles.configMap), and its certificate. Made
+# for this run, kept in DIR/secret (the checker looks for the token in the
+# streams and logs, where it must not be).
+( umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(32), end="")' > "$OUT/secret/token" ) ||
+    die "the soak's token"
+TOKEN_SHA="$(python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$OUT/secret/token")"
+K -n "$NS" create secret generic varek-soak-cred --from-file=token="$OUT/secret/token" --dry-run=client -o json |
+    K apply -f - > /dev/null || die "the token's Secret (varek-soak-cred)"
+{
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 7 -subj "/CN=VAREK soak CA" \
+        -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign \
+        -keyout "$OUT/secret/ca.key" -out "$OUT/tls/ca.pem" &&
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=$ALLOWED_NAME" \
+        -keyout "$OUT/secret/allowed.key" -out "$OUT/tls/allowed.csr" &&
+    openssl x509 -req -in "$OUT/tls/allowed.csr" -CA "$OUT/tls/ca.pem" -CAkey "$OUT/secret/ca.key" \
+        -CAserial "$OUT/tls/ca.srl" -CAcreateserial -days 7 -out "$OUT/tls/allowed.pem" \
+        -extfile <(printf 'subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n' "$ALLOWED_NAME")
+} > "$OUT/tls/openssl.log" 2>&1 || { tail -5 "$OUT/tls/openssl.log" | tee -a "$LOG"; die "the allowed service's certificate (openssl)"; }
+K -n "$NS" create configmap varek-soak-roots --from-file=soak.pem="$OUT/tls/ca.pem" --dry-run=client -o json |
+    K apply -f - > /dev/null || die "the trust bundle's ConfigMap (varek-soak-roots)"
 REPO="${IMAGE%:*}" TAG="${IMAGE##*:}"
 # v1.36 step 9 (D10): each node's own key (the chart's default), published as its VarekNodeKey
-SETS=(--set image.repository="$REPO" --set image.tag="$TAG" --set anchor.enabled=true)
+SETS=(--set image.repository="$REPO" --set image.tag="$TAG" --set anchor.enabled=true
+      --set 'credentials.secrets={varek-soak-cred}' --set trustBundles.configMap=varek-soak-roots)
+[ -n "$ROTATE" ] && SETS+=(--set streams.rotateBytes="$ROTATE")
 [ -n "$DIGEST" ] && SETS+=(--set image.digest="$DIGEST")
 [ "$OPENSHIFT" = 1 ] && SETS+=(--set runtime=cri-o --set openshift.enabled=true)
 if [ "$ECR_PULL" = 1 ]; then
@@ -162,48 +211,70 @@ for n in "$SVC" "$AG"; do K create namespace "$n" > /dev/null 2>&1; done
 K label namespace "$SVC" --overwrite pod-security.kubernetes.io/enforce=restricted > /dev/null
 K label namespace "$AG" --overwrite pod-security.kubernetes.io/enforce=restricted varek.dev/policy-required=true > /dev/null
 K -n "$SVC" create configmap soak-code --from-file="$SOAK/servers.py" --dry-run=client -o json | K apply -f - > /dev/null
+K -n "$SVC" create secret tls allowed-tls --cert="$OUT/tls/allowed.pem" --key="$OUT/secret/allowed.key" \
+    --dry-run=client -o json | K apply -f - > /dev/null || die "the allowed service's certificate (allowed-tls)"
 K -n "$AG" create configmap soak-code --from-file="$SOAK/pod_agent.py" --dry-run=client -o json | K apply -f - > /dev/null
 if [ "$OPENSHIFT" = 1 ]; then
     # the agents' service account may use the chart's supervised SCC
     K -n "$AG" create rolebinding varek-supervised --clusterrole=varek-supervised-scc --serviceaccount="$AG:default" \
         --dry-run=client -o json | K apply -f - > /dev/null
 fi
-python3 - "$OUT/manifests" "$AGENT_IMG" "$SVC" "$OPENSHIFT" <<'EOF'
+python3 - "$OUT/manifests" "$AGENT_IMG" "$SVC" "$OPENSHIFT" "$TOKEN_SHA" <<'EOF'
 import json, sys
-out, img, ns, openshift = sys.argv[1:]
+out, img, ns, openshift, token_sha = sys.argv[1:]
 items = []
 # on OpenShift the namespace's user (restricted-v2 admits only its range)
 user = {} if openshift == "1" else {"runAsUser": 65534}
-for name in ("allowed", "denied"):
+# v1.36 step 12: the allowed service over HTTPS (its port 443 the
+# container's 8443), telling the token from anything else in X-Varek-Soak;
+# the denied one as before
+for name, port, sport in (("allowed", 8443, 443), ("denied", 8080, 8080)):
     lab = {"app": name}
+    cmd = ["python3", "-u", "/code/servers.py", "--name", name, "--port", str(port)]
+    mounts = [{"name": "code", "mountPath": "/code"}]
+    vols = [{"name": "code", "configMap": {"name": "soak-code"}}]
+    if name == "allowed":
+        cmd += ["--tls", "/tls/tls.crt", "/tls/tls.key", "--token-sha256", token_sha]
+        mounts.append({"name": "tls", "mountPath": "/tls", "readOnly": True})
+        vols.append({"name": "tls", "secret": {"secretName": "allowed-tls"}})
     items += [{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": name, "namespace": ns},
                "spec": {"replicas": 1, "selector": {"matchLabels": lab}, "template": {"metadata": {"labels": lab}, "spec": {
                    "securityContext": {"runAsNonRoot": True, "seccompProfile": {"type": "RuntimeDefault"}},
-                   "containers": [{"name": name, "image": img,
-                                   "command": ["python3", "-u", "/code/servers.py", "--name", name, "--port", "8080"],
-                                   "ports": [{"containerPort": 8080}],
+                   "containers": [{"name": name, "image": img, "command": cmd,
+                                   "ports": [{"containerPort": port}],
                                    "securityContext": {"allowPrivilegeEscalation": False, **user,
                                                        "capabilities": {"drop": ["ALL"]}},
-                                   "readinessProbe": {"tcpSocket": {"port": 8080}},
-                                   "volumeMounts": [{"name": "code", "mountPath": "/code"}]}],
-                   "volumes": [{"name": "code", "configMap": {"name": "soak-code"}}]}}}},
+                                   "readinessProbe": {"tcpSocket": {"port": port}},
+                                   "volumeMounts": mounts}],
+                   "volumes": vols}}}},
               {"apiVersion": "v1", "kind": "Service", "metadata": {"name": name, "namespace": ns},
-               "spec": {"selector": lab, "ports": [{"port": 8080, "targetPort": 8080}]}}]
+               "spec": {"selector": lab, "ports": [{"port": sport, "targetPort": port}]}}]
 json.dump({"apiVersion": "v1", "kind": "List", "items": items}, open(f"{out}/services.json", "w"), indent=1)
 EOF
 K apply -f "$OUT/manifests/services.json" > /dev/null || die "the services"
 K -n "$SVC" rollout status deploy/allowed --timeout=10m > /dev/null && K -n "$SVC" rollout status deploy/denied --timeout=10m > /dev/null ||
     die "the services did not start"
 DENIED_IP="$(K -n "$SVC" get svc denied -o jsonpath='{.spec.clusterIP}')"
-ALLOWED_HOST="allowed.$SVC.svc.cluster.local:8080"
-sed "s/@ALLOWED@/$ALLOWED_HOST/" "$SOAK/policy.txt" > "$OUT/policy.txt"
-python3 - "$OUT/policy.txt" "$AG" > "$OUT/manifests/policy.json" <<'EOF'
+sed "s/@ALLOWED@/$ALLOWED_NAME/g" "$SOAK/policy.txt" > "$OUT/policy.txt"
+sed "s/@ALLOWED@/$ALLOWED_NAME/g" "$SOAK/plan.txt" > "$OUT/plan.txt"
+# v1.36 step 12: the credential given to the agents' namespace (D2), before
+# the policy naming it; the policy's trust bundle the chart's ConfigMap's
+# key (D7); the plan each pod names
+python3 - "$OUT/policy.txt" "$OUT/plan.txt" "$AG" "$OUT/manifests" <<'EOF'
 import json, sys
-print(json.dumps({"apiVersion": "varek.dev/v1alpha1", "kind": "VarekPolicy",
-                  "metadata": {"name": "agent", "namespace": sys.argv[2]}, "spec": {"policy": open(sys.argv[1]).read()}}))
+pol, plan, ns, out = sys.argv[1:]
+json.dump({"apiVersion": "varek.dev/v1alpha1", "kind": "VarekCredential", "metadata": {"name": "varek-soak-cred"},
+           "spec": {"credential": "soak_token", "source": "file:/var/lib/varek/credentials/varek-soak-cred/token",
+                    "namespaces": [ns]}}, open(f"{out}/credential.json", "w"))
+json.dump({"apiVersion": "varek.dev/v1alpha1", "kind": "VarekPolicy", "metadata": {"name": "agent", "namespace": ns},
+           "spec": {"policy": open(pol).read(), "trustBundle": "soak.pem"}}, open(f"{out}/policy.json", "w"))
+json.dump({"apiVersion": "varek.dev/v1alpha1", "kind": "VarekPlan", "metadata": {"name": "agent", "namespace": ns},
+           "spec": {"plan": open(plan).read()}}, open(f"{out}/plan.json", "w"))
 EOF
-K apply -f "$OUT/manifests/policy.json" > "$OUT/policy.apply" 2>&1 || { cat "$OUT/policy.apply" | tee -a "$LOG"; die "the policy was refused"; }
-sleep 10                                # the plugin's -sync writes it to each node
+for m in credential policy plan; do
+    K apply -f "$OUT/manifests/$m.json" > "$OUT/$m.apply" 2>&1 || { cat "$OUT/$m.apply" | tee -a "$LOG"; die "the $m was refused"; }
+done
+sleep 15                                # the plugin's -sync writes them to each node
 
 # --- 4. the agents
 START=$(date +%s)
@@ -228,20 +299,22 @@ for n in "${NODES[@]}"; do follow_exporter "$n" & FOLLOWERS+=($!); done
 stop_followers() { touch "$OUT/.done"; for f in "${FOLLOWERS[@]}"; do pkill -P "$f" 2>/dev/null; kill "$f" 2>/dev/null; done; }
 trap stop_followers EXIT
 END=$((START + $(python3 -c "print(int(float('$HOURS') * 3600))")))
-python3 - "$OUT" "$AGENT_IMG" "$AG" "$SVC" "$DENIED_IP" "$HOURS" "$INTERVAL" "$SHORT_EVERY" "$OPENSHIFT" "${NODES[@]}" <<'EOF'
+python3 - "$OUT" "$AGENT_IMG" "$AG" "$SVC" "$DENIED_IP" "$HOURS" "$INTERVAL" "$SHORT_EVERY" "$OPENSHIFT" \
+    "$VOLUME_RATE" "$TOKEN_SHA" "${ROTATE:-0}" "${NODES[@]}" <<'EOF'
 import json, sys
-out, img, ns, svc, denied_ip, hours, interval, short_every, openshift, *nodes = sys.argv[1:]
+out, img, ns, svc, denied_ip, hours, interval, short_every, openshift, rate, token_sha, rotate, *nodes = sys.argv[1:]
 long_s = int(float(hours) * 3600)
 def pod_spec(args, node=None):
     sc = {"runAsNonRoot": True, "runAsGroup": 65534 if openshift == "0" else 1000,
           "seccompProfile": {"type": "Localhost", "localhostProfile": "varek/unsupervised.json"}}
     if openshift == "0":
         sc["runAsUser"] = 65534                     # on OpenShift the namespace's user (its SCC)
+    # v1.36 step 12: the agent runs as python3.12, its build sub-agent as python3 (policy.txt)
     spec = {"restartPolicy": "Never", "securityContext": sc, "enableServiceLinks": False,
             "containers": [{"name": "agent", "image": img,
-                            "command": ["/usr/local/bin/python3", "/varek-soak/pod_agent.py"] + args +
+                            "command": ["/usr/local/bin/python3.12", "/varek-soak/pod_agent.py", "--ship-gate"] + args +
                                        ["--outside", "/outside", "--project", "/work/project",
-                                        "--allowed", f"http://allowed.{svc}.svc.cluster.local:8080/",
+                                        "--allowed", f"https://allowed.{svc}.svc.cluster.local/",
                                         "--denied", f"http://denied.{svc}.svc.cluster.local:8080/",
                                         "--denied-ip", f"http://{denied_ip}:8080/"],
                             "env": [{"name": "HOME", "value": "/work"}, {"name": "GIT_CONFIG_NOSYSTEM", "value": "1"},
@@ -257,11 +330,16 @@ def pod_spec(args, node=None):
     if node:
         spec["nodeSelector"] = {"kubernetes.io/hostname": node}
     return spec
-ann = {"varek.dev/policy": "agent"}
+ann = {"varek.dev/policy": "agent", "varek.dev/plan": "agent"}
 items = [{"apiVersion": "v1", "kind": "Pod",
           "metadata": {"name": f"long-{i}", "namespace": ns, "annotations": ann, "labels": {"soak": "long"}},
           "spec": pod_spec(["--interval", interval, "--seconds", str(long_s), "--probe-every", "10"], n)}
          for i, n in enumerate(nodes)]
+# v1.36 step 12: the ship gate's large stream, one a node
+items += [{"apiVersion": "v1", "kind": "Pod",
+           "metadata": {"name": f"volume-{i}", "namespace": ns, "annotations": ann, "labels": {"soak": "volume"}},
+           "spec": pod_spec(["--volume", rate, "--seconds", str(long_s)], n)}
+          for i, n in enumerate(nodes)]
 items.append({"apiVersion": "batch/v1", "kind": "CronJob", "metadata": {"name": "short", "namespace": ns},
               "spec": {"schedule": f"*/{short_every} * * * *", "concurrencyPolicy": "Forbid",
                        "successfulJobsHistoryLimit": 3, "failedJobsHistoryLimit": 50,
@@ -270,7 +348,8 @@ items.append({"apiVersion": "batch/v1", "kind": "CronJob", "metadata": {"name": 
                            "spec": pod_spec(["--interval", "5", "--seconds", "60", "--probe-every", "4"])}}}}})
 json.dump({"apiVersion": "v1", "kind": "List", "items": items}, open(f"{out}/manifests/agents.json", "w"), indent=1)
 json.dump({"hours": float(hours), "interval": float(interval), "short_every": int(short_every), "nodes": nodes,
-           "denied_ip": denied_ip, "openshift": openshift == "1"}, open(f"{out}/meta.json", "w"))
+           "denied_ip": denied_ip, "openshift": openshift == "1", "ship_gate": True, "volume_rate": int(rate),
+           "token_sha256": token_sha, "rotate_bytes": int(rotate)}, open(f"{out}/meta.json", "w"))
 EOF
 K apply -f "$OUT/manifests/agents.json" > "$OUT/agents.apply" 2>&1 || { cat "$OUT/agents.apply" | tee -a "$LOG"; die "the agents were refused"; }
 python3 - "$OUT/meta.json" "$START" "$END" "$IMAGE" "$DIGEST" <<'EOF'
@@ -279,7 +358,7 @@ m = json.load(open(sys.argv[1]))
 m.update(start=int(sys.argv[2]), end=int(sys.argv[3]), image=sys.argv[4], digest=sys.argv[5])
 json.dump(m, open(sys.argv[1], "w"))
 EOF
-say "the agents started: ${#NODES[@]} long (one a node), a short Job every $SHORT_EVERY min; until $(TZ=America/Chicago date -d @$END '+%Y-%m-%d %H:%M %Z')"
+say "the agents started: ${#NODES[@]} long and ${#NODES[@]} volume (one of each a node), a short Job every $SHORT_EVERY min; until $(TZ=America/Chicago date -d @$END '+%Y-%m-%d %H:%M %Z')"
 
 # --- 5. the samples
 TARPY='import sys, tarfile
@@ -362,10 +441,11 @@ for f in glob.glob(f"{out}/exporter/*.jsonl"):
             except ValueError:
                 continue
             done.add((e.get("metadata") or {}).get("correlation_uid"))
-# every run: the short Jobs' pods kept as they ended, and a long agent a node
+# every run: the short Jobs' pods kept as they ended, and a long agent and a
+# volume pod a node
 short = [f for f in glob.glob(f"{out}/logs/*.pod.json")
          if json.load(open(f))["metadata"].get("labels", {}).get("soak") == "short"]
-want = len(short) + len(json.load(open(f"{out}/meta.json"))["nodes"])
+want = len(short) + 2 * len(json.load(open(f"{out}/meta.json"))["nodes"])
 sys.exit(0 if len(done) >= want else 1)
 EOF
     sleep 10

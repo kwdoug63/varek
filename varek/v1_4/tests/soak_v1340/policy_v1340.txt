@@ -1,0 +1,34 @@
+# v1.34's 24-hour runs (tests/soak_v1340): the pod agent's policy
+# (pod_agent.py without --ship-gate), in the python:3.12-bookworm image, as
+# crio_trial.sh runs it; soak.sh's, from v1.36 step 12, is policy.txt.
+# @ALLOWED@ is the allowed service (its address and port).
+require warden 1.29
+# the system and the interpreter, read; the agent's code, read
+allow path /usr/ readonly
+allow path /lib/ readonly
+allow path /lib64/ readonly
+allow path /etc/ld.so.cache readonly
+allow path /etc/ld.so.preload readonly            # looked for at every launch (there is none)
+allow path /etc/gitattributes readonly            # git looks for it (there is none)
+allow path /etc/localtime readonly
+allow path /etc/passwd readonly
+allow path /etc/group readonly
+allow path /etc/nsswitch.conf readonly
+allow path /etc/host.conf readonly
+allow path /etc/hosts readonly
+allow path /etc/resolv.conf readonly
+allow path /etc/gai.conf readonly
+allow path /proc/self/ readonly
+allow path /dev/null
+allow path /dev/urandom readonly
+allow path /varek-soak/ readonly
+allow path exact /varek-soak readonly             # the script's directory, opened by the interpreter
+# its project, a volume of its own (noexec: D4)
+allow path /work/
+# what it launches: the interpreter (its build step) and git
+allow exec /usr/local/bin/python3
+allow exec /usr/local/bin/python3.12
+allow exec /usr/bin/git
+allow exec prefix /usr/lib/git-core/
+# the one service it calls
+allow host @ALLOWED@

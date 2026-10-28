@@ -157,3 +157,48 @@ def test_a_malformed_connection_id_fails_the_audit(tmp_path, capsys):
     rc = va.main(["--policy", str(pol), "--checker", CHECKER, str(s)])
     out = capsys.readouterr().out
     assert rc != 0 and "varek_audit: FAIL" in out and "malformed connection id [1]" in out
+
+
+def test_a_connection_the_proxy_could_not_read_is_reported_once():
+    """v1.36 step 12: a proxy_unreadable record stands for a hand-off's
+    decision: for a connection handed to the proxy, once, with its kind and
+    the proxy's reason"""
+    problems = []
+    pc = va.ProxiedCheck(None, problems, None)
+    for cid in (3, 4):
+        pc.rec({"action": "net.connect", "target": "169.254.169.254:80", "proxy_handoff": True, "proxy_conn": cid}, cid)
+    pc.ev({"event": "proxy_unreadable", "proxy_conn": 3, "proxy_kind": "http", "why": "a Host that is not a host name"})
+    assert problems == []
+    pc.ev({"event": "proxy_unreadable", "proxy_conn": 3, "proxy_kind": "http", "why": "again"})
+    pc.ev({"event": "proxy_unreadable", "proxy_conn": 9, "proxy_kind": "tls", "why": "no SNI"})
+    pc.ev({"event": "proxy_unreadable", "proxy_conn": 4, "proxy_kind": "smtp", "why": ""})
+    assert len(problems) == 3
+    assert "connection 3, which is not a hand-off or was decided already" in problems[0]
+    assert "connection 9, which is not a hand-off" in problems[1]
+    assert "connection 4: a malformed proxy_unreadable record" in problems[2]
+
+
+def test_a_connection_the_proxy_could_not_read_is_an_ocsf_refusal(tmp_path):
+    """v1.36 step 12: the OCSF export writes a proxy_unreadable record as
+    Network Activity, Refuse, Denied and Blocked, to where its hand-off went"""
+    import varek_ocsf as ocsf     # noqa: E402
+    pol = tmp_path / "p.policy"
+    pol.write_text("require warden 1.26\nproxy on\nallow host a.example.com:443\n")
+    ex = ocsf.Exporter(str(pol), "node-1")
+    out = []
+    for r in ({"event": "run_start", "run": RUN, "warden": "1.36.0", "timestamp_ns": 10**18, "chain": "c0"},
+              {"run": RUN, "seq": 1, "report_id": "pr-1", "action": "net.connect", "target": "169.254.169.254:80",
+               "resolved": "127.0.0.1:41000", "decision_raw": "UNKNOWN", "decision_final": "ALLOW",
+               "rule": "proxy_handoff_in_progress", "proxy_handoff": True, "proxy_conn": 4, "agent_pid": 7,
+               "obo": ["agent"], "kernel_verdict": "ALLOW", "errno": 0, "timestamp_ns": 10**18 + 1, "chain": "c1"},
+              {"event": "proxy_unreadable", "run": RUN, "proxy_conn": 4, "proxy_kind": "http",
+               "why": "a Host that is not a host name", "timestamp_ns": 10**18 + 2, "chain": "c2"}):
+        out += ex.feed(r)
+    out += ex.finish()
+    ev = [e for e in out if e["unmapped"]["varek"].get("event") == "proxy_unreadable"]
+    assert len(ev) == 1
+    e = ev[0]
+    assert (e["class_name"], e["activity_name"], e["action"], e["disposition"]) == \
+        ("Network Activity", "Refuse", "Denied", "Blocked")
+    assert e["dst_endpoint"] == {"name": "169.254.169.254:80", "ip": "169.254.169.254", "port": 80}
+    assert e["status_detail"] == "a Host that is not a host name" and e["unmapped"]["varek"]["handoff_seq"] == 1

@@ -2916,6 +2916,19 @@ class ProxiedCheck:
         elif event == "proxy_close":
             if type(e.get("proxy_conn")) is int:      # v1.36 step 11 (review): else ProxiedCheck says so
                 self.port.pop(e["proxy_conn"], None)
+        elif event == "proxy_unreadable":
+            # v1.36 step 12: a hand-off the proxy could not read, refused with
+            # nothing dialed: its report in place of a decision, once
+            cid = e.get("proxy_conn")
+            if type(cid) is not int or cid not in self.handoffs or cid in self.seen:
+                self.problems.append(f"a proxy_unreadable record for connection {cid!r}, which is not a hand-off "
+                                     f"or was decided already")
+                return
+            self.seen.add(cid)
+            self.port.pop(cid, None)
+            if e.get("proxy_kind") not in PROXY_KINDS + ("none",) or not isinstance(e.get("why"), str) \
+                    or not e["why"]:
+                self.problems.append(f"connection {cid}: a malformed proxy_unreadable record")
 
     def rec(self, rec, pos):
         if rec.get("proxy_handoff") is True and type(rec.get("proxy_conn")) is int:

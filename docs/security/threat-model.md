@@ -388,9 +388,11 @@ Model-B techniques below, with the residual limits stated honestly.
     the Warden; if it dies mid-run, the run stops. The Warden never blocks
     sending to it.
   - *Recorded and audited.* Each hand-off, decision (`net.proxy`) and close
-    (`proxy_close`) is a chained record. `varek_audit.py` asks each hand-off
+    (`proxy_close`) is a chained record, and (v1.36) so is each connection
+    the proxy could not read and refused (`proxy_unreadable`), which until
+    then only the log said. `varek_audit.py` asks each hand-off
     and each dialed address of the policy again, checks one certified
-    decision per hand-off and a close for each connection passed on, and
+    decision (or one `proxy_unreadable`) per hand-off and a close for each connection passed on, and
     that no connect on a proxied port was dialed directly except by a
     numeric rule.
   - *Chained to a customer's proxy.* With `proxy upstream`, the Warden
@@ -883,7 +885,8 @@ are claimed as solved.
   - *The identity providers.* A compromised issuer or trust-domain CA can
     name any user or agent (trust boundary 12).
   - *Not every record.* Records that are not a process's call
-    (resolutions, the stub resolver's questions, `proxy_close`) carry no
+    (resolutions, the stub resolver's questions, `proxy_close`,
+    `proxy_unreadable`) carry no
     `obo`.
   - *Sub-agents.* A threaded process cannot launch one. Where the kernel's
     process events cannot be used (some containers), a launch of the image
