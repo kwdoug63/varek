@@ -58,8 +58,9 @@ if [ "$DEPS" = 1 ]; then
         # A name the host's repositories do not have is left out (strict=0)
         # and the build's own packages are checked after; --allowerasing:
         # the cloud images' curl-minimal gives way to curl.
-        java="java-21-openjdk-headless"
-        grep -q '^ID="*amzn' /etc/os-release && java="java-21-amazon-corretto-headless"
+        # a JDK, not a runtime alone: the Java checks compile their probe with javac
+        java="java-21-openjdk-devel"
+        grep -q '^ID="*amzn' /etc/os-release && java="java-21-amazon-corretto-devel"
         dnf -y --allowerasing --setopt=strict=0 install gcc make git openssl libseccomp-devel openssl-devel \
             libsodium-devel python3 python3-pip python3-cryptography "$java" squid curl util-linux \
             glibc-static libasan libubsan gcc-c++ cmake procps-ng iproute sudo runc || { echo "arm64_sweep.sh: dnf failed"; exit 1; }
