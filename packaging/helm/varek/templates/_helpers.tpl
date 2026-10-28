@@ -86,3 +86,33 @@ aws_container_token_file = /var/run/varek/tokens/aws/token
 oidc_ca = /etc/varek/issuer-ca/ca.crt
 {{- end }}
 {{- end -}}
+
+{{/* v1.36 step 11 (review): what the chart's values must hold, failed at
+  render, not found on the node. The node's key's directory and its public
+  key's are apart, each apart from every other directory a container of the
+  DaemonSet mounts (a key under the streams' directory would be the
+  exporter's to read); the credentials' directory apart from the node agent's
+  other mounts; a stream's segment 0 (none) or 65536 bytes or more, as the
+  Warden takes it. */}}
+{{- define "varek.validate" -}}
+{{- $n := .Values.node -}}
+{{- $dirs := dict "node.policies" $n.policies "node.streams" $n.streams "node.socket" $n.socket "node.bin" $n.bin "node.control" $n.control "node.exportState" $n.exportState "node.kubelet" $n.kubelet "flowPolicy.stateDir" .Values.flowPolicy.stateDir "credentials.dir" .Values.credentials.dir -}}
+{{- if and (not .Values.signing.secretName) .Values.signing.nodeKey.enabled -}}
+{{- $_ := set $dirs "signing.nodeKey.dir" .Values.signing.nodeKey.dir -}}
+{{- $_ := set $dirs "signing.nodeKey.pubDir" .Values.signing.nodeKey.pubDir -}}
+{{- end -}}
+{{- range $a, $pa := $dirs -}}
+{{- if not (and (kindIs "string" $pa) (hasPrefix "/" $pa) (not (contains "/../" (printf "%s/" $pa)))) -}}
+{{- fail (printf "%s: an absolute path, with no .. (it is %v)" $a $pa) -}}
+{{- end -}}
+{{- range $b, $pb := $dirs -}}
+{{- if and (lt $a $b) (or (eq (trimSuffix "/" $pa) (trimSuffix "/" $pb)) (hasPrefix (printf "%s/" (trimSuffix "/" $pa)) $pb) (hasPrefix (printf "%s/" (trimSuffix "/" $pb)) $pa)) -}}
+{{- fail (printf "%s (%s) and %s (%s): each a directory of its own, neither in the other" $a $pa $b $pb) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $r := .Values.streams.rotateBytes -}}
+{{- if not (and (kindIs "float64" $r | or (kindIs "int" $r) (kindIs "int64" $r)) (eq (float64 $r) (float64 (int64 $r))) (or (eq (int64 $r) 0) (ge (int64 $r) 65536))) -}}
+{{- fail (printf "streams.rotateBytes: 0 (no rotation) or a whole number of bytes, 65536 or more (it is %v)" $r) -}}
+{{- end -}}
+{{- end -}}

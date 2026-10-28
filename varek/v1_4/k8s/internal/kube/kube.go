@@ -87,7 +87,28 @@ type Pod struct {
 	} `json:"metadata"`
 	Spec struct {
 		ServiceAccountName string `json:"serviceAccountName"`
+		// v1.36 step 11 (review): the init containers, for the NRI plugin's
+		// check of the webhook's (the runtime may not say a container's image)
+		InitContainers []InitContainer `json:"initContainers"`
 	} `json:"spec"`
+}
+
+// InitContainer is what the NRI plugin reads of a pod's init container
+type InitContainer struct {
+	Name         string          `json:"name"`
+	Image        string          `json:"image"`
+	Command      []string        `json:"command"`
+	Args         []string        `json:"args"`
+	Env          json.RawMessage `json:"env"`
+	EnvFrom      json.RawMessage `json:"envFrom"`
+	VolumeMounts []struct {
+		Name        string `json:"name"`
+		MountPath   string `json:"mountPath"`
+		ReadOnly    bool   `json:"readOnly"`
+		SubPath     string `json:"subPath"`
+		SubPathExpr string `json:"subPathExpr"`
+	} `json:"volumeMounts"`
+	VolumeDevices json.RawMessage `json:"volumeDevices"`
 }
 
 // GetPod is a pod by its namespace and name; nil, nil when there is none

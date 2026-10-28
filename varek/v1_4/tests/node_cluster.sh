@@ -53,7 +53,21 @@ CRIO_REPO="https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v$VERS
 K8S_REPO="https://pkgs.k8s.io/core:/stable:/v$K8S/$FMT/"
 # SELinux as the host has it (none on the runner)
 SELINUX="$(getenforce 2>/dev/null || echo none)"
-FLANNEL="https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
+# v1.36 step 11 (review): flannel's manifest, the CNI plugins and
+# containerd's unit pinned, each checked by a SHA-256 kept here (each the
+# download's own, 2026-10-28; the project's published sums agree)
+FLANNEL_V=v0.28.10
+FLANNEL="https://github.com/flannel-io/flannel/releases/download/$FLANNEL_V/kube-flannel.yml"
+FLANNEL_SHA=393bdbce53eb50c8eb97dd513b218518b7d6e7985dc7b889be956e112a711084
+CNI_V=v1.9.1
+case "$ARCH" in
+    amd64) CNI_SHA=b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303 ;;
+    arm64) CNI_SHA=56171987d3947707c3563db2f4001bccaf50fd63468611b9f3cbecb1375ee7ec ;;
+    *) CNI_SHA="" ;;
+esac
+# containerd.service, the same file in 2.2.10 and 2.3.7
+UNIT_V=v2.3.7
+UNIT_SHA=1941362cbaa89dd591b99c32b050d82c583d3cd2e5fa63085d7017457ec5fca8
 # A test image the Kubernetes project keeps, with a shell and sleep
 export POD_IMAGE="${POD_IMAGE:-registry.k8s.io/e2e-test-images/busybox:1.36.1-1}"
 KUBECTL=/usr/bin/kubectl
@@ -82,6 +96,7 @@ latest() {   # OWNER/REPO PATTERN
     return 1
 }
 get() { curl -fsSL --retry 3 --retry-delay 5 "$@"; }
+sha_is() { [ "$(sha256sum "$1" | awk '{print $1}')" = "$2" ]; }   # FILE HEX
 # On a failure, what the runtime and the kubelet said, and the containers
 # the runtime made (the first run's crun cells failed with neither kept)
 # The log's own tail is printed first: the fourth run's install failures
@@ -218,7 +233,9 @@ else
     [ "$(sha256sum "$OUT/containerd.tgz" | awk '{print $1}')" = "$(cat "$OUT/containerd.sha")" ] || fail "containerd's checksum does not match"
     run tar -C /usr/local -xzf "$OUT/containerd.tgz" || fail "unpacking containerd"
     command -v runc > /dev/null || run apt-get install -y runc
-    get -o /etc/systemd/system/containerd.service "https://raw.githubusercontent.com/containerd/containerd/v$full/containerd.service" || fail "containerd's unit"
+    get -o "$OUT/containerd.service" "https://raw.githubusercontent.com/containerd/containerd/$UNIT_V/containerd.service" || fail "containerd's unit"
+    sha_is "$OUT/containerd.service" "$UNIT_SHA" || fail "containerd's unit ($UNIT_V) does not match its SHA-256"
+    install -m 0644 "$OUT/containerd.service" /etc/systemd/system/containerd.service
     install -d /etc/containerd
     /usr/local/bin/containerd config default > /etc/containerd/config.toml
     sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
@@ -249,10 +266,12 @@ fi
 if [ -x /opt/cni/bin/bridge ] && [ -x /opt/cni/bin/portmap ] && [ -x /opt/cni/bin/loopback ]; then
     measure "cni" "the kubernetes-cni package's plugins"
 else
-    cni="v$(latest containernetworking/plugins 'v1\.[0-9]*\.[0-9]*')" || fail "no CNI plugins release found"
+    [ -n "$CNI_SHA" ] || fail "no pinned CNI plugins for $ARCH"
     install -d /opt/cni/bin
-    get "https://github.com/containernetworking/plugins/releases/download/$cni/cni-plugins-linux-$ARCH-$cni.tgz" | tar -C /opt/cni/bin -xz || fail "the CNI plugins"
-    measure "cni" "the CNI plugins $cni"
+    get -o "$OUT/cni.tgz" "https://github.com/containernetworking/plugins/releases/download/$CNI_V/cni-plugins-linux-$ARCH-$CNI_V.tgz" || fail "downloading the CNI plugins $CNI_V"
+    sha_is "$OUT/cni.tgz" "$CNI_SHA" || fail "the CNI plugins ($CNI_V) do not match their SHA-256"
+    run tar -C /opt/cni/bin -xzf "$OUT/cni.tgz" || fail "unpacking the CNI plugins"
+    measure "cni" "the CNI plugins $CNI_V"
 fi
 
 # --- the cluster
@@ -304,7 +323,9 @@ if [ "$SELINUX" = Enforcing ]; then
 EOF
     measure "pod_network" "a bridge on the node (10-varek-bridge.conflist)"
 else
-    run "$KUBECTL" apply -f "$FLANNEL" || fail "flannel"
+    get -o "$OUT/kube-flannel.yml" "$FLANNEL" || fail "downloading flannel $FLANNEL_V"
+    sha_is "$OUT/kube-flannel.yml" "$FLANNEL_SHA" || fail "flannel's manifest ($FLANNEL_V) does not match its SHA-256"
+    run "$KUBECTL" apply -f "$OUT/kube-flannel.yml" || fail "flannel"
 fi
 if run "$KUBECTL" wait --for=condition=Ready node --all --timeout=300s; then
     measure "node_ready" "yes, $(( $(date +%s) - START )) s from the start"

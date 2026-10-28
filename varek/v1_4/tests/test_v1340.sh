@@ -477,6 +477,10 @@ if "cg2" in opts:     # v1.36 step 5: the cgroup filesystem as a cgroup v2 node 
         if m["destination"] == "/sys/fs/cgroup": m.update(type="cgroup2", source="cgroup2")
 if "twice" in opts:
     c["mounts"].append({"destination": "/work2", "type": "bind", "source": B + "/work", "options": ["rbind", "ro", "nosuid", "nodev"]})
+for o in opts:     # v1.36 step 11 (review): the pod's varek-obo volume mounted in the container (mount-obo=UID)
+    if o.startswith("mount-obo="):
+        c["mounts"].append({"destination": "/t", "type": "bind", "options": ["rbind", "ro", "nosuid", "nodev"],
+                            "source": B + "/kubelet/pods/" + o[10:] + "/volumes/kubernetes.io~secret/varek-obo"})
 json.dump(c, open(cfg, "w"))
 PY
     }
@@ -941,6 +945,9 @@ else
     chown 65534 "$K/pods/$U5/volumes/kubernetes.io~secret/varek-obo/..data/token"
     ob ob5 obo "uid=$U5" obo=alice-token
     check "refused: a token that is not root's" orefused ob5 'is not a file of root.s'
+    ob ob9 obo "uid=$U1" obo=alice-token "mount-obo=$U1"
+    check "refused: a container mounting its pod's varek-obo volume (the user's token: the node agent's to read)" \
+        orefused ob9 'mounts its pod.s varek-obo volume'
     U6=0a1b2c3d-0000-4000-8000-000000000006; kvol "$U6" expired
     ob ob6 obo "uid=$U6" obo=alice-token
     check "refused: an expired token (warden-secrets, as on a host)" orefused ob6 "the user's token: .*expired"
@@ -997,6 +1004,18 @@ PY
         "grep -qx 'connect: EACCES' '$B/dry1.out'"
     check "... its record: the policy's refusal (enforced), dry_run_refused" rec l dry1 \
         'any(r.get("action") == "net.connect" and r.get("decision_final") == "DENY" and r.get("dry_run_refused") is True and "enforced" not in r and r.get("target") == "127.0.0.1:9" for r in R)'
+    # v1.36 step 11 (review): a listen, which the cluster's network would reach, refused all the same
+    lbundle dryl "$B/s/l.sock" "$B/f/dry.json" dry "/varek/init -- /probe listen" dry work-exec; run dryl
+    check "... a listen: refused all the same (the cluster could connect to it), a dry run's refusal" sh -c \
+        "grep -qx 'listen: EACCES' '$B/dryl.out'"
+    check "... its record: dry_run_refused, the call by its number" rec l dryl \
+        'any(r.get("action") == "other" and r.get("decision_final") == "DENY" and r.get("dry_run_refused") is True and r.get("rule") == "syscall_not_admitted" for r in R)'
+    if [ -n "$CERT" ]; then
+        DL="$(stream l dryl)"
+        python3 "$HERE/tools/varek_audit.py" --policy "${DL%.jsonl}.policy" --checker "$CERT" "$DL" > "$B/dryl.audit" 2>&1; arcl=$?
+        check "... and the audit takes it as a dry run's refusal (exit 3)" sh -c \
+            "[ $arcl = 3 ] && grep -q 'VERIFIED: DRY RUN, NOT ENFORCED' '$B/dryl.audit'"
+    fi
     if [ -n "$CERT" ]; then
         python3 "$HERE/tools/varek_audit.py" --policy "${DS%.jsonl}.policy" --checker "$CERT" "$DS" > "$B/dry1.audit" 2>&1; arc=$?
         check "... and the audit verifies the stream: a dry run, not enforced (exit 3)" sh -c \
@@ -1012,7 +1031,7 @@ PY
         check "... and refuses a dry run's refusal that is not a refused connect" sh -c \
             "python3 '$HERE/tests/log_rechain.py' '$B/dry-forged.jsonl' > '$B/dry-forged2.jsonl' &&
              python3 '$HERE/tools/varek_audit.py' --policy '${DS%.jsonl}.policy' --checker '$CERT' '$B/dry-forged2.jsonl' > '$B/dry-forged.out' 2>&1;
-             [ \$? != 0 ] && grep -q 'not a refused connect or proxied name' '$B/dry-forged.out'"
+             [ \$? != 0 ] && grep -q 'not a refused connect, proxied name, listen or accept' '$B/dry-forged.out'"
     fi
     mkdir -p "$B/work/ra" "$B/work/rb"; chmod 777 "$B/work/ra" "$B/work/rb"; echo f > "$B/work/ra/f"; chmod 666 "$B/work/ra/f"
     lbundle dry3 "$B/s/l.sock" "$B/f/dry.json" dry "/varek/init -- /probe rename /work/ra/f /work/rb/g" dry work-exec; run dry3
@@ -1250,17 +1269,23 @@ PY
         "python3 '$HERE/tools/varek_audit.py' --list-runs --anchor '$B/nanchor-rx' | grep -q '^  node node-1  key $NKPUB  announced '"
     # the node agent again, with its key there: the same key, announced again
     for a in $AGENTS; do kill "$a" 2>/dev/null; done; sleep 0.5; rm -f "$B/s/nk.sock"
+    # v1.36 step 11 (review): the copies a supervisor killed left behind
+    printf 'token\n' > "$B/s/c-left.obo"; printf 'svid\n' > "$B/s/c-left.svid"; printf 'x\n' > "$B/s/keep.txt"
     check "the node agent started again: it signs with the key it made (the same public key), announced again" sh -c \
         "'$WARDEN' '$B/p.txt' --node-agent '$B/s/nk.sock' --node-streams '$B/streams-nk' --node-key '$B/nkey/node.key' \
              --node-name node-1 --anchor '$B/nanchor' > '$B/nk2.log' 2>&1 & p=\$!; sleep 1; kill \$p;
          grep -q 'signing with the node.s key' '$B/nk2.log' && [ \"\$(cat '$B/nkey/node.key.pub')\" = '$NKPUB' ] &&
          [ \"\$(grep -c '\"event\":\"node_key\"' '$B/nanchor')\" = 2 ]"
+    check "... and removed the copies of a pod's token and SVID a supervisor killed left behind (and nothing else)" sh -c \
+        "[ ! -e '$B/s/c-left.obo' ] && [ ! -e '$B/s/c-left.svid' ] && [ -e '$B/s/keep.txt' ]"
     mkdir -p "$B/nkpub"; chmod 755 "$B/nkpub"
     check "--node-key-pub: the public key written apart (where the plugin reads it), not beside the key" sh -c \
         "'$WARDEN' '$B/p.txt' --node-agent '$B/s/nk.sock' --node-streams '$B/streams-nk' --node-key '$B/nkey/node.key' \
              --node-key-pub '$B/nkpub/node.key.pub' --node-name node-1 > '$B/nk5.log' 2>&1 & p=\$!; sleep 1; kill \$p;
          [ \"\$(cat '$B/nkpub/node.key.pub')\" = '$NKPUB' ] && [ \"\$(stat -c '%u %a' '$B/nkpub/node.key.pub')\" = '0 444' ] &&
-         '$WARDEN' /dev/null --node-agent '$B/s/x.sock' --node-streams /tmp --node-name n1 --node-key-pub '$B/nkpub/x'; [ \$? = 2 ]"
+         '$WARDEN' /dev/null --node-agent '$B/s/x.sock' --node-streams /tmp --node-name n1 --node-key-pub '$B/nkpub/x'; [ \$? = 2 ] &&
+         '$WARDEN' /dev/null --node-agent '$B/s/x.sock' --node-streams /tmp --node-name n1 --node-key '$B/nkey/node.key' \
+             --node-key-pub '$B/nkey/node.key' 2>&1 | grep -q 'names the key.s own file'"
     chmod 0644 "$B/nkey/node.key"
     check "a key others may read: refused at the start" sh -c \
         "'$WARDEN' '$B/p.txt' --node-agent '$B/s/nk3.sock' --node-streams '$B/streams-nk' --node-key '$B/nkey/node.key' \

@@ -11,13 +11,16 @@ name: Matrix in VMs
 #   the hosts: every host suite on Rocky Linux 9 and on Amazon Linux 2023
 #     (the OS of EKS's nodes). Ubuntu 24.04 is the runner's own, in
 #     warden-build.yml.
-# For each release (its tag), and for each pull request that touches the
-# Warden, the node agent, the chart, the node image or these cells. Each
+# For each release (container-release.yml calls it on the tag's commit, and
+# publishes nothing unless every cell passes), and for each pull request that
+# touches the Warden, the node agent, the chart, the node image or these
+# cells. Each
 # image is its project's newest, checked by its SHA-256 and cached by it.
 
 on:
-  push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  # v1.36 step 11: a release's run is the release workflow's (workflow_call),
+  # not a second one on the tag's push
+  workflow_call:
   pull_request:
     branches: [main]
     paths:
@@ -47,14 +50,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
       - name: Build the node image, and save it
         timeout-minutes: 20
         run: |
           docker build -f packaging/container/Containerfile --target node -t varek-node:ci .
           docker save -o "$RUNNER_TEMP/varek-node.tar" varek-node:ci
           ls -l "$RUNNER_TEMP/varek-node.tar"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: node-image-vm
           path: ${{ runner.temp }}/varek-node.tar
@@ -75,30 +80,45 @@ jobs:
     # the cell's files and the image cache in the runner's own space, not in
     # the checkout the cell copies into the VM
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         if: matrix.cell == 'chart'
         with:
           name: node-image-vm
           path: ${{ runner.temp }}
       - name: The image (its project's newest, and its SHA-256)
         id: img
-        run: bash varek/v1_4/tests/vm_cell.sh resolve --os "${{ matrix.os }}" | tee -a "$GITHUB_OUTPUT"
+        # v1.36 step 11 (review): pipefail, so a failed resolve fails the
+        # step, not tee; the matrix's values and the steps' outputs reach the
+        # scripts through env, not pasted into them
+        env:
+          VM_OS: ${{ matrix.os }}
+        run: |
+          set -o pipefail
+          bash varek/v1_4/tests/vm_cell.sh resolve --os "$VM_OS" | tee -a "$GITHUB_OUTPUT"
       # restored here, saved after the cell even if it fails (a download
       # is kept for the next run whatever the cell found)
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         id: cache
         with:
           path: ${{ runner.temp }}/vm-cache/${{ steps.img.outputs.file }}
           key: vm-${{ steps.img.outputs.file }}-${{ steps.img.outputs.sha }}
       - name: The cell
+        env:
+          VM_OS: ${{ matrix.os }}
+          VM_CELL: ${{ matrix.cell }}
+          IMG_FILE: ${{ steps.img.outputs.file }}
+          IMG_SHA: ${{ steps.img.outputs.sha }}
+          IMG_BASE: ${{ steps.img.outputs.base }}
         run: |
           OUT="$RUNNER_TEMP/vm-cell" CACHE="$RUNNER_TEMP/vm-cache"
           mkdir -p "$OUT" "$CACHE"
-          sudo -E env "PATH=$PATH" bash varek/v1_4/tests/vm_cell.sh run --os "${{ matrix.os }}" --cell "${{ matrix.cell }}" \
+          sudo -E env "PATH=$PATH" bash varek/v1_4/tests/vm_cell.sh run --os "$VM_OS" --cell "$VM_CELL" \
             --cache "$CACHE" --out "$OUT" --archive "$RUNNER_TEMP/varek-node.tar" \
-            --file "${{ steps.img.outputs.file }}" --sha "${{ steps.img.outputs.sha }}" --base "${{ steps.img.outputs.base }}"
-      - uses: actions/cache/save@v4
+            --file "$IMG_FILE" --sha "$IMG_SHA" --base "$IMG_BASE"
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         if: always() && steps.cache.outputs.cache-hit != 'true'
         with:
           path: ${{ runner.temp }}/vm-cache/${{ steps.img.outputs.file }}
@@ -109,7 +129,7 @@ jobs:
           OUT="$RUNNER_TEMP/vm-cell" CACHE="$RUNNER_TEMP/vm-cache"
           sudo rm -f "$OUT"/vm/key "$OUT"/vm/key.pub "$OUT"/vm/*.qcow2 "$OUT"/vm/seed.iso
           sudo chmod -R a+rX "$OUT" "$CACHE" 2>/dev/null || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: always()
         with:
           name: vm-${{ matrix.os }}-${{ matrix.cell }}

@@ -192,7 +192,14 @@ def main():
     nk = f"{d}/node-keys.json"
     key = ["--node-keys", nk] if os.path.exists(nk) else ["--pubkey", f"{d}/node.key.pub"]
     if os.path.exists(nk):
-        listed = collections.Counter(i["spec"]["node"] for i in json.load(open(nk)).get("items", []))
+        # v1.36 step 11 (review): an empty or malformed list (soak.sh leaves an
+        # empty file when kubectl fails) is a failed check, not a traceback
+        try:
+            with open(nk) as f:
+                listed = collections.Counter(i["spec"]["node"] for i in json.load(f).get("items") or [])
+        except (OSError, ValueError, AttributeError, KeyError, TypeError) as e:
+            listed = collections.Counter()
+            c(False, "the cluster's VarekNodeKey list read (node-keys.json)", f"{type(e).__name__}: {e}")
         unkeyed = [n for n in meta["nodes"] if not listed.get(n)]
         c(not unkeyed, "each node's key published (a VarekNodeKey for each node)",
           f"{len(meta['nodes']) - len(unkeyed)} of {len(meta['nodes'])}" + (f"; none for {unkeyed}" if unkeyed else ""))

@@ -11,10 +11,12 @@ with tools/varek_audit.py in a process of its own. Every SAMPLE_S it reads
 that process's resident memory (VmRSS) and how far it has read the stream
 (the stream's offset, /proc/PID/fdinfo). It passes when, while the stream
 is read, the memory at the last tenth is within SLACK_KB of the memory at
-the first tenth, and the audit's verdict is the reference audit's (with
---reference, the tools directory of the audit to compare with: the same
-exit status, and the same report but for the time it took). The
-certificate checker runs in its own processes and is not counted."""
+the first tenth, the audit passes (exit 0), the stream holds the records
+asked for (at least nine tenths of --records; a stream given, at least one),
+and the audit's verdict is the reference audit's (with --reference, the
+tools directory of the audit to compare with: the same exit status, and the
+same report but for the time it took). The certificate checker runs in its
+own processes and is not counted."""
 import argparse
 import json
 import os
@@ -26,6 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 V14 = os.path.dirname(os.path.dirname(HERE))
 SAMPLE_S = 0.2
 SLACK_KB = 16 * 1024
+MIN_SHARE = 0.9   # of --records, in a stream made here (about 1.2 records a turn)
 
 
 def status(pid, field):
@@ -84,6 +87,15 @@ def main():
     ap.add_argument("--plan")
     ap.add_argument("--reference", help="the tools directory of the audit to compare the verdict with")
     a = ap.parse_args()
+    # v1.36 step 11 (review): a missing reference, a stream without its
+    # policy and plan, few records or a failing audit fail the measurement
+    if a.stream and not (a.policy and a.plan):
+        ap.error("--stream needs --policy and --plan")
+    if a.reference:
+        ref = os.path.join(a.reference, "varek_audit.py")
+        if not (os.path.isfile(ref) and os.access(ref, os.R_OK)):
+            print(f"MEASURE FAIL: no readable varek_audit.py in --reference {a.reference}")
+            return 1
     os.makedirs(a.out, exist_ok=True)
     if a.stream:
         stream, policy, plan = a.stream, a.policy, a.plan
@@ -96,10 +108,17 @@ def main():
     with open(stream, "rb") as f:
         nrec = sum(1 for line in f if line.startswith(b"{"))
     print(f"MEASURE stream: {nrec} records, {size} bytes")
+    want = 1 if a.stream else max(1, int(a.records * MIN_SHARE))
+    if nrec < want:
+        print(f"MEASURE FAIL: {nrec} records in the stream, at least {want} wanted")
+        return 1
     samples = []
     rc, out, peak, secs = audit(os.path.join(V14, "tools"), stream, policy, plan, samples)
     print(f"MEASURE audit: exit {rc}, {secs:.0f} s, peak {peak} kB")
     print("\n".join("  " + l for l in out.strip().splitlines()[:3] + out.strip().splitlines()[-1:]))
+    ok_rc = rc == 0
+    if not ok_rc:
+        print(f"MEASURE audit: NO: exit {rc}, not 0")
     # the memory while the stream is read, by how far: the first and the last tenth
     read = [(pos, rss) for _, pos, rss in samples if pos < size]
     first = [rss for pos, rss in read if pos <= size * 0.1]
@@ -127,6 +146,7 @@ def main():
     with open(os.path.join(a.out, "d9.json"), "w") as f:
         json.dump({"records": nrec, "bytes": size, "exit": rc, "seconds": secs, "peak_kb": peak,
                    "samples": samples, "same_as_reference": same}, f)
+    ok = ok and ok_rc
     print(f"MEASURE {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 

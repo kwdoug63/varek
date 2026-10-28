@@ -35,6 +35,17 @@ name: Container release
 # both, :<version>. The image for both and each architecture's are signed
 # (cosign --recursive); each architecture's bill of materials is attested
 # on its own image. The chart pins the image for both.
+#
+# v1.36 step 11: nothing is built for publishing until the matrix passes on
+# the tag's commit: every cell of matrix.yml (CRI-O and containerd, amd64
+# and arm64) and of matrix-vm.yml (SELinux enforcing, the RHEL 9 and Amazon
+# Linux 2023 hosts), each run here as a called workflow. A red cell, and the
+# tag publishes no image, chart or signature; re-run the failed jobs once
+# fixed, or tag the fix.
+#
+# v1.36 step 11 (review): node-arm64 signs its image as soon as it pushes
+# it, as publish signs amd64's, so :<version>-arm64 is not left unsigned
+# while publish runs (or when it fails); publish's --recursive signs it again.
 
 on:
   push:
@@ -43,15 +54,29 @@ on:
 permissions: {}
 
 jobs:
+  # v1.36 step 11: the ship gate's matrix, on the tag's commit
+  matrix:
+    name: Matrix
+    permissions:
+      contents: read
+    uses: ./.github/workflows/matrix.yml
+  matrix-vm:
+    name: Matrix in VMs
+    permissions:
+      contents: read
+    uses: ./.github/workflows/matrix-vm.yml
+
   # v1.36: the node image for arm64, built and checked on the arm64 runner,
-  # pushed as :<version>-arm64; publish joins it to amd64's
+  # pushed as :<version>-arm64 and signed; publish joins it to amd64's
   node-arm64:
-    name: Build, check and push the node image for arm64
+    name: Build, check, push and sign the node image for arm64
+    needs: [matrix, matrix-vm]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     permissions:
       contents: read
       packages: write      # push to ghcr.io
+      id-token: write      # cosign keyless: the workflow's OIDC identity
     env:
       NODE: ghcr.io/${{ github.repository_owner }}/varek-node
     outputs:
@@ -87,22 +112,27 @@ jobs:
           cat node-version.txt
           grep -qE "^VAREK Warden  ${RELEASE//./\\.}  " node-version.txt
           [ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$NODE:$VERSION-arm64")" = linux/arm64 ]
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5  # v3.10.1
+        with:
+          cosign-release: v2.6.1
       - name: Log in to the GitHub Container Registry (the workflow's own token)
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
         run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-      - name: Push it (publish signs it, with amd64's)
+      - name: Push it and sign it (cosign, keyless; publish signs it again, with amd64's)
         id: push
         run: |
           docker push "$NODE:$VERSION-arm64"
           digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$NODE:$VERSION-arm64")"
-          echo "pushed $digest as $VERSION-arm64"
+          [[ "$digest" == "$NODE@sha256:"* ]] || { echo "no digest for $NODE:$VERSION-arm64: $digest"; exit 1; }
+          cosign sign --yes "$digest"
+          echo "pushed and signed $digest as $VERSION-arm64"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
   publish:
     name: Build, check, publish and sign the image
-    needs: node-arm64
+    needs: [matrix, matrix-vm, node-arm64]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:

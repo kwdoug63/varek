@@ -189,16 +189,24 @@ class Problems:
 
 class IdSet:
     """A set of integers kept as intervals: small while the ids come close to
-    in order (connection ids 1, 2, 3, ..., some still open)."""
+    in order (connection ids 1, 2, 3, ..., some still open). v1.36 step 11
+    (review): ids scattered over more than IDSET_INTERVALS intervals are kept
+    as a set instead (as large, but each added in constant time)."""
 
     def __init__(self):
         self.lo, self.hi = [], []
+        self.big = None
 
     def __contains__(self, x):
+        if self.big is not None:
+            return x in self.big
         i = bisect.bisect_right(self.lo, x) - 1
         return i >= 0 and x <= self.hi[i]
 
     def add(self, x):
+        if self.big is not None:
+            self.big.add(x)
+            return
         if x in self:
             return
         i = bisect.bisect_right(self.lo, x)
@@ -211,19 +219,32 @@ class IdSet:
             self.hi[i - 1] = x
         elif right:
             self.lo[i] = x
+        elif len(self.lo) >= IDSET_INTERVALS:
+            self.big = {v for l, h in zip(self.lo, self.hi) for v in range(l, h + 1)}
+            self.big.add(x)
+            self.lo, self.hi = [], []
         else:
             self.lo.insert(i, x)
             self.hi.insert(i, x)
 
     def __len__(self):
+        if self.big is not None:
+            return len(self.big)
         return sum(h - l + 1 for l, h in zip(self.lo, self.hi))
 
     def __bool__(self):
-        return bool(self.lo)
+        return bool(self.big) if self.big is not None else bool(self.lo)
 
     def is_range(self, a, b):
         """exactly a..b"""
+        if self.big is not None:
+            return len(self.big) == b - a + 1 and min(self.big) == a and max(self.big) == b
         return self.lo == [a] and self.hi == [b]
+
+
+IDSET_INTERVALS = 4096
+DNS_BATCH = 4096                         # the stub's records held before their names are asked
+DNS_NAMES_KEPT = 65536                   # the names whose rules are kept
 
 
 class Spool:
@@ -747,10 +768,22 @@ class DryCheck:
                 problems.append(f"seq {seq}: \"dry_run_refused\" is {r.get('dry_run_refused')!r}; the Warden writes only true")
             elif not self.dry or not isinstance(self.rs.get("node"), dict):
                 problems.append(f"seq {seq}: a dry run's refusal in a pod, in a run that is not a dry run under the node agent")
-            elif r.get("action") not in ("net.connect", "net.proxy") or r.get("decision_final") != "DENY" or \
-                    "enforced" in r:
-                problems.append(f"seq {seq}: a dry run's refusal in a pod that is not a refused connect or proxied name")
+            elif (r.get("action") not in ("net.connect", "net.proxy") and not self.listen(r)) or \
+                    r.get("decision_final") != "DENY" or "enforced" in r:
+                problems.append(f"seq {seq}: a dry run's refusal in a pod that is not a refused connect, proxied name, "
+                                f"listen or accept")
         self.prev = r
+
+    # v1.36 step 11 (review): and a listen or an accept, which would be
+    # reached from the cluster's network: the system calls' numbers on the
+    # Warden's two architectures
+    LISTEN = {"x86_64": {50, 43, 288}, "aarch64": {201, 202, 242}}
+
+    def listen(self, r):
+        nrs = self.LISTEN.get((self.rs or {}).get("arch"), set())
+        t = r.get("target")
+        return r.get("action") == "other" and isinstance(t, str) and t.startswith("syscall:") and \
+            t[8:].isdigit() and int(t[8:]) in nrs
 
     def pair(self, r, other):
         """a rename let through: both its names decided and recorded, the old
@@ -1339,6 +1372,8 @@ class LaunchesCheck:
             self.nboot += 1
         act, rule, seq = r.get("action"), r.get("rule"), r.get("seq")
         pid = r.get("agent_pid")
+        if type(pid) is not int:             # v1.36 step 11 (review): a malformed pid is no key
+            pid = None
         if r.get("decision_final") == "ALLOW" and pid in self.after:
             for k in self.after.pop(pid):
                 k[1] = seq                   # the first allowed call after the kill
@@ -1937,7 +1972,8 @@ class ChainCheck:
     def ev(self, e, line):
         event = e.get("event")
         if event == "proxy_close":
-            self.conn_obo.pop(e.get("proxy_conn"), None)
+            if type(e.get("proxy_conn")) is int:
+                self.conn_obo.pop(e["proxy_conn"], None)
         if not self.on:
             return
         if event == "subagent_settled":
@@ -2146,7 +2182,8 @@ class CredentialsCheck:
             if e.get("why") == "revoked" and not self.after(line):
                 self.sec["cred_closes"].append(f"connection {e.get('proxy_conn')!r} closed as revoked, but no "
                                                f"revocation is recorded before it")
-            self.allowed_with.pop(e.get("proxy_conn"), None)
+            if type(e.get("proxy_conn")) is int:
+                self.allowed_with.pop(e["proxy_conn"], None)
             return
         if event == "dns_question":
             # and after it the stub looks nothing up
@@ -2877,7 +2914,8 @@ class ProxiedCheck:
                 t = self.charged.get(e["name"])
                 self.charged[e["name"]] = e["timestamp_ns"] if t is None else min(t, e["timestamp_ns"])
         elif event == "proxy_close":
-            self.port.pop(e.get("proxy_conn"), None)
+            if type(e.get("proxy_conn")) is int:      # v1.36 step 11 (review): else ProxiedCheck says so
+                self.port.pop(e["proxy_conn"], None)
 
     def rec(self, rec, pos):
         if rec.get("proxy_handoff") is True and type(rec.get("proxy_conn")) is int:
@@ -3078,8 +3116,11 @@ class DnsCheck:
     NOERROR answer carried only addresses the name's latest resolution listed.
     finish() returns (questions, budget refusals). v1.36 (D9): as the
     records come; the rule each name is answered by is asked of the checker
-    when the name first comes (the names are the policy's, and its
-    wildcards' budgets bound them)."""
+    when the name first comes. v1.36 step 11 (review): the agent chooses the
+    names, so they are asked DNS_BATCH at a time (the stub's records held
+    until their batch is answered, then checked in order), and at most
+    DNS_NAMES_KEPT names' rules are kept (past that they are dropped, and a
+    name that comes again is asked again)."""
 
     def __init__(self, rs, checker, policy, rules, sec):
         self.rs, self.checker, self.policy, self.rules, self.sec = rs, checker, policy, rules, sec
@@ -3087,6 +3128,7 @@ class DnsCheck:
         self.syn_seen = False
         self.by_rule, self.synth = {}, set()     # name -> rule (asked once a name), names only on proxied ports
         self.asked = set()
+        self.q, self.want = [], set()        # the stub's records held, and their names not yet asked
         self.syn_given, self.syn_taken = {}, set()
         self.charged, self.used, self.window, self.pending, self.latest = {}, {}, {}, {}, {}
         self.dry_sent = set()
@@ -3137,17 +3179,6 @@ class DnsCheck:
         self.failed = "loop" if keep else "early"
         self.nq = self.nb = 0
 
-    def name(self, name):
-        """the rule the stub answers a name by, and whether the policy allows it
-        only on proxied ports, asked of the checker when it first comes"""
-        if not (isinstance(name, str) and name) or name in self.asked:
-            return
-        self.asked.add(name)
-        r = stub_rules(self.checker, self.policy, self.rules, {name})
-        self.by_rule.update(r)
-        if self.pports is not None and proxied_only(self.checker, self.policy, self.rules, {name}, self.pports):
-            self.synth.add(name)
-
     def ev(self, e):
         if self.failed == "early" or e.get("event") not in ("resolution", "dns_question", "synthetic_address"):
             return
@@ -3155,16 +3186,41 @@ class DnsCheck:
             self.syn_seen = True
         if self.failed:
             return
-        if e.get("event") in ("dns_question", "synthetic_address"):
+        self.q.append(e)
+        name = e.get("name")
+        if e.get("event") in ("dns_question", "synthetic_address") and isinstance(name, str) and name and \
+                name not in self.asked:
+            self.want.add(name)
+        if len(self.q) >= DNS_BATCH:
+            self.flush()
+
+    def flush(self):
+        """the names held asked of the checker at once (the rule the stub
+        answers each by, and whether the policy allows it only on proxied
+        ports), then the records held checked in order"""
+        q, self.q = self.q, []
+        if self.failed:
+            return
+        if self.want:
+            if len(self.asked) + len(self.want) > DNS_NAMES_KEPT:
+                self.asked, self.by_rule, self.synth = set(), {}, set()
+                self.want = {e["name"] for e in q if e.get("event") in ("dns_question", "synthetic_address")
+                             and isinstance(e.get("name"), str) and e["name"]}
+            names, self.want = self.want, set()
             try:
-                self.name(e.get("name"))
+                self.by_rule.update(stub_rules(self.checker, self.policy, self.rules, names))
+                if self.pports is not None:
+                    self.synth |= proxied_only(self.checker, self.policy, self.rules, names, self.pports)
             except Exception as x:
                 self.fail(x, keep=False)
                 return
-        try:
-            self.one(e)
-        except Exception as x:
-            self.fail(x)
+            self.asked |= names
+        for e in q:
+            try:
+                self.one(e)
+            except Exception as x:
+                self.fail(x)
+                return
 
     def one(self, e):
         problems, rules, wild, per = self.sec["dns_loop"], self.rules, self.wild, self.per
@@ -3327,6 +3383,7 @@ class DnsCheck:
                 problems.append(f"{name}: answered {extra}, which its latest resolution does not list")
 
     def finish(self, meta):
+        self.flush()
         if self.failed == "early":
             return 0, 0
         if self.pports is None and self.syn_seen:
@@ -3739,6 +3796,8 @@ class Integrity:
         self.sealed_max = None               # anchored without a key: the last record the anchor holds
         self.start_rx = None                 # when the anchor host received run_start (D10)
         self.key_note = None                 # --node-keys: whose key signed the stream
+        self.last_ts = None                  # the last signed record's time, the node's (D10)
+        self.last_rx = None                  # the latest the anchor host received a record of the run (D10)
 
     def start(self, rs, run):
         """run_start: the key, the pinned key, checkpoint_every, and the anchor's
@@ -3846,6 +3905,8 @@ class Integrity:
                                                   f"since the previous signature, more than checkpoint_every "
                                                   f"({self.every}): checkpoints were removed")
                 self.prev = c["ndec"]
+                if isinstance(c.get("ts"), int):
+                    self.last_ts = c["ts"]
                 self.sealed(c["ndec"])
         if self.anchor is not None:
             self.match(c)
@@ -3871,6 +3932,8 @@ class Integrity:
             self.end_rx = hit["received_ns"]
         if hit.get("event") == "run_start" and isinstance(hit.get("received_ns"), int):
             self.start_rx = hit["received_ns"]
+        if isinstance(hit.get("received_ns"), int):
+            self.last_rx = hit["received_ns"] if self.last_rx is None else max(self.last_rx, hit["received_ns"])
         # How late each record reached the anchor host: its receive time (set
         # by the anchor host) against the time in the STREAM's signed record
         # (an anchor line's own timestamp is not trusted).
@@ -3888,10 +3951,15 @@ class Integrity:
         """v1.36 step 9 (D10): the stream's key, if the cluster's list holds it
         for the stream's node and it was not retired before the run began;
         else None, with the problem. A key is retired when the node's next
-        key is admitted, at that one's creationTimestamp (the cluster's time).
-        The run began when the anchor host received its run_start, if the
-        anchor holds that; else at the time its run_start says, the node's
-        own."""
+        key is admitted, at that one's creationTimestamp (the cluster's time;
+        a key admitted in the same second retires it then, which came first
+        not being known). The run began when the anchor host received its
+        run_start, if the anchor holds that; else at the time its run_start
+        says, the node's own. v1.36 step 11 (review): and no record of the
+        run was signed after the key was retired (the latest the anchor host
+        received one, else the last signed record's own time), more than
+        --clock-slack after: a run left unfinished is not finished later by
+        whoever holds the retired key."""
         a, rs = self.a, self.rs or {}
         keys, why = _node_keys(a.node_keys)
         if keys is None:
@@ -3910,7 +3978,7 @@ class Integrity:
                         f"{node}" + (f" (it is {', '.join(elsewhere)}'s)" if elsewhere else ""))
             return None
         admitted, _, name = mine[at]
-        nxt = next((e for e in mine[at + 1:] if e[0] > admitted), None)
+        nxt = min((e for i, e in enumerate(mine) if i != at and e[0] >= admitted), default=None)
         if self.start_rx is not None:
             began, clock = self.start_rx, "by the anchor host's clock"
         elif isinstance(rs.get("timestamp_ns"), int):
@@ -3918,23 +3986,34 @@ class Integrity:
         else:
             head.append("run_start has no timestamp_ns: when the run began is not known")
             return None
+        how = "admitted in the same second, which came first not known" if nxt is not None and \
+            nxt[0] == admitted else "admitted"
         if nxt is not None and began >= nxt[0]:
             head.append(f"the stream is signed by node {node}'s key {name}, retired at {_ns_text(nxt[0])} when the "
-                        f"node's next key ({nxt[2]}) was admitted; the run began at {_ns_text(began)} ({clock}), "
+                        f"node's next key ({nxt[2]}) was {how}; the run began at {_ns_text(began)} ({clock}), "
                         f"after")
             return None
+        if self.last_rx is not None:
+            last, lclock = self.last_rx, "the anchor host received it"
+        else:
+            last, lclock = self.last_ts, "its own time, the node's: the anchor holds no time it received it"
+        if nxt is not None and last is not None and last > nxt[0] + int(a.clock_slack * 1e9):
+            head.append(f"the stream is signed by node {node}'s key {name}, retired at {_ns_text(nxt[0])} when the "
+                        f"node's next key ({nxt[2]}) was {how}; a record of the run was signed after, at "
+                        f"{_ns_text(last)} ({lclock}), past --clock-slack")
+            return None
         self.key_note = (f"node {node}'s key {name}, admitted {_ns_text(admitted)}" +
-                         (f"; retired at {_ns_text(nxt[0])}, after the run began at {_ns_text(began)} ({clock})"
-                          if nxt is not None else ""))
+                         (f"; retired at {_ns_text(nxt[0])} (the next key {how}), after the run began at "
+                          f"{_ns_text(began)} ({clock}) and its last signed record" if nxt is not None else ""))
         return self.pk
 
     def finish(self, meta, complete):
         """the rest of log_integrity's checks, its notes printed; the level"""
         a, sec, rs = self.a, self.sec, self.rs or {}
         if meta.get("log") is None:
-            if a.pubkey or a.anchor:
+            if a.pubkey or a.anchor or a.node_keys:      # v1.36 step 11 (review): --node-keys too
                 sec["integ_head"].append("the stream is not hash-chained (a pre-1.16 Warden): "
-                                         "--pubkey / --anchor cannot be checked")
+                                         "--pubkey / --node-keys / --anchor cannot be checked")
             return "none (pre-1.16 stream: no hash chain)"
         level = "chain"
         if self.mode == "malformed":
@@ -4529,13 +4608,21 @@ def main(argv=None):
     checks = {}
     plan_events = []
 
+    def unread(line, e):
+        """v1.36 step 11 (review): a record a check could not read fails the
+        audit with a problem, not a traceback (and the other checks go on)"""
+        sec["run"].append(f"line {line}: a record the audit cannot read ({type(e).__name__}: {e})")
+
     def feed(item):
         kind, rec, line = item[0], item[1], item[2]
         if kind == "dec":
             pos = st["ndec"]
             st["ndec"] += 1
             for c in checks["recs"]:
-                c(rec, pos, line)
+                try:
+                    c(rec, pos, line)
+                except (TypeError, ValueError, KeyError, AttributeError, IndexError) as e:
+                    unread(line, e)
             return
         before = item[3]
         event = rec.get("event")
@@ -4547,7 +4634,10 @@ def main(argv=None):
             else:
                 sec["plan"].append("more plan records than a plan has steps")
         for c in checks["evs"]:
-            c(rec, before, line)
+            try:
+                c(rec, before, line)
+            except (TypeError, ValueError, KeyError, AttributeError, IndexError) as e:
+                unread(line, e)
 
     def sealed(ndec):
         """a record that seals what came before it: what waited is audited"""

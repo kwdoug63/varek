@@ -54,12 +54,14 @@ def test_a_list_that_is_not_one(tmp_path, item, why):
     assert keys is None and why in msg
 
 
-def integrity(path, node="node-1", key=K1, began=T0 + 120, rx=None):
+def integrity(path, node="node-1", key=K1, began=T0 + 120, rx=None, last=None, last_rx=None):
     """an Integrity at run_end, for the node_key check alone"""
-    a = types.SimpleNamespace(node_keys=path, pubkey=None, anchor=None)
+    a = types.SimpleNamespace(node_keys=path, pubkey=None, anchor=None, clock_slack=5.0)
     it = va.Integrity(a, {}, lambda n: None)
     it.rs = {"node": {"node_name": node} if node else {}, "timestamp_ns": began * 10**9}
     it.pk, it.start_rx = bytes.fromhex(key), (rx * 10**9 if rx else None)
+    it.last_ts = (last if last is not None else began) * 10**9
+    it.last_rx = (last_rx or rx) * 10**9 if (last_rx or rx) else None     # run_start's, if the anchor holds it
     return it
 
 
@@ -95,6 +97,41 @@ def test_a_key_retired_before_the_run_began(tmp_path):
     # ... and after: refused, by the anchor host's clock, whatever the node says
     pk, probs = check(integrity(p, began=T0 + 30, rx=T0 + 90))
     assert pk is None and "(by the anchor host's clock), after" in probs[0]
+
+
+def test_a_retired_key_signing_after_it_was_retired(tmp_path):
+    """v1.36 step 11 (review): a run begun before the next key was admitted is
+    not finished after by whoever holds the retired key"""
+    p = listing(tmp_path, nk("node-1", K1, T0), nk("node-1", K2, T0 + 60))
+    pk, probs = check(integrity(p, began=T0 + 10, rx=T0 + 10, last_rx=T0 + 5000))
+    assert pk is None and "a record of the run was signed after" in probs[0] and "the anchor host received it" in probs[0]
+    pk, probs = check(integrity(p, began=T0 + 10, last=T0 + 5000))
+    assert pk is None and "its own time, the node's" in probs[0]
+    # within --clock-slack of the retirement: trusted
+    pk, probs = check(integrity(p, began=T0 + 10, rx=T0 + 10, last_rx=T0 + 64))
+    assert pk == bytes.fromhex(K1) and not probs
+
+
+def test_two_keys_admitted_in_the_same_second(tmp_path):
+    """v1.36 step 11 (review): creationTimestamp is to the second; two keys of
+    a node admitted in one second retire each other then"""
+    p = listing(tmp_path, nk("node-1", K1, T0), nk("node-1", K2, T0))
+    for key in (K1, K2):
+        pk, probs = check(integrity(p, key=key, began=T0 + 10**6))
+        assert pk is None and "admitted in the same second, which came first not known" in probs[0]
+    it = integrity(p, key=K2, began=T0 - 10, last=T0 - 5)
+    pk, probs = check(it)
+    assert pk == bytes.fromhex(K2) and not probs and "same second" in it.key_note
+
+
+def test_node_keys_on_a_stream_with_no_chain(tmp_path):
+    """v1.36 step 11 (review): --node-keys on a stream with no hash chain is
+    refused, as --pubkey is"""
+    a = types.SimpleNamespace(node_keys=str(tmp_path / "none.json"), pubkey=None, anchor=None)
+    sec = va.Problems(va.SECTIONS)
+    it = va.Integrity(a, sec, lambda n: None)
+    level = it.finish({}, True)
+    assert level.startswith("none") and "--node-keys" in sec["integ_head"].items[0]
 
 
 def test_the_newest_key_is_not_retired(tmp_path):
@@ -134,3 +171,15 @@ def test_the_forwarder_and_the_receiver_carry_node_key_lines(line, ok):
     assert (r.returncode == 0) is ok
     old = f'{{"run":"{"a" * 32}","event":"checkpoint","records":3,"chain":"{"b" * 64}","timestamp_ns":5}}'
     assert fwd.LINE.match(old.encode()) and not fwd.NODE_KEY_LINE.match(old.encode())
+
+
+def test_an_id_set_of_scattered_ids():
+    """v1.36 step 11 (review): ids far from in order are kept as a set"""
+    s = va.IdSet()
+    for x in range(2 * (va.IDSET_INTERVALS + 10), 0, -2):
+        s.add(x)
+    assert s.big is not None and len(s) == va.IDSET_INTERVALS + 10 and 2 in s and 3 not in s
+    t = va.IdSet()
+    for x in range(1, 6):
+        t.add(x)
+    assert t.big is None and t.is_range(1, 5)

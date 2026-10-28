@@ -38,6 +38,12 @@ else
 fi
 out="$(run "$IMAGE" /opt/varek/varek-init 2>&1)" && rc=0 || rc=$?
 if [ "$rc" = 2 ] && grep -q '^usage: varek-init -- COMMAND' <<<"$out"; then ok "varek-init runs (usage, exit 2)"; else no "varek-init: exit $rc: $out"; fi
+# v1.36 step 11 (review): the credential helper and the SVID fetcher run, not
+# only are there: each refuses a call with no arguments, exit 2, in its own words
+out="$(run "$IMAGE" /opt/varek/warden-secrets 2>&1)" && rc=0 || rc=$?
+if [ "$rc" = 2 ] && grep -q '^warden-secrets: the Warden starts this program' <<<"$out"; then ok "warden-secrets runs (refused by hand, exit 2)"; else no "warden-secrets: exit $rc: $out"; fi
+out="$(run "$IMAGE" /opt/varek/varek-svid 2>&1)" && rc=0 || rc=$?
+if [ "$rc" = 2 ] && grep -q '^usage: varek-svid -socket ADMIN_SOCKET -pid PID -out FILE' <<<"$out"; then ok "varek-svid runs (usage, exit 2)"; else no "varek-svid: exit $rc: $out"; fi
 # the plugin and the webhook: each flag the chart passes
 out="$(run "$IMAGE" /opt/varek/varek-nri -h 2>&1 || true)"
 for f in -warden -policies -listener -launcher -socket -sync; do

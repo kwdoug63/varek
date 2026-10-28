@@ -129,11 +129,13 @@ exporter:
   enabled: true
   # streams followed at once (each a process); the others wait their turn
   maxFollowers: 64
-  # each stream is audited whole when its run ends (tools/varek_audit.py),
-  # about 3.7 KB a record (measured, v1.34 step 9: 202,857 records, 748 MB,
-  # 110 s): a pod's day of an agent's work, some 440,000 records, about
-  # 1.6 GB. A run whose audit does not fit is reported not verified, never
-  # verified.
+  # each stream is audited when its run ends (tools/varek_audit.py), in one
+  # pass in bounded memory (v1.36 D9: 31,960 kB at most for 1,008,566
+  # records). What it holds back as it reads (records awaiting a signature,
+  # the certificates to re-check, the anchor's lines) it keeps in temporary
+  # files, on this scratch volume on the node's disk (/tmp in the exporter).
+  # A run whose audit does not fit is reported not verified, never verified.
+  scratchSize: 4Gi
   resources:
     requests: { cpu: 20m, memory: 64Mi }
     limits: { memory: 2Gi }

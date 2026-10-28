@@ -213,6 +213,11 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc > 3 && !strcmp(argv[1], "rename")) { printf("rename: %s\n", rename(argv[2], argv[3]) == 0 ? "ok" : en(errno)); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "listen")) {     /* v1.36 step 11 (review): a dry run's listen in a pod */
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        printf("listen: %s\n", s >= 0 && listen(s, 1) == 0 ? "ok" : en(errno));
+        return 0;
+    }
     if (argc > 2 && !strcmp(argv[1], "env")) { const char *v = getenv(argv[2]); printf("env: %s\n", v ? v : "none"); return 0; }
     /* v1.36 step 8: N reads of a file (a stream long enough to rotate) */
     if (argc > 3 && !strcmp(argv[1], "reads")) {

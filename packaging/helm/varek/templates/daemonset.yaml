@@ -10,6 +10,7 @@
 {{- /* v1.36 step 9 (D10): each node's own key, unless one Secret signs for every node */ -}}
 {{- $nk := and (not .Values.signing.secretName) .Values.signing.nodeKey.enabled -}}
 {{- $nkd := .Values.signing.nodeKey -}}
+{{- include "varek.validate" . -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -33,6 +34,9 @@ spec:
         app.kubernetes.io/component: node
     spec:
       serviceAccountName: {{ include "varek.nodeName" . }}
+      # v1.36 step 11 (review): the account's token in the plugin alone (the
+      # one container that reads the API server), not in every container
+      automountServiceAccountToken: false
       hostPID: true
       priorityClassName: {{ .Values.priorityClassName }}
       {{- with .Values.nodeSelector }}
@@ -205,8 +209,9 @@ spec:
             # v1.36 step 4 (D1): the credentials' Secrets, warden-secrets'
             # configuration, and the tokens the DaemonSet signs in with (each
             # a link into the volume's ..data, which warden-secrets follows)
-            {{- range $cred.secrets }}
-            - { name: {{ printf "cred-%s" . | trunc 63 | trimSuffix "-" }}, mountPath: {{ $cred.dir }}/{{ . }}, readOnly: true }
+            {{- range $i, $s := $cred.secrets }}
+            # v1.36 step 11 (review): named by its place (a Secret's name may hold dots, a volume's may not)
+            - { name: cred-{{ $i }}, mountPath: {{ $cred.dir }}/{{ $s }}, readOnly: true }
             {{- end }}
             {{- if $conf }}
             - { name: secrets-conf, mountPath: /etc/varek/secrets, readOnly: true }
@@ -225,7 +230,8 @@ spec:
             # HostToContainer), the SPIRE agent's admin socket, its bundle
             - { name: kubelet-pods, mountPath: {{ .Values.node.kubelet }}/pods, readOnly: true, mountPropagation: HostToContainer }
             {{- if .Values.spire.adminSocket }}
-            - { name: spire-admin, mountPath: {{ dir .Values.spire.adminSocket }} }
+            # read-only: a socket is connected to all the same (v1.36 step 11, review)
+            - { name: spire-admin, mountPath: {{ dir .Values.spire.adminSocket }}, readOnly: true }
             {{- end }}
             {{- if .Values.spire.bundleConfigMap }}
             - { name: spire-bundle, mountPath: /etc/varek/spire-bundle, readOnly: true }
@@ -286,6 +292,7 @@ spec:
             - { name: policies, mountPath: {{ .Values.node.policies }} }
             - { name: nri, mountPath: {{ dir .Values.nri.socket }} }
             - { name: tmp, mountPath: /tmp }
+            - { name: api-token, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true }
             {{- if $nk }}
             - { name: node-key-pub, mountPath: {{ $nkd.pubDir }}, readOnly: true }
             {{- end }}
@@ -337,7 +344,8 @@ spec:
           volumeMounts:
             - { name: streams, mountPath: {{ .Values.node.streams }}, readOnly: true }
             - { name: export, mountPath: {{ .Values.node.exportState }} }
-            - { name: tmp, mountPath: /tmp }
+            # v1.36 step 11 (review): the audit's temporary files, on disk (D9)
+            - { name: exporter-scratch, mountPath: /tmp }
             {{- if .Values.signing.secretName }}
             - { name: key, mountPath: /etc/varek/node.key.pub, subPath: key.pub, readOnly: true }
             {{- else if $nk }}
@@ -355,9 +363,22 @@ spec:
         - { name: state, hostPath: { path: {{ $state }}, type: Directory } }
         - { name: nri, hostPath: { path: {{ dir .Values.nri.socket }}, type: Directory } }
         - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 64Mi } }
+        {{- if .Values.exporter.enabled }}
+        - { name: exporter-scratch, emptyDir: { sizeLimit: {{ .Values.exporter.scratchSize }} } }
+        {{- end }}
+        # the plugin's API token, as the kubelet would automount it (bound to
+        # this pod, so the token names the pod and its node: D10)
+        - name: api-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken: { expirationSeconds: 3607, path: token }
+              - configMap: { name: kube-root-ca.crt, items: [{ key: ca.crt, path: ca.crt }] }
+              - downwardAPI: { items: [{ path: namespace, fieldRef: { apiVersion: v1, fieldPath: metadata.namespace } }] }
         - { name: kubelet-pods, hostPath: { path: {{ .Values.node.kubelet }}/pods, type: Directory } }
         {{- if .Values.spire.adminSocket }}
-        - { name: spire-admin, hostPath: { path: {{ dir .Values.spire.adminSocket }}, type: DirectoryOrCreate } }
+        # the SPIRE agent's own directory, not made here (v1.36 step 11, review)
+        - { name: spire-admin, hostPath: { path: {{ dir .Values.spire.adminSocket }}, type: Directory } }
         {{- end }}
         # projected, not configMap: a ConfigMap's volume is a directory on the
         # node's disk that the kubelet makes writable by all (0777), which
@@ -386,9 +407,9 @@ spec:
             secretName: {{ .Values.signing.secretName }}
             defaultMode: 0400
         {{- end }}
-        {{- range $cred.secrets }}
-        - name: {{ printf "cred-%s" . | trunc 63 | trimSuffix "-" }}
-          secret: { secretName: {{ . }}, defaultMode: 0400 }
+        {{- range $i, $s := $cred.secrets }}
+        - name: cred-{{ $i }}
+          secret: { secretName: {{ $s }}, defaultMode: 0400 }
         {{- end }}
         {{- if $conf }}
         - name: secrets-conf
@@ -403,7 +424,7 @@ spec:
           projected:
             defaultMode: 0400
             sources:
-              - serviceAccountToken: { audience: {{ $cred.vault.kubernetesAuth.audience | quote }}, expirationSeconds: 3600, path: token }
+              - serviceAccountToken: { audience: {{ required "credentials.vault.kubernetesAuth.audience: Vault's role binds its tokens to an audience; give it" $cred.vault.kubernetesAuth.audience | quote }}, expirationSeconds: 3600, path: token }
         {{- end }}
         {{- if or $cred.aws.roleArn $cred.aws.podIdentity }}
         - name: aws-token

@@ -25,7 +25,15 @@ the container does not start. The chart installs:
 
 ## Requirements
 
-- Kubernetes 1.30 or later, Linux nodes with Landlock (kernel 5.13 or later).
+- Kubernetes 1.30 or later (from 1.30 a pod's service account token names
+  its node, which a node's key is tied to), Linux nodes with Landlock
+  (kernel 5.13 or later). CI runs Kubernetes 1.35, 1.36 and 1.37 (the
+  repository README's platform table); earlier versions the chart takes are
+  not tested.
+- The kubelet's root at `node.kubelet` (`/var/lib/kubelet`): the DaemonSet
+  mounts its `pods/` directory, which must exist (a pod acting for a user's
+  token is read there), so a node whose kubelet keeps its root elsewhere
+  sets `node.kubelet`.
 - A runtime whose NRI lets a plugin set a container's seccomp policy and
   command: **containerd 2.2** or later (EKS, kind), or **CRI-O 1.35** or
   later (OpenShift). With an earlier one the plugin says so in its log and
@@ -163,9 +171,8 @@ too) takes the `VarekPlan` of that name as it is then, so whoever may update
 first record names the plan it was held to by its SHA-256
 (`run_start.hold.plan_sha256`).
 
-Helm installs a chart's CRDs only when it first installs the chart, so on an
-upgrade from 1.34 apply the new one by hand:
-`kubectl apply -f https://raw.githubusercontent.com/kwdoug63/varek/v1.35.0/packaging/helm/varek/crds/varekplan.yaml`.
+Helm installs a chart's CRDs only when it first installs the chart: on an
+upgrade apply every CRD of the release first (see [Upgrading](#upgrading)).
 
 ## Credentials (from 1.36)
 
@@ -218,9 +225,8 @@ The sources:
 The chart writes warden-secrets' configuration from these values (a Secret,
 `<release>-node-secrets-conf`). It holds no token or key.
 
-Helm installs a chart's CRDs only when it first installs the chart, so on an
-upgrade from 1.35 apply the new one by hand:
-`kubectl apply -f https://raw.githubusercontent.com/kwdoug63/varek/v1.36.0/packaging/helm/varek/crds/varekcredential.yaml`.
+Helm installs a chart's CRDs only when it first installs the chart: on an
+upgrade apply every CRD of the release first (see [Upgrading](#upgrading)).
 
 ## Sub-agents and confined MCP servers (from 1.36)
 
@@ -233,7 +239,7 @@ starts, are its own whatever it says. The pod gets no capability and nothing
 is delegated to it. A plan's `subagent` and `mcp_call` steps are decided as
 on a host (an `mcp_call` to a stdio server is UNKNOWN there too).
 
-Two refusals are the node's own: a sub-agent launched by the container's
+The node's own refusals: a sub-agent launched by the container's
 first process itself (`subagent_first_process`: that process stays in the
 container's group, so a process started in the container later, with
 `kubectl exec`, is not put in a sub-agent's), and a container running as
@@ -319,8 +325,11 @@ spec:
   says `"dry_run_refused": true`, and suggest reads it as the policy's
   refusal. No launch is held (no writable mount is made noexec, and the
   launcher's Landlock set is `/`, moving files between directories
-  granted). As on a host, a dry run takes no plan,
-  credentials or sub-agents.
+  granted; on a node whose Landlock is ABI 1, with no REFER right, a move
+  between directories is refused all the same). As on a host, a dry run
+  takes no plan (a policy that says `require plan` is refused with it), no
+  flow policy, credentials or sub-agents. A dry run's listen or accept is
+  refused all the same too: the cluster could connect to it.
 - **A trust bundle** is the roots inspecting mode trusts in place of the
   node image's. Put the bundles in a ConfigMap of the release's namespace
   and set `trustBundles.configMap`; it is mounted (projected) at
@@ -330,14 +339,18 @@ spec:
   with its refusal breaker. The breaker's table is kept on each node, in
   `flowPolicy.stateDir` (a host path), so its budgets bound each node, not
   the cluster: a pod scheduled on another node starts its counts again. Its
-  session is the pod's namespace and service account, which the plugin reads
-  from the API server (the chart gives it `get` on pods).
+  session is the pod's namespace and service account (`NAMESPACE/ACCOUNT`, at
+  most 128 characters, or the container is refused), which the plugin reads
+  from the API server (the chart gives it `get` on pods, in every
+  namespace: RBAC cannot narrow it to the node's own).
 
 ## A key for each node (from 1.36)
 
 Each node agent makes its own signing key at its first start
 (`signing.nodeKey`). The key stays on the node, root's and mode 0400, in a
-directory only the node agent mounts (`signing.nodeKey.dir`). Its public
+directory only the node agent mounts (`signing.nodeKey.dir`; the init
+container that makes the directory, root's and 0700, mounts it too, before
+any key is in it). Its public
 key is written apart (`signing.nodeKey.pubDir`), where the plugin and the
 exporter read it. The plugin publishes it as the node's `VarekNodeKey`, a
 cluster-scoped resource named for the node and the key:
@@ -350,9 +363,12 @@ node-1-3f9a0c2e71d4b856       node-1   3f9a0c2e71d4b856...     2d
 
 - **Only that node publishes it.** The webhook admits a `VarekNodeKey` only
   from the node agent's service account, and only for the node its token was
-  given on: the API server gives the node's name with the kubelet's bound
-  token. A key is never changed, and a node does not remove one; a cluster
-  administrator may. The webhook is never skipped for these
+  given on: the API server gives the node's name with a token bound to the
+  DaemonSet's pod (one bound to the node alone is refused). The account's
+  token is in the plugin's container alone (`automountServiceAccountToken:
+  false`; the plugin's is projected). A key is never changed, has no owner
+  (it outlives any), and a node does not remove one; a cluster administrator
+  may. The webhook is never skipped for these
   (`failurePolicy: Fail` whatever `admission.failurePolicy` says), since it is
   what ties each key to its node.
 - **Each stream names its node** (`run_start`'s `node.node_name`), and is
@@ -363,14 +379,17 @@ node-1-3f9a0c2e71d4b856       node-1   3f9a0c2e71d4b856...     2d
   ```sh
   kubectl get vareknodekeys -o json > node-keys.json
   varek_audit.py --policy STREAM.policy --checker vdp_cert_check \
-      --node-keys node-keys.json --anchor ANCHOR STREAM.jsonl
+      --node-keys node-keys.json --anchor ANCHOR STREAM.jsonl STREAM.jsonl.2 ...
   ```
 
-  The stream's key must be the one listed for its node.
+  The stream's key must be the one listed for its node, and every segment
+  of a rotated stream given, in order (`streams.rotateBytes`).
 - **A rebuilt node** (its key gone) makes a new key, published as a new
   `VarekNodeKey`; the one before is kept for the streams it signed. The old
   key is retired at the new one's `creationTimestamp`, a time the cluster
-  sets, and the audit trusts it only for runs that began before then. The
+  sets, and the audit trusts it only for runs that began before then and
+  signed nothing after (a run left unfinished is not finished later with
+  the old key). The
   time a run began is the anchor host's when the anchor holds its
   `run_start` with a receive time (`tools/varek_anchor_receiver.sh`);
   otherwise it is the node's own clock, and the report says so.
@@ -381,6 +400,26 @@ node-1-3f9a0c2e71d4b856       node-1   3f9a0c2e71d4b856...     2d
 
 `signing.secretName` instead signs every node's streams with one key, a
 Secret (v1.34's way); then no node makes a key of its own.
+
+## Upgrading
+
+Helm installs a chart's CRDs only when it first installs the chart, and
+never upgrades them. Before `helm upgrade`, apply every CRD of the release
+you upgrade to: a CRD left at an older release's schema prunes the fields
+it does not know (a `VarekPolicy`'s `dryRun`, `trustBundle` and
+`flowPolicy` would be dropped without a word), and a resource it does not
+have cannot be made (`VarekCredential`, `VarekNodeKey`):
+
+```sh
+V=v1.36.0
+for crd in varekpolicy varekplan varekcredential vareknodekey; do
+  kubectl apply -f https://raw.githubusercontent.com/kwdoug63/varek/$V/packaging/helm/varek/crds/$crd.yaml
+done
+```
+
+From 1.35: each node now signs with its own key by default
+(`signing.nodeKey`), and streams rotate at 256 MiB (`streams.rotateBytes`);
+the chart's `fail`s name a value it cannot render with.
 
 ## Values
 
@@ -397,6 +436,7 @@ Secret (v1.34's way); then no node makes a key of its own.
 | `signing.checkpointEvery` | `256` | a checkpoint every this many records |
 | `anchor.enabled`, `anchor.file` | `false`, `anchor` | each run's checkpoints appended to the node's anchor, in the streams' directory |
 | `exporter.enabled`, `exporter.maxFollowers` | `true`, `64` | the streams as OCSF in the exporter's log; at most this many followed at once |
+| `exporter.scratchSize` | `4Gi` | the exporter's scratch volume on the node's disk (`/tmp`), where each audit keeps what it holds back as it reads |
 | `nodeAgent.extraArgs` | `[]` | more of the Warden's options |
 | `admission.failurePolicy` | `Fail` | while the webhook is down, what it checks is refused, not let in |
 | `admission.excludeNamespaces` | `[kube-system]` | not checked (the chart's own namespace never is): an annotated pod there is not checked, and still does not run unless the plugin adjusts it |
@@ -412,7 +452,7 @@ Secret (v1.34's way); then no node makes a key of its own.
 | `spire.adminSocket`, `spire.self`, `spire.bundleConfigMap` | `""` | the SPIRE agent's admin socket on the node, the node agent's own SPIFFE ID, a ConfigMap holding the trust bundle |
 | `flowPolicy.stateDir` | `/var/lib/varek/flow` | where each node keeps a flow policy's breaker table (a host path, root's) |
 | `trustBundles.configMap` | `""` | a ConfigMap of trust bundles a `VarekPolicy` names by key (`spec.trustBundle`) |
-| `streams.rotateBytes` | `268435456` (256 MiB) | a stream past this size goes on in a new segment beside it (`.jsonl.2`, `.jsonl.3`, ...); `0` no rotation |
+| `streams.rotateBytes` | `268435456` (256 MiB) | a stream past this size goes on in a new segment beside it (`.jsonl.2`, `.jsonl.3`, ...); 65536 or more, or `0` for none (the chart then leaves the Warden's `--node-stream-rotate` out) |
 
 ## What it does not do yet
 

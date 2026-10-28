@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -398,6 +399,24 @@ func TestOnBehalfOf(t *testing.T) {
 		ctr("/bin/agent")); err == nil || !strings.Contains(err.Error(), "not a Secret's name") {
 		t.Errorf("a name that is not a Secret's: %v", err)
 	}
+	// v1.36 step 11 (review): the pod's init container as the API server has it
+	apiPod := func(image string, edit func(c map[string]interface{})) *kube.Pod {
+		c := map[string]interface{}{"name": oboInit, "image": image, "command": []string{"/bin/true"},
+			"volumeMounts": []interface{}{
+				map[string]interface{}{"name": oboInit, "mountPath": "/var/run/varek-obo", "readOnly": true},
+				map[string]interface{}{"name": "kube-api-access-x7k2p", "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount", "readOnly": true}}}
+		if edit != nil {
+			edit(c)
+		}
+		b, _ := json.Marshal(map[string]interface{}{"metadata": map[string]string{"uid": "u-1"},
+			"spec": map[string]interface{}{"initContainers": []interface{}{c}}})
+		o := &kube.Pod{}
+		if err := json.Unmarshal(b, o); err != nil {
+			t.Fatal(err)
+		}
+		return o
+	}
+	p.api = fakePods{"ns/p": apiPod(p.oboImage, nil)}
 	init := func(img *api.Image, args ...string) *api.Container {
 		c := ctr(args...)
 		c.Name, c.Image = oboInit, img
@@ -431,8 +450,38 @@ func TestOnBehalfOf(t *testing.T) {
 			t.Errorf("a container named %s, %s: carried as any other (refused here for its profile): %v", oboInit, c.what, err)
 		}
 	}
+	for _, c := range []struct {
+		what string
+		pod  *kube.Pod
+	}{
+		{"its image, as the API server has it, another", apiPod("evil:latest", nil)},
+		{"a mount of the pod's at /bin", apiPod(p.oboImage, func(c map[string]interface{}) {
+			c["volumeMounts"] = append(c["volumeMounts"].([]interface{}),
+				map[string]interface{}{"name": "tools", "mountPath": "/bin", "readOnly": true})
+		})},
+		{"the token's mount writable", apiPod(p.oboImage, func(c map[string]interface{}) {
+			c["volumeMounts"].([]interface{})[0].(map[string]interface{})["readOnly"] = false
+		})},
+		{"an environment", apiPod(p.oboImage, func(c map[string]interface{}) {
+			c["envFrom"] = []interface{}{map[string]interface{}{"secretRef": map[string]interface{}{"name": "alice-token"}}}
+		})},
+		{"args", apiPod(p.oboImage, func(c map[string]interface{}) { c["args"] = []string{"x"} })},
+		{"no such init container", apiPod(p.oboImage, func(c map[string]interface{}) { c["name"] = "other" })},
+		{"no pod", nil},
+	} {
+		p.api = fakePods{"ns/p": c.pod}
+		if _, err := p.adjust(context.Background(), pod(ann), init(nil, "/bin/true")); err == nil ||
+			!strings.Contains(err.Error(), "seccomp profile is RUNTIME_DEFAULT") {
+			t.Errorf("the init container, %s: carried as any other (refused here for its profile): %v", c.what, err)
+		}
+	}
+	p.api = nil
+	if _, err := p.adjust(context.Background(), pod(ann), init(nil, "/bin/true")); err == nil {
+		t.Error("the init container, with no pod read from the API server: let through")
+	}
 	// by name, as the runtime resolves it (the chart's image by its tag)
 	p.oboImage = "varek-node:ci"
+	p.api = fakePods{"ns/p": apiPod("varek-node:ci", nil)}
 	if adj, err := p.adjust(context.Background(), pod(ann), init(&api.Image{Name: "docker.io/library/varek-node:ci"}, "/bin/true")); adj != nil || err != nil {
 		t.Errorf("the image by its name as the runtime resolves it: %v %v", adj, err)
 	}
