@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 #
 # crio_trial.sh — v1.34 step 9 (docs/security/v1.34-kubernetes.md): the
-# 24-hour runs' agent (pod_agent.py) and policy (policy.txt) checked on one
+# 24-hour runs' agent (pod_agent.py) and policy (policy_v1340.txt) checked on one
 # host before a cluster's run: the agent in the python:3.12-bookworm image,
 # in a pod CRI-O runs (its own network and PID namespaces, a bridge network),
 # as user 65534 with every capability dropped, no new privileges, VAREK's
@@ -53,7 +53,7 @@ make -s -C "$HERE" warden varek-init tools/varek_keygen tools/vdp_cert_check > "
 install -m 755 "$HERE/warden" "$OUT/warden"; install -m 755 "$HERE/varek-init" "$OUT/varek-init"
 "$HERE/tools/varek_keygen" "$OUT/node.key" > /dev/null
 mkdir -m 755 "$OUT/policies" "$OUT/policies/soak" "$OUT/streams"; mkdir -m 700 "$OUT/sock"
-sed "s/@ALLOWED@/$BR:8080/" "$SOAK/policy.txt" > "$OUT/policies/soak/agent.policy"
+sed "s/@ALLOWED@/$BR:8080/" "$SOAK/policy_v1340.txt" > "$OUT/policies/soak/agent.policy"
 chmod 644 "$OUT/policies/soak/agent.policy"
 mkdir -p "$OUT/seccomp/varek" "$OUT/code" "$OUT/work" "$OUT/outside"
 echo '{"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRet":1,"syscalls":[]}' > "$OUT/seccomp/varek/unsupervised.json"
