@@ -679,7 +679,10 @@ ran pod-dry
 check "the pod's dry run ran to its end, supervised" grep -q '^varek-init: Landlock' "$OUT/pod-dry.log"
 check "... a read and a launch the policy refuses: let through" sh -c \
     "grep -qx 'read_denied: 0' '$OUT/pod-dry.log' && grep -qx 'launch_denied: 0' '$OUT/pod-dry.log'"
-check "... a copy written to its volume and launched: let through (no launch held, no mount noexec)" grep -qx 'launch_written: 0' "$OUT/pod-dry.log"
+# the copy is busybox's, which runs as the applet its name gives: "copy" is
+# none, so it says so and exits 127, where a refused launch exits 126
+check "... a copy written to its volume and launched: let through (no launch held, no mount noexec; busybox ran, as no applet)" sh -c \
+    "grep -qx 'copy_written: 0' '$OUT/pod-dry.log' && grep -qx 'launch_written: 127' '$OUT/pod-dry.log'"
 check "... a connect to the API server: refused all the same (the cluster's network, D6a)" grep -q '^connect: [1-9]' "$OUT/pod-dry.log"
 streams10
 SD="$(podstream pod-dry)"
@@ -737,7 +740,7 @@ check "... its record" \
 check "... the breaker's table on the node (flowPolicy.stateDir), root's alone" sh -c \
     "[ \"\$($NODE_EXEC stat -c '%u %a' /var/lib/varek/flow/breaker.state)\" = '0 600' ]"
 # -- a trust bundle (D7): a key of the chart's ConfigMap
-vpx tb "require warden 1.26
+vpx tb "require warden 1.29
 proxy inspect
 ${POLICY#*
 }
