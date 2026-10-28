@@ -162,6 +162,20 @@ spire:
   # /etc/varek/spire-bundle/KEY
   bundleConfigMap: ""
 
+# v1.36 step 7 (D7b): a VarekPolicy's flow policy (spec.flowPolicy) gates
+# the pod's plan with a refusal breaker whose table is kept on each node,
+# here (a host path, root's): the budgets bound each node, not the cluster.
+# A pod's session is its namespace and service account.
+flowPolicy:
+  stateDir: /var/lib/varek/flow
+
+# v1.36 step 7 (D7): the trust bundles a VarekPolicy names (spec.trustBundle:
+# a key), in a ConfigMap of this release's namespace, mounted projected at
+# /etc/varek/trust-bundles; "" a pod's inspecting mode trusts the node
+# image's roots
+trustBundles:
+  configMap: ""
+
 nodeAgent:
   resources:
     requests: { cpu: 50m, memory: 64Mi }

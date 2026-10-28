@@ -16,6 +16,9 @@ import (
 	"varek.dev/varek-k8s/internal/kube"
 )
 
+// v1.36 step 7: --dry-run for a policy naming credentials, and a flow
+// policy holding "nobudget" or given with --no-plan, are refused too.
+//
 // a stand-in for the Warden: it refuses a policy holding "bad"; v1.35: a
 // plan holding "nosuchkind" (--plan; v1.36 step 5: a plan that does not
 // read, as every kind of step is carried), and --no-plan for a policy holding
@@ -25,16 +28,21 @@ const fakeWarden = `#!/bin/sh
 pol="$1"; shift
 grep -q bad "$pol" && { echo "[warden] policy $pol:2: a bad line" >&2; exit 1; }
 [ "$1" = --oci-filter ] || exit 2; shift
-plan= noplan= list= ns=
+plan= noplan= list= ns= dry= flow=
 while [ $# -gt 0 ]; do
   case "$1" in
     --plan) plan="$2"; shift 2 ;;
     --no-plan) noplan=1; shift ;;
+    --dry-run) dry=1; shift ;;
+    --flow-policy) flow="$2"; shift 2 ;;
     --credential-list) list="$2"; shift 2 ;;
     --pod-namespace) ns="$2"; shift 2 ;;
     *) exit 2 ;;
   esac
 done
+[ -n "$dry" ] && grep -q credential "$pol" && { echo "[warden] --oci-filter: --dry-run with a policy that names credentials is refused" >&2; exit 1; }
+[ -n "$flow" ] && grep -q nobudget "$flow" && { echo "[warden] --flow-policy $flow declares no session_refusal_budget. refusing to start" >&2; exit 1; }
+[ -n "$flow" ] && [ -n "$noplan" ] && { echo "[warden] --oci-filter: the policy has a flow policy, which checks a plan: a pod under it names its plan (varek.dev/plan)" >&2; exit 1; }
 [ -n "$plan" ] && grep -q nosuchkind "$plan" && { echo "[warden] --oci-filter: the plan $plan: the plan does not read: line 2: an unknown kind of step" >&2; exit 1; }
 [ -n "$noplan" ] && grep -q 'require plan' "$pol" && { echo "[warden] --oci-filter: the policy says require plan: a pod under it names its plan (varek.dev/plan)" >&2; exit 1; }
 c=$(sed -n 's/^credential \([a-z_]*\) from \(.*\)$/\1 \2/p' "$pol" | head -1)
@@ -347,6 +355,29 @@ func TestRealWarden(t *testing.T) {
 	s.oboImage = "registry.example/varek-node@sha256:abc"
 	if ok, msg := post(t, s, "/pod", "team-a", oboPod(t, s, "obo", nil)); !ok {
 		t.Errorf("a pod acting for a user under it: %q", msg)
+	}
+	// v1.36 step 7 (D6, D7b): a dry run and a flow policy, as the Warden checks them
+	flow := "varek_policy 1\nlabel SECRET 0\nsticky SECRET\nrefusal_budget 2\nsession_refusal_budget 3\non_exhaustion deny\n" +
+		"unknown_disposition deny\nrule file_open\n  match target /data/denied\n  origin SECRET\n"
+	for _, c := range []struct {
+		what string
+		text string
+		spec map[string]interface{}
+		why  string
+	}{
+		{"a dry run", "require warden 1.29\nallow path /tmp/\n", map[string]interface{}{"dryRun": true}, ""},
+		{"a dry run with credentials", "require warden 1.28\nproxy on\ncredential gh from file:/var/lib/varek/credentials/gh/token\nallow host api.github.com:443\n",
+			map[string]interface{}{"dryRun": true}, "--dry-run with a policy that names credentials is refused"},
+		{"a flow policy it certifies", "require warden 1.35\nallow path /tmp/\n", map[string]interface{}{"flowPolicy": flow}, ""},
+		{"one without a session_refusal_budget", "require warden 1.35\nallow path /tmp/\n",
+			map[string]interface{}{"flowPolicy": strings.Replace(flow, "session_refusal_budget 3\n", "", 1)}, "declares no session_refusal_budget"},
+		{"a dry run with a flow policy", "require warden 1.35\nallow path /tmp/\n", map[string]interface{}{"dryRun": true, "flowPolicy": flow},
+			"--dry-run with a flow policy"},
+	} {
+		ok, msg := post(t, s, "/varekpolicy", "team-a", vpx("agent", c.text, c.spec))
+		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
+			t.Errorf("%s: allowed %v, %q", c.what, ok, msg)
+		}
 	}
 }
 
@@ -700,4 +731,55 @@ func TestPodOnBehalfOf(t *testing.T) {
 		requireOBO.MatchString("require on-behalf-ofx\n") {
 		t.Error("the `require on-behalf-of` line")
 	}
+}
+
+// v1.36 step 7 (D6, D7, D7b): a VarekPolicy's dry run, flow policy and trust bundle
+func vpx(name, text string, spec map[string]interface{}) map[string]interface{} {
+	spec["policy"] = text
+	return map[string]interface{}{"metadata": map[string]string{"name": name, "namespace": "team-a"}, "spec": spec}
+}
+
+func TestVarekPolicyDryFlowTrust(t *testing.T) {
+	s := testServer(t, "")
+	creds := "require warden 1.28\nproxy on\ncredential gh from file:/var/lib/varek/credentials/gh/token\nallow host api.github.com:443\n"
+	for _, c := range []struct {
+		what string
+		text string
+		spec map[string]interface{}
+		why  string
+	}{
+		{"a dry run", "allow path /tmp/\n", map[string]interface{}{"dryRun": true}, ""},
+		{"a dry run with credentials: refused by the Warden", creds, map[string]interface{}{"dryRun": true}, "--dry-run with a policy that names credentials"},
+		{"a flow policy the Warden loads", "allow path /tmp/\n", map[string]interface{}{"flowPolicy": "varek_policy 1\n"}, ""},
+		{"one it refuses, its reason given", "allow path /tmp/\n", map[string]interface{}{"flowPolicy": "nobudget\n"},
+			"the flow policy declares no session_refusal_budget"},
+		{"a trust bundle", "allow path /tmp/\n", map[string]interface{}{"trustBundle": "corp-ca.pem"}, ""},
+		{"a trust bundle that is not a key", "allow path /tmp/\n", map[string]interface{}{"trustBundle": "../ca.pem"}, "is not a ConfigMap's key"},
+	} {
+		ok, msg := post(t, s, "/varekpolicy", "team-a", vpx("agent", c.text, c.spec))
+		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
+			t.Errorf("%s: allowed %v, %q", c.what, ok, msg)
+		}
+	}
+	// a pod under a policy with a flow policy names its plan
+	s.api = fakeFlowAPI{fakeAPI{"plan:team-a/p1": "plan 1.35\naction a file_open /tmp/x\n"}}
+	if ok, msg := post(t, s, "/pod", "team-a", agentPod("flowy", nil)); ok || !strings.Contains(msg, "names its plan") {
+		t.Errorf("a flow policy, a pod naming no plan: allowed %v, %q", ok, msg)
+	}
+	if ok, msg := post(t, s, "/pod", "team-a", agentPod("flowy", func(p *pod) { p.Metadata.Annotations[planAnnotation] = "p1" })); !ok {
+		t.Errorf("a flow policy, a pod naming its plan: %q", msg)
+	}
+}
+
+// fakeAPI, with team-a/flowy a policy that has a flow policy
+type fakeFlowAPI struct{ fakeAPI }
+
+func (f fakeFlowAPI) GetPolicy(ctx context.Context, ns, name string) (*kube.Policy, error) {
+	if ns+"/"+name != "team-a/flowy" {
+		return f.fakeAPI.GetPolicy(ctx, ns, name)
+	}
+	p := &kube.Policy{}
+	p.Metadata.Namespace, p.Metadata.Name = ns, name
+	p.Spec.Policy, p.Spec.FlowPolicy = "require warden 1.35\nallow path /tmp/\n", "varek_policy 1\n"
+	return p, nil
 }

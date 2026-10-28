@@ -3,8 +3,9 @@
   VarekPlan (-sync; plans from v1.35) and the cluster's VarekCredential
   resources (v1.36); the webhook reads a pod's policy and plan, and lists the
   VarekCredential resources to check a policy that names credentials. Neither
-  may change one. */}}
-{{- range $who := list (dict "name" (include "varek.nodeName" .) "verbs" (list "get" "list" "watch") "credVerbs" (list "get" "list" "watch")) (dict "name" (include "varek.admissionName" .) "verbs" (list "get") "credVerbs" (list "list")) }}
+  may change one. v1.36 step 7 (D7b): the plugin gets a pod, for its service
+  account (a flow policy's session). */}}
+{{- range $who := list (dict "name" (include "varek.nodeName" .) "verbs" (list "get" "list" "watch") "credVerbs" (list "get" "list" "watch") "podVerbs" (list "get")) (dict "name" (include "varek.admissionName" .) "verbs" (list "get") "credVerbs" (list "list") "podVerbs" (list)) }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -24,6 +25,11 @@ rules:
   - apiGroups: ["varek.dev"]
     resources: ["varekcredentials"]
     verbs: {{ toJson $who.credVerbs }}
+  {{- if $who.podVerbs }}
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: {{ toJson $who.podVerbs }}
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

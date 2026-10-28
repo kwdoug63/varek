@@ -195,3 +195,54 @@ func TestSyncCredentials(t *testing.T) {
 		t.Errorf("only the list is left (no temporary file): %v", e)
 	}
 }
+
+// v1.36 step 7 (D6, D7, D7b): a VarekPolicy's flow policy and options beside
+// its policy, kept while it says them and removed with it
+func TestSyncFlowAndOptions(t *testing.T) {
+	d := t.TempDir()
+	s := &syncer{dir: d, logf: func(string, ...interface{}) {}}
+	p := &kube.Policy{}
+	p.Metadata.Namespace, p.Metadata.Name = "team-a", "agent"
+	p.Spec.Policy, p.Spec.FlowPolicy, p.Spec.DryRun, p.Spec.TrustBundle = "allow path /tmp/\n", "varek_policy 1\n", true, "corp.pem"
+	if err := s.write(p); err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(d, "team-a", "agent")
+	read := func(ext string) string { b, _ := os.ReadFile(base + ext); return string(b) }
+	if read(".policy") != "allow path /tmp/\n" || read(".flow") != "varek_policy 1\n" ||
+		read(".run") != `{"dryRun":true,"trustBundle":"corp.pem"}`+"\n" {
+		t.Fatalf("the files: %q %q %q", read(".policy"), read(".flow"), read(".run"))
+	}
+	if st, err := os.Stat(base + ".flow"); err != nil || st.Mode().Perm() != 0o644 {
+		t.Errorf("the flow policy readable by all, written by root alone: %v", err)
+	}
+	p.Spec.FlowPolicy, p.Spec.DryRun, p.Spec.TrustBundle = "", false, ""
+	if err := s.write(p); err != nil {
+		t.Fatal(err)
+	}
+	for _, ext := range []string{".flow", ".run"} {
+		if _, err := os.Stat(base + ext); !os.IsNotExist(err) {
+			t.Errorf("%s kept for a policy that no longer says it: %v", ext, err)
+		}
+	}
+	p.Spec.FlowPolicy = "varek_policy 1\n"
+	s.write(p)
+	if err := s.prune(map[string]bool{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, ext := range []string{".policy", ".flow"} {
+		if _, err := os.Stat(base + ext); !os.IsNotExist(err) {
+			t.Errorf("%s kept after its resource is gone: %v", ext, err)
+		}
+	}
+	// plans have their own file alone
+	ps := &syncer{dir: d, logf: s.logf, resource: kube.Plans}
+	pl := &kube.Policy{}
+	pl.Metadata.Namespace, pl.Metadata.Name, pl.Spec.Plan = "team-a", "p1", "plan 1.35\n"
+	if err := ps.write(pl); err != nil || read(".flow") != "" {
+		t.Fatalf("a plan: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(d, "team-a", "p1.plan")); string(b) != "plan 1.35\n" {
+		t.Errorf("the plan's file: %q", b)
+	}
+}

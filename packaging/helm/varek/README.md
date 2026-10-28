@@ -293,6 +293,45 @@ as it starts. A configuration that waits for the container's status
 is refused. Selectors by namespace, service account and pod label are
 attested from the pod alone (`disable_container_selectors = true`).
 
+## A dry run, a flow policy, a trust bundle (from 1.36)
+
+A `VarekPolicy` can say three more things beside its policy, as a host's
+Warden takes them on its command line:
+
+```yaml
+spec:
+  policy: |
+    require warden 1.35
+    allow path /data/allowed readonly
+  dryRun: false          # --dry-run
+  trustBundle: corp.pem  # --trust-bundle: a key of trustBundles.configMap
+  flowPolicy: |          # --flow-policy
+    varek_policy 1
+    refusal_budget 2
+    session_refusal_budget 10
+    ...
+```
+
+- **A dry run** decides and records every call and lets through one the
+  policy refuses, for `varek policy suggest`. In a pod a connect the policy
+  refuses is refused all the same: it would reach the cluster's network
+  (other pods, the API server, the instance metadata service). Its record
+  says `"dry_run_refused": true`, and suggest reads it as the policy's
+  refusal. No launch is held (no writable mount is made noexec, and the
+  launcher's Landlock set is `/`). As on a host, a dry run takes no plan,
+  credentials or sub-agents.
+- **A trust bundle** is the roots inspecting mode trusts in place of the
+  node image's. Put the bundles in a ConfigMap of the release's namespace
+  and set `trustBundles.configMap`; it is mounted (projected) at
+  `/etc/varek/trust-bundles`, and `trustBundle` names a key. Without it, a
+  pod's inspecting mode trusts the node image's roots, not its own image's.
+- **A flow policy** gates the pod's plan (the pod names one, `varek.dev/plan`)
+  with its refusal breaker. The breaker's table is kept on each node, in
+  `flowPolicy.stateDir` (a host path), so its budgets bound each node, not
+  the cluster: a pod scheduled on another node starts its counts again. Its
+  session is the pod's namespace and service account, which the plugin reads
+  from the API server (the chart gives it `get` on pods).
+
 ## Values
 
 | Value | Default | |
@@ -320,6 +359,8 @@ attested from the pod alone (`disable_container_selectors = true`).
 | `onBehalfOf.user` | `65534` | the token's init container's user and group (on OpenShift, the namespace's) |
 | `onBehalfOf.issuerCaConfigMap` | `""` | a ConfigMap whose `ca.crt` verifies the token issuers' TLS (`kube-root-ca.crt` for the cluster's own); `""` the image's trust store |
 | `spire.adminSocket`, `spire.self`, `spire.bundleConfigMap` | `""` | the SPIRE agent's admin socket on the node, the node agent's own SPIFFE ID, a ConfigMap holding the trust bundle |
+| `flowPolicy.stateDir` | `/var/lib/varek/flow` | where each node keeps a flow policy's breaker table (a host path, root's) |
+| `trustBundles.configMap` | `""` | a ConfigMap of trust bundles a `VarekPolicy` names by key (`spec.trustBundle`) |
 
 ## What it does not do yet
 

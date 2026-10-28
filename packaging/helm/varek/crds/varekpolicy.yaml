@@ -6,7 +6,11 @@
 # VAREK's NRI plugin (varek-nri -sync) writes each to its node's policy
 # directory, as POLICY_DIR/<namespace>/<name>.policy; the admission webhook
 # (varek-admission) refuses one the Warden does not load or the node agent
-# does not carry. Helm installs it with the chart, and does not change or
+# does not carry. v1.36 step 7 (docs/security/v1.36-kubernetes-parity.md, D6,
+# D7, D7b): beside the policy, a dry run, a trust bundle (a key of the
+# chart's trustBundles.configMap) and a flow policy, which the plugin writes
+# beside the policy and the node agent takes as a host's Warden takes
+# --dry-run, --trust-bundle and --flow-policy. Helm installs it with the chart, and does not change or
 # remove it on an upgrade or an uninstall (Helm's rule for crds/): a new
 # version of it is applied by hand (kubectl apply -f).
 apiVersion: apiextensions.k8s.io/v1
@@ -46,4 +50,24 @@ spec:
                   description: The policy, as written for the Warden (varek/v1_4/policy.txt is one).
                   type: string
                   minLength: 1
+                  maxLength: 1048576
+                dryRun:
+                  description: >-
+                    A dry run (the Warden's --dry-run): every call is decided and recorded, and one the
+                    policy refuses is let through, except a connect, which in a pod would reach the
+                    cluster's network (D6). For varek policy suggest; not with credentials, sub-agents,
+                    a plan or a flow policy.
+                  type: boolean
+                trustBundle:
+                  description: >-
+                    The roots inspecting mode trusts in place of the node image's (--trust-bundle): a
+                    key of the ConfigMap the chart's trustBundles.configMap names.
+                  type: string
+                  pattern: '^[-._a-zA-Z0-9]{1,253}$'
+                flowPolicy:
+                  description: >-
+                    A flow policy (the Warden's --flow-policy file), with its refusal breaker kept on
+                    each node; a pod under it names its plan, and its session is the pod's namespace
+                    and service account.
+                  type: string
                   maxLength: 1048576

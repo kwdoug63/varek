@@ -274,12 +274,22 @@ const planCarrier = "require warden 1.35\n"
 // failure of the webhook's own) is not. v1.35 step 4c: with a pod's plan
 // (of podWithPlan), or for a pod naming none (podNoPlan).
 func (s *server) check(ctx context.Context, text, ns string) checked {
-	return s.checkPlan(ctx, text, policyAlone, "", ns)
+	return s.checkPlan(ctx, text, extras{}, policyAlone, "", ns)
 }
+
+// v1.36 step 7 (D6, D7b): what a VarekPolicy says beside its policy that the
+// Warden checks with it: its dry run (--dry-run) and its flow policy
+// (--flow-policy)
+type extras struct {
+	dry  bool
+	flow string
+}
+
+func extrasOf(p *kube.Policy) extras { return extras{dry: p.Spec.DryRun, flow: p.Spec.FlowPolicy} }
 
 // v1.36 step 4 (D2): of the namespace ns, whose given credentials (the
 // cluster's list, read only for a policy naming one) are checked with it
-func (s *server) checkPlan(ctx context.Context, text string, of checkOf, plan, ns string) checked {
+func (s *server) checkPlan(ctx context.Context, text string, x extras, of checkOf, plan, ns string) checked {
 	list := ""
 	if credentialLine.MatchString(text) {
 		cs, err := s.api.ListCredentials(ctx)
@@ -288,7 +298,8 @@ func (s *server) checkPlan(ctx context.Context, text string, of checkOf, plan, n
 		}
 		list = kube.CredentialList(cs)
 	}
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%d\x00%d\x00%s\x00%d\x00%s\x00%s\x00%s", of, len(text), text, len(plan), plan, ns, list)))
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d\x00%d\x00%s\x00%d\x00%s\x00%s\x00%s\x00%t\x00%d\x00%s", of, len(text), text,
+		len(plan), plan, ns, list, x.dry, len(x.flow), x.flow)))
 	s.mu.Lock()
 	c, ok := s.cache[sum]
 	s.mu.Unlock()
@@ -319,6 +330,16 @@ func (s *server) checkPlan(ctx context.Context, text string, of checkOf, plan, n
 		}
 		args = append(args, "--credential-list", lp, "--pod-namespace", ns)
 	}
+	if x.dry {
+		args = append(args, "--dry-run")
+	}
+	if x.flow != "" {
+		fp := filepath.Join(dir, "flow")
+		if err := os.WriteFile(fp, []byte(x.flow), 0o600); err != nil {
+			return checked{why: err.Error()}
+		}
+		args = append(args, "--flow-policy", fp)
+	}
 	planPath := filepath.Join(dir, "plan")
 	switch of {
 	case podWithPlan:
@@ -340,7 +361,7 @@ func (s *server) checkPlan(ctx context.Context, text string, of checkOf, plan, n
 		if ctx.Err() != nil || !errors.As(err, &ee) || !ee.Exited() {
 			return checked{why: fmt.Sprintf("the Warden did not finish checking it (%v)", err)}
 		}
-		c.why = strings.ReplaceAll(warden(errb.String(), path), " "+planPath, "")
+		c.why = strings.ReplaceAll(strings.ReplaceAll(warden(errb.String(), path), " "+planPath, ""), filepath.Join(dir, "flow"), "the flow policy")
 		if c.why == "" {
 			c.why = err.Error()
 		}
@@ -387,7 +408,14 @@ func (s *server) varekPolicy(ctx context.Context, req *request) string {
 	if strings.TrimSpace(p.Spec.Policy) == "" {
 		return "the policy is empty"
 	}
-	if c := s.check(ctx, p.Spec.Policy, ns); c.why != "" {
+	// v1.36 step 7 (D7): a trust bundle is a key of the chart's ConfigMap
+	if p.Spec.TrustBundle != "" && !kube.TrustKeyOK(p.Spec.TrustBundle) {
+		return fmt.Sprintf("its trustBundle %q is not a ConfigMap's key (1 to 253 of a-z, A-Z, 0-9, -, _ and .)", p.Spec.TrustBundle)
+	}
+	if len(p.Spec.FlowPolicy) > kube.MaxPolicy {
+		return fmt.Sprintf("the flow policy is larger than %d bytes", kube.MaxPolicy)
+	}
+	if c := s.checkPlan(ctx, p.Spec.Policy, extrasOf(&p), policyAlone, "", ns); c.why != "" {
 		return "the Warden refuses this policy: " + c.why
 	}
 	return ""
@@ -418,7 +446,7 @@ func (s *server) varekPlan(ctx context.Context, req *request) string {
 	if strings.TrimSpace(p.Spec.Plan) == "" {
 		return "the plan is empty"
 	}
-	if c := s.checkPlan(ctx, planCarrier, podWithPlan, p.Spec.Plan, ns); c.why != "" {
+	if c := s.checkPlan(ctx, planCarrier, extras{}, podWithPlan, p.Spec.Plan, ns); c.why != "" {
 		return "the Warden refuses this plan: " + c.why
 	}
 	return ""
@@ -515,10 +543,10 @@ func (s *server) pod(ctx context.Context, req *request) string {
 		if pl == nil {
 			return fmt.Sprintf("there is no VarekPlan %s in namespace %s", plan, ns)
 		}
-		if c = s.checkPlan(ctx, vp.Spec.Policy, podWithPlan, pl.Spec.Plan, ns); c.why != "" {
+		if c = s.checkPlan(ctx, vp.Spec.Policy, extrasOf(vp), podWithPlan, pl.Spec.Plan, ns); c.why != "" {
 			return fmt.Sprintf("the Warden refuses its policy %s with its plan %s: %s", name, plan, c.why)
 		}
-	} else if c = s.checkPlan(ctx, vp.Spec.Policy, podNoPlan, "", ns); c.why != "" {
+	} else if c = s.checkPlan(ctx, vp.Spec.Policy, extrasOf(vp), podNoPlan, "", ns); c.why != "" {
 		return fmt.Sprintf("the Warden refuses its policy %s: %s", name, c.why)
 	}
 	// v1.36 step 6 (D5): a pod acting for a user; its init container, the
