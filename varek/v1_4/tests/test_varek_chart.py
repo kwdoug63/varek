@@ -559,6 +559,17 @@ def test_dry_run_flow_policy_and_trust_bundles():
     assert v["projected"]["sources"] == [{"configMap": {"name": "corp-roots"}}] and "configMap" not in v
 
 
+def test_stream_rotation():
+    """v1.36 step 8 (D9): the node agent rotates each stream at the chart's
+    size, given in bytes as a whole number (never as a float); 0, none"""
+    agent = ctr(pod(render(), "DaemonSet"), "node-agent")
+    assert arg(agent, "--node-stream-rotate") == "268435456"
+    agent = ctr(pod(render("streams.rotateBytes=1073741824"), "DaemonSet"), "node-agent")
+    assert arg(agent, "--node-stream-rotate") == "1073741824"
+    agent = ctr(pod(render("streams.rotateBytes=0"), "DaemonSet"), "node-agent")
+    assert "--node-stream-rotate" not in agent["command"]
+
+
 def test_the_varekcredential_crd():
     crd = one(render(), "CustomResourceDefinition", "varekcredentials.varek.dev")
     assert crd["spec"]["scope"] == "Cluster" and crd["spec"]["names"]["kind"] == "VarekCredential"

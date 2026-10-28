@@ -169,6 +169,15 @@ spire:
 flowPolicy:
   stateDir: /var/lib/varek/flow
 
+# v1.36 step 8 (D9): a container's stream, past this many bytes, goes on in
+# a new segment beside it (<container>.<supervisor>.jsonl.2, .3, ...), each
+# beginning with a checkpoint that names it and carries the hash chain on
+# from the one before; the exporter follows them in turn, and the audit
+# takes them in order (varek_audit.py ... NAME.jsonl NAME.jsonl.2 ...).
+# 65536 or more; 0, no rotation.
+streams:
+  rotateBytes: 268435456                # 256 MiB
+
 # v1.36 step 7 (D7): the trust bundles a VarekPolicy names (spec.trustBundle:
 # a key), in a ConfigMap of this release's namespace, mounted projected at
 # /etc/varek/trust-bundles; "" a pod's inspecting mode trusts the node

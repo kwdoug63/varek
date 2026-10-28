@@ -58,6 +58,17 @@ def jl(path):
     return out
 
 
+def segments(path):
+    """v1.36 (D9): a stream and the segments it went on in (the node agent
+    rotates a stream at the chart's streams.rotateBytes): NAME.jsonl,
+    NAME.jsonl.2, ..."""
+    out, n = [path], 2
+    while os.path.exists(f"{path}.{n}"):
+        out.append(f"{path}.{n}")
+        n += 1
+    return out
+
+
 def pct(xs, p):
     if not xs:
         return 0
@@ -151,7 +162,7 @@ def main():
     streams, by_pod = {}, collections.defaultdict(list)
     for node in meta["nodes"]:
         for s in glob.glob(f"{d}/streams/{node}/*.jsonl"):
-            recs = jl(s)
+            recs = [r for g in segments(s) for r in jl(g)]       # v1.36 (D9): the segments in order
             rs = next((r for r in recs if r.get("event") == "run_start"), None)
             if not rs:
                 continue
@@ -178,7 +189,7 @@ def main():
         anchor = f"{d}/streams/{v['node']}/anchor"
         r = subprocess.run([sys.executable, os.path.join(a.tools, "varek_audit.py"), "--policy", s[:-6] + ".policy",
                             "--checker", os.path.join(a.tools, "vdp_cert_check"), "--pubkey", f"{d}/node.key.pub",
-                            "--anchor", anchor, s], capture_output=True, text=True)
+                            "--anchor", anchor] + segments(s), capture_output=True, text=True)
         v["audit"] = r.returncode == 0
         if r.returncode != 0:
             audit_bad.append((v["pod"], (r.stdout + r.stderr).strip().splitlines()[-1:]))

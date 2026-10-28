@@ -1536,6 +1536,10 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
         int so = openat(sd, sname, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (so < 0 || dup2(so, STDERR_FILENO) < 0) node_fail("cannot open its stream");
         close(so);
+        if (g_rotate) {                         /* v1.36 (D9): its next segments go beside it */
+            g_seg_dir = fcntl(sd, F_DUPFD_CLOEXEC, 3);
+            snprintf(g_seg_base, sizeof g_seg_base, "%s", sbase);
+        }
         if (ok == 0) ok = node_policy(buf, (size_t)r, policy_path, why, sizeof why);
         if (ok == 0) ok = node_copy(sd, streams, sbase, "policy", ".policy", g_nr.policy_sha, policy_path,
                                     why, sizeof why);                                        /* step 5 */

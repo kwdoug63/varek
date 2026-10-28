@@ -145,6 +145,11 @@ spec:
             - --node-trust-bundles
             - /etc/varek/trust-bundles
             {{- end }}
+            {{- if .Values.streams.rotateBytes }}
+            # v1.36 step 8 (D9): each stream in segments of this size
+            - --node-stream-rotate
+            - {{ int64 .Values.streams.rotateBytes | quote }}
+            {{- end }}
             {{- range .Values.nodeAgent.extraArgs }}
             - {{ . | quote }}
             {{- end }}
