@@ -634,7 +634,7 @@ uninstall:
 	@echo "removed $(PREFIX); settings in /etc/varek and logs in /var/log/varek were kept"
 
 test-cli: warden warden-proxy tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
-	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_container.py tests/test_varek_license.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py tests/test_varek_bench_mcp.py
+	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_container.py tests/test_varek_license.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py tests/test_varek_bench_mcp.py tests/test_varek_audit_stream.py
 
 # v1.34 step 2: the node agent's JSON reader (node_json.c)
 test-node-json: tests/test_node_json.c node_json.c node_json.h

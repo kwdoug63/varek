@@ -155,7 +155,9 @@ def main():
             setattr(va, name, wrap(name, fn))
 
     sized = {}
-    orig_parse = va._parse_log
+    # v1.36 step 8 (D9): the audit no longer parses the whole stream first
+    # (d9_flat_memory.py measures it from the first record to the last)
+    orig_parse = getattr(va, "_parse_log", None)
 
     def parse_and_size(*args, **kw):
         res = orig_parse(*args, **kw)
@@ -164,7 +166,8 @@ def main():
         sized["n"] = len(recs)
         sized["per_record"] = sum(deep_size(r) for r in sample) / max(1, len(sample))
         return res
-    va._parse_log = wrap("_parse_log", parse_and_size)
+    if orig_parse is not None:
+        va._parse_log = wrap("_parse_log", parse_and_size)
 
     start_rss = status("VmRSS")
     reset_peak()
