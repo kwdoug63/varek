@@ -105,6 +105,22 @@
 #      on-behalf-of`, no volume on the node, a key that leads out of it, a
 #      token not root's, an expired token, an SVID SPIRE does not give, the
 #      chain given to the node agent itself.
+# v1.36 step 7 (D6, D7, D7b):
+#  13. the dry run, flow policies and trust bundles under the node agent,
+#      each the pod's VarekPolicy's (the plugin's annotations): a dry run
+#      (--oci-filter --dry-run's filter) lets through a read and a launch
+#      the policy refuses (the launcher's set /), refuses a connect all the
+#      same (dry_run_refused), and the audit verifies it as a dry run and
+#      refuses a forged dry_run_refused; a flow policy copied beside the
+#      stream and held to the plugin's SHA-256, its gate deciding the pod's
+#      plan, its breaker's table the node's (--node-flow-state), counting
+#      across containers by the session namespace/service account; a trust
+#      bundle, a key of the node's ConfigMap (--node-trust-bundles, laid out
+#      as the kubelet lays a projected volume out), the roots run_start
+#      records; refused: a dry run with a plan or credentials, a flow policy
+#      without a service account, a plan, its SHA-256 or --node-flow-state, a
+#      trust bundle not in the ConfigMap, under a node agent with none, or
+#      not a key; each given to the node agent itself.
 #
 #   test_v1340.sh VDP_CHECK VDP_CERT_CHECK WARDEN [VAREK_INIT]
 set -u
@@ -425,6 +441,16 @@ if ann != "-":
             c["annotations"]["varek.dev/plan"] = o[5:]
             psha = hashlib.sha256(open(pl, "rb").read()).hexdigest() if os.path.isfile(pl) else "0" * 64
             if "plan-no-sha" not in opts: c["annotations"]["varek.dev/plan-sha256"] = "e" * 64 if "plan-bad-sha" in opts else psha
+    # v1.36 step 7: the VarekPolicy's dry run (dry), trust bundle (trust=KEY) and flow policy (flow: the
+    # SHA-256 of POLICY.flow, or flow-bad-sha), and the pod's service account (sa=NAME), as the plugin adds them
+    if "dry" in opts: c["annotations"]["varek.dev/dry-run"] = "true"
+    for o in opts:
+        if o.startswith("trust="): c["annotations"]["varek.dev/trust-bundle"] = o[6:]
+        if o.startswith("sa="): c["annotations"]["varek.dev/service-account"] = o[3:]
+    if "flow" in opts or "flow-bad-sha" in opts:
+        ff = B + "/pol/team-a/" + ann + ".flow"
+        c["annotations"]["varek.dev/flow-sha256"] = "d" * 64 if "flow-bad-sha" in opts else \
+            hashlib.sha256(open(ff, "rb").read()).hexdigest() if os.path.isfile(ff) else "0" * 64
 for m in c["mounts"]:
     if m["destination"] == "/dev": m["options"].append("noexec")      # as the NRI plugin makes it
 c["mounts"].append({"destination": "/varek/init", "type": "bind", "source": B + ("/other-init" if "other-init" in opts else "/varek-init"),
@@ -915,6 +941,143 @@ else
     check "refused: --on-behalf-of or --agent-svid given to the node agent itself (each pod names its own)" sh -c \
         "'$WARDEN' '$B/pol' --node-agent '$B/s/x2.sock' --node-streams '$B/streams' --on-behalf-of '$B/obo.conf' > /dev/null 2>&1; [ \$? = 2 ] &&
          '$WARDEN' '$B/pol' --node-agent '$B/s/x2.sock' --node-streams '$B/streams' --agent-svid '$B/obo.conf' > /dev/null 2>&1; [ \$? = 2 ]"
+fi
+
+echo "== 13. the dry run, flow policies and trust bundles under the node agent (v1.36 step 7, D6, D7, D7b) =="
+if [ -z "$WARDEN" ] || ! declare -f lbundle > /dev/null; then
+    skip "the dry run, flow policies and trust bundles under the node agent (need the launcher, as section 6)"
+else
+    nx() { "$WARDEN" "$B/pol" --node-agent "$B/s/x3.sock" --node-streams "$B/streams" "$@" > /dev/null 2>&1; [ $? = 2 ]; }
+    nxall() { nx --dry-run && nx --trust-bundle /dev/null && nx --session s && nx --breaker-state /tmp/b && nx --gate-status /tmp/g; }
+    check "refused: --dry-run, --trust-bundle, --session, --breaker-state or --gate-status given to the node agent itself" nxall
+    check "... and --node-trust-bundles or --node-flow-state without --node-agent" sh -c \
+        "'$WARDEN' /dev/null --node-trust-bundles /tmp -- /bin/true > /dev/null 2>&1; [ \$? = 2 ] &&
+         '$WARDEN' /dev/null --node-flow-state /tmp -- /bin/true > /dev/null 2>&1; [ \$? = 2 ]"
+    # -- the dry run (D6): the pod's VarekPolicy's, a connect the policy refuses refused all the same (D6a)
+    printf 'require warden 1.29\nallow path /data/allowed readonly\n' > "$P/dry.policy"
+    printf 'require warden 1.28\ncredential k from file:/x\nallow path /data/allowed readonly\n' > "$P/drycred.policy"
+    chmod 644 "$P/dry.policy" "$P/drycred.policy"
+    "$WARDEN" "$P/dry.policy" --oci-filter --dry-run > "$B/f/dry.json" 2>/dev/null; drc=$?
+    "$WARDEN" "$P/dry.policy" --oci-filter > "$B/f/dry0.json" 2>/dev/null
+    check "--oci-filter --dry-run: written, every call outside the allowlist notified (more rules than enforcing's)" python3 - \
+        "$B/f/dry.json" "$B/f/dry0.json" "$drc" <<'PY'
+import json, sys
+d, e = (json.load(open(x)) for x in sys.argv[1:3])
+sys.exit(0 if sys.argv[3] == "0" and len(d["syscalls"]) > len(e["syscalls"]) and d["defaultAction"] == e["defaultAction"] else 1)
+PY
+    check "--oci-filter --dry-run with --plan, under a policy naming credentials, or with a flow policy: refused (as on a host)" sh -c \
+        "! '$WARDEN' '$P/dry.policy' --oci-filter --dry-run --plan '$P/held.plan' > /dev/null 2>&1 &&
+         '$WARDEN' '$P/drycred.policy' --oci-filter --dry-run 2>&1 | grep -q 'with a policy that names credentials is refused'"
+    lbundle dry1 "$B/s/l.sock" "$B/f/dry.json" dry "/varek/init -- /probe" dry work-exec; run dry1
+    sed 's/^/     /' "$B/dry1.out"
+    DS="$(stream l dry1)"
+    check "a pod's dry run: the command ran; run_start says a dry run" sh -c \
+        "grep -qx 'read_allowed: ok allowed content' '$B/dry1.out' && grep -q '\"event\":\"run_start\".*\"mode\":\"dry_run\"' '$DS'"
+    check "... a read the policy refuses: let through, recorded as not enforced" sh -c \
+        "grep -qx 'read_denied: ok secret' '$B/dry1.out' && grep -F '\"resolved\":\"/data/denied\"' '$DS' | grep -q '\"enforced\":false'"
+    check "... a launch the policy refuses: let through (no launch held: the launcher's set is / alone)" sh -c \
+        "grep -qx 'exec_again: ran' '$B/dry1.out'"
+    check "... run_start's launch set: / alone" rec l dry1 'S and S[0]["node"]["launch_paths"] == ["/"]'
+    check "... a connect the policy refuses: refused all the same (the pod's network, D6a), a dry run's refusal" sh -c \
+        "grep -qx 'connect: EACCES' '$B/dry1.out'"
+    check "... its record: the policy's refusal (enforced), dry_run_refused" rec l dry1 \
+        'any(r.get("action") == "net.connect" and r.get("decision_final") == "DENY" and r.get("dry_run_refused") is True and "enforced" not in r and r.get("target") == "127.0.0.1:9" for r in R)'
+    if [ -n "$CERT" ]; then
+        python3 "$HERE/tools/varek_audit.py" --policy "${DS%.jsonl}.policy" --checker "$CERT" "$DS" > "$B/dry1.audit" 2>&1; arc=$?
+        check "... and the audit verifies the stream: a dry run, not enforced (exit 3)" sh -c \
+            "[ $arc = 3 ] && grep -q 'VERIFIED: DRY RUN, NOT ENFORCED' '$B/dry1.audit'"
+        python3 - "$DS" "$B/dry-forged.jsonl" <<'PY'
+import sys
+out = open(sys.argv[2], "w")
+for l in open(sys.argv[1]):
+    if l.startswith("{") and '"/data/denied"' in l and '"enforced":false' in l:
+        l = l.replace('"enforced":false,', '"enforced":false,"dry_run_refused":true,', 1)
+    out.write(l)
+PY
+        check "... and refuses a dry run's refusal that is not a refused connect" sh -c \
+            "python3 '$HERE/tests/log_rechain.py' '$B/dry-forged.jsonl' > '$B/dry-forged2.jsonl' &&
+             python3 '$HERE/tools/varek_audit.py' --policy '${DS%.jsonl}.policy' --checker '$CERT' '$B/dry-forged2.jsonl' > '$B/dry-forged.out' 2>&1;
+             [ \$? != 0 ] && grep -q 'not a refused connect or proxied name' '$B/dry-forged.out'"
+    fi
+    lbundle dry2 "$B/s/l.sock" "$B/f/dry.json" dry "/varek/init -- /probe" dry work-exec plan=held; run dry2
+    check "refused: a pod's dry run with a plan (as on a host)" refused l dry2 'a dry run with --plan is refused'
+    # -- the flow policy (D7b): its gate and breaker on the node, the session the pod's namespace and service account
+    printf 'require warden 1.35\nallow path /data/allowed readonly\nallow path /data/denied readonly\n' > "$P/flow.policy"
+    printf 'varek_policy 1\nlabel SECRET 0\nsticky SECRET\nrefusal_budget 2\nsession_refusal_budget 3\non_exhaustion deny\nunknown_disposition deny\nrule file_open\n  match target /data/denied\n  origin SECRET\nrule file_open\n  match target /data/allowed\n  deny_in SECRET\n' > "$P/flow.flow"
+    sed '/^session_refusal_budget/d' "$P/flow.flow" > "$B/f/nosess.flow"
+    printf 'plan 1.35\naction a file_open /data/allowed open=read\n' > "$P/fgood.plan"
+    printf 'plan 1.35\naction r file_open /data/denied open=read\naction w file_open /data/allowed open=read\nedge r w\n' > "$P/fleak.plan"
+    chmod 644 "$P/flow.policy" "$P/flow.flow" "$P/fgood.plan" "$P/fleak.plan"
+    "$WARDEN" "$P/flow.policy" --oci-filter --flow-policy "$P/flow.flow" --plan "$P/fgood.plan" > "$B/f/flow.json" 2>/dev/null; frc=$?
+    check "--oci-filter --flow-policy: the flow policy loads, is certified, has its budgets" sh -c "[ $frc = 0 ] &&
+        '$WARDEN' '$P/flow.policy' --oci-filter --flow-policy '$P/flow.flow' > /dev/null 2>&1"
+    check "... refused: one without a session_refusal_budget, or a pod naming no plan (--no-plan)" sh -c \
+        "'$WARDEN' '$P/flow.policy' --oci-filter --flow-policy '$B/f/nosess.flow' 2>&1 | grep -q 'declares no session_refusal_budget' &&
+         '$WARDEN' '$P/flow.policy' --oci-filter --flow-policy '$P/flow.flow' --no-plan 2>&1 | grep -q 'a pod under it names its plan'"
+    mkdir -m 700 "$B/flowstate"
+    check "a node agent keeping the breaker's table on the node (--node-flow-state)" \
+        agent fl "$B/pol" --node-launcher "$B/varek-init" --node-flow-state "$B/flowstate"
+    fl() { lbundle "$1" "$B/s/fl.sock" "$B/f/flow.json" flow "/varek/init -- /probe" flow "${@:2}"; run "$1"; }
+    fl fl1 plan=fgood sa=agent-sa
+    FS="$(stream fl fl1)"
+    check "a pod's plan the flow policy passes: the command ran, the run held to the plan" sh -c \
+        "grep -qx 'read_allowed: ok allowed content' '$B/fl1.out' && grep -qx 'read_denied: EACCES' '$B/fl1.out'"
+    check "... the flow gate's record: PASS, the session the pod's namespace/service account" rec fl fl1 \
+        'any(r.get("event") == "plan_gate" and r.get("gate") == "flow" and r.get("breaker") == "PASS" and r.get("session") == "team-a/agent-sa" for r in R)'
+    check "... the flow policy copied beside the stream (read-only)" sh -c \
+        "cmp -s '${FS%.jsonl}.flow' '$P/flow.flow' && [ \"\$(stat -c %a '${FS%.jsonl}.flow')\" = 400 ]"
+    check "... the breaker's table on the node, root's alone" sh -c \
+        "[ -f '$B/flowstate/breaker.state' ] && [ \"\$(stat -c %u:%a '$B/flowstate/breaker.state')\" = 0:600 ]"
+    if [ -n "$CERT" ]; then
+        check "... and the audit accepts the stream" python3 "$HERE/tools/varek_audit.py" --policy "${FS%.jsonl}.policy" --checker "$CERT" "$FS"
+    fi
+    fl fl2 plan=fleak sa=agent-sa
+    check "a plan the flow policy refuses: refused, the container ended, the breaker counting (1 of 2)" sh -c \
+        "! grep -q '^read_allowed' '$B/fl2.out' && grep -q 'refused by its flow policy' '$(stream fl fl2)'"
+    check "... its record: REFUSED_RETRYABLE, refusal 1 of 2" rec fl fl2 \
+        'any(r.get("event") == "plan_gate" and r.get("gate") == "flow" and r.get("breaker") == "REFUSED_RETRYABLE" and r.get("refusals") == 1 and r.get("budget") == 2 for r in R)'
+    fl fl3 plan=fleak sa=agent-sa
+    check "the same plan again, from another container on the node: the table is the node's (2 of 2: terminal)" rec fl fl3 \
+        'any(r.get("event") == "plan_gate" and r.get("refusals") == 2 and r.get("breaker") == "TERMINAL_DENY" for r in R)'
+    fl fl4 plan=fleak sa=other-sa
+    check "... under another service account: another session, its own count (1)" rec fl fl4 \
+        'any(r.get("event") == "plan_gate" and r.get("session") == "team-a/other-sa" and r.get("refusals") == 1 for r in R)'
+    fl fl5 plan=fgood
+    check "refused: a flow policy, and the container names no service account (the breaker's session)" refused fl fl5 'names no service account'
+    fl fl6 sa=agent-sa
+    check "refused: a flow policy, and its pod names no plan" refused fl fl6 'which checks a plan, and its pod names no plan'
+    fl fl7 plan=fgood sa=agent-sa flow-bad-sha
+    check "refused: a flow policy not the one the plugin checked (another SHA-256)" refused fl fl7 'the flow policy .* is not the one the NRI plugin'
+    lbundle fl8 "$B/s/l.sock" "$B/f/flow.json" flow "/varek/init -- /probe" flow plan=fgood sa=agent-sa; run fl8
+    check "refused: a flow policy under a node agent with no --node-flow-state" refused l fl8 'no directory for the breaker'
+    # -- the trust bundle (D7): a key of the node's ConfigMap, as the kubelet lays a projected volume out
+    TBS=""
+    for f in /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt; do [ -f "$f" ] && TBS="$f" && break; done
+    if [ -z "$TBS" ] || ! declare -f in_pod > /dev/null || [ ! -x "$HERE/warden-proxy" ]; then
+        skip "the trust bundle (needs a host bundle, the pod's network, as section 7, and warden-proxy)"
+    else
+        TB="$B/trust"; mkdir -p "$TB/..2026_10_28_10_00_00.1"
+        cp "$TBS" "$TB/..2026_10_28_10_00_00.1/corp.pem"; chmod 644 "$TB/..2026_10_28_10_00_00.1/corp.pem"
+        ln -sfn ..2026_10_28_10_00_00.1 "$TB/..data"; ln -sfn ..data/corp.pem "$TB/corp.pem"
+        printf 'require warden 1.26\nproxy inspect\nallow path /data/allowed readonly\nallow host svc.test:443\n' > "$P/tb.policy"
+        chmod 644 "$P/tb.policy"
+        "$WARDEN" "$P/tb.policy" --oci-filter > "$B/f/tb.json" 2>/dev/null
+        check "a node agent with the node's trust bundles (--node-trust-bundles)" agent tb "$B/pol" --node-launcher "$B/varek-init" \
+            --node-trust-bundles "$TB"
+        lbundle tb1 "$B/s/tb.sock" "$B/f/tb.json" tb "/varek/init -- /probe" trust=corp.pem; in_pod tb1; run tb1
+        WANT="$(cd "$TB/..2026_10_28_10_00_00.1" && pwd -P)/corp.pem"
+        check "a pod's trust bundle: the command ran, run_start's roots the bundle's (the node's ConfigMap, read in the node's view)" \
+            sh -c "grep -qx 'read_allowed: ok allowed content' '$B/tb1.out'"
+        check "... run_start: that file, its SHA-256" rec tb tb1 \
+            'S and S[0]["trust"]["host_bundle"] == "'"$WANT"'" and S[0]["trust"]["host_bundle_sha256"] == "'"$(sha256sum "$TBS" | cut -d' ' -f1)"'"'
+        lbundle tb2 "$B/s/tb.sock" "$B/f/tb.json" tb "/varek/init -- /probe" trust=nosuch.pem; in_pod tb2; run tb2
+        check "refused: a trust bundle not in the node's ConfigMap" refused tb tb2 'its trust bundle nosuch.pem is not in the node'
+        lbundle tb3 "$B/s/l.sock" "$B/f/tb.json" tb "/varek/init -- /probe" trust=corp.pem; in_pod tb3; run tb3
+        check "refused: a trust bundle under a node agent with no --node-trust-bundles" refused l tb3 'given no directory of them'
+        lbundle tb4 "$B/s/tb.sock" "$B/f/tb.json" tb "/varek/init -- /probe" trust=../corp.pem; in_pod tb4; run tb4
+        check "refused: a trust bundle's key that is not a ConfigMap's" sh -c \
+            "! grep -q '^read_allowed' '$B/tb4.out' && grep -q 'is not a ConfigMap.s key' '$B/streams-tb'/unknown.*.jsonl"
+    fi
 fi
 
 echo

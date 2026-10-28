@@ -896,9 +896,10 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
     if (d_final == DEC_ALLOW && !a->proxy_handoff && hold_refuses(a)) { d_final = DEC_DENY; held = true; }
     /* v1.29: a dry run dials a connect the policy refuses as it dials an
      * allowed one (the agent has no network of its own), recorded as not
-     * enforced; never a Unix socket, which the Warden would reach as root */
+     * enforced; never a Unix socket, which the Warden would reach as root.
+     * v1.36 step 7 (D6a): in a pod, refused all the same (dry_net_let) */
     if (d_final != DEC_ALLOW &&
-        (fam == AF_UNIX || held || !dry_let(a, cert_refused ? "certificate_refused" : decision_rule_id(a, d_raw)))) {
+        (fam == AF_UNIX || held || !dry_net_let(a, cert_refused ? "certificate_refused" : decision_rule_id(a, d_raw)))) {
         close(ag);
         if (pin >= 0) close(pin);
         net_record(tid, a, d_raw, d_final, held ? "outside_plan" :

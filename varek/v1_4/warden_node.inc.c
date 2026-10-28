@@ -72,6 +72,18 @@
  * goes to the proxy in the pod's network namespace, as on a host; the agent
  * has the placeholder the NRI plugin put in its environment
  * (VAREK_CRED_<NAME>). */
+/* v1.36 step 7 (D6, D7, D7b): the dry run, flow policies and trust bundles,
+ * each said by the pod's VarekPolicy beside its policy, which the plugin
+ * puts in the container's annotations (varek.dev/dry-run, trust-bundle,
+ * flow-sha256, and service-account from the API server), never the pod's
+ * own (node_inputs). A dry run is a host's, but a connect the policy
+ * refuses is refused all the same (dry_net_let: the pod's network is the
+ * cluster's), and no launch is held (the launcher's set is /). A flow
+ * policy is copied beside the stream as the policy is, and gates the pod's
+ * plan with its breaker, whose table is the node's (--node-flow-state) and
+ * whose session is the pod's namespace and service account. A trust bundle
+ * is a key of the ConfigMap at --node-trust-bundles, read in the node's
+ * view. node_unsupported now refuses nothing a host runs. */
 #include "node_json.h"
 
 #define NODE_LAUNCHER "/varek/init"              /* where the plugin binds the launcher */
@@ -180,6 +192,44 @@ static int node_state_pid(const char *doc, size_t n, pid_t *out, char *why, size
     return 0;
 }
 
+/* One of the plugin's own annotations (it sets or removes each, so the
+ * pod's author cannot give one): 1 and its value, 0 when absent, -1 when not
+ * a string of fewer than ON bytes */
+static int node_own(const char *doc, size_t n, const char *key, char *out, size_t on) {
+    const char *pk[] = { "state", "annotations", key }, *v;
+    size_t vn;
+    out[0] = '\0';
+    if (nj_find(doc, n, pk, 3, &v, &vn) < 0) return 0;
+    if (nj_string(v, vn, out, on) < 0) { out[0] = '\0'; return -1; }
+    return 1;
+}
+
+/* a DNS subdomain of Kubernetes' (a Secret's, a service account's name): 1 to
+ * 253 of a-z, 0-9, - and ., beginning and ending with a letter or digit */
+static bool node_dns_name(const char *s) {
+    size_t k = 0;
+    for (; s[k]; k++)
+        if (!((s[k] >= 'a' && s[k] <= 'z') || (s[k] >= '0' && s[k] <= '9') || s[k] == '-' || s[k] == '.'))
+            return false;
+    return k > 0 && k <= 253 && s[0] != '-' && s[0] != '.' && s[k - 1] != '-' && s[k - 1] != '.';
+}
+
+/* a key of a ConfigMap's: 1 to 253 of a-z, A-Z, 0-9, -, _ and ., not . or .. */
+static bool node_cm_key(const char *s) {
+    size_t k = 0;
+    for (; s[k]; k++)
+        if (!((s[k] >= 'a' && s[k] <= 'z') || (s[k] >= 'A' && s[k] <= 'Z') || (s[k] >= '0' && s[k] <= '9') ||
+              s[k] == '-' || s[k] == '_' || s[k] == '.'))
+            return false;
+    return k > 0 && k <= 253 && strcmp(s, ".") && strcmp(s, "..");
+}
+
+static bool node_hex64(const char *s) {
+    size_t k = 0;
+    for (; s[k]; k++) if (!strchr("0123456789abcdef", s[k])) return false;
+    return k == 64;
+}
+
 /* The rest of the container's state (its pid and pidfd are the listener's,
  * node_admit). 0, or -1 with why. */
 static int node_state(const char *doc, size_t n, char *why, size_t wn) {
@@ -221,6 +271,33 @@ static int node_state(const char *doc, size_t n, char *why, size_t wn) {
             snprintf(why, wn, "the container's varek.dev/on-behalf-of is not a Secret's name");
             return -1;
         }
+    }
+    /* v1.36 step 7: the dry run, the trust bundle, the flow policy's hash and
+     * the service account, each the plugin's */
+    char dv[8];
+    int r = node_own(doc, n, "varek.dev/dry-run", dv, sizeof dv);
+    if (r < 0 || (r == 1 && strcmp(dv, "true"))) {
+        snprintf(why, wn, "the container's varek.dev/dry-run is not \"true\"");
+        return -1;
+    }
+    g_nr.dry = r == 1;
+    if ((r = node_own(doc, n, "varek.dev/trust-bundle", g_nr.trust, sizeof g_nr.trust)) < 0 ||
+        (r == 1 && !node_cm_key(g_nr.trust))) {
+        g_nr.trust[0] = '\0';
+        snprintf(why, wn, "the container's varek.dev/trust-bundle is not a ConfigMap's key");
+        return -1;
+    }
+    if ((r = node_own(doc, n, "varek.dev/flow-sha256", g_nr.flow_sha, sizeof g_nr.flow_sha)) < 0 ||
+        (r == 1 && !node_hex64(g_nr.flow_sha))) {
+        g_nr.flow_sha[0] = '\0';
+        snprintf(why, wn, "the container's varek.dev/flow-sha256 is not a SHA-256 (64 hex digits)");
+        return -1;
+    }
+    if ((r = node_own(doc, n, "varek.dev/service-account", g_nr.sa, sizeof g_nr.sa)) < 0 ||
+        (r == 1 && !node_dns_name(g_nr.sa))) {
+        g_nr.sa[0] = '\0';
+        snprintf(why, wn, "the container's varek.dev/service-account is not a service account's name");
+        return -1;
     }
     return 0;
 }
@@ -329,6 +406,29 @@ static int node_plan(const char *doc, size_t n, const char **plan_path, char *wh
     return 0;
 }
 
+/* v1.36 step 7 (D7b): the flow policy of the pod's VarekPolicy, which the
+ * plugin's sync writes as POLICY_DIR/<pod's namespace>/<policy>.flow, held
+ * to the SHA-256 of the one the plugin checked (varek.dev/flow-sha256). None:
+ * *flow_path stays NULL. 0, or -1 with why. */
+static int node_flow(const char **flow_path, char *why, size_t wn) {
+    if (!g_nr.flow_sha[0]) return 0;
+    if (!g_node_policies || !g_nr.policy[0]) {
+        snprintf(why, wn, "the container names a flow policy, and this node agent has one policy, not a directory of "
+                 "policies");
+        return -1;
+    }
+    static char path[PATH_MAX];
+    struct stat st;
+    snprintf(path, sizeof path, "%s/%s/%s.flow", g_node_policies, g_nr.pod_ns, g_nr.policy);
+    int e = lstat(path, &st) < 0 ? errno : 0;
+    if (e || !S_ISREG(st.st_mode)) {
+        snprintf(why, wn, "no flow policy for policy %s (%.300s: %s)", g_nr.policy, path, e ? strerror(e) : "not a file");
+        return -1;
+    }
+    *flow_path = path;
+    return 0;
+}
+
 /* v1.34 step 5 (D8): the policy the container runs under, copied beside its
  * stream (DIR/<container>.<supervisor>.policy, root's, read-only) and loaded
  * from there, so the run's evidence holds the policy as it was, whatever the
@@ -374,8 +474,8 @@ static int node_copy(int sd, const char *streams, const char *base, const char *
     if (dst >= 0) close(dst);
     free(b);
     if (!ok) { snprintf(why, wn, "cannot copy the %s beside the stream (%s)", what, strerror(errno)); return -1; }
-    static char copies[2][PATH_MAX];                  /* the policy's, the plan's: each its own */
-    char *copy = copies[strcmp(what, "plan") == 0];
+    static char copies[3][PATH_MAX];                  /* the policy's, the plan's, the flow policy's */
+    char *copy = copies[!strcmp(what, "plan") ? 1 : !strcmp(what, "flow policy") ? 2 : 0];
     snprintf(copy, PATH_MAX, "%s/%s", streams, cname);
     *policy_path = copy;
     return 0;
@@ -776,15 +876,13 @@ static const char *node_policy_why(const struct policy *p) {
     return NULL;
 }
 
-static const char *node_unsupported(const struct policy *p, bool dry, const char *plan, const char *flow,
-                                    const char *obo, const char *svid, const char *trust) {
-    if (dry) return "a dry run";
-    (void)plan;                                  /* v1.35 step 4c (D11): the pod's plan is carried */
-    if (flow) return "a flow policy";
+static const char *node_unsupported(const struct policy *p, const char *obo, const char *svid) {
+    /* v1.35 step 4c (D11): the pod's plan is carried; v1.36 step 7 (D6, D7,
+     * D7b): the dry run, the flow policy and the trust bundle, each the pod's
+     * VarekPolicy's (node_inputs) */
     /* v1.36 step 6 (D5): each pod names its own user's token, and the SVID is
      * its pod's, from SPIRE (node_obo); not one for every container */
     if (obo || svid) return "--on-behalf-of or --agent-svid given to the node agent itself";
-    if (trust) return "a trust bundle";
     if (p->v.launches && !g_nr.launcher)
         return "decided launches without the launcher (" NODE_LAUNCHER " first in the command: the NRI plugin)";
     return node_policy_why(p);
@@ -1159,6 +1257,52 @@ static void node_obo(const struct policy *p, const char **obo, const char **svid
     }
 }
 
+/* v1.36 step 7 (D6, D7, D7b): what the pod's VarekPolicy says beyond its
+ * policy, from the plugin's annotations, as the Warden takes it on a host:
+ * the dry run (--dry-run); the trust bundle, the key of that name in the
+ * ConfigMap mounted at --node-trust-bundles DIR (--trust-bundle DIR/KEY,
+ * read by trust_setup in the node's view, before the container's is
+ * entered); and for a flow policy the breaker's table under
+ * --node-flow-state DIR (the node's, a host path, as the streams are: the
+ * budget bounds each node) and its session, the pod's namespace and service
+ * account (namespace/name), which the plugin takes from the API server and
+ * the pod's author does not choose. node_fail on what refuses the start. */
+static const char *g_node_trust_dir;               /* --node-trust-bundles */
+static const char *g_node_flow_state;              /* --node-flow-state */
+static void node_inputs(const char *flow_path, const char **session, const char **state) {
+    static char tb[PATH_MAX], sess[160], st[PATH_MAX];
+    if (g_nr.dry) g_dry = true;
+    if (g_nr.trust[0]) {
+        if (!g_node_trust_dir)
+            node_fail("its policy names a trust bundle (varek.dev/trust-bundle), and the node agent was given no "
+                      "directory of them (--node-trust-bundles: the chart's trustBundles.configMap)");
+        if ((size_t)snprintf(tb, sizeof tb, "%s/%s", g_node_trust_dir, g_nr.trust) >= sizeof tb)
+            node_fail("the trust bundle's path is too long");
+        struct stat ts;
+        int e = stat(tb, &ts) < 0 ? errno : 0;
+        if (e || !S_ISREG(ts.st_mode)) {
+            char why[PATH_MAX + 160];
+            snprintf(why, sizeof why, "its trust bundle %.253s is not in the node's ConfigMap (%.300s: %s)", g_nr.trust,
+                     tb, e ? strerror(e) : "not a file");
+            node_fail(why);
+        }
+        g_trust_bundle_arg = tb;
+    }
+    if (!flow_path) return;
+    if (!g_nr.sa[0] || !node_label(g_nr.pod_ns))
+        node_fail("its policy has a flow policy, and the container names no service account (varek.dev/service-account, "
+                  "the NRI plugin's from the API server): the breaker's session");
+    if ((size_t)snprintf(sess, sizeof sess, "%s/%s", g_nr.pod_ns, g_nr.sa) > 128)
+        node_fail("the breaker's session (the pod's namespace/service account) is longer than 128 characters");
+    *session = sess;
+    if (!g_node_flow_state)
+        node_fail("its policy has a flow policy, and the node agent was given no directory for the breaker's table "
+                  "(--node-flow-state: the chart's flowPolicy.stateDir)");
+    if ((size_t)snprintf(st, sizeof st, "%s/breaker.state", g_node_flow_state) >= sizeof st)
+        node_fail("--node-flow-state: the path is too long");
+    *state = st;
+}
+
 /* The listener's live supervisors, each with its container's init (review:
  * a supervisor that ends any way, killed or crashed too, ends its container,
  * which may not go on unsupervised) */
@@ -1256,7 +1400,7 @@ static ssize_t node_receive(int c, char *buf, size_t cap, int *fds, int *nfd) {
  * set up to continue the Warden's start as for a run) and -1 if the listener
  * cannot be made; the node agent itself never returns otherwise. */
 static int node_listen(const char *sock_path, const char *streams, const char *launcher, const char **policy_path,
-                       const char **plan_path) {
+                       const char **plan_path, const char **flow_path) {
     int sd = open(streams, O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (sd < 0) { fprintf(stderr, "[warden] --node-streams %s: %s\n", streams, strerror(errno)); return -1; }
     /* v1.34 step 3: a directory of policies, chosen by name per container,
@@ -1400,6 +1544,9 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
             ok = node_copy(sd, streams, sbase, "plan", ".plan", g_nr.plan_sha, plan_path, why, sizeof why);
             g_hold_req = true;                  /* D11: a pod's plan holds its run (D2) */
         }
+        if (ok == 0) ok = node_flow(flow_path, why, sizeof why);                          /* v1.36 step 7 */
+        if (ok == 0 && *flow_path)
+            ok = node_copy(sd, streams, sbase, "flow policy", ".flow", g_nr.flow_sha, flow_path, why, sizeof why);
         close(sd);
         if (ok == 0) ok = node_config(why, sizeof why);
         if (ok == 0) ok = node_process(why, sizeof why);
@@ -1564,7 +1711,10 @@ static int node_set_view(char *why, size_t wn) {
     size_t len = 0;
     FILE *f = open_memstream(&buf, &len);
     if (!f) { snprintf(why, wn, "out of memory"); return -1; }
-    for (size_t k = 0; k < g_exec_n + g_exec_nalias; k++) {
+    /* v1.36 step 7 (D6): a dry run's set is / alone (Landlock's rule is
+     * beneath a directory: every file), as a host's dry run applies none */
+    if (g_dry) fputs("/\n", f);
+    for (size_t k = 0; !g_dry && k < g_exec_n + g_exec_nalias; k++) {
         const char *pk = k < g_exec_n ? g_exec_rs[k].path : g_exec_alias[k - g_exec_n];
         bool dup = false;
         for (size_t j = 0; j < k && !dup; j++) dup = !strcmp(j < g_exec_n ? g_exec_rs[j].path : g_exec_alias[j - g_exec_n], pk);
@@ -1675,24 +1825,34 @@ static int node_supervise(const struct policy *p, const char *boot_path, const c
      * policy, by which the calls the pod's filter notifies for the runtime
      * are answered once the command runs */
     char why[600];
-    if (wd_filter_bpf(p->v.open_as_agent ? WD_FILTER_CHANGES : 0, &g_nr.bpf, &g_nr.nbpf) < 0)
+    /* v1.36 step 7 (D6): a dry run's, as the plugin's (--oci-filter --dry-run):
+     * a call outside the allowlist is notified, and goes to the kernel */
+    if (wd_filter_bpf((p->v.open_as_agent ? WD_FILTER_CHANGES : 0) | (g_dry ? WD_FILTER_DRY : 0), &g_nr.bpf,
+                      &g_nr.nbpf) < 0)
         node_fail("cannot compile the Warden's filter for the policy");
     if (g_nr.launcher && node_launcher_check(why, sizeof why) < 0) node_fail(why);
-    if (p->v.launches && node_d4(why, sizeof why) < 0) node_fail(why);
+    /* v1.36 step 7 (D6): a dry run holds no launch, as on a host (no
+     * Landlock, no noexec mounts: the plugin adds none), so D4 is not held */
+    if (p->v.launches && !g_dry && node_d4(why, sizeof why) < 0) node_fail(why);
     if (g_nr.launcher) {
         g_exec_rules_off = !p->v.launches;      /* the command alone, when the policy decides no launch */
         if (exec_ruleset_build(p, boot_path) < 0 || (p->v.launches && exec_confined_checks(p) < 0))
             node_fail("the launch set cannot be built (above)");
         if (g_ll_abi < 1)
             node_fail("the node has no Landlock: the launcher could not hold the container to its launch set");
-        if (p->v.launches) {
+        if (p->v.launches && !g_dry) {
             if (noexec_build(p, boot_path) < 0) node_fail("the directories the agent may write (above)");
             if (g_nxi_n)
                 node_fail("a program the policy allows to launch is under a directory it may write: kept executable "
                           "on a host, it cannot be in a pod (D4: every writable mount noexec)");
         }
         if (node_set_view(why, sizeof why) < 0) node_fail(why);
-        fprintf(stderr, "[warden] launch set: %zu files, held by the launcher's Landlock (ABI %d)\n", g_exec_n, g_ll_abi);
+        if (g_dry)
+            fprintf(stderr, "[warden] launch set: %zu files, decided and recorded; not held (dry run: the launcher's "
+                    "Landlock is given /, every file)\n", g_exec_n);
+        else
+            fprintf(stderr, "[warden] launch set: %zu files, held by the launcher's Landlock (ABI %d)\n", g_exec_n,
+                    g_ll_abi);
     }
     /* the pod's network namespace is the Warden's own now: both held, the
      * same, so a socket made "in the agent's" and the stub resolver's are the
@@ -1712,9 +1872,15 @@ static int node_supervise(const struct policy *p, const char *boot_path, const c
      * set; refused, the container ends; passed, the run is held to it (D2) */
     if (plan_path) {
         g_hold_collect = true;
-        if (warden_verify_plan_parsed(plan, plan_err, plan_path, p, true) != 0) {
-            emit_run_end(1);
-            node_fail("its plan is refused (the plan_step and plan_gate records above)");
+        /* v1.36 step 7 (D7b): with a flow policy, its gate and breaker, the
+         * node's table (node_inputs), as on a host */
+        int gate = g_flow_cfg ? warden_gate_plan_flow_parsed(plan, plan_err, plan_path, p)
+                              : warden_verify_plan_parsed(plan, plan_err, plan_path, p, true);
+        if (gate != 0) {
+            emit_run_end(g_flow_cfg ? gate : 1);
+            node_fail(g_flow_cfg ? "its plan is refused by its flow policy's gate (the plan_gate record above; the "
+                                   "breaker counts the refusal)"
+                                 : "its plan is refused (the plan_step and plan_gate records above)");
         }
         g_hold_collect = false;
         g_hold_on = true;
