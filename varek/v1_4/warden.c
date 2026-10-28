@@ -5853,6 +5853,9 @@ static void usage(const char *argv0) {
         "               the flow policies' breaker table)\n"
         "              [--node-stream-rotate <bytes>]   (v1.36: each stream goes on in a new segment,\n"
         "               <container>.<supervisor>.jsonl.2, .3, ..., past this size; the audit takes them in order)\n"
+        "              [--node-name <node> [--node-key <file> [--node-key-pub <file>]]]   (v1.36: the node's name in\n"
+        "               each run_start; the node's own signing key, made at the first start, and where its public key\n"
+        "               is written, <file>.pub by default)\n"
         "       %s <policy.txt> --oci-filter [--plan PLAN | --no-plan]   (v1.34: the policy's filter in OCI's form, for the\n"
         "              NRI plugin; v1.35: with the pod's plan, or for a pod that names none)\n"
         "              [--credential-list FILE --pod-namespace NS]   (v1.36: the cluster's VarekCredential resources)\n"
@@ -6037,6 +6040,7 @@ int main(int argc, char **argv) {
     int sep_idx = -1;
     const char *node_sock = NULL, *node_streams = NULL;                     /* v1.34 step 2 */
     const char *rotate_arg = NULL;                                          /* v1.36 (D9) */
+    const char *node_key_arg = NULL, *node_key_pub_arg = NULL;              /* v1.36 step 9 (D10) */
     const char *node_launcher = NULL;                                       /* v1.34 step 3 */
     /* v1.36 step 4 (D1, D2): the directory a file: store must be under (the
      * chart's Secrets); --oci-filter's cluster list of VarekCredential
@@ -6088,6 +6092,12 @@ int main(int argc, char **argv) {
             g_node_flow_state = argv[++i];
         } else if (strcmp(argv[i], "--node-stream-rotate") == 0 && !rotate_arg && i + 1 < argc) {  /* v1.36 (D9) */
             rotate_arg = argv[++i];
+        } else if (strcmp(argv[i], "--node-key") == 0 && !node_key_arg) {             /* v1.36 step 9 (D10) */
+            node_key_arg = argv[++i];
+        } else if (strcmp(argv[i], "--node-name") == 0 && !g_node_name) {
+            g_node_name = argv[++i];
+        } else if (strcmp(argv[i], "--node-key-pub") == 0 && !node_key_pub_arg) {
+            node_key_pub_arg = argv[++i];
         } else if (strcmp(argv[i], "--credential-list") == 0 && !cred_list_arg) {
             cred_list_arg = argv[++i];
         } else if (strcmp(argv[i], "--pod-namespace") == 0 && !pod_ns_arg) {
@@ -6246,6 +6256,8 @@ int main(int argc, char **argv) {
         (node_sock && (obo_arg || svid_arg || obo_exp_arg)) ||     /* step 6: each pod names its own */
         ((g_node_trust_dir || g_node_flow_state) && !node_sock) ||  /* step 7: so the dry run, trust bundle, */
         (rotate_arg && !node_sock) ||                               /* step 8 (D9) */
+        ((node_key_arg || g_node_name) && !node_sock) || (node_key_arg && (key_path || !g_node_name)) ||  /* step 9 */
+        (node_key_pub_arg && !node_key_arg) ||
         (node_sock && (g_dry || g_trust_bundle_arg || session_arg || state_arg || gstatus_arg))) {   /* flow */
         fprintf(stderr, "[warden] --node-agent takes --node-streams DIR, and no agent (\"--\"), check, plan (each "
                 "pod names its own, v1.35) or --writable-exec (a pod's mounts are checked, D4); --node-launcher "
@@ -6256,7 +6268,8 @@ int main(int argc, char **argv) {
                 "varek.dev/on-behalf-of, and its SVID is its own, from SPIRE); --node-trust-bundles and "
                 "--node-flow-state with --node-agent, and not --dry-run, --trust-bundle, --session, "
                 "--breaker-state or --gate-status (each pod's VarekPolicy says them); --node-stream-rotate "
-                "with --node-agent\n");
+                "with --node-agent; --node-key and --node-name with --node-agent, --node-key with --node-name and "
+                "not --sign-key (it is the node's signing key), --node-key-pub with --node-key\n");
         return 2;
     }
     if (rotate_arg) {                       /* v1.36 (D9): a segment's size, 64 KiB or more */
@@ -6269,6 +6282,15 @@ int main(int argc, char **argv) {
             return 2;
         }
         g_rotate = v;
+    }
+    if (g_node_name && !node_name_ok(g_node_name)) {                     /* v1.36 step 9 (D10) */
+        fprintf(stderr, "[warden] --node-name takes the node's name as Kubernetes has it (1 to 253 of a-z, 0-9, . "
+                "and -, beginning and ending with a letter or digit)\n");
+        return 2;
+    }
+    if (node_key_arg) {                     /* made, or read, once; each supervisor signs with it */
+        if (node_key_prepare(node_key_arg, node_key_pub_arg, anchor_path) < 0) return 1;
+        key_path = node_key_arg;
     }
     if (node_sock && node_listen(node_sock, node_streams, node_launcher, &policy_path, &plan_path, &flow_path) < 0)
         return 1;

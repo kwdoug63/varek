@@ -68,6 +68,14 @@
 //	                  MutatingWebhookConfiguration's); /pod holds the pod to
 //	                  them.
 //
+// v1.36 step 9 (D10): a key for each node.
+//
+//	/vareknodekey     a VarekNodeKey made only by the node agent's service
+//	                  account (-node-agent-sa), from the node it names (the
+//	                  node's name the API server gives for its token), named
+//	                  for its node and key; never changed; removed by anyone
+//	                  but a node.
+//
 // Each answer that refuses says why; the API server shows it to whoever
 // applied the object.
 //
@@ -77,7 +85,7 @@
 //
 //	varek-admission -warden FILE -tls-cert FILE -tls-key FILE [-listen :8443]
 //	                [-runtime-classes NAME,...] [-credentials-dir DIR]
-//	                [-obo-image REF] [-obo-user UID]
+//	                [-obo-image REF] [-obo-user UID] [-node-agent-sa USER]
 package main
 
 import (
@@ -129,7 +137,18 @@ type request struct {
 	Operation string          `json:"operation"`
 	Object    json.RawMessage `json:"object"`
 	OldObject json.RawMessage `json:"oldObject"`
+	// v1.36 step 9 (D10): who asked (a node's key is admitted only from its node)
+	UserInfo userInfo `json:"userInfo"`
 }
+
+type userInfo struct {
+	Username string              `json:"username"`
+	Extra    map[string][]string `json:"extra"`
+}
+
+// the node a service account's token was given on (the kubelet binds a pod's
+// token to the pod and its node, and the API server says the node's name here)
+const nodeNameExtra = "authentication.kubernetes.io/node-name"
 
 type response struct {
 	UID     string  `json:"uid"`
@@ -226,6 +245,10 @@ type server struct {
 	// the platform's, as OpenShift's restricted-v2 gives one)
 	oboImage string
 	oboUser  int64
+	// v1.36 step 9 (D10): the node agent's service account
+	// (system:serviceaccount:NAMESPACE:NAME), the only one whose VarekNodeKey
+	// is admitted, and only for the node its token was given on
+	nodeAgent string
 
 	mu    sync.Mutex
 	cache map[[32]byte]checked // by the SHA-256 of what was checked (W2): the policy, and the pod's plan
@@ -469,6 +492,47 @@ func (s *server) varekCredential(_ context.Context, req *request) string {
 			return fmt.Sprintf("a file: source is a file under %s, the node agent's credentials directory (the chart's "+
 				"Secrets; D1), named plainly (it is %s)", s.credDir, src)
 		}
+	}
+	return ""
+}
+
+// v1.36 step 9 (D10): a VarekNodeKey is made only by the node agent's
+// plugin on the node it names (the node's name in its token), as the key
+// that node agent made; it is never changed; and it is removed only by
+// someone else (a cluster administrator), never by a node
+func (s *server) varekNodeKey(_ context.Context, req *request) string {
+	if req.Operation == "DELETE" {
+		if s.nodeAgent != "" && req.UserInfo.Username == s.nodeAgent {
+			return "a node does not remove a node's key (a cluster administrator does)"
+		}
+		return ""
+	}
+	var k kube.NodeKey
+	if err := json.Unmarshal(req.Object, &k); err != nil {
+		return "the VarekNodeKey does not read: " + err.Error()
+	}
+	if why := kube.NodeKeyProblem(&k); why != "" {
+		return why
+	}
+	if req.Operation == "UPDATE" {
+		var old kube.NodeKey
+		if err := json.Unmarshal(req.OldObject, &old); err != nil {
+			return "the VarekNodeKey's old object does not read: " + err.Error()
+		}
+		if old.Spec != k.Spec {
+			return "a node's key is not changed: a new key is a new VarekNodeKey (the one before is kept for the streams it signed)"
+		}
+		return ""
+	}
+	if s.nodeAgent == "" {
+		return "this webhook was not given the node agent's service account (-node-agent-sa): it admits no node's key"
+	}
+	if req.UserInfo.Username != s.nodeAgent {
+		return fmt.Sprintf("a node's key is published only by the node agent (%s), not %s", s.nodeAgent, req.UserInfo.Username)
+	}
+	if n := req.UserInfo.Extra[nodeNameExtra]; len(n) != 1 || n[0] != k.Spec.Node {
+		return fmt.Sprintf("a node's key is published only from that node: the token was given on %s, the key names %s "+
+			"(a cluster whose service account tokens do not name their node admits none)", strings.Join(n, ","), k.Spec.Node)
 	}
 	return ""
 }
@@ -721,6 +785,7 @@ func (s *server) mux() *http.ServeMux {
 	m.HandleFunc("/varekpolicy", s.handle(s.varekPolicy))
 	m.HandleFunc("/varekplan", s.handle(s.varekPlan))             // v1.35 step 4c
 	m.HandleFunc("/varekcredential", s.handle(s.varekCredential)) // v1.36 step 4
+	m.HandleFunc("/vareknodekey", s.handle(s.varekNodeKey))       // v1.36 step 9
 	m.HandleFunc("/pod", s.handle(s.pod))
 	m.HandleFunc("/pod-required", s.handle(func(ctx context.Context, r *request) string {
 		var p pod
@@ -791,6 +856,8 @@ func main() {
 	oboImage := flag.String("obo-image", "", "v1.36: the image of the init container a pod acting for a user is given (the "+
 		"node image, by digest)")
 	oboUser := flag.Int64("obo-user", oboNobody, "v1.36: its user and group (0: the platform's, as on OpenShift)")
+	nodeAgent := flag.String("node-agent-sa", "", "v1.36: the node agent's service account (system:serviceaccount:NS:NAME): "+
+		"a VarekNodeKey is admitted only from it, for the node its token was given on")
 	flag.Parse()
 	if !strings.HasPrefix(*wardenPath, "/") || *cert == "" || *key == "" {
 		fmt.Fprintln(os.Stderr, "varek-admission: give -warden (an absolute path), -tls-cert and -tls-key")
@@ -804,6 +871,7 @@ func main() {
 	s := newServer(*wardenPath, c, *classes)
 	s.credDir = *credDir
 	s.oboImage, s.oboUser = *oboImage, *oboUser
+	s.nodeAgent = *nodeAgent
 	cf := &certFiles{cert: *cert, key: *key}
 	if _, err := cf.get(nil); err != nil {
 		fmt.Fprintln(os.Stderr, "varek-admission: the certificate:", err)

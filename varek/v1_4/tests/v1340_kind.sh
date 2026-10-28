@@ -6,7 +6,8 @@
 # cluster (containerd 2.2 or later, NRI on) with the node image, and checked
 # as a cluster runs it:
 #   1. the chart installs and its node agent, plugin, exporter and webhook
-#      are ready; the node's signing key and anchor given;
+#      are ready; the anchor given; the node agent makes the node's key and
+#      the plugin publishes it as the node's VarekNodeKey (v1.36 step 9);
 #   2. the webhook (a real API server's calls): a VarekPolicy the Warden
 #      does not load, and one naming a credential no VarekCredential gives,
 #      refused at deploy with the Warden's reason; a policy
@@ -23,7 +24,8 @@
 #      one it does not, a copy written to its volume (noexec) and launched;
 #      a pod naming no policy left as it is;
 #   4. the evidence: the pod's stream on the node, signed with the node's
-#      key and anchored, verified by the audit; the exporter's OCSF events
+#      key and anchored, verified by the audit (with the cluster's
+#      VarekNodeKey list, --node-keys); the exporter's OCSF events
 #      in its log;
 #   5. the policy changed: written to the node again, and a new pod run
 #      under the new one; the policy deleted: removed from the node;
@@ -63,6 +65,14 @@
 #      from the API server), one it refuses ended and counted in the node's
 #      table; a pod's trust bundle, the chart's ConfigMap's key, the roots
 #      run_start records.
+#  11. a key for each node (v1.36 step 9, D10): the node's key root's and
+#      0400 on the node, its public key the VarekNodeKey's; a VarekNodeKey
+#      made by an administrator, or by the node agent's account with a
+#      token naming no node, refused; the key changed, or removed by the
+#      node agent's account, refused; the node rebuilt (its key gone): a
+#      new key made and published, the old VarekNodeKey kept; a pod's
+#      stream after it verified with the new key, and section 4's, signed
+#      before, still verified with the old one.
 #
 #   varek/v1_4/tests/v1340_kind.sh --image IMAGE [--out DIR] [--keep]
 #                                  [--node-image kindest/node:TAG]
@@ -70,7 +80,7 @@
 #
 # IMAGE is the node image (packaging/container/Containerfile --target node),
 # built where this runs. Needs docker, kind, kubectl, helm, python3 and this
-# checkout's tools/varek_keygen and tools/vdp_cert_check (make all). The
+# checkout's tools/vdp_cert_check (make all). The
 # summary is DIR/summary.txt (default /var/tmp/varek-kind); everything else
 # is beside it. CI: .github/workflows/kubernetes.yml.
 #
@@ -104,7 +114,7 @@ TOOLS="docker kind kubectl helm python3"
 for t in $TOOLS; do
     command -v "$t" > /dev/null || { echo "v1340_kind.sh: $t is needed" >&2; exit 2; }
 done
-[ -x "$HERE/tools/varek_keygen" ] && [ -x "$HERE/tools/vdp_cert_check" ] ||
+[ -x "$HERE/tools/vdp_cert_check" ] ||
     { echo "v1340_kind.sh: build the tools first (make -C varek/v1_4 all)" >&2; exit 2; }
 POD_IMG=mirror.gcr.io/library/busybox:1.36
 CL=varek-ci N=varek-ci-control-plane NS=varek-system
@@ -199,11 +209,8 @@ else
     say "  node: $(on_node sh -c 'containerd --version | cut -d" " -f3; runc --version | head -1' | tr '\n' ' ')$(on_node uname -r)"
     kind load docker-image "$IMAGE" --name "$CL" > "$OUT/load.log" 2>&1 || { cat "$OUT/load.log"; exit 1; }
 fi
-"$HERE/tools/varek_keygen" "$OUT/node.key" > /dev/null
 kubectl create namespace "$NS" > /dev/null
 kubectl label namespace "$NS" pod-security.kubernetes.io/enforce=privileged > /dev/null
-kubectl -n "$NS" create secret generic varek-node-key --from-file=key="$OUT/node.key" \
-    --from-file=key.pub="$OUT/node.key.pub" > /dev/null
 # section 7's credential: a value made here, in a Secret the chart mounts in
 # the node agent (credentials.secrets)
 CRED_VAL="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
@@ -223,12 +230,27 @@ REPO="${IMAGE%:*}" TAG="${IMAGE##*:}"
 check "the chart installs, its pods ready (the node agent, the plugin, the exporter, the webhook)" \
     helm install varek "$ROOT/packaging/helm/varek" -n "$NS" --wait --timeout 6m \
     --set image.repository="$REPO" --set image.tag="$TAG" --set image.pullPolicy=Never \
-    --set signing.secretName=varek-node-key --set signing.checkpointEvery=8 --set anchor.enabled=true \
+    --set signing.checkpointEvery=8 --set anchor.enabled=true \
     --set admission.replicas=1 --set runtime="$CHART_RT" --set 'credentials.secrets={varek-test-cred}' \
     --set onBehalfOf.issuerCaConfigMap=kube-root-ca.crt --set trustBundles.configMap=varek-test-roots
 for _ in $(seq 60); do grep -q '^varek-nri: runtime' <(kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null) && break; sleep 2; done
 say "  plugin: $(kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null | grep -m1 '^varek-nri: runtime' || echo 'NOT registered')"
 check "the plugin registered with the node's runtime (NRI)" sh -c "kubectl -n '$NS' logs ds/varek-node -c plugin | grep -q '^varek-nri: runtime'"
+# v1.36 step 9 (D10): the node's own key, published as its VarekNodeKey; the
+# cluster's list, as an auditor fetches it, for every audit here
+NODE="$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')"
+keys_of() {   # FILE: the cluster's VarekNodeKey list into FILE; how many it holds for the node
+    kubectl get vareknodekeys -o json > "$1" 2>/dev/null
+    python3 -c 'import json,sys; print(sum(1 for i in json.load(open(sys.argv[1]))["items"] if i["spec"]["node"] == sys.argv[2]))' "$1" "$NODE" 2>/dev/null
+}
+for _ in $(seq 60); do [ "$(keys_of "$OUT/node-keys.json")" = 1 ] && break; sleep 2; done
+NKPUB="$(on_node cat /var/lib/varek/key-pub/node.key.pub 2>/dev/null)"
+say "  node key: $NODE $NKPUB"
+check "the node agent made the node's key, and the plugin published it: the node's VarekNodeKey, its key the node's" \
+    python3 -c 'import json,sys
+items = [i for i in json.load(open(sys.argv[1]))["items"] if i["spec"]["node"] == sys.argv[2]]
+sys.exit(0 if len(items) == 1 and items[0]["spec"]["publicKey"] == sys.argv[3] and len(sys.argv[3]) == 64 and
+         items[0]["metadata"]["name"] == sys.argv[2] + "-" + sys.argv[3][:16] else 1)' "$OUT/node-keys.json" "$NODE" "$NKPUB"
 
 # the policy: v1340_crio.sh's, for busybox (its commands hardlinks of one
 # file, each named; each check launches its program)
@@ -388,7 +410,7 @@ check "... the policy copied beside it (root's, 0400), the stream root's (0600)"
     "on() { $NODE_EXEC stat -c '%u %a' \"/var/log/varek/\$(basename \"\$1\")\"; }; [ \"\$(on '$SA')\" = '0 600' ] && [ \"\$(on '${SA%.jsonl}.policy')\" = '0 400' ]"
 check "the audit verifies it: signed with the node's key, anchored, each decision under its policy" \
     python3 "$HERE/tools/varek_audit.py" --policy "${SA%.jsonl}.policy" --checker "$HERE/tools/vdp_cert_check" \
-    --pubkey "$OUT/node.key.pub" --anchor "$OUT/streams/anchor" "$SA"
+    --node-keys "$OUT/node-keys.json" --anchor "$OUT/streams/anchor" "$SA"
 RUN="$(python3 -c 'import json,sys; print([json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")][0]["run"])' "$SA" 2>/dev/null)"
 check "the anchor holds the run's checkpoints" grep -q "$RUN" "$OUT/streams/anchor"
 for _ in $(seq 30); do kubectl -n "$NS" logs ds/varek-node -c exporter 2>/dev/null | grep -q "$RUN" && break; sleep 2; done
@@ -558,7 +580,7 @@ sys.exit(0 if subs.get("reader#1") == cg + "/reader-1" and subs.get("files#1") =
          {"reader#1", "files#1"} <= settled else 1)
 EOF
 check "... and the audit verifies it" python3 "$HERE/tools/varek_audit.py" --policy "${SS%.jsonl}.policy" \
-    --checker "$HERE/tools/vdp_cert_check" --pubkey "$OUT/node.key.pub" "$SS"
+    --checker "$HERE/tools/vdp_cert_check" --node-keys "$OUT/node-keys.json" "$SS"
 
 echo "== 9. a pod acting for a user (v1.36 step 6: D5)"
 # the cluster's service account issuer: its discovery and keys read by
@@ -631,7 +653,7 @@ EOF
 check "... the token in no stream on the node" sh -c "! grep -rqF -- '${TOK##*.}' '$OUT/streams9'"
 check "... no copy of it left in the node agent's socket directory" sh -c "! $NODE_EXEC ls /run/varek-node | grep -q '\.obo\$'"
 check "... and the audit verifies the stream" python3 "$HERE/tools/varek_audit.py" --policy "${SO%.jsonl}.policy" \
-    --checker "$HERE/tools/vdp_cert_check" --pubkey "$OUT/node.key.pub" "$SO"
+    --checker "$HERE/tools/vdp_cert_check" --node-keys "$OUT/node-keys.json" "$SO"
 
 echo "== 10. the dry run, a flow policy and a trust bundle (v1.36 step 7: D6, D7, D7b)"
 vpx() {   # NAME TEXT SPEC: a VarekPolicy in team-a, SPEC its other fields (JSON)
@@ -694,7 +716,7 @@ SD="$(podstream pod-dry)"
 check "... run_start says a dry run; the connect's record a dry run's refusal (dry_run_refused)" streamhas "$SD" \
     'R[0].get("mode") == "dry_run" and any(r.get("action") == "net.connect" and r.get("dry_run_refused") is True and r.get("decision_final") == "DENY" and r.get("target", "").endswith(":443") for r in R)'
 python3 "$HERE/tools/varek_audit.py" --policy "${SD%.jsonl}.policy" --checker "$HERE/tools/vdp_cert_check" \
-    --pubkey "$OUT/node.key.pub" "$SD" > "$OUT/pod-dry.audit" 2>&1; arc=$?
+    --node-keys "$OUT/node-keys.json" "$SD" > "$OUT/pod-dry.audit" 2>&1; arc=$?
 check "... and the audit verifies it: a dry run, not enforced (exit 3)" sh -c \
     "[ $arc = 3 ] && grep -q 'VERIFIED: DRY RUN, NOT ENFORCED' '$OUT/pod-dry.audit'"
 # -- a flow policy (D7b): its breaker's table on the node, its session the pod's namespace and service account
@@ -759,6 +781,54 @@ check "the pod under it ran to its end, supervised" grep -q '^varek-init: Landlo
 streams10
 check "... run_start: inspecting mode's roots the ConfigMap's key, as the node agent reads it" streamhas "$(podstream pod-tb)" \
     'R[0].get("trust", {}).get("host_bundle", "").startswith("/etc/varek/trust-bundles/") and R[0]["trust"]["host_bundle"].endswith("/corp.pem") and R[0]["trust"]["host_bundle_sha256"] == "'"$(sha256sum "$OUT/roots.pem" | cut -c1-64)"'"'
+
+echo "== 11. a key for each node (v1.36 step 9: D10)"
+check "the node's key on the node: root's, 0400, in a directory root's alone; its public key apart, the VarekNodeKey's" sh -c \
+    "[ \"\$($NODE_EXEC stat -c '%u %a' /var/lib/varek/key/node.key)\" = '0 400' ] &&
+     [ \"\$($NODE_EXEC stat -c '%u %a' /var/lib/varek/key)\" = '0 700' ] && [ -n '$NKPUB' ] &&
+     [ \"\$($NODE_EXEC cat /var/lib/varek/key-pub/node.key.pub)\" = '$NKPUB' ]"
+FORGED="$(printf 'f%.0s' $(seq 64))"
+printf '{"apiVersion": "varek.dev/v1alpha1", "kind": "VarekNodeKey", "metadata": {"name": "%s"}, "spec": {"node": "%s", "publicKey": "%s"}}\n' \
+    "$NODE-${FORGED:0:16}" "$NODE" "$FORGED" > "$OUT/vnk-forged.json"
+refused "a VarekNodeKey made by a cluster administrator: refused (only the node agent publishes one)" \
+    "$OUT/vnk-forged.json" "published only by the node agent"
+check "... by the node agent's account, its token naming no node: refused (only from that node)" sh -c \
+    "! kubectl --as=system:serviceaccount:$NS:varek-node apply -f '$OUT/vnk-forged.json' > '$OUT/vnk-forged2.out' 2>&1 &&
+     grep -q 'published only from that node' '$OUT/vnk-forged2.out'"
+NK_NAME="$NODE-${NKPUB:0:16}"
+check "the node's key changed: refused" sh -c \
+    "! kubectl patch vareknodekey '$NK_NAME' --type merge -p '{\"spec\":{\"publicKey\":\"$FORGED\"}}' > '$OUT/vnk-patch.out' 2>&1 &&
+     grep -q 'is not changed' '$OUT/vnk-patch.out'"
+check "... removed by the node agent's account: refused, the key still there" sh -c \
+    "! kubectl --as=system:serviceaccount:$NS:varek-node delete vareknodekey '$NK_NAME' > /dev/null 2>&1 &&
+     kubectl get vareknodekey '$NK_NAME'"
+# the node rebuilt: its key gone, the node agent started again
+on_node rm -f /var/lib/varek/key/node.key
+kubectl -n "$NS" delete pod -l app.kubernetes.io/component=node --wait=true > /dev/null 2>&1
+kubectl -n "$NS" rollout status ds/varek-node --timeout=180s > /dev/null 2>&1
+for _ in $(seq 60); do [ "$(keys_of "$OUT/node-keys2.json")" = 2 ] && break; sleep 2; done
+NKPUB2="$(on_node cat /var/lib/varek/key-pub/node.key.pub 2>/dev/null)"
+say "  node key after the rebuild: $NODE $NKPUB2"
+check "the node rebuilt: a new key made and published as a new VarekNodeKey, the old one kept" \
+    python3 -c 'import json,sys
+keys = sorted(i["spec"]["publicKey"] for i in json.load(open(sys.argv[1]))["items"] if i["spec"]["node"] == sys.argv[2])
+sys.exit(0 if keys == sorted(sys.argv[3:5]) and sys.argv[3] != sys.argv[4] else 1)' "$OUT/node-keys2.json" "$NODE" "$NKPUB" "$NKPUB2"
+for _ in $(seq 60); do kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null | grep -q '^varek-nri: runtime' && break; sleep 2; done
+kubectl apply -f "$OUT/vp-busybox.json" > /dev/null 2>&1
+synced 'allow exec /bin/sleep' > /dev/null
+pod pod-k team-a busybox > "$OUT/pod-k.json"
+kubectl apply -f "$OUT/pod-k.json" > /dev/null 2>&1
+ran pod-k
+streams10
+SK="$(podstream pod-k)"
+check "a pod after the rebuild: its stream signed with the new key, verified with the cluster's list" sh -c \
+    "[ -n '$SK' ] && python3 '$HERE/tools/varek_audit.py' --policy '${SK%.jsonl}.policy' --checker '$HERE/tools/vdp_cert_check' \
+         --node-keys '$OUT/node-keys2.json' '$SK' > '$OUT/pod-k.audit' 2>&1 &&
+     grep -qF \"signed with node $NODE's key $NODE-${NKPUB2:0:16}, admitted \" '$OUT/pod-k.audit'"
+check "section 4's stream, signed before the rebuild: verified still, with the old key (retired after its run began)" sh -c \
+    "python3 '$HERE/tools/varek_audit.py' --policy '${SA%.jsonl}.policy' --checker '$HERE/tools/vdp_cert_check' \
+         --node-keys '$OUT/node-keys2.json' '$SA' > '$OUT/pod-a.audit2' 2>&1 &&
+     grep -q \"signed with node $NODE's key $NODE-${NKPUB:0:16}, admitted .*; retired at \" '$OUT/pod-a.audit2'"
 
 echo
 [ "$fail" = 0 ] && say "v1340_kind: PASS" || say "v1340_kind: FAIL"

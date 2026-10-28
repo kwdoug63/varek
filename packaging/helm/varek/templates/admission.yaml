@@ -130,6 +130,9 @@ spec:
             - {{ include "varek.image" . }}
             - -obo-user
             - {{ if .Values.openshift.enabled }}"0"{{ else }}{{ .Values.onBehalfOf.user | int64 | quote }}{{ end }}
+            # v1.36 step 9 (D10): a VarekNodeKey only from the node agent, for its own node
+            - -node-agent-sa
+            - system:serviceaccount:{{ .Release.Namespace }}:{{ include "varek.nodeName" . }}
           ports:
             - { name: https, containerPort: 8443 }
           readinessProbe:
@@ -186,13 +189,13 @@ metadata:
   {{- end }}
 webhooks:
   {{- $excluded := concat (list .Release.Namespace) .Values.admission.excludeNamespaces | uniq }}
-  {{- range $hook := list (dict "name" "varekpolicy" "path" "/varekpolicy" "resource" "varekpolicies") (dict "name" "varekplan" "path" "/varekplan" "resource" "varekplans") (dict "name" "varekcredential" "path" "/varekcredential" "resource" "varekcredentials") (dict "name" "pod" "path" "/pod") (dict "name" "pod-required" "path" "/pod-required") }}
+  {{- range $hook := list (dict "name" "varekpolicy" "path" "/varekpolicy" "resource" "varekpolicies") (dict "name" "varekplan" "path" "/varekplan" "resource" "varekplans") (dict "name" "varekcredential" "path" "/varekcredential" "resource" "varekcredentials") (dict "name" "vareknodekey" "path" "/vareknodekey" "resource" "vareknodekeys" "ops" (list "CREATE" "UPDATE" "DELETE") "failurePolicy" "Fail") (dict "name" "pod" "path" "/pod") (dict "name" "pod-required" "path" "/pod-required") }}
   - name: {{ $hook.name }}.varek.dev
     {{- if $hook.resource }}
     rules:
       - apiGroups: ["varek.dev"]
         apiVersions: ["v1alpha1"]
-        operations: ["CREATE", "UPDATE"]
+        operations: {{ toJson ($hook.ops | default (list "CREATE" "UPDATE")) }}
         resources: [{{ $hook.resource | quote }}]
     {{- else }}
     rules:
@@ -217,7 +220,9 @@ webhooks:
       {{- end }}
     admissionReviewVersions: ["v1"]
     sideEffects: None
-    failurePolicy: {{ $.Values.admission.failurePolicy }}
+    # v1.36 step 9 (D10): a node's key is admitted only through the webhook
+    # (it binds the key to the node it came from), so never without it
+    failurePolicy: {{ $hook.failurePolicy | default $.Values.admission.failurePolicy }}
     timeoutSeconds: {{ $.Values.admission.timeoutSeconds }}
   {{- end }}
 ---

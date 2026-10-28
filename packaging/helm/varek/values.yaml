@@ -65,10 +65,22 @@ node:
     containerd: /run/containerd
     cri-o: /run/containers
 
-# D8: each container's stream signed with the node's key, a Secret holding
-# `key` (tools/varek_keygen's private key) and `key.pub`; "" signs nothing
+# D8: each container's stream signed with the node's key. v1.36 step 9
+# (D10): each node agent makes its own key at its first start (nodeKey) and
+# keeps it on the node; the NRI plugin publishes its public key as the
+# node's VarekNodeKey, which the admission webhook admits only from that
+# node. Audit a stream with the cluster's list: varek_audit.py --node-keys
+# (kubectl get vareknodekeys -o json). secretName instead signs every node's
+# streams with one key, a Secret holding `key` (tools/varek_keygen's private
+# key) and `key.pub` (v1.34 D8); with neither, nothing is signed
 signing:
   secretName: ""
+  nodeKey:
+    enabled: true
+    # the key, root's, 0400, in a directory only the node agent mounts
+    dir: /var/lib/varek/key
+    # its public key, which the plugin and the exporter read
+    pubDir: /var/lib/varek/key-pub
   # a checkpoint every this many records (the Warden's --checkpoint-every)
   checkpointEvery: 256
 

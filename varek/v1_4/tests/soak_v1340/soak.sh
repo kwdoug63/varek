@@ -25,7 +25,7 @@
 #        [--openshift] [--ecr-pull-secret] [--out DIR] [--check-only DIR]
 #
 # Against the cluster kubectl's current context names, with helm and python3
-# where this runs, and this checkout's tools/varek_keygen and
+# where this runs, and this checkout's
 # tools/vdp_cert_check built (make -C varek/v1_4 all). --image is the node
 # image (packaging/container/Containerfile --target node) the nodes can
 # pull; --digest pins it. --openshift: CRI-O, the chart's SCCs, the agents'
@@ -69,7 +69,7 @@ fi
 [ -z "$DIGEST" ] || [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] ||
     { echo "soak.sh: --digest takes sha256: and 64 hex digits (the one docker push printed), not '$DIGEST'" >&2; exit 2; }
 for t in kubectl helm python3; do command -v "$t" > /dev/null || { echo "soak.sh: $t is needed" >&2; exit 2; }; done
-[ -x "$HERE/tools/varek_keygen" ] && [ -x "$HERE/tools/vdp_cert_check" ] ||
+[ -x "$HERE/tools/vdp_cert_check" ] ||
     { echo "soak.sh: build the tools first (make -C varek/v1_4 all)" >&2; exit 2; }
 OUT="${OUT:-/var/tmp/varek-soak-k8s-$(date +%Y%m%d-%H%M)}"
 [ -e "$OUT" ] && { echo "soak.sh: $OUT exists (give another --out)" >&2; exit 2; }
@@ -119,15 +119,11 @@ else
 fi
 
 # --- 2. the chart
-"$HERE/tools/varek_keygen" "$OUT/node.key" > /dev/null
 K create namespace "$NS" > /dev/null 2>&1
 K label namespace "$NS" --overwrite pod-security.kubernetes.io/enforce=privileged > /dev/null
-K -n "$NS" delete secret varek-node-key > /dev/null 2>&1
-K -n "$NS" create secret generic varek-node-key --from-file=key="$OUT/node.key" --from-file=key.pub="$OUT/node.key.pub" > /dev/null ||
-    die "the node key's Secret"
 REPO="${IMAGE%:*}" TAG="${IMAGE##*:}"
-SETS=(--set image.repository="$REPO" --set image.tag="$TAG" --set signing.secretName=varek-node-key
-      --set anchor.enabled=true)
+# v1.36 step 9 (D10): each node's own key (the chart's default), published as its VarekNodeKey
+SETS=(--set image.repository="$REPO" --set image.tag="$TAG" --set anchor.enabled=true)
 [ -n "$DIGEST" ] && SETS+=(--set image.digest="$DIGEST")
 [ "$OPENSHIFT" = 1 ] && SETS+=(--set runtime=cri-o --set openshift.enabled=true)
 if [ "$ECR_PULL" = 1 ]; then
@@ -390,7 +386,8 @@ for p in $(K -n "$NS" get pod -l app.kubernetes.io/component=node -o name); do
     K -n "$NS" logs "$p" -c node-agent > "$OUT/streams/$node.node-agent.log" 2>/dev/null
     K -n "$NS" logs "$p" -c plugin > "$OUT/streams/$node.plugin.log" 2>/dev/null
 done
-cp "$OUT/node.key.pub" "$OUT/streams/node.key.pub"
+# v1.36 step 9 (D10): each node signs with its own key; the cluster's list
+K get vareknodekeys -o json > "$OUT/node-keys.json" 2>/dev/null || say "soak.sh: the cluster's VarekNodeKey list was not read"
 say "collected; judging"
 python3 "$SOAK/soak_check.py" "$OUT" --tools "$HERE/tools" 2>&1 | tee -a "$LOG"
 exit "${PIPESTATUS[0]}"

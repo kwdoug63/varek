@@ -13,8 +13,10 @@ DIR/report.txt. The run passes when:
                 one for each turn of work
   streams       each agent pod's container has one stream on its node,
                 named by its pod, with its run_end; each audited
-                (tools/varek_audit.py: signed with the node key, anchored,
-                each decision under its policy)
+                (tools/varek_audit.py: signed with the node's own key as
+                the cluster's VarekNodeKey list holds it, v1.36 D10, or the
+                one key of a run before it; anchored; each decision under
+                its policy)
   exporter      each stream's run has the audit's event, passed, in the
                 exporter's log on its node
   VAREK's pods  the node agent, plugin, exporter and webhook containers not
@@ -185,11 +187,20 @@ def main():
     c(all(v["end"] for v in streams.values()), "each stream has its run_end",
       f"{sum(1 for v in streams.values() if not v['end'])} without")
     audit_bad = []
+    # v1.36 step 9 (D10): each node's own key, from the cluster's list; a run
+    # before it signed every node's streams with one key (node.key.pub)
+    nk = f"{d}/node-keys.json"
+    key = ["--node-keys", nk] if os.path.exists(nk) else ["--pubkey", f"{d}/node.key.pub"]
+    if os.path.exists(nk):
+        listed = collections.Counter(i["spec"]["node"] for i in json.load(open(nk)).get("items", []))
+        unkeyed = [n for n in meta["nodes"] if not listed.get(n)]
+        c(not unkeyed, "each node's key published (a VarekNodeKey for each node)",
+          f"{len(meta['nodes']) - len(unkeyed)} of {len(meta['nodes'])}" + (f"; none for {unkeyed}" if unkeyed else ""))
     for s, v in sorted(streams.items()):
         anchor = f"{d}/streams/{v['node']}/anchor"
         r = subprocess.run([sys.executable, os.path.join(a.tools, "varek_audit.py"), "--policy", s[:-6] + ".policy",
-                            "--checker", os.path.join(a.tools, "vdp_cert_check"), "--pubkey", f"{d}/node.key.pub",
-                            "--anchor", anchor] + segments(s), capture_output=True, text=True)
+                            "--checker", os.path.join(a.tools, "vdp_cert_check")] + key +
+                           ["--anchor", anchor] + segments(s), capture_output=True, text=True)
         v["audit"] = r.returncode == 0
         if r.returncode != 0:
             audit_bad.append((v["pod"], (r.stdout + r.stderr).strip().splitlines()[-1:]))

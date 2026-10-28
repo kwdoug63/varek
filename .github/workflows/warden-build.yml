@@ -119,6 +119,7 @@ jobs:
           python3 -m pytest -q tests
           python3 -m pytest -q varek/v1_4/tests/test_varek_bench.py   # varek bench: the parts that need no root
           python3 -m pytest -q varek/v1_4/tests/test_varek_audit_stream.py   # v1.36 (D9): the one-pass audit's running state
+          python3 -m pytest -q varek/v1_4/tests/test_varek_node_keys.py      # v1.36 (D10): a key for each node
           mkdir -p /tmp/ci_data /tmp/ci_key
           printf 'allow path /tmp/ci_data/\n' > /tmp/ci_policy.txt
           varek/v1_4/tools/varek_keygen /tmp/ci_key/log.key

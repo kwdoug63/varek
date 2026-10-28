@@ -95,7 +95,8 @@ def test_lint_strict():
 def test_the_default_render():
     docs = render()
     assert kinds(docs) == ["ClusterRole", "ClusterRole", "ClusterRoleBinding", "ClusterRoleBinding",
-                           "CustomResourceDefinition", "CustomResourceDefinition", "CustomResourceDefinition", "DaemonSet", "Deployment",
+                           "CustomResourceDefinition", "CustomResourceDefinition", "CustomResourceDefinition",
+                           "CustomResourceDefinition", "DaemonSet", "Deployment",
                            "MutatingWebhookConfiguration", "PodDisruptionBudget", "Secret",
                            "Service", "ServiceAccount", "ServiceAccount", "ValidatingWebhookConfiguration"]
     for d in docs:
@@ -216,6 +217,8 @@ def test_signing_and_the_anchor():
     assert "key" not in volumes(spec)
     spec = pod(render("signing.secretName=varek-key", "signing.checkpointEvery=64", "anchor.enabled=true"), "DaemonSet")
     agent, exporter = ctr(spec, "node-agent"), ctr(spec, "exporter")
+    # v1.36 step 9 (D10): one key for every node, in place of each node's own
+    assert "--node-key" not in agent["command"] and "node-key" not in volumes(spec)
     key = arg(agent, "--sign-key")
     # a file (subPath), not the Secret volume's link: the Warden opens its key O_NOFOLLOW
     m = mounts(agent)[key]
@@ -246,7 +249,7 @@ def test_the_webhook():
     vwc = one(docs, "ValidatingWebhookConfiguration")
     hooks = {h["name"]: h for h in vwc["webhooks"]}
     assert set(hooks) == {"varekpolicy.varek.dev", "varekplan.varek.dev", "varekcredential.varek.dev",
-                          "pod.varek.dev", "pod-required.varek.dev"}
+                          "vareknodekey.varek.dev", "pod.varek.dev", "pod-required.varek.dev"}
     secret = one(docs, "Secret")
     assert secret["type"] == "kubernetes.io/tls"
     svc = one(docs, "Service")
@@ -267,6 +270,13 @@ def test_the_webhook():
                                                             "operations": ["CREATE", "UPDATE"],
                                                             "resources": ["varekcredentials"]}]
     assert "namespaceSelector" not in hooks["varekcredential.varek.dev"]
+    # v1.36 step 9 (D10): the nodes' keys: made, changed and removed, each checked, never without the webhook
+    assert hooks["vareknodekey.varek.dev"]["rules"] == [{"apiGroups": ["varek.dev"], "apiVersions": ["v1alpha1"],
+                                                         "operations": ["CREATE", "UPDATE", "DELETE"],
+                                                         "resources": ["vareknodekeys"]}]
+    assert "namespaceSelector" not in hooks["vareknodekey.varek.dev"]
+    vwc = one(render("admission.failurePolicy=Ignore"), "ValidatingWebhookConfiguration")
+    assert {h["name"]: h["failurePolicy"] for h in vwc["webhooks"]}["vareknodekey.varek.dev"] == "Fail"
     for name in ("pod.varek.dev", "pod-required.varek.dev"):
         # G-3: an update is sent too (the annotation is not changed)
         assert hooks[name]["rules"][0]["operations"] == ["CREATE", "UPDATE"]
@@ -341,8 +351,10 @@ def test_rbac_reads_only():
     # v1.36 step 4 (D2): the node lists and watches the credentials; the webhook lists them
     cred = ["varekcredentials"]
     # v1.36 step 7 (D7b): the plugin gets a pod, for its service account (a flow policy's session)
+    # v1.36 step 9 (D10): it makes its node's key, and reads it back; changes or removes none
     assert rules == {"t-node": [{"apiGroups": ["varek.dev"], "resources": res, "verbs": ["get", "list", "watch"]},
                                 {"apiGroups": ["varek.dev"], "resources": cred, "verbs": ["get", "list", "watch"]},
+                                {"apiGroups": ["varek.dev"], "resources": ["vareknodekeys"], "verbs": ["get", "create"]},
                                 {"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}],
                      "t-admission": [{"apiGroups": ["varek.dev"], "resources": res, "verbs": ["get"]},
                                      {"apiGroups": ["varek.dev"], "resources": cred, "verbs": ["list"]}]}
@@ -568,6 +580,53 @@ def test_stream_rotation():
     assert arg(agent, "--node-stream-rotate") == "1073741824"
     agent = ctr(pod(render("streams.rotateBytes=0"), "DaemonSet"), "node-agent")
     assert "--node-stream-rotate" not in agent["command"]
+
+
+def test_node_keys():
+    """v1.36 step 9 (D10): each node agent makes its own key, in a directory
+    only it mounts; its public key, apart, read by the plugin (which
+    publishes it as the node's VarekNodeKey) and the exporter (which pins
+    it); the webhook told the node agent's service account"""
+    docs = render("anchor.enabled=true")
+    spec = pod(docs, "DaemonSet")
+    agent, plugin, exporter = (ctr(spec, n) for n in ("node-agent", "plugin", "exporter"))
+    key, pub = arg(agent, "--node-key"), arg(agent, "--node-key-pub")
+    assert key == "/var/lib/varek/key/node.key" and pub == "/var/lib/varek/key-pub/node.key.pub"
+    assert host_path(spec, agent, key) == key and host_path(spec, agent, pub) == pub
+    assert arg(agent, "--node-name") == "$(NODE_NAME)" and "--sign-key" not in agent["command"]
+    assert arg(agent, "--checkpoint-every") == "256"
+    for c in (agent, plugin):
+        assert {"name": "NODE_NAME", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}} in c["env"]
+    assert arg(plugin, "-node-key-pub") == pub and arg(plugin, "-node") == "$(NODE_NAME)"
+    assert arg(exporter, "--pubkey") == pub
+    for c in (plugin, exporter):
+        assert mounts(c)[os.path.dirname(pub)]["readOnly"] is True and host_path(spec, c, pub) == pub
+        assert os.path.dirname(key) not in mounts(c), f"{c['name']} is given the public key only"
+    assert not mounts(agent)[os.path.dirname(key)].get("readOnly")
+    script = ctr(spec, "prepare", init=True)["command"][-1]
+    assert "install -d -o 0 -g 0 -m 0700 /host/key\n" in script and "chmod 0700 /host/key\n" in script
+    assert "-m 0755 /host/key-pub" in script
+    adm = ctr(pod(docs, "Deployment"), "admission")
+    assert arg(adm, "-node-agent-sa") == f"system:serviceaccount:{NS}:t-node"
+    # off: no key, and nothing published
+    spec = pod(render("signing.nodeKey.enabled=false"), "DaemonSet")
+    agent, plugin = ctr(spec, "node-agent"), ctr(spec, "plugin")
+    assert "--node-key" not in agent["command"] and "-node-key-pub" not in plugin["command"]
+    assert "node-key" not in volumes(spec) and arg(agent, "--node-name") == "$(NODE_NAME)"
+
+
+def test_the_vareknodekey_crd():
+    crd = one(render(), "CustomResourceDefinition", "vareknodekeys.varek.dev")
+    assert crd["spec"]["scope"] == "Cluster" and crd["spec"]["names"]["kind"] == "VarekNodeKey"
+    v = crd["spec"]["versions"][0]
+    assert v["name"] == "v1alpha1" and v["served"] and v["storage"]
+    spec = v["schema"]["openAPIV3Schema"]["properties"]["spec"]
+    assert spec["required"] == ["node", "publicKey"]
+    assert spec["x-kubernetes-validations"][0]["rule"] == "self == oldSelf"
+    # the names and keys the webhook takes (k8s/internal/kube/nodekeys.go)
+    go = open(os.path.join(ROOT, "varek", "v1_4", "k8s", "internal", "kube", "nodekeys.go")).read()
+    assert spec["properties"]["node"]["pattern"] == re.search(r"nodeName  = regexp\.MustCompile\(`([^`]*)`\)", go).group(1)
+    assert spec["properties"]["publicKey"]["pattern"] == re.search(r"publicKey = regexp\.MustCompile\(`([^`]*)`\)", go).group(1)
 
 
 def test_the_varekcredential_crd():

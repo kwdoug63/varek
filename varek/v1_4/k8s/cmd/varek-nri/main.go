@@ -707,7 +707,14 @@ func main() {
 	api := flag.String("api", "", "-sync: the API server (default: the cluster's, from the service account)")
 	apiToken := flag.String("api-token", "", "-sync: the service account's token file")
 	apiCA := flag.String("api-ca", "", "-sync: the cluster's CA")
+	// v1.36 step 9 (D10): the node's key, published as its VarekNodeKey
+	nodeKeyPub := flag.String("node-key-pub", "", "-sync: the node agent's public key (its --node-key FILE.pub), published as the node's VarekNodeKey")
+	nodeName := flag.String("node", "", "-node-key-pub: the node's name (the pod's spec.nodeName)")
 	flag.Parse()
+	if (*nodeKeyPub != "") != (*nodeName != "") || (*nodeKeyPub != "" && !*syncAPI) {
+		fmt.Fprintln(os.Stderr, "varek-nri: -node-key-pub and -node go together, with -sync")
+		os.Exit(2)
+	}
 	p.handlers = map[string]bool{}
 	for _, h := range strings.Split(*handlers, ",") {
 		if h = strings.TrimSpace(h); h != "" {
@@ -732,6 +739,9 @@ func main() {
 		go (&syncer{c: c, dir: p.policies, logf: logf, resource: kube.Plans}).run(context.Background())
 		go (&credSyncer{c: c, dir: p.policies, logf: logf}).run(context.Background()) // v1.36 step 4 (D2)
 		p.api = c                                                                     // v1.36 step 7 (D7b)
+		if *nodeKeyPub != "" {                                                        // v1.36 step 9 (D10)
+			go (&keyPublisher{c: c, node: *nodeName, pub: *nodeKeyPub, logf: logf}).run(context.Background())
+		}
 	}
 	opts := []stub.Option{stub.WithPluginName("varek"), stub.WithPluginIdx("10")}
 	if *socket != "" {

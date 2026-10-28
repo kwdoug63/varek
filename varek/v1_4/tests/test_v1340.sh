@@ -121,6 +121,21 @@
 #      without a service account, a plan, its SHA-256 or --node-flow-state, a
 #      trust bundle not in the ConfigMap, under a node agent with none, or
 #      not a key; each given to the node agent itself.
+# v1.36 step 8 (D9):
+#  14. the stream in segments: a node agent rotating at 64 KiB, each segment
+#      beginning with a signed checkpoint naming it and the chain value the
+#      one before ended on; the audit takes them in order or put together,
+#      and refuses one left out, out of order or re-chained.
+# v1.36 step 9 (D10):
+#  15. a key for each node: --node-key made at the node agent's first start
+#      (0400, its public key beside it or apart, --node-key-pub), announced
+#      to the anchor, the same
+#      key at the next start; each stream signed with it, run_start naming
+#      the node (--node-name); the audit with the cluster's list
+#      (--node-keys): the node's key signed, another node's refused, a key
+#      retired before the run began refused (by the node's clock, or by the
+#      anchor host's receive time); refused at the start: a key's directory
+#      others may write, a key others may read, one that is not a key.
 #
 #   test_v1340.sh VDP_CHECK VDP_CERT_CHECK WARDEN [VAREK_INIT]
 set -u
@@ -1154,6 +1169,107 @@ last = ev[-1]["unmapped"]["varek"]
 sys.exit(0 if sys.argv[2] == "0" and last.get("event") == "audit" and last["audit"].get("passed") is True
          and len(rids - {None}) == ndec and ndec >= 600 else 1)
 PY
+fi
+
+echo "== 15. a key for each node (v1.36 step 9, D10) =="
+mkdir -p "$B/nkey"; chmod 700 "$B/nkey"
+check "--node-key or --node-name without --node-agent is refused" sh -c \
+    "'$WARDEN' /dev/null --node-name n1 -- /bin/true; [ \$? = 2 ] &&
+     '$WARDEN' /dev/null --node-key '$B/nkey/x' --node-name n1 -- /bin/true; [ \$? = 2 ]"
+check "... --node-key without --node-name, or with --sign-key; a name Kubernetes would not give a node" sh -c \
+    "'$WARDEN' /dev/null --node-agent '$B/s/x.sock' --node-streams /tmp --node-key '$B/nkey/x'; [ \$? = 2 ] &&
+     '$WARDEN' /dev/null --node-agent '$B/s/x.sock' --node-streams /tmp --node-key '$B/nkey/x' --node-name n1 \
+         --sign-key '$B/nkey/x'; [ \$? = 2 ] &&
+     '$WARDEN' /dev/null --node-agent '$B/s/x.sock' --node-streams /tmp --node-name Node_1; [ \$? = 2 ] &&
+     '$WARDEN' /dev/null --node-agent '$B/s/x.sock' --node-streams /tmp --node-name -n1; [ \$? = 2 ]"
+mkdir -p "$B/nkey-open"; chmod 777 "$B/nkey-open"
+check "a key's directory others may write: refused (no key made)" sh -c \
+    "'$WARDEN' '$B/p.txt' --node-agent '$B/s/x.sock' --node-streams /tmp --node-key '$B/nkey-open/node.key' \
+         --node-name n1 > '$B/nk0.log' 2>&1; [ \$? = 1 ] && grep -q 'must be root.s, written by no one else' '$B/nk0.log' &&
+     [ ! -e '$B/nkey-open/node.key' ]"
+if [ -z "$CERT" ]; then
+    skip "a key for each node (needs the certificate checker)"
+else
+    : > "$B/nanchor"; chmod 600 "$B/nanchor"
+    check "a node agent with no key yet: it makes one" agent nk "$B/p.txt" --node-key "$B/nkey/node.key" \
+        --node-name node-1 --anchor "$B/nanchor" --checkpoint-every 16
+    NKPUB="$(cat "$B/nkey/node.key.pub" 2>/dev/null)"
+    check "... the key root's and 0400, 64 hex characters; its public key beside it, 0444" sh -c \
+        "[ \"\$(stat -c '%u %a %s' '$B/nkey/node.key')\" = '0 400 65' ] && [ \"\$(stat -c '%u %a' '$B/nkey/node.key.pub')\" = '0 444' ] &&
+         grep -Eqx '[0-9a-f]{64}' '$B/nkey/node.key.pub' && grep -q 'made the node.s key $B/nkey/node.key (node node-1' '$B/nk.log'"
+    check "... announced to the anchor: the node's name and its key" \
+        grep -qx "{\"event\":\"node_key\",\"node\":\"node-1\",\"key\":\"$NKPUB\",\"timestamp_ns\":[0-9]*}" "$B/nanchor"
+    bundle nk1 "$B/s/nk.sock" "/probe reads 40 /data/allowed" 1; run nk1
+    check "a container's stream: signed with the node's key, its run_start naming the node" \
+        rec nk nk1 "S and S[0]['log_pubkey'] == '$NKPUB' and S[0]['node']['node_name'] == 'node-1' and E"
+    NKS="$(stream nk nk1)"
+    NOW=$(date +%s)
+    keys() {   # the cluster's list, as kubectl writes it: NODE KEY ADMITTED-SECONDS ...
+        python3 - "$@" <<'PY'
+import datetime, json, sys
+a, items = sys.argv[1:], []
+for i in range(0, len(a), 3):
+    t = datetime.datetime.fromtimestamp(int(a[i + 2]), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    items.append({"apiVersion": "varek.dev/v1alpha1", "kind": "VarekNodeKey",
+                  "metadata": {"name": f"{a[i]}-{a[i + 1][:16]}", "creationTimestamp": t},
+                  "spec": {"node": a[i], "publicKey": a[i + 1]}})
+print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
+PY
+    }
+    OTHER="$(printf 'b%.0s' $(seq 64))"
+    audit_nk() { python3 "$HERE/tools/varek_audit.py" --policy "${NKS%.jsonl}.policy" --checker "$CERT" "$@" "$NKS"; }
+    keys node-1 "$NKPUB" $((NOW - 3600)) node-2 "$OTHER" $((NOW - 3600)) > "$B/nk-list.json"
+    audit_nk --node-keys "$B/nk-list.json" > "$B/nk-a1.out" 2>&1; r1=$?
+    check "the audit with the cluster's list: the node's key, signed" sh -c \
+        "[ $r1 = 0 ] && grep -q '^varek_audit: integrity: signed$' '$B/nk-a1.out' &&
+         grep -q \"signed with node node-1's key node-1-${NKPUB:0:16}, admitted \" '$B/nk-a1.out'"
+    keys node-1 "$OTHER" $((NOW - 3600)) node-2 "$NKPUB" $((NOW - 3600)) > "$B/nk-list2.json"
+    check "... a list holding the key for another node only: refused, and it says whose it is" sh -c \
+        "! python3 '$HERE/tools/varek_audit.py' --policy '${NKS%.jsonl}.policy' --checker '$CERT' --node-keys '$B/nk-list2.json' \
+             '$NKS' > '$B/nk-a2.out' 2>&1 && grep -q 'does not hold for node node-1 (it is node-2.s)' '$B/nk-a2.out'"
+    # the node rebuilt: its next key admitted an hour ago, before this run
+    keys node-1 "$NKPUB" $((NOW - 7200)) node-1 "$OTHER" $((NOW - 3600)) > "$B/nk-list3.json"
+    check "a key retired (the node's next admitted) before the run began: refused" sh -c \
+        "! python3 '$HERE/tools/varek_audit.py' --policy '${NKS%.jsonl}.policy' --checker '$CERT' --node-keys '$B/nk-list3.json' \
+             '$NKS' > '$B/nk-a3.out' 2>&1 && grep -q 'retired at .* when the node.s next key (node-1-bbbbbbbbbbbbbbbb) was admitted' '$B/nk-a3.out' &&
+         grep -q \"by the node's own clock\" '$B/nk-a3.out'"
+    keys node-1 "$NKPUB" $((NOW - 7200)) node-1 "$OTHER" $((NOW + 3600)) > "$B/nk-list4.json"
+    audit_nk --node-keys "$B/nk-list4.json" > "$B/nk-a4.out" 2>&1; r4=$?
+    check "... retired after the run began: signed, the report says when, and by whose clock" sh -c \
+        "[ $r4 = 0 ] && grep -q \"; retired at .*, after the run began at .* (by the node's own clock\" '$B/nk-a4.out'"
+    # the anchor host's receive times (a receiver adds them), from long before:
+    # the run began when the anchor host received its run_start
+    sed "s/}\$/,\"received_ns\":$(( (NOW - 5400) * 1000000000 ))}/" "$B/nanchor" > "$B/nanchor-rx"
+    audit_nk --node-keys "$B/nk-list3.json" --anchor "$B/nanchor-rx" --clock-slack 100000 > "$B/nk-a5.out" 2>&1; r5=$?
+    check "... the anchor's receive time, not the node's claim: the run began before the next key, signed" sh -c \
+        "[ $r5 = 0 ] && grep -q \"after the run began at .* (by the anchor host's clock)\" '$B/nk-a5.out'"
+    check "--node-keys and --pubkey together: refused" sh -c "! python3 '$HERE/tools/varek_audit.py' \
+        --policy '${NKS%.jsonl}.policy' --checker '$CERT' --node-keys '$B/nk-list.json' --pubkey '$B/nkey/node.key.pub' \
+        '$NKS' > /dev/null 2>&1"
+    check "--list-runs shows the node's key as the anchor holds it" sh -c \
+        "python3 '$HERE/tools/varek_audit.py' --list-runs --anchor '$B/nanchor-rx' | grep -q '^  node node-1  key $NKPUB  announced '"
+    # the node agent again, with its key there: the same key, announced again
+    for a in $AGENTS; do kill "$a" 2>/dev/null; done; sleep 0.5; rm -f "$B/s/nk.sock"
+    check "the node agent started again: it signs with the key it made (the same public key), announced again" sh -c \
+        "'$WARDEN' '$B/p.txt' --node-agent '$B/s/nk.sock' --node-streams '$B/streams-nk' --node-key '$B/nkey/node.key' \
+             --node-name node-1 --anchor '$B/nanchor' > '$B/nk2.log' 2>&1 & p=\$!; sleep 1; kill \$p;
+         grep -q 'signing with the node.s key' '$B/nk2.log' && [ \"\$(cat '$B/nkey/node.key.pub')\" = '$NKPUB' ] &&
+         [ \"\$(grep -c '\"event\":\"node_key\"' '$B/nanchor')\" = 2 ]"
+    mkdir -p "$B/nkpub"; chmod 755 "$B/nkpub"
+    check "--node-key-pub: the public key written apart (where the plugin reads it), not beside the key" sh -c \
+        "'$WARDEN' '$B/p.txt' --node-agent '$B/s/nk.sock' --node-streams '$B/streams-nk' --node-key '$B/nkey/node.key' \
+             --node-key-pub '$B/nkpub/node.key.pub' --node-name node-1 > '$B/nk5.log' 2>&1 & p=\$!; sleep 1; kill \$p;
+         [ \"\$(cat '$B/nkpub/node.key.pub')\" = '$NKPUB' ] && [ \"\$(stat -c '%u %a' '$B/nkpub/node.key.pub')\" = '0 444' ] &&
+         '$WARDEN' /dev/null --node-agent '$B/s/x.sock' --node-streams /tmp --node-name n1 --node-key-pub '$B/nkpub/x'; [ \$? = 2 ]"
+    chmod 0644 "$B/nkey/node.key"
+    check "a key others may read: refused at the start" sh -c \
+        "'$WARDEN' '$B/p.txt' --node-agent '$B/s/nk3.sock' --node-streams '$B/streams-nk' --node-key '$B/nkey/node.key' \
+             --node-name node-1 > '$B/nk3.log' 2>&1; [ \$? = 1 ] && grep -q 'readable by no one else' '$B/nk3.log'"
+    chmod 0400 "$B/nkey/node.key"
+    printf 'not a key\n' > "$B/nkey/bad.key"; chmod 400 "$B/nkey/bad.key"
+    check "... and one that is not a key: refused, saying to remove it" sh -c \
+        "'$WARDEN' '$B/p.txt' --node-agent '$B/s/nk3.sock' --node-streams '$B/streams-nk' --node-key '$B/nkey/bad.key' \
+             --node-name node-1 > '$B/nk4.log' 2>&1; [ \$? = 1 ] && grep -q 'remove it, and the node agent makes a new one' '$B/nk4.log'"
 fi
 
 echo
