@@ -1586,8 +1586,12 @@ static int get_json(const char *url, char **out, size_t *ol, char *why, size_t w
      * the base URLs it is also used for; a well-known URL keeps it) */
     const char *rp = strstr(url, "://");
     rp = rp ? strchr(rp + 3, '/') : NULL;
+    /* v1.36 step 6: a key set's own type too (RFC 7517): the Kubernetes API
+     * server, the cluster's service account issuer, serves its keys as
+     * application/jwk-set+json only, and answers 406 to a request for
+     * application/json alone (the first kind run of the step) */
     if (http_do(&u, g_conf.oidc_ca[0] ? g_conf.oidc_ca : NULL, false, "GET", rp ? rp : "/",
-                "Accept: application/json\r\n", "", 0, &st, out, ol, why, wn) < 0)
+                "Accept: application/json, application/jwk-set+json\r\n", "", 0, &st, out, ol, why, wn) < 0)
         return -1;
     if (st != 200) {
         snprintf(why, wn, "%s answered %d", shown(url, sb, sizeof sb), st);

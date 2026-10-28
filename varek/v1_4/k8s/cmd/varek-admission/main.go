@@ -7,9 +7,9 @@
 //	/varekpolicy   a VarekPolicy created or changed: its name is one the node
 //	               agent takes, and the Warden loads its text and carries it in
 //	               a pod (warden POLICY --oci-filter: both parsers, and nothing
-//	               the node agent does not carry yet: the on-behalf-of chain;
-//	               v1.36 carries credentials, step 4, and sub-agents and
-//	               confined MCP servers, step 5);
+//	               the node agent does not carry yet; v1.36 carries
+//	               credentials, step 4, sub-agents and confined MCP servers,
+//	               step 5, and the on-behalf-of chain, step 6);
 //	/pod           a pod annotated varek.dev/policy: NAME names a VarekPolicy
 //	               of its namespace that the Warden loads, and each of its
 //	               containers runs as the node agent requires: no privilege
@@ -61,6 +61,13 @@
 //	                  same at the container's start, so a webhook that is down
 //	                  or bypassed is not enough.
 //
+// v1.36 step 6 (D5): a pod acting for a user (varek.dev/on-behalf-of), its
+// token's volume and init container (obo.go).
+//
+//	/pod-mutate       the volume and the init container given (a
+//	                  MutatingWebhookConfiguration's); /pod holds the pod to
+//	                  them.
+//
 // Each answer that refuses says why; the API server shows it to whoever
 // applied the object.
 //
@@ -70,6 +77,7 @@
 //
 //	varek-admission -warden FILE -tls-cert FILE -tls-key FILE [-listen :8443]
 //	                [-runtime-classes NAME,...] [-credentials-dir DIR]
+//	                [-obo-image REF] [-obo-user UID]
 package main
 
 import (
@@ -127,6 +135,9 @@ type response struct {
 	UID     string  `json:"uid"`
 	Allowed bool    `json:"allowed"`
 	Status  *status `json:"status,omitempty"`
+	// v1.36 step 6: a mutating hook's
+	PatchType *string `json:"patchType,omitempty"`
+	Patch     []byte  `json:"patch,omitempty"`
 }
 
 type status struct {
@@ -163,6 +174,9 @@ type container struct {
 	Name            string   `json:"name"`
 	Command         []string `json:"command"`
 	SecurityContext *secCtx  `json:"securityContext"`
+	VolumeMounts    []struct {
+		Name string `json:"name"`
+	} `json:"volumeMounts"` // v1.36 step 6
 }
 
 type pod struct {
@@ -185,6 +199,8 @@ type pod struct {
 		SecurityContext  *secCtx     `json:"securityContext"`
 		InitContainers   []container `json:"initContainers"`
 		Containers       []container `json:"containers"`
+		// v1.36 step 6: added by an update (pods/ephemeralcontainers)
+		EphemeralContainers []container `json:"ephemeralContainers"`
 	} `json:"spec"`
 }
 
@@ -206,6 +222,10 @@ type server struct {
 	api     reader
 	classes map[string]bool // runtime classes whose handler runs the Warden's filter (G-4)
 	credDir string          // v1.36 step 4: where a file: source must be (the chart's), or ""
+	// v1.36 step 6: the init container's image (the node image) and user (0:
+	// the platform's, as OpenShift's restricted-v2 gives one)
+	oboImage string
+	oboUser  int64
 
 	mu    sync.Mutex
 	cache map[[32]byte]checked // by the SHA-256 of what was checked (W2): the policy, and the pod's plan
@@ -447,11 +467,14 @@ func (s *server) pod(ctx context.Context, req *request) string {
 		if wasPlan, wasPlanned := old.Metadata.Annotations[planAnnotation]; wasPlan != plan || wasPlanned != planned {
 			return fmt.Sprintf("its %s annotation is set when the pod is created, and not added, changed or removed after", planAnnotation)
 		}
-		return ""
+		return oboUpdate(&p, &old) // v1.36 step 6
 	}
 	if !ok {
 		if planned {
 			return fmt.Sprintf("it names a plan (%s) and no policy (%s): a plan is held under a policy", planAnnotation, annotation)
+		}
+		if _, acting := p.Metadata.Annotations[oboAnnotation]; acting { // v1.36 step 6
+			return fmt.Sprintf("it acts for a user (%s) and names no policy (%s): the chain is the node agent's to carry", oboAnnotation, annotation)
 		}
 		return ""
 	}
@@ -498,7 +521,9 @@ func (s *server) pod(ctx context.Context, req *request) string {
 	} else if c = s.checkPlan(ctx, vp.Spec.Policy, podNoPlan, "", ns); c.why != "" {
 		return fmt.Sprintf("the Warden refuses its policy %s: %s", name, c.why)
 	}
-	var whys []string
+	// v1.36 step 6 (D5): a pod acting for a user; its init container, the
+	// webhook's, is not the agent's and is checked as given
+	whys, skip := s.oboWhys(req, &p, vp.Spec.Policy)
 	if p.Spec.HostNetwork || p.Spec.HostPID || p.Spec.HostIPC {
 		whys = append(whys, "it shares the node's network, PID or IPC namespace (hostNetwork, hostPID, hostIPC)")
 	}
@@ -526,7 +551,10 @@ func (s *server) pod(ctx context.Context, req *request) string {
 		}
 	}
 	all := append(append([]container{}, p.Spec.InitContainers...), p.Spec.Containers...)
-	for _, k := range all {
+	for i, k := range all {
+		if i == skip {
+			continue
+		}
 		pc, cc := p.Spec.SecurityContext, k.SecurityContext
 		user := pick(cc, pc, func(x *secCtx) *int64 { return x.RunAsUser })
 		group := pick(cc, pc, func(x *secCtx) *int64 { return x.RunAsGroup })
@@ -577,7 +605,7 @@ func (s *server) pod(ctx context.Context, req *request) string {
 }
 
 func newServer(warden string, api reader, classes string) *server {
-	s := &server{warden: warden, api: api, classes: map[string]bool{}, cache: map[[32]byte]checked{},
+	s := &server{warden: warden, api: api, classes: map[string]bool{}, cache: map[[32]byte]checked{}, oboUser: oboNobody,
 		slots: make(chan struct{}, maxChecks)}
 	for _, c := range strings.Split(classes, ",") {
 		if c = strings.TrimSpace(c); c != "" {
@@ -634,8 +662,34 @@ func (s *server) handle(decide func(context.Context, *request) string) http.Hand
 	}
 }
 
+// v1.36 step 6: a mutating hook's answer, with its JSON patch
+func (s *server) handleMutate(w http.ResponseWriter, r *http.Request) {
+	var rv review
+	if r.Method != http.MethodPost || json.NewDecoder(http.MaxBytesReader(w, r.Body, maxReview)).Decode(&rv) != nil || rv.Request == nil {
+		http.Error(w, "an AdmissionReview is expected", http.StatusBadRequest)
+		return
+	}
+	ops, why := s.mutate(rv.Request)
+	out := review{APIVersion: "admission.k8s.io/v1", Kind: "AdmissionReview",
+		Response: &response{UID: rv.Request.UID, Allowed: why == ""}}
+	if why != "" {
+		out.Response.Status = &status{Code: http.StatusForbidden, Message: "VAREK: " + why}
+	} else if len(ops) > 0 {
+		b, err := json.Marshal(ops)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		pt := "JSONPatch"
+		out.Response.PatchType, out.Response.Patch = &pt, b
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
 func (s *server) mux() *http.ServeMux {
 	m := http.NewServeMux()
+	m.HandleFunc("/pod-mutate", s.handleMutate) // v1.36 step 6
 	m.HandleFunc("/varekpolicy", s.handle(s.varekPolicy))
 	m.HandleFunc("/varekplan", s.handle(s.varekPlan))             // v1.35 step 4c
 	m.HandleFunc("/varekcredential", s.handle(s.varekCredential)) // v1.36 step 4
@@ -706,6 +760,9 @@ func main() {
 		"a pod naming another is refused")
 	credDir := flag.String("credentials-dir", "", "v1.36: the node agent's credentials directory (the chart's Secrets): a "+
 		"VarekCredential's file: source must be under it")
+	oboImage := flag.String("obo-image", "", "v1.36: the image of the init container a pod acting for a user is given (the "+
+		"node image, by digest)")
+	oboUser := flag.Int64("obo-user", oboNobody, "v1.36: its user and group (0: the platform's, as on OpenShift)")
 	flag.Parse()
 	if !strings.HasPrefix(*wardenPath, "/") || *cert == "" || *key == "" {
 		fmt.Fprintln(os.Stderr, "varek-admission: give -warden (an absolute path), -tls-cert and -tls-key")
@@ -718,6 +775,7 @@ func main() {
 	}
 	s := newServer(*wardenPath, c, *classes)
 	s.credDir = *credDir
+	s.oboImage, s.oboUser = *oboImage, *oboUser
 	cf := &certFiles{cert: *cert, key: *key}
 	if _, err := cf.get(nil); err != nil {
 		fmt.Fprintln(os.Stderr, "varek-admission: the certificate:", err)

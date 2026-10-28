@@ -124,6 +124,19 @@ spec:
             - --secrets-conf
             - /etc/varek/secrets/secrets.conf
             {{- end }}
+            # v1.36 step 6 (D5): a pod's user's token, from the kubelet's copy
+            # of its varek-obo volume; its SVID from the node's SPIRE agent
+            - --node-kubelet
+            - {{ .Values.node.kubelet }}
+            {{- if .Values.spire.adminSocket }}
+            - --node-spire-socket
+            - {{ .Values.spire.adminSocket }}
+            {{- if .Values.spire.self }}
+            - --node-spire-self
+            - {{ .Values.spire.self | quote }}
+            {{- end }}
+            {{- else if .Values.spire.self }}{{ fail "spire.self: give spire.adminSocket too" }}
+            {{- end }}
             {{- range .Values.nodeAgent.extraArgs }}
             - {{ . | quote }}
             {{- end }}
@@ -161,6 +174,19 @@ spec:
             {{- if or $cred.aws.roleArn $cred.aws.podIdentity }}
             - { name: aws-token, mountPath: /var/run/varek/tokens/aws, readOnly: true }
             {{- end }}
+            # v1.36 step 6 (D5): the kubelet's pods (each Secret volume a
+            # mount the kubelet makes after this pod starts: seen through
+            # HostToContainer), the SPIRE agent's admin socket, its bundle
+            - { name: kubelet-pods, mountPath: {{ .Values.node.kubelet }}/pods, readOnly: true, mountPropagation: HostToContainer }
+            {{- if .Values.spire.adminSocket }}
+            - { name: spire-admin, mountPath: {{ dir .Values.spire.adminSocket }} }
+            {{- end }}
+            {{- if .Values.spire.bundleConfigMap }}
+            - { name: spire-bundle, mountPath: /etc/varek/spire-bundle, readOnly: true }
+            {{- end }}
+            {{- if .Values.onBehalfOf.issuerCaConfigMap }}
+            - { name: issuer-ca, mountPath: /etc/varek/issuer-ca, readOnly: true }
+            {{- end }}
         - name: plugin
           image: {{ include "varek.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -178,6 +204,9 @@ spec:
             - {{ .Values.nri.socket }}
             - -runtime-handlers
             - {{ join "," .Values.nri.runtimeHandlers | quote }}
+            # v1.36 step 6: the webhook's init container for a pod acting for a user
+            - -obo-image
+            - {{ include "varek.image" . }}
             - -sync
           # root, to write the node's policies (root's) and reach the runtime's
           # NRI socket (root's), with no capability
@@ -257,6 +286,22 @@ spec:
         - { name: state, hostPath: { path: {{ $state }}, type: Directory } }
         - { name: nri, hostPath: { path: {{ dir .Values.nri.socket }}, type: Directory } }
         - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 64Mi } }
+        - { name: kubelet-pods, hostPath: { path: {{ .Values.node.kubelet }}/pods, type: Directory } }
+        {{- if .Values.spire.adminSocket }}
+        - { name: spire-admin, hostPath: { path: {{ dir .Values.spire.adminSocket }}, type: DirectoryOrCreate } }
+        {{- end }}
+        # projected, not configMap: a ConfigMap's volume is a directory on the
+        # node's disk that the kubelet makes writable by all (0777), which
+        # warden-secrets refuses for a trust file's; a projected one is in
+        # memory, as a Secret's is (the first kind run of v1.36 step 6)
+        {{- if .Values.spire.bundleConfigMap }}
+        - name: spire-bundle
+          projected: { defaultMode: 0444, sources: [{ configMap: { name: {{ .Values.spire.bundleConfigMap }} } }] }
+        {{- end }}
+        {{- if .Values.onBehalfOf.issuerCaConfigMap }}
+        - name: issuer-ca
+          projected: { defaultMode: 0444, sources: [{ configMap: { name: {{ .Values.onBehalfOf.issuerCaConfigMap }}, items: [{ key: ca.crt, path: ca.crt }] } }] }
+        {{- end }}
         {{- if .Values.signing.secretName }}
         - name: key
           secret:

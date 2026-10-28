@@ -50,7 +50,8 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 
 {{/* v1.36 step 4 (D1): warden-secrets' configuration from the credentials
   values, key = value lines, or "" when no vault: or aws-sm: store is
-  configured (file: stores need none) */}}
+  configured (file: stores need none); step 6 (D5): and the CA its token
+  issuers are verified with */}}
 {{- define "varek.secretsConf" -}}
 {{- $c := .Values.credentials -}}
 {{- if and (or $c.vault.caSecret $c.vault.kubernetesAuth.role) (not $c.vault.addr) }}
@@ -80,5 +81,8 @@ aws_web_identity_token_file = /var/run/varek/tokens/aws/token
 {{- if $c.aws.podIdentity }}
 aws_container_credentials_uri = http://169.254.170.23/v1/credentials
 aws_container_token_file = /var/run/varek/tokens/aws/token
+{{- end }}
+{{- if .Values.onBehalfOf.issuerCaConfigMap }}
+oidc_ca = /etc/varek/issuer-ca/ca.crt
 {{- end }}
 {{- end -}}

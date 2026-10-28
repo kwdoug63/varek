@@ -137,6 +137,21 @@ def serve(d):
                 body = {"issuer": base, "jwks_uri": base + "/jwks"}      # not https://.../liar
             elif self.path == "/jwks":
                 body = jwks
+            elif self.path == "/jwks-set":
+                # v1.36 step 6: as the Kubernetes API server serves its keys
+                # (application/jwk-set+json only, 406 to a request for JSON alone)
+                if "application/jwk-set+json" not in self.headers.get("Accept", ""):
+                    self.send_response(406)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                out = json.dumps(jwks).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/jwk-set+json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+                return
             elif self.path == "/jwks-two":
                 body = jwks_two
             elif self.path == "/jwks-odd":

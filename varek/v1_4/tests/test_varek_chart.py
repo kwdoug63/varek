@@ -95,11 +95,12 @@ def test_lint_strict():
 def test_the_default_render():
     docs = render()
     assert kinds(docs) == ["ClusterRole", "ClusterRole", "ClusterRoleBinding", "ClusterRoleBinding",
-                           "CustomResourceDefinition", "CustomResourceDefinition", "CustomResourceDefinition", "DaemonSet", "Deployment", "PodDisruptionBudget", "Secret",
+                           "CustomResourceDefinition", "CustomResourceDefinition", "CustomResourceDefinition", "DaemonSet", "Deployment",
+                           "MutatingWebhookConfiguration", "PodDisruptionBudget", "Secret",
                            "Service", "ServiceAccount", "ServiceAccount", "ValidatingWebhookConfiguration"]
     for d in docs:
         if d["kind"] not in ("CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
-                             "ValidatingWebhookConfiguration"):
+                             "ValidatingWebhookConfiguration", "MutatingWebhookConfiguration"):
             assert d["metadata"]["namespace"] == NS, d["metadata"]
     images = {c["image"] for k in ("DaemonSet", "Deployment") for key in ("containers", "initContainers")
               for c in pod(docs, k).get(key, [])}
@@ -468,6 +469,65 @@ def test_credentials():
                       (("credentials.vault.caSecret=vca",), "need vault.addr")):
         p = render(*sets, ok=False)
         assert p.returncode != 0 and why in p.stderr, (sets, p.stderr)
+
+
+def test_on_behalf_of():
+    """v1.36 step 6 (D5): a pod acting for a user. The mutating hook gives it
+    its token's volume and the init container (the node image); the node
+    agent reads the kubelet's copy, by the same path on the node, seen as
+    the kubelet mounts it; its SVID from the SPIRE agent's admin socket"""
+    docs = render("admission.excludeNamespaces={kube-system,monitoring}", "image.digest=sha256:" + "a" * 64)
+    image = "ghcr.io/kwdoug63/varek-node@sha256:" + "a" * 64
+    mwc = one(docs, "MutatingWebhookConfiguration")
+    assert [h["name"] for h in mwc["webhooks"]] == ["pod-mutate.varek.dev"]
+    h = mwc["webhooks"][0]
+    secret = one(docs, "Secret")
+    assert h["clientConfig"]["service"] == {"name": "t-admission", "namespace": NS, "path": "/pod-mutate", "port": 443}
+    assert h["clientConfig"]["caBundle"] == secret["data"]["ca.crt"]
+    assert h["rules"] == [{"apiGroups": [""], "apiVersions": ["v1"], "operations": ["CREATE"], "resources": ["pods"]}]
+    assert h["reinvocationPolicy"] == "Never" and h["failurePolicy"] == "Fail" and h["sideEffects"] == "None"
+    # every namespace's pods but the excluded (a namespace that requires a policy too)
+    assert h["namespaceSelector"]["matchExpressions"] == [
+        {"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": [NS, "kube-system", "monitoring"]}]
+    vwc = one(docs, "ValidatingWebhookConfiguration")
+    for v in vwc["webhooks"]:
+        if v["name"].startswith("pod"):
+            assert v["rules"][0]["resources"] == ["pods", "pods/ephemeralcontainers"], v["name"]
+    adm = ctr(pod(docs, "Deployment"), "admission")
+    assert arg(adm, "-obo-image") == image and arg(adm, "-obo-user") == "65534"
+    spec = pod(docs, "DaemonSet")
+    agent, plugin = ctr(spec, "node-agent"), ctr(spec, "plugin")
+    assert arg(plugin, "-obo-image") == image
+    assert arg(agent, "--node-kubelet") == "/var/lib/kubelet"
+    m = mounts(agent)["/var/lib/kubelet/pods"]
+    assert m["readOnly"] is True and m["mountPropagation"] == "HostToContainer"
+    assert host_path(spec, agent, "/var/lib/kubelet/pods") == "/var/lib/kubelet/pods"
+    assert "--node-spire-socket" not in agent["command"] and "/etc/varek/spire-bundle" not in mounts(agent)
+    # SPIRE: the admin socket's directory, the node agent's own ID, the bundle
+    sock = "/run/spire/admin-sockets/admin.sock"
+    me = "spiffe://example.org/ns/varek-system/sa/t-node"
+    spec = pod(render("spire.adminSocket=" + sock, "spire.self=" + me, "spire.bundleConfigMap=spire-bundle"), "DaemonSet")
+    agent = ctr(spec, "node-agent")
+    assert arg(agent, "--node-spire-socket") == sock and arg(agent, "--node-spire-self") == me
+    assert host_path(spec, agent, sock) == sock
+    # projected (in memory): a configMap volume's directory is the node's, writable by all
+    assert volumes(spec)[mounts(agent)["/etc/varek/spire-bundle"]["name"]]["projected"]["sources"] == [
+        {"configMap": {"name": "spire-bundle"}}]
+    assert mounts(agent)["/etc/varek/spire-bundle"]["readOnly"] is True
+    p = render("spire.self=" + me, ok=False)
+    assert p.returncode != 0 and "spire.self: give spire.adminSocket too" in p.stderr
+    # the issuers' CA: the cluster's own (kube-root-ca.crt), in warden-secrets' configuration
+    docs = render("onBehalfOf.issuerCaConfigMap=kube-root-ca.crt")
+    agent, spec = ctr(pod(docs, "DaemonSet"), "node-agent"), pod(docs, "DaemonSet")
+    assert _conf(docs)["oidc_ca"] == "/etc/varek/issuer-ca/ca.crt"
+    assert arg(agent, "--secrets-conf") == "/etc/varek/secrets/secrets.conf"
+    v = volumes(spec)[mounts(agent)["/etc/varek/issuer-ca"]["name"]]["projected"]
+    assert v["sources"] == [{"configMap": {"name": "kube-root-ca.crt", "items": [{"key": "ca.crt", "path": "ca.crt"}]}}]
+    assert "configMap" not in volumes(spec)[mounts(agent)["/etc/varek/issuer-ca"]["name"]]
+    assert "issuer-ca" not in volumes(pod(render(), "DaemonSet"))
+    # the init container's user: the value, or on OpenShift the namespace's
+    assert arg(ctr(pod(render("onBehalfOf.user=1001"), "Deployment"), "admission"), "-obo-user") == "1001"
+    assert arg(ctr(pod(render("openshift.enabled=true", "runtime=cri-o"), "Deployment"), "admission"), "-obo-user") == "0"
 
 
 def test_the_varekcredential_crd():

@@ -109,6 +109,8 @@ func testServer(t *testing.T, warden string) *server {
 		"team-a/creds":  "require warden 1.28\nproxy on\ncredential gh from file:/var/lib/varek/credentials/gh/token\nallow host api.github.com:443\n",
 		"team-b/creds":  "require warden 1.28\nproxy on\ncredential gh from file:/var/lib/varek/credentials/gh/token\nallow host api.github.com:443\n",
 		"cred:gh-token": "gh file:/var/lib/varek/credentials/gh/token team-a,team-c",
+		// v1.36 step 6 (D5)
+		"team-a/obo": "require warden 1.29\nrequire on-behalf-of\ntrust issuer https://idp.example/ audience varek-agent\nallow path /tmp/\n",
 	}, "runc, crun")
 }
 
@@ -336,6 +338,16 @@ func TestRealWarden(t *testing.T) {
 	if ok, msg := post(t, s, "/pod", "team-a", agentPod("needs", nil)); ok || !strings.Contains(msg, "names its plan (varek.dev/plan)") {
 		t.Errorf("`require plan`, a pod naming no plan: allowed %v, %q", ok, msg)
 	}
+	// v1.36 step 6 (D5): a policy that says `require on-behalf-of`, loaded and
+	// carried; a pod under it acts for a user, as the webhook gives it
+	obo := "require warden 1.29\nrequire on-behalf-of\ntrust issuer https://idp.example/ audience varek-agent\nallow path /tmp/\n"
+	if ok, msg := post(t, s, "/varekpolicy", "team-a", vp("obo", obo)); !ok {
+		t.Errorf("a policy that says `require on-behalf-of`: %q", msg)
+	}
+	s.oboImage = "registry.example/varek-node@sha256:abc"
+	if ok, msg := post(t, s, "/pod", "team-a", oboPod(t, s, "obo", nil)); !ok {
+		t.Errorf("a pod acting for a user under it: %q", msg)
+	}
 }
 
 // v1.35 step 4c (D11): a VarekPlan, and a pod's plan with its policy
@@ -461,5 +473,231 @@ func TestCredentialsGiven(t *testing.T) {
 	bp := agentPod("creds", func(p *pod) { p.Metadata.Namespace = "team-b" })
 	if ok, msg := post(t, s, "/pod", "team-b", bp); ok || !strings.Contains(msg, "is not given to namespace team-b") {
 		t.Errorf("a pod whose policy names a credential not given to its namespace: allowed %v, %q", ok, msg)
+	}
+}
+
+// v1.36 step 6 (D5): a pod acting for a user, as the mutating hook gives it
+// (the patch applied, and the API server's defaults)
+func oboPod(t *testing.T, s *server, policy string, edit func(m map[string]interface{})) map[string]interface{} {
+	t.Helper()
+	p := agentPod(policy, nil)
+	p.Metadata.Annotations[oboAnnotation] = "alice-token"
+	b, _ := json.Marshal(p)
+	var m map[string]interface{}
+	json.Unmarshal(b, &m)
+	spec := m["spec"].(map[string]interface{})
+	spec["volumes"] = []interface{}{s.oboVolume("alice-token")}
+	c := s.oboContainer()
+	c["imagePullPolicy"], c["terminationMessagePath"] = "IfNotPresent", "/dev/termination-log"
+	c["volumeMounts"] = append(c["volumeMounts"].([]interface{}), map[string]interface{}{"name": "kube-api-access-x",
+		"mountPath": "/var/run/secrets/kubernetes.io/serviceaccount", "readOnly": true})
+	spec["initContainers"] = []interface{}{c}
+	if edit != nil {
+		edit(m)
+	}
+	return m
+}
+
+func mutateOps(t *testing.T, s *server, obj interface{}) (bool, string, []patchOp) {
+	t.Helper()
+	b, _ := json.Marshal(obj)
+	in, _ := json.Marshal(review{APIVersion: "admission.k8s.io/v1", Kind: "AdmissionReview",
+		Request: &request{UID: "u-1", Namespace: "team-a", Operation: "CREATE", Object: b}})
+	rec := httptest.NewRecorder()
+	s.mux().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/pod-mutate", bytes.NewReader(in)))
+	var out review
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || out.Response == nil || out.Response.UID != "u-1" {
+		t.Fatalf("/pod-mutate: the answer does not read: %s", rec.Body.String())
+	}
+	var ops []patchOp
+	if out.Response.Patch != nil {
+		if out.Response.PatchType == nil || *out.Response.PatchType != "JSONPatch" {
+			t.Errorf("a patch without its type: %s", rec.Body.String())
+		}
+		if err := json.Unmarshal(out.Response.Patch, &ops); err != nil {
+			t.Fatalf("the patch: %v", err)
+		}
+	}
+	msg := ""
+	if out.Response.Status != nil {
+		msg = out.Response.Status.Message
+	}
+	return out.Response.Allowed, msg, ops
+}
+
+func TestPodMutate(t *testing.T) {
+	s := testServer(t, "")
+	acting := agentPod("obo", func(p *pod) { p.Metadata.Annotations[oboAnnotation] = "alice-token" })
+	if ok, msg, _ := mutateOps(t, s, acting); ok || !strings.Contains(msg, "-obo-image") {
+		t.Errorf("no image for the init container: allowed %v, %q", ok, msg)
+	}
+	s.oboImage = "registry.example/varek-node@sha256:abc"
+	ok, msg, ops := mutateOps(t, s, acting)
+	if !ok || len(ops) != 2 || ops[0].Path != "/spec/volumes" || ops[1].Path != "/spec/initContainers" {
+		t.Fatalf("the volume and the init container given: %v %q %+v", ok, msg, ops)
+	}
+	vol, _ := json.Marshal(ops[0].Value)
+	if !strings.Contains(string(vol), `"secretName":"alice-token"`) || !strings.Contains(string(vol), `"key":"token","path":"token"`) {
+		t.Errorf("the volume: %s", vol)
+	}
+	ctr, _ := json.Marshal(ops[1].Value)
+	for _, w := range []string{`"name":"varek-obo"`, `"image":"registry.example/varek-node@sha256:abc"`, `"command":["/bin/true"]`,
+		`"mountPath":"/var/run/varek-obo"`, `"readOnly":true`, `"runAsUser":65534`, `"type":"RuntimeDefault"`} {
+		if !strings.Contains(string(ctr), w) {
+			t.Errorf("the init container: %s not in %s", w, ctr)
+		}
+	}
+	// a pod with init containers and volumes of its own: added to theirs
+	more := agentPod("obo", func(p *pod) {
+		p.Metadata.Annotations[oboAnnotation] = "alice-token"
+		p.Spec.InitContainers = []container{{Name: "setup"}}
+	})
+	m := map[string]interface{}{}
+	b, _ := json.Marshal(more)
+	json.Unmarshal(b, &m)
+	m["spec"].(map[string]interface{})["volumes"] = []interface{}{map[string]interface{}{"name": "data", "emptyDir": map[string]interface{}{}}}
+	if ok, _, ops := mutateOps(t, s, m); !ok || len(ops) != 2 || ops[0].Path != "/spec/volumes/-" || ops[1].Path != "/spec/initContainers/0" {
+		t.Errorf("added to the pod's own: %+v", ops)
+	}
+	// as the webhook gave it already: nothing more
+	if ok, msg, ops := mutateOps(t, s, oboPod(t, s, "obo", nil)); !ok || len(ops) != 0 {
+		t.Errorf("given already: %v %q %+v", ok, msg, ops)
+	}
+	s.oboUser = 0
+	if _, _, ops := mutateOps(t, s, acting); len(ops) != 2 {
+		t.Errorf("-obo-user 0: %+v", ops)
+	} else if c, _ := json.Marshal(ops[1].Value); strings.Contains(string(c), "runAsUser") {
+		t.Errorf("-obo-user 0: the platform's user (OpenShift's), not one given: %s", c)
+	}
+	s.oboUser = oboNobody
+	for _, c := range []struct {
+		what string
+		obj  interface{}
+		why  string
+	}{
+		{"a pod acting for no one", agentPod("obo", nil), ""},
+		{"a pod naming no policy", agentPod("", func(p *pod) { p.Metadata.Annotations = map[string]string{oboAnnotation: "x"} }), ""},
+		{"not a Secret's name", agentPod("obo", func(p *pod) { p.Metadata.Annotations[oboAnnotation] = "Alice/x" }), "not a Secret's name"},
+		{"a volume of the name, its own", oboPod(t, s, "obo", func(m map[string]interface{}) {
+			m["spec"].(map[string]interface{})["volumes"] = []interface{}{map[string]interface{}{"name": oboName, "emptyDir": map[string]interface{}{}}}
+		}), "its volume varek-obo is not the webhook's"},
+		{"an init container of the name, its own", oboPod(t, s, "obo", func(m map[string]interface{}) {
+			m["spec"].(map[string]interface{})["initContainers"].([]interface{})[0].(map[string]interface{})["command"] = []string{"/bin/sh"}
+		}), "its init container varek-obo is not the webhook's"},
+		{"a container of the name", agentPod("obo", func(p *pod) {
+			p.Metadata.Annotations[oboAnnotation] = "alice-token"
+			p.Spec.Containers[0].Name = oboName
+		}), "the name is the webhook's init container's"},
+	} {
+		ok, msg, ops := mutateOps(t, s, c.obj)
+		if ok != (c.why == "") || !strings.Contains(msg, c.why) || (c.why == "" && len(ops) != 0) {
+			t.Errorf("%s: allowed %v, %q, %+v", c.what, ok, msg, ops)
+		}
+	}
+	// an update is not changed
+	b, _ = json.Marshal(acting)
+	if ops, why := s.mutate(&request{Operation: "UPDATE", Object: b}); len(ops) != 0 || why != "" {
+		t.Errorf("an update: %+v %q", ops, why)
+	}
+}
+
+func TestPodOnBehalfOf(t *testing.T) {
+	s := testServer(t, "")
+	s.oboImage = "registry.example/varek-node@sha256:abc"
+	spec := func(m map[string]interface{}) map[string]interface{} { return m["spec"].(map[string]interface{}) }
+	initc := func(m map[string]interface{}) map[string]interface{} {
+		return spec(m)["initContainers"].([]interface{})[0].(map[string]interface{})
+	}
+	isc := func(m map[string]interface{}) map[string]interface{} {
+		return initc(m)["securityContext"].(map[string]interface{})
+	}
+	for _, c := range []struct {
+		what   string
+		policy string
+		edit   func(m map[string]interface{})
+		why    string
+	}{
+		{"as the webhook gives it", "obo", nil, ""},
+		{"... under a policy that does not require it", "agent", nil, ""},
+		{"`require on-behalf-of`, acting for no one", "obo", func(m map[string]interface{}) {
+			delete(m["metadata"].(map[string]interface{})["annotations"].(map[string]interface{}), oboAnnotation)
+		}, "says `require on-behalf-of`, and it names no user's token"},
+		{"no volume", "obo", func(m map[string]interface{}) { delete(spec(m), "volumes") }, "has not the token's volume"},
+		{"no init container", "obo", func(m map[string]interface{}) { delete(spec(m), "initContainers") }, "has not the token's volume and init container"},
+		{"the volume of another Secret", "obo", func(m map[string]interface{}) { spec(m)["volumes"] = []interface{}{s.oboVolume("bob")} }, "is not the webhook's"},
+		{"the volume optional", "obo", func(m map[string]interface{}) {
+			spec(m)["volumes"].([]interface{})[0].(map[string]interface{})["secret"].(map[string]interface{})["optional"] = true
+		}, "is not the webhook's"},
+		{"the volume twice", "obo", func(m map[string]interface{}) {
+			spec(m)["volumes"] = append(spec(m)["volumes"].([]interface{}), s.oboVolume("alice-token"))
+		}, "once each"},
+		{"another image", "obo", func(m map[string]interface{}) { initc(m)["image"] = "evil:latest" }, "its image is not"},
+		{"another command", "obo", func(m map[string]interface{}) {
+			initc(m)["command"] = []string{"/bin/sh", "-c", "cat /var/run/varek-obo/token"}
+		}, "its command is not"},
+		{"args", "obo", func(m map[string]interface{}) { initc(m)["args"] = []string{"x"} }, "it has args"},
+		{"an environment", "obo", func(m map[string]interface{}) { initc(m)["env"] = []interface{}{} }, "it has env"},
+		{"a lifecycle hook", "obo", func(m map[string]interface{}) { initc(m)["lifecycle"] = map[string]interface{}{} }, "it has lifecycle"},
+		{"a sidecar", "obo", func(m map[string]interface{}) { initc(m)["restartPolicy"] = "Always" }, "it has restartPolicy"},
+		{"a writable mount", "obo", func(m map[string]interface{}) {
+			initc(m)["volumeMounts"] = []interface{}{map[string]interface{}{"name": oboName, "mountPath": oboMount}}
+		}, "is not read-only"},
+		{"as root", "obo", func(m map[string]interface{}) { isc(m)["runAsUser"] = 0 }, "securityContext is not the webhook's"},
+		{"privilege escalation", "obo", func(m map[string]interface{}) { delete(isc(m), "allowPrivilegeEscalation") }, "securityContext is not the webhook's"},
+		{"a capability added", "obo", func(m map[string]interface{}) {
+			isc(m)["capabilities"] = map[string]interface{}{"drop": []string{"ALL"}, "add": []string{"DAC_READ_SEARCH"}}
+		}, "securityContext is not the webhook's"},
+		{"the unsupervised profile (which the plugin does not replace for it)", "obo", func(m map[string]interface{}) {
+			isc(m)["seccompProfile"] = map[string]interface{}{"type": "Localhost", "localhostProfile": unsupervised}
+		}, "securityContext is not the webhook's"},
+		{"the agent mounting the token's volume", "obo", func(m map[string]interface{}) {
+			c := spec(m)["containers"].([]interface{})[0].(map[string]interface{})
+			c["volumeMounts"] = []interface{}{map[string]interface{}{"name": oboName, "mountPath": "/t", "readOnly": true}}
+		}, "container agent mounts varek-obo"},
+		{"the init container's user from the platform (-obo-user 0)", "obo", func(m map[string]interface{}) {
+			delete(isc(m), "runAsUser")
+			delete(isc(m), "runAsGroup")
+		}, ""},
+	} {
+		ok, msg := post(t, s, "/pod", "team-a", oboPod(t, s, c.policy, c.edit))
+		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
+			t.Errorf("%s: allowed %v, %q", c.what, ok, msg)
+		}
+	}
+	if ok, msg := post(t, s, "/pod", "team-a", agentPod("", func(p *pod) {
+		p.Metadata.Annotations = map[string]string{oboAnnotation: "alice-token"}
+	})); ok || !strings.Contains(msg, "names no policy") {
+		t.Errorf("acting for a user under no policy: allowed %v, %q", ok, msg)
+	}
+	// an update: the annotation fixed; no ephemeral container added that mounts the volume
+	old := oboPod(t, s, "obo", nil)
+	for _, c := range []struct {
+		what string
+		edit func(m map[string]interface{})
+		why  string
+	}{
+		{"unchanged", nil, ""},
+		{"the annotation removed", func(m map[string]interface{}) {
+			delete(m["metadata"].(map[string]interface{})["annotations"].(map[string]interface{}), oboAnnotation)
+		}, "not added, changed or removed"},
+		{"the annotation changed", func(m map[string]interface{}) {
+			m["metadata"].(map[string]interface{})["annotations"].(map[string]interface{})[oboAnnotation] = "bob"
+		}, "not added, changed or removed"},
+		{"an ephemeral container mounting the volume", func(m map[string]interface{}) {
+			spec(m)["ephemeralContainers"] = []interface{}{map[string]interface{}{"name": "debug",
+				"volumeMounts": []interface{}{map[string]interface{}{"name": oboName, "mountPath": "/t"}}}}
+		}, "container debug, added, mounts varek-obo"},
+		{"an ephemeral container of its own", func(m map[string]interface{}) {
+			spec(m)["ephemeralContainers"] = []interface{}{map[string]interface{}{"name": "debug"}}
+		}, ""},
+	} {
+		ok, msg := postOp(t, s, "/pod", "team-a", "UPDATE", oboPod(t, s, "obo", c.edit), old)
+		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
+			t.Errorf("an update, %s: allowed %v, %q", c.what, ok, msg)
+		}
+	}
+	if !requireOBO.MatchString("allow path /x\n  require\ton-behalf-of\n") || requireOBO.MatchString("# require on-behalf-of\n") ||
+		requireOBO.MatchString("require on-behalf-ofx\n") {
+		t.Error("the `require on-behalf-of` line")
 	}
 }

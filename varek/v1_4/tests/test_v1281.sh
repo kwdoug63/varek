@@ -245,6 +245,11 @@ CASES
     : > "$T/requests.log"; mint rs256-nokid; go two "$T/p2.txt" --on-behalf-of "$T/tok"
     refuse "a token naming no key when the issuer has two for its algorithm" two "it names no key (kid) and the issuer has 2 keys for RS256"
     check "the policy's jwks URL is used, not the discovery document" sh -c "grep -q 'GET /jwks-two' '$T/requests.log' && ! grep -q well-known '$T/requests.log'"
+    # v1.36 step 6: keys served as a key set's own type only, as the Kubernetes
+    # API server (the cluster's service account issuer) serves its own
+    printf '%b' "require warden 1.28\ntrust issuer $ISS audience varek-agent jwks $ISS/jwks-set\n$LIBS" > "$T/pset.txt"
+    mint es256; go jwkset "$T/pset.txt" --on-behalf-of "$T/tok"
+    check "keys served as application/jwk-set+json only (406 to JSON alone, as Kubernetes' issuer): verified" ok jwkset
     printf '%b' "require warden 1.28\ntrust issuer $ISS/liar audience varek-agent\n$LIBS" > "$T/p3.txt"
     mint es256 "$ISS/liar"; go liar "$T/p3.txt" --on-behalf-of "$T/tok"
     refuse "a discovery document naming another issuer" liar "the issuer's discovery document names another issuer ($ISS)"

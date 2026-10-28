@@ -81,6 +81,24 @@ static const char *g_node_policies;               /* the policies' directory, or
 static const char *g_node_creds_dir;              /* v1.36 step 4: --node-credentials, the file: stores' */
 #define NODE_CRED_LIST ".credentials"             /* POLICY_DIR/.credentials: the cluster's VarekCredential list */
 static const char *const kNodeStore[] = { "", "file", "vault", "aws-sm" };
+/* v1.36 step 6 (D5): the on-behalf-of chain. The user's token is in a
+ * Secret volume of the pod (varek-obo, key token) that only an init
+ * container mounts (VAREK's admission webhook adds both); the kubelet keeps
+ * it on the node while the pod runs (M2b), and the node agent reads it there
+ * by the pod's uid. The agent's SVID comes from the node's SPIRE agent,
+ * asked by the container's process id through its Delegated Identity API
+ * (M3), by varek-svid. Each is handed to warden-secrets as a root-only copy
+ * in the socket's directory, as --on-behalf-of and --agent-svid are on a
+ * host. */
+static const char *g_node_kubelet = "/var/lib/kubelet";   /* --node-kubelet */
+static const char *g_node_spire;                           /* --node-spire-socket: the SPIRE agent's admin socket */
+static const char *g_node_spire_self;                      /* --node-spire-self: the node agent's own SPIFFE ID */
+static const char *g_node_svid_bin;                        /* --node-svid-helper, else varek-svid beside the Warden */
+static char g_node_sock_dir[PATH_MAX];                     /* the socket's directory, root's alone */
+static char g_node_obo_file[PATH_MAX], g_node_svid_file[PATH_MAX];
+#define NODE_OBO_VOLUME "varek-obo"
+#define NODE_OBO_KEY    "token"
+#define NODE_OBO_MAX    65536
 static bool  g_node_have_launcher;
 static dev_t g_node_launcher_dev;                 /* --node-launcher, on the node */
 static ino_t g_node_launcher_ino;
@@ -187,6 +205,22 @@ static int node_state(const char *doc, size_t n, char *why, size_t wn) {
         snprintf(why, wn, "the container's state names its pod twice, differently, or unusably (the NRI plugin's, "
                  "containerd's and CRI-O's annotations)");
         return -1;
+    }
+    /* v1.36 step 6 (D5): the Secret its user's token is in, a DNS name */
+    const char *op[] = { "state", "annotations", "varek.dev/on-behalf-of" }, *v;
+    size_t vn;
+    g_nr.obo[0] = '\0';
+    if (nj_find(doc, n, op, 3, &v, &vn) == 0) {
+        bool ok = nj_string(v, vn, g_nr.obo, sizeof g_nr.obo) == 0 && g_nr.obo[0] && g_nr.obo[0] != '.' &&
+                  g_nr.obo[0] != '-';
+        for (size_t k = 0; ok && g_nr.obo[k]; k++)
+            ok = (g_nr.obo[k] >= 'a' && g_nr.obo[k] <= 'z') || (g_nr.obo[k] >= '0' && g_nr.obo[k] <= '9') ||
+                 g_nr.obo[k] == '-' || g_nr.obo[k] == '.';
+        if (!ok) {
+            g_nr.obo[0] = '\0';
+            snprintf(why, wn, "the container's varek.dev/on-behalf-of is not a Secret's name");
+            return -1;
+        }
     }
     return 0;
 }
@@ -736,8 +770,9 @@ static int node_enter(int type) {
  * and the admission check refuse it before the container starts) */
 static const char *node_policy_why(const struct policy *p) {
     /* v1.36 step 4 (D1, D2): credentials are carried (node_creds_check);
-     * step 5 (D3, D4): sub-agents and confined MCP servers (sub_setup_node) */
-    if (p->v.require_obo) return "the on-behalf-of chain (require on-behalf-of)";
+     * step 5 (D3, D4): sub-agents and confined MCP servers (sub_setup_node);
+     * step 6 (D5): the on-behalf-of chain (node_obo) */
+    (void)p;
     return NULL;
 }
 
@@ -746,7 +781,9 @@ static const char *node_unsupported(const struct policy *p, bool dry, const char
     if (dry) return "a dry run";
     (void)plan;                                  /* v1.35 step 4c (D11): the pod's plan is carried */
     if (flow) return "a flow policy";
-    if (obo || svid) return "the on-behalf-of chain";
+    /* v1.36 step 6 (D5): each pod names its own user's token, and the SVID is
+     * its pod's, from SPIRE (node_obo); not one for every container */
+    if (obo || svid) return "--on-behalf-of or --agent-svid given to the node agent itself";
     if (trust) return "a trust bundle";
     if (p->v.launches && !g_nr.launcher)
         return "decided launches without the launcher (" NODE_LAUNCHER " first in the command: the NRI plugin)";
@@ -970,8 +1007,156 @@ static void node_fail(const char *why) {
 /* Every way out of a supervisor (a failed start, a policy that does not
  * load, the end of the run) ends its container: its calls under the filter
  * would otherwise go unanswered, or, with the descriptor closed, fail */
+/* v1.36 step 6: the copies of the user's token and the agent's SVID, once
+ * warden-secrets has read them (and at the supervisor's end) */
+static void node_obo_forget(void) {
+    if (g_node_obo_file[0]) { (void)unlink(g_node_obo_file); g_node_obo_file[0] = '\0'; }
+    if (g_node_svid_file[0]) { (void)unlink(g_node_svid_file); g_node_svid_file[0] = '\0'; }
+}
+
 static void node_atexit(void) {
     if (g_nr.pidfd >= 0) (void)syscall(__NR_pidfd_send_signal, g_nr.pidfd, SIGKILL, NULL, 0);
+    node_obo_forget();
+}
+
+/* The pod's uid, as a path component: hex digits and '-' */
+static bool node_uid_ok(const char *u) {
+    size_t k = 0;
+    for (; u[k]; k++)
+        if (!((u[k] >= '0' && u[k] <= '9') || (u[k] >= 'a' && u[k] <= 'f') || u[k] == '-')) return false;
+    return k >= 8 && k <= 64;
+}
+
+/* The user's token, from the pod's varek-obo volume on the node, copied to
+ * a file of root's alone. 0, or -1 with why. */
+static int node_obo_token(char *why, size_t wn) {
+    if (!node_uid_ok(g_nr.pod_uid)) {
+        snprintf(why, wn, "the container's pod names no uid its token could be found by");
+        return -1;
+    }
+    char vol[PATH_MAX], want[PATH_MAX], path[PATH_MAX + 16], real[PATH_MAX];
+    int vl = snprintf(vol, sizeof vol, "%s/pods/%s/volumes/kubernetes.io~secret/" NODE_OBO_VOLUME, g_node_kubelet,
+                      g_nr.pod_uid);
+    if (vl < 0 || (size_t)vl >= sizeof vol) { snprintf(why, wn, "the kubelet's directory's path is too long"); return -1; }
+    if (!realpath(vol, want)) {
+        snprintf(why, wn, "its pod's token (Secret %.200s) is not on the node (%.300s: %s): the pod's init container "
+                 NODE_OBO_VOLUME " mounts it, which VAREK's admission webhook adds (--node-kubelet names the kubelet's "
+                 "directory)", g_nr.obo, vol, strerror(errno));
+        return -1;
+    }
+    /* the key is a link into the kubelet's ..data, inside the volume */
+    snprintf(path, sizeof path, "%s/" NODE_OBO_KEY, vol);
+    size_t wl = strlen(want);
+    if (!realpath(path, real) || strncmp(real, want, wl) || real[wl] != '/') {
+        snprintf(why, wn, "its pod's token volume holds no key " NODE_OBO_KEY " inside it (%.300s)", path);
+        return -1;
+    }
+    int fd = open(real, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != 0 || st.st_size <= 0 ||
+        st.st_size > NODE_OBO_MAX) {
+        snprintf(why, wn, "its pod's token (%.300s) is not a file of root's of 1 to %d bytes", path, NODE_OBO_MAX);
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    static char tok[NODE_OBO_MAX];
+    size_t n = 0;
+    while (n < (size_t)st.st_size) {
+        ssize_t r = read(fd, tok + n, (size_t)st.st_size - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        n += (size_t)r;
+    }
+    close(fd);
+    if (n != (size_t)st.st_size) {
+        explicit_bzero(tok, sizeof tok);
+        snprintf(why, wn, "its pod's token (%.300s) could not be read whole", path);
+        return -1;
+    }
+    if ((size_t)snprintf(g_node_obo_file, sizeof g_node_obo_file, "%s/%.128s.obo", g_node_sock_dir, g_nr.id) >=
+        sizeof g_node_obo_file) {
+        explicit_bzero(tok, sizeof tok);
+        g_node_obo_file[0] = '\0';
+        snprintf(why, wn, "the node agent's socket directory's path is too long");
+        return -1;
+    }
+    (void)unlink(g_node_obo_file);
+    int out = open(g_node_obo_file, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    bool ok = out >= 0 && write(out, tok, n) == (ssize_t)n && fsync(out) == 0;
+    explicit_bzero(tok, sizeof tok);
+    if (out >= 0) close(out);
+    if (!ok) {
+        snprintf(why, wn, "cannot keep its pod's token for warden-secrets (%.300s: %s)", g_node_obo_file, strerror(errno));
+        node_obo_forget();
+        return -1;
+    }
+    return 0;
+}
+
+/* The agent's SVID, from the node's SPIRE agent by the container's process
+ * id (varek-svid, its lines in the stream). 0, or -1 with why. */
+static int node_obo_svid(char *why, size_t wn) {
+    char bin[PATH_MAX];
+    if (g_node_svid_bin) snprintf(bin, sizeof bin, "%s", g_node_svid_bin);
+    else {
+        ssize_t k = proc_readlinkf(bin, sizeof bin - 16, "self/exe");
+        if (k <= 0) { snprintf(why, wn, "cannot find this binary's directory"); return -1; }
+        bin[k] = '\0';
+        char *sl = strrchr(bin, '/');
+        snprintf(sl ? sl + 1 : bin, sizeof bin - (size_t)(sl ? sl + 1 - bin : 0), "varek-svid");
+    }
+    if ((size_t)snprintf(g_node_svid_file, sizeof g_node_svid_file, "%s/%.128s.svid", g_node_sock_dir, g_nr.id) >=
+        sizeof g_node_svid_file) {
+        g_node_svid_file[0] = '\0';
+        snprintf(why, wn, "the node agent's socket directory's path is too long");
+        return -1;
+    }
+    (void)unlink(g_node_svid_file);
+    char pid[16];
+    snprintf(pid, sizeof pid, "%d", (int)g_nr.pid);
+    pid_t c = fork();
+    if (c < 0) { snprintf(why, wn, "cannot start varek-svid (%s)", strerror(errno)); return -1; }
+    if (c == 0) {
+        dup2(STDERR_FILENO, STDOUT_FILENO);
+        if (g_node_spire_self)
+            execl(bin, "varek-svid", "-socket", g_node_spire, "-pid", pid, "-out", g_node_svid_file,
+                  "-not", g_node_spire_self, (char *)NULL);
+        else
+            execl(bin, "varek-svid", "-socket", g_node_spire, "-pid", pid, "-out", g_node_svid_file, (char *)NULL);
+        _exit(127);
+    }
+    int st = 0;
+    while (waitpid(c, &st, 0) < 0 && errno == EINTR) ;
+    struct stat fs;
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0 || lstat(g_node_svid_file, &fs) < 0 || !S_ISREG(fs.st_mode) ||
+        fs.st_uid != 0 || (fs.st_mode & 077)) {
+        snprintf(why, wn, "cannot get the pod's SVID from the node's SPIRE agent (%.200s %s, above)", bin,
+                 WIFEXITED(st) ? (WEXITSTATUS(st) == 127 ? "did not start" : "refused") : "was killed");
+        node_obo_forget();
+        return -1;
+    }
+    return 0;
+}
+
+/* The pod's chain, as the Warden's --on-behalf-of and --agent-svid on a
+ * host: the user's token when its pod names one (varek.dev/on-behalf-of,
+ * required by `require on-behalf-of`), the agent's SVID when the policy
+ * trusts a SPIFFE trust domain and the node agent has SPIRE's socket. The
+ * paths are the copies', or NULL. node_fail on what refuses the start. */
+static void node_obo(const struct policy *p, const char **obo, const char **svid) {
+    char why[700];
+    *obo = *svid = NULL;
+    if (p->v.require_obo && !g_nr.obo[0])
+        node_fail("its policy says `require on-behalf-of`, and its pod names no user's token (varek.dev/on-behalf-of: "
+                  "the Secret it is in)");
+    if (g_nr.obo[0]) {
+        if (node_obo_token(why, sizeof why) < 0) node_fail(why);
+        *obo = g_node_obo_file;
+    }
+    if (p->v.nspiffe && g_node_spire) {
+        if (node_obo_svid(why, sizeof why) < 0) node_fail(why);
+        *svid = g_node_svid_file;
+    }
 }
 
 /* The listener's live supervisors, each with its container's init (review:
@@ -1117,6 +1302,11 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
     if (lstat(dir, &ds) < 0 || !S_ISDIR(ds.st_mode) || ds.st_uid != 0 || (ds.st_mode & 077)) {
         fprintf(stderr, "[warden] --node-agent %s: its directory %s must be root's, with no access for others (chmod 700)\n",
                 sock_path, dir);
+        return -1;
+    }
+    /* v1.36 step 6: where the copies of a pod's token and SVID are kept */
+    if (!realpath(dir, g_node_sock_dir)) {
+        fprintf(stderr, "[warden] --node-agent %s: %s\n", dir, strerror(errno));
         return -1;
     }
     int ls = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -1428,6 +1618,14 @@ static int node_launcher_exec(int notify_fd, const struct seccomp_notif *req, co
                               const char *bootstrap_path, bool by_fd) {
     char why[PATH_MAX + 160];
     if ((pid_t)req->pid != g_nr.pid) node_fail("a launch before the container's command, not by its init");
+    /* v1.36 step 6 (found by the sweep, once in 97 runs): the runtime's launch
+     * of /varek/init, let through, can be restarted by the kernel before it
+     * takes (a signal at its credential lock gives -ERESTARTNOINTR, and the
+     * runtime's init is Go, whose preemption signals it), and so is notified
+     * again. The process then still runs the runtime's init, not the
+     * launcher: no code of the container's, or of the launcher's, has run. It
+     * is the runtime's launch again, checked as the first was. */
+    if (g_nr.in_launcher && !node_runs_launcher((pid_t)req->pid)) g_nr.in_launcher = false;
     if (!g_nr.in_launcher) {
         if (by_fd || strcmp(a->target, NODE_LAUNCHER)) {
             snprintf(why, sizeof why, "before the launcher, the container's init launched \"%.*s\", not " NODE_LAUNCHER,

@@ -374,3 +374,70 @@ func TestCredentials(t *testing.T) {
 		t.Errorf("a name the Warden gives that is not a credential's: %v %v", adj, err)
 	}
 }
+
+// v1.36 step 6 (D5): a pod acting for a user. The Secret's name goes in each
+// container's annotations; the webhook's init container is let through as
+// it is; one of its name otherwise is carried as any other
+func TestOnBehalfOf(t *testing.T) {
+	p := setup(t)
+	p.oboImage = "registry.example/varek-node@sha256:abc"
+	ann := map[string]string{annotation: "agent", oboAnnotation: "alice-token"}
+	adj, err := p.adjust(context.Background(), pod(ann), ctr("/bin/agent"))
+	if err != nil || adj == nil || adj.GetAnnotations()[oboAnnotation] != "alice-token" {
+		t.Fatalf("the Secret's name in the container's annotations: %v %v", adj, err)
+	}
+	if adj, _ := p.adjust(context.Background(), pod(map[string]string{annotation: "agent"}), ctr("/bin/agent")); adj == nil ||
+		adj.GetAnnotations()[oboAnnotation] != "" {
+		t.Errorf("a pod acting for no one: %v", adj)
+	} else if _, ok := adj.GetAnnotations()["-"+oboAnnotation]; !ok {
+		t.Errorf("a pod acting for no one: the annotation removed (%v)", adj.GetAnnotations())
+	}
+	if _, err := p.adjust(context.Background(), pod(map[string]string{annotation: "agent", oboAnnotation: "Alice/x"}),
+		ctr("/bin/agent")); err == nil || !strings.Contains(err.Error(), "not a Secret's name") {
+		t.Errorf("a name that is not a Secret's: %v", err)
+	}
+	init := func(img *api.Image, args ...string) *api.Container {
+		c := ctr(args...)
+		c.Name, c.Image = oboInit, img
+		c.Linux.SeccompProfile = &api.SecurityProfile{ProfileType: api.SecurityProfile_RUNTIME_DEFAULT}
+		return c
+	}
+	for _, c := range []struct {
+		what string
+		img  *api.Image
+	}{
+		{"the runtime says no image", nil},
+		{"its digest", &api.Image{Name: "registry.example/varek-node@sha256:abc", Digest: "sha256:abc"}},
+	} {
+		if adj, err := p.adjust(context.Background(), pod(ann), init(c.img, "/bin/true")); adj != nil || err != nil {
+			t.Errorf("the init container, %s: let through as it is (%v %v)", c.what, adj, err)
+		}
+	}
+	for _, c := range []struct {
+		what string
+		ann  map[string]string
+		img  *api.Image
+		args []string
+	}{
+		{"another image", ann, &api.Image{Name: "evil", Digest: "sha256:def"}, []string{"/bin/true"}},
+		{"another command", ann, nil, []string{"/bin/sh", "-c", "x"}},
+		{"a pod acting for no one", map[string]string{annotation: "agent"}, nil, []string{"/bin/true"}},
+		{"another image by name", ann, &api.Image{Name: "varek-node:evil"}, []string{"/bin/true"}},
+	} {
+		if _, err := p.adjust(context.Background(), pod(c.ann), init(c.img, c.args...)); err == nil ||
+			!strings.Contains(err.Error(), "seccomp profile is RUNTIME_DEFAULT") {
+			t.Errorf("a container named %s, %s: carried as any other (refused here for its profile): %v", oboInit, c.what, err)
+		}
+	}
+	// by name, as the runtime resolves it (the chart's image by its tag)
+	p.oboImage = "varek-node:ci"
+	if adj, err := p.adjust(context.Background(), pod(ann), init(&api.Image{Name: "docker.io/library/varek-node:ci"}, "/bin/true")); adj != nil || err != nil {
+		t.Errorf("the image by its name as the runtime resolves it: %v %v", adj, err)
+	}
+	for ref, want := range map[string]string{"busybox": "docker.io/library/busybox", "kwdoug63/x:1": "docker.io/kwdoug63/x:1",
+		"ghcr.io/kwdoug63/x:1": "ghcr.io/kwdoug63/x:1", "localhost/x": "localhost/x", "reg:5000/x": "reg:5000/x"} {
+		if fullName(ref) != want {
+			t.Errorf("fullName(%q) = %q", ref, fullName(ref))
+		}
+	}
+}

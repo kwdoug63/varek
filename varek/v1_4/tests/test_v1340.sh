@@ -93,6 +93,18 @@
 #      sub-agent launched by the container's first process itself
 #      (subagent_first_process), a policy that could write the container's
 #      control groups.
+# v1.36 step 6 (D5):
+#  12. the on-behalf-of chain under the node agent: a pod naming its user's
+#      token (varek.dev/on-behalf-of), its Secret volume where the kubelet
+#      keeps it (a stand-in kubelet directory, KEY -> ..data/KEY), and the
+#      agent's SVID from a stand-in varek-svid (asked by the container's
+#      process id, the node agent's own SPIFFE ID left out): each verified by
+#      warden-secrets as on a host, run_start naming the user and the
+#      agent's SPIFFE ID, the copies gone once read, the audit; --oci-filter
+#      carries `require on-behalf-of`; refused: no token under `require
+#      on-behalf-of`, no volume on the node, a key that leads out of it, a
+#      token not root's, an expired token, an SVID SPIRE does not give, the
+#      chain given to the node agent itself.
 #
 #   test_v1340.sh VDP_CHECK VDP_CERT_CHECK WARDEN [VAREK_INIT]
 set -u
@@ -401,6 +413,10 @@ if ann != "-":
     pf = B + "/pol/team-a/" + ann + ".policy"
     sha = hashlib.sha256(open(pf, "rb").read()).hexdigest() if os.path.isfile(pf) else "0" * 64
     c["annotations"] = {"varek.dev/policy": ann, "varek.dev/pod-namespace": "team-a"}
+    # v1.36 step 6: uid=UID (varek.dev/pod-uid, the plugin's), obo=SECRET (varek.dev/on-behalf-of)
+    for o in opts:
+        if o.startswith("uid="): c["annotations"]["varek.dev/pod-uid"] = o[4:]
+        if o.startswith("obo="): c["annotations"]["varek.dev/on-behalf-of"] = o[4:]
     if "no-sha" not in opts: c["annotations"]["varek.dev/policy-sha256"] = "f" * 64 if "bad-sha" in opts else sha
     # v1.35 step 4c: the pod's plan (plan=NAME), as the plugin adds it, or plan-no-sha, plan-bad-sha
     for o in opts:
@@ -815,6 +831,90 @@ else
     "$WARDEN" "$P/subw.policy" --oci-filter > "$B/f/subw.json" 2>/dev/null
     lbundle subw "$B/s/l.sock" "$B/f/subw.json" subw "/varek/init -- /probe sub" cg2; run subw
     check "refused: a policy that lets the agent write the container's control groups" refused l subw 'with sub-agents named, the control groups must be out of the agent.s reach'
+fi
+
+echo "== 12. the on-behalf-of chain under the node agent (v1.36 step 6, D5) =="
+if [ -z "$WARDEN" ] || ! declare -f lbundle > /dev/null || [ ! -x "$HERE/warden-secrets" ] || ! python3 -c 'import cryptography' 2>/dev/null; then
+    skip "the on-behalf-of chain under the node agent (needs the launcher, as section 6, warden-secrets and python3-cryptography)"
+else
+    I="$B/idp"; mkdir -p "$I"; chmod 755 "$I"
+    python3 "$HERE/tests/v1281_idp.py" serve "$I" > "$I/serve.out" 2>&1 &
+    SERVERS="$SERVERS $!"
+    for _ in $(seq 100); do [ -f "$I/port" ] && break; sleep 0.1; done
+    ISS="https://127.0.0.1:$(cat "$I/port")"
+    python3 "$HERE/tests/v1281_idp.py" svid "$I"
+    chmod 644 "$I/ca.pem" "$I"/bundle*.pem
+    printf 'oidc_ca = %s/ca.pem\n' "$I" > "$B/obo.conf"; chmod 600 "$B/obo.conf"
+    printf 'require warden 1.29\nrequire on-behalf-of\ntrust issuer %s audience varek-agent\ntrust spiffe example.test bundle %s/bundle.pem\nallow path /data/allowed readonly\n' \
+        "$ISS" "$I" > "$P/obo.policy"
+    printf 'require warden 1.29\ntrust issuer %s audience varek-agent\nallow path /data/allowed readonly\n' "$ISS" > "$P/oboopt.policy"
+    chmod 644 "$P/obo.policy" "$P/oboopt.policy"
+    # the kubelet's directory, as it keeps a pod's Secret volume: KEY -> ..data/KEY, ..data -> ..<time>/
+    K="$B/kubelet"
+    kvol() {   # UID [TOKEN-CASE]: the pod's varek-obo volume, its token minted by the stand-in issuer
+        local v="$K/pods/$1/volumes/kubernetes.io~secret/varek-obo"
+        mkdir -p "$v/..2026_10_28_10_00_00.1"; chmod 755 "$K" "$K/pods" "$K/pods/$1" "$K/pods/$1/volumes" "$(dirname "$v")" 2>/dev/null
+        python3 "$HERE/tests/v1281_idp.py" mint "$I" "${2:-es256}" > "$v/..2026_10_28_10_00_00.1/token"
+        chmod 644 "$v/..2026_10_28_10_00_00.1/token"
+        ln -sfn ..2026_10_28_10_00_00.1 "$v/..data"; ln -sfn ..data/token "$v/token"
+    }
+    U1=0a1b2c3d-0000-4000-8000-000000000001
+    kvol "$U1"
+    # a stand-in varek-svid: says how it was asked, and gives the stand-in authority's SVID
+    printf '#!/bin/sh\necho "$*" >> %s/svid.args\nwhile [ $# -gt 0 ]; do case "$1" in -out) out="$2" ;; esac; shift 2; done\n[ -n "${VAREK_TEST_SVID_FAIL:-}" ] && { echo "varek-svid: no SVID for the process" >&2; exit 1; }\numask 077; cp %s/svid-good.pem "$out"\n' "$B" "$I" > "$B/fake-svid"
+    chmod 755 "$B/fake-svid"; : > "$B/svid.args"
+    check "--oci-filter: a policy that says \`require on-behalf-of\`, carried (v1.36 step 6)" sh -c "'$WARDEN' '$P/obo.policy' --oci-filter > '$B/f/obo.json' 2> '$B/f/obo.err'"
+    check "a node agent with the kubelet's directory (--node-kubelet) and SPIRE's (--node-spire-socket, --node-spire-self)" \
+        agent ob "$B/pol" --node-launcher "$B/varek-init" --node-kubelet "$K" --node-spire-socket "$B/spire.sock" \
+        --node-spire-self spiffe://example.test/varek-node --node-svid-helper "$B/fake-svid" --secrets-conf "$B/obo.conf"
+    ob() { lbundle "$1" "$B/s/ob.sock" "$B/f/obo.json" "$2" "/varek/init -- /probe" "${@:3}"; run "$1"; }
+    ob ob1 obo "uid=$U1" obo=alice-token
+    sed 's/^/     /' "$B/ob1.out"
+    OS="$(stream ob ob1)"
+    check "a pod acting for its user: the command ran, a read the policy allows answered" said ob1 "read_allowed: ok allowed content"
+    check "... the user's token from its Secret volume on the node, verified by warden-secrets" \
+        grep -q 'on behalf of alice@example.test (issuer .*): token verified (ES256, key ec1)' "$OS"
+    check "... the agent's SVID from SPIRE, verified against the trust bundle" grep -q 'agent spiffe://example.test/agents/coder: SVID verified' "$OS"
+    check "... run_start names the user and the agent's SPIFFE ID" rec ob ob1 \
+        'S and S[0]["on_behalf_of"]["user"]["subject"] == "alice@example.test" and S[0]["on_behalf_of"]["agent"]["spiffe_id"] == "spiffe://example.test/agents/coder"'
+    OP="$(python3 -c 'import json,sys; print(next(json.loads(l) for l in open(sys.argv[1]) if "\"event\":\"run_start\"" in l)["node"]["pid"])' "$OS" 2>/dev/null)"
+    check "... varek-svid asked by the container's process id, the node agent's own SPIFFE ID left out" sh -c \
+        "[ -n '$OP' ] && grep -qx -- '-socket $B/spire.sock -pid $OP -out $(cd "$B/s" && pwd -P)/v1340-ob1.svid -not spiffe://example.test/varek-node' '$B/svid.args'"
+    check "... the copies of the token and the SVID gone once read" sh -c "! ls '$B/s' | grep -q '\\.obo\$\\|\\.svid\$'"
+    TOK="$(cat "$K/pods/$U1/volumes/kubernetes.io~secret/varek-obo/token")"
+    check "... the token nowhere in the stream" sh -c "! grep -qF -- '${TOK##*.}' '$OS'"
+    if [ -n "$CERT" ]; then
+        check "... and the audit accepts the stream" python3 "$HERE/tools/varek_audit.py" --policy "${OS%.jsonl}.policy" --checker "$CERT" "$OS"
+    fi
+    orefused() { ! grep -q '^read_allowed' "$B/$1.out" && grep -q "$2" "$(stream ob "$1")"; }
+    ob ob2 obo "uid=$U1"
+    check "refused: \`require on-behalf-of\`, and its pod names no user's token" orefused ob2 'names no user.s token (varek.dev/on-behalf-of'
+    ob ob3 obo uid=0a1b2c3d-0000-4000-8000-0000000000ff obo=alice-token
+    check "refused: the pod's token volume not on the node" orefused ob3 'is not on the node'
+    U4=0a1b2c3d-0000-4000-8000-000000000004; kvol "$U4"
+    printf 'elsewhere\n' > "$B/outside-token"; chmod 600 "$B/outside-token"
+    ln -sfn "$B/outside-token" "$K/pods/$U4/volumes/kubernetes.io~secret/varek-obo/token"
+    ob ob4 obo "uid=$U4" obo=alice-token
+    check "refused: a token key that leads out of its volume" orefused ob4 'holds no key token inside it'
+    U5=0a1b2c3d-0000-4000-8000-000000000005; kvol "$U5"
+    chown 65534 "$K/pods/$U5/volumes/kubernetes.io~secret/varek-obo/..data/token"
+    ob ob5 obo "uid=$U5" obo=alice-token
+    check "refused: a token that is not root's" orefused ob5 'is not a file of root.s'
+    U6=0a1b2c3d-0000-4000-8000-000000000006; kvol "$U6" expired
+    ob ob6 obo "uid=$U6" obo=alice-token
+    check "refused: an expired token (warden-secrets, as on a host)" orefused ob6 "the user's token: .*expired"
+    VAREK_TEST_SVID_FAIL=1 agent obf "$B/pol" --node-launcher "$B/varek-init" --node-kubelet "$K" \
+        --node-spire-socket "$B/spire.sock" --node-svid-helper "$B/fake-svid" --secrets-conf "$B/obo.conf"
+    lbundle ob7 "$B/s/obf.sock" "$B/f/obo.json" obo "/varek/init -- /probe" "uid=$U1" obo=alice-token; run ob7
+    check "refused: an SVID the node's SPIRE agent does not give" sh -c \
+        "! grep -q '^read_allowed' '$B/ob7.out' && grep -q 'cannot get the pod.s SVID from the node.s SPIRE agent' '$(stream obf ob7)' && grep -q 'varek-svid: no SVID for the process' '$(stream obf ob7)'"
+    "$WARDEN" "$P/oboopt.policy" --oci-filter > "$B/f/oboopt.json" 2>/dev/null
+    lbundle ob8 "$B/s/ob.sock" "$B/f/oboopt.json" oboopt "/varek/init -- /probe" "uid=$U1"; run ob8
+    check "a policy that trusts an issuer, its pod naming no token: runs, for no user (as on a host)" sh -c \
+        "grep -qx 'read_allowed: ok allowed content' '$B/ob8.out' && ! grep -q 'on behalf of' '$(stream ob ob8)'"
+    check "refused: --on-behalf-of or --agent-svid given to the node agent itself (each pod names its own)" sh -c \
+        "'$WARDEN' '$B/pol' --node-agent '$B/s/x2.sock' --node-streams '$B/streams' --on-behalf-of '$B/obo.conf' > /dev/null 2>&1; [ \$? = 2 ] &&
+         '$WARDEN' '$B/pol' --node-agent '$B/s/x2.sock' --node-streams '$B/streams' --agent-svid '$B/obo.conf' > /dev/null 2>&1; [ \$? = 2 ]"
 fi
 
 echo

@@ -32,7 +32,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden warden-proxy warden-secrets target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-v1311 test-v1320 test-v1321 test-v1340 test-v1350 test-v1300 test-v1300-oflags test-varek-k8s test-varek-chart sweep-v1340 test-v1340-kind test-v1340-apiserver varek-nri varek-admission test-node-json test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
+.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-v1311 test-v1320 test-v1321 test-v1340 test-v1350 test-v1300 test-v1300-oflags test-varek-k8s test-varek-chart sweep-v1340 test-v1340-kind test-v1340-apiserver varek-nri varek-admission varek-svid test-node-json test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
 
 all: $(BINS)
 
@@ -489,8 +489,12 @@ varek-nri:
 varek-admission:
 	cd k8s && go build -o ../varek-admission ./cmd/varek-admission
 
-test-varek-k8s: warden
-	@cd k8s && test -z "$$(gofmt -l .)" && go vet ./... && VAREK_WARDEN="$(CURDIR)/warden" go test -count=1 ./...
+# v1.36 step 6 (D5): the pod's SVID from the node's SPIRE agent, for the node agent
+varek-svid:
+	cd k8s && go build -o ../varek-svid ./cmd/varek-svid
+
+test-varek-k8s: warden warden-secrets varek-svid
+	@cd k8s && test -z "$$(gofmt -l .)" && go vet ./... && VAREK_WARDEN="$(CURDIR)/warden" VAREK_SVID_BIN="$(CURDIR)/varek-svid" go test -count=1 ./...
 
 # v1.34 step 6: the Helm chart (packaging/helm/varek) rendered under each of
 # its settings, by helm on PATH or HELM; KUBECONFORM, if set, also checks
@@ -595,7 +599,7 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared tests/proxy_parse_test tests/proxy_parse_fuzzer tests/v1281_sub tests/v1290_open tests/v1290_lat tests/v1310_peek tests/v1300_oflags tests/test_node_json varek-init varek-nri varek-admission
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared tests/proxy_parse_test tests/proxy_parse_fuzzer tests/v1281_sub tests/v1290_open tests/v1290_lat tests/v1310_peek tests/v1300_oflags tests/test_node_json varek-init varek-nri varek-admission varek-svid
 
 # v1.22: install the runtime and the `varek` command.
 #   sudo make install                  -> /opt/varek, plus /usr/local/bin/varek
