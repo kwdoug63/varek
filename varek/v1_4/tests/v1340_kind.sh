@@ -650,16 +650,21 @@ streams10() {   # the node's streams, copied to OUT/streams10
         docker cp "$N:/var/log/varek" "$OUT/streams10" > /dev/null 2>&1
     fi
 }
-podstream() {   # POD: its stream in OUT/streams10
+podstream() {   # POD: its first stream in OUT/streams10 (a container the node agent
+                # refuses can be started again by the kubelet, as CRI-O's is on the
+                # SELinux cell: each start a stream of its own)
     python3 - "$OUT/streams10" "$1" <<'EOF'
 import glob, json, sys
-for p in sorted(glob.glob(sys.argv[1] + "/*.jsonl")):
+got = []
+for p in glob.glob(sys.argv[1] + "/*.jsonl"):
     for l in open(p):
         if l.startswith("{"):
             r = json.loads(l)
             if r.get("event") == "run_start" and r.get("node", {}).get("pod", {}).get("name") == sys.argv[2]:
-                print(p)
+                got.append((r.get("timestamp_ns", 0), p))
             break
+if got:
+    print(min(got)[1])
 EOF
 }
 streamhas() {   # STREAM PYTHON: a record of STREAM holds (R: the records)
