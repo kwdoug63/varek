@@ -180,6 +180,21 @@ are stated below as limits. The largest:
   enforcing at the end, and the test cluster's downloads are pinned by
   SHA-256.
 
+## Found building the ship gate's runs
+
+- **A connection the egress proxy could not read left no record of its
+  refusal** (fixed). The proxy refuses a connection whose head it cannot
+  read: an HTTP `Host` that is an address (the instance metadata service,
+  `169.254.169.254`, asked for on port 80 under inspecting mode), no whole
+  request within 10 s, a TLS hello without a name. The stream held the
+  connect, allowed and handed to the proxy, and nothing after it; only the
+  Warden's log said it was refused. Each is now a chained
+  `proxy_unreadable` record (the connection, what the proxy read it as,
+  its reason). The audit takes it in place of the hand-off's decision,
+  once for each hand-off. `varek refusals` lists it as UNREADABLE, and the
+  OCSF export writes it as a Network Activity refusal (Denied, Blocked) to
+  where the agent connected.
+
 ## Known limits
 
 - **A flow policy's breaker counts per node**, not across the cluster: a

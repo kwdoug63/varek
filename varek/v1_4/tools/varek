@@ -387,7 +387,7 @@ def summarize(recs):
     s = {"run": None, "start": None, "complete": False, "warden": None, "policy": None,
          "policy_sha": None,
          "allowed": 0, "refused": 0, "unknown": 0, "refusals": [],
-         "proxy_targets": {}, "proxy_denied": set(), "proxy_ends": [],
+         "proxy_targets": {}, "proxy_denied": set(), "proxy_ends": [], "handoff_targets": {},
          "cred_refused": [], "revoked": None, "credentials": [],
          "user": None, "spiffe_id": None, "subagents": {}, "expired": None,
          "dry": False, "not_enforced": 0, "mcp_servers": set(), "mcp_calls": 0,
@@ -444,6 +444,10 @@ def summarize(recs):
             if r.get("why") in ("refused_request", "server_tls", "client_tls", "tls_timeout", "max_body") \
                     and type(r.get("proxy_conn")) is int:
                 s["proxy_ends"].append(r)
+        elif ev == "proxy_unreadable" and type(r.get("proxy_conn")) is int:
+            # v1.36 step 12: a connection the proxy could not read, refused
+            # with nothing dialed
+            s["proxy_ends"].append(r)
         elif ev == "dns_question" and (r.get("rule") == "wildcard_budget" or
                                        (r.get("rule") == "no_rule" and r.get("enforced") is False)):
             # v1.25: a name a wildcard rule's budget refused (NXDOMAIN);
@@ -462,6 +466,8 @@ def summarize(recs):
                 s["mcp_calls"] += 1
             if r.get("action") == "net.proxy" and isinstance(r.get("proxy_conn"), int):
                 s["proxy_targets"].setdefault(r["proxy_conn"], r.get("target", ""))
+            if r.get("proxy_handoff") is True and isinstance(r.get("proxy_conn"), int):    # v1.36 step 12
+                s["handoff_targets"].setdefault(r["proxy_conn"], r.get("target", ""))
             if r.get("action") in ("net.request", "net.mcp") and d != "ALLOW" and type(r.get("proxy_conn")) is int:
                 s["proxy_denied"].add(r["proxy_conn"])                  # v1.31: an MCP call's refusal too
             if d == "ALLOW":
@@ -2289,9 +2295,15 @@ def cmd_refusals(args):
     if s["refused"] > args.n:
         info(f"\n  ... and {s['refused'] - args.n} more (use -n to see them)")
     if ends:
-        info(f"\n{len(ends)} connection(s) the proxy ended (inspecting mode):\n")
+        info(f"\n{len(ends)} connection(s) the proxy ended:\n")
         for e in ends[: args.n]:
             why, cid = e.get("why"), e.get("proxy_conn")
+            if e.get("event") == "proxy_unreadable":                                # v1.36 step 12
+                info(f"  {'UNREADABLE':11}  {'proxy':13}  connection {cid} "
+                     f"({s['handoff_targets'].get(cid, '?')}, {e.get('proxy_kind', '?')})")
+                hint(f"the proxy could not read it: {why}; nothing was dialed, and the agent's connection was "
+                     f"refused")
+                continue
             err = e.get("request_error") or e.get("tls_error") or ""
             label, what = {
                 "refused_request": ("REFUSED", "the proxy refused the request before deciding it"

@@ -136,6 +136,25 @@ static void px_open_add(uint64_t id, bool inspect, const struct px_req *q) {
     g_px_open[g_px_nopen++] = o;
 }
 
+/* v1.36 step 12 (the ship gate's runs): the proxy_unreadable record, chained
+ * like proxy_close: a connection handed to the proxy whose head it could not
+ * read (an HTTP Host that is an address, no whole request, a TLS hello
+ * without a name), refused by the proxy with nothing dialed. Before it, the
+ * stream held the hand-off's connect (allowed, handed to the proxy) and
+ * nothing of its refusal, which only the log said.
+ *   {"event":"proxy_unreadable","run":R,"proxy_conn":N,"proxy_kind":"tls|
+ *    http|connect|none","why":W,"timestamp_ns":TS} */
+static void px_unreadable_record(uint64_t id, pp_kind_t kind, const char *why) {
+    FILE *f = rec_begin();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(f, "{\"event\":\"proxy_unreadable\",\"run\":\"%s\",\"proxy_conn\":%llu,\"proxy_kind\":\"%s\",\"why\":\"",
+            g_run_id, (unsigned long long)id, pp_kind_name(kind));
+    json_escape(f, why);
+    fprintf(f, "\",\"timestamp_ns\":%lld}\n", (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+    rec_end(NULL);
+}
+
 /* The proxy_close record (step 7), chained like a resolution record:
  *   {"event":"proxy_close","run":R,"proxy_conn":N,"why":"closed|reset|idle|
  *    run_end|unreported","bytes_up":U,"bytes_down":D,"relay_ms":M,
@@ -1213,6 +1232,7 @@ static int proxy_service(const struct policy *p) {
             log_line_start();
             fprintf(g_log, "[warden] proxy: connection %llu (%s) refused by the proxy: %s\n",
                     (unsigned long long)m.id, pp_kind_name((pp_kind_t)m.kind), m.why);
+            px_unreadable_record(m.id, (pp_kind_t)m.kind, m.why);
         }
     }
 }

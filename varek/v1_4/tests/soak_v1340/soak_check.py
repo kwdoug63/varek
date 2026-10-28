@@ -36,7 +36,9 @@ and, for the ship gate's runs (meta.json's ship_gate, v1.36 step 12):
                 audit given the plan's copy beside it: its SHA-256 the
                 gate's); refused outside the plan only the probes' reads of
                 /etc/hostname, by the agent and by its sub-agent; refused
-                otherwise only the probes' calls and glibc's nscd
+                otherwise only the probes' calls and glibc's nscd; the
+                metadata probe's connections, which the egress proxy
+                refuses, each in the stream (proxy_unreadable)
   sub-agents    each long agent's build sub-agent and MCP server launched
                 and settled, the server's own rules holding it
   volume pods   each node's ran the whole run, every read done; the largest
@@ -333,7 +335,7 @@ def main():
     for node in meta["nodes"]:
         for s in glob.glob(f"{d}/streams/{node}/*.jsonl"):
             v = {"node": node, "records": 0, "end": False, "deny": 0, "allow": 0, "denied": [], "subs": set(),
-                 "settled": collections.Counter(), "sub_recs": collections.Counter()}
+                 "settled": collections.Counter(), "sub_recs": collections.Counter(), "unreadable": 0}
             rs = None
             for r in records(s):
                 if rs is None:
@@ -343,6 +345,8 @@ def main():
                 v["records"] += 1
                 if r.get("event") == "run_end":
                     v["end"] = True
+                elif r.get("event") == "proxy_unreadable":
+                    v["unreadable"] += 1
                 elif r.get("event") == "subagent_settled":
                     v["settled"][(str(r.get("subagent", "")).split("#")[0], r.get("result"))] += 1
                 f = r.get("decision_final")
@@ -488,6 +492,15 @@ def main():
         srv = sum(1 for v in streams.values() for r in v["denied"]
                   if r.get("sub") == "files" and str(r.get("resolved") or r.get("target") or "") == "/etc/passwd")
         c(srv > 0, "the MCP server held to its own rules: its read of /etc/passwd (the agent's to read) refused", f"{srv}")
+        # the metadata probe's connection, refused by the egress proxy (its
+        # Host an address): a proxy_unreadable record for each
+        meta_probes = {f"long-{i}": sum(1 for r in agent_log(jl(f"{d}/logs/long-{i}.jsonl"))["probes"]
+                                        if r["probe"] == "metadata") for i in range(len(meta["nodes"]))}
+        unrec = [(v["pod"], v["unreadable"], meta_probes[v["pod"]]) for v in longs.values()
+                 if v["unreadable"] < meta_probes.get(v["pod"], 0)]
+        c(longs and not unrec, "the metadata probe's connections, refused by the egress proxy, each in the stream "
+          "(proxy_unreadable)", "; ".join(f"{p}: {n} of {m}" for p, n, m in unrec) or
+          f"{sum(v['unreadable'] for v in longs.values())} records, {sum(meta_probes.values())} probes")
         need = GATE_RECORDS if hours >= 24 else int(0.5 * meta.get("volume_rate", 0) * hours * 3600)
         bv = streams.get(big, {})
         c(big is not None and bv.get("records", 0) > need,
