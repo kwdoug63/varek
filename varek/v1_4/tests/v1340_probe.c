@@ -29,6 +29,10 @@
 // and with "hold", waiting 4 s after.
 // v1.36 step 4, with "env NAME": its value in the environment (env: VALUE,
 // or env: none), the placeholder the NRI plugin set.
+// v1.36 step 7, with "rename FROM TO": rename: ok, or its errno's name.
+// (A dry run lets a rename the policy refuses go to the kernel: from one
+// directory to another, Landlock refuses it, EXDEV, unless the launcher's
+// set grants it beneath them.)
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -208,6 +212,7 @@ int main(int argc, char **argv) {
         if (argc > 4) { struct timespec t = { 4, 0 }; nanosleep(&t, NULL); }
         return 0;
     }
+    if (argc > 3 && !strcmp(argv[1], "rename")) { printf("rename: %s\n", rename(argv[2], argv[3]) == 0 ? "ok" : en(errno)); return 0; }
     if (argc > 2 && !strcmp(argv[1], "env")) { const char *v = getenv(argv[2]); printf("env: %s\n", v ? v : "none"); return 0; }
     if (argc > 1 && !strcmp(argv[1], "wait")) { printf("waiting\n"); fflush(stdout); for (;;) sleep(1); }
     if (argc > 1 && !strcmp(argv[1], "launch")) {

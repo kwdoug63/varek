@@ -318,7 +318,8 @@ spec:
   (other pods, the API server, the instance metadata service). Its record
   says `"dry_run_refused": true`, and suggest reads it as the policy's
   refusal. No launch is held (no writable mount is made noexec, and the
-  launcher's Landlock set is `/`). As on a host, a dry run takes no plan,
+  launcher's Landlock set is `/`, moving files between directories
+  granted). As on a host, a dry run takes no plan,
   credentials or sub-agents.
 - **A trust bundle** is the roots inspecting mode trusts in place of the
   node image's. Put the bundles in a ConfigMap of the release's namespace

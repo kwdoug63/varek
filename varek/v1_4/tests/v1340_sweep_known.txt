@@ -67,6 +67,10 @@
 #            and what is read from their streams later, differs.
 #  STAND-IN  how the stand-in differs from a pod in a way that does not bear
 #            on the node agent (named in the reason).
+#  D6A       v1.36 step 7 (D6a): in a pod a dry run refuses a connect the
+#            policy refuses all the same (its network is the cluster's), the
+#            record the policy's refusal, enforced, with dry_run_refused; on
+#            a host the Warden dials it, recorded not enforced.
 test-v1121	^O_CREAT in the allowed directory succeeds$	AS-USER: the policy has no require warden 1.29; the directory and trunc_me.txt are root's (probe: creat_allowed, trunc_allowed DENIED)
 test-v1121	^created file holds what the agent wrote$	AS-USER: the policy has no require warden 1.29; the directory and trunc_me.txt are root's (probe: creat_allowed, trunc_allowed DENIED)
 test-v1121	^created file honours the agent's umask	AS-USER: the policy has no require warden 1.29; the directory and trunc_me.txt are root's (probe: creat_allowed, trunc_allowed DENIED)
@@ -177,3 +181,11 @@ test-v1130	^a rule without flag clauses admits writes$	AS-USER: the policy is 1.
 test-v1130	^\.\.\. and appends$	AS-USER: the file the write would have made is not there
 test-v1130	^all three recorded as fragment_escape_flags	AS-USER: with no file, the opens fail resolution before their flags are decided (recorded resolution_failed, still refused)
 test-v1140	^prefix rule still admits the workspace	AS-USER: the policy is 1.14's, the directory root's
+test-v1290	^a connect the policy refuses is dialed by the Warden$	D6A: in a pod the dry run refuses the connect all the same (the agent's PermissionError), not dialed
+test-v1290	^\.\.\. recorded DENY, enforced:false \(dialed: at once or in progress\)$	D6A: the connect's record is the policy's refusal, enforced, with dry_run_refused, not dialed_fd_injection
+test-v1290	^the verdict stream \(a protected object\) is still refused$	STREAM: the stream the agent is given is the stand-in's copy of the container's, not the node agent's (a file on the node, outside every pod): not a protected object, so the dry run lets the read through
+test-v1290	^\.\.\. recorded protected_object, enforced$	STREAM: the copy is not a protected object, so its read is recorded let through (not enforced), not protected_object
+test-v1290	^forged: the protected object let through$	STREAM: there is no protected_object record in the run to forge (the copy is not a protected object)
+test-v1290	^\.\.\. and a call refused all the same as refused \(the stream\)$	STREAM: the read of the copy is let through (WOULD_REFUSE), not refused all the same
+test-v1290	^varek refusals --not-enforced: only the calls let through$	STREAM: the read of the copy is among the calls let through
+test-v1290	^varek refusals --enforced: only the calls refused$	STREAM: the read of the copy is not among the calls refused

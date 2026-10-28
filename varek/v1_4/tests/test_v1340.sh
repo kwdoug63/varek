@@ -999,6 +999,10 @@ PY
              python3 '$HERE/tools/varek_audit.py' --policy '${DS%.jsonl}.policy' --checker '$CERT' '$B/dry-forged2.jsonl' > '$B/dry-forged.out' 2>&1;
              [ \$? != 0 ] && grep -q 'not a refused connect or proxied name' '$B/dry-forged.out'"
     fi
+    mkdir -p "$B/work/ra" "$B/work/rb"; chmod 777 "$B/work/ra" "$B/work/rb"; echo f > "$B/work/ra/f"; chmod 666 "$B/work/ra/f"
+    lbundle dry3 "$B/s/l.sock" "$B/f/dry.json" dry "/varek/init -- /probe rename /work/ra/f /work/rb/g" dry work-exec; run dry3
+    check "... a rename the policy refuses, from one directory to another: let through (the launcher's set grants it beneath /)" sh -c \
+        "grep -qx 'rename: ok' '$B/dry3.out' && [ -e '$B/work/rb/g' ] && [ ! -e '$B/work/ra/f' ]"
     lbundle dry2 "$B/s/l.sock" "$B/f/dry.json" dry "/varek/init -- /probe" dry work-exec plan=held; run dry2
     check "refused: a pod's dry run with a plan (as on a host)" refused l dry2 'a dry run with --plan is refused'
     # -- the flow policy (D7b): its gate and breaker on the node, the session the pod's namespace and service account
