@@ -543,7 +543,7 @@ def audit(args, log):
         argv += ["--anchor", args.anchor]
     if args.allow_incomplete:
         argv.append("--allow-incomplete")
-    p = subprocess.run(argv + [log], capture_output=True, text=True)
+    p = subprocess.run(argv + (log if isinstance(log, list) else [log]), capture_output=True, text=True)
     problems = [ln.strip() for ln in p.stdout.splitlines() if "PROBLEM" in ln]
     # 0: verified; 3: verified, a dry run (not enforced, v1.29)
     return p.returncode in (0, 3), problems, p.stdout + p.stderr, p.returncode == 3
@@ -593,9 +593,11 @@ def cmd_follow(args):
     chained = {"head": cdx.LOG_CHAIN_IV, "n": 0, "signed": [], "since_signed": 0, "anchor_errors": []}
     run, ndec, buf, last = None, 0, "", time.monotonic()
     ended = False
+    segs = [path]           # v1.36 (D9): the stream's segments so far (the node agent's rotation)
+    seg_first = False       # the next record begins a segment
 
     def fail(lineno, why):
-        raise ExportError(f"{path}:{lineno}: {why}")
+        raise ExportError(f"{segs[-1]}:{lineno}: {why}")
 
     for _ in range(200):                       # the stream may not exist yet
         if os.path.exists(path):
@@ -607,6 +609,20 @@ def cmd_follow(args):
     try:
         while not ended:
             chunk = fh.readline()
+            if not chunk:
+                # v1.36 (D9): the stream goes on in its next segment once that
+                # is there (the Warden writes no more to this one then)
+                nxt = f"{path}.{len(segs) + 1}"
+                if os.path.exists(nxt):
+                    chunk = fh.readline()
+                    if not chunk:
+                        if buf:
+                            fail(lineno, "a segment that ends inside a line")
+                        fh.close()
+                        fh = open(nxt, encoding="utf-8", errors="surrogateescape", newline="\n")
+                        segs.append(nxt)
+                        seg_first, lineno, last = True, 0, time.monotonic()
+                        continue
             if not chunk:
                 if args.idle and time.monotonic() - last > args.idle:
                     problems.append(f"the stream stopped growing for {args.idle:g} s with no run_end "
@@ -628,6 +644,14 @@ def cmd_follow(args):
                 fail(lineno, "a line that is not JSON")
             if not isinstance(rec, dict):
                 fail(lineno, "a record that is not a JSON object")
+            # v1.36 (D9): a segment begins with a checkpoint that names it and the
+            # chain value the one before ended on; no other record names one
+            if seg_first or (rec.get("event") == "checkpoint" and ("segment" in rec or "prev_chain" in rec)):
+                if rec.get("event") != "checkpoint" or run is None or rec.get("run") != run or \
+                        rec.get("segment") != len(segs) or rec.get("prev_chain") != chained["head"].hex():
+                    fail(lineno, f"segment {len(segs)} does not begin with a checkpoint of this run that names "
+                                 f"it and the chain value segment {len(segs) - 1} ended on")
+                seg_first = False
             if run is None:
                 if rec.get("event") != "run_start":
                     continue
@@ -667,7 +691,7 @@ def cmd_follow(args):
         out.write(dumps(ev) + "\n")
     dry = False
     if ended:
-        ok, probs, _, dry = audit(args, path)
+        ok, probs, _, dry = audit(args, segs)
         problems += probs
     else:
         ok = False

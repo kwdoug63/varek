@@ -362,6 +362,7 @@ spec:
 | `spire.adminSocket`, `spire.self`, `spire.bundleConfigMap` | `""` | the SPIRE agent's admin socket on the node, the node agent's own SPIFFE ID, a ConfigMap holding the trust bundle |
 | `flowPolicy.stateDir` | `/var/lib/varek/flow` | where each node keeps a flow policy's breaker table (a host path, root's) |
 | `trustBundles.configMap` | `""` | a ConfigMap of trust bundles a `VarekPolicy` names by key (`spec.trustBundle`) |
+| `streams.rotateBytes` | `268435456` (256 MiB) | a stream past this size goes on in a new segment beside it (`.jsonl.2`, `.jsonl.3`, ...); `0` no rotation |
 
 ## What it does not do yet
 

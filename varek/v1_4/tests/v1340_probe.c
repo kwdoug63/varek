@@ -214,6 +214,13 @@ int main(int argc, char **argv) {
     }
     if (argc > 3 && !strcmp(argv[1], "rename")) { printf("rename: %s\n", rename(argv[2], argv[3]) == 0 ? "ok" : en(errno)); return 0; }
     if (argc > 2 && !strcmp(argv[1], "env")) { const char *v = getenv(argv[2]); printf("env: %s\n", v ? v : "none"); return 0; }
+    /* v1.36 step 8: N reads of a file (a stream long enough to rotate) */
+    if (argc > 3 && !strcmp(argv[1], "reads")) {
+        long n = atol(argv[2]);
+        for (long i = 0; i < n; i++) { int fd = open(argv[3], O_RDONLY); if (fd >= 0) close(fd); }
+        printf("reads: %ld\n", n);
+        return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "wait")) { printf("waiting\n"); fflush(stdout); for (;;) sleep(1); }
     if (argc > 1 && !strcmp(argv[1], "launch")) {
         setvbuf(stdout, NULL, _IONBF, 0);

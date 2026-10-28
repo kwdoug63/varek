@@ -139,14 +139,15 @@ def _chain_step(st, raw, rec, lineno, ndecisions, fail):
             fail(lineno, f"checkpoint counts {rec.get('records')} decision records, "
                          f"the stream holds {ndecisions} before it.")
         sig = m.group(2).decode() if m.group(2) else None
-        st["signed"].append({"event": event, "chain": h, "sig": sig, "line": lineno,
-                             "records": rec.get("records", 0), "ndec": ndecisions,
-                             "ts": rec.get("timestamp_ns")})
+        c = {"event": event, "chain": h, "sig": sig, "line": lineno,
+             "records": rec.get("records", 0), "ndec": ndecisions, "ts": rec.get("timestamp_ns")}
+        # v1.36 (D9): handed on as it comes (the audit keeps none), or kept
+        st["on_signed"]("signed", c) if "on_signed" in st else st["signed"].append(c)
         if sig:
             st["since_signed"] = 0
     elif event == "anchor_error":
-        st["anchor_errors"].append({"line": lineno, "anchoring": rec.get("anchoring"),
-                                    "errno": rec.get("errno")})
+        ae = {"line": lineno, "anchoring": rec.get("anchoring"), "errno": rec.get("errno")}
+        st["on_signed"]("anchor_error", ae) if "on_signed" in st else st["anchor_errors"].append(ae)
 
 
 # v1.28: the events of credential release and revocation (varek_audit.py)
@@ -183,139 +184,189 @@ def _parse_log(stream, allow_incomplete=False, meta=None):
     The chain alone only catches accidental damage (anyone can recompute it);
     what it gives the audit is a single value per record that signatures and
     an external anchor can seal. The signed records ("sig") are returned in
-    meta["log"] for tools/varek_audit.py to verify."""
-    name = getattr(stream, "name", "<stdin>")
+    meta["log"] for tools/varek_audit.py to verify.
+
+    v1.36 (D9): this collects what _iter_log yields, one record at a time,
+    for the exporters; tools/varek_audit.py reads _iter_log itself and keeps
+    no record once its checks have seen it."""
+    records = []
+    m = meta if meta is not None else {}
+    lines = {}
+    lists = (("plan_step", "plan_events"), ("plan_gate", "plan_events"), ("resolution", "resolutions"),
+             ("proxy_close", "proxy_closes"), ("request_body", "request_bodies"),
+             ("exec_result", "exec_results"), ("subagent_settled", "subagent_events"))
+    for item in _iter_log(stream, allow_incomplete, m):
+        rec, lineno = item[1], item[2]
+        lines[id(rec)] = lineno           # v1.26.1 review: each record's place in the stream
+        if item[0] == "dec":
+            records.append(rec)
+        elif item[0] == "ev":
+            event, before = rec.get("event"), item[3]
+            # v1.18.0: this run's plan_gate record goes to the attestation
+            if event == "plan_gate":
+                m["plan_gate"] = rec
+            # v1.35 step 7: the plan gate's records; v1.24: the resolution
+            # records; v1.26 (step 7): the proxy's closes; v1.26.1 (step 6): an
+            # inspected request's body; v1.27 (step 4): each allowed launch's
+            # outcome; v1.28.1 review: how each sub-agent's launch settled;
+            # each with the number of decision records before it
+            for ev, key in lists:
+                if event == ev:
+                    m.setdefault(key, []).append((before, rec))
+            # v1.28: credentials and revocation
+            if event in CRED_EVENTS:
+                m.setdefault("cred_events", []).append((before, rec))
+            # v1.25: the stub resolver's questions and the resolutions, in
+            # stream order; v1.26: and the synthetic addresses
+            if event in ("resolution", "dns_question", "synthetic_address"):
+                m.setdefault("dns_events", []).append(rec)
+    m["lineno"] = lines
+    m["log"] = m.pop("chain", None)
+    m.pop("ndecisions", None)
+    return m.pop("_run", None), records, m.get("run_end") is not None, m.pop("_warden", VAREK_VERSION)
+
+
+def _iter_log(stream, allow_incomplete=False, meta=None, on_line=None, on_signed=None):
+    """v1.36 (D9): _parse_log's checks, one record at a time. Yields
+    ("dec", record, line) for each decision record (its seq is its place)
+    and ("ev", record, line, decisions before it) for each other record of
+    the run but run_start and run_end, which go to meta["run_start"] and
+    meta["run_end"] (and are yielded as ("start", record, line) and ("end",
+    record, line)). The chain's state is meta["chain"]; with on_signed, each
+    checkpoint-type record and each anchor_error is handed to it instead of
+    being kept (("signed", entry) or ("anchor_error", entry)). on_line(rec,
+    line) sees every record of the run (the token scan).
+
+    stream may be a list: the segments of one stream, in order (the node
+    agent's rotation). Each segment after the first begins with a
+    checkpoint naming its number ("segment": 2, 3, ...) and the chain value
+    the segment before it ended on ("prev_chain"); the chain runs on across
+    them, and lines are counted across them."""
+    streams = stream if isinstance(stream, list) else [stream]
+    names = [getattr(s, "name", "<stdin>") for s in streams]
+    bases = []          # (lines before the segment, its name)
 
     def fail(lineno, why):
-        raise StreamError(f"varek_cyclonedx: {name}:{lineno}: {why} "
+        base, name = next(((b, n) for b, n in reversed(bases) if b < lineno), (0, bases[-1][1] if bases else
+                                                                                names[0]))
+        raise StreamError(f"varek_cyclonedx: {name}:{lineno - base if lineno else 0}: {why} "
                           f"Refusing to emit a BOM.")
 
     run = None
-    records = []
+    ndec = 0
     ended = None
     warden_version = VAREK_VERSION
     chained = None      # v1.16: the chain state, when run_start says the stream is chained
     early = {}          # v1.35 step 9 (review): the run ids of records before run_start, by line
-    for lineno, raw in enumerate(stream, 1):
-        if not raw.startswith("{"):
-            continue
-        try:
-            rec = json.loads(raw)
-        except ValueError as e:      # v1.25 review: also an integer past Python's digit limit
-            fail(lineno, f"record is not valid JSON ({e}).")
-        if not isinstance(rec, dict):
-            fail(lineno, "record is not a JSON object.")
-        if meta is not None:             # v1.26.1 review: each record's place in the stream
-            meta.setdefault("lineno", {})[id(rec)] = lineno
-        event = rec.get("event")
-        if run is None and event != "run_start" and isinstance(rec.get("run"), str):
-            early.setdefault(rec["run"], lineno)
-        if event == "run_start" or (run is not None and rec.get("run") == run):
-            if chained is not None or (event == "run_start" and run is None
-                                       and rec.get("log") == LOG_CHAIN_FORMAT):
-                if chained is None:
-                    chained = {"head": LOG_CHAIN_IV, "n": 0, "signed": [], "since_signed": 0,
-                               "anchor_errors": []}
-                if ended is not None:
-                    fail(lineno, "record after run_end.")
-                _chain_step(chained, raw, rec, lineno, len(records), fail)
-        if event == "run_start":
-            if run is not None:
-                fail(lineno, "second run_start in one stream.")
-            run = rec.get("run")
-            if not isinstance(run, str) or len(run) != 32:
-                fail(lineno, "run_start has no valid run id.")
-            if run in early:     # v1.35 step 9 (review): unchained, so put there by someone else
-                fail(early[run], "a record of the run before its run_start (the Warden writes run_start "
-                                 "first): not one the chain covers.")
-            w = rec.get("warden")
-            if isinstance(w, str) and w:
-                warden_version = w
-            if chained is None and _version_at_least(w, (1, 16)):
-                fail(lineno, "run_start names a Warden that chains its records (1.16 or later) "
-                             "but the stream is not chained: the chain was stripped.")
-            if meta is not None:
-                meta["run_start"] = rec      # v1.15: policy_sha256, for the audit
-            continue
-        if "decision_final" in rec and event is not None:
-            # v1.31 review: a decision record carries no event (the exporters
-            # would read it as the event it names)
-            fail(lineno, f"a decision record that also says it is a {event!r} event.")
-        if "decision_final" not in rec and event != "run_end":
-            # e.g. a pre-launch plan record; carries no authorization. v1.18.0:
-            # this run's plan_gate record (chained above) goes to the attestation.
-            if event == "plan_gate" and run is not None and rec.get("run") == run \
-                    and meta is not None:
-                meta["plan_gate"] = rec
-            # v1.35 step 7: the plan gate's records, each with the number of
-            # decision records before it (varek_audit.py checks them together)
-            if event in ("plan_step", "plan_gate") and run is not None and rec.get("run") == run \
-                    and meta is not None:
-                meta.setdefault("plan_events", []).append((len(records), rec))
-            # v1.24: this run's resolution records, each with the number of
-            # decision records before it (varek_audit.py checks a connect
-            # decided on a name against the resolutions it relied on).
-            if event == "resolution" and run is not None and rec.get("run") == run \
-                    and meta is not None:
-                meta.setdefault("resolutions", []).append((len(records), rec))
-            # v1.25: the stub resolver's questions and the resolutions, in
-            # stream order (varek_audit.py checks the budgets and that every
-            # name looked up on demand was asked for first). v1.26: and the
-            # synthetic addresses given with the proxy on.
-            # v1.26 (step 7): the proxy's close records, each with the number
-            # of decision records before it
-            if event == "proxy_close" and run is not None and rec.get("run") == run \
-                    and meta is not None:
-                meta.setdefault("proxy_closes", []).append((len(records), rec))
-            # v1.26.1 (step 6): an inspected request's body (its length and SHA-256)
-            if event == "request_body" and run is not None and rec.get("run") == run \
-                    and meta is not None:
-                meta.setdefault("request_bodies", []).append((len(records), rec))
-            # v1.27 (step 4): each allowed launch's outcome, after its record
-            if event == "exec_result" and run is not None and rec.get("run") == run \
-                    and meta is not None:
-                meta.setdefault("exec_results", []).append((len(records), rec))
-            # v1.28.1 review: how each sub-agent's launch settled
-            if event == "subagent_settled" and run is not None and rec.get("run") == run \
-                    and meta is not None:
-                meta.setdefault("subagent_events", []).append((len(records), rec))
-            # v1.28: credentials and revocation, each with the number of
-            # decision records before it
-            if event in CRED_EVENTS and run is not None and rec.get("run") == run and meta is not None:
-                meta.setdefault("cred_events", []).append((len(records), rec))
-            if event in ("resolution", "dns_question", "synthetic_address") and run is not None \
-                    and rec.get("run") == run and meta is not None:
-                meta.setdefault("dns_events", []).append(rec)
-            continue
-        if run is None:
-            fail(lineno, "record before run_start (a pre-v1.12.1 log, or not a "
-                         "Warden stream); its records cannot be authenticated.")
-        if ended is not None:
-            fail(lineno, "record after run_end.")
-        if rec.get("run") != run:
-            fail(lineno, "foreign record: its run id does not match this run's "
-                         "run_start (it was not written by this Warden run).")
-        if event == "run_end":
-            if rec.get("records") != len(records):
-                fail(lineno, f"run_end counts {rec.get('records')} records, the "
-                             f"stream holds {len(records)}.")
-            ended = rec
-            continue
-        if rec.get("seq") != len(records):
-            fail(lineno, f"seq {rec.get('seq')} where {len(records)} was expected "
-                         f"(a record is missing, repeated or foreign).")
-        records.append(rec)
+    lineno = 0
+    segment = 2         # v1.36 (D9): the next segment's number
+    for k, fh in enumerate(streams, 1):
+        bases.append((lineno, names[k - 1]))
+        first = True
+        for raw in fh:
+            lineno += 1
+            if not raw.startswith("{"):
+                continue
+            try:
+                rec = json.loads(raw)
+            except ValueError as e:      # v1.25 review: also an integer past Python's digit limit
+                fail(lineno, f"record is not valid JSON ({e}).")
+            if not isinstance(rec, dict):
+                fail(lineno, "record is not a JSON object.")
+            event = rec.get("event")
+            # v1.36 (D9): each segment after the first begins with a checkpoint
+            # that names it and the chain value the one before ended on (in
+            # its own file, or the segments put together in one)
+            if (k > 1 and first) or (event == "checkpoint" and ("segment" in rec or "prev_chain" in rec)):
+                if event != "checkpoint" or rec.get("segment") != segment or chained is None or run is None or \
+                        rec.get("run") != run or rec.get("prev_chain") != chained["head"].hex():
+                    fail(lineno, f"segment {segment} does not begin with a checkpoint of this run that names "
+                                 f"it and the chain value segment {segment - 1} ended on.")
+                segment += 1
+            first = False
+            if run is None and event != "run_start" and isinstance(rec.get("run"), str):
+                early.setdefault(rec["run"], lineno)
+            if event == "run_start" or (run is not None and rec.get("run") == run):
+                if chained is not None or (event == "run_start" and run is None
+                                           and rec.get("log") == LOG_CHAIN_FORMAT):
+                    if chained is None:
+                        chained = {"head": LOG_CHAIN_IV, "n": 0, "signed": [], "since_signed": 0,
+                                   "anchor_errors": []}
+                        if on_signed is not None:
+                            chained["on_signed"] = on_signed
+                        if meta is not None:
+                            meta["chain"] = chained
+                    if ended is not None:
+                        fail(lineno, "record after run_end.")
+                    _chain_step(chained, raw, rec, lineno, ndec, fail)
+            if event == "run_start":
+                if run is not None:
+                    fail(lineno, "second run_start in one stream.")
+                run = rec.get("run")
+                if not isinstance(run, str) or len(run) != 32:
+                    fail(lineno, "run_start has no valid run id.")
+                if run in early:     # v1.35 step 9 (review): unchained, so put there by someone else
+                    fail(early[run], "a record of the run before its run_start (the Warden writes run_start "
+                                     "first): not one the chain covers.")
+                w = rec.get("warden")
+                if isinstance(w, str) and w:
+                    warden_version = w
+                if chained is None and _version_at_least(w, (1, 16)):
+                    fail(lineno, "run_start names a Warden that chains its records (1.16 or later) "
+                                 "but the stream is not chained: the chain was stripped.")
+                if meta is not None:
+                    meta["run_start"] = rec      # v1.15: policy_sha256, for the audit
+                    meta["_run"], meta["_warden"] = run, warden_version
+                if on_line is not None:
+                    on_line(rec, lineno)
+                yield ("start", rec, lineno)
+                continue
+            if on_line is not None and run is not None and rec.get("run") == run:
+                on_line(rec, lineno)
+            if "decision_final" in rec and event is not None:
+                # v1.31 review: a decision record carries no event (the exporters
+                # would read it as the event it names)
+                fail(lineno, f"a decision record that also says it is a {event!r} event.")
+            if "decision_final" not in rec and event != "run_end":
+                # e.g. a pre-launch plan record; carries no authorization
+                if run is not None and rec.get("run") == run:
+                    yield ("ev", rec, lineno, ndec)
+                continue
+            if run is None:
+                fail(lineno, "record before run_start (a pre-v1.12.1 log, or not a "
+                             "Warden stream); its records cannot be authenticated.")
+            if ended is not None:
+                fail(lineno, "record after run_end.")
+            if rec.get("run") != run:
+                fail(lineno, "foreign record: its run id does not match this run's "
+                             "run_start (it was not written by this Warden run).")
+            if event == "run_end":
+                if rec.get("records") != ndec:
+                    fail(lineno, f"run_end counts {rec.get('records')} records, the "
+                                 f"stream holds {ndec}.")
+                ended = rec
+                if meta is not None:
+                    meta["run_end"] = ended
+                yield ("end", rec, lineno)
+                continue
+            if rec.get("seq") != ndec:
+                fail(lineno, f"seq {rec.get('seq')} where {ndec} was expected "
+                             f"(a record is missing, repeated or foreign).")
+            ndec += 1
+            yield ("dec", rec, lineno)
+        if k > 1 and first:
+            fail(lineno + 1, f"{names[k - 1]} holds no record (a segment begins with its checkpoint).")
 
     if meta is not None:
-        meta["log"] = chained            # v1.16: None for an unchained (pre-1.16) stream
-        meta["run_end"] = ended          # v1.25 review: when the run ended, for the audit
+        meta.setdefault("chain", chained)  # v1.16: None for an unchained (pre-1.16) stream
+        meta["run_end"] = ended            # v1.25 review: when the run ended, for the audit
+        meta["ndecisions"] = ndec
     if run is None:
         fail(0, "no run_start record: not a v1.12.1+ Warden stream.")
     if ended is None and not allow_incomplete:
         fail(0, "no run_end record: the stream is incomplete (the Warden did "
                 "not finish, or the log was cut). Use --allow-incomplete to "
                 "attest the part that is present.")
-    return run, records, ended is not None, warden_version
 
 
 def _ts(records):

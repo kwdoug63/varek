@@ -1084,6 +1084,78 @@ PY
     fi
 fi
 
+echo "== 14. the stream in segments (v1.36 step 8, D9) =="
+check "--node-stream-rotate without --node-agent is refused" sh -c \
+    "'$WARDEN' /dev/null --node-stream-rotate 65536 -- /bin/true; [ \$? = 2 ]"
+check "... and a size under 64 KiB, or not a number" sh -c \
+    "'$WARDEN' /dev/null --node-agent '$B/s/x.sock' --node-streams /tmp --node-stream-rotate 4096; [ \$? = 2 ] &&
+     '$WARDEN' /dev/null --node-agent '$B/s/x.sock' --node-streams /tmp --node-stream-rotate 64k; [ \$? = 2 ]"
+if [ ! -x "$HERE/tools/varek_keygen" ] || [ -z "$CERT" ]; then
+    skip "the stream in segments (needs tools/varek_keygen and the certificate checker)"
+else
+    "$HERE/tools/varek_keygen" "$B/rotkey" > /dev/null 2>&1
+    : > "$B/ranchor"; chmod 600 "$B/ranchor"
+    check "a node agent rotating its streams at 64 KiB, signing and anchoring" agent r "$B/p.txt" --sign-key "$B/rotkey" \
+        --anchor "$B/ranchor" --checkpoint-every 16 --node-stream-rotate 65536
+    bundle rot "$B/s/r.sock" "/probe reads 600 /data/allowed" 1; run rot
+    R0="$(stream r rot)"
+    SEGS="$R0"; k=2; while [ -e "$R0.$k" ]; do SEGS="$SEGS $R0.$k"; k=$((k + 1)); done
+    check "the reads ran, and the stream went on in segments beside it (.jsonl.2, .jsonl.3, ...)" sh -c \
+        "grep -qx 'reads: 600' '$B/rot.out' && [ -s '$R0.2' ] && [ -s '$R0.3' ]"
+    check "... each root's and 0600, none past the size by more than a record" sh -c \
+        "for s in $SEGS; do [ \"\$(stat -c '%u %a' \"\$s\")\" = '0 600' ] && [ \"\$(stat -c %s \"\$s\")\" -lt 70000 ] || exit 1; done"
+    check "each segment after the first begins with a checkpoint naming it and the chain value the one before ended on" \
+        python3 - $SEGS <<'PY'
+import json, sys
+prev = None
+for k, path in enumerate(sys.argv[1:], 1):
+    recs = [json.loads(l) for l in open(path) if l.startswith("{")]
+    if k > 1:
+        f = recs[0]
+        assert f.get("event") == "checkpoint" and f.get("segment") == k and f.get("prev_chain") == prev, (k, f)
+        assert "sig" in f, "the segment's checkpoint is signed"
+        assert not any("segment" in r for r in recs[1:]), k
+        assert not any(r.get("event") == "run_start" for r in recs), k
+    assert all(r.get("event") != "run_end" for r in recs) or k == len(sys.argv) - 1, k
+    prev = recs[-1]["chain"]
+PY
+    check "the audit verifies the segments, in order, with the node's key and the anchor" \
+        python3 "$HERE/tools/varek_audit.py" --policy "${R0%.jsonl}.policy" --checker "$CERT" \
+        --pubkey "$B/rotkey.pub" --anchor "$B/ranchor" $SEGS
+    cat $SEGS > "$B/rot-all.jsonl"
+    check "... and the segments put together in one file" \
+        python3 "$HERE/tools/varek_audit.py" --policy "${R0%.jsonl}.policy" --checker "$CERT" \
+        --pubkey "$B/rotkey.pub" --anchor "$B/ranchor" "$B/rot-all.jsonl"
+    python3 "$HERE/tools/varek_audit.py" --policy "${R0%.jsonl}.policy" --checker "$CERT" --pubkey "$B/rotkey.pub" \
+        "$R0" > "$B/rot1.out" 2>&1; rrc=$?
+    check "the first segment alone: refused (no run_end), and the audit says where the stream goes on" sh -c \
+        "[ $rrc = 1 ] && grep -q 'the stream goes on in $R0.2 (the node agent rotated it)' '$B/rot1.out'"
+    check "a segment left out: refused" sh -c "! python3 '$HERE/tools/varek_audit.py' --policy '${R0%.jsonl}.policy' \
+        --checker '$CERT' --pubkey '$B/rotkey.pub' $(echo $SEGS | cut -d' ' -f1,3-) > '$B/rot2.out' 2>&1 &&
+        grep -q 'segment 2 does not begin with a checkpoint' '$B/rot2.out'"
+    check "segments out of order: refused" sh -c "! python3 '$HERE/tools/varek_audit.py' --policy '${R0%.jsonl}.policy' \
+        --checker '$CERT' --pubkey '$B/rotkey.pub' $(echo $SEGS | awk '{t=$2; $2=$3; $3=t; print}') > /dev/null 2>&1"
+    # an editor who re-makes the chain (it carries no secret) but names another
+    # chain value in a segment's checkpoint
+    check "a segment's checkpoint naming another chain value: refused, the chain re-made around it" sh -c \
+        "sed '0,/\"prev_chain\":\"[0-9a-f]*\"/s//\"prev_chain\":\"$(printf '0%.0s' $(seq 64))\"/' '$B/rot-all.jsonl' > '$B/rot-forged.jsonl' &&
+         python3 '$HERE/tests/log_rechain.py' '$B/rot-forged.jsonl' > '$B/rot-forged2.jsonl' &&
+         ! python3 '$HERE/tools/varek_audit.py' --policy '${R0%.jsonl}.policy' --checker '$CERT' '$B/rot-forged2.jsonl' > '$B/rot3.out' 2>&1 &&
+         grep -q 'segment 2 does not begin with a checkpoint of this run that names it and the chain value segment 1 ended on' '$B/rot3.out'"
+    python3 "$HERE/tools/varek_node_export.py" --streams "$B/streams-r" --once --checker "$CERT" \
+        --pubkey "$B/rotkey.pub" --anchor "$B/ranchor" --device node-1 -o "$B/rot-ocsf.jsonl" > "$B/rot-export.out" 2>&1; xrc=$?
+    check "the node exporter follows the segments in turn: the run's every decision as OCSF, its audit passed" \
+        python3 - "$B/rot-ocsf.jsonl" "$xrc" $SEGS <<'PY'
+import json, sys
+ev = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+ndec = sum(1 for p in sys.argv[3:] for l in open(p) if l.startswith("{") and '"decision_final"' in l)
+rids = {e.get("unmapped", {}).get("varek", {}).get("report_id") for e in ev}
+last = ev[-1]["unmapped"]["varek"]
+sys.exit(0 if sys.argv[2] == "0" and last.get("event") == "audit" and last["audit"].get("passed") is True
+         and len(rids - {None}) == ndec and ndec >= 600 else 1)
+PY
+fi
+
 echo
 [ "$fail" = 0 ] && echo "test_v1340: PASS ($skips skipped)" || echo "test_v1340: FAIL"
 [ "$fail" = 0 ]

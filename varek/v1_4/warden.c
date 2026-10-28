@@ -2299,10 +2299,29 @@ static bool          g_log_broken = false;  /* a record could not be written */
 static FILE         *g_rf;                  /* the record being built */
 static char         *g_rb;
 static size_t        g_rl;
+/* v1.36 (D9): the node agent's rotation. A supervisor's stream goes on in a
+ * new segment, DIR/<container>.<supervisor>.jsonl.N (N = 2, 3, ...), once the
+ * one it writes has passed --node-stream-rotate bytes: at the next record, so
+ * each segment ends between two records and none follows run_end. Each
+ * segment begins with a checkpoint that names it and the chain value the one
+ * before it ended on ("segment", "prev_chain"); signed and anchored as any
+ * checkpoint, and the chain runs on across the files. */
+static uint64_t      g_rotate;              /* bytes a segment holds (0: no rotation) */
+static uint64_t      g_seg_bytes;           /* written to this segment */
+static unsigned      g_seg = 1;             /* this segment's number */
+static int           g_seg_dir = -1;        /* the streams' directory */
+static char          g_seg_base[200];       /* <container>.<supervisor> */
+static bool          g_rotate_due, g_rotating;
 
 static bool checkpoints_on(void) { return g_signing || g_anchor_fd >= 0; }
 
+static void seg_rotate(void);
+
 static FILE *rec_begin(void) {
+    if (g_rotate_due && !g_rotating) {
+        g_rotate_due = false;
+        seg_rotate();
+    }
     rewind(g_rf);
     return g_rf;
 }
@@ -2368,8 +2387,9 @@ static void rec_end(const char *ckpt_event) {
     }
     log_line_start();
     fwrite(g_rb, 1, bl, g_log);
-    fprintf(g_log, ",\"chain\":\"%s\"%s%s%s}\n", chain_hex,
-            sign ? ",\"sig\":\"" : "", sign ? sig_hex : "", sign ? "\"" : "");
+    int tl = fprintf(g_log, ",\"chain\":\"%s\"%s%s%s}\n", chain_hex,
+                     sign ? ",\"sig\":\"" : "", sign ? sig_hex : "", sign ? "\"" : "");
+    if (g_rotate && (g_seg_bytes += bl + (tl > 0 ? (uint64_t)tl : 0)) >= g_rotate) g_rotate_due = true;
     /* A stream that cannot be written stops supervision (fail closed): the
      * agent must not run on unrecorded. */
     if (fflush(g_log) != 0 || ferror(g_log)) g_log_broken = true;
@@ -2386,6 +2406,45 @@ static void emit_anchor_error(const char *event, int err) {
                "\"records\":%" PRIu64 ",\"errno\":%d,\"anchor_errors\":%" PRIu64 "}\n",
             g_run_id, event, g_records, err, g_anchor_errors);
     rec_end(NULL);                      /* chained; not itself anchored */
+}
+
+/* v1.36 (D9): the stream goes on in its next segment (g_rotate). If the
+ * file cannot be made, it goes on in this one (it is whole either way), and
+ * is tried again after as much again. */
+static void seg_rotate(void) {
+    char name[256], prev[65];
+    int n = snprintf(name, sizeof name, "%s.jsonl.%u", g_seg_base, g_seg + 1);
+    /* this segment whole on disk before the next is there (a follower moves
+     * on when it sees the next) */
+    int fd = n > 0 && (size_t)n < sizeof name && g_seg_dir >= 0 && fflush(g_log) == 0 ?
+             openat(g_seg_dir, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600) : -1;
+    if (fd < 0 || dup3(fd, fileno(g_log), O_CLOEXEC) < 0) {
+        int err = errno;
+        if (fd >= 0) {
+            close(fd);
+            (void)unlinkat(g_seg_dir, name, 0);
+        }
+        g_seg_bytes = 0;
+        log_line_start();
+        fprintf(g_log, "[warden] could not begin the stream's segment %s (%s); it goes on in this one\n", name,
+                strerror(err));
+        fflush(g_log);
+        return;
+    }
+    (void)dup2(fd, STDERR_FILENO);          /* the supervisor's own lines go on there too */
+    close(fd);
+    g_seg++;
+    g_seg_bytes = 0;
+    sodium_bin2hex(prev, sizeof prev, g_chain, sizeof g_chain);
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    g_rotating = true;
+    FILE *f = rec_begin();
+    fprintf(f, "{\"event\":\"checkpoint\",\"run\":\"%s\",\"records\":%" PRIu64 ",\"segment\":%u,"
+               "\"prev_chain\":\"%s\",\"timestamp_ns\":%lld}\n",
+            g_run_id, g_records, g_seg, prev, (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+    rec_end("checkpoint");
+    g_rotating = false;
 }
 
 /* A checkpoint: a signed (and anchored) record that seals every record before
@@ -5792,6 +5851,8 @@ static void usage(const char *argv0) {
         "               [--node-svid-helper <varek-svid>]]   (v1.36: the pod's user's token and SVID)\n"
         "              [--node-trust-bundles <dir>] [--node-flow-state <dir>]   (v1.36: the trust bundles' ConfigMap,\n"
         "               the flow policies' breaker table)\n"
+        "              [--node-stream-rotate <bytes>]   (v1.36: each stream goes on in a new segment,\n"
+        "               <container>.<supervisor>.jsonl.2, .3, ..., past this size; the audit takes them in order)\n"
         "       %s <policy.txt> --oci-filter [--plan PLAN | --no-plan]   (v1.34: the policy's filter in OCI's form, for the\n"
         "              NRI plugin; v1.35: with the pod's plan, or for a pod that names none)\n"
         "              [--credential-list FILE --pod-namespace NS]   (v1.36: the cluster's VarekCredential resources)\n"
@@ -5975,6 +6036,7 @@ int main(int argc, char **argv) {
     wr_config_default(&dns_cfg);
     int sep_idx = -1;
     const char *node_sock = NULL, *node_streams = NULL;                     /* v1.34 step 2 */
+    const char *rotate_arg = NULL;                                          /* v1.36 (D9) */
     const char *node_launcher = NULL;                                       /* v1.34 step 3 */
     /* v1.36 step 4 (D1, D2): the directory a file: store must be under (the
      * chart's Secrets); --oci-filter's cluster list of VarekCredential
@@ -6024,6 +6086,8 @@ int main(int argc, char **argv) {
             g_node_trust_dir = argv[++i];
         } else if (strcmp(argv[i], "--node-flow-state") == 0 && !g_node_flow_state) {
             g_node_flow_state = argv[++i];
+        } else if (strcmp(argv[i], "--node-stream-rotate") == 0 && !rotate_arg && i + 1 < argc) {  /* v1.36 (D9) */
+            rotate_arg = argv[++i];
         } else if (strcmp(argv[i], "--credential-list") == 0 && !cred_list_arg) {
             cred_list_arg = argv[++i];
         } else if (strcmp(argv[i], "--pod-namespace") == 0 && !pod_ns_arg) {
@@ -6181,6 +6245,7 @@ int main(int argc, char **argv) {
         ((g_node_spire_self || g_node_svid_bin) && !g_node_spire) ||
         (node_sock && (obo_arg || svid_arg || obo_exp_arg)) ||     /* step 6: each pod names its own */
         ((g_node_trust_dir || g_node_flow_state) && !node_sock) ||  /* step 7: so the dry run, trust bundle, */
+        (rotate_arg && !node_sock) ||                               /* step 8 (D9) */
         (node_sock && (g_dry || g_trust_bundle_arg || session_arg || state_arg || gstatus_arg))) {   /* flow */
         fprintf(stderr, "[warden] --node-agent takes --node-streams DIR, and no agent (\"--\"), check, plan (each "
                 "pod names its own, v1.35) or --writable-exec (a pod's mounts are checked, D4); --node-launcher "
@@ -6190,8 +6255,20 @@ int main(int argc, char **argv) {
                 "--on-behalf-of, --agent-svid or --on-behalf-of-expiry (each pod names its user's token, "
                 "varek.dev/on-behalf-of, and its SVID is its own, from SPIRE); --node-trust-bundles and "
                 "--node-flow-state with --node-agent, and not --dry-run, --trust-bundle, --session, "
-                "--breaker-state or --gate-status (each pod's VarekPolicy says them)\n");
+                "--breaker-state or --gate-status (each pod's VarekPolicy says them); --node-stream-rotate "
+                "with --node-agent\n");
         return 2;
+    }
+    if (rotate_arg) {                       /* v1.36 (D9): a segment's size, 64 KiB or more */
+        char *end = NULL;
+        errno = 0;
+        unsigned long long v = strtoull(rotate_arg, &end, 10);
+        if (errno || end == rotate_arg || *end || rotate_arg[0] == '-' || v < 65536) {
+            fprintf(stderr, "[warden] --node-stream-rotate takes a size in bytes, 65536 or more (leave it out "
+                    "for no rotation)\n");
+            return 2;
+        }
+        g_rotate = v;
     }
     if (node_sock && node_listen(node_sock, node_streams, node_launcher, &policy_path, &plan_path, &flow_path) < 0)
         return 1;
