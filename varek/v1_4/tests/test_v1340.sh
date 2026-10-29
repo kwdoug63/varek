@@ -319,8 +319,11 @@ check "... and the process it names is not killed" kill -0 "$VICTIM"
 # held on another connection until the runtime has ended. Ended but not yet
 # reaped (a zombie, its parent read): taken, its supervisor going on to the
 # bundle the stand-in lacks, and said in the node agent's log. Reaped
-# before it could be read (nothing then ties it to the process it names,
-# review): refused
+# before it could be read (nothing of it then ties it to the process it
+# names, review): v1.36 step 12, the process's first call on the listener
+# sent ties them (crun under CRI-O, OpenShift's runtime, is reaped so when
+# two containers start together); until then nothing is done for it, and a
+# container not tied so is refused, not ended
 "$B/rt" "$B/s/a.sock" gone zombie > "$B/rt.out" 2>&1; rrc=$?
 for _ in $(seq 100); do cat "$B"/streams-a/gone.*.jsonl 2>/dev/null | grep -q 'container gone refused' && break; sleep 0.1; done
 check "a runtime that ended once it sent the state, not yet reaped: its child taken" sh -c \
@@ -328,9 +331,62 @@ check "a runtime that ended once it sent the state, not yet reaped: its child ta
 check "... and the node agent's log says it was taken by the runtime's parent" \
     grep -q "the runtime (pid [0-9]*) ended before it could be read; its container's process $(head -1 "$B/rt.out" 2>/dev/null) taken by the runtime's parent" "$B/a.log"
 "$B/rt" "$B/s/a.sock" reaped reaped > "$B/rt2.out" 2>&1; rrc2=$?
-for _ in $(seq 100); do grep -q 'was reaped before it could be read' "$B/a.log" && break; sleep 0.1; done
-check "a runtime reaped before it could be read: refused, and its child not taken" sh -c \
-    "[ $rrc2 = 0 ] && grep -q \"ended and was reaped before it could be read: nothing ties it to the process the state names ($(head -1 "$B/rt2.out" 2>/dev/null))\" '$B/a.log' && ! ls '$B'/streams-a/reaped.* > /dev/null 2>&1"
+P2="$(head -1 "$B/rt2.out" 2>/dev/null)"
+for _ in $(seq 100); do grep -q "the process the state names ($P2) ended before a call came" "$B/a.log" && break; sleep 0.1; done
+check "a runtime reaped before it could be read, its child making no call: not taken (it waits for its first call)" \
+    grep -q "the runtime (pid [0-9]*) was reaped before it could be read: its container's process $P2 waits for its first call" "$B/a.log"
+check "... nothing done for it until then (no stream), it ending before a call: refused, and not ended by the node agent" sh -c \
+    "[ $rrc2 = 0 ] && grep -q 'and the process the state names ($P2) ended before a call came on the listener sent: refused' '$B/a.log' &&
+     grep -qx 'alive yes' '$B/rt2.out' && ! ls '$B'/streams-a/reaped.* > /dev/null 2>&1"
+# v1.36 step 12: the same, its child calling once it has sent its listener
+# (as a container's init does, ahead of its command): taken by that call,
+# its supervisor going on to the bundle the stand-in lacks
+"$B/rt" "$B/s/a.sock" called reaped-call > "$B/rt4.out" 2>&1; rrc4=$?
+P4="$(head -1 "$B/rt4.out" 2>/dev/null)"
+for _ in $(seq 100); do cat "$B"/streams-a/called.*.jsonl 2>/dev/null | grep -q 'container called refused' && break; sleep 0.1; done
+check "a runtime reaped before it could be read, its child calling: taken by its first call (the kernel's tie)" \
+    grep -q "the runtime (pid [0-9]*) was reaped before it could be read; its container's process $P4 taken by its first call" "$B/a.log"
+check "... its supervisor set up after it (its stream), the call held for it" sh -c \
+    "[ $rrc4 = 0 ] && cat '$B'/streams-a/called.*.jsonl | grep -q 'container called refused: cannot read the bundle'"
+# the runtime in a mount namespace of its own, read while it runs (runc
+# 1.2 and later as it creates a container: the matrix's containerd cells,
+# pods started together), its child calling: taken by that call
+"$B/rt" "$B/s/a.sock" privns private-call > "$B/rt9.out" 2>&1; rrc9=$?
+P9="$(head -1 "$B/rt9.out" 2>/dev/null)"
+for _ in $(seq 100); do cat "$B"/streams-a/privns.*.jsonl 2>/dev/null | grep -q 'container privns refused' && break; sleep 0.1; done
+check "a runtime read in a mount namespace of its own, its child calling: taken by its first call" \
+    grep -q "the runtime (pid [0-9]*) ran in a mount namespace of its own; its container's process $P9 taken by its first call" "$B/a.log"
+check "... its supervisor set up after it (its stream)" sh -c \
+    "[ $rrc9 = 0 ] && cat '$B'/streams-a/privns.*.jsonl | grep -q 'container privns refused: cannot read the bundle'"
+# a root process that reaches the socket names another process (under a
+# filter of its own, the shim's child) and sends a listener of its own
+# child's, which calls, then ends at once: refused at that call, the
+# process it named not ended, no stream
+"$B/rt" "$B/s/a.sock" forged2 forged > "$B/rt5.out" 2>&1; rrc5=$?
+P5="$(head -1 "$B/rt5.out" 2>/dev/null)"
+for _ in $(seq 100); do grep -q "not from the process the state names ($P5)" "$B/a.log" && break; sleep 0.1; done
+check "a state naming another process, sent with a listener of its own: refused at the first call (not that process's)" \
+    grep -q "and the first call on the listener sent came from process [0-9]* (thread [0-9]*), not from the process the state names ($P5): refused" "$B/a.log"
+check "... the process it named not ended, nothing done for it (no stream)" sh -c \
+    "[ $rrc5 = 0 ] && grep -qx 'alive yes' '$B/rt5.out' && ! ls '$B'/streams-a/forged2.* > /dev/null 2>&1"
+# a node agent waiting 2.5 s for a first call (VAREK_WARDEN_TEST_TIE_MS), one
+# container at a time (VAREK_WARDEN_TEST_TIES): no call in that time, refused
+# (not ended); a second while one waits, refused (not ended)
+VAREK_WARDEN_TEST_TIE_MS=2500 VAREK_WARDEN_TEST_TIES=1 agent t "$B/p.txt"
+"$B/rt" "$B/s/t.sock" quiet reaped > "$B/rt6.out" 2>&1; rrc6=$?
+P6="$(head -1 "$B/rt6.out" 2>/dev/null)"
+check "a container reaped before it could be read, no call within the time: refused, not ended" sh -c \
+    "[ $rrc6 = 0 ] && grep -q 'and no call came on the listener sent within 2500 ms: nothing ties it to the process the state names ($P6), refused' '$B/t.log' &&
+     grep -qx 'alive yes' '$B/rt6.out' && ! ls '$B'/streams-t/quiet.* > /dev/null 2>&1"
+"$B/rt" "$B/s/t.sock" first reaped > "$B/rt7.out" 2>&1 &
+RT7=$!
+for _ in $(seq 100); do grep -q "its container's process $(head -1 "$B/rt7.out" 2>/dev/null) waits for its first call" "$B/t.log" 2>/dev/null && break; sleep 0.1; done
+"$B/rt" "$B/s/t.sock" second reaped-call > "$B/rt8.out" 2>&1; rrc8=$?
+wait "$RT7"
+P8="$(head -1 "$B/rt8.out" 2>/dev/null)"
+check "a second while one waits for its first call (at most 1): refused, not ended" sh -c \
+    "[ $rrc8 = 0 ] && grep -q '1 waiting for their first call (at most 1): the process the state names ($P8) not ended' '$B/t.log' &&
+     grep -qx 'alive yes' '$B/rt8.out' && ! ls '$B'/streams-t/second.* > /dev/null 2>&1"
 # ended, its parent not where the runtime runs (another mount namespace):
 # what another root process's zombie would show; refused
 unshare -m "$B/rt" "$B/s/a.sock" elsewhere zombie > "$B/rt3.out" 2>&1; rrc3=$?

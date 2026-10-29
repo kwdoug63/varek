@@ -194,6 +194,28 @@ are stated below as limits. The largest:
   once for each hand-off. `varek refusals` lists it as UNREADABLE, and the
   OCSF export writes it as a Network Activity refusal (Denied, Blocked) to
   where the agent connected.
+- **A pod started with another could be refused at its start** (fixed;
+  found in the OpenShift run). On OpenShift's one node two supervised pods
+  were created in the same instant; one never ran (`exec container process
+  /varek/init: Function not implemented`). CRI-O's runtime, crun, sends the
+  node agent the container's listener, then ends without waiting, and
+  conmon reaps it at once. The node agent, taking the other pod's
+  connection, read this one after: with the runtime gone, nothing tied the
+  connection to the process it named, and it was refused (as v1.34's
+  review decided, so that a root process reaching the node agent's socket
+  cannot name another pod's process). The container failed closed: it
+  never ran unsupervised. containerd's runc can be reaped the same way.
+  Now, when the runtime cannot be read, the kernel ties them: the first
+  call on the listener sent must come from the process the state names.
+  Until it does, nothing is done for the container and the node agent ends
+  nothing; a listener sent with a state naming another process is refused
+  at that call, and one with no call within 120 s is refused. The node
+  agent's log says each container taken so. The matrix, starting 20 pods
+  at once, found the other side of the race: runc (1.2 and later) creates
+  a container from a mount namespace of its own, and when the node agent
+  read runc before it ended, it refused it for that. That runtime is now
+  tied the same way, by the container's first call. The 24-hour runs are
+  made again on the fixed image (to come).
 
 ## Known limits
 

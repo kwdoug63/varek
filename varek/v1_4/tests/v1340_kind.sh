@@ -830,6 +830,47 @@ check "section 4's stream, signed before the rebuild: verified still, with the o
          --node-keys '$OUT/node-keys2.json' '$SA' > '$OUT/pod-a.audit2' 2>&1 &&
      grep -q \"signed with node $NODE's key $NODE-${NKPUB:0:16}, admitted .*; retired at \" '$OUT/pod-a.audit2'"
 
+echo "== 12. supervised pods started together (v1.36 step 12)"
+# On OpenShift's one node (CRI-O, crun) two supervised pods started in the
+# same instant: one's runtime ended and was reaped while the node agent took
+# the other's connection, and the node agent refused it (nothing of the
+# runtime then tied it to the process it named); the pod never ran. The
+# container's first call now ties it (node_tie). BURST pods at once
+BURST=20
+kubectl -n "$NS" logs ds/varek-node -c node-agent > "$OUT/node-agent-burst0.log" 2>&1
+for i in $(seq "$BURST"); do
+    CHECK='(exec /bin/true); echo "launch_allowed: $?"' pod "burst-$i" team-a busybox > "$OUT/burst-$i.json"
+done
+python3 - "$OUT" "$BURST" > "$OUT/burst.json" <<'EOF'
+import json, sys
+print(json.dumps({"apiVersion": "v1", "kind": "List",
+                  "items": [json.load(open(f"{sys.argv[1]}/burst-{i}.json")) for i in range(1, int(sys.argv[2]) + 1)]}))
+EOF
+kubectl apply -f "$OUT/burst.json" > /dev/null 2>&1
+burst_ended() { kubectl -n team-a get pods -o jsonpath='{range .items[*]}{.metadata.name} {.status.phase}{"\n"}{end}' 2>/dev/null |
+                awk '$1 ~ /^burst-/ && ($2 == "Succeeded" || $2 == "Failed")' | wc -l; }
+for _ in $(seq 180); do [ "$(burst_ended)" -ge "$BURST" ] && break; sleep 1; done
+BOK=0
+for i in $(seq "$BURST"); do
+    kubectl -n team-a logs "burst-$i" > "$OUT/burst-$i.log" 2>&1
+    if [ "$(kubectl -n team-a get pod "burst-$i" -o jsonpath='{.status.phase}' 2>/dev/null)" = Succeeded ] &&
+       grep -qx 'launch_allowed: 0' "$OUT/burst-$i.log" && grep -q '^varek-init: Landlock' "$OUT/burst-$i.log"; then
+        BOK=$((BOK + 1))
+    else
+        kubectl -n team-a describe pod "burst-$i" > "$OUT/burst-$i.describe" 2>&1
+        sed "s/^/     burst-$i: /" "$OUT/burst-$i.log" | tail -3 | tee -a "$SUM"
+        grep -E '^ *(Reason|Message|Exit Code):' "$OUT/burst-$i.describe" | sed "s/^ */     burst-$i: /" | tee -a "$SUM"
+    fi
+done
+kubectl -n "$NS" logs ds/varek-node -c node-agent > "$OUT/node-agent-burst.log" 2>&1
+count_new() {   # PATTERN: the node agent's lines saying it, since the pods were created
+    echo $(( $(grep -c "$1" "$OUT/node-agent-burst.log") - $(grep -c "$1" "$OUT/node-agent-burst0.log") ))
+}
+say "  started together: $BURST pods; their containers taken by their first call (the runtime reaped before it could be read): $(count_new 'taken by its first call')"
+check "$BURST supervised pods created at once: each supervised (the launcher first) and run to its end" sh -c "[ $BOK = $BURST ]"
+check "... the node agent refused none of their containers" sh -c "[ $(count_new 'a connection refused') = 0 ]"
+kubectl -n team-a delete pods $(seq -f 'burst-%g' "$BURST") --wait=false > /dev/null 2>&1
+
 echo
 [ "$fail" = 0 ] && say "v1340_kind: PASS" || say "v1340_kind: FAIL"
 [ "$fail" = 0 ]
