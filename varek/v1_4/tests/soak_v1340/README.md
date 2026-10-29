@@ -269,6 +269,30 @@ openshift-install destroy cluster --dir ~/varek-sno # end
 rm -f ~/ocp/pull-secret.json ~/varek-sno-install-config.yaml.keep # end
 ```
 
+The cluster's other files on the host go with it: its kubeadmin password
+and kubeconfig (`~/varek-sno/auth`), and the service accounts' signing
+key `ccoctl` made (`~/ocp/ccoctl-out/serviceaccount-signer.private`):
+
+```sh
+rm -rf /root/varek-sno /root/ocp # end
+```
+
+## 4. Last: the host
+
+What the runs wrote is on the host alone. Keep it before the host goes,
+as one archive (the streams, each run's report, the node keys, the
+anchor), copied where the release's evidence is kept:
+
+```sh
+tar -czf /var/tmp/varek-soak-runs.tar.gz -C /var/tmp $(cd /var/tmp && ls -d varek-soak-*/ | tr -d /) # end
+```
+
+Then end the host, from wherever it was made (CloudShell):
+
+```sh
+AWS_PAGER="" aws ec2 terminate-instances --region us-east-1 --instance-ids INSTANCE_ID # end
+```
+
 ## Files
 
 | File | What it does |

@@ -6,7 +6,8 @@
 > test scripts; the docs against the code). Its findings are fixed or
 > stated as limits (below). A human or third-party review has not been
 > done. The ship gate's 24-hour runs (EKS with amd64 and Graviton nodes,
-> and single-node OpenShift) are still to come.
+> and single-node OpenShift) run on the release's build, `6f5af2f`, from
+> October 29 to October 30; their results are to come.
 
 MIT · github.com/kwdoug63/varek
 
@@ -72,7 +73,9 @@ upgrade in progress refuses rather than runs with less.
 - **`make test-v1340`** (as root): the node agent's sections, one for each
   carried feature (sections 10 to 15: credentials, sub-agents and MCP
   servers, the on-behalf-of chain, the dry run with flow policies and trust
-  bundles, streams in segments, the node's key); 274 checks, 0 skipped.
+  bundles, streams in segments, the node's key); 284 checks, 0 skipped
+  (section 5 with the runtimes the node agent cannot read: reaped, or in
+  a mount namespace of their own).
 - **The sweep** (`tests/v1340_sweep.sh`, every suite, once under the Warden
   and once as pods under the node agent): 2,872 checks hold in both, 121
   differ, each with its reason listed, none unlisted.
@@ -89,8 +92,13 @@ upgrade in progress refuses rather than runs with less.
 - **The cluster**: on kind and on each matrix cell, `v1340_kind.sh` (each
   carried feature as pods, and a node rebuilt with a new key); the Go
   tests; the chart's tests (36); `v1340_apiserver.sh` against a real API
-  server.
-- **The ship gate's runs**: to come (step 12).
+  server. On each, 20 supervised pods created at once, each run to its
+  end, none refused.
+- **The ship gate's runs** (step 12), on `6f5af2f` (the node image's list
+  `sha256:ff8a3654…6419a9`), 24 hours each, from October 29 at 8:15 AM
+  Central; each six-minute trial passed:
+  - EKS, an amd64 node and a Graviton one (containerd 2.3.7): *to come.*
+  - Single-node OpenShift 4.22.18 (CRI-O 1.35.9, crun): *to come.*
 
 ## Compatibility
 
@@ -219,6 +227,10 @@ are stated below as limits. The largest:
 
 ## Known limits
 
+- **The node agent reads one runtime's connection at a time**, for up to
+  5 s each: a runtime slow to send its state, or a root process that
+  reaches the node agent's socket and sends slowly, delays the start of
+  the node's other supervised containers by as long.
 - **A flow policy's breaker counts per node**, not across the cluster: a
   pod scheduled on another node starts its counts again.
 - **A dry run in a pod refuses the connects its policy refuses**, unlike a
