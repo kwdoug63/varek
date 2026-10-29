@@ -1020,7 +1020,14 @@ are claimed as solved.
     wait), its namespaces are not known: the connection is then tied to
     the process the state names by the runtime's parent, read before it
     ended, which must be root and run where the runtime does. A runtime
-    already reaped before it is read is refused (step 8). The socket's
+    already reaped before it is read (crun under CRI-O, when two containers
+    start together) leaves nothing of itself: v1.36 step 12, the kernel ties
+    them instead, the first call on the listener sent coming from the
+    process the state names, before anything is done for it; a listener
+    sent with a state naming another process never shows that process's
+    calls, and is refused at the first, nothing of the named process
+    touched (step 8 refused every such connection, and such a pod never
+    ran). The socket's
     directory being root's alone on the node is what keeps other processes
     out; a root container given that directory by a hostPath could
     connect.

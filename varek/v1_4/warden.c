@@ -859,6 +859,12 @@ struct node_run {
     char   trust[254];
     char   flow_sha[65];
     char   sa[254];
+    /* v1.36 step 12: the container's first call, which tied it to the
+     * listener its runtime sent when the runtime was reaped before it could
+     * be read (node_tie), held while the supervisor is set up and decided
+     * first */
+    bool   held;
+    struct seccomp_notif held_req;
 };
 static struct node_run g_nr = { .notify_fd = -1, .pidfd = -1, .set_view = -1, .node_netns = -1 };
 
@@ -4150,6 +4156,15 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                       pid_t bootstrap_pid) {
     bool bootstrap_done = false;
     while (!g_stop && !g_log_broken) {
+        struct seccomp_notif req;
+        /* v1.36 step 12: the container's first call, received when it tied
+         * the container to its listener (node_tie): its caller waits, and
+         * nothing else comes from it until it is answered */
+        if (g_nr.held) {
+            req = g_nr.held_req;
+            g_nr.held = false;
+            goto decide;
+        }
         /* v1.9.3: wait on the listener AND the target's pidfd. Blocking in
          * NOTIF_RECV alone can hang forever if the target exits between the
          * g_stop check and the ioctl (the SIGCHLD is already spent).
@@ -4244,13 +4259,13 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         if (!(pfds[0].revents & POLLIN))
             continue;
 
-        struct seccomp_notif req;
         memset(&req, 0, sizeof(req));
         if (ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_RECV, &req) < 0) {
             if (errno == EINTR || errno == ENOENT) continue;  /* ENOENT: requester died */
             return false;
         }
 
+    decide:;
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
