@@ -1021,8 +1021,10 @@ are claimed as solved.
     the process the state names by the runtime's parent, read before it
     ended, which must be root and run where the runtime does. A runtime
     already reaped before it is read (crun under CRI-O, when two containers
-    start together) leaves nothing of itself: v1.36 step 12, the kernel ties
-    them instead, the first call on the listener sent coming from the
+    start together), or read while it runs in a mount namespace of its own
+    (runc 1.2 and later, as it creates a container; root, in the node
+    agent's user and PID namespaces, its parent the shim), is not taken on
+    its word: v1.36 step 12, the kernel ties them instead, the first call on the listener sent coming from the
     process the state names, before anything is done for it; a listener
     sent with a state naming another process never shows that process's
     calls, and is refused at the first, nothing of the named process

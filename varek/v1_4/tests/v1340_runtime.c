@@ -5,7 +5,7 @@
 // under containerd and crun under CRI-O: its shim, a subreaper, has it
 // reaped, and the container's process is then the shim's child. As root:
 //
-//   v1340_runtime SOCKET ID zombie|reaped|reaped-call|forged
+//   v1340_runtime SOCKET ID zombie|reaped|reaped-call|forged|private-call
 //
 // Run as the shim: holds the node agent with a connection that sends
 // nothing (it reads one connection at a time, for at most 5 s); forks the
@@ -17,7 +17,10 @@
 // the runtime ended. reaped-call: the container's process, once it has sent
 // its listener, makes a call its filter notifies (getppid), as a container's
 // init does ahead of its command (v1.36 step 12: what ties it to its
-// listener when the runtime was reaped). forged: the state names another
+// listener when the runtime was reaped). private-call: likewise, the
+// runtime in a mount namespace of its own (as runc 1.2 and later creates a
+// container), alive while the node agent reads it, then ending. forged: the
+// state names another
 // process (the shim's child, under a filter of its own), sent with the
 // listener of a container's process that makes that call: what a root
 // process that reaches the socket could send, naming another pod's process.
@@ -33,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -102,12 +106,13 @@ static void other(void) {
 
 int main(int argc, char **argv) {
     if (argc != 4 || (strcmp(argv[3], "zombie") && strcmp(argv[3], "reaped") && strcmp(argv[3], "reaped-call") &&
-                      strcmp(argv[3], "forged"))) {
-        fprintf(stderr, "usage: v1340_runtime SOCKET ID zombie|reaped|reaped-call|forged\n");
+                      strcmp(argv[3], "forged") && strcmp(argv[3], "private-call"))) {
+        fprintf(stderr, "usage: v1340_runtime SOCKET ID zombie|reaped|reaped-call|forged|private-call\n");
         return 2;
     }
     bool zombie = strcmp(argv[3], "zombie") == 0, forged = strcmp(argv[3], "forged") == 0;
-    bool call = forged || strcmp(argv[3], "reaped-call") == 0;
+    bool private = strcmp(argv[3], "private-call") == 0;
+    bool call = forged || private || strcmp(argv[3], "reaped-call") == 0;
     if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) < 0) { perror("v1340_runtime: subreaper"); return 1; }
     pid_t o = 0;   // forged: the process the state names
     if (forged && (o = fork()) == 0) other();
@@ -121,6 +126,7 @@ int main(int argc, char **argv) {
     if (rt == 0) {   // the runtime
         close(pp[0]);
         close(hold);   // the shim's alone: the node agent goes on when the shim closes it
+        if (private && unshare(CLONE_NEWNS) < 0) _exit(1);
         int sp[2];
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0) _exit(1);
         pid_t c = fork();
@@ -138,20 +144,24 @@ int main(int argc, char **argv) {
         pid_t named = o ? o : c;
         (void)!write(pp[1], &named, sizeof named);
         (void)!write(pp[1], &c, sizeof c);
+        if (private) sleep(2);   // read by the node agent while it runs
         _exit(0);   // the connection closed with it, as runc create ends
     }
     close(pp[1]);
     pid_t c = 0, named = 0;
     siginfo_t si = { 0 };
     // its end waited for; a zombie left as one (WNOWAIT), else reaped
-    if (read(pp[0], &named, sizeof named) != (ssize_t)sizeof named || read(pp[0], &c, sizeof c) != (ssize_t)sizeof c ||
-        waitid(P_PID, (id_t)rt, &si, WEXITED | (zombie ? WNOWAIT : 0)) < 0 || si.si_code != CLD_EXITED || si.si_status) {
+    // (private-call: the node agent let go first, the runtime running)
+    bool sent = read(pp[0], &named, sizeof named) == (ssize_t)sizeof named && read(pp[0], &c, sizeof c) == (ssize_t)sizeof c;
+    if (sent && private) close(hold);
+    if (!sent || waitid(P_PID, (id_t)rt, &si, WEXITED | (zombie ? WNOWAIT : 0)) < 0 || si.si_code != CLD_EXITED ||
+        si.si_status) {
         fprintf(stderr, "v1340_runtime: the runtime did not send the listener\n");
         return 1;
     }
     printf("%d\n", (int)named);
     fflush(stdout);
-    close(hold);    // the node agent goes on, to the runtime's connection
+    if (!private) close(hold);    // the node agent goes on, to the runtime's connection
     sleep(3);
     // still running (not ended, nor a zombie): not ended by the node agent
     siginfo_t ws = { 0 };

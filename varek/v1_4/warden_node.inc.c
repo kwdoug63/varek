@@ -749,6 +749,7 @@ struct node_peer {
     pid_t pid;          /* SO_PEERCRED's, as the kernel took it at connect */
     uid_t uid;
     int state;          /* 1: read, where the runtime runs; 0: read, not (why); -1: ended before it could be read */
+    bool mnt_only;      /* 0 alone: in the node agent's user and PID namespaces, a mount namespace of its own */
     long ppid;          /* its parent, where read (a zombie's too), or -1 */
     char why[400];
 };
@@ -771,6 +772,11 @@ static void node_peer_read(int c, struct node_peer *p) {
     /* not where the runtime runs, or ended while it was read (kind, in CI:
      * its mount namespace read, then gone when compared) */
     p->state = proc_statf(&st, "%d/ns/mnt", (int)cr.pid) < 0 ? -1 : 0;
+    /* v1.36 step 12: runc (1.2 and later) creates a container in a mount
+     * namespace of its own, which the node agent sees when it reads runc
+     * before it has ended (the matrix's containerd cells, pods started
+     * together) */
+    p->mnt_only = p->state == 0 && node_same_ns(cr.pid, "user", "self") && node_same_ns(cr.pid, "pid", "self");
 }
 
 /* A connection the listener takes, checked before a supervisor is forked
@@ -791,34 +797,57 @@ static void node_peer_read(int c, struct node_peer *p) {
  * to the process it names: the kernel ties them instead, the first call on
  * the listener sent coming from that process (node_tie), before anything is
  * entered, written or ended for it; here the process's parent, the shim, is
- * root and runs where the runtime does. 0 with the process's pid and pidfd,
- * 1 likewise for a container to be tied by its first call, or -1 with why. */
+ * root and runs where the runtime does. Likewise a peer read in a mount
+ * namespace of its own (runc 1.2 and later, as it creates a container), root
+ * and in the node agent's user and PID namespaces, its parent the shim. 0
+ * with the process's pid and pidfd, 1 likewise for a container to be tied by
+ * its first call, or -1 with why. */
 static int node_admit(const struct node_peer *peer, const char *doc, size_t n, int fd, pid_t *pid, int *pidfd,
                       char *why, size_t wn) {
     *pidfd = -1;
     bool tie = false;
-    if (peer->pid <= 0 || peer->state == 0) { snprintf(why, wn, "%s", peer->why); return -1; }
+    if (peer->pid <= 0 || (peer->state == 0 && !peer->mnt_only)) { snprintf(why, wn, "%s", peer->why); return -1; }
     if (peer->uid != 0) {
         snprintf(why, wn, "the peer (pid %d) is not root (uid %u)", (int)peer->pid, (unsigned)peer->uid);
-        return -1;
+        goto fail;
     }
     char ln[64];
     ssize_t k = proc_readlinkf(ln, sizeof ln - 1, "self/fd/%d", fd);
     if (k < 0 || (ln[k] = '\0', strcmp(ln, "anon_inode:seccomp notify"))) {
         snprintf(why, wn, "the descriptor sent is not a seccomp listener");
-        return -1;
+        goto fail;
     }
-    if (node_state_pid(doc, n, pid, why, wn) < 0) return -1;
+    if (node_state_pid(doc, n, pid, why, wn) < 0) goto fail;
     if ((*pidfd = (int)syscall(__NR_pidfd_open, *pid, 0)) < 0) {
         snprintf(why, wn, "the container's process %d is gone (%s)", (int)*pid, strerror(errno));
-        return -1;
+        goto fail;
     }
     long pp = node_status_field(*pid, "PPid:"), sc = node_status_field(*pid, "Seccomp:");
     if (!node_alive(*pidfd)) {
         snprintf(why, wn, "the container's process %d is gone (%s)", (int)*pid, strerror(errno));
         goto fail;
     }
-    if (peer->state == 1) {
+    if (peer->state == 0) {
+        /* v1.36 step 12: the peer read, root and in the node agent's user and
+         * PID namespaces, in a mount namespace of its own (runc's, as it
+         * creates the container): not taken on its word, nor on its parent's
+         * (a root process in a container that reaches the socket has a mount
+         * namespace of its own too). The process the state names is its child
+         * or its parent's; its parent, the shim, root where the runtime runs;
+         * and the process's first call ties it (node_tie) */
+        long rt = peer->ppid, ru = rt > 0 ? node_status_field((pid_t)rt, "Uid:") : -1;
+        if (pp != (long)peer->pid && !(rt > 0 && pp == rt)) {
+            snprintf(why, wn, "the process the state names (%d) is not the peer's child nor its parent's (its parent "
+                     "is %ld, the peer %d, the peer's parent %ld)", (int)*pid, pp, (int)peer->pid, rt);
+            goto fail;
+        }
+        if (rt <= 0 || ru != 0) {
+            snprintf(why, wn, "the peer's parent (%ld) is not root (uid %ld)", rt, ru);
+            goto fail;
+        }
+        if (node_runtime_ns((pid_t)rt, "the peer's parent", why, wn) < 0) goto fail;
+        tie = true;
+    } else if (peer->state == 1) {
         if (pp != (long)peer->pid && !(peer->ppid > 0 && pp == peer->ppid)) {
             snprintf(why, wn, "the process the state names (%d) is not the peer's child nor its parent's (its parent "
                      "is %ld, the peer %d, the peer's parent %ld)", (int)*pid, pp, (int)peer->pid, peer->ppid);
@@ -872,6 +901,12 @@ static int node_admit(const struct node_peer *peer, const char *doc, size_t n, i
                 (int)peer->pid, (int)*pid, peer->ppid);
     return 0;
 fail:
+    /* a peer in a mount namespace of its own: that first, as before */
+    if (peer->state == 0) {
+        char w[512];
+        snprintf(w, sizeof w, "%s", why);
+        snprintf(why, wn, "%.250s; and %.250s", peer->why, w);
+    }
     close(*pidfd);
     *pidfd = -1;
     return -1;
@@ -1643,7 +1678,7 @@ static ssize_t node_receive(int c, char *buf, size_t cap, int *fds, int *nfd) {
  * init calls once it has its filter, ahead of its command;
  * VAREK_WARDEN_TEST_TIE_MS for the tests). 0, or -1 with why: nothing has
  * been done for the process, and it is not ended. */
-static int node_tie(int fd, pid_t pid, int pidfd, pid_t peer, char *why, size_t wn) {
+static int node_tie(int fd, pid_t pid, int pidfd, pid_t peer, const char *how, char *why, size_t wn) {
     long ms = 120000;
     const char *t = getenv("VAREK_WARDEN_TEST_TIE_MS");
     if (t && *t) ms = strtol(t, NULL, 10);
@@ -1655,9 +1690,9 @@ static int node_tie(int fd, pid_t pid, int pidfd, pid_t peer, char *why, size_t 
     for (;;) {
         int left = node_left_ms(&end);
         if (left == 0) {
-            snprintf(why, wn, "the runtime (pid %d) was reaped before it could be read, and no call came on the "
+            snprintf(why, wn, "the runtime (pid %d) %s, and no call came on the "
                      "listener sent within %ld ms: nothing ties it to the process the state names (%d), refused",
-                     (int)peer, ms, (int)pid);
+                     (int)peer, how, ms, (int)pid);
             return -1;
         }
         struct pollfd p[2] = { { .fd = fd, .events = POLLIN }, { .fd = pidfd, .events = POLLIN } };
@@ -1673,14 +1708,14 @@ static int node_tie(int fd, pid_t pid, int pidfd, pid_t peer, char *why, size_t 
             if (poll(&e, 1, 200) > 0) p[1].revents = e.revents;
         }
         if (p[1].revents & POLLIN) {
-            snprintf(why, wn, "the runtime (pid %d) was reaped before it could be read, and the process the state "
-                     "names (%d) ended before a call came on the listener sent: refused", (int)peer, (int)pid);
+            snprintf(why, wn, "the runtime (pid %d) %s, and the process the state "
+                     "names (%d) ended before a call came on the listener sent: refused", (int)peer, how, (int)pid);
             return -1;
         }
         if (p[0].revents & (POLLHUP | POLLERR | POLLNVAL)) {
-            snprintf(why, wn, "the runtime (pid %d) was reaped before it could be read, and no process is left under "
+            snprintf(why, wn, "the runtime (pid %d) %s, and no process is left under "
                      "the listener sent's filter, the process the state names (%d) not among them: refused",
-                     (int)peer, (int)pid);
+                     (int)peer, how, (int)pid);
             return -1;
         }
         if (!(p[0].revents & POLLIN)) continue;
@@ -1696,9 +1731,9 @@ static int node_tie(int fd, pid_t pid, int pidfd, pid_t peer, char *why, size_t 
          * waiting (the caller read was the one that made it) */
         pid_t tg = task_tgid((pid_t)req.pid);
         if (tg != pid || !node_alive(pidfd) || !notif_id_valid(fd, req.id)) {
-            snprintf(why, wn, "the runtime (pid %d) was reaped before it could be read, and the first call on the "
+            snprintf(why, wn, "the runtime (pid %d) %s, and the first call on the "
                      "listener sent came from process %d (thread %u), not from the process the state names (%d): "
-                     "refused", (int)peer, (int)tg, (unsigned)req.pid, (int)pid);
+                     "refused", (int)peer, how, (int)tg, (unsigned)req.pid, (int)pid);
             return -1;
         }
         g_nr.held_req = req;
@@ -1818,6 +1853,8 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
         /* v1.36 step 12: a container to be tied by its first call is not yet
          * known to be the one named: refused here, it is not ended */
         bool tie = adm == 1;
+        /* how the runtime left the node agent nothing of itself to tie it by */
+        const char *tie_how = peer.state == 0 ? "ran in a mount namespace of its own" : "was reaped before it could be read";
         static int maxties = -1;                /* VAREK_WARDEN_TEST_TIES: the tests' */
         if (maxties < 0) {
             const char *e = getenv("VAREK_WARDEN_TEST_TIES");
@@ -1825,10 +1862,9 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
         }
         int nties = tie ? node_nties() : 0;
         if (tie && (g_node_nlive == NODE_MAX_SUPERVISORS || nties >= maxties)) {
-            fprintf(stderr, "[warden] node agent: a connection refused: its runtime (pid %d) was reaped before it could "
-                    "be read, and the node agent supervises %d containers, %d waiting for their first call (at most "
-                    "%d): the process the state names (%d) not ended\n", (int)peer.pid, g_node_nlive, nties, maxties,
-                    (int)pid);
+            fprintf(stderr, "[warden] node agent: a connection refused: its runtime (pid %d) %s, and the node agent "
+                    "supervises %d containers, %d waiting for their first call (at most %d): the process the state "
+                    "names (%d) not ended\n", (int)peer.pid, tie_how, g_node_nlive, nties, maxties, (int)pid);
             close(pidfd);
             close(fds[0]);
             continue;
@@ -1864,9 +1900,8 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
             g_node_live[g_node_nlive++].pidfd = pidfd;
             if (tie) {
                 close(tp[1]);
-                fprintf(stderr, "[warden] node agent: the runtime (pid %d) was reaped before it could be read: its "
-                        "container's process %d waits for its first call to tie it to the listener sent\n",
-                        (int)peer.pid, (int)pid);
+                fprintf(stderr, "[warden] node agent: the runtime (pid %d) %s: its container's process %d waits for "
+                        "its first call to tie it to the listener sent\n", (int)peer.pid, tie_how, (int)pid);
             }
             close(fds[0]);
             continue;
@@ -1881,7 +1916,7 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
         sigaction(SIGCHLD, &(struct sigaction){ .sa_handler = SIG_DFL }, NULL);
         if (tie) {
             close(tp[0]);
-            if (node_tie(fds[0], pid, pidfd, peer.pid, why, sizeof why) < 0) {
+            if (node_tie(fds[0], pid, pidfd, peer.pid, tie_how, why, sizeof why) < 0) {
                 fprintf(stderr, "[warden] node agent: a connection refused: %s\n", why);
                 _exit(0);   /* the pipe closed unwritten: the process is not ended */
             }
@@ -1891,9 +1926,8 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
                 _exit(0);
             }
             close(tp[1]);
-            fprintf(stderr, "[warden] node agent: the runtime (pid %d) was reaped before it could be read; its "
-                    "container's process %d taken by its first call (on the listener sent, from that process)\n",
-                    (int)peer.pid, (int)pid);
+            fprintf(stderr, "[warden] node agent: the runtime (pid %d) %s; its container's process %d taken by its "
+                    "first call (on the listener sent, from that process)\n", (int)peer.pid, tie_how, (int)pid);
         }
         g_nr.on = true;
         g_nr.notify_fd = fds[0];

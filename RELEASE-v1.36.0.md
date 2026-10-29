@@ -210,8 +210,12 @@ are stated below as limits. The largest:
   Until it does, nothing is done for the container and the node agent ends
   nothing; a listener sent with a state naming another process is refused
   at that call, and one with no call within 120 s is refused. The node
-  agent's log says each container taken so. The 24-hour runs are made
-  again on the fixed image (to come).
+  agent's log says each container taken so. The matrix, starting 20 pods
+  at once, found the other side of the race: runc (1.2 and later) creates
+  a container from a mount namespace of its own, and when the node agent
+  read runc before it ended, it refused it for that. That runtime is now
+  tied the same way, by the container's first call. The 24-hour runs are
+  made again on the fixed image (to come).
 
 ## Known limits
 

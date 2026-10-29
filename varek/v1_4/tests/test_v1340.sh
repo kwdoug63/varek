@@ -348,6 +348,16 @@ check "a runtime reaped before it could be read, its child calling: taken by its
     grep -q "the runtime (pid [0-9]*) was reaped before it could be read; its container's process $P4 taken by its first call" "$B/a.log"
 check "... its supervisor set up after it (its stream), the call held for it" sh -c \
     "[ $rrc4 = 0 ] && cat '$B'/streams-a/called.*.jsonl | grep -q 'container called refused: cannot read the bundle'"
+# the runtime in a mount namespace of its own, read while it runs (runc
+# 1.2 and later as it creates a container: the matrix's containerd cells,
+# pods started together), its child calling: taken by that call
+"$B/rt" "$B/s/a.sock" privns private-call > "$B/rt9.out" 2>&1; rrc9=$?
+P9="$(head -1 "$B/rt9.out" 2>/dev/null)"
+for _ in $(seq 100); do cat "$B"/streams-a/privns.*.jsonl 2>/dev/null | grep -q 'container privns refused' && break; sleep 0.1; done
+check "a runtime read in a mount namespace of its own, its child calling: taken by its first call" \
+    grep -q "the runtime (pid [0-9]*) ran in a mount namespace of its own; its container's process $P9 taken by its first call" "$B/a.log"
+check "... its supervisor set up after it (its stream)" sh -c \
+    "[ $rrc9 = 0 ] && cat '$B'/streams-a/privns.*.jsonl | grep -q 'container privns refused: cannot read the bundle'"
 # a root process that reaches the socket names another process (under a
 # filter of its own, the shim's child) and sends a listener of its own
 # child's, which calls, then ends at once: refused at that call, the
