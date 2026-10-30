@@ -341,7 +341,8 @@ def main():
     for node in meta["nodes"]:
         for s in glob.glob(f"{d}/streams/{node}/*.jsonl"):
             v = {"node": node, "records": 0, "end": False, "deny": 0, "allow": 0, "denied": [], "subs": set(),
-                 "settled": collections.Counter(), "sub_recs": collections.Counter(), "unreadable": 0}
+                 "settled": collections.Counter(), "sub_recs": collections.Counter(), "unreadable": 0,
+                 "ended": 0}
             rs = None
             for r in records(s):
                 if rs is None:
@@ -353,6 +354,8 @@ def main():
                     v["end"] = True
                 elif r.get("event") == "proxy_unreadable":
                     v["unreadable"] += 1
+                elif r.get("event") == "subagent_ended":          # v1.36 step 12
+                    v["ended"] += 1
                 elif r.get("event") == "subagent_settled":
                     v["settled"][(str(r.get("subagent", "")).split("#")[0], r.get("result"))] += 1
                 f = r.get("decision_final")
@@ -495,6 +498,16 @@ def main():
         c(longs and len(sub_ok) == len(longs), "each long agent's sub-agent and MCP server launched and settled, every launch",
           f"{len(sub_ok)} of {len(longs)}; " + "; ".join(
               f"{v['pod']}: {dict(v['settled'])}" for v in longs.values()))
+        # v1.36 step 12: the limit is the sub-agents held at once (1,024), not
+        # the launches: each released as it ends (subagent_ended), all but the
+        # few still running at the end; a 24-hour run launches past 1,024
+        rel_bad = [v["pod"] for v in longs.values()
+                   if v["ended"] < sum(v["settled"].values()) - 8
+                   or (hours >= 24 and sum(v["settled"].values()) <= 1024)]
+        c(longs and not rel_bad, "... each released as it ended (subagent_ended)" +
+          (", past the 1,024 held at once" if hours >= 24 else ""),
+          "; ".join(f"{v['pod']}: {v['ended']} released of {sum(v['settled'].values())} launched"
+                    for v in longs.values()))
         srv = sum(1 for v in streams.values() for r in v["denied"]
                   if r.get("sub") == "files" and str(r.get("resolved") or r.get("target") or "") == "/etc/passwd")
         c(srv > 0, "the MCP server held to its own rules: its read of /etc/passwd (the agent's to read) refused", f"{srv}")

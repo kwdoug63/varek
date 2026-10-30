@@ -971,6 +971,12 @@ struct exec_pend {
 };
 static struct exec_pend g_xp[EXEC_PEND_MAX];
 static size_t g_nxp;
+
+/* v1.36 step 12: whether a launch waiting on its exec_result starts sub-agent s */
+static bool exec_pend_names(int s) {
+    for (size_t k = 0; k < g_nxp; k++) if (g_xp[k].sub == s) return true;
+    return false;
+}
 static bool g_exec_checking;     /* launches on and the agent's own launch done */
 
 /* The image a launch of path runs: the file itself, or for a script the

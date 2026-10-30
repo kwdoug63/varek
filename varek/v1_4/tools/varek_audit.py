@@ -133,7 +133,8 @@ O_CREAT, O_TRUNC = 0o100, 0o1000
 # v1.36 (D9): the audit reads the stream once and keeps no record once its
 # checks have seen it. What it keeps is bounded by the policy and the plan
 # (names, rules, the plan's steps), by what the Warden itself bounds
-# (sub-agents, SUB_MAX), and by what is open at a time (connections not yet
+# (the sub-agents it holds at once, SUB_MAX: v1.36 step 12, each dropped at
+# its subagent_ended), and by what is open at a time (connections not yet
 # closed, launches not yet settled); the rows it asks the checker about wait
 # on disk; each section of the problems keeps the first PROBLEMS_SHOWN (the
 # report prints no more) and counts the rest.
@@ -1870,7 +1871,10 @@ class ChainCheck:
     finish() returns {sub-agent: decisions}, or None when the Warden predates
     the chain. v1.36 (D9): record by record; what it keeps is the run's
     sub-agents (at most SUB_MAX, the Warden's) and the open connections'
-    chains."""
+    chains. v1.36 step 12: SUB_MAX is the sub-agents held at once; a released
+    one's subagent_ended (once, after it settled, with no sub-agent of its own
+    left) drops it, its decisions folded into its name's (done), and no
+    decision is for it after, the proxy's on its connections included."""
 
     def __init__(self, ident, rs, run, sec):
         self.ident, self.rs, self.run, self.sec = ident, rs, run, sec
@@ -1891,6 +1895,10 @@ class ChainCheck:
         self.count, self.per_name, self.conn_obo = {}, {}, {}
         self.launch_of = {}              # seq -> the sub-agent its record names (an exec_result's launch)
         self.waiting = {}                # sub-agent -> the outcomes its exec_result said, until it settled
+        # v1.36 step 12: the released sub-agents, by name: [launches, decisions, fewest, most]
+        self.done = {}
+        self.children = {}               # sub-agent -> its sub-agents not released
+        self.launch_seq = {}             # sub-agent -> its launch record's seq (for launch_of)
 
     def head(self, problems):
         iss, dom, subrules, req, mres = self.ident
@@ -1971,10 +1979,13 @@ class ChainCheck:
 
     def ev(self, e, line):
         event = e.get("event")
-        if event == "proxy_close":
+        if event in ("proxy_close", "proxy_unreadable"):     # v1.36 step 12 (review): unreadable ends it too
             if type(e.get("proxy_conn")) is int:
                 self.conn_obo.pop(e["proxy_conn"], None)
         if not self.on:
+            return
+        if event == "subagent_ended":
+            self.ended(e.get("subagent"))
             return
         if event == "subagent_settled":
             tag = e.get("subagent")
@@ -1988,7 +1999,7 @@ class ChainCheck:
             # each launch's exec_result is its own: the sub-agent its launch
             # record names (by decision_seq), and, once settled, the same outcome
             tag = e.get("subagent")
-            want = self.launch_of.get(e.get("decision_seq")) if type(e.get("decision_seq")) is int else None
+            want = self.launch_of.pop(e.get("decision_seq"), None) if type(e.get("decision_seq")) is int else None
             if tag != want:
                 self.sec["chain_results"].append(f"an exec_result for the launch at seq {e.get('decision_seq')} names "
                                                  f"sub-agent {tag!r}, but that launch started {want!r}")
@@ -1997,6 +2008,34 @@ class ChainCheck:
                     self.outcome(tag, e["result"])
                 elif len(self.waiting) <= SUB_MAX:
                     self.waiting.setdefault(tag, []).append(e["result"])
+
+    def ended(self, tag):
+        """v1.36 step 12: subagent_ended, the Warden released tag"""
+        problems = self.sec["chain_ended"]
+        st = self.started.get(tag) if isinstance(tag, str) else None
+        if st is None:
+            problems.append(f"a subagent_ended event for {tag!r}, which is not a sub-agent launched and not "
+                            f"yet released")
+            return
+        if tag not in self.settled:
+            problems.append(f"sub-agent {tag} released before its launch settled (subagent_settled)")
+        if self.children.get(tag):
+            problems.append(f"sub-agent {tag} released while {self.children[tag]} sub-agent(s) it launched were not")
+        # a connection still open for it would show as a later decision for
+        # it, which rec() refuses (after it was released)
+        n = self.count.pop(tag, 0)
+        d = self.done.setdefault(tag.rsplit("#", 1)[0], [0, 0, n, n])
+        d[0] += 1
+        d[1] += n
+        d[2], d[3] = min(d[2], n), max(d[3], n)
+        del self.started[tag]
+        self.settled.pop(tag, None)
+        self.waiting.pop(tag, None)
+        self.launch_of.pop(self.launch_seq.pop(tag, None), None)
+        parent = st[3] if len(st) > 3 else None
+        self.children.pop(tag, None)
+        if parent is not None and self.children.get(parent):
+            self.children[parent] -= 1
 
     def outcome(self, tag, res):
         if res != self.settled[tag][1]:
@@ -2036,8 +2075,13 @@ class ChainCheck:
             tag = f"{m.group(1)}#{m.group(2)}"
             st = started.get(tag)
             if st is None:
-                problems.append(f"seq {seq}: a decision for sub-agent {tag} before (or without) a launch that "
-                                f"started it")
+                # v1.36 step 12: a number already launched, and not held: released
+                if int(m.group(2)) <= self.per_name.get(m.group(1), 0):
+                    problems.append(f"seq {seq}: a decision for sub-agent {tag} after it was released "
+                                    f"(subagent_ended)")
+                else:
+                    problems.append(f"seq {seq}: a decision for sub-agent {tag} before (or without) a launch that "
+                                    f"started it")
                 break
             if st[1] != ob[:len(base) + k]:
                 problems.append(f"seq {seq}: sub-agent {tag} in a chain other than the one that launched it")
@@ -2073,8 +2117,11 @@ class ChainCheck:
                 want = (self.cg or "") + "".join("/" + t.replace("#", "-") for t in tags + [tag])
                 if r.get("cgroup") != want:
                     problems.append(f"seq {seq}: sub-agent {tag}'s control group is {r.get('cgroup')!r}, not {want!r}")
-                started[tag] = (line, ob, r.get("cgroup"))
+                started[tag] = (line, ob, r.get("cgroup"), tags[-1] if tags else None)
                 self.count.setdefault(tag, 0)
+                self.launch_seq[tag] = seq                                     # v1.36 step 12
+                if tags:
+                    self.children[tags[-1]] = self.children.get(tags[-1], 0) + 1
         elif r.get("action") == "process.exec" and r.get("rule") == "exec_allowed" and subrules.get(r.get("policy_line")):
             problems.append(f"seq {seq}: a launch allowed by policy line {r.get('policy_line')}, which names "
                             f"sub-agent {subrules[r.get('policy_line')]}, started none")
@@ -2101,23 +2148,36 @@ class ChainCheck:
         for tag in self.started:
             if tag not in self.settled or self.settled[tag][1] != "failed":
                 self.count.setdefault(tag, 0)
-        return self.count
+        return SubCounts(self.count, self.done)
+
+
+class SubCounts(dict):
+    """v1.36 step 12: {sub-agent: decisions} for those not released, and, in
+    done, the released ones by name: [launches, decisions, fewest, most]"""
+
+    def __init__(self, live, done):
+        super().__init__(live)
+        self.done = done
 
 
 def chain_summary(per_sub):
     """v1.30: the sub-agents by name, as the chain line shows them: how many
     were launched and how many decisions they had, with the range per launch
-    when it varies (a 24-hour run launches hundreds of each)."""
-    by = {}
+    when it varies (a 24-hour run launches hundreds of each). v1.36 step 12:
+    the released ones counted by name, the others one by one."""
+    by = {name: list(d) for name, d in getattr(per_sub, "done", {}).items()}
     for tag, n in per_sub.items():
-        by.setdefault(tag.rsplit("#", 1)[0], []).append(n)
+        d = by.setdefault(tag.rsplit("#", 1)[0], [0, 0, n, n])
+        d[0] += 1
+        d[1] += n
+        d[2], d[3] = min(d[2], n), max(d[3], n)
     out = []
     for name in sorted(by):
-        ns = by[name]
-        each = f"{ns[0]} each" if min(ns) == max(ns) else f"{min(ns)} to {max(ns)} each"
-        out.append(f"{name} {len(ns)} launch{'es' if len(ns) != 1 else ''}, "
-                   f"{sum(ns)} decision{'s' if sum(ns) != 1 else ''}"
-                   f"{f' ({each})' if len(ns) > 1 else ''}")
+        k, total, lo, hi = by[name]
+        each = f"{lo} each" if lo == hi else f"{lo} to {hi} each"
+        out.append(f"{name} {k} launch{'es' if k != 1 else ''}, "
+                   f"{total} decision{'s' if total != 1 else ''}"
+                   f"{f' ({each})' if k > 1 else ''}")
     return "; ".join(out) if out else "none"
 
 
@@ -4498,12 +4558,12 @@ SECTIONS = (
     "proxy_start", "trust", "handoff", "proxied", "dialed", "closes", "requests", "refreq",
     "pcreds", "cred_head", "cred_time", "cred_between", "cred_expiry", "cred_unrecorded", "cred_recs",
     "cred_events", "cred_closes", "cred_dns",
-    "pident", "chain_head", "chain_settled", "chain_recs", "chain_results", "chain_end",
+    "pident", "chain_head", "chain_settled", "chain_recs", "chain_results", "chain_ended", "chain_end",
     "reqplan", "pconf", "subjects", "tokens",
     "launches_head", "launches_a", "launches_b", "launches_c", "launches_d", "launches_e", "launches_f",
     "launches_h",
     "end_proxy", "end_proxied", "end_ids")
-SUB_MAX = 1024              # the sub-agent launches a run may make (warden_subagent.inc.c)
+SUB_MAX = 1024              # the sub-agents a run holds at once (warden_subagent.inc.c; v1.36 step 12)
 PLAN_EVENTS_MAX = 1 << 16   # more plan records than a plan has steps is a problem; kept no further
 
 

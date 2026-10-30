@@ -20,7 +20,15 @@
 //   v1281_sub write FILE              open FILE for writing; print the result
 //   v1281_sub loop FILE SECONDS       open FILE every 250 ms for SECONDS; print
 //                                     how many opens worked and how many not
+//   v1281_sub repeat N PROG ARGS...   v1.36 step 12: N times, one after the
+//                                     other, fork: the child launches PROG
+//                                     ARGS; print how many ran and how many
+//                                     launches were refused
+//   v1281_sub hold N PROG ARGS...     v1.36 step 12: fork N children at once,
+//                                     each launching PROG ARGS; wait for all;
+//                                     print how many launches were refused
 #include <errno.h>
+#include <stdbool.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -109,6 +117,27 @@ int main(int argc, char **argv) {
             usleep(250000);
         }
         printf("opened %d refused %d\n", ok, no);
+        return 0;
+    }
+    if ((!strcmp(m, "repeat") || !strcmp(m, "hold")) && argc >= 4) {
+        int n = atoi(argv[2]), ran = 0, refused = 0;
+        bool hold = !strcmp(m, "hold");
+        for (int i = 0; i < n; i++) {
+            pid_t c = fork();
+            if (c < 0) return 1;
+            if (c == 0) { execv(argv[3], argv + 3); _exit(errno == EACCES ? 126 : 127); }
+            if (!hold) {
+                int st = 0;
+                waitpid(c, &st, 0);
+                if (WIFEXITED(st) && WEXITSTATUS(st) == 126) refused++; else ran++;
+            }
+        }
+        if (hold) {
+            int st = 0;
+            while (wait(&st) > 0) { if (WIFEXITED(st) && WEXITSTATUS(st) == 126) refused++; else ran++; }
+        }
+        printf("ran %d refused %d\n", ran, refused);
+        fflush(stdout);
         return 0;
     }
     if (!strcmp(m, "write")) {

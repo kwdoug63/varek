@@ -2208,6 +2208,7 @@ static void       stub_resolved(size_t i);
 static void       px_resolved(size_t i);  /* v1.26: proxied requests waiting on a lookup */
 static bool       px_up_charged(const char *name);  /* v1.26 review: sent to the upstream, charged */
 static void       px_handed_off(uint64_t id, unsigned port, int subject);  /* v1.26 review: a hand-off announced */
+static void       px_handoff_drop(uint64_t id);                            /* v1.36 step 12: never reported */
 static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden_stub.inc.c) */
 /* v1.25: the stub's address; v1.34 step 4: under the node agent, the first of
  * 127.53.53.53 to 127.53.53.254 free in the pod's network namespace (which

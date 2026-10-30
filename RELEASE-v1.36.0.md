@@ -6,8 +6,10 @@
 > test scripts; the docs against the code). Its findings are fixed or
 > stated as limits (below). A human or third-party review has not been
 > done. The ship gate's 24-hour runs (EKS with amd64 and Graviton nodes,
-> and single-node OpenShift) run on the release's build, `6f5af2f`, from
-> October 29 to October 30; their results are to come.
+> and single-node OpenShift) on `6f5af2f`, October 29 to 30, both failed
+> for one cause: the sub-agent limit counted a run's launches (below,
+> "Found building the ship gate's runs"). Fixed October 30; the runs are
+> made again on the fixed build, their results to come.
 
 MIT · github.com/kwdoug63/varek
 
@@ -97,8 +99,14 @@ upgrade in progress refuses rather than runs with less.
 - **The ship gate's runs** (step 12), on `6f5af2f` (the node image's list
   `sha256:ff8a3654…6419a9`), 24 hours each, from October 29 at 8:15 AM
   Central; each six-minute trial passed:
-  - EKS, an amd64 node and a Graviton one (containerd 2.3.7): *to come.*
-  - Single-node OpenShift 4.22.18 (CRI-O 1.35.9, crun): *to come.*
+  - On `6f5af2f`, both failed for one cause (the sub-agent limit, below):
+    `soak_check: FAIL (4)` on EKS, an amd64 node and a Graviton one
+    (containerd 2.3.7); `FAIL (3)` on single-node OpenShift 4.22.18
+    (CRI-O 1.35.9, crun). Everything else held: every probe, the token in
+    no stream or log, 98 and 100 streams (1,953,669 and 3,490,100 records)
+    all audited, the large stream of 1,385,957 records audited in fixed
+    memory, no VAREK container restarted, the node agent's memory flat.
+  - On the fixed build: *to come.*
 
 ## Compatibility
 
@@ -127,8 +135,8 @@ upgrade in progress refuses rather than runs with less.
   (`exporter.scratchSize`, 4Gi), where the audit keeps what it holds back.
 - **New records and fields**: `run_start`'s `node.node_name`; a segment's
   checkpoint (`segment`, `prev_chain`); `dry_run_refused` under the node
-  agent; the anchor's `node_key` line. An audit of a v1.35 stream is as
-  before.
+  agent; the anchor's `node_key` line; `subagent_ended` (step 12: a
+  sub-agent released). An audit of a v1.35 stream is as before.
 - **On CRI-O**, install the chart with `--set runtime=cri-o`: with the
   default, every supervised container is refused (the node agent cannot
   read its bundle's `config.json`).
@@ -224,6 +232,22 @@ are stated below as limits. The largest:
   read runc before it ended, it refused it for that. That runtime is now
   tied the same way, by the container's first call. The 24-hour runs are
   made again on the fixed image (to come).
+
+- **A long-running container's sub-agents reached the limit of a run's
+  launches** (fixed; found in both 24-hour runs). The Warden held a run to
+  1,024 sub-agent launches (`SUB_MAX`, v1.28.1). Under the node agent a run
+  is a container's life, and an agent that launched two each turn reached
+  1,024 after 8.5 hours; every launch after it was refused
+  (`subagent_limit`), failing closed, recorded and audited. Now the limit
+  is the sub-agents held at once: at each launch, a sub-agent that has
+  ended is released and its slot used again. It is released only when it
+  has settled, none it launched is held, no launch or connection for it is
+  open, and its control group is removed (no process in it, no group below
+  it). The new chained record `subagent_ended` says so, and its group no
+  longer waits for the run's end. The audit drops what it keeps for a
+  sub-agent at its `subagent_ended`, so its memory stays bounded by the
+  sub-agents held at once. It refuses a decision for a released
+  sub-agent, a sub-agent released twice or before one it launched.
 
 ## Known limits
 
