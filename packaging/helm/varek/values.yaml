@@ -6,6 +6,7 @@
 #
 #   kubectl create namespace varek-system
 #   kubectl label namespace varek-system pod-security.kubernetes.io/enforce=privileged
+#   helm install varek-crds oci://ghcr.io/kwdoug63/charts/varek-crds -n varek-system
 #   helm install varek oci://ghcr.io/kwdoug63/charts/varek -n varek-system
 #
 # A pod is then supervised when it names a VarekPolicy of its namespace with
@@ -250,6 +251,14 @@ admission:
   resources:
     requests: { cpu: 10m, memory: 32Mi }
     limits: { memory: 256Mi }
+
+# The custom resources (VarekPolicy, VarekPlan, VarekCredential,
+# VarekNodeKey) are the varek-crds chart's, installed before this one
+# (packaging/helm/varek-crds): installed on a cluster without them, this
+# chart refuses, saying so. false installs it all the same (its webhook and
+# plugin then fail on each resource they read).
+crds:
+  check: true
 
 # OpenShift: a SecurityContextConstraints for the node agent's service
 # account (privileged, the node's PID namespace, host paths; the plugin,

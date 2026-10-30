@@ -186,6 +186,18 @@ if [ "$ECR_PULL" = 1 ]; then
         die "the image's pull secret (aws ecr get-login-password)"
     SETS+=(--set "imagePullSecrets[0].name=varek-image-pull")
 fi
+# the CRDs, the varek-crds chart's: on a cluster where a chart before the
+# split installed them (its crds/, which no release owns), given to its
+# release first, so that Helm takes them over (packaging/helm/varek-crds/README.md)
+for c in varekpolicies varekplans varekcredentials vareknodekeys; do
+    if K get crd "$c.varek.dev" > /dev/null 2>&1; then
+        K annotate crd "$c.varek.dev" meta.helm.sh/release-name=varek-crds meta.helm.sh/release-namespace="$NS" --overwrite > /dev/null &&
+        K label crd "$c.varek.dev" app.kubernetes.io/managed-by=Helm --overwrite > /dev/null || die "the CRD $c.varek.dev could not be given to varek-crds"
+    fi
+done
+say "installing the CRDs (varek-crds)"
+helm upgrade --install varek-crds "$ROOT/packaging/helm/varek-crds" -n "$NS" --wait --timeout 5m > "$OUT/helm-crds.log" 2>&1 ||
+    { tail -20 "$OUT/helm-crds.log" | tee -a "$LOG"; die "the CRDs did not install"; }
 say "installing the chart (${SETS[*]})"
 helm upgrade --install varek "$ROOT/packaging/helm/varek" -n "$NS" --wait --timeout 10m "${SETS[@]}" > "$OUT/helm.log" 2>&1 ||
     { tail -20 "$OUT/helm.log" | tee -a "$LOG"; die "the chart did not install"; }

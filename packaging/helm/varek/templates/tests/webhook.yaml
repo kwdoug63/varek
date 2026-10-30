@@ -1,0 +1,69 @@
+{{/* SPDX-License-Identifier: MIT
+  helm test: the admission webhook answers its health check over HTTPS, its
+  certificate verified with the CA the chart gives the API server for it (a
+  Secret's ca.crt, or admission.tls.caBundle). A webhook down refuses every
+  pod and policy it checks (failurePolicy Fail): this is the check that the
+  chart is up. Run as restricted-v2 allows (on OpenShift, the namespace's
+  user). */}}
+{{- $name := include "varek.admissionName" . -}}
+{{- $secret := .Values.admission.tls.secretName | default (printf "%s-tls" $name) -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ .Release.Name }}-test-webhook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "varek.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  nodeSelector:
+    kubernetes.io/os: linux
+  securityContext:
+    runAsNonRoot: true
+    {{- if not .Values.openshift.enabled }}
+    runAsUser: 65532
+    runAsGroup: 65532
+    {{- end }}
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: webhook
+      image: {{ include "varek.image" . }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      command:
+        - python3
+        - -c
+        - |
+          import base64, os, ssl, sys, urllib.request
+          b64 = os.environ.get("VAREK_CA_B64")
+          ctx = ssl.create_default_context(cadata=base64.b64decode(b64).decode()) if b64 else \
+              ssl.create_default_context(cafile="/tls/ca.crt")
+          url = "https://{{ $name }}.{{ .Release.Namespace }}.svc/healthz"
+          with urllib.request.urlopen(url, context=ctx, timeout=20) as r:
+              print(url, r.status)
+              sys.exit(0 if r.status == 200 else 1)
+      {{- with .Values.admission.tls.caBundle }}
+      env:
+        - { name: VAREK_CA_B64, value: {{ . | quote }} }
+      {{- end }}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: [ALL] }
+      resources:
+        requests: { cpu: 10m, memory: 32Mi }
+        limits: { memory: 64Mi }
+      {{- if not .Values.admission.tls.caBundle }}
+      volumeMounts:
+        - { name: tls, mountPath: /tls, readOnly: true }
+  volumes:
+    - name: tls
+      secret: { secretName: {{ $secret }}, items: [{ key: ca.crt, path: ca.crt }] }
+      {{- end }}

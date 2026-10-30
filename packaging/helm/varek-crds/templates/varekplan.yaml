@@ -8,13 +8,21 @@
 # POLICY_DIR/<namespace>/<name>.plan; the node agent decides it in the
 # container's view as the container starts, and holds the run to it. The
 # admission webhook (varek-admission) refuses one the Warden does not read,
-# or one with a step of a kind the node agent does not carry yet. Helm
-# installs it with the chart, and does not change or remove it on an upgrade
-# or an uninstall (Helm's rule for crds/): it is applied by hand on an
-# upgrade from a chart before 1.35 (kubectl apply -f).
+# or one with a step of a kind the node agent does not carry yet.
+# The varek-crds chart installs it (Red Hat's chart certification refuses a
+# chart with CRDs, so they are a chart of their own, installed before the
+# varek chart); helm upgrade varek-crds changes it, and its
+# helm.sh/resource-policy keeps it, and every resource of its kind, on an
+# uninstall.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    app.kubernetes.io/part-of: varek
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
   name: varekplans.varek.dev
 spec:
   group: varek.dev

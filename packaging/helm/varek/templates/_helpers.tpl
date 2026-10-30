@@ -111,6 +111,16 @@ oidc_ca = /etc/varek/issuer-ca/ca.crt
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- /* the CRDs, the varek-crds chart's: checked where the chart is
+  installed on a cluster (lookup sees one, by the namespace's default service
+  account, which a namespaced installer may read; helm template sees none) */ -}}
+{{- if and .Values.crds.check (lookup "v1" "ServiceAccount" .Release.Namespace "default") -}}
+{{- range $k := list "VarekPolicy" "VarekPlan" "VarekCredential" "VarekNodeKey" -}}
+{{- if not ($.Capabilities.APIVersions.Has (printf "varek.dev/v1alpha1/%s" $k)) -}}
+{{- fail (printf "the cluster has no %s: install the varek-crds chart first (helm install varek-crds oci://ghcr.io/kwdoug63/charts/varek-crds; packaging/helm/varek-crds/README.md)" $k) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- $r := .Values.streams.rotateBytes -}}
 {{- if not (and (kindIs "float64" $r | or (kindIs "int" $r) (kindIs "int64" $r)) (eq (float64 $r) (float64 (int64 $r))) (or (eq (int64 $r) 0) (ge (int64 $r) 65536))) -}}
 {{- fail (printf "streams.rotateBytes: 0 (no rotation) or a whole number of bytes, 65536 or more (it is %v)" $r) -}}

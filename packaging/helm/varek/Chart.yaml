@@ -18,3 +18,10 @@ keywords: [security, seccomp, agents, policy, nri]
 annotations:
   # docs/security/v1.34-kubernetes.md, section 3 and the implementation plan's step 6
   varek.dev/design: docs/security/v1.34-kubernetes.md
+  # Red Hat's chart certification (chart-verifier, partner profile): the
+  # chart's name in OpenShift's console, its provider, and the architectures
+  # its node image is built for
+  charts.openshift.io/name: VAREK
+  charts.openshift.io/provider: Sober Agentic Infrastructure, Inc.
+  charts.openshift.io/supportURL: https://github.com/kwdoug63/varek/blob/main/SECURITY.md
+  charts.openshift.io/archs: x86_64,aarch64

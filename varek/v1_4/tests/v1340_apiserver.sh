@@ -83,7 +83,8 @@ for _ in $(seq 120); do K get --raw /readyz > /dev/null 2>&1 && break; sleep 0.5
 check "the API server is ready ($("$A/kube-apiserver" --version))" K get --raw /readyz
 
 echo "== 1. the resource"
-helm template t "$ROOT/packaging/helm/varek" -n varek-system --kube-version 1.31.0 --include-crds > "$OUT/chart.yaml"
+{ helm template t "$ROOT/packaging/helm/varek" -n varek-system --kube-version 1.31.0 && echo --- &&
+  helm template c "$ROOT/packaging/helm/varek-crds" -n varek-system --kube-version 1.31.0; } > "$OUT/chart.yaml"
 python3 - "$OUT/chart.yaml" "$OUT" "$(base64 -w0 < "$P/ca.crt")" <<'EOF'
 import json, sys, yaml
 docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]

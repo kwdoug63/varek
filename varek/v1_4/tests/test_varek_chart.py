@@ -17,6 +17,8 @@ import yaml
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 CHART = os.path.join(ROOT, "packaging", "helm", "varek")
+# the custom resources, a chart of their own (Red Hat's chart certification)
+CRDS = os.path.join(ROOT, "packaging", "helm", "varek-crds")
 HELM = os.environ.get("HELM") or shutil.which("helm")
 KUBECONFORM = os.environ.get("KUBECONFORM")
 KUBE = "1.31.0"
@@ -33,7 +35,7 @@ def helm(*args, ok=True):
 
 
 def render(*sets, ok=True):
-    args = ["template", "t", CHART, "-n", NS, "--kube-version", KUBE, "--include-crds"]
+    args = ["template", "t", CHART, "-n", NS, "--kube-version", KUBE]
     for s in sets:
         args += ["--set", s]
     p = helm(*args, ok=ok)
@@ -43,6 +45,12 @@ def render(*sets, ok=True):
         k = subprocess.run([KUBECONFORM, "-strict", "-summary", "-kubernetes-version", KUBE,
                             "-ignore-missing-schemas"], input=p.stdout, capture_output=True, text=True, check=False)
         assert k.returncode == 0, k.stdout + k.stderr
+    return [d for d in yaml.safe_load_all(p.stdout) if d]
+
+
+def render_crds():
+    """the varek-crds chart's render: the CRDs"""
+    p = helm("template", "c", CRDS, "-n", NS, "--kube-version", KUBE)
     return [d for d in yaml.safe_load_all(p.stdout) if d]
 
 
@@ -95,9 +103,8 @@ def test_lint_strict():
 def test_the_default_render():
     docs = render()
     assert kinds(docs) == ["ClusterRole", "ClusterRole", "ClusterRoleBinding", "ClusterRoleBinding",
-                           "CustomResourceDefinition", "CustomResourceDefinition", "CustomResourceDefinition",
-                           "CustomResourceDefinition", "DaemonSet", "Deployment",
-                           "MutatingWebhookConfiguration", "PodDisruptionBudget", "Secret",
+                           "DaemonSet", "Deployment",
+                           "MutatingWebhookConfiguration", "Pod", "PodDisruptionBudget", "Secret",
                            "Service", "ServiceAccount", "ServiceAccount", "ValidatingWebhookConfiguration"]
     for d in docs:
         if d["kind"] not in ("CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
@@ -399,7 +406,7 @@ def test_openshift():
 
 
 def test_the_crd_names_what_the_node_agent_takes():
-    docs = render()
+    docs = render_crds()
     kube = open(os.path.join(ROOT, "varek", "v1_4", "k8s", "internal", "kube", "kube.go")).read()
     go = re.search(r"var Name = regexp\.MustCompile\(`([^`]*)`\)", kube).group(1)
     # v1.35 step 4c (D11): VarekPlan beside VarekPolicy, its text spec.plan
@@ -551,7 +558,7 @@ def test_dry_run_flow_policy_and_trust_bundles():
     ConfigMap, projected (in memory: a configMap volume's directory is the
     node's, writable by all)"""
     docs = render()
-    crd = one(docs, "CustomResourceDefinition", "varekpolicies.varek.dev")
+    crd = one(render_crds(), "CustomResourceDefinition", "varekpolicies.varek.dev")
     props = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
     assert props["dryRun"]["type"] == "boolean" and props["flowPolicy"]["type"] == "string"
     kube = open(os.path.join(ROOT, "varek", "v1_4", "k8s", "internal", "kube", "kube.go")).read()
@@ -673,7 +680,7 @@ def test_node_keys():
 
 
 def test_the_vareknodekey_crd():
-    crd = one(render(), "CustomResourceDefinition", "vareknodekeys.varek.dev")
+    crd = one(render_crds(), "CustomResourceDefinition", "vareknodekeys.varek.dev")
     assert crd["spec"]["scope"] == "Cluster" and crd["spec"]["names"]["kind"] == "VarekNodeKey"
     v = crd["spec"]["versions"][0]
     assert v["name"] == "v1alpha1" and v["served"] and v["storage"]
@@ -687,7 +694,7 @@ def test_the_vareknodekey_crd():
 
 
 def test_the_varekcredential_crd():
-    crd = one(render(), "CustomResourceDefinition", "varekcredentials.varek.dev")
+    crd = one(render_crds(), "CustomResourceDefinition", "varekcredentials.varek.dev")
     assert crd["spec"]["scope"] == "Cluster" and crd["spec"]["names"]["kind"] == "VarekCredential"
     v = crd["spec"]["versions"][0]
     assert v["name"] == "v1alpha1" and v["served"] and v["storage"]
@@ -742,6 +749,8 @@ def test_ci_and_the_release_build_check_and_sign_the_node_image_and_the_chart():
               "platforms.py node-index.json linux/amd64 linux/arm64", 'cosign sign --yes --recursive "$node"',
               'cosign attest --yes --type cyclonedx --predicate "sbom-node-$a.cdx.json" "$d"', "helm lint --strict",
               "helm package", 'helm push', 'cosign sign --yes "$CHARTS/varek@$d"',
+              "helm package packaging/helm/varek-crds", 'cosign sign --yes "$CHARTS/varek-crds@$d"',
+              '"$CRDS_DIGEST" > /dev/null',
               '"$NODE_DIGEST" > /dev/null', 'for d in "$NODE_AMD64" "$NODE_ARM64"', '"$CHART_DIGEST" > /dev/null',
               'docker buildx imagetools create -t "$NODE:$t" "$NODE_DIGEST"'):
         assert w in joined, w
@@ -751,6 +760,43 @@ def test_ci_and_the_release_build_check_and_sign_the_node_image_and_the_chart():
     # each in order: published, then signed, then verified, then the tags moved
     at = lambda w: next(i for i, r in enumerate(run) if w in r)
     assert at('docker push "$NODE:$VERSION-amd64"') < at("helm package") < at("helm push") < at('"$CHART_DIGEST" > /dev/null') < at('imagetools create -t "$NODE:$t"')
+    assert at('cosign sign --yes "$CHARTS/varek-crds@$d"') < at('"$CRDS_DIGEST" > /dev/null')
     # the platforms checked before the image for both is signed
     pub = run[at("platforms.py")]
     assert pub.index("platforms.py") < pub.index("cosign sign")
+
+
+def test_red_hat_chart_certification():
+    """Red Hat's chart certification (chart-verifier, partner profile): no CRD
+    in the chart (they are varek-crds'), a values schema, a helm test, the
+    annotations; each CRD kept on an uninstall"""
+    assert not os.path.exists(os.path.join(CHART, "crds"))
+    assert not [d for d in render() if d["kind"] == "CustomResourceDefinition"]
+    meta = yaml.safe_load(open(os.path.join(CHART, "Chart.yaml")))
+    assert meta["annotations"]["charts.openshift.io/name"] == "VAREK"
+    assert set(meta["annotations"]["charts.openshift.io/archs"].split(",")) == {"x86_64", "aarch64"}
+    assert os.path.exists(os.path.join(CHART, "values.schema.json"))
+    crds = render_crds()
+    assert sorted(d["metadata"]["name"] for d in crds) == ["varekcredentials.varek.dev", "vareknodekeys.varek.dev",
+                                                           "varekplans.varek.dev", "varekpolicies.varek.dev"]
+    assert all(d["metadata"]["annotations"]["helm.sh/resource-policy"] == "keep" for d in crds)
+    crdm = yaml.safe_load(open(os.path.join(CRDS, "Chart.yaml")))
+    assert (crdm["version"], crdm["appVersion"]) == (meta["version"], meta["appVersion"])
+    # the helm test: the webhook's health, its certificate verified
+    t = one(render(), "Pod")
+    assert t["metadata"]["annotations"]["helm.sh/hook"] == "test"
+    c = t["spec"]["containers"][0]
+    assert "https://t-admission.varek-system.svc/healthz" in c["command"][2]
+    assert t["spec"]["securityContext"]["runAsNonRoot"] and c["securityContext"]["capabilities"] == {"drop": ["ALL"]}
+    assert "runAsUser" not in one(render("openshift.enabled=true"), "Pod")["spec"]["securityContext"]
+    # with the operator's Secret and its CA given as a value
+    t = one(render("admission.tls.secretName=mine", "admission.tls.caBundle=Q0E="), "Pod")
+    assert t["spec"]["containers"][0]["env"] == [{"name": "VAREK_CA_B64", "value": "Q0E="}] and "volumes" not in t["spec"]
+
+
+def test_the_values_schema():
+    """values.schema.json: a value of the wrong type refused at render"""
+    p = render("signing.nodeKey.enabled=yes-please", ok=False)
+    assert p.returncode != 0 and "signing.nodeKey.enabled" in p.stderr
+    p = render("admission.replicas=two", ok=False)
+    assert p.returncode != 0 and "admission.replicas" in p.stderr
