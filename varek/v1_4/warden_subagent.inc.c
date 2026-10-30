@@ -52,6 +52,18 @@
  * A process in no group of the run is refused every call
  * (subagent_unattributed): it can only be there if something moved it.
  *
+ * v1.36 step 12 (the ship gate's runs): SUB_MAX bounds the sub-agents a run
+ * holds at once, not the launches it makes. Under the node agent a run is a
+ * container's life, days for a long-running agent, and a launch of a
+ * sub-agent every turn reached 1,024 launches in 8.5 hours, after which
+ * every launch was refused (subagent_limit). Now, at each launch, a
+ * sub-agent that has ended is released (sub_reclaim): its group is removed
+ * (rmdir succeeds only when no process is in it and no group below it), and
+ * nothing the Warden holds still names it (a launch waiting on its
+ * exec_result, a connection handed to the proxy or a dial for it, a
+ * sub-agent it launched). Its slot is used again, and subagent_ended
+ * records it. A pending sub-agent is never released.
+ *
  * v1.36 step 5 (docs/security/v1.36-kubernetes-parity.md, D3 (a)): under
  * the node agent the container's own group (the runtime's: a systemd scope,
  * crio-<id>.scope or cri-containerd-<id>.scope) is the run's. The
@@ -99,11 +111,11 @@ struct sub_pidfd_info {
 #define SUB_PIDFD_GET_INFO _IOWR(0xFF, 11, struct sub_pidfd_info)
 #define SUB_PIDFD_INFO_CGROUPID (1UL << 2)
 
-#define SUB_MAX       1024           /* sub-agent launches a run may make */
+#define SUB_MAX       1024           /* sub-agents a run holds at once (v1.36 step 12: not its launches) */
 #define SUB_MAX_DEPTH 8              /* sub-agents nested in sub-agents */
 #define SUB_REL_MAX   512            /* a group's path under the run's: 8 x "/NAME-n" */
 
-enum { SUB_AGENT = 0, SUB_PENDING, SUB_LAUNCHED, SUB_FAILED };
+enum { SUB_AGENT = 0, SUB_PENDING, SUB_LAUNCHED, SUB_FAILED, SUB_FREE };   /* SUB_FREE: released, v1.36 step 12 */
 #define SUB_LAYOUT_N 10              /* /proc/<pid>/stat's layout fields, below */
 
 struct subject {
@@ -130,10 +142,14 @@ struct subject {
     int      psubj;
     bool     mcp;
     bool     confined;               /* v1.31: its launch rule declares it a confined subject */
+    /* v1.36 step 12: what still names it, so that it is not released */
+    int      nchild;                 /* sub-agents it launched, not released */
+    int      handoffs;               /* connections handed to the proxy for it, not yet reported */
 };
 
 static struct subject *g_sub;
 static size_t g_nsub;
+static bool exec_pend_names(int s);          /* v1.36 step 12: warden_exec.inc.c */
 static char g_cg_dir[PATH_MAX];      /* the run's group, on the filesystem (relative to g_cg_dfd) */
 /* v1.36 step 5: AT_FDCWD (g_cg_dir absolute), or under the node agent the
  * supervisor's own mount of the cgroup filesystem (g_cg_dir relative to its
@@ -863,7 +879,8 @@ static int sub_attribute(pid_t tid) {
     size_t bl = strlen(g_cg_self);
     if (strncmp(l, g_cg_self, bl) || (l[bl] && l[bl] != '/')) return -1;
     const char *rel = l + bl;
-    for (size_t i = 0; i < g_nsub; i++) if (!strcmp(g_sub[i].rel, rel)) { s = (int)i; break; }
+    for (size_t i = 0; i < g_nsub; i++)
+        if (g_sub[i].state != SUB_FREE && !strcmp(g_sub[i].rel, rel)) { s = (int)i; break; }
     if (s < 0) return -1;
 found:
     sub_settle(s, tid);                  /* the first call from its group settles the launch */
@@ -883,6 +900,72 @@ static bool sub_aslr(void) {
     return c == '2';
 }
 
+/* v1.36 step 12: the sub-agents a run may hold at once (SUB_MAX; fewer for
+ * the tests, VAREK_WARDEN_TEST_SUB_MAX) */
+static size_t sub_max(void) {
+    static size_t m;
+    if (!m) {
+        const char *e = getenv("VAREK_WARDEN_TEST_SUB_MAX");
+        long v = e ? strtol(e, NULL, 10) : 0;
+        m = v > 0 && v < SUB_MAX ? (size_t)v : SUB_MAX;
+    }
+    return m;
+}
+
+/* v1.36 step 12: a connection the proxy has been handed for subject s
+ * (delta 1), or reported on (-1): warden_pxdecide.inc.c */
+static void sub_handoff(int s, int delta) {
+    if (g_sub_on && g_sub && s > 0 && (size_t)s < g_nsub && g_sub[s].state != SUB_FREE) g_sub[s].handoffs += delta;
+}
+
+/* subagent_ended: a sub-agent released (once): no process is in its group,
+ * no group below it, and nothing the Warden holds names it */
+static void sub_ended_record(int s) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    FILE *f = rec_begin();
+    fprintf(f, "{\"event\":\"subagent_ended\",\"run\":\"%s\",\"subagent\":\"%s#%u\",\"timestamp_ns\":%lld}\n",
+            g_run_id, g_sub[s].name, g_sub[s].n, (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+    rec_end(NULL);
+}
+
+/* v1.36 step 12: release each sub-agent that has ended, so that its slot is
+ * used again. A launched or failed one, with no sub-agent of its own left,
+ * no launch waiting on its exec_result, no connection or dial for it, and
+ * its group removed: the kernel removes a group only when no process is in
+ * it and no group is below it, and nothing moves a process into a
+ * sub-agent's group but its launch. Released deepest first: a group below
+ * another is removed before it, in a later pass if needed. Never keep, the
+ * launcher of the launch being decided (review: its process, killed during
+ * the launch, leaves its group empty, and its slot must not be reused under
+ * it; its ancestors each hold it, nchild). */
+static void sub_reclaim(int keep) {
+    px_expire_handoffs();                        /* review: hand-offs the proxy never reported */
+    for (int pass = 0; pass < SUB_MAX_DEPTH; pass++) {
+        bool any = false;
+        for (size_t i = 1; i < g_nsub; i++) {
+            struct subject *x = &g_sub[i];
+            if ((int)i == keep || (x->state != SUB_LAUNCHED && x->state != SUB_FAILED) || x->nchild ||
+                x->handoffs > 0 || exec_pend_names((int)i) || px_names_subject((int)i) ||
+                pend_names_subject((int)i))
+                continue;
+            /* review: removed whatever cgid says (a failed one's already is:
+             * ENOENT; a launched one whose id could not be read is not) */
+            char dir[PATH_MAX + SUB_REL_MAX];
+            sub_dir((int)i, dir, sizeof dir);
+            if (sub_cg_rmdir(dir) < 0 && errno != ENOENT) continue;
+            x->cgid = 0;
+            sub_ended_record((int)i);
+            if (x->parent > 0) g_sub[x->parent].nchild--;
+            x->state = SUB_FREE;
+            x->rel[0] = '\0';
+            x->tgid = 0;
+            any = true;
+        }
+        if (!any) return;
+    }
+}
+
 /* A launch the policy allows by a rule with subagent=name, from a process of
  * subject from: the sub-agent made, its group made and the process moved.
  * The subject, or -1 with the rule that refuses it. */
@@ -890,7 +973,6 @@ static int sub_launch(pid_t tid, int from, const char *name, int csubj, bool mcp
                       uint64_t seq, const char **rule) {
     *rule = "subagent_failed";
     if (from < 0 || (size_t)from >= g_nsub) return -1;
-    if (g_nsub > SUB_MAX) { *rule = "subagent_limit"; return -1; }
     if (g_sub[from].depth >= SUB_MAX_DEPTH) { *rule = "subagent_depth"; return -1; }
     pid_t tgid = task_tgid(tid);
     if (tgid <= 0) return -1;
@@ -917,6 +999,11 @@ static int sub_launch(pid_t tid, int from, const char *name, int csubj, bool mcp
     /* v1.36 step 5: under the node agent the container's first process
      * stays in the container's group (M1); after the refusals a host makes */
     if (g_cg_container && tgid == g_nr.pid) { *rule = "subagent_first_process"; return -1; }
+    /* v1.36 step 12: a slot released, else a new one, up to sub_max() held */
+    sub_reclaim(from);
+    size_t slot = 1;
+    while (slot < g_nsub && g_sub[slot].state != SUB_FREE) slot++;
+    if (slot == g_nsub && g_nsub > sub_max()) { *rule = "subagent_limit"; return -1; }
     sub_cn_drain();                      /* events from before this launch are not its */
     size_t c = 0;
     while (c < g_nsub_count && strcmp(g_sub_count[c].name, name)) c++;
@@ -925,7 +1012,7 @@ static int sub_launch(pid_t tid, int from, const char *name, int csubj, bool mcp
         snprintf(g_sub_count[c].name, sizeof g_sub_count[c].name, "%s", name);
         g_nsub_count++;
     }
-    struct subject *s = &g_sub[g_nsub];
+    struct subject *s = &g_sub[slot];
     memset(s, 0, sizeof *s);
     snprintf(s->name, sizeof s->name, "%s", name);
     s->n = g_sub_count[c].n + 1;
@@ -944,19 +1031,26 @@ static int sub_launch(pid_t tid, int from, const char *name, int csubj, bool mcp
     char rel[SUB_REL_MAX + 48], obo[sizeof s->obo + 64];
     int rl = snprintf(rel, sizeof rel, "%s/%s-%u", g_sub[from].rel, name, s->n);
     int ol = snprintf(obo, sizeof obo, "%s,\"subagent:%s#%u\"", g_sub[from].obo, name, s->n);
-    if (rl < 0 || (size_t)rl >= sizeof s->rel || ol < 0 || (size_t)ol >= sizeof s->obo) return -1;
+    if (rl < 0 || (size_t)rl >= sizeof s->rel || ol < 0 || (size_t)ol >= sizeof s->obo) {
+        s->state = SUB_FREE;             /* v1.36 step 12: the slot stays free */
+        s->rel[0] = '\0';
+        return -1;
+    }
     memcpy(s->rel, rel, (size_t)rl + 1);
     memcpy(s->obo, obo, (size_t)ol + 1);
     char dir[PATH_MAX + SUB_REL_MAX];
-    sub_dir((int)g_nsub, dir, sizeof dir);
-    if (mkdirat(g_cg_dfd, dir, 0755) < 0) return -1;
+    sub_dir((int)slot, dir, sizeof dir);
+    /* review: a slot not taken stays free (a failure below leaves it so) */
+    if (mkdirat(g_cg_dfd, dir, 0755) < 0) { s->state = SUB_FREE; s->rel[0] = '\0'; return -1; }
     s->cgid = sub_dir_id(dir);
     int pidfd = (int)syscall(__NR_pidfd_open, tgid, 0);
     int ok = pidfd >= 0 ? sub_move(tgid, pidfd, dir) : -1;
     if (pidfd >= 0) close(pidfd);
-    if (ok < 0) { sub_cg_rmdir(dir); return -1; }
+    if (ok < 0) { sub_cg_rmdir(dir); s->cgid = 0; s->state = SUB_FREE; s->rel[0] = '\0'; return -1; }
     g_sub_count[c].n++;
-    return (int)g_nsub++;
+    g_sub[from].nchild++;
+    if (slot == g_nsub) g_nsub++;
+    return (int)slot;
 }
 
 /* v1.31: the policy subject the calls of runtime subject s are decided as
@@ -1008,7 +1102,7 @@ static void sub_finish(void) {
     for (int round = 0; round < 50; round++) {
         bool left = false;
         for (size_t i = g_nsub; i-- > 1; ) {
-            if (g_sub[i].state == SUB_FAILED) continue;            /* removed when it failed */
+            if (g_sub[i].state == SUB_FAILED || g_sub[i].state == SUB_FREE) continue;   /* removed already */
             char dir[PATH_MAX + SUB_REL_MAX];
             sub_dir((int)i, dir, sizeof dir);
             if (sub_cg_rmdir(dir) < 0 && errno != ENOENT) left = true;

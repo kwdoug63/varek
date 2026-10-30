@@ -576,6 +576,28 @@ sys.exit(0 if rs and all(isinstance(r.get("obo"), list) and r["obo"][:1] == ["ag
         SOPT=()
         [ "$(obos user)" = "user+agent+subagent:alpha#1" ] && pass "with a verified user: user, agent, sub-agent" || flunk "with a user ($(obos user))"
     else skip "obo with a user (section 2 did not run)"; fi
+    # v1.36 step 12 (the ship gate's runs): the limit is the sub-agents held at
+    # once, not the launches a run makes (under the node agent a run is a
+    # container's life: 1,024 launches came in 8.5 hours). With the tests'
+    # limit of 4: 300 launches one after the other all run, each released
+    VAREK_WARDEN_TEST_SUB_MAX=4 sgo many repeat 300 "$B/a" open "$B/f"
+    check "300 launches one after the other, 4 held at most: all run" grep -qx 'ran 300 refused 0' "$OUT/many.so"
+    check "... none refused for the limit, each but the last released (subagent_ended)" sh -c \
+        "! grep -q subagent_limit '$OUT/many.out' && [ \$(grep -c '\"event\":\"subagent_ended\"' '$OUT/many.out') -ge 299 ]"
+    check "... the run's groups all removed at its end" sh -c "! ls '$CGM' | grep -q '^varek-'"
+    check "... the audit accepts it, each launch counted" sh -c \
+        "python3 '$HERE/tools/varek_audit.py' --policy '$B/p.txt' --checker '$CERT' '$OUT/many.out' | grep -q 'sub-agents: alpha 300 launches'"
+    VAREK_WARDEN_TEST_SUB_MAX=4 sgo hold hold 6 "$B/a" loop "$B/f" 2
+    check "6 held at once with a limit of 4: 4 run, 2 refused (subagent_limit)" sh -c \
+        "grep -qx 'ran 4 refused 2' '$OUT/hold.so' && [ \$(grep -c '\"rule\":\"subagent_limit\"' '$OUT/hold.out') = 2 ]"
+    check "... the audit accepts it" python3 "$HERE/tools/varek_audit.py" --policy "$B/p.txt" --checker "$CERT" "$OUT/hold.out"
+    VAREK_WARDEN_TEST_SUB_MAX=4 sgo nestmany repeat 60 "$B/a" exec "$B/b" open "$B/f"
+    check "60 launches of a sub-agent that launches its own: all run, the inner released before the outer" \
+        sh -c "grep -qx 'ran 60 refused 0' '$OUT/nestmany.so' && python3 -c 'import json,sys
+L = [json.loads(l) for l in open(sys.argv[1]) if l.startswith(\"{\")]
+end = {r[\"subagent\"]: i for i, r in enumerate(L) if r.get(\"event\") == \"subagent_ended\"}
+sys.exit(0 if len(end) >= 118 and all(end[f\"beta#{k}\"] < end[f\"alpha#{k}\"] for k in range(1, 60)) else 1)' '$OUT/nestmany.out'"
+    check "... the audit accepts it" python3 "$HERE/tools/varek_audit.py" --policy "$B/p.txt" --checker "$CERT" "$OUT/nestmany.out"
 fi
 
 echo "== 4. the user's token expires during the run =="
@@ -695,6 +717,20 @@ for r in recs:
     if isinstance(r, dict) and r.get('event') in ('exec_result', 'subagent_settled'): r.pop('subagent', None)
 dr[-1]['obo'] = ['agent', 'subagent:alpha#1']"
     refuses "a failed launch with its sub-agent stripped from its results" "$B/p.txt" "$OUT/g15.log" "subagent_settled event that is malformed"
+    # v1.36 step 12: a released sub-agent is gone: no decision for it after,
+    # released once, and never before a sub-agent it launched
+    if [ -s "$OUT/many.out" ] && [ -s "$OUT/nestmany.out" ]; then
+        python3 "$F" "$OUT/many.out" "$OUT/g17.log" "r = next(r for r in recs if isinstance(r, dict) and 'report_id' in r and r.get('obo') == ['agent', 'subagent:alpha#2'])
+r['obo'] = ['agent', 'subagent:alpha#1']"
+        refuses "a decision for a sub-agent after it was released" "$B/p.txt" "$OUT/g17.log" "after it was released (subagent_ended)"
+        python3 "$F" "$OUT/many.out" "$OUT/g18.log" "e = next(r for r in recs if isinstance(r, dict) and r.get('event') == 'subagent_ended' and r.get('subagent') == 'alpha#1')
+i = [k for k, r in enumerate(recs) if isinstance(r, dict) and r.get('event') == 'run_end'][0]; recs.insert(i, dict(e))"
+        refuses "a sub-agent released twice" "$B/p.txt" "$OUT/g18.log" "is not a sub-agent launched and not yet released"
+        python3 "$F" "$OUT/nestmany.out" "$OUT/g19.log" "a = next(k for k, r in enumerate(recs) if isinstance(r, dict) and r.get('event') == 'subagent_ended' and r.get('subagent') == 'alpha#1')
+b = next(k for k, r in enumerate(recs) if isinstance(r, dict) and r.get('event') == 'subagent_ended' and r.get('subagent') == 'beta#1')
+recs.insert(b, recs.pop(a))"
+        refuses "a sub-agent released before one it launched" "$B/p.txt" "$OUT/g19.log" "sub-agent(s) it launched were not"
+    else skip "a released sub-agent's records (section 3's runs did not run)"; fi
     python3 "$F" "$OUT/e2big.out" "$OUT/g16.log" "ex = [r for r in recs if isinstance(r, dict) and r.get('event') in ('exec_result', 'subagent_settled')]
 for e in ex: recs.remove(e)
 i = [k for k, r in enumerate(recs) if isinstance(r, dict) and r.get('event') == 'run_end'][0]; recs[i:i] = ex

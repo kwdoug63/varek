@@ -63,10 +63,19 @@ static struct px_req g_px[PX_MAX_DIAL];
 static uint8_t  *g_ho_state;
 static uint16_t *g_ho_port;
 static int      *g_ho_subj;                    /* v1.28.1: whom the agent's connect was for */
+static int64_t  *g_ho_at;                      /* v1.36 step 12 (review): when announced (monotonic ms) */
 static size_t    g_ho_cap;
+static uint64_t  g_ho_low = 1;                 /* every id below it is reported or dropped */
+/* v1.36 step 12 (review): a hand-off not reported by then never will be: the
+ * proxy drops an announcement after WP_ANNOUNCE_MS and a connection whose
+ * head it has not read after WP_READ_MS, and some silently (its table full).
+ * It is dropped (state 3): its subject no longer held for it, and a report on
+ * it after is the proxy misbehaving, as a second report is. */
+#define PX_HO_EXPIRE_MS (2 * (WP_ANNOUNCE_MS + WP_READ_MS + WP_VERDICT_MS))
 
 /* v1.28.1: the subject of hand-off id's connect (the proxy's records are its) */
 static int px_subject(uint64_t id) { return id < g_ho_cap && g_ho_subj ? g_ho_subj[id] : 0; }
+static void sub_handoff(int s, int delta);     /* v1.36 step 12: warden_subagent.inc.c */
 
 static void px_handed_off(uint64_t id, unsigned port, int subject) {
     if (id >= g_ho_cap) {
@@ -81,12 +90,37 @@ static void px_handed_off(uint64_t id, unsigned port, int subject) {
         int *sj = realloc(g_ho_subj, nc * sizeof *sj);
         if (!sj) return;
         g_ho_subj = sj;
+        int64_t *at = realloc(g_ho_at, nc * sizeof *at);
+        if (!at) return;
+        g_ho_at = at;
         memset(g_ho_state + g_ho_cap, 0, nc - g_ho_cap);
         g_ho_cap = nc;
     }
     g_ho_state[id] = 1;
     g_ho_port[id] = (uint16_t)port;
     g_ho_subj[id] = subject;
+    g_ho_at[id] = wr_now_ms();
+    sub_handoff(subject, 1);                     /* v1.36 step 12: not released until reported */
+}
+
+/* v1.36 step 12 (review): hand-off id will not be reported (its connect
+ * failed, or it expired) */
+static void px_handoff_drop(uint64_t id) {
+    if (id >= g_ho_cap || !g_ho_state || g_ho_state[id] != 1) return;
+    g_ho_state[id] = 3;
+    sub_handoff(g_ho_subj[id], -1);
+}
+
+/* v1.36 step 12 (review): drop the hand-offs announced longer ago than
+ * PX_HO_EXPIRE_MS and not reported (ids are given in time order) */
+static void px_expire_handoffs(void) {
+    int64_t now = wr_now_ms();
+    for (; g_ho_low < g_ho_cap && g_ho_low <= g_proxy_conns; g_ho_low++) {
+        if (g_ho_state[g_ho_low] == 1) {
+            if (now - g_ho_at[g_ho_low] < PX_HO_EXPIRE_MS) break;
+            px_handoff_drop(g_ho_low);
+        }
+    }
 }
 
 /* Step 7: the connections passed to the proxy and not yet closed, and when
@@ -134,6 +168,14 @@ static void px_open_add(uint64_t id, bool inspect, const struct px_req *q) {
         o.port = q->port;
     }
     g_px_open[g_px_nopen++] = o;
+}
+
+/* v1.36 step 12: whether a connection still open, or a dial in progress, is
+ * for subject s (a sub-agent named by one is not released) */
+static bool px_names_subject(int s) {
+    for (size_t k = 0; k < g_px_nopen; k++) if (px_subject(g_px_open[k].id) == s) return true;
+    for (int k = 0; k < PX_MAX_DIAL; k++) if (g_px[k].used && g_px[k].a && g_px[k].a->subject == s) return true;
+    return false;
 }
 
 /* v1.36 step 12 (the ship gate's runs): the proxy_unreadable record, chained
@@ -1217,10 +1259,11 @@ static int proxy_service(const struct policy *p) {
             return -1;
         /* v1.26 review: one report per hand-off, and (TLS, HTTP) on the port
          * the agent connected to; anything else and the proxy is not
-         * behaving */
+         * behaving (v1.36 step 12: a dropped one, state 3, too) */
         if (m.id >= g_ho_cap || g_ho_state[m.id] != 1) return -1;
         if (m.type == WP_MSG_REQUEST && m.kind != PP_KIND_CONNECT && m.port != g_ho_port[m.id]) return -1;
         g_ho_state[m.id] = 2;
+        sub_handoff(g_ho_subj[m.id], -1);        /* v1.36 step 12 */
         if (m.type == WP_MSG_REQUEST) {
             char why[8];
             if (m.port == 0 || m.port > 65535 || m.kind == PP_KIND_NONE ||

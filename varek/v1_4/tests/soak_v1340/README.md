@@ -269,6 +269,35 @@ openshift-install destroy cluster --dir ~/varek-sno # end
 rm -f ~/ocp/pull-secret.json ~/varek-sno-install-config.yaml.keep # end
 ```
 
+The cluster's other files on the host go with it: its kubeadmin password
+and kubeconfig (`~/varek-sno/auth`), and the service accounts' signing
+key `ccoctl` made (`~/ocp/ccoctl-out/serviceaccount-signer.private`):
+
+```sh
+rm -rf /root/varek-sno /root/ocp # end
+```
+
+## 4. Last: the host
+
+What the runs wrote is on the host alone. Keep it before the host goes,
+as one archive (the streams, each run's report, the cluster's node keys,
+the anchor), without each run's `secret/` (the soak's token and the test
+CA's keys, which nothing else holds), in a private S3 bucket of the
+account (decided October 29, 2026, for v1.36.0's runs), its SHA-256 kept
+beside it:
+
+```sh
+cd /var/tmp && tar -czf varek-soak-runs.tar.gz --exclude='*/secret' $(ls -d varek-soak-*/ | tr -d /) && sha256sum varek-soak-runs.tar.gz | tee varek-soak-runs.tar.gz.sha256 # end
+AWS_PAGER="" aws s3api create-bucket --bucket BUCKET --region us-east-1 && AWS_PAGER="" aws s3api put-public-access-block --bucket BUCKET --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true # end
+aws s3 cp /var/tmp/varek-soak-runs.tar.gz s3://BUCKET/RELEASE/ && aws s3 cp /var/tmp/varek-soak-runs.tar.gz.sha256 s3://BUCKET/RELEASE/ && aws s3 ls s3://BUCKET/RELEASE/ # end
+```
+
+Then end the host, from wherever it was made (CloudShell):
+
+```sh
+AWS_PAGER="" aws ec2 terminate-instances --region us-east-1 --instance-ids INSTANCE_ID # end
+```
+
 ## Files
 
 | File | What it does |

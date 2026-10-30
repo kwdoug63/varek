@@ -569,6 +569,13 @@ static struct pending_op *g_pend[MAX_PENDING];
 static int g_npend = 0;
 static size_t g_pend_bytes = 0;
 
+/* v1.36 step 12 (review): whether a pending operation's record is still to
+ * be written for subject s (a sub-agent named by one is not released) */
+static bool pend_names_subject(int s) {
+    for (int i = 0; i < g_npend; i++) if (g_pend[i]->act && g_pend[i]->act->subject == s) return true;
+    return false;
+}
+
 static void ts_add_ns(struct timespec *t, int64_t ns) {
     t->tv_sec += ns / 1000000000LL;
     t->tv_nsec += ns % 1000000000LL;
@@ -733,7 +740,12 @@ static int proxy_dial(int s, int dom, const struct sockaddr_storage *to, socklen
         const char *c = strrchr(a->dialed, ':');
         px_handed_off(g_proxy_conns, c ? (unsigned)strtoul(c + 1, NULL, 10) : 0, a->subject);
     }
-    return connect(s, (const struct sockaddr *)to, tl) < 0 ? -errno : 0;
+    if (connect(s, (const struct sockaddr *)to, tl) < 0 && errno != EINPROGRESS) {
+        int e = errno;
+        px_handoff_drop(g_proxy_conns);          /* v1.36 step 12 (review): it will never be reported */
+        return -e;
+    }
+    return 0;
 }
 
 static void net_connect(int notify_fd, const struct seccomp_notif *req, struct action *a,
