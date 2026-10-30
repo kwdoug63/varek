@@ -6,7 +6,7 @@ be true before VAREK is offered as production software, and what the
 first pilots need from it. Each piece that changes code still gets its own
 design note before it is built.
 **Author:** Kenneth Wayne Douglas, MD
-**Last updated:** October 29, 2026 (Central)
+**Last updated:** October 30, 2026 (Central)
 
 The question (October 29, 2026) was what is left after v1.37 before VAREK
 is ready to sell, with the market reached by customers, not by raising
@@ -34,6 +34,7 @@ repository: a CI run, a report, or a document.
 | R6 | Can our security team use what it records? | v1.37 ships, ordered by the first pilot's SIEM |
 | R7 | Can we try it in an afternoon? | A clean EKS or OpenShift cluster to a refused and an allowed pod in under 15 minutes, timed |
 | R8 | Has anyone like us run it? | Two pilots finished, at least one with a reference |
+| R9 | Why does it need so much privilege? | A page says what the node agent holds and why, and it runs with a named, measured set of capabilities instead of `privileged: true` |
 
 R1 and R8 are the ones money cannot buy quickly, so they start now, with
 the design partners (below), alongside the rest.
@@ -144,6 +145,26 @@ in the release notes, as the 24-hour runs' are.
      in the forked child, or several at once.
   3. **The plugin's memory on OpenShift**, read from the 24-hour report;
      found and fixed if it grows.
+- **The node agent's privilege (R9).** v1.36.0 runs it as `privileged:
+  true`, root, in the node's PID namespace. A platform team will set that
+  beside supervisors that run inside the pod with no privilege. Answered in
+  three steps (`docs/security/node-agent-privilege.md`):
+  1. **The page** (written October 30, 2026): what the node agent does that
+     needs each right, what the agent pods are spared, and what
+     `privileged: true` gives that it does not use.
+  2. **A named set instead of `privileged: true`**: eight capabilities
+     (CAP_SYS_ADMIN, CAP_SYS_PTRACE, CAP_SYS_CHROOT, CAP_SETUID,
+     CAP_SETGID, CAP_KILL, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH),
+     `hostPID`, SELinux `spc_t`, and a seccomp profile of VAREK's, measured
+     on every cell of the matrix. The OpenShift security context constraint
+     then no longer allows a privileged container. A v1.37 candidate, built
+     with the step 12 items.
+  3. **Splitting what holds the rights** from the parsers and the
+     decisions, scoped with the review of the trusted computing base
+     (section 1, item 8).
+
+  `hostPID`, CAP_SYS_ADMIN and CAP_SYS_PTRACE stay: they are the
+  supervision itself, and the page says so plainly.
 - **v1.37** (security operations) as planned, with its order set by the
   first pilot: the SIEM the first pilot runs is built and tested first.
 - **What a compliance function reads.** The Agent Baseline mapping
@@ -182,7 +203,9 @@ counts as:
    longest), and the assurance items 1 to 5 (free, and the first thing a
    pilot's security team looks for).
 2. **v1.36's three open items**, first the bundle confirmation, since it
-   is a security finding and the pilots' testers would find it.
+   is a security finding and the pilots' testers would find it; with them,
+   the node agent's named capability set (R9), since both change the node
+   agent and are measured on the same matrix.
 3. **Scale and churn and operations**, together: the tests produce the
    overhead table, and the runbook comes from what they break.
 4. **v1.37**, in the order the first pilot asks for.
@@ -226,4 +249,5 @@ rest for the pilots to finish. The pilots set the real date.
 - `docs/security/threat-model.md`, `docs/security/TRUSTED-COMPUTING-BASE.md`,
   `docs/security/bypass-classes.md`, `SECURITY.md`.
 - `docs/standards/agent-baseline.md`.
+- `docs/security/node-agent-privilege.md` (R9).
 - `varek/v1_4/tests/soak_v1340/` (the 24-hour runs' harness).
