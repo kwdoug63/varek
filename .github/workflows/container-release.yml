@@ -104,6 +104,7 @@ jobs:
           docker build -f packaging/container/Containerfile --target node \
             --label org.opencontainers.image.version="$VERSION" \
             --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --build-arg VAREK_VERSION="$VERSION" --build-arg VAREK_REVISION="$GITHUB_SHA" \
             -t "$NODE:$VERSION-arm64" .
       - name: Check it before publishing - each command the chart names runs, the launcher static, the Warden the tag's version
         run: |
@@ -184,6 +185,7 @@ jobs:
           docker build -f packaging/container/Containerfile --target runtime \
             --label org.opencontainers.image.version="$VERSION" \
             --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --build-arg VAREK_VERSION="$VERSION" --build-arg VAREK_REVISION="$GITHUB_SHA" \
             -t "$IMAGE:$VERSION" .
       - name: Check it before publishing - varek doctor finds every setting
         run: |
@@ -241,6 +243,7 @@ jobs:
           docker build -f packaging/container/Containerfile --target node \
             --label org.opencontainers.image.version="$VERSION" \
             --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --build-arg VAREK_VERSION="$VERSION" --build-arg VAREK_REVISION="$GITHUB_SHA" \
             -t "$NODE:$VERSION-amd64" .
       - name: Check it before publishing - each command the chart names runs, the launcher static, the Warden the tag's version
         run: |
