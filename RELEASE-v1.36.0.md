@@ -1,16 +1,12 @@
 # VAREK v1.36.0 — Kubernetes at Parity, and the Supported Platforms
 
-> Draft (October 28, 2026). v1.36.0 had a review by AI review agents, six,
-> each on one part (the node agent's C code; the one-pass audit and the
-> exports; the cluster's Go code; the Helm chart and its RBAC; CI and the
-> test scripts; the docs against the code). Its findings are fixed or
-> stated as limits (below). A human or third-party review has not been
-> done. The ship gate's 24-hour runs (EKS with amd64 and Graviton nodes,
-> and single-node OpenShift) on `6f5af2f`, October 29 to 30, both failed
-> for one cause: the sub-agent limit counted a run's launches (below,
-> "Found building the ship gate's runs"). Fixed October 30
-> (kwdoug63/varek#107); made again on that build, `c1d9a37`, October 30 to
-> 31, both runs passed: the ship gate is met.
+> v1.36.0 had a review by AI review agents, six, each on one part (the
+> node agent's C code; the one-pass audit and the exports; the cluster's Go
+> code; the Helm chart and its RBAC; CI and the test scripts; the docs
+> against the code). Its findings are fixed or stated as limits (below). A
+> human or third-party review has not been done. The ship gate's 24-hour
+> runs passed on `c1d9a37`, October 30 to 31: EKS with amd64 and Graviton
+> nodes, and single-node OpenShift (below, "Tested").
 
 MIT · github.com/kwdoug63/varek
 

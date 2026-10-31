@@ -9,6 +9,34 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.36.0] - 2026-10-31 — Kubernetes at parity, and the supported platforms
+
+Every policy and plan that runs on a host now runs under the node agent on
+Kubernetes, decided the same way; what cannot be carried into a pod from
+outside is refused, never run with less. Credentials (`file:`, `vault:`
+through Vault's Kubernetes auth, `aws-sm:` through IRSA, EKS Pod Identity
+or the node's role), given to namespaces by a cluster-scoped
+`VarekCredential`, the pod holding only a placeholder; sub-agents and
+confined MCP servers, each in a group below the container's own; the
+on-behalf-of chain, the user's token from a Secret the pod names and the
+agent's SVID from the node's SPIRE agent; the dry run, flow policies and
+trust bundles as `VarekPolicy` fields. The node image is one image for
+amd64 and arm64. The audit reads a stream once in bounded memory (1,008,566
+records in 31,960 kB at most, against 3.6 GB before), and the node agent
+rotates each stream in signed segments. Each node signs with its own key,
+published as its `VarekNodeKey` and checked by `varek_audit.py
+--node-keys`. Every platform the README calls supported runs in CI: CRI-O
+1.35 to 1.37 under runc and crun and containerd 2.2 and 2.3 on amd64 and
+arm64, SELinux enforcing, and every host suite on Rocky Linux 9 (for RHEL 9) and Amazon
+Linux 2023. Found in the ship gate's runs and fixed: a container whose
+runtime was reaped, or read in a mount namespace of its own, is tied to
+its process by its first call; a refused connection the proxy could not
+read is recorded (`proxy_unreadable`); and a run's sub-agents are bounded
+by those held at once, not by its launches (`subagent_ended`). 24 hours
+each on Amazon EKS (amd64 and Graviton) and single-node OpenShift 4.22: every
+turn done, each long agent's sub-agents launched 2,620 times, every probe
+held, every stream audited. See [`RELEASE-v1.36.0.md`](./RELEASE-v1.36.0.md).
+
 ## [1.35.0] - 2026-10-26 — Agent frameworks: plans from the framework
 
 A plan (the steps an agent says it will take) now comes from the agent's
