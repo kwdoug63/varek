@@ -8,8 +8,9 @@
 > done. The ship gate's 24-hour runs (EKS with amd64 and Graviton nodes,
 > and single-node OpenShift) on `6f5af2f`, October 29 to 30, both failed
 > for one cause: the sub-agent limit counted a run's launches (below,
-> "Found building the ship gate's runs"). Fixed October 30; the runs are
-> made again on the fixed build, their results to come.
+> "Found building the ship gate's runs"). Fixed October 30
+> (kwdoug63/varek#107); made again on that build, `c1d9a37`, October 30 to
+> 31, both runs passed: the ship gate is met.
 
 MIT · github.com/kwdoug63/varek
 
@@ -106,7 +107,16 @@ upgrade in progress refuses rather than runs with less.
     no stream or log, 98 and 100 streams (1,953,669 and 3,490,100 records)
     all audited, the large stream of 1,385,957 records audited in fixed
     memory, no VAREK container restarted, the node agent's memory flat.
-  - On the fixed build: *to come.*
+  - On the fixed build, `c1d9a37` (the node image's list
+    `sha256:d2ae611d…6121e1d`), October 30 to 31: **both passed**,
+    `soak_check: PASS`, 33 of 33 checks on EKS and 29 of 29 on OpenShift.
+    Every long agent's turn done (2,592 on EKS, 1,296 on OpenShift), 0
+    failed; each long agent's sub-agent and MCP server launched 2,620 times
+    and released as they ended; every allowed request carried the token
+    and no request reached the denied service; 100 and 98 streams
+    (4,015,690 and 2,226,748 records), all audited; the large stream of
+    1,385,957 records audited in fixed memory; no VAREK container
+    restarted. The plugin's memory on OpenShift: 14.8 to 26.0 MB.
 
 ## Compatibility
 
@@ -230,8 +240,9 @@ are stated below as limits. The largest:
   at once, found the other side of the race: runc (1.2 and later) creates
   a container from a mount namespace of its own, and when the node agent
   read runc before it ended, it refused it for that. That runtime is now
-  tied the same way, by the container's first call. The 24-hour runs are
-  made again on the fixed image (to come).
+  tied the same way, by the container's first call. The 24-hour runs were
+  made again on the fixed image, and failed for the sub-agent limit
+  (below); on the build that fixes that too, both passed.
 
 - **A long-running container's sub-agents reached the limit of a run's
   launches** (fixed; found in both 24-hour runs). The Warden held a run to
