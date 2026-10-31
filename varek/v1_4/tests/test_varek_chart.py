@@ -796,7 +796,11 @@ def test_red_hat_chart_certification():
 
 def test_the_values_schema():
     """values.schema.json: a value of the wrong type refused at render"""
+    # Helm names the value by its path, dotted (3.16) or as a JSON pointer
+    # (3.22, as CI runs it: /signing/nodeKey/enabled)
+    def names(err, path):
+        return path in err or "/" + path.replace(".", "/") in err
     p = render("signing.nodeKey.enabled=yes-please", ok=False)
-    assert p.returncode != 0 and "signing.nodeKey.enabled" in p.stderr
+    assert p.returncode != 0 and names(p.stderr, "signing.nodeKey.enabled")
     p = render("admission.replicas=two", ok=False)
-    assert p.returncode != 0 and "admission.replicas" in p.stderr
+    assert p.returncode != 0 and names(p.stderr, "admission.replicas")
