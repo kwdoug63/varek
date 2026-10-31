@@ -241,8 +241,15 @@ for _ in $(seq 60); do grep -q '^varek-nri: runtime' <(kubectl -n "$NS" logs ds/
 say "  plugin: $(kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null | grep -m1 '^varek-nri: runtime' || echo 'NOT registered')"
 check "the plugin registered with the node's runtime (NRI)" sh -c "kubectl -n '$NS' logs ds/varek-node -c plugin | grep -q '^varek-nri: runtime'"
 # the chart's own test (Red Hat's chart certification runs it): the webhook
-# answers, its certificate verified with the chart's CA
-check "helm test: the webhook answers, its certificate verified" helm test varek -n "$NS" --timeout 3m
+# answers, its certificate verified with the chart's CA. Its output and the
+# test pod's log kept (OUT/helm-test.log), and shown when it fails
+if helm test varek -n "$NS" --timeout 3m --logs > "$OUT/helm-test.log" 2>&1; then
+    pass "helm test: the webhook answers, its certificate verified"
+else
+    flunk "helm test: the webhook answers, its certificate verified"
+    kubectl -n "$NS" describe pod varek-test-webhook >> "$OUT/helm-test.log" 2>&1
+    sed 's/^/     helm test: /' "$OUT/helm-test.log" | tail -60
+fi
 # v1.36 step 9 (D10): the node's own key, published as its VarekNodeKey; the
 # cluster's list, as an auditor fetches it, for every audit here
 NODE="$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')"
