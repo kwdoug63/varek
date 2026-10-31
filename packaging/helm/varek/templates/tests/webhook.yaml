@@ -6,7 +6,11 @@
   chart is up. Run as restricted-v2 allows (on OpenShift, the namespace's
   user). The pod is kept until the next test run (before-hook-creation),
   so its log can be read after it (helm test --logs): deleted as soon as
-  it succeeded, helm test reported it missing. */}}
+  it succeeded, helm test reported it missing. It connects to the Service's
+  address the kubelet gives it (NAME_SERVICE_HOST, _PORT) and verifies the
+  certificate for the Service's name, so it checks the webhook, not the
+  cluster's DNS (which failed it on the CRI-O crun cells of #110); with no
+  such variable (enableServiceLinks false), it looks the name up. */}}
 {{- $name := include "varek.admissionName" . -}}
 {{- $secret := .Values.admission.tls.secretName | default (printf "%s-tls" $name) -}}
 apiVersion: v1
@@ -43,14 +47,19 @@ spec:
         - python3
         - -c
         - |
-          import base64, os, ssl, sys, urllib.request
+          import base64, os, socket, ssl, sys
           b64 = os.environ.get("VAREK_CA_B64")
           ctx = ssl.create_default_context(cadata=base64.b64decode(b64).decode()) if b64 else \
               ssl.create_default_context(cafile="/tls/ca.crt")
-          url = "https://{{ $name }}.{{ .Release.Namespace }}.svc/healthz"
-          with urllib.request.urlopen(url, context=ctx, timeout=20) as r:
-              print(url, r.status)
-              sys.exit(0 if r.status == 200 else 1)
+          host = "{{ $name }}.{{ .Release.Namespace }}.svc"
+          addr = os.environ.get("{{ $name | upper | replace "-" "_" }}_SERVICE_HOST", host)
+          port = int(os.environ.get("{{ $name | upper | replace "-" "_" }}_SERVICE_PORT", "443"))
+          with socket.create_connection((addr, port), timeout=20) as raw:
+              with ctx.wrap_socket(raw, server_hostname=host) as t:
+                  t.sendall(("GET /healthz HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % host).encode())
+                  status = t.recv(64).split(b"\r\n", 1)[0].decode(errors="replace")
+          print("https://%s/healthz (%s:%d): %s" % (host, addr, port, status))
+          sys.exit(0 if status.split(" ")[1:2] == ["200"] else 1)
       {{- with .Values.admission.tls.caBundle }}
       env:
         - { name: VAREK_CA_B64, value: {{ . | quote }} }

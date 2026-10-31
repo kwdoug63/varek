@@ -788,7 +788,9 @@ def test_red_hat_chart_certification():
     # kept until the next run, so helm test --logs can read it
     assert t["metadata"]["annotations"]["helm.sh/hook-delete-policy"] == "before-hook-creation"
     c = t["spec"]["containers"][0]
-    assert "https://t-admission.varek-system.svc/healthz" in c["command"][2]
+    # the Service's address from the kubelet, the certificate checked for its name
+    assert 'host = "t-admission.varek-system.svc"' in c["command"][2] and "GET /healthz" in c["command"][2]
+    assert "T_ADMISSION_SERVICE_HOST" in c["command"][2] and "server_hostname=host" in c["command"][2]
     assert t["spec"]["securityContext"]["runAsNonRoot"] and c["securityContext"]["capabilities"] == {"drop": ["ALL"]}
     assert "runAsUser" not in one(render("openshift.enabled=true"), "Pod")["spec"]["securityContext"]
     # with the operator's Secret and its CA given as a value
