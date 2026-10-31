@@ -785,6 +785,8 @@ def test_red_hat_chart_certification():
     # the helm test: the webhook's health, its certificate verified
     t = one(render(), "Pod")
     assert t["metadata"]["annotations"]["helm.sh/hook"] == "test"
+    # kept until the next run, so helm test --logs can read it
+    assert t["metadata"]["annotations"]["helm.sh/hook-delete-policy"] == "before-hook-creation"
     c = t["spec"]["containers"][0]
     assert "https://t-admission.varek-system.svc/healthz" in c["command"][2]
     assert t["spec"]["securityContext"]["runAsNonRoot"] and c["securityContext"]["capabilities"] == {"drop": ["ALL"]}

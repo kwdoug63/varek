@@ -4,7 +4,9 @@
   Secret's ca.crt, or admission.tls.caBundle). A webhook down refuses every
   pod and policy it checks (failurePolicy Fail): this is the check that the
   chart is up. Run as restricted-v2 allows (on OpenShift, the namespace's
-  user). */}}
+  user). The pod is kept until the next test run (before-hook-creation),
+  so its log can be read after it (helm test --logs): deleted as soon as
+  it succeeded, helm test reported it missing. */}}
 {{- $name := include "varek.admissionName" . -}}
 {{- $secret := .Values.admission.tls.secretName | default (printf "%s-tls" $name) -}}
 apiVersion: v1
@@ -17,7 +19,7 @@ metadata:
     app.kubernetes.io/component: test
   annotations:
     helm.sh/hook: test
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+    helm.sh/hook-delete-policy: before-hook-creation
 spec:
   restartPolicy: Never
   automountServiceAccountToken: false
