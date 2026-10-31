@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+apiVersion: v2
+name: varek-crds
+description: >-
+  The custom resources of VAREK on Kubernetes (VarekPolicy, VarekPlan,
+  VarekCredential, VarekNodeKey), installed before the varek chart. A chart
+  of their own, so that the varek chart holds no CRD (Red Hat's chart
+  certification refuses one that does) and so that helm upgrade changes
+  them; each is kept on an uninstall.
+type: application
+version: 1.36.0
+appVersion: "1.36.0"
+kubeVersion: ">=1.30.0-0"
+home: https://github.com/kwdoug63/varek
+sources:
+  - https://github.com/kwdoug63/varek
+keywords: [security, seccomp, agents, policy, crds]

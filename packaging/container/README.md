@@ -53,6 +53,16 @@ docker build -f packaging/container/Containerfile -t varek .
 
 `podman build` takes the same arguments.
 
+The images carry the labels Red Hat's container certification (preflight)
+asks for: `name`, `vendor`, `version`, `release`, `summary`,
+`description` and `maintainer`, each VAREK's, since the UBI base image's
+name an image and a vendor of Red Hat's; and the licenses are in
+`/licenses`. A build sets the version with `--build-arg VAREK_VERSION=` and
+the commit with `--build-arg VAREK_REVISION=` (the release workflow passes
+both; a local build says `dev`). The node image runs as root, for the node
+agent: its certification project sets host-level access to Privileged,
+which Red Hat reviews (`docs/security/node-agent-privilege.md`).
+
 ## Run
 
 Never `--privileged`. Drop every capability, then add only these:

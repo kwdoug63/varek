@@ -55,8 +55,18 @@ pins its image by the digest that was signed.
 ```sh
 kubectl create namespace varek-system
 kubectl label namespace varek-system pod-security.kubernetes.io/enforce=privileged
-helm install varek oci://ghcr.io/kwdoug63/charts/varek --version 1.35.0 -n varek-system
+helm install varek-crds oci://ghcr.io/kwdoug63/charts/varek-crds --version VERSION -n varek-system
+helm install varek oci://ghcr.io/kwdoug63/charts/varek --version VERSION -n varek-system
 ```
+
+The custom resources (`VarekPolicy`, `VarekPlan`, `VarekCredential`,
+`VarekNodeKey`) are a chart of their own, `varek-crds`
+(`packaging/helm/varek-crds`), installed first: Red Hat's chart
+certification refuses a chart that holds a CRD, and `helm upgrade` changes
+a chart's templates where it never changes its `crds/`. Installed on a
+cluster without them, this chart refuses and says so (`crds.check`). Until
+the first release with the split, the chart is the one of 1.36.0 and
+before, which holds them: install it alone.
 
 To check the signatures first:
 
@@ -403,9 +413,21 @@ Secret (v1.34's way); then no node makes a key of its own.
 
 ## Upgrading
 
-Helm installs a chart's CRDs only when it first installs the chart, and
-never upgrades them. Before `helm upgrade`, apply every CRD of the release
-you upgrade to: a CRD left at an older release's schema prunes the fields
+Upgrade the CRDs' chart first, then this one:
+
+```sh
+helm upgrade varek-crds oci://ghcr.io/kwdoug63/charts/varek-crds --version VERSION -n varek-system
+helm upgrade varek oci://ghcr.io/kwdoug63/charts/varek --version VERSION -n varek-system
+```
+
+From a chart of 1.36.0 or before, which installed the CRDs from its
+`crds/` (owned by no release): give them to the `varek-crds` release before
+installing it (`packaging/helm/varek-crds/README.md`), then install it and
+upgrade this chart.
+
+Charts of 1.36.0 and before: Helm installs a chart's CRDs only when it
+first installs the chart, and never upgrades them. Before `helm upgrade`,
+apply every CRD of the release you upgrade to: a CRD left at an older release's schema prunes the fields
 it does not know (a `VarekPolicy`'s `dryRun`, `trustBundle` and
 `flowPolicy` would be dropped without a word), and a resource it does not
 have cannot be made (`VarekCredential`, `VarekNodeKey`):
@@ -443,6 +465,7 @@ the chart's `fail`s name a value it cannot render with.
 | `admission.runtimeClasses` | `[]` | RuntimeClass names a supervised pod may give: ones whose handler is in `nri.runtimeHandlers` |
 | `admission.tls.*` | the chart's own CA | or a `kubernetes.io/tls` Secret (`secretName`, with its `ca.crt` or `caBundle`), or cert-manager (`certManager.enabled`, `issuerName`) |
 | `openshift.enabled` | `false` | the SecurityContextConstraints for the node agent |
+| `crds.check` | `true` | refuse to install on a cluster without the `varek-crds` chart's CRDs (checked where the chart installs on a cluster; `helm template` sees none) |
 | `credentials.dir`, `credentials.secrets` | `/var/lib/varek/credentials`, `[]` | where a `file:` source is, and the Secrets mounted there |
 | `credentials.vault.*` | `addr: ""`, `caSecret: ""`, `kubernetesAuth: {role: "", mount: kubernetes, audience: vault}` | `vault:` sources, signed in to with the node agent's service account |
 | `credentials.aws.*` | `region: ""`, `roleArn: ""`, `podIdentity: false` | `aws-sm:` sources: IRSA, EKS Pod Identity, or the node's instance role |

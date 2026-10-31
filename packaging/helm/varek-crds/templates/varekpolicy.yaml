@@ -10,12 +10,21 @@
 # D7, D7b): beside the policy, a dry run, a trust bundle (a key of the
 # chart's trustBundles.configMap) and a flow policy, which the plugin writes
 # beside the policy and the node agent takes as a host's Warden takes
-# --dry-run, --trust-bundle and --flow-policy. Helm installs it with the chart, and does not change or
-# remove it on an upgrade or an uninstall (Helm's rule for crds/): a new
-# version of it is applied by hand (kubectl apply -f).
+# --dry-run, --trust-bundle and --flow-policy.
+# The varek-crds chart installs it (Red Hat's chart certification refuses a
+# chart with CRDs, so they are a chart of their own, installed before the
+# varek chart); helm upgrade varek-crds changes it, and its
+# helm.sh/resource-policy keeps it, and every resource of its kind, on an
+# uninstall.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    app.kubernetes.io/part-of: varek
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
   name: varekpolicies.varek.dev
 spec:
   group: varek.dev

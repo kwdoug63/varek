@@ -227,6 +227,10 @@ kubectl -n default get configmap kube-root-ca.crt -o jsonpath='{.data.ca\.crt}' 
 kubectl -n "$NS" create configmap varek-test-roots --from-file=corp.pem="$OUT/roots.pem" > /dev/null
 REPO="${IMAGE%:*}" TAG="${IMAGE##*:}"
 [ "$REPO" = "$IMAGE" ] && TAG=latest
+# the CRDs first: a chart of their own (Red Hat's chart certification), which
+# the varek chart refuses to install without
+check "the CRDs install (the varek-crds chart)" \
+    helm install varek-crds "$ROOT/packaging/helm/varek-crds" -n "$NS" --wait --timeout 2m
 check "the chart installs, its pods ready (the node agent, the plugin, the exporter, the webhook)" \
     helm install varek "$ROOT/packaging/helm/varek" -n "$NS" --wait --timeout 6m \
     --set image.repository="$REPO" --set image.tag="$TAG" --set image.pullPolicy=Never \
@@ -236,6 +240,22 @@ check "the chart installs, its pods ready (the node agent, the plugin, the expor
 for _ in $(seq 60); do grep -q '^varek-nri: runtime' <(kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null) && break; sleep 2; done
 say "  plugin: $(kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null | grep -m1 '^varek-nri: runtime' || echo 'NOT registered')"
 check "the plugin registered with the node's runtime (NRI)" sh -c "kubectl -n '$NS' logs ds/varek-node -c plugin | grep -q '^varek-nri: runtime'"
+# the chart's own test (Red Hat's chart certification runs it): the webhook
+# answers, its certificate verified with the chart's CA. Its output and the
+# test pod's log kept (OUT/helm-test.log), and shown when it fails
+if helm test varek -n "$NS" --timeout 3m --logs > "$OUT/helm-test.log" 2>&1; then
+    pass "helm test: the webhook answers, its certificate verified"
+else
+    flunk "helm test: the webhook answers, its certificate verified"
+    # the test pod is kept (before-hook-creation): its own log first, then
+    # its state, then helm's words without the chart's notes
+    kubectl -n "$NS" logs varek-test-webhook > "$OUT/helm-test-pod.log" 2>&1
+    kubectl -n "$NS" describe pod varek-test-webhook > "$OUT/helm-test-pod.describe" 2>&1
+    sed 's/^/     test pod: /' "$OUT/helm-test-pod.log" | tail -40
+    grep -A4 '^    State:' "$OUT/helm-test-pod.describe" | sed 's/^/     test pod: /'
+    awk '/^NOTES:/ { skip = 1 } /^POD LOGS|^Error/ { skip = 0 } !skip' "$OUT/helm-test.log" \
+        | sed 's/^/     helm test: /' | tail -20
+fi
 # v1.36 step 9 (D10): the node's own key, published as its VarekNodeKey; the
 # cluster's list, as an auditor fetches it, for every audit here
 NODE="$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')"

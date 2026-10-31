@@ -1,0 +1,357 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "VAREK's chart values",
+  "description": "The types of the chart's values (values.yaml says what each is). The chart's own checks, at render, refuse what the node would refuse, with the reason.",
+  "type": "object",
+  "properties": {
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string"
+        },
+        "digest": {
+          "type": "string"
+        },
+        "pullPolicy": {
+          "type": "string"
+        }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "runtime": {
+      "type": "string"
+    },
+    "nri": {
+      "type": "object",
+      "properties": {
+        "socket": {
+          "type": "string"
+        },
+        "runtimeHandlers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "node": {
+      "type": "object",
+      "properties": {
+        "policies": {
+          "type": "string"
+        },
+        "streams": {
+          "type": "string"
+        },
+        "socket": {
+          "type": "string"
+        },
+        "bin": {
+          "type": "string"
+        },
+        "control": {
+          "type": "string"
+        },
+        "exportState": {
+          "type": "string"
+        },
+        "seccompRoot": {
+          "type": "string"
+        },
+        "dnsServer": {
+          "type": "string"
+        },
+        "kubelet": {
+          "type": "string"
+        },
+        "state": {
+          "type": "object",
+          "properties": {
+            "containerd": {
+              "type": "string"
+            },
+            "cri-o": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "signing": {
+      "type": "object",
+      "properties": {
+        "secretName": {
+          "type": "string"
+        },
+        "nodeKey": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "dir": {
+              "type": "string"
+            },
+            "pubDir": {
+              "type": "string"
+            }
+          }
+        },
+        "checkpointEvery": {
+          "type": "number"
+        }
+      }
+    },
+    "anchor": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "file": {
+          "type": "string"
+        }
+      }
+    },
+    "credentials": {
+      "type": "object",
+      "properties": {
+        "dir": {
+          "type": "string"
+        },
+        "secrets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "vault": {
+          "type": "object",
+          "properties": {
+            "addr": {
+              "type": "string"
+            },
+            "caSecret": {
+              "type": "string"
+            },
+            "kubernetesAuth": {
+              "type": "object",
+              "properties": {
+                "role": {
+                  "type": "string"
+                },
+                "mount": {
+                  "type": "string"
+                },
+                "audience": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "aws": {
+          "type": "object",
+          "properties": {
+            "region": {
+              "type": "string"
+            },
+            "roleArn": {
+              "type": "string"
+            },
+            "podIdentity": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "exporter": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "maxFollowers": {
+          "type": "number"
+        },
+        "scratchSize": {
+          "type": "string"
+        },
+        "resources": {
+          "type": "object"
+        }
+      }
+    },
+    "onBehalfOf": {
+      "type": "object",
+      "properties": {
+        "user": {
+          "type": "number"
+        },
+        "issuerCaConfigMap": {
+          "type": "string"
+        }
+      }
+    },
+    "spire": {
+      "type": "object",
+      "properties": {
+        "adminSocket": {
+          "type": "string"
+        },
+        "self": {
+          "type": "string"
+        },
+        "bundleConfigMap": {
+          "type": "string"
+        }
+      }
+    },
+    "flowPolicy": {
+      "type": "object",
+      "properties": {
+        "stateDir": {
+          "type": "string"
+        }
+      }
+    },
+    "streams": {
+      "type": "object",
+      "properties": {
+        "rotateBytes": {
+          "type": [
+            "number",
+            "string"
+          ],
+          "description": "checked at render: 0, or a whole number of bytes, 65536 or more"
+        }
+      }
+    },
+    "trustBundles": {
+      "type": "object",
+      "properties": {
+        "configMap": {
+          "type": "string"
+        }
+      }
+    },
+    "nodeAgent": {
+      "type": "object",
+      "properties": {
+        "resources": {
+          "type": "object"
+        },
+        "extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "plugin": {
+      "type": "object",
+      "properties": {
+        "resources": {
+          "type": "object"
+        }
+      }
+    },
+    "nodeSelector": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "tolerations": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "priorityClassName": {
+      "type": "string"
+    },
+    "admission": {
+      "type": "object",
+      "properties": {
+        "replicas": {
+          "type": "number"
+        },
+        "failurePolicy": {
+          "type": "string"
+        },
+        "timeoutSeconds": {
+          "type": "number"
+        },
+        "excludeNamespaces": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "runtimeClasses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "secretName": {
+              "type": "string"
+            },
+            "caBundle": {
+              "type": "string"
+            },
+            "certManager": {
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "issuerKind": {
+                  "type": "string"
+                },
+                "issuerName": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "resources": {
+          "type": "object"
+        }
+      }
+    },
+    "openshift": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "crds": {
+      "type": "object",
+      "properties": {
+        "check": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
