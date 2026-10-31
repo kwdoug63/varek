@@ -247,8 +247,14 @@ if helm test varek -n "$NS" --timeout 3m --logs > "$OUT/helm-test.log" 2>&1; the
     pass "helm test: the webhook answers, its certificate verified"
 else
     flunk "helm test: the webhook answers, its certificate verified"
-    kubectl -n "$NS" describe pod varek-test-webhook >> "$OUT/helm-test.log" 2>&1
-    sed 's/^/     helm test: /' "$OUT/helm-test.log" | tail -60
+    # the test pod is kept (before-hook-creation): its own log first, then
+    # its state, then helm's words without the chart's notes
+    kubectl -n "$NS" logs varek-test-webhook > "$OUT/helm-test-pod.log" 2>&1
+    kubectl -n "$NS" describe pod varek-test-webhook > "$OUT/helm-test-pod.describe" 2>&1
+    sed 's/^/     test pod: /' "$OUT/helm-test-pod.log" | tail -40
+    grep -A4 '^    State:' "$OUT/helm-test-pod.describe" | sed 's/^/     test pod: /'
+    awk '/^NOTES:/ { skip = 1 } /^POD LOGS|^Error/ { skip = 0 } !skip' "$OUT/helm-test.log" \
+        | sed 's/^/     helm test: /' | tail -20
 fi
 # v1.36 step 9 (D10): the node's own key, published as its VarekNodeKey; the
 # cluster's list, as an auditor fetches it, for every audit here
