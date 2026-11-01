@@ -851,10 +851,18 @@ def test_the_crds_chart_test_schema_and_annotations():
         assert p.returncode != 0, bad
 
 
-def test_the_openshift_certification_values():
+def test_the_openshift_certification_values(tmp_path):
     """packaging/helm/certification/values-openshift.yaml: CRI-O and the chart's SCCs, the chart's own image"""
     vals = os.path.join(ROOT, "packaging", "helm", "certification", "values-openshift.yaml")
-    p = helm("template", "t", CHART, "-n", NS, "--kube-version", KUBE, "-f", vals)
+    # the chart as the release packages it (container-release.yml): its
+    # values.yaml given the node image's digest, the multi-arch list's
+    released = tmp_path / "varek"
+    shutil.copytree(CHART, released)
+    v = released / "values.yaml"
+    text = v.read_text()
+    assert '\n  digest: ""\n' in text
+    v.write_text(text.replace('\n  digest: ""\n', '\n  digest: "sha256:' + "0" * 64 + '"\n', 1))
+    p = helm("template", "t", str(released), "-n", NS, "--kube-version", KUBE, "-f", vals)
     docs = [d for d in yaml.safe_load_all(p.stdout) if d]
     one(docs, "SecurityContextConstraints", "t-node")
     one(docs, "SecurityContextConstraints", "t-supervised")
@@ -862,6 +870,11 @@ def test_the_openshift_certification_values():
     ds = one(docs, "DaemonSet")
     images = {c["image"] for c in ds["spec"]["template"]["spec"]["containers"]}
     assert images == {f"ghcr.io/kwdoug63/varek-node:{meta['appVersion']}"}, images
+    # every image by its tag: chart-verifier's images-are-certified matches a
+    # digest only against the catalog's per-arch digests, and the chart's
+    # default digest is the multi-arch list's
+    every = set(re.findall(r"^\s*image:\s*(\S+)", p.stdout, re.M))
+    assert every == images, every
     # CRI-O's state, read-only (the runtime the values name)
     vols = {v["name"]: v for v in ds["spec"]["template"]["spec"]["volumes"]}
     assert vols["state"]["hostPath"]["path"] == "/run/containers"

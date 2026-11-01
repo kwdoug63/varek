@@ -8,7 +8,7 @@ catalog. This directory holds what that run needs:
 
 | File | What it is |
 | --- | --- |
-| `values-openshift.yaml` | the varek chart's values for OpenShift: `runtime: cri-o`, `openshift.enabled: true` (its SecurityContextConstraints); the image is the chart's own |
+| `values-openshift.yaml` | the varek chart's values for OpenShift: `runtime: cri-o`, `openshift.enabled: true` (its SecurityContextConstraints); the image is the chart's own, by its tag (`image.digest: ""`: chart-verifier matches a digest only against the catalog's per-arch digests, and the released chart's digest is the multi-arch list's) |
 | `verify_on_openshift.sh` | checks the cluster, makes the namespace, installs the CRDs' chart, runs chart-verifier and prints each check's outcome |
 
 The CRDs come from the `varek-crds` chart, installed first: the varek chart
