@@ -742,8 +742,17 @@ def cmd_doctor(args):
 
     cfg = None
     try:
-        cfg = load_config()
-        ok(f"settings in {cfg['path']}")
+        # v1.36.1's first run on RHEL: no settings is not a failure, since
+        # `varek run` works without them (the baseline, v1.29); settings that
+        # are there and do not load still fail
+        cfg = load_config(required=False)
+        if cfg is None:
+            warn(f"no settings at {config_path()}: `varek run` uses the baseline policy and makes "
+                 f"its log directory and signing key at its first run")
+            hint("`sudo varek init --pack <name>` for a policy pack, signing and the log directory "
+                 "(`varek policy list` shows the packs)")
+        else:
+            ok(f"settings in {cfg['path']}")
     except CliError as e:
         fail(str(e))
         hint(e.fix)
