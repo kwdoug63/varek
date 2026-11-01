@@ -63,6 +63,14 @@ both; a local build says `dev`). The node image runs as root, for the node
 agent: its certification project sets host-level access to Privileged,
 which Red Hat reviews (`docs/security/node-agent-privilege.md`).
 
+CI runs Red Hat's checks (preflight) on both images as built, on every
+change (`container.yml`): `packaging/container/preflight_check.sh varek
+varek-node` pushes each to a registry on the runner and checks it; every
+check must pass but `RunAsNonRoot`, which both images fail by design (they
+run as root, under host-level access Privileged). Each base image is pinned
+by digest in the `Containerfile`, so a build is reproducible; a newer base
+is taken by changing the digest there.
+
 ## Run
 
 Never `--privileged`. Drop every capability, then add only these:
