@@ -364,7 +364,8 @@ container that makes the directory, root's and 0700, mounts it too, before
 any key is in it). Its public
 key is written apart (`signing.nodeKey.pubDir`), where the plugin and the
 exporter read it. The plugin publishes it as the node's `VarekNodeKey`, a
-cluster-scoped resource named for the node and the key:
+cluster-scoped resource named for the node and the key, and publishes again
+when the file's key changes (a node agent that made a new key):
 
 ```sh
 kubectl get vareknodekeys
