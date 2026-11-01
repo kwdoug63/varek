@@ -6,8 +6,8 @@
 # report goes in the chart's pull request to openshift-helm-charts/charts
 # (packaging/helm/certification/README.md).
 #
-#   verify_on_openshift.sh --version 1.37.0 [--out DIR] [--namespace NS]
-#   verify_on_openshift.sh --chart varek-1.37.0.tgz --crds varek-crds-1.37.0.tgz [...]
+#   verify_on_openshift.sh --version 1.36.1 [--out DIR] [--namespace NS]
+#   verify_on_openshift.sh --chart varek-1.36.1.tgz --crds varek-crds-1.36.1.tgz [...]
 #
 # --version pulls both charts of that release from oci://ghcr.io/kwdoug63/charts.
 # Before anything is changed it checks the cluster: OpenShift, CRI-O 1.35 or

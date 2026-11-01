@@ -680,7 +680,8 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * node agent; the grammar stays 1.31; v1.36.0, docs/security/v1.36-
  * kubernetes-parity.md D12: Kubernetes at parity, the grammar stays 1.35) */
 #define VDP_WARDEN_REL_MINOR 36
-#define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's */
+#define VDP_WARDEN_PATCH 1      /* v1.27.1: the Warden's version beyond the grammar's
+                                 * (v1.36.1: packaging for Red Hat's certification) */
 
 /* v1.27: a note on exec rule i, for lint and the Warden's load-time notes,
  * in buf (empty: none); returns its length. An allow exec rule naming a shell

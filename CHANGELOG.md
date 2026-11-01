@@ -9,6 +9,24 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.36.1] - 2026-11-01 — Packaged for Red Hat's certification
+
+A patch release of 1.36.0; the Warden reports 1.36.1 and decides nothing
+differently. Both images carry the labels Red Hat's container certification
+asks for and the licenses in `/licenses`; CI runs preflight v1.14.1 on both
+on every change (every check passing but `RunAsNonRoot`, by design: host-level
+access Privileged); each base image is pinned by digest. The chart passes the
+mandatory checks of chart-verifier's partner profile that need no cluster (10
+pass, `signature-is-valid` skipped; the other two need OpenShift and Red Hat's
+catalog): the CRDs are a chart of their own, `varek-crds`, installed first and
+upgraded by `helm upgrade` (the `varek` chart refuses to install without
+them); a values schema; a `helm test` of the admission webhook; the
+`charts.openshift.io` annotations. The release workflow publishes and signs
+both charts. `packaging/helm/certification/` holds the OpenShift values and
+`verify_on_openshift.sh`, for the certification run. Upgrading from 1.36.0:
+give the CRDs to the `varek-crds` release, install it, then upgrade the chart.
+`RELEASE-v1.36.1.md`.
+
 ## [1.36.0] - 2026-10-31 — Kubernetes at parity, and the supported platforms
 
 Every policy and plan that runs on a host now runs under the node agent on
