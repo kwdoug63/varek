@@ -23,7 +23,7 @@
 #            admission webhook (varek-admission) and, v1.36, the pod's SVID
 #            from SPIRE (varek-svid), built in build-go
 # Each base pinned by its index digest (every architecture's), so a build is
-# the same build whenever it is made: the digests v1.36.0 was built from
+# the same build whenever it is made: the digests v1.36.1 is built from
 # (ubuntu's, of November 1, 2026; the test stage is not released). A newer
 # base is taken by changing the digest here, in a change CI checks.
 ARG BUILD_BASE=docker.io/library/almalinux:9@sha256:245f8aab832fe800aa42bdab5fad75ebbd8e0b4c9f24820a83c638b177857ae2

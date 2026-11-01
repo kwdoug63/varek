@@ -8,8 +8,8 @@ description: >-
   certification refuses one that does) and so that helm upgrade changes
   them; each is kept on an uninstall.
 type: application
-version: 1.36.0
-appVersion: "1.36.0"
+version: 1.36.1
+appVersion: "1.36.1"
 kubeVersion: ">=1.30.0-0"
 home: https://github.com/kwdoug63/varek
 sources:

@@ -6,7 +6,7 @@ chart (`packaging/helm/varek/README.md`); the `varek` chart refuses to
 install on a cluster that has none of them.
 
 ```sh
-helm install varek-crds oci://ghcr.io/kwdoug63/charts/varek-crds --version 1.36.0
+helm install varek-crds oci://ghcr.io/kwdoug63/charts/varek-crds --version 1.36.1
 ```
 
 They are a chart of their own for two reasons:
@@ -23,7 +23,7 @@ leaves it, and every `VarekPolicy`, `VarekPlan`, `VarekCredential` and
 `VarekNodeKey` of the cluster with it. Remove them with `kubectl delete crd`,
 which deletes every resource of their kinds.
 
-## From a chart of 1.36 or before
+## From a chart of 1.36.0 or before
 
 There the `varek` chart installed them from its `crds/`, which no release
 owns. Before installing this chart, give them to its release (the release's

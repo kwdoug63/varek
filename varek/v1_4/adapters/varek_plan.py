@@ -21,7 +21,7 @@ import sys
 import types
 from urllib.parse import urlsplit
 
-VERSION = "1.36.0"
+VERSION = "1.36.1"
 LABEL = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
 HOSTPORT = re.compile(r"[A-Za-z0-9.-]{1,253}:[0-9]{1,5}")
 MAX_STEPS = 256
