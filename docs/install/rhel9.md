@@ -90,9 +90,10 @@ sudo varek doctor
 `varek version` names the `varek` command's version and the Warden's, the
 second line `VAREK Warden  1.36.1  (/opt/varek)`. `varek doctor` checks the
 kernel, the build and the host's settings, and names the fix for any it
-finds missing. Until step 6 it reports one FAIL, `no configuration at
-/etc/varek/varek.conf`, and exits 1: a run needs no configuration (step 5),
-so on a fresh host every other check is the one to read.
+finds missing. Until step 6 it notes there are no settings at
+`/etc/varek/varek.conf`: a run needs none (step 5). From the release after
+1.36.1 that is a WARN; 1.36.1 reports it as a FAIL and exits 1, so on a
+fresh host read the other checks.
 
 ## 5. A first run
 
@@ -121,8 +122,8 @@ sudo varek init --pack healthcare
 sudo varek preflight --run
 ```
 
-`varek init` writes the settings, `/etc/varek/varek.conf` (the check
-`varek doctor` failed in step 4 then passes), with the pack, the signing key and the log
+`varek init` writes the settings, `/etc/varek/varek.conf` (`varek doctor`
+then reports them OK), with the pack, the signing key and the log
 directory. The packs are `cybersecurity`, `finance`, `healthcare`,
 `national-defense` and `utility`; `--pack /path/to/policy.txt` takes your
 own. Then:

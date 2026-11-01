@@ -17,12 +17,16 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   stopped, so a node agent that made a new key after the plugin read the old
   file left the new key unpublished, and its streams unverifiable with the
   cluster's list (`v1340_kind.sh`'s rebuild check on CRI-O 1.35, runc).
+- `varek doctor` on a host with no settings: a WARN, naming `varek init`,
+  where it was a FAIL (exit 1), since `varek run` works without them (the
+  baseline). Settings that are there and do not load still fail. Found by
+  the install guide's first run on RHEL 9.8.
 - `docs/install/rhel9.md`: installing VAREK on RHEL 9 from a release's tag
   (EPEL 9 for libsodium, `make install BINDIR=/usr/bin`, `varek doctor`, a
   first run, a policy pack), run end to end on RHEL 9.8 (EC2, SELinux
   enforcing) from v1.36.1. That run corrected it: CodeReady Builder is not
   needed (and EPEL's `crb enable` does nothing on an RHUI image), `varek
-  doctor` fails only for the settings until `varek init`, `varek refusals`
+  doctor` noted only the missing settings until `varek init`, `varek refusals`
   is root's, and the first run makes the log directory and the signing key.
 
 ## [1.36.1] - 2026-11-01 — Packaged for Red Hat's certification
