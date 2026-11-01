@@ -92,9 +92,24 @@ jobs:
         run: docker build -f packaging/container/Containerfile --target node -t varek-node .
       - name: The node image - each command the chart names runs, the launcher static
         run: packaging/container/node_check.sh varek-node
-      - name: Install preflight (pinned, built from source; its modules checked against Go's checksum database)
+      - name: Install preflight (pinned, Red Hat's 1.22.0 release binary, checked by its SHA-256)
+        # Red Hat accepts results only from recent preflight (1.19.0 to 1.22.0
+        # on November 1, 2026; 1.14.1 is refused), so CI runs the version the
+        # submissions use. Releases after 1.14.1 have no Go module version
+        # (their tags carry no "v"), so this is the release's own binary, its
+        # hash the one the 1.36.1 submissions were made with.
+        env:
+          PREFLIGHT_VERSION: "1.22.0"
+          PREFLIGHT_SHA256: 1451ed8763f209f4d4a63848d9d62d1d40653a247db43d7606feb28eadbbd99b
         run: |
-          GOBIN="$RUNNER_TEMP/bin" go install github.com/redhat-openshift-ecosystem/openshift-preflight/cmd/preflight@v1.14.1
+          [ "$(uname -m)" = x86_64 ] || { echo "the pinned hash is preflight-linux-amd64's; this runner is $(uname -m)"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/bin/preflight" \
+            "https://github.com/redhat-openshift-ecosystem/openshift-preflight/releases/download/$PREFLIGHT_VERSION/preflight-linux-amd64"
+          echo "$PREFLIGHT_SHA256  $RUNNER_TEMP/bin/preflight" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/preflight"
+          "$RUNNER_TEMP/bin/preflight" --version | grep -q "^preflight version $PREFLIGHT_VERSION " ||
+            { "$RUNNER_TEMP/bin/preflight" --version; echo "not preflight $PREFLIGHT_VERSION"; exit 1; }
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Red Hat's container certification checks (preflight) on the runtime and node images
         run: OUT="$RUNNER_TEMP/preflight" packaging/container/preflight_check.sh varek varek-node

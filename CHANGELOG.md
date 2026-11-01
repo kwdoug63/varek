@@ -9,6 +9,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+- CI's preflight is 1.22.0, Red Hat's release binary checked by its SHA-256,
+  the version 1.36.1's images were submitted with: Red Hat refuses results
+  from 1.14.1, which CI ran (`container.yml`).
+- `docs/install/rhel9.md`: installing VAREK on RHEL 9 from a release's tag
+  (EPEL 9 for libsodium, CodeReady Builder, `make install BINDIR=/usr/bin`,
+  `varek doctor`, a first run).
+
 ## [1.36.1] - 2026-11-01 — Packaged for Red Hat's certification
 
 A patch release of 1.36.0; the Warden reports 1.36.1 and decides nothing

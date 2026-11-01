@@ -290,7 +290,9 @@ pip install -e ".[dev]"
 
 The C Warden (`varek/v1_4`) additionally requires `CAP_SYS_ADMIN` (run it as
 root or via `sudo`); it checks at startup and refuses to run without it. See
-[`varek/v1_4/README.md`](./varek/v1_4/README.md).
+[`varek/v1_4/README.md`](./varek/v1_4/README.md). On Red Hat Enterprise Linux 9,
+the steps from a release's tag to a first run, EPEL and CodeReady Builder
+included: [`docs/install/rhel9.md`](./docs/install/rhel9.md).
 
 The runtime **fails closed** if these are unmet. The package installs and imports
 cleanly everywhere, but `SeccompBpfBackend.is_available()` returns an explanatory
