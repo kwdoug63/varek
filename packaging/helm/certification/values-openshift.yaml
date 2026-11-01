@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+#
+# The varek chart's values for Red Hat's chart certification run
+# (chart-verifier's partner profile, its chart-testing check), on OpenShift:
+# packaging/helm/certification/README.md. Only what OpenShift needs differs
+# from the chart's defaults; the image is the chart's own (its appVersion's
+# tag), so images-are-certified checks the image the release published.
+
+# CRI-O, OpenShift's runtime (1.35 or later: OpenShift 4.22), with NRI on
+# (the MachineConfig in varek/v1_4/tests/soak_v1340/openshift-nri-*.yaml)
+runtime: cri-o
+
+# the chart's SecurityContextConstraints: the node agent's (privileged, the
+# node's PID namespace, host paths), bound to its service account alone, and
+# the one for supervised pods
+openshift:
+  enabled: true

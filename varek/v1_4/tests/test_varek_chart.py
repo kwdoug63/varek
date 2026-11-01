@@ -798,6 +798,22 @@ def test_red_hat_chart_certification():
     assert t["spec"]["containers"][0]["env"] == [{"name": "VAREK_CA_B64", "value": "Q0E="}] and "volumes" not in t["spec"]
 
 
+def test_the_openshift_certification_values():
+    """packaging/helm/certification/values-openshift.yaml: CRI-O and the chart's SCCs, the chart's own image"""
+    vals = os.path.join(ROOT, "packaging", "helm", "certification", "values-openshift.yaml")
+    p = helm("template", "t", CHART, "-n", NS, "--kube-version", KUBE, "-f", vals)
+    docs = [d for d in yaml.safe_load_all(p.stdout) if d]
+    one(docs, "SecurityContextConstraints", "t-node")
+    one(docs, "SecurityContextConstraints", "t-supervised")
+    meta = yaml.safe_load(open(os.path.join(CHART, "Chart.yaml")))
+    ds = one(docs, "DaemonSet")
+    images = {c["image"] for c in ds["spec"]["template"]["spec"]["containers"]}
+    assert images == {f"ghcr.io/kwdoug63/varek-node:{meta['appVersion']}"}, images
+    # CRI-O's state, read-only (the runtime the values name)
+    vols = {v["name"]: v for v in ds["spec"]["template"]["spec"]["volumes"]}
+    assert vols["state"]["hostPath"]["path"] == "/run/containers"
+
+
 def test_the_values_schema():
     """values.schema.json: a value of the wrong type refused at render"""
     # Helm names the value by its path, dotted (3.16) or as a JSON pointer
