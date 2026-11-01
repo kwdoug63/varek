@@ -79,25 +79,64 @@ func TestKeyPublisher(t *testing.T) {
 	logf := func(f string, a ...interface{}) { lm.Lock(); logs = append(logs, fmt.Sprintf(f, a...)); lm.Unlock() }
 	// the node agent writes its key a little after the plugin starts
 	go func() { time.Sleep(50 * time.Millisecond); os.WriteFile(pub, []byte(key+"\n"), 0o444) }()
+	// held reads the stand-in API server's resource of that name
+	held := func(name string) (kube.NodeKey, bool) {
+		api.mu.Lock()
+		defer api.mu.Unlock()
+		k, ok := api.keys[name]
+		return k, ok
+	}
+	waitFor := func(name string) kube.NodeKey {
+		for i := 0; i < 1000; i++ {
+			if k, ok := held(name); ok {
+				return k
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("%s was not published", name)
+		return kube.NodeKey{}
+	}
+	ctx1, stop := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		(&keyPublisher{c: c, node: "node-1", pub: pub, logf: logf, wait: 10 * time.Millisecond}).run(context.Background())
+		(&keyPublisher{c: c, node: "node-1", pub: pub, logf: logf, wait: 10 * time.Millisecond, watch: 10 * time.Millisecond}).run(ctx1)
 		close(done)
 	}()
+	k := waitFor("node-1-0f0f0f0f0f0f0f0f")
+	if k.Spec.Node != "node-1" || k.Spec.PublicKey != key {
+		t.Fatalf("published %+v", k)
+	}
+	// the node agent lost its key and made a new one after the plugin read
+	// the old file: the new key published too, the old one kept
+	key2 := strings.Repeat("1e", 32)
+	os.WriteFile(pub+".new", []byte(key2+"\n"), 0o444)
+	os.Rename(pub+".new", pub)
+	k2 := waitFor("node-1-1e1e1e1e1e1e1e1e")
+	if k2.Spec.Node != "node-1" || k2.Spec.PublicKey != key2 {
+		t.Fatalf("published %+v", k2)
+	}
+	if _, ok := held("node-1-0f0f0f0f0f0f0f0f"); !ok {
+		t.Error("the old key's VarekNodeKey is gone")
+	}
+	stop()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("the key was not published")
-	}
-	k, ok := api.keys["node-1-0f0f0f0f0f0f0f0f"]
-	if !ok || k.Spec.Node != "node-1" || k.Spec.PublicKey != key {
-		t.Fatalf("published %+v", api.keys)
+		t.Fatal("the publisher did not stop with its context")
 	}
 	lm.Lock()
-	if !strings.Contains(strings.Join(logs, "\n"), "not published yet") || !strings.Contains(logs[len(logs)-1], "VarekNodeKey node-1-0f0f0f0f0f0f0f0f") {
+	all := strings.Join(logs, "\n")
+	if !strings.Contains(all, "not published yet") || !strings.Contains(all, "VarekNodeKey node-1-0f0f0f0f0f0f0f0f") ||
+		!strings.Contains(logs[len(logs)-1], "VarekNodeKey node-1-1e1e1e1e1e1e1e1e") {
 		t.Errorf("logs: %q", logs)
 	}
 	lm.Unlock()
+	api.mu.Lock()
+	posts := api.posts
+	api.mu.Unlock()
+	if posts != 2 {
+		t.Errorf("%d posts: each key once, the file read again without posting", posts)
+	}
 	// the plugin started again: the key is there already, the same one
 	if err := c.PublishNodeKey(context.Background(), "node-1", key); err != nil {
 		t.Errorf("publishing the same key again: %v", err)
