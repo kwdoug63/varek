@@ -92,6 +92,18 @@ jobs:
         run: docker build -f packaging/container/Containerfile --target node -t varek-node .
       - name: The node image - each command the chart names runs, the launcher static
         run: packaging/container/node_check.sh varek-node
+      - name: Install preflight (pinned, built from source; its modules checked against Go's checksum database)
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install github.com/redhat-openshift-ecosystem/openshift-preflight/cmd/preflight@v1.14.1
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Red Hat's container certification checks (preflight) on the runtime and node images
+        run: OUT="$RUNNER_TEMP/preflight" packaging/container/preflight_check.sh varek varek-node
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: preflight
+          path: ${{ runner.temp }}/preflight
+          if-no-files-found: ignore
       - name: Build the test image
         run: docker build -f packaging/container/Containerfile --target test -t varek-test .
       - name: Run every suite in the test image
