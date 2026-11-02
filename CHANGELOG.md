@@ -16,6 +16,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   varek chart's node image, run as restricted-v2 allows. Its only values
   are that image's. `verify_on_openshift.sh --crds-only` makes its report;
   `v1340_kind.sh` runs its test.
+- The six-minute soak trial in CI judged the node agent's memory from its
+  first sample, which can come before the agents run: a supervisor then
+  is its size at its start, and its steady size read as growth (PR #117's
+  arm64 trial, 2.8 to 12.7 MB). A run of under three hours is now judged
+  from a third into it; the 24-hour runs, from the first hour, as before
+  (`soak_check.py`, `test_soak_v1340_check.py`).
 - CI's preflight is 1.22.0, Red Hat's release binary checked by its SHA-256,
   the version 1.36.1's images were submitted with: Red Hat refuses results
   from 1.14.1, which CI ran (`container.yml`).
