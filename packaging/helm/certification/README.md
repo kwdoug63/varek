@@ -13,7 +13,9 @@ catalog. This directory holds what that run needs:
 
 The CRDs come from the `varek-crds` chart, installed first: the varek chart
 refuses to install without them, and chart-verifier installs only the chart
-it checks. Only the `varek` chart is submitted for certification.
+it checks. The `varek-crds` chart is certified on its own, by its own run
+(`--crds-only`, below), from the release after 1.36.1: 1.36.1's has no
+test, values schema or annotations.
 
 ## Order
 
@@ -55,7 +57,15 @@ The run, for the release (both charts pulled from
 packaging/helm/certification/verify_on_openshift.sh --version 1.36.1 --out ~/chart-verifier-1.36.1 # end
 ```
 
-Before it changes anything it refuses a cluster that is not OpenShift, a
+For `varek-crds`, on the same cluster and **before** the run above (it
+refuses a cluster that already has VAREK's CRDs, and deletes the ones it
+made when done). It needs no NRI and no privileged namespace:
+
+```sh
+packaging/helm/certification/verify_on_openshift.sh --crds-only --version VERSION --out ~/chart-verifier-crds-VERSION # end
+```
+
+Before it changes anything the varek chart's run refuses a cluster that is not OpenShift, a
 node without CRI-O 1.35 or later, a cluster without VAREK's NRI
 MachineConfig, and a machine config pool not yet updated. Then it makes the
 namespace `varek-system` (Pod Security `privileged`, for the node agent),
@@ -69,7 +79,10 @@ printed; it ends `PASS` when none failed (`SKIPPED` is not a failure:
 
 `OUT/report.yaml` and the chart's archive go in the chart's pull request to
 [openshift-helm-charts/charts](https://github.com/openshift-helm-charts/charts),
-at `charts/partners/<the organization>/varek/<version>/`. The namespace and
+at `charts/partners/<the organization>/varek/<version>/`; the `--crds-only`
+run's at `charts/partners/<the organization>/varek-crds/<version>/`, a pull
+request of its own. Each chart is its own component in Red Hat Partner
+Connect, which opens the pull request that adds the chart's `OWNERS` file. The namespace and
 the `varek-crds` release stay; remove them when done:
 
 ```sh

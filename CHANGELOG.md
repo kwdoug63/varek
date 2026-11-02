@@ -9,6 +9,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+- The `varek-crds` chart is ready for Red Hat's chart certification on its
+  own: the `charts.openshift.io` annotations, a values schema, and a
+  `helm test` that the API server serves the four kinds (the group's
+  discovery document, read with the pod's own token: no role), in the
+  varek chart's node image, run as restricted-v2 allows. Its only values
+  are that image's. `verify_on_openshift.sh --crds-only` makes its report;
+  `v1340_kind.sh` runs its test.
 - CI's preflight is 1.22.0, Red Hat's release binary checked by its SHA-256,
   the version 1.36.1's images were submitted with: Red Hat refuses results
   from 1.14.1, which CI ran (`container.yml`).

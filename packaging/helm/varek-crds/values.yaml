@@ -1,3 +1,13 @@
 # SPDX-License-Identifier: MIT
-# The CRDs take no settings.
-{}
+# The CRDs take no settings. These are the image of the chart's helm test
+# alone (templates/tests/served.yaml), which checks that the API server
+# serves the four kinds: the varek chart's node image, its version the
+# chart's.
+image:
+  repository: ghcr.io/kwdoug63/varek-node
+  # default: the chart's appVersion
+  tag: ""
+  # a digest (sha256:...) pins the image whatever its tag points at
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []

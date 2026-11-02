@@ -228,9 +228,19 @@ kubectl -n "$NS" create configmap varek-test-roots --from-file=corp.pem="$OUT/ro
 REPO="${IMAGE%:*}" TAG="${IMAGE##*:}"
 [ "$REPO" = "$IMAGE" ] && TAG=latest
 # the CRDs first: a chart of their own (Red Hat's chart certification), which
-# the varek chart refuses to install without
+# the varek chart refuses to install without; its helm test (in the node
+# image) checks that the API server serves the four kinds
 check "the CRDs install (the varek-crds chart)" \
-    helm install varek-crds "$ROOT/packaging/helm/varek-crds" -n "$NS" --wait --timeout 2m
+    helm install varek-crds "$ROOT/packaging/helm/varek-crds" -n "$NS" --wait --timeout 2m \
+    --set image.repository="$REPO" --set image.tag="$TAG" --set image.pullPolicy=Never
+if helm test varek-crds -n "$NS" --timeout 3m --logs > "$OUT/helm-test-crds.log" 2>&1; then
+    pass "helm test varek-crds: the API server serves the four kinds"
+else
+    flunk "helm test varek-crds: the API server serves the four kinds"
+    kubectl -n "$NS" logs varek-crds-test-served 2>&1 | sed 's/^/     test pod: /' | tail -20
+    awk '/^NOTES:/ { skip = 1 } /^POD LOGS|^Error/ { skip = 0 } !skip' "$OUT/helm-test-crds.log" \
+        | sed 's/^/     helm test: /' | tail -20
+fi
 check "the chart installs, its pods ready (the node agent, the plugin, the exporter, the webhook)" \
     helm install varek "$ROOT/packaging/helm/varek" -n "$NS" --wait --timeout 6m \
     --set image.repository="$REPO" --set image.tag="$TAG" --set image.pullPolicy=Never \
