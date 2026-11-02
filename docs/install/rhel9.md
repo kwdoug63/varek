@@ -15,13 +15,20 @@ Run end to end on RHEL 9.8 (an Amazon EC2 image, kernel
 v1.36.1 tag, with no SELinux denial; the guide was then corrected from
 what that run showed (no CodeReady Builder, the first run, `varek doctor`'s
 note on the settings, `sudo` for `varek refusals`). This guide lives on the
-repository's main branch; it applies to v1.36.1 and later.
+repository's main branch and applies to v1.36.1 and later; each release's
+own copy is at its tag
+(`https://github.com/kwdoug63/varek/blob/<tag>/docs/install/rhel9.md`).
 
 ## What it needs
 
-- RHEL 9 (kernel 5.14 or later, cgroup v2: RHEL 9's defaults), x86_64.
-  CI also runs every host suite on RHEL 9 in a VM, tested on Rocky Linux 9
-  (the repository README's platform table).
+- **RHEL 9.8 or a later RHEL 9 minor release, on x86_64.** 9.8 is the
+  version this guide was run on, and the one VAREK Enterprise's Red Hat
+  software certification is made on; Red Hat's policy carries a RHEL 9
+  certification to the later 9.x releases. aarch64 would be a
+  certification of its own, not made yet. The Warden needs what every RHEL
+  9 has by default: kernel 5.14 or later, cgroup v2. CI also runs every
+  host suite on RHEL 9 in a VM, tested on Rocky Linux 9 (the repository
+  README's platform table).
 - Root, or `sudo`. The Warden needs CAP_SYS_ADMIN and refuses to start
   without it; the agent it runs holds none of its rights.
 - **EPEL 9**, for libsodium, which RHEL 9 does not ship. EPEL is the Fedora

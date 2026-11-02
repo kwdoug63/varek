@@ -79,7 +79,10 @@ build's packages from BaseOS and AppStream, `make install
 BINDIR=/usr/bin`, `varek doctor`, a first run, a policy pack. It was run
 end to end on RHEL 9.8 (Amazon EC2, SELinux enforcing) from the v1.36.1
 tag, with no SELinux denial, and corrected from what that run showed:
-CodeReady Builder is not needed, and `varek refusals` is root's.
+CodeReady Builder is not needed, and `varek refusals` is root's. It
+names RHEL 9.8 on x86_64 as the minimum, the version VAREK Enterprise's
+Red Hat software certification is made on, and each release's copy is
+at its tag, which the certification's listing links to.
 
 ## CI
 

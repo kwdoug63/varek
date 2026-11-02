@@ -51,6 +51,9 @@ differently, and the grammar stays 1.35. The charts and both images are
   needed (and EPEL's `crb enable` does nothing on an RHUI image), `varek
   doctor` noted only the missing settings until `varek init`, `varek refusals`
   is root's, and the first run makes the log directory and the signing key.
+  It names RHEL 9.8 on x86_64 as the minimum (Red Hat's Partner
+  Acceleration Desk: a 9.8 certification carries to later 9.x releases;
+  aarch64 is one of its own).
 
 ## [1.36.1] - 2026-11-01 — Packaged for Red Hat's certification
 
