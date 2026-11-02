@@ -23,7 +23,10 @@ the ship gate's runs) and writes DIR/report.txt. The run passes when:
                 restarted
   memory        the node agent's listener and the long agents' supervisors
                 at the end within 1.5 times their size after the first hour
-                (and 4 MB), reported as they went
+                (and 4 MB), reported as they went; in a run of under three
+                hours, their size after its first third (the six-minute
+                trial in CI: a supervisor sampled before its run began is
+                its size at its start, not its size when working)
 
 and, for the ship gate's runs (meta.json's ship_gate, v1.36 step 12):
 
@@ -66,6 +69,18 @@ GATE_PROBES = PROBES | {"outside_plan", "builder_outside_plan", "server_outside"
 SAMPLE_S = 0.05                 # the audit's memory, sampled (d9_flat_memory.py: 0.2 s, for a stream of 1M)
 SLACK_KB = 16 * 1024            # as d9_flat_memory.py
 GATE_RECORDS = 1_000_000        # the ship gate's large stream, in a run of 24 hours
+
+
+def mem_baseline(xs, t0, hours):
+    """the size a process's growth is judged from: its first sample an hour
+    into the run, or a third into a run of under three hours. The first
+    sample of a short run can come before the agents run (their pods
+    Pending): a supervisor then is its size at its start, a quarter of its
+    size working, and the run's steady size reads as growth. The run's
+    first sample when there is none after (a run cut short)."""
+    warm = min(3600, hours * 3600 / 3)
+    after = [kb for t, kb in xs if t >= t0 + warm]
+    return after[0] if after else xs[0][1]
 
 
 def jl(path):
@@ -565,9 +580,9 @@ def main():
             vals = [kb for _, kb in xs]
             mem_rows.append(f"{node} {role}: {min(vals) / 1024:.1f} to {max(vals) / 1024:.1f} MB "
                             f"(median {statistics.median(vals) / 1024:.1f})")
-            after = [kb for t, kb in xs if t >= t0 + 3600] or vals
-            if role in ("listener", "supervisor") and vals[-1] > 1.5 * after[0] + 4096:
-                grow.append(f"{node} {role} {after[0] / 1024:.1f} -> {vals[-1] / 1024:.1f} MB")
+            base = mem_baseline(xs, t0, hours)
+            if role in ("listener", "supervisor") and vals[-1] > 1.5 * base + 4096:
+                grow.append(f"{node} {role} {base / 1024:.1f} -> {vals[-1] / 1024:.1f} MB")
     c(mem and not grow, "the node agent's memory flat over the run", "; ".join(grow) or f"{len(mem)} samples")
 
     # --- the report

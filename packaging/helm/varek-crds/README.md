@@ -18,6 +18,26 @@ They are a chart of their own for two reasons:
   never upgrades them; these are templates, so `helm upgrade varek-crds`
   applies a new version.
 
+## Its test
+
+`helm test varek-crds` checks that the API server serves the four kinds:
+a pod reads the group's discovery document (`/apis/varek.dev/v1alpha1`)
+with its own service account token, which any identity may read, so the
+chart grants no role. It runs the varek chart's node image, at the chart's
+version (`image` in `values.yaml`, its only values), as restricted-v2
+allows: on OpenShift the namespace gives its user, elsewhere 65532.
+
+## Red Hat's certification
+
+The chart carries what chart-verifier's partner profile asks for: no
+`crds/` directory (the CRDs are templates), a values schema, the test
+above, in an image Red Hat certified, and the `charts.openshift.io`
+annotations. Its run on OpenShift is
+`packaging/helm/certification/verify_on_openshift.sh --crds-only`
+(`packaging/helm/certification/README.md`).
+
+## Kept on an uninstall
+
 Each carries `helm.sh/resource-policy: keep`: `helm uninstall varek-crds`
 leaves it, and every `VarekPolicy`, `VarekPlan`, `VarekCredential` and
 `VarekNodeKey` of the cluster with it. Remove them with `kubectl delete crd`,

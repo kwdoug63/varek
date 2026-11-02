@@ -199,6 +199,10 @@ if [ "$HOST" = 1 ]; then
             sudo ctr -n k8s.io images import "$ARCHIVE" > "$OUT/load.log" 2>&1 ;;
         *) echo "v1340_kind.sh: the runtime $RT" >&2; exit 1 ;;
     esac || { cat "$OUT/load.log"; echo "v1340_kind.sh: the image did not load into $RT" >&2; exit 1; }
+    # containerd's CRI plugin learns of an image `ctr images import` added
+    # from containerd's event, after the import returns: crictl can miss it
+    # for a moment (PR #117's containerd 2.3.7 cell). Up to 30 s for it.
+    for _ in $(seq 30); do sudo crictl inspecti "$QUAL" > /dev/null 2>&1 && break; sleep 1; done
     sudo crictl inspecti "$QUAL" > /dev/null 2>&1 || { cat "$OUT/load.log"; echo "v1340_kind.sh: $QUAL is not in the node's runtime" >&2; exit 1; }
     IMAGE="$QUAL"
 else
@@ -228,9 +232,19 @@ kubectl -n "$NS" create configmap varek-test-roots --from-file=corp.pem="$OUT/ro
 REPO="${IMAGE%:*}" TAG="${IMAGE##*:}"
 [ "$REPO" = "$IMAGE" ] && TAG=latest
 # the CRDs first: a chart of their own (Red Hat's chart certification), which
-# the varek chart refuses to install without
+# the varek chart refuses to install without; its helm test (in the node
+# image) checks that the API server serves the four kinds
 check "the CRDs install (the varek-crds chart)" \
-    helm install varek-crds "$ROOT/packaging/helm/varek-crds" -n "$NS" --wait --timeout 2m
+    helm install varek-crds "$ROOT/packaging/helm/varek-crds" -n "$NS" --wait --timeout 2m \
+    --set image.repository="$REPO" --set image.tag="$TAG" --set image.pullPolicy=Never
+if helm test varek-crds -n "$NS" --timeout 3m --logs > "$OUT/helm-test-crds.log" 2>&1; then
+    pass "helm test varek-crds: the API server serves the four kinds"
+else
+    flunk "helm test varek-crds: the API server serves the four kinds"
+    kubectl -n "$NS" logs varek-crds-test-served 2>&1 | sed 's/^/     test pod: /' | tail -20
+    awk '/^NOTES:/ { skip = 1 } /^POD LOGS|^Error/ { skip = 0 } !skip' "$OUT/helm-test-crds.log" \
+        | sed 's/^/     helm test: /' | tail -20
+fi
 check "the chart installs, its pods ready (the node agent, the plugin, the exporter, the webhook)" \
     helm install varek "$ROOT/packaging/helm/varek" -n "$NS" --wait --timeout 6m \
     --set image.repository="$REPO" --set image.tag="$TAG" --set image.pullPolicy=Never \

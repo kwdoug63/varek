@@ -48,9 +48,11 @@ def render(*sets, ok=True):
     return [d for d in yaml.safe_load_all(p.stdout) if d]
 
 
-def render_crds():
-    """the varek-crds chart's render: the CRDs"""
-    p = helm("template", "c", CRDS, "-n", NS, "--kube-version", KUBE)
+def render_crds(*args, ok=True):
+    """the varek-crds chart's render: the CRDs and its helm test's pod"""
+    p = helm("template", "c", CRDS, "-n", NS, "--kube-version", KUBE, *args, ok=ok)
+    if not ok:
+        return p
     return [d for d in yaml.safe_load_all(p.stdout) if d]
 
 
@@ -776,7 +778,7 @@ def test_red_hat_chart_certification():
     assert meta["annotations"]["charts.openshift.io/name"] == "VAREK"
     assert set(meta["annotations"]["charts.openshift.io/archs"].split(",")) == {"x86_64", "aarch64"}
     assert os.path.exists(os.path.join(CHART, "values.schema.json"))
-    crds = render_crds()
+    crds = [d for d in render_crds() if d["kind"] == "CustomResourceDefinition"]
     assert sorted(d["metadata"]["name"] for d in crds) == ["varekcredentials.varek.dev", "vareknodekeys.varek.dev",
                                                            "varekplans.varek.dev", "varekpolicies.varek.dev"]
     assert all(d["metadata"]["annotations"]["helm.sh/resource-policy"] == "keep" for d in crds)
@@ -796,6 +798,48 @@ def test_red_hat_chart_certification():
     # with the operator's Secret and its CA given as a value
     t = one(render("admission.tls.secretName=mine", "admission.tls.caBundle=Q0E="), "Pod")
     assert t["spec"]["containers"][0]["env"] == [{"name": "VAREK_CA_B64", "value": "Q0E="}] and "volumes" not in t["spec"]
+
+
+def test_the_crds_chart_red_hat_certification():
+    """varek-crds certified too (chart-verifier, partner profile): no crds/
+    directory, the annotations, a values schema, a helm test that the API
+    server serves the four kinds, in a certified image; nothing but the four
+    CRDs and the test pod"""
+    assert not os.path.exists(os.path.join(CRDS, "crds"))
+    p = helm("lint", "--strict", CRDS, "--kube-version", KUBE)
+    assert "0 chart(s) failed" in p.stdout, p.stdout
+    meta = yaml.safe_load(open(os.path.join(CRDS, "Chart.yaml")))
+    assert meta["annotations"]["charts.openshift.io/name"] == "VAREK CRDs"
+    assert meta["annotations"]["charts.openshift.io/provider"] == "Sober Agentic Infrastructure, Inc."
+    assert set(meta["annotations"]["charts.openshift.io/archs"].split(",")) == {"x86_64", "aarch64"}
+    assert meta["kubeVersion"] and os.path.exists(os.path.join(CRDS, "README.md"))
+    assert os.path.exists(os.path.join(CRDS, "values.schema.json"))
+    docs = render_crds()
+    assert sorted(d["kind"] for d in docs) == ["CustomResourceDefinition"] * 4 + ["Pod"]
+    t = one(docs, "Pod")
+    assert t["metadata"]["name"] == "c-test-served"
+    assert t["metadata"]["annotations"] == {"helm.sh/hook": "test", "helm.sh/hook-delete-policy": "before-hook-creation"}
+    c = t["spec"]["containers"][0]
+    # the varek chart's node image, the chart's version: the image Red Hat certified
+    assert c["image"] == f"ghcr.io/kwdoug63/varek-node:{meta['appVersion']}"
+    code = c["command"][2]
+    assert '/apis/varek.dev/v1alpha1' in code and "KUBERNETES_SERVICE_HOST" in code and 'cafile=sa + "/ca.crt"' in code
+    plurals = {d["spec"]["names"]["plural"] for d in docs if d["kind"] == "CustomResourceDefinition"}
+    assert all(f'"{n}"' in code for n in plurals) and len(plurals) == 4
+    assert all(d["spec"]["versions"][0]["name"] == "v1alpha1" for d in docs if d["kind"] == "CustomResourceDefinition")
+    # as restricted-v2 allows; the user the namespace's on OpenShift
+    assert t["spec"]["securityContext"]["runAsNonRoot"] and t["spec"]["securityContext"]["runAsUser"] == 65532
+    assert c["securityContext"] == {"allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True,
+                                    "capabilities": {"drop": ["ALL"]}}
+    ocp = one(render_crds("--api-versions", "security.openshift.io/v1"), "Pod")
+    assert "runAsUser" not in ocp["spec"]["securityContext"] and "runAsGroup" not in ocp["spec"]["securityContext"]
+    # pinned by digest, and the schema refusing a value of the wrong type
+    d = "sha256:" + "a" * 64
+    assert one(render_crds("--set", "image.digest=" + d), "Pod")["spec"]["containers"][0]["image"] == \
+        "ghcr.io/kwdoug63/varek-node@" + d
+    for bad in ("image.pullPolicy=Sometimes", "image.digest=latest"):
+        p = render_crds("--set", bad, ok=False)
+        assert p.returncode != 0, bad
 
 
 def test_the_openshift_certification_values():
