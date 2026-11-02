@@ -199,6 +199,10 @@ if [ "$HOST" = 1 ]; then
             sudo ctr -n k8s.io images import "$ARCHIVE" > "$OUT/load.log" 2>&1 ;;
         *) echo "v1340_kind.sh: the runtime $RT" >&2; exit 1 ;;
     esac || { cat "$OUT/load.log"; echo "v1340_kind.sh: the image did not load into $RT" >&2; exit 1; }
+    # containerd's CRI plugin learns of an image `ctr images import` added
+    # from containerd's event, after the import returns: crictl can miss it
+    # for a moment (PR #117's containerd 2.3.7 cell). Up to 30 s for it.
+    for _ in $(seq 30); do sudo crictl inspecti "$QUAL" > /dev/null 2>&1 && break; sleep 1; done
     sudo crictl inspecti "$QUAL" > /dev/null 2>&1 || { cat "$OUT/load.log"; echo "v1340_kind.sh: $QUAL is not in the node's runtime" >&2; exit 1; }
     IMAGE="$QUAL"
 else
