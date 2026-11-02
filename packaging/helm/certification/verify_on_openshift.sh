@@ -6,9 +6,9 @@
 # report goes in the chart's pull request to openshift-helm-charts/charts
 # (packaging/helm/certification/README.md).
 #
-#   verify_on_openshift.sh --version 1.36.1 [--out DIR] [--namespace NS]
-#   verify_on_openshift.sh --chart varek-1.36.1.tgz --crds varek-crds-1.36.1.tgz [...]
-#   verify_on_openshift.sh --crds-only --version VERSION [--out DIR] [--namespace NS]
+#   verify_on_openshift.sh --version 1.36.2 [--out DIR] [--namespace NS]
+#   verify_on_openshift.sh --chart varek-1.36.2.tgz --crds varek-crds-1.36.2.tgz [...]
+#   verify_on_openshift.sh --crds-only --version 1.36.2 [--out DIR] [--namespace NS]
 #
 # --crds-only runs chart-verifier on the varek-crds chart instead, for its
 # own certification: it needs OpenShift and nothing of the node's (no CRI-O

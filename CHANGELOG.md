@@ -9,6 +9,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.36.2] - 2026-11-02 — The node key published again; varek-crds ready for its own certification
+
+A patch release of 1.36.1; the Warden reports 1.36.2 and decides nothing
+differently, and the grammar stays 1.35. The charts and both images are
+1.36.2; the CRDs' schemas are 1.36.1's. See `RELEASE-v1.36.2.md`.
+
 - The `varek-crds` chart is ready for Red Hat's chart certification on its
   own: the `charts.openshift.io` annotations, a values schema, and a
   `helm test` that the API server serves the four kinds (the group's
@@ -22,6 +28,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   arm64 trial, 2.8 to 12.7 MB). A run of under three hours is now judged
   from a third into it; the 24-hour runs, from the first hour, as before
   (`soak_check.py`, `test_soak_v1340_check.py`).
+- `v1340_kind.sh` waits up to 30 s for the CRI plugin to see the image it
+  imported with `ctr` before saying it is not there: containerd's CRI
+  image cache learns of it from an event, after the import returns (PR
+  #117's containerd 2.3.7 cell).
 - CI's preflight is 1.22.0, Red Hat's release binary checked by its SHA-256,
   the version 1.36.1's images were submitted with: Red Hat refuses results
   from 1.14.1, which CI ran (`container.yml`).
@@ -41,6 +51,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   needed (and EPEL's `crb enable` does nothing on an RHUI image), `varek
   doctor` noted only the missing settings until `varek init`, `varek refusals`
   is root's, and the first run makes the log directory and the signing key.
+  It names RHEL 9.8 on x86_64 as the minimum (Red Hat's Partner
+  Acceleration Desk: a 9.8 certification carries to later 9.x releases;
+  aarch64 is one of its own).
 
 ## [1.36.1] - 2026-11-01 — Packaged for Red Hat's certification
 

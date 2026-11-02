@@ -14,8 +14,8 @@ catalog. This directory holds what that run needs:
 The CRDs come from the `varek-crds` chart, installed first: the varek chart
 refuses to install without them, and chart-verifier installs only the chart
 it checks. The `varek-crds` chart is certified on its own, by its own run
-(`--crds-only`, below), from the release after 1.36.1: 1.36.1's has no
-test, values schema or annotations.
+(`--crds-only`, below), from 1.36.2: 1.36.1's has no test, values schema
+or annotations.
 
 ## Order
 
@@ -54,7 +54,7 @@ The run, for the release (both charts pulled from
 `oci://ghcr.io/kwdoug63/charts`; or `--chart` and `--crds` for local ones):
 
 ```sh
-packaging/helm/certification/verify_on_openshift.sh --version 1.36.1 --out ~/chart-verifier-1.36.1 # end
+packaging/helm/certification/verify_on_openshift.sh --version 1.36.2 --out ~/chart-verifier-1.36.2 # end
 ```
 
 For `varek-crds`, on the same cluster and **before** the run above (it
@@ -62,7 +62,7 @@ refuses a cluster that already has VAREK's CRDs, and deletes the ones it
 made when done). It needs no NRI and no privileged namespace:
 
 ```sh
-packaging/helm/certification/verify_on_openshift.sh --crds-only --version VERSION --out ~/chart-verifier-crds-VERSION # end
+packaging/helm/certification/verify_on_openshift.sh --crds-only --version 1.36.2 --out ~/chart-verifier-crds-1.36.2 # end
 ```
 
 Before it changes anything the varek chart's run refuses a cluster that is not OpenShift, a
