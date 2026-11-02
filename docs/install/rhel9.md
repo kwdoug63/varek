@@ -12,9 +12,10 @@ For Kubernetes and OpenShift, install the Helm charts instead
 
 Run end to end on RHEL 9.8 (an Amazon EC2 image, kernel
 5.14.0-687.45.1.el9_8, SELinux enforcing) on November 1, 2026, from the
-v1.36.1 tag: every step below, as written, with no SELinux denial. This
-guide lives on the repository's main branch; it applies to v1.36.1 and
-later.
+v1.36.1 tag, with no SELinux denial; the guide was then corrected from
+what that run showed (no CodeReady Builder, the first run, `varek doctor`'s
+note on the settings, `sudo` for `varek refusals`). This guide lives on the
+repository's main branch; it applies to v1.36.1 and later.
 
 ## What it needs
 
