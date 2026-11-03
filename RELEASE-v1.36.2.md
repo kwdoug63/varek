@@ -1,12 +1,12 @@
-# VAREK v1.36.2 — The Node Key Published Again; varek-crds Ready for Its Own Certification
+# VAREK v1.36.2 — The Node Key Published Again; a Test for varek-crds
 
 Released 2026-11-02 · MIT · github.com/kwdoug63/varek
 
 ## Summary
 
 A patch release of v1.36.1. The NRI plugin now publishes a node's key
-whenever the node agent makes a new one. The `varek-crds` chart carries
-what Red Hat's chart certification asks of it, for its own certification.
+whenever the node agent makes a new one. The `varek-crds` chart has a
+`helm test`, a values schema and OpenShift's annotations.
 `varek doctor` warns, rather than fails, on a host with no settings. A
 guide installs VAREK on RHEL 9.
 
@@ -35,10 +35,22 @@ published as a new `VarekNodeKey`; the old one is kept, so streams signed
 before the change still verify. Errors back off from 2 s, doubled up to a
 minute (`varek/v1_4/k8s/cmd/varek-nri/nodekey.go`).
 
-## varek-crds, ready for its own certification
+## varek-crds: a test, a values schema, annotations
 
-1.36.1's `varek-crds` chart failed three of chart-verifier's mandatory
-partner-profile checks. 1.36.2's passes them:
+**Corrected November 2, 2026.** This release said `varek-crds` was ready
+for its own Red Hat chart certification. It is not, and cannot be:
+chart-verifier's `not-contains-crds` check, mandatory in the partner
+profile, flags a CustomResourceDefinition in a chart's `templates/` as
+well as in its `crds/`, and Red Hat's own run installs a chart with a
+service account confined to its test namespace, which cannot create
+cluster-scoped resources such as CRDs. Its submission,
+[openshift-helm-charts/charts#3624](https://github.com/openshift-helm-charts/charts/pull/3624),
+passed the other 11 checks and failed those two; it was withdrawn. Red
+Hat's route for CRDs is an Operator. The certified `varek` chart, which
+holds no CRD, is unaffected. The additions below stay, for what they check:
+
+1.36.1's `varek-crds` chart lacked three things chart-verifier's partner
+profile asks of a chart. 1.36.2's has them:
 
 - **`required-annotations-present`:** the `charts.openshift.io`
   annotations: name "VAREK CRDs", provider, support URL, and the
@@ -57,11 +69,8 @@ partner-profile checks. 1.36.2's passes them:
     elsewhere. Red Hat's own run of a chart passes no values, so this is
     found, not set.
 
-`verify_on_openshift.sh --crds-only` makes the chart's report on
-OpenShift (`packaging/helm/certification/README.md`). It needs no NRI and
-no privileged namespace, refuses a cluster that already has VAREK's CRDs,
-and deletes the four it made when done. Run it before the `varek` chart's
-run on the same cluster.
+The release's `verify_on_openshift.sh --crds-only`, which made the
+chart's report on OpenShift, has since been removed (the correction above).
 
 ## varek doctor on a host with no settings
 
@@ -126,9 +135,8 @@ Partner Connect certifies each release's images and charts. For 1.36.2:
 2. The `varek` chart's 1.36.2 report from an OpenShift run, in a pull
    request to openshift-helm-charts/charts at
    `charts/partners/soberagents/varek/1.36.2/`.
-3. The `varek-crds` chart's first, at
-   `charts/partners/soberagents/varek-crds/1.36.2/`, under its own
-   component, "VAREK CRDs Helm chart".
+The `varek-crds` chart is not certified (above); it is published and
+signed on ghcr.io.
 
 ## Upgrading
 

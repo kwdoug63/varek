@@ -800,11 +800,12 @@ def test_red_hat_chart_certification():
     assert t["spec"]["containers"][0]["env"] == [{"name": "VAREK_CA_B64", "value": "Q0E="}] and "volumes" not in t["spec"]
 
 
-def test_the_crds_chart_red_hat_certification():
-    """varek-crds certified too (chart-verifier, partner profile): no crds/
-    directory, the annotations, a values schema, a helm test that the API
-    server serves the four kinds, in a certified image; nothing but the four
-    CRDs and the test pod"""
+def test_the_crds_chart_test_schema_and_annotations():
+    """varek-crds: no crds/ directory, the annotations, a values schema, a
+    helm test that the API server serves the four kinds, in the varek
+    chart's node image; nothing but the four CRDs and the test pod. (Not a
+    certified chart: chart-verifier's not-contains-crds flags CRDs in
+    templates/ too, packaging/helm/varek-crds/README.md.)"""
     assert not os.path.exists(os.path.join(CRDS, "crds"))
     p = helm("lint", "--strict", CRDS, "--kube-version", KUBE)
     assert "0 chart(s) failed" in p.stdout, p.stdout
