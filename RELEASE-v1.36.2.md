@@ -135,6 +135,7 @@ Partner Connect certifies each release's images and charts. For 1.36.2:
 2. The `varek` chart's 1.36.2 report from an OpenShift run, in a pull
    request to openshift-helm-charts/charts at
    `charts/partners/soberagents/varek/1.36.2/`.
+
 The `varek-crds` chart is not certified (above); it is published and
 signed on ghcr.io.
 
