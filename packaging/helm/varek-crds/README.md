@@ -11,9 +11,9 @@ helm install varek-crds oci://ghcr.io/kwdoug63/charts/varek-crds --version 1.36.
 
 They are a chart of their own for two reasons:
 
-- **Red Hat's chart certification** refuses a chart that holds a CRD
-  (chart-verifier's `not-contains-crds`), so the certified `varek` chart
-  holds none.
+- **Red Hat's chart certification** refuses a chart that holds a CRD, in
+  `crds/` or in `templates/` (chart-verifier's `not-contains-crds`), so the
+  certified `varek` chart holds none.
 - **`helm upgrade` changes them.** Helm installs a chart's `crds/` once and
   never upgrades them; these are templates, so `helm upgrade varek-crds`
   applies a new version.
@@ -27,14 +27,19 @@ chart grants no role. It runs the varek chart's node image, at the chart's
 version (`image` in `values.yaml`, its only values), as restricted-v2
 allows: on OpenShift the namespace gives its user, elsewhere 65532.
 
-## Red Hat's certification
+## Not certified by Red Hat
 
-The chart carries what chart-verifier's partner profile asks for: no
-`crds/` directory (the CRDs are templates), a values schema, the test
-above, in an image Red Hat certified, and the `charts.openshift.io`
-annotations. Its run on OpenShift is
-`packaging/helm/certification/verify_on_openshift.sh --crds-only`
-(`packaging/helm/certification/README.md`).
+This chart cannot be a certified chart: chart-verifier's `not-contains-crds` check, mandatory in the partner
+profile, flags a CustomResourceDefinition in a chart's `templates/` as
+well as in its `crds/`, and Red Hat's own run installs a chart with a
+service account confined to its test namespace, which cannot create
+cluster-scoped resources such as CRDs. Its submission,
+[openshift-helm-charts/charts#3624](https://github.com/openshift-helm-charts/charts/pull/3624)
+(November 2, 2026), passed the other 11 checks and failed those two; it was
+withdrawn. Red Hat's route for CRDs is an Operator. The `varek` chart, which
+holds none, is certified; this chart is published and signed on ghcr.io
+with each release. It keeps its values schema, its test and its
+`charts.openshift.io` annotations.
 
 ## Kept on an uninstall
 

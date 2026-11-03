@@ -9,19 +9,30 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [1.36.2] - 2026-11-02 — The node key published again; varek-crds ready for its own certification
+- `varek-crds` cannot be a certified chart, as 1.36.2 said it could be:
+  chart-verifier's `not-contains-crds` check, mandatory in the partner
+  profile, flags a CustomResourceDefinition in a chart's `templates/` as
+  well as in its `crds/`, and Red Hat's own run installs a chart with a
+  service account confined to its test namespace, which cannot create
+  cluster-scoped resources such as CRDs
+  (openshift-helm-charts/charts#3624, withdrawn). `RELEASE-v1.36.2.md`,
+  the README, the varek-crds README and the certification README say
+  so; `verify_on_openshift.sh --crds-only` is removed. The chart's test,
+  values schema and annotations stay.
+
+## [1.36.2] - 2026-11-02 — The node key published again; a test for varek-crds
 
 A patch release of 1.36.1; the Warden reports 1.36.2 and decides nothing
 differently, and the grammar stays 1.35. The charts and both images are
 1.36.2; the CRDs' schemas are 1.36.1's. See `RELEASE-v1.36.2.md`.
 
-- The `varek-crds` chart is ready for Red Hat's chart certification on its
-  own: the `charts.openshift.io` annotations, a values schema, and a
-  `helm test` that the API server serves the four kinds (the group's
-  discovery document, read with the pod's own token: no role), in the
-  varek chart's node image, run as restricted-v2 allows. Its only values
-  are that image's. `verify_on_openshift.sh --crds-only` makes its report;
-  `v1340_kind.sh` runs its test.
+- The `varek-crds` chart has the `charts.openshift.io` annotations, a
+  values schema, and a `helm test` that the API server serves the four
+  kinds (the group's discovery document, read with the pod's own token: no
+  role), in the varek chart's node image, run as restricted-v2 allows. Its
+  only values are that image's. `v1340_kind.sh` runs its test. (Released
+  as "ready for its own certification" with `verify_on_openshift.sh
+  --crds-only`; corrected under Unreleased.)
 - The six-minute soak trial in CI judged the node agent's memory from its
   first sample, which can come before the agents run: a supervisor then
   is its size at its start, and its steady size read as growth (PR #117's
