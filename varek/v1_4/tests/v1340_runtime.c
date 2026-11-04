@@ -24,6 +24,12 @@
 // process (the shim's child, under a filter of its own), sent with the
 // listener of a container's process that makes that call: what a root
 // process that reaches the socket could send, naming another pod's process.
+// v1.36.3 (D1, D2): VAREK_RT_BUNDLE, if set, is the bundle the state names
+// (else /nonexistent), and VAREK_RT_CGROUP, if set, a cgroup (below
+// /sys/fs/cgroup) the process the state names is put in before the state
+// is sent, as a runtime puts a container's: the node agent confirms the
+// container by both. A cgroup named for another id than ID is what an
+// impersonation looks like.
 // Prints the pid the state names, waits 3 s for the node agent, prints
 // "alive yes|no" (whether that process is still running), and ends it. 0,
 // or 1 (said why) if it could not.
@@ -131,15 +137,30 @@ int main(int argc, char **argv) {
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0) _exit(1);
         pid_t c = fork();
         if (c < 0) _exit(1);
-        if (c == 0) { close(sp[0]); container(sp[1], call); }
+        // the pipe's end not held by the container: a runtime that ends
+        // early is then seen to (its parent's read ends), not waited on
+        if (c == 0) { close(sp[0]); close(pp[1]); container(sp[1], call); }
         close(sp[1]);
         int l = recv_fd(sp[0]);
+        const char *cgp = getenv("VAREK_RT_CGROUP"), *bundle = getenv("VAREK_RT_BUNDLE");
+        if (cgp && *cgp) {   // the named process put in its cgroup, as a runtime does
+            char d[512], f[600];
+            snprintf(d, sizeof d, "/sys/fs/cgroup/%s", cgp);
+            snprintf(f, sizeof f, "%s/cgroup.procs", d);
+            FILE *cf = fopen(f, "w");
+            if (!cf || fprintf(cf, "%d\n", (int)(o ? o : c)) < 0 || fclose(cf) != 0) {
+                fprintf(stderr, "v1340_runtime: cannot put %d in %s\n", (int)(o ? o : c), d);
+                kill(c, SIGKILL);
+                _exit(1);
+            }
+        }
         int s = dial(argv[1]);
-        char st[512];
+        char st[1024];
         int n = snprintf(st, sizeof st,
                          "{\"ociVersion\":\"1.2.1\",\"fds\":[\"seccompFd\"],\"pid\":%d,\"metadata\":\"\",\"state\":"
                          "{\"ociVersion\":\"1.2.1\",\"id\":\"%s\",\"status\":\"creating\",\"pid\":%d,"
-                         "\"bundle\":\"/nonexistent\"}}", (int)(o ? o : c), argv[2], (int)(o ? o : c));
+                         "\"bundle\":\"%s\"}}", (int)(o ? o : c), argv[2], (int)(o ? o : c),
+                         bundle && *bundle ? bundle : "/nonexistent");
         if (l < 0 || s < 0 || n <= 0 || (size_t)n >= sizeof st || send_fd(s, st, (size_t)n, l) < 0) _exit(1);
         pid_t named = o ? o : c;
         (void)!write(pp[1], &named, sizeof named);

@@ -100,6 +100,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -240,6 +241,13 @@ type pod struct {
 		Containers       []container `json:"containers"`
 		// v1.36 step 6: added by an update (pods/ephemeralcontainers)
 		EphemeralContainers []container `json:"ephemeralContainers"`
+		// v1.36.3 (D6): a hostPath that holds the node agent's socket
+		Volumes []struct {
+			Name     string `json:"name"`
+			HostPath *struct {
+				Path string `json:"path"`
+			} `json:"hostPath"`
+		} `json:"volumes"`
 	} `json:"spec"`
 }
 
@@ -269,6 +277,8 @@ type server struct {
 	// (system:serviceaccount:NAMESPACE:NAME), the only one whose VarekNodeKey
 	// is admitted, and only for the node its token was given on
 	nodeAgent string
+	// v1.36.3 (D6): the node agent's socket's directory on each node, or ""
+	socketDir string
 
 	mu    sync.Mutex
 	cache map[[32]byte]checked // by the SHA-256 of what was checked (W2): the policy, and the pod's plan
@@ -579,6 +589,18 @@ func (s *server) pod(ctx context.Context, req *request) string {
 	if err := json.Unmarshal(req.Object, &p); err != nil {
 		return "the pod does not read: " + err.Error()
 	}
+	// v1.36.3 (D6, docs/security/v1.36.3-bundle-confirmation.md): no pod the
+	// webhook serves mounts the directory of the node agent's socket, or one
+	// above it, whatever it names: a process that reaches the socket is
+	// what the node agent must otherwise tell from the runtime (D1 to D3).
+	// Read-only is no exception (a socket is connected to all the same).
+	// VAREK's own namespace is not served. A pod's volumes are fixed once it
+	// is created.
+	if req.Operation != "UPDATE" {
+		if why := socketMounted(s.socketDir, &p); why != "" {
+			return why
+		}
+	}
 	name, ok := p.Metadata.Annotations[annotation]
 	plan, planned := p.Metadata.Annotations[planAnnotation]
 	// G-3: what a pod was admitted as it stays; its spec is otherwise
@@ -731,6 +753,35 @@ func (s *server) pod(ctx context.Context, req *request) string {
 		}
 	}
 	return strings.Join(whys, "; ")
+}
+
+// socketMounted says why a pod's hostPath volume reaches DIR (the node
+// agent's socket's directory): at it or above it, /var/run read as /run
+// (one is a link to the other on the nodes the chart runs on); "" if none
+func socketMounted(dir string, p *pod) string {
+	if dir == "" {
+		return ""
+	}
+	dir = path.Clean(dir)
+	forms := []string{dir}
+	if rest, ok := strings.CutPrefix(dir, "/run/"); ok {
+		forms = append(forms, "/var/run/"+rest)
+	} else if rest, ok := strings.CutPrefix(dir, "/var/run/"); ok {
+		forms = append(forms, "/run/"+rest)
+	}
+	for _, v := range p.Spec.Volumes {
+		if v.HostPath == nil {
+			continue
+		}
+		hp := path.Clean("/" + v.HostPath.Path)
+		for _, d := range forms {
+			if hp == "/" || d == hp || strings.HasPrefix(d, hp+"/") {
+				return fmt.Sprintf("its volume %s mounts the node's %s, which holds VAREK's node agent's socket (%s): "+
+					"no pod but VAREK's own may reach it", v.Name, v.HostPath.Path, dir)
+			}
+		}
+	}
+	return ""
 }
 
 func newServer(warden string, api reader, classes string) *server {
@@ -895,7 +946,13 @@ func main() {
 	oboUser := flag.Int64("obo-user", oboNobody, "v1.36: its user and group (0: the platform's, as on OpenShift)")
 	nodeAgent := flag.String("node-agent-sa", "", "v1.36: the node agent's service account (system:serviceaccount:NS:NAME): "+
 		"a VarekNodeKey is admitted only from it, for the node its token was given on")
+	socketDir := flag.String("node-socket-dir", "", "v1.36.3: the node agent's socket's directory on each node: no pod "+
+		"the webhook serves may mount it, or one above it, as a hostPath (D6)")
 	flag.Parse()
+	if *socketDir != "" && !strings.HasPrefix(*socketDir, "/") {
+		fmt.Fprintln(os.Stderr, "varek-admission: -node-socket-dir is an absolute path")
+		os.Exit(2)
+	}
 	if !strings.HasPrefix(*wardenPath, "/") || *cert == "" || *key == "" {
 		fmt.Fprintln(os.Stderr, "varek-admission: give -warden (an absolute path), -tls-cert and -tls-key")
 		os.Exit(2)
@@ -909,6 +966,7 @@ func main() {
 	s.credDir = *credDir
 	s.oboImage, s.oboUser = *oboImage, *oboUser
 	s.nodeAgent = *nodeAgent
+	s.socketDir = *socketDir
 	cf := &certFiles{cert: *cert, key: *key}
 	if _, err := cf.get(nil); err != nil {
 		fmt.Fprintln(os.Stderr, "varek-admission: the certificate:", err)

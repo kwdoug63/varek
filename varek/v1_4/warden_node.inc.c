@@ -913,16 +913,14 @@ fail:
 }
 
 /* The container's command, from its bundle: its first launch. 0, or -1. */
+static char *g_node_cfg;
+static size_t g_node_cfg_n;
 static int node_config(char *why, size_t wn) {
-    int bd = open(g_nr.bundle, O_PATH | O_DIRECTORY | O_CLOEXEC);
-    char *doc = NULL;
-    size_t n = 0;
-    if (bd < 0 || node_read_file(bd, "config.json", &doc, &n, 16u << 20) < 0) {
-        snprintf(why, wn, "cannot read the bundle's config.json (%s)", strerror(errno));
-        if (bd >= 0) close(bd);
-        return -1;
-    }
-    close(bd);
+    /* v1.36.3: the bundle's config.json, read once, by node_same_annotations */
+    char *doc = g_node_cfg;
+    size_t n = g_node_cfg_n;
+    g_node_cfg = NULL;
+    if (!doc) { snprintf(why, wn, "the bundle's config.json was not read"); return -1; }
     char w[160];
     int rc = -1;
     if (nj_check(doc, n, w, sizeof w) < 0) snprintf(why, wn, "the bundle's config.json is not well formed (%s)", w);
@@ -1742,75 +1740,147 @@ static int node_tie(int fd, pid_t pid, int pidfd, pid_t peer, const char *how, c
     }
 }
 
-/* v1.36.3 measurements (docs/security/v1.36.3-bundle-confirmation.md, M1 to
- * M4), report only: as a connection is admitted, what D1 to D3 would check,
- * one line in the node's log, refusing nothing. M1: the cgroup of the
- * process the state names, read as the listener arrives, and whether it
- * names the state's container id and pod uid; M2: the bundle's form and
- * owner; M3: the state's annotations against the bundle's config.json, for
- * each key VAREK reads; M4: the time each part takes. */
-static long node_us_since(const struct timespec *t0) {
-    struct timespec t1;
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    return (t1.tv_sec - t0->tv_sec) * 1000000L + (t1.tv_nsec - t0->tv_nsec) / 1000;
+/* v1.36.3 (docs/security/v1.36.3-bundle-confirmation.md, D1 to D4): the
+ * container a connection names, confirmed. Through v1.36.2 the node agent
+ * checked who sent a connection and which process its listener is for, but
+ * took the container's id, bundle and annotations from the state as sent:
+ * a root process that reached the socket could name another pod's, and have
+ * a process of its own held to that pod's policy, its stream signed as that
+ * pod's container, with that pod's credentials and user token. Now, on every
+ * path:
+ *   D1  the process the state names is in that container's cgroup, the one
+ *       the kernel holds: the state's id is the container's scope's
+ *       (crio-<id>.scope, cri-containerd-<id>.scope, or <id> under the
+ *       cgroupfs driver), its own or the one above crun's leaf, named
+ *       `container`; and the pod's uid, where the state names one, is the
+ *       pod's cgroup's;
+ *   D2  the bundle is that id's, under a runtime's own directory
+ *       (--node-bundle-root, by default containerd's and CRI-O's), named by
+ *       no link, root's and written by no one else;
+ *   D3  the annotations VAREK reads are the bundle's config.json's, which
+ *       the runtime wrote (node_same_annotations, in the supervisor);
+ *   D4  otherwise the connection is refused, as any other is.
+ * Measured on every cell of the matrix and kind before it was built (the
+ * note's M1 to M4). */
+#define NODE_MAX_ROOTS 8
+static const char *g_node_roots[NODE_MAX_ROOTS];
+static int g_node_nroots;
+static const char *const kNodeDefaultRoots[] = { "/run/containerd/io.containerd.runtime.v2.task/k8s.io",
+                                                 "/run/containers/storage/overlay-containers" };
+
+/* the cgroup's component C names the container ID: its scope's form, or the
+ * cgroupfs driver's plain id */
+static bool node_cg_names(const char *c, size_t cn, const char *id) {
+    static const char *const kPre[] = { "", "cri-containerd-", "crio-", "docker-" };
+    size_t il = strlen(id);
+    for (size_t i = 0; i < sizeof kPre / sizeof kPre[0]; i++) {
+        size_t pl = strlen(kPre[i]);
+        if (cn < pl + il || memcmp(c, kPre[i], pl) || memcmp(c + pl, id, il)) continue;
+        const char *rest = c + pl + il;
+        size_t rn = cn - pl - il;
+        if (rn == 0 && (pl == 0 || i == 2)) return true;        /* <id>, crio-<id> (cgroupfs) */
+        if (rn == 6 && !memcmp(rest, ".scope", 6) && pl) return true;
+    }
+    return false;
 }
 
-static void node_measure(pid_t pid, int pidfd, const char *doc, size_t n, const char *path) {
-    struct timespec t0;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    char id[160] = "", bundle[PATH_MAX] = "", uid[80] = "", cg[1024] = "";
+/* the cgroup's path holds the pod's: a component pod<uid>, its - as _ under
+ * the systemd driver, ending the component or followed by ".slice" */
+static bool node_cg_pod(const char *cg, const char *uid) {
+    char u[2][160];
+    snprintf(u[0], sizeof u[0], "pod%s", uid);
+    snprintf(u[1], sizeof u[1], "pod%s", uid);
+    for (char *c = u[1]; *c; c++) if (*c == '-') *c = '_';
+    for (int k = 0; k < 2; k++)
+        for (const char *p = cg; (p = strstr(p, u[k])) != NULL; p++) {
+            const char *e = p + strlen(u[k]);
+            bool start = p == cg || p[-1] == '/' || p[-1] == '-';
+            if (start && (*e == '\0' || *e == '/' || !strncmp(e, ".slice", 6))) return true;
+        }
+    return false;
+}
+
+static int node_confirm(pid_t pid, int pidfd, const char *doc, size_t n, char *why, size_t wn) {
+    char id[128] = "", bundle[PATH_MAX] = "", uid[128] = "", cg[PATH_MAX + 8] = "";
     const char *ip[] = { "state", "id" }, *bp[] = { "state", "bundle" };
     node_str(doc, n, ip, 2, id, sizeof id);
     node_str(doc, n, bp, 2, bundle, sizeof bundle);
+    if (!id[0] || strchr(id, '/') || !strcmp(id, ".") || !strcmp(id, "..")) {
+        snprintf(why, wn, "the container's state names no usable id");
+        return -1;
+    }
     static const char *const kUid[3] = { "varek.dev/pod-uid", "io.kubernetes.cri.sandbox-uid", "io.kubernetes.pod.uid" };
-    if (node_annotation(doc, n, kUid, uid, sizeof uid) < 0) snprintf(uid, sizeof uid, "(conflict)");
-    /* M1: cgroup v2's line, read while the process is shown alive */
+    if (node_annotation(doc, n, kUid, uid, sizeof uid) < 0) {
+        snprintf(why, wn, "the container's state names its pod's uid twice, differently");
+        return -1;
+    }
+    /* D1: cgroup v2's line, read while the process is shown alive (its pid
+     * not yet another's) */
     FILE *f = proc_fopenf("%d/cgroup", (int)pid);
-    char line[1024];
+    char line[PATH_MAX + 8];
     while (f && fgets(line, sizeof line, f))
         if (!strncmp(line, "0::", 3)) { snprintf(cg, sizeof cg, "%s", line + 3); cg[strcspn(cg, "\n")] = '\0'; }
     if (f) fclose(f);
-    bool alive = node_alive(pidfd);
-    const char *last = strrchr(cg, '/');
-    last = last ? last + 1 : cg;
-    char want[256];
-    const char *cg_id = "no";
-    static const char *const kForm[][3] = { { "", "", "plain" }, { "cri-containerd-", ".scope", "cri-containerd" },
-                                            { "crio-", ".scope", "crio" }, { "docker-", ".scope", "docker" } };
-    for (size_t i = 0; id[0] && i < sizeof kForm / sizeof kForm[0]; i++) {
-        snprintf(want, sizeof want, "%s%s%s", kForm[i][0], id, kForm[i][1]);
-        if (!strcmp(last, want)) { cg_id = kForm[i][2]; break; }
+    if (!node_alive(pidfd)) { snprintf(why, wn, "the container's process %d is gone", (int)pid); return -1; }
+    if (cg[0] != '/' || !strcmp(cg, "/")) {
+        snprintf(why, wn, "the process the state names (%d) has no cgroup of its own (cgroup v2: \"%.200s\"): "
+                 "nothing confirms it is container %.80s", (int)pid, cg, id);
+        return -1;
     }
-    const char *cg_pod = "no";
-    if (uid[0]) {
-        char u2[80];
-        snprintf(u2, sizeof u2, "%s", uid);
-        for (char *c = u2; *c; c++) if (*c == '-') *c = '_';
-        snprintf(want, sizeof want, "pod%s", uid);
-        if (strstr(cg, want)) cg_pod = "dashes";
-        else if (snprintf(want, sizeof want, "pod%s", u2), strstr(cg, want)) cg_pod = "underscores";
+    const char *last = strrchr(cg, '/') + 1, *comp = last;
+    size_t cl = strlen(last);
+    if (!strcmp(last, "container") && last - 1 > cg) {        /* crun's leaf: the scope is the one above */
+        const char *e = last - 1, *b2 = e;
+        while (b2 > cg && b2[-1] != '/') b2--;
+        comp = b2;
+        cl = (size_t)(e - b2);
     }
-    long us_cg = node_us_since(&t0);
-    /* M2: the bundle's form, and its owner and mode, not following a link */
-    const char *bform = "other";
-    char bcopy[PATH_MAX];
-    snprintf(bcopy, sizeof bcopy, "%s", bundle);
-    char *b1 = strrchr(bcopy, '/');
-    if (b1 && id[0]) {
-        if (!strcmp(b1 + 1, id)) bform = "dir=id";
-        else if (!strcmp(b1 + 1, "userdata")) {
-            *b1 = '\0';
-            char *b2 = strrchr(bcopy, '/');
-            if (b2 && !strcmp(b2 + 1, id)) bform = "id/userdata";
-        }
+    if (!node_cg_names(comp, cl, id)) {
+        snprintf(why, wn, "the process the state names (%d) is not container %.80s's: its cgroup is %.300s",
+                 (int)pid, id, cg);
+        return -1;
     }
-    struct stat bs;
-    char bown[48] = "unreadable";
-    if (lstat(bundle, &bs) == 0)
-        snprintf(bown, sizeof bown, "%s uid=%u mode=%03o", S_ISDIR(bs.st_mode) ? "dir" : S_ISLNK(bs.st_mode) ? "link" : "other",
-                 (unsigned)bs.st_uid, (unsigned)(bs.st_mode & 0777));
-    long us_b = node_us_since(&t0) - us_cg;
-    /* M3: each key VAREK reads, the state's against config.json's */
+    if (uid[0] && !node_cg_pod(cg, uid)) {
+        snprintf(why, wn, "the process the state names (%d) is not pod %.80s's: its cgroup is %.300s", (int)pid, uid, cg);
+        return -1;
+    }
+    /* D2: the bundle is that id's, under a runtime's own directory, named by
+     * no link */
+    char real[PATH_MAX];
+    if (bundle[0] != '/' || !realpath(bundle, real) || strcmp(real, bundle)) {
+        snprintf(why, wn, "the container's bundle (%.300s) is not a path to it without a link", bundle);
+        return -1;
+    }
+    bool under = false;
+    int nr = g_node_nroots ? g_node_nroots : (int)(sizeof kNodeDefaultRoots / sizeof kNodeDefaultRoots[0]);
+    for (int i = 0; i < nr && !under; i++) {
+        const char *r = g_node_nroots ? g_node_roots[i] : kNodeDefaultRoots[i];
+        size_t rl = strlen(r);
+        if (strncmp(bundle, r, rl) || bundle[rl] != '/') continue;
+        const char *t = bundle + rl + 1;
+        size_t il = strlen(id);
+        under = !strncmp(t, id, il) && (t[il] == '\0' || !strcmp(t + il, "/userdata"));
+    }
+    if (!under) {
+        snprintf(why, wn, "the container's bundle (%.300s) is not container %.80s's under a runtime's directory "
+                 "(--node-bundle-root)", bundle, id);
+        return -1;
+    }
+    struct stat st;
+    if (lstat(bundle, &st) < 0 || !S_ISDIR(st.st_mode) || st.st_uid != 0 || (st.st_mode & 022)) {
+        snprintf(why, wn, "the container's bundle (%.300s) is not a directory root's, written by no one else", bundle);
+        return -1;
+    }
+    return 0;
+}
+
+/* D3, in the supervisor: the annotations VAREK reads, the state's against
+ * the bundle's config.json (the bundle confirmed, D2), which the runtime
+ * wrote from the pod's spec and the NRI plugin's adjustments; OCI's state
+ * carries a copy of them. Equal on every container measured (M3); a sender
+ * other than the runtime is what makes them differ. config.json is kept for
+ * node_config, read once. 0, or -1 with why. */
+static int node_same_annotations(const char *doc, size_t n, char *why, size_t wn) {
     static const char *const kKeys[] = {
         "varek.dev/policy", "varek.dev/policy-sha256", "varek.dev/plan", "varek.dev/plan-sha256",
         "varek.dev/on-behalf-of", "varek.dev/dry-run", "varek.dev/trust-bundle", "varek.dev/flow-sha256",
@@ -1818,38 +1888,33 @@ static void node_measure(pid_t pid, int pidfd, const char *doc, size_t n, const 
         "varek.dev/container", "io.kubernetes.cri.sandbox-namespace", "io.kubernetes.cri.sandbox-name",
         "io.kubernetes.cri.sandbox-uid", "io.kubernetes.cri.container-name", "io.kubernetes.pod.namespace",
         "io.kubernetes.pod.name", "io.kubernetes.pod.uid", "io.kubernetes.container.name" };
-    int bd = bundle[0] == '/' ? open(bundle, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) : -1;
-    char *cfg = NULL;
-    size_t cn = 0;
-    int same = 0, both = 0;
-    char differ[512] = "";
-    const char *annot = "config.json unreadable";
-    if (bd >= 0 && node_read_file(bd, "config.json", &cfg, &cn, 16u << 20) == 0) {
-        annot = "read";
-        for (size_t i = 0; i < sizeof kKeys / sizeof kKeys[0]; i++) {
-            const char *sp[] = { "state", "annotations", kKeys[i] }, *cp[] = { "annotations", kKeys[i] }, *v;
-            size_t vn;
-            char sv[512] = "", cv[512] = "";
-            bool hs = nj_find(doc, n, sp, 3, &v, &vn) == 0 && nj_string(v, vn, sv, sizeof sv) == 0;
-            bool hc = nj_find(cfg, cn, cp, 2, &v, &vn) == 0 && nj_string(v, vn, cv, sizeof cv) == 0;
-            if (!hs && !hc) continue;
-            both++;
-            if (hs && hc && !strcmp(sv, cv)) same++;
-            else {
-                size_t dl = strlen(differ);
-                snprintf(differ + dl, sizeof differ - dl, "%s%s(%s)", dl ? "," : "", kKeys[i],
-                         !hs ? "config only" : !hc ? "state only" : "differ");
-            }
+    int bd = open(g_nr.bundle, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (bd < 0 || node_read_file(bd, "config.json", &g_node_cfg, &g_node_cfg_n, 16u << 20) < 0) {
+        snprintf(why, wn, "cannot read the bundle's config.json (%s)", strerror(errno));
+        if (bd >= 0) close(bd);
+        return -1;
+    }
+    close(bd);
+    char w[160];
+    if (nj_check(g_node_cfg, g_node_cfg_n, w, sizeof w) < 0) {
+        snprintf(why, wn, "the bundle's config.json is not well formed (%s)", w);
+        return -1;
+    }
+    for (size_t i = 0; i < sizeof kKeys / sizeof kKeys[0]; i++) {
+        const char *sp[] = { "state", "annotations", kKeys[i] }, *cp[] = { "annotations", kKeys[i] }, *v;
+        size_t vn;
+        char sv[1024], cv[1024];
+        bool hs = nj_find(doc, n, sp, 3, &v, &vn) == 0;
+        if (hs && nj_string(v, vn, sv, sizeof sv) < 0) sv[0] = '\x01', sv[1] = '\0';
+        bool hc = nj_find(g_node_cfg, g_node_cfg_n, cp, 2, &v, &vn) == 0;
+        if (hc && nj_string(v, vn, cv, sizeof cv) < 0) cv[0] = '\x02', cv[1] = '\0';
+        if (hs != hc || (hs && strcmp(sv, cv))) {
+            snprintf(why, wn, "the container's state and its bundle's config.json differ on %s (%s): the state is not "
+                     "its runtime's", kKeys[i], !hs ? "in config.json only" : !hc ? "in the state only" : "different values");
+            return -1;
         }
     }
-    if (bd >= 0) close(bd);
-    free(cfg);
-    long us_a = node_us_since(&t0) - us_cg - us_b;
-    fprintf(stderr, "[warden] node agent: MEASURE v1.36.3 path=%s pid=%d alive=%s id=%.80s cgroup=%.400s cg_id=%s "
-            "cg_pod=%s bundle=%.300s bundle_form=%s bundle_stat=\"%s\" annotations=%s same=%d/%d differ=%s "
-            "us_cgroup=%ld us_bundle=%ld us_annotations=%ld\n",
-            path, (int)pid, alive ? "yes" : "no", id[0] ? id : "-", cg[0] ? cg : "-", cg_id, cg_pod,
-            bundle[0] ? bundle : "-", bform, bown, annot, same, both, differ[0] ? differ : "-", us_cg, us_b, us_a);
+    return 0;
 }
 
 /* Listen for the runtime. Returns 0 in each supervisor (one per container,
@@ -1959,10 +2024,15 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
             close(fds[0]);
             continue;
         }
-        /* v1.36.3 measurements, report only (M1 to M4) */
-        node_measure(pid, pidfd, buf, (size_t)r,
-                     adm == 1 ? (peer.state == 0 ? "own-mount-namespace" : "reaped")
-                              : (peer.state == 1 ? "read" : "runtime-ended"));
+        /* v1.36.3 (D1, D2): the container the state names, confirmed before
+         * anything is done for it; refused, the process is not ended (it may
+         * be anyone's) */
+        if (node_confirm(pid, pidfd, buf, (size_t)r, why, sizeof why) < 0) {
+            fprintf(stderr, "[warden] node agent: a connection refused: %s\n", why);
+            close(pidfd);
+            close(fds[0]);
+            continue;
+        }
         if (g_node_chld) node_reap();
         /* v1.36 step 12: a container to be tied by its first call is not yet
          * known to be the one named: refused here, it is not ended */
@@ -2061,6 +2131,9 @@ static int node_listen(const char *sock_path, const char *streams, const char *l
             g_seg_dir = fcntl(sd, F_DUPFD_CLOEXEC, 3);
             snprintf(g_seg_base, sizeof g_seg_base, "%s", sbase);
         }
+        /* v1.36.3 (D3): the annotations read from here on are the bundle's
+         * (the container confirmed, D1 and D2: its stream named by its id) */
+        if (ok == 0) ok = node_same_annotations(buf, (size_t)r, why, sizeof why);
         if (ok == 0) ok = node_policy(buf, (size_t)r, policy_path, why, sizeof why);
         if (ok == 0) ok = node_copy(sd, streams, sbase, "policy", ".policy", g_nr.policy_sha, policy_path,
                                     why, sizeof why);                                        /* step 5 */

@@ -23,7 +23,7 @@
 #            admission webhook (varek-admission) and, v1.36, the pod's SVID
 #            from SPIRE (varek-svid), built in build-go
 # Each base pinned by its index digest (every architecture's), so a build is
-# the same build whenever it is made: the digests v1.36.1 and v1.36.2 are
+# the same build whenever it is made: the digests v1.36.1 to v1.36.3 are
 # built from (ubuntu's, of November 1, 2026; the test stage is not
 # released). A newer base is taken by changing the digest here, in a
 # change CI checks.

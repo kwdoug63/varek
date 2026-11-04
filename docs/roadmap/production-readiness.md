@@ -56,9 +56,10 @@ plan has been marked done that does not.
 | R8 | Not recorded here | Kept outside the repository, as section 5 says |
 | R9 | Step 1 of 3 | `docs/security/node-agent-privilege.md` (October 30). Next: the named set of capabilities, with the step 12 items |
 
-Section 4's first item, confirming a tied connection's bundle, is the next
-code change: it is a security finding, and it needs no pilot. Its design
-note is `docs/security/v1.36.3-bundle-confirmation.md` (for decision).
+Section 4's first item, confirming a tied connection's bundle, is built
+for v1.36.3 (`docs/security/v1.36.3-bundle-confirmation.md`, decided and
+measured November 4), with the webhook's refusal of a pod that mounts the
+node agent's socket.
 
 ## 1. Assurance (R1)
 

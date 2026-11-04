@@ -87,6 +87,10 @@ import time
 
 ENV = os.environ
 D = ENV.get("VAREK_SWEEP_DIR", "")
+BUNDLES = os.path.join(D, "bundles")
+# the containers' cgroups: not named varek-*, which test_v1281 reads as the
+# Warden's own run groups left behind at the cgroup root
+CGROUP = "/sys/fs/cgroup/v1340-sweep-" + os.path.basename(D).rsplit(".", 1)[-1] if D else ""
 WARDEN = ENV.get("VAREK_SWEEP_WARDEN", "")
 LAUNCHER = ENV.get("VAREK_SWEEP_LAUNCHER", "")
 RUNC = ENV.get("VAREK_SWEEP_RUNC", "runc")
@@ -252,6 +256,15 @@ def main():
     os.mkdir(streams, 0o700)
     state = os.path.join(inv, "state")
     os.mkdir(state, 0o700)
+    # v1.36.3 (D1, D2): the container as a runtime makes one, which the node
+    # agent confirms: its bundle named by its id under the runtime's
+    # directory (BUNDLES, the node agent's --node-bundle-root), root's and
+    # mode 700, and its process in a cgroup of its own, its pod's below
+    cid = "sweep-" + n
+    os.makedirs(BUNDLES, mode=0o755, exist_ok=True)
+    bundle = os.path.join(BUNDLES, cid)
+    os.mkdir(bundle, 0o700)
+    pod_cg = os.path.join(CGROUP, "pod" + n)
 
     # v1.36 step 4 (D2): each credential the policy names given to this
     # namespace, from its source, as a cluster administrator's VarekCredential
@@ -327,7 +340,8 @@ def main():
     agent_log = open(os.path.join(inv, "agent.log"), "w+")
     # v1.36 step 6: no standard input of the suite's (a node agent has none)
     agent = subprocess.Popen([WARDEN, pol_dir, "--node-agent", sock, "--node-streams", streams,
-                              "--node-launcher", LAUNCHER, "--node-credentials", "/"] + opts,
+                              "--node-launcher", LAUNCHER, "--node-credentials", "/",
+                              "--node-bundle-root", BUNDLES] + opts,
                              stdin=subprocess.DEVNULL, stdout=agent_log, stderr=agent_log)
     for _ in range(100):
         if os.path.exists(sock) or agent.poll() is not None:
@@ -361,8 +375,6 @@ def main():
     mounted = subprocess.run(["mount", "-t", "overlay", "overlay", "-o",
                               "lowerdir=%s/hostroot,upperdir=%s,workdir=%s" % (D, up, wk), root]).returncode == 0
 
-    bundle = os.path.join(inv, "bundle")
-    os.mkdir(bundle)
     subprocess.run([RUNC, "spec"], cwd=bundle, check=True)
     cfg_path = os.path.join(bundle, "config.json")
     c = json.load(open(cfg_path))
@@ -380,6 +392,7 @@ def main():
     c["linux"]["namespaces"] = [x for x in c["linux"]["namespaces"] if x["type"] != "network"]
     meta = "sweep/%s/%s" % (SUITE, n)
     c["linux"]["seccomp"] = dict(filt, listenerPath=sock, listenerMetadata=meta)
+    c["linux"]["cgroupsPath"] = "/%s/pod%s/%s" % (os.path.basename(CGROUP), n, cid)   # the cgroupfs driver's form
     for m in c["mounts"]:
         # as the plugin makes a pod's writable mounts (kernel file systems apart)
         opts_m = m.setdefault("options", [])
@@ -424,7 +437,6 @@ def main():
         c["annotations"]["varek.dev/trust-bundle"] = tkey
     json.dump(c, open(cfg_path, "w"))
 
-    cid = "sweep-" + n
     proc = None
     got = []
 
@@ -517,8 +529,13 @@ def main():
         # the stream's policy copy stays (run_start's policy_path, which an
         # audit after the run reads); the rest goes
         if not ENV.get("VAREK_SWEEP_KEEP"):
-            for x in ("bundle", "state", "pol", "s"):
+            for x in ("state", "pol", "s"):
                 shutil.rmtree(os.path.join(inv, x), ignore_errors=True)
+            shutil.rmtree(bundle, ignore_errors=True)
+        try:
+            os.rmdir(pod_cg)                 # runc removed the container's own
+        except OSError:
+            pass
         os.write(watch_w, b"k")              # the watchdog stands down: an end of our own
         os._exit(rc)
 

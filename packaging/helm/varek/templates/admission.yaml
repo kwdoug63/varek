@@ -133,6 +133,9 @@ spec:
             # v1.36 step 9 (D10): a VarekNodeKey only from the node agent, for its own node
             - -node-agent-sa
             - system:serviceaccount:{{ .Release.Namespace }}:{{ include "varek.nodeName" . }}
+            # v1.36.3 (D6): no pod it serves mounts the node agent's socket's directory
+            - -node-socket-dir
+            - {{ .Values.node.socket }}
           ports:
             - { name: https, containerPort: 8443 }
           readinessProbe:
