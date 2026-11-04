@@ -641,10 +641,14 @@ refused "a pod under it naming no user's token: refused at deploy" "$OUT/p-nobod
 pod p-mount team-a obo obomount > "$OUT/p-mount.json"
 refused "a pod whose agent mounts its token's volume: refused" "$OUT/p-mount.json" "container agent mounts varek-obo"
 # v1.36.3 (D6): no pod the webhook serves mounts the node agent's socket's
-# directory, or one above it (checked before anything else of the pod)
+# directory, or one above it (checked before anything else of the pod), in
+# a namespace of its own: team-a's Pod Security (restricted) refuses any
+# hostPath before the webhook is asked, as it would in a namespace with the
+# baseline level
+kubectl create namespace varek-sock > /dev/null 2>&1 || true
 python3 - "$OUT/p-sock.json" <<'PY'
 import json, sys
-json.dump({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p-sock", "namespace": "team-a",
+json.dump({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p-sock", "namespace": "varek-sock",
                                                          "annotations": {"varek.dev/policy": "agent"}},
            "spec": {"containers": [{"name": "c", "image": "registry.invalid/none:1", "command": ["/bin/true"],
                                     "volumeMounts": [{"name": "run", "mountPath": "/host-run", "readOnly": True}]}],
@@ -652,6 +656,7 @@ json.dump({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p-sock", "na
 PY
 refused "a pod mounting the node's /run, read-only (v1.36.3, D6): refused, before its policy is read" "$OUT/p-sock.json" \
     "holds VAREK's node agent's socket"
+kubectl delete namespace varek-sock --wait=false > /dev/null 2>&1
 CHECK='(exec /bin/cat /var/run/varek-obo/token) > /dev/null 2>&1; echo "token_read: $?"
 (exec /bin/cat /etc/hostname) > /dev/null 2>&1; echo "read_allowed: $?"
 (exec /bin/true); echo "launch_allowed: $?"' pod pod-o team-a obo obo > "$OUT/pod-o.json"
