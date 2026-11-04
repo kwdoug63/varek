@@ -57,7 +57,8 @@ plan has been marked done that does not.
 | R9 | Step 1 of 3 | `docs/security/node-agent-privilege.md` (October 30). Next: the named set of capabilities, with the step 12 items |
 
 Section 4's first item, confirming a tied connection's bundle, is the next
-code change: it is a security finding, and it needs no pilot.
+code change: it is a security finding, and it needs no pilot. Its design
+note is `docs/security/v1.36.3-bundle-confirmation.md` (for decision).
 
 ## 1. Assurance (R1)
 
