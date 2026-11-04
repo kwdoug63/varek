@@ -161,13 +161,13 @@ skip()  { printf '  SKIP   %s\n' "$1"; skips=$((skips + 1)); }
 check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else flunk "$d"; fi; }
 RUNC="${RUNC:-$(command -v runc || true)}"
 [ -z "$RUNC" ] && [ -x /usr/libexec/crio/runc ] && RUNC=/usr/libexec/crio/runc
-B="" AGENTS="" SERVERS="" CG=/sys/fs/cgroup/varek-v1340
+B="" AGENTS="" SERVERS="" CGROOT=/sys/fs/cgroup/varek-v1340
 cleanup() {
     for a in $AGENTS $SERVERS; do kill "$a" 2>/dev/null; done
     [ -n "$B" ] && [ -e "$B/netns" ] && umount "$B/netns" 2>/dev/null
     if [ -n "$B" ]; then for c in "$B"/state/*; do [ -e "$c" ] && "$RUNC" --root "$B/state" delete -f "${c##*/}" >/dev/null 2>&1; done; fi
     # v1.36.3: the containers' cgroups (D1), the deepest first
-    [ -n "$B" ] && [ -d "$CG" ] && find "$CG" -depth -type d -exec rmdir {} \; 2>/dev/null
+    [ -n "$B" ] && [ -d "$CGROOT" ] && find "$CGROOT" -depth -type d -exec rmdir {} \; 2>/dev/null
     [ -n "${KEEP:-}" ] && echo "kept $B" || { [ -n "$B" ] && rm -rf "$B"; }
 }
 trap cleanup EXIT
@@ -200,7 +200,7 @@ fi
 B="$(mktemp -d /tmp/varek_v1340.XXXXXX)"; chmod 755 "$B"
 mkdir -p "$B/streams" "$B/state" "$B/f" "$B/rootfs/data" "$B/rootfs/proc" "$B/rootfs/dev" "$B/rootfs/tmp"
 mkdir -m 700 "$B/s"                          # the sockets' directory: root's alone
-mkdir -p "$B/bundles" "$CG"                  # v1.36.3: the runtime's bundles (D2), the containers' cgroups (D1)
+mkdir -p "$B/bundles" "$CGROOT"                  # v1.36.3: the runtime's bundles (D2), the containers' cgroups (D1)
 mv /tmp/varek_v1340_probe.$$ "$B/rootfs/probe"; mv /tmp/varek_v1340_ocif.$$ "$B/ocif"; mv /tmp/varek_v1340_rt.$$ "$B/rt"
 chmod 755 "$B/rootfs/probe"
 echo "allowed content" > "$B/rootfs/data/allowed"; echo "secret" > "$B/rootfs/data/denied"; chmod 644 "$B/rootfs/data/"*
@@ -212,7 +212,7 @@ printf 'require warden 1.24\nallow path /data/allowed readonly\nallow host examp
 # a bundle: NAME POLICY-SOCKET ARGV0 NNP [UID]
 bundle() {
     mkdir -p "$B/bundles/v1340-$1" && (cd "$B/bundles/v1340-$1" && "$RUNC" spec >/dev/null)
-    python3 - "$B/b-$1/config.json" "$B/f/oci.json" "$2" "$3" "$4" "$ARCH" "$B/rootfs" "${5:-65534}" "${6:-}" <<'PY'
+    python3 - "$B/bundles/v1340-$1/config.json" "$B/f/oci.json" "$2" "$3" "$4" "$ARCH" "$B/rootfs" "${5:-65534}" "${6:-}" <<'PY'
 import json, sys
 cfg, flt, sock, argv0, nnp, arch, root, uid, caps = sys.argv[1:]
 c = json.load(open(cfg)); f = json.load(open(flt))
@@ -256,7 +256,7 @@ PY
 # container's own, as a runtime gives one: SOCKET ID MODE [CGROUP-ID [BUNDLE]]
 rtrun() {
     local id="$2" cg="${4:-$2}" bd="${5:-$B/bundles/$2}"
-    mkdir -p "$CG/$cg"
+    mkdir -p "$CGROOT/$cg"
     [ -e "$bd" ] || mkdir -p "$bd"
     [ -e "$bd/config.json" ] || echo '{"annotations":{}}' > "$bd/config.json"
     VAREK_RT_BUNDLE="$bd" VAREK_RT_CGROUP="varek-v1340/$cg" "$B/rt" "$1" "$2" "$3"
@@ -511,7 +511,7 @@ PY
         local name="$1" sock="$2" filt="$3" ann="$4" args="$5"
         shift 5
         mkdir -p "$B/bundles/v1340-$name" && (cd "$B/bundles/v1340-$name" && "$RUNC" spec >/dev/null)
-        python3 - "$B/b-$name/config.json" "$filt" "$sock" "$ARCH" "$B" "$ann" "$args" "$@" <<'PY'
+        python3 - "$B/bundles/v1340-$name/config.json" "$filt" "$sock" "$ARCH" "$B" "$ann" "$args" "$@" <<'PY'
 import json, sys
 cfg, flt, sock, arch, B, ann, args = sys.argv[1:8]
 opts = set(sys.argv[8:])
@@ -671,7 +671,7 @@ PY
     SERVERS="$SERVERS $!"
     for _ in $(seq 50); do [ -e "$B/dns.ready" ] && grep -q 'Serving HTTP' "$B/http.out" 2>/dev/null && break; sleep 0.1; done
     in_pod() {   # the bundle NAME joins the pod's network namespace
-        python3 - "$B/b-$1/config.json" "$B/netns" <<'PY'
+        python3 - "$B/bundles/v1340-$1/config.json" "$B/netns" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1]))
 c["linux"]["namespaces"] = [n for n in c["linux"]["namespaces"] if n["type"] != "network"] + [{"type": "network", "path": sys.argv[2]}]

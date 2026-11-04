@@ -18,7 +18,8 @@
 #
 #   sudo varek/v1_4/tests/v1340_sweep.sh [--out DIR] [--runc PATH] [--only host|node] [SUITE...]
 #
-# Needs root, runc (or RUNC), python3, overlayfs and what the suites need.
+# Needs root, runc (or RUNC), python3, overlayfs, cgroup v2 (the node run)
+# and what the suites need.
 # Writes DIR/{host,node}/SUITE.log, DIR/calls.jsonl (each Warden call of the
 # node run, carried or passed through, with why) and DIR/summary.txt
 # (default /var/tmp/varek-sweep-<time>); VAREK_SWEEP_KEEP=1 keeps each
@@ -42,6 +43,9 @@ done
 [ -n "$RUNC" ] || RUNC="$(command -v runc || true)"
 [ -n "$RUNC" ] && [ -x "$RUNC" ] || { echo "v1340_sweep.sh: runc is needed (RUNC)" >&2; exit 2; }
 command -v python3 > /dev/null || { echo "v1340_sweep.sh: python3 is needed" >&2; exit 2; }
+# v1.36.3 (D1): the node agent confirms each container by its cgroup v2 line
+[ "$ONLY" = host ] || [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = cgroup2fs ] ||
+    { echo "v1340_sweep.sh: the node run needs cgroup v2 at /sys/fs/cgroup" >&2; exit 2; }
 OUT="${OUT:-/var/tmp/varek-sweep-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT/host" "$OUT/node"
 # its own directory on the root file system (not /tmp: the container's /tmp
@@ -50,6 +54,9 @@ W="$(mktemp -d /var/lib/varek-sweep.XXXXXX)"; chmod 755 "$W"
 cleanup() {
     umount -l "$W/hostroot" 2>/dev/null; umount -l "$W/ovl" 2>/dev/null
     for r in "$W"/inv/*/state; do [ -d "$r" ] && for c in "$r"/*; do [ -e "$c" ] && "$RUNC" --root "$r" delete -f "${c##*/}" >/dev/null 2>&1; done; done
+    # the containers' cgroups (tests/v1340_pod.py: varek-sweep-<W's suffix>/pod<n>/sweep-<n>)
+    G="/sys/fs/cgroup/varek-sweep-${W##*.}"
+    [ -d "$G" ] && { rmdir "$G"/*/* "$G"/* "$G" 2>/dev/null; }
     if [ -n "${VAREK_SWEEP_KEEP:-}" ]; then echo "kept $W"; else rm -rf "$W"; fi
 }
 trap cleanup EXIT

@@ -137,7 +137,9 @@ int main(int argc, char **argv) {
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0) _exit(1);
         pid_t c = fork();
         if (c < 0) _exit(1);
-        if (c == 0) { close(sp[0]); container(sp[1], call); }
+        // the pipe's end not held by the container: a runtime that ends
+        // early is then seen to (its parent's read ends), not waited on
+        if (c == 0) { close(sp[0]); close(pp[1]); container(sp[1], call); }
         close(sp[1]);
         int l = recv_fd(sp[0]);
         const char *cgp = getenv("VAREK_RT_CGROUP"), *bundle = getenv("VAREK_RT_BUNDLE");
@@ -148,6 +150,7 @@ int main(int argc, char **argv) {
             FILE *cf = fopen(f, "w");
             if (!cf || fprintf(cf, "%d\n", (int)(o ? o : c)) < 0 || fclose(cf) != 0) {
                 fprintf(stderr, "v1340_runtime: cannot put %d in %s\n", (int)(o ? o : c), d);
+                kill(c, SIGKILL);
                 _exit(1);
             }
         }
