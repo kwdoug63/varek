@@ -905,6 +905,13 @@ check "$BURST supervised pods created at once: each supervised (the launcher fir
 check "... the node agent refused none of their containers" sh -c "[ $(count_new 'a connection refused') = 0 ]"
 kubectl -n team-a delete pods $(seq -f 'burst-%g' "$BURST") --wait=false > /dev/null 2>&1
 
+# v1.36.3 measurements (docs/security/v1.36.3-bundle-confirmation.md, M1 to
+# M4), report only: the node agent's line for each container it admitted,
+# in the job's log
+kubectl -n "$NS" logs ds/varek-node -c node-agent 2>/dev/null | grep 'MEASURE v1.36.3' > "$OUT/measure-v1363.log" || true
+say "  v1.36.3 measurements: $(wc -l < "$OUT/measure-v1363.log") containers admitted"
+sed 's/^.*MEASURE v1.36.3 /MEASURE v1.36.3 /' "$OUT/measure-v1363.log"
+
 echo
 [ "$fail" = 0 ] && say "v1340_kind: PASS" || say "v1340_kind: FAIL"
 [ "$fail" = 0 ]

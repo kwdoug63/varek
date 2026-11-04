@@ -6,7 +6,7 @@ be true before VAREK is offered as production software, and what the
 first pilots need from it. Each piece that changes code still gets its own
 design note before it is built.
 **Author:** Kenneth Wayne Douglas, MD
-**Last updated:** October 30, 2026 (Central)
+**Last updated:** November 4, 2026 (Central)
 
 The question (October 29, 2026) was what is left after v1.37 before VAREK
 is ready to sell, with the market reached by customers, not by raising
@@ -38,6 +38,27 @@ repository: a CI run, a report, or a document.
 
 R1 and R8 are the ones money cannot buy quickly, so they start now, with
 the design partners (below), alongside the rest.
+
+## Status (November 4, 2026)
+
+After v1.36.2. Each row says what exists in the repository; nothing on the
+plan has been marked done that does not.
+
+| # | Status | What exists, and what is next |
+|---|---|---|
+| R1 | Started | The proxy's parsers fuzzed under ASan and UBSan in CI; `SECURITY.md` invites bypass reports against `bypass-classes.md` (item 5). Next: the node agent's JSON fuzz target, CodeQL. No outside review yet |
+| R2 | Not started | The 24-hour runs on EKS (amd64 and Graviton) and single-node OpenShift, and the 20-pod burst check; none of section 2's tests |
+| R3 | Partly | The soak reports hold memory and decision times; not one table per release |
+| R4 | Not started | Upgrade steps are in each release's notes; no test with pods running |
+| R5 | Partly | `SECURITY.md` (November 4): scope by component, severity, response times, the supported versions and the advisory process. Next: the runbook and the limits page |
+| R6 | Planned | v1.37, in the first pilot's order |
+| R7 | Not timed | The charts install on EKS and OpenShift; both images, and the `varek` chart, are Red Hat certified (1.36.1 and 1.36.2); VAREK Enterprise's RHEL 9 certification is in testing |
+| R8 | Not recorded here | Kept outside the repository, as section 5 says |
+| R9 | Step 1 of 3 | `docs/security/node-agent-privilege.md` (October 30). Next: the named set of capabilities, with the step 12 items |
+
+Section 4's first item, confirming a tied connection's bundle, is the next
+code change: it is a security finding, and it needs no pilot. Its design
+note is `docs/security/v1.36.3-bundle-confirmation.md` (for decision).
 
 ## 1. Assurance (R1)
 
@@ -199,28 +220,59 @@ counts as:
 
 ## Order and why
 
-1. **Now, while v1.36 is tagged:** start the design partners (R8 takes the
-   longest), and the assurance items 1 to 5 (free, and the first thing a
-   pilot's security team looks for).
-2. **v1.36's three open items**, first the bundle confirmation, since it
-   is a security finding and the pilots' testers would find it; with them,
-   the node agent's named capability set (R9), since both change the node
-   agent and are measured on the same matrix.
-3. **Scale and churn and operations**, together: the tests produce the
-   overhead table, and the runbook comes from what they break.
-4. **v1.37**, in the order the first pilot asks for.
-5. **The compliance pages**, with the pilots.
-6. **OSTIF and the Sovereign Tech Agency** once items 1 to 4 are green;
-   **the paid review** at the first contract.
+Two milestones, since most of the time is not VAREK's to spend: what VAREK
+builds and runs sets the first; the pilots and the reviewers set the
+second. (Revised November 4, 2026. The first version targeted all of it
+for about twelve weeks after v1.36.0, about January 23, 2027; that date
+stays the outer bound.)
 
-Ready (every row of the table true) is targeted for about twelve weeks
-after v1.36.0 is tagged: about four for the open items and the assurance
-items, about four for scale, churn and operations alongside v1.37, and the
-rest for the pilots to finish. The pilots set the real date.
+### Milestone 1: ready for a pilot (about December 2, 2026)
+
+Everything in it is VAREK's own work, in this order:
+
+1. **v1.36.3** (about November 13): the bundle confirmation
+   (`docs/security/v1.36.3-bundle-confirmation.md`), measured on the
+   matrix first, with its advisory; the webhook's hostPath refusal with
+   it, if decided.
+2. **The free assurance items**, alongside v1.36.3: the fuzz targets
+   (the node agent's JSON first), CodeQL, OpenSSF Scorecard and the Best
+   Practices badge, the weekly ASan and UBSan run. `SECURITY.md`, which
+   item 5 and R5 need, is done (November 4).
+3. **v1.37's first steps** (about November 20 to 27): the accept loop's
+   5 s receive, the named set of capabilities (R9 step 2), the plugin's
+   memory on OpenShift; measured on the same matrix.
+4. **Scale, churn and upgrades** (section 2), on EKS, in the same weeks:
+   their numbers make the overhead table (R3), and the runbook and the
+   limits page (R5) are written from what they break. The 7-day run
+   starts once the tests pass, and runs in the background.
+5. **The timed install** (R7) on EKS and OpenShift, last, on the build
+   the pilots will get.
+
+When these are done, rows R2 to R5, R7 and R9 hold, and R1 holds its
+free items. That is what a pilot's security team tests.
+
+### Milestone 2: every row true (set by the pilots; not before mid-January 2027)
+
+- **R8.** A pilot succeeds after 30 days under policy (section 5), so a
+  pilot that starts by mid-November finishes no earlier than
+  mid-December, and two are needed, one with a reference. Finding them
+  starts now; it is the longest part.
+- **R1.** At least one outside review: a pilot's security team's
+  findings, or OSTIF or the Sovereign Tech Agency once the free items are
+  green, or the paid review at the first contract.
+- **R6.** v1.37's integrations, in the order the first pilot asks for.
+- **The compliance pages**, with the pilots' compliance teams.
+
+R8 is a sales milestone, not a product one: VAREK can be offered to
+design partners from milestone 1. The plan's dates are estimates; each
+release's notes say what was measured, and this section is revised when
+one slips.
 
 ## Decided
 
-- Nothing yet. This plan is new (October 29, 2026).
+- **The support window** (November 4, 2026): the latest release line and
+  the one before get security fixes, as patch releases. `SECURITY.md`
+  says so, with the versions.
 
 ## Decisions open, with recommendations
 
@@ -234,9 +286,6 @@ rest for the pilots to finish. The pilots set the real date.
 - **The pilots' terms**: free, and a first-year discount (recommended), or
   paid at a low fixed price, which tests willingness to pay sooner but
   finds fewer partners.
-- **The support window**: the latest release and the one before
-  (recommended), or a long-term release line once there is a paying
-  customer to hold it for.
 - **Whether to publish the overhead before the pilots** (recommended: yes;
   a buyer will measure it anyway).
 
