@@ -25,8 +25,8 @@ and `docs/security/v1.36.3-bundle-confirmation.md`.
   is that id's under the runtime's directory (`--node-bundle-root`; the
   chart gives the one under `node.state`), named through no link, and that
   the annotations it reads are the bundle's `config.json`'s; otherwise the
-  connection is refused. A GitHub advisory, with a CVE, is published with
-  the release.
+  connection is refused. Advisory GHSA-pcxh-jj4w-2jcc (High, 7.2),
+  published with the release; its CVE has been requested.
 - The admission webhook refuses a pod it serves that mounts the node
   agent's socket's directory, or one above it, as a hostPath
   (`-node-socket-dir`, which the chart sets).

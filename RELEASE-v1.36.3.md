@@ -63,8 +63,9 @@ node may have run a pod with a hostPath of the socket's directory
 recorded there by v1.36.0 to v1.36.2 with `varek audit --node-keys`, and
 check that each stream's `run_start` names the pod that ran.
 
-**Advisory:** a GitHub security advisory, with a CVE, published with this
-release.
+**Advisory:** GHSA-pcxh-jj4w-2jcc, published with this release
+(https://github.com/kwdoug63/varek/security/advisories/GHSA-pcxh-jj4w-2jcc);
+its CVE has been requested and is added here when it is assigned.
 
 ## What changes for an operator
 
