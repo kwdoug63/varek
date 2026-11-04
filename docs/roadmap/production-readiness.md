@@ -6,7 +6,7 @@ be true before VAREK is offered as production software, and what the
 first pilots need from it. Each piece that changes code still gets its own
 design note before it is built.
 **Author:** Kenneth Wayne Douglas, MD
-**Last updated:** October 30, 2026 (Central)
+**Last updated:** November 4, 2026 (Central)
 
 The question (October 29, 2026) was what is left after v1.37 before VAREK
 is ready to sell, with the market reached by customers, not by raising
@@ -38,6 +38,26 @@ repository: a CI run, a report, or a document.
 
 R1 and R8 are the ones money cannot buy quickly, so they start now, with
 the design partners (below), alongside the rest.
+
+## Status (November 4, 2026)
+
+After v1.36.2. Each row says what exists in the repository; nothing on the
+plan has been marked done that does not.
+
+| # | Status | What exists, and what is next |
+|---|---|---|
+| R1 | Started | The proxy's parsers fuzzed under ASan and UBSan in CI; `SECURITY.md` invites bypass reports against `bypass-classes.md` (item 5). Next: the node agent's JSON fuzz target, CodeQL. No outside review yet |
+| R2 | Not started | The 24-hour runs on EKS (amd64 and Graviton) and single-node OpenShift, and the 20-pod burst check; none of section 2's tests |
+| R3 | Partly | The soak reports hold memory and decision times; not one table per release |
+| R4 | Not started | Upgrade steps are in each release's notes; no test with pods running |
+| R5 | Partly | `SECURITY.md` (November 4): scope by component, severity, response times, the supported versions and the advisory process. Next: the runbook and the limits page |
+| R6 | Planned | v1.37, in the first pilot's order |
+| R7 | Not timed | The charts install on EKS and OpenShift; both images, and the `varek` chart, are Red Hat certified (1.36.1 and 1.36.2); VAREK Enterprise's RHEL 9 certification is in testing |
+| R8 | Not recorded here | Kept outside the repository, as section 5 says |
+| R9 | Step 1 of 3 | `docs/security/node-agent-privilege.md` (October 30). Next: the named set of capabilities, with the step 12 items |
+
+Section 4's first item, confirming a tied connection's bundle, is the next
+code change: it is a security finding, and it needs no pilot.
 
 ## 1. Assurance (R1)
 
@@ -220,7 +240,9 @@ rest for the pilots to finish. The pilots set the real date.
 
 ## Decided
 
-- Nothing yet. This plan is new (October 29, 2026).
+- **The support window** (November 4, 2026): the latest release line and
+  the one before get security fixes, as patch releases. `SECURITY.md`
+  says so, with the versions.
 
 ## Decisions open, with recommendations
 
@@ -234,9 +256,6 @@ rest for the pilots to finish. The pilots set the real date.
 - **The pilots' terms**: free, and a first-year discount (recommended), or
   paid at a low fixed price, which tests willingness to pay sooner but
   finds fewer partners.
-- **The support window**: the latest release and the one before
-  (recommended), or a long-term release line once there is a paying
-  customer to hold it for.
 - **Whether to publish the overhead before the pilots** (recommended: yes;
   a buyer will measure it anyway).
 

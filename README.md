@@ -699,7 +699,7 @@ verify_guardrails.py` (see above).
 
 **Reporting vulnerabilities.** Do not open public issues. Use
 [GitHub private vulnerability reporting](https://github.com/kwdoug63/varek/security/advisories/new)
-or [SECURITY.md](./SECURITY.md). Reports receive acknowledgment within 72 hours.
+or [SECURITY.md](./SECURITY.md). Reports are acknowledged within 48 hours.
 
 **Threat model and trusted computing base.** Adversary models, in-scope
 guarantees, and out-of-scope conditions are documented in
