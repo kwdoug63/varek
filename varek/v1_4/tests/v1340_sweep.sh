@@ -54,8 +54,8 @@ W="$(mktemp -d /var/lib/varek-sweep.XXXXXX)"; chmod 755 "$W"
 cleanup() {
     umount -l "$W/hostroot" 2>/dev/null; umount -l "$W/ovl" 2>/dev/null
     for r in "$W"/inv/*/state; do [ -d "$r" ] && for c in "$r"/*; do [ -e "$c" ] && "$RUNC" --root "$r" delete -f "${c##*/}" >/dev/null 2>&1; done; done
-    # the containers' cgroups (tests/v1340_pod.py: varek-sweep-<W's suffix>/pod<n>/sweep-<n>)
-    G="/sys/fs/cgroup/varek-sweep-${W##*.}"
+    # the containers' cgroups (tests/v1340_pod.py: v1340-sweep-<W's suffix>/pod<n>/sweep-<n>)
+    G="/sys/fs/cgroup/v1340-sweep-${W##*.}"
     [ -d "$G" ] && { rmdir "$G"/*/* "$G"/* "$G" 2>/dev/null; }
     if [ -n "${VAREK_SWEEP_KEEP:-}" ]; then echo "kept $W"; else rm -rf "$W"; fi
 }

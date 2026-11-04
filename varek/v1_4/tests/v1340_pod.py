@@ -88,7 +88,9 @@ import time
 ENV = os.environ
 D = ENV.get("VAREK_SWEEP_DIR", "")
 BUNDLES = os.path.join(D, "bundles")
-CGROUP = "/sys/fs/cgroup/varek-sweep-" + os.path.basename(D).rsplit(".", 1)[-1] if D else ""
+# the containers' cgroups: not named varek-*, which test_v1281 reads as the
+# Warden's own run groups left behind at the cgroup root
+CGROUP = "/sys/fs/cgroup/v1340-sweep-" + os.path.basename(D).rsplit(".", 1)[-1] if D else ""
 WARDEN = ENV.get("VAREK_SWEEP_WARDEN", "")
 LAUNCHER = ENV.get("VAREK_SWEEP_LAUNCHER", "")
 RUNC = ENV.get("VAREK_SWEEP_RUNC", "runc")
