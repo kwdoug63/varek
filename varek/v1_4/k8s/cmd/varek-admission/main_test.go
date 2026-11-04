@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -941,5 +942,48 @@ func TestVarekNodeKey(t *testing.T) {
 	}
 	if ok, _ := ask("DELETE", &kube.NodeKey{}, nil, "kubernetes-admin", ""); !ok {
 		t.Error("an administrator's removal of a key refused")
+	}
+}
+
+// v1.36.3 (D6): no pod the webhook serves mounts the node agent's socket's
+// directory, or one above it, as a hostPath, whether it names a policy or not
+func TestPodSocketMount(t *testing.T) {
+	s := testServer(t, "")
+	s.socketDir = "/run/varek-node"
+	hp := func(paths ...string) func(*pod) {
+		return func(p *pod) {
+			var vs []map[string]interface{}
+			for i, x := range paths {
+				vs = append(vs, map[string]interface{}{"name": fmt.Sprintf("v%d", i), "hostPath": map[string]string{"path": x}})
+			}
+			b, _ := json.Marshal(vs)
+			if err := json.Unmarshal(b, &p.Spec.Volumes); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, c := range []struct {
+		what, policy string
+		edit         func(*pod)
+		why          string
+	}{
+		{"the socket's directory", "agent", hp("/run/varek-node"), "mounts the node's /run/varek-node"},
+		{"... named with a trailing slash", "agent", hp("/run/varek-node/"), "VAREK's node agent's socket"},
+		{"a directory above it", "agent", hp("/run"), "mounts the node's /run"},
+		{"the node's root", "agent", hp("/"), "mounts the node's /"},
+		{"... through /var/run", "agent", hp("/var/run/varek-node"), "mounts the node's /var/run/varek-node"},
+		{"a pod naming no policy, too", "", hp("/run"), "VAREK's node agent's socket"},
+		{"another hostPath, beside it", "agent", hp("/var/log/app", "/run/varek-node2"), ""},
+		{"a directory below another of /run", "", hp("/run/containerd"), ""},
+		{"no hostPath", "agent", nil, ""},
+	} {
+		ok, msg := post(t, s, "/pod", "team-a", agentPod(c.policy, c.edit))
+		if ok != (c.why == "") || !strings.Contains(msg, c.why) {
+			t.Errorf("%s: allowed %v, %q", c.what, ok, msg)
+		}
+	}
+	s.socketDir = ""
+	if ok, msg := post(t, s, "/pod", "team-a", agentPod("agent", hp("/run"))); !ok {
+		t.Errorf("no -node-socket-dir: refused %q", msg)
 	}
 }

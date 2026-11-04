@@ -136,6 +136,14 @@
 #      retired before the run began refused (by the node's clock, or by the
 #      anchor host's receive time); refused at the start: a key's directory
 #      others may write, a key others may read, one that is not a key.
+# v1.36.3 (docs/security/v1.36.3-bundle-confirmation.md, D1 to D4, D7):
+#  16. the container a connection names: a stand-in runtime naming another
+#      container (its id, its bundle) for a process in a cgroup of its own,
+#      by each way the node agent takes a runtime (ended and read, reaped,
+#      in a mount namespace of its own): refused, the process not ended, no
+#      stream under that id; a bundle outside the runtime's directory, or
+#      named through a link: refused; the state's annotations not its
+#      bundle's config.json's: refused in its supervisor.
 #
 #   test_v1340.sh VDP_CHECK VDP_CERT_CHECK WARDEN [VAREK_INIT]
 set -u
@@ -153,11 +161,13 @@ skip()  { printf '  SKIP   %s\n' "$1"; skips=$((skips + 1)); }
 check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else flunk "$d"; fi; }
 RUNC="${RUNC:-$(command -v runc || true)}"
 [ -z "$RUNC" ] && [ -x /usr/libexec/crio/runc ] && RUNC=/usr/libexec/crio/runc
-B="" AGENTS="" SERVERS=""
+B="" AGENTS="" SERVERS="" CG=/sys/fs/cgroup/varek-v1340
 cleanup() {
     for a in $AGENTS $SERVERS; do kill "$a" 2>/dev/null; done
     [ -n "$B" ] && [ -e "$B/netns" ] && umount "$B/netns" 2>/dev/null
     if [ -n "$B" ]; then for c in "$B"/state/*; do [ -e "$c" ] && "$RUNC" --root "$B/state" delete -f "${c##*/}" >/dev/null 2>&1; done; fi
+    # v1.36.3: the containers' cgroups (D1), the deepest first
+    [ -n "$B" ] && [ -d "$CG" ] && find "$CG" -depth -type d -exec rmdir {} \; 2>/dev/null
     [ -n "${KEEP:-}" ] && echo "kept $B" || { [ -n "$B" ] && rm -rf "$B"; }
 }
 trap cleanup EXIT
@@ -170,20 +180,27 @@ if [ -z "$WARDEN" ]; then skip "the options (needs the warden binary)"; else
         "'$WARDEN' /dev/null --node-agent /tmp/x.sock --node-streams /tmp --writable-exec; [ \$? = 2 ]"
     check "--node-launcher without --node-agent is refused" sh -c "'$WARDEN' /dev/null --node-launcher /bin/true -- /bin/true; [ \$? = 2 ]"
     check "--oci-filter with an agent to start is refused" sh -c "'$WARDEN' /dev/null --oci-filter -- /bin/true; [ \$? = 2 ]"
+    check "--node-bundle-root without --node-agent is refused (v1.36.3)" sh -c \
+        "'$WARDEN' /dev/null --node-bundle-root /run/x -- /bin/true; [ \$? = 2 ]"
+    check "... and one that is not an absolute path" sh -c \
+        "'$WARDEN' /dev/null --node-agent /tmp/x.sock --node-streams /tmp --node-bundle-root run/x; [ \$? = 2 ]"
 fi
 
 case "$(uname -m)" in x86_64) ARCH=SCMP_ARCH_X86_64 ;; aarch64) ARCH=SCMP_ARCH_AARCH64 ;; *) ARCH="" ;; esac
+# v1.36.3 (D1): the node agent confirms a container by its cgroup, cgroup v2's
 if [ "$(id -u)" != 0 ] || [ -z "$WARDEN" ] || [ -z "$RUNC" ] || [ -z "$ARCH" ] || ! command -v python3 >/dev/null ||
+   [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" != cgroup2fs ] ||
    ! gcc -static -O2 -o /tmp/varek_v1340_probe.$$ "$HERE/tests/v1340_probe.c" -lpthread 2>/dev/null ||
    ! gcc -O2 -I"$HERE" -o /tmp/varek_v1340_ocif.$$ "$HERE/tests/v1340_oci_filter.c" -lseccomp 2>/dev/null ||
    ! gcc -O2 -o /tmp/varek_v1340_rt.$$ "$HERE/tests/v1340_runtime.c" 2>/dev/null; then
     rm -f /tmp/varek_v1340_probe.$$ /tmp/varek_v1340_ocif.$$ /tmp/varek_v1340_rt.$$
-    skip "containers under the node agent (need root, the warden, runc, python3, a static gcc and libseccomp)"
+    skip "containers under the node agent (need root, cgroup v2, the warden, runc, python3, a static gcc and libseccomp)"
     echo; [ "$fail" = 0 ] && echo "test_v1340: PASS ($skips skipped)" || echo "test_v1340: FAIL"; [ "$fail" = 0 ]; exit
 fi
 B="$(mktemp -d /tmp/varek_v1340.XXXXXX)"; chmod 755 "$B"
 mkdir -p "$B/streams" "$B/state" "$B/f" "$B/rootfs/data" "$B/rootfs/proc" "$B/rootfs/dev" "$B/rootfs/tmp"
 mkdir -m 700 "$B/s"                          # the sockets' directory: root's alone
+mkdir -p "$B/bundles" "$CG"                  # v1.36.3: the runtime's bundles (D2), the containers' cgroups (D1)
 mv /tmp/varek_v1340_probe.$$ "$B/rootfs/probe"; mv /tmp/varek_v1340_ocif.$$ "$B/ocif"; mv /tmp/varek_v1340_rt.$$ "$B/rt"
 chmod 755 "$B/rootfs/probe"
 echo "allowed content" > "$B/rootfs/data/allowed"; echo "secret" > "$B/rootfs/data/denied"; chmod 644 "$B/rootfs/data/"*
@@ -194,14 +211,16 @@ printf 'require warden 1.24\nallow path /data/allowed readonly\nallow host examp
 
 # a bundle: NAME POLICY-SOCKET ARGV0 NNP [UID]
 bundle() {
-    mkdir -p "$B/b-$1" && (cd "$B/b-$1" && "$RUNC" spec >/dev/null)
+    mkdir -p "$B/bundles/v1340-$1" && (cd "$B/bundles/v1340-$1" && "$RUNC" spec >/dev/null)
     python3 - "$B/b-$1/config.json" "$B/f/oci.json" "$2" "$3" "$4" "$ARCH" "$B/rootfs" "${5:-65534}" "${6:-}" <<'PY'
 import json, sys
 cfg, flt, sock, argv0, nnp, arch, root, uid, caps = sys.argv[1:]
 c = json.load(open(cfg)); f = json.load(open(flt))
 f.pop("warden_badarch", None); f["architectures"] = [arch]
 for s in f["syscalls"]: s.pop("nr", None)
-f["listenerPath"] = sock; f["listenerMetadata"] = "varek-test/" + cfg.split("/")[-2]
+d = cfg.split("/")[-2]
+f["listenerPath"] = sock; f["listenerMetadata"] = "varek-test/b-" + d[len("v1340-"):]
+c["linux"]["cgroupsPath"] = "/varek-v1340/" + d      # v1.36.3 (D1): its own cgroup, named by its id
 c["process"].update(terminal=False, args=argv0.split(), env=["PATH=/"], user={"uid": int(uid), "gid": int(uid)},
                     noNewPrivileges=nnp == "1", cwd="/")
 c["root"] = {"path": root, "readonly": True}
@@ -216,12 +235,13 @@ agent() {
     local n="$1" pol="$2"
     shift 2
     mkdir -p "$B/streams-$n"
-    "$WARDEN" "$pol" --node-agent "$B/s/$n.sock" --node-streams "$B/streams-$n" "$@" > "$B/$n.log" 2>&1 &
+    "$WARDEN" "$pol" --node-agent "$B/s/$n.sock" --node-streams "$B/streams-$n" --node-bundle-root "$B/bundles" "$@" \
+        > "$B/$n.log" 2>&1 &
     AGENTS="$AGENTS $!"
     for _ in $(seq 50); do [ -S "$B/s/$n.sock" ] && return 0; sleep 0.1; done
     return 1
 }
-run() { (cd "$B/b-$1" && timeout 60 "$RUNC" --root "$B/state" run "v1340-$1" > "$B/$1.out" 2>&1); echo $? > "$B/$1.rc"; sleep 0.5; }
+run() { (cd "$B/bundles/v1340-$1" && timeout 60 "$RUNC" --root "$B/state" run "v1340-$1" > "$B/$1.out" 2>&1); echo $? > "$B/$1.rc"; sleep 0.5; }
 stream() { ls "$B/streams-$1"/v1340-$2.*.jsonl 2>/dev/null | head -1; }
 said() { grep -qx "$2" "$B/$1.out"; }
 rec() { python3 - "$(stream "$1" "$2")" "$3" <<'PY'
@@ -230,6 +250,16 @@ recs = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
 sys.exit(0 if eval(sys.argv[2], {"R": recs, "S": [r for r in recs if r.get("event") == "run_start"],
                                   "E": [r for r in recs if r.get("event") == "run_end"]}) else 1)
 PY
+}
+
+# v1.36.3 (D1, D2): the stand-in runtime with a bundle and a cgroup of the
+# container's own, as a runtime gives one: SOCKET ID MODE [CGROUP-ID [BUNDLE]]
+rtrun() {
+    local id="$2" cg="${4:-$2}" bd="${5:-$B/bundles/$2}"
+    mkdir -p "$CG/$cg"
+    [ -e "$bd" ] || mkdir -p "$bd"
+    [ -e "$bd/config.json" ] || echo '{"annotations":{}}' > "$bd/config.json"
+    VAREK_RT_BUNDLE="$bd" VAREK_RT_CGROUP="varek-v1340/$cg" "$B/rt" "$1" "$2" "$3"
 }
 
 echo "== 2. a container under the node agent =="
@@ -324,13 +354,13 @@ check "... and the process it names is not killed" kill -0 "$VICTIM"
 # sent ties them (crun under CRI-O, OpenShift's runtime, is reaped so when
 # two containers start together); until then nothing is done for it, and a
 # container not tied so is refused, not ended
-"$B/rt" "$B/s/a.sock" gone zombie > "$B/rt.out" 2>&1; rrc=$?
+rtrun "$B/s/a.sock" gone zombie > "$B/rt.out" 2>&1; rrc=$?
 for _ in $(seq 100); do cat "$B"/streams-a/gone.*.jsonl 2>/dev/null | grep -q 'container gone refused' && break; sleep 0.1; done
 check "a runtime that ended once it sent the state, not yet reaped: its child taken" sh -c \
-    "[ $rrc = 0 ] && cat '$B'/streams-a/gone.*.jsonl | grep -q 'container gone refused: cannot read the bundle'"
+    "[ $rrc = 0 ] && cat '$B'/streams-a/gone.*.jsonl | grep -q \"container gone refused: the container's command must be named by an absolute path\""
 check "... and the node agent's log says it was taken by the runtime's parent" \
     grep -q "the runtime (pid [0-9]*) ended before it could be read; its container's process $(head -1 "$B/rt.out" 2>/dev/null) taken by the runtime's parent" "$B/a.log"
-"$B/rt" "$B/s/a.sock" reaped reaped > "$B/rt2.out" 2>&1; rrc2=$?
+rtrun "$B/s/a.sock" reaped reaped > "$B/rt2.out" 2>&1; rrc2=$?
 P2="$(head -1 "$B/rt2.out" 2>/dev/null)"
 for _ in $(seq 100); do grep -q "the process the state names ($P2) ended before a call came" "$B/a.log" && break; sleep 0.1; done
 check "a runtime reaped before it could be read, its child making no call: not taken (it waits for its first call)" \
@@ -341,28 +371,28 @@ check "... nothing done for it until then (no stream), it ending before a call: 
 # v1.36 step 12: the same, its child calling once it has sent its listener
 # (as a container's init does, ahead of its command): taken by that call,
 # its supervisor going on to the bundle the stand-in lacks
-"$B/rt" "$B/s/a.sock" called reaped-call > "$B/rt4.out" 2>&1; rrc4=$?
+rtrun "$B/s/a.sock" called reaped-call > "$B/rt4.out" 2>&1; rrc4=$?
 P4="$(head -1 "$B/rt4.out" 2>/dev/null)"
 for _ in $(seq 100); do cat "$B"/streams-a/called.*.jsonl 2>/dev/null | grep -q 'container called refused' && break; sleep 0.1; done
 check "a runtime reaped before it could be read, its child calling: taken by its first call (the kernel's tie)" \
     grep -q "the runtime (pid [0-9]*) was reaped before it could be read; its container's process $P4 taken by its first call" "$B/a.log"
 check "... its supervisor set up after it (its stream), the call held for it" sh -c \
-    "[ $rrc4 = 0 ] && cat '$B'/streams-a/called.*.jsonl | grep -q 'container called refused: cannot read the bundle'"
+    "[ $rrc4 = 0 ] && cat '$B'/streams-a/called.*.jsonl | grep -q \"container called refused: the container's command must be named by an absolute path\""
 # the runtime in a mount namespace of its own, read while it runs (runc
 # 1.2 and later as it creates a container: the matrix's containerd cells,
 # pods started together), its child calling: taken by that call
-"$B/rt" "$B/s/a.sock" privns private-call > "$B/rt9.out" 2>&1; rrc9=$?
+rtrun "$B/s/a.sock" privns private-call > "$B/rt9.out" 2>&1; rrc9=$?
 P9="$(head -1 "$B/rt9.out" 2>/dev/null)"
 for _ in $(seq 100); do cat "$B"/streams-a/privns.*.jsonl 2>/dev/null | grep -q 'container privns refused' && break; sleep 0.1; done
 check "a runtime read in a mount namespace of its own, its child calling: taken by its first call" \
     grep -q "the runtime (pid [0-9]*) ran in a mount namespace of its own; its container's process $P9 taken by its first call" "$B/a.log"
 check "... its supervisor set up after it (its stream)" sh -c \
-    "[ $rrc9 = 0 ] && cat '$B'/streams-a/privns.*.jsonl | grep -q 'container privns refused: cannot read the bundle'"
+    "[ $rrc9 = 0 ] && cat '$B'/streams-a/privns.*.jsonl | grep -q \"container privns refused: the container's command must be named by an absolute path\""
 # a root process that reaches the socket names another process (under a
 # filter of its own, the shim's child) and sends a listener of its own
 # child's, which calls, then ends at once: refused at that call, the
 # process it named not ended, no stream
-"$B/rt" "$B/s/a.sock" forged2 forged > "$B/rt5.out" 2>&1; rrc5=$?
+rtrun "$B/s/a.sock" forged2 forged > "$B/rt5.out" 2>&1; rrc5=$?
 P5="$(head -1 "$B/rt5.out" 2>/dev/null)"
 for _ in $(seq 100); do grep -q "not from the process the state names ($P5)" "$B/a.log" && break; sleep 0.1; done
 check "a state naming another process, sent with a listener of its own: refused at the first call (not that process's)" \
@@ -373,15 +403,15 @@ check "... the process it named not ended, nothing done for it (no stream)" sh -
 # container at a time (VAREK_WARDEN_TEST_TIES): no call in that time, refused
 # (not ended); a second while one waits, refused (not ended)
 VAREK_WARDEN_TEST_TIE_MS=2500 VAREK_WARDEN_TEST_TIES=1 agent t "$B/p.txt"
-"$B/rt" "$B/s/t.sock" quiet reaped > "$B/rt6.out" 2>&1; rrc6=$?
+rtrun "$B/s/t.sock" quiet reaped > "$B/rt6.out" 2>&1; rrc6=$?
 P6="$(head -1 "$B/rt6.out" 2>/dev/null)"
 check "a container reaped before it could be read, no call within the time: refused, not ended" sh -c \
     "[ $rrc6 = 0 ] && grep -q 'and no call came on the listener sent within 2500 ms: nothing ties it to the process the state names ($P6), refused' '$B/t.log' &&
      grep -qx 'alive yes' '$B/rt6.out' && ! ls '$B'/streams-t/quiet.* > /dev/null 2>&1"
-"$B/rt" "$B/s/t.sock" first reaped > "$B/rt7.out" 2>&1 &
+rtrun "$B/s/t.sock" first reaped > "$B/rt7.out" 2>&1 &
 RT7=$!
 for _ in $(seq 100); do grep -q "its container's process $(head -1 "$B/rt7.out" 2>/dev/null) waits for its first call" "$B/t.log" 2>/dev/null && break; sleep 0.1; done
-"$B/rt" "$B/s/t.sock" second reaped-call > "$B/rt8.out" 2>&1; rrc8=$?
+rtrun "$B/s/t.sock" second reaped-call > "$B/rt8.out" 2>&1; rrc8=$?
 wait "$RT7"
 P8="$(head -1 "$B/rt8.out" 2>/dev/null)"
 check "a second while one waits for its first call (at most 1): refused, not ended" sh -c \
@@ -480,14 +510,18 @@ PY
     lbundle() {
         local name="$1" sock="$2" filt="$3" ann="$4" args="$5"
         shift 5
-        mkdir -p "$B/b-$name" && (cd "$B/b-$name" && "$RUNC" spec >/dev/null)
+        mkdir -p "$B/bundles/v1340-$name" && (cd "$B/bundles/v1340-$name" && "$RUNC" spec >/dev/null)
         python3 - "$B/b-$name/config.json" "$filt" "$sock" "$ARCH" "$B" "$ann" "$args" "$@" <<'PY'
 import json, sys
 cfg, flt, sock, arch, B, ann, args = sys.argv[1:8]
 opts = set(sys.argv[8:])
 c = json.load(open(cfg)); f = json.load(open(flt))
 f.pop("varekCredentials", None)      # v1.36 step 4: the plugin's, not the runtime's
-f["architectures"] = [arch]; f["listenerPath"] = sock; f["listenerMetadata"] = "varek-test/" + cfg.split("/")[-2]
+d = cfg.split("/")[-2]
+f["architectures"] = [arch]; f["listenerPath"] = sock; f["listenerMetadata"] = "varek-test/b-" + d[len("v1340-"):]
+# v1.36.3 (D1): its own cgroup, named by its id, below its pod's when it names one
+pu = [o[4:] for o in opts if o.startswith("uid=")]
+c["linux"]["cgroupsPath"] = "/varek-v1340/" + ("pod" + pu[0] + "/" if pu else "") + d
 c["process"].update(terminal=False, args=args.split(), env=["PATH=/"], user={"uid": 65534, "gid": 65534},
                     noNewPrivileges=True, cwd="/")
 # v1.36 step 4: env=NAME=VALUE, as the NRI plugin sets a credential's placeholder
@@ -1352,6 +1386,54 @@ PY
         "'$WARDEN' '$B/p.txt' --node-agent '$B/s/nk3.sock' --node-streams '$B/streams-nk' --node-key '$B/nkey/bad.key' \
              --node-name node-1 > '$B/nk4.log' 2>&1; [ \$? = 1 ] && grep -q 'remove it, and the node agent makes a new one' '$B/nk4.log'"
 fi
+
+echo "== 16. the container a connection names (v1.36.3: D1 to D4, D7) =="
+# What a root process that reaches the node agent's socket could send
+# through v1.36.2: a state naming another pod's container, its id and its
+# bundle, for a process of its own (here in a cgroup of its own, as its
+# container's process is), with that process's listener
+check "a node agent for the impersonations" agent c "$B/p.txt"
+mkdir -p "$B/bundles/v1340-victim"
+printf '{"annotations":{"varek.dev/policy":"victim","varek.dev/pod-namespace":"team-b"}}' > "$B/bundles/v1340-victim/config.json"
+logs() { grep -qF -- "$1" "$B/c.log"; }              # the node agent's log says TEXT
+nostream() { ! ls "$B"/streams-c/"$1".* > /dev/null 2>&1; }
+alive() { grep -qx "alive $2" "$B/$1.out"; }
+for m in zombie reaped-call private-call; do
+    rtrun "$B/s/c.sock" v1340-victim "$m" v1340-attacker > "$B/imp-$m.out" 2>&1
+    P="$(head -1 "$B/imp-$m.out" 2>/dev/null)"
+    W="a connection refused: the process the state names ($P) is not container v1340-victim's: its cgroup is /varek-v1340/v1340-attacker"
+    for _ in $(seq 50); do logs "$W" && break; sleep 0.1; done
+    check "another container named ($m): refused, its process's cgroup not that container's" logs "$W"
+    check "... the process not ended" alive "imp-$m" yes
+    check "... nothing done for it (no stream under that id)" nostream v1340-victim
+done
+# D2: the bundle is the confirmed id's, under the runtime's directory, named
+# by no link
+mkdir -p "$B/elsewhere/v1340-out"
+rtrun "$B/s/c.sock" v1340-out reaped-call v1340-out "$B/elsewhere/v1340-out" > "$B/imp-out.out" 2>&1
+check "a bundle outside the runtime's directory: refused" \
+    logs "a connection refused: the container's bundle ($B/elsewhere/v1340-out) is not container v1340-out's under a runtime's directory"
+check "... nothing done for it" nostream v1340-out
+mkdir -p "$B/elsewhere/real"; echo '{"annotations":{}}' > "$B/elsewhere/real/config.json"
+ln -s "$B/elsewhere/real" "$B/bundles/v1340-link"
+rtrun "$B/s/c.sock" v1340-link reaped-call v1340-link "$B/bundles/v1340-link" > "$B/imp-link.out" 2>&1
+check "a bundle named through a link: refused" \
+    logs "a connection refused: the container's bundle ($B/bundles/v1340-link) is not a path to it without a link"
+check "... nothing done for it" nostream v1340-link
+# D3: the container confirmed (its cgroup, its bundle), the state's
+# annotations not its config.json's: refused in its supervisor, its own
+# container ended
+mkdir -p "$B/bundles/v1340-annot"
+printf '{"annotations":{"varek.dev/policy":"another"}}' > "$B/bundles/v1340-annot/config.json"
+rtrun "$B/s/c.sock" v1340-annot reaped-call > "$B/imp-annot.out" 2>&1
+annot_refused() { cat "$B"/streams-c/v1340-annot.*.jsonl 2>/dev/null | grep -qF 'differ on varek.dev/policy (in config.json only)'; }
+for _ in $(seq 50); do annot_refused && break; sleep 0.1; done
+check "the state's annotations not its bundle's: refused in its supervisor" annot_refused
+check "... its own container ended (it is confirmed that container's)" alive imp-annot no
+# every container the sections before started, its runtime's, confirmed
+none_unconfirmed() { ! cat "$B"/[a-z]*.log 2>/dev/null | grep -F "a connection refused: the process the state names" |
+                     grep -v "is not container v1340-victim's" | grep -q .; }
+check "every other container was confirmed by its cgroup and its bundle (none refused for them)" none_unconfirmed
 
 echo
 [ "$fail" = 0 ] && echo "test_v1340: PASS ($skips skipped)" || echo "test_v1340: FAIL"

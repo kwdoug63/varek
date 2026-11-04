@@ -215,8 +215,14 @@ def test_the_runtime_chooses_the_state_directory():
         spec = pod(render(f"runtime={runtime}"), "DaemonSet")
         assert volumes(spec)["state"]["hostPath"]["path"] == state
         assert state in mounts(ctr(spec, "node-agent"))
+        # v1.36.3 (D2): the bundles' directory, under that state directory
+        sub = "io.containerd.runtime.v2.task/k8s.io" if runtime == "containerd" else "storage/overlay-containers"
+        assert arg(ctr(spec, "node-agent"), "--node-bundle-root") == f"{state}/{sub}"
     p = render("runtime=docker", ok=False)
     assert p.returncode != 0 and 'runtime "docker": give containerd or cri-o' in p.stderr
+    # a state directory of the platform's own (k3s's containerd): the bundles' follows it
+    spec = pod(render("node.state.containerd=/run/k3s/containerd"), "DaemonSet")
+    assert arg(ctr(spec, "node-agent"), "--node-bundle-root") == "/run/k3s/containerd/io.containerd.runtime.v2.task/k8s.io"
 
 
 def test_signing_and_the_anchor():
@@ -674,6 +680,8 @@ def test_node_keys():
     assert "-m 0755 /host/key-pub" in script
     adm = ctr(pod(docs, "Deployment"), "admission")
     assert arg(adm, "-node-agent-sa") == f"system:serviceaccount:{NS}:t-node"
+    # v1.36.3 (D6): the node agent's socket's directory, which no pod it serves mounts
+    assert arg(adm, "-node-socket-dir") == "/run/varek-node"
     # off: no key, and nothing published
     spec = pod(render("signing.nodeKey.enabled=false"), "DaemonSet")
     agent, plugin = ctr(spec, "node-agent"), ctr(spec, "plugin")

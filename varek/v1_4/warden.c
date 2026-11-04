@@ -5878,6 +5878,8 @@ static void usage(const char *argv0) {
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
         "       %s <policies dir | policy.txt> --node-agent <socket> --node-streams <dir>\n"
         "              [--node-launcher <varek-init>]   (v1.34: the node agent, one supervisor a container)\n"
+        "              [--node-bundle-root <dir>]...   (v1.36.3: where the runtimes keep bundles; by default\n"
+        "               containerd's and CRI-O's)\n"
         "              [--node-credentials <dir>]   (v1.36: where a file: credential is)\n"
         "              [--node-kubelet <dir>] [--node-spire-socket <admin socket> [--node-spire-self <SPIFFE ID>]\n"
         "               [--node-svid-helper <varek-svid>]]   (v1.36: the pod's user's token and SVID)\n"
@@ -6108,6 +6110,14 @@ int main(int argc, char **argv) {
             node_streams = argv[++i];
         } else if (strcmp(argv[i], "--node-launcher") == 0 && !node_launcher && i + 1 < argc) {   /* v1.34 step 3 */
             node_launcher = argv[++i];
+        } else if (strcmp(argv[i], "--node-bundle-root") == 0 && i + 1 < argc) {   /* v1.36.3 (D2) */
+            if (g_node_nroots == NODE_MAX_ROOTS || argv[i + 1][0] != '/' || strlen(argv[i + 1]) < 2 ||
+                argv[i + 1][strlen(argv[i + 1]) - 1] == '/') {
+                fprintf(stderr, "[warden] --node-bundle-root: at most %d, each an absolute path not ending in /\n",
+                        NODE_MAX_ROOTS);
+                return 2;
+            }
+            g_node_roots[g_node_nroots++] = argv[++i];
         } else if (strcmp(argv[i], "--node-credentials") == 0 && !g_node_creds_dir) {   /* v1.36 step 4 */
             g_node_creds_dir = argv[++i];
         } else if (strcmp(argv[i], "--node-kubelet") == 0 && !node_kubelet_arg && i + 1 < argc) {   /* v1.36 step 6 */
@@ -6281,7 +6291,7 @@ int main(int argc, char **argv) {
     }
     if ((node_sock && (sep_idx >= 0 || g_check_only || !node_streams || g_writable_exec || plan_path ||
                        flow_path || g_hold_req)) ||
-        (node_launcher && !node_sock) || (oci_no_plan && !oci_only) ||    /* v1.34 step 2 */
+        (node_launcher && !node_sock) || (g_node_nroots && !node_sock) || (oci_no_plan && !oci_only) ||    /* v1.34 step 2 */
         (g_node_creds_dir && !node_sock) || ((cred_list_arg || pod_ns_arg) && !oci_only) ||   /* v1.36 step 4 */
         ((node_kubelet_arg || g_node_spire || g_node_spire_self || g_node_svid_bin) && !node_sock) ||  /* step 6 */
         ((g_node_spire_self || g_node_svid_bin) && !g_node_spire) ||

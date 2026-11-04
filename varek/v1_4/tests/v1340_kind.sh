@@ -640,6 +640,18 @@ pod p-nobody team-a obo > "$OUT/p-nobody.json"
 refused "a pod under it naming no user's token: refused at deploy" "$OUT/p-nobody.json" "says .require on-behalf-of., and it names no user's token"
 pod p-mount team-a obo obomount > "$OUT/p-mount.json"
 refused "a pod whose agent mounts its token's volume: refused" "$OUT/p-mount.json" "container agent mounts varek-obo"
+# v1.36.3 (D6): no pod the webhook serves mounts the node agent's socket's
+# directory, or one above it (checked before anything else of the pod)
+python3 - "$OUT/p-sock.json" <<'PY'
+import json, sys
+json.dump({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p-sock", "namespace": "team-a",
+                                                         "annotations": {"varek.dev/policy": "agent"}},
+           "spec": {"containers": [{"name": "c", "image": "registry.invalid/none:1", "command": ["/bin/true"],
+                                    "volumeMounts": [{"name": "run", "mountPath": "/host-run", "readOnly": True}]}],
+                    "volumes": [{"name": "run", "hostPath": {"path": "/run"}}]}}, open(sys.argv[1], "w"))
+PY
+refused "a pod mounting the node's /run, read-only (v1.36.3, D6): refused, before its policy is read" "$OUT/p-sock.json" \
+    "holds VAREK's node agent's socket"
 CHECK='(exec /bin/cat /var/run/varek-obo/token) > /dev/null 2>&1; echo "token_read: $?"
 (exec /bin/cat /etc/hostname) > /dev/null 2>&1; echo "read_allowed: $?"
 (exec /bin/true); echo "launch_allowed: $?"' pod pod-o team-a obo obo > "$OUT/pod-o.json"
@@ -904,13 +916,6 @@ say "  started together: $BURST pods; their containers taken by their first call
 check "$BURST supervised pods created at once: each supervised (the launcher first) and run to its end" sh -c "[ $BOK = $BURST ]"
 check "... the node agent refused none of their containers" sh -c "[ $(count_new 'a connection refused') = 0 ]"
 kubectl -n team-a delete pods $(seq -f 'burst-%g' "$BURST") --wait=false > /dev/null 2>&1
-
-# v1.36.3 measurements (docs/security/v1.36.3-bundle-confirmation.md, M1 to
-# M4), report only: the node agent's line for each container it admitted,
-# in the job's log
-kubectl -n "$NS" logs ds/varek-node -c node-agent 2>/dev/null | grep 'MEASURE v1.36.3' > "$OUT/measure-v1363.log" || true
-say "  v1.36.3 measurements: $(wc -l < "$OUT/measure-v1363.log") containers admitted"
-sed 's/^.*MEASURE v1.36.3 /MEASURE v1.36.3 /' "$OUT/measure-v1363.log"
 
 echo
 [ "$fail" = 0 ] && say "v1340_kind: PASS" || say "v1340_kind: FAIL"

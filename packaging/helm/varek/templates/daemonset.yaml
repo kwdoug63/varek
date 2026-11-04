@@ -119,6 +119,10 @@ spec:
             - {{ .Values.node.streams }}
             - --node-launcher
             - {{ .Values.node.bin }}/varek-init
+            # v1.36.3 (D2): where the runtime keeps each container's bundle,
+            # under its state directory: a bundle elsewhere is refused
+            - --node-bundle-root
+            - {{ $state }}/{{ if eq .Values.runtime "containerd" }}io.containerd.runtime.v2.task/k8s.io{{ else }}storage/overlay-containers{{ end }}
             {{- if $dns }}
             # the policy's names resolved through the cluster's DNS, not a
             # server the pod's resolv.conf names
