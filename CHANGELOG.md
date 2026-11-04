@@ -9,6 +9,35 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.36.3] - 2026-11-04 — The container a connection names, confirmed
+
+A security patch release of 1.36.2; the Warden reports 1.36.3 and decides
+nothing differently, and the grammar stays 1.35. See `RELEASE-v1.36.3.md`
+and `docs/security/v1.36.3-bundle-confirmation.md`.
+
+- **Security (High).** Through 1.36.2 the node agent took a runtime
+  connection's container id, bundle and annotations from the state as
+  sent; since 1.36.0 a pod allowed a hostPath of the node agent's socket's
+  directory, running as root, could have a process of its own supervised
+  as another pod's container (its policy, stream identity, credentials and
+  user token). The node agent now confirms, on every path, that the
+  process is in that container's cgroup (and its pod's), that the bundle
+  is that id's under the runtime's directory (`--node-bundle-root`; the
+  chart gives the one under `node.state`), named through no link, and that
+  the annotations it reads are the bundle's `config.json`'s; otherwise the
+  connection is refused. A GitHub advisory, with a CVE, is published with
+  the release.
+- The admission webhook refuses a pod it serves that mounts the node
+  agent's socket's directory, or one above it, as a hostPath
+  (`-node-socket-dir`, which the chart sets).
+- `test_v1340.sh` section 16 sends the impersonation through each way a
+  runtime is taken, and a bundle outside the runtime's directory or named
+  through a link, and annotations that are not the bundle's: each refused.
+  The suite's containers run in cgroups and bundles of their own, and it
+  needs cgroup v2. kind refuses a pod mounting the node's `/run`.
+- The checks were measured first, report only, on the matrix and kind (18
+  cells, 387 containers): they hold everywhere, crun's `container` leaf
+  named, and add under 0.1 ms at the median.
 - `varek-crds` cannot be a certified chart, as 1.36.2 said it could be:
   chart-verifier's `not-contains-crds` check, mandatory in the partner
   profile, flags a CustomResourceDefinition in a chart's `templates/` as

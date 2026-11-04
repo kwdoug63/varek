@@ -1032,7 +1032,19 @@ are claimed as solved.
     ran). The socket's
     directory being root's alone on the node is what keeps other processes
     out; a root container given that directory by a hostPath could
-    connect.
+    connect. Through v1.36.2 such a container could also name another
+    pod's container (its id, bundle and annotations) for a process of its
+    own, and have it held to that pod's policy, its stream signed as that
+    pod's, with that pod's credentials and user token: the node agent took
+    them from the state as sent. From v1.36.3
+    (`docs/security/v1.36.3-bundle-confirmation.md`) it confirms them on
+    every path: the process is in that container's cgroup (and its pod's),
+    the bundle is that id's under the runtime's own directory, named
+    through no link, and the annotations VAREK reads are the bundle's
+    `config.json`'s; and the admission webhook refuses a pod it serves that
+    mounts the socket's directory, or one above it. What is left to a
+    process that reaches the socket (root on the node, or a pod in a
+    namespace the webhook does not serve) is naming its own container.
   - *Policies come from the cluster* (D7). Whoever may create or change a
     namespace's `VarekPolicy` resources decides what its agents may do, as
     whoever may edit the policy file does on a host: that right is to be

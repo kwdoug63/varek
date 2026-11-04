@@ -74,11 +74,11 @@ repositories to dnf, though it exits 0.)
 
 ## 3. Build and install a release
 
-The release's tag, here v1.36.2 (the list:
+The release's tag, here v1.36.3 (the list:
 https://github.com/kwdoug63/varek/releases):
 
 ```sh
-git clone --branch v1.36.2 --depth 1 https://github.com/kwdoug63/varek.git && cd varek/varek/v1_4
+git clone --branch v1.36.3 --depth 1 https://github.com/kwdoug63/varek.git && cd varek/varek/v1_4
 make
 sudo make install BINDIR=/usr/bin
 ```
@@ -96,7 +96,7 @@ sudo varek doctor
 ```
 
 `varek version` names the `varek` command's version and the Warden's, the
-second line `VAREK Warden  1.36.2  (/opt/varek)`. `varek doctor` checks the
+second line `VAREK Warden  1.36.3  (/opt/varek)`. `varek doctor` checks the
 kernel, the build and the host's settings, and names the fix for any it
 finds missing. Until step 6 it notes there are no settings at
 `/etc/varek/varek.conf`: a run needs none (step 5). From 1.36.2 that is a
