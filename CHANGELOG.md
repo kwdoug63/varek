@@ -9,6 +9,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+- **Tests.** The sweep (`tests/v1340_sweep.sh`): a node run's suite that
+  times out now keeps, for its own calls, each node agent's log and the
+  containers' streams, with the processes then running
+  (`node/SUITE.timeout/`), so a stalled case can be read after the run;
+  before, they went with the run's directory unless `VAREK_SWEEP_KEEP` was
+  set.
+
 ## [1.36.3] - 2026-11-04 — The container a connection names, confirmed
 
 A security patch release of 1.36.2; the Warden reports 1.36.3 and decides

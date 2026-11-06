@@ -23,8 +23,11 @@
 # Writes DIR/{host,node}/SUITE.log, DIR/calls.jsonl (each Warden call of the
 # node run, carried or passed through, with why) and DIR/summary.txt
 # (default /var/tmp/varek-sweep-<time>); VAREK_SWEEP_KEEP=1 keeps each
-# container's stream and the node agent's log. Exit status 1 for a difference no
-# reason is listed for, or a suite that fails on the host.
+# container's stream and the node agent's log. A node run's suite that times
+# out keeps them anyway, for its own calls only, with the processes then
+# running: DIR/node/SUITE.timeout/{ps.txt,CALL/agent.log,CALL/streams/}.
+# Exit status 1 for a difference no reason is listed for, or a suite that
+# fails on the host.
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -79,12 +82,30 @@ if [ ${#SUITES[@]} = 0 ]; then
 fi
 LIMIT=1800
 
+# a node run's suite that timed out: what its calls (W/inv/<call>, those not
+# there before it began) leave, kept before the cleanup removes W, and the
+# processes still running (the stalled case among them)
+kept_timed_out() {   # SUITE BEFORE
+    local k="$OUT/node/$1.timeout" d n=0
+    mkdir -p "$k"
+    ps -eo pid,ppid,etimes,stat,args --forest > "$k/ps.txt" 2>&1
+    for d in $(ls "$W/inv" 2>/dev/null | LC_ALL=C sort | LC_ALL=C comm -13 "$2" -); do
+        mkdir -p "$k/$d"
+        cp "$W/inv/$d/agent.log" "$k/$d/" 2>/dev/null
+        [ -d "$W/inv/$d/streams" ] && cp -r "$W/inv/$d/streams" "$k/$d/" 2>/dev/null
+        n=$((n + 1))
+    done
+    say "node   $1 timed out (${LIMIT}s): $n call(s)' node-agent logs and streams kept in $k"
+}
+
 suite() {   # MODE SUITE
     local t0 rc
     t0=$(date +%s)
     if [ "$1" = node ]; then
+        ls "$W/inv" 2>/dev/null | LC_ALL=C sort > "$W/inv.before"
         # the Warden as the suite names it (./warden), not remade (-o)
         timeout "$LIMIT" make -s -o warden -C "$S" "$2" > "$OUT/node/$2.log" 2>&1; rc=$?
+        [ "$rc" = 124 ] && kept_timed_out "$2" "$W/inv.before"
     else
         timeout "$LIMIT" make -s -C "$S" "$2" > "$OUT/host/$2.log" 2>&1; rc=$?
     fi
