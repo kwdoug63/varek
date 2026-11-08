@@ -1,4 +1,4 @@
-# VAREK
+# VAREK™
 
 ### Kernel-enforced, proof-checked authorization for what an AI agent's process actually does.
 
@@ -750,6 +750,11 @@ VAREK is open-source software licensed under the [MIT License](LICENSE).
 Copyright (c) 2026 Sober Agentic Infrastructure, Inc. See [NOTICE](./NOTICE).
 
 ### Trademarks
+
+VAREK, the VAREK logo, and Don't Trust. Verify. are trademarks of Sober Agentic
+Infrastructure, Inc. The MIT License covers the code and grants no right to use
+these marks, except as needed to describe the origin of the software. Patent
+pending.
 
 CycloneDX is a trademark of the OWASP Foundation. VAREK and Sober Agentic
 Infrastructure, Inc. are not affiliated with, endorsed by, or certified by the
