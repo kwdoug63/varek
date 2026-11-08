@@ -190,7 +190,7 @@ The runtime line has progressed well beyond simple syscall containment:
   (connects: shipped in v1.21.0; launches, opt-in, in v1.27.0). See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.17.0 history.
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.36.3 history.
 
 ### Network
 
