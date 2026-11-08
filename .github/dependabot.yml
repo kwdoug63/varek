@@ -1,0 +1,25 @@
+# Dependabot version and security updates for VAREK.
+# Docs: https://docs.github.com/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "gomod"
+    directories:
+      - "/varek/v1_4/k8s"
+      - "/varek/v1_4/tests/v1340_nri"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "pip"
+    directories:
+      - "/"
+      - "/varek/v1_4/tools"
+      - "/varek/v1_4/adapters"
+      - "/varek/v1_4/adapters/samples/agentcore-weather/app"
+      - "/examples/integrations/fastapi-inference"
+    schedule:
+      interval: "weekly"
