@@ -6,7 +6,7 @@ toolchain go1.24.7
 
 require (
 	github.com/containerd/nri v0.12.3
-	github.com/spiffe/spire-api-sdk v1.15.3
+	github.com/spiffe/spire-api-sdk v1.16.0
 	google.golang.org/grpc v1.79.3
 )
 
