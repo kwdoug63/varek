@@ -5,7 +5,7 @@ go 1.24.0
 toolchain go1.24.7
 
 require (
-	github.com/containerd/nri v0.12.3
+	github.com/containerd/nri v0.12.5
 	github.com/spiffe/spire-api-sdk v1.15.3
 	google.golang.org/grpc v1.79.3
 )
@@ -17,7 +17,6 @@ require (
 	github.com/opencontainers/runtime-spec v1.3.0 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/tetratelabs/wazero v1.11.0 // indirect
-	golang.org/x/mod v0.32.0 // indirect
 	golang.org/x/net v0.48.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/text v0.32.0 // indirect
