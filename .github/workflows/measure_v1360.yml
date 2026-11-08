@@ -42,7 +42,7 @@ jobs:
       OUT: ${{ github.workspace }}/measure
       M: varek/v1_4/tests/measure_v1360
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: The host
         run: |
           uname -srm; stat -fc 'cgroup: %T' /sys/fs/cgroup; systemctl --version | head -1
@@ -84,7 +84,7 @@ jobs:
       OUT: ${{ github.workspace }}/measure
       M: varek/v1_4/tests/measure_v1360
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: The host
         run: |
           uname -srm; stat -fc 'cgroup: %T' /sys/fs/cgroup; systemctl --version | head -1
@@ -121,7 +121,7 @@ jobs:
     env:
       OUT: ${{ github.workspace }}/measure
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: M4c, KVM
         run: sudo -E env "PATH=$PATH" bash varek/v1_4/tests/measure_v1360/m4_kvm.sh --out "$OUT"
       - name: Keep the logs
