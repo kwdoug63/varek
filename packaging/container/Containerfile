@@ -30,7 +30,7 @@
 ARG BUILD_BASE=docker.io/library/almalinux:9@sha256:245f8aab832fe800aa42bdab5fad75ebbd8e0b4c9f24820a83c638b177857ae2
 ARG RUNTIME_BASE=registry.access.redhat.com/ubi9/ubi-minimal:latest@sha256:bba2b4bbf0ed15cfe7dd72a1e17ae7d2015a141f306b304e1a2785c41400e39c
 ARG TEST_BASE=docker.io/library/ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
-ARG GO_BASE=docker.io/library/golang:1.24@sha256:d2d2bc1c84f7e60d7d2438a3836ae7d0c847f4888464e7ec9ba3a1339a1ee804
+ARG GO_BASE=docker.io/library/golang:1.27@sha256:e519d3b0a5b285e5aa53ab9eef02bc6bbb9cb04608389b743a136a9ce75f0d1e
 # Red Hat's container certification (preflight) asks for these labels, and
 # that none of name, vendor and maintainer is Red Hat's, which the UBI base
 # image's are: so each is set here, for the runtime image and the node image.

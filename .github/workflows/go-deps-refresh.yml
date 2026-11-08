@@ -1,0 +1,73 @@
+name: Go dependencies refresh (temporary)
+
+# One-off, branch-only helper for security/go-1.27: resolves the Go module
+# updates with the real Go toolchain (go get + go mod tidy), builds, vets
+# and tests both modules, runs govulncheck, then commits go.mod/go.sum back
+# and deletes this file in the same commit. It never reaches main.
+
+on:
+  push:
+    branches: [security/go-1.27]
+    paths: [".github/workflows/go-deps-refresh.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: security/go-1.27
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+          cache: false
+      - name: Update the modules
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          for m in varek/v1_4/k8s varek/v1_4/tests/v1340_nri; do
+            echo "::group::$m"
+            cd "$GITHUB_WORKSPACE/$m"
+            if [ "$m" = varek/v1_4/k8s ]; then
+              go get google.golang.org/grpc@v1.85.0 \
+                     github.com/containerd/nri@v0.12.5 \
+                     github.com/spiffe/spire-api-sdk@v1.16.0
+            else
+              go get github.com/containerd/nri@v0.12.5 google.golang.org/grpc@v1.85.0
+            fi
+            go get golang.org/x/net@latest golang.org/x/sys@latest \
+                   golang.org/x/text@latest golang.org/x/mod@latest
+            go get toolchain@go1.27.3
+            go mod tidy
+            go mod verify
+            CGO_ENABLED=0 go build -trimpath ./...
+            go vet ./...
+            go test ./...
+            echo "::endgroup::"
+          done
+      - name: govulncheck
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          for m in varek/v1_4/k8s varek/v1_4/tests/v1340_nri; do
+            echo "== $m"
+            (cd "$m" && "$(go env GOPATH)/bin/govulncheck" -show verbose ./...)
+          done
+      - name: Commit go.mod and go.sum, remove this workflow
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -q .github/workflows/go-deps-refresh.yml
+          git add varek/v1_4/k8s/go.mod varek/v1_4/k8s/go.sum \
+                  varek/v1_4/tests/v1340_nri/go.mod varek/v1_4/tests/v1340_nri/go.sum
+          git diff --cached --stat
+          git commit -q -m "Go modules: grpc 1.85.0, nri 0.12.5, spire-api-sdk 1.16.0, latest x/net, x/sys, x/text, x/mod; toolchain go1.27.3" \
+                        -m "Resolved by go get and go mod tidy under Go 1.27.3; built, vetted, tested and govulncheck'd in the same job."
+          git push origin HEAD:security/go-1.27
