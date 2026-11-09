@@ -1,4 +1,0 @@
-# The example agent's Python packages (its image is built on VAREK's, Python 3.9).
-# requirements.txt is this file compiled with every version and hash pinned
-# (pip install --require-hashes); Dependabot recompiles it.
-requests

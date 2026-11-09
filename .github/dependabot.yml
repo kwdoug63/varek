@@ -23,7 +23,6 @@ updates:
       - "/examples/integrations/fastapi-inference"
       # hash-pinned files compiled by pip-compile (each from its .in file)
       - "/.github/requirements"
-      - "/packaging/container/example"
     schedule:
       interval: "weekly"
 
