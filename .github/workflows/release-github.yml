@@ -10,14 +10,16 @@ name: GitHub Release
 #     (FILE.sig, FILE.pem and FILE.sigstore.json, a Sigstore bundle);
 #   - SLSA build provenance for every file is made by the SLSA framework's
 #     generic generator (multiple.intoto.jsonl);
-#   - the Release is created with the files, their signatures and the
-#     provenance, its notes RELEASE-vX.Y.Z.md from the tag when there is one.
+#   - the files, their signatures and the provenance are attached to the
+#     tag's Release: added to the one already published (its notes and
+#     settings untouched), or a new Release is created, its notes
+#     RELEASE-vX.Y.Z.md from the tag when there is one.
 #
 # Called by container-release.yml once a tag's images and charts are
 # published and signed. Run by hand (workflow_dispatch) for a tag released
 # before this workflow existed: the same steps, the bills of materials
-# taken from that tag's container-release.yml run. It refuses a tag that
-# already has a Release.
+# taken from that tag's container-release.yml run. It refuses a tag whose
+# Release already carries these files (its SHA256SUMS), and replaces none.
 #
 # The SLSA generator is referenced by its version tag, not a commit: it
 # verifies its own reference and refuses a commit (Scorecard allows this).
@@ -51,15 +53,18 @@ jobs:
     env:
       VERSION: ${{ inputs.version }}
     steps:
-      - name: The version is a release tag's, and has no Release yet
+      - name: The version is a release tag's, and its Release does not carry these files yet
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "not a version: $VERSION"; exit 1; }
           gh api "repos/$REPO/git/ref/tags/v$VERSION" > /dev/null
-          if gh release view "v$VERSION" -R "$REPO" > /dev/null 2>&1; then
-            echo "v$VERSION already has a Release"; exit 1
+          if assets="$(gh release view "v$VERSION" -R "$REPO" --json assets --jq '.assets[].name' 2>/dev/null)"; then
+            if grep -qx SHA256SUMS <<<"$assets"; then
+              echo "v$VERSION's Release already carries its files (SHA256SUMS)"; exit 1
+            fi
+            echo "v$VERSION has a Release; the files will be added to it"
           fi
       # this workflow's own commit: the tag's when called on a tag, the
       # branch's when run by hand (an earlier tag may predate collect.sh)
@@ -170,15 +175,22 @@ jobs:
               --certificate-oidc-issuer "$iss" "$f" > /dev/null
             echo "signed and verified: $f"
           done
-      - name: Publish the Release
+      - name: Attach the files to the tag's Release (or publish one)
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          notes=(--generate-notes)
-          [ -f "RELEASE-v$VERSION.md" ] && notes=(--notes-file "RELEASE-v$VERSION.md")
-          pre=(); case "$VERSION" in *-*) pre=(--prerelease) ;; esac
-          gh release create "v$VERSION" -R "$REPO" --verify-tag --title "VAREK $VERSION" \
-            "${notes[@]}" "${pre[@]}" \
-            "$RUNNER_TEMP"/release/* "$RUNNER_TEMP"/provenance/*
+          if gh release view "v$VERSION" -R "$REPO" > /dev/null 2>&1; then
+            # the Release published by hand: its notes and settings stay;
+            # no asset of the same name is replaced (no --clobber)
+            gh release upload "v$VERSION" -R "$REPO" \
+              "$RUNNER_TEMP"/release/* "$RUNNER_TEMP"/provenance/*
+          else
+            notes=(--generate-notes)
+            [ -f "RELEASE-v$VERSION.md" ] && notes=(--notes-file "RELEASE-v$VERSION.md")
+            pre=(); case "$VERSION" in *-*) pre=(--prerelease) ;; esac
+            gh release create "v$VERSION" -R "$REPO" --verify-tag --title "VAREK $VERSION" \
+              "${notes[@]}" "${pre[@]}" \
+              "$RUNNER_TEMP"/release/* "$RUNNER_TEMP"/provenance/*
+          fi
           gh release view "v$VERSION" -R "$REPO" --json assets --jq '.assets[].name'
