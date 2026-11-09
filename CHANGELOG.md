@@ -9,6 +9,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+- `packaging/helm/certification/verify_on_openshift.sh --version` no longer
+  stops at `cp: ... are the same file`: the chart `helm pull` puts in `--out`
+  is used where it is instead of being copied onto itself.
+
 ## [1.36.3] - 2026-11-04 — The container a connection names, confirmed
 
 A security patch release of 1.36.2; the Warden reports 1.36.3 and decides
