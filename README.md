@@ -1,4 +1,4 @@
-# VAREK
+# VAREK™
 
 ### Kernel-enforced, proof-checked authorization for what an AI agent's process actually does.
 
@@ -190,7 +190,7 @@ The runtime line has progressed well beyond simple syscall containment:
   (connects: shipped in v1.21.0; launches, opt-in, in v1.27.0). See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.17.0 history.
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.36.3 history.
 
 ### Network
 
@@ -576,14 +576,15 @@ different risks at different points in the stack.
 - [x] **v1.29.0** — `varek run -- <agent>` with nothing set up first (a baseline policy and agent profiles), files opened and changed as the agent's own user, a dry run that records what a policy would refuse without enforcing it, and `varek policy suggest` ([design](./docs/security/v1.29-varek-run.md))
 - [x] **v1.31.0** — Standards: authorization events in OCSF beside CycloneDX; MCP servers confined to their own rules, MCP calls decided by method and tool, MCP tokens bound to their server; a mapping to Agent Baseline ([design](./docs/security/v1.31-standards.md))
 - [x] **v1.31.1** — A patch release of v1.31.0: `epoll_wait`, `epoll_create`, `pipe` and `getpgrp` admitted under every policy, so asyncio, a shell's command substitution and bash work under the Warden ([release notes](./RELEASE-v1.31.1.md)).
-- [x] **v1.32.1** — A patch release of v1.32.0: rootless Podman without `--systemd=always`
 - [x] **v1.32.0** — Containers: an official image (`ghcr.io/kwdoug63/varek`, signed, with an SBOM), Docker and Podman, rootless included, under a published minimal set of settings, never `--privileged` ([design](./docs/security/v1.32-containers.md))
+- [x] **v1.32.1** — A patch release of v1.32.0: rootless Podman without `--systemd=always`
 - [ ] **macOS** (in progress; planned as v1.30.0, then v1.33.0; v1.34.0 shipped first, so it takes the next number when it is released) — macOS: the agent and the Warden in a lightweight Linux VM, with the same guarantees as on Linux ([plan](./docs/roadmap/v1.28-v1.31.md))
 - [x] **v1.34.0** — Kubernetes: a node agent, a Helm chart, OpenShift and Amazon EKS ([design](./docs/security/v1.34-kubernetes.md))
 - [x] **v1.35.0** — Agent frameworks: plans generated from the framework, Amazon Bedrock AgentCore first; plans held under the node agent too ([design](./docs/security/v1.35-frameworks.md))
 - [x] **v1.36.0** — Kubernetes at parity with a host (credentials, sub-agents, confined MCP servers, plans and the dry run in pods; arm64; an audit in bounded memory; a key for each node), and the supported platforms tested in CI ([plan](./docs/roadmap/v1.36-v1.37.md))
 - [x] **v1.36.1** — A patch release of v1.36.0: the images and the chart packaged for Red Hat's certification, the CRDs a chart of their own ([release notes](./RELEASE-v1.36.1.md))
 - [x] **v1.36.2** — A patch release of v1.36.1: the node key published again when it changes, a test for `varek-crds`, `varek doctor`'s warning, the RHEL 9 install guide ([release notes](./RELEASE-v1.36.2.md))
+- [x] **v1.36.3** — A security patch release of v1.36.2: the node agent confirms the container a runtime connection names (its cgroup, its bundle under the runtime's directory, its annotations) before supervising it, and the admission webhook refuses a pod that mounts the node agent's socket directory ([advisory GHSA-pcxh-jj4w-2jcc](https://github.com/kwdoug63/varek/security/advisories/GHSA-pcxh-jj4w-2jcc), [release notes](./RELEASE-v1.36.3.md))
 - [x] **v1.36.3** — A security patch release of v1.36.2: the container a node agent connection names, confirmed by its cgroup, its bundle and its `config.json`; the webhook refuses a pod mounting the node agent's socket ([release notes](./RELEASE-v1.36.3.md))
 - [ ] **v1.37.0** (planned; was v1.36.0) — Security operations: Splunk, Microsoft Sentinel, OpenTelemetry ([plan](./docs/roadmap/v1.32-v1.35.md))
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
@@ -750,6 +751,11 @@ VAREK is open-source software licensed under the [MIT License](LICENSE).
 Copyright (c) 2026 Sober Agentic Infrastructure, Inc. See [NOTICE](./NOTICE).
 
 ### Trademarks
+
+VAREK, the VAREK logo, and Don't Trust. Verify. are trademarks of Sober Agentic
+Infrastructure, Inc. The MIT License covers the code and grants no right to use
+these marks, except as needed to describe the origin of the software. Patent
+pending.
 
 CycloneDX is a trademark of the OWASP Foundation. VAREK and Sober Agentic
 Infrastructure, Inc. are not affiliated with, endorsed by, or certified by the

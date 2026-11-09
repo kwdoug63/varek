@@ -1,6 +1,6 @@
 # VAREK — Threat Model
 
-Version: current as of v1.32.0 (release candidate; v1.31.0 added with it) · MIT · github.com/kwdoug63/varek
+Version: current as of v1.36.3 (released November 4, 2026) · MIT · github.com/kwdoug63/varek
 
 This document states what VAREK defends, against whom, and what it explicitly
 does not defend. It is deliberately conservative: where a guarantee is
@@ -152,6 +152,42 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
   GitHub identity for that version's tag, and its SBOM attestation; the
   base images are taken by tag at each build, and the SBOM records what
   went in.
+- **Trust boundary 17 (v1.34.0; v1.36.3):** a Kubernetes node and the
+  cluster's control plane. The node agent (one Warden per node, a
+  DaemonSet) is privileged on the node, as Falco or Tetragon are; the
+  node's root, its kernel, its container runtime (containerd or CRI-O,
+  with runc or crun) and the kubelet are trusted as a host's kernel is.
+  The filter a supervised container runs under is the one the runtime's
+  spec names, set by VAREK's NRI plugin; the node agent cannot read it
+  back. Whoever may create or change a namespace's `VarekPolicy` and
+  `VarekPlan` resources decides what its agents may do, as whoever may
+  edit the policy file does on a host, and whoever may change the chart's
+  namespace is root on every node. The admission webhook
+  (`failurePolicy: Fail`) is part of the guarantee in the namespaces it
+  serves. From v1.36.3 the node agent confirms the container each
+  connection names (its cgroup, its bundle, the bundle's annotations)
+  rather than taking the runtime's state on its word; what is left to a
+  process that reaches the node agent's socket (root on the node) is
+  naming its own container.
+- **Trust boundary 18 (v1.35.0):** the agent's framework and the adapter
+  that reads it. A plan written by `varek plan generate` is the
+  framework's description of the agent, taken from the agent's own code
+  and configuration; it is trusted only to narrow what the policy allows,
+  never to widen it. The adapter runs confined like an agent (the system
+  and the project read-only, the credential stores refused, no network);
+  a code adapter imports the agent's code, which can make it write a plan
+  broader than the framework's objects would give, and the policy bounds
+  that plan.
+- **Trust boundary 19 (v1.36.0):** what a node supplies for a pod. Under
+  the node agent, a credential is fetched in the node's network under the
+  DaemonSet's identity (the chart's Secrets, Vault's Kubernetes auth,
+  IRSA, EKS Pod Identity or the node's role); the user's token is the
+  kubelet's copy of a Secret the pod names; the agent's SVID comes from
+  the node's SPIRE agent; and each node signs its streams with a key of
+  its own, published as its `VarekNodeKey`, which the webhook admits only
+  from that node. Those sources, and the cluster's list of node keys kept
+  by whoever audits, are trusted as the host's credential sources, issuer
+  and key are on a host. The agent's pod never holds them.
 
 ## 3. Adversary models
 
@@ -673,6 +709,75 @@ Model-B techniques below, with the residual limits stated honestly.
     with cosign keyless and given a signed CycloneDX SBOM attestation,
     both verified before `:1.32` and `:latest` move to it; every action
     the release runs is pinned by commit.
+- **Kubernetes: a node agent and a Helm chart (v1.34.0).** A decision made
+  by the node agent is the decision the Warden makes on a host: the same
+  filter, decision procedure, certificates, records and refusals, one
+  supervisor, policy and stream for each container.
+  - *The agent's pod passes Pod Security "restricted".* The agent holds no
+    capability (the node agent refuses a container whose effective,
+    permitted or ambient set is not empty), runs as a user other than
+    root with no new privileges, and is PID 1 of a PID namespace of its
+    own, so ending it ends everything it started.
+  - *A container that is not adjusted does not run.* Each container of a
+    supervised pod names VAREK's unsupervised seccomp profile, which
+    refuses every call and which only the NRI plugin replaces with the
+    Warden's filter; with no plugin on the node, an old runtime, or a
+    plugin that does not answer in time, the container does not start.
+  - *The launch set in a pod.* A small static launcher (`varek-init`,
+    bound read-only, checked by the node agent to be that file) applies
+    Landlock to the programs the policy allows to launch before any of the
+    container's own code runs; every writable mount is made noexec.
+  - *Refused, not run with less.* What cannot be carried into a pod from
+    outside is refused, with the reason in the pod's events, never run
+    with less.
+  - *Evidence on the node.* One stream per container, outside every pod,
+    signed and anchored, the policy copied beside it, and exported as OCSF
+    for the cluster's collector.
+- **Plans from the agent framework (v1.35.0).** `varek plan generate`
+  writes an agent's plan from what its framework already says of it
+  (Amazon Bedrock AgentCore, IBM watsonx Orchestrate, LangGraph, the
+  OpenAI Agents SDK, the Claude Agent SDK and Claude Code), with no change
+  to the agent's code.
+  - *A run held to its plan* (`--hold-to-plan`, or the policy's `require
+    plan`): a call the policy allows that no step covers is refused
+    (`outside_plan`), for files, connections, launches, MCP calls and
+    credentials alike. The hold is applied after the decision procedure,
+    never instead of it, so it can only refuse.
+  - *Plan 1.35* may name MCP calls, sub-agents and credentials, each step
+    decided under the subject whose rules it falls under (`as=`).
+  - *A refused plan is explained.* The plan gate's refusals are chained
+    records naming the plan by its SHA-256; `varek refusals` explains a
+    refused plan step by step, and the audit checks the gate's records
+    against the run and its hold.
+- **Kubernetes at parity (v1.36.0 to v1.36.3).** Every policy and every
+  plan that runs on a host runs under the node agent, decided the same
+  way; a 1.35 node agent refuses a pod needing a feature it does not
+  carry, so an upgrade in progress refuses rather than runs with less.
+  - *Credentials in pods.* The value is fetched by warden-secrets in the
+    node's network and swapped into the agent's request by the proxy in
+    the pod's network; the pod holds only a placeholder.
+  - *Sub-agents, confined MCP servers and the on-behalf-of chain in pods,*
+    each call attributed by the sub-agent's control group, made below the
+    container's own, as on a host.
+  - *The dry run, flow policies and trust bundles in pods;* a dry run's
+    refused connects are refused in a pod all the same, since they would
+    reach the cluster's network.
+  - *An audit in bounded memory, and a key for each node.* The audit reads
+    a stream of any length in memory bounded by the policy and the plan;
+    the node agent rotates each stream, each segment opening with a signed
+    checkpoint; one node's key cannot sign as another's
+    (`varek audit --node-keys`).
+  - *The container a connection names, confirmed (v1.36.3).* Before it
+    does anything for a container, on every path, the node agent checks
+    that the process the runtime's state names is in that container's
+    cgroup (and its pod's), that the bundle is that id's under the
+    runtime's own directory, named through no link, and that the
+    annotations VAREK reads are the bundle's `config.json`'s; otherwise
+    the connection is refused. The admission webhook refuses a pod that
+    mounts the node agent's socket's directory, or one above it.
+  - *amd64 and arm64 (Graviton),* each built and checked on its own
+    runner; each runtime and host the README calls supported is run in
+    CI, and what the matrix does not cover is not called supported.
 
 The per-class status of every known bypass class is maintained in
 `docs/security/bypass-classes.md`.
@@ -974,8 +1079,8 @@ are claimed as solved.
     in.
   - *Review.* v1.32.0 was reviewed by AI review agents, not by a human or
     third party. Its findings are listed in its release notes.
-- Kubernetes (v1.34.0, in progress: steps 1 to 8 built,
-  `v1.34-kubernetes.md`):
+- Kubernetes (v1.34.0 to v1.36.3, `v1.34-kubernetes.md`,
+  `v1.36-kubernetes-parity.md`, `v1.36.3-bundle-confirmation.md`):
   - *The pod's network, not an empty one* (D5). On a host the agent's
     network namespace is empty and the Warden dials every connect from its
     own. In a pod the agent has the pod's interfaces and the cluster's
@@ -1076,11 +1181,81 @@ are claimed as solved.
     (`tests/v1340_sweep_known.txt`). The sweep's container is runc's with
     the plugin's adjustments, not a kubelet's: the chart on a cluster is
     `kind`'s, in CI.
-  - *The node's signing key* is one Secret given to every node: a stream
-    names its node, but any node's key signs as any other's.
-  - *Review.* Step 2 and then steps 1 to 7 as a whole (step 8) were
-    reviewed by AI review agents; their findings and fixes are listed in
-    `v1.34-kubernetes.md` (step 8) and the release notes. No human or
+  - *The node's signing key.* Through v1.35 a node signed only with the
+    one Secret `signing.secretName` named, given to every node, so any
+    node's key signed as any other's. From v1.36.0 each node
+    makes its own key, tied to its node by the node's name in the NRI
+    plugin's service account token; a cluster whose tokens do not name
+    their node admits no `VarekNodeKey`, and uses `signing.secretName`
+    there. The anchor's `node_key` line is the node's own
+    announcement: the audit relies on the cluster's list (`--node-keys`),
+    kept with the evidence by whoever audits. A retired key's time is the
+    run's start as the anchor host received it when the anchor holds it,
+    else the node's own clock, which a node taken over can set.
+  - *One connection at a time* (v1.36.0). The node agent reads one
+    runtime's connection at a time, for up to 5 s each: a runtime slow to
+    send its state, or a root process on the node that reaches the socket
+    and sends slowly, delays the start of the node's other supervised
+    containers by as long.
+  - *What a node fetches for a pod* (v1.36.0). A policy's `trust issuer`
+    discovery document and keys are fetched by the node agent from its
+    pod's network, so a policy's author chooses where it connects, as on a
+    host. With EKS Pod Identity, EKS's own webhook puts the token in every
+    container of the DaemonSet; with neither IRSA nor Pod Identity,
+    warden-secrets uses the node's instance role through IMDSv2. The pod's
+    SVID is verified against the policy's trust domain and bundle, not
+    against an expected ID.
+  - *Counts and dry runs per node* (v1.36.0). A flow policy's breaker
+    counts per node, not across the cluster. A dry run in a pod refuses
+    the connects its policy refuses, unlike a host's. A sub-agent launched
+    by the container's first process is refused
+    (`subagent_first_process`).
+  - *The cluster's own grants* (v1.36.0). The NRI plugin gets pods in
+    every namespace (RBAC cannot narrow a grant to one node's pods). The
+    admission webhook answers whoever reaches its service; keep its
+    namespace's ingress to the API server with a NetworkPolicy where that
+    matters. The CRDs' schemas check less than the webhook, whose checks
+    are the binding ones. A container starting while its `VarekPolicy`
+    changes may be refused, never run under a policy other than the one
+    its SHA-256 names.
+  - *Where the profile check is the webhook's alone.* CRI-O 1.37 does not
+    tell the NRI plugin a container's seccomp profile, so there the
+    webhook's check that each supervised container names VAREK's
+    unsupervised profile is the only one.
+  - *Platforms.* RHEL 9 is tested on Rocky Linux 9. Kubernetes 1.30 to 1.34
+    are accepted by the chart but not tested; CI runs 1.35, 1.36 and 1.37.
+  - *Review.* v1.34.0 and v1.36.0 were each reviewed by AI review agents;
+    their findings and fixes are listed in `v1.34-kubernetes.md`,
+    `v1.36-kubernetes-parity.md` and the release notes. The v1.36.3 fix
+    was measured before it was built (`v1.36.3-bundle-confirmation.md`)
+    and published with advisory GHSA-pcxh-jj4w-2jcc. No human or third-party review has been made.
+- Plans from the agent framework (v1.35.0, `v1.35-frameworks.md`):
+  - *A plan names only what the framework says.* A tool that runs in the
+    agent's process (a function tool) is not in the plan unless named with
+    `--host` or `--file`; held, its other calls are refused. A model built
+    inside a node at run time has no host in the plan.
+  - *A server whose tools are listed when the agent connects* gets one
+    step naming no tool, which covers every tool of that server; a policy
+    that names its tools refuses it.
+  - *MCP limits carried from v1.31.* An `mcp` rule cannot name a server at
+    an address; the MCP client's own GET and DELETE are refused in every
+    held run; a stdio MCP server's calls are not decided, only its launch.
+  - *The code adapters import the agent's code:* confined, it can still
+    make the adapter write a plan broader than the framework's objects
+    would give; the plan is checked against the policy, which bounds it.
+  - *A launch is held by the file launched by that name,* not by what it
+    does: a multi-call binary picks its applet from `argv[0]`, which the
+    agent chooses.
+  - *A plan bound by its name* under the node agent: each container start
+    takes the `VarekPlan` of that name as it then is (`run_start` names it
+    by its SHA-256).
+  - *A host-name step is matched as written:* a name spelt otherwise is
+    refused its connection, never allowed one.
+  - *The plan's records are chained, not sealed:* without a signing key,
+    anyone who can rewrite and re-chain the stream can make a refused plan
+    read as authorized. Sign the stream for evidence that holds.
+  - *Review.* v1.35.0 was reviewed by six AI review agents, each on one
+    part; its findings are listed in its release notes. No human or
     third-party review has been made.
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).

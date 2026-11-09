@@ -193,8 +193,8 @@ Dockerfile with a small agent; CI builds it on each change and runs it
 under the settings above):
 
 ```
-FROM ghcr.io/kwdoug63/varek:1.32.0
-RUN microdnf -y install python3-pip && pip3 install --no-cache-dir requests && microdnf clean all
+FROM ghcr.io/kwdoug63/varek:1.32.0@sha256:8a5706d72bbc8d3cdffa191200ca38bddbac08915b8a0667b687d5ec4725f9cb
+RUN microdnf -y install python3-requests && microdnf clean all
 COPY agent.py /work/agent.py
 CMD ["python3", "/work/agent.py"]
 ```

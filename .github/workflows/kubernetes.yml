@@ -50,7 +50,7 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -69,7 +69,7 @@ jobs:
         run: docker build -f packaging/container/Containerfile --target node -t varek-node:ci .
       - name: The chart on kind
         run: varek/v1_4/tests/v1340_kind.sh --image varek-node:ci --out "$RUNNER_TEMP/kind"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: always()
         with:
           name: kind${{ matrix.arch == 'arm64' && '-arm64' || '' }}
@@ -84,14 +84,16 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install build dependencies (as warden-build.yml)
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
           sudo apt-get install -y openjdk-21-jdk-headless musl-tools
           sudo apt-get install -y --no-install-recommends squid python3-cryptography
-          python3 -m pip install --break-system-packages -r varek/v1_4/tools/requirements-test.txt pytest pyyaml
+          # every version and hash pinned (requirements-ci.in, compiled); --ignore-installed:
+          # the runner's Debian packages cannot be uninstalled by pip
+          python3 -m pip install --break-system-packages --ignore-installed --require-hashes -r varek/v1_4/tools/requirements-ci.txt
       - name: The host
         run: uname -srm; runc --version | head -1
       - name: The sweep
@@ -104,7 +106,7 @@ jobs:
       - name: Keep the sweep's logs
         if: always()
         run: sudo chmod -R a+rX "$RUNNER_TEMP/sweep" 2>/dev/null || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: always()
         with:
           name: sweep${{ matrix.arch == 'arm64' && '-arm64' || '' }}
@@ -119,7 +121,7 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -140,7 +142,7 @@ jobs:
         run: |
           varek/v1_4/tests/soak_v1340/soak.sh --image varek-node:ci --hours 0.1 --interval 3 \
             --short-every 2 --sample 30 --volume-rate 200 --rotate-bytes 4194304 --out "$RUNNER_TEMP/soak"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: always()
         with:
           name: soak${{ matrix.arch == 'arm64' && '-arm64' || '' }}

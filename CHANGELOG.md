@@ -9,6 +9,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+- `packaging/helm/certification/verify_on_openshift.sh --version` no longer
+  stops at `cp: ... are the same file`: the chart `helm pull` puts in `--out`
+  is used where it is instead of being copied onto itself.
 - **Tests.** The sweep (`tests/v1340_sweep.sh`): a node run's suite that
   times out now keeps, for its own calls, each node agent's log and the
   containers' streams, with the processes then running
