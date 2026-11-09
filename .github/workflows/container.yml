@@ -49,7 +49,7 @@ jobs:
         --cap-add NET_ADMIN --cap-add NET_BIND_SERVICE --cap-add CHOWN
         --cgroupns=private --security-opt apparmor=varek-container
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: The host
         run: |
           uname -srm; docker --version
@@ -113,7 +113,7 @@ jobs:
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Red Hat's container certification checks (preflight) on the runtime and node images
         run: OUT="$RUNNER_TEMP/preflight" packaging/container/preflight_check.sh varek varek-node
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: always()
         with:
           name: preflight
@@ -126,7 +126,7 @@ jobs:
       - name: Keep the sweep's logs
         if: always()
         run: sudo chmod -R a+rX "$RUNNER_TEMP/sweep" 2>/dev/null || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: always()
         with:
           name: container-sweep
