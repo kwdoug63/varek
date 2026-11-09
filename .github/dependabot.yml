@@ -21,5 +21,15 @@ updates:
       - "/varek/v1_4/adapters"
       - "/varek/v1_4/adapters/samples/agentcore-weather/app"
       - "/examples/integrations/fastapi-inference"
+      # hash-pinned files compiled by pip-compile (each from its .in file)
+      - "/.github/requirements"
+    schedule:
+      interval: "weekly"
+
+  # base images pinned by digest
+  - package-ecosystem: "docker"
+    directories:
+      - "/varek/v1_4/adapters/samples/agentcore-weather/app"
+      - "/packaging/container/example"
     schedule:
       interval: "weekly"

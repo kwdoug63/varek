@@ -1,0 +1,6 @@
+# pytest for platform-fail-closed.yml (macOS, Windows, Linux; Python 3.11).
+# pytest.txt is this file compiled with every version and hash pinned (pip
+# install --require-hashes); Dependabot recompiles it. colorama is named so
+# the file also holds what pytest needs on Windows.
+pytest
+colorama
