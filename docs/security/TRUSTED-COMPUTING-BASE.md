@@ -1,6 +1,6 @@
 # VAREK — Trusted Computing Base
 
-Version: current as of v1.29.0 (release candidate) · MIT · github.com/kwdoug63/varek
+Version: current as of v1.36.3 (released November 4, 2026) · MIT · github.com/kwdoug63/varek
 
 A SATISFIED verdict is only as sound as the components that produce and enforce
 it. This document lists every component in the verification-and-enforcement
@@ -40,10 +40,20 @@ move components leftward — and, above all, to shrink the set that must be trus
 | The dry run (`dry_let` and its callers in `warden.c`, `warden_change.inc.c`, `warden_exec.inc.c`, `warden_net.inc.c`; `add_dry_rest` in `warden_baseline_filter.c`) | With `--dry-run`, lets through what the policy refuses, recorded `"enforced":false`, and keeps refusing the hard-denied calls, the protected objects, Unix-socket connects and revocation | Trusted | Added in v1.29.0. A fault could let through one of those refusals; the audit (`check_dry`) fails a stream in which one is marked not enforced, and exits 3 for any dry run. |
 | The baseline and the profiles (`tools/varek_baseline.py`, `policies/agents/`) | Writes the policy `varek run` uses with no settings | Checked | Added in v1.29.0. Ordinary policies: decided by the SMT decision procedure, every authorization certified, and cross-checked by `make crosscheck-profiles`. A fault makes the policy too narrow or too wide, never a decision unsound for the policy it wrote; the policy is stored and shown (`varek run --show-policy`). |
 | `varek policy suggest` (`tools/varek_suggest.py`) | Drafts rules from a run's refusals | Untrusted (advisory) | Added in v1.29.0. Its output is a draft for review, never used by itself; each active rule is re-decided by the decision procedure and the draft linted. |
+| MCP mediation (`mcp_json.c`, `warden_proxy_mcp.inc.c`; confined servers in `warden_subagent.inc.c`) | Reads each remote MCP call's whole body with a strict parser and decides it on its method and the object it names; runs a declared MCP server under its own rules (`for=NAME`) | Trusted | Added in v1.31.0. A call that cannot be read, a batch, a duplicate key or a header that disagrees with the body is refused. For "the call decided is the call sent", the trusted parts are the parser (about 600 lines) and the proxy's MCP path (about 350); each allowed decision is certified and names its subject, and the checker replays it as that subject only. A stdio MCP server's calls are not decided, only its launch. |
+| OCSF exporter (`tools/varek_ocsf.py`) | Converts the verdict stream to OCSF authorization events | Trusted | Added in v1.31.0. Each event carries its record's report id, sequence number and chain hash; `--verify` finds an event edited, dropped, reordered or cut, and a stream the audit refuses is not exported. Its correctness does not affect enforcement, only the exported record. |
+| The plan hold (`warden_hold.inc.c`) | With `--hold-to-plan` or `require plan`, refuses a call the policy allows that no step of the plan covers (`outside_plan`) | Trusted | Added in v1.35.0. Applied after the decision procedure and the certificate checker, never instead of them, so a fault can let through a call the plan does not name (still decided and certified under the policy) but cannot authorize one the policy refuses. The audit checks the gate's records against the run and its hold. |
+| Framework adapters (`adapters/`, `varek plan generate`) | Write an agent's plan from what its framework says of it (AgentCore, watsonx Orchestrate, LangGraph, the OpenAI Agents SDK, the Claude Agent SDK and Claude Code) | Untrusted (input) | Added in v1.35.0. A plan only narrows the policy; it is decided against the policy before the agent starts. Each adapter runs confined under the Warden (read-only, credential stores refused, no network); the code adapters import the agent's code, so their output is treated as the agent's own description, never as authority. |
+| Node agent (`warden_node.inc.c`, `node_json.c`, `warden_oci.c`) | On Kubernetes, the Warden on each node: takes the seccomp listener the runtime sends for each supervised container, confirms the container, and forks a supervisor that decides its calls as a host's Warden decides an agent's | Trusted | Added in v1.34.0; at parity with a host in v1.36.0. About 2,500 lines for admitting connections, tying the descriptor to its process, reading the container's state and serving the pod's inputs from the node. Through v1.36.2 it took a container's id, bundle and annotations from the runtime's state as sent; from v1.36.3 (`node_confirm`, `node_same_annotations`) it confirms them against the container's cgroup, the runtime's bundle directory and the bundle's `config.json` before it does anything for the container (GHSA-pcxh-jj4w-2jcc). It cannot read the installed filter back: that the filter is the Warden's rests on the runtime's spec, which only the node's root writes. In external-audit scope. |
+| NRI plugin (`k8s/cmd/varek-nri`) | Sets the Warden's filter, the launcher and noexec mounts in each supervised container's OCI configuration; writes policies to the node; publishes the node's key | Trusted | Added in v1.34.0. A container it does not adjust keeps VAREK's unsupervised profile, which refuses every call, and does not start. From v1.36.2 it republishes the node's key whenever the node agent makes a new one. |
+| Admission webhook (`k8s/cmd/varek-admission`) | Refuses a policy the Warden does not load, a pod that does not name the unsupervised profile or drop every capability, and (v1.36.3) a pod that mounts the node agent's socket's directory | Trusted | Added in v1.34.0. Part of the guarantee in the namespaces it serves (`failurePolicy: Fail`); excluded namespaces (`kube-system` by default, the chart's own) are not checked. CRI-O 1.37 does not tell the plugin a container's profile, so there the webhook's check is the only one. It admits a node's `VarekNodeKey` only from that node. |
+| The launcher in a pod (`varek_init.c`, `varek-init`) | Applies the launch set with Landlock before the container's own code runs | Trusted | Added in v1.34.0. About 145 lines, built static, bound read-only; the node agent checks it is that file. Landlock cannot be added to a running process from outside, so this is where the launch set is applied in a pod. |
+| SVIDs in pods (`k8s/cmd/varek-svid`) | Gets the agent's X.509-SVID from the node's SPIRE agent for the container's process (the Delegated Identity API) | Trusted | Added in v1.36.0. The SVID is verified by warden-secrets against the policy's trust domain and bundle, as on a host. |
+| Container runtime, NRI and kubelet | Start each supervised container under the filter its spec names and send the listener to the node agent | Trusted | From v1.34.0. Out of VAREK's control, as the kernel is: containerd 2.2 and later or CRI-O 1.35 and later, with runc or crun. The supported combinations are each run in CI (v1.36.0). |
 | `varek doctor` in a container (`tools/varek_container.py`) | Checks each setting the Warden needs of its container and names the flag that grants a missing one | Untrusted (advisory) | Added in v1.32.0. It reads the container's state and tests the Warden's mounts in a child of its own; it grants nothing and the Warden relies on none of it: without it, a missing setting makes the Warden refuse to start, or run with less (no DNS stub without NET_ADMIN or NET_BIND_SERVICE), never with the agent less confined. `varek run`'s refusal in a container comes from it (`for_run`). |
 | The launch set's SHA-256 (OpenSSL libcrypto) | Hashes each file of the launch set at startup, recorded in `run_start` | Trusted | From v1.29.0 (libsodium before). Only the digest is used; libcrypto is initialised with `OPENSSL_INIT_NO_LOAD_CONFIG`, so no configuration file is read and no provider or module is loaded into the Warden. |
 | Kernel mechanisms (seccomp, PID namespaces, capabilities, Landlock) | In-kernel enforcement primitives the Warden builds on | Trusted | Out of VAREK's control; relied upon as a platform assumption (see Threat Model §5.3). Landlock (v1.27, under `require warden 1.27`) holds the set of files the agent may launch; mount namespaces and `noexec` mounts (v1.27.1, the same opt-in) hold the files the agent may write. |
-| Build / toolchain | Produces the deployed binaries | Trusted | Planned: reproducible builds so a third party can reproduce the artifact bit-for-bit. |
+| Build / toolchain | Produces the deployed binaries, images and chart | Trusted | From v1.32.0 each image is signed with cosign keyless (the release workflow's GitHub identity for that version's tag) with a signed CycloneDX SBOM attestation, and every action the release runs is pinned by commit; from v1.34.0 the Helm chart is signed and pins the node image by the digest the release signed; from v1.36.0 the node image is built and checked on its own runner for amd64 and for arm64. Base images are taken by tag, so builds are not yet reproducible bit-for-bit. Planned: reproducible builds so a third party can reproduce the artifact. |
 
 ## Soundness of the chain
 
@@ -70,21 +80,4 @@ mitigation strategy, in priority order:
 
 The asset "the verdict stream reflects the decisions actually made" has two
 adversaries. The supervised agent has been unable to forge, drop or reorder a
-record since v1.12.1 (run id, sequence numbers, relayed stderr), provided it
-cannot open the stream file itself, which v1.16 refuses at startup. From v1.16
-the log's holder cannot either, up to what the key and the anchor cover:
-without the key, nothing before the last signature can change and a stream
-cannot be cut short undetected (an incomplete stream is audited only up to its
-last signature); with an anchor, anchored history cannot change even for the
-key holder. Not covered: records after the last anchored checkpoint of an
-unfinished run, root on the Warden host during the run, raw storage devices the
-startup check does not recognize, and the unchained lines (status lines, the
-agent's relayed stderr, `--plan` gate records).
-
-## What this does not claim
-
-No component above the kernel is currently *verified* in the strong sense. This
-document exists so that fact is stated rather than discovered. v1.15 moved the
-enforcement decision procedure to *checked* for authorizations; the certificate
-checker that took its place is trusted, and is the natural candidate for formal
-verification. The compiler and encoder come next.
+record since v1.12.1 (run id, sequence numb
