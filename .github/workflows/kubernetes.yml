@@ -69,7 +69,7 @@ jobs:
         run: docker build -f packaging/container/Containerfile --target node -t varek-node:ci .
       - name: The chart on kind
         run: varek/v1_4/tests/v1340_kind.sh --image varek-node:ci --out "$RUNNER_TEMP/kind"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: always()
         with:
           name: kind${{ matrix.arch == 'arm64' && '-arm64' || '' }}
@@ -106,7 +106,7 @@ jobs:
       - name: Keep the sweep's logs
         if: always()
         run: sudo chmod -R a+rX "$RUNNER_TEMP/sweep" 2>/dev/null || true
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: always()
         with:
           name: sweep${{ matrix.arch == 'arm64' && '-arm64' || '' }}
@@ -142,7 +142,7 @@ jobs:
         run: |
           varek/v1_4/tests/soak_v1340/soak.sh --image varek-node:ci --hours 0.1 --interval 3 \
             --short-every 2 --sample 30 --volume-rate 200 --rotate-bytes 4194304 --out "$RUNNER_TEMP/soak"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: always()
         with:
           name: soak${{ matrix.arch == 'arm64' && '-arm64' || '' }}
