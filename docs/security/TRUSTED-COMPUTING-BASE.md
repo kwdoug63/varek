@@ -80,4 +80,27 @@ mitigation strategy, in priority order:
 
 The asset "the verdict stream reflects the decisions actually made" has two
 adversaries. The supervised agent has been unable to forge, drop or reorder a
-record since v1.12.1 (run id, sequence numb
+record since v1.12.1 (run id, sequence numbers, relayed stderr), provided it
+cannot open the stream file itself, which v1.16 refuses at startup. From v1.16
+the log's holder cannot either, up to what the key and the anchor cover:
+without the key, nothing before the last signature can change and a stream
+cannot be cut short undetected (an incomplete stream is audited only up to its
+last signature); with an anchor, anchored history cannot change even for the
+key holder. Not covered: records after the last anchored checkpoint of an
+unfinished run, root on the Warden host during the run, raw storage devices the
+startup check does not recognize, and the unchained lines (status lines and
+the agent's relayed stderr). From v1.35.0 the plan gate's records are chained
+like any other, but without a signing key they are chained, not sealed. On
+Kubernetes (v1.36.0) each node signs with its own key, published as its
+`VarekNodeKey`; the audit checks a stream's key against the cluster's list
+(`--node-keys`), and each rotated segment opens with a signed checkpoint naming
+the chain value the one before ended on. The audit reads a stream of any length
+in memory bounded by the policy and the plan.
+
+## What this does not claim
+
+No component above the kernel is currently *verified* in the strong sense. This
+document exists so that fact is stated rather than discovered. v1.15 moved the
+enforcement decision procedure to *checked* for authorizations; the certificate
+checker that took its place is trusted, and is the natural candidate for formal
+verification. The compiler and encoder come next.
