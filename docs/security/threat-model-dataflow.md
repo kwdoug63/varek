@@ -19,7 +19,7 @@ of VAREK's defense surface and have non-overlapping trust boundaries:
   untrusted code (code-interpreter tools, agentic execution contexts,
   sandboxed eval)." Defends against malicious code *executing* inside
   VAREK's seccomp sandbox.
-- This document (data-flow verifier): the pre-execution verification
+- This document (data-flow verifier): the plan-level verification
   of an agent's *proposed plan* over its action graph. Defends
   against plans that compose individually-permitted actions into a
   leak, before any action runs.

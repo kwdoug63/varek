@@ -1,6 +1,6 @@
 # VAREK v1.7 / v1.8 — cross-action data-flow verification
 
-Pre-execution verification of how sensitive labels flow across an
+Plan-level verification of how sensitive labels flow across an
 agent's action graph. v1.6 decides each action's policy in
 isolation (USPTO Provisional 64/062,549); v1.7 adds a second axis
 that decides over the *path between actions* before any action

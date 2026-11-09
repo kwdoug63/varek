@@ -2,10 +2,10 @@
 /*
  * execution_plan.h — VAREK v1.6 plan-graph verification API.
  *
- * Pre-execution verification of an ExecutionPlan as a single
+ * Plan-level verification of an ExecutionPlan as a single
  * compositional decision over a directed acyclic graph of Actions.
  * Implements USPTO Provisional 64/062,549 (May 2026) covering
- * pre-execution verification of action graphs as compositional
+ * plan-level verification of action graphs as compositional
  * policy decisions.
  *
  * Symmetric-suppression invariant: callers MUST refuse execution on
