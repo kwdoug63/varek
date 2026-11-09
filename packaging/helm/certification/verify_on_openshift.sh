@@ -83,9 +83,10 @@ helm upgrade --install varek-crds "$CRDS" -n "$NS" --wait --timeout 5m > "$OUT/h
     { tail -20 "$OUT/helm-crds.log" >&2; die "the CRDs' chart did not install"; }
 
 echo "== chart-verifier, the partner profile (installs the chart, runs helm test, uninstalls it)"
-cp "$VALUES" "$OUT/values-openshift.yaml"
-cp "$CHART" "$OUT/" 2> /dev/null || cp -r "$CHART" "$OUT/"
+# --version pulls the chart into OUT already: cp of a file onto itself fails (and set -e ends the run)
+[ "$VALUES" -ef "$OUT/values-openshift.yaml" ] || cp "$VALUES" "$OUT/values-openshift.yaml"
 chart="$(basename "$CHART")"
+[ "$CHART" -ef "$OUT/$chart" ] || cp -r "$CHART" "$OUT/"
 args=(verify --set profile.vendortype=partner --chart-values /work/values-openshift.yaml
       --namespace "$NS" --openshift-version "$ocp" --helm-install-timeout 10m)
 rc=0
