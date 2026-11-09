@@ -6,7 +6,7 @@
 # watsonx reads YAML with the system's PyYAML (python3-yaml).
 #
 #   python3 -m venv /var/tmp/varek-fw && /var/tmp/varek-fw/bin/pip install -r adapters/requirements-frameworks.txt
-langgraph==1.2.17
+langgraph==1.2.20
 langgraph-prebuilt==1.1.1
 langchain-core==1.7.0
 langchain-anthropic==1.7.6
