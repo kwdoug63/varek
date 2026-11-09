@@ -1468,7 +1468,7 @@ static action_kind_t kind_from_string(const char *s) {
  * is forked, so there is no process to resolve against and the named file may
  * not exist yet. Plan verification is therefore an approximation: it collapses
  * `.`, `..` and duplicate slashes lexically and decides policy on that, which
- * is the pre-execution analog of the runtime canonical path. It does not follow
+ * is the plan-level analog of the runtime canonical path. It does not follow
  * symlinks (there is nothing to follow yet), so a plan that lexically clears the
  * policy is still enforced per-syscall at runtime; the gate is an advisory
  * pre-check, not a substitute for enforcement.
@@ -5909,7 +5909,7 @@ static void usage(const char *argv0) {
         "  and the requirement; processes the agent spawns may then outlive\n"
         "  a crashed Warden.\n"
         "\n"
-        "  Optional --plan <plan.txt> enables v1.6 pre-execution plan\n"
+        "  Optional --plan <plan.txt> enables v1.6 plan-level\n"
         "  verification. The target is not forked unless the plan\n"
         "  verifies as SATISFIED against the loaded policy. A process_exec\n"
         "  step is UNSATISFIED: the runtime refuses launches (v1.18). v1.21: a\n"
@@ -6993,7 +6993,7 @@ int main(int argc, char **argv) {
         if (!g_nr.on) names_resolve_all(true);
     }
 
-    /* v1.6 pre-execution plan verification. Fires before fork; on
+    /* v1.6 plan-level verification. Fires before fork; on
      * any non-SATISFIED result the target is not started. */
     g_hold_collect = g_hold_req && !g_nr.on;      /* v1.35 step 4: each step that passes */
     if (g_nr.on) {

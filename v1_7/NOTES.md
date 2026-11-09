@@ -1,6 +1,6 @@
 # VAREK v1.7 / v1.8 — design notes
 
-## Scope: pre-execution data-flow verification across an ExecutionPlan
+## Scope: plan-level data-flow verification across an ExecutionPlan
 
 v1.6 lifted the per-Action policy decision to a plan-level decision
 over the action graph (USPTO Provisional 64/062,549). v1.7 adds a
@@ -357,7 +357,7 @@ surface would belong to the language layer revival, not to v1.7+.
 Tracking control-flow influence on top of data flow (a plan that
 leaks one bit through *which* tool gets called rather than data
 flowing into it) is a research problem and may not be tractable in
-the fixed pre-execution DAG model. CaMeL and FIDES carry the same
+the fixed plan-level DAG model. CaMeL and FIDES carry the same
 gap. `docs/security/threat-model-dataflow.md` L3 states this as a
 documented limitation.
 
@@ -383,7 +383,7 @@ substantially overlapping with concurrent prior art — CaMeL (March
 2025) and FIDES (May 2025) — which predate every provisional in
 the portfolio. The only narrow candidate for surviving claim
 language over that prior art is the cross-layer integration: a
-single pre-execution two-axis verdict bound to kernel-boundary
+single plan-level two-axis verdict bound to kernel-boundary
 syscall enforcement (Provisional 64/059,592). Whether that
 combination is patentably distinct is for IP counsel; see the
 counsel memo (internal). v1.7 source files do not claim coverage

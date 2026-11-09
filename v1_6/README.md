@@ -1,8 +1,8 @@
 # VAREK v1.6 — ExecutionPlan verification
 
-Pre-execution verification of an agent's action graph as a single
+Plan-level verification of an agent's action graph as a single
 compositional policy decision. Implements USPTO Provisional
-64/062,549 (May 2026), covering pre-execution verification of
+64/062,549 (May 2026), covering plan-level verification of
 action graphs as compositional policy decisions.
 
 The v1.6 line ships in three patch releases:
