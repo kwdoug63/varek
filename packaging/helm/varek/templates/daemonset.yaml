@@ -5,6 +5,12 @@
   to is; the plugin and the exporter hold no capability. */}}
 {{- $state := include "varek.state" . -}}
 {{- $dns := include "varek.dnsServer" . -}}
+{{- $conf := include "varek.secretsConf" . -}}
+{{- $cred := .Values.credentials -}}
+{{- /* v1.36 step 9 (D10): each node's own key, unless one Secret signs for every node */ -}}
+{{- $nk := and (not .Values.signing.secretName) .Values.signing.nodeKey.enabled -}}
+{{- $nkd := .Values.signing.nodeKey -}}
+{{- include "varek.validate" . -}}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -28,6 +34,9 @@ spec:
         app.kubernetes.io/component: node
     spec:
       serviceAccountName: {{ include "varek.nodeName" . }}
+      # v1.36 step 11 (review): the account's token in the plugin alone (the
+      # one container that reads the API server), not in every container
+      automountServiceAccountToken: false
       hostPID: true
       priorityClassName: {{ .Values.priorityClassName }}
       {{- with .Values.nodeSelector }}
@@ -57,6 +66,14 @@ spec:
             - |
               install -d -o 0 -g 0 -m 0700 /host/socket /host/streams /host/control /host/export
               install -d -o 0 -g 0 -m 0755 /host/policies /host/bin
+              {{- if $nk }}
+              # v1.36 step 9 (D10): the node's key, the node agent's alone;
+              # its public key, which the plugin and the exporter read
+              install -d -o 0 -g 0 -m 0700 /host/key
+              install -d -o 0 -g 0 -m 0755 /host/key-pub
+              chmod 0700 /host/key
+              chmod 0755 /host/key-pub
+              {{- end }}
               chmod 0700 /host/socket /host/streams /host/control /host/export
               chmod 0755 /host/policies /host/bin
               install -o 0 -g 0 -m 0755 /opt/varek/varek-init /host/bin/.varek-init.new
@@ -85,6 +102,10 @@ spec:
             - { name: policies, mountPath: /host/policies }
             - { name: bin, mountPath: /host/bin }
             - { name: seccomp, mountPath: /host/seccomp }
+            {{- if $nk }}
+            - { name: node-key, mountPath: /host/key }
+            - { name: node-key-pub, mountPath: /host/key-pub }
+            {{- end }}
       containers:
         - name: node-agent
           image: {{ include "varek.image" . }}
@@ -98,15 +119,31 @@ spec:
             - {{ .Values.node.streams }}
             - --node-launcher
             - {{ .Values.node.bin }}/varek-init
+            # v1.36.3 (D2): where the runtime keeps each container's bundle,
+            # under its state directory: a bundle elsewhere is refused
+            - --node-bundle-root
+            - {{ $state }}/{{ if eq .Values.runtime "containerd" }}io.containerd.runtime.v2.task/k8s.io{{ else }}storage/overlay-containers{{ end }}
             {{- if $dns }}
             # the policy's names resolved through the cluster's DNS, not a
             # server the pod's resolv.conf names
             - --dns-server
             - {{ $dns | quote }}
             {{- end }}
+            # v1.36 step 9 (D10): the node's name in each run_start
+            - --node-name
+            - $(NODE_NAME)
             {{- if .Values.signing.secretName }}
             - --sign-key
             - /etc/varek/node.key
+            - --checkpoint-every
+            - {{ .Values.signing.checkpointEvery | quote }}
+            {{- else if $nk }}
+            # the node's own key, made at the first start; its public key
+            # published by the plugin as the node's VarekNodeKey
+            - --node-key
+            - {{ $nkd.dir }}/node.key
+            - --node-key-pub
+            - {{ $nkd.pubDir }}/node.key.pub
             - --checkpoint-every
             - {{ .Values.signing.checkpointEvery | quote }}
             {{- end }}
@@ -114,9 +151,46 @@ spec:
             - --anchor
             - {{ .Values.node.streams }}/{{ .Values.anchor.file }}
             {{- end }}
+            # v1.36 step 4 (D1): a file: source is under the chart's directory;
+            # warden-secrets' configuration for vault: and aws-sm:
+            - --node-credentials
+            - {{ $cred.dir }}
+            {{- if $conf }}
+            - --secrets-conf
+            - /etc/varek/secrets/secrets.conf
+            {{- end }}
+            # v1.36 step 6 (D5): a pod's user's token, from the kubelet's copy
+            # of its varek-obo volume; its SVID from the node's SPIRE agent
+            - --node-kubelet
+            - {{ .Values.node.kubelet }}
+            {{- if .Values.spire.adminSocket }}
+            - --node-spire-socket
+            - {{ .Values.spire.adminSocket }}
+            {{- if .Values.spire.self }}
+            - --node-spire-self
+            - {{ .Values.spire.self | quote }}
+            {{- end }}
+            {{- else if .Values.spire.self }}{{ fail "spire.self: give spire.adminSocket too" }}
+            {{- end }}
+            # v1.36 step 7 (D7b, D7): a flow policy's breaker table, on the
+            # node; the trust bundles a VarekPolicy names
+            - --node-flow-state
+            - {{ .Values.flowPolicy.stateDir }}
+            {{- if .Values.trustBundles.configMap }}
+            - --node-trust-bundles
+            - /etc/varek/trust-bundles
+            {{- end }}
+            {{- if .Values.streams.rotateBytes }}
+            # v1.36 step 8 (D9): each stream in segments of this size
+            - --node-stream-rotate
+            - {{ int64 .Values.streams.rotateBytes | quote }}
+            {{- end }}
             {{- range .Values.nodeAgent.extraArgs }}
             - {{ . | quote }}
             {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
           securityContext:
             privileged: true
             runAsUser: 0
@@ -132,6 +206,47 @@ spec:
             {{- if .Values.signing.secretName }}
             # a file, not the Secret volume's link (the Warden opens its key O_NOFOLLOW)
             - { name: key, mountPath: /etc/varek/node.key, subPath: key, readOnly: true }
+            {{- else if $nk }}
+            - { name: node-key, mountPath: {{ $nkd.dir }} }
+            - { name: node-key-pub, mountPath: {{ $nkd.pubDir }} }
+            {{- end }}
+            # v1.36 step 4 (D1): the credentials' Secrets, warden-secrets'
+            # configuration, and the tokens the DaemonSet signs in with (each
+            # a link into the volume's ..data, which warden-secrets follows)
+            {{- range $i, $s := $cred.secrets }}
+            # v1.36 step 11 (review): named by its place (a Secret's name may hold dots, a volume's may not)
+            - { name: cred-{{ $i }}, mountPath: {{ $cred.dir }}/{{ $s }}, readOnly: true }
+            {{- end }}
+            {{- if $conf }}
+            - { name: secrets-conf, mountPath: /etc/varek/secrets, readOnly: true }
+            {{- end }}
+            {{- if $cred.vault.caSecret }}
+            - { name: vault-ca, mountPath: /etc/varek/vault-ca, readOnly: true }
+            {{- end }}
+            {{- if $cred.vault.kubernetesAuth.role }}
+            - { name: vault-token, mountPath: /var/run/varek/tokens/vault, readOnly: true }
+            {{- end }}
+            {{- if or $cred.aws.roleArn $cred.aws.podIdentity }}
+            - { name: aws-token, mountPath: /var/run/varek/tokens/aws, readOnly: true }
+            {{- end }}
+            # v1.36 step 6 (D5): the kubelet's pods (each Secret volume a
+            # mount the kubelet makes after this pod starts: seen through
+            # HostToContainer), the SPIRE agent's admin socket, its bundle
+            - { name: kubelet-pods, mountPath: {{ .Values.node.kubelet }}/pods, readOnly: true, mountPropagation: HostToContainer }
+            {{- if .Values.spire.adminSocket }}
+            # read-only: a socket is connected to all the same (v1.36 step 11, review)
+            - { name: spire-admin, mountPath: {{ dir .Values.spire.adminSocket }}, readOnly: true }
+            {{- end }}
+            {{- if .Values.spire.bundleConfigMap }}
+            - { name: spire-bundle, mountPath: /etc/varek/spire-bundle, readOnly: true }
+            {{- end }}
+            {{- if .Values.onBehalfOf.issuerCaConfigMap }}
+            - { name: issuer-ca, mountPath: /etc/varek/issuer-ca, readOnly: true }
+            {{- end }}
+            # v1.36 step 7
+            - { name: flow-state, mountPath: {{ .Values.flowPolicy.stateDir }} }
+            {{- if .Values.trustBundles.configMap }}
+            - { name: trust-bundles, mountPath: /etc/varek/trust-bundles, readOnly: true }
             {{- end }}
         - name: plugin
           image: {{ include "varek.image" . }}
@@ -150,7 +265,20 @@ spec:
             - {{ .Values.nri.socket }}
             - -runtime-handlers
             - {{ join "," .Values.nri.runtimeHandlers | quote }}
+            # v1.36 step 6: the webhook's init container for a pod acting for a user
+            - -obo-image
+            - {{ include "varek.image" . }}
             - -sync
+            {{- if $nk }}
+            # v1.36 step 9 (D10): the node's key, published as its VarekNodeKey
+            - -node-key-pub
+            - {{ $nkd.pubDir }}/node.key.pub
+            - -node
+            - $(NODE_NAME)
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            {{- end }}
           # root, to write the node's policies (root's) and reach the runtime's
           # NRI socket (root's), with no capability
           securityContext:
@@ -168,6 +296,10 @@ spec:
             - { name: policies, mountPath: {{ .Values.node.policies }} }
             - { name: nri, mountPath: {{ dir .Values.nri.socket }} }
             - { name: tmp, mountPath: /tmp }
+            - { name: api-token, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true }
+            {{- if $nk }}
+            - { name: node-key-pub, mountPath: {{ $nkd.pubDir }}, readOnly: true }
+            {{- end }}
         {{- if .Values.exporter.enabled }}
         - name: exporter
           image: {{ include "varek.image" . }}
@@ -190,6 +322,9 @@ spec:
             {{- if .Values.signing.secretName }}
             - --pubkey
             - /etc/varek/node.key.pub
+            {{- else if $nk }}
+            - --pubkey
+            - {{ $nkd.pubDir }}/node.key.pub
             {{- end }}
             {{- if .Values.anchor.enabled }}
             - --anchor
@@ -213,9 +348,12 @@ spec:
           volumeMounts:
             - { name: streams, mountPath: {{ .Values.node.streams }}, readOnly: true }
             - { name: export, mountPath: {{ .Values.node.exportState }} }
-            - { name: tmp, mountPath: /tmp }
+            # v1.36 step 11 (review): the audit's temporary files, on disk (D9)
+            - { name: exporter-scratch, mountPath: /tmp }
             {{- if .Values.signing.secretName }}
             - { name: key, mountPath: /etc/varek/node.key.pub, subPath: key.pub, readOnly: true }
+            {{- else if $nk }}
+            - { name: node-key-pub, mountPath: {{ $nkd.pubDir }}, readOnly: true }
             {{- end }}
         {{- end }}
       volumes:
@@ -229,9 +367,73 @@ spec:
         - { name: state, hostPath: { path: {{ $state }}, type: Directory } }
         - { name: nri, hostPath: { path: {{ dir .Values.nri.socket }}, type: Directory } }
         - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 64Mi } }
+        {{- if .Values.exporter.enabled }}
+        - { name: exporter-scratch, emptyDir: { sizeLimit: {{ .Values.exporter.scratchSize }} } }
+        {{- end }}
+        # the plugin's API token, as the kubelet would automount it (bound to
+        # this pod, so the token names the pod and its node: D10)
+        - name: api-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken: { expirationSeconds: 3607, path: token }
+              - configMap: { name: kube-root-ca.crt, items: [{ key: ca.crt, path: ca.crt }] }
+              - downwardAPI: { items: [{ path: namespace, fieldRef: { apiVersion: v1, fieldPath: metadata.namespace } }] }
+        - { name: kubelet-pods, hostPath: { path: {{ .Values.node.kubelet }}/pods, type: Directory } }
+        {{- if .Values.spire.adminSocket }}
+        # the SPIRE agent's own directory, not made here (v1.36 step 11, review)
+        - { name: spire-admin, hostPath: { path: {{ dir .Values.spire.adminSocket }}, type: Directory } }
+        {{- end }}
+        # projected, not configMap: a ConfigMap's volume is a directory on the
+        # node's disk that the kubelet makes writable by all (0777), which
+        # warden-secrets refuses for a trust file's; a projected one is in
+        # memory, as a Secret's is (the first kind run of v1.36 step 6)
+        {{- if .Values.spire.bundleConfigMap }}
+        - name: spire-bundle
+          projected: { defaultMode: 0444, sources: [{ configMap: { name: {{ .Values.spire.bundleConfigMap }} } }] }
+        {{- end }}
+        {{- if .Values.trustBundles.configMap }}
+        - name: trust-bundles
+          projected: { defaultMode: 0444, sources: [{ configMap: { name: {{ .Values.trustBundles.configMap }} } }] }
+        {{- end }}
+        - { name: flow-state, hostPath: { path: {{ .Values.flowPolicy.stateDir }}, type: DirectoryOrCreate } }
+        {{- if .Values.onBehalfOf.issuerCaConfigMap }}
+        - name: issuer-ca
+          projected: { defaultMode: 0444, sources: [{ configMap: { name: {{ .Values.onBehalfOf.issuerCaConfigMap }}, items: [{ key: ca.crt, path: ca.crt }] } }] }
+        {{- end }}
+        {{- if $nk }}
+        - { name: node-key, hostPath: { path: {{ $nkd.dir }}, type: DirectoryOrCreate } }
+        - { name: node-key-pub, hostPath: { path: {{ $nkd.pubDir }}, type: DirectoryOrCreate } }
+        {{- end }}
         {{- if .Values.signing.secretName }}
         - name: key
           secret:
             secretName: {{ .Values.signing.secretName }}
             defaultMode: 0400
+        {{- end }}
+        {{- range $i, $s := $cred.secrets }}
+        - name: cred-{{ $i }}
+          secret: { secretName: {{ $s }}, defaultMode: 0400 }
+        {{- end }}
+        {{- if $conf }}
+        - name: secrets-conf
+          secret: { secretName: {{ include "varek.nodeName" . }}-secrets-conf, defaultMode: 0400 }
+        {{- end }}
+        {{- if $cred.vault.caSecret }}
+        - name: vault-ca
+          secret: { secretName: {{ $cred.vault.caSecret }}, defaultMode: 0444, items: [{ key: ca.crt, path: ca.crt }] }
+        {{- end }}
+        {{- if $cred.vault.kubernetesAuth.role }}
+        - name: vault-token
+          projected:
+            defaultMode: 0400
+            sources:
+              - serviceAccountToken: { audience: {{ required "credentials.vault.kubernetesAuth.audience: Vault's role binds its tokens to an audience; give it" $cred.vault.kubernetesAuth.audience | quote }}, expirationSeconds: 3600, path: token }
+        {{- end }}
+        {{- if or $cred.aws.roleArn $cred.aws.podIdentity }}
+        - name: aws-token
+          projected:
+            defaultMode: 0400
+            sources:
+              - serviceAccountToken: { audience: {{ if $cred.aws.roleArn }}sts.amazonaws.com{{ else }}pods.eks.amazonaws.com{{ end }}, expirationSeconds: 86400, path: token }
         {{- end }}

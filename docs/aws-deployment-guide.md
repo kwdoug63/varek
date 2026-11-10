@@ -37,7 +37,7 @@ Contents
 
 ### What VAREK does
 
-VAREK is a pre-execution authorization runtime for AI agents. The VAREK
+VAREK is kernel-enforced authorization for AI agents. The VAREK
 Warden starts your agent and decides every file open, network connection and
 program launch the agent attempts against your policy, at the Linux kernel
 boundary (seccomp user notification), before the action happens. Only

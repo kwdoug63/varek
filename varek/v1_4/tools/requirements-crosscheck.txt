@@ -1,4 +1,7 @@
 # The reference SMT solver for tools/smt_crosscheck.py (make crosscheck,
 # make test-v1130 / test-v1140 / test-v1150 / test-v1160), v1.18.0:
 #   pip install -r tools/requirements-crosscheck.txt
-z3-solver>=4.8
+# 5.0 or later: under every 4.x release (4.13 to 4.16) the cross-check's
+# regex queries time out, each counted a disagreement (October 21, 2026:
+# test-v1130's cross-check, 87 s under 5.1.0, past 15 minutes under 4.x)
+z3-solver>=5.0

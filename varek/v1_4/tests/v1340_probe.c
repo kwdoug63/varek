@@ -27,6 +27,12 @@
 //   stub           the nameserver /etc/resolv.conf names (the stub's view)
 //   get_wild       WILD asked of that nameserver (A), then an HTTP GET to it
 // and with "hold", waiting 4 s after.
+// v1.36 step 4, with "env NAME": its value in the environment (env: VALUE,
+// or env: none), the placeholder the NRI plugin set.
+// v1.36 step 7, with "rename FROM TO": rename: ok, or its errno's name.
+// (A dry run lets a rename the policy refuses go to the kernel: from one
+// directory to another, Landlock refuses it, EXDEV, unless the launcher's
+// set grants it beneath them.)
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -206,6 +212,20 @@ int main(int argc, char **argv) {
         if (argc > 4) { struct timespec t = { 4, 0 }; nanosleep(&t, NULL); }
         return 0;
     }
+    if (argc > 3 && !strcmp(argv[1], "rename")) { printf("rename: %s\n", rename(argv[2], argv[3]) == 0 ? "ok" : en(errno)); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "listen")) {     /* v1.36 step 11 (review): a dry run's listen in a pod */
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        printf("listen: %s\n", s >= 0 && listen(s, 1) == 0 ? "ok" : en(errno));
+        return 0;
+    }
+    if (argc > 2 && !strcmp(argv[1], "env")) { const char *v = getenv(argv[2]); printf("env: %s\n", v ? v : "none"); return 0; }
+    /* v1.36 step 8: N reads of a file (a stream long enough to rotate) */
+    if (argc > 3 && !strcmp(argv[1], "reads")) {
+        long n = atol(argv[2]);
+        for (long i = 0; i < n; i++) { int fd = open(argv[3], O_RDONLY); if (fd >= 0) close(fd); }
+        printf("reads: %ld\n", n);
+        return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "wait")) { printf("waiting\n"); fflush(stdout); for (;;) sleep(1); }
     if (argc > 1 && !strcmp(argv[1], "launch")) {
         setvbuf(stdout, NULL, _IONBF, 0);
@@ -218,6 +238,21 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "arch")) { setvbuf(stdout, NULL, _IONBF, 0); arch32(); return 0; }
+    /* v1.36 step 5: a sub-agent and a confined MCP server, each launched by
+     * a child; then one launched by the container's first process itself */
+    if (argc > 1 && !strcmp(argv[1], "sub")) {
+        setvbuf(stdout, NULL, _IONBF, 0);
+        launch("launch_sub", "/sub");
+        launch("launch_srv", "/srv");
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "subself")) {
+        setvbuf(stdout, NULL, _IONBF, 0);
+        char *const av[] = { "/sub", NULL };
+        execv("/sub", av);
+        printf("subself: %s\n", en(errno));
+        return 0;
+    }
     if (argc > 1) { printf("exec_again: ran\n"); return 0; }
     setvbuf(stdout, NULL, _IONBF, 0);
     readf("read_allowed", "/data/allowed");

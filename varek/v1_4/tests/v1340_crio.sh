@@ -25,7 +25,12 @@
 #      not: then the webhook's check is the one);
 #   F  not annotated, with the unsupervised profile, which the plugin then
 #      leaves: its command never runs (a container of a supervised pod the
-#      plugin does not adjust does not run).
+#      plugin does not adjust does not run);
+#   G  (v1.35 step 4c, D11) as A, and annotated varek.dev/plan: busybox: the
+#      plugin passes the plan's name and SHA-256, the node agent decides the
+#      plan in the container's view and holds the run to it: a read and a
+#      launch the plan names, a launch the policy allows and no step names
+#      refused (outside_plan).
 # Where CRI-O has no network configured, a bridge one is put in
 # /etc/cni/net.d for the run, and taken out after.
 # Under each runtime CRI-O has of crun and runc (--runtimes). The summary is
@@ -81,6 +86,20 @@ allow exec /bin/true
 allow exec /bin/sleep
 EOF
 chmod 644 "$OUT/policies/varek/busybox.policy"
+# v1.35 step 4c: pod G's plan (the shell's own reads, a read and two launches)
+cat > "$OUT/policies/varek/busybox.plan" <<'EOF'
+plan 1.35
+action bin file_open /bin/ open=read
+action lib file_open /lib/ open=read
+action lib64 file_open /lib64/ open=read
+action cache file_open /etc/ld.so.cache open=read
+action host file_open /etc/hostname open=read
+action proc file_open /proc/self/ open=read
+action null file_open /dev/null
+action cat process_exec /bin/cat
+action sleep process_exec /bin/sleep
+EOF
+chmod 644 "$OUT/policies/varek/busybox.plan"
 # VAREK's unsupervised profile, as the chart puts it under the kubelet's seccomp root
 mkdir -p "$OUT/seccomp/varek"
 echo '{"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRet":1,"syscalls":[]}' > "$OUT/seccomp/varek/unsupervised.json"
@@ -124,16 +143,18 @@ CHECK='while read -r k v; do case "$k" in Seccomp:|NoNewPrivs:) echo "$k $v" ;; 
 
 for rt in $RUNTIMES; do
     say "== $rt"
-    for pod in a:busybox:true b::true c:busybox:false d:nosuch:true e:busybox:true f::true; do
-        IFS=: read -r name pol ro <<< "$pod"
+    for pod in a:busybox:true b::true c:busybox:false d:nosuch:true e:busybox:true f::true g:busybox:true:busybox; do
+        IFS=: read -r name pol ro plan <<< "$pod"
         W="$OUT/work-$rt-$name"; mkdir -p "$W"; chmod 1777 "$W"
-        python3 - "$rt" "$name" "$pol" "$ro" "$POD_IMG" "$CHECK" "$W" "$OUT" <<'EOF'
+        python3 - "$rt" "$name" "$pol" "$ro" "$POD_IMG" "$CHECK" "$W" "$OUT" "$plan" <<'EOF'
 import json, sys, uuid
-rt, name, pol, ro, img, check, work, out = sys.argv[1:]
+rt, name, pol, ro, img, check, work, out, plan = sys.argv[1:]
 pod = {"metadata": {"name": f"varek-{name}-{rt}", "namespace": "varek", "uid": str(uuid.uuid4()), "attempt": 0},
        "log_directory": out, "linux": {"security_context": {"namespace_options": {"network": 0, "pid": 1}}}}
 if pol:
     pod["annotations"] = {"varek.dev/policy": pol}
+if plan:
+    pod["annotations"]["varek.dev/plan"] = plan
 # CRI's profile types: 0 RuntimeDefault, 2 Localhost
 seccomp = {"profile_type": 0}
 if (pol and name != "e") or name == "f":
@@ -194,6 +215,14 @@ sys.exit(0 if s["policy"] == "busybox" and s["launcher"] is True and s["pod"]["n
     fi
     check "F (the unsupervised profile, the container not adjusted): its command never ran" sh -c \
         "! grep -q '^read_allowed' '$OUT/$rt-f.log' && ! grep -q 'varek-f-$rt' '$OUT/varek-nri.log'"
+    check "G (a plan): a read and a launch its steps name ran; a launch the policy allows and no step names, refused" sh -c \
+        "grep -qx 'read_allowed: 0' '$OUT/$rt-g.log' && grep -q '^launch_allowed: [1-9]' '$OUT/$rt-g.log'"
+    check "G: its stream: run_start names the plan and holds the run; the refused launch outside_plan" python3 -c '
+import json, sys
+recs = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+s = [r for r in recs if r.get("event") == "run_start"][0]
+sys.exit(0 if s["node"]["plan"] == "busybox" and s["hold"]["plan"].endswith(".plan") and
+         any(r.get("rule") == "outside_plan" and r.get("target") == "/bin/true" for r in recs) else 1)' "$(stream g)"
 done
 echo
 [ "$fail" = 0 ] && say "v1340_crio: PASS" || say "v1340_crio: FAIL"

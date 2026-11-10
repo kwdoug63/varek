@@ -1,0 +1,49 @@
+# v1.36 step 12 (tests/soak_v1340/soak.sh): the pod agent's plan, its
+# VarekPlan `agent`, under policy.txt (`require plan`). The run is held to
+# it: a call the policy allows that no step covers is refused (outside_plan).
+# It names all the policy gives but /etc/hostname, which the outside_plan
+# probe reads. @ALLOWED@ is the allowed service's name, as in the policy.
+plan 1.35
+#
+# the system and the interpreter, read; the agent's code, read
+action usr file_open /usr/ open=read
+action lib file_open /lib/ open=read
+action lib64 file_open /lib64/ open=read
+action ld_cache file_open /etc/ld.so.cache open=read
+action ld_preload file_open /etc/ld.so.preload open=read
+action gitattributes file_open /etc/gitattributes open=read
+action localtime file_open /etc/localtime open=read
+action passwd file_open /etc/passwd open=read
+action group file_open /etc/group open=read
+action nsswitch file_open /etc/nsswitch.conf open=read
+action host_conf file_open /etc/host.conf open=read
+action hosts file_open /etc/hosts open=read
+action resolv file_open /etc/resolv.conf open=read
+action gai file_open /etc/gai.conf open=read
+action ssl file_open /etc/ssl/ open=read
+action locale_alias file_open /etc/locale.alias open=read
+action fips file_open /proc/sys/crypto/fips_enabled open=read
+action proc_self file_open /proc/self/ open=read
+action dev_null file_open /dev/null
+action dev_urandom file_open /dev/urandom open=read
+action code file_open /varek-soak/ open=read
+#
+# its project
+action project file_open /work/
+#
+# what it launches: git, the build sub-agent, the MCP server
+action git process_exec /usr/bin/git
+action builder subagent builder
+action files subagent files
+#
+# the allowed service, and the token on its requests
+action allowed net_connect @ALLOWED@:443
+action token credential soak_token
+#
+# the MCP server's own calls (its rules, for=files)
+action f_usr file_open /usr/ open=read as=files
+action f_lib file_open /lib/ open=read as=files
+action f_lib64 file_open /lib64/ open=read as=files
+action f_ld_cache file_open /etc/ld.so.cache open=read as=files
+action f_ld_preload file_open /etc/ld.so.preload open=read as=files
+action f_notes file_open /work/project/notes/ open=read as=files

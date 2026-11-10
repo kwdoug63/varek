@@ -45,6 +45,12 @@ import tempfile
 
 import z3 as smt  # the reference SMT solver; see tools/requirements-crosscheck.txt
 
+# z3 4.x times out on the regex queries (each a disagreement): refused, by name
+if smt.get_version()[0] < 5:
+    sys.exit(f"smt_crosscheck: z3 {smt.get_version_string()} is too old: the cross-check needs z3 5.0 or "
+             "later (tools/requirements-crosscheck.txt; on aarch64 with glibc before 2.38, as RHEL 9, "
+             "pip builds it from source: it needs gcc-c++ and cmake)")
+
 L = 4095
 KNOWN = 0x007FFFC3
 ACC = 0o3
@@ -665,6 +671,7 @@ def parse_lines(raw_lines, path):
             raise PolicyError(f"{where}: for= names no confined subject")
         return k
     issuers, spiffe, require_obo = [], [], False   # v1.28.1
+    require_plan = False                           # v1.35 step 4
     if True:
         for lineno, raw in enumerate(raw_lines, 1):
             if b"\0" in raw:
@@ -687,6 +694,12 @@ def parse_lines(raw_lines, path):
                     raise PolicyError(f"{path}:{lineno}: bad require on-behalf-of")
                 require_obo = True
                 continue
+            if toks[0] == "require" and len(toks) >= 2 and toks[1] == "plan":
+                # v1.35 step 4 (D7)
+                if len(toks) != 2 or req < (1, 35) or require_plan:
+                    raise PolicyError(f"{path}:{lineno}: bad require plan")
+                require_plan = True
+                continue
             if toks[0] == "trust":
                 # v1.28.1
                 if req < (1, 28):
@@ -708,7 +721,7 @@ def parse_lines(raw_lines, path):
                 if len(toks) != 3 or toks[1] != "warden" or not m:
                     raise PolicyError(f"{path}:{lineno}: bad directive")
                 v = (int(m.group(1)), int(m.group(2)))
-                if v > (1, 31):
+                if v > (1, 35):                    # v1.35 step 4: the grammar is 1.35
                     raise PolicyError(f"{path}:{lineno}: requires newer Warden")
                 if legacy_name and v >= (1, 24):
                     raise PolicyError(f"{path}:{lineno}: require warden 1.24 after a host name")
@@ -1069,6 +1082,7 @@ def parse_lines(raw_lines, path):
     parse_policy.open_as_agent = req >= (1, 29)
     parse_policy.creds = creds                     # v1.28
     parse_policy.identity = (issuers, spiffe, require_obo)   # v1.28.1
+    parse_policy.require_plan = require_plan                 # v1.35 step 4
     parse_policy.cred_aud = cred_aud                         # v1.31
     parse_policy.subjects = subjects
     parse_policy.mcpres = mcpres
@@ -1724,7 +1738,14 @@ def fuzz_policy(rng, path):
         # v1.28: credentials, named and carried by allow request rules
         v128 = rng.random() < 0.6
         v131 = v128 and rng.random() < 0.7           # v1.31: MCP servers, confined subjects, mcp rules
-        lines.append("require warden 1.31" if v131 else "require warden 1.28" if v128 else "require warden 1.26")
+        v135 = v131 and rng.random() < 0.4           # v1.35 step 4: require plan
+        lines.append("require warden 1.35" if v135 else "require warden 1.31" if v131 else
+                     "require warden 1.28" if v128 else "require warden 1.26")
+        if v135 and rng.random() < 0.6:
+            lines.append(rng.choice(["require plan"] * 4 + ([] if valid else
+                         ["require plan x", "require plan\nrequire plan", "require plans"])))
+        elif v131 and not valid and rng.random() < 0.1:
+            lines.append("require plan")                # before 1.35: refused
         lines.append("proxy inspect" if valid or rng.random() < 0.8 else rng.choice(["proxy on", ""]))
         cred_names = []
         if v128 or (not valid and rng.random() < 0.2):
@@ -2279,6 +2300,7 @@ def check_policy(vdp, policy, rng, nq, stats, verbose, checker=None):
     want_i = [f"issuer {a} {b} {c or '-'}" for a, b, c in iss] + [f"spiffe {d} {b}" for d, b in spf]
     want_i += [f"subagent {r['line']} {r['subagent']}" for r in rules if r.get("subagent")]
     want_i += ["require on-behalf-of"] if robo else []
+    want_i += ["require plan"] if parse_policy.require_plan else []   # v1.35 step 4
     # v1.31: the confined subjects, the rules for each, the MCP resources
     want_i += [f"confined {k + 1} {n} {'mcp' if m else 'subagent'} {ln} {rules[ri].get('sha256') or '-'}"
                for k, (n, ri, m, ln) in enumerate(parse_policy.subjects)]

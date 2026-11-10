@@ -1,0 +1,17 @@
+{
+  "targets": {
+    "default": {
+      "resources": {
+        "mcp": {
+          "gateways": {
+            "travel-tools": {
+              "gatewayId": "travel-tools-z9x8c7v6b5",
+              "gatewayArn": "arn:aws:bedrock-agentcore:us-west-2:111122223333:gateway/travel-tools-z9x8c7v6b5",
+              "gatewayUrl": "https://travel-tools-z9x8c7v6b5.gateway.bedrock-agentcore.us-west-2.amazonaws.com/mcp"
+            }
+          }
+        }
+      }
+    }
+  }
+}

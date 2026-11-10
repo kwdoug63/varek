@@ -59,6 +59,9 @@ import time
 LINE = re.compile(rb'^\{"run":"[0-9a-f]{32}","event":"(run_start|checkpoint|run_end)",'
                   rb'"records":(0|[1-9][0-9]{0,19}),"chain":"[0-9a-f]{64}"(,"sig":"[0-9a-f]{128}")?,'
                   rb'"timestamp_ns":(0|[1-9][0-9]{0,18})\}$')
+# v1.36 step 9 (D10): the node agent's key, announced at each start
+NODE_KEY_LINE = re.compile(rb'^\{"event":"node_key","node":"[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?",'
+                           rb'"key":"[0-9a-f]{64}","timestamp_ns":(0|[1-9][0-9]{0,18})\}$')
 MAX_LINE = 1024
 ROTATE_AT = 16 << 20            # rotate the spool once fully sent and this large
 BATCH_MAX = 1 << 20
@@ -305,7 +308,7 @@ def main(argv=None):
                 buf = b""
             good = []
             for l in lines:
-                if LINE.match(l):
+                if LINE.match(l) or NODE_KEY_LINE.match(l):
                     good.append(l)
                 elif l.strip():
                     log(f"ignoring a line that is not an anchor record ({l[:60]!r})")

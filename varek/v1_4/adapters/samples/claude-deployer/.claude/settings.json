@@ -1,0 +1,4 @@
+{
+  "permissions": { "allow": [ "Read(./deploy/**)", "mcp__deploy" ] },
+  "env": { "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1" }
+}

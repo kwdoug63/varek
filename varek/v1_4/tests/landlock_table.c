@@ -241,6 +241,12 @@ static int probe(void) {
     int tf = open(scratch, O_TMPFILE | O_RDWR, 0600);
     int have_tmpfile = tf >= 0;
     if (tf >= 0) close(tf);
+    /* v1.36: MFD_NOEXEC_SEAL and MFD_EXEC came with Linux 6.3; before it
+     * (Amazon Linux 2023's 6.1) memfd_create refuses them (EINVAL), so the
+     * memfd rows cannot be set up there, and say so */
+    int mf = (int)syscall(SYS_memfd_create, "probe", MFD_NOEXEC_SEAL);
+    int have_mfd_flags = mf >= 0;
+    if (mf >= 0) close(mf);
     printf("%-28s\t%-62s\t%-16s\t%-16s\t%s\n", "id", "launch", "control", "in the domain", "verdict");
     for (size_t i = 0; i < sizeof rows / sizeof *rows; i++) {
         char c[64], d[64];
@@ -249,6 +255,8 @@ static int probe(void) {
         const char *v;
         int refused = !strncmp(d, "refused", 7);
         if (!have_tmpfile && !strncmp(rows[i].id, "tmpfile", 7)) v = "skip (no O_TMPFILE on this filesystem)";
+        else if (!have_mfd_flags && !strncmp(rows[i].id, "memfd", 5))
+            v = "skip (no MFD_NOEXEC_SEAL or MFD_EXEC before Linux 6.3)";
         else if (rows[i].must_refuse < 0) { v = !strcmp(d, "runs") ? "ok (runs)" : "FAIL (the set's program must run)"; bad |= strcmp(d, "runs") != 0; }
         else if (rows[i].must_refuse) {
             if (!refused) { v = "FAIL (must be refused)"; bad = 1; }

@@ -569,6 +569,13 @@ static struct pending_op *g_pend[MAX_PENDING];
 static int g_npend = 0;
 static size_t g_pend_bytes = 0;
 
+/* v1.36 step 12 (review): whether a pending operation's record is still to
+ * be written for subject s (a sub-agent named by one is not released) */
+static bool pend_names_subject(int s) {
+    for (int i = 0; i < g_npend; i++) if (g_pend[i]->act && g_pend[i]->act->subject == s) return true;
+    return false;
+}
+
 static void ts_add_ns(struct timespec *t, int64_t ns) {
     t->tv_sec += ns / 1000000000LL;
     t->tv_nsec += ns % 1000000000LL;
@@ -733,7 +740,12 @@ static int proxy_dial(int s, int dom, const struct sockaddr_storage *to, socklen
         const char *c = strrchr(a->dialed, ':');
         px_handed_off(g_proxy_conns, c ? (unsigned)strtoul(c + 1, NULL, 10) : 0, a->subject);
     }
-    return connect(s, (const struct sockaddr *)to, tl) < 0 ? -errno : 0;
+    if (connect(s, (const struct sockaddr *)to, tl) < 0 && errno != EINPROGRESS) {
+        int e = errno;
+        px_handoff_drop(g_proxy_conns);          /* v1.36 step 12 (review): it will never be reported */
+        return -e;
+    }
+    return 0;
 }
 
 static void net_connect(int notify_fd, const struct seccomp_notif *req, struct action *a,
@@ -890,14 +902,19 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
         fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n",
                 g_records, a->check_why);
     }
+    /* v1.35 step 4: outside the run's plan (a connection handed to the proxy
+     * is held where the proxy reads its destination, warden_pxdecide.inc.c) */
+    bool held = false;
+    if (d_final == DEC_ALLOW && !a->proxy_handoff && hold_refuses(a)) { d_final = DEC_DENY; held = true; }
     /* v1.29: a dry run dials a connect the policy refuses as it dials an
      * allowed one (the agent has no network of its own), recorded as not
-     * enforced; never a Unix socket, which the Warden would reach as root */
+     * enforced; never a Unix socket, which the Warden would reach as root.
+     * v1.36 step 7 (D6a): in a pod, refused all the same (dry_net_let) */
     if (d_final != DEC_ALLOW &&
-        (fam == AF_UNIX || !dry_let(a, cert_refused ? "certificate_refused" : decision_rule_id(a, d_raw)))) {
+        (fam == AF_UNIX || held || !dry_net_let(a, cert_refused ? "certificate_refused" : decision_rule_id(a, d_raw)))) {
         close(ag);
         if (pin >= 0) close(pin);
-        net_record(tid, a, d_raw, d_final,
+        net_record(tid, a, d_raw, d_final, held ? "outside_plan" :
                    cert_refused ? "certificate_refused" : decision_rule_id(a, d_raw), t0, EACCES);
         send_simple(notify_fd, req->id, DEC_DENY);
         return;
@@ -1074,7 +1091,7 @@ static void net_connect(int notify_fd, const struct seccomp_notif *req, struct a
 /* ---- sendmsg / sendmmsg on a connected socket ---- */
 
 #define RELAY_MAX (256 * 1024)
-struct msghdr_user {                      /* struct msghdr as the x86_64 kernel reads it */
+struct msghdr_user {                      /* struct msghdr as the kernel reads it (x86_64, aarch64) */
     uint64_t name;
     uint32_t namelen, pad0;
     uint64_t iov;

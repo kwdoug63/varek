@@ -326,7 +326,7 @@ def is_dynamic(path):
             data = fh.read()
     except OSError:
         return False
-    if data[:4] != b"\x7fELF" or data[4] != 2:  # 64-bit only (the Warden is x86_64)
+    if data[:4] != b"\x7fELF" or data[4] != 2:  # 64-bit only (the Warden is x86_64 or arm64, both little-endian)
         return False
     import struct
     phoff = struct.unpack_from("<Q", data, 0x20)[0]

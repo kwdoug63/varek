@@ -10,7 +10,13 @@ allow path /etc/localtime readonly
 allow path /usr/lib/ readonly
 allow path /lib/ readonly
 allow path /lib64/ readonly
+allow path /usr/lib64/ readonly                # RHEL, Fedora: /lib64 is /usr/lib64 (and Python's library)
 allow path /usr/local/lib/ readonly            # Python site-packages (requests)
+allow path /usr/local/lib64/ readonly          # ... their compiled parts, on RHEL
+allow path /etc/pki/tls/certs/ readonly        # RHEL: /etc/ssl/certs leads here
+allow path /etc/pki/ca-trust/extracted/ readonly
+allow path exact /etc/pki/tls/openssl.cnf readonly
+allow path /etc/crypto-policies/back-ends/ readonly # RHEL: openssl.cnf includes these
 allow path /usr/share/ readonly
 allow path /opt/node22/ readonly               # the Node.js install used here
 allow path /proc/self/ readonly

@@ -1,35 +1,40 @@
 {{/* SPDX-License-Identifier: MIT
   OpenShift: the node agent's pod is privileged, in the node's PID namespace,
-  with host paths; this lets the chart's node service account (and no other)
-  run it. The webhook runs under restricted-v2, as the namespace's user (the
-  chart then sets no user for it). */}}
+  with host paths. Its SecurityContextConstraints (varek-node-agent) is the
+  varek-crds chart's, installed before this one, so that it exists when the
+  DaemonSet makes its first pod: Helm creates an SCC (a kind it does not know)
+  after a DaemonSet, so one of this chart's own came too late for that pod,
+  which OpenShift refused once before the DaemonSet's retry was admitted. It
+  names no user; this lets the chart's node service account (and no other)
+  use it, by a ClusterRole bound in the release's namespace, which Helm
+  creates before the DaemonSet. The webhook runs under restricted-v2, as the
+  namespace's user (the chart then sets no user for it). */}}
 {{- if .Values.openshift.enabled }}
-apiVersion: security.openshift.io/v1
-kind: SecurityContextConstraints
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
 metadata:
-  name: {{ include "varek.nodeName" . }}
+  name: {{ include "varek.nodeName" . }}-scc
   labels: {{- include "varek.labels" . | nindent 4 }}
-allowPrivilegedContainer: true
-allowPrivilegeEscalation: true
-allowHostPID: true
-allowHostDirVolumePlugin: true
-allowHostIPC: false
-allowHostNetwork: false
-allowHostPorts: false
-# the init container's, to make the node's directories root's
-allowedCapabilities: [CHOWN, DAC_OVERRIDE, FOWNER]
-defaultAddCapabilities: []
-requiredDropCapabilities: []
-readOnlyRootFilesystem: false
-runAsUser: { type: RunAsAny }
-seLinuxContext: { type: RunAsAny }
-fsGroup: { type: RunAsAny }
-supplementalGroups: { type: RunAsAny }
-seccompProfiles: ["*"]
-# projected: the service account's token
-volumes: [hostPath, secret, emptyDir, projected, configMap, downwardAPI]
-users:
-  - system:serviceaccount:{{ .Release.Namespace }}:{{ include "varek.nodeName" . }}
+rules:
+  - apiGroups: [security.openshift.io]
+    resources: [securitycontextconstraints]
+    resourceNames: [varek-node-agent]
+    verbs: [use]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "varek.nodeName" . }}-scc
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "varek.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "varek.nodeName" . }}-scc
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "varek.nodeName" . }}
+    namespace: {{ .Release.Namespace }}
 {{- end }}
 {{- if .Values.openshift.enabled }}
 {{- $sup := printf "%s-supervised" .Release.Name }}

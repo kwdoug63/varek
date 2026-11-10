@@ -5,6 +5,9 @@ leased secret), AWS Secrets Manager (each request's SigV4 signature checked,
 written here from the AWS documentation, apart from the C signer) and the
 instance metadata service (IMDSv2). Vault and Secrets Manager are served
 over HTTPS with a CA made for the test; the metadata service over HTTP.
+v1.36 step 4 (D1): and the DaemonSet's sign-ins, each checking the token it
+is given: Vault's Kubernetes login, STS's AssumeRoleWithWebIdentity (IRSA,
+over HTTPS) and the EKS Pod Identity agent (over HTTP).
 
   v1280_stores.py DIR
 
@@ -33,6 +36,14 @@ CERT_HOURS = float(os.environ.get("V1280_CERT_HOURS", "2"))     # the soak needs
 VAULT_TOKEN = "s.test-token-v1280"
 AWS_ID, AWS_SECRET = "AKIDV1280TEST", "v1280-test-secret-key/abc"
 ROLE_ID, ROLE_SECRET, ROLE_TOKEN = "ASIAROLEV1280", "role-secret-v1280", "role-session-token-v1280"
+# v1.36 step 4: the service account's tokens (JWT-shaped), what each sign-in gives
+K8S_JWT = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ2YXJlay1ub2RlIn0.c2lnLWs4cy12MTM2MA"
+K8S_VAULT_TOKEN = "s.k8s-login-v1360"
+IRSA_JWT = "eyJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJzdHMuYW1hem9uYXdzLmNvbSJ9.c2lnLWlyc2E"
+IRSA_ROLE = "arn:aws:iam::111122223333:role/varek-node"
+IRSA_ID, IRSA_SECRET, IRSA_TOKEN = "ASIAIRSAV1360", "irsa-secret-v1360/xyz", "irsa-session-token-v1360"
+POD_JWT = "eyJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJwb2RzLmVrcy5hbWF6b25hd3MuY29tIn0.c2lnLXBvZA"
+POD_ID, POD_SECRET, POD_TOKEN = "ASIAPODV1360", "pod-secret-v1360", "pod-session-token-v1360"
 VALUES = {                                     # what each store holds (test values, not secrets)
     "vault2": "vault-kv2-value-7f3a", "vault1": "vault-kv1-value-91c2", "lease": "db-password-5d8e",
     "short": "db-short-6b1f", "stuck": "db-stuck-0c4a", "soak": "db-soak-3e9d", "aws": "aws-sm-value-c4b1",
@@ -115,9 +126,17 @@ class Stores(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = self.path
+        if p == "/v1/credentials":                                  # v1.36: the EKS Pod Identity agent
+            ok = self.headers.get("Authorization") == POD_JWT
+            LOG.write(f"pod-identity GET token={'ok' if ok else 'bad'}\n")
+            if not ok:
+                return self.send(400, {"code": "InvalidTokenException"})
+            return self.send(200, {"AccessKeyId": POD_ID, "SecretAccessKey": POD_SECRET, "Token": POD_TOKEN,
+                                   "AccountId": "111122223333", "Expiration": "2099-01-01T00:00:00Z"})
         if p.startswith("/v1/"):                                   # Vault
-            ok = self.headers.get("X-Vault-Token") == VAULT_TOKEN
-            LOG.write(f"vault GET {p} token={'ok' if ok else 'bad'}\n")
+            ok = self.headers.get("X-Vault-Token") in (VAULT_TOKEN, K8S_VAULT_TOKEN)
+            LOG.write(f"vault GET {p} token={'ok' if ok else 'bad'}"
+                      + (" (the Kubernetes login's)" if self.headers.get("X-Vault-Token") == K8S_VAULT_TOKEN else "") + "\n")
             if not ok:
                 return self.send(403, {"errors": ["permission denied"]})
             if p == "/v1/secret/data/agents/gh":
@@ -185,14 +204,40 @@ class Stores(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         b = self.body()
+        if self.path.startswith("/v1/auth/") and self.path.endswith("/login"):      # v1.36: Vault's Kubernetes auth
+            try:
+                j = json.loads(b or b"{}")
+            except ValueError:
+                j = {}
+            mount = self.path[len("/v1/auth/"):-len("/login")]
+            ok = j.get("jwt") == K8S_JWT and j.get("role") == "agents"
+            LOG.write(f"vault POST login mount={mount} role={j.get('role')} jwt={'ok' if ok else 'bad'}\n")
+            if not ok:
+                return self.send(403, {"errors": ["permission denied"]})
+            return self.send(200, {"auth": {"client_token": K8S_VAULT_TOKEN, "lease_duration": 3600}})
+        if self.headers.get("Content-Type", "").startswith("application/x-www-form-urlencoded"):  # v1.36: STS
+            import urllib.parse
+            q = dict(urllib.parse.parse_qsl(b.decode()))
+            ok = (q.get("Action") == "AssumeRoleWithWebIdentity" and q.get("WebIdentityToken") == IRSA_JWT
+                  and q.get("RoleArn") == IRSA_ROLE and q.get("RoleSessionName") and q.get("Version") == "2011-06-15")
+            LOG.write(f"sts POST {q.get('Action')} role={q.get('RoleArn')} token={'ok' if ok else 'bad'}\n")
+            if not ok:
+                return self.send(403, b"<ErrorResponse><Error><Code>AccessDenied</Code></Error></ErrorResponse>")
+            x = ("<AssumeRoleWithWebIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">"
+                 "<AssumeRoleWithWebIdentityResult><Credentials>"
+                 f"<AccessKeyId>{IRSA_ID}</AccessKeyId><SecretAccessKey>{IRSA_SECRET}</SecretAccessKey>"
+                 f"<SessionToken>{IRSA_TOKEN}</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration>"
+                 "</Credentials></AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>")
+            return self.send(200, x.encode())
         if self.headers.get("X-Amz-Target") != "secretsmanager.GetSecretValue":
             return self.send(400, {"__type": "UnknownOperation"})
         h = {k.lower(): v for k, v in self.headers.items()}
         h["Authorization"] = self.headers.get("Authorization", "")
         h["X-Amz-Date"] = self.headers.get("X-Amz-Date", "")
         akid = h["Authorization"].split("Credential=")[-1].split("/")[0]
-        secret = {AWS_ID: AWS_SECRET, ROLE_ID: ROLE_SECRET}.get(akid)
-        tok_ok = akid != ROLE_ID or h.get("x-amz-security-token") == ROLE_TOKEN
+        secret = {AWS_ID: AWS_SECRET, ROLE_ID: ROLE_SECRET, IRSA_ID: IRSA_SECRET, POD_ID: POD_SECRET}.get(akid)
+        tok_ok = h.get("x-amz-security-token") == {ROLE_ID: ROLE_TOKEN, IRSA_ID: IRSA_TOKEN,
+                                                    POD_ID: POD_TOKEN}.get(akid, h.get("x-amz-security-token"))
         ok = secret is not None and tok_ok and sigv4_ok(h, "POST", self.path, b, secret)
         sid = json.loads(b or b"{}").get("SecretId", "")
         LOG.write(f"aws POST id={sid} key={akid} signature={'ok' if ok else 'bad'}\n")

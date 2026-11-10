@@ -1,0 +1,94 @@
+name: CodeQL
+
+# Static analysis (SAST) of the code VAREK ships and tests:
+#   c-cpp   the Warden and its tools (varek/v1_4), plan_verify (v1_6) and the
+#           v1.7 layer (v1_7), built with the same packages and make targets
+#           as warden-build.yml, so CodeQL sees exactly what CI compiles;
+#   go      the NRI plugin, the admission webhook and varek-svid
+#           (varek/v1_4/k8s) and the NRI test stand-in (varek/v1_4/tests/v1340_nri);
+#   python  the tools, adapters, tests and examples (no build).
+# Results go to the repository's code-scanning alerts.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # weekly, so new CodeQL queries run against main between pushes
+    - cron: '23 4 * * 1'
+
+# the token reads only, unless a job says otherwise
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # to upload the results to code scanning
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: c-cpp
+            build-mode: manual
+          - language: go
+            build-mode: manual
+          - language: python
+            build-mode: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies (as warden-build.yml)
+        timeout-minutes: 10
+        if: matrix.language == 'c-cpp'
+        run: |
+          # a stalled mirror is retried, not waited on (a matrix cell once hung
+          # 45 minutes in apt-get update and was cancelled before its test ran)
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+            | sudo tee /etc/apt/apt.conf.d/80varek-ci-retries > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
+
+      - name: Set up Go (the modules' toolchain)
+        if: matrix.language == 'go'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: varek/v1_4/k8s/go.mod
+          cache: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Build the Warden and its tools, plan_verify and the v1.7 layer (as warden-build.yml)
+        if: matrix.language == 'c-cpp'
+        run: |
+          make -C varek/v1_4 all
+          make -C v1_6 all
+          make -C v1_7 all
+
+      - name: Build the Go modules
+        if: matrix.language == 'go'
+        run: |
+          go version
+          (cd varek/v1_4/k8s && go build ./...)
+          (cd varek/v1_4/tests/v1340_nri && go build ./...)
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:${{ matrix.language }}

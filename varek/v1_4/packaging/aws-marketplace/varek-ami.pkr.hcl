@@ -95,7 +95,7 @@ source "amazon-ebs" "varek" {
   temporary_key_pair_type     = "ed25519"
 
   ami_name        = local.ami_name
-  ami_description = "VAREK Enterprise ${var.varek_version}: pre-execution authorization for AI agents (Amazon Linux 2023, x86_64)"
+  ami_description = "VAREK Enterprise ${var.varek_version}: kernel-enforced authorization for AI agents (Amazon Linux 2023, x86_64)"
   ena_support     = true
   sriov_support   = true
   imds_support    = "v2.0"

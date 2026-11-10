@@ -183,6 +183,16 @@ static void held_drop(int k) {
     SSL_free(g_held[k].ss);                          /* (the client's SSL frees its BIOs) */
     SSL_free(g_held[k].cs);
     close(g_held[k].fd);
+    /* v1.30 (the RHEL 9 sweep): a cut connection (max_body) ends at the
+     * server with a FIN after what was let through, not a reset. What the
+     * server sent that the proxy never read (a TLS 1.3 server's session
+     * tickets) is discarded first: closing a socket with unread data sends
+     * a reset, which can make the server drop what it has not yet read. */
+    if (g_held[k].up >= 0 && g_held[k].cut) {
+        char drain[4096];
+        (void)shutdown(g_held[k].up, SHUT_WR);
+        for (int i = 0; i < 64 && recv(g_held[k].up, drain, sizeof drain, MSG_DONTWAIT) > 0; i++) { }
+    }
     if (g_held[k].up >= 0) close(g_held[k].up);
     if (g_held[k].credbuf && g_held[k].buf)
         OPENSSL_cleanse(g_held[k].buf, g_held[k].bufcap ? g_held[k].bufcap : PP_IN_MAX);   /* v1.28 */
@@ -1291,6 +1301,14 @@ static void held_read(int k) {
     h->since = mono_ms();
 }
 
+/* v1.36 step 4: which step of the start failed, to the Warden (stderr is
+ * /dev/null), in place of WP_MSG_READY */
+static void start_fail(int ctl, const char *what, int err) {
+    struct wp_startfail f = { .type = WP_MSG_STARTFAIL, .err = err };
+    snprintf(f.what, sizeof f.what, "%s", what);
+    (void)send(ctl, &f, sizeof f, MSG_NOSIGNAL);
+}
+
 int wp_helper_main(int ctl) {
     signal(SIGPIPE, SIG_IGN);
     /* v1.26.1: not dumpable, so no process of the proxy's own user can read
@@ -1298,7 +1316,7 @@ int wp_helper_main(int ctl) {
     (void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
     g_ctl = ctl;
     int ls = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-    if (ls < 0) { perror("[proxy] socket"); return 1; }
+    if (ls < 0) { perror("[proxy] socket"); start_fail(ctl, "socket", errno); return 1; }
     struct sockaddr_in a;
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
@@ -1307,7 +1325,9 @@ int wp_helper_main(int ctl) {
     socklen_t al = sizeof a;
     if (bind(ls, (struct sockaddr *)&a, sizeof a) < 0 || listen(ls, 1024) < 0 ||
         getsockname(ls, (struct sockaddr *)&a, &al) < 0) {
+        int e = errno;
         perror("[proxy] listen");
+        start_fail(ctl, "listen on 127.0.0.1", e);
         return 1;
     }
     struct wp_msg m = { .type = WP_MSG_READY, .port = ntohs(a.sin_port) };
@@ -1488,7 +1508,10 @@ static int drop_to(uid_t u, gid_t g) {
     if (setresgid(g, g, g) < 0 || setresuid(u, u, u) < 0) return -1;
     struct __user_cap_header_struct hdr = { .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0 };
     struct __user_cap_data_struct data[2];
+    /* v1.36 step 4: the inheritable set too, which a change of user leaves
+     * (CRI-O gives a privileged container one) */
     memset(data, 0, sizeof data);
+    if (syscall(SYS_capset, &hdr, data) != 0) return -1;
     if (syscall(SYS_capget, &hdr, data) != 0) return -1;
     for (int i = 0; i < 2; i++)
         if (data[i].effective || data[i].permitted || data[i].inheritable) { errno = EPERM; return -1; }
@@ -1515,7 +1538,9 @@ int main(int argc, char **argv) {
         (void)madvise(g_cv, (size_t)WS_MAX_CREDS * WS_MAX_VALUE, MADV_DONTDUMP);
     }
     if (drop_to(u, g) < 0) {
-        fprintf(stderr, "[proxy] cannot drop to %s (%s)\n", argv[1], strerror(errno));
+        int e = errno;
+        fprintf(stderr, "[proxy] cannot drop to %s (%s)\n", argv[1], strerror(e));
+        start_fail(3, "drop to its user", e);
         return 2;
     }
     return wp_helper_main(3);

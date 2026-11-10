@@ -136,7 +136,7 @@ def build_cast(v1_6_dir: Path, warden_dir: Path, tmp: Path) -> Cast:
 
     # Scene 0 — context
     cast.comment("VAREK v1.6 demo")
-    cast.comment("Pre-execution verification of agent action graphs")
+    cast.comment("Plan-level verification of agent action graphs")
     cast.comment("USPTO Provisional 64/062,549")
     cast.pause(SHORT_PAUSE)
 
@@ -166,7 +166,7 @@ def build_cast(v1_6_dir: Path, warden_dir: Path, tmp: Path) -> Cast:
     cast.output(out + pretty_jsonl(err))
     cast.pause(SCENE_PAUSE)
 
-    # Scene 4 — patched warden, denied plan (the pre-execution suppression moment)
+    # Scene 4 — patched warden, denied plan (the plan-level suppression moment)
     cast.comment("v1.6.2 integration: patched warden refuses to fork "
                  "when plan is unsatisfied")
     cast.prompt()
@@ -288,7 +288,7 @@ def main() -> int:
     try:
         cast = build_cast(v1_6, work / "varek" / "varek" / "v1_4", scene)
         out_path = here / "varek_v1_6_demo.cast"
-        out_path.write_text(cast.render(title="VAREK v1.6 — pre-execution plan verification"))
+        out_path.write_text(cast.render(title="VAREK v1.6 — plan-level verification"))
 
         # Sanity-check: header parses, events are time-monotonic.
         with open(out_path) as f:

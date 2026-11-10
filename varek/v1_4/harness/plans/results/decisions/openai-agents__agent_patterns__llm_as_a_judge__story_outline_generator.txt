@@ -1,0 +1,4 @@
+/var/tmp/varek-plan-corpus3/policies/openai-agents__agent_patterns__llm_as_a_judge__story_outline_generator.policy: glob tokens 0 of 4096
+/var/tmp/varek-plan-corpus3/policies/openai-agents__agent_patterns__llm_as_a_judge__story_outline_generator.policy: 17 rules, 0 can never fire
+
+  OK    /var/tmp/varek-plan-corpus3/plans/openai-agents__agent_patterns__llm_as_a_judge__story_outline_generator.plan: authorized under /var/tmp/varek-plan-corpus3/policies/openai-agents__agent_patterns__llm_as_a_judge__story_outline_generator.policy (17 actions)

@@ -1,0 +1,7 @@
+# The Python packages the CI jobs install (warden-build.yml, kubernetes.yml):
+# the regression tests' packages, pytest and PyYAML. requirements-ci.txt is
+# this file compiled with every version and hash pinned (pip install
+# --require-hashes); Dependabot recompiles it.
+-r requirements-test.txt
+pytest
+pyyaml

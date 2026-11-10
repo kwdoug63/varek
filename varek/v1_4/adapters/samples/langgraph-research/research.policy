@@ -1,0 +1,30 @@
+# The sample's policy (VAREK v1.35): the research graphs may call Anthropic's
+# and OpenAI's APIs and every tool of the docs server, which only reads. The
+# researcher graph's plan is authorized under it; the publisher's is refused:
+# it launches an MCP server (files) over stdio, and no rule here launches
+# that sub-agent.
+require warden 1.35
+proxy inspect
+allow path /usr/ readonly
+allow path /lib/ readonly
+allow path /lib64/ readonly
+deny  path /etc/shadow
+allow path /etc/ readonly
+allow path /proc/self/ readonly
+allow path exact /proc/stat readonly
+allow path exact /proc/cpuinfo readonly
+allow path exact /proc/meminfo readonly
+allow path exact /proc/sys/crypto/fips_enabled readonly
+allow path /sys/devices/system/cpu/ readonly
+allow path /sys/fs/cgroup/ readonly
+allow path exact /dev/null
+allow path exact /dev/urandom readonly
+allow path /tmp/
+allow path /srv/research/ readonly
+allow host api.anthropic.com:443
+allow host api.openai.com:443
+allow host docs.example.com:443
+allow mcp https://docs.example.com/mcp initialize
+allow mcp https://docs.example.com/mcp notifications/initialized
+allow mcp https://docs.example.com/mcp tools/list
+allow mcp https://docs.example.com/mcp tools/call *

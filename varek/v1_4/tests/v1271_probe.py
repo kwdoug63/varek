@@ -12,6 +12,7 @@ import mmap
 import os
 import shutil
 import sys
+import sysconfig
 
 W = sys.argv[1]
 libc = ctypes.CDLL(None, use_errno=True)
@@ -28,7 +29,8 @@ def err(e):
 
 # a system library, at its own path and as a copy in the writable directory
 lib = "libm.so.6"                                      # a library every glibc host has
-src = next(os.path.join(d, lib) for d in ("/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu",
+MA = sysconfig.get_config_var("MULTIARCH") or "x86_64-linux-gnu"    # aarch64-linux-gnu on arm64
+src = next(os.path.join(d, lib) for d in ("/lib/" + MA, "/usr/lib/" + MA,
                                           "/lib64", "/usr/lib64", "/lib", "/usr/lib")
            if os.path.exists(os.path.join(d, lib)))
 dst = os.path.join(W, "copy-" + lib)

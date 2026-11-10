@@ -574,6 +574,15 @@ PY
         sh -c "grep -Eq 'proxy: connection 8 \((none|tls)\) refused by the proxy: no whole request within 10 s' '$OUT/p.log' && grep -q '^DRIP closed 1[0-3]$' '$OUT/p.out'"
     check "the names, not the bytes, reach the Warden: three decisions and five refusals by the proxy" \
         sh -c "[ \$(grep -c '\"action\":\"net.proxy\"' '$OUT/p.log') = 3 ] && [ \$(grep -c 'proxy: connection' '$OUT/p.log') = 5 ]"
+    # v1.36 step 12: until then the stream held a refused connection's
+    # hand-off (allowed, handed to the proxy) and nothing of its refusal
+    check "each of the five refusals by the proxy in the stream: a proxy_unreadable record, its kind and reason" \
+        python3 -c 'import json, sys
+R = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{\"event\":\"proxy_unreadable\"")]
+got = {(r["proxy_conn"], r["proxy_kind"], r["why"]) for r in R if "chain" in r}
+want = {(2, "tls", "no SNI"), (5, "connect", "an SNI that is not the CONNECT target"), (6, "none", "neither TLS nor HTTP"),
+        (7, "connect", "no whole request within 10 s")}
+sys.exit(0 if len(R) == 5 and want <= got and any(c == 8 and w == "no whole request within 10 s" for c, k, w in got) else 1)' "$OUT/p.log"
     check "the audit accepts the run" \
         python3 "$HERE/tools/varek_audit.py" --policy "$POLP" --checker "$CERT" "$OUT/p.log"
     rm -rf "$W"
@@ -622,7 +631,14 @@ while True:
 PY
     SRV="$SRV $!"
     mkdir -p "$OUT/www"; echo "http-ok" > "$OUT/www/x.txt"
-    python3 -m http.server "$HP" --bind "$HOSTIP" --directory "$OUT/www" --protocol HTTP/1.1 > "$OUT/http6.log" 2>&1 &
+    # http.server's --protocol is Python 3.11's; RHEL 9 has 3.9: the same server, HTTP/1.1 set here
+    python3 - "$HP" "$HOSTIP" "$OUT/www" > "$OUT/http6.log" 2>&1 <<'PY' &
+import functools, http.server, sys
+class H(http.server.SimpleHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+http.server.ThreadingHTTPServer((sys.argv[2], int(sys.argv[1])),
+                                functools.partial(H, directory=sys.argv[3])).serve_forever()
+PY
     SRV="$SRV $!"
     PORT=$((20000 + RANDOM % 20000))
     printf '{"api.example.com": {"ttl": 30, "a": ["%s"]}, "a.svc.example.com": {"ttl": 30, "a": ["%s"]}, "b.svc.example.com": {"ttl": 30, "a": ["%s"]}, "lo.example.com": {"ttl": 30, "a": ["127.0.0.1"]}, "den.example.com": {"ttl": 30, "a": ["192.0.2.77"]}, "m6.example.com": {"ttl": 30, "aaaa": ["::ffff:127.0.0.1"]}, "d6.example.com": {"ttl": 30, "aaaa": ["::ffff:192.0.2.77"]}}\n' \

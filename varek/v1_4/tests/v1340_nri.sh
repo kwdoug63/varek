@@ -62,7 +62,7 @@ cd "$HERE" || exit 1
 gcc -O2 -I. -o "$S/v1340_oci_filter" tests/v1340_oci_filter.c -lseccomp 2> "$OUT/build.log" &&
 gcc -O2 -static -o "$S/v1340_listener" tests/v1340_listener.c 2>> "$OUT/build.log" &&
 gcc -O2 -static -o "$S/v1340_init" tests/v1340_init.c 2>> "$OUT/build.log" &&
-(cd tests/v1340_nri && GOTOOLCHAIN=go1.24.7 CGO_ENABLED=0 GOFLAGS=-mod=readonly go build -trimpath -o "$S/v1340_nri" .) >> "$OUT/build.log" 2>&1 ||
+(cd tests/v1340_nri && GOTOOLCHAIN=go1.27.3 CGO_ENABLED=0 GOFLAGS=-mod=readonly go build -trimpath -o "$S/v1340_nri" .) >> "$OUT/build.log" 2>&1 ||
     { tail -5 "$OUT/build.log"; echo "v1340_nri.sh: the build failed" >&2; exit 1; }
 mkdir -p "$S/f" && "$S/v1340_oci_filter" 1 "$S/f" > /dev/null &&
 python3 - "$S/f/oci.json" "$S/varek.json" <<'EOF' || exit 1

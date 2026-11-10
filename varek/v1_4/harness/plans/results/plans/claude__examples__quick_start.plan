@@ -1,0 +1,40 @@
+# Written by `varek plan generate --from claude` (VAREK 1.35.0, adapters/claude_agent.py)
+# from --allow
+# 2 allow rule(s), 0 MCP server(s), 0 sub-agent(s)
+# Each step names something the agent is given. Held to this plan (varek run --hold-to-plan,
+# or a policy's `require plan`), the run is refused a call the policy allows that no step
+# covers.
+plan 1.35
+#
+# the language runtime's own reads, and the agent's code
+action sys_usr file_open /usr/ open=read
+action sys_lib file_open /lib/ open=read
+action sys_lib64 file_open /lib64/ open=read
+action sys_etc file_open /etc/ open=read
+action proc_self file_open /proc/self/ open=read
+action dev_null file_open /dev/null
+action dev_urandom file_open /dev/urandom open=read
+action tmp file_open /tmp/
+action proc_stat file_open /proc/stat open=read
+action proc_cpuinfo file_open /proc/cpuinfo open=read
+action proc_meminfo file_open /proc/meminfo open=read
+action fips file_open /proc/sys/crypto/fips_enabled open=read
+action sys_cpu file_open /sys/devices/system/cpu/ open=read
+action cgroup file_open /sys/fs/cgroup/ open=read
+action app file_open /var/tmp/corpus-src/claude-agent-sdk-python/examples/ open=read
+action file__claude file_open /home/agent/.claude/
+action file__claude_json file_open /home/agent/.claude.json
+#
+# the hosts the agent reaches
+#   api.anthropic.com:443: Anthropic's API
+action model net_connect api.anthropic.com:443
+#   statsig.anthropic.com:443: the CLI's telemetry (off with the settings' env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1)
+action cli_telemetry net_connect statsig.anthropic.com:443
+#
+# the programs the agent launches
+#   the Claude Code CLI the SDK runs
+action claude_cli process_exec /var/tmp/lg/venv/lib/python3.11/site-packages/claude_agent_sdk/_bundled/claude
+#
+# allow rule Read: every Read call, which no step can name: the policy decides each
+# allow rule Write: every Write call, which no step can name: the policy decides each
+# the CLI also reports errors to Sentry unless DISABLE_ERROR_REPORTING=1: refused unless named

@@ -53,6 +53,25 @@ docker build -f packaging/container/Containerfile -t varek .
 
 `podman build` takes the same arguments.
 
+The images carry the labels Red Hat's container certification (preflight)
+asks for: `name`, `vendor`, `version`, `release`, `summary`,
+`description` and `maintainer`, each VAREK's, since the UBI base image's
+name an image and a vendor of Red Hat's; and the licenses are in
+`/licenses`. A build sets the version with `--build-arg VAREK_VERSION=` and
+the commit with `--build-arg VAREK_REVISION=` (the release workflow passes
+both; a local build says `dev`). The node image runs as root, for the node
+agent: its certification project sets host-level access to Privileged,
+which Red Hat reviews (`docs/security/node-agent-privilege.md`).
+
+CI runs Red Hat's checks (preflight 1.22.0, a version Red Hat accepts
+submissions from; it refuses results from 1.14.1) on both images as built,
+on every change (`container.yml`): `packaging/container/preflight_check.sh varek
+varek-node` pushes each to a registry on the runner and checks it; every
+check must pass but `RunAsNonRoot`, which both images fail by design (they
+run as root, under host-level access Privileged). Each base image is pinned
+by digest in the `Containerfile`, so a build is reproducible; a newer base
+is taken by changing the digest there.
+
 ## Run
 
 Never `--privileged`. Drop every capability, then add only these:
@@ -174,8 +193,8 @@ Dockerfile with a small agent; CI builds it on each change and runs it
 under the settings above):
 
 ```
-FROM ghcr.io/kwdoug63/varek:1.32.0
-RUN microdnf -y install python3-pip && pip3 install --no-cache-dir requests && microdnf clean all
+FROM ghcr.io/kwdoug63/varek:1.32.0@sha256:8a5706d72bbc8d3cdffa191200ca38bddbac08915b8a0667b687d5ec4725f9cb
+RUN microdnf -y install python3-requests && microdnf clean all
 COPY agent.py /work/agent.py
 CMD ["python3", "/work/agent.py"]
 ```

@@ -4,7 +4,10 @@
 // and admission webhook use (v1.34 step 5, docs/security/v1.34-kubernetes.md,
 // D7): the VarekPolicy resource, read and watched through the API server with
 // the pod's service account, over HTTPS checked against the cluster's CA. No
-// client library: a list, a get and a watch are a few requests.
+// client library: a list, a get and a watch are a few requests. v1.35 step
+// 4c (D11): and the VarekPlan resource, a pod's plan, the same way. v1.36
+// step 4 (D2): and the VarekCredential resource, cluster-scoped
+// (credentials.go).
 package kube
 
 import (
@@ -25,11 +28,13 @@ import (
 	"time"
 )
 
-// Group, version and resource of VAREK's policies (packaging/helm/varek/crds/varekpolicy.yaml)
+// Group, version and resource of VAREK's policies (packaging/helm/varek/crds/varekpolicy.yaml),
+// and of its plans (crds/varekplan.yaml, v1.35)
 const (
 	Group    = "varek.dev"
 	Version  = "v1alpha1"
 	Resource = "varekpolicies"
+	Plans    = "varekplans"
 )
 
 // A policy's name, and a namespace's as the node agent takes it: 1 to 63 of
@@ -46,12 +51,86 @@ type Meta struct {
 	ResourceVersion string `json:"resourceVersion"`
 }
 
-// Policy is a VarekPolicy: its text is the policy as written for the Warden
+// Policy is a VarekPolicy: its text is the policy as written for the Warden;
+// or a VarekPlan (v1.35): its text is the plan, as written for the Warden; or
+// a VarekCredential (v1.36): a credential's source and the namespaces given it
 type Policy struct {
 	Metadata Meta `json:"metadata"`
 	Spec     struct {
 		Policy string `json:"policy"`
+		Plan   string `json:"plan"`
+		// v1.36 step 4 (D2): a VarekCredential's
+		Credential string   `json:"credential"`
+		Source     string   `json:"source"`
+		Namespaces []string `json:"namespaces"`
+		// v1.36 step 7 (D6, D7, D7b): a VarekPolicy's dry run, its trust
+		// bundle (a key of the chart's trust bundle ConfigMap) and its flow
+		// policy (the text of a --flow-policy file)
+		DryRun      bool   `json:"dryRun"`
+		TrustBundle string `json:"trustBundle"`
+		FlowPolicy  string `json:"flowPolicy"`
 	} `json:"spec"`
+}
+
+// TrustKey is a trust bundle's name: a ConfigMap's key, as the node agent
+// takes it (1 to 253 of a-z, A-Z, 0-9, -, _ and ., not . or ..)
+var TrustKey = regexp.MustCompile(`^[-._a-zA-Z0-9]{1,253}$`)
+
+// TrustKeyOK is whether k is a trust bundle's name
+func TrustKeyOK(k string) bool { return TrustKey.MatchString(k) && k != "." && k != ".." }
+
+// Pod is the part of a pod used here (v1.36 step 7, D7b: the breaker's
+// session is the pod's namespace and service account)
+type Pod struct {
+	Metadata struct {
+		UID string `json:"uid"`
+	} `json:"metadata"`
+	Spec struct {
+		ServiceAccountName string `json:"serviceAccountName"`
+		// v1.36 step 11 (review): the init containers, for the NRI plugin's
+		// check of the webhook's (the runtime may not say a container's image)
+		InitContainers []InitContainer `json:"initContainers"`
+	} `json:"spec"`
+}
+
+// InitContainer is what the NRI plugin reads of a pod's init container
+type InitContainer struct {
+	Name         string          `json:"name"`
+	Image        string          `json:"image"`
+	Command      []string        `json:"command"`
+	Args         []string        `json:"args"`
+	Env          json.RawMessage `json:"env"`
+	EnvFrom      json.RawMessage `json:"envFrom"`
+	VolumeMounts []struct {
+		Name        string `json:"name"`
+		MountPath   string `json:"mountPath"`
+		ReadOnly    bool   `json:"readOnly"`
+		SubPath     string `json:"subPath"`
+		SubPathExpr string `json:"subPathExpr"`
+	} `json:"volumeMounts"`
+	VolumeDevices json.RawMessage `json:"volumeDevices"`
+}
+
+// GetPod is a pod by its namespace and name; nil, nil when there is none
+func (c *Client) GetPod(ctx context.Context, ns, name string) (*Pod, error) {
+	p := &Pod{}
+	err := c.get(ctx, "/api/v1/namespaces/"+url.PathEscape(ns)+"/pods/"+url.PathEscape(name), p)
+	var se *StatusError
+	if errors.As(err, &se) && se.Code == http.StatusNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// Text is a VarekPolicy's policy, or a VarekPlan's plan
+func (p *Policy) Text(resource string) string {
+	if resource == Plans {
+		return p.Spec.Plan
+	}
+	return p.Spec.Policy
 }
 
 // List is a page of them
@@ -164,17 +243,22 @@ func (c *Client) get(ctx context.Context, path string, out interface{}) error {
 	return json.NewDecoder(io.LimitReader(resp.Body, 256<<20)).Decode(out)
 }
 
-func collection(ns string) string {
+func collection(resource, ns string) string {
 	if ns == "" {
-		return fmt.Sprintf("/apis/%s/%s/%s", Group, Version, Resource)
+		return fmt.Sprintf("/apis/%s/%s/%s", Group, Version, resource)
 	}
-	return fmt.Sprintf("/apis/%s/%s/namespaces/%s/%s", Group, Version, url.PathEscape(ns), Resource)
+	return fmt.Sprintf("/apis/%s/%s/namespaces/%s/%s", Group, Version, url.PathEscape(ns), resource)
 }
 
 // ListPolicies calls each for every namespace's policies, a page at a time,
 // and returns the list's version (a watch's start); a list whose
 // continuation expired (410) fails Gone, and is listed again
 func (c *Client) ListPolicies(ctx context.Context, each func(*Policy)) (string, error) {
+	return c.List(ctx, Resource, each)
+}
+
+// List is ListPolicies for either resource (Resource, Plans)
+func (c *Client) List(ctx context.Context, resource string, each func(*Policy)) (string, error) {
 	cont := ""
 	for {
 		q := "?limit=" + fmt.Sprint(PageSize)
@@ -182,7 +266,7 @@ func (c *Client) ListPolicies(ctx context.Context, each func(*Policy)) (string, 
 			q += "&continue=" + url.QueryEscape(cont)
 		}
 		l := &List{}
-		if err := c.get(ctx, collection("")+q, l); err != nil {
+		if err := c.get(ctx, collection(resource, "")+q, l); err != nil {
 			return "", err
 		}
 		for i := range l.Items {
@@ -197,8 +281,18 @@ func (c *Client) ListPolicies(ctx context.Context, each func(*Policy)) (string, 
 
 // GetPolicy is a namespace's policy by its name; nil, nil when there is none
 func (c *Client) GetPolicy(ctx context.Context, ns, name string) (*Policy, error) {
+	return c.Get(ctx, Resource, ns, name)
+}
+
+// GetPlan is a namespace's plan by its name (v1.35); nil, nil when there is none
+func (c *Client) GetPlan(ctx context.Context, ns, name string) (*Policy, error) {
+	return c.Get(ctx, Plans, ns, name)
+}
+
+// Get is GetPolicy for either resource
+func (c *Client) Get(ctx context.Context, resource, ns, name string) (*Policy, error) {
 	p := &Policy{}
-	err := c.get(ctx, collection(ns)+"/"+url.PathEscape(name), p)
+	err := c.get(ctx, collection(resource, ns)+"/"+url.PathEscape(name), p)
 	var se *StatusError
 	if errors.As(err, &se) && se.Code == http.StatusNotFound {
 		return nil, nil
@@ -213,7 +307,12 @@ func (c *Client) GetPolicy(ctx context.Context, ns, name string) (*Policy, error
 // the watch ends (nil: watch again from the last version seen, which it
 // returns) or fails (Gone: list again)
 func (c *Client) WatchPolicies(ctx context.Context, rv string, each func(Event) error) (string, error) {
-	resp, err := c.request(ctx, collection("")+"?watch=1&allowWatchBookmarks=true&resourceVersion="+url.QueryEscape(rv))
+	return c.Watch(ctx, Resource, rv, each)
+}
+
+// Watch is WatchPolicies for either resource
+func (c *Client) Watch(ctx context.Context, resource, rv string, each func(Event) error) (string, error) {
+	resp, err := c.request(ctx, collection(resource, "")+"?watch=1&allowWatchBookmarks=true&resourceVersion="+url.QueryEscape(rv))
 	if err != nil {
 		return rv, err
 	}
@@ -236,15 +335,18 @@ func (c *Client) WatchPolicies(ctx context.Context, rv string, each func(Event) 
 		var m struct {
 			Metadata Meta `json:"metadata"`
 		}
+		next := rv
 		if json.Unmarshal(ev.Object, &m) == nil && m.Metadata.ResourceVersion != "" {
-			rv = m.Metadata.ResourceVersion
+			next = m.Metadata.ResourceVersion
 		}
-		if ev.Type == "BOOKMARK" {
-			continue
+		// v1.35 step 9 (review): past an event only once it is applied, so a
+		// failed one is not skipped when the watch resumes
+		if ev.Type != "BOOKMARK" {
+			if err := each(ev); err != nil {
+				return rv, err
+			}
 		}
-		if err := each(ev); err != nil {
-			return rv, err
-		}
+		rv = next
 	}
 	return rv, sc.Err()
 }

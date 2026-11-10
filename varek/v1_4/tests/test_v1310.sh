@@ -129,7 +129,7 @@ refused "for= before 1.31"                        'require warden 1.29\nallow pa
 refused "confined before 1.31"                    'require warden 1.29\nallow exec /x subagent=a confined\n'            "confined needs"
 refused "audience= before 1.31"                   'require warden 1.29\ncredential a from file:/x audience=https://m.example.com/\n' "audience= needs"
 refused "trust mcp-resource before 1.31"          "require warden 1.29\ntrust mcp-resource $U\n"                       "needs \`require warden 1.31\`"
-refused "require warden 1.32"                     'require warden 1.32\n'                                                "requires Warden 1.32"
+refused "require warden 1.36"                     'require warden 1.36\n'                                                "requires Warden 1.36"
 for launcher in /usr/bin/node /usr/bin/npx /usr/local/bin/uvx /usr/bin/docker /usr/bin/env /usr/bin/python3.12 /bin/sh /lib64/ld-linux-x86-64.so.2 \
                 /usr/bin/time /usr/bin/strace /usr/bin/bwrap /usr/bin/setpriv /usr/local/bin/tsx; do       # review: more launchers
     refused "an MCP server that is $(basename "$launcher")" "${R}mcp server a exec $launcher\n" "an interpreter or a launcher"

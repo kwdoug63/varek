@@ -29,6 +29,7 @@
 
 int wp_start(wp_t *w, int exe_fd, uid_t uid, gid_t gid) {
     w->ctl = -1;
+    w->why[0] = '\0';
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) < 0) return -1;
     char ids[32];
@@ -59,6 +60,8 @@ int wp_start(wp_t *w, int exe_fd, uid_t uid, gid_t gid) {
         char *const av[] = { (char *)"warden-proxy", ids, NULL };
         char *const env[] = { NULL };
         fexecve(4, av, env);
+        struct wp_startfail f = { .type = WP_MSG_STARTFAIL, .err = errno, .what = "exec" };   /* v1.36 step 4 */
+        (void)send(3, &f, sizeof f, MSG_NOSIGNAL);
         _exit(127);
     }
     close(sv[1]);
@@ -71,16 +74,28 @@ int wp_start(wp_t *w, int exe_fd, uid_t uid, gid_t gid) {
     int one = 1;
     if (setsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &one, sizeof one) < 0) { close(sv[0]); return -1; }
     struct pollfd pf = { .fd = sv[0], .events = POLLIN };
+    union { struct wp_msg m; struct wp_startfail f; } u;
     struct wp_msg m;
     int pr;
     while ((pr = poll(&pf, 1, 5000)) < 0 && errno == EINTR) { }
     union { char b[CMSG_SPACE(sizeof(struct ucred))]; struct cmsghdr al; } cb;
-    struct iovec v = { &m, sizeof m };
+    struct iovec v = { &u, sizeof u };
     struct msghdr mh = { .msg_iov = &v, .msg_iovlen = 1, .msg_control = cb.b, .msg_controllen = sizeof cb.b };
     ssize_t n = pr == 1 ? recvmsg(sv[0], &mh, 0) : -1;
+    /* v1.36 step 4: the step of its start that failed, as it says */
+    if (n == (ssize_t)sizeof u.f && u.f.type == WP_MSG_STARTFAIL) {
+        close(sv[0]);
+        u.f.what[sizeof u.f.what - 1] = '\0';
+        int e = u.f.err > 0 && u.f.err < 4096 ? u.f.err : EPROTO;
+        snprintf(w->why, sizeof w->why, "the proxy's %s failed: %s", u.f.what, strerror(e));
+        errno = e;
+        return -1;
+    }
+    memcpy(&m, &u.m, sizeof m);
     if (n != (ssize_t)sizeof m || m.type != WP_MSG_READY || m.port == 0 || m.port > 65535) {
         close(sv[0]);
         errno = pr == 0 ? ETIMEDOUT : EPROTO;
+        if (pr == 1 && n == 0) snprintf(w->why, sizeof w->why, "the proxy ended before it was ready");
         return -1;
     }
     struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
