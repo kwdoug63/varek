@@ -8,7 +8,7 @@
 #   python3 -m venv /var/tmp/varek-fw && /var/tmp/varek-fw/bin/pip install -r adapters/requirements-frameworks.txt
 langgraph==1.2.20
 langgraph-prebuilt==1.1.1
-langchain-core==1.7.0
+langchain-core==1.7.6
 langchain-anthropic==1.7.10
 langchain-openai==1.7.2
 langchain-aws==1.9.0
