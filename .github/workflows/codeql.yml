@@ -51,8 +51,13 @@ jobs:
           persist-credentials: false
 
       - name: Install build dependencies (as warden-build.yml)
+        timeout-minutes: 10
         if: matrix.language == 'c-cpp'
         run: |
+          # a stalled mirror is retried, not waited on (a matrix cell once hung
+          # 45 minutes in apt-get update and was cancelled before its test ran)
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+            | sudo tee /etc/apt/apt.conf.d/80varek-ci-retries > /dev/null
           sudo apt-get update
           sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
 
