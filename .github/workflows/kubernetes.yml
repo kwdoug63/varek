@@ -52,7 +52,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install build dependencies
+        timeout-minutes: 10
         run: |
+          # a stalled mirror is retried, not waited on (a matrix cell once hung
+          # 45 minutes in apt-get update and was cancelled before its test ran)
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+            | sudo tee /etc/apt/apt.conf.d/80varek-ci-retries > /dev/null
           sudo apt-get update
           sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
       - name: Build the tools the test uses (the key and the certificate checker)
@@ -86,7 +91,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install build dependencies (as warden-build.yml)
+        timeout-minutes: 30
         run: |
+          # a stalled mirror is retried, not waited on (a matrix cell once hung
+          # 45 minutes in apt-get update and was cancelled before its test ran)
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+            | sudo tee /etc/apt/apt.conf.d/80varek-ci-retries > /dev/null
           sudo apt-get update
           sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
           sudo apt-get install -y openjdk-21-jdk-headless musl-tools
@@ -123,7 +133,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install build dependencies
+        timeout-minutes: 10
         run: |
+          # a stalled mirror is retried, not waited on (a matrix cell once hung
+          # 45 minutes in apt-get update and was cancelled before its test ran)
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+            | sudo tee /etc/apt/apt.conf.d/80varek-ci-retries > /dev/null
           sudo apt-get update
           sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
       - name: Build the tools the check uses (the key, the certificate checker)
