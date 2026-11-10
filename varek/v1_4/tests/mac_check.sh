@@ -178,7 +178,11 @@ done
 
 if [ "$SWEEP" = 1 ]; then
     echo "== 6a. every suite inside the VM" | tee -a "$SUM"
-    vssh "sudo /opt/varek-src/varek/v1_4/tests/arm64_sweep.sh --deps --out /var/tmp/varek-vm-sweep" > "$OUT/sweep.log" 2>&1
+    # the host suites, as the matrix's VM cells run them (tests/vm_cell.sh):
+    # the Kubernetes ones need a cluster, Go or kind, and run in kubernetes.yml
+    suites="$(sed -n 's/^\.PHONY:\(.*\)$/\1/p' "$HERE/Makefile" | tr ' ' '\n' | grep -E '^test-' |
+        grep -vxE 'test-cli|test-varek-k8s|test-varek-chart|test-v1340-kind|test-v1340-apiserver' | tr '\n' ' ')test-cli crosscheck"
+    vssh "sudo /opt/varek-src/varek/v1_4/tests/arm64_sweep.sh --deps --out /var/tmp/varek-vm-sweep $suites" > "$OUT/sweep.log" 2>&1
     vssh "cat /var/tmp/varek-vm-sweep/summary.txt 2>/dev/null || ls /var/tmp/varek-vm-sweep" > "$OUT/sweep-summary.txt" 2>&1
     tail -45 "$OUT/sweep-summary.txt" | tee -a "$SUM"
     if grep -q ' FAILED ' "$OUT/sweep-summary.txt" || ! grep -Eq '^test-[a-z0-9-]+ +ok ' "$OUT/sweep-summary.txt"; then
