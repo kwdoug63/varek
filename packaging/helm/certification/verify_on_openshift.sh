@@ -44,7 +44,10 @@ mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
 echo "== the cluster: $(oc config current-context)"
-oc api-resources --api-group=security.openshift.io -o name 2> /dev/null | grep -q '^securitycontextconstraints' ||
+# Capture oc's output before grepping it: with pipefail, `oc … | grep -q` fails at random,
+# because grep -q exits on its first match and oc, still writing, dies of SIGPIPE (exit 141)
+sccs="$(oc api-resources --api-group=security.openshift.io -o name 2> /dev/null || true)"
+grep -q '^securitycontextconstraints' <<< "$sccs" ||
     die "$(oc config current-context) is not OpenShift (KUBECONFIG?)"
 ocp="$(oc version -o json | python3 -c 'import json,sys; v=json.load(sys.stdin).get("openshiftVersion",""); print(".".join(v.split(".")[:2]))')"
 [ -n "$ocp" ] || die "oc version gives no OpenShift version"
@@ -60,7 +63,8 @@ for line in sys.stdin:
         print(f"{name} ({rt})")')"
 [ -z "$bad" ] || die "a node without CRI-O 1.35 or later: $bad"
 # NRI on: VAREK's MachineConfig (varek/v1_4/tests/soak_v1340/openshift-nri-*.yaml), every pool updated
-oc get machineconfig -o name | grep -q -- '-varek-nri$' ||
+mcs="$(oc get machineconfig -o name)"
+grep -q -- '-varek-nri$' <<< "$mcs" ||
     die "no VAREK NRI MachineConfig: oc apply -f varek/v1_4/tests/soak_v1340/openshift-nri-master.yaml (single-node; and -worker.yaml with workers), then wait for the pools"
 notready="$(oc get mcp -o jsonpath='{range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Updated")].status}{"\n"}{end}' | grep -v '=True$' || true)"
 [ -z "$notready" ] || die "a machine config pool not yet updated (oc get mcp -w): $notready"
