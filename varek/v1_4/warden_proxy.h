@@ -49,7 +49,9 @@ enum { WP_MSG_READY = 1, WP_MSG_CONN = 2, WP_MSG_REQUEST = 3, WP_MSG_UNREADABLE 
        WP_MSG_REVOKE = 22, WP_MSG_REVOKED = 23,
        /* v1.31 (docs/security/v1.31-standards.md, section 3): an MCP call,
         * struct wp_mcpreq and struct wp_mcpverdict below */
-       WP_MSG_MCPREQ = 24, WP_MSG_MCPVERDICT = 25 };
+       WP_MSG_MCPREQ = 24, WP_MSG_MCPVERDICT = 25,
+       /* v1.36 step 4: the proxy could not start, struct wp_startfail below */
+       WP_MSG_STARTFAIL = 26 };
 
 /* v1.28 (docs/security/v1.28-credential-release.md, section 3). Before the
  * agent starts, Warden -> proxy: WP_MSG_PH, each credential's placeholder
@@ -185,6 +187,14 @@ struct wp_msg {                  /* proxy -> Warden: WP_MSG_READY */
     uint32_t port;               /* the listener's port */
 };
 
+/* v1.36 step 4: proxy -> Warden, in place of WP_MSG_READY: the step of its
+ * start that failed, and its errno (its stderr is /dev/null) */
+struct wp_startfail {
+    uint32_t type;               /* WP_MSG_STARTFAIL */
+    int32_t  err;
+    char     what[40];
+};
+
 /* Warden -> proxy, step 4: a connection the Warden is about to make to the
  * listener from 127.0.0.1:from_port, for the agent's connect to dest. Sent
  * before the connect, so the proxy has it by the time it accepts. A
@@ -312,11 +322,13 @@ typedef struct {
     unsigned port;               /* its listener on 127.0.0.1 */
     uid_t    uid;
     gid_t    gid;
+    char     why[96];            /* v1.36 step 4: wp_start's failure, as the proxy reported it, or "" */
 } wp_t;
 
 /* Start the proxy as uid:gid. exe_fd: the warden-proxy binary, as the sealed
  * in-memory copy the Warden hashed (v1.26.1: see wp_load). Waits up to 5 s
- * for it to report its listener. 0, or -1 with errno set. */
+ * for it to report its listener. 0, or -1 with errno set (and w->why, when
+ * the proxy said which step of its start failed). */
 int wp_start(wp_t *w, int exe_fd, uid_t uid, gid_t gid);
 
 /* v1.26.1: read the warden-proxy binary at path into a sealed memfd (so what

@@ -303,6 +303,10 @@ typedef struct {
     vdp_spiffe_t spiffe[VDP_MAX_SPIFFE];
     size_t       nspiffe;
     bool         require_obo;
+    /* v1.35 step 4 (D7): `require plan`, after `require warden 1.35`: a run
+     * without a plan, or not held to it, refuses to start. Not part of any
+     * decision. */
+    bool         require_plan;
     /* v1.31: the confined subjects (subject k is subjects[k - 1]) and the
      * MCP resources trusted for the user's token */
     vdp_subject_t subjects[VDP_MAX_SUBJECTS];
@@ -468,6 +472,11 @@ const char *vdp_kind_name(vdp_kind_t k);
 //       in Authorization: Bearer (a request rule may not). opaque: it is not
 //       a JWT (its audience cannot be read).
 //   trust mcp-resource URL [audience AUD]   (vdp_mcpres_t)
+//
+// v1.35 (docs/security/v1.35-frameworks.md, D7), after `require warden 1.35`:
+//   require plan
+//       a run without a plan (`--plan`), or not held to it
+//       (`--hold-to-plan`), refuses to start (once). Not part of any decision.
 //
 // Refused at the end of the file: request or mcp rules or passthrough hosts
 // without `proxy inspect`; a request or mcp rule on a port that is not
@@ -665,12 +674,18 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * `require warden 1.31`; a v1.29 Warden refuses each, so the policy fails
  * closed there. (v1.30 adds no lines.) */
 #define VDP_WARDEN_MAJOR 1
-#define VDP_WARDEN_MINOR 31     /* the grammar: the highest `require warden` a policy may name */
+#define VDP_WARDEN_MINOR 35     /* the grammar: the highest `require warden` a policy may name */
 /* v1.32 (D12): the Warden's own version, ahead of the grammar's when a
- * release adds no policy lines (v1.32.0: containers; v1.33.0: macOS; the
- * grammar stays 1.31) */
-#define VDP_WARDEN_REL_MINOR 33
-#define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's */
+ * release adds no policy lines (v1.32.0: containers; v1.34.0: Kubernetes, the
+ * node agent; the grammar stays 1.31; v1.36.0, docs/security/v1.36-
+ * kubernetes-parity.md D12: Kubernetes at parity, the grammar stays 1.35;
+ * v1.37.0: macOS, through a Linux VM, the grammar stays 1.35) */
+#define VDP_WARDEN_REL_MINOR 37
+#define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's
+                                 * (v1.36.1: packaging for Red Hat's certification;
+                                 * v1.36.2: the node key published again, a test
+                                 * for varek-crds; v1.36.3: the container a
+                                 * connection names, confirmed) */
 
 /* v1.27: a note on exec rule i, for lint and the Warden's load-time notes,
  * in buf (empty: none); returns its length. An allow exec rule naming a shell

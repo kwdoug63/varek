@@ -61,6 +61,21 @@ def test_commands_without_settings_explain_init(tmp_path):
     assert "varek init" in r.stderr
 
 
+def test_doctor_without_settings_warns(tmp_path):
+    # v1.36.1's first run on RHEL: a host with no settings (only the baseline,
+    # which `varek run` uses) is a warning, not a failure; settings that are
+    # there and do not load still fail
+    r = varek("doctor", config=str(tmp_path / "none.conf"))
+    line = [ln for ln in r.stdout.splitlines() if "none.conf" in ln]
+    assert line and "WARN" in line[0] and "FAIL" not in line[0], r.stdout
+    assert "varek init --pack" in r.stdout
+    bad = tmp_path / "bad.conf"
+    bad.write_text("[other]\nx = 1\n")
+    r = varek("doctor", config=str(bad))
+    assert r.returncode != 0
+    assert any("FAIL" in ln and "no [varek] section" in ln for ln in r.stdout.splitlines()), r.stdout
+
+
 def _init(tmp_path, pack="healthcare"):
     conf = str(tmp_path / "etc" / "varek.conf")
     varek("init", "--pack", pack, "--log-dir", str(tmp_path / "log"), config=conf, check=0)

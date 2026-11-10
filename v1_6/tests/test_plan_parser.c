@@ -282,6 +282,60 @@ static int test_null_safety(void)
     return 0;
 }
 
+/* v1.35 (D3): `plan 1.35`, first and once; a plan without it is version 0 */
+static int load_str(const char *plan, char *err, size_t errn, plan_parsed_t **out)
+{
+    char path[64];
+    write_temp(plan, path, sizeof(path));
+    *out = plan_parser_load(path, err, errn);
+    unlink(path);
+    return 0;
+}
+
+static int test_plan_version(void)
+{
+    char err[256] = {0};
+    plan_parsed_t *h = NULL;
+    load_str("# a comment first is fine\nplan 1.35\naction a mcp_call https://m.example.com/mcp name=search\n",
+             err, sizeof err, &h);
+    EXPECT_TRUE(h != NULL);
+    EXPECT_TRUE(plan_parser_version(h) == 135);
+    EXPECT_TRUE(plan_parser_action_count(h) == 1);
+    plan_parser_free(h);
+
+    load_str("action a file_open /a\n", err, sizeof err, &h);
+    EXPECT_TRUE(h != NULL);
+    EXPECT_TRUE(plan_parser_version(h) == 0);
+    plan_parser_free(h);
+    EXPECT_TRUE(plan_parser_version(NULL) == 0);
+
+    err[0] = '\0';
+    load_str("action a file_open /a\nplan 1.35\n", err, sizeof err, &h);
+    EXPECT_TRUE(h == NULL);
+    EXPECT_TRUE(strstr(err, "must be the plan's first line") != NULL);
+
+    err[0] = '\0';
+    load_str("plan 1.35\nplan 1.35\naction a file_open /a\n", err, sizeof err, &h);
+    EXPECT_TRUE(h == NULL);
+    EXPECT_TRUE(strstr(err, "first line, once") != NULL);
+
+    err[0] = '\0';
+    load_str("plan 1.36\naction a file_open /a\n", err, sizeof err, &h);
+    EXPECT_TRUE(h == NULL);
+    EXPECT_TRUE(strstr(err, "unknown plan version") != NULL);
+
+    err[0] = '\0';
+    load_str("plan\naction a file_open /a\n", err, sizeof err, &h);
+    EXPECT_TRUE(h == NULL);
+    EXPECT_TRUE(strstr(err, "plan requires") != NULL);
+
+    err[0] = '\0';
+    load_str("plan 1.35 extra\naction a file_open /a\n", err, sizeof err, &h);
+    EXPECT_TRUE(h == NULL);
+    EXPECT_TRUE(strstr(err, "plan requires") != NULL);
+    return 0;
+}
+
 int main(void)
 {
     int fails = 0;
@@ -297,6 +351,7 @@ int main(void)
     fails += test_empty_plan_rejected();
     fails += test_missing_file();
     fails += test_null_safety();
+    fails += test_plan_version();
     printf("test_plan_parser: %s\n", fails == 0 ? "PASS" : "FAIL");
     return fails == 0 ? 0 : 1;
 }

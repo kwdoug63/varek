@@ -19,6 +19,10 @@ on:
   pull_request:
     branches: [main]
 
+# v1.34 review: the token reads only
+permissions:
+  contents: read
+
 jobs:
   build:
     # v1.30: every step on x86_64 and on arm64 (GitHub's arm64 Linux runners),
@@ -34,9 +38,14 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install build dependencies
+        timeout-minutes: 45
         run: |
+          # a stalled mirror is retried, not waited on (a matrix cell once hung
+          # 45 minutes in apt-get update and was cancelled before its test ran)
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+            | sudo tee /etc/apt/apt.conf.d/80varek-ci-retries > /dev/null
           sudo apt-get update
           sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
           # v1.24: test_v1240.sh runs a Java client as the agent, with the
@@ -51,7 +60,7 @@ jobs:
         run: make -C varek/v1_4 all
       - name: Check the deployment scripts parse
         run: |
-          python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py varek/v1_4/tools/varek_bench.py varek/v1_4/tools/varek_vm.py varek/v1_4/tools/varek_suggest.py
+          python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py varek/v1_4/tools/varek_bench.py varek/v1_4/tools/varek_node_export.py varek/v1_4/tools/varek_vm.py varek/v1_4/tools/varek_suggest.py
           bash -n varek/v1_4/tools/varek_preflight.sh
           bash -n varek/v1_4/tools/varek_anchor_receiver.sh
       - name: Lint the shipped policies
@@ -97,15 +106,28 @@ jobs:
         run: sudo make -C varek/v1_4 test-v1320
       - name: v1.32.1 rootless Podman without --systemd=always (the cgroup remount in a user namespace, delegated or not)
         run: sudo make -C varek/v1_4 test-v1321
+      - name: v1.34 steps 2 and 3 the node agent (a container runc starts under the Warden's filter, handed to it; the launcher, policies by name, D4)
+        run: |
+          runc --version | head -1   # the runner's, with its Docker; the suite skips without one
+          sudo make -C varek/v1_4 test-v1340
+      - name: v1.34 steps 3 and 5 the NRI plugin and the admission webhook (gofmt, go vet, their unit tests)
+        run: |
+          go version
+          make -C varek/v1_4 test-varek-k8s
       - name: Build and test the plan_verify CLI (v1_6, v1.16.3)
         run: make -C v1_6 plan_verify check check-plan-verify
       - name: Test the v1.7 layer (v1.18.0)
         run: make -C v1_7 check
       - name: Python suites and CycloneDX schema (v1.18.0)
         run: |
-          python3 -m pip install --break-system-packages -r varek/v1_4/tools/requirements-test.txt pytest pyyaml
+          # every version and hash pinned (requirements-ci.in, compiled); --ignore-installed:
+          # the runner's Debian packages cannot be uninstalled by pip
+          python3 -m pip install --break-system-packages --ignore-installed --require-hashes -r varek/v1_4/tools/requirements-ci.txt
           python3 -m pytest -q tests
           python3 -m pytest -q varek/v1_4/tests/test_varek_bench.py   # varek bench: the parts that need no root
+          python3 -m pytest -q varek/v1_4/tests/test_varek_audit_stream.py   # v1.36 (D9): the one-pass audit's running state
+          python3 -m pytest -q varek/v1_4/tests/test_varek_node_keys.py      # v1.36 (D10): a key for each node
+          python3 -m pytest -q varek/v1_4/tests/test_soak_v1340_check.py     # the soak harness's memory judgement
           mkdir -p /tmp/ci_data /tmp/ci_key
           printf 'allow path /tmp/ci_data/\n' > /tmp/ci_policy.txt
           varek/v1_4/tools/varek_keygen /tmp/ci_key/log.key
@@ -115,3 +137,9 @@ jobs:
             --pubkey /tmp/ci_key/log.key.pub --sign-key /tmp/ci_key/log.key --output /tmp/ci_signed.json
           python3 varek/v1_4/tools/varek_cyclonedx.py --verify /tmp/ci_signed.json --pubkey /tmp/ci_key/log.key.pub
           python3 varek/v1_4/tests/cdx_schema_check.py /tmp/ci_bom.json /tmp/ci_signed.json
+      - name: v1.34 step 6 the Helm chart (lint, and each setting's render checked and against Kubernetes' schemas)
+        run: |
+          # the runner's helm (ubuntu-latest has one); kubeconform built pinned
+          helm version --short
+          GOBIN=/tmp/ci_bin go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7
+          KUBECONFORM=/tmp/ci_bin/kubeconform make -C varek/v1_4 test-varek-chart

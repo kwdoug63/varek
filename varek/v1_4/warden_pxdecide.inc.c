@@ -63,10 +63,19 @@ static struct px_req g_px[PX_MAX_DIAL];
 static uint8_t  *g_ho_state;
 static uint16_t *g_ho_port;
 static int      *g_ho_subj;                    /* v1.28.1: whom the agent's connect was for */
+static int64_t  *g_ho_at;                      /* v1.36 step 12 (review): when announced (monotonic ms) */
 static size_t    g_ho_cap;
+static uint64_t  g_ho_low = 1;                 /* every id below it is reported or dropped */
+/* v1.36 step 12 (review): a hand-off not reported by then never will be: the
+ * proxy drops an announcement after WP_ANNOUNCE_MS and a connection whose
+ * head it has not read after WP_READ_MS, and some silently (its table full).
+ * It is dropped (state 3): its subject no longer held for it, and a report on
+ * it after is the proxy misbehaving, as a second report is. */
+#define PX_HO_EXPIRE_MS (2 * (WP_ANNOUNCE_MS + WP_READ_MS + WP_VERDICT_MS))
 
 /* v1.28.1: the subject of hand-off id's connect (the proxy's records are its) */
 static int px_subject(uint64_t id) { return id < g_ho_cap && g_ho_subj ? g_ho_subj[id] : 0; }
+static void sub_handoff(int s, int delta);     /* v1.36 step 12: warden_subagent.inc.c */
 
 static void px_handed_off(uint64_t id, unsigned port, int subject) {
     if (id >= g_ho_cap) {
@@ -81,12 +90,37 @@ static void px_handed_off(uint64_t id, unsigned port, int subject) {
         int *sj = realloc(g_ho_subj, nc * sizeof *sj);
         if (!sj) return;
         g_ho_subj = sj;
+        int64_t *at = realloc(g_ho_at, nc * sizeof *at);
+        if (!at) return;
+        g_ho_at = at;
         memset(g_ho_state + g_ho_cap, 0, nc - g_ho_cap);
         g_ho_cap = nc;
     }
     g_ho_state[id] = 1;
     g_ho_port[id] = (uint16_t)port;
     g_ho_subj[id] = subject;
+    g_ho_at[id] = wr_now_ms();
+    sub_handoff(subject, 1);                     /* v1.36 step 12: not released until reported */
+}
+
+/* v1.36 step 12 (review): hand-off id will not be reported (its connect
+ * failed, or it expired) */
+static void px_handoff_drop(uint64_t id) {
+    if (id >= g_ho_cap || !g_ho_state || g_ho_state[id] != 1) return;
+    g_ho_state[id] = 3;
+    sub_handoff(g_ho_subj[id], -1);
+}
+
+/* v1.36 step 12 (review): drop the hand-offs announced longer ago than
+ * PX_HO_EXPIRE_MS and not reported (ids are given in time order) */
+static void px_expire_handoffs(void) {
+    int64_t now = wr_now_ms();
+    for (; g_ho_low < g_ho_cap && g_ho_low <= g_proxy_conns; g_ho_low++) {
+        if (g_ho_state[g_ho_low] == 1) {
+            if (now - g_ho_at[g_ho_low] < PX_HO_EXPIRE_MS) break;
+            px_handoff_drop(g_ho_low);
+        }
+    }
 }
 
 /* Step 7: the connections passed to the proxy and not yet closed, and when
@@ -134,6 +168,33 @@ static void px_open_add(uint64_t id, bool inspect, const struct px_req *q) {
         o.port = q->port;
     }
     g_px_open[g_px_nopen++] = o;
+}
+
+/* v1.36 step 12: whether a connection still open, or a dial in progress, is
+ * for subject s (a sub-agent named by one is not released) */
+static bool px_names_subject(int s) {
+    for (size_t k = 0; k < g_px_nopen; k++) if (px_subject(g_px_open[k].id) == s) return true;
+    for (int k = 0; k < PX_MAX_DIAL; k++) if (g_px[k].used && g_px[k].a && g_px[k].a->subject == s) return true;
+    return false;
+}
+
+/* v1.36 step 12 (the ship gate's runs): the proxy_unreadable record, chained
+ * like proxy_close: a connection handed to the proxy whose head it could not
+ * read (an HTTP Host that is an address, no whole request, a TLS hello
+ * without a name), refused by the proxy with nothing dialed. Before it, the
+ * stream held the hand-off's connect (allowed, handed to the proxy) and
+ * nothing of its refusal, which only the log said.
+ *   {"event":"proxy_unreadable","run":R,"proxy_conn":N,"proxy_kind":"tls|
+ *    http|connect|none","why":W,"timestamp_ns":TS} */
+static void px_unreadable_record(uint64_t id, pp_kind_t kind, const char *why) {
+    FILE *f = rec_begin();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(f, "{\"event\":\"proxy_unreadable\",\"run\":\"%s\",\"proxy_conn\":%llu,\"proxy_kind\":\"%s\",\"why\":\"",
+            g_run_id, (unsigned long long)id, pp_kind_name(kind));
+    json_escape(f, why);
+    fprintf(f, "\",\"timestamp_ns\":%lld}\n", (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+    rec_end(NULL);
 }
 
 /* The proxy_close record (step 7), chained like a resolution record:
@@ -450,8 +511,9 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
     snprintf(a->resolved, sizeof a->resolved, "%s:%u", q->name, q->port);
     decision_t d_raw = policy_decide(p, a);
     /* v1.29: a dry run relays a name the policy refuses, as not enforced:
-     * resolved like a wildcard's, charged to no budget */
-    if (d_raw != DEC_ALLOW && !dry_let(a, decision_rule_id(a, d_raw))) {
+     * resolved like a wildcard's, charged to no budget; v1.36 step 7 (D6a):
+     * not in a pod (dry_net_let) */
+    if (d_raw != DEC_ALLOW && !dry_net_let(a, decision_rule_id(a, d_raw))) {
         px_refuse(q, d_raw, decision_rule_id(a, d_raw), EACCES);
         return;
     }
@@ -459,6 +521,10 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
         log_line_start();
         fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n", g_records, a->check_why);
         px_refuse(q, d_raw, "certificate_refused", EACCES);
+        return;
+    }
+    if (!a->dry && hold_refuses(a)) {                     /* v1.35 step 4: outside the run's plan */
+        px_refuse(q, d_raw, "outside_plan", EACCES);
         return;
     }
     /* v1.26.1: in inspecting mode a host that is not a passthrough host is
@@ -773,6 +839,11 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
             rule = "max_body";
         }
     }
+    /* v1.35 step 4: a credential no step of the run's plan names */
+    if (d_final == DEC_ALLOW && hold_refuses_cred(p, a, p->v.rules[a->rule_index].cred)) {
+        d_final = DEC_DENY;
+        rule = "outside_plan";
+    }
     /* v1.29: a dry run relays a request the policy refuses, with no
      * credential and no body limit, as not enforced */
     bool dry_allow = d_final != DEC_ALLOW && dry_let(a, rule);
@@ -781,6 +852,7 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
         snprintf(why, sizeof why, "its body is over max_body=%llu (policy line %d)", (unsigned long long)maxb,
                  a->policy_line);
     else if (!strcmp(rule, "revoked")) snprintf(why, sizeof why, "the run was revoked (varek revoke)");
+    else if (!strcmp(rule, "outside_plan")) snprintf(why, sizeof why, "it carries a credential no step of the run's plan names");
     else if (mcp_ep) snprintf(why, sizeof why, "an MCP endpoint takes no query");
     else if (mcp_var) snprintf(why, sizeof why, "another spelling of an MCP endpoint (its case or a trailing /)");
     else if (d_raw == DEC_DENY) snprintf(why, sizeof why, "the policy denies it (line %d)", a->policy_line);
@@ -986,6 +1058,16 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
             d_final = DEC_DENY;
             rule = "credential_expired";
         }
+        /* v1.35 step 4: a call, or a credential it carries, no step of the run's plan names */
+        if (d_final == DEC_ALLOW && hold_refuses(a)) {
+            d_final = DEC_DENY;
+            rule = "outside_plan";
+            snprintf(why, sizeof why, "no step of the run's plan names this call");
+        } else if (d_final == DEC_ALLOW && hold_refuses_cred(p, a, p->v.rules[a->rule_index].cred)) {
+            d_final = DEC_DENY;
+            rule = "outside_plan";
+            snprintf(why, sizeof why, "it carries a credential no step of the run's plan names");
+        }
         if (d_final == DEC_ALLOW) snprintf(why, sizeof why, "allowed");
         else if (!strcmp(rule, "max_body"))
             snprintf(why, sizeof why, "its body is over max_body=%llu (policy line %d)", (unsigned long long)maxb,
@@ -994,6 +1076,7 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
         else if (!strcmp(rule, "certificate_refused")) snprintf(why, sizeof why, "its certificate was refused");
         else if (!strcmp(rule, "credential_expired"))
             snprintf(why, sizeof why, "the MCP token its rule (line %d) names has expired", a->policy_line);
+        else if (!strcmp(rule, "outside_plan")) { }          /* v1.35 step 4: said above */
         else if (d_raw == DEC_DENY) snprintf(why, sizeof why, "the policy denies it (line %d)", a->policy_line);
         else snprintf(why, sizeof why, "no mcp rule allows it");
     }
@@ -1176,10 +1259,11 @@ static int proxy_service(const struct policy *p) {
             return -1;
         /* v1.26 review: one report per hand-off, and (TLS, HTTP) on the port
          * the agent connected to; anything else and the proxy is not
-         * behaving */
+         * behaving (v1.36 step 12: a dropped one, state 3, too) */
         if (m.id >= g_ho_cap || g_ho_state[m.id] != 1) return -1;
         if (m.type == WP_MSG_REQUEST && m.kind != PP_KIND_CONNECT && m.port != g_ho_port[m.id]) return -1;
         g_ho_state[m.id] = 2;
+        sub_handoff(g_ho_subj[m.id], -1);        /* v1.36 step 12 */
         if (m.type == WP_MSG_REQUEST) {
             char why[8];
             if (m.port == 0 || m.port > 65535 || m.kind == PP_KIND_NONE ||
@@ -1191,6 +1275,7 @@ static int proxy_service(const struct policy *p) {
             log_line_start();
             fprintf(g_log, "[warden] proxy: connection %llu (%s) refused by the proxy: %s\n",
                     (unsigned long long)m.id, pp_kind_name((pp_kind_t)m.kind), m.why);
+            px_unreadable_record(m.id, (pp_kind_t)m.kind, m.why);
         }
     }
 }

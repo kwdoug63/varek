@@ -9,6 +9,212 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+- **OpenShift: the node agent's first pod is no longer refused.** Helm
+  creates a SecurityContextConstraints, a kind it does not know, after a
+  DaemonSet, so the `varek` chart's own SCC for its node agent did not yet
+  exist when the DaemonSet made its first pod: OpenShift refused that pod
+  once ("unable to validate against any security context constraint")
+  before the DaemonSet's retry was admitted, as both chart certification
+  runs on OpenShift 4.22 showed. The SCC (now `varek-node-agent`, naming no
+  one) is the `varek-crds` chart's, which is installed first and creates it
+  on OpenShift; the `varek` chart, with `openshift.enabled=true`, grants its
+  node agent's service account alone its use (the ClusterRole
+  `RELEASE-node-scc`, bound in the release's namespace), which Helm creates
+  before the DaemonSet. Upgrade `varek-crds` before `varek`, as before: the
+  other way round, the node agent's pods are refused until `varek-crds` is
+  upgraded too.
+- `packaging/helm/certification/verify_on_openshift.sh --version` no longer
+  stops at `cp: ... are the same file`: the chart `helm pull` puts in `--out`
+  is used where it is instead of being copied onto itself.
+- **Tests.** The sweep (`tests/v1340_sweep.sh`): a node run's suite that
+  times out now keeps, for its own calls, each node agent's log and the
+  containers' streams, with the processes then running
+  (`node/SUITE.timeout/`), so a stalled case can be read after the run;
+  before, they went with the run's directory unless `VAREK_SWEEP_KEEP` was
+  set.
+
+## [1.36.3] - 2026-11-04 — The container a connection names, confirmed
+
+A security patch release of 1.36.2; the Warden reports 1.36.3 and decides
+nothing differently, and the grammar stays 1.35. See `RELEASE-v1.36.3.md`
+and `docs/security/v1.36.3-bundle-confirmation.md`.
+
+- **Security (High).** Through 1.36.2 the node agent took a runtime
+  connection's container id, bundle and annotations from the state as
+  sent; since 1.36.0 a pod allowed a hostPath of the node agent's socket's
+  directory, running as root, could have a process of its own supervised
+  as another pod's container (its policy, stream identity, credentials and
+  user token). The node agent now confirms, on every path, that the
+  process is in that container's cgroup (and its pod's), that the bundle
+  is that id's under the runtime's directory (`--node-bundle-root`; the
+  chart gives the one under `node.state`), named through no link, and that
+  the annotations it reads are the bundle's `config.json`'s; otherwise the
+  connection is refused. Advisory GHSA-pcxh-jj4w-2jcc (High, 7.2),
+  published with the release; its CVE has been requested.
+- The admission webhook refuses a pod it serves that mounts the node
+  agent's socket's directory, or one above it, as a hostPath
+  (`-node-socket-dir`, which the chart sets).
+- `test_v1340.sh` section 16 sends the impersonation through each way a
+  runtime is taken, and a bundle outside the runtime's directory or named
+  through a link, and annotations that are not the bundle's: each refused.
+  The suite's containers run in cgroups and bundles of their own, and it
+  needs cgroup v2. kind refuses a pod mounting the node's `/run`.
+- The checks were measured first, report only, on the matrix and kind (18
+  cells, 387 containers): they hold everywhere, crun's `container` leaf
+  named, and add under 0.1 ms at the median.
+- `varek-crds` cannot be a certified chart, as 1.36.2 said it could be:
+  chart-verifier's `not-contains-crds` check, mandatory in the partner
+  profile, flags a CustomResourceDefinition in a chart's `templates/` as
+  well as in its `crds/`, and Red Hat's own run installs a chart with a
+  service account confined to its test namespace, which cannot create
+  cluster-scoped resources such as CRDs
+  (openshift-helm-charts/charts#3624, withdrawn). `RELEASE-v1.36.2.md`,
+  the README, the varek-crds README and the certification README say
+  so; `verify_on_openshift.sh --crds-only` is removed. The chart's test,
+  values schema and annotations stay.
+
+## [1.36.2] - 2026-11-02 — The node key published again; a test for varek-crds
+
+A patch release of 1.36.1; the Warden reports 1.36.2 and decides nothing
+differently, and the grammar stays 1.35. The charts and both images are
+1.36.2; the CRDs' schemas are 1.36.1's. See `RELEASE-v1.36.2.md`.
+
+- The `varek-crds` chart has the `charts.openshift.io` annotations, a
+  values schema, and a `helm test` that the API server serves the four
+  kinds (the group's discovery document, read with the pod's own token: no
+  role), in the varek chart's node image, run as restricted-v2 allows. Its
+  only values are that image's. `v1340_kind.sh` runs its test. (Released
+  as "ready for its own certification" with `verify_on_openshift.sh
+  --crds-only`; corrected under Unreleased.)
+- The six-minute soak trial in CI judged the node agent's memory from its
+  first sample, which can come before the agents run: a supervisor then
+  is its size at its start, and its steady size read as growth (PR #117's
+  arm64 trial, 2.8 to 12.7 MB). A run of under three hours is now judged
+  from a third into it; the 24-hour runs, from the first hour, as before
+  (`soak_check.py`, `test_soak_v1340_check.py`).
+- `v1340_kind.sh` waits up to 30 s for the CRI plugin to see the image it
+  imported with `ctr` before saying it is not there: containerd's CRI
+  image cache learns of it from an event, after the import returns (PR
+  #117's containerd 2.3.7 cell).
+- CI's preflight is 1.22.0, Red Hat's release binary checked by its SHA-256,
+  the version 1.36.1's images were submitted with: Red Hat refuses results
+  from 1.14.1, which CI ran (`container.yml`).
+- The NRI plugin keeps reading the node's public key file and publishes a
+  changed key as a new `VarekNodeKey`. Through 1.36.1 it published once and
+  stopped, so a node agent that made a new key after the plugin read the old
+  file left the new key unpublished, and its streams unverifiable with the
+  cluster's list (`v1340_kind.sh`'s rebuild check on CRI-O 1.35, runc).
+- `varek doctor` on a host with no settings: a WARN, naming `varek init`,
+  where it was a FAIL (exit 1), since `varek run` works without them (the
+  baseline). Settings that are there and do not load still fail. Found by
+  the install guide's first run on RHEL 9.8.
+- `docs/install/rhel9.md`: installing VAREK on RHEL 9 from a release's tag
+  (EPEL 9 for libsodium, `make install BINDIR=/usr/bin`, `varek doctor`, a
+  first run, a policy pack), run end to end on RHEL 9.8 (EC2, SELinux
+  enforcing) from v1.36.1. That run corrected it: CodeReady Builder is not
+  needed (and EPEL's `crb enable` does nothing on an RHUI image), `varek
+  doctor` noted only the missing settings until `varek init`, `varek refusals`
+  is root's, and the first run makes the log directory and the signing key.
+  It names RHEL 9.8 on x86_64 as the minimum (Red Hat's Partner
+  Acceleration Desk: a 9.8 certification carries to later 9.x releases;
+  aarch64 is one of its own).
+
+## [1.36.1] - 2026-11-01 — Packaged for Red Hat's certification
+
+A patch release of 1.36.0; the Warden reports 1.36.1 and decides nothing
+differently. Both images carry the labels Red Hat's container certification
+asks for and the licenses in `/licenses`; CI runs preflight v1.14.1 on both
+on every change (every check passing but `RunAsNonRoot`, by design: host-level
+access Privileged); each base image is pinned by digest. The chart passes the
+mandatory checks of chart-verifier's partner profile that need no cluster (10
+pass, `signature-is-valid` skipped; the other two need OpenShift and Red Hat's
+catalog): the CRDs are a chart of their own, `varek-crds`, installed first and
+upgraded by `helm upgrade` (the `varek` chart refuses to install without
+them); a values schema; a `helm test` of the admission webhook; the
+`charts.openshift.io` annotations. The release workflow publishes and signs
+both charts. `packaging/helm/certification/` holds the OpenShift values and
+`verify_on_openshift.sh`, for the certification run. Upgrading from 1.36.0:
+give the CRDs to the `varek-crds` release, install it, then upgrade the chart.
+`RELEASE-v1.36.1.md`.
+
+## [1.36.0] - 2026-10-31 — Kubernetes at parity, and the supported platforms
+
+Every policy and plan that runs on a host now runs under the node agent on
+Kubernetes, decided the same way; what cannot be carried into a pod from
+outside is refused, never run with less. Credentials (`file:`, `vault:`
+through Vault's Kubernetes auth, `aws-sm:` through IRSA, EKS Pod Identity
+or the node's role), given to namespaces by a cluster-scoped
+`VarekCredential`, the pod holding only a placeholder; sub-agents and
+confined MCP servers, each in a group below the container's own; the
+on-behalf-of chain, the user's token from a Secret the pod names and the
+agent's SVID from the node's SPIRE agent; the dry run, flow policies and
+trust bundles as `VarekPolicy` fields. The node image is one image for
+amd64 and arm64. The audit reads a stream once in bounded memory (1,008,566
+records in 31,960 kB at most, against 3.6 GB before), and the node agent
+rotates each stream in signed segments. Each node signs with its own key,
+published as its `VarekNodeKey` and checked by `varek_audit.py
+--node-keys`. Every platform the README calls supported runs in CI: CRI-O
+1.35 to 1.37 under runc and crun and containerd 2.2 and 2.3 on amd64 and
+arm64, SELinux enforcing, and every host suite on Rocky Linux 9 (for RHEL 9) and Amazon
+Linux 2023. Found in the ship gate's runs and fixed: a container whose
+runtime was reaped, or read in a mount namespace of its own, is tied to
+its process by its first call; a refused connection the proxy could not
+read is recorded (`proxy_unreadable`); and a run's sub-agents are bounded
+by those held at once, not by its launches (`subagent_ended`). 24 hours
+each on Amazon EKS (amd64 and Graviton) and single-node OpenShift 4.22: every
+turn done, each long agent's sub-agents launched 2,620 times, every probe
+held, every stream audited. See [`RELEASE-v1.36.0.md`](./RELEASE-v1.36.0.md).
+
+## [1.35.0] - 2026-10-26 — Agent frameworks: plans from the framework
+
+A plan (the steps an agent says it will take) now comes from the agent's
+framework, and a run can be held to it. `varek plan generate --from
+FRAMEWORK PROJECT` writes the plan from what Amazon Bedrock AgentCore, IBM
+watsonx Orchestrate, LangGraph, the OpenAI Agents SDK, or the Claude Agent
+SDK and Claude Code already say of the agent; the adapter runs under the
+Warden, the project read-only, no network, and the code adapters import
+the agent in its own Python with each provider's key a placeholder. Plan
+1.35 names MCP calls, sub-agents and credentials, and any step may be
+decided under a confined subject (`as=`). `varek run --plan PLAN
+--hold-to-plan` refuses a call the policy allows and no step covers
+(`outside_plan`), for files, connections, launches, MCP calls and
+credentials alike; the hold can only refuse. A policy line `require plan`
+refuses a run not held to a plan. Under the node agent a pod names its plan
+by annotation or a `VarekPlan`, checked at admission and held in the
+container. The plan gate's records are chained and name the plan by its
+SHA-256; `varek audit --plan`, the OCSF event and the CycloneDX evidence
+carry it. A plan's `process_exec` step is decided as the launch is, and the
+Warden builds for arm64. v1.11's condition was measured on 130 plans from
+the frameworks' published examples: with plan 1.35 the plan gate cannot
+meet it, and v1.11 stays a candidate. Not carried under the node agent yet:
+`mcp_call`, `subagent` and `credential` steps (v1.36). 24 hours on a host (a DigitalOcean droplet, Ubuntu) with an OpenAI Agents SDK agent held to its generated plan under `require plan`: 1,439 turns, every one done; each of the 429 probes refused outside the plan, and nothing else refused but what every run refuses; the stream audited and its 31,711 OCSF events valid; memory flat. See
+[`RELEASE-v1.35.0.md`](./RELEASE-v1.35.0.md).
+
+## [1.34.0] - 2026-10-24 — Kubernetes: a node agent and a Helm chart
+
+The Warden supervises a pod's containers from outside them, so the agent's
+pod passes Pod Security's "restricted" level. A node agent on each node
+(`warden POLICY_DIR --node-agent`, a DaemonSet) receives each supervised
+container's seccomp notifications through `linux.seccomp.listenerPath`
+and decides its calls as on a host, one supervisor, policy and signed,
+anchored stream per container. An NRI plugin (`varek-nri`; containerd 2.2
+or later, CRI-O 1.35 or later) sets the Warden's filter, written by the
+Warden itself (`--oci-filter`), puts the launcher `varek-init` first in the
+command to apply the launch set with Landlock, and makes writable mounts
+noexec; a container it cannot carry is refused, and one it does not adjust
+keeps VAREK's unsupervised profile and does not start. The pod's network,
+stub resolver and egress proxy work in the pod's namespace. `VarekPolicy`
+resources, an admission webhook, an exporter of each stream as OCSF, and a
+signed Helm chart (`oci://ghcr.io/kwdoug63/charts/varek`) with an SCC for
+OpenShift. On a runtime whose NRI is before v0.12 no seccomp rule carries
+an errno (NRI v0.11 crashed CRI-O 1.35); under SELinux the dialed socket
+has the agent's context. Not carried in pods yet: credentials, sub-agents,
+confined MCP servers, `require on-behalf-of`, plans and the dry run. No
+policy line changes; the grammar stays 1.31. 24 hours each on Amazon EKS
+(containerd 2.3.5) and single-node OpenShift 4.22 (CRI-O 1.35.9, SELinux
+enforcing): every probe held, every stream audited.
+`RELEASE-v1.34.0.md`.
+
 ## [1.32.1] - 2026-10-19 — Rootless Podman without `--systemd=always`
 
 A patch release of 1.32.0. In a user namespace (rootless Podman) the Warden

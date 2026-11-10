@@ -27,6 +27,10 @@
 static bool g_revoked;
 static int  g_ctl_listen = -1;
 static char g_ctl_path[100];
+/* /run/varek, held: the socket is removed through it, so in the node
+ * agent's supervisor, in the container's mount namespace by then, the
+ * node's is (review) */
+static int  g_ctl_dir = -1;
 static pid_t g_ctl_owner;               /* only the Warden removes it, never a child */
 
 static void ctl_close(void);
@@ -45,6 +49,7 @@ static void ctl_open(void) {
         errno = EPERM;
         goto fail;
     }
+    if (g_ctl_dir < 0 && (g_ctl_dir = open("/run/varek", O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)) < 0) goto fail;
     snprintf(g_ctl_path, sizeof g_ctl_path, "/run/varek/%s.ctl", g_run_id);
     (void)unlink(g_ctl_path);
     int s = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
@@ -78,7 +83,11 @@ static void ctl_close(void) {
     if (g_ctl_owner && getpid() != g_ctl_owner) return;
     if (g_ctl_listen >= 0) close(g_ctl_listen);
     g_ctl_listen = -1;
-    if (g_ctl_path[0]) (void)unlink(g_ctl_path);
+    if (g_ctl_path[0]) {
+        const char *base = strrchr(g_ctl_path, '/');
+        if (g_ctl_dir >= 0 && base) (void)unlinkat(g_ctl_dir, base + 1, 0);
+        else (void)unlink(g_ctl_path);
+    }
     g_ctl_path[0] = '\0';
 }
 

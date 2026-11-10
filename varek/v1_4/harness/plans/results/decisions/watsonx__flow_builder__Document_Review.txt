@@ -1,0 +1,4 @@
+/var/tmp/varek-plan-corpus3/policies/watsonx__flow_builder__Document_Review.policy: glob tokens 0 of 4096
+/var/tmp/varek-plan-corpus3/policies/watsonx__flow_builder__Document_Review.policy: 15 rules, 0 can never fire
+
+  OK    /var/tmp/varek-plan-corpus3/plans/watsonx__flow_builder__Document_Review.plan: authorized under /var/tmp/varek-plan-corpus3/policies/watsonx__flow_builder__Document_Review.policy (15 actions)

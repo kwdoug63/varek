@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+# v1.34 step 9 (README.md): CRI-O's NRI turned on for the master pool, which
+# VAREK's plugin needs (CRI-O 1.35 or later: OpenShift 4.22). The Machine
+# Config Operator writes the drop-in and reboots the pool's nodes one at a
+# time. Single-node OpenShift's one node is in the master pool.
+#
+#   oc apply -f openshift-nri-master.yaml
+#   oc get mcp master -w           (until UPDATED is True)
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-master-varek-nri
+  labels:
+    machineconfiguration.openshift.io/role: master
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    storage:
+      files:
+        - path: /etc/crio/crio.conf.d/99-varek-nri.conf
+          mode: 420          # 0644
+          overwrite: true
+          contents:
+            source: "data:,%23%20v1.34%20step%209%20%28VAREK%29%3A%20NRI%20on%2C%20for%20VAREK%27s%20plugin%0A%5Bcrio.nri%5D%0Aenable_nri%20%3D%20true%0A"

@@ -1,0 +1,34 @@
+VAREK {{ .Chart.AppVersion }} is installed in {{ .Release.Namespace }}: the node agent, the NRI
+plugin{{ if .Values.exporter.enabled }} and the exporter{{ end }} on every node ({{ include "varek.nodeName" . }}), and the
+admission webhook ({{ include "varek.admissionName" . }}).
+
+A pod is supervised when it names a VarekPolicy of its namespace:
+
+  apiVersion: varek.dev/v1alpha1
+  kind: VarekPolicy
+  metadata: { name: agent, namespace: team-a }
+  spec:
+    policy: |
+      require warden 1.29
+      allow path /work/
+
+  and in the pod: metadata.annotations: { varek.dev/policy: agent }
+  and its seccomp profile VAREK's unsupervised one:
+    securityContext: { seccompProfile: { type: Localhost, localhostProfile: varek/unsupervised.json } }
+  (every call refused, until the plugin puts the Warden's filter in its
+  place: a container it does not adjust does not run)
+
+Its containers must not allow privilege escalation, must drop every
+capability (capabilities: drop: [ALL]), must not run as root or in group 0,
+must use the cluster's DNS, and, under a policy that decides launches, must
+have a read-only root; the webhook says so at deploy. Label a namespace varek.dev/policy-required=true
+to refuse its pods that name no policy.
+
+The evidence is on each node in {{ .Values.node.streams }} (a stream and its policy for
+each container){{ if .Values.exporter.enabled }}, and as OCSF in the exporter's log:
+  kubectl -n {{ .Release.Namespace }} logs ds/{{ include "varek.nodeName" . }} -c exporter{{ end }}.
+{{- if not .Values.signing.secretName }}
+
+The streams are not signed: give signing.secretName (a Secret with key and
+key.pub, from tools/varek_keygen) to sign them with the node's key.
+{{- end }}

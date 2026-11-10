@@ -1301,6 +1301,12 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
                 else if (!ver_ge(req_maj, req_min, 1, 28)) rc = fail(err, en, name, ln, "on-behalf-of before 1.28");
                 else if (p->require_obo) rc = fail(err, en, name, ln, "on-behalf-of twice");
                 else p->require_obo = 1;
+            } else if (!strcmp(tok[0], "require") && nt >= 2 && !strcmp(tok[1], "plan")) {
+                /* v1.35 step 4 (D7) */
+                if (nt != 2) rc = fail(err, en, name, ln, "bad require plan");
+                else if (!ver_ge(req_maj, req_min, 1, 35)) rc = fail(err, en, name, ln, "require plan before 1.35");
+                else if (p->require_plan) rc = fail(err, en, name, ln, "require plan twice");
+                else p->require_plan = 1;
             } else if (!strcmp(tok[0], "require")) {
                 int a, b;
                 if (nt != 3 || strcmp(tok[1], "warden") || !parse_ver(tok[2], &a, &b))

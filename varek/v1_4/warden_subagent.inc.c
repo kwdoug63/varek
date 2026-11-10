@@ -51,6 +51,31 @@
  *     process that cannot be moved is still attributed to the launcher.
  * A process in no group of the run is refused every call
  * (subagent_unattributed): it can only be there if something moved it.
+ *
+ * v1.36 step 12 (the ship gate's runs): SUB_MAX bounds the sub-agents a run
+ * holds at once, not the launches it makes. Under the node agent a run is a
+ * container's life, days for a long-running agent, and a launch of a
+ * sub-agent every turn reached 1,024 launches in 8.5 hours, after which
+ * every launch was refused (subagent_limit). Now, at each launch, a
+ * sub-agent that has ended is released (sub_reclaim): its group is removed
+ * (rmdir succeeds only when no process is in it and no group below it), and
+ * nothing the Warden holds still names it (a launch waiting on its
+ * exec_result, a connection handed to the proxy or a dial for it, a
+ * sub-agent it launched). Its slot is used again, and subagent_ended
+ * records it. A pending sub-agent is never released.
+ *
+ * v1.36 step 5 (docs/security/v1.36-kubernetes-parity.md, D3 (a)): under
+ * the node agent the container's own group (the runtime's: a systemd scope,
+ * crio-<id>.scope or cri-containerd-<id>.scope) is the run's. The
+ * supervisor joins the node's cgroup namespace and mounts the cgroup
+ * filesystem detached, for itself alone (g_cg_dfd), and makes each
+ * sub-agent's group below the container's from there: nothing is delegated
+ * to the pod, and the pod gets no capability. The container's group is
+ * neither made nor removed, and its first process is never moved below it
+ * (M1: a process started in the container later, kubectl exec, would land
+ * in that group): a launch of a sub-agent by the first process itself is
+ * refused (subagent_first_process). A container running as root is refused,
+ * as --run-as root is on a host.
  */
 
 #include <sys/vfs.h>
@@ -86,11 +111,11 @@ struct sub_pidfd_info {
 #define SUB_PIDFD_GET_INFO _IOWR(0xFF, 11, struct sub_pidfd_info)
 #define SUB_PIDFD_INFO_CGROUPID (1UL << 2)
 
-#define SUB_MAX       1024           /* sub-agent launches a run may make */
+#define SUB_MAX       1024           /* sub-agents a run holds at once (v1.36 step 12: not its launches) */
 #define SUB_MAX_DEPTH 8              /* sub-agents nested in sub-agents */
 #define SUB_REL_MAX   512            /* a group's path under the run's: 8 x "/NAME-n" */
 
-enum { SUB_AGENT = 0, SUB_PENDING, SUB_LAUNCHED, SUB_FAILED };
+enum { SUB_AGENT = 0, SUB_PENDING, SUB_LAUNCHED, SUB_FAILED, SUB_FREE };   /* SUB_FREE: released, v1.36 step 12 */
 #define SUB_LAYOUT_N 10              /* /proc/<pid>/stat's layout fields, below */
 
 struct subject {
@@ -117,11 +142,21 @@ struct subject {
     int      psubj;
     bool     mcp;
     bool     confined;               /* v1.31: its launch rule declares it a confined subject */
+    /* v1.36 step 12: what still names it, so that it is not released */
+    int      nchild;                 /* sub-agents it launched, not released */
+    int      handoffs;               /* connections handed to the proxy for it, not yet reported */
 };
 
 static struct subject *g_sub;
 static size_t g_nsub;
-static char g_cg_dir[PATH_MAX];      /* the run's group, on the filesystem */
+static bool exec_pend_names(int s);          /* v1.36 step 12: warden_exec.inc.c */
+static char g_cg_dir[PATH_MAX];      /* the run's group, on the filesystem (relative to g_cg_dfd) */
+/* v1.36 step 5: AT_FDCWD (g_cg_dir absolute), or under the node agent the
+ * supervisor's own mount of the cgroup filesystem (g_cg_dir relative to its
+ * root); and whether the run's group is the container's (not made, not
+ * removed, nothing moved into it) */
+static int  g_cg_dfd = AT_FDCWD;
+static bool g_cg_container;
 static struct { char name[33]; uint32_t n; } g_sub_count[VDP_MAX_RULES];
 static bool g_sub_froze;             /* a group was frozen while attributing this call */
 static bool g_sub_pidfd;             /* the kernel tells a thread's cgroup id through a pidfd */
@@ -218,8 +253,18 @@ static uint64_t sub_cgid_of(pid_t tid) {
 
 static uint64_t sub_dir_id(const char *dir) {
     struct stat st;
-    return stat(dir, &st) == 0 ? (uint64_t)st.st_ino : 0;
+    return fstatat(g_cg_dfd, dir, &st, 0) == 0 ? (uint64_t)st.st_ino : 0;
 }
+
+/* A file of a group, opened on the cgroup filesystem g_cg_dir is on */
+static int sub_cg_open(const char *path, int flags) { return openat(g_cg_dfd, path, flags | O_CLOEXEC); }
+static FILE *sub_cg_fopen(const char *path) {
+    int fd = sub_cg_open(path, O_RDONLY);
+    FILE *f = fd < 0 ? NULL : fdopen(fd, "re");
+    if (fd >= 0 && !f) close(fd);
+    return f;
+}
+static int sub_cg_rmdir(const char *dir) { return unlinkat(g_cg_dfd, dir, AT_REMOVEDIR); }
 static size_t g_nsub_count;
 
 /* The cgroup2 mount (its mount point and root), and this process's group in
@@ -228,7 +273,7 @@ static int sub_find_cgroup2(char *mnt, size_t mn, char *root, size_t rn, char *s
                             char *why, size_t wn) {
     /* make test-v1281: act as if there were none */
     if (getenv("VAREK_WARDEN_TEST_NO_CGROUP2")) { snprintf(why, wn, "VAREK_WARDEN_TEST_NO_CGROUP2 is set"); return -1; }
-    FILE *mi = fopen("/proc/self/mountinfo", "re");
+    FILE *mi = proc_fopenf("self/mountinfo");
     if (!mi) { snprintf(why, wn, "cannot read the mounts (%s)", strerror(errno)); return -1; }
     char *line = NULL;
     size_t lc = 0;
@@ -249,7 +294,7 @@ static int sub_find_cgroup2(char *mnt, size_t mn, char *root, size_t rn, char *s
     free(line);
     fclose(mi);
     if (!found) { snprintf(why, wn, "no cgroup2 filesystem is mounted"); return -1; }
-    FILE *cg = fopen("/proc/self/cgroup", "re");
+    FILE *cg = proc_fopenf("self/cgroup");
     if (!cg) { snprintf(why, wn, "cannot read /proc/self/cgroup (%s)", strerror(errno)); return -1; }
     char buf[PATH_MAX + 8];
     found = false;
@@ -266,20 +311,21 @@ static int sub_find_cgroup2(char *mnt, size_t mn, char *root, size_t rn, char *s
 }
 
 /* Is the policy's writing reach into the control groups? The paths a write
- * would move a process with, for the run's group and each sub-agent's first. */
-static int sub_refuse_writable(const struct policy *p, const char *mnt) {
+ * would move a process with, for the run's group (run, as the agent sees
+ * it) and each sub-agent's first. */
+static int sub_refuse_writable(const struct policy *p, const char *mnt, const char *run) {
     static const char *const kFiles[] = { "cgroup.procs", "cgroup.threads", "cgroup.freeze", "cgroup.kill",
                                           "cgroup.subtree_control" };
     char path[PATH_MAX + 128];
     for (size_t f = 0; f < sizeof kFiles / sizeof kFiles[0]; f++) {
-        const char *bases[3] = { mnt, g_cg_dir, NULL };
+        const char *bases[3] = { mnt, run, NULL };
         for (int b = 0; bases[b]; b++) {
             snprintf(path, sizeof path, "%s/%s", bases[b], kFiles[f]);
             if (vdpc_path_writable(&p->c, path, strlen(path))) goto refuse;
         }
         for (size_t i = 0; i < p->v.n; i++) {
             if (!p->v.rules[i].subagent[0]) continue;
-            snprintf(path, sizeof path, "%s/%s-1/%s", g_cg_dir, p->v.rules[i].subagent, kFiles[f]);
+            snprintf(path, sizeof path, "%s/%s-1/%s", run, p->v.rules[i].subagent, kFiles[f]);
             if (vdpc_path_writable(&p->c, path, strlen(path))) goto refuse;
         }
     }
@@ -306,7 +352,7 @@ refuse:
  * user namespaces): not one; otherwise unreadable: taken as one. */
 static bool sub_in_userns(void) {
     struct stat st;
-    if (stat("/proc/self/ns/user", &st) < 0) return errno != ENOENT;
+    if (proc_statf(&st, "self/ns/user") < 0) return errno != ENOENT;
     return st.st_ino != 0xEFFFFFFDU;
 }
 
@@ -420,10 +466,172 @@ static int sub_container_cgroup(const char *mnt, const char *self, bool check_on
     return 0;
 }
 
+/* The subjects, the agent's first (a check's too). 0, or -1 printed. */
+static int sub_alloc(void) {
+    if (!g_sub) g_sub = calloc(SUB_MAX + 1, sizeof *g_sub);
+    if (!g_sub) { fprintf(stderr, "[warden] out of memory\n"); return -1; }
+    g_sub[0] = (struct subject){ .parent = -1, .state = SUB_AGENT };
+    g_nsub = 1;
+    return 0;
+}
+
+/* The second half of a run's start, a host's or the node agent's: the
+ * run's group's id, the process events, how a caller's group is read */
+static int sub_setup_known(void) {
+    if (sub_alloc() < 0) return -1;
+    g_sub[0].cgid = sub_dir_id(g_cg_dir);
+    bool cn = sub_cn_open() == 0;
+    /* the cheaper way to read a caller's group, when this kernel has it */
+    g_sub_pidfd = g_sub[0].cgid != 0 && sub_cgid_of((pid_t)syscall(SYS_gettid)) != 0 &&
+                  !getenv("VAREK_WARDEN_TEST_NO_PIDFD_INFO");
+    fprintf(stderr, "[warden] sub-agents: the run's control group %s%s (each call's group read %s; launches "
+            "known %s)\n", g_cg_container ? g_cg_self : g_cg_dir, g_cg_container ? ", the container's" : "",
+            g_sub_pidfd ? "through a pidfd" : "from /proc",
+            cn ? "from the kernel's process events" : sub_aslr() ? "by the image a process runs and, for a "
+            "sub-agent of the image its launcher runs, its memory layout (no process events here)" :
+            "by the image a process runs (no process events here, and layouts are not randomized: a sub-agent "
+            "of the image its launcher runs is refused)");
+    return 0;
+}
+
+#ifndef FSOPEN_CLOEXEC
+#define FSOPEN_CLOEXEC 0x00000001
+#endif
+#ifndef FSCONFIG_CMD_CREATE
+#define FSCONFIG_CMD_CREATE 6
+#endif
+#ifndef FSMOUNT_CLOEXEC
+#define FSMOUNT_CLOEXEC 0x00000001
+#endif
+#ifndef MOUNT_ATTR_NOSUID
+#define MOUNT_ATTR_NOSUID 0x00000002
+#define MOUNT_ATTR_NODEV  0x00000004
+#define MOUNT_ATTR_NOEXEC 0x00000008
+#endif
+#ifndef __NR_fsopen
+#define __NR_fsopen 430
+#define __NR_fsconfig 431
+#define __NR_fsmount 432
+#endif
+
+/* v1.36 step 5 (D3 (a)): under the node agent, the container's own group
+ * stands for the run's. The supervisor joins the node's cgroup namespace
+ * (its pod's is its own: the container's group is outside what it shows)
+ * and mounts the cgroup filesystem detached, seen from the node's root, for
+ * itself alone; the container's mounts and the node's are not changed. 0,
+ * or -1 printed. */
+static int sub_setup_node(const struct policy *p) {
+    if (g_nr.uid == 0) {
+        fprintf(stderr, "[warden] the policy names a sub-agent, and the container runs as root (uid 0): it could "
+                "move itself between control groups; refusing to start\n");
+        return -1;
+    }
+    if (getenv("VAREK_WARDEN_TEST_NO_CGROUP2")) {
+        fprintf(stderr, "[warden] the policy names a sub-agent, which needs cgroup v2: VAREK_WARDEN_TEST_NO_CGROUP2 "
+                "is set; refusing to start\n");
+        return -1;
+    }
+    /* the initial cgroup namespace's inode is fixed (PROC_CGROUP_INIT_INO),
+     * as the user namespace's is (sub_in_userns): in it already, the node's
+     * init need not be reached */
+    struct stat mine;
+    if (proc_statf(&mine, "self/ns/cgroup") < 0) {
+        fprintf(stderr, "[warden] the policy names a sub-agent: cannot read the supervisor's cgroup namespace (%s); "
+                "refusing to start\n", strerror(errno));
+        return -1;
+    }
+    if (mine.st_ino != 0xEFFFFFFBU) {
+        int ns = proc_openf(O_RDONLY, 0, "1/ns/cgroup");
+        if (ns < 0 || setns(ns, CLONE_NEWCGROUP) < 0) {
+            fprintf(stderr, "[warden] the policy names a sub-agent: cannot join the node's cgroup namespace (%s); "
+                    "refusing to start\n", strerror(errno));
+            if (ns >= 0) close(ns);
+            return -1;
+        }
+        close(ns);
+    }
+    /* the container's group, as the node names it */
+    FILE *cg = proc_fopenf("%d/cgroup", (int)g_nr.pid);
+    char buf[PATH_MAX + 8];
+    bool found = false;
+    while (cg && !found && fgets(buf, sizeof buf, cg))
+        if (!strncmp(buf, "0::", 3)) { buf[strcspn(buf, "\n")] = '\0'; found = true; }
+    if (cg) fclose(cg);
+    const char *scope = buf + 3;
+    if (!found || scope[0] != '/' || !scope[1] || strstr(scope, "/../") || strlen(scope) >= sizeof g_cg_self - SUB_REL_MAX) {
+        fprintf(stderr, "[warden] the policy names a sub-agent: the container's control group (cgroup v2) cannot be "
+                "read%s%s; refusing to start\n", found ? ": " : "", found ? scope : "");
+        return -1;
+    }
+    int fs = (int)syscall(__NR_fsopen, "cgroup2", FSOPEN_CLOEXEC);
+    int mfd = -1;
+    if (fs >= 0 && syscall(__NR_fsconfig, fs, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == 0)
+        mfd = (int)syscall(__NR_fsmount, fs, FSMOUNT_CLOEXEC, MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC);
+    int e = errno;
+    if (fs >= 0) close(fs);
+    if (mfd < 0) {
+        fprintf(stderr, "[warden] the policy names a sub-agent: cannot mount the cgroup filesystem for the supervisor "
+                "(%s); refusing to start\n", strerror(e));
+        return -1;
+    }
+    g_cg_dfd = mfd;
+    g_cg_container = true;
+    size_t sl = strlen(scope);                       /* checked above: well under PATH_MAX */
+    memcpy(g_cg_self, scope, sl + 1);
+    memcpy(g_cg_dir, scope + 1, sl);
+    struct stat st;
+    if (fstatat(g_cg_dfd, g_cg_dir, &st, 0) < 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "[warden] the policy names a sub-agent: the container's control group %s is not on the node's "
+                "cgroup v2 filesystem; refusing to start\n", g_cg_self);
+        return -1;
+    }
+    char f[PATH_MAX + 32];
+    snprintf(f, sizeof f, "%s/cgroup.freeze", g_cg_dir);
+    if (faccessat(g_cg_dfd, f, W_OK, 0) < 0) {
+        fprintf(stderr, "[warden] the policy names a sub-agent: the kernel's cgroup v2 has no cgroup.freeze (5.2 "
+                "or later is needed); refusing to start\n");
+        return -1;
+    }
+    /* the agent's reach, in its own view: each cgroup v2 mount of the
+     * container, and the container's group on it (its root, in a cgroup
+     * namespace of the container's own) */
+    FILE *mi = proc_fopenf("%d/mountinfo", (int)g_nr.pid);
+    char *line = NULL;
+    size_t lc = 0;
+    int rc = 0;
+    while (rc == 0 && mi && getline(&line, &lc, mi) > 0) {
+        char *dash = strstr(line, " - ");
+        if (!dash || strncmp(dash + 3, "cgroup2 ", 8)) continue;
+        char *save = NULL, *fl[5];
+        int k = 0;
+        for (char *t = strtok_r(line, " ", &save); t && k < 5; t = strtok_r(NULL, " ", &save)) fl[k++] = t;
+        if (k < 5) continue;
+        noexec_unescape(fl[3]);
+        noexec_unescape(fl[4]);
+        char run[PATH_MAX];
+        size_t rl = strcmp(fl[3], "/") ? strlen(fl[3]) : 0;
+        if (!strncmp(scope, fl[3], rl) && (scope[rl] == '/' || !scope[rl]))
+            snprintf(run, sizeof run, "%s%s", strcmp(fl[4], "/") ? fl[4] : "", scope + rl);
+        else
+            snprintf(run, sizeof run, "%s", fl[4]);
+        rc = sub_refuse_writable(p, fl[4], run);
+    }
+    free(line);
+    if (mi) fclose(mi);
+    else {
+        fprintf(stderr, "[warden] the policy names a sub-agent: cannot read the container's mounts (%s); refusing "
+                "to start\n", strerror(errno));
+        return -1;
+    }
+    if (rc < 0) return -1;
+    return sub_setup_known();
+}
+
 /* Startup: the run's group, made (not in a check). 0, or -1 printed. */
 static int sub_setup(const struct policy *p, bool check_only, bool agent_root) {
     for (size_t i = 0; i < p->v.n; i++) if (p->v.rules[i].subagent[0]) g_sub_on = true;
     if (!g_sub_on) return 0;
+    if (g_nr.on) return sub_setup_node(p);                  /* v1.36 step 5 */
     char mnt[PATH_MAX], root[PATH_MAX], self[PATH_MAX], why[PATH_MAX + 64];
     if (agent_root) {
         fprintf(stderr, "[warden] the policy names a sub-agent, and the agent runs as root (--run-as root): it "
@@ -448,13 +656,10 @@ static int sub_setup(const struct policy *p, bool check_only, bool agent_root) {
         fprintf(stderr, "[warden] the policy names a sub-agent: the control group's path is too long; refusing to start\n");
         return -1;
     }
-    if (sub_refuse_writable(p, mnt) < 0) return -1;
+    if (sub_refuse_writable(p, mnt, g_cg_dir) < 0) return -1;
     int ro = sub_container_cgroup(mnt, self, check_only);
     if (ro < 0) return -1;
-    g_sub = calloc(SUB_MAX + 1, sizeof *g_sub);
-    if (!g_sub) { fprintf(stderr, "[warden] out of memory\n"); return -1; }
-    g_sub[0] = (struct subject){ .parent = -1, .state = SUB_AGENT };
-    g_nsub = 1;
+    if (sub_alloc() < 0) return -1;
     if (check_only) {
         char parent[PATH_MAX];
         snprintf(parent, sizeof parent, "%s%s", mnt, under);
@@ -481,18 +686,7 @@ static int sub_setup(const struct policy *p, bool check_only, bool agent_root) {
         rmdir(g_cg_dir);
         return -1;
     }
-    g_sub[0].cgid = sub_dir_id(g_cg_dir);
-    bool cn = sub_cn_open() == 0;
-    /* the cheaper way to read a caller's group, when this kernel has it */
-    g_sub_pidfd = g_sub[0].cgid != 0 && sub_cgid_of((pid_t)syscall(SYS_gettid)) != 0 &&
-                  !getenv("VAREK_WARDEN_TEST_NO_PIDFD_INFO");
-    fprintf(stderr, "[warden] sub-agents: the run's control group %s (each call's group read %s; launches "
-            "known %s)\n", g_cg_dir, g_sub_pidfd ? "through a pidfd" : "from /proc",
-            cn ? "from the kernel's process events" : sub_aslr() ? "by the image a process runs and, for a "
-            "sub-agent of the image its launcher runs, its memory layout (no process events here)" :
-            "by the image a process runs (no process events here, and layouts are not randomized: a sub-agent "
-            "of the image its launcher runs is refused)");
-    return 0;
+    return sub_setup_known();
 }
 
 /* The agent, in its child before its launch (still root): into the run's group */
@@ -512,7 +706,7 @@ static int sub_enter_run(void) {
 static int sub_move(pid_t tgid, int pidfd, const char *dir) {
     char procs[PATH_MAX + SUB_REL_MAX + 32], num[16];
     snprintf(procs, sizeof procs, "%s/cgroup.procs", dir);
-    int fd = open(procs, O_WRONLY | O_CLOEXEC);
+    int fd = sub_cg_open(procs, O_WRONLY);
     if (fd < 0) return -1;
     int nl = snprintf(num, sizeof num, "%d", (int)tgid);
     ssize_t w = write(fd, num, (size_t)nl);
@@ -539,9 +733,8 @@ static int sub_effective(int s) {
  * the reader may not trace it). */
 static int sub_layout(pid_t pid, unsigned long long out[SUB_LAYOUT_N]) {
     static const int field[SUB_LAYOUT_N] = { 26, 27, 28, 45, 46, 47, 48, 49, 50, 51 };
-    char p[64], buf[2048];
-    snprintf(p, sizeof p, "/proc/%d/stat", (int)pid);
-    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    char buf[2048];
+    int fd = proc_openf(O_RDONLY, 0, "%d/stat", (int)pid);
     if (fd < 0) return -1;
     ssize_t n = read(fd, buf, sizeof buf - 1);
     close(fd);
@@ -588,13 +781,13 @@ static void sub_fail(int s) {
     sub_dir(s, dir, sizeof dir);
     sub_dir(to, dst, sizeof dst);
     snprintf(f, sizeof f, "%s/cgroup.freeze", dir);
-    int fz = open(f, O_WRONLY | O_CLOEXEC);
+    int fz = sub_cg_open(f, O_WRONLY);
     if (fz >= 0) { (void)!write(fz, "1", 1); close(fz); }
     /* wait (briefly) until frozen: then nothing in it can start another */
     snprintf(f, sizeof f, "%s/cgroup.events", dir);
     for (int i = 0; i < 200; i++) {
         char ev[256] = "";
-        int e = open(f, O_RDONLY | O_CLOEXEC);
+        int e = sub_cg_open(f, O_RDONLY);
         ssize_t r = e >= 0 ? read(e, ev, sizeof ev - 1) : -1;
         if (e >= 0) close(e);
         if (r > 0) { ev[r] = '\0'; if (strstr(ev, "frozen 1")) break; }
@@ -603,7 +796,7 @@ static void sub_fail(int s) {
     }
     for (int round = 0; round < 8; round++) {
         snprintf(f, sizeof f, "%s/cgroup.procs", dir);
-        FILE *pf = fopen(f, "re");
+        FILE *pf = sub_cg_fopen(f);
         if (!pf) break;
         int moved = 0, left = 0;
         long pid;
@@ -615,9 +808,9 @@ static void sub_fail(int s) {
         if (!left || !moved) break;
     }
     snprintf(f, sizeof f, "%s/cgroup.freeze", dir);
-    fz = open(f, O_WRONLY | O_CLOEXEC);
+    fz = sub_cg_open(f, O_WRONLY);
     if (fz >= 0) { (void)!write(fz, "0", 1); close(fz); }
-    if (rmdir(dir) == 0) g_sub[s].cgid = 0;          /* review: a removed group's id never matches */
+    if (sub_cg_rmdir(dir) == 0) g_sub[s].cgid = 0;          /* review: a removed group's id never matches */
 }
 
 /* Settle a pending sub-agent. With the connector: launched if its launcher
@@ -633,10 +826,8 @@ static int sub_settle(int s, pid_t tid) {
         return g_sub[s].state;
     }
     if (!tid) return SUB_PENDING;
-    char p[64];
     struct stat st;
-    snprintf(p, sizeof p, "/proc/%d/exe", (int)tid);
-    bool launched = stat(p, &st) == 0 && st.st_dev == g_sub[s].edev && st.st_ino == g_sub[s].eino;
+    bool launched = proc_statf(&st, "%d/exe", (int)tid) == 0 && st.st_dev == g_sub[s].edev && st.st_ino == g_sub[s].eino;
     if (launched && g_sub[s].by_layout) {
         /* v1.32: the launcher's own image: launched only if its layout is
          * new (a process it forked after has the same layout as it) */
@@ -665,7 +856,7 @@ static const char *sub_pend_end(int s, pid_t tid, const char *result) {
  * group could not be read: the thread has gone) */
 static int sub_attribute(pid_t tid) {
     if (!g_sub_on) return 0;
-    char p[64], buf[PATH_MAX + 64];
+    char buf[PATH_MAX + 64];
     int s = -1;
     if (g_sub_pidfd) {
         uint64_t id = sub_cgid_of(tid);
@@ -675,9 +866,8 @@ static int sub_attribute(pid_t tid) {
         if (s < 0) return -1;
         goto found;
     }
-    snprintf(p, sizeof p, "/proc/%d/cgroup", (int)tid);
     /* review: line by line (a hybrid host's v1 lines come first, and may be long) */
-    FILE *cf = fopen(p, "re");
+    FILE *cf = proc_fopenf("%d/cgroup", (int)tid);
     if (!cf) return -2;
     char *l = NULL;
     bool got = false;
@@ -689,7 +879,8 @@ static int sub_attribute(pid_t tid) {
     size_t bl = strlen(g_cg_self);
     if (strncmp(l, g_cg_self, bl) || (l[bl] && l[bl] != '/')) return -1;
     const char *rel = l + bl;
-    for (size_t i = 0; i < g_nsub; i++) if (!strcmp(g_sub[i].rel, rel)) { s = (int)i; break; }
+    for (size_t i = 0; i < g_nsub; i++)
+        if (g_sub[i].state != SUB_FREE && !strcmp(g_sub[i].rel, rel)) { s = (int)i; break; }
     if (s < 0) return -1;
 found:
     sub_settle(s, tid);                  /* the first call from its group settles the launch */
@@ -701,10 +892,78 @@ found:
  * image could keep the launcher's layout. */
 static bool sub_aslr(void) {
     if (getenv("VAREK_WARDEN_TEST_NO_ASLR")) return false;    /* make test-v1281 */
-    int fd = open("/proc/sys/kernel/randomize_va_space", O_RDONLY | O_CLOEXEC);
+    /* v1.36 step 5: the node's /proc (under the node agent the supervisor is
+     * in the container's mount namespace by then) */
+    int fd = proc_openf(O_RDONLY, 0, "sys/kernel/randomize_va_space");
     char c = 0;
     if (fd >= 0) { if (read(fd, &c, 1) != 1) c = 0; close(fd); }
     return c == '2';
+}
+
+/* v1.36 step 12: the sub-agents a run may hold at once (SUB_MAX; fewer for
+ * the tests, VAREK_WARDEN_TEST_SUB_MAX) */
+static size_t sub_max(void) {
+    static size_t m;
+    if (!m) {
+        const char *e = getenv("VAREK_WARDEN_TEST_SUB_MAX");
+        long v = e ? strtol(e, NULL, 10) : 0;
+        m = v > 0 && v < SUB_MAX ? (size_t)v : SUB_MAX;
+    }
+    return m;
+}
+
+/* v1.36 step 12: a connection the proxy has been handed for subject s
+ * (delta 1), or reported on (-1): warden_pxdecide.inc.c */
+static void sub_handoff(int s, int delta) {
+    if (g_sub_on && g_sub && s > 0 && (size_t)s < g_nsub && g_sub[s].state != SUB_FREE) g_sub[s].handoffs += delta;
+}
+
+/* subagent_ended: a sub-agent released (once): no process is in its group,
+ * no group below it, and nothing the Warden holds names it */
+static void sub_ended_record(int s) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    FILE *f = rec_begin();
+    fprintf(f, "{\"event\":\"subagent_ended\",\"run\":\"%s\",\"subagent\":\"%s#%u\",\"timestamp_ns\":%lld}\n",
+            g_run_id, g_sub[s].name, g_sub[s].n, (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
+    rec_end(NULL);
+}
+
+/* v1.36 step 12: release each sub-agent that has ended, so that its slot is
+ * used again. A launched or failed one, with no sub-agent of its own left,
+ * no launch waiting on its exec_result, no connection or dial for it, and
+ * its group removed: the kernel removes a group only when no process is in
+ * it and no group is below it, and nothing moves a process into a
+ * sub-agent's group but its launch. Released deepest first: a group below
+ * another is removed before it, in a later pass if needed. Never keep, the
+ * launcher of the launch being decided (review: its process, killed during
+ * the launch, leaves its group empty, and its slot must not be reused under
+ * it; its ancestors each hold it, nchild). */
+static void sub_reclaim(int keep) {
+    px_expire_handoffs();                        /* review: hand-offs the proxy never reported */
+    for (int pass = 0; pass < SUB_MAX_DEPTH; pass++) {
+        bool any = false;
+        for (size_t i = 1; i < g_nsub; i++) {
+            struct subject *x = &g_sub[i];
+            if ((int)i == keep || (x->state != SUB_LAUNCHED && x->state != SUB_FAILED) || x->nchild ||
+                x->handoffs > 0 || exec_pend_names((int)i) || px_names_subject((int)i) ||
+                pend_names_subject((int)i))
+                continue;
+            /* review: removed whatever cgid says (a failed one's already is:
+             * ENOENT; a launched one whose id could not be read is not) */
+            char dir[PATH_MAX + SUB_REL_MAX];
+            sub_dir((int)i, dir, sizeof dir);
+            if (sub_cg_rmdir(dir) < 0 && errno != ENOENT) continue;
+            x->cgid = 0;
+            sub_ended_record((int)i);
+            if (x->parent > 0) g_sub[x->parent].nchild--;
+            x->state = SUB_FREE;
+            x->rel[0] = '\0';
+            x->tgid = 0;
+            any = true;
+        }
+        if (!any) return;
+    }
 }
 
 /* A launch the policy allows by a rule with subagent=name, from a process of
@@ -714,14 +973,12 @@ static int sub_launch(pid_t tid, int from, const char *name, int csubj, bool mcp
                       uint64_t seq, const char **rule) {
     *rule = "subagent_failed";
     if (from < 0 || (size_t)from >= g_nsub) return -1;
-    if (g_nsub > SUB_MAX) { *rule = "subagent_limit"; return -1; }
     if (g_sub[from].depth >= SUB_MAX_DEPTH) { *rule = "subagent_depth"; return -1; }
     pid_t tgid = task_tgid(tid);
     if (tgid <= 0) return -1;
     /* single-threaded only (see above) */
-    char sp[64], line[128];
-    snprintf(sp, sizeof sp, "/proc/%d/status", (int)tgid);
-    FILE *sf = fopen(sp, "re");
+    char line[128];
+    FILE *sf = proc_fopenf("%d/status", (int)tgid);
     int threads = -1;
     while (sf && fgets(line, sizeof line, sf)) if (sscanf(line, "Threads: %d", &threads) == 1) break;
     if (sf) fclose(sf);
@@ -733,13 +990,20 @@ static int sub_launch(pid_t tid, int from, const char *name, int csubj, bool mcp
     unsigned long long layout[SUB_LAYOUT_N] = { 0 };
     if (g_cn < 0) {
         struct stat xs;
-        snprintf(sp, sizeof sp, "/proc/%d/exe", (int)tgid);
-        if (stat(sp, &xs) < 0) { *rule = "subagent_same_image"; return -1; }
+        if (proc_statf(&xs, "%d/exe", (int)tgid) < 0) { *rule = "subagent_same_image"; return -1; }
         if (xs.st_dev == edev && xs.st_ino == eino) {
             if (!sub_aslr() || sub_layout(tgid, layout) < 0) { *rule = "subagent_same_image"; return -1; }
             by_layout = true;
         }
     }
+    /* v1.36 step 5: under the node agent the container's first process
+     * stays in the container's group (M1); after the refusals a host makes */
+    if (g_cg_container && tgid == g_nr.pid) { *rule = "subagent_first_process"; return -1; }
+    /* v1.36 step 12: a slot released, else a new one, up to sub_max() held */
+    sub_reclaim(from);
+    size_t slot = 1;
+    while (slot < g_nsub && g_sub[slot].state != SUB_FREE) slot++;
+    if (slot == g_nsub && g_nsub > sub_max()) { *rule = "subagent_limit"; return -1; }
     sub_cn_drain();                      /* events from before this launch are not its */
     size_t c = 0;
     while (c < g_nsub_count && strcmp(g_sub_count[c].name, name)) c++;
@@ -748,7 +1012,7 @@ static int sub_launch(pid_t tid, int from, const char *name, int csubj, bool mcp
         snprintf(g_sub_count[c].name, sizeof g_sub_count[c].name, "%s", name);
         g_nsub_count++;
     }
-    struct subject *s = &g_sub[g_nsub];
+    struct subject *s = &g_sub[slot];
     memset(s, 0, sizeof *s);
     snprintf(s->name, sizeof s->name, "%s", name);
     s->n = g_sub_count[c].n + 1;
@@ -767,19 +1031,26 @@ static int sub_launch(pid_t tid, int from, const char *name, int csubj, bool mcp
     char rel[SUB_REL_MAX + 48], obo[sizeof s->obo + 64];
     int rl = snprintf(rel, sizeof rel, "%s/%s-%u", g_sub[from].rel, name, s->n);
     int ol = snprintf(obo, sizeof obo, "%s,\"subagent:%s#%u\"", g_sub[from].obo, name, s->n);
-    if (rl < 0 || (size_t)rl >= sizeof s->rel || ol < 0 || (size_t)ol >= sizeof s->obo) return -1;
+    if (rl < 0 || (size_t)rl >= sizeof s->rel || ol < 0 || (size_t)ol >= sizeof s->obo) {
+        s->state = SUB_FREE;             /* v1.36 step 12: the slot stays free */
+        s->rel[0] = '\0';
+        return -1;
+    }
     memcpy(s->rel, rel, (size_t)rl + 1);
     memcpy(s->obo, obo, (size_t)ol + 1);
     char dir[PATH_MAX + SUB_REL_MAX];
-    sub_dir((int)g_nsub, dir, sizeof dir);
-    if (mkdir(dir, 0755) < 0) return -1;
+    sub_dir((int)slot, dir, sizeof dir);
+    /* review: a slot not taken stays free (a failure below leaves it so) */
+    if (mkdirat(g_cg_dfd, dir, 0755) < 0) { s->state = SUB_FREE; s->rel[0] = '\0'; return -1; }
     s->cgid = sub_dir_id(dir);
     int pidfd = (int)syscall(__NR_pidfd_open, tgid, 0);
     int ok = pidfd >= 0 ? sub_move(tgid, pidfd, dir) : -1;
     if (pidfd >= 0) close(pidfd);
-    if (ok < 0) { rmdir(dir); return -1; }
+    if (ok < 0) { sub_cg_rmdir(dir); s->cgid = 0; s->state = SUB_FREE; s->rel[0] = '\0'; return -1; }
     g_sub_count[c].n++;
-    return (int)g_nsub++;
+    g_sub[from].nchild++;
+    if (slot == g_nsub) g_nsub++;
+    return (int)slot;
 }
 
 /* v1.31: the policy subject the calls of runtime subject s are decided as
@@ -824,21 +1095,24 @@ static bool sub_cgroup_write(int fd, int flags) {
 }
 
 /* The run's end: its groups removed, the deepest first (each process has
- * ended: the agent's PID namespace is gone) */
+ * ended: the agent's PID namespace is gone; under the node agent, the
+ * container's, as its first process has ended) */
 static void sub_finish(void) {
     if (!g_sub_on || !g_sub) return;
     for (int round = 0; round < 50; round++) {
         bool left = false;
         for (size_t i = g_nsub; i-- > 1; ) {
-            if (g_sub[i].state == SUB_FAILED) continue;            /* removed when it failed */
+            if (g_sub[i].state == SUB_FAILED || g_sub[i].state == SUB_FREE) continue;   /* removed already */
             char dir[PATH_MAX + SUB_REL_MAX];
             sub_dir((int)i, dir, sizeof dir);
-            if (rmdir(dir) < 0 && errno != ENOENT) left = true;
+            if (sub_cg_rmdir(dir) < 0 && errno != ENOENT) left = true;
         }
-        if (rmdir(g_cg_dir) < 0 && errno != ENOENT) left = true;
+        /* v1.36 step 5: the container's own group is the runtime's */
+        if (!g_cg_container && rmdir(g_cg_dir) < 0 && errno != ENOENT) left = true;
         if (!left) return;
         struct timespec ts = { 0, 20000000 };
         nanosleep(&ts, NULL);
     }
-    fprintf(stderr, "[warden] sub-agents: could not remove the run's control groups under %s\n", g_cg_dir);
+    fprintf(stderr, "[warden] sub-agents: could not remove the run's control groups under %s\n",
+            g_cg_container ? g_cg_self : g_cg_dir);
 }

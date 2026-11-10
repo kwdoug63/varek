@@ -49,7 +49,7 @@ jobs:
         --cap-add NET_ADMIN --cap-add NET_BIND_SERVICE --cap-add CHOWN
         --cgroupns=private --security-opt apparmor=varek-container
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: The host
         run: |
           uname -srm; docker --version
@@ -88,6 +88,37 @@ jobs:
           out="$(docker run --rm $SETTINGS varek-example)"
           echo "$out"
           python3 -c 'import json,sys; r = json.loads(sys.argv[1].splitlines()[-1]); ok = r["read_own_file"] == "ok" and r["import_requests"] == "ok" and r["read_shadow"] != "ok" and r["write_etc"] != "ok" and r["user"] != 0; sys.exit(0 if ok else 1)' "$out"
+      - name: Build the node image (v1.34, the Helm chart's)
+        run: docker build -f packaging/container/Containerfile --target node -t varek-node .
+      - name: The node image - each command the chart names runs, the launcher static
+        run: packaging/container/node_check.sh varek-node
+      - name: Install preflight (pinned, Red Hat's 1.22.0 release binary, checked by its SHA-256)
+        # Red Hat accepts results only from recent preflight (1.19.0 to 1.22.0
+        # on November 1, 2026; 1.14.1 is refused), so CI runs the version the
+        # submissions use. Releases after 1.14.1 have no Go module version
+        # (their tags carry no "v"), so this is the release's own binary, its
+        # hash the one the 1.36.1 submissions were made with.
+        env:
+          PREFLIGHT_VERSION: "1.22.0"
+          PREFLIGHT_SHA256: 1451ed8763f209f4d4a63848d9d62d1d40653a247db43d7606feb28eadbbd99b
+        run: |
+          [ "$(uname -m)" = x86_64 ] || { echo "the pinned hash is preflight-linux-amd64's; this runner is $(uname -m)"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/bin/preflight" \
+            "https://github.com/redhat-openshift-ecosystem/openshift-preflight/releases/download/$PREFLIGHT_VERSION/preflight-linux-amd64"
+          echo "$PREFLIGHT_SHA256  $RUNNER_TEMP/bin/preflight" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/preflight"
+          "$RUNNER_TEMP/bin/preflight" --version | grep -q "^preflight version $PREFLIGHT_VERSION " ||
+            { "$RUNNER_TEMP/bin/preflight" --version; echo "not preflight $PREFLIGHT_VERSION"; exit 1; }
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Red Hat's container certification checks (preflight) on the runtime and node images
+        run: OUT="$RUNNER_TEMP/preflight" packaging/container/preflight_check.sh varek varek-node
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        if: always()
+        with:
+          name: preflight
+          path: ${{ runner.temp }}/preflight
+          if-no-files-found: ignore
       - name: Build the test image
         run: docker build -f packaging/container/Containerfile --target test -t varek-test .
       - name: Run every suite in the test image
@@ -95,7 +126,7 @@ jobs:
       - name: Keep the sweep's logs
         if: always()
         run: sudo chmod -R a+rX "$RUNNER_TEMP/sweep" 2>/dev/null || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: always()
         with:
           name: container-sweep

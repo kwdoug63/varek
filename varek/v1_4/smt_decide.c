@@ -1252,6 +1252,17 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             p->require_obo = true;
             continue;
         }
+        /* v1.35 step 4 (D7): require plan */
+        if (!strcmp(tok[0], "require") && nt >= 2 && !strcmp(tok[1], "plan")) {
+            if (nt != 2) { rc = perr(err, errlen, path, lineno, "need: require plan"); break; }
+            if (!(req_maj > 1 || (req_maj == 1 && req_min >= 35))) {
+                rc = perr(err, errlen, path, lineno, "`require plan` needs `require warden 1.35` before it");
+                break;
+            }
+            if (p->require_plan) { rc = perr(err, errlen, path, lineno, "`require plan` given twice"); break; }
+            p->require_plan = true;
+            continue;
+        }
         if (!strcmp(tok[0], "require")) {
             int maj = -1, mn = -1;
             if (nt != 3 || strcmp(tok[1], "warden") || parse_version(tok[2], &maj, &mn) < 0) {

@@ -334,9 +334,8 @@ static const char *change_resolve_fd(pid_t pid, int fd, struct chg_pin *pin, cha
 
 /* For ftruncate: is the agent's descriptor open for writing? */
 static bool change_fd_writable(pid_t pid, int fd) {
-    char p[64], line[128];
-    snprintf(p, sizeof p, "/proc/%d/fdinfo/%d", pid, fd);
-    FILE *f = fopen(p, "re");
+    char line[128];
+    FILE *f = proc_fopenf("%d/fdinfo/%d", pid, fd);
     if (!f) return false;
     unsigned flags = 0;
     bool got = false;
@@ -361,14 +360,15 @@ static const char *change_decide(const struct policy *p, struct action *a, decis
         fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n", g_records, a->check_why);
         return "certificate_refused";
     }
+    if (hold_refuses(a)) return "outside_plan";          /* v1.35 step 4: outside the run's plan */
     return NULL;
 }
 
 /* Carry out an allowed change as the agent: 0 or -errno */
 static int change_do(pid_t pid, const struct action *a, const struct chg_pin *x, const struct chg_pin *y) {
     if (y && y->fd < 0) y = NULL;
-    char self[64];
-    if (!x->named) snprintf(self, sizeof self, "/proc/self/fd/%d", x->fd);
+    char self[64];   /* below the node's /proc (v1.34) */
+    if (!x->named) snprintf(self, sizeof self, "self/fd/%d", x->fd);
     /* a name written with a trailing '/' must be a directory, as the kernel
      * would have it (unlink("f/") of a file is ENOTDIR, not a removal) */
     const struct chg_pin *ts[2] = { x, y };
@@ -399,16 +399,16 @@ static int change_do(pid_t pid, const struct action *a, const struct chg_pin *x,
             r = (int)syscall(SYS_renameat2, x->fd, x->name, y->fd, y->name, a->chg_flags);
             break;
         case CHG_CHMOD:
-            r = fchmodat(AT_FDCWD, self, (mode_t)a->chg_mode, 0);
+            r = fchmodat(proc_dir(), self, (mode_t)a->chg_mode, 0);
             break;
         case CHG_UTIME:
             if (x->named)
                 r = utimensat(x->fd, x->name, a->chg_times_null ? NULL : a->chg_times, AT_SYMLINK_NOFOLLOW);
             else
-                r = utimensat(AT_FDCWD, self, a->chg_times_null ? NULL : a->chg_times, 0);
+                r = utimensat(proc_dir(), self, a->chg_times_null ? NULL : a->chg_times, 0);
             break;
         case CHG_TRUNCATE: {
-            int w = open(self, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+            int w = openat(proc_dir(), self, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
             if (w < 0) { r = -1; break; }
             r = ftruncate(w, (off_t)a->chg_len);
             int e = errno;
@@ -482,8 +482,17 @@ static void change_handle(int notify_fd, const struct seccomp_notif *req, struct
             const char *erule = NULL;
             decision_t eraw = DEC_UNKNOWN;
             a->open_flags = O_RDONLY;
+            /* v1.35 step 9 (review): held, the answer is the hold's too: a lookup,
+             * asked as a metadata call is (a directory above a step's path) */
+            bool hold_ok = true;
+            if (g_hold_on) {
+                int k = a->kind;
+                a->kind = ACT_FILE_STAT;
+                hold_ok = hold_covers(a);
+                a->kind = k;
+            }
             if (S_ISDIR(es.st_mode) && is_ancestor(a->resolved, sub_policy_subject(a->subject)) &&
-                !ancestor_denied(p, a->resolved, sub_policy_subject(a->subject))) {
+                !ancestor_denied(p, a->resolved, sub_policy_subject(a->subject)) && hold_ok) {
                 erule = "mkdir_exists_ancestor";
                 eraw = DEC_ALLOW;
             } else if (!change_decide(p, a, &eraw)) {

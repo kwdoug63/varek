@@ -32,7 +32,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden warden-proxy warden-secrets target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-v1300-oflags test-v1300 test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112 test-v1311 test-v1320 test-v1321
+.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-v1311 test-v1320 test-v1321 test-v1340 test-v1350 test-v1300 test-v1300-oflags test-varek-k8s test-varek-chart sweep-v1340 test-v1340-kind test-v1340-apiserver varek-nri varek-admission varek-svid test-node-json test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
 
 all: $(BINS)
 
@@ -74,7 +74,7 @@ CHECKER := checker/vdp_checker.c checker/vdp_checker.h
 # uses the host's resolver library.
 RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c shared_domains.c shared_domains.h warden_proxy.c warden_proxy.h proxy_parse.h warden_secrets.c warden_secrets.h warden_revoke.inc.c
 
-warden: warden.c warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c warden_exec.inc.c warden_noexec.inc.c warden_subagent.inc.c warden_revoke.inc.c warden_asagent.inc.c warden_change.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
+warden: warden.c warden_node.inc.c node_json.c node_json.h warden_oci.c warden_oci.h warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c warden_exec.inc.c warden_noexec.inc.c warden_subagent.inc.c warden_revoke.inc.c warden_asagent.inc.c warden_change.inc.c warden_hold.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
 	@# v1.27: Landlock does not govern a memfd, so the agent must never make one
 	@# (docs/security/v1.27-program-launches.md): memfd_create stays hard-denied
@@ -87,7 +87,7 @@ warden: warden.c warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_sy
 	    { echo "warden: prctl(PR_SET_MM) must stay refused (v1.32, the layout settling)"; exit 1; }
 	@[ "$$(grep -c 'SCMP_ACT_ALLOW, SCMP_SYS(prctl)' warden_baseline_filter.c)" = 2 ] || \
 	    { echo "warden: a prctl rule changed: check it admits no PR_SET_MM (v1.32), then this count"; exit 1; }
-	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c warden_secrets.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lcrypto -lresolv
+	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c node_json.c warden_oci.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c warden_secrets.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lcrypto -lresolv
 
 # v1.26.1: the egress proxy, its own program (the Warden starts it from a
 # sealed copy whose SHA-256 it records). It links neither libseccomp nor
@@ -107,9 +107,9 @@ warden-secrets: warden_secrets_helper.c warden_secrets.h mcp_json.c mcp_json.h m
 # v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
 # ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that
 # the certificate checker refuses the wrong verdict. Never deploy it.
-warden_faultinject: warden.c warden_net.inc.c warden_exec.inc.c warden_noexec.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
+warden_faultinject: warden.c warden_node.inc.c node_json.c node_json.h warden_oci.c warden_oci.h warden_net.inc.c warden_exec.inc.c warden_noexec.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
-	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT -pthread $(LDFLAGS) -o $@ warden.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c warden_secrets.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lcrypto -lresolv
+	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT -pthread $(LDFLAGS) -o $@ warden.c node_json.c warden_oci.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c warden_secrets.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lcrypto -lresolv
 
 # v1.15: command-line front end to the certificate checker (policy digest,
 # batch certificate checks). Links the checker only, never smt_decide.c.
@@ -444,24 +444,22 @@ test-v1290: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_ch
 	@./tests/test_v1290.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
 
 # v1.31 (docs/security/v1.31-standards.md)
+# v1.30: the open flags between this architecture's kernel encoding and
+# VAREK's (x86_64's), on each architecture the Warden builds for
+tests/v1300_oflags: tests/v1300_oflags.c smt_decide.c smt_decide.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/v1300_oflags.c smt_decide.c
+test-v1300-oflags: tests/v1300_oflags
+	@./tests/v1300_oflags
+# v1.30: the Warden on x86_64 and arm64 (the open flags in a run, records,
+# certificates, run_start's architecture and the audit); run on each
+test-v1300: warden tools/vdp_cert_check tests/v1300_oflags
+	@sudo ./tests/test_v1300.sh ./tools/vdp_cert_check ./warden
+
 tests/v1310_peek: tests/v1310_peek.c
 	$(CC) -O2 -Wall -Wextra -o $@ $<
 
 test-v1310: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check tests/v1281_sub tests/v1310_peek
 	@./tests/test_v1310.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
-
-# v1.30: the open flags between this architecture's kernel encoding and
-# VAREK's (x86_64's), on each architecture the Warden builds for
-tests/v1300_oflags: tests/v1300_oflags.c smt_decide.c smt_decide.h
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/v1300_oflags.c smt_decide.c
-
-test-v1300-oflags: tests/v1300_oflags
-	@./tests/v1300_oflags
-
-# v1.30: the Warden on x86_64 and arm64 (the open flags in a run, records,
-# certificates, run_start's architecture and the audit); run on each
-test-v1300: warden tools/vdp_cert_check tests/v1300_oflags
-	@sudo ./tests/test_v1300.sh ./tools/vdp_cert_check ./warden
 
 # v1.31.1: calls glibc and bash make, admitted under every policy
 test-v1311: warden tools/vdp_check tools/vdp_cert_check
@@ -476,6 +474,65 @@ test-v1320: warden tools/vdp_check tools/vdp_cert_check
 # user namespace)
 test-v1321: warden tools/vdp_check tools/vdp_cert_check tests/v1281_sub
 	@./tests/test_v1321.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
+
+# v1.34 step 3: the launcher the NRI plugin puts first in a pod's command
+# (varek_init.c), static: it runs from the node inside any image. Not in
+# BINS, since a static build needs the C library's static archive.
+varek-init: varek_init.c
+	$(CC) -O2 -Wall -Wextra -static -o $@ varek_init.c
+
+# v1.34 step 3: the NRI plugin; step 5: the admission webhook (k8s/, Go: one
+# module, cmd/varek-nri and cmd/varek-admission), and their unit tests
+varek-nri:
+	cd k8s && go build -o ../varek-nri ./cmd/varek-nri
+
+varek-admission:
+	cd k8s && go build -o ../varek-admission ./cmd/varek-admission
+
+# v1.36 step 6 (D5): the pod's SVID from the node's SPIRE agent, for the node agent
+varek-svid:
+	cd k8s && go build -o ../varek-svid ./cmd/varek-svid
+
+test-varek-k8s: warden warden-secrets varek-svid
+	@cd k8s && test -z "$$(gofmt -l .)" && go vet ./... && VAREK_WARDEN="$(CURDIR)/warden" VAREK_SVID_BIN="$(CURDIR)/varek-svid" go test -count=1 ./...
+
+# v1.34 step 6: the Helm chart (packaging/helm/varek) rendered under each of
+# its settings, by helm on PATH or HELM; KUBECONFORM, if set, also checks
+# each render against Kubernetes' schemas
+test-varek-chart:
+	python3 -m pytest -q tests/test_varek_chart.py tests/test_varek_node_export.py
+
+# v1.34 step 7 (docs/security/v1.34-kubernetes.md, section 4):
+#   sweep-v1340          the suites, each again with every agent it starts run
+#                        as a pod's container under the node agent, each check
+#                        compared (root, runc; SUITES= to name some)
+#   test-v1340-kind      the chart on a kind cluster, with the node image
+#                        IMAGE= (packaging/container/Containerfile --target node)
+#   test-v1340-apiserver the chart's resource and webhook and the plugin's sync
+#                        against a real API server, without a cluster (root,
+#                        CRI-O; ENVTEST= the directory setup-envtest gives)
+sweep-v1340:
+	sudo tests/v1340_sweep.sh $(SUITES)
+
+test-v1340-kind: tools/varek_keygen tools/vdp_cert_check
+	tests/v1340_kind.sh --image $(IMAGE)
+
+test-v1340-apiserver:
+	sudo tests/v1340_apiserver.sh $(ENVTEST)
+
+# v1.34 step 3: the plugin, the node agent and the launcher together under
+# CRI-O (needs root, CRI-O with NRI, crictl and Go): tests/v1340_crio.sh
+
+# v1.34 step 2: the node agent, a container runc starts under the Warden's
+# filter handed to it (docs/security/v1.34-kubernetes.md); needs root and runc.
+# Step 3: with the launcher, policies by name and D4.
+test-v1340: warden warden-proxy varek-init tools/vdp_check tools/vdp_cert_check test-node-json
+	@./tests/test_v1340.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden ./varek-init
+
+# v1.35 step 2: the present mismatches between a plan's decision and the
+# runtime's (docs/security/v1.35-frameworks.md, D9); needs root.
+test-v1350: warden tools/vdp_cert_check tools/vdp_check
+	@./tests/test_v1350.sh ./warden
 
 # v1.31: the strict JSON parser for MCP calls (mcp_json.c), under ASan and
 # UBSan: its vectors, then MJ_N mutated inputs
@@ -542,7 +599,7 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared tests/proxy_parse_test tests/proxy_parse_fuzzer tests/v1281_sub tests/v1290_open tests/v1290_lat tests/v1300_oflags tests/v1310_peek
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared tests/proxy_parse_test tests/proxy_parse_fuzzer tests/v1281_sub tests/v1290_open tests/v1290_lat tests/v1310_peek tests/v1300_oflags tests/test_node_json varek-init varek-nri varek-admission varek-svid
 
 # v1.22: install the runtime and the `varek` command.
 #   sudo make install                  -> /opt/varek, plus /usr/local/bin/varek
@@ -553,7 +610,7 @@ INSTALL_TOOLS := tools/varek tools/vdp_check tools/vdp_cert_check tools/varek_ke
 	tools/varek_audit.py tools/varek_cyclonedx.py tools/varek_ocsf.py tools/varek_ed25519.py \
 	tools/varek_preflight.sh tools/varek_anchor_forward.py tools/varek_anchor_receiver.sh \
 	tools/varek_license.py tools/varek_vm.py tools/varek_bench.py tools/varek_bench_proxy.py tools/bench_proxy_client.py tools/varek_bench_launch.py \
-	tools/varek_baseline.py tools/varek_suggest.py tools/varek_container.py \
+	tools/varek_baseline.py tools/varek_suggest.py tools/varek_container.py tools/varek_node_export.py \
 	tools/bench_workload
 
 install: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
@@ -564,6 +621,8 @@ install: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check
 	install -m 0644 policies/*.policy.txt $(DESTDIR)$(PREFIX)/policies/
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/policies/agents
 	install -m 0644 policies/agents/*.profile.txt $(DESTDIR)$(PREFIX)/policies/agents/
+	install -d -m 0755 $(DESTDIR)$(PREFIX)/adapters        # v1.35 step 5: varek plan generate's adapters
+	install -m 0644 adapters/*.py adapters/requirements-frameworks.txt $(DESTDIR)$(PREFIX)/adapters/
 	if [ -d tools/systemd ]; then install -d -m 0755 $(DESTDIR)$(PREFIX)/tools/systemd && \
 	    install -m 0644 tools/systemd/* $(DESTDIR)$(PREFIX)/tools/systemd/; fi
 	ln -sf $(PREFIX)/tools/varek $(DESTDIR)$(BINDIR)/varek
@@ -575,4 +634,8 @@ uninstall:
 	@echo "removed $(PREFIX); settings in /etc/varek and logs in /var/log/varek were kept"
 
 test-cli: warden warden-proxy tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
-	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_license.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py tests/test_varek_bench_mcp.py tests/test_varek_vm.py tests/test_varek_container.py
+	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_container.py tests/test_varek_license.py tests/test_varek_vm.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py tests/test_varek_bench_mcp.py tests/test_varek_audit_stream.py tests/test_varek_node_keys.py
+
+# v1.34 step 2: the node agent's JSON reader (node_json.c)
+test-node-json: tests/test_node_json.c node_json.c node_json.h
+	@$(CC) $(CFLAGS) -o tests/test_node_json tests/test_node_json.c node_json.c && ./tests/test_node_json
