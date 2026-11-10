@@ -578,7 +578,7 @@ different risks at different points in the stack.
 - [x] **v1.31.1** — A patch release of v1.31.0: `epoll_wait`, `epoll_create`, `pipe` and `getpgrp` admitted under every policy, so asyncio, a shell's command substitution and bash work under the Warden ([release notes](./RELEASE-v1.31.1.md)).
 - [x] **v1.32.0** — Containers: an official image (`ghcr.io/kwdoug63/varek`, signed, with an SBOM), Docker and Podman, rootless included, under a published minimal set of settings, never `--privileged` ([design](./docs/security/v1.32-containers.md))
 - [x] **v1.32.1** — A patch release of v1.32.0: rootless Podman without `--systemd=always`
-- [ ] **macOS** (in progress; planned as v1.30.0, then v1.33.0; v1.34.0 shipped first, so it takes the next number when it is released) — macOS: the agent and the Warden in a lightweight Linux VM, with the same guarantees as on Linux ([plan](./docs/roadmap/v1.28-v1.31.md))
+- [ ] **v1.37.0** (in progress; macOS, planned as v1.30.0, then v1.33.0; v1.34.0 to v1.36.3 shipped first, so it takes v1.37.0, decided November 10, 2026) — macOS: the agent and the Warden in a lightweight Linux VM, with the same guarantees as on Linux ([plan](./docs/roadmap/v1.28-v1.31.md))
 - [x] **v1.34.0** — Kubernetes: a node agent, a Helm chart, OpenShift and Amazon EKS ([design](./docs/security/v1.34-kubernetes.md))
 - [x] **v1.35.0** — Agent frameworks: plans generated from the framework, Amazon Bedrock AgentCore first; plans held under the node agent too ([design](./docs/security/v1.35-frameworks.md))
 - [x] **v1.36.0** — Kubernetes at parity with a host (credentials, sub-agents, confined MCP servers, plans and the dry run in pods; arm64; an audit in bounded memory; a key for each node), and the supported platforms tested in CI ([plan](./docs/roadmap/v1.36-v1.37.md))
@@ -586,7 +586,7 @@ different risks at different points in the stack.
 - [x] **v1.36.2** — A patch release of v1.36.1: the node key published again when it changes, a test for `varek-crds`, `varek doctor`'s warning, the RHEL 9 install guide ([release notes](./RELEASE-v1.36.2.md))
 - [x] **v1.36.3** — A security patch release of v1.36.2: the node agent confirms the container a runtime connection names (its cgroup, its bundle under the runtime's directory, its annotations) before supervising it, and the admission webhook refuses a pod that mounts the node agent's socket directory ([advisory GHSA-pcxh-jj4w-2jcc](https://github.com/kwdoug63/varek/security/advisories/GHSA-pcxh-jj4w-2jcc), [release notes](./RELEASE-v1.36.3.md))
 - [x] **v1.36.3** — A security patch release of v1.36.2: the container a node agent connection names, confirmed by its cgroup, its bundle and its `config.json`; the webhook refuses a pod mounting the node agent's socket ([release notes](./RELEASE-v1.36.3.md))
-- [ ] **v1.37.0** (planned; was v1.36.0) — Security operations: Splunk, Microsoft Sentinel, OpenTelemetry ([plan](./docs/roadmap/v1.32-v1.35.md))
+- [ ] **v1.38.0** (planned; was v1.36.0, then v1.37.0) — Security operations: Splunk, Microsoft Sentinel, OpenTelemetry ([plan](./docs/roadmap/v1.32-v1.35.md))
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow; revisited after v1.35, once generated plans show how many steps it would clear ([plan](./docs/roadmap/v1.36-v1.37.md))
 

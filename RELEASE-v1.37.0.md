@@ -1,6 +1,6 @@
-# VAREK v1.33.0 — macOS, Through a Linux VM
+# VAREK v1.37.0 — macOS, Through a Linux VM
 
-**Draft until the full sweep on the EC2 Mac** (the 24-hour soak there passed; `docs/security/v1.33-mac-runbook.md`).
+**Draft until the Mac's checks, the full sweep and the 24-hour soak pass on the EC2 Mac on this code** (`docs/security/v1.33-mac-runbook.md`). Planned as v1.30.0, then v1.33.0; numbered v1.37.0 on November 10, 2026, when main (v1.36.3) was merged into its branch. The October runs below were on 1.33.0's code (v1.32.1's Warden with arm64 and the VM); they are run again on 1.37.0's.
 
 > Reviewed by three AI review agents (October 19, 2026; the arm64 Warden, the
 > VM path, and the tests, CI, tools and documentation), against the code; their
@@ -34,7 +34,8 @@ at all.
 - **Admitted under every policy:** `getpgid(0)`, which glibc's `getpgrp()`
   calls on arm64 (arm64 has no `getpgrp`), as `getpgrp` is on x86-64.
 
-It is v1.32.1's Warden with the above; no policy line, rule or record
+It is v1.36.3's Warden with the above (the arm64 Warden and `getpgid(0)` reached main
+first, in v1.34.0 to v1.36.0); no policy line, rule or record
 changes meaning.
 
 ## Tested
