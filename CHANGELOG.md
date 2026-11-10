@@ -9,6 +9,20 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+- **OpenShift: the node agent's first pod is no longer refused.** Helm
+  creates a SecurityContextConstraints, a kind it does not know, after a
+  DaemonSet, so the `varek` chart's own SCC for its node agent did not yet
+  exist when the DaemonSet made its first pod: OpenShift refused that pod
+  once ("unable to validate against any security context constraint")
+  before the DaemonSet's retry was admitted, as both chart certification
+  runs on OpenShift 4.22 showed. The SCC (now `varek-node-agent`, naming no
+  one) is the `varek-crds` chart's, which is installed first and creates it
+  on OpenShift; the `varek` chart, with `openshift.enabled=true`, grants its
+  node agent's service account alone its use (the ClusterRole
+  `RELEASE-node-scc`, bound in the release's namespace), which Helm creates
+  before the DaemonSet. Upgrade `varek-crds` before `varek`, as before: the
+  other way round, the node agent's pods are refused until `varek-crds` is
+  upgraded too.
 - `packaging/helm/certification/verify_on_openshift.sh --version` no longer
   stops at `cp: ... are the same file`: the chart `helm pull` puts in `--out`
   is used where it is instead of being copied onto itself.

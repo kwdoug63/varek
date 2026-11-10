@@ -260,10 +260,13 @@ admission:
 crds:
   check: true
 
-# OpenShift: a SecurityContextConstraints for the node agent's service
-# account (privileged, the node's PID namespace, host paths; the plugin,
-# the exporter and the init container as spc_t, the launcher labelled for
-# containers), and one for supervised pods (RELEASE-supervised:
+# OpenShift: the node agent's service account given the use of the
+# varek-crds chart's SecurityContextConstraints, varek-node-agent
+# (privileged, the node's PID namespace, host paths; the plugin, the
+# exporter and the init container as spc_t, the launcher labelled for
+# containers), which exists before this chart's DaemonSet makes a pod
+# (RELEASE-node-scc, bound in the release's namespace), and an SCC for
+# supervised pods (RELEASE-supervised:
 # restricted-v2 with VAREK's unsupervised profile admitted), given to a
 # namespace's service accounts by binding the ClusterRole
 # RELEASE-supervised-scc

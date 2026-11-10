@@ -84,8 +84,14 @@ its bill of materials attested on it (`cosign verify-attestation --type
 cyclonedx` on that tag, with the same two options).
 
 On OpenShift (CRI-O), add `--set runtime=cri-o --set openshift.enabled=true`.
-This creates a SecurityContextConstraints that only the node agent's service
-account may use.
+The node agent runs under the SecurityContextConstraints `varek-node-agent`,
+which the `varek-crds` chart creates when it is installed on OpenShift. It
+names no one: this chart lets its node agent's service account, and no other,
+use it, by a ClusterRole (`RELEASE-node-scc`) bound in the release's
+namespace. It is the CRDs' chart's so that it exists before this chart's
+DaemonSet makes its first pod: Helm creates an SCC after a DaemonSet, so one
+of this chart's own (1.36.3 and before) came too late for that pod, which
+OpenShift refused once before the DaemonSet's retry was admitted.
 
 ## A supervised pod
 
@@ -422,6 +428,12 @@ helm upgrade varek-crds oci://ghcr.io/kwdoug63/charts/varek-crds --version VERSI
 helm upgrade varek oci://ghcr.io/kwdoug63/charts/varek --version VERSION -n varek-system
 ```
 
+On OpenShift, the CRDs' chart first matters for one more thing: from a
+chart of 1.36.3 or before, upgrading it creates the node agent's SCC
+(`varek-node-agent`), and upgrading this chart then removes the SCC it made
+of its own (`RELEASE-node`). Upgraded the other way round, the node agent's
+pods are refused until the CRDs' chart is upgraded too.
+
 From a chart of 1.36.0 or before, which installed the CRDs from its
 `crds/` (owned by no release): give them to the `varek-crds` release before
 installing it (`packaging/helm/varek-crds/README.md`), then install it and
@@ -466,7 +478,7 @@ the chart's `fail`s name a value it cannot render with.
 | `admission.excludeNamespaces` | `[kube-system]` | not checked (the chart's own namespace never is): an annotated pod there is not checked, and still does not run unless the plugin adjusts it |
 | `admission.runtimeClasses` | `[]` | RuntimeClass names a supervised pod may give: ones whose handler is in `nri.runtimeHandlers` |
 | `admission.tls.*` | the chart's own CA | or a `kubernetes.io/tls` Secret (`secretName`, with its `ca.crt` or `caBundle`), or cert-manager (`certManager.enabled`, `issuerName`) |
-| `openshift.enabled` | `false` | the SecurityContextConstraints for the node agent |
+| `openshift.enabled` | `false` | OpenShift: the node agent's use of the `varek-crds` chart's SecurityContextConstraints (`varek-node-agent`), and the one for supervised pods |
 | `crds.check` | `true` | refuse to install on a cluster without the `varek-crds` chart's CRDs (checked where the chart installs on a cluster; `helm template` sees none) |
 | `credentials.dir`, `credentials.secrets` | `/var/lib/varek/credentials`, `[]` | where a `file:` source is, and the Secrets mounted there |
 | `credentials.vault.*` | `addr: ""`, `caSecret: ""`, `kubernetesAuth: {role: "", mount: kubernetes, audience: vault}` | `vault:` sources, signed in to with the node agent's service account |
