@@ -113,7 +113,7 @@ jobs:
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Red Hat's container certification checks (preflight) on the runtime and node images
         run: OUT="$RUNNER_TEMP/preflight" packaging/container/preflight_check.sh varek varek-node
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: always()
         with:
           name: preflight
@@ -126,7 +126,7 @@ jobs:
       - name: Keep the sweep's logs
         if: always()
         run: sudo chmod -R a+rX "$RUNNER_TEMP/sweep" 2>/dev/null || true
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: always()
         with:
           name: container-sweep
