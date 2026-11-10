@@ -1,10 +1,12 @@
 # VAREK Enterprise on AWS: Deployment Guide
 
-Version 1.2, for VAREK Enterprise 1.34.0 on AWS Marketplace. Since 1.23.1 the
+Version 1.2, for VAREK Enterprise 1.36.3 on AWS Marketplace. Since 1.23.1 the
 runtime adds host names and opt-in wildcards in host rules, the egress proxy,
 decided program launches, credential release, `varek run` with nothing set up
-first, MCP and OCSF support, containers and Kubernetes; see `CHANGELOG.md` and
-the release notes for each. Policies written for 1.23.x load unchanged.
+first, MCP and OCSF support, containers and Kubernetes, and plans generated
+from an agent's framework that a run can be held to (`varek plan generate`,
+`--hold-to-plan`); see `CHANGELOG.md` and the release notes for each.
+Policies written for 1.23.x load unchanged.
 Published by Sober Agentic Infrastructure, Inc. (SAI).
 
 This guide covers deploying, operating, backing up, upgrading and getting
