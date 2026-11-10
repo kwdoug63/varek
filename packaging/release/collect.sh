@@ -10,6 +10,8 @@
 #
 # Writes to OUT_DIR:
 #   varek-VERSION.tgz, varek-crds-VERSION.tgz   the Helm charts, as published
+#                                               (varek-crds from 1.36.1 on:
+#                                               1.36.0 and earlier had none)
 #   sbom.cdx.json, sbom-node-amd64.cdx.json,
 #   sbom-node-arm64.cdx.json                    the images' bills of materials
 #   varek-VERSION-artifacts.txt                 each published artifact's
@@ -37,7 +39,10 @@ for ref in "$IMAGE:$VERSION" "$NODE:$VERSION"; do
     verify "${ref%:*}@$d"
     echo "${ref%:*}@$d  $ref" >> "$OUT/varek-$VERSION-artifacts.txt"
 done
-for c in varek varek-crds; do
+# varek-crds was first published with 1.36.1; an earlier tag has only varek
+charts=(varek)
+[ "$(printf '%s\n' 1.36.1 "$VERSION" | sort -V | head -n1)" = 1.36.1 ] && charts+=(varek-crds)
+for c in "${charts[@]}"; do
     helm pull "oci://$CHARTS/$c" --version "$VERSION" -d "$OUT" 2>&1 | tee "$OUT/.pull.txt"
     d="$(sed -n 's/^Digest: //p' "$OUT/.pull.txt")"
     [[ "$d" == sha256:* ]] || { echo "collect.sh: helm pull gave no digest for $c" >&2; exit 1; }
