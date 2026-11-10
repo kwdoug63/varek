@@ -19,8 +19,8 @@ image:
 # (the MachineConfig in varek/v1_4/tests/soak_v1340/openshift-nri-*.yaml)
 runtime: cri-o
 
-# the chart's SecurityContextConstraints: the node agent's (privileged, the
-# node's PID namespace, host paths), bound to its service account alone, and
-# the one for supervised pods
+# OpenShift: the node agent's service account given the use of the varek-crds
+# chart's SecurityContextConstraints (varek-node-agent: privileged, the node's
+# PID namespace, host paths), and the chart's SCC for supervised pods
 openshift:
   enabled: true

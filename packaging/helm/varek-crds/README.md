@@ -27,6 +27,19 @@ chart grants no role. It runs the varek chart's node image, at the chart's
 version (`image` in `values.yaml`, its only values), as restricted-v2
 allows: on OpenShift the namespace gives its user, elsewhere 65532.
 
+## On OpenShift
+
+Installed on OpenShift (where the API server serves
+`security.openshift.io/v1`, which Helm sees on its own), this chart also
+creates the SecurityContextConstraints the `varek` chart's node agent runs
+under, `varek-node-agent`: privileged, in the node's PID namespace, with
+host paths. It names no user or group, so no one may use it until a role
+grants `use` of it; the `varek` chart, with `openshift.enabled=true`, grants
+that to its node agent's service account alone. It is this chart's so that
+it exists before the `varek` chart's DaemonSet makes its first pod: Helm
+creates an SCC, a kind it does not know, after a DaemonSet. Unlike the CRDs
+it is not kept: `helm uninstall varek-crds` removes it.
+
 ## Not certified by Red Hat
 
 This chart cannot be a certified chart: chart-verifier's `not-contains-crds` check, mandatory in the partner

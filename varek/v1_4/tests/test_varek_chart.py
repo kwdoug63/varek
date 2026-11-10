@@ -382,8 +382,22 @@ def test_rbac_reads_only():
 
 def test_openshift():
     docs = render("openshift.enabled=true", "runtime=cri-o")
-    scc = one(docs, "SecurityContextConstraints", "t-node")
-    assert scc["users"] == [f"system:serviceaccount:{NS}:t-node"]
+    # the node agent's SCC is the varek-crds chart's, so that it exists before
+    # the DaemonSet's first pod (Helm creates an SCC after a DaemonSet); it
+    # names no one, and this chart grants its node service account alone its
+    # use, by a ClusterRole bound in the release's namespace
+    assert [d["metadata"]["name"] for d in docs if d["kind"] == "SecurityContextConstraints"] == ["t-supervised"]
+    scc = one(render_crds("--api-versions", "security.openshift.io/v1"), "SecurityContextConstraints", "varek-node-agent")
+    assert scc["users"] == [] and scc["groups"] == []
+    assert "SecurityContextConstraints" not in kinds(render_crds())
+    role = one(docs, "ClusterRole", "t-node-scc")
+    assert role["rules"] == [{"apiGroups": ["security.openshift.io"], "resources": ["securitycontextconstraints"],
+                              "resourceNames": ["varek-node-agent"], "verbs": ["use"]}]
+    bind = one(docs, "RoleBinding", "t-node-scc")
+    assert bind["metadata"]["namespace"] == NS
+    assert bind["roleRef"] == {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "t-node-scc"}
+    assert bind["subjects"] == [{"kind": "ServiceAccount", "name": "t-node", "namespace": NS}]
+    assert "RoleBinding" not in kinds(render())
     assert scc["allowPrivilegedContainer"] and scc["allowHostPID"] and scc["allowHostDirVolumePlugin"]
     assert not scc["allowHostNetwork"]
     spec = pod(docs, "DaemonSet")
@@ -479,7 +493,8 @@ def test_credentials():
     sdocs = render("openshift.enabled=true", "runtime=cri-o", "credentials.secrets={gh-token}",
                    "credentials.vault.addr=https://vault:8200", "credentials.vault.kubernetesAuth.role=agents")
     used = {next(k for k in x if k != "name") for x in pod(sdocs, "DaemonSet")["volumes"]}
-    assert used <= set(one(sdocs, "SecurityContextConstraints", "t-node")["volumes"])
+    node_scc = one(render_crds("--api-versions", "security.openshift.io/v1"), "SecurityContextConstraints", "varek-node-agent")
+    assert used <= set(node_scc["volumes"])
 
     # EKS Pod Identity: the node's agent, with the token its audience names
     docs = render("credentials.aws.podIdentity=true")
@@ -864,7 +879,8 @@ def test_the_openshift_certification_values(tmp_path):
     v.write_text(text.replace('\n  digest: ""\n', '\n  digest: "sha256:' + "0" * 64 + '"\n', 1))
     p = helm("template", "t", str(released), "-n", NS, "--kube-version", KUBE, "-f", vals)
     docs = [d for d in yaml.safe_load_all(p.stdout) if d]
-    one(docs, "SecurityContextConstraints", "t-node")
+    one(docs, "ClusterRole", "t-node-scc")
+    one(docs, "RoleBinding", "t-node-scc")
     one(docs, "SecurityContextConstraints", "t-supervised")
     meta = yaml.safe_load(open(os.path.join(CHART, "Chart.yaml")))
     ds = one(docs, "DaemonSet")
