@@ -105,7 +105,13 @@ int main(void) {
         { "wait4",         "allow" },
         { "ioctl_tcgets",  "allow" },
         { "ioctl_tiocsti", "deny"  },
+#if defined(__x86_64__)
+        // a call from another ABI kills the whole process. v1.30: x86_64's x32;
+        // arm64's other ABI (32-bit ARM) cannot be entered from a 64-bit
+        // process, and there this number is only one the table does not have,
+        // refused as the "x32" probe above shows
         { "x32_in_thread", "killed" },
+#endif
         { "io_uring_setup","enosys" },
         { "io_uring_enter","killed" },
         { "sendto_null",   "allow" },

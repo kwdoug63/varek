@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: MIT
-# v1.34 step 9: the EKS cluster for the 24-hour run (README.md). Two amd64
-# nodes on Amazon Linux 2023, whose containerd is 2.2 or later (the plugin
-# needs NRI v0.10); one long agent runs on each.
+# v1.34 step 9, v1.36 step 12: the EKS cluster for the 24-hour run
+# (README.md). One node of each architecture, both on Amazon Linux 2023,
+# whose containerd is 2.2 or later (the plugin needs NRI v0.10): an amd64
+# node (m6i.large) and a Graviton one (m7g.large, arm64), in one cluster, the
+# node image a manifest list of both. One long agent and one volume pod run
+# on each.
 #
 #   eksctl create cluster -f eks-cluster.yaml      (about 20 minutes)
 #   eksctl delete cluster -f eks-cluster.yaml      (after the run)
@@ -11,14 +14,21 @@ metadata:
   name: varek-soak
   region: us-east-1
   version: "1.35"
-  tags: { purpose: varek-v1.34-soak }
+  tags: { purpose: varek-v1.36-soak }
 managedNodeGroups:
   - name: agents
     amiFamily: AmazonLinux2023
     instanceType: m6i.large
-    desiredCapacity: 2
-    minSize: 2
-    maxSize: 2
+    desiredCapacity: 1
+    minSize: 1
+    maxSize: 1
     volumeSize: 40
     # the node role's default policies include reading ECR, where the node
-    # image is pushed (README.md, step 2)
+    # image is pushed (README.md, step 1)
+  - name: agents-arm64
+    amiFamily: AmazonLinux2023
+    instanceType: m7g.large
+    desiredCapacity: 1
+    minSize: 1
+    maxSize: 1
+    volumeSize: 40

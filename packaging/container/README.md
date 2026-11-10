@@ -7,7 +7,7 @@ container, exactly as on a host. The design and its decisions are in
 
 > **Released in v1.32.0** (October 19, 2026; rootless Podman without
 > `--systemd=always` from v1.32.1), and published with every release since
-> (currently v1.34.0). The settings below are measured on real hosts: every
+> (currently v1.36.3). The settings below are measured on real hosts: every
 > suite passes under them with Docker on Ubuntu 24.04 (AppArmor, cgroup
 > v2), and rootful and rootless Podman on RHEL 9.8 (SELinux enforcing,
 > cgroup v2). In a container the kernel gives no process events (RHEL 9,
@@ -15,7 +15,7 @@ container, exactly as on a host. The design and its decisions are in
 > runs and, for one of the image its launcher runs (a Python agent launching
 > a Python MCP server), by its memory layout. The image is built for amd64
 > (x86_64) only. For Kubernetes, use the node agent and Helm chart
-> (v1.34.0, `packaging/helm/varek/`) rather than this image's settings.
+> (from v1.34.0, `packaging/helm/varek/`) rather than this image's settings.
 
 ## Get the image
 
@@ -26,7 +26,7 @@ materials attached as a signed attestation
 (`.github/workflows/container-release.yml`):
 
 ```
-docker pull ghcr.io/kwdoug63/varek:1.34.0
+docker pull ghcr.io/kwdoug63/varek:1.36.3
 ```
 
 (If the package is not public yet, a pull needs a GitHub login first:
@@ -34,8 +34,8 @@ docker pull ghcr.io/kwdoug63/varek:1.34.0
 version's tag, by its exact identity:
 
 ```
-cosign verify ghcr.io/kwdoug63/varek:1.34.0 \
-  --certificate-identity https://github.com/kwdoug63/varek/.github/workflows/container-release.yml@refs/tags/v1.34.0 \
+cosign verify ghcr.io/kwdoug63/varek:1.36.3 \
+  --certificate-identity https://github.com/kwdoug63/varek/.github/workflows/container-release.yml@refs/tags/v1.36.3 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
@@ -43,7 +43,7 @@ and its bill of materials, with `cosign verify-attestation --type cyclonedx`
 and the same two options. `cosign verify` prints the digest it checked
 (`"docker-manifest-digest"`); run that digest
 (`ghcr.io/kwdoug63/varek@sha256:...`), not the tag, which can be moved.
-`:1.34` follows the newest v1.34 release and `:latest` the newest release; verify the version they
+`:1.36` follows the newest v1.36 release and `:latest` the newest release; verify the version they
 point to as above.
 
 ## Build
@@ -55,6 +55,25 @@ docker build -f packaging/container/Containerfile -t varek .
 ```
 
 `podman build` takes the same arguments.
+
+The images carry the labels Red Hat's container certification (preflight)
+asks for: `name`, `vendor`, `version`, `release`, `summary`,
+`description` and `maintainer`, each VAREK's, since the UBI base image's
+name an image and a vendor of Red Hat's; and the licenses are in
+`/licenses`. A build sets the version with `--build-arg VAREK_VERSION=` and
+the commit with `--build-arg VAREK_REVISION=` (the release workflow passes
+both; a local build says `dev`). The node image runs as root, for the node
+agent: its certification project sets host-level access to Privileged,
+which Red Hat reviews (`docs/security/node-agent-privilege.md`).
+
+CI runs Red Hat's checks (preflight 1.22.0, a version Red Hat accepts
+submissions from; it refuses results from 1.14.1) on both images as built,
+on every change (`container.yml`): `packaging/container/preflight_check.sh varek
+varek-node` pushes each to a registry on the runner and checks it; every
+check must pass but `RunAsNonRoot`, which both images fail by design (they
+run as root, under host-level access Privileged). Each base image is pinned
+by digest in the `Containerfile`, so a build is reproducible; a newer base
+is taken by changing the digest there.
 
 ## Run
 
@@ -177,8 +196,8 @@ Dockerfile with a small agent; CI builds it on each change and runs it
 under the settings above):
 
 ```
-FROM ghcr.io/kwdoug63/varek:1.32.0
-RUN microdnf -y install python3-pip && pip3 install --no-cache-dir requests && microdnf clean all
+FROM ghcr.io/kwdoug63/varek:1.32.0@sha256:8a5706d72bbc8d3cdffa191200ca38bddbac08915b8a0667b687d5ec4725f9cb
+RUN microdnf -y install python3-requests && microdnf clean all
 COPY agent.py /work/agent.py
 CMD ["python3", "/work/agent.py"]
 ```

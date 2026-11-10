@@ -1,0 +1,35 @@
+# The sample's policy (VAREK v1.35): the reviewer may read the code, write its
+# reviews, run git, read Python's docs, and read and comment on issues. Its
+# plan (`varek plan generate --from claude . --app-dir /srv/reviewer --home
+# /home/agent --cli /opt/claude/bin/claude`) is authorized under it.
+require warden 1.35
+proxy inspect
+allow path /usr/ readonly
+allow path /lib/ readonly
+allow path /lib64/ readonly
+deny  path /etc/shadow
+allow path /etc/ readonly
+allow path /proc/self/ readonly
+allow path exact /proc/stat readonly
+allow path exact /proc/cpuinfo readonly
+allow path exact /proc/meminfo readonly
+allow path exact /proc/sys/crypto/fips_enabled readonly
+allow path /sys/devices/system/cpu/ readonly
+allow path /sys/fs/cgroup/ readonly
+allow path exact /dev/null
+allow path exact /dev/urandom readonly
+allow path /tmp/
+allow path /srv/reviewer/ readonly
+allow path /srv/reviewer/reviews/
+allow path /home/agent/.claude/
+allow path exact /home/agent/.claude.json
+allow exec /opt/claude/bin/claude
+allow exec /usr/bin/git
+allow host api.anthropic.com:443
+allow host docs.python.org:443
+allow host issues.example.com:443
+allow mcp https://issues.example.com/mcp initialize
+allow mcp https://issues.example.com/mcp notifications/initialized
+allow mcp https://issues.example.com/mcp tools/list
+allow mcp https://issues.example.com/mcp tools/call get_issue
+allow mcp https://issues.example.com/mcp tools/call add_comment

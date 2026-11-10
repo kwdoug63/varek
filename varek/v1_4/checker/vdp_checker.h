@@ -87,7 +87,7 @@
 #include <stdint.h>
 
 #define VDPC_GRAMMAR_MAJOR 1
-#define VDPC_GRAMMAR_MINOR 31
+#define VDPC_GRAMMAR_MINOR 35     /* v1.35 step 4: require plan */
 
 #define VDPC_MAX_S        4095
 #define VDPC_MAX_RULES    512      /* v1.31: VDP_MAX_RULES */
@@ -152,6 +152,7 @@ typedef struct {
     vdpc_spiffe_t spiffe[VDPC_MAX_SPIFFE];
     size_t        nspiffe;
     int           require_obo;        /* v1.28.1: `require on-behalf-of` */
+    int           require_plan;       /* v1.35 step 4 (D7): `require plan` */
     vdpc_subject_t subjects[32];      /* v1.31: subject k is subjects[k - 1] */
     size_t        nsubjects;
     vdpc_mcpres_t mcpres[8];          /* v1.31 */

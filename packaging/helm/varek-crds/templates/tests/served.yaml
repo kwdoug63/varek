@@ -1,0 +1,91 @@
+{{/* SPDX-License-Identifier: MIT
+  helm test: the API server serves the four kinds, VarekPolicy, VarekPlan,
+  VarekCredential and VarekNodeKey, at varek.dev/v1alpha1. It reads the
+  group's discovery document, which any authenticated identity may read
+  (the cluster role system:discovery), with the pod's own service account
+  token: no role of the chart's. A CRD appears there only once the API
+  server has established it and serves its version, so this is the check
+  that the chart did what it is for. It retries for a minute (a CRD just
+  created is established soon after). It connects to the API server's
+  Service address the kubelet gives it (KUBERNETES_SERVICE_HOST), not
+  through the cluster's DNS, and verifies its certificate with the service
+  account's CA. Run as restricted-v2 allows: on OpenShift (the API group
+  security.openshift.io) the namespace gives the user, elsewhere 65532. The
+  pod is kept until the next test run (before-hook-creation), so its log
+  can be read after it (helm test --logs). */}}
+{{- $tag := .Values.image.tag | default .Chart.AppVersion -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ .Release.Name }}-test-served
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: varek
+    app.kubernetes.io/component: test
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: true
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  nodeSelector:
+    kubernetes.io/os: linux
+  securityContext:
+    runAsNonRoot: true
+    {{- if not (.Capabilities.APIVersions.Has "security.openshift.io/v1") }}
+    runAsUser: 65532
+    runAsGroup: 65532
+    {{- end }}
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: served
+      {{- if .Values.image.digest }}
+      image: {{ .Values.image.repository }}@{{ .Values.image.digest }}
+      {{- else }}
+      image: {{ .Values.image.repository }}:{{ $tag }}
+      {{- end }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      command:
+        - python3
+        - -c
+        - |
+          import json, os, ssl, sys, time, urllib.request
+          sa = "/var/run/secrets/kubernetes.io/serviceaccount"
+          host = os.environ["KUBERNETES_SERVICE_HOST"]
+          port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+          url = "https://%s:%s/apis/varek.dev/v1alpha1" % ("[%s]" % host if ":" in host else host, port)
+          want = {"varekpolicies", "varekplans", "varekcredentials", "vareknodekeys"}
+          ctx = ssl.create_default_context(cafile=sa + "/ca.crt")
+          token = open(sa + "/token").read().strip()
+          got, why = set(), ""
+          for _ in range(30):
+              try:
+                  req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
+                  with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                      got = {x["name"] for x in json.load(r).get("resources", []) if "/" not in x["name"]}
+                  why = ""
+              except Exception as e:
+                  why = "%s: %s" % (type(e).__name__, e)
+              if want <= got:
+                  break
+              time.sleep(2)
+          print("%s: %s" % (url, ", ".join(sorted(got & want)) or "none of the four"))
+          if why:
+              print("  last error: " + why)
+          missing = sorted(want - got)
+          if missing:
+              print("  not served: " + ", ".join(missing))
+          sys.exit(1 if missing else 0)
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: [ALL] }
+      resources:
+        requests: { cpu: 10m, memory: 32Mi }
+        limits: { memory: 64Mi }

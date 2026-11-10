@@ -1,0 +1,196 @@
+name: GitHub Release
+
+# The GitHub Release for a release tag (vX.Y.Z), its files signed and with
+# SLSA provenance. Nothing here builds anything: packaging/release/collect.sh
+# gathers what container-release.yml published and signed for the tag (the
+# Helm charts as pushed to ghcr.io, the images' bills of materials from the
+# release run, each artifact's digest), verifying each cosign signature
+# first. Then:
+#   - every file is signed with cosign, keyless, as this workflow
+#     (FILE.sig, FILE.pem and FILE.sigstore.json, a Sigstore bundle);
+#   - SLSA build provenance for every file is made by the SLSA framework's
+#     generic generator (multiple.intoto.jsonl);
+#   - the files, their signatures and the provenance are attached to the
+#     tag's Release: added to the one already published (its notes and
+#     settings untouched), or a new Release is created, its notes
+#     RELEASE-vX.Y.Z.md from the tag when there is one.
+#
+# Called by container-release.yml once a tag's images and charts are
+# published and signed. Run by hand (workflow_dispatch) for a tag released
+# before this workflow existed: the same steps, the bills of materials
+# taken from that tag's container-release.yml run. It refuses a tag whose
+# Release already carries these files (its SHA256SUMS), and replaces none.
+#
+# The SLSA generator is referenced by its version tag, not a commit: it
+# verifies its own reference and refuses a commit (Scorecard allows this).
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The version (X.Y.Z, the tag without its v)
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The version of an existing release tag (X.Y.Z, without the v)
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  files:
+    name: Gather and verify the release's files
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read        # the release run's bills of materials
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: The version is a release tag's, and its Release does not carry these files yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "not a version: $VERSION"; exit 1; }
+          gh api "repos/$REPO/git/ref/tags/v$VERSION" > /dev/null
+          if assets="$(gh release view "v$VERSION" -R "$REPO" --json assets --jq '.assets[].name' 2>/dev/null)"; then
+            if grep -qx SHA256SUMS <<<"$assets"; then
+              echo "v$VERSION's Release already carries its files (SHA256SUMS)"; exit 1
+            fi
+            echo "v$VERSION has a Release; the files will be added to it"
+          fi
+      # this workflow's own commit: the tag's when called on a tag, the
+      # branch's when run by hand (an earlier tag may predate collect.sh)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532  # v4.1.3
+        with:
+          cosign-release: v2.6.1
+      - name: Install helm (pinned, built from source; its modules checked against Go's checksum database)
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install helm.sh/helm/v3/cmd/helm@v3.18.6
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: The bills of materials, from this run (a tag's release)
+        if: github.event_name != 'workflow_dispatch'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: sbom-${{ inputs.version }}
+          path: ${{ runner.temp }}/sbom
+      - name: The tag's container-release.yml run (by hand, for an earlier tag)
+        id: run
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          id="$(gh run list -R "$REPO" -w container-release.yml --branch "v$VERSION" --status success \
+                  --json databaseId --jq '.[0].databaseId')"
+          [ -n "$id" ] && [ "$id" != null ] || { echo "no successful container-release.yml run for v$VERSION"; exit 1; }
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+      - name: The bills of materials, from that run
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: sbom-${{ inputs.version }}
+          path: ${{ runner.temp }}/sbom
+          run-id: ${{ steps.run.outputs.id }}
+          github-token: ${{ github.token }}
+      - name: Gather the published files and verify each artifact's signature
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }}
+        run: packaging/release/collect.sh "$VERSION" "$RUNNER_TEMP/sbom" "$RUNNER_TEMP/release"
+      - name: The files' hashes, for the provenance
+        id: hash
+        run: |
+          cd "$RUNNER_TEMP/release"
+          echo "hashes=$(sha256sum -- * | base64 -w0)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: release-files-${{ inputs.version }}
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: error
+
+  provenance:
+    name: SLSA provenance for the release's files
+    needs: [files]
+    permissions:
+      actions: read        # the workflow run's details
+      id-token: write      # the provenance's signature (Sigstore, keyless)
+      contents: write      # the generator's declared need; it uploads nothing (upload-assets: false)
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.files.outputs.hashes }}
+      provenance-name: multiple.intoto.jsonl
+      upload-assets: false
+
+  release:
+    name: Sign the files and publish the Release
+    needs: [files, provenance]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write      # create the Release
+      id-token: write      # cosign keyless: this workflow's OIDC identity
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      # this workflow's own commit: the tag's when called on a tag, the
+      # branch's when run by hand (an earlier tag may predate collect.sh)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: release-files-${{ inputs.version }}
+          path: ${{ runner.temp }}/release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: ${{ needs.provenance.outputs.provenance-name }}
+          path: ${{ runner.temp }}/provenance
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532  # v4.1.3
+        with:
+          cosign-release: v2.6.1
+      - name: Sign each file (cosign, keyless) and verify it, as a user would
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          cd "$RUNNER_TEMP/release"
+          # the signer: this run's workflow (container-release.yml on a tag,
+          # release-github.yml run by hand), this repository's
+          iss=https://token.actions.githubusercontent.com
+          for f in *; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" \
+              --output-signature "$f.sig" --output-certificate "$f.pem" "$f" > /dev/null
+            cosign verify-blob --bundle "$f.sigstore.json" \
+              --certificate-identity-regexp "^https://github.com/$REPO/\.github/workflows/" \
+              --certificate-oidc-issuer "$iss" "$f" > /dev/null
+            echo "signed and verified: $f"
+          done
+      - name: Attach the files to the tag's Release (or publish one)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          if gh release view "v$VERSION" -R "$REPO" > /dev/null 2>&1; then
+            # the Release published by hand: its notes and settings stay;
+            # no asset of the same name is replaced (no --clobber)
+            gh release upload "v$VERSION" -R "$REPO" \
+              "$RUNNER_TEMP"/release/* "$RUNNER_TEMP"/provenance/*
+          else
+            notes=(--generate-notes)
+            [ -f "RELEASE-v$VERSION.md" ] && notes=(--notes-file "RELEASE-v$VERSION.md")
+            pre=(); case "$VERSION" in *-*) pre=(--prerelease) ;; esac
+            gh release create "v$VERSION" -R "$REPO" --verify-tag --title "VAREK $VERSION" \
+              "${notes[@]}" "${pre[@]}" \
+              "$RUNNER_TEMP"/release/* "$RUNNER_TEMP"/provenance/*
+          fi
+          gh release view "v$VERSION" -R "$REPO" --json assets --jq '.assets[].name'

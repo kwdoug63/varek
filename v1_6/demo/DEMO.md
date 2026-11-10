@@ -182,7 +182,7 @@ $ ./warden policy.txt --plan plan_denied.txt -- /bin/echo 'TARGET RAN (must NOT 
 The target binary never runs. The plan verification fires in `main()`
 before `fork()`; on any non-SATISFIED decision the supervisor exits
 with non-zero status and the agent process is never created. This is
-the strongest possible realization of "pre-execution verification."
+the strongest possible realization of plan-level verification.
 
 ### 5. Authorized plan — both layers visible
 
@@ -229,4 +229,4 @@ The demo demonstrates the three patent claims composed:
 |--------|---------------------------------------------------|-----------------------------------------|
 | 64/006,104 | SMT-style decision procedure, symmetric suppression | Every record is SATISFIED / UNSATISFIED / UNKNOWN with both negatives suppressing. |
 | 64/059,592 | Warden architecture, kernel injection           | The `pr-` per-action records show the v1.4 Warden's seccomp-unotify supervisor in action. |
-| 64/062,549 | Pre-execution verification of action graphs     | The `pp-` plan-level records and the pre-fork rejection are this patent in code. |
+| 64/062,549 | Plan-level verification of action graphs     | The `pp-` plan-level records and the pre-fork rejection are this patent in code. |

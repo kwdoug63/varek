@@ -1,0 +1,1 @@
+{ "mcpServers": { "issues": { "type": "http", "url": "https://issues.example.com/mcp" } } }

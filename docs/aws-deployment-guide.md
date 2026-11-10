@@ -1,13 +1,6 @@
 # VAREK Enterprise on AWS: Deployment Guide
 
-Version 1.2 (October 25, 2026), for VAREK Enterprise 1.23.1 on AWS Marketplace.
-
-> **Which version the AMI runs.** The AWS Marketplace listing offers
-> VAREK Enterprise 1.23.1, listed October 4, 2026, when 1.23.0 was withdrawn
-> for new subscribers. Releases since (v1.24.0 to v1.34.0) are published on
-> GitHub and, from v1.32.0, as the container image `ghcr.io/kwdoug63/varek`;
-> they are not in the AMI yet. This guide describes 1.23.1. On an instance,
-> `varek version` prints the version it runs.
+Version 1.1, for VAREK Enterprise 1.23.1 on AWS Marketplace.
 Published by Sober Agentic Infrastructure, Inc. (SAI).
 
 This guide covers deploying, operating, backing up, upgrading and getting
@@ -40,7 +33,7 @@ Contents
 
 ### What VAREK does
 
-VAREK is a pre-execution authorization runtime for AI agents. The VAREK
+VAREK is kernel-enforced authorization for AI agents. The VAREK
 Warden starts your agent and decides every file open, network connection and
 program launch the agent attempts against your policy, at the Linux kernel
 boundary (seccomp user notification), before the action happens. Only
@@ -714,7 +707,7 @@ EC2 key pairs and agent secrets under your own policies.
   libraries changed. Run `sudo varek doctor` afterwards.
 - **VAREK.** A new AMI is published as a new version of the AWS
   Marketplace listing, built on current Amazon Linux 2023 patches; not every
-  GitHub release becomes an AMI (the listing currently offers 1.23.1). SAI
+  GitHub release becomes an AMI. SAI
   announces new versions and security advisories to subscribers. To upgrade:
   1. Launch a new instance from the new version, as in [7.2](#72-launch-the-instance).
   2. Copy `/etc/varek` from the old instance (and `/var/lib/varek` if used).

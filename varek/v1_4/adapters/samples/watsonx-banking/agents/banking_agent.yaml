@@ -1,0 +1,12 @@
+spec_version: v1
+kind: native
+name: banking_agent
+description: Answers questions about a customer's accounts, and converts currencies with the FX agent
+llm: watsonx/meta-llama/llama-3-3-70b-instruct
+style: react
+instructions: Look up the customer's accounts before answering about them.
+toolkits:
+  - banking
+collaborators:
+  - fx_agent
+tools: []

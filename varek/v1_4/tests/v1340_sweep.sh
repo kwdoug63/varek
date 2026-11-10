@@ -18,12 +18,16 @@
 #
 #   sudo varek/v1_4/tests/v1340_sweep.sh [--out DIR] [--runc PATH] [--only host|node] [SUITE...]
 #
-# Needs root, runc (or RUNC), python3, overlayfs and what the suites need.
+# Needs root, runc (or RUNC), python3, overlayfs, cgroup v2 (the node run)
+# and what the suites need.
 # Writes DIR/{host,node}/SUITE.log, DIR/calls.jsonl (each Warden call of the
 # node run, carried or passed through, with why) and DIR/summary.txt
 # (default /var/tmp/varek-sweep-<time>); VAREK_SWEEP_KEEP=1 keeps each
-# container's stream and the node agent's log. Exit status 1 for a difference no
-# reason is listed for, or a suite that fails on the host.
+# container's stream and the node agent's log. A node run's suite that times
+# out keeps them anyway, for its own calls only, with the processes then
+# running: DIR/node/SUITE.timeout/{ps.txt,CALL/agent.log,CALL/streams/}.
+# Exit status 1 for a difference no reason is listed for, or a suite that
+# fails on the host.
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -42,6 +46,9 @@ done
 [ -n "$RUNC" ] || RUNC="$(command -v runc || true)"
 [ -n "$RUNC" ] && [ -x "$RUNC" ] || { echo "v1340_sweep.sh: runc is needed (RUNC)" >&2; exit 2; }
 command -v python3 > /dev/null || { echo "v1340_sweep.sh: python3 is needed" >&2; exit 2; }
+# v1.36.3 (D1): the node agent confirms each container by its cgroup v2 line
+[ "$ONLY" = host ] || [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = cgroup2fs ] ||
+    { echo "v1340_sweep.sh: the node run needs cgroup v2 at /sys/fs/cgroup" >&2; exit 2; }
 OUT="${OUT:-/var/tmp/varek-sweep-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT/host" "$OUT/node"
 # its own directory on the root file system (not /tmp: the container's /tmp
@@ -50,6 +57,9 @@ W="$(mktemp -d /var/lib/varek-sweep.XXXXXX)"; chmod 755 "$W"
 cleanup() {
     umount -l "$W/hostroot" 2>/dev/null; umount -l "$W/ovl" 2>/dev/null
     for r in "$W"/inv/*/state; do [ -d "$r" ] && for c in "$r"/*; do [ -e "$c" ] && "$RUNC" --root "$r" delete -f "${c##*/}" >/dev/null 2>&1; done; done
+    # the containers' cgroups (tests/v1340_pod.py: v1340-sweep-<W's suffix>/pod<n>/sweep-<n>)
+    G="/sys/fs/cgroup/v1340-sweep-${W##*.}"
+    [ -d "$G" ] && { rmdir "$G"/*/* "$G"/* "$G" 2>/dev/null; }
     if [ -n "${VAREK_SWEEP_KEEP:-}" ]; then echo "kept $W"; else rm -rf "$W"; fi
 }
 trap cleanup EXIT
@@ -72,12 +82,30 @@ if [ ${#SUITES[@]} = 0 ]; then
 fi
 LIMIT=1800
 
+# a node run's suite that timed out: what its calls (W/inv/<call>, those not
+# there before it began) leave, kept before the cleanup removes W, and the
+# processes still running (the stalled case among them)
+kept_timed_out() {   # SUITE BEFORE
+    local k="$OUT/node/$1.timeout" d n=0
+    mkdir -p "$k"
+    ps -eo pid,ppid,etimes,stat,args --forest > "$k/ps.txt" 2>&1
+    for d in $(ls "$W/inv" 2>/dev/null | LC_ALL=C sort | LC_ALL=C comm -13 "$2" -); do
+        mkdir -p "$k/$d"
+        cp "$W/inv/$d/agent.log" "$k/$d/" 2>/dev/null
+        [ -d "$W/inv/$d/streams" ] && cp -r "$W/inv/$d/streams" "$k/$d/" 2>/dev/null
+        n=$((n + 1))
+    done
+    say "node   $1 timed out (${LIMIT}s): $n call(s)' node-agent logs and streams kept in $k"
+}
+
 suite() {   # MODE SUITE
     local t0 rc
     t0=$(date +%s)
     if [ "$1" = node ]; then
+        ls "$W/inv" 2>/dev/null | LC_ALL=C sort > "$W/inv.before"
         # the Warden as the suite names it (./warden), not remade (-o)
         timeout "$LIMIT" make -s -o warden -C "$S" "$2" > "$OUT/node/$2.log" 2>&1; rc=$?
+        [ "$rc" = 124 ] && kept_timed_out "$2" "$W/inv.before"
     else
         timeout "$LIMIT" make -s -C "$S" "$2" > "$OUT/host/$2.log" 2>&1; rc=$?
     fi
@@ -96,17 +124,23 @@ if [ "$ONLY" != host ]; then
     : > "$OUT/calls.jsonl"; chmod 666 "$OUT/calls.jsonl"   # a suite runs the Warden as other users too
     # the stand-in where any user (or a user namespace's root) can run it
     install -m 755 "$HERE/tests/v1340_pod.py" "$W/bin/v1340_pod.py"
+    PY="$(command -v python3)"
     # the version the Warden reports, which tools/varek reads from its binary
     VER="$(grep -ao '"warden":"[0-9.]*"' "$S/warden-sweep-real" | head -1)"
     for t in "${SUITES[@]}"; do
         # the stand-in, its settings written in (sudo, in the suites' targets, clears the environment)
+        # v1.36 step 5: in Python, not sh (a shell drops variables whose names
+        # are not its own, BASH_FUNC_f%% among them, which the agent is to
+        # get), and isolated (-I: a suite's PYTHONPATH is the agent's, not the
+        # stand-in's)
         cat > "$S/warden" <<EOF
-#!/bin/sh
+#!$PY -I
 # v1340_sweep.sh's stand-in for the Warden $VER
-export VAREK_SWEEP_DIR='$W' VAREK_SWEEP_WARDEN='$S/warden-sweep-real' VAREK_SWEEP_LAUNCHER='$S/varek-init' \
-       VAREK_SWEEP_RUNC='$RUNC' VAREK_SWEEP_LOG='$OUT/calls.jsonl' VAREK_SWEEP_SUITE='$t' \
-       VAREK_SWEEP_KEEP='${VAREK_SWEEP_KEEP:-}'
-exec python3 '$W/bin/v1340_pod.py' "\$@"
+import os, sys
+os.environ.update(VAREK_SWEEP_DIR='$W', VAREK_SWEEP_WARDEN='$S/warden-sweep-real', VAREK_SWEEP_LAUNCHER='$S/varek-init',
+                  VAREK_SWEEP_RUNC='$RUNC', VAREK_SWEEP_LOG='$OUT/calls.jsonl', VAREK_SWEEP_SUITE='$t',
+                  VAREK_SWEEP_KEEP='${VAREK_SWEEP_KEEP:-}')
+os.execv(sys.executable, [sys.executable, "-I", "$W/bin/v1340_pod.py"] + sys.argv[1:])
 EOF
         chmod 755 "$S/warden"; touch -r "$S/warden-sweep-real" "$S/warden"
         suite node "$t"

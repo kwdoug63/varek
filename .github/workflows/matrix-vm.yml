@@ -1,0 +1,136 @@
+name: Matrix in VMs
+
+# v1.36 step 2, its second part (docs/security/v1.36-kubernetes-parity.md,
+# D11): the matrix's cells that need a host other than the runner's Ubuntu,
+# each a cloud image booted under KVM on a hosted runner and reached by ssh
+# (varek/v1_4/tests/vm_cell.sh):
+#   SELinux enforcing: a one-node CRI-O 1.35 cluster on Rocky Linux 9 (RHEL
+#     9's rebuild; OpenShift's nodes are RHEL 9 with CRI-O), VAREK's chart
+#     checked on it as matrix.yml checks it (v1340_kind.sh --host), and
+#     SELinux's denials counted;
+#   the hosts: every host suite on Rocky Linux 9 and on Amazon Linux 2023
+#     (the OS of EKS's nodes). Ubuntu 24.04 is the runner's own, in
+#     warden-build.yml.
+# For each release (container-release.yml calls it on the tag's commit, and
+# publishes nothing unless every cell passes), and for each pull request that
+# touches the Warden, the node agent, the chart, the node image or these
+# cells. Each
+# image is its project's newest, checked by its SHA-256 and cached by it.
+
+on:
+  # v1.36 step 11: a release's run is the release workflow's (workflow_call),
+  # not a second one on the tag's push
+  workflow_call:
+  pull_request:
+    branches: [main]
+    paths:
+      - "varek/v1_4/*.c"
+      - "varek/v1_4/*.h"
+      - "varek/v1_4/Makefile"
+      - "varek/v1_4/k8s/**"
+      - "packaging/helm/**"
+      - "packaging/container/**"
+      - "varek/v1_4/tests/vm_cell.sh"
+      - "varek/v1_4/tests/node_cluster.sh"
+      - "varek/v1_4/tests/arm64_sweep.sh"
+      - "varek/v1_4/tests/v1340_kind.sh"
+      - ".github/workflows/matrix-vm.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# No concurrency group: a push does not cancel the run before it. A host
+# cell's sweep runs for an hour or more, and its result is kept, not lost
+# to the next push (matrix.yml's two-minute cells do cancel).
+
+jobs:
+  image:
+    name: The node image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the node image, and save it
+        timeout-minutes: 20
+        run: |
+          docker build -f packaging/container/Containerfile --target node -t varek-node:ci .
+          docker save -o "$RUNNER_TEMP/varek-node.tar" varek-node:ci
+          ls -l "$RUNNER_TEMP/varek-node.tar"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: node-image-vm
+          path: ${{ runner.temp }}/varek-node.tar
+          retention-days: 1
+
+  vm:
+    name: ${{ matrix.name }}
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: "SELinux enforcing: CRI-O 1.35 on Rocky Linux 9", os: rocky9, cell: chart}
+          - {name: "Rocky Linux 9 host: every suite", os: rocky9, cell: sweep}
+          - {name: "Amazon Linux 2023 host: every suite", os: al2023, cell: sweep}
+    # the cell's files and the image cache in the runner's own space, not in
+    # the checkout the cell copies into the VM
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        if: matrix.cell == 'chart'
+        with:
+          name: node-image-vm
+          path: ${{ runner.temp }}
+      - name: The image (its project's newest, and its SHA-256)
+        id: img
+        # v1.36 step 11 (review): pipefail, so a failed resolve fails the
+        # step, not tee; the matrix's values and the steps' outputs reach the
+        # scripts through env, not pasted into them
+        env:
+          VM_OS: ${{ matrix.os }}
+        run: |
+          set -o pipefail
+          bash varek/v1_4/tests/vm_cell.sh resolve --os "$VM_OS" | tee -a "$GITHUB_OUTPUT"
+      # restored here, saved after the cell even if it fails (a download
+      # is kept for the next run whatever the cell found)
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        id: cache
+        with:
+          path: ${{ runner.temp }}/vm-cache/${{ steps.img.outputs.file }}
+          key: vm-${{ steps.img.outputs.file }}-${{ steps.img.outputs.sha }}
+      - name: The cell
+        env:
+          VM_OS: ${{ matrix.os }}
+          VM_CELL: ${{ matrix.cell }}
+          IMG_FILE: ${{ steps.img.outputs.file }}
+          IMG_SHA: ${{ steps.img.outputs.sha }}
+          IMG_BASE: ${{ steps.img.outputs.base }}
+        run: |
+          OUT="$RUNNER_TEMP/vm-cell" CACHE="$RUNNER_TEMP/vm-cache"
+          mkdir -p "$OUT" "$CACHE"
+          sudo -E env "PATH=$PATH" bash varek/v1_4/tests/vm_cell.sh run --os "$VM_OS" --cell "$VM_CELL" \
+            --cache "$CACHE" --out "$OUT" --archive "$RUNNER_TEMP/varek-node.tar" \
+            --file "$IMG_FILE" --sha "$IMG_SHA" --base "$IMG_BASE"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/vm-cache/${{ steps.img.outputs.file }}
+          key: vm-${{ steps.img.outputs.file }}-${{ steps.img.outputs.sha }}
+      - name: Keep the logs (not the VM's key or disks)
+        if: always()
+        run: |
+          OUT="$RUNNER_TEMP/vm-cell" CACHE="$RUNNER_TEMP/vm-cache"
+          sudo rm -f "$OUT"/vm/key "$OUT"/vm/key.pub "$OUT"/vm/*.qcow2 "$OUT"/vm/seed.iso
+          sudo chmod -R a+rX "$OUT" "$CACHE" 2>/dev/null || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        if: always()
+        with:
+          name: vm-${{ matrix.os }}-${{ matrix.cell }}
+          path: ${{ runner.temp }}/vm-cell

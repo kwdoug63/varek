@@ -6,6 +6,10 @@
 which augments v1.6 plan-graph verification with a flow axis and adds
 explicit, audited declassification (v1.8.0).
 
+(v1.35: a run may now be held to its plan, `--hold-to-plan`; see
+`threat-model.md`, "Compositional plan safety". What follows on a plan's
+flow axis is unchanged.)
+
 This is a **companion** to
 [`threat-model.md`](./threat-model.md), which covers the runtime
 containment (Guardrails) layer. The two layers address different parts
@@ -15,7 +19,7 @@ of VAREK's defense surface and have non-overlapping trust boundaries:
   untrusted code (code-interpreter tools, agentic execution contexts,
   sandboxed eval)." Defends against malicious code *executing* inside
   VAREK's seccomp sandbox.
-- This document (data-flow verifier): the pre-execution verification
+- This document (data-flow verifier): the plan-level verification
   of an agent's *proposed plan* over its action graph. Defends
   against plans that compose individually-permitted actions into a
   leak, before any action runs.

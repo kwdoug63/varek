@@ -17,6 +17,8 @@ import yaml
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 CHART = os.path.join(ROOT, "packaging", "helm", "varek")
+# the custom resources, a chart of their own (Red Hat's chart certification)
+CRDS = os.path.join(ROOT, "packaging", "helm", "varek-crds")
 HELM = os.environ.get("HELM") or shutil.which("helm")
 KUBECONFORM = os.environ.get("KUBECONFORM")
 KUBE = "1.31.0"
@@ -33,7 +35,7 @@ def helm(*args, ok=True):
 
 
 def render(*sets, ok=True):
-    args = ["template", "t", CHART, "-n", NS, "--kube-version", KUBE, "--include-crds"]
+    args = ["template", "t", CHART, "-n", NS, "--kube-version", KUBE]
     for s in sets:
         args += ["--set", s]
     p = helm(*args, ok=ok)
@@ -43,6 +45,14 @@ def render(*sets, ok=True):
         k = subprocess.run([KUBECONFORM, "-strict", "-summary", "-kubernetes-version", KUBE,
                             "-ignore-missing-schemas"], input=p.stdout, capture_output=True, text=True, check=False)
         assert k.returncode == 0, k.stdout + k.stderr
+    return [d for d in yaml.safe_load_all(p.stdout) if d]
+
+
+def render_crds(*args, ok=True):
+    """the varek-crds chart's render: the CRDs and its helm test's pod"""
+    p = helm("template", "c", CRDS, "-n", NS, "--kube-version", KUBE, *args, ok=ok)
+    if not ok:
+        return p
     return [d for d in yaml.safe_load_all(p.stdout) if d]
 
 
@@ -95,15 +105,18 @@ def test_lint_strict():
 def test_the_default_render():
     docs = render()
     assert kinds(docs) == ["ClusterRole", "ClusterRole", "ClusterRoleBinding", "ClusterRoleBinding",
-                           "CustomResourceDefinition", "DaemonSet", "Deployment", "PodDisruptionBudget", "Secret",
+                           "DaemonSet", "Deployment",
+                           "MutatingWebhookConfiguration", "Pod", "PodDisruptionBudget", "Secret",
                            "Service", "ServiceAccount", "ServiceAccount", "ValidatingWebhookConfiguration"]
     for d in docs:
         if d["kind"] not in ("CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
-                             "ValidatingWebhookConfiguration"):
+                             "ValidatingWebhookConfiguration", "MutatingWebhookConfiguration"):
             assert d["metadata"]["namespace"] == NS, d["metadata"]
     images = {c["image"] for k in ("DaemonSet", "Deployment") for key in ("containers", "initContainers")
               for c in pod(docs, k).get(key, [])}
-    assert images == {"ghcr.io/kwdoug63/varek-node:1.34.0"}
+    # the image's tag is the chart's appVersion, which a release sets to its tag
+    app = yaml.safe_load(open(os.path.join(CHART, "Chart.yaml")))["appVersion"]
+    assert images == {f"ghcr.io/kwdoug63/varek-node:{app}"}
 
 
 def test_each_path_is_the_nodes_own():
@@ -142,8 +155,8 @@ def test_the_unsupervised_profile():
     assert "mv -f /host/seccomp/varek/.unsupervised.json.new /host/seccomp/varek/unsupervised.json" in script
     spec = pod(render("node.seccompRoot=/var/lib/k/seccomp"), "DaemonSet")
     assert volumes(spec)["seccomp"]["hostPath"]["path"] == "/var/lib/k/seccomp"
-    # a node the release's image does not run on gets no node agent
-    assert spec["nodeSelector"] == {"kubernetes.io/os": "linux", "kubernetes.io/arch": "amd64"}
+    # v1.36 (D8): the release's image is for amd64 and arm64, so every Linux node gets the node agent
+    assert spec["nodeSelector"] == {"kubernetes.io/os": "linux"}
 
 
 def test_the_exporters_state():
@@ -202,8 +215,14 @@ def test_the_runtime_chooses_the_state_directory():
         spec = pod(render(f"runtime={runtime}"), "DaemonSet")
         assert volumes(spec)["state"]["hostPath"]["path"] == state
         assert state in mounts(ctr(spec, "node-agent"))
+        # v1.36.3 (D2): the bundles' directory, under that state directory
+        sub = "io.containerd.runtime.v2.task/k8s.io" if runtime == "containerd" else "storage/overlay-containers"
+        assert arg(ctr(spec, "node-agent"), "--node-bundle-root") == f"{state}/{sub}"
     p = render("runtime=docker", ok=False)
     assert p.returncode != 0 and 'runtime "docker": give containerd or cri-o' in p.stderr
+    # a state directory of the platform's own (k3s's containerd): the bundles' follows it
+    spec = pod(render("node.state.containerd=/run/k3s/containerd"), "DaemonSet")
+    assert arg(ctr(spec, "node-agent"), "--node-bundle-root") == "/run/k3s/containerd/io.containerd.runtime.v2.task/k8s.io"
 
 
 def test_signing_and_the_anchor():
@@ -213,6 +232,8 @@ def test_signing_and_the_anchor():
     assert "key" not in volumes(spec)
     spec = pod(render("signing.secretName=varek-key", "signing.checkpointEvery=64", "anchor.enabled=true"), "DaemonSet")
     agent, exporter = ctr(spec, "node-agent"), ctr(spec, "exporter")
+    # v1.36 step 9 (D10): one key for every node, in place of each node's own
+    assert "--node-key" not in agent["command"] and "node-key" not in volumes(spec)
     key = arg(agent, "--sign-key")
     # a file (subPath), not the Secret volume's link: the Warden opens its key O_NOFOLLOW
     m = mounts(agent)[key]
@@ -242,7 +263,8 @@ def test_the_webhook():
     docs = render("admission.excludeNamespaces={kube-system,monitoring}")
     vwc = one(docs, "ValidatingWebhookConfiguration")
     hooks = {h["name"]: h for h in vwc["webhooks"]}
-    assert set(hooks) == {"varekpolicy.varek.dev", "pod.varek.dev", "pod-required.varek.dev"}
+    assert set(hooks) == {"varekpolicy.varek.dev", "varekplan.varek.dev", "varekcredential.varek.dev",
+                          "vareknodekey.varek.dev", "pod.varek.dev", "pod-required.varek.dev"}
     secret = one(docs, "Secret")
     assert secret["type"] == "kubernetes.io/tls"
     svc = one(docs, "Service")
@@ -254,6 +276,22 @@ def test_the_webhook():
         assert h["failurePolicy"] == "Fail" and h["sideEffects"] == "None"
     assert hooks["varekpolicy.varek.dev"]["rules"][0]["resources"] == ["varekpolicies"]
     assert hooks["varekpolicy.varek.dev"]["rules"][0]["operations"] == ["CREATE", "UPDATE"]
+    # v1.35 step 4c (D11): the plans
+    assert hooks["varekplan.varek.dev"]["rules"] == [{"apiGroups": ["varek.dev"], "apiVersions": ["v1alpha1"],
+                                                       "operations": ["CREATE", "UPDATE"], "resources": ["varekplans"]}]
+    assert "namespaceSelector" not in hooks["varekplan.varek.dev"]
+    # v1.36 step 4 (D2): the credentials, cluster-scoped, each checked
+    assert hooks["varekcredential.varek.dev"]["rules"] == [{"apiGroups": ["varek.dev"], "apiVersions": ["v1alpha1"],
+                                                            "operations": ["CREATE", "UPDATE"],
+                                                            "resources": ["varekcredentials"]}]
+    assert "namespaceSelector" not in hooks["varekcredential.varek.dev"]
+    # v1.36 step 9 (D10): the nodes' keys: made, changed and removed, each checked, never without the webhook
+    assert hooks["vareknodekey.varek.dev"]["rules"] == [{"apiGroups": ["varek.dev"], "apiVersions": ["v1alpha1"],
+                                                         "operations": ["CREATE", "UPDATE", "DELETE"],
+                                                         "resources": ["vareknodekeys"]}]
+    assert "namespaceSelector" not in hooks["vareknodekey.varek.dev"]
+    vwc = one(render("admission.failurePolicy=Ignore"), "ValidatingWebhookConfiguration")
+    assert {h["name"]: h["failurePolicy"] for h in vwc["webhooks"]}["vareknodekey.varek.dev"] == "Fail"
     for name in ("pod.varek.dev", "pod-required.varek.dev"):
         # G-3: an update is sent too (the annotation is not changed)
         assert hooks[name]["rules"][0]["operations"] == ["CREATE", "UPDATE"]
@@ -324,8 +362,18 @@ def test_the_webhooks_certificate_three_ways():
 def test_rbac_reads_only():
     docs = render()
     rules = {d["metadata"]["name"]: d["rules"] for d in docs if d["kind"] == "ClusterRole"}
-    assert rules == {"t-node": [{"apiGroups": ["varek.dev"], "resources": ["varekpolicies"], "verbs": ["get", "list", "watch"]}],
-                     "t-admission": [{"apiGroups": ["varek.dev"], "resources": ["varekpolicies"], "verbs": ["get"]}]}
+    res = ["varekpolicies", "varekplans"]                    # v1.35 step 4c: the plans too
+    # v1.36 step 4 (D2): the node lists and watches the credentials; the webhook lists them
+    cred = ["varekcredentials"]
+    # v1.36 step 7 (D7b): the plugin gets a pod, for its service account (a flow policy's session)
+    # v1.36 step 9 (D10): it makes its node's key, and reads it back; changes or removes none
+    # v1.36 step 11 (review): the credentials never got one by one
+    assert rules == {"t-node": [{"apiGroups": ["varek.dev"], "resources": res, "verbs": ["get", "list", "watch"]},
+                                {"apiGroups": ["varek.dev"], "resources": cred, "verbs": ["list", "watch"]},
+                                {"apiGroups": ["varek.dev"], "resources": ["vareknodekeys"], "verbs": ["get", "create"]},
+                                {"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}],
+                     "t-admission": [{"apiGroups": ["varek.dev"], "resources": res, "verbs": ["get"]},
+                                     {"apiGroups": ["varek.dev"], "resources": cred, "verbs": ["list"]}]}
     for b in (d for d in docs if d["kind"] == "ClusterRoleBinding"):
         assert b["subjects"] == [{"kind": "ServiceAccount", "name": b["roleRef"]["name"], "namespace": NS}]
     assert pod(docs, "DaemonSet")["serviceAccountName"] == "t-node"
@@ -334,8 +382,22 @@ def test_rbac_reads_only():
 
 def test_openshift():
     docs = render("openshift.enabled=true", "runtime=cri-o")
-    scc = one(docs, "SecurityContextConstraints", "t-node")
-    assert scc["users"] == [f"system:serviceaccount:{NS}:t-node"]
+    # the node agent's SCC is the varek-crds chart's, so that it exists before
+    # the DaemonSet's first pod (Helm creates an SCC after a DaemonSet); it
+    # names no one, and this chart grants its node service account alone its
+    # use, by a ClusterRole bound in the release's namespace
+    assert [d["metadata"]["name"] for d in docs if d["kind"] == "SecurityContextConstraints"] == ["t-supervised"]
+    scc = one(render_crds("--api-versions", "security.openshift.io/v1"), "SecurityContextConstraints", "varek-node-agent")
+    assert scc["users"] == [] and scc["groups"] == []
+    assert "SecurityContextConstraints" not in kinds(render_crds())
+    role = one(docs, "ClusterRole", "t-node-scc")
+    assert role["rules"] == [{"apiGroups": ["security.openshift.io"], "resources": ["securitycontextconstraints"],
+                              "resourceNames": ["varek-node-agent"], "verbs": ["use"]}]
+    bind = one(docs, "RoleBinding", "t-node-scc")
+    assert bind["metadata"]["namespace"] == NS
+    assert bind["roleRef"] == {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "t-node-scc"}
+    assert bind["subjects"] == [{"kind": "ServiceAccount", "name": "t-node", "namespace": NS}]
+    assert "RoleBinding" not in kinds(render())
     assert scc["allowPrivilegedContainer"] and scc["allowHostPID"] and scc["allowHostDirVolumePlugin"]
     assert not scc["allowHostNetwork"]
     spec = pod(docs, "DaemonSet")
@@ -366,14 +428,310 @@ def test_openshift():
 
 
 def test_the_crd_names_what_the_node_agent_takes():
-    crd = one(render(), "CustomResourceDefinition")
-    assert crd["metadata"]["name"] == "varekpolicies.varek.dev" and crd["spec"]["scope"] == "Namespaced"
-    v = crd["spec"]["versions"][0]
-    assert v["name"] == "v1alpha1" and v["served"] and v["storage"]
-    rule = v["schema"]["openAPIV3Schema"]["x-kubernetes-validations"][0]["rule"]
+    docs = render_crds()
     kube = open(os.path.join(ROOT, "varek", "v1_4", "k8s", "internal", "kube", "kube.go")).read()
     go = re.search(r"var Name = regexp\.MustCompile\(`([^`]*)`\)", kube).group(1)
-    assert f"matches('{go}')" in rule, (rule, go)
+    # v1.35 step 4c (D11): VarekPlan beside VarekPolicy, its text spec.plan
+    for name, kind, field in (("varekpolicies.varek.dev", "VarekPolicy", "policy"), ("varekplans.varek.dev", "VarekPlan", "plan")):
+        crd = one(docs, "CustomResourceDefinition", name)
+        assert crd["spec"]["scope"] == "Namespaced" and crd["spec"]["names"]["kind"] == kind
+        v = crd["spec"]["versions"][0]
+        assert v["name"] == "v1alpha1" and v["served"] and v["storage"]
+        rule = v["schema"]["openAPIV3Schema"]["x-kubernetes-validations"][0]["rule"]
+        assert f"matches('{go}')" in rule, (rule, go)
+        spec = v["schema"]["openAPIV3Schema"]["properties"]["spec"]
+        assert spec["required"] == [field] and spec["properties"][field]["type"] == "string"
+
+
+def _conf(docs):
+    """warden-secrets' configuration the chart writes, as key = value"""
+    text = one(docs, "Secret", "t-node-secrets-conf")["stringData"]["secrets.conf"]
+    return dict(l.split(" = ", 1) for l in text.splitlines() if l and not l.startswith("#"))
+
+
+def test_credentials():
+    """v1.36 step 4 (D1, D2): a file: source under the node agent's directory,
+    each Secret there; warden-secrets' configuration for vault: and aws-sm:,
+    each sign-in's token the kubelet projects for the node agent"""
+    docs = render()
+    spec = pod(docs, "DaemonSet")
+    agent = ctr(spec, "node-agent")
+    assert arg(agent, "--node-credentials") == "/var/lib/varek/credentials"
+    assert "--secrets-conf" not in agent["command"]
+    assert "t-node-secrets-conf" not in {d["metadata"]["name"] for d in docs if d["kind"] == "Secret"}
+    # the webhook names a file: source by the node agent's directory
+    assert arg(ctr(pod(docs, "Deployment"), "admission"), "-credentials-dir") == "/var/lib/varek/credentials"
+
+    docs = render("credentials.secrets={gh-token,db}", "credentials.vault.addr=https://vault:8200",
+                  "credentials.vault.caSecret=vca", "credentials.vault.kubernetesAuth.role=agents",
+                  "credentials.aws.region=us-east-2", "credentials.aws.roleArn=arn:aws:iam::1:role/r")
+    spec = pod(docs, "DaemonSet")
+    agent, m, v = ctr(spec, "node-agent"), mounts(ctr(spec, "node-agent")), volumes(spec)
+    for s in ("gh-token", "db"):
+        mp = m[f"/var/lib/varek/credentials/{s}"]
+        assert mp["readOnly"] and v[mp["name"]]["secret"] == {"secretName": s, "defaultMode": 0o400}
+    conf = arg(agent, "--secrets-conf")
+    assert conf == "/etc/varek/secrets/secrets.conf"
+    assert v[m[os.path.dirname(conf)]["name"]]["secret"] == {"secretName": "t-node-secrets-conf", "defaultMode": 0o400}
+    c = _conf(docs)
+    assert c == {"vault_addr": "https://vault:8200", "vault_ca": "/etc/varek/vault-ca/ca.crt",
+                 "vault_k8s_role": "agents", "vault_k8s_jwt_file": "/var/run/varek/tokens/vault/token",
+                 "vault_k8s_mount": "kubernetes", "aws_region": "us-east-2",
+                 "aws_role_arn": "arn:aws:iam::1:role/r",
+                 "aws_web_identity_token_file": "/var/run/varek/tokens/aws/token"}
+    # each key is one warden-secrets reads
+    helper = open(os.path.join(ROOT, "varek", "v1_4", "warden_secrets_helper.c")).read()
+    assert set(c) <= set(re.findall(r"\bK\((\w+)\)", helper)), set(c) - set(re.findall(r"\bK\((\w+)\)", helper))
+    # each file it names is on a mount: the CA, and each token, projected with its audience
+    assert v[m["/etc/varek/vault-ca"]["name"]]["secret"]["secretName"] == "vca"
+    for key, aud in (("vault_k8s_jwt_file", "vault"), ("aws_web_identity_token_file", "sts.amazonaws.com")):
+        vol = v[m[os.path.dirname(c[key])]["name"]]["projected"]
+        assert vol["defaultMode"] == 0o400
+        assert vol["sources"] == [{"serviceAccountToken": {"audience": aud, "expirationSeconds": vol["sources"][0]["serviceAccountToken"]["expirationSeconds"],
+                                                           "path": os.path.basename(c[key])}}]
+    # OpenShift admits each of these volumes
+    sdocs = render("openshift.enabled=true", "runtime=cri-o", "credentials.secrets={gh-token}",
+                   "credentials.vault.addr=https://vault:8200", "credentials.vault.kubernetesAuth.role=agents")
+    used = {next(k for k in x if k != "name") for x in pod(sdocs, "DaemonSet")["volumes"]}
+    node_scc = one(render_crds("--api-versions", "security.openshift.io/v1"), "SecurityContextConstraints", "varek-node-agent")
+    assert used <= set(node_scc["volumes"])
+
+    # EKS Pod Identity: the node's agent, with the token its audience names
+    docs = render("credentials.aws.podIdentity=true")
+    c = _conf(docs)
+    assert c == {"aws_container_credentials_uri": "http://169.254.170.23/v1/credentials",
+                 "aws_container_token_file": "/var/run/varek/tokens/aws/token"}
+    spec = pod(docs, "DaemonSet")
+    vol = volumes(spec)[mounts(ctr(spec, "node-agent"))["/var/run/varek/tokens/aws"]["name"]]
+    assert vol["projected"]["sources"][0]["serviceAccountToken"]["audience"] == "pods.eks.amazonaws.com"
+    # the node's instance role: a region alone, and no token
+    docs = render("credentials.aws.region=us-east-2")
+    assert _conf(docs) == {"aws_region": "us-east-2"}
+    assert "/var/run/varek/tokens/aws" not in mounts(ctr(pod(docs, "DaemonSet"), "node-agent"))
+
+    for sets, why in ((("credentials.aws.roleArn=arn:aws:iam::1:role/r", "credentials.aws.podIdentity=true"), "not both"),
+                      (("credentials.vault.kubernetesAuth.role=agents",), "need vault.addr"),
+                      (("credentials.vault.caSecret=vca",), "need vault.addr")):
+        p = render(*sets, ok=False)
+        assert p.returncode != 0 and why in p.stderr, (sets, p.stderr)
+
+
+def test_on_behalf_of():
+    """v1.36 step 6 (D5): a pod acting for a user. The mutating hook gives it
+    its token's volume and the init container (the node image); the node
+    agent reads the kubelet's copy, by the same path on the node, seen as
+    the kubelet mounts it; its SVID from the SPIRE agent's admin socket"""
+    docs = render("admission.excludeNamespaces={kube-system,monitoring}", "image.digest=sha256:" + "a" * 64)
+    image = "ghcr.io/kwdoug63/varek-node@sha256:" + "a" * 64
+    mwc = one(docs, "MutatingWebhookConfiguration")
+    assert [h["name"] for h in mwc["webhooks"]] == ["pod-mutate.varek.dev"]
+    h = mwc["webhooks"][0]
+    secret = one(docs, "Secret")
+    assert h["clientConfig"]["service"] == {"name": "t-admission", "namespace": NS, "path": "/pod-mutate", "port": 443}
+    assert h["clientConfig"]["caBundle"] == secret["data"]["ca.crt"]
+    assert h["rules"] == [{"apiGroups": [""], "apiVersions": ["v1"], "operations": ["CREATE"], "resources": ["pods"]}]
+    assert h["reinvocationPolicy"] == "Never" and h["failurePolicy"] == "Fail" and h["sideEffects"] == "None"
+    # every namespace's pods but the excluded (a namespace that requires a policy too)
+    assert h["namespaceSelector"]["matchExpressions"] == [
+        {"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": [NS, "kube-system", "monitoring"]}]
+    vwc = one(docs, "ValidatingWebhookConfiguration")
+    for v in vwc["webhooks"]:
+        if v["name"].startswith("pod"):
+            assert v["rules"][0]["resources"] == ["pods", "pods/ephemeralcontainers"], v["name"]
+    adm = ctr(pod(docs, "Deployment"), "admission")
+    assert arg(adm, "-obo-image") == image and arg(adm, "-obo-user") == "65534"
+    spec = pod(docs, "DaemonSet")
+    agent, plugin = ctr(spec, "node-agent"), ctr(spec, "plugin")
+    assert arg(plugin, "-obo-image") == image
+    assert arg(agent, "--node-kubelet") == "/var/lib/kubelet"
+    m = mounts(agent)["/var/lib/kubelet/pods"]
+    assert m["readOnly"] is True and m["mountPropagation"] == "HostToContainer"
+    assert host_path(spec, agent, "/var/lib/kubelet/pods") == "/var/lib/kubelet/pods"
+    assert "--node-spire-socket" not in agent["command"] and "/etc/varek/spire-bundle" not in mounts(agent)
+    # SPIRE: the admin socket's directory, the node agent's own ID, the bundle
+    sock = "/run/spire/admin-sockets/admin.sock"
+    me = "spiffe://example.org/ns/varek-system/sa/t-node"
+    spec = pod(render("spire.adminSocket=" + sock, "spire.self=" + me, "spire.bundleConfigMap=spire-bundle"), "DaemonSet")
+    agent = ctr(spec, "node-agent")
+    assert arg(agent, "--node-spire-socket") == sock and arg(agent, "--node-spire-self") == me
+    assert host_path(spec, agent, sock) == sock
+    # projected (in memory): a configMap volume's directory is the node's, writable by all
+    assert volumes(spec)[mounts(agent)["/etc/varek/spire-bundle"]["name"]]["projected"]["sources"] == [
+        {"configMap": {"name": "spire-bundle"}}]
+    assert mounts(agent)["/etc/varek/spire-bundle"]["readOnly"] is True
+    p = render("spire.self=" + me, ok=False)
+    assert p.returncode != 0 and "spire.self: give spire.adminSocket too" in p.stderr
+    # the issuers' CA: the cluster's own (kube-root-ca.crt), in warden-secrets' configuration
+    docs = render("onBehalfOf.issuerCaConfigMap=kube-root-ca.crt")
+    agent, spec = ctr(pod(docs, "DaemonSet"), "node-agent"), pod(docs, "DaemonSet")
+    assert _conf(docs)["oidc_ca"] == "/etc/varek/issuer-ca/ca.crt"
+    assert arg(agent, "--secrets-conf") == "/etc/varek/secrets/secrets.conf"
+    v = volumes(spec)[mounts(agent)["/etc/varek/issuer-ca"]["name"]]["projected"]
+    assert v["sources"] == [{"configMap": {"name": "kube-root-ca.crt", "items": [{"key": "ca.crt", "path": "ca.crt"}]}}]
+    assert "configMap" not in volumes(spec)[mounts(agent)["/etc/varek/issuer-ca"]["name"]]
+    assert "issuer-ca" not in volumes(pod(render(), "DaemonSet"))
+    # the init container's user: the value, or on OpenShift the namespace's
+    assert arg(ctr(pod(render("onBehalfOf.user=1001"), "Deployment"), "admission"), "-obo-user") == "1001"
+    assert arg(ctr(pod(render("openshift.enabled=true", "runtime=cri-o"), "Deployment"), "admission"), "-obo-user") == "0"
+
+
+def test_dry_run_flow_policy_and_trust_bundles():
+    """v1.36 step 7 (D6, D7, D7b): the VarekPolicy's fields; a flow policy's
+    breaker table on the node (root's host path); the trust bundles'
+    ConfigMap, projected (in memory: a configMap volume's directory is the
+    node's, writable by all)"""
+    docs = render()
+    crd = one(render_crds(), "CustomResourceDefinition", "varekpolicies.varek.dev")
+    props = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+    assert props["dryRun"]["type"] == "boolean" and props["flowPolicy"]["type"] == "string"
+    kube = open(os.path.join(ROOT, "varek", "v1_4", "k8s", "internal", "kube", "kube.go")).read()
+    go = re.search(r"var TrustKey = regexp\.MustCompile\(`([^`]*)`\)", kube).group(1)
+    assert props["trustBundle"]["pattern"] == go, (props["trustBundle"], go)
+    spec = pod(docs, "DaemonSet")
+    agent = ctr(spec, "node-agent")
+    assert arg(agent, "--node-flow-state") == "/var/lib/varek/flow"
+    assert host_path(spec, agent, "/var/lib/varek/flow") == "/var/lib/varek/flow"
+    assert "--node-trust-bundles" not in agent["command"] and "/etc/varek/trust-bundles" not in mounts(agent)
+    spec = pod(render("trustBundles.configMap=corp-roots", "flowPolicy.stateDir=/var/lib/varek/breaker"), "DaemonSet")
+    agent = ctr(spec, "node-agent")
+    assert arg(agent, "--node-trust-bundles") == "/etc/varek/trust-bundles"
+    assert arg(agent, "--node-flow-state") == "/var/lib/varek/breaker"
+    m = mounts(agent)["/etc/varek/trust-bundles"]
+    assert m["readOnly"] is True
+    v = volumes(spec)[m["name"]]
+    assert v["projected"]["sources"] == [{"configMap": {"name": "corp-roots"}}] and "configMap" not in v
+
+
+def test_the_api_token_in_the_plugin_alone():
+    """v1.36 step 11 (review): the node's service account token is not in
+    every container of the DaemonSet (the exporter could publish a node's key
+    with it, a credential's process log in with it): the plugin's alone,
+    bound to the pod, as the kubelet would automount it"""
+    spec = pod(render("exporter.enabled=true"), "DaemonSet")
+    assert spec["automountServiceAccountToken"] is False
+    sa = "/var/run/secrets/kubernetes.io/serviceaccount"
+    for c in spec["containers"] + spec["initContainers"]:
+        assert (sa in mounts(c)) == (c["name"] == "plugin"), c["name"]
+    assert mounts(ctr(spec, "plugin"))[sa] == {"name": "api-token", "mountPath": sa, "readOnly": True}
+    src = volumes(spec)["api-token"]["projected"]["sources"]
+    assert src[0]["serviceAccountToken"]["path"] == "token" and "audience" not in src[0]["serviceAccountToken"]
+    assert src[1]["configMap"]["name"] == "kube-root-ca.crt" and src[2]["downwardAPI"]["items"][0]["path"] == "namespace"
+    p = render("credentials.vault.addr=https://vault.example", "credentials.vault.kubernetesAuth.role=r",
+               "credentials.vault.kubernetesAuth.audience=", ok=False)
+    assert p.returncode != 0 and "binds its tokens to an audience" in p.stderr
+
+
+@pytest.mark.parametrize("sets, why", [
+    (["streams.rotateBytes=1000"], "65536 or more"),
+    (["streams.rotateBytes=1.5"], "a whole number of bytes"),
+    (["signing.nodeKey.pubDir=/var/lib/varek/key"], "each a directory of its own"),
+    (["signing.nodeKey.pubDir=/var/lib/varek/key/pub"], "each a directory of its own"),
+    (["signing.nodeKey.dir=/var/log/varek/key"], "node.streams (/var/log/varek) and signing.nodeKey.dir"),
+    (["credentials.dir=/var/lib/varek/policies/c"], "credentials.dir (/var/lib/varek/policies/c) and node.policies"),
+    (["signing.nodeKey.dir=/var/lib/varek/../x"], "an absolute path, with no .."),
+    (["signing.nodeKey.dir=key"], "an absolute path"),
+])
+def test_values_refused_at_render(sets, why):
+    """v1.36 step 11 (review): what the node would refuse, or would expose,
+    refused when the chart renders"""
+    p = render(*sets, ok=False)
+    assert p.returncode != 0 and why in p.stderr, p.stderr
+
+
+def test_values_the_checks_let_through():
+    render("streams.rotateBytes=0")
+    render("streams.rotateBytes=65536")
+    # one Secret signing every node: the node key's directories are not used, so not checked
+    render("signing.secretName=k", "signing.nodeKey.dir=/var/log/varek/key")
+    # a Secret's name with dots: its volume named by its place
+    spec = pod(render("credentials.secrets={gh.token,aws}"), "DaemonSet")
+    assert volumes(spec)["cred-0"]["secret"]["secretName"] == "gh.token"
+    assert mounts(ctr(spec, "node-agent"))["/var/lib/varek/credentials/gh.token"]["name"] == "cred-0"
+    # the SPIRE agent's directory, read-only, never made here
+    spec = pod(render("spire.adminSocket=/run/spire/admin-sockets/admin.sock"), "DaemonSet")
+    assert mounts(ctr(spec, "node-agent"))["/run/spire/admin-sockets"]["readOnly"] is True
+    assert volumes(spec)["spire-admin"]["hostPath"]["type"] == "Directory"
+    # the exporter's audit keeps what it holds back on the node's disk, not in the plugin's memory volume
+    spec = pod(render(), "DaemonSet")
+    assert mounts(ctr(spec, "exporter"))["/tmp"]["name"] == "exporter-scratch"
+    assert volumes(spec)["exporter-scratch"]["emptyDir"] == {"sizeLimit": "4Gi"}
+    assert mounts(ctr(spec, "plugin"))["/tmp"]["name"] == "tmp"
+
+
+def test_stream_rotation():
+    """v1.36 step 8 (D9): the node agent rotates each stream at the chart's
+    size, given in bytes as a whole number (never as a float); 0, none"""
+    agent = ctr(pod(render(), "DaemonSet"), "node-agent")
+    assert arg(agent, "--node-stream-rotate") == "268435456"
+    agent = ctr(pod(render("streams.rotateBytes=1073741824"), "DaemonSet"), "node-agent")
+    assert arg(agent, "--node-stream-rotate") == "1073741824"
+    agent = ctr(pod(render("streams.rotateBytes=0"), "DaemonSet"), "node-agent")
+    assert "--node-stream-rotate" not in agent["command"]
+
+
+def test_node_keys():
+    """v1.36 step 9 (D10): each node agent makes its own key, in a directory
+    only it mounts; its public key, apart, read by the plugin (which
+    publishes it as the node's VarekNodeKey) and the exporter (which pins
+    it); the webhook told the node agent's service account"""
+    docs = render("anchor.enabled=true")
+    spec = pod(docs, "DaemonSet")
+    agent, plugin, exporter = (ctr(spec, n) for n in ("node-agent", "plugin", "exporter"))
+    key, pub = arg(agent, "--node-key"), arg(agent, "--node-key-pub")
+    assert key == "/var/lib/varek/key/node.key" and pub == "/var/lib/varek/key-pub/node.key.pub"
+    assert host_path(spec, agent, key) == key and host_path(spec, agent, pub) == pub
+    assert arg(agent, "--node-name") == "$(NODE_NAME)" and "--sign-key" not in agent["command"]
+    assert arg(agent, "--checkpoint-every") == "256"
+    for c in (agent, plugin):
+        assert {"name": "NODE_NAME", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}} in c["env"]
+    assert arg(plugin, "-node-key-pub") == pub and arg(plugin, "-node") == "$(NODE_NAME)"
+    assert arg(exporter, "--pubkey") == pub
+    for c in (plugin, exporter):
+        assert mounts(c)[os.path.dirname(pub)]["readOnly"] is True and host_path(spec, c, pub) == pub
+        assert os.path.dirname(key) not in mounts(c), f"{c['name']} is given the public key only"
+    assert not mounts(agent)[os.path.dirname(key)].get("readOnly")
+    script = ctr(spec, "prepare", init=True)["command"][-1]
+    assert "install -d -o 0 -g 0 -m 0700 /host/key\n" in script and "chmod 0700 /host/key\n" in script
+    assert "-m 0755 /host/key-pub" in script
+    adm = ctr(pod(docs, "Deployment"), "admission")
+    assert arg(adm, "-node-agent-sa") == f"system:serviceaccount:{NS}:t-node"
+    # v1.36.3 (D6): the node agent's socket's directory, which no pod it serves mounts
+    assert arg(adm, "-node-socket-dir") == "/run/varek-node"
+    # off: no key, and nothing published
+    spec = pod(render("signing.nodeKey.enabled=false"), "DaemonSet")
+    agent, plugin = ctr(spec, "node-agent"), ctr(spec, "plugin")
+    assert "--node-key" not in agent["command"] and "-node-key-pub" not in plugin["command"]
+    assert "node-key" not in volumes(spec) and arg(agent, "--node-name") == "$(NODE_NAME)"
+
+
+def test_the_vareknodekey_crd():
+    crd = one(render_crds(), "CustomResourceDefinition", "vareknodekeys.varek.dev")
+    assert crd["spec"]["scope"] == "Cluster" and crd["spec"]["names"]["kind"] == "VarekNodeKey"
+    v = crd["spec"]["versions"][0]
+    assert v["name"] == "v1alpha1" and v["served"] and v["storage"]
+    spec = v["schema"]["openAPIV3Schema"]["properties"]["spec"]
+    assert spec["required"] == ["node", "publicKey"]
+    assert spec["x-kubernetes-validations"][0]["rule"] == "self == oldSelf"
+    # the names and keys the webhook takes (k8s/internal/kube/nodekeys.go)
+    go = open(os.path.join(ROOT, "varek", "v1_4", "k8s", "internal", "kube", "nodekeys.go")).read()
+    assert spec["properties"]["node"]["pattern"] == re.search(r"nodeName  = regexp\.MustCompile\(`([^`]*)`\)", go).group(1)
+    assert spec["properties"]["publicKey"]["pattern"] == re.search(r"publicKey = regexp\.MustCompile\(`([^`]*)`\)", go).group(1)
+
+
+def test_the_varekcredential_crd():
+    crd = one(render_crds(), "CustomResourceDefinition", "varekcredentials.varek.dev")
+    assert crd["spec"]["scope"] == "Cluster" and crd["spec"]["names"]["kind"] == "VarekCredential"
+    v = crd["spec"]["versions"][0]
+    assert v["name"] == "v1alpha1" and v["served"] and v["storage"]
+    spec = v["schema"]["openAPIV3Schema"]["properties"]["spec"]
+    assert spec["required"] == ["credential", "source", "namespaces"]
+    # the names and sources the node agent takes (k8s/internal/kube/credentials.go)
+    go = open(os.path.join(ROOT, "varek", "v1_4", "k8s", "internal", "kube", "credentials.go")).read()
+    name = re.search(r"var CredentialName = regexp\.MustCompile\(`([^`]*)`\)", go).group(1)
+    assert spec["properties"]["credential"]["pattern"] == name
+    src = spec["properties"]["source"]
+    assert src["pattern"] == "^(file|vault|aws-sm):[!-~]+$" and src["maxLength"] == len("aws-sm:") + 1024
+    assert spec["properties"]["namespaces"]["minItems"] == 1
 
 
 def test_the_chart_version_is_the_wardens():
@@ -388,17 +746,163 @@ def test_ci_and_the_release_build_check_and_sign_the_node_image_and_the_chart():
     assert "--target node" in ci and "node_check.sh" in ci
     ci = " ".join(s.get("run", "") for s in yaml.safe_load(open(os.path.join(wf, "warden-build.yml")))["jobs"]["build"]["steps"])
     assert "test-varek-chart" in ci and "KUBECONFORM=" in ci and re.search(r"kubeconform@v\d+\.\d+\.\d+", ci)
-    rel = yaml.safe_load(open(os.path.join(wf, "container-release.yml")))["jobs"]["publish"]["steps"]
+    jobs = yaml.safe_load(open(os.path.join(wf, "container-release.yml")))["jobs"]
+    rel = jobs["publish"]["steps"]
     run = [s.get("run", "") for s in rel]
     joined = " ".join(run)
-    for w in ("--target node", "node_check.sh", 'docker push "$NODE:$VERSION"', 'cosign sign --yes "$node"',
-              'cosign attest --yes --type cyclonedx --predicate sbom-node.cdx.json "$node"', "helm lint --strict",
+    # v1.36 (D8): arm64's node image built and checked on the arm64 runner, before publish
+    arm = jobs["node-arm64"]
+    assert arm["runs-on"] == "ubuntu-24.04-arm" and "node-arm64" in jobs["publish"]["needs"]
+    # v1.36 step 11: nothing is pushed until both matrices pass on the tag's commit
+    assert jobs["matrix"]["uses"] == "./.github/workflows/matrix.yml"
+    assert jobs["matrix-vm"]["uses"] == "./.github/workflows/matrix-vm.yml"
+    for j in ("node-arm64", "publish"):
+        assert {"matrix", "matrix-vm"} <= set(jobs[j]["needs"]), j
+    for m in ("matrix.yml", "matrix-vm.yml"):
+        assert "workflow_call" in yaml.safe_load(open(os.path.join(wf, m)))[True], m
+    # the VM cells run once for a tag: the release's call, not their own trigger too
+    assert "push" not in yaml.safe_load(open(os.path.join(wf, "matrix-vm.yml")))[True]
+    armrun = " ".join(s.get("run", "") for s in arm["steps"])
+    for w in ("--target node", 'node_check.sh "$NODE:$VERSION-arm64"', "= linux/arm64 ]",
+              'docker push "$NODE:$VERSION-arm64"', '"digest=$digest" >> "$GITHUB_OUTPUT"'):
+        assert w in armrun, w
+    # v1.36 step 11 (review): the arm64 image signed as it is pushed, not left unsigned while publish runs
+    assert 'cosign sign --yes "$digest"' in armrun and arm["permissions"]["id-token"] == "write"
+    assert armrun.index('docker push "$NODE:$VERSION-arm64"') < armrun.index('cosign sign --yes "$digest"')
+    for w in ("--target node", 'node_check.sh "$NODE:$VERSION-amd64"', "= linux/amd64 ]", 'docker push "$NODE:$VERSION-amd64"',
+              'docker buildx imagetools create -t "$NODE:$VERSION" "$amd64" "$ARM64"',
+              "platforms.py node-index.json linux/amd64 linux/arm64", 'cosign sign --yes --recursive "$node"',
+              'cosign attest --yes --type cyclonedx --predicate "sbom-node-$a.cdx.json" "$d"', "helm lint --strict",
               "helm package", 'helm push', 'cosign sign --yes "$CHARTS/varek@$d"',
-              '"$NODE_DIGEST" > /dev/null', '"$CHART_DIGEST" > /dev/null'):
+              "helm package packaging/helm/varek-crds", 'cosign sign --yes "$CHARTS/varek-crds@$d"',
+              '"$CRDS_DIGEST" > /dev/null',
+              '"$NODE_DIGEST" > /dev/null', 'for d in "$NODE_AMD64" "$NODE_ARM64"', '"$CHART_DIGEST" > /dev/null',
+              'docker buildx imagetools create -t "$NODE:$t" "$NODE_DIGEST"'):
         assert w in joined, w
     # helm pinned; the chart's version the tag's; its image the digest just signed
     assert re.search(r"helm\.sh/helm/v3/cmd/helm@v\d+\.\d+\.\d+", joined)
     assert "for f in version appVersion" in joined and 'd="${NODE_DIGEST#*@}"' in joined
     # each in order: published, then signed, then verified, then the tags moved
     at = lambda w: next(i for i, r in enumerate(run) if w in r)
-    assert at('docker push "$NODE:$VERSION"') < at("helm package") < at("helm push") < at('"$CHART_DIGEST" > /dev/null') < at("docker push \"$i:$t\"")
+    assert at('docker push "$NODE:$VERSION-amd64"') < at("helm package") < at("helm push") < at('"$CHART_DIGEST" > /dev/null') < at('imagetools create -t "$NODE:$t"')
+    assert at('cosign sign --yes "$CHARTS/varek-crds@$d"') < at('"$CRDS_DIGEST" > /dev/null')
+    # the platforms checked before the image for both is signed
+    pub = run[at("platforms.py")]
+    assert pub.index("platforms.py") < pub.index("cosign sign")
+
+
+def test_red_hat_chart_certification():
+    """Red Hat's chart certification (chart-verifier, partner profile): no CRD
+    in the chart (they are varek-crds'), a values schema, a helm test, the
+    annotations; each CRD kept on an uninstall"""
+    assert not os.path.exists(os.path.join(CHART, "crds"))
+    assert not [d for d in render() if d["kind"] == "CustomResourceDefinition"]
+    meta = yaml.safe_load(open(os.path.join(CHART, "Chart.yaml")))
+    assert meta["annotations"]["charts.openshift.io/name"] == "VAREK"
+    assert set(meta["annotations"]["charts.openshift.io/archs"].split(",")) == {"x86_64", "aarch64"}
+    assert os.path.exists(os.path.join(CHART, "values.schema.json"))
+    crds = [d for d in render_crds() if d["kind"] == "CustomResourceDefinition"]
+    assert sorted(d["metadata"]["name"] for d in crds) == ["varekcredentials.varek.dev", "vareknodekeys.varek.dev",
+                                                           "varekplans.varek.dev", "varekpolicies.varek.dev"]
+    assert all(d["metadata"]["annotations"]["helm.sh/resource-policy"] == "keep" for d in crds)
+    crdm = yaml.safe_load(open(os.path.join(CRDS, "Chart.yaml")))
+    assert (crdm["version"], crdm["appVersion"]) == (meta["version"], meta["appVersion"])
+    # the helm test: the webhook's health, its certificate verified
+    t = one(render(), "Pod")
+    assert t["metadata"]["annotations"]["helm.sh/hook"] == "test"
+    # kept until the next run, so helm test --logs can read it
+    assert t["metadata"]["annotations"]["helm.sh/hook-delete-policy"] == "before-hook-creation"
+    c = t["spec"]["containers"][0]
+    # the Service's address from the kubelet, the certificate checked for its name
+    assert 'host = "t-admission.varek-system.svc"' in c["command"][2] and "GET /healthz" in c["command"][2]
+    assert "T_ADMISSION_SERVICE_HOST" in c["command"][2] and "server_hostname=host" in c["command"][2]
+    assert t["spec"]["securityContext"]["runAsNonRoot"] and c["securityContext"]["capabilities"] == {"drop": ["ALL"]}
+    assert "runAsUser" not in one(render("openshift.enabled=true"), "Pod")["spec"]["securityContext"]
+    # with the operator's Secret and its CA given as a value
+    t = one(render("admission.tls.secretName=mine", "admission.tls.caBundle=Q0E="), "Pod")
+    assert t["spec"]["containers"][0]["env"] == [{"name": "VAREK_CA_B64", "value": "Q0E="}] and "volumes" not in t["spec"]
+
+
+def test_the_crds_chart_test_schema_and_annotations():
+    """varek-crds: no crds/ directory, the annotations, a values schema, a
+    helm test that the API server serves the four kinds, in the varek
+    chart's node image; nothing but the four CRDs and the test pod. (Not a
+    certified chart: chart-verifier's not-contains-crds flags CRDs in
+    templates/ too, packaging/helm/varek-crds/README.md.)"""
+    assert not os.path.exists(os.path.join(CRDS, "crds"))
+    p = helm("lint", "--strict", CRDS, "--kube-version", KUBE)
+    assert "0 chart(s) failed" in p.stdout, p.stdout
+    meta = yaml.safe_load(open(os.path.join(CRDS, "Chart.yaml")))
+    assert meta["annotations"]["charts.openshift.io/name"] == "VAREK CRDs"
+    assert meta["annotations"]["charts.openshift.io/provider"] == "Sober Agentic Infrastructure, Inc."
+    assert set(meta["annotations"]["charts.openshift.io/archs"].split(",")) == {"x86_64", "aarch64"}
+    assert meta["kubeVersion"] and os.path.exists(os.path.join(CRDS, "README.md"))
+    assert os.path.exists(os.path.join(CRDS, "values.schema.json"))
+    docs = render_crds()
+    assert sorted(d["kind"] for d in docs) == ["CustomResourceDefinition"] * 4 + ["Pod"]
+    t = one(docs, "Pod")
+    assert t["metadata"]["name"] == "c-test-served"
+    assert t["metadata"]["annotations"] == {"helm.sh/hook": "test", "helm.sh/hook-delete-policy": "before-hook-creation"}
+    c = t["spec"]["containers"][0]
+    # the varek chart's node image, the chart's version: the image Red Hat certified
+    assert c["image"] == f"ghcr.io/kwdoug63/varek-node:{meta['appVersion']}"
+    code = c["command"][2]
+    assert '/apis/varek.dev/v1alpha1' in code and "KUBERNETES_SERVICE_HOST" in code and 'cafile=sa + "/ca.crt"' in code
+    plurals = {d["spec"]["names"]["plural"] for d in docs if d["kind"] == "CustomResourceDefinition"}
+    assert all(f'"{n}"' in code for n in plurals) and len(plurals) == 4
+    assert all(d["spec"]["versions"][0]["name"] == "v1alpha1" for d in docs if d["kind"] == "CustomResourceDefinition")
+    # as restricted-v2 allows; the user the namespace's on OpenShift
+    assert t["spec"]["securityContext"]["runAsNonRoot"] and t["spec"]["securityContext"]["runAsUser"] == 65532
+    assert c["securityContext"] == {"allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True,
+                                    "capabilities": {"drop": ["ALL"]}}
+    ocp = one(render_crds("--api-versions", "security.openshift.io/v1"), "Pod")
+    assert "runAsUser" not in ocp["spec"]["securityContext"] and "runAsGroup" not in ocp["spec"]["securityContext"]
+    # pinned by digest, and the schema refusing a value of the wrong type
+    d = "sha256:" + "a" * 64
+    assert one(render_crds("--set", "image.digest=" + d), "Pod")["spec"]["containers"][0]["image"] == \
+        "ghcr.io/kwdoug63/varek-node@" + d
+    for bad in ("image.pullPolicy=Sometimes", "image.digest=latest"):
+        p = render_crds("--set", bad, ok=False)
+        assert p.returncode != 0, bad
+
+
+def test_the_openshift_certification_values(tmp_path):
+    """packaging/helm/certification/values-openshift.yaml: CRI-O and the chart's SCCs, the chart's own image"""
+    vals = os.path.join(ROOT, "packaging", "helm", "certification", "values-openshift.yaml")
+    # the chart as the release packages it (container-release.yml): its
+    # values.yaml given the node image's digest, the multi-arch list's
+    released = tmp_path / "varek"
+    shutil.copytree(CHART, released)
+    v = released / "values.yaml"
+    text = v.read_text()
+    assert '\n  digest: ""\n' in text
+    v.write_text(text.replace('\n  digest: ""\n', '\n  digest: "sha256:' + "0" * 64 + '"\n', 1))
+    p = helm("template", "t", str(released), "-n", NS, "--kube-version", KUBE, "-f", vals)
+    docs = [d for d in yaml.safe_load_all(p.stdout) if d]
+    one(docs, "ClusterRole", "t-node-scc")
+    one(docs, "RoleBinding", "t-node-scc")
+    one(docs, "SecurityContextConstraints", "t-supervised")
+    meta = yaml.safe_load(open(os.path.join(CHART, "Chart.yaml")))
+    ds = one(docs, "DaemonSet")
+    images = {c["image"] for c in ds["spec"]["template"]["spec"]["containers"]}
+    assert images == {f"ghcr.io/kwdoug63/varek-node:{meta['appVersion']}"}, images
+    # every image by its tag: chart-verifier's images-are-certified matches a
+    # digest only against the catalog's per-arch digests, and the chart's
+    # default digest is the multi-arch list's
+    every = set(re.findall(r"^\s*image:\s*(\S+)", p.stdout, re.M))
+    assert every == images, every
+    # CRI-O's state, read-only (the runtime the values name)
+    vols = {v["name"]: v for v in ds["spec"]["template"]["spec"]["volumes"]}
+    assert vols["state"]["hostPath"]["path"] == "/run/containers"
+
+
+def test_the_values_schema():
+    """values.schema.json: a value of the wrong type refused at render"""
+    # Helm names the value by its path, dotted (3.16) or as a JSON pointer
+    # (3.22, as CI runs it: /signing/nodeKey/enabled)
+    def names(err, path):
+        return path in err or "/" + path.replace(".", "/") in err
+    p = render("signing.nodeKey.enabled=yes-please", ok=False)
+    assert p.returncode != 0 and names(p.stderr, "signing.nodeKey.enabled")
+    p = render("admission.replicas=two", ok=False)
+    assert p.returncode != 0 and names(p.stderr, "admission.replicas")

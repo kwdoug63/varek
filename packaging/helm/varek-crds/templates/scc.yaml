@@ -1,0 +1,45 @@
+{{/* SPDX-License-Identifier: MIT
+  OpenShift: the SecurityContextConstraints the varek chart's node agent runs
+  under (privileged, the node's PID namespace, host paths). It is this
+  chart's, not the varek chart's, so that it exists before the varek chart's
+  DaemonSet makes its first pod: Helm creates a kind it does not know (an SCC)
+  after the kinds it does (a DaemonSet), so an SCC of the varek chart's own
+  came too late for that pod, which OpenShift refused once ("unable to
+  validate against any security context constraint") before the DaemonSet's
+  retry was admitted. It names no user or group: no one may use it until a
+  ClusterRole grants "use" of it, and the varek chart grants that to its node
+  service account alone (RELEASE-node-scc). On OpenShift only (the API group
+  served, as the chart's test tells), so a cluster without the kind gets
+  none. */}}
+{{- if .Capabilities.APIVersions.Has "security.openshift.io/v1" }}
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: varek-node-agent
+  labels:
+    app.kubernetes.io/part-of: varek
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+allowPrivilegedContainer: true
+allowPrivilegeEscalation: true
+allowHostPID: true
+allowHostDirVolumePlugin: true
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPorts: false
+# the init container's, to make the node's directories root's
+allowedCapabilities: [CHOWN, DAC_OVERRIDE, FOWNER]
+defaultAddCapabilities: []
+requiredDropCapabilities: []
+readOnlyRootFilesystem: false
+runAsUser: { type: RunAsAny }
+seLinuxContext: { type: RunAsAny }
+fsGroup: { type: RunAsAny }
+supplementalGroups: { type: RunAsAny }
+seccompProfiles: ["*"]
+# projected: the service account's token
+volumes: [hostPath, secret, emptyDir, projected, configMap, downwardAPI]
+# granted by RBAC alone (the varek chart's RELEASE-node-scc ClusterRole)
+users: []
+groups: []
+{{- end }}

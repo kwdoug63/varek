@@ -5,7 +5,9 @@ a node's evidence as OCSF, for the cluster's collector.
 
 The node agent writes each container's verdict stream to its directory
 (--node-streams DIR: DIR/<container>.<supervisor>.jsonl), with the policy the
-container ran under beside it (DIR/<container>.<supervisor>.policy). This
+container ran under beside it (DIR/<container>.<supervisor>.policy); v1.36
+(D9): past the chart's streams.rotateBytes the stream goes on in segments
+beside it (.jsonl.2, .jsonl.3, ...), which its follower reads in turn. This
 follows every stream there, those already present and each new one, and
 exports each with tools/varek_ocsf.py --follow under its own policy copy (the
 audit runs on each record as it comes, with the node's public key and anchor
@@ -56,8 +58,18 @@ def alive(pid):
         return True
 
 
+def last_segment(path):
+    """v1.36 (D9): the stream's last segment (the node agent rotates a stream
+    at the chart's streams.rotateBytes: NAME.jsonl, NAME.jsonl.2, ...)"""
+    n = 1
+    while os.path.exists(f"{path}.{n + 1}"):
+        n += 1
+    return path if n == 1 else f"{path}.{n}"
+
+
 def ends_with_run_end(path):
-    """True when the stream's last record is its run_end"""
+    """True when the stream's last record is its run_end (in its last segment)"""
+    path = last_segment(path)
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -168,7 +180,7 @@ class Exporter:
                 self.done(path)
                 continue
             try:
-                quiet = now - os.stat(path).st_mtime
+                quiet = now - os.stat(last_segment(path)).st_mtime
             except OSError:
                 quiet = QUIET_S
             if alive(pid) or quiet < QUIET_S:

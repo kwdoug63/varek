@@ -259,7 +259,9 @@ static plan_breaker_t *round_trip(const plan_breaker_t *b,
 
 static int load_text(const char *text, const plan_label_policy_config_t *cfg)
 {
-    FILE *in = fmemopen((void *)text, strlen(text), "r");
+    /* an empty state is a real empty file: fmemopen of zero bytes fails
+     * (EINVAL) on some C libraries (RHEL 9's), which would test nothing */
+    FILE *in = text[0] ? fmemopen((void *)text, strlen(text), "r") : tmpfile();
     plan_breaker_t *b = plan_breaker_new();
     int rc = (in && b) ? plan_breaker_load(b, in, cfg) : -2;
     if (in) fclose(in);

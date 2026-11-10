@@ -1,10 +1,10 @@
-# VAREK
+# VAREK™
 
 ### Kernel-enforced, proof-checked authorization for what an AI agent's process actually does.
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.34.0-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.36.3-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -70,7 +70,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.34.0.**
+   **Current release: v1.36.3.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -137,7 +137,12 @@ The runtime line has progressed well beyond simple syscall containment:
   "Never requires a human" becomes certified rather than hoped. Since v1.18.0 the
   Warden runs it on the `--flow-policy` at startup and refuses to start if it
   fails.
-- **v1.34.0 — Kubernetes: a node agent and a Helm chart.** Through v1.32 the Warden ran inside the agent's container, with capabilities and a cgroup namespace a cluster's admission policy refuses. From v1.34.0 one Warden on each node (a DaemonSet) supervises each annotated pod's containers from outside them, so the agent's pod passes Pod Security's "restricted" level: the runtime hands the node agent each container's seccomp notifications (`listenerPath`), and its calls are decided as on a host, with one signed, anchored stream per container. An NRI plugin (containerd 2.2+, CRI-O 1.35+) sets the Warden's own filter and puts a small launcher first to apply the launch set; a container it cannot carry, or does not adjust, does not run. The pod's network, stub resolver and egress proxy work in the pod; `VarekPolicy` resources, an admission webhook, an OCSF exporter and a signed Helm chart, with OpenShift's constraints. Credentials, sub-agents, confined MCP servers, plans and the dry run are not carried in pods yet (planned for a later release). 24 hours each on Amazon EKS and on single-node OpenShift with SELinux enforcing, every probe held and every stream audited. Reviewed by AI review agents. See [`RELEASE-v1.34.0.md`](./RELEASE-v1.34.0.md).
+- **v1.36.3 — the container a connection names, confirmed (a security patch release of v1.36.2).** The node agent took the container id, bundle and annotations a runtime's connection named as sent; since v1.36.0, a pod allowed a hostPath of the node agent's socket's directory, running as root, could have a process of its own supervised as another pod's container. From v1.36.3 the node agent confirms the container by its process's cgroup, its bundle by the runtime's directory, and its annotations by the bundle's `config.json`, and the admission webhook refuses a pod that mounts the socket's directory. The Warden decides nothing differently. See [`RELEASE-v1.36.3.md`](./RELEASE-v1.36.3.md).
+- **v1.36.2 — the node key published again, and a test for `varek-crds` (a patch release of v1.36.1).** The NRI plugin now publishes a node's new key whenever the node agent makes one; through 1.36.1 it published once, so a key made after the plugin started (a node rebuilt with its key lost) went unpublished and that node's streams could not be checked against the cluster's list. The `varek-crds` chart has a `helm test`, a values schema and OpenShift's annotations; as a chart of CRDs it cannot be a Red Hat certified chart (chart-verifier's `not-contains-crds` flags CRDs in `templates/` too), while the `varek` chart is certified. `varek doctor` on a host with no settings warns instead of failing. A guide installs VAREK on RHEL 9, run end to end on RHEL 9.8 with SELinux enforcing. The Warden decides nothing differently. See [`RELEASE-v1.36.2.md`](./RELEASE-v1.36.2.md).
+- **v1.36.1 — packaged for Red Hat's certification (a patch release of v1.36.0).** The images carry the labels and licenses Red Hat's container certification asks for, and CI runs its checks (preflight) on both on every change; each base image is pinned by digest. The custom resources are now a chart of their own, `varek-crds`, installed before the `varek` chart and upgraded by `helm upgrade`; the chart has a values schema, a `helm test` and OpenShift's annotations, and passes chart-verifier's partner profile where it runs without OpenShift. The Warden decides nothing differently. Upgrading from 1.36.0 takes one step for the CRDs. See [`RELEASE-v1.36.1.md`](./RELEASE-v1.36.1.md).
+- **v1.36.0 — Kubernetes at parity, and the supported platforms.** Through v1.35 the node agent refused a pod whose policy needed credentials, sub-agents, confined MCP servers, the on-behalf-of chain or the dry run. From v1.36.0 each runs in a pod as on a host: credentials fetched on the node and given by a cluster-scoped `VarekCredential`, the pod holding a placeholder; sub-agents in groups below the container's own; the user's token from a Secret and the agent's SVID from the node's SPIRE agent; flow policies and trust bundles as `VarekPolicy` fields. The node image runs on amd64 and arm64; the audit reads a stream once in bounded memory, and streams rotate in signed segments; each node signs with its own key. Every supported platform runs in CI (CRI-O 1.35 to 1.37 under runc and crun, containerd 2.2 and 2.3, amd64 and arm64, SELinux enforcing, RHEL 9 (tested on Rocky Linux 9) and Amazon Linux 2023 hosts). 24 hours each on Amazon EKS (amd64 and Graviton) and single-node OpenShift 4.22: every turn done, each long agent's sub-agents launched 2,620 times and released as they ended, every probe held, every stream audited. Reviewed by AI review agents. See [`RELEASE-v1.36.0.md`](./RELEASE-v1.36.0.md).
+- **v1.35.0 — Agent frameworks: plans from the framework.** Through v1.34 a plan was a file nothing outside the tests wrote, checked once and never held to. From v1.35.0 `varek plan generate` writes an agent's plan from its framework (Amazon Bedrock AgentCore, IBM watsonx Orchestrate, LangGraph, the OpenAI Agents SDK, the Claude Agent SDK and Claude Code), the adapter itself confined by the Warden, and `varek run --plan PLAN --hold-to-plan` holds the run to it: a call the policy allows and the plan does not name is refused as the agent makes it. Plans name MCP calls, sub-agents and credentials; `require plan` refuses a run not held to one; pods name theirs under the node agent. The plan's records name it by its SHA-256 in the audit, OCSF and CycloneDX. 24 hours on a host (a DigitalOcean droplet, Ubuntu) with an OpenAI Agents SDK agent held to its generated plan under `require plan`: 1,439 turns, every one done; each of the 429 probes refused outside the plan, and nothing else refused but what every run refuses; the stream audited and its 31,711 OCSF events valid; memory flat. Reviewed by AI review agents. See [`RELEASE-v1.35.0.md`](./RELEASE-v1.35.0.md).
+- **v1.34.0 — Kubernetes: a node agent and a Helm chart.** Through v1.32 the Warden ran inside the agent's container, with capabilities and a cgroup namespace a cluster's admission policy refuses. From v1.34.0 one Warden on each node (a DaemonSet) supervises each annotated pod's containers from outside them, so the agent's pod passes Pod Security's "restricted" level: the runtime hands the node agent each container's seccomp notifications (`listenerPath`), and its calls are decided as on a host, with one signed, anchored stream per container. An NRI plugin (containerd 2.2+, CRI-O 1.35+) sets the Warden's own filter and puts a small launcher first to apply the launch set; a container it cannot carry, or does not adjust, does not run. The pod's network, stub resolver and egress proxy work in the pod; `VarekPolicy` resources, an admission webhook, an OCSF exporter and a signed Helm chart, with OpenShift's constraints. Credentials, sub-agents, confined MCP servers, plans and the dry run are not carried in pods yet (planned for v1.36.0). 24 hours each on Amazon EKS and on single-node OpenShift with SELinux enforcing, every probe held and every stream audited. Reviewed by AI review agents. See [`RELEASE-v1.34.0.md`](./RELEASE-v1.34.0.md).
 - **v1.32.1 — rootless Podman without `--systemd=always` (a patch release of v1.32.0).** Podman mounts a rootless container's cgroup filesystem read-only; through v1.32.0 the Warden then refused sub-agents and confined MCP servers there unless the container ran with `--systemd=always`. Measured on rootless Podman, the bind remount it makes elsewhere works in a user namespace too, so from v1.32.1 it makes it there, and refuses, naming that flag or the missing cgroup delegation, only where the kernel or the delegation does not allow it. Every suite passes rootless without `--systemd=always`. See [`RELEASE-v1.32.1.md`](./RELEASE-v1.32.1.md).
 - **v1.32.0 — containers: an official image, Docker and Podman.** Through v1.31.1 the Warden ran as root on a host, and under Docker's or Podman's defaults it refused to start. `ghcr.io/kwdoug63/varek` carries the Warden, its helpers and `varek` on UBI 9 minimal, its entrypoint `varek run --`, so the agent is the Warden's child in namespaces it makes inside the container. The documented settings, never `--privileged`: `--cap-drop ALL` and ten capabilities, each shown needed, `--cgroupns=private`, the runtime's default seccomp profile, VAREK's AppArmor profile or SELinux module (`container_init_t`), and rootless Podman with `--systemd=always`. Sub-agents and confined MCP servers run in a container: the Warden bind-remounts the container's own cgroup view read-write in its own mount namespace, and, with no process events there, tells a sub-agent of its launcher's image by its memory layout. `varek doctor` checks each setting and names the flag for a missing one; `varek run` refuses a container that cannot carry the run. Each tag's image is signed with cosign and carries a CycloneDX SBOM as a signed attestation. Every suite passes inside the container on Docker with AppArmor and on rootful and rootless Podman with SELinux; a 24-hour soak in a container. Reviewed by AI review agents. See [`RELEASE-v1.32.0.md`](./RELEASE-v1.32.0.md).
 - **v1.31.1 — calls glibc and bash make (a patch release of v1.31.0).** The Warden refused `epoll_wait(2)` and `epoll_create(2)` on x86_64, so asyncio's default event loop failed under every policy; `pipe(2)`, so a shell's command substitution failed on RHEL 9; and, under a policy before 1.29, `getpgrp(2)`, so bash did not start. All four are admitted. See [`RELEASE-v1.31.1.md`](./RELEASE-v1.31.1.md).
@@ -185,7 +190,7 @@ The runtime line has progressed well beyond simple syscall containment:
   (connects: shipped in v1.21.0; launches, opt-in, in v1.27.0). See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.17.0 history.
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.36.3 history.
 
 ### Network
 
@@ -287,12 +292,39 @@ pip install -e ".[dev]"
 
 The C Warden (`varek/v1_4`) additionally requires `CAP_SYS_ADMIN` (run it as
 root or via `sudo`); it checks at startup and refuses to run without it. See
-[`varek/v1_4/README.md`](./varek/v1_4/README.md).
+[`varek/v1_4/README.md`](./varek/v1_4/README.md). On Red Hat Enterprise Linux 9,
+the steps from a release's tag to a first run, EPEL included (run end to
+end on RHEL 9.8): [`docs/install/rhel9.md`](./docs/install/rhel9.md).
 
 The runtime **fails closed** if these are unmet. The package installs and imports
 cleanly everywhere, but `SeccompBpfBackend.is_available()` returns an explanatory
 string on non-Linux hosts or environments without kernel support. No silent
 degradation.
+
+### Supported platforms
+
+Each platform below is checked in CI; the job named is the one to read.
+"Each PR" means each pull request that touches the code the workflow
+watches. A release runs both matrices on its tag's commit and publishes
+nothing unless every cell passes (v1.36,
+[D11](./docs/security/v1.36-kubernetes-parity.md)).
+
+| Platform | What runs | CI job | When |
+|---|---|---|---|
+| Ubuntu 24.04, x86_64 and arm64 (host) | the Warden's build and its suites | [`warden-build.yml`](https://github.com/kwdoug63/varek/actions/workflows/warden-build.yml): *Build the Warden with libseccomp + libsodium* | each PR |
+| RHEL 9 (host), tested on Rocky Linux 9 | every host suite, in a VM | [`matrix-vm.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix-vm.yml): *Rocky Linux 9 host: every suite* | each PR and release |
+| Amazon Linux 2023 (host, Linux 6.1) | every host suite, in a VM | [`matrix-vm.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix-vm.yml): *Amazon Linux 2023 host: every suite* | each PR and release |
+| Kubernetes, CRI-O 1.35, 1.36 and 1.37, under runc and crun, amd64 and arm64 | the Helm chart, on a kubeadm node | [`matrix.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix.yml): *CRI-O 1.35, runc*, *CRI-O 1.35, runc, arm64* (and the other five, each on both) | each PR and release |
+| Kubernetes, containerd 2.2 and 2.3, amd64 and arm64 | the Helm chart, on a kubeadm node | [`matrix.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix.yml): *containerd 2.2, runc*, *containerd 2.3, runc*, each also *…, arm64* | each PR and release |
+| Kubernetes, SELinux enforcing (CRI-O 1.35 on Rocky Linux 9) | the Helm chart, SELinux's denials counted | [`matrix-vm.yml`](https://github.com/kwdoug63/varek/actions/workflows/matrix-vm.yml): *SELinux enforcing: CRI-O 1.35 on Rocky Linux 9* | each PR and release |
+| Kubernetes on kind, amd64 and arm64 | the Helm chart; the suites under the node agent | [`kubernetes.yml`](https://github.com/kwdoug63/varek/actions/workflows/kubernetes.yml): *The chart on kind*, *The suites under the node agent*, each also *…, arm64* | each PR |
+| Containers (the UBI 9 image) | the suites in the image | [`container.yml`](https://github.com/kwdoug63/varek/actions/workflows/container.yml): *Build the image and run the suites in it* | each PR |
+| macOS, Windows | refused (the runtime fails closed) | [`platform-fail-closed.yml`](https://github.com/kwdoug63/varek/actions/workflows/platform-fail-closed.yml) | each PR |
+
+On CRI-O, install the chart with `--set runtime=cri-o`. The node image is
+published for amd64 and arm64 as one image (v1.36), each architecture
+built and checked on its own runner, and the chart's DaemonSet runs on
+every Linux node of either.
 
 ### Verify your installation
 
@@ -309,6 +341,13 @@ refuses to initialize rather than run without containment. To convert the three
 SKIPs to PASSes, run on a Linux host meeting the production requirements.
 
 ### Quick start
+
+> **Legacy (v1.1).** `varek_guardrails` and the integration demos below run
+> in the agent's own process and use none of the Warden. They are kept so
+> existing copies keep working (v1.35, D10). For an agent built on a
+> framework, `varek plan generate` writes its plan from the framework
+> ([`varek/v1_4/adapters/README.md`](./varek/v1_4/adapters/README.md)) and
+> `varek run --plan PLAN --hold-to-plan` runs it under the Warden held to it.
 
 ```python
 import sys
@@ -356,8 +395,9 @@ except IsolationError as e:
 
 ### Integration demos
 
-Numbered demos apply Warden to popular agent frameworks. Each follows the same
-`Target / Vector / Defense` pattern and runs end-to-end.
+Numbered demos (legacy, v1.1: in-process, without the Warden; see the note
+above) apply the v1.1 containment layer to popular agent frameworks. Each
+follows the same `Target / Vector / Defense` pattern and runs end-to-end.
 
 | File | Surface |
 |------|---------|
@@ -523,7 +563,7 @@ different risks at different points in the stack.
 - [x] **v1.21.1** — Plan steps declare how they open a file (`open=read`, `open=O_WRONLY|O_CREAT|…`), so the gate authorizes declared reads of read-only paths
 - [x] **v1.22.0** — The `varek` command (run, refusals, audit, signed export, policy packs) and `varek bench` (per-call cost of mediation on the host, every verdict checked)
 - [x] **v1.23.0** — VAREK Enterprise on AWS Marketplace (AMI with Enterprise policy packs and a License Manager check)
-- [x] **v1.23.1** — The Enterprise license check works with Marketplace contract entitlements; deployment guide for AWS (the version the AWS Marketplace AMI offers; later releases are on GitHub and in the container image)
+- [x] **v1.23.1** — The Enterprise license check works with Marketplace contract entitlements; deployment guide for AWS
 - [x] **v1.24.0** (v1.21 stage 2) — Host names without agent DNS: the Warden resolves allowed names and serves a hosts view ([design](./docs/security/v1.21-stage2-host-names.md))
 - [x] **v1.25.0** — Wildcard host names, opt-in (`allow host *.example.com:443 acknowledge=dns-channel`): shared domains where anyone can register names refused at load, lookups answered by the Warden and bounded per rule ([design](./docs/security/v1.25-wildcard-host-names.md))
 - [x] **v1.26.0** (v1.21 stage 3) — The egress proxy, SNI mode (`proxy on`): decisions on the name the agent asks for (TLS SNI, HTTP Host), closing the shared-CDN gap on proxied ports with no agent DNS; chaining to a customer proxy (`proxy upstream`) ([design](./docs/security/v1.26-egress-proxy.md))
@@ -536,14 +576,19 @@ different risks at different points in the stack.
 - [x] **v1.29.0** — `varek run -- <agent>` with nothing set up first (a baseline policy and agent profiles), files opened and changed as the agent's own user, a dry run that records what a policy would refuse without enforcing it, and `varek policy suggest` ([design](./docs/security/v1.29-varek-run.md))
 - [x] **v1.31.0** — Standards: authorization events in OCSF beside CycloneDX; MCP servers confined to their own rules, MCP calls decided by method and tool, MCP tokens bound to their server; a mapping to Agent Baseline ([design](./docs/security/v1.31-standards.md))
 - [x] **v1.31.1** — A patch release of v1.31.0: `epoll_wait`, `epoll_create`, `pipe` and `getpgrp` admitted under every policy, so asyncio, a shell's command substitution and bash work under the Warden ([release notes](./RELEASE-v1.31.1.md)).
-- [x] **v1.32.1** — A patch release of v1.32.0: rootless Podman without `--systemd=always`
 - [x] **v1.32.0** — Containers: an official image (`ghcr.io/kwdoug63/varek`, signed, with an SBOM), Docker and Podman, rootless included, under a published minimal set of settings, never `--privileged` ([design](./docs/security/v1.32-containers.md))
+- [x] **v1.32.1** — A patch release of v1.32.0: rootless Podman without `--systemd=always`
 - [ ] **macOS** (in progress; planned as v1.30.0, then v1.33.0; v1.34.0 shipped first, so it takes the next number when it is released) — macOS: the agent and the Warden in a lightweight Linux VM, with the same guarantees as on Linux ([plan](./docs/roadmap/v1.28-v1.31.md))
 - [x] **v1.34.0** — Kubernetes: a node agent, a Helm chart, OpenShift and Amazon EKS ([design](./docs/security/v1.34-kubernetes.md))
-- [ ] **v1.35.0** (planned) — Agent frameworks: plans generated from the framework, Amazon Bedrock AgentCore first ([plan](./docs/roadmap/v1.32-v1.35.md))
-- [ ] **v1.36.0** (planned) — Security operations: Splunk, Microsoft Sentinel, OpenTelemetry ([plan](./docs/roadmap/v1.32-v1.35.md))
+- [x] **v1.35.0** — Agent frameworks: plans generated from the framework, Amazon Bedrock AgentCore first; plans held under the node agent too ([design](./docs/security/v1.35-frameworks.md))
+- [x] **v1.36.0** — Kubernetes at parity with a host (credentials, sub-agents, confined MCP servers, plans and the dry run in pods; arm64; an audit in bounded memory; a key for each node), and the supported platforms tested in CI ([plan](./docs/roadmap/v1.36-v1.37.md))
+- [x] **v1.36.1** — A patch release of v1.36.0: the images and the chart packaged for Red Hat's certification, the CRDs a chart of their own ([release notes](./RELEASE-v1.36.1.md))
+- [x] **v1.36.2** — A patch release of v1.36.1: the node key published again when it changes, a test for `varek-crds`, `varek doctor`'s warning, the RHEL 9 install guide ([release notes](./RELEASE-v1.36.2.md))
+- [x] **v1.36.3** — A security patch release of v1.36.2: the node agent confirms the container a runtime connection names (its cgroup, its bundle under the runtime's directory, its annotations) before supervising it, and the admission webhook refuses a pod that mounts the node agent's socket directory ([advisory GHSA-pcxh-jj4w-2jcc](https://github.com/kwdoug63/varek/security/advisories/GHSA-pcxh-jj4w-2jcc), [release notes](./RELEASE-v1.36.3.md))
+- [x] **v1.36.3** — A security patch release of v1.36.2: the container a node agent connection names, confirmed by its cgroup, its bundle and its `config.json`; the webhook refuses a pod mounting the node agent's socket ([release notes](./RELEASE-v1.36.3.md))
+- [ ] **v1.37.0** (planned; was v1.36.0) — Security operations: Splunk, Microsoft Sentinel, OpenTelemetry ([plan](./docs/roadmap/v1.32-v1.35.md))
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
-- [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow
+- [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow; revisited after v1.35, once generated plans show how many steps it would clear ([plan](./docs/roadmap/v1.36-v1.37.md))
 
 ### Language
 
@@ -657,7 +702,7 @@ verify_guardrails.py` (see above).
 
 **Reporting vulnerabilities.** Do not open public issues. Use
 [GitHub private vulnerability reporting](https://github.com/kwdoug63/varek/security/advisories/new)
-or [SECURITY.md](./SECURITY.md). Reports receive acknowledgment within 72 hours.
+or [SECURITY.md](./SECURITY.md). Reports are acknowledged within 48 hours.
 
 **Threat model and trusted computing base.** Adversary models, in-scope
 guarantees, and out-of-scope conditions are documented in
@@ -706,6 +751,11 @@ VAREK is open-source software licensed under the [MIT License](LICENSE).
 Copyright (c) 2026 Sober Agentic Infrastructure, Inc. See [NOTICE](./NOTICE).
 
 ### Trademarks
+
+VAREK, the VAREK logo, and Don't Trust. Verify. are trademarks of Sober Agentic
+Infrastructure, Inc. The MIT License covers the code and grants no right to use
+these marks, except as needed to describe the origin of the software. Patent
+pending.
 
 CycloneDX is a trademark of the OWASP Foundation. VAREK and Sober Agentic
 Infrastructure, Inc. are not affiliated with, endorsed by, or certified by the

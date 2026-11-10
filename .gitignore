@@ -1,5 +1,7 @@
 # === Anthropic / Claude Code ===
 .claude/
+# v1.35: the Claude adapter's samples are projects whose .claude/ settings are the fixture
+!varek/v1_4/adapters/samples/*/.claude/
 
 # === Python ===
 __pycache__/

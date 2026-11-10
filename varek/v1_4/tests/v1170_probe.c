@@ -110,7 +110,11 @@ static int mode_meta(void) {
     e = errno; res("cwd_empty_path", r == 0, e);
     r = (int)syscall(SYS_faccessat2, AT_FDCWD, "", W_OK, AT_EMPTY_PATH);
     e = errno; res("cwd_access_w", r == 0, e);
+#ifdef SYS_readlink
     long k = syscall(SYS_readlink, D "/lnk", b, 0x100000005UL);  /* int bufsiz = 5 */
+#else                                                            /* v1.30: arm64 has readlinkat only */
+    long k = syscall(SYS_readlinkat, AT_FDCWD, D "/lnk", b, 0x100000005UL);
+#endif
     printf("PROBE %-22s %ld\n", "readlink_int_size", k);
     r = fstatat(AT_FDCWD, D "/ok.txt", &ast, 0x8000000);
     e = errno; res("stat_bad_flags", r == 0, e);

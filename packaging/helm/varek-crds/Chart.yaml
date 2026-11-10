@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+apiVersion: v2
+name: varek-crds
+description: >-
+  The custom resources of VAREK on Kubernetes (VarekPolicy, VarekPlan,
+  VarekCredential, VarekNodeKey), installed before the varek chart. A chart
+  of their own, so that the varek chart holds no CRD (Red Hat's chart
+  certification refuses one that does) and so that helm upgrade changes
+  them; each is kept on an uninstall.
+type: application
+version: 1.36.3
+appVersion: "1.36.3"
+kubeVersion: ">=1.30.0-0"
+home: https://github.com/kwdoug63/varek
+sources:
+  - https://github.com/kwdoug63/varek
+keywords: [security, seccomp, agents, policy, crds]
+annotations:
+  # Red Hat's chart certification (chart-verifier, partner profile): the
+  # chart's name in OpenShift's console, its provider, and the architectures
+  # of the image its helm test runs (the varek chart's node image)
+  charts.openshift.io/name: VAREK CRDs
+  charts.openshift.io/provider: Sober Agentic Infrastructure, Inc.
+  charts.openshift.io/supportURL: https://github.com/kwdoug63/varek/blob/main/SECURITY.md
+  charts.openshift.io/archs: x86_64,aarch64

@@ -55,7 +55,7 @@
  * Build:    make
  * Run:      sudo ./warden policy.txt -- ./target_program [args...]
  *
- * Requires: Linux kernel >= 5.14, x86_64 (BPF arch check).
+ * Requires: Linux kernel >= 5.14, x86_64 or aarch64 (BPF arch check).
  */
 
 #ifndef _GNU_SOURCE
@@ -184,7 +184,49 @@ struct open_how_local {
     uint64_t resolve;
 };
 
+#if defined(__x86_64__)
 #define ARCH_NR     AUDIT_ARCH_X86_64
+#define WARDEN_ARCH "x86_64"            /* run_start's arch (v1.30) */
+#define WARDEN_O_LARGEFILE 0100000      /* the kernel's bit (glibc's O_LARGEFILE is 0) */
+#elif defined(__aarch64__)
+#define ARCH_NR     AUDIT_ARCH_AARCH64
+#define WARDEN_ARCH "aarch64"
+#define WARDEN_O_LARGEFILE 0400000
+#else
+#error "VAREK Warden supports x86_64 and aarch64"
+#endif
+/* v1.30: arm64 has only the *at forms of these calls. A number no call
+ * carries stands in for each, so the comparisons below never match there. */
+#ifndef __NR_open
+#define __NR_open     (-101)
+#endif
+#ifndef __NR_stat
+#define __NR_stat     (-102)
+#endif
+#ifndef __NR_lstat
+#define __NR_lstat    (-103)
+#endif
+#ifndef __NR_access
+#define __NR_access   (-104)
+#endif
+#ifndef __NR_readlink
+#define __NR_readlink (-105)
+#endif
+#ifndef __NR_unlink
+#define __NR_unlink   (-106)
+#endif
+#ifndef __NR_rmdir
+#define __NR_rmdir    (-107)
+#endif
+#ifndef __NR_mkdir
+#define __NR_mkdir    (-108)
+#endif
+#ifndef __NR_rename
+#define __NR_rename   (-109)
+#endif
+#ifndef __NR_chmod
+#define __NR_chmod    (-110)
+#endif
 #define PATH_LIMIT  4096
 #define MAX_RULES    512
 #define MAX_CTX       64
@@ -278,6 +320,8 @@ struct action {
     bool          proxy_handoff;        /* v1.26: a connect handed to the egress proxy */
     int           subject;              /* v1.28.1: who the call is for (warden_subagent.inc.c): 0 the
                                            agent, a sub-agent, or -1 (in no group of the run) */
+    int           plan_psubj;           /* v1.35 (D6): a plan step's policy subject, plus 1 (0: none,
+                                           the subject is the call's attribution, as at run time) */
     /* v1.29: a change by name (warden_change.inc.c) */
     int           chg_op;               /* CHG_* */
     char          target2[PATH_LIMIT];  /* a rename's new name */
@@ -289,6 +333,7 @@ struct action {
     struct timespec chg_times[2];
     bool          chg_times_null;
     bool          dry;                  /* v1.29: a refusal a dry run let through (not enforced) */
+    bool          dry_kept;             /* v1.36 step 7 (D6a): a pod's connect a dry run refuses all the same */
     char          extra[4608];          /* extra record fields, trusted text, each ending in ',' */
 };
 
@@ -787,12 +832,54 @@ struct node_run {
     int    set_view;            /* the launch set the launcher reads, a sealed memfd */
     char  *set_text;            /* its text, one path a line */
     char   policy_sha[65];      /* v1.34 step 5: the plugin's SHA-256 of the policy it wrote the filter for, or "" */
+    char   plan[64];            /* v1.35 step 4c (D11): the pod's plan, by name (varek.dev/plan), or "" */
+    char   plan_sha[65];        /* the plugin's SHA-256 of the plan it checked the policy with, or "" */
     char   dns[80];             /* v1.34 step 4: the pod's DNS server, "a.b.c.d:53" (its resolv.conf), or "" */
     struct sock_filter *bpf;    /* the Warden's own filter for the policy, compiled */
     unsigned nbpf;
     long   not_admitted;        /* calls it refuses, which the pod's filter notifies */
+    /* v1.36 step 4 (D1): the node agent's own network namespace, where
+     * warden-secrets is started (the stores are reached from the node, under
+     * the DaemonSet's identity); and the placeholders the NRI plugin put in
+     * the container's environment, VAREK_CRED_<NAME>=..., as the bundle's
+     * config.json gives them */
+    int    node_netns;
+    char   cred_env[64][160];
+    int    ncred_env;
+    bool   cred_env_over;       /* more VAREK_CRED_ entries than are kept, or one too long */
+    /* v1.36 step 6 (D5): the Secret the user's token is in (varek.dev/on-behalf-of,
+     * which the NRI plugin copies from the pod), or "" */
+    char   obo[254];
+    /* v1.36 step 7 (D6, D7, D7b): the plugin's, from the pod's VarekPolicy:
+     * a dry run (varek.dev/dry-run), the trust bundle's key in the node's
+     * ConfigMap (varek.dev/trust-bundle), the SHA-256 of the flow policy it
+     * checked (varek.dev/flow-sha256), and the pod's service account
+     * (varek.dev/service-account, from the API server), the breaker's session */
+    bool   dry;
+    char   trust[254];
+    char   flow_sha[65];
+    char   sa[254];
+    /* v1.36 step 12: the container's first call, which tied it to the
+     * listener its runtime sent when the runtime was reaped before it could
+     * be read (node_tie), held while the supervisor is set up and decided
+     * first */
+    bool   held;
+    struct seccomp_notif held_req;
 };
-static struct node_run g_nr = { .notify_fd = -1, .pidfd = -1, .set_view = -1 };
+static struct node_run g_nr = { .notify_fd = -1, .pidfd = -1, .set_view = -1, .node_netns = -1 };
+
+/* v1.36 step 7 (docs/security/v1.36-kubernetes-parity.md, D6a): a dry run
+ * lets a connect the policy refuses through (dry_let) on a host, where the
+ * agent's network namespace is empty and the Warden dials it. In a pod the
+ * connect would reach the cluster's network (other pods, the API server, the
+ * instance metadata service), so a dry run refuses it there all the same,
+ * the record saying it was a dry run's refusal (dry_run_refused), which
+ * `varek policy suggest` reads as the policy's refusal it is. A name the
+ * proxy would relay is the same. */
+static bool dry_net_let(struct action *a, const char *rule) {
+    if (g_nr.on && g_dry && dry_policy_rule(rule)) { a->dry_kept = true; return false; }
+    return dry_let(a, rule);
+}
 static void node_run_start(FILE *f);
 static void node_fail(const char *why) __attribute__((noreturn));
 static bool node_launcher_open(int notify_fd, const struct seccomp_notif *req);
@@ -874,6 +961,10 @@ static int derive_intent(const struct seccomp_notif *req,
     memset(out, 0, sizeof(*out));
     out->policy_line = -1;
     int nr = (int)req->data.nr;
+    /* v1.33: a negative number is no system call (the legacy calls arm64
+     * lacks are given such numbers here, and the filter notifies none):
+     * never derived as one */
+    if (nr < 0) { out->kind = ACT_OTHER; snprintf(out->target, sizeof out->target, "syscall:%d", nr); return 0; }
     /* v1.29: the changes by name (warden_change.inc.c) */
     int cr = g_changes_on ? change_derive(req, out) : 0;
     if (cr) return cr < 0 ? -1 : 0;
@@ -1180,6 +1271,11 @@ static int derive_intent(const struct seccomp_notif *req,
 
 static bool g_revoked;               /* v1.28 step 4: warden_revoke.inc.c */
 static int sub_policy_subject(int s);  /* v1.31: warden_subagent.inc.c */
+/* v1.35 (D6): the policy subject an action is decided as: a plan step's own
+ * (as=NAME), else the calling process's attribution */
+static int act_policy_subject(const struct action *a) {
+    return a->plan_psubj > 0 ? a->plan_psubj - 1 : sub_policy_subject(a->subject);
+}
 static decision_t policy_decide(const struct policy *p, struct action *a)
 {
     /* v1.13: every decision is made by the SMT decision procedure
@@ -1230,7 +1326,7 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
     int ri;
     vdp_why_t why;
     /* v1.31: by the calling subject's rules (the Warden's attribution) */
-    vdp_verdict_t v = vdp_decide_subj(&p->v, sub_policy_subject(a->subject), kind, s, (uint32_t)a->open_flags,
+    vdp_verdict_t v = vdp_decide_subj(&p->v, act_policy_subject(a), kind, s, vdp_oflags_from_native((uint32_t)a->open_flags),
                                       kind == VDP_KIND_PATH && a->flags_known,
                                       &ri, &why);
     a->why = vdp_why_name(why);
@@ -1322,9 +1418,9 @@ static bool certify(const struct policy *p, struct action *a) {
     if ((size_t)n < sizeof a->cert) n += snprintf(a->cert + n, sizeof a->cert - (size_t)n, "\"");
     /* v1.31: the subject the certificate is checked as, from the Warden's own
      * attribution (not the procedure's), recorded when it is not the agent */
-    int subj = sub_policy_subject(a->subject);
+    int subj = act_policy_subject(a);
     if (subj && (size_t)n < sizeof a->cert) snprintf(a->cert + n, sizeof a->cert - (size_t)n, ",\"cert_subject\":%d", subj);
-    if (!vdpc_check_subj(&p->c, subj, kind, s, strlen(s), (uint32_t)a->open_flags, has_flags, &cc,
+    if (!vdpc_check_subj(&p->c, subj, kind, s, strlen(s), vdp_oflags_from_native((uint32_t)a->open_flags), has_flags, &cc,
                          a->check_why, sizeof a->check_why)) {
         for (char *q = a->check_why; *q; q++)          /* recorded inside a JSON string */
             if (*q == '"' || *q == '\\' || (unsigned char)*q < 0x20) *q = '\'';
@@ -1372,7 +1468,7 @@ static action_kind_t kind_from_string(const char *s) {
  * is forked, so there is no process to resolve against and the named file may
  * not exist yet. Plan verification is therefore an approximation: it collapses
  * `.`, `..` and duplicate slashes lexically and decides policy on that, which
- * is the pre-execution analog of the runtime canonical path. It does not follow
+ * is the plan-level analog of the runtime canonical path. It does not follow
  * symlinks (there is nothing to follow yet), so a plan that lexically clears the
  * policy is still enforced per-syscall at runtime; the gate is an advisory
  * pre-check, not a substitute for enforcement.
@@ -1431,7 +1527,81 @@ struct warden_plan_ud {
      * field (NULL: no fields). */
     const plan_parsed_t *parsed;
     const plan_spec_t   *spec;
+    /* v1.35 step 2 (D9): the plan file, for the plan_step records (NULL:
+     * none written). */
+    const char          *plan_path;
 };
+
+/* v1.35 step 7: the plan file's SHA-256, read where the plan is read (in the
+ * node's view under the node agent), for its plan_gate record: the evidence
+ * names the plan by its bytes, not its path alone ("" when unread) */
+static char g_gate_plan_sha[65];
+
+/* v1.35 step 9 (review): the plan is read once, into memory, and that copy
+ * is both hashed and parsed, for the hold and the gate alike (through step 8
+ * the file was read three times: a plan rewritten between them was decided
+ * on one content and named by another's SHA-256) */
+#define PLAN_SNAPSHOT_MAX (64u << 20)
+static char  *g_plan_snap;
+static size_t g_plan_snap_len;
+static char   g_plan_snap_path[PATH_MAX];
+static char   g_plan_snap_sha[65];
+
+static int plan_snapshot(const char *path) {
+    if (g_plan_snap && !strcmp(path, g_plan_snap_path)) return 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    size_t cap = 65536, n = 0;
+    char *b = malloc(cap);
+    for (;;) {
+        if (!b) { close(fd); errno = ENOMEM; return -1; }
+        if (n == cap) {
+            if (cap >= PLAN_SNAPSHOT_MAX) { free(b); close(fd); errno = EFBIG; return -1; }
+            char *nb = realloc(b, cap * 2);
+            if (!nb) { free(b); close(fd); errno = ENOMEM; return -1; }
+            b = nb, cap *= 2;
+        }
+        ssize_t r = read(fd, b + n, cap - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) { int e = errno; free(b); close(fd); errno = e; return -1; }
+        if (r == 0) break;
+        n += (size_t)r;
+    }
+    close(fd);
+    unsigned char h[32];
+    crypto_hash_sha256(h, (const unsigned char *)b, n);
+    sodium_bin2hex(g_plan_snap_sha, sizeof g_plan_snap_sha, h, sizeof h);
+    free(g_plan_snap);
+    g_plan_snap = b, g_plan_snap_len = n;
+    snprintf(g_plan_snap_path, sizeof g_plan_snap_path, "%s", path);
+    return 0;
+}
+
+/* the plan parsed from its snapshot, its SHA-256 the gate's (v1.35 step 7:
+ * the evidence names the plan by its bytes, not its path alone) */
+static plan_parsed_t *plan_load_snapshot(const char *path, char *err, size_t errlen) {
+    g_gate_plan_sha[0] = 0;
+    if (!path || plan_snapshot(path) < 0) {
+        snprintf(err, errlen, "%s: cannot open", path ? path : "?");
+        return NULL;
+    }
+    /* an empty file is read as one empty line (fmemopen takes no empty buffer) */
+    FILE *fp = g_plan_snap_len ? fmemopen(g_plan_snap, g_plan_snap_len, "r") : fmemopen((void *)"\n", 1, "r");
+    plan_parsed_t *pp = plan_parser_load_stream(fp, path, err, errlen);
+    if (pp) memcpy(g_gate_plan_sha, g_plan_snap_sha, sizeof g_gate_plan_sha);
+    return pp;
+}
+
+/* v1.35 step 2 (D9): why a step was not SATISFIED, for its plan_step record.
+ * Filled by plan_step_decide; the deciding rule's line when a rule decided. */
+struct plan_step_note {
+    char why[320];
+    int  policy_line;
+    char resolved[PATH_MAX];
+    char mcp_host[PATH_MAX];    /* v1.35 step 4: an mcp_call step's server, host:port */
+};
+
+#include "warden_hold.inc.c"         /* v1.35 step 4: a run held to its plan */
 
 /* v1.21.1: how a file_open step says it will open its file.
  *
@@ -1463,9 +1633,12 @@ static const struct { const char *name; int bits; } kPlanOpenFlags[] = {
     { "O_TRUNC", O_TRUNC },       { "O_APPEND", O_APPEND },       { "O_NONBLOCK", O_NONBLOCK },
     { "O_DSYNC", O_DSYNC },       { "O_ASYNC", O_ASYNC },         { "O_DIRECT", O_DIRECT },
     /* The kernel's bit, as the policy language names it (smt_decide.c
-     * K_O_LARGEFILE): glibc defines O_LARGEFILE as 0 on x86_64, which would
-     * make a declared O_LARGEFILE mean no flag at all. */
-    { "O_LARGEFILE", 0100000 },   { "O_DIRECTORY", O_DIRECTORY }, { "O_NOFOLLOW", O_NOFOLLOW },
+     * K_O_LARGEFILE): glibc defines O_LARGEFILE as 0 on 64-bit systems, which
+     * would make a declared O_LARGEFILE mean no flag at all. v1.30: the
+     * kernel's own bit on this architecture, as every flag here (the
+     * Warden keeps an action's flags as the kernel's, and translates them
+     * where they are decided and recorded). */
+    { "O_LARGEFILE", WARDEN_O_LARGEFILE }, { "O_DIRECTORY", O_DIRECTORY }, { "O_NOFOLLOW", O_NOFOLLOW },
     { "O_NOATIME", O_NOATIME },   { "O_CLOEXEC", O_CLOEXEC },     { "O_SYNC", O_SYNC },
     { "O_PATH", O_PATH },         { "O_TMPFILE", O_TMPFILE },
 };
@@ -1527,20 +1700,251 @@ static int net_plan_canon(const char *in, char *out, size_t n, char *why, size_t
  * for use by warden_adapter_verify(). The plan_spec_action_t's
  * (kind, target) pair is sufficient because policy_decide() only
  * inspects those two fields. */
-static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
-                                           void *ud)
-{
-    const struct warden_plan_ud *u = (const struct warden_plan_ud *)ud;
-    if (!u || !u->policy || !a) return PLAN_DEC_UNKNOWN;
+static plan_decision_t plan_exec_decide(const struct policy *p, struct action *a, const char **why);  /* warden_exec.inc.c */
 
+/* v1.35 (D3, D4, D6; docs/security/v1.35-frameworks.md): the steps a plan
+ * in format 1.35 (`plan 1.35` its first line) may name besides file_open,
+ * net_connect and process_exec, and the subject a step is decided as.
+ *
+ *   mcp_call URL [method=METHOD] [name=NAME]
+ *       an MCP call over HTTP, decided as v1.31 decides one: on the object
+ *       <canonical URL>#<METHOD>#<NAME> (vdp_mcp_object), by the mcp rules,
+ *       and certified. METHOD defaults to tools/call. Without name= the step
+ *       is the server (its tools found when it is connected): decided on the
+ *       empty name, so SATISFIED only where a rule allows any name. A server
+ *       that is not an http:// or https:// URL (a stdio server) is UNKNOWN:
+ *       its calls are not decided (its launch is a subagent step).
+ *   subagent NAME [exec=PATH]
+ *       a sub-agent, or a confined MCP server, decided as its launch: by the
+ *       exec rules, as a process_exec step is, and SATISFIED only when the
+ *       rule that allows the program is one with subagent=NAME. Without
+ *       exec= the program is the one exact rule with subagent=NAME names.
+ *   credential NAME
+ *       a credential the policy names (`credential NAME from ...`) and an
+ *       allow request or mcp rule of the step's subject releases
+ *       (credential=NAME); the requests that carry it are decided when made.
+ *   as=NAME   on any step: decided under the rules of NAME, a confined
+ *       subject (`mcp server NAME`, `subagent=NAME confined`), as its calls
+ *       are; for an unconfined sub-agent, the rules of the subject that
+ *       launches it, as its calls are. A name the policy does not give is
+ *       UNKNOWN.
+ *
+ * A plan without `plan 1.35` is read as through v1.34: these kinds, and an
+ * as= field, are UNKNOWN there. */
+static const char *plan_field(const struct warden_plan_ud *u, const plan_spec_action_t *a, const char *key) {
+    if (!u->parsed || !u->spec || a < u->spec->actions || a >= u->spec->actions + u->spec->n_actions)
+        return NULL;
+    size_t nf = 0;
+    const plan_spec_field_t *fl = plan_parser_fields(u->parsed, (size_t)(a - u->spec->actions), &nf);
+    for (size_t k = 0; k < nf; k++)
+        if (fl[k].key && !strcmp(fl[k].key, key)) return fl[k].value ? fl[k].value : "";
+    return NULL;
+}
+
+/* as=NAME: 1 + the policy subject its calls are decided as (1: the agent's
+ * rules), or 0 with why */
+static int plan_subject(const struct policy *p, const char *name, const char **why) {
+    for (size_t k = 0; k < p->v.nsubjects; k++)
+        if (!strcmp(p->v.subjects[k].name, name)) return (int)k + 2;
+    int subj = -1;
+    for (size_t i = 0; i < p->v.n; i++) {
+        const vdp_rule_t *r = &p->v.rules[i];
+        if (r->kind != VDP_KIND_EXEC || r->verb != VDP_ALLOW || strcmp(r->subagent, name)) continue;
+        if (subj >= 0 && subj != r->subj) { *why = "the sub-agent is launched by rules of two subjects"; return 0; }
+        subj = r->subj;
+    }
+    if (subj < 0) { *why = "the policy names no sub-agent or MCP server by that name"; return 0; }
+    return subj + 1;
+}
+
+/* a subagent step: its launch, as a process_exec step's (plan_exec_decide),
+ * then the deciding rule's subagent= */
+static plan_decision_t plan_subagent_decide(const struct warden_plan_ud *u, const plan_spec_action_t *a,
+                                            struct action *act, const char **why) {
+    const struct policy *p = u->policy;
+    const char *name = a->target ? a->target : "";
+    int subj = act->plan_psubj > 0 ? act->plan_psubj - 1 : 0;
+    const vdp_rule_t *only = NULL;
+    size_t n = 0;
+    for (size_t i = 0; i < p->v.n; i++) {
+        const vdp_rule_t *r = &p->v.rules[i];
+        if (r->kind == VDP_KIND_EXEC && r->verb == VDP_ALLOW && r->subj == subj && !strcmp(r->subagent, name)) {
+            only = r;
+            n++;
+        }
+    }
+    if (!n) { *why = "no rule of the policy launches a sub-agent by that name"; return PLAN_DEC_UNKNOWN; }
+    const char *path = plan_field(u, a, "exec");
+    if (!path) {
+        if (n != 1 || only->s.op != VDP_STR_EQ) {
+            *why = "name the sub-agent's program with exec=PATH (no one exact rule names it)";
+            return PLAN_DEC_UNKNOWN;
+        }
+        path = only->s.c;
+    }
+    if (strlen(path) >= sizeof act->target) { *why = "the program's path is too long"; return PLAN_DEC_UNKNOWN; }
+    snprintf(act->target, sizeof act->target, "%s", path);
+    act->kind = ACT_PROCESS_EXEC;
+    if (!p->v.launches) {
+        *why = "the Warden refuses every launch after the first at runtime, as the policy does not decide "
+               "launches (require warden 1.27)";
+        return PLAN_DEC_UNSATISFIED;
+    }
+    plan_decision_t pd = plan_exec_decide(p, act, why);
+    if (pd == PLAN_DEC_SATISFIED &&
+        (act->rule_index < 0 || strcmp(p->v.rules[act->rule_index].subagent, name))) {
+        *why = "the program is allowed, but by a rule that does not launch it as this sub-agent";
+        return PLAN_DEC_UNKNOWN;
+    }
+    return pd;
+}
+
+/* a credential step: named, and released by an allow rule of the subject */
+static plan_decision_t plan_cred_decide(const struct policy *p, const plan_spec_action_t *a,
+                                        struct action *act, const char **why) {
+    const char *name = a->target ? a->target : "";
+    int subj = act->plan_psubj > 0 ? act->plan_psubj - 1 : 0;
+    size_t c = 0;
+    while (c < p->v.ncreds && strcmp(p->v.creds[c].name, name)) c++;
+    if (c == p->v.ncreds) { *why = "the policy names no credential by that name"; return PLAN_DEC_UNKNOWN; }
+    for (size_t i = 0; i < p->v.n; i++) {
+        const vdp_rule_t *r = &p->v.rules[i];
+        if (r->verb == VDP_ALLOW && (r->kind == VDP_KIND_REQUEST || r->kind == VDP_KIND_MCP) &&
+            r->cred == (int)c + 1 && r->subj == subj) {
+            act->policy_line = r->line;
+            return PLAN_DEC_SATISFIED;
+        }
+    }
+    *why = "no rule of the policy releases it (credential=) to this subject";
+    return PLAN_DEC_UNKNOWN;
+}
+
+/* an mcp_call step's server: its host and port decided (and certified) as the
+ * connection the proxy reads is (ACT_NET_PROXY), before the call. At run time
+ * the call is decided only on a connection the host rules allow, so a step
+ * whose host they do not is not SATISFIED either. url is canonical
+ * (vdp_mcp_url): scheme://host:port/path. */
+static plan_decision_t plan_mcp_host(const struct policy *p, const struct action *call, const char *url,
+                                     char *host, size_t hn, const char **why) {
+    struct action h;
+    memset(&h, 0, sizeof h);
+    h.kind = ACT_NET_PROXY;
+    h.policy_line = -1;
+    h.plan_psubj = call->plan_psubj;
+    const char *b = strstr(url, "://");
+    const char *e = b ? strchr(b + 3, '/') : NULL;
+    if (!b || !e || (size_t)(e - b - 3) >= sizeof h.resolved) { *why = "the server's URL has no host"; return PLAN_DEC_UNKNOWN; }
+    memcpy(h.resolved, b + 3, (size_t)(e - b - 3));
+    snprintf(h.target, sizeof h.target, "%s", h.resolved);
+    decision_t d = policy_decide(p, &h);
+    if (d == DEC_ALLOW && certify(p, &h)) { snprintf(host, hn, "%s", h.resolved); return PLAN_DEC_SATISFIED; }
+    *why = d == DEC_DENY ? "the connection to its server's host and port is refused by a host rule"
+         : d == DEC_ALLOW ? "the connection to its server's host and port: certificate refused"
+                          : "no host rule allows the connection to its server's host and port";
+    return d == DEC_DENY ? PLAN_DEC_UNSATISFIED : PLAN_DEC_UNKNOWN;
+}
+
+static void plan_step_log(const plan_spec_action_t *a, const char *target, plan_decision_t pd, const char *why) {
+    log_line_start();
+    fputs("[warden] plan: ", g_log);
+    json_escape(g_log, a->kind ? a->kind : "");
+    fputs(" step \"", g_log);
+    json_escape(g_log, target);
+    fprintf(g_log, "\" is %s: %s\n", plan_decision_name(pd), why);
+    fflush(g_log);
+}
+
+/* v1.35 step 9 (review): in plan 1.35, a field the Warden does not read for
+ * the step's kind is refused, not passed over: a misspelled open= (opne=read)
+ * or name= would leave the step wider than written. The bad field's key, or
+ * NULL. */
+static const char *plan_bad_field(const struct warden_plan_ud *u, const plan_spec_action_t *a) {
+    static const struct { const char *kind, *keys; } ok[] = {
+        { "file_open", " open as " }, { "net_connect", " as " }, { "process_exec", " as " },
+        { "subagent", " exec as " }, { "mcp_call", " method name as " }, { "credential", " as " },
+    };
+    if (!u->parsed || !u->spec || a < u->spec->actions || a >= u->spec->actions + u->spec->n_actions || !a->kind)
+        return NULL;
+    const char *keys = NULL;
+    for (size_t i = 0; i < sizeof ok / sizeof ok[0]; i++)
+        if (!strcmp(a->kind, ok[i].kind)) keys = ok[i].keys;
+    if (!keys) return NULL;                         /* a kind not decided: UNKNOWN already */
+    size_t nf = 0;
+    const plan_spec_field_t *fl = plan_parser_fields(u->parsed, (size_t)(a - u->spec->actions), &nf);
+    for (size_t k = 0; k < nf; k++) {
+        char pat[48];
+        if (!fl[k].key || strlen(fl[k].key) > 40) return fl[k].key ? fl[k].key : "?";
+        snprintf(pat, sizeof pat, " %s ", fl[k].key);
+        if (!strstr(keys, pat)) return fl[k].key;
+    }
+    return NULL;
+}
+
+static plan_decision_t plan_step_decide(const struct warden_plan_ud *u, const plan_spec_action_t *a,
+                                        struct plan_step_note *nt)
+{
     struct action act;
     memset(&act, 0, sizeof(act));
+    act.policy_line = -1;
     act.kind = kind_from_string(a->kind);
     /* v1.20.0: a target that does not fit is UNKNOWN, never cut short and
      * decided as the shorter path it would become. */
-    if (a->target && strlen(a->target) >= sizeof(act.target)) return PLAN_DEC_UNKNOWN;
+    if (a->target && strlen(a->target) >= sizeof(act.target)) {
+        snprintf(nt->why, sizeof nt->why, "the target is too long");
+        return PLAN_DEC_UNKNOWN;
+    }
     if (a->target) {
         snprintf(act.target, sizeof(act.target), "%s", a->target);
+    }
+    /* v1.35 (D3, D4, D6): the subject, then the kinds of plan 1.35 */
+    {
+        int ver = plan_parser_version(u->parsed);
+        const char *why = NULL;
+        plan_decision_t pd = PLAN_DEC_UNKNOWN;
+        bool newkind = a->kind && (!strcmp(a->kind, "mcp_call") || !strcmp(a->kind, "subagent") ||
+                                   !strcmp(a->kind, "credential"));
+        const char *as = plan_field(u, a, "as");
+        const char *badf = ver >= 135 ? plan_bad_field(u, a) : NULL;
+        static char badwhy[160];
+        if (badf) {
+            snprintf(badwhy, sizeof badwhy, "a %.20s step takes no %.40s= field (the Warden would not read it)",
+                     a->kind, badf);
+            why = badwhy;
+        }
+        else if (as && ver < 135) why = "an as= field needs `plan 1.35` as the plan's first line";
+        else if (as && !(act.plan_psubj = plan_subject(u->policy, as, &why))) { }
+        else if (newkind && ver < 135) why = "this kind of step needs `plan 1.35` as the plan's first line";
+        else if (newkind && !strcmp(a->kind, "credential")) pd = plan_cred_decide(u->policy, a, &act, &why);
+        else if (newkind && !strcmp(a->kind, "subagent")) pd = plan_subagent_decide(u, a, &act, &why);
+        else if (newkind) {                                             /* mcp_call */
+            char url[VDP_STR_MAX + 1];
+            const char *method = plan_field(u, a, "method"), *name = plan_field(u, a, "name");
+            const char *bad = strstr(act.target, "://") ? vdp_mcp_url(act.target, false, url, sizeof url)
+                                                        : "not an http:// or https:// URL";
+            if (bad && !strstr(act.target, "://"))
+                why = "a stdio MCP server's calls are not decided (the Warden decides MCP calls over HTTP); "
+                      "its launch is a subagent step";
+            else if (bad) why = bad;
+            else if (vdp_mcp_object(url, method ? method : "tools/call", name ? name : "", act.resolved,
+                                    sizeof act.resolved) < 0)
+                why = "the method or name is outside what the Warden decides";
+            else if ((pd = plan_mcp_host(u->policy, &act, url, nt->mcp_host, sizeof nt->mcp_host, &why)) ==
+                     PLAN_DEC_SATISFIED) {
+                pd = PLAN_DEC_UNKNOWN;
+                act.kind = ACT_NET_MCP;                                 /* decided below, as a call */
+            }
+        }
+        if (why || pd != PLAN_DEC_UNKNOWN) {
+            if (!why) {                                                 /* a credential or subagent step SATISFIED */
+                if (g_hold_collect) hold_from_step(a, &act, nt);
+                return pd;
+            }
+            plan_step_log(a, act.target, pd, why);
+            snprintf(nt->why, sizeof nt->why, "%s", why);
+            nt->policy_line = act.policy_line;
+            snprintf(nt->resolved, sizeof nt->resolved, "%s", act.resolved[0] ? act.resolved : act.target);
+            return pd;
+        }
     }
     /* v1.12.4: policy_decide() decides a file open on the RESOLVED canonical
      * path (v1.12.0+), not the raw target. At plan time there is no live agent
@@ -1551,6 +1955,15 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
      * unparseable path leaves resolved empty and stays UNKNOWN. */
     if (act.kind == ACT_FILE_OPEN) {
         (void)plan_lexical_canon(act.target, act.resolved, sizeof(act.resolved));
+        /* v1.35 step 4: a directory step (its target ending in '/') is decided
+         * on the directory's name with its '/', as a prefix rule names it;
+         * each call beneath it is decided by the policy when it is made */
+        size_t tl = strlen(act.target), rl = strlen(act.resolved);
+        if (tl > 1 && act.target[tl - 1] == '/' && rl > 1 && act.resolved[rl - 1] != '/' &&
+            rl + 1 < sizeof act.resolved) {
+            act.resolved[rl] = '/';
+            act.resolved[rl + 1] = '\0';
+        }
     }
     /* v1.21.1: the flags the step declares it will open with (see
      * plan_open_field). */
@@ -1565,6 +1978,7 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
             json_escape(g_log, act.target);
             fprintf(g_log, "\" is UNKNOWN: %s\n", why);
             fflush(g_log);
+            snprintf(nt->why, sizeof nt->why, "%s", why);
             return PLAN_DEC_UNKNOWN;
         }
         if (r > 0) { act.open_flags = of; act.flags_known = true; }
@@ -1572,17 +1986,28 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
     /* v1.18.0: the runtime refuses every launch after the first, whatever
      * the policy says, so a process_exec step is UNSATISFIED (a plan lists
      * what the agent does after it starts, so every such step is a later
-     * launch). v1.21: connects are decided at runtime, so a net_connect step
-     * is decided by the policy on the destination the runtime would decide
-     * on (net_plan_canon); through v1.20.0 it was always UNSATISFIED. */
+     * launch). v1.35 step 2 (D9): unless the policy decides launches
+     * (require warden 1.27): then the step is decided as the launch would be
+     * (plan_exec_decide). v1.21: connects are decided at runtime, so a
+     * net_connect step is decided by the policy on the destination the
+     * runtime would decide on (net_plan_canon); through v1.20.0 it was always
+     * UNSATISFIED. */
     if (act.kind == ACT_PROCESS_EXEC) {
-        log_line_start();
-        fprintf(g_log, "[warden] plan: %s step \"", a->kind);
-        json_escape(g_log, act.target);
-        fprintf(g_log, "\" is UNSATISFIED: the Warden refuses every launch after the first "
-                "at runtime, whatever the policy says\n");
-        fflush(g_log);
-        return PLAN_DEC_UNSATISFIED;
+        const char *why = "the Warden refuses every launch after the first at runtime, "
+                          "as the policy does not decide launches (require warden 1.27)";
+        plan_decision_t pd = PLAN_DEC_UNSATISFIED;
+        if (u->policy->v.launches) pd = plan_exec_decide(u->policy, &act, &why);
+        if (pd != PLAN_DEC_SATISFIED) {
+            log_line_start();
+            fprintf(g_log, "[warden] plan: %s step \"", a->kind);
+            json_escape(g_log, act.target);
+            fprintf(g_log, "\" is %s: %s\n", plan_decision_name(pd), why);
+            fflush(g_log);
+            snprintf(nt->why, sizeof nt->why, "%s", why);
+            nt->policy_line = act.policy_line;
+            snprintf(nt->resolved, sizeof nt->resolved, "%s", act.resolved);
+        } else if (g_hold_collect) hold_from_step(a, &act, nt);
+        return pd;
     }
     if (act.kind == ACT_NET_CONNECT) {
         char why[200];
@@ -1592,10 +2017,13 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
             json_escape(g_log, act.target);
             fprintf(g_log, "\" is UNKNOWN: %s\n", why);
             fflush(g_log);
+            snprintf(nt->why, sizeof nt->why, "%s", why);
             return PLAN_DEC_UNKNOWN;
         }
     }
     decision_t d = policy_decide(u->policy, &act);
+    nt->policy_line = act.policy_line;
+    snprintf(nt->resolved, sizeof nt->resolved, "%s", act.resolved);
     if (d == DEC_ALLOW && !certify(u->policy, &act)) {
         /* v1.15: the plan gate authorizes only what the checker confirms. */
         log_line_start();
@@ -1603,41 +2031,107 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
         json_escape(g_log, act.target);
         fprintf(g_log, "\": %s\n", act.check_why);
         fflush(g_log);
+        snprintf(nt->why, sizeof nt->why, "its certificate is refused: %s", act.check_why);
         return PLAN_DEC_UNKNOWN;
     }
+    /* v1.35 step 3: a step the policy decides is logged with its reason too,
+     * as every other is (through step 2 only its record said why, and
+     * `varek policy check --plan`, which writes no record, showed nothing) */
+    plan_decision_t pd = PLAN_DEC_UNKNOWN;
     switch (d) {
-        case DEC_ALLOW:   return PLAN_DEC_SATISFIED;
-        case DEC_DENY:    return PLAN_DEC_UNSATISFIED;
-        case DEC_UNKNOWN: return PLAN_DEC_UNKNOWN;
+        case DEC_ALLOW:
+            if (g_hold_collect) hold_from_step(a, &act, nt);
+            return PLAN_DEC_SATISFIED;
+        case DEC_DENY:
+            snprintf(nt->why, sizeof nt->why, "the policy refuses it");
+            pd = PLAN_DEC_UNSATISFIED;
+            break;
+        case DEC_UNKNOWN:
+            snprintf(nt->why, sizeof nt->why, "%s", act.kind == ACT_OTHER ? "the Warden decides no step of this kind"
+                                                                      : "no rule of the policy allows it");
+            break;
     }
-    return PLAN_DEC_UNKNOWN;
+    plan_step_log(a, act.kind == ACT_NET_MCP && act.resolved[0] ? act.resolved : act.target, pd, nt->why);
+    return pd;
+}
+
+/* v1.35 step 2 (D9): the plan gate's chained records (defined after the
+ * record writer). */
+static void emit_plan_step(const char *plan_path, const plan_spec_action_t *a,
+                           plan_decision_t pd, const struct plan_step_note *nt);
+static void emit_plan_gate_basic(const char *plan_path, size_t n_actions, size_t n_edges,
+                                 plan_decision_t pd, const char *error, const char *why);
+
+static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
+                                           void *ud)
+{
+    const struct warden_plan_ud *u = (const struct warden_plan_ud *)ud;
+    if (!u || !u->policy || !a) return PLAN_DEC_UNKNOWN;
+    struct plan_step_note nt = { .policy_line = -1 };
+    plan_decision_t pd = plan_step_decide(u, a, &nt);
+    if (pd != PLAN_DEC_SATISFIED && u->plan_path) emit_plan_step(u->plan_path, a, pd, &nt);
+    return pd;
 }
 
 /* Verify an agent's declared plan against the current policy, ahead
  * of any execution. Returns 0 if the plan is authorized, non-zero
- * otherwise. Emits a plan-level pathology record to stderr. */
-static int warden_verify_plan(const char *plan_path,
-                              const struct policy *policy)
+ * otherwise. Emits a plan-level pathology record to stderr. v1.35 step 2
+ * (D9): and chained plan_step and plan_gate records, unless `records` is
+ * false (--check-startup, which opens no stream). */
+/* v1.35 step 4c: a plan read already (parsed, or NULL with err): under the
+ * node agent it is read in the node's view and decided in the container's
+ * (node_supervise); it is freed here */
+static int warden_verify_plan_parsed(plan_parsed_t *parsed, const char *err, const char *plan_path,
+                                     const struct policy *policy, bool records)
 {
-    char err[256] = {0};
-    plan_parsed_t *parsed = plan_parser_load(plan_path, err, sizeof(err));
     if (!parsed) {
         fprintf(stderr, "[warden] plan load failed: %s\n", err);
+        if (records) emit_plan_gate_basic(plan_path, 0, 0, PLAN_DEC_UNKNOWN, err, NULL);
         return 1;
     }
 
     const plan_spec_t *spec = plan_parser_spec(parsed);
-    pathology_sink_t *sink = pathology_sink_new(stderr);
-    struct warden_plan_ud ud = { .policy = policy, .parsed = parsed, .spec = spec };
+    /* v1.35 step 9 (review): the pathology report to memory, then to standard
+     * error prefixed as the flow gate's is (through step 8 an unprefixed JSON
+     * line with no run id went into the stream, which a follower took for
+     * another run's record); and its suppression_reason, the plan's refusal
+     * when no step is (a cycle, an empty plan), on the plan_gate record */
+    char *pbuf = NULL;
+    size_t plen = 0;
+    FILE *pmem = open_memstream(&pbuf, &plen);
+    pathology_sink_t *sink = pathology_sink_new(pmem ? pmem : stderr);
+    struct warden_plan_ud ud = { .policy = policy, .parsed = parsed, .spec = spec,
+                                 .plan_path = records ? plan_path : NULL };
 
     plan_decision_t pd = warden_adapter_verify(spec, warden_plan_decider,
                                                &ud, sink);
 
     /* v1.21.1: read the count before the plan is freed (spec points into it;
      * through v1.21.0 it was read after plan_parser_free). */
-    size_t n_actions = spec->n_actions;
+    size_t n_actions = spec->n_actions, n_edges = spec->n_edges;
     pathology_sink_free(sink);
     plan_parser_free(parsed);
+    char why[32] = "";
+    if (pmem) {
+        fclose(pmem);
+        if (pbuf && plen) {
+            fputs("[warden] plan pathology: ", stderr);
+            fwrite(pbuf, 1, plen, stderr);
+            if (pbuf[plen - 1] != '\n') fputc('\n', stderr);
+            const char *r = strstr(pbuf, "\"suppression_reason\":\"");
+            if (r) {
+                r += strlen("\"suppression_reason\":\"");
+                size_t k = 0;
+                while (r[k] && r[k] != '"' && k + 1 < sizeof(why) &&
+                       ((r[k] >= 'a' && r[k] <= 'z') || r[k] == '_')) { why[k] = r[k]; k++; }
+                why[r[k] == '"' ? k : 0] = '\0';
+            }
+        }
+        free(pbuf);
+    }
+    if (records) emit_plan_gate_basic(plan_path, n_actions, n_edges, pd, NULL,
+                                      /* a step's refusal is its plan_step record's */
+                                      pd != PLAN_DEC_SATISFIED && why[0] && strcmp(why, "node") ? why : NULL);
 
     if (pd != PLAN_DEC_SATISFIED) {
         fprintf(stderr,
@@ -1649,6 +2143,14 @@ static int warden_verify_plan(const char *plan_path,
             "[warden] plan authorized (%zu actions); proceeding to supervise\n",
             n_actions);
     return 0;
+}
+
+static int warden_verify_plan(const char *plan_path,
+                              const struct policy *policy, bool records)
+{
+    char err[256] = {0};
+    plan_parsed_t *parsed = plan_load_snapshot(plan_path, err, sizeof(err));
+    return warden_verify_plan_parsed(parsed, err, plan_path, policy, records);
 }
 
 /* ---------------- Pathology Report ---------------- */
@@ -1706,6 +2208,7 @@ static void       stub_resolved(size_t i);
 static void       px_resolved(size_t i);  /* v1.26: proxied requests waiting on a lookup */
 static bool       px_up_charged(const char *name);  /* v1.26 review: sent to the upstream, charged */
 static void       px_handed_off(uint64_t id, unsigned port, int subject);  /* v1.26 review: a hand-off announced */
+static void       px_handoff_drop(uint64_t id);                            /* v1.36 step 12: never reported */
 static bool       g_stub_on;           /* v1.25: the stub resolver is up (warden_stub.inc.c) */
 /* v1.25: the stub's address; v1.34 step 4: under the node agent, the first of
  * 127.53.53.53 to 127.53.53.254 free in the pod's network namespace (which
@@ -1803,10 +2306,29 @@ static bool          g_log_broken = false;  /* a record could not be written */
 static FILE         *g_rf;                  /* the record being built */
 static char         *g_rb;
 static size_t        g_rl;
+/* v1.36 (D9): the node agent's rotation. A supervisor's stream goes on in a
+ * new segment, DIR/<container>.<supervisor>.jsonl.N (N = 2, 3, ...), once the
+ * one it writes has passed --node-stream-rotate bytes: at the next record, so
+ * each segment ends between two records and none follows run_end. Each
+ * segment begins with a checkpoint that names it and the chain value the one
+ * before it ended on ("segment", "prev_chain"); signed and anchored as any
+ * checkpoint, and the chain runs on across the files. */
+static uint64_t      g_rotate;              /* bytes a segment holds (0: no rotation) */
+static uint64_t      g_seg_bytes;           /* written to this segment */
+static unsigned      g_seg = 1;             /* this segment's number */
+static int           g_seg_dir = -1;        /* the streams' directory */
+static char          g_seg_base[200];       /* <container>.<supervisor> */
+static bool          g_rotate_due, g_rotating;
 
 static bool checkpoints_on(void) { return g_signing || g_anchor_fd >= 0; }
 
+static void seg_rotate(void);
+
 static FILE *rec_begin(void) {
+    if (g_rotate_due && !g_rotating) {
+        g_rotate_due = false;
+        seg_rotate();
+    }
     rewind(g_rf);
     return g_rf;
 }
@@ -1872,8 +2394,9 @@ static void rec_end(const char *ckpt_event) {
     }
     log_line_start();
     fwrite(g_rb, 1, bl, g_log);
-    fprintf(g_log, ",\"chain\":\"%s\"%s%s%s}\n", chain_hex,
-            sign ? ",\"sig\":\"" : "", sign ? sig_hex : "", sign ? "\"" : "");
+    int tl = fprintf(g_log, ",\"chain\":\"%s\"%s%s%s}\n", chain_hex,
+                     sign ? ",\"sig\":\"" : "", sign ? sig_hex : "", sign ? "\"" : "");
+    if (g_rotate && (g_seg_bytes += bl + (tl > 0 ? (uint64_t)tl : 0)) >= g_rotate) g_rotate_due = true;
     /* A stream that cannot be written stops supervision (fail closed): the
      * agent must not run on unrecorded. */
     if (fflush(g_log) != 0 || ferror(g_log)) g_log_broken = true;
@@ -1890,6 +2413,45 @@ static void emit_anchor_error(const char *event, int err) {
                "\"records\":%" PRIu64 ",\"errno\":%d,\"anchor_errors\":%" PRIu64 "}\n",
             g_run_id, event, g_records, err, g_anchor_errors);
     rec_end(NULL);                      /* chained; not itself anchored */
+}
+
+/* v1.36 (D9): the stream goes on in its next segment (g_rotate). If the
+ * file cannot be made, it goes on in this one (it is whole either way), and
+ * is tried again after as much again. */
+static void seg_rotate(void) {
+    char name[256], prev[65];
+    int n = snprintf(name, sizeof name, "%s.jsonl.%u", g_seg_base, g_seg + 1);
+    /* this segment whole on disk before the next is there (a follower moves
+     * on when it sees the next) */
+    int fd = n > 0 && (size_t)n < sizeof name && g_seg_dir >= 0 && fflush(g_log) == 0 ?
+             openat(g_seg_dir, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600) : -1;
+    if (fd < 0 || dup3(fd, fileno(g_log), O_CLOEXEC) < 0) {
+        int err = errno;
+        if (fd >= 0) {
+            close(fd);
+            (void)unlinkat(g_seg_dir, name, 0);
+        }
+        g_seg_bytes = 0;
+        log_line_start();
+        fprintf(g_log, "[warden] could not begin the stream's segment %s (%s); it goes on in this one\n", name,
+                strerror(err));
+        fflush(g_log);
+        return;
+    }
+    (void)dup2(fd, STDERR_FILENO);          /* the supervisor's own lines go on there too */
+    close(fd);
+    g_seg++;
+    g_seg_bytes = 0;
+    sodium_bin2hex(prev, sizeof prev, g_chain, sizeof g_chain);
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    g_rotating = true;
+    FILE *f = rec_begin();
+    fprintf(f, "{\"event\":\"checkpoint\",\"run\":\"%s\",\"records\":%" PRIu64 ",\"segment\":%u,"
+               "\"prev_chain\":\"%s\",\"timestamp_ns\":%lld}\n",
+            g_run_id, g_records, g_seg, prev, (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+    rec_end("checkpoint");
+    g_rotating = false;
 }
 
 /* A checkpoint: a signed (and anchored) record that seals every record before
@@ -2072,6 +2634,7 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     FILE *f = rec_begin();
     /* the version is one literal, so `varek version` can read it from the binary */
     fprintf(f, "{\"event\":\"run_start\",\"run\":\"%s\",\"warden\":\"" WARDEN_VERSION "\","
+               "\"arch\":\"" WARDEN_ARCH "\","        /* v1.30 */
                "\"policy_path\":\"", g_run_id);
     json_escape(f, policy_path);
     fprintf(f, "\",\"policy_rules\":%zu,\"policy_sha256\":\"%s\",%s", p->v.n, p->sha256,
@@ -2083,6 +2646,8 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
             );
     /* v1.16: how this stream is protected (see the log integrity notes). */
     fputs("\"log\":\"chain-1\",", f);
+    /* v1.35 step 4: the run is held to this plan (if it passes the gate) */
+    if (g_hold_req) fprintf(f, "\"hold\":{\"plan\":\"%s\",\"plan_sha256\":\"%s\"},", g_hold_plan_json, g_hold_plan_sha);
     if (g_signing) {
         char pk_hex[2 * crypto_sign_PUBLICKEYBYTES + 1];
         sodium_bin2hex(pk_hex, sizeof pk_hex, g_pk, sizeof g_pk);
@@ -2502,6 +3067,7 @@ static void emit_pathology(uint64_t seq,
                            uint64_t latency_ns,
                            int kernel_errno)
 {
+    bool held = rule_id && !strcmp(rule_id, "outside_plan");   /* v1.35 step 4 */
     if (!g_log) return;
     /* v1.31 (the shared soak): a checkpoint seals at most checkpoint_every
      * decision records. It is written between notifications
@@ -2515,7 +3081,8 @@ static void emit_pathology(uint64_t seq,
     clock_gettime(CLOCK_REALTIME, &ts);
     char flags_json[40] = "";
     if ((a->kind == ACT_FILE_OPEN || is_meta_kind(a->kind) || a->kind == ACT_FILE_CHANGE) && a->flags_known)
-        snprintf(flags_json, sizeof flags_json, "0x%x", (unsigned)a->open_flags);
+        snprintf(flags_json, sizeof flags_json, "0x%x",           /* v1.30: VAREK's encoding */
+                 (unsigned)vdp_oflags_from_native((uint32_t)a->open_flags));
     /* v1.17.0: what an access() asked, so an audit can tell F_OK/R_OK from
      * W_OK/X_OK. */
     if (a->kind == ACT_FILE_ACCESS && flags_json[0])
@@ -2542,6 +3109,7 @@ static void emit_pathology(uint64_t seq,
     /* v1.28.1: who it was for */
     sub_obo(f, a->subject);
     if (a->dry) { fputs("\"enforced\":false,", f); g_dry_unenforced++; }   /* v1.29 */
+    if (a->dry_kept) fputs("\"dry_run_refused\":true,", f);                  /* v1.36 step 7 (D6a) */
     fprintf(f, "\"action\":\"%s\",\"target\":\"",
             a->kind == ACT_FILE_CHANGE ? change_op_name(a->chg_op) : action_kind_name(a->kind));
     json_escape(f, a->target);
@@ -2554,7 +3122,7 @@ static void emit_pathology(uint64_t seq,
         "\"policy_line\":%d,"
         "%s%s%s"
         "%s%s%s%s%s%s"
-        "%s%s"
+        "%s%s%s%s%s"
         "\"kernel_verdict\":\"%s\","
         "\"errno\":%d,"
         "\"latency_us\":%" PRIu64 ","
@@ -2571,6 +3139,8 @@ static void emit_pathology(uint64_t seq,
         a->cert[0] && !a->certified ? a->check_why : "",
         a->cert[0] && !a->certified ? "\"," : "",
         net_json, a->extra,
+        /* v1.35 step 4: an outside_plan refusal names the plan the run is held to */
+        held ? "\"plan\":\"" : "", held ? g_hold_plan_json : "", held ? "\"," : "",
         /* v1.12.1: an ALLOW whose open then failed (EEXIST, ENXIO, ...)
          * delivered nothing; say so rather than reporting ALLOW.
          * v1.18.0: a refusal names the errno the agent actually received
@@ -3587,6 +4157,15 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                       pid_t bootstrap_pid) {
     bool bootstrap_done = false;
     while (!g_stop && !g_log_broken) {
+        struct seccomp_notif req;
+        /* v1.36 step 12: the container's first call, received when it tied
+         * the container to its listener (node_tie): its caller waits, and
+         * nothing else comes from it until it is answered */
+        if (g_nr.held) {
+            req = g_nr.held_req;
+            g_nr.held = false;
+            goto decide;
+        }
         /* v1.9.3: wait on the listener AND the target's pidfd. Blocking in
          * NOTIF_RECV alone can hang forever if the target exits between the
          * g_stop check and the ioctl (the SIGCHLD is already spent).
@@ -3681,13 +4260,13 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         if (!(pfds[0].revents & POLLIN))
             continue;
 
-        struct seccomp_notif req;
         memset(&req, 0, sizeof(req));
         if (ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_RECV, &req) < 0) {
             if (errno == EINTR || errno == ENOENT) continue;  /* ENOENT: requester died */
             return false;
         }
 
+    decide:;
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -3884,14 +4463,39 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                 send_simple(notify_fd, req.id, DEC_DENY);
                 continue;
             }
+            /* v1.35 step 10: a name view's file reached by its host target
+             * (/etc/resolv.conf a symlink to /run/systemd/resolve/stub-resolv.conf,
+             * as systemd-resolved makes it) is decided as the view's own path,
+             * as its open is (view_serve): glibc's resolver stats the file
+             * before each lookup to see whether to read it again, and that
+             * stat, refused for a directory the policy never names, was a
+             * refusal on every lookup on such a host. A deny rule over the
+             * view's path still refuses it. */
+            if ((g_any_name || g_inspect_on) && mfd >= 0 && view_by_canonical(act.resolved) >= 0 &&
+                !(act.kind == ACT_FILE_ACCESS && (act.access_mode & (W_OK | X_OK))))
+                snprintf(act.resolved, sizeof act.resolved, "%s", kViewPath[view_by_canonical(act.resolved)]);
             /* A directory the policy's allow rules lead to: a read-type
              * lookup is answered without a decision (see load_ancestors). */
             if (mfd >= 0 &&
                 !(act.kind == ACT_FILE_ACCESS && (act.access_mode & (W_OK | X_OK)))) {
                 struct stat ast;
-                if (fstat(mfd, &ast) == 0 && S_ISDIR(ast.st_mode) &&
-                    is_ancestor(act.resolved, sub_policy_subject(act.subject)) &&
-                    !ancestor_denied(p, act.resolved, sub_policy_subject(act.subject))) {
+                bool anc = fstat(mfd, &ast) == 0 && S_ISDIR(ast.st_mode) &&
+                           is_ancestor(act.resolved, sub_policy_subject(act.subject)) &&
+                           !ancestor_denied(p, act.resolved, sub_policy_subject(act.subject));
+                if (anc && g_hold_on && !hold_covers(&act)) {
+                    /* v1.35 step 9 (review): the policy leads to it, the plan does
+                     * not: the hold's refusal, recorded as one (through step 8 it
+                     * fell to the policy's decision and was recorded as that) */
+                    close(mfd);
+                    clock_gettime(CLOCK_MONOTONIC, &t1);
+                    uint64_t lat_h = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
+                                   + (t1.tv_nsec - t0.tv_nsec);
+                    emit_pathology(g_report_seq++, req.pid, &act, DEC_ALLOW, DEC_DENY,
+                                   "outside_plan", lat_h, EACCES);
+                    send_simple(notify_fd, req.id, DEC_DENY);
+                    continue;
+                }
+                if (anc) {                                                  /* v1.35 step 4 */
                     int64_t r = meta_answer(req.pid, notify_fd, req.id, &act, mfd, true);
                     close(mfd);
                     if (r < 0) send_errno(notify_fd, req.id, (int)-r);
@@ -3906,7 +4510,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             }
             decision_t m_raw   = policy_decide(p, &act);
             decision_t m_final = (m_raw == DEC_ALLOW) ? DEC_ALLOW : DEC_DENY;
-            bool m_cert_refused = false;
+            bool m_cert_refused = false, m_held = false;
             if (m_final == DEC_ALLOW && !certify(p, &act)) {
                 m_final = DEC_DENY;
                 m_cert_refused = true;
@@ -3914,12 +4518,14 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                 fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n",
                         g_records, act.check_why);
             }
+            if (m_final == DEC_ALLOW && hold_refuses(&act)) { m_final = DEC_DENY; m_held = true; }   /* v1.35 */
             clock_gettime(CLOCK_MONOTONIC, &t1);
             if (m_final != DEC_ALLOW) {
                 if (mfd >= 0) close(mfd);
                 uint64_t lat_m = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                                + (t1.tv_nsec - t0.tv_nsec);
-                const char *mrule = m_cert_refused ? "certificate_refused" : decision_rule_id(&act, m_raw);
+                const char *mrule = m_held ? "outside_plan" : m_cert_refused ? "certificate_refused"
+                                                                             : decision_rule_id(&act, m_raw);
                 bool mlet = dry_let(&act, mrule);                   /* v1.29: to the kernel */
                 emit_pathology(g_report_seq++, req.pid, &act, m_raw, m_final, mrule, lat_m, mlet ? 0 : EACCES);
                 send_simple(notify_fd, req.id, mlet ? DEC_ALLOW : DEC_DENY);
@@ -4004,9 +4610,11 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
                     in_protected_dir(act.resolved, -1) == 0) {
                     decision_t nr = policy_decide(p, &act);
                     bool nok = nr == DEC_ALLOW && certify(p, &act);
+                    bool nheld = nok && hold_refuses(&act);                 /* v1.35 step 4 */
+                    if (nheld) nok = false;
                     clock_gettime(CLOCK_MONOTONIC, &t1);
-                    const char *nrule = nok ? "open_not_found" : nr == DEC_ALLOW ? "certificate_refused"
-                                                                                : decision_rule_id(&act, nr);
+                    const char *nrule = nok ? "open_not_found" : nheld ? "outside_plan"
+                                      : nr == DEC_ALLOW ? "certificate_refused" : decision_rule_id(&act, nr);
                     bool nlet = !nok && dry_let(&act, nrule);          /* v1.29: to the kernel */
                     emit_pathology(g_report_seq++, req.pid, &act, nr, nok ? DEC_ALLOW : DEC_DENY, nrule,
                                    (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec),
@@ -4060,7 +4668,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         decision_t d_final = (d_raw == DEC_ALLOW) ? DEC_ALLOW : DEC_DENY;
         /* v1.15: a file open is authorized only if the independent checker
          * accepts the verdict's certificate. */
-        bool cert_refused = false;
+        bool cert_refused = false, held = false;
         if (d_final == DEC_ALLOW && act.kind == ACT_FILE_OPEN && !certify(p, &act)) {
             d_final = DEC_DENY;
             cert_refused = true;
@@ -4068,6 +4676,11 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             log_line_start();
             fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n",
                     g_records, act.check_why);
+        }
+        /* v1.35 step 4: allowed and certified, but outside the run's plan */
+        if (d_final == DEC_ALLOW && act.kind == ACT_FILE_OPEN && hold_refuses(&act)) {
+            d_final = DEC_DENY;
+            held = true;
         }
 
         if (act.kind == ACT_FILE_OPEN) {
@@ -4099,7 +4712,8 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             clock_gettime(CLOCK_MONOTONIC, &t1);
             uint64_t lat_d = (t1.tv_sec - t0.tv_sec) * 1000000000ULL
                            + (t1.tv_nsec - t0.tv_nsec);
-            const char *orule = cert_refused ? "certificate_refused" : decision_rule_id(&act, d_raw);
+            const char *orule = held ? "outside_plan" : cert_refused ? "certificate_refused"
+                                                                     : decision_rule_id(&act, d_raw);
             bool olet = dry_let(&act, orule);       /* v1.29: to the kernel, as the agent */
             emit_pathology(g_report_seq++, req.pid, &act, d_raw, d_final, orule, lat_d, olet ? 0 : EACCES);
             send_simple(notify_fd, req.id, olet ? DEC_ALLOW : d_final);
@@ -4125,6 +4739,22 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * allowlist here (when enforcing it is refused there, EPERM): the
          * kernel carries it out, recorded as not enforced */
         if (act.kind == ACT_OTHER && g_dry) {
+            /* v1.36 step 11 (review): in a pod, a socket listening would be
+             * reached from the cluster's network, as a connect would reach it
+             * (dry_net_let): listen and accept are refused all the same, the
+             * record saying it was a dry run's refusal */
+            if (g_nr.on && (req.data.nr == __NR_listen || req.data.nr == __NR_accept4
+#ifdef __NR_accept
+                            || req.data.nr == __NR_accept
+#endif
+                            )) {
+                act.dry_kept = true;
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                emit_pathology(g_report_seq++, req.pid, &act, DEC_UNKNOWN, DEC_DENY, "syscall_not_admitted",
+                               (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec), EACCES);
+                send_simple(notify_fd, req.id, DEC_DENY);
+                continue;
+            }
             act.dry = true;
             clock_gettime(CLOCK_MONOTONIC, &t1);
             emit_pathology(g_report_seq++, req.pid, &act, DEC_UNKNOWN, DEC_DENY, "syscall_not_admitted",
@@ -4563,7 +5193,8 @@ static int parse_run_as(const char *v, struct run_as *ra) {
 
 /* In the child, before the filter: no supplementary groups, an empty
  * capability bounding and ambient set, then the unprivileged user and group
- * (which clears the permitted and effective sets). Verified afterwards. */
+ * (which clears the permitted and effective sets), then an empty inheritable
+ * set. Verified afterwards. */
 static int drop_privileges(const struct run_as *ra) {
     if (setgroups(0, NULL) < 0) return -errno;
     for (int cap = 0; cap <= 63; cap++)
@@ -4573,7 +5204,10 @@ static int drop_privileges(const struct run_as *ra) {
     if (setresuid(ra->uid, ra->uid, ra->uid) < 0) return -errno;
     struct __user_cap_header_struct hdr = { .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0 };
     struct __user_cap_data_struct data[2];
+    /* v1.36 step 4: the inheritable set too, which a change of user leaves
+     * (CRI-O gives a privileged container one) */
     memset(data, 0, sizeof data);
+    if (syscall(SYS_capset, &hdr, data) != 0) return -errno;
     if (syscall(SYS_capget, &hdr, data) != 0) return -errno;
     for (int i = 0; i < 2; i++)
         if (data[i].effective || data[i].permitted || data[i].inheritable) return -EPERM;
@@ -4657,6 +5291,57 @@ static int find_program(const char *name, char *out, size_t n) {
  * malformed) is an error and the plan is refused. The lock file and the
  * table are protected from the agent by identity, like the signing key. */
 
+/* v1.35 step 2 (D9): each step the plan gate does not find SATISFIED is a
+ * chained plan_step record, so `varek refusals` and the audit read why a plan
+ * was refused from the stream itself (through v1.34 the basic gate's reasons
+ * were lines on standard error only). The plan's own text (label, kind,
+ * target) is escaped, as a path is. */
+static void emit_plan_step(const char *plan_path, const plan_spec_action_t *a,
+                           plan_decision_t pd, const struct plan_step_note *nt) {
+    FILE *f = rec_begin();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(f, "{\"event\":\"plan_step\",\"run\":\"%s\",\"plan\":\"", g_run_id);
+    json_escape(f, plan_path);
+    fputs("\",\"label\":\"", f);
+    json_escape(f, a->label ? a->label : "");
+    fputs("\",\"kind\":\"", f);
+    json_escape(f, a->kind ? a->kind : "");
+    fputs("\",\"target\":\"", f);
+    json_escape(f, a->target ? a->target : "");
+    fputs("\",\"resolved\":\"", f);
+    json_escape(f, nt->resolved);
+    fprintf(f, "\",\"decision\":\"%s\",\"policy_line\":%d,\"why\":\"", plan_decision_name(pd),
+            nt->policy_line);
+    json_escape(f, nt->why);
+    fprintf(f, "\",\"timestamp_ns\":%lld}\n", (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+    rec_end(NULL);
+}
+
+/* v1.35 step 2 (D9): the basic gate's outcome as a chained plan_gate record
+ * (the flow gate writes its own, with the breaker's fields): the plan, its
+ * size, the verdict, and why it could not be read when it could not. Through
+ * v1.34 the outcome was a line on standard error only. */
+static void emit_plan_gate_basic(const char *plan_path, size_t n_actions, size_t n_edges,
+                                 plan_decision_t pd, const char *error, const char *why) {
+    FILE *f = rec_begin();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(f, "{\"event\":\"plan_gate\",\"run\":\"%s\",\"gate\":\"plan\",\"plan\":\"", g_run_id);
+    json_escape(f, plan_path);
+    fprintf(f, "\",\"actions\":%zu,\"edges\":%zu,\"verdict\":\"%s\"", n_actions, n_edges,
+            plan_decision_name(pd));
+    if (g_gate_plan_sha[0]) fprintf(f, ",\"plan_sha256\":\"%s\"", g_gate_plan_sha);    /* v1.35 step 7 */
+    if (why) fprintf(f, ",\"why\":\"%s\"", why);    /* step 9 (review): node, cycle, empty, ...: [a-z_] only */
+    if (error) {
+        fputs(",\"error\":\"", f);
+        json_escape(f, error);
+        fputc('"', f);
+    }
+    fprintf(f, ",\"timestamp_ns\":%lld}\n", (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+    rec_end(NULL);
+}
+
 #define BREAKER_DEFAULT_DIR  "/var/lib/varek"
 #define BREAKER_DEFAULT_NAME "breaker.state"
 
@@ -4682,8 +5367,10 @@ static bool own_private_file(const struct stat *st) {
 /* Load and certify the flow policy; open and check the state directory, the
  * lock file and (if it exists) the table; open --gate-status. Returns 0, or -1
  * after saying why. */
-static int flow_setup(const struct policy *pol, const char *cfg_path, const char *state_path,
-                      const char *session, const char *gate_status_path) {
+/* The flow policy loaded and certified, with the budgets the Warden requires
+ * (v1.36 step 7: also --oci-filter's check, for the plugin and the webhook).
+ * 0, or -1 after saying why. */
+static int flow_load(const char *cfg_path) {
     int line = 0;
     const char *msg = NULL;
     if (plan_label_policy_config_load(cfg_path, &g_flow_cfg, &line, &msg) != 0) {
@@ -4724,6 +5411,12 @@ static int flow_setup(const struct policy *pol, const char *cfg_path, const char
                 "session_refusal_budget 10); refusing to start\n", cfg_path);
         return -1;
     }
+    return 0;
+}
+
+static int flow_setup(const struct policy *pol, const char *cfg_path, const char *state_path,
+                      const char *session, const char *gate_status_path) {
+    if (flow_load(cfg_path) < 0) return -1;
     if (session) {
         size_t n = strlen(session);
         bool ok = n >= 1 && n <= 128;
@@ -4951,9 +5644,10 @@ static int cmp_arg_key(const void *x, const void *y) {
     return strcmp(((const plan_action_arg_t *)x)->key, ((const plan_action_arg_t *)y)->key);
 }
 
-static int warden_gate_plan_flow(const char *plan_path, const struct policy *policy) {
-    char err[256] = {0};
-    plan_parsed_t *parsed = plan_parser_load(plan_path, err, sizeof(err));
+/* v1.36 step 7 (D7b): the gate on a plan parsed already (the node agent's,
+ * read in the node's view and decided in the container's); it is freed */
+static int warden_gate_plan_flow_parsed(plan_parsed_t *parsed, const char *err, const char *plan_path,
+                                        const struct policy *policy) {
     if (!parsed) {
         fprintf(stderr, "[warden] plan load failed: %s\n", err);
         return GATE_ERROR;
@@ -4979,7 +5673,8 @@ static int warden_gate_plan_flow(const char *plan_path, const struct policy *pol
     canon = calloc(n, sizeof *canon);
     if (!plan || !acts || !args || !canon) goto out;
 
-    struct warden_plan_ud ud = { .policy = policy, .parsed = parsed, .spec = spec };
+    struct warden_plan_ud ud = { .policy = policy, .parsed = parsed, .spec = spec,
+                                 .plan_path = plan_path };
     for (size_t i = 0; i < n; i++) {
         const plan_spec_action_t *sa = &spec->actions[i];
         plan_decision_t d = warden_plan_decider(sa, &ud);
@@ -5078,12 +5773,14 @@ static int warden_gate_plan_flow(const char *plan_path, const struct policy *pol
     FILE *f = rec_begin();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    fprintf(f, "{\"event\":\"plan_gate\",\"run\":\"%s\",\"plan\":\"", g_run_id);
+    fprintf(f, "{\"event\":\"plan_gate\",\"run\":\"%s\",\"gate\":\"flow\",\"plan\":\"", g_run_id);
     json_escape(f, plan_path);
     fprintf(f, "\",\"actions\":%zu,\"edges\":%zu,\"node_axis\":\"%s\",\"flow_axis\":\"%s\","
-               "\"verdict\":\"%s\",\"session\":\"", n, spec->n_edges,
+               "\"verdict\":\"%s\",", n, spec->n_edges,
             plan_decision_name(resp.node_axis), plan_decision_name(resp.flow_axis),
             plan_decision_name(resp.verdict));
+    if (g_gate_plan_sha[0]) fprintf(f, "\"plan_sha256\":\"%s\",", g_gate_plan_sha);     /* v1.35 step 7 */
+    fputs("\"session\":\"", f);
     json_escape(f, g_session);
     fprintf(f, "\",\"signature\":\"%016" PRIx64 "\",\"breaker\":\"%s\",\"refusals\":%u,"
                "\"budget\":%u,\"session_refusals\":%u,\"session_budget\":%u,"
@@ -5159,9 +5856,15 @@ out:
     return result;
 }
 
+static int warden_gate_plan_flow(const char *plan_path, const struct policy *policy) {
+    char err[256] = {0};
+    plan_parsed_t *parsed = plan_load_snapshot(plan_path, err, sizeof(err));
+    return warden_gate_plan_flow_parsed(parsed, err, plan_path, policy);
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s <policy.txt> [--plan <plan.txt> [--flow-policy <cfg>\n"
+        "usage: %s <policy.txt> [--plan <plan.txt> [--hold-to-plan] [--flow-policy <cfg>\n"
         "              [--session <id>] [--breaker-state <file>] [--gate-status <file>]]]\n"
         "              [--sign-key <key>]\n"
         "              [--anchor <path>] [--checkpoint-every <n>] [--run-as <user>]\n"
@@ -5175,7 +5878,22 @@ static void usage(const char *argv0) {
         "       %s <policy.txt> [the options above] --check-startup   (v1.21)\n"
         "       %s <policies dir | policy.txt> --node-agent <socket> --node-streams <dir>\n"
         "              [--node-launcher <varek-init>]   (v1.34: the node agent, one supervisor a container)\n"
-        "       %s <policy.txt> --oci-filter   (v1.34: the policy's filter in OCI's form, for the NRI plugin)\n"
+        "              [--node-bundle-root <dir>]...   (v1.36.3: where the runtimes keep bundles; by default\n"
+        "               containerd's and CRI-O's)\n"
+        "              [--node-credentials <dir>]   (v1.36: where a file: credential is)\n"
+        "              [--node-kubelet <dir>] [--node-spire-socket <admin socket> [--node-spire-self <SPIFFE ID>]\n"
+        "               [--node-svid-helper <varek-svid>]]   (v1.36: the pod's user's token and SVID)\n"
+        "              [--node-trust-bundles <dir>] [--node-flow-state <dir>]   (v1.36: the trust bundles' ConfigMap,\n"
+        "               the flow policies' breaker table)\n"
+        "              [--node-stream-rotate <bytes>]   (v1.36: each stream goes on in a new segment,\n"
+        "               <container>.<supervisor>.jsonl.2, .3, ..., past this size; the audit takes them in order)\n"
+        "              [--node-name <node> [--node-key <file> [--node-key-pub <file>]]]   (v1.36: the node's name in\n"
+        "               each run_start; the node's own signing key, made at the first start, and where its public key\n"
+        "               is written, <file>.pub by default)\n"
+        "       %s <policy.txt> --oci-filter [--plan PLAN | --no-plan]   (v1.34: the policy's filter in OCI's form, for the\n"
+        "              NRI plugin; v1.35: with the pod's plan, or for a pod that names none)\n"
+        "              [--credential-list FILE --pod-namespace NS]   (v1.36: the cluster's VarekCredential resources)\n"
+        "              [--dry-run] [--flow-policy FILE]   (v1.36: the pod's VarekPolicy's dry run and flow policy)\n"
         , argv0, argv0, argv0, argv0);
     fprintf(stderr,
         "\n"
@@ -5191,7 +5909,7 @@ static void usage(const char *argv0) {
         "  and the requirement; processes the agent spawns may then outlive\n"
         "  a crashed Warden.\n"
         "\n"
-        "  Optional --plan <plan.txt> enables v1.6 pre-execution plan\n"
+        "  Optional --plan <plan.txt> enables v1.6 plan-level\n"
         "  verification. The target is not forked unless the plan\n"
         "  verifies as SATISFIED against the loaded policy. A process_exec\n"
         "  step is UNSATISFIED: the runtime refuses launches (v1.18). v1.21: a\n"
@@ -5294,6 +6012,21 @@ static void usage(const char *argv0) {
 
 #include "warden_node.inc.c"         /* v1.34 step 2: the node agent */
 
+/* v1.29: what a dry run is not given (section 3): a plan (the plan gate
+ * refuses before the agent starts; no command checks a plan without starting
+ * the agent: v1.35), credentials (it would hand the proxy real values for an
+ * agent whose policy is not settled: D2), or sub-agents (their attribution
+ * rests on launches being held). v1.36 step 7: also a flow policy, which
+ * checks a plan, for --oci-filter (the plugin's and the webhook's check).
+ * What it is given with, or NULL. */
+static const char *dry_refusal(const struct policy *p, bool plan, bool flow) {
+    bool subs = false;
+    for (size_t i = 0; i < p->v.n; i++) if (p->v.rules[i].subagent[0]) subs = true;
+    return plan ? "--plan" : flow ? "a flow policy (it checks a plan)" :
+           p->v.ncreds ? "a policy that names credentials" :
+           subs ? "a policy that names sub-agents (subagent=)" : NULL;
+}
+
 int main(int argc, char **argv) {
     /* v1.24: the resolver helper is this program re-executed (a clean address
      * space, without the signing key); see warden_resolve.h. */
@@ -5313,11 +6046,12 @@ int main(int argc, char **argv) {
      * state directory, lock and table, and --gate-status), then exits: 0 if
      * the Warden would start, 1 with the reason otherwise. No agent runs and
      * no verdict stream is written. tools/varek_preflight.sh uses it. */
-    bool oci_only = false;
+    bool oci_only = false, oci_no_plan = false;
     for (int i = 2; i < argc && strcmp(argv[i], "--"); i++)
         if (!strcmp(argv[i], "--check-startup")) g_check_only = true;
         else if (!strcmp(argv[i], "--check-credentials")) g_check_only = g_check_creds = true;   /* v1.28 */
         else if (!strcmp(argv[i], "--oci-filter")) oci_only = true;                             /* v1.34 step 3 */
+        else if (!strcmp(argv[i], "--no-plan")) oci_no_plan = true;                             /* v1.35 step 4c */
     if (argc < (g_check_only || oci_only ? 3 : 4)) { usage(argv[0]); return 2; }
 
     const char *policy_path = argv[1];
@@ -5329,6 +6063,7 @@ int main(int argc, char **argv) {
     const char *proxy_bin_arg = NULL;   /* v1.26.1: the warden-proxy binary */
     const char *secrets_bin_arg = NULL, *secrets_as_arg = NULL, *secrets_conf_arg = NULL;   /* v1.28 */
     const char *obo_arg = NULL, *svid_arg = NULL, *obo_exp_arg = NULL;                  /* v1.28.1 */
+    const char *node_kubelet_arg = NULL;                                                 /* v1.36 step 6 */
     const char *flow_path   = NULL;     /* v1.18.0 */
     const char *session_arg = NULL;     /* v1.18.0 */
     const char *state_arg   = NULL;     /* v1.18.0 */
@@ -5338,12 +6073,20 @@ int main(int argc, char **argv) {
     wr_config_default(&dns_cfg);
     int sep_idx = -1;
     const char *node_sock = NULL, *node_streams = NULL;                     /* v1.34 step 2 */
+    const char *rotate_arg = NULL;                                          /* v1.36 (D9) */
+    const char *node_key_arg = NULL, *node_key_pub_arg = NULL;              /* v1.36 step 9 (D10) */
     const char *node_launcher = NULL;                                       /* v1.34 step 3 */
+    /* v1.36 step 4 (D1, D2): the directory a file: store must be under (the
+     * chart's Secrets); --oci-filter's cluster list of VarekCredential
+     * resources and the pod's namespace */
+    const char *cred_list_arg = NULL, *pod_ns_arg = NULL;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) { sep_idx = i; break; }
         if (strcmp(argv[i], "--check-startup") == 0 || strcmp(argv[i], "--check-credentials") == 0 ||
-            strcmp(argv[i], "--oci-filter") == 0) continue;
+            strcmp(argv[i], "--oci-filter") == 0 || strcmp(argv[i], "--no-plan") == 0) continue;
+        /* v1.36 step 7: --oci-filter --dry-run may end the line */
+        if (strcmp(argv[i], "--dry-run") == 0) { g_dry = true; continue; }                /* v1.29 */
         if (i + 1 >= argc) { usage(argv[0]); return 2; }
         if (strcmp(argv[i], "--plan") == 0 && !plan_path) {
             plan_path = argv[++i];
@@ -5359,14 +6102,48 @@ int main(int argc, char **argv) {
             key_path = argv[++i];
         } else if (strcmp(argv[i], "--anchor") == 0 && !anchor_path) {
             anchor_path = argv[++i];
-        } else if (strcmp(argv[i], "--dry-run") == 0) {                  /* v1.29 */
-            g_dry = true;
+        } else if (strcmp(argv[i], "--hold-to-plan") == 0) {             /* v1.35 step 4 */
+            g_hold_req = true;
         } else if (strcmp(argv[i], "--node-agent") == 0 && !node_sock && i + 1 < argc) {   /* v1.34 step 2 */
             node_sock = argv[++i];
         } else if (strcmp(argv[i], "--node-streams") == 0 && !node_streams && i + 1 < argc) {
             node_streams = argv[++i];
         } else if (strcmp(argv[i], "--node-launcher") == 0 && !node_launcher && i + 1 < argc) {   /* v1.34 step 3 */
             node_launcher = argv[++i];
+        } else if (strcmp(argv[i], "--node-bundle-root") == 0 && i + 1 < argc) {   /* v1.36.3 (D2) */
+            if (g_node_nroots == NODE_MAX_ROOTS || argv[i + 1][0] != '/' || strlen(argv[i + 1]) < 2 ||
+                argv[i + 1][strlen(argv[i + 1]) - 1] == '/') {
+                fprintf(stderr, "[warden] --node-bundle-root: at most %d, each an absolute path not ending in /\n",
+                        NODE_MAX_ROOTS);
+                return 2;
+            }
+            g_node_roots[g_node_nroots++] = argv[++i];
+        } else if (strcmp(argv[i], "--node-credentials") == 0 && !g_node_creds_dir) {   /* v1.36 step 4 */
+            g_node_creds_dir = argv[++i];
+        } else if (strcmp(argv[i], "--node-kubelet") == 0 && !node_kubelet_arg && i + 1 < argc) {   /* v1.36 step 6 */
+            node_kubelet_arg = g_node_kubelet = argv[++i];
+        } else if (strcmp(argv[i], "--node-spire-socket") == 0 && !g_node_spire && i + 1 < argc) {
+            g_node_spire = argv[++i];
+        } else if (strcmp(argv[i], "--node-spire-self") == 0 && !g_node_spire_self && i + 1 < argc) {
+            g_node_spire_self = argv[++i];
+        } else if (strcmp(argv[i], "--node-svid-helper") == 0 && !g_node_svid_bin && i + 1 < argc) {
+            g_node_svid_bin = argv[++i];
+        } else if (strcmp(argv[i], "--node-trust-bundles") == 0 && !g_node_trust_dir) {   /* v1.36 step 7 */
+            g_node_trust_dir = argv[++i];
+        } else if (strcmp(argv[i], "--node-flow-state") == 0 && !g_node_flow_state) {
+            g_node_flow_state = argv[++i];
+        } else if (strcmp(argv[i], "--node-stream-rotate") == 0 && !rotate_arg && i + 1 < argc) {  /* v1.36 (D9) */
+            rotate_arg = argv[++i];
+        } else if (strcmp(argv[i], "--node-key") == 0 && !node_key_arg) {             /* v1.36 step 9 (D10) */
+            node_key_arg = argv[++i];
+        } else if (strcmp(argv[i], "--node-name") == 0 && !g_node_name) {
+            g_node_name = argv[++i];
+        } else if (strcmp(argv[i], "--node-key-pub") == 0 && !node_key_pub_arg) {
+            node_key_pub_arg = argv[++i];
+        } else if (strcmp(argv[i], "--credential-list") == 0 && !cred_list_arg) {
+            cred_list_arg = argv[++i];
+        } else if (strcmp(argv[i], "--pod-namespace") == 0 && !pod_ns_arg) {
+            pod_ns_arg = argv[++i];
         } else if (strcmp(argv[i], "--writable-exec") == 0) {            /* v1.27.1 */
             g_writable_exec = true;
         } else if (strcmp(argv[i], "--run-as") == 0 && !run_as_arg) {
@@ -5431,8 +6208,10 @@ int main(int argc, char **argv) {
 
     /* v1.34 step 3: the filter in OCI's form, for the NRI plugin */
     if (oci_only) {
-        if (sep_idx >= 0 || g_check_only || node_sock || g_dry || plan_path) {
-            fprintf(stderr, "[warden] --oci-filter takes the policy alone\n");
+        if (sep_idx >= 0 || g_check_only || node_sock || g_hold_req || session_arg || state_arg || gstatus_arg ||
+            g_trust_bundle_arg || (plan_path && oci_no_plan)) {
+            fprintf(stderr, "[warden] --oci-filter takes the policy, and the pod's plan (--plan PLAN) or "
+                    "--no-plan; v1.36: and its VarekPolicy's --dry-run and --flow-policy FILE\n");
             return 2;
         }
         static struct policy op;
@@ -5444,24 +6223,154 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[warden] --oci-filter: the node agent does not carry %s yet\n", no);
             return 1;
         }
+        /* v1.35 step 4c (D11): with the pod's plan (--plan), or for a pod
+         * that names none (--no-plan), which a policy that says `require
+         * plan` refuses; the policy alone (a VarekPolicy) is checked as before */
         char why[200];
-        if (wd_oci_filter_write(stdout, op.v.open_as_agent ? WD_FILTER_CHANGES : 0, why, sizeof why) < 0 ||
-            fflush(stdout) != 0) {
-            fprintf(stderr, "[warden] --oci-filter: %s\n", why);
+        if (oci_no_plan && op.v.require_plan) {
+            fprintf(stderr, "[warden] --oci-filter: the policy says `require plan`: a pod under it names its plan "
+                    "(varek.dev/plan)\n");
             return 1;
         }
+        if (plan_path && node_plan_carried(plan_path, why, sizeof why) < 0) {
+            fprintf(stderr, "[warden] --oci-filter: the plan %s: %s\n", plan_path, why);
+            return 1;
+        }
+        /* v1.36 step 7 (D6, D7b): the VarekPolicy's dry run, as a host's
+         * (dry_refusal), and its flow policy, which loads, is certified, has
+         * the budgets the Warden requires, and checks the pod's plan */
+        const char *dno = !g_dry ? NULL : op.v.require_plan ? "a policy that says `require plan` (it needs a plan)"
+                                                            : dry_refusal(&op, plan_path, flow_path);
+        if (dno) {
+            fprintf(stderr, "[warden] --oci-filter: --dry-run with %s is refused\n", dno);
+            return 1;
+        }
+        if (flow_path && flow_load(flow_path) < 0) return 1;
+        if (flow_path && oci_no_plan) {
+            fprintf(stderr, "[warden] --oci-filter: the policy has a flow policy, which checks a plan: a pod under it "
+                    "names its plan (varek.dev/plan)\n");
+            return 1;
+        }
+        /* v1.36 step 4 (D2): a policy that names credentials, for the pod's
+         * namespace, against the cluster's VarekCredential list (the
+         * plugin's copy, or the webhook's from the API server) */
+        if (op.v.ncreds) {
+            char cw[700];
+            if (!cred_list_arg || !pod_ns_arg) {
+                fprintf(stderr, "[warden] --oci-filter: the policy names credentials: give --credential-list FILE "
+                        "--pod-namespace NS (the cluster's VarekCredential resources, the pod's namespace)\n");
+                return 1;
+            }
+            if (node_creds_given(&op, cred_list_arg, pod_ns_arg, false, cw, sizeof cw) < 0) {
+                fprintf(stderr, "[warden] --oci-filter: %s\n", cw);
+                return 1;
+            }
+        }
+        /* the filter, and v1.36: the credentials whose placeholders the plugin
+         * puts in the container's environment ("varekCredentials", beside the
+         * profile's own fields) */
+        char *fb = NULL;
+        size_t fl = 0;
+        FILE *ff = open_memstream(&fb, &fl);
+        if (!ff || wd_oci_filter_write(ff, (op.v.open_as_agent ? WD_FILTER_CHANGES : 0) | (g_dry ? WD_FILTER_DRY : 0),
+                                       why, sizeof why) < 0 ||
+            fclose(ff) != 0) {
+            fprintf(stderr, "[warden] --oci-filter: %s\n", ff ? why : "out of memory");
+            free(fb);
+            return 1;
+        }
+        while (fl && (fb[fl - 1] == '\n' || fb[fl - 1] == ' ')) fl--;
+        if (!fl || fb[fl - 1] != '}') { fprintf(stderr, "[warden] --oci-filter: the filter is not one object\n"); free(fb); return 1; }
+        fwrite(fb, 1, fl - 1, stdout);
+        free(fb);
+        fputs(",\"varekCredentials\":[", stdout);
+        for (size_t k = 0; k < op.v.ncreds; k++) printf("%s\"%s\"", k ? "," : "", op.v.creds[k].name);
+        fputs("]}\n", stdout);
+        if (fflush(stdout) != 0) { fprintf(stderr, "[warden] --oci-filter: cannot write the filter\n"); return 1; }
         return 0;
     }
-    if ((node_sock && (sep_idx >= 0 || g_check_only || !node_streams || g_writable_exec)) ||
-        (node_launcher && !node_sock)) {                                    /* v1.34 step 2 */
-        fprintf(stderr, "[warden] --node-agent takes --node-streams DIR, and no agent (\"--\"), check or "
-                "--writable-exec (a pod's mounts are checked, D4); --node-launcher goes with --node-agent\n");
+    if ((node_sock && (sep_idx >= 0 || g_check_only || !node_streams || g_writable_exec || plan_path ||
+                       flow_path || g_hold_req)) ||
+        (node_launcher && !node_sock) || (g_node_nroots && !node_sock) || (oci_no_plan && !oci_only) ||    /* v1.34 step 2 */
+        (g_node_creds_dir && !node_sock) || ((cred_list_arg || pod_ns_arg) && !oci_only) ||   /* v1.36 step 4 */
+        ((node_kubelet_arg || g_node_spire || g_node_spire_self || g_node_svid_bin) && !node_sock) ||  /* step 6 */
+        ((g_node_spire_self || g_node_svid_bin) && !g_node_spire) ||
+        (node_sock && (obo_arg || svid_arg || obo_exp_arg)) ||     /* step 6: each pod names its own */
+        ((g_node_trust_dir || g_node_flow_state) && !node_sock) ||  /* step 7: so the dry run, trust bundle, */
+        (rotate_arg && !node_sock) ||                               /* step 8 (D9) */
+        ((node_key_arg || g_node_name) && !node_sock) || (node_key_arg && (key_path || !g_node_name)) ||  /* step 9 */
+        (node_key_pub_arg && !node_key_arg) ||
+        (node_sock && (g_dry || g_trust_bundle_arg || session_arg || state_arg || gstatus_arg))) {   /* flow */
+        fprintf(stderr, "[warden] --node-agent takes --node-streams DIR, and no agent (\"--\"), check, plan (each "
+                "pod names its own, v1.35) or --writable-exec (a pod's mounts are checked, D4); --node-launcher "
+                "goes with --node-agent, --no-plan with --oci-filter; v1.36: --node-credentials goes with --node-agent, "
+                "--credential-list and --pod-namespace with --oci-filter; --node-kubelet and --node-spire-socket with "
+                "--node-agent, --node-spire-self and --node-svid-helper with --node-spire-socket; and not "
+                "--on-behalf-of, --agent-svid or --on-behalf-of-expiry (each pod names its user's token, "
+                "varek.dev/on-behalf-of, and its SVID is its own, from SPIRE); --node-trust-bundles and "
+                "--node-flow-state with --node-agent, and not --dry-run, --trust-bundle, --session, "
+                "--breaker-state or --gate-status (each pod's VarekPolicy says them); --node-stream-rotate "
+                "with --node-agent; --node-key and --node-name with --node-agent, --node-key with --node-name and "
+                "not --sign-key (it is the node's signing key), --node-key-pub with --node-key\n");
         return 2;
     }
-    if (node_sock && node_listen(node_sock, node_streams, node_launcher, &policy_path) < 0) return 1;
+    if (rotate_arg) {                       /* v1.36 (D9): a segment's size, 64 KiB or more */
+        char *end = NULL;
+        errno = 0;
+        unsigned long long v = strtoull(rotate_arg, &end, 10);
+        if (errno || end == rotate_arg || *end || rotate_arg[0] == '-' || v < 65536) {
+            fprintf(stderr, "[warden] --node-stream-rotate takes a size in bytes, 65536 or more (leave it out "
+                    "for no rotation)\n");
+            return 2;
+        }
+        g_rotate = v;
+    }
+    if (g_node_name && !node_name_ok(g_node_name)) {                     /* v1.36 step 9 (D10) */
+        fprintf(stderr, "[warden] --node-name takes the node's name as Kubernetes has it (1 to 253 of a-z, 0-9, . "
+                "and -, beginning and ending with a letter or digit)\n");
+        return 2;
+    }
+    if (node_key_arg && node_key_pub_arg && !strcmp(node_key_arg, node_key_pub_arg)) {   /* v1.36 step 11 (review) */
+        fprintf(stderr, "[warden] --node-key-pub names the key's own file: give the public key a file of its own\n");
+        return 2;
+    }
+    if (node_key_arg) {                     /* made, or read, once; each supervisor signs with it */
+        if (node_key_prepare(node_key_arg, node_key_pub_arg, anchor_path) < 0) return 1;
+        key_path = node_key_arg;
+    }
+    if (node_sock && node_listen(node_sock, node_streams, node_launcher, &policy_path, &plan_path, &flow_path) < 0)
+        return 1;
     /* from here, under the node agent, the supervisor of one container */
+    if (g_nr.on) node_inputs(flow_path, &session_arg, &state_arg);          /* v1.36 step 7 */
     if (!g_check_only && !g_nr.on && (sep_idx < 0 || sep_idx + 1 >= argc)) { usage(argv[0]); return 2; }
+    /* v1.35 step 4: the hold needs a plan to hold to; its path and hash are
+     * read now, for run_start and every outside_plan record */
+    if (g_hold_req) {
+        if (!plan_path) {
+            fprintf(stderr, "[warden] --hold-to-plan holds a run to its plan; give --plan too\n");
+            return 2;
+        }
+        if (plan_snapshot(plan_path) < 0) {          /* step 9 (review): the gate parses these bytes */
+            fprintf(stderr, "[warden] cannot read the plan %s (%s)\n", plan_path, strerror(errno));
+            return 1;
+        }
+        memcpy(g_hold_plan_sha, g_plan_snap_sha, sizeof g_hold_plan_sha);
+        char *jb = NULL;
+        size_t jn = 0;
+        FILE *jf = open_memstream(&jb, &jn);
+        if (!jf) return 1;
+        json_escape(jf, plan_path);
+        fclose(jf);
+        if (!jb || strlen(jb) >= sizeof g_hold_plan_json) {   /* step 9 (review): never cut inside an escape */
+            fprintf(stderr, "[warden] the plan's path is too long to record in each refusal; give a shorter one\n");
+            free(jb);
+            return 2;
+        }
+        snprintf(g_hold_plan_json, sizeof g_hold_plan_json, "%s", jb);
+        free(jb);
+    }
     if (flow_path && !plan_path && !g_check_only) {
+        if (g_nr.on) node_fail("its policy has a flow policy, which checks a plan, and its pod names no plan (varek.dev/plan)");
         fprintf(stderr, "[warden] --flow-policy checks a plan; give --plan too\n");
         return 2;
     }
@@ -5514,17 +6423,17 @@ int main(int argc, char **argv) {
     /* ~2 MB (512 rules x 4 KB constants): static, not on the stack. */
     static struct policy p;
     if (policy_load(policy_path, &p) < 0) return 1;
-    /* v1.29: a dry run (section 3), on the command line only (D3). Not with
-     * a plan (the plan gate refuses before the agent starts; no command
-     * checks a plan without starting the agent: v1.35), with credentials (it would hand the
-     * proxy real values for an agent whose policy is not settled: D2), or
-     * with sub-agents (their attribution rests on launches being held). */
+    /* v1.29: a dry run (section 3), on the command line only (D3); not with
+     * a plan, credentials or sub-agents (dry_refusal). v1.36 step 7 (D6):
+     * under the node agent, the pod's VarekPolicy's, refused the same */
     if (g_dry) {
-        bool subs = false;
-        for (size_t i = 0; i < p.v.n; i++) if (p.v.rules[i].subagent[0]) subs = true;
-        const char *no = plan_path ? "--plan" : p.v.ncreds ? "a policy that names credentials"
-                       : subs ? "a policy that names sub-agents (subagent=)" : NULL;
+        const char *no = dry_refusal(&p, plan_path, false);
         if (no) {
+            if (g_nr.on) {
+                char why[160];
+                snprintf(why, sizeof why, "a dry run with %s is refused (as on a host)", no);
+                node_fail(why);
+            }
             fprintf(stderr, "[warden] --dry-run with %s is refused\n", no);
             return 2;
         }
@@ -5563,11 +6472,26 @@ int main(int argc, char **argv) {
         node_fail("the policy names hosts, and the pod's /etc/resolv.conf names no IPv4 nameserver to resolve "
                   "them through (give the node agent --dns-server)");
     if (g_nr.on) {                                                         /* v1.34 step 2 */
-        const char *no = node_unsupported(&p, g_dry, plan_path, flow_path, obo_arg, svid_arg, g_trust_bundle_arg);
+        const char *no = node_unsupported(&p, obo_arg, svid_arg);
         if (no) {
             char why[256];
             snprintf(why, sizeof why, "%s is not carried under the node agent yet", no);
             node_fail(why);
+        }
+        node_obo(&p, &obo_arg, &svid_arg);                                 /* v1.36 step 6 (D5) */
+    }
+    /* v1.35 step 4 (D7): a policy that says `require plan` runs an agent only
+     * with a plan it is held to */
+    if (p.v.require_plan && g_nr.on && !plan_path)                       /* v1.35 step 4c (D11) */
+        node_fail("its policy says `require plan`, and its pod names no plan (varek.dev/plan)");
+    if (p.v.require_plan && !g_nr.on && (!plan_path || !g_hold_req)) {
+        if (g_check_only) {
+            fprintf(stderr, "[warden] note: the policy says `require plan`: a run needs a plan it is held to "
+                    "(--plan PLAN --hold-to-plan)\n");
+        } else {
+            fprintf(stderr, "[warden] the policy says `require plan`: a run needs a plan it is held to "
+                    "(--plan PLAN --hold-to-plan); refusing to start\n");
+            return 1;
         }
     }
     if (wildcards_check(policy_path, &p, psl_arg, shared_arg) < 0) return 1;            /* v1.25 */
@@ -5624,7 +6548,7 @@ int main(int argc, char **argv) {
     if (p.v.proxy && geteuid() == 0) {
         if (wp_start(&g_proxy, proxy_fd, pxa.uid, pxa.gid) < 0) {
             fprintf(stderr, "[warden] cannot start the egress proxy (%s); refusing to start\n",
-                    strerror(errno));
+                    g_proxy.why[0] ? g_proxy.why : strerror(errno));
             if (g_sk) sodium_free(g_sk);
             return 1;
         }
@@ -5673,6 +6597,13 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (access(b, F_OK) == 0 && refuse_secret_reachable(&p, b, true) < 0) return 1;
+    }
+    /* v1.36 step 4 (D1, D2): under the node agent, each credential given to
+     * the pod's namespace, a file: store under the chart's directory, and the
+     * placeholders the NRI plugin set, before warden-secrets starts */
+    if (g_nr.on && p.v.ncreds) {
+        char why[800];
+        if (node_creds_check(&p, g_cred_ph, why, sizeof why) < 0) node_fail(why);
     }
     if (p.v.ncreds || obo_arg || svid_arg) {
         static const char *const kStore[] = { "", "file", "vault", "aws-sm" };
@@ -5729,9 +6660,16 @@ int main(int argc, char **argv) {
                 return 1;
             }
             fprintf(stderr, "[warden] credentials' helper %s, SHA-256 %s\n", sb, g_secrets_sha);
-            if (ws_start(&g_secrets, sfd, sca.uid, sca.gid) < 0) {
+            /* v1.36 step 4 (D1): under the node agent, in the node agent's own
+             * network namespace (the stores reached from the node, as the
+             * DaemonSet); the supervisor then returns to the pod's */
+            if (g_nr.on && setns(g_nr.node_netns, CLONE_NEWNET) < 0) node_fail("cannot return to the node's network namespace");
+            int wsr = ws_start(&g_secrets, sfd, sca.uid, sca.gid), wse = errno;
+            if (g_nr.on && node_enter(CLONE_NEWNET) < 0) node_fail("cannot enter the container's network namespace again");
+            if (g_nr.on) { close(g_nr.node_netns); g_nr.node_netns = -1; }
+            if (wsr < 0) {
                 close(sfd);
-                fprintf(stderr, "[warden] cannot start warden-secrets (%s); refusing to start\n", strerror(errno));
+                fprintf(stderr, "[warden] cannot start warden-secrets (%s); refusing to start\n", strerror(wse));
                 return 1;
             }
             close(sfd);
@@ -5770,6 +6708,10 @@ int main(int argc, char **argv) {
             /* every local file the helper read, whatever came of it: the
              * agent must not be able to open one (v1.28.1: a trust bundle,
              * to write one) */
+            /* v1.36 step 4: under the node agent these are the node agent's
+             * own files (its pod's mounts, root's, readable by no other user),
+             * which a container (never root, no capability) does not reach;
+             * a policy that names one by its path is refused all the same */
             for (size_t k = 0; k < nfiles; k++) {
                 char real[PATH_MAX];
                 const char *f = realpath(files[k], real) ? real : files[k];
@@ -5820,6 +6762,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "[warden]   actor %u: %s%s%s\n", k + 1, id->act[k].sub,
                             id->act[k].iss[0] ? ", issuer " : "", id->act[k].iss);
             }
+            if (g_nr.on) node_obo_forget();                                /* v1.36 step 6: read, verified */
             if (g_identity.has_svid)
                 fprintf(stderr, "[warden] agent %s: SVID verified against the bundle for %s (line %d), SHA-256 %s\n",
                         g_identity.spiffe_id, p.v.spiffe[g_identity.spiffe].domain, p.v.spiffe[g_identity.spiffe].line,
@@ -5868,6 +6811,13 @@ int main(int argc, char **argv) {
                 for (size_t k = 0; k < p.v.ncreds; k++) {
                     unsigned char rnd[32], dg[32];
                     char b64[64], env[48];
+                    if (g_nr.on) {
+                        /* v1.36 step 4: the NRI plugin's, in the container's
+                         * environment already (node_creds_check) */
+                        crypto_hash_sha256(dg, (const unsigned char *)g_cred_ph[k], strlen(g_cred_ph[k]));
+                        sodium_bin2hex(g_cred_ph_sha[k], sizeof g_cred_ph_sha[k], dg, sizeof dg);
+                        continue;
+                    }
                     randombytes_buf(rnd, sizeof rnd);
                     sodium_bin2base64(b64, sizeof b64, rnd, sizeof rnd, sodium_base64_VARIANT_URLSAFE_NO_PADDING);
                     snprintf(g_cred_ph[k], sizeof g_cred_ph[k], "varek_ph_%s_%s", p.v.creds[k].name, b64);
@@ -5964,9 +6914,24 @@ int main(int argc, char **argv) {
             names_resolve_all(false);
             wr_async_stop(&g_names);
         }
-        fprintf(stderr, "[warden] startup checks passed: the policy%s%s%s%s would be accepted%s\n",
+        /* v1.35 step 2 (D9): a plan is decided as the run would decide it
+         * (after the launch set is built), with each step's reason, and no
+         * record written: `varek policy check --plan`. The flow policy and
+         * the breaker are not stepped by a check. */
+        if (plan_path) {
+            if (!g_log) g_log = stderr;             /* the decider's reasons, with no stream */
+            if (flow_path)
+                fprintf(stderr, "[warden] the plan's steps are decided (the node check); a check does not "
+                        "step the flow policy or the breaker\n");
+            if (warden_verify_plan(plan_path, &p, false) != 0) {
+                if (g_sk) sodium_free(g_sk);
+                return 1;
+            }
+        }
+        fprintf(stderr, "[warden] startup checks passed: the policy%s%s%s%s%s would be accepted%s\n",
                 key_path ? ", the signing key" : "", anchor_path ? ", the anchor" : "",
                 flow_path ? ", the flow policy, the breaker state" : "",
+                plan_path ? ", the plan" : "",
                 gstatus_arg ? ", --gate-status" : "",
                 pidns && !have_cap_sys_admin() ? " (but this user lacks CAP_SYS_ADMIN, which "
                 "a run needs)" : "");
@@ -6028,9 +6993,13 @@ int main(int argc, char **argv) {
         if (!g_nr.on) names_resolve_all(true);
     }
 
-    /* v1.6 pre-execution plan verification. Fires before fork; on
+    /* v1.6 plan-level verification. Fires before fork; on
      * any non-SATISFIED result the target is not started. */
-    if (plan_path && g_flow_cfg) {
+    g_hold_collect = g_hold_req && !g_nr.on;      /* v1.35 step 4: each step that passes */
+    if (g_nr.on) {
+        /* v1.35 step 4c: the pod's plan is decided in node_supervise, in the
+         * container's view, after run_start */
+    } else if (plan_path && g_flow_cfg) {
         /* v1.18.0: node + flow check, refusal breaker (exit 3, 4 or 5). */
         int gate = warden_gate_plan_flow(plan_path, &p);
         if (gate != GATE_PASS) {
@@ -6038,10 +7007,16 @@ int main(int argc, char **argv) {
             if (g_sk) sodium_free(g_sk);
             return gate;
         }
-    } else if (plan_path && warden_verify_plan(plan_path, &p) != 0) {
+    } else if (plan_path && warden_verify_plan(plan_path, &p, true) != 0) {
         emit_run_end(1);                    /* v1.16: a closed (and signed) stream */
         if (g_sk) sodium_free(g_sk);
         return 1;
+    }
+    if (g_hold_req && !g_nr.on) {                                          /* v1.35 step 4 */
+        g_hold_collect = false;
+        g_hold_on = true;
+        fprintf(stderr, "[warden] the run is held to its plan: %zu entries; a call the policy allows "
+                "outside them is refused (outside_plan)\n", g_nhold);
     }
 
     struct sigaction sa = { .sa_handler = on_term };
@@ -6051,7 +7026,13 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGCHLD, &sa, NULL);
 
-    if (g_nr.on) return node_supervise(&p, boot_path, policy_path);         /* v1.34 step 2 */
+    if (g_nr.on) {                                                         /* v1.34 step 2 */
+        /* v1.35 step 4c: the pod's plan read here, in the node's view (its
+         * copy beside the stream), decided in the container's */
+        static char perr[256];
+        plan_parsed_t *pp = plan_path ? plan_load_snapshot(plan_path, perr, sizeof perr) : NULL;
+        return node_supervise(&p, boot_path, policy_path, plan_path, pp, perr);
+    }
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {

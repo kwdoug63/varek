@@ -1,0 +1,19 @@
+{
+  "targets": {
+    "default": {
+      "resources": {
+        "runtimes": { "weather_agent": { "runtimeId": "weather_agent-AbCdEf1234", "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/weather_agent-AbCdEf1234", "roleArn": "arn:aws:iam::111122223333:role/WeatherDeskRuntime" } },
+        "mcp": {
+          "gateways": {
+            "weather-tools": {
+              "gatewayId": "weather-tools-q1w2e3r4t5",
+              "gatewayArn": "arn:aws:bedrock-agentcore:us-east-1:111122223333:gateway/weather-tools-q1w2e3r4t5",
+              "gatewayUrl": "https://weather-tools-q1w2e3r4t5.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp",
+              "targets": { "forecast": { "targetId": "T0FORECAST" } }
+            }
+          }
+        }
+      }
+    }
+  }
+}

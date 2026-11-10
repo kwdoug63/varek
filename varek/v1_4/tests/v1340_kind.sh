@@ -6,10 +6,11 @@
 # cluster (containerd 2.2 or later, NRI on) with the node image, and checked
 # as a cluster runs it:
 #   1. the chart installs and its node agent, plugin, exporter and webhook
-#      are ready; the node's signing key and anchor given;
+#      are ready; the anchor given; the node agent makes the node's key and
+#      the plugin publishes it as the node's VarekNodeKey (v1.36 step 9);
 #   2. the webhook (a real API server's calls): a VarekPolicy the Warden
-#      does not load, and one with what the node agent does not carry
-#      (credentials), refused at deploy with the Warden's reason; a policy
+#      does not load, and one naming a credential no VarekCredential gives,
+#      refused at deploy with the Warden's reason; a policy
 #      that loads accepted, and written to the node by the plugin's -sync;
 #      pods refused for a policy not in their namespace, a command by a
 #      relative path, a writable root under a policy that decides launches,
@@ -23,40 +24,97 @@
 #      one it does not, a copy written to its volume (noexec) and launched;
 #      a pod naming no policy left as it is;
 #   4. the evidence: the pod's stream on the node, signed with the node's
-#      key and anchored, verified by the audit; the exporter's OCSF events
+#      key and anchored, verified by the audit (with the cluster's
+#      VarekNodeKey list, --node-keys); the exporter's OCSF events
 #      in its log;
 #   5. the policy changed: written to the node again, and a new pod run
 #      under the new one; the policy deleted: removed from the node;
 #   6. the node agent's pods taken off the node: a pod naming the policy
 #      does not run (its unsupervised profile kept); they come back, and a
-#      new pod is supervised.
+#      new pod is supervised;
+#   7. credentials (v1.36 step 4, docs/security/v1.36-kubernetes-parity.md,
+#      D1, D2): a VarekCredential whose file: source is not under the
+#      chart's directory refused; one giving a Secret's key to team-a,
+#      written to the node by the plugin's -sync; a policy naming it refused
+#      in a namespace it is not given to; a pod naming it runs with the
+#      plugin's placeholder, never the value, which warden-secrets fetched
+#      on the node (run_start);
+#   8. sub-agents and confined MCP servers (v1.36 step 5, D3, D4): a pod whose
+#      policy names a sub-agent and a confined MCP server, each launched by
+#      its shell: each in a group the node agent made below the container's
+#      own (as each reads its /proc/self/cgroup), the server held to its own
+#      rules, each launch settled, and the audit verifies the stream;
+#   9. a pod acting for a user (v1.36 step 6, D5): the user's token a
+#      service account token of the cluster's own issuer (its discovery
+#      opened to the unauthenticated, as for federation), in a Secret the
+#      pod names (varek.dev/on-behalf-of); a pod naming none under a policy
+#      that says `require on-behalf-of` refused; the webhook gives the pod
+#      its token's volume and init container, and refuses an agent mounting
+#      it; the node agent reads the kubelet's copy, warden-secrets verifies
+#      it (run_start names the user), the agent cannot read it, and the
+#      audit verifies the stream. (No SPIRE here: the SVID is test_v1340's
+#      section 12 and varek-svid's own test.)
+#  10. the dry run, a flow policy and a trust bundle (v1.36 step 7, D6, D7,
+#      D7b), each a VarekPolicy's field: a dry run with credentials refused
+#      at deploy; a pod's dry run lets through a read and launches the
+#      policy refuses and a launch from its volume (no mount noexec), and
+#      refuses a connect to the API server all the same (dry_run_refused),
+#      the audit verifying it as a dry run; a flow policy written to the
+#      node, a pod under it naming no plan refused at deploy, a plan it
+#      passes run (the session the pod's namespace and service account,
+#      from the API server), one it refuses ended and counted in the node's
+#      table; a pod's trust bundle, the chart's ConfigMap's key, the roots
+#      run_start records.
+#  11. a key for each node (v1.36 step 9, D10): the node's key root's and
+#      0400 on the node, its public key the VarekNodeKey's; a VarekNodeKey
+#      made by an administrator, or by the node agent's account with a
+#      token naming no node, refused; the key changed, or removed by the
+#      node agent's account, refused; the node rebuilt (its key gone): a
+#      new key made and published, the old VarekNodeKey kept; a pod's
+#      stream after it verified with the new key, and section 4's, signed
+#      before, still verified with the old one.
 #
 #   varek/v1_4/tests/v1340_kind.sh --image IMAGE [--out DIR] [--keep]
 #                                  [--node-image kindest/node:TAG]
+#   varek/v1_4/tests/v1340_kind.sh --host --image IMAGE --archive FILE [--out DIR]
 #
 # IMAGE is the node image (packaging/container/Containerfile --target node),
 # built where this runs. Needs docker, kind, kubectl, helm, python3 and this
-# checkout's tools/varek_keygen and tools/vdp_cert_check (make all). The
+# checkout's tools/vdp_cert_check (make all). The
 # summary is DIR/summary.txt (default /var/tmp/varek-kind); everything else
 # is beside it. CI: .github/workflows/kubernetes.yml.
+#
+# --host (v1.36 step 2, the matrix): the same checks on a one-node cluster
+# already running on this host (tests/node_cluster.sh, kubeadm under CRI-O
+# or containerd), its kubeconfig in KUBECONFIG or ~/.kube/config. IMAGE is
+# loaded into the node's runtime from FILE (`docker save IMAGE`, made before
+# the cluster: node_cluster.sh stops the runner's Docker), fully named
+# (docker.io/library/... when it has no registry), and the node's files are
+# read with sudo. Needs no kind or docker; skopeo or podman for CRI-O, ctr
+# for containerd. CI: .github/workflows/matrix.yml.
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-OUT=/var/tmp/varek-kind KEEP=0 IMAGE="" NODE_IMG=kindest/node:v1.37.0
+OUT=/var/tmp/varek-kind KEEP=0 IMAGE="" NODE_IMG=kindest/node:v1.37.0 HOST=0 ARCHIVE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --image) IMAGE="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         --keep) KEEP=1; shift ;;
         --node-image) NODE_IMG="$2"; shift 2 ;;
+        --host) HOST=1; shift ;;
+        --archive) ARCHIVE="$2"; shift 2 ;;
         *) echo "v1340_kind.sh: unknown option $1" >&2; exit 2 ;;
     esac
 done
-[ -n "$IMAGE" ] || { echo "usage: v1340_kind.sh --image IMAGE [--out DIR] [--keep] [--node-image IMG]" >&2; exit 2; }
-for t in docker kind kubectl helm python3; do
+[ -n "$IMAGE" ] || { echo "usage: v1340_kind.sh [--host] --image IMAGE [--out DIR] [--keep] [--node-image IMG]" >&2; exit 2; }
+TOOLS="docker kind kubectl helm python3"
+[ "$HOST" = 1 ] && TOOLS="kubectl helm python3 sudo crictl"
+[ "$HOST" = 0 ] || [ -s "$ARCHIVE" ] || { echo "v1340_kind.sh: --host needs --archive FILE (docker save IMAGE)" >&2; exit 2; }
+for t in $TOOLS; do
     command -v "$t" > /dev/null || { echo "v1340_kind.sh: $t is needed" >&2; exit 2; }
 done
-[ -x "$HERE/tools/varek_keygen" ] && [ -x "$HERE/tools/vdp_cert_check" ] ||
+[ -x "$HERE/tools/vdp_cert_check" ] ||
     { echo "v1340_kind.sh: build the tools first (make -C varek/v1_4 all)" >&2; exit 2; }
 POD_IMG=mirror.gcr.io/library/busybox:1.36
 CL=varek-ci N=varek-ci-control-plane NS=varek-system
@@ -66,7 +124,9 @@ say() { echo "$*" | tee -a "$SUM"; }
 pass() { say "  PASS   $1"; }
 flunk() { say "  FAIL   $1"; fail=1; }
 check() { local d="$1"; shift; if "$@" > /dev/null 2>&1; then pass "$d"; else flunk "$d"; fi; }
-on_node() { docker exec "$N" "$@"; }
+# A command on the node: in kind's node container, or on this host as root
+if [ "$HOST" = 1 ]; then NODE_EXEC="sudo"; else NODE_EXEC="docker exec $N"; fi
+on_node() { $NODE_EXEC "$@"; }
 node_logs() {   # SUFFIX: the node agent's and the plugin's logs, as OUT/{node-agent,plugin}SUFFIX.log
     kubectl -n "$NS" logs ds/varek-node -c node-agent > "$OUT/node-agent$1.log" 2>&1
     kubectl -n "$NS" logs ds/varek-node -c plugin > "$OUT/plugin$1.log" 2>&1
@@ -79,33 +139,152 @@ cleanup() {
         for l in "$OUT"/node-agent*.log "$OUT"/plugin*.log; do
             [ -s "$l" ] && { echo "== ${l##*/}, its end"; tail -40 "$l"; }
         done
+        # the first supervised pod, its streams and what the node saw (the
+        # matrix's first CRI-O cells: every supervised pod killed at its start)
+        for l in "$OUT/pod-a.log" "$OUT/pod-a.describe"; do
+            [ -s "$l" ] && { echo "== ${l##*/}, its end"; tail -30 "$l"; }
+        done
+        rm -rf "$OUT/streams-end"; mkdir -p "$OUT/streams-end"
+        if [ "$HOST" = 1 ]; then
+            sudo sh -c 'cp -a /var/log/varek/. "$1"/' sh "$OUT/streams-end" 2>/dev/null
+            sudo chown -R "$(id -u):$(id -g)" "$OUT/streams-end" 2>/dev/null
+        else
+            docker cp "$N:/var/log/varek/." "$OUT/streams-end" > /dev/null 2>&1
+        fi
+        for l in "$OUT"/streams-end/*.jsonl; do
+            [ -s "$l" ] && { echo "== stream ${l##*/}, its end"; tail -12 "$l" | cut -c1-400; }
+        done
+        # v1.36 step 4: what the runtime confines the node agent with (its
+        # LSM label, its seccomp mode), as each runtime gives a privileged pod
+        echo "== the node agent's confinement"
+        kubectl -n "$NS" exec ds/varek-node -c node-agent -- sh -c \
+            'echo "label: $(cat /proc/self/attr/current 2>&1)"; grep -E "^(Seccomp|NoNewPrivs|CapEff):" /proc/self/status' 2>&1 | head -6
+        echo "== the node's kernel: seccomp, AppArmor and kills"
+        on_node dmesg 2>/dev/null | grep -iE 'seccomp|type=1326|killed|segfault|apparmor=.DENIED' | tail -20
+        if [ "$HOST" = 1 ]; then
+            echo "== the runtime's journal: errors and warnings"
+            sudo journalctl -u crio -u containerd --since "-15 min" --no-pager 2>/dev/null |
+                grep -iE 'level=(error|warn)|seccomp|notif|nri' | tail -40 | cut -c1-400
+        fi
     fi
-    [ "$KEEP" = 1 ] || kind delete cluster --name "$CL" > /dev/null 2>&1
+    [ "$KEEP" = 1 ] || [ "$HOST" = 1 ] || kind delete cluster --name "$CL" > /dev/null 2>&1
 }
 trap cleanup EXIT
-say "v1340_kind.sh $(TZ=America/Chicago date '+%Y-%m-%d %H:%M %Z'); $(uname -sr); kind $(kind version | cut -d' ' -f2); $NODE_IMG; image $IMAGE; commit $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
-
 echo "== 1. the cluster and the chart"
-kind delete cluster --name "$CL" > /dev/null 2>&1
-kind create cluster --name "$CL" --image "$NODE_IMG" --wait 300s > "$OUT/kind.log" 2>&1 ||
-    { tail -20 "$OUT/kind.log"; echo "v1340_kind.sh: the cluster did not start" >&2; exit 1; }
-say "  node: $(on_node sh -c 'containerd --version | cut -d" " -f3; runc --version | head -1' | tr '\n' ' ')$(on_node uname -r)"
-kind load docker-image "$IMAGE" --name "$CL" > "$OUT/load.log" 2>&1 || { cat "$OUT/load.log"; exit 1; }
-"$HERE/tools/varek_keygen" "$OUT/node.key" > /dev/null
+if [ "$HOST" = 1 ]; then
+    say "v1340_kind.sh --host $(TZ=America/Chicago date '+%Y-%m-%d %H:%M %Z'); $(uname -srm); image $IMAGE; commit $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
+    # the API server can still be settling just after the cluster's own checks
+    for _ in $(seq 15); do kubectl get node > "$OUT/kubectl.log" 2>&1 && break; sleep 2; done
+    kubectl get node > "$OUT/kubectl.log" 2>&1 || { cat "$OUT/kubectl.log"; ls -l "${KUBECONFIG:-$HOME/.kube/config}";
+        echo "v1340_kind.sh: no cluster here (KUBECONFIG=${KUBECONFIG:-unset})" >&2; exit 1; }
+    RT="$(kubectl get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}')"
+    say "  node: $RT, kubelet $(kubectl get node -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}'), $(uname -r)"
+    # The image, fully named: CRI-O does not resolve a short name in its own
+    # storage unless it is told a registry to search
+    first="${IMAGE%%/*}"
+    case "$IMAGE" in
+        */*) case "$first" in *.*|*:*|localhost) QUAL="$IMAGE" ;; *) QUAL="docker.io/$IMAGE" ;; esac ;;
+        *) QUAL="docker.io/library/$IMAGE" ;;
+    esac
+    # (the log is this user's file: only the command runs as root)
+    # shellcheck disable=SC2024
+    case "$RT" in
+        cri-o://*)
+            if command -v skopeo > /dev/null; then
+                sudo skopeo copy "docker-archive:$ARCHIVE" "containers-storage:$QUAL" > "$OUT/load.log" 2>&1
+            else
+                sudo podman load -i "$ARCHIVE" > "$OUT/load.log" 2>&1 && sudo podman tag "$IMAGE" "$QUAL" >> "$OUT/load.log" 2>&1
+            fi ;;
+        containerd://*)
+            sudo ctr -n k8s.io images import "$ARCHIVE" > "$OUT/load.log" 2>&1 ;;
+        *) echo "v1340_kind.sh: the runtime $RT" >&2; exit 1 ;;
+    esac || { cat "$OUT/load.log"; echo "v1340_kind.sh: the image did not load into $RT" >&2; exit 1; }
+    # containerd's CRI plugin learns of an image `ctr images import` added
+    # from containerd's event, after the import returns: crictl can miss it
+    # for a moment (PR #117's containerd 2.3.7 cell). Up to 30 s for it.
+    for _ in $(seq 30); do sudo crictl inspecti "$QUAL" > /dev/null 2>&1 && break; sleep 1; done
+    sudo crictl inspecti "$QUAL" > /dev/null 2>&1 || { cat "$OUT/load.log"; echo "v1340_kind.sh: $QUAL is not in the node's runtime" >&2; exit 1; }
+    IMAGE="$QUAL"
+else
+    say "v1340_kind.sh $(TZ=America/Chicago date '+%Y-%m-%d %H:%M %Z'); $(uname -sr); kind $(kind version | cut -d' ' -f2); $NODE_IMG; image $IMAGE; commit $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
+    kind delete cluster --name "$CL" > /dev/null 2>&1
+    kind create cluster --name "$CL" --image "$NODE_IMG" --wait 300s > "$OUT/kind.log" 2>&1 ||
+        { tail -20 "$OUT/kind.log"; echo "v1340_kind.sh: the cluster did not start" >&2; exit 1; }
+    say "  node: $(on_node sh -c 'containerd --version | cut -d" " -f3; runc --version | head -1' | tr '\n' ' ')$(on_node uname -r)"
+    kind load docker-image "$IMAGE" --name "$CL" > "$OUT/load.log" 2>&1 || { cat "$OUT/load.log"; exit 1; }
+fi
 kubectl create namespace "$NS" > /dev/null
 kubectl label namespace "$NS" pod-security.kubernetes.io/enforce=privileged > /dev/null
-kubectl -n "$NS" create secret generic varek-node-key --from-file=key="$OUT/node.key" \
-    --from-file=key.pub="$OUT/node.key.pub" > /dev/null
+# section 7's credential: a value made here, in a Secret the chart mounts in
+# the node agent (credentials.secrets)
+CRED_VAL="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+kubectl -n "$NS" create secret generic varek-test-cred --from-literal=token="$CRED_VAL" > /dev/null
+# the chart's runtime (its default containerd): the node agent reads each
+# container's bundle from the runtime's state, mounted from the node (the
+# matrix's first CRI-O cells installed the default, mounted /run/containerd,
+# and every supervised container was refused: no config.json in its bundle)
+CHART_RT=containerd
+[ "$HOST" = 1 ] && case "$RT" in cri-o://*) CHART_RT=cri-o ;; esac
+# section 10's trust bundle: the cluster's CA, as a key of a ConfigMap the
+# chart mounts in the node agent (trustBundles.configMap)
+kubectl -n default get configmap kube-root-ca.crt -o jsonpath='{.data.ca\.crt}' > "$OUT/roots.pem"
+kubectl -n "$NS" create configmap varek-test-roots --from-file=corp.pem="$OUT/roots.pem" > /dev/null
 REPO="${IMAGE%:*}" TAG="${IMAGE##*:}"
 [ "$REPO" = "$IMAGE" ] && TAG=latest
+# the CRDs first: a chart of their own (Red Hat's chart certification), which
+# the varek chart refuses to install without; its helm test (in the node
+# image) checks that the API server serves the four kinds
+check "the CRDs install (the varek-crds chart)" \
+    helm install varek-crds "$ROOT/packaging/helm/varek-crds" -n "$NS" --wait --timeout 2m \
+    --set image.repository="$REPO" --set image.tag="$TAG" --set image.pullPolicy=Never
+if helm test varek-crds -n "$NS" --timeout 3m --logs > "$OUT/helm-test-crds.log" 2>&1; then
+    pass "helm test varek-crds: the API server serves the four kinds"
+else
+    flunk "helm test varek-crds: the API server serves the four kinds"
+    kubectl -n "$NS" logs varek-crds-test-served 2>&1 | sed 's/^/     test pod: /' | tail -20
+    awk '/^NOTES:/ { skip = 1 } /^POD LOGS|^Error/ { skip = 0 } !skip' "$OUT/helm-test-crds.log" \
+        | sed 's/^/     helm test: /' | tail -20
+fi
 check "the chart installs, its pods ready (the node agent, the plugin, the exporter, the webhook)" \
     helm install varek "$ROOT/packaging/helm/varek" -n "$NS" --wait --timeout 6m \
     --set image.repository="$REPO" --set image.tag="$TAG" --set image.pullPolicy=Never \
-    --set signing.secretName=varek-node-key --set signing.checkpointEvery=8 --set anchor.enabled=true \
-    --set admission.replicas=1
+    --set signing.checkpointEvery=8 --set anchor.enabled=true \
+    --set admission.replicas=1 --set runtime="$CHART_RT" --set 'credentials.secrets={varek-test-cred}' \
+    --set onBehalfOf.issuerCaConfigMap=kube-root-ca.crt --set trustBundles.configMap=varek-test-roots
 for _ in $(seq 60); do grep -q '^varek-nri: runtime' <(kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null) && break; sleep 2; done
 say "  plugin: $(kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null | grep -m1 '^varek-nri: runtime' || echo 'NOT registered')"
 check "the plugin registered with the node's runtime (NRI)" sh -c "kubectl -n '$NS' logs ds/varek-node -c plugin | grep -q '^varek-nri: runtime'"
+# the chart's own test (Red Hat's chart certification runs it): the webhook
+# answers, its certificate verified with the chart's CA. Its output and the
+# test pod's log kept (OUT/helm-test.log), and shown when it fails
+if helm test varek -n "$NS" --timeout 3m --logs > "$OUT/helm-test.log" 2>&1; then
+    pass "helm test: the webhook answers, its certificate verified"
+else
+    flunk "helm test: the webhook answers, its certificate verified"
+    # the test pod is kept (before-hook-creation): its own log first, then
+    # its state, then helm's words without the chart's notes
+    kubectl -n "$NS" logs varek-test-webhook > "$OUT/helm-test-pod.log" 2>&1
+    kubectl -n "$NS" describe pod varek-test-webhook > "$OUT/helm-test-pod.describe" 2>&1
+    sed 's/^/     test pod: /' "$OUT/helm-test-pod.log" | tail -40
+    grep -A4 '^    State:' "$OUT/helm-test-pod.describe" | sed 's/^/     test pod: /'
+    awk '/^NOTES:/ { skip = 1 } /^POD LOGS|^Error/ { skip = 0 } !skip' "$OUT/helm-test.log" \
+        | sed 's/^/     helm test: /' | tail -20
+fi
+# v1.36 step 9 (D10): the node's own key, published as its VarekNodeKey; the
+# cluster's list, as an auditor fetches it, for every audit here
+NODE="$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')"
+keys_of() {   # FILE: the cluster's VarekNodeKey list into FILE; how many it holds for the node
+    kubectl get vareknodekeys -o json > "$1" 2>/dev/null
+    python3 -c 'import json,sys; print(sum(1 for i in json.load(open(sys.argv[1]))["items"] if i["spec"]["node"] == sys.argv[2]))' "$1" "$NODE" 2>/dev/null
+}
+for _ in $(seq 60); do [ "$(keys_of "$OUT/node-keys.json")" = 1 ] && break; sleep 2; done
+NKPUB="$(on_node cat /var/lib/varek/key-pub/node.key.pub 2>/dev/null)"
+say "  node key: $NODE $NKPUB"
+check "the node agent made the node's key, and the plugin published it: the node's VarekNodeKey, its key the node's" \
+    python3 -c 'import json,sys
+items = [i for i in json.load(open(sys.argv[1]))["items"] if i["spec"]["node"] == sys.argv[2]]
+sys.exit(0 if len(items) == 1 and items[0]["spec"]["publicKey"] == sys.argv[3] and len(sys.argv[3]) == 64 and
+         items[0]["metadata"]["name"] == sys.argv[2] + "-" + sys.argv[3][:16] else 1)' "$OUT/node-keys.json" "$NODE" "$NKPUB"
 
 # the policy: v1340_crio.sh's, for busybox (its commands hardlinks of one
 # file, each named; each check launches its program)
@@ -149,6 +328,14 @@ if edit == "relative":
     c["command"] = ["sh", "-c", check]
 if edit == "writable":
     c["securityContext"]["readOnlyRootFilesystem"] = False
+# section 9: acting for a user (and the agent mounting its token's volume)
+if edit in ("obo", "obomount"):
+    meta["annotations"]["varek.dev/on-behalf-of"] = "alice-token"
+if edit == "obomount":
+    c["volumeMounts"].append({"name": "varek-obo", "mountPath": "/token", "readOnly": True})
+# section 10: the pod's plan
+if edit.startswith("plan="):
+    meta["annotations"]["varek.dev/plan"] = edit[5:]
 # VAREK's unsupervised profile, which the plugin replaces (a pod naming no
 # policy keeps the runtime's)
 profile = {"type": "RuntimeDefault"}
@@ -191,13 +378,13 @@ vp creds 'require warden 1.28
 proxy on
 credential k from file:/etc/varek/creds/k
 allow host api.example.com:443' > "$OUT/vp-creds.json"
-refused "a VarekPolicy with credentials (not carried by the node agent yet): refused at deploy" "$OUT/vp-creds.json" "does not carry credentials"
+refused "a VarekPolicy naming a credential no VarekCredential gives (D2): refused at deploy" "$OUT/vp-creds.json" "is given by no VarekCredential"
 vp busybox "$POLICY" > "$OUT/vp-busybox.json"
 check "a VarekPolicy the Warden loads: admitted" kubectl apply -f "$OUT/vp-busybox.json"
 synced() { for _ in $(seq 30); do on_node cat /var/lib/varek/policies/team-a/busybox.policy 2> /dev/null | grep -qx "$1" && return 0; sleep 1; done; return 1; }
 check "... written to the node by the plugin's -sync (POLICY_DIR/team-a/busybox.policy)" synced 'allow exec /bin/sleep'
 check "... root's, 0644, in a directory others cannot write" sh -c \
-    "[ \"\$(docker exec $N stat -c '%u %a' /var/lib/varek/policies/team-a/busybox.policy)\" = '0 644' ] && [ \"\$(docker exec $N stat -c '%u %a' /var/lib/varek/policies)\" = '0 755' ]"
+    "[ \"\$($NODE_EXEC stat -c '%u %a' /var/lib/varek/policies/team-a/busybox.policy)\" = '0 644' ] && [ \"\$($NODE_EXEC stat -c '%u %a' /var/lib/varek/policies)\" = '0 755' ]"
 pod p-nosuch team-a nosuch > "$OUT/p-nosuch.json"
 refused "a pod naming a policy not in its namespace: refused" "$OUT/p-nosuch.json" "no VarekPolicy nosuch in namespace team-a"
 pod p-relative team-a busybox relative > "$OUT/p-relative.json"
@@ -207,7 +394,7 @@ refused "a writable root under a policy that decides launches (D4): refused" "$O
 pod p-default team-a busybox runtimedefault > "$OUT/p-default.json"
 refused "a seccomp profile other than VAREK's unsupervised one: refused" "$OUT/p-default.json" "seccompProfile must be"
 check "VAREK's unsupervised profile on the node (every call refused)" sh -c \
-    "docker exec $N cat /var/lib/kubelet/seccomp/varek/unsupervised.json | grep -q '\"defaultAction\":\"SCMP_ACT_ERRNO\"'"
+    "$NODE_EXEC cat /var/lib/kubelet/seccomp/varek/unsupervised.json | grep -q '\"defaultAction\":\"SCMP_ACT_ERRNO\"'"
 kubectl create namespace team-req > /dev/null
 kubectl label namespace team-req varek.dev/policy-required=true pod-security.kubernetes.io/enforce=restricted > /dev/null
 pod p-none team-req - > "$OUT/p-none.json"
@@ -235,7 +422,12 @@ check "a pod naming no policy: left as it is, its command ran" sh -c \
 
 echo "== 4. the evidence"
 sleep 3
-rm -rf "$OUT/streams"; docker cp "$N:/var/log/varek" "$OUT/streams" > /dev/null 2>&1
+rm -rf "$OUT/streams"
+if [ "$HOST" = 1 ]; then
+    sudo cp -a /var/log/varek "$OUT/streams" && sudo chown -R "$(id -u):$(id -g)" "$OUT/streams"
+else
+    docker cp "$N:/var/log/varek" "$OUT/streams" > /dev/null 2>&1
+fi
 SA="$(python3 - "$OUT/streams" <<'EOF'
 import glob, json, sys
 for p in sorted(glob.glob(sys.argv[1] + "/*.jsonl")):
@@ -249,10 +441,10 @@ EOF
 )"
 check "the pod's stream on the node: run_start names the pod, its namespace and the policy" sh -c "[ -n '$SA' ] && [ -s '$SA' ]"
 check "... the policy copied beside it (root's, 0400), the stream root's (0600)" sh -c \
-    "on() { docker exec $N stat -c '%u %a' \"/var/log/varek/\$(basename \"\$1\")\"; }; [ \"\$(on '$SA')\" = '0 600' ] && [ \"\$(on '${SA%.jsonl}.policy')\" = '0 400' ]"
+    "on() { $NODE_EXEC stat -c '%u %a' \"/var/log/varek/\$(basename \"\$1\")\"; }; [ \"\$(on '$SA')\" = '0 600' ] && [ \"\$(on '${SA%.jsonl}.policy')\" = '0 400' ]"
 check "the audit verifies it: signed with the node's key, anchored, each decision under its policy" \
     python3 "$HERE/tools/varek_audit.py" --policy "${SA%.jsonl}.policy" --checker "$HERE/tools/vdp_cert_check" \
-    --pubkey "$OUT/node.key.pub" --anchor "$OUT/streams/anchor" "$SA"
+    --node-keys "$OUT/node-keys.json" --anchor "$OUT/streams/anchor" "$SA"
 RUN="$(python3 -c 'import json,sys; print([json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")][0]["run"])' "$SA" 2>/dev/null)"
 check "the anchor holds the run's checkpoints" grep -q "$RUN" "$OUT/streams/anchor"
 for _ in $(seq 30); do kubectl -n "$NS" logs ds/varek-node -c exporter 2>/dev/null | grep -q "$RUN" && break; sleep 2; done
@@ -271,14 +463,14 @@ echo "== 5. the policy changed, then deleted"
 vp busybox "$POLICY
 allow path /etc/passwd readonly" > "$OUT/vp-busybox2.json"
 check "the changed policy admitted, and written to the node again" sh -c \
-    "kubectl apply -f '$OUT/vp-busybox2.json' && for i in \$(seq 30); do docker exec $N grep -qx 'allow path /etc/passwd readonly' /var/lib/varek/policies/team-a/busybox.policy && exit 0; sleep 1; done; exit 1"
+    "kubectl apply -f '$OUT/vp-busybox2.json' && for i in \$(seq 30); do $NODE_EXEC grep -qx 'allow path /etc/passwd readonly' /var/lib/varek/policies/team-a/busybox.policy && exit 0; sleep 1; done; exit 1"
 pod pod-a2 team-a busybox > "$OUT/pod-a2.json"
 kubectl apply -f "$OUT/pod-a2.json" > /dev/null 2>&1
 ran pod-a2
 check "a new pod runs under the new policy (the read it now allows)" grep -qx 'read_denied: 0' "$OUT/pod-a2.log"
 kubectl -n team-a delete varekpolicy busybox > /dev/null 2>&1
 check "the policy deleted: removed from the node" sh -c \
-    "for i in \$(seq 30); do docker exec $N test -e /var/lib/varek/policies/team-a/busybox.policy || exit 0; sleep 1; done; exit 1"
+    "for i in \$(seq 30); do $NODE_EXEC test -e /var/lib/varek/policies/team-a/busybox.policy || exit 0; sleep 1; done; exit 1"
 
 echo "== 6. the node agent's pods taken off the node, then back"
 node_logs "-before-restart"   # the restart below ends these
@@ -312,6 +504,423 @@ kubectl apply -f "$OUT/pod-a3.json" > /dev/null 2>&1
 ran pod-a3
 check "a new pod supervised by it, as before" sh -c \
     "grep -q '^varek-init: Landlock' '$OUT/pod-a3.log' && grep -q '^launch_denied: [1-9]' '$OUT/pod-a3.log'"
+
+echo "== 7. credentials (v1.36 step 4: D1, D2)"
+vc() {   # NAME CREDENTIAL SOURCE NAMESPACE: a VarekCredential
+    python3 -c 'import json, sys; print(json.dumps({"apiVersion": "varek.dev/v1alpha1", "kind": "VarekCredential",
+        "metadata": {"name": sys.argv[1]}, "spec": {"credential": sys.argv[2], "source": sys.argv[3], "namespaces": [sys.argv[4]]}}))' "$@"
+}
+CSRC=file:/var/lib/varek/credentials/varek-test-cred/token
+vc outside test_cred file:/etc/varek/creds/k team-a > "$OUT/vc-outside.json"
+refused "a VarekCredential whose file: source is not under the chart's directory: refused" "$OUT/vc-outside.json" "the node agent's credentials directory"
+vc varek-test-cred test_cred "$CSRC" team-a > "$OUT/vc.json"
+check "a VarekCredential giving a Secret's key to team-a: admitted" kubectl apply -f "$OUT/vc.json"
+check "... written to the node by the plugin's -sync (POLICY_DIR/.credentials)" sh -c \
+    "for i in \$(seq 30); do $NODE_EXEC cat /var/lib/varek/policies/.credentials 2>/dev/null | grep -qx 'test_cred	team-a	$CSRC	varek-test-cred' && exit 0; sleep 1; done; exit 1"
+CPOL="require warden 1.29
+proxy inspect
+credential test_cred from $CSRC
+${POLICY#*
+}
+allow host kubernetes.default.svc.cluster.local:443
+allow request GET https://kubernetes.default.svc.cluster.local/version credential=test_cred header=X-Varek-Test"
+kubectl create namespace team-b > /dev/null
+kubectl label namespace team-b pod-security.kubernetes.io/enforce=restricted > /dev/null
+vp creds "$CPOL" | sed 's/"team-a"/"team-b"/' > "$OUT/vp-creds-b.json"
+refused "a policy naming it in a namespace it is not given to (team-b): refused at deploy" "$OUT/vp-creds-b.json" "is not given to namespace team-b"
+vp creds "$CPOL" > "$OUT/vp-creds-a.json"
+check "a policy naming it in team-a: admitted, and written to the node" sh -c \
+    "kubectl apply -f '$OUT/vp-creds-a.json' && for i in \$(seq 30); do $NODE_EXEC grep -q '^credential test_cred' /var/lib/varek/policies/team-a/creds.policy 2>/dev/null && exit 0; sleep 1; done; exit 1"
+CHECK='echo "placeholder: ${VAREK_CRED_TEST_CRED:-none}"
+(exec /bin/true); echo "launch_allowed: $?"' pod pod-c team-a creds > "$OUT/pod-c.json"
+kubectl apply -f "$OUT/pod-c.json" > /dev/null 2>&1
+check "the pod naming it ran to its end" ran pod-c
+check "... supervised (the launcher first)" said pod-c '^varek-init: Landlock'
+PH="$(sed -n 's/^placeholder: //p' "$OUT/pod-c.log")"
+check "... its environment holds the plugin's placeholder (VAREK_CRED_TEST_CRED), not the value" sh -c \
+    "printf %s '$PH' | grep -Eqx 'varek_ph_test_cred_[A-Za-z0-9_-]{43}' && ! grep -qF -- '$CRED_VAL' '$OUT/pod-c.log' && grep -qx 'launch_allowed: 0' '$OUT/pod-c.log'"
+rm -rf "$OUT/streams7"
+if [ "$HOST" = 1 ]; then
+    sudo cp -a /var/log/varek "$OUT/streams7" && sudo chown -R "$(id -u):$(id -g)" "$OUT/streams7"
+else
+    docker cp "$N:/var/log/varek" "$OUT/streams7" > /dev/null 2>&1
+fi
+check "... run_start: fetched by warden-secrets on the node (its length), the placeholder's SHA-256 the pod's" \
+    python3 - "$OUT/streams7" "${#CRED_VAL}" "$(printf %s "$PH" | sha256sum | cut -c1-64)" <<'EOF'
+import glob, json, sys
+for p in sorted(glob.glob(sys.argv[1] + "/*.jsonl")):
+    for l in open(p):
+        if l.startswith("{"):
+            r = json.loads(l)
+            if r.get("event") == "run_start" and r.get("node", {}).get("pod", {}).get("name") == "pod-c":
+                c = r.get("credentials") or [{}]
+                sys.exit(0 if len(c) == 1 and c[0].get("name") == "test_cred" and c[0].get("length") == int(sys.argv[2])
+                         and c[0].get("placeholder_sha256") == sys.argv[3] else 1)
+            break
+sys.exit(1)
+EOF
+check "... the value in no stream on the node" sh -c "! grep -rqF -- '$CRED_VAL' '$OUT/streams7'"
+
+echo "== 8. sub-agents and confined MCP servers (v1.36 step 5: D3, D4)"
+# busybox's programs are one file: each launch is of the image its shell
+# runs, settled by its memory layout (the pod's network has no process events)
+SPOL="require warden 1.31
+mcp server files exec /bin/head
+$(printf '%s\n' "${POLICY#*
+}" | sed 's|^allow exec /bin/cat$|allow exec /bin/cat subagent=reader|')
+allow path /proc/self/ readonly for=files
+allow path /etc/hostname readonly for=files
+allow path /lib/ readonly for=files
+allow path /lib64/ readonly for=files
+allow path /etc/ld.so.cache readonly for=files"
+vp subs "$SPOL" > "$OUT/vp-subs.json"
+check "a policy naming a sub-agent and a confined MCP server: admitted (carried), and written to the node" sh -c \
+    "kubectl apply -f '$OUT/vp-subs.json' && for i in \$(seq 30); do $NODE_EXEC grep -q '^mcp server files' /var/lib/varek/policies/team-a/subs.policy 2>/dev/null && exit 0; sleep 1; done; exit 1"
+CHECK='echo "reader: $(exec /bin/cat /proc/self/cgroup)"
+echo "files: $(exec /bin/head -n 1 /proc/self/cgroup)"
+(exec /bin/head -n 1 /etc/hostname) > /dev/null 2>&1; echo "files_allowed: $?"
+(exec /bin/head -n 1 /etc/passwd) > /dev/null 2>&1; echo "files_denied: $?"' pod pod-s team-a subs > "$OUT/pod-s.json"
+kubectl apply -f "$OUT/pod-s.json" > /dev/null 2>&1
+check "the pod ran to its end" ran pod-s
+check "... supervised (the launcher first)" said pod-s '^varek-init: Landlock'
+check "the sub-agent in a group below the container's own (its /proc/self/cgroup: .../reader-1)" said pod-s '^reader: 0::/\(.*/\)\{0,1\}reader-1$'
+check "the confined server in its own (.../files-1)" said pod-s '^files: 0::/\(.*/\)\{0,1\}files-1$'
+check "... held to its own rules: a file they allow read, one they do not refused" sh -c \
+    "grep -qx 'files_allowed: 0' '$OUT/pod-s.log' && grep -q '^files_denied: [1-9]' '$OUT/pod-s.log'"
+rm -rf "$OUT/streams8"
+if [ "$HOST" = 1 ]; then
+    sudo cp -a /var/log/varek "$OUT/streams8" && sudo chown -R "$(id -u):$(id -g)" "$OUT/streams8"
+else
+    docker cp "$N:/var/log/varek" "$OUT/streams8" > /dev/null 2>&1
+fi
+SS="$(python3 - "$OUT/streams8" <<'EOF'
+import glob, json, sys
+for p in sorted(glob.glob(sys.argv[1] + "/*.jsonl")):
+    for l in open(p):
+        if l.startswith("{"):
+            r = json.loads(l)
+            if r.get("event") == "run_start" and r.get("node", {}).get("pod", {}).get("name") == "pod-s":
+                print(p)
+            break
+EOF
+)"
+check "... its stream: the run's group the container's, each sub-agent's below it, each launch settled" python3 - "$SS" <<'EOF'
+import json, sys
+R = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+cg = R[0]["on_behalf_of"]["agent"]["cgroup"]
+subs = {r["subagent"]: r["cgroup"] for r in R if r.get("action") == "process.exec" and "subagent" in r}
+settled = {r["subagent"] for r in R if r.get("event") == "subagent_settled" and r.get("result") == "launched"}
+sys.exit(0 if subs.get("reader#1") == cg + "/reader-1" and subs.get("files#1") == cg + "/files-1" and
+         {"reader#1", "files#1"} <= settled else 1)
+EOF
+check "... and the audit verifies it" python3 "$HERE/tools/varek_audit.py" --policy "${SS%.jsonl}.policy" \
+    --checker "$HERE/tools/vdp_cert_check" --node-keys "$OUT/node-keys.json" "$SS"
+
+echo "== 9. a pod acting for a user (v1.36 step 6: D5)"
+# the cluster's service account issuer: its discovery and keys read by
+# warden-secrets on the node, unauthenticated, verified with the cluster's CA
+kubectl create clusterrolebinding varek-ci-issuer --clusterrole=system:service-account-issuer-discovery \
+    --group=system:unauthenticated > /dev/null
+ISS="$(kubectl get --raw /.well-known/openid-configuration | python3 -c 'import json, sys; print(json.load(sys.stdin)["issuer"])')"
+say "  issuer: $ISS"
+kubectl -n team-a create serviceaccount alice > /dev/null
+TOK="$(kubectl -n team-a create token alice --audience varek-agent --duration 1h)"
+kubectl -n team-a create secret generic alice-token --from-literal=token="$TOK" > /dev/null
+# the keys by the API server's name in the cluster (its certificate's), not
+# the address its discovery document gives
+OPOL="require warden 1.29
+require on-behalf-of
+trust issuer $ISS audience varek-agent jwks https://kubernetes.default.svc.cluster.local/openid/v1/jwks
+${POLICY#*
+}"
+vp obo "$OPOL" > "$OUT/vp-obo.json"
+check "a policy that says \`require on-behalf-of\`: admitted (carried), and written to the node" sh -c \
+    "kubectl apply -f '$OUT/vp-obo.json' && for i in \$(seq 30); do $NODE_EXEC grep -q '^require on-behalf-of' /var/lib/varek/policies/team-a/obo.policy 2>/dev/null && exit 0; sleep 1; done; exit 1"
+pod p-nobody team-a obo > "$OUT/p-nobody.json"
+refused "a pod under it naming no user's token: refused at deploy" "$OUT/p-nobody.json" "says .require on-behalf-of., and it names no user's token"
+pod p-mount team-a obo obomount > "$OUT/p-mount.json"
+refused "a pod whose agent mounts its token's volume: refused" "$OUT/p-mount.json" "container agent mounts varek-obo"
+# v1.36.3 (D6): no pod the webhook serves mounts the node agent's socket's
+# directory, or one above it (checked before anything else of the pod), in
+# a namespace of its own: team-a's Pod Security (restricted) refuses any
+# hostPath before the webhook is asked, as it would in a namespace with the
+# baseline level
+kubectl create namespace varek-sock > /dev/null 2>&1 || true
+python3 - "$OUT/p-sock.json" <<'PY'
+import json, sys
+json.dump({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p-sock", "namespace": "varek-sock",
+                                                         "annotations": {"varek.dev/policy": "agent"}},
+           "spec": {"containers": [{"name": "c", "image": "registry.invalid/none:1", "command": ["/bin/true"],
+                                    "volumeMounts": [{"name": "run", "mountPath": "/host-run", "readOnly": True}]}],
+                    "volumes": [{"name": "run", "hostPath": {"path": "/run"}}]}}, open(sys.argv[1], "w"))
+PY
+refused "a pod mounting the node's /run, read-only (v1.36.3, D6): refused, before its policy is read" "$OUT/p-sock.json" \
+    "holds VAREK's node agent's socket"
+kubectl delete namespace varek-sock --wait=false > /dev/null 2>&1
+CHECK='(exec /bin/cat /var/run/varek-obo/token) > /dev/null 2>&1; echo "token_read: $?"
+(exec /bin/cat /etc/hostname) > /dev/null 2>&1; echo "read_allowed: $?"
+(exec /bin/true); echo "launch_allowed: $?"' pod pod-o team-a obo obo > "$OUT/pod-o.json"
+check "the pod acting for alice: admitted" kubectl apply -f "$OUT/pod-o.json"
+kubectl -n team-a get pod pod-o -o json > "$OUT/pod-o.spec.json" 2>&1
+check "... given its token's volume and the init container that alone mounts it (the node image, /bin/true)" \
+    python3 - "$OUT/pod-o.spec.json" "$IMAGE" <<'EOF'
+import json, sys
+s = json.load(open(sys.argv[1]))["spec"]
+init = [c for c in s.get("initContainers", []) if c["name"] == "varek-obo"]
+vol = [v for v in s["volumes"] if v["name"] == "varek-obo"]
+agent = [c for c in s["containers"] if c["name"] == "agent"][0]
+sys.exit(0 if len(init) == 1 and init[0]["image"] == sys.argv[2] and init[0]["command"] == ["/bin/true"] and
+         len(vol) == 1 and vol[0]["secret"]["secretName"] == "alice-token" and
+         not any(m["name"] == "varek-obo" for m in agent.get("volumeMounts", [])) else 1)
+EOF
+check "the pod ran to its end" ran pod-o
+check "... supervised (the launcher first), its command ran" sh -c \
+    "grep -q '^varek-init: Landlock' '$OUT/pod-o.log' && grep -qx 'read_allowed: 0' '$OUT/pod-o.log' && grep -qx 'launch_allowed: 0' '$OUT/pod-o.log'"
+check "... the agent cannot read its user's token (not mounted in its container)" grep -q '^token_read: [1-9]' "$OUT/pod-o.log"
+rm -rf "$OUT/streams9"
+if [ "$HOST" = 1 ]; then
+    sudo cp -a /var/log/varek "$OUT/streams9" && sudo chown -R "$(id -u):$(id -g)" "$OUT/streams9"
+else
+    docker cp "$N:/var/log/varek" "$OUT/streams9" > /dev/null 2>&1
+fi
+SO="$(python3 - "$OUT/streams9" <<'EOF'
+import glob, json, sys
+for p in sorted(glob.glob(sys.argv[1] + "/*.jsonl")):
+    for l in open(p):
+        if l.startswith("{"):
+            r = json.loads(l)
+            if r.get("event") == "run_start" and r.get("node", {}).get("pod", {}).get("name") == "pod-o":
+                print(p)
+            break
+EOF
+)"
+check "... run_start: the token from the kubelet's copy, verified by warden-secrets, names alice and the issuer" \
+    python3 - "$SO" "$ISS" <<'EOF'
+import json, sys
+r = next(json.loads(l) for l in open(sys.argv[1]) if l.startswith("{"))
+u = r.get("on_behalf_of", {}).get("user", {})
+sys.exit(0 if u.get("subject") == "system:serviceaccount:team-a:alice" and u.get("issuer") == sys.argv[2] else 1)
+EOF
+check "... the token in no stream on the node" sh -c "! grep -rqF -- '${TOK##*.}' '$OUT/streams9'"
+check "... no copy of it left in the node agent's socket directory" sh -c "! $NODE_EXEC ls /run/varek-node | grep -q '\.obo\$'"
+check "... and the audit verifies the stream" python3 "$HERE/tools/varek_audit.py" --policy "${SO%.jsonl}.policy" \
+    --checker "$HERE/tools/vdp_cert_check" --node-keys "$OUT/node-keys.json" "$SO"
+
+echo "== 10. the dry run, a flow policy and a trust bundle (v1.36 step 7: D6, D7, D7b)"
+vpx() {   # NAME TEXT SPEC: a VarekPolicy in team-a, SPEC its other fields (JSON)
+    python3 -c 'import json, sys; s = json.loads(sys.argv[3]); s["policy"] = sys.argv[2] + "\n"
+print(json.dumps({"apiVersion": "varek.dev/v1alpha1", "kind": "VarekPolicy", "metadata": {"name": sys.argv[1], "namespace": "team-a"}, "spec": s}))' "$@"
+}
+vplan() {   # NAME TEXT: a VarekPlan in team-a
+    python3 -c 'import json, sys; print(json.dumps({"apiVersion": "varek.dev/v1alpha1", "kind": "VarekPlan",
+        "metadata": {"name": sys.argv[1], "namespace": "team-a"}, "spec": {"plan": sys.argv[2] + "\n"}}))' "$1" "$2"
+}
+streams10() {   # the node's streams, copied to OUT/streams10
+    rm -rf "$OUT/streams10"
+    if [ "$HOST" = 1 ]; then
+        sudo cp -a /var/log/varek "$OUT/streams10" && sudo chown -R "$(id -u):$(id -g)" "$OUT/streams10"
+    else
+        docker cp "$N:/var/log/varek" "$OUT/streams10" > /dev/null 2>&1
+    fi
+}
+podstream() {   # POD: its first stream in OUT/streams10 (a container the node agent
+                # refuses can be started again by the kubelet, as CRI-O's is on the
+                # SELinux cell: each start a stream of its own)
+    python3 - "$OUT/streams10" "$1" <<'EOF'
+import glob, json, sys
+got = []
+for p in glob.glob(sys.argv[1] + "/*.jsonl"):
+    for l in open(p):
+        if l.startswith("{"):
+            r = json.loads(l)
+            if r.get("event") == "run_start" and r.get("node", {}).get("pod", {}).get("name") == sys.argv[2]:
+                got.append((r.get("timestamp_ns", 0), p))
+            break
+if got:
+    print(min(got)[1])
+EOF
+}
+streamhas() {   # STREAM PYTHON: a record of STREAM holds (R: the records)
+    python3 -c 'import json, sys; R = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]; sys.exit(0 if eval(sys.argv[2]) else 1)' "$1" "$2"
+}
+# -- the dry run (D6)
+vpx drycreds "$CPOL" '{"dryRun": true}' > "$OUT/vp-drycreds.json"
+refused "a dry run of a policy naming credentials: refused at deploy (as on a host)" "$OUT/vp-drycreds.json" "with a policy that names credentials is refused"
+vpx dry "$POLICY" '{"dryRun": true}' > "$OUT/vp-dry.json"
+check "a VarekPolicy saying a dry run: admitted, and its options written beside it on the node" sh -c \
+    "kubectl apply -f '$OUT/vp-dry.json' && for i in \$(seq 30); do $NODE_EXEC grep -q '\"dryRun\":true' /var/lib/varek/policies/team-a/dry.run 2>/dev/null && exit 0; sleep 1; done; exit 1"
+APISERVER="$(kubectl get service kubernetes -o jsonpath='{.spec.clusterIP}')"
+CHECK="$CHECK
+(exec /bin/wget -q -T 3 -O /dev/null http://$APISERVER:443/) 2>/dev/null; echo \"connect: \$?\"" pod pod-dry team-a dry > "$OUT/pod-dry.json"
+kubectl apply -f "$OUT/pod-dry.json" > /dev/null 2>&1
+ran pod-dry
+check "the pod's dry run ran to its end, supervised" grep -q '^varek-init: Landlock' "$OUT/pod-dry.log"
+check "... a read and a launch the policy refuses: let through" sh -c \
+    "grep -qx 'read_denied: 0' '$OUT/pod-dry.log' && grep -qx 'launch_denied: 0' '$OUT/pod-dry.log'"
+# the copy is busybox's, which runs as the applet its name gives: "copy" is
+# none, so it says so and exits 127, where a refused launch exits 126
+check "... a copy written to its volume and launched: let through (no launch held, no mount noexec; busybox ran, as no applet)" sh -c \
+    "grep -qx 'copy_written: 0' '$OUT/pod-dry.log' && grep -qx 'launch_written: 127' '$OUT/pod-dry.log'"
+check "... a connect to the API server: refused all the same (the cluster's network, D6a)" grep -q '^connect: [1-9]' "$OUT/pod-dry.log"
+streams10
+SD="$(podstream pod-dry)"
+check "... run_start says a dry run; the connect's record a dry run's refusal (dry_run_refused)" streamhas "$SD" \
+    'R[0].get("mode") == "dry_run" and any(r.get("action") == "net.connect" and r.get("dry_run_refused") is True and r.get("decision_final") == "DENY" and r.get("target", "").endswith(":443") for r in R)'
+python3 "$HERE/tools/varek_audit.py" --policy "${SD%.jsonl}.policy" --checker "$HERE/tools/vdp_cert_check" \
+    --node-keys "$OUT/node-keys.json" "$SD" > "$OUT/pod-dry.audit" 2>&1; arc=$?
+check "... and the audit verifies it: a dry run, not enforced (exit 3)" sh -c \
+    "[ $arc = 3 ] && grep -q 'VERIFIED: DRY RUN, NOT ENFORCED' '$OUT/pod-dry.audit'"
+# -- a flow policy (D7b): its breaker's table on the node, its session the pod's namespace and service account
+FLOW='varek_policy 1
+label SECRET 0
+sticky SECRET
+refusal_budget 2
+session_refusal_budget 5
+on_exhaustion deny
+unknown_disposition deny
+rule file_open
+  match target /etc/hostname
+  origin SECRET
+rule file_open
+  match target /work/*
+  deny_in SECRET'
+vpx flowy "require warden 1.35
+${POLICY#*
+}" "$(python3 -c 'import json, sys; print(json.dumps({"flowPolicy": sys.argv[1] + "\n"}))' "$FLOW")" > "$OUT/vp-flowy.json"
+check "a VarekPolicy with a flow policy: admitted, and its flow policy written beside it on the node" sh -c \
+    "kubectl apply -f '$OUT/vp-flowy.json' && for i in \$(seq 30); do $NODE_EXEC grep -q '^session_refusal_budget 5' /var/lib/varek/policies/team-a/flowy.flow 2>/dev/null && exit 0; sleep 1; done; exit 1"
+vplan fgood 'plan 1.35
+action a file_open /etc/hostname open=read' > "$OUT/vplan-fgood.json"
+vplan fleak 'plan 1.35
+action r file_open /etc/hostname open=read
+action w file_open /work/out open=O_WRONLY|O_CREAT|O_TRUNC
+edge r w' > "$OUT/vplan-fleak.json"
+kubectl apply -f "$OUT/vplan-fgood.json" -f "$OUT/vplan-fleak.json" > /dev/null
+for _ in $(seq 30); do on_node test -f /var/lib/varek/policies/team-a/fleak.plan && break; sleep 1; done
+pod p-flnone team-a flowy > "$OUT/p-flnone.json"
+refused "a pod under it naming no plan: refused at deploy" "$OUT/p-flnone.json" "names its plan"
+CHECK='read -r h < /etc/hostname && echo "read_allowed: 0"' pod pod-fl team-a flowy plan=fgood > "$OUT/pod-fl.json"
+kubectl apply -f "$OUT/pod-fl.json" > /dev/null 2>&1
+# (the run is held to the plan, which names no file the image's loader
+# opens: what the command does then is not what is checked here)
+ran pod-fl
+CHECK='read -r h < /etc/hostname && echo "read_allowed: 0"' pod pod-fl2 team-a flowy plan=fleak > "$OUT/pod-fl2.json"
+kubectl apply -f "$OUT/pod-fl2.json" > /dev/null 2>&1
+ran pod-fl2
+check "a pod whose plan the flow policy refuses: ended before its command ran" sh -c "! grep -q '^read_allowed' '$OUT/pod-fl2.log'"
+streams10
+check "a pod whose plan the flow policy passes: its gate PASS, its session team-a/default (the pod's namespace and service account, from the API server), the run held to the plan" \
+    streamhas "$(podstream pod-fl)" 'any(r.get("event") == "plan_gate" and r.get("gate") == "flow" and r.get("breaker") == "PASS" and r.get("session") == "team-a/default" for r in R) and R[0].get("hold", {}).get("plan", "").endswith(".plan")'
+check "... the other's REFUSED_RETRYABLE, refusal 1 of 2, in the same session, and the container refused" sh -c \
+    "grep -q 'refused by its flow policy' '$(podstream pod-fl2)'" 
+check "... its record" \
+    streamhas "$(podstream pod-fl2)" 'any(r.get("event") == "plan_gate" and r.get("breaker") == "REFUSED_RETRYABLE" and r.get("refusals") == 1 and r.get("budget") == 2 and r.get("session") == "team-a/default" for r in R)'
+check "... the breaker's table on the node (flowPolicy.stateDir), root's alone" sh -c \
+    "[ \"\$($NODE_EXEC stat -c '%u %a' /var/lib/varek/flow/breaker.state)\" = '0 600' ]"
+# -- a trust bundle (D7): a key of the chart's ConfigMap
+vpx tb "require warden 1.29
+proxy inspect
+${POLICY#*
+}
+allow host kubernetes.default.svc.cluster.local:443" '{"trustBundle": "corp.pem"}' > "$OUT/vp-tb.json"
+check "a VarekPolicy naming a trust bundle: admitted, and written to the node" sh -c \
+    "kubectl apply -f '$OUT/vp-tb.json' && for i in \$(seq 30); do $NODE_EXEC grep -q 'corp.pem' /var/lib/varek/policies/team-a/tb.run 2>/dev/null && exit 0; sleep 1; done; exit 1"
+pod pod-tb team-a tb > "$OUT/pod-tb.json"
+kubectl apply -f "$OUT/pod-tb.json" > /dev/null 2>&1
+ran pod-tb
+check "the pod under it ran to its end, supervised" grep -q '^varek-init: Landlock' "$OUT/pod-tb.log"
+streams10
+check "... run_start: inspecting mode's roots the ConfigMap's key, as the node agent reads it" streamhas "$(podstream pod-tb)" \
+    'R[0].get("trust", {}).get("host_bundle", "").startswith("/etc/varek/trust-bundles/") and R[0]["trust"]["host_bundle"].endswith("/corp.pem") and R[0]["trust"]["host_bundle_sha256"] == "'"$(sha256sum "$OUT/roots.pem" | cut -c1-64)"'"'
+
+echo "== 11. a key for each node (v1.36 step 9: D10)"
+check "the node's key on the node: root's, 0400, in a directory root's alone; its public key apart, the VarekNodeKey's" sh -c \
+    "[ \"\$($NODE_EXEC stat -c '%u %a' /var/lib/varek/key/node.key)\" = '0 400' ] &&
+     [ \"\$($NODE_EXEC stat -c '%u %a' /var/lib/varek/key)\" = '0 700' ] && [ -n '$NKPUB' ] &&
+     [ \"\$($NODE_EXEC cat /var/lib/varek/key-pub/node.key.pub)\" = '$NKPUB' ]"
+FORGED="$(printf 'f%.0s' $(seq 64))"
+printf '{"apiVersion": "varek.dev/v1alpha1", "kind": "VarekNodeKey", "metadata": {"name": "%s"}, "spec": {"node": "%s", "publicKey": "%s"}}\n' \
+    "$NODE-${FORGED:0:16}" "$NODE" "$FORGED" > "$OUT/vnk-forged.json"
+refused "a VarekNodeKey made by a cluster administrator: refused (only the node agent publishes one)" \
+    "$OUT/vnk-forged.json" "published only by the node agent"
+check "... by the node agent's account, its token naming no node: refused (only from that node)" sh -c \
+    "! kubectl --as=system:serviceaccount:$NS:varek-node apply -f '$OUT/vnk-forged.json' > '$OUT/vnk-forged2.out' 2>&1 &&
+     grep -q 'published only from that node' '$OUT/vnk-forged2.out'"
+NK_NAME="$NODE-${NKPUB:0:16}"
+check "the node's key changed: refused" sh -c \
+    "! kubectl patch vareknodekey '$NK_NAME' --type merge -p '{\"spec\":{\"publicKey\":\"$FORGED\"}}' > '$OUT/vnk-patch.out' 2>&1 &&
+     grep -q 'is not changed' '$OUT/vnk-patch.out'"
+check "... removed by the node agent's account: refused, the key still there" sh -c \
+    "! kubectl --as=system:serviceaccount:$NS:varek-node delete vareknodekey '$NK_NAME' > /dev/null 2>&1 &&
+     kubectl get vareknodekey '$NK_NAME'"
+# the node rebuilt: its key gone, the node agent started again
+on_node rm -f /var/lib/varek/key/node.key
+kubectl -n "$NS" delete pod -l app.kubernetes.io/component=node --wait=true > /dev/null 2>&1
+kubectl -n "$NS" rollout status ds/varek-node --timeout=180s > /dev/null 2>&1
+for _ in $(seq 60); do [ "$(keys_of "$OUT/node-keys2.json")" = 2 ] && break; sleep 2; done
+NKPUB2="$(on_node cat /var/lib/varek/key-pub/node.key.pub 2>/dev/null)"
+say "  node key after the rebuild: $NODE $NKPUB2"
+check "the node rebuilt: a new key made and published as a new VarekNodeKey, the old one kept" \
+    python3 -c 'import json,sys
+keys = sorted(i["spec"]["publicKey"] for i in json.load(open(sys.argv[1]))["items"] if i["spec"]["node"] == sys.argv[2])
+sys.exit(0 if keys == sorted(sys.argv[3:5]) and sys.argv[3] != sys.argv[4] else 1)' "$OUT/node-keys2.json" "$NODE" "$NKPUB" "$NKPUB2"
+for _ in $(seq 60); do kubectl -n "$NS" logs ds/varek-node -c plugin 2>/dev/null | grep -q '^varek-nri: runtime' && break; sleep 2; done
+kubectl apply -f "$OUT/vp-busybox.json" > /dev/null 2>&1
+synced 'allow exec /bin/sleep' > /dev/null
+pod pod-k team-a busybox > "$OUT/pod-k.json"
+kubectl apply -f "$OUT/pod-k.json" > /dev/null 2>&1
+ran pod-k
+streams10
+SK="$(podstream pod-k)"
+check "a pod after the rebuild: its stream signed with the new key, verified with the cluster's list" sh -c \
+    "[ -n '$SK' ] && python3 '$HERE/tools/varek_audit.py' --policy '${SK%.jsonl}.policy' --checker '$HERE/tools/vdp_cert_check' \
+         --node-keys '$OUT/node-keys2.json' '$SK' > '$OUT/pod-k.audit' 2>&1 &&
+     grep -qF \"signed with node $NODE's key $NODE-${NKPUB2:0:16}, admitted \" '$OUT/pod-k.audit'"
+check "section 4's stream, signed before the rebuild: verified still, with the old key (retired after its run began)" sh -c \
+    "python3 '$HERE/tools/varek_audit.py' --policy '${SA%.jsonl}.policy' --checker '$HERE/tools/vdp_cert_check' \
+         --node-keys '$OUT/node-keys2.json' '$SA' > '$OUT/pod-a.audit2' 2>&1 &&
+     grep -q \"signed with node $NODE's key $NODE-${NKPUB:0:16}, admitted .*; retired at \" '$OUT/pod-a.audit2'"
+
+echo "== 12. supervised pods started together (v1.36 step 12)"
+# On OpenShift's one node (CRI-O, crun) two supervised pods started in the
+# same instant: one's runtime ended and was reaped while the node agent took
+# the other's connection, and the node agent refused it (nothing of the
+# runtime then tied it to the process it named); the pod never ran. The
+# container's first call now ties it (node_tie). BURST pods at once
+BURST=20
+kubectl -n "$NS" logs ds/varek-node -c node-agent > "$OUT/node-agent-burst0.log" 2>&1
+for i in $(seq "$BURST"); do
+    CHECK='(exec /bin/true); echo "launch_allowed: $?"' pod "burst-$i" team-a busybox > "$OUT/burst-$i.json"
+done
+python3 - "$OUT" "$BURST" > "$OUT/burst.json" <<'EOF'
+import json, sys
+print(json.dumps({"apiVersion": "v1", "kind": "List",
+                  "items": [json.load(open(f"{sys.argv[1]}/burst-{i}.json")) for i in range(1, int(sys.argv[2]) + 1)]}))
+EOF
+kubectl apply -f "$OUT/burst.json" > /dev/null 2>&1
+burst_ended() { kubectl -n team-a get pods -o jsonpath='{range .items[*]}{.metadata.name} {.status.phase}{"\n"}{end}' 2>/dev/null |
+                awk '$1 ~ /^burst-/ && ($2 == "Succeeded" || $2 == "Failed")' | wc -l; }
+for _ in $(seq 180); do [ "$(burst_ended)" -ge "$BURST" ] && break; sleep 1; done
+BOK=0
+for i in $(seq "$BURST"); do
+    kubectl -n team-a logs "burst-$i" > "$OUT/burst-$i.log" 2>&1
+    if [ "$(kubectl -n team-a get pod "burst-$i" -o jsonpath='{.status.phase}' 2>/dev/null)" = Succeeded ] &&
+       grep -qx 'launch_allowed: 0' "$OUT/burst-$i.log" && grep -q '^varek-init: Landlock' "$OUT/burst-$i.log"; then
+        BOK=$((BOK + 1))
+    else
+        kubectl -n team-a describe pod "burst-$i" > "$OUT/burst-$i.describe" 2>&1
+        sed "s/^/     burst-$i: /" "$OUT/burst-$i.log" | tail -3 | tee -a "$SUM"
+        grep -E '^ *(Reason|Message|Exit Code):' "$OUT/burst-$i.describe" | sed "s/^ */     burst-$i: /" | tee -a "$SUM"
+    fi
+done
+kubectl -n "$NS" logs ds/varek-node -c node-agent > "$OUT/node-agent-burst.log" 2>&1
+count_new() {   # PATTERN: the node agent's lines saying it, since the pods were created
+    echo $(( $(grep -c "$1" "$OUT/node-agent-burst.log") - $(grep -c "$1" "$OUT/node-agent-burst0.log") ))
+}
+say "  started together: $BURST pods; their containers taken by their first call (the runtime reaped before it could be read): $(count_new 'taken by its first call')"
+check "$BURST supervised pods created at once: each supervised (the launcher first) and run to its end" sh -c "[ $BOK = $BURST ]"
+check "... the node agent refused none of their containers" sh -c "[ $(count_new 'a connection refused') = 0 ]"
+kubectl -n team-a delete pods $(seq -f 'burst-%g' "$BURST") --wait=false > /dev/null 2>&1
 
 echo
 [ "$fail" = 0 ] && say "v1340_kind: PASS" || say "v1340_kind: FAIL"

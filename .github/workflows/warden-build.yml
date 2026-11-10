@@ -10,6 +10,8 @@ name: Warden build
 # host matching), the Python suites, and the exporter's output against the
 # CycloneDX 1.6 schema.
 # v1.24.0: the host-name grammar and the resolution table (make test-v1240).
+# v1.33.0: the same job on arm64 (a matrix, both runners pinned to Ubuntu
+# 24.04), and make test-v1300.
 
 on:
   push:
@@ -23,12 +25,27 @@ permissions:
 
 jobs:
   build:
-    name: Build the Warden with libseccomp + libsodium
-    runs-on: ubuntu-latest
+    # v1.30: every step on x86_64 and on arm64 (GitHub's arm64 Linux runners),
+    # from the same source (docs/security/v1.30-macos.md, D2 and D5)
+    name: Build the Warden with libseccomp + libsodium (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install build dependencies
+        timeout-minutes: 45
         run: |
+          # a stalled mirror is retried, not waited on (a matrix cell once hung
+          # 45 minutes in apt-get update and was cancelled before its test ran)
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+            | sudo tee /etc/apt/apt.conf.d/80varek-ci-retries > /dev/null
           sudo apt-get update
           sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
           # v1.24: test_v1240.sh runs a Java client as the agent, with the
@@ -43,7 +60,7 @@ jobs:
         run: make -C varek/v1_4 all
       - name: Check the deployment scripts parse
         run: |
-          python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py varek/v1_4/tools/varek_bench.py varek/v1_4/tools/varek_node_export.py
+          python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py varek/v1_4/tools/varek_bench.py varek/v1_4/tools/varek_node_export.py varek/v1_4/tools/varek_suggest.py
           bash -n varek/v1_4/tools/varek_preflight.sh
           bash -n varek/v1_4/tools/varek_anchor_receiver.sh
       - name: Lint the shipped policies
@@ -81,6 +98,8 @@ jobs:
         run: make -C varek/v1_4 test-mcp-json
       - name: v1.31 standards (the grammar; confined MCP servers; MCP calls over HTTP; MCP tokens; the OCSF export; audit and tools)
         run: sudo make -C varek/v1_4 test-v1310
+      - name: v1.30 the Warden on this architecture (open flags in VAREK's encoding, flag clauses in a run, run_start's arch)
+        run: make -C varek/v1_4 test-v1300
       - name: v1.31.1 calls glibc and bash make, admitted under every policy (asyncio's event loop, pipe, bash)
         run: sudo make -C varek/v1_4 test-v1311
       - name: v1.32 containers (the version, varek doctor and the run's refusal in a container, the packaging)
@@ -101,9 +120,14 @@ jobs:
         run: make -C v1_7 check
       - name: Python suites and CycloneDX schema (v1.18.0)
         run: |
-          python3 -m pip install --break-system-packages -r varek/v1_4/tools/requirements-test.txt pytest pyyaml
+          # every version and hash pinned (requirements-ci.in, compiled); --ignore-installed:
+          # the runner's Debian packages cannot be uninstalled by pip
+          python3 -m pip install --break-system-packages --ignore-installed --require-hashes -r varek/v1_4/tools/requirements-ci.txt
           python3 -m pytest -q tests
           python3 -m pytest -q varek/v1_4/tests/test_varek_bench.py   # varek bench: the parts that need no root
+          python3 -m pytest -q varek/v1_4/tests/test_varek_audit_stream.py   # v1.36 (D9): the one-pass audit's running state
+          python3 -m pytest -q varek/v1_4/tests/test_varek_node_keys.py      # v1.36 (D10): a key for each node
+          python3 -m pytest -q varek/v1_4/tests/test_soak_v1340_check.py     # the soak harness's memory judgement
           mkdir -p /tmp/ci_data /tmp/ci_key
           printf 'allow path /tmp/ci_data/\n' > /tmp/ci_policy.txt
           varek/v1_4/tools/varek_keygen /tmp/ci_key/log.key

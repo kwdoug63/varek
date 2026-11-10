@@ -1,12 +1,12 @@
 # VAREK v1.6 — design notes
 
-## Scope: pre-execution verification of an ExecutionPlan
+## Scope: plan-level verification of an ExecutionPlan
 
 v1.6 lifts VAREK's per-Action policy decision to a plan-level
 decision over a directed acyclic graph of Actions. Verification
 fires before any node executes; only a fully `SATISFIED` plan
 authorizes execution. This implements USPTO Provisional
-64/062,549 (filed May 2026), covering pre-execution verification
+64/062,549 (filed May 2026), covering plan-level verification
 of action graphs as compositional policy decisions.
 
 The v1.4 Warden's `policy_decide()` returns `ALLOW` / `DENY` /
@@ -259,7 +259,7 @@ fork()
 Without `--plan`, the binary's behavior is exact-equivalent to
 v1.4. With `--plan`, an unauthorized plan halts the supervisor
 before the target ever starts, which is the strongest possible
-realization of "pre-execution verification."
+realization of plan-level verification.
 
 ## JSON pathology format
 

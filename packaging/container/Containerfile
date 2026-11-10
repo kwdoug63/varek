@@ -19,12 +19,27 @@
 #   node     v1.34 (docs/security/v1.34-kubernetes.md): the runtime image
 #            with what a Kubernetes node runs (the Helm chart's DaemonSet and
 #            admission webhook, packaging/helm/varek): the launcher
-#            (varek-init, static), the NRI plugin (varek-nri) and the
-#            admission webhook (varek-admission), built in build-go
-ARG BUILD_BASE=docker.io/library/almalinux:9
-ARG RUNTIME_BASE=registry.access.redhat.com/ubi9/ubi-minimal:latest
-ARG TEST_BASE=docker.io/library/ubuntu:24.04
-ARG GO_BASE=docker.io/library/golang:1.24
+#            (varek-init, static), the NRI plugin (varek-nri), the
+#            admission webhook (varek-admission) and, v1.36, the pod's SVID
+#            from SPIRE (varek-svid), built in build-go
+# Each base pinned by its index digest (every architecture's), so a build is
+# the same build whenever it is made: the digests v1.36.1 to v1.36.3 are
+# built from (ubuntu's, of November 1, 2026; the test stage is not
+# released). A newer base is taken by changing the digest here, in a
+# change CI checks.
+ARG BUILD_BASE=docker.io/library/almalinux:9@sha256:245f8aab832fe800aa42bdab5fad75ebbd8e0b4c9f24820a83c638b177857ae2
+ARG RUNTIME_BASE=registry.access.redhat.com/ubi9/ubi-minimal:latest@sha256:bba2b4bbf0ed15cfe7dd72a1e17ae7d2015a141f306b304e1a2785c41400e39c
+ARG TEST_BASE=docker.io/library/ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
+ARG GO_BASE=docker.io/library/golang:1.27@sha256:e519d3b0a5b285e5aa53ab9eef02bc6bbb9cb04608389b743a136a9ce75f0d1e
+# Red Hat's container certification (preflight) asks for these labels, and
+# that none of name, vendor and maintainer is Red Hat's, which the UBI base
+# image's are: so each is set here, for the runtime image and the node image.
+# The release workflow passes the version and the commit.
+ARG VAREK_VERSION=dev
+ARG VAREK_RELEASE=1
+ARG VAREK_REVISION=unknown
+ARG VAREK_VENDOR="Sober Agentic Infrastructure, Inc."
+ARG VAREK_MAINTAINER="Sober Agentic Infrastructure, Inc. <kenneth.douglas@soberagents.ai>"
 
 FROM ${BUILD_BASE} AS build
 COPY packaging/container/deps.sh /usr/local/sbin/varek-deps
@@ -40,7 +55,8 @@ RUN make -C /src/varek/v1_4 clean all varek-init \
 FROM ${GO_BASE} AS build-go
 COPY varek/v1_4/k8s /src/k8s
 RUN cd /src/k8s && CGO_ENABLED=0 go build -trimpath -o /node/opt/varek/varek-nri ./cmd/varek-nri \
- && CGO_ENABLED=0 go build -trimpath -o /node/opt/varek/varek-admission ./cmd/varek-admission
+ && CGO_ENABLED=0 go build -trimpath -o /node/opt/varek/varek-admission ./cmd/varek-admission \
+ && CGO_ENABLED=0 go build -trimpath -o /node/opt/varek/varek-svid ./cmd/varek-svid
 
 FROM ${RUNTIME_BASE} AS runtime
 COPY packaging/container/deps.sh /usr/local/sbin/varek-deps
@@ -48,10 +64,31 @@ COPY packaging/container/RPM-GPG-KEY-EPEL-9 /tmp/RPM-GPG-KEY-EPEL-9
 RUN varek-deps runtime && rm -f /usr/local/sbin/varek-deps
 COPY --from=build /out/ /
 COPY LICENSE NOTICE /opt/varek/
+# preflight's HasLicense: the licenses in /licenses
+COPY LICENSE NOTICE /licenses/
+ARG VAREK_VERSION
+ARG VAREK_RELEASE
+ARG VAREK_REVISION
+ARG VAREK_VENDOR
+ARG VAREK_MAINTAINER
 LABEL org.opencontainers.image.title="VAREK" \
-      org.opencontainers.image.description="The Warden: kernel-enforced, proof-checked authorization for what an AI agent's process does" \
+      org.opencontainers.image.description="The Warden: decides each call of an AI agent's process against its policy, in the kernel, and records every decision in a signed stream" \
       org.opencontainers.image.source="https://github.com/kwdoug63/varek" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.vendor="${VAREK_VENDOR}" \
+      name="varek" \
+      vendor="${VAREK_VENDOR}" \
+      maintainer="${VAREK_MAINTAINER}" \
+      version="${VAREK_VERSION}" \
+      release="${VAREK_RELEASE}" \
+      summary="VAREK's Warden: an AI agent's process run under a policy it cannot leave" \
+      description="The Warden decides each call of an AI agent's process against its policy, in the kernel (seccomp), and records every decision in a signed, chained stream that the audit checks." \
+      url="https://github.com/kwdoug63/varek" \
+      io.k8s.display-name="VAREK" \
+      io.k8s.description="The Warden: an AI agent's process run under a policy, every decision recorded" \
+      com.redhat.component="varek" \
+      vcs-type="git" \
+      vcs-ref="${VAREK_REVISION}"
 # The project is mounted here; the verdict stream goes to /var/log/varek (a
 # volume), a signing key, if any, comes from a mounted secret.
 WORKDIR /work
@@ -80,7 +117,13 @@ FROM runtime AS node
 COPY --from=build /node/ /
 COPY --from=build-go /node/ /
 LABEL org.opencontainers.image.title="VAREK node" \
-      org.opencontainers.image.description="The Warden's node agent, NRI plugin, launcher and admission webhook, for Kubernetes"
+      org.opencontainers.image.description="The Warden's node agent, NRI plugin, launcher and admission webhook, for Kubernetes" \
+      name="varek-node" \
+      summary="VAREK on Kubernetes: the Warden's node agent, NRI plugin, launcher and admission webhook" \
+      description="The node image of VAREK's Helm chart: the Warden's node agent, which decides each call of a supervised pod's containers from outside them and records every decision in a signed stream; the NRI plugin; the launcher; and the admission webhook." \
+      io.k8s.display-name="VAREK node" \
+      io.k8s.description="The Warden's node agent, NRI plugin, launcher and admission webhook, for Kubernetes" \
+      com.redhat.component="varek-node"
 WORKDIR /
 ENTRYPOINT []
 CMD ["/opt/varek/warden"]

@@ -333,8 +333,10 @@ static const char *const kDryNever[] = {
 };
 
 static int add_dry_rest(scmp_filter_ctx ctx, int file_changes) {
+    /* getpgid: admitted for 0 only (glibc's getpgrp() on arm64), refused
+     * otherwise, in a dry run as when enforcing */
     static const char *const kConditional[] = { "clone", "clone3", "ioctl", "kill", "sendto", "setsockopt",
-                                                "unshare", "io_uring_setup", NULL };
+                                                "unshare", "io_uring_setup", "getpgid", NULL };
     for (int nr = 0; nr < 1024; nr++) {
         char *n = seccomp_syscall_resolve_num_arch(SCMP_ARCH_NATIVE, nr);
         if (!n) continue;
@@ -383,7 +385,7 @@ static int deny_ns_bits(scmp_filter_ctx ctx, int sysnr) {
 // No other rule names clone3, and this one is the same in enforce, observe and
 // non-strict builds.
 #ifndef __NR_clone3
-#define __NR_clone3 435   // x86_64; the Warden supports x86_64 only
+#define __NR_clone3 435   // the same on x86_64 and aarch64
 #endif
 static int add_clone3(scmp_filter_ctx ctx) {
     int nr = seccomp_syscall_resolve_name("clone3");
@@ -571,6 +573,13 @@ static int build(scmp_filter_ctx *out_ctx, int observe, int flags) {
     // kill(-pgid) fall to the default refusal all the same, for a run with
     // VAREK_WARDEN_NO_PIDNS=1, where -1 would reach every process of its user.
     if ((rc = allow_int_range(ctx, SCMP_SYS(kill), 0, 1, 0x7fffffffull, NULL)) < 0) goto fail;
+    // v1.33 (arm64's first CI run): getpgid(0), the caller's own process
+    // group, under every policy, as getpgrp is from v1.31.1: arm64 has no
+    // getpgrp, and glibc's getpgrp() calls getpgid(0) there, so bash could
+    // not start under a policy before 1.29. From 1.29 getpgid is admitted for
+    // any pid (kAdmit129).
+    if (!file_changes &&
+        (rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(getpgid), 1, SCMP_A0(SCMP_CMP_EQ, 0))) < 0) goto fail;
     if ((rc = add_list(ctx, kAdmit, SCMP_ACT_ALLOW)) < 0) goto fail;
     if ((rc = deny_ns_bits(ctx, SCMP_SYS(clone))) < 0) goto fail;
     if ((rc = deny_ns_bits(ctx, SCMP_SYS(unshare))) < 0) goto fail;

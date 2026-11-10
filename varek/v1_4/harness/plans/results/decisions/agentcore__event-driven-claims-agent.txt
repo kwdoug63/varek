@@ -1,0 +1,4 @@
+/var/tmp/varek-plan-corpus3/policies/agentcore__event-driven-claims-agent.policy: glob tokens 1151 of 4096
+/var/tmp/varek-plan-corpus3/policies/agentcore__event-driven-claims-agent.policy: 29 rules, 0 can never fire
+
+  OK    /var/tmp/varek-plan-corpus3/plans/agentcore__event-driven-claims-agent.plan: authorized under /var/tmp/varek-plan-corpus3/policies/agentcore__event-driven-claims-agent.policy (28 actions)

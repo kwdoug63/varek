@@ -1,0 +1,30 @@
+# plan_corpus.py: the "named" policy, from the plan's own steps
+require warden 1.35
+proxy inspect
+allow path /usr/ readonly
+allow path /lib/ readonly
+allow path /lib64/ readonly
+allow path /etc/ readonly
+allow path /proc/self/ readonly
+allow path exact /dev/null
+allow path exact /dev/urandom readonly
+allow path /tmp/
+allow path exact /proc/stat readonly
+allow path exact /proc/cpuinfo readonly
+allow path exact /proc/meminfo readonly
+allow path exact /proc/sys/crypto/fips_enabled readonly
+allow path /sys/devices/system/cpu/ readonly
+allow path /sys/fs/cgroup/ readonly
+allow path /app/ readonly
+allow host bedrock-agentcore.us-east-1.amazonaws.com:443
+allow host xray.us-east-1.amazonaws.com:443
+allow host logs.us-east-1.amazonaws.com:443
+allow host itincidentgateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com:443
+allow mcp https://itincidentgateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp initialize
+allow mcp https://itincidentgateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp notifications/initialized
+allow mcp https://itincidentgateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp tools/list
+allow mcp https://itincidentgateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp tools/call lookup-user___lookup_user
+allow mcp https://itincidentgateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp tools/call get-process-info___get_process_info
+allow mcp https://itincidentgateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp tools/call create-change-request___create_change_request
+allow mcp https://itincidentgateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp tools/call query-kb___query_kb
+allow mcp https://itincidentgateway.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp tools/call x_amz_bedrock_agentcore_search
