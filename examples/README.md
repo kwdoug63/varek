@@ -6,6 +6,9 @@ Instead of relying on dynamically typed Python scripts, brittle YAML files, and 
 
 Below is an index of self-contained examples demonstrating how VAREK securely wraps and orchestrates existing tools and frameworks.
 
+## 🧾 Audit & Verification
+* **[Audit reconstructibility demo](./audit-demo/)** — One script that builds VAREK, runs an agent under the Warden (file opens, a direct connect, MCP calls and HTTPS through the egress proxy), audits the run from the saved log, policy, public key and anchor alone, and shows 18 kinds of tampering caught, including forged authorizations refused by the certificate checker with the signatures and anchor bypassed.
+
 ## 🔌 API & Microservices
 * **[FastAPI Inference Serving](./integrations/inference-serving/)** — VAREK handling pre/post-processing tensor shapes behind a FastAPI endpoint, before hitting PyTorch/ONNX.
 * **[External REST Boundaries](./integrations/fastapi-inference/)** — VAREK enforcing strict data contracts before sending payloads to dynamically typed Python microservices.
