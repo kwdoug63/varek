@@ -118,6 +118,22 @@ func TestKeyPublisher(t *testing.T) {
 	if _, ok := held("node-1-0f0f0f0f0f0f0f0f"); !ok {
 		t.Error("the old key's VarekNodeKey is gone")
 	}
+	// The stand-in API server holds the key before the publisher has read
+	// the response to its POST. Stopping now could cancel that read, and the
+	// publisher would log "not published yet: ... context canceled" last.
+	// Wait for the publisher to log the new key before stopping it.
+	for i := 0; ; i++ {
+		lm.Lock()
+		logged := len(logs) > 0 && strings.Contains(logs[len(logs)-1], "VarekNodeKey node-1-1e1e1e1e1e1e1e1e")
+		lm.Unlock()
+		if logged {
+			break
+		}
+		if i == 1000 {
+			t.Fatal("the publisher did not log the new key")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	stop()
 	select {
 	case <-done:
