@@ -678,9 +678,10 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
 /* v1.32 (D12): the Warden's own version, ahead of the grammar's when a
  * release adds no policy lines (v1.32.0: containers; v1.34.0: Kubernetes, the
  * node agent; the grammar stays 1.31; v1.36.0, docs/security/v1.36-
- * kubernetes-parity.md D12: Kubernetes at parity, the grammar stays 1.35) */
-#define VDP_WARDEN_REL_MINOR 36
-#define VDP_WARDEN_PATCH 3      /* v1.27.1: the Warden's version beyond the grammar's
+ * kubernetes-parity.md D12: Kubernetes at parity, the grammar stays 1.35;
+ * v1.37.0: macOS, through a Linux VM, the grammar stays 1.35) */
+#define VDP_WARDEN_REL_MINOR 37
+#define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's
                                  * (v1.36.1: packaging for Red Hat's certification;
                                  * v1.36.2: the node key published again, a test
                                  * for varek-crds; v1.36.3: the container a

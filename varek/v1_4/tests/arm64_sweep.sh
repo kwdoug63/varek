@@ -76,6 +76,11 @@ if [ "$DEPS" = 1 ]; then
         # gcc-c++ and cmake: z3 5 built from source (its aarch64 wheels need
         # glibc 2.38; RHEL 9 has 2.34), for the cross-check
         dnf -y install musl-gcc > /dev/null 2>&1 || echo "arm64_sweep.sh: note: no musl-gcc here (the musl checks skip)"
+        # gcc-toolset-13 (RHEL 9's AppStream): z3 5.4 and later need C++20's
+        # <format>, which RHEL 9's own GCC 11 lacks (November 10, 2026: z3
+        # 5.4.0's source build failed in the Mac's RHEL 9.8 guest)
+        dnf -y install gcc-toolset-13-gcc-c++ > /dev/null 2>&1 ||
+            echo "arm64_sweep.sh: note: no gcc-toolset-13 here (z3, built from source, may not build)"
     else
         echo "arm64_sweep.sh: --deps knows apt-get and dnf only"; exit 1
     fi
@@ -89,8 +94,13 @@ if [ "$DEPS" = 1 ]; then
     # half an hour)
     python3 -m pip install $BSP --ignore-installed --prefer-binary -q -r "$HERE/tools/requirements-test.txt" \
         pytest pyyaml || { echo "arm64_sweep.sh: pip failed"; exit 1; }
-    # the cross-check oracle's solver is optional: without it that check skips
-    python3 -m pip install $BSP --ignore-installed --prefer-binary -q -r "$HERE/tools/requirements-crosscheck.txt" ||
+    # the cross-check oracle's solver is optional: without it that check skips.
+    # Built from source, with gcc-toolset-13's compiler where RHEL has it
+    # (above); its libstdc++ additions are linked in, so z3 runs on the
+    # system's own
+    TS=/opt/rh/gcc-toolset-13/root/usr/bin ZCC=""
+    [ -x "$TS/g++" ] && ZCC="CC=$TS/gcc CXX=$TS/g++"
+    env $ZCC python3 -m pip install $BSP --ignore-installed --prefer-binary -q -r "$HERE/tools/requirements-crosscheck.txt" ||
         echo "arm64_sweep.sh: note: z3-solver did not install; the cross-check oracle skips"
 fi
 {

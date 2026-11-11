@@ -60,7 +60,7 @@ jobs:
         run: make -C varek/v1_4 all
       - name: Check the deployment scripts parse
         run: |
-          python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py varek/v1_4/tools/varek_bench.py varek/v1_4/tools/varek_node_export.py varek/v1_4/tools/varek_suggest.py
+          python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py varek/v1_4/tools/varek_bench.py varek/v1_4/tools/varek_node_export.py varek/v1_4/tools/varek_vm.py varek/v1_4/tools/varek_suggest.py
           bash -n varek/v1_4/tools/varek_preflight.sh
           bash -n varek/v1_4/tools/varek_anchor_receiver.sh
       - name: Lint the shipped policies
