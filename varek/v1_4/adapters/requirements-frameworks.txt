@@ -16,7 +16,7 @@ langchain-mcp-adapters==0.3.2
 openai-agents==0.24.0
 openai==3.46.0
 anthropic==2.6.0
-mcp==1.30.0
+mcp==2.3.0
 # read as data by the adapters, not imported; installed to check the specs
 # and settings the samples hold against what the framework's own tools write
 ibm-watsonx-orchestrate==2.19.1
