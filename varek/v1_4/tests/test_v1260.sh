@@ -78,6 +78,29 @@ pass()  { printf '  PASS   %s\n' "$1"; }
 flunk() { printf '  FAIL   %s\n' "$1"; fail=1; }
 skip()  { printf '  SKIP   %s\n' "$1"; skips=$((skips + 1)); }
 check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else flunk "$d"; fi; }
+# dns_start ZONE LOG READY: the test's DNS server (tests/dns_test_server.py) on
+# a fresh port, PORT, its pid in DNSPID. It waits up to 30 s for the server's
+# ready file and tries another port if the server exits first (a port in use);
+# 1 if it never starts, its output in $OUT/dns.out. Before, each start waited
+# 5 s and carried on regardless: a server not yet up made the Warden's lookups
+# fail (EAI_AGAIN in the agent), which read as a wrong answer about names.
+dns_start() {
+    local try
+    for try in 1 2 3; do
+        PORT=$((20000 + RANDOM % 20000)); rm -f "$3"
+        python3 "$HERE/tests/dns_test_server.py" --port "$PORT" --zone "$1" --log "$2" \
+            --ready "$3" > "$OUT/dns.out" 2>&1 &
+        DNSPID=$!
+        for _ in $(seq 300); do
+            [ -e "$3" ] && return 0
+            kill -0 "$DNSPID" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill "$DNSPID" 2>/dev/null; wait "$DNSPID" 2>/dev/null
+    done
+    return 1
+}
+dns_started() { dns_start "$@" || flunk "the test's DNS server started (it did not: $(tail -1 "$OUT/dns.out" 2>/dev/null))"; }
 trap '[ -n "${KEEP:-}" ] && echo "kept $OUT" || rm -rf "$OUT"' EXIT
 
 echo "== 1. policy grammar =="
@@ -242,13 +265,9 @@ except OSError as e:
     print("REFUSED", e.errno, flush=True)
 PY
     chmod 644 "$W/agent.py"
-    PORT=$((20000 + RANDOM % 20000))
     printf '{"api.example.com": {"ttl": 30, "a": ["10.9.9.1"]}, "ssh.example.com": {"ttl": 30, "a": ["10.9.9.2"]}, "both.example.com": {"ttl": 30, "a": ["10.9.9.3"]}, "x.svc.example.com": {"ttl": 30, "a": ["10.9.9.4"]}}\n' > "$OUT/zone.json"
     : > "$OUT/q.log"
-    python3 "$HERE/tests/dns_test_server.py" --port "$PORT" --zone "$OUT/zone.json" --log "$OUT/q.log" \
-        --ready "$OUT/ready" > "$OUT/dns.out" 2>&1 &
-    DNSPID=$!
-    for _ in $(seq 50); do [ -e "$OUT/ready" ] && break; sleep 0.1; done
+    dns_started "$OUT/zone.json" "$OUT/q.log" "$OUT/ready"
     PATHS="allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ld.so.cache readonly\nallow path $W/ readonly\n"
     POL="$OUT/syn.policy"
     printf "require warden 1.26\nproxy on\nallow host api.example.com:443\nallow host ssh.example.com:22\nallow host both.example.com:443\nallow host both.example.com:22\n$PATHS" > "$POL"
@@ -640,13 +659,10 @@ http.server.ThreadingHTTPServer((sys.argv[2], int(sys.argv[1])),
                                 functools.partial(H, directory=sys.argv[3])).serve_forever()
 PY
     SRV="$SRV $!"
-    PORT=$((20000 + RANDOM % 20000))
     printf '{"api.example.com": {"ttl": 30, "a": ["%s"]}, "a.svc.example.com": {"ttl": 30, "a": ["%s"]}, "b.svc.example.com": {"ttl": 30, "a": ["%s"]}, "lo.example.com": {"ttl": 30, "a": ["127.0.0.1"]}, "den.example.com": {"ttl": 30, "a": ["192.0.2.77"]}, "m6.example.com": {"ttl": 30, "aaaa": ["::ffff:127.0.0.1"]}, "d6.example.com": {"ttl": 30, "aaaa": ["::ffff:192.0.2.77"]}}\n' \
         "$HOSTIP" "$HOSTIP" "$HOSTIP" > "$OUT/zone6.json"
-    rm -f "$OUT/ready6"
-    python3 "$HERE/tests/dns_test_server.py" --port "$PORT" --zone "$OUT/zone6.json" --log "$OUT/q6.log" \
-        --ready "$OUT/ready6" > /dev/null 2>&1 &
-    DNSP=$!
+    dns_started "$OUT/zone6.json" "$OUT/q6.log" "$OUT/ready6"
+    DNSP=$DNSPID
     SRV="$SRV $DNSP"
     for _ in $(seq 50); do
         [ -e "$OUT/ready6" ] && python3 -c "import socket; socket.create_connection(('$HOSTIP', $HP), 0.2); socket.create_connection(('$HOSTIP', $TP), 0.2)" 2>/dev/null && break
@@ -976,13 +992,11 @@ import json, sys
 z = json.load(open(sys.argv[1])); z["squid.example.com"] = {"ttl": 30, "a": [sys.argv[2]]}
 json.dump(z, open(sys.argv[1], "w"))
 PY
-        kill $DNSP 2>/dev/null
-        rm -f "$OUT/ready6"
-        python3 "$HERE/tests/dns_test_server.py" --port "$PORT" --zone "$OUT/zone6.json" --log "$OUT/q6.log" \
-            --ready "$OUT/ready6" > /dev/null 2>&1 &
-        DNSP=$!
+        # a fresh port: the server just killed may still hold the old one
+        kill $DNSP 2>/dev/null; wait $DNSP 2>/dev/null
+        dns_started "$OUT/zone6.json" "$OUT/q6.log" "$OUT/ready6"
+        DNSP=$DNSPID
         SRV="$SRV $DNSP"
-        for _ in $(seq 50); do [ -e "$OUT/ready6" ] && break; sleep 0.1; done
         POLN="$OUT/upname.policy"
         upol "http://squid.example.com:$SP" > "$POLN"
         env -i PATH=/usr/bin:/bin timeout 90 "$WARDEN" "$POLN" --dns-server "127.0.0.1:$PORT" -- \

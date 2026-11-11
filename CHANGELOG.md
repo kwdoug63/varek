@@ -32,6 +32,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   (`node/SUITE.timeout/`), so a stalled case can be read after the run;
   before, they went with the run's directory unless `VAREK_SWEEP_KEEP` was
   set.
+- **Tests.** `tests/test_v1260.sh` starts its DNS server and checks that it
+  started: up to 30 s for it to be ready, another port if it exits first (a
+  port in use), and a plain failure if it never starts. Each start waited
+  5 s and carried on regardless, and the upstream section restarted the
+  server on the port it had just killed. On the Mac's sweep inside the VM,
+  the agent's lookups of the two names that needed the server failed
+  (`EAI_AGAIN`), three checks about names; the suite passed when run again.
+  A server that was not answering is the likely cause, and is now reported
+  as that.
 
 ## [1.36.3] - 2026-11-04 — The container a connection names, confirmed
 
