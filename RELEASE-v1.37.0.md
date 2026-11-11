@@ -1,6 +1,6 @@
 # VAREK v1.37.0 — macOS, Through a Linux VM
 
-**Draft until the Mac's checks, the full sweep and the 24-hour soak pass on the EC2 Mac on this code** (`docs/security/v1.33-mac-runbook.md`). Planned as v1.30.0, then v1.33.0; numbered v1.37.0 on November 10, 2026, when main (v1.36.3) was merged into its branch. The October runs below were on 1.33.0's code (v1.32.1's Warden with arm64 and the VM); they are run again on 1.37.0's.
+The Mac's checks, the full sweep inside the VM and the 24-hour soak passed on the EC2 Mac on this code, November 10 and 11, 2026 (`docs/security/v1.33-mac-runbook.md`; below). Planned as v1.30.0, then v1.33.0; numbered v1.37.0 on November 10, 2026, when main (v1.36.3) was merged into its branch. The October runs, also below, were on 1.33.0's code (v1.32.1's Warden with arm64 and the VM).
 
 > Reviewed by three AI review agents (October 19, 2026; the arm64 Warden, the
 > VM path, and the tests, CI, tools and documentation), against the code; their
@@ -42,9 +42,42 @@ changes meaning.
 
 - Every suite on arm64 Linux (an AWS Graviton instance, RHEL 9.8) and on
   x86-64; CI on both (`ubuntu-24.04` and `ubuntu-24.04-arm`).
-- On an EC2 Mac (`mac2.metal`, Macmini9,1, M1; macOS 15.8; vfkit 0.6.4;
-  a RHEL 9.8 aarch64 guest, 4 vCPUs, 4 GiB), `tests/mac_check.sh`,
-  October 20, 2026: every check passes (the Mac; the VM made from Red
+- **On 1.37.0's code, on an EC2 Mac** (`mac2.metal`; a RHEL 9 aarch64
+  guest), November 10 and 11, 2026:
+  - `tests/mac_check.sh`, November 10: every check of the Mac and the VM
+    passes, and the soak's 6-minute trial. The full sweep inside the VM:
+    every suite passes but test-v1260, 3 of 157 checks, all in its
+    synthetic-address section: the two names that need the test's own DNS
+    server (`ssh.example.com`, `both.example.com`) failed to resolve
+    (`EAI_AGAIN`), while every name the Warden answers itself was right.
+    Run again in the same VM, the suite passed (156 passed, 1 skipped).
+    The test waited 5 s for its DNS server and carried on whether it had
+    started or not; it now waits up to 30 s and fails plainly if the
+    server never starts (#169).
+  - `tests/mac_check.sh --sweep`, November 11, with #169's
+    `test_v1260.sh`: `mac_check.sh: PASS`. Every suite passes inside the
+    VM, among them test-v1130, test-v1140 and test-v1150, `make
+    crosscheck` (519 s; z3 5.0 built from source), test-v1240 (105 passed,
+    0 failed, 3 skipped) and test-v1260 (156 passed, 0 failed, 1 skipped).
+  - **24 hours inside the VM** (`tests/mac_soak.sh`, the shared soak),
+    November 10 to 11, from 12:18 pm CST: `soak_check: PASS`.
+
+    | | |
+    |---|---|
+    | Duration | 24.0 h, a turn every 60 s: 1,440 turns in each run; Warden 1.37.0 (aarch64) |
+    | Run A | every task before the user's token expired worked (`tools/list` 259, `tools/call` 258, `fs` reads 258, `gh`'s calls 258, sub-agent launches 258); 144 probes, all held; the run revoked 0.03 s after the expiry, no turn after it working (4); 258 requests carried the credential, 0 swaps refused; the audit passing; OCSF: 12,259 events, the stream's (14,945 records, the chain intact), valid OCSF 1.9.0 |
+    | Run B | 1,296 of 1,296 pieces of work done, 288 git commits; 144 probes, all refused; the stream signed (464,024 records), the audit passing |
+    | Run C (dry run) | 1,440 of 1,440 done; 5,766 calls the narrower policy refuses let through and recorded; the audit (493,610 records): `VERIFIED: DRY RUN, NOT ENFORCED`; `varek policy suggest`: 41 exact rules; under the draft, 12 of 12 done and nothing let through |
+    | The Warden's decisions | the agent's MCP calls p50 33 µs (p99 49); `gh`'s MCP calls p50 37 µs (p99 46); the agent's opens p50 169 µs (p99 514); `fs`'s opens p50 372 µs (p99 3,068) |
+    | Memory | each Warden 14.1 to 14.5 MB at the start and 14.4 to 16.3 MB at most; A's rose 1.6 MB in the first 10 minutes and 0.2 MB in the 23 h 50 min after; the proxy, `warden-secrets` and the two MCP servers 8 to 19 MB, flat (144 samples each) |
+
+    Every stream was judged in the one pass, C's included.
+
+  The summaries, the soak's report and its files were kept
+  (`s3://varek-mac-results-982471468969/`) before the Mac was terminated.
+- **On 1.33.0's code** (October 20 and 21, 2026). On an EC2 Mac
+  (`mac2.metal`, Macmini9,1, M1; macOS 15.8; vfkit 0.6.4; a RHEL 9.8
+  aarch64 guest, 4 vCPUs, 4 GiB), `tests/mac_check.sh`, October 20, 2026: every check passes (the Mac; the VM made from Red
   Hat's image, checked by its SHA-256, and registered; its cold start;
   `varek doctor` inside; one share, the project; root in the VM reaching
   no file of the Mac's by a link or `..`; an agent under the Warden in the
@@ -62,9 +95,9 @@ changes meaning.
   wheels need glibc 2.38). test-v1240: 6 of 106 checks, each an agent's
   connect to the VM's own address after a name the Warden resolved
   (`python: and connects`, `curl: fetches from an allowed name`, three
-  reached-address checks); the name checks before them pass. Not yet
-  explained (they pass on arm64 RHEL 9.8 on a Graviton instance); the
-  logs went with the instance. A known limit until it is: below.
+  reached-address checks); the name checks before them pass. Not
+  explained (they pass on arm64 RHEL 9.8 on a Graviton instance, and in
+  the VM on 1.37.0's code); the logs went with the instance.
 - **24 hours inside the VM on the Mac** (`tests/mac_soak.sh`, the shared
   soak), October 20 to 21, 2026, 9:47 pm to 9:47 pm CDT: `soak_check:
   PASS`.
@@ -81,8 +114,10 @@ changes meaning.
   The first judging stopped at C's audit: the audit, holding C's stream
   (476,082 records) in memory, reached 1.86 GB, and the VM (4 GiB, no
   swap) ended it (out of memory). With 4 GiB of swap added, the same
-  records were judged again (`soak.sh --check-only`): PASS. A known limit,
-  below.
+  records were judged again (`soak.sh --check-only`): PASS. That was
+  1.33.0's audit: since v1.36.0 the audit reads a stream once, in memory
+  bounded by the policy and the plan (`RELEASE-v1.36.0.md`), and on
+  1.37.0's code C's audit (493,610 records) passed in the one pass.
 
 ## Known limits
 
@@ -99,9 +134,7 @@ From the review (`docs/security/v1.30-macos.md`, Review):
   Warden keep it from the agent.
 - A statically linked musl agent records `O_LARGEFILE` on arm64 and not on
   x86-64.
-- The audit holds a run's whole stream in memory: about 1.9 GB for 24
-  hours of a dry run's records (476,082). A long run's audit needs that
-  much memory, or swap.
 - test-v1240's connects to the machine's own address, after a name the
-  Warden resolved, failed in the VM on the Mac (6 checks, above): not yet
-  explained.
+  Warden resolved, failed in the VM on the Mac on 1.33.0's code (6
+  checks, above) and passed on 1.37.0's, November 10 and 11; the October
+  failure is not explained.

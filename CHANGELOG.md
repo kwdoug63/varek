@@ -16,8 +16,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   policies, decisions, records and audit as on Linux. The Warden reports
   1.37.0; the grammar stays 1.35. Planned as v1.30.0, then v1.33.0; it takes
   v1.37.0, and security operations moves to v1.38.0 (November 10, 2026).
-  See `RELEASE-v1.37.0.md` (a draft until the Mac's checks, sweep and
-  24-hour soak pass on this code) and `docs/security/v1.30-macos.md`.
+  The Mac's checks, the full sweep inside the VM and the 24-hour soak
+  passed on this code on an EC2 Mac, November 10 and 11, 2026. See
+  `RELEASE-v1.37.0.md` and `docs/security/v1.30-macos.md`.
 - **OpenShift: the node agent's first pod is no longer refused.** Helm
   creates a SecurityContextConstraints, a kind it does not know, after a
   DaemonSet, so the `varek` chart's own SCC for its node agent did not yet
