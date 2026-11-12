@@ -412,6 +412,30 @@ def mcp_servers(specs, cwd, tmp):
     return out
 
 
+# v1.38: under the working directory, git's settings and hooks (its own,
+# a linked worktree's, a submodule's), each (matcher, pattern after the
+# directory). Prefixes where they will do; the globs have no ** (one that
+# crosses directories made the cross-check's solver search over the
+# baseline run out), so a submodule's are covered one level down
+# (.git/modules/NAME/), not a nested submodule's.
+GIT_PROTECTED = (
+    ("prefix", "/.git/config"),              # config, config.worktree, config.lock
+    ("prefix", "/.git/hooks"),               # the directory and every hook
+    ("glob", "/.git/worktrees/*/config*"),
+    ("glob", "/.git/modules/*/config*"),
+    ("glob", "/.git/modules/*/hooks"),
+    ("glob", "/.git/modules/*/hooks/*"),
+)
+# each denied as these flag clauses: every way an open (or a change by name,
+# decided as an open) writes
+GIT_WRITES = ("access=wo", "access=rw", "+O_CREAT", "+O_TRUNC")
+
+
+def glob_escape(s):
+    """s as a glob that matches it alone: each wildcard and backslash escaped"""
+    return re.sub(r"([*?\[\]{}\\])", r"\\\1", s)
+
+
 def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH, servers=(), ttys=()):
     """The baseline's text for this run (v1.31: with each --mcp server
     confined, under rules of its own). ttys: the terminals the agent is
@@ -431,6 +455,24 @@ def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH, servers=(), ttys=()):
     L.append("# anything no rule allows is refused. To change it, copy it, edit it and run")
     L.append("# with `varek run --policy FILE` (a dry run first: `--dry-run`).")
     L.append("require warden 1.31" if servers else "require warden 1.29")
+    L.append("")
+    # v1.38: git's settings and hooks in the working directory, never written:
+    # git runs what they name (a hook, core.fsmonitor, a filter), and on a
+    # Mac the project is shared with the VM, so the Mac's own git runs it
+    # too, outside the Warden. First in the policy (the first rule that
+    # matches decides), each a deny of a write: write-only, read-write, a
+    # creation, a truncation (a removal and a rename are decided as writes).
+    # Reads fall through to the rules below, the credential denies first.
+    # The Warden renames no directory and the baseline admits no link, so
+    # .git is not moved or linked around them. (Write-only denies, and at the
+    # top: an allow ... readonly and a deny of the same pattern, or rules
+    # among the others, made the cross-check's solver search run out.)
+    L.append("# --- git's settings and hooks in the working directory: never written (git runs")
+    L.append("# what they name: a hook, core.fsmonitor; on the host too when it is shared) ---")
+    for how, pat in GIT_PROTECTED:
+        p = (glob_escape(cwd) if how == "glob" else cwd) + pat
+        for fl in GIT_WRITES:
+            L.append(f"deny  path {how} {p} {fl}")
     L.append("")
     L.append("# --- the certificate authorities (public), read-only, before the key patterns ---")
     for r, c in TRUST_READS:

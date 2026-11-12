@@ -111,6 +111,11 @@ echo "project file a" > "$AG/proj/a"; echo "project file b" > "$AG/proj/b"
 echo "the agent's own" > "$AG/agent_only"; echo "fs's own" > "$AG/srv_only"
 chmod 644 "$AG/proj/a" "$AG/proj/b" "$AG/agent_only" "$AG/srv_only"
 for d in b c; do printf 'A project for the shared soak (run %s).\n' "$d" > "$OUT/$d/work/README"; chmod 644 "$OUT/$d/work/README"; done
+# each project a git repository already, as a project is: from v1.38 the
+# baseline never writes the working directory's .git/config, so the agent
+# cannot make one there (git init); its commits are its own, as before
+for d in b c; do runuser -u nobody -- git -c init.defaultBranch=main init -q "$OUT/$d/work" ||
+    { echo "soak.sh: git init in $OUT/$d/work failed"; exit 1; }; done
 PIDS=""
 trap 'kill $PIDS 2>/dev/null' EXIT
 
