@@ -54,6 +54,17 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   A server that was not answering is the likely cause, and is now reported
   as that.
 
+- **Release: each node image's own digest signed and verified.** Docker's
+  containerd image store, now on GitHub's x86-64 runners, pushes one
+  platform's image as an index of the image and its build's attestation.
+  The index for both platforms lists the image, so the release's recursive
+  signature covered the image, while the verify step checked that
+  one-platform index and found no signature: v1.37.0's release run on
+  87264bc stopped there, after the images and charts were published and
+  signed, before `:1.37` and `:latest` moved. `platforms.py --image` gives
+  the platform's image digest from such an index, and the release takes it
+  for amd64 and arm64 before signing and verifying.
+
 ## [1.36.3] - 2026-11-04 — The container a connection names, confirmed
 
 A security patch release of 1.36.2; the Warden reports 1.36.3 and decides

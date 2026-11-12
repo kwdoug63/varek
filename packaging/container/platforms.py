@@ -8,6 +8,14 @@
 # runs it on the node image before signing it.
 #
 #   platforms.py INDEX.json linux/amd64 linux/arm64
+#
+# platforms.py --image MANIFEST.json PLATFORM: the digest of that platform's
+# image when MANIFEST is an index of one platform's image (with a build's
+# attestation, as Docker's containerd image store pushes a single-platform
+# image); nothing when MANIFEST is an image itself, whose digest the caller
+# already has. The release takes the image's own digest this way, since the
+# index for both platforms lists the image and not that one platform's index,
+# and so `cosign sign --recursive` signs the image and not that index.
 import json
 import sys
 
@@ -29,9 +37,40 @@ def platforms(index):
     return sorted(out)
 
 
+INDEX_TYPES = ("application/vnd.oci.image.index.v1+json",
+               "application/vnd.docker.distribution.manifest.list.v2+json")
+
+
+def image_digest(manifest, platform):
+    """The digest of PLATFORM's image in an index; None for an image itself."""
+    if manifest.get("mediaType") not in INDEX_TYPES:
+        return None
+    found = []
+    for m in manifest.get("manifests", []):
+        p = m.get("platform") or {}
+        v = p.get("variant")
+        if p.get("architecture") == "arm64" and v == "v8":
+            v = None
+        if "/".join(x for x in (p.get("os"), p.get("architecture"), v) if x) == platform:
+            found.append(m["digest"])
+    if len(found) != 1:
+        raise ValueError(f"the index names {platform} {len(found)} times, not once")
+    return found[0]
+
+
 def main(argv):
+    if len(argv) == 4 and argv[1] == "--image":
+        try:
+            with open(argv[2]) as f:
+                d = image_digest(json.load(f), argv[3])
+        except (OSError, ValueError, KeyError) as e:
+            print(f"platforms.py: {e}", file=sys.stderr)
+            return 1
+        if d:
+            print(d)
+        return 0
     if len(argv) < 3:
-        print("usage: platforms.py INDEX.json PLATFORM...", file=sys.stderr)
+        print("usage: platforms.py INDEX.json PLATFORM... | platforms.py --image MANIFEST.json PLATFORM", file=sys.stderr)
         return 2
     try:
         with open(argv[1]) as f:

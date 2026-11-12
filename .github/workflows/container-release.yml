@@ -127,6 +127,11 @@ jobs:
           docker push "$NODE:$VERSION-arm64"
           digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$NODE:$VERSION-arm64")"
           [[ "$digest" == "$NODE@sha256:"* ]] || { echo "no digest for $NODE:$VERSION-arm64: $digest"; exit 1; }
+          # the image's own digest where Docker pushed an index of it (its
+          # containerd image store): the index for both lists the image
+          docker buildx imagetools inspect --raw "$digest" > node-arm64.json
+          d="$(python3 packaging/container/platforms.py --image node-arm64.json linux/arm64)"
+          if [ -n "$d" ]; then digest="$NODE@$d"; fi
           cosign sign --yes "$digest"
           echo "pushed and signed $digest as $VERSION-arm64"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
@@ -261,6 +266,15 @@ jobs:
         run: |
           docker push "$NODE:$VERSION-amd64"
           amd64="$(docker inspect --format '{{index .RepoDigests 0}}' "$NODE:$VERSION-amd64")"
+          # Docker's containerd image store pushes one platform's image as an
+          # index (the image and its build's attestation); the index for both
+          # lists the image, and the recursive signature below covers the
+          # image, not that index, so NODE_AMD64 is the image's own digest
+          # (v1.37.0's release run on 87264bc verified that index and found
+          # no signature)
+          docker buildx imagetools inspect --raw "$amd64" > node-amd64.json
+          d="$(python3 packaging/container/platforms.py --image node-amd64.json linux/amd64)"
+          if [ -n "$d" ]; then amd64="$NODE@$d"; fi
           [[ "$ARM64" == "$NODE@sha256:"* ]] || { echo "node-arm64 gave no digest: $ARM64"; exit 1; }
           docker buildx imagetools create -t "$NODE:$VERSION" "$amd64" "$ARM64"
           # the image for both: exactly linux/amd64 and linux/arm64 (a build's
