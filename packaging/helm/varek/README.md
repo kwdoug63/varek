@@ -71,13 +71,13 @@ one of those alone.
 To check the signatures first:
 
 ```sh
-cosign verify ghcr.io/kwdoug63/charts/varek:1.36.3 \
-  --certificate-identity https://github.com/kwdoug63/varek/.github/workflows/container-release.yml@refs/tags/v1.36.3 \
+cosign verify ghcr.io/kwdoug63/charts/varek:1.37.0 \
+  --certificate-identity https://github.com/kwdoug63/varek/.github/workflows/container-release.yml@refs/tags/v1.37.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-and the same for `ghcr.io/kwdoug63/charts/varek-crds:1.36.3` and
-`ghcr.io/kwdoug63/varek-node:1.36.3`. From v1.36 the node
+and the same for `ghcr.io/kwdoug63/charts/varek-crds:1.37.0` and
+`ghcr.io/kwdoug63/varek-node:1.37.0`. From v1.36 the node
 image is one image for amd64 and arm64, and each architecture's is also
 tagged `:<version>-amd64` and `:<version>-arm64`, signed the same way, with
 its bill of materials attested on it (`cosign verify-attestation --type
