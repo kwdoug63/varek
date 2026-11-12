@@ -35,8 +35,8 @@ at all.
   calls on arm64 (arm64 has no `getpgrp`), as `getpgrp` is on x86-64.
 
 It is v1.36.3's Warden with the above (the arm64 Warden and `getpgid(0)` reached main
-first, in v1.34.0 to v1.36.0); no policy line, rule or record
-changes meaning.
+first, in v1.35.0, and the arm64 node image in v1.36.0); no policy line, rule or
+record changes meaning.
 
 ## Tested
 
