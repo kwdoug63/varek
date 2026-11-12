@@ -412,6 +412,22 @@ def mcp_servers(specs, cwd, tmp):
     return out
 
 
+# v1.38: under the working directory, git's settings and hooks (its own,
+# a submodule's, a linked worktree's), each a glob after the directory
+GIT_PROTECTED = (
+    "/.git/config*",
+    "/.git/hooks**",
+    "/.git/worktrees/*/config*",
+    "/.git/modules/**/config*",
+    "/.git/modules/**/hooks**",
+)
+
+
+def glob_escape(s):
+    """s as a glob that matches it alone: each wildcard and backslash escaped"""
+    return re.sub(r"([*?\[\]{}\\])", r"\\\1", s)
+
+
 def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH, servers=(), ttys=()):
     """The baseline's text for this run (v1.31: with each --mcp server
     confined, under rules of its own). ttys: the terminals the agent is
@@ -451,6 +467,22 @@ def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH, servers=(), ttys=()):
         if not (t.startswith("/dev/pts/") and t[9:].isdigit()):
             raise BaselineError(f"{t}: not a terminal under /dev/pts/")
         L.append(f"{'allow path exact ' + t:<52} # the terminal varek run was started on")
+    L.append("")
+    # v1.38: git's settings and hooks in the working directory, read-only:
+    # git runs what they name (a hook, core.fsmonitor, a filter), and on a
+    # Mac the project is shared with the VM, so the Mac's own git runs it
+    # too, outside the Warden. Each is read (the allow, read-only) and
+    # refused anything else (the deny: a write, a creation, a truncation,
+    # a removal, a rename to or from it), before the working directory's
+    # rule, since the first rule that matches decides. The Warden renames no
+    # directory and the baseline admits no link, so .git is not moved or
+    # linked around them. config* takes in config.worktree and git's
+    # config.lock (a git config in the run fails at its lock, not after it).
+    L.append("# --- git's settings and hooks in the working directory: read, never written (git")
+    L.append("# runs what they name: a hook, core.fsmonitor; on the host too when it is shared) ---")
+    for pat in GIT_PROTECTED:
+        L.append(f"allow path glob {glob_escape(cwd)}{pat} readonly")
+        L.append(f"deny  path glob {glob_escape(cwd)}{pat}")
     L.append("")
     L.append("# --- the working directory and the agent's temporary directory (TMPDIR) ---")
     L.append(f"allow path exact {cwd} readonly")
