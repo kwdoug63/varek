@@ -255,7 +255,8 @@ else flunk "the cross-check: the three parsers agree on the claude baseline ($(t
 check "the credential stores come before any allow rule but the CA bundles'" python3 -c "
 import sys
 L = [l.split('#')[0].strip() for l in open('$OUT/gen/none.txt')]
-last_deny = max(k for k, l in enumerate(L) if l.startswith('deny '))
+# (v1.38: git's settings and hooks, each an allow readonly and a deny after it, come later)
+last_deny = max(k for k, l in enumerate(L) if l.startswith('deny ') and '/.git/' not in l)
 early = [l for l in L[:last_deny] if l.startswith('allow ')]
 ok = all(l.endswith(' readonly') and any(s in l for s in ('/etc/ssl/', '/etc/pki/', '/usr/local/ssl/', '/certifi/')) for l in early)
 sys.exit(0 if early and ok and any('contains /.ssh/' in l for l in L[:last_deny + 1]) else 1)"
