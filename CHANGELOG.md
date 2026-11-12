@@ -10,6 +10,20 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Changed
+- **`varek vm`: a packet filter on the Mac keeps the VM from the Mac and
+  its networks.** vmnet's NAT made the Mac the guest's gateway: root in the
+  VM (not under the Warden) reached the Mac's services, its networks and,
+  on an EC2 Mac, the instance metadata service (a v1.37.0 known limit).
+  `varek vm start` and `init` load pf rules, by the VM's address, into an
+  anchor of their own (`com.apple/varek-vm`) with sudo, after the VM has
+  its address and before the project is mounted; `stop` flushes them. The
+  Mac's ssh to the VM, the VM's DNS and DHCP, and the Internet pass;
+  anything else to the Mac, link-local addresses, the private ranges and
+  shared address space is dropped, and IPv6 on vmnet's bridge. A start
+  whose rules do not load is refused; `VAREK_VM_FIREWALL=off` starts
+  without them. `mac_check.sh` now requires that root in the VM does not
+  reach the Mac or the metadata service, and that DNS and the Internet
+  work. Not yet run on a Mac.
 - **`varek vm run`: the agent runs as a user of its own in the VM, without
   sudo.** It ran as the VM's user, `varek`, who has sudo without a password
   (kept from the agent by `no_new_privs` and the Warden; a v1.37.0 known
