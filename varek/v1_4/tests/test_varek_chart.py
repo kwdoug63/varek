@@ -791,6 +791,42 @@ def test_ci_and_the_release_build_check_and_sign_the_node_image_and_the_chart():
     assert pub.index("platforms.py") < pub.index("cosign sign")
 
 
+def test_the_release_signs_and_verifies_each_platform_image_not_an_index_of_it():
+    """v1.37.0: Docker's containerd image store pushes one platform's image as
+    an index (the image and its build's attestation). The index for both
+    platforms lists the image, so cosign sign --recursive signs the image and
+    not that one platform's index; the release takes each platform's image
+    digest (platforms.py --image) before signing and verifying it"""
+    wf = open(os.path.join(ROOT, ".github", "workflows", "container-release.yml")).read()
+    for a in ("amd64", "arm64"):
+        assert f"platforms.py --image node-{a}.json linux/{a}" in wf, a
+    assert wf.index("platforms.py --image node-amd64.json") < wf.index('docker buildx imagetools create -t "$NODE:$VERSION" "$amd64" "$ARM64"')
+    assert wf.index("platforms.py --image node-arm64.json") < wf.index('cosign sign --yes "$digest"')
+    py = os.path.join(ROOT, "packaging", "container", "platforms.py")
+    idx = "application/vnd.oci.image.index.v1+json"
+    one = {"mediaType": idx, "manifests": [
+        {"digest": "sha256:" + "a" * 64, "platform": {"os": "linux", "architecture": "amd64"}},
+        {"digest": "sha256:" + "b" * 64, "platform": {"os": "unknown", "architecture": "unknown"}}]}
+    image = {"mediaType": "application/vnd.oci.image.manifest.v1+json", "layers": []}
+
+    def run(m, plat, tmp):
+        f = os.path.join(tmp, "m.json")
+        json.dump(m, open(f, "w"))
+        return subprocess.run(["python3", py, "--image", f, plat], capture_output=True, text=True)
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        r = run(one, "linux/amd64", tmp)
+        assert r.returncode == 0 and r.stdout.strip() == "sha256:" + "a" * 64
+        r = run(image, "linux/amd64", tmp)
+        assert r.returncode == 0 and r.stdout == ""
+        r = run(one, "linux/arm64", tmp)
+        assert r.returncode == 1 and "0 times" in r.stderr
+        two = {"mediaType": idx, "manifests": one["manifests"][:1] * 2}
+        r = run(two, "linux/amd64", tmp)
+        assert r.returncode == 1 and "2 times" in r.stderr
+
+
 def test_red_hat_chart_certification():
     """Red Hat's chart certification (chart-verifier, partner profile): no CRD
     in the chart (they are varek-crds'), a values schema, a helm test, the
