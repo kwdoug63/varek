@@ -243,9 +243,9 @@ def test_the_baseline_names_only_the_agents_own_terminal():
 def test_the_baseline_reads_but_never_writes_gits_settings_and_hooks():
     """v1.38 (v1.37.0's known limit): the baseline let the agent write the
     working directory's .git/config and .git/hooks/, which git runs (on a
-    Mac, the Mac's own git too, outside the Warden). They are read, and
-    refused anything else, before the working directory's rule; git's other
-    files and a clone inside the directory are written as before."""
+    Mac, the Mac's own git too, outside the Warden). Every write to them is
+    refused, first in the policy; reads, git's other files and a clone
+    inside the directory go on as before."""
     import pwd
     import shutil
     import subprocess
@@ -261,10 +261,14 @@ def test_the_baseline_reads_but_never_writes_gits_settings_and_hooks():
         t = b.generate(cwd, pw, "/tmp/varek-1000", None)
         rules = [l.split("#")[0].strip() for l in t.splitlines()]
         g = b.glob_escape(cwd)
-        for pat in b.GIT_PROTECTED:
-            i = rules.index(f"allow path glob {g}{pat} readonly")
-            assert rules[i + 1] == f"deny  path glob {g}{pat}"
-            assert i < rules.index(f"allow path {cwd}/")          # the first rule that matches decides
+        first_allow = next(k for k, r in enumerate(rules) if r.startswith("allow "))
+        for how, pat in b.GIT_PROTECTED:
+            p = (g if how == "glob" else cwd) + pat
+            for fl in ("access=wo", "access=rw", "+O_CREAT", "+O_TRUNC"):
+                assert rules.index(f"deny  path {how} {p} {fl}") < first_allow   # first: nothing allows it before
+        git = [r for r in rules if "/.git/" in r]
+        assert not any("**" in r for r in git)                     # no glob across directories (the cross-check)
+        assert all(r.startswith("deny ") for r in git if "credentials" not in r)   # reads fall through
         vdp = os.path.join(tools, "vdp_check")
         if not os.access(vdp, os.X_OK):
             continue                                              # built by make (the suites)
@@ -279,7 +283,7 @@ def test_the_baseline_reads_but_never_writes_gits_settings_and_hooks():
                     (".git/config", RT, "UNSATISFIED"), (".git/config.lock", W, "UNSATISFIED"),
                     (".git/hooks/pre-commit", R, "SATISFIED"), (".git/hooks/pre-commit", W, "UNSATISFIED"),
                     (".git/hooks", MK, "UNSATISFIED"), (".git/worktrees/w/config.worktree", W, "UNSATISFIED"),
-                    (".git/modules/a/modules/b/config", W, "UNSATISFIED"),
+                    (".git/modules/a/config", W, "UNSATISFIED"), (".git/modules/a/hooks", MK, "UNSATISFIED"),
                     (".git/modules/a/hooks/post-checkout", W, "UNSATISFIED"),
                     (".git/HEAD", W, "SATISFIED"), (".git/index", W, "SATISFIED"),
                     (".git/objects/ab/cd", W, "SATISFIED"), (".git/refs/heads/main", W, "SATISFIED"),

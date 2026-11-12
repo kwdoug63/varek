@@ -14,14 +14,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   settings and hooks.** It let the agent write `.git/config` and
   `.git/hooks/`, which git runs (a hook, `core.fsmonitor`), and on a Mac the
   Mac's own git too, outside the Warden (a v1.37.0 known limit). The
-  baseline now has, before the working directory's rule, an `allow ...
-  readonly` and a `deny` for each of `.git/config*`, `.git/hooks**`,
-  `.git/worktrees/*/config*`, `.git/modules/**/config*` and
-  `.git/modules/**/hooks**` (the working directory's path escaped in the
-  glob). Commits, fetches, merges and clones inside the directory work as
+  baseline now opens with deny rules for every write (`access=wo`,
+  `access=rw`, `+O_CREAT`, `+O_TRUNC`; a removal or a rename is decided as
+  a write) to the prefixes `.git/config` and `.git/hooks` and the globs
+  `.git/worktrees/*/config*`, `.git/modules/*/config*`,
+  `.git/modules/*/hooks` and `.git/modules/*/hooks/*` (the working
+  directory's path escaped in the globs). Reads fall through to the rules
+  after them, the credential denies first. No `**`, and write-only denies
+  at the top: the other shapes tried (an `allow ... readonly` and a `deny`
+  of the same pattern, or the rules placed among the others) made the
+  cross-check's solver search over the baseline run out (test-v1290, where
+  z3 is installed); this one passes it in about the time main's baseline
+  does. A nested submodule's settings are not covered. Commits, fetches, merges and clones inside the directory work as
   before; `git init` there, `git config` and what writes the repository's
   config (`git remote add`, `git push -u`) fail; a run that needs them
-  takes `--policy`. `test_varek_cli.py` checks the rules' order and, with
+  takes `--policy`. `test_varek_cli.py` checks the rules' place and, with
   `vdp_check`, each read and write decided.
 
 ## [1.37.0] - 2026-11-12 — macOS, through a Linux VM
