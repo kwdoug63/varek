@@ -30,9 +30,11 @@
 #      writes the project, and the Mac sees its file; it cannot read a file
 #      in the Mac's home directory (not in the VM at all), nor write outside
 #      the project in the VM, nor connect to the Mac (the VM's gateway) or
-#      to the instance metadata service; its verdict stream copied to the
-#      project and audited; what root in the VM reaches of the Mac's network
-#      is reported (a known limit, docs/security/v1.30-macos.md);
+#      to the instance metadata service; it runs as the VM's agent user,
+#      which has no sudo (v1.38); its verdict stream copied to the
+#      project and audited; root in the VM does not reach the Mac or the
+#      instance metadata service (the VM's packet filter, v1.38), and its DNS
+#      and the Internet still work (with VAREK_VM_FIREWALL=off: reported);
 #   6. (--sweep) every suite inside the VM; (--soak-trial) the soak's trial.
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -133,8 +135,8 @@ GW="$(vssh "ip route show default | awk '{print \$3; exit}'" 2>/dev/null)"
 
 echo "== 5. an agent under the Warden in the VM" | tee -a "$SUM"
 cat > "$PROJ/probe.py" <<EOF
-import os, json
-r = {}
+import os, json, pwd
+r = {"user": pwd.getpwuid(os.getuid()).pw_name}
 def t(name, f):
     try: f(); r[name] = "ok"
     except OSError as e: r[name] = e.strerror
@@ -154,6 +156,9 @@ EOF
 r() { python3 -c "import json,sys; d=[json.loads(l) for l in open('$OUT/probe.out') if l.startswith('{')]; print(d[-1].get(sys.argv[1]) if d else 'no output')" "$1"; }
 [ "$(r read_project)" = ok ] && [ "$(r write_project)" = ok ] && pass "the agent reads and writes the project" || flunk "the project ($(r read_project), $(r write_project))"
 check "... and the Mac sees what it wrote" grep -q 'written by the agent in the VM' "$PROJ/from-the-vm.txt"
+[ "$(r user)" = agent ] && pass "it runs as the VM's agent user (agent), not the VM's user (varek)" || flunk "it runs as $(r user), not agent"
+check "... and the agent user has no sudo, no group but its own, and a locked password" vssh \
+    "sudo -l -n -U agent 2>&1 | grep -q 'not allowed' && [ \"\$(id -nG agent)\" = agent ] && sudo passwd -S agent | grep -q '^agent L'"
 [ "$(r read_mac_secret)" != ok ] && pass "it cannot read the Mac's file outside the project ($(r read_mac_secret))" || flunk "it read the Mac's file outside the project"
 [ "$(r write_outside)" != ok ] && pass "it cannot write outside the project in the VM ($(r write_outside))" || flunk "it wrote outside the project"
 [ "$(r read_shadow)" != ok ] && pass "it cannot read the VM's /etc/shadow ($(r read_shadow))" || flunk "it read /etc/shadow"
@@ -169,12 +174,26 @@ vssh "sudo varek audit /var/log/varek/$SNAME" > "$OUT/audit.txt" 2>&1; arc=$?
 [ "$arc" = 0 ] && pass "... and the stream audits in the VM (exit 0)" || flunk "the stream's audit in the VM: exit $arc ($OUT/audit.txt)"
 check "... and the copy on the Mac is the VM's stream" sh -c \
     "[ \"\$(shasum -a 256 < '$STREAM' | cut -d' ' -f1)\" = \"\$(python3 '$VAREK' vm ssh 'sudo sha256sum /var/log/varek/$SNAME' | cut -d' ' -f1)\" ]"
-# root in the VM, unlike the agent, is not under the Warden: what it reaches of the Mac's network
-for t in "${GW:-192.168.64.1} 22" "${GW:-192.168.64.1} 5000" "169.254.169.254 80"; do
-    set -- $t
-    if vssh "timeout 5 bash -c '</dev/tcp/$1/$2'" > /dev/null 2>&1; then w="reaches"; else w="does not reach"; fi
-    echo "  INFO  root in the VM $w $1:$2" | tee -a "$SUM"
-done
+# root in the VM, unlike the agent, is not under the Warden: from v1.38 the
+# VM's packet filter on the Mac (pf, varek vm start) keeps it from the Mac,
+# link-local addresses and the private networks; its DNS and the Internet pass
+if [ "${VAREK_VM_FIREWALL:-on}" != off ]; then
+    check "the VM's packet filter is loaded on the Mac (pf anchor com.apple/varek-vm)" sh -c \
+        "sudo /sbin/pfctl -a com.apple/varek-vm -s rules 2>/dev/null | grep -q 'block drop quick inet from'"
+    for t in "${GW:-192.168.64.1} 22" "${GW:-192.168.64.1} 5000" "169.254.169.254 80"; do
+        set -- $t
+        check "root in the VM does not reach $1:$2 (the packet filter)" vssh "! sudo timeout 5 bash -c '</dev/tcp/$1/$2'"
+    done
+    check "... its DNS still answers (vmnet's, on the Mac)" vssh "getent hosts access.redhat.com"
+    check "... and it reaches the Internet (https://access.redhat.com)" vssh \
+        "curl -sS -o /dev/null --max-time 20 https://access.redhat.com"
+else
+    for t in "${GW:-192.168.64.1} 22" "${GW:-192.168.64.1} 5000" "169.254.169.254 80"; do
+        set -- $t
+        if vssh "timeout 5 bash -c '</dev/tcp/$1/$2'" > /dev/null 2>&1; then w="reaches"; else w="does not reach"; fi
+        echo "  INFO  root in the VM $w $1:$2 (VAREK_VM_FIREWALL=off)" | tee -a "$SUM"
+    done
+fi
 
 if [ "$SWEEP" = 1 ]; then
     echo "== 6a. every suite inside the VM" | tee -a "$SUM"

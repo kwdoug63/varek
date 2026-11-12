@@ -17,7 +17,17 @@ directory holding it.
                                directory) shared
   varek vm run [ARGS] -- CMD   `varek run` inside, on the working directory
   varek vm ssh [CMD]           a shell (or CMD) inside, as the VM's user
+
+The agent runs as a user of its own in the VM, `agent`: not in wheel, no
+sudo, no password and no ssh key. The VM's user, `varek`, has sudo: it is
+the Mac's way in (varek vm ssh), and the Warden runs as root through it.
   varek vm stop | status
+
+While it runs, a packet filter on the Mac (pf, its own anchor, loaded with
+sudo) keeps the VM from the Mac's own addresses, but for the DNS vmnet
+gives it; from link-local addresses (the instance metadata service); and
+from the private networks; IPv6 from the VM is dropped on its bridge. Its
+Internet traffic passes. VAREK_VM_FIREWALL=off starts it without (said so).
 
 What it needs on the Mac: vfkit and qemu-img (`brew install vfkit qemu`),
 ssh and ssh-keygen. The RHEL image is downloaded by the user from Red Hat
@@ -26,6 +36,7 @@ their own subscription: varek never asks for or holds a Red Hat password.
 """
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -39,9 +50,16 @@ import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 SRC_ROOT = os.path.realpath(os.path.join(HERE, "..", "..", ".."))   # the VAREK checkout
-USER = "varek"                      # the VM's user (sudo); the agent runs as it under varek run
+USER = "varek"                      # the VM's user, the Mac's way in (ssh, sudo)
+AGENT = "agent"                     # v1.38: the user the agent runs as under varek run: no sudo, no login
 LEASES = "/var/db/dhcpd_leases"     # macOS vmnet's DHCP leases (the VM's address by its MAC)
 VM_ROOT = os.path.expanduser(os.environ.get("VAREK_VM_DIR", "~/.varek/vm"))
+PF_ANCHOR = "com.apple/varek-vm"    # v1.38: the VM's packet filter, under the anchor macOS's pf.conf evaluates
+PFCTL = "/sbin/pfctl"
+# v1.38: the networks the VM is kept from (the Mac's own addresses besides):
+# link-local (the instance metadata service), the private ranges, shared
+# address space (carrier-grade NAT, some VPNs)
+PF_BLOCKED = ("169.254.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")
 
 
 class VmError(Exception):
@@ -183,6 +201,79 @@ def meta_data(instance_id, hostname):
     return f"instance-id: {instance_id}\nlocal-hostname: {hostname}\n"
 
 
+# v1.38: the agent's user in the VM, made (or checked) at each start, so a VM
+# set up before it gets one too: its own group, a home for the baseline's
+# rules, a locked password, no ssh key, in no group but its own, and refused
+# a start if sudo would let it run anything
+AGENT_USER_SH = (
+    "set -e; "
+    f"id -u {AGENT} >/dev/null 2>&1 || useradd --create-home --user-group --shell /bin/bash "
+    f"--comment 'VAREK agent' {AGENT}; "
+    f"passwd -l {AGENT} >/dev/null; "
+    f"usermod -G '' {AGENT}; "
+    f"rm -rf ~{AGENT}/.ssh; "
+    f"[ \"$(id -u {AGENT})\" != 0 ]; "
+    f"if sudo -l -n -U {AGENT} 2>/dev/null | grep -q 'may run'; then "
+    f"echo 'the agent user {AGENT} may run commands with sudo' >&2; exit 1; fi")
+
+
+def pf_rules(vm_ip, bridge):
+    """v1.38: the VM's packet filter (pf), for its anchor: the Mac's own
+    connections to the VM (ssh) and their replies pass; the VM's DNS to the
+    Mac (vmnet's forwarder) and its DHCP pass; anything else from the VM to
+    the Mac's addresses, link-local, the private ranges and shared address
+    space is dropped, and IPv6 coming in on its bridge. Each rule quick:
+    the first that matches decides, past the rest of pf's rules."""
+    ip = ipaddress.IPv4Address(vm_ip)
+    if not (ip.is_private and not ip.is_loopback and not ip.is_link_local):
+        raise VmError(f"the VM's address {vm_ip} is not a private address on vmnet's network")
+    if not re.fullmatch(r"bridge[0-9]{1,4}", bridge or ""):
+        raise VmError(f"vmnet's bridge {bridge!r} is not a bridge interface")
+    return (f"# varek vm (v1.38): the VM {ip} kept from the Mac and its networks while it runs\n"
+            f"pass quick inet from self to {ip} keep state\n"
+            f"pass quick inet proto {{ udp tcp }} from {ip} to self port 53 keep state\n"
+            f"pass quick inet proto udp from {ip} port 68 to any port 67 keep state\n"
+            f"block drop quick inet from {ip} to self\n"
+            f"block drop quick inet from {ip} to {{ {', '.join(PF_BLOCKED)} }}\n"
+            f"block drop in quick on {bridge} inet6 all\n")
+
+
+def bridge_of(ifconfig_text, addr):
+    """the interface `ifconfig` shows holding the IPv4 address addr (vmnet's
+    bridge holds the VM's gateway), or None"""
+    cur = None
+    for line in ifconfig_text.splitlines():
+        m = re.match(r"^([a-z][a-z0-9]*): flags=", line)
+        if m:
+            cur = m.group(1)
+        elif cur and re.match(rf"^\s+inet {re.escape(addr)} ", line):
+            return cur
+    return None
+
+
+def pf_token(text):
+    """the reference `pfctl -E` prints (Token : N), for `pfctl -X N`"""
+    m = re.search(r"^Token\s*:\s*([0-9]+)\s*$", text, re.M)
+    return m.group(1) if m else None
+
+
+def firewall_wanted(env=None):
+    """VAREK_VM_FIREWALL=off starts the VM without its packet filter"""
+    return (env if env is not None else os.environ).get("VAREK_VM_FIREWALL", "on").strip().lower() != "off"
+
+
+def run_argv(args):
+    """`varek run`'s arguments in the VM: the user's, the agent's user
+    named (--run-as agent); a --run-as of the user's own is refused"""
+    for x in args:
+        if x == "--":
+            break
+        if x == "--run-as" or x.startswith("--run-as="):
+            raise VmError("varek vm run runs the agent as the VM's agent user: --run-as is not taken",
+                          fix="leave --run-as out")
+    return ["--run-as", AGENT] + list(args)
+
+
 def vfkit_argv(vfkit, vmdir, cfg, shares=(), cloud_init=None):
     """vfkit's command line: EFI boot from the raw disk, NAT networking with
     the VM's MAC, a serial log, an entropy source, and each share (path, tag)
@@ -317,9 +408,57 @@ def ssh(vmdir, ip, cmd, check=True, tty=False, **kw):
     return r
 
 
+def firewall_on(vmdir, cfg, ip):
+    """v1.38: the VM's packet filter loaded (pf_rules) and pf enabled, with
+    sudo on the Mac; refused a start if it does not load"""
+    if not firewall_wanted():
+        print("[varek] VAREK_VM_FIREWALL=off: the VM reaches the Mac and its networks (no packet filter)",
+              file=sys.stderr)
+        return False
+    gw = ssh(vmdir, ip, "ip -4 route show default | awk '{print $3; exit}'",
+             capture_output=True, text=True).stdout.strip()
+    try:
+        ipaddress.IPv4Address(gw)
+    except ValueError:
+        raise VmError(f"the VM's gateway is not an address ({gw!r})")
+    bridge = bridge_of(subprocess.run(["ifconfig"], capture_output=True, text=True).stdout, gw)
+    rules = pf_rules(ip, bridge)
+    print(f"[varek] the VM's packet filter: sudo pfctl -a {PF_ANCHOR} (the Mac's password, if sudo asks)",
+          file=sys.stderr)
+    r = subprocess.run(["sudo", PFCTL, "-a", PF_ANCHOR, "-f", "-"], input=rules, text=True,
+                       capture_output=True)
+    if r.returncode != 0:
+        raise VmError(f"the VM's packet filter did not load: {r.stderr.strip()[-300:]}",
+                      fix="VAREK_VM_FIREWALL=off to start it without (the VM then reaches the Mac)")
+    e = subprocess.run(["sudo", PFCTL, "-E"], capture_output=True, text=True)
+    cfg["pf_token"] = pf_token(e.stdout + e.stderr)
+    shown = subprocess.run(["sudo", PFCTL, "-a", PF_ANCHOR, "-s", "rules"], capture_output=True, text=True).stdout
+    if e.returncode != 0 or not cfg["pf_token"] or f"block drop quick inet from {ip} to" not in shown:
+        firewall_off(cfg)
+        raise VmError("pf did not take the VM's packet filter (pfctl -E, or the anchor's rules)",
+                      fix="VAREK_VM_FIREWALL=off to start it without (the VM then reaches the Mac)")
+    cfg["pf_vm"] = ip
+    save_cfg(vmdir, cfg)
+    return True
+
+
+def firewall_off(cfg):
+    """the VM's packet filter flushed, and pf's reference released"""
+    if not (cfg.get("pf_vm") or cfg.get("pf_token")):
+        return
+    subprocess.run(["sudo", PFCTL, "-a", PF_ANCHOR, "-F", "rules"], capture_output=True)
+    subprocess.run(["sudo", PFCTL, "-a", PF_ANCHOR, "-F", "states"], capture_output=True)
+    if cfg.get("pf_token"):
+        subprocess.run(["sudo", PFCTL, "-X", cfg["pf_token"]], capture_output=True)
+    cfg["pf_vm"] = cfg["pf_token"] = None
+
+
 def halt(vmdir, cfg):
     pid = running_pid(vmdir)
     if not pid:
+        if cfg.get("pf_vm") or cfg.get("pf_token"):      # vfkit gone, its filter left
+            firewall_off(cfg)
+            save_cfg(vmdir, cfg)
         return False
     ip = guest_ip(cfg)
     if ip:
@@ -341,6 +480,7 @@ def halt(vmdir, cfg):
         break
     if running_pid(vmdir):
         raise VmError(f"the VM's vfkit (pid {pid}) does not stop", fix=f"kill -9 {pid}")
+    firewall_off(cfg)
     cfg["project"] = None
     save_cfg(vmdir, cfg)
     return True
@@ -455,6 +595,8 @@ def cmd_init(a):
         ip = boot(vmdir, cfg, [], [os.path.join(ci, "user-data"), os.path.join(ci, "meta-data")])
     print(f"[varek] the VM is up at {ip}")
     try:
+        if cfg.get("pf_vm") != ip:
+            firewall_on(vmdir, cfg, ip)      # setting it up reaches the Internet, not the Mac
         rhel = ssh(vmdir, ip, ". /etc/os-release; echo $ID", capture_output=True, text=True).stdout.strip() == "rhel"
         if rhel and ssh(vmdir, ip, "sudo subscription-manager status", check=False, capture_output=True).returncode != 0:
             if a.rh_org and a.rh_activation_key_file:
@@ -488,10 +630,17 @@ def start(project):
     if running_pid(vmdir):
         ip = guest_ip(cfg)
         if cfg.get("project") == p and ip:
+            if firewall_wanted() and cfg.get("pf_vm") != ip:
+                firewall_on(vmdir, cfg, ip)
             return vmdir, cfg, ip, p
         raise VmError(f"the VM is running with {cfg.get('project')} shared",
                       fix="varek vm stop, then start it in this project")
     ip = boot(vmdir, cfg, [(p, "project")])
+    try:
+        firewall_on(vmdir, cfg, ip)          # before the project is mounted
+    except BaseException:
+        halt(vmdir, cfg)
+        raise
     ssh(vmdir, ip, f"sudo mkdir -p {sh_quote(p)} && sudo mount -t virtiofs project {sh_quote(p)}")
     cfg["project"] = p
     save_cfg(vmdir, cfg)
@@ -508,9 +657,11 @@ STREAMS = "sudo sh -c 'ls -t /var/log/varek/verdicts-*.log 2>/dev/null'"
 
 
 def cmd_run(a):
+    argv = run_argv(a.args)
     vmdir, cfg, ip, p = start(os.getcwd())
+    ssh(vmdir, ip, f"sudo sh -c {sh_quote(AGENT_USER_SH)}")
     before = set(ssh(vmdir, ip, STREAMS, check=False, capture_output=True, text=True).stdout.split())
-    args = " ".join(sh_quote(x) for x in a.args)
+    args = " ".join(sh_quote(x) for x in argv)
     r = ssh(vmdir, ip, f"cd {sh_quote(p)} && sudo varek run {args}", check=False, tty=True)
     copy_stream(vmdir, ip, p, before)
     return r.returncode
@@ -572,7 +723,8 @@ def cmd_status(a):
     pid = running_pid(vmdir)
     print(f"VM        {vmdir}\nset up    {cfg.get('provisioned') or 'no (varek vm init --resume)'}\n"
           f"running   {'yes, pid %d' % pid if pid else 'no'}\n"
-          f"address   {(guest_ip(cfg) or '-') if pid else '-'}\nshared    {cfg.get('project') or '-'}")
+          f"address   {(guest_ip(cfg) or '-') if pid else '-'}\nshared    {cfg.get('project') or '-'}\n"
+          f"filter    {('pf anchor ' + PF_ANCHOR + ' for ' + cfg['pf_vm']) if pid and cfg.get('pf_vm') else 'none'}")
     return 0
 
 

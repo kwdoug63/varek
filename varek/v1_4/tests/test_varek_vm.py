@@ -184,6 +184,117 @@ def test_image_checked_by_sha256_and_format(tmp_path):
         assert not (tmp_path / "disk.raw").exists()
 
 
+def test_run_names_the_agent_user_and_takes_no_other():
+    """v1.38: the agent runs as the VM's agent user (no sudo), not as the
+    VM's user (sudo); a --run-as of the user's own is refused, and one after
+    -- is the command's"""
+    assert vm.run_argv(["--profile", "python", "--", "python3", "p.py"]) == \
+        ["--run-as", "agent", "--profile", "python", "--", "python3", "p.py"]
+    assert vm.run_argv([]) == ["--run-as", "agent"]
+    for bad in (["--run-as", "varek", "--", "true"], ["--run-as=root", "--", "true"]):
+        with pytest.raises(vm.VmError, match="--run-as is not taken"):
+            vm.run_argv(bad)
+    assert vm.run_argv(["--", "tool", "--run-as", "x"])[:2] == ["--run-as", "agent"]
+    assert vm.AGENT != vm.USER
+
+
+def test_the_agent_user_has_no_sudo_password_key_or_group():
+    s = vm.AGENT_USER_SH
+    assert s.startswith("set -e; ")
+    assert "useradd --create-home --user-group" in s and "passwd -l agent" in s
+    assert "usermod -G '' agent" in s and "rm -rf ~agent/.ssh" in s        # wheel, if given, taken away
+    assert "sudo -l -n -U agent" in s and "exit 1" in s                    # a sudo rule for it: refused
+    assert "wheel" not in s and "NOPASSWD" not in s
+    r = subprocess.run(["sh", "-n", "-c", s])
+    assert r.returncode == 0
+
+
+def test_the_packet_filter_keeps_the_vm_from_the_mac_and_its_networks():
+    """v1.38 (v1.37.0's known limit: the VM's network reaches the Mac): the
+    rules pf loads in the VM's anchor, quick, in this order"""
+    r = [l for l in vm.pf_rules("192.168.64.5", "bridge100").splitlines() if not l.startswith("#")]
+    assert r == [
+        "pass quick inet from self to 192.168.64.5 keep state",            # the Mac's ssh to the VM, and replies
+        "pass quick inet proto { udp tcp } from 192.168.64.5 to self port 53 keep state",   # vmnet's DNS
+        "pass quick inet proto udp from 192.168.64.5 port 68 to any port 67 keep state",    # DHCP
+        "block drop quick inet from 192.168.64.5 to self",
+        ("block drop quick inet from 192.168.64.5 to { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, "
+         "192.168.0.0/16, 100.64.0.0/10 }"),
+        "block drop in quick on bridge100 inet6 all"]
+    for ip, br in (("8.8.8.8", "bridge100"), ("127.0.0.1", "bridge100"), ("169.254.1.2", "bridge100"),
+                   ("192.168.64.5", "en0"), ("192.168.64.5", "bridge100; pass all"), ("x", "bridge100")):
+        with pytest.raises((vm.VmError, ValueError)):
+            vm.pf_rules(ip, br)
+
+
+def test_the_filter_finds_vmnets_bridge_and_pfs_token():
+    text = ("lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000\n"
+            "en0: flags=8863<UP,BROADCAST> mtu 1500\n\tinet 172.31.5.9 netmask 0xfffff000 broadcast 172.31.15.255\n"
+            "bridge100: flags=8a63<UP,BROADCAST> mtu 1500\n\toptions=3<RXCSUM,TXCSUM>\n"
+            "\tinet 192.168.64.1 netmask 0xffffff00 broadcast 192.168.64.255\n\tmember: vmenet0 flags=3<LEARNING>\n")
+    assert vm.bridge_of(text, "192.168.64.1") == "bridge100"
+    assert vm.bridge_of(text, "192.168.64.10") is None and vm.bridge_of(text, "192.168.64") is None
+    assert vm.pf_token("No ALTQ support in kernel\nALTQ related functions disabled\npf enabled\nToken : 123456789\n") == "123456789"
+    assert vm.pf_token("pfctl: pf already enabled\n") is None
+    assert vm.firewall_wanted({}) and vm.firewall_wanted({"VAREK_VM_FIREWALL": "on"})
+    assert not vm.firewall_wanted({"VAREK_VM_FIREWALL": "OFF"})
+
+
+def test_the_filter_is_loaded_before_the_project_and_flushed_at_the_stop(tmp_path, monkeypatch):
+    """start: pf's rules loaded (sudo pfctl -a ANCHOR -f -), pf enabled (-E,
+    its token kept), the rules read back, then the project mounted; halt:
+    the anchor's rules and states flushed and the token released (-X)"""
+    calls, mounted = [], []
+    cfg = {"mac": "5a:04:00:01:02:03", "provisioned": "t", "project": None}
+    monkeypatch.setattr(vm, "save_cfg", lambda d, c: None)
+    monkeypatch.setattr(vm, "need_mac_host", lambda: None)
+    monkeypatch.setattr(vm, "load_cfg", lambda d: cfg)
+    monkeypatch.setattr(vm, "check_share", lambda p, refuse=(): p)
+    monkeypatch.setattr(vm, "running_pid", lambda d: None)
+    monkeypatch.setattr(vm, "boot", lambda d, c, shares, ci=None: "192.168.64.5")
+
+    def fake_ssh(d, ip, cmd, check=True, **kw):
+        if "route" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "192.168.64.1\n", "")
+        mounted.append((cmd, len(calls)))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        if argv == ["ifconfig"]:
+            return subprocess.CompletedProcess(argv, 0, "bridge100: flags=1<UP>\n\tinet 192.168.64.1 netmask 0xffffff00\n", "")
+        if argv[-1] == "-E":
+            return subprocess.CompletedProcess(argv, 0, "", "pf enabled\nToken : 42\n")
+        if argv[-2:] == ["-s", "rules"]:
+            return subprocess.CompletedProcess(argv, 0, "block drop quick inet from 192.168.64.5 to 10.0.0.0/8\n", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    monkeypatch.setattr(vm, "ssh", fake_ssh)
+    monkeypatch.setattr(vm.subprocess, "run", fake_run)
+    monkeypatch.delenv("VAREK_VM_FIREWALL", raising=False)
+    vm.start(str(tmp_path))
+    assert ["sudo", "/sbin/pfctl", "-a", "com.apple/varek-vm", "-f", "-"] in calls
+    assert cfg["pf_token"] == "42" and cfg["pf_vm"] == "192.168.64.5"
+    mount = [n for c, n in mounted if "mount -t virtiofs" in c]
+    assert mount and mount[0] >= calls.index(["sudo", "/sbin/pfctl", "-E"]) + 1    # after the filter
+    calls.clear()
+    vm.firewall_off(cfg)
+    assert calls == [["sudo", "/sbin/pfctl", "-a", "com.apple/varek-vm", "-F", "rules"],
+                     ["sudo", "/sbin/pfctl", "-a", "com.apple/varek-vm", "-F", "states"],
+                     ["sudo", "/sbin/pfctl", "-X", "42"]]
+    assert cfg["pf_vm"] is None and cfg["pf_token"] is None
+    # rules pf did not take: the start refused, the filter taken down
+    monkeypatch.setattr(vm.subprocess, "run", lambda argv, **kw: (calls.append(argv), subprocess.CompletedProcess(
+        argv, 0, "" if argv[-2:] == ["-s", "rules"] else "bridge100: flags=1<UP>\n\tinet 192.168.64.1 x\n",
+        "Token : 7\n" if argv[-1] == "-E" else ""))[1])
+    with pytest.raises(vm.VmError, match="did not take"):
+        vm.firewall_on(str(tmp_path), cfg, "192.168.64.5")
+    assert ["sudo", "/sbin/pfctl", "-X", "7"] in calls and cfg["pf_vm"] is None
+    # VAREK_VM_FIREWALL=off: no pfctl at all
+    calls.clear()
+    monkeypatch.setenv("VAREK_VM_FIREWALL", "off")
+    assert vm.firewall_on(str(tmp_path), cfg, "192.168.64.5") is False and calls == []
+
+
 @pytest.mark.skipif(sys.platform == "darwin", reason="the refusal is for hosts that are not a Mac")
 def test_varek_vm_refuses_other_hosts():
     r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "varek"), "vm", "run", "--", "true"],

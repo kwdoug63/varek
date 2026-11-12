@@ -30,6 +30,29 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   config (`git remote add`, `git push -u`) fail; a run that needs them
   takes `--policy`. `test_varek_cli.py` checks the rules' place and, with
   `vdp_check`, each read and write decided.
+- **`varek vm`: a packet filter on the Mac keeps the VM from the Mac and
+  its networks.** vmnet's NAT made the Mac the guest's gateway: root in the
+  VM (not under the Warden) reached the Mac's services, its networks and,
+  on an EC2 Mac, the instance metadata service (a v1.37.0 known limit).
+  `varek vm start` and `init` load pf rules, by the VM's address, into an
+  anchor of their own (`com.apple/varek-vm`) with sudo, after the VM has
+  its address and before the project is mounted; `stop` flushes them. The
+  Mac's ssh to the VM, the VM's DNS and DHCP, and the Internet pass;
+  anything else to the Mac, link-local addresses, the private ranges and
+  shared address space is dropped, and IPv6 on vmnet's bridge. A start
+  whose rules do not load is refused; `VAREK_VM_FIREWALL=off` starts
+  without them. `mac_check.sh` now requires that root in the VM does not
+  reach the Mac or the metadata service, and that DNS and the Internet
+  work. Not yet run on a Mac.
+- **`varek vm run`: the agent runs as a user of its own in the VM, without
+  sudo.** It ran as the VM's user, `varek`, who has sudo without a password
+  (kept from the agent by `no_new_privs` and the Warden; a v1.37.0 known
+  limit). Before each run `varek vm run` makes or checks the user `agent`:
+  its own group and no other, a locked password, no ssh key, and the run
+  refused if sudo would let it run anything; then `sudo varek run --run-as
+  agent`. A VM made by v1.37.0 gets the user at its next run. `varek vm run`
+  takes no `--run-as`. `mac_check.sh` checks the agent's user and that it
+  has no sudo. `varek` stays the Mac's way in (`varek vm ssh`).
 
 ## [1.37.0] - 2026-11-12 — macOS, through a Linux VM
 
