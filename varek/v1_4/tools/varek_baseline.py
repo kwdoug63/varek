@@ -413,13 +413,18 @@ def mcp_servers(specs, cwd, tmp):
 
 
 # v1.38: under the working directory, git's settings and hooks (its own,
-# a submodule's, a linked worktree's), each a glob after the directory
+# a linked worktree's, a submodule's), each (matcher, pattern after the
+# directory). Prefixes where they will do; the globs have no ** (a glob
+# that crosses directories makes the solver's reachability queries over
+# the baseline take far longer: the cross-check's), so a submodule's are
+# covered one level down (.git/modules/NAME/), not a nested submodule's.
 GIT_PROTECTED = (
-    "/.git/config*",
-    "/.git/hooks**",
-    "/.git/worktrees/*/config*",
-    "/.git/modules/**/config*",
-    "/.git/modules/**/hooks**",
+    ("prefix", "/.git/config"),              # config, config.worktree, config.lock
+    ("prefix", "/.git/hooks"),               # the directory and every hook
+    ("glob", "/.git/worktrees/*/config*"),
+    ("glob", "/.git/modules/*/config*"),
+    ("glob", "/.git/modules/*/hooks"),
+    ("glob", "/.git/modules/*/hooks/*"),
 )
 
 
@@ -476,13 +481,14 @@ def generate(cwd, pw, tmp, profile, path=SYSTEM_PATH, servers=(), ttys=()):
     # a removal, a rename to or from it), before the working directory's
     # rule, since the first rule that matches decides. The Warden renames no
     # directory and the baseline admits no link, so .git is not moved or
-    # linked around them. config* takes in config.worktree and git's
-    # config.lock (a git config in the run fails at its lock, not after it).
+    # linked around them. The config prefix takes in config.worktree and
+    # git's config.lock (a git config in the run fails at its lock).
     L.append("# --- git's settings and hooks in the working directory: read, never written (git")
     L.append("# runs what they name: a hook, core.fsmonitor; on the host too when it is shared) ---")
-    for pat in GIT_PROTECTED:
-        L.append(f"allow path glob {glob_escape(cwd)}{pat} readonly")
-        L.append(f"deny  path glob {glob_escape(cwd)}{pat}")
+    for how, pat in GIT_PROTECTED:
+        p = (glob_escape(cwd) if how == "glob" else cwd) + pat
+        L.append(f"allow path {how} {p} readonly")
+        L.append(f"deny  path {how} {p}")
     L.append("")
     L.append("# --- the working directory and the agent's temporary directory (TMPDIR) ---")
     L.append(f"allow path exact {cwd} readonly")

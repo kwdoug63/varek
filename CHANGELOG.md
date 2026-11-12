@@ -15,10 +15,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `.git/hooks/`, which git runs (a hook, `core.fsmonitor`), and on a Mac the
   Mac's own git too, outside the Warden (a v1.37.0 known limit). The
   baseline now has, before the working directory's rule, an `allow ...
-  readonly` and a `deny` for each of `.git/config*`, `.git/hooks**`,
-  `.git/worktrees/*/config*`, `.git/modules/**/config*` and
-  `.git/modules/**/hooks**` (the working directory's path escaped in the
-  glob). Commits, fetches, merges and clones inside the directory work as
+  readonly` and a `deny` for each of the prefixes `.git/config` and
+  `.git/hooks` and the globs `.git/worktrees/*/config*`,
+  `.git/modules/*/config*`, `.git/modules/*/hooks` and
+  `.git/modules/*/hooks/*` (the working directory's path escaped in the
+  globs; no `**`, which made the cross-check's solver queries over the
+  baseline run past the suite's limit, so a nested submodule's are not
+  covered). Commits, fetches, merges and clones inside the directory work as
   before; `git init` there, `git config` and what writes the repository's
   config (`git remote add`, `git push -u`) fail; a run that needs them
   takes `--policy`. `test_varek_cli.py` checks the rules' order and, with

@@ -261,10 +261,12 @@ def test_the_baseline_reads_but_never_writes_gits_settings_and_hooks():
         t = b.generate(cwd, pw, "/tmp/varek-1000", None)
         rules = [l.split("#")[0].strip() for l in t.splitlines()]
         g = b.glob_escape(cwd)
-        for pat in b.GIT_PROTECTED:
-            i = rules.index(f"allow path glob {g}{pat} readonly")
-            assert rules[i + 1] == f"deny  path glob {g}{pat}"
+        for how, pat in b.GIT_PROTECTED:
+            p = (g if how == "glob" else cwd) + pat
+            i = rules.index(f"allow path {how} {p} readonly")
+            assert rules[i + 1] == f"deny  path {how} {p}"
             assert i < rules.index(f"allow path {cwd}/")          # the first rule that matches decides
+        assert not any("**" in r for r in rules if "/.git/" in r)  # no glob across directories (the cross-check)
         vdp = os.path.join(tools, "vdp_check")
         if not os.access(vdp, os.X_OK):
             continue                                              # built by make (the suites)
@@ -279,7 +281,7 @@ def test_the_baseline_reads_but_never_writes_gits_settings_and_hooks():
                     (".git/config", RT, "UNSATISFIED"), (".git/config.lock", W, "UNSATISFIED"),
                     (".git/hooks/pre-commit", R, "SATISFIED"), (".git/hooks/pre-commit", W, "UNSATISFIED"),
                     (".git/hooks", MK, "UNSATISFIED"), (".git/worktrees/w/config.worktree", W, "UNSATISFIED"),
-                    (".git/modules/a/modules/b/config", W, "UNSATISFIED"),
+                    (".git/modules/a/config", W, "UNSATISFIED"), (".git/modules/a/hooks", MK, "UNSATISFIED"),
                     (".git/modules/a/hooks/post-checkout", W, "UNSATISFIED"),
                     (".git/HEAD", W, "SATISFIED"), (".git/index", W, "SATISFIED"),
                     (".git/objects/ab/cd", W, "SATISFIED"), (".git/refs/heads/main", W, "SATISFIED"),
