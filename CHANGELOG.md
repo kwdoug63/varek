@@ -9,7 +9,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-- **macOS, through a Linux VM (v1.37.0, in progress).** `varek vm` makes
+## [1.37.0] - 2026-11-12 — macOS, through a Linux VM
+
+- **macOS, through a Linux VM.** `varek vm` makes
   and runs a RHEL 9 aarch64 VM on a Mac with Apple silicon (vfkit, Apple's
   Virtualization framework), the project the one directory it shares;
   `varek run` on a Mac runs inside it under the Warden, with the same
