@@ -241,7 +241,16 @@ agent() {
     for _ in $(seq 50); do [ -S "$B/s/$n.sock" ] && return 0; sleep 0.1; done
     return 1
 }
-run() { (cd "$B/bundles/v1340-$1" && timeout 60 "$RUNC" --root "$B/state" run "v1340-$1" > "$B/$1.out" 2>&1); echo $? > "$B/$1.rc"; sleep 0.5; }
+# timeout's TERM goes to runc, which passes it to the container's first
+# process, which ignores it: -k kills runc 10 s later, and the container
+# is deleted, so a stuck one fails its own check, not the whole suite
+run() {
+    local rc
+    (cd "$B/bundles/v1340-$1" && timeout -k 10 60 "$RUNC" --root "$B/state" run "v1340-$1" > "$B/$1.out" 2>&1); rc=$?
+    echo "$rc" > "$B/$1.rc"
+    case "$rc" in 124|137) "$RUNC" --root "$B/state" delete -f "v1340-$1" > /dev/null 2>&1 ;; esac
+    sleep 0.5
+}
 stream() { ls "$B/streams-$1"/v1340-$2.*.jsonl 2>/dev/null | head -1; }
 said() { grep -qx "$2" "$B/$1.out"; }
 rec() { python3 - "$(stream "$1" "$2")" "$3" <<'PY'
