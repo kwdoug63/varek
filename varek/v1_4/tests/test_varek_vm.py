@@ -184,6 +184,31 @@ def test_image_checked_by_sha256_and_format(tmp_path):
         assert not (tmp_path / "disk.raw").exists()
 
 
+def test_run_names_the_agent_user_and_takes_no_other():
+    """v1.38: the agent runs as the VM's agent user (no sudo), not as the
+    VM's user (sudo); a --run-as of the user's own is refused, and one after
+    -- is the command's"""
+    assert vm.run_argv(["--profile", "python", "--", "python3", "p.py"]) == \
+        ["--run-as", "agent", "--profile", "python", "--", "python3", "p.py"]
+    assert vm.run_argv([]) == ["--run-as", "agent"]
+    for bad in (["--run-as", "varek", "--", "true"], ["--run-as=root", "--", "true"]):
+        with pytest.raises(vm.VmError, match="--run-as is not taken"):
+            vm.run_argv(bad)
+    assert vm.run_argv(["--", "tool", "--run-as", "x"])[:2] == ["--run-as", "agent"]
+    assert vm.AGENT != vm.USER
+
+
+def test_the_agent_user_has_no_sudo_password_key_or_group():
+    s = vm.AGENT_USER_SH
+    assert s.startswith("set -e; ")
+    assert "useradd --create-home --user-group" in s and "passwd -l agent" in s
+    assert "usermod -G '' agent" in s and "rm -rf ~agent/.ssh" in s        # wheel, if given, taken away
+    assert "sudo -l -n -U agent" in s and "exit 1" in s                    # a sudo rule for it: refused
+    assert "wheel" not in s and "NOPASSWD" not in s
+    r = subprocess.run(["sh", "-n", "-c", s])
+    assert r.returncode == 0
+
+
 @pytest.mark.skipif(sys.platform == "darwin", reason="the refusal is for hosts that are not a Mac")
 def test_varek_vm_refuses_other_hosts():
     r = subprocess.run([sys.executable, os.path.join(HERE, "tools", "varek"), "vm", "run", "--", "true"],

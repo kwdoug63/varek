@@ -9,6 +9,17 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+- **`varek vm run`: the agent runs as a user of its own in the VM, without
+  sudo.** It ran as the VM's user, `varek`, who has sudo without a password
+  (kept from the agent by `no_new_privs` and the Warden; a v1.37.0 known
+  limit). Before each run `varek vm run` makes or checks the user `agent`:
+  its own group and no other, a locked password, no ssh key, and the run
+  refused if sudo would let it run anything; then `sudo varek run --run-as
+  agent`. A VM made by v1.37.0 gets the user at its next run. `varek vm run`
+  takes no `--run-as`. `mac_check.sh` checks the agent's user and that it
+  has no sudo. `varek` stays the Mac's way in (`varek vm ssh`).
+
 ## [1.37.0] - 2026-11-12 — macOS, through a Linux VM
 
 - **macOS, through a Linux VM.** `varek vm` makes

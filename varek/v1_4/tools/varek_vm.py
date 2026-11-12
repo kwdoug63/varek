@@ -17,6 +17,10 @@ directory holding it.
                                directory) shared
   varek vm run [ARGS] -- CMD   `varek run` inside, on the working directory
   varek vm ssh [CMD]           a shell (or CMD) inside, as the VM's user
+
+The agent runs as a user of its own in the VM, `agent`: not in wheel, no
+sudo, no password and no ssh key. The VM's user, `varek`, has sudo: it is
+the Mac's way in (varek vm ssh), and the Warden runs as root through it.
   varek vm stop | status
 
 What it needs on the Mac: vfkit and qemu-img (`brew install vfkit qemu`),
@@ -39,7 +43,8 @@ import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 SRC_ROOT = os.path.realpath(os.path.join(HERE, "..", "..", ".."))   # the VAREK checkout
-USER = "varek"                      # the VM's user (sudo); the agent runs as it under varek run
+USER = "varek"                      # the VM's user, the Mac's way in (ssh, sudo)
+AGENT = "agent"                     # v1.38: the user the agent runs as under varek run: no sudo, no login
 LEASES = "/var/db/dhcpd_leases"     # macOS vmnet's DHCP leases (the VM's address by its MAC)
 VM_ROOT = os.path.expanduser(os.environ.get("VAREK_VM_DIR", "~/.varek/vm"))
 
@@ -181,6 +186,34 @@ def user_data(pubkey, hostname):
 
 def meta_data(instance_id, hostname):
     return f"instance-id: {instance_id}\nlocal-hostname: {hostname}\n"
+
+
+# v1.38: the agent's user in the VM, made (or checked) at each start, so a VM
+# set up before it gets one too: its own group, a home for the baseline's
+# rules, a locked password, no ssh key, in no group but its own, and refused
+# a start if sudo would let it run anything
+AGENT_USER_SH = (
+    "set -e; "
+    f"id -u {AGENT} >/dev/null 2>&1 || useradd --create-home --user-group --shell /bin/bash "
+    f"--comment 'VAREK agent' {AGENT}; "
+    f"passwd -l {AGENT} >/dev/null; "
+    f"usermod -G '' {AGENT}; "
+    f"rm -rf ~{AGENT}/.ssh; "
+    f"[ \"$(id -u {AGENT})\" != 0 ]; "
+    f"if sudo -l -n -U {AGENT} 2>/dev/null | grep -q 'may run'; then "
+    f"echo 'the agent user {AGENT} may run commands with sudo' >&2; exit 1; fi")
+
+
+def run_argv(args):
+    """`varek run`'s arguments in the VM: the user's, the agent's user
+    named (--run-as agent); a --run-as of the user's own is refused"""
+    for x in args:
+        if x == "--":
+            break
+        if x == "--run-as" or x.startswith("--run-as="):
+            raise VmError("varek vm run runs the agent as the VM's agent user: --run-as is not taken",
+                          fix="leave --run-as out")
+    return ["--run-as", AGENT] + list(args)
 
 
 def vfkit_argv(vfkit, vmdir, cfg, shares=(), cloud_init=None):
@@ -508,9 +541,11 @@ STREAMS = "sudo sh -c 'ls -t /var/log/varek/verdicts-*.log 2>/dev/null'"
 
 
 def cmd_run(a):
+    argv = run_argv(a.args)
     vmdir, cfg, ip, p = start(os.getcwd())
+    ssh(vmdir, ip, f"sudo sh -c {sh_quote(AGENT_USER_SH)}")
     before = set(ssh(vmdir, ip, STREAMS, check=False, capture_output=True, text=True).stdout.split())
-    args = " ".join(sh_quote(x) for x in a.args)
+    args = " ".join(sh_quote(x) for x in argv)
     r = ssh(vmdir, ip, f"cd {sh_quote(p)} && sudo varek run {args}", check=False, tty=True)
     copy_stream(vmdir, ip, p, before)
     return r.returncode
