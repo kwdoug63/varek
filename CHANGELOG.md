@@ -9,6 +9,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.38.0] - 2026-11-13 — hardening: git's settings, the VM's agent user and network
+
+Three of v1.37.0's known limits, closed; security operations moves to
+v1.39.0. The Warden decides nothing differently; the policy grammar stays
+1.35 (`RELEASE-v1.38.0.md`).
+
 ### Changed
 - **The baseline reads, and never writes, the working directory's git
   settings and hooks.** It let the agent write `.git/config` and
@@ -43,7 +49,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   whose rules do not load is refused; `VAREK_VM_FIREWALL=off` starts
   without them. `mac_check.sh` now requires that root in the VM does not
   reach the Mac or the metadata service, and that DNS and the Internet
-  work. Not yet run on a Mac.
+  work. Run on an EC2 Mac (`mac2.metal`, us-east-2) on November 12, 2026,
+  on 141f054 (#176's head, as merged): `mac_check.sh --sweep` ended
+  `mac_check.sh: PASS`, 33 checks and every suite inside the VM passing,
+  the filter's among them (the anchor loaded; root in the VM reaching
+  neither the Mac's ports 22 and 5000 nor 169.254.169.254; DNS and the
+  Internet working). Its summaries are in
+  `s3://varek-mac-results-982471468969/pr176-us-east-2-20261113T0242Z/`.
 - **`varek vm run`: the agent runs as a user of its own in the VM, without
   sudo.** It ran as the VM's user, `varek`, who has sudo without a password
   (kept from the agent by `no_new_privs` and the Warden; a v1.37.0 known
@@ -52,7 +64,18 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   refused if sudo would let it run anything; then `sudo varek run --run-as
   agent`. A VM made by v1.37.0 gets the user at its next run. `varek vm run`
   takes no `--run-as`. `mac_check.sh` checks the agent's user and that it
-  has no sudo. `varek` stays the Mac's way in (`varek vm ssh`).
+  has no sudo. `varek` stays the Mac's way in (`varek vm ssh`). On the
+  EC2 Mac run of November 12 (above), the agent ran as `agent`, without
+  sudo, and read and wrote the project over virtio-fs, the Mac seeing
+  what it wrote.
+
+### Tests
+- **test_v1340: a stuck container fails its own check, not the whole
+  suite** (#174). `run()` gave runc `timeout 60`, whose TERM runc passes to
+  the container's first process, which ignores it: a container stuck in a
+  call nobody answered held the suite to the sweep's 1800 s limit (#173's
+  x86-64 node-agent job). It uses `timeout -k 10 60` and deletes a
+  container that timed out.
 
 ## [1.37.0] - 2026-11-12 — macOS, through a Linux VM
 
