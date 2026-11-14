@@ -6,7 +6,7 @@ chart (`packaging/helm/varek/README.md`); the `varek` chart refuses to
 install on a cluster that has none of them.
 
 ```sh
-helm install varek-crds oci://ghcr.io/kwdoug63/charts/varek-crds --version 1.37.0
+helm install varek-crds oci://ghcr.io/kwdoug63/charts/varek-crds --version 1.38.0
 ```
 
 They are a chart of their own for two reasons:

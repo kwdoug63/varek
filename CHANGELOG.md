@@ -9,6 +9,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.38.0] - 2026-11-13 — hardening: git's settings, the VM's agent user and network
+
+Three of v1.37.0's known limits, closed; security operations moves to
+v1.39.0. The Warden decides nothing differently; the policy grammar stays
+1.35 (`RELEASE-v1.38.0.md`).
+
 ### Changed
 - **The baseline reads, and never writes, the working directory's git
   settings and hooks.** It let the agent write `.git/config` and
@@ -62,6 +68,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   EC2 Mac run of November 12 (above), the agent ran as `agent`, without
   sudo, and read and wrote the project over virtio-fs, the Mac seeing
   what it wrote.
+
+### Tests
+- **test_v1340: a stuck container fails its own check, not the whole
+  suite** (#174). `run()` gave runc `timeout 60`, whose TERM runc passes to
+  the container's first process, which ignores it: a container stuck in a
+  call nobody answered held the suite to the sweep's 1800 s limit (#173's
+  x86-64 node-agent job). It uses `timeout -k 10 60` and deletes a
+  container that timed out.
 
 ## [1.37.0] - 2026-11-12 — macOS, through a Linux VM
 
