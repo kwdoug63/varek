@@ -43,7 +43,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   whose rules do not load is refused; `VAREK_VM_FIREWALL=off` starts
   without them. `mac_check.sh` now requires that root in the VM does not
   reach the Mac or the metadata service, and that DNS and the Internet
-  work. Not yet run on a Mac.
+  work. Run on an EC2 Mac (`mac2.metal`, us-east-2) on November 12, 2026,
+  on 141f054 (#176's head, as merged): `mac_check.sh --sweep` ended
+  `mac_check.sh: PASS`, 33 checks and every suite inside the VM passing,
+  the filter's among them (the anchor loaded; root in the VM reaching
+  neither the Mac's ports 22 and 5000 nor 169.254.169.254; DNS and the
+  Internet working). Its summaries are in
+  `s3://varek-mac-results-982471468969/pr176-us-east-2-20261113T0242Z/`.
 - **`varek vm run`: the agent runs as a user of its own in the VM, without
   sudo.** It ran as the VM's user, `varek`, who has sudo without a password
   (kept from the agent by `no_new_privs` and the Warden; a v1.37.0 known
@@ -52,7 +58,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   refused if sudo would let it run anything; then `sudo varek run --run-as
   agent`. A VM made by v1.37.0 gets the user at its next run. `varek vm run`
   takes no `--run-as`. `mac_check.sh` checks the agent's user and that it
-  has no sudo. `varek` stays the Mac's way in (`varek vm ssh`).
+  has no sudo. `varek` stays the Mac's way in (`varek vm ssh`). On the
+  EC2 Mac run of November 12 (above), the agent ran as `agent`, without
+  sudo, and read and wrote the project over virtio-fs, the Mac seeing
+  what it wrote.
 
 ## [1.37.0] - 2026-11-12 — macOS, through a Linux VM
 
