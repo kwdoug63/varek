@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.37.0-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.38.0-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -70,7 +70,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.37.0.**
+   **Current release: v1.38.0.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -137,6 +137,7 @@ The runtime line has progressed well beyond simple syscall containment:
   "Never requires a human" becomes certified rather than hoped. Since v1.18.0 the
   Warden runs it on the `--flow-policy` at startup and refuses to start if it
   fails.
+- **v1.38.0 — hardening: git's settings, the VM's agent user and network.** Three of v1.37.0's known limits closed. The baseline policy never writes the working directory's git settings and hooks (`.git/config`, `.git/hooks/`, a worktree's and a submodule's), which git runs, on a Mac outside the Warden too; reads and git's other files are as before. On a Mac, the agent runs in the VM as a user of its own without sudo, and a packet filter on the Mac (pf, its own anchor) keeps the VM from the Mac, link-local addresses (the instance metadata service) and the private networks while it runs. `mac_check.sh --sweep` passed on an EC2 Mac on this code, November 12, 2026. The baseline's change costs the agent `git init` at the root of the working directory, `git config` and `git push -u` there (a run that needs them takes `--policy`). See [`RELEASE-v1.38.0.md`](./RELEASE-v1.38.0.md).
 - **v1.37.0 — macOS, through a Linux VM.** An agent on a Mac with Apple silicon runs inside a RHEL 9 aarch64 VM (`varek vm`, on Apple's Virtualization framework through vfkit), under the arm64 Warden, with the same policies, decisions, records and audit as on Linux; the Mac shares one directory with the VM, the project, and its other files are not in the VM at all. The Mac's checks, the full sweep inside the VM and a 24-hour soak passed on an EC2 Mac on this code, November 10 and 11, 2026. No policy line, rule or record changes meaning. See [`RELEASE-v1.37.0.md`](./RELEASE-v1.37.0.md).
 - **v1.36.3 — the container a connection names, confirmed (a security patch release of v1.36.2).** The node agent took the container id, bundle and annotations a runtime's connection named as sent; since v1.36.0, a pod allowed a hostPath of the node agent's socket's directory, running as root, could have a process of its own supervised as another pod's container. From v1.36.3 the node agent confirms the container by its process's cgroup, its bundle by the runtime's directory, and its annotations by the bundle's `config.json`, and the admission webhook refuses a pod that mounts the socket's directory. The Warden decides nothing differently. See [`RELEASE-v1.36.3.md`](./RELEASE-v1.36.3.md).
 - **v1.36.2 — the node key published again, and a test for `varek-crds` (a patch release of v1.36.1).** The NRI plugin now publishes a node's new key whenever the node agent makes one; through 1.36.1 it published once, so a key made after the plugin started (a node rebuilt with its key lost) went unpublished and that node's streams could not be checked against the cluster's list. The `varek-crds` chart has a `helm test`, a values schema and OpenShift's annotations; as a chart of CRDs it cannot be a Red Hat certified chart (chart-verifier's `not-contains-crds` flags CRDs in `templates/` too), while the `varek` chart is certified. `varek doctor` on a host with no settings warns instead of failing. A guide installs VAREK on RHEL 9, run end to end on RHEL 9.8 with SELinux enforcing. The Warden decides nothing differently. See [`RELEASE-v1.36.2.md`](./RELEASE-v1.36.2.md).
@@ -586,7 +587,8 @@ different risks at different points in the stack.
 - [x] **v1.36.2** — A patch release of v1.36.1: the node key published again when it changes, a test for `varek-crds`, `varek doctor`'s warning, the RHEL 9 install guide ([release notes](./RELEASE-v1.36.2.md))
 - [x] **v1.36.3** — A security patch release of v1.36.2: the node agent confirms the container a runtime connection names (its cgroup, its bundle under the runtime's directory, its annotations) before supervising it, and the admission webhook refuses a pod that mounts the node agent's socket directory ([advisory GHSA-pcxh-jj4w-2jcc](https://github.com/kwdoug63/varek/security/advisories/GHSA-pcxh-jj4w-2jcc), [release notes](./RELEASE-v1.36.3.md))
 - [x] **v1.37.0** — macOS through a Linux VM (planned as v1.30.0, then v1.33.0): the agent and the Warden in a RHEL 9 VM on a Mac with Apple silicon, with the same policies, decisions, records and audit as on Linux; the arm64 Warden ([release notes](./RELEASE-v1.37.0.md))
-- [ ] **v1.38.0** (planned; was v1.36.0, then v1.37.0) — Security operations: Splunk, Microsoft Sentinel, OpenTelemetry ([plan](./docs/roadmap/v1.32-v1.35.md))
+- [x] **v1.38.0** — Hardening: the baseline never writes the working directory's git settings and hooks; on a Mac, the agent's own user in the VM without sudo, and a packet filter keeping the VM from the Mac and its networks ([release notes](./RELEASE-v1.38.0.md))
+- [ ] **v1.39.0** (planned; was v1.36.0, then v1.37.0, then v1.38.0) — Security operations: Splunk, Microsoft Sentinel, OpenTelemetry ([plan](./docs/roadmap/v1.32-v1.35.md))
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow; revisited after v1.35, once generated plans show how many steps it would clear ([plan](./docs/roadmap/v1.36-v1.37.md))
 
