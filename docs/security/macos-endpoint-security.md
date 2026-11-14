@@ -187,9 +187,13 @@ done on an EC2 Mac, as the checks are.
 
 ## Plan (once D1 to D5 are decided)
 
-1. M1 to M7 on an EC2 Mac, with a minimal client (`tests/es_probe/`):
-   subscribe to AUTH_OPEN and AUTH_EXEC for one process, answer from a
-   fixed rule, measure.
+1. M1 to M7 on an EC2 Mac, with a minimal client
+   (`varek/v1_4/tests/es_probe/`, written November 13, 2026, not yet
+   built: its README is the run's steps): it supervises one command and
+   its children (inverted muting, NOTIFY_FORK), answers AUTH_OPEN,
+   AUTH_EXEC, AUTH_CREATE, AUTH_UNLINK, AUTH_RENAME and AUTH_TRUNCATE
+   from a fixed rule, and records each answer's time against its deadline.
+   It covers M1 to M4 and M6; M5 needs the content filter, M7 a runner.
 2. `warden_es.c`: the event loop, the decisions and the records for files
    and launches, under a policy with no `host` rules; the shared parts
    unchanged. Its suite runs on an EC2 Mac.
