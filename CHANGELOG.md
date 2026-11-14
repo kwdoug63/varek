@@ -9,7 +9,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [1.38.0] - 2026-11-13 — hardening: git's settings, the VM's agent user and network
+## [1.38.0] - 2026-11-14 — hardening: git's settings, the VM's agent user and network
 
 Three of v1.37.0's known limits, closed; security operations moves to
 v1.39.0. The Warden decides nothing differently; the policy grammar stays
