@@ -163,13 +163,18 @@ Identifiers & Profiles), by the account holder:
 
 1. **Identifiers → + → App IDs → App**: a description (`VAREK Warden`) and
    an explicit bundle ID in reverse-DNS form under a domain the project
-   holds (for example `dev.varek.warden`; to choose). Under Capabilities,
-   enable **Endpoint Security** (listed once the entitlement is assigned).
+   holds. Under Capabilities, enable **Endpoint Security** (listed once
+   the entitlement is assigned). **Done November 13, 2026:** `VAREK
+   Warden`, `ai.soberagents.varek.warden`, Endpoint Security enabled. A
+   bundle ID cannot be renamed, only deleted and made again.
 2. **Certificates → + → Developer ID Application**: needed to sign what is
    shipped outside the Mac App Store, and to notarize it. Its request (CSR)
    is made with a private key kept by the account holder (Keychain Access
    on a Mac, or `openssl`); the key never goes in the repository or in a
-   chat.
+   chat. To sign on a Mac later, the key and the certificate Apple returns
+   are imported into that Mac's keychain (as a `.p12`), for `codesign` to
+   find; a key left unencrypted on disk (`openssl -nodes`) is kept in a
+   private place, or encrypted.
 3. **Profiles → + → Developer ID**: for the App ID of step 1 and the
    certificate of step 2. The profile carries the entitlement; the daemon is
    signed with it.
