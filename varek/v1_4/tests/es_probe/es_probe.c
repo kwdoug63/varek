@@ -6,7 +6,8 @@
 // records how long each answer took against the message's deadline.
 //
 //   varek-es-probe [--log FILE] [--deny-write PREFIX] [--deny-exec PATH]
-//                  [--delay-us N] [--cache] [--track-pids] -- CMD [ARGS...]
+//                  [--delay-us N] [--cache] [--track-pids]
+//                  [--rules-on-usr1] [--clear-cache-on-usr1] -- CMD [ARGS...]
 //
 // It must run as root, signed with the Endpoint Security entitlement (its
 // bundle: build_sign.sh), and approved for Full Disk Access. It starts CMD
@@ -35,7 +36,12 @@
 // milliseconds (M1).
 // --delay-us N waits N microseconds before every answer, to find where the
 // deadline is and what happens past it (M1). --cache lets the kernel cache
-// the answers (M4). At CMD's exit a summary goes to stdout.
+// the answers (M4). --rules-on-usr1: the --deny-write and --deny-exec rules
+// are off until the probe gets SIGUSR1 (the command sends it: kill -USR1
+// $PPID), to see whether an answer cached before a rule outlives it (M4);
+// --clear-cache-on-usr1 also clears the kernel's cache of this client's
+// answers (es_clear_cache) then. A {"event":"usr1"} line marks the moment.
+// At CMD's exit a summary goes to stdout.
 //
 // Built in CI on GitHub's macOS runner (it stops there as not entitled);
 // signed and run on an EC2 Mac.
@@ -65,6 +71,8 @@ static const char *g_deny_exec = NULL;    // a path
 static long g_delay_us = 0;
 static bool g_cache = false;
 static bool g_track = false;              // --track-pids
+static _Atomic bool g_rules_on = true;    // false until SIGUSR1 under --rules-on-usr1
+static bool g_clear_on_usr1 = false;
 #define PIDS 100000                       // macOS's pids are below 99999
 static _Atomic unsigned char g_sel[PIDS]; // --track-pids: the selected pids
 static FILE *g_log;
@@ -93,7 +101,7 @@ static void jstr(FILE *f, const char *s, size_t n) {
 }
 
 static bool under(const char *path, const char *prefix) {
-    return prefix && path && strncmp(path, prefix, strlen(prefix)) == 0;
+    return prefix && path && atomic_load(&g_rules_on) && strncmp(path, prefix, strlen(prefix)) == 0;
 }
 
 static void path_of(const es_file_t *f, char *out, size_t n) {
@@ -177,7 +185,7 @@ static void handle(es_client_t *c, const es_message_t *m) {
     case ES_EVENT_TYPE_AUTH_EXEC:
         ev = "exec";
         path_of(m->event.exec.target->executable, p, sizeof p);
-        deny = g_deny_exec && strcmp(p, g_deny_exec) == 0;
+        deny = g_deny_exec && atomic_load(&g_rules_on) && strcmp(p, g_deny_exec) == 0;
         break;
     case ES_EVENT_TYPE_AUTH_CREATE:
         ev = "create";
@@ -226,7 +234,8 @@ static int cmp_u64(const void *a, const void *b) {
 
 static int usage(void) {
     fprintf(stderr, "usage: varek-es-probe [--log FILE] [--deny-write PREFIX] [--deny-exec PATH] "
-                    "[--delay-us N] [--cache] [--track-pids] -- CMD [ARGS...]\n");
+                    "[--delay-us N] [--cache] [--track-pids] [--rules-on-usr1] [--clear-cache-on-usr1] "
+                    "-- CMD [ARGS...]\n");
     return 2;
 }
 
@@ -241,6 +250,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--delay-us") && i + 1 < argc) g_delay_us = atol(argv[++i]);
         else if (!strcmp(argv[i], "--cache")) g_cache = true;
         else if (!strcmp(argv[i], "--track-pids")) g_track = true;
+        else if (!strcmp(argv[i], "--rules-on-usr1")) atomic_store(&g_rules_on, false);
+        else if (!strcmp(argv[i], "--clear-cache-on-usr1")) g_clear_on_usr1 = true;
         else return usage();
     }
     if (i >= argc) return usage();
@@ -282,6 +293,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "es_probe: es_subscribe failed\n");
         return 3;
     }
+    // M4: SIGUSR1 turns the rules on (and, if asked, clears the cache), off the signal handler
+    signal(SIGUSR1, SIG_IGN);
+    dispatch_source_t usr1 = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGUSR1, 0,
+                                                    dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+    dispatch_source_set_event_handler(usr1, ^{
+        atomic_store(&g_rules_on, true);              // the rule first, then the cache cleared
+        es_clear_cache_result_t cr = g_clear_on_usr1 ? es_clear_cache(client) : ES_CLEAR_CACHE_RESULT_SUCCESS;
+        dispatch_async(g_logq, ^{
+            fprintf(g_log, "{\"event\":\"usr1\",\"rules_on\":true,\"cache_cleared\":%s}\n",
+                    !g_clear_on_usr1 ? "false" : cr == ES_CLEAR_CACHE_RESULT_SUCCESS ? "true" : "\"failed\"");
+            fflush(g_log);
+        });
+    });
+    dispatch_resume(usr1);
 
     // CMD, held until it is selected: a pipe it reads one byte from
     int go[2];
@@ -293,6 +318,7 @@ int main(int argc, char **argv) {
         close(go[1]);
         if (read(go[0], &b, 1) != 1) _exit(126);
         close(go[0]);
+        signal(SIGUSR1, SIG_DFL);          // the probe's own ignoring is not the command's
         execvp(argv[i], &argv[i]);
         fprintf(stderr, "es_probe: exec %s: %s\n", argv[i], strerror(errno));
         _exit(127);
