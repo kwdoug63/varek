@@ -29,6 +29,32 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   a dry run's let-through calls) and a workbook. Tested against a stand-in
   Azure (`tests/test_varek_sentinel.py`).
 
+## [1.39.1] - 2026-11-16 — the evaluation listing's license check
+
+The license check accepts an hourly AWS Marketplace listing, so the
+evaluation listing (`VAREK Enterprise: Evaluation (30-Day Free Trial)`)
+can offer the Enterprise packs during a free trial. The Warden decides
+nothing differently; the policy grammar stays 1.35 (`RELEASE-v1.39.1.md`).
+
+### Added
+- **Product-code licensing for an hourly listing.** `marketplace.json`
+  may name a `product_code`; `varek_license.check()` then reads the
+  instance's product codes from instance metadata (IMDSv2,
+  `/latest/meta-data/product-codes`) and counts the instance as licensed
+  (`hourly`) when the code is there. No IAM role or License Manager call
+  is needed. A file may name a code and dimensions; the code is tried
+  first. `build.sh --product-code <code>` writes it, with no dimensions
+  unless `--dimensions` names some.
+- **`packaging/aws-marketplace/add_free_trial.py`.** Adds or replaces the
+  free trial (5 to 31 days) on an hourly listing's public offer through
+  the Catalog API, keeping its prices; shows the change, submits it only
+  with `--apply`.
+
+### Changed
+- `varek license`, `varek doctor` and the Enterprise-pack refusal name
+  what the check needs for the kind of listing: instance metadata for an
+  hourly listing, the License Manager permissions for a contract.
+
 ## [1.39.0] - 2026-11-16 — security operations: OpenTelemetry and Splunk
 
 The first part of security operations: a run's OCSF events, audited first,

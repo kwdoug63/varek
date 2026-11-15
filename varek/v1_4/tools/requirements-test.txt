@@ -5,5 +5,8 @@
 # the OWASP CycloneDX project's schemas and validator. rfc3986-validator (MIT)
 # turns on jsonschema's "uri" format checking, which the JSF signature schema
 # needs. (It replaces rfc3987, which is GPLv3+.)
-cyclonedx-python-lib[json-validation]>=8
-rfc3986-validator>=0.1.1
+#
+# Exact versions, the ones requirements-ci.txt pins (both install on Python
+# 3.9, RHEL 9's and Amazon Linux 2023's); Dependabot updates them.
+cyclonedx-python-lib[json-validation]==11.12.0
+rfc3986-validator==0.1.1

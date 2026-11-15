@@ -40,6 +40,12 @@ variable "product_id" {
   description = "AWS Marketplace product ID used by License Manager (GUID, or prod-...). Empty builds a test image with no license check."
 }
 
+variable "product_code" {
+  type        = string
+  default     = ""
+  description = "v1.39.1: the product code of an hourly listing (the evaluation listing). The license check then accepts an instance carrying this code in instance metadata."
+}
+
 variable "dimensions" {
   type        = list(string)
   default     = ["enterprise_tier_b", "enterprise_tier_a"]
@@ -149,7 +155,8 @@ build {
   provisioner "file" {
     content = jsonencode(merge(
       { product_id = var.product_id, dimensions = var.dimensions },
-      var.issuer_fingerprint == "" ? {} : { issuer_fingerprint = var.issuer_fingerprint }
+      var.issuer_fingerprint == "" ? {} : { issuer_fingerprint = var.issuer_fingerprint },
+      var.product_code == "" ? {} : { product_code = var.product_code }
     ))
     destination = "/tmp/varek-marketplace.json"
   }
@@ -172,6 +179,7 @@ build {
     custom_data = {
       varek_version = var.varek_version
       product_id    = var.product_id
+      product_code  = var.product_code
       base_ami      = data.amazon-ami.al2023.id
     }
   }

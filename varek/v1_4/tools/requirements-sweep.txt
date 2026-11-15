@@ -1,0 +1,11 @@
+# The Python packages tests/arm64_sweep.sh --deps installs (and so
+# tests/vm_cell.sh's sweep cells), each at an exact version; Dependabot
+# updates them. The reference solver is tools/requirements-crosscheck.txt,
+# installed on its own (its source build may fail; that check then skips).
+#   pip install -r tools/requirements-sweep.txt
+-r requirements-test.txt
+# pytest 9 needs Python 3.10; RHEL 9, Rocky Linux 9 and Amazon Linux 2023 run
+# 3.9, which takes 8.4, the last release for it
+pytest==9.2.0; python_version >= "3.10"
+pytest==8.4.2; python_version < "3.10"
+pyyaml==6.0.3

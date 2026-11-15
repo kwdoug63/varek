@@ -281,10 +281,13 @@ def require_entitlement(src):
         raise CliError(f"{name} is a VAREK Enterprise pack; it runs on the VAREK Enterprise "
                        "AMI from AWS Marketplace",
                        fix=f"use a VAREK Core pack: {core}")
+    fix = ("attach an instance role allowing license-manager:CheckoutLicense "
+           "and license-manager:CheckInLicense (see `varek license`), then try again")
+    if "instance metadata" in r.detail:
+        fix = ("run it on the EC2 instance launched from the AWS Marketplace listing, "
+               "with the instance metadata service enabled (see `varek license`)")
     raise CliError(f"{name} is a VAREK Enterprise pack and the license could not be "
-                   f"checked: {r.detail}",
-                   fix="attach an instance role allowing license-manager:CheckoutLicense "
-                       "and license-manager:CheckInLicense (see `varek license`), then try again")
+                   f"checked: {r.detail}", fix=fix)
 
 
 def pack_summary(path):
@@ -858,7 +861,7 @@ def cmd_doctor(args):
             warn("no VAREK Enterprise entitlement: the VAREK Core packs still work")
         else:
             warn(f"VAREK Enterprise license not checked: {r.detail}")
-            hint("`varek license` shows the IAM permission the instance needs")
+            hint("`varek license` shows what the check needs")
 
     # v1.35 step 7: the plan adapters `varek plan generate` runs (not needed to run an agent)
     adir = os.path.join(varek_home(), "adapters")
@@ -977,10 +980,15 @@ def cmd_license(args):
         info("VAREK Enterprise, with the HIPAA and SOC 2 packs, is sold on AWS Marketplace.")
         return 0
     info(f"VAREK Enterprise, AWS Marketplace product {mp['product_id']}")
-    info(f"Checking for: {', '.join(mp['dimensions'])}\n")
+    looks = ([f"product code {mp['product_code']} (hourly listing)"] if mp["product_code"] else []) \
+        + mp["dimensions"]
+    info(f"Checking for: {', '.join(looks)}\n")
     r = varek_license.check(varek_home())
     if r.ok:
         ok(f"licensed: {r.dimension}")
+        if r.dimension == varek_license.HOURLY:
+            hint(r.detail)
+            return 0
         if "not returned" in r.detail:
             warn(r.detail)
             hint("allow license-manager:CheckInLicense in the instance role, "
@@ -988,11 +996,19 @@ def cmd_license(args):
         return 0
     if r.status == varek_license.NOT_LICENSED:
         warn(f"no VAREK Enterprise entitlement for this AWS account ({r.detail})")
-        hint("if this account does hold a subscription, a check made in the last hour "
-             "may still hold it; see `Troubleshooting` in docs/aws-deployment-guide.md")
+        if mp["dimensions"]:
+            hint("if this account does hold a subscription, a check made in the last hour "
+                 "may still hold it; see `Troubleshooting` in docs/aws-deployment-guide.md")
+        else:
+            hint("launch the instance from the AWS Marketplace listing, which attaches "
+                 "the product code")
         hint("the Warden and the VAREK Core packs keep working; Enterprise packs can't be chosen")
         return 1
     fail(f"could not check the license: {r.detail}")
+    if not mp["dimensions"]:
+        hint("the check reads instance metadata (IMDSv2) at 169.254.169.254; run it on the "
+             "EC2 instance launched from the listing, with the metadata service enabled")
+        return 1
     hint("the instance needs an IAM role with these permissions:")
     hint('  {"Effect": "Allow", "Action": ["license-manager:CheckoutLicense",')
     hint('   "license-manager:CheckInLicense"], "Resource": "*"}')

@@ -117,6 +117,25 @@ account: `aws license-manager list-received-licenses --query 'Licenses[].Product
 (License Manager may first need its service-linked role there:
 `aws iam create-service-linked-role --aws-service-name license-manager.amazonaws.com`).
 
+#### The evaluation listing (hourly, with a free trial)
+
+`VAREK Enterprise: Evaluation (30-Day Free Trial)` (`prod-wrdrltp5kybfi`) is
+a second, hourly-priced listing, because AWS offers free trials on hourly AMI
+pricing and not on contract pricing. An hourly listing has no License
+Manager license; Marketplace meters it by the product code it attaches to the
+AMI, and an instance launched from it carries that code in instance metadata.
+Build its image with the product code, and the license check (v1.39.1) reads
+`/latest/meta-data/product-codes` over IMDSv2 instead of calling
+License Manager. No instance role is needed.
+
+```bash
+./build.sh --version 1.39.1 --packs ~/varek-packs \
+  --product-id prod-wrdrltp5kybfi --product-code 12xdxsgc8errk2cz18e6z2g4a
+```
+
+Submit this image only to the evaluation listing, and the contract image only
+to the contract listing: each carries the other's settings otherwise.
+
 #### Test the license check before the listing is live
 
 License Manager can issue a license from your own account that looks like a
