@@ -33,6 +33,11 @@ on:
       - "varek/v1_4/tests/vm_cell.sh"
       - "varek/v1_4/tests/node_cluster.sh"
       - "varek/v1_4/tests/arm64_sweep.sh"
+      # the sweep's Python packages, so a Dependabot update of one runs the
+      # sweep cells
+      - "varek/v1_4/tools/requirements-sweep.txt"
+      - "varek/v1_4/tools/requirements-test.txt"
+      - "varek/v1_4/tools/requirements-crosscheck.txt"
       - "varek/v1_4/tests/v1340_kind.sh"
       - ".github/workflows/matrix-vm.yml"
   workflow_dispatch:
