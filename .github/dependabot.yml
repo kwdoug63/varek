@@ -25,6 +25,12 @@ updates:
       - "/.github/requirements"
     schedule:
       interval: "weekly"
+    ignore:
+      # adapters/requirements-frameworks.txt: langchain-mcp-adapters (0.3.2,
+      # the latest) needs mcp < 2; mcp 2.3.0 left the file impossible to
+      # install. Remove when langchain-mcp-adapters takes mcp 2.
+      - dependency-name: "mcp"
+        versions: [">=2"]
 
   # base images pinned by digest
   - package-ecosystem: "docker"

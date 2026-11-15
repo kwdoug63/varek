@@ -1426,7 +1426,10 @@ def plan_confinement(project, adapter_dir, python, env_dirs=()):
           # control group's limits), as the baseline allows
           "allow path exact /proc/stat readonly", "allow path exact /proc/cpuinfo readonly",
           "allow path exact /proc/meminfo readonly", "allow path /sys/devices/system/cpu/ readonly",
-          "allow path /sys/fs/cgroup/ readonly"]
+          "allow path /sys/fs/cgroup/ readonly",
+          # the memory allocator's check of the kernel's overcommit setting, as the baseline allows
+          # (some Pythons read it as they start: a 3.13 under /usr/local was refused it)
+          "allow path exact /proc/sys/vm/overcommit_memory readonly"]
     for d in (project, adapter_dir) + tuple(env_dirs):
         L += [f"allow path exact {d} readonly", f"allow path {d}/ readonly"]
     L.append(f"allow exec {python}")
