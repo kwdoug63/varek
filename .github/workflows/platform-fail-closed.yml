@@ -40,3 +40,34 @@ jobs:
         run: pip install --require-hashes -r .github/requirements/pytest.txt
       - name: Run Linux behavior test
         run: pytest tests/test_platform_gating.py::TestLinuxBehavior -v
+  # docs/security/macos-endpoint-security.md: es_probe, the Endpoint Security
+  # client for the measurements, compiled against the macOS SDK here, so a
+  # build error is found before an EC2 Mac's 24 hours start. Signed ad hoc,
+  # without the entitlement (the Developer ID key never leaves Ken's Mac),
+  # it must stop at es_new_client as not entitled.
+  es-probe-builds-on-macos:
+    name: es_probe builds on macOS and stops without the entitlement
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Build
+        run: |
+          sw_vers
+          clang -O2 -Wall -Wextra -fblocks -o "$RUNNER_TEMP/varek-es-probe" \
+            varek/v1_4/tests/es_probe/es_probe.c -lEndpointSecurity -lbsm 2>&1 | tee "$RUNNER_TEMP/cc.out"
+          test -x "$RUNNER_TEMP/varek-es-probe"
+          if [ -s "$RUNNER_TEMP/cc.out" ]; then echo "::warning::es_probe compiled with warnings"; fi
+      - name: Run without the entitlement
+        run: |
+          codesign -s - -f "$RUNNER_TEMP/varek-es-probe"
+          rc=0; "$RUNNER_TEMP/varek-es-probe" 2> usage.err || rc=$?
+          [ "$rc" = 2 ] && grep -q '^usage: varek-es-probe' usage.err
+          rc=0; "$RUNNER_TEMP/varek-es-probe" --track-pids --delay-us 5 -- /usr/bin/true 2> both.err || rc=$?
+          [ "$rc" = 2 ] && grep -q 'not with --track-pids' both.err
+          rc=0; "$RUNNER_TEMP/varek-es-probe" --others-uncached -- /usr/bin/true 2> oth.err || rc=$?
+          [ "$rc" = 2 ] && grep -q 'are for --track-pids' oth.err
+          for mode in "" --track-pids; do
+            rc=0; sudo "$RUNNER_TEMP/varek-es-probe" $mode -- /usr/bin/true 2> es.err || rc=$?
+            cat es.err
+            [ "$rc" = 3 ] && grep -q 'es_new_client: not entitled' es.err
+          done
