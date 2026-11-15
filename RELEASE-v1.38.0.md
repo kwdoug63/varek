@@ -89,9 +89,19 @@ MIT · github.com/kwdoug63/varek
 
   Its summaries are in
   `s3://varek-mac-results-982471468969/pr176-us-east-2-20261113T0242Z/`.
-- **No 24-hour soak was run on this code.** The soak harness's six-minute
-  trial passed in CI on each PR; the last 24-hour soak was v1.37.0's, on
-  the Mac, November 10 and 11.
+- **24 hours** (`tests/soak_shared/soak.sh`, the shared soak), November 13
+  to 14, 2026, from about 6:44 PM CST, on #178's head (the code tagged):
+  an EC2 `t3.medium`, Ubuntu 24.04, us-east-1. Its six-minute trial passed
+  first. `soak_check: PASS`.
+
+  | | |
+  |---|---|
+  | Duration | 24.0 h, a turn every 60 s: 1,440 turns in each run; Warden 1.38.0 (x86-64) |
+  | Run A | every task before the user's token expired worked (`tools/list` 259, `tools/call` 258, `fs` reads 258, `gh`'s calls 258, sub-agent launches 258); 144 probes, all held; the run revoked 0.01 s after the expiry, no turn after it working (5); 258 requests carried the credential, 0 swaps refused; the audit passing; OCSF: 11,719 events, the stream's (14,405 records, the chain intact), valid OCSF 1.9.0 |
+  | Run B (the baseline, with its git rules) | 1,296 of 1,296 pieces of work done, 288 git commits; 144 probes, all refused; the stream signed (434,446 records), the audit passing |
+  | Run C (dry run) | 1,440 of 1,440 done; 4,324 calls the narrower policy refuses let through and recorded; the audit (463,655 records): `VERIFIED: DRY RUN, NOT ENFORCED`; `varek policy suggest`: 39 exact rules; under the draft, 12 of 12 done and nothing let through |
+  | The Warden's decisions | the agent's MCP calls p50 22 µs (p99 39); `gh`'s MCP calls p50 24 µs (p99 41); the agent's opens p50 73 µs (p99 1,196); `fs`'s opens p50 185 µs (p99 1,296) |
+  | Memory | each Warden 12.4 to 12.8 MB at the start and 12.7 to 13.1 MB at most; the proxy, `warden-secrets` and the two MCP servers 8.6 to 21.1 MB, flat (144 samples each) |
 
 ## Known limits
 
