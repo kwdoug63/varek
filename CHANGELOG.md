@@ -9,6 +9,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.39.0] - 2026-11-16 — security operations: OpenTelemetry and Splunk
+
+The first part of security operations: a run's OCSF events, audited first,
+sent to an OpenTelemetry collector and to Splunk, each past the ship gate
+against a real instance. Microsoft Sentinel, CrowdStrike Falcon and Wiz
+are v1.40.0. The Warden decides nothing differently; the policy grammar
+stays 1.35 (`RELEASE-v1.39.0.md`).
+
 ### Added
 - **Splunk export and app** (v1.39, `docs/security/v1.39-security-operations.md`,
   section 2). `varek export --format splunk [LOG]` sends a run's OCSF
