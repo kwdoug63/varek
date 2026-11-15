@@ -92,8 +92,8 @@ if [ "$DEPS" = 1 ]; then
     # one meets the requirement; z3 5 has none for aarch64 before glibc 2.38,
     # so on RHEL 9 it is built from source (gcc-c++ and cmake, above; about
     # half an hour)
-    python3 -m pip install $BSP --ignore-installed --prefer-binary -q -r "$HERE/tools/requirements-test.txt" \
-        pytest pyyaml || { echo "arm64_sweep.sh: pip failed"; exit 1; }
+    python3 -m pip install $BSP --ignore-installed --prefer-binary -q \
+        -r "$HERE/tools/requirements-sweep.txt" || { echo "arm64_sweep.sh: pip failed"; exit 1; }
     # the cross-check oracle's solver is optional: without it that check skips.
     # Built from source, with gcc-toolset-13's compiler where RHEL has it
     # (above); its libstdc++ additions are linked in, so z3 runs on the

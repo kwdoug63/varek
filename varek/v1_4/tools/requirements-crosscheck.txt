@@ -4,4 +4,6 @@
 # 5.0 or later: under every 4.x release (4.13 to 4.16) the cross-check's
 # regex queries time out, each counted a disagreement (October 21, 2026:
 # test-v1130's cross-check, 87 s under 5.1.0, past 15 minutes under 4.x)
-z3-solver>=5.0
+# Exact version (Dependabot updates it); where it has no wheel (aarch64 before
+# glibc 2.38, so RHEL 9) it is built from source.
+z3-solver==5.4.1.0
