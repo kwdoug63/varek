@@ -9,6 +9,28 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+- **OpenTelemetry export** (v1.39, `docs/security/v1.39-security-operations.md`,
+  section 1). `varek export --format otlp [LOG]` sends a run's OCSF events,
+  audited first as `--format ocsf` writes them, to an OpenTelemetry
+  collector as OTLP log records over OTLP/HTTP (JSON; the standard library
+  only); `--follow STREAM` sends a live run's as they are decided.
+  `tools/varek_otel.py` does the sending. Each record's body names the
+  decision, the object and the policy line with its text; its attributes
+  carry the OCSF class, action and disposition, the three-state verdict,
+  the rule, the policy line, text, name and SHA-256, the run, the report id,
+  the agent, the process and user, the final decision (`varek.decision`,
+  ALLOW or DENY) and the whole OCSF event (`ocsf.event`); a refusal is a
+  WARN, a failed audit an ERROR, as `severityText` (the field a backend
+  reads a level from). The
+  endpoint and headers follow `OTEL_EXPORTER_OTLP_*`; `--otlp-header
+  NAME=ENVVAR` takes an API key from the environment, never the command
+  line. A busy collector is retried; a refusal or a partial rejection ends
+  the export with exit 1. Tested with a stand-in collector
+  (`tests/test_varek_otel.py`) and against the OpenTelemetry Collector
+  0.120.0 and Grafana Cloud's OTLP endpoint: a live run's refusals there
+  within about a second.
+
 ## [1.38.0] - 2026-11-14 — hardening: git's settings, the VM's agent user and network
 
 Three of v1.37.0's known limits, closed; security operations moves to
