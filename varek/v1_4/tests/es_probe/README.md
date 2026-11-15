@@ -4,9 +4,12 @@ The measurements M1 to M4 and M6 of
 `docs/security/macos-endpoint-security.md`, made with `es_probe`, a
 minimal Endpoint Security client: it supervises one command and its
 children, answers each AUTH event from a fixed rule, and records each
-answer's time against its deadline, one JSON line each. Not built in CI
-(it needs the macOS SDK); built, signed and run on an EC2 Mac. Untested
-until that run: the first build may need fixing there.
+answer's time against its deadline, one JSON line each. CI builds it on
+GitHub's macOS runner (`platform-fail-closed.yml`: no warnings on macOS
+26.7.2, November 15, 2026), signs it ad hoc and runs it as root, where it
+stops at `es_new_client` as not entitled; signed with the Developer ID
+profile, and run, only on an EC2 Mac. Its measurements are untested until
+that run.
 
 Every command below runs on the Mac, at its `ec2-user@… %` prompt (zsh;
 first `setopt interactivecomments`), unless it says otherwise. Root only
