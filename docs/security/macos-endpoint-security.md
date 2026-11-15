@@ -2,10 +2,11 @@
 
 Status: **draft, not scheduled** (started November 13, 2026). No release
 number until it is decided; security operations is v1.39.0 and comes first
-(`docs/roadmap/v1.36-v1.37.md`). Nothing below is built. Facts about
-Apple's frameworks are from Apple's documentation as we understand it, and
-each one we depend on is listed under "Measure first" to be checked on a
-Mac before a decision rests on it.
+(`docs/roadmap/v1.36-v1.37.md`). Nothing below is built but the probe.
+Facts about Apple's frameworks were from Apple's documentation as we
+understood it; M1 to M4, and M6 in part, were measured on an EC2 Mac on
+November 15, 2026 ("Measured", below), and three of them were not as we
+understood: the design below is revised for them.
 
 What starts it: on November 13, 2026, Apple assigned the Endpoint Security
 entitlement (`com.apple.developer.endpoint-security.client`) to the
@@ -38,7 +39,7 @@ fact. Among the AUTH events (macOS 13 to 15):
 | The Warden decides on Linux | The AUTH event |
 |---|---|
 | a launch (`execve`) | `AUTH_EXEC` (the file, its signing information, argv, env) |
-| an open, with its flags | `AUTH_OPEN` (answered with the flags allowed, `es_respond_flags_result`: read but not write is expressible) |
+| an open, with its flags | `AUTH_OPEN` (answered with the flags allowed, `es_respond_flags_result`; but a read-write open answered read-only is refused whole, EPERM, not given a read-only descriptor: M3) |
 | create, unlink, rename, link, truncate | `AUTH_CREATE`, `AUTH_UNLINK`, `AUTH_RENAME`, `AUTH_LINK`, `AUTH_TRUNCATE` |
 | chmod, chown, utimes, xattrs | `AUTH_SETMODE`, `AUTH_SETOWNER`, `AUTH_UTIMES`, `AUTH_SETEXTATTR`, ... |
 | chdir, readlink, readdir | `AUTH_CHDIR`, `AUTH_READLINK`, `AUTH_READDIR` |
@@ -52,7 +53,9 @@ The file in an event is the kernel's (`es_file_t`: its path and its
 delivered, as on Linux, not on a name read twice. A process is named by
 its audit token; NOTIFY_FORK and NOTIFY_EXIT give the tree. Muting, and
 since macOS 13 inverted muting, let the client receive events for chosen
-processes only (the agent and what it starts). A result may be cached by
+processes only; but an audit token changes at each exec, and a child's
+first events can come before its fork is handled, so inverted muting loses
+the agent's children (M2). A result may be cached by
 the kernel (`cache`), which a policy that decides by flags and path can use
 only where the answer cannot change.
 
@@ -77,16 +80,20 @@ only where the answer cannot change.
 - **Every system call.** There is no allowlist of calls, as the Linux
   Warden's seccomp filter is: a call no event covers goes ahead. The
   default-deny is per event type, not per call.
-- **A deadline missed.** Each AUTH message has a deadline; a client that
-  misses it is killed by the system (and the operation, we expect, allowed:
-  to measure). The SMT decision procedure, and its certificate, must fit
-  inside it, every time, or the client must answer from a cache.
+- **A deadline missed.** Each AUTH message has a deadline (15 s on macOS
+  26.7.2); a client that misses it is killed by the system (SIGKILL), and
+  **the operation goes ahead**: missing the deadline fails open (M1). The
+  SMT decision procedure, and its certificate, must fit inside it, every
+  time, and the daemon must answer DENY itself before the deadline when a
+  decision is not ready (D7).
 
 ## The design in one paragraph (proposed)
 
 A daemon, `varek-esd`, runs as root, holds the Endpoint Security
-entitlement and the user's Full Disk Access, and subscribes, with inverted
-muting, to the AUTH events above for the agent's process tree only. `varek
+entitlement and the user's Full Disk Access, and subscribes to the AUTH
+events above, selecting the agent's process tree by pid (its pid, then
+each fork's and each exec's, by parent: D6) and answering every other
+process's events at once, cached. `varek
 run` on the Mac starts the agent (its own user, as in the VM since v1.38),
 tells the daemon its audit token and policy, and the daemon decides each
 event with the same decision procedure and checker as the Linux Warden,
@@ -130,6 +137,37 @@ does (above).
   on the Mac, and the default is no network.
 - **D5. Is the VM kept?** Proposed: yes, as the full path; native is for a
   policy within its subset.
+- **D6. How the agent's processes are selected** (from M2). Proposed: by
+  pid, not by inverted muting. Every process's AUTH events come; a process
+  is the agent's when its pid, its parent's or its original parent's is
+  (the agent's at first, then each NOTIFY_FORK's child), until NOTIFY_EXIT;
+  another process's events are allowed at once and cached. Inverted muting
+  by audit token lost every child in M2, and most of M1's work. The cost:
+  the daemon is in every process's path on the Mac, so a stall in it holds
+  the whole Mac (up to the deadline, then fails open); `es_mute_path` for
+  the system's own paths is to be measured as a way to narrow it.
+- **D7. Fail closed at the deadline** (from M1). Proposed: every AUTH
+  event is answered by the daemon before its deadline: a decision not ready
+  by the deadline less a margin (a second, to be set from M1's worst) is
+  answered DENY, recorded as such (`"rule":"deadline"`), from a timer
+  separate from the decision. A missed deadline would kill the client and
+  let the operation, and every later one until it restarts, go ahead.
+- **D8. Paths are the real paths** (from M3). ES gives the resolved path:
+  `/tmp`, `/etc` and `/var` are `/private/tmp`, `/private/etc`,
+  `/private/var`. Proposed: the policy's paths are resolved (firmlinks and
+  symlinks) when it is loaded on a Mac, and the records name both, so a
+  rule for `/tmp/x` holds; a rule whose path cannot be resolved refuses to
+  start.
+- **D9. No read-only answer to a read-write open** (from M3). An open with
+  write refused is refused whole (EPERM), not narrowed to a read. Proposed:
+  the policy's `readonly` refuses a read-write open on the Mac, as on Linux
+  without `SECCOMP_ADDFD`, and the docs say so.
+- **D10. The cache** (from M4). Proposed: answers are cached only where
+  the policy's answer cannot change during the run (the agent's reads of
+  system files), `es_clear_cache` is called at each run's start and end and
+  at any change of policy, and a write is never cached. Still to measure:
+  whether a cached allow survives a new client's or a new run's rule
+  without `es_clear_cache`.
 
 ## Measure first (on an EC2 Mac, before any decision above)
 
@@ -154,6 +192,59 @@ does (above).
 - **M7.** CI: whether a GitHub-hosted macOS runner can load an Endpoint
   Security client at all (SIP, TCC, the entitlement). If not, the checks
   run on an EC2 Mac, as `mac_check.sh` does.
+
+## Measured (EC2 Mac, November 15, 2026)
+
+`mac2.metal`, us-east-2b, macOS 26.7.2, about 1:00 to 1:15 AM CST; the
+probe (`varek/v1_4/tests/es_probe/`, at 7a2e27d) signed with the Developer
+ID profile (team 6TRS8N9VX7, `com.apple.developer.endpoint-security.client`
+true), run as root. The probe answers from a fixed rule: the times are
+Endpoint Security's and the probe's, not the decision procedure's (the
+Linux Warden decides an open in 73 µs p50, the v1.38.0 soak).
+
+- **M1, the time to answer, and the deadline.**
+  - Selected by pid (`--track-pids`), 5,000 `cat` runs: 60,030 answers,
+    p50 9.5 µs, p99 56 µs, max 183 µs; a clone and a compile: 6,344
+    answers, p50 8.7 µs, p99 21 µs. By inverted muting, the same runs gave
+    1,557 and 21 answers: most of the work was not seen (M2).
+  - The deadline (`budget_ms`): 15,000 ms on every event.
+  - Each answer delayed 1 s: allowed, 14.0 s left; 10 s: allowed, 5.0 s
+    left; 70 s: the client killed (SIGKILL) at 15 s, and **the open went
+    ahead** (`cat` printed all of `/etc/hosts`). A missed deadline fails
+    open (D7).
+- **M2, children.** Three `cat`s (one in the shell, one in a background
+  subshell, one in a nested shell): by inverted muting, **0 of 3 opens
+  seen, in 11 runs of 11**: a child's exec, with its new audit token, comes
+  before its fork's notice is handled. Selected by pid: 3 of 3 (78
+  answers, 5 forks, 7 execs). Hence D6.
+- **M3, writes refused.**
+  - A rule for `/tmp/esw` never matched: ES reports `/private/tmp/esw`
+    (D8).
+  - With `/private/tmp/esw`, selected by pid: 5 refused, the file still
+    `before`; `>`, `rm`, `mv` and `touch` saw "Operation not permitted".
+    An `O_RDWR` open answered with read only was **refused whole (EPERM)**,
+    not given a read-only descriptor (D9).
+  - By inverted muting: only the shell's own write refused; its children's
+    `rm` and `touch` went ahead, and the file was deleted (M2).
+- **M4, the cache.** With `--cache`, the 5,000 opens of `/etc/hosts` were
+  answered once (answers 60,030 to 5,032; p50 12.4 µs). With a rule
+  refusing writes under `/private/etc` added, a write there was still
+  refused, the cached reads unaffected. Not measured: whether a cached
+  allow of the same open survives a new rule (D10).
+- **M6, approvals.** Started as root from a Session Manager shell, the
+  client was made with no approval asked: the responsible process is
+  presumably the SSM agent, which EC2's macOS images give Full Disk Access.
+  Not measured: from an ssh login, as a launchd job, or on a user's Mac
+  (where Full Disk Access is approved in System Settings).
+- **Signing**, from a Session Manager shell: only in ec2-user's own
+  security session (`launchctl asuser 501`); `sudo -iu` keeps root's, and
+  codesign finds no identity (`es_probe/README.md`).
+- **M7, CI.** GitHub's macOS runner (macOS 26.7.2) builds the probe with
+  no warnings; signed ad hoc, it stops at `es_new_client` as not entitled.
+  A run with the entitlement needs the Developer ID profile and key, which
+  stay off CI: the checks run on an EC2 Mac.
+- **M5** (the content filter) is not measured: it needs the Network
+  Extension.
 
 ## Prerequisites (Apple Developer account)
 
@@ -188,12 +279,14 @@ done on an EC2 Mac, as the checks are.
 ## Plan (once D1 to D5 are decided)
 
 1. M1 to M7 on an EC2 Mac, with a minimal client
-   (`varek/v1_4/tests/es_probe/`, written November 13, 2026, not yet
-   built: its README is the run's steps): it supervises one command and
-   its children (inverted muting, NOTIFY_FORK), answers AUTH_OPEN,
-   AUTH_EXEC, AUTH_CREATE, AUTH_UNLINK, AUTH_RENAME and AUTH_TRUNCATE
-   from a fixed rule, and records each answer's time against its deadline.
-   It covers M1 to M4 and M6; M5 needs the content filter, M7 a runner.
+   (`varek/v1_4/tests/es_probe/`: its README is the run's steps): it
+   supervises one command and its children (by inverted muting, or by pid
+   with `--track-pids`), answers AUTH_OPEN, AUTH_EXEC, AUTH_CREATE,
+   AUTH_UNLINK, AUTH_RENAME and AUTH_TRUNCATE from a fixed rule, and
+   records each answer's time against its deadline. **Done November 15,
+   2026** for M1 to M4, M6 in part and M7 ("Measured"); still to do: M4's
+   cached allow against a new rule, M6 on a user's Mac, the cost of D6
+   with `es_mute_path`, and M5 with the content filter.
 2. `warden_es.c`: the event loop, the decisions and the records for files
    and launches, under a policy with no `host` rules; the shared parts
    unchanged. Its suite runs on an EC2 Mac.
