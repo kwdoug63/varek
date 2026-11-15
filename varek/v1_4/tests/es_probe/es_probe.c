@@ -7,7 +7,8 @@
 //
 //   varek-es-probe [--log FILE] [--deny-write PREFIX] [--deny-exec PATH]
 //                  [--delay-us N] [--cache] [--track-pids]
-//                  [--rules-on-usr1] [--clear-cache-on-usr1] -- CMD [ARGS...]
+//                  [--rules-on-usr1] [--clear-cache-on-usr1]
+//                  [--others-uncached] [--mute-system-targets] -- CMD [ARGS...]
 //
 // It must run as root, signed with the Endpoint Security entitlement (its
 // bundle: build_sign.sh), and approved for Full Disk Access. It starts CMD
@@ -41,6 +42,13 @@
 // $PPID), to see whether an answer cached before a rule outlives it (M4);
 // --clear-cache-on-usr1 also clears the kernel's cache of this client's
 // answers (es_clear_cache) then. A {"event":"usr1"} line marks the moment.
+// The cost of D6 and D10 (--track-pids only): --others-uncached answers
+// the other processes' AUTH events uncached (by default they are cached);
+// --mute-system-targets mutes the events whose target is under the
+// system's SIP-protected paths (es_mute_path, target prefix: /System/,
+// /usr/lib/, /usr/share/, /Library/Apple/). The summary then counts the
+// other processes' answers and their times, and gives the probe's CPU
+// time and the command's wall time.
 // At CMD's exit a summary goes to stdout.
 //
 // Built in CI on GitHub's macOS runner (it stops there as not entitled);
@@ -52,6 +60,7 @@
 #include <mach/mach_time.h>
 #include <dispatch/dispatch.h>
 #include <sys/fcntl.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <errno.h>
 #include <signal.h>
@@ -73,6 +82,11 @@ static bool g_cache = false;
 static bool g_track = false;              // --track-pids
 static _Atomic bool g_rules_on = true;    // false until SIGUSR1 under --rules-on-usr1
 static bool g_clear_on_usr1 = false;
+static bool g_others_uncached = false;    // --others-uncached
+static bool g_mute_system = false;        // --mute-system-targets
+#define MAXO 2000000
+static uint64_t g_olat[MAXO];             // ns, event to answer, the other processes' (--track-pids)
+static _Atomic long g_on;
 #define PIDS 100000                       // macOS's pids are below 99999
 static _Atomic unsigned char g_sel[PIDS]; // --track-pids: the selected pids
 static FILE *g_log;
@@ -140,10 +154,13 @@ static void handle(es_client_t *c, const es_message_t *m) {
             sel_set(pid, 1);
         if (!sel(pid)) {
             if (m->action_type == ES_ACTION_TYPE_AUTH) {
+                bool cache = !g_others_uncached;
                 if (m->event_type == ES_EVENT_TYPE_AUTH_OPEN)
-                    es_respond_flags_result(c, m, (uint32_t)m->event.open.fflag, true);
+                    es_respond_flags_result(c, m, (uint32_t)m->event.open.fflag, cache);
                 else
-                    es_respond_auth_result(c, m, ES_AUTH_RESULT_ALLOW, true);
+                    es_respond_auth_result(c, m, ES_AUTH_RESULT_ALLOW, cache);
+                long j = atomic_fetch_add(&g_on, 1);
+                if (j < MAXO) g_olat[j] = to_ns(mach_absolute_time() - m->mach_time);
             }
             return;
         }
@@ -252,9 +269,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--track-pids")) g_track = true;
         else if (!strcmp(argv[i], "--rules-on-usr1")) atomic_store(&g_rules_on, false);
         else if (!strcmp(argv[i], "--clear-cache-on-usr1")) g_clear_on_usr1 = true;
+        else if (!strcmp(argv[i], "--others-uncached")) g_others_uncached = true;
+        else if (!strcmp(argv[i], "--mute-system-targets")) g_mute_system = true;
         else return usage();
     }
     if (i >= argc) return usage();
+    if (!g_track && (g_others_uncached || g_mute_system)) {
+        fprintf(stderr, "es_probe: --others-uncached and --mute-system-targets are for --track-pids\n");
+        return 2;
+    }
     if (g_track && g_delay_us > 0) {
         // every process's AUTH events wait in the one queue behind a delayed answer
         fprintf(stderr, "es_probe: --delay-us is for inverted muting, not with --track-pids\n");
@@ -282,6 +305,14 @@ int main(int argc, char **argv) {
         mach_msg_type_number_t sc = TASK_AUDIT_TOKEN_COUNT;
         if (task_info(mach_task_self(), TASK_AUDIT_TOKEN, (task_info_t)&self, &sc) == KERN_SUCCESS)
             es_mute_process(client, &self);
+        if (g_mute_system) {
+            const char *sys[] = { "/System/", "/usr/lib/", "/usr/share/", "/Library/Apple/" };
+            for (size_t k = 0; k < sizeof sys / sizeof sys[0]; k++)
+                if (es_mute_path(client, sys[k], ES_MUTE_PATH_TYPE_TARGET_PREFIX) != ES_RETURN_SUCCESS) {
+                    fprintf(stderr, "es_probe: es_mute_path %s failed\n", sys[k]);
+                    return 3;
+                }
+        }
     } else if (es_invert_muting(client, ES_MUTE_INVERSION_TYPE_PROCESS) != ES_RETURN_SUCCESS) {
         fprintf(stderr, "es_probe: es_invert_muting failed (macOS 13 or later is needed)\n");
         return 3;
@@ -335,11 +366,13 @@ int main(int argc, char **argv) {
     }
     if (g_track) sel_set(pid, 1);
     else es_mute_process(client, &tok);    // inverted: selected
+    uint64_t t_start = mach_absolute_time();
     if (write(go[1], "x", 1) != 1) { kill(pid, SIGKILL); return 3; }
     close(go[1]);
 
     int st = 0;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    double wall_s = to_ns(mach_absolute_time() - t_start) / 1e9;
     es_unsubscribe_all(client);
     es_delete_client(client);
     dispatch_sync(g_logq, ^{});
@@ -353,5 +386,20 @@ int main(int argc, char **argv) {
     if (k > 0)
         printf("es_probe: event to answer p50 %.1f us, p99 %.1f us, max %.1f us; least time left before a deadline %.1f ms\n",
                g_lat[k / 2] / 1000.0, g_lat[(k * 99) / 100] / 1000.0, g_lat[k - 1] / 1000.0, g_left_min / 1e6);
+    if (g_track) {
+        long on = atomic_load(&g_on), ok = on < MAXO ? on : MAXO;
+        qsort(g_olat, (size_t)ok, sizeof g_olat[0], cmp_u64);
+        struct rusage ru;
+        getrusage(RUSAGE_SELF, &ru);
+        double cpu = ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+        printf("es_probe: other processes: %ld AUTH answers (%s%s), %.0f a second",
+               on, g_others_uncached ? "uncached" : "cached", g_mute_system ? ", system targets muted" : "",
+               wall_s > 0 ? on / wall_s : 0.0);
+        if (ok > 0)
+            printf(", event to answer p50 %.1f us, p99 %.1f us, max %.1f us",
+                   g_olat[ok / 2] / 1000.0, g_olat[(ok * 99) / 100] / 1000.0, g_olat[ok - 1] / 1000.0);
+        printf("\nes_probe: the command's wall time %.2f s; the probe's CPU time %.2f s (%.1f%% of one core)\n",
+               wall_s, cpu, wall_s > 0 ? 100.0 * cpu / wall_s : 0.0);
+    }
     return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
 }

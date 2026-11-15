@@ -242,6 +242,44 @@ M=~/varek/varek/v1_4/tests/es_probe/m4c.py # end
 For each: the lines `m4c.py` printed, the summary line, the file, and the
 log's opens of `/private/tmp/esc/f` (in 3, those after `{"event":"usr1"}`).
 
+**The cost of D6 and D10** (every other process's AUTH events answered
+by the client, uncached). The agent's own answers are uncached in every
+run (no `--cache`). Each workload without the probe first, for its time:
+
+```
+cd /tmp && /usr/bin/time -p /bin/sh -c 'for i in $(seq 1 5000); do /bin/cat /etc/hosts > /dev/null; done' # end
+```
+
+```
+cd /tmp && rm -rf m1 && /usr/bin/time -p /bin/sh -c 'git clone -q https://github.com/kwdoug63/varek.git m1 && python3 -m compileall -q m1 > /dev/null' # end
+```
+
+Then each workload under the probe three ways, `O` set to each in turn:
+the others cached (as before), uncached, and uncached with the system's
+SIP-protected paths muted:
+
+```
+for O in "" "--others-uncached" "--others-uncached --mute-system-targets"; do echo "== others: ${O:-cached}"; P --track-pids $O -- /bin/sh -c 'for i in $(seq 1 5000); do /bin/cat /etc/hosts > /dev/null; done'; done # end
+```
+
+```
+for O in "" "--others-uncached" "--others-uncached --mute-system-targets"; do echo "== others: ${O:-cached}"; cd /tmp && rm -rf m1 && P --track-pids $O -- /bin/sh -c 'git clone -q https://github.com/kwdoug63/varek.git m1 && python3 -m compileall -q m1 > /dev/null'; done # end
+```
+
+And the machine at rest, a minute of `sleep`, for the background load the
+client carries:
+
+```
+for O in "" "--others-uncached" "--others-uncached --mute-system-targets"; do echo "== others: ${O:-cached}"; P --track-pids $O -- /bin/sleep 60; done # end
+```
+
+For each: the summary's three lines (the agent's answers and their times;
+the other processes' answers, a second, and their times; the wall time
+and the probe's CPU time), and the two `time` lines without the probe.
+With `--mute-system-targets` the agent's own events on those paths are not
+seen either (the reads of the system's libraries; their writes SIP
+refuses): that run is for the cost only.
+
 ## 5. Afterwards
 
 - The logs: `tar czf ~/es-probe-logs.tgz ~/es-m*.jsonl`, kept as the Mac
