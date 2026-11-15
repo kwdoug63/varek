@@ -10,6 +10,23 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Added
+- **Splunk export and app** (v1.39, `docs/security/v1.39-security-operations.md`,
+  section 2). `varek export --format splunk [LOG]` sends a run's OCSF
+  events, audited first, to a Splunk HTTP Event Collector, sourcetype
+  `varek:ocsf`, the whole OCSF event as each event's body and the
+  decision's time as its time; `--follow STREAM` sends a live run's.
+  `tools/varek_splunk.py` does the sending. The run, the decision and the
+  class are indexed fields. The token comes from the environment
+  (`--hec-token-env`, default `SPLUNK_HEC_TOKEN`), never the command line;
+  the HEC's certificate is always checked (`--ca` for a private CA);
+  `--hec-ack` waits for Splunk's indexer acknowledgement. The app,
+  `integrations/splunk/varek` (installed in `/opt/varek/integrations`),
+  names the fields (`varek_decision`, `varek_verdict`, `varek_policy_line`,
+  `varek_policy_text`, `varek_decided_by`, `varek_target`, ...) and gives a
+  dashboard: refusals by policy line, agent and run, what dry runs let
+  through, and failed audits. Tested with a stand-in HEC
+  (`tests/test_varek_splunk.py`) and against Splunk Enterprise 10.4.5: a
+  live run's refusals indexed within 2 seconds.
 - **OpenTelemetry export** (v1.39, `docs/security/v1.39-security-operations.md`,
   section 1). `varek export --format otlp [LOG]` sends a run's OCSF events,
   audited first as `--format ocsf` writes them, to an OpenTelemetry

@@ -2419,6 +2419,35 @@ def cmd_export_otlp(args):
     """v1.39: `varek export --format otlp`: the run's OCSF events (audited, as
     --format ocsf writes them) sent as OpenTelemetry log records to a
     collector (tools/varek_otel.py); with --follow, as the run goes"""
+    ot = [sys.executable, tool("varek_otel.py"), "-"]
+    if args.endpoint:
+        ot += ["--endpoint", args.endpoint]
+    for h in args.otlp_header or []:
+        ot += ["--header", h]
+    return _export_sent(args, ot, "the run's events sent as OpenTelemetry log records")
+
+
+def cmd_export_splunk(args):
+    """v1.39: `varek export --format splunk`: the run's OCSF events (audited,
+    as --format ocsf writes them) sent to a Splunk HTTP Event Collector,
+    sourcetype varek:ocsf (tools/varek_splunk.py); with --follow, as the run
+    goes"""
+    sp = [sys.executable, tool("varek_splunk.py"), "-"]
+    if args.endpoint:
+        sp += ["--hec", args.endpoint]
+    if args.hec_token_env:
+        sp += ["--token-env", args.hec_token_env]
+    if args.splunk_index:
+        sp += ["--index", args.splunk_index]
+    if args.ca:
+        sp += ["--ca", args.ca]
+    if args.hec_ack:
+        sp.append("--ack")
+    return _export_sent(args, sp, "the run's events sent to Splunk")
+
+
+def _export_sent(args, sender, done):
+    """the run's OCSF events, audited (tools/varek_ocsf.py), piped to a sender"""
     if args.verify:
         raise CliError("--verify is for --format ocsf and cyclonedx",
                        fix="export with --format ocsf to keep a file to verify")
@@ -2446,24 +2475,19 @@ def cmd_export_otlp(args):
         ox += ["--idle", str(args.idle)]
     if args.allow_incomplete:
         ox.append("--allow-incomplete")
-    ot = [sys.executable, tool("varek_otel.py"), "-"]
-    if args.endpoint:
-        ot += ["--endpoint", args.endpoint]
-    for h in args.otlp_header or []:
-        ot += ["--header", h]
     ocsf = subprocess.Popen(ox, stdout=subprocess.PIPE)
     try:
-        otel = subprocess.Popen(ot, stdin=ocsf.stdout)
-        ocsf.stdout.close()                    # the exporter's end only: it sees the pipe close
-        rc_otel = otel.wait()
+        out = subprocess.Popen(sender, stdin=ocsf.stdout)
+        ocsf.stdout.close()                    # the sender's end only: it sees the pipe close
+        rc_out = out.wait()
     finally:
         rc_ocsf = ocsf.wait()
     if rc_ocsf != 0:
         raise CliError(f"the OCSF export of {log} failed (exit {rc_ocsf}); what it wrote before was sent",
                        fix="see its message above: a stream the audit refuses is not exported")
-    if rc_otel != 0:
-        return rc_otel
-    ok(f"the run's events sent as OpenTelemetry log records")
+    if rc_out != 0:
+        return rc_out
+    ok(done)
     return 0
 
 
@@ -2513,8 +2537,10 @@ def cmd_export(args):
         return cmd_export_ocsf(args)
     if getattr(args, "format", "cyclonedx") == "otlp":                  # v1.39
         return cmd_export_otlp(args)
+    if getattr(args, "format", "cyclonedx") == "splunk":                # v1.39
+        return cmd_export_splunk(args)
     if args.follow:
-        raise CliError("--follow is for --format ocsf and otlp")
+        raise CliError("--follow is for --format ocsf, otlp and splunk")
     if args.verify:
         cfg = load_config(required=False)
         pub = args.pubkey or (_pubkey(cfg) if cfg else None)
@@ -3292,15 +3318,26 @@ def build_parser():
 
     sp = add("export", cmd_export, "write CycloneDX 1.6 authorization evidence, or OCSF 1.9.0 events, for a run")
     sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")
-    sp.add_argument("--format", choices=("cyclonedx", "ocsf", "otlp"), default="cyclonedx",
+    sp.add_argument("--format", choices=("cyclonedx", "ocsf", "otlp", "splunk"), default="cyclonedx",
                     help="cyclonedx (default); ocsf: OCSF 1.9.0 events, one per line (v1.31); otlp: those "
-                         "events sent to an OpenTelemetry collector as log records (v1.39)")
+                         "events sent to an OpenTelemetry collector as log records (v1.39); splunk: sent to "
+                         "a Splunk HTTP Event Collector, sourcetype varek:ocsf (v1.39)")
     sp.add_argument("--endpoint", help="otlp: the collector's OTLP/HTTP logs URL (default: "
-                    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, OTEL_EXPORTER_OTLP_ENDPOINT, or http://localhost:4318/v1/logs)")
+                    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, OTEL_EXPORTER_OTLP_ENDPOINT, or http://localhost:4318/v1/logs); "
+                    "splunk: the HTTP Event Collector's URL, https://HOST:8088 (default: SPLUNK_HEC_URL)")
+    sp.add_argument("--hec-token-env", metavar="ENVVAR",
+                    help="splunk: the environment variable holding the HEC token (default SPLUNK_HEC_TOKEN; "
+                         "a token is never taken from the command line)")
+    sp.add_argument("--splunk-index", metavar="INDEX", help="splunk: the index (default: the token's)")
+    sp.add_argument("--ca", metavar="FILE", help="splunk: certificate authorities to trust for the HEC's "
+                    "certificate (default: the system's)")
+    sp.add_argument("--hec-ack", action="store_true",
+                    help="splunk: wait for Splunk to acknowledge each batch as indexed (the token's indexer "
+                         "acknowledgement must be on)")
     sp.add_argument("--otlp-header", action="append", metavar="NAME=ENVVAR",
                     help="otlp: send header NAME with the value of the environment variable ENVVAR "
                          "(an API key: never on the command line); repeatable")
-    sp.add_argument("--follow", metavar="STREAM", help="ocsf, otlp: tail a live run's stream, writing (or "
+    sp.add_argument("--follow", metavar="STREAM", help="ocsf, otlp, splunk: tail a live run's stream, writing (or "
                     "sending) each event as its record is chained (to stdout, or -o)")
     sp.add_argument("--policy", help="ocsf: the policy file the run used (default: found from the log)")
     sp.add_argument("--idle", type=float, default=0, metavar="SECONDS",

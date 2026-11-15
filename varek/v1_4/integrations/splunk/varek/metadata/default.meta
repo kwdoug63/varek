@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: MIT
+# the sourcetype's fields and the macro, for every app's searches
+[]
+access = read : [ * ], write : [ admin, sc_admin ]
+export = system

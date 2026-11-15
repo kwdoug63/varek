@@ -1,0 +1,167 @@
+<form version="1.1" theme="light">
+  <label>VAREK: the Warden's decisions</label>
+  <description>Refusals by policy line, agent and run; what dry runs let through; failed audits. The events are OCSF 1.9.0, sent by varek export --format splunk (macro varek_events).</description>
+  <fieldset submitButton="false" autoRun="true">
+    <input type="time" token="t">
+      <label>Time</label>
+      <default>
+        <earliest>-24h@h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+    <input type="text" token="run">
+      <label>Run (varek_run)</label>
+      <default>*</default>
+    </input>
+    <input type="text" token="host">
+      <label>Host</label>
+      <default>*</default>
+    </input>
+  </fieldset>
+  <row>
+    <panel>
+      <single>
+        <title>Refused</title>
+        <search>
+          <query>`varek_events` varek_run="$run$" host="$host$" `varek_refused` | stats count</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="rangeColors">["0x1F2937","0xB45309"]</option>
+        <option name="rangeValues">[0]</option>
+        <option name="useColors">1</option>
+      </single>
+    </panel>
+    <panel>
+      <single>
+        <title>Decisions</title>
+        <search>
+          <query>`varek_events` varek_run="$run$" host="$host$" varek_decision=* | stats count</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+      </single>
+    </panel>
+    <panel>
+      <single>
+        <title>Runs</title>
+        <search>
+          <query>`varek_events` varek_run="$run$" host="$host$" | stats dc(varek_run)</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+      </single>
+    </panel>
+    <panel>
+      <single>
+        <title>Let through in dry runs</title>
+        <search>
+          <query>`varek_events` varek_run="$run$" host="$host$" varek_mode=dry_run | stats count</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+      </single>
+    </panel>
+    <panel>
+      <single>
+        <title>Failed audits</title>
+        <search>
+          <query>`varek_events` varek_run="$run$" host="$host$" varek_event=audit varek_audit_passed=false | stats count</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="rangeColors">["0x1F2937","0xB91C1C"]</option>
+        <option name="rangeValues">[0]</option>
+        <option name="useColors">1</option>
+      </single>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <chart>
+        <title>Refusals over time, by what decided them</title>
+        <search>
+          <query>`varek_events` varek_run="$run$" host="$host$" `varek_refused` | timechart count by varek_decided_by limit=8 useother=true</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+        <option name="charting.chart">column</option>
+        <option name="charting.chart.stackMode">stacked</option>
+        <option name="charting.legend.placement">bottom</option>
+      </chart>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <table>
+        <title>Refusals by policy line (or the rule, for a default deny)</title>
+        <search>
+          <query>`varek_events` varek_run="$run$" host="$host$" `varek_refused` | stats count AS refused dc(varek_run) AS runs values(varek_target) AS targets latest(_time) AS last BY varek_decided_by | sort - refused | eval last=strftime(last, "%F %T %Z") | rename varek_decided_by AS "decided by"</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+        <option name="count">10</option>
+      </table>
+    </panel>
+    <panel>
+      <table>
+        <title>Refusals by agent</title>
+        <search>
+          <query>`varek_events` varek_run="$run$" host="$host$" `varek_refused` | eval agent=coalesce(varek_agent, "(the agent)") | stats count AS refused dc(varek_decided_by) AS "policy lines" BY agent | sort - refused</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <table>
+        <title>Runs</title>
+        <search>
+          <query>`varek_events` varek_run="$run$" host="$host$" | stats count(eval(varek_decision="DENY" AND coalesce(varek_mode, "")!="dry_run")) AS refused count(eval(isnotnull(varek_decision))) AS decisions count(eval(varek_mode="dry_run")) AS "dry run, let through" values(eval(if(varek_event="audit", if(varek_audit_passed="true", "passed", "FAILED"), null()))) AS audit earliest(_time) AS start latest(_time) AS end values(varek_policy_name) AS policy BY varek_run host | rename varek_run AS run | eval start=strftime(start, "%F %T %Z"), end=strftime(end, "%F %T %Z") | sort - end</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+        <option name="count">10</option>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <table>
+        <title>Latest refusals</title>
+        <search>
+          <query>`varek_events` varek_run="$run$" host="$host$" `varek_refused` | eval when=strftime(_time, "%F %T.%3N %Z") | table when host varek_agent class_name activity_name varek_target varek_verdict varek_decided_by varek_run varek_report_id | rename varek_agent AS agent class_name AS class activity_name AS activity varek_target AS target varek_verdict AS verdict varek_decided_by AS "decided by" varek_run AS run varek_report_id AS record</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+        <option name="count">20</option>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <table>
+        <title>Dry runs: what the policy refuses, let through and recorded</title>
+        <search>
+          <query>`varek_events` varek_run="$run$" host="$host$" varek_mode=dry_run | stats count BY varek_decided_by varek_target | sort - count | rename varek_decided_by AS "decided by" varek_target AS target</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+      </table>
+    </panel>
+    <panel>
+      <table>
+        <title>Failed audits</title>
+        <search>
+          <query>`varek_events` varek_run="$run$" host="$host$" varek_event=audit varek_audit_passed=false | eval when=strftime(_time, "%F %T %Z") | table when host varek_run unmapped.varek.audit.mode unmapped.varek.audit.problems{} | rename varek_run AS run unmapped.varek.audit.mode AS mode unmapped.varek.audit.problems{} AS problems</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+      </table>
+    </panel>
+  </row>
+</form>
