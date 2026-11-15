@@ -112,7 +112,8 @@ MIT · github.com/kwdoug63/varek
 - **Splunk:** tested on Splunk Enterprise on one host, not Splunk Cloud,
   and with a private CA's certificate on the HEC, not a public CA's.
   Splunk's default HEC certificate names no host, so the HEC needs a
-  certificate of its own. The app is not yet checked by AppInspect or on
+  certificate of its own. The app passes Splunk AppInspect 4.4.0 (every
+  check, and Splunk Cloud's: no failure, no warning), but is not yet on
   Splunkbase.
 - **Both:** an export that fails mid-run ends; the events after it stay in
   the verdict stream, and exporting the run again sends all of its events
