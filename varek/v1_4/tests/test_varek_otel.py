@@ -28,7 +28,7 @@ DENIED = {
     "actor": {"process": {"pid": 333}, "user": {"uid": "alice@example.test"}},
     "ai_agent": {"name": "python3", "type": "Other"},
     "policy": {"name": "p.txt", "uid": "ab" * 32, "desc": "deny  path /etc/shadow"},
-    "unmapped": {"varek": {"report_id": "pr-1-122", "seq": 122, "decision": "UNSATISFIED",
+    "unmapped": {"varek": {"report_id": "pr-1-122", "seq": 122, "decision": "UNSATISFIED", "decision_final": "DENY",
                            "rule": "policy_match", "policy_line": 91}},
 }
 
@@ -41,12 +41,14 @@ def test_a_refusal_is_a_warning_naming_the_policy_line():
     r = otel.log_record(DENIED, observed_ns=5)
     a = attrs(r)
     assert r["timeUnixNano"] == "1794711677967000000" and r["observedTimeUnixNano"] == "5"
-    assert r["severityNumber"] == 13 and r["severityText"] == "Medium"
+    assert r["severityNumber"] == 13 and r["severityText"] == "WARN"           # a level Loki reads
+    assert attrs(r)["ocsf.severity"] == "Medium"
     assert r["body"]["stringValue"] == ("Blocked: File System Activity: Open /etc/shadow "
                                         "(policy line 91: deny  path /etc/shadow)")
     assert a["event.name"] == "varek.decision" and a["ocsf.disposition"] == "Blocked"
     assert a["varek.policy.line"] == "91" and a["varek.policy.text"] == "deny  path /etc/shadow"
-    assert a["varek.verdict"] == "UNSATISFIED" and a["varek.report_id"] == "pr-1-122"
+    assert a["varek.verdict"] == "UNSATISFIED" and a["varek.decision"] == "DENY"
+    assert a["varek.report_id"] == "pr-1-122"
     assert a["process.pid"] == "333" and a["user.id"] == "alice@example.test" and a["varek.agent"] == "python3"
     assert json.loads(a["ocsf.event"]) == DENIED                    # nothing the OCSF event says is lost
     assert "ocsf.event" not in attrs(otel.log_record(DENIED, full_event=False))
@@ -68,7 +70,7 @@ def test_severities_and_lifecycle_events():
             "time": 1, "severity_id": 4, "severity": "High", "metadata": {},
             "unmapped": {"varek": {"event": "audit", "audit": {"passed": False}}}}
     r = otel.log_record(life)
-    assert r["severityNumber"] == 17 and attrs(r)["event.name"] == "varek.audit"
+    assert r["severityNumber"] == 17 and r["severityText"] == "ERROR" and attrs(r)["event.name"] == "varek.audit"
     assert attrs(r)["varek.audit.passed"] is False
     assert [otel.SEVERITY[k][0] for k in (1, 2, 3, 4, 5)] == [9, 10, 13, 17, 21]
     with pytest.raises(otel.OtelError):

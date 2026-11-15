@@ -9,11 +9,13 @@ record to an OpenTelemetry collector, over OTLP/HTTP with the JSON encoding
 
 A record carries:
   * its time (the event's), the time it was read, and a severity from the
-    event's (Informational INFO, Medium WARN, High ERROR, ...);
+    event's (Informational INFO, Medium WARN, High ERROR, ...), its text
+    the short name (INFO, WARN, ...) a backend reads a level from;
   * a one-line body: the decision, the class and activity, the object, and
     the policy line that decided it, with its text;
   * attributes: event.name, the OCSF class, activity, action, disposition
-    and status, the three-state verdict, the rule, the policy line's number
+    and status, the three-state verdict and the final decision (ALLOW or
+    DENY), the rule, the policy line's number
     and text, the policy's name and SHA-256, the run, the record's report id
     and seq, the agent or sub-agent, the process id, the user; and the
     whole OCSF event as JSON (ocsf.event), the line as read, so nothing the
@@ -147,7 +149,8 @@ def log_record(ev, line=None, full_event=True, observed_ns=None):
         "ocsf.action": ev.get("action"), "ocsf.disposition": ev.get("disposition"),
         "ocsf.status": ev.get("status"), "ocsf.severity": ev.get("severity"),
         "ocsf.metadata.uid": _get(ev, "metadata", "uid"),
-        "varek.verdict": v.get("decision"), "varek.rule": v.get("rule"),
+        "varek.verdict": v.get("decision"), "varek.decision": v.get("decision_final"),
+        "varek.rule": v.get("rule"),
         "varek.policy.line": line_no if isinstance(line_no, int) and line_no > 0 else None,
         "varek.policy.text": pol.get("desc"), "varek.policy.name": pol.get("name"),
         "varek.policy.sha256": pol.get("uid"),
@@ -163,7 +166,9 @@ def log_record(ev, line=None, full_event=True, observed_ns=None):
     if full_event:
         attrs["ocsf.event"] = line if line is not None else json.dumps(ev, sort_keys=True, separators=(",", ":"))
     rec = {"timeUnixNano": str(t_ns), "observedTimeUnixNano": str(observed_ns or time.time_ns()),
-           "severityNumber": sev_num, "severityText": str(ev.get("severity") or sev_name),
+           # the short name, as backends read a level from it (Loki's
+           # level: OCSF's "Medium" is none it knows); OCSF's in ocsf.severity
+           "severityNumber": sev_num, "severityText": sev_name,
            "body": {"stringValue": body}, "attributes": _kv(attrs)}
     return rec
 
