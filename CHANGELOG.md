@@ -13,7 +13,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Three of v1.37.0's known limits, closed; security operations moves to
 v1.39.0. The Warden decides nothing differently; the policy grammar stays
-1.35 (`RELEASE-v1.38.0.md`).
+1.35 (`RELEASE-v1.38.0.md`). The shared 24-hour soak passed on this code,
+November 13 to 14, 2026, on an EC2 instance (Ubuntu 24.04):
+`soak_check: PASS`, its run B under the baseline with the git rules (288
+git commits, every probe refused).
 
 ### Changed
 - **The baseline reads, and never writes, the working directory's git
