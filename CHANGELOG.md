@@ -31,6 +31,24 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   0.120.0 and Grafana Cloud's OTLP endpoint: a live run's refusals there
   within about a second.
 
+### Fixed
+- **The adapters' framework pins install again**
+  (`adapters/requirements-frameworks.txt`). Dependabot's mcp 2.3.0 (November
+  10) conflicts with langchain-mcp-adapters 0.3.2, the latest, which needs
+  mcp < 2, so the file could not be installed and test_v1350's code
+  adapters could not be set up. mcp is back at 1.30.0, and Dependabot
+  ignores mcp 2.x until langchain-mcp-adapters takes it. With it, five
+  updates: langchain-core 1.8.0, langchain-openai 1.7.4, openai 3.49.0,
+  anthropic 2.8.0, claude-agent-sdk 0.2.180; test_v1350 passes with them
+  (137 checks, the langgraph and openai-agents adapters under the Warden
+  included). CI now installs the file and imports the frameworks
+  (`warden-build.yml`), so a pin that cannot be installed is found when it
+  is proposed.
+- **`varek plan generate` lets the adapter's Python read
+  `/proc/sys/vm/overcommit_memory`**, as the baseline does: some Pythons
+  read it as they start (a 3.13 under `/usr/local` did), and the Warden
+  refused it, so the plan's run recorded a refusal.
+
 ## [1.38.0] - 2026-11-14 — hardening: git's settings, the VM's agent user and network
 
 Three of v1.37.0's known limits, closed; security operations moves to

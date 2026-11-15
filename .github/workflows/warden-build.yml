@@ -58,6 +58,16 @@ jobs:
           sudo apt-get install -y --no-install-recommends python3-cryptography
       - name: Build the Warden and its tools
         run: make -C varek/v1_4 all
+      - name: The adapters' framework pins install (adapters/requirements-frameworks.txt)
+        run: |
+          # v1.39: test_v1350's code adapters run in a Python with these;
+          # nothing else installs them, so a pin that cannot be installed
+          # (mcp 2.3.0 beside langchain-mcp-adapters, November 2026) is
+          # found here, not by the next person to set it up
+          python3 -m venv "$RUNNER_TEMP/varek-fw"
+          "$RUNNER_TEMP/varek-fw/bin/pip" install -q -r varek/v1_4/adapters/requirements-frameworks.txt
+          "$RUNNER_TEMP/varek-fw/bin/pip" check
+          "$RUNNER_TEMP/varek-fw/bin/python" -I -c 'import langgraph, langchain_anthropic, langchain_openai, langchain_aws, langchain_mcp_adapters, agents, openai, anthropic, mcp'
       - name: Check the deployment scripts parse
         run: |
           python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py varek/v1_4/tools/varek_bench.py varek/v1_4/tools/varek_node_export.py varek/v1_4/tools/varek_vm.py varek/v1_4/tools/varek_suggest.py

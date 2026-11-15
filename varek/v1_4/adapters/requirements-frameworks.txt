@@ -6,18 +6,24 @@
 # watsonx reads YAML with the system's PyYAML (python3-yaml).
 #
 #   python3 -m venv /var/tmp/varek-fw && /var/tmp/varek-fw/bin/pip install -r adapters/requirements-frameworks.txt
+#
+# Updated November 15, 2026 (v1.39): test_v1350 passes with these (137
+# checks, section 9's code adapters included). mcp stays 1.x:
+# langchain-mcp-adapters (0.3.2, the latest) needs mcp < 2, and mcp 2.3.0
+# left this file impossible to install (.github/dependabot.yml ignores mcp
+# 2.x; CI installs this file, warden-build.yml).
 langgraph==1.2.20
 langgraph-prebuilt==1.1.1
-langchain-core==1.7.6
+langchain-core==1.8.0
 langchain-anthropic==1.7.10
-langchain-openai==1.7.2
+langchain-openai==1.7.4
 langchain-aws==1.9.0
 langchain-mcp-adapters==0.3.2
 openai-agents==0.24.0
-openai==3.46.0
-anthropic==2.6.0
-mcp==2.3.0
+openai==3.49.0
+anthropic==2.8.0
+mcp==1.30.0
 # read as data by the adapters, not imported; installed to check the specs
 # and settings the samples hold against what the framework's own tools write
 ibm-watsonx-orchestrate==2.19.1
-claude-agent-sdk==0.2.174
+claude-agent-sdk==0.2.180
