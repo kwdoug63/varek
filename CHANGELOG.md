@@ -19,14 +19,17 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   decision, the object and the policy line with its text; its attributes
   carry the OCSF class, action and disposition, the three-state verdict,
   the rule, the policy line, text, name and SHA-256, the run, the report id,
-  the agent, the process and user, and the whole OCSF event
-  (`ocsf.event`); a refusal is a WARN, a failed audit an ERROR. The
+  the agent, the process and user, the final decision (`varek.decision`,
+  ALLOW or DENY) and the whole OCSF event (`ocsf.event`); a refusal is a
+  WARN, a failed audit an ERROR, as `severityText` (the field a backend
+  reads a level from). The
   endpoint and headers follow `OTEL_EXPORTER_OTLP_*`; `--otlp-header
   NAME=ENVVAR` takes an API key from the environment, never the command
   line. A busy collector is retried; a refusal or a partial rejection ends
   the export with exit 1. Tested with a stand-in collector
   (`tests/test_varek_otel.py`) and against the OpenTelemetry Collector
-  0.120.0: a live run's refusals at the collector within about a second.
+  0.120.0 and Grafana Cloud's OTLP endpoint: a live run's refusals there
+  within about a second.
 
 ## [1.38.0] - 2026-11-14 — hardening: git's settings, the VM's agent user and network
 
