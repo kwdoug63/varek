@@ -149,8 +149,9 @@ does (above).
   process's answer is **never** cached: the kernel's cache is shared by
   every process running the same executable, and an allow cached for a
   process outside the tree answered the agent's same open, under a rule
-  refusing it, with no event (M4c, run 1). Its cost, every process's
-  events answered uncached, is to be measured.
+  refusing it, with no event (M4c, run 1). Its cost was measured: small
+  on an idle Mac ("The cost of D6 and D10"), the agent's own uncached
+  answers the most of it.
 - **D7. Fail closed at the deadline** (from M1). Proposed: every AUTH
   event is answered by the daemon before its deadline: a decision not ready
   by the deadline less a margin (a second, to be set from M1's worst) is
@@ -178,8 +179,10 @@ does (above).
   - **no answer is cached**, the agent's or another process's
     (`cache=false` on every response), until a case is measured where a
     cached answer cannot stand in for a decision the policy would make
-    differently; the cost is measured first (every AUTH event answered by
-    the daemon);
+    differently. Measured: the other processes' uncached answers cost
+    nothing seen; the agent's own, about a quarter more wall time for the
+    worst case (5,000 short processes) and a tenth for a clone and compile
+    ("The cost of D6 and D10");
   - `es_clear_cache` when the daemon starts and at each run's start and
     end, so nothing cached before (by an earlier version, or a crash
     before a response) outlives it.
@@ -279,6 +282,35 @@ Linux Warden decides an open in 73 µs p50, the v1.38.0 soak).
 
   Run 1 is a way around the policy: the kernel answered the agent's open
   from an allow cached for another process. (D6, D10)
+- **The cost of D6 and D10** (at 19116c5; `--track-pids`, the agent's own
+  answers uncached throughout). Without the probe, as root: the 5,000
+  `cat`s 7.25 s; a clone of the repository and a compile of its 1,299
+  Python files 1.06 s.
+
+  | Workload | The other processes | Their answers | The agent's answers | Wall time | The probe's CPU |
+  |---|---|---|---|---|---|
+  | 5,000 `cat`s | cached | 10, 1/s | 60,030; p50 9.7 µs, p99 56.5 µs | 8.90 s | 1.24 s (13.9%) |
+  | | **uncached** | 142, 16/s; p50 51 µs, p99 388 µs | 60,030; p50 9.7 µs, p99 56.8 µs | 8.88 s | 1.22 s (13.8%) |
+  | | uncached, system targets muted | 26, 3/s | 45,023; p50 9.4 µs | 8.35 s | 0.76 s (9.1%) |
+  | Clone and compile | cached | 11, 9/s | 4,343; p50 9.2 µs, p99 22.9 µs | 1.17 s | 0.17 s |
+  | | **uncached** | 25, 21/s; p50 70 µs, p99 154 µs | 4,343; p50 9.4 µs, p99 25.3 µs | 1.20 s | 0.17 s |
+  | | uncached, system targets muted | 20, 17/s | 4,288 | 1.19 s | 0.17 s |
+  | A minute at rest (`sleep 60`) | cached | 33, 1/s | 7 to 9 | 60.15 s | 0.01 s |
+  | | **uncached** | 160, 3/s; p50 82 µs, p99 506 µs | | 60.15 s | 0.02 s |
+  | | uncached, system targets muted | 143, 2/s | | 60.15 s | 0.02 s |
+
+  - The other processes uncached (D6) changed neither the wall time nor
+    the probe's CPU: at rest 3 answers a second instead of 1.
+  - The cost is the agent's own uncached answers (D10): about 23% more
+    wall time for 5,000 short processes (some 27 µs an event), about 11%
+    for the clone and compile, each answered within 57 µs at p99.
+  - Muting the SIP-protected system paths as targets (`es_mute_path`)
+    took the worst case to 15% and the probe's CPU from 1.2 to 0.76 s;
+    but it hides the agent's own reads of the system's libraries too
+    (their writes SIP refuses), so it is not proposed: a policy decides
+    those reads.
+  - This was an idle EC2 Mac: a person's Mac, with its browsers and
+    indexing, has more processes whose events come; not measured.
 - **M6, approvals.** Started as root from a Session Manager shell, the
   client was made with no approval asked: the responsible process is
   presumably the SSM agent, which EC2's macOS images give Full Disk Access.
@@ -332,11 +364,10 @@ done on an EC2 Mac, as the checks are.
    with `--track-pids`), answers AUTH_OPEN, AUTH_EXEC, AUTH_CREATE,
    AUTH_UNLINK, AUTH_RENAME and AUTH_TRUNCATE from a fixed rule, and
    records each answer's time against its deadline. **Done November 15,
-   2026** for M1 to M4, M4b, M4c, M6 in part and M7 ("Measured"); still
-   to do: the cost of D6 and D10 together (every process's AUTH events
-   answered uncached; with `es_mute_path` for the system's own paths),
-   another client's cache, M6 on a user's Mac, and M5 with the content
-   filter.
+   2026** for M1 to M4, M4b, M4c, M6 in part, M7, and the cost of D6
+   and D10 ("Measured"); still to do: the same cost on a person's Mac (its
+   background processes), another client's cache, M6 on a user's Mac, and
+   M5 with the content filter.
 2. `warden_es.c`: the event loop, the decisions and the records for files
    and launches, under a policy with no `host` rules; the shared parts
    unchanged. Its suite runs on an EC2 Mac.

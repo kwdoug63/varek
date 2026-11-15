@@ -244,14 +244,15 @@ log's opens of `/private/tmp/esc/f` (in 3, those after `{"event":"usr1"}`).
 
 **The cost of D6 and D10** (every other process's AUTH events answered
 by the client, uncached). The agent's own answers are uncached in every
-run (no `--cache`). Each workload without the probe first, for its time:
+run (no `--cache`). Each workload without the probe first, for its time, as root as the
+probe's command is (and `m1`, left by a run as root, removed with sudo):
 
 ```
-cd /tmp && /usr/bin/time -p /bin/sh -c 'for i in $(seq 1 5000); do /bin/cat /etc/hosts > /dev/null; done' # end
+cd /tmp && sudo /usr/bin/time -p /bin/sh -c 'for i in $(seq 1 5000); do /bin/cat /etc/hosts > /dev/null; done' # end
 ```
 
 ```
-cd /tmp && rm -rf m1 && /usr/bin/time -p /bin/sh -c 'git clone -q https://github.com/kwdoug63/varek.git m1 && python3 -m compileall -q m1 > /dev/null' # end
+cd /tmp && sudo rm -rf m1 && sudo /usr/bin/time -p /bin/sh -c 'git clone -q https://github.com/kwdoug63/varek.git m1 && python3 -m compileall -q m1 > /dev/null' # end
 ```
 
 Then each workload under the probe three ways, `O` set to each in turn:
@@ -263,7 +264,7 @@ for O in "" "--others-uncached" "--others-uncached --mute-system-targets"; do ec
 ```
 
 ```
-for O in "" "--others-uncached" "--others-uncached --mute-system-targets"; do echo "== others: ${O:-cached}"; cd /tmp && rm -rf m1 && P --track-pids $O -- /bin/sh -c 'git clone -q https://github.com/kwdoug63/varek.git m1 && python3 -m compileall -q m1 > /dev/null'; done # end
+for O in "" "--others-uncached" "--others-uncached --mute-system-targets"; do echo "== others: ${O:-cached}"; cd /tmp && sudo rm -rf m1 && P --track-pids $O -- /bin/sh -c 'git clone -q https://github.com/kwdoug63/varek.git m1 && python3 -m compileall -q m1 > /dev/null'; done # end
 ```
 
 And the machine at rest, a minute of `sleep`, for the background load the
