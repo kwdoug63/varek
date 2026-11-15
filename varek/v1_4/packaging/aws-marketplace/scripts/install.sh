@@ -59,7 +59,8 @@ say "Marketplace settings"
 product_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("product_id",""))' "$MARKET")
 if [ -n "$product_id" ]; then
     install -m 0644 "$MARKET" "$PREFIX/marketplace.json"
-    echo "  license check for product $product_id"
+    product_code=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("product_code",""))' "$MARKET")
+    echo "  license check for product $product_id${product_code:+ (product code $product_code, hourly)}"
 else
     echo "  no product_id: test image, no license check (Enterprise packs cannot be selected)"
 fi

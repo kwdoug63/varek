@@ -27,6 +27,20 @@ at once. Otherwise the next check within the hour (another `varek run
 (v1.23.1: v1.23.0 asked for Unit=None, which License Manager refuses for a
 Count entitlement, and never checked in.)
 
+v1.39.1: an hourly listing (the evaluation listing with its free trial) has no
+contract and so no License Manager license: AWS Marketplace meters it by the
+product code it attaches to the AMI, and an instance launched from it carries
+that code in instance metadata. Its marketplace.json names the code instead
+of dimensions:
+
+    {"product_id": "<the product's prod-... ID>", "product_code": "<code>",
+     "dimensions": []}
+
+`check()` then reads the instance's product codes from the instance metadata
+service (IMDSv2) and counts the instance as licensed when the code is there.
+No IAM role is needed for that. A file may name both a product code and
+dimensions; the product code is tried first.
+
 The result only decides whether the Enterprise policy packs (the files whose
 header says they are licensed to VAREK Enterprise subscribers) may be selected.
 The Warden itself never depends on it: with no entitlement, VAREK keeps
@@ -37,8 +51,10 @@ Enterprise packs are simply not present.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
+import urllib.error
 import urllib.request
 import uuid
 
@@ -47,6 +63,9 @@ MARKETPLACE_FILE = "marketplace.json"
 ISSUER_FINGERPRINT = "aws:294406891311:AWS/Marketplace:issuer-fingerprint"
 ENTERPRISE_MARK = "Licensed to VAREK Enterprise subscribers"
 IMDS = "http://169.254.169.254"
+# AWS Marketplace product codes are lower-case letters and digits (25 today).
+PRODUCT_CODE_RE = re.compile(r"[a-z0-9]{8,64}")
+HOURLY = "hourly"              # Result.dimension when the product code licensed it
 
 # Statuses returned in Result.status
 LICENSED = "licensed"          # an entitlement was checked out
@@ -82,10 +101,15 @@ def load_marketplace(varek_home):
         raise ValueError(f"{path} is unreadable: {e}")
     pid = str(data.get("product_id", "")).strip()
     dims = [str(d).strip() for d in data.get("dimensions", []) if str(d).strip()]
-    if not pid or not dims:
-        raise ValueError(f"{path} needs a product_id and at least one dimension")
+    code = str(data.get("product_code", "")).strip()
+    if code and not PRODUCT_CODE_RE.fullmatch(code):
+        raise ValueError(f"{path} has a malformed product_code {code!r}")
+    if not pid or not (dims or code):
+        raise ValueError(f"{path} needs a product_id and at least one dimension "
+                         "or a product_code")
     issuer = str(data.get("issuer_fingerprint", "")).strip() or ISSUER_FINGERPRINT
-    return {"product_id": pid, "dimensions": dims, "issuer": issuer, "path": path}
+    return {"product_id": pid, "dimensions": dims, "product_code": code,
+            "issuer": issuer, "path": path}
 
 
 def is_enterprise_pack(path):
@@ -102,21 +126,49 @@ def is_enterprise_pack(path):
     return False
 
 
-def instance_region(timeout=2.0):
-    """The EC2 Region from the instance metadata service (IMDSv2), or None."""
+class _NotFound(Exception):
+    """IMDS answered 404: the item does not exist on this instance."""
+
+
+def _imds_get(path, timeout=2.0):
+    """GET one instance metadata item over IMDSv2. Raises on any failure."""
     # Never send metadata requests through an http_proxy the host may set.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(
+        IMDS + "/latest/api/token", method="PUT",
+        headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+    token = opener.open(req, timeout=timeout).read().decode()
+    req = urllib.request.Request(
+        IMDS + path, headers={"X-aws-ec2-metadata-token": token})
     try:
-        req = urllib.request.Request(
-            IMDS + "/latest/api/token", method="PUT",
-            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
-        token = opener.open(req, timeout=timeout).read().decode()
-        req = urllib.request.Request(
-            IMDS + "/latest/meta-data/placement/region",
-            headers={"X-aws-ec2-metadata-token": token})
-        return opener.open(req, timeout=timeout).read().decode().strip() or None
+        return opener.open(req, timeout=timeout).read().decode()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise _NotFound(path)
+        raise
+
+
+def instance_region(timeout=2.0):
+    """The EC2 Region from the instance metadata service (IMDSv2), or None."""
+    try:
+        return _imds_get("/latest/meta-data/placement/region", timeout).strip() or None
     except Exception:
         return None
+
+
+def instance_product_codes(timeout=2.0):
+    """The AWS Marketplace product codes on this instance, or None if IMDS can't be asked.
+
+    An instance launched from a paid AMI carries the product's code; IMDS answers
+    404 when the instance has none, which is an empty list, not a failure.
+    """
+    try:
+        body = _imds_get("/latest/meta-data/product-codes", timeout)
+    except _NotFound:
+        return []
+    except Exception:
+        return None
+    return [c.strip() for c in body.splitlines() if c.strip()]
 
 
 def _checkout(aws, region, product_id, dimension, timeout, issuer=ISSUER_FINGERPRINT):
@@ -163,6 +215,22 @@ def check(varek_home, region=None, aws=None, timeout=20):
         return Result(UNAVAILABLE, str(e))
     if mp is None:
         return Result(NOT_MARKETPLACE, "not the VAREK Enterprise image")
+    code_miss = ""
+    if mp["product_code"]:
+        codes = instance_product_codes()
+        if codes is not None and mp["product_code"] in codes:
+            return Result(LICENSED,
+                          f"instance launched from AWS Marketplace product code "
+                          f"{mp['product_code']} (hourly or free trial)",
+                          HOURLY, mp["product_id"])
+        if codes is None:
+            code_miss = "could not read the instance's product codes from instance metadata"
+        else:
+            code_miss = (f"this instance was not launched with AWS Marketplace product code "
+                         f"{mp['product_code']}")
+        if not mp["dimensions"]:
+            status = UNAVAILABLE if codes is None else NOT_LICENSED
+            return Result(status, code_miss, product_id=mp["product_id"])
     aws = aws or shutil.which("aws")
     if not aws:
         return Result(UNAVAILABLE, "the AWS CLI is not installed", product_id=mp["product_id"])
