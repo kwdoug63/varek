@@ -20,4 +20,4 @@ mcp==2.3.0
 # read as data by the adapters, not imported; installed to check the specs
 # and settings the samples hold against what the framework's own tools write
 ibm-watsonx-orchestrate==2.19.1
-claude-agent-sdk==0.2.174
+claude-agent-sdk==0.2.180
