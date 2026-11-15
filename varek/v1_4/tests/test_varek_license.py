@@ -374,9 +374,16 @@ def test_instance_product_codes(monkeypatch, fake, want):
 
 def test_license_command_hourly_off_ec2(tmp_path, hourly_home):
     # Off EC2 the metadata service doesn't answer: the command says what the check needs.
+    # Some CI hosts do answer at 169.254.169.254 (404 for product-codes); then the
+    # command says the instance wasn't launched with the code. Either way it refuses.
+    imds_answers = vl.instance_product_codes() is not None
     r = varek("license", env={"VAREK_HOME": str(hourly_home),
                               "VAREK_CONFIG": str(tmp_path / "none.conf")})
+    out = r.stdout + r.stderr
     assert r.returncode == 1
     assert f"product code {CODE} (hourly listing)" in r.stdout
-    assert "IMDSv2" in r.stdout + r.stderr
-    assert "license-manager:CheckoutLicense" not in r.stdout + r.stderr
+    if imds_answers:
+        assert "attaches the product code" in out
+    else:
+        assert "IMDSv2" in out
+    assert "license-manager:CheckoutLicense" not in out
