@@ -62,6 +62,10 @@ jobs:
           codesign -s - -f "$RUNNER_TEMP/varek-es-probe"
           rc=0; "$RUNNER_TEMP/varek-es-probe" 2> usage.err || rc=$?
           [ "$rc" = 2 ] && grep -q '^usage: varek-es-probe' usage.err
-          rc=0; sudo "$RUNNER_TEMP/varek-es-probe" -- /usr/bin/true 2> es.err || rc=$?
-          cat es.err
-          [ "$rc" = 3 ] && grep -q 'es_new_client: not entitled' es.err
+          rc=0; "$RUNNER_TEMP/varek-es-probe" --track-pids --delay-us 5 -- /usr/bin/true 2> both.err || rc=$?
+          [ "$rc" = 2 ] && grep -q 'not with --track-pids' both.err
+          for mode in "" --track-pids; do
+            rc=0; sudo "$RUNNER_TEMP/varek-es-probe" $mode -- /usr/bin/true 2> es.err || rc=$?
+            cat es.err
+            [ "$rc" = 3 ] && grep -q 'es_new_client: not entitled' es.err
+          done

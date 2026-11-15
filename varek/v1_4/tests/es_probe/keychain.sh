@@ -15,6 +15,12 @@
 # passwords made here, which no one types or keeps: the keychain stays
 # unlocked for 6 hours, then build_sign.sh is run again after this. Apple's
 # Developer ID intermediates are imported with them, for the chain.
+#
+# Run it in ec2-user's own security session: an ssh login, or, from a
+# Session Manager shell (whose sudo -iu keeps root's session: no identity
+# found, codesign failing with errSecInternalComponent),
+#   sudo launchctl asuser 501 sudo -u ec2-user -H zsh -c '...'
+# with build_sign.sh in the same command.
 set -euo pipefail
 KEY="${1:?usage: keychain.sh KEY CERT}" CERT="${2:?usage: keychain.sh KEY CERT}"
 die() { printf 'keychain.sh: %s\n' "$*" >&2; exit 1; }
@@ -32,7 +38,10 @@ fi
 "$OSSL" x509 -in "$W/cert.pem" -noout -subject
 KP="$("$OSSL" rand -hex 24)" PP="$("$OSSL" rand -hex 24)"
 "$OSSL" pkcs12 -export -inkey "$KEY" -in "$W/cert.pem" -out "$W/signing.p12" -passout "pass:$PP"
-KC=varek-signing.keychain
+# the full path: a bare name was refused (SecKeychainCreate: Permission
+# denied) from a Session Manager shell, November 15, 2026
+mkdir -p "$HOME/Library/Keychains"
+KC="$HOME/Library/Keychains/varek-signing.keychain-db"
 security delete-keychain "$KC" 2>/dev/null || true
 security create-keychain -p "$KP" "$KC"
 security set-keychain-settings -lut 21600 "$KC"

@@ -35,8 +35,19 @@ git clone -b claude/varek-roadmap-landing-01dbw5-macos-es https://github.com/kwd
 
 ## 2. Sign
 
+From an ssh login as ec2-user:
+
 ```
 ~/varek/varek/v1_4/tests/es_probe/keychain.sh ~/apple-signing/varek-devid.key ~/apple-signing/CERT.cer # end
+```
+
+From a Session Manager shell, not `sudo -iu ec2-user` (it keeps root's
+security session: `0 valid identities`, and codesign fails with
+`errSecInternalComponent`), but ec2-user's own, with the keychain made
+the default and build_sign.sh in the same command (November 15, 2026):
+
+```
+sudo launchctl asuser 501 sudo -u ec2-user -H zsh -c 'K=~/varek/varek/v1_4/tests/es_probe; $K/keychain.sh ~/apple-signing/varek-devid.key ~/apple-signing/CERT.cer && security default-keychain -d user -s ~/Library/Keychains/varek-signing.keychain-db && $K/build_sign.sh ~/apple-signing/PROFILE.provisionprofile "IDENTITY"' # end
 ```
 
 It checks the certificate is the key's, makes a keychain of its own and
@@ -112,13 +123,23 @@ P --log ~/es-m1c.jsonl --delay-us 1000000 -- /bin/cat /etc/hosts # end
 (and `--delay-us 10000000`, then `--delay-us 70000000`, each with its own
 `--log`).
 
-**M2, children.** Opens by a child and a grandchild in the background:
+**M2, children.** Opens by a child and a grandchild in the background,
+selected by inverted muting (the design's), then by pid, which sees every
+process and so misses nothing of the tree:
 
 ```
 P --log ~/es-m2.jsonl -- /bin/sh -c '/bin/cat /etc/hosts > /dev/null; (/bin/cat /etc/hosts > /dev/null &); /bin/sh -c "/bin/cat /etc/hosts > /dev/null"; wait' # end
 ```
 
-Every `cat`'s open of `/etc/hosts` should be in the log, three of them.
+```
+P --log ~/es-m2t.jsonl --track-pids -- /bin/sh -c '/bin/cat /etc/hosts > /dev/null; (/bin/cat /etc/hosts > /dev/null &); /bin/sh -c "/bin/cat /etc/hosts > /dev/null"; wait' # end
+```
+
+Every `cat`'s open of `/etc/hosts` should be in each log, three of them,
+and the summaries' forks and execs the same. Fewer under inverted muting
+means a child acted before its fork was handled (its events unseen): run
+it ten times (`for i in $(seq 1 10); do P --log ~/es-m2-$i.jsonl -- …; done`)
+to see how often.
 
 **M3, a read-only answer to a read-write open**, and the other writes
 refused:
@@ -150,6 +171,7 @@ allow outlives a new client's rule.
 
 - The logs: `tar czf ~/es-probe-logs.tgz ~/es-m*.jsonl`, kept as the Mac
   run's results were (`docs/security/v1.33-mac-runbook.md`, Afterwards).
-- Delete the key and the keychain from the Mac:
-  `security delete-keychain varek-signing.keychain && rm -P ~/apple-signing/varek-devid.key # end`
+- Delete the key and the keychain from the Mac (in ec2-user's session, as
+  in step 2):
+  `security delete-keychain ~/Library/Keychains/varek-signing.keychain-db && rm -P ~/apple-signing/varek-devid.key # end`
 - Terminate the instance; release the host after its 24 hours.

@@ -6,13 +6,24 @@
 // records how long each answer took against the message's deadline.
 //
 //   varek-es-probe [--log FILE] [--deny-write PREFIX] [--deny-exec PATH]
-//                  [--delay-us N] [--cache] -- CMD [ARGS...]
+//                  [--delay-us N] [--cache] [--track-pids] -- CMD [ARGS...]
 //
 // It must run as root, signed with the Endpoint Security entitlement (its
 // bundle: build_sign.sh), and approved for Full Disk Access. It starts CMD
-// held, selects it (inverted muting by its audit token: only the selected
-// processes' events come), lets it run, selects each child it forks
-// (NOTIFY_FORK), and answers:
+// held, selects it, lets it run, and selects each child it forks
+// (NOTIFY_FORK) and each image they exec, in one of two ways (M2 compares
+// them):
+//   inverted muting (the default, the design's): only the selected audit
+//     tokens' events come. An exec gives the process a new audit token (its
+//     pidversion changes), so each AUTH_EXEC of a selected process selects
+//     the new image's token before it is answered; a child is selected when
+//     its NOTIFY_FORK is handled, so an event of the child's before that is
+//     not seen.
+//   --track-pids: every process's events come; a process is selected when
+//     its pid, its parent's or its original parent's is (the command's at
+//     first, then each fork's), until it exits; the others' AUTH events are
+//     allowed at once, cached, and not recorded.
+// It answers:
 //   AUTH_OPEN    the flags asked, less FWRITE under --deny-write (M3)
 //   AUTH_CREATE, AUTH_UNLINK, AUTH_RENAME, AUTH_TRUNCATE
 //                denied under --deny-write, else allowed
@@ -26,7 +37,8 @@
 // deadline is and what happens past it (M1). --cache lets the kernel cache
 // the answers (M4). At CMD's exit a summary goes to stdout.
 //
-// Not built in CI: it needs the macOS SDK. Built and run on an EC2 Mac.
+// Built in CI on GitHub's macOS runner (it stops there as not entitled);
+// signed and run on an EC2 Mac.
 
 #include <EndpointSecurity/EndpointSecurity.h>
 #include <bsm/libbsm.h>
@@ -52,6 +64,9 @@ static const char *g_deny_write = NULL;   // a path prefix
 static const char *g_deny_exec = NULL;    // a path
 static long g_delay_us = 0;
 static bool g_cache = false;
+static bool g_track = false;              // --track-pids
+#define PIDS 100000                       // macOS's pids are below 99999
+static _Atomic unsigned char g_sel[PIDS]; // --track-pids: the selected pids
 static FILE *g_log;
 static mach_timebase_info_data_t g_tb;
 static dispatch_queue_t g_logq;
@@ -59,7 +74,10 @@ static dispatch_queue_t g_logq;
 #define MAXS 200000
 static uint64_t g_lat[MAXS];              // ns, event to answer
 static int64_t g_left_min = INT64_MAX;    // ns, the least time left before a deadline
-static _Atomic long g_n, g_denied, g_forks;
+static _Atomic long g_n, g_denied, g_forks, g_execs;
+
+static bool sel(pid_t p) { return p > 0 && p < PIDS && atomic_load(&g_sel[p]); }
+static void sel_set(pid_t p, unsigned char v) { if (p > 0 && p < PIDS) atomic_store(&g_sel[p], v); }
 
 static uint64_t to_ns(uint64_t mach) { return mach * g_tb.numer / g_tb.denom; }
 
@@ -107,13 +125,35 @@ static void record(const es_message_t *m, const char *ev, const char *path, long
 
 static void handle(es_client_t *c, const es_message_t *m) {
     char p[2048] = "";
+    if (g_track) {
+        // a process of the command's tree: its pid, its parent's or its original parent's selected
+        pid_t pid = audit_token_to_pid(m->process->audit_token);
+        if (!sel(pid) && (sel(m->process->ppid) || sel(m->process->original_ppid)))
+            sel_set(pid, 1);
+        if (!sel(pid)) {
+            if (m->action_type == ES_ACTION_TYPE_AUTH) {
+                if (m->event_type == ES_EVENT_TYPE_AUTH_OPEN)
+                    es_respond_flags_result(c, m, (uint32_t)m->event.open.fflag, true);
+                else
+                    es_respond_auth_result(c, m, ES_AUTH_RESULT_ALLOW, true);
+            }
+            return;
+        }
+        if (m->event_type == ES_EVENT_TYPE_NOTIFY_EXIT) { sel_set(pid, 0); return; }
+    }
     if (m->event_type == ES_EVENT_TYPE_NOTIFY_FORK) {
-        // M2: select the child; an event of its before this is not seen
-        es_mute_process(c, &m->event.fork.child->audit_token);
+        // M2: select the child; with inverted muting an event of its before this is not seen
+        if (g_track) sel_set(audit_token_to_pid(m->event.fork.child->audit_token), 1);
+        else es_mute_process(c, &m->event.fork.child->audit_token);
         atomic_fetch_add(&g_forks, 1);
         return;
     }
     if (m->action_type != ES_ACTION_TYPE_AUTH) return;
+    if (m->event_type == ES_EVENT_TYPE_AUTH_EXEC) {
+        // the new image has a new audit token: selected before the exec is answered
+        if (!g_track) es_mute_process(c, &m->event.exec.target->audit_token);
+        atomic_fetch_add(&g_execs, 1);
+    }
     if (g_delay_us > 0) usleep((useconds_t)g_delay_us);
     const char *ev = "?", *ans = "allow";
     long flags = -1;
@@ -186,7 +226,7 @@ static int cmp_u64(const void *a, const void *b) {
 
 static int usage(void) {
     fprintf(stderr, "usage: varek-es-probe [--log FILE] [--deny-write PREFIX] [--deny-exec PATH] "
-                    "[--delay-us N] [--cache] -- CMD [ARGS...]\n");
+                    "[--delay-us N] [--cache] [--track-pids] -- CMD [ARGS...]\n");
     return 2;
 }
 
@@ -200,9 +240,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--deny-exec") && i + 1 < argc) g_deny_exec = argv[++i];
         else if (!strcmp(argv[i], "--delay-us") && i + 1 < argc) g_delay_us = atol(argv[++i]);
         else if (!strcmp(argv[i], "--cache")) g_cache = true;
+        else if (!strcmp(argv[i], "--track-pids")) g_track = true;
         else return usage();
     }
     if (i >= argc) return usage();
+    if (g_track && g_delay_us > 0) {
+        // every process's AUTH events wait in the one queue behind a delayed answer
+        fprintf(stderr, "es_probe: --delay-us is for inverted muting, not with --track-pids\n");
+        return 2;
+    }
     mach_timebase_info(&g_tb);
     g_log = logp ? fopen(logp, "w") : stderr;
     if (!g_log) { perror(logp); return 2; }
@@ -219,13 +265,19 @@ int main(int argc, char **argv) {
         fprintf(stderr, "es_probe: es_new_client: %s (%d)\n", why, (int)r);
         return 3;
     }
-    if (es_invert_muting(client, ES_MUTE_INVERSION_TYPE_PROCESS) != ES_RETURN_SUCCESS) {
+    if (g_track) {
+        // every process's events come: not this probe's own
+        audit_token_t self;
+        mach_msg_type_number_t sc = TASK_AUDIT_TOKEN_COUNT;
+        if (task_info(mach_task_self(), TASK_AUDIT_TOKEN, (task_info_t)&self, &sc) == KERN_SUCCESS)
+            es_mute_process(client, &self);
+    } else if (es_invert_muting(client, ES_MUTE_INVERSION_TYPE_PROCESS) != ES_RETURN_SUCCESS) {
         fprintf(stderr, "es_probe: es_invert_muting failed (macOS 13 or later is needed)\n");
         return 3;
     }
     es_event_type_t evs[] = { ES_EVENT_TYPE_AUTH_OPEN, ES_EVENT_TYPE_AUTH_EXEC, ES_EVENT_TYPE_AUTH_CREATE,
                               ES_EVENT_TYPE_AUTH_UNLINK, ES_EVENT_TYPE_AUTH_RENAME, ES_EVENT_TYPE_AUTH_TRUNCATE,
-                              ES_EVENT_TYPE_NOTIFY_FORK };
+                              ES_EVENT_TYPE_NOTIFY_FORK, ES_EVENT_TYPE_NOTIFY_EXIT };
     if (es_subscribe(client, evs, sizeof evs / sizeof evs[0]) != ES_RETURN_SUCCESS) {
         fprintf(stderr, "es_probe: es_subscribe failed\n");
         return 3;
@@ -255,7 +307,8 @@ int main(int argc, char **argv) {
         kill(pid, SIGKILL);
         return 3;
     }
-    es_mute_process(client, &tok);         // inverted: selected
+    if (g_track) sel_set(pid, 1);
+    else es_mute_process(client, &tok);    // inverted: selected
     if (write(go[1], "x", 1) != 1) { kill(pid, SIGKILL); return 3; }
     close(go[1]);
 
@@ -268,8 +321,9 @@ int main(int argc, char **argv) {
     long n = atomic_load(&g_n);
     long k = n < MAXS ? n : MAXS;
     qsort(g_lat, (size_t)k, sizeof g_lat[0], cmp_u64);
-    printf("es_probe: %ld AUTH answers (%ld denied), %ld forks selected; command exit %d\n",
-           n, atomic_load(&g_denied), atomic_load(&g_forks), WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st));
+    printf("es_probe: %s: %ld AUTH answers (%ld denied), %ld forks and %ld execs selected; command exit %d\n",
+           g_track ? "pids tracked" : "inverted muting", n, atomic_load(&g_denied), atomic_load(&g_forks),
+           atomic_load(&g_execs), WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st));
     if (k > 0)
         printf("es_probe: event to answer p50 %.1f us, p99 %.1f us, max %.1f us; least time left before a deadline %.1f ms\n",
                g_lat[k / 2] / 1000.0, g_lat[(k * 99) / 100] / 1000.0, g_lat[k - 1] / 1000.0, g_left_min / 1e6);
