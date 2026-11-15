@@ -38,6 +38,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import varek_license  # noqa: E402
@@ -2392,6 +2393,80 @@ def cmd_audit(args):
     return run_cmd(argv, check=False).returncode
 
 
+def _run_start_of(log, wait=30.0):
+    """v1.39: a live stream's run_start (its policy's path and SHA-256), read
+    as soon as the Warden has written it; None if it does not come in time"""
+    end = time.time() + wait
+    while True:
+        try:
+            with open(log, errors="replace") as fh:
+                for line in fh:
+                    if line.startswith("{"):
+                        try:
+                            r = json.loads(line)
+                        except ValueError:
+                            continue
+                        if isinstance(r, dict) and r.get("event") == "run_start":
+                            return r
+        except OSError:
+            pass
+        if time.time() >= end:
+            return None
+        time.sleep(0.5)
+
+
+def cmd_export_otlp(args):
+    """v1.39: `varek export --format otlp`: the run's OCSF events (audited, as
+    --format ocsf writes them) sent as OpenTelemetry log records to a
+    collector (tools/varek_otel.py); with --follow, as the run goes"""
+    if args.verify:
+        raise CliError("--verify is for --format ocsf and cyclonedx",
+                       fix="export with --format ocsf to keep a file to verify")
+    cfg = config_or_defaults()
+    log = args.follow or latest_log(cfg, args.log)
+    if args.follow and not os.path.exists(log):
+        raise CliError(f"no stream at {log}", fix="give the path the run writes its verdict stream to")
+    if args.follow:
+        rs = _run_start_of(log) or {}
+        s = {"policy": rs.get("policy_path"), "policy_sha": rs.get("policy_sha256")}
+    else:
+        s = summarize(read_records(log))
+    policy = args.policy or _policy_for_log(cfg, s)
+    if not policy:
+        raise CliError("the policy file this run used is not on this host",
+                       fix="restore it, or give it with --policy; the records name the policy the run used")
+    ox = [sys.executable, tool("varek_ocsf.py"), "--policy", policy, "--checker", tool("vdp_cert_check")]
+    pub = args.pubkey or _pubkey(cfg)
+    if pub:
+        ox += ["--pubkey", pub]
+    if cfg["anchor"] and os.path.isfile(cfg["anchor"]):
+        ox += ["--anchor", cfg["anchor"]]
+    ox += ["--follow", log] if args.follow else ["--log", log]
+    if args.follow and args.idle:
+        ox += ["--idle", str(args.idle)]
+    if args.allow_incomplete:
+        ox.append("--allow-incomplete")
+    ot = [sys.executable, tool("varek_otel.py"), "-"]
+    if args.endpoint:
+        ot += ["--endpoint", args.endpoint]
+    for h in args.otlp_header or []:
+        ot += ["--header", h]
+    ocsf = subprocess.Popen(ox, stdout=subprocess.PIPE)
+    try:
+        otel = subprocess.Popen(ot, stdin=ocsf.stdout)
+        ocsf.stdout.close()                    # the exporter's end only: it sees the pipe close
+        rc_otel = otel.wait()
+    finally:
+        rc_ocsf = ocsf.wait()
+    if rc_ocsf != 0:
+        raise CliError(f"the OCSF export of {log} failed (exit {rc_ocsf}); what it wrote before was sent",
+                       fix="see its message above: a stream the audit refuses is not exported")
+    if rc_otel != 0:
+        return rc_otel
+    ok(f"the run's events sent as OpenTelemetry log records")
+    return 0
+
+
 def cmd_export_ocsf(args):
     """v1.31: `varek export --format ocsf`: OCSF 1.9.0 events (tools/varek_ocsf.py),
     audited first; --follow tails a live run; --verify checks events against
@@ -2436,8 +2511,10 @@ def cmd_export_ocsf(args):
 def cmd_export(args):
     if getattr(args, "format", "cyclonedx") == "ocsf":                  # v1.31
         return cmd_export_ocsf(args)
+    if getattr(args, "format", "cyclonedx") == "otlp":                  # v1.39
+        return cmd_export_otlp(args)
     if args.follow:
-        raise CliError("--follow is for --format ocsf")
+        raise CliError("--follow is for --format ocsf and otlp")
     if args.verify:
         cfg = load_config(required=False)
         pub = args.pubkey or (_pubkey(cfg) if cfg else None)
@@ -3215,10 +3292,16 @@ def build_parser():
 
     sp = add("export", cmd_export, "write CycloneDX 1.6 authorization evidence, or OCSF 1.9.0 events, for a run")
     sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")
-    sp.add_argument("--format", choices=("cyclonedx", "ocsf"), default="cyclonedx",
-                    help="cyclonedx (default) or ocsf: OCSF 1.9.0 events, one per line (v1.31)")
-    sp.add_argument("--follow", metavar="STREAM", help="ocsf: tail a live run's stream, writing each event "
-                    "as its record is chained (to stdout, or -o)")
+    sp.add_argument("--format", choices=("cyclonedx", "ocsf", "otlp"), default="cyclonedx",
+                    help="cyclonedx (default); ocsf: OCSF 1.9.0 events, one per line (v1.31); otlp: those "
+                         "events sent to an OpenTelemetry collector as log records (v1.39)")
+    sp.add_argument("--endpoint", help="otlp: the collector's OTLP/HTTP logs URL (default: "
+                    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, OTEL_EXPORTER_OTLP_ENDPOINT, or http://localhost:4318/v1/logs)")
+    sp.add_argument("--otlp-header", action="append", metavar="NAME=ENVVAR",
+                    help="otlp: send header NAME with the value of the environment variable ENVVAR "
+                         "(an API key: never on the command line); repeatable")
+    sp.add_argument("--follow", metavar="STREAM", help="ocsf, otlp: tail a live run's stream, writing (or "
+                    "sending) each event as its record is chained (to stdout, or -o)")
     sp.add_argument("--policy", help="ocsf: the policy file the run used (default: found from the log)")
     sp.add_argument("--idle", type=float, default=0, metavar="SECONDS",
                     help="ocsf --follow: end, with a failed verdict, after this long with no new record "
