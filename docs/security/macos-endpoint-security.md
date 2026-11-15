@@ -145,7 +145,11 @@ does (above).
   by audit token lost every child in M2, and most of M1's work. The cost:
   the daemon is in every process's path on the Mac, so a stall in it holds
   the whole Mac (up to the deadline, then fails open); `es_mute_path` for
-  the system's own paths is to be measured as a way to narrow it.
+  the system's own paths is to be measured as a way to narrow it. Another
+  process's answer must **not** be cached: the kernel's cache is shared by
+  every process running the same executable (M4, M4b), so an allow cached
+  for a process outside the tree may answer the agent's same open with no
+  event (to measure: M4c).
 - **D7. Fail closed at the deadline** (from M1). Proposed: every AUTH
   event is answered by the daemon before its deadline: a decision not ready
   by the deadline less a margin (a second, to be set from M1's worst) is
@@ -162,12 +166,24 @@ does (above).
   write refused is refused whole (EPERM), not narrowed to a read. Proposed:
   the policy's `readonly` refuses a read-write open on the Mac, as on Linux
   without `SECCOMP_ADDFD`, and the docs say so.
-- **D10. The cache** (from M4). Proposed: answers are cached only where
-  the policy's answer cannot change during the run (the agent's reads of
-  system files), `es_clear_cache` is called at each run's start and end and
-  at any change of policy, and a write is never cached. Still to measure:
-  whether a cached allow survives a new client's or a new run's rule
-  without `es_clear_cache`.
+- **D10. The cache** (from M4 and M4b). A cached answer is the kernel's,
+  for an executable and a file, not for a process: 5,000 `cat`s were
+  answered once (M4), and each of M4b's refusals reached the client once,
+  the next two processes refused from the cache. Proposed:
+  - nothing is cached at first; an answer is cached only where it is the
+    same under every policy and for every process (none is known yet);
+  - `es_clear_cache` at each run's start and end and at any change of
+    policy (a run's cached refusals would otherwise outlive it too);
+  - another process's answers never cached (D6).
+
+  Measured: an allow cached before a rule did not outlive it, in the same
+  client with or without `es_clear_cache`, nor across clients (M4b). Each
+  first write after the rule was a new process, whose open reached the
+  client; a write to the file may drop its cached answers (each run's
+  appends had written it), which M4b cannot tell apart. Still to measure:
+  one long-lived process writing before and after the rule, and an allow
+  cached for a process outside the tree against the agent's same open
+  (M4c).
 
 ## Measure first (on an EC2 Mac, before any decision above)
 
@@ -229,8 +245,22 @@ Linux Warden decides an open in 73 µs p50, the v1.38.0 soak).
 - **M4, the cache.** With `--cache`, the 5,000 opens of `/etc/hosts` were
   answered once (answers 60,030 to 5,032; p50 12.4 µs). With a rule
   refusing writes under `/private/etc` added, a write there was still
-  refused, the cached reads unaffected. Not measured: whether a cached
-  allow of the same open survives a new rule (D10).
+  refused, the cached reads unaffected.
+- **M4b, a cached allow against a later rule** (at 3b0af80, `--track-pids
+  --cache`). Three appends to a file by three `/bin/sh -c` processes,
+  allowed and cached, then a rule refusing writes there, then three more
+  appends, each its own process:
+
+  | | The three appends after the rule | The file |
+  |---|---|---|
+  | The rule turned on in the same client (SIGUSR1) | all refused (EPERM) | `start a1 a2 a3` |
+  | The same, `es_clear_cache` at the signal | all refused | `start a1 a2 a3` |
+  | The rule in a new client, after the first cached the appends | all refused | `start a1 a2 a3` |
+
+  In each, one refusal reached the client (`read_only`) and the next two
+  came from the cache: refusals are cached, and a cached answer applies to
+  another process of the same executable. The allows cached before the
+  rule were not used. (D10)
 - **M6, approvals.** Started as root from a Session Manager shell, the
   client was made with no approval asked: the responsible process is
   presumably the SSM agent, which EC2's macOS images give Full Disk Access.
@@ -284,9 +314,11 @@ done on an EC2 Mac, as the checks are.
    with `--track-pids`), answers AUTH_OPEN, AUTH_EXEC, AUTH_CREATE,
    AUTH_UNLINK, AUTH_RENAME and AUTH_TRUNCATE from a fixed rule, and
    records each answer's time against its deadline. **Done November 15,
-   2026** for M1 to M4, M6 in part and M7 ("Measured"); still to do: M4's
-   cached allow against a new rule, M6 on a user's Mac, the cost of D6
-   with `es_mute_path`, and M5 with the content filter.
+   2026** for M1 to M4, M4b, M6 in part and M7 ("Measured"); still to do:
+   M4c (an allow cached for a process outside the tree, against the
+   agent's same open; one process writing before and after a rule), M6 on
+   a user's Mac, the cost of D6 uncached and with `es_mute_path`, and M5
+   with the content filter.
 2. `warden_es.c`: the event loop, the decisions and the records for files
    and launches, under a policy with no `host` rules; the shared parts
    unchanged. Its suite runs on an EC2 Mac.
