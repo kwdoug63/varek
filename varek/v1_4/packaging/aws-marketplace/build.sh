@@ -6,6 +6,8 @@
 #
 #   ./build.sh --version 1.23.1 --packs ~/varek-packs --product-id <product ID>
 #   ./build.sh --version 1.23.1 --packs ~/varek-packs --test     # no license check
+#   ./build.sh --version 1.39.1 --packs ~/varek-packs --product-id <product ID> \
+#              --product-code <product code>                      # hourly listing
 #
 # --packs is a directory of Enterprise *.policy.txt files. They are licensed
 # content and are never committed to this repository.
@@ -16,15 +18,16 @@ REPO=$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null) || {
     echo "build.sh: run it from a git checkout of kwdoug63/varek" >&2; exit 1; }
 MARK="Licensed to VAREK Enterprise subscribers"
 
-version="" packs="" product_id="" region="us-east-1" subnet="" test=0 dims="" issuer=""
-usage() { sed -n '4,11p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+version="" packs="" product_id="" product_code="" region="us-east-1" subnet="" test=0 dims="" dims_set=0 issuer=""
+usage() { sed -n '4,13p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 need() { [ -n "${2:-}" ] || { echo "build.sh: $1 needs a value" >&2; usage 2; }; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --version) need "$@"; version=$2; shift 2 ;;
         --packs) need "$@"; packs=$2; shift 2 ;;
         --product-id) need "$@"; product_id=$2; shift 2 ;;
-        --dimensions) need "$@"; dims=$2; shift 2 ;;   # comma-separated, highest tier first
+        --product-code) need "$@"; product_code=$2; shift 2 ;;  # hourly listing (v1.39.1)
+        --dimensions) need "$@"; dims=$2; dims_set=1; shift 2 ;;   # comma-separated, highest tier first
         --region) need "$@"; region=$2; shift 2 ;;
         --subnet) need "$@"; subnet=$2; shift 2 ;;
         --issuer-fingerprint) need "$@"; issuer=$2; shift 2 ;;  # testing only, see README
@@ -42,8 +45,15 @@ if [ "$test" -eq 0 ]; then
     # The product ID for License Manager: a GUID per AWS docs, or the portal's prod-... ID.
     [[ "$product_id" =~ ^(prod-[a-z0-9]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$ ]] ||
         die "--product-id is required: the product ID from the Marketplace portal (or --test)"
+    # An hourly listing (the evaluation listing) is licensed by the product code
+    # Marketplace attaches to the AMI, read from instance metadata: no contract
+    # dimensions, unless --dimensions also names some.
+    if [ -n "$product_code" ]; then
+        [[ "$product_code" =~ ^[a-z0-9]{8,64}$ ]] ||
+            die "--product-code must be the listing's product code (lower-case letters and digits)"
+    fi
 else
-    product_id=""
+    product_id="" product_code=""
 fi
 command -v packer >/dev/null || die "packer is not installed; see README.md, 'Install Packer'"
 aws sts get-caller-identity >/dev/null 2>&1 || die "no AWS credentials (run this in AWS CloudShell, or set a profile)"
@@ -75,15 +85,17 @@ commit=$(git -C "$REPO" rev-parse --short HEAD)
 dim_var=()
 if [ -n "$dims" ]; then
     dim_var=(-var "dimensions=[\"${dims//,/\",\"}\"]")
+elif [ -n "$product_code" ] && [ "$dims_set" -eq 0 ]; then
+    dim_var=(-var "dimensions=[]")
 fi
 
 echo "Building VAREK Enterprise $version (commit $commit) in $region"
 echo "  packs: ${files[*]##*/}"
-echo "  product: ${product_id:-none (test image)}"
+echo "  product: ${product_id:-none (test image)}${product_code:+, product code $product_code (hourly)}"
 cd "$HERE"
 packer init .
 args=(-var "varek_version=$version" -var "source_tarball=$work/varek-src.tar.gz"
-      -var "packs_dir=$packs" -var "product_id=$product_id" -var "issuer_fingerprint=$issuer"
+      -var "packs_dir=$packs" -var "product_id=$product_id" -var "product_code=$product_code" -var "issuer_fingerprint=$issuer"
       -var "region=$region" -var "subnet_id=$subnet" "${dim_var[@]}")
 packer validate "${args[@]}" .
 packer build -color=false "${args[@]}" .

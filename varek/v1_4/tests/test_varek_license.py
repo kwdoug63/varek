@@ -266,3 +266,117 @@ def test_init_gates_enterprise_packs_only(tmp_path, home, monkeypatch):
     assert "enterprise_tier_a" in r.stdout
     r = varek("license", env=env)
     assert r.returncode == 0 and "licensed: enterprise_tier_a" in r.stdout
+
+
+# ------------------------------------- v1.39.1: hourly listing, product code --
+
+CODE = "12xdxsgc8errk2cz18e6z2g4a"
+
+
+@pytest.fixture
+def hourly_home(tmp_path):
+    """A VAREK_HOME as the evaluation (hourly) AMI writes it: a product code, no dimensions."""
+    h = tmp_path / "home"
+    h.mkdir()
+    (h / "marketplace.json").write_text(json.dumps(
+        {"product_id": "prod-wrdrltp5kybfi", "dimensions": [], "product_code": CODE}))
+    return h
+
+
+def test_product_code_on_the_instance_licenses_it(hourly_home, monkeypatch):
+    monkeypatch.setattr(vl, "instance_product_codes", lambda timeout=2.0: [CODE])
+    monkeypatch.setenv("PATH", "/nonexistent")       # License Manager is never asked
+    r = vl.check(str(hourly_home))
+    assert r.ok and r.dimension == vl.HOURLY and CODE in r.detail
+    assert r.product_id == "prod-wrdrltp5kybfi"
+
+
+@pytest.mark.parametrize("codes", [[], ["someothercode1234567890ab"]])
+def test_without_the_product_code_it_is_not_licensed(hourly_home, monkeypatch, codes):
+    monkeypatch.setattr(vl, "instance_product_codes", lambda timeout=2.0: codes)
+    r = vl.check(str(hourly_home))
+    assert r.status == vl.NOT_LICENSED and "not launched with" in r.detail
+
+
+def test_metadata_unreachable_is_unavailable(hourly_home, monkeypatch):
+    monkeypatch.setattr(vl, "instance_product_codes", lambda timeout=2.0: None)
+    r = vl.check(str(hourly_home))
+    assert r.status == vl.UNAVAILABLE and "instance metadata" in r.detail
+
+
+def test_product_code_first_then_dimensions(home, monkeypatch):
+    # A file may name both; without the code on the instance, the contract check runs.
+    h, log = home
+    data = json.loads((h / "marketplace.json").read_text())
+    data["product_code"] = CODE
+    (h / "marketplace.json").write_text(json.dumps(data))
+    monkeypatch.setattr(vl, "instance_product_codes", lambda timeout=2.0: [])
+    monkeypatch.setenv("FAKE_AWS_MODE", "licensed:enterprise_tier_a")
+    r = vl.check(str(h))
+    assert r.ok and r.dimension == "enterprise_tier_a"
+    monkeypatch.setattr(vl, "instance_product_codes", lambda timeout=2.0: [CODE])
+    log.write_text("")
+    r = vl.check(str(h))
+    assert r.ok and r.dimension == vl.HOURLY
+    assert not checkouts(log)                        # the code settled it
+
+
+@pytest.mark.parametrize("data, words", [
+    ({"product_id": "prod-x", "dimensions": []}, "product_code"),
+    ({"product_id": "prod-x", "dimensions": [], "product_code": "Bad Code!"}, "malformed"),
+    ({"product_id": "", "dimensions": [], "product_code": CODE}, "product_id"),
+])
+def test_bad_hourly_marketplace_file(tmp_path, data, words):
+    (tmp_path / "marketplace.json").write_text(json.dumps(data))
+    r = vl.check(str(tmp_path))
+    assert r.status == vl.UNAVAILABLE and words in r.detail
+
+
+def test_contract_file_without_product_code_still_loads(home):
+    h, _ = home
+    mp = vl.load_marketplace(str(h))
+    assert mp["product_code"] == "" and mp["dimensions"] == ["enterprise_tier_b", "enterprise_tier_a"]
+
+
+class _FakeIMDS:
+    """Stands in for urllib's opener: answers IMDSv2 like EC2 does."""
+
+    def __init__(self, codes=None, status=200, down=False):
+        self.codes, self.status, self.down, self.paths = codes, status, down, []
+
+    def open(self, req, timeout=None):
+        import io
+        import urllib.error
+        if self.down:
+            raise urllib.error.URLError("no route to host")
+        self.paths.append((req.get_method(), req.full_url))
+        if req.full_url.endswith("/latest/api/token"):
+            assert req.get_method() == "PUT"
+            return io.BytesIO(b"tok")
+        assert req.headers.get("X-aws-ec2-metadata-token") == "tok"
+        if self.status == 404:
+            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+        return io.BytesIO("\n".join(self.codes).encode())
+
+
+@pytest.mark.parametrize("fake, want", [
+    (_FakeIMDS(codes=[CODE]), [CODE]),
+    (_FakeIMDS(codes=["a" * 25, CODE]), ["a" * 25, CODE]),
+    (_FakeIMDS(status=404), []),                     # no product code on this instance
+    (_FakeIMDS(down=True), None),                    # not on EC2, or IMDS off
+])
+def test_instance_product_codes(monkeypatch, fake, want):
+    monkeypatch.setattr(vl.urllib.request, "build_opener", lambda *a: fake)
+    assert vl.instance_product_codes() == want
+    if not fake.down:
+        assert fake.paths[-1][1] == vl.IMDS + "/latest/meta-data/product-codes"
+
+
+def test_license_command_hourly_off_ec2(tmp_path, hourly_home):
+    # Off EC2 the metadata service doesn't answer: the command says what the check needs.
+    r = varek("license", env={"VAREK_HOME": str(hourly_home),
+                              "VAREK_CONFIG": str(tmp_path / "none.conf")})
+    assert r.returncode == 1
+    assert f"product code {CODE} (hourly listing)" in r.stdout
+    assert "IMDSv2" in r.stdout + r.stderr
+    assert "license-manager:CheckoutLicense" not in r.stdout + r.stderr
