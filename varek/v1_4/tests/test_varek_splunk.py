@@ -108,6 +108,7 @@ class Hec:
         scheme = "http"
         if tls:
             c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            c.minimum_version = ssl.TLSVersion.TLSv1_2
             c.load_cert_chain(*tls)
             self.srv.socket = c.wrap_socket(self.srv.socket, server_side=True)
             scheme = "https"
