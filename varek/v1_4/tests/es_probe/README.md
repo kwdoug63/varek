@@ -199,6 +199,49 @@ For each, send:
   line (in 3, in the second log). None, while the appends succeed, means
   they were answered from the cache.
 
+**M4c, the cache across processes** (`m4c.py`, one Python process for
+each open). The test file reset as for M4b first, each time. `M` is the
+helper:
+
+```
+M=~/varek/varek/v1_4/tests/es_probe/m4c.py # end
+```
+
+1. Control: the agent's read-write open, under a rule refusing writes
+   there, with nothing cached before it (expect EPERM):
+
+   ```
+   P --log ~/es-m4c0.jsonl --track-pids --cache --deny-write /private/tmp/esc -- /usr/bin/python3 $M open /private/tmp/esc/f # end
+   ```
+
+2. A process outside the tree opens the file read-write while the probe
+   runs (allowed, and cached: `--track-pids` caches others' answers), then
+   the agent makes the same open, from the same executable, under the
+   rule:
+
+   ```
+   (sleep 3; /usr/bin/python3 $M open /private/tmp/esc/f) & P --log ~/es-m4c1.jsonl --track-pids --cache --deny-write /private/tmp/esc -- /bin/sh -c "sleep 6; /usr/bin/python3 $M open /private/tmp/esc/f"; wait # end
+   ```
+
+   The outside open should print `ok`. If the agent's also prints `ok`,
+   and the log has no open of the file, the outside process's cached allow
+   answered the agent's open: D6 must never cache another process's
+   answer. EPERM, with the open in the log, means the cache did not carry
+   it over.
+
+3. One long-lived process: three appends, the rule (SIGUSR1 to the probe,
+   its parent), three more, each with its result:
+
+   ```
+   P --log ~/es-m4c2.jsonl --track-pids --cache --deny-write /private/tmp/esc --rules-on-usr1 -- /usr/bin/python3 $M loop /private/tmp/esc/f; cat /private/tmp/esc/f # end
+   ```
+
+   `ok` after the rule means an allow cached for the process outlived the
+   rule.
+
+For each: the lines `m4c.py` printed, the summary line, the file, and the
+log's opens of `/private/tmp/esc/f` (in 3, those after `{"event":"usr1"}`).
+
 ## 5. Afterwards
 
 - The logs: `tar czf ~/es-probe-logs.tgz ~/es-m*.jsonl`, kept as the Mac
