@@ -1,0 +1,110 @@
+# VAREK for Microsoft Sentinel
+
+v1.40 (`docs/security/v1.39-security-operations.md`, section 3). The
+Warden's decisions in Microsoft Sentinel: `varek export --format sentinel`
+sends a run's OCSF 1.9.0 events, audited first, as rows of the custom
+table `VarekOCSF_CL` in Sentinel's Log Analytics workspace, through the
+Azure Monitor Logs Ingestion API and a data collection rule. Analytics
+rules raise an incident for a refusal and for a failed audit, and a
+workbook gives an overview.
+
+**Tested against a stand-in Azure** (`tests/test_varek_sentinel.py`): Entra
+ID's token endpoint, a VM's metadata service and the Logs Ingestion API.
+Not yet against a real workspace: the templates' deployment and the KQL of
+the rules and workbook are checked by the first live test.
+
+## 1. The table and the data collection rule
+
+`azuredeploy.json`, in the workspace's resource group, makes:
+
+- the table `VarekOCSF_CL` (30 columns, below);
+- the data collection rule `varek-ocsf` (kind Direct, so it has its own
+  logs ingestion endpoint), its stream `Custom-VarekOCSF` passed to the
+  table unchanged;
+- given `principalId`, that identity's **Monitoring Metrics Publisher**
+  role on the rule: the right to send to it, and nothing else.
+
+```
+az deployment group create -g RESOURCE_GROUP --template-file /opt/varek/integrations/sentinel/azuredeploy.json -p workspaceName=WORKSPACE principalId=OBJECT_ID # end
+```
+
+Its outputs are the two values the export needs: `logsIngestionEndpoint`
+and `dataCollectionRuleImmutableId` (`dcr-...`).
+
+## 2. An identity to send as
+
+One of:
+
+- **An app registration** (Microsoft Entra ID → App registrations → New
+  registration), with a client secret. Its service principal's object id
+  is `principalId` above. The export reads the secret from the
+  environment (`AZURE_CLIENT_SECRET`, or the variable `--azure-secret-env`
+  names), never the command line, and the tenant and client ids from
+  `AZURE_TENANT_ID` and `AZURE_CLIENT_ID` or `--azure-tenant` and
+  `--azure-client-id`.
+- **A managed identity**, on an Azure VM that runs the agents
+  (`--azure-auth managed-identity`; `--azure-client-id` for a
+  user-assigned one). No secret at all.
+
+A new role assignment can take some minutes to apply; until it does, the
+API answers 403.
+
+## 3. Export
+
+```
+varek export --format sentinel --endpoint ENDPOINT --dcr dcr-ID # end
+```
+
+A live run, each event as it is decided:
+
+```
+varek export --format sentinel --follow /var/log/varek/run.log --endpoint ENDPOINT --dcr dcr-ID # end
+```
+
+`--endpoint` and `--dcr` default to `AZURE_LOGS_INGESTION_ENDPOINT` and
+`AZURE_DCR_IMMUTABLE_ID`. Rows are sent gzipped, in batches under the
+API's 1 MB. A batch refused for a reason a retry can mend (429, 500, 502,
+503, 504, no answer) is sent again, backing off; one too large (413) is
+split; a 401 gets a new token once; any other refusal ends the export with
+exit 1.
+
+## 4. The analytics rules and the workbook
+
+`sentinel-content.json`, after `azuredeploy.json`, in the same resource
+group:
+
+```
+az deployment group create -g RESOURCE_GROUP --template-file /opt/varek/integrations/sentinel/sentinel-content.json -p workspaceName=WORKSPACE # end
+```
+
+- **VAREK: an agent's action refused** (Medium; an incident): one alert
+  for each run, agent and policy line (or rule) in five minutes, with what
+  was refused.
+- **VAREK: a run's audit failed** (High; an incident): the run's verdict
+  stream is not as the Warden wrote it.
+- **VAREK: a dry run let through what its policy refuses**
+  (Informational; no incident).
+- **The workbook, *VAREK: the Warden's decisions***: counts; refusals over
+  time, by policy line and by agent; runs; the latest refusals; dry runs;
+  failed audits.
+
+## The table
+
+| Column | |
+|---|---|
+| `TimeGenerated` | the decision's time |
+| `Decision` | ALLOW or DENY (a dry run records DENY for what it lets through, with `Mode` `dry_run`) |
+| `Verdict` | SATISFIED, UNSATISFIED or UNKNOWN |
+| `PolicyLine`, `PolicyText` | the policy line that decided, and its text |
+| `Rule` | the rule (`policy_match`, `default_deny_unknown`, ...) |
+| `Target` | what the decision was about: a file, a process, an endpoint, an MCP call |
+| `RunId`, `ReportId`, `Seq` | the run, and the record in its verdict stream |
+| `Agent`, `AgentType`, `Computer`, `ProcessId`, `UserId` | who and where |
+| `PolicyName`, `PolicySha256`, `WardenVersion` | the policy and the Warden |
+| `EventName`, `AuditPassed` | lifecycle events (`varek.run_start`, `varek.audit`, ...) and an audit's result |
+| `ClassUid`, `ClassName`, `ActivityName`, `Action`, `Disposition`, `Status`, `SeverityId`, `Severity` | OCSF's |
+| `OcsfEvent` | the whole OCSF event (dynamic) |
+
+```
+VarekOCSF_CL | where Decision == "DENY" and Mode != "dry_run" | summarize count() by PolicyLine, PolicyText, Rule
+```
