@@ -10,6 +10,34 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Added
+- **Microsoft Sentinel export** (v1.40, `docs/security/v1.39-security-operations.md`,
+  section 3; not yet tested against a real workspace). `varek export
+  --format sentinel [LOG]` sends a run's OCSF events, audited first, as
+  rows of the custom table `VarekOCSF_CL` in Sentinel's Log Analytics
+  workspace, through the Azure Monitor Logs Ingestion API and a data
+  collection rule; `--follow STREAM` sends a live run's.
+  `tools/varek_sentinel.py` does the sending: the decision, the verdict,
+  the rule, the policy line and its text, what was decided, the run and
+  the agent as columns, and the whole OCSF event. The token is Microsoft
+  Entra ID's: a client secret from the environment (never the command
+  line), an Azure VM's managed identity, or a token had before. Rows go
+  gzipped under the API's 1 MB a request; a busy API is retried, a batch
+  too large split, and any other refusal ends the export with exit 1.
+  `integrations/sentinel` (installed in `/opt/varek/integrations`) holds
+  the deployment templates: the table, the data collection rule and the
+  identity's role on it; three analytics rules (a refusal, a failed audit,
+  a dry run's let-through calls) and a workbook. Tested against a stand-in
+  Azure (`tests/test_varek_sentinel.py`).
+
+## [1.39.0] - 2026-11-16 — security operations: OpenTelemetry and Splunk
+
+The first part of security operations: a run's OCSF events, audited first,
+sent to an OpenTelemetry collector and to Splunk, each past the ship gate
+against a real instance. Microsoft Sentinel, CrowdStrike Falcon and Wiz
+are v1.40.0. The Warden decides nothing differently; the policy grammar
+stays 1.35 (`RELEASE-v1.39.0.md`).
+
+### Added
 - **Splunk export and app** (v1.39, `docs/security/v1.39-security-operations.md`,
   section 2). `varek export --format splunk [LOG]` sends a run's OCSF
   events, audited first, to a Splunk HTTP Event Collector, sourcetype

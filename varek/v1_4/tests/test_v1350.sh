@@ -61,6 +61,21 @@ fail=0
 pass()  { printf '  PASS   %s\n' "$1"; }
 flunk() { printf '  FAIL   %s\n' "$1"; fail=1; }
 check() { local what=$1; shift; if "$@" > /dev/null 2>&1; then pass "$what"; else flunk "$what"; fi; }
+# v1.39: why a code adapter's check failed, where it ran in the agent's Python
+# (CI's runner differs from a developer's host): what the Warden refused in
+# its run, and the end of what the command said
+why_code() {
+    [ -f "$OUT/c.log" ] && python3 - "$OUT/c.log" <<'PY'
+import json, sys
+for l in open(sys.argv[1], errors="replace"):
+    if l.startswith("{") and '"decision_final":"DENY"' in l:
+        r = json.loads(l)
+        print("         refused:", r.get("action"), r.get("target") or r.get("resolved") or r.get("path"),
+              "rule", r.get("rule"), "line", r.get("policy_line"))
+PY
+    tail -5 "$OUT/cli.out" | sed 's/^/         said: /'
+}
+checkc() { local what=$1; shift; if "$@" > /dev/null 2>&1; then pass "$what"; else flunk "$what"; why_code; fi; }
 
 if [ "$(id -u)" != 0 ]; then echo "test_v1350: needs root (the Warden supervises)"; exit 2; fi
 
@@ -530,35 +545,49 @@ check "... a label taken twice renamed (model), and the merged plan read as a pl
 FWPY=${VAREK_FW_PYTHON:-}
 if [ -n "$FWPY" ] && runuser -u nobody -- "$FWPY" -I -c 'import langgraph, langchain_anthropic, langchain_openai, langchain_mcp_adapters, agents' > /dev/null 2>&1; then
     cgen() { VAREK_HOME="$OUT/home" python3 "$VAREK" plan generate --python "$FWPY" --log "$OUT/c.log" "$@" > "$OUT/gen.plan" 2> "$OUT/cli.out"; }
+    # "nothing refused", but urllib3's IPv6 check: imported by the agent's
+    # frameworks, it binds [::1] port 0 to learn whether the host has IPv6,
+    # and takes a failure as "no". The Warden refuses every bind (the agent
+    # may not bind sockets), so on a host with IPv6 (CI's runner) that bind
+    # is refused; any other refusal still fails the check.
+    cat > "$OUT/no_refusal.py" <<'PY'
+import json, sys
+for l in open(sys.argv[1], errors="replace"):
+    if l.startswith("{") and '"decision_final":"DENY"' in l:
+        r = json.loads(l)
+        if r.get("action") == "net.bind" and str(r.get("target") or r.get("resolved")) in ("[::1]:0", "127.0.0.1:0"):
+            continue
+        sys.exit(1)
+PY
     # the agent's Python environment, which the plan names and each sample's policy must allow (step 10)
     "$FWPY" -I -c 'import os, sys
 for d in dict.fromkeys(os.path.normpath(x) for x in (sys.prefix, sys.base_prefix, os.path.realpath(sys.prefix), os.path.realpath(sys.base_prefix))):
     if not (d in ("/", "/usr") or d.startswith(("/usr/", "/lib", "/etc/"))): print(f"allow path {d}/ readonly")' > "$OUT/venv.rules"
     for p in langgraph-research/research openai-support/support; do cat "$OUT/$p.policy" "$OUT/venv.rules" > "$OUT/$p.venv.policy"; done
     cgen --from langgraph "$OUT/langgraph-research" --graph researcher --app-dir /srv/research
-    check "langgraph under the Warden in the agent's Python: the graph's model, its MCP client's server, nothing refused" sh -c \
+    checkc "langgraph under the Warden in the agent's Python: the graph's model, its MCP client's server, nothing refused" sh -c \
         "grep -q 'action model net_connect api.anthropic.com:443\$' '$OUT/gen.plan' &&
          grep -q 'mcp_call https://docs.example.com/mcp method=tools/call\$' '$OUT/gen.plan' &&
-         ! grep -q '\"decision_final\":\"DENY\"' '$OUT/c.log'"
-    check "... the agent's Python environment named, read-only (the plan's python_env steps)" sh -c \
+         python3 '$OUT/no_refusal.py' '$OUT/c.log'"
+    checkc "... the agent's Python environment named, read-only (the plan's python_env steps)" sh -c \
         "[ -s '$OUT/venv.rules' ] && grep -q '^action python_env[^ ]* file_open /[^ ]*/ open=read\$' '$OUT/gen.plan'"
-    check "... the graph's print as it is imported kept out of the plan (on standard error)" sh -c \
+    checkc "... the graph's print as it is imported kept out of the plan (on standard error)" sh -c \
         "! grep -q 'researcher built' '$OUT/gen.plan' && grep -q 'researcher built' '$OUT/cli.out'"
     cgen --policy "$OUT/langgraph-research/research.venv.policy" --from langgraph "$OUT/langgraph-research" --graph researcher --app-dir /srv/research; rc=$?
-    check "... the researcher's plan under the sample's policy: authorized" sh -c "[ $rc = 0 ] && grep -q 'the plan: authorized under' '$OUT/cli.out'"
+    checkc "... the researcher's plan under the sample's policy: authorized" sh -c "[ $rc = 0 ] && grep -q 'the plan: authorized under' '$OUT/cli.out'"
     cgen --policy "$OUT/langgraph-research/research.venv.policy" --from langgraph "$OUT/langgraph-research" --graph publisher --app-dir /srv/research; rc=$?
-    check "... the publisher's (a factory; a stdio MCP server it launches): refused, the sub-agent named" sh -c \
+    checkc "... the publisher's (a factory; a stdio MCP server it launches): refused, the sub-agent named" sh -c \
         "[ $rc = 1 ] && grep -q 'subagent step \"files\" is UNKNOWN: no rule of the policy launches a sub-agent by that name' '$OUT/cli.out' &&
-         ! grep -q '\"decision_final\":\"DENY\"' '$OUT/c.log'"
+         python3 '$OUT/no_refusal.py' '$OUT/c.log'"
     cgen --from openai-agents "$OUT/openai-support" --entry support.py:triage --app-dir /srv/support
-    check "openai-agents under the Warden: the handoff's agent too, the static filter's tools, the traces' host" sh -c \
+    checkc "openai-agents under the Warden: the handoff's agent too, the static filter's tools, the traces' host" sh -c \
         "grep -q 'name=search_articles\$' '$OUT/gen.plan' && grep -q 'name=get_article\$' '$OUT/gen.plan' &&
          grep -q \"agent billing's tool invoice_total\" '$OUT/gen.plan' && grep -q \"^#   api.openai.com:443: the SDK's traces\" '$OUT/gen.plan' &&
-         ! grep -q '\"decision_final\":\"DENY\"' '$OUT/c.log'"
+         python3 '$OUT/no_refusal.py' '$OUT/c.log'"
     cgen --policy "$OUT/openai-support/support.venv.policy" --from openai-agents "$OUT/openai-support" --entry support.py:triage --app-dir /srv/support; rc=$?
-    check "... the triage agent's plan under the sample's policy: authorized" sh -c "[ $rc = 0 ] && grep -q 'the plan: authorized under' '$OUT/cli.out'"
+    checkc "... the triage agent's plan under the sample's policy: authorized" sh -c "[ $rc = 0 ] && grep -q 'the plan: authorized under' '$OUT/cli.out'"
     cgen --policy "$OUT/openai-support/support.venv.policy" --from openai-agents "$OUT/openai-support" --entry support.py:ops --app-dir /srv/support; rc=$?
-    check "... the ops agent's (no tool filter): refused, its step naming no tool" sh -c \
+    checkc "... the ops agent's (no tool filter): refused, its step naming no tool" sh -c \
         "[ $rc = 1 ] && grep -q 'ops.example.com:443/mcp#tools/call#\" is UNKNOWN: no rule of the policy allows it' '$OUT/cli.out'"
 else pass "the code adapters under the Warden: not tried (VAREK_FW_PYTHON names no Python with the frameworks that nobody can read)"; fi
 

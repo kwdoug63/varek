@@ -56,6 +56,8 @@ jobs:
           # v1.28: test_v1280.sh's stand-in Vault and AWS servers make a test CA
           # and test_v1281.sh's stand-in issuer and SPIFFE authority sign with it
           sudo apt-get install -y --no-install-recommends python3-cryptography
+          # v1.35: test_v1350's watsonx adapter reads YAML with the system's PyYAML
+          sudo apt-get install -y --no-install-recommends python3-yaml
       - name: Build the Warden and its tools
         run: make -C varek/v1_4 all
       - name: The adapters' framework pins install (adapters/requirements-frameworks.txt)
@@ -64,10 +66,13 @@ jobs:
           # nothing else installs them, so a pin that cannot be installed
           # (mcp 2.3.0 beside langchain-mcp-adapters, November 2026) is
           # found here, not by the next person to set it up
-          python3 -m venv "$RUNNER_TEMP/varek-fw"
-          "$RUNNER_TEMP/varek-fw/bin/pip" install -q -r varek/v1_4/adapters/requirements-frameworks.txt
-          "$RUNNER_TEMP/varek-fw/bin/pip" check
-          "$RUNNER_TEMP/varek-fw/bin/python" -I -c 'import langgraph, langchain_anthropic, langchain_openai, langchain_aws, langchain_mcp_adapters, agents, openai, anthropic, mcp'
+          # In /var/tmp, readable by nobody: test_v1350 runs the code adapters
+          # as nobody, in this Python (the runner's home is not readable).
+          python3 -m venv /var/tmp/varek-fw
+          /var/tmp/varek-fw/bin/pip install -q -r varek/v1_4/adapters/requirements-frameworks.txt
+          /var/tmp/varek-fw/bin/pip check
+          /var/tmp/varek-fw/bin/python -I -c 'import langgraph, langchain_anthropic, langchain_openai, langchain_aws, langchain_mcp_adapters, agents, openai, anthropic, mcp'
+          chmod -R a+rX /var/tmp/varek-fw
       - name: Check the deployment scripts parse
         run: |
           python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py varek/v1_4/tools/varek_bench.py varek/v1_4/tools/varek_node_export.py varek/v1_4/tools/varek_vm.py varek/v1_4/tools/varek_suggest.py
@@ -120,6 +125,14 @@ jobs:
         run: |
           runc --version | head -1   # the runner's, with its Docker; the suite skips without one
           sudo make -C varek/v1_4 test-v1340
+      - name: v1.35 agent frameworks (the adapters, plans generated under the Warden; the code adapters in the agent's Python, with the framework pins)
+        run: |
+          # v1.39: run in CI for the first time; the pins are the step above's.
+          # The suite passes when the frameworks cannot be imported as nobody,
+          # saying the code adapters were not tried: that is a failure here.
+          set -o pipefail
+          sudo make -C varek/v1_4 test-v1350 VAREK_FW_PYTHON=/var/tmp/varek-fw/bin/python3 | tee "$RUNNER_TEMP/v1350.log"
+          ! grep -q 'the code adapters under the Warden: not tried' "$RUNNER_TEMP/v1350.log"
       - name: v1.34 steps 3 and 5 the NRI plugin and the admission webhook (gofmt, go vet, their unit tests)
         run: |
           go version
