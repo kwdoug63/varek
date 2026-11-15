@@ -164,8 +164,40 @@ P --log ~/es-m4.jsonl --cache -- /bin/sh -c 'for i in $(seq 1 5000); do /bin/cat
 ```
 
 Fewer answers than M1's first run means opens answered from the cache;
-then the same with `--deny-write /etc` added, to see whether a cached
-allow outlives a new client's rule.
+then the same with `--deny-write /private/etc` added (ES gives real paths:
+`/etc` is `/private/etc`).
+
+**M4b, a cached allow against a rule that comes after it.** A file anyone
+may write:
+
+```
+sudo mkdir -p /private/tmp/esc && echo start | sudo tee /private/tmp/esc/f > /dev/null && sudo chmod 666 /private/tmp/esc/f # end
+```
+
+1. The same client, the rule turned on mid-run: three appends allowed and
+   cached, then the rule (`--rules-on-usr1`: SIGUSR1 from the command),
+   then three more appends, each with its exit status:
+
+   ```
+   P --log ~/es-m4b.jsonl --track-pids --cache --deny-write /private/tmp/esc --rules-on-usr1 -- /bin/sh -c 'for i in 1 2 3; do /bin/sh -c "echo a$i >> /private/tmp/esc/f"; done; kill -USR1 $PPID; sleep 1; for i in 1 2 3; do /bin/sh -c "echo b$i >> /private/tmp/esc/f"; echo "b$i rc=$?"; done; cat /private/tmp/esc/f' # end
+   ```
+
+2. The same, the file reset first (the `mkdir` command above), with
+   `--clear-cache-on-usr1` added and `--log ~/es-m4c.jsonl`.
+3. Across clients, the file reset first: one probe caches the appends with
+   no rule, then a new probe has the rule from its start:
+
+   ```
+   P --log ~/es-m4d1.jsonl --track-pids --cache -- /bin/sh -c 'for i in 1 2 3; do /bin/sh -c "echo a$i >> /private/tmp/esc/f"; done' && P --log ~/es-m4d2.jsonl --track-pids --cache --deny-write /private/tmp/esc -- /bin/sh -c 'for i in 1 2 3; do /bin/sh -c "echo b$i >> /private/tmp/esc/f"; echo "b$i rc=$?"; done; cat /private/tmp/esc/f' # end
+   ```
+
+For each, send:
+- the `b` lines' rc: 0 means the cached allow outlived the rule; 1, with
+  "Operation not permitted", means it did not;
+- the file's last lines;
+- the log's opens of `/private/tmp/esc/f` after the `{"event":"usr1"}`
+  line (in 3, in the second log). None, while the appends succeed, means
+  they were answered from the cache.
 
 ## 5. Afterwards
 
