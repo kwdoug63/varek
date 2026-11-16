@@ -341,6 +341,10 @@ def pod_spec(args, node=None):
                         {"name": "code", "configMap": {"name": "soak-code"}}]}
     if node:
         spec["nodeSelector"] = {"kubernetes.io/hostname": node}
+        # GKE taints its Arm nodes kubernetes.io/arch=arm64:NoSchedule and adds
+        # the toleration only to pods that ask for arm64 by architecture; a pod
+        # pinned to a node by name must tolerate it to run there at all
+        spec["tolerations"] = [{"key": "kubernetes.io/arch", "operator": "Exists", "effect": "NoSchedule"}]
     return spec
 ann = {"varek.dev/policy": "agent", "varek.dev/plan": "agent"}
 items = [{"apiVersion": "v1", "kind": "Pod",
