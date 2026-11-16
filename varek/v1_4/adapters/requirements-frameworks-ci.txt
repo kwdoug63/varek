@@ -628,9 +628,9 @@ langchain-anthropic==1.7.10 \
     --hash=sha256:72869686960b3d6665f99e7c91c9f6dd4a1d9ccf73d23edd8702eb603cc2e498 \
     --hash=sha256:9ba64332784bddedabbeb24f5f5759f2d0dfe58244e0ef07e313e039b21ecb1f
     # via -r requirements-frameworks.txt
-langchain-aws==1.9.0 \
-    --hash=sha256:8823a08d2956b0d54d766d3c3ce7b5b2f185fdc16436be97c2729960d1211d9c \
-    --hash=sha256:e449e931a1f966e5fef4e5917f59ea008ebc033a3340b48d0f0bd639287c7ade
+langchain-aws==1.9.3 \
+    --hash=sha256:7b23c0dff0190c94094a7aa285118d219eeb9ed4f2d005caf554a5800a10e915 \
+    --hash=sha256:d37b442a16ffdc52ead72a92b8225bf8c66eb76ee91368e5ffe65eabca3dd8c1
     # via -r requirements-frameworks.txt
 langchain-core==1.8.0 \
     --hash=sha256:89732f9e7d311de9913ba22caf921c72520145a829f05ec1d9c85013e904213c \
