@@ -100,8 +100,20 @@ MIT · github.com/kwdoug63/varek
     drawn in Splunk Web with no error.
 - **test_v1350** with the new framework pins: 137 of 137, the langgraph
   and openai-agents adapters under the Warden included.
-- **24 hours** (`tests/soak_shared/soak.sh`, the shared soak): to run on
-  this release's code before it is tagged, as for every release.
+- **24 hours** (`tests/soak_shared/soak.sh`, the shared soak), November 15
+  to 16, 2026, from 3:00 AM CST, on #191's head (`c6fe24e`): an EC2
+  `t3.medium`, Ubuntu 24.04, us-east-1. Its six-minute trial passed first.
+  `soak_check: PASS`. The tagged code adds CI, tests, documentation and the
+  Splunk app's `app.conf` (#192, #179, #194), no Warden code.
+
+  | | |
+  |---|---|
+  | Duration | 24.0 h, a turn every 60 s: 1,440 turns in each run; Warden 1.39.0 (x86-64) |
+  | Run A | every task before the user's token expired worked (`tools/list` 259, `tools/call` 258, `fs` reads 258, `gh`'s calls 258, sub-agent launches 258); 144 probes, all held; the run revoked 0.00 s after the expiry, no turn after it working (5); 258 requests carried the credential, 0 swaps refused; the audit passing; OCSF: 11,719 events followed, 11,718 of them the stream's (14,405 records, the chain intact), all valid OCSF 1.9.0 |
+  | Run B (the baseline, with its git rules) | 1,296 of 1,296 pieces of work done, 288 git commits; 144 probes, all refused; the stream signed (436,188 records), the audit passing |
+  | Run C (dry run) | 1,440 of 1,440 done; 4,324 calls the narrower policy refuses let through and recorded; the audit (463,655 records): `VERIFIED: DRY RUN, NOT ENFORCED`; `varek policy suggest`: 39 exact rules; under the draft, 12 of 12 done and nothing let through |
+  | The Warden's decisions | the agent's MCP calls p50 23 µs (p99 33); `gh`'s MCP calls p50 26 µs (p99 62); the agent's opens p50 72 µs (p99 1,166); `fs`'s opens p50 206 µs (p99 1,999) |
+  | Memory | each Warden 12.4 to 12.8 MB at the start and 12.7 to 13.0 MB at most; the proxy, `warden-secrets` and the two MCP servers 8.6 to 21.1 MB, flat (144 samples each) |
 
 ## Known limits
 
@@ -112,7 +124,8 @@ MIT · github.com/kwdoug63/varek
 - **Splunk:** tested on Splunk Enterprise on one host, not Splunk Cloud,
   and with a private CA's certificate on the HEC, not a public CA's.
   Splunk's default HEC certificate names no host, so the HEC needs a
-  certificate of its own. The app is not yet checked by AppInspect or on
+  certificate of its own. The app passes Splunk AppInspect 4.4.0 (every
+  check, and Splunk Cloud's: no failure, no warning), but is not yet on
   Splunkbase.
 - **Both:** an export that fails mid-run ends; the events after it stay in
   the verdict stream, and exporting the run again sends all of its events

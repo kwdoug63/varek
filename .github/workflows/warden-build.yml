@@ -60,7 +60,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends python3-yaml
       - name: Build the Warden and its tools
         run: make -C varek/v1_4 all
-      - name: The adapters' framework pins install (adapters/requirements-frameworks.txt)
+      - name: The adapters' framework pins install (adapters/requirements-frameworks-ci.txt, hash-pinned)
         run: |
           # v1.39: test_v1350's code adapters run in a Python with these;
           # nothing else installs them, so a pin that cannot be installed
@@ -69,7 +69,10 @@ jobs:
           # In /var/tmp, readable by nobody: test_v1350 runs the code adapters
           # as nobody, in this Python (the runner's home is not readable).
           python3 -m venv /var/tmp/varek-fw
-          /var/tmp/varek-fw/bin/pip install -q -r varek/v1_4/adapters/requirements-frameworks.txt
+          # requirements-frameworks.txt's pins with every transitive
+          # dependency, each version and hash pinned (compiled from
+          # requirements-frameworks-ci.in; Dependabot recompiles it)
+          /var/tmp/varek-fw/bin/pip install -q --require-hashes -r varek/v1_4/adapters/requirements-frameworks-ci.txt
           /var/tmp/varek-fw/bin/pip check
           /var/tmp/varek-fw/bin/python -I -c 'import langgraph, langchain_anthropic, langchain_openai, langchain_aws, langchain_mcp_adapters, agents, openai, anthropic, mcp'
           chmod -R a+rX /var/tmp/varek-fw

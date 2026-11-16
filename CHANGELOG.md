@@ -61,7 +61,9 @@ The first part of security operations: a run's OCSF events, audited first,
 sent to an OpenTelemetry collector and to Splunk, each past the ship gate
 against a real instance. Microsoft Sentinel, CrowdStrike Falcon and Wiz
 are v1.40.0. The Warden decides nothing differently; the policy grammar
-stays 1.35 (`RELEASE-v1.39.0.md`).
+stays 1.35 (`RELEASE-v1.39.0.md`). The shared 24-hour soak passed on this
+code, November 15 to 16, 2026, on an EC2 instance (Ubuntu 24.04):
+`soak_check: PASS`, every probe held or refused, memory flat.
 
 ### Added
 - **Splunk export and app** (v1.39, `docs/security/v1.39-security-operations.md`,
