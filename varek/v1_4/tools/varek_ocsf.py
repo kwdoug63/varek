@@ -813,6 +813,19 @@ def main(argv=None):
     except (ExportError, cdx.StreamError) as e:
         print(f"varek_ocsf: {e}", file=sys.stderr)
         return 1
+    except BrokenPipeError:
+        # v1.40: what reads the events went away (`varek export`'s sender,
+        # failed: it says why); no traceback burying its message. stdout
+        # goes to /dev/null so the flush at exit does not raise again.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
+        return EXIT_READER_GONE
+
+
+EXIT_READER_GONE = 3                    # the events' reader closed the pipe
 
 
 if __name__ == "__main__":

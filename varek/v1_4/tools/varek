@@ -2511,17 +2511,27 @@ def _export_sent(args, sender, done):
     if args.allow_incomplete:
         ox.append("--allow-incomplete")
     ocsf = subprocess.Popen(ox, stdout=subprocess.PIPE)
+    rc_out = None
     try:
         out = subprocess.Popen(sender, stdin=ocsf.stdout)
         ocsf.stdout.close()                    # the sender's end only: it sees the pipe close
         rc_out = out.wait()
     finally:
+        if rc_out != 0 and ocsf.poll() is None:
+            # the sender stopped: a reader following a quiet run would
+            # otherwise wait for its next record to find the pipe closed
+            ocsf.terminate()
         rc_ocsf = ocsf.wait()
+    if rc_out != 0:
+        # v1.40 (Sentinel's live test): the sender failed, so whatever the
+        # reader then did is not the cause; the sender said why above
+        fail(f"sending the OCSF events of {log} failed (the sender exited {rc_out})")
+        hint("its message above says why, and how much it sent first; "
+             "exporting the run again sends all of the run's events")
+        return rc_out
     if rc_ocsf != 0:
         raise CliError(f"the OCSF export of {log} failed (exit {rc_ocsf}); what it wrote before was sent",
                        fix="see its message above: a stream the audit refuses is not exported")
-    if rc_out != 0:
-        return rc_out
     ok(done)
     return 0
 

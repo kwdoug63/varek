@@ -11,7 +11,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 - **Microsoft Sentinel export** (v1.40, `docs/security/v1.39-security-operations.md`,
-  section 3; not yet tested against a real workspace). `varek export
+  section 3; past the ship gate in a real workspace). `varek export
   --format sentinel [LOG]` sends a run's OCSF events, audited first, as
   rows of the custom table `VarekOCSF_CL` in Sentinel's Log Analytics
   workspace, through the Azure Monitor Logs Ingestion API and a data
@@ -26,8 +26,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `integrations/sentinel` (installed in `/opt/varek/integrations`) holds
   the deployment templates: the table, the data collection rule and the
   identity's role on it; three analytics rules (a refusal, a failed audit,
-  a dry run's let-through calls) and a workbook. Tested against a stand-in
-  Azure (`tests/test_varek_sentinel.py`).
+  a dry run's let-through calls) and a workbook. Tested in a Log Analytics
+  workspace with Sentinel, November 16, 2026: both templates deployed
+  unchanged, a live run's 142 events all in the table, each refusal there
+  within 25 s with its policy line, the refusal rule's incident raised and
+  the workbook drawn; and against a stand-in Azure
+  (`tests/test_varek_sentinel.py`).
+
+### Fixed
+- **A sender that fails is named as the failure.** When `varek export
+  --format otlp`, `splunk` or `sentinel` lost its sender (Sentinel's live
+  test: Entra ID refused a wrongly pasted secret during `--follow`), the
+  OCSF reader died on the closed pipe with a traceback burying the
+  sender's message, and `varek export` blamed the audit. The reader now
+  exits quietly (exit 3) and is stopped when the sender stops; the CLI
+  says the send failed, with the sender's exit code.
 
 ## [1.39.1] - 2026-11-16 — the evaluation listing's license check
 

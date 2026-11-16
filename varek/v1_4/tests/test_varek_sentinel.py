@@ -263,3 +263,43 @@ def test_credentials_refused_and_arguments_wrong():
         assert r.returncode == 2 and "no logs ingestion endpoint" in r.stderr
     finally:
         az.close()
+
+
+VAREK = os.path.join(HERE, "tools", "varek")
+BUILT = all(os.access(os.path.join(HERE, b), os.X_OK)
+            for b in ("warden", "warden-proxy", "tools/vdp_check", "tools/vdp_cert_check", "tools/varek_keygen"))
+ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+@pytest.mark.skipif(not (BUILT and ROOT and sys.platform.startswith("linux")),
+                    reason="needs Linux, root and a built runtime")
+def test_a_refused_secret_is_the_send_failing_not_the_audit(tmp_path):
+    # Sentinel's live test (November 16, 2026): Entra ID refused the secret
+    # during `varek export --follow`; the reader then died on the closed pipe
+    # with a traceback, and the CLI blamed the audit. Now the sender's message
+    # stands, the CLI says the send failed, and no traceback follows.
+    conf = str(tmp_path / "etc" / "varek.conf")
+
+    def varek(*args, env=None):
+        e = dict(os.environ, NO_COLOR="1", VAREK_CONFIG=conf, NO_PROXY="127.0.0.1")
+        e.update(env or {})
+        return subprocess.run([sys.executable, VAREK, *args], text=True, capture_output=True, env=e, timeout=180)
+
+    assert varek("init", "--pack", "healthcare", "--log-dir", str(tmp_path / "log")).returncode == 0
+    assert varek("run", "--", "/bin/sh", "-c", "cat /etc/hostname >/dev/null 2>&1; true").returncode == 0
+    log = str(max((tmp_path / "log").glob("verdicts-*.log")))
+    az = Azure(token_status=401)
+    try:
+        azure = {"AZURE_TENANT_ID": "tenant-1", "AZURE_CLIENT_ID": "client-1",
+                 "AZURE_CLIENT_SECRET": SECRET, "AZURE_AUTHORITY_HOST": az.base}
+        for how in ([log], ["--follow", log]):
+            r = varek("export", "--format", "sentinel", *how, "--endpoint", az.base, "--dcr", "dcr-0f1e", env=azure)
+            out = r.stdout + r.stderr
+            assert r.returncode != 0, out
+            assert "AADSTS7000215" in out                      # the sender's own message
+            assert "sending the OCSF events of" in out and "failed (the sender exited" in out
+            assert "audit refuses" not in out and "Traceback" not in out and "BrokenPipe" not in out
+            assert SECRET not in out
+        assert az.tokens and not az.posts                      # no row sent without a token
+    finally:
+        az.close()

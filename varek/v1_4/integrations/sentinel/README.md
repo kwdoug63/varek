@@ -8,10 +8,13 @@ Azure Monitor Logs Ingestion API and a data collection rule. Analytics
 rules raise an incident for a refusal and for a failed audit, and a
 workbook gives an overview.
 
-**Tested against a stand-in Azure** (`tests/test_varek_sentinel.py`): Entra
-ID's token endpoint, a VM's metadata service and the Logs Ingestion API.
-Not yet against a real workspace: the templates' deployment and the KQL of
-the rules and workbook are checked by the first live test.
+**Tested in a real workspace** (November 16, 2026): both templates
+deployed unchanged; a live run's 142 events in `VarekOCSF_CL`; each
+refusal there within 25 s of its decision, with its policy line; the
+refusal rule's incident raised and the workbook drawn
+(`docs/security/v1.39-security-operations.md`, section 3). And against a
+stand-in Azure (`tests/test_varek_sentinel.py`): Entra ID's token
+endpoint, a VM's metadata service and the Logs Ingestion API.
 
 ## 1. The table and the data collection rule
 
@@ -68,6 +71,18 @@ API's 1 MB. A batch refused for a reason a retry can mend (429, 500, 502,
 split; a 401 gets a new token once; any other refusal ends the export with
 exit 1.
 
+**The first rows to a new table take minutes.** Azure Monitor sets up a
+new table and data collection rule on their first rows: in the live test,
+the first run's rows reached the workspace five to six minutes after they
+were sent, all at once; from the next run, within 25 s. Judge how soon a
+refusal arrives after the first run.
+
+What a run sent:
+
+```
+VarekOCSF_CL | summarize Rows=count(), FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated) by RunId
+```
+
 ## 4. The analytics rules and the workbook
 
 `sentinel-content.json`, after `azuredeploy.json`, in the same resource
@@ -87,6 +102,13 @@ az deployment group create -g RESOURCE_GROUP --template-file /opt/varek/integrat
 - **The workbook, *VAREK: the Warden's decisions***: counts; refusals over
   time, by policy line and by agent; runs; the latest refusals; dry runs;
   failed audits.
+
+Sentinel is moving to the Microsoft Defender portal (after March 31, 2027,
+Sentinel is in Defender only), and the Azure portal's Sentinel →
+Workbooks page now points there. The workbook is an Azure Monitor
+workbook in the resource group either way: open it from the resource
+group (type *Azure Workbook*), or onboard the workspace to Defender and
+find it under Microsoft Sentinel → Threat management → Workbooks.
 
 ## The table
 
