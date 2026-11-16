@@ -11,7 +11,11 @@
 # checks, section 9's code adapters included). mcp stays 1.x:
 # langchain-mcp-adapters (0.3.2, the latest) needs mcp < 2, and mcp 2.3.0
 # left this file impossible to install (.github/dependabot.yml ignores mcp
-# 2.x; CI installs this file, warden-build.yml).
+# 2.x). CI installs these pins hash-pinned, with every transitive dependency:
+# requirements-frameworks-ci.txt, compiled from requirements-frameworks-ci.in
+# (warden-build.yml). After changing a pin here, recompile it:
+#   pip-compile --generate-hashes --no-emit-index-url --strip-extras \
+#     --output-file=requirements-frameworks-ci.txt requirements-frameworks-ci.in
 langgraph==1.2.20
 langgraph-prebuilt==1.1.1
 langchain-core==1.8.0
