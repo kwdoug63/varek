@@ -1,0 +1,6 @@
+# The framework pins as CI installs them (warden-build.yml, for test_v1350's
+# code adapters): requirements-frameworks.txt, the file people install, with
+# every transitive dependency. requirements-frameworks-ci.txt is this file
+# compiled with every version and hash pinned (pip install --require-hashes);
+# Dependabot recompiles it.
+-r requirements-frameworks.txt
