@@ -607,7 +607,7 @@ clean:
 PREFIX ?= /opt/varek
 BINDIR ?= /usr/local/bin
 INSTALL_TOOLS := tools/varek tools/vdp_check tools/vdp_cert_check tools/varek_keygen \
-	tools/varek_audit.py tools/varek_cyclonedx.py tools/varek_ocsf.py tools/varek_otel.py tools/varek_splunk.py tools/varek_ed25519.py \
+	tools/varek_audit.py tools/varek_cyclonedx.py tools/varek_ocsf.py tools/varek_otel.py tools/varek_splunk.py tools/varek_sentinel.py tools/varek_ed25519.py \
 	tools/varek_preflight.sh tools/varek_anchor_forward.py tools/varek_anchor_receiver.sh \
 	tools/varek_license.py tools/varek_vm.py tools/varek_bench.py tools/varek_bench_proxy.py tools/bench_proxy_client.py tools/varek_bench_launch.py \
 	tools/varek_baseline.py tools/varek_suggest.py tools/varek_container.py tools/varek_node_export.py \
@@ -631,6 +631,9 @@ install: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check
 	install -m 0644 integrations/splunk/varek/default/data/ui/views/*.xml $(DESTDIR)$(PREFIX)/integrations/splunk/varek/default/data/ui/views/
 	install -m 0644 integrations/splunk/varek/default/data/ui/nav/*.xml $(DESTDIR)$(PREFIX)/integrations/splunk/varek/default/data/ui/nav/
 	install -m 0644 integrations/splunk/varek/metadata/default.meta $(DESTDIR)$(PREFIX)/integrations/splunk/varek/metadata/
+	# v1.40: Microsoft Sentinel's templates (integrations/sentinel/README.md)
+	install -d -m 0755 $(DESTDIR)$(PREFIX)/integrations/sentinel
+	install -m 0644 integrations/sentinel/README.md integrations/sentinel/*.json $(DESTDIR)$(PREFIX)/integrations/sentinel/
 	if [ -d tools/systemd ]; then install -d -m 0755 $(DESTDIR)$(PREFIX)/tools/systemd && \
 	    install -m 0644 tools/systemd/* $(DESTDIR)$(PREFIX)/tools/systemd/; fi
 	ln -sf $(PREFIX)/tools/varek $(DESTDIR)$(BINDIR)/varek
@@ -642,7 +645,7 @@ uninstall:
 	@echo "removed $(PREFIX); settings in /etc/varek and logs in /var/log/varek were kept"
 
 test-cli: warden warden-proxy tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
-	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_container.py tests/test_varek_license.py tests/test_add_free_trial.py tests/test_varek_vm.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py tests/test_varek_bench_mcp.py tests/test_varek_audit_stream.py tests/test_varek_node_keys.py tests/test_varek_otel.py tests/test_varek_splunk.py
+	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_container.py tests/test_varek_license.py tests/test_add_free_trial.py tests/test_varek_vm.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py tests/test_varek_bench_mcp.py tests/test_varek_audit_stream.py tests/test_varek_node_keys.py tests/test_varek_otel.py tests/test_varek_splunk.py tests/test_varek_sentinel.py
 
 # v1.34 step 2: the node agent's JSON reader (node_json.c)
 test-node-json: tests/test_node_json.c node_json.c node_json.h

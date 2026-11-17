@@ -1,0 +1,395 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.40.0.0",
+  "metadata": {
+    "description": "VAREK for Microsoft Sentinel (v1.40): analytics rules on VarekOCSF_CL (a refusal, a failed audit, a dry run's let-through calls) and a workbook, in the Sentinel workspace. Deploy azuredeploy.json first: it makes the table."
+  },
+  "parameters": {
+    "workspaceName": {
+      "type": "string",
+      "metadata": {
+        "description": "The workspace Microsoft Sentinel is on, with VarekOCSF_CL (azuredeploy.json)."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    }
+  },
+  "variables": {
+    "workspaceId": "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('workspaceName'))]",
+    "workbook": {
+      "version": "Notebook/1.0",
+      "items": [
+        {
+          "type": 1,
+          "content": {
+            "json": "## VAREK: the Warden's decisions\nRefusals by policy line, agent and run; what dry runs let through; failed audits. The rows are OCSF 1.9.0 events in `VarekOCSF_CL`, sent by `varek export --format sentinel`."
+          },
+          "name": "title"
+        },
+        {
+          "type": 9,
+          "content": {
+            "version": "KqlParameterItem/1.0",
+            "parameters": [
+              {
+                "id": "t",
+                "version": "KqlParameterItem/1.0",
+                "name": "TimeRange",
+                "type": 4,
+                "isRequired": true,
+                "value": {
+                  "durationMs": 86400000
+                },
+                "typeSettings": {
+                  "selectableValues": [
+                    {
+                      "durationMs": 3600000
+                    },
+                    {
+                      "durationMs": 86400000
+                    },
+                    {
+                      "durationMs": 604800000
+                    },
+                    {
+                      "durationMs": 2592000000
+                    }
+                  ]
+                },
+                "label": "Time"
+              },
+              {
+                "id": "r",
+                "version": "KqlParameterItem/1.0",
+                "name": "Run",
+                "type": 1,
+                "value": "*",
+                "label": "Run (RunId)"
+              }
+            ],
+            "style": "pills",
+            "queryType": 0,
+            "resourceType": "microsoft.operationalinsights/workspaces"
+          },
+          "name": "parameters"
+        },
+        {
+          "type": 3,
+          "content": {
+            "version": "KqlItem/1.0",
+            "query": "VarekOCSF_CL\n| where \"{Run}\" == \"*\" or RunId == \"{Run}\"\n| summarize Refused = countif(Decision == \"DENY\" and Mode != \"dry_run\"), Decisions = countif(isnotempty(Decision)), Runs = dcount(RunId), [\"Let through in dry runs\"] = countif(Mode == \"dry_run\"), [\"Failed audits\"] = countif(EventName == \"varek.audit\" and AuditPassed == false)\n| evaluate narrow()\n| project Count = toint(Value), Name = Column",
+            "size": 0,
+            "title": "Counts",
+            "timeContextFromParameter": "TimeRange",
+            "queryType": 0,
+            "resourceType": "microsoft.operationalinsights/workspaces",
+            "visualization": "tiles",
+            "tileSettings": {
+              "titleContent": {
+                "columnMatch": "Name"
+              },
+              "leftContent": {
+                "columnMatch": "Count",
+                "formatter": 12
+              },
+              "showBorder": true
+            }
+          },
+          "name": "Counts"
+        },
+        {
+          "type": 3,
+          "content": {
+            "version": "KqlItem/1.0",
+            "query": "VarekOCSF_CL\n| where Decision == \"DENY\" and Mode != \"dry_run\"\n| where \"{Run}\" == \"*\" or RunId == \"{Run}\"\n| extend DecidedBy = iff(PolicyLine > 0, strcat(\"line \", tostring(PolicyLine), \": \", PolicyText), Rule)\n| summarize Refused = count() by bin(TimeGenerated, {TimeRange:grain}), DecidedBy",
+            "size": 0,
+            "title": "Refusals over time, by what decided them",
+            "timeContextFromParameter": "TimeRange",
+            "queryType": 0,
+            "resourceType": "microsoft.operationalinsights/workspaces",
+            "visualization": "timechart"
+          },
+          "name": "Refusals over time, by what decided them"
+        },
+        {
+          "type": 3,
+          "content": {
+            "version": "KqlItem/1.0",
+            "query": "VarekOCSF_CL\n| where Decision == \"DENY\" and Mode != \"dry_run\"\n| where \"{Run}\" == \"*\" or RunId == \"{Run}\"\n| extend DecidedBy = iff(PolicyLine > 0, strcat(\"line \", tostring(PolicyLine), \": \", PolicyText), Rule)\n| summarize Refused = count(), Runs = dcount(RunId), Targets = make_set(Target, 10), Last = max(TimeGenerated) by DecidedBy\n| order by Refused desc",
+            "size": 0,
+            "title": "Refusals by policy line (or the rule, for a default deny)",
+            "timeContextFromParameter": "TimeRange",
+            "queryType": 0,
+            "resourceType": "microsoft.operationalinsights/workspaces",
+            "visualization": "table"
+          },
+          "name": "Refusals by policy line (or the rule, for a default deny)"
+        },
+        {
+          "type": 3,
+          "content": {
+            "version": "KqlItem/1.0",
+            "query": "VarekOCSF_CL\n| where Decision == \"DENY\" and Mode != \"dry_run\"\n| where \"{Run}\" == \"*\" or RunId == \"{Run}\"\n| extend DecidedBy = iff(PolicyLine > 0, strcat(\"line \", tostring(PolicyLine), \": \", PolicyText), Rule)\n| summarize Refused = count(), [\"Policy lines\"] = dcount(DecidedBy) by Agent = coalesce(Agent, \"(the agent)\")\n| order by Refused desc",
+            "size": 0,
+            "title": "Refusals by agent",
+            "timeContextFromParameter": "TimeRange",
+            "queryType": 0,
+            "resourceType": "microsoft.operationalinsights/workspaces",
+            "visualization": "table"
+          },
+          "name": "Refusals by agent"
+        },
+        {
+          "type": 3,
+          "content": {
+            "version": "KqlItem/1.0",
+            "query": "VarekOCSF_CL\n| where \"{Run}\" == \"*\" or RunId == \"{Run}\"\n| summarize Refused = countif(Decision == \"DENY\" and Mode != \"dry_run\"), Decisions = countif(isnotempty(Decision)), [\"Dry run, let through\"] = countif(Mode == \"dry_run\"), Audit = take_anyif(iff(AuditPassed, \"passed\", \"FAILED\"), EventName == \"varek.audit\"), Start = min(TimeGenerated), End = max(TimeGenerated), Policy = take_any(PolicyName) by RunId, Computer\n| order by End desc",
+            "size": 0,
+            "title": "Runs",
+            "timeContextFromParameter": "TimeRange",
+            "queryType": 0,
+            "resourceType": "microsoft.operationalinsights/workspaces",
+            "visualization": "table"
+          },
+          "name": "Runs"
+        },
+        {
+          "type": 3,
+          "content": {
+            "version": "KqlItem/1.0",
+            "query": "VarekOCSF_CL\n| where Decision == \"DENY\" and Mode != \"dry_run\"\n| where \"{Run}\" == \"*\" or RunId == \"{Run}\"\n| extend DecidedBy = iff(PolicyLine > 0, strcat(\"line \", tostring(PolicyLine), \": \", PolicyText), Rule)\n| project TimeGenerated, Computer, Agent, ClassName, ActivityName, Target, Verdict, DecidedBy, RunId, ReportId\n| order by TimeGenerated desc\n| take 50",
+            "size": 0,
+            "title": "Latest refusals",
+            "timeContextFromParameter": "TimeRange",
+            "queryType": 0,
+            "resourceType": "microsoft.operationalinsights/workspaces",
+            "visualization": "table"
+          },
+          "name": "Latest refusals"
+        },
+        {
+          "type": 3,
+          "content": {
+            "version": "KqlItem/1.0",
+            "query": "VarekOCSF_CL\n| where \"{Run}\" == \"*\" or RunId == \"{Run}\"\n| where Mode == \"dry_run\"\n| extend DecidedBy = iff(PolicyLine > 0, strcat(\"line \", tostring(PolicyLine), \": \", PolicyText), Rule)\n| summarize Count = count() by DecidedBy, Target\n| order by Count desc",
+            "size": 0,
+            "title": "Dry runs: what the policy refuses, let through and recorded",
+            "timeContextFromParameter": "TimeRange",
+            "queryType": 0,
+            "resourceType": "microsoft.operationalinsights/workspaces",
+            "visualization": "table"
+          },
+          "name": "Dry runs: what the policy refuses, let through and recorded"
+        },
+        {
+          "type": 3,
+          "content": {
+            "version": "KqlItem/1.0",
+            "query": "VarekOCSF_CL\n| where \"{Run}\" == \"*\" or RunId == \"{Run}\"\n| where EventName == \"varek.audit\" and AuditPassed == false\n| project TimeGenerated, Computer, RunId, Mode = tostring(OcsfEvent.unmapped.varek.audit.mode), Problems = tostring(OcsfEvent.unmapped.varek.audit.problems)",
+            "size": 0,
+            "title": "Failed audits",
+            "timeContextFromParameter": "TimeRange",
+            "queryType": 0,
+            "resourceType": "microsoft.operationalinsights/workspaces",
+            "visualization": "table"
+          },
+          "name": "Failed audits"
+        }
+      ],
+      "isLocked": false,
+      "fallbackResourceIds": [
+        "[variables('workspaceId')]"
+      ]
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+      "apiVersion": "2023-02-01",
+      "name": "[concat(parameters('workspaceName'), '/Microsoft.SecurityInsights/', guid(parameters('workspaceName'), 'varek-refused'))]",
+      "kind": "Scheduled",
+      "properties": {
+        "displayName": "VAREK: an agent's action refused",
+        "description": "The VAREK Warden refused an agent's action: the run, the agent, what it tried and the policy line (or the rule, for a default deny) that refused it. One alert for each run, agent and policy line in the period.",
+        "severity": "Medium",
+        "enabled": true,
+        "query": "VarekOCSF_CL\n| where Decision == \"DENY\" and Mode != \"dry_run\"\n| extend DecidedBy = iff(PolicyLine > 0, strcat(\"line \", tostring(PolicyLine), \": \", PolicyText), Rule)\n| summarize Refused = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Targets = make_set(Target, 20), Verdicts = make_set(Verdict) by RunId, Computer, Agent, DecidedBy, PolicyName",
+        "queryFrequency": "PT5M",
+        "queryPeriod": "PT5M",
+        "triggerOperator": "GreaterThan",
+        "triggerThreshold": 0,
+        "suppressionDuration": "PT1H",
+        "suppressionEnabled": false,
+        "tactics": [],
+        "eventGroupingSettings": {
+          "aggregationKind": "AlertPerResult"
+        },
+        "entityMappings": [
+          {
+            "entityType": "Host",
+            "fieldMappings": [
+              {
+                "identifier": "HostName",
+                "columnName": "Computer"
+              }
+            ]
+          }
+        ],
+        "customDetails": {
+          "Refused": "Refused",
+          "Targets": "Targets",
+          "DecidedBy": "DecidedBy",
+          "RunId": "RunId"
+        },
+        "alertDetailsOverride": {
+          "alertDisplayNameFormat": "VAREK refused {{Agent}} on {{Computer}}: {{DecidedBy}}"
+        },
+        "incidentConfiguration": {
+          "createIncident": true,
+          "groupingConfiguration": {
+            "enabled": true,
+            "reopenClosedIncident": false,
+            "lookbackDuration": "PT5H",
+            "matchingMethod": "Selected",
+            "groupByEntities": [
+              "Host"
+            ],
+            "groupByAlertDetails": [],
+            "groupByCustomDetails": [
+              "RunId"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+      "apiVersion": "2023-02-01",
+      "name": "[concat(parameters('workspaceName'), '/Microsoft.SecurityInsights/', guid(parameters('workspaceName'), 'varek-audit-failed'))]",
+      "kind": "Scheduled",
+      "properties": {
+        "displayName": "VAREK: a run's audit failed",
+        "description": "The audit of a VAREK run's verdict stream failed: the stream is not the Warden's as it wrote it (a record changed, missing or forged), or its policy is not the one it names. The run's events cannot be trusted.",
+        "severity": "High",
+        "enabled": true,
+        "query": "VarekOCSF_CL\n| where EventName == \"varek.audit\" and AuditPassed == false\n| extend Problems = tostring(OcsfEvent.unmapped.varek.audit.problems), AuditMode = tostring(OcsfEvent.unmapped.varek.audit.mode)\n| project TimeGenerated, RunId, Computer, AuditMode, Problems",
+        "queryFrequency": "PT5M",
+        "queryPeriod": "PT5M",
+        "triggerOperator": "GreaterThan",
+        "triggerThreshold": 0,
+        "suppressionDuration": "PT1H",
+        "suppressionEnabled": false,
+        "tactics": [],
+        "eventGroupingSettings": {
+          "aggregationKind": "AlertPerResult"
+        },
+        "entityMappings": [
+          {
+            "entityType": "Host",
+            "fieldMappings": [
+              {
+                "identifier": "HostName",
+                "columnName": "Computer"
+              }
+            ]
+          }
+        ],
+        "customDetails": {
+          "RunId": "RunId",
+          "Problems": "Problems"
+        },
+        "alertDetailsOverride": {
+          "alertDisplayNameFormat": "VAREK: the audit of run {{RunId}} on {{Computer}} failed"
+        },
+        "incidentConfiguration": {
+          "createIncident": true,
+          "groupingConfiguration": {
+            "enabled": true,
+            "reopenClosedIncident": false,
+            "lookbackDuration": "PT5H",
+            "matchingMethod": "Selected",
+            "groupByEntities": [
+              "Host"
+            ],
+            "groupByAlertDetails": [],
+            "groupByCustomDetails": [
+              "RunId"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+      "apiVersion": "2023-02-01",
+      "name": "[concat(parameters('workspaceName'), '/Microsoft.SecurityInsights/', guid(parameters('workspaceName'), 'varek-dry-run'))]",
+      "kind": "Scheduled",
+      "properties": {
+        "displayName": "VAREK: a dry run let through what its policy refuses",
+        "description": "A VAREK dry run (NOT ENFORCING) let through calls its policy refuses, and recorded them. Expected while a policy is drafted (varek policy suggest); not where runs are meant to be enforced.",
+        "severity": "Informational",
+        "enabled": true,
+        "query": "VarekOCSF_CL\n| where Mode == \"dry_run\"\n| extend DecidedBy = iff(PolicyLine > 0, strcat(\"line \", tostring(PolicyLine), \": \", PolicyText), Rule)\n| summarize LetThrough = count(), Targets = make_set(Target, 20) by RunId, Computer, Agent, DecidedBy",
+        "queryFrequency": "PT5M",
+        "queryPeriod": "PT5M",
+        "triggerOperator": "GreaterThan",
+        "triggerThreshold": 0,
+        "suppressionDuration": "PT1H",
+        "suppressionEnabled": false,
+        "tactics": [],
+        "eventGroupingSettings": {
+          "aggregationKind": "AlertPerResult"
+        },
+        "entityMappings": [
+          {
+            "entityType": "Host",
+            "fieldMappings": [
+              {
+                "identifier": "HostName",
+                "columnName": "Computer"
+              }
+            ]
+          }
+        ],
+        "customDetails": {
+          "LetThrough": "LetThrough",
+          "Targets": "Targets",
+          "DecidedBy": "DecidedBy"
+        },
+        "alertDetailsOverride": {
+          "alertDisplayNameFormat": "VAREK dry run on {{Computer}} let through: {{DecidedBy}}"
+        },
+        "incidentConfiguration": {
+          "createIncident": false,
+          "groupingConfiguration": {
+            "enabled": true,
+            "reopenClosedIncident": false,
+            "lookbackDuration": "PT5H",
+            "matchingMethod": "Selected",
+            "groupByEntities": [
+              "Host"
+            ],
+            "groupByAlertDetails": [],
+            "groupByCustomDetails": []
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Insights/workbooks",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceGroup().id, parameters('workspaceName'), 'varek-workbook')]",
+      "location": "[parameters('location')]",
+      "kind": "shared",
+      "properties": {
+        "displayName": "VAREK: the Warden's decisions",
+        "category": "sentinel",
+        "version": "Notebook/1.0",
+        "sourceId": "[variables('workspaceId')]",
+        "serializedData": "[string(variables('workbook'))]"
+      }
+    }
+  ]
+}
