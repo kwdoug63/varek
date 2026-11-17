@@ -121,8 +121,10 @@ for n in nodes:
     ok = m and ((m[1] == "containerd" and (int(m[2]), int(m[3])) >= (2, 2)) or
                 (m[1] == "cri-o" and (int(m[2]), int(m[3])) >= (1, 35)))
     line = f"{n['metadata']['name']}\t{i['architecture']}\t{rt}\t{i['kubeletVersion']}\t{i['osImage']}\t{i['kernelVersion']}\tready={ready}"
-    # a node the agents cannot be placed on (a control plane's taint) runs no long agent
-    if any(t.get("effect") in ("NoSchedule", "NoExecute") for t in n["spec"].get("taints", [])):
+    # a node the agents cannot be placed on (a control plane's taint) runs no long agent;
+    # an architecture taint (GKE's Arm nodes) is one the agents tolerate (pod_spec)
+    if any(t.get("effect") in ("NoSchedule", "NoExecute") and t.get("key") != "kubernetes.io/arch"
+           for t in n["spec"].get("taints", [])):
         print(line + "\t(tainted: no long agent)", file=sys.stderr)
         continue
     out.append(line)

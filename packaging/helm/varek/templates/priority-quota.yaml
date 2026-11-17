@@ -1,0 +1,26 @@
+{{/* SPDX-License-Identifier: MIT
+  The node agent's pods ask for priorityClassName (system-node-critical by
+  default). A cluster whose API server limits the critical priority classes
+  (Kubernetes' "limit Priority Class consumption by default"; GKE does, on
+  every cluster) admits a pod of one only in a namespace with a ResourceQuota
+  scoped to that class: on GKE, kube-system's gcp-critical-pods. Without one
+  in the release's namespace the DaemonSet creates no pod at all ("insufficient
+  quota to match these scopes", GKE, November 2026). This quota names the
+  class and sets a limit that never binds, as GKE's own does; on a cluster
+  that limits nothing it changes nothing. */}}
+{{- if and .Values.criticalPodsQuota (has .Values.priorityClassName (list "system-node-critical" "system-cluster-critical")) }}
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ .Release.Name }}-critical-pods
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "varek.labels" . | nindent 4 }}
+spec:
+  hard:
+    pods: "1G"
+  scopeSelector:
+    matchExpressions:
+      - scopeName: PriorityClass
+        operator: In
+        values: [{{ .Values.priorityClassName | quote }}]
+{{- end }}

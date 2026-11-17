@@ -283,6 +283,9 @@
     "priorityClassName": {
       "type": "string"
     },
+    "criticalPodsQuota": {
+      "type": "boolean"
+    },
     "admission": {
       "type": "object",
       "properties": {

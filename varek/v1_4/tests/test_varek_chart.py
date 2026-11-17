@@ -106,7 +106,7 @@ def test_the_default_render():
     docs = render()
     assert kinds(docs) == ["ClusterRole", "ClusterRole", "ClusterRoleBinding", "ClusterRoleBinding",
                            "DaemonSet", "Deployment",
-                           "MutatingWebhookConfiguration", "Pod", "PodDisruptionBudget", "Secret",
+                           "MutatingWebhookConfiguration", "Pod", "PodDisruptionBudget", "ResourceQuota", "Secret",
                            "Service", "ServiceAccount", "ServiceAccount", "ValidatingWebhookConfiguration"]
     for d in docs:
         if d["kind"] not in ("CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
@@ -208,6 +208,25 @@ def test_who_may_write_what():
     # written whole, then renamed over the old one
     assert "mv -f /host/bin/.varek-init.new /host/bin/varek-init" in script
     assert spec["tolerations"] == [{"operator": "Exists"}] and spec["priorityClassName"] == "system-node-critical"
+
+
+def test_the_critical_priority_quota():
+    # GKE (November 2026): the DaemonSet created no pod in the release's
+    # namespace, "insufficient quota to match these scopes: [{PriorityClass
+    # In [system-node-critical system-cluster-critical]}]", until a quota
+    # scoped to the class was there; it never binds
+    q = one(render(), "ResourceQuota")
+    assert q["metadata"]["name"] == "t-critical-pods" and q["metadata"]["namespace"] == NS
+    assert q["spec"]["hard"] == {"pods": "1G"}
+    assert q["spec"]["scopeSelector"]["matchExpressions"] == [
+        {"scopeName": "PriorityClass", "operator": "In", "values": ["system-node-critical"]}]
+    q = one(render("priorityClassName=system-cluster-critical"), "ResourceQuota")
+    assert q["spec"]["scopeSelector"]["matchExpressions"][0]["values"] == ["system-cluster-critical"]
+    # none for a class no cluster limits, none when turned off
+    assert "ResourceQuota" not in kinds(render("priorityClassName=varek-node"))
+    assert "ResourceQuota" not in kinds(render("priorityClassName="))
+    assert "ResourceQuota" not in kinds(render("criticalPodsQuota=false"))
+    assert render("criticalPodsQuota=maybe", ok=False).returncode != 0
 
 
 def test_the_runtime_chooses_the_state_directory():

@@ -45,6 +45,19 @@ the container does not start. The chart installs:
 - A namespace of its own that admits privileged pods. The node agent is
   privileged on the node, in the node's PID namespace, as Falco and Tetragon
   are.
+- **GKE** (being tested, November 2026; not yet a supported platform):
+  - **Standard clusters with Ubuntu nodes** (`UBUNTU_CONTAINERD`, amd64
+    and Axion arm64). Their nodes have every requirement above:
+    containerd 2.4 with NRI on, Landlock, cgroup v2.
+  - **Not Container-Optimized OS.** Its kernel is built without Landlock,
+    its `/opt` is read-only, and its `/var` is `noexec`.
+  - **Not Autopilot,** which admits no privileged `hostPID` DaemonSet.
+  - **A GKE Sandbox (gVisor) pod is refused,** as any sandboxed runtime is
+    (`nri.runtimeHandlers`).
+  - GKE admits a `system-node-critical` pod only in a namespace with a
+    ResourceQuota scoped to that class. The chart ships one in its
+    namespace (`criticalPodsQuota`, on by default, a limit that never
+    binds); without it the DaemonSet creates no pod.
 
 ## Install
 
