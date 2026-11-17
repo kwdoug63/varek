@@ -223,6 +223,11 @@ nodeSelector:
 tolerations:
   - operator: Exists
 priorityClassName: system-node-critical
+# a ResourceQuota in the release's namespace scoped to that priority class,
+# with a limit that never binds: a cluster that limits the critical classes
+# to namespaces holding one (GKE, every cluster) admits the node agent's pods
+# only with it; elsewhere it changes nothing (templates/priority-quota.yaml)
+criticalPodsQuota: true
 
 # D7: the admission webhook
 admission:
