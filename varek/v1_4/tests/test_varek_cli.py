@@ -96,7 +96,7 @@ def test_init_then_doctor(tmp_path):
 @needs_runtime
 def test_run_refusals_audit_export_verify(tmp_path):
     conf = _init(tmp_path)
-    r = varek("run", "--", "/bin/sh", "-c", "cat /etc/hostname >/dev/null 2>&1; echo done",
+    r = varek("run", "--", "/bin/sh", "-c", "read x < /etc/hostname 2>/dev/null; echo done",
               config=conf, check=0)
     assert "done" in r.stdout
     assert "refused" in r.stderr
@@ -150,7 +150,7 @@ def test_installed_layout_runs_preflight(tmp_path):
 @needs_runtime
 def test_old_run_is_audited_against_the_policy_it_used(tmp_path):
     conf = _init(tmp_path)
-    varek("run", "--", "/bin/sh", "-c", "cat /etc/hostname >/dev/null 2>&1; true", config=conf, check=0)
+    varek("run", "--", "/bin/sh", "-c", "read x < /etc/hostname 2>/dev/null; true", config=conf, check=0)
     first = sorted((tmp_path / "log").glob("verdicts-*.log"))[0]
     varek("policy", "use", "finance", config=conf, check=0)   # the run's policy is now a backup
     r = varek("audit", str(first), config=conf, check=0)
@@ -359,3 +359,36 @@ def test_suggest_names_arm64s_system_calls_from_the_generic_table():
     if os.path.exists("/usr/include/asm-generic/unistd.h"):
         real = s._syscall_names("aarch64")
         assert real[84] == "sync_file_range" and 244 not in real and real[79] == "newfstatat" and real[80] == "fstat"
+
+
+PACKS = ("healthcare", "finance", "cybersecurity", "utility", "national-defense")
+
+
+@needs_runtime
+@pytest.mark.skipif(not os.path.exists("/usr/bin/python3"), reason="no /usr/bin/python3")
+@pytest.mark.parametrize("pack", PACKS)
+def test_a_python_agent_starts_under_each_pack_refused_nothing(tmp_path, pack):
+    # v1.40: the packs allow what the loader, the C library and Python read as
+    # they start (most of it files that need not exist); before, every run
+    # under a pack began with some 19 refusals, noise to an alerting rule
+    # (Sentinel's live test, November 16, 2026). CI runs this on Ubuntu, Rocky
+    # Linux 9 and Amazon Linux 2023: a refusal here is a start-up read a
+    # distribution adds, to be allowed in the packs if it is as harmless.
+    os.makedirs("/tmp/varek", exist_ok=True)            # the packs' scratch, must exist (noexec)
+    log = tmp_path / "run.log"
+    env = dict(os.environ, NO_COLOR="1", VAREK_CONFIG=str(tmp_path / "none.conf"),
+               HOME="/tmp/varek")                       # the agent's user's packages, not root's (refused)
+    r = subprocess.run([sys.executable, VAREK, "run", "--policy", os.path.join(HERE, "policies", f"{pack}.policy.txt"),
+                        "--log", str(log), "--", "/usr/bin/python3", "-c", "pass"],
+                       cwd="/tmp/varek", stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    refused = []
+    for line in log.read_text().splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("decision_final") == "DENY" and "event" not in rec:
+            refused.append((rec.get("action"), rec.get("target"), rec.get("resolved"), rec.get("rule"),
+                            rec.get("policy_line")))
+    assert not refused, f"{pack}: the start-up reads refused: {refused}"
