@@ -127,6 +127,17 @@ k8s_install() {
         run apt-cache policy kubeadm kubelet kubectl cri-tools "$@"
         run apt-get install -y --allow-downgrades "$@" "kubelet=$K8S.*" "kubeadm=$K8S.*" "kubectl=$K8S.*" ||
             fail "installing ${*:+$* and }Kubernetes $K8S"
+        # the cell tests the Kubernetes project's packages (pkgs.k8s.io's
+        # versions end -1.1, -2.1, ...), not a distribution's rebuild
+        local p v
+        for p in kubelet kubeadm kubectl; do
+            v="$(dpkg-query -W -f='${Version}' "$p")"
+            measure "$p" "$v"
+            case "$v" in
+                *-[0-9]*.[0-9]*) ;;
+                *) fail "$p $v is not the Kubernetes project's package (pkgs.k8s.io)" ;;
+            esac
+        done
     fi
     command -v crictl > /dev/null && return 0
     [ "$PM" = apt ] && run apt-get install -y cri-tools && command -v crictl > /dev/null && return 0
@@ -161,6 +172,13 @@ if [ "$PM" = apt ]; then
     key() { get "$1Release.key" | gpg --dearmor --yes -o "$2"; }
     key "$K8S_REPO" /etc/apt/keyrings/kubernetes.gpg || fail "the Kubernetes package key"
     echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] $K8S_REPO /" > /etc/apt/sources.list.d/kubernetes.list
+    # the Kubernetes project's packages, never another repository's build of
+    # them: GitHub's ubuntu-24.04 image (November 2026) carries Microsoft's
+    # repository, whose kubeadm, kubelet and kubectl (1.35.10-ubuntu24.04u7)
+    # sort above pkgs.k8s.io's (1.35.x-1.1), so kubeadm=1.35.* took
+    # Microsoft's, and its 429s failed cells
+    printf 'Package: kubeadm kubelet kubectl kubernetes-cni cri-tools\nPin: origin packages.microsoft.com\nPin-Priority: -1\n' \
+        > /etc/apt/preferences.d/90-varek-k8s-upstream
 else
     repo kubernetes "$K8S_REPO"
     # the API server's and the kubelet's ports, and the pods' traffic
