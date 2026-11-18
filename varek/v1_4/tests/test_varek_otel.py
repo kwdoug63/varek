@@ -187,3 +187,32 @@ def test_input_that_is_not_ocsf_is_refused():
         assert r.returncode == 2
     finally:
         c.close()
+
+
+def at(pos):
+    """DENIED as varek_ocsf.py writes it: the position of its record in the stream"""
+    ev = json.loads(json.dumps(DENIED))
+    ev["unmapped"]["varek"]["position"] = pos
+    return ev
+
+
+def test_a_failed_send_names_where_the_events_not_sent_begin():
+    # v1.40: the first batch (positions 10, 11) taken, the second refused:
+    # the message names 12, where `varek export --from-position` resumes
+    assert otel.position_of(at(12)) == 12 and otel.position_of(DENIED) is None
+    assert otel.position_of(at(0)) is None and otel.position_of(at(True)) is None
+    assert otel.resume_note(None) == ""
+    c = Collector(answers=[200, 400])
+    try:
+        r = run(["--endpoint", c.url, "--batch", "2"], [at(p) for p in range(10, 15)])
+        assert r.returncode == 1 and "HTTP 400" in r.stderr
+        assert "2 records sent before; those not sent begin at position 12: " \
+               "`varek export --from-position 12` sends them" in r.stderr
+    finally:
+        c.close()
+    c = Collector(answers=[400])
+    try:
+        r = run(["--endpoint", c.url], [DENIED])                  # an event naming no position
+        assert r.returncode == 1 and "(0 records sent before)" in r.stderr and "--from-position" not in r.stderr
+    finally:
+        c.close()

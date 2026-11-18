@@ -69,7 +69,9 @@ varek export --format sentinel --follow /var/log/varek/run.log --endpoint ENDPOI
 API's 1 MB. A batch refused for a reason a retry can mend (429, 500, 502,
 503, 504, no answer) is sent again, backing off; one too large (413) is
 split; a 401 gets a new token once; any other refusal ends the export with
-exit 1.
+exit 1. Its message says where the rows not sent begin, and the same export
+with `--from-position N` sends them (the stream is audited whole all the
+same; `docs/security/v1.39-security-operations.md`, section 5).
 
 **The first rows to a new table take minutes.** Azure Monitor sets up a
 new table and data collection rule on their first rows: in the live test,

@@ -52,6 +52,9 @@ Usage:
     or no answer) is sent again, --retries times at most, waiting longer
     each time (or as Retry-After says); a batch too large (413) is split; a
     401 gets a new token once; any other refusal ends the export with exit 1.
+    v1.40: its message then names the position the rows not sent begin at
+    (their record's, unmapped.varek.position): `varek export
+    --from-position N` sends them, and the stream's events from there on.
 
 Exit status: 0 every event sent and accepted (204); 1 an event not accepted;
 2 the input is not OCSF events, or the arguments are wrong.
@@ -69,7 +72,7 @@ import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from varek_otel import _get, _object, lines_of  # noqa: E402  (the same reading and the same object)
+from varek_otel import _get, _object, lines_of, position_of, resume_note  # noqa: E402  (the same reading and the same object)
 
 API_VERSION = "2023-01-01"
 STREAM = "Custom-VarekOCSF"
@@ -310,13 +313,17 @@ def main(argv=None, env=None):
         return 2
     fh = sys.stdin if a.events == "-" else open(a.events, "rb")
     pending, sent, last, n = [], 0, time.monotonic(), 0
+    where = []                       # v1.40: each pending row's position
+    done = 0                         # pending's rows already accepted, in this flush
 
     def flush():
-        nonlocal pending, sent, last
+        nonlocal pending, sent, last, where, done
+        done = 0
         for b in batches(pending):
-            api.send(b)
+            api.send(b)              # a 413 splits it; a part accepted before a refusal is sent again
             sent += len(b)
-        pending = []
+            done += len(b)
+        pending, where, done = [], [], 0
         last = time.monotonic()
 
     try:
@@ -325,7 +332,9 @@ def main(argv=None, env=None):
             if line is not None and line.strip():
                 n += 1
                 try:
-                    pending.append(row(json.loads(line)))
+                    ev = json.loads(line)
+                    pending.append(row(ev))
+                    where.append(position_of(ev))
                 except ValueError:
                     print(f"varek_sentinel: line {n} is not JSON", file=sys.stderr)
                     return 2
@@ -336,7 +345,8 @@ def main(argv=None, env=None):
                 flush()
         flush()
     except SentinelError as e:
-        print(f"varek_sentinel: {e} ({sent} rows sent before)", file=sys.stderr)
+        rest = where[done] if done < len(where) else None
+        print(f"varek_sentinel: {e} ({sent} rows sent before{resume_note(rest)})", file=sys.stderr)
         return 1
     print(f"varek_sentinel: {sent} rows sent to {url.split('?')[0]} in {api.requests} request(s)",
           file=sys.stderr)

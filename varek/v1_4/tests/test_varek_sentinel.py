@@ -303,3 +303,31 @@ def test_a_refused_secret_is_the_send_failing_not_the_audit(tmp_path):
         assert az.tokens and not az.posts                      # no row sent without a token
     finally:
         az.close()
+
+
+def at(pos):
+    """DENIED as varek_ocsf.py writes it: the position of its record in the stream"""
+    ev = json.loads(json.dumps(DENIED))
+    ev["unmapped"]["varek"]["position"] = pos
+    return ev
+
+
+def test_a_failed_send_names_where_the_rows_not_sent_begin():
+    # v1.40: the first batch (positions 10, 11) accepted, the second refused
+    az = Azure(answers=[204, 400])
+    try:
+        r = run(az, ["--batch", "2"], [at(p) for p in range(10, 15)])
+        assert r.returncode == 1 and "HTTP 400" in r.stderr
+        assert "2 rows sent before; those not sent begin at position 12: " \
+               "`varek export --from-position 12` sends them" in r.stderr
+    finally:
+        az.close()
+    # a batch too large, split, its first half accepted and its second
+    # refused: the batch's first row, so the half accepted is sent again
+    # rather than the half refused lost
+    az = Azure(too_big=2, answers=[204, 400])
+    try:
+        r = run(az, ["--batch", "4"], [at(p) for p in range(10, 14)])
+        assert r.returncode == 1 and "(0 rows sent before; those not sent begin at position 10" in r.stderr
+    finally:
+        az.close()

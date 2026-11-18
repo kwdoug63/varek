@@ -2510,6 +2510,8 @@ def _export_sent(args, sender, done):
         ox += ["--idle", str(args.idle)]
     if args.allow_incomplete:
         ox.append("--allow-incomplete")
+    if args.from_position is not None:
+        ox += ["--from-position", str(args.from_position)]         # v1.40
     ocsf = subprocess.Popen(ox, stdout=subprocess.PIPE)
     rc_out = None
     try:
@@ -2526,8 +2528,9 @@ def _export_sent(args, sender, done):
         # v1.40 (Sentinel's live test): the sender failed, so whatever the
         # reader then did is not the cause; the sender said why above
         fail(f"sending the OCSF events of {log} failed (the sender exited {rc_out})")
-        hint("its message above says why, and how much it sent first; "
-             "exporting the run again sends all of the run's events")
+        hint("its message above says why and how much it sent first; where it names a position, "
+             "the same export with --from-position sends the rest, else exporting the run again sends "
+             "all of its events")
         return rc_out
     if rc_ocsf != 0:
         raise CliError(f"the OCSF export of {log} failed (exit {rc_ocsf}); what it wrote before was sent",
@@ -2560,9 +2563,13 @@ def cmd_export_ocsf(args):
     if cfg["anchor"] and os.path.isfile(cfg["anchor"]):
         argv += ["--anchor", cfg["anchor"]]
     if args.verify:
+        if args.from_position is not None:
+            raise CliError("--verify checks a whole export; --from-position is for writing one")
         argv += ["--verify", args.verify, "--log", log]
     else:
         argv += ["--follow", log] if args.follow else ["--log", log]
+        if args.from_position is not None:
+            argv += ["--from-position", str(args.from_position)]   # v1.40
         out = args.output or (None if args.follow else re.sub(r"\.log$", "", log) + ".ocsf.jsonl")
         if out:
             argv += ["--output", out]
@@ -2578,6 +2585,9 @@ def cmd_export_ocsf(args):
 
 
 def cmd_export(args):
+    if getattr(args, "from_position", None) is not None and args.from_position < 1:
+        raise CliError("--from-position: a position is 1 or more",
+                       fix="give the position the failed send named")             # v1.40
     if getattr(args, "format", "cyclonedx") == "ocsf":                  # v1.31
         return cmd_export_ocsf(args)
     if getattr(args, "format", "cyclonedx") == "otlp":                  # v1.39
@@ -2588,6 +2598,9 @@ def cmd_export(args):
         return cmd_export_sentinel(args)
     if args.follow:
         raise CliError("--follow is for --format ocsf, otlp, splunk and sentinel")
+    if args.from_position is not None:
+        raise CliError("--from-position is for --format ocsf, otlp, splunk and sentinel",
+                       fix="the CycloneDX evidence is one document, written whole")
     if args.verify:
         cfg = load_config(required=False)
         pub = args.pubkey or (_pubkey(cfg) if cfg else None)
@@ -3401,6 +3414,10 @@ def build_parser():
                          "(an API key: never on the command line); repeatable")
     sp.add_argument("--follow", metavar="STREAM", help="ocsf, otlp, splunk, sentinel: tail a live run's stream, writing (or "
                     "sending) each event as its record is chained (to stdout, or -o)")
+    sp.add_argument("--from-position", type=int, metavar="N",
+                    help="ocsf, otlp, splunk, sentinel: the rest of an export that failed partway: the events "
+                         "from the first whose record is at position N or later (the position the failed "
+                         "send named); the stream is audited whole all the same (v1.40)")
     sp.add_argument("--policy", help="ocsf: the policy file the run used (default: found from the log)")
     sp.add_argument("--idle", type=float, default=0, metavar="SECONDS",
                     help="ocsf --follow: end, with a failed verdict, after this long with no new record "
