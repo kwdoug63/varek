@@ -125,8 +125,19 @@ k8s_install() {
         run systemctl enable kubelet
     else
         run apt-cache policy kubeadm kubelet kubectl cri-tools "$@"
-        run apt-get install -y --allow-downgrades "$@" "kubelet=$K8S.*" "kubeadm=$K8S.*" "kubectl=$K8S.*" ||
-            fail "installing ${*:+$* and }Kubernetes $K8S"
+        # the exact version, the newest of the cell's minor that pkgs.k8s.io
+        # lists: "kubeadm=$K8S.*" took the highest of every repository's,
+        # and Microsoft's (1.35.10-ubuntu24.04u7, on GitHub's runner image)
+        # sorts above pkgs.k8s.io's (1.35.x-1.1), a negative pin or not
+        local kv
+        kv="$(apt-cache madison kubeadm | awk -F'|' -v m="$K8S." '
+                { v = $2; gsub(/ /, "", v) }
+                $3 ~ /pkgs\.k8s\.io/ && index(v, m) == 1 && v ~ /-[0-9]+\.[0-9]+$/ { print v }' |
+              sort -V | tail -1)"
+        [ -n "$kv" ] || fail "no Kubernetes $K8S in pkgs.k8s.io's repository"
+        measure "k8s.package" "$kv (pkgs.k8s.io)"
+        run apt-get install -y --allow-downgrades "$@" "kubelet=$kv" "kubeadm=$kv" "kubectl=$kv" ||
+            fail "installing ${*:+$* and }Kubernetes $kv"
         # the cell tests the Kubernetes project's packages (pkgs.k8s.io's
         # versions end -1.1, -2.1, ...), not a distribution's rebuild
         local p v
@@ -172,13 +183,6 @@ if [ "$PM" = apt ]; then
     key() { get "$1Release.key" | gpg --dearmor --yes -o "$2"; }
     key "$K8S_REPO" /etc/apt/keyrings/kubernetes.gpg || fail "the Kubernetes package key"
     echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] $K8S_REPO /" > /etc/apt/sources.list.d/kubernetes.list
-    # the Kubernetes project's packages, never another repository's build of
-    # them: GitHub's ubuntu-24.04 image (November 2026) carries Microsoft's
-    # repository, whose kubeadm, kubelet and kubectl (1.35.10-ubuntu24.04u7)
-    # sort above pkgs.k8s.io's (1.35.x-1.1), so kubeadm=1.35.* took
-    # Microsoft's, and its 429s failed cells
-    printf 'Package: kubeadm kubelet kubectl kubernetes-cni cri-tools\nPin: origin packages.microsoft.com\nPin-Priority: -1\n' \
-        > /etc/apt/preferences.d/90-varek-k8s-upstream
 else
     repo kubernetes "$K8S_REPO"
     # the API server's and the kubelet's ports, and the pods' traffic
