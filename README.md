@@ -324,6 +324,11 @@ nothing unless every cell passes (v1.36,
 | Containers (the UBI 9 image) | the suites in the image | [`container.yml`](https://github.com/kwdoug63/varek/actions/workflows/container.yml): *Build the image and run the suites in it* | each PR |
 | macOS, Windows | refused (the runtime fails closed) | [`platform-fail-closed.yml`](https://github.com/kwdoug63/varek/actions/workflows/platform-fail-closed.yml) | each PR |
 
+Beyond CI, the 24-hour Kubernetes soak (`varek/v1_4/tests/soak_v1340`)
+has passed on Amazon EKS (amd64 and Graviton) and single-node OpenShift
+4.22 (v1.36.0), and on GKE Standard with Ubuntu nodes (amd64 and Axion,
+November 2026; not Container-Optimized OS: the chart's README).
+
 On CRI-O, install the chart with `--set runtime=cri-o`. The node image is
 published for amd64 and arm64 as one image (v1.36), each architecture
 built and checked on its own runner, and the chart's DaemonSet runs on
