@@ -32,8 +32,23 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   within 25 s with its policy line, the refusal rule's incident raised and
   the workbook drawn; and against a stand-in Azure
   (`tests/test_varek_sentinel.py`).
+- **GKE Standard, tested** (`docs/security/v1.36-kubernetes-parity.md`).
+  The 24-hour Kubernetes soak passed on GKE 1.37 with Ubuntu nodes, amd64
+  and Axion arm64, November 17 to 18, 2026. Every probe held, all 100
+  streams were audited, and memory stayed flat. Container-Optimized OS
+  can't run the node agent (no Landlock in its kernel, a read-only `/opt`,
+  a `noexec` `/var`), nor can Autopilot or GKE Sandbox. The chart README
+  says so, and how to keep the DaemonSet to Ubuntu nodes.
 
 ### Fixed
+- **The chart's DaemonSet runs on GKE.** GKE admits a
+  `system-node-critical` pod only in a namespace holding a ResourceQuota
+  scoped to that class, so the DaemonSet created no pod there. The chart
+  now ships that quota in its namespace (`criticalPodsQuota`, on by
+  default, with a limit that never binds); elsewhere it changes nothing.
+- **The Kubernetes soak runs on Arm nodes that are tainted by
+  architecture** (GKE's): `soak.sh`'s pods tolerate `kubernetes.io/arch`,
+  and such a node is no longer left out.
 - **A sender that fails is named as the failure.** When `varek export
   --format otlp`, `splunk` or `sentinel` lost its sender (Sentinel's live
   test: Entra ID refused a wrongly pasted secret during `--follow`), the

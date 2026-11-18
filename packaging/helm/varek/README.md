@@ -45,19 +45,24 @@ the container does not start. The chart installs:
 - A namespace of its own that admits privileged pods. The node agent is
   privileged on the node, in the node's PID namespace, as Falco and Tetragon
   are.
-- **GKE** (being tested, November 2026; not yet a supported platform):
-  - **Standard clusters with Ubuntu nodes** (`UBUNTU_CONTAINERD`, amd64
-    and Axion arm64). Their nodes have every requirement above:
-    containerd 2.4 with NRI on, Landlock, cgroup v2.
-  - **Not Container-Optimized OS.** Its kernel is built without Landlock,
-    its `/opt` is read-only, and its `/var` is `noexec`.
+- **GKE Standard with Ubuntu nodes** (`UBUNTU_CONTAINERD`, amd64 and Axion
+  arm64): tested 24 hours, November 17 to 18, 2026, `soak_check: PASS`
+  (`docs/security/v1.36-kubernetes-parity.md`).
+  - **Not Container-Optimized OS,** GKE's default node image. Its kernel
+    is built without Landlock, its `/opt` is read-only and its `/var` is
+    `noexec`. On a cluster that also has COS node pools (GKE Sandbox's
+    included), keep the DaemonSet to the Ubuntu nodes, or its pod on a COS
+    node stays in `Init`:
+    `--set-string 'nodeSelector.cloud\.google\.com/gke-os-distribution=ubuntu'`.
+    A supervised pod placed on a node without the node agent does not run.
   - **Not Autopilot,** which admits no privileged `hostPID` DaemonSet.
-  - **A GKE Sandbox (gVisor) pod is refused,** as any sandboxed runtime is
-    (`nri.runtimeHandlers`).
-  - GKE admits a `system-node-critical` pod only in a namespace with a
-    ResourceQuota scoped to that class. The chart ships one in its
-    namespace (`criticalPodsQuota`, on by default, a limit that never
-    binds); without it the DaemonSet creates no pod.
+  - **Not GKE Sandbox (gVisor).** GKE refuses its pods a `Localhost`
+    seccomp profile, which every supervised container names, and its nodes
+    run COS.
+  - **The quota.** GKE admits a `system-node-critical` pod only in a
+    namespace with a ResourceQuota scoped to that class. The chart ships
+    one in its namespace (`criticalPodsQuota`, on by default, with a limit
+    that never binds); without it the DaemonSet creates no pod.
 
 ## Install
 
