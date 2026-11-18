@@ -125,8 +125,30 @@ k8s_install() {
         run systemctl enable kubelet
     else
         run apt-cache policy kubeadm kubelet kubectl cri-tools "$@"
-        run apt-get install -y --allow-downgrades "$@" "kubelet=$K8S.*" "kubeadm=$K8S.*" "kubectl=$K8S.*" ||
-            fail "installing ${*:+$* and }Kubernetes $K8S"
+        # the exact version, the newest of the cell's minor that pkgs.k8s.io
+        # lists: "kubeadm=$K8S.*" took the highest of every repository's,
+        # and Microsoft's (1.35.10-ubuntu24.04u7, on GitHub's runner image)
+        # sorts above pkgs.k8s.io's (1.35.x-1.1), a negative pin or not
+        local kv
+        kv="$(apt-cache madison kubeadm | awk -F'|' -v m="$K8S." '
+                { v = $2; gsub(/ /, "", v) }
+                $3 ~ /pkgs\.k8s\.io/ && index(v, m) == 1 && v ~ /-[0-9]+\.[0-9]+$/ { print v }' |
+              sort -V | tail -1)"
+        [ -n "$kv" ] || fail "no Kubernetes $K8S in pkgs.k8s.io's repository"
+        measure "k8s.package" "$kv (pkgs.k8s.io)"
+        run apt-get install -y --allow-downgrades "$@" "kubelet=$kv" "kubeadm=$kv" "kubectl=$kv" ||
+            fail "installing ${*:+$* and }Kubernetes $kv"
+        # the cell tests the Kubernetes project's packages (pkgs.k8s.io's
+        # versions end -1.1, -2.1, ...), not a distribution's rebuild
+        local p v
+        for p in kubelet kubeadm kubectl; do
+            v="$(dpkg-query -W -f='${Version}' "$p")"
+            measure "$p" "$v"
+            case "$v" in
+                *-[0-9]*.[0-9]*) ;;
+                *) fail "$p $v is not the Kubernetes project's package (pkgs.k8s.io)" ;;
+            esac
+        done
     fi
     command -v crictl > /dev/null && return 0
     [ "$PM" = apt ] && run apt-get install -y cri-tools && command -v crictl > /dev/null && return 0
