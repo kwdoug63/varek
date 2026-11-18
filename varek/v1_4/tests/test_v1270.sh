@@ -110,17 +110,21 @@ launches "require warden 1.27"                 "require warden 1.27\n$X"        
 launches "1.27 with no exec rule"              'require warden 1.27\n'                 on
 launches "1.26, then 1.27"                     "require warden 1.26\nrequire warden 1.27\n$X" on
 launches "1.27, then 1.24 (the highest holds)" "require warden 1.27\nrequire warden 1.24\n$X" on
-# the shipped packs keep their v1.26 meaning: their exec rules decide only the
-# agent's own launch until a pack says require warden 1.27
-packs=0 packs_off=0
+# v1.40: the shipped packs say require warden 1.27, so their exec rules decide
+# launches after the agent's own (both parsers agree); the cybersecurity pack
+# names no shell and no interpreter, only yara
+packs=0 packs_on=0
 for f in "$HERE"/policies/*.txt; do
     packs=$((packs + 1))
-    [ "$("$VDP" "$f" launches 2>/dev/null)" = off ] && [ "$("$CERT" "$f" launches 2>/dev/null)" = off ] &&
-        packs_off=$((packs_off + 1))
+    [ "$("$VDP" "$f" launches 2>/dev/null)" = on ] && [ "$("$CERT" "$f" launches 2>/dev/null)" = on ] &&
+        packs_on=$((packs_on + 1))
 done
-if [ "$packs" -gt 0 ] && [ "$packs" = "$packs_off" ]; then
-    pass "every shipped policy pack ($packs) keeps launches off"
-else flunk "every shipped policy pack keeps launches off ($packs_off of $packs)"; fi
+if [ "$packs" -gt 0 ] && [ "$packs" = "$packs_on" ]; then
+    pass "every shipped policy pack ($packs) decides launches (require warden 1.27)"
+else flunk "every shipped policy pack decides launches ($packs_on of $packs)"; fi
+check "the cybersecurity pack launches yara alone: no shell, no interpreter" sh -c \
+    "[ \"\$(grep -c '^allow exec ' '$HERE/policies/cybersecurity.policy.txt')\" = 1 ] &&
+     grep -q '^allow exec /usr/bin/yara\$' '$HERE/policies/cybersecurity.policy.txt'"
 
 # the policy check's notes
 lint() { printf '%b' "$1" > "$OUT/n.txt"; "$VDP" "$OUT/n.txt" lint > "$OUT/n.out" 2>&1; echo $? > "$OUT/n.rc"; }

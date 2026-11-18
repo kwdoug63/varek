@@ -33,6 +33,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the workbook drawn; and against a stand-in Azure
   (`tests/test_varek_sentinel.py`).
 
+### Changed
+- **The sector packs decide program launches** (`require warden 1.27`,
+  was 1.14). Under 1.14 every launch after the agent's own was refused,
+  whatever the packs' `allow exec` lines said. Now those lines take effect:
+  - healthcare, finance, utility and national-defense let the agent start
+    `python3`, a general-purpose interpreter;
+  - cybersecurity drops `python3` and names `yara` alone, keeping its "no
+    shell" intent;
+  - any program not named is refused, held by Landlock.
+
+  Every directory a pack lets the agent write is now mounted `noexec` for
+  the run. Each must exist when the run starts, and the agent's program
+  and its standard input must not be in one (`--writable-exec` turns the
+  mounts off for a run). An older Warden than 1.27 refuses the packs.
+
 ### Fixed
 - **A sender that fails is named as the failure.** When `varek export
   --format otlp`, `splunk` or `sentinel` lost its sender (Sentinel's live
