@@ -41,6 +41,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   says so, and how to keep the DaemonSet to Ubuntu nodes.
 
 ### Changed
+- **A run under a sector pack starts with no refusals.** The packs allow,
+  read-only, what the loader, the C library and Python read as a program
+  starts: `/etc/ld.so.preload`, locale names, Python's own links and
+  home-finding files (most absent), and site-wide packages. A Python
+  agent's start-up went from some 19 refusals to none, so a refusal in
+  Sentinel, Splunk or OpenTelemetry is the agent's.
 - **The sector packs decide program launches** (`require warden 1.27`,
   was 1.14). Under 1.14 every launch after the agent's own was refused,
   whatever the packs' `allow exec` lines said. Now those lines take effect:

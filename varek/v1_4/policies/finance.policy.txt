@@ -54,6 +54,12 @@ require warden 1.27
 deny  path /var/lib/ledger/keys/           # settlement / signing keys — never
 deny  path /var/lib/ledger/journal/posted/ # posted entries are immutable to the agent
 allow path /etc/ld.so.cache readonly            # loader cache: read
+# v1.40: what the loader, the C library and Python read under /etc as any
+# program starts (most need not exist); read-only, nothing secret
+allow path exact /etc/ld.so.preload readonly     # the loader: libraries to preload (usually absent)
+allow path exact /etc/locale.alias readonly      # the C library's locale names (Debian links /usr/share/locale/locale.alias here)
+allow path glob /etc/python3*/sitecustomize.py readonly   # Debian's Python (sitecustomize.py links here)
+allow path glob /etc/alternatives/python3* readonly   # python3 -> /etc/alternatives/python3 -> the program (Debian, RHEL)
 deny  path /etc/
 deny  path /root/
 
@@ -93,6 +99,21 @@ allow path /usr/lib64/ readonly                 # shared libraries on RHEL, Fedo
 allow path /lib/ readonly                       # loader / shared libraries: read, never write
 allow path /lib64/ readonly                     # loader / shared libraries: read, never write
 allow path /usr/share/ readonly                  # shared OS data (time zones, locale): read, never write
+# v1.40: what the C library and Python read as they start, most of it files
+# that need not exist; without these every run began with some 19 refusals,
+# noise to an alerting rule (docs/security/v1.39-security-operations.md)
+allow path exact /proc/sys/vm/overcommit_memory readonly   # the C library's allocator
+allow path glob /usr/bin/python3* readonly       # Python reads its own program and links to find its home
+allow path exact /usr/bin/pyvenv.cfg readonly    # Python: is this a virtual environment (absent)
+allow path exact /usr/pyvenv.cfg readonly
+allow path exact /usr/bin/pybuilddir.txt readonly    # Python: a build tree's marker (absent)
+allow path exact /usr/bin/lib readonly          # Python: where a build tree's library would be (absent: decided
+allow path /usr/bin/lib/ readonly                # where the lookup stops, this name)
+allow path exact /usr/bin/Modules readonly      # Python 3.12: a build tree's other marker,
+allow path /usr/bin/Modules/ readonly            # Modules/Setup.local (absent)
+allow path /usr/local/lib/ readonly              # packages installed for every user (pip without --user)
+allow path /usr/local/lib64/ readonly            # ... on RHEL, Fedora and Amazon Linux
+allow path exact /tmp/varek readonly             # the scratch directory itself (its rule above covers what is in it)
 
 # --- Programs the agent may launch --------------------------------------------
 # python3 is a general-purpose interpreter: the agent may start Python
