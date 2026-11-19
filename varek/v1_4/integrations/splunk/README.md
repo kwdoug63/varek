@@ -90,6 +90,10 @@ varek export --format splunk --follow /var/log/varek/run.log --endpoint https://
 A batch the HEC refuses for a reason a retry can mend (503, "server is
 busy"; 429, 502, 504; no answer) is sent again, backing off; any other
 refusal ends the export with exit 1, naming the first event not taken.
+The message also says where the events not sent begin (with `--hec-ack`,
+the first not acknowledged as indexed), and the same export with
+`--from-position N` sends them (`docs/security/v1.39-security-operations.md`,
+section 5).
 
 ## 4. Searches
 

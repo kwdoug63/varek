@@ -42,6 +42,10 @@ Usage:
     --retries times at most, waiting longer each time (or as Retry-After
     says); any other refusal ends the export with exit 1, naming the first
     event the HEC did not take (those before it were taken).
+    v1.40: the message then names the position the events not sent begin
+    at (their record's, unmapped.varek.position; with --ack, the first not
+    acknowledged as indexed): `varek export --from-position N` sends them,
+    and the stream's events from there on.
 
 Exit status: 0 every event sent (and, with --ack, indexed); 1 an event not
 taken; 2 the input is not OCSF events, or the arguments are wrong.
@@ -58,7 +62,7 @@ import urllib.request
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from varek_otel import lines_of  # noqa: E402  (the same reading of a pipe as it arrives)
+from varek_otel import lines_of, position_of, resume_note  # noqa: E402  (the same reading of a pipe as it arrives)
 
 SOURCE = "varek-warden"
 SOURCETYPE = "varek:ocsf"
@@ -217,20 +221,21 @@ def main(argv=None, env=None):
         return 2
     fh = sys.stdin if a.events == "-" else open(a.events, "rb")
     pending, sent, requests, last = [], 0, 0, time.monotonic()
-    waiting = {}                     # ackId -> (events, when sent)
+    waiting = {}                     # ackId -> (events, when sent, the first one's position)
     indexed = 0
+    first = None                     # v1.40: the position of pending's first event
 
     def flush():
-        nonlocal pending, sent, requests, last
+        nonlocal pending, sent, requests, last, first
         if pending:
             ack_id = hec.send(pending)
             requests += 1
             if a.ack:
                 if ack_id is None:
                     raise SplunkError("--ack: the HEC gave no ackId (the token's indexer acknowledgement is off)")
-                waiting[int(ack_id)] = (len(pending), time.monotonic())
+                waiting[int(ack_id)] = (len(pending), time.monotonic(), first)
             sent += len(pending)
-            pending = []
+            pending, first = [], None
         last = time.monotonic()
 
     def check_acks(final=False):
@@ -239,7 +244,7 @@ def main(argv=None, env=None):
             for i in hec.acked(set(waiting)):
                 indexed += waiting.pop(i)[0]
             now = time.monotonic()
-            late = [i for i, (_, t) in waiting.items() if now - t > a.ack_timeout]
+            late = [i for i, (_, t, _) in waiting.items() if now - t > a.ack_timeout]
             if late:
                 raise SplunkError(f"{sum(waiting[i][0] for i in late)} event(s) received but not "
                                   f"acknowledged as indexed within {a.ack_timeout:g} s")
@@ -259,6 +264,8 @@ def main(argv=None, env=None):
                     return 2
                 try:
                     pending.append(hec_event(ev, a.index))
+                    if len(pending) == 1:
+                        first = position_of(ev)
                 except SplunkError as e:
                     print(f"varek_splunk: line {n}: {e}", file=sys.stderr)
                     return 2
@@ -270,7 +277,10 @@ def main(argv=None, env=None):
         if waiting:
             check_acks(final=True)
     except SplunkError as e:
-        print(f"varek_splunk: {e} ({sent} events sent before)", file=sys.stderr)
+        # v1.40: the events not taken begin at the earliest batch sent and
+        # not yet acknowledged (--ack), else at the batch being sent
+        rest = next(iter(waiting.values()))[2] if waiting else first
+        print(f"varek_splunk: {e} ({sent} events sent before{resume_note(rest)})", file=sys.stderr)
         return 1
     tail = f", {indexed} acknowledged as indexed" if a.ack else ""
     print(f"varek_splunk: {sent} events sent to {url} in {requests} request(s){tail}", file=sys.stderr)

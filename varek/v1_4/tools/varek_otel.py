@@ -43,6 +43,9 @@ Usage:
     503, 504, or no answer) is sent again, --retries times at most, waiting
     longer each time (or as Retry-After says); any other refusal, and a
     partial success that rejects records, ends the export with exit 1.
+    v1.40: its message then names the position the events not sent begin
+    at (their record's, unmapped.varek.position): `varek export
+    --from-position N` sends them, and the stream's events from there on.
 
 Exit status: 0 every event sent and accepted; 1 an event not accepted;
 2 the input is not OCSF events (a line that is not a JSON object).
@@ -253,6 +256,24 @@ def send(url, body, headers, timeout=10.0, retries=5, sleep=time.sleep):
 
 # ------------------------------------------------------------------- main --
 
+def position_of(ev):
+    """v1.40: the position, in its stream, of the record an OCSF event came
+    from (unmapped.varek.position, as tools/varek_ocsf.py writes it); None
+    for an event that names none"""
+    v = _get(ev, "unmapped", "varek")
+    p = v.get("position") if isinstance(v, dict) else None
+    return p if type(p) is int and p >= 1 else None
+
+
+def resume_note(pos):
+    """v1.40: what a failed export's message adds: where the events not
+    sent begin, and how to send them (nothing if that is not known: the
+    export is then made again whole)"""
+    if pos is None:
+        return ""
+    return f"; those not sent begin at position {pos}: `varek export --from-position {pos}` sends them"
+
+
 def lines_of(fh, interval):
     """the input's lines as they come; None when --interval passes with none
     (a time to send what is waiting)"""
@@ -295,16 +316,17 @@ def main(argv=None):
         return 2
     fh = sys.stdin if a.events == "-" else open(a.events, "rb")
     pending, sent, requests, last = [], 0, 0, time.monotonic()
+    first = None                     # v1.40: the position of the first event not yet accepted
 
     def flush():
-        nonlocal pending, sent, requests, last
+        nonlocal pending, sent, requests, last, first
         if pending:
             rejected, why = send(url, payload(pending), headers, a.timeout, a.retries)
             requests += 1
             if rejected:
                 raise OtelError(f"the collector rejected {rejected} of {len(pending)} records: {why}".strip())
             sent += len(pending)
-            pending = []
+            pending, first = [], None
         last = time.monotonic()
 
     n = 0
@@ -319,6 +341,8 @@ def main(argv=None):
                     return 2
                 try:
                     pending.append((resource_of(ev), log_record(ev, line.strip(), not a.no_full_event)))
+                    if len(pending) == 1:
+                        first = position_of(ev)
                 except OtelError as e:
                     print(f"varek_otel: line {n}: {e}", file=sys.stderr)
                     return 2
@@ -326,7 +350,7 @@ def main(argv=None):
                 flush()
         flush()
     except OtelError as e:
-        print(f"varek_otel: {e} ({sent} records sent before)", file=sys.stderr)
+        print(f"varek_otel: {e} ({sent} records sent before{resume_note(first)})", file=sys.stderr)
         return 1
     print(f"varek_otel: {sent} records sent to {url} in {requests} request(s)", file=sys.stderr)
     return 0

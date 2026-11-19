@@ -240,3 +240,30 @@ def test_input_that_is_not_ocsf_is_refused():
         assert r.returncode == 2 and "not an OCSF event" in r.stderr and not h.got
     finally:
         h.close()
+
+
+def at(pos):
+    """DENIED as varek_ocsf.py writes it: the position of its record in the stream"""
+    ev = json.loads(json.dumps(DENIED))
+    ev["unmapped"]["varek"]["position"] = pos
+    return ev
+
+
+def test_a_failed_send_names_where_the_events_not_sent_begin():
+    # v1.40: without --ack, the batch refused; with it, the earliest batch
+    # received but not acknowledged as indexed
+    h = Hec(answers=[(200, {"text": "Success", "code": 0}), (400, {"text": "Invalid data format", "code": 6})])
+    try:
+        r = run(["--hec", h.url, "--batch", "2"], [at(p) for p in range(10, 15)])
+        assert r.returncode == 1 and "HTTP 400" in r.stderr
+        assert "2 events sent before; those not sent begin at position 12: " \
+               "`varek export --from-position 12` sends them" in r.stderr
+    finally:
+        h.close()
+    h = Hec(ack=True, ack_after=None)
+    try:
+        r = run(["--hec", h.url, "--ack", "--ack-timeout", "2", "--batch", "2"], [at(p) for p in range(10, 13)])
+        assert r.returncode == 1 and "not acknowledged as indexed within 2 s" in r.stderr
+        assert "3 events sent before; those not sent begin at position 10" in r.stderr
+    finally:
+        h.close()

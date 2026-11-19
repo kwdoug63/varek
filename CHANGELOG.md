@@ -39,6 +39,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   can't run the node agent (no Landlock in its kernel, a read-only `/opt`,
   a `noexec` `/var`), nor can Autopilot or GKE Sandbox. The chart README
   says so, and how to keep the DaemonSet to Ubuntu nodes.
+- **A failed export resumed** (`docs/security/v1.39-security-operations.md`,
+  section 5). When `varek export --format otlp`, `splunk` or `sentinel`
+  fails partway, the sender's message names the position its unsent
+  events begin at, and the same export with `--from-position N` sends the
+  rest, where until now the run was exported again whole. The position is
+  the record's (`unmapped.varek.position`, on every OCSF event). The
+  stream is still audited whole, and the audit's verdict is always sent.
+  Events come out in their records' order, so none from there on is left
+  out. `--format ocsf` takes it too.
 
 ### Changed
 - **A run under a sector pack starts with no refusals.** The packs allow,

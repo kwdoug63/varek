@@ -56,6 +56,13 @@ Usage:
         Check that EVENTS are exactly the events this exporter writes from
         STREAM (none edited, removed, added or reordered), and that the
         stream is intact.
+    --from-position N (v1.40; with --log or --follow): the rest of an export
+        that failed partway. The stream is audited whole, as ever, but the
+        events are written from the first whose record is at position N or
+        later (unmapped.varek.position; a sender that fails names the
+        position its unsent events begin at); the audit's verdict event is
+        always written. Events come out in their records' order, so none
+        from N on is left out (some sent before may be sent again).
 """
 import argparse
 import hashlib
@@ -579,6 +586,25 @@ def check_policy(exporter, rs):
                           f"({rs['policy_sha256']})")
 
 
+class FromPosition:
+    """v1.40: --from-position N: True for each event to write, False for one
+    before the first event whose record is at position N or later. Events
+    are written in their records' order (what waits for a record that folds
+    into it holds back those after it), so from that event on every event
+    is written, an event finish() adds with an earlier position too."""
+
+    def __init__(self, n):
+        self.n, self.on, self.skipped = n, not n or n <= 1, 0
+
+    def __call__(self, ev):
+        if not self.on:
+            p = (ev.get("unmapped") or {}).get("varek", {}).get("position")
+            self.on = type(p) is int and p >= self.n
+        if not self.on:
+            self.skipped += 1
+        return self.on
+
+
 def cmd_batch(args):
     log, d = private_copy(args.log)
     try:
@@ -600,7 +626,12 @@ def _batch(args, log):
         if r.get("event") == "run_start":
             check_policy(ex, r)
     events += ex.finish()
-    events.append(audit_event(ex, True, "batch", [], dry))
+    keep = FromPosition(args.from_position)
+    events = [ev for ev in events if keep(ev)]                    # v1.40
+    events.append(audit_event(ex, True, "batch", [], dry))       # the verdict: always
+    if keep.skipped:
+        print(f"varek_ocsf: --from-position {args.from_position}: the {keep.skipped} event(s) before it "
+              f"not written", file=sys.stderr)
     out = open(args.output, "w") if args.output else sys.stdout
     for ev in events:
         out.write(dumps(ev) + "\n")
@@ -630,6 +661,7 @@ def cmd_follow(args):
     fh = open(path, encoding="utf-8", errors="surrogateescape", newline="\n")
     lineno = 0
     problems = []
+    keep = FromPosition(args.from_position)                      # v1.40
     try:
         while not ended:
             chunk = fh.readline()
@@ -698,7 +730,8 @@ def cmd_follow(args):
             if rec.get("event") == "run_start" and "decision_final" not in rec:
                 check_policy(ex, rec)           # review: before its event is written
             for ev in evs:
-                out.write(dumps(ev) + "\n")
+                if keep(ev):
+                    out.write(dumps(ev) + "\n")
             out.flush()
             if rec.get("event") == "run_end":
                 ended = True
@@ -712,7 +745,8 @@ def cmd_follow(args):
     if ex is None:
         raise ExportError(f"{path}: no run_start")
     for ev in ex.finish():
-        out.write(dumps(ev) + "\n")
+        if keep(ev):
+            out.write(dumps(ev) + "\n")
     dry = False
     if ended:
         ok, probs, _, dry = audit(args, segs)
@@ -797,13 +831,20 @@ def main(argv=None):
                                                             "the run is taken to have ended early (default 0: "
                                                             "wait for run_end; an agent may be quiet for long)")
     ap.add_argument("--output", "-o")
+    ap.add_argument("--from-position", type=int, metavar="N",
+                    help="v1.40: write the events from the first whose record is at position N or later "
+                         "(the rest of an export that failed partway; the stream is audited whole)")
     args = ap.parse_args(argv)
     try:
         if not args.checker:
             ap.error("exporting and --verify need --checker (the stream is audited)")
+        if args.from_position is not None and args.from_position < 1:
+            ap.error("--from-position: a position is 1 or more")
         if args.verify:
             if not args.log:
                 ap.error("--verify needs --log")
+            if args.from_position is not None:
+                ap.error("--verify checks a whole export; --from-position is for writing one")
             return cmd_verify(args)
         if args.follow:
             return cmd_follow(args)
