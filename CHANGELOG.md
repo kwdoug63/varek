@@ -51,6 +51,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   out. `--format ocsf` takes it too.
 
 ### Changed
+- **Sentinel's analytics rules judge a row when it arrives**
+  (`integrations/sentinel/sentinel-content.json`). They looked back 5
+  minutes by the decision's time, so a run exported more than a few
+  minutes after its end reached the table but raised no incident. Each
+  rule now runs every 5 minutes over a day and keeps the rows that arrived
+  since it last ran (`ingestion_time()`): a run exported within a day of
+  its decisions raises its incidents, each row judged once. Deploy
+  `sentinel-content.json` again to replace rules deployed before.
 - **A run under a sector pack starts with no refusals.** The packs allow,
   read-only, what the loader, the C library and Python read as a program
   starts: `/etc/ld.so.preload`, locale names, Python's own links and
