@@ -86,6 +86,21 @@ def test_the_template_table_rule_and_rows_agree():
             assert name in tcols or name in made or name == "VarekOCSF_CL", (name, q)
 
 
+
+def test_the_rules_judge_each_row_once_when_it_arrives():
+    # v1.40 (Sentinel's live test, November 19, 2026): a rule that looked back
+    # 5 minutes by the decision's time raised nothing for a run exported later.
+    # Microsoft's pattern for ingestion delay: a longer look-back, and only the
+    # rows that arrived since the rule last ran, so each is judged once. Under
+    # 2 days: a solution rule that looks back 2 days or more runs hourly at most.
+    content = json.load(open(os.path.join(SENTINEL, "sentinel-content.json")))
+    rules = [r["properties"] for r in content["resources"] if r.get("kind") == "Scheduled"]
+    assert len(rules) == 3
+    for r in rules:
+        assert r["queryFrequency"] == "PT5M" and r["queryPeriod"] == "P1D", r["displayName"]
+        first = r["query"].split("\n")[1]
+        assert first == "| where TimeGenerated > ago(1d) and ingestion_time() > ago(5m)", (r["displayName"], first)
+
 def test_batches_and_the_url():
     rows = [{"x": "a" * 100}] * 50
     bs = list(sen.batches(rows, limit=1000))
