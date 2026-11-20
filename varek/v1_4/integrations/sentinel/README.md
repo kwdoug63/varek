@@ -98,12 +98,20 @@ az deployment group create -g RESOURCE_GROUP --template-file /opt/varek/integrat
   for each run, agent and policy line (or rule) in five minutes, with what
   was refused.
 - **VAREK: a run's audit failed** (High; an incident): the run's verdict
-  stream is not as the Warden wrote it.
+  stream is not as the Warden wrote it. Only a live export (`--follow`)
+  sends one: a run exported whole is audited first, and a stream the audit
+  refuses sends nothing. In the live test (November 19, 2026) the incident
+  came 10 minutes after the run.
 - **VAREK: a dry run let through what its policy refuses**
   (Informational; no incident).
 - **The workbook, *VAREK: the Warden's decisions***: counts; refusals over
   time, by policy line and by agent; runs; the latest refusals; dry runs;
   failed audits.
+
+The rules run every 5 minutes and look back 5 minutes by the decision's
+own time. Export a run live (`--follow`) or within minutes of its end for
+its incidents: a run exported later reaches the table and the workbook,
+but raises none.
 
 Sentinel is moving to the Microsoft Defender portal (after March 31, 2027,
 Sentinel is in Defender only), and the Azure portal's Sentinel →

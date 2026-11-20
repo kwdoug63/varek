@@ -156,3 +156,56 @@ def test_an_export_resumed_from_a_position(tmp_path):
         assert [row["OcsfEvent"] for row in az.rows()] == full[k:]
     finally:
         az.close()
+
+
+@pytest.mark.skipif(not (BUILT and ROOT and sys.platform.startswith("linux")),
+                    reason="needs Linux, root and a built runtime")
+def test_a_refused_stream_says_why_and_what_was_sent(tmp_path):
+    # Sentinel's live test of the failed-audit rule (November 19, 2026): with
+    # --follow the reason reached Sentinel but not the screen; the batch audit
+    # named its private copy, not the file given; and the CLI said "what it
+    # wrote before was sent" after 0 rows
+    from test_varek_sentinel import Azure, SECRET
+    conf = str(tmp_path / "etc" / "varek.conf")
+
+    def varek(*args, env=None):
+        e = dict(os.environ, NO_COLOR="1", VAREK_CONFIG=conf, NO_PROXY="127.0.0.1")
+        e.update(env or {})
+        return subprocess.run([sys.executable, VAREK, *args], text=True, capture_output=True, env=e, timeout=180)
+
+    assert varek("init", "--pack", "healthcare", "--log-dir", str(tmp_path / "log")).returncode == 0
+    os.makedirs("/tmp/varek", exist_ok=True)
+    assert varek("run", "--", "/bin/sh", "-c", "read a < /etc/hostname; read b < /etc/shadow; true").returncode == 0
+    log = str(max((tmp_path / "log").glob("verdicts-*.log")))
+    lines = open(log).read().split("\n")
+    i = next(n for n, x in enumerate(lines) if '"decision_final":"DENY"' in x)
+    lines[i] = lines[i].replace('"decision_final":"DENY"', '"decision_final":"ALLOW"', 1)
+    bad = log[:-len(".log")] + "-tampered.log"
+    open(bad, "w").write("\n".join(lines))
+    broken = f"{bad}:{i + 1}: hash chain broken"
+
+    r = varek("export", "--format", "ocsf", "--follow", bad, "-o", str(tmp_path / "f.jsonl"))
+    out = r.stdout + r.stderr
+    assert r.returncode != 0 and f"the audit failed: {broken}" in out, out          # on the screen too
+    r = varek("export", "--format", "ocsf", bad, "-o", str(tmp_path / "b.jsonl"))
+    out = r.stdout + r.stderr
+    assert r.returncode != 0 and broken in out and "varek-ocsf-" not in out, out     # the file given, not the copy
+
+    azure = {"AZURE_TENANT_ID": "tenant-1", "AZURE_CLIENT_ID": "client-1", "AZURE_CLIENT_SECRET": SECRET}
+    az = Azure()
+    try:
+        env = dict(azure, AZURE_AUTHORITY_HOST=az.base)
+        r = varek("export", "--format", "sentinel", bad, "--endpoint", az.base, "--dcr", "dcr-0f1e", env=env)
+        out = r.stdout + r.stderr
+        assert r.returncode != 0 and "failed (exit 1): nothing was sent" in out and not az.rows(), out
+        assert broken in out and "varek-ocsf-" not in out, out
+        r = varek("export", "--format", "sentinel", "--follow", bad, "--endpoint", az.base, "--dcr", "dcr-0f1e",
+                  env=env)
+        out = r.stdout + r.stderr
+        assert r.returncode != 0 and "the events it wrote before it stopped were sent" in out, out
+        assert f"the audit failed: {broken}" in out, out
+        audit = [x for x in az.rows() if x.get("EventName") == "varek.audit"]
+        assert len(audit) == 1 and audit[0]["AuditPassed"] is False and audit[0]["OcsfEvent"]["severity"] == "High"
+        assert broken in audit[0]["OcsfEvent"]["unmapped"]["varek"]["audit"]["problems"][0]
+    finally:
+        az.close()

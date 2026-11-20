@@ -605,10 +605,18 @@ class FromPosition:
         return self.on
 
 
+def as_given(err, copy, given):
+    """v1.40 (Sentinel's live test): an error about the private copy names the
+    file given instead (the copy is removed when the command ends)"""
+    return type(err)(str(err).replace(copy, given))
+
+
 def cmd_batch(args):
     log, d = private_copy(args.log)
     try:
         return _batch(args, log)
+    except (ExportError, cdx.StreamError) as e:
+        raise as_given(e, log, args.log) from None
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -616,7 +624,7 @@ def cmd_batch(args):
 def _batch(args, log):
     ok, problems, text, dry = audit(args, log)
     if not ok:
-        sys.stderr.write(text)
+        sys.stderr.write(text.replace(log, args.log))     # the file given, not the copy
         raise ExportError("the audit refuses this stream; no events are written")
     recs, _ = run_records(log, args.allow_incomplete)
     ex = Exporter(args.policy, args.device)
@@ -755,6 +763,13 @@ def cmd_follow(args):
         ok = False
     out.write(dumps(audit_event(ex, ok and not problems, "follow", problems, dry)) + "\n")
     out.flush()
+    if not (ok and not problems):
+        # v1.40 (Sentinel's live test): why, on the screen too, not only in
+        # the verdict event the SIEM gets
+        for p in problems[:5] or ["the whole stream's audit did not pass"]:
+            print(f"varek_ocsf: the audit failed: {p}", file=sys.stderr)
+        if len(problems) > 5:
+            print(f"varek_ocsf: ... and {len(problems) - 5} more, in the audit's verdict event", file=sys.stderr)
     return 0 if ok and not problems else 1
 
 
@@ -762,6 +777,8 @@ def cmd_verify(args):
     log, d = private_copy(args.log)
     try:
         return _verify(args, log)
+    except (ExportError, cdx.StreamError) as e:
+        raise as_given(e, log, args.log) from None
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -781,7 +798,7 @@ def _verify(args, log):
     # check), not only its chain, which anyone can recompute
     ok, _, text, dry = audit(args, log)
     if not ok:
-        sys.stderr.write(text)
+        sys.stderr.write(text.replace(log, args.log))     # the file given, not the copy
         raise ExportError("the audit refuses the stream: its events cannot be the evidence of a run")
     recs, _ = run_records(log, args.allow_incomplete)
     ex = Exporter(args.policy, device)

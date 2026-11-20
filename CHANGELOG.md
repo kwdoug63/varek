@@ -30,8 +30,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   workspace with Sentinel, November 16, 2026: both templates deployed
   unchanged, a live run's 142 events all in the table, each refusal there
   within 25 s with its policy line, the refusal rule's incident raised and
-  the workbook drawn; and against a stand-in Azure
-  (`tests/test_varek_sentinel.py`).
+  the workbook drawn; on November 19, a tampered stream sent with
+  `--follow` raised the failed-audit rule's High incident; and against a
+  stand-in Azure (`tests/test_varek_sentinel.py`).
 - **GKE Standard, tested** (`docs/security/v1.36-kubernetes-parity.md`).
   The 24-hour Kubernetes soak passed on GKE 1.37 with Ubuntu nodes, amd64
   and Axion arm64, November 17 to 18, 2026. Every probe held, all 100
@@ -71,6 +72,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   mounts off for a run). An older Warden than 1.27 refuses the packs.
 
 ### Fixed
+- **A stream the audit refuses: the export says why, and what was sent**
+  (Sentinel's live test of the failed-audit rule, November 19, 2026). With
+  `--follow` the reason (the broken line) is printed, not only sent in the
+  audit's verdict; the whole-stream audit names the file given, not the
+  exporter's private copy; and `varek export` says "nothing was sent" or
+  "the events it wrote before it stopped were sent", not "what it wrote
+  before was sent" after 0 rows.
 - **The chart's DaemonSet runs on GKE.** GKE admits a
   `system-node-critical` pod only in a namespace holding a ResourceQuota
   scoped to that class, so the DaemonSet created no pod there. The chart
