@@ -102,8 +102,9 @@ MIT · github.com/kwdoug63/varek
 - **A run under a sector pack starts with no refusals** (#208). The packs
   allow, read-only, what the loader, the C library and Python read as a
   program starts:
-  - `/etc/ld.so.preload` and locale names;
-  - Python's own links and home-finding files, most of them absent;
+  - `/etc/ld.so.preload`, locale names and the time zone;
+  - Python's own links and home-finding files, most of them absent
+    (beside its program, the `lib` and `lib64` a build tree would have);
   - the site-wide packages.
 
   A Python agent's start-up went from 19 refusals to none, so a refusal in
@@ -173,9 +174,11 @@ MIT · github.com/kwdoug63/varek
   - **The pack tests:**
     - each pack's launches decided, by both parsers;
     - a bare Python agent starting under each pack with no refusal, in
-      CI on Ubuntu 24.04 (the host, Python 3.12, and the container image)
-      and on Python 3.13 by hand. Rocky Linux 9 and Amazon Linux 2023
-      (Python 3.9) run it in this release's CI: VERIFY BEFORE TAGGING.
+      CI on Ubuntu 24.04 (the host, Python 3.12, and the container image),
+      Rocky Linux 9 and Amazon Linux 2023 (Python 3.9), and on Python 3.13
+      by hand. This release's CI found the last three reads the packs
+      allow: Python 3.9's `lib64` lookups beside its program, and Amazon
+      Linux 2023's time zone file.
   - `smt_crosscheck` on the five packs: 0 disagreements.
 - **Microsoft Sentinel, live,** in a Log Analytics workspace with
   Sentinel, East US, from a RHEL 9 host (Amazon EC2):
@@ -236,8 +239,9 @@ MIT · github.com/kwdoug63/varek
 - **The packs:**
   - `python3` is a general-purpose interpreter: any code it can read
     runs, under the pack's file and network rules.
-  - The start-up reads were checked with Python 3.12 (Ubuntu 24.04) and
-    3.13. Another distribution's Python may read something else at start.
+  - The start-up reads were checked with Python 3.9 (Rocky Linux 9, Amazon
+    Linux 2023), 3.12 (Ubuntu 24.04) and 3.13. Another distribution's
+    Python may read something else at start.
 - **GKE:** Container-Optimized OS nodes can't run the node agent (their
   kernel has no Landlock), nor can Autopilot or GKE Sandbox.
 - From v1.38.0, unchanged:

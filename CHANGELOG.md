@@ -76,8 +76,10 @@ unchanged; the policy grammar stays 1.35 (`RELEASE-v1.40.0.md`).
   Deploy `sentinel-content.json` again to replace rules deployed before.
 - **A run under a sector pack starts with no refusals.** The packs allow,
   read-only, what the loader, the C library and Python read as a program
-  starts: `/etc/ld.so.preload`, locale names, Python's own links and
-  home-finding files (most absent), and site-wide packages. A Python
+  starts: `/etc/ld.so.preload`, locale names, the time zone, Python's own
+  links and home-finding files (most absent; on RHEL and Amazon Linux, its
+  `lib64` beside its program), and site-wide packages. Checked with
+  Python 3.9 (Rocky Linux 9, Amazon Linux 2023), 3.12 and 3.13. A Python
   agent's start-up went from some 19 refusals to none, so a refusal in
   Sentinel, Splunk or OpenTelemetry is the agent's.
 - **The sector packs decide program launches** (`require warden 1.27`,
