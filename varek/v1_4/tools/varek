@@ -2533,8 +2533,14 @@ def _export_sent(args, sender, done):
              "all of its events")
         return rc_out
     if rc_ocsf != 0:
-        raise CliError(f"the OCSF export of {log} failed (exit {rc_ocsf}); what it wrote before was sent",
-                       fix="see its message above: a stream the audit refuses is not exported")
+        # v1.40 (Sentinel's live test): what reached the SIEM, said as it is
+        if args.follow:
+            raise CliError(f"the OCSF export of {log} failed (exit {rc_ocsf}): the events it wrote before it "
+                           f"stopped were sent",
+                           fix="its message above says why; once the run's start was read, so does the audit's "
+                               "verdict, sent last")
+        raise CliError(f"the OCSF export of {log} failed (exit {rc_ocsf}): nothing was sent",
+                       fix="its message above says why: a stream the audit refuses is not exported")
     ok(done)
     return 0
 
