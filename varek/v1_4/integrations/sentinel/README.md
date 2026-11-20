@@ -108,12 +108,16 @@ az deployment group create -g RESOURCE_GROUP --template-file /opt/varek/integrat
   time, by policy line and by agent; runs; the latest refusals; dry runs;
   failed audits.
 
-The rules run every 5 minutes and judge the rows that arrived since they
-last ran (`ingestion_time()`), whenever their decisions were made, up to a
+The rules run every 5 minutes and judge the rows that arrived in the last
+6 minutes (`ingestion_time()`), whenever their decisions were made, up to a
 day before: a run exported within a day of its decisions raises its
-incidents, each once. One exported later reaches the table and the
-workbook but raises none. (A day: Sentinel runs a rule that looks back 2
-days or more at most hourly.) Rules deployed before v1.40.0 looked back 5
+incidents. One exported later reaches the table and the workbook but
+raises none. (A day: Sentinel runs a rule that looks back 2 days or more
+at most hourly.) The window is a minute longer than the rule's period
+because Sentinel's runs are not exactly 5 minutes apart: none falls
+between two runs, and a row both see raises a second alert, in the same
+incident (the incidents group a run's alerts). An alert's time is its
+rows', the latest decision. Rules deployed before v1.40.0 looked back 5
 minutes by the decision's time; deploy `sentinel-content.json` again to
 replace them.
 
