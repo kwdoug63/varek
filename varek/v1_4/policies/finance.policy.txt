@@ -111,6 +111,8 @@ allow path exact /usr/bin/lib readonly          # Python: where a build tree's l
 allow path /usr/bin/lib/ readonly                # where the lookup stops, this name)
 allow path exact /usr/bin/Modules readonly      # Python 3.12: a build tree's other marker,
 allow path /usr/bin/Modules/ readonly            # Modules/Setup.local (absent)
+allow path exact /usr/bin/lib64 readonly        # Python on RHEL and Amazon Linux (its library in lib64):
+allow path /usr/bin/lib64/ readonly              # os.py, os.pyc, lib-dynload looked for here first (absent)
 allow path /usr/local/lib/ readonly              # packages installed for every user (pip without --user)
 allow path /usr/local/lib64/ readonly            # ... on RHEL, Fedora and Amazon Linux
 allow path exact /tmp/varek readonly             # the scratch directory itself (its rule above covers what is in it)
