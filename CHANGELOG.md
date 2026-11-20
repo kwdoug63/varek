@@ -9,6 +9,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+- **CrowdStrike Falcon Next-Gen SIEM export, against a stand-in** (v1.41,
+  `docs/security/v1.39-security-operations.md`, section 4a; not yet
+  tested in a Falcon tenant). `varek export --format falcon [LOG]` sends
+  a run's OCSF events, audited first, to a Next-Gen SIEM HTTP Event
+  Collector data connector, sourcetype `varek:ocsf`, the whole OCSF event
+  in each; `--follow STREAM` sends a live run's, and `--from-position N`
+  the rest of one that failed. `tools/varek_falcon.py` does the sending:
+  the connector's URL as the Falcon console gives it (`--endpoint`, or
+  `FALCON_HEC_URL`), its API key from the environment (`FALCON_HEC_API_KEY`,
+  never the command line). A busy connector is retried, a batch too large
+  split, and any other refusal ends the export with exit 1.
+
 ## [1.40.0] - 2026-11-20 — security operations: Microsoft Sentinel
 
 The second part of security operations: a run's OCSF events, audited
