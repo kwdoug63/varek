@@ -56,9 +56,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   minutes by the decision's time, so a run exported more than a few
   minutes after its end reached the table but raised no incident. Each
   rule now runs every 5 minutes over a day and keeps the rows that arrived
-  since it last ran (`ingestion_time()`): a run exported within a day of
-  its decisions raises its incidents, each row judged once. Deploy
-  `sentinel-content.json` again to replace rules deployed before.
+  in the last 6 minutes (`ingestion_time()`, a minute more than its period,
+  as Sentinel's runs are not exactly 5 minutes apart): a run exported
+  within a day of its decisions raises its incidents; a row two runs see
+  raises a second alert in the same incident. An alert's time is its
+  rows' latest decision, not the day the rule looks over. Tested live on
+  November 20, 2026: a run exported 8 minutes late raised its incidents.
+  Deploy `sentinel-content.json` again to replace rules deployed before.
 - **A run under a sector pack starts with no refusals.** The packs allow,
   read-only, what the loader, the C library and Python read as a program
   starts: `/etc/ld.so.preload`, locale names, Python's own links and
