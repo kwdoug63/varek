@@ -63,6 +63,7 @@ allow path /etc/ld.so.cache readonly            # loader cache: read
 # program starts (most need not exist); read-only, nothing secret
 allow path exact /etc/ld.so.preload readonly     # the loader: libraries to preload (usually absent)
 allow path exact /etc/locale.alias readonly      # the C library's locale names (Debian links /usr/share/locale/locale.alias here)
+allow path exact /etc/localtime readonly         # the C library's time zone (Amazon Linux 2023's Python reads it at start)
 allow path glob /etc/python3*/sitecustomize.py readonly   # Debian's Python (sitecustomize.py links here)
 allow path glob /etc/alternatives/python3* readonly   # python3 -> /etc/alternatives/python3 -> the program (Debian, RHEL)
 deny  path /etc/
