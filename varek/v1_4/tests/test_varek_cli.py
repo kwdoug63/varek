@@ -371,8 +371,9 @@ def test_a_python_agent_starts_under_each_pack_refused_nothing(tmp_path, pack):
     # v1.40: the packs allow what the loader, the C library and Python read as
     # they start (most of it files that need not exist); before, every run
     # under a pack began with some 19 refusals, noise to an alerting rule
-    # (Sentinel's live test, November 16, 2026). CI runs this on Ubuntu, Rocky
-    # Linux 9 and Amazon Linux 2023: a refusal here is a start-up read a
+    # (Sentinel's live test, November 16, 2026). CI runs this on Ubuntu, and on
+    # Rocky Linux 9 and Amazon Linux 2023 when their host suites run (a change
+    # to C code, the charts or packaging): a refusal here is a start-up read a
     # distribution adds, to be allowed in the packs if it is as harmless.
     os.makedirs("/tmp/varek", exist_ok=True)            # the packs' scratch, must exist (noexec)
     log = tmp_path / "run.log"
@@ -391,4 +392,6 @@ def test_a_python_agent_starts_under_each_pack_refused_nothing(tmp_path, pack):
         if rec.get("decision_final") == "DENY" and "event" not in rec:
             refused.append((rec.get("action"), rec.get("target"), rec.get("resolved"), rec.get("rule"),
                             rec.get("policy_line")))
+    for x in refused:                                    # each in full (pytest shortens the assertion's list)
+        print("refused:", *x)
     assert not refused, f"{pack}: the start-up reads refused: {refused}"

@@ -682,8 +682,10 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * v1.37.0: macOS, through a Linux VM, the grammar stays 1.35; v1.38.0:
  * hardening, the baseline's git rules, the VM's agent user and packet
  * filter, the grammar stays 1.35; v1.39.0: security operations, the OCSF
- * events sent to OpenTelemetry and Splunk, the grammar stays 1.35) */
-#define VDP_WARDEN_REL_MINOR 39
+ * events sent to OpenTelemetry and Splunk, the grammar stays 1.35; v1.40.0:
+ * Microsoft Sentinel, a failed export resumed, the sector packs at
+ * `require warden 1.27`, the grammar stays 1.35) */
+#define VDP_WARDEN_REL_MINOR 40
 #define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's
                                  * (v1.36.1: packaging for Red Hat's certification;
                                  * v1.36.2: the node key published again, a test

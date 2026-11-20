@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.39.0-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.40.0-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -70,7 +70,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.39.0.**
+   **Current release: v1.40.0.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -137,6 +137,7 @@ The runtime line has progressed well beyond simple syscall containment:
   "Never requires a human" becomes certified rather than hoped. Since v1.18.0 the
   Warden runs it on the `--flow-policy` at startup and refuses to start if it
   fails.
+- **v1.40.0 — security operations: Microsoft Sentinel.** `varek export --format sentinel` sends a run's OCSF events, audited first, to Microsoft Sentinel's workspace as rows of `VarekOCSF_CL`, through the Azure Monitor Logs Ingestion API (a client secret from the environment, or an Azure VM's managed identity); `--follow` sends a live run's. `integrations/sentinel` deploys the table and data collection rule, three analytics rules and a workbook: a refusal raises an incident naming its policy line, a tampered verdict stream a High one, each judged when its row arrives, up to a day after the run. An export that fails partway names where its unsent events begin, and `--from-position N` sends the rest. The sector packs now say `require warden 1.27`: their `allow exec` lines decide which programs an agent may launch (any other refused), their writable directories are mounted `noexec`, and an agent starts under them with no refusals. Tested live in a Sentinel workspace, and with a 24-hour soak on GKE. CrowdStrike Falcon and Wiz move to v1.41.0. Includes v1.39.1's license check for AWS Marketplace's hourly listing. The Warden's code is unchanged. See [`RELEASE-v1.40.0.md`](./RELEASE-v1.40.0.md).
 - **v1.39.0 — security operations: OpenTelemetry and Splunk.** A run's OCSF events, audited first as `varek export --format ocsf` writes them, go where security teams look. `varek export --format otlp` sends them to an OpenTelemetry collector (and through it to Grafana, Datadog, Honeycomb, Elastic) as OTLP log records, a refusal a WARN naming its policy line; `--format splunk` sends them to a Splunk HTTP Event Collector, and a Splunk app names their fields and gives a dashboard of refusals by policy line, agent and run, dry runs and failed audits. With `--follow` a live run's events go as they are decided. Keys come from the environment, never the command line; a refusal or lost batch ends the export with exit 1. Tested against Grafana Cloud and Splunk Enterprise 10.4.5: a live run's refusals there within about two seconds. Microsoft Sentinel, CrowdStrike Falcon and Wiz are v1.40.0. The Warden decides nothing differently. See [`RELEASE-v1.39.0.md`](./RELEASE-v1.39.0.md).
 - **v1.38.0 — hardening: git's settings, the VM's agent user and network.** Three of v1.37.0's known limits closed. The baseline policy never writes the working directory's git settings and hooks (`.git/config`, `.git/hooks/`, a worktree's and a submodule's), which git runs, on a Mac outside the Warden too; reads and git's other files are as before. On a Mac, the agent runs in the VM as a user of its own without sudo, and a packet filter on the Mac (pf, its own anchor) keeps the VM from the Mac, link-local addresses (the instance metadata service) and the private networks while it runs. `mac_check.sh --sweep` passed on an EC2 Mac on this code, November 12, 2026. The baseline's change costs the agent `git init` at the root of the working directory, `git config` and `git push -u` there (a run that needs them takes `--policy`). See [`RELEASE-v1.38.0.md`](./RELEASE-v1.38.0.md).
 - **v1.37.0 — macOS, through a Linux VM.** An agent on a Mac with Apple silicon runs inside a RHEL 9 aarch64 VM (`varek vm`, on Apple's Virtualization framework through vfkit), under the arm64 Warden, with the same policies, decisions, records and audit as on Linux; the Mac shares one directory with the VM, the project, and its other files are not in the VM at all. The Mac's checks, the full sweep inside the VM and a 24-hour soak passed on an EC2 Mac on this code, November 10 and 11, 2026. No policy line, rule or record changes meaning. See [`RELEASE-v1.37.0.md`](./RELEASE-v1.37.0.md).
@@ -193,7 +194,7 @@ The runtime line has progressed well beyond simple syscall containment:
   (connects: shipped in v1.21.0; launches, opt-in, in v1.27.0). See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.39.0 history.
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.40.0 history.
 
 ### Network
 
@@ -595,7 +596,8 @@ different risks at different points in the stack.
 - [x] **v1.37.0** — macOS through a Linux VM (planned as v1.30.0, then v1.33.0): the agent and the Warden in a RHEL 9 VM on a Mac with Apple silicon, with the same policies, decisions, records and audit as on Linux; the arm64 Warden ([release notes](./RELEASE-v1.37.0.md))
 - [x] **v1.38.0** — Hardening: the baseline never writes the working directory's git settings and hooks; on a Mac, the agent's own user in the VM without sudo, and a packet filter keeping the VM from the Mac and its networks ([release notes](./RELEASE-v1.38.0.md))
 - [x] **v1.39.0** — Security operations, first part: the OCSF events sent to OpenTelemetry and to Splunk (with a Splunk app), live with `--follow` ([release notes](./RELEASE-v1.39.0.md))
-- [ ] **v1.40.0** (planned) — Security operations, second part: Microsoft Sentinel, CrowdStrike Falcon Foundry, Wiz ([plan](./docs/security/v1.39-security-operations.md))
+- [x] **v1.40.0** — Security operations, second part: Microsoft Sentinel (analytics rules and a workbook), a failed export resumed, the sector packs deciding launches ([release notes](./RELEASE-v1.40.0.md))
+- [ ] **v1.41.0** (planned; was v1.40.0) — Security operations, third part: CrowdStrike Falcon Foundry and Wiz, each waiting on its partner program's tenant ([plan](./docs/security/v1.39-security-operations.md))
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow; revisited after v1.35, once generated plans show how many steps it would clear ([plan](./docs/roadmap/v1.36-v1.37.md))
 

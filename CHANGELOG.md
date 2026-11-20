@@ -9,6 +9,17 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.40.0] - 2026-11-20 — security operations: Microsoft Sentinel
+
+The second part of security operations: a run's OCSF events, audited
+first, sent to Microsoft Sentinel, with analytics rules raising incidents
+for a refusal and for a failed audit, each tested live. An export that
+fails partway sends the rest with `--from-position`. The sector packs
+decide program launches and start an agent with no refusals. CrowdStrike
+Falcon and Wiz, each waiting on its partner program's tenant, move to
+v1.41.0. Includes v1.39.1, never tagged on its own. The Warden's code is
+unchanged; the policy grammar stays 1.35 (`RELEASE-v1.40.0.md`).
+
 ### Added
 - **Microsoft Sentinel export** (v1.40, `docs/security/v1.39-security-operations.md`,
   section 3; past the ship gate in a real workspace). `varek export
@@ -65,8 +76,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Deploy `sentinel-content.json` again to replace rules deployed before.
 - **A run under a sector pack starts with no refusals.** The packs allow,
   read-only, what the loader, the C library and Python read as a program
-  starts: `/etc/ld.so.preload`, locale names, Python's own links and
-  home-finding files (most absent), and site-wide packages. A Python
+  starts: `/etc/ld.so.preload`, locale names, the time zone, Python's own
+  links and home-finding files (most absent; on RHEL and Amazon Linux, its
+  `lib64` beside its program), and site-wide packages. Checked with
+  Python 3.9 (Rocky Linux 9, Amazon Linux 2023), 3.12 and 3.13. A Python
   agent's start-up went from some 19 refusals to none, so a refusal in
   Sentinel, Splunk or OpenTelemetry is the agent's.
 - **The sector packs decide program launches** (`require warden 1.27`,
