@@ -79,6 +79,18 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   error"). Both now say 1.29. A test makes the legacy `stat(2)` and
   `lstat(2)` calls directly under the bench's policy (x86-64): allowed where
   the policy reads, refused and recorded elsewhere.
+- **Microsoft Sentinel, two corrections from a live test** (November 21,
+  2026, `docs/security/v1.39-security-operations.md`, section 3). The test
+  exported a run from an Azure VM with its managed identity, no secret: 403
+  with no role, every row with Monitoring Metrics Publisher on the one
+  rule, and the refusal incident raised. That had been tested only against
+  the stand-in. `integrations/sentinel/README.md` now says:
+  - a new role can take up to about half an hour to apply (here, 23
+    minutes), not "some minutes";
+  - a row is judged by two or three of the rule's runs, not at most two:
+    Sentinel measures a scheduled rule's `ago()` from about 5 minutes
+    before the run. Each repeat lands in the same incident;
+  - where an alert's run is (`Custom Details`, `RunId[0]`).
 - `tests/test_v1260.sh`: the captures of real clients' ClientHellos wait
   for their listener. It slept 0.3 s on a random port, and under the node
   agent a listener could take longer to start, so the client was refused and

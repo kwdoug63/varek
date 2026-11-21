@@ -49,8 +49,9 @@ One of:
   (`--azure-auth managed-identity`; `--azure-client-id` for a
   user-assigned one). No secret at all.
 
-A new role assignment can take some minutes to apply; until it does, the
-API answers 403.
+A new role assignment can take up to about half an hour to apply (23
+minutes in the managed-identity live test, November 21, 2026); until it
+does, the API answers 403.
 
 ## 3. Export
 
@@ -114,10 +115,14 @@ day before: a run exported within a day of its decisions raises its
 incidents. One exported later reaches the table and the workbook but
 raises none. (A day: Sentinel runs a rule that looks back 2 days or more
 at most hourly.) The window is a minute longer than the rule's period
-because Sentinel's runs are not exactly 5 minutes apart: none falls
-between two runs, and a row both see raises a second alert, in the same
-incident (the incidents group a run's alerts). An alert's time is its
-rows', the latest decision. Rules deployed before v1.40.0 looked back 5
+because Sentinel's runs are not exactly 5 minutes apart: no row falls
+between two runs. Sentinel also measures a scheduled rule's `ago()` from
+about 5 minutes before the run (its built-in delay for late rows), so a
+row is judged by two or three runs, and each raises its alert again, in
+the same incident (the incidents group a run's alerts by run and host).
+An alert's time is its rows', the latest decision. In `SecurityAlert`, a
+refusal's or a failed audit's run is in the alert's custom details:
+`parse_json(tostring(parse_json(ExtendedProperties)["Custom Details"])).RunId[0]`. Rules deployed before v1.40.0 looked back 5
 minutes by the decision's time; deploy `sentinel-content.json` again to
 replace them.
 
