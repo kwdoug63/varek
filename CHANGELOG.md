@@ -28,6 +28,34 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   UBSan, every permitted and excluded name kept, up to 256 names of 253
   characters each way.
 
+
+### Changed
+
+- **The sector packs say `require warden 1.29`** (they said 1.27). Under it:
+  - **Files are opened as the agent's own user and groups,** not as root,
+    so the kernel's permissions apply on top of the policy.
+  - **A change by name is decided as a write on every name it touches,** and
+    carried out as the agent: remove, rename, make a directory, change a
+    mode or a time, truncate. Before, each was refused. A rename is
+    decided on both names, so a file still cannot be given a name a deny
+    rule covers. Removal is decided as truncation is, so a rule that lets
+    the agent rewrite a file lets it remove it. Links stay refused.
+  - **The legacy `stat(2)` and `lstat(2)` are decided** like a read-only
+    open. A Python built against a glibc before 2.33 (python-build-standalone,
+    which uv installs) finds its library with them, and could not start
+    under a pack.
+
+  The packs also allow, read-only, what a Python in `/usr/local` reads as
+  it starts: the `/usr/local/bin` counterparts of v1.40's `/usr/bin`
+  entries, and `/proc/self/exe`, `/proc/self/maps` and `/dev/urandom`. Such
+  a Python, and the distribution's, start under every pack with no
+  refusal.
+
+  **Upgrading:** each directory a pack lets the agent write must also be
+  writable by the agent's user (`varek run` runs it as `nobody` unless
+  told otherwise). A write the policy allows into a directory that user
+  cannot write fails with the kernel's `EACCES`, recorded.
+
 ### Fixed
 
 - The run CA's name constraints (`proxy_ca.c`) are assembled with each

@@ -36,9 +36,11 @@
 # x.pem.bak and an id_rsa outside a .ssh directory were allowed; from v1.21
 # they spell each letter as a class of both cases and also match a name that
 # continues after the extension with a dot or a ~ (see the rules). The
-# agent cannot rename files or create links (those syscalls are refused when
-# the Warden enforces), so it cannot give an existing file a name these rules
-# miss; files it creates in its own scratch space are covered by the same rules.
+# agent cannot create links (those syscalls are refused when the Warden
+# enforces), and a rename is decided on both of its names (from v1.41, under
+# `require warden 1.29`; before, refused), so it cannot give an existing file
+# a name these rules miss; files it creates in its own scratch space are
+# covered by the same rules.
 #
 # `require warden 1.27` (v1.40): an older Warden refuses this file. From
 # 1.27 the exec rules below decide every launch after the agent's own
@@ -48,7 +50,22 @@
 # the run starts, and the agent's program and its standard input must not be
 # in one. Under 1.14 every launch after the agent's own was refused,
 # whatever these rules said.
-require warden 1.27
+#
+# `require warden 1.29` (v1.41; v1.40 said 1.27):
+#   * Files are opened as the agent's own user and groups, not as root: a
+#     directory below that the agent may write must also be writable by the
+#     agent's user (`varek run` runs it as nobody unless told otherwise), or
+#     the write fails with the kernel's EACCES, recorded.
+#   * A change by name in a directory the agent may write (remove, rename,
+#     make a directory, change a mode or a time, truncate) is decided as a
+#     write on every name it touches, and carried out as the agent; before,
+#     each was refused. Removal is decided as truncation is: a rule that lets
+#     the agent rewrite a file lets it remove it. Links stay refused.
+#   * The legacy stat(2) and lstat(2) are decided like a read-only open:
+#     a program built against a glibc before 2.33, or against musl, finds
+#     its files with them (a Python from python-build-standalone, which uv
+#     installs, could not start under 1.27).
+require warden 1.29
 
 # --- Denied even under an allowed tree (evaluated first) ----------------------
 deny  path /var/lib/ledger/keys/           # settlement / signing keys — never
@@ -116,6 +133,22 @@ allow path exact /usr/bin/lib64 readonly        # Python on RHEL and Amazon Linu
 allow path /usr/bin/lib64/ readonly              # os.py, os.pyc, lib-dynload looked for here first (absent)
 allow path /usr/local/lib/ readonly              # packages installed for every user (pip without --user)
 allow path /usr/local/lib64/ readonly            # ... on RHEL, Fedora and Amazon Linux
+# v1.41: the same for a Python installed in /usr/local (a container image's,
+# or python-build-standalone's), and what such a Python reads of its own
+# process as it starts
+allow path glob /usr/local/bin/python3* readonly # its program and links
+allow path exact /usr/local/bin/pyvenv.cfg readonly   # a virtual environment? (absent)
+allow path exact /usr/local/pyvenv.cfg readonly
+allow path exact /usr/local/bin/pybuilddir.txt readonly   # a build tree's marker (absent)
+allow path exact /usr/local/bin/lib readonly     # a build tree's library (absent)
+allow path /usr/local/bin/lib/ readonly
+allow path exact /usr/local/bin/Modules readonly # a build tree's other marker (absent)
+allow path /usr/local/bin/Modules/ readonly
+allow path exact /usr/local/bin/lib64 readonly   # its library in lib64 (absent)
+allow path /usr/local/bin/lib64/ readonly
+allow path exact /proc/self/exe readonly         # its own program, to find its home
+allow path exact /proc/self/maps readonly        # its own memory map
+allow path exact /dev/urandom readonly           # random bytes
 allow path exact /tmp/varek readonly             # the scratch directory itself (its rule above covers what is in it)
 
 # --- Programs the agent may launch --------------------------------------------

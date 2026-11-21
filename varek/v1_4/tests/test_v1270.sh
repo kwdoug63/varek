@@ -110,7 +110,7 @@ launches "require warden 1.27"                 "require warden 1.27\n$X"        
 launches "1.27 with no exec rule"              'require warden 1.27\n'                 on
 launches "1.26, then 1.27"                     "require warden 1.26\nrequire warden 1.27\n$X" on
 launches "1.27, then 1.24 (the highest holds)" "require warden 1.27\nrequire warden 1.24\n$X" on
-# v1.40: the shipped packs say require warden 1.27, so their exec rules decide
+# v1.40: the shipped packs say require warden 1.27 (v1.41: 1.29), so their exec rules decide
 # launches after the agent's own (both parsers agree); the cybersecurity pack
 # names no shell and no interpreter, only yara
 packs=0 packs_on=0
@@ -120,7 +120,7 @@ for f in "$HERE"/policies/*.txt; do
         packs_on=$((packs_on + 1))
 done
 if [ "$packs" -gt 0 ] && [ "$packs" = "$packs_on" ]; then
-    pass "every shipped policy pack ($packs) decides launches (require warden 1.27)"
+    pass "every shipped policy pack ($packs) decides launches (require warden 1.27 or later)"
 else flunk "every shipped policy pack decides launches ($packs_on of $packs)"; fi
 check "the cybersecurity pack launches yara alone: no shell, no interpreter" sh -c \
     "[ \"\$(grep -c '^allow exec ' '$HERE/policies/cybersecurity.policy.txt')\" = 1 ] &&
