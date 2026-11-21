@@ -395,3 +395,76 @@ def test_a_python_agent_starts_under_each_pack_refused_nothing(tmp_path, pack):
     for x in refused:                                    # each in full (pytest shortens the assertion's list)
         print("refused:", *x)
     assert not refused, f"{pack}: the start-up reads refused: {refused}"
+
+
+@needs_runtime
+@pytest.mark.skipif(not os.path.exists("/usr/bin/python3"), reason="no /usr/bin/python3")
+@pytest.mark.parametrize("pack", PACKS)
+def test_each_pack_decides_changes_and_the_legacy_stat_as_the_agent(tmp_path, pack):
+    # v1.41: the packs say `require warden 1.29`. Under it (a) the legacy
+    # stat(2)/lstat(2) are decided like a read-only open (a Python built
+    # against a glibc before 2.33, as python-build-standalone's, finds its
+    # library with them, and could not start under 1.27); (b) a change by
+    # name is decided as a write on every name it touches: a rename within the
+    # scratch space is allowed, a rename to a name a deny rule covers (x.pem)
+    # is refused, a removal is allowed, a link stays refused; (c) files are
+    # opened as the agent's user, so a directory the policy lets it write but
+    # its user cannot is refused by the kernel (EACCES).
+    import pwd
+    import shutil
+    import uuid
+    nobody = pwd.getpwnam("nobody")
+    os.makedirs("/tmp/varek", exist_ok=True)
+    mine = f"/tmp/varek/t-{uuid.uuid4().hex[:8]}"        # the agent's own
+    roots = mine + "-root"                               # root's, 0755
+    os.makedirs(mine)
+    os.chown(mine, nobody.pw_uid, nobody.pw_gid)
+    os.makedirs(roots, mode=0o755)
+    agent = f"""
+import ctypes, json, os, platform
+mine, roots = {mine!r}, {roots!r}
+out = {{}}
+def tried(name, f):
+    try:
+        f(); out[name] = 0
+    except OSError as e:
+        out[name] = e.errno
+if platform.machine() == "x86_64":
+    libc = ctypes.CDLL(None, use_errno=True)
+    buf = ctypes.create_string_buffer(256)
+    for nr, call in ((4, "stat"), (6, "lstat")):
+        r = libc.syscall(nr, b"/usr/lib", buf)
+        out[call] = 0 if r == 0 else ctypes.get_errno()
+tried("write", lambda: open(mine + "/a", "w").write("x"))
+tried("rename", lambda: os.rename(mine + "/a", mine + "/b"))
+tried("rename_to_pem", lambda: os.rename(mine + "/b", mine + "/b.pem"))
+tried("link", lambda: os.link(mine + "/b", mine + "/c"))
+tried("unlink", lambda: os.unlink(mine + "/b"))
+tried("write_roots", lambda: open(roots + "/a", "w").write("x"))
+print(json.dumps(out))
+"""
+    log = tmp_path / "run.log"
+    env = dict(os.environ, NO_COLOR="1", VAREK_CONFIG=str(tmp_path / "none.conf"), HOME="/tmp/varek")
+    try:
+        r = subprocess.run([sys.executable, VAREK, "run", "--policy",
+                            os.path.join(HERE, "policies", f"{pack}.policy.txt"), "--log", str(log),
+                            "--", "/usr/bin/python3", "-c", agent],
+                           cwd="/tmp/varek", stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env,
+                           timeout=120)
+        assert r.returncode == 0, r.stdout + r.stderr
+        got = json.loads([x for x in r.stdout.splitlines() if x.startswith("{")][-1])
+        import errno
+        want = {"write": 0, "rename": 0, "rename_to_pem": errno.EACCES, "link": errno.EPERM, "unlink": 0,
+                "write_roots": errno.EACCES}
+        if os.uname().machine == "x86_64":
+            want.update(stat=0, lstat=0)
+        assert got == want, got
+        recs = [json.loads(x) for x in log.read_text().splitlines() if x.startswith("{")]
+        acts = {(x.get("action"), x.get("decision_final")) for x in recs}
+        assert ("file.rename_to", "ALLOW") in acts and ("file.unlink", "ALLOW") in acts
+        assert any(x.get("action") == "file.rename_to" and x.get("decision_final") == "DENY"
+                   and str(x.get("target", "")).endswith("b.pem") for x in recs)   # refused, and recorded
+        assert not os.path.exists(mine + "/b.pem") and not os.path.exists(roots + "/a")
+    finally:
+        shutil.rmtree(mine, ignore_errors=True)
+        shutil.rmtree(roots, ignore_errors=True)
