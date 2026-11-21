@@ -68,6 +68,16 @@ static int add_ext(X509 *cert, X509V3_CTX *ctx, int nid, const char *value) {
     return ok ? 0 : -1;
 }
 
+/* Append part and name to buf (cap bytes) at *off. 0, or -1 when they do
+ * not fit whole: nothing is then written at or past cap, and *off stays. */
+static int nc_add(char *buf, size_t cap, size_t *off, const char *part, const char *name) {
+    if (*off >= cap) return -1;
+    int r = snprintf(buf + *off, cap - *off, "%s%s", part, name);
+    if (r < 0 || (size_t)r >= cap - *off) return -1;
+    *off += (size_t)r;
+    return 0;
+}
+
 int pca_make_ca(pca_t *c, const char *run_id, char *const *names, size_t n, char *const *excl, size_t nx,
                 long valid_s,
                 char *why, size_t wn) {
@@ -118,14 +128,22 @@ int pca_make_ca(pca_t *c, const char *run_id, char *const *names, size_t n, char
     for (size_t i = 0; i < nx; i++) cap += strlen(excl[i]) + 16;
     char *nc = malloc(cap);
     if (!nc) { snprintf(why, wn, "out of memory"); return -1; }
-    size_t off = (size_t)snprintf(nc, cap, "critical");
-    for (size_t i = 0; i < n; i++) off += (size_t)snprintf(nc + off, cap - off, ",permitted;DNS:%s", names[i]);
-    if (n == 0) off += (size_t)snprintf(nc + off, cap - off, ",permitted;DNS:invalid");
+    size_t off = 0;
+    int full = nc_add(nc, cap, &off, "critical", "");
+    for (size_t i = 0; i < n; i++) full |= nc_add(nc, cap, &off, ",permitted;DNS:", names[i]);
+    if (n == 0) full |= nc_add(nc, cap, &off, ",permitted;DNS:", "invalid");
     /* review: constraints bind only the name types they name, so a leaf for
      * an IP address would not be constrained: exclude every one; and the
      * passthrough hosts, which a wildcard's suffix permits */
-    for (size_t i = 0; i < nx; i++) off += (size_t)snprintf(nc + off, cap - off, ",excluded;DNS:%s", excl[i]);
-    snprintf(nc + off, cap - off, ",excluded;IP:0.0.0.0/0.0.0.0,excluded;IP:::/::");
+    for (size_t i = 0; i < nx; i++) full |= nc_add(nc, cap, &off, ",excluded;DNS:", excl[i]);
+    full |= nc_add(nc, cap, &off, ",excluded;IP:0.0.0.0/0.0.0.0,excluded;IP:::/::", "");
+    if (full) {
+        /* cap is sized for every part, so this is not expected; were it
+         * ever short, a truncated list could drop a constraint: no CA */
+        free(nc);
+        snprintf(why, wn, "the CA's name constraints do not fit");
+        return -1;
+    }
     int bad = add_ext(x, &ctx, NID_basic_constraints, "critical,CA:TRUE,pathlen:0") ||
               add_ext(x, &ctx, NID_key_usage, "critical,keyCertSign,cRLSign") ||
               add_ext(x, &ctx, NID_subject_key_identifier, "hash") ||

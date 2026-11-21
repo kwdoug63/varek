@@ -7,6 +7,7 @@
 [![Runtime](https://img.shields.io/badge/runtime-v1.40.0-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/16965/badge)](https://www.bestpractices.dev/projects/16965)
 
 > **Reporting vulnerabilities:** [private vulnerability reporting](https://github.com/kwdoug63/varek/security/advisories/new) or [SECURITY.md](./SECURITY.md). Do not open public issues.
 

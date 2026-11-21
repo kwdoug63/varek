@@ -10,6 +10,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Added
+
 - **CrowdStrike Falcon Next-Gen SIEM export, against a stand-in** (v1.41,
   `docs/security/v1.39-security-operations.md`, section 4a; not yet
   tested in a Falcon tenant). `varek export --format falcon [LOG]` sends
@@ -21,6 +22,22 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `FALCON_HEC_URL`), its API key from the environment (`FALCON_HEC_API_KEY`,
   never the command line). A busy connector is retried, a batch too large
   split, and any other refusal ends the export with exit 1.
+- The README shows the OpenSSF Best Practices badge (passing, project
+  16965, https://www.bestpractices.dev/projects/16965).
+- `make test-proxy-ca` (in CI): the run CA's name constraints under ASan and
+  UBSan, every permitted and excluded name kept, up to 256 names of 253
+  characters each way.
+
+### Fixed
+
+- The run CA's name constraints (`proxy_ca.c`) are assembled with each
+  part's length checked: a buffer too short for them now refuses to make the
+  CA, where the unchecked appends would have written past its end (CodeQL,
+  "potentially overflowing call to snprintf"). The buffer is sized for every
+  part, so no run reached this; the proxy's behavior is unchanged.
+- The bench clients (`tools/bench_proxy_client.py`,
+  `tools/bench_mcp_client.py`) state TLS 1.2 as their minimum rather than
+  relying on the Python default.
 
 ## [1.40.0] - 2026-11-20 — security operations: Microsoft Sentinel
 

@@ -68,6 +68,7 @@ def main():
     n, warmup, sizes = int(sys.argv[4]), int(sys.argv[5]), [int(x) for x in sys.argv[6:]]
     addr = socket.getaddrinfo(addr or name, port, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
     ctx = ssl.create_default_context(cafile=None if cafile == "default" else cafile)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2           # stated, not left to the default
 
     def connect():
         s = socket.create_connection((addr, port), 30)
