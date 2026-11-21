@@ -114,6 +114,8 @@ jobs:
         run: sudo make -C varek/v1_4 test-v1290
       - name: v1.31 the strict JSON parser for MCP calls under ASan/UBSan (vectors, then 1M mutated inputs)
         run: make -C varek/v1_4 test-mcp-json
+      - name: The run CA's name constraints under ASan/UBSan (every name kept, up to 256 of 253 characters)
+        run: make -C varek/v1_4 test-proxy-ca
       - name: v1.31 standards (the grammar; confined MCP servers; MCP calls over HTTP; MCP tokens; the OCSF export; audit and tools)
         run: sudo make -C varek/v1_4 test-v1310
       - name: v1.30 the Warden on this architecture (open flags in VAREK's encoding, flag clauses in a run, run_start's arch)

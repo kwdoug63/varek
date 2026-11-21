@@ -24,6 +24,7 @@ tests/v1281_sub
 tests/test_node_json
 tests/v1310_peek
 tests/mcp_json_test
+tests/proxy_ca_test
 tests/v1290_open
 tests/v1290_lat
 tests/v1300_oflags

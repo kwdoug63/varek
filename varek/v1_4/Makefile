@@ -543,6 +543,14 @@ tests/mcp_json_test: tests/mcp_json_test.c mcp_json.c mcp_json.h
 test-mcp-json: tests/mcp_json_test
 	@./tests/mcp_json_test $(MJ_N)
 
+# The run CA's name constraints (proxy_ca.c), under ASan and UBSan: every
+# permitted and excluded name kept, up to PCA_MAX_NAMES of 253 characters
+tests/proxy_ca_test: tests/proxy_ca_test.c proxy_ca.c proxy_ca.h
+	$(CC) -O1 -g -std=gnu11 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=all -o $@ tests/proxy_ca_test.c proxy_ca.c -lssl -lcrypto
+
+test-proxy-ca: tests/proxy_ca_test
+	@./tests/proxy_ca_test
+
 # v1.26 step 5: the proxy's parsers, under ASan and UBSan: the vectors, then
 # FUZZ_N mutated inputs (make fuzz-proxy-parse FUZZ_N=50000000 for longer).
 FUZZ_N ?= 2000000
@@ -599,7 +607,7 @@ run-conformance: warden target_conformance
 	@sudo ./warden conformance_policy.txt -- $(abspath target_conformance)
 
 clean:
-	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared tests/proxy_parse_test tests/proxy_parse_fuzzer tests/v1281_sub tests/v1290_open tests/v1290_lat tests/v1310_peek tests/v1300_oflags tests/test_node_json varek-init varek-nri varek-admission varek-svid
+	rm -f $(BINS) target_conformance bench.log tests/lifecycle_target tests/test_v193_lifecycle tests/v112_probe tests/v1121_probe tests/v1122_probe tests/v1123_probe tests/v1130_probe tests/v1140_probe tests/v1150_probe tests/v1160_probe tests/v1170_probe tests/v1180_probe tests/v1210_probe tests/v1210_bench warden_faultinject tests/test_v14_filter tests/test_v1240_resolve tests/test_v1250_shared tests/proxy_parse_test tests/proxy_parse_fuzzer tests/v1281_sub tests/v1290_open tests/v1290_lat tests/v1310_peek tests/v1300_oflags tests/test_node_json tests/proxy_ca_test varek-init varek-nri varek-admission varek-svid
 
 # v1.22: install the runtime and the `varek` command.
 #   sudo make install                  -> /opt/varek, plus /usr/local/bin/varek
