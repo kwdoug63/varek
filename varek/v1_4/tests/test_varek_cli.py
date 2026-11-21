@@ -468,3 +468,46 @@ print(json.dumps(out))
     finally:
         shutil.rmtree(mine, ignore_errors=True)
         shutil.rmtree(roots, ignore_errors=True)
+
+
+@needs_runtime
+def test_doctor_and_run_warn_of_a_writable_directory_the_agents_user_cannot_write(tmp_path):
+    # v1.41: under `require warden 1.29` (the packs' since v1.41) files are
+    # opened as the agent's user, so a directory the policy lets the agent
+    # write must be writable by that user, or the kernel refuses the write.
+    # `varek doctor` and `varek run` say which are not (or are not there),
+    # and how to fix each; under 1.28 (opened as root) they say nothing.
+    import pwd
+    import shutil
+    import uuid
+    nobody = pwd.getpwnam("nobody")
+    base = f"/tmp/varek-writes-{uuid.uuid4().hex[:8]}"    # 0755 to the top, so nobody can reach it
+    dirs = {k: os.path.join(base, k) for k in ("roots", "mine", "group", "gone")}
+    os.makedirs(dirs["roots"], mode=0o755)
+    os.makedirs(dirs["mine"])
+    os.chown(dirs["mine"], nobody.pw_uid, -1)
+    os.makedirs(dirs["group"])
+    os.chown(dirs["group"], 0, nobody.pw_gid)
+    os.chmod(dirs["group"], 0o775)
+    os.chmod(base, 0o755)
+    rules = "".join(f"allow path {d}/\n" for d in dirs.values())
+    try:
+        for req, warned in (("1.29", True), ("1.28", False)):
+            pol = tmp_path / f"p{req}.policy.txt"
+            pol.write_text(f"require warden {req}\n" + rules)
+            conf = str(tmp_path / req / "etc" / "varek.conf")
+            varek("init", "--pack", str(pol), "--log-dir", str(tmp_path / req / "log"), config=conf, check=0)
+            doc = varek("doctor", config=conf)
+            run = varek("run", "--", "/bin/true", config=conf)   # its warning comes before the agent starts
+            for out in (doc.stdout + doc.stderr, run.stdout + run.stderr):
+                said = [ln for ln in out.splitlines() if base in ln and "WARN" in ln]
+                if not warned:
+                    assert not said, out
+                    continue
+                assert len(said) == 2, out
+                assert any(dirs["roots"] + " (policy line 2) is not writable by the agent's user nobody" in ln
+                           for ln in said), out
+                assert any(dirs["gone"] + " (policy line 5) does not exist" in ln for ln in said), out
+                assert f"chown nobody {dirs['roots']}" in out and f"install -d -o nobody {dirs['gone']}" in out
+    finally:
+        shutil.rmtree(base, ignore_errors=True)

@@ -794,6 +794,10 @@ def cmd_doctor(args):
                         fail(text)
                         hint("a confined subject's file must be root's, written by no one else, and its pin current")
                         bad += 1
+                # v1.41: the directories the agent may write, writable by its user
+                for text, fix in check_agent_writes(cfg["policy"], cfg["run_as"]):
+                    warn(text)
+                    hint(fix)
                 # v1.28: each credential the policy names can be fetched
                 names = policy_credential_names(cfg["policy"])
                 if names and os.geteuid() != 0:
@@ -1810,6 +1814,11 @@ def cmd_run(args):
             require_entitlement(policy)
         run_as = args.run_as or cfg["run_as"] or "nobody"
         label = pack_summary(policy) or os.path.basename(policy)
+        # v1.41: under `require warden 1.29` the agent's user must be able to
+        # write where the policy lets it (a warning: the run goes ahead)
+        for text, fix in check_agent_writes(policy, run_as):
+            warn(text)
+            hint(fix)
     # v1.32: in a container, refused here, before the agent starts, if the
     # container cannot carry this run, with the flag that grants what it lacks
     if varek_container.in_container():
@@ -2060,6 +2069,76 @@ def policy_servers(path):
         elif len(f) == 3 and f[0] == "for" and f[1].isdigit() and f[2].isdigit():
             forl[int(f[1])] = int(f[2])
     return subs, forl
+
+
+def _writable_dirs(policy):
+    """v1.41: the directories a policy lets the agent write, as the Warden
+    reads it on this host (`warden POLICY --check-startup`, its noexec list):
+    [(directory, policy line, exists)]; [] if the Warden cannot say"""
+    try:
+        r = subprocess.run([warden_bin(), policy, "--check-startup"], capture_output=True, text=True,
+                           timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    out = []
+    for ln in r.stderr.splitlines():
+        m = re.match(r"\[warden\]   noexec (.+?)( \(not there;[^)]*\))? \(line (\d+)\)$", ln)
+        if m:
+            out.append((m.group(1), int(m.group(3)), m.group(2) is None))
+    return out
+
+
+def _can_write_as(pw, path):
+    """v1.41: may this user make and change files in the directory, as the
+    kernel judges it (owner, mode, groups, ACLs, a read-only mount)? Asked in
+    a child that takes the user's ids and groups. None if it cannot be asked
+    (not root)."""
+    if os.geteuid() != 0:
+        return None
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setgroups(os.getgrouplist(pw.pw_name, pw.pw_gid))
+            os.setgid(pw.pw_gid)
+            os.setuid(pw.pw_uid)
+            os._exit(0 if os.access(path, os.W_OK | os.X_OK) else 1)
+        except BaseException:
+            os._exit(2)
+    _, status = os.waitpid(pid, 0)
+    code = os.waitstatus_to_exitcode(status)
+    return True if code == 0 else False if code == 1 else None
+
+
+def check_agent_writes(policy, run_as):
+    """v1.41: under `require warden 1.29` (the sector packs' since v1.41) the
+    Warden opens files as the agent's own user, so a directory the policy
+    lets the agent write must also be writable by that user, or the kernel
+    refuses the write (EACCES), recorded. [(text, fix)] for each directory
+    that is not there or not writable so; [] if files are opened as root
+    (an earlier `require`, or a root agent)."""
+    import pwd
+    oq = run_cmd([tool("vdp_check"), policy, "openas"], capture=True, check=False)
+    if oq.returncode != 0 or oq.stdout.strip() != "on":
+        return []
+    try:
+        pw = pwd.getpwnam(run_as)
+    except KeyError:
+        return []
+    if pw.pw_uid == 0:
+        return []
+    out = []
+    for d, line, there in _writable_dirs(policy):
+        q = shlex.quote(d)
+        if not there:
+            out.append((f"{d} (policy line {line}) does not exist: the agent's opens under it are refused",
+                        f"make it the agent's: install -d -o {run_as} {q}"))
+        elif _can_write_as(pw, d) is False:
+            out.append((f"{d} (policy line {line}) is not writable by the agent's user {run_as}: the policy "
+                        f"allows writes there, but the Warden opens files as {run_as}, and the kernel refuses "
+                        f"them (EACCES)",
+                        f"chown {run_as} {q}, or give one of {run_as}'s groups write access "
+                        f"(chgrp GROUP {q} && chmod g+w {q}), or setfacl -m u:{run_as}:rwx {q}"))
+    return out
 
 
 def check_server_files(path):
