@@ -210,6 +210,30 @@ MIT · github.com/kwdoug63/varek
     exporter's log;
   - 8 VAREK containers, none restarted;
   - the node agent's memory flat.
+- **24 hours on the tagged code** (`5808933`), November 20 to 21, 2026,
+  from 12:26 PM CST, two EC2 `t3.medium` instances (Ubuntu 24.04,
+  us-east-1) side by side. Each one's short trial passed first.
+  - **The shared soak** (`tests/soak_shared/soak.sh`), on a host running
+    nothing else under the Warden: `soak_check: PASS`.
+
+    | | |
+    |---|---|
+    | Duration | 24.0 h, a turn every 60 s: 1,440 turns in each run; Warden 1.40.0 (x86-64) |
+    | Run A | every task before the user's token expired worked (`tools/list` 259, `tools/call` 258, `fs` reads 258, `gh`'s calls 258, sub-agent launches 258); 144 probes, all held; the run revoked 0.01 s after the expiry, no turn after it working (5); 258 requests carried the credential, 0 swaps refused; the remote MCP server's 775 requests, 0 errors; the audit passing; OCSF: 11,719 events followed, 11,718 of them the stream's (14,405 records, the chain intact), all valid OCSF 1.9.0 |
+    | Run B (the baseline, with its git rules) | 1,296 of 1,296 pieces of work done, 288 git commits; 144 probes, all refused; the stream signed (436,188 records), the audit passing |
+    | Run C (dry run) | 1,440 of 1,440 done; 4,324 calls the narrower policy refuses let through and recorded; the audit (463,655 records): `VERIFIED: DRY RUN, NOT ENFORCED`; `varek policy suggest`: 39 exact rules; under the draft, 12 of 12 done and nothing let through |
+    | The Warden's decisions | the agent's MCP calls p50 18 µs (p99 36); `gh`'s MCP calls p50 19 µs (p99 62); the agent's opens p50 58 µs (p99 1,144); `fs`'s opens p50 193 µs (p99 1,939) |
+    | Memory | each Warden 12.5 to 12.8 MB at the start and 12.7 to 13.0 MB at most; the proxy, `warden-secrets` and the two MCP servers 8.7 to 21.0 MB, flat (144 samples each); no swap used |
+
+  - **The sector packs and the export** (a loop written for this
+    release): every minute, a Python agent under the next of the five
+    packs wrote a file in its scratch directory and read `/etc/shadow`.
+    `packloop: PASS`: 1,440 runs, 288 under each pack, every one as
+    expected:
+    - exactly one refusal, `/etc/shadow`, and none at start-up;
+    - the OCSF export passing its audit;
+    - `--from-position` at the middle event giving exactly the full
+      export's events from there.
 - **v1.39.1's license check:** `tests/test_varek_license.py`, with and
   without an instance metadata service answering
   (`RELEASE-v1.39.1.md`).

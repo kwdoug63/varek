@@ -94,7 +94,11 @@ fails partway sends the rest with `--from-position`. The sector packs
 decide program launches and start an agent with no refusals. CrowdStrike
 Falcon and Wiz, each waiting on its partner program's tenant, move to
 v1.41.0. Includes v1.39.1, never tagged on its own. The Warden's code is
-unchanged; the policy grammar stays 1.35 (`RELEASE-v1.40.0.md`).
+unchanged; the policy grammar stays 1.35 (`RELEASE-v1.40.0.md`). The
+24-hour soak passed on the tagged code, November 20 to 21, 2026, on two
+EC2 instances (Ubuntu 24.04): the shared soak, `soak_check: PASS`, every
+probe held or refused, memory flat; and 1,440 runs under the five sector
+packs, each with its one refusal, its export audited and resumed.
 
 ### Added
 - **Microsoft Sentinel export** (v1.40, `docs/security/v1.39-security-operations.md`,
