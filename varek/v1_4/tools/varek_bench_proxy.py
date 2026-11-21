@@ -101,9 +101,14 @@ def compose_policy(mode, port, bench_dir, cred_file=None):
     """The policy of a run under the Warden: the proxy on (SNI mode) or
     inspecting, the bench's name, in inspecting mode a request rule for
     /ok, a deny rule for /denied and (v1.28) a rule for /cred carrying the
-    credential from cred_file, and read-only paths for Python."""
+    credential from cred_file, and read-only paths for Python.
+
+    v1.41: `require warden 1.29` in both modes (was 1.26 and 1.28), so the
+    legacy stat(2) and lstat(2) are decided, not refused: a Python built
+    against a glibc before 2.33 (python-build-standalone, which uv installs)
+    calls them to find its standard library, and could not start."""
     lines = ["# varek bench --proxy: the bench's own rules only",
-             "require warden 1.28" if mode == "inspect" else "require warden 1.26",
+             "require warden 1.29",
              "proxy inspect" if mode == "inspect" else "proxy on",
              f"proxy ports {port}",
              f"allow host {NAME}:{port}"]

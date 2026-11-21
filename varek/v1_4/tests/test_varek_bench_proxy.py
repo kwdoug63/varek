@@ -8,6 +8,7 @@ host's own other than loopback.
 """
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -87,7 +88,10 @@ def test_policies_name_the_mode_and_the_request_rules():
     assert "allow path /tmp/x/ readonly" in insp
     # v1.28: the credential, and the rule that carries it, in inspecting mode only
     insp = bp.compose_policy("inspect", 4433, "/tmp/x", "/run/b/credential.key")
-    assert "require warden 1.28\n" in insp and "credential bench from file:/run/b/credential.key\n" in insp
+    assert "credential bench from file:/run/b/credential.key\n" in insp
+    # v1.41: 1.29 in both modes, so the legacy stat(2) and lstat(2) are decided
+    # (a Python built against a glibc before 2.33 calls them at its start)
+    assert "require warden 1.29\n" in insp and "require warden 1.29\n" in sni
     assert "allow request GET https://bench.example.com:4433/cred credential=bench header=Authorization:Bearer" in insp
     assert "credential" not in sni
 
@@ -249,3 +253,41 @@ def test_checks_fail_on_a_credential_not_carried_or_a_swap_refused():
     recs = recs_for("inspect", 5) + [{"event": "credential_refused", "credential": "bench"}]
     assert [c for c, ok, _ in bp.check_mode("inspect", run_for("inspect", 5), recs, 5, 0) if not ok] == \
         ["inspect: no swap refused"]
+
+
+@pytest.mark.skipif(os.uname().machine != "x86_64", reason="the legacy stat(2) and lstat(2) are x86-64's")
+@needs_runtime
+def test_the_bench_policy_decides_the_legacy_stat(tmp_path):
+    # v1.41: a Python built against a glibc before 2.33 (python-build-standalone,
+    # which uv installs) finds its standard library with the legacy stat(2);
+    # under the bench's policy (then `require warden 1.26`) that was refused
+    # before any decision, unlogged, and the agent could not start. Under 1.29
+    # each is decided like a read-only open: allowed where the policy reads,
+    # refused (EACCES, logged) elsewhere.
+    d = str(tmp_path / "bench")
+    os.makedirs(d)
+    os.chmod(str(tmp_path), 0o755)
+    os.chmod(d, 0o755)
+    policy = str(tmp_path / "p.txt")
+    with open(policy, "w") as fh:
+        fh.write(bp.compose_policy("sni", 4443, d))
+    agent = ("import ctypes, os\n"
+             "libc = ctypes.CDLL(None, use_errno=True)\n"
+             "buf = ctypes.create_string_buffer(256)\n"
+             "for nr, path in ((4, b'/usr/lib'), (6, b'/usr/lib'), (4, b'/root/.profile')):\n"
+             "    r = libc.syscall(nr, path, buf)\n"
+             "    print(nr, path.decode(), r, ctypes.get_errno() if r else 0)\n")
+    python = shutil.which("python3", path="/usr/bin:/bin") or sys.executable
+    log = str(tmp_path / "verdicts.log")
+    with open(log, "w") as err:
+        r = subprocess.run([os.path.join(HERE, "warden"), policy, "--run-as", "nobody", "--",
+                            python, "-c", agent], stdout=subprocess.PIPE, stderr=err, text=True,
+                           timeout=120, env={"PATH": "/usr/bin:/bin"})
+    text = open(log).read()
+    assert r.returncode == 0, r.stdout + text[-2000:]
+    got = [ln.split() for ln in r.stdout.splitlines()]
+    assert got == [["4", "/usr/lib", "0", "0"], ["6", "/usr/lib", "0", "0"],
+                   ["4", "/root/.profile", "-1", "13"]], r.stdout       # 13: EACCES, decided; not EPERM
+    recs = [json.loads(ln) for ln in text.splitlines() if ln.startswith("{")]
+    assert any(x.get("action") == "file.stat" and x.get("target") == "/root/.profile"
+               and x.get("decision_final") == "DENY" for x in recs)    # the refusal is in the record

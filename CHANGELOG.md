@@ -38,6 +38,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - The bench clients (`tools/bench_proxy_client.py`,
   `tools/bench_mcp_client.py`) state TLS 1.2 as their minimum rather than
   relying on the Python default.
+- **`varek bench --proxy` with a Python built against a glibc before
+  2.33.** Such a Python (python-build-standalone, which uv installs) finds
+  its standard library with the legacy `stat(2)`. The Warden decides that
+  call only under `require warden 1.29`, and the bench's policies said 1.26
+  (SNI mode) and 1.28 (inspecting), so the call was refused before any
+  decision, unrecorded, and the agent could not start ("Fatal Python
+  error"). Both now say 1.29. A test makes the legacy `stat(2)` and
+  `lstat(2)` calls directly under the bench's policy (x86-64): allowed where
+  the policy reads, refused and recorded elsewhere.
 
 ## [1.40.0] - 2026-11-20 — security operations: Microsoft Sentinel
 
