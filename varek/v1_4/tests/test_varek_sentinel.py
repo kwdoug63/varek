@@ -95,8 +95,9 @@ def test_the_rules_judge_each_row_when_it_arrives():
     # looks back 2 days or more runs hourly at most. The arrival window is a
     # minute wider than the rule's period (November 20's live test): Sentinel's
     # runs are not exactly 5 minutes apart, and a 5-minute window left a row
-    # between two runs unjudged whenever they were further apart; a row in the
-    # overlap raises a second alert, grouped into the same incident.
+    # between two runs unjudged whenever they were further apart. A row is
+    # judged by two or three runs (November 21's: Sentinel measures ago() from
+    # about 5 minutes before the run), each alert grouped into the run's incident.
     content = json.load(open(os.path.join(SENTINEL, "sentinel-content.json")))
     rules = [r["properties"] for r in content["resources"] if r.get("kind") == "Scheduled"]
     assert len(rules) == 3
@@ -109,7 +110,7 @@ def test_the_rules_judge_each_row_when_it_arrives():
         assert last.startswith(("| summarize TimeGenerated = max(TimeGenerated),", "| project TimeGenerated,")), \
             (r["displayName"], last)
         inc = r["incidentConfiguration"]
-        if inc["createIncident"]:          # a second alert for a run joins its run's incident
+        if inc["createIncident"]:          # a run's repeated alerts join its run's incident
             g = inc["groupingConfiguration"]
             assert g["enabled"] is True and "RunId" in g["groupByCustomDetails"], r["displayName"]
     assert sum(r["incidentConfiguration"]["createIncident"] for r in rules) == 2   # the dry run's: no incident
