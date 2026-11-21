@@ -47,6 +47,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   error"). Both now say 1.29. A test makes the legacy `stat(2)` and
   `lstat(2)` calls directly under the bench's policy (x86-64): allowed where
   the policy reads, refused and recorded elsewhere.
+- `tests/test_v1260.sh`: the captures of real clients' ClientHellos wait
+  for their listener. It slept 0.3 s on a random port, and under the node
+  agent a listener could take longer to start, so the client was refused and
+  the capture left empty ("a curl ClientHello", once on arm64). The listener
+  now takes a free port and names it once it is listening.
 
 ## [1.40.0] - 2026-11-20 — security operations: Microsoft Sentinel
 

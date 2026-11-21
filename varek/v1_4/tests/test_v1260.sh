@@ -452,13 +452,19 @@ else
     check "the parsers' vectors (ASan, UBSan)" "$PPT" unit
     check "200,000 fuzzed inputs, no fault (ASan, UBSan)" "$PPT" fuzz 100000 "$RANDOM"
     # Real clients' first flights, captured by a listener that answers nothing
+    # The listener takes a free port and names it in $out.port once it is
+    # listening; the command runs only then. (It slept 0.3 s on a random
+    # port: under the node agent a listener can take longer to start, and
+    # the client, refused, left the capture empty.)
     capture() {   # capture <out> <command...> (the command connects to 127.0.0.1:$CP)
         local out="$1"; shift
-        CP=$((30000 + RANDOM % 20000))
-        python3 - "$CP" "$out" <<'PY' &
-import socket, sys, time
-l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-l.bind(("127.0.0.1", int(sys.argv[1]))); l.listen(1); l.settimeout(10)
+        rm -f "$out.port"
+        python3 - "$out" <<'PY' &
+import os, socket, sys, time
+l = socket.socket(); l.bind(("127.0.0.1", 0)); l.listen(1); l.settimeout(10)
+with open(sys.argv[1] + ".port.tmp", "w") as f:
+    f.write(str(l.getsockname()[1]))
+os.rename(sys.argv[1] + ".port.tmp", sys.argv[1] + ".port")
 c, _ = l.accept(); c.settimeout(1); d = b""; t = time.time()
 while time.time() - t < 2:
     try:
@@ -467,10 +473,11 @@ while time.time() - t < 2:
         d += x
     except socket.timeout:
         break
-open(sys.argv[2], "wb").write(d)
+open(sys.argv[1], "wb").write(d)
 PY
-        local lp=$!
-        sleep 0.3
+        local lp=$! i
+        for i in $(seq 100); do [ -s "$out.port" ] && break; sleep 0.1; done
+        CP=$(cat "$out.port" 2>/dev/null)
         CP=$CP "$@" > /dev/null 2>&1 &
         local cp=$!
         wait "$lp"; kill "$cp" 2>/dev/null; wait "$cp" 2>/dev/null
