@@ -54,7 +54,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   **Upgrading:** each directory a pack lets the agent write must also be
   writable by the agent's user (`varek run` runs it as `nobody` unless
   told otherwise). A write the policy allows into a directory that user
-  cannot write fails with the kernel's `EACCES`, recorded.
+  cannot write fails with the kernel's `EACCES`, recorded. `varek doctor`
+  and `varek run` say which such directories are not writable by that user,
+  or are not there, and how to fix each (`chown`, a group's write access, an
+  ACL, or `install -d -o USER`). They ask the kernel as that user, so its
+  groups, ACLs and a read-only mount count.
 
 ### Fixed
 
