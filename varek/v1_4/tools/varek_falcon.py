@@ -20,10 +20,12 @@ Usage:
         EVENTS: a file of OCSF events, or - (the default) for standard input,
         read as it arrives (a pipe from varek_ocsf.py --follow sends each
         event within --interval seconds of its being written).
-        --url: the connector's API URL, as the Falcon console gives it when
-        its API key is generated (https://...crowdstrike.com/...).
+        --url: the connector's API URL, as the Falcon console shows it on the
+        connector's page (https://ID.ingest.CLOUD.crowdstrike.com/...).
         /services/collector is added to a URL that does not end in a
-        collector path. Default: the environment's FALCON_HEC_URL.
+        collector path (/services/collector, its /event or /raw, or
+        LogScale's /api/v1/ingest/hec, or its /raw). Default: the
+        environment's FALCON_HEC_URL.
         --key-env: the environment variable holding the connector's API key
         (default FALCON_HEC_API_KEY): a key is never taken from a command
         line, where ps and the shell's history show it. It is sent as
@@ -31,12 +33,17 @@ Usage:
         --ca: the certificate authorities to trust for the connector's TLS
         certificate (default: the system's). Its name is checked against
         the URL's host; there is no option to skip the check.
-    A batch refused for a reason a retry can mend (429, 500, 502, 503, 504,
-    or no answer) is sent again, --retries times at most, waiting longer each
-    time (or as Retry-After says); a batch too large (413) is split; any other
-    refusal ends the export with exit 1, naming the position the events not
-    sent begin at (their record's, unmapped.varek.position): `varek export
-    --from-position N` sends them, and the stream's events from there on.
+    Only a 200 is an answer that the events were taken (LogScale's Ingest
+    API: committed, not to be resent). A batch refused for a reason a retry
+    can mend (429, any 5xx, a 2xx other than 200 or a 3xx, which is not
+    followed, or no answer) is sent again, --retries times at most, waiting
+    longer each time (or as Retry-After says); a batch too large (413) is
+    split; any other refusal ends the export with exit 1, naming the
+    position the events not sent begin at (their record's,
+    unmapped.varek.position): `varek export --from-position N` sends them,
+    and the stream's events from there on. An event over the 1 MB a
+    Next-Gen SIEM event may be is not sent (the connector would take it
+    truncated, its fields dropped, and answer 200): it ends the export so.
 
 Exit status: 0 every event sent; 1 an event not taken; 2 the input is not OCSF
 events, or the arguments are wrong.
@@ -56,9 +63,22 @@ from varek_otel import lines_of, position_of, resume_note  # noqa: E402  (the sa
 from varek_splunk import SplunkError, hec_event  # noqa: E402  (the same HEC event)
 
 COLLECTOR = "/services/collector"
-PATHS = ("/services/collector", "/services/collector/event", "/services/collector/raw")
-RETRY_STATUS = (429, 500, 502, 503, 504)
-MAX_BODY = 900_000              # under a megabyte a request, the event's own limit
+PATHS = ("/services/collector", "/services/collector/event", "/services/collector/raw",
+         "/api/v1/ingest/hec", "/api/v1/ingest/hec/raw")       # LogScale's HEC paths, both forms
+MAX_BODY = 900_000              # a request (CrowdStrike advises 5 MB and 5,000 events at most)
+MAX_EVENT = 1_000_000           # an event (1 MB; a larger one is kept truncated, answered 200)
+
+
+def _mendable(code):
+    """a status a retry can mend: 429, any 5xx, and 201-399 (not taken; only a 200 is)"""
+    return code == 429 or 500 <= code <= 599 or 201 <= code <= 399
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """a 3xx is not followed: urllib would send a POST's redirect on as a GET, without its events"""
+
+    def redirect_request(self, *a, **k):
+        return None
 
 
 class FalconError(Exception):
@@ -117,6 +137,8 @@ class Connector:
                         "Content-Type": "text/plain" if raw else "application/json",
                         "User-Agent": "varek-falcon"}
         self.ctx = ssl.create_default_context(cafile=ca) if url.startswith("https:") else None
+        handlers = [_NoRedirect] + ([urllib.request.HTTPSHandler(context=self.ctx)] if self.ctx else [])
+        self.opener = urllib.request.build_opener(*handlers)
         self.timeout, self.retries, self.sleep = timeout, retries, sleep
         self.requests = 0
 
@@ -124,37 +146,43 @@ class Connector:
         """send a batch; a 413 splits it in two"""
         delay = 1.0
         data = body_of(items)
+        if len(items) == 1 and len(data) > MAX_EVENT:
+            raise FalconError(f"an event of {len(data):,} bytes is over the {MAX_EVENT:,} a Next-Gen SIEM "
+                              "event may be (it would be kept truncated, its fields dropped): not sent")
         for attempt in range(self.retries + 1):
             req = urllib.request.Request(self.url, data=data, headers=self.headers, method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout, context=self.ctx) as r:
-                    text = r.read().decode("utf-8", "replace")
+                with self.opener.open(req, timeout=self.timeout) as r:
+                    code, text, hdrs = r.status, r.read().decode("utf-8", "replace"), r.headers
                 self.requests += 1
-                _accepted(text, len(items))
-                return
+                if code == 200:
+                    _accepted(text, len(items))
+                    return
             except urllib.error.HTTPError as e:
-                text = e.read().decode("utf-8", "replace")
+                code, text, hdrs = e.code, e.read().decode("utf-8", "replace"), e.headers
                 self.requests += 1
-                if e.code == 413 and len(items) > 1:
+                if code == 413 and len(items) > 1:
                     half = len(items) // 2
                     self.send(items[:half])
                     self.send(items[half:])
                     return
-                if e.code not in RETRY_STATUS or attempt == self.retries:
-                    raise FalconError(_refusal(e.code, text, len(items)))
-                ra = e.headers.get("Retry-After") if e.headers else None
-                wait = float(ra) if ra and ra.isdigit() else delay
             except (urllib.error.URLError, OSError) as e:
                 reason = getattr(e, "reason", e)
                 if isinstance(reason, ssl.SSLError) or attempt == self.retries:
                     raise FalconError(f"no answer from {self.url}: {reason}")
-                wait = delay
+                self.sleep(min(delay, 30.0))
+                delay = min(delay * 2, 30.0)
+                continue
+            if not _mendable(code) or attempt == self.retries:
+                raise FalconError(_refusal(code, text, len(items)))
+            ra = hdrs.get("Retry-After") if hdrs else None
+            wait = float(ra) if ra and ra.isdigit() else delay
             self.sleep(min(wait, 30.0))
             delay = min(delay * 2, 30.0)
 
 
 def _accepted(text, n):
-    """a 2xx: taken, unless its answer is the HEC's with a code other than 0"""
+    """a 200: taken, unless its answer is the HEC's with a code other than 0"""
     try:
         ans = json.loads(text) if text.strip() else {}
     except ValueError:

@@ -46,6 +46,9 @@ def test_the_connector_url():
     assert fal.endpoint_of(one) == (one + "/services/collector", False)
     assert fal.endpoint_of(one + "/services/collector/raw/") == (one + "/services/collector/raw", True)
     assert fal.endpoint_of("http://127.0.0.1:9") == ("http://127.0.0.1:9/services/collector", False)
+    ls = "https://x.ingest.logscale.us-2.crowdstrike.com/api/v1/ingest/hec"   # LogScale's other HEC paths
+    assert fal.endpoint_of(ls) == (ls, False)
+    assert fal.endpoint_of(ls + "/raw") == (ls + "/raw", True)
     for bad in (None, "", "abc.crowdstrike.com", "ftp://x/y", "http://abc.ingest.us-2.crowdstrike.com"):
         with pytest.raises(fal.FalconError):
             fal.endpoint_of(bad)
@@ -81,8 +84,10 @@ class Connector:
                 outer.got.append({"path": self.path, "headers": hdr, "body": raw, "events": evs})
                 code, body = outer.answers.pop(0) if outer.answers else (200, {"text": "Success", "code": 0})
                 self.send_response(code)
-                if code in (429, 503):
+                if code != 200:
                     self.send_header("Retry-After", "0")
+                if 300 <= code < 400:
+                    self.send_header("Location", "/elsewhere")
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write((body if isinstance(body, str) else json.dumps(body)).encode())
@@ -179,6 +184,20 @@ def test_busy_and_too_big_are_mended_and_a_refusal_ends_the_export():
         assert len(c.got) == 3 and "1 events sent" in r.stderr and "3 request(s)" in r.stderr
     finally:
         c.close()
+    # only a 200 is taken: a 202 and a 302 (not followed) are sent again, as any 5xx is
+    c = Connector(answers=[(202, ""), (302, ""), (507, "")])
+    try:
+        r = run(["--url", c.url, "--retries", "3"], [DENIED])
+        assert r.returncode == 0, r.stderr
+        assert [g["path"] for g in c.got] == ["/services/collector"] * 4 and "4 request(s)" in r.stderr
+    finally:
+        c.close()
+    c = Connector(answers=[(302, "")] * 2)
+    try:
+        r = run(["--url", c.url, "--retries", "1"], [DENIED])
+        assert r.returncode == 1 and "HTTP 302" in r.stderr and len(c.got) == 2
+    finally:
+        c.close()
     c = Connector(answers=[(413, "")])
     try:
         r = run(["--url", c.url, "--batch", "4"], [DENIED] * 4)
@@ -266,6 +285,16 @@ def test_a_failed_send_names_where_the_events_not_sent_begin():
         assert r.returncode == 1 and "HTTP 400" in r.stderr
         assert "2 events sent before; those not sent begin at position 12: " \
                "`varek export --from-position 12` sends them" in r.stderr
+    finally:
+        c.close()
+    # an event over 1 MB is not sent (the connector would keep it truncated, with a 200)
+    big = at(31)
+    big["unmapped"]["varek"]["pad"] = "x" * fal.MAX_EVENT
+    c = Connector()
+    try:
+        r = run(["--url", c.url], [at(30), big, at(32)])
+        assert r.returncode == 1 and "over the 1,000,000" in r.stderr and "begin at position 31" in r.stderr
+        assert [e["event"]["unmapped"]["varek"]["position"] for e in c.events()] == [30]
     finally:
         c.close()
     # a batch too large, split, its first half taken and its second refused:
