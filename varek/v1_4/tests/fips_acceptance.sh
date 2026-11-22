@@ -39,6 +39,18 @@ if [ "$(cat /proc/sys/crypto/fips_enabled 2>/dev/null)" != 1 ]; then
     echo "  On RHEL 9: sudo fips-mode-setup --enable && sudo reboot, then run this again." >&2
     exit 2
 fi
+# What the build and the audit need, named now rather than as failures halfway
+# through: the build packages, and python3-cryptography, which v1.41's
+# varek_audit.py verifies signatures with (a fresh RHEL 9 has neither).
+missing=""
+for p in gcc make git tar python3 libseccomp-devel openssl-devel python3-cryptography; do
+    rpm -q "$p" > /dev/null 2>&1 || missing="$missing $p"
+done
+if [ -n "$missing" ]; then
+    echo "fips_acceptance.sh: not installed:$missing" >&2
+    echo "  sudo dnf install -y$missing, and run this again." >&2
+    exit 2
+fi
 # The test probes (tests/v1160_probe and the like) are static by design, so the
 # host needs its C library's static archive; on RHEL that is glibc-static, from
 # CodeReady Builder. Said now, not as a link error halfway through.
@@ -147,8 +159,12 @@ EOF
 grep -q "MD5 FOR-SECURITY: REFUSED" "$E/python-fips.txt" && ok "Python's hashlib is in FIPS mode (MD5 refused for security)" \
   || bad "Python's hashlib is not in FIPS mode ($(head -1 "$E/python-fips.txt"))"
 grep -q "P384 RFC6979: VERIFIES" "$E/python-fips.txt" && ok "the audit's ECDSA P-384 verifies RFC 6979's vector in FIPS mode" \
-  || bad "the audit's ECDSA P-384 in FIPS mode ($(grep P384 "$E/python-fips.txt"))"
-if grep -q "ED25519 OFFERED: NO" "$E/python-fips.txt"; then
+  || bad "the audit's ECDSA P-384 in FIPS mode ($(grep P384 "$E/python-fips.txt" || tail -1 "$E/python-fips.txt"))"
+if ! grep -q "ED25519 OFFERED:" "$E/python-fips.txt"; then
+    # the check stopped before it asked (an import failed): say why, and not
+    # that Ed25519 is offered
+    bad "the audit's Python crypto could not be checked ($(tail -1 "$E/python-fips.txt"); python-fips.txt)"
+elif grep -q "ED25519 OFFERED: NO" "$E/python-fips.txt"; then
     o="$(python3 "$HERE/tools/varek_audit.py" --policy "$HERE/tests/v140_fixture/policy.txt" --checker "$HERE/tools/vdp_cert_check" \
           --pubkey "$HERE/tests/v140_fixture/log.key.pub" "$HERE/tests/v140_fixture/verdicts.log" 2>&1)"
     echo "$o" > "$E/v140-log-in-fips-mode.txt"
