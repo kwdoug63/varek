@@ -84,6 +84,18 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   agent a listener could take longer to start, so the client was refused and
   the capture left empty ("a curl ClientHello", once on arm64). The listener
   now takes a free port and names it once it is listening.
+- **Sentinel's analytics rules raise one alert for each row**
+  (`integrations/sentinel/sentinel-content.json`). They took the rows that
+  arrived in the last 6 minutes with no upper bound; in a rule, `now()` is
+  the end of its query window, about 5 minutes before it runs, so a row
+  that arrived between a window's end and its run was judged by that run
+  and the next two: the same alert three times, in one incident (the live
+  test of a managed identity's export, November 21, 2026). Each rule now
+  takes the rows that arrived in its own 5-minute window,
+  `ingestion_time() > ago(5m) and ingestion_time() <= now()`; the windows
+  end exactly 5 minutes apart, so each row is judged once. The Sentinel
+  README shows how to find a run's alerts by the `RunId` in their custom
+  details. Deploy `sentinel-content.json` again to replace the rules.
 
 ## [1.40.0] - 2026-11-20 — security operations: Microsoft Sentinel
 

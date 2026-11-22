@@ -92,18 +92,23 @@ def test_the_rules_judge_each_row_when_it_arrives():
     # 5 minutes by the decision's time raised nothing for a run exported later.
     # Microsoft's pattern for ingestion delay: a longer look-back, and the rows
     # that arrived since the rule last ran. Under 2 days: a solution rule that
-    # looks back 2 days or more runs hourly at most. The arrival window is a
-    # minute wider than the rule's period (November 20's live test): Sentinel's
-    # runs are not exactly 5 minutes apart, and a 5-minute window left a row
-    # between two runs unjudged whenever they were further apart; a row in the
-    # overlap raises a second alert, grouped into the same incident.
+    # looks back 2 days or more runs hourly at most. In a rule, now() is the
+    # end of the run's query window, not the time it runs: the windows end
+    # exactly 5 minutes apart, and each run starts about 5 minutes after its
+    # window ends. So each run takes the rows that arrived in its own 5 minutes,
+    # (now() - 5m, now()], and each row is judged once. Without the upper bound,
+    # a row that arrived after a window's end but before its run was judged by
+    # that run and the next ones too: two alerts with a 5-minute window
+    # (November 20), three with 6 minutes (November 21, a managed identity's
+    # export 23 minutes late).
     content = json.load(open(os.path.join(SENTINEL, "sentinel-content.json")))
     rules = [r["properties"] for r in content["resources"] if r.get("kind") == "Scheduled"]
     assert len(rules) == 3
     for r in rules:
         assert r["queryFrequency"] == "PT5M" and r["queryPeriod"] == "P1D", r["displayName"]
         first = r["query"].split("\n")[1]
-        assert first == "| where TimeGenerated > ago(1d) and ingestion_time() > ago(6m)", (r["displayName"], first)
+        assert first == ("| where TimeGenerated > ago(1d)"
+                         " and ingestion_time() > ago(5m) and ingestion_time() <= now()"), (r["displayName"], first)
         # an alert's time is its rows' (the latest decision), not the day the rule looks back over
         last = r["query"].split("\n")[-1]
         assert last.startswith(("| summarize TimeGenerated = max(TimeGenerated),", "| project TimeGenerated,")), \
