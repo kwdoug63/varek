@@ -27,7 +27,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `make test-proxy-ca` (in CI): the run CA's name constraints under ASan and
   UBSan, every permitted and excluded name kept, up to 256 names of 253
   characters each way.
-
+- `docs/security/openssf-best-practices.md`: the answer given for each
+  OpenSSF Best Practices criterion (project 16965), and how the CodeQL
+  findings open at submission were fixed or dismissed, with each reason.
 
 ### Changed
 
@@ -59,6 +61,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   or are not there, and how to fix each (`chown`, a group's write access, an
   ACL, or `install -d -o USER`). They ask the kernel as that user, so its
   groups, ACLs and a read-only mount count.
+- The test scripts' installs are pinned by hash (OpenSSF Scorecard,
+  Pinned-Dependencies). `measure_v1360/m3_spire.sh` builds its SPIRE client
+  from `measure_v1360/m3delegate/` (go.mod and go.sum, the node agent's
+  module versions) with `-mod=readonly`, not `go get @latest`.
+  `profiles_v1290.sh` installs the three agent CLIs with `npm ci` from
+  `profiles_v1290/package-lock.json`, into `~/.npm-global/lib/node_modules`
+  as before. Dependabot updates both.
 
 ### Fixed
 
