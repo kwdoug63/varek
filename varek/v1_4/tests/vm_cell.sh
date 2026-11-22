@@ -148,7 +148,8 @@ if [ "$CMD" = inside ]; then
         [ "$(getenforce 2>/dev/null)" = Enforcing ] || { measure "selinux" "not enforcing: the cell's point is missing"; exit 1; }
         # what the chart test needs: its two tools built here, skopeo for
         # the image, helm (its newest 3.x release, checked by its SHA-256)
-        dnf -y -q --allowerasing install gcc make git libseccomp-devel openssl-devel python3 \
+        # v1.41: python3-cryptography, which the audit verifies signatures with
+        dnf -y -q --allowerasing install gcc make git libseccomp-devel openssl-devel python3 python3-cryptography \
             skopeo tar curl audit > "$OUT/deps.log" 2>&1 || { tail -30 "$OUT/deps.log"; echo "vm_cell.sh: dnf failed"; exit 1; }
         make -C "$HERE" tools/varek_keygen tools/vdp_cert_check > "$OUT/build.log" 2>&1 ||
             { tail -30 "$OUT/build.log"; echo "vm_cell.sh: the tools did not build"; exit 1; }
