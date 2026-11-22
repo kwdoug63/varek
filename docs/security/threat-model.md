@@ -1,6 +1,6 @@
 # VAREK — Threat Model
 
-Version: current as of v1.36.3 (released November 4, 2026) · MIT · github.com/kwdoug63/varek
+Version: current as of v1.40.0 (released November 20, 2026) · MIT · github.com/kwdoug63/varek
 
 This document states what VAREK defends, against whom, and what it explicitly
 does not defend. It is deliberately conservative: where a guarantee is
@@ -188,6 +188,31 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
   from that node. Those sources, and the cluster's list of node keys kept
   by whoever audits, are trusted as the host's credential sources, issuer
   and key are on a host. The agent's pod never holds them.
+- **Trust boundary 20 (v1.37.0; v1.38.0):** a Mac, its hypervisor and the
+  VM. On a Mac with Apple silicon the agent and the Warden run in a RHEL 9
+  aarch64 VM, on Apple's Virtualization framework through vfkit; inside it
+  the Warden decides and enforces as on Linux. macOS, the Virtualization
+  framework, vfkit and the Mac's user are trusted as a host's kernel is.
+  The Mac shares one directory with the VM, the project, at the same path;
+  its other files are not in the VM. What the agent may write there is
+  input to the Mac's own tools: from v1.38.0 the baseline refuses every
+  write to the project's git settings and hooks, which git on the Mac
+  would run, and anything else the Mac's tools read from the project (an
+  IDE's task files, `.envrc`) is the policy's to keep from the agent. Root
+  in the VM is not under the Warden. From v1.38.0 the agent runs in the
+  VM as a user of its own, with no sudo, and a packet filter on the Mac
+  (its own pf anchor) keeps the VM from the Mac's addresses, its networks
+  and the instance metadata service, the Internet, DNS and DHCP passing.
+- **Trust boundary 21 (v1.39.0; v1.40.0):** the security tools a run's
+  evidence is sent to: an OpenTelemetry collector, a Splunk HTTP Event
+  Collector, and Microsoft Sentinel's Log Analytics workspace through the
+  Azure Monitor Logs Ingestion API, with a Microsoft Entra ID token. The
+  export audits the verdict stream first and sends the audit's verdict
+  with the events; the stream, not a collector's copy, remains the
+  evidence. What a collector or SIEM does with a row (keeps it, drops it,
+  alerts on it) is trusted as that tool's. Keys and secrets come from the
+  environment, never the command line; the Splunk collector's
+  certificate and name are always checked.
 
 ## 3. Adversary models
 
@@ -778,6 +803,47 @@ Model-B techniques below, with the residual limits stated honestly.
   - *amd64 and arm64 (Graviton),* each built and checked on its own
     runner; each runtime and host the README calls supported is run in
     CI, and what the matrix does not cover is not called supported.
+- **macOS, through a Linux VM (v1.37.0), hardened (v1.38.0).** On a Mac
+  with Apple silicon the agent runs under the Warden in a RHEL 9 VM, with
+  the same policies, decisions, certificates, records and audit as on
+  Linux.
+  - *One Warden for both architectures.* x86-64 and arm64 build from one
+    source; open flags are recorded in one encoding, the Warden
+    translating arm64's where flags are decided, certified and recorded,
+    and `run_start` names the architecture, which the audit checks.
+  - *Only the project is shared* with the VM, mounted at the same path;
+    the Mac's other files are not in it.
+  - *The project's git settings and hooks are never written* under the
+    baseline (v1.38.0): every write to `.git/config`, `.git/hooks` and a
+    linked worktree's or submodule's settings is refused, so the agent
+    cannot plant code that git on the Mac would run.
+  - *The agent has no sudo in the VM* (v1.38.0): `varek vm run` runs it as
+    a user of its own, with a locked password and no ssh key, and refuses
+    the run if sudo would let that user run anything.
+  - *The VM cannot reach the Mac* (v1.38.0): a packet filter drops what
+    the VM sends to the Mac's addresses, link-local addresses (the
+    metadata service), the private ranges and shared address space. A
+    start whose rules do not load is refused.
+- **Security operations: the evidence sent where security teams look
+  (v1.39.0, v1.40.0).** `varek export` sends a run's OCSF events to an
+  OpenTelemetry collector (`otlp`), to Splunk (`splunk`) and to Microsoft
+  Sentinel (`sentinel`), finished runs or, with `--follow`, live ones.
+  - *Audited first.* The stream is audited before anything is sent, and
+    the audit's verdict is always sent: a stream the audit refuses raises
+    a failed-audit event (in Sentinel, a High incident).
+  - *Each refusal names its policy line.* Every event carries the
+    decision, the three-state verdict, the rule, the policy line and its
+    text, the run and the agent, and the whole OCSF event; in Sentinel a
+    refusal raises an incident naming the line that decided it.
+  - *Failures are loud.* A refusal a retry can mend is retried; any other
+    ends the export with exit 1, naming what was not taken. From v1.40.0
+    an export that fails partway names the position its unsent events
+    begin at, and `--from-position` sends the rest.
+- **The sector packs decide program launches (v1.40.0).** The healthcare,
+  finance, utility, national-defense and cybersecurity packs need
+  `require warden 1.27`: each names the programs an agent may launch, any
+  other is refused and held by Landlock, and every directory a pack lets
+  the agent write is mounted `noexec` for the run.
 
 The per-class status of every known bypass class is maintained in
 `docs/security/bypass-classes.md`.
@@ -1257,6 +1323,57 @@ are claimed as solved.
   - *Review.* v1.35.0 was reviewed by six AI review agents, each on one
     part; its findings are listed in its release notes. No human or
     third-party review has been made.
+- macOS, through a Linux VM (v1.37.0 and v1.38.0, `v1.30-macos.md`,
+  `RELEASE-v1.37.0.md`, `RELEASE-v1.38.0.md`):
+  - *Root in the VM is not under the Warden.* The agent's connections are
+    the Warden's to decide; from v1.38.0 the agent has no sudo and the
+    packet filter keeps the VM from the Mac, but a process that gains root
+    in the VM is outside both.
+  - *The packet filter's rules name the Mac's addresses when they load;*
+    an address the Mac gets later, from another network, is not among
+    them until the next start (the private ranges still are). Its IPv6
+    rule is the bridge's, so other vmnet VMs lose IPv6 while this VM
+    runs. On a VM's first boot there are a few seconds before the rules
+    load, with no project mounted.
+  - *The baseline's git rules* do not cover a nested submodule's settings
+    (`.git/modules/a/modules/b/...`); an IDE's task files and `.envrc` in
+    the project are the policy's to keep from the agent; `mv .git` by the
+    agent falls back to copying and leaves `config` and `hooks`.
+  - *The VM persists between runs,* and stays up after `varek vm run`
+    with the project shared, until `varek vm stop`. The guest can fill the
+    Mac's disk through its serial log.
+  - *Review.* v1.37.0 was reviewed by three AI review agents; v1.38.0 was
+    tested as its release notes state, without a separate review pass. No
+    human or third-party review has been made.
+- Security operations (v1.39.0 and v1.40.0, `v1.39-security-operations.md`):
+  - *An exported copy is a copy.* A collector or SIEM holds what it was
+    sent; whether it keeps every row, and what its rules raise, is that
+    tool's. The verdict stream, audited with `varek audit`, is the
+    evidence.
+  - *Sentinel's analytics rules judge rows that arrive within a day of
+    their decisions;* a run exported later reaches the table and the
+    workbook but raises no incident, and a row two rule runs see raises a
+    second alert in the same incident. At release it was tested in one
+    workspace with a client secret, a managed identity only against a
+    stand-in.
+  - *Events may be sent twice.* An export run again, or resumed with
+    `--from-position` after a batch split or near the run's end, can send
+    events the tool already holds; each event's `metadata.uid` tells them
+    apart. Nothing is buffered on disk between attempts.
+  - *OpenTelemetry* is OTLP/HTTP with JSON only, logs only. *Splunk* was
+    tested on Splunk Enterprise with a private CA's certificate, not on
+    Splunk Cloud; its default HEC certificate names no host, so the HEC
+    needs one of its own.
+  - *The sector packs' `python3`* (healthcare, finance, utility,
+    national-defense) is a general-purpose interpreter: any code it can
+    read runs, under the pack's file and network rules. The start-up
+    reads were checked with Python 3.9, 3.12 and 3.13.
+  - *The Enterprise license check (v1.39.1)* is a compliance check, not
+    copy protection: the packs are readable text on the buyer's instance.
+  - *Review.* v1.39.0 and v1.40.0 were tested as their release notes
+    state, against real instances (an OpenTelemetry collector, Splunk
+    Enterprise, a Sentinel workspace), without a separate review pass. No
+    human or third-party review has been made.
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).
 - An agent may probe for SATISFIED-but-harmful actions near a policy boundary;
