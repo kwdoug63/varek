@@ -104,6 +104,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   end exactly 5 minutes apart, so each row is judged once. The Sentinel
   README shows how to find a run's alerts by the `RunId` in their custom
   details. Deploy `sentinel-content.json` again to replace the rules.
+  Tested live (November 21, 2026): two runs exported 8 minutes late raised
+  one alert for each refusing line and one for the failed audit, each
+  once over 4 to 5 passes, 8 to 9 minutes after their rows arrived.
 
 ## [1.40.0] - 2026-11-20 — security operations: Microsoft Sentinel
 

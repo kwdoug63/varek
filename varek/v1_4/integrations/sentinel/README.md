@@ -116,8 +116,9 @@ within a day of its decisions raises its incidents. One exported later
 reaches the table and the workbook but raises none. (A day: Sentinel runs
 a rule that looks back 2 days or more at most hourly.) In a rule, `now()`
 is the end of the run's query window, and the windows end exactly 5
-minutes apart, so each row is judged once and raises one alert. An
-alert's time is its rows', the latest decision. Rules deployed before
+minutes apart, so each row is judged once and raises one alert, about 5
+to 10 minutes after it arrives (8 to 9 in the live test, November 21,
+2026). An alert's time is its rows', the latest decision. Rules deployed before
 v1.40.0 looked back 5 minutes by the decision's time, and v1.40.0's took
 the last 6 minutes of arrivals with no upper bound, so a row could raise
 the same alert up to three times; deploy `sentinel-content.json` again
