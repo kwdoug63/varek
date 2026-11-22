@@ -79,23 +79,34 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   error"). Both now say 1.29. A test makes the legacy `stat(2)` and
   `lstat(2)` calls directly under the bench's policy (x86-64): allowed where
   the policy reads, refused and recorded elsewhere.
-- **Microsoft Sentinel, two corrections from a live test** (November 21,
-  2026, `docs/security/v1.39-security-operations.md`, section 3). The test
-  exported a run from an Azure VM with its managed identity, no secret: 403
-  with no role, every row with Monitoring Metrics Publisher on the one
-  rule, and the refusal incident raised. That had been tested only against
-  the stand-in. `integrations/sentinel/README.md` now says:
-  - a new role can take up to about half an hour to apply (here, 23
-    minutes), not "some minutes";
-  - a row is judged by two or three of the rule's runs, not at most two:
-    Sentinel measures a scheduled rule's `ago()` from about 5 minutes
-    before the run. Each repeat lands in the same incident;
-  - where an alert's run is (`Custom Details`, `RunId[0]`).
+- **Microsoft Sentinel, a managed identity tested live** (November 21,
+  2026, `docs/security/v1.39-security-operations.md`, section 3). A run was
+  exported from an Azure VM with its managed identity, no secret: 403 with
+  no role; with Monitoring Metrics Publisher on the one rule, every row,
+  and the refusal incident raised. That had been tested only against the
+  stand-in. `integrations/sentinel/README.md` now says a new role can take
+  up to about half an hour to apply (here, 23 minutes), not "some
+  minutes". The same test's repeated alerts led to the rules' fix below.
 - `tests/test_v1260.sh`: the captures of real clients' ClientHellos wait
   for their listener. It slept 0.3 s on a random port, and under the node
   agent a listener could take longer to start, so the client was refused and
   the capture left empty ("a curl ClientHello", once on arm64). The listener
   now takes a free port and names it once it is listening.
+- **Sentinel's analytics rules raise one alert for each row**
+  (`integrations/sentinel/sentinel-content.json`). They took the rows that
+  arrived in the last 6 minutes with no upper bound; in a rule, `now()` is
+  the end of its query window, about 5 minutes before it runs, so a row
+  that arrived between a window's end and its run was judged by that run
+  and the next two: the same alert three times, in one incident (the live
+  test of a managed identity's export, November 21, 2026). Each rule now
+  takes the rows that arrived in its own 5-minute window,
+  `ingestion_time() > ago(5m) and ingestion_time() <= now()`; the windows
+  end exactly 5 minutes apart, so each row is judged once. The Sentinel
+  README shows how to find a run's alerts by the `RunId` in their custom
+  details. Deploy `sentinel-content.json` again to replace the rules.
+  Tested live (November 21, 2026): two runs exported 8 minutes late raised
+  one alert for each refusing line and one for the failed audit, each
+  once over 4 to 5 passes, 8 to 9 minutes after their rows arrived.
 
 ## [1.40.0] - 2026-11-20 — security operations: Microsoft Sentinel
 
