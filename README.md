@@ -598,7 +598,8 @@ different risks at different points in the stack.
 - [x] **v1.38.0** — Hardening: the baseline never writes the working directory's git settings and hooks; on a Mac, the agent's own user in the VM without sudo, and a packet filter keeping the VM from the Mac and its networks ([release notes](./RELEASE-v1.38.0.md))
 - [x] **v1.39.0** — Security operations, first part: the OCSF events sent to OpenTelemetry and to Splunk (with a Splunk app), live with `--follow` ([release notes](./RELEASE-v1.39.0.md))
 - [x] **v1.40.0** — Security operations, second part: Microsoft Sentinel (analytics rules and a workbook), a failed export resumed, the sector packs deciding launches ([release notes](./RELEASE-v1.40.0.md))
-- [ ] **v1.41.0** (planned; was v1.40.0) — Security operations, third part: CrowdStrike Falcon Foundry and Wiz, each waiting on its partner program's tenant ([plan](./docs/security/v1.39-security-operations.md))
+- [ ] **v1.41.0** (planned) — VAREK implements no cryptography of its own: every hash and signature through the host's OpenSSL 3 (SHA-384, ECDSA P-384), and a Defense build (`make DEFENSE=1`) that runs only with RHEL 9's FIPS 140-3 validated module, in FIPS mode ([report](./docs/security/v1.41-cryptography.md))
+- [ ] **v1.42.0** (planned; was v1.40.0, then v1.41.0) — Security operations, third part: CrowdStrike Falcon Foundry and Wiz, each waiting on its partner program's tenant ([plan](./docs/security/v1.39-security-operations.md))
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow; revisited after v1.35, once generated plans show how many steps it would clear ([plan](./docs/roadmap/v1.36-v1.37.md))
 

@@ -67,6 +67,8 @@ spec:
                   type: string
                   pattern: '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$'
                 publicKey:
-                  description: The node agent's Ed25519 public key, 64 hex characters (its --node-key FILE.pub).
+                  description: The node agent's public key, as its --node-key FILE.pub holds it. v1.41 is ECDSA P-384, the uncompressed point (194 hex characters, 04 first); v1.40 and earlier wrote Ed25519 keys (64).
                   type: string
-                  pattern: '^[0-9a-f]{64}$'
+                  # v1.41: a P-384 point (04 || X || Y, 194 hex); a key from
+                  # v1.40 or earlier (Ed25519, 64 hex) still validates
+                  pattern: '^(04[0-9a-f]{192}|[0-9a-f]{64})$'

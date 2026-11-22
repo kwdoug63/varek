@@ -21,8 +21,14 @@ policy file alone:
      holder cannot rewrite it), every signed record in the stream must appear
      in the anchor and every anchored record of this run must appear in the
      stream: history that reached the anchor cannot be rewritten even by the
-     key holder. Signatures are verified by tools/varek_ed25519.py (RFC 8032,
-     pure Python), not by the library that made them.
+     key holder. v1.41: the stream says its format in run_start ("log"):
+     chain-2 (SHA-384 chain, ECDSA P-384 signatures, the Warden from v1.41) or
+     chain-1 (SHA-256, Ed25519, v1.16 to v1.40); both are checked.
+     Signatures are verified through the `cryptography` package on the host's
+     OpenSSL (tools/varek_ed25519.py), so on a host in FIPS mode by the FIPS
+     140-3 validated module. (Through v1.40 they were verified by a pure-Python
+     Ed25519, separate from the library that made them; now the Warden signs
+     and this verifies with the same validated library, as FIPS requires.)
   2. The policy file given here must hash to the policy_sha256 in run_start:
      the certificates are checked against exactly the text the Warden used.
   3. The only authorizations are certified file opens and the agent's one
@@ -100,7 +106,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from varek_cyclonedx import StreamError, _iter_log, _version_at_least, LOG_SIG_DOMAIN, LOG_CHAIN_FORMAT, \
-    CRED_EVENTS  # noqa: E402
+    CRED_EVENTS, log_format, pubkey_from_hex  # noqa: E402
 import varek_ed25519  # noqa: E402
 
 # Record rules for an authorized file open (the policy decided ALLOW).
@@ -745,6 +751,15 @@ class DryCheck:
                             f"but has none")
         elif "arch" in rs and not _version_at_least(rs.get("warden"), (1, 33)):
             problems.append(f"run_start records an architecture, but names the Warden {rs.get('warden')!r}, "
+                            f"which records none")
+        # v1.41: the provider that computed the chain and the signatures
+        if "crypto_provider" in rs and rs.get("crypto_provider") not in ("fips", "default"):
+            problems.append(f"run_start's crypto_provider {rs.get('crypto_provider')!r} is not one the Warden writes")
+        elif "crypto_provider" not in rs and _version_at_least(rs.get("warden"), (1, 41)):
+            problems.append(f"run_start names the Warden {rs.get('warden')!r}, which records its crypto provider, "
+                            f"but has none")
+        elif "crypto_provider" in rs and not _version_at_least(rs.get("warden"), (1, 41)):
+            problems.append(f"run_start records a crypto provider, but names the Warden {rs.get('warden')!r}, "
                             f"which records none")
         end = meta.get("run_end")
         if isinstance(end, dict) and end.get("mode") != rs.get("mode"):
@@ -3736,14 +3751,17 @@ def policy_ancestors(path):
 
 
 def _hex_key(txt):
-    """Exactly 64 lowercase hex characters, or None."""
-    if not isinstance(txt, str) or len(txt) != 64 or any(c not in "0123456789abcdef" for c in txt):
+    """A log public key as the Warden writes it, in lowercase hex: a P-384
+    point (194 characters, 04 || X || Y; v1.41) or an Ed25519 key (64; v1.40
+    and earlier). Its bytes, or None."""
+    if not isinstance(txt, str) or not re.fullmatch(r"04[0-9a-f]{192}|[0-9a-f]{64}", txt):
         return None
     return bytes.fromhex(txt)
 
 
 def _cli_pubkey(arg):
-    """--pubkey: 64 hex characters, or a file holding them (tools/varek_keygen's .pub)."""
+    """--pubkey: the key's hex (194 characters, P-384; or 64, Ed25519), or a file
+    holding it (tools/varek_keygen's .pub)."""
     if os.path.isfile(arg):
         with open(arg) as fh:
             arg = fh.read()
@@ -3784,8 +3802,8 @@ def _node_keys(path):
             return None, f"--node-keys {path}: an item that is not a VarekNodeKey"
         k, t, node = _hex_key(sp.get("publicKey")), _rfc3339_ns(md.get("creationTimestamp")), sp.get("node")
         if k is None or t is None or not isinstance(node, str) or not node:
-            return None, (f"--node-keys {path}: VarekNodeKey {md.get('name')!r} has no node, no 64-hex publicKey, "
-                          f"or no creationTimestamp")
+            return None, (f"--node-keys {path}: VarekNodeKey {md.get('name')!r} has no node, no publicKey "
+                          f"(194 hex, P-384; or 64, Ed25519), or no creationTimestamp")
         keys.setdefault(node, []).append((t, k, str(md.get("name"))))
     for v in keys.values():
         v.sort(key=lambda e: (e[0], e[2]))
@@ -3853,6 +3871,8 @@ class Integrity:
         self.rs = None
         self.early = []                      # the signed records before run_start was read (run_start's own)
         self.mode = None                     # "signed", "malformed" (a bad log_pubkey) or None
+        self.fmt, self.chained = None, False  # v1.41: the stream's integrity format (start())
+        self.unavailable = None              # v1.41: why its signatures cannot be checked on this host
         self.pk = self.pinned = None
         self.nsigned = self.bad = 0
         self.last_event = None
@@ -3877,21 +3897,25 @@ class Integrity:
         lines for this run"""
         self.rs, self.run = rs, run
         a, head = self.a, self.sec["integ_head"]
-        self.chained = rs.get("log") == LOG_CHAIN_FORMAT
+        self.fmt = log_format(rs.get("log"))         # v1.41: chain-1 or chain-2
+        self.chained = self.fmt is not None
         stream_key = rs.get("log_pubkey")
         if not self.chained:
             return
         if stream_key is not None:
             self.pk = _hex_key(stream_key)
-            if self.pk is None:
-                head.append("run_start carries a malformed log_pubkey")
+            if self.pk is None or len(self.pk) != self.fmt["key_len"] or \
+                    rs.get("sigalg", self.fmt["sigalg"]) != self.fmt["sigalg"]:
+                head.append(f"run_start carries a malformed log_pubkey (or one not of its format, "
+                            f"{self.fmt['name']}: {self.fmt['sigalg']})")
                 self.mode = "malformed"
                 return
             self.mode = "signed"
             if a.pubkey:
                 self.pinned = _cli_pubkey(a.pubkey)
                 if self.pinned is None:
-                    head.append("--pubkey is not 64 hex characters (or a file holding them)")
+                    head.append("--pubkey is not a public key (194 hex characters, P-384; or 64, Ed25519) "
+                                "or a file holding one")
                 elif self.pinned != self.pk:
                     head.append(f"the stream is signed by {self.pk.hex()}, not by the pinned key "
                                 f"{self.pinned.hex()}")
@@ -3937,10 +3961,15 @@ class Integrity:
                     if skey is not None:
                         ch, sig = str(e.get("chain")), e.get("sig")
                         try:
-                            good = isinstance(sig, str) and len(ch) == 64 and \
-                                varek_ed25519.verify(skey, LOG_SIG_DOMAIN + bytes.fromhex(ch), bytes.fromhex(sig))
+                            good = isinstance(sig, str) and len(ch) == self.fmt["chain_hex"] and \
+                                self.fmt["verify"](skey, self.fmt["domain"] + bytes.fromhex(ch), bytes.fromhex(sig))
                         except ValueError:
                             good = False
+                        except varek_ed25519.AlgorithmUnavailable as ex:    # v1.41 (e is the line)
+                            good = False
+                            if self.unavailable is None:
+                                self.unavailable = str(ex)
+                                self.sec["integ_aread"].append(f"anchor {a.anchor}: {ex}")
                         if not good:
                             self.ignored += 1
                     self.anchor.add(e, good)
@@ -3966,9 +3995,17 @@ class Integrity:
         if self.mode == "signed":
             if c["sig"] is None:
                 self.sec["integ_sigs"].append(f"line {c['line']}: {c['event']} record is not signed")
-            elif not varek_ed25519.verify(self.pk, LOG_SIG_DOMAIN + c["chain"], bytes.fromhex(c["sig"])):
-                self.bad += 1
-                self.sec["integ_sigs"].append(f"line {c['line']}: {c['event']} signature does not verify")
+            else:
+                try:
+                    good = self.fmt["verify"](self.pk, self.fmt["domain"] + c["chain"], bytes.fromhex(c["sig"]))
+                except varek_ed25519.AlgorithmUnavailable as e:
+                    good = None                  # v1.41: not checkable here (not a forgery): said once
+                    if self.unavailable is None:
+                        self.unavailable = str(e)
+                        self.sec["integ_sigs"].append(f"line {c['line']}: {e}")
+                if good is False:
+                    self.bad += 1
+                    self.sec["integ_sigs"].append(f"line {c['line']}: {c['event']} signature does not verify")
             if c["sig"]:
                 # The Warden signs at least every checkpoint_every decision records. A
                 # longer stretch without a signature means checkpoints were removed
@@ -4573,10 +4610,14 @@ def main(argv=None):
     ap.add_argument("--checker", help="tools/vdp_cert_check (required to audit)")
     ap.add_argument("--allow-incomplete", action="store_true",
                     help="audit a stream with no run_end record")
+    ap.add_argument("--require-fips", action="store_true",
+                    help="v1.41: fail unless run_start, signed under the pinned key, says the stream's hashing "
+                         "and signing were the host's FIPS provider's (a Defense build, or a host in FIPS mode)")
     ap.add_argument("--allow-test-build", action="store_true",
                     help="audit a stream from the test-only fault-injected Warden (testing)")
-    ap.add_argument("--pubkey", help="the Warden's signing public key (64 hex characters, "
-                    "or a .pub file from tools/varek_keygen): signatures must verify under it")
+    ap.add_argument("--pubkey", help="the Warden's signing public key (194 hex characters, P-384; 64 for an "
+                    "Ed25519 key of v1.40 or earlier; or a .pub file from tools/varek_keygen): signatures must "
+                    "verify under it")
     ap.add_argument("--node-keys", metavar="LIST", help="v1.36 (D10): the cluster's VarekNodeKey resources "
                     "(kubectl get vareknodekeys -o json): the stream must be signed by the key listed for its "
                     "node, and not one retired before the run began")
@@ -4763,6 +4804,17 @@ def main(argv=None):
     meta["plan_events"] = plan_events
 
     integrity = integ.finish(meta, complete)
+    # v1.41: --require-fips. The provider run_start names is believed as far as
+    # run_start's signature, under a key the caller pinned, vouches for it.
+    cprov = meta.get("run_start", {}).get("crypto_provider")
+    if a.require_fips:
+        if cprov != "fips":
+            sec["integ_head"].append(f"--require-fips: run_start says the stream's hashing and signing were the "
+                                     f"{cprov or 'unrecorded'} provider's, not the host's FIPS provider's")
+        if not integrity.startswith("signed") or "not pinned" in integrity:
+            sec["integ_head"].append("--require-fips: the provider run_start names is vouched for only by its "
+                                     "signature under a pinned key (give --pubkey or --node-keys; the stream "
+                                     "must be signed)")
     if a.run and a.run != run:
         sec["run"].append(f"the stream is run {run}, not the run asked for ({a.run})")
     # An incomplete signed stream is audited only as far as its last signature:
@@ -4992,6 +5044,10 @@ def report(a, meta, sec, k, integrity, run, warden, complete, nrec, prules, rule
     for n_ in cnotes:
         print(f"varek_audit: note: {n_}")
     print(f"varek_audit: integrity: {integrity}")
+    cprov = meta.get("run_start", {}).get("crypto_provider")
+    if isinstance(cprov, str):                                                           # v1.41
+        print(f"varek_audit: crypto provider: {cprov}"
+              f"{' (the host FIPS 140-3 validated module)' if cprov == 'fips' else ''}")
     if isinstance(meta.get("run_start", {}).get("arch"), str):                          # v1.33.0
         print(f"varek_audit: architecture: {meta['run_start']['arch']}")
     t0 = meta.get("run_start", {}).get("timestamp_ns")

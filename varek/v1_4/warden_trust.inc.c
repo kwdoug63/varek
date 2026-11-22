@@ -21,9 +21,12 @@ static const char *const kHostBundles[] = {
 #define TRUST_BUNDLE_MAX (8u << 20)
 
 static void trust_sha_hex(const unsigned char *d, size_t n, char out[65]) {
-    unsigned char h[32];
-    crypto_hash_sha256(h, d, n);
-    sodium_bin2hex(out, 65, h, sizeof h);
+    unsigned char h[VFIPS_SHA256_LEN];
+    if (vfips_sha256(d, n, h) != 0) {         /* v1.41: via the host provider; fail closed */
+        fprintf(stderr, "[warden] trust views: SHA-256 via the host crypto provider failed; stopping\n");
+        abort();
+    }
+    vfips_bin2hex(out, 65, h, sizeof h);
 }
 
 /* The names the CA may sign for: each host name an allow rule lets the agent
@@ -75,9 +78,11 @@ static int trust_pem_der(const unsigned char *pem, size_t n, unsigned char **der
     size_t cap = n;
     *der = malloc(cap);
     if (!*der) return -1;
-    const char *end = NULL;
-    if (sodium_base642bin(*der, cap, (const char *)pem + bl, n - bl - el, "\n", dl, &end,
-                          sodium_base64_VARIANT_ORIGINAL) != 0 || *dl == 0 || (*der)[0] != 0x30) {
+    /* v1.41: OpenSSL's PEM base64 decoder (newlines skipped; any other
+     * non-base64 byte is refused — stricter than the v1.26.1 decode, which
+     * stopped quietly at the first one) */
+    if (vfips_b64decode(*der, cap, (const char *)pem + bl, n - bl - el, dl) != 0 ||
+        *dl == 0 || (*der)[0] != 0x30) {
         free(*der);
         *der = NULL;
         return -1;

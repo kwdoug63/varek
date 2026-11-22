@@ -12,7 +12,7 @@
 #
 # Stages:
 #   build    AlmaLinux 9, binary-compatible with RHEL 9, with the build
-#            dependencies (CodeReady Builder and EPEL); nothing of it ships
+#            dependencies (CodeReady Builder; v1.41: no EPEL); nothing of it ships
 #   runtime  Red Hat's Universal Base Image 9 (minimal), the image (D6)
 #   test     Ubuntu 24.04 with what CI installs, to run the suites inside a
 #            container (tests/container_sweep.sh): --target test
@@ -60,7 +60,6 @@ RUN cd /src/k8s && CGO_ENABLED=0 go build -trimpath -o /node/opt/varek/varek-nri
 
 FROM ${RUNTIME_BASE} AS runtime
 COPY packaging/container/deps.sh /usr/local/sbin/varek-deps
-COPY packaging/container/RPM-GPG-KEY-EPEL-9 /tmp/RPM-GPG-KEY-EPEL-9
 RUN varek-deps runtime && rm -f /usr/local/sbin/varek-deps
 COPY --from=build /out/ /
 COPY LICENSE NOTICE /opt/varek/

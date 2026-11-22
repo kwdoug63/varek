@@ -124,9 +124,10 @@ trap 'rm -f "$tmp" "$tmp.ok"' EXIT
 # The forwarder sends at most 1 MiB per batch; anything past 4 MiB is not
 # read (and so not stored), and the forwarder would send it again.
 head -c 4194304 > "$tmp" || exit 3
-re='^\{"run":"[0-9a-f]{32}","event":"(run_start|checkpoint|run_end)","records":(0|[1-9][0-9]{0,19}),"chain":"[0-9a-f]{64}"(,"sig":"[0-9a-f]{128}")?,"timestamp_ns":(0|[1-9][0-9]{0,18})\}$'
+# v1.41: chain-2 (SHA-384 chain, DER ECDSA P-384 signature) or chain-1 (SHA-256, Ed25519)
+re='^\{"run":"[0-9a-f]{32}","event":"(run_start|checkpoint|run_end)","records":(0|[1-9][0-9]{0,19}),("chain":"[0-9a-f]{96}"(,"sig":"([0-9a-f]{2}){8,104}")?|"chain":"[0-9a-f]{64}"(,"sig":"[0-9a-f]{128}")?),"timestamp_ns":(0|[1-9][0-9]{0,18})\}$'
 # v1.36 step 9 (D10): and the node agent's key, announced at each start
-nk='^\{"event":"node_key","node":"[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?","key":"[0-9a-f]{64}","timestamp_ns":(0|[1-9][0-9]{0,18})\}$'
+nk='^\{"event":"node_key","node":"[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?",("key":"04[0-9a-f]{192}","sigalg":"ecdsa-p384-sha384"|"key":"[0-9a-f]{64}"),"timestamp_ns":(0|[1-9][0-9]{0,18})\}$'
 LC_ALL=C grep -E -e "$re" -e "$nk" "$tmp" > "$tmp.ok"; rc=$?
 [ "$rc" -le 1 ] || exit 4
 [ -s "$tmp.ok" ] || exit 0

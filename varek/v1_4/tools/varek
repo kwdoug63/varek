@@ -177,7 +177,7 @@ def write_config(path, cfg):
         fh.write("# VAREK settings, written by `varek init`. Edit by hand or re-run init.\n")
         fh.write("#   policy     the policy the Warden enforces\n")
         fh.write("#   log_dir    where each run's verdict stream is written\n")
-        fh.write("#   sign_key   Ed25519 key that signs the stream (empty: unsigned)\n")
+        fh.write("#   sign_key   ECDSA P-384 key that signs the stream (v1.41; empty: unsigned)\n")
         fh.write("#   anchor     optional --anchor path (FIFO for an off-host anchor)\n")
         fh.write("#   spool      the anchor forwarder's spool directory, if any\n")
         fh.write("#   run_as     the unprivileged user the agent runs as\n")
@@ -526,7 +526,72 @@ def verdict_word(r):
     return {"ALLOW": "SATISFIED", "DENY": "UNSATISFIED", "UNKNOWN": "UNKNOWN"}.get(raw, raw)
 
 
-def _pubkey(cfg):
+# v1.41: the Warden signs with ECDSA P-384 (a PEM key). A key of v1.40 or
+# earlier (an Ed25519 seed, 64 hex characters) is not used: `varek init`, or a
+# first run, retires it, removing its private half and keeping its public half
+# beside the new key as log.key.v140.pub, which `varek audit` and `varek
+# export` use for the runs it signed (their streams say "log":"chain-1").
+V140_PUB = ".v140.pub"
+
+
+def _key_is_v140(path):
+    """True if path holds a v1.40 signing key (an Ed25519 seed, 64 hex characters)."""
+    try:
+        with open(path, "rb") as fh:
+            b = fh.read(80)
+    except OSError:
+        return False
+    return re.fullmatch(rb"[0-9a-fA-F]{64}\n?", b) is not None
+
+
+def _retire_v140_key(key):
+    """v1.41: retire a v1.40 key at key: its public half kept as key + V140_PUB
+    (to verify the runs it signed), its private half removed. The kept path."""
+    kept, pub = key + V140_PUB, key + ".pub"
+    if os.path.exists(pub):
+        with open(pub) as fh:
+            new = fh.read().strip()
+        if os.path.exists(kept):
+            with open(kept) as fh:
+                if fh.read().strip() != new:
+                    raise CliError(f"{kept} already holds another v1.40 key's public half",
+                                   fix=f"move {kept} aside (it verifies the runs that key signed), then retry")
+        os.replace(pub, kept)
+        os.chmod(kept, 0o644)
+    os.remove(key)
+    return kept
+
+
+def _log_format(log):
+    """A verdict stream's integrity format, from its run_start: "chain-2" (v1.41),
+    "chain-1" (v1.16 to v1.40), or None."""
+    try:
+        with open(log, encoding="utf-8", errors="surrogateescape") as fh:
+            for i, line in enumerate(fh):
+                if i > 500:
+                    break
+                if line.startswith("{") and '"event":"run_start"' in line[:80]:
+                    return json.loads(line).get("log")
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def _bom_format(path):
+    """"chain-1" for evidence signed by v1.40 or earlier (JSF Ed25519), else None."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            alg = (json.load(fh).get("signature") or {}).get("algorithm")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return "chain-1" if alg == "Ed25519" else None
+
+
+def _pubkey(cfg, fmt=None):
+    """The configured key's public half; for a chain-1 stream (or evidence) of
+    v1.40 or earlier, the retired v1.40 key's, when it was kept (v1.41)."""
+    if cfg["sign_key"] and fmt == "chain-1" and os.path.exists(cfg["sign_key"] + V140_PUB):
+        return cfg["sign_key"] + V140_PUB
     if cfg["sign_key"] and os.path.exists(cfg["sign_key"] + ".pub"):
         return cfg["sign_key"] + ".pub"
     return None
@@ -827,6 +892,11 @@ def cmd_doctor(args):
                     fail(f"signing key {cfg['sign_key']} is readable by group or others")
                     hint(f"sudo chmod 600 {cfg['sign_key']}")
                     bad += 1
+                elif _key_is_v140(cfg["sign_key"]):                    # v1.41
+                    fail(f"signing key {cfg['sign_key']} is v1.40's Ed25519 key, which the Warden no longer uses")
+                    hint("`sudo varek init` replaces it, keeping its public half as "
+                         f"{cfg['sign_key']}{V140_PUB} for the runs it signed")
+                    bad += 1
                 else:
                     ok(f"signing key {cfg['sign_key']} (mode 600)")
             except PermissionError:
@@ -889,6 +959,17 @@ def cmd_init(args):
     path = config_path()
     etc = os.path.dirname(os.path.abspath(path))
     existing = load_config(required=False)
+    # v1.41: on a host set up by v1.40 or earlier, `varek init` upgrades the
+    # signing key, and only that: the settings and the policy stay as they are
+    if existing and not args.force and existing["sign_key"] and _key_is_v140(existing["sign_key"]):
+        key = existing["sign_key"]
+        kept = _retire_v140_key(key)
+        run_cmd([tool("varek_keygen"), key], capture=True)
+        ok(f"signing key {key}: v1.40's Ed25519 key replaced by a P-384 key (600) and {key}.pub")
+        ok(f"the old key's public half kept as {kept}: `varek audit` and `varek export` use it "
+           f"for the runs that key signed")
+        ok(f"settings {path} and the policy kept")
+        return 0
     if existing and not args.force:
         raise CliError(f"{path} already exists",
                        fix="use `sudo varek policy use <pack>` to change the policy, "
@@ -922,7 +1003,13 @@ def cmd_init(args):
     key = ""
     if not args.no_sign:
         key = os.path.join(etc, "log.key")
-        if os.path.exists(key) and not args.force_key:
+        if os.path.exists(key) and _key_is_v140(key):
+            # v1.41: v1.40's Ed25519 key is retired, whether or not --force-key
+            kept = _retire_v140_key(key)
+            run_cmd([tool("varek_keygen"), key], capture=True)
+            ok(f"signing key {key}: v1.40's Ed25519 key replaced by a P-384 key (600) and {key}.pub; "
+               f"the old key's public half kept as {kept}, to verify the runs it signed")
+        elif os.path.exists(key) and not args.force_key:
             ok(f"signing key {key} kept (use --force-key to replace it)")
         else:
             for p in (key, key + ".pub"):
@@ -1725,6 +1812,11 @@ def first_use(cfg):
         os.chmod(d, 0o750)
         print(_paint("2", f"[varek] log directory {d} (750), made on first use"), file=sys.stderr)
     key = os.path.join(cfg["etc"], "log.key")
+    if os.path.exists(key) and _key_is_v140(key):                       # v1.41
+        kept = _retire_v140_key(key)
+        run_cmd([tool("varek_keygen"), key], capture=True)
+        print(_paint("2", f"[varek] signing key {key}: v1.40's Ed25519 key replaced by a P-384 key; "
+                          f"its public half kept as {kept}, for the runs it signed"), file=sys.stderr)
     if not os.path.exists(key):
         os.makedirs(cfg["etc"], exist_ok=True)
         os.chmod(cfg["etc"], 0o755)
@@ -1850,6 +1942,11 @@ def cmd_run(args):
             raise CliError("--hold-to-plan holds the run to a plan", fix="give the plan with --plan PLAN")
         argv += ["--hold-to-plan"]
     if cfg["sign_key"]:
+        if _key_is_v140(cfg["sign_key"]):                                 # v1.41
+            raise CliError(f"the signing key {cfg['sign_key']} is v1.40's Ed25519 key, which the Warden "
+                           f"no longer uses (it signs with ECDSA P-384)",
+                           fix=f"`sudo varek init` replaces it, keeping its public half as "
+                               f"{cfg['sign_key']}{V140_PUB} to verify the runs it signed")
         argv += ["--sign-key", cfg["sign_key"]]
     if cfg["anchor"]:
         argv += ["--anchor", cfg["anchor"]]
@@ -2478,7 +2575,7 @@ def cmd_audit(args):
                        fix="restore it, then audit with tools/varek_audit.py --policy <file>")
     argv = [sys.executable, tool("varek_audit.py"),
             "--policy", policy, "--checker", tool("vdp_cert_check")]
-    pub = _pubkey(cfg)
+    pub = _pubkey(cfg, _log_format(log))
     if pub:
         argv += ["--pubkey", pub]
     if cfg["anchor"] and os.path.isfile(cfg["anchor"]):
@@ -2591,7 +2688,7 @@ def _export_sent(args, sender, done):
         raise CliError("the policy file this run used is not on this host",
                        fix="restore it, or give it with --policy; the records name the policy the run used")
     ox = [sys.executable, tool("varek_ocsf.py"), "--policy", policy, "--checker", tool("vdp_cert_check")]
-    pub = args.pubkey or _pubkey(cfg)
+    pub = args.pubkey or _pubkey(cfg, _log_format(log))
     if pub:
         ox += ["--pubkey", pub]
     if cfg["anchor"] and os.path.isfile(cfg["anchor"]):
@@ -2654,7 +2751,7 @@ def cmd_export_ocsf(args):
     argv = [sys.executable, tool("varek_ocsf.py"), "--policy", policy, "--checker", tool("vdp_cert_check")]
     # review: the key given, else the configured one; the stream is audited
     # with it for --verify too
-    pub = args.pubkey or _pubkey(cfg)
+    pub = args.pubkey or _pubkey(cfg, _log_format(log))
     if pub:
         argv += ["--pubkey", pub]
     if cfg["anchor"] and os.path.isfile(cfg["anchor"]):
@@ -2702,7 +2799,7 @@ def cmd_export(args):
                        fix="the CycloneDX evidence is one document, written whole")
     if args.verify:
         cfg = load_config(required=False)
-        pub = args.pubkey or (_pubkey(cfg) if cfg else None)
+        pub = args.pubkey or (_pubkey(cfg, _bom_format(args.verify)) if cfg else None)
         if not pub:
             raise CliError("verifying needs the Warden's public key",
                            fix="pass --pubkey /etc/varek/log.key.pub")
@@ -2724,8 +2821,12 @@ def cmd_export(args):
             raise CliError("signing the evidence needs the signing key, which only root can read",
                            fix="run `sudo varek export`, or `varek export --no-sign`")
         argv += ["--sign-key", cfg["sign_key"]]
-    elif _pubkey(cfg):
-        argv += ["--pubkey", _pubkey(cfg)]
+        # v1.41: a run of v1.40 or earlier is checked under its retired key's
+        # public half, and the evidence signed with today's key
+        if _pubkey(cfg, _log_format(log)) and _pubkey(cfg, _log_format(log)).endswith(V140_PUB):
+            argv += ["--pubkey", _pubkey(cfg, _log_format(log))]
+    elif _pubkey(cfg, _log_format(log)):
+        argv += ["--pubkey", _pubkey(cfg, _log_format(log))]
     if args.allow_incomplete:
         argv.append("--allow-incomplete")
     rc = run_cmd(argv, check=False).returncode

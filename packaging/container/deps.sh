@@ -37,11 +37,13 @@ if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     case "$stage" in
-    build)   pkgs="build-essential libseccomp-dev libsodium-dev libssl-dev python3 ca-certificates" ;;
+    build)   pkgs="build-essential libseccomp-dev libssl-dev python3 ca-certificates" ;;
     # what CI installs for the suites (.github/workflows/warden-build.yml)
     test)    pkgs="openjdk-21-jdk-headless musl-tools squid python3-cryptography python3-pytest python3-yaml
                    python3-pip curl openssl git iproute2 procps sudo" ;;
-    runtime) pkgs="libseccomp2 libsodium23 libssl3t64 python3 ca-certificates" ;;
+    # v1.41: python3-cryptography: varek_audit.py verifies signatures with it
+    # (tools/varek_ed25519.py), here and in the node image's exporter
+    runtime) pkgs="libseccomp2 libssl3t64 python3 python3-cryptography ca-certificates" ;;
     esac
     # shellcheck disable=SC2086
     apt-get install -y -qq --no-install-recommends $pkgs >/dev/null
@@ -49,32 +51,21 @@ if command -v apt-get >/dev/null 2>&1; then
 elif command -v dnf >/dev/null 2>&1; then
     case "$stage" in
     build)
-        retry dnf -y -q install epel-release dnf-plugins-core
+        # v1.41: no EPEL (it was there for libsodium, which VAREK no longer uses)
+        retry dnf -y -q install dnf-plugins-core
         dnf config-manager --set-enabled crb
         # glibc-static (CodeReady Builder): the launcher, varek-init, is static (v1.34)
-        retry dnf -y -q install gcc make libseccomp-devel libsodium-devel openssl-devel python3 glibc-static ;;
+        retry dnf -y -q install gcc make libseccomp-devel openssl-devel python3 glibc-static ;;
     test) echo "deps.sh: the test stage is Ubuntu's (see the Containerfile)" >&2; exit 2 ;;
-    runtime) retry dnf -y -q install libseccomp libsodium openssl-libs python3 ;;
+    runtime) retry dnf -y -q install libseccomp openssl-libs python3 python3-cryptography ;;
     esac
     dnf clean all >/dev/null
 elif command -v microdnf >/dev/null 2>&1; then
     [ "$stage" = runtime ] || { echo "deps.sh: microdnf images are for the runtime stage only" >&2; exit 2; }
-    # libsodium is not in UBI's repositories; it comes from EPEL 9, as on RHEL.
-    # EPEL's key is the one kept with this file (packaging/container/
-    # RPM-GPG-KEY-EPEL-9, fingerprint FF8A D134 4597 106E CE81 3B91 8A38 72BF
-    # 3228 467C), imported first, so epel-release is installed only signed by
-    # it, and every EPEL package microdnf installs after it is checked by it
-    if ! rpm -q epel-release >/dev/null 2>&1; then
-        key="${VAREK_EPEL_KEY:-/tmp/RPM-GPG-KEY-EPEL-9}"
-        rpm --import "$key"
-        rpm -q gpg-pubkey-3228467c >/dev/null || { echo "deps.sh: EPEL 9's key did not import" >&2; exit 1; }
-        curl -fsSL -o /tmp/epel-release.rpm https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
-        rpm -K /tmp/epel-release.rpm | grep -q 'digests signatures OK$' ||
-            { echo "deps.sh: epel-release is not signed by EPEL 9's key" >&2; exit 1; }
-        rpm -i /tmp/epel-release.rpm
-        rm -f /tmp/epel-release.rpm "$key"
-    fi
-    retry microdnf -y install libseccomp libsodium openssl-libs python3 >/dev/null
+    # v1.41: every package is UBI's own (libsodium, which needed EPEL, is no
+    # longer used: the Warden's hashing and signing are the host's OpenSSL)
+    # v1.41: python3-cryptography too (UBI's), the audit's signature checks
+    retry microdnf -y install libseccomp openssl-libs python3 python3-cryptography >/dev/null
     microdnf clean all >/dev/null
 else
     echo "deps.sh: no apt-get, dnf or microdnf" >&2; exit 2

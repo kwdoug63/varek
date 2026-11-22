@@ -10,7 +10,7 @@
 # The guest: RHEL 9.6 or later on aarch64, registered (subscription-manager)
 # or a cloud's own RHEL image (its repositories from the cloud's RHUI), or a
 # rebuild of it (AlmaLinux, Rocky Linux) or CentOS Stream 9. It installs
-# what the Warden needs to build (libsodium from EPEL), builds it from a copy
+# what the Warden needs to build (all from RHEL; v1.41: no EPEL), builds it from a copy
 # of SRC in /opt/varek-src, installs it (make install: /opt/varek, varek in
 # /usr/bin), makes sure Landlock is on, and runs varek doctor.
 set -euo pipefail
@@ -44,26 +44,7 @@ esac
 
 say "packages"
 dnf -y install gcc make git tar python3 libseccomp-devel openssl-devel
-# libsodium (the Warden's Ed25519 signatures) is in EPEL, not RHEL. EPEL's
-# key is the one kept with this file (RPM-GPG-KEY-EPEL-9, fingerprint FF8A
-# D134 4597 106E CE81 3B91 8A38 72BF 3228 467C), imported first, so
-# epel-release is installed only signed by it (dnf does not check a package
-# given by its URL), and every EPEL package after it is checked by it
-if ! rpm -q epel-release > /dev/null 2>&1; then
-    KEY="$SRC/varek/v1_4/packaging/vm/RPM-GPG-KEY-EPEL-9"
-    FPR="$(gpg --show-keys --with-colons "$KEY" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }')"
-    [ "$FPR" = FF8AD1344597106ECE813B918A3872BF3228467C ] || die "the EPEL key kept with this file is not EPEL 9's ($FPR)"
-    rpm --import "$KEY"
-    rpm -q gpg-pubkey-3228467c > /dev/null || die "EPEL 9's key did not import"
-    T="$(mktemp -d)"
-    curl -fsSL -o "$T/epel-release.rpm" https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
-    # signed, and by that key (rpm -K alone accepts any key imported)
-    rpm -Kv "$T/epel-release.rpm" | grep -Eqi 'signature.*key id 3228467c: ok' || die "epel-release is not signed by EPEL 9's key"
-    rpm -K "$T/epel-release.rpm" | grep -q 'digests signatures OK$' || die "epel-release's digests or signatures do not check"
-    dnf -y install "$T/epel-release.rpm"
-    rm -rf "$T"
-fi
-dnf -y install libsodium-devel
+# v1.41: nothing from EPEL (it was there for libsodium, which VAREK no longer uses)
 
 say "the Warden, from $SRC"
 rm -rf /opt/varek-src.new

@@ -221,7 +221,7 @@ static void px_close_record(uint64_t id, const char *why, const struct wp_close 
         static const uint8_t zero[32];
         if (memcmp(m->server_cert, zero, sizeof zero)) {
             char hx[65];
-            sodium_bin2hex(hx, sizeof hx, m->server_cert, sizeof m->server_cert);
+            vfips_bin2hex(hx, sizeof hx, m->server_cert, sizeof m->server_cert);
             fprintf(f, "\"server_cert_sha256\":\"%s\",", hx);
         }
         if (m->tls_why[0]) {
@@ -961,10 +961,10 @@ static const char *px_token_refused(const struct px_open *o, const struct wp_mcp
     if (m->token == WP_TOK_NONE || m->token == WP_TOK_PLACEHOLDER) return NULL;
     if (g_identity.has_user) {                /* a copy of the run's user token would be passthrough */
         char hx[65];
-        sodium_bin2hex(hx, sizeof hx, m->token_sha256, sizeof m->token_sha256);
+        vfips_bin2hex(hx, sizeof hx, m->token_sha256, sizeof m->token_sha256);
         char sx[65] = "";
         if (m->token == WP_TOK_JWT)           /* review: or the same claims, signed again (ECDSA's other s) */
-            sodium_bin2hex(sx, sizeof sx, m->token_sin_sha256, sizeof m->token_sin_sha256);
+            vfips_bin2hex(sx, sizeof sx, m->token_sin_sha256, sizeof m->token_sin_sha256);
         if (!strcmp(hx, g_identity.token_sha256) || (sx[0] && !strcmp(sx, g_identity.token_sin_sha256))) {
             snprintf(why, wn, "its bearer token is the run's user token, which no call may pass on");
             return "mcp_token_user";
@@ -1085,7 +1085,7 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
     bool dry_allow = m->ok == WP_MCP_OK && d_final != DEC_ALLOW && dry_let(a, rule);
     if (dry_allow) snprintf(why, sizeof why, "dry run");
     char hx[65];
-    sodium_bin2hex(hx, sizeof hx, m->sha256, sizeof m->sha256);
+    vfips_bin2hex(hx, sizeof hx, m->sha256, sizeof m->sha256);
     size_t el;
     bool cut = false;
     snprintf(a->extra, sizeof a->extra, "\"proxy_conn\":%llu,\"request_seq\":%llu,\"mcp_url\":\"%s\",",
@@ -1180,7 +1180,7 @@ static int px_httpbody(const struct wp_httpbody *m) {
     o->body_seq = 0;
     if (m->exceeded == 1) o->cut = true;
     char hx[65];
-    sodium_bin2hex(hx, sizeof hx, m->sha256, sizeof m->sha256);
+    vfips_bin2hex(hx, sizeof hx, m->sha256, sizeof m->sha256);
     FILE *f = rec_begin();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

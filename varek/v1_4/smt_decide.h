@@ -684,8 +684,12 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * filter, the grammar stays 1.35; v1.39.0: security operations, the OCSF
  * events sent to OpenTelemetry and Splunk, the grammar stays 1.35; v1.40.0:
  * Microsoft Sentinel, a failed export resumed, the sector packs at
- * `require warden 1.27`, the grammar stays 1.35) */
-#define VDP_WARDEN_REL_MINOR 40
+ * `require warden 1.27`, the grammar stays 1.35; v1.41.0: every hash and
+ * signature through the host's OpenSSL 3 provider (the FIPS provider on a
+ * host in FIPS mode), the verdict stream in format chain-2 (SHA-384, ECDSA
+ * P-384), libsodium no longer used, and the Defense build (make DEFENSE=1);
+ * the grammar stays 1.35) */
+#define VDP_WARDEN_REL_MINOR 41
 #define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's
                                  * (v1.36.1: packaging for Red Hat's certification;
                                  * v1.36.2: the node key published again, a test

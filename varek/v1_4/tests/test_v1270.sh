@@ -65,6 +65,7 @@ CERT="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
 WARDEN="${3:-}"
 [ -n "$WARDEN" ] && WARDEN="$(cd "$(dirname "$WARDEN")" && pwd)/$(basename "$WARDEN")"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+export VAREK_TESTS="$HERE/tests"   # tests/varek_logfmt.py, for the re-chainers: chain-1 or chain-2, as the stream says
 OUT="$(mktemp -d)"
 fail=0 skips=0
 pass()  { printf '  PASS   %s\n' "$1"; }
@@ -455,12 +456,12 @@ import hashlib, json, sys
 src, out, gs, fs, ws = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
 lines = open(src, errors="surrogateescape").read().splitlines(True)
 def rechain(recs, name):
-    head = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
+    sys.path.insert(0, __import__("os").environ["VAREK_TESTS"]); F = __import__("varek_logfmt").of_lines(recs); head = F["iv"]   # the stream's own format
     with open(f"{out}/{name}", "w", errors="surrogateescape") as f:
         for l in recs:
             if l.startswith("{") and ',"chain":"' in l:
                 body = l[:l.index(',"chain":"')]
-                head = hashlib.sha256(head + body.encode("utf-8", "surrogateescape")).digest()
+                head = F["hash"](head + body.encode("utf-8", "surrogateescape")).digest()
                 l = body + ',"chain":"' + head.hex() + '"}\n'
             f.write(l)
 def edit(seq, fn, name):
