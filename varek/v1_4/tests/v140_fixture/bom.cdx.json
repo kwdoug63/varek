@@ -1,10 +1,10 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.6",
-  "serialNumber": "urn:uuid:1aaed819-4058-42e1-875a-bc6b40925761",
+  "serialNumber": "urn:uuid:00000000-0000-4000-8000-000000000140",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-11-22T13:30:10Z",
+    "timestamp": "2026-11-22T12:12:01Z",
     "lifecycles": [
       {
         "phase": "operations"
@@ -50,8 +50,8 @@
     "component": {
       "type": "application",
       "bom-ref": "agent-run",
-      "name": "/bin/sh",
-      "version": "2026-11-22T13:30:05Z",
+      "name": "cat",
+      "version": "2026-11-22T12:12:01Z",
       "description": "Autonomous agent run whose process's actions the VAREK Warden decided at the kernel.",
       "properties": [
         {
@@ -60,7 +60,7 @@
         },
         {
           "name": "varek:policy",
-          "value": "policy.txt"
+          "value": "/tmp/varek_v140_fixture/policy.txt"
         },
         {
           "name": "varek:policy.sha256",
@@ -68,15 +68,15 @@
         },
         {
           "name": "varek:run.id",
-          "value": "36bace810beb2ba1adc0addf0e9dd53c"
+          "value": "29ca8e8de6925b63e7992cd45dd0bbcb"
         },
         {
           "name": "varek:log.chain",
-          "value": "aad952e650199ebaea037f6224000e24352736fd9bd667ec318f96cf3252dd0f"
+          "value": "66356e707a5ff18d592c1b9e2cb0d1fa612eddfca5220dc5a07b68f77d29ec47"
         },
         {
           "name": "varek:log.pubkey",
-          "value": "64814ad13062fbc949f26d78e52b00458125315346ac1897d35284fe2f82bc41"
+          "value": "724778fa88452299ffdcd75c1a63630847292bb85391efb18f408dd87e7cd1bd"
         },
         {
           "name": "varek:run.complete",
@@ -84,19 +84,19 @@
         },
         {
           "name": "varek:run.start",
-          "value": "2026-11-22T13:30:05Z"
+          "value": "2026-11-22T12:12:01Z"
         },
         {
           "name": "varek:run.end",
-          "value": "2026-11-22T13:30:05Z"
+          "value": "2026-11-22T12:12:01Z"
         },
         {
           "name": "varek:decisions.total",
-          "value": "29"
+          "value": "9"
         },
         {
           "name": "varek:decisions.authorized",
-          "value": "27"
+          "value": "7"
         },
         {
           "name": "varek:decisions.refused",
@@ -116,15 +116,15 @@
         },
         {
           "name": "varek:authorized.files",
-          "value": "26"
+          "value": "6"
         },
         {
           "name": "varek:authorized.files.resolved",
-          "value": "26"
+          "value": "6"
         },
         {
           "name": "varek:authorized.certified",
-          "value": "26"
+          "value": "6"
         },
         {
           "name": "varek:certificates.refused",
@@ -147,7 +147,7 @@
       },
       {
         "name": "varek:verdict.allow",
-        "value": "27"
+        "value": "7"
       },
       {
         "name": "varek:verdict.deny",
@@ -162,8 +162,8 @@
   "components": [
     {
       "type": "data",
-      "bom-ref": "authorized-object:76d097a9-666c-5270-81a9-e66bda5a9ddf",
-      "name": "/bin/sh",
+      "bom-ref": "authorized-object:4282424e-f461-59ba-9f2a-88ef866f98da",
+      "name": "/bin/cat",
       "description": "Object the agent was authorized to reach via process.exec.",
       "properties": [
         {
@@ -176,7 +176,7 @@
         },
         {
           "name": "varek:requested",
-          "value": "/bin/sh"
+          "value": "/bin/cat"
         },
         {
           "name": "varek:kernel_verdict",
@@ -415,8 +415,8 @@
           "version": "1.40.0"
         }
       },
-      "timestamp": "2026-11-22T13:30:10Z",
-      "text": "VAREK authorization record for policy 'policy.txt' (SHA-256 b0a146d91ff72df0aad9b4c534051a8f301c003e2fd13a7bd947c24de81b1e70, equal to the file named). 29 decision(s) recorded between 2026-11-22T13:30:05Z and 2026-11-22T13:30:05Z: 27 authorized, 2 refused. Raw verdicts: ALLOW=27, DENY=1, UNKNOWN=1. All 1 UNKNOWN verdict(s) were refused (symmetric suppression). All 26 authorized file decision(s) name the resolved canonical object they were made on. 26 of 27 authorization(s) carry a certificate the independent checker accepted. The stream is hash-chained (this exporter checked the chain); all 5 of its signed records verify under the key 64814ad13062fbc949f26d78e52b00458125315346ac1897d35284fe2f82bc41, checked by this exporter. The record covers the system calls this Warden version pauses and decides: file opens and file lookups (stat, access, readlink), connects (each dialed by the Warden and handed over), program launches, and sends that name a destination or carry control data. Calls the kernel filter admits without asking the Warden (reads and writes on descriptors already held, memory, time, threads) and calls it refuses outright are not recorded. No user's token was given: the run acted for the agent alone."
+      "timestamp": "2026-11-22T12:12:01Z",
+      "text": "VAREK authorization record for policy '/tmp/varek_v140_fixture/policy.txt' (SHA-256 b0a146d91ff72df0aad9b4c534051a8f301c003e2fd13a7bd947c24de81b1e70, equal to the file named). 9 decision(s) recorded between 2026-11-22T12:12:01Z and 2026-11-22T12:12:01Z: 7 authorized, 2 refused. Raw verdicts: ALLOW=7, DENY=1, UNKNOWN=1. All 1 UNKNOWN verdict(s) were refused (symmetric suppression). All 6 authorized file decision(s) name the resolved canonical object they were made on. 6 of 7 authorization(s) carry a certificate the independent checker accepted. The stream is hash-chained (this exporter checked the chain); all 6 of its signed records verify under the key 724778fa88452299ffdcd75c1a63630847292bb85391efb18f408dd87e7cd1bd, checked by this exporter. The record covers the system calls this Warden version pauses and decides: file opens and file lookups (stat, access, readlink), connects (each dialed by the Warden and handed over), program launches, and sends that name a destination or carry control data. Calls the kernel filter admits without asking the Warden (reads and writes on descriptors already held, memory, time, threads) and calls it refuses outright are not recorded. No user's token was given: the run acted for the agent alone."
     }
   ],
   "signature": {
@@ -424,8 +424,8 @@
     "publicKey": {
       "kty": "OKP",
       "crv": "Ed25519",
-      "x": "ZIFK0TBi-8lJ8m145SsARYElMVNGrBiX01KE_i-CvEE"
+      "x": "ckd4-ohFIpn_3NdcGmNjCEcpK7hTke-xj0CN2H580b0"
     },
-    "value": "DFiLfhSd2gJaGrhl_jC2Ad4h0TqmK-8q7V_ucuzSosWaVxBL4sNq4g8n6JfuyZwBUmx5MhEVNTBfkcpKRVzoCg"
+    "value": "jIchduyJ_nL9DFex6tVLyiobd4YY2RXUhRn8j1OkrloWgzsrnGQXDvMzVejwQpz3EA-_nTVqxhdcW4ASnmXKCA"
   }
 }

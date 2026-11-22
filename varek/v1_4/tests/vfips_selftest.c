@@ -89,6 +89,19 @@ int main(int argc, char **argv) {
           "base64 (PEM body) decoded");
     CHECK(vfips_b64decode(dec, sizeof dec, "3q2+7w*/gA==", 12, &bl) != 0, "... and a stray byte refused");
 
+    {   // a key made here: its recorded public key is the uncompressed point,
+        // and the same one its PEM gives back (RHEL 9.8's OpenSSL 3.5 and its
+        // FIPS provider hand out the compressed form unless asked otherwise)
+        static char gpem[4096];
+        char gp[VFIPS_PUB_HEX_MAX], lp[VFIPS_PUB_HEX_MAX];
+        CHECK(vfips_keygen_pem(gpem, sizeof gpem, gp, sizeof gp) == 0, "a P-384 key generated");
+        CHECK(strlen(gp) == 194 && !strncmp(gp, "04", 2), "... its public key recorded as the 97-byte uncompressed point");
+        vfips_key *g = vfips_key_load_pem(gpem, strlen(gpem), why, sizeof why);
+        CHECK(g && vfips_pubkey_hex(g, lp, sizeof lp) == 194 && !strcmp(gp, lp),
+              "... and its PEM, loaded, gives the same point");
+        vfips_key_free(g);
+        vfips_memzero(gpem, sizeof gpem);
+    }
     if (argc < 2) { printf("  (no key given: the round trip is not run)\n"); return fails ? 1 : 0; }
     FILE *f = fopen(argv[1], "rb");
     if (!f) { perror(argv[1]); return 1; }
@@ -102,6 +115,17 @@ int main(int argc, char **argv) {
     if (!k) { printf("  (%s)\n", why); return 1; }
     char kp[VFIPS_PUB_HEX_MAX];
     CHECK(vfips_pubkey_hex(k, kp, sizeof kp) == 194 && !strncmp(kp, "04", 2), "its public key: the 97-byte point");
+    {   // and varek_keygen's .pub next to it says the same
+        char pubpath[4096], pubtxt[VFIPS_PUB_HEX_MAX + 2] = {0};
+        snprintf(pubpath, sizeof pubpath, "%s.pub", argv[1]);
+        FILE *pf = fopen(pubpath, "r");
+        if (pf) {
+            if (!fgets(pubtxt, sizeof pubtxt, pf)) pubtxt[0] = '\0';
+            fclose(pf);
+            pubtxt[strcspn(pubtxt, "\n")] = '\0';
+            CHECK(!strcmp(pubtxt, kp), "varek_keygen's .pub is the same uncompressed point");
+        }
+    }
     unsigned char chain[VFIPS_CHAIN_LEN];
     vfips_sha384("record-bytes", 12, chain);
     unsigned char msg[sizeof VFIPS_LOG_SIG_DOMAIN - 1 + VFIPS_CHAIN_LEN];
