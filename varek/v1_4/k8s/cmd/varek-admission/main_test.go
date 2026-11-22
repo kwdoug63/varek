@@ -903,6 +903,21 @@ func TestVarekNodeKey(t *testing.T) {
 	if ok, msg := ask("CREATE", bad, nil, agent, "node-1"); ok || !strings.Contains(msg, "64 lowercase hex") {
 		t.Errorf("a key not as the Warden writes it: %v %q", ok, msg)
 	}
+	// v1.41: a P-384 key (the uncompressed point) is admitted; one that is
+	// not a point (no 04), or is cut short, is not
+	p384 := "04" + strings.Repeat("ab", 96)
+	good := nk("node-1", "")
+	good.Spec.PublicKey, good.Metadata.Name = p384, kube.NodeKeyName("node-1", p384)
+	if ok, msg := ask("CREATE", good, nil, agent, "node-1"); !ok {
+		t.Errorf("a P-384 key refused: %q", msg)
+	}
+	for _, k := range []string{"05" + strings.Repeat("ab", 96), "04" + strings.Repeat("ab", 95)} {
+		b2 := nk("node-1", "")
+		b2.Spec.PublicKey, b2.Metadata.Name = k, kube.NodeKeyName("node-1", k)
+		if ok, msg := ask("CREATE", b2, nil, agent, "node-1"); ok || !strings.Contains(msg, "194 lowercase hex") {
+			t.Errorf("a key that is not a P-384 point admitted (%.6s...): %v %q", k, ok, msg)
+		}
+	}
 	// never changed; labels and the like may be
 	other := nk("node-1", "")
 	other.Spec.PublicKey = strings.Repeat("cd", 32)

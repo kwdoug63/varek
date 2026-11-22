@@ -81,6 +81,7 @@
 #include <unistd.h>
 #include <grp.h>
 
+#include "varek_fips.h"          /* v1.41: provider selection and the FIPS check */
 #include <openssl/core_names.h>
 #include <openssl/ec.h>
 #include <openssl/err.h>
@@ -1011,16 +1012,25 @@ static void hexs(const unsigned char *d, size_t n, char *out) {
     out[2 * n] = '\0';
 }
 
+/* v1.41: a digest or MAC the provider cannot compute ends the helper (the
+ * Warden then refuses to start the run): through v1.40 the result was not
+ * checked, and an uncomputed digest left uninitialised bytes to be signed. */
 static void sha256_hex(const void *d, size_t n, char out[65]) {
     unsigned char h[32];
     unsigned int hl = 0;
-    EVP_Digest(d, n, h, &hl, EVP_sha256(), NULL);
+    if (EVP_Digest(d, n, h, &hl, EVP_sha256(), NULL) != 1 || hl != 32) {
+        fprintf(stderr, "[secrets] SHA-256 via the host crypto provider failed\n");
+        abort();
+    }
     hexs(h, 32, out);
 }
 
 static void hmac(const void *k, size_t kl, const void *d, size_t dl, unsigned char out[32]) {
     size_t ol = 0;
-    EVP_Q_mac(NULL, "HMAC", NULL, "SHA256", NULL, k, kl, d, dl, out, 32, &ol);
+    if (!EVP_Q_mac(NULL, "HMAC", NULL, "SHA256", NULL, k, kl, d, dl, out, 32, &ol) || ol != 32) {
+        fprintf(stderr, "[secrets] HMAC-SHA256 via the host crypto provider failed\n");
+        abort();
+    }
 }
 
 /* The instance's role credentials, through IMDSv2. 0, or -1 with why. */
@@ -2200,6 +2210,20 @@ int main(int argc, char **argv) {
     /* v1.28 review: a store that resets the connection must not kill the
      * helper (SIGPIPE): it reports the failure instead */
     (void)signal(SIGPIPE, SIG_IGN);
+    /* v1.41: the crypto backend, before any certificate, key or token is
+     * read (verify_svid runs as root, before the drop, as OpenSSL's first use
+     * did). The host's OpenSSL configuration is read, so system crypto policy
+     * applies to this helper's TLS; on a host in FIPS mode the FIPS provider
+     * services its TLS, digests, HMAC and signature checks. In the Defense
+     * build it refuses to run unless that provider is active, and the Warden
+     * then refuses to start the run. */
+    {
+        char cwhy[256] = {0};
+        if (vfips_init(0, cwhy, sizeof cwhy) != 0) {
+            fprintf(stderr, "[secrets] refusing to run: %s\n", cwhy);
+            return 2;
+        }
+    }
     if (arena_init() < 0) return 2;
     /* the setup and the credentials */
     static struct ws_setup su;

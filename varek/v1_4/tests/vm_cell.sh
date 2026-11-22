@@ -96,13 +96,13 @@ if [ "$CMD" = inside ]; then
     mkdir -p "$OUT"
     . /etc/os-release
     measure "vm" "$PRETTY_NAME, $(uname -r), SELinux $(getenforce 2>/dev/null || echo none), $(nproc) CPUs, $(awk '/MemTotal/ {print int($2 / 1024)}' /proc/meminfo) MB"
-    # RHEL 9's rebuilds: libsodium is EPEL's, glibc-static CodeReady
-    # Builder's (the image's own build does the same, packaging/container/deps.sh)
+    # RHEL 9's rebuilds: glibc-static is CodeReady Builder's (the image's own
+    # build does the same, packaging/container/deps.sh); v1.41: no EPEL
     case "$ID" in
         rocky|almalinux|centos)
-            dnf -y -q install epel-release dnf-plugins-core > "$OUT/repos.log" 2>&1 &&
+            dnf -y -q install dnf-plugins-core > "$OUT/repos.log" 2>&1 &&
                 dnf config-manager --set-enabled crb >> "$OUT/repos.log" 2>&1 ||
-                { cat "$OUT/repos.log"; echo "vm_cell.sh: EPEL and CRB"; exit 1; } ;;
+                { cat "$OUT/repos.log"; echo "vm_cell.sh: CRB"; exit 1; } ;;
     esac
     cd "$ROOT" || exit 1
     case "$CELL" in
@@ -148,7 +148,7 @@ if [ "$CMD" = inside ]; then
         [ "$(getenforce 2>/dev/null)" = Enforcing ] || { measure "selinux" "not enforcing: the cell's point is missing"; exit 1; }
         # what the chart test needs: its two tools built here, skopeo for
         # the image, helm (its newest 3.x release, checked by its SHA-256)
-        dnf -y -q --allowerasing install gcc make git libseccomp-devel libsodium-devel openssl-devel python3 \
+        dnf -y -q --allowerasing install gcc make git libseccomp-devel openssl-devel python3 \
             skopeo tar curl audit > "$OUT/deps.log" 2>&1 || { tail -30 "$OUT/deps.log"; echo "vm_cell.sh: dnf failed"; exit 1; }
         make -C "$HERE" tools/varek_keygen tools/vdp_cert_check > "$OUT/build.log" 2>&1 ||
             { tail -30 "$OUT/build.log"; echo "vm_cell.sh: the tools did not build"; exit 1; }

@@ -323,23 +323,30 @@ static void names_record_fields(struct action *a) {
     if (!g_names_on || a->ncand == 0) return;     /* a Unix connect has no candidates */
     if (a->ncand > NAMES_LISTED) {
         const char **v = malloc((size_t)a->ncand * sizeof *v);
-        unsigned char h[crypto_hash_sha256_BYTES];
-        char hx[2 * crypto_hash_sha256_BYTES + 1];
+        unsigned char h[VFIPS_SHA256_LEN];
+        char hx[2 * VFIPS_SHA256_LEN + 1];
         if (!v) {
             snprintf(a->extra, sizeof a->extra, "\"dialed\":\"%s\",\"candidates_n\":%d,", a->dialed, a->ncand);
             return;
         }
         for (int c = 0; c < a->ncand; c++) v[c] = g_cand[c];
         qsort(v, (size_t)a->ncand, sizeof *v, cand_cmp);
-        crypto_hash_sha256_state st;
-        crypto_hash_sha256_init(&st);
-        for (int c = 0; c < a->ncand; c++) {
-            if (c) crypto_hash_sha256_update(&st, (const unsigned char *)"\n", 1);
-            crypto_hash_sha256_update(&st, (const unsigned char *)v[c], strlen(v[c]));
+        /* v1.41: via the host provider. A digest it cannot compute stops
+         * supervision (fail closed) rather than record a wrong one. */
+        vfips_md *st = vfips_md_new(256);
+        int bad = !st;
+        for (int c = 0; !bad && c < a->ncand; c++) {
+            if (c && vfips_md_update(st, "\n", 1) != 0) bad = 1;
+            if (!bad && vfips_md_update(st, v[c], strlen(v[c])) != 0) bad = 1;
         }
-        crypto_hash_sha256_final(&st, h);
+        if (!bad && vfips_md_final(st, h) != 0) bad = 1;
+        vfips_md_free(st);
         free(v);
-        sodium_bin2hex(hx, sizeof hx, h, sizeof h);
+        if (bad) {
+            fprintf(stderr, "[warden] candidates digest: SHA-256 via the host crypto provider failed; stopping\n");
+            abort();
+        }
+        vfips_bin2hex(hx, sizeof hx, h, sizeof h);
         snprintf(a->extra, sizeof a->extra,
                  "\"dialed\":\"%s\",\"candidates_n\":%d,\"candidates_sha256\":\"%s\","
                  "\"resolution_generation\":%llu,",
