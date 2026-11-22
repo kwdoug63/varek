@@ -25,7 +25,7 @@ langchain-aws==1.9.3
 langchain-mcp-adapters==0.3.2
 openai-agents==0.24.0
 openai==3.49.0
-anthropic==2.8.0
+anthropic==2.10.0
 mcp==1.30.0
 # read as data by the adapters, not imported; installed to check the specs
 # and settings the samples hold against what the framework's own tools write
