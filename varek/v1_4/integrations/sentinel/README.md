@@ -49,8 +49,9 @@ One of:
   (`--azure-auth managed-identity`; `--azure-client-id` for a
   user-assigned one). No secret at all.
 
-A new role assignment can take some minutes to apply; until it does, the
-API answers 403.
+A new role assignment can take up to about half an hour to apply (23
+minutes in the managed-identity live test, November 21, 2026); until it
+does, the API answers 403.
 
 ## 3. Export
 

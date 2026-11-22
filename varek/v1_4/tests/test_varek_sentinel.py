@@ -114,7 +114,7 @@ def test_the_rules_judge_each_row_when_it_arrives():
         assert last.startswith(("| summarize TimeGenerated = max(TimeGenerated),", "| project TimeGenerated,")), \
             (r["displayName"], last)
         inc = r["incidentConfiguration"]
-        if inc["createIncident"]:          # a second alert for a run joins its run's incident
+        if inc["createIncident"]:          # a run's repeated alerts join its run's incident
             g = inc["groupingConfiguration"]
             assert g["enabled"] is True and "RunId" in g["groupByCustomDetails"], r["displayName"]
     assert sum(r["incidentConfiguration"]["createIncident"] for r in rules) == 2   # the dry run's: no incident
