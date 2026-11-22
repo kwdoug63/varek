@@ -10,6 +10,7 @@ Author: Kenneth Wayne Douglas, MD
 Published by Sober Agentic Infrastructure, Inc.
 Security contact: kenneth.douglas@soberagents.ai
 License: MIT · Project: [varek-lang.org](https://varek-lang.org) · Source: [github.com/kwdoug63/varek](https://github.com/kwdoug63/varek)
+Open-source practice: [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/16965/badge)](https://www.bestpractices.dev/projects/16965)
 
 ---
 
