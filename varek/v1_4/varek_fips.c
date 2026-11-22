@@ -20,6 +20,8 @@
 #include <openssl/err.h>
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
+#include <openssl/bn.h>
+#include <openssl/core_names.h>
 #include <openssl/provider.h>
 #include <openssl/core_names.h>
 #include <openssl/param_build.h>
@@ -181,9 +183,25 @@ static bool is_p384(EVP_PKEY *pkey) {
     return strcmp(g, "secp384r1") == 0 || strcmp(g, "P-384") == 0;
 }
 
+// The public key as the uncompressed point 0x04 || X || Y (97 bytes for
+// P-384), built from the key's coordinates. OSSL_PKEY_PARAM_PUB_KEY gives the
+// point in the key's conversion form, which is not fixed: RHEL 9.8's OpenSSL
+// 3.5 with its FIPS provider gives the compressed form (49 bytes), so the
+// encoding VAREK records is built here, whatever the library's default.
 static int pub_octets(EVP_PKEY *pkey, unsigned char *buf, size_t cap, size_t *len) {
-    return EVP_PKEY_get_octet_string_param(pkey, OSSL_PKEY_PARAM_PUB_KEY,
-                                           buf, cap, len) == 1 ? 0 : -1;
+    BIGNUM *x = NULL, *y = NULL;
+    int rc = -1;
+    if (cap >= 97 &&
+        EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_EC_PUB_X, &x) == 1 &&
+        EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_EC_PUB_Y, &y) == 1 &&
+        BN_bn2binpad(x, buf + 1, 48) == 48 && BN_bn2binpad(y, buf + 49, 48) == 48) {
+        buf[0] = 0x04;
+        *len = 97;
+        rc = 0;
+    }
+    BN_free(x);
+    BN_free(y);
+    return rc;
 }
 
 int vfips_keygen_pem(char *pem, size_t pemn, char *pub_hex, size_t pubn) {

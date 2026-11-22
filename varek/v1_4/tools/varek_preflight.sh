@@ -254,8 +254,9 @@ if [ -n "$KEY" ]; then
                 pass "signing key is a PKCS#8 PEM private key"
                 if command -v openssl >/dev/null 2>&1; then
                     # Only the public half is derived (nothing of the private key
-                    # is printed): P-384's OID, 1.3.132.0.34, in its DER form
-                    spki="$(openssl pkey -in "$K" -pubout -outform DER 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+                    # is printed), its point uncompressed whatever the key's own form (RHEL 9.8's
+                    # OpenSSL writes it compressed): P-384's OID, 1.3.132.0.34, in its DER form
+                    spki="$(openssl pkey -in "$K" -pubout -outform DER -ec_conv_form uncompressed 2>/dev/null | od -An -tx1 | tr -d ' \n')"
                     if [ -z "$spki" ]; then fail "signing key: openssl cannot read it as a private key"
                     elif [[ "$spki" == *06052b81040022* ]]; then
                         pass "signing key is on curve P-384"

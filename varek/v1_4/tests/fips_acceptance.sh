@@ -39,6 +39,16 @@ if [ "$(cat /proc/sys/crypto/fips_enabled 2>/dev/null)" != 1 ]; then
     echo "  On RHEL 9: sudo fips-mode-setup --enable && sudo reboot, then run this again." >&2
     exit 2
 fi
+# The test probes (tests/v1160_probe and the like) are static by design, so the
+# host needs its C library's static archive; on RHEL that is glibc-static, from
+# CodeReady Builder. Said now, not as a link error halfway through.
+if ! printf 'int main(void){return 0;}\n' | cc -static -x c -o /dev/null - 2>/dev/null; then
+    echo "fips_acceptance.sh: no static C library (the test probes are built static)." >&2
+    echo "  On RHEL 9 on EC2 (RHUI): sudo dnf config-manager --set-enabled codeready-builder-for-rhel-9-rhui-rpms" >&2
+    echo "  (elsewhere: sudo subscription-manager repos --enable codeready-builder-for-rhel-9-x86_64-rpms)" >&2
+    echo "  then: sudo dnf install -y glibc-static, and run this again." >&2
+    exit 2
+fi
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUTBASE="${1:-$PWD/varek-fips-evidence}"
 E="$OUTBASE/varek-fips-acceptance-$(hostname -s)-$STAMP"
@@ -52,8 +62,9 @@ note() { line INFO "$1"; }
 {
     echo "VAREK v1.41 Defense build: acceptance on RHEL 9 in FIPS mode"
     echo "host $(hostname -f 2>/dev/null || hostname), $(date -u)"
-    echo "checkout $(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo '(not a git checkout)')" \
-         "$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null)"
+    # safe.directory: this runs as root on a checkout another user owns
+    echo "checkout $(git -c safe.directory="$ROOT" -C "$ROOT" rev-parse HEAD 2>/dev/null || echo '(not a git checkout)')" \
+         "$(git -c safe.directory="$ROOT" -C "$ROOT" describe --tags --always --dirty 2>/dev/null)"
     echo
 } > "$S"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
