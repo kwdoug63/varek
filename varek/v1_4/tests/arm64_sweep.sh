@@ -87,7 +87,7 @@ if [ "$DEPS" = 1 ]; then
     # --ignore-installed: beside the system's own copies (Ubuntu's jsonschema
     # cannot be uninstalled by pip, and the CycloneDX validator needs a newer
     # one); --break-system-packages where pip has it (not RHEL 9's)
-    BSP=""; python3 -m pip install --help 2>/dev/null | grep -q -- --break-system-packages && BSP=--break-system-packages
+    BSP=""; python3 -m pip help install 2>/dev/null | grep -q -- --break-system-packages && BSP=--break-system-packages
     # --prefer-binary: a release with a wheel for this Python and machine where
     # one meets the requirement; z3 5 has none for aarch64 before glibc 2.38,
     # so on RHEL 9 it is built from source (gcc-c++ and cmake, above; about
