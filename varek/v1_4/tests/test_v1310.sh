@@ -706,7 +706,7 @@ ids = [e['unmapped']['varek'].get('report_id') for e in E if 'report_id' in e['u
 want = [r['report_id'] for r in R if r['action'] != 'file.rename_to']
 sys.exit(0 if ids == want else 1)"
     check "each event names its record's seq and chain value, and the run (correlation_uid)" \
-        ev "$OUT/m.ev" "all(v['chain'] and len(v['chain']) == 64 for v in V[:-1]) and len({e['metadata']['correlation_uid'] for e in E}) == 1"
+        ev "$OUT/m.ev" "all(v['chain'] and len(v['chain']) == 96 for v in V[:-1]) and len({e['metadata']['correlation_uid'] for e in E}) == 1"
     check "the classes: file, process, network, HTTP, API (MCP) and lifecycle" \
         ev "$OUT/m.ev" "{1001, 1007, 4001, 4002, 6003, 6002} <= {e['class_uid'] for e in E}"
     check "an MCP tools/call is API Activity Other, with its tool; a tools/list is Read" \
